@@ -1,0 +1,157 @@
+# Change log
+
+## 2026-09-15
+
+- Initialized the standalone Go2Cpp C++17 runtime project in `/UserData/CodexWorkSpace/Go2Cpp`.
+- Added the design and compatibility matrix describing GMP, context, channel, error and explicit panic/defer boundaries.
+- Added the umbrella CMake runtime target, warning policy, install/export rules, and test/example options.
+- Added `docs/testing.md` with reproducible Debug/Release/Clang, sanitizer,
+  Valgrind, example, watchdog and stress-test commands.
+- Linked the verification matrix from `README.md` for discoverability.
+- Key documentation/test files for this verification unit: `docs/testing.md`,
+  `README.md`, `codex.md`, and `tests/test_scheduler.cpp`.
+- Verification recorded on 2026-09-15: GCC Debug and Release, Clang 18
+  Debug, ASan, UBSan, CTest (2/2), the runtime example, and Valgrind Memcheck
+  passed. The final Memcheck runs found zero errors and zero bytes in use at
+  exit for both the unit suite and scheduler smoke test (661,087 and 846
+  allocations/frees in the final sample; allocation counts can vary with the
+  libc/thread implementation).
+- TSan configured and compiled, but cannot start in this WSL image because of
+  `ThreadSanitizer: unexpected memory mapping`; no TSan race conclusion is
+  claimed.
+- Synchronized the self-referential scheduler test task publication before
+  callback access (assignment before enqueue plus a release/acquire gate);
+  200 full-suite runs and 200 scheduler-smoke runs passed with a ten-second
+  watchdog per process. The smoke test's always-evaluated checks are warning
+  clean in Release as well as Debug.
+- Added iterative context cancellation and iterative parent-state release so
+  deep cancellation/destruction chains do not consume the native call stack;
+  the 20,000-node test and an independent 100,000-node audit passed.
+- Added explicit expired-deadline behavior, root-context cancellation
+  protection, channel cancellation-priority coverage, panic-body exception
+  translation, and the scheduler yield-then-unhandled-panic regression.
+- Restricted scheduler `yield`/`park` to the current G and finalized unbound P
+  states as dead during shutdown; sparse-P and never-started shutdown tests now
+  cover those transitions.
+- Made `error::Is`/`As` chain traversal iterative and added a 100,000-layer
+  wrapping regression; built-in wrapper release is iterative, while custom
+  error ownership/message graphs remain required to be acyclic.
+- Split CMake into option/module/test/install files and verified umbrella,
+  individual-module, and relocated-prefix package consumers; all configured,
+  built, and exited zero. The final smoke and full-suite watchdog runs each
+  completed 200/200 iterations.
+- Status: implementation and stress verification are complete for this
+  snapshot; native-Linux TSan remains a follow-up because the WSL image cannot
+  start the instrumented process.
+
+## Pause handoff (2026-09-15)
+
+The requested pause is at the pre-commit handoff. The latest canonical WSL
+source includes the fake-clock expiry fix, named/typed context-key isolation,
+current-G-only scheduler yield/park admission, sparse-P shutdown finalization,
+iterative built-in error-chain release, and panic-handler exception isolation.
+
+Latest completed gates:
+
+- `build-final-modular`: GCC Debug build and CTest 2/2 passed; the example
+  prints the GMP/channel/error/panic demonstration output.
+- `build-final-asan` and `build-final-ubsan`: rebuilt after the latest runtime
+  changes; the full unit executable passed with no diagnostics.
+- Valgrind Memcheck on the unit and scheduler-smoke executables: both exit 0,
+  `0 bytes in 0 blocks`, `ERROR SUMMARY: 0`; the sampled allocation counts
+  were 661,087/661,087 and 846/846.
+- Watchdog stress: `go2cpp_tests` 200/200 and
+  `go2cpp_scheduler_smoke` 200/200 passed, with a ten-second timeout per run.
+- The existing package-consumer audit passed for the umbrella target,
+  individual module targets, and a relocated install prefix; its temporary
+  source/install directories were removed.
+
+## Resume verification (2026-09-16)
+
+- Reconfigured and rebuilt GCC Release after the final context/panic edits;
+  CTest passed 2/2 and the runtime example exited zero with the expected
+  GMP/channel/error/recover output.
+- Reconfigured with `CC=clang CXX=clang++`, rebuilt with Clang 18, and passed
+  CTest 2/2. Both final compiler configurations were warning-clean under the
+  configured `-Wall -Wextra -Wpedantic` policy.
+- Rechecked the Go `go1.23.0` source archive against
+  `third_party/go-reference/SHA256SUMS`; SHA-256 verification passed.
+- Remaining handoff action is repository staging/diff review and the requested
+  Git commit. Native-Linux TSan remains an external environment follow-up.
+
+Known boundaries to preserve in the final report: cooperative rather than
+asynchronously preemptive scheduling, native blocking calls occupy their M,
+polling/API-based select, explicit nil-channel status instead of an infinite
+nil-channel block, copyable values for `SendCase`, no Go compiler/ABI/GC, and
+the documented inability of a C++ throw during explicit `Frame` destruction
+to be recovered by that frame. Custom error ownership/message graphs must be
+acyclic. The default WSL TSan invocation remains loader-sensitive and can report
+`ThreadSanitizer: unexpected memory mapping` before the test starts; the final
+non-PIE/ASLR-disabled WSL run is recorded below, and a native Linux gate is
+still recommended.
+
+## Finalization (2026-09-16)
+
+- Added a persistent per-Scheduler owner token to `Task`; a G is bound to the
+  first scheduler that admits it, and foreign `enqueue`/`wake` calls are
+  rejected without changing the task state. Added the cross-scheduler
+  ownership regression in `tests/test_scheduler.cpp`.
+- Added the full-buffer select-send regression in `tests/test_channel.cpp`.
+  It verifies that draining a full capacity-1 channel refills the slot from an
+  armed select sender and preserves FIFO order.
+- Updated `docs/design.md`, `docs/scheduler.md`, and
+  `docs/compatibility.md` with the ownership and bounded-wait contracts. Added
+  `docs/dependencies.md` with the Go provenance and GC/ABI/stack/cgo
+  replacement inventory; linked it from `README.md`.
+- Rebuilt and tested the final source with GCC 13 Debug (`build-final-modular`),
+  GCC 13 Release (`build-final-release`), Clang 18 (`build-final-clang-env`),
+  and a strict `-Werror` build (`build-final-werror`). Every CTest run passed
+  2/2; the example printed the GMP, select/directional-channel, error and
+  recover output.
+- Rebuilt ASan and UBSan configurations and ran both unit and scheduler-smoke
+  executables with no diagnostics. Valgrind Memcheck reported zero errors and
+  zero bytes in use at exit for both binaries (1,161,500 and 983 allocations/
+  frees in the recorded sample). The Go archive checksum verified `OK` from
+  `third_party/go-reference`.
+- TSan compiled successfully. The default WSL layout can fail at process
+  startup with `unexpected memory mapping`; running the non-PIE build through
+  `setarch x86_64 -R` allowed both test executables to exit zero with no TSan
+  report. A native Linux runner remains the recommended independent gate.
+- Watchdog stress completed 200 `go2cpp_tests` runs and 300
+  `go2cpp_scheduler_smoke` runs, each with a ten-second process timeout. The
+  refreshed `build-final-install` prefix contains all module/umbrella targets,
+  headers and package configuration files.
+- Status: all requested compatibility-subset modules, examples, tests and
+  documentation are complete for this snapshot. Remaining work is optional:
+  run TSan on a native Linux kernel/loader and expand the explicit API if a
+  future translator needs semantics outside the documented subset.
+
+## Final audit continuation (2026-09-16)
+
+- Closed the scheduler admission window identified during review: queue
+  removal, runnable accounting, stop observation, and the Task execution claim
+  now occur under one scheduler admission transaction. Added regressions for
+  duplicate enqueue during a yielded callable and wake-after-park before the
+  callable returns.
+- Made internal requeue/wake failure handling idempotent with
+  `cancel_if_runnable_unqueued()`. A concurrent successful public enqueue is no
+  longer mistaken for a failure and cannot be cancelled by the worker.
+- Added terminal task-registry pruning and moved shutdown queue-task
+  destruction outside scheduler/P/join locks. The smoke suite now verifies a
+  task capture whose destructor re-enters the Scheduler; it exits under the
+  ten-second watchdog.
+- Refreshed the example to print context value/cancellation and error identity
+  checks. The final example output and exit status are successful.
+- Final GCC Debug and `-Werror` CTest runs passed 2/2 after the audit fixes;
+  ASan, UBSan and non-PIE/ASLR-disabled TSan were rebuilt and passed both test
+  executables. Valgrind Memcheck reported zero errors and zero bytes in use at
+  exit: unit `1,161,500` allocs/frees and smoke `983` allocs/frees.
+- The watchdog loop passed 200 unit runs and 300 scheduler-smoke runs after
+  the audit fixes. The installed umbrella, individual-target and relocated
+  package consumers all exited zero. `sha256sum -c` still reports `OK` for the
+  pinned Go archive.
+- No required implementation task remains in this snapshot. Explicit future
+  work is limited to a native-Linux TSan gate and any translator/ABI features
+  outside this standalone C++17 library; cooperative scheduling, nil-channel
+  finite-status behavior, explicit panic frames, and other documented
+  compatibility boundaries remain intentional.

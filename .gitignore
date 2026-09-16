@@ -1,0 +1,12 @@
+/build/
+/build-*/
+/third_party/go1.23.0.src.tar.gz
+/.cache/
+*.o
+*.a
+*.so
+*.dylib
+*.log
+core.*
+vgcore.*
+compile_commands.json
