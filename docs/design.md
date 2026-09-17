@@ -34,11 +34,31 @@ force an executing task from `runnable`/`waiting` bookkeeping to `dead`; this
 path clears deferred requeue state. There is no transition out of `dead` or
 `cancelled`; only `runnable` tasks may appear in a queue.
 
+This backend does not preserve a C++ call stack across `yield` or `park`.
+Those calls change the logical G state and the worker requeues the task after
+the current callable returns. A task that blocks in an arbitrary native call
+therefore retains its M until that call returns; it is not a transparent
+stackful-fiber suspension. C++ RAII locals created by the callable are cleaned
+when that callable returns or unwinds. Captures held by the callable remain
+owned by the `Task` until its last external/runtime owner releases it, even
+after the G state is terminal. The runtime cannot force-unwind a non-returning
+callable or invent a continuation for it.
+
 The `Scheduler` object is the external owner of the worker table and must
 outlive every worker thread. A task may call `shutdown()` to publish the stop
 request, but destroying the scheduler from one of its own workers is not
 supported; the owner thread performs the final join and destruction after the
 workers return.
+
+The M table is allocated once by `start()`; `max_workers` is clamped to P
+count and is not a dynamic growth target. Local/global queues and stealing
+balance queued work, but there is no blocked-M replacement, idle-thread
+retirement, or task-class-aware worker reuse. A future dynamic M manager must
+keep P execution exclusive while allowing an M blocked outside the scheduler
+to release its P, bound the total M count and idle cache, and verify scale-up,
+scale-down, shutdown, and load balance under bursty and mixed-class loads.
+Task-class locality should be a soft affinity that never prevents stealing or
+starves other classes; no task-class identifier exists in the current API.
 
 ## Context
 
@@ -47,6 +67,48 @@ workers return.
 ## Channels and select
 
 `Channel<T>` supports capacity zero (rendezvous) and capacity N (FIFO ring buffer), multiple producers/consumers, close, and cancellation-aware operations. A receive after close returns the type's default value with `ok=false`; a send after close returns a `SendResult::closed` status and can be promoted to a panic by the caller. Repeated close returns an error. Nil-channel behavior is represented by an invalid handle and is explicitly reported rather than hanging forever. `AsSendOnly` and `AsRecvOnly` create source-level directional views that omit the opposite operation set; the views can also be used to build matching select cases. `select` provides a non-blocking/default form and a bounded wait form over send and receive cases, with an optional context and timeout supplied to the select call. There is no separate `TimeoutCase` object. Ready cases are rotated with an atomic round-robin cursor; this is deterministic fairness rather than cryptographic randomness. Cases that are not immediately ready publish heap wait nodes under the channel mutex. A one-shot `SelectWaitState` claims exactly one case, pairs two independent unbuffered selects atomically, and is disarmed on every exit; close and context callbacks wake the state. Because `SelectProbe` is type-erased with `std::any`, channel element types used by select cases must be copyable; direct channel operations support move-only values. A nil select case reports `kNil`, and when no channel case is ready the supplied context is checked before `DefaultCase` by policy. The wait loop still uses a short bounded condition-variable interval for custom probe cases, so this is not a netpoller-grade wake-up path.
+
+## Socket I/O and hooks
+
+The current library has no socket wrapper or hook registry. In particular,
+there is no public `IOManager`, FD readiness backend, `addEvent`/
+`cancelEvent`, or `wait_for_event` implementation. Socket operations are
+therefore outside the supported subset and must not be described as
+non-blocking G waits. A future I/O module is expected to expose a syscall hook
+contract and scheduler adapter: readiness is registered before a timeout, the
+wait state owns an idempotent ready/timeout/cancel transition, and FD close,
+`EINTR`, `EBADF`, nonblocking mode, and original-syscall fallback are
+specified. The hook must resume a valid continuation or return an explicit
+status; it must never leave a G suspended after a timer/readiness race.
+
+The intended default is transparent interception, not only opt-in socket
+wrapper classes. The hook surface must cover at least `connect`, `accept`,
+`read`/`readv`/`recv*`, `write`/`writev`/`send*`, `close`,
+`fcntl`, `ioctl`, and socket timeout options. Calls made outside a managed
+G, calls on unsupported descriptors, and explicitly user-nonblocking calls
+must fall back to the original libc/syscall behavior. An FD registry must
+separate runtime nonblocking state from user-visible nonblocking state, retain
+send/receive timeouts, and use a generation/token so close plus descriptor
+reuse cannot wake the wrong waiter. `EINTR` is retried according to the
+operation contract; `EAGAIN` registers epoll readiness before the timer and
+parks the current Fiber; `connect(EINPROGRESS)` resumes on writability and
+checks `SO_ERROR`. `close` invalidates the generation and cancels all
+registered waits. This transparent call/return shape requires a resumable
+stackful Fiber (or an equivalent compiler-generated continuation) and cannot
+be implemented correctly by the current logical re-entry task model alone.
+The acceptance suite must include socketpair readiness, a zero/short timeout
+racing registration, readiness-versus-timeout/cancellation, concurrent close
+and FD-number reuse, user-nonblocking fallback, `EINTR`, `EBADF`, and
+leak/race instrumentation. No such tests exist in this release.
+
+## Coroutine synchronization
+
+There are no thread-like coroutine `Mutex`, `ConditionVariable`, `Fiber`, or
+`WaitGroup` APIs in this release. The existing condition variables protect
+runtime data structures and may block an OS thread. Adding these facilities
+requires either a stackful-fiber backend (kept behind a replaceable executor
+interface) or an explicitly callback/state-machine API; a blocking
+`std::condition_variable` wrapper would not provide coroutine semantics.
 
 ## Defer, panic and recover
 
@@ -60,8 +122,8 @@ Errors are immutable `shared_ptr<const Error>` values. A null handle is the only
 
 The library does not provide segmented/user-mode stacks, asynchronous compiler-level preemption, exact Go scheduler fairness, reflection-visible goroutine identities, garbage collection, Go interface ABI compatibility, or automatic panic transfer through arbitrary C++ call frames. These require compiler/ABI/GC integration and are recorded rather than simulated unsafely.
 
-Go runtime facilities are replaced as follows: GC and stack maps use `shared_ptr`, RAII and explicit frame ownership; `mcall`/`gogo`/`gopark`/`morestack` use the C++ worker loop and cooperative task states; `sudog`, futexes and netpoller waits use heap wait nodes, mutex/condition-variable notifications and the shared timer service; runtime atomics use `std::atomic`. cgo, sysmon, assembly ABI details and exact traceback generation are outside this library.
+Go runtime facilities are replaced as follows: GC and stack maps use `shared_ptr`, RAII and explicit frame ownership; `mcall`/`gogo`/`gopark`/`morestack` use the C++ worker loop and cooperative task states; `sudog`, futexes and timer waits use heap wait nodes, mutex/condition-variable notifications and the shared timer service. There is intentionally no netpoller/socket hook replacement yet. cgo, sysmon, assembly ABI details and exact traceback generation are outside this library.
 
 ## Extension and plugin boundary
 
-The 0.x package intentionally exposes source-level extension points rather than a binary plugin ABI. `SchedulerConfig` is the registration contract for the default executor (P count, worker bound, queue limit and idle wait), while `Context::SetNowFunctionForTesting` injects a clock for deterministic timeout construction. `SelectCase` accepts custom non-blocking probes, which is the supported way to bridge another wait backend. The scheduler worker loop, timer service and channel storage backend remain private implementation details; replacing one requires an adapter at these public boundaries and must preserve the state/result contracts in this document. A future plugin ABI is out of scope until the library has a 1.0 ABI policy.
+The 0.x package intentionally exposes source-level extension points rather than a binary plugin ABI. `SchedulerConfig` is the registration contract for the default executor (P count, worker bound, queue limit and idle wait), while `Context::SetNowFunctionForTesting` injects a clock for deterministic timeout construction. `SelectCase` accepts custom non-blocking probes, which can bridge another wait backend for select only; it is not a syscall/socket hook. A future I/O hook must be registered through an explicit adapter contract and preserve the wait-state result/idempotence rules above. The scheduler worker loop, timer service and channel storage backend remain private implementation details; replacing one requires an adapter at these public boundaries and must preserve the state/result contracts in this document. A future plugin ABI is out of scope until the library has a 1.0 ABI policy.

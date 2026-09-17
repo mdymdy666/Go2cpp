@@ -150,8 +150,37 @@ still recommended.
   the audit fixes. The installed umbrella, individual-target and relocated
   package consumers all exited zero. `sha256sum -c` still reports `OK` for the
   pinned Go archive.
-- No required implementation task remains in this snapshot. Explicit future
-  work is limited to a native-Linux TSan gate and any translator/ABI features
-  outside this standalone C++17 library; cooperative scheduling, nil-channel
-  finite-status behavior, explicit panic frames, and other documented
-  compatibility boundaries remain intentional.
+- No required implementation task remained for the compatibility subset
+  documented at that snapshot. Its then-known future work was limited to a
+  native-Linux TSan gate and translator/ABI features outside this standalone
+  C++17 library. The following boundary audit supersedes that statement for
+  the newly requested Fiber, socket-hook, coroutine-sync, and dynamic-M scope.
+
+## Boundary audit and HOOK clarification (2026-09-17)
+
+- Rechecked the four newly raised boundary cases against the source, tests and
+  public headers. A returning/panicking callable or a cancelled queued/waiting
+  task reaches a terminal G state, and queue/wake/shutdown races are covered.
+  This does not force-unwind a running C++ stack or destroy a `Task` retained
+  by user ownership. The scheduler does not preserve a C++ stack across
+  `yield`/`park`; a callable that never returns cannot be resumed by this
+  backend, and a blocking syscall occupies its M.
+- The socket requirement is **not implemented**. There is no `IOManager`, FD
+  readiness backend, `addEvent`/`cancelEvent`, `wait_for_event`, or syscall
+  hook registry. The requested hook semantics include original-syscall
+  fallback, readiness-before-timer registration, idempotent timeout/cancel
+  wake-up, nonblocking-mode handling, FD reuse generations, and
+  FD-close/`EINTR`/`EBADF` rules. Required transparent interception covers
+  connect/accept, read/recv, write/send, close, fcntl/ioctl, and socket timeout
+  options; explicit wrapper-only I/O is not sufficient.
+- Coroutine-level `Fiber`, mutex, condition-variable and waitgroup facilities
+  are not implemented. Existing `std::condition_variable` instances are
+  internal OS-thread coordination, not coroutine suspension. A stackful-fiber
+  backend or explicit callback/state-machine API is required.
+- M management is fixed at `Scheduler::start()`: one stable worker per
+  configured slot, with local/global queues and stealing. There is no dynamic
+  scale-up/scale-down, blocked-syscall handoff, idle-M reclamation, or
+  same-task-type thread-cache contract.
+- Status: the existing compatibility subset remains intact, but these four
+  boundary requests are only partially satisfied. The gaps are now explicit
+  in `docs/compatibility.md` and `docs/design.md`.
