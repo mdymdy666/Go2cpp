@@ -75,6 +75,18 @@ void run_beginner_api_tests() {
     GO2CPP_CHECK(handler_result.status == ChannelStatus::kInvalid);
     GO2CPP_CHECK(handler_result.error != nullptr);
 
+    // 总时长配置必须限制没有事件时的 Select 等待，不能永久挂起。
+    SelectLoop bounded_event;
+    bounded_event.bind(RecvCase(MakeChannel<int>(0)));
+    bounded_event.make_stop_config(0, 20ms);
+    const auto bounded_start = std::chrono::steady_clock::now();
+    const auto bounded_result = bounded_event.work();
+    const auto bounded_elapsed = std::chrono::steady_clock::now() - bounded_start;
+    GO2CPP_CHECK(bounded_result.status == ChannelStatus::kTimedOut ||
+                 bounded_result.status == ChannelStatus::kCancelled);
+    GO2CPP_CHECK(bounded_elapsed < 1s);
+    GO2CPP_CHECK(!bounded_event.runnable());
+
     // 同一个事件批次允许 native 线程和 Fiber 依次工作；内部 sync::Mutex
     // 在 Fiber 竞争时会停靠 Fiber，而不是占住唯一的 M。
     auto mixed_channel = MakeChannel<int>(0);
