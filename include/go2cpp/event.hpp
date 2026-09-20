@@ -19,14 +19,27 @@ namespace go2cpp {
 // EventBatch 是 Select 的新手友好包装。它只管理 channel SelectCase；任意
 // 可能阻塞的业务回调仍应通过 go()/Scheduler::spawn() 启动，再用 channel
 // 报告结果。这样等待会经过 ParkingCondition，Fiber 不会占住 M。
-// 对象必须一直存活到所有 work/bind/add_event 调用返回；stop() 只改变状态，
-// 不会强制销毁仍在等待的 Fiber 栈。
+// 对象必须一直存活到所有 work/bind/add_event 调用返回；stop() 会唤醒等待，
+// 但只走协作式返回路径，不会强制销毁仍在等待的 Fiber 栈。
 class EventBatch final {
+    struct StopControl final {
+        ContextPtr context;
+        CancelFunc cancel;
+    };
+
+    static std::shared_ptr<StopControl> make_stop_control() {
+        auto control = std::make_shared<StopControl>();
+        auto pair = Context::WithCancel(Context::Background());
+        control->context = std::move(pair.first);
+        control->cancel = std::move(pair.second);
+        return control;
+    }
+
 public:
     using Duration = ContextDuration;
     using Handler = std::function<void(const SelectResult&)>;
 
-    EventBatch() = default;
+    EventBatch() : m_stop_control(make_stop_control()) {}
     EventBatch(const EventBatch&) = delete;
     EventBatch& operator=(const EventBatch&) = delete;
 
@@ -58,6 +71,7 @@ public:
         m_stopped = false;
         m_rounds = 0;
         m_started_at.reset();
+        m_stop_control = make_stop_control();
         m_mutex.Unlock();
     }
 
@@ -91,11 +105,18 @@ public:
 
     void stop() noexcept {
         try {
+            std::shared_ptr<StopControl> control;
             if (!m_mutex.Lock()) {
                 return;
             }
             m_stopped = true;
+            control = m_stop_control;
             m_mutex.Unlock();
+            // 取消 DoneSignal 会唤醒正在 Select 的 Fiber；它仍通过正常
+            // 返回路径退出，不会从这里强制销毁挂起栈。
+            if (control && control->cancel) {
+                control->cancel();
+            }
         } catch (...) {
             // shutdown 期间不能再阻塞调用方；未能加锁时不触碰共享状态。
         }
@@ -109,6 +130,7 @@ public:
         m_started_at.reset();
         m_has_result = false;
         m_last = SelectResult{};
+        m_stop_control = make_stop_control();
         m_mutex.Unlock();
     }
 
@@ -147,6 +169,7 @@ public:
         std::vector<SelectCase> selected_cases;
         std::vector<Handler> selected_handlers;
         Handler handler;
+        ContextPtr stop_context;
         std::optional<Duration> effective_timeout;
         bool stop_on_timeout = true;
         {
@@ -188,6 +211,8 @@ public:
                     }
                 }
                 stop_on_timeout = m_stop_on_timeout;
+                stop_context = m_stop_control ? m_stop_control->context :
+                                                   Context::Background();
             } else {
                 m_last = work_stopped();
                 m_has_result = true;
@@ -199,8 +224,21 @@ public:
         }
 
         SelectResult result;
+        DoneSignal::CallbackId stop_bridge_id = 0;
+        CancelFunc stop_bridge_cancel;
+        ContextPtr effective_context = stop_context;
         try {
-            result = Select(selected_cases, context, effective_timeout);
+            if (context) {
+                auto child = Context::WithCancel(context);
+                effective_context = std::move(child.first);
+                stop_bridge_cancel = std::move(child.second);
+                if (stop_context) {
+                    stop_bridge_id = stop_context->Done().AddCallback(
+                        [stop_bridge_cancel] { stop_bridge_cancel(); });
+                }
+            }
+            result = Select(selected_cases, effective_context,
+                            effective_timeout);
         } catch (const std::exception& exception) {
             result.index = SelectResult::kNoSelection;
             result.selected = false;
@@ -212,6 +250,12 @@ public:
             result.selected = false;
             result.status = ChannelStatus::kInvalid;
             result.error = NewError("Select 执行发生未知异常");
+        }
+        if (stop_context && stop_bridge_id != 0) {
+            stop_context->Done().RemoveCallback(stop_bridge_id);
+        }
+        if (stop_bridge_cancel) {
+            stop_bridge_cancel();
         }
 
         {
@@ -320,6 +364,7 @@ private:
 
     mutable sync::Mutex m_mutex;
     sync::Mutex m_work_mutex;
+    std::shared_ptr<StopControl> m_stop_control;
     std::vector<Entry> m_entries;
     std::optional<Duration> m_loop_timeout;
     std::optional<Duration> m_max_duration;

@@ -315,6 +315,7 @@ valgrind --leak-check=full --show-leak-kinds=definite,indirect,possible build-cu
 ```
 
 `EventBatch` 总时长回归（空 channel、20ms）通过；Release CTest 首次有一次 mixed-runtime watchdog 偶发超时，独立 5 轮和随后完整重跑均通过。
+EventBatch `stop()` 唤醒 Fiber 的 P=1 回归通过。
 新增 `timer`、`beginner` 过滤测试各重复 10 轮通过；Clang 18 对新手测试执行
 `-fsyntax-only -Wall -Wextra -Wpedantic` 通过。TSan 仍沿用此前 WSL 镜像的启动限制记录，
 没有把未启动的完整套件宣称为通过。Valgrind 全套本轮仍有 416B intentional

@@ -67,6 +67,21 @@ void run_beginner_api_tests() {
     GO2CPP_REQUIRE(fiber_sender->wait_for(2s));
     GO2CPP_CHECK(fiber_selected.load(std::memory_order_acquire));
 
+    // stop() 要取消内部等待 context，让正在 Select 的 Fiber 尽快返回。
+    SelectLoop stopped_events;
+    stopped_events.bind(RecvCase(MakeChannel<int>(0)));
+    std::atomic<bool> stop_returned{false};
+    auto stopped_waiter = scheduler.spawn([&] {
+        const auto result = stopped_events.work();
+        stop_returned.store(result.status == ChannelStatus::kCancelled,
+                            std::memory_order_release);
+    });
+    GO2CPP_REQUIRE_EVENTUALLY(
+        stopped_waiter->state() == GState::kWaiting, 1s);
+    stopped_events.stop();
+    GO2CPP_REQUIRE(stopped_waiter->wait_for(2s));
+    GO2CPP_CHECK(stop_returned.load(std::memory_order_acquire));
+
     SelectLoop throwing_handler;
     throwing_handler.bind(DefaultCase(), [](const SelectResult&) {
         throw std::runtime_error("handler failure");
