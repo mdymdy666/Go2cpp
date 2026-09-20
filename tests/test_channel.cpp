@@ -66,7 +66,7 @@ void run_channel_tests() {
     });
     std::this_thread::sleep_for(2ms);
     GO2CPP_CHECK(rendezvous->SendFor(9, 500ms).Ok());
-    receiver.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(receiver, 3s);
     GO2CPP_CHECK(received.load(std::memory_order_acquire));
 
     auto close_channel = MakeChannel<int>(1);
@@ -109,7 +109,7 @@ void run_channel_tests() {
     });
     std::this_thread::sleep_for(2ms);
     context_pair.second();
-    blocked.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(blocked, 3s);
     GO2CPP_CHECK(canceled_status.load(std::memory_order_acquire) ==
                  ChannelStatus::kCancelled);
 
@@ -149,12 +149,11 @@ void run_channel_tests() {
         receive_select_result =
             Select({RecvCase(armed_receive_channel)}, {}, 1s);
     });
-    while (!receive_select_started.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
+    GO2CPP_REQUIRE_EVENTUALLY(
+        receive_select_started.load(std::memory_order_acquire), 3s);
     std::this_thread::sleep_for(2ms);
     GO2CPP_CHECK(armed_receive_channel->SendFor(73, 1s).Ok());
-    receive_select_thread.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(receive_select_thread, 3s);
     GO2CPP_CHECK(receive_select_result.selected &&
                  receive_select_result.Value<int>().value_or(0) == 73);
 
@@ -165,12 +164,11 @@ void run_channel_tests() {
         send_select_started.store(true, std::memory_order_release);
         send_select_result = Select({SendCase(armed_send_channel, 74)}, {}, 1s);
     });
-    while (!send_select_started.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
+    GO2CPP_REQUIRE_EVENTUALLY(
+        send_select_started.load(std::memory_order_acquire), 3s);
     std::this_thread::sleep_for(2ms);
     const auto ordinary_receive = armed_send_channel->RecvFor(74ms);
-    send_select_thread.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(send_select_thread, 3s);
     GO2CPP_CHECK(ordinary_receive.Ok() && ordinary_receive.ValueOrDefault() == 74);
     GO2CPP_CHECK(send_select_result.selected && send_select_result.ok);
 
@@ -185,12 +183,11 @@ void run_channel_tests() {
         full_send_result =
             Select({SendCase(full_buffer_select_channel, 82)}, {}, 1s);
     });
-    while (!full_send_started.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
+    GO2CPP_REQUIRE_EVENTUALLY(
+        full_send_started.load(std::memory_order_acquire), 3s);
     std::this_thread::sleep_for(2ms);
     const auto full_buffer_first = full_buffer_select_channel->RecvFor(1s);
-    full_send_thread.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(full_send_thread, 3s);
     GO2CPP_CHECK(full_buffer_first.Ok() &&
                  full_buffer_first.ValueOrDefault() == 81);
     GO2CPP_CHECK(full_send_result.selected && full_send_result.ok);
@@ -212,11 +209,10 @@ void run_channel_tests() {
         pair_ready.fetch_add(1, std::memory_order_acq_rel);
         pair_send_result = Select({SendCase(select_pair_channel, 75)}, {}, 1s);
     });
-    while (pair_ready.load(std::memory_order_acquire) != 2) {
-        std::this_thread::yield();
-    }
-    pair_receiver.join();
-    pair_sender.join();
+    GO2CPP_REQUIRE_EVENTUALLY(
+        pair_ready.load(std::memory_order_acquire) == 2, 3s);
+    GO2CPP_JOIN_WITH_WATCHDOG(pair_receiver, 3s);
+    GO2CPP_JOIN_WITH_WATCHDOG(pair_sender, 3s);
     GO2CPP_CHECK(pair_receive_result.selected && pair_receive_result.ok &&
                  pair_receive_result.Value<int>().value_or(0) == 75);
     GO2CPP_CHECK(pair_send_result.selected && pair_send_result.ok);
@@ -240,7 +236,7 @@ void run_channel_tests() {
     });
     std::this_thread::sleep_for(2ms);
     GO2CPP_CHECK(close_select_channel->Close().Ok());
-    close_select_thread.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(close_select_thread, 3s);
     GO2CPP_CHECK(close_select_result.selected &&
                  close_select_result.status == ChannelStatus::kClosed);
 
@@ -254,7 +250,7 @@ void run_channel_tests() {
     });
     std::this_thread::sleep_for(2ms);
     select_context_pair.second();
-    cancelled_select_thread.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(cancelled_select_thread, 3s);
     GO2CPP_CHECK(cancelled_select_result.status == ChannelStatus::kCancelled);
     GO2CPP_CHECK(cancelled_select_channel->TrySend(78).Ok());
 
@@ -289,7 +285,10 @@ void run_channel_tests() {
             for (int i = 0; i < values_per_producer; ++i) {
                 const auto result = stress->SendFor(
                     p * values_per_producer + i, 2s);
-                GO2CPP_CHECK(result.Ok());
+                if (!result.Ok()) {
+                    go2cpp_tests::watchdog_abort("channel producer", __FILE__,
+                                                 __LINE__);
+                }
             }
         });
     }
@@ -303,18 +302,18 @@ void run_channel_tests() {
                 if (result.Ok()) {
                     consumed.fetch_add(1, std::memory_order_relaxed);
                 } else {
-                    GO2CPP_CHECK(false);
-                    return;
+                    go2cpp_tests::watchdog_abort("channel consumer", __FILE__,
+                                                 __LINE__);
                 }
             }
         });
     }
     for (auto& producer : producers) {
-        producer.join();
+        GO2CPP_JOIN_WITH_WATCHDOG(producer, 5s);
     }
     stress->Close();
     for (auto& consumer : consumers) {
-        consumer.join();
+        GO2CPP_JOIN_WITH_WATCHDOG(consumer, 5s);
     }
     GO2CPP_CHECK(consumed.load(std::memory_order_relaxed) ==
                  producer_count * values_per_producer);
@@ -344,18 +343,18 @@ void run_channel_tests() {
     const auto managed_start_deadline = std::chrono::steady_clock::now() + 1s;
     while (!managed_recv_started.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < managed_start_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(managed_recv_started.load(std::memory_order_acquire));
     while (managed_receiver->state() != GState::kWaiting &&
            std::chrono::steady_clock::now() < managed_start_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     auto managed_sender = managed.spawn([&] {
         GO2CPP_CHECK(managed_rendezvous->Send(91).Ok());
     });
-    GO2CPP_CHECK(managed_receiver->wait_for(1s));
-    GO2CPP_CHECK(managed_sender->wait_for(1s));
+    GO2CPP_REQUIRE(managed_receiver->wait_for(1s));
+    GO2CPP_REQUIRE(managed_sender->wait_for(1s));
     GO2CPP_CHECK(managed_recv_done.load(std::memory_order_acquire));
     GO2CPP_CHECK(managed_value.load(std::memory_order_acquire) == 91);
 
@@ -374,8 +373,8 @@ void run_channel_tests() {
                                   std::memory_order_relaxed);
         }
     });
-    GO2CPP_CHECK(managed_buffer_sender->wait_for(2s));
-    GO2CPP_CHECK(managed_buffer_receiver->wait_for(2s));
+    GO2CPP_REQUIRE(managed_buffer_sender->wait_for(2s));
+    GO2CPP_REQUIRE(managed_buffer_receiver->wait_for(2s));
     GO2CPP_CHECK(managed_sum.load(std::memory_order_relaxed) == 10);
 
     auto managed_timeout_channel = MakeChannel<int>(0);
@@ -384,7 +383,7 @@ void run_channel_tests() {
         managed_timeout.store(managed_timeout_channel->RecvFor(25ms).status,
                               std::memory_order_release);
     });
-    GO2CPP_CHECK(timeout_task->wait_for(1s));
+    GO2CPP_REQUIRE(timeout_task->wait_for(1s));
     GO2CPP_CHECK(managed_timeout.load(std::memory_order_acquire) ==
                  ChannelStatus::kTimedOut);
 
@@ -398,10 +397,10 @@ void run_channel_tests() {
     });
     while (cancel_task->state() != GState::kWaiting &&
            std::chrono::steady_clock::now() < managed_start_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     managed_cancel_context.second();
-    GO2CPP_CHECK(cancel_task->wait_for(1s));
+    GO2CPP_REQUIRE(cancel_task->wait_for(1s));
     GO2CPP_CHECK(managed_cancel_status.load(std::memory_order_acquire) ==
                  ChannelStatus::kCancelled);
 
@@ -415,13 +414,13 @@ void run_channel_tests() {
     });
     while (managed_select_receiver->state() != GState::kWaiting &&
            std::chrono::steady_clock::now() < managed_start_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     auto managed_select_sender = managed.spawn([&] {
         GO2CPP_CHECK(managed_select_channel->Send(93).Ok());
     });
-    GO2CPP_CHECK(managed_select_receiver->wait_for(1s));
-    GO2CPP_CHECK(managed_select_sender->wait_for(1s));
+    GO2CPP_REQUIRE(managed_select_receiver->wait_for(1s));
+    GO2CPP_REQUIRE(managed_select_sender->wait_for(1s));
     GO2CPP_CHECK(managed_select_ok.load(std::memory_order_acquire));
 
     // Shutdown must wake a channel-blocked G and let its stack unwind before
@@ -434,7 +433,7 @@ void run_channel_tests() {
     });
     while (shutdown_task->state() != GState::kWaiting &&
            std::chrono::steady_clock::now() < managed_start_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     managed.shutdown();
     GO2CPP_CHECK(shutdown_task->state() == GState::kCancelled ||

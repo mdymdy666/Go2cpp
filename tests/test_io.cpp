@@ -161,7 +161,7 @@ void test_single_p_and_wait_results() {
     while (!manager.Cancel(cancelled_pair[0], IOEvent::kRead) &&
            !cancel_done.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < cancel_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(wait_until(cancel_done));
     GO2CPP_CHECK(cancel_status.load(std::memory_order_acquire) ==
@@ -184,7 +184,7 @@ void test_single_p_and_wait_results() {
     while (!manager.NotifyClose(closed_pair[0]) &&
            !close_done.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < close_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     raw_close(closed_pair[0]);
     closed_pair[0] = -1;

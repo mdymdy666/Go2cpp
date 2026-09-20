@@ -1,5 +1,6 @@
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/scheduler.hpp"
+#include "go2cpp/thread_policy.hpp"
 #include "go2cpp/panic_defer.hpp"
 #include "test_support.hpp"
 
@@ -42,7 +43,7 @@ void run_scheduler_tests() {
                 }
                 seen.push_back(current.get());
             }
-            std::this_thread::yield();
+            go2cpp_tests::yield_for_watchdog();
             completed.fetch_add(1, std::memory_order_release);
         }));
     }
@@ -53,9 +54,19 @@ void run_scheduler_tests() {
     }
     GO2CPP_CHECK(completed.load(std::memory_order_acquire) == task_count);
     GO2CPP_CHECK(duplicate.load(std::memory_order_relaxed) == 0);
-    for (const auto& task : tasks) {
-        GO2CPP_CHECK(task->state() == GState::kDead);
+    const auto terminal_deadline = std::chrono::steady_clock::now() + 3s;
+    bool all_terminal = false;
+    while (std::chrono::steady_clock::now() < terminal_deadline) {
+        all_terminal = std::all_of(
+            tasks.begin(), tasks.end(), [](const auto& task) {
+                return task->state() == GState::kDead;
+            });
+        if (all_terminal) {
+            break;
+        }
+        std::this_thread::sleep_for(1ms);
     }
+    GO2CPP_CHECK(all_terminal);
     GO2CPP_CHECK(scheduler.runnable_count() == 0);
 
     std::atomic<int> yielded{0};
@@ -64,9 +75,8 @@ void run_scheduler_tests() {
     yielding = std::make_shared<Task>([&] {
         // enqueue() may run the task before it returns. Publish the
         // self-reference before the Fiber reads it.
-        while (!published.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
+        GO2CPP_REQUIRE_EVENTUALLY(
+            published.load(std::memory_order_acquire), 3s);
         yielded.fetch_add(1, std::memory_order_release);
         GO2CPP_CHECK(scheduler.yield(yielding));
         // A stackful G continues here; its callable is not invoked again.
@@ -79,7 +89,7 @@ void run_scheduler_tests() {
     const auto yield_deadline = std::chrono::steady_clock::now() + 1s;
     while (yielded.load(std::memory_order_acquire) < 2 &&
            std::chrono::steady_clock::now() < yield_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(yielded.load(std::memory_order_acquire) == 2);
 
@@ -87,9 +97,8 @@ void run_scheduler_tests() {
     std::atomic<bool> panic_published{false};
     std::shared_ptr<Task> yield_then_panic;
     yield_then_panic = std::make_shared<Task>([&] {
-        while (!panic_published.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
+        GO2CPP_REQUIRE_EVENTUALLY(
+            panic_published.load(std::memory_order_acquire), 3s);
         if (panic_runs.fetch_add(1, std::memory_order_relaxed) == 0) {
             GO2CPP_CHECK(scheduler.yield(yield_then_panic));
             go2cpp::panic_defer::panic(
@@ -101,7 +110,7 @@ void run_scheduler_tests() {
     const auto panic_deadline = std::chrono::steady_clock::now() + 1s;
     while (yield_then_panic->state() != GState::kDead &&
            std::chrono::steady_clock::now() < panic_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(yield_then_panic->state() == GState::kDead);
     GO2CPP_CHECK(panic_runs.load(std::memory_order_acquire) == 1);
@@ -110,15 +119,21 @@ void run_scheduler_tests() {
     std::atomic<bool> running_release{false};
     auto externally_touched = scheduler.spawn([&] {
         running_entered.store(true, std::memory_order_release);
-        while (!running_release.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+        const auto release_deadline = std::chrono::steady_clock::now() + 5s;
+        while (!running_release.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < release_deadline) {
+            go2cpp_tests::yield_for_watchdog();
+        }
+        if (!running_release.load(std::memory_order_acquire)) {
+            go2cpp_tests::watchdog_abort("running task release", __FILE__,
+                                         __LINE__);
         }
     });
     const auto running_deadline = std::chrono::steady_clock::now() + 1s;
     while ((!running_entered.load(std::memory_order_acquire) ||
              externally_touched->state() != GState::kRunning) &&
            std::chrono::steady_clock::now() < running_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(running_entered.load(std::memory_order_acquire));
     GO2CPP_CHECK(externally_touched->state() == GState::kRunning);
@@ -127,7 +142,7 @@ void run_scheduler_tests() {
     running_release.store(true, std::memory_order_release);
     while (externally_touched->state() != GState::kDead &&
            std::chrono::steady_clock::now() < running_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(externally_touched->state() == GState::kDead);
 
@@ -144,20 +159,31 @@ void run_scheduler_tests() {
     // is occupied by another callable. Once that node is dequeued, the
     // scheduler must release the callable captures rather than retaining
     // user resources in the task registry forever.
-    Scheduler cancelled_queue(1);
+    SchedulerConfig cancelled_config;
+    cancelled_config.processor_count = 1;
+    cancelled_config.min_workers = 1;
+    cancelled_config.max_workers = 1;
+    cancelled_config.allow_worker_oversubscription = false;
+    Scheduler cancelled_queue(cancelled_config);
     cancelled_queue.start();
     std::atomic<bool> blocker_entered{false};
     std::atomic<bool> release_blocker{false};
     auto blocker = cancelled_queue.spawn([&] {
         blocker_entered.store(true, std::memory_order_release);
-        while (!release_blocker.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+        const auto release_deadline = std::chrono::steady_clock::now() + 5s;
+        while (!release_blocker.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < release_deadline) {
+            go2cpp_tests::yield_for_watchdog();
+        }
+        if (!release_blocker.load(std::memory_order_acquire)) {
+            go2cpp_tests::watchdog_abort("blocker release", __FILE__,
+                                         __LINE__);
         }
     });
     const auto blocker_deadline = std::chrono::steady_clock::now() + 1s;
     while (!blocker_entered.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < blocker_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(blocker_entered.load(std::memory_order_acquire));
     auto retained_capture = std::make_shared<int>(42);
@@ -172,7 +198,7 @@ void run_scheduler_tests() {
     const auto release_deadline = std::chrono::steady_clock::now() + 1s;
     while (!retained_capture_weak.expired() &&
            std::chrono::steady_clock::now() < release_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(retained_capture_weak.expired());
     GO2CPP_CHECK(blocker->wait_for(1s));
@@ -197,7 +223,7 @@ void run_scheduler_tests() {
         const auto entered_deadline = std::chrono::steady_clock::now() + 1s;
         while (!entered.load(std::memory_order_acquire) &&
                std::chrono::steady_clock::now() < entered_deadline) {
-            std::this_thread::yield();
+            go2cpp_tests::yield_for_watchdog();
         }
         GO2CPP_CHECK(entered.load(std::memory_order_acquire));
         GO2CPP_CHECK(raw_task->cancel());
@@ -245,7 +271,7 @@ void run_scheduler_tests() {
     const auto accepted_deadline = std::chrono::steady_clock::now() + 1s;
     while (unbound_task->state() != GState::kDead &&
            std::chrono::steady_clock::now() < accepted_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(unbound_task->state() == GState::kDead);
     accepting_owner.shutdown();
@@ -267,7 +293,7 @@ void run_scheduler_tests() {
     const auto pre_cancel_deadline = std::chrono::steady_clock::now() + 1s;
     while (!pre_cancel_capture_weak.expired() &&
            std::chrono::steady_clock::now() < pre_cancel_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(pre_cancel_capture_weak.expired());
     pre_cancel_owner.shutdown();
@@ -278,8 +304,15 @@ void run_scheduler_tests() {
     for (int i = 0; i < 2; ++i) {
         concurrent_shutdown.spawn([&] {
             shutdown_arrived.fetch_add(1, std::memory_order_acq_rel);
-            while (shutdown_arrived.load(std::memory_order_acquire) != 2) {
-                std::this_thread::yield();
+            const auto arrival_deadline =
+                std::chrono::steady_clock::now() + 5s;
+            while (shutdown_arrived.load(std::memory_order_acquire) != 2 &&
+                   std::chrono::steady_clock::now() < arrival_deadline) {
+                go2cpp_tests::yield_for_watchdog();
+            }
+            if (shutdown_arrived.load(std::memory_order_acquire) != 2) {
+                go2cpp_tests::watchdog_abort("concurrent shutdown arrival",
+                                             __FILE__, __LINE__);
             }
             concurrent_shutdown.shutdown();
             shutdown_returned.fetch_add(1, std::memory_order_release);
@@ -289,7 +322,7 @@ void run_scheduler_tests() {
     const auto shutdown_deadline = std::chrono::steady_clock::now() + 2s;
     while (shutdown_returned.load(std::memory_order_acquire) != 2 &&
            std::chrono::steady_clock::now() < shutdown_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(shutdown_returned.load(std::memory_order_acquire) == 2);
     concurrent_shutdown.shutdown();
@@ -315,7 +348,7 @@ void run_scheduler_tests() {
     const auto join_deadline = std::chrono::steady_clock::now() + 2s;
     while (!parent_finished.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < join_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(child_started.load(std::memory_order_acquire));
     GO2CPP_CHECK(parent_finished.load(std::memory_order_acquire));
@@ -331,28 +364,108 @@ void run_scheduler_tests() {
     std::atomic<bool> parked_in_join{false};
     std::atomic<bool> cancelled_join_returned{false};
     auto never = std::make_shared<Task>([] {
+        const auto cancellation_deadline =
+            std::chrono::steady_clock::now() + 10s;
         while (Scheduler::current_task() &&
-               !Scheduler::current_task()->cancellation_requested()) {
+               !Scheduler::current_task()->cancellation_requested() &&
+               std::chrono::steady_clock::now() < cancellation_deadline) {
             (void)Scheduler::current_scheduler()->yield_current();
+            // Memcheck needs a small native pause here; other sanitizer
+            // runs retain the original cooperative yield-only behavior.
+            go2cpp_tests::pause_for_watchdog();
+        }
+        if (Scheduler::current_task() &&
+            !Scheduler::current_task()->cancellation_requested()) {
+            go2cpp_tests::watchdog_abort("join target cancellation", __FILE__,
+                                         __LINE__);
         }
     });
     auto cancellable_joiner = std::make_shared<Task>([&] {
         parked_in_join.store(true, std::memory_order_release);
-        const bool joined = never->wait();
+        const bool joined = never->wait_for(5s);
         cancelled_join_returned.store(!joined, std::memory_order_release);
     });
     GO2CPP_CHECK(cancel_join_scheduler.enqueue(cancellable_joiner));
     GO2CPP_CHECK(cancel_join_scheduler.enqueue(never));
-    const auto parked_deadline = std::chrono::steady_clock::now() + 2s;
-    while ((!parked_in_join.load(std::memory_order_acquire) ||
-             cancellable_joiner->state() != GState::kWaiting) &&
-           std::chrono::steady_clock::now() < parked_deadline) {
-        std::this_thread::yield();
-    }
-    GO2CPP_CHECK(parked_in_join.load(std::memory_order_acquire));
-    GO2CPP_CHECK(cancellable_joiner->state() == GState::kWaiting);
-    GO2CPP_CHECK(cancellable_joiner->Cancel());
-    GO2CPP_CHECK(cancellable_joiner->wait_for(2s));
+    GO2CPP_REQUIRE_EVENTUALLY(
+        parked_in_join.load(std::memory_order_acquire) &&
+            cancellable_joiner->state() == GState::kWaiting,
+        5s);
+    GO2CPP_REQUIRE(cancellable_joiner->Cancel());
+    GO2CPP_REQUIRE(cancellable_joiner->wait_for(5s));
     GO2CPP_CHECK(cancelled_join_returned.load(std::memory_order_acquire));
     cancel_join_scheduler.shutdown();
+
+    // Participation and hook policy are explicit TLS scopes.  Merely marking
+    // an external thread eligible does not change Scheduler::current_scheduler
+    // or execute a queue item; only an internal worker is a runtime M.
+    GO2CPP_CHECK(!go2cpp::ThreadParticipatesInGMP());
+    {
+        go2cpp::ScopedThreadParticipation participation(
+            scheduler, go2cpp::ThreadParticipationMode::kGmpEligible);
+        const auto snapshot = go2cpp::CurrentThreadPolicy();
+        GO2CPP_CHECK(snapshot.participates_in_gmp());
+        GO2CPP_CHECK(!snapshot.runtime_worker);
+        GO2CPP_CHECK(go2cpp::Scheduler::current_scheduler() == nullptr);
+        {
+            go2cpp::ScopedThreadParticipation unmanaged(
+                nullptr, go2cpp::ThreadParticipationMode::kUnmanaged);
+            GO2CPP_CHECK(!go2cpp::ThreadParticipatesInGMP());
+        }
+        GO2CPP_CHECK(go2cpp::ThreadParticipatesInGMP());
+    }
+    GO2CPP_CHECK(!go2cpp::ThreadParticipatesInGMP());
+
+    const auto original_hook_mode = go2cpp::CurrentThreadHookMode();
+    {
+        go2cpp::ScopedThreadHookMode disabled(
+            go2cpp::ThreadHookMode::kDisabled);
+        GO2CPP_CHECK(go2cpp::CurrentThreadHookMode() ==
+                     go2cpp::ThreadHookMode::kDisabled);
+    }
+    GO2CPP_CHECK(go2cpp::CurrentThreadHookMode() == original_hook_mode);
+
+    Scheduler policy_scheduler(1);
+    policy_scheduler.start();
+    std::atomic<bool> worker_policy_seen{false};
+    std::atomic<bool> nested_worker_policy_seen{false};
+    auto policy_task = policy_scheduler.spawn([&] {
+        const auto snapshot = go2cpp::CurrentThreadPolicy();
+        worker_policy_seen.store(
+            snapshot.runtime_worker &&
+                snapshot.scheduler == &policy_scheduler &&
+                snapshot.participation ==
+                    go2cpp::ThreadParticipationMode::kGmpEligible,
+            std::memory_order_release);
+        {
+            // An external-style nested scope must not lie about the M/P
+            // binding of an actual runtime worker.
+            go2cpp::ScopedThreadParticipation nested(
+                nullptr, go2cpp::ThreadParticipationMode::kUnmanaged);
+            const auto nested_snapshot = go2cpp::CurrentThreadPolicy();
+            nested_worker_policy_seen.store(
+                nested_snapshot.runtime_worker &&
+                    nested_snapshot.scheduler == &policy_scheduler &&
+                    nested_snapshot.participation ==
+                        go2cpp::ThreadParticipationMode::kGmpEligible,
+                std::memory_order_release);
+        }
+    });
+    GO2CPP_CHECK(policy_task->wait_for(1s));
+    GO2CPP_CHECK(worker_policy_seen.load(std::memory_order_acquire));
+    GO2CPP_CHECK(nested_worker_policy_seen.load(std::memory_order_acquire));
+
+    std::atomic<bool> blocking_api_reusable{false};
+    auto blocking_api_task = policy_scheduler.spawn([&] {
+        const bool first = go2cpp::Scheduler::enter_blocking();
+        go2cpp::Scheduler::leave_blocking();
+        const bool second = go2cpp::Scheduler::enter_blocking();
+        go2cpp::Scheduler::leave_blocking();
+        blocking_api_reusable.store(first && second,
+                                    std::memory_order_release);
+    });
+    GO2CPP_CHECK(blocking_api_task->wait_for(1s));
+    GO2CPP_CHECK(blocking_api_reusable.load(std::memory_order_acquire));
+    policy_scheduler.shutdown();
+
 }

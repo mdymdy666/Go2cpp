@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <limits>
 #include <mutex>
@@ -56,13 +57,44 @@ public:
 
     void Wake() noexcept {
         std::lock_guard<std::mutex> lock(m_wake_mutex);
+        if (!m_active) {
+            return;
+        }
         try {
-            if (m_active && m_scheduler != nullptr && m_task) {
+            if (m_scheduler != nullptr && m_task) {
+                // A managed waiter resumes through its owning scheduler.
+                // Scheduler::wake_or_cancel also retains started Gs when
+                // shutdown or queue allocation races this callback.
                 (void)m_scheduler->wake(m_task);
+            } else {
+                // Native callers wait on this node's private condition
+                // variable. The result is the predicate, so a notify that
+                // arrives before wait() is not lost.
+                m_native_condition.notify_one();
             }
         } catch (...) {
             // Scheduler's reliable wake handoff retains every started G.
         }
+    }
+
+    bool managed() const noexcept {
+        return m_scheduler != nullptr && static_cast<bool>(m_task);
+    }
+
+    WaitResult WaitNative() noexcept {
+        try {
+            std::unique_lock<std::mutex> lock(m_native_mutex);
+            m_native_condition.wait(lock, [this] {
+                return result() != WaitResult::kWaiting;
+            });
+        } catch (...) {
+            // condition_variable may report an implementation/system error.
+            // Never let that escape the runtime wait boundary (which is
+            // noexcept because scheduler and cancellation callbacks are
+            // advisory); convert it to the same terminal path as cancellation.
+            (void)TryFinish(WaitResult::kCancelled);
+        }
+        return result();
     }
 
     const std::shared_ptr<Task>& task() const noexcept { return m_task; }
@@ -73,6 +105,8 @@ private:
     std::shared_ptr<Task> m_task;
     std::atomic<WaitResult> m_result{WaitResult::kWaiting};
     std::mutex m_wake_mutex;
+    std::mutex m_native_mutex;
+    std::condition_variable m_native_condition;
     bool m_active{false};
 };
 
@@ -141,16 +175,25 @@ private:
 };
 
 WaitResult Await(const std::shared_ptr<WaitNode>& waiter) noexcept {
-    if (!waiter || waiter->scheduler() == nullptr || !waiter->task()) {
+    if (!waiter) {
         return WaitResult::kCancelled;
     }
 
-    Scheduler* const scheduler = waiter->scheduler();
-    const auto& task = waiter->task();
     const auto finish = [&waiter](WaitResult result) {
         waiter->Disarm();
         return result;
     };
+    if (!waiter->managed()) {
+        // Native callers consume the same result state but sleep on a
+        // condition_variable; this keeps a blocked OS thread out of the GMP
+        // worker pool while preserving notify-before-wait semantics.
+        return finish(waiter->WaitNative());
+    }
+
+    // A managed G never waits on a native condition_variable: parking releases
+    // its M and the scheduler wake path requeues the same logical G.
+    Scheduler* const scheduler = waiter->scheduler();
+    const auto& task = waiter->task();
     for (;;) {
         if (task->cancellation_requested()) {
             if (waiter->result() == WaitResult::kWaiting) {
@@ -195,6 +238,19 @@ ContextPtr TimeoutContext(ContextDuration timeout, const ContextPtr& parent,
     return std::move(pair.first);
 }
 
+// ConditionVariable::Wait is specified with the same precondition as
+// std::condition_variable::wait: the caller owns the mutex. Even an already
+// cancelled context or a zero timeout must perform the atomic-looking
+// unlock/relock boundary so another waiter can make progress and the caller
+// regains its lock before observing the false result. Mutex::Lock may decline
+// to re-park a G during scheduler shutdown; in that case the documented result
+// is false with the mutex left unlocked.
+bool AbortConditionWait(Mutex& mutex) {
+    mutex.Unlock();
+    (void)mutex.Lock();
+    return false;
+}
+
 }  // namespace
 
 struct Mutex::Impl {
@@ -220,7 +276,7 @@ bool Mutex::Lock(const ContextPtr& context) {
     }
 
     const WaitTarget target = CurrentTarget();
-    if (!target || target.task->cancellation_requested()) {
+    if (target && target.task->cancellation_requested()) {
         return false;
     }
     const auto waiter =
@@ -308,7 +364,7 @@ void Mutex::Unlock() {
 void Mutex::lock() {
     if (!Lock()) {
         throw std::logic_error(
-            "go2cpp::sync::Mutex cannot block outside a runnable managed G");
+            "go2cpp::sync::Mutex lock was cancelled or scheduler unavailable");
     }
 }
 
@@ -322,27 +378,35 @@ ConditionVariable::~ConditionVariable() = default;
 
 bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
     if (context && context->IsDone()) {
-        return false;
+        return AbortConditionWait(mutex);
     }
     const WaitTarget target = CurrentTarget();
-    if (!target || target.task->cancellation_requested()) {
-        return false;
+    if (target && target.task->cancellation_requested()) {
+        return AbortConditionWait(mutex);
     }
 
     const auto waiter =
         std::make_shared<WaitNode>(target.scheduler, target.task);
     ContextSubscription subscription(context, waiter);
+    bool abort_before_publish = false;
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
-        if ((context && context->IsDone()) ||
-            waiter->result() != WaitResult::kWaiting) {
-            return false;
+        abort_before_publish =
+            (context && context->IsDone()) ||
+            waiter->result() != WaitResult::kWaiting;
+        if (!abort_before_publish) {
+            m_impl->m_waiters.push_back(waiter);
+            if (!waiter->Arm()) {
+                m_impl->m_waiters.pop_back();
+                abort_before_publish = true;
+            }
         }
-        m_impl->m_waiters.push_back(waiter);
-        if (!waiter->Arm()) {
-            m_impl->m_waiters.pop_back();
-            return false;
-        }
+    }
+    if (abort_before_publish) {
+        // Do this after releasing the CV registry lock. Unlock can wake a
+        // waiter that calls NotifyOne, which must be able to inspect the
+        // registry without a lock inversion.
+        return AbortConditionWait(mutex);
     }
 
     try {
@@ -471,7 +535,7 @@ bool WaitGroup::Wait(const ContextPtr& context) {
     }
 
     const WaitTarget target = CurrentTarget();
-    if (!target || target.task->cancellation_requested()) {
+    if (target && target.task->cancellation_requested()) {
         return false;
     }
     const auto waiter =

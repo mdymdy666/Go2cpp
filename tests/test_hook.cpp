@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 #if defined(__has_include)
 #if __has_include(<valgrind/valgrind.h>)
@@ -41,6 +42,16 @@ bool wait_until(const std::atomic<bool>& value,
         std::this_thread::sleep_for(100us);
     }
     return value.load(std::memory_order_acquire);
+}
+
+template <typename Predicate>
+bool wait_until_predicate(Predicate predicate,
+                          std::chrono::milliseconds timeout = 2s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(100us);
+    }
+    return predicate();
 }
 
 bool make_pair(int (&fds)[2]) {
@@ -221,7 +232,7 @@ void test_native_fallback_and_failed_dup() {
         native_timeout_errno.store(result < 0 ? errno : 0,
                                    std::memory_order_release);
     });
-    timeout_reader.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(timeout_reader, 3s);
     GO2CPP_CHECK(native_timeout_errno.load(std::memory_order_acquire) ==
                  ETIMEDOUT);
 
@@ -251,7 +262,7 @@ void test_native_fallback_and_failed_dup() {
     if (!completed) {
         close_pair(fds);
     }
-    ordinary_reader.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(ordinary_reader, 3s);
     GO2CPP_CHECK(received.load(std::memory_order_acquire) == byte);
     GO2CPP_CHECK(native_error.load(std::memory_order_acquire) == 0);
     close_pair(fds);
@@ -361,13 +372,101 @@ void test_dup2_replacement_and_identity() {
 
 }  // namespace
 
+void test_plain_scheduler_lazy_adoption_timeout() {
+    // With hooks enabled but no IOManager, a managed Fiber still gets the
+    // nonblocking descriptor plus native poll fallback and a real deadline.
+    go2cpp::SchedulerConfig config;
+    config.processor_count = 1;
+    config.min_workers = 1;
+    config.max_workers = 0;
+    config.idle_worker_timeout = 10ms;
+    go2cpp::Scheduler scheduler(config);
+    scheduler.start();
+
+    int fds[2]{-1, -1};
+    GO2CPP_CHECK(make_pair(fds));
+    timeval timeout{0, 40 * 1000};
+    GO2CPP_CHECK(::setsockopt(fds[0], SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                              sizeof(timeout)) == 0);
+    std::atomic<int> read_error{0};
+    std::atomic<bool> peer_done{false};
+    auto waiter = scheduler.spawn([&] {
+        char byte = 0;
+        const ssize_t result = ::recv(fds[0], &byte, 1, 0);
+        read_error.store(result < 0 ? errno : 0, std::memory_order_release);
+    });
+    auto peer = scheduler.spawn([&] {
+        peer_done.store(true, std::memory_order_release);
+    });
+    GO2CPP_CHECK(peer->wait_for(2s));
+    GO2CPP_CHECK(peer_done.load(std::memory_order_acquire));
+    GO2CPP_CHECK(waiter->wait_for(2s));
+    GO2CPP_CHECK(read_error.load(std::memory_order_acquire) == ETIMEDOUT);
+    close_pair(fds);
+    scheduler.shutdown();
+}
+
+void test_native_fallback_grows_replacement_m() {
+    go2cpp::SchedulerConfig config;
+    config.processor_count = 1;
+    config.min_workers = 1;
+    config.max_workers = 0;
+    config.idle_worker_timeout = 10ms;
+    go2cpp::Scheduler scheduler(config);
+    scheduler.start();
+
+    std::atomic<bool> entered{false};
+    std::atomic<int> peers_done{0};
+    auto sleeper = scheduler.spawn([&] {
+        go2cpp::ScopedThreadHookMode disabled(
+            go2cpp::ThreadHookMode::kDisabled);
+        entered.store(true, std::memory_order_release);
+        const timespec request{0, 50 * 1000 * 1000};
+        (void)::nanosleep(&request, nullptr);
+    });
+    GO2CPP_CHECK(wait_until(entered));
+
+    std::vector<std::shared_ptr<go2cpp::Task>> peers;
+    for (int index = 0; index < 4; ++index) {
+        peers.emplace_back(scheduler.spawn([&] {
+            peers_done.fetch_add(1, std::memory_order_release);
+        }));
+    }
+    GO2CPP_CHECK(wait_until_predicate([&] {
+        return peers_done.load(std::memory_order_acquire) == 4;
+    }, 2s));
+    GO2CPP_CHECK(scheduler.worker_count() >= 2);
+    GO2CPP_CHECK(scheduler.worker_count() <= 2);
+    GO2CPP_CHECK(sleeper->wait_for(2s));
+    for (const auto& peer : peers) {
+        GO2CPP_CHECK(peer->wait_for(2s));
+    }
+    GO2CPP_CHECK(wait_until_predicate(
+        [&] { return scheduler.worker_count() == 1; }, 2s));
+    scheduler.shutdown();
+}
+
 void run_hook_tests() {
     go2cpp_tests::announce("transparent Linux socket hook interposer");
     go2cpp::hook::ScopedEnable enable;
+    GO2CPP_CHECK(go2cpp::hook::IsEnabled());
+    {
+        go2cpp::hook::ScopedThreadHookMode disabled(
+            go2cpp::ThreadHookMode::kDisabled);
+        GO2CPP_CHECK(!go2cpp::hook::IsEnabled());
+    }
+    GO2CPP_CHECK(go2cpp::hook::IsEnabled());
+    {
+        go2cpp::hook::ScopedThreadHookMode enabled(
+            go2cpp::ThreadHookMode::kEnabled);
+        GO2CPP_CHECK(go2cpp::hook::IsEnabled());
+    }
     test_transparent_read_and_sleep();
     test_timeout_and_user_nonblocking();
     test_close_and_dup_metadata();
     test_native_fallback_and_failed_dup();
     test_ioctl_and_urgent_data_boundaries();
     test_dup2_replacement_and_identity();
+    test_plain_scheduler_lazy_adoption_timeout();
+    test_native_fallback_grows_replacement_m();
 }

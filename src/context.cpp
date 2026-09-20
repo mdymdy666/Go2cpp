@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <thread>
@@ -142,8 +143,17 @@ public:
     using Id = std::uint64_t;
 
     static TimerService& Instance() {
-        static TimerService service;
-        return service;
+        // Context states can be destroyed during arbitrary static teardown.
+        // Keep the service and its synchronization primitives alive until the
+        // process exits, so State::~State() can always remove a pending timer
+        // without touching a destroyed singleton. The exit hook stops the
+        // worker first, avoiding a live-thread Memcheck report.
+        static TimerService* service = [] {
+            auto* value = new TimerService();
+            std::atexit(&TimerService::ShutdownAtExit);
+            return value;
+        }();
+        return *service;
     }
 
     TimerService(const TimerService&) = delete;
@@ -162,13 +172,19 @@ private:
 
     TimerService() : m_thread([this] { Run(); }) {}
 
-    ~TimerService() {
+    ~TimerService() { Shutdown(); }
+
+    static void ShutdownAtExit() noexcept { Instance().Shutdown(); }
+
+    void Shutdown() noexcept {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_stopping = true;
+            m_entries.clear();
         }
         m_cv.notify_all();
-        if (m_thread.joinable() && m_thread.get_id() != std::this_thread::get_id()) {
+        if (m_thread.joinable() &&
+            m_thread.get_id() != std::this_thread::get_id()) {
             m_thread.join();
         }
     }

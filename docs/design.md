@@ -31,8 +31,12 @@ gate/disarm step
 before their owner returns.
 
 The owning `Scheduler`/`IOManager` object must remain alive until all worker
-threads have stopped. Destruction from one of its own managed Gs fails fast,
-because a C++ destructor cannot safely defer the owner object's lifetime.
+threads and external member-callers have stopped. Destruction (and a final
+`shutdown()`) must not run concurrently with `start`, `enqueue`, snapshots,
+or other member calls; the reaper holds its join gate through retired-thread
+joins, but it cannot make an object lifetime race safe. Destruction from one of
+its own managed Gs fails fast, because a C++ destructor cannot safely defer the
+owner object's lifetime.
 Ordinary `Channel` member calls require the object to outlive every concurrent
 caller and waiter; `~Channel()` is not a concurrent cancellation primitive and
 must not run while a raw/stack channel call is active. `SelectCase` captures a
@@ -66,29 +70,60 @@ wakes started waiting Gs, and waits for started Fibers to return naturally.
 Worker-initiated shutdown publishes the same drain request; once the registry is
 terminal the workers transition to stopping and the owner thread joins them.
 
-M management starts at `min_workers`, grows while runnable backlog and busy M
-count demand it, and retires idle M records down to the floor. The effective
-maximum is clamped to P because this implementation does not yet expose a
-blocking-region handoff that releases P around arbitrary native calls. Retired
-records are joined/reaped, so repeated load waves do not grow metadata without
-bound. Task class IDs provide a bounded soft affinity scan and counters; they
-never prevent stealing or promise a thread-local cache.
+M management starts at min_workers, grows while runnable backlog and busy M
+count demand it, and retires idle M records down to the floor. With
+allow_worker_oversubscription=false, the configured maximum is strictly
+clamped to P. With the default setting, ordinary runnable bursts remain
+P-bounded; each active BlockingRegion contributes one replacement-M slot,
+up to max_workers. This is an explicit declaration for a short native
+blocking call, not asynchronous preemption or a full Go-style P handoff:
+the blocked M keeps its P accounting token while the replacement M may
+share that P. Retired records are joined/reaped, so repeated load waves do
+not grow metadata without bound. Task class IDs provide a bounded soft
+affinity scan and counters; they never prevent stealing or promise a
+thread-local cache.
 
 ## Fiber and execution context
 
 `go2cpp::Fiber` uses Boost.Context raw `fcontext_t`, a protected fixed-size
 stack, and an explicit trampoline. It has `Ready`, `Running`, `Suspended`,
 `Completed` and `Failed` states. Resume calls are serialized; errno is saved and
-restored around every switch. A Fiber may migrate between M threads, so normal
-`thread_local` values must not be treated as G-local state. Destruction requests
-cancellation and resumes a Ready/Suspended Fiber until it completes, preserving
-stack destructors and defers. A Fiber that ignores cancellation can make its
-destructor wait; there is intentionally no unsafe forced stack disposal.
+restored around every switch. A Fiber may migrate between M threads,
+so normal thread_local values must not be treated as G-local state.
+FiberLocalCache<T> (also available as FiberLocal<T>) stores a shared
+value under the logical Fiber identity, survives migration, and releases
+it after the Fiber trampoline completes. Calls from ordinary threads use
+a normal per-thread fallback. This is a value-local facility, not a
+reusable stack or Fiber-object pool; stack reuse remains a replaceable
+backend concern. Transient cache objects on a long-lived Fiber intentionally
+retain their key/value entry until Fiber completion, so stable cache instances
+are preferred for hot paths. Destruction requests cancellation and resumes a
+Ready/Suspended Fiber until it completes, preserving stack destructors and
+defers. A Fiber that ignores cancellation can make its destructor wait; there is
+intentionally no unsafe forced stack disposal.
 
 `panic_defer::ExecutionContext` is carried by the Fiber and installed by a
 short `Binding` around each resume. This replaces the thread-local-only state
 used by simple callback runtimes and prevents panic/recover state leaking when
 an M is reused by another G.
+
+## Thread policy and native blocking
+
+ThreadParticipationMode and ScopedThreadParticipation let an external thread
+record whether it is eligible to cooperate with a Scheduler, while
+ThreadHookMode and ScopedThreadHookMode override the process-wide socket hook
+for that thread. Runtime-created workers mark themselves as managed workers
+automatically. An external participation scope is deliberately policy metadata
+only: it does not attach the thread as an M, run a scheduler queue, or provide
+an external run_one loop.
+
+BlockingRegion is the explicit bridge for a managed G that must call a known
+native blocking function. It marks the current M as blocking and permits one
+replacement M per active region, subject to max_workers. The RAII object is
+non-movable and records the entering M so its destructor can repair that M's
+state even if a misuse lets the Fiber migrate; nevertheless it must not span a
+Fiber yield, park, or migration. Arbitrary unhooked blocking calls are still
+not detected automatically.
 
 `panic_defer::panic()` records runtime state but does not rewrite ordinary C++
 control flow. Generated code must return through the active frame boundary
@@ -117,9 +152,10 @@ deadlocking; it is a deliberate C++ extension rather than a promise of the
 Go runtime's exact callback timing. A null parent maps to `Background()`.
 Unlike Go's `Background().Done()`/`TODO().Done()` nil channel, a root here
 returns a non-null `DoneSignal` that remains permanently unsignaled.
-Callbacks should not synchronously wait on siblings or ancestors, and global
-static Context objects should not outlive the process-wide timer service during
-static destruction; those shutdown orders are caller responsibilities.
+Callbacks should not synchronously wait on siblings or ancestors. The
+context deadline service is intentionally process-lifetime so static Context
+destruction can safely remove pending timers; an exit callback stops and joins
+the timer thread while the intentionally retained service object remains valid.
 
 ## Channels and synchronization
 
@@ -143,18 +179,26 @@ ended.
 
 `sync::Mutex`, `ConditionVariable` and `WaitGroup` use FIFO wait nodes and the
 same disarm gate. Managed calls release the external mutex before parking and
-reacquire it on a normal wake. Unmanaged contended `Mutex::Lock` returns false
-(or `lock()` throws `logic_error`) rather than blocking an unknown OS thread.
+reacquire it on a normal wake.
+
+An ordinary thread that contends on the same object waits on the wait node
+native condition_variable; both caller classes share the FIFO handoff, and
+unlock is intentionally not thread-owned. This avoids transferring ownership
+of a std::mutex across a Fiber that may migrate after a hooked I/O wait.
+lock() can throw logic_error only when a managed G cannot continue waiting,
+for example during shutdown; an unmanaged thread may block until its timeout
+or notification.
 WaitGroup zero transitions are wave-based, so a new `Add` cannot consume an old
 wave's notifications.
 
 ## Socket hook and wait protocol
 
-The Linux hook is a shared C ABI interposer. It wraps `socket`/`socketpair` and
-activates cooperative I/O only for a Fiber currently owned by an IOManager;
-an ordinary thread falls through to the original libc function. Each managed
+The Linux hook is a shared C ABI interposer. It wraps `socket`/`socketpair`;
+a Fiber owned by an IOManager uses epoll, while a managed Fiber on a plain
+Scheduler lazily adopts the descriptor and uses bounded native poll fallback.
+An ordinary thread falls through to the original libc function. Each managed
 socket has an open description recording user-visible versus runtime
-`O_NONBLOCK` and send/receive timeouts. Every potentially blocking operation
+`O_NONBLOCK` and send/receive timeouts.
 follows this shape:
 
 1. Hold `DescriptorGuard` briefly, validate the live generation, and call the
@@ -193,12 +237,14 @@ requested state from the raw file flags while restoring runtime nonblocking.
 Readiness deadlines are rounded up to the poller's millisecond granularity;
 native-thread fallback uses bounded millisecond slices, so sub-millisecond
 timeouts are lower-bounded by that scheduling granularity.
+Known interposed calls that fall back to a native syscall or poll use invoke_native_blocking and automatically publish M::Blocking; arbitrary unhooked native calls still require an explicit BlockingRegion.
 
 ## Extension boundaries
 
 The default scheduler, Fiber backend, timer service, channel storage and epoll
 manager are concrete implementations behind public result/state contracts.
-`SchedulerConfig`, `TaskOptions`, `Context::SetNowFunctionForTesting`,
+SchedulerConfig, TaskOptions, BlockingRegion, FiberLocalCache<T>,
+thread-policy scopes, Context::SetNowFunctionForTesting,
 `SelectCase`, `DescriptorGuard`/tokens and the C hook controls are the supported
 replacement/embedding boundaries. There is no binary plugin ABI before 1.0;
 replacement implementations must preserve state transitions, one-shot wake
@@ -218,3 +264,18 @@ on close, fd-generation ABA, timer/readiness races, and incomplete variadic
 hook handling. Go2Cpp addresses those with raw Boost.Context ownership,
 weak/gated callbacks, generation tokens, one-shot outcomes and explicit
 `ENOTSUP` for unknown command shapes.
+
+## Boundary API usage
+
+The recommended mixed-mode pattern is to use the runtime synchronization
+classes for state shared by Fibers and ordinary threads. Do not hold a
+thread-owned std::mutex across a Fiber yield or hooked I/O operation: the
+Fiber may resume on another M and unlocking that native mutex from a different
+thread is undefined behavior. Use sync::Mutex (or release the native lock
+before yielding) and pair every wait with a timeout or cancellation policy.
+
+Use ScopedThreadHookMode(kDisabled) only for a deliberately native call; this
+scope changes hook admission for the current thread and does not change G/M/P
+ownership. Use BlockingRegion around a known native blocking call from a
+managed G. The region is RAII and non-nestable, and it must end before the
+Fiber parks or yields.

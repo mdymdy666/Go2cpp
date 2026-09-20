@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <functional>
 #include <mutex>
@@ -29,7 +30,7 @@ public:
 
     ~Watchdog() {
         m_done.store(true, std::memory_order_release);
-        m_thread.join();
+        GO2CPP_JOIN_WITH_WATCHDOG(m_thread, 3s);
     }
 
 private:
@@ -66,8 +67,15 @@ void Burst(go2cpp::Scheduler& scheduler, std::size_t worker_cap,
             while (maximum < active &&
                    !maximum_running.compare_exchange_weak(
                        maximum, active, std::memory_order_acq_rel)) {}
-            while (!release.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
+            const auto release_deadline =
+                std::chrono::steady_clock::now() + 10s;
+            while (!release.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < release_deadline) {
+                go2cpp_tests::yield_for_watchdog();
+            }
+            if (!release.load(std::memory_order_acquire)) {
+                go2cpp_tests::watchdog_abort("burst release", __FILE__,
+                                             __LINE__);
             }
             running.fetch_sub(1, std::memory_order_acq_rel);
             completed.fetch_add(1, std::memory_order_release);
@@ -109,7 +117,7 @@ void GrowShrinkRegrow() {
             for (const auto& processor : scheduler.processors()) {
                 GO2CPP_CHECK(processor.id < scheduler.processor_count());
             }
-            std::this_thread::yield();
+            go2cpp_tests::yield_for_watchdog();
         }
     });
 
@@ -117,13 +125,23 @@ void GrowShrinkRegrow() {
     for (int wave = 0; wave < 6; ++wave) {
         Burst(scheduler, 4, maximum_running);
         GO2CPP_CHECK(WaitUntil([&] { return scheduler.worker_count() == 1; }));
-        // Reaping takes place on the next admission. The table is bounded by
-        // active plus the last retired wave, not the total number of waves.
-        GO2CPP_CHECK(scheduler.machines().size() <= 4);
+        // A later admission performs dead-M reaping. Drive that maintenance
+        // point explicitly so the bound is checked after joins, including
+        // under slow Memcheck scheduling.
+        if (wave + 1 < 6) {
+            auto maintenance = scheduler.spawn([] {});
+            GO2CPP_CHECK(maintenance->wait_for(5s));
+            GO2CPP_CHECK(WaitUntil(
+                [&] { return scheduler.machines().size() <= 4; }, 5s));
+        }
     }
     GO2CPP_CHECK(maximum_running.load(std::memory_order_acquire) <= 4);
+    auto final_maintenance = scheduler.spawn([] {});
+    GO2CPP_CHECK(final_maintenance->wait_for(5s));
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return scheduler.machines().size() <= 4; }, 5s));
     snapshots_done.store(true, std::memory_order_release);
-    snapshots.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(snapshots, 5s);
     scheduler.shutdown();
     GO2CPP_CHECK(scheduler.worker_count() == 0);
 }
@@ -132,7 +150,8 @@ void ProcessorCapAndMinimumFloor() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 3;
     config.min_workers = 2;
-    config.max_workers = 64;  // Effective bound must remain P, not 64 M's.
+    config.max_workers = 64;  // Strict mode keeps the effective bound at P.
+    config.allow_worker_oversubscription = false;
     config.idle_worker_timeout = 3ms;
     go2cpp::Scheduler scheduler(config);
     scheduler.start();
@@ -145,6 +164,64 @@ void ProcessorCapAndMinimumFloor() {
         GO2CPP_CHECK(scheduler.worker_count() == 2);
     }
     GO2CPP_CHECK(maximum_running.load(std::memory_order_acquire) <= 3);
+    scheduler.shutdown();
+}
+
+void BlockingRegionOvercommit() {
+    go2cpp::SchedulerConfig config;
+    config.processor_count = 1;
+    config.min_workers = 1;
+    config.max_workers = 0;  // Normalized default reserves one replacement M.
+    config.idle_worker_timeout = 10ms;
+    config.allow_worker_oversubscription = true;
+    go2cpp::Scheduler scheduler(config);
+    scheduler.start();
+
+    std::mutex native_mutex;
+    std::condition_variable native_condition;
+    bool release_blocked = false;
+    std::atomic<bool> entered{false};
+    std::atomic<int> peers_done{0};
+    auto blocked = scheduler.spawn([&] {
+        go2cpp::BlockingRegion region;
+        GO2CPP_CHECK(region.active());
+        entered.store(true, std::memory_order_release);
+        std::unique_lock<std::mutex> lock(native_mutex);
+        GO2CPP_REQUIRE(native_condition.wait_for(
+            lock, 5s, [&] { return release_blocked; }));
+    });
+    GO2CPP_CHECK(WaitUntil([&] {
+        return entered.load(std::memory_order_acquire);
+    }));
+
+    std::vector<std::shared_ptr<go2cpp::Task>> peers;
+    for (int index = 0; index < 8; ++index) {
+        peers.emplace_back(scheduler.spawn([&] {
+            peers_done.fetch_add(1, std::memory_order_release);
+        }));
+    }
+    GO2CPP_CHECK(WaitUntil([&] {
+        return peers_done.load(std::memory_order_acquire) == 8;
+    }));
+    GO2CPP_CHECK(scheduler.worker_count() >= 2);
+    GO2CPP_CHECK(scheduler.worker_count() <= 2);
+    const auto machine_snapshot = scheduler.machines();
+    const auto blocking_count = std::count_if(
+        machine_snapshot.begin(), machine_snapshot.end(), [](const auto& machine) {
+            return machine.state == go2cpp::MState::Blocking;
+        });
+    GO2CPP_CHECK(blocking_count == 1);
+
+    {
+        std::lock_guard<std::mutex> lock(native_mutex);
+        release_blocked = true;
+    }
+    native_condition.notify_all();
+    GO2CPP_CHECK(blocked->wait_for(2s));
+    for (const auto& peer : peers) {
+        GO2CPP_CHECK(peer->wait_for(2s));
+    }
+    GO2CPP_CHECK(WaitUntil([&] { return scheduler.worker_count() == 1; }));
     scheduler.shutdown();
 }
 
@@ -203,8 +280,14 @@ void CancelWakeShutdownRace() {
                 ~StackGuard() { m_counter->fetch_add(1, std::memory_order_release); }
             } guard{&destructed};
             entered.fetch_add(1, std::memory_order_release);
-            while (!go2cpp::Scheduler::current_task()->cancellation_requested()) {
+            const auto cancellation_deadline =
+                std::chrono::steady_clock::now() + 10s;
+            while (!go2cpp::Scheduler::current_task()->cancellation_requested() &&
+                   std::chrono::steady_clock::now() < cancellation_deadline) {
                 (void)scheduler.park_current();
+            }
+            if (!go2cpp::Scheduler::current_task()->cancellation_requested()) {
+                go2cpp_tests::watchdog_abort("cancel wake", __FILE__, __LINE__);
             }
         });
         GO2CPP_CHECK(WaitUntil([&] {
@@ -212,7 +295,7 @@ void CancelWakeShutdownRace() {
         }));
         std::thread notifier([&] { (void)scheduler.wake_or_cancel(task); });
         scheduler.shutdown();
-        notifier.join();
+        GO2CPP_JOIN_WITH_WATCHDOG(notifier, 5s);
         GO2CPP_CHECK(task->state() == go2cpp::GState::Cancelled);
         GO2CPP_CHECK(entered.load(std::memory_order_acquire) == 1);
         GO2CPP_CHECK(destructed.load(std::memory_order_acquire) == 1);
@@ -227,6 +310,7 @@ void run_dynamic_scheduler_tests() {
     go2cpp_tests::announce("dynamic M growth/shrink, P cap, bounded affinity and wake drain");
     GrowShrinkRegrow();
     ProcessorCapAndMinimumFloor();
+    BlockingRegionOvercommit();
     BoundedClassAffinity();
     CancelWakeShutdownRace();
 }

@@ -23,11 +23,15 @@ int main() {
             group.Done();
             return;
         }
-        while (!ready) {
+        const auto wait_deadline = std::chrono::steady_clock::now() + 2s;
+        while (!ready &&
+               std::chrono::steady_clock::now() < wait_deadline) {
             if (!condition.WaitFor(mutex, 1s)) {
-                success.store(false);
                 break;
             }
+        }
+        if (!ready) {
+            success.store(false);
         }
         counter += ready ? 1 : 0;
         mutex.Unlock();

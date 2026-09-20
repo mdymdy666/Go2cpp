@@ -278,3 +278,120 @@ section for the current status.
   Memcheck was rerun again on the current tree. `valgrind-tests-final5.log`
   and `valgrind-smoke-final5.log` exited zero with `0 bytes in 0 blocks` and
   `ERROR SUMMARY: 0`; allocation totals were `1,809,665` and `3,390`.
+
+## Boundary API follow-up (2026-09-20)
+
+- Extended the public documentation and runnable examples for the mixed native
+  thread and managed Fiber boundary. Added mixed_runtime_demo.cpp and registered
+  it as a CMake example/test target.
+- Documented scheduler-aware mixed Mutex, ConditionVariable and WaitGroup
+  semantics, including native condition-variable wait nodes, non-thread-owned
+  unlock, timeout/cancellation expectations, and the prohibition on holding a
+  thread-owned std::mutex across Fiber migration.
+- Documented FiberLocalCache/FiberLocal value lifetime and migration behavior,
+  per-thread hook and GMP participation scopes, and the intentional boundary
+  that external participation records policy only and does not attach an M or
+  run a queue.
+- Documented BlockingRegion replacement-M admission. Known interposed socket
+  and sleep fallbacks account for native blocking automatically; arbitrary
+  unhooked native calls still require the explicit RAII region and remain
+  cooperative.
+- The post-boundary Debug build in build-docs-check compiled 57 targets; CTest
+  passed 8/8, and the mixed example passed 20/20 watchdog runs. The Hook-off
+  Release static build in build-docs-static passed 7/7, including the mixed
+  example. Final sanitizer, Valgrind and compiler reruns are recorded below.
+
+## Final verification after boundary hardening (2026-09-20, superseded)
+
+- Made BlockingRegion non-movable and bound its cleanup to the entering M id.
+  The destructor repairs the captured M even if an invalid Fiber migration
+  occurs; the public contract still forbids yielding or parking inside the
+  region. Native close fallback now uses the same blocking accounting.
+- Worker participation scopes now preserve the scheduler-owned worker metadata
+  when nested inside a runtime M. External participation remains an explicit
+  policy/eligibility scope only; it does not attach an M or run a queue.
+- Managed hook admission without an IOManager now lazily adopts sockets and
+  uses the bounded native poll/deadline path when hooks are enabled. Explicitly
+  disabled hooks preserve native blocking semantics and use BlockingRegion
+  accounting. The recursion guard remains active.
+- Added the plain-Scheduler lazy-adoption timeout regression and the worker
+  nested-policy regression. The ASan test race that asserted Task::state
+  immediately after a completion counter was made watchdog-based.
+- Made the context deadline TimerService an intentionally process-lifetime
+  singleton, removing static Context/TimerService destruction-order UAF risk;
+  an exit callback stops and joins the service thread while the intentionally retained service object remains valid.
+
+Final verification from /UserData/CodexWorkSpace/Go2Cpp:
+- GCC Debug Hook-on CTest 8/8; Release static Hook-off 7/7; strict Werror 8/8;
+  Clang 18 8/8.
+- ASan and UBSan full unit/smoke runs passed with the documented environment
+  variables.
+- Memcheck logs build-check/valgrind-boundary-tests-final4.log and
+  build-check/valgrind-boundary-smoke-final4.log exited zero with ERROR SUMMARY
+  0. Definite, indirect and possible leaks were all zero. Intentional process-lifetime FiberLocal registry and context-timer service storage remained reachable: 360 bytes in three blocks for the unit run and 96 bytes in one block for smoke. The native context waiter now has a 2-second `WaitFor` watchdog before join.
+- Watchdog stress passed go2cpp_tests 40/40 and go2cpp_scheduler_smoke 80/80.
+  Rebuilt TSan scheduler, dynamic, and fiber filters passed with `setarch x86_64 -R`; the full suite exceeded a 120-second Python watchdog without a diagnostic, while the normal WSL invocation reports `ThreadSanitizer: unexpected memory mapping`. Native Linux remains the TSan gate.
+- Install/export smoke passed with the current `build-install-final` tree and a temporary package consumer.
+- Known semantic boundaries remain: no exact Go P handoff or asynchronous
+  preemption, no external-thread attach/run-one backend, no Fiber stack pool,
+  and no guarantee of same-task-type cache reuse. Arbitrary unhooked native
+  blocking still requires an explicit BlockingRegion; poll/select/mmsg,
+  sendfile/splice, io_uring and similar socket-adjacent APIs remain outside
+  the hook subset.
+
+
+## Final boundary hardening and race-detector follow-up (2026-09-20)
+
+- Added watchdog-safe test infrastructure in tests/test_support.hpp:
+  bounded RequireEventually, aborting Require, and thread joins guarded by
+  a separate watchdog thread. Long test Fiber loops use a 1 ms pause only when
+  running under Valgrind, so Memcheck cannot starve the coordinating test
+  thread while TSan keeps the original yield behavior.
+- Hardened tests/test_scheduler.cpp and related module/smoke/example tests:
+  cancellation and publication waits have absolute deadlines, critical waits
+  fail fast instead of continuing into unsafe teardown, and the cancelled
+  queue-capture case uses a strict one-worker/no-oversubscription scheduler.
+- TSan found a real race during this pass: dynamic M growth relocated
+  Scheduler::Impl::machines vector slots while a managed worker performed
+  BlockingRegion lookup. The machine record container is now a deque, so
+  published shared-pointer slots are not relocated during append; scheduler,
+  dynamic and fiber TSan filters then passed repeatedly. This is reflected in
+  src/scheduler.cpp and docs/scheduler.md.
+- Final GCC Debug/Release, strict Werror, Clang, ASan and UBSan CTest matrices
+  passed: 8/8 Debug, 7/7 Release static, 8/8 Werror, 8/8 Clang, 8/8 ASan,
+  and 2/2 UBSan unit/smoke.
+- Valgrind final8 logs passed with zero definite/indirect/possible leaks:
+  unit 1,516,975 allocs / 1,516,972 frees and 360 bytes in three
+  intentional reachable blocks; smoke 3,406 / 3,405 and 96 bytes in one
+  intentional FiberLocal-registry block. Both report ERROR SUMMARY: 0.
+- Final stress passed 10 unit and 10 scheduler-smoke executions with a
+  45-second process watchdog. Install/export consumer smoke printed 7.
+- Remaining boundaries are unchanged and intentional: no exact Go P handoff or
+  asynchronous preemption, external participation is metadata-only, FiberLocal
+  is a logical value cache rather than a Folly stack/object pool, arbitrary
+  unhooked blocking needs explicit BlockingRegion, and the WSL full-suite
+  TSan gate remains incomplete pending native Linux.
+
+## Shutdown lock hardening (2026-09-20)
+
+- External shutdown now moves each published `std::thread` out while holding
+  `Impl::mutex`, releases the scheduler mutex, and joins the moved thread. The
+  final processor/state scan is also lock-protected. This removes the temporary
+  snapshot allocation from the OOM-sensitive shutdown path while preserving
+  the `join_mutex -> Impl::mutex` ordering.
+- After this change, Debug CTest remained 8/8; dynamic, sync and scheduler-smoke
+  watchdog runs passed. Memcheck final9 reported zero definite, indirect or
+  possible leaks (unit 1,517,159 allocs / 1,517,156 frees; smoke 3,415 / 3,414)
+  with only the documented 360B and 96B process-lifetime reachable blocks.
+
+## Reaper lifetime hardening (2026-09-20)
+
+- `reap_dead_workers()` now reserves its retired-thread vector before moving
+  any joinable `std::thread`, and retains `join_mutex` through the actual joins.
+  This makes the OOM path non-terminating and keeps external shutdown from
+  observing a half-finished reaper maintenance pass.
+- After the reaper change, Release Hook-off 7/7, strict Werror 8/8, Clang 8/8,
+  ASan 8/8 and UBSan 2/2 passed; TSan scheduler and dynamic filters passed
+  under `setarch x86_64 -R`. Final10 Memcheck again had zero definite,
+  indirect or possible leaks: unit 1,560,975/1,560,972 allocations/frees and
+  360B reachable; smoke 4,042/4,041 and 96B reachable; both `ERROR SUMMARY: 0`.

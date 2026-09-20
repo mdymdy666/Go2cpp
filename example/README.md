@@ -13,3 +13,17 @@ cmake -S . -B build -DGO2CPP_BUILD_EXAMPLES=ON
 cmake --build build --target go2cpp_runtime_demo
 ./build/go2cpp_runtime_demo
 ```
+
+For boundary cases involving ordinary threads and managed Fibers, run `example/mixed_runtime_demo.cpp`.
+
+```sh
+cmake --build build --target go2cpp_mixed_runtime_demo
+./build/go2cpp_mixed_runtime_demo
+```
+
+The example uses `sync::Mutex`, `ConditionVariable` and `WaitGroup` from both sides
+of a shared wait queue, checks that `FiberLocal` state survives a cooperative
+yield, scopes hook participation per native thread, and declares a short
+`BlockingRegion` so a replacement M can service queued work. External
+`ScopedThreadParticipation` is intentionally a policy/eligibility scope; it
+does not attach that native thread as a scheduler worker.

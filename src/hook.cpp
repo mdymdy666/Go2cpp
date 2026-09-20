@@ -166,14 +166,34 @@ auto invoke_real(Function function, Args&&... args)
     return function(std::forward<Args>(args)...);
 }
 
+// A disabled/unavailable IOManager still needs to account for a native call
+// made by a managed G. The region is a no-op on ordinary threads and on a
+// worker that is already inside another declared region. It lets the scheduler
+// publish M::Blocking and admit a replacement M before the syscall sleeps.
+template <typename Function, typename... Args>
+auto invoke_native_blocking(Function function, Args&&... args)
+    -> decltype(function(std::forward<Args>(args)...)) {
+    std::optional<go2cpp::BlockingRegion> blocking_region;
+    if (go2cpp::Scheduler::current_task() != nullptr) {
+        blocking_region.emplace();
+    }
+    return invoke_real(function, std::forward<Args>(args)...);
+}
+
+int raw_close_fallback(int fd) noexcept {
+    return static_cast<int>(::syscall(SYS_close, fd));
+}
+
 std::atomic<bool> s_enabled{true};
 std::atomic<std::uint64_t> s_scoped_enable_count{0};
 std::atomic<std::int64_t> s_connect_timeout_ms{5000};
 thread_local IOManager* s_bound_manager = nullptr;
 
 bool hooks_enabled() noexcept {
-    return s_enabled.load(std::memory_order_acquire) ||
-           s_scoped_enable_count.load(std::memory_order_acquire) != 0;
+    const bool process_enabled =
+        s_enabled.load(std::memory_order_acquire) ||
+        s_scoped_enable_count.load(std::memory_order_acquire) != 0;
+    return go2cpp::thread_policy::detail::HookAllowed(process_enabled);
 }
 
 IOManager* current_manager() noexcept {
@@ -603,8 +623,20 @@ Result cooperative_io(int fd, Function function, IOEvent event,
         return static_cast<Result>(-1);
     }
     IOManager* manager = cooperative_manager();
+    const bool managed_hook_admission =
+        manager != nullptr ||
+        (hooks_enabled() && s_real_call_depth == 0 &&
+         go2cpp::Scheduler::current_task() != nullptr &&
+         go2cpp::Fiber::Current() != nullptr);
+    // A managed Fiber without an IOManager uses the same descriptor metadata
+    // and native poll fallback when hooks are enabled. A disabled hook keeps
+    // the caller's native blocking choice, but still accounts the M below.
+    std::optional<go2cpp::BlockingRegion> blocking_region;
+    if (manager == nullptr && go2cpp::Scheduler::current_task() != nullptr) {
+        blocking_region.emplace();
+    }
     auto descriptor = descriptor_for(fd);
-    if (!descriptor && manager) {
+    if (!descriptor && managed_hook_admission) {
         descriptor = try_adopt_socket(fd);
     }
     if (!descriptor) {
@@ -675,8 +707,20 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
         return -1;
     }
     IOManager* manager = cooperative_manager();
+    const bool managed_hook_admission =
+        manager != nullptr ||
+        (hooks_enabled() && s_real_call_depth == 0 &&
+         go2cpp::Scheduler::current_task() != nullptr &&
+         go2cpp::Fiber::Current() != nullptr);
+    // A managed Fiber without an IOManager can still use bounded native poll
+    // fallback when hooks are enabled. A disabled hook keeps native semantics
+    // and only publishes M::Blocking.
+    std::optional<go2cpp::BlockingRegion> blocking_region;
+    if (manager == nullptr && go2cpp::Scheduler::current_task() != nullptr) {
+        blocking_region.emplace();
+    }
     auto descriptor = descriptor_for(fd);
-    if (!descriptor && manager) {
+    if (!descriptor && managed_hook_admission) {
         descriptor = try_adopt_socket(fd);
     }
     if (!descriptor) {
@@ -703,10 +747,10 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
         return result;
     }
 
-    // The configured connect timeout also applies to the native fallback.
-    // Without a manager the socket is still runtime-nonblocking after lazy
-    // adoption, so an EINPROGRESS wait must not become unbounded merely
-    // because the Fiber/epoll path is unavailable.
+    // The configured connect timeout also applies to the native poll fallback
+    // after managed lazy adoption. If metadata allocation fails, or hooks are
+    // explicitly disabled, the original libc call remains the documented
+    // native-blocking boundary.
     const auto deadline =
         deadline_from_timeout(connect_wait_timeout(descriptor));
     const auto token = snapshot_descriptor(descriptor).m_token;
@@ -964,7 +1008,7 @@ unsigned int sleep(unsigned int seconds) {
         errno = ENOSYS;
         return seconds;
     }
-    return invoke_real(s_originals.m_sleep, seconds);
+    return invoke_native_blocking(s_originals.m_sleep, seconds);
 }
 
 int usleep(useconds_t microseconds) {
@@ -981,7 +1025,7 @@ int usleep(useconds_t microseconds) {
         errno = ENOSYS;
         return -1;
     }
-    return invoke_real(s_originals.m_usleep, microseconds);
+    return invoke_native_blocking(s_originals.m_usleep, microseconds);
 }
 
 int nanosleep(const timespec* request, timespec* remaining) {
@@ -1009,7 +1053,7 @@ int nanosleep(const timespec* request, timespec* remaining) {
         errno = ENOSYS;
         return -1;
     }
-    return invoke_real(s_originals.m_nanosleep, request, remaining);
+    return invoke_native_blocking(s_originals.m_nanosleep, request, remaining);
 }
 
 int socket(int domain, int type, int protocol) {
@@ -1095,7 +1139,7 @@ ssize_t recv(int fd, void* buffer, size_t length, int flags) {
             errno = ENOTSUP;
             return static_cast<ssize_t>(-1);
         }
-        return invoke_real(s_originals.m_recv, fd, buffer, length, flags);
+        return invoke_native_blocking(s_originals.m_recv, fd, buffer, length, flags);
     }
 #endif
 #ifdef MSG_OOB
@@ -1121,8 +1165,8 @@ ssize_t recvfrom(int fd, void* buffer, size_t length, int flags,
             errno = ENOTSUP;
             return static_cast<ssize_t>(-1);
         }
-        return invoke_real(s_originals.m_recvfrom, fd, buffer, length, flags,
-                           source, source_length);
+        return invoke_native_blocking(s_originals.m_recvfrom, fd, buffer, length, flags,
+                                      source, source_length);
     }
 #endif
 #ifdef MSG_OOB
@@ -1144,7 +1188,7 @@ ssize_t recvmsg(int fd, msghdr* message, int flags) {
             errno = ENOTSUP;
             return static_cast<ssize_t>(-1);
         }
-        return invoke_real(s_originals.m_recvmsg, fd, message, flags);
+        return invoke_native_blocking(s_originals.m_recvmsg, fd, message, flags);
     }
 #endif
 #ifdef MSG_OOB
@@ -1204,8 +1248,8 @@ int close(int fd) {
     // Do not hold the process-wide descriptor lifecycle gate across the real
     // close: SO_LINGER and filesystem-backed descriptors may block here.
     const int result = s_originals.m_close
-                           ? invoke_real(s_originals.m_close, fd)
-                           : static_cast<int>(::syscall(SYS_close, fd));
+                           ? invoke_native_blocking(s_originals.m_close, fd)
+                           : invoke_native_blocking(&raw_close_fallback, fd);
     {
         DescriptorGuard lifecycle;
         finish_close(fd, plan.m_descriptor);

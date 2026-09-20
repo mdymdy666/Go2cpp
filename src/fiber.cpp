@@ -1,5 +1,7 @@
 #include "go2cpp/fiber.hpp"
 
+#include "go2cpp/fiber_local.hpp"
+
 #include "go2cpp/panic_defer.hpp"
 
 #include <boost/context/detail/fcontext.hpp>
@@ -136,6 +138,10 @@ struct Fiber::Impl {
             terminal_state = FiberState::Failed;
         }
         self->m_function = {};
+        // Fiber-local values belong to the logical G, not to the worker M.
+        // Run their destructors after the body/defer stack has unwound and
+        // before handing control back to the caller.
+        fiber_local::detail::Cleanup(self->m_owner);
         self->m_reason.store(SuspendReason::None, std::memory_order_release);
         self->m_state.store(terminal_state, std::memory_order_release);
         self->m_saved_errno = load_errno();

@@ -11,9 +11,9 @@ namespace go2cpp::sync {
  * A scheduler-aware FIFO mutex.
  *
  * A managed G suspends through Scheduler::park instead of blocking its M.
- * An unmanaged caller may acquire an immediately available mutex, but Lock
- * returns false instead of blocking when the mutex is contended. lock() turns
- * that explicit failure into std::logic_error for BasicLockable adapters.
+ * An unmanaged caller waits on a native condition_variable when the mutex is
+ * contended. Both caller classes share one FIFO handoff queue, so a mutex
+ * acquired by a Fiber may be released by a different Fiber or OS thread.
  *
  * As with std::mutex, the object must outlive every user and waiter.
  * Ownership is Go-style: Unlock may be called by a different G or thread.
@@ -36,9 +36,9 @@ public:
     bool TryLock() noexcept;
     void Unlock();
 
-    // BasicLockable-compatible spellings. lock() throws std::logic_error if
-    // the current caller cannot wait (for example, an unmanaged contender or
-    // a G being cancelled during scheduler shutdown).
+    // BasicLockable-compatible spellings. lock() blocks a native caller on
+    // contention and throws std::logic_error only when a managed G cannot
+    // continue waiting (for example during scheduler shutdown).
     void lock();
     bool try_lock() noexcept { return TryLock(); }
     void unlock() { Unlock(); }
@@ -51,10 +51,13 @@ private:
 /**
  * A scheduler-aware condition variable for sync::Mutex.
  *
- * Wait always reacquires the mutex before a normal notification or Context
- * cancellation return. During scheduler shutdown the G is not allowed to
- * park again; if immediate reacquisition is impossible, Wait returns false
- * with the mutex unlocked.
+ * Managed G waiters park their Fiber while ordinary callers block on a native
+ * condition variable. Both kinds can notify one another through the same FIFO
+ * queue. Wait always reacquires the mutex before returning from a normal
+ * notification or Context cancellation. An already-done Context and a zero or
+ * negative WaitFor timeout still perform the unlock/relock boundary. During
+ * scheduler shutdown the G is not allowed to park again; if immediate
+ * reacquisition is impossible, Wait returns false with the mutex unlocked.
  */
 class ConditionVariable final {
 public:
@@ -88,9 +91,11 @@ private:
 };
 
 /**
- * A reusable Go-style wait group.
+ * A reusable Go-style wait group for both managed Gs and ordinary threads.
  *
- * Each transition to zero releases the waiters from that wave. A later Add
+ * Managed waiters park their Fiber; ordinary waiters block on a native
+ * condition variable. Each transition to zero releases the waiters from that
+ * wave. A later Add
  * starts a new wave even if waiters released from the previous wave have not
  * run yet. Counter underflow and signed overflow throw std::logic_error while
  * leaving the counter unchanged.

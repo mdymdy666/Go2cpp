@@ -1,10 +1,13 @@
 #include "go2cpp/fiber.hpp"
+#include "go2cpp/fiber_local.hpp"
 #include "go2cpp/panic_defer.hpp"
 #include "test_support.hpp"
 
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
+#include <chrono>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -29,6 +32,7 @@ void run_fiber_tests() {
     using go2cpp::Fiber;
     using go2cpp::FiberState;
     using go2cpp::SuspendReason;
+    using namespace std::chrono_literals;
 
     GO2CPP_CHECK(!Fiber::Suspend());
     GO2CPP_CHECK(!Fiber::CancellationRequested());
@@ -87,13 +91,19 @@ void run_fiber_tests() {
     long first_fiber_tid = 0;
     long second_fiber_tid = 0;
     int migrated_local = 0;
+    go2cpp::FiberLocalCache<int> migrated_slot;
+    bool migrated_slot_preserved = false;
     Fiber migrating([&] {
         int preserved_local = 7;
+        int& logical_local = migrated_slot.GetOrCreate(11);
+        GO2CPP_CHECK(logical_local == 11);
         migrated_local = 1;
         first_fiber_tid = ::syscall(SYS_gettid);
         GO2CPP_CHECK(Fiber::Suspend(SuspendReason::Yield));
         GO2CPP_CHECK(preserved_local == 7);
         GO2CPP_CHECK(migrated_local == 1);
+        GO2CPP_CHECK(migrated_slot.TryGet() != nullptr);
+        migrated_slot_preserved = *migrated_slot.TryGet() == 11;
         migrated_local = 2;
         second_fiber_tid = ::syscall(SYS_gettid);
     });
@@ -103,26 +113,30 @@ void run_fiber_tests() {
         std::unique_lock<std::mutex> lock(migration_mutex);
         first_suspended = true;
         migration_cv.notify_all();
-        migration_cv.wait(lock, [&] { return allow_first_exit; });
+        GO2CPP_REQUIRE(migration_cv.wait_for(
+            lock, 3s, [&] { return allow_first_exit; }));
     });
     {
         std::unique_lock<std::mutex> lock(migration_mutex);
-        migration_cv.wait(lock, [&] { return first_suspended; });
+        GO2CPP_REQUIRE(migration_cv.wait_for(
+            lock, 3s, [&] { return first_suspended; }));
     }
     GO2CPP_CHECK(migrating.state() == FiberState::Suspended);
     std::thread second([&] {
         second_thread = std::this_thread::get_id();
         GO2CPP_CHECK(migrating.resume());
     });
-    second.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(second, 3s);
     {
         std::lock_guard<std::mutex> lock(migration_mutex);
         allow_first_exit = true;
     }
     migration_cv.notify_all();
-    first.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(first, 3s);
     GO2CPP_CHECK(migrating.state() == FiberState::Completed);
     GO2CPP_CHECK(migrated_local == 2);
+    GO2CPP_CHECK(migrated_slot_preserved);
+    GO2CPP_CHECK(migrated_slot.TryGet() == nullptr);
     GO2CPP_CHECK(first_thread != second_thread);
     GO2CPP_CHECK(first_fiber_tid != second_fiber_tid);
 
@@ -135,17 +149,21 @@ void run_fiber_tests() {
     std::atomic<bool> release{false};
     Fiber exclusively_resumed([&] {
         entered.store(true, std::memory_order_release);
-        while (!release.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+        const auto release_deadline = std::chrono::steady_clock::now() + 5s;
+        while (!release.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < release_deadline) {
+            go2cpp_tests::yield_for_watchdog();
+        }
+        if (!release.load(std::memory_order_acquire)) {
+            go2cpp_tests::watchdog_abort("fiber release", __FILE__, __LINE__);
         }
     });
     std::thread running([&] { GO2CPP_CHECK(exclusively_resumed.resume()); });
-    while (!entered.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
+    GO2CPP_REQUIRE_EVENTUALLY(
+        entered.load(std::memory_order_acquire), 3s);
     GO2CPP_CHECK(!exclusively_resumed.resume());
     release.store(true, std::memory_order_release);
-    running.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(running, 3s);
     GO2CPP_CHECK(exclusively_resumed.state() == FiberState::Completed);
 
     std::atomic<int> abandoned_destroyed{0};
@@ -246,7 +264,7 @@ void run_fiber_tests() {
         panic(PanicValue::text("migrated panic"));
         GO2CPP_CHECK(panicking());
     });
-    bind_first.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(bind_first, 3s);
     GO2CPP_CHECK(!panicking());
 
     std::thread bind_second([&] {
@@ -257,6 +275,62 @@ void run_fiber_tests() {
         GO2CPP_CHECK(value.as_text() != nullptr);
         GO2CPP_CHECK(*value.as_text() == "migrated panic");
     });
-    bind_second.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(bind_second, 3s);
     GO2CPP_CHECK(!panicking());
+
+    // FiberLocalCache follows the logical G across a migration, while an
+    // ordinary thread gets an independent TLS fallback.
+    go2cpp::FiberLocalCache<int> thread_local_value;
+    thread_local_value.GetOrCreate() = 7;
+    std::atomic<int> other_thread_value{0};
+    std::thread fallback_thread([&] {
+        GO2CPP_CHECK(thread_local_value.TryGet() == nullptr);
+        other_thread_value.store(thread_local_value.GetOrCreate(9),
+                                 std::memory_order_release);
+    });
+    GO2CPP_JOIN_WITH_WATCHDOG(fallback_thread, 3s);
+    GO2CPP_CHECK(other_thread_value.load(std::memory_order_acquire) == 9);
+    GO2CPP_CHECK(thread_local_value.TryGet() != nullptr);
+    GO2CPP_CHECK(*thread_local_value.TryGet() == 7);
+    thread_local_value.Reset();
+    GO2CPP_CHECK(thread_local_value.TryGet() == nullptr);
+
+    struct LocalLifetime {
+        explicit LocalLifetime(std::atomic<int>* count) : m_count(count) {}
+        ~LocalLifetime() { m_count->fetch_add(1, std::memory_order_release); }
+        std::atomic<int>* m_count;
+        int value{0};
+    };
+    go2cpp::FiberLocalCache<LocalLifetime> fiber_value;
+    std::atomic<int> local_destroyed{0};
+    go2cpp::Fiber local_cache_fiber([&] {
+        auto& local = fiber_value.GetOrCreate(&local_destroyed);
+        local.value = 42;
+        GO2CPP_CHECK(fiber_value.TryGet() != nullptr);
+        GO2CPP_CHECK(go2cpp::Fiber::Suspend(SuspendReason::Yield));
+        GO2CPP_CHECK(fiber_value.TryGet()->value == 42);
+    });
+    GO2CPP_CHECK(local_cache_fiber.resume());
+    GO2CPP_CHECK(local_destroyed.load(std::memory_order_acquire) == 0);
+    GO2CPP_CHECK(local_cache_fiber.resume());
+    GO2CPP_CHECK(local_cache_fiber.state() == FiberState::Completed);
+    GO2CPP_CHECK(local_destroyed.load(std::memory_order_acquire) == 1);
+
+    // The key object may have a shorter scope than its logical G.  Destroying
+    // the wrapper must not invalidate a value that is still live in a Fiber;
+    // the trampoline remains the sole owner of that value's cleanup.
+    std::atomic<int> short_lived_destroyed{0};
+    std::unique_ptr<go2cpp::FiberLocalCache<LocalLifetime>> short_lived_cache(
+        new go2cpp::FiberLocalCache<LocalLifetime>());
+    auto* const short_lived_key = short_lived_cache.get();
+    Fiber short_lived_fiber([short_lived_key, &short_lived_destroyed] {
+        short_lived_key->GetOrCreate(&short_lived_destroyed);
+        GO2CPP_CHECK(Fiber::Suspend(SuspendReason::Yield));
+    });
+    GO2CPP_CHECK(short_lived_fiber.resume());
+    short_lived_cache.reset();
+    GO2CPP_CHECK(short_lived_destroyed.load(std::memory_order_acquire) == 0);
+    GO2CPP_CHECK(short_lived_fiber.resume());
+    GO2CPP_CHECK(short_lived_fiber.state() == FiberState::Completed);
+    GO2CPP_CHECK(short_lived_destroyed.load(std::memory_order_acquire) == 1);
 }

@@ -1,15 +1,26 @@
 #pragma once
 
 #include "go2cpp/io.hpp"
+#include "go2cpp/thread_policy.hpp"
 
 #include <chrono>
 
 namespace go2cpp::hook {
 
-// Hooking defaults to enabled process-wide, but an operation is made
-// cooperative only in a Fiber owned by an IOManager. Ordinary threads and
-// non-socket blocking I/O generally fall through to libc; adopted sockets use
-// a native poll fallback because their kernel flags remain nonblocking. Tracked
+using ThreadHookMode = ::go2cpp::ThreadHookMode;
+using ScopedThreadHookMode = ::go2cpp::ScopedThreadHookMode;
+inline ThreadHookMode CurrentThreadMode() noexcept {
+    return ::go2cpp::CurrentThreadHookMode();
+}
+inline void SetThreadMode(ThreadHookMode mode) noexcept {
+    ::go2cpp::SetCurrentThreadHookMode(mode);
+}
+
+// Hooking defaults to enabled process-wide. A Fiber owned by an IOManager
+// uses epoll; a managed Fiber without an IOManager uses bounded native poll
+// fallback after lazy socket adoption. Ordinary threads and non-socket
+// blocking I/O generally fall through to libc; adopted sockets use a native
+// poll fallback because their kernel flags remain nonblocking. Tracked
 // descriptors and unknown variadic fcntl/ioctl commands follow the explicit
 // metadata/ENOTSUP contract below rather than an unconditional libc promise.
 // Disabling the hook stops new Fiber/epoll admission; metadata already

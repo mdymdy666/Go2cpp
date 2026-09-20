@@ -1,9 +1,21 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#if defined(__has_include)
+#if __has_include(<valgrind/valgrind.h>)
+#include <valgrind/valgrind.h>
+#define GO2CPP_TEST_HAS_VALGRIND 1
+#endif
+#endif
 
 namespace go2cpp_tests {
 
@@ -26,8 +38,103 @@ inline void announce(const std::string& name) {
     std::cout << "[test] " << name << '\n';
 }
 
+// Keep cooperative test loops schedulable under heavy instrumentation.
+inline void yield_for_watchdog() noexcept {
+    std::this_thread::yield();
+#if defined(GO2CPP_TEST_HAS_VALGRIND)
+    if (RUNNING_ON_VALGRIND) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+#endif
+}
+
+inline void pause_for_watchdog() noexcept {
+#if defined(GO2CPP_TEST_HAS_VALGRIND)
+    if (RUNNING_ON_VALGRIND) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+#endif
+}
+
+
+[[noreturn]] inline void watchdog_abort(const char* expression,
+                                        const char* file,
+                                        int line) {
+    std::fprintf(stderr, "[watchdog] timed out: %s (%s:%d)\n",
+                 expression ? expression : "operation", file, line);
+    std::fflush(stderr);
+    std::abort();
+}
+
+inline void require(bool condition, const char* expression,
+                    const char* file, int line) {
+    if (!condition) {
+        watchdog_abort(expression, file, line);
+    }
+}
+
+template <typename Predicate>
+bool RequireEventually(Predicate&& predicate,
+                       std::chrono::steady_clock::duration timeout,
+                       const char* expression,
+                       const char* file, int line) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            watchdog_abort(expression, file, line);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+template <typename Rep, typename Period>
+void JoinWithWatchdog(std::thread& thread,
+                      std::chrono::duration<Rep, Period> timeout,
+                      const char* expression,
+                      const char* file, int line) {
+    if (!thread.joinable()) {
+        return;
+    }
+
+    struct JoinState {
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool joined{false};
+    };
+    const auto state = std::make_shared<JoinState>();
+    std::thread watchdog([state, timeout, expression, file, line] {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        if (!state->condition.wait_for(lock, timeout,
+                                      [&] { return state->joined; })) {
+            watchdog_abort(expression, file, line);
+        }
+    });
+
+    thread.join();
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->joined = true;
+    }
+    state->condition.notify_one();
+    watchdog.join();
+}
+
 }  // namespace go2cpp_tests
 
 #define GO2CPP_CHECK(expression) \
     ::go2cpp_tests::check(static_cast<bool>(expression), #expression, __FILE__, \
                           __LINE__)
+
+
+#define GO2CPP_REQUIRE(expression) \
+    ::go2cpp_tests::require(static_cast<bool>(expression), #expression, __FILE__, \
+                            __LINE__)
+
+#define GO2CPP_REQUIRE_EVENTUALLY(expression, timeout) \
+    ::go2cpp_tests::RequireEventually( \
+        [&] { return static_cast<bool>(expression); }, (timeout), #expression, \
+        __FILE__, __LINE__)
+
+#define GO2CPP_JOIN_WITH_WATCHDOG(thread, timeout) \
+    ::go2cpp_tests::JoinWithWatchdog((thread), (timeout), #thread, __FILE__, __LINE__)

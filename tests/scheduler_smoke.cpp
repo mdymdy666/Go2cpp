@@ -1,4 +1,5 @@
 #include "go2cpp/scheduler.hpp"
+#include "test_support.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -125,8 +126,15 @@ void test_wake_before_park_handoff() {
     std::shared_ptr<go2cpp::Task> task;
     task = std::make_shared<go2cpp::Task>([&] {
         entered.store(true, std::memory_order_release);
-        while (!release.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+        const auto release_deadline =
+            std::chrono::steady_clock::now() + 5s;
+        while (!release.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < release_deadline) {
+            go2cpp_tests::yield_for_watchdog();
+        }
+        if (!release.load(std::memory_order_acquire)) {
+            go2cpp_tests::watchdog_abort("smoke task release", __FILE__,
+                                         __LINE__);
         }
         if (!attempted.exchange(true, std::memory_order_acq_rel)) {
             park_return.store(scheduler.park(task), std::memory_order_release);
@@ -165,8 +173,15 @@ void test_wake_token_cleared_by_yield() {
     task = std::make_shared<go2cpp::Task>([&] {
         runs.fetch_add(1, std::memory_order_acq_rel);
         entered.store(true, std::memory_order_release);
-        while (!release_yield.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+        const auto release_deadline =
+            std::chrono::steady_clock::now() + 5s;
+        while (!release_yield.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < release_deadline) {
+            go2cpp_tests::yield_for_watchdog();
+        }
+        if (!release_yield.load(std::memory_order_acquire)) {
+            go2cpp_tests::watchdog_abort("smoke task release", __FILE__,
+                                         __LINE__);
         }
         SMOKE_CHECK(scheduler.yield(task));
         runs.fetch_add(1, std::memory_order_acq_rel);
@@ -222,7 +237,7 @@ void test_enqueue_rejected_while_yielding_callable_is_active() {
     while (task->state() != go2cpp::GState::kDead &&
            std::chrono::steady_clock::now() < duplicate_deadline) {
         (void)scheduler.enqueue(task);
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     SMOKE_CHECK(wait_until([&] {
         return runs.load(std::memory_order_acquire) == 3 &&
@@ -299,8 +314,15 @@ void test_exception_isolation_and_shutdown_cancel() {
 
     std::atomic<bool> release{false};
     auto blocker = scheduler.spawn([&] {
-        while (!release.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+        const auto release_deadline =
+            std::chrono::steady_clock::now() + 5s;
+        while (!release.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < release_deadline) {
+            go2cpp_tests::yield_for_watchdog();
+        }
+        if (!release.load(std::memory_order_acquire)) {
+            go2cpp_tests::watchdog_abort("smoke blocker release", __FILE__,
+                                         __LINE__);
         }
     });
     SMOKE_CHECK(wait_until([&] { return blocker->state() == go2cpp::GState::kRunning; }));
@@ -313,7 +335,7 @@ void test_exception_isolation_and_shutdown_cancel() {
         release.store(true, std::memory_order_release);
         scheduler.shutdown();
     });
-    stopper.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(stopper, 5s);
     SMOKE_CHECK(blocker->state() == go2cpp::GState::kDead ||
                 blocker->state() == go2cpp::GState::kCancelled);
     for (const auto& task : pending) {

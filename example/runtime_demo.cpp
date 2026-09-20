@@ -34,7 +34,9 @@ int main() {
     scheduler.spawn(
         [&] { channel->SendOrPanic(42, cancel_context_pair.first); });
 
-    while (received.load(std::memory_order_acquire) == 0) {
+    const auto receive_deadline = std::chrono::steady_clock::now() + 2s;
+    while (received.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < receive_deadline) {
         if (context_pair.first->Done().WaitFor(10ms)) {
             break;
         }

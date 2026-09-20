@@ -6,7 +6,7 @@
 |---|---|---|
 | G | `scheduler::Task` | Strongly retained by the scheduler registry while non-terminal; one `m_execution_claim`; one queue claim `m_queued`; first admitting scheduler owns it permanently |
 | M | private `Machine` plus `std::thread` | One worker thread, one preferred P, dynamically admitted/retired under the scheduler mutex |
-| P | private `Processor` | Bounded local queue and active-M count; at most one live M is assigned while the effective M bound is clamped to P |
+| P | private `Processor` | Bounded local queue and active-M count; M records may be overcommitted only for declared BlockingRegion replacement workers |
 
 The transition table is:
 
@@ -25,10 +25,11 @@ M: idle -> running -> idle -> parked -> idle
 P: idle <-> running; idle -> dead during shutdown
 ```
 
-`M::blocking` and `M::stopping`/`P::stopping` are reserved enum states; the
-current cooperative backend does not publish `blocking` or `P::stopping` while
-it has no blocking-region handoff. A retiring or shutdown worker publishes
-`M::stopping` before `M::dead`.
+A declared BlockingRegion publishes M::blocking around a known native
+blocking call and asks the scheduler to admit a replacement M when queued work
+exists. P remains a scheduling token owned by the blocked M; the replacement
+M may share that P, so this is bounded overcommit rather than an exact Go P
+handoff. A retiring or shutdown worker publishes M::stopping before M::dead.
 
 Queue insertion, removal, runnable accounting, shutdown admission and the
 `runnable -> running` claim are serialized by the scheduler admission mutex.
@@ -68,19 +69,25 @@ advanced API and must still return cooperatively.
 
 ## Dynamic M policy
 
-`min_workers` is the retained floor. When queued work plus busy workers exceeds
-the active count, the scheduler adds M records up to the effective
-`max_workers`; the effective maximum is `min(requested_max_workers, P)`. An idle
-M waits `idle_worker_timeout`, reserves retirement under the admission mutex,
-and decrements both global and P-local active counts exactly once. Dead records
-are joined outside scheduler locks and removed from snapshots. Task class IDs
-are a bounded scan preference with hit/miss counters; stealing remains
-available, so class locality cannot starve other work.
+min_workers is the retained floor. Ordinary queued work grows the pool only
+up to the P-bounded ceiling. When allow_worker_oversubscription is enabled,
+each active BlockingRegion contributes one replacement-M slot, up to the
+configured max_workers. Setting it false restores a strict P ceiling. Idle M
+records wait idle_worker_timeout, reserve retirement under the admission
+mutex, and decrement both global and P-local active counts exactly once. Dead
+records are joined outside scheduler locks and removed from snapshots. Task
+class IDs are a bounded scan preference with hit/miss counters; stealing
+remains available, so class locality cannot starve other work.
 
-This is intentionally not a claim of Go's `sysmon` or blocking-region
-behavior. A native syscall that is not intercepted continues to occupy its M.
-Adding a blocking-region adapter requires a new public registration contract,
-P release/reacquisition proof, and separate stress tests before M may exceed P.
+The replacement slot is opt-in and scoped. BlockingRegion is non-movable
+and records the entering M for cleanup; it still must not span a Fiber
+yield/park or migration. The scheduler cannot detect an arbitrary native syscall
+or force-preempt a C++ continuation. The interposed
+socket and sleep fallbacks use the same blocking accounting automatically;
+unhooked native calls need an explicit BlockingRegion and must not span a
+Fiber yield or park. External ScopedThreadParticipation only records
+per-thread eligibility and Scheduler association; it does not attach an M or
+run a queue.
 
 ## Shutdown and join
 
@@ -103,6 +110,6 @@ shutdown wait, which is preferable to skipping C++ RAII.
 `processors()` and `machines()` expose snapshots only; they do not grant queue
 ownership. Tests cover P=1 and multi-P execution, duplicate enqueue/wake races,
 cross-scheduler rejection, parked cancellation, raw Fiber park cancellation,
-cancelled queue capture release, dynamic growth/shrink/regrow, P caps,
+cancelled queue capture release, dynamic growth/shrink/regrow, strict P caps, BlockingRegion replacement-M growth,
 task-class counters, worker shutdown, task destructor re-entry and
 watchdog-bounded stress.

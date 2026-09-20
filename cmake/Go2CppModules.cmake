@@ -16,10 +16,13 @@ add_library(go2cpp_channel ${CMAKE_CURRENT_SOURCE_DIR}/src/channel.cpp)
 add_library(go2cpp_scheduler
     ${CMAKE_CURRENT_SOURCE_DIR}/src/scheduler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/parking_condition.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/timer.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/timer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/thread_policy.cpp)
 add_library(go2cpp_panic_defer
     ${CMAKE_CURRENT_SOURCE_DIR}/src/panic_defer.cpp)
-add_library(go2cpp_fiber ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber.cpp)
+add_library(go2cpp_fiber
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber_local.cpp)
 add_library(go2cpp_sync ${CMAKE_CURRENT_SOURCE_DIR}/src/sync.cpp)
 add_library(go2cpp_io ${CMAKE_CURRENT_SOURCE_DIR}/src/io.cpp)
 

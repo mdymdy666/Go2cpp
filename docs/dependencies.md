@@ -44,7 +44,7 @@ runtime, cgo, bundled GC or GNU GMP mathematics library is linked.
 The hook is a shared target by default so its TLS and descriptor registry have
 one process instance. Static consumers must configure
 `-DGO2CPP_BUILD_HOOK=OFF` and use `IOManager`/explicit APIs; the C hook symbols
-are not provided in that mode.
+are not provided in that mode. FiberLocalCache is a small clean-room logical-Fiber value registry; it has no Folly dependency and no Folly source is copied into this repository. It deliberately does not pool stacks or worker objects, so Boost.Context and the scheduler remain replaceable boundaries.
 
 ## Local Sylar reference
 

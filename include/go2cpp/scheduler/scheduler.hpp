@@ -1,6 +1,7 @@
 #pragma once
 
 #include "go2cpp/core/parking_condition.hpp"
+#include "go2cpp/thread_policy.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -86,12 +87,17 @@ struct SchedulerConfig {
     std::size_t max_workers = 0;
     std::chrono::milliseconds idle_wait{10};
     std::size_t local_queue_limit = 256;
-    // Zero selects one initial worker. This backend clamps the effective
-    // max_workers to P; a blocking-region M>P handoff is not yet provided.
+    // Zero selects one initial worker. With max_workers=0 the normalized
+    // ceiling is 2*P when overcommit is enabled, while ordinary runnable
+    // demand remains P-bounded; blocking regions may consume the extra slots.
     std::size_t min_workers = 0;
     std::chrono::milliseconds idle_worker_timeout{250};
     std::size_t fiber_stack_size = 0;
     std::size_t task_affinity_budget = 4;
+    // Permit more M workers than P when a caller declares a native blocking
+    // region.  The default keeps the worker pool elastic; set false when a
+    // deployment requires a strict one-M-per-P ceiling.
+    bool allow_worker_oversubscription = true;
 };
 
 using TaskClassId = std::uint64_t;
@@ -218,6 +224,31 @@ private:
 
 class Scheduler {
 public:
+    // Marks a short native call that may block its current M.  The region
+    // publishes M::Blocking and asks the pool to grow for queued Gs; it does
+    // not make arbitrary blocking code preemptible.  It must not span a
+    // Fiber yield/park or a call that migrates the current G.
+    class BlockingRegion final {
+    public:
+        explicit BlockingRegion(Scheduler* scheduler = nullptr) noexcept;
+        ~BlockingRegion() noexcept;
+
+        BlockingRegion(const BlockingRegion&) = delete;
+        BlockingRegion& operator=(const BlockingRegion&) = delete;
+        // A region is bound to the M that entered it. Moving it could move
+        // destruction to another Fiber/thread and leave the original M
+        // marked Blocking, so the scope is intentionally non-movable.
+        BlockingRegion(BlockingRegion&&) = delete;
+        BlockingRegion& operator=(BlockingRegion&&) = delete;
+
+        bool active() const noexcept { return m_active; }
+
+    private:
+        Scheduler* m_scheduler{nullptr};
+        bool m_active{false};
+        MId m_machine_id{0};
+    };
+
     explicit Scheduler(SchedulerConfig config = {});
     explicit Scheduler(std::size_t processor_count);
     ~Scheduler();
@@ -285,10 +316,17 @@ public:
     static Scheduler* current_scheduler() noexcept;
     static MId current_machine_id() noexcept;
     static PId current_processor_id() noexcept;
+    // Explicit hooks for interposers and embedders that call a native blocking
+    // API from a managed G. BlockingRegion is preferred for RAII use.
+    static bool enter_blocking() noexcept;
+    static void leave_blocking() noexcept;
     static MId CurrentMachineId() noexcept { return current_machine_id(); }
     static PId CurrentProcessorId() noexcept { return current_processor_id(); }
 
 private:
+    static void leave_blocking_for(Scheduler* scheduler,
+                                   MId machine_id) noexcept;
+
     // The opaque shared slot keeps a dynamic worker stable while machine
     // records are appended or retired by the scheduler.
     void worker_loop(std::shared_ptr<void> machine);
@@ -313,6 +351,7 @@ using MId = scheduler::MId;
 using PId = scheduler::PId;
 using TaskClassId = scheduler::TaskClassId;
 using TaskOptions = scheduler::TaskOptions;
+using BlockingRegion = scheduler::Scheduler::BlockingRegion;
 using Goroutine = scheduler::Task;
 using Machine = scheduler::MachineSnapshot;
 using Processor = scheduler::ProcessorSnapshot;

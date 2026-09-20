@@ -36,15 +36,18 @@ void run_context_tests() {
     }
 
     std::atomic<bool> done_waiter{false};
+    std::atomic<bool> done_wait_result{false};
     std::thread waiter([&] {
-        child->Done().Wait();
+        done_wait_result.store(child->Done().WaitFor(2s),
+                               std::memory_order_release);
         done_waiter.store(true, std::memory_order_release);
     });
     std::this_thread::sleep_for(2ms);
     child_pair.second();
     child_pair.second();
-    waiter.join();
+    GO2CPP_JOIN_WITH_WATCHDOG(waiter, 3s);
     GO2CPP_CHECK(done_waiter.load(std::memory_order_acquire));
+    GO2CPP_CHECK(done_wait_result.load(std::memory_order_acquire));
     GO2CPP_CHECK(child->IsDone());
     GO2CPP_CHECK(Is(child->Err(), CanceledError()));
     GO2CPP_CHECK(Is(child->Cause(), CanceledError()));
@@ -111,7 +114,7 @@ void run_context_tests() {
         cancellers.emplace_back([cancel = race_pair.second] { cancel(); });
     }
     for (auto& thread : cancellers) {
-        thread.join();
+        GO2CPP_JOIN_WITH_WATCHDOG(thread, 3s);
     }
     GO2CPP_CHECK(race_pair.first->Done().IsDone());
 
@@ -142,7 +145,7 @@ void run_context_tests() {
     const auto managed_deadline = std::chrono::steady_clock::now() + 1s;
     while (!managed_waited.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < managed_deadline) {
-        std::this_thread::yield();
+        go2cpp_tests::yield_for_watchdog();
     }
     auto managed_canceller = managed.spawn([&] { managed_cancel.second(); });
     GO2CPP_CHECK(managed_waiter->wait_for(2s));

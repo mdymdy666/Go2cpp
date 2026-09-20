@@ -38,17 +38,41 @@ void TestUnmanagedBoundaryAndCounterErrors() {
     GO2CPP_CHECK(mutex.LockFor(0ms));
     mutex.Unlock();
     GO2CPP_CHECK(mutex.Lock());
-    GO2CPP_CHECK(!mutex.Lock());
-    GO2CPP_CHECK(!mutex.TryLock());
 
-    bool lock_threw = false;
-    try {
-        mutex.lock();
-    } catch (const std::logic_error&) {
-        lock_threw = true;
-    }
-    GO2CPP_CHECK(lock_threw);
+    // An unmanaged contender now blocks on the same FIFO waiter path as a G.
+    std::atomic<bool> native_entered{false};
+    std::atomic<bool> native_acquired{false};
+    std::thread native_waiter([&] {
+        native_entered.store(true, std::memory_order_release);
+        native_acquired.store(mutex.Lock(), std::memory_order_release);
+        if (native_acquired.load(std::memory_order_acquire)) {
+            mutex.Unlock();
+        }
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return native_entered.load(std::memory_order_acquire); }));
+    GO2CPP_CHECK(!native_acquired.load(std::memory_order_acquire));
+    GO2CPP_CHECK(!mutex.TryLock());
     mutex.Unlock();
+    GO2CPP_JOIN_WITH_WATCHDOG(native_waiter, 3s);
+    GO2CPP_CHECK(native_acquired.load(std::memory_order_acquire));
+
+    // BasicLockable spelling follows the same blocking native path.
+    GO2CPP_CHECK(mutex.Lock());
+    std::atomic<bool> adapter_entered{false};
+    std::atomic<bool> adapter_acquired{false};
+    std::thread adapter_waiter([&] {
+        adapter_entered.store(true, std::memory_order_release);
+        mutex.lock();
+        adapter_acquired.store(true, std::memory_order_release);
+        mutex.unlock();
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return adapter_entered.load(std::memory_order_acquire); }));
+    GO2CPP_CHECK(!adapter_acquired.load(std::memory_order_acquire));
+    mutex.Unlock();
+    GO2CPP_JOIN_WITH_WATCHDOG(adapter_waiter, 3s);
+    GO2CPP_CHECK(adapter_acquired.load(std::memory_order_acquire));
     GO2CPP_CHECK(mutex.TryLock());
     mutex.Unlock();
 
@@ -64,6 +88,293 @@ void TestUnmanagedBoundaryAndCounterErrors() {
     group.Add(1);
     group.Done();
     GO2CPP_CHECK(group.Wait());
+}
+
+
+void TestMixedThreadAndFiberSynchronization() {
+    go2cpp::Scheduler scheduler(SchedulerConfig(1));
+    scheduler.start();
+
+    // A native owner can hand the logical mutex to a Fiber. The mutex does not
+    // encode OS-thread ownership, so migration never turns this into a
+    // pthread-owner violation.
+    go2cpp::sync::Mutex mutex;
+    GO2CPP_CHECK(mutex.Lock());
+    std::atomic<bool> fiber_waiting{false};
+    std::atomic<bool> fiber_acquired{false};
+    auto fiber_waiter = scheduler.spawn([&] {
+        fiber_waiting.store(true, std::memory_order_release);
+        const bool acquired = mutex.Lock();
+        fiber_acquired.store(acquired, std::memory_order_release);
+        if (acquired) {
+            mutex.Unlock();
+        }
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return fiber_waiting.load(std::memory_order_acquire); }));
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return fiber_waiter->state() == go2cpp::GState::kWaiting; }));
+    mutex.Unlock();
+    GO2CPP_CHECK(fiber_waiter->wait_for(2s));
+    GO2CPP_CHECK(fiber_acquired.load(std::memory_order_acquire));
+
+    // The reverse direction blocks a native thread behind a Fiber owner.
+    std::atomic<bool> fiber_holds{false};
+    std::atomic<bool> release_fiber{false};
+    auto fiber_owner = scheduler.spawn([&] {
+        GO2CPP_CHECK(mutex.Lock());
+        fiber_holds.store(true, std::memory_order_release);
+        const auto release_deadline = std::chrono::steady_clock::now() + 5s;
+        while (!release_fiber.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < release_deadline) {
+            (void)scheduler.yield_current();
+            go2cpp_tests::pause_for_watchdog();
+        }
+        if (!release_fiber.load(std::memory_order_acquire)) {
+            go2cpp_tests::watchdog_abort("fiber owner release", __FILE__,
+                                         __LINE__);
+        }
+        mutex.Unlock();
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return fiber_holds.load(std::memory_order_acquire); }));
+    std::atomic<bool> native_entered{false};
+    std::atomic<bool> native_acquired{false};
+    std::thread native_waiter([&] {
+        native_entered.store(true, std::memory_order_release);
+        const bool acquired = mutex.Lock();
+        native_acquired.store(acquired, std::memory_order_release);
+        if (acquired) {
+            mutex.Unlock();
+        }
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return native_entered.load(std::memory_order_acquire); }));
+    GO2CPP_CHECK(!native_acquired.load(std::memory_order_acquire));
+    release_fiber.store(true, std::memory_order_release);
+    GO2CPP_CHECK(fiber_owner->wait_for(2s));
+    GO2CPP_JOIN_WITH_WATCHDOG(native_waiter, 3s);
+    GO2CPP_CHECK(native_acquired.load(std::memory_order_acquire));
+
+    // Native waits honor the same Context timeout/cancellation callbacks.
+    GO2CPP_CHECK(mutex.Lock());
+    std::atomic<bool> timeout_entered{false};
+    std::atomic<bool> timeout_result{true};
+    std::thread timeout_waiter([&] {
+        timeout_entered.store(true, std::memory_order_release);
+        timeout_result.store(mutex.LockFor(20ms), std::memory_order_release);
+        if (timeout_result.load(std::memory_order_acquire)) {
+            mutex.Unlock();
+        }
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return timeout_entered.load(std::memory_order_acquire); }));
+    GO2CPP_JOIN_WITH_WATCHDOG(timeout_waiter, 3s);
+    GO2CPP_CHECK(!timeout_result.load(std::memory_order_acquire));
+    mutex.Unlock();
+
+    GO2CPP_CHECK(mutex.Lock());
+    auto native_cancel = go2cpp::WithCancel(go2cpp::Background());
+    std::atomic<bool> cancel_entered{false};
+    std::atomic<bool> cancel_result{true};
+    std::thread cancel_waiter([&] {
+        cancel_entered.store(true, std::memory_order_release);
+        cancel_result.store(mutex.Lock(native_cancel.first),
+                            std::memory_order_release);
+        if (cancel_result.load(std::memory_order_acquire)) {
+            mutex.Unlock();
+        }
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return cancel_entered.load(std::memory_order_acquire); }));
+    native_cancel.second();
+    GO2CPP_JOIN_WITH_WATCHDOG(cancel_waiter, 3s);
+    GO2CPP_CHECK(!cancel_result.load(std::memory_order_acquire));
+    mutex.Unlock();
+
+    // A native CV waiter can be notified by a managed G.
+    go2cpp::sync::ConditionVariable condition;
+    std::atomic<bool> native_ready{false};
+    std::atomic<bool> native_cv_started{false};
+    std::atomic<bool> native_cv_result{false};
+    std::thread native_cv_waiter([&] {
+        GO2CPP_CHECK(mutex.Lock());
+        native_cv_started.store(true, std::memory_order_release);
+        const auto ready_deadline = std::chrono::steady_clock::now() + 3s;
+        while (!native_ready.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < ready_deadline) {
+            const auto remaining = ready_deadline -
+                                   std::chrono::steady_clock::now();
+            const std::chrono::steady_clock::duration max_wait = 2s;
+            const auto wait_duration =
+                remaining < max_wait ? remaining : max_wait;
+            if (!condition.WaitFor(mutex, wait_duration)) {
+                break;
+            }
+        }
+        if (!native_ready.load(std::memory_order_acquire)) {
+            mutex.Unlock();
+            go2cpp_tests::watchdog_abort("native condition notification",
+                                         __FILE__, __LINE__);
+        }
+        native_cv_result.store(true, std::memory_order_release);
+        mutex.Unlock();
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return native_cv_started.load(std::memory_order_acquire); }));
+    auto managed_notifier = scheduler.spawn([&] {
+        GO2CPP_CHECK(mutex.Lock());
+        native_ready.store(true, std::memory_order_release);
+        condition.NotifyOne();
+        mutex.Unlock();
+    });
+    GO2CPP_CHECK(managed_notifier->wait_for(2s));
+    GO2CPP_JOIN_WITH_WATCHDOG(native_cv_waiter, 3s);
+    GO2CPP_CHECK(native_cv_result.load(std::memory_order_acquire));
+
+    // A managed CV waiter can be notified by an ordinary thread.
+    native_ready.store(false, std::memory_order_release);
+    std::atomic<bool> managed_cv_started{false};
+    std::atomic<bool> managed_cv_result{false};
+    auto managed_cv_waiter = scheduler.spawn([&] {
+        GO2CPP_CHECK(mutex.Lock());
+        managed_cv_started.store(true, std::memory_order_release);
+        const auto ready_deadline = std::chrono::steady_clock::now() + 3s;
+        while (!native_ready.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < ready_deadline) {
+            const auto remaining = ready_deadline -
+                                   std::chrono::steady_clock::now();
+            const std::chrono::steady_clock::duration max_wait = 2s;
+            const auto wait_duration =
+                remaining < max_wait ? remaining : max_wait;
+            if (!condition.WaitFor(mutex, wait_duration)) {
+                break;
+            }
+        }
+        if (!native_ready.load(std::memory_order_acquire)) {
+            mutex.Unlock();
+            go2cpp_tests::watchdog_abort("managed condition notification",
+                                         __FILE__, __LINE__);
+        }
+        managed_cv_result.store(true, std::memory_order_release);
+        mutex.Unlock();
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return managed_cv_started.load(std::memory_order_acquire); }));
+    std::thread native_notifier([&] {
+        GO2CPP_CHECK(mutex.Lock());
+        native_ready.store(true, std::memory_order_release);
+        condition.NotifyOne();
+        mutex.Unlock();
+    });
+    GO2CPP_JOIN_WITH_WATCHDOG(native_notifier, 3s);
+    GO2CPP_CHECK(managed_cv_waiter->wait_for(2s));
+    GO2CPP_CHECK(managed_cv_result.load(std::memory_order_acquire));
+
+    // WaitGroup uses the same dual-mode waiter: native Wait/Fiber Done and
+    // Fiber Wait/native Done are both valid.
+    go2cpp::sync::WaitGroup group;
+    group.Add(1);
+    std::atomic<bool> native_group_started{false};
+    std::atomic<bool> native_group_result{false};
+    std::thread native_group_waiter([&] {
+        native_group_started.store(true, std::memory_order_release);
+        native_group_result.store(group.WaitFor(2s), std::memory_order_release);
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return native_group_started.load(std::memory_order_acquire); }));
+    auto managed_done = scheduler.spawn([&] { group.Done(); });
+    GO2CPP_CHECK(managed_done->wait_for(2s));
+    GO2CPP_JOIN_WITH_WATCHDOG(native_group_waiter, 3s);
+    GO2CPP_CHECK(native_group_result.load(std::memory_order_acquire));
+
+    group.Add(1);
+    std::atomic<bool> managed_group_result{false};
+    auto managed_group_waiter = scheduler.spawn([&] {
+        managed_group_result.store(group.WaitFor(2s),
+                                   std::memory_order_release);
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return managed_group_waiter->state() == go2cpp::GState::kWaiting; }));
+    std::thread native_done([&] { group.Done(); });
+    GO2CPP_JOIN_WITH_WATCHDOG(native_done, 3s);
+    GO2CPP_CHECK(managed_group_waiter->wait_for(2s));
+    GO2CPP_CHECK(managed_group_result.load(std::memory_order_acquire));
+
+    scheduler.shutdown();
+}
+
+void TestImmediateConditionAndWaitGroupAbort() {
+    go2cpp::sync::Mutex mutex;
+    go2cpp::sync::ConditionVariable condition;
+
+    // An already-cancelled native context still follows the CV unlock/relock
+    // contract. The caller owns the mutex after the false result.
+    GO2CPP_CHECK(mutex.Lock());
+    auto cancelled = go2cpp::WithCancel(go2cpp::Background());
+    cancelled.second();
+    GO2CPP_CHECK(!condition.Wait(mutex, cancelled.first));
+    const bool native_probe_after_cancel = mutex.TryLock();
+    GO2CPP_CHECK(!native_probe_after_cancel);
+    // Either the expected relock or a regression that returned unlocked leaves
+    // exactly one logical lock to release here.
+    mutex.Unlock();
+
+    // Zero and negative durations create an already-expired context
+    // synchronously; they must not strand a native caller or leave an
+    // unexpected lock state.
+    GO2CPP_CHECK(mutex.Lock());
+    GO2CPP_CHECK(!condition.WaitFor(mutex, 0ms));
+    const bool native_probe_after_timeout = mutex.TryLock();
+    GO2CPP_CHECK(!native_probe_after_timeout);
+    mutex.Unlock();
+
+    go2cpp::sync::WaitGroup group;
+    group.Add(1);
+    GO2CPP_CHECK(!group.WaitFor(0ms));
+    auto group_cancel = go2cpp::WithCancel(go2cpp::Background());
+    group_cancel.second();
+    GO2CPP_CHECK(!group.Wait(group_cancel.first));
+    group.Done();
+    GO2CPP_CHECK(group.Wait());
+
+    // Exercise the same immediate paths from a managed G. The task remains
+    // runnable because the timeout/cancellation is observed before publication.
+    go2cpp::Scheduler scheduler(SchedulerConfig(1));
+    scheduler.start();
+    std::atomic<bool> managed_cv_done{false};
+    std::atomic<bool> managed_cv_relocked{false};
+    auto managed_cv = scheduler.spawn([&] {
+        GO2CPP_CHECK(mutex.Lock());
+        const bool result = condition.WaitFor(mutex, 0ms);
+        const bool probe = mutex.TryLock();
+        if (probe) {
+            mutex.Unlock();
+        } else {
+            managed_cv_relocked.store(true, std::memory_order_release);
+            mutex.Unlock();
+        }
+        GO2CPP_CHECK(!result);
+        managed_cv_done.store(true, std::memory_order_release);
+    });
+    GO2CPP_CHECK(managed_cv->wait_for(2s));
+    GO2CPP_CHECK(managed_cv_done.load(std::memory_order_acquire));
+    GO2CPP_CHECK(managed_cv_relocked.load(std::memory_order_acquire));
+
+    group.Add(1);
+    std::atomic<bool> managed_group_done{false};
+    std::atomic<bool> managed_group_result{true};
+    auto managed_group = scheduler.spawn([&] {
+        managed_group_result.store(group.WaitFor(0ms),
+                                    std::memory_order_release);
+        managed_group_done.store(true, std::memory_order_release);
+    });
+    GO2CPP_CHECK(managed_group->wait_for(2s));
+    GO2CPP_CHECK(managed_group_done.load(std::memory_order_acquire));
+    GO2CPP_CHECK(!managed_group_result.load(std::memory_order_acquire));
+    group.Done();
+    GO2CPP_CHECK(group.Wait());
+    scheduler.shutdown();
 }
 
 void TestFifoAndSingleProcessorProgress() {
@@ -113,7 +424,7 @@ void TestFifoAndSingleProcessorProgress() {
     std::atomic<bool> wait_finished{false};
     scheduler.spawn([&] {
         wait_started.store(true, std::memory_order_release);
-        wait_finished.store(group.Wait(), std::memory_order_release);
+        wait_finished.store(group.WaitFor(3s), std::memory_order_release);
     });
     scheduler.spawn([&] { group.Done(); });
     GO2CPP_CHECK(WaitUntil([&] {
@@ -125,7 +436,7 @@ void TestFifoAndSingleProcessorProgress() {
     group.Add(1);
     std::atomic<bool> second_wave{false};
     scheduler.spawn([&] {
-        second_wave.store(group.Wait(), std::memory_order_release);
+        second_wave.store(group.WaitFor(3s), std::memory_order_release);
     });
     GO2CPP_CHECK(WaitUntil([&] {
         return scheduler.runnable_count() == 0;
@@ -219,9 +530,8 @@ void TestNotifyBeforeParkRace() {
             state->completed.fetch_add(1, std::memory_order_release);
         });
         scheduler.spawn([state] {
-            while (!state->waiter_entered.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
+            GO2CPP_REQUIRE_EVENTUALLY(
+                state->waiter_entered.load(std::memory_order_acquire), 3s);
             GO2CPP_CHECK(state->mutex.Lock());
             state->condition.NotifyOne();
             state->mutex.Unlock();
@@ -244,7 +554,7 @@ void TestSpuriousWakeDoesNotCancelWait() {
     scheduler.spawn([&] {
         // An earlier, unrelated wake permit must not cancel this new wait.
         (void)scheduler.wake(go2cpp::Scheduler::current_task());
-        result.store(group.Wait(), std::memory_order_release);
+        result.store(group.WaitFor(3s), std::memory_order_release);
     });
     scheduler.spawn([&] { group.Done(); });
     scheduler.start();
@@ -260,7 +570,7 @@ void TestWaitGroupWaveReleasedBeforeReuse() {
     scheduler.start();
     std::atomic<bool> first_result{false};
     auto first = scheduler.spawn([&] {
-        first_result.store(group.Wait(), std::memory_order_release);
+        first_result.store(group.WaitFor(3s), std::memory_order_release);
     });
     GO2CPP_CHECK(WaitUntil(
         [&] { return first->state() == go2cpp::GState::kWaiting; }));
@@ -274,7 +584,7 @@ void TestWaitGroupWaveReleasedBeforeReuse() {
         const auto watchdog = std::chrono::steady_clock::now() + 2s;
         while (!release_blocker.load(std::memory_order_acquire) &&
                std::chrono::steady_clock::now() < watchdog) {
-            std::this_thread::yield();
+            go2cpp_tests::yield_for_watchdog();
         }
     });
     GO2CPP_CHECK(WaitUntil(
@@ -289,7 +599,7 @@ void TestWaitGroupWaveReleasedBeforeReuse() {
 
     std::atomic<bool> second_result{false};
     auto second = scheduler.spawn([&] {
-        second_result.store(group.Wait(), std::memory_order_release);
+        second_result.store(group.WaitFor(3s), std::memory_order_release);
     });
     GO2CPP_CHECK(WaitUntil(
         [&] { return second->state() == go2cpp::GState::kWaiting; }));
@@ -318,20 +628,34 @@ void TestUnlockRacesContextCancellation() {
             [&] { return waiter->state() == go2cpp::GState::kWaiting; }));
         std::atomic<bool> race{false};
         std::thread canceller([&] {
-            while (!race.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
+            const auto race_deadline =
+                std::chrono::steady_clock::now() + 3s;
+            while (!race.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < race_deadline) {
+                go2cpp_tests::yield_for_watchdog();
+            }
+            if (!race.load(std::memory_order_acquire)) {
+                go2cpp_tests::watchdog_abort("sync race start", __FILE__,
+                                             __LINE__);
             }
             cancellation.second();
         });
         std::thread unlocker([&] {
-            while (!race.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
+            const auto race_deadline =
+                std::chrono::steady_clock::now() + 3s;
+            while (!race.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < race_deadline) {
+                go2cpp_tests::yield_for_watchdog();
+            }
+            if (!race.load(std::memory_order_acquire)) {
+                go2cpp_tests::watchdog_abort("sync race start", __FILE__,
+                                             __LINE__);
             }
             mutex.Unlock();
         });
         race.store(true, std::memory_order_release);
-        canceller.join();
-        unlocker.join();
+        GO2CPP_JOIN_WITH_WATCHDOG(canceller, 3s);
+        GO2CPP_JOIN_WITH_WATCHDOG(unlocker, 3s);
         GO2CPP_CHECK(waiter->wait_for(2s));
         GO2CPP_CHECK(returned.load(std::memory_order_acquire));
         const bool acquired = mutex.TryLock();
@@ -361,22 +685,29 @@ void TestContextCallbackRacesSchedulerShutdown() {
         scheduler->start();
         auto waiter = scheduler->spawn([&] {
             StackRelease release(released);
-            GO2CPP_CHECK(!group.Wait(cancellation.first));
+            GO2CPP_CHECK(!group.WaitFor(3s, cancellation.first));
             returned.store(true, std::memory_order_release);
         });
         GO2CPP_CHECK(WaitUntil(
             [&] { return waiter->state() == go2cpp::GState::kWaiting; }));
         std::atomic<bool> race{false};
         std::thread canceller([&] {
-            while (!race.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
+            const auto race_deadline =
+                std::chrono::steady_clock::now() + 3s;
+            while (!race.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < race_deadline) {
+                go2cpp_tests::yield_for_watchdog();
+            }
+            if (!race.load(std::memory_order_acquire)) {
+                go2cpp_tests::watchdog_abort("sync race start", __FILE__,
+                                             __LINE__);
             }
             cancellation.second();
         });
         race.store(true, std::memory_order_release);
         scheduler->shutdown();
         scheduler.reset();
-        canceller.join();
+        GO2CPP_JOIN_WITH_WATCHDOG(canceller, 3s);
         GO2CPP_CHECK(returned.load(std::memory_order_acquire));
         GO2CPP_CHECK(released.load(std::memory_order_acquire) == 1);
         GO2CPP_CHECK(waiter->wait_for(100ms));
@@ -390,6 +721,8 @@ void TestContextCallbackRacesSchedulerShutdown() {
 void run_sync_tests() {
     go2cpp_tests::announce("scheduler-aware synchronization");
     TestUnmanagedBoundaryAndCounterErrors();
+    TestMixedThreadAndFiberSynchronization();
+    TestImmediateConditionAndWaitGroupAbort();
     TestFifoAndSingleProcessorProgress();
     TestContextAndTimeout();
     TestNotifyBeforeParkRace();

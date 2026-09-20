@@ -2,6 +2,7 @@
 
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/panic_defer.hpp"
+#include "go2cpp/thread_policy.hpp"
 
 #include <algorithm>
 #include <condition_variable>
@@ -23,6 +24,11 @@ thread_local Scheduler* t_scheduler = nullptr;
 thread_local std::shared_ptr<Task> t_task;
 thread_local MId t_machine_id = 0;
 thread_local PId t_processor_id = 0;
+// BlockingRegion is deliberately non-nestable: one M has one state
+// transition, and rejecting nested scopes avoids double accounting. The
+// machine id is retained so a misuse that lets a Fiber migrate before its
+// region is destroyed can still clear the original M's state.
+thread_local MId t_blocking_machine_id = 0;
 
 std::size_t default_processor_count() noexcept {
     const auto count = std::thread::hardware_concurrency();
@@ -513,15 +519,28 @@ public:
         requested.processor_count = std::max<std::size_t>(1,
                                                            requested.processor_count);
         if (requested.max_workers == 0) {
-            requested.max_workers = requested.processor_count;
+            // Keep ordinary runnable demand P-bounded, but reserve a bounded
+            // replacement ceiling for explicitly declared native blocking M's.
+            // This lets the default scheduler make progress without requiring
+            // every caller to guess a max-worker value; callers can still set
+            // an exact max or disable overcommit below.
+            requested.max_workers =
+                requested.allow_worker_oversubscription &&
+                        requested.processor_count <=
+                            std::numeric_limits<std::size_t>::max() / 2
+                    ? requested.processor_count * 2
+                    : std::numeric_limits<std::size_t>::max();
         }
         requested.max_workers = std::max<std::size_t>(1, requested.max_workers);
-        // This backend does not yet expose a BlockingRegion handoff. Keep the
-        // effective M bound at P instead of claiming support for more M's
-        // than can own a processor at once. The bound is revisited when the
-        // blocking-region backend is added.
-        requested.max_workers = std::min(requested.max_workers,
-                                         requested.processor_count);
+        // A strict one-M-per-P ceiling is still available for deployments
+        // that set allow_worker_oversubscription=false.  The default permits
+        // declared native blocking regions to grow replacement M workers;
+        // this is an intentional overcommit, not a claim of asynchronous
+        // preemption for arbitrary native calls.
+        if (!requested.allow_worker_oversubscription) {
+            requested.max_workers =
+                std::min(requested.max_workers, requested.processor_count);
+        }
         if (requested.min_workers == 0) {
             requested.min_workers = 1;
         }
@@ -591,6 +610,11 @@ public:
         }
         {
             std::lock_guard<std::mutex> lock(mutex);
+            // Reserve before moving any joinable std::thread. If allocation
+            // fails, maybe_grow() can leave the dead records for a later
+            // retry; after this point thread moves are noexcept and cannot
+            // make vector destruction terminate the process.
+            retired.reserve(machines.size());
             for (auto it = machines.begin(); it != machines.end();) {
                 const auto& machine = *it;
                 if (!machine) {
@@ -607,12 +631,15 @@ public:
                 }
             }
         }
-        join_lock.unlock();
         for (auto& thread : retired) {
             if (thread.joinable()) {
                 thread.join();
             }
         }
+        // Keep shutdown/reaper serialization through the actual join. The
+        // retired worker records are already erased, but releasing the gate
+        // earlier would let an owner observe a half-finished maintenance pass.
+        join_lock.unlock();
     }
 
     void maybe_grow(Scheduler* scheduler) {
@@ -639,10 +666,23 @@ public:
         const auto queued = runnable.load(std::memory_order_acquire);
         const auto busy = running_workers.load(std::memory_order_acquire);
         const auto active = active_workers.load(std::memory_order_relaxed);
-        // One worker is enough for one runnable G. Grow only for excess
-        // backlog, and never beyond the effective P-bounded max.
-        const auto desired = std::min(config.max_workers,
-                                     std::max(config.min_workers, queued + busy));
+        const auto blocking = blocking_workers.load(std::memory_order_acquire);
+        // Normal runnable bursts stay P-bounded.  Each explicitly declared
+        // native blocking M contributes one replacement slot, up to the
+        // configured max; this prevents a large queue from creating dozens
+        // of threads merely because max_workers is generous.
+        const auto extra_ceiling =
+            blocking > std::numeric_limits<std::size_t>::max() -
+                          config.processor_count
+                ? std::numeric_limits<std::size_t>::max()
+                : config.processor_count + blocking;
+        const auto worker_ceiling = std::min(config.max_workers, extra_ceiling);
+        const auto demand =
+            queued > std::numeric_limits<std::size_t>::max() - busy
+                ? std::numeric_limits<std::size_t>::max()
+                : queued + busy;
+        const auto desired = std::min(worker_ceiling,
+                                     std::max(config.min_workers, demand));
         if (desired <= active) {
             return;
         }
@@ -831,7 +871,10 @@ public:
     // Machine records outlive their worker thread. Keeping shared slots makes
     // machine indices/references stable while dynamic growth appends workers,
     // and lets snapshots safely observe a worker that is being reaped.
-    std::vector<std::shared_ptr<Machine>> machines;
+    // A deque keeps published machine slots stable while dynamic M growth
+    // appends records; snapshots and BlockingRegion lookup never observe a
+    // vector relocation of an existing shared_ptr slot.
+    std::deque<std::shared_ptr<Machine>> machines;
     std::atomic<bool> started{false};
     std::atomic<bool> draining{false};
     std::atomic<bool> stopping{false};
@@ -839,6 +882,7 @@ public:
     std::atomic<std::size_t> runnable{0};
     std::atomic<std::size_t> active_workers{0};
     std::atomic<std::size_t> running_workers{0};
+    std::atomic<std::size_t> blocking_workers{0};
     std::atomic<std::size_t> next_processor{0};
     std::mutex join_mutex;
 };
@@ -847,8 +891,11 @@ Scheduler::Scheduler(SchedulerConfig config)
     : m_impl(std::make_unique<Impl>(config, this)) {}
 
 Scheduler::Scheduler(std::size_t processor_count)
-    : Scheduler(SchedulerConfig{processor_count, processor_count,
-                                std::chrono::milliseconds{10}, 256}) {}
+    : Scheduler([processor_count] {
+          SchedulerConfig config;
+          config.processor_count = processor_count;
+          return config;
+      }()) {}
 
 Scheduler::~Scheduler() {
     // The worker loop stores this object as its scheduler identity. Destroying
@@ -984,29 +1031,50 @@ void Scheduler::shutdown() {
     }
     m_impl->condition.notify_all();
 
-    for (const auto& machine : m_impl->machines) {
-        if (!machine || !machine->thread.joinable()) {
-            continue;
+    // The external caller owns join_mutex, which prevents the worker-side
+    // reaper from moving or erasing thread objects while they are joined.
+    // Extract one std::thread at a time while holding Impl::mutex, then join
+    // it after releasing that mutex because worker epilogues take the mutex
+    // before exit. Moving a std::thread is noexcept, so shutdown does not
+    // need a temporary vector allocation that could fail during OOM cleanup.
+    for (;;) {
+        std::thread worker;
+        {
+            std::lock_guard<std::mutex> lock(m_impl->mutex);
+            for (const auto& machine : m_impl->machines) {
+                if (machine && machine->thread.joinable()) {
+                    worker = std::move(machine->thread);
+                    break;
+                }
+            }
+        }
+        if (!worker.joinable()) {
+            break;
         }
         // Worker-initiated shutdown returned above, so this path is always an
         // external owner. Join every remaining thread; comparing reusable
         // std::thread::id values here could otherwise leave a joinable record.
-        machine->thread.join();
+        worker.join();
     }
 
-    for (auto& processor : m_impl->processors) {
-        if (processor.active_machines.load(std::memory_order_acquire) == 0) {
-            processor.state.store(PState::kDead, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        for (auto& processor : m_impl->processors) {
+            if (processor.active_machines.load(std::memory_order_acquire) ==
+                0) {
+                processor.state.store(PState::kDead,
+                                      std::memory_order_release);
+            }
         }
-    }
 
-    bool any_joinable = false;
-    for (const auto& machine : m_impl->machines) {
-        any_joinable = any_joinable ||
-                       (machine && machine->thread.joinable());
-    }
-    if (!any_joinable) {
-        m_impl->started.store(false, std::memory_order_release);
+        bool any_joinable = false;
+        for (const auto& machine : m_impl->machines) {
+            any_joinable = any_joinable ||
+                           (machine && machine->thread.joinable());
+        }
+        if (!any_joinable) {
+            m_impl->started.store(false, std::memory_order_release);
+        }
     }
     if (join_lock.owns_lock()) {
         join_lock.unlock();
@@ -1304,6 +1372,92 @@ bool Scheduler::cancel(const std::shared_ptr<Task>& task) {
     return true;
 }
 
+Scheduler::BlockingRegion::BlockingRegion(Scheduler* scheduler) noexcept
+    : m_scheduler(scheduler != nullptr ? scheduler
+                                       : Scheduler::current_scheduler()) {
+    if (m_scheduler == nullptr ||
+        m_scheduler != Scheduler::current_scheduler()) {
+        return;
+    }
+    m_active = Scheduler::enter_blocking();
+    if (m_active) {
+        m_machine_id = Scheduler::current_machine_id();
+    }
+}
+
+Scheduler::BlockingRegion::~BlockingRegion() noexcept {
+    if (m_active && m_scheduler != nullptr) {
+        Scheduler::leave_blocking_for(m_scheduler, m_machine_id);
+        if (t_blocking_machine_id == m_machine_id) {
+            t_blocking_machine_id = 0;
+        }
+        m_active = false;
+    }
+}
+
+bool Scheduler::enter_blocking() noexcept {
+    Scheduler* const scheduler = current_scheduler();
+    if (scheduler == nullptr || !scheduler->m_impl || !current_task()) {
+        return false;
+    }
+    bool entered = false;
+    {
+        std::lock_guard<std::mutex> lock(scheduler->m_impl->mutex);
+        for (const auto& machine : scheduler->m_impl->machines) {
+            if (!machine || machine->id != t_machine_id) {
+                continue;
+            }
+            const auto state = machine->state.load(std::memory_order_relaxed);
+            if (state == MState::kRunning) {
+                machine->state.store(MState::kBlocking,
+                                     std::memory_order_release);
+                scheduler->m_impl->blocking_workers.fetch_add(
+                    1, std::memory_order_relaxed);
+                entered = true;
+            }
+            break;
+        }
+    }
+    if (entered) {
+        t_blocking_machine_id = t_machine_id;
+        // Growth is deliberately outside the admission lock.  A queued G can
+        // now obtain a replacement M even when this M enters a native call.
+        scheduler->m_impl->maybe_grow(scheduler);
+    }
+    return entered;
+}
+
+void Scheduler::leave_blocking() noexcept {
+    Scheduler* const scheduler = current_scheduler();
+    if (scheduler == nullptr || !scheduler->m_impl ||
+        t_blocking_machine_id == 0) {
+        return;
+    }
+    leave_blocking_for(scheduler, t_blocking_machine_id);
+    t_blocking_machine_id = 0;
+}
+
+void Scheduler::leave_blocking_for(Scheduler* scheduler,
+                                   MId machine_id) noexcept {
+    if (scheduler == nullptr || !scheduler->m_impl || machine_id == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(scheduler->m_impl->mutex);
+    for (const auto& machine : scheduler->m_impl->machines) {
+        if (!machine || machine->id != machine_id) {
+            continue;
+        }
+        if (machine->state.load(std::memory_order_relaxed) ==
+            MState::kBlocking) {
+            machine->state.store(MState::kRunning,
+                                 std::memory_order_release);
+            scheduler->m_impl->blocking_workers.fetch_sub(
+                1, std::memory_order_relaxed);
+        }
+        break;
+    }
+}
+
 std::size_t Scheduler::processor_count() const noexcept {
     return m_impl ? m_impl->processors.size() : 0;
 }
@@ -1383,6 +1537,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         return;
     }
     t_scheduler = this;
+    thread_policy::detail::EnterRuntimeWorker(this);
     t_machine_id = machine->id;
     t_processor_id = machine->processor;
     auto& own_processor =
@@ -1554,6 +1709,12 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             t_task = task;
             task->run();
             t_task.reset();
+            // A well-formed BlockingRegion is destroyed before the G yields or
+            // returns. Clearing this thread marker at the task boundary also
+            // prevents a misuse that migrated an active region from poisoning
+            // the next G scheduled on this M; its destructor still repairs the
+            // captured original machine state.
+            t_blocking_machine_id = 0;
             if (own_processor.running_machines.fetch_sub(
                     1, std::memory_order_acq_rel) == 1) {
                 own_processor.state.store(PState::kIdle,
@@ -1679,9 +1840,11 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     }
     m_impl->condition.notify_all();
     t_task.reset();
+    thread_policy::detail::LeaveRuntimeWorker();
     t_scheduler = nullptr;
     t_machine_id = 0;
     t_processor_id = 0;
+    t_blocking_machine_id = 0;
 }
 
 }  // namespace go2cpp::scheduler
