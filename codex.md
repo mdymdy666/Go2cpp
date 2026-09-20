@@ -156,7 +156,11 @@ still recommended.
   C++17 library. The following boundary audit supersedes that statement for
   the newly requested Fiber, socket-hook, coroutine-sync, and dynamic-M scope.
 
-## Boundary audit and HOOK clarification (2026-09-17)
+## Boundary audit and HOOK clarification (2026-09-17, superseded)
+
+This historical snapshot predates the implementation below. Its "not
+implemented" conclusions are retained for audit history; use the 2026-09-18
+section for the current status.
 
 - Rechecked the four newly raised boundary cases against the source, tests and
   public headers. A returning/panicking callable or a cancelled queued/waiting
@@ -184,3 +188,93 @@ still recommended.
 - Status: the existing compatibility subset remains intact, but these four
   boundary requests are only partially satisfied. The gaps are now explicit
   in `docs/compatibility.md` and `docs/design.md`.
+
+## Boundary implementation and final verification (2026-09-18)
+
+- Replaced the earlier callback-only scheduler path with a stackful
+  Boost.Context Fiber backend. `Task` now owns a resumable C++ continuation;
+  G/M/P admission, local/global queues, bounded stealing, park/wake pending
+  permits, owner binding, dynamic M growth/shrink and task-class affinity are
+  implemented in `src/scheduler.cpp`. Shutdown requests cooperative
+  cancellation, wakes parked Gs, waits for started Fibers to return through
+  their trampoline, releases completed Fiber stacks immediately, and never
+  force-discards a live C++ stack.
+- Added scheduler-aware `sync::Mutex`, `ConditionVariable` and `WaitGroup`,
+  shared `ParkingCondition` and process-wide timer service. Managed G waits
+  suspend their Fiber and leave the M available; unmanaged contended mutex
+  calls deliberately return false/throw rather than silently blocking an
+  unknown OS thread.
+- Added Linux `IOManager`/epoll/eventfd readiness and the shared default-on
+  socket hook. The hook covers connect/accept/read/recv/write/send,
+  close/dup/fcntl/ioctl, socket timeout options and sleep. It registers
+  readiness before deadline timers, uses one-shot outcomes and generation
+  tokens, and has original-call/native-poll fallbacks. A boundary audit fixed
+  `dup2`/`dup3` pre-replacement close notification, `dup2(fd, fd)` identity,
+  native fallback `ETIMEDOUT`, and extreme-deadline conversion overflow.
+- Added runnable examples under `example/`: `fiber_sync_demo.cpp`,
+  `managed_pipeline_demo.cpp`, `dynamic_gmp_demo.cpp` and `io_hook_demo.cpp`.
+  Added saturating relative-deadline arithmetic for Context and channel/select
+  APIs, with regression coverage for `ContextDuration::min()/max()`.
+  Updated the compatibility/design/dependency/scheduler/testing documents to
+  distinguish implemented semantics from unsupported Go/compiler/ABI behavior.
+- Current verification from the canonical WSL path:
+  GCC Debug shared CTest **7/7**, Clang 18 Debug **7/7**, Release static
+  Hook-off CTest **6/6**, strict `-Werror` CTest **7/7**; ASan and UBSan full
+  unit/smoke runs passed; Valgrind unit and smoke runs both exited zero with
+  `0 bytes in 0 blocks` and `ERROR SUMMARY: 0` (final alloc/free totals
+  `1,883,691` and `3,387`); `(cd third_party/go-reference && sha256sum -c
+  SHA256SUMS)` returned `OK` for the Go 1.23.0 archive; install/export smoke
+  completed; serial watchdog stress passed
+  `go2cpp_tests` **40/40** and `go2cpp_scheduler_smoke` **80/80**.
+- TSan was rebuilt with non-PIE/ASLR-disabled WSL invocation. Filtered
+  context/channel/scheduler/dynamic/fiber/sync/io runs passed. The full suite and hook filter
+  exceeded the WSL watchdog without a diagnostic, so no full-suite TSan pass
+  is claimed; native Linux remains the appropriate final TSan gate.
+- Remaining explicit boundaries: no Go parser/compiler/GC/ABI, no
+  asynchronous preemption or blocking-region M>P handoff, cooperative rather
+  than forced Fiber cancellation, no exact Go fairness, and no transparent
+  interception of every Linux socket-adjacent API (`poll`/`select`/`ppoll`,
+  `*mmsg`, `sendfile`, `splice`, and signal-restart policy remain outside the
+  subset). Static consumers must disable the shared Hook target.
+
+## Final boundary regression and handoff (2026-09-18)
+
+- Fixed cancellation/shutdown lost-wake windows for unstarted queued Gs and
+  for advanced raw `Fiber::Suspend(Park)` users. Failed queue claims now prune
+  terminal tasks and release callable captures; scheduler shutdown is notified
+  when an external cancellation changes the terminal predicate. Fiber creation,
+  pointer publication, resume observation and terminal ownership transfer are
+  serialized against cancellation by the Task transition mutex.
+- Added regressions for cancelled-queue capture release, raw Fiber park
+  cancellation, managed `MSG_OOB` (`ENOTSUP`), tracked `FIONBIO` invalid-pointer
+  `EFAULT`, empty/inert select, singleton `errors.Join`, context callback
+  subtree marking, and zero/negative timed mutex acquisition.
+- Hook boundary fixes include applying the configured connect timeout to native
+  fallback, kernel-first `FIONBIO` validation, split close lifecycle locking
+  around potentially blocking `SO_LINGER`, and explicit documentation for
+  raw syscall/`io_uring`/`close_range`/fork-exec gaps. Ordinary-thread
+  `MSG_WAITALL` on a previously adopted runtime-nonblocking descriptor remains
+  a known semantic limitation; managed `MSG_WAITALL` and `MSG_OOB` return
+  `ENOTSUP`.
+- Earlier current-tree verification baseline: GCC Debug shared **7/7**, Release static
+  Hook-off **6/6**, Clang 18 Debug **7/7**, and strict `-Werror` **7/7**;
+  ASan and UBSan unit/smoke runs passed. Valgrind Memcheck logs
+  `build-check/valgrind-tests-final3.log` and
+  `build-check/valgrind-smoke-final3.log` both exited zero with 0 bytes in
+  use, ERROR SUMMARY 0, and allocation totals `1,908,203` and `3,388`.
+  The final serial watchdog run passed 40 unit and 80 smoke executions.
+- TSan filtered runs completed earlier for context/channel/scheduler/dynamic/
+  fiber/sync/io without a diagnostic; the rebuilt final WSL run did not finish
+  within the watchdog, so no full-suite or hook TSan pass is claimed. Native
+  Linux TSan remains a release-gate follow-up. Channel destruction, throwing
+  select element/callback rollback, static-destruction ordering for global
+  contexts, and owner lifetime for raw `IOManager*` bindings remain explicit
+  documented preconditions or follow-up work.
+- After the final `IOManager::wait` park-failure guard and select-formatting
+  cleanup, Memcheck was rerun on the current tree. `valgrind-tests-final4.log`
+  and `valgrind-smoke-final4.log` both exited zero with `0 bytes in 0 blocks`
+  and `ERROR SUMMARY: 0`; allocation totals were `1,815,429` and `3,388`.
+- After the public pre-cancelled-`Task` admission cleanup and its regression,
+  Memcheck was rerun again on the current tree. `valgrind-tests-final5.log`
+  and `valgrind-smoke-final5.log` exited zero with `0 bytes in 0 blocks` and
+  `ERROR SUMMARY: 0`; allocation totals were `1,809,665` and `3,390`.

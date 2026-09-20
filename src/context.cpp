@@ -1,8 +1,10 @@
 #include "go2cpp/context.hpp"
+#include "go2cpp/core/parking_condition.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <limits>
 #include <map>
 #include <thread>
 #include <unordered_map>
@@ -13,7 +15,7 @@ namespace go2cpp {
 
 struct DoneSignal::State {
     mutable std::mutex mutex;
-    mutable std::condition_variable cv;
+    mutable core::ParkingCondition cv;
     bool done{false};
     CallbackId next_id{1};
     std::unordered_map<CallbackId, std::function<void()>> callbacks;
@@ -23,18 +25,21 @@ DoneSignal::DoneSignal() : m_state(std::make_shared<State>()) {}
 DoneSignal::~DoneSignal() = default;
 
 void DoneSignal::Wait() const {
-    std::unique_lock<std::mutex> lock(m_state->mutex);
-    m_state->cv.wait(lock, [this] { return m_state->done; });
+    const auto state = m_state;
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->cv.wait(lock, [state] { return state->done; });
 }
 
 bool DoneSignal::WaitFor(ContextDuration timeout) const {
-    std::unique_lock<std::mutex> lock(m_state->mutex);
-    return m_state->cv.wait_for(lock, timeout, [this] { return m_state->done; });
+    const auto state = m_state;
+    std::unique_lock<std::mutex> lock(state->mutex);
+    return state->cv.wait_for(lock, timeout, [state] { return state->done; });
 }
 
 bool DoneSignal::WaitUntil(ContextTimePoint deadline) const {
-    std::unique_lock<std::mutex> lock(m_state->mutex);
-    return m_state->cv.wait_until(lock, deadline, [this] { return m_state->done; });
+    const auto state = m_state;
+    std::unique_lock<std::mutex> lock(state->mutex);
+    return state->cv.wait_until(lock, deadline, [state] { return state->done; });
 }
 
 bool DoneSignal::IsDone() const noexcept {
@@ -107,6 +112,30 @@ namespace {
 
 std::mutex s_clock_mutex;
 Context::NowFunction s_now_function;
+
+ContextTimePoint SaturatingDeadline(ContextTimePoint now,
+                                    ContextDuration timeout) noexcept {
+    // Keep the addition in the time-point domain. In particular, a
+    // ContextDuration::max() timeout must not wrap into the past and become
+    // an accidental immediate cancellation.
+    using Rep = ContextDuration::rep;
+    if (timeout > ContextDuration::zero() &&
+        now > ContextTimePoint::max() - timeout) {
+        return ContextTimePoint::max();
+    }
+    if (timeout < ContextDuration::zero()) {
+        // Negating duration::min() would overflow. It is already farther
+        // below any representable time point, so handle it explicitly before
+        // using the otherwise safe subtraction below.
+        if constexpr (std::numeric_limits<Rep>::is_signed) {
+            if (timeout.count() == std::numeric_limits<Rep>::min() ||
+                now < ContextTimePoint::min() - timeout) {
+                return ContextTimePoint::min();
+            }
+        }
+    }
+    return now + timeout;
+}
 
 class TimerService {
 public:
@@ -184,6 +213,11 @@ struct Context::State : std::enable_shared_from_this<Context::State> {
     };
 
     static void DrainCancellation(std::vector<CancellationWork> work) {
+        // Mark the complete subtree before invoking any user callback. Done
+        // callbacks are allowed to observe/wait on descendants; signaling a
+        // parent callback first would otherwise deadlock a synchronous
+        // parent->child wait during cancellation propagation.
+        std::vector<std::shared_ptr<State>> to_signal;
         while (!work.empty()) {
             CancellationWork item = std::move(work.back());
             work.pop_back();
@@ -222,11 +256,14 @@ struct Context::State : std::enable_shared_from_this<Context::State> {
             if (old_timer != 0) {
                 TimerService::Instance().Remove(old_timer);
             }
-            item.state->done.Signal();
+            to_signal.emplace_back(item.state);
             for (auto& child : descendants) {
                 work.push_back(
                     {std::move(child), local_error, local_cause, false});
             }
+        }
+        for (auto it = to_signal.rbegin(); it != to_signal.rend(); ++it) {
+            (*it)->done.Signal();
         }
     }
 
@@ -521,7 +558,7 @@ std::pair<ContextPtr, CancelFunc> Context::WithDeadline(
 
 std::pair<ContextPtr, CancelFunc> Context::WithTimeout(
     const ContextPtr& parent, ContextDuration timeout) {
-    return WithDeadline(parent, Now() + timeout);
+    return WithDeadline(parent, SaturatingDeadline(Now(), timeout));
 }
 
 ContextPtr Context::WithValue(const ContextPtr& parent, std::string key,

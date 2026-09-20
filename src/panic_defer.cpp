@@ -7,17 +7,20 @@ namespace go2cpp::panic_defer {
 namespace {
 
 struct ExecutionState {
-    Frame* current_frame{nullptr};
-    Frame* active_defer{nullptr};
-    PanicValue panic_value;
-    UnhandledPanicHandler handler;
-    bool panicking{false};
-    bool unwinding{false};
+    Frame* m_current_frame{nullptr};
+    Frame* m_active_defer{nullptr};
+    PanicValue m_panic_value;
+    UnhandledPanicHandler m_handler;
+    bool m_panicking{false};
+    bool m_unwinding{false};
 };
 
-thread_local ExecutionState t_state;
+thread_local ExecutionState s_fallback_state;
+thread_local ExecutionState* s_current_state = &s_fallback_state;
 std::mutex s_handler_mutex;
 UnhandledPanicHandler s_default_handler;
+
+ExecutionState& current_state() noexcept { return *s_current_state; }
 
 UnhandledPanicHandler copy_default_handler() {
     std::lock_guard<std::mutex> lock(s_handler_mutex);
@@ -25,6 +28,25 @@ UnhandledPanicHandler copy_default_handler() {
 }
 
 }  // namespace
+
+struct ExecutionContext::Impl {
+    ExecutionState m_state;
+};
+
+ExecutionContext::ExecutionContext() : m_impl(std::make_unique<Impl>()) {}
+
+ExecutionContext::~ExecutionContext() = default;
+
+Binding::Binding(ExecutionContext& context) noexcept
+    : m_previous(s_current_state) {
+    s_current_state = &context.m_impl->m_state;
+}
+
+Binding::~Binding() noexcept {
+    if (m_previous != nullptr) {
+        s_current_state = static_cast<ExecutionState*>(m_previous);
+    }
+}
 
 PanicValue PanicValue::nil() {
     PanicValue result;
@@ -38,22 +60,23 @@ PanicValue PanicValue::text(std::string message) {
 }
 
 Frame::Frame(Frame* parent) noexcept
-    : m_parent(parent != nullptr ? parent : t_state.current_frame),
-      m_previous_active_defer(t_state.active_defer) {
-    t_state.current_frame = this;
+    : m_parent(parent != nullptr ? parent : current_state().m_current_frame),
+      m_previous_active_defer(current_state().m_active_defer) {
+    current_state().m_current_frame = this;
 }
 
-Frame::~Frame() {
+Frame::~Frame() noexcept {
+    ExecutionState& state = current_state();
     if (!m_finished && !m_unwound) {
-        if (t_state.panicking) {
+        if (state.m_panicking) {
             unwind();
         } else {
             finish();
         }
     }
-    if (t_state.current_frame == this) {
-        t_state.current_frame = m_parent;
-        t_state.active_defer = m_previous_active_defer;
+    if (state.m_current_frame == this) {
+        state.m_current_frame = m_parent;
+        state.m_active_defer = m_previous_active_defer;
     }
 }
 
@@ -65,14 +88,15 @@ void Frame::defer_call_impl(std::function<void()> callback) {
 }
 
 void Frame::run_deferred(bool panic_path) noexcept {
-    const bool previous_unwinding = t_state.unwinding;
-    Frame* const previous_active_defer = t_state.active_defer;
-    t_state.unwinding = panic_path;
+    ExecutionState& state = current_state();
+    const bool previous_unwinding = state.m_unwinding;
+    Frame* const previous_active_defer = state.m_active_defer;
+    state.m_unwinding = panic_path;
     m_processing = true;
     while (!m_defers.empty()) {
         std::function<void()> callback = std::move(m_defers.back());
         m_defers.pop_back();
-        t_state.active_defer = this;
+        state.m_active_defer = this;
         try {
             callback();
         } catch (...) {
@@ -81,16 +105,16 @@ void Frame::run_deferred(bool panic_path) noexcept {
             // panic so later defers can still observe/recover it.
             panic(PanicValue::text("C++ exception in defer callback"));
         }
-        t_state.active_defer = nullptr;
+        state.m_active_defer = nullptr;
         // A defer may itself request a panic while finishing normally. The
         // remaining defers must then observe an active unwind and may recover.
-        if (t_state.panicking) {
-            t_state.unwinding = true;
+        if (state.m_panicking) {
+            state.m_unwinding = true;
         }
     }
     m_processing = false;
-    t_state.active_defer = previous_active_defer;
-    t_state.unwinding = previous_unwinding;
+    state.m_active_defer = previous_active_defer;
+    state.m_unwinding = previous_unwinding;
 }
 
 void Frame::finish() noexcept {
@@ -113,33 +137,36 @@ void panic(PanicValue value) {
     if (!value.valid()) {
         value = PanicValue::nil();
     }
-    t_state.panic_value = std::move(value);
-    t_state.panicking = true;
-    if (t_state.active_defer != nullptr) {
-        t_state.unwinding = true;
+    ExecutionState& state = current_state();
+    state.m_panic_value = std::move(value);
+    state.m_panicking = true;
+    if (state.m_active_defer != nullptr) {
+        state.m_unwinding = true;
     }
 }
 
 void panic_nil() { panic(PanicValue::nil()); }
 
-bool panicking() noexcept { return t_state.panicking; }
+bool panicking() noexcept { return current_state().m_panicking; }
 
-Frame* Frame::Current() noexcept { return t_state.current_frame; }
+Frame* Frame::Current() noexcept { return current_state().m_current_frame; }
 
 PanicValue recover() noexcept {
-    if (!t_state.panicking || !t_state.unwinding ||
-        t_state.active_defer == nullptr ||
-        t_state.active_defer != t_state.current_frame) {
+    ExecutionState& state = current_state();
+    if (!state.m_panicking || !state.m_unwinding ||
+        state.m_active_defer == nullptr ||
+        state.m_active_defer != state.m_current_frame) {
         return PanicValue{};
     }
-    PanicValue result = t_state.panic_value;
-    t_state.panic_value = PanicValue{};
-    t_state.panicking = false;
+    PanicValue result = state.m_panic_value;
+    state.m_panic_value = PanicValue{};
+    state.m_panicking = false;
     return result;
 }
 
 PanicValue current_panic() noexcept {
-    return t_state.panicking ? t_state.panic_value : PanicValue{};
+    ExecutionState& state = current_state();
+    return state.m_panicking ? state.m_panic_value : PanicValue{};
 }
 
 void set_unhandled_panic_handler(UnhandledPanicHandler handler) {
@@ -155,58 +182,62 @@ bool run(std::function<void()> body) {
             body();
         }
     } catch (...) {
-        // C++ exceptions do not cross the runtime boundary.  Translate an
+        // C++ exceptions do not cross the runtime boundary. Translate an
         // accidental callback throw into an ordinary unhandled panic so the
         // frame still executes its registered defers.
         panic(PanicValue::text("C++ exception in goroutine body"));
     }
-    if (t_state.panicking) {
+    ExecutionState& state = current_state();
+    if (state.m_panicking) {
         frame.unwind();
     } else {
         frame.finish();
     }
-    const bool completed = !t_state.panicking;
-    if (t_state.panicking) {
-        UnhandledPanicHandler handler = t_state.handler;
+    const bool completed = !state.m_panicking;
+    if (state.m_panicking) {
+        UnhandledPanicHandler handler = state.m_handler;
         if (!handler) {
             handler = copy_default_handler();
         }
         if (handler) {
             try {
-                handler(t_state.panic_value);
+                handler(state.m_panic_value);
             } catch (...) {
                 // An observer cannot replace the terminal runtime result or
                 // take down a worker with an accidental C++ exception.
             }
         }
-        t_state.panic_value = PanicValue{};
-        t_state.panicking = false;
+        state.m_panic_value = PanicValue{};
+        state.m_panicking = false;
     }
     return completed;
 }
 
-GoroutineScope::GoroutineScope() noexcept
-    : m_previous_frame(t_state.current_frame),
-      m_previous_panic(t_state.panic_value),
-      m_previous_handler(t_state.handler),
-      m_previous_active(t_state.panicking),
-      m_previous_unwinding(t_state.unwinding),
-      m_previous_defer(t_state.active_defer) {
-    t_state.current_frame = nullptr;
-    t_state.active_defer = nullptr;
-    t_state.panic_value = PanicValue{};
-    t_state.panicking = false;
-    t_state.unwinding = false;
-    t_state.handler = copy_default_handler();
+GoroutineScope::GoroutineScope()
+    : m_previous_frame(current_state().m_current_frame),
+      m_previous_panic(current_state().m_panic_value),
+      m_previous_handler(current_state().m_handler),
+      m_previous_active(current_state().m_panicking),
+      m_previous_unwinding(current_state().m_unwinding),
+      m_previous_defer(current_state().m_active_defer) {
+    UnhandledPanicHandler handler = copy_default_handler();
+    ExecutionState& state = current_state();
+    state.m_current_frame = nullptr;
+    state.m_active_defer = nullptr;
+    state.m_panic_value = PanicValue{};
+    state.m_panicking = false;
+    state.m_unwinding = false;
+    state.m_handler = std::move(handler);
 }
 
 GoroutineScope::~GoroutineScope() noexcept {
-    t_state.current_frame = m_previous_frame;
-    t_state.active_defer = m_previous_defer;
-    t_state.panic_value = m_previous_panic;
-    t_state.panicking = m_previous_active;
-    t_state.unwinding = m_previous_unwinding;
-    t_state.handler = std::move(m_previous_handler);
+    ExecutionState& state = current_state();
+    state.m_current_frame = m_previous_frame;
+    state.m_active_defer = m_previous_defer;
+    state.m_panic_value = m_previous_panic;
+    state.m_panicking = m_previous_active;
+    state.m_unwinding = m_previous_unwinding;
+    state.m_handler = std::move(m_previous_handler);
 }
 
 }  // namespace go2cpp::panic_defer

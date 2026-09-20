@@ -1,129 +1,220 @@
-# Go2Cpp runtime design
+# Runtime Design
 
-## Scope and build contract
+## Scope and contract
 
-Go2Cpp is an independent C++ runtime/library. It does not embed Go, cgo, a Go garbage collector, compiler-generated stack maps, or a Go internal ABI. The baseline is C++17, GCC 13 or Clang 18 on Linux, with the C++ standard library and POSIX threads. Public headers are stable at the source/API level for the 0.x series; ABI stability is not promised before 1.0.
+Go2Cpp is an independent C++17 runtime/library, not a translator. It targets
+Linux with GCC 13 or Clang 18 and uses the standard C++ library, POSIX threads,
+Linux epoll/eventfd for I/O, and Boost.Context for the replaceable stackful
+Fiber backend. Public source/API names are under `go2cpp`; 0.x has no ABI
+stability promise. The default build is shared and includes the Linux hook;
+static builds must set `GO2CPP_BUILD_HOOK=OFF` so there is one process-wide
+descriptor/TLS registry.
 
-The implementation never throws C++ exceptions for runtime control flow and never uses `setjmp`/`longjmp`. Panic propagation is an explicit cooperative protocol at runtime call boundaries. Ordinary C++ destructors therefore run normally. User callbacks should return from a boundary after requesting a panic; code that continues doing work after `panic()` is outside the supported subset.
+The runtime's own scheduling, panic, cancellation and waiting paths do not use
+C++ exceptions, futures, promises, `setjmp` or `longjmp` as control flow. An
+accidental exception thrown by user code is caught at the outer Fiber/body
+boundary and translated to an unhandled panic result; ordinary C++ destructors
+still run. A translator must explicitly create `panic_defer::Frame` boundaries.
 
-## Ownership and concurrency
+## Ownership model
 
-Runtime objects are owned by `std::shared_ptr` handles or RAII value wrappers. Context parents retain weak child entries and prune expired entries during child creation/cancellation. Scheduler G objects are reference-counted task records; each G is bound to the first Scheduler that admits it, is enqueued at most once while runnable, and has one owner M while running. Channel waiters are heap nodes owned by the operation until wake-up and removed under the channel mutex. No API returns a reference whose lifetime depends on an internal lock.
+Tasks, channels, contexts, wait nodes and Fiber state use RAII and smart
+pointers. A scheduler registry strongly owns every non-terminal Task, including
+parked Gs; queue nodes and wait nodes hold `shared_ptr` references. A started
+terminal Task is removed from the scheduler registry only after its Fiber
+trampoline has returned; an unstarted terminal Task has no stack and may be
+pruned during queue/admission cleanup. User-held Task handles may keep captures
+alive longer. Context parents retain a strong parent anchor while child entries
+are weak and pruned, so cancellation propagation does not form a cycle. Timer
+callbacks capture weak wait nodes and all scheduler-facing wait nodes have a
+gate/disarm step
+before their owner returns.
 
-The default clock is `std::chrono::steady_clock`; `Context::SetNowFunctionForTesting` can inject the clock used to calculate new timeout deadlines and synchronous-expiry checks. The timer service itself uses the monotonic steady clock and is shared by all timed contexts. Notifications happen after a state transition protected by the corresponding state lock; wait predicates recheck terminal state, and channel cancellation is rechecked at a bounded wait quantum, preventing permanent lost wake-ups while keeping the backend portable.
+The owning `Scheduler`/`IOManager` object must remain alive until all worker
+threads have stopped. Destruction from one of its own managed Gs fails fast,
+because a C++ destructor cannot safely defer the owner object's lifetime.
+Ordinary `Channel` member calls require the object to outlive every concurrent
+caller and waiter; `~Channel()` is not a concurrent cancellation primitive and
+must not run while a raw/stack channel call is active. `SelectCase` captures a
+`ChannelPtr` when a shared channel is used, but a raw or stack channel cannot
+self-retain.
 
-## GMP scheduler model
+## GMP scheduler
 
-- **G** (`Goroutine`): one callable task, lifecycle state (`new`, `runnable`, `running`, `waiting`, `done`, `cancelled`), and an atomic run claim.
-- **M** (`Machine`): one worker OS thread. An M may execute only one G at a time and is bound to one P while executing.
-- **P** (`Processor`): a scheduling token with a bounded local deque. The scheduler owns exactly `P` processors; an M must hold a P before taking a G.
+`Task` is G, `Machine` is an OS worker M, and each `Processor` is a P scheduling
+token. A P local queue is bounded; overflow uses a global FIFO queue. Workers
+prefer their local queue, then global work, then bounded victim scans from the
+back. A task has exactly one scheduler owner, one `m_queued` queue claim and
+one `m_execution_claim`; dequeue, runnable accounting and the running claim are
+committed under the admission mutex. Thus a wake racing with dequeue cannot
+publish a second execution of one G.
 
-Each P has a mutex-protected FIFO local queue. A global FIFO queue handles overflow and wake-up. Idle workers steal from the back of another P's queue. Under the scheduler admission mutex, a worker removes one queue node and invokes a single Task transition that clears the queued reservation and sets the execution claim plus `runnable -> running` state atomically. An external enqueue therefore sees either the reservation or the execution claim and cannot publish a duplicate while the callable is active; the runnable counter is decremented in the same queue-admission transaction. Only the currently executing G may call `yield` or `park`; an external `wake` transitions a waiting G immediately, or records a one-bit pending wake when the G is still running. `park` consumes that token during the running-to-waiting handoff and requeues the G, so a wake racing with park cannot be lost. This prevents a second queue publication while a C++ callable is still executing. Blocking user work should call `yield`/return; an arbitrary blocking syscall cannot be transparently detached from its M in this subset. Shutdown closes admission, wakes all workers, drains queued tasks as cancelled, and joins workers.
+Legal G transitions are:
 
-The state transition invariant is:
-
-```
-new -> runnable -> running -> (runnable | waiting | done | cancelled)
+```text
+new -> runnable -> running -> runnable | waiting | dead | cancelled
 waiting -> runnable | cancelled
-
-Unhandled panic terminal edge: running | runnable | waiting -> dead
+dead/cancelled -> terminal
 ```
 
-An unhandled panic or translated C++ exception is a terminal event and may
-force an executing task from `runnable`/`waiting` bookkeeping to `dead`; this
-path clears deferred requeue state. There is no transition out of `dead` or
-`cancelled`; only `runnable` tasks may appear in a queue.
+`yield` and `park` are valid only for the current G. The Fiber backend preserves
+the C++ continuation, so a G resumes after the call instead of re-entering its
+callable. A readiness, timer, channel or synchronization notifier either
+transitions waiting to runnable or records one pending wake token while the G
+is still running. Shutdown closes admission, cancels unstarted queue entries,
+wakes started waiting Gs, and waits for started Fibers to return naturally.
+Worker-initiated shutdown publishes the same drain request; once the registry is
+terminal the workers transition to stopping and the owner thread joins them.
 
-This backend does not preserve a C++ call stack across `yield` or `park`.
-Those calls change the logical G state and the worker requeues the task after
-the current callable returns. A task that blocks in an arbitrary native call
-therefore retains its M until that call returns; it is not a transparent
-stackful-fiber suspension. C++ RAII locals created by the callable are cleaned
-when that callable returns or unwinds. Captures held by the callable remain
-owned by the `Task` until its last external/runtime owner releases it, even
-after the G state is terminal. The runtime cannot force-unwind a non-returning
-callable or invent a continuation for it.
+M management starts at `min_workers`, grows while runnable backlog and busy M
+count demand it, and retires idle M records down to the floor. The effective
+maximum is clamped to P because this implementation does not yet expose a
+blocking-region handoff that releases P around arbitrary native calls. Retired
+records are joined/reaped, so repeated load waves do not grow metadata without
+bound. Task class IDs provide a bounded soft affinity scan and counters; they
+never prevent stealing or promise a thread-local cache.
 
-The `Scheduler` object is the external owner of the worker table and must
-outlive every worker thread. A task may call `shutdown()` to publish the stop
-request, but destroying the scheduler from one of its own workers is not
-supported; the owner thread performs the final join and destruction after the
-workers return.
+## Fiber and execution context
 
-The M table is allocated once by `start()`; `max_workers` is clamped to P
-count and is not a dynamic growth target. Local/global queues and stealing
-balance queued work, but there is no blocked-M replacement, idle-thread
-retirement, or task-class-aware worker reuse. A future dynamic M manager must
-keep P execution exclusive while allowing an M blocked outside the scheduler
-to release its P, bound the total M count and idle cache, and verify scale-up,
-scale-down, shutdown, and load balance under bursty and mixed-class loads.
-Task-class locality should be a soft affinity that never prevents stealing or
-starves other classes; no task-class identifier exists in the current API.
+`go2cpp::Fiber` uses Boost.Context raw `fcontext_t`, a protected fixed-size
+stack, and an explicit trampoline. It has `Ready`, `Running`, `Suspended`,
+`Completed` and `Failed` states. Resume calls are serialized; errno is saved and
+restored around every switch. A Fiber may migrate between M threads, so normal
+`thread_local` values must not be treated as G-local state. Destruction requests
+cancellation and resumes a Ready/Suspended Fiber until it completes, preserving
+stack destructors and defers. A Fiber that ignores cancellation can make its
+destructor wait; there is intentionally no unsafe forced stack disposal.
 
-## Context
+`panic_defer::ExecutionContext` is carried by the Fiber and installed by a
+short `Binding` around each resume. This replaces the thread-local-only state
+used by simple callback runtimes and prevents panic/recover state leaking when
+an M is reused by another G.
 
-`Background` and `TODO` are immortal roots and ignore direct cancellation. `WithCancel`, `WithDeadline`, and `WithTimeout` create child nodes. Cancellation is idempotent, propagates parent-to-child through an iterative work queue, closes a shared `Done` event exactly once, and records `Canceled` or `DeadlineExceeded` plus an optional cause. `WithValue` stores a type-erased value behind a typed key identity; values are immutable after construction. The compatibility string-key overload also permits the empty string as a real key. A child holds a strong parent anchor so cancellation and values remain available even if the caller drops its parent handle. Parent child entries are weak and pruned, so this ownership direction does not form a cycle; a custom state deleter releases very deep parent chains iteratively.
+`panic_defer::panic()` records runtime state but does not rewrite ordinary C++
+control flow. Generated code must return through the active frame boundary
+after recording a panic; arbitrary statements after `panic()` are outside the
+supported Go-like subset.
 
-## Channels and select
+## Context and timers
 
-`Channel<T>` supports capacity zero (rendezvous) and capacity N (FIFO ring buffer), multiple producers/consumers, close, and cancellation-aware operations. A receive after close returns the type's default value with `ok=false`; a send after close returns a `SendResult::closed` status and can be promoted to a panic by the caller. Repeated close returns an error. Nil-channel behavior is represented by an invalid handle and is explicitly reported rather than hanging forever. `AsSendOnly` and `AsRecvOnly` create source-level directional views that omit the opposite operation set; the views can also be used to build matching select cases. `select` provides a non-blocking/default form and a bounded wait form over send and receive cases, with an optional context and timeout supplied to the select call. There is no separate `TimeoutCase` object. Ready cases are rotated with an atomic round-robin cursor; this is deterministic fairness rather than cryptographic randomness. Cases that are not immediately ready publish heap wait nodes under the channel mutex. A one-shot `SelectWaitState` claims exactly one case, pairs two independent unbuffered selects atomically, and is disarmed on every exit; close and context callbacks wake the state. Because `SelectProbe` is type-erased with `std::any`, channel element types used by select cases must be copyable; direct channel operations support move-only values. A nil select case reports `kNil`, and when no channel case is ready the supplied context is checked before `DefaultCase` by policy. The wait loop still uses a short bounded condition-variable interval for custom probe cases, so this is not a netpoller-grade wake-up path.
+Context cancellation is an iterative work queue: each state is marked once,
+its timer is removed, descendants are marked, and then `Done` callbacks are
+signaled from the leaves back toward the parent. `DoneSignal` provides callbacks and `Wait`/`WaitFor`/`WaitUntil`;
+when called by a managed G those methods use `core::ParkingCondition`, which
+parks the Fiber and leaves the M available. Channel and synchronization waits
+use the same parking primitive and a named process-wide `core::TimerService`.
+The context module retains its own weak-state deadline service so injected
+clock construction remains independent of the monotonic timer worker.
 
-## Socket I/O and hooks
+Typed Context keys use an identity token retained by the context node; values
+are immutable `std::any` objects. A string-key overload is provided for dynamic
+translated code. Error handles are immutable shared values; `Join` preserves a
+singleton `JoinError` wrapper, while `Wrap` with a null cause returns null.
+Cancellation never implicitly becomes a panic.
 
-The current library has no socket wrapper or hook registry. In particular,
-there is no public `IOManager`, FD readiness backend, `addEvent`/
-`cancelEvent`, or `wait_for_event` implementation. Socket operations are
-therefore outside the supported subset and must not be described as
-non-blocking G waits. A future I/O module is expected to expose a syscall hook
-contract and scheduler adapter: readiness is registered before a timeout, the
-wait state owns an idempotent ready/timeout/cancel transition, and FD close,
-`EINTR`, `EBADF`, nonblocking mode, and original-syscall fallback are
-specified. The hook must resume a valid continuation or return an explicit
-status; it must never leave a G suspended after a timer/readiness race.
+This subtree-first callback order lets a callback wait on a descendant without
+deadlocking; it is a deliberate C++ extension rather than a promise of the
+Go runtime's exact callback timing. A null parent maps to `Background()`.
+Unlike Go's `Background().Done()`/`TODO().Done()` nil channel, a root here
+returns a non-null `DoneSignal` that remains permanently unsignaled.
+Callbacks should not synchronously wait on siblings or ancestors, and global
+static Context objects should not outlive the process-wide timer service during
+static destruction; those shutdown orders are caller responsibilities.
 
-The intended default is transparent interception, not only opt-in socket
-wrapper classes. The hook surface must cover at least `connect`, `accept`,
-`read`/`readv`/`recv*`, `write`/`writev`/`send*`, `close`,
-`fcntl`, `ioctl`, and socket timeout options. Calls made outside a managed
-G, calls on unsupported descriptors, and explicitly user-nonblocking calls
-must fall back to the original libc/syscall behavior. An FD registry must
-separate runtime nonblocking state from user-visible nonblocking state, retain
-send/receive timeouts, and use a generation/token so close plus descriptor
-reuse cannot wake the wrong waiter. `EINTR` is retried according to the
-operation contract; `EAGAIN` registers epoll readiness before the timer and
-parks the current Fiber; `connect(EINPROGRESS)` resumes on writability and
-checks `SO_ERROR`. `close` invalidates the generation and cancels all
-registered waits. This transparent call/return shape requires a resumable
-stackful Fiber (or an equivalent compiler-generated continuation) and cannot
-be implemented correctly by the current logical re-entry task model alone.
-The acceptance suite must include socketpair readiness, a zero/short timeout
-racing registration, readiness-versus-timeout/cancellation, concurrent close
-and FD-number reuse, user-nonblocking fallback, `EINTR`, `EBADF`, and
-leak/race instrumentation. No such tests exist in this release.
+## Channels and synchronization
 
-## Coroutine synchronization
+`Channel<T>` uses a mutex-protected FIFO ring/deque, separate sender/receiver
+wait queues and one-shot select states. A send/receive/close changes a
+generation and wakes only the claimed node(s); close drains waiters, receives
+after buffer drain report the zero value plus `ok=false`, and sends after close
+return a closed status unless `SendOrPanic` is selected. `SelectWaitState`
+prevents two cases or two unbuffered selects from claiming one operation.
 
-There are no thread-like coroutine `Mutex`, `ConditionVariable`, `Fiber`, or
-`WaitGroup` APIs in this release. The existing condition variables protect
-runtime data structures and may block an OS thread. Adding these facilities
-requires either a stackful-fiber backend (kept behind a replaceable executor
-interface) or an explicitly callback/state-machine API; a blocking
-`std::condition_variable` wrapper would not provide coroutine semantics.
+An empty select returns an invalid status rather than blocking forever like Go's
+`select {}`. Select probes/arms/disarm callbacks and select transfer copies are
+expected not to throw; there is no rollback contract for a user type whose
+copy/move constructor throws after a wait node has been claimed. Ordinary
+blocking channel calls require the `Channel` object to outlive the call;
+destruction is not a concurrent wake-up mechanism and cannot extend the
+lifetime of a raw object.
+Call `Close()` while the object is still alive when waiters must be released;
+the destructor itself must run only after all member calls and waiters have
+ended.
 
-## Defer, panic and recover
+`sync::Mutex`, `ConditionVariable` and `WaitGroup` use FIFO wait nodes and the
+same disarm gate. Managed calls release the external mutex before parking and
+reacquire it on a normal wake. Unmanaged contended `Mutex::Lock` returns false
+(or `lock()` throws `logic_error`) rather than blocking an unknown OS thread.
+WaitGroup zero transitions are wave-based, so a new `Add` cannot consume an old
+wave's notifications.
 
-`Frame` owns a LIFO defer stack. Arguments are captured by value when `defer_call` is registered. `Frame::finish` runs defers on normal return. `panic` marks the current goroutine's panic state; `Frame::unwind` runs defers in reverse order. A defer can call `recover` only while it is the active frame during that unwind; the first successful recover clears the panic and returns its payload. A panic in a defer replaces the current panic (re-panic) and unwinding continues. `run` translates an accidental C++ exception from a body into an unhandled panic after preserving the outer runtime frame path. A C++ exception thrown while a user-created `Frame` is itself being destroyed is already in C++ stack unwinding; that frame finishes normally and cannot recover the later translated panic. Such code must call `panic()` explicitly when it needs Go-style recovery. Unhandled-panic observers are isolated from accidental C++ exceptions. Panic state is thread/goroutine local and is never recoverable across scheduler tasks. `panic(nil)` is represented by a non-null `PanicValue` with `is_nil=true`, so it remains distinguishable from "no panic".
+## Socket hook and wait protocol
 
-## Error boundary
+The Linux hook is a shared C ABI interposer. It wraps `socket`/`socketpair` and
+activates cooperative I/O only for a Fiber currently owned by an IOManager;
+an ordinary thread falls through to the original libc function. Each managed
+socket has an open description recording user-visible versus runtime
+`O_NONBLOCK` and send/receive timeouts. Every potentially blocking operation
+follows this shape:
 
-Errors are immutable `shared_ptr<const Error>` values. A null handle is the only nil error; typed-nil is not manufactured by the library. `Wrap` and `Join` retain causes, `Unwrap` exposes a single cause, and `Is`/`As` walk the chain with an explicit worklist (cycles and very deep generated chains do not consume the native call stack). Built-in `WrappedError` formatting and ownership release are iterative for deep chains. Custom error graphs must remain acyclic for ownership reclamation; a shared-pointer cycle cannot be collected. `AsMutable` exists only as an explicitly unsafe adapter escape hatch and must not be used for concurrently shared errors. Errors are ordinary results and are never implicitly converted into panic requests. Context cancellation uses an error value and channel operations return status/result objects. Arbitrary custom `Message()` implementations are expected to describe acyclic chains; callers needing hostile/cyclic custom formatting should use `Is`/`As` rather than recursively formatting the message.
+1. Hold `DescriptorGuard` briefly, validate the live generation, and call the
+   original syscall.
+2. On `EAGAIN`/`EWOULDBLOCK`, release the guard and publish epoll readiness
+   and the absolute-deadline index in one State-mutex transaction. The poller
+   cannot expire that index until the readiness registration is visible, which
+   is equivalent to readiness-before-timer even though both records are
+   committed before the mutex is released.
+3. Park the current G. Readiness, timeout, cancellation and close all use one
+   atomic outcome claim; the wake path is idempotent and disarms its raw
+   scheduler pointer before the waiter leaves.
+4. Retry the original syscall with the same absolute deadline. `connect` also
+   checks `SO_ERROR` after writability.
 
-## Non-goals and explicit differences
+`DescriptorToken` generations and epoll registration IDs prevent stale events
+from reviving a reused numeric fd. Hooked `close` invalidates the token and
+broadcasts to every live IOManager before the real close. `dup2`/`dup3` preflight
+the target close and broadcast it before the replacement syscall, then publish
+cloned metadata only after success; deterministic no-op/error forms are passed
+through without a false close notification. Unknown variadic command contracts
+return `ENOTSUP` rather than reading an argument of an unknown ABI type. The
+hook intentionally does not claim to intercept every Linux socket-adjacent API
+(`poll`/`select`, `sendfile`, `splice`, `*mmsg`, `io_uring`, `close_range`,
+raw/glibc no-cancel entry points and similar helpers remain outside this
+subset). This is a deliberate safety boundary.
+`MSG_WAITALL` is passed through to libc for ordinary threads, but returns
+`ENOTSUP` in a managed Fiber because this bounded hook does not accumulate
+partial reads. Managed urgent-data receives (`MSG_OOB`) likewise return
+`ENOTSUP`; `EPOLLPRI` is intentionally not registered by this subset. Direct
+raw syscalls, fork/exec descriptor state and metadata allocation failures are
+outside exact transparent semantics; metadata allocation failures are caught
+so a successful syscall remains usable. `ioctl(FIONBIO)` lets the kernel
+validate the caller pointer first, preserving `EFAULT`, then reconstructs the
+requested state from the raw file flags while restoring runtime nonblocking.
+Readiness deadlines are rounded up to the poller's millisecond granularity;
+native-thread fallback uses bounded millisecond slices, so sub-millisecond
+timeouts are lower-bounded by that scheduling granularity.
 
-The library does not provide segmented/user-mode stacks, asynchronous compiler-level preemption, exact Go scheduler fairness, reflection-visible goroutine identities, garbage collection, Go interface ABI compatibility, or automatic panic transfer through arbitrary C++ call frames. These require compiler/ABI/GC integration and are recorded rather than simulated unsafely.
+## Extension boundaries
 
-Go runtime facilities are replaced as follows: GC and stack maps use `shared_ptr`, RAII and explicit frame ownership; `mcall`/`gogo`/`gopark`/`morestack` use the C++ worker loop and cooperative task states; `sudog`, futexes and timer waits use heap wait nodes, mutex/condition-variable notifications and the shared timer service. There is intentionally no netpoller/socket hook replacement yet. cgo, sysmon, assembly ABI details and exact traceback generation are outside this library.
+The default scheduler, Fiber backend, timer service, channel storage and epoll
+manager are concrete implementations behind public result/state contracts.
+`SchedulerConfig`, `TaskOptions`, `Context::SetNowFunctionForTesting`,
+`SelectCase`, `DescriptorGuard`/tokens and the C hook controls are the supported
+replacement/embedding boundaries. There is no binary plugin ABI before 1.0;
+replacement implementations must preserve state transitions, one-shot wake
+claims, ownership and shutdown contracts.
 
-## Extension and plugin boundary
+## Sylar clean-room audit
 
-The 0.x package intentionally exposes source-level extension points rather than a binary plugin ABI. `SchedulerConfig` is the registration contract for the default executor (P count, worker bound, queue limit and idle wait), while `Context::SetNowFunctionForTesting` injects a clock for deterministic timeout construction. `SelectCase` accepts custom non-blocking probes, which can bridge another wait backend for select only; it is not a syscall/socket hook. A future I/O hook must be registered through an explicit adapter contract and preserve the wait-state result/idempotence rules above. The scheduler worker loop, timer service and channel storage backend remain private implementation details; replacing one requires an adapter at these public boundaries and must preserve the state/result contracts in this document. A future plugin ABI is out of scope until the library has a 1.0 ABI policy.
+The local Sylar2 files were consulted as design references only:
+`/UserData/CodexWorkSpace/sylar2/sylar/fiber.cc`, `scheduler.cc`,
+`iomanager.cc` and `hook.cc` (the requested `IOManager.cc` is named
+`iomanager.cc` in that checkout). The checkout has no project license file and
+is not a Go2Cpp dependency; its source is not copied or built here. The audit
+identified useful concepts (stackful swap, scheduler queues, epoll readiness,
+readiness-before-timer hook ordering) and boundaries that needed stronger
+contracts in this project: suspended-stack destruction, raw manager pointers
+on close, fd-generation ABA, timer/readiness races, and incomplete variadic
+hook handling. Go2Cpp addresses those with raw Boost.Context ownership,
+weak/gated callbacks, generation tokens, one-shot outcomes and explicit
+`ENOTSUP` for unknown command shapes.

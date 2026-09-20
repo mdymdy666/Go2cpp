@@ -1,4 +1,5 @@
 #include "go2cpp/context.hpp"
+#include "go2cpp/scheduler.hpp"
 #include "test_support.hpp"
 
 #include <atomic>
@@ -54,6 +55,19 @@ void run_context_tests() {
     GO2CPP_CHECK(grandchild_pair.first->Done().WaitFor(100ms));
     GO2CPP_CHECK(Is(grandchild_pair.first->Err(), CanceledError()));
 
+    // Descendant cancellation is committed before parent callbacks run. A
+    // callback may therefore synchronously inspect/wait on a child without
+    // deadlocking the cancellation caller.
+    const auto callback_parent = WithCancel(root);
+    const auto callback_child = WithCancel(callback_parent.first);
+    std::atomic<bool> callback_waited{false};
+    callback_parent.first->Done().AddCallback([&] {
+        callback_waited.store(callback_child.first->Done().WaitFor(100ms),
+                              std::memory_order_release);
+    });
+    callback_parent.second();
+    GO2CPP_CHECK(callback_waited.load(std::memory_order_acquire));
+
     const auto deadline_pair = WithTimeout(root, 20ms);
     GO2CPP_CHECK(!deadline_pair.first->Done().IsDone());
     GO2CPP_CHECK(deadline_pair.first->Done().WaitFor(500ms));
@@ -64,6 +78,16 @@ void run_context_tests() {
         WithDeadline(root, Context::Clock::now() - 1s);
     GO2CPP_CHECK(already_expired.first->IsDone());
     GO2CPP_CHECK(Is(already_expired.first->Err(), DeadlineExceededError()));
+
+    // Extreme relative deadlines must saturate instead of wrapping into the
+    // past and cancelling a context that was intended to live indefinitely.
+    const auto enormous = WithTimeout(root, ContextDuration::max());
+    GO2CPP_CHECK(enormous.first->Deadline() == ContextTimePoint::max());
+    GO2CPP_CHECK(!enormous.first->IsDone());
+    enormous.second();
+    const auto immediate = WithTimeout(root, ContextDuration::min());
+    GO2CPP_CHECK(immediate.first->IsDone());
+    GO2CPP_CHECK(Is(immediate.first->Err(), DeadlineExceededError()));
 
     const auto fake_now = Context::Clock::now() + 10s;
     Context::SetNowFunctionForTesting([fake_now] { return fake_now; });
@@ -101,4 +125,28 @@ void run_context_tests() {
     deep_pair.second();
     GO2CPP_CHECK(deep_leaf->Done().WaitFor(2s));
     GO2CPP_CHECK(Is(deep_leaf->Err(), CanceledError()));
+
+    // Done().Wait/WaitFor must park a managed G. With one P the cancelling
+    // sibling can only run if the waiter releases its M instead of entering
+    // a native condition_variable wait.
+    Scheduler managed(1);
+    managed.start();
+    auto managed_cancel = WithCancel(Background());
+    std::atomic<bool> managed_waited{false};
+    std::atomic<bool> managed_result{false};
+    auto managed_waiter = managed.spawn([&] {
+        managed_waited.store(true, std::memory_order_release);
+        managed_result.store(managed_cancel.first->Done().WaitFor(1s),
+                             std::memory_order_release);
+    });
+    const auto managed_deadline = std::chrono::steady_clock::now() + 1s;
+    while (!managed_waited.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < managed_deadline) {
+        std::this_thread::yield();
+    }
+    auto managed_canceller = managed.spawn([&] { managed_cancel.second(); });
+    GO2CPP_CHECK(managed_waiter->wait_for(2s));
+    GO2CPP_CHECK(managed_canceller->wait_for(2s));
+    GO2CPP_CHECK(managed_result.load(std::memory_order_acquire));
+    managed.shutdown();
 }

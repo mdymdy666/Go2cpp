@@ -1,66 +1,108 @@
-# GMP scheduler module
+# GMP Scheduler Contract
 
-The scheduler is a small, independent C++17 implementation of the part of
-the Go G/M/P model that can be represented without compiler-generated stacks.
-`Task` is the G record, `Machine` is a worker OS thread, and each processor
-owns a local run queue.  A bounded local queue spills to the scheduler's
-global FIFO queue; an idle worker steals from the back of another processor's
-queue.
+## Data and ownership
 
-## State and ownership
+| Record | C++ object | Owner and invariant |
+|---|---|---|
+| G | `scheduler::Task` | Strongly retained by the scheduler registry while non-terminal; one `m_execution_claim`; one queue claim `m_queued`; first admitting scheduler owns it permanently |
+| M | private `Machine` plus `std::thread` | One worker thread, one preferred P, dynamically admitted/retired under the scheduler mutex |
+| P | private `Processor` | Bounded local queue and active-M count; at most one live M is assigned while the effective M bound is clamped to P |
 
-Only the following transitions are accepted:
+The transition table is:
 
 ```text
-new       -> runnable | cancelled
-runnable  -> running | cancelled
-running   -> runnable | waiting | dead | cancelled
-waiting   -> runnable | cancelled
-dead      -> (terminal)
-cancelled -> (terminal)
+new -> runnable -> running -> runnable | waiting | dead | cancelled
+waiting -> runnable | cancelled
+dead/cancelled -> terminal
 ```
 
-An unhandled panic (or a C++ exception translated at the goroutine boundary)
-may finalize a task that has already marked itself runnable/waiting; the
-worker clears deferred requeue state before entering `dead`.
+The worker-state transitions exposed by snapshots are:
 
-`Task::m_queued` is a single queue-membership claim. A worker removes a node
-and claims `m_queued=false`, `m_execution_claim=true`, and `runnable -> running`
-under one scheduler-admission transaction. A task is permanently bound to the
-first scheduler that admits it; attempts to enqueue or wake it through another
-scheduler are rejected without changing its state.
-`Task::m_execution_claim`
-is a separate run claim, so an external wake or yield cannot cause two workers
-to enter one callable concurrently.  Queue insertion and shutdown admission
-are serialized by the scheduler mutex. Queue nodes own `shared_ptr<Task>`;
-workers never retain a raw task pointer after releasing that ownership. The
-scheduler registry stores weak task entries only while a G is live; worker
-completion, admission, and shutdown prune `dead`/`cancelled` entries even when
-the caller retains a terminal `Task` handle, so registry metadata does not
-grow with the lifetime of a long-running scheduler.
+```text
+M: idle -> running -> idle -> parked -> idle
+                 \-> stopping -> dead
+    parked -> stopping -> dead
+P: idle <-> running; idle -> dead during shutdown
+```
 
-An M holds one preferred P for its lifetime. `max_workers` is clamped to the
-configured P count, so each P has at most one worker M in this backend. `yield`
-and `park` are cooperative operations available only to the currently
-executing G; an external caller must not mutate a running G because this
-backend has no resumable C++ stack. `wake` transitions a waiting G directly;
-when it races with a running G's `park`, it records a pending wake token that
-`park` consumes and hands back to the worker loop. A native blocking call
-inside a task still occupies its M until it returns.
+`M::blocking` and `M::stopping`/`P::stopping` are reserved enum states; the
+current cooperative backend does not publish `blocking` or `P::stopping` while
+it has no blocking-region handoff. A retiring or shutdown worker publishes
+`M::stopping` before `M::dead`.
 
-## Shutdown
+Queue insertion, removal, runnable accounting, shutdown admission and the
+`runnable -> running` claim are serialized by the scheduler admission mutex.
+The task transition mutex protects state/claim fields. Code never destroys a
+user capture while holding a scheduler, P, queue or completion lock.
 
-Shutdown closes admission, marks all queued tasks cancelled, and wakes parked
-workers. A worker-initiated call publishes the stop request and returns without
-joining any M, preventing concurrent worker callers from joining each other;
-the owning external thread performs all joins. A task already executing on an
-M is allowed to return; a task removed concurrently but not yet claimed is
-cancelled. Shutdown is one-way and idempotent. The scheduler object must stay
-alive until every worker has returned; a worker may request shutdown but must
-not destroy its owning scheduler. Final destruction belongs to the external
-owner after the join.
+The queue/claim invariant is:
 
-The implementation deliberately does not provide segmented stacks,
-compiler-level asynchronous preemption, or transparent detachment around
-blocking system calls.  Those facilities require a compiler/ABI integration
-that is outside this standalone compatibility library.
+* a runnable G has either one queue/rescue node (`m_queued=true`) or is in the
+  admission handoff; it is never present in two queues;
+* a running G owns `m_execution_claim=true` and is absent from all queues;
+  dequeue clears `m_queued` and claims execution in one transition;
+* `runnable_count` counts admitted queue/rescue nodes, while a pending wake
+  token does not count as runnable work; terminal Gs have no queue or execution
+  claim.
+
+The short admission window may expose an intermediate field value only while
+the scheduler mutex is held; workers and notifiers cannot observe that window.
+
+## Wake and park protocol
+
+Only the current G may call `yield` or `park`. A notifier seeing `waiting`
+changes it to `runnable` and enqueues it. A notifier racing with a running G
+sets one pending wake bit; `park` consumes that bit and keeps the continuation
+running. A wake racing with shutdown either enters the queue/rescue list or is
+observed as cancellation. Wait nodes use a separate wake gate so `disarm()`
+waits for an in-flight callback before a scheduler pointer can become invalid.
+
+Each worker admission resumes the Fiber continuation; repeated admissions
+continue it until the callable returns. The scheduler does not call the
+callable again after a yield; the continuation resumes at the instruction
+after the switch. A direct `Fiber::Suspend` is mapped to runnable for `Yield`
+and to waiting for other reasons, except that a concurrent wake/cancellation is
+converted to a runnable continuation so shutdown cannot strand the G between
+the context switch and state publication. Raw Fiber suspension remains an
+advanced API and must still return cooperatively.
+
+## Dynamic M policy
+
+`min_workers` is the retained floor. When queued work plus busy workers exceeds
+the active count, the scheduler adds M records up to the effective
+`max_workers`; the effective maximum is `min(requested_max_workers, P)`. An idle
+M waits `idle_worker_timeout`, reserves retirement under the admission mutex,
+and decrements both global and P-local active counts exactly once. Dead records
+are joined outside scheduler locks and removed from snapshots. Task class IDs
+are a bounded scan preference with hit/miss counters; stealing remains
+available, so class locality cannot starve other work.
+
+This is intentionally not a claim of Go's `sysmon` or blocking-region
+behavior. A native syscall that is not intercepted continues to occupy its M.
+Adding a blocking-region adapter requires a new public registration contract,
+P release/reacquisition proof, and separate stress tests before M may exceed P.
+
+## Shutdown and join
+
+Shutdown is one-way. It closes admission, cancels unstarted queued Gs, marks
+started Gs for cooperative cancellation, wakes parked Gs, and waits until every
+registered G is terminal. Worker-initiated shutdown only publishes the drain
+request; once the last G is terminal, a worker marks the scheduler stopping and
+exits without joining itself. The owning thread performs the final joins.
+
+`Task::wait`/`Join` and timed variants use `core::ParkingCondition` when called
+inside a managed G, so a one-P scheduler can run the joined child. Unmanaged
+callers use the same predicate with a native condition-variable fallback.
+Self-join and a cancelled managed waiter return false. Destroying a suspended
+Fiber is a cancellation request followed by natural completion; a body that
+never reaches a cooperative/return boundary can therefore make join or
+shutdown wait, which is preferable to skipping C++ RAII.
+
+## Diagnostics and tests
+
+`processors()` and `machines()` expose snapshots only; they do not grant queue
+ownership. Tests cover P=1 and multi-P execution, duplicate enqueue/wake races,
+cross-scheduler rejection, parked cancellation, raw Fiber park cancellation,
+cancelled queue capture release, dynamic growth/shrink/regrow, P caps,
+task-class counters, worker shutdown, task destructor re-entry and
+watchdog-bounded stress.

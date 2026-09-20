@@ -49,6 +49,44 @@ private:
 
 class Frame;
 
+// Owns the panic/defer state of one logical execution stream. Binding the
+// context lets a stackful Fiber carry this state when it migrates between OS
+// threads. Calls made without a Binding continue to use a thread-local
+// fallback context.
+class ExecutionContext {
+public:
+    ExecutionContext();
+    ~ExecutionContext();
+    ExecutionContext(const ExecutionContext&) = delete;
+    ExecutionContext& operator=(const ExecutionContext&) = delete;
+    ExecutionContext(ExecutionContext&&) = delete;
+    ExecutionContext& operator=(ExecutionContext&&) = delete;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+
+    friend class Binding;
+};
+
+// Installs an ExecutionContext for the lifetime of this guard and restores
+// the previous context on destruction. Bindings may be nested, but a single
+// ExecutionContext must not be bound concurrently by multiple threads.
+class Binding {
+public:
+    explicit Binding(ExecutionContext& context) noexcept;
+    ~Binding() noexcept;
+    Binding(const Binding&) = delete;
+    Binding& operator=(const Binding&) = delete;
+    Binding(Binding&&) = delete;
+    Binding& operator=(Binding&&) = delete;
+
+private:
+    // Opaque pointer keeps the execution-state representation private while
+    // making this guard allocation-free on every Fiber context switch.
+    void* m_previous{nullptr};
+};
+
 // A goroutine-local execution boundary.  Constructing a boundary installs a
 // frame on the current thread.  It is safe to call finish() or unwind() more
 // than once; the first terminal operation owns the defer stack.
@@ -59,7 +97,7 @@ public:
     Frame& operator=(const Frame&) = delete;
     Frame(Frame&&) = delete;
     Frame& operator=(Frame&&) = delete;
-    ~Frame();
+    ~Frame() noexcept;
 
     template <typename F>
     void defer_call(F&& callback) {
@@ -128,7 +166,7 @@ bool run(std::function<void()> body);
 // one G task to another on a reused M thread.
 class GoroutineScope {
 public:
-    GoroutineScope() noexcept;
+    GoroutineScope();
     GoroutineScope(const GoroutineScope&) = delete;
     GoroutineScope& operator=(const GoroutineScope&) = delete;
     ~GoroutineScope() noexcept;

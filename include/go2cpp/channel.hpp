@@ -1,6 +1,7 @@
 #pragma once
 
 #include "go2cpp/context.hpp"
+#include "go2cpp/core/parking_condition.hpp"
 #include "go2cpp/error.hpp"
 #include "go2cpp/panic_defer.hpp"
 
@@ -14,6 +15,7 @@
 #include <deque>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -76,6 +78,21 @@ struct SelectCase;
 
 namespace detail {
 
+inline ContextTimePoint SaturatingDeadline(ContextDuration timeout) noexcept {
+  const auto now = std::chrono::steady_clock::now();
+  if (timeout > ContextDuration::zero() &&
+      now > ContextTimePoint::max() - timeout) {
+    return ContextTimePoint::max();
+  }
+  if (timeout < ContextDuration::zero() &&
+      (timeout.count() ==
+           std::numeric_limits<ContextDuration::rep>::min() ||
+       now < ContextTimePoint::min() - timeout)) {
+    return ContextTimePoint::min();
+  }
+  return now + timeout;
+}
+
 // Shared by every armed case in one Select call. A channel operation must
 // claim this state before committing a transfer, which prevents two ready
 // channels from selecting the same caller concurrently.
@@ -127,10 +144,20 @@ class SelectWaitState final {
     return m_selected;
   }
 
-  bool WaitFor(ContextDuration timeout) {
+  bool WaitFor(ContextDuration timeout, const ContextPtr& context = {}) {
     std::unique_lock<std::mutex> lock(m_mutex);
     return m_cv.wait_for(lock, timeout,
-                         [this] { return m_selected || m_cancelled; });
+                         [this, &context] {
+                           return m_selected || m_cancelled ||
+                                  (context && context->IsDone());
+                         });
+  }
+
+  bool Wait(const ContextPtr& context = {}) {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    return m_cv.wait(lock, [this, &context] {
+      return m_selected || m_cancelled || (context && context->IsDone());
+    });
   }
 
   void Notify() { m_cv.notify_one(); }
@@ -162,7 +189,7 @@ class SelectWaitState final {
 
  private:
   mutable std::mutex m_mutex;
-  std::condition_variable m_cv;
+  core::ParkingCondition m_cv;
   bool m_selected{false};
   bool m_cancelled{false};
   bool m_taken{false};
@@ -245,7 +272,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     if (timeout < Duration::zero()) {
       timeout = Duration::zero();
     }
-    return SendUntil(std::move(value), std::chrono::steady_clock::now() + timeout,
+    return SendUntil(std::move(value), detail::SaturatingDeadline(timeout),
                      context, false);
   }
 
@@ -261,7 +288,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     if (timeout < Duration::zero()) {
       timeout = Duration::zero();
     }
-    return RecvUntil(std::chrono::steady_clock::now() + timeout, context, false);
+    return RecvUntil(detail::SaturatingDeadline(timeout), context, false);
   }
 
   ChannelRecvResult<T> TryRecv() {
@@ -634,7 +661,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     ErrorPtr error;
     std::shared_ptr<detail::SelectWaitState> select_state;
     std::size_t select_index{static_cast<std::size_t>(-1)};
-    std::condition_variable cv;
+    core::ParkingCondition cv;
   };
 
   struct PendingRecv {
@@ -646,7 +673,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     ErrorPtr error;
     std::shared_ptr<detail::SelectWaitState> select_state;
     std::size_t select_index{static_cast<std::size_t>(-1)};
-    std::condition_variable cv;
+    core::ParkingCondition cv;
   };
 
   struct CallbackGuard {
@@ -736,8 +763,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           continue;
         }
       }
-      m_receivers.pop_front();
       receiver->value.emplace(std::move(value));
+      m_receivers.pop_front();
       receiver->ok = true;
       receiver->ready = true;
       receiver->status = ChannelStatus::kReady;
@@ -784,15 +811,18 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
 
       ErrorPtr context_error;
       const auto context_status = ContextRecvStatus(context, &context_error);
-      if (context_status != ChannelStatus::kReady) {
+      if (context_status != ChannelStatus::kReady ||
+          core::ParkingCondition::CancellationRequested()) {
         pending->cancelled = true;
-        pending->status = context_status;
-        pending->error = context_error;
+        pending->status = context_status != ChannelStatus::kReady
+                              ? context_status
+                              : ChannelStatus::kCancelled;
+        pending->error = context_error ? context_error : CanceledError();
         ErasePending(m_senders, pending);
         ++m_generation;
         lock.unlock();
         m_change_cv.notify_all();
-        return {context_status, context_error};
+        return {pending->status, pending->error};
       }
       if (DeadlineReached(deadline)) {
         pending->cancelled = true;
@@ -807,15 +837,12 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
 
       if (deadline.has_value()) {
         auto wait_for = *deadline - std::chrono::steady_clock::now();
-        if (wait_for > std::chrono::milliseconds(2)) {
-          wait_for = std::chrono::milliseconds(2);
-        }
         pending->cv.wait_for(lock, wait_for, [&] {
           return pending->accepted || pending->closed || pending->cancelled ||
                  (context && context->IsDone());
         });
       } else {
-        pending->cv.wait_for(lock, std::chrono::milliseconds(2), [&] {
+        pending->cv.wait(lock, [&] {
           return pending->accepted || pending->closed || pending->cancelled ||
                  (context && context->IsDone());
         });
@@ -848,8 +875,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     // An unbuffered sender can rendezvous directly with this receiver.
     while (!m_senders.empty()) {
       auto sender = m_senders.front();
-      m_senders.pop_front();
       if (sender->cancelled) {
+        m_senders.pop_front();
         continue;
       }
       if (sender->select_state) {
@@ -860,10 +887,12 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         if (!sender->select_state->TrySelect(sender->select_index,
                                              std::move(probe))) {
           sender->cancelled = true;
+          m_senders.pop_front();
           continue;
         }
       }
       T value = std::move(sender->value);
+      m_senders.pop_front();
       sender->accepted = true;
       sender->status = ChannelStatus::kReady;
       sender->cv.notify_one();
@@ -911,15 +940,18 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
 
       context_error.reset();
       const auto status = ContextRecvStatus(context, &context_error);
-      if (status != ChannelStatus::kReady) {
+      if (status != ChannelStatus::kReady ||
+          core::ParkingCondition::CancellationRequested()) {
         pending->cancelled = true;
-        pending->status = status;
-        pending->error = context_error;
+        pending->status = status != ChannelStatus::kReady
+                              ? status
+                              : ChannelStatus::kCancelled;
+        pending->error = context_error ? context_error : CanceledError();
         ErasePending(m_receivers, pending);
         ++m_generation;
         lock.unlock();
         m_change_cv.notify_all();
-        return {std::nullopt, false, true, status, context_error};
+        return {std::nullopt, false, true, pending->status, pending->error};
       }
       if (DeadlineReached(deadline)) {
         pending->cancelled = true;
@@ -935,15 +967,12 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
 
       if (deadline.has_value()) {
         auto wait_for = *deadline - std::chrono::steady_clock::now();
-        if (wait_for > std::chrono::milliseconds(2)) {
-          wait_for = std::chrono::milliseconds(2);
-        }
         pending->cv.wait_for(lock, wait_for, [&] {
           return pending->ready || pending->cancelled ||
                  (context && context->IsDone());
         });
       } else {
-        pending->cv.wait_for(lock, std::chrono::milliseconds(2), [&] {
+        pending->cv.wait(lock, [&] {
           return pending->ready || pending->cancelled ||
                  (context && context->IsDone());
         });
@@ -991,7 +1020,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
 
   std::size_t m_capacity{0};
   mutable std::mutex m_mutex;
-  mutable std::condition_variable m_change_cv;
+  mutable core::ParkingCondition m_change_cv;
   std::deque<T> m_buffer;
   std::deque<std::shared_ptr<PendingSend>> m_senders;
   std::deque<std::shared_ptr<PendingRecv>> m_receivers;

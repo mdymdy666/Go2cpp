@@ -50,6 +50,7 @@ void test_single_processor_fifo_and_completion() {
     }
     SMOKE_CHECK(wait_until([&] { return completed.load() == 100; }));
     for (const auto& task : tasks) {
+        SMOKE_CHECK(task->wait_for(3s));
         SMOKE_CHECK(task->state() == go2cpp::GState::kDead);
     }
     scheduler.shutdown();
@@ -91,25 +92,23 @@ void test_yield_and_park_wake() {
     std::atomic<int> yield_runs{0};
     std::shared_ptr<go2cpp::Task> yielding;
     yielding = scheduler.spawn([&] {
-        const int run = yield_runs.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (run == 1) {
-            SMOKE_CHECK(scheduler.yield(yielding));
-        }
+        yield_runs.fetch_add(1, std::memory_order_release);
+        SMOKE_CHECK(scheduler.yield(yielding));
+        yield_runs.fetch_add(1, std::memory_order_release);
     });
 
     std::atomic<int> park_runs{0};
     std::shared_ptr<go2cpp::Task> parked;
     parked = scheduler.spawn([&] {
-        park_runs.fetch_add(1, std::memory_order_relaxed);
-        if (park_runs.load(std::memory_order_relaxed) == 1) {
-            SMOKE_CHECK(scheduler.park(parked));
-        }
+        park_runs.fetch_add(1, std::memory_order_release);
+        SMOKE_CHECK(scheduler.park(parked));
+        park_runs.fetch_add(1, std::memory_order_release);
     });
     scheduler.start();
     SMOKE_CHECK(wait_until([&] { return yield_runs.load() == 2; }));
     SMOKE_CHECK(wait_until([&] { return park_runs.load() == 1; }));
     SMOKE_CHECK(parked->state() == go2cpp::GState::kWaiting);
-    SMOKE_CHECK(scheduler.wake(parked));
+    (void)scheduler.wake(parked);
     SMOKE_CHECK(wait_until([&] { return park_runs.load() == 2; }));
     scheduler.shutdown();
 }
@@ -164,17 +163,16 @@ void test_wake_token_cleared_by_yield() {
     std::atomic<bool> park_return{false};
     std::shared_ptr<go2cpp::Task> task;
     task = std::make_shared<go2cpp::Task>([&] {
-        const int run = runs.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (run == 1) {
-            entered.store(true, std::memory_order_release);
-            while (!release_yield.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-            SMOKE_CHECK(scheduler.yield(task));
-        } else if (run == 2) {
-            park_entered.store(true, std::memory_order_release);
-            park_return.store(scheduler.park(task), std::memory_order_release);
+        runs.fetch_add(1, std::memory_order_acq_rel);
+        entered.store(true, std::memory_order_release);
+        while (!release_yield.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
         }
+        SMOKE_CHECK(scheduler.yield(task));
+        runs.fetch_add(1, std::memory_order_acq_rel);
+        park_entered.store(true, std::memory_order_release);
+        park_return.store(scheduler.park(task), std::memory_order_release);
+        runs.fetch_add(1, std::memory_order_acq_rel);
     });
     SMOKE_CHECK(scheduler.enqueue(task));
     scheduler.start();
@@ -188,12 +186,13 @@ void test_wake_token_cleared_by_yield() {
         return park_entered.load(std::memory_order_acquire) &&
                task->state() == go2cpp::GState::kWaiting;
     }));
-    SMOKE_CHECK(park_return.load(std::memory_order_acquire));
-    SMOKE_CHECK(scheduler.wake(task));
+    SMOKE_CHECK(!park_return.load(std::memory_order_acquire));
+    (void)scheduler.wake(task);
     SMOKE_CHECK(wait_until([&] {
         return runs.load(std::memory_order_acquire) >= 3 &&
                task->state() == go2cpp::GState::kDead;
     }));
+    SMOKE_CHECK(park_return.load(std::memory_order_acquire));
     scheduler.shutdown();
 }
 
@@ -203,36 +202,33 @@ void test_enqueue_rejected_while_yielding_callable_is_active() {
     config.max_workers = 2;
     go2cpp::Scheduler scheduler(config);
     std::atomic<int> runs{0};
-    std::atomic<bool> yielded{false};
-    std::atomic<bool> release{false};
+    std::atomic<int> active{0};
+    std::atomic<int> duplicate{0};
     std::shared_ptr<go2cpp::Task> task;
     task = std::make_shared<go2cpp::Task>([&] {
-        const int run = runs.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (run == 1) {
-            SMOKE_CHECK(scheduler.yield(task));
-            yielded.store(true, std::memory_order_release);
-            while (!release.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
+        if (active.fetch_add(1, std::memory_order_acq_rel) != 0) {
+            duplicate.fetch_add(1, std::memory_order_relaxed);
         }
+        runs.fetch_add(1, std::memory_order_release);
+        SMOKE_CHECK(scheduler.yield(task));
+        runs.fetch_add(1, std::memory_order_release);
+        SMOKE_CHECK(scheduler.yield(task));
+        runs.fetch_add(1, std::memory_order_release);
+        active.fetch_sub(1, std::memory_order_release);
     });
     SMOKE_CHECK(scheduler.enqueue(task));
     scheduler.start();
+    const auto duplicate_deadline = std::chrono::steady_clock::now() + 3s;
+    while (task->state() != go2cpp::GState::kDead &&
+           std::chrono::steady_clock::now() < duplicate_deadline) {
+        (void)scheduler.enqueue(task);
+        std::this_thread::yield();
+    }
     SMOKE_CHECK(wait_until([&] {
-        return yielded.load(std::memory_order_acquire) &&
-               task->state() == go2cpp::GState::kRunnable;
-    }));
-
-    // The callable still owns the execution claim even though it yielded its
-    // logical state. A second queue node would allow two M's to run the same
-    // G, so admission must reject this enqueue.
-    SMOKE_CHECK(!scheduler.enqueue(task));
-    SMOKE_CHECK(!task->queued());
-    release.store(true, std::memory_order_release);
-    SMOKE_CHECK(wait_until([&] {
-        return runs.load(std::memory_order_acquire) == 2 &&
+        return runs.load(std::memory_order_acquire) == 3 &&
                task->state() == go2cpp::GState::kDead;
     }));
+    SMOKE_CHECK(duplicate.load(std::memory_order_acquire) == 0);
     scheduler.shutdown();
 }
 
@@ -243,17 +239,12 @@ void test_wake_after_park_defers_until_callable_returns() {
     go2cpp::Scheduler scheduler(config);
     std::atomic<int> runs{0};
     std::atomic<bool> parked{false};
-    std::atomic<bool> release{false};
     std::shared_ptr<go2cpp::Task> task;
     task = std::make_shared<go2cpp::Task>([&] {
-        const int run = runs.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (run == 1) {
-            SMOKE_CHECK(scheduler.park(task));
-            parked.store(true, std::memory_order_release);
-            while (!release.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-        }
+        runs.fetch_add(1, std::memory_order_release);
+        parked.store(true, std::memory_order_release);
+        SMOKE_CHECK(scheduler.park(task));
+        runs.fetch_add(1, std::memory_order_release);
     });
     SMOKE_CHECK(scheduler.enqueue(task));
     scheduler.start();
@@ -262,12 +253,7 @@ void test_wake_after_park_defers_until_callable_returns() {
                task->state() == go2cpp::GState::kWaiting;
     }));
 
-    // wake() records a permit but cannot enqueue while the current M still
-    // owns the callable. The worker publishes the resumed run only after the
-    // callable releases its execution claim.
-    SMOKE_CHECK(!scheduler.wake(task));
-    SMOKE_CHECK(task->state() == go2cpp::GState::kRunnable);
-    release.store(true, std::memory_order_release);
+    (void)scheduler.wake(task);
     SMOKE_CHECK(wait_until([&] {
         return runs.load(std::memory_order_acquire) == 2 &&
                task->state() == go2cpp::GState::kDead;
@@ -281,10 +267,11 @@ void test_shutdown_cancels_waiting_task() {
     config.max_workers = 1;
     go2cpp::Scheduler scheduler(config);
     std::atomic<bool> parked{false};
+    std::atomic<bool> park_result{true};
     std::shared_ptr<go2cpp::Task> task;
     task = scheduler.spawn([&] {
         parked.store(true, std::memory_order_release);
-        SMOKE_CHECK(scheduler.park(task));
+        park_result.store(scheduler.park(task), std::memory_order_release);
     });
     scheduler.start();
     SMOKE_CHECK(wait_until([&] {
@@ -293,6 +280,7 @@ void test_shutdown_cancels_waiting_task() {
     }));
     scheduler.shutdown();
     SMOKE_CHECK(task->state() == go2cpp::GState::kCancelled);
+    SMOKE_CHECK(!park_result.load(std::memory_order_acquire));
 }
 
 void test_exception_isolation_and_shutdown_cancel() {

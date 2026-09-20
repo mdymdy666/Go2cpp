@@ -176,9 +176,6 @@ ErrorPtr Join(std::vector<ErrorPtr> causes) {
   if (filtered.empty()) {
     return {};
   }
-  if (filtered.size() == 1) {
-    return filtered.front();
-  }
   return std::make_shared<JoinError>(std::move(filtered));
 }
 

@@ -40,12 +40,20 @@ SelectResult Select(const std::vector<SelectCase>& cases,
   }
 
   bool has_default = false;
+  bool has_usable_case = false;
   for (const auto& item : cases) {
     has_default = has_default || item.is_default;
+    has_usable_case = has_usable_case || item.is_default ||
+                      static_cast<bool>(item.probe) ||
+                      static_cast<bool>(item.arm);
   }
-  const auto start = std::chrono::steady_clock::now();
+  if (!has_usable_case) {
+    return {SelectResult::kNoSelection, false, false, {},
+            ChannelStatus::kInvalid, NewError("select has no usable cases")};
+  }
   const auto deadline =
-      timeout.has_value() ? std::optional<ContextTimePoint>(start + *timeout)
+      timeout.has_value()
+          ? std::optional<ContextTimePoint>(detail::SaturatingDeadline(*timeout))
                            : std::nullopt;
   static std::atomic<std::size_t> cursor{0};
 
@@ -101,13 +109,14 @@ SelectResult Select(const std::vector<SelectCase>& cases,
               ChannelStatus::kTimedOut, ChannelTimeoutError()};
     }
 
-    bool has_armed_case = false;
+    bool has_poll_case = false;
     auto wait_state = std::make_shared<detail::SelectWaitState>();
     for (std::size_t index = 0; index < cases.size(); ++index) {
       if (!cases[index].arm) {
+        has_poll_case = has_poll_case ||
+                        (!cases[index].is_default && cases[index].probe);
         continue;
       }
-      has_armed_case = true;
       cases[index].arm(wait_state, index);
     }
 
@@ -160,20 +169,23 @@ SelectResult Select(const std::vector<SelectCase>& cases,
       if (context && context->IsDone()) {
         break;
       }
+      if (core::ParkingCondition::CancellationRequested()) {
+        break;
+      }
       if (deadline.has_value()) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= *deadline) {
           break;
         }
         auto remaining = *deadline - now;
-        if (remaining > std::chrono::milliseconds(2)) {
+        if (has_poll_case && remaining > std::chrono::milliseconds(2)) {
           remaining = std::chrono::milliseconds(2);
         }
-        wait_state->WaitFor(remaining);
-      } else if (has_armed_case) {
-        wait_state->WaitFor(std::chrono::milliseconds(2));
+        wait_state->WaitFor(remaining, context);
+      } else if (has_poll_case) {
+        wait_state->WaitFor(std::chrono::milliseconds(2), context);
       } else {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        wait_state->Wait(context);
       }
     }
 
@@ -207,6 +219,10 @@ SelectResult Select(const std::vector<SelectCase>& cases,
               deadline_error ? ChannelStatus::kDeadlineExceeded
                              : ChannelStatus::kCancelled,
               err ? err : CanceledError()};
+    }
+    if (core::ParkingCondition::CancellationRequested()) {
+      return {SelectResult::kNoSelection, false, false, {},
+              ChannelStatus::kCancelled, CanceledError()};
     }
     if (deadline.has_value() &&
         std::chrono::steady_clock::now() >= *deadline) {

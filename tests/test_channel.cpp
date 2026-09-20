@@ -1,4 +1,5 @@
 #include "go2cpp/channel.hpp"
+#include "go2cpp/scheduler.hpp"
 #include "test_support.hpp"
 
 #include <atomic>
@@ -86,6 +87,12 @@ void run_channel_tests() {
     const auto nil_select = Select({RecvCase(ChannelPtr<int>{})});
     GO2CPP_CHECK(nil_select.selected &&
                  nil_select.status == ChannelStatus::kNil);
+    const auto empty_select = Select({});
+    GO2CPP_CHECK(!empty_select.selected &&
+                 empty_select.status == ChannelStatus::kInvalid);
+    const auto inert_select = Select({SelectCase{}});
+    GO2CPP_CHECK(!inert_select.selected &&
+                 inert_select.status == ChannelStatus::kInvalid);
 
     auto timeout_channel = MakeChannel<int>(0);
     const auto timeout_recv = timeout_channel->RecvFor(5ms);
@@ -311,4 +318,126 @@ void run_channel_tests() {
     }
     GO2CPP_CHECK(consumed.load(std::memory_order_relaxed) ==
                  producer_count * values_per_producer);
+
+    // A channel wait in a managed G must release the only M. These checks use
+    // one processor/worker deliberately: a native condition_variable wait
+    // would deadlock the sender forever.
+    SchedulerConfig managed_config;
+    managed_config.processor_count = 1;
+    managed_config.max_workers = 1;
+    managed_config.idle_wait = 1ms;
+    Scheduler managed(managed_config);
+    managed.start();
+
+    auto managed_rendezvous = MakeChannel<int>(0);
+    std::atomic<bool> managed_recv_started{false};
+    std::atomic<bool> managed_recv_done{false};
+    std::atomic<int> managed_value{0};
+    auto managed_receiver = managed.spawn([&] {
+        managed_recv_started.store(true, std::memory_order_release);
+        const auto result = managed_rendezvous->Recv();
+        if (result.Ok()) {
+            managed_value.store(result.ValueOrDefault(), std::memory_order_release);
+        }
+        managed_recv_done.store(result.Ok(), std::memory_order_release);
+    });
+    const auto managed_start_deadline = std::chrono::steady_clock::now() + 1s;
+    while (!managed_recv_started.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < managed_start_deadline) {
+        std::this_thread::yield();
+    }
+    GO2CPP_CHECK(managed_recv_started.load(std::memory_order_acquire));
+    while (managed_receiver->state() != GState::kWaiting &&
+           std::chrono::steady_clock::now() < managed_start_deadline) {
+        std::this_thread::yield();
+    }
+    auto managed_sender = managed.spawn([&] {
+        GO2CPP_CHECK(managed_rendezvous->Send(91).Ok());
+    });
+    GO2CPP_CHECK(managed_receiver->wait_for(1s));
+    GO2CPP_CHECK(managed_sender->wait_for(1s));
+    GO2CPP_CHECK(managed_recv_done.load(std::memory_order_acquire));
+    GO2CPP_CHECK(managed_value.load(std::memory_order_acquire) == 91);
+
+    auto managed_buffer = MakeChannel<int>(2);
+    std::atomic<int> managed_sum{0};
+    auto managed_buffer_sender = managed.spawn([&] {
+        for (int value = 1; value <= 4; ++value) {
+            GO2CPP_CHECK(managed_buffer->SendFor(value, 1s).Ok());
+        }
+    });
+    auto managed_buffer_receiver = managed.spawn([&] {
+        for (int i = 0; i != 4; ++i) {
+            const auto result = managed_buffer->RecvFor(1s);
+            GO2CPP_CHECK(result.Ok());
+            managed_sum.fetch_add(result.ValueOrDefault(),
+                                  std::memory_order_relaxed);
+        }
+    });
+    GO2CPP_CHECK(managed_buffer_sender->wait_for(2s));
+    GO2CPP_CHECK(managed_buffer_receiver->wait_for(2s));
+    GO2CPP_CHECK(managed_sum.load(std::memory_order_relaxed) == 10);
+
+    auto managed_timeout_channel = MakeChannel<int>(0);
+    std::atomic<ChannelStatus> managed_timeout{ChannelStatus::kInvalid};
+    auto timeout_task = managed.spawn([&] {
+        managed_timeout.store(managed_timeout_channel->RecvFor(25ms).status,
+                              std::memory_order_release);
+    });
+    GO2CPP_CHECK(timeout_task->wait_for(1s));
+    GO2CPP_CHECK(managed_timeout.load(std::memory_order_acquire) ==
+                 ChannelStatus::kTimedOut);
+
+    auto managed_cancel_channel = MakeChannel<int>(0);
+    auto managed_cancel_context = WithCancel(Background());
+    std::atomic<ChannelStatus> managed_cancel_status{ChannelStatus::kInvalid};
+    auto cancel_task = managed.spawn([&] {
+        managed_cancel_status.store(
+            managed_cancel_channel->Recv(managed_cancel_context.first).status,
+            std::memory_order_release);
+    });
+    while (cancel_task->state() != GState::kWaiting &&
+           std::chrono::steady_clock::now() < managed_start_deadline) {
+        std::this_thread::yield();
+    }
+    managed_cancel_context.second();
+    GO2CPP_CHECK(cancel_task->wait_for(1s));
+    GO2CPP_CHECK(managed_cancel_status.load(std::memory_order_acquire) ==
+                 ChannelStatus::kCancelled);
+
+    auto managed_select_channel = MakeChannel<int>(0);
+    std::atomic<bool> managed_select_ok{false};
+    auto managed_select_receiver = managed.spawn([&] {
+        const auto result = Select({RecvCase(managed_select_channel)}, {}, 1s);
+        managed_select_ok.store(result.selected && result.ok &&
+                                     result.Value<int>().value_or(0) == 93,
+                                 std::memory_order_release);
+    });
+    while (managed_select_receiver->state() != GState::kWaiting &&
+           std::chrono::steady_clock::now() < managed_start_deadline) {
+        std::this_thread::yield();
+    }
+    auto managed_select_sender = managed.spawn([&] {
+        GO2CPP_CHECK(managed_select_channel->Send(93).Ok());
+    });
+    GO2CPP_CHECK(managed_select_receiver->wait_for(1s));
+    GO2CPP_CHECK(managed_select_sender->wait_for(1s));
+    GO2CPP_CHECK(managed_select_ok.load(std::memory_order_acquire));
+
+    // Shutdown must wake a channel-blocked G and let its stack unwind before
+    // the scheduler returns; this guards against suspended-capture leaks.
+    auto shutdown_channel = MakeChannel<int>(0);
+    std::atomic<bool> shutdown_returned{false};
+    auto shutdown_task = managed.spawn([&] {
+        const auto result = shutdown_channel->Recv();
+        shutdown_returned.store(result.Cancelled(), std::memory_order_release);
+    });
+    while (shutdown_task->state() != GState::kWaiting &&
+           std::chrono::steady_clock::now() < managed_start_deadline) {
+        std::this_thread::yield();
+    }
+    managed.shutdown();
+    GO2CPP_CHECK(shutdown_task->state() == GState::kCancelled ||
+                 shutdown_task->state() == GState::kDead);
+    GO2CPP_CHECK(shutdown_returned.load(std::memory_order_acquire));
 }

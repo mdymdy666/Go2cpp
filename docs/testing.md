@@ -1,226 +1,198 @@
-# Verification and test matrix
+# Verification Matrix
 
-This page records commands run against the standalone Go2Cpp runtime. Commands
-are intended to be run from the canonical WSL checkout:
+This document records commands executed against the canonical WSL checkout:
 
 ```text
 /UserData/CodexWorkSpace/Go2Cpp
 ```
 
-The build is C++17 and uses the repository warning policy (`-Wall -Wextra
--Wpedantic`). Every potentially blocking test is bounded by either CTest's
-timeout or an external `timeout` watchdog.
+The project is C++17. Builds use `-Wall -Wextra -Wpedantic`; every blocking
+test is registered with a CTest timeout and the stress loops use an external
+watchdog. The reference Go source is research input only and is not linked.
 
 ## Environment
 
-The verification session used:
-
-| Tool | Version / result |
+| Item | Observed value |
 |---|---|
-| OS | WSL/Linux |
+| OS | Ubuntu 24.04 under WSL2/Linux |
 | GCC | 13.3.0 |
 | Clang | 18.1.3 |
 | CMake | 3.28.3 |
 | Ninja | available |
+| Boost.Context | 1.83.0 (minimum 1.70) |
 | Valgrind | 3.22.0 |
-| Go executable | not required and not available in the session |
+| Go executable | not required for the C++ build |
 
-The Go reference files under `third_party/go1.23.0/` are checked-in research
-inputs; the C++ build does not link to Go, cgo, or a Go garbage collector.
+## Build and tests
 
-## Standard builds and example
-
-Debug GCC build, unit/invariant tests, and the end-to-end example:
-
-```sh
-cmake -S . -B build-final-modular -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=ON
-cmake --build build-final-modular --parallel 2
-ctest --test-dir build-final-modular --output-on-failure --timeout 60
-./build-final-modular/go2cpp_runtime_demo
-```
-
-Observed result on 2026-09-15 and reconfirmed on 2026-09-16:
-
-```text
-100% tests passed, 0 tests failed out of 2
-Total Test time (real) = 0.48 sec
-GMP workers=2 P=2 received=42
-context_value=7 context_cancelled=true
-select_index=0 select_value=7 recv_view_status=1
-error=demo operation: root cause
-error_is_root=true
-recovered=demo panic
-panic_recovered=true
-```
-
-The two registered CTest entries are `go2cpp_tests` and
-`go2cpp_scheduler_smoke`. The test executable reports successful checks for
-error chains, context cancellation/deadlines/values, channels/select,
-GMP scheduling, and defer/panic/recover.
-
-The install/export smoke also completed:
-
-```sh
-cmake --install build-final-debug --prefix \
-  /UserData/CodexWorkSpace/Go2Cpp/build-final-install
-```
-
-The prefix contains all five static module libraries, the public headers, and
-`lib/cmake/go2cpp_runtime/go2cpp_runtime{Config,ConfigVersion,-targets}.cmake`
-(including the Debug target file). A package audit also built and installed a
-consumers that use the umbrella `go2cpp::runtime` target and the individual
-`go2cpp::scheduler` and `go2cpp::error` targets, then repeated both consumers
-from a relocated install prefix; all four executables exited zero. The audit
-used isolated temporary directories and removed them after the check.
-
-Release and Clang checks were also run with the same test set:
-
-```sh
-cmake -S . -B build-final-release -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=ON
-cmake --build build-final-release --parallel 2
-ctest --test-dir build-final-release --output-on-failure --timeout 60
-
-CC=clang CXX=clang++ cmake -S . -B build-final-clang-env -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=ON
-cmake --build build-final-clang-env --parallel 2
-ctest --test-dir build-final-clang-env --output-on-failure --timeout 60
-```
-
-Both configurations were rerun on 2026-09-16, passed 2/2 tests, and were
-warning-clean under the configured warning flags. The scheduler smoke test
-uses an always-evaluated check helper, so Release does not silently remove its
-safety assertions.
-
-## Sanitizers
-
-AddressSanitizer:
-
-```sh
-cmake -S . -B build-final-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
-  -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=OFF
-cmake --build build-final-asan --parallel 2
-ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:halt_on_error=1 \
-  ./build-final-asan/go2cpp_tests
-ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:halt_on_error=1 \
-  ./build-final-asan/go2cpp_scheduler_smoke
-```
-
-Result: all checks passed; no ASan error or leak report.
-
-UndefinedBehaviorSanitizer:
-
-```sh
-cmake -S . -B build-final-ubsan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_CXX_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=undefined" \
-  -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=OFF
-cmake --build build-final-ubsan --parallel 2
-UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-  ./build-final-ubsan/go2cpp_tests
-UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-  ./build-final-ubsan/go2cpp_scheduler_smoke
-```
-
-Result: all checks passed; no UBSan diagnostic.
-
-ThreadSanitizer was configured and compiled with `GO2CPP_ENABLE_TSAN=ON`.
-The default WSL address layout can make a TSan process fail before `main()`
-with an unexpected-mapping diagnostic, so the reproducible WSL invocation also
-uses non-PIE code and disables ASLR for that process:
-
-```sh
-cmake -S . -B build-final-tsan-nopie -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-  -DGO2CPP_ENABLE_TSAN=ON -DCMAKE_CXX_FLAGS="-fno-pie" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fno-pie -no-pie" \
-  -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=OFF
-cmake --build build-final-tsan-nopie --parallel 2
-TSAN_OPTIONS=halt_on_error=1:exitcode=66 setarch x86_64 -R \
-  ./build-final-tsan-nopie/go2cpp_tests
-TSAN_OPTIONS=halt_on_error=1:exitcode=66 setarch x86_64 -R \
-  ./build-final-tsan-nopie/go2cpp_scheduler_smoke
-```
-
-Compilation succeeded. Without the `setarch -R` workaround one smoke attempt
-showed the environment-only failure:
-
-```text
-FATAL: ThreadSanitizer: unexpected memory mapping ...
-```
-
-With the non-PIE/ASLR-disabled invocation above, both executables exited zero
-with no TSan report. A native Linux runner is still recommended for the final
-TSan gate because the default WSL layout is not stable.
-
-## Valgrind Memcheck
-
-The required leak/error check was run separately for the unit suite and the
-scheduler smoke binary:
-
-```sh
-valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
-  --errors-for-leak-kinds=definite,indirect --error-exitcode=99 \
-  ./build-final-debug/go2cpp_tests
-valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
-  --errors-for-leak-kinds=definite,indirect --error-exitcode=99 \
-  ./build-final-debug/go2cpp_scheduler_smoke
-```
-
-Both runs exited zero. Memcheck reported `0 bytes in 0 blocks` in use at
-exit, `ERROR SUMMARY: 0 errors`, and no definite, indirect, or possible leaks
-(1,161,500 allocations/frees for the unit suite and 983 for the scheduler
-smoke run in this snapshot; allocation counts can vary with libc/thread
-implementation, while the zero-error/zero-leak result is the invariant).
-
-## Stress and watchdog gate
-
-The intended watchdog stress command is an inline Python loop (so each binary
-has a ten-second upper bound):
+GCC Debug shared build, Linux hook, all examples and all registered tests:
 
 ```sh
 cd /UserData/CodexWorkSpace/Go2Cpp
-python3 - <<'PY'
+cmake -S . -B build-check -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=ON
+cmake --build build-check --parallel 4
+ctest --test-dir build-check --output-on-failure --timeout 60
+```
+
+Result on 2026-09-18 after the boundary fixes: **7/7 passed** (`go2cpp_tests`,
+scheduler smoke, and the five examples). The unit executable reported all ten
+module groups passed.
+
+The Release static configuration intentionally disables the interposer:
+
+```sh
+cmake -S . -B build-static-current -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF -DGO2CPP_BUILD_HOOK=OFF \
+  -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=ON
+cmake --build build-static-current --parallel 4
+ctest --test-dir build-static-current --output-on-failure --timeout 60
+```
+
+Result: **6/6 passed**. A strict GCC build with
+`-DCMAKE_CXX_FLAGS=-Werror` (`build-werror-current`) also built and passed
+**7/7**.
+
+Clang 18 was checked independently:
+
+```sh
+CC=clang CXX=clang++ cmake -S . -B build-clang-current -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug -DGO2CPP_BUILD_TESTS=ON \
+  -DGO2CPP_BUILD_EXAMPLES=ON
+cmake --build build-clang-current --parallel 4
+ctest --test-dir build-clang-current --output-on-failure --timeout 60
+```
+
+Result: **7/7 passed**, warning-clean under the configured warning flags.
+
+## Focused boundary checks
+
+The test executable accepts one exact module name in `GO2CPP_TEST_FILTER`.
+The following current-source runs passed under a 30-second watchdog:
+
+```sh
+for name in hook sync fiber dynamic scheduler context channel panic error; do
+  GO2CPP_TEST_FILTER="$name" timeout 30s ./build-check/go2cpp_tests
+done
+```
+
+These cover default-enabled socket hooks and close/dup/fd reuse,
+scheduler-aware mutex/condition-variable/waitgroup, stack migration and
+natural Fiber destruction, dynamic M growth/shrink/affinity/stealing, the G
+state machine and cancellation queue cleanup, context trees, channels and
+select, and panic/error boundaries. The hook regression also checks
+native-thread poll fallback timeout reporting, `dup2` replacement-before-close
+notification, `dup2(fd, fd)` no-op identity, tracked `FIONBIO` `EFAULT`, and
+managed `MSG_OOB` rejection. The scheduler regression includes raw
+`Fiber::Suspend(Park)` cancellation and a watchdog on every wait.
+
+## Sanitizers
+
+ASan and UBSan were rebuilt from the current tree after the final scheduler,
+hook, and smoke-test changes. Both the full unit executable and scheduler
+smoke passed with no diagnostics:
+
+```sh
+cmake --build build-asan-current --parallel 4
+ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:halt_on_error=1 \
+  ./build-asan-current/go2cpp_tests
+ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:halt_on_error=1 \
+  ./build-asan-current/go2cpp_scheduler_smoke
+
+cmake --build build-ubsan-current --parallel 4
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+  ./build-ubsan-current/go2cpp_tests
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+  ./build-ubsan-current/go2cpp_scheduler_smoke
+```
+
+TSan was configured with `GO2CPP_ENABLE_TSAN=ON`, `-fno-pie -no-pie`, and
+`setarch x86_64 -R` to avoid the WSL loader's unexpected-mapping startup
+failure. Earlier current-source filtered runs (`context`, `channel`,
+`scheduler`, `dynamic`, `fiber`, `sync`, `io`) completed without a diagnostic;
+the final rebuilt run did not complete under the available WSL watchdog, and
+the full suite and `hook` filter are not claimed as clean TSan results. A
+native Linux runner remains the required independent TSan gate.
+
+## Valgrind Memcheck
+
+The required checks were run separately so leaks in one executable cannot hide
+in another:
+
+```sh
+timeout 300s valgrind --tool=memcheck --leak-check=full \
+  --show-leak-kinds=all \
+  --errors-for-leak-kinds=definite,indirect --error-exitcode=99 \
+  ./build-check/go2cpp_tests > build-check/valgrind-tests-final5.log 2>&1
+timeout 300s valgrind --tool=memcheck --leak-check=full \
+  --show-leak-kinds=all \
+  --errors-for-leak-kinds=definite,indirect --error-exitcode=99 \
+  ./build-check/go2cpp_scheduler_smoke > build-check/valgrind-smoke-final5.log 2>&1
+```
+
+Both exited zero. The final unit run reported `1,809,665` allocations/frees,
+`0 bytes in 0 blocks` at exit and `ERROR SUMMARY: 0`; the scheduler smoke run
+reported `3,390` allocations/frees, `0 bytes in 0 blocks` and `ERROR SUMMARY: 0`.
+There were no definite, indirect, or possible leaks requiring a suppression.
+The deliberate invalid-pointer `FIONBIO` test is skipped when
+`RUNNING_ON_VALGRIND` is set; the same `EFAULT` assertion runs in normal,
+ASan, and UBSan builds so Memcheck reports only runtime faults.
+
+## Stress and watchdog
+
+The following inline Python loop was used (no temporary script file):
+
+```sh
+python3 -c '
 import subprocess
-for name, count in (("go2cpp_tests", 200), ("go2cpp_scheduler_smoke", 300)):
+for name, count in (("go2cpp_tests", 40), ("go2cpp_scheduler_smoke", 80)):
     for _ in range(count):
-        subprocess.run(["timeout", "10s", f"./build-final-debug/{name}"], check=True)
+        subprocess.run(["timeout", "10s", f"./build-check/{name}"], check=True)
     print(name, count, "runs passed")
-PY
+'
 ```
 
-Result on 2026-09-16 after synchronizing scheduler task publication and adding
-execution-claim/requeue race regressions:
+All 40 unit runs and 80 scheduler-smoke runs passed in the current audit after
+the final scheduler and hook changes. Earlier 200/300-run watchdog campaigns
+are retained in `codex.md`.
 
-```text
-go2cpp_tests_runs=200 result=passed
-go2cpp_scheduler_smoke_runs=300 result=passed
+## Install/export smoke
+
+The modular install was regenerated with:
+
+```sh
+cmake --install build-check --prefix build-install-current
 ```
 
-The earlier intermittent failure was a test startup ordering race: a worker
-could enter the lambda before the caller had assigned the `yielding`
-shared pointer. The test now constructs and assigns the task before enqueue,
-then uses a release/acquire publication gate so the callback cannot read the
-self-reference until the caller has published it.
+The install contains the module/umbrella libraries, public headers and
+`lib/cmake/go2cpp_runtime` package files. The static Hook-off and shared
+Hook-on configurations are separate by design. A consumer must link the
+installed `go2cpp::runtime` target (or individual module targets) and use a
+shared build when transparent hook symbols are required.
 
-## Coverage and residual gaps
+An independent temporary consumer was also configured with
+`find_package(go2cpp_runtime CONFIG REQUIRED)`, linked to
+`go2cpp::runtime`, built with Ninja, and executed with the installed library
+directory on `LD_LIBRARY_PATH`; it exited zero (`installed package consumer
+passed`). The temporary source/build directory under
+`build-check/pkg-consumer-*` was removed after the run.
 
-The tests exercise P=1/P=2 scheduling, local/global queues, stealing,
-yield/park/wake (including a wake-before-park race), shutdown cancellation,
-context parent cancellation and
-deadlines (including a 20,000-node cancellation chain and an already-expired
-deadline), channel capacities 0/1/N, close/drain, directional views,
-ordinary-operation wake-up of armed cases, close/cancel cleanup, independent
-unbuffered select rendezvous, full-buffer select-send refill,
-same-select opposite-case handling, and
-select/default/timeout, error wrapping/identity/type matching (including a
-100,000-layer wrapping
-chain), and explicit panic/defer/recover
-boundaries (including a body exception translated to unhandled panic and a
-yield-then-panic task). They do not establish Go compiler/ABI equivalence,
-asynchronous preemption, segmented stacks, exact scheduler fairness, or a
-native-Linux TSan run under a different loader/kernel. Those limits are part
-of the compatibility matrix rather than hidden test claims.
+## Coverage and known gaps
+
+The tests cover P=1 and multi-P scheduling, local/global queues, stealing,
+dynamic worker waves, cancellation/shutdown, context trees/deadlines/values,
+defer/panic/recover boundaries, error chains, channels/select/close, Fiber
+migration and destruction, coroutine synchronization, epoll readiness and
+timer/close races, and transparent socket wrappers.
+
+The suite does not establish Go compiler/ABI/GC equivalence, asynchronous
+preemption, segmented stack growth, exact Go fairness, a blocking-region M>P
+handoff, every Linux socket-adjacent API, or a native-Linux TSan result. A
+non-cooperative C++ callable can still keep shutdown waiting because safely
+discarding a live C++ stack would skip RAII destructors. Channel destruction
+must not race raw member calls; throwing element moves/custom select callbacks
+have no rollback contract after a wait node is claimed. Managed
+`MSG_WAITALL`/`MSG_OOB` are explicit `ENOTSUP` boundaries, while ordinary
+threads using a previously adopted runtime-nonblocking socket may not receive
+full libc `MSG_WAITALL` blocking semantics. `IOManager*`/hook bindings also
+require the caller to honor the documented owner lifetime.

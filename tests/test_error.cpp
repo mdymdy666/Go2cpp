@@ -37,6 +37,11 @@ void run_error_tests() {
     GO2CPP_CHECK(Is(joined, tagged));
     const auto found = As<TaggedError>(joined);
     GO2CPP_CHECK(found && found->tag() == 7);
+    const auto singleton_join = Join({base});
+    GO2CPP_CHECK(singleton_join &&
+                 dynamic_cast<const JoinError*>(singleton_join.get()) !=
+                     nullptr);
+    GO2CPP_CHECK(Is(singleton_join, base));
     GO2CPP_CHECK(!Join({}));
 
     // A custom cyclic unwrap graph must not recurse forever.
