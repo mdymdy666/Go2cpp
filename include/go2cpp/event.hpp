@@ -174,6 +174,19 @@ public:
                 }
                 effective_timeout = timeout.has_value() ? timeout
                                                          : m_loop_timeout;
+                // max_duration 是整个批次的硬上限，即使没有设置 loop_time
+                // 也必须把剩余时间传给 Select，不能无限等待。
+                if (m_max_duration > Duration::zero()) {
+                    const auto elapsed =
+                        std::chrono::steady_clock::now() - *m_started_at;
+                    const auto remaining = *m_max_duration - elapsed;
+                    if (remaining <= Duration::zero()) {
+                        effective_timeout = Duration::zero();
+                    } else if (!effective_timeout.has_value() ||
+                               remaining < *effective_timeout) {
+                        effective_timeout = remaining;
+                    }
+                }
                 stop_on_timeout = m_stop_on_timeout;
             } else {
                 m_last = work_stopped();
