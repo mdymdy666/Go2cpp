@@ -1,14 +1,14 @@
-# GMP Scheduler Contract
+# GMP 调度器契约
 
-## Data and ownership
+## 数据、所有权与状态
 
-| Record | C++ object | Owner and invariant |
+| 记录 | C++ 对象 | 所有权与不变量 |
 |---|---|---|
-| G | `scheduler::Task` | Strongly retained by the scheduler registry while non-terminal; one `m_execution_claim`; one queue claim `m_queued`; first admitting scheduler owns it permanently |
-| M | private `Machine` plus `std::thread` | One worker thread, one preferred P, dynamically admitted/retired under the scheduler mutex |
-| P | private `Processor` | Bounded local queue and active-M count; M records may be overcommitted only for declared BlockingRegion replacement workers |
+| G | `scheduler::Task` | 非终态期间由 Scheduler 注册表强持有；最多一个 `m_execution_claim` 和一个 `m_queued` 队列 claim；首次接纳它的 Scheduler 永久拥有它 |
+| M | 私有 `Machine` 与 `std::thread` | 一个 worker 线程和一个首选 P；在 Scheduler 互斥量下动态加入、退休、join/reap |
+| P | 私有 `Processor` | 有界本地队列和活动 M 计数；只有声明 `BlockingRegion` 时才允许替代 M 与其共享 P |
 
-The transition table is:
+G 的合法转换为：
 
 ```text
 new -> runnable -> running -> runnable | waiting | dead | cancelled
@@ -16,100 +16,67 @@ waiting -> runnable | cancelled
 dead/cancelled -> terminal
 ```
 
-The worker-state transitions exposed by snapshots are:
+快照中的 M/P 转换为：
 
 ```text
 M: idle -> running -> idle -> parked -> idle
                  \-> stopping -> dead
     parked -> stopping -> dead
-P: idle <-> running; idle -> dead during shutdown
+P: idle <-> running; shutdown 时 idle -> dead
 ```
 
-A declared BlockingRegion publishes M::blocking around a known native
-blocking call and asks the scheduler to admit a replacement M when queued work
-exists. P remains a scheduling token owned by the blocked M; the replacement
-M may share that P, so this is bounded overcommit rather than an exact Go P
-handoff. A retiring or shutdown worker publishes M::stopping before M::dead.
+入队、出队、runnable 计数、shutdown admission 和 `runnable -> running` claim 在
+admission mutex 下串行；Task transition mutex 保护状态字段。任何用户回调/捕获对象
+都不会在 Scheduler、P、队列或 completion 锁内析构。
 
-Queue insertion, removal, runnable accounting, shutdown admission and the
-`runnable -> running` claim are serialized by the scheduler admission mutex.
-The task transition mutex protects state/claim fields. Code never destroys a
-user capture while holding a scheduler, P, queue or completion lock.
+队列不变量如下：
 
-The queue/claim invariant is:
+- runnable G 恰好拥有一个队列/救援节点，或正处在 admission handoff，不能同时出现在两个队列；
+- running G 拥有 `m_execution_claim=true` 且不在任何队列；出队会在同一转换中清除 `m_queued` 并取得执行 claim；
+- `runnable_count` 统计已接纳的队列节点，pending wake 不计入 runnable；终态 G 没有队列和执行 claim。
 
-* a runnable G has either one queue/rescue node (`m_queued=true`) or is in the
-  admission handoff; it is never present in two queues;
-* a running G owns `m_execution_claim=true` and is absent from all queues;
-  dequeue clears `m_queued` and claims execution in one transition;
-* `runnable_count` counts admitted queue/rescue nodes, while a pending wake
-  token does not count as runnable work; terminal Gs have no queue or execution
-  claim.
+## park、wake 与 Fiber continuation
 
-The short admission window may expose an intermediate field value only while
-the scheduler mutex is held; workers and notifiers cannot observe that window.
+只有当前 G 可以调用 `yield` 或 `park`。通知者看到 waiting 时把它改为 runnable 并
+入队；若 G 仍在 running，则只设置一个 pending wake 位，由下一次 park 消费。shutdown
+竞态中的 wake 要么进入队列/救援列表，要么转为取消。等待节点另有 wake gate，
+`disarm()` 会等待正在执行的回调，之后才允许 Scheduler 指针失效。
 
-## Wake and park protocol
+每次 worker admission 都恢复同一 Fiber continuation；yield 后从切换点继续，绝不会
+重新调用 callable。`Fiber::Suspend(Yield)` 映射为 runnable，其它原因映射为 waiting；
+若切换前发生 wake/cancel，则恢复为 runnable，避免 shutdown 把 G 留在状态发布空窗。
+原始 Fiber API 属于高级接口，调用方仍必须合作返回。
 
-Only the current G may call `yield` or `park`. A notifier seeing `waiting`
-changes it to `runnable` and enqueues it. A notifier racing with a running G
-sets one pending wake bit; `park` consumes that bit and keeps the continuation
-running. A wake racing with shutdown either enters the queue/rescue list or is
-observed as cancellation. Wait nodes use a separate wake gate so `disarm()`
-waits for an in-flight callback before a scheduler pointer can become invalid.
+## 动态 M 策略
 
-Each worker admission resumes the Fiber continuation; repeated admissions
-continue it until the callable returns. The scheduler does not call the
-callable again after a yield; the continuation resumes at the instruction
-after the switch. A direct `Fiber::Suspend` is mapped to runnable for `Yield`
-and to waiting for other reasons, except that a concurrent wake/cancellation is
-converted to a runnable continuation so shutdown cannot strand the G between
-the context switch and state publication. Raw Fiber suspension remains an
-advanced API and must still return cooperatively.
+`min_workers` 是保留底线。普通队列压力只把 M 增长到 P 有界上限；启用
+`allow_worker_oversubscription` 时，每个活动 `BlockingRegion` 可申请一个替代 M，
+但不超过 `max_workers`。关闭该选项即严格 P 上限。空闲 M 等待
+`idle_worker_timeout` 后在 admission mutex 下预留退休名额，并各减少一次全局和
+P-local 计数；死亡记录在锁外 join 后从快照删除。Task class 只影响有限扫描顺序，
+窃取始终可用，不会因亲和性导致饥饿。
 
-## Dynamic M policy
+`BlockingRegion` 不可移动，并记录进入它的 M；不能跨 Fiber yield/park/迁移。它不会
+探测任意 native syscall，也不会抢占 C++ continuation。Hook 的 socket/sleep fallback
+会自动发布 blocking 记账；未 Hook 的调用必须显式包在 `BlockingRegion` 中。
+`ScopedThreadParticipation` 只是每线程策略元数据，不会附加 M 或运行队列。
 
-min_workers is the retained floor. Ordinary queued work grows the pool only
-up to the P-bounded ceiling. When allow_worker_oversubscription is enabled,
-each active BlockingRegion contributes one replacement-M slot, up to the
-configured max_workers. Setting it false restores a strict P ceiling. Idle M
-records wait idle_worker_timeout, reserve retirement under the admission
-mutex, and decrement both global and P-local active counts exactly once. Dead
-records are joined outside scheduler locks and removed from snapshots. Task
-class IDs are a bounded scan preference with hit/miss counters; stealing
-remains available, so class locality cannot starve other work.
+## shutdown 与 join
 
-The replacement slot is opt-in and scoped. BlockingRegion is non-movable
-and records the entering M for cleanup; it still must not span a Fiber
-yield/park or migration. The scheduler cannot detect an arbitrary native syscall
-or force-preempt a C++ continuation. The interposed
-socket and sleep fallbacks use the same blocking accounting automatically;
-unhooked native calls need an explicit BlockingRegion and must not span a
-Fiber yield or park. External ScopedThreadParticipation only records
-per-thread eligibility and Scheduler association; it does not attach an M or
-run a queue.
+shutdown 是单向操作：关闭 admission，取消未启动队列 G，给已启动 G 设置合作取消，
+唤醒 parked G，等待注册表全部终态。worker 自身发起 shutdown 时只发布 drain 请求，
+最后一个 G 终态后 worker 标记 stopping 并退出，不会 join 自己；拥有者线程执行最终
+join。Scheduler/IOManager 所有者必须长于 worker 和外部成员调用，析构不能与成员调用
+并发。
 
-## Shutdown and join
+managed G 调用 `Task::wait`/`Join` 时使用 `ParkingCondition`，所以 P=1 也能运行被
+等待的子 G；普通线程使用 native condition fallback。自 join 或已取消的 managed
+waiter 返回 false。销毁挂起 Fiber 是“请求取消 + 自然完成”，永不返回的 body 会让
+join/shutdown 等待，这保证 C++ RAII 不被跳过。
 
-Shutdown is one-way. It closes admission, cancels unstarted queued Gs, marks
-started Gs for cooperative cancellation, wakes parked Gs, and waits until every
-registered G is terminal. Worker-initiated shutdown only publishes the drain
-request; once the last G is terminal, a worker marks the scheduler stopping and
-exits without joining itself. The owning thread performs the final joins.
+## 可观测性与验证
 
-`Task::wait`/`Join` and timed variants use `core::ParkingCondition` when called
-inside a managed G, so a one-P scheduler can run the joined child. Unmanaged
-callers use the same predicate with a native condition-variable fallback.
-Self-join and a cancelled managed waiter return false. Destroying a suspended
-Fiber is a cancellation request followed by natural completion; a body that
-never reaches a cooperative/return boundary can therefore make join or
-shutdown wait, which is preferable to skipping C++ RAII.
-
-## Diagnostics and tests
-
-`processors()` and `machines()` expose snapshots only; they do not grant queue
-ownership. Tests cover P=1 and multi-P execution, duplicate enqueue/wake races,
-cross-scheduler rejection, parked cancellation, raw Fiber park cancellation,
-cancelled queue capture release, dynamic growth/shrink/regrow, strict P caps, BlockingRegion replacement-M growth,
-task-class counters, worker shutdown, task destructor re-entry and
-watchdog-bounded stress.
+`processors()`、`machines()` 只返回快照，不授予队列所有权。测试覆盖 P=1/多 P、
+重复 enqueue/wake、跨 Scheduler 拒绝、park 取消、Fiber 取消、队列 capture 回收、
+动态增长/收缩/再增长、严格 P 上限、BlockingRegion 替代 M、task class 计数、worker
+shutdown、析构重入和带 watchdog 的压力循环。精确命令见 `docs/testing.md`。

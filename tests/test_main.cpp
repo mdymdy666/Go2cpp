@@ -13,6 +13,8 @@ void run_panic_defer_tests();
 void run_fiber_tests();
 void run_sync_tests();
 void run_io_tests();
+void run_timer_tests();
+void run_beginner_api_tests();
 void run_hook_tests();
 
 int main() {
@@ -30,6 +32,8 @@ int main() {
     if (selected("fiber")) run_fiber_tests();
     if (selected("sync")) run_sync_tests();
     if (selected("io")) run_io_tests();
+    if (selected("timer")) run_timer_tests();
+    if (selected("beginner")) run_beginner_api_tests();
 #ifdef GO2CPP_TEST_HOOK
     if (selected("hook")) run_hook_tests();
 #endif

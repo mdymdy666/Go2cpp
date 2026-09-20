@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -268,6 +269,24 @@ public:
     std::shared_ptr<Task> spawn(Task::Function function, TaskOptions options);
     std::shared_ptr<Task> go(Task::Function function) { return spawn(std::move(function)); }
     bool enqueue(const std::shared_ptr<Task>& task);
+    // 新手入口：把已经构造好的任务加入当前调度器。任务不会被复制，
+    // 调度器取得一个共享句柄；调用者可以继续使用原来的句柄等待或取消。
+    std::shared_ptr<Task> add(const std::shared_ptr<Task>& task) {
+        return enqueue(task) ? task : std::shared_ptr<Task>{};
+    }
+    // 直接加入一个回调，等价于 spawn，但名字更接近 Go 的使用方式。
+    std::shared_ptr<Task> add(Task::Function function) {
+        return spawn(std::move(function));
+    }
+    // 允许 go2cpp::fiber 等轻量包装器通过 task() 接口接入，而不让
+    // scheduler.hpp 依赖上层包装器的定义。
+    template <typename TaskLike,
+              typename = std::enable_if_t<std::is_same_v<
+                  decltype(std::declval<const TaskLike&>().task()),
+                  std::shared_ptr<Task>>>>
+    std::shared_ptr<Task> add(const TaskLike& task_like) {
+        return add(task_like.task());
+    }
     bool yield(const std::shared_ptr<Task>& task);
     bool park(const std::shared_ptr<Task>& task);
     bool yield_current();
@@ -289,6 +308,12 @@ public:
         return spawn(std::move(function));
     }
     bool Enqueue(const std::shared_ptr<Task>& task) { return enqueue(task); }
+    std::shared_ptr<Task> Add(const std::shared_ptr<Task>& task) {
+        return add(task);
+    }
+    std::shared_ptr<Task> Add(Task::Function function) {
+        return add(std::move(function));
+    }
     bool Yield(const std::shared_ptr<Task>& task) { return yield(task); }
     bool Park(const std::shared_ptr<Task>& task) { return park(task); }
     bool Wake(const std::shared_ptr<Task>& task) { return wake(task); }

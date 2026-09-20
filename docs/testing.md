@@ -297,3 +297,24 @@ all retired workers have joined. The current Release/Clang/Werror/ASan/UBSan
 and TSan-filter reruns passed; final10 Memcheck reported the same zero lost
 categories (unit 1,560,975/1,560,972 allocs/frees, smoke 4,042/4,041) with
 only the documented 360B and 96B still reachable.
+
+## 2026-09-20 追加验证
+
+以下命令均在 `/UserData/CodexWorkSpace/Go2Cpp` 执行：
+
+```text
+cmake -S . -B build-current2 -DCMAKE_BUILD_TYPE=Debug -DGO2CPP_BUILD_HOOK=ON -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=ON
+cmake --build build-current2 -j2
+ctest --test-dir build-current2 --output-on-failure --timeout 60        # 9/9
+cmake -S . -B build-release2 -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGO2CPP_BUILD_HOOK=OFF -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=ON
+ctest --test-dir build-release2 --output-on-failure --timeout 60        # 8/8
+cmake -S . -B build-werror2 -DCMAKE_BUILD_TYPE=Debug -DGO2CPP_BUILD_HOOK=ON -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=ON -DCMAKE_CXX_FLAGS='-Werror' # 构建通过
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 build-asan2/go2cpp_tests     # 全组通过
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build-ubsan2/go2cpp_tests # 全组通过
+valgrind --leak-check=full --show-leak-kinds=definite,indirect,possible build-current2/go2cpp_tests # 0/0/0，0 errors
+```
+
+新增 `timer`、`beginner` 过滤测试各重复 10 轮通过；Clang 18 对新手测试执行
+`-fsyntax-only -Wall -Wextra -Wpedantic` 通过。TSan 仍沿用此前 WSL 镜像的启动限制记录，
+没有把未启动的完整套件宣称为通过。Valgrind 全套本轮仍有 416B intentional
+`still reachable` 进程级状态，`definite/indirect/possible` 均为 0。

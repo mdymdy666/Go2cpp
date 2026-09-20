@@ -7,6 +7,8 @@
 #include "go2cpp/error.hpp"
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/fiber_local.hpp"
+#include "go2cpp/go.hpp"
+#include "go2cpp/event.hpp"
 #include "go2cpp/hook.hpp"
 #include "go2cpp/io.hpp"
 #include "go2cpp/panic_defer.hpp"

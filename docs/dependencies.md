@@ -1,60 +1,46 @@
-# Upstream and dependency inventory
+# 上游与依赖清单
 
-## Go reference
+## Go 上游参考
 
-The implementation was designed against Go `go1.23.0` from
-`https://go.googlesource.com/go` (tag commit
-`6885bad7dd86880be6929c02085e5c7a67ff2887`). The release archive is
-`https://go.dev/dl/go1.23.0.src.tar.gz` with SHA-256
-`42b7a8e80d805daa03022ed3fde4321d4c3bf2c990a144165d01eeecd6f699c6`.
-The upstream license is BSD-3-Clause; its `LICENSE` is retained in
-`third_party/go1.23.0/LICENSE`. The extracted reference files are research
-inputs only and are not part of any CMake target.
+本项目按 Go `go1.23.0` 设计，仓库为
+`https://go.googlesource.com/go`，固定 commit：
+`6885bad7dd86880be6929c02085e5c7a67ff2887`。源码归档地址为
+`https://go.dev/dl/go1.23.0.src.tar.gz`，SHA-256 为
+`42b7a8e80d805daa03022ed3fde4321d4c3bf2c990a144165d01eeecd6f699c6`。
+上游许可证为 BSD-3-Clause，原始 `LICENSE` 保留在
+`third_party/go1.23.0/LICENSE`。参考文件只用于研究，不加入任何 CMake target，
+第三方源码与许可证原文不翻译、不修改。
 
-The local archive is intentionally ignored by Git because it is a large
-source tarball. `third_party/go-reference/SHA256SUMS` and the extracted files
-are tracked so the provenance and checksum remain reviewable. From the
-repository root, verify it with `(cd third_party/go-reference && sha256sum -c
-SHA256SUMS)`; the relative archive path in the checksum file is intentional.
+归档文件因体积较大被 Git 忽略；可在仓库根目录执行：
 
-## Runtime capability replacement
+```sh
+cd third_party/go-reference && sha256sum -c SHA256SUMS
+```
 
-| Go dependency or mechanism | C++17 replacement in this project | Boundary |
+## Go 能力的 C++ 替代
+
+| Go 机制 | 本项目替代 | 明确边界 |
 |---|---|---|
-| Garbage collector and stack maps | `std::shared_ptr`, RAII, explicit ownership and weak child links | No moving GC or Go heap ABI |
-| Segmented/user stacks and `morestack` | Boost.Context protected Fiber stacks and explicit `Task`/`Frame` ownership | Fixed per-Fiber stack; no compiler-generated growth or Go stack maps |
-| `mcall`, `gogo`, `gopark`, internal scheduler ABI | Cooperative C++ worker loop with G/M/P state transitions and raw `fcontext` switches | No assembly or asynchronous compiler preemption |
-| `sudog`, futex and netpoller waits | Gated heap wait nodes, `ParkingCondition`, shared timer service and Linux epoll IOManager | Backend is Linux epoll; no exact Go netpoller ABI |
-| Runtime atomics | `std::atomic` plus transition mutexes where a state handoff spans fields | C++ memory model applies |
-| cgo and Go internal ABI | No dependency; public C++ headers only | cgo interoperation is out of scope |
-| Compiler-generated defer/panic calls | Explicit `panic_defer::Frame` registration and unwind protocol | Source transformation must create boundaries |
+| GC、栈图和 Go heap ABI | `shared_ptr`、RAII、显式所有权、弱子节点 | 没有移动 GC、写屏障或 Go heap ABI |
+| `morestack`、分段栈 | Boost.Context 保护栈与 Task/Fiber 所有权 | 栈大小固定，不提供编译器生成的栈图和异步增长 |
+| `mcall`/`gogo`/`gopark` | 合作式 C++ worker 与显式 G/M/P 状态 | 没有汇编 ABI 和任意指令点抢占 |
+| `sudog`、futex、netpoller | 堆等待节点、ParkingCondition、TimerService、Linux epoll | 不复刻 Go netpoller 内部 ABI |
+| runtime 原子操作 | `std::atomic` 加状态转换互斥量 | 遵循 C++ 内存模型，不承诺 Go 内部顺序 |
+| cgo 与内部 ABI | 无依赖，只有公共 C++ 头文件 | cgo 互操作不在范围内 |
+| 编译器生成 defer/panic | 显式 `panic_defer::Frame` 与 unwind 协议 | 转译器必须生成边界，普通 C++ 函数不会自动获得 Go 语义 |
+| Go 定时器/取消 | 可取消 `TimerService`、Context deadline、等待节点 gate | 回调线程不会直接恢复 Fiber 栈 |
 
-## Build dependencies
+## 构建依赖
 
-The runtime links `Threads::Threads`, Boost.Context (minimum 1.70; verified in
-this workspace with 1.83.0), and on Linux the system `dl` library for the hook.
-Boost.Context is distributed under the Boost Software License 1.0; Go2Cpp does
-not vendor or modify it, and the system package remains the consumer's license
-responsibility.
-The IO module uses Linux epoll/eventfd/syscalls. Valgrind headers are detected
-optionally to register protected Fiber stacks; ASan and TSan integration is
-compiled only when the corresponding compiler sanitizer is enabled. No Go
-runtime, cgo, bundled GC or GNU GMP mathematics library is linked.
+运行时链接 `Threads::Threads` 和 Boost.Context（最低 1.70；当前工作区验证为
+1.83.0）。Linux Hook 额外使用系统 `dl`。Boost.Context 使用 Boost Software
+License 1.0；Go2Cpp 不携带或修改它，系统包许可证由部署者负责。IO 模块使用
+Linux epoll/eventfd/syscall。检测到 Valgrind 头文件时会注册保护 Fiber 栈；ASan、
+UBSan、TSan 仅作为独立验证配置，不能混用互相冲突的 sanitizer。
 
-The hook is a shared target by default so its TLS and descriptor registry have
-one process instance. Static consumers must configure
-`-DGO2CPP_BUILD_HOOK=OFF` and use `IOManager`/explicit APIs; the C hook symbols
-are not provided in that mode. FiberLocalCache is a small clean-room logical-Fiber value registry; it has no Folly dependency and no Folly source is copied into this repository. It deliberately does not pool stacks or worker objects, so Boost.Context and the scheduler remain replaceable boundaries.
+## 可替换边界
 
-## Local Sylar reference
-
-Clean-room design review also examined the user-provided local checkout at
-`/UserData/CodexWorkSpace/sylar2/sylar`. The relevant file is
-`iomanager.cc` (lowercase), alongside `fiber.cc`, `scheduler.cc` and `hook.cc`;
-there is no `IOManager.cc` with that exact case. The checkout was not added as
-a dependency, has no project license file in the supplied directory, and no
-source was copied into a build target. Its concepts informed the Fiber swap,
-epoll registration-before-timer ordering and hook surface. Go2Cpp adds explicit
-ownership/generation gates, natural suspended-stack completion, idempotent
-outcomes and safe unknown-variadic-command handling where the reference code
-did not define those contracts.
+Scheduler、Fiber backend、TimerService、Channel 等待后端、IOManager 和 Hook
+均通过公共状态/结果契约隔离；0.x 没有稳定插件 ABI。替换实现必须保持 G/M/P
+状态转换、一次性 wake claim、对象所有权、取消和 shutdown 规则。项目不依赖 Go
+运行时、cgo、垃圾回收器、汇编或第三方 Sylar 代码。

@@ -12,6 +12,8 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fiber.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sync.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_timer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_beginner_api.cpp
     )
     target_link_libraries(go2cpp_tests PRIVATE go2cpp_runtime)
     if (TARGET go2cpp_hook)
@@ -36,7 +38,7 @@ endif()
 
 if (GO2CPP_BUILD_EXAMPLES)
     set(GO2CPP_EXAMPLES runtime_demo fiber_sync_demo managed_pipeline_demo
-                        dynamic_gmp_demo mixed_runtime_demo)
+                        dynamic_gmp_demo mixed_runtime_demo beginner_demo)
     if (TARGET go2cpp_hook)
         list(APPEND GO2CPP_EXAMPLES io_hook_demo)
     endif()
