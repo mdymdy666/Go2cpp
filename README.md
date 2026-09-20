@@ -64,7 +64,7 @@ go2cpp::shutdown_default_scheduler();
 `fiber::bind()` 会把它加入指定调度器。`go2cpp::SelectLoop`/`EventBatch`
 只包装已有的 channel `SelectCase`；可能阻塞的业务逻辑仍应放进 `go()`，
 再通过 channel 传递结果。事件状态访问支持普通线程与 Fiber 并发，结构修改
-采用锁保护和快照语义；批次对象仍须长于所有调用者，`stop()` 只发出协作式停止请求。
+采用锁保护和快照语义；批次对象仍须长于所有调用者，`stop()` 通过内部 Context 唤醒等待，并只发出协作式停止请求。
 
 转译代码需要完整公共接口时，包含 `go2cpp/runtime.hpp`。模块 target
 （`go2cpp::error`、`go2cpp::context`、`go2cpp::channel`、

@@ -53,7 +53,12 @@ public:
         if (!m_mutex.Lock()) {
             return;
         }
-        m_entries.push_back(Entry{std::move(event), std::move(handler)});
+        try {
+            m_entries.push_back(Entry{std::move(event), std::move(handler)});
+        } catch (...) {
+            m_mutex.Unlock();
+            throw;
+        }
         m_mutex.Unlock();
     }
 
@@ -62,6 +67,7 @@ public:
     }
 
     void clear() {
+        auto fresh_control = make_stop_control();
         if (!m_mutex.Lock()) {
             return;
         }
@@ -71,7 +77,7 @@ public:
         m_stopped = false;
         m_rounds = 0;
         m_started_at.reset();
-        m_stop_control = make_stop_control();
+        m_stop_control = std::move(fresh_control);
         m_mutex.Unlock();
     }
 
@@ -122,6 +128,7 @@ public:
         }
     }
     void reset() {
+        auto fresh_control = make_stop_control();
         if (!m_mutex.Lock()) {
             return;
         }
@@ -130,7 +137,7 @@ public:
         m_started_at.reset();
         m_has_result = false;
         m_last = SelectResult{};
-        m_stop_control = make_stop_control();
+        m_stop_control = std::move(fresh_control);
         m_mutex.Unlock();
     }
 

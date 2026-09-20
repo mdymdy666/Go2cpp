@@ -139,4 +139,4 @@ Context 测试时钟、SelectCase、Descriptor token/guard 和 C Hook 控制是�
 提交。`EventBatch`/`SelectLoop` 只包装 channel SelectCase，内部使用
 `sync::Mutex` 串行 `work()`，支持 native/Fiber 调用；事件列表修改采用锁保护和
 `work()` 快照语义。任意阻塞业务回调应先用 `go()` 启动并通过 channel 报告结果。
-批次对象必须长于所有并发调用，`stop()` 只发出协作式停止请求。
+批次对象必须长于所有并发调用，`stop()` 通过内部 Context 唤醒等待，并只发出协作式停止请求。
