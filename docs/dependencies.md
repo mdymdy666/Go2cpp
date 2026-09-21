@@ -1,5 +1,21 @@
 # 上游与依赖清单
 
+## Go bootstrap 基线（Go 1.4.3）
+
+为了复刻 Go 最初的非自举实现，项目另外保存了官方 Go 1.4.3 源码归档：
+
+- 官方下载：`https://go.dev/dl/go1.4.3.src.tar.gz`
+- 本地归档：`third_party/go1.4.3.src.tar.gz`
+- SHA-256：`9947fc705b0b841b5938c48b22dc33e9647ec0752bae66e50278df4f23f64959`
+- 完整展开：`third_party/go1.4.3-full/`（本地只读，已加入 `.gitignore`）
+
+Go 1.4.3 仍然包含 C/汇编启动链：`src/runtime/proc.c`、
+`src/runtime/panic.c`、`src/runtime/malloc.c`，以及 `src/cmd/` 下的 C 编译器实现。
+Go 1.5 发布后才完成用 Go 重写编译器和 runtime 的自举转换。因此 GMP、栈、
+调度和 panic/defer 的底层复刻应优先阅读 Go 1.4.3；Go 1.23 仅用于当前语义和
+后续 API 对照。Go 1.4.3 尚未包含标准库 `context` 包，Context 对照必须使用
+后续 Go 版本的 `src/context/context.go`。
+
 ## Go 上游参考
 
 本项目按 Go `go1.23.0` 设计，仓库为
