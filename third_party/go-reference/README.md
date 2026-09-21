@@ -20,3 +20,5 @@ Relevant upstream files:
 - `src/runtime/chan.go`, `src/runtime/chan_test.go`
 - `src/runtime/panic.go`, `src/runtime/panic_test.go`, `src/runtime/defer_test.go`
 - `src/context/context.go`, `src/context/context_test.go`
+
+The complete Go source tree is expanded locally at `../go1.23.0-full/` (13,222 files) and is ignored by Git.

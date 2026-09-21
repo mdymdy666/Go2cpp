@@ -12,3 +12,4 @@ vgcore.*
 compile_commands.json
 /docs/doxygen/
 /doxygen-output/
+/third_party/go1.23.0-full/
