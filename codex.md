@@ -407,3 +407,15 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
   under `setarch x86_64 -R`. Final10 Memcheck again had zero definite,
   indirect or possible leaks: unit 1,560,975/1,560,972 allocations/frees and
   360B reachable; smoke 4,042/4,041 and 96B reachable; both `ERROR SUMMARY: 0`.
+
+## 2026-09-21 恢复工作验证
+
+- 重新确认 WSL 工作目录为 `/UserData/CodexWorkSpace/Go2Cpp`，Git 根目录、
+  分支和工作区状态正确；恢复时未发现未提交改动。
+- 使用已有 `build-check` 运行
+  `ctest --test-dir build-check --output-on-failure --timeout 60`，当前 Debug
+  Hook-on 测试 **9/9** 通过，包含单元测试、调度器、Fiber 同步、动态 M、
+  混合 native/Fiber、入门 API 和 IO Hook 示例。
+- 本次只做恢复审计和回归验证，没有引入新的实现缺口。未改变已记录的边界：
+  WSL 环境仍不能把完整 TSan 套件作为最终通过依据；异步抢占、完整 Go
+  编译器/ABI/GC 语义和未覆盖的 Linux socket API 仍属于明确限制。
