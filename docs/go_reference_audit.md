@@ -152,3 +152,26 @@ third_party/go1.23.0-full/
 ## 审计建议
 
 如果要求达到更高可信度，下一步应做 Go/C++ 双实现的随机对拍、逐测试映射、调度状态机模型检查，以及对 Context/Channel/select/panic 的差异用例补齐；在这些工作完成前，不应宣称 100% Go 兼容。
+## 自举前 C 源码的实际位置
+
+如果目标是查看“最初不是用 Go 写的 Go”，不要从 `go1.23.0-full` 开始。应查看：
+
+```text
+third_party/go1.4.3-c-bootstrap/
+```
+
+该目录从 Go 1.4.3 官方归档抽取 C、头文件、汇编及少量 yacc/lex 输入，重点包括：
+
+```text
+src/runtime/proc.c
+src/runtime/panic.c
+src/runtime/malloc.c
+src/runtime/chan.h
+src/runtime/asm_amd64.s
+src/cmd/5c/
+src/cmd/6c/
+src/cmd/gc/
+```
+
+注意：Go 1.4.3 的 runtime 已经是 C、Go 和汇编混合实现；不存在一个“整个 runtime 都只有 C”的 Go 1.4 源码目录。这里抽取的是自举前真正由 C/汇编承担的部分。Go 1.4.3 仍有 `proc.go`、`chan.go` 等 Go 文件，而 Go 1.5 才完成主要 compiler/runtime 自举转换。
+
