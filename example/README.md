@@ -2,8 +2,9 @@
 
 `example/runtime_demo.cpp` 是端到端示例。它创建 G/M/P 调度器，通过类型化
 channel 传递值，绑定 timeout context，演示 `WithValue` 和显式子节点取消，
-使用仅发送/仅接收视图执行 `select`，格式化并检查包装错误的身份，最后演示
-显式 defer/recover 边界。构建命令：
+使用仅发送/仅接收视图执行 `select`，并格式化和检查包装错误的身份。运行时
+不提供 Go 的 panic/recover/defer 控制流，用户代码应使用普通 C++ 异常和 RAII。
+构建命令：
 
 ```sh
 cmake -S . -B build -DGO2CPP_BUILD_EXAMPLES=ON

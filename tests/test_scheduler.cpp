@@ -1,13 +1,13 @@
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/scheduler.hpp"
 #include "go2cpp/thread_policy.hpp"
-#include "go2cpp/panic_defer.hpp"
 #include "test_support.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -92,28 +92,6 @@ void run_scheduler_tests() {
         go2cpp_tests::yield_for_watchdog();
     }
     GO2CPP_CHECK(yielded.load(std::memory_order_acquire) == 2);
-
-    std::atomic<int> panic_runs{0};
-    std::atomic<bool> panic_published{false};
-    std::shared_ptr<Task> yield_then_panic;
-    yield_then_panic = std::make_shared<Task>([&] {
-        GO2CPP_REQUIRE_EVENTUALLY(
-            panic_published.load(std::memory_order_acquire), 3s);
-        if (panic_runs.fetch_add(1, std::memory_order_relaxed) == 0) {
-            GO2CPP_CHECK(scheduler.yield(yield_then_panic));
-            go2cpp::panic_defer::panic(
-                go2cpp::panic_defer::PanicValue::text("unhandled"));
-        }
-    });
-    GO2CPP_CHECK(scheduler.enqueue(yield_then_panic));
-    panic_published.store(true, std::memory_order_release);
-    const auto panic_deadline = std::chrono::steady_clock::now() + 1s;
-    while (yield_then_panic->state() != GState::kDead &&
-           std::chrono::steady_clock::now() < panic_deadline) {
-        go2cpp_tests::yield_for_watchdog();
-    }
-    GO2CPP_CHECK(yield_then_panic->state() == GState::kDead);
-    GO2CPP_CHECK(panic_runs.load(std::memory_order_acquire) == 1);
 
     std::atomic<bool> running_entered{false};
     std::atomic<bool> running_release{false};
@@ -467,5 +445,43 @@ void run_scheduler_tests() {
     GO2CPP_CHECK(blocking_api_task->wait_for(1s));
     GO2CPP_CHECK(blocking_api_reusable.load(std::memory_order_acquire));
     policy_scheduler.shutdown();
+
+    // 普通 C++ 异常只在 Fiber 边界记录为失败；Task 的终态和
+    // exception_ptr 都必须可观察。
+    Scheduler failure_scheduler(1);
+    failure_scheduler.start();
+    auto failed_task = failure_scheduler.spawn([] {
+        throw std::runtime_error("scheduler task failure");
+    });
+    GO2CPP_CHECK(failed_task->wait_for(1s));
+    GO2CPP_CHECK(failed_task->state() == GState::kFailed);
+    GO2CPP_CHECK(failed_task->failed());
+    GO2CPP_CHECK(static_cast<bool>(failed_task->failure()));
+    bool rethrown = false;
+    try {
+        failed_task->rethrow_failure();
+    } catch (const std::runtime_error& error) {
+        rethrown = std::string_view(error.what()) ==
+                   "scheduler task failure";
+    } catch (...) {
+        rethrown = false;
+    }
+    GO2CPP_CHECK(rethrown);
+    failure_scheduler.shutdown();
+
+    // 有界 shutdown 不会强行释放仍在原生调用中的 Fiber 栈；超时后可
+    // 等待调用自然返回，再次 shutdown_for 完成 worker 回收。
+    Scheduler bounded_scheduler(1);
+    bounded_scheduler.start();
+    std::atomic<bool> blocking_entered{false};
+    auto blocking_task = bounded_scheduler.spawn([&] {
+        blocking_entered.store(true, std::memory_order_release);
+        std::this_thread::sleep_for(80ms);
+    });
+    GO2CPP_REQUIRE_EVENTUALLY(
+        blocking_entered.load(std::memory_order_acquire), 1s);
+    GO2CPP_CHECK(!bounded_scheduler.shutdown_for(1ms));
+    GO2CPP_CHECK(blocking_task->wait_for(1s));
+    GO2CPP_CHECK(bounded_scheduler.shutdown_for(1s));
 
 }

@@ -63,6 +63,11 @@ public:
 
     static bool CancellationRequested() noexcept;
 
+    // 手动 Fiber（没有 Scheduler/Task 绑定）无法把等待交还给 carrier
+    // 线程，因此禁止退回原生 condition_variable 造成整条线程阻塞。
+    // 调用方应先绑定 Scheduler，或使用非阻塞接口处理该情况。
+    static bool FiberWaitUnsupported() noexcept;
+
 private:
     enum class WaitStatus { kNotified, kTimedOut, kCancelled };
     class WaitNode;

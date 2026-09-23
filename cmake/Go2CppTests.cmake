@@ -8,7 +8,6 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_channel.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dynamic_scheduler.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_panic_defer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fiber.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sync.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_future.cpp

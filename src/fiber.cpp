@@ -2,8 +2,6 @@
 
 #include "go2cpp/fiber_local.hpp"
 
-#include "go2cpp/panic_defer.hpp"
-
 #include <boost/context/detail/fcontext.hpp>
 #include <boost/context/protected_fixedsize_stack.hpp>
 #include <boost/context/stack_traits.hpp>
@@ -12,6 +10,7 @@
 #include <atomic>
 #include <cerrno>
 #include <exception>
+#include <stdexcept>
 #include <limits>
 #include <mutex>
 #include <thread>
@@ -126,7 +125,8 @@ struct FiberStack {
 
 // 父链只保存这份独立元数据，不保存父 Fiber 栈或 owner 的所有权。子 Fiber
 // 持有父记录，因此父对象结束后仍可生成一致的墓碑帧、传播取消状态；
-// 真正的 fcontext 恢复仍要求父 Fiber 对象存活，并在不满足时 fail-fast。
+// 真正的 fcontext 恢复仍要求父 Fiber 对象存活。错误生命周期会进入 Failed
+// 放弃路径，不能把已经失效的父栈当作可恢复上下文。
 struct FiberRecord {
     explicit FiberRecord(std::uint64_t fiber_id) : id(fiber_id) {}
 
@@ -160,16 +160,55 @@ struct Fiber::Impl {
 #endif
     }
 
+    void abandon_suspended(const char* message) noexcept {
+        // 挂起的 fcontext 没有正在执行的指令，释放其栈是安全的；但栈上
+        // 的 C++ 局部变量无法再展开。因此只能显式标记 Failed，并清理
+        // FiberLocal 值，不能伪造 Completed。这个路径只允许在已经取得
+        // m_resume_claim 后执行，避免与另一个 resume 并发访问上下文。
+        try {
+            const auto error = std::make_exception_ptr(std::runtime_error(message));
+            std::lock_guard<std::mutex> lock(m_failure_mutex);
+            if (!m_failure) {
+                m_failure = error;
+            }
+        } catch (...) {
+            // 诊断对象分配失败时仍必须完成上下文隔离。
+        }
+        m_function = {};
+        m_caller = nullptr;
+        m_context = nullptr;
+        m_record->reason.store(SuspendReason::None, std::memory_order_release);
+        m_scheduler_propagate.store(false, std::memory_order_release);
+        m_record->state.store(FiberState::Failed, std::memory_order_release);
+        fiber_local::detail::Cleanup(m_owner);
+    }
+
     ~Impl() noexcept {
-        // 先发布墓碑，再请求协作式收尾。父链记录不会悬空；若当前
-        // Fiber 仍挂起且调用方不是固定父级，继续恢复会破坏 fcontext
-        // 的调用栈，必须明确终止，而不能静默释放栈或无限重试。
+        // 不能在 Fiber 自身栈上销毁自身；此约束保留为明确的 API 前置条件，
+        // 否则没有任何安全位置可以释放当前正在使用的栈。
+        if (s_current_fiber == m_owner) {
+            std::terminate();
+        }
+
+        // 先取得执行 claim，再观察终态。entry() 会先发布 Completed/Failed，
+        // 后由 resume() 释放 claim；若只检查 state，析构可能在这个窗口释放
+        // fcontext/保护栈，导致 resume_locked() 继续访问已释放对象。
+        bool expected_claim = false;
+        while (!m_resume_claim.compare_exchange_weak(
+            expected_claim, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+            expected_claim = false;
+            std::this_thread::yield();
+        }
+
+        // 先发布墓碑，再请求协作式收尾。父链记录不会悬空；析构线程
+        // 只有在能够回到原父 Fiber 的情况下才允许恢复挂起栈。
         m_record->alive.store(false, std::memory_order_release);
         m_record->cancellation_requested.store(true,
                                                 std::memory_order_release);
-        // Ready Fiber 尚未进入过用户栈，没有需要展开的栈帧；可以在
-        // 任意调用方安全跳过主体。只有 Suspended Fiber 需要固定父级
-        // 恢复，以执行挂起点之后的 RAII/defer。
+
+        // Ready Fiber 尚未进入用户栈，没有需要展开的局部变量；可以在
+        // 任意调用方安全跳过主体。
         if (m_record->state.load(std::memory_order_acquire) ==
             FiberState::Ready) {
             m_function = {};
@@ -178,30 +217,44 @@ struct Fiber::Impl {
             m_record->state.store(FiberState::Completed,
                                   std::memory_order_release);
         }
-        while (m_record->state.load(std::memory_order_acquire) ==
-                   FiberState::Suspended) {
-            bool expected = false;
-            if (!m_resume_claim.compare_exchange_strong(
-                    expected, true, std::memory_order_acq_rel,
-                    std::memory_order_acquire)) {
-                std::this_thread::yield();
-                continue;
+
+        while (true) {
+            const FiberState state =
+                m_record->state.load(std::memory_order_acquire);
+            if (state == FiberState::Completed || state == FiberState::Failed) {
+                break;
             }
-            const bool resumed = resume_locked(true);
-            m_resume_claim.store(false, std::memory_order_release);
-            if (!resumed) {
+            if (state == FiberState::Running) {
+                // 取得 claim 后不应再观察到 Running；该分支只保护未来
+                // 后端扩展，不能释放仍在执行的栈。
                 std::terminate();
             }
+            if (state != FiberState::Suspended) {
+                abandon_suspended("Fiber destroyed in an invalid state");
+                break;
+            }
+
+            const bool resumed = resume_locked(true);
+            if (!resumed) {
+                // 当前析构调用方不是固定父 Fiber，无法安全跳转到挂起栈。
+                // 记录失败并释放上下文，而不是让进程被 terminate。
+                abandon_suspended("Fiber parent is not resumable during destruction");
+                break;
+            }
         }
+
         const auto final_state = m_record->state.load(std::memory_order_acquire);
         if (final_state == FiberState::Ready ||
             final_state == FiberState::Suspended ||
             final_state == FiberState::Running) {
+            // 取得独占 claim 后理论上不可达；保守地 fail-fast，避免 UAF。
             std::terminate();
         }
 #if defined(GO2CPP_FIBER_TSAN)
         __tsan_destroy_fiber(m_tsan_fiber);
 #endif
+        // m_resume_claim 故意保持为 true，Impl 即将释放，任何后续 resume
+        // 都违反 owner 生命周期契约；在本析构期间不会再有并发上下文访问。
     }
 
     static void entry(boost::context::detail::transfer_t transfer) noexcept {
@@ -225,8 +278,8 @@ struct Fiber::Impl {
         }
         self->m_function = {};
         // Fiber-local values belong to the logical G, not to the worker M.
-        // Run their destructors after the body/defer stack has unwound and
-        // before handing control back to the caller.
+        // Run their destructors after the body has unwound and before handing
+        // control back to the caller.
         fiber_local::detail::Cleanup(self->m_owner);
         self->m_record->reason.store(SuspendReason::None, std::memory_order_release);
         self->m_record->state.store(terminal_state, std::memory_order_release);
@@ -343,9 +396,6 @@ struct Fiber::Impl {
 
             boost::context::detail::transfer_t transfer{};
             {
-                // 每个 Fiber 维护独立的 panic/defer 状态；嵌套切换只
-                // 在当前跳转期间覆盖 TLS，返回后由 Binding 自动恢复。
-                panic_defer::Binding binding(m_execution_context);
 #if defined(GO2CPP_FIBER_ASAN)
                 void* caller_fake_stack = nullptr;
                 __sanitizer_start_switch_fiber(&caller_fake_stack,
@@ -393,9 +443,12 @@ struct Fiber::Impl {
                     !parent_record->alive.load(std::memory_order_acquire) ||
                     m_parent == nullptr ||
                     !m_parent->m_impl->suspend(reason, true)) {
-                    // 不能把仍挂起的子栈当作完成任务交给调度器；
-                    // 父级失效属于运行时所有权契约破坏，直接 fail-fast。
-                    std::terminate();
+                    // 不能把仍挂起的子栈当作完成任务交给调度器。父级
+                    // 已失效时将当前 Fiber 标记失败并清理其局部值，让
+                    // Scheduler 走普通失败收尾；不再从这里 terminate。
+                    abandon_suspended("nested Fiber parent is not resumable");
+                    s_current_fiber = original_caller;
+                    return false;
                 }
                 s_current_fiber = m_owner;
                 continue;
@@ -449,7 +502,6 @@ struct Fiber::Impl {
     Function m_function;
     const std::size_t m_stack_size;
     FiberStack m_stack;
-    panic_defer::ExecutionContext m_execution_context;
     boost::context::detail::fcontext_t m_context{nullptr};
     boost::context::detail::fcontext_t m_caller{nullptr};
     std::atomic<bool> m_scheduler_propagate{false};
@@ -483,7 +535,13 @@ FiberResumeResult Fiber::resume_result() noexcept {
     result.accepted = resume();
     result.state = state();
     result.failure = failure();
-    result.context_snapshot = context_snapshot();
+    try {
+        result.context_snapshot = context_snapshot();
+    } catch (...) {
+        // 快照只是诊断信息，不能因为 OOM 让 noexcept API terminate；
+        // state/failure 仍然有效，调用方可稍后再次请求快照。
+        result.context_snapshot.clear();
+    }
     return result;
 }
 
@@ -606,7 +664,12 @@ FiberContextSnapshot Fiber::context_snapshot() const {
         cursor = std::move(parent);
     }
     std::reverse(result.begin(), result.end());
-    result.insert(result.begin(), main_context_frame(root_binding));
+    // 这是从 main_fiber 进入目标 Fiber 后的调用链快照；main_fiber
+    // 只是根帧，不应与链中当前/目标 Fiber 同时标记 active。没有
+    // Fiber 时 CurrentContextSnapshot() 仍单独返回 active 的 main_fiber。
+    auto main_frame = main_context_frame(root_binding);
+    main_frame.active = false;
+    result.insert(result.begin(), std::move(main_frame));
     return result;
 }
 

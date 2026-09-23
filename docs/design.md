@@ -8,10 +8,10 @@ Boost.Context 栈式 Fiber 后端。公共名称位于 `go2cpp` 命名空间；0
 二进制 ABI 稳定。默认构建为共享库并启用 Linux Hook，静态构建必须关闭
 `GO2CPP_BUILD_HOOK`，以保证进程内只有一份 FD/TLS 注册表。
 
-调度、取消、等待和 panic/defer 的运行时控制流不使用 C++ 异常、future、promise、
-`setjmp` 或 `longjmp`。用户回调意外抛出的 C++ 异常会在 Fiber/Task 最外层边界
-被记录为未恢复 panic，正常 C++ 析构仍会执行；转译器必须显式创建
-`panic_defer::Frame`。普通 `error` 永远不会隐式变成 panic。
+调度、取消和等待不把 C++ 异常当作运行时控制流，也不使用 future、promise、
+`setjmp` 或 `longjmp`。panic/recover/defer 运行时目前不在本库范围内；用户回调
+抛出的普通 C++ 异常由 Fiber 边界捕获并记录到 `Fiber::failure()`，Task 通过
+失败状态报告。普通 `error` 不会隐式转换为异常或其他控制流。
 
 ## 所有权与生命周期
 
@@ -39,16 +39,17 @@ admission mutex 下提交，避免 wake 与 dequeue 竞态造成重复运行或�
 合法 G 状态转换如下：
 
 ```text
-new -> runnable -> running -> runnable | waiting | dead | cancelled
+new -> runnable -> running -> runnable | waiting | dead | cancelled | failed
 waiting -> runnable | cancelled
-dead/cancelled -> terminal
+failed/dead/cancelled -> terminal
 ```
 
 `yield()`/`park()` 只能作用于当前 G。Fiber 后端保存 C++ continuation，恢复后从
 原调用点继续，不会再次进入 callable。channel、IO、timer、Context 和同步通知
 要么把 waiting G 原子转为 runnable，要么在 G 仍运行时记录一次 pending wake。
 shutdown 先关闭 admission，取消未启动队列项，唤醒已启动等待 G，等待 Fiber 自然
-返回，再由拥有者 join worker；绝不强行丢弃挂起的 C++ 栈。
+返回，再由拥有者 join worker；`shutdown_for()` 超时只返回 false 并保留栈和停止状态，
+后续调用必须继续收尾，绝不强行丢弃挂起的 C++ 栈。
 
 M 从 `min_workers` 开始，根据 runnable backlog 和忙碌 M 数量有界扩展，空闲超时
 回收至下限，死亡记录会 join/reap。`allow_worker_oversubscription=false` 时最大
@@ -68,12 +69,14 @@ M 严格不超过 P；默认模式下普通 runnable 峰值仍以 P 为上限。
 （别名 `FiberLocal<T>`）按逻辑 Fiber 保存共享值，迁移不丢失，trampoline 完成后
 释放；普通线程使用 TLS fallback。它是值局部设施，不是栈池或 Fiber 对象池。
 析构会请求取消并继续 Ready/Suspended Fiber 直到自然完成，因此忽略取消的 Fiber
-可能让析构等待，但不会使用危险的强制栈释放。
+可能让析构等待。错误父级或错误调用方无法安全恢复时，运行时会清空上下文、清理
+FiberLocal 并标记 Failed；不会把挂起栈伪造为正常完成。
 
-每次 resume 周围用 `panic_defer::Binding` 安装 Fiber 自己的 ExecutionContext，
-避免 M 复用下 panic/recover 状态串 G。嵌套父链的诊断、取消和 alive 标志存放在
-共享 `FiberRecord` 链中，父对象结束后保留墓碑但不保留可恢复栈；Suspended 子 Fiber
-只能由固定父级继续恢复，错误调用方会 fail-fast。
+嵌套父链的诊断、取消和 alive 标志存放在共享 `FiberRecord` 链中，父对象结束后
+保留墓碑但不保留可恢复栈；Suspended 子 Fiber 只能由固定父级继续恢复。错误调用方会放弃上下文并标记
+Failed，挂起栈上的 RAII 无法在该路径补做。父/子对象和发起 resume 的调用栈必须
+按 owner 契约存活；Fiber 自身析构、自身栈上销毁仍是禁止用法。Fiber 不安装独立的
+panic/recover/defer 上下文。
 
 ## 线程参与、Hook 与阻塞
 
@@ -84,8 +87,7 @@ M 严格不超过 P；默认模式下普通 runnable 峰值仍以 P 为上限。
 
 `BlockingRegion` 是不可移动 RAII 对象，记录进入它的 M，结束时修复 M 状态，且
 不能跨 Fiber yield/park/迁移；worker 在任务边界发现未销毁的 region 会 fail-fast。
-它是 sysmon 的观测边界，只扩展线程池，不会把任意未 Hook 的阻塞调用变成可抢占操作。`panic_defer::panic()` 只记录运行时状态；转译代码
-必须回到活动 Frame 边界，不能把它当作普通 C++ 控制流跳转。
+它是 sysmon 的观测边界，只扩展线程池，不会把任意未 Hook 的阻塞调用变成可抢占操作。
 
 ## Context 与 Timer
 
@@ -104,14 +106,17 @@ Context key 使用进程内 identity token，值是不可变 `std::any`；字符
 
 `Channel<T>` 使用互斥保护的 FIFO 缓冲、独立发送/接收等待队列和一次性
 `SelectWaitState`。容量 0/1/N、多生产者/消费者、close、取消、deadline、方向
-视图、select/default/timeout 都有状态结果。close 唤醒所有等待者；缓冲排空后接收
-返回零值与 `ok=false`；发送已关闭 channel 返回 closed status，只有
-`SendOrPanic()` 才记录 Go 风格 panic。空 select 返回 invalid，避免测试永久挂起。
+视图、select/default/timeout 都有状态结果。为保证接收和 select 的强异常安全，
+T 必须是不抛 move 构造且析构不抛的类型；select 还要求值可复制到
+`std::any`。close 唤醒所有等待者；缓冲排空后接收返回零值与 `ok=false`；
+发送已关闭 channel 返回 closed status，`Close()` 不抛异常。空 select 返回
+invalid，避免测试永久挂起。
 
 `sync::Mutex`、`ConditionVariable`、`WaitGroup` 使用 FIFO 等待节点和 disarm gate。
 managed G 在等待前释放外部锁并 park，native 线程阻塞自己的 condition variable，
-两者共用同一移交队列，所以一个线程可以解锁由另一个 M 执行的 Fiber。禁止把
-线程所有的 `std::mutex` 跨 Fiber yield 或 Hook IO；锁和等待对象必须长于所有等待者。
+两者共用同一移交队列，所以一个线程可以解锁由另一个 M 执行的 Fiber。没有 Scheduler
+的手动 Fiber 在竞争等待、已取消 Context 或超时路径返回 false 且不阻塞 carrier；
+禁止把线程所有的 `std::mutex` 跨 Fiber yield 或 Hook IO；锁和等待对象必须长于所有等待者。
 
 ## Socket Hook 与等待顺序
 
@@ -152,7 +157,7 @@ Context 测试时钟、SelectCase、Descriptor token/guard 和 C Hook 控制是�
 
 sysmon 的等待锁与 Scheduler 主锁分离，监控线程在队列锁竞争时仍能推进心跳；扫描本身采用 try_to_lock，因此可能跳过一轮，但不会无限等待。系统只创建一个 monitor 线程，避免重复扫描和 detached 计数竞争；高负载下由 worker 池按 backlog/BlockingRegion 有界增加 M，受 max_workers 和线程资源限制。monitor 只做逻辑 P 脱离，绝不异步打断 C++ 栈、终止 Fiber 或跨线程注入异常。
 
-嵌套 Fiber 的 FiberRecord 保存 main_fiber、直接父级、当前执行绑定和挂起原因。SuspendForScheduler/park_io 使 IO 挂起沿父链传播，唤醒时恢复同一 continuation；三层链连续超时和 readiness 的测试确认不会跳回 main_fiber 或跳过父级。Suspended Fiber 仍必须由固定父级恢复，错误生命周期会 fail-fast，这是保护 C++ RAII 的边界。
+嵌套 Fiber 的 FiberRecord 保存 main_fiber、直接父级、当前执行绑定和挂起原因。SuspendForScheduler/park_io 使 IO 挂起沿父链传播，唤醒时恢复同一 continuation；三层链连续超时和 readiness 的测试确认不会跳回 main_fiber 或跳过父级。Suspended Fiber 仍应由固定父级恢复；错误生命周期会进入 Failed 并释放不可恢复上下文，这是 C++ RAII 无法跨栈复制的边界。
 
 ### 栈策略与多 FD 等待
 

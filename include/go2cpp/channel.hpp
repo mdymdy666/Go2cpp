@@ -3,7 +3,6 @@
 #include "go2cpp/context.hpp"
 #include "go2cpp/core/parking_condition.hpp"
 #include "go2cpp/error.hpp"
-#include "go2cpp/panic_defer.hpp"
 
 #include <algorithm>
 #include <any>
@@ -42,11 +41,11 @@ inline bool ChannelStatusIsReady(ChannelStatus status) noexcept {
   return status == ChannelStatus::kReady || status == ChannelStatus::kClosed;
 }
 
-ErrorPtr ChannelClosedError();
-ErrorPtr ChannelAlreadyClosedError();
-ErrorPtr ChannelWouldBlockError();
-ErrorPtr ChannelNilError();
-ErrorPtr ChannelTimeoutError();
+ErrorPtr ChannelClosedError() noexcept;
+ErrorPtr ChannelAlreadyClosedError() noexcept;
+ErrorPtr ChannelWouldBlockError() noexcept;
+ErrorPtr ChannelNilError() noexcept;
+ErrorPtr ChannelTimeoutError() noexcept;
 
 struct ChannelSendResult {
   ChannelStatus status{ChannelStatus::kInvalid};
@@ -78,6 +77,18 @@ struct SelectCase;
 
 namespace detail {
 
+// Channel value types come from user code and may throw while being copied or
+// moved. Keep such failures out of the wait-state machine: callers receive
+// kInvalid and the registration remains retryable. Error construction is
+// best-effort so the failure path cannot corrupt the channel lock invariant.
+inline ErrorPtr ValueOperationError() noexcept {
+  try {
+    return NewError("channel value construction failed");
+  } catch (...) {
+    return {};
+  }
+}
+
 inline ContextTimePoint SaturatingDeadline(ContextDuration timeout) noexcept {
   const auto now = std::chrono::steady_clock::now();
   if (timeout > ContextDuration::zero() &&
@@ -104,9 +115,11 @@ class SelectWaitState final {
       if (m_selected || m_cancelled) {
         return false;
       }
-      m_selected = true;
       m_index = index;
       m_probe = std::move(probe);
+      // std::any assignment may allocate and throw. Publish selected only
+      // after the probe has been committed successfully.
+      m_selected = true;
     }
     m_cv.notify_one();
     return true;
@@ -127,12 +140,12 @@ class SelectWaitState final {
           second->m_cancelled) {
         return false;
       }
-      first->m_selected = true;
       first->m_index = first_index;
       first->m_probe = std::move(first_probe);
-      second->m_selected = true;
       second->m_index = second_index;
       second->m_probe = std::move(second_probe);
+      first->m_selected = true;
+      second->m_selected = true;
     }
     first->m_cv.notify_one();
     second->m_cv.notify_one();
@@ -181,9 +194,11 @@ class SelectWaitState final {
     if (!m_selected || m_taken) {
       return false;
     }
-    m_taken = true;
     *index = m_index;
-    *probe = std::move(m_probe);
+    // If std::any copying fails, leave the selection consumable for a retry.
+    SelectProbe copy = m_probe;
+    *probe = std::move(copy);
+    m_taken = true;
     return true;
   }
 
@@ -226,6 +241,11 @@ struct ChannelRecvResult {
 
 template <typename T>
 class Channel final : public std::enable_shared_from_this<Channel<T>> {
+  static_assert(std::is_nothrow_move_constructible<T>::value,
+                "Channel<T> requires a nothrow move constructor");
+  static_assert(std::is_nothrow_destructible<T>::value,
+                "Channel<T> requires a nothrow destructor");
+
  public:
   using Ptr = std::shared_ptr<Channel<T>>;
   using Duration = ContextDuration;
@@ -236,7 +256,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
   }
 
   explicit Channel(std::size_t capacity = 0) : m_capacity(capacity) {}
-  ~Channel() { Close(); }
+  ~Channel() noexcept { (void)Close(); }
 
   Channel(const Channel&) = delete;
   Channel& operator=(const Channel&) = delete;
@@ -253,51 +273,67 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
   bool closed() const { return IsClosed(); }
 
   ChannelSendResult Send(T value, const ContextPtr& context = {}) {
-    return SendUntil(std::move(value), std::nullopt, context, false);
-  }
-
-  // Explicit Go-like boundary. The ordinary Send API is status based so
-  // callers can handle a close race without C++ exceptions.
-  ChannelSendResult SendOrPanic(T value, const ContextPtr& context = {}) {
-    auto result = Send(std::move(value), context);
-    if (result.Closed()) {
-      panic_defer::panic(
-          panic_defer::PanicValue::text("send on closed channel"));
+    try {
+      return SendUntil(std::move(value), std::nullopt, context, false);
+    } catch (...) {
+      return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
-    return result;
   }
 
   ChannelSendResult SendFor(T value, Duration timeout,
                             const ContextPtr& context = {}) {
-    if (timeout < Duration::zero()) {
-      timeout = Duration::zero();
+    try {
+      if (timeout < Duration::zero()) {
+        timeout = Duration::zero();
+      }
+      return SendUntil(std::move(value), detail::SaturatingDeadline(timeout),
+                       context, false);
+    } catch (...) {
+      return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
-    return SendUntil(std::move(value), detail::SaturatingDeadline(timeout),
-                     context, false);
   }
 
   ChannelSendResult TrySend(T value) {
-    return SendUntil(std::move(value), std::chrono::steady_clock::now(), {}, true);
+    try {
+      return SendUntil(std::move(value), std::chrono::steady_clock::now(), {}, true);
+    } catch (...) {
+      return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+    }
   }
 
   ChannelRecvResult<T> Recv(const ContextPtr& context = {}) {
-    return RecvUntil(std::nullopt, context, false);
+    try {
+      return RecvUntil(std::nullopt, context, false);
+    } catch (...) {
+      return {std::nullopt, false, true, ChannelStatus::kInvalid,
+              detail::ValueOperationError()};
+    }
   }
 
   ChannelRecvResult<T> RecvFor(Duration timeout, const ContextPtr& context = {}) {
-    if (timeout < Duration::zero()) {
-      timeout = Duration::zero();
+    try {
+      if (timeout < Duration::zero()) {
+        timeout = Duration::zero();
+      }
+      return RecvUntil(detail::SaturatingDeadline(timeout), context, false);
+    } catch (...) {
+      return {std::nullopt, false, true, ChannelStatus::kInvalid,
+              detail::ValueOperationError()};
     }
-    return RecvUntil(detail::SaturatingDeadline(timeout), context, false);
   }
 
   ChannelRecvResult<T> TryRecv() {
-    return RecvUntil(std::chrono::steady_clock::now(), {}, true);
+    try {
+      return RecvUntil(std::chrono::steady_clock::now(), {}, true);
+    } catch (...) {
+      return {std::nullopt, false, true, ChannelStatus::kInvalid,
+              detail::ValueOperationError()};
+    }
   }
 
   // Close is idempotent and wakes every blocked operation.  A repeated close
   // returns kAlreadyClosed; no C++ exception is thrown.
-  ChannelSendResult Close() {
+  ChannelSendResult Close() noexcept {
     std::deque<std::shared_ptr<PendingSend>> senders;
     std::deque<std::shared_ptr<PendingRecv>> receivers;
     {
@@ -315,8 +351,14 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           probe.ready = true;
           probe.status = ChannelStatus::kClosed;
           probe.error = ChannelClosedError();
-          sender->select_state->TrySelect(sender->select_index,
-                                          std::move(probe));
+          try {
+            (void)sender->select_state->TrySelect(sender->select_index,
+                                                  std::move(probe));
+          } catch (...) {
+            // Close 仍须唤醒该 select；选择结果不可提交时，把节点
+            // 取消掉，避免异常穿过 Close 并留下永远等待的 Fiber。
+            sender->select_state->Cancel();
+          }
           sender->cancelled = true;
           continue;
         }
@@ -330,8 +372,12 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           probe.ready = true;
           probe.status = ChannelStatus::kClosed;
           probe.error = ChannelClosedError();
-          receiver->select_state->TrySelect(receiver->select_index,
-                                            std::move(probe));
+          try {
+            (void)receiver->select_state->TrySelect(receiver->select_index,
+                                                    std::move(probe));
+          } catch (...) {
+            receiver->select_state->Cancel();
+          }
           receiver->cancelled = true;
           continue;
         }
@@ -349,15 +395,6 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
     m_change_cv.notify_all();
     return {ChannelStatus::kReady, {}};
-  }
-
-  ChannelSendResult CloseOrPanic() {
-    auto result = Close();
-    if (result.status == ChannelStatus::kAlreadyClosed) {
-      panic_defer::panic(
-          panic_defer::PanicValue::text("close of closed channel"));
-    }
-    return result;
   }
 
   // A monotonically increasing generation is useful to external select
@@ -541,7 +578,11 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           recv_probe.ready = true;
           recv_probe.ok = true;
           recv_probe.status = ChannelStatus::kReady;
-          recv_probe.value = value;
+          try {
+            recv_probe.value = value;
+          } catch (...) {
+            return false;
+          }
           if (!detail::SelectWaitState::TrySelectPair(
                   state, index, std::move(send_probe),
                   receiver->select_state, receiver->select_index,
@@ -563,10 +604,18 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           return true;
         }
       }
-      if (!state->TrySelect(index, std::move(send_probe))) {
+      // Construct the receiver value before publishing the select. If the
+      // user type throws, neither side has been selected and the waiter stays
+      // valid for a later sender.
+      try {
+        receiver->value.emplace(value);
+      } catch (...) {
         return false;
       }
-      receiver->value.emplace(value);
+      if (!state->TrySelect(index, std::move(send_probe))) {
+        receiver->value.reset();
+        return false;
+      }
       receiver->ok = true;
       receiver->ready = true;
       receiver->status = ChannelStatus::kReady;
@@ -596,17 +645,34 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       probe.ready = true;
       probe.ok = true;
       probe.status = ChannelStatus::kReady;
-      if (!state->TrySelect(index, std::move(probe))) {
+      try {
+        m_buffer.emplace_back(value);
+      } catch (...) {
         return false;
       }
-      m_buffer.emplace_back(value);
+      bool selected = false;
+      try {
+        selected = state->TrySelect(index, std::move(probe));
+      } catch (...) {
+        m_buffer.pop_back();
+        return false;
+      }
+      if (!selected) {
+        m_buffer.pop_back();
+        return false;
+      }
       ++m_generation;
       lock.unlock();
       m_change_cv.notify_all();
       return true;
     }
 
-    auto pending = std::make_shared<PendingSend>(value);
+    std::shared_ptr<PendingSend> pending;
+    try {
+      pending = std::make_shared<PendingSend>(value);
+    } catch (...) {
+      return false;
+    }
     pending->select_state = state;
     pending->select_index = index;
     m_senders.emplace_back(std::move(pending));
@@ -679,9 +745,13 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
   struct CallbackGuard {
     const ContextPtr& context;
     DoneSignal::CallbackId id{0};
-    ~CallbackGuard() {
+    ~CallbackGuard() noexcept {
       if (context && id != 0) {
-        context->Done().RemoveCallback(id);
+        try {
+          context->Done().RemoveCallback(id);
+        } catch (...) {
+          // 清理路径不能让异常越过 noexcept 析构函数。
+        }
       }
     }
   };
@@ -745,11 +815,23 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           SelectProbe probe;
           probe.ready = true;
           probe.ok = true;
-          probe.value = value;
+          try {
+            probe.value = value;
+          } catch (...) {
+            // 值复制失败时保留接收节点，后续发送仍可重试。
+            return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+          }
           probe.status = ChannelStatus::kReady;
+          bool selected = false;
+          try {
+            selected = receiver->select_state->TrySelect(
+                receiver->select_index, std::move(probe));
+          } catch (...) {
+            // 选择状态未发布时节点仍然有效，不能先把它从队列移除。
+            return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+          }
           m_receivers.pop_front();
-          if (!receiver->select_state->TrySelect(receiver->select_index,
-                                                 std::move(probe))) {
+          if (!selected) {
             receiver->cancelled = true;
             continue;
           }
@@ -763,7 +845,13 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           continue;
         }
       }
-      receiver->value.emplace(std::move(value));
+      try {
+        receiver->value.emplace(std::move(value));
+      } catch (...) {
+        // Keep the receiver queued. optional::emplace provides the strong
+        // empty-on-throw guarantee, so a later sender can retry it.
+        return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+      }
       m_receivers.pop_front();
       receiver->ok = true;
       receiver->ready = true;
@@ -776,7 +864,11 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
 
     if (m_buffer.size() < m_capacity) {
-      m_buffer.emplace_back(std::move(value));
+      try {
+        m_buffer.emplace_back(std::move(value));
+      } catch (...) {
+        return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+      }
       ++m_generation;
       lock.unlock();
       m_change_cv.notify_all();
@@ -789,12 +881,26 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
               nonblocking ? ChannelWouldBlockError() : ChannelTimeoutError()};
     }
 
-    auto pending = std::make_shared<PendingSend>(std::move(value));
-    m_senders.emplace_back(pending);
+    if (core::ParkingCondition::FiberWaitUnsupported()) {
+      return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+    }
+    std::shared_ptr<PendingSend> pending;
+    try {
+      pending = std::make_shared<PendingSend>(std::move(value));
+      m_senders.emplace_back(pending);
+    } catch (...) {
+      return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+    }
     CallbackGuard callback_guard{context};
     if (context) {
-      callback_guard.id = context->Done().AddCallback(
-          [pending] { pending->cv.notify_one(); });
+      try {
+        callback_guard.id = context->Done().AddCallback(
+            [pending] { pending->cv.notify_one(); });
+      } catch (...) {
+        ErasePending(m_senders, pending);
+        ++m_generation;
+        return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+      }
     }
 
     for (;;) {
@@ -861,6 +967,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     std::unique_lock<std::mutex> lock(m_mutex);
 
     if (!m_buffer.empty()) {
+      // Channel<T> requires a nothrow move constructor, so extracting the
+      // front value cannot leave a damaged element behind after an exception.
       T value = std::move(m_buffer.front());
       m_buffer.pop_front();
       // Refill one blocked sender into a newly available buffer slot.
@@ -880,27 +988,52 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         continue;
       }
       if (sender->select_state) {
-        SelectProbe probe;
-        probe.ready = true;
-        probe.ok = true;
-        probe.status = ChannelStatus::kReady;
-        if (!sender->select_state->TrySelect(sender->select_index,
-                                             std::move(probe))) {
-          sender->cancelled = true;
-          m_senders.pop_front();
-          continue;
+        // A selected sender must not be claimed before its value can be
+        // transferred. For a potentially-throwing value type, require a
+        // noexcept copy/move path; otherwise leave the sender queued and
+        // report a recoverable operation failure.
+        if constexpr (!std::is_nothrow_move_constructible<T>::value &&
+                      !std::is_nothrow_copy_constructible<T>::value) {
+          return {std::nullopt, false, true, ChannelStatus::kInvalid,
+                  detail::ValueOperationError()};
+        } else {
+          SelectProbe probe;
+          probe.ready = true;
+          probe.ok = true;
+          probe.status = ChannelStatus::kReady;
+          if (!sender->select_state->TrySelect(sender->select_index,
+                                               std::move(probe))) {
+            sender->cancelled = true;
+            m_senders.pop_front();
+            continue;
+          }
         }
       }
-      T value = std::move(sender->value);
-      m_senders.pop_front();
-      sender->accepted = true;
-      sender->status = ChannelStatus::kReady;
-      sender->cv.notify_one();
-      ++m_generation;
-      lock.unlock();
-      m_change_cv.notify_all();
-      return {std::optional<T>(std::move(value)), true, true,
-              ChannelStatus::kReady, {}};
+      if constexpr (std::is_nothrow_move_constructible<T>::value) {
+        T value = std::move(sender->value);
+        m_senders.pop_front();
+        sender->accepted = true;
+        sender->status = ChannelStatus::kReady;
+        sender->cv.notify_one();
+        ++m_generation;
+        lock.unlock();
+        m_change_cv.notify_all();
+        return {std::optional<T>(std::move(value)), true, true,
+                ChannelStatus::kReady, {}};
+      } else {
+        // The only remaining accepted path is a noexcept copy. Returning a
+        // copy avoids invoking a potentially-throwing move after selection.
+        T value = sender->value;
+        m_senders.pop_front();
+        sender->accepted = true;
+        sender->status = ChannelStatus::kReady;
+        sender->cv.notify_one();
+        ++m_generation;
+        lock.unlock();
+        m_change_cv.notify_all();
+        return {std::optional<T>(value), true, true,
+                ChannelStatus::kReady, {}};
+      }
     }
 
     // Closed channels drain buffered values first, then yield the zero value.
@@ -921,12 +1054,29 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
               nonblocking ? ChannelWouldBlockError() : ChannelTimeoutError()};
     }
 
-    auto pending = std::make_shared<PendingRecv>();
-    m_receivers.emplace_back(pending);
+    if (core::ParkingCondition::FiberWaitUnsupported()) {
+      return {std::nullopt, false, true, ChannelStatus::kInvalid,
+              detail::ValueOperationError()};
+    }
+    std::shared_ptr<PendingRecv> pending;
+    try {
+      pending = std::make_shared<PendingRecv>();
+      m_receivers.emplace_back(pending);
+    } catch (...) {
+      return {std::nullopt, false, true, ChannelStatus::kInvalid,
+              detail::ValueOperationError()};
+    }
     CallbackGuard callback_guard{context};
     if (context) {
-      callback_guard.id = context->Done().AddCallback(
-          [pending] { pending->cv.notify_one(); });
+      try {
+        callback_guard.id = context->Done().AddCallback(
+            [pending] { pending->cv.notify_one(); });
+      } catch (...) {
+        ErasePending(m_receivers, pending);
+        ++m_generation;
+        return {std::nullopt, false, true, ChannelStatus::kInvalid,
+                detail::ValueOperationError()};
+      }
     }
 
     for (;;) {
@@ -988,22 +1138,52 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         continue;
       }
       if (sender->select_state) {
-        SelectProbe probe;
-        probe.ready = true;
-        probe.ok = true;
-        probe.status = ChannelStatus::kReady;
-        if (!sender->select_state->TrySelect(sender->select_index,
-                                             std::move(probe))) {
+        if constexpr (!std::is_nothrow_move_constructible<T>::value &&
+                      !std::is_nothrow_copy_constructible<T>::value) {
+          // Do not claim a select whose value cannot be transferred without
+          // risking a partially committed buffer.
+          break;
+        } else {
+          try {
+            if constexpr (std::is_nothrow_move_constructible<T>::value) {
+              m_buffer.emplace_back(std::move(sender->value));
+            } else {
+              m_buffer.emplace_back(sender->value);
+            }
+          } catch (...) {
+            break;
+          }
+          SelectProbe probe;
+          probe.ready = true;
+          probe.ok = true;
+          probe.status = ChannelStatus::kReady;
+          bool selected = false;
+          try {
+            selected = sender->select_state->TrySelect(sender->select_index,
+                                                       std::move(probe));
+          } catch (...) {
+            selected = false;
+          }
+          if (!selected) {
+            m_buffer.pop_back();
+            sender->cancelled = true;
+            m_senders.pop_front();
+            continue;
+          }
           sender->cancelled = true;
           m_senders.pop_front();
           continue;
         }
-        m_buffer.emplace_back(std::move(sender->value));
-        sender->cancelled = true;
-        m_senders.pop_front();
-        continue;
       }
-      m_buffer.emplace_back(std::move(sender->value));
+      try {
+        if constexpr (std::is_nothrow_move_constructible<T>::value) {
+          m_buffer.emplace_back(std::move(sender->value));
+        } else {
+          m_buffer.emplace_back(sender->value);
+        }
+      } catch (...) {
+        break;
+      }
       sender->accepted = true;
       sender->status = ChannelStatus::kReady;
       sender->cv.notify_one();
@@ -1072,25 +1252,11 @@ class SendOnlyChannel final {
     return m_channel->TrySend(std::move(value));
   }
 
-  ChannelSendResult SendOrPanic(T value, const ContextPtr& context = {}) const {
-    if (!m_channel) {
-      return {ChannelStatus::kNil, ChannelNilError()};
-    }
-    return m_channel->SendOrPanic(std::move(value), context);
-  }
-
-  ChannelSendResult Close() const {
+  ChannelSendResult Close() const noexcept {
     if (!m_channel) {
       return {ChannelStatus::kNil, ChannelNilError()};
     }
     return m_channel->Close();
-  }
-
-  ChannelSendResult CloseOrPanic() const {
-    if (!m_channel) {
-      return {ChannelStatus::kNil, ChannelNilError()};
-    }
-    return m_channel->CloseOrPanic();
   }
 
   std::size_t Capacity() const noexcept {

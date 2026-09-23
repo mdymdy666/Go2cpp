@@ -5,29 +5,41 @@
 #include <thread>
 
 namespace go2cpp {
+namespace {
 
-ErrorPtr ChannelClosedError() {
-  static const ErrorPtr error = NewError("channel closed");
+ErrorPtr make_channel_error(const char* message) noexcept {
+  try {
+    return NewError(message);
+  } catch (...) {
+    // 错误对象只用于诊断；分配失败时仍保持 channel 的状态机完整。
+    return {};
+  }
+}
+
+}  // namespace
+
+ErrorPtr ChannelClosedError() noexcept {
+  static const ErrorPtr error = make_channel_error("channel closed");
   return error;
 }
 
-ErrorPtr ChannelAlreadyClosedError() {
-  static const ErrorPtr error = NewError("channel already closed");
+ErrorPtr ChannelAlreadyClosedError() noexcept {
+  static const ErrorPtr error = make_channel_error("channel already closed");
   return error;
 }
 
-ErrorPtr ChannelWouldBlockError() {
-  static const ErrorPtr error = NewError("channel operation would block");
+ErrorPtr ChannelWouldBlockError() noexcept {
+  static const ErrorPtr error = make_channel_error("channel operation would block");
   return error;
 }
 
-ErrorPtr ChannelNilError() {
-  static const ErrorPtr error = NewError("nil channel");
+ErrorPtr ChannelNilError() noexcept {
+  static const ErrorPtr error = make_channel_error("nil channel");
   return error;
 }
 
-ErrorPtr ChannelTimeoutError() {
-  static const ErrorPtr error = NewError("channel operation timed out");
+ErrorPtr ChannelTimeoutError() noexcept {
+  static const ErrorPtr error = make_channel_error("channel operation timed out");
   return error;
 }
 
@@ -61,7 +73,12 @@ SelectResult Select(const std::vector<SelectCase>& cases,
                          const std::shared_ptr<detail::SelectWaitState>& state) {
     for (const auto& item : select_cases) {
       if (item.disarm) {
-        item.disarm(state);
+        try {
+          item.disarm(state);
+        } catch (...) {
+          // Disarm is cleanup. A user-supplied case must not prevent the
+          // remaining channel registrations from being removed.
+        }
       }
     }
   };
@@ -76,7 +93,13 @@ SelectResult Select(const std::vector<SelectCase>& cases,
       if (!cases[index].probe) {
         continue;
       }
-      auto probe = cases[index].probe();
+      SelectProbe probe;
+      try {
+        probe = cases[index].probe();
+      } catch (...) {
+        return {SelectResult::kNoSelection, false, false, {},
+                ChannelStatus::kInvalid, detail::ValueOperationError()};
+      }
       if (probe.ready) {
         return {index, true, probe.ok, std::move(probe.value), probe.status,
                 std::move(probe.error)};
@@ -108,22 +131,45 @@ SelectResult Select(const std::vector<SelectCase>& cases,
       return {SelectResult::kNoSelection, false, false, {},
               ChannelStatus::kTimedOut, ChannelTimeoutError()};
     }
+    if (core::ParkingCondition::FiberWaitUnsupported()) {
+      return {SelectResult::kNoSelection, false, false, {},
+              ChannelStatus::kInvalid,
+              detail::ValueOperationError()};
+    }
 
     bool has_poll_case = false;
     auto wait_state = std::make_shared<detail::SelectWaitState>();
-    for (std::size_t index = 0; index < cases.size(); ++index) {
-      if (!cases[index].arm) {
-        has_poll_case = has_poll_case ||
-                        (!cases[index].is_default && cases[index].probe);
-        continue;
+    try {
+      for (std::size_t index = 0; index < cases.size(); ++index) {
+        if (!cases[index].arm) {
+          has_poll_case = has_poll_case ||
+                          (!cases[index].is_default && cases[index].probe);
+          continue;
+        }
+        cases[index].arm(wait_state, index);
       }
-      cases[index].arm(wait_state, index);
+    } catch (...) {
+      wait_state->Cancel();
+      try {
+        disarm(cases, wait_state);
+      } catch (...) {
+      }
+      return {SelectResult::kNoSelection, false, false, {},
+              ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
 
     std::size_t selected_index = SelectResult::kNoSelection;
     SelectProbe selected_probe;
+    bool take_failed = false;
     const auto take_selected = [&] {
-      return wait_state->Take(&selected_index, &selected_probe);
+      try {
+        return wait_state->Take(&selected_index, &selected_probe);
+      } catch (...) {
+        // 结果复制失败时不能把已选状态当作未发生，否则会继续等待并
+        // 让注册节点泄漏；由调用方走统一取消/拆除路径。
+        take_failed = true;
+        return false;
+      }
     };
     if (take_selected()) {
       disarm(cases, wait_state);
@@ -134,19 +180,47 @@ SelectResult Select(const std::vector<SelectCase>& cases,
               selected_probe.status,
               std::move(selected_probe.error)};
     }
+    if (take_failed) {
+      wait_state->Cancel();
+      disarm(cases, wait_state);
+      return {SelectResult::kNoSelection, false, false, {},
+              ChannelStatus::kInvalid, detail::ValueOperationError()};
+    }
 
     DoneSignal::CallbackId callback_id = 0;
     if (context) {
-      callback_id = context->Done().AddCallback([wait_state] {
-        wait_state->Notify();
-      });
+      try {
+        callback_id = context->Done().AddCallback([wait_state] {
+          wait_state->Notify();
+        });
+      } catch (...) {
+        // 回调注册可能因分配失败而抛出；此时必须先取消并拆除所有
+        // channel 节点，否则下一次发送会唤醒已返回的 Select。
+        wait_state->Cancel();
+        disarm(cases, wait_state);
+        return {SelectResult::kNoSelection, false, false, {},
+                ChannelStatus::kInvalid, detail::ValueOperationError()};
+      }
     }
+
+    const auto remove_callback = [&] {
+      if (context && callback_id != 0) {
+        try {
+          context->Done().RemoveCallback(callback_id);
+        } catch (...) {
+          // 仅清理观察者注册；等待节点拆除不能被异常打断。
+        }
+      }
+    };
 
     bool custom_selected = false;
     bool channel_selected = false;
     for (;;) {
       if (take_selected()) {
         channel_selected = true;
+        break;
+      }
+      if (take_failed) {
         break;
       }
 
@@ -157,10 +231,27 @@ SelectResult Select(const std::vector<SelectCase>& cases,
             !cases[index].probe) {
           continue;
         }
-        auto probe = cases[index].probe();
-        if (probe.ready && wait_state->TrySelect(index, std::move(probe))) {
-          custom_selected = true;
-          break;
+        SelectProbe probe;
+        try {
+          probe = cases[index].probe();
+        } catch (...) {
+          remove_callback();
+          wait_state->Cancel();
+          disarm(cases, wait_state);
+          return {SelectResult::kNoSelection, false, false, {},
+                  ChannelStatus::kInvalid, detail::ValueOperationError()};
+        }
+        try {
+          if (probe.ready && wait_state->TrySelect(index, std::move(probe))) {
+            custom_selected = true;
+            break;
+          }
+        } catch (...) {
+          remove_callback();
+          wait_state->Cancel();
+          disarm(cases, wait_state);
+          return {SelectResult::kNoSelection, false, false, {},
+                  ChannelStatus::kInvalid, detail::ValueOperationError()};
         }
       }
       if (custom_selected) {
@@ -172,26 +263,32 @@ SelectResult Select(const std::vector<SelectCase>& cases,
       if (core::ParkingCondition::CancellationRequested()) {
         break;
       }
-      if (deadline.has_value()) {
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= *deadline) {
-          break;
+      try {
+        if (deadline.has_value()) {
+          const auto now = std::chrono::steady_clock::now();
+          if (now >= *deadline) {
+            break;
+          }
+          auto remaining = *deadline - now;
+          if (has_poll_case && remaining > std::chrono::milliseconds(2)) {
+            remaining = std::chrono::milliseconds(2);
+          }
+          wait_state->WaitFor(remaining, context);
+        } else if (has_poll_case) {
+          wait_state->WaitFor(std::chrono::milliseconds(2), context);
+        } else {
+          wait_state->Wait(context);
         }
-        auto remaining = *deadline - now;
-        if (has_poll_case && remaining > std::chrono::milliseconds(2)) {
-          remaining = std::chrono::milliseconds(2);
-        }
-        wait_state->WaitFor(remaining, context);
-      } else if (has_poll_case) {
-        wait_state->WaitFor(std::chrono::milliseconds(2), context);
-      } else {
-        wait_state->Wait(context);
+      } catch (...) {
+        remove_callback();
+        wait_state->Cancel();
+        disarm(cases, wait_state);
+        return {SelectResult::kNoSelection, false, false, {},
+                ChannelStatus::kInvalid, detail::ValueOperationError()};
       }
     }
 
-    if (context && callback_id != 0) {
-      context->Done().RemoveCallback(callback_id);
-    }
+    remove_callback();
     if (!channel_selected && !custom_selected) {
       // Linearize timeout/cancellation against a late channel handoff before
       // removing wait nodes. If the handoff won the race, preserve it.
@@ -204,6 +301,10 @@ SelectResult Select(const std::vector<SelectCase>& cases,
     }
     disarm(cases, wait_state);
 
+    if (take_failed) {
+      return {SelectResult::kNoSelection, false, false, {},
+              ChannelStatus::kInvalid, detail::ValueOperationError()};
+    }
     if (channel_selected) {
       return {selected_index,
               selected_probe.ready,

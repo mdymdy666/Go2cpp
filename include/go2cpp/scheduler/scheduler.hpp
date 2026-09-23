@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -46,6 +47,8 @@ enum class GState : std::uint8_t {
     kWaiting,
     kDead,
     kCancelled,
+    // 普通 C++ 异常在 Fiber 边界被捕获后的失败终态。
+    kFailed,
 
     // Readable aliases for callers that mirror the Go terminology.
     New = kNew,
@@ -54,6 +57,7 @@ enum class GState : std::uint8_t {
     Waiting = kWaiting,
     Dead = kDead,
     Cancelled = kCancelled,
+    Failed = kFailed,
 };
 
 enum class MState : std::uint8_t {
@@ -154,6 +158,10 @@ public:
     bool started() const noexcept;
     bool cancellation_requested() const noexcept;
     TaskClassId task_class() const noexcept;
+    // 普通 C++ 异常导致的失败是可观察终态，不会静默当作正常完成。
+    bool failed() const noexcept;
+    std::exception_ptr failure() const;
+    void rethrow_failure() const;
     // Returns false for a self-join or when the joining managed G is
     // cancelled. Unmanaged callers retain the normal thread join behavior.
     bool wait() const;
@@ -166,6 +174,9 @@ public:
         return cancellation_requested();
     }
     TaskClassId TaskClass() const noexcept { return task_class(); }
+    bool Failed() const noexcept { return failed(); }
+    std::exception_ptr Failure() const { return failure(); }
+    void RethrowFailure() const { rethrow_failure(); }
     bool Join() const { return wait(); }
     // Internal queue/run claims.  They are public so the replaceable worker
     // backend can enforce the same invariant without exposing data members.
@@ -221,6 +232,8 @@ private:
     std::atomic<bool> m_run_claim{false};
     std::atomic<bool> m_started{false};
     std::atomic<bool> m_cancel_requested{false};
+    mutable std::mutex m_failure_mutex;
+    std::exception_ptr m_failure;
     // No-allocation rescue queue link. It is changed only under the owning
     // scheduler's admission mutex and never forms a cycle.
     std::shared_ptr<Task> m_emergency_next;
@@ -271,10 +284,18 @@ public:
 
     void start();
     void shutdown();
+    // 请求停止并在给定时间内等待所有 Fiber/worker 完成。返回 true 表示
+    // 已完成并已回收 worker；返回 false 表示超时或从 worker 自身调用。
+    // 超时不会释放仍在运行的 Fiber 栈，调用者可稍后再次调用本接口或
+    // 使用无界 shutdown() 完成最终回收。
+    bool shutdown_for(std::chrono::steady_clock::duration timeout);
     bool is_running() const noexcept;
 
     void Start() { start(); }
     void Shutdown() { shutdown(); }
+    bool ShutdownFor(std::chrono::steady_clock::duration timeout) {
+        return shutdown_for(timeout);
+    }
     bool IsRunning() const noexcept { return is_running(); }
 
     std::shared_ptr<Task> spawn(Task::Function function);

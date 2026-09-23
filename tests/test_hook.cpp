@@ -539,7 +539,7 @@ void test_managed_poll_fallback_publishes_blocking() {
     scheduler.shutdown();
 }
 
-void test_managed_write_error_is_not_panic() {
+void test_managed_write_error_is_reported() {
     go2cpp::IOManager manager(one_worker_config());
     GO2CPP_CHECK(manager.Start());
 
@@ -790,7 +790,7 @@ void run_hook_tests() {
     test_native_fallback_grows_replacement_m();
     test_iomanager_untracked_fd_publishes_blocking();
     test_managed_poll_fallback_publishes_blocking();
-    test_managed_write_error_is_not_panic();
+    test_managed_write_error_is_reported();
     test_nested_fiber_io_timeout_and_wake();
     test_deep_nested_fiber_io_chain();
 }

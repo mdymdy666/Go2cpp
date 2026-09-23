@@ -1,5 +1,6 @@
 #include "go2cpp/sync.hpp"
 
+#include "go2cpp/fiber.hpp"
 #include "go2cpp/scheduler.hpp"
 
 #include <algorithm>
@@ -113,6 +114,7 @@ private:
 struct WaitTarget {
     Scheduler* scheduler{nullptr};
     std::shared_ptr<Task> task;
+    bool unsupported_manual_fiber{false};
 
     explicit operator bool() const noexcept {
         return scheduler != nullptr && static_cast<bool>(task);
@@ -120,7 +122,11 @@ struct WaitTarget {
 };
 
 WaitTarget CurrentTarget() noexcept {
-    return {Scheduler::current_scheduler(), Scheduler::current_task()};
+    Scheduler* const scheduler = Scheduler::current_scheduler();
+    auto task = Scheduler::current_task();
+    const bool manual_fiber = Fiber::Current() != nullptr &&
+                              (scheduler == nullptr || !task);
+    return {scheduler, std::move(task), manual_fiber};
 }
 
 class ContextSubscription final {
@@ -245,7 +251,14 @@ ContextPtr TimeoutContext(ContextDuration timeout, const ContextPtr& parent,
 // regains its lock before observing the false result. Mutex::Lock may decline
 // to re-park a G during scheduler shutdown; in that case the documented result
 // is false with the mutex left unlocked.
-bool AbortConditionWait(Mutex& mutex) {
+bool AbortConditionWait(Mutex& mutex, bool preserve_lock = false) {
+    // A manually resumed Fiber has no scheduler continuation. Unlocking and
+    // then blocking on relock could still park the carrier thread if another
+    // owner wins the race, so this explicitly constrained path keeps the
+    // caller's lock and reports false.
+    if (preserve_lock) {
+        return false;
+    }
     mutex.Unlock();
     (void)mutex.Lock();
     return false;
@@ -276,6 +289,11 @@ bool Mutex::Lock(const ContextPtr& context) {
     }
 
     const WaitTarget target = CurrentTarget();
+    if (target.unsupported_manual_fiber) {
+        // A manually resumed Fiber has no scheduler continuation to park.
+        // Returning false is safer than blocking its carrier thread.
+        return false;
+    }
     if (target && target.task->cancellation_requested()) {
         return false;
     }
@@ -377,10 +395,15 @@ ConditionVariable::ConditionVariable() : m_impl(std::make_unique<Impl>()) {}
 ConditionVariable::~ConditionVariable() = default;
 
 bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
+    // 必须先识别手动 Fiber。即使 Context 已取消，也不能走普通线程的
+    // unlock/relock 路径，否则竞争中的重锁会阻塞 carrier 线程。
+    const WaitTarget target = CurrentTarget();
+    if (target.unsupported_manual_fiber) {
+        return AbortConditionWait(mutex, true);
+    }
     if (context && context->IsDone()) {
         return AbortConditionWait(mutex);
     }
-    const WaitTarget target = CurrentTarget();
     if (target && target.task->cancellation_requested()) {
         return AbortConditionWait(mutex);
     }
@@ -535,6 +558,9 @@ bool WaitGroup::Wait(const ContextPtr& context) {
     }
 
     const WaitTarget target = CurrentTarget();
+    if (target.unsupported_manual_fiber) {
+        return false;
+    }
     if (target && target.task->cancellation_requested()) {
         return false;
     }

@@ -309,7 +309,9 @@ void test_exception_isolation_and_shutdown_cancel() {
     std::atomic<bool> reached{false};
     auto good = scheduler.spawn([&] { reached.store(true); });
     SMOKE_CHECK(wait_until([&] { return reached.load(); }));
-    SMOKE_CHECK(bad->state() == go2cpp::GState::kDead);
+    SMOKE_CHECK(bad->state() == go2cpp::GState::kFailed);
+    SMOKE_CHECK(bad->failed());
+    SMOKE_CHECK(static_cast<bool>(bad->failure()));
     SMOKE_CHECK(good->state() == go2cpp::GState::kDead);
 
     std::atomic<bool> release{false};

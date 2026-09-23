@@ -11,9 +11,9 @@
 G 的合法转换为：
 
 ```text
-new -> runnable -> running -> runnable | waiting | dead | cancelled
+new -> runnable -> running -> runnable | waiting | dead | cancelled | failed
 waiting -> runnable | cancelled
-dead/cancelled -> terminal
+failed/dead/cancelled -> terminal
 ```
 
 快照中的 M/P 转换为：
@@ -49,8 +49,9 @@ admission mutex 下串行；Task transition mutex 保护状态字段。任何用
 原始 Fiber API 属于高级接口，调用方仍必须合作返回。嵌套 Fiber 的父链由共享
 元数据记录保存，父对象结束后快照可以得到 `alive=false` 墓碑帧；但真正的
 fcontext 恢复仍要求固定父 Fiber 对象存活。Ready 子 Fiber 尚未进入用户栈，析构时
-可以安全跳过主体；Suspended 子 Fiber 若在错误父级之外析构会 fail-fast，避免
-无限重试、跳过 RAII/defer 或释放仍可恢复的栈。
+可以安全跳过主体；Suspended 子 Fiber 若在错误父级之外析构会标记 Failed 并放弃上下文，避免
+跳入错误父栈或释放仍可恢复的栈；该路径不能执行挂起栈上的 RAII，因此正常用法
+仍是由固定父级完成子 Fiber。
 
 ## 动态 M 策略
 
@@ -94,8 +95,9 @@ join。Scheduler/IOManager 所有者必须长于 worker 和外部成员调用，
 
 managed G 调用 `Task::wait`/`Join` 时使用 `ParkingCondition`，所以 P=1 也能运行被
 等待的子 G；普通线程使用 native condition fallback。自 join 或已取消的 managed
-waiter 返回 false。销毁挂起 Fiber 是“请求取消 + 自然完成”，永不返回的 body 会让
-join/shutdown 等待，这保证 C++ RAII 不被跳过。
+waiter 返回 false。销毁挂起 Fiber 通常是“请求取消 + 自然完成”，永不返回的 body 会让
+join/shutdown 等待，这保证 C++ RAII 不被跳过；错误父级路径会返回 Failed，
+ 超时后不得释放仍运行的栈。
 
 ## 可观测性与验证
 
@@ -110,4 +112,4 @@ sysmon 的节拍等待使用独立的 sysmon_wait_condition，不再先获取 Sc
 
 Hook IO 的 readiness、deadline、cancel 和 close 唤醒均通过一次性等待节点和 park_io() 进入 Fiber；嵌套 Fiber 的 IO 挂起会沿固定父链传播，唤醒后按原 fcontext 继续，测试覆盖三层父链、连续超时/ready 两次等待和父级返回顺序。当前公共 API 每个等待节点只接受一个 (fd, event)，没有 Fiber 级 wait_any/多 FD select；需要同时等待多个 FD 时应由多个 G/Fiber 分别等待，再用 Channel/Select 汇合，或使用应用层的外部 epoll。该限制已明确记录，不把多个独立等待误称为 Go select。
 
-monitor 不会从异线程终止、迁移或恢复任意 C++ Fiber 栈，也不会向 write 等系统调用注入 C++ 异常。Hook 系统调用错误保持 libc 的返回值和 errno；未恢复错误由调用者决定是否转成 error 或显式 panic。关闭对端后 send(MSG_NOSIGNAL) 的回归确认错误不会导致 Task 异常终止。
+monitor 不会从异线程终止、迁移或恢复任意 C++ Fiber 栈，也不会向 write 等系统调用注入 C++ 异常。Hook 系统调用错误保持 libc 的返回值和 errno；调用者应显式转换为 error 或使用普通 C++ 异常。关闭对端后的错误由调用者处理。

@@ -12,7 +12,6 @@
 #include "go2cpp/event.hpp"
 #include "go2cpp/hook.hpp"
 #include "go2cpp/io.hpp"
-#include "go2cpp/panic_defer.hpp"
 #include "go2cpp/scheduler.hpp"
 #include "go2cpp/sync.hpp"
 #include "go2cpp/thread_policy.hpp"

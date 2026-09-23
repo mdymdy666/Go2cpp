@@ -43,7 +43,7 @@ cd third_party/go-reference && sha256sum -c SHA256SUMS
 | `sudog`、futex、netpoller | 堆等待节点、ParkingCondition、TimerService、Linux epoll | 不复刻 Go netpoller 内部 ABI |
 | runtime 原子操作 | `std::atomic` 加状态转换互斥量 | 遵循 C++ 内存模型，不承诺 Go 内部顺序 |
 | cgo 与内部 ABI | 无依赖，只有公共 C++ 头文件 | cgo 互操作不在范围内 |
-| 编译器生成 defer/panic | 显式 `panic_defer::Frame` 与 unwind 协议 | 转译器必须生成边界，普通 C++ 函数不会自动获得 Go 语义 |
+| 编译器生成 defer/panic | 当前未提供对应运行时；Fiber 只保留普通 C++ 异常结果 | 需要 Go panic/recover/defer 语义的转译代码不属于当前支持范围，普通 C++ 函数使用 RAII 与 try/catch |
 | Go 定时器/取消 | 可取消 `TimerService`、Context deadline、等待节点 gate | 回调线程不会直接恢复 Fiber 栈 |
 
 ## 构建依赖

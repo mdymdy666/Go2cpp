@@ -71,7 +71,7 @@ The test executable accepts one exact module name in `GO2CPP_TEST_FILTER`.
 The following current-source runs passed under a 45-second watchdog:
 
 ```sh
-for name in hook sync fiber dynamic scheduler context channel panic error; do
+for name in hook sync fiber dynamic scheduler context channel error; do
   GO2CPP_TEST_FILTER="$name" timeout 45s ./build-check/go2cpp_tests
 done
 ```
@@ -80,7 +80,7 @@ These cover default-enabled socket hooks and close/dup/fd reuse,
 scheduler-aware mutex/condition-variable/waitgroup, stack migration and
 natural Fiber destruction, dynamic M growth/shrink/affinity/stealing, the G
 state machine and cancellation queue cleanup, context trees, channels and
-select, and panic/error boundaries. The hook regression also checks
+select, ordinary C++ exception boundaries, and error chains. The hook regression also checks
 native-thread poll fallback timeout reporting, `dup2` replacement-before-close
 notification, `dup2(fd, fd)` no-op identity, tracked `FIONBIO` `EFAULT`,
 managed `MSG_OOB` rejection. The scheduler regression includes raw Fiber
@@ -181,7 +181,7 @@ passed`). The temporary source/build directory under
 
 The tests cover P=1 and multi-P scheduling, local/global queues, stealing,
 dynamic worker waves, cancellation/shutdown, context trees/deadlines/values,
-defer/panic/recover boundaries, error chains, channels/select/close, Fiber
+ordinary C++ exception boundaries, error chains, channels/select/close, Fiber
 migration and destruction, coroutine synchronization, epoll readiness and
 timer/close races, and transparent socket wrappers.
 
@@ -342,7 +342,7 @@ WSL + Boost.Context 偶发的 `unexpected memory mapping` 已在本轮绕过地�
 
 ## Fiber 父链与 sysmon 多 M 交接复核（2026-09-23）
 
-- `GO2CPP_TEST_FILTER=fiber timeout 60s ./build-concurrency-audit/go2cpp_tests`：通过；新增父对象结束后的 `alive=false` 墓碑快照，以及嵌套 Fiber 唤醒后 panic/defer 隔离回归。
+- `GO2CPP_TEST_FILTER=fiber timeout 60s ./build-concurrency-audit/go2cpp_tests`：通过；新增父对象结束后的 `alive=false` 墓碑快照，以及嵌套 Fiber 唤醒后的父链顺序和失败隔离回归。
 - `GO2CPP_TEST_FILTER=dynamic timeout 90s ./build-concurrency-audit/go2cpp_tests`：重复 10 次通过；新增两个并发长阻塞 G 的 detached 计数、替代 M 保留和共同唤醒验证。
 - `ctest --test-dir build-concurrency-audit --output-on-failure --timeout 60`：2/2；Hook-on 9/9；Release 8/8；Werror 2/2；Clang 2/2；ASan 2/2；UBSan 2/2。
 - TSan 全量命令连续 3/3 通过：`setarch x86_64 -R env TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 timeout 90s ./build-tsan-concurrency/go2cpp_tests`。
@@ -372,3 +372,14 @@ WSL + Boost.Context 偶发的 `unexpected memory mapping` 已在本轮绕过地�
 - 当前工作树源码重编译后，Hook/Fiber/dynamic 过滤器各连续 5/5 通过；Hook 全套 CTest 9/9、Release 8/8、Werror 2/2、Clang 2/2、ASan 2/2、UBSan 2/2 通过。
 - 当前 TSan 构建使用 setarch x86_64 -R，完整 go2cpp_tests 单次通过且没有 ThreadSanitizer 报告；WSL 下重复全套曾出现不同 native waiter watchdog 超时，因此不能把 WSL 重复运行描述为稳定发布门槛。
 - 当前 Memcheck 日志为 build-sysmon-hook/valgrind-final-current.log：416 bytes/4 blocks still reachable，definite/indirect/possible lost 均为 0，ERROR SUMMARY 为 0。
+
+## 2026-09-23 本次交付最终工作树复测
+
+以下结果对应本次提交前的最终源码（包含 panic_defer 删除、Channel<T> 不抛 move 约束、手动 Fiber 条件变量修复和 Fiber 快照 active 修复）：
+
+- Debug Hook-on：`cmake --build build-postpanic --parallel 4`；`ctest --test-dir build-postpanic --output-on-failure --timeout 120`，9/9 通过；sync、fiber、channel 过滤测试分别通过。
+- Release Hook-on：`cmake --build build-final-release --parallel 4`；CTest 9/9 通过。
+- ASan+UBSan Debug：`build-final-asan`，使用 `-fsanitize=address,undefined -fno-omit-frame-pointer`，CTest 9/9 通过；未报告 sanitizer 错误。
+- Valgrind Memcheck：`LD_LIBRARY_PATH=build-final-release valgrind --tool=memcheck --leak-check=full --show-leak-kinds=definite,indirect,possible --error-exitcode=99 --log-file=build-final-release/valgrind-final.log build-final-release/go2cpp_tests`，ERROR SUMMARY 0；definite/indirect/possible 均为 0；416 bytes/4 blocks 仍可达，属于 FiberLocal/TimerService 进程级状态。
+- TSan：普通启动仍在当前 WSL 失败于 `unexpected memory mapping`；`setarch x86_64 -R` 启动可运行 scheduler/fiber 过滤，但最终 sync 过滤在 `tests/test_sync.cpp:158` 的 native waiter watchdog 超时，未产生 race 报告。因此本次不宣称 TSan 全量通过，native Linux 仍需作为发布门槛。
+- 构建期间仅见 WSL 挂载时间偏差的 clock skew 警告，不影响上述退出码和测试结果。

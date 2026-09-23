@@ -104,9 +104,26 @@ TaskClassId Task::task_class() const noexcept {
     return m_options.task_class;
 }
 
+bool Task::failed() const noexcept {
+    return state() == GState::kFailed;
+}
+
+std::exception_ptr Task::failure() const {
+    std::lock_guard<std::mutex> lock(m_failure_mutex);
+    return m_failure;
+}
+
+void Task::rethrow_failure() const {
+    const auto error = failure();
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
 bool Task::terminal() const noexcept {
     const auto current = state();
-    return current == GState::kDead || current == GState::kCancelled;
+    return current == GState::kDead || current == GState::kCancelled ||
+           current == GState::kFailed;
 }
 
 bool Task::wait() const {
@@ -320,7 +337,8 @@ bool Task::request_cancel(bool notify) noexcept {
     {
         std::lock_guard<std::mutex> lock(m_transition_mutex);
         const auto state = m_state.load(std::memory_order_relaxed);
-        if (state == GState::kDead || state == GState::kCancelled) {
+        if (state == GState::kDead || state == GState::kCancelled ||
+            state == GState::kFailed) {
             return false;
         }
         m_cancel_requested.store(true, std::memory_order_release);
@@ -328,7 +346,7 @@ bool Task::request_cancel(bool notify) noexcept {
             m_fiber->RequestCancellation();
         }
         // A started Fiber must resume to its trampoline so stack locals and
-        // defers finish normally. Only an unstarted G is terminal immediately.
+        // stack cleanup finishes normally. Only an unstarted G is terminal immediately.
         if (!m_started.load(std::memory_order_relaxed) &&
             !m_execution_claim.load(std::memory_order_relaxed)) {
             m_state.store(GState::kCancelled, std::memory_order_release);
@@ -402,9 +420,8 @@ void Task::run() {
                     auto body = std::move(m_function);
                     if (body) {
                         // Fiber::entry catches ordinary C++ exceptions and
-                        // exposes them through Fiber::failure(). The runtime
-                        // deliberately has no panic/recover control-flow
-                        // layer; user code must handle exceptions explicitly.
+                        // exposes them through Fiber::failure(). User code must
+                        // handle ordinary C++ exceptions explicitly.
                         body();
                     }
                 },
@@ -418,9 +435,14 @@ void Task::run() {
                 fiber = m_fiber.get();
             }
         } catch (...) {
+            const auto error = std::current_exception();
+            {
+                std::lock_guard<std::mutex> lock(m_failure_mutex);
+                m_failure = error;
+            }
             {
                 std::lock_guard<std::mutex> lock(m_transition_mutex);
-                m_state.store(GState::kDead, std::memory_order_release);
+                m_state.store(GState::kFailed, std::memory_order_release);
                 m_execution_claim.store(false, std::memory_order_release);
             }
             auto abandoned_function = release_callable();
@@ -448,6 +470,9 @@ void Task::run() {
     // can therefore safely request cancellation on this stable pointer.
     const bool resumed = fiber->resume();
     const FiberState fiber_state = fiber->state();
+    const auto fiber_failure = fiber_state == FiberState::Failed
+                                   ? fiber->failure()
+                                   : std::exception_ptr{};
     bool became_terminal = false;
     Function completed_function;
     std::unique_ptr<Fiber> completed_fiber;
@@ -457,10 +482,17 @@ void Task::run() {
             fiber_state == FiberState::Failed) {
             m_deferred_enqueue.store(false, std::memory_order_relaxed);
             m_wake_pending.store(false, std::memory_order_relaxed);
-            m_state.store(m_cancel_requested.load(std::memory_order_relaxed)
-                              ? GState::kCancelled
-                              : GState::kDead,
-                          std::memory_order_release);
+            if (fiber_failure) {
+                std::lock_guard<std::mutex> failure_lock(m_failure_mutex);
+                m_failure = fiber_failure;
+            }
+            const auto terminal_state = fiber_state == FiberState::Failed
+                                            ? GState::kFailed
+                                            : (m_cancel_requested.load(
+                                                   std::memory_order_relaxed)
+                                                   ? GState::kCancelled
+                                                   : GState::kDead);
+            m_state.store(terminal_state, std::memory_order_release);
             // A cancelled-before-first-resume Fiber can still retain the
             // callable. Move it out while updating state, then destroy it
             // after the transition lock is released.
@@ -986,7 +1018,8 @@ public:
                 continue;
             }
             const auto state = task->state();
-            if (state == GState::kDead || state == GState::kCancelled) {
+            if (state == GState::kDead || state == GState::kCancelled ||
+                state == GState::kFailed) {
                 continue;
             }
             task->request_cancel(false);
@@ -1130,10 +1163,24 @@ void Scheduler::start() {
     m_impl->condition.notify_all();
 }
 
-void Scheduler::shutdown() {
+bool Scheduler::shutdown_for(
+    std::chrono::steady_clock::duration timeout) {
     if (!m_impl) {
-        return;
+        return true;
     }
+
+    const auto clock_now = std::chrono::steady_clock::now();
+    const bool bounded =
+        timeout != std::chrono::steady_clock::duration::max();
+    const auto nonnegative_timeout =
+        timeout < std::chrono::steady_clock::duration::zero()
+            ? std::chrono::steady_clock::duration::zero()
+            : timeout;
+    const auto max_time = std::chrono::steady_clock::time_point::max();
+    const auto deadline =
+        bounded && nonnegative_timeout < max_time - clock_now
+            ? clock_now + nonnegative_timeout
+            : max_time;
 
     // A worker may initiate shutdown, but it must never join another M: two
     // workers doing so concurrently would each wait for the other to return
@@ -1195,7 +1242,7 @@ void Scheduler::shutdown() {
         }
         deferred_destruction.clear();
         completion_notifications.clear();
-        return;
+        return true;
     }
     m_impl->condition.notify_all();
 
@@ -1206,7 +1253,7 @@ void Scheduler::shutdown() {
             }
         }
         deferred_destruction.clear();
-        return;
+        return false;
     }
 
     // Keep workers alive while every started Fiber observes cancellation and
@@ -1215,15 +1262,55 @@ void Scheduler::shutdown() {
     // std::thread can; discarding its suspended stack would skip RAII.
     {
         std::unique_lock<std::mutex> lock(m_impl->mutex);
-        m_impl->condition.wait(lock, [this] {
+        const auto terminal = [this] {
             return m_impl->all_tasks_terminal_locked();
-        });
+        };
+        const bool completed =
+            bounded ? m_impl->condition.wait_until(lock, deadline, terminal)
+                    : (m_impl->condition.wait(lock, terminal), true);
         m_impl->collect_terminal_locked(deferred_destruction);
+        if (!completed) {
+            // 保持 draining 状态和已发布的取消请求；Fiber 栈仍由 worker
+            // 拥有，不能因为超时而强制释放。后续 shutdown_for()/shutdown()
+            // 会从这里继续收尾。
+            lock.unlock();
+            for (auto& task : deferred_destruction) {
+                if (task) {
+                    auto abandoned_function = task->release_callable();
+                }
+            }
+            deferred_destruction.clear();
+            completion_notifications.clear();
+            return false;
+        }
         m_impl->stopping.store(true, std::memory_order_release);
         m_impl->draining.store(false, std::memory_order_release);
     }
     m_impl->stop_sysmon(true);
     m_impl->condition.notify_all();
+
+    // 先等待 worker 主动退出；这样有界调用不会在 timeout 后把仍运行的
+    // std::thread 留给析构路径。若本轮超时，stopping 保持为 true，后续
+    // 调用可以继续等待并完成 join。
+    if (bounded) {
+        std::unique_lock<std::mutex> lock(m_impl->mutex);
+        const bool workers_stopped = m_impl->condition.wait_until(
+            lock, deadline, [this] {
+                return m_impl->active_workers.load(std::memory_order_acquire) ==
+                       0;
+            });
+        if (!workers_stopped) {
+            lock.unlock();
+            for (auto& task : deferred_destruction) {
+                if (task) {
+                    auto abandoned_function = task->release_callable();
+                }
+            }
+            deferred_destruction.clear();
+            completion_notifications.clear();
+            return false;
+        }
+    }
 
     // The external caller owns join_mutex, which prevents the worker-side
     // reaper from moving or erasing thread objects while they are joined.
@@ -1280,6 +1367,11 @@ void Scheduler::shutdown() {
     }
     deferred_destruction.clear();
     completion_notifications.clear();
+    return true;
+}
+
+void Scheduler::shutdown() {
+    (void)shutdown_for(std::chrono::steady_clock::duration::max());
 }
 
 bool Scheduler::is_running() const noexcept {
@@ -1314,7 +1406,8 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     // retaining a pre-cancelled callable in the scheduler registry until the
     // next shutdown/worker collection pass.
     const auto initial_state = task->state();
-    if (initial_state == GState::kDead || initial_state == GState::kCancelled) {
+    if (initial_state == GState::kDead || initial_state == GState::kCancelled ||
+        initial_state == GState::kFailed) {
         return false;
     }
 

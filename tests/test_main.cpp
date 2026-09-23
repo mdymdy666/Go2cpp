@@ -9,7 +9,6 @@ void run_context_tests();
 void run_channel_tests();
 void run_scheduler_tests();
 void run_dynamic_scheduler_tests();
-void run_panic_defer_tests();
 void run_fiber_tests();
 void run_sync_tests();
 void run_future_tests();
@@ -29,7 +28,6 @@ int main() {
     if (selected("channel")) run_channel_tests();
     if (selected("scheduler")) run_scheduler_tests();
     if (selected("dynamic")) run_dynamic_scheduler_tests();
-    if (selected("panic")) run_panic_defer_tests();
     if (selected("fiber")) run_fiber_tests();
     if (selected("sync")) run_sync_tests();
     if (selected("future")) run_future_tests();

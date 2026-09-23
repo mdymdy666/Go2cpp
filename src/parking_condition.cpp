@@ -1,5 +1,6 @@
 #include "go2cpp/core/parking_condition.hpp"
 
+#include "go2cpp/fiber.hpp"
 #include "go2cpp/core/timer.hpp"
 #include "go2cpp/scheduler.hpp"
 
@@ -111,6 +112,10 @@ bool ParkingCondition::CancellationRequested() noexcept {
     return task && task->cancellation_requested();
 }
 
+bool ParkingCondition::FiberWaitUnsupported() noexcept {
+    return Fiber::Current() != nullptr && !Scheduler::current_task();
+}
+
 void ParkingCondition::notify_one() noexcept {
     std::shared_ptr<WaitNode> selected;
     {
@@ -152,6 +157,11 @@ ParkingCondition::WaitStatus ParkingCondition::WaitOnce(
     Scheduler* const scheduler = Scheduler::current_scheduler();
     const auto task = Scheduler::current_task();
     const bool managed = scheduler != nullptr && static_cast<bool>(task);
+    if (!managed && Fiber::Current() != nullptr) {
+        // 没有 Scheduler 归属的手动 Fiber 无法安全 park；保持外部
+        // mutex 锁定并返回取消状态，避免阻塞 carrier OS 线程。
+        return WaitStatus::kCancelled;
+    }
     if (managed && task->cancellation_requested()) {
         return WaitStatus::kCancelled;
     }

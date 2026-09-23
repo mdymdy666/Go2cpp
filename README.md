@@ -12,7 +12,7 @@
   以及支持阻塞、关闭和 select 的类型化 channel；
 - Linux epoll `IOManager` 和默认启用、带 FD generation 关闭保护的 socket Hook；
 - 支持 `Is`、`As`、`Unwrap`、`Join` 的不可变错误链；
-- 显式 frame/defer/panic/recover 协议，运行时控制流不使用 C++ 异常或 `longjmp`。
+- Fiber 边界捕获普通 C++ 异常并通过 `Fiber::failure()`/`Task::failure()` 报告；资源清理由 RAII 和 `try/catch` 负责。Go 的 panic/recover/defer 控制流不在当前范围内。
 
 构建并运行默认测试套件：
 
@@ -68,7 +68,7 @@ go2cpp::shutdown_default_scheduler();
 
 转译代码需要完整公共接口时，包含 `go2cpp/runtime.hpp`。模块 target
 （`go2cpp::error`、`go2cpp::context`、`go2cpp::channel`、
-`go2cpp::scheduler`、`go2cpp::panic_defer`、`go2cpp::fiber`、
+`go2cpp::scheduler`、`go2cpp::fiber`、
 `go2cpp::sync`、`go2cpp::io`、`go2cpp::hook`）既可在源码树中单独使用，
 也会与 `go2cpp::runtime` umbrella target 一起导出。
 

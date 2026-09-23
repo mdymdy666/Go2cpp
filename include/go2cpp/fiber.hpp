@@ -92,8 +92,10 @@ public:
     // 析构会请求取消并等待 Fiber 自然返回。Ready Fiber 会跳过主体；
     // Suspended Fiber 只有在固定父级/调用方仍可恢复时才会继续执行。
     // owner 必须长于所有 resume()；不能在 Fiber 自身执行期间析构。
-    // 若挂起 Fiber 在错误的父级之外析构，运行时会 fail-fast，避免跳过
-    // 栈上的 RAII/defer 或释放仍可恢复的上下文。忽略取消的主体可能阻塞析构。
+    // 若挂起 Fiber 在错误的父级之外析构，运行时会安全放弃该上下文并
+    // 标记 Failed，而不是释放后继续恢复或直接终止进程；这条路径无法
+    // 展开挂起栈上的局部 RAII，因此规范代码应始终由固定父级收尾。
+    // 忽略取消的主体可能阻塞析构。
     ~Fiber();
     Fiber(const Fiber&) = delete;
     Fiber& operator=(const Fiber&) = delete;

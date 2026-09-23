@@ -84,14 +84,14 @@ third_party/go1.23.0-full/
 
 - Go channel 是编译器和 runtime 共同使用的 `hchan`，C++ 是模板 `Channel<T>` 和共享状态对象。
 - Go nil channel 的阻塞 send/receive 会永久阻塞；C++ 返回 `ChannelStatus::kNil`，不会复现永久阻塞语义。
-- Go 向 closed channel 发送必然 panic；C++ 普通 `Send` 返回 closed status，只有 `SendOrPanic` 才记录运行时 panic。
+- Go 向 closed channel 发送必然 panic；C++ 普通 `Send` 返回 closed status，运行时不提供 panic 控制流。
 - Go 重复 close 会 panic；C++ `Close` 返回 `kAlreadyClosed`。
 - Go 的 select 由编译器/runtime 生成并使用 sudog、selectgo、随机化顺序；C++ 使用 `SelectCase`、probe/arm/disarm 和自定义等待状态。
 - C++ 的 select 公平性是有限的轮转游标，不是 Go runtime 的随机选择算法和调度交互。
 - C++ 的 timeout、Context、取消和自定义 probe 是额外协议，不存在于 Go `chan.go` 的同一实现边界。
 - 通道对象生命周期由 C++ 调用方负责，不能依赖 Go GC 自动保活。
 
-### 4. defer / panic / recover
+### 4. defer / panic / recover（当前未实现）
 
 参考文件：
 
@@ -99,18 +99,10 @@ third_party/go1.23.0-full/
 - `third_party/go1.23.0-full/src/runtime/defer_test.go`
 - `third_party/go1.23.0-full/src/runtime/panic_test.go`
 
-当前 C++ 实现：
-
-- `include/go2cpp/panic_defer.hpp`
-- `src/panic_defer.cpp`
-
-不是原实现的地方：
-
-- Go 编译器自动插入 defer；C++ 必须显式创建 `panic_defer::Frame`。
-- Go panic 会由 runtime 进行栈展开；C++ `panic()` 主要记录状态，必须返回到活动 Frame 边界才能完成展开。
-- 没有 Go 的精确 goroutine 栈追踪、`Goexit`、runtime panic 进程终止和内部 ABI。
-- 用户 C++ exception 在最外层被转换为未恢复 panic，这是兼容层策略，不是 Go 行为。
-- `panic(nil)` 使用 C++ 的显式 nil 标记，不等同于 Go runtime 的完整 panic nil 对象和版本细节。
+当前 C++ 运行时不提供对应模块。Fiber 只在入口边界捕获普通 C++ 异常并
+通过 `Fiber::failure()` 报告；用户代码应使用 C++ RAII、`try/catch` 和显式
+错误返回。Go 编译器自动插入的 defer、runtime 栈展开、recover 边界和
+`panic(nil)` 均不在当前支持范围内。
 
 ### 5. error
 
@@ -143,15 +135,14 @@ third_party/go1.23.0-full/
 - 调度模型的 G/M/P 概念、runnable/waiting/dead 等状态意图。
 - Context 的父子取消、deadline、timeout、value、cause 语义目标。
 - Channel 的容量、FIFO、阻塞收发、关闭和 select 目标。
-- defer 的注册时参数求值、LIFO 和 panic 路径执行目标。
-- panic/recover 的同 Fiber 隔离和直接 defer 恢复边界目标。
+- defer/panic/recover 仅保留为上游语义调研记录，未进入 C++ 运行时目标。
 - error 的包装、解包、身份判断和 Join 目标。
 
 这些是“语义目标”，不是 Go runtime 内部代码的证明性复刻。
 
 ## 审计建议
 
-如果要求达到更高可信度，下一步应做 Go/C++ 双实现的随机对拍、逐测试映射、调度状态机模型检查，以及对 Context/Channel/select/panic 的差异用例补齐；在这些工作完成前，不应宣称 100% Go 兼容。
+如果要求达到更高可信度，下一步应做 Go/C++ 双实现的随机对拍、逐测试映射、调度状态机模型检查，以及对 Context/Channel/select 的差异用例补齐；在这些工作完成前，不应宣称 100% Go 兼容。
 ## 自举前 C 源码的实际位置
 
 如果目标是查看“最初不是用 Go 写的 Go”，不要从 `go1.23.0-full` 开始。应查看：
@@ -174,4 +165,3 @@ src/cmd/gc/
 ```
 
 注意：Go 1.4.3 的 runtime 已经是 C、Go 和汇编混合实现；不存在一个“整个 runtime 都只有 C”的 Go 1.4 源码目录。这里抽取的是自举前真正由 C/汇编承担的部分。Go 1.4.3 仍有 `proc.go`、`chan.go` 等 Go 文件，而 Go 1.5 才完成主要 compiler/runtime 自举转换。
-

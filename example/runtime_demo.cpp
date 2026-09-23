@@ -1,6 +1,5 @@
 #include "go2cpp/channel.hpp"
 #include "go2cpp/context.hpp"
-#include "go2cpp/panic_defer.hpp"
 #include "go2cpp/scheduler.hpp"
 
 #include <atomic>
@@ -31,8 +30,9 @@ int main() {
             received.store(result.ValueOrDefault(), std::memory_order_release);
         }
     });
-    scheduler.spawn(
-        [&] { channel->SendOrPanic(42, cancel_context_pair.first); });
+    scheduler.spawn([&] {
+        (void)channel->Send(42, cancel_context_pair.first);
+    });
 
     const auto receive_deadline = std::chrono::steady_clock::now() + 2s;
     while (received.load(std::memory_order_acquire) == 0 &&
@@ -68,19 +68,6 @@ int main() {
               << '\n';
     std::cout << "error=" << ErrorMessage(error) << '\n';
     std::cout << "error_is_root=" << (Is(error, root_error) ? "true" : "false")
-              << '\n';
-
-    const bool panic_recovered = panic_defer::run([] {
-        panic_defer::Frame frame;
-        frame.defer_call([] {
-            const auto value = panic_defer::recover();
-            if (const auto* text = value.as_text()) {
-                std::cout << "recovered=" << *text << '\n';
-            }
-        });
-        panic_defer::panic(panic_defer::PanicValue::text("demo panic"));
-    });
-    std::cout << "panic_recovered=" << (panic_recovered ? "true" : "false")
               << '\n';
 
     context_pair.second();

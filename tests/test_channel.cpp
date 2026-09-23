@@ -38,6 +38,8 @@ static_assert(!has_recv<go2cpp::SendOnlyChannel<int>>::value);
 static_assert(has_recv<go2cpp::RecvOnlyChannel<int>>::value);
 static_assert(!has_send<go2cpp::RecvOnlyChannel<int>>::value);
 static_assert(!has_close<go2cpp::RecvOnlyChannel<int>>::value);
+static_assert(noexcept(std::declval<go2cpp::Channel<int>&>().Close()));
+static_assert(std::is_nothrow_destructible<go2cpp::Channel<int>>::value);
 
 }  // namespace
 

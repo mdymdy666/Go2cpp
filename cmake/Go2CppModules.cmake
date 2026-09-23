@@ -18,8 +18,6 @@ add_library(go2cpp_scheduler
     ${CMAKE_CURRENT_SOURCE_DIR}/src/parking_condition.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/timer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/thread_policy.cpp)
-add_library(go2cpp_panic_defer
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/panic_defer.cpp)
 add_library(go2cpp_fiber
     ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber_local.cpp)
@@ -40,7 +38,6 @@ set_target_properties(go2cpp_error PROPERTIES EXPORT_NAME error)
 set_target_properties(go2cpp_context PROPERTIES EXPORT_NAME context)
 set_target_properties(go2cpp_channel PROPERTIES EXPORT_NAME channel)
 set_target_properties(go2cpp_scheduler PROPERTIES EXPORT_NAME scheduler)
-set_target_properties(go2cpp_panic_defer PROPERTIES EXPORT_NAME panic_defer)
 set_target_properties(go2cpp_fiber PROPERTIES EXPORT_NAME fiber)
 set_target_properties(go2cpp_sync PROPERTIES EXPORT_NAME sync)
 set_target_properties(go2cpp_future PROPERTIES EXPORT_NAME future)
@@ -57,7 +54,6 @@ add_library(go2cpp::error ALIAS go2cpp_error)
 add_library(go2cpp::context ALIAS go2cpp_context)
 add_library(go2cpp::channel ALIAS go2cpp_channel)
 add_library(go2cpp::scheduler ALIAS go2cpp_scheduler)
-add_library(go2cpp::panic_defer ALIAS go2cpp_panic_defer)
 add_library(go2cpp::fiber ALIAS go2cpp_fiber)
 add_library(go2cpp::sync ALIAS go2cpp_sync)
 add_library(go2cpp::future ALIAS go2cpp_future)
@@ -71,7 +67,6 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_context
     go2cpp_channel
     go2cpp_scheduler
-    go2cpp_panic_defer
     go2cpp_fiber
     go2cpp_sync
     go2cpp_future
@@ -105,10 +100,9 @@ target_include_directories(go2cpp_runtime INTERFACE
 )
 
 target_link_libraries(go2cpp_context PUBLIC go2cpp_error go2cpp_scheduler)
-target_link_libraries(go2cpp_channel PUBLIC go2cpp_context go2cpp_error
-                                      go2cpp_panic_defer)
-target_link_libraries(go2cpp_scheduler PUBLIC go2cpp_panic_defer go2cpp_fiber)
-target_link_libraries(go2cpp_fiber PUBLIC go2cpp_panic_defer Boost::context)
+target_link_libraries(go2cpp_channel PUBLIC go2cpp_context go2cpp_error)
+target_link_libraries(go2cpp_scheduler PUBLIC go2cpp_fiber)
+target_link_libraries(go2cpp_fiber PUBLIC Boost::context)
 if (GO2CPP_HAVE_VALGRIND_HEADER)
     target_compile_definitions(go2cpp_fiber PRIVATE BOOST_USE_VALGRIND=1)
 endif()
@@ -121,7 +115,7 @@ if (TARGET go2cpp_hook)
 endif()
 target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_error go2cpp_context go2cpp_channel go2cpp_scheduler
-    go2cpp_panic_defer go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io
+    go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io
     Threads::Threads)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_runtime INTERFACE go2cpp_hook)

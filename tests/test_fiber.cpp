@@ -1,6 +1,5 @@
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/fiber_local.hpp"
-#include "go2cpp/panic_defer.hpp"
 #include "go2cpp/scheduler.hpp"
 #include "test_support.hpp"
 
@@ -170,17 +169,12 @@ void run_fiber_tests() {
     std::atomic<int> abandoned_destroyed{0};
     bool abandoned_continued = false;
     bool abandoned_cancelled = false;
-    bool abandoned_deferred = false;
     {
         Fiber abandoned([&] {
-            go2cpp::panic_defer::run([&] {
-                go2cpp::panic_defer::Frame frame;
-                frame.defer_call([&] { abandoned_deferred = true; });
-                LifetimeProbe probe(abandoned_destroyed);
-                Fiber::Suspend(SuspendReason::Park);
-                abandoned_continued = true;
-                abandoned_cancelled = Fiber::CancellationRequested();
-            });
+            LifetimeProbe probe(abandoned_destroyed);
+            Fiber::Suspend(SuspendReason::Park);
+            abandoned_continued = true;
+            abandoned_cancelled = Fiber::CancellationRequested();
         });
         GO2CPP_CHECK(abandoned.resume());
         GO2CPP_CHECK(abandoned.state() == FiberState::Suspended);
@@ -188,7 +182,6 @@ void run_fiber_tests() {
     GO2CPP_CHECK(abandoned_destroyed.load(std::memory_order_relaxed) == 1);
     GO2CPP_CHECK(abandoned_continued);
     GO2CPP_CHECK(abandoned_cancelled);
-    GO2CPP_CHECK(abandoned_deferred);
 
     int cancellation_loop_iterations = 0;
     bool cancellation_loop_finished = false;
@@ -235,6 +228,55 @@ void run_fiber_tests() {
     GO2CPP_CHECK(nested_parent.state() == FiberState::Completed);
     GO2CPP_CHECK(nested_continuation == 2);
 
+    // 子 Fiber 仍挂在父栈上时，如果用户在错误的调用方销毁它，
+    // 运行时不能跳入已经不在当前执行链的父栈。此路径应放弃子上下文
+    // 并标记失败，但不能 terminate；随后父 Fiber 仍应能正常收尾。
+    std::unique_ptr<Fiber> detached_child;
+    std::atomic<bool> detached_parent_suspended{false};
+    Fiber detached_parent([&] {
+        auto child = std::make_unique<Fiber>([] {
+            GO2CPP_CHECK(Fiber::Suspend(SuspendReason::Park));
+        });
+        GO2CPP_CHECK(child->resume());
+        GO2CPP_CHECK(child->state() == FiberState::Suspended);
+        detached_child.reset(child.release());
+        detached_parent_suspended.store(true, std::memory_order_release);
+        GO2CPP_CHECK(Fiber::Suspend(SuspendReason::Yield));
+    });
+    GO2CPP_CHECK(detached_parent.resume());
+    GO2CPP_REQUIRE_EVENTUALLY(
+        detached_parent_suspended.load(std::memory_order_acquire), 1s);
+    GO2CPP_REQUIRE(detached_child != nullptr);
+    detached_child.reset();
+    GO2CPP_CHECK(detached_parent.resume());
+    GO2CPP_CHECK(detached_parent.state() == FiberState::Completed);
+
+    // 错误父级析构也必须摘除 FiberLocal 值，不能因地址复用把旧 G 的
+    // 值带给后续 Fiber。该 child 在挂起状态下从父栈逃逸，再由外部销毁。
+    std::atomic<int> orphan_local_destroyed{0};
+    go2cpp::FiberLocalCache<LifetimeProbe> orphan_local;
+    std::unique_ptr<Fiber> orphan_child;
+    std::atomic<bool> orphan_parent_suspended{false};
+    Fiber orphan_parent([&] {
+        auto child = std::make_unique<Fiber>([&] {
+            orphan_local.GetOrCreate(orphan_local_destroyed);
+            GO2CPP_CHECK(Fiber::Suspend(SuspendReason::Park));
+        });
+        GO2CPP_CHECK(child->resume());
+        GO2CPP_CHECK(child->state() == FiberState::Suspended);
+        orphan_child.reset(child.release());
+        orphan_parent_suspended.store(true, std::memory_order_release);
+        GO2CPP_CHECK(Fiber::Suspend(SuspendReason::Yield));
+    });
+    GO2CPP_CHECK(orphan_parent.resume());
+    GO2CPP_REQUIRE_EVENTUALLY(
+        orphan_parent_suspended.load(std::memory_order_acquire), 1s);
+    GO2CPP_REQUIRE(orphan_child != nullptr);
+    orphan_child.reset();
+    GO2CPP_CHECK(orphan_local_destroyed.load(std::memory_order_acquire) == 1);
+    GO2CPP_CHECK(orphan_parent.resume());
+    GO2CPP_CHECK(orphan_parent.state() == FiberState::Completed);
+
     // 父对象结束后，子 Fiber 的诊断链仍由共享记录保留墓碑，不能
     // 因为访问快照而解引用已经销毁的父对象。子本身先完成，避免
     // 试图从不存在的父栈恢复。
@@ -272,30 +314,11 @@ void run_fiber_tests() {
                 nested_stage.store(1, std::memory_order_release);
                 const auto snapshot = Fiber::CurrentContextSnapshot();
                 if (snapshot.size() >= 4 && snapshot.front().main_fiber &&
+                    !snapshot.front().active && snapshot.back().active &&
                     snapshot.back().depth >= 3) {
                     inner_snapshot_ok.store(true, std::memory_order_release);
                 }
                 GO2CPP_CHECK(nested_scheduler.park_current());
-                // 唤醒后重新进入嵌套 Fiber，验证跨多层 fcontext 返回后
-                // panic/defer 仍绑定到当前 Fiber，而不是落到父 G。
-                bool nested_recovered = false;
-                Fiber post_wake_panic([&] {
-                    using namespace go2cpp::panic_defer;
-                    run([&] {
-                        Frame frame;
-                        frame.defer_call([&] {
-                            const auto value = recover();
-                            nested_recovered =
-                                value.as_text() != nullptr &&
-                                *value.as_text() == "post-wake";
-                        });
-                        panic(PanicValue::text("post-wake"));
-                    });
-                });
-                GO2CPP_CHECK(post_wake_panic.resume());
-                GO2CPP_CHECK(post_wake_panic.state() == FiberState::Completed);
-                GO2CPP_CHECK(nested_recovered);
-                GO2CPP_CHECK(!go2cpp::panic_defer::panicking());
                 nested_stage.store(3, std::memory_order_release);
             });
             GO2CPP_CHECK(inner.resume());
@@ -331,50 +354,6 @@ void run_fiber_tests() {
     GO2CPP_CHECK(parent_failure.resume());
     GO2CPP_CHECK(parent_observed_failure);
     GO2CPP_CHECK(parent_failure.state() == FiberState::Completed);
-
-    using namespace go2cpp::panic_defer;
-    std::string recovered;
-    bool panic_run_completed = false;
-    Fiber panic_fiber([&] {
-        panic_run_completed = run([&] {
-            Frame frame;
-            frame.defer_call([&] {
-                const PanicValue value = recover();
-                if (const auto* text = value.as_text()) {
-                    recovered = *text;
-                }
-            });
-            panic(PanicValue::text("fiber-local panic"));
-            Fiber::Suspend(SuspendReason::Yield);
-        });
-    });
-    GO2CPP_CHECK(panic_fiber.resume());
-    GO2CPP_CHECK(!panicking());
-    GO2CPP_CHECK(panic_fiber.resume());
-    GO2CPP_CHECK(panic_fiber.state() == FiberState::Completed);
-    GO2CPP_CHECK(panic_run_completed);
-    GO2CPP_CHECK(recovered == "fiber-local panic");
-    GO2CPP_CHECK(!panicking());
-
-    ExecutionContext execution_context;
-    std::thread bind_first([&] {
-        Binding binding(execution_context);
-        panic(PanicValue::text("migrated panic"));
-        GO2CPP_CHECK(panicking());
-    });
-    GO2CPP_JOIN_WITH_WATCHDOG(bind_first, 3s);
-    GO2CPP_CHECK(!panicking());
-
-    std::thread bind_second([&] {
-        GO2CPP_CHECK(!panicking());
-        Binding binding(execution_context);
-        const PanicValue value = current_panic();
-        GO2CPP_CHECK(value.valid());
-        GO2CPP_CHECK(value.as_text() != nullptr);
-        GO2CPP_CHECK(*value.as_text() == "migrated panic");
-    });
-    GO2CPP_JOIN_WITH_WATCHDOG(bind_second, 3s);
-    GO2CPP_CHECK(!panicking());
 
     // FiberLocalCache follows the logical G across a migration, while an
     // ordinary thread gets an independent TLS fallback.

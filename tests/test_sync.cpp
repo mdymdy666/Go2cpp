@@ -1,4 +1,6 @@
 #include "go2cpp/sync.hpp"
+#include "go2cpp/fiber.hpp"
+#include "go2cpp/channel.hpp"
 
 #include "go2cpp/scheduler.hpp"
 #include "test_support.hpp"
@@ -377,6 +379,58 @@ void TestImmediateConditionAndWaitGroupAbort() {
     scheduler.shutdown();
 }
 
+void TestManualFiberDoesNotBlockCarrier() {
+    go2cpp::sync::Mutex mutex;
+    go2cpp::sync::ConditionVariable condition;
+    go2cpp::sync::WaitGroup group;
+    group.Add(1);
+    auto channel = go2cpp::MakeChannel<int>(0);
+    std::atomic<bool> finished{false};
+    std::atomic<bool> mutex_result{true};
+    std::atomic<bool> condition_result{true};
+    std::atomic<bool> group_result{true};
+    std::atomic<go2cpp::ChannelStatus> channel_result{
+        go2cpp::ChannelStatus::kReady};
+
+    GO2CPP_CHECK(mutex.Lock());
+    go2cpp::Fiber fiber([&] {
+        // There is no Scheduler::current_task() for this manually resumed
+        // Fiber. Contended waits must return promptly instead of blocking the
+        // thread that owns the Fiber stack.
+        mutex_result.store(mutex.Lock(), std::memory_order_release);
+        condition_result.store(condition.Wait(mutex), std::memory_order_release);
+        group_result.store(group.WaitFor(50ms), std::memory_order_release);
+        channel_result.store(channel->RecvFor(50ms).status,
+                             std::memory_order_release);
+        finished.store(true, std::memory_order_release);
+    });
+    GO2CPP_CHECK(fiber.resume());
+    GO2CPP_CHECK(finished.load(std::memory_order_acquire));
+    GO2CPP_CHECK(!mutex_result.load(std::memory_order_acquire));
+    GO2CPP_CHECK(!condition_result.load(std::memory_order_acquire));
+    GO2CPP_CHECK(!group_result.load(std::memory_order_acquire));
+    GO2CPP_CHECK(channel_result.load(std::memory_order_acquire) ==
+                 go2cpp::ChannelStatus::kInvalid);
+
+    // 即使 Context 已取消，手动 Fiber 也必须保留调用方持有的锁，
+    // 不能走普通线程的 unlock/relock 路径而阻塞 carrier。
+    auto cancelled_context = go2cpp::WithCancel(go2cpp::Background());
+    cancelled_context.second();
+    std::atomic<bool> cancelled_condition_result{true};
+    go2cpp::Fiber cancelled_fiber([&] {
+        cancelled_condition_result.store(
+            condition.Wait(mutex, cancelled_context.first),
+            std::memory_order_release);
+    });
+    GO2CPP_CHECK(cancelled_fiber.resume());
+    GO2CPP_CHECK(!cancelled_condition_result.load(std::memory_order_acquire));
+    GO2CPP_CHECK(!mutex.TryLock());
+
+    // ConditionVariable's constrained manual-Fiber path preserves the lock.
+    mutex.Unlock();
+    group.Done();
+}
+
 void TestFifoAndSingleProcessorProgress() {
     go2cpp::Scheduler scheduler(SchedulerConfig(1));
     go2cpp::sync::Mutex mutex;
@@ -723,6 +777,7 @@ void run_sync_tests() {
     TestUnmanagedBoundaryAndCounterErrors();
     TestMixedThreadAndFiberSynchronization();
     TestImmediateConditionAndWaitGroupAbort();
+    TestManualFiberDoesNotBlockCarrier();
     TestFifoAndSingleProcessorProgress();
     TestContextAndTimeout();
     TestNotifyBeforeParkRace();

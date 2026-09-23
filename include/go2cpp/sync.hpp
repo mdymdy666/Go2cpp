@@ -55,9 +55,12 @@ private:
  * condition variable. Both kinds can notify one another through the same FIFO
  * queue. Wait always reacquires the mutex before returning from a normal
  * notification or Context cancellation. An already-done Context and a zero or
- * negative WaitFor timeout still perform the unlock/relock boundary. During
- * scheduler shutdown the G is not allowed to park again; if immediate
- * reacquisition is impossible, Wait returns false with the mutex unlocked.
+ * negative WaitFor timeout still perform the unlock/relock boundary. A manually
+ * resumed Fiber without a Scheduler is explicitly unsupported; it returns false
+ * while retaining the mutex so the carrier thread cannot block on a native
+ * relock. During scheduler shutdown the G is not allowed to park again; if
+ * immediate reacquisition is impossible, Wait returns false with the mutex
+ * unlocked.
  */
 class ConditionVariable final {
 public:
