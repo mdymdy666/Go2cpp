@@ -145,3 +145,17 @@ Context 测试时钟、SelectCase、Descriptor token/guard 和 C Hook 控制是�
 `sync::Mutex` 串行 `work()`，支持 native/Fiber 调用；事件列表修改采用锁保护和
 `work()` 快照语义。任意阻塞业务回调应先用 `go()` 启动并通过 channel 报告结果。
 批次对象必须长于所有并发调用，`stop()` 通过内部 Context 唤醒等待，并只发出协作式停止请求。
+
+## 2026-09-23 边界复核补充
+
+### monitor 与父链
+
+sysmon 的等待锁与 Scheduler 主锁分离，监控线程在队列锁竞争时仍能推进心跳；扫描本身采用 try_to_lock，因此可能跳过一轮，但不会无限等待。系统只创建一个 monitor 线程，避免重复扫描和 detached 计数竞争；高负载下由 worker 池按 backlog/BlockingRegion 有界增加 M，受 max_workers 和线程资源限制。monitor 只做逻辑 P 脱离，绝不异步打断 C++ 栈、终止 Fiber 或跨线程注入异常。
+
+嵌套 Fiber 的 FiberRecord 保存 main_fiber、直接父级、当前执行绑定和挂起原因。SuspendForScheduler/park_io 使 IO 挂起沿父链传播，唤醒时恢复同一 continuation；三层链连续超时和 readiness 的测试确认不会跳回 main_fiber 或跳过父级。Suspended Fiber 仍必须由固定父级恢复，错误生命周期会 fail-fast，这是保护 C++ RAII 的边界。
+
+### 栈策略与多 FD 等待
+
+Fiber 使用带保护页的固定大小 Boost.Context 栈（默认 128 KiB，可通过配置指定）。当前没有 Go morestack/newstack/copystack 式自动扩容：C++ 编译器不会提供 Go 栈图和可安全重写的挂起指针，直接复制正在运行的 C++ 栈会破坏 RAII、引用和 fcontext。需要更深调用栈时必须显式提高 fiber_stack_size，栈保护页会把越界变成可诊断故障，而不是声称已经实现 Go 栈增长。
+
+IOManager::wait 是单 FD/单事件等待。epoll 内部可同时服务很多等待者，但没有把多个 FD 注册为一个 Fiber 原子等待的公共 wait_any API；这不是 monitor 缺陷，而是尚未承诺的接口边界。应用可用多个 go() 任务配合 Channel Select 汇合。

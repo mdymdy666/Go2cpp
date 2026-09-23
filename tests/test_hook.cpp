@@ -1,4 +1,5 @@
 #include "go2cpp/hook.hpp"
+#include "go2cpp/fiber.hpp"
 #include "test_support.hpp"
 
 #include <fcntl.h>
@@ -11,6 +12,8 @@
 
 #include <atomic>
 #include <cerrno>
+#include <memory>
+#include <mutex>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -491,6 +494,233 @@ void test_native_fallback_grows_replacement_m() {
     scheduler.shutdown();
 }
 
+
+void test_managed_write_error_is_not_panic() {
+    go2cpp::IOManager manager(one_worker_config());
+    GO2CPP_CHECK(manager.Start());
+
+    int fds[2]{-1, -1};
+    GO2CPP_CHECK(make_pair(fds));
+    GO2CPP_CHECK(::close(fds[1]) == 0);
+    fds[1] = -1;
+
+    std::atomic<ssize_t> result{0};
+    std::atomic<int> system_error{0};
+    auto task = manager.Go([&] {
+        const char value = 'x';
+        errno = 0;
+        const ssize_t written =
+            ::send(fds[0], &value, 1, MSG_NOSIGNAL);
+        result.store(written, std::memory_order_release);
+        system_error.store(written < 0 ? errno : 0,
+                           std::memory_order_release);
+    });
+    GO2CPP_CHECK(task->wait_for(2s));
+    GO2CPP_CHECK(result.load(std::memory_order_acquire) < 0);
+    const int error = system_error.load(std::memory_order_acquire);
+    GO2CPP_CHECK(error == EPIPE || error == ECONNRESET || error == EBADF);
+    GO2CPP_CHECK(task->state() == go2cpp::GState::kDead);
+
+    close_pair(fds);
+    manager.Shutdown();
+}
+
+void test_nested_fiber_io_timeout_and_wake() {
+    go2cpp::SchedulerConfig config;
+    config.processor_count = 1;
+    config.min_workers = 1;
+    config.max_workers = 2;
+    config.sysmon_interval = 2ms;
+    config.long_syscall_threshold = 10ms;
+    go2cpp::IOManager manager(config);
+    GO2CPP_CHECK(manager.Start());
+
+    int timeout_fds[2]{-1, -1};
+    int wake_fds[2]{-1, -1};
+    GO2CPP_CHECK(make_pair(timeout_fds));
+    GO2CPP_CHECK(make_pair(wake_fds));
+    const timeval timeout{0, 200'000};
+    GO2CPP_CHECK(::setsockopt(timeout_fds[0], SOL_SOCKET, SO_RCVTIMEO,
+                               &timeout, sizeof(timeout)) == 0);
+
+    std::mutex child_mutex;
+    std::shared_ptr<go2cpp::Fiber> observed_child;
+    std::atomic<int> phase{0};
+    std::atomic<int> timeout_errno{0};
+    std::atomic<int> wake_errno{0};
+    std::atomic<char> received{0};
+
+    auto task = manager.Go([&] {
+        auto timeout_child = std::make_shared<go2cpp::Fiber>([&] {
+            phase.store(1, std::memory_order_release);
+            char byte = 0;
+            const ssize_t result = ::recv(timeout_fds[0], &byte, 1, 0);
+            timeout_errno.store(result < 0 ? errno : 0,
+                                std::memory_order_release);
+        });
+        {
+            std::lock_guard<std::mutex> lock(child_mutex);
+            observed_child = timeout_child;
+        }
+        GO2CPP_CHECK(timeout_child->resume());
+        GO2CPP_CHECK(timeout_errno.load(std::memory_order_acquire) ==
+                     ETIMEDOUT);
+        phase.store(2, std::memory_order_release);
+
+        auto wake_child = std::make_shared<go2cpp::Fiber>([&] {
+            phase.store(3, std::memory_order_release);
+            char byte = 0;
+            const ssize_t result = ::recv(wake_fds[0], &byte, 1, 0);
+            wake_errno.store(result < 0 ? errno : 0,
+                             std::memory_order_release);
+            if (result == 1) {
+                received.store(byte, std::memory_order_release);
+            }
+        });
+        {
+            std::lock_guard<std::mutex> lock(child_mutex);
+            observed_child = wake_child;
+        }
+        GO2CPP_CHECK(wake_child->resume());
+        phase.store(4, std::memory_order_release);
+    });
+
+    GO2CPP_REQUIRE_EVENTUALLY(phase.load(std::memory_order_acquire) == 1,
+                              2s);
+    const auto child_is_io_suspended = [&] {
+        std::shared_ptr<go2cpp::Fiber> child;
+        {
+            std::lock_guard<std::mutex> lock(child_mutex);
+            child = observed_child;
+        }
+        if (!child) {
+            return false;
+        }
+        const auto snapshot = child->context_snapshot();
+        return snapshot.size() >= 2 &&
+               snapshot.back().state == go2cpp::FiberState::Suspended &&
+               snapshot.back().suspend_reason == go2cpp::SuspendReason::Io;
+    };
+    GO2CPP_REQUIRE_EVENTUALLY(child_is_io_suspended(), 2s);
+    // phase=2 是 timeout child 完成后的瞬时状态，随后立即进入
+    // 第二个等待 child 的 phase=3；观察线程不能要求恰好采到 2。
+    GO2CPP_REQUIRE_EVENTUALLY(phase.load(std::memory_order_acquire) >= 2,
+                              3s);
+    GO2CPP_REQUIRE_EVENTUALLY(phase.load(std::memory_order_acquire) == 3,
+                              2s);
+    GO2CPP_REQUIRE_EVENTUALLY(child_is_io_suspended(), 2s);
+    {
+        const char value = 'n';
+        GO2CPP_CHECK(::write(wake_fds[1], &value, 1) == 1);
+    }
+    GO2CPP_CHECK(task->wait_for(3s));
+    GO2CPP_CHECK(phase.load(std::memory_order_acquire) == 4);
+    GO2CPP_CHECK(wake_errno.load(std::memory_order_acquire) == 0);
+    GO2CPP_CHECK(received.load(std::memory_order_acquire) == 'n');
+    close_pair(timeout_fds);
+    close_pair(wake_fds);
+    manager.Shutdown();
+}
+
+
+void test_deep_nested_fiber_io_chain() {
+    go2cpp::SchedulerConfig config;
+    config.processor_count = 1;
+    config.min_workers = 1;
+    config.max_workers = 2;
+    config.sysmon_interval = 2ms;
+    config.long_syscall_threshold = 10ms;
+    go2cpp::IOManager manager(config);
+    GO2CPP_CHECK(manager.Start());
+
+    int timeout_fds[2]{-1, -1};
+    int wake_fds[2]{-1, -1};
+    GO2CPP_CHECK(make_pair(timeout_fds));
+    GO2CPP_CHECK(make_pair(wake_fds));
+    const timeval timeout{0, 150'000};
+    GO2CPP_CHECK(::setsockopt(timeout_fds[0], SOL_SOCKET, SO_RCVTIMEO,
+                               &timeout, sizeof(timeout)) == 0);
+
+    std::mutex deepest_mutex;
+    std::shared_ptr<go2cpp::Fiber> deepest;
+    std::atomic<int> phase{0};
+    std::atomic<int> timeout_errno{0};
+    std::atomic<int> wake_errno{0};
+    std::atomic<char> received{0};
+
+    auto task = manager.Go([&] {
+        auto level_one = std::make_shared<go2cpp::Fiber>([&] {
+            auto level_two = std::make_shared<go2cpp::Fiber>([&] {
+                auto level_three = std::make_shared<go2cpp::Fiber>([&] {
+                    phase.store(1, std::memory_order_release);
+                    char byte = 0;
+                    const ssize_t timeout_result =
+                        ::recv(timeout_fds[0], &byte, 1, 0);
+                    timeout_errno.store(timeout_result < 0 ? errno : 0,
+                                        std::memory_order_release);
+                    phase.store(2, std::memory_order_release);
+
+                    phase.store(3, std::memory_order_release);
+                    const ssize_t wake_result =
+                        ::recv(wake_fds[0], &byte, 1, 0);
+                    wake_errno.store(wake_result < 0 ? errno : 0,
+                                     std::memory_order_release);
+                    if (wake_result == 1) {
+                        received.store(byte, std::memory_order_release);
+                    }
+                    phase.store(4, std::memory_order_release);
+                });
+                {
+                    std::lock_guard<std::mutex> lock(deepest_mutex);
+                    deepest = level_three;
+                }
+                GO2CPP_CHECK(level_three->resume());
+                GO2CPP_CHECK(level_three->state() ==
+                             go2cpp::FiberState::Completed);
+                phase.store(5, std::memory_order_release);
+            });
+            GO2CPP_CHECK(level_two->resume());
+            phase.store(6, std::memory_order_release);
+        });
+        GO2CPP_CHECK(level_one->resume());
+        phase.store(7, std::memory_order_release);
+    });
+
+    GO2CPP_REQUIRE_EVENTUALLY(phase.load(std::memory_order_acquire) == 1,
+                              2s);
+    const auto deepest_is_io_suspended = [&] {
+        std::shared_ptr<go2cpp::Fiber> fiber;
+        {
+            std::lock_guard<std::mutex> lock(deepest_mutex);
+            fiber = deepest;
+        }
+        if (!fiber) {
+            return false;
+        }
+        const auto snapshot = fiber->context_snapshot();
+        return snapshot.size() >= 5 && snapshot.back().depth >= 4 &&
+               snapshot.back().state == go2cpp::FiberState::Suspended &&
+               snapshot.back().suspend_reason == go2cpp::SuspendReason::Io;
+    };
+    GO2CPP_REQUIRE_EVENTUALLY(deepest_is_io_suspended(), 2s);
+    GO2CPP_REQUIRE_EVENTUALLY(phase.load(std::memory_order_acquire) >= 2,
+                              3s);
+    GO2CPP_REQUIRE_EVENTUALLY(phase.load(std::memory_order_acquire) == 3,
+                              2s);
+    GO2CPP_REQUIRE_EVENTUALLY(deepest_is_io_suspended(), 2s);
+
+    const char value = 'd';
+    GO2CPP_CHECK(::write(wake_fds[1], &value, 1) == 1);
+    GO2CPP_CHECK(task->wait_for(3s));
+    GO2CPP_CHECK(phase.load(std::memory_order_acquire) == 7);
+    GO2CPP_CHECK(timeout_errno.load(std::memory_order_acquire) == ETIMEDOUT);
+    GO2CPP_CHECK(wake_errno.load(std::memory_order_acquire) == 0);
+    GO2CPP_CHECK(received.load(std::memory_order_acquire) == value);
+    close_pair(timeout_fds);
+    close_pair(wake_fds);
+    manager.Shutdown();
+}
+
 void run_hook_tests() {
     go2cpp_tests::announce("transparent Linux socket hook interposer");
     go2cpp::hook::ScopedEnable enable;
@@ -515,4 +745,7 @@ void run_hook_tests() {
     test_plain_scheduler_lazy_adoption_timeout();
     test_native_fallback_grows_replacement_m();
     test_iomanager_untracked_fd_publishes_blocking();
+    test_managed_write_error_is_not_panic();
+    test_nested_fiber_io_timeout_and_wake();
+    test_deep_nested_fiber_io_chain();
 }

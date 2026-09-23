@@ -18,6 +18,7 @@
 
 namespace go2cpp {
 class Fiber;
+enum class SuspendReason : std::uint8_t;
 }
 
 namespace go2cpp::scheduler {
@@ -300,6 +301,9 @@ public:
     }
     bool yield(const std::shared_ptr<Task>& task);
     bool park(const std::shared_ptr<Task>& task);
+    // IOManager 使用此入口记录 Fiber 正在等待 readiness；它与普通
+    // park 共用同一 Task 状态和 wake 竞态，但诊断帧会保留 Io 原因。
+    bool park_io(const std::shared_ptr<Task>& task);
     bool yield_current();
     bool park_current();
     // Returns true when a waiting G was enqueued immediately. A false result
@@ -347,7 +351,13 @@ public:
     std::vector<MachineSnapshot> machines() const;
     // 返回 sysmon 线程是否正在运行，便于部署自检和测试。
     bool sysmon_running() const noexcept;
+    // 每次监控周期都会递增，即使调度器互斥量正被高负载路径占用。
+    // 该计数只用于活性观测，不参与调度决策。
+    std::uint64_t sysmon_pass_count() const noexcept;
     bool SysmonRunning() const noexcept { return sysmon_running(); }
+    std::uint64_t SysmonPassCount() const noexcept {
+        return sysmon_pass_count();
+    }
 
     // Returns the task currently executing on this thread, if any.  These
     // values are observational and are never used for ownership.
@@ -365,6 +375,8 @@ public:
 private:
     static void leave_blocking_for(Scheduler* scheduler,
                                    MId machine_id) noexcept;
+    bool park_with_reason(const std::shared_ptr<Task>& task,
+                          go2cpp::SuspendReason reason);
 
     // The opaque shared slot keeps a dynamic worker stable while machine
     // records are appended or retired by the scheduler.

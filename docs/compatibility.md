@@ -26,3 +26,10 @@
 直接 `syscall(2)`、`io_uring`、`close_range` 和 glibc no-cancel entry point
 会绕过 interposer，可能阻塞 M，也不在 FD generation 跟踪和 managed Fiber
 唤醒语义内。
+
+## 2026-09-23 监控与嵌套 Fiber 补充
+
+- sysmon 活性：monitor 使用独立等待条件和主锁 try_to_lock 扫描；sysmon_pass_count 是周期心跳尝试计数，sysmon_running 是线程存活标志。只保留一个 monitor，M 的高负载扩容由有界 worker 策略完成，不能突破 max_workers，也不能发现 raw/未声明阻塞。
+- 嵌套 IO：单 FD 等待可在三层 Fiber 父链中连续经历 timeout、ready、cancel 和 close，唤醒后恢复原 continuation；父级对象失效时只保留诊断墓碑，不能恢复已释放的栈。没有公共多 FD wait_any/Fiber select，多个 FD 需拆成多个 G/Fiber 后使用 Channel Select 汇合。
+- 系统调用错误：Hook 保留 libc 返回值与 errno。monitor 不终止 Fiber、不迁移 C++ 栈、不把 write/send 错误转换成 panic；是否包装为 error 由调用者显式决定。
+- 栈：固定保护栈而非 Go 自动增长栈；不能把 C++ 挂起栈安全复制为 Go 栈。超过配置栈容量属于可诊断失败，后续若要替换 segmented-stack backend 必须单独验证 ABI、sanitizer 和 RAII。

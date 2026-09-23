@@ -55,6 +55,18 @@ thread_local Fiber* s_current_fiber = nullptr;
 // 调度器在 worker 进入/离开 G 时更新这份元数据，Fiber 首次进入时继承它。
 thread_local FiberExecutionBinding s_main_execution{};
 
+// resume_locked 可能沿父链循环多次，任意失败/取消返回都必须恢复进入
+// resume 前的直接调用者，避免 TLS 残留成已完成或错误的 Fiber。
+struct FiberTlsRestore final {
+    explicit FiberTlsRestore(Fiber* previous) noexcept : m_previous(previous) {}
+    ~FiberTlsRestore() noexcept { s_current_fiber = m_previous; }
+
+    FiberTlsRestore(const FiberTlsRestore&) = delete;
+    FiberTlsRestore& operator=(const FiberTlsRestore&) = delete;
+
+    Fiber* m_previous;
+};
+
 std::atomic<std::uint64_t> s_next_fiber_id{1};
 
 FiberContextFrame main_context_frame(
@@ -302,6 +314,12 @@ struct Fiber::Impl {
         if (validate_caller && !bind_caller(s_current_fiber)) {
             return false;
         }
+        // Scheduler 级挂起可能在本函数内部沿父链循环多次。每一轮跳转
+        // 都暂时把 TLS 当前 Fiber 设为本对象，但完成后必须恢复最初的
+        // 调用者；否则父函数在同一栈帧里创建下一个子 Fiber 时，会把
+        // 已完成的前一个子 Fiber 错当成新子 Fiber 的父级。
+        Fiber* const original_caller = s_current_fiber;
+        const FiberTlsRestore tls_restore(original_caller);
         for (;;) {
             const FiberState current = m_record->state.load(std::memory_order_acquire);
             if (current != FiberState::Ready && current != FiberState::Suspended) {
@@ -350,7 +368,16 @@ struct Fiber::Impl {
                                 : transfer.fctx;
             }
 
-            s_current_fiber = previous_fiber;
+            // jump 返回有两种语义：如果当前 Fiber 仍在 Running，说明
+            // 是它在自己的栈上恢复了嵌套子 Fiber，执行流仍属于当前
+            // owner；只有挂起/完成/失败并回到 caller 时，才恢复旧 TLS。
+            // 无条件恢复 previous_fiber 会让父 Fiber 后续创建的子 Fiber
+            // 错绑到根上下文，破坏父链并可能触发 fail-fast。
+            const FiberState returned_state =
+                m_record->state.load(std::memory_order_acquire);
+            s_current_fiber = returned_state == FiberState::Running
+                                  ? m_owner
+                                  : previous_fiber;
             store_errno(caller_errno);
 
             // 调度器挂起沿直接父链传播；普通 Suspend 不进入这个分支，
@@ -373,6 +400,7 @@ struct Fiber::Impl {
                 s_current_fiber = m_owner;
                 continue;
             }
+            s_current_fiber = original_caller;
             return true;
         }
     }

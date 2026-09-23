@@ -1069,7 +1069,7 @@ WaitResult IOManager::wait(int fd, IOEvent event,
     // Consume the pending handoff even for a completion that raced ahead of
     // park. Unrelated permits and external wakeups are spurious, not cancel.
     for (;;) {
-        const bool parked = m_scheduler.park(node->task);
+        const bool parked = m_scheduler.park_io(node->task);
         if (node->outcome.load(std::memory_order_acquire) != 0) {
             break;
         }

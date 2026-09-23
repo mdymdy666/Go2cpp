@@ -366,6 +366,48 @@ void SysmonMultipleDetaches() {
     GO2CPP_CHECK(!scheduler.sysmon_running());
 }
 
+void SysmonHeartbeatUnderLoad() {
+    go2cpp::SchedulerConfig config;
+    config.processor_count = 2;
+    config.min_workers = 1;
+    config.max_workers = 4;
+    config.sysmon_interval = 1ms;
+    config.long_syscall_threshold = 5ms;
+    config.idle_worker_timeout = 20ms;
+    go2cpp::Scheduler scheduler(config);
+    scheduler.start();
+    GO2CPP_CHECK(scheduler.sysmon_running());
+
+    const auto initial = scheduler.sysmon_pass_count();
+    GO2CPP_REQUIRE_EVENTUALLY(scheduler.sysmon_pass_count() >= initial + 5,
+                              2s);
+
+    std::atomic<int> completed{0};
+    std::vector<std::shared_ptr<go2cpp::Task>> tasks;
+    tasks.reserve(256);
+    for (int round = 0; round != 8; ++round) {
+        for (int index = 0; index != 32; ++index) {
+            tasks.emplace_back(scheduler.spawn([&] {
+                for (int spin = 0; spin != 32; ++spin) {
+                    std::this_thread::yield();
+                }
+                completed.fetch_add(1, std::memory_order_release);
+            }));
+        }
+    }
+    GO2CPP_REQUIRE_EVENTUALLY(completed.load(std::memory_order_acquire) ==
+                                  256,
+                              5s);
+    const auto before_shutdown = scheduler.sysmon_pass_count();
+    GO2CPP_REQUIRE_EVENTUALLY(scheduler.sysmon_pass_count() > before_shutdown,
+                              2s);
+    for (const auto& task : tasks) {
+        GO2CPP_CHECK(task->wait_for(2s));
+    }
+    scheduler.shutdown();
+    GO2CPP_CHECK(!scheduler.sysmon_running());
+}
+
 void BoundedClassAffinity() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 1;
@@ -455,6 +497,7 @@ void run_dynamic_scheduler_tests() {
     BoundedClassAffinity();
     SysmonDetachesLongSyscall();
     SysmonMultipleDetaches();
+    SysmonHeartbeatUnderLoad();
     CancelWakeShutdownRace();
 }
 

@@ -780,11 +780,17 @@ public:
         if (!scheduler || !config.enable_sysmon) {
             return;
         }
+        // 心跳先于调度器锁更新。高负载时即使本轮无法取得锁，
+        // monitor 线程也不会永久卡在业务队列上，调用者仍能观察到它在线。
         const auto now = steady_now_ns();
+        sysmon_pass_count.fetch_add(1, std::memory_order_relaxed);
         const auto threshold = milliseconds_to_ns(config.long_syscall_threshold);
         std::size_t detached_count = 0;
         {
-            std::lock_guard<std::mutex> lock(mutex);
+            std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+            if (!lock.owns_lock()) {
+                return;
+            }
             for (const auto& machine : machines) {
                 if (!machine ||
                     machine->state.load(std::memory_order_acquire) !=
@@ -825,8 +831,11 @@ public:
 
     void sysmon_loop(Scheduler* scheduler) noexcept {
         while (!sysmon_stop.load(std::memory_order_acquire)) {
-            std::unique_lock<std::mutex> lock(mutex);
-            condition.wait_for(lock, config.sysmon_interval, [this] {
+            // sysmon 的节拍等待不能争用调度器主锁。worker 在高负载下可能
+            // 持有主锁进行队列/生命周期处理；监控线程只应等待自己的停止
+            // 条件，然后在扫描阶段用 try_to_lock 做一次有界尝试。
+            std::unique_lock<std::mutex> lock(sysmon_wait_mutex);
+            sysmon_wait_condition.wait_for(lock, config.sysmon_interval, [this] {
                 return sysmon_stop.load(std::memory_order_acquire) ||
                        stopping.load(std::memory_order_acquire);
             });
@@ -843,7 +852,7 @@ public:
 
     void stop_sysmon(bool join) noexcept {
         sysmon_stop.store(true, std::memory_order_release);
-        condition.notify_all();
+        sysmon_wait_condition.notify_all();
         if (join && sysmon_thread.joinable() &&
             sysmon_thread.get_id() != std::this_thread::get_id()) {
             sysmon_thread.join();
@@ -1010,6 +1019,9 @@ public:
     std::thread sysmon_thread;
     std::atomic<bool> sysmon_stop{false};
     std::atomic<bool> sysmon_active{false};
+    std::atomic<std::uint64_t> sysmon_pass_count{0};
+    std::mutex sysmon_wait_mutex;
+    std::condition_variable sysmon_wait_condition;
     std::shared_ptr<const void> owner_token;
     std::shared_ptr<TaskCancellationGate> cancellation_gate;
     mutable std::mutex mutex;
@@ -1438,6 +1450,15 @@ bool Scheduler::yield_current() {
 }
 
 bool Scheduler::park(const std::shared_ptr<Task>& task) {
+    return park_with_reason(task, SuspendReason::Park);
+}
+
+bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
+    return park_with_reason(task, SuspendReason::Io);
+}
+
+bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
+                                  SuspendReason reason) {
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get()) {
         return false;
@@ -1457,7 +1478,7 @@ bool Scheduler::park(const std::shared_ptr<Task>& task) {
     if (action != ParkAction::kParked) {
         return false;
     }
-    if (!Fiber::SuspendForScheduler(SuspendReason::Park)) {
+    if (!Fiber::SuspendForScheduler(reason)) {
         return false;
     }
     return !task->cancellation_requested();
@@ -1703,6 +1724,11 @@ std::vector<MachineSnapshot> Scheduler::machines() const {
 bool Scheduler::sysmon_running() const noexcept {
     return m_impl && m_impl->sysmon_active.load(std::memory_order_acquire) &&
            !m_impl->sysmon_stop.load(std::memory_order_acquire);
+}
+
+std::uint64_t Scheduler::sysmon_pass_count() const noexcept {
+    return m_impl ? m_impl->sysmon_pass_count.load(std::memory_order_acquire)
+                  : 0;
 }
 
 std::shared_ptr<Task> Scheduler::current_task() noexcept {

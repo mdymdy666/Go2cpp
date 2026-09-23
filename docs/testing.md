@@ -348,3 +348,27 @@ WSL + Boost.Context 偶发的 `unexpected memory mapping` 已在本轮绕过地�
 - TSan 全量命令连续 3/3 通过：`setarch x86_64 -R env TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 timeout 90s ./build-tsan-concurrency/go2cpp_tests`。
 - Valgrind 全量 Hook-on：`in use at exit` 416 bytes/4 blocks，definite/indirect/possible lost 均为 0，ERROR SUMMARY 0；dynamic：96 bytes/1 block 为进程级可达状态，三类 lost 均为 0，ERROR SUMMARY 0。
 - 运行时新增约束：`BlockingRegion` 跨 Fiber yield/park 或 G 任务边界会 fail-fast，不再静默留下错误的 blocking_workers/P 记账。
+
+## 2026-09-23 monitor、嵌套 IO 与错误边界复核
+
+以下命令均在 /UserData/CodexWorkSpace/Go2Cpp 执行，测试进程均带有超时 watchdog：
+
+- cmake --build build-sysmon-hook -j2：通过；新增 sysmon 独立等待锁和三层嵌套 IO/写错误回归后重新编译。
+- ctest --test-dir build-sysmon-hook --output-on-failure --timeout 90：9/9 通过；包含 unit、smoke、Hook 示例和所有运行时示例。
+- ctest --test-dir build-sysmon-release --output-on-failure --timeout 90：8/8 通过；Release 为静态、Hook-off 配置。
+- ctest --test-dir build-sysmon-werror --output-on-failure --timeout 90：2/2 通过，GCC -Werror。
+- ctest --test-dir build-sysmon-clang --output-on-failure --timeout 90：2/2 通过，Clang 18。
+- ASan：env ASAN_OPTIONS=detect_leaks=1:abort_on_error=1:halt_on_error=1 ctest --test-dir build-sysmon-asan --output-on-failure --timeout 120，2/2 通过。
+- UBSan：env UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ctest --test-dir build-sysmon-ubsan --output-on-failure --timeout 120，2/2 通过。
+- timeout 45s env GO2CPP_TEST_FILTER=hook ./build-sysmon-hook/go2cpp_tests：通过；包含两层和三层 Fiber 链、第一次 ETIMEDOUT、第二次 readiness 唤醒、父链返回顺序、send(MSG_NOSIGNAL) 的 EPIPE/ECONNRESET/EBADF 错误保持，以及已有 Hook/FD 竞态。Hook 过滤器随后连续 10 次通过。
+- timeout 30s env GO2CPP_TEST_FILTER=fiber ./build-sysmon-hook/go2cpp_tests、GO2CPP_TEST_FILTER=dynamic：各自通过；Fiber 过滤器连续 10 次、dynamic 过滤器连续 10 次通过。dynamic 测试覆盖 sysmon_running、心跳计数、高负载任务、长阻塞 detach/替代 M、唤醒和 shutdown。
+- TSan 当前 build-tsan-concurrency 在 setarch x86_64 -R 下完整套件单次通过；sync 过滤器 5/5、fiber 和 dynamic 过滤器各 3/3 通过。重复完整套件时，WSL 主机曾在 test_sync.cpp 的 native waiter/CV watchdog 处超时，无 ThreadSanitizer race 报告；gdb 下同一 sync 套件正常完成。该环境抖动没有被宣称为“全量重复稳定”，native Linux 仍是 TSan 发布门槛。
+- Valgrind Memcheck 全 Hook-on：build-sysmon-hook/valgrind-nested-final.log，1,577,888 allocs / 1,577,884 frees，416 bytes/4 blocks still reachable，definite/indirect/possible lost 均为 0，ERROR SUMMARY 0。scheduler smoke：valgrind-nested-smoke-final.log，96 bytes/1 block reachable，三类 lost 均为 0，ERROR SUMMARY 0。可达块属于已有 FiberLocal/TimerService 进程生命周期状态。
+
+当前补充验证只证明已声明/Hook 的阻塞边界；monitor 不能异步终止任意 C++ 系统调用，不能迁移其栈，也没有自动 Fiber 栈增长或公共多 FD wait_any。这些是设计限制而不是未观察到的测试通过。
+
+## 2026-09-23 最终复测修订
+
+- 当前工作树源码重编译后，Hook/Fiber/dynamic 过滤器各连续 5/5 通过；Hook 全套 CTest 9/9、Release 8/8、Werror 2/2、Clang 2/2、ASan 2/2、UBSan 2/2 通过。
+- 当前 TSan 构建使用 setarch x86_64 -R，完整 go2cpp_tests 单次通过且没有 ThreadSanitizer 报告；WSL 下重复全套曾出现不同 native waiter watchdog 超时，因此不能把 WSL 重复运行描述为稳定发布门槛。
+- 当前 Memcheck 日志为 build-sysmon-hook/valgrind-final-current.log：416 bytes/4 blocks still reachable，definite/indirect/possible lost 均为 0，ERROR SUMMARY 为 0。

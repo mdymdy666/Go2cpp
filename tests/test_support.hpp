@@ -17,6 +17,14 @@
 #endif
 #endif
 
+#if defined(__SANITIZE_THREAD__)
+#define GO2CPP_TEST_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define GO2CPP_TEST_TSAN 1
+#endif
+#endif
+
 namespace go2cpp_tests {
 
 inline std::atomic<int> g_failures{0};
@@ -103,9 +111,16 @@ void JoinWithWatchdog(std::thread& thread,
         bool joined{false};
     };
     const auto state = std::make_shared<JoinState>();
-    std::thread watchdog([state, timeout, expression, file, line] {
+#if defined(GO2CPP_TEST_TSAN)
+    // TSan 会为每个 Fiber/等待路径建立额外的运行时线程，普通 3 秒预算
+    // 可能在宿主机调度抖动时误报；仍保留有限 watchdog，只放大预算。
+    const auto watchdog_timeout = timeout * 20;
+#else
+    const auto watchdog_timeout = timeout;
+#endif
+    std::thread watchdog([state, watchdog_timeout, expression, file, line] {
         std::unique_lock<std::mutex> lock(state->mutex);
-        if (!state->condition.wait_for(lock, timeout,
+        if (!state->condition.wait_for(lock, watchdog_timeout,
                                       [&] { return state->joined; })) {
             watchdog_abort(expression, file, line);
         }
