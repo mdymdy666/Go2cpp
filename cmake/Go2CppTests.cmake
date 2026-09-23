@@ -11,6 +11,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_panic_defer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fiber.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sync.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_future.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_timer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_beginner_api.cpp

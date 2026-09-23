@@ -640,6 +640,12 @@ Result cooperative_io(int fd, Function function, IOEvent event,
         descriptor = try_adopt_socket(fd);
     }
     if (!descriptor) {
+        // IOManager 正常路径把 socket 设为 nonblocking 并 park Fiber；
+        // 未跟踪/懒采用失败的 fd 会回到 libc，必须显式发布 M::Blocking，
+        // 否则 sysmon 无法为这个长系统调用申请替代 M。
+        if (!blocking_region && go2cpp::Scheduler::current_task() != nullptr) {
+            blocking_region.emplace();
+        }
         return invoke_real(function, fd, args...);
     }
 
@@ -724,6 +730,11 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
         descriptor = try_adopt_socket(fd);
     }
     if (!descriptor) {
+        // connect 的未跟踪 fd 同样会落回可能阻塞的 libc 调用；在
+        // managed G 中补齐 BlockingRegion，普通线程保持原生语义。
+        if (!blocking_region && go2cpp::Scheduler::current_task() != nullptr) {
+            blocking_region.emplace();
+        }
         return invoke_real(s_originals.m_connect, fd, address, length);
     }
 

@@ -320,3 +320,31 @@ EventBatch `stop()` 唤醒 Fiber 的 P=1 回归通过。
 `-fsyntax-only -Wall -Wextra -Wpedantic` 通过。TSan 仍沿用此前 WSL 镜像的启动限制记录，
 没有把未启动的完整套件宣称为通过。Valgrind 全套本轮仍有 416B intentional
 `still reachable` 进程级状态，`definite/indirect/possible` 均为 0。
+
+
+## sysmon 长系统调用专项验证（2026-09-23）
+
+本次补充了受限 Go 风格 sysmon 的回归测试。测试只把显式
+`BlockingRegion` 和 Hook 能识别的 native fallback 当作可观测阻塞边界：
+
+- `cmake --build build-concurrency-audit -j2`
+- `GO2CPP_TEST_FILTER=dynamic timeout 45s ./build-concurrency-audit/go2cpp_tests`，重复 10 次通过；覆盖 P=4、单个长 syscall、逻辑 detach、替代 M 保留、原 G 唤醒和 shutdown。
+- `ctest --test-dir build-concurrency-audit --output-on-failure`：2/2 通过。
+- Hook-on 构建 `build-sysmon-hook`：`ctest --test-dir build-sysmon-hook --output-on-failure`，9/9 通过；新增 IOManager + 未跟踪 pipe FD fallback 测试，确认 sysmon 能看到可能阻塞的 libc 调用。
+- ASan `build-sysmon-asan`：2/2 通过；UBSan `build-sysmon-ubsan`：2/2 通过。
+- Valgrind dynamic：0 definite/indirect/possible lost，ERROR SUMMARY 为 0；仅保留已有进程生命周期 reachable 块。
+
+该实现不能安全地从另一个线程强制打断任意 C++ 系统调用或迁移其栈；raw
+`syscall`、未 Hook 的第三方阻塞库和 `max_workers` 已耗尽时属于明确边界。此前
+WSL + Boost.Context 偶发的 `unexpected memory mapping` 已在本轮绕过地址随机化
+后复测；当前全量 TSan 连续 3 次通过，历史限制仍作为环境风险保留。
+
+
+## Fiber 父链与 sysmon 多 M 交接复核（2026-09-23）
+
+- `GO2CPP_TEST_FILTER=fiber timeout 60s ./build-concurrency-audit/go2cpp_tests`：通过；新增父对象结束后的 `alive=false` 墓碑快照，以及嵌套 Fiber 唤醒后 panic/defer 隔离回归。
+- `GO2CPP_TEST_FILTER=dynamic timeout 90s ./build-concurrency-audit/go2cpp_tests`：重复 10 次通过；新增两个并发长阻塞 G 的 detached 计数、替代 M 保留和共同唤醒验证。
+- `ctest --test-dir build-concurrency-audit --output-on-failure --timeout 60`：2/2；Hook-on 9/9；Release 8/8；Werror 2/2；Clang 2/2；ASan 2/2；UBSan 2/2。
+- TSan 全量命令连续 3/3 通过：`setarch x86_64 -R env TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 timeout 90s ./build-tsan-concurrency/go2cpp_tests`。
+- Valgrind 全量 Hook-on：`in use at exit` 416 bytes/4 blocks，definite/indirect/possible lost 均为 0，ERROR SUMMARY 0；dynamic：96 bytes/1 block 为进程级可达状态，三类 lost 均为 0，ERROR SUMMARY 0。
+- 运行时新增约束：`BlockingRegion` 跨 Fiber yield/park 或 G 任务边界会 fail-fast，不再静默留下错误的 blocking_workers/P 记账。

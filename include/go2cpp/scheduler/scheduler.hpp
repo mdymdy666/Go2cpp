@@ -99,6 +99,11 @@ struct SchedulerConfig {
     // region.  The default keeps the worker pool elastic; set false when a
     // deployment requires a strict one-M-per-P ceiling.
     bool allow_worker_oversubscription = true;
+    // Go sysmon 风格的阻塞监控。它只观察已声明的 BlockingRegion/Hook
+    // 边界，不会从另一个线程强行切断任意 C++ 调用栈。
+    bool enable_sysmon = true;
+    std::chrono::milliseconds sysmon_interval{10};
+    std::chrono::milliseconds long_syscall_threshold{50};
 };
 
 using TaskClassId = std::uint64_t;
@@ -125,6 +130,11 @@ struct MachineSnapshot {
     TaskClassId last_task_class{0};
     std::size_t affinity_hits{0};
     std::size_t affinity_misses{0};
+    // sysmon 将长时间阻塞的 M 标记为已脱离 P；M 仍在原生调用中运行，
+    // 但该 P 的 attached 计数不再包含它，替代 M 可以接管调度资源。
+    bool processor_detached{false};
+    GId blocking_task{0};
+    std::uint64_t long_syscall_count{0};
 };
 
 class Task : public std::enable_shared_from_this<Task> {
@@ -225,10 +235,10 @@ private:
 
 class Scheduler {
 public:
-    // Marks a short native call that may block its current M.  The region
-    // publishes M::Blocking and asks the pool to grow for queued Gs; it does
-    // not make arbitrary blocking code preemptible.  It must not span a
-    // Fiber yield/park or a call that migrates the current G.
+    // Marks a native call that may block its current M.  The region publishes
+    // M::Blocking; sysmon 超过阈值后会把该 M 与 P 的计数解绑并驱动替代
+    // M。它不从别的线程强行破坏调用栈，不能跨 Fiber yield/park，
+    // 也不能跨迁移当前 G 的调用。
     class BlockingRegion final {
     public:
         explicit BlockingRegion(Scheduler* scheduler = nullptr) noexcept;
@@ -243,6 +253,7 @@ public:
         BlockingRegion& operator=(BlockingRegion&&) = delete;
 
         bool active() const noexcept { return m_active; }
+        bool Active() const noexcept { return active(); }
 
     private:
         Scheduler* m_scheduler{nullptr};
@@ -334,6 +345,9 @@ public:
     }
     std::vector<ProcessorSnapshot> processors() const;
     std::vector<MachineSnapshot> machines() const;
+    // 返回 sysmon 线程是否正在运行，便于部署自检和测试。
+    bool sysmon_running() const noexcept;
+    bool SysmonRunning() const noexcept { return sysmon_running(); }
 
     // Returns the task currently executing on this thread, if any.  These
     // values are observational and are never used for ownership.

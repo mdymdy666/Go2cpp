@@ -24,6 +24,7 @@ add_library(go2cpp_fiber
     ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber_local.cpp)
 add_library(go2cpp_sync ${CMAKE_CURRENT_SOURCE_DIR}/src/sync.cpp)
+add_library(go2cpp_future ${CMAKE_CURRENT_SOURCE_DIR}/src/future.cpp)
 add_library(go2cpp_io ${CMAKE_CURRENT_SOURCE_DIR}/src/io.cpp)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GO2CPP_BUILD_HOOK)
@@ -42,6 +43,7 @@ set_target_properties(go2cpp_scheduler PROPERTIES EXPORT_NAME scheduler)
 set_target_properties(go2cpp_panic_defer PROPERTIES EXPORT_NAME panic_defer)
 set_target_properties(go2cpp_fiber PROPERTIES EXPORT_NAME fiber)
 set_target_properties(go2cpp_sync PROPERTIES EXPORT_NAME sync)
+set_target_properties(go2cpp_future PROPERTIES EXPORT_NAME future)
 set_target_properties(go2cpp_io PROPERTIES EXPORT_NAME io)
 if (TARGET go2cpp_hook)
     set_target_properties(go2cpp_hook PROPERTIES EXPORT_NAME hook)
@@ -58,6 +60,7 @@ add_library(go2cpp::scheduler ALIAS go2cpp_scheduler)
 add_library(go2cpp::panic_defer ALIAS go2cpp_panic_defer)
 add_library(go2cpp::fiber ALIAS go2cpp_fiber)
 add_library(go2cpp::sync ALIAS go2cpp_sync)
+add_library(go2cpp::future ALIAS go2cpp_future)
 add_library(go2cpp::io ALIAS go2cpp_io)
 if (TARGET go2cpp_hook)
     add_library(go2cpp::hook ALIAS go2cpp_hook)
@@ -71,6 +74,7 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_panic_defer
     go2cpp_fiber
     go2cpp_sync
+    go2cpp_future
     go2cpp_io
 )
 if (TARGET go2cpp_hook)
@@ -109,6 +113,7 @@ if (GO2CPP_HAVE_VALGRIND_HEADER)
     target_compile_definitions(go2cpp_fiber PRIVATE BOOST_USE_VALGRIND=1)
 endif()
 target_link_libraries(go2cpp_sync PUBLIC go2cpp_context go2cpp_scheduler)
+target_link_libraries(go2cpp_future PUBLIC go2cpp_context go2cpp_scheduler)
 target_link_libraries(go2cpp_io PUBLIC go2cpp_context go2cpp_scheduler)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_hook PUBLIC go2cpp_io go2cpp_fiber
@@ -116,7 +121,8 @@ if (TARGET go2cpp_hook)
 endif()
 target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_error go2cpp_context go2cpp_channel go2cpp_scheduler
-    go2cpp_panic_defer go2cpp_fiber go2cpp_sync go2cpp_io Threads::Threads)
+    go2cpp_panic_defer go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io
+    Threads::Threads)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_runtime INTERFACE go2cpp_hook)
     # An interposer provides symbols through libc calls, not explicit API

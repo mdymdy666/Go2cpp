@@ -39,9 +39,9 @@ third_party/go1.23.0-full/
 
 - Go 的 `G`、`M`、`P` 内部结构、状态位、栈所有权和 GC 扫描状态没有移植；C++ 使用 `Task`、worker 和 `Processor`。
 - 没有 Go 编译器生成的栈图、`g0`、`mcall`、`gogo`、`gopark` ABI、分段/可增长 Go 栈。
-- 没有 Go 的异步抢占、`sysmon`、精确 `GOMAXPROCS`、锁定 goroutine、系统调用 P 交接、GC stop-the-world 协议、cgo 调度协议。
+- 没有 Go 的异步抢占、精确 `GOMAXPROCS`、锁定 goroutine、系统调用 P 精确交接、GC stop-the-world 协议、cgo 调度协议；项目只实现受限的 sysmon 观察线程。
 - Fiber 只能在显式 `yield`、`park`、Hook IO 和库等待点切换；未被 Hook 的 native 阻塞调用仍可能占用 worker。
-- `BlockingRegion` 是 C++ 的有界替代线程机制，不是 Go 的 `_Psyscall` 和精确 M/P 交接。
+- `BlockingRegion` 与 Hook fallback 是 C++ 的有界阻塞记账；sysmon 达阈值后做可逆的逻辑 detach 和替代 M 保留，不是 Go 的 `_Psyscall` 和精确 M/P 交接。
 - 本地/全局队列、窃取和公平策略是项目自定义实现，不保证与 Go 的 `runqget`、`globrunqget`、`findRunnable` 逐行为一致。
 - `FiberLocal` 是 C++ Fiber 的值存储，不是 Go 的 G-local 或 GC 感知对象。
 

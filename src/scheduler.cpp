@@ -35,6 +35,26 @@ std::size_t default_processor_count() noexcept {
     return count == 0 ? 1U : static_cast<std::size_t>(count);
 }
 
+std::int64_t steady_now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::int64_t milliseconds_to_ns(
+    std::chrono::milliseconds duration) noexcept {
+    constexpr auto max_value = std::numeric_limits<std::int64_t>::max();
+    const auto milliseconds = duration.count();
+    if (milliseconds <= 0) {
+        return 0;
+    }
+    constexpr auto scale = static_cast<std::int64_t>(1000000);
+    if (milliseconds > max_value / scale) {
+        return max_value;
+    }
+    return milliseconds * scale;
+}
+
 }  // namespace
 
 // Tasks retain only a weak handle. This short gate excludes Scheduler
@@ -412,6 +432,14 @@ void Task::run() {
     if (m_cancel_requested.load(std::memory_order_acquire)) {
         fiber->RequestCancellation();
     }
+    // 发布 G/M/P 绑定。Fiber 首次进入时会继承该绑定，嵌套 Fiber 之后
+    // 只能沿同一逻辑 G 的父链恢复，即使 G 迁移到另一个 M 也不会丢失
+    // 调度器归属。
+    if (Scheduler* const scheduler = Scheduler::current_scheduler()) {
+        fiber->bind_execution(FiberExecutionBinding{
+            reinterpret_cast<std::uintptr_t>(scheduler), id(), t_machine_id,
+            t_processor_id, true});
+    }
     // Only this run claim can move/destroy m_fiber, and it does so after
     // resume() returns while holding m_transition_mutex. A concurrent cancel
     // can therefore safely request cancellation on this stable pointer.
@@ -499,6 +527,12 @@ public:
         std::size_t affinity_budget{0};
         std::size_t affinity_hits{0};
         std::size_t affinity_misses{0};
+        // 这些原子字段由 worker、BlockingRegion 和 sysmon 共同观察；
+        // P 计数的增减仍在 Impl::mutex 下完成。
+        std::atomic<bool> processor_detached{false};
+        std::atomic<std::int64_t> blocking_since_ns{0};
+        std::atomic<GId> blocking_task{0};
+        std::atomic<std::uint64_t> long_syscall_count{0};
     };
 
     explicit Impl(SchedulerConfig requested, Scheduler* scheduler)
@@ -510,7 +544,7 @@ public:
         }
     }
 
-    ~Impl() = default;
+    ~Impl() { stop_sysmon(true); }
 
     static SchedulerConfig normalize(SchedulerConfig requested) {
         if (requested.processor_count == 0) {
@@ -552,6 +586,13 @@ public:
         }
         if (requested.idle_worker_timeout <= std::chrono::milliseconds::zero()) {
             requested.idle_worker_timeout = std::chrono::milliseconds(1);
+        }
+        if (requested.sysmon_interval <= std::chrono::milliseconds::zero()) {
+            requested.sysmon_interval = std::chrono::milliseconds(1);
+        }
+        if (requested.long_syscall_threshold <=
+            std::chrono::milliseconds::zero()) {
+            requested.long_syscall_threshold = requested.sysmon_interval;
         }
         return requested;
     }
@@ -642,6 +683,22 @@ public:
         join_lock.unlock();
     }
 
+    // 统计当前仍处于 sysmon 逻辑解绑状态的 M。调用方必须持有 mutex；
+    // 这样 sysmon 标记后、原 G 返回前的短竞态不会使用过期计数扩容。
+    std::size_t detached_machine_count_locked() const noexcept {
+        std::size_t count = 0;
+        for (const auto& machine : machines) {
+            if (machine &&
+                machine->processor_detached.load(std::memory_order_acquire)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    // 普通入队只按 runnable demand 扩容；每个仍 detached 的长阻塞 M
+    // 预留一个替代槽，即便当前队列暂时为空，也不会让 P 长时间失去
+    // 可运行的 M。
     void maybe_grow(Scheduler* scheduler) {
         if (!scheduler) {
             return;
@@ -667,22 +724,36 @@ public:
         const auto busy = running_workers.load(std::memory_order_acquire);
         const auto active = active_workers.load(std::memory_order_relaxed);
         const auto blocking = blocking_workers.load(std::memory_order_acquire);
+        const auto detached = detached_machine_count_locked();
+        const auto effective_blocking = std::max(blocking, detached);
         // Normal runnable bursts stay P-bounded.  Each explicitly declared
         // native blocking M contributes one replacement slot, up to the
         // configured max; this prevents a large queue from creating dozens
         // of threads merely because max_workers is generous.
         const auto extra_ceiling =
-            blocking > std::numeric_limits<std::size_t>::max() -
-                          config.processor_count
+            effective_blocking > std::numeric_limits<std::size_t>::max() -
+                              config.processor_count
                 ? std::numeric_limits<std::size_t>::max()
-                : config.processor_count + blocking;
+                : config.processor_count + effective_blocking;
         const auto worker_ceiling = std::min(config.max_workers, extra_ceiling);
         const auto demand =
             queued > std::numeric_limits<std::size_t>::max() - busy
                 ? std::numeric_limits<std::size_t>::max()
                 : queued + busy;
-        const auto desired = std::min(worker_ceiling,
-                                     std::max(config.min_workers, demand));
+        auto desired = std::min(worker_ceiling,
+                                std::max(config.min_workers, demand));
+        if (detached != 0) {
+            // 替代槽只需要补足当前的最小 worker 底线；普通 runnable
+            // 需求仍由上面的 P 有界 ceiling 控制。不能因为机器有很多
+            // 个 P，就为一个长 syscall 无条件启动 P+1 个 M。
+            const auto handoff_target = std::min(
+                worker_ceiling,
+                detached > std::numeric_limits<std::size_t>::max() -
+                                  config.min_workers
+                    ? std::numeric_limits<std::size_t>::max()
+                    : config.min_workers + detached);
+            desired = std::max(desired, handoff_target);
+        }
         if (desired <= active) {
             return;
         }
@@ -700,6 +771,83 @@ public:
         }
         lock.unlock();
         condition.notify_all();
+    }
+
+    // sysmon 只做可逆的资源记账：它不会从别的线程跳转或终止正在
+    // syscall 中的 C++ 栈。达到阈值后，M 继续执行原生调用，但从 P 的
+    // attached 计数中移除，并按阻塞数申请替代 M。
+    void sysmon_pass(Scheduler* scheduler) noexcept {
+        if (!scheduler || !config.enable_sysmon) {
+            return;
+        }
+        const auto now = steady_now_ns();
+        const auto threshold = milliseconds_to_ns(config.long_syscall_threshold);
+        std::size_t detached_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (const auto& machine : machines) {
+                if (!machine ||
+                    machine->state.load(std::memory_order_acquire) !=
+                        MState::kBlocking) {
+                    continue;
+                }
+                const auto since = machine->blocking_since_ns.load(
+                    std::memory_order_acquire);
+                if (since <= 0 || now < since || now - since < threshold ||
+                    machine->processor_detached.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                machine->processor_detached.store(true,
+                                                   std::memory_order_release);
+                machine->long_syscall_count.fetch_add(
+                    1, std::memory_order_relaxed);
+                const auto processor_id = machine->processor % processors.size();
+                auto& processor = processors[processor_id];
+                if (processor.active_machines.load(
+                        std::memory_order_relaxed) != 0) {
+                    processor.active_machines.fetch_sub(
+                        1, std::memory_order_acq_rel);
+                }
+                if (processor.active_machines.load(
+                        std::memory_order_relaxed) == 0 &&
+                    !stopping.load(std::memory_order_acquire)) {
+                    processor.state.store(PState::kIdle,
+                                          std::memory_order_release);
+                }
+                ++detached_count;
+            }
+        }
+        if (detached_count != 0) {
+            maybe_grow(scheduler);
+            condition.notify_all();
+        }
+    }
+
+    void sysmon_loop(Scheduler* scheduler) noexcept {
+        while (!sysmon_stop.load(std::memory_order_acquire)) {
+            std::unique_lock<std::mutex> lock(mutex);
+            condition.wait_for(lock, config.sysmon_interval, [this] {
+                return sysmon_stop.load(std::memory_order_acquire) ||
+                       stopping.load(std::memory_order_acquire);
+            });
+            const bool stop = sysmon_stop.load(std::memory_order_acquire) ||
+                              stopping.load(std::memory_order_acquire);
+            lock.unlock();
+            if (stop) {
+                break;
+            }
+            sysmon_pass(scheduler);
+        }
+        sysmon_active.store(false, std::memory_order_release);
+    }
+
+    void stop_sysmon(bool join) noexcept {
+        sysmon_stop.store(true, std::memory_order_release);
+        condition.notify_all();
+        if (join && sysmon_thread.joinable() &&
+            sysmon_thread.get_id() != std::this_thread::get_id()) {
+            sysmon_thread.join();
+        }
     }
 
     void collect_terminal_locked(
@@ -859,6 +1007,9 @@ public:
     }
 
     SchedulerConfig config;
+    std::thread sysmon_thread;
+    std::atomic<bool> sysmon_stop{false};
+    std::atomic<bool> sysmon_active{false};
     std::shared_ptr<const void> owner_token;
     std::shared_ptr<TaskCancellationGate> cancellation_gate;
     mutable std::mutex mutex;
@@ -923,11 +1074,19 @@ void Scheduler::start() {
 
     m_impl->started.store(true, std::memory_order_release);
     m_impl->accepting.store(true, std::memory_order_release);
+    m_impl->sysmon_stop.store(false, std::memory_order_release);
     try {
         for (std::size_t i = 0; i < m_impl->config.min_workers; ++i) {
             (void)m_impl->spawn_worker_locked(this);
         }
+        if (m_impl->config.enable_sysmon) {
+            m_impl->sysmon_active.store(true, std::memory_order_release);
+            m_impl->sysmon_thread = std::thread([impl = m_impl.get(), this] {
+                impl->sysmon_loop(this);
+            });
+        }
     } catch (...) {
+        m_impl->sysmon_active.store(false, std::memory_order_release);
         m_impl->accepting.store(false, std::memory_order_release);
         lock.unlock();
         // Drain and join the workers that were successfully created before
@@ -975,6 +1134,8 @@ void Scheduler::shutdown() {
         }
     }
 
+    // sysmon 在 draining 阶段仍保持运行，直到所有已启动 G 完成自然
+    // 取消/唤醒。这样长系统调用返回前，监控不会提前丢失替代 M。
     for (const auto& task : completion_notifications) {
         if (task) {
             task->notify_terminal();
@@ -992,6 +1153,7 @@ void Scheduler::shutdown() {
                                       std::memory_order_release);
             }
         }
+        m_impl->stop_sysmon(true);
         if (join_lock.owns_lock()) {
             join_lock.unlock();
         }
@@ -1029,6 +1191,7 @@ void Scheduler::shutdown() {
         m_impl->stopping.store(true, std::memory_order_release);
         m_impl->draining.store(false, std::memory_order_release);
     }
+    m_impl->stop_sysmon(true);
     m_impl->condition.notify_all();
 
     // The external caller owns join_mutex, which prevents the worker-side
@@ -1264,7 +1427,7 @@ bool Scheduler::yield(const std::shared_ptr<Task>& task) {
         return false;
     }
     task->defer_enqueue();
-    if (!Fiber::Suspend(SuspendReason::Yield)) {
+    if (!Fiber::SuspendForScheduler(SuspendReason::Yield)) {
         return false;
     }
     return !task->cancellation_requested();
@@ -1294,7 +1457,7 @@ bool Scheduler::park(const std::shared_ptr<Task>& task) {
     if (action != ParkAction::kParked) {
         return false;
     }
-    if (!Fiber::Suspend(SuspendReason::Park)) {
+    if (!Fiber::SuspendForScheduler(SuspendReason::Park)) {
         return false;
     }
     return !task->cancellation_requested();
@@ -1411,6 +1574,13 @@ bool Scheduler::enter_blocking() noexcept {
             if (state == MState::kRunning) {
                 machine->state.store(MState::kBlocking,
                                      std::memory_order_release);
+                machine->blocking_since_ns.store(steady_now_ns(),
+                                                std::memory_order_release);
+                const auto task = current_task();
+                machine->blocking_task.store(
+                    task ? task->id() : 0, std::memory_order_release);
+                machine->processor_detached.store(false,
+                                                   std::memory_order_release);
                 scheduler->m_impl->blocking_workers.fetch_add(
                     1, std::memory_order_relaxed);
                 entered = true;
@@ -1449,10 +1619,22 @@ void Scheduler::leave_blocking_for(Scheduler* scheduler,
         }
         if (machine->state.load(std::memory_order_relaxed) ==
             MState::kBlocking) {
+            const bool detached = machine->processor_detached.exchange(
+                false, std::memory_order_acq_rel);
+            machine->blocking_since_ns.store(0, std::memory_order_release);
+            machine->blocking_task.store(0, std::memory_order_release);
             machine->state.store(MState::kRunning,
                                  std::memory_order_release);
             scheduler->m_impl->blocking_workers.fetch_sub(
                 1, std::memory_order_relaxed);
+            if (detached) {
+                auto& processor = scheduler->m_impl->processors[
+                    machine->processor % scheduler->m_impl->processors.size()];
+                processor.active_machines.fetch_add(1,
+                                                    std::memory_order_acq_rel);
+                processor.state.store(PState::kRunning,
+                                      std::memory_order_release);
+            }
         }
         break;
     }
@@ -1510,9 +1692,17 @@ std::vector<MachineSnapshot> Scheduler::machines() const {
         result.push_back(MachineSnapshot{
             machine->id, machine->state.load(std::memory_order_acquire),
             machine->processor, machine->last_task_class,
-            machine->affinity_hits, machine->affinity_misses});
+            machine->affinity_hits, machine->affinity_misses,
+            machine->processor_detached.load(std::memory_order_acquire),
+            machine->blocking_task.load(std::memory_order_acquire),
+            machine->long_syscall_count.load(std::memory_order_acquire)});
     }
     return result;
+}
+
+bool Scheduler::sysmon_running() const noexcept {
+    return m_impl && m_impl->sysmon_active.load(std::memory_order_acquire) &&
+           !m_impl->sysmon_stop.load(std::memory_order_acquire);
 }
 
 std::shared_ptr<Task> Scheduler::current_task() noexcept {
@@ -1707,14 +1897,21 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             own_processor.state.store(PState::kRunning,
                                       std::memory_order_release);
             t_task = task;
+            Fiber::BindCurrentExecution(FiberExecutionBinding{
+                reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,
+                t_processor_id, true});
             task->run();
             t_task.reset();
-            // A well-formed BlockingRegion is destroyed before the G yields or
-            // returns. Clearing this thread marker at the task boundary also
-            // prevents a misuse that migrated an active region from poisoning
-            // the next G scheduled on this M; its destructor still repairs the
-            // captured original machine state.
-            t_blocking_machine_id = 0;
+            Fiber::BindCurrentExecution(FiberExecutionBinding{
+                reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,
+                t_processor_id, true});
+            // BlockingRegion 不能跨 Fiber yield/park 或 G 的任务边界。若
+            // 仍有活动标记，继续调度会让 blocking_workers 和 P 的 attached
+            // 计数永久失真；宁可在边界处 fail-fast，也不能静默清掉 TLS 后
+            // 把不一致状态传给后续 G。正常 Hook/RAII 路径在这里必为 0。
+            if (t_blocking_machine_id != 0) {
+                std::terminate();
+            }
             if (own_processor.running_machines.fetch_sub(
                     1, std::memory_order_acq_rel) == 1) {
                 own_processor.state.store(PState::kIdle,
@@ -1794,9 +1991,27 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                                  std::memory_order_release);
             break;
         }
+        // 长 syscall 的原 M 仍计入 active_workers，但已经从 P 的
+        // attached 计数中移除。替代 M 在原 M 返回前必须保留，不能被
+        // 普通 idle timeout 提前回收。
+        const auto required_workers = [this] {
+            const auto detached = m_impl->detached_machine_count_locked();
+            if (detached == 0) {
+                return m_impl->config.min_workers;
+            }
+            const auto handoff_floor =
+                detached > std::numeric_limits<std::size_t>::max() -
+                              m_impl->config.min_workers
+                    ? std::numeric_limits<std::size_t>::max()
+                    : m_impl->config.min_workers + detached;
+            return std::max(
+                m_impl->config.min_workers,
+                std::min(m_impl->config.max_workers, handoff_floor));
+        };
+        const auto worker_floor = required_workers();
         const bool can_shrink =
             m_impl->active_workers.load(std::memory_order_relaxed) >
-            m_impl->config.min_workers;
+            worker_floor;
         const auto idle_timeout = can_shrink
                                     ? m_impl->config.idle_worker_timeout
                                     : m_impl->config.idle_wait;
@@ -1804,11 +2019,12 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             return m_impl->stopping.load(std::memory_order_acquire) ||
                    m_impl->runnable.load(std::memory_order_acquire) != 0;
         });
+        const auto current_floor = required_workers();
         if (!woke && can_shrink &&
             m_impl->runnable.load(std::memory_order_acquire) == 0 &&
             !m_impl->stopping.load(std::memory_order_acquire) &&
             m_impl->active_workers.load(std::memory_order_relaxed) >
-                m_impl->config.min_workers) {
+                current_floor) {
             machine->state.store(MState::kStopping, std::memory_order_release);
             // Reserve the retirement while still holding mutex. Otherwise
             // several idle M's can all observe active > min and shrink below
@@ -1825,8 +2041,12 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     {
         std::lock_guard<std::mutex> lock(m_impl->mutex);
         if (!retired) {
-            own_processor.active_machines.fetch_sub(1,
-                                                    std::memory_order_relaxed);
+            // sysmon 可能已经从 P 的 attached 计数中移除了这个 M。
+            // 退出时只撤销仍然 attached 的计数，避免 size_t 下溢。
+            if (!machine->processor_detached.load(std::memory_order_acquire)) {
+                own_processor.active_machines.fetch_sub(
+                    1, std::memory_order_relaxed);
+            }
             m_impl->active_workers.fetch_sub(1, std::memory_order_relaxed);
         }
         if (own_processor.active_machines.load(std::memory_order_relaxed) == 0) {
@@ -1840,6 +2060,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     }
     m_impl->condition.notify_all();
     t_task.reset();
+    Fiber::BindCurrentExecution(FiberExecutionBinding{});
     thread_policy::detail::LeaveRuntimeWorker();
     t_scheduler = nullptr;
     t_machine_id = 0;

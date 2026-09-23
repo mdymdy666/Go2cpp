@@ -225,6 +225,147 @@ void BlockingRegionOvercommit() {
     scheduler.shutdown();
 }
 
+void SysmonDetachesLongSyscall() {
+    go2cpp::SchedulerConfig config;
+    // 多 P 但只有一个长 syscall 时，sysmon 只应补一个替代 M，
+    // 不能按整机 P 数量一次性扩容。
+    config.processor_count = 4;
+    config.min_workers = 1;
+    config.max_workers = 8;
+    config.idle_worker_timeout = 100ms;
+    config.sysmon_interval = 2ms;
+    config.long_syscall_threshold = 15ms;
+    config.enable_sysmon = true;
+    go2cpp::Scheduler scheduler(config);
+    scheduler.start();
+    GO2CPP_CHECK(scheduler.sysmon_running());
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool release = false;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> peer_done{false};
+    auto blocked = scheduler.spawn([&] {
+        go2cpp::BlockingRegion region;
+        GO2CPP_CHECK(region.active());
+        entered.store(true, std::memory_order_release);
+        std::unique_lock<std::mutex> lock(mutex);
+        GO2CPP_REQUIRE(condition.wait_for(lock, 2s, [&] { return release; }));
+    });
+    GO2CPP_REQUIRE_EVENTUALLY(entered.load(std::memory_order_acquire), 2s);
+
+    bool detached_seen = false;
+    GO2CPP_REQUIRE(WaitUntil(
+        [&] {
+            const auto snapshots = scheduler.machines();
+            for (const auto& machine : snapshots) {
+                if (machine.processor_detached &&
+                    machine.blocking_task != 0 &&
+                    machine.long_syscall_count != 0) {
+                    detached_seen = true;
+                    return true;
+                }
+            }
+            return false;
+        }, 2s));
+    GO2CPP_CHECK(detached_seen);
+    // sysmon 的交接应在没有队列需求时也预留替代 M；否则 P 仍会被
+    // 长 syscall 占住，后续 G 只能等到入队后才恢复并发。
+    GO2CPP_REQUIRE_EVENTUALLY(scheduler.worker_count() >= 2, 2s);
+    GO2CPP_CHECK(scheduler.worker_count() <= 2);
+    // 即使没有新的 runnable G，替代 M 也必须在原生调用返回前保留，
+    // 不能被 idle_worker_timeout 提前回收。
+    std::this_thread::sleep_for(150ms);
+    GO2CPP_CHECK(scheduler.worker_count() >= 2);
+
+    auto peer = scheduler.spawn([&] {
+        peer_done.store(true, std::memory_order_release);
+    });
+    GO2CPP_REQUIRE_EVENTUALLY(peer_done.load(std::memory_order_acquire), 2s);
+    GO2CPP_CHECK(peer->wait_for(2s));
+    GO2CPP_CHECK(blocked->state() != go2cpp::GState::kDead);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+    }
+    condition.notify_all();
+    GO2CPP_CHECK(blocked->wait_for(2s));
+    GO2CPP_CHECK(blocked->state() == go2cpp::GState::kDead ||
+                 blocked->state() == go2cpp::GState::kCancelled);
+    scheduler.shutdown();
+    GO2CPP_CHECK(!scheduler.sysmon_running());
+}
+
+void SysmonMultipleDetaches() {
+    go2cpp::SchedulerConfig config;
+    config.processor_count = 2;
+    config.min_workers = 1;
+    config.max_workers = 4;
+    config.idle_worker_timeout = 80ms;
+    config.sysmon_interval = 2ms;
+    config.long_syscall_threshold = 10ms;
+    config.enable_sysmon = true;
+    go2cpp::Scheduler scheduler(config);
+    scheduler.start();
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool release = false;
+    std::atomic<int> entered{0};
+    std::vector<std::shared_ptr<go2cpp::Task>> blocked;
+    for (int index = 0; index != 2; ++index) {
+        blocked.emplace_back(scheduler.spawn([&] {
+            go2cpp::BlockingRegion region;
+            GO2CPP_CHECK(region.active());
+            entered.fetch_add(1, std::memory_order_release);
+            std::unique_lock<std::mutex> lock(mutex);
+            GO2CPP_REQUIRE(condition.wait_for(
+                lock, 2s, [&] { return release; }));
+        }));
+    }
+    GO2CPP_REQUIRE_EVENTUALLY(entered.load(std::memory_order_acquire) == 2,
+                              2s);
+    GO2CPP_CHECK(WaitUntil(
+        [&] {
+            std::size_t detached = 0;
+            for (const auto& machine : scheduler.machines()) {
+                detached += machine.processor_detached ? 1U : 0U;
+            }
+            return detached >= 2;
+        },
+        2s));
+    GO2CPP_CHECK(scheduler.worker_count() >= 3);
+    GO2CPP_CHECK(scheduler.worker_count() <= 4);
+    std::this_thread::sleep_for(120ms);
+    GO2CPP_CHECK(scheduler.worker_count() >= 3);
+
+    std::atomic<int> peers_done{0};
+    std::vector<std::shared_ptr<go2cpp::Task>> peers;
+    for (int index = 0; index != 4; ++index) {
+        peers.emplace_back(scheduler.spawn([&] {
+            peers_done.fetch_add(1, std::memory_order_release);
+        }));
+    }
+    GO2CPP_REQUIRE_EVENTUALLY(peers_done.load(std::memory_order_acquire) == 4,
+                              2s);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+    }
+    condition.notify_all();
+    for (const auto& task : blocked) {
+        GO2CPP_CHECK(task->wait_for(2s));
+    }
+    for (const auto& task : peers) {
+        GO2CPP_CHECK(task->wait_for(2s));
+    }
+    GO2CPP_REQUIRE_EVENTUALLY(scheduler.worker_count() == 1, 2s);
+    scheduler.shutdown();
+    GO2CPP_CHECK(!scheduler.sysmon_running());
+}
+
 void BoundedClassAffinity() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 1;
@@ -312,6 +453,8 @@ void run_dynamic_scheduler_tests() {
     ProcessorCapAndMinimumFloor();
     BlockingRegionOvercommit();
     BoundedClassAffinity();
+    SysmonDetachesLongSyscall();
+    SysmonMultipleDetaches();
     CancelWakeShutdownRace();
 }
 

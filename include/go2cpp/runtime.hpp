@@ -5,6 +5,7 @@
 #include "go2cpp/channel.hpp"
 #include "go2cpp/context.hpp"
 #include "go2cpp/error.hpp"
+#include "go2cpp/future.hpp"
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/fiber_local.hpp"
 #include "go2cpp/go.hpp"

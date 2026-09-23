@@ -12,6 +12,7 @@ void run_dynamic_scheduler_tests();
 void run_panic_defer_tests();
 void run_fiber_tests();
 void run_sync_tests();
+void run_future_tests();
 void run_io_tests();
 void run_timer_tests();
 void run_beginner_api_tests();
@@ -31,6 +32,7 @@ int main() {
     if (selected("panic")) run_panic_defer_tests();
     if (selected("fiber")) run_fiber_tests();
     if (selected("sync")) run_sync_tests();
+    if (selected("future")) run_future_tests();
     if (selected("io")) run_io_tests();
     if (selected("timer")) run_timer_tests();
     if (selected("beginner")) run_beginner_api_tests();

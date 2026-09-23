@@ -1,6 +1,7 @@
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/fiber_local.hpp"
 #include "go2cpp/panic_defer.hpp"
+#include "go2cpp/scheduler.hpp"
 #include "test_support.hpp"
 
 #include <atomic>
@@ -233,6 +234,103 @@ void run_fiber_tests() {
     GO2CPP_CHECK(nested_parent.resume());
     GO2CPP_CHECK(nested_parent.state() == FiberState::Completed);
     GO2CPP_CHECK(nested_continuation == 2);
+
+    // 父对象结束后，子 Fiber 的诊断链仍由共享记录保留墓碑，不能
+    // 因为访问快照而解引用已经销毁的父对象。子本身先完成，避免
+    // 试图从不存在的父栈恢复。
+    std::unique_ptr<Fiber> tombstone_child;
+    {
+        Fiber tombstone_parent([&] {
+            tombstone_child = std::make_unique<Fiber>([] {});
+            GO2CPP_CHECK(tombstone_child->resume());
+            GO2CPP_CHECK(tombstone_child->state() == FiberState::Completed);
+        });
+        GO2CPP_CHECK(tombstone_parent.resume());
+        GO2CPP_CHECK(tombstone_parent.state() == FiberState::Completed);
+    }
+    const auto tombstone_snapshot = tombstone_child->context_snapshot();
+    GO2CPP_REQUIRE(tombstone_snapshot.size() >= 3);
+    GO2CPP_CHECK(!tombstone_snapshot[1].alive);
+    tombstone_child.reset();
+
+    // 调度器挂起必须穿过完整的嵌套链。inner park 时，outer 和根 G
+    // 都只保存 continuation；唤醒后应先回到 inner，再回到 outer，
+    // 不能直接把 outer 的后续代码提前执行。
+    go2cpp::SchedulerConfig nested_config;
+    nested_config.processor_count = 1;
+    nested_config.min_workers = 1;
+    nested_config.max_workers = 1;
+    nested_config.idle_wait = 1ms;
+    go2cpp::Scheduler nested_scheduler(nested_config);
+    nested_scheduler.start();
+    std::atomic<int> nested_stage{0};
+    std::atomic<bool> inner_snapshot_ok{false};
+    std::shared_ptr<go2cpp::Task> nested_task;
+    nested_task = nested_scheduler.spawn([&] {
+        Fiber outer([&] {
+            Fiber inner([&] {
+                nested_stage.store(1, std::memory_order_release);
+                const auto snapshot = Fiber::CurrentContextSnapshot();
+                if (snapshot.size() >= 4 && snapshot.front().main_fiber &&
+                    snapshot.back().depth >= 3) {
+                    inner_snapshot_ok.store(true, std::memory_order_release);
+                }
+                GO2CPP_CHECK(nested_scheduler.park_current());
+                // 唤醒后重新进入嵌套 Fiber，验证跨多层 fcontext 返回后
+                // panic/defer 仍绑定到当前 Fiber，而不是落到父 G。
+                bool nested_recovered = false;
+                Fiber post_wake_panic([&] {
+                    using namespace go2cpp::panic_defer;
+                    run([&] {
+                        Frame frame;
+                        frame.defer_call([&] {
+                            const auto value = recover();
+                            nested_recovered =
+                                value.as_text() != nullptr &&
+                                *value.as_text() == "post-wake";
+                        });
+                        panic(PanicValue::text("post-wake"));
+                    });
+                });
+                GO2CPP_CHECK(post_wake_panic.resume());
+                GO2CPP_CHECK(post_wake_panic.state() == FiberState::Completed);
+                GO2CPP_CHECK(nested_recovered);
+                GO2CPP_CHECK(!go2cpp::panic_defer::panicking());
+                nested_stage.store(3, std::memory_order_release);
+            });
+            GO2CPP_CHECK(inner.resume());
+            // 该断言在 inner park 期间不能执行；它只会在 inner 完成后
+            // 继续，验证 scheduler 唤醒没有跳过父 Fiber continuation。
+            GO2CPP_CHECK(nested_stage.load(std::memory_order_acquire) == 3);
+            nested_stage.store(4, std::memory_order_release);
+        });
+        GO2CPP_CHECK(outer.resume());
+        GO2CPP_CHECK(nested_stage.load(std::memory_order_acquire) == 4);
+    });
+    GO2CPP_REQUIRE_EVENTUALLY(
+        nested_stage.load(std::memory_order_acquire) == 1, 2s);
+    GO2CPP_REQUIRE_EVENTUALLY(
+        nested_task->state() == go2cpp::GState::kWaiting, 2s);
+    GO2CPP_CHECK(inner_snapshot_ok.load(std::memory_order_acquire));
+    GO2CPP_CHECK(nested_scheduler.wake(nested_task));
+    GO2CPP_CHECK(nested_task->wait_for(2s));
+    GO2CPP_CHECK(nested_stage.load(std::memory_order_acquire) == 4);
+    GO2CPP_CHECK(nested_task->state() == go2cpp::GState::kDead);
+    nested_scheduler.shutdown();
+
+    // 子 Fiber 的异常停在 Fiber 边界内，父 Fiber 用显式结果处理，
+    // 不依赖 C++ 异常穿过调度器，也能保留父链快照。
+    Fiber child_failure([&] { throw std::runtime_error("nested failure"); });
+    bool parent_observed_failure = false;
+    Fiber parent_failure([&] {
+        const auto result = child_failure.resume_result();
+        parent_observed_failure = result.accepted && result.failed() &&
+                                  result.failure != nullptr &&
+                                  result.context_snapshot.size() >= 3;
+    });
+    GO2CPP_CHECK(parent_failure.resume());
+    GO2CPP_CHECK(parent_observed_failure);
+    GO2CPP_CHECK(parent_failure.state() == FiberState::Completed);
 
     using namespace go2cpp::panic_defer;
     std::string recovered;

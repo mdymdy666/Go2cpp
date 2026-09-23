@@ -20,9 +20,10 @@ dead/cancelled -> terminal
 
 ```text
 M: idle -> running -> idle -> parked -> idle
+                 \-> blocking [processor_detached=true] -> running
                  \-> stopping -> dead
     parked -> stopping -> dead
-P: idle <-> running; shutdown 时 idle -> dead
+P: idle <-> running; detached M 时 attached 计数可暂时为零；shutdown 时 idle -> dead
 ```
 
 入队、出队、runnable 计数、shutdown admission 和 `runnable -> running` claim 在
@@ -45,7 +46,11 @@ admission mutex 下串行；Task transition mutex 保护状态字段。任何用
 每次 worker admission 都恢复同一 Fiber continuation；yield 后从切换点继续，绝不会
 重新调用 callable。`Fiber::Suspend(Yield)` 映射为 runnable，其它原因映射为 waiting；
 若切换前发生 wake/cancel，则恢复为 runnable，避免 shutdown 把 G 留在状态发布空窗。
-原始 Fiber API 属于高级接口，调用方仍必须合作返回。
+原始 Fiber API 属于高级接口，调用方仍必须合作返回。嵌套 Fiber 的父链由共享
+元数据记录保存，父对象结束后快照可以得到 `alive=false` 墓碑帧；但真正的
+fcontext 恢复仍要求固定父 Fiber 对象存活。Ready 子 Fiber 尚未进入用户栈，析构时
+可以安全跳过主体；Suspended 子 Fiber 若在错误父级之外析构会 fail-fast，避免
+无限重试、跳过 RAII/defer 或释放仍可恢复的栈。
 
 ## 动态 M 策略
 
@@ -56,10 +61,28 @@ admission mutex 下串行；Task transition mutex 保护状态字段。任何用
 P-local 计数；死亡记录在锁外 join 后从快照删除。Task class 只影响有限扫描顺序，
 窃取始终可用，不会因亲和性导致饥饿。
 
-`BlockingRegion` 不可移动，并记录进入它的 M；不能跨 Fiber yield/park/迁移。它不会
-探测任意 native syscall，也不会抢占 C++ continuation。Hook 的 socket/sleep fallback
-会自动发布 blocking 记账；未 Hook 的调用必须显式包在 `BlockingRegion` 中。
-`ScopedThreadParticipation` 只是每线程策略元数据，不会附加 M 或运行队列。
+### sysmon 长系统调用交接
+
+当 `enable_sysmon=true` 时，Scheduler 启动一个独立监控线程，以
+`sysmon_interval` 检查已发布的 `MState::Blocking`。进入 `BlockingRegion` 或 Hook
+的 native fallback 时记录 `blocking_since` 和当前 G；持续时间达到
+`long_syscall_threshold` 后，sysmon 将 `MachineSnapshot::processor_detached` 置为真，
+从所属 P 的 attached M 计数中扣除一次，并为该长调用申请一个替代 M。替代槽按
+`min_workers + detached_count` 计算，仍受 `max_workers` 和严格模式限制，不会因为
+整机 P 数量很大而无条件创建 P 个线程。原 M 仍在自己的 C++ 调用栈中运行，返回时
+`BlockingRegion` 原子地清除标记并把 M 重新计入 P；在此之前替代 M 不会被 idle timeout
+回收。
+
+这是安全的“逻辑解绑”，不是 Go runtime 的精确 `_Psyscall` 交接，也不会从另一个
+线程强行切断/迁移任意 C++ 栈。未 Hook、未包在 `BlockingRegion` 中的阻塞调用不可被
+sysmon 发现；raw syscall、第三方阻塞库和达到 `max_workers` 的场景只能保持现有
+线程语义。
+
+`BlockingRegion` 不可移动，并记录进入它的 M；不能跨 Fiber yield/park/迁移。worker
+在 G 任务边界发现仍活动的 region 会 fail-fast，避免把旧 M 的 blocking 记账静默
+遗留给后续 G。Hook 的 socket/sleep 和未跟踪 FD fallback 会自动发布 blocking 记账；
+未 Hook 的调用必须显式包在 `BlockingRegion` 中。`ScopedThreadParticipation` 只是每线程
+策略元数据，不会附加 M 或运行队列。
 
 ## shutdown 与 join
 

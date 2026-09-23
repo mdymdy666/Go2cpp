@@ -52,10 +52,13 @@ shutdown 先关闭 admission，取消未启动队列项，唤醒已启动等待 
 
 M 从 `min_workers` 开始，根据 runnable backlog 和忙碌 M 数量有界扩展，空闲超时
 回收至下限，死亡记录会 join/reap。`allow_worker_oversubscription=false` 时最大
-M 严格不超过 P；默认模式下普通 runnable 峰值仍以 P 为上限，只有显式
-`BlockingRegion` 为一个已知的短 native 阻塞调用申请替代 M，并受
-`max_workers` 限制。阻塞 M 保留其 P 记账令牌，替代 M 可能共享 P，这不是异步
-抢占或精确 Go P 交接。task class 只提供有界软亲和性，不保证线程缓存或 CPU 绑核。
+M 严格不超过 P；默认模式下普通 runnable 峰值仍以 P 为上限。sysmon 线程以
+`sysmon_interval` 检查 `BlockingRegion`/Hook 发布的 `MState::Blocking`，超过
+`long_syscall_threshold` 后将 M 从 P 的 attached 计数逻辑解绑，并按
+`min_workers + detached_count` 申请替代 M；原 M 返回时由 RAII 重新绑定，替代 M 在此
+之前不会被 idle 回收。该机制不抢占异线程 C++ 栈、不模拟精确 Go P 交接，未 Hook 的
+阻塞调用仍需显式 `BlockingRegion`，并受 `max_workers` 限制。task class 只提供有界
+软亲和性，不保证线程缓存或 CPU 绑核。
 
 ## Fiber 与 FiberLocal
 
@@ -68,7 +71,9 @@ M 严格不超过 P；默认模式下普通 runnable 峰值仍以 P 为上限，
 可能让析构等待，但不会使用危险的强制栈释放。
 
 每次 resume 周围用 `panic_defer::Binding` 安装 Fiber 自己的 ExecutionContext，
-避免 M 复用下 panic/recover 状态串 G。
+避免 M 复用下 panic/recover 状态串 G。嵌套父链的诊断、取消和 alive 标志存放在
+共享 `FiberRecord` 链中，父对象结束后保留墓碑但不保留可恢复栈；Suspended 子 Fiber
+只能由固定父级继续恢复，错误调用方会 fail-fast。
 
 ## 线程参与、Hook 与阻塞
 
@@ -78,9 +83,9 @@ M 严格不超过 P；默认模式下普通 runnable 峰值仍以 P 为上限，
 代码应使用非阻塞 API 或显式 `BlockingRegion`。
 
 `BlockingRegion` 是不可移动 RAII 对象，记录进入它的 M，结束时修复 M 状态，且
-不能跨 Fiber yield/park/迁移。它只扩展线程池，不会把任意未 Hook 的阻塞调用变成
-可抢占操作。`panic_defer::panic()` 只记录运行时状态；转译代码必须回到活动
-Frame 边界，不能把它当作普通 C++ 控制流跳转。
+不能跨 Fiber yield/park/迁移；worker 在任务边界发现未销毁的 region 会 fail-fast。
+它是 sysmon 的观测边界，只扩展线程池，不会把任意未 Hook 的阻塞调用变成可抢占操作。`panic_defer::panic()` 只记录运行时状态；转译代码
+必须回到活动 Frame 边界，不能把它当作普通 C++ 控制流跳转。
 
 ## Context 与 Timer
 

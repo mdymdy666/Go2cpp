@@ -406,6 +406,51 @@ void test_plain_scheduler_lazy_adoption_timeout() {
     scheduler.shutdown();
 }
 
+void test_iomanager_untracked_fd_publishes_blocking() {
+    go2cpp::SchedulerConfig config;
+    config.processor_count = 1;
+    config.min_workers = 1;
+    config.max_workers = 2;
+    config.sysmon_interval = 2ms;
+    config.long_syscall_threshold = 10ms;
+    config.idle_worker_timeout = 100ms;
+    go2cpp::IOManager manager(config);
+    GO2CPP_CHECK(manager.Start());
+
+    int pipe_fds[2]{-1, -1};
+    GO2CPP_CHECK(::pipe(pipe_fds) == 0);
+    std::atomic<bool> entered{false};
+    std::atomic<bool> peer_done{false};
+    std::atomic<bool> detached{false};
+    auto reader = manager.Go([&] {
+        entered.store(true, std::memory_order_release);
+        char value = 0;
+        GO2CPP_CHECK(::read(pipe_fds[0], &value, 1) == 1);
+    });
+    GO2CPP_CHECK(wait_until(entered));
+    GO2CPP_CHECK(wait_until_predicate([&] {
+        for (const auto& machine : manager.scheduler().machines()) {
+            if (machine.processor_detached) {
+                detached.store(true, std::memory_order_release);
+                return true;
+            }
+        }
+        return false;
+    }, 2s));
+    auto peer = manager.Go([&] {
+        peer_done.store(true, std::memory_order_release);
+    });
+    GO2CPP_CHECK(wait_until(peer_done));
+    GO2CPP_CHECK(detached.load(std::memory_order_acquire));
+    const char value = 'p';
+    GO2CPP_CHECK(::write(pipe_fds[1], &value, 1) == 1);
+    GO2CPP_CHECK(reader->wait_for(2s));
+    GO2CPP_CHECK(peer->wait_for(2s));
+    (void)::close(pipe_fds[0]);
+    (void)::close(pipe_fds[1]);
+    manager.Shutdown();
+}
+
 void test_native_fallback_grows_replacement_m() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 1;
@@ -469,4 +514,5 @@ void run_hook_tests() {
     test_dup2_replacement_and_identity();
     test_plain_scheduler_lazy_adoption_timeout();
     test_native_fallback_grows_replacement_m();
+    test_iomanager_untracked_fd_publishes_blocking();
 }
