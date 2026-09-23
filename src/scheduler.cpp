@@ -1,7 +1,6 @@
 #include "go2cpp/scheduler/scheduler.hpp"
 
 #include "go2cpp/fiber.hpp"
-#include "go2cpp/panic_defer.hpp"
 #include "go2cpp/thread_policy.hpp"
 
 #include <algorithm>
@@ -402,7 +401,11 @@ void Task::run() {
                     // returns or the Fiber is deliberately unwound.
                     auto body = std::move(m_function);
                     if (body) {
-                        (void)panic_defer::run(std::move(body));
+                        // Fiber::entry catches ordinary C++ exceptions and
+                        // exposes them through Fiber::failure(). The runtime
+                        // deliberately has no panic/recover control-flow
+                        // layer; user code must handle exceptions explicitly.
+                        body();
                     }
                 },
                 stack_size);
@@ -789,8 +792,13 @@ public:
         {
             std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
             if (!lock.owns_lock()) {
+                // 不要把一次锁竞争当成“本轮扫描完成”。worker 在高负载
+                // 下可能连续持有主锁；保留重试标记让 monitor 缩短下一
+                // 个周期，而不是静默丢失长 syscall 的解绑机会。
+                sysmon_retry_pending.store(true, std::memory_order_release);
                 return;
             }
+            sysmon_retry_pending.store(false, std::memory_order_release);
             for (const auto& machine : machines) {
                 if (!machine ||
                     machine->state.load(std::memory_order_acquire) !=
@@ -834,10 +842,20 @@ public:
             // sysmon 的节拍等待不能争用调度器主锁。worker 在高负载下可能
             // 持有主锁进行队列/生命周期处理；监控线程只应等待自己的停止
             // 条件，然后在扫描阶段用 try_to_lock 做一次有界尝试。
+            const bool retry =
+                sysmon_retry_pending.exchange(false, std::memory_order_acq_rel);
+            // 锁竞争后的重试保持有界退避，避免 monitor 在主锁长期繁忙
+            // 时忙等，同时确保一次失败扫描不会被完整周期掩盖。
+            const auto wait_interval = retry
+                                           ? std::min(
+                                                 config.sysmon_interval,
+                                                 std::chrono::milliseconds(1))
+                                           : config.sysmon_interval;
             std::unique_lock<std::mutex> lock(sysmon_wait_mutex);
-            sysmon_wait_condition.wait_for(lock, config.sysmon_interval, [this] {
+            sysmon_wait_condition.wait_for(lock, wait_interval, [this] {
                 return sysmon_stop.load(std::memory_order_acquire) ||
-                       stopping.load(std::memory_order_acquire);
+                       stopping.load(std::memory_order_acquire) ||
+                       sysmon_retry_pending.load(std::memory_order_acquire);
             });
             const bool stop = sysmon_stop.load(std::memory_order_acquire) ||
                               stopping.load(std::memory_order_acquire);
@@ -1019,6 +1037,7 @@ public:
     std::thread sysmon_thread;
     std::atomic<bool> sysmon_stop{false};
     std::atomic<bool> sysmon_active{false};
+    std::atomic<bool> sysmon_retry_pending{false};
     std::atomic<std::uint64_t> sysmon_pass_count{0};
     std::mutex sysmon_wait_mutex;
     std::condition_variable sysmon_wait_condition;

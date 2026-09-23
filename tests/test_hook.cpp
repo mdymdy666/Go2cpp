@@ -4,6 +4,7 @@
 
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -495,6 +496,49 @@ void test_native_fallback_grows_replacement_m() {
 }
 
 
+void test_managed_poll_fallback_publishes_blocking() {
+    go2cpp::SchedulerConfig config;
+    config.processor_count = 1;
+    config.min_workers = 1;
+    config.max_workers = 2;
+    config.sysmon_interval = 2ms;
+    config.long_syscall_threshold = 5ms;
+    config.idle_worker_timeout = 100ms;
+    go2cpp::Scheduler scheduler(config);
+    scheduler.start();
+
+    int pipe_fds[2]{-1, -1};
+    GO2CPP_CHECK(::pipe(pipe_fds) == 0);
+    std::atomic<bool> entered{false};
+    std::atomic<bool> peer_done{false};
+    std::atomic<int> poll_result{-2};
+    auto waiter = scheduler.spawn([&] {
+        pollfd descriptor{pipe_fds[0], POLLIN, 0};
+        entered.store(true, std::memory_order_release);
+        poll_result.store(::poll(&descriptor, 1, 40),
+                          std::memory_order_release);
+    });
+    GO2CPP_CHECK(wait_until(entered));
+    auto peer = scheduler.spawn([&] {
+        peer_done.store(true, std::memory_order_release);
+    });
+    GO2CPP_CHECK(wait_until(peer_done));
+    GO2CPP_CHECK(peer->wait_for(2s));
+    GO2CPP_CHECK(wait_until_predicate([&] {
+        for (const auto& machine : scheduler.machines()) {
+            if (machine.processor_detached) {
+                return true;
+            }
+        }
+        return false;
+    }));
+    GO2CPP_CHECK(waiter->wait_for(2s));
+    GO2CPP_CHECK(poll_result.load(std::memory_order_acquire) == 0);
+    (void)::close(pipe_fds[0]);
+    (void)::close(pipe_fds[1]);
+    scheduler.shutdown();
+}
+
 void test_managed_write_error_is_not_panic() {
     go2cpp::IOManager manager(one_worker_config());
     GO2CPP_CHECK(manager.Start());
@@ -745,6 +789,7 @@ void run_hook_tests() {
     test_plain_scheduler_lazy_adoption_timeout();
     test_native_fallback_grows_replacement_m();
     test_iomanager_untracked_fd_publishes_blocking();
+    test_managed_poll_fallback_publishes_blocking();
     test_managed_write_error_is_not_panic();
     test_nested_fiber_io_timeout_and_wake();
     test_deep_nested_fiber_io_chain();

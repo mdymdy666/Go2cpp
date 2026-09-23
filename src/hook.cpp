@@ -10,8 +10,10 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -70,6 +72,14 @@ using FcntlFn = int (*)(int, int, ...);
 using IoctlFn = int (*)(int, unsigned long, ...);
 using GetSockOptFn = int (*)(int, int, int, void*, socklen_t*);
 using SetSockOptFn = int (*)(int, int, int, const void*, socklen_t);
+using PollFn = int (*)(struct pollfd*, nfds_t, int);
+using PpollFn = int (*)(struct pollfd*, nfds_t, const timespec*,
+                        const sigset_t*);
+using SelectFn = int (*)(int, fd_set*, fd_set*, fd_set*, timeval*);
+using PselectFn = int (*)(int, fd_set*, fd_set*, fd_set*, const timespec*,
+                          const sigset_t*);
+using EpollWaitFn = int (*)(int, epoll_event*, int, int);
+using EpollPwaitFn = int (*)(int, epoll_event*, int, int, const sigset_t*);
 
 struct Originals {
     SleepFn m_sleep{nullptr};
@@ -98,6 +108,12 @@ struct Originals {
     IoctlFn m_ioctl{nullptr};
     GetSockOptFn m_getsockopt{nullptr};
     SetSockOptFn m_setsockopt{nullptr};
+    PollFn m_poll{nullptr};
+    PpollFn m_ppoll{nullptr};
+    SelectFn m_select{nullptr};
+    PselectFn m_pselect{nullptr};
+    EpollWaitFn m_epoll_wait{nullptr};
+    EpollPwaitFn m_epoll_pwait{nullptr};
 };
 
 Originals s_originals;
@@ -155,6 +171,13 @@ void initialize_originals() noexcept {
             load_symbol<GetSockOptFn>("getsockopt");
         s_originals.m_setsockopt =
             load_symbol<SetSockOptFn>("setsockopt");
+        s_originals.m_poll = load_symbol<PollFn>("poll");
+        s_originals.m_ppoll = load_symbol<PpollFn>("ppoll");
+        s_originals.m_select = load_symbol<SelectFn>("select");
+        s_originals.m_pselect = load_symbol<PselectFn>("pselect");
+        s_originals.m_epoll_wait = load_symbol<EpollWaitFn>("epoll_wait");
+        s_originals.m_epoll_pwait =
+            load_symbol<EpollPwaitFn>("epoll_pwait");
         s_resolving = false;
     });
 }
@@ -610,6 +633,13 @@ int native_wait(int fd, IOEvent event,
             return errno;
         }
         if (result > 0) {
+            // poll 返回就绪后再次通过生命周期门检查。这样 close/dup2
+            // Hook 在就绪通知与真正读写之间不能把旧 generation 伪装成
+            // 新的同号 fd；真正的 syscall 仍在 cooperative_io 的门内执行。
+            DescriptorGuard lifecycle;
+            if (descriptor_closed(descriptor)) {
+                return EBADF;
+            }
             return (poll_descriptor.revents & POLLNVAL) != 0 ? EBADF : 0;
         }
     }
@@ -1065,6 +1095,78 @@ int nanosleep(const timespec* request, timespec* remaining) {
         return -1;
     }
     return invoke_native_blocking(s_originals.m_nanosleep, request, remaining);
+}
+
+// 多路等待 API 暂时不在 IOManager 的单 fd 等待接口上伪造“任意
+// 就绪”语义。managed Fiber 进入显式 BlockingRegion，sysmon 可以为
+// 长时间 poll/select/epoll_wait 逻辑解绑原 M 并补充替代 M；普通线程和
+// 未参与调度的调用完全沿用 libc 行为。这样不会把一次等待错误地拆成
+// 多个顺序等待，也不会改变 timeout/EINTR/信号掩码等 ABI 细节。
+int poll(struct pollfd* descriptors, nfds_t count, int timeout) {
+    initialize_originals();
+    if (!s_originals.m_poll) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return invoke_native_blocking(s_originals.m_poll, descriptors, count,
+                                  timeout);
+}
+
+int ppoll(struct pollfd* descriptors, nfds_t count, const timespec* timeout,
+          const sigset_t* signal_mask) {
+    initialize_originals();
+    if (!s_originals.m_ppoll) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return invoke_native_blocking(s_originals.m_ppoll, descriptors, count,
+                                  timeout, signal_mask);
+}
+
+int select(int descriptor_count, fd_set* read_set, fd_set* write_set,
+           fd_set* exception_set, timeval* timeout) {
+    initialize_originals();
+    if (!s_originals.m_select) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return invoke_native_blocking(s_originals.m_select, descriptor_count,
+                                  read_set, write_set, exception_set, timeout);
+}
+
+int pselect(int descriptor_count, fd_set* read_set, fd_set* write_set,
+            fd_set* exception_set, const timespec* timeout,
+            const sigset_t* signal_mask) {
+    initialize_originals();
+    if (!s_originals.m_pselect) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return invoke_native_blocking(s_originals.m_pselect, descriptor_count,
+                                  read_set, write_set, exception_set, timeout,
+                                  signal_mask);
+}
+
+int epoll_wait(int epoll_descriptor, epoll_event* events, int max_events,
+               int timeout) {
+    initialize_originals();
+    if (!s_originals.m_epoll_wait) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return invoke_native_blocking(s_originals.m_epoll_wait, epoll_descriptor,
+                                  events, max_events, timeout);
+}
+
+int epoll_pwait(int epoll_descriptor, epoll_event* events, int max_events,
+                int timeout, const sigset_t* signal_mask) {
+    initialize_originals();
+    if (!s_originals.m_epoll_pwait) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return invoke_native_blocking(s_originals.m_epoll_pwait, epoll_descriptor,
+                                  events, max_events, timeout, signal_mask);
 }
 
 int socket(int domain, int type, int protocol) {
