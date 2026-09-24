@@ -110,6 +110,6 @@ shutdown、析构重入和带 watchdog 的压力循环。精确命令见 `docs/t
 
 sysmon 的节拍等待使用独立的 sysmon_wait_condition，不再先获取 Scheduler 队列主锁；每一轮只在扫描阶段对主锁执行一次 try_to_lock。sysmon_pass_count() 在扫描尝试开始时递增，因此它是 monitor 活性心跳，不代表本轮一定完成了 detach 扫描。sysmon_running() 与该计数应一起用于部署自检。实现保持一个 monitor 线程，不会在高负载时复制多个 monitor；真正的扩容由 maybe_grow() 根据 runnable backlog、声明的阻塞 M 数量和 max_workers 有界执行。达到上限、线程资源耗尽或未声明的阻塞调用都不会被伪装成已扩容。
 
-Hook IO 的 readiness、deadline、cancel 和 close 唤醒均通过一次性等待节点和 park_io() 进入 Fiber；嵌套 Fiber 的 IO 挂起会沿固定父链传播，唤醒后按原 fcontext 继续，测试覆盖三层父链、连续超时/ready 两次等待和父级返回顺序。当前公共 API 每个等待节点只接受一个 (fd, event)，没有 Fiber 级 wait_any/多 FD select；需要同时等待多个 FD 时应由多个 G/Fiber 分别等待，再用 Channel/Select 汇合，或使用应用层的外部 epoll。该限制已明确记录，不把多个独立等待误称为 Go select。
+Hook IO 的 readiness、deadline、cancel 和 close 唤醒均通过一次性等待节点和 park_io() 进入 Fiber；嵌套 Fiber 的 IO 挂起会沿固定父链传播，唤醒后按原 fcontext 继续，测试覆盖三层父链、连续超时/ready 两次等待和父级返回顺序。IOManager 现提供 `WaitAny/WaitMany`：多个 (fd, event) 会登记到同一 epoll poller，任一节点完成后唤醒当前 Fiber，并幂等清理其余节点；WaitMany 返回同一轮已就绪索引集合。普通线程调用返回 `EPERM`，应使用原生 poll/select。Hook 对 libc poll/select 的 ABI 仍保持原样，不自动改写信号掩码、EINTR 或 revents。
 
 monitor 不会从异线程终止、迁移或恢复任意 C++ Fiber 栈，也不会向 write 等系统调用注入 C++ 异常。Hook 系统调用错误保持 libc 的返回值和 errno；调用者应显式转换为 error 或使用普通 C++ 异常。关闭对端后的错误由调用者处理。

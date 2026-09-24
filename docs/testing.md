@@ -365,7 +365,7 @@ WSL + Boost.Context 偶发的 `unexpected memory mapping` 已在本轮绕过地�
 - TSan 当前 build-tsan-concurrency 在 setarch x86_64 -R 下完整套件单次通过；sync 过滤器 5/5、fiber 和 dynamic 过滤器各 3/3 通过。重复完整套件时，WSL 主机曾在 test_sync.cpp 的 native waiter/CV watchdog 处超时，无 ThreadSanitizer race 报告；gdb 下同一 sync 套件正常完成。该环境抖动没有被宣称为“全量重复稳定”，native Linux 仍是 TSan 发布门槛。
 - Valgrind Memcheck 全 Hook-on：build-sysmon-hook/valgrind-nested-final.log，1,577,888 allocs / 1,577,884 frees，416 bytes/4 blocks still reachable，definite/indirect/possible lost 均为 0，ERROR SUMMARY 0。scheduler smoke：valgrind-nested-smoke-final.log，96 bytes/1 block reachable，三类 lost 均为 0，ERROR SUMMARY 0。可达块属于已有 FiberLocal/TimerService 进程生命周期状态。
 
-当前补充验证只证明已声明/Hook 的阻塞边界；monitor 不能异步终止任意 C++ 系统调用，不能迁移其栈，也没有自动 Fiber 栈增长或公共多 FD wait_any。这些是设计限制而不是未观察到的测试通过。
+当前补充验证只证明已声明/Hook 的阻塞边界；monitor 不能异步终止任意 C++ 系统调用，不能迁移其栈，也没有自动 Fiber 栈增长。`WaitAny/WaitMany` 已覆盖同一 Fiber 的多 FD epoll 等待，但不替换 Hook 的 libc poll/select ABI。这些是设计限制而不是未观察到的测试通过。
 
 ## 2026-09-23 最终复测修订
 
