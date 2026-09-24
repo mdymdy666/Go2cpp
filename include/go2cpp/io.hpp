@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <utility>
+#include <vector>
 
 namespace go2cpp::io {
 
@@ -84,6 +85,44 @@ struct WaitResult {
     explicit operator bool() const noexcept { return ready(); }
 };
 
+// 一个等待项描述一个 fd 上的读/写就绪条件。expected_descriptor 可选，
+// 用于把数字 fd 与捕获时的代际绑定，避免 close+复用后误唤醒旧等待。
+struct WaitRequest {
+    int fd{-1};
+    IOEvent event{IOEvent::kRead};
+    DescriptorTokenPtr expected_descriptor;
+};
+
+struct WaitAnyResult {
+    static constexpr std::size_t kNoIndex =
+        static_cast<std::size_t>(-1);
+
+    WaitStatus status{WaitStatus::kError};
+    int system_error{0};
+    std::size_t index{kNoIndex};
+    int fd{-1};
+    IOEvent event{IOEvent::kRead};
+
+    bool ready() const noexcept {
+        return status == WaitStatus::kReady && index != kNoIndex;
+    }
+    explicit operator bool() const noexcept { return ready(); }
+};
+
+// wait_many 在一次唤醒中返回已经完成的所有请求索引。它不是“等待所有
+// 请求都完成”的屏障；需要屏障时应使用多个任务或 WaitGroup。ready_indices
+// 按请求注册顺序排列，调用方可以据此稳定地分发后续 Fiber 工作。
+struct WaitManyResult {
+    WaitStatus status{WaitStatus::kError};
+    int system_error{0};
+    std::vector<std::size_t> ready_indices;
+
+    bool ready() const noexcept {
+        return status == WaitStatus::kReady && !ready_indices.empty();
+    }
+    explicit operator bool() const noexcept { return ready(); }
+};
+
 /**
  * Linux readiness manager for scheduler fibers.
  *
@@ -128,6 +167,20 @@ public:
     WaitResult wait_for(int fd, IOEvent event, Duration timeout,
                         ContextPtr context = {});
 
+    // 一次等待多个 fd；仅允许在当前 IOManager 的 managed Fiber 中调用。
+    // 普通线程调用返回 kError/EPERM，应直接使用系统 poll/select。
+    WaitAnyResult wait_any(const std::vector<WaitRequest>& requests,
+                           std::optional<TimePoint> deadline = std::nullopt,
+                           ContextPtr context = {});
+    WaitAnyResult wait_any_for(const std::vector<WaitRequest>& requests,
+                               Duration timeout, ContextPtr context = {});
+    WaitManyResult wait_many(
+        const std::vector<WaitRequest>& requests,
+        std::optional<TimePoint> deadline = std::nullopt,
+        ContextPtr context = {});
+    WaitManyResult wait_many_for(const std::vector<WaitRequest>& requests,
+                                 Duration timeout, ContextPtr context = {});
+
     WaitResult Wait(int fd, IOEvent event,
                     std::optional<TimePoint> deadline = std::nullopt,
                     ContextPtr context = {}) {
@@ -136,6 +189,25 @@ public:
     WaitResult WaitFor(int fd, IOEvent event, Duration timeout,
                        ContextPtr context = {}) {
         return wait_for(fd, event, timeout, std::move(context));
+    }
+    WaitAnyResult WaitAny(const std::vector<WaitRequest>& requests,
+                          std::optional<TimePoint> deadline = std::nullopt,
+                          ContextPtr context = {}) {
+        return wait_any(requests, deadline, std::move(context));
+    }
+    WaitAnyResult WaitAnyFor(const std::vector<WaitRequest>& requests,
+                             Duration timeout, ContextPtr context = {}) {
+        return wait_any_for(requests, timeout, std::move(context));
+    }
+    WaitManyResult WaitMany(
+        const std::vector<WaitRequest>& requests,
+        std::optional<TimePoint> deadline = std::nullopt,
+        ContextPtr context = {}) {
+        return wait_many(requests, deadline, std::move(context));
+    }
+    WaitManyResult WaitManyFor(const std::vector<WaitRequest>& requests,
+                               Duration timeout, ContextPtr context = {}) {
+        return wait_many_for(requests, timeout, std::move(context));
     }
 
     // Explicit cancellation reports kCancelled. It does not close fd.
@@ -175,4 +247,7 @@ using IOManager = io::IOManager;
 using IOEvent = io::IOEvent;
 using IOWaitResult = io::WaitResult;
 using IOWaitStatus = io::WaitStatus;
+using IOWaitRequest = io::WaitRequest;
+using IOWaitAnyResult = io::WaitAnyResult;
+using IOWaitManyResult = io::WaitManyResult;
 }  // namespace go2cpp

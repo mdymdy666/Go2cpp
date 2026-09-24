@@ -163,4 +163,10 @@ sysmon 的等待锁与 Scheduler 主锁分离，监控线程在队列锁竞争�
 
 Fiber 使用带保护页的固定大小 Boost.Context 栈（默认 128 KiB，可通过配置指定）。当前没有 Go morestack/newstack/copystack 式自动扩容：C++ 编译器不会提供 Go 栈图和可安全重写的挂起指针，直接复制正在运行的 C++ 栈会破坏 RAII、引用和 fcontext。需要更深调用栈时必须显式提高 fiber_stack_size，栈保护页会把越界变成可诊断故障，而不是声称已经实现 Go 栈增长。
 
-IOManager::wait 是单 FD/单事件等待。epoll 内部可同时服务很多等待者，但没有把多个 FD 注册为一个 Fiber 原子等待的公共 wait_any API；这不是 monitor 缺陷，而是尚未承诺的接口边界。应用可用多个 go() 任务配合 Channel Select 汇合。
+Fiber 栈仍是固定保护栈，尚未实现 Go 风格动态扩容。IOManager 提供
+`WaitAny/WaitMany`：每个请求对应一个带 generation 的 WaitNode，全部登记在
+同一个 epoll poller 中；任一节点完成时通过 Scheduler 的 pending-wake 交接唤醒
+当前 Fiber，返回 ready 请求索引，并对其余节点执行幂等取消。截止时间、Context
+取消和 `NotifyClose` 会完成整组节点，避免残留 waiter。`WaitMany` 返回同一轮已
+完成的全部索引，而不是“等待所有请求”的屏障；需要屏障时使用 WaitGroup。
+该接口要求 managed Fiber；普通线程得到 `EPERM`，继续使用原生 `poll/select`。

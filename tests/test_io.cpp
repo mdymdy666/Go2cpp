@@ -371,6 +371,125 @@ void test_generation_reuse_and_cross_manager_close() {
     second.Shutdown();
 }
 
+void test_wait_any_and_wait_many() {
+    IOManager manager(one_worker_config());
+    GO2CPP_CHECK(manager.Start());
+
+    int first[2]{-1, -1};
+    int second[2]{-1, -1};
+    GO2CPP_CHECK(make_pair(first));
+    GO2CPP_CHECK(make_pair(second));
+
+    const std::vector<go2cpp::IOWaitRequest> requests{
+        {first[0], IOEvent::kRead, {}},
+        {second[0], IOEvent::kRead, {}},
+    };
+    std::atomic<bool> any_done{false};
+    go2cpp::IOWaitAnyResult any_result;
+    auto any_task = manager.Go([&] {
+        any_result = manager.WaitAnyFor(requests, 1s);
+        any_done.store(true, std::memory_order_release);
+    });
+    (void)any_task;
+    std::this_thread::sleep_for(2ms);
+    const char one = '1';
+    GO2CPP_CHECK(::syscall(SYS_write, second[1], &one, 1) == 1);
+    GO2CPP_CHECK(wait_until(any_done));
+    GO2CPP_CHECK(any_result.ready());
+    GO2CPP_CHECK(any_result.index == 1);
+    GO2CPP_CHECK(any_result.fd == second[0]);
+    GO2CPP_CHECK(any_result.event == IOEvent::kRead);
+
+    char consumed = 0;
+    GO2CPP_CHECK(::syscall(SYS_read, second[0], &consumed, 1) == 1);
+
+    const char first_byte = 'a';
+    const char second_byte = 'b';
+    GO2CPP_CHECK(::syscall(SYS_write, first[1], &first_byte, 1) == 1);
+    GO2CPP_CHECK(::syscall(SYS_write, second[1], &second_byte, 1) == 1);
+    std::atomic<bool> many_done{false};
+    go2cpp::IOWaitManyResult many_result;
+    auto many_task = manager.Go([&] {
+        many_result = manager.WaitManyFor(requests, 1s);
+        many_done.store(true, std::memory_order_release);
+    });
+    (void)many_task;
+    GO2CPP_CHECK(wait_until(many_done));
+    GO2CPP_CHECK(many_result.ready());
+    GO2CPP_CHECK(many_result.ready_indices.size() == 2);
+    GO2CPP_CHECK(many_result.ready_indices[0] == 0);
+    GO2CPP_CHECK(many_result.ready_indices[1] == 1);
+
+    const auto native_result = manager.WaitAnyFor(requests, 1ms);
+    GO2CPP_CHECK(native_result.status == IOWaitStatus::kError);
+    GO2CPP_CHECK(native_result.system_error == EPERM);
+
+    close_pair(manager, first);
+    close_pair(manager, second);
+    manager.Shutdown();
+}
+
+void test_wait_any_cancellation_and_close() {
+    IOManager manager(one_worker_config());
+    GO2CPP_CHECK(manager.Start());
+    int first[2]{-1, -1};
+    int second[2]{-1, -1};
+    GO2CPP_CHECK(make_pair(first));
+    GO2CPP_CHECK(make_pair(second));
+    const std::vector<go2cpp::IOWaitRequest> requests{
+        {first[0], IOEvent::kRead, {}},
+        {second[0], IOEvent::kRead, {}},
+    };
+
+    auto cancellation = go2cpp::WithCancel(go2cpp::Background());
+    std::atomic<bool> cancelled_done{false};
+    go2cpp::IOWaitAnyResult cancelled_result;
+    manager.Go([&] {
+        cancelled_result = manager.WaitAny(requests, std::nullopt,
+                                            cancellation.first);
+        cancelled_done.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(2ms);
+    cancellation.second();
+    GO2CPP_CHECK(wait_until(cancelled_done));
+    GO2CPP_CHECK(cancelled_result.status == IOWaitStatus::kCancelled);
+
+    std::atomic<bool> closed_done{false};
+    go2cpp::IOWaitAnyResult closed_result;
+    manager.Go([&] {
+        closed_result = manager.WaitAnyFor(requests, 1s);
+        closed_done.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(2ms);
+    GO2CPP_CHECK(manager.NotifyClose(first[0]));
+    raw_close(first[0]);
+    first[0] = -1;
+    GO2CPP_CHECK(wait_until(closed_done));
+    GO2CPP_CHECK(closed_result.status == IOWaitStatus::kClosed);
+    GO2CPP_CHECK(closed_result.system_error == EBADF);
+
+    std::atomic<bool> timeout_done{false};
+    go2cpp::IOWaitManyResult timeout_result;
+    manager.Go([&] {
+        timeout_result = manager.WaitManyFor(
+            std::vector<go2cpp::IOWaitRequest>{
+                {second[0], IOEvent::kRead, {}},
+            },
+            5ms);
+        timeout_done.store(true, std::memory_order_release);
+    });
+    GO2CPP_CHECK(wait_until(timeout_done));
+    GO2CPP_CHECK(timeout_result.status == IOWaitStatus::kTimeout);
+
+    const auto empty = manager.WaitAnyFor({}, 1ms);
+    GO2CPP_CHECK(empty.status == IOWaitStatus::kError);
+    GO2CPP_CHECK(empty.system_error == EINVAL);
+
+    close_pair(manager, first);
+    close_pair(manager, second);
+    manager.Shutdown();
+}
+
 }  // namespace
 
 void run_io_tests() {
@@ -380,4 +499,6 @@ void run_io_tests() {
     test_readiness_timeout_race();
     test_sequential_and_spurious_waits();
     test_generation_reuse_and_cross_manager_close();
+    test_wait_any_and_wait_many();
+    test_wait_any_cancellation_and_close();
 }

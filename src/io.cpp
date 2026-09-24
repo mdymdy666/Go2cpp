@@ -1105,6 +1105,265 @@ WaitResult IOManager::wait_for(int fd, IOEvent event, Duration timeout,
     return wait(fd, event, deadline, std::move(context));
 }
 
+WaitManyResult IOManager::wait_many(
+    const std::vector<WaitRequest>& requests,
+    std::optional<TimePoint> deadline,
+    ContextPtr context) {
+    WaitManyResult result;
+    const auto fail = [&result](WaitStatus status, int error) {
+        result.status = status;
+        result.system_error = error;
+        result.ready_indices.clear();
+    };
+
+    if (requests.empty()) {
+        fail(WaitStatus::kError, EINVAL);
+        return result;
+    }
+    if (Scheduler::current_scheduler() != &m_scheduler ||
+        !Scheduler::current_task()) {
+        // IOManager 的多 fd 等待必须让出 managed Fiber。普通线程请使用
+        // 原生 poll/select；这里不偷偷阻塞调用方线程。
+        fail(WaitStatus::kError, EPERM);
+        return result;
+    }
+    if (context && context->IsDone()) {
+        const bool timed_out = Is(context->Err(), DeadlineExceededError());
+        fail(timed_out ? WaitStatus::kTimeout : WaitStatus::kCancelled,
+             timed_out ? ETIMEDOUT : ECANCELED);
+        return result;
+    }
+    if (deadline.has_value() && *deadline <= Clock::now()) {
+        fail(WaitStatus::kTimeout, ETIMEDOUT);
+        return result;
+    }
+
+    std::vector<State::NodePtr> nodes;
+    try {
+        nodes.reserve(requests.size());
+    } catch (...) {
+        fail(WaitStatus::kError, ENOMEM);
+        return result;
+    }
+
+    const auto cleanup = [&nodes, this] {
+        for (const auto& node : nodes) {
+            if (!node) {
+                continue;
+            }
+            if (node->outcome.load(std::memory_order_acquire) == 0) {
+                (void)m_state->complete(node, WaitStatus::kCancelled,
+                                        ECANCELED);
+            }
+            node->disarm();
+        }
+    };
+
+    for (const auto& request : requests) {
+        if (event_mask(request.event) == 0) {
+            cleanup();
+            fail(WaitStatus::kError, EINVAL);
+            return result;
+        }
+        int registration_error = 0;
+        State::NodePtr node;
+        try {
+            node = m_state->register_wait(
+                request.fd, request.event, deadline, &registration_error,
+                request.expected_descriptor);
+        } catch (...) {
+            cleanup();
+            fail(WaitStatus::kError, ENOMEM);
+            return result;
+        }
+        if (!node) {
+            cleanup();
+            fail(registration_error == ESHUTDOWN ? WaitStatus::kClosed
+                                                 : WaitStatus::kError,
+                 registration_error == 0 ? EIO : registration_error);
+            return result;
+        }
+        nodes.push_back(std::move(node));
+        const auto& registered = nodes.back();
+        if (registered->outcome.load(std::memory_order_acquire) != 0) {
+            // An invalid fd or epoll arm failure is terminal for the set. The
+            // already registered nodes are cancelled below.
+            const WaitResult terminal = decode_outcome(
+                registered->outcome.load(std::memory_order_acquire));
+            cleanup();
+            fail(terminal.status, terminal.system_error);
+            return result;
+        }
+    }
+
+    const auto task = nodes.front()->task;
+    DoneSignal::CallbackId callback_id = 0;
+    if (context) {
+        const std::weak_ptr<State> weak_state(m_state);
+        const std::weak_ptr<Context> weak_context(context);
+        // Holding the nodes in this callback prevents a late cancellation
+        // callback from observing a destroyed node. RemoveCallback below
+        // removes the callback before this owner is released.
+        std::shared_ptr<std::vector<State::NodePtr>> callback_nodes;
+        try {
+            callback_nodes =
+                std::make_shared<std::vector<State::NodePtr>>(nodes);
+            callback_id = context->Done().AddCallback(
+                [weak_state, weak_context, callback_nodes] {
+                    const auto state = weak_state.lock();
+                    if (!state) {
+                        return;
+                    }
+                    const auto current_context = weak_context.lock();
+                    const bool timed_out =
+                        current_context &&
+                        Is(current_context->Err(), DeadlineExceededError());
+                    for (const auto& node : *callback_nodes) {
+                        (void)state->complete(
+                            node,
+                            timed_out ? WaitStatus::kTimeout
+                                      : WaitStatus::kCancelled,
+                            timed_out ? ETIMEDOUT : ECANCELED);
+                    }
+                });
+        } catch (...) {
+            cleanup();
+            fail(WaitStatus::kError, ENOMEM);
+            return result;
+        }
+    }
+
+    const auto has_terminal = [&nodes] {
+        for (const auto& node : nodes) {
+            if (node && node->outcome.load(std::memory_order_acquire) != 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // A deadline can become due between registration and park. Complete the
+    // set before parking so a zero-length race cannot leave the Fiber asleep.
+    if (deadline.has_value() && *deadline <= Clock::now()) {
+        for (const auto& node : nodes) {
+            (void)m_state->complete(node, WaitStatus::kTimeout, ETIMEDOUT);
+        }
+    }
+
+    while (!has_terminal()) {
+        const bool parked = m_scheduler.park_io(task);
+        if (has_terminal()) {
+            break;
+        }
+        if (task->cancellation_requested() ||
+            Scheduler::current_scheduler() != &m_scheduler ||
+            Scheduler::current_task().get() != task.get() ||
+            (!parked && !m_scheduler.is_running())) {
+            for (const auto& node : nodes) {
+                (void)m_state->complete(node, WaitStatus::kCancelled,
+                                         ECANCELED);
+            }
+            break;
+        }
+    }
+
+    if (context && callback_id != 0) {
+        try {
+            context->Done().RemoveCallback(callback_id);
+        } catch (...) {
+            // RemoveCallback is non-throwing in the current implementation;
+            // preserve the wake result if a replaceable Context backend throws.
+        }
+    }
+
+    // Ready wins over timeout/cancel when several epoll/timer callbacks race.
+    // This mirrors poll/select's rule that observed readiness is actionable.
+    WaitStatus terminal_status = WaitStatus::kCancelled;
+    int terminal_error = ECANCELED;
+    bool have_terminal = false;
+    for (std::size_t index = 0; index < nodes.size(); ++index) {
+        const auto& node = nodes[index];
+        if (!node) {
+            continue;
+        }
+        const WaitResult current = decode_outcome(
+            node->outcome.load(std::memory_order_acquire));
+        if (current.status == WaitStatus::kReady) {
+            try {
+                result.ready_indices.push_back(index);
+            } catch (...) {
+                result.ready_indices.clear();
+                fail(WaitStatus::kError, ENOMEM);
+                cleanup();
+                return result;
+            }
+            continue;
+        }
+        if (!have_terminal && current.status != WaitStatus::kError) {
+            terminal_status = current.status;
+            terminal_error = current.system_error;
+            have_terminal = true;
+        } else if (!have_terminal) {
+            terminal_status = current.status;
+            terminal_error = current.system_error;
+            have_terminal = true;
+        }
+    }
+    if (!result.ready_indices.empty()) {
+        result.status = WaitStatus::kReady;
+        result.system_error = 0;
+    } else if (have_terminal) {
+        fail(terminal_status, terminal_error);
+    } else {
+        fail(WaitStatus::kCancelled, ECANCELED);
+    }
+    cleanup();
+    return result;
+}
+
+WaitAnyResult IOManager::wait_any(const std::vector<WaitRequest>& requests,
+                                   std::optional<TimePoint> deadline,
+                                   ContextPtr context) {
+    WaitAnyResult result;
+    const WaitManyResult many =
+        wait_many(requests, deadline, std::move(context));
+    result.status = many.status;
+    result.system_error = many.system_error;
+    if (many.ready_indices.empty()) {
+        return result;
+    }
+    result.index = many.ready_indices.front();
+    if (result.index < requests.size()) {
+        result.fd = requests[result.index].fd;
+        result.event = requests[result.index].event;
+    }
+    return result;
+}
+
+WaitAnyResult IOManager::wait_any_for(
+    const std::vector<WaitRequest>& requests, Duration timeout,
+    ContextPtr context) {
+    const auto now = Clock::now();
+    const auto remaining = TimePoint::max() - now;
+    const auto deadline = timeout <= Duration::zero()
+                              ? now
+                              : (timeout >= remaining ? TimePoint::max()
+                                                      : now + timeout);
+    return wait_any(requests, deadline, std::move(context));
+}
+
+WaitManyResult IOManager::wait_many_for(
+    const std::vector<WaitRequest>& requests, Duration timeout,
+    ContextPtr context) {
+    const auto now = Clock::now();
+    const auto remaining = TimePoint::max() - now;
+    const auto deadline = timeout <= Duration::zero()
+                              ? now
+                              : (timeout >= remaining ? TimePoint::max()
+                                                      : now + timeout);
+    return wait_many(requests, deadline, std::move(context));
+}
+
 bool IOManager::cancel(int fd, IOEvent event) {
     return event_mask(event) != 0 && m_state && m_state->cancel(fd, event);
 }
