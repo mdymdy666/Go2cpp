@@ -1097,11 +1097,11 @@ int nanosleep(const timespec* request, timespec* remaining) {
     return invoke_native_blocking(s_originals.m_nanosleep, request, remaining);
 }
 
-// 多路等待 API 暂时不在 IOManager 的单 fd 等待接口上伪造“任意
-// 就绪”语义。managed Fiber 进入显式 BlockingRegion，sysmon 可以为
-// 长时间 poll/select/epoll_wait 逻辑解绑原 M 并补充替代 M；普通线程和
-// 未参与调度的调用完全沿用 libc 行为。这样不会把一次等待错误地拆成
-// 多个顺序等待，也不会改变 timeout/EINTR/信号掩码等 ABI 细节。
+// poll/select/epoll_wait Hook 保持 libc ABI 和 timeout、EINTR、信号掩码、
+// revents 语义，不把一次多路等待偷偷拆成多个顺序等待。需要在 Fiber 中
+// 通过 epoll 注册多个 fd 并由任一事件唤醒时，显式调用 IOManager::WaitAny/
+// WaitMany；普通线程继续使用原生 poll/select，长时间 native 调用仍由
+// BlockingRegion/sysmon 记录其 M 状态。
 int poll(struct pollfd* descriptors, nfds_t count, int timeout) {
     initialize_originals();
     if (!s_originals.m_poll) {

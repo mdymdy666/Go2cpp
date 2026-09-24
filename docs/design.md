@@ -9,9 +9,21 @@ Boost.Context 栈式 Fiber 后端。公共名称位于 `go2cpp` 命名空间；0
 `GO2CPP_BUILD_HOOK`，以保证进程内只有一份 FD/TLS 注册表。
 
 调度、取消和等待不把 C++ 异常当作运行时控制流，也不使用 future、promise、
-`setjmp` 或 `longjmp`。panic/recover/defer 运行时目前不在本库范围内；用户回调
-抛出的普通 C++ 异常由 Fiber 边界捕获并记录到 `Fiber::failure()`，Task 通过
-失败状态报告。普通 `error` 不会隐式转换为异常或其他控制流。
+setjmp 或 longjmp。库提供显式的 RAII defer 和共享状态 panic/recover：它们
+用于可验证的错误发布与作用域清理，不尝试跳转或复制 C++ 挂起栈。用户回调抛出的
+普通 C++ 异常由 Fiber 边界捕获并记录到 Fiber::failure()，Task 通过失败状态报告；
+普通 error 不会隐式转换为异常或 panic。
+
+## 显式 defer、panic、recover
+
+defer 不可复制，构造时按值保存回调参数，析构或 run_now() 只执行一次；同一 C++
+作用域内的声明顺序决定逆序（LIFO）执行。回调内部通过 recover::take() 或
+operator() 消费已绑定 panic 的状态，回调外调用会返回空或 false。panic::call()
+只记录 PanicInfo（字符串、整数码或 std::any payload），不会执行 longjmp、抛出
+内部专用异常，也不会替用户结束当前函数。defer 回调中的普通 C++ 异常被捕获到
+当前线程的 LastDeferException()，不会穿过 noexcept 析构。因此这是一套显式状态
+协议，不是 Go 编译器隐式插入的栈帧展开；需要跨 Fiber 传递时应显式共享 panic
+对象并由目标 Fiber 的 defer 回调处理；库不保存 G/Fiber owner token，无法自动拒绝跨执行流 recover，用户必须自行绑定执行流。
 
 ## 所有权与生命周期
 
@@ -107,11 +119,10 @@ Context key 使用进程内 identity token，值是不可变 `std::any`；字符
 `Channel<T>` 使用互斥保护的 FIFO 缓冲、独立发送/接收等待队列和一次性
 `SelectWaitState`。容量 0/1/N、多生产者/消费者、close、取消、deadline、方向
 视图、select/default/timeout 都有状态结果。为保证接收和 select 的强异常安全，
-T 必须是不抛 move 构造且析构不抛的类型；select 还要求值可复制到
-`std::any`。close 唤醒所有等待者；缓冲排空后接收返回零值与 `ok=false`；
-发送已关闭 channel 返回 closed status，`Close()` 不抛异常。空 select 返回
-invalid，避免测试永久挂起。
-
+T 必须是不抛 move 构造且析构不抛的类型；内建 RecvCase/SendCase 还要求 T
+可复制。不可复制值可以通过普通 Send/Recv 或独立 SelectValue 传递，但放入
+Channel Select/EventBatch 会立即返回 kInvalid，不会登记一个无法回滚的等待者。
+close 唤醒所有等待者；缓冲排空后接收返回零值与 ok=false；
 `sync::Mutex`、`ConditionVariable`、`WaitGroup` 使用 FIFO 等待节点和 disarm gate。
 managed G 在等待前释放外部锁并 park，native 线程阻塞自己的 condition variable，
 两者共用同一移交队列，所以一个线程可以解锁由另一个 M 执行的 Fiber。没有 Scheduler
@@ -167,6 +178,10 @@ Fiber 栈仍是固定保护栈，尚未实现 Go 风格动态扩容。IOManager 
 `WaitAny/WaitMany`：每个请求对应一个带 generation 的 WaitNode，全部登记在
 同一个 epoll poller 中；任一节点完成时通过 Scheduler 的 pending-wake 交接唤醒
 当前 Fiber，返回 ready 请求索引，并对其余节点执行幂等取消。截止时间、Context
-取消和 `NotifyClose` 会完成整组节点，避免残留 waiter。`WaitMany` 返回同一轮已
+取消和 NotifyClose 会完成整组节点，避免残留 waiter。WaitMany 返回同一轮已
 完成的全部索引，而不是“等待所有请求”的屏障；需要屏障时使用 WaitGroup。
-该接口要求 managed Fiber；普通线程得到 `EPERM`，继续使用原生 `poll/select`。
+同一集合不得重复提交相同 fd/方向，重复项返回 EINVAL；注册过程中遇到无效 fd
+会取消已注册节点并返回整体错误。该接口要求 managed Fiber；普通线程得到 EPERM，
+继续使用原生 poll/select。
+
+SelectCaster 的函数对象可能被多个 Fiber 并发调用；若内部有可变状态，调用方必须自行加锁或为每个执行流创建独立实例。

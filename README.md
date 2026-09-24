@@ -12,7 +12,13 @@
   以及支持阻塞、关闭和 select 的类型化 channel；
 - Linux epoll `IOManager` 和默认启用、带 FD generation 关闭保护的 socket Hook；
 - 支持 `Is`、`As`、`Unwrap`、`Join` 的不可变错误链；
-- Fiber 边界捕获普通 C++ 异常并通过 `Fiber::failure()`/`Task::failure()` 报告；资源清理由 RAII 和 `try/catch` 负责。Go 的 panic/recover/defer 控制流不在当前范围内。
+- Fiber 边界捕获普通 C++ 异常并通过 Fiber::failure()/Task::failure() 报告；资源清理由 RAII 和 try/catch 负责。
+- 提供显式 defer、panic、recover 状态对象：defer 用 RAII 保证作用域退出的 LIFO 回调，
+  panic::call() 发布共享错误状态，recover::take() 只能在 defer 回调中消费；它不会伪造 C++ 栈跳转。
+- 独立的 SelectValue/SelectCaster 提供可替换的类型擦除中介；它可以承载不可
+  复制值并转换成业务类型。内建 Channel 的 RecvCase/SendCase 和 EventBatch
+  为保证等待节点可回滚，要求 T 可复制；move-only 值请使用普通 Send/Recv 或
+  直接使用 SelectValue。
 
 构建并运行默认测试套件：
 
@@ -67,7 +73,7 @@ go2cpp::shutdown_default_scheduler();
 采用锁保护和快照语义；批次对象仍须长于所有调用者，`stop()` 通过内部 Context 唤醒等待，并只发出协作式停止请求。
 
 转译代码需要完整公共接口时，包含 `go2cpp/runtime.hpp`。模块 target
-（`go2cpp::error`、`go2cpp::context`、`go2cpp::channel`、
+（`go2cpp::error`、`go2cpp::control_flow`、`go2cpp::context`、`go2cpp::channel`、
 `go2cpp::scheduler`、`go2cpp::fiber`、
 `go2cpp::sync`、`go2cpp::io`、`go2cpp::hook`）既可在源码树中单独使用，
 也会与 `go2cpp::runtime` umbrella target 一起导出。
@@ -79,3 +85,29 @@ go2cpp::shutdown_default_scheduler();
 cmake --build build --target go2cpp_beginner_demo
 ./build/go2cpp_beginner_demo
 ```
+## 显式控制流与类型转换
+
+    go2cpp::panic failure;
+    go2cpp::recover recovery(failure);
+    {
+        go2cpp::defer cleanup([&] {
+            if (auto info = recovery.take()) {
+                // 处理显式 panic 状态
+            }
+        });
+        failure.call("错误码", 7);
+        return;  // C++ 不会自动跳转，业务代码自行结束当前路径
+    }
+
+defer 的带参数构造会在注册时复制/移动参数；回调异常不会穿过析构函数，
+可通过 LastDeferException() 查询。SelectResult::TypedValue<T>() 和
+MakeCaster<From, To>() 用于把 channel/select 的类型擦除值转换成业务类型；
+move-only 结果使用 SelectResult::TakeValue<T>()；但 Channel Select/EventBatch
+不会对 move-only T 建立异步等待，调用会立即返回 kInvalid，避免静默挂起。
+panic/recover 是显式共享状态，库不验证 G/Fiber 身份，调用方应把它们限制在同一
+执行流中。
+
+## 多 FD 等待
+
+IOManager::WaitAnyFor() 和 WaitManyFor() 只在该 IOManager 的 managed Fiber
+中挂起并接入 epoll；普通线程返回 EPERM，应直接使用原生 poll/select。

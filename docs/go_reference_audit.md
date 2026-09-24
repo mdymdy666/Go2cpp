@@ -91,18 +91,26 @@ third_party/go1.23.0-full/
 - C++ 的 timeout、Context、取消和自定义 probe 是额外协议，不存在于 Go `chan.go` 的同一实现边界。
 - 通道对象生命周期由 C++ 调用方负责，不能依赖 Go GC 自动保活。
 
-### 4. defer / panic / recover（当前未实现）
+### 4. defer / panic / recover
 
 参考文件：
 
-- `third_party/go1.23.0-full/src/runtime/panic.go`
-- `third_party/go1.23.0-full/src/runtime/defer_test.go`
-- `third_party/go1.23.0-full/src/runtime/panic_test.go`
+- third_party/go1.23.0-full/src/runtime/panic.go
+- third_party/go1.23.0-full/src/runtime/defer_test.go
+- third_party/go1.23.0-full/src/runtime/panic_test.go
 
-当前 C++ 运行时不提供对应模块。Fiber 只在入口边界捕获普通 C++ 异常并
-通过 `Fiber::failure()` 报告；用户代码应使用 C++ RAII、`try/catch` 和显式
-错误返回。Go 编译器自动插入的 defer、runtime 栈展开、recover 边界和
-`panic(nil)` 均不在当前支持范围内。
+当前 C++ 实现：
+
+- include/go2cpp/control_flow.hpp
+- src/control_flow.cpp
+- tests/test_control_flow.cpp
+
+这里实现的是可测试的显式等价层，而不是 Go 编译器/runtime 的逐帧复制：
+
+- defer 是 RAII 对象，构造时保存参数，析构按作用域的逆序执行一次。
+- panic::call() 发布共享 PanicInfo；recover::take() 只在 defer 回调的活动边界内消费，普通 C++ 异常不会被它捕获。
+- 不使用 setjmp、longjmp、内部异常或强制栈展开；call() 后必须由调用者显式 return/分支。未消费状态不会自动让 Fiber 失败。
+- panic(nil)、编译器自动 defer、精确 G/栈帧 recover 和 Go 的 repanic 控制流仍不提供。共享状态可跨线程持有，但库不检查 G/Fiber owner；应用必须自行把 recover 绑定到负责该状态的 Fiber/执行流，否则不会得到 Go 的跨 goroutine 禁止 recover 语义。
 
 ### 5. error
 
@@ -135,7 +143,7 @@ third_party/go1.23.0-full/
 - 调度模型的 G/M/P 概念、runnable/waiting/dead 等状态意图。
 - Context 的父子取消、deadline、timeout、value、cause 语义目标。
 - Channel 的容量、FIFO、阻塞收发、关闭和 select 目标。
-- defer/panic/recover 仅保留为上游语义调研记录，未进入 C++ 运行时目标。
+- defer/panic/recover 已进入显式控制流模块，但不提供 Go 的隐式栈展开。
 - error 的包装、解包、身份判断和 Join 目标。
 
 这些是“语义目标”，不是 Go runtime 内部代码的证明性复刻。

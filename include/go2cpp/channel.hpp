@@ -20,6 +20,7 @@
 #include <optional>
 #include <random>
 #include <type_traits>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -47,6 +48,276 @@ ErrorPtr ChannelWouldBlockError() noexcept;
 ErrorPtr ChannelNilError() noexcept;
 ErrorPtr ChannelTimeoutError() noexcept;
 
+// SelectValue 是 select 结果使用的共享类型擦除载体。它不要求实际值可复制，
+// 用户可以通过 Get/Take 或 SelectCaster 将它转换成自己的业务类型。
+class SelectValue final {
+ private:
+  struct Concept {
+    virtual ~Concept() = default;
+    virtual const std::type_info& Type() const noexcept = 0;
+    virtual const void* Data() const noexcept = 0;
+    virtual void* MutableData() noexcept = 0;
+    virtual std::any ToAny() const = 0;
+  };
+
+  template <typename T>
+  struct Holder final : Concept {
+    template <typename U>
+    explicit Holder(U&& value) : value(std::forward<U>(value)) {}
+
+    const std::type_info& Type() const noexcept override { return typeid(T); }
+    const void* Data() const noexcept override { return &value; }
+    void* MutableData() noexcept override { return &value; }
+    std::any ToAny() const override {
+      if constexpr (std::is_copy_constructible<T>::value) {
+        return std::any(value);
+      } else {
+        return {};
+      }
+    }
+
+    T value;
+  };
+
+  // 兼容用户仍以 std::any 填充自定义 SelectProbe 的场景。类型信息
+  // 保留在 any 中，Caster 可通过 As<T>() 取回具体值。
+  struct AnyHolder final : Concept {
+    explicit AnyHolder(std::any input) : value(std::move(input)) {}
+
+    const std::type_info& Type() const noexcept override {
+      return value.has_value() ? value.type() : typeid(void);
+    }
+    const void* Data() const noexcept override { return nullptr; }
+    void* MutableData() noexcept override { return nullptr; }
+    std::any ToAny() const override { return value; }
+
+    std::any value;
+  };
+
+ public:
+  SelectValue() noexcept = default;
+
+  template <typename T>
+  static SelectValue From(T&& value) {
+    using ValueType = std::decay_t<T>;
+    SelectValue result;
+    result.m_value = std::make_shared<Holder<ValueType>>(
+        std::forward<T>(value));
+    return result;
+  }
+
+  static SelectValue FromAny(std::any value) {
+    if (!value.has_value()) {
+      return {};
+    }
+    SelectValue result;
+    result.m_value = std::make_shared<AnyHolder>(std::move(value));
+    return result;
+  }
+
+  bool HasValue() const noexcept { return static_cast<bool>(m_value); }
+  explicit operator bool() const noexcept { return HasValue(); }
+
+  const std::type_info& Type() const noexcept {
+    return m_value ? m_value->Type() : typeid(void);
+  }
+
+  template <typename T>
+  const std::decay_t<T>* Get() const noexcept {
+    using ValueType = std::decay_t<T>;
+    if (!m_value || m_value->Type() != typeid(ValueType)) {
+      return nullptr;
+    }
+    if (const auto* value = m_value->Data()) {
+      return static_cast<const ValueType*>(value);
+    }
+    if (const auto* any_holder = dynamic_cast<const AnyHolder*>(m_value.get())) {
+      return std::any_cast<ValueType>(&any_holder->value);
+    }
+    return nullptr;
+  }
+
+  template <typename T>
+  std::decay_t<T>* GetMutable() noexcept {
+    using ValueType = std::decay_t<T>;
+    if (!m_value || m_value->Type() != typeid(ValueType)) {
+      return nullptr;
+    }
+    if (auto* value = m_value->MutableData()) {
+      return static_cast<ValueType*>(value);
+    }
+    if (auto* any_holder = dynamic_cast<AnyHolder*>(m_value.get())) {
+      return std::any_cast<ValueType>(&any_holder->value);
+    }
+    return nullptr;
+  }
+
+  template <typename T>
+  std::optional<std::decay_t<T>> As() const {
+    using ValueType = std::decay_t<T>;
+    const auto* value = Get<ValueType>();
+    if (value) {
+      if constexpr (std::is_copy_constructible<ValueType>::value) {
+        try {
+          return *value;
+        } catch (...) {
+          return std::nullopt;
+        }
+      } else {
+        return std::nullopt;
+      }
+    }
+
+    // AnyHolder 没有可移植的 void* 访问，但 std::any_cast 能保留类型安全。
+    if constexpr (std::is_copy_constructible<ValueType>::value) {
+      try {
+        auto any_value = ToAny();
+        return std::any_cast<ValueType>(std::move(any_value));
+      } catch (...) {
+        return std::nullopt;
+      }
+    } else {
+      return std::nullopt;
+    }
+  }
+
+  template <typename T>
+  std::optional<std::decay_t<T>> Take() {
+    using ValueType = std::decay_t<T>;
+    if (m_value.use_count() != 1) {
+      return std::nullopt;
+    }
+    if (auto* value = GetMutable<ValueType>()) {
+      if constexpr (std::is_move_constructible<ValueType>::value) {
+        try {
+          return std::move(*value);
+        } catch (...) {
+          return std::nullopt;
+        }
+      } else {
+        return std::nullopt;
+      }
+    }
+
+    auto* any_holder = dynamic_cast<AnyHolder*>(m_value.get());
+    if (!any_holder) {
+      return std::nullopt;
+    }
+    if constexpr (std::is_move_constructible<ValueType>::value) {
+      if (auto* value = std::any_cast<ValueType>(&any_holder->value)) {
+        try {
+          auto result = std::move(*value);
+          any_holder->value.reset();
+          return result;
+        } catch (...) {
+          return std::nullopt;
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  // 仅用于兼容旧的 std::any 访问。不可复制对象会返回空 any。
+  std::any ToAny() const {
+    return m_value ? m_value->ToAny() : std::any{};
+  }
+
+ private:
+  std::shared_ptr<Concept> m_value;
+};
+
+class SelectCaster {
+ public:
+  virtual ~SelectCaster() = default;
+
+  // 工厂转换器会把用户函数异常转换为空值；自定义实现也应返回失败值，
+  // 不要把异常带入 select 状态机。SelectResult::Cast 还会做最后一道隔离。
+  virtual SelectValue Cast(const SelectValue& source) const = 0;
+
+  template <typename From, typename To, typename Function>
+  static std::shared_ptr<const SelectCaster> Create(Function&& function);
+};
+
+using Caster = SelectCaster;
+
+template <typename From, typename To, typename Function>
+std::shared_ptr<const SelectCaster> MakeSelectCaster(Function&& function) {
+  return SelectCaster::Create<From, To>(std::forward<Function>(function));
+}
+
+template <typename From, typename To, typename Function>
+std::shared_ptr<const SelectCaster> MakeCaster(Function&& function) {
+  return MakeSelectCaster<From, To>(std::forward<Function>(function));
+}
+
+namespace detail {
+
+template <typename T>
+struct IsOptional : std::false_type {};
+
+template <typename T>
+struct IsOptional<std::optional<T>> : std::true_type {};
+
+template <typename From, typename To, typename Function>
+class FunctionSelectCaster final : public SelectCaster {
+ public:
+  explicit FunctionSelectCaster(Function&& function)
+      : m_function(std::forward<Function>(function)) {}
+
+  SelectValue Cast(const SelectValue& source) const override {
+    try {
+      const auto* input = source.Get<From>();
+      std::optional<From> copied_input;
+      if (!input) {
+        if constexpr (!std::is_copy_constructible<From>::value) {
+          return {};
+        } else {
+          copied_input = source.As<From>();
+          if (!copied_input.has_value()) {
+            return {};
+          }
+          input = &*copied_input;
+        }
+      }
+      using Result = std::invoke_result_t<Function&, const From&>;
+      if constexpr (std::is_same<std::decay_t<Result>, SelectValue>::value) {
+        return m_function(*input);
+      } else if constexpr (IsOptional<std::decay_t<Result>>::value) {
+        auto converted = m_function(*input);
+        if (!converted.has_value()) {
+          return {};
+        }
+        return SelectValue::From(std::move(*converted));
+      } else {
+        static_assert(std::is_constructible<To, Result>::value,
+                      "SelectCaster result must construct the target type");
+        return SelectValue::From(To(m_function(*input)));
+      }
+    } catch (...) {
+      return {};
+    }
+  }
+
+ private:
+  mutable Function m_function;
+};
+
+template <typename From, typename To, typename Function>
+std::shared_ptr<const SelectCaster> MakeFunctionSelectCaster(
+    Function&& function) {
+  using FunctionType = std::decay_t<Function>;
+  return std::make_shared<FunctionSelectCaster<From, To, FunctionType>>(
+      std::forward<Function>(function));
+}
+
+}  // namespace detail
+
+template <typename From, typename To, typename Function>
+std::shared_ptr<const SelectCaster> SelectCaster::Create(Function&& function) {
+  return detail::MakeFunctionSelectCaster<From, To>(
+      std::forward<Function>(function));
+}
+
 struct ChannelSendResult {
   ChannelStatus status{ChannelStatus::kInvalid};
   ErrorPtr error;
@@ -69,8 +340,42 @@ struct SelectProbe {
   bool ready{false};
   bool ok{false};
   std::any value;
+  SelectValue typed_value;
   ChannelStatus status{ChannelStatus::kWouldBlock};
   ErrorPtr error;
+
+  template <typename T>
+  bool SetValue(T&& input) noexcept {
+    try {
+      typed_value = SelectValue::From(std::forward<T>(input));
+      try {
+        value = typed_value.ToAny();
+      } catch (...) {
+        value.reset();
+      }
+      return typed_value.HasValue();
+    } catch (...) {
+      value.reset();
+      typed_value = {};
+      return false;
+    }
+  }
+
+  bool SetAny(std::any input) noexcept {
+    try {
+      typed_value = SelectValue::FromAny(std::move(input));
+      try {
+        value = typed_value.ToAny();
+      } catch (...) {
+        value.reset();
+      }
+      return typed_value.HasValue();
+    } catch (...) {
+      value.reset();
+      typed_value = {};
+      return false;
+    }
+  }
 };
 
 struct SelectCase;
@@ -195,8 +500,20 @@ class SelectWaitState final {
       return false;
     }
     *index = m_index;
-    // If std::any copying fails, leave the selection consumable for a retry.
-    SelectProbe copy = m_probe;
+    // std::any 的复制可能失败；typed_value 使用共享载体，可以在这种
+    // 情况下仍然把选择结果交给用户的 Caster。
+    SelectProbe copy;
+    copy.ready = m_probe.ready;
+    copy.ok = m_probe.ok;
+    copy.status = m_probe.status;
+    copy.error = m_probe.error;
+    // Take 只允许成功一次，直接移动共享载体，保留 move-only 结果的所有权。
+    copy.typed_value = std::move(m_probe.typed_value);
+    try {
+      copy.value = m_probe.value;
+    } catch (...) {
+      copy.value.reset();
+    }
     *probe = std::move(copy);
     m_taken = true;
     return true;
@@ -433,7 +750,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         probe.ready = true;
         probe.ok = true;
         probe.status = ChannelStatus::kReady;
-        probe.value = m_buffer.front();
+        if (!probe.SetValue(m_buffer.front())) {
+          return false;
+        }
         if (!state->TrySelect(index, std::move(probe))) {
           return false;
         }
@@ -469,7 +788,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           recv_probe.ready = true;
           recv_probe.ok = true;
           recv_probe.status = ChannelStatus::kReady;
-          recv_probe.value = sender->value;
+          if (!recv_probe.SetValue(sender->value)) {
+            return false;
+          }
           SelectProbe send_probe;
           send_probe.ready = true;
           send_probe.ok = true;
@@ -501,7 +822,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         probe.ready = true;
         probe.ok = true;
         probe.status = ChannelStatus::kReady;
-        probe.value = sender->value;
+        if (!probe.SetValue(sender->value)) {
+          return false;
+        }
         if (!state->TrySelect(index, std::move(probe))) {
           return false;
         }
@@ -579,7 +902,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           recv_probe.ok = true;
           recv_probe.status = ChannelStatus::kReady;
           try {
-            recv_probe.value = value;
+            if (!recv_probe.SetValue(value)) {
+              return false;
+            }
           } catch (...) {
             return false;
           }
@@ -816,7 +1141,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           probe.ready = true;
           probe.ok = true;
           try {
-            probe.value = value;
+            if (!probe.SetValue(value)) {
+              return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+            }
           } catch (...) {
             // 值复制失败时保留接收节点，后续发送仍可重试。
             return {ChannelStatus::kInvalid, detail::ValueOperationError()};
@@ -1360,9 +1687,13 @@ struct SelectCase {
                      std::size_t)>
       arm;
   std::function<void(const std::shared_ptr<detail::SelectWaitState>&)> disarm;
+  // 内建 Channel Select 对不可复制 T 先显式拒绝，避免 arm 失败后永久等待。
+  // 独立 SelectValue 仍可承载 move-only 值。
+  bool unsupported{false};
 
   explicit operator bool() const noexcept {
-    return static_cast<bool>(probe) || is_default || static_cast<bool>(arm);
+    return static_cast<bool>(probe) || is_default || static_cast<bool>(arm) ||
+           unsupported;
   }
 };
 
@@ -1375,102 +1706,174 @@ struct SelectResult {
   std::any value;
   ChannelStatus status{ChannelStatus::kWouldBlock};
   ErrorPtr error;
+  SelectValue typed_value;
+
+  SelectResult() = default;
+  SelectResult(std::size_t result_index, bool result_selected,
+               bool result_ok, std::any result_value,
+               ChannelStatus result_status, ErrorPtr result_error,
+               SelectValue result_typed_value = {})
+      : index(result_index),
+        selected(result_selected),
+        ok(result_ok),
+        value(std::move(result_value)),
+        status(result_status),
+        error(std::move(result_error)),
+        typed_value(std::move(result_typed_value)) {}
 
   explicit operator bool() const noexcept { return selected; }
 
   template <typename T>
-  std::optional<T> Value() const {
-    if (!value.has_value()) {
+  std::optional<std::decay_t<T>> Value() const {
+    using ValueType = std::decay_t<T>;
+    // std::any 只能保存可复制值；对 move-only 类型不要实例化
+    // std::any_cast<T>()，调用方可使用 SelectResult::TakeValue<T>()。
+    if constexpr (!std::is_copy_constructible<ValueType>::value) {
+      return std::nullopt;
+    } else {
+      if (!value.has_value()) {
+        return typed_value.As<ValueType>();
+      }
+      try {
+        return std::any_cast<ValueType>(value);
+      } catch (...) {
+        return typed_value.As<ValueType>();
+      }
+    }
+  }
+
+  const SelectValue& ValueObject() const noexcept { return typed_value; }
+
+  template <typename T>
+  std::optional<std::decay_t<T>> TypedValue() const {
+    return typed_value.As<T>();
+  }
+
+  template <typename T>
+  std::optional<std::decay_t<T>> TakeValue() {
+    return typed_value.Take<T>();
+  }
+
+  template <typename T>
+  std::optional<T> Cast(const SelectCaster& caster) const {
+    if (!typed_value.HasValue()) {
       return std::nullopt;
     }
     try {
-      return std::any_cast<T>(value);
-    } catch (const std::bad_any_cast&) {
+      return caster.Cast(typed_value).As<T>();
+    } catch (...) {
       return std::nullopt;
     }
+  }
+
+  template <typename T>
+  std::optional<T> Cast(
+      const std::shared_ptr<const SelectCaster>& caster) const {
+    if (!caster) {
+      return std::nullopt;
+    }
+    return Cast<T>(*caster);
   }
 };
 
 template <typename T>
 SelectCase RecvCase(const ChannelPtr<T>& channel) {
-  return SelectCase{[channel] {
-                      if (!channel) {
-                        SelectProbe probe;
-                        probe.ready = true;
-                        probe.status = ChannelStatus::kNil;
-                        probe.error = ChannelNilError();
-                        return probe;
-                      }
-                      auto result = channel->TryRecv();
-                      if (!result.ready) {
-                        return SelectProbe{};
-                      }
-                      SelectProbe probe;
-                      probe.ready = true;
-                      probe.ok = result.ok;
-                      probe.status = result.status;
-                      probe.error = result.error;
-                      if (result.value.has_value()) {
-                        probe.value = std::move(*result.value);
-                      }
-                      return probe;
-                    },
-                    false,
-                    [channel](const std::shared_ptr<detail::SelectWaitState>&
-                                  state,
-                              std::size_t index) {
-                      if (channel) {
-                        channel->ArmSelectRecv(state, index);
-                      }
-                    },
-                    [channel](const std::shared_ptr<detail::SelectWaitState>&
-                                  state) {
-                      if (channel) {
-                        channel->DisarmSelect(state);
-                      }
-                    }};
+  SelectCase result{
+      [channel] {
+        if (!channel) {
+          SelectProbe probe;
+          probe.ready = true;
+          probe.status = ChannelStatus::kNil;
+          probe.error = ChannelNilError();
+          return probe;
+        }
+        auto value = channel->TryRecv();
+        if (!value.ready) {
+          return SelectProbe{};
+        }
+        SelectProbe probe;
+        probe.ready = true;
+        probe.ok = value.ok;
+        probe.status = value.status;
+        probe.error = value.error;
+        if (value.value.has_value()) {
+          if (!probe.SetValue(std::move(*value.value))) {
+            probe.ready = true;
+            probe.status = ChannelStatus::kInvalid;
+            probe.error = detail::ValueOperationError();
+          }
+        }
+        return probe;
+      },
+      false,
+      [channel](const std::shared_ptr<detail::SelectWaitState>& state,
+                std::size_t index) {
+        if (channel) {
+          channel->ArmSelectRecv(state, index);
+        }
+      },
+      [channel](const std::shared_ptr<detail::SelectWaitState>& state) {
+        if (channel) {
+          channel->DisarmSelect(state);
+        }
+      }};
+  result.unsupported = !std::is_copy_constructible<T>::value;
+  return result;
 }
-
 template <typename T>
 SelectCase SendCase(const ChannelPtr<T>& channel, T value) {
-  // Select send cases require a copyable value because failed probes must leave
-  // the value available for a later round.
+  // 失败的 probe 还要保留发送值，因此内建 select 只接受可复制 T。
   auto shared_value = std::make_shared<T>(std::move(value));
-  return SelectCase{[channel, shared_value] {
-                      if (!channel) {
-                        SelectProbe probe;
-                        probe.ready = true;
-                        probe.status = ChannelStatus::kNil;
-                        probe.error = ChannelNilError();
-                        return probe;
-                      }
-                      auto result = channel->TrySend(*shared_value);
-                      if (result.status == ChannelStatus::kWouldBlock) {
-                        return SelectProbe{};
-                      }
-                      SelectProbe probe;
-                      probe.ready = true;
-                      probe.ok = result.Ok();
-                      probe.status = result.status;
-                      probe.error = result.error;
-                      return probe;
-                    },
-                    false,
-                    [channel, shared_value](
-                        const std::shared_ptr<detail::SelectWaitState>& state,
-                        std::size_t index) {
-                      if (channel) {
-                        channel->ArmSelectSend(state, index, *shared_value);
-                      }
-                    },
-                    [channel](const std::shared_ptr<detail::SelectWaitState>&
-                                  state) {
-                      if (channel) {
-                        channel->DisarmSelect(state);
-                      }
-                    }};
+  SelectCase result{
+      [channel, shared_value] {
+        if constexpr (!std::is_copy_constructible<T>::value) {
+          SelectProbe probe;
+          probe.ready = true;
+          probe.status = ChannelStatus::kInvalid;
+          probe.error = detail::ValueOperationError();
+          return probe;
+        } else {
+          if (!channel) {
+            SelectProbe probe;
+            probe.ready = true;
+            probe.status = ChannelStatus::kNil;
+            probe.error = ChannelNilError();
+            return probe;
+          }
+          auto send_result = channel->TrySend(*shared_value);
+          if (send_result.status == ChannelStatus::kWouldBlock) {
+            return SelectProbe{};
+          }
+          SelectProbe probe;
+          probe.ready = true;
+          probe.ok = send_result.Ok();
+          probe.status = send_result.status;
+          probe.error = send_result.error;
+          return probe;
+        }
+      },
+      false,
+      [channel, shared_value](
+          const std::shared_ptr<detail::SelectWaitState>& state,
+          std::size_t index) {
+        if constexpr (std::is_copy_constructible<T>::value) {
+          if (channel) {
+            channel->ArmSelectSend(state, index, *shared_value);
+          }
+        } else {
+          (void)channel;
+          (void)state;
+          (void)index;
+        }
+      },
+      [channel](const std::shared_ptr<detail::SelectWaitState>& state) {
+        if (channel) {
+          channel->DisarmSelect(state);
+        }
+      }};
+  result.unsupported = !std::is_copy_constructible<T>::value;
+  return result;
 }
-
 template <typename T>
 SelectCase RecvCase(const RecvOnlyChannel<T>& channel) {
   return RecvCase(channel.m_channel);

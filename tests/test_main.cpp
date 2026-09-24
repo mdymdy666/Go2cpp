@@ -5,6 +5,7 @@
 #include <string_view>
 
 void run_error_tests();
+void run_control_flow_tests();
 void run_context_tests();
 void run_channel_tests();
 void run_scheduler_tests();
@@ -24,6 +25,7 @@ int main() {
         return filter.empty() || filter == name;
     };
     if (selected("error")) run_error_tests();
+    if (selected("control_flow") || selected("defer")) run_control_flow_tests();
     if (selected("context")) run_context_tests();
     if (selected("channel")) run_channel_tests();
     if (selected("scheduler")) run_scheduler_tests();

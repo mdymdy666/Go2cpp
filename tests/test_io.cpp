@@ -22,6 +22,12 @@ using go2cpp::IOWaitStatus;
 
 bool wait_until(const std::atomic<bool>& flag,
                 std::chrono::milliseconds timeout = 2s) {
+#if defined(GO2CPP_TEST_HAS_VALGRIND)
+    // Memcheck 会显著放大 Fiber/epoll 调度时间，但 watchdog 仍必须有界。
+    if (RUNNING_ON_VALGRIND) {
+        timeout *= 10;
+    }
+#endif
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (!flag.load(std::memory_order_acquire) &&
            std::chrono::steady_clock::now() < deadline) {
@@ -34,6 +40,22 @@ bool make_pair(int (&fds)[2]) {
     return ::socketpair(AF_UNIX,
                         SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
                         0, fds) == 0;
+}
+
+bool wait_for_task_state(const std::shared_ptr<go2cpp::Task>& task,
+                         go2cpp::GState expected,
+                         std::chrono::milliseconds timeout = 2s) {
+#if defined(GO2CPP_TEST_HAS_VALGRIND)
+    if (RUNNING_ON_VALGRIND) {
+        timeout *= 10;
+    }
+#endif
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (task && task->state() != expected &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(100us);
+    }
+    return task && task->state() == expected;
 }
 
 void raw_close(int fd) {
@@ -390,8 +412,7 @@ void test_wait_any_and_wait_many() {
         any_result = manager.WaitAnyFor(requests, 1s);
         any_done.store(true, std::memory_order_release);
     });
-    (void)any_task;
-    std::this_thread::sleep_for(2ms);
+    GO2CPP_CHECK(wait_for_task_state(any_task, go2cpp::GState::Waiting));
     const char one = '1';
     GO2CPP_CHECK(::syscall(SYS_write, second[1], &one, 1) == 1);
     GO2CPP_CHECK(wait_until(any_done));
@@ -405,20 +426,46 @@ void test_wait_any_and_wait_many() {
 
     const char first_byte = 'a';
     const char second_byte = 'b';
-    GO2CPP_CHECK(::syscall(SYS_write, first[1], &first_byte, 1) == 1);
-    GO2CPP_CHECK(::syscall(SYS_write, second[1], &second_byte, 1) == 1);
     std::atomic<bool> many_done{false};
     go2cpp::IOWaitManyResult many_result;
     auto many_task = manager.Go([&] {
         many_result = manager.WaitManyFor(requests, 1s);
         many_done.store(true, std::memory_order_release);
     });
-    (void)many_task;
+    GO2CPP_CHECK(wait_for_task_state(many_task, go2cpp::GState::Waiting));
+    GO2CPP_CHECK(::syscall(SYS_write, first[1], &first_byte, 1) == 1);
+    GO2CPP_CHECK(::syscall(SYS_write, second[1], &second_byte, 1) == 1);
     GO2CPP_CHECK(wait_until(many_done));
     GO2CPP_CHECK(many_result.ready());
     GO2CPP_CHECK(many_result.ready_indices.size() == 2);
     GO2CPP_CHECK(many_result.ready_indices[0] == 0);
     GO2CPP_CHECK(many_result.ready_indices[1] == 1);
+
+    std::atomic<bool> duplicate_done{false};
+    manager.Go([&] {
+        const std::vector<go2cpp::IOWaitRequest> duplicate{
+            {first[0], IOEvent::kRead, {}},
+            {first[0], IOEvent::kRead, {}},
+        };
+        const auto duplicate_result = manager.WaitManyFor(duplicate, 10ms);
+        GO2CPP_CHECK(duplicate_result.status == IOWaitStatus::kError);
+        GO2CPP_CHECK(duplicate_result.system_error == EINVAL);
+        duplicate_done.store(true, std::memory_order_release);
+    });
+    GO2CPP_CHECK(wait_until(duplicate_done));
+
+    std::atomic<bool> invalid_done{false};
+    manager.Go([&] {
+        const std::vector<go2cpp::IOWaitRequest> mixed_invalid{
+            {first[0], IOEvent::kRead, {}},
+            {-1, IOEvent::kRead, {}},
+        };
+        const auto invalid_result = manager.WaitManyFor(mixed_invalid, 10ms);
+        GO2CPP_CHECK(invalid_result.status == IOWaitStatus::kError);
+        GO2CPP_CHECK(invalid_result.system_error == EBADF);
+        invalid_done.store(true, std::memory_order_release);
+    });
+    GO2CPP_CHECK(wait_until(invalid_done));
 
     const auto native_result = manager.WaitAnyFor(requests, 1ms);
     GO2CPP_CHECK(native_result.status == IOWaitStatus::kError);

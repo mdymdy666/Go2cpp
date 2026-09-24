@@ -21,6 +21,8 @@ namespace go2cpp {
 // 报告结果。这样等待会经过 ParkingCondition，Fiber 不会占住 M。
 // 对象必须一直存活到所有 work/bind/add_event 调用返回；stop() 会唤醒等待，
 // 但只走协作式返回路径，不会强制销毁仍在等待的 Fiber 栈。
+// Handler 接收 const SelectResult&，并且内部保存的是并发安全快照；因此
+// move-only 结果只能通过 SelectValue::Get<T>() 观察，不能在 Handler 中 Take.
 class EventBatch final {
     struct StopControl final {
         ContextPtr context;

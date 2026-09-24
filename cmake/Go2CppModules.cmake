@@ -11,6 +11,7 @@ if (GO2CPP_BUILD_HOOK AND NOT BUILD_SHARED_LIBS)
 endif()
 
 add_library(go2cpp_error ${CMAKE_CURRENT_SOURCE_DIR}/src/error.cpp)
+add_library(go2cpp_control_flow ${CMAKE_CURRENT_SOURCE_DIR}/src/control_flow.cpp)
 add_library(go2cpp_context ${CMAKE_CURRENT_SOURCE_DIR}/src/context.cpp)
 add_library(go2cpp_channel ${CMAKE_CURRENT_SOURCE_DIR}/src/channel.cpp)
 add_library(go2cpp_scheduler
@@ -35,6 +36,7 @@ add_library(go2cpp_runtime INTERFACE)
 add_library(go2cpp::runtime ALIAS go2cpp_runtime)
 
 set_target_properties(go2cpp_error PROPERTIES EXPORT_NAME error)
+set_target_properties(go2cpp_control_flow PROPERTIES EXPORT_NAME control_flow)
 set_target_properties(go2cpp_context PROPERTIES EXPORT_NAME context)
 set_target_properties(go2cpp_channel PROPERTIES EXPORT_NAME channel)
 set_target_properties(go2cpp_scheduler PROPERTIES EXPORT_NAME scheduler)
@@ -51,6 +53,7 @@ set_target_properties(go2cpp_runtime PROPERTIES EXPORT_NAME runtime)
 # are not a second library or ABI; they only make add_subdirectory consumers
 # use the same names as find_package consumers.
 add_library(go2cpp::error ALIAS go2cpp_error)
+add_library(go2cpp::control_flow ALIAS go2cpp_control_flow)
 add_library(go2cpp::context ALIAS go2cpp_context)
 add_library(go2cpp::channel ALIAS go2cpp_channel)
 add_library(go2cpp::scheduler ALIAS go2cpp_scheduler)
@@ -64,6 +67,7 @@ endif()
 
 set(GO2CPP_MODULE_TARGETS
     go2cpp_error
+    go2cpp_control_flow
     go2cpp_context
     go2cpp_channel
     go2cpp_scheduler
@@ -114,7 +118,7 @@ if (TARGET go2cpp_hook)
                           ${CMAKE_DL_LIBS})
 endif()
 target_link_libraries(go2cpp_runtime INTERFACE
-    go2cpp_error go2cpp_context go2cpp_channel go2cpp_scheduler
+    go2cpp_error go2cpp_control_flow go2cpp_context go2cpp_channel go2cpp_scheduler
     go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io
     Threads::Threads)
 if (TARGET go2cpp_hook)

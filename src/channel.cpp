@@ -54,6 +54,12 @@ SelectResult Select(const std::vector<SelectCase>& cases,
   bool has_default = false;
   bool has_usable_case = false;
   for (const auto& item : cases) {
+    if (item.unsupported) {
+      return {SelectResult::kNoSelection, false, false, {},
+              ChannelStatus::kInvalid,
+              NewError("channel select 不支持不可复制值；请直接使用 Send/Recv "
+                       "或 SelectValue")};
+    }
     has_default = has_default || item.is_default;
     has_usable_case = has_usable_case || item.is_default ||
                       static_cast<bool>(item.probe) ||
@@ -102,7 +108,7 @@ SelectResult Select(const std::vector<SelectCase>& cases,
       }
       if (probe.ready) {
         return {index, true, probe.ok, std::move(probe.value), probe.status,
-                std::move(probe.error)};
+                std::move(probe.error), std::move(probe.typed_value)};
       }
     }
 
@@ -178,7 +184,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
               selected_probe.ok,
               std::move(selected_probe.value),
               selected_probe.status,
-              std::move(selected_probe.error)};
+              std::move(selected_probe.error),
+              std::move(selected_probe.typed_value)};
     }
     if (take_failed) {
       wait_state->Cancel();
@@ -311,7 +318,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
               selected_probe.ok,
               std::move(selected_probe.value),
               selected_probe.status,
-              std::move(selected_probe.error)};
+              std::move(selected_probe.error),
+              std::move(selected_probe.typed_value)};
     }
     if (context && context->IsDone()) {
       const auto err = context->Err();

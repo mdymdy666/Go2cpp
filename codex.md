@@ -1,3 +1,10 @@
+> 当前快照（2026-09-24）：在此前删除旧 panic_defer 模块后，新增
+> control_flow 模块。它提供 RAII defer、显式 panic/recover 状态和
+> LastDeferException()；这是可验证的 C++ 等价协议，不是 Go 编译器级自动
+> 栈展开。Channel select 新增 SelectValue/SelectCaster/SetAny，IOManager
+> 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
+> 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
+>
 > 当前快照说明（2026-09-23）：以下早期记录是追加式审计历史，其中的
 > panic/defer/recover 示例和模块名称不代表当前 API。当前源码已删除
 > `panic_defer` 模块、`SendOrPanic`/`CloseOrPanic` 和对应测试；Fiber 只
@@ -467,3 +474,45 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
 - 当前源码重编译后的 Hook/Fiber/dynamic 过滤器各 5/5，通过 Hook 9/9、Release 8/8、Werror 2/2、Clang 2/2、ASan 2/2、UBSan 2/2；TSan 在 setarch x86_64 -R 下当前全量单次通过，无 race 报告。
 - WSL + TSan 重复全套仍可能在不同 native waiter watchdog 超时，不能据此宣称重复稳定；这属于测试环境风险，生产实现未通过放宽同步语义来掩盖。
 - 最新 Memcheck 为 build-sysmon-hook/valgrind-final-current.log，definite/indirect/possible lost 均为 0，416B 为已有进程级 reachable 状态。
+
+## 2026-09-24：显式控制流、Caster 与多 FD 等价层
+
+- 新增 control_flow 模块：defer 是不可复制 RAII 对象，构造参数按值保存，析构或
+  run_now() 按 C++ 作用域逆序执行一次；panic/recover 使用共享 PanicInfo 状态，
+  recover 只在 defer 回调边界消费，回调异常通过 LastDeferException() 查询。
+- 恢复旧 panic_defer 模块并不安全，因此没有使用 longjmp、信号异常或 C++ 内部
+  异常伪造 Go 栈跳转。该模块是显式状态协议，调用者必须在 call() 后自行 return
+  或分支；普通 C++ 异常、Fiber failure 和 error 保持独立。
+- Channel select 增加 SelectValue、SelectCaster、MakeCaster、SetAny 和栈对象
+  Cast 重载；std::any 仍保持兼容字段，不可复制源值可通过共享 holder 访问。
+- IOManager 增加 WaitAny/WaitMany 及 timeout/cancel/close 组合；多个请求登记到
+  epoll，普通线程明确返回 EPERM。修复一次多 FD readiness 竞态：Fiber 恢复前用
+  零超时 poll 汇总仍就绪节点，再执行其余 waiter 清理。
+- 本轮 Debug CTest 为 10/10；更多 Release、Werror、ASan、UBSan、Valgrind
+  结果在 docs/testing.md 追加，未把 WSL 环境限制冒充 sanitizer 通过。
+
+已知边界：recover 不提供 Go 编译器级 G/栈帧隔离，panic 不自动终止 Fiber 或展开
+外层 defer；SelectCaster 的可变函数对象需要调用方自行保证并发安全；固定 Fiber 栈
+仍未实现 Go 式动态扩容；poll/select Hook 保持 libc ABI，不自动改写为 WaitMany。
+
+
+## 2026-09-24 最终边界复核
+
+- defer/panic/recover 增加显式状态协议测试：参数注册时保存、LIFO、run_once/dismiss、普通异常作用域展开、回调异常记录、Caster 异常隔离和线程边界。
+- SelectResult::Value<T>() 对不可复制 T 不再实例化 std::any_cast；新增 TakeValue<T>()，避免 move-only 类型的编译期断言。
+- WaitMany 的补采样改为只完成 fd/方向队列头节点，并拒绝同一集合内重复 fd/方向；新增混合无效 fd 回归，保持外部 waiter FIFO。
+- Debug 10/10、Werror 10/10、Release 9/9、ASan/UBSan 全组通过；Valgrind 完整套件 416B/4 blocks still reachable，definite/indirect/possible 均 0，ERROR SUMMARY 0。
+- TSan 在 setarch 下四个过滤用例通过；完整套件在 WSL 120 秒 watchdog 超时，未宣称全量通过。
+- 已知语义边界仍保留：panic 不自动展开 C++ 栈，recover 不绑定 G/Fiber owner，固定 Fiber 栈无 Go 式动态增长，WaitAny/WaitMany 仅 managed Fiber 可用。
+## 2026-09-24 最终修复记录
+
+- 修改内容：为 WaitMany 增加完整请求集合预校验，避免在部分 epoll 节点已发布后才发现无效 FD；修复 Memcheck 下混合无效 FD 的顺序竞态。
+- 修改内容：SelectWaitState::Take 直接移动 typed holder；内建 Channel Select 对不可复制元素明确返回 kInvalid，普通 Send/Recv 与独立 SelectValue 保留 move-only 支持。
+- 验证：Debug CTest 10/10、Werror CTest 10/10、Release CTest 9/9；ASan/UBSan 全量测试通过。
+- 验证：Valgrind Memcheck 完整套件 ERROR SUMMARY 0，definite/indirect/possible lost 均为 0，416 bytes/4 blocks still reachable。
+- 验证：TSan 在 setarch 下 control_flow、io、channel、scheduler_smoke 四个过滤用例通过；完整套件仍受 WSL watchdog 限制，未宣称全量通过。
+- 后续状态：构建目录和测试日志已清理，本轮提交已完成。固定 Fiber 栈、显式 panic/recover 协议、managed Fiber 专用 WaitAny/WaitMany 和 Caster 并发责任仍属于兼容性边界。
+
+- 示例补充：新增 example/io_wait_many_demo.cpp，展示两个 socket FD 的 WaitManyFor
+  和 WaitAnyFor；Hook-on Debug/Werror 各 11/11，Hook-off Release 10/10，直接运行
+  输出 wait-many=true。

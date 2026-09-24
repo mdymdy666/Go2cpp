@@ -383,3 +383,43 @@ WSL + Boost.Context 偶发的 `unexpected memory mapping` 已在本轮绕过地�
 - Valgrind Memcheck：`LD_LIBRARY_PATH=build-final-release valgrind --tool=memcheck --leak-check=full --show-leak-kinds=definite,indirect,possible --error-exitcode=99 --log-file=build-final-release/valgrind-final.log build-final-release/go2cpp_tests`，ERROR SUMMARY 0；definite/indirect/possible 均为 0；416 bytes/4 blocks 仍可达，属于 FiberLocal/TimerService 进程级状态。
 - TSan：普通启动仍在当前 WSL 失败于 `unexpected memory mapping`；`setarch x86_64 -R` 启动可运行 scheduler/fiber 过滤，但最终 sync 过滤在 `tests/test_sync.cpp:158` 的 native waiter watchdog 超时，未产生 race 报告。因此本次不宣称 TSan 全量通过，native Linux 仍需作为发布门槛。
 - 构建期间仅见 WSL 挂载时间偏差的 clock skew 警告，不影响上述退出码和测试结果。
+
+## 2026-09-24 显式控制流、Caster 与多 FD 复测
+
+以下命令在 /UserData/CodexWorkSpace/Go2Cpp 执行：
+
+- cmake -S . -B build-check -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_BUILD_EXAMPLES=ON -DGO2CPP_BUILD_HOOK=ON -DCMAKE_BUILD_TYPE=Debug
+- cmake --build build-check --parallel 4
+- ctest --test-dir build-check --output-on-failure --timeout 60：10/10 通过，包含 go2cpp_tests、scheduler smoke、全部示例和 control_flow_demo。
+- GO2CPP_TEST_FILTER=control_flow ./build-check/go2cpp_tests：defer LIFO、注册时参数保存、显式 panic/recover、回调异常隔离、线程隔离和 Caster 通过。
+- GO2CPP_TEST_FILTER=io ./build-check/go2cpp_tests：WaitAny/WaitMany 的 ready、timeout、cancel、close、普通线程 EPERM 和 FD generation 用例通过。
+- WaitMany 曾暴露“第一个 epoll 回调先恢复 Fiber、第二个已就绪 fd 被 cleanup 取消”的竞态；现已增加零超时 readiness 汇总并重跑上述套件通过。
+
+控制流模块不使用 setjmp/longjmp 或内部 C++ 异常；panic::call() 是显式状态发布，
+不是自动栈展开。WaitAny/WaitMany 只服务 managed Fiber，普通线程仍使用原生
+poll/select。后续 sanitizer 和 Memcheck 结果以本节追加记录为准。
+
+
+### 最终复核补充（同一工作树）
+
+- Werror Debug：cmake --build build-werror-new --parallel 4，CTest 10/10 通过。
+- Release Hook-off：cmake --build build-release-new --parallel 4，CTest 9/9 通过。
+- ASan：ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./build-asan-new/go2cpp_tests，全组通过。
+- UBSan：UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 ./build-ubsan-new/go2cpp_tests，全组通过。
+- Valgrind Memcheck：build-check/valgrind-control-flow-final-2.log，完整套件通过；in use at exit 为 416 bytes/4 blocks，definite/indirect/possible lost 均为 0，ERROR SUMMARY 为 0。
+- TSan：setarch x86_64 -R 下 control_flow、io、channel、scheduler_smoke 四个过滤分别通过；完整套件在当前 WSL 120 秒 watchdog 内无可用输出并以 124 超时，因此不宣称 TSan 全量通过，native Linux 仍是发布门槛。
+- 为避免 Memcheck 下启动放大造成假失败，IO 用例先等待任务进入 GState::Waiting 再写入测试 fd；同时增加重复 fd/方向和混合无效 fd 的 WaitMany 边界用例。
+## 2026-09-24 最终边界修复复测
+
+- WaitMany 现在先验证完整请求集合，再发布任何 epoll 节点；这修复了 Memcheck 下“前一个可读 FD 先完成、后一个无效 FD 被跳过”的顺序竞态。混合无效 FD 用例整体返回 `kError/EBADF`。
+- `cmake --build build-check --parallel 4`；Debug CTest 10/10 通过。
+- `cmake --build build-werror-new --parallel 4`；Werror CTest 10/10 通过。
+- `cmake --build build-release-new --parallel 4`；Release CTest 9/9 通过。
+- ASan 和 UBSan 的全量 `go2cpp_tests` 均通过。
+- Valgrind Memcheck：`build-check/valgrind-final-7.log`，416 bytes/4 blocks still reachable；definite/indirect/possible lost 均为 0，`ERROR SUMMARY: 0 errors`。
+- TSan 在 `setarch x86_64 -R` 下的 `control_flow`、`io`、`channel`、`scheduler_smoke` 四个过滤用例通过；完整套件仍不宣称，WSL watchdog 限制需在原生 Linux 复核。
+- 内建 Channel Select 对 move-only 类型现在立即返回 `kInvalid`，避免异步 handoff 悬挂；普通 `Send/Recv` 和独立 `SelectValue` 仍支持 move-only。EventBatch 的 const Handler 只提供观察接口，不能转移所有权。
+
+- 新增 example/io_wait_many_demo.cpp：Hook-on Debug/Werror CTest 各 11/11 通过，
+  Hook-off Release CTest 10/10 通过；示例同时验证两个 FD 的 WaitMany 就绪索引和
+  WaitAny 超时路径，直接运行输出 wait-many=true。

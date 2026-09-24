@@ -4,6 +4,7 @@ if (GO2CPP_BUILD_TESTS)
     add_executable(go2cpp_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_main.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_error.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_control_flow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_context.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_channel.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scheduler.cpp
@@ -38,7 +39,8 @@ endif()
 
 if (GO2CPP_BUILD_EXAMPLES)
     set(GO2CPP_EXAMPLES runtime_demo fiber_sync_demo managed_pipeline_demo
-                        dynamic_gmp_demo mixed_runtime_demo beginner_demo)
+                        dynamic_gmp_demo mixed_runtime_demo beginner_demo
+                        control_flow_demo io_wait_many_demo)
     if (TARGET go2cpp_hook)
         list(APPEND GO2CPP_EXAMPLES io_hook_demo)
     endif()

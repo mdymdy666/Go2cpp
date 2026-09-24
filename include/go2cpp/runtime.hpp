@@ -4,6 +4,7 @@
 // available when a smaller dependency surface is preferred.
 #include "go2cpp/channel.hpp"
 #include "go2cpp/context.hpp"
+#include "go2cpp/control_flow.hpp"
 #include "go2cpp/error.hpp"
 #include "go2cpp/future.hpp"
 #include "go2cpp/fiber.hpp"

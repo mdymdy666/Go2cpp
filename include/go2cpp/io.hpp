@@ -112,6 +112,8 @@ struct WaitAnyResult {
 // wait_many 在一次唤醒中返回已经完成的所有请求索引。它不是“等待所有
 // 请求都完成”的屏障；需要屏障时应使用多个任务或 WaitGroup。ready_indices
 // 按请求注册顺序排列，调用方可以据此稳定地分发后续 Fiber 工作。
+// 同一集合内不得重复提交相同 fd/方向；补采样只完成该 fd/方向等待队列的
+// 队头节点，以保持多个 Fiber 之间的 FIFO。
 struct WaitManyResult {
     WaitStatus status{WaitStatus::kError};
     int system_error{0};

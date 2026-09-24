@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <fcntl.h>
+#include <poll.h>
 
 #include <algorithm>
 #include <atomic>
@@ -467,6 +468,43 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                     m_slots.erase(found);
                 }
             }
+        }
+        wake_nodes(wake);
+        tickle();
+        return true;
+    }
+
+    // 仅允许队列头节点由补采样路径完成，保持同一 fd/方向的 FIFO。
+    bool complete_if_head(const NodePtr& node, WaitStatus status,
+                          int system_error) noexcept {
+        if (!node) {
+            return false;
+        }
+        WakeList wake;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const auto found = m_slots.find(node->fd);
+            if (found == m_slots.end() ||
+                found->second->generation != node->generation) {
+                return false;
+            }
+            FdSlot& slot = *found->second;
+            Queue& queue = queue_for(slot, node->event);
+            purge_terminal_locked(queue);
+            if (queue.empty() || queue.front().get() != node.get() ||
+                !claim(*node, status, system_error)) {
+                return false;
+            }
+            queue.pop_front();
+            erase_timer_locked(*node);
+            const int arm_error = update_interest_locked(slot);
+            if (arm_error != 0) {
+                fail_slot_locked(slot, arm_error, wake);
+            }
+            if (slot.readers.empty() && slot.writers.empty()) {
+                m_slots.erase(found);
+            }
+            wake.push_back(node);
         }
         wake_nodes(wake);
         tickle();
@@ -1138,6 +1176,34 @@ WaitManyResult IOManager::wait_many(
         return result;
     }
 
+    // 一个 WaitMany 集合中同一 fd/方向只能出现一次；否则一次 readiness
+    // 可能同时消费多个请求，无法给外部 waiter 提供可验证的 FIFO。
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+        for (std::size_t j = 0; j < i; ++j) {
+            if (requests[i].fd == requests[j].fd &&
+                requests[i].event == requests[j].event) {
+                fail(WaitStatus::kError, EINVAL);
+                return result;
+            }
+        }
+    }
+
+    // 先验证完整请求集合，再发布任何 epoll 节点。否则前面的可读 FD
+    // 可能先触发并让 WaitMany 返回，后面的无效 FD 就会被静默跳过。
+    for (const auto& request : requests) {
+        if (event_mask(request.event) == 0) {
+            fail(WaitStatus::kError, EINVAL);
+            return result;
+        }
+        if ((request.expected_descriptor &&
+             (!request.expected_descriptor->valid() ||
+              request.expected_descriptor->fd() != request.fd)) ||
+            !descriptor_is_open(request.fd)) {
+            fail(WaitStatus::kError, EBADF);
+            return result;
+        }
+    }
+
     std::vector<State::NodePtr> nodes;
     try {
         nodes.reserve(requests.size());
@@ -1274,6 +1340,65 @@ WaitManyResult IOManager::wait_many(
             // RemoveCallback is non-throwing in the current implementation;
             // preserve the wake result if a replaceable Context backend throws.
         }
+    }
+
+    // epoll 的唤醒回调可能在同一个 Fiber 恢复前后分批到达。对仍未
+    // claim 的节点做一次零超时 poll，把同一时刻已经就绪的 FD 一并收集，
+    // 避免第一个回调先恢复 Fiber 后 cleanup 取消第二个已就绪节点。
+    try {
+        std::vector<pollfd> probes;
+        std::vector<std::size_t> probe_indices;
+        probes.reserve(nodes.size());
+        probe_indices.reserve(nodes.size());
+        for (std::size_t index = 0; index < nodes.size(); ++index) {
+            const auto& node = nodes[index];
+            if (!node || node->outcome.load(std::memory_order_acquire) != 0) {
+                continue;
+            }
+            pollfd descriptor{};
+            descriptor.fd = node->fd;
+            descriptor.events = node->event == IOEvent::kRead
+                                    ? static_cast<short>(POLLIN | POLLPRI)
+                                    : POLLOUT;
+            probes.push_back(descriptor);
+            probe_indices.push_back(index);
+        }
+        if (!probes.empty()) {
+            // 这里只做零超时的内部补探测，不能经过本项目导出的 poll Hook，
+            // 否则 Hook-on 构建会再次进入阻塞封装并可能递归 park 当前 Fiber。
+            const long poll_result = ::syscall(
+                SYS_poll, probes.data(), static_cast<nfds_t>(probes.size()), 0);
+            if (poll_result > 0) {
+                for (std::size_t probe_index = 0;
+                     probe_index < probes.size(); ++probe_index) {
+                    const short revents = probes[probe_index].revents;
+                    if (revents == 0) {
+                        continue;
+                    }
+                    const auto node_index = probe_indices[probe_index];
+                    const auto& node = nodes[node_index];
+                    if (!node) {
+                        continue;
+                    }
+                    if ((revents & POLLNVAL) != 0) {
+                        (void)m_state->complete_if_head(
+                            node, WaitStatus::kClosed, EBADF);
+                    } else if ((revents & (POLLIN | POLLOUT | POLLPRI |
+                                          POLLERR | POLLHUP
+#ifdef POLLRDHUP
+                                          | POLLRDHUP
+#endif
+                                          )) != 0) {
+                        (void)m_state->complete_if_head(node,
+                                                          WaitStatus::kReady,
+                                                          0);
+                    }
+                }
+            }
+        }
+    } catch (...) {
+        // 结果收集是增强路径；epoll 的已 claim 结果仍然有效，分配失败
+        // 时保留原有单节点语义。
     }
 
     // Ready wins over timeout/cancel when several epoll/timer callbacks race.
