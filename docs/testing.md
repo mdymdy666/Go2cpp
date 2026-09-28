@@ -423,3 +423,22 @@ poll/select。后续 sanitizer 和 Memcheck 结果以本节追加记录为准。
 - 新增 example/io_wait_many_demo.cpp：Hook-on Debug/Werror CTest 各 11/11 通过，
   Hook-off Release CTest 10/10 通过；示例同时验证两个 FD 的 WaitMany 就绪索引和
   WaitAny 超时路径，直接运行输出 wait-many=true。
+
+## 2026-09-26 Context 局部回滚复测
+
+以下命令均在 WSL 的 `/UserData/CodexWorkSpace/Go2Cpp` 执行，构建目录只用于本轮验证：
+
+- Debug + examples：`cmake -S . -B build-rollback ...`、`cmake --build
+  build-rollback -j2`、`ctest --test-dir build-rollback --output-on-failure`，11/11
+  通过；新增 `go2cpp_context_rollback_demo` 通过。
+- `-Werror` Debug：`build-rollback-werror`，CTest 2/2 通过。
+- Release：`build-rollback-release`，CTest 2/2 通过。
+- ASan + UBSan：`build-rollback-asan`，CTest 2/2 通过，无 sanitizer 报告。
+- Context 定向测试重复 30 次通过；覆盖 LIFO/savepoint ABA、父取消/deadline、移动
+  所有权、commit、异常 undo、P=1 managed wait 和取消/显式 rollback 竞态。
+- TSan：普通启动在 WSL 报 `unexpected memory mapping`；`setarch x86_64 -R` 的
+  context 过滤通过。全量启动曾在既有 native waiter watchdog 处中止，不能作为
+  WSL 全量通过结论，需原生 Linux 复核。
+- Valgrind Memcheck：`build-rollback/valgrind-context-final-2.log`，
+  `ERROR SUMMARY: 0`，definite/indirect/possible lost 均为 0；416B/4 blocks
+  still reachable 是进程级 TimerService/FiberLocal 缓存，不是 Context 回滚泄漏。

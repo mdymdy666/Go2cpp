@@ -40,6 +40,17 @@ example/io_wait_many_demo.cpp 同时注册两个 socket FD，演示 WaitManyFor(
 多个就绪索引，再用 WaitAnyFor() 验证超时。它只在 managed Fiber 中调用
 IOManager 多路等待；普通线程仍应使用系统 poll/select。
 
+## Context 局部回滚
+
+`example/context_rollback_demo.cpp` 展示 `ContextRollback` 的新手入口：先登记
+补偿动作，再用 `savepoint()` 局部回滚；如果没有调用 `commit()`，离开作用域时会
+自动完成剩余回滚。构建并运行：
+
+```sh
+cmake --build build --target go2cpp_context_rollback_demo
+./build/go2cpp_context_rollback_demo
+```
+
 ## 控制流与 Caster
 
     cmake --build build --target go2cpp_control_flow_demo

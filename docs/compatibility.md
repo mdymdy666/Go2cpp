@@ -25,6 +25,21 @@ SelectValue/SelectCaster 提供可替换的类型擦除中介；std::any 仍保�
 公共 result/status API 会显式暴露不支持状态，而不是假装等价于 Go。
 所有权和可替换边界见 `docs/design.md`、`docs/scheduler.md`、`docs/dependencies.md`。
 
+## Context 局部回滚补充
+
+`ContextRollback`/`RollbackScope` 创建一个临时子 Context，并提供 LIFO undo、
+savepoint、显式 `rollback()` 和 `commit()`。回滚会取消并从父节点登记表移除
+临时 child；提交只丢弃 undo，保留 child 的正常父取消传播。`RollbackDone()`
+单独表示补偿动作完成，不能用 `Context::Done()` 推断 undo 已经结束。undo 回调
+可能运行在调用取消的 native/定时器线程，必须是短小、幂等、非阻塞且不依赖 Fiber
+专属状态；取消会先冻结 action 日志并发布 Done，再执行内部 undo，普通 Done 观察
+回调在 undo 后运行，但 Done 等待者仍可能早于 undo 完成恢复，必须等待
+`RollbackDone()`。undo 不得等待自身的 `RollbackDone()` 或尚未发布的信号。已发生的 socket/file/RPC 副作用、父 Context 的 Err/Done/deadline/value
+不会被恢复。只有显式登记的 undo 会执行；child 的后代取消不会反向触发 scope。
+回调异常会继续执行剩余动作并把事务标为 `kFailed`；局部 rollback 失败后不能
+commit。上述异常隔离不覆盖容器 OOM；这是一种局部补偿协议，不是隔离事务，也
+不使用 `longjmp`。
+
 直接 `syscall(2)`、`io_uring`、`close_range` 和 glibc no-cancel entry point
 会绕过 interposer，可能阻塞 M，也不在 FD generation 跟踪和 managed Fiber
 唤醒语义内。

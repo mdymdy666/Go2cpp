@@ -4,6 +4,27 @@
 > 栈展开。Channel select 新增 SelectValue/SelectCaster/SetAny，IOManager
 > 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
 > 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
+
+## 2026-09-26：Context 局部回滚
+
+- 新增 `ContextRollback`/`RollbackScope`：临时子 Context、LIFO undo、savepoint、
+  显式 rollback/commit 和独立 `RollbackDone()` 完成通知。
+- Context 独立取消现在会从父节点弱登记表中移除 child；deadline timer 注册失败
+  不再留下永远等待的 Context。`WithValue` 的异常路径会取消并清理半发布 child。
+- undo 只表示局部补偿，不恢复父 Context 或外部 IO；回调在线程锁外执行，异常隔离
+  并记录为 `kFailed`。取消先发布 child `Done`，再执行内部 undo，普通 Done 观察回调
+  在 undo 后运行；undo 不得等待自身 `RollbackDone()` 或尚未发布的信号。仍禁止
+  longjmp、跨 Fiber/线程跳转和在回调中阻塞。
+- Context 取消新增前置 claim：在 child `Done` 可观察前冻结 action 日志，避免
+  取消窗口追加/提交新动作；未取消的短命 child 会从 parent 的 weak 登记表及时移除。
+- 新增 ContextRollback 单元覆盖 savepoint LIFO/ABA、析构/父取消、deadline、移动
+  所有权、managed P=1、异常隔离、取消与显式 rollback 竞态；新增
+  `example/context_rollback_demo.cpp`，详细契约见 `docs/context_rollback.md`。
+- 验证：Debug 示例 CTest 11/11；Release 2/2；`-Werror` 2/2；ASan+UBSan 2/2；
+  Context 定向重复 30/30；TSan 使用 `setarch x86_64 -R` 的 context 过滤通过，
+  全量 TSan 在 WSL native waiter watchdog/地址映射限制下不作为全量通过结论；
+  Valgrind Memcheck `ERROR SUMMARY=0`，definite/indirect/possible 均为 0，
+  416B/4 blocks 为进程级 still reachable 缓存。
 >
 > 当前快照说明（2026-09-23）：以下早期记录是追加式审计历史，其中的
 > panic/defer/recover 示例和模块名称不代表当前 API。当前源码已删除

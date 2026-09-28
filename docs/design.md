@@ -114,6 +114,23 @@ Context key 使用进程内 identity token，值是不可变 `std::any`；字符
 动态转译代码提供便利。根 Context 的 DoneSignal 非空但永久不触发，这是与 Go
 根 context nil channel 的明确差异。取消不会隐式变为 panic。
 
+### Context 局部回滚
+
+`ContextRollback` 是一个临时子 Context 的补偿边界：它在自己的状态锁下管理
+LIFO undo 和 savepoint，显式 `rollback()` 会取消 child 并解除 parent 的弱登记，
+`commit()` 只丢弃 undo 而保留 child 的正常取消传播。undo 在 Context 锁外执行，
+异常被隔离并记录为 `kFailed`；`RollbackDone()` 与 Context `Done()` 分别表示
+补偿完成和取消线性化。取消线程可能是 TimerService 或任意调用 `Cancel()` 的线程，
+因此动作不得 park、yield、阻塞、访问 Fiber 专属状态或捕获悬空栈引用。
+取消会先冻结 rollback action 日志并发布 child 的 `Done`，再由内部回调执行 undo，
+最后才运行普通 `Done` 观察回调；需要等待注销动作完成的调用方仍必须等待
+`RollbackDone()`。undo 不得等待自身的 `RollbackDone()` 或依赖尚未发布的信号。
+事务状态操作可并发，但事务对象的移动和析构必须由 owner 串行化；内部回调先于
+普通回调，普通 `DoneSignal` 回调之间只保证至多一次，不保证相互顺序。
+只有显式登记的 undo 会执行；child 的后代取消不会反向触发 scope。该机制只补偿
+尚未发布的内部注册关系，不能恢复父 Context、已发布 value、网络/文件写入或其他
+外部副作用；当前不使用 `setjmp/longjmp`。
+
 ## Channel、Select 与同步
 
 `Channel<T>` 使用互斥保护的 FIFO 缓冲、独立发送/接收等待队列和一次性

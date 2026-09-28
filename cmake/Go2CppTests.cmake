@@ -40,7 +40,7 @@ endif()
 if (GO2CPP_BUILD_EXAMPLES)
     set(GO2CPP_EXAMPLES runtime_demo fiber_sync_demo managed_pipeline_demo
                         dynamic_gmp_demo mixed_runtime_demo beginner_demo
-                        control_flow_demo io_wait_many_demo)
+                        control_flow_demo io_wait_many_demo context_rollback_demo)
     if (TARGET go2cpp_hook)
         list(APPEND GO2CPP_EXAMPLES io_hook_demo)
     endif()
