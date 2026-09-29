@@ -16,6 +16,7 @@ void run_future_tests();
 void run_io_tests();
 void run_timer_tests();
 void run_beginner_api_tests();
+void run_log_config_tests();
 void run_hook_tests();
 
 int main() {
@@ -36,6 +37,7 @@ int main() {
     if (selected("io")) run_io_tests();
     if (selected("timer")) run_timer_tests();
     if (selected("beginner")) run_beginner_api_tests();
+    if (selected("log")) run_log_config_tests();
 #ifdef GO2CPP_TEST_HOOK
     if (selected("hook")) run_hook_tests();
 #endif

@@ -1,6 +1,7 @@
 #include "go2cpp/scheduler/scheduler.hpp"
 
 #include "go2cpp/fiber.hpp"
+#include "go2cpp/log.hpp"
 #include "go2cpp/thread_policy.hpp"
 
 #include <algorithm>
@@ -12,6 +13,11 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 namespace go2cpp::scheduler {
 namespace {
@@ -530,6 +536,11 @@ void Task::run() {
         m_execution_claim.store(false, std::memory_order_release);
     }
     if (became_terminal) {
+        if (fiber_failure) {
+            auto logger = GO2CPP_LOG_NAME("Scheduler");
+            GO2CPP_LOG_ERROR(logger) << "Fiber task " << m_id
+                                     << " failed with an uncaught exception";
+        }
         notify_terminal();
         completed_fiber.reset();
     }
@@ -923,16 +934,22 @@ public:
             // can reclaim it when allocation succeeds.
             return;
         }
-        for (auto it = task_registry.begin(); it != task_registry.end();) {
+        // 单次稳定压缩是 O(n)。逐项 vector::erase 会把大批任务完成时的
+        // 回收变成 O(n²)，且整段移动发生在调度器总锁内。
+        auto output = task_registry.begin();
+        for (auto it = task_registry.begin(); it != task_registry.end(); ++it) {
             if (!*it || (*it)->terminal()) {
                 if (*it) {
                     deferred_destruction.emplace_back(std::move(*it));
                 }
-                it = task_registry.erase(it);
             } else {
-                ++it;
+                if (output != it) {
+                    *output = std::move(*it);
+                }
+                ++output;
             }
         }
+        task_registry.erase(output, task_registry.end());
     }
 
     void emergency_enqueue_locked(const std::shared_ptr<Task>& task) noexcept {
@@ -1099,6 +1116,11 @@ public:
     std::atomic<std::size_t> running_workers{0};
     std::atomic<std::size_t> blocking_workers{0};
     std::atomic<std::size_t> next_processor{0};
+    std::atomic<std::uint64_t> metric_task_runs{0};
+    std::atomic<std::uint64_t> metric_task_completions{0};
+    std::atomic<std::uint64_t> metric_fiber_resume_ns{0};
+    std::atomic<std::uint64_t> metric_local_queue_pops{0};
+    std::atomic<std::uint64_t> metric_steal_pops{0};
     std::mutex join_mutex;
 };
 
@@ -1544,6 +1566,52 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     return true;
 }
 
+bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
+    if (!task || current_scheduler() != this ||
+        t_processor_id >= m_impl->processors.size()) {
+        return enqueue(task);
+    }
+
+    // Worker 自己把刚刚 yield 的 G 放回原 P 时，不需要重新做 owner、
+    // registry 和全局 admission。只使用 P 队列锁，避免每次 Fiber 切换
+    // 都争用调度器总锁。shutdown 仍通过 draining/stopping 的二次检查与
+    // P 队列锁建立一致的排空顺序。
+    if (!m_impl->accepting.load(std::memory_order_acquire) ||
+        m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire)) {
+        return enqueue(task);
+    }
+
+    auto& processor = m_impl->processors[t_processor_id];
+    bool retry_regular_enqueue = false;
+    {
+        std::lock_guard<std::mutex> queue_lock(processor.mutex);
+        if (!m_impl->accepting.load(std::memory_order_acquire) ||
+            m_impl->draining.load(std::memory_order_acquire) ||
+            m_impl->stopping.load(std::memory_order_acquire)) {
+            retry_regular_enqueue = true;
+        } else if (task->try_mark_queued()) {
+            // 计数必须先于节点发布，否则另一个 worker 可能先 pop 节点
+            // 再递减尚未增加的 runnable，造成下溢。
+            m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+            try {
+                processor.queue.push_back(task);
+            } catch (...) {
+                m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                task->clear_queued();
+                retry_regular_enqueue = true;
+            }
+        } else {
+            return false;
+        }
+    }
+    if (retry_regular_enqueue) {
+        return enqueue(task);
+    }
+    m_impl->condition.notify_one();
+    return true;
+}
+
 bool Scheduler::yield(const std::shared_ptr<Task>& task) {
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get() || task->cancellation_requested() ||
@@ -1843,6 +1911,17 @@ std::uint64_t Scheduler::sysmon_pass_count() const noexcept {
                   : 0;
 }
 
+SchedulerMetrics Scheduler::metrics() const noexcept {
+    if (!m_impl) {
+        return {};
+    }
+    return {m_impl->metric_task_runs.load(std::memory_order_acquire),
+            m_impl->metric_task_completions.load(std::memory_order_acquire),
+            m_impl->metric_fiber_resume_ns.load(std::memory_order_acquire),
+            m_impl->metric_local_queue_pops.load(std::memory_order_acquire),
+            m_impl->metric_steal_pops.load(std::memory_order_acquire)};
+}
+
 std::shared_ptr<Task> Scheduler::current_task() noexcept {
     return t_task;
 }
@@ -1868,13 +1947,52 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     thread_policy::detail::EnterRuntimeWorker(this);
     t_machine_id = machine->id;
     t_processor_id = machine->processor;
+#if defined(__linux__)
+    if (m_impl->config.pin_workers_to_cpu &&
+        machine->processor < static_cast<PId>(CPU_SETSIZE)) {
+        cpu_set_t cpu_set;
+        CPU_ZERO(&cpu_set);
+        CPU_SET(static_cast<int>(machine->processor), &cpu_set);
+        // 亲和性是优化提示；容器或 cpuset 拒绝时继续运行，不改变语义。
+        (void)::pthread_setaffinity_np(pthread_self(), sizeof(cpu_set),
+                                       &cpu_set);
+    }
+#endif
     auto& own_processor =
         m_impl->processors[machine->processor % m_impl->processors.size()];
     bool retired = false;
+    std::size_t maintenance_budget = 0;
 
     for (;;) {
         std::shared_ptr<Task> task;
         bool claimed = false;
+        bool local_queue_pop = false;
+        // 绝大多数 yield 回来的 G 都会回到原 P。本地队列由同一 P 的
+        // worker 独占消费，先走无调度器总锁路径；只有本地为空时才进入
+        // 需要全局 admission 锁的全局队列/窃取路径。
+        if (!m_impl->stopping.load(std::memory_order_acquire) &&
+            m_impl->running_workers.load(std::memory_order_acquire) != 0 &&
+            m_impl->runnable.load(std::memory_order_acquire) >
+                m_impl->processors.size()) {
+            {
+                std::lock_guard<std::mutex> queue_lock(own_processor.mutex);
+                if (!own_processor.queue.empty()) {
+                    task = std::move(own_processor.queue.front());
+                    own_processor.queue.pop_front();
+                    local_queue_pop = true;
+                }
+            }
+            if (task) {
+                m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                claimed = task->try_mark_running();
+                if (!claimed) {
+                    task->clear_queued();
+                }
+            }
+        }
+        if (task && m_impl->stopping.load(std::memory_order_acquire)) {
+            task->request_cancel(false);
+        }
         {
             // Queue removal, the shutdown check, and the runnable->running
             // claim form one admission transaction.  In particular, an
@@ -1882,7 +2000,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             // queued bit already cleared and publish a duplicate node before
             // this worker owns the execution claim.
             std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
-            if (!m_impl->stopping.load(std::memory_order_acquire)) {
+            if (!task && !m_impl->stopping.load(std::memory_order_acquire)) {
                 const bool prefer_class =
                     machine->last_task_class != 0 &&
                     machine->affinity_budget != 0 &&
@@ -1984,6 +2102,10 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         std::lock_guard<std::mutex> queue_lock(victim.mutex);
                         if (!victim.queue.empty()) {
                             task = take_victim(victim.queue);
+                            if (task) {
+                                m_impl->metric_steal_pops.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
                             break;
                         }
                     }
@@ -2038,7 +2160,22 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             Fiber::BindCurrentExecution(FiberExecutionBinding{
                 reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,
                 t_processor_id, true});
+            const auto run_started = steady_now_ns();
             task->run();
+            const auto resume_elapsed =
+                static_cast<std::uint64_t>(std::max<std::int64_t>(
+                    0, steady_now_ns() - run_started));
+            m_impl->metric_task_runs.fetch_add(1, std::memory_order_relaxed);
+            m_impl->metric_fiber_resume_ns.fetch_add(
+                resume_elapsed, std::memory_order_relaxed);
+            if (task->terminal()) {
+                m_impl->metric_task_completions.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            if (local_queue_pop) {
+                m_impl->metric_local_queue_pops.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
             t_task.reset();
             Fiber::BindCurrentExecution(FiberExecutionBinding{
                 reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,
@@ -2064,19 +2201,26 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             if (task->state() == GState::kRunnable &&
                 !task->queued()) {
                 (void)task->consume_deferred_enqueue();
-                if (!enqueue(task)) {
+                if (!requeue_from_worker(task)) {
                     (void)task->cancel_if_runnable_unqueued();
                 }
             } else {
                 (void)task->consume_deferred_enqueue();
             }
             std::vector<std::shared_ptr<Task>> deferred_destruction;
-            {
+            const bool draining =
+                m_impl->draining.load(std::memory_order_acquire);
+            if (draining || ++maintenance_budget >= 64) {
                 std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
                 m_impl->collect_terminal_locked(deferred_destruction);
                 (void)m_impl->finish_draining_locked();
+                maintenance_budget = 0;
             }
-            m_impl->condition.notify_all();
+            if (draining) {
+                m_impl->condition.notify_all();
+            } else {
+                m_impl->condition.notify_one();
+            }
             for (auto& retained_task : deferred_destruction) {
                 if (retained_task) {
                     auto abandoned_function =

@@ -25,6 +25,8 @@ add_library(go2cpp_fiber
 add_library(go2cpp_sync ${CMAKE_CURRENT_SOURCE_DIR}/src/sync.cpp)
 add_library(go2cpp_future ${CMAKE_CURRENT_SOURCE_DIR}/src/future.cpp)
 add_library(go2cpp_io ${CMAKE_CURRENT_SOURCE_DIR}/src/io.cpp)
+add_library(go2cpp_log ${CMAKE_CURRENT_SOURCE_DIR}/src/log.cpp)
+add_library(go2cpp_config ${CMAKE_CURRENT_SOURCE_DIR}/src/config.cpp)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GO2CPP_BUILD_HOOK)
     add_library(go2cpp_hook SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/hook.cpp)
@@ -44,6 +46,8 @@ set_target_properties(go2cpp_fiber PROPERTIES EXPORT_NAME fiber)
 set_target_properties(go2cpp_sync PROPERTIES EXPORT_NAME sync)
 set_target_properties(go2cpp_future PROPERTIES EXPORT_NAME future)
 set_target_properties(go2cpp_io PROPERTIES EXPORT_NAME io)
+set_target_properties(go2cpp_log PROPERTIES EXPORT_NAME log)
+set_target_properties(go2cpp_config PROPERTIES EXPORT_NAME config)
 if (TARGET go2cpp_hook)
     set_target_properties(go2cpp_hook PROPERTIES EXPORT_NAME hook)
 endif()
@@ -61,6 +65,8 @@ add_library(go2cpp::fiber ALIAS go2cpp_fiber)
 add_library(go2cpp::sync ALIAS go2cpp_sync)
 add_library(go2cpp::future ALIAS go2cpp_future)
 add_library(go2cpp::io ALIAS go2cpp_io)
+add_library(go2cpp::log ALIAS go2cpp_log)
+add_library(go2cpp::config ALIAS go2cpp_config)
 if (TARGET go2cpp_hook)
     add_library(go2cpp::hook ALIAS go2cpp_hook)
 endif()
@@ -75,6 +81,8 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_sync
     go2cpp_future
     go2cpp_io
+    go2cpp_log
+    go2cpp_config
 )
 if (TARGET go2cpp_hook)
     list(APPEND GO2CPP_MODULE_TARGETS go2cpp_hook)
@@ -105,7 +113,8 @@ target_include_directories(go2cpp_runtime INTERFACE
 
 target_link_libraries(go2cpp_context PUBLIC go2cpp_error go2cpp_scheduler)
 target_link_libraries(go2cpp_channel PUBLIC go2cpp_context go2cpp_error)
-target_link_libraries(go2cpp_scheduler PUBLIC go2cpp_fiber)
+target_link_libraries(go2cpp_scheduler PUBLIC go2cpp_fiber go2cpp_log)
+target_link_libraries(go2cpp_config PUBLIC go2cpp_scheduler go2cpp_log)
 target_link_libraries(go2cpp_fiber PUBLIC Boost::context)
 if (GO2CPP_HAVE_VALGRIND_HEADER)
     target_compile_definitions(go2cpp_fiber PRIVATE BOOST_USE_VALGRIND=1)
@@ -119,7 +128,7 @@ if (TARGET go2cpp_hook)
 endif()
 target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_error go2cpp_control_flow go2cpp_context go2cpp_channel go2cpp_scheduler
-    go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io
+    go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io go2cpp_log go2cpp_config
     Threads::Threads)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_runtime INTERFACE go2cpp_hook)

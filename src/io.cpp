@@ -186,10 +186,29 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             wake_active = false;
             scheduler = nullptr;
         }
+
+        void reset() noexcept {
+            id = 0;
+            fd = -1;
+            generation = 0;
+            event = IOEvent::kRead;
+            scheduler = nullptr;
+            task.reset();
+            descriptor.reset();
+            wake_active = true;
+            outcome.store(0, std::memory_order_relaxed);
+            wake_next.reset();
+        }
     };
 
     using NodePtr = std::shared_ptr<WaitNode>;
     using Queue = std::deque<NodePtr>;
+
+    // WaitNode 的所有权会随 Fiber 迁移到不同 M；用当前 M 的 TLS 小缓存
+    // 避免每轮 wait 都争用 State 总锁。缓存项不持有 State，只带原始键，
+    // 因而 State 销毁不会形成反向生命周期。
+    inline static thread_local std::vector<std::pair<State*, NodePtr>>
+        s_node_cache;
 
     class WakeList {
     public:
@@ -345,13 +364,19 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
     NodePtr register_wait(int fd, IOEvent event,
                           std::optional<TimePoint> deadline, int* error,
                           DescriptorTokenPtr expected_descriptor) {
-        DescriptorGuard descriptor_guard;
+        // Hook 调用通常已经捕获了代际 token。此路径不再重复取得全局
+        // 描述符注册锁，也不重复执行 F_GETFD；token 的有效位就是 close/
+        // dup2 交接的线性化结果。未提供 token 的裸 API 仍保留完整校验。
+        std::optional<DescriptorGuard> descriptor_guard;
+        if (!expected_descriptor) {
+            descriptor_guard.emplace();
+        }
         if (error != nullptr) {
             *error = 0;
         }
         if ((expected_descriptor &&
              (!expected_descriptor->valid() || expected_descriptor->fd() != fd)) ||
-            !descriptor_is_open(fd)) {
+             (!expected_descriptor && !descriptor_is_open(fd))) {
             if (error != nullptr) {
                 *error = EBADF;
             }
@@ -366,14 +391,11 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             return {};
         }
 
-        auto node = std::make_shared<WaitNode>();
-        node->fd = fd;
-        node->event = event;
-        node->scheduler = m_scheduler;
-        node->task = Scheduler::current_task();
-        node->descriptor = expected_descriptor
-                               ? std::move(expected_descriptor)
-                               : DescriptorGuard::Capture(fd);
+        auto task = Scheduler::current_task();
+        DescriptorTokenPtr descriptor = expected_descriptor
+                                            ? std::move(expected_descriptor)
+                                            : DescriptorGuard::Capture(fd);
+        NodePtr node;
 
         int arm_error = 0;
         {
@@ -384,6 +406,30 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 }
                 return {};
             }
+
+            for (auto it = s_node_cache.begin(); it != s_node_cache.end(); ++it) {
+                if (it->first == this) {
+                    node = std::move(it->second);
+                    s_node_cache.erase(it);
+                    node->reset();
+                    break;
+                }
+            }
+            if (!node) {
+                try {
+                    node = std::make_shared<WaitNode>();
+                } catch (...) {
+                    if (error != nullptr) {
+                        *error = ENOMEM;
+                    }
+                    return {};
+                }
+            }
+            node->fd = fd;
+            node->event = event;
+            node->scheduler = m_scheduler;
+            node->task = std::move(task);
+            node->descriptor = std::move(descriptor);
 
             auto found = m_slots.find(fd);
             if (found == m_slots.end()) {
@@ -411,7 +457,8 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             } catch (...) {
                 erase_node_locked(slot, node);
                 erase_timer_locked(*node);
-                if (slot.readers.empty() && slot.writers.empty()) {
+                if (slot.readers.empty() && slot.writers.empty() &&
+                    !slot.registered) {
                     m_slots.erase(found);
                 }
                 if (error) {
@@ -464,7 +511,8 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 if (arm_error != 0) {
                     fail_slot_locked(slot, arm_error, wake);
                 }
-                if (slot.readers.empty() && slot.writers.empty()) {
+                if (slot.readers.empty() && slot.writers.empty() &&
+                    !slot.registered) {
                     m_slots.erase(found);
                 }
             }
@@ -472,6 +520,21 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         wake_nodes(wake);
         tickle();
         return true;
+    }
+
+    void recycle_node(NodePtr node) noexcept {
+        if (!node) {
+            return;
+        }
+        node->disarm();
+        node->reset();
+        try {
+            if (s_node_cache.size() < 64) {
+                s_node_cache.emplace_back(this, std::move(node));
+            }
+        } catch (...) {
+            // 缓存只是性能优化，分配失败不影响等待语义。
+        }
     }
 
     // 仅允许队列头节点由补采样路径完成，保持同一 fd/方向的 FIFO。
@@ -501,7 +564,8 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             if (arm_error != 0) {
                 fail_slot_locked(slot, arm_error, wake);
             }
-            if (slot.readers.empty() && slot.writers.empty()) {
+            if (slot.readers.empty() && slot.writers.empty() &&
+                !slot.registered) {
                 m_slots.erase(found);
             }
             wake.push_back(node);
@@ -637,6 +701,20 @@ private:
         }
 
         if (interest == 0) {
+            if (slot.registered && slot.registration_id != 0) {
+                epoll_event idle{};
+                idle.events = 0;
+                idle.data.u64 = slot.registration_id;
+                if (::epoll_ctl(m_epoll_fd, EPOLL_CTL_MOD, slot.fd, &idle) == 0) {
+                    slot.interest = 0;
+                    const auto registration = m_registrations.find(
+                        slot.registration_id);
+                    if (registration != m_registrations.end()) {
+                        registration->second.interest = 0;
+                    }
+                    return 0;
+                }
+            }
             invalidate_registration_locked(slot);
             return 0;
         }
@@ -733,8 +811,6 @@ private:
             }
 
             FdSlot& slot = *found->second;
-            m_registrations.erase(registration);
-            slot.registration_id = 0;
             // EPOLLONESHOT leaves the open-file registration present but
             // disabled. update_interest_locked() therefore uses MOD.
             slot.registered = true;
@@ -759,7 +835,8 @@ private:
             if (arm_error != 0) {
                 fail_slot_locked(slot, arm_error, wake);
             }
-            if (slot.readers.empty() && slot.writers.empty()) {
+            if (slot.readers.empty() && slot.writers.empty() &&
+                !slot.registered) {
                 m_slots.erase(found);
             }
         }
@@ -795,7 +872,8 @@ private:
                     if (arm_error != 0) {
                         fail_slot_locked(slot, arm_error, wake);
                     }
-                    if (slot.readers.empty() && slot.writers.empty()) {
+                    if (slot.readers.empty() && slot.writers.empty() &&
+                        !slot.registered) {
                         m_slots.erase(found);
                     }
                 }
@@ -848,11 +926,21 @@ private:
         constexpr int kEventBatch = 64;
         epoll_event events[kEventBatch]{};
         for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (m_stop_poller) {
+                    break;
+                }
+                // register_wait 在同一把锁下发布 epoll 节点；只有它在
+                // 这里置位后并发发布才需要 eventfd 打断 epoll_wait。
+                m_poller_waiting.store(true, std::memory_order_release);
+            }
             int count;
             do {
                 count = ::epoll_wait(m_epoll_fd, events, kEventBatch,
                                      poll_timeout_ms());
             } while (count < 0 && errno == EINTR);
+            m_poller_waiting.store(false, std::memory_order_release);
 
             if (count < 0) {
                 WakeList wake;
@@ -900,17 +988,16 @@ private:
         if (m_wake_fd < 0) {
             return;
         }
+        if (!m_poller_waiting.load(std::memory_order_acquire)) {
+            return;
+        }
         const std::uint64_t value = 1;
-        const long result =
-            ::syscall(SYS_write, m_wake_fd, &value, sizeof(value));
-        (void)result;
+        (void)::syscall(SYS_write, m_wake_fd, &value, sizeof(value));
     }
 
     void wake_nodes(WakeList& nodes) noexcept {
         while (const auto node = nodes.pop_front()) {
             if (node) {
-                // false may mean the pending-wake token was accepted while
-                // the G was still running. It is not a failure in that race.
                 node->wake();
             }
         }
@@ -942,7 +1029,8 @@ private:
             if (arm_error != 0) {
                 fail_slot_locked(slot, arm_error, wake);
             }
-            if (slot.readers.empty() && slot.writers.empty()) {
+            if (slot.readers.empty() && slot.writers.empty() &&
+                !slot.registered) {
                 m_slots.erase(found);
             }
         }
@@ -954,6 +1042,7 @@ private:
     Scheduler* m_scheduler{nullptr};
     int m_epoll_fd{-1};
     int m_wake_fd{-1};
+    std::atomic<bool> m_poller_waiting{false};
     int m_init_error{0};
 
     mutable std::mutex m_mutex;
@@ -1066,8 +1155,9 @@ WaitResult IOManager::wait(int fd, IOEvent event,
                 registration_error == 0 ? EIO : registration_error};
     }
     if (node->outcome.load(std::memory_order_acquire) != 0) {
-        node->disarm();
-        return decode_outcome(node->outcome.load(std::memory_order_acquire));
+        const auto result = decode_outcome(node->outcome.load(std::memory_order_acquire));
+        m_state->recycle_node(std::move(node));
+        return result;
     }
 
     DoneSignal::CallbackId callback_id = 0;
@@ -1095,7 +1185,7 @@ WaitResult IOManager::wait(int fd, IOEvent event,
             });
         } catch (...) {
             (void)m_state->complete(node, WaitStatus::kError, ENOMEM);
-            node->disarm();
+            m_state->recycle_node(std::move(node));
             return {WaitStatus::kError, ENOMEM};
         }
     }
@@ -1128,8 +1218,9 @@ WaitResult IOManager::wait(int fd, IOEvent event,
     if (context && callback_id != 0) {
         context->Done().RemoveCallback(callback_id);
     }
-    node->disarm();
-    return decode_outcome(node->outcome.load(std::memory_order_acquire));
+    const auto result = decode_outcome(node->outcome.load(std::memory_order_acquire));
+    m_state->recycle_node(std::move(node));
+    return result;
 }
 
 WaitResult IOManager::wait_for(int fd, IOEvent event, Duration timeout,
@@ -1197,8 +1288,8 @@ WaitManyResult IOManager::wait_many(
         }
         if ((request.expected_descriptor &&
              (!request.expected_descriptor->valid() ||
-              request.expected_descriptor->fd() != request.fd)) ||
-            !descriptor_is_open(request.fd)) {
+               request.expected_descriptor->fd() != request.fd)) ||
+            (!request.expected_descriptor && !descriptor_is_open(request.fd))) {
             fail(WaitStatus::kError, EBADF);
             return result;
         }

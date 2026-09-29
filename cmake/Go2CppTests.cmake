@@ -15,6 +15,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_io.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_timer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_beginner_api.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_log_config.cpp
     )
     target_link_libraries(go2cpp_tests PRIVATE go2cpp_runtime)
     if (TARGET go2cpp_hook)
@@ -35,12 +36,21 @@ if (GO2CPP_BUILD_TESTS)
         -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_scheduler_smoke COMMAND go2cpp_scheduler_smoke)
     set_tests_properties(go2cpp_scheduler_smoke PROPERTIES TIMEOUT 30)
+
+    add_executable(go2cpp_high_load_stress
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/high_load_stress.cpp)
+    target_link_libraries(go2cpp_high_load_stress PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_high_load_stress PRIVATE
+        -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_high_load_stress COMMAND go2cpp_high_load_stress)
+    set_tests_properties(go2cpp_high_load_stress PROPERTIES TIMEOUT 180)
 endif()
 
 if (GO2CPP_BUILD_EXAMPLES)
     set(GO2CPP_EXAMPLES runtime_demo fiber_sync_demo managed_pipeline_demo
                         dynamic_gmp_demo mixed_runtime_demo beginner_demo
-                        control_flow_demo io_wait_many_demo context_rollback_demo)
+                        control_flow_demo io_wait_many_demo context_rollback_demo
+                        log_config_demo)
     if (TARGET go2cpp_hook)
         list(APPEND GO2CPP_EXAMPLES io_hook_demo)
     endif()

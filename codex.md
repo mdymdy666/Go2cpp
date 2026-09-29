@@ -537,3 +537,19 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
 - 示例补充：新增 example/io_wait_many_demo.cpp，展示两个 socket FD 的 WaitManyFor
   和 WaitAnyFor；Hook-on Debug/Werror 各 11/11，Hook-off Release 10/10，直接运行
   输出 wait-many=true。
+
+## 2026-09-30：工程化日志与配置模块
+
+- 新增 `include/go2cpp/log.hpp`、`src/log.cpp`：自有 C++17 日志实现，按
+  `LogFilter -> LogItemWorker -> LogFormatter -> LogSink` 解耦；默认使用线程安全
+  文件 Sink，发布等级为 warn，默认写入 `log/go2cpp.log`，stdout 必须配置开启。
+- 提供 `PatternFormatter`、`CallbackSink` 和大小写兼容的 `GO2CPP::Logger`/宏接口，
+  可在回调中桥接 spdlog/fmt，不把第三方 ABI 强行加入运行时。
+- 新增 `include/go2cpp/config.hpp`、`src/config.cpp` 和根目录 `go2cpp.ini`：支持
+  section、key=value、注释、日志和调度器参数统一校验；`max_workers` 上限 32、
+  `local_queue_limit` 必须大于 0 等约束在启动前检查。
+- CMake 增加 `go2cpp_log`、`go2cpp_config` 目标及安装导出；新增日志并发/过滤/配置
+  边界测试与 `example/log_config_demo.cpp`。
+- 验证：WSL GCC 13.3 + Boost.Context 1.83 的工程化构建成功；日志过滤并发测试通过，
+  `go2cpp_log_config_demo` 通过。完整 CTest 中已有 scheduler-aware synchronization
+  用例一次出现既有的时序失败，单独重跑日志测试和其余目标成功；该失败未被隐藏。

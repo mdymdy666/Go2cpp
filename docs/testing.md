@@ -409,6 +409,68 @@ poll/select。后续 sanitizer 和 Memcheck 结果以本节追加记录为准。
 - Valgrind Memcheck：build-check/valgrind-control-flow-final-2.log，完整套件通过；in use at exit 为 416 bytes/4 blocks，definite/indirect/possible lost 均为 0，ERROR SUMMARY 为 0。
 - TSan：setarch x86_64 -R 下 control_flow、io、channel、scheduler_smoke 四个过滤分别通过；完整套件在当前 WSL 120 秒 watchdog 内无可用输出并以 124 超时，因此不宣称 TSan 全量通过，native Linux 仍是发布门槛。
 - 为避免 Memcheck 下启动放大造成假失败，IO 用例先等待任务进入 GState::Waiting 再写入测试 fd；同时增加重复 fd/方向和混合无效 fd 的 WaitMany 边界用例。
+
+## 2026-09-28 高负载调度与 IO 对比复测
+
+本轮在 `NewGo2Cpp` 工作树新增 `tests/high_load_stress.cpp`，用于大数据量
+验证和线程池基线对比：50,000 个任务各执行 4 次 Fiber yield，2,000 个
+Fiber 与 32 个普通线程混合竞争同步锁，16/16 个生产者消费者传输 32,000
+条 Channel 消息，以及 4,096 个 FD 各进行 25 轮就绪等待（共 102,400 次 IO
+等待）。线程基线使用独立的固定大小 `ThreadPool`、`std::mutex` 和 native
+`poll`，不把线程结果冒充为 Fiber 结果。
+
+调度器为 Worker 自己重新入队的 G 增加了 P 本地队列快速路径，减少全局
+admission/registry 锁竞争；普通 Worker 的唤醒改为 `notify_one`，终结任务
+登记按批次维护。IO poller 对同一批 epoll 就绪节点使用批量 G 唤醒，并合并
+eventfd tickle；描述符已经捕获 generation token 时跳过重复的 `F_GETFD`。
+所有优化都保留 shutdown 的二次状态检查、emergency 队列和异常分配回退路径。
+
+Release 构建和完整压测连续 3 次通过，典型结果为：计算密集任务 Fiber
+1.60--1.72 秒、线程池 1.43--1.48 秒；Fiber 调度 2.2 秒左右、线程池
+约 0.04--0.19 秒；混合同步锁 10.9--11.5 秒、线程池约 0.04 秒；Fiber
+Channel 21--25 毫秒、线程池 56--71 毫秒；高并发 Fiber IO 2.17--2.30 秒、
+native poll 1.85--2.05 秒。Fiber 调度和 IO 仍包含上下文
+切换、队列发布和事件唤醒成本，不能按永久 OS 线程模型的数字推断等价性能。
+当前高并发 IO 仍约比 native poll 慢 5%--20%，因此尚未满足“所有 IO 场景
+全面超过线程模型”的目标；这是当前版本的明确未达标项，不能用改变工作量或
+减少并发校验的方式掩盖。主要剩余成本是每轮 epoll 注册/撤销和 G 唤醒，后续
+需要持久化 FD interest、批量完成节点以及更低开销的 Fiber park backend。
+
+验证命令：
+
+```
+cmake --build build-high-load --target go2cpp_high_load_stress -j8
+timeout 180s ./build-high-load/go2cpp_high_load_stress
+ASAN_OPTIONS=halt_on_error=1:detect_leaks=1 timeout 240s \
+  ./build-high-load-asan/go2cpp_high_load_stress
+ctest --test-dir build-review-new --output-on-failure --timeout 240
+```
+
+Release 连续 3 次和 ASan 全量高负载均通过；Debug CTest 为 13/13 通过。曾
+由基准代码在后台消费者退出前销毁 Channel，ASan 报告
+`ParkingCondition::notify_all` 的 use-after-free；现已增加任务完成栅栏，
+并重新通过 Release、ASan 和 Debug 全套。TSan 仍受当前 WSL 的
+`unexpected memory mapping`/资源放大限制，不能据此宣称高负载 TSan 通过，
+需在原生 Linux 复核。
+
+## 2026-09-29 IO 热路径优化复测
+
+针对上一节 IO 尚未超过线程基线的问题，继续完成了三项链路优化：
+
+- `WaitNode` 使用当前 M 的线程本地复用缓存，避免每轮等待重新分配节点；
+- epoll readiness 在一个 `epoll_wait` 批次内先汇总，再一次性批量唤醒 G；
+- 已注册 FD 在没有等待者时保留 idle interest，使用 `EPOLL_CTL_MOD` 恢复，
+  避免重复 `EPOLL_CTL_DEL`/`ADD`。close/dup2 仍执行真正的 DEL 和 generation 清理。
+
+Release 高并发 IO 负载为 4,096 个 pipe FD、每个 FD 25 轮、共 102,400 次
+readiness 等待。IO-only 连续 5 次结果：Fiber 分别为 1.814、1.793、1.703、
+1.723、1.767 秒；native poll 分别为 1.802、1.789、1.707、1.845、1.777 秒，
+5 次均不慢于线程基线，平均约快 3%。完整 Release 高负载、Debug CTest 13/13、
+Werror 编译和 ASan 高负载均通过。
+
+ASan 下由于 Fiber/线程切换和 sanitizer 插桩放大，IO 绝对时间仍明显高于
+native poll，但无 AddressSanitizer 报告；该结果只用于安全性验证，性能结论以
+Release 为准。WSL 的 TSan 映射限制仍未改变，需原生 Linux 作为 TSan 发布门槛。
 ## 2026-09-24 最终边界修复复测
 
 - WaitMany 现在先验证完整请求集合，再发布任何 epoll 节点；这修复了 Memcheck 下“前一个可读 FD 先完成、后一个无效 FD 被跳过”的顺序竞态。混合无效 FD 用例整体返回 `kError/EBADF`。
@@ -442,3 +504,96 @@ poll/select。后续 sanitizer 和 Memcheck 结果以本节追加记录为准。
 - Valgrind Memcheck：`build-rollback/valgrind-context-final-2.log`，
   `ERROR SUMMARY: 0`，definite/indirect/possible lost 均为 0；416B/4 blocks
   still reachable 是进程级 TimerService/FiberLocal 缓存，不是 Context 回滚泄漏。
+
+## 2026-09-29 IO 全链路最终复测（以本节为准）
+
+上一节曾尝试把一个 `epoll_wait` 返回批次中的多个节点合并后调用
+`wake_many`。在 10,000 轮 readiness/timeout 竞态测试中发现偶发丢失 Fiber
+唤醒，已经撤销该批量唤醒路径；当前实现逐事件完成、逐事件唤醒，并保留已验证的
+FD idle registration、generation token 和 WaitNode 线程本地缓存优化。这样以每个
+等待节点只完成一次为不变量，避免批量路径改变 `GState::Waiting -> Runnable`
+的线性化顺序。
+
+最终 Release IO-only 测试仍使用 4,096 个 pipe FD、每 FD 25 轮、共 102,400
+次等待。连续 5 次结果如下：
+
+| 次数 | Fiber epoll 等待 | native poll 基线 |
+| ---: | ---: | ---: |
+| 1 | 0.949 s | 1.799 s |
+| 2 | 1.036 s | 1.754 s |
+| 3 | 1.022 s | 1.749 s |
+| 4 | 0.979 s | 1.782 s |
+| 5 | 1.020 s | 1.761 s |
+
+平均 Fiber 1.001 s，native poll 1.769 s，Fiber 链路快约 43%。这项性能结论
+仅适用于 Release 下已经覆盖的 epoll pipe/socket readiness、timeout、cancel、
+close、WaitAny/WaitMany 和 hook 等场景；Debug/Werror 和 ASan 只作为正确性
+验证，不用其插桩时间宣称性能领先。
+
+最终验证命令和结果：
+
+- `cmake --build build-high-load -j 8 --target go2cpp_high_load_stress`：通过。
+- `./build-high-load/go2cpp_high_load_stress --io-only`：上述 5 次均通过，且每次
+  Fiber 均快于 native poll。
+- `cmake --build build-high-load-werror -j 8 --target go2cpp_high_load_stress`：通过。
+- `./build-high-load-werror/go2cpp_high_load_stress --io-only`：通过；该 Debug
+  构建受未优化和告警检查影响，不作为性能基线。
+- `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./build-high-load-asan/go2cpp_high_load_stress --io-only`：通过，无 ASan 报告。
+- `ctest --test-dir build-review-new --output-on-failure -E go2cpp_high_load_stress`：
+  12/12 通过；其中 `go2cpp_tests` 连续 4 次直接运行均通过，包含 10,000 轮
+  IO 竞态测试。高负载全套中的其余调度、锁和 Channel 项目此前已有 Release、
+  ASan 通过记录。
+
+当前仍不宣称所有任意阻塞系统调用都异步化：未进入 hook/IOManager 的普通系统
+调用仍可能阻塞其所在 M；TSan 全量验证仍需原生 Linux，WSL 会受到
+`unexpected memory mapping` 限制。
+
+## 2026-09-30 性能优化任务 1～4 复测
+
+本轮只处理运行时性能，不加入日志和配置工程化模块。修改包括：
+
+- 调度器：Worker 在满足“已有运行 M 且 runnable 数量明显高于 P 数量”时，
+  直接从本地 P 队列取 G，绕过调度器总 admission 锁；初始化阶段仍使用原
+  全局路径，避免 shutdown/动态扩容公平性回归。
+- Fiber：受保护栈加入 M 本地和有界全局复用池，完成后的栈才允许回收复用，
+  保留 guard page 和 ASan/TSan 切换协议。
+- 同步锁：sync::Mutex 的无竞争 Lock/TryLock 使用原子 CAS；等待者仍使用
+  FIFO 队列和原有 Fiber park/native condition_variable 双路径，并增加
+  m_has_waiters 旁路以减少无竞争 Unlock 获取内部互斥量。
+- 观测：新增 Scheduler::metrics()，提供 task runs、完成数、Fiber resume
+  累计纳秒、本地队列命中和窃取次数；高负载示例会打印这些指标。
+- 硬件：新增 SchedulerConfig::pin_workers_to_cpu，Linux 上可将 M 绑定到
+  对应 P 的 CPU。默认关闭，避免覆盖宿主进程或容器的既有 cpuset 策略；
+  min_workers 仍保证至少一个初始 M 不因空闲回收而消失。
+
+Release 高负载结果（50,000 个任务各 4 次 yield、8,000 个计算任务、
+2,000 Fiber 与 32 线程混合锁、32,000 条 Channel 消息、4,096 FD×25 轮
+IO）：
+
+| 场景 | 优化后 Fiber | 线程基线 | 相对上一轮 |
+| --- | ---: | ---: | ---: |
+| 计算 | 1,419 ms | 1,415 ms | Fiber 从约 1,587 ms 降至约 1.4 s |
+| 调度 | 835 ms | 55 ms | Fiber 从约 2,643 ms 降至约 0.7～0.8 s |
+| 混合锁 | 5,960 ms | 41 ms | 受跨 Fiber/M 竞争影响，仍明显落后 |
+| Channel | 28 ms | 97 ms | Fiber 约快 71% |
+| IO | 1,179 ms | 1,945 ms | Fiber 约快 39%，保持领先 |
+
+调度器指标示例：250,000 次 task run、50,000 次完成，Fiber resume 累计
+约 613 ms，本地队列命中约 216,000 次，窃取约个位数到十几次。说明优化后
+绝大多数 G 重新进入原 P 的本地队列，跨 P 窃取不是主要路径。
+
+验证：
+
+- ctest --test-dir build-review-new --output-on-failure -E go2cpp_high_load_stress：
+  12/12 通过。
+- cmake --build build-high-load-werror -j 8 --target go2cpp_high_load_stress：
+  通过。
+- ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./build-high-load-asan/go2cpp_tests：
+  全部测试通过，无 ASan 报告；高负载 scheduler/IO ASan 测试也通过。
+- 完整高负载 Release 通过，包含所有结果校验。
+
+当前仍未在现有 Boost.Context fcontext 后端实现可安全的运行中栈搬迁和
+真正的 segmented stack。栈复用已经完成，但 Fiber 仍使用带保护页的固定容量
+栈；直接用 memcpy 搬迁活动 C++ 栈会破坏指针、RAII 和 fcontext，不能作为
+可靠优化提交。后续若启用编译器 split-stack 或替换为支持 segmented stack
+的后端，才能继续推进自动扩容。

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cerrno>
 #include <exception>
+#include <iterator>
 #include <stdexcept>
 #include <limits>
 #include <mutex>
@@ -68,6 +69,31 @@ struct FiberTlsRestore final {
 
 std::atomic<std::uint64_t> s_next_fiber_id{1};
 
+// 受保护栈的映射/解除映射成本远高于一次 Fiber 上下文切换。栈不能在
+// Fiber 仍可恢复时复用，因此只在 Fiber 完成、且其 fcontext 已经失效后
+// 放回缓存。先使用当前 M 的 TLS 缓存，跨 M 销毁时再进入有界全局缓存。
+struct CachedStack {
+    std::size_t size{0};
+    boost::context::stack_context context{};
+};
+
+struct StackCache {
+    ~StackCache() noexcept {
+        for (auto& entry : entries) {
+            if (entry.context.sp != nullptr) {
+                boost::context::protected_fixedsize_stack allocator(entry.size);
+                allocator.deallocate(entry.context);
+            }
+        }
+    }
+
+    std::vector<CachedStack> entries;
+};
+
+std::mutex s_stack_pool_mutex;
+StackCache s_stack_pool;
+thread_local StackCache s_thread_stack_pool;
+
 FiberContextFrame main_context_frame(
     const FiberExecutionBinding& binding) noexcept {
     FiberContextFrame frame;
@@ -104,9 +130,11 @@ std::size_t normalize_stack_size(std::size_t requested) noexcept {
 
 struct FiberStack {
     explicit FiberStack(std::size_t size)
-        : m_allocator(size), m_context(m_allocator.allocate()) {}
+        : m_requested_size(size),
+          m_allocator(size),
+          m_context(acquire(m_allocator, m_requested_size)) {}
 
-    ~FiberStack() noexcept { m_allocator.deallocate(m_context); }
+    ~FiberStack() noexcept { release(m_allocator, m_requested_size, m_context); }
 
     FiberStack(const FiberStack&) = delete;
     FiberStack& operator=(const FiberStack&) = delete;
@@ -119,6 +147,60 @@ struct FiberStack {
         return static_cast<const char*>(m_context.sp) - usable_size();
     }
 
+    void* stack_pointer() const noexcept { return m_context.sp; }
+
+private:
+    static boost::context::stack_context acquire(
+        boost::context::protected_fixedsize_stack& allocator,
+        std::size_t size) {
+        for (auto it = s_thread_stack_pool.entries.rbegin();
+             it != s_thread_stack_pool.entries.rend(); ++it) {
+            if (it->size == size) {
+                const auto context = it->context;
+                s_thread_stack_pool.entries.erase(std::next(it).base());
+                return context;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
+            for (auto it = s_stack_pool.entries.rbegin();
+                 it != s_stack_pool.entries.rend(); ++it) {
+                if (it->size == size) {
+                    const auto context = it->context;
+                    s_stack_pool.entries.erase(std::next(it).base());
+                    return context;
+                }
+            }
+        }
+        return allocator.allocate();
+    }
+
+    static void release(boost::context::protected_fixedsize_stack& allocator,
+                        std::size_t size,
+                        boost::context::stack_context& context) noexcept {
+        if (context.sp == nullptr) {
+            return;
+        }
+        try {
+            if (s_thread_stack_pool.entries.size() < 8U) {
+                s_thread_stack_pool.entries.push_back(CachedStack{size, context});
+                context = {};
+                return;
+            }
+            std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
+            if (s_stack_pool.entries.size() < 128U) {
+                s_stack_pool.entries.push_back(CachedStack{size, context});
+                context = {};
+                return;
+            }
+        } catch (...) {
+            // 缓存只用于性能优化；容量不足或分配失败时回收到系统。
+        }
+        allocator.deallocate(context);
+        context = {};
+    }
+
+    std::size_t m_requested_size;
     boost::context::protected_fixedsize_stack m_allocator;
     boost::context::stack_context m_context;
 };
@@ -154,7 +236,7 @@ struct Fiber::Impl {
           m_stack_size(normalize_stack_size(stack_size)),
           m_stack(m_stack_size) {
         m_context = boost::context::detail::make_fcontext(
-            m_stack.m_context.sp, m_stack.usable_size(), &Impl::entry);
+            m_stack.stack_pointer(), m_stack.usable_size(), &Impl::entry);
 #if defined(GO2CPP_FIBER_TSAN)
         m_tsan_fiber = __tsan_create_fiber(0);
 #endif

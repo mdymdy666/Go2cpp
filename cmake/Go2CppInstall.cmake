@@ -9,6 +9,8 @@ install(TARGETS ${GO2CPP_MODULE_TARGETS} go2cpp_runtime
 )
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/go2cpp.ini
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/go2cpp_runtime)
 install(EXPORT go2cpp_runtime_targets
     FILE go2cpp_runtime-targets.cmake
     NAMESPACE go2cpp::

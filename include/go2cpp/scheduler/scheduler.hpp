@@ -109,6 +109,9 @@ struct SchedulerConfig {
     bool enable_sysmon = true;
     std::chrono::milliseconds sysmon_interval{10};
     std::chrono::milliseconds long_syscall_threshold{50};
+    // Linux 上可将 M 绑定到与 P 对应的 CPU。默认关闭，避免嵌入宿主已有
+    // CPU 配额/容器亲和性策略；打开后超出 CPU 数量的 P 不执行绑定。
+    bool pin_workers_to_cpu = false;
 };
 
 using TaskClassId = std::uint64_t;
@@ -140,6 +143,16 @@ struct MachineSnapshot {
     bool processor_detached{false};
     GId blocking_task{0};
     std::uint64_t long_syscall_count{0};
+};
+
+// 调度器热点计数器。所有时间均为 steady_clock 纳秒，采用累计值，便于
+// 调用方按两次快照的差值计算单次 Fiber 运行、切换和本地队列命中成本。
+struct SchedulerMetrics {
+    std::uint64_t task_runs{0};
+    std::uint64_t task_completions{0};
+    std::uint64_t fiber_resume_ns{0};
+    std::uint64_t local_queue_pops{0};
+    std::uint64_t steal_pops{0};
 };
 
 class Task : public std::enable_shared_from_this<Task> {
@@ -375,10 +388,12 @@ public:
     // 每次监控周期都会递增，即使调度器互斥量正被高负载路径占用。
     // 该计数只用于活性观测，不参与调度决策。
     std::uint64_t sysmon_pass_count() const noexcept;
+    SchedulerMetrics metrics() const noexcept;
     bool SysmonRunning() const noexcept { return sysmon_running(); }
     std::uint64_t SysmonPassCount() const noexcept {
         return sysmon_pass_count();
     }
+    SchedulerMetrics Metrics() const noexcept { return metrics(); }
 
     // Returns the task currently executing on this thread, if any.  These
     // values are observational and are never used for ownership.
@@ -394,6 +409,8 @@ public:
     static PId CurrentProcessorId() noexcept { return current_processor_id(); }
 
 private:
+    // 仅供拥有该 G 执行权的 worker 在 resume 返回后调用。
+    bool requeue_from_worker(const std::shared_ptr<Task>& task);
     static void leave_blocking_for(Scheduler* scheduler,
                                    MId machine_id) noexcept;
     bool park_with_reason(const std::shared_ptr<Task>& task,

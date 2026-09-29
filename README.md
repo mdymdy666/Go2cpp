@@ -12,6 +12,8 @@
   以及支持阻塞、关闭和 select 的类型化 channel；
 - Linux epoll `IOManager` 和默认启用、带 FD generation 关闭保护的 socket Hook；
 - 支持 `Is`、`As`、`Unwrap`、`Join` 的不可变错误链；
+- 线程安全、可替换 Filter/Formatter/Worker/Sink 的日志模块，以及可校验的 INI
+  配置模块；默认 warning/error 写入 `log/go2cpp.log`，stdout 需显式开启。
 - Fiber 边界捕获普通 C++ 异常并通过 Fiber::failure()/Task::failure() 报告；资源清理由 RAII 和 try/catch 负责。
 - 提供显式 defer、panic、recover 状态对象：defer 用 RAII 保证作用域退出的 LIFO 回调，
   panic::call() 发布共享错误状态，recover::take() 只能在 defer 回调中消费；它不会伪造 C++ 栈跳转。
@@ -42,6 +44,10 @@ ctest --test-dir build --output-on-failure
 以及 Linux Hook 构建下的 `io_hook_demo.cpp`。其中
 `mixed_runtime_demo.cpp` 展示普通线程与 Fiber 的同步、FiberLocal 值、
 线程级 Hook 策略和显式 `BlockingRegion`。
+
+日志和配置的完整新手示例是 `example/log_config_demo.cpp`，工程配置模板是根目录
+的 `go2cpp.ini`，详细说明见 [`docs/logging.md`](docs/logging.md) 和
+[`docs/configuration.md`](docs/configuration.md)。
 
 
 ## 新手入口
@@ -74,8 +80,8 @@ go2cpp::shutdown_default_scheduler();
 
 转译代码需要完整公共接口时，包含 `go2cpp/runtime.hpp`。模块 target
 （`go2cpp::error`、`go2cpp::control_flow`、`go2cpp::context`、`go2cpp::channel`、
-`go2cpp::scheduler`、`go2cpp::fiber`、
-`go2cpp::sync`、`go2cpp::io`、`go2cpp::hook`）既可在源码树中单独使用，
+`go2cpp::scheduler`、`go2cpp::fiber`、`go2cpp::sync`、`go2cpp::io`、
+`go2cpp::log`、`go2cpp::config`、`go2cpp::hook`）既可在源码树中单独使用，
 也会与 `go2cpp::runtime` umbrella target 一起导出。
 
 

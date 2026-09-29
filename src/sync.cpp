@@ -268,7 +268,10 @@ bool AbortConditionWait(Mutex& mutex, bool preserve_lock = false) {
 
 struct Mutex::Impl {
     std::mutex m_mutex;
-    bool m_locked{false};
+    // 无竞争路径只需一次 CAS，不再为每个 Fiber 的 Lock/Unlock 获取
+    // 慢路径互斥量；有等待者时仍由 m_mutex 串行化 FIFO handoff。
+    std::atomic<bool> m_fast_locked{false};
+    std::atomic<bool> m_has_waiters{false};
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
 };
 
@@ -280,12 +283,11 @@ bool Mutex::Lock(const ContextPtr& context) {
         return false;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(m_impl->m_mutex);
-        if (!m_impl->m_locked) {
-            m_impl->m_locked = true;
-            return true;
-        }
+    bool expected = false;
+    if (m_impl->m_fast_locked.compare_exchange_strong(
+            expected, true, std::memory_order_acquire,
+            std::memory_order_relaxed)) {
+        return true;
     }
 
     const WaitTarget target = CurrentTarget();
@@ -306,13 +308,18 @@ bool Mutex::Lock(const ContextPtr& context) {
             waiter->result() != WaitResult::kWaiting) {
             return false;
         }
-        if (!m_impl->m_locked) {
-            m_impl->m_locked = true;
+        expected = false;
+        if (m_impl->m_fast_locked.compare_exchange_strong(
+                expected, true, std::memory_order_acquire,
+                std::memory_order_relaxed)) {
             return true;
         }
         m_impl->m_waiters.push_back(waiter);
+        m_impl->m_has_waiters.store(true, std::memory_order_release);
         if (!waiter->Arm()) {
             m_impl->m_waiters.pop_back();
+            m_impl->m_has_waiters.store(!m_impl->m_waiters.empty(),
+                                        std::memory_order_release);
             return false;
         }
     }
@@ -322,6 +329,8 @@ bool Mutex::Lock(const ContextPtr& context) {
     if (result != WaitResult::kNotified) {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
         RemoveWaiter(m_impl->m_waiters, waiter);
+        m_impl->m_has_waiters.store(!m_impl->m_waiters.empty(),
+                                    std::memory_order_release);
         return false;
     }
     return true;
@@ -344,19 +353,25 @@ bool Mutex::LockFor(ContextDuration timeout, const ContextPtr& parent) {
 }
 
 bool Mutex::TryLock() noexcept {
-    std::lock_guard<std::mutex> lock(m_impl->m_mutex);
-    if (m_impl->m_locked) {
-        return false;
-    }
-    m_impl->m_locked = true;
-    return true;
+    bool expected = false;
+    return m_impl->m_fast_locked.compare_exchange_strong(
+        expected, true, std::memory_order_acquire,
+        std::memory_order_relaxed);
 }
 
 void Mutex::Unlock() {
+    if (!m_impl->m_has_waiters.load(std::memory_order_acquire)) {
+        bool expected = true;
+        if (m_impl->m_fast_locked.compare_exchange_strong(
+                expected, false, std::memory_order_release,
+                std::memory_order_relaxed)) {
+            return;
+        }
+    }
     std::shared_ptr<WaitNode> selected;
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
-        if (!m_impl->m_locked) {
+        if (!m_impl->m_fast_locked.load(std::memory_order_acquire)) {
             throw std::logic_error("go2cpp::sync::Mutex unlock of unlocked mutex");
         }
         while (!m_impl->m_waiters.empty()) {
@@ -369,7 +384,11 @@ void Mutex::Unlock() {
             }
         }
         if (!selected) {
-            m_impl->m_locked = false;
+            m_impl->m_has_waiters.store(false, std::memory_order_release);
+            m_impl->m_fast_locked.store(false, std::memory_order_release);
+        } else {
+            m_impl->m_has_waiters.store(!m_impl->m_waiters.empty(),
+                                        std::memory_order_release);
         }
         // With a selected waiter the lock remains logically held: ownership
         // is handed directly to the FIFO head, so a TryLock caller cannot barge.
