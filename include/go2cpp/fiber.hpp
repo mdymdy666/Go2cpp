@@ -106,6 +106,10 @@ public:
     // failed, or concurrently resumed Fiber. User exceptions never escape;
     // they are retained by failure() and set state() to Failed.
     bool resume() noexcept;
+    // 调度器内部的快速恢复入口。G 已经由 Scheduler 串行化 resume，首次
+    // 进入仍校验父级，后续恢复跳过重复的父链元数据锁；普通用户必须使用
+    // resume()，以保留严格的调用者校验。
+    bool resume_from_scheduler() noexcept;
     // 与 resume 相同，但返回显式状态和失败时的调用链快照，适合父 Fiber
     // 按 try/catch 风格决定继续、转换错误或向上报告。
     FiberResumeResult resume_result() noexcept;

@@ -11,6 +11,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace go2cpp::sync {
 namespace {
@@ -101,6 +102,14 @@ public:
     const std::shared_ptr<Task>& task() const noexcept { return m_task; }
     Scheduler* scheduler() const noexcept { return m_scheduler; }
 
+    void Reset(Scheduler* scheduler, std::shared_ptr<Task> task) noexcept {
+        std::lock_guard<std::mutex> lock(m_wake_mutex);
+        m_active = false;
+        m_scheduler = scheduler;
+        m_task = std::move(task);
+        m_result.store(WaitResult::kWaiting, std::memory_order_release);
+    }
+
 private:
     Scheduler* m_scheduler{nullptr};
     std::shared_ptr<Task> m_task;
@@ -110,6 +119,32 @@ private:
     std::condition_variable m_native_condition;
     bool m_active{false};
 };
+
+// WaitNode 只在等待期间被队列或取消回调引用。完成一次等待后将对象放回
+// 当前 M 的小缓存，避免混合 Mutex 在短临界区竞争时反复分配控制块和
+// condition_variable。缓存节点已清空 scheduler/task，不延长用户对象生命期。
+thread_local std::vector<std::shared_ptr<WaitNode>> t_wait_node_cache;
+
+std::shared_ptr<WaitNode> AcquireWaitNode(Scheduler* scheduler,
+                                          std::shared_ptr<Task> task) {
+    if (!t_wait_node_cache.empty()) {
+        auto waiter = std::move(t_wait_node_cache.back());
+        t_wait_node_cache.pop_back();
+        waiter->Reset(scheduler, std::move(task));
+        return waiter;
+    }
+    return std::make_shared<WaitNode>(scheduler, std::move(task));
+}
+
+void ReleaseWaitNode(std::shared_ptr<WaitNode> waiter) noexcept {
+    if (!waiter) {
+        return;
+    }
+    waiter->Reset(nullptr, {});
+    if (t_wait_node_cache.size() < 32U) {
+        t_wait_node_cache.push_back(std::move(waiter));
+    }
+}
 
 struct WaitTarget {
     Scheduler* scheduler{nullptr};
@@ -284,7 +319,8 @@ bool Mutex::Lock(const ContextPtr& context) {
     }
 
     bool expected = false;
-    if (m_impl->m_fast_locked.compare_exchange_strong(
+    if (!m_impl->m_has_waiters.load(std::memory_order_acquire) &&
+        m_impl->m_fast_locked.compare_exchange_strong(
             expected, true, std::memory_order_acquire,
             std::memory_order_relaxed)) {
         return true;
@@ -299,19 +335,48 @@ bool Mutex::Lock(const ContextPtr& context) {
     if (target && target.task->cancellation_requested()) {
         return false;
     }
-    const auto waiter =
-        std::make_shared<WaitNode>(target.scheduler, target.task);
+
+    // 混合并发下，短临界区通常只需要等待当前 Fiber 完成一小段工作。
+    // 先让受调度的 G 协作式让出执行权，避免为每一次短暂竞争分配
+    // WaitNode、注册取消回调并进入 Scheduler::park 的慢路径。只在没有
+    // 已发布等待者时使用该路径；一旦形成等待队列，仍由 FIFO handoff
+    // 保证公平和跨线程唤醒语义。单 P 调度器不启用重试，因此保留严格
+    // 的发布顺序；多 P 场景只在尚未发布等待节点时走该短路径。
+    if (target && target.scheduler->processor_count() > 1 &&
+        !m_impl->m_has_waiters.load(std::memory_order_acquire)) {
+        constexpr int kCooperativeAttempts = 16;
+        for (int attempt = 0; attempt < kCooperativeAttempts; ++attempt) {
+            if (m_impl->m_has_waiters.load(std::memory_order_acquire)) {
+                break;
+            }
+            expected = false;
+            if (m_impl->m_fast_locked.compare_exchange_weak(
+                    expected, true, std::memory_order_acquire,
+                    std::memory_order_relaxed)) {
+                return true;
+            }
+            if (target.task->cancellation_requested() ||
+                !target.scheduler->yield_current()) {
+                break;
+            }
+        }
+    }
+    const auto waiter = AcquireWaitNode(target.scheduler, target.task);
     ContextSubscription subscription(context, waiter);
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
         if ((context && context->IsDone()) ||
             waiter->result() != WaitResult::kWaiting) {
+            subscription.Reset();
+            ReleaseWaitNode(waiter);
             return false;
         }
         expected = false;
         if (m_impl->m_fast_locked.compare_exchange_strong(
                 expected, true, std::memory_order_acquire,
                 std::memory_order_relaxed)) {
+            subscription.Reset();
+            ReleaseWaitNode(waiter);
             return true;
         }
         m_impl->m_waiters.push_back(waiter);
@@ -320,6 +385,8 @@ bool Mutex::Lock(const ContextPtr& context) {
             m_impl->m_waiters.pop_back();
             m_impl->m_has_waiters.store(!m_impl->m_waiters.empty(),
                                         std::memory_order_release);
+            subscription.Reset();
+            ReleaseWaitNode(waiter);
             return false;
         }
     }
@@ -331,8 +398,10 @@ bool Mutex::Lock(const ContextPtr& context) {
         RemoveWaiter(m_impl->m_waiters, waiter);
         m_impl->m_has_waiters.store(!m_impl->m_waiters.empty(),
                                     std::memory_order_release);
+        ReleaseWaitNode(waiter);
         return false;
     }
+    ReleaseWaitNode(waiter);
     return true;
 }
 
@@ -353,6 +422,9 @@ bool Mutex::LockFor(ContextDuration timeout, const ContextPtr& parent) {
 }
 
 bool Mutex::TryLock() noexcept {
+    if (m_impl->m_has_waiters.load(std::memory_order_acquire)) {
+        return false;
+    }
     bool expected = false;
     return m_impl->m_fast_locked.compare_exchange_strong(
         expected, true, std::memory_order_acquire,

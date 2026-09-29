@@ -5,6 +5,24 @@
 > 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
 > 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
 
+## 2026-09-29：调度器与混合锁性能整改
+
+- 本地 P 队列成功取到 G 后跳过调度器全局 admission 锁；G/M/P 计数统一在
+  两条取任务路径之后更新，避免本地快路径遗漏运行计数。
+- `maybe_grow()` 改为有界维护周期，同时保留 runnable backlog 下的初始 worker
+  补齐，修复并发 shutdown 测试中第二个 G 被取消而无法执行的问题。
+- Scheduler Fiber 恢复增加首次父级绑定和后续快速恢复入口；同一 M 上不再
+  每次重复获取 Fiber 父链元数据锁，迁移到新 M/P 时仍更新调试绑定。
+- 混合 Mutex 增加有界 Fiber 协作重试，并在已有 FIFO 等待者时禁止无序快进；
+  短临界区基准从约 13.9 秒降至约 0.10～0.20 秒。
+- 新增 `docs/performance.md`，记录 50,000 任务、混合锁、Channel、IO 的
+  实测结果，以及 Coost 官方资料和当前无法进行同机源码基准的原因。不得将
+  Coost 官方日志吞吐表冒充调度器或锁性能结果。
+- 验证：`go2cpp_high_load_stress` 完成全部检查；调度器定向测试连续 3 次
+  通过；工程化构建 CTest 13/13、`-Werror` CTest 3/3、ASan+UBSan
+  `go2cpp_tests` 全部通过；Valgrind Memcheck 报告 0 definite/indirect/possible
+  leak，0 errors，416B/4 blocks 为进程级 still reachable 缓存。
+
 ## 2026-09-26：Context 局部回滚
 
 - 新增 `ContextRollback`/`RollbackScope`：临时子 Context、LIFO undo、savepoint、

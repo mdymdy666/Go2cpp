@@ -467,14 +467,24 @@ void Task::run() {
     // 只能沿同一逻辑 G 的父链恢复，即使 G 迁移到另一个 M 也不会丢失
     // 调度器归属。
     if (Scheduler* const scheduler = Scheduler::current_scheduler()) {
-        fiber->bind_execution(FiberExecutionBinding{
-            reinterpret_cast<std::uintptr_t>(scheduler), id(), t_machine_id,
-            t_processor_id, true});
+        // 同一个 M 上的连续 yield 不需要重复获取 Fiber 元数据锁。发生
+        // 迁移时才更新调试绑定，保留跨 M 运行的可观测性。
+        if (m_last_machine_id != t_machine_id ||
+            m_last_processor_id != t_processor_id || !m_binding_published) {
+            fiber->bind_execution(FiberExecutionBinding{
+                reinterpret_cast<std::uintptr_t>(scheduler), id(),
+                t_machine_id, t_processor_id, true});
+            m_last_machine_id = t_machine_id;
+            m_last_processor_id = t_processor_id;
+            m_binding_published = true;
+        }
     }
     // Only this run claim can move/destroy m_fiber, and it does so after
     // resume() returns while holding m_transition_mutex. A concurrent cancel
     // can therefore safely request cancellation on this stable pointer.
-    const bool resumed = fiber->resume();
+    const bool resumed = Scheduler::current_scheduler() != nullptr
+                             ? fiber->resume_from_scheduler()
+                             : fiber->resume();
     const FiberState fiber_state = fiber->state();
     const auto fiber_failure = fiber_state == FiberState::Failed
                                    ? fiber->failure()
@@ -1993,14 +2003,14 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         if (task && m_impl->stopping.load(std::memory_order_acquire)) {
             task->request_cancel(false);
         }
-        {
+        if (!task) {
             // Queue removal, the shutdown check, and the runnable->running
-            // claim form one admission transaction.  In particular, an
-            // external enqueue cannot observe a popped Runnable G with its
-            // queued bit already cleared and publish a duplicate node before
-            // this worker owns the execution claim.
+            // claim form one admission transaction.  A task already claimed
+            // from this worker's local queue skips this global mutex entirely:
+            // the worker owns the execution claim and the local queue lock has
+            // already made the node invisible to stealers.
             std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
-            if (!task && !m_impl->stopping.load(std::memory_order_acquire)) {
+            if (!m_impl->stopping.load(std::memory_order_acquire)) {
                 const bool prefer_class =
                     machine->last_task_class != 0 &&
                     machine->affinity_budget != 0 &&
@@ -2120,38 +2130,51 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         // duplicate made the execution claim fail.
                         task->clear_queued();
                     }
-                    if (claimed) {
-                        m_impl->running_workers.fetch_add(
-                            1, std::memory_order_relaxed);
-                        machine->state.store(MState::kRunning,
-                                             std::memory_order_release);
-                        const auto task_class = task->task_class();
-                        if (task_class != 0 && task_class ==
-                                                    machine->last_task_class &&
-                            machine->affinity_budget != 0) {
-                            ++machine->affinity_hits;
-                            --machine->affinity_budget;
-                        } else {
-                            if (machine->last_task_class != 0 &&
-                                task_class != machine->last_task_class) {
-                                ++machine->affinity_misses;
-                            }
-                            machine->last_task_class = task_class;
-                            machine->affinity_budget =
-                                task_class == 0
-                                    ? 0
-                                    : m_impl->config.task_affinity_budget;
-                        }
-                    }
                 }
             }
         }
 
+        // Both the local fast path and the admission path arrive here with a
+        // claimed G. Keep the M/P accounting in one place so a local dequeue
+        // cannot skip running_workers/affinity bookkeeping.
         if (task && claimed) {
-            // A pre-start backlog needs growth too. Account for this claim
-            // before checking demand so a blocked first G cannot prevent its
-            // queued peer from getting a replacement M (within the P cap).
-            m_impl->maybe_grow(this);
+            m_impl->running_workers.fetch_add(1, std::memory_order_relaxed);
+            machine->state.store(MState::kRunning, std::memory_order_release);
+            const auto task_class = task->task_class();
+            if (task_class != 0 && task_class == machine->last_task_class &&
+                machine->affinity_budget != 0) {
+                ++machine->affinity_hits;
+                --machine->affinity_budget;
+            } else {
+                if (machine->last_task_class != 0 &&
+                    task_class != machine->last_task_class) {
+                    ++machine->affinity_misses;
+                }
+                machine->last_task_class = task_class;
+                machine->affinity_budget =
+                    task_class == 0 ? 0 : m_impl->config.task_affinity_budget;
+            }
+        }
+
+        if (task && claimed) {
+            // Growth is maintenance, not part of the Fiber switch hot path.
+            // A previous implementation scanned/reaped under scheduler locks
+            // for every resume, which dominated short yield workloads. Check
+            // quickly on a backlog and otherwise amortize the scan.
+            ++maintenance_budget;
+            const auto growth_period =
+                m_impl->runnable.load(std::memory_order_relaxed) >
+                        m_impl->processors.size()
+                    ? std::size_t{8}
+                    : std::size_t{64};
+            const bool needs_initial_worker =
+                m_impl->active_workers.load(std::memory_order_relaxed) <
+                    m_impl->processors.size() &&
+                m_impl->runnable.load(std::memory_order_relaxed) != 0;
+            if (needs_initial_worker || maintenance_budget >= growth_period) {
+                m_impl->maybe_grow(this);
+                maintenance_budget = 0;
+            }
             own_processor.running_machines.fetch_add(1,
                                                      std::memory_order_relaxed);
             own_processor.state.store(PState::kRunning,
@@ -2210,7 +2233,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             std::vector<std::shared_ptr<Task>> deferred_destruction;
             const bool draining =
                 m_impl->draining.load(std::memory_order_acquire);
-            if (draining || ++maintenance_budget >= 64) {
+            if (draining || maintenance_budget >= 64) {
                 std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
                 m_impl->collect_terminal_locked(deferred_destruction);
                 (void)m_impl->finish_draining_locked();

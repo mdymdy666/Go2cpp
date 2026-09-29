@@ -245,6 +245,9 @@ private:
     std::atomic<bool> m_run_claim{false};
     std::atomic<bool> m_started{false};
     std::atomic<bool> m_cancel_requested{false};
+    MId m_last_machine_id{0};
+    PId m_last_processor_id{0};
+    bool m_binding_published{false};
     mutable std::mutex m_failure_mutex;
     std::exception_ptr m_failure;
     // No-allocation rescue queue link. It is changed only under the owning

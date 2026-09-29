@@ -392,6 +392,25 @@ struct Fiber::Impl {
         return result;
     }
 
+    bool resume_from_scheduler() noexcept {
+        bool expected = false;
+        if (!m_resume_claim.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return false;
+        }
+        if (!m_scheduler_parent_bound) {
+            if (!bind_caller(s_current_fiber)) {
+                m_resume_claim.store(false, std::memory_order_release);
+                return false;
+            }
+            m_scheduler_parent_bound = true;
+        }
+        const bool result = resume_locked(false);
+        m_resume_claim.store(false, std::memory_order_release);
+        return result;
+    }
+
     // 首次进入时固定直接父 Fiber；之后只能由同一个父级恢复。
     // 父链的可观测信息放在共享记录中，真正恢复仍验证父对象存活。
     // 先复制父记录，再写入本 Fiber，避免同时锁两个 Fiber 的记录而形成
@@ -587,6 +606,7 @@ struct Fiber::Impl {
     boost::context::detail::fcontext_t m_context{nullptr};
     boost::context::detail::fcontext_t m_caller{nullptr};
     std::atomic<bool> m_scheduler_propagate{false};
+    bool m_scheduler_parent_bound{false};
     std::atomic<bool> m_resume_claim{false};
     mutable std::mutex m_metadata_mutex;
     Fiber* m_parent{nullptr};
@@ -611,6 +631,10 @@ Fiber::Fiber(Function function, std::size_t stack_size)
 Fiber::~Fiber() = default;
 
 bool Fiber::resume() noexcept { return m_impl->resume(); }
+
+bool Fiber::resume_from_scheduler() noexcept {
+    return m_impl->resume_from_scheduler();
+}
 
 FiberResumeResult Fiber::resume_result() noexcept {
     FiberResumeResult result;
