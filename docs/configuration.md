@@ -19,3 +19,21 @@ if (!go2cpp::config::LoadRuntimeConfig("go2cpp.ini", &config, &error) ||
     // 配置错误时不要启动业务 Scheduler
 }
 ```
+
+配置中心提供类似 Sylar `ConfigVar` 的强类型变量和监听器：
+
+```cpp
+auto& registry = go2cpp::config::Config::Instance();
+auto workers = registry.Lookup<std::size_t>("scheduler.max_workers", 0,
+                                             "最大 M 数量");
+workers->AddListener([](const auto&, const auto& current) {
+    // 在线刷新业务侧参数
+});
+registry.StartWatcher("go2cpp.ini", std::chrono::milliseconds(500));
+```
+
+`Config::LoadFromFile` 会先校验所有已注册变量的类型，再统一提交变更；监听器只
+在值真正改变后触发。`BindLoggingConfig` 将 `log.*` 变量绑定到 LoggerManager，
+因此热加载会更新已经存在的 Logger。`BindRuntimeConfig` 可以把调度参数绑定到
+一个 `RuntimeConfig` 对象；已经启动的 Scheduler 对 P/M 队列结构参数仍建议重新
+创建，避免在线改变队列拓扑。

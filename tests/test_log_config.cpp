@@ -13,6 +13,7 @@ void run_log_config_tests() {
     go2cpp_tests::announce("日志与配置工程化接口");
     using namespace go2cpp;
     using namespace go2cpp::config;
+    using namespace std::chrono_literals;
     IniFile ini;
     std::string error;
     GO2CPP_REQUIRE(ini.Parse("# 注释\n[scheduler]\nmin_workers=1\nmax_workers=4\n[log]\nlevel=info\nstdout=false\n", &error));
@@ -55,4 +56,57 @@ void run_log_config_tests() {
     GO2CPP_CHECK(contents.str().find("警告写入文件") != std::string::npos);
     GO2CPP_CHECK(contents.str().find("不会写入") == std::string::npos);
     std::filesystem::remove_all(directory);
+
+    // Sylar 风格的 %d/%T/%N/%p/%m 格式和多输出地。
+    auto memory = std::make_shared<log::MemorySink>();
+    auto root = std::make_shared<Logger>("root-test");
+    root->SetLevel(log::Level::Info);
+    root->AddWorker(std::make_shared<log::LogItemWorker>(
+        std::make_shared<log::MinimumLevelFilter>(log::Level::Info),
+        std::make_shared<log::PatternFormatter>("%p%T%N%T%m%n"), memory));
+    auto child = std::make_shared<Logger>("child-test");
+    child->SetLevel(log::Level::Info);
+    child->SetParent(root);
+    child->SetPropagate(true);
+    GO2CPP_LOG_INFO(child) << "层级传播";
+    const auto lines = memory->Snapshot();
+    GO2CPP_REQUIRE(lines.size() == 1);
+    GO2CPP_CHECK(lines.front().find("INFO\tchild-test\t层级传播") != std::string::npos);
+
+    const auto rotating_path = std::filesystem::temp_directory_path() / "go2cpp-rotate.log";
+    std::filesystem::remove(rotating_path);
+    auto rotating = std::make_shared<log::RotatingFileSink>(
+        rotating_path.string(), 32, 2);
+    log::LogRecord record;
+    for (int i = 0; i < 8; ++i) rotating->Write(record, "012345678901234567890123456789\n");
+    GO2CPP_CHECK(std::filesystem::exists(rotating_path.string() + ".1"));
+    std::filesystem::remove(rotating_path);
+    std::filesystem::remove(rotating_path.string() + ".1");
+    std::filesystem::remove(rotating_path.string() + ".2");
+
+    // ConfigVar 监听器和文件热加载：修改 ini 后已创建 Logger 立即切换级别。
+    auto& registry = config::Config::Instance();
+    GO2CPP_REQUIRE(config::BindLoggingConfig(registry, &error));
+    const auto watch_path = std::filesystem::temp_directory_path() / "go2cpp-dynamic.ini";
+    {
+        std::ofstream watch_file(watch_path);
+        watch_file << "[log]\nlevel=error\nstdout=false\nformat={message}\\n\n";
+    }
+    GO2CPP_REQUIRE(registry.StartWatcher(watch_path.string(), std::chrono::milliseconds(20)));
+    auto dynamic_logger = GO2CPP_LOG_NAME("dynamic");
+    GO2CPP_CHECK(dynamic_logger->level() == log::Level::Error);
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    {
+        std::ofstream watch_file(watch_path, std::ios::trunc);
+        watch_file << "[log]\nlevel=info\nstdout=false\nformat=%p:%m%n\n";
+    }
+    GO2CPP_REQUIRE_EVENTUALLY(dynamic_logger->level() == log::Level::Info, 1s);
+    registry.StopWatcher();
+    std::filesystem::remove(watch_path);
+
+    RuntimeConfig dynamic_runtime;
+    GO2CPP_REQUIRE(config::BindRuntimeConfig(registry, &dynamic_runtime, &error));
+    auto max_workers = registry.Lookup<std::size_t>("scheduler.max_workers", 0, "最大 M");
+    max_workers->SetValue(8);
+    GO2CPP_CHECK(dynamic_runtime.scheduler.max_workers == 8);
 }

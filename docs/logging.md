@@ -28,3 +28,18 @@ void report() {
 配置应在第一次调用 `GO2CPP_LOG_NAME` 前加载，这样新建 Logger 会使用新的目录、
 文件和格式。已经创建的 Logger 会立即更新等级；如需切换输出目标，建议重新配置
 后再创建模块 Logger。
+
+格式器同时兼容 Sylar 常用的 `%d{%Y-%m-%d %H:%M:%S}%T%N%T[%p]%T%f:%l-%T%m%n`
+标记。模块还提供 `RotatingFileSink`、`StderrSink` 和 `MemorySink`；一个 Logger 可
+挂载多个 Worker，每个 Worker 独立设置 Filter、Formatter、Sink，并可将记录传播到
+父 Logger。
+
+动态配置示例：
+
+```cpp
+auto& config = go2cpp::config::Config::Instance();
+go2cpp::config::BindLoggingConfig(config);
+config.StartWatcher("go2cpp.ini", std::chrono::milliseconds(500));
+```
+
+修改配置文件后，已创建的 Logger 会即时更新日志级别、格式、文件和 stdout 输出。

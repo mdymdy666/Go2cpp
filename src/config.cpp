@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <charconv>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
+#include <iostream>
 
 namespace go2cpp::config {
 namespace {
@@ -76,6 +78,10 @@ bool IniFile::Parse(const std::string& text, std::string* error) {
         auto value = Trim(clean.substr(equal + 1));
         const auto comment = value.find_first_of("#;");
         if (comment != std::string::npos) value = Trim(value.substr(0, comment));
+        for (std::size_t position = 0; (position = value.find("\\n", position)) != std::string::npos;) {
+            value.replace(position, 2, "\n");
+            ++position;
+        }
         if (key.empty()) { if (error) *error = "配置键为空，行 " + std::to_string(line_number); return false; }
         m_sections[current][key] = value;
     }
@@ -143,6 +149,155 @@ bool RuntimeConfig::ApplyLogging(std::string* error) const {
 bool LoadRuntimeConfig(const std::string& path, RuntimeConfig* config, std::string* error) {
     IniFile ini;
     return ini.Load(path, error) && RuntimeConfig::FromIni(ini, config, error);
+}
+
+Config& Config::Instance() {
+    static Config instance;
+    return instance;
+}
+
+Config::~Config() { StopWatcher(); }
+
+ConfigVarBase::ptr Config::LookupBase(const std::string& name) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto it = m_vars.find(name);
+    return it == m_vars.end() ? nullptr : it->second;
+}
+
+bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
+    const auto variables = List();
+    // 先检查所有已注册项对应的文本能否转换；实际写入仍按变量顺序完成，
+    // 这样错误能指出具体变量，同时不要求所有类型都暴露内部临时值。
+    std::vector<std::pair<ConfigVarBase::ptr, std::string>> pending;
+    for (const auto& variable : variables) {
+        if (!variable) continue;
+        const auto separator = variable->name().find('.');
+        const auto section = separator == std::string::npos ? "global" : variable->name().substr(0, separator);
+        const auto key = separator == std::string::npos ? variable->name() : variable->name().substr(separator + 1);
+        if (!ini.Has(section, key)) continue;
+        const auto text = ini.Get(section, key);
+        if (!variable->ValidateString(text, error)) return false;
+        pending.emplace_back(variable, text);
+    }
+    for (const auto& [variable, text] : pending) if (!variable->FromString(text, error)) return false;
+    return true;
+}
+
+bool Config::LoadFromFile(const std::string& path, std::string* error) {
+    IniFile ini;
+    return ini.Load(path, error) && LoadFromIni(ini, error);
+}
+
+std::vector<ConfigVarBase::ptr> Config::List() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<ConfigVarBase::ptr> result;
+    result.reserve(m_vars.size());
+    for (const auto& [name, variable] : m_vars) result.push_back(variable);
+    return result;
+}
+
+bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds interval) {
+    if (path.empty() || interval <= std::chrono::milliseconds::zero()) return false;
+    StopWatcher();
+    std::error_code error;
+    auto stamp = std::filesystem::last_write_time(path, error);
+    if (error) return false;
+    if (!LoadFromFile(path, nullptr)) return false;
+    m_watching.store(true, std::memory_order_release);
+    m_watcher = std::thread([this, path, interval, stamp]() mutable {
+        while (m_watching.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(interval);
+            if (!m_watching.load(std::memory_order_acquire)) break;
+            std::error_code read_error;
+            const auto current = std::filesystem::last_write_time(path, read_error);
+            if (read_error || current == stamp) continue;
+            std::string error;
+            if (LoadFromFile(path, &error)) {
+                stamp = current;
+            } else {
+                std::cerr << "Go2Cpp 配置热加载失败: " << error << '\n';
+                stamp = current;
+            }
+        }
+    });
+    return true;
+}
+
+void Config::StopWatcher() {
+    m_watching.store(false, std::memory_order_release);
+    if (m_watcher.joinable()) {
+        if (m_watcher.get_id() == std::this_thread::get_id()) m_watcher.detach();
+        else m_watcher.join();
+    }
+}
+
+bool BindLoggingConfig(Config& config, std::string* error) {
+    auto level = config.Lookup<log::Level>("log.level", log::Level::Warn, "日志最低级别");
+    auto stdout_enabled = config.Lookup<bool>("log.stdout", false, "是否输出到 stdout");
+    auto directory = config.Lookup<std::string>("log.directory", "log", "日志目录");
+    auto file = config.Lookup<std::string>("log.file", "go2cpp.log", "日志文件名");
+    auto format = config.Lookup<std::string>("log.format", "{time} [{level}] {logger} ({file}:{line}) {message}\n", "日志格式");
+    if (!level || !stdout_enabled || !directory || !file || !format) {
+        if (error) *error = "日志配置变量类型冲突";
+        return false;
+    }
+    const std::weak_ptr<ConfigVar<log::Level>> weak_level = level;
+    const std::weak_ptr<ConfigVar<bool>> weak_stdout = stdout_enabled;
+    const std::weak_ptr<ConfigVar<std::string>> weak_directory = directory;
+    const std::weak_ptr<ConfigVar<std::string>> weak_file = file;
+    const std::weak_ptr<ConfigVar<std::string>> weak_format = format;
+    const auto apply = [weak_level, weak_stdout, weak_directory, weak_file, weak_format]() {
+        const auto current_level = weak_level.lock();
+        const auto current_stdout = weak_stdout.lock();
+        const auto current_directory = weak_directory.lock();
+        const auto current_file = weak_file.lock();
+        const auto current_format = weak_format.lock();
+        if (!current_level || !current_stdout || !current_directory || !current_file || !current_format) return;
+        log::LoggerManager::Instance().Configure(current_level->GetValue(), current_stdout->GetValue(),
+                                                  current_directory->GetValue(), current_file->GetValue(), current_format->GetValue());
+    };
+    level->AddListener([apply](const log::Level&, const log::Level&) { apply(); });
+    stdout_enabled->AddListener([apply](const bool&, const bool&) { apply(); });
+    directory->AddListener([apply](const std::string&, const std::string&) { apply(); });
+    file->AddListener([apply](const std::string&, const std::string&) { apply(); });
+    format->AddListener([apply](const std::string&, const std::string&) { apply(); });
+    apply();
+    return true;
+}
+
+bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error) {
+    if (!target) { if (error) *error = "RuntimeConfig 绑定目标为空"; return false; }
+    if (!BindLoggingConfig(config, error)) return false;
+    bool valid = true;
+    const auto bind_size = [&config, target, &valid](const std::string& name, std::size_t* field, const char* description) {
+        auto variable = config.Lookup<std::size_t>(name, *field, description);
+        if (!variable) { valid = false; return; }
+        variable->AddListener([field](const std::size_t&, const std::size_t& value) { *field = value; });
+    };
+    bind_size("scheduler.processor_count", &target->scheduler.processor_count, "P 数量，0 为自动");
+    bind_size("scheduler.min_workers", &target->scheduler.min_workers, "最小 M 数量");
+    bind_size("scheduler.max_workers", &target->scheduler.max_workers, "最大 M 数量");
+    bind_size("scheduler.local_queue_limit", &target->scheduler.local_queue_limit, "P 本地队列容量");
+    bind_size("scheduler.fiber_stack_size", &target->scheduler.fiber_stack_size, "Fiber 初始栈大小");
+    bind_size("scheduler.task_affinity_budget", &target->scheduler.task_affinity_budget, "任务亲和预算");
+    auto allow_oversubscription = config.Lookup<bool>("scheduler.allow_worker_oversubscription", target->scheduler.allow_worker_oversubscription, "允许 M 超过 P");
+    auto enable_sysmon = config.Lookup<bool>("scheduler.enable_sysmon", target->scheduler.enable_sysmon, "启用 sysmon");
+    auto pin_workers = config.Lookup<bool>("scheduler.pin_workers_to_cpu", target->scheduler.pin_workers_to_cpu, "绑定 CPU");
+    if (!allow_oversubscription || !enable_sysmon || !pin_workers) valid = false;
+    allow_oversubscription->AddListener([target](const bool&, const bool& value) { target->scheduler.allow_worker_oversubscription = value; });
+    enable_sysmon->AddListener([target](const bool&, const bool& value) { target->scheduler.enable_sysmon = value; });
+    pin_workers->AddListener([target](const bool&, const bool& value) { target->scheduler.pin_workers_to_cpu = value; });
+    auto idle_wait = config.Lookup<std::size_t>("scheduler.idle_wait_ms", target->scheduler.idle_wait.count(), "空闲等待毫秒");
+    auto idle_timeout = config.Lookup<std::size_t>("scheduler.idle_worker_timeout_ms", target->scheduler.idle_worker_timeout.count(), "空闲 M 回收毫秒");
+    auto sysmon_interval = config.Lookup<std::size_t>("scheduler.sysmon_interval_ms", target->scheduler.sysmon_interval.count(), "sysmon 周期毫秒");
+    auto syscall_threshold = config.Lookup<std::size_t>("scheduler.long_syscall_threshold_ms", target->scheduler.long_syscall_threshold.count(), "长系统调用阈值毫秒");
+    if (!idle_wait || !idle_timeout || !sysmon_interval || !syscall_threshold) valid = false;
+    idle_wait->AddListener([target](const std::size_t&, const std::size_t& value) { target->scheduler.idle_wait = std::chrono::milliseconds(value); });
+    idle_timeout->AddListener([target](const std::size_t&, const std::size_t& value) { target->scheduler.idle_worker_timeout = std::chrono::milliseconds(value); });
+    sysmon_interval->AddListener([target](const std::size_t&, const std::size_t& value) { target->scheduler.sysmon_interval = std::chrono::milliseconds(value); });
+    syscall_threshold->AddListener([target](const std::size_t&, const std::size_t& value) { target->scheduler.long_syscall_threshold = std::chrono::milliseconds(value); });
+    if (!valid && error) *error = "运行时配置变量类型冲突";
+    return valid;
 }
 
 }  // namespace go2cpp::config

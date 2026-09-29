@@ -553,3 +553,19 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
 - 验证：WSL GCC 13.3 + Boost.Context 1.83 的工程化构建成功；日志过滤并发测试通过，
   `go2cpp_log_config_demo` 通过。完整 CTest 中已有 scheduler-aware synchronization
   用例一次出现既有的时序失败，单独重跑日志测试和其余目标成功；该失败未被隐藏。
+
+## 2026-09-30：工程化日志与配置增强复做
+
+- 复核发现上一版日志只有单一文件/标准输出 Sink，配置只能一次性读取，未达到 Sylar
+  级别。本轮在原模块上增量增强，没有替换现有 Logger API。
+- 日志增加 Sylar 风格 `%d/%p/%N/%T/%f/%l/%m/%n` 格式解析、NOTICE/CRIT/ALERT
+  等级、Logger 父级传播、多 Worker 默认/自定义分层、动态重建默认输出地、滚动文件
+  Sink、stderr Sink、内存 Sink、Flush/Reopen 和第三方 Callback 边界。
+- 配置增加强类型 `ConfigVar<T>`、`ValueCodec`（基础类型、字符串、vector）、变更
+  监听器、事务式类型预校验、文件 mtime watcher、`BindLoggingConfig` 和
+  `BindRuntimeConfig`。运行中修改 `go2cpp.ini` 会立即更新已存在 Logger；调度器结构
+  参数仍明确要求重建 Scheduler，避免在线修改 P/M 队列拓扑。
+- 修复 ASan 发现的监听器共享指针环：日志监听器改用 weak_ptr，完整日志测试不再泄漏。
+- 验证：完整 `go2cpp_tests` 通过；Werror 构建通过；ASan/UBSan 全量 `go2cpp_tests`
+  通过；Valgrind 日志测试通过，未报告 definite/indirect/possible leak；动态配置、
+  Sylar 格式、层级传播和滚动文件均有回归测试。

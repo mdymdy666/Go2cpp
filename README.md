@@ -49,6 +49,9 @@ ctest --test-dir build --output-on-failure
 的 `go2cpp.ini`，详细说明见 [`docs/logging.md`](docs/logging.md) 和
 [`docs/configuration.md`](docs/configuration.md)。
 
+配置中心支持强类型 `ConfigVar<T>`、变更监听器和文件热加载；日志模块支持多
+Formatter/Sink、Sylar 风格格式、Logger 父级传播和滚动文件输出。
+
 
 ## 新手入口
 

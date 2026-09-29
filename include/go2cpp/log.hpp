@@ -16,6 +16,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <unordered_map>
+#include <optional>
 
 namespace go2cpp::log {
 
@@ -23,10 +25,14 @@ enum class Level : std::uint8_t {
     Trace = 0,
     Debug,
     Info,
+    Notice,
     Warn,
     Error,
+    Crit,
+    Alert,
     Critical,
     Off,
+    Fatal = Critical,
 };
 
 const char* ToString(Level level) noexcept;
@@ -41,6 +47,8 @@ struct LogRecord {
     std::uint64_t timestamp_ms{0};
     std::uint64_t thread_id{0};
     std::uint64_t fiber_id{0};
+    std::uint64_t elapse_ms{0};
+    std::string thread_name;
     int line{0};
 };
 
@@ -78,9 +86,11 @@ public:
                                   "({file}:{line}) {message}\n");
     std::string Format(const LogRecord& record) const override;
     const std::string& pattern() const noexcept { return m_pattern; }
+    bool HasError() const noexcept { return m_error; }
 
 private:
     std::string m_pattern;
+    bool m_error{false};
 };
 
 class LogSink {
@@ -89,18 +99,34 @@ public:
     virtual ~LogSink() = default;
     virtual void Write(const LogRecord& record,
                        std::string_view formatted) = 0;
+    virtual void Flush() {}
+    virtual bool Reopen() { return true; }
 };
 
-class FileSink final : public LogSink {
+class FileSink : public LogSink {
 public:
     explicit FileSink(std::string path);
     void Write(const LogRecord& record, std::string_view formatted) override;
+    void Flush() override;
+    bool Reopen() override;
     const std::string& path() const noexcept { return m_path; }
 
-private:
+protected:
     std::string m_path;
     std::mutex m_mutex;
     std::unique_ptr<std::ostream> m_stream;
+};
+
+class RotatingFileSink final : public FileSink {
+public:
+    RotatingFileSink(std::string path, std::size_t max_bytes,
+                     std::size_t max_files = 3);
+    void Write(const LogRecord& record, std::string_view formatted) override;
+
+private:
+    std::size_t m_max_bytes;
+    std::size_t m_max_files;
+    std::size_t m_bytes{0};
 };
 
 class StdoutSink final : public LogSink {
@@ -109,6 +135,25 @@ public:
 
 private:
     std::mutex m_mutex;
+};
+
+class StderrSink final : public LogSink {
+public:
+    void Write(const LogRecord& record, std::string_view formatted) override;
+
+private:
+    std::mutex m_mutex;
+};
+
+class MemorySink final : public LogSink {
+public:
+    void Write(const LogRecord& record, std::string_view formatted) override;
+    std::vector<std::string> Snapshot() const;
+    void Clear();
+
+private:
+    mutable std::mutex m_mutex;
+    std::vector<std::string> m_lines;
 };
 
 // 兼容 spdlog/fmt 等第三方系统的边界：调用方只需在回调里转发格式化文本。
@@ -133,6 +178,8 @@ public:
     void SetMinimumLevel(Level level);
     void SetFormatter(LogFormatter::ptr formatter);
     void SetSink(LogSink::ptr sink);
+    void Flush();
+    const LogSink::ptr& sink() const noexcept { return m_sink; }
 
 private:
     mutable std::mutex m_mutex;
@@ -151,7 +198,13 @@ public:
     Level level() const noexcept;
     bool ShouldLog(Level level) const noexcept;
     void AddWorker(LogItemWorker::ptr worker);
+    void AddDefaultWorker(LogItemWorker::ptr worker);
+    void ConfigureDefaults(std::vector<LogItemWorker::ptr> workers);
     void ClearWorkers();
+    void SetParent(Logger::ptr parent);
+    void SetPropagate(bool propagate) noexcept;
+    bool propagate() const noexcept;
+    void Flush() const;
     void Log(LogRecord record) const;
 
 private:
@@ -159,6 +212,10 @@ private:
     mutable std::mutex m_mutex;
     Level m_level{Level::Warn};
     std::vector<LogItemWorker::ptr> m_workers;
+    std::vector<LogItemWorker::ptr> m_default_workers;
+    std::vector<LogItemWorker::ptr> m_custom_workers;
+    std::weak_ptr<Logger> m_parent;
+    bool m_propagate{false};
 };
 
 class LoggerManager final {
@@ -168,6 +225,11 @@ public:
     Logger::ptr Root();
     void Configure(Level level, bool stdout_enabled, const std::string& directory,
                    const std::string& file, const std::string& pattern = {});
+    void ConfigureLogger(const std::string& name, Level level, bool propagate,
+                         std::vector<LogItemWorker::ptr> workers = {});
+    void Remove(const std::string& name);
+    std::vector<Logger::ptr> List() const;
+    void Flush();
 
 private:
     LoggerManager();
