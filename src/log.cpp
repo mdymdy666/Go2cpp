@@ -296,6 +296,7 @@ void LogItemWorker::SetMinimumLevel(Level level) {
 }
 void LogItemWorker::SetFormatter(LogFormatter::ptr formatter) { std::lock_guard<std::mutex> lock(m_mutex); m_formatter = std::move(formatter); }
 void LogItemWorker::SetSink(LogSink::ptr sink) { std::lock_guard<std::mutex> lock(m_mutex); m_sink = std::move(sink); }
+LogSink::ptr LogItemWorker::Sink() const { std::lock_guard<std::mutex> lock(m_mutex); return m_sink; }
 void LogItemWorker::Flush() {
     LogSink::ptr sink;
     { std::lock_guard<std::mutex> lock(m_mutex); sink = m_sink; }

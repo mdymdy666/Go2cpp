@@ -179,7 +179,7 @@ public:
     void SetFormatter(LogFormatter::ptr formatter);
     void SetSink(LogSink::ptr sink);
     void Flush();
-    const LogSink::ptr& sink() const noexcept { return m_sink; }
+    LogSink::ptr Sink() const;
 
 private:
     mutable std::mutex m_mutex;
