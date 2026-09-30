@@ -196,26 +196,49 @@ std::vector<ConfigVarBase::ptr> Config::List() const {
     return result;
 }
 
-bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds interval) {
-    if (path.empty() || interval <= std::chrono::milliseconds::zero()) return false;
-    StopWatcher();
-    std::error_code error;
-    auto stamp = std::filesystem::last_write_time(path, error);
-    if (error) return false;
-    if (!LoadFromFile(path, nullptr)) return false;
+bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds interval, std::string* error) {
+    if (path.empty() || interval <= std::chrono::milliseconds::zero()) {
+        if (error) *error = "config watcher path or interval is invalid";
+        return false;
+    }
+    std::lock_guard<std::mutex> lifecycle_lock(m_watcher_lifecycle_mutex);
+    stop_watcher_locked();
+    std::error_code read_error;
+    auto stamp = std::filesystem::last_write_time(path, read_error);
+    if (read_error) {
+        if (error) *error = "cannot read config timestamp: " + path;
+        return false;
+    }
+    if (!LoadFromFile(path, error)) return false;
     m_watching.store(true, std::memory_order_release);
     m_watcher = std::thread([this, path, interval, stamp]() mutable {
         while (m_watching.load(std::memory_order_acquire)) {
-            std::this_thread::sleep_for(interval);
+            // 条件变量让 StopWatcher 立即唤醒，不必等待一个完整刷新周期。
+            std::unique_lock<std::mutex> wait_lock(m_watcher_mutex);
+            m_watcher_cv.wait_for(wait_lock, interval, [this] {
+                return !m_watching.load(std::memory_order_acquire);
+            });
+            wait_lock.unlock();
             if (!m_watching.load(std::memory_order_acquire)) break;
             std::error_code read_error;
             const auto current = std::filesystem::last_write_time(path, read_error);
             if (read_error || current == stamp) continue;
             std::string error;
-            if (LoadFromFile(path, &error)) {
+            try {
+                if (LoadFromFile(path, &error)) {
+                    stamp = current;
+                } else {
+                    std::cerr << "Go2Cpp 配置热加载失败: " << error << '\n';
+                    stamp = current;
+                }
+            } catch (const std::exception& exception) {
+                // 监听器属于用户扩展点，异常不能逃出 watcher 线程；
+                // 记录本次失败后继续监视后续文件变化。
+                std::cerr << "Go2Cpp 配置监听器异常: " << exception.what()
+                          << '\n';
                 stamp = current;
-            } else {
-                std::cerr << "Go2Cpp 配置热加载失败: " << error << '\n';
+            } catch (...) {
+                std::cerr << "Go2Cpp 配置监听器抛出未知异常\n";
                 stamp = current;
             }
         }
@@ -223,12 +246,18 @@ bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds int
     return true;
 }
 
-void Config::StopWatcher() {
+void Config::stop_watcher_locked() noexcept {
     m_watching.store(false, std::memory_order_release);
+    m_watcher_cv.notify_all();
     if (m_watcher.joinable()) {
         if (m_watcher.get_id() == std::this_thread::get_id()) m_watcher.detach();
         else m_watcher.join();
     }
+}
+
+void Config::StopWatcher() {
+    std::lock_guard<std::mutex> lifecycle_lock(m_watcher_lifecycle_mutex);
+    stop_watcher_locked();
 }
 
 bool BindLoggingConfig(Config& config, std::string* error) {
@@ -284,18 +313,46 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
     auto enable_sysmon = config.Lookup<bool>("scheduler.enable_sysmon", target->scheduler.enable_sysmon, "启用 sysmon");
     auto pin_workers = config.Lookup<bool>("scheduler.pin_workers_to_cpu", target->scheduler.pin_workers_to_cpu, "绑定 CPU");
     if (!allow_oversubscription || !enable_sysmon || !pin_workers) valid = false;
-    allow_oversubscription->AddListener([target](const bool&, const bool& value) { target->scheduler.allow_worker_oversubscription = value; });
-    enable_sysmon->AddListener([target](const bool&, const bool& value) { target->scheduler.enable_sysmon = value; });
-    pin_workers->AddListener([target](const bool&, const bool& value) { target->scheduler.pin_workers_to_cpu = value; });
+    if (allow_oversubscription) {
+        allow_oversubscription->AddListener([target](const bool&, const bool& value) {
+            target->scheduler.allow_worker_oversubscription = value;
+        });
+    }
+    if (enable_sysmon) {
+        enable_sysmon->AddListener([target](const bool&, const bool& value) {
+            target->scheduler.enable_sysmon = value;
+        });
+    }
+    if (pin_workers) {
+        pin_workers->AddListener([target](const bool&, const bool& value) {
+            target->scheduler.pin_workers_to_cpu = value;
+        });
+    }
     auto idle_wait = config.Lookup<std::size_t>("scheduler.idle_wait_ms", target->scheduler.idle_wait.count(), "空闲等待毫秒");
     auto idle_timeout = config.Lookup<std::size_t>("scheduler.idle_worker_timeout_ms", target->scheduler.idle_worker_timeout.count(), "空闲 M 回收毫秒");
     auto sysmon_interval = config.Lookup<std::size_t>("scheduler.sysmon_interval_ms", target->scheduler.sysmon_interval.count(), "sysmon 周期毫秒");
     auto syscall_threshold = config.Lookup<std::size_t>("scheduler.long_syscall_threshold_ms", target->scheduler.long_syscall_threshold.count(), "长系统调用阈值毫秒");
     if (!idle_wait || !idle_timeout || !sysmon_interval || !syscall_threshold) valid = false;
-    idle_wait->AddListener([target](const std::size_t&, const std::size_t& value) { target->scheduler.idle_wait = std::chrono::milliseconds(value); });
-    idle_timeout->AddListener([target](const std::size_t&, const std::size_t& value) { target->scheduler.idle_worker_timeout = std::chrono::milliseconds(value); });
-    sysmon_interval->AddListener([target](const std::size_t&, const std::size_t& value) { target->scheduler.sysmon_interval = std::chrono::milliseconds(value); });
-    syscall_threshold->AddListener([target](const std::size_t&, const std::size_t& value) { target->scheduler.long_syscall_threshold = std::chrono::milliseconds(value); });
+    if (idle_wait) {
+        idle_wait->AddListener([target](const std::size_t&, const std::size_t& value) {
+            target->scheduler.idle_wait = std::chrono::milliseconds(value);
+        });
+    }
+    if (idle_timeout) {
+        idle_timeout->AddListener([target](const std::size_t&, const std::size_t& value) {
+            target->scheduler.idle_worker_timeout = std::chrono::milliseconds(value);
+        });
+    }
+    if (sysmon_interval) {
+        sysmon_interval->AddListener([target](const std::size_t&, const std::size_t& value) {
+            target->scheduler.sysmon_interval = std::chrono::milliseconds(value);
+        });
+    }
+    if (syscall_threshold) {
+        syscall_threshold->AddListener([target](const std::size_t&, const std::size_t& value) {
+            target->scheduler.long_syscall_threshold = std::chrono::milliseconds(value);
+        });
+    }
     if (!valid && error) *error = "运行时配置变量类型冲突";
     return valid;
 }

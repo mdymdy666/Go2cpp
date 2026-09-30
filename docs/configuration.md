@@ -32,8 +32,31 @@ workers->AddListener([](const auto&, const auto& current) {
 registry.StartWatcher("go2cpp.ini", std::chrono::milliseconds(500));
 ```
 
+新手也可以用一个调用完成首次加载、日志绑定和热更新：
+
+```cpp
+auto& config = go2cpp::config::Config::Instance();
+std::string error;
+if (!go2cpp::config::LoadAndWatch(config, "go2cpp.ini",
+                                  std::chrono::milliseconds(500), &error)) {
+    // error 中包含解析、类型转换或文件监听失败原因
+}
+```
+
+配置变量的普通读取不再持有配置锁；刷新线程以不可变快照发布新值，
+因此业务线程可以直接调用 `GetValue()`。监听器仍按注册顺序串行执行，
+监听器中不应长时间阻塞或再次等待业务锁。
+
 `Config::LoadFromFile` 会先校验所有已注册变量的类型，再统一提交变更；监听器只
 在值真正改变后触发。`BindLoggingConfig` 将 `log.*` 变量绑定到 LoggerManager，
 因此热加载会更新已经存在的 Logger。`BindRuntimeConfig` 可以把调度参数绑定到
 一个 `RuntimeConfig` 对象；已经启动的 Scheduler 对 P/M 队列结构参数仍建议重新
 创建，避免在线改变队列拓扑。
+
+`RuntimeConfig` 由调用方持有时，必须保证它的生命周期覆盖 watcher 的整个运行期；
+停止 watcher 后再销毁该对象。通常每个配置中心只调用一次 `BindLoggingConfig` 和
+`BindRuntimeConfig`，避免重复注册监听器。不要在 watcher 自己的监听器回调中再次
+调用 `StartWatcher` 或 `StopWatcher`，需要重启时应由其他管理线程执行。
+`BindRuntimeConfig` 的监听器会更新目标对象字段；如果业务线程同时直接读取这些
+公开字段，调用方必须用自己的互斥量或在停用 watcher 后读取。Scheduler 已启动后
+不要在线修改队列拓扑、P 数量或 M 上限。

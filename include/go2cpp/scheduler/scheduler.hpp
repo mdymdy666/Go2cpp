@@ -207,6 +207,11 @@ public:
     void request_wake() noexcept;
     bool consume_wake() noexcept;
     bool try_register() noexcept;
+    // 将 owner、取消门和首次入队的状态转换合并为一次锁操作。
+    // 外部生产者的热路径必须保持这个原子边界，避免在多个状态锁之间
+    // 反复切换；失败时不会发布队列节点。
+    bool prepare_enqueue(const std::shared_ptr<const void>& owner,
+                         const std::shared_ptr<TaskCancellationGate>& gate) noexcept;
     // Bind a task to exactly one scheduler. The anchor is an opaque identity
     // token and does not retain the Scheduler object itself.
     bool bind_owner(const std::shared_ptr<const void>& owner) noexcept;

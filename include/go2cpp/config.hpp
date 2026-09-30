@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <list>
 #include <map>
@@ -50,6 +51,8 @@ struct ValueCodec {
         T parsed{};
         stream >> parsed;
         if (stream.fail()) return false;
+        stream >> std::ws;
+        if (!stream.eof()) return false;
         *value = std::move(parsed);
         return true;
     }
@@ -121,19 +124,31 @@ public:
     using ptr = std::shared_ptr<ConfigVar<T>>;
     using Listener = std::function<void(const T& old_value, const T& new_value)>;
     ConfigVar(std::string name, T value, std::string description)
-        : ConfigVarBase(std::move(name), std::move(description)), m_value(std::move(value)) {}
-    T GetValue() const { std::shared_lock<std::shared_mutex> lock(m_mutex); return m_value; }
+        : ConfigVarBase(std::move(name), std::move(description)),
+          m_value(std::make_shared<const T>(std::move(value))) {}
+    // 读取是配置热路径，值以不可变 shared_ptr 发布，避免普通读取阻塞
+    // 配置刷新；SetValue 仍通过互斥锁串行化监听器和写入。
+    T GetValue() const {
+        const auto value = std::atomic_load_explicit(&m_value, std::memory_order_acquire);
+        return value ? *value : T{};
+    }
     void SetValue(const T& value) {
         T old_value;
         std::map<std::uint64_t, Listener> listeners;
-        { std::unique_lock<std::shared_mutex> lock(m_mutex); if (m_value == value) return; old_value = m_value; m_value = value; listeners = m_listeners; }
+        { std::lock_guard<std::mutex> lock(m_mutex);
+          const auto current = std::atomic_load_explicit(&m_value, std::memory_order_acquire);
+          if (current && *current == value) return;
+          old_value = current ? *current : T{};
+          std::atomic_store_explicit(&m_value, std::make_shared<const T>(value),
+                                     std::memory_order_release);
+          listeners = m_listeners; }
         for (const auto& [id, listener] : listeners) if (listener) listener(old_value, value);
     }
     std::uint64_t AddListener(Listener listener) {
         const auto id = m_next_listener.fetch_add(1, std::memory_order_relaxed);
-        std::unique_lock<std::shared_mutex> lock(m_mutex); m_listeners.emplace(id, std::move(listener)); return id;
+        std::lock_guard<std::mutex> lock(m_mutex); m_listeners.emplace(id, std::move(listener)); return id;
     }
-    void DelListener(std::uint64_t id) { std::unique_lock<std::shared_mutex> lock(m_mutex); m_listeners.erase(id); }
+    void DelListener(std::uint64_t id) { std::lock_guard<std::mutex> lock(m_mutex); m_listeners.erase(id); }
     std::string ToString() const override { return ValueCodec<T>::Encode(GetValue()); }
     bool ValidateString(const std::string& value, std::string* error = nullptr) const override {
         T parsed{};
@@ -148,8 +163,8 @@ public:
     }
 
 private:
-    mutable std::shared_mutex m_mutex;
-    T m_value;
+    mutable std::mutex m_mutex;
+    std::shared_ptr<const T> m_value;
     std::map<std::uint64_t, Listener> m_listeners;
     std::atomic<std::uint64_t> m_next_listener{1};
 };
@@ -171,16 +186,21 @@ public:
     bool LoadFromIni(const IniFile& ini, std::string* error = nullptr);
     bool LoadFromFile(const std::string& path, std::string* error = nullptr);
     std::vector<ConfigVarBase::ptr> List() const;
-    bool StartWatcher(const std::string& path, std::chrono::milliseconds interval = std::chrono::milliseconds(1000));
+    bool StartWatcher(const std::string& path, std::chrono::milliseconds interval = std::chrono::milliseconds(1000), std::string* error = nullptr);
     void StopWatcher();
     bool Watching() const noexcept { return m_watching.load(std::memory_order_acquire); }
 
 private:
     Config() = default;
     ~Config();
+    void stop_watcher_locked() noexcept;
     mutable std::mutex m_mutex;
     std::unordered_map<std::string, ConfigVarBase::ptr> m_vars;
     std::atomic<bool> m_watching{false};
+    // 保护 std::thread 对象本身；配置值读取不使用这把生命周期锁。
+    mutable std::mutex m_watcher_lifecycle_mutex;
+    mutable std::mutex m_watcher_mutex;
+    std::condition_variable m_watcher_cv;
     std::thread m_watcher;
 };
 
@@ -189,6 +209,14 @@ private:
 bool BindLoggingConfig(Config& config, std::string* error = nullptr);
 bool BindRuntimeConfig(Config& config, RuntimeConfig* target,
                        std::string* error = nullptr);
+
+// 新手接口：一次调用完成“加载 + 绑定 + 热更新”。失败时不会启动 watcher。
+inline bool LoadAndWatch(Config& config, const std::string& path,
+                         std::chrono::milliseconds interval = std::chrono::milliseconds(1000),
+                         std::string* error = nullptr) {
+    if (!BindLoggingConfig(config, error)) return false;
+    return config.StartWatcher(path, interval, error);
+}
 
 struct RuntimeConfig final {
     scheduler::SchedulerConfig scheduler{};

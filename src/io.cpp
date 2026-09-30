@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <condition_variable>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -173,6 +174,14 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         bool wake_active{true};
         std::atomic<std::uint64_t> outcome{0};
         std::shared_ptr<WaitNode> wake_next;
+        std::mutex callback_mutex;
+        std::condition_variable callback_cv;
+        bool callback_active{false};
+        bool callbacks_stopped{false};
+        std::mutex operation_mutex;
+        std::condition_variable operation_cv;
+        bool operation_active{false};
+        bool operations_stopped{false};
 
         void wake() noexcept {
             std::lock_guard<std::mutex> lock(wake_mutex);
@@ -198,6 +207,63 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             wake_active = true;
             outcome.store(0, std::memory_order_relaxed);
             wake_next.reset();
+            // reset 只在 stop_callbacks() 返回后执行，因而没有回调仍在
+            // 观察业务字段；标志本身仍用同一把锁复位，避免新的
+            // begin_callback() 与复用操作发生数据竞争。
+            {
+                std::lock_guard<std::mutex> lock(callback_mutex);
+                callbacks_stopped = false;
+                callback_active = false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(operation_mutex);
+                operations_stopped = false;
+                operation_active = false;
+            }
+        }
+
+        bool begin_callback() noexcept {
+            std::lock_guard<std::mutex> lock(callback_mutex);
+            if (callbacks_stopped) {
+                return false;
+            }
+            callback_active = true;
+            return true;
+        }
+
+        void end_callback() noexcept {
+            {
+                std::lock_guard<std::mutex> lock(callback_mutex);
+                callback_active = false;
+            }
+            callback_cv.notify_all();
+        }
+
+        void stop_callbacks() noexcept {
+            std::unique_lock<std::mutex> lock(callback_mutex);
+            callbacks_stopped = true;
+            callback_cv.wait(lock, [this] { return !callback_active; });
+        }
+
+        bool begin_operation() noexcept {
+            std::lock_guard<std::mutex> lock(operation_mutex);
+            if (operations_stopped) return false;
+            operation_active = true;
+            return true;
+        }
+
+        void end_operation() noexcept {
+            {
+                std::lock_guard<std::mutex> lock(operation_mutex);
+                operation_active = false;
+            }
+            operation_cv.notify_all();
+        }
+
+        void stop_operations() noexcept {
+            std::unique_lock<std::mutex> lock(operation_mutex);
+            operations_stopped = true;
+            operation_cv.wait(lock, [this] { return !operation_active; });
         }
     };
 
@@ -460,14 +526,47 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 bool consume_pending = event == IOEvent::kRead
                                            ? slot.pending_read
                                            : slot.pending_write;
+                bool pending_ready = consume_pending;
                 if (consume_pending) {
+                    // pending 只是 epoll 的候选提示；FD 可能已被业务线程
+                    // 读空。用零超时 poll 做最终确认，避免 stale ready。
+                    pollfd probe{};
+                    probe.fd = fd;
+                    probe.events = event == IOEvent::kRead
+                                       ? static_cast<short>(POLLIN | POLLPRI)
+                                       : POLLOUT;
+                    const long probe_result =
+                        ::syscall(SYS_poll, &probe, 1, 0);
+                    if (probe_result < 0 && errno != EINTR) {
+                        pending_ready = false;
+                        (void)claim(*node, WaitStatus::kError,
+                                    errno == 0 ? EIO : errno);
+                    } else if (probe_result <= 0 ||
+                               (probe.revents & POLLNVAL) != 0) {
+                        pending_ready = false;
+                    } else if ((probe.revents &
+                                (POLLIN | POLLOUT | POLLPRI | POLLERR |
+                                 POLLHUP
+#ifdef POLLRDHUP
+                                 | POLLRDHUP
+#endif
+                                 )) == 0) {
+                        pending_ready = false;
+                    }
+                }
+                if (consume_pending && pending_ready) {
                     if (event == IOEvent::kRead) {
                         slot.pending_read = false;
                     } else {
                         slot.pending_write = false;
                     }
                     (void)claim(*node, WaitStatus::kReady, 0);
-                } else {
+                } else if (node->outcome.load(std::memory_order_relaxed) == 0) {
+                    if (event == IOEvent::kRead) {
+                        slot.pending_read = false;
+                    } else {
+                        slot.pending_write = false;
+                    }
                     queue_for(slot, event).push_back(node);
                 }
                 if (deadline.has_value() &&
@@ -520,7 +619,11 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
 
     bool complete(const NodePtr& node, WaitStatus status,
                   int system_error) noexcept {
-        if (!node || !claim(*node, status, system_error)) {
+        if (!node || !node->begin_operation()) {
+            return false;
+        }
+        if (!claim(*node, status, system_error)) {
+            node->end_operation();
             return false;
         }
 
@@ -553,6 +656,8 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         if (!node) {
             return;
         }
+        node->stop_callbacks();
+        node->stop_operations();
         node->disarm();
         node->reset();
         try {
@@ -567,7 +672,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
     // 仅允许队列头节点由补采样路径完成，保持同一 fd/方向的 FIFO。
     bool complete_if_head(const NodePtr& node, WaitStatus status,
                           int system_error) noexcept {
-        if (!node) {
+        if (!node || !node->begin_operation()) {
             return false;
         }
         WakeList wake;
@@ -576,6 +681,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             const auto found = m_slots.find(node->fd);
             if (found == m_slots.end() ||
                 found->second->generation != node->generation) {
+                node->end_operation();
                 return false;
             }
             FdSlot& slot = *found->second;
@@ -583,10 +689,23 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             purge_terminal_locked(queue);
             if (queue.empty() || queue.front().get() != node.get() ||
                 !claim(*node, status, system_error)) {
+                node->end_operation();
                 return false;
             }
             queue.pop_front();
+            if (node->event == IOEvent::kRead) {
+                slot.pending_read = false;
+            } else {
+                slot.pending_write = false;
+            }
             erase_timer_locked(*node);
+            // 补采样完成节点时，poller 可能已经把旧 registration 的
+            // 事件放进内核队列。删除 registration 使迟到事件被忽略，
+            // 同时只在这个需要消费旧事件的路径付出 DEL/ADD 成本。
+            if (slot.readers.empty() && slot.writers.empty() &&
+                slot.registered) {
+                invalidate_registration_locked(slot);
+            }
             const int arm_error = update_interest_locked(slot);
             if (arm_error != 0) {
                 fail_slot_locked(slot, arm_error, wake);
@@ -782,9 +901,12 @@ private:
         while (!queue.empty()) {
             NodePtr node = std::move(queue.front());
             queue.pop_front();
-            if (node && claim(*node, status, system_error)) {
+            if (node && node->begin_operation() &&
+                claim(*node, status, system_error)) {
                 erase_timer_locked(*node);
                 wake.push_back(std::move(node));
+            } else if (node) {
+                node->end_operation();
             }
         }
     }
@@ -802,9 +924,12 @@ private:
         while (!queue.empty()) {
             NodePtr node = std::move(queue.front());
             queue.pop_front();
-            if (node && claim(*node, WaitStatus::kReady, 0)) {
+            if (node && node->begin_operation() &&
+                claim(*node, WaitStatus::kReady, 0)) {
                 erase_timer_locked(*node);
                 return node;
+            } else if (node) {
+                node->end_operation();
             }
         }
         return {};
@@ -838,6 +963,9 @@ private:
             const bool write_ready = error_or_hup || (events & EPOLLOUT) != 0;
             if (read_ready && (snapshot.interest & kReadMask) != 0) {
                 if (auto node = take_ready_locked(slot.readers)) {
+                    // readiness 已交给具体 waiter；不要把同一个事件
+                    // 留在 pending 位，避免下一次注册得到伪 ready。
+                    slot.pending_read = false;
                     wake.push_back(std::move(node));
                 } else {
                     slot.pending_read = true;
@@ -845,6 +973,7 @@ private:
             }
             if (write_ready && (snapshot.interest & kWriteMask) != 0) {
                 if (auto node = take_ready_locked(slot.writers)) {
+                    slot.pending_write = false;
                     wake.push_back(std::move(node));
                 } else {
                     slot.pending_write = true;
@@ -1029,6 +1158,7 @@ private:
         while (const auto node = nodes.pop_front()) {
             if (node) {
                 node->wake();
+                node->end_operation();
             }
         }
     }
@@ -1204,6 +1334,13 @@ WaitResult IOManager::wait(int fd, IOEvent event,
                 if (!state || !current_node) {
                     return;
                 }
+                if (!current_node->begin_callback()) {
+                    return;
+                }
+                struct CallbackGuard final {
+                    State::WaitNode* node;
+                    ~CallbackGuard() { node->end_callback(); }
+                } callback_guard{current_node.get()};
                 const auto current_context = weak_context.lock();
                 const bool timed_out =
                     current_context &&
@@ -1374,13 +1511,17 @@ WaitManyResult IOManager::wait_many(
         nodes.push_back(std::move(node));
         const auto& registered = nodes.back();
         if (registered->outcome.load(std::memory_order_acquire) != 0) {
-            // An invalid fd or epoll arm failure is terminal for the set. The
-            // already registered nodes are cancelled below.
+            // pending readiness may be consumed synchronously during
+            // registration. It is a successful member of the set, not a
+            // reason to discard ready_indices; only an error/close result
+            // aborts the complete request set.
             const WaitResult terminal = decode_outcome(
                 registered->outcome.load(std::memory_order_acquire));
-            cleanup();
-            fail(terminal.status, terminal.system_error);
-            return result;
+            if (terminal.status != WaitStatus::kReady) {
+                cleanup();
+                fail(terminal.status, terminal.system_error);
+                return result;
+            }
         }
     }
 
@@ -1407,6 +1548,13 @@ WaitManyResult IOManager::wait_many(
                         current_context &&
                         Is(current_context->Err(), DeadlineExceededError());
                     for (const auto& node : *callback_nodes) {
+                        if (!node || !node->begin_callback()) {
+                            continue;
+                        }
+                        struct CallbackGuard final {
+                            State::WaitNode* node;
+                            ~CallbackGuard() { node->end_callback(); }
+                        } callback_guard{node.get()};
                         (void)state->complete(
                             node,
                             timed_out ? WaitStatus::kTimeout
@@ -1435,6 +1583,64 @@ WaitManyResult IOManager::wait_many(
     if (deadline.has_value() && *deadline <= Clock::now()) {
         for (const auto& node : nodes) {
             (void)m_state->complete(node, WaitStatus::kTimeout, ETIMEDOUT);
+        }
+    }
+
+    // 所有请求发布完成后先做一次零超时探测。数据可能在第一个节点
+    // 注册后、第二个节点注册前就已经到达；如果直接 park，poller 可能
+    // 只先唤醒一个 Fiber，导致另一个已就绪节点依赖后续 eventfd 时序。
+    // 这里使用原生 syscall，避免进入 poll Hook 递归等待。
+    if (!has_terminal()) {
+        try {
+            std::vector<pollfd> probes;
+            std::vector<std::size_t> probe_indices;
+            probes.reserve(nodes.size());
+            probe_indices.reserve(nodes.size());
+            for (std::size_t index = 0; index < nodes.size(); ++index) {
+                const auto& node = nodes[index];
+                if (!node || node->outcome.load(std::memory_order_acquire) != 0) {
+                    continue;
+                }
+                pollfd descriptor{};
+                descriptor.fd = node->fd;
+                descriptor.events = node->event == IOEvent::kRead
+                                        ? static_cast<short>(POLLIN | POLLPRI)
+                                        : POLLOUT;
+                probes.push_back(descriptor);
+                probe_indices.push_back(index);
+            }
+            if (!probes.empty()) {
+                const long poll_result = ::syscall(
+                    SYS_poll, probes.data(), static_cast<nfds_t>(probes.size()), 0);
+                if (poll_result > 0) {
+                    for (std::size_t probe_index = 0;
+                         probe_index < probes.size(); ++probe_index) {
+                        const short revents = probes[probe_index].revents;
+                        if (revents == 0) {
+                            continue;
+                        }
+                        const auto& node = nodes[probe_indices[probe_index]];
+                        if (!node) {
+                            continue;
+                        }
+                        if ((revents & POLLNVAL) != 0) {
+                            (void)m_state->complete_if_head(
+                                node, WaitStatus::kClosed, EBADF);
+                        } else if ((revents & (POLLIN | POLLOUT | POLLPRI |
+                                               POLLERR | POLLHUP
+#ifdef POLLRDHUP
+                                               | POLLRDHUP
+#endif
+                                               )) != 0) {
+                            (void)m_state->complete_if_head(
+                                node, WaitStatus::kReady, 0);
+                        }
+                    }
+                }
+            }
+        } catch (...) {
+            // 预探测只是减少已就绪请求的唤醒延迟，内存不足时保留
+            // epoll 主路径，不改变等待结果。
         }
     }
 

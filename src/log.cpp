@@ -7,7 +7,6 @@
 #include <iostream>
 #include <sstream>
 #include <thread>
-#include <unordered_map>
 #include <cstdio>
 
 namespace go2cpp::log {
@@ -15,37 +14,35 @@ namespace {
 
 std::string FormatTime(std::uint64_t timestamp_ms);
 
-std::string ReplaceTokens(std::string result,
-                          const std::unordered_map<std::string, std::string>& values) {
-    for (const auto& [key, value] : values) {
-        const std::string token = "{" + key + "}";
-        std::size_t position = 0;
-        while ((position = result.find(token, position)) != std::string::npos) {
-            result.replace(position, token.size(), value);
-            position += value.size();
-        }
-    }
-    return result;
-}
-
 std::string FormatPattern(std::string pattern, const LogRecord& record) {
-    // 同时支持 Go2Cpp 的 {message} 风格和 Sylar 常用的 %d/%p/%m 风格。
-    pattern = ReplaceTokens(std::move(pattern), {
-        {"time", FormatTime(record.timestamp_ms)},
-        {"level", ToString(record.level)},
-        {"logger", record.logger},
-        {"thread", std::to_string(record.thread_id)},
-        {"fiber", std::to_string(record.fiber_id)},
-        {"elapse", std::to_string(record.elapse_ms)},
-        {"thread_name", record.thread_name},
-        {"file", record.file},
-        {"line", std::to_string(record.line)},
-        {"function", record.function},
-        {"message", record.message},
-    });
+    // 一次线性扫描同时支持 {message} 风格和 Sylar 的 %d/%p/%m 风格，
+    // 避免旧实现为每个字段建立 unordered_map 并反复 find/replace。
+    const auto append_token = [&record](std::string_view token, std::string& output) {
+        if (token == "time") output += FormatTime(record.timestamp_ms);
+        else if (token == "level") output += ToString(record.level);
+        else if (token == "logger") output += record.logger;
+        else if (token == "thread") output += std::to_string(record.thread_id);
+        else if (token == "fiber") output += std::to_string(record.fiber_id);
+        else if (token == "elapse") output += std::to_string(record.elapse_ms);
+        else if (token == "thread_name") output += record.thread_name;
+        else if (token == "file") output += record.file;
+        else if (token == "line") output += std::to_string(record.line);
+        else if (token == "function") output += record.function;
+        else if (token == "message") output += record.message;
+        else return false;
+        return true;
+    };
     std::string output;
     output.reserve(pattern.size() + record.message.size());
     for (std::size_t i = 0; i < pattern.size(); ++i) {
+        if (pattern[i] == '{') {
+            const auto end = pattern.find('}', i + 1);
+            if (end != std::string::npos && append_token(
+                    std::string_view(pattern).substr(i + 1, end - i - 1), output)) {
+                i = end;
+                continue;
+            }
+        }
         if (pattern[i] != '%') {
             output.push_back(pattern[i]);
             continue;
@@ -106,10 +103,16 @@ std::string FormatTime(std::uint64_t timestamp_ms) {
 #else
     localtime_r(&seconds, &local_time);
 #endif
-    std::ostringstream stream;
-    stream << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << '.'
-           << std::setfill('0') << std::setw(3) << (timestamp_ms % 1000);
-    return stream.str();
+    char date[64]{};
+    if (std::strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", &local_time) == 0) {
+        return {};
+    }
+    char millis[5]{};
+    std::snprintf(millis, sizeof(millis), ".%03llu",
+                  static_cast<unsigned long long>(timestamp_ms % 1000));
+    std::string result(date);
+    result += millis;
+    return result;
 }
 
 std::uint64_t CurrentTimeMs() noexcept {
@@ -174,13 +177,16 @@ FileSink::FileSink(std::string path) : m_path(std::move(path)) {
     Reopen();
 }
 
-void FileSink::Write(const LogRecord&, std::string_view formatted) {
+void FileSink::Write(const LogRecord& record, std::string_view formatted) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_stream) return;
     auto* stream = dynamic_cast<std::ofstream*>(m_stream.get());
     if (!stream || !stream->good()) return;
     stream->write(formatted.data(), static_cast<std::streamsize>(formatted.size()));
-    stream->flush();
+    // 发布默认只记录告警及错误；这些记录必须在调用返回后可被外部
+    // 日志收集器立即读取。Info/Debug 仍保留缓冲写入，避免把高吞吐
+    // 日志退化成每条一次 flush。
+    if (record.level >= Level::Warn) stream->flush();
 }
 
 void FileSink::Flush() {
@@ -205,7 +211,15 @@ bool FileSink::Reopen() {
 
 RotatingFileSink::RotatingFileSink(std::string path, std::size_t max_bytes,
                                    std::size_t max_files)
-    : FileSink(std::move(path)), m_max_bytes(max_bytes), m_max_files(max_files) {}
+    : FileSink(std::move(path)), m_max_bytes(max_bytes), m_max_files(max_files) {
+    // 进程重启后继续追加同一个文件时，旋转阈值必须包含已有字节数；
+    // 否则第一次写入会暂时突破 max_bytes。
+    std::error_code error;
+    const auto existing = std::filesystem::file_size(m_path, error);
+    if (!error) {
+        m_bytes = existing;
+    }
+}
 
 void RotatingFileSink::Write(const LogRecord&, std::string_view formatted) {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -230,7 +244,6 @@ void RotatingFileSink::Write(const LogRecord&, std::string_view formatted) {
     if (m_stream) {
         auto* stream = dynamic_cast<std::ofstream*>(m_stream.get());
         stream->write(formatted.data(), static_cast<std::streamsize>(formatted.size()));
-        stream->flush();
         m_bytes += formatted.size();
     }
 }
@@ -238,13 +251,11 @@ void RotatingFileSink::Write(const LogRecord&, std::string_view formatted) {
 void StdoutSink::Write(const LogRecord&, std::string_view formatted) {
     std::lock_guard<std::mutex> lock(m_mutex);
     std::cout.write(formatted.data(), static_cast<std::streamsize>(formatted.size()));
-    std::cout.flush();
 }
 
 void StderrSink::Write(const LogRecord&, std::string_view formatted) {
     std::lock_guard<std::mutex> lock(m_mutex);
     std::cerr.write(formatted.data(), static_cast<std::streamsize>(formatted.size()));
-    std::cerr.flush();
 }
 
 void MemorySink::Write(const LogRecord&, std::string_view formatted) {
@@ -263,64 +274,98 @@ void MemorySink::Clear() {
 }
 
 void CallbackSink::Write(const LogRecord& record, std::string_view formatted) {
-    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_callback) m_callback(record, formatted);
 }
 
 LogItemWorker::LogItemWorker(LogFilter::ptr filter, LogFormatter::ptr formatter,
                              LogSink::ptr sink)
-    : m_filter(std::move(filter)), m_formatter(std::move(formatter)), m_sink(std::move(sink)) {}
+    : m_snapshot(std::make_shared<const Snapshot>(Snapshot{
+          std::move(filter), std::move(formatter), std::move(sink)})) {}
 
 bool LogItemWorker::Submit(const LogRecord& record) {
-    LogFilter::ptr filter;
-    LogFormatter::ptr formatter;
-    LogSink::ptr sink;
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        filter = m_filter;
-        formatter = m_formatter;
-        sink = m_sink;
-    }
+    const auto snapshot = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
+    if (!snapshot) return false;
     // 不在 Worker 锁内调用用户 Formatter/Sink；这样自定义 Sink 再次记录
     // 日志时不会形成同一 Worker 的递归锁死。
-    if (!filter || !formatter || !sink || !filter->Accept(record)) return false;
-    const auto formatted = formatter->Format(record);
-    sink->Write(record, formatted);
+    if (!snapshot->filter || !snapshot->formatter || !snapshot->sink ||
+        !snapshot->filter->Accept(record)) return false;
+    const auto formatted = snapshot->formatter->Format(record);
+    snapshot->sink->Write(record, formatted);
     return true;
 }
 
-void LogItemWorker::SetFilter(LogFilter::ptr filter) { std::lock_guard<std::mutex> lock(m_mutex); m_filter = std::move(filter); }
+void LogItemWorker::SetFilter(LogFilter::ptr filter) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto current = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
+    auto next = std::make_shared<Snapshot>(current ? *current : Snapshot{});
+    next->filter = std::move(filter);
+    std::atomic_store_explicit(&m_snapshot, std::shared_ptr<const Snapshot>(std::move(next)),
+                               std::memory_order_release);
+}
 void LogItemWorker::SetMinimumLevel(Level level) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (auto filter = std::dynamic_pointer_cast<MinimumLevelFilter>(m_filter)) filter->SetLevel(level);
+    const auto current = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
+    if (current) {
+        if (auto filter = std::dynamic_pointer_cast<MinimumLevelFilter>(current->filter)) {
+            filter->SetLevel(level);
+        }
+    }
 }
-void LogItemWorker::SetFormatter(LogFormatter::ptr formatter) { std::lock_guard<std::mutex> lock(m_mutex); m_formatter = std::move(formatter); }
-void LogItemWorker::SetSink(LogSink::ptr sink) { std::lock_guard<std::mutex> lock(m_mutex); m_sink = std::move(sink); }
-LogSink::ptr LogItemWorker::Sink() const { std::lock_guard<std::mutex> lock(m_mutex); return m_sink; }
+void LogItemWorker::SetFormatter(LogFormatter::ptr formatter) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto current = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
+    auto next = std::make_shared<Snapshot>(current ? *current : Snapshot{});
+    next->formatter = std::move(formatter);
+    std::atomic_store_explicit(&m_snapshot, std::shared_ptr<const Snapshot>(std::move(next)),
+                               std::memory_order_release);
+}
+void LogItemWorker::SetSink(LogSink::ptr sink) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto current = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
+    auto next = std::make_shared<Snapshot>(current ? *current : Snapshot{});
+    next->sink = std::move(sink);
+    std::atomic_store_explicit(&m_snapshot, std::shared_ptr<const Snapshot>(std::move(next)),
+                               std::memory_order_release);
+}
+LogSink::ptr LogItemWorker::Sink() const {
+    const auto snapshot = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
+    return snapshot ? snapshot->sink : nullptr;
+}
 void LogItemWorker::Flush() {
-    LogSink::ptr sink;
-    { std::lock_guard<std::mutex> lock(m_mutex); sink = m_sink; }
-    if (sink) sink->Flush();
+    const auto snapshot = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
+    if (snapshot && snapshot->sink) snapshot->sink->Flush();
 }
 
-Logger::Logger(std::string name) : m_name(std::move(name)) {}
+Logger::Logger(std::string name)
+    : m_name(std::move(name)),
+      m_worker_snapshot(std::make_shared<const std::vector<LogItemWorker::ptr>>()) {}
 void Logger::SetLevel(Level level) noexcept {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_level = level;
-    for (const auto& worker : m_workers) {
+    m_level.store(level, std::memory_order_release);
+    const auto workers = std::atomic_load_explicit(&m_worker_snapshot, std::memory_order_acquire);
+    for (const auto& worker : *workers) {
         // LoggerManager 重新加载配置时同步更新默认过滤器；用户自定义过滤器
         // 不是 MinimumLevelFilter 时保持原样。
         if (worker) worker->SetMinimumLevel(level);
     }
 }
-Level Logger::level() const noexcept { std::lock_guard<std::mutex> lock(m_mutex); return m_level; }
-bool Logger::ShouldLog(Level value) const noexcept { return value >= level() && value != Level::Off; }
+Level Logger::level() const noexcept { return m_level.load(std::memory_order_acquire); }
+bool Logger::ShouldLog(Level value) const noexcept {
+    const auto minimum = m_level.load(std::memory_order_relaxed);
+    return value >= minimum && minimum != Level::Off;
+}
+void PublishLoggerWorkers(std::vector<LogItemWorker::ptr>* workers,
+                          std::shared_ptr<const std::vector<LogItemWorker::ptr>>* snapshot) {
+    std::atomic_store_explicit(snapshot,
+        std::make_shared<const std::vector<LogItemWorker::ptr>>(*workers),
+        std::memory_order_release);
+}
 void Logger::AddWorker(LogItemWorker::ptr worker) {
     if (!worker) return;
     std::lock_guard<std::mutex> lock(m_mutex);
     m_custom_workers.push_back(std::move(worker));
     m_workers = m_default_workers;
     m_workers.insert(m_workers.end(), m_custom_workers.begin(), m_custom_workers.end());
+    PublishLoggerWorkers(&m_workers, &m_worker_snapshot);
 }
 void Logger::AddDefaultWorker(LogItemWorker::ptr worker) {
     if (!worker) return;
@@ -328,24 +373,27 @@ void Logger::AddDefaultWorker(LogItemWorker::ptr worker) {
     m_default_workers.push_back(std::move(worker));
     m_workers = m_default_workers;
     m_workers.insert(m_workers.end(), m_custom_workers.begin(), m_custom_workers.end());
+    PublishLoggerWorkers(&m_workers, &m_worker_snapshot);
 }
 void Logger::ConfigureDefaults(std::vector<LogItemWorker::ptr> workers) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_default_workers = std::move(workers);
     m_workers = m_default_workers;
     m_workers.insert(m_workers.end(), m_custom_workers.begin(), m_custom_workers.end());
+    PublishLoggerWorkers(&m_workers, &m_worker_snapshot);
 }
-void Logger::ClearWorkers() { std::lock_guard<std::mutex> lock(m_mutex); m_workers.clear(); m_default_workers.clear(); m_custom_workers.clear(); }
+void Logger::ClearWorkers() { std::lock_guard<std::mutex> lock(m_mutex); m_workers.clear(); m_default_workers.clear(); m_custom_workers.clear(); PublishLoggerWorkers(&m_workers, &m_worker_snapshot); }
 void Logger::SetParent(Logger::ptr parent) { std::lock_guard<std::mutex> lock(m_mutex); m_parent = std::move(parent); }
-void Logger::SetPropagate(bool propagate) noexcept { std::lock_guard<std::mutex> lock(m_mutex); m_propagate = propagate; }
-bool Logger::propagate() const noexcept { std::lock_guard<std::mutex> lock(m_mutex); return m_propagate; }
-void Logger::Flush() const { std::vector<LogItemWorker::ptr> workers; { std::lock_guard<std::mutex> lock(m_mutex); workers = m_workers; } for (const auto& worker : workers) if (worker) worker->Flush(); }
+void Logger::SetPropagate(bool propagate) noexcept { m_propagate.store(propagate, std::memory_order_release); }
+bool Logger::propagate() const noexcept { return m_propagate.load(std::memory_order_acquire); }
+void Logger::Flush() const { const auto workers = std::atomic_load_explicit(&m_worker_snapshot, std::memory_order_acquire); for (const auto& worker : *workers) if (worker) worker->Flush(); }
 void Logger::Log(LogRecord record) const {
-    std::vector<LogItemWorker::ptr> workers;
     Logger::ptr parent;
-    bool propagate = false;
-    { std::lock_guard<std::mutex> lock(m_mutex); if (record.level < m_level || m_level == Level::Off) return; workers = m_workers; parent = m_parent.lock(); propagate = m_propagate; }
-    for (const auto& worker : workers) (void)worker->Submit(record);
+    if (!ShouldLog(record.level)) return;
+    const auto workers = std::atomic_load_explicit(&m_worker_snapshot, std::memory_order_acquire);
+    for (const auto& worker : *workers) (void)worker->Submit(record);
+    const bool propagate = m_propagate.load(std::memory_order_acquire);
+    if (propagate) { std::lock_guard<std::mutex> lock(m_mutex); parent = m_parent.lock(); }
     if (propagate && parent) parent->Log(std::move(record));
 }
 
@@ -408,13 +456,15 @@ void LoggerManager::Flush() { for (const auto& logger : List()) if (logger) logg
 
 LogLine::LogLine(Logger::ptr logger, Level level, const char* file, int line, const char* function)
     : m_logger(std::move(logger)) {
+    m_enabled = m_logger && m_logger->ShouldLog(level);
+    if (!m_enabled) return;
     m_record.level = level; m_record.file = file ? file : ""; m_record.line = line; m_record.function = function ? function : "";
     if (m_logger) { m_record.logger = m_logger->name(); }
     m_record.timestamp_ms = CurrentTimeMs(); m_record.thread_id = CurrentThreadId();
 }
 
 LogLine::~LogLine() noexcept {
-    if (!m_logger || !m_logger->ShouldLog(m_record.level)) return;
+    if (!m_enabled || !m_logger) return;
     try { m_record.message = m_stream.str(); m_logger->Log(std::move(m_record)); } catch (...) {}
 }
 

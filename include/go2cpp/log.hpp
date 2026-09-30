@@ -160,12 +160,13 @@ private:
 class CallbackSink final : public LogSink {
 public:
     using Callback = std::function<void(const LogRecord&, std::string_view)>;
+    // 回调对象在构造后不可变，Write 不再为每条日志加内部锁；若回调
+    // 访问共享状态，应由回调自己选择合适的同步策略。
     explicit CallbackSink(Callback callback) : m_callback(std::move(callback)) {}
     void Write(const LogRecord& record, std::string_view formatted) override;
 
 private:
     Callback m_callback;
-    std::mutex m_mutex;
 };
 
 class LogItemWorker {
@@ -182,10 +183,15 @@ public:
     LogSink::ptr Sink() const;
 
 private:
+    // 热路径只做一次原子 shared_ptr 读取。配置变更时生成新的快照，
+    // 因此格式化器和 Sink 不会在每条日志上争用 Worker 配置锁。
+    struct Snapshot {
+        LogFilter::ptr filter;
+        LogFormatter::ptr formatter;
+        LogSink::ptr sink;
+    };
     mutable std::mutex m_mutex;
-    LogFilter::ptr m_filter;
-    LogFormatter::ptr m_formatter;
-    LogSink::ptr m_sink;
+    std::shared_ptr<const Snapshot> m_snapshot;
 };
 
 class Logger final : public std::enable_shared_from_this<Logger> {
@@ -210,12 +216,14 @@ public:
 private:
     std::string m_name;
     mutable std::mutex m_mutex;
-    Level m_level{Level::Warn};
+    std::atomic<Level> m_level{Level::Warn};
     std::vector<LogItemWorker::ptr> m_workers;
     std::vector<LogItemWorker::ptr> m_default_workers;
     std::vector<LogItemWorker::ptr> m_custom_workers;
     std::weak_ptr<Logger> m_parent;
-    bool m_propagate{false};
+    std::atomic<bool> m_propagate{false};
+    // m_workers 只在配置时修改；日志线程通过原子快照无锁读取。
+    std::shared_ptr<const std::vector<LogItemWorker::ptr>> m_worker_snapshot;
 };
 
 class LoggerManager final {
@@ -254,6 +262,7 @@ private:
     Logger::ptr m_logger;
     LogRecord m_record;
     std::ostringstream m_stream;
+    bool m_enabled{false};
 };
 
 }  // namespace go2cpp::log

@@ -346,7 +346,10 @@ bool Mutex::Lock(const ContextPtr& context) {
     // 的发布顺序；多 P 场景只在尚未发布等待节点时走该短路径。
     if (target && target.scheduler->processor_count() > 1 &&
         !m_impl->m_has_waiters.load(std::memory_order_acquire)) {
-        constexpr int kCooperativeAttempts = 16;
+        // 竞争刚出现时，临界区通常仍在另一个 P 上运行。多做一小段
+        // 协作重试可以避免把短临界区升级为 WaitNode + park/unpark；
+        // 单 P 不走这条路径，因此不会把唯一 M 忙等住。
+        constexpr int kCooperativeAttempts = 1024;
         for (int attempt = 0; attempt < kCooperativeAttempts; ++attempt) {
             if (m_impl->m_has_waiters.load(std::memory_order_acquire)) {
                 break;

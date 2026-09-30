@@ -5,6 +5,7 @@
 #include "go2cpp/thread_policy.hpp"
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -243,6 +244,33 @@ void Task::bind_cancellation_gate(
     const std::shared_ptr<TaskCancellationGate>& gate) noexcept {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     m_cancellation_gate = gate;
+}
+
+bool Task::prepare_enqueue(
+    const std::shared_ptr<const void>& owner,
+    const std::shared_ptr<TaskCancellationGate>& gate) noexcept {
+    if (!owner || !gate) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (!m_owner_anchor) {
+        m_owner_anchor = owner;
+    } else if (m_owner_anchor.get() != owner.get()) {
+        return false;
+    }
+    m_cancellation_gate = gate;
+    const auto state = m_state.load(std::memory_order_relaxed);
+    if (state == GState::kNew) {
+        m_state.store(GState::kRunnable, std::memory_order_release);
+    } else if (state != GState::kRunnable) {
+        return false;
+    }
+    if (m_execution_claim.load(std::memory_order_relaxed) ||
+        m_queued.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    m_queued.store(true, std::memory_order_release);
+    return true;
 }
 
 bool Task::promote_new() noexcept {
@@ -605,6 +633,11 @@ void Task::run() {
 
 class Scheduler::Impl {
 public:
+    // 任务注册表按固定条带拆分，避免大量外部生产者在提交短任务时
+    // 争用同一把互斥量。每个条带仍然是普通 vector + mutex，关闭和
+    // 回收阶段按条带逐一加锁，因此不会改变注册表的强所有权语义。
+    static constexpr std::size_t kRegistryStripeCount = 16;
+
     struct Processor {
         explicit Processor(PId processor_id) : id(processor_id) {}
 
@@ -624,12 +657,12 @@ public:
         PId processor;
         std::thread thread;
         std::atomic<MState> state{MState::kIdle};
-        // These fields are owned by the worker represented by this object.
-        // Snapshot readers access them only while holding Impl::mutex.
-        TaskClassId last_task_class{0};
-        std::size_t affinity_budget{0};
-        std::size_t affinity_hits{0};
-        std::size_t affinity_misses{0};
+        // 这些字段由对应 worker 更新，同时允许 machines() 在另一个线程
+        // 读取；即使 worker 不持有调度器总锁，也必须使用原子访问。
+        std::atomic<TaskClassId> last_task_class{0};
+        std::atomic<std::size_t> affinity_budget{0};
+        std::atomic<std::size_t> affinity_hits{0};
+        std::atomic<std::size_t> affinity_misses{0};
         // 这些原子字段由 worker、BlockingRegion 和 sysmon 共同观察；
         // P 计数的增减仍在 Impl::mutex 下完成。
         std::atomic<bool> processor_detached{false};
@@ -645,10 +678,18 @@ public:
         for (std::size_t i = 0; i < config.processor_count; ++i) {
             processors.emplace_back(static_cast<PId>(i));
         }
-        // 高并发提交时 task_registry 是唯一需要持有 admission mutex 的
-        // 连续容器。预留常见批量规模，避免 producer burst 反复搬迁
+        // 高并发提交时注册表按条带分别扩容，避免 producer burst 反复搬迁
         // shared_ptr；超出后仍按 vector 原有策略增长，不改变上限语义。
-        task_registry.reserve(4096);
+        for (auto& registry : task_registries) {
+            registry.reserve(4096 / kRegistryStripeCount);
+        }
+    }
+
+    static std::size_t registry_stripe(const Task& task) noexcept {
+        // GId 单调递增，低位分片即可；条带数为 2 的幂，编译器会将
+        // 模运算优化为按位与。
+        return static_cast<std::size_t>(task.id()) &
+               (kRegistryStripeCount - 1);
     }
 
     ~Impl() { stop_sysmon(true); }
@@ -987,30 +1028,37 @@ public:
         // parked outside a run queue. This prevents destruction of a suspended
         // stack. Move terminal entries to caller-owned storage so arbitrary
         // user captures are never destroyed while the scheduler lock is held.
-        try {
-            deferred_destruction.reserve(deferred_destruction.size() +
-                                         task_registry.size());
-        } catch (...) {
-            // Retaining a terminal entry is safe. A later worker/shutdown pass
-            // can reclaim it when allocation succeeds.
-            return;
-        }
-        // 单次稳定压缩是 O(n)。逐项 vector::erase 会把大批任务完成时的
-        // 回收变成 O(n²)，且整段移动发生在调度器总锁内。
-        auto output = task_registry.begin();
-        for (auto it = task_registry.begin(); it != task_registry.end(); ++it) {
-            if (!*it || (*it)->terminal()) {
-                if (*it) {
-                    deferred_destruction.emplace_back(std::move(*it));
-                }
-            } else {
-                if (output != it) {
-                    *output = std::move(*it);
-                }
-                ++output;
+        for (std::size_t stripe = 0; stripe < kRegistryStripeCount;
+             ++stripe) {
+            auto& task_registry = task_registries[stripe];
+            std::lock_guard<std::mutex> registry_lock(
+                registry_mutexes[stripe]);
+            try {
+                deferred_destruction.reserve(deferred_destruction.size() +
+                                             task_registry.size());
+            } catch (...) {
+                // Retaining a terminal entry is safe. A later worker/shutdown
+                // pass can reclaim it when allocation succeeds.
+                continue;
             }
+            // 单次稳定压缩是 O(n)。逐项 vector::erase 会把大批任务完成时的
+            // 回收变成 O(n²)，且整段移动发生在调度器总锁内。
+            auto output = task_registry.begin();
+            for (auto it = task_registry.begin(); it != task_registry.end();
+                 ++it) {
+                if (!*it || (*it)->terminal()) {
+                    if (*it) {
+                        deferred_destruction.emplace_back(std::move(*it));
+                    }
+                } else {
+                    if (output != it) {
+                        *output = std::move(*it);
+                    }
+                    ++output;
+                }
+            }
+            task_registry.erase(output, task_registry.end());
         }
-        task_registry.erase(output, task_registry.end());
     }
 
     void emergency_enqueue_locked(const std::shared_ptr<Task>& task) noexcept {
@@ -1081,6 +1129,26 @@ public:
         }
         global_queue.swap(resumable_global);
 
+        // external producers do not hold scheduler mutex.
+        std::deque<std::shared_ptr<Task>> incoming;
+        {
+            std::lock_guard<std::mutex> incoming_lock(incoming_mutex);
+            incoming.swap(incoming_queue);
+        }
+        for (auto& task : incoming) {
+            if (!task) continue;
+            if (task->started()) {
+                task->request_cancel(false);
+                global_queue.emplace_back(std::move(task));
+            } else {
+                task->clear_queued();
+                task->request_cancel(false);
+                completion_notifications.emplace_back(task);
+                runnable.fetch_sub(1, std::memory_order_relaxed);
+                deferred_destruction.emplace_back(std::move(task));
+            }
+        }
+
         // The rescue queue contains only previously started Gs when a normal
         // queue allocation failed. Keep them runnable and request cooperative
         // cancellation; no new node allocation is required here.
@@ -1091,47 +1159,61 @@ public:
         // Waiting Gs are not in a queue. Request cancellation and perform the
         // same pending-wake handoff used by I/O readiness so a park racing
         // this scan cannot be lost.
-        for (const auto& task : task_registry) {
-            if (!task) {
-                continue;
-            }
-            const auto state = task->state();
-            if (state == GState::kDead || state == GState::kCancelled ||
-                state == GState::kFailed) {
-                continue;
-            }
-            task->request_cancel(false);
-            if (task->terminal()) {
-                completion_notifications.emplace_back(task);
-            }
-            if (!task->started()) {
-                continue;
-            }
-            const auto action = task->wake_for_scheduler();
-            if (action == WakeAction::kEnqueue && task->try_mark_queued()) {
-                runnable.fetch_add(1, std::memory_order_relaxed);
-                try {
-                    global_queue.emplace_back(task);
-                } catch (...) {
+        for (std::size_t stripe = 0; stripe < kRegistryStripeCount;
+             ++stripe) {
+            std::lock_guard<std::mutex> registry_lock(
+                registry_mutexes[stripe]);
+            for (const auto& task : task_registries[stripe]) {
+                if (!task) {
+                    continue;
+                }
+                const auto state = task->state();
+                if (state == GState::kDead || state == GState::kCancelled ||
+                    state == GState::kFailed) {
+                    continue;
+                }
+                task->request_cancel(false);
+                if (task->terminal()) {
+                    completion_notifications.emplace_back(task);
+                }
+                if (!task->started()) {
+                    continue;
+                }
+                const auto action = task->wake_for_scheduler();
+                if (action == WakeAction::kEnqueue && task->try_mark_queued()) {
+                    runnable.fetch_add(1, std::memory_order_relaxed);
+                    try {
+                        global_queue.emplace_back(task);
+                    } catch (...) {
+                        emergency_enqueue_locked(task);
+                    }
+                } else if (task->state() == GState::kRunnable &&
+                           !task->queued() && task->try_mark_queued()) {
+                    // A notifier may have changed Waiting -> Runnable before it
+                    // acquired this admission mutex. Shutdown must claim that G
+                    // itself rather than leave a suspended Runnable unqueued.
+                    runnable.fetch_add(1, std::memory_order_relaxed);
                     emergency_enqueue_locked(task);
                 }
-            } else if (task->state() == GState::kRunnable &&
-                       !task->queued() && task->try_mark_queued()) {
-                // A notifier may have changed Waiting -> Runnable before it
-                // acquired this admission mutex. Shutdown must claim that G
-                // itself rather than leave a suspended Runnable unqueued.
-                runnable.fetch_add(1, std::memory_order_relaxed);
-                emergency_enqueue_locked(task);
             }
         }
         collect_terminal_locked(deferred_destruction);
     }
 
     bool all_tasks_terminal_locked() const {
-        return std::all_of(task_registry.begin(), task_registry.end(),
-                           [](const auto& task) {
-                               return !task || task->terminal();
-                           });
+        for (std::size_t stripe = 0; stripe < kRegistryStripeCount;
+             ++stripe) {
+            std::lock_guard<std::mutex> registry_lock(
+                registry_mutexes[stripe]);
+            if (!std::all_of(task_registries[stripe].begin(),
+                             task_registries[stripe].end(),
+                             [](const auto& task) {
+                                 return !task || task->terminal();
+                             })) {
+                return false;
+            }
+        }
+        return true;
     }
 
     bool finish_draining_locked() noexcept {
@@ -1155,11 +1237,15 @@ public:
     std::shared_ptr<const void> owner_token;
     std::shared_ptr<TaskCancellationGate> cancellation_gate;
     mutable std::mutex mutex;
+    mutable std::array<std::mutex, kRegistryStripeCount> registry_mutexes;
+    std::mutex incoming_mutex;
+    std::deque<std::shared_ptr<Task>> incoming_queue;
     std::condition_variable condition;
     std::deque<std::shared_ptr<Task>> global_queue;
     std::shared_ptr<Task> emergency_head;
     std::shared_ptr<Task> emergency_tail;
-    std::vector<std::shared_ptr<Task>> task_registry;
+    std::array<std::vector<std::shared_ptr<Task>>, kRegistryStripeCount>
+        task_registries;
     std::deque<Processor> processors;
     // Machine records outlive their worker thread. Keeping shared slots makes
     // machine indices/references stable while dynamic growth appends workers,
@@ -1484,35 +1570,24 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     if (!task || !m_impl) {
         return false;
     }
-
-    // Do not bind/register a task that has already reached a terminal state.
-    // Besides making the public enqueue contract deterministic, this avoids
-    // retaining a pre-cancelled callable in the scheduler registry until the
-    // next shutdown/worker collection pass.
     const auto initial_state = task->state();
     if (initial_state == GState::kDead || initial_state == GState::kCancelled ||
         initial_state == GState::kFailed) {
         return false;
     }
 
-    // Admission and queue insertion share the scheduler mutex.  This closes
-    // the shutdown race where a producer could observe accepting=true, then
-    // insert a G after shutdown had already drained the queues.
-    std::unique_lock<std::mutex> admission_lock(m_impl->mutex);
+    const bool from_worker =
+        current_scheduler() == this && t_processor_id < m_impl->processors.size();
     const bool drain_resume =
         m_impl->draining.load(std::memory_order_acquire) &&
         task->started() && task->cancellation_requested();
     if ((!m_impl->accepting.load(std::memory_order_acquire) && !drain_resume) ||
         m_impl->stopping.load(std::memory_order_acquire)) {
-        // A failed attempt by an unrelated/stopped scheduler must not poison
-        // an otherwise unowned task. spawn() performs the cancellation it
-        // needs after enqueue() reports failure.
         bool notify = false;
         if (task->owned_by(m_impl->owner_token)) {
             task->request_cancel(false);
             notify = task->terminal();
         }
-        admission_lock.unlock();
         if (notify) {
             task->notify_terminal();
         }
@@ -1524,78 +1599,133 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         admission_state != GState::kRunnable) {
         return false;
     }
-
-    // A G is permanently associated with the scheduler that first admits it;
-    // keeping this binding under the admission lock also preserves the global
-    // scheduler -> task-transition lock order used by workers and shutdown.
-    if (!task->bind_owner(m_impl->owner_token)) {
+    if (!task->prepare_enqueue(m_impl->owner_token,
+                               m_impl->cancellation_gate)) {
         return false;
     }
-    // Task::cancel reads this weak pointer under the transition mutex. Keep
-    // first admission synchronized with concurrent external cancellation;
-    // a plain weak_ptr assignment here would be a data race.
-    task->bind_cancellation_gate(m_impl->cancellation_gate);
 
-    bool registered_here = task->try_register();
-    if (registered_here) {
-        try {
-            m_impl->task_registry.emplace_back(task);
-        } catch (...) {
-            task->m_registered.store(false, std::memory_order_release);
-            registered_here = false;
-            task->request_cancel(false);
-            admission_lock.unlock();
-            if (task->terminal()) {
-                task->notify_terminal();
+    bool registered_here = false;
+    bool registry_admission_failed = false;
+    {
+        const auto registry_stripe =
+            Scheduler::Impl::registry_stripe(*task);
+        std::lock_guard<std::mutex> registry_lock(
+            m_impl->registry_mutexes[registry_stripe]);
+        registered_here = task->try_register();
+        if (registered_here) {
+            try {
+                m_impl->task_registries[registry_stripe].emplace_back(task);
+            } catch (...) {
+                task->m_registered.store(false, std::memory_order_release);
+                registered_here = false;
+                registry_admission_failed = true;
             }
+        }
+    }
+    // 注册表是挂起 G 的最后一个强所有权。首次注册分配失败时绝不能
+    // 继续发布队列节点，否则任务第一次 park 后可能只剩调用方的裸句柄，
+    // Fiber 栈会在无人持有时被销毁。将这次入队报告为失败，让 spawn()
+    // 按普通取消路径处理。
+    if (registry_admission_failed) {
+        task->clear_queued();
+        task->request_cancel(false);
+        task->notify_terminal();
+        return false;
+    }
+
+    if (task->state() != GState::kRunnable || !task->queued()) {
+        if (registered_here) {
+            std::shared_ptr<Task> abandoned;
+            {
+                const auto registry_stripe =
+                    Scheduler::Impl::registry_stripe(*task);
+                std::lock_guard<std::mutex> registry_lock(
+                    m_impl->registry_mutexes[registry_stripe]);
+                auto& task_registry =
+                    m_impl->task_registries[registry_stripe];
+                auto found = std::find(task_registry.begin(),
+                                       task_registry.end(), task);
+                if (found != task_registry.end()) {
+                    if (task->terminal()) {
+                        abandoned = std::move(*found);
+                    }
+                    task_registry.erase(found);
+                }
+            }
+            task->m_registered.store(false, std::memory_order_release);
+            if (abandoned) {
+                auto abandoned_function = abandoned->release_callable();
+            }
+        }
+        return false;
+    }
+
+    // Worker-issued shutdown resumes must use the admission-locked queues so
+    // shutdown's draining scan and the resume are ordered. Normal producers
+    // use the short incoming queue and never contend with worker dequeue.
+    if (!from_worker && !drain_resume) {
+        bool published = false;
+        {
+            std::lock_guard<std::mutex> incoming_lock(m_impl->incoming_mutex);
+            if (m_impl->accepting.load(std::memory_order_acquire) &&
+                !m_impl->stopping.load(std::memory_order_acquire)) {
+                m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    m_impl->incoming_queue.emplace_back(task);
+                    published = true;
+                } catch (...) {
+                    m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (!published) {
+            if (task->started()) {
+                // incoming_queue 的计数在 emplace 失败时已经回滚；救援链
+                // 仍需要重新计入 runnable，worker 取出它时才会配对递减。
+                std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
+                m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+                m_impl->emergency_enqueue_locked(task);
+                m_impl->condition.notify_one();
+                return true;
+            }
+            task->clear_queued();
+            task->request_cancel(false);
+            if (registered_here) {
+                const auto registry_stripe =
+                    Scheduler::Impl::registry_stripe(*task);
+                std::lock_guard<std::mutex> registry_lock(
+                    m_impl->registry_mutexes[registry_stripe]);
+                auto& task_registry =
+                    m_impl->task_registries[registry_stripe];
+                auto found = std::find(task_registry.begin(),
+                                       task_registry.end(), task);
+                if (found != task_registry.end()) {
+                    task_registry.erase(found);
+                }
+                task->m_registered.store(false, std::memory_order_release);
+            }
+            task->notify_terminal();
             return false;
         }
-    }
-
-    GState state = task->state();
-    if (state == GState::kNew) {
-        state = task->promote_new() ? GState::kRunnable : task->state();
-    }
-    if (state != GState::kRunnable || !task->try_mark_queued()) {
-        // A concurrent external cancellation can win after the initial check,
-        // after registration but before queue admission. Remove that terminal
-        // entry now; arbitrary callable destruction happens after the
-        // admission lock is released.
-        std::vector<std::shared_ptr<Task>> deferred_destruction;
-        if (registered_here) {
-            const auto found = std::find(m_impl->task_registry.begin(),
-                                         m_impl->task_registry.end(), task);
-            if (found != m_impl->task_registry.end()) {
-                if (task->terminal()) {
-                    deferred_destruction.emplace_back(std::move(*found));
-                }
-                m_impl->task_registry.erase(found);
-            }
-            task->m_registered.store(false, std::memory_order_release);
+    } else {
+        std::unique_lock<std::mutex> admission_lock(m_impl->mutex);
+        if ((!m_impl->accepting.load(std::memory_order_acquire) && !drain_resume) ||
+            m_impl->stopping.load(std::memory_order_acquire)) {
+            task->clear_queued();
+            task->request_cancel(false);
+            admission_lock.unlock();
+            task->notify_terminal();
+            return false;
         }
-        admission_lock.unlock();
-        for (auto& retained_task : deferred_destruction) {
-            if (retained_task) {
-                auto abandoned_function = retained_task->release_callable();
-            }
-        }
-        return false;
-    }
-
-    const auto preferred = (current_scheduler() == this)
-                               ? static_cast<std::size_t>(t_processor_id)
-                               : m_impl->next_processor.fetch_add(
-                                     1, std::memory_order_relaxed);
-    auto& processor = m_impl->processors[preferred % m_impl->processors.size()];
-
-    bool use_global = false;
-    {
+        const auto preferred =
+            from_worker ? static_cast<std::size_t>(t_processor_id)
+                        : m_impl->next_processor.fetch_add(
+                              1, std::memory_order_relaxed);
+        auto& processor =
+            m_impl->processors[preferred % m_impl->processors.size()];
         std::lock_guard<std::mutex> queue_lock(processor.mutex);
-        use_global = processor.queue.size() >= m_impl->config.local_queue_limit;
-        // Publish the runnable count before making the node visible to a
-        // worker.  Otherwise a fast worker can pop immediately after
-        // push_back and decrement a counter that has not been incremented
-        // yet (size_t underflow and a permanently false wake predicate).
+        const bool use_global =
+            processor.queue.size() >= m_impl->config.local_queue_limit;
         m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
         try {
             if (!use_global) {
@@ -1605,33 +1735,40 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
             }
         } catch (...) {
             if (task->started()) {
-                // An already-started Fiber cannot be destroyed or left
-                // Runnable without a queue node after allocation failure.
-                // The intrusive rescue queue reuses its Task-owned link.
+                // 已启动 Fiber 不能在分配失败时丢失。救援队列复用
+                // Task 内嵌链，不需要再次分配节点，仍保留 runnable/queued
+                // 计数，后续 worker 会从这里恢复并完成取消收尾。
                 m_impl->emergency_enqueue_locked(task);
             } else {
                 m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
                 task->clear_queued();
                 task->request_cancel(false);
                 admission_lock.unlock();
+                if (registered_here) {
+                    const auto registry_stripe =
+                        Scheduler::Impl::registry_stripe(*task);
+                    std::lock_guard<std::mutex> registry_lock(
+                        m_impl->registry_mutexes[registry_stripe]);
+                    auto& task_registry =
+                        m_impl->task_registries[registry_stripe];
+                    const auto found = std::find(task_registry.begin(),
+                                                 task_registry.end(), task);
+                    if (found != task_registry.end()) {
+                        task_registry.erase(found);
+                    }
+                    task->m_registered.store(false, std::memory_order_release);
+                }
                 task->notify_terminal();
                 return false;
             }
         }
     }
-    admission_lock.unlock();
-    // Grow outside the admission critical section. The helper reaps workers
-    // that already timed out, then admits only the amount of M needed for the
-    // current runnable backlog.
-    // Sample maintenance during producer bursts; the worker-side path still
-    // performs immediate growth while the initial P set is being filled.
+
     const auto maintenance_ticket =
         m_impl->enqueue_maintenance.fetch_add(1, std::memory_order_relaxed);
     const bool initial_workers_missing =
         m_impl->active_workers.load(std::memory_order_relaxed) <
         m_impl->config.min_workers;
-    // 单 P 调度器在一个 M 被 Hook 标记为 blocking 时，替代 M 必须
-    // 立即启动；不能把这类低频但有进度要求的路径延迟到采样周期。
     const bool replacement_may_be_needed =
         m_impl->active_workers.load(std::memory_order_relaxed) <=
             m_impl->config.min_workers &&
@@ -2014,8 +2151,10 @@ std::vector<MachineSnapshot> Scheduler::machines() const {
         }
         result.push_back(MachineSnapshot{
             machine->id, machine->state.load(std::memory_order_acquire),
-            machine->processor, machine->last_task_class,
-            machine->affinity_hits, machine->affinity_misses,
+            machine->processor,
+            machine->last_task_class.load(std::memory_order_relaxed),
+            machine->affinity_hits.load(std::memory_order_relaxed),
+            machine->affinity_misses.load(std::memory_order_relaxed),
             machine->processor_detached.load(std::memory_order_acquire),
             machine->blocking_task.load(std::memory_order_acquire),
             machine->long_syscall_count.load(std::memory_order_acquire)});
@@ -2115,6 +2254,37 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         if (task && m_impl->stopping.load(std::memory_order_acquire)) {
             task->request_cancel(false);
         }
+        if (!task && !m_impl->stopping.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> incoming_lock(m_impl->incoming_mutex);
+            if (!m_impl->incoming_queue.empty()) {
+                auto selected = m_impl->incoming_queue.begin();
+                if (machine->last_task_class.load(std::memory_order_relaxed) != 0 &&
+                    machine->affinity_budget.load(std::memory_order_relaxed) != 0 &&
+                    m_impl->config.task_affinity_budget != 0) {
+                    std::size_t scanned = 0;
+                    for (auto it = selected;
+                         it != m_impl->incoming_queue.end() &&
+                         scanned < m_impl->config.task_affinity_budget;
+                         ++it, ++scanned) {
+                            if (*it && (*it)->task_class() ==
+                                      machine->last_task_class.load(std::memory_order_relaxed)) {
+                            selected = it;
+                            break;
+                        }
+                    }
+                }
+                task = std::move(*selected);
+                m_impl->incoming_queue.erase(selected);
+                m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                claimed = task->try_mark_running();
+                if (!claimed) {
+                    task->clear_queued();
+                }
+            }
+        }
+        if (task && m_impl->stopping.load(std::memory_order_acquire)) {
+            task->request_cancel(false);
+        }
         if (!task) {
             // Queue removal, the shutdown check, and the runnable->running
             // claim form one admission transaction.  A task already claimed
@@ -2124,10 +2294,11 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
             if (!m_impl->stopping.load(std::memory_order_acquire)) {
                 const bool prefer_class =
-                    machine->last_task_class != 0 &&
-                    machine->affinity_budget != 0 &&
+                    machine->last_task_class.load(std::memory_order_relaxed) != 0 &&
+                    machine->affinity_budget.load(std::memory_order_relaxed) != 0 &&
                     m_impl->config.task_affinity_budget != 0;
-                const auto preferred_class = machine->last_task_class;
+                const auto preferred_class =
+                    machine->last_task_class.load(std::memory_order_relaxed);
                 const auto scan_limit = m_impl->config.task_affinity_budget;
                 const auto take_local = [&](auto& queue) {
                     if (prefer_class) {
@@ -2253,18 +2424,22 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             m_impl->running_workers.fetch_add(1, std::memory_order_relaxed);
             machine->state.store(MState::kRunning, std::memory_order_release);
             const auto task_class = task->task_class();
-            if (task_class != 0 && task_class == machine->last_task_class &&
-                machine->affinity_budget != 0) {
-                ++machine->affinity_hits;
-                --machine->affinity_budget;
+            const auto last_task_class =
+                machine->last_task_class.load(std::memory_order_relaxed);
+            if (task_class != 0 && task_class == last_task_class &&
+                machine->affinity_budget.load(std::memory_order_relaxed) != 0) {
+                machine->affinity_hits.fetch_add(1, std::memory_order_relaxed);
+                machine->affinity_budget.fetch_sub(1, std::memory_order_relaxed);
             } else {
-                if (machine->last_task_class != 0 &&
-                    task_class != machine->last_task_class) {
-                    ++machine->affinity_misses;
+                if (last_task_class != 0 && task_class != last_task_class) {
+                    machine->affinity_misses.fetch_add(1,
+                                                       std::memory_order_relaxed);
                 }
-                machine->last_task_class = task_class;
-                machine->affinity_budget =
-                    task_class == 0 ? 0 : m_impl->config.task_affinity_budget;
+                machine->last_task_class.store(task_class,
+                                               std::memory_order_relaxed);
+                machine->affinity_budget.store(
+                    task_class == 0 ? 0 : m_impl->config.task_affinity_budget,
+                    std::memory_order_relaxed);
             }
         }
 

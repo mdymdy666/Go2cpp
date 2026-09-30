@@ -614,3 +614,35 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
 - 验证：Debug/Release 全量 CTest 各 14/14 通过；scheduler、dynamic、io 过滤器
   通过；`git diff --check` 通过。构建时仅有 WSL 文件时钟偏移警告。未改变用户的
   `LOCAL_CODE_REVIEW_ORDER.md` 未跟踪文件。
+
+## 2026-09-30：当前收尾复核与并发热路径修复
+
+- 调度器将外部生产者改为 `incoming_queue` 与独立互斥量，并把任务注册表拆成
+  16 个分片；`Task::prepare_enqueue` 在一次状态转换中完成 owner、取消门和入队
+  标记，减少重复加锁和重复入队窗口。
+- IO 的 `WaitMany` 增加注册后的零超时 readiness 补采样，修复“状态为 ready 但
+  ready 列表为空”的竞态；领取等待节点时清理 pending 标记，并只在同一注册的
+  读写队列都为空时失效 epoll interest，避免高负载下丢唤醒或重复注册。
+- Mutex 保留有等待者时的公平保护，只对无等待者竞争执行有限次协作让出；没有把
+  普通线程锁伪装成可跨线程迁移的 Fiber 锁。
+- 配置 watcher 增加生命周期互斥量和条件变量快速停止；配置读取使用不可变原子
+  快照；日志 sink、级别和 worker 列表使用快照并避免 Info 级别逐条 flush。新增
+  的生命周期约束已写入 `docs/configuration.md`。
+- 当前构建验证：WaitMany demo 连续 20 次通过；高负载样例通过；最终 Debug CTest
+  13/13、Release CTest 14/14 均通过。性能复测写入
+  `docs/performance.md`：公平调度中位数约为 Coost 4 倍，IO 场景约为 Coost 0.59 倍，
+  混合 Mutex 仍明显落后，未宣称达到全局 1.25 倍目标。
+- 进一步修复：Machine 的任务亲和字段改为原子快照，避免 worker 更新与
+  `Scheduler::machines()` 读取之间的数据竞争；配置 watcher 捕获监听器异常，避免
+  用户回调异常导致 watcher 线程 `std::terminate`。修复后两套 CTest 再次全通过。
+- IO 生命周期复核增加 WaitNode 的完成操作屏障：`complete`、epoll 取 ready 节点和
+  deadline drain 在 claim 前登记 active operation，节点回收会等待这些操作完成；
+  Context 回调仍有独立进入/退出屏障。pending readiness 保留高性能 epoll 快路径，
+  但在下次消费前通过零超时原生 poll 复核 FD，避免读空后的 stale ready。
+- 最终验证：Release CTest 14/14、Debug CTest 13/13、Werror CTest 3/3、ASan
+  CTest 3/3 通过；核心 Release `go2cpp_tests` 连续 4 次通过。TSan 当前构建在本机
+  WSL 报 `ThreadSanitizer: unexpected memory mapping`，属于运行环境限制，未宣称通过。
+  Valgrind 当前测试的 ERROR SUMMARY 为 0，definite/indirect/possible leak 均为 0，
+  但 Memcheck 放大时序导致 IO watchdog 超时，416 bytes still reachable 为进程级缓存。
+- Fiber Context 复核结论不变：自研自动扩栈上下文曾在嵌套恢复中破坏父链，已撤回；
+  当前生产实现继续使用 Boost.Context 受保护固定栈，自动扩栈属于未完成边界。
