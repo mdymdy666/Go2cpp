@@ -309,6 +309,10 @@ WakeAction Task::wake_for_scheduler() noexcept {
 }
 
 WakeAction Task::wake_for_io() noexcept {
+    return wake_for_wait();
+}
+
+WakeAction Task::wake_for_wait() noexcept {
     GState expected = GState::kWaiting;
     if (m_state.compare_exchange_strong(expected, GState::kRunnable,
                                         std::memory_order_acq_rel,
@@ -1968,7 +1972,7 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
     if (!task || !m_impl || !task->owned_by(m_impl->owner_token)) {
         return false;
     }
-    const auto action = task->wake_for_scheduler();
+    const auto action = task->wake_for_wait();
     if (action == WakeAction::kPending) {
         return false;
     }
@@ -2057,7 +2061,7 @@ bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
     if (!task || !task->owned_by(m_impl->owner_token)) {
         return false;
     }
-    const auto action = task->wake_for_scheduler();
+    const auto action = task->wake_for_wait();
     if (action == WakeAction::kPending) {
         // The running G will consume the permit if it parks. It is not
         // immediately runnable because its C++ callable still owns the M.
@@ -2112,7 +2116,7 @@ bool Scheduler::cancel(const std::shared_ptr<Task>& task) {
         return changed;
     }
 
-    const auto action = task->wake_for_scheduler();
+    const auto action = task->wake_for_wait();
     if (action == WakeAction::kEnqueue) {
         if (!enqueue(task)) {
             (void)task->cancel_if_runnable_unqueued();

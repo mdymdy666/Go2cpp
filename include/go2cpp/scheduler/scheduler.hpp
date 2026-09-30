@@ -226,6 +226,10 @@ public:
     // worker consumes it after the Fiber returns from park, so this transition
     // can use an atomic state CAS without taking the scheduler mutex.
     WakeAction wake_for_io() noexcept;
+    // 跨 M 的同步等待唤醒使用同一套 Waiting -> Runnable 原子线性化。
+    // 它不访问 Fiber 栈，只发布状态和 pending token；真正 resume 仍由
+    // execution_claim 串行化，因此不会让两个 M 同时进入同一个 Fiber。
+    WakeAction wake_for_wait() noexcept;
     ParkAction park_for_scheduler() noexcept;
     bool try_mark_running();
     // Internal state transitions used by Scheduler. mark_runnable() only
