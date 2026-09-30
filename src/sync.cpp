@@ -215,12 +215,12 @@ private:
     CancelFunc m_cancel;
 };
 
-WaitResult Await(const std::shared_ptr<WaitNode>& waiter) noexcept {
+WaitResult Await(WaitNode* waiter) noexcept {
     if (!waiter) {
         return WaitResult::kCancelled;
     }
 
-    const auto finish = [&waiter](WaitResult result) {
+    const auto finish = [waiter](WaitResult result) {
         waiter->Disarm();
         return result;
     };
@@ -263,9 +263,8 @@ WaitResult Await(const std::shared_ptr<WaitNode>& waiter) noexcept {
     }
 }
 
-template <typename Queue>
-void RemoveWaiter(Queue& waiters,
-                  const std::shared_ptr<WaitNode>& waiter) noexcept {
+template <typename Queue, typename Waiter>
+void RemoveWaiter(Queue& waiters, const Waiter& waiter) noexcept {
     const auto position = std::find(waiters.begin(), waiters.end(), waiter);
     if (position != waiters.end()) {
         waiters.erase(position);
@@ -307,7 +306,10 @@ struct Mutex::Impl {
     // 慢路径互斥量；有等待者时仍由 m_mutex 串行化 FIFO handoff。
     std::atomic<bool> m_fast_locked{false};
     std::atomic<bool> m_has_waiters{false};
-    std::deque<std::shared_ptr<WaitNode>> m_waiters;
+    // 等待节点由 Lock 调用栈或带 Context 的拥有者保存。指针队列避免
+    // 无 Context 的短等待反复分配 shared_ptr 控制块，生命周期由等待者
+    // 在挂起期间保证。
+    std::deque<WaitNode*> m_waiters;
 };
 
 Mutex::Mutex() : m_impl(std::make_unique<Impl>()) {}
@@ -361,22 +363,32 @@ bool Mutex::Lock(const ContextPtr& context) {
             }
         }
     }
-    const auto waiter = AcquireWaitNode(target.scheduler, target.task);
-    ContextSubscription subscription(context, waiter);
+    WaitNode stack_waiter(target.scheduler, target.task);
+    std::shared_ptr<WaitNode> owned_waiter;
+    WaitNode* waiter = &stack_waiter;
+    if (context) {
+        owned_waiter = AcquireWaitNode(target.scheduler, target.task);
+        waiter = owned_waiter.get();
+    }
+    ContextSubscription subscription(context, owned_waiter);
+    const auto release_waiter = [&] {
+        subscription.Reset();
+        if (owned_waiter) {
+            ReleaseWaitNode(std::move(owned_waiter));
+        }
+    };
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
         if ((context && context->IsDone()) ||
             waiter->result() != WaitResult::kWaiting) {
-            subscription.Reset();
-            ReleaseWaitNode(waiter);
+            release_waiter();
             return false;
         }
         expected = false;
         if (m_impl->m_fast_locked.compare_exchange_strong(
-                expected, true, std::memory_order_acquire,
-                std::memory_order_relaxed)) {
-            subscription.Reset();
-            ReleaseWaitNode(waiter);
+                    expected, true, std::memory_order_acquire,
+                    std::memory_order_relaxed)) {
+            release_waiter();
             return true;
         }
         m_impl->m_waiters.push_back(waiter);
@@ -385,8 +397,7 @@ bool Mutex::Lock(const ContextPtr& context) {
             m_impl->m_waiters.pop_back();
             m_impl->m_has_waiters.store(!m_impl->m_waiters.empty(),
                                         std::memory_order_release);
-            subscription.Reset();
-            ReleaseWaitNode(waiter);
+            release_waiter();
             return false;
         }
     }
@@ -398,10 +409,14 @@ bool Mutex::Lock(const ContextPtr& context) {
         RemoveWaiter(m_impl->m_waiters, waiter);
         m_impl->m_has_waiters.store(!m_impl->m_waiters.empty(),
                                     std::memory_order_release);
-        ReleaseWaitNode(waiter);
+        if (owned_waiter) {
+            ReleaseWaitNode(std::move(owned_waiter));
+        }
         return false;
     }
-    ReleaseWaitNode(waiter);
+    if (owned_waiter) {
+        ReleaseWaitNode(std::move(owned_waiter));
+    }
     return true;
 }
 
@@ -440,18 +455,18 @@ void Mutex::Unlock() {
             return;
         }
     }
-    std::shared_ptr<WaitNode> selected;
+    WaitNode* selected = nullptr;
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
         if (!m_impl->m_fast_locked.load(std::memory_order_acquire)) {
             throw std::logic_error("go2cpp::sync::Mutex unlock of unlocked mutex");
         }
         while (!m_impl->m_waiters.empty()) {
-            auto candidate = std::move(m_impl->m_waiters.front());
+            WaitNode* candidate = m_impl->m_waiters.front();
             m_impl->m_waiters.pop_front();
             if (candidate &&
                 candidate->TryFinish(WaitResult::kNotified)) {
-                selected = std::move(candidate);
+                selected = candidate;
                 break;
             }
         }
@@ -536,7 +551,7 @@ bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
         throw;
     }
 
-    const WaitResult result = Await(waiter);
+    const WaitResult result = Await(waiter.get());
     subscription.Reset();
     {
         // Context-cancelled nodes are removed by their owner. Notify paths
@@ -674,7 +689,7 @@ bool WaitGroup::Wait(const ContextPtr& context) {
         }
     }
 
-    const WaitResult result = Await(waiter);
+    const WaitResult result = Await(waiter.get());
     subscription.Reset();
     if (result != WaitResult::kNotified) {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);

@@ -48,21 +48,44 @@ Fiber 等待仍通过 Scheduler park，普通线程仍通过条件变量等待�
 
 ## 与 Coost 的可比性
 
-Coost 官方仓库明确提供多线程协程调度、共享栈、协程锁和 waitgroup；其
-默认共享若干约 1 MB 的栈，目标是降低大量协程的栈内存占用。参见
+本轮直接使用本机已有的 Coost checkout：
+`/mnt/e/CodexWorkspace/Go2Cpp/coost`，构建时的 HEAD 为 `c1cc11b`。
+该 checkout 在开始前已经是 dirty 状态，因此下面的数字代表这份本地快照，
+不代表某个干净发布版；没有修改 Coost 源码。参见
 [Coost 官方仓库](https://github.com/idealvin/coost)。
 
-本工作区当前无法从 GitHub 拉取 Coost 源码（WSL 到 github.com:443 的网络
-连接被环境拒绝），因此没有伪造 Coost 的本地运行数字，也没有把 Coost 的
-日志吞吐表当成调度器或 Mutex 基准。官方页面公布的是日志与 glog/spdlog
-的对比，不是本项目使用的同一任务、同一 IO 和同一锁测试，不能直接换算成
-本项目的性能差距。
+两个项目都在同一台 WSL2/Linux 主机上以 Release 构建。调度测试使用 50,000
+个任务、每个任务 4 次让出、8 个生产线程；Coost 使用 `co::sleep(0)` 让任务
+被定时器重新放回 runnable 队列，因而只比较“自动重新调度”这条路径，不能把
+Coost 的 `co::yield()`（需要调用者显式再次 resume）当成同一个 API。混合锁
+测试使用 2,000 个协程、32 个普通线程，共 206,400 次加解锁；IO 测试使用
+4,096 个 socketpair reader、25 轮 readiness。
 
-结构上，当前 Go2Cpp 使用 Boost.Context 的受保护固定栈、按线程和全局的栈
-缓存，以及 P 本地队列加有界窃取；Coost 的共享栈方案仍是后续可以借鉴的
-方向。当前未完成的性能缺口是可验证的共享/动态栈后端，以及把调度基准改成
-同样保存用户栈的线程 Fiber 基线。两项都不能仅凭 Coost 的 README 数字宣称
-已经解决。
+| 场景 | Coost | Go2Cpp（本轮） | 结果 |
+|---|---:|---:|---|
+| 自动调度与 yield | 13～52 ms | 436～497 ms | Go2Cpp 慢约 8～38 倍 |
+| 混合 Fiber/线程 Mutex | 1,097～1,766 ms | 99～107 ms | Go2Cpp 快约 10～18 倍 |
+| 多 fd IO 等待 | 486～569 ms | 1,666～2,098 ms | Go2Cpp 慢约 3.0～4.3 倍 |
+
+调度差距主要来自实现模型：Coost 使用少量共享栈，切换时保存/恢复栈内容；
+Go2Cpp 当前使用 Boost.Context 受保护固定栈，并在安全性优先的路径中维护
+G/M/P、Fiber 父链和任务状态。共享栈可以显著减少栈分配和切换成本，但必须
+补齐 C++ 栈对象生命周期、栈地址失效和异常边界验证，不能直接替换成未验证
+的 memcpy 方案。
+
+混合锁结果已经反超 Coost。本轮将无 Context 的竞争等待节点改为调用栈上的
+节点，队列只保存裸指针并保持 FIFO handoff；带 Context 的等待仍由缓存的
+拥有节点保证取消期间的生命周期。这样去除了短等待的 shared_ptr 控制块和
+分配开销，同时没有改变普通线程阻塞语义。
+
+IO 仍是明确的性能缺口。Go2Cpp 的 DescriptorToken、fd generation 校验、
+取消/超时竞争和 epoll interest 更新增加了锁与生命周期管理成本；Coost 的
+实现使用更轻量的嵌入式等待节点。下一步可以在保持 generation 校验的前提下
+增加 Fiber 私有 IO 等待节点和批量 interest 更新，但当前不宣称已经解决。
+
+上述 Go2Cpp 调度对照临时将 Fiber 栈设为 32 KiB；生产默认值仍由
+`SchedulerConfig` 控制，没有为了单个基准改变公开默认值。Coost 的调度和锁
+数据来自三次连续运行，IO 数据也来自三次连续运行；宿主调度抖动会影响区间。
 
 ## 复现实验
 

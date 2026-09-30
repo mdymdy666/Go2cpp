@@ -5,7 +5,7 @@
 > 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
 > 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
 
-## 2026-09-29：调度器与混合锁性能整改
+## 2026-09-29：调度器、混合锁与 Coost 对比
 
 - 本地 P 队列成功取到 G 后跳过调度器全局 admission 锁；G/M/P 计数统一在
   两条取任务路径之后更新，避免本地快路径遗漏运行计数。
@@ -15,13 +15,20 @@
   每次重复获取 Fiber 父链元数据锁，迁移到新 M/P 时仍更新调试绑定。
 - 混合 Mutex 增加有界 Fiber 协作重试，并在已有 FIFO 等待者时禁止无序快进；
   短临界区基准从约 13.9 秒降至约 0.10～0.20 秒。
-- 新增 `docs/performance.md`，记录 50,000 任务、混合锁、Channel、IO 的
-  实测结果，以及 Coost 官方资料和当前无法进行同机源码基准的原因。不得将
-  Coost 官方日志吞吐表冒充调度器或锁性能结果。
+- `src/sync.cpp` 的无 Context 竞争等待改用调用栈上的 `WaitNode`，队列保存裸
+  指针；带 Context 的等待继续使用线程本地缓存的拥有节点。该路径参考了本地
+  Coost 的嵌入式等待节点设计，但保留 Go2Cpp 的取消和 Fiber park 语义。
+- 新增并更新 `docs/performance.md`，记录本机 Coost checkout（HEAD
+  `c1cc11b`，工作区 dirty）的可复现对照：调度 13～52 ms 对 436～497 ms，
+  混合 Mutex 1,097～1,766 ms 对 99～107 ms，IO 486～569 ms 对 1,666～2,098 ms。调度和
+  IO 仍有差距，混合锁已反超；没有把 Coost README 的日志数据冒充调度器或锁
+  基准。
 - 验证：`go2cpp_high_load_stress` 完成全部检查；调度器定向测试连续 3 次
   通过；工程化构建 CTest 13/13、`-Werror` CTest 3/3、ASan+UBSan
-  `go2cpp_tests` 全部通过；Valgrind Memcheck 报告 0 definite/indirect/possible
-  leak，0 errors，416B/4 blocks 为进程级 still reachable 缓存。
+  `go2cpp_tests` 全部通过；本轮 Valgrind 按 `sync/scheduler/dynamic/channel/io`
+  分模块运行，均为 0 errors、0 definite/indirect/possible leak；完整测试在
+  Valgrind 下被 IO/动态日志的内置 watchdog 超时终止，不能作为全量 Valgrind
+  通过结论。
 
 ## 2026-09-26：Context 局部回滚
 
