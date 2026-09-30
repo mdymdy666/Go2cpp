@@ -198,3 +198,31 @@ timeout 90s ./build-engineering-wsl/go2cpp_high_load_stress
 样例为：计算 1,544 ms（线程 1,490 ms）、调度 123 ms（线程 88 ms）、混合 Mutex
 8,931 ms（线程 39 ms）、Channel 22 ms（线程 72 ms）、IO 955 ms（线程 2,035 ms）。
 这说明 IO 场景仍明显受益，但混合锁和调度提交开销仍未达到 Coost 的 1.25 倍目标。
+
+## 2026-09-30 Context 与跨 M 唤醒专项
+
+Linux x86_64 已增加 Go2Cpp 自有上下文后端：汇编只保存 callee-saved 寄存器、
+RSP/RIP 和 caller transfer，C++ `FiberStack` 使用带 `PROT_NONE` guard page 的
+mmap，并按栈大小使用 TLS/全局有界缓存。这样不再链接 Boost.Context；ASan/TSan
+切换标记、父链校验、`m_resume_claim` 和跨 M 的 transfer 更新仍由 Fiber 外层
+负责。非 Linux x86_64 回退 Boost.Context。
+
+coost 的 `tb_context_make/jump` 已作为布局参考，但没有直接复制其共享栈、8 槽
+固定调度器或 `_exit` 终止路径。coost 的 Buffer 不是自动动态栈；本后端同样不
+提供 Go 式 `morestack`，栈容量仍需通过配置显式设置。
+
+native 后端高负载三次采样：调度 `113～133 ms`，计算 `1327～1526 ms`，混合
+Mutex `6680～6895 ms`，IO `616～665 ms`；同一轮线程基准分别约 `40～46 ms`、
+`1283～1439 ms`、`39～42 ms`、`1614～1704 ms`。上下文替换没有改变调度语义，
+但显著降低了栈映射重复分配；调度仍慢于线程和 coost，混合锁仍是主要瓶颈。
+
+IO WaitNode、ParkingCondition 和 sync WaitNode 的跨 M wake/disarm/arm 门使用
+`HybridGate`：先对 atomic flag 做 64 次 `_mm_pause`/yield，持续竞争才进入
+`std::mutex` 慢路径；门内仍保护 Scheduler 指针、Task shared ownership、
+callback_active 和 operation 生命周期。它没有修改 Fiber 的 `fcontext` 并发规则：
+同一 Fiber 仍必须由 Task execution claim 串行恢复，wake 只发布状态和队列节点。
+
+与前一版同负载约 8.5～8.8 s 的混合锁相比，本轮 native Context+HybridGate 为
+约 6.7～6.9 s（该基准宿主抖动较大），线程 `std::mutex` 仍约 40 ms。HybridGate
+只能降低唤醒门开销，不能把 Fiber park/wake、FIFO handoff 和跨 M 调度变成一次
+原子操作；高争用共享锁仍应按本文件的分片/原子规约使用。

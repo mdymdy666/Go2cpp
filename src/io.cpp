@@ -1,5 +1,7 @@
 #include "go2cpp/io.hpp"
 
+#include "go2cpp/core/hybrid_mutex.hpp"
+
 #ifndef __linux__
 #error "go2cpp::io currently requires Linux epoll"
 #endif
@@ -170,7 +172,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         Scheduler* scheduler{nullptr};
         std::shared_ptr<Task> task;
         DescriptorTokenPtr descriptor;
-        std::mutex wake_mutex;
+        core::HybridMutex wake_mutex;
         bool wake_active{true};
         std::atomic<std::uint64_t> outcome{0};
         std::shared_ptr<WaitNode> wake_next;
@@ -184,14 +186,14 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         bool operations_stopped{false};
 
         void wake() noexcept {
-            std::lock_guard<std::mutex> lock(wake_mutex);
+            std::lock_guard<core::HybridMutex> lock(wake_mutex);
             if (wake_active && scheduler && task) {
                 (void)scheduler->wake_io(task);
             }
         }
 
         void disarm() noexcept {
-            std::lock_guard<std::mutex> lock(wake_mutex);
+            std::lock_guard<core::HybridMutex> lock(wake_mutex);
             wake_active = false;
             scheduler = nullptr;
         }

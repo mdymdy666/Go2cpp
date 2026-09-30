@@ -77,8 +77,9 @@ struct FiberResumeResult {
 };
 
 // A movable execution stack with a protected guard page. A Fiber can migrate
-// between OS threads, provided resume() calls are sequential. Boost.Context
-// remains an implementation detail and is not exposed by this interface.
+// between OS threads, provided resume() calls are sequential. The Linux
+// x86_64 build uses the internal context backend; other platforms may use
+// Boost.Context. The backend is not exposed by this interface.
 class Fiber {
 public:
     using Function = std::function<void()>;

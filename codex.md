@@ -647,6 +647,24 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
 - Fiber Context 复核结论不变：自研自动扩栈上下文曾在嵌套恢复中破坏父链，已撤回；
   当前生产实现继续使用 Boost.Context 受保护固定栈，自动扩栈属于未完成边界。
 
+## 2026-09-30：Context 后端与跨 M 唤醒门
+
+- Linux x86_64 新增 Go2Cpp 自有 Context ABI，布局借鉴 coost/TBOX，但保留
+  `mmap + PROT_NONE` guard page、FiberStack TLS/全局缓存、ASan/TSan 切换、
+  `m_resume_claim` 串行恢复和跨 M caller transfer；该平台不再链接 Boost.Context。
+  非 x86_64 Linux/其他平台回退 Boost.Context。
+- 明确 coost 的 Buffer 只是固定共享栈的挂起快照，不是自动动态栈；本轮没有复制
+  `_exit` 结束路径，也没有声称实现 Go `morestack`/`copystack`。
+- IO WaitNode、ParkingCondition 和 sync WaitNode 的 wake/disarm/arm 使用
+  `HybridGate`：原子 flag 先做 64 次短自旋，竞争持续再进入 `std::mutex`；节点
+  内的 Scheduler/Task 所有权和 callback/operation 生命周期仍由门保护。
+- native 后端高负载复测：调度 113～133 ms、计算 1327～1526 ms、混合 Mutex
+  6680～6895 ms、IO 616～665 ms；线程对照约 40～46 ms、1283～1439 ms、39～42 ms、
+  1614～1704 ms。混合锁仍受 park/wake/FIFO handoff 限制，未达到线程或 Coost
+  1.25 倍目标。
+- native Release CTest 14/14、native ASan/UBSan CTest 14/14 通过；高负载连续
+  3 次通过。详细约束与数据见 `docs/performance.md`、`docs/design.md`。
+
 ## 2026-09-30：调度器与混合 Mutex 专项优化收尾
 
 - 调度器新增 16 条 incoming 条带、非空位图、已注册 G 的唤醒快路径和 worker

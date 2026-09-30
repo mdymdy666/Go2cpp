@@ -2,7 +2,9 @@
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
-find_dependency(Boost 1.70 COMPONENTS context)
+if (NOT @GO2CPP_NATIVE_CONTEXT@)
+    find_dependency(Boost 1.70 COMPONENTS context)
+endif()
 include("${CMAKE_CURRENT_LIST_DIR}/go2cpp_runtime-targets.cmake")
 
 check_required_components(go2cpp_runtime)

@@ -1,6 +1,13 @@
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
-find_package(Boost 1.70 REQUIRED COMPONENTS context)
+set(GO2CPP_NATIVE_CONTEXT OFF)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
+    NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|riscv|ppc|s390")
+    set(GO2CPP_NATIVE_CONTEXT ON)
+endif()
+if (NOT GO2CPP_NATIVE_CONTEXT)
+    find_package(Boost 1.70 REQUIRED COMPONENTS context)
+endif()
 include(CheckIncludeFileCXX)
 check_include_file_cxx(valgrind/valgrind.h GO2CPP_HAVE_VALGRIND_HEADER)
 
@@ -21,7 +28,12 @@ add_library(go2cpp_scheduler
     ${CMAKE_CURRENT_SOURCE_DIR}/src/thread_policy.cpp)
 add_library(go2cpp_fiber
     ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber_local.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber_local.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/context_backend.cpp)
+if (GO2CPP_NATIVE_CONTEXT)
+    target_sources(go2cpp_fiber PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/context_x64.S)
+    target_compile_definitions(go2cpp_fiber PRIVATE GO2CPP_USE_NATIVE_CONTEXT=1)
+endif()
 add_library(go2cpp_sync ${CMAKE_CURRENT_SOURCE_DIR}/src/sync.cpp)
 add_library(go2cpp_future ${CMAKE_CURRENT_SOURCE_DIR}/src/future.cpp)
 add_library(go2cpp_io ${CMAKE_CURRENT_SOURCE_DIR}/src/io.cpp)
@@ -115,9 +127,14 @@ target_link_libraries(go2cpp_context PUBLIC go2cpp_error go2cpp_scheduler)
 target_link_libraries(go2cpp_channel PUBLIC go2cpp_context go2cpp_error)
 target_link_libraries(go2cpp_scheduler PUBLIC go2cpp_fiber go2cpp_log)
 target_link_libraries(go2cpp_config PUBLIC go2cpp_scheduler go2cpp_log)
-target_link_libraries(go2cpp_fiber PUBLIC Boost::context)
-if (GO2CPP_HAVE_VALGRIND_HEADER)
-    target_compile_definitions(go2cpp_fiber PRIVATE BOOST_USE_VALGRIND=1)
+if (GO2CPP_NATIVE_CONTEXT)
+    # Linux x86_64 uses the internal context ABI; it no longer needs the
+    # Boost.Context protected-stack implementation at link time.
+else()
+    target_link_libraries(go2cpp_fiber PUBLIC Boost::context)
+    if (GO2CPP_HAVE_VALGRIND_HEADER)
+        target_compile_definitions(go2cpp_fiber PRIVATE BOOST_USE_VALGRIND=1)
+    endif()
 endif()
 target_link_libraries(go2cpp_sync PUBLIC go2cpp_context go2cpp_scheduler)
 target_link_libraries(go2cpp_future PUBLIC go2cpp_context go2cpp_scheduler)

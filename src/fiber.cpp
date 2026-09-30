@@ -1,10 +1,16 @@
 #include "go2cpp/fiber.hpp"
 
+#include "go2cpp/detail/context_backend.hpp"
 #include "go2cpp/fiber_local.hpp"
 
+#if !defined(GO2CPP_USE_NATIVE_CONTEXT)
 #include <boost/context/detail/fcontext.hpp>
 #include <boost/context/protected_fixedsize_stack.hpp>
 #include <boost/context/stack_traits.hpp>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -74,16 +80,27 @@ std::atomic<std::uint64_t> s_next_fiber_id{1};
 // 放回缓存。先使用当前 M 的 TLS 缓存，跨 M 销毁时再进入有界全局缓存。
 struct CachedStack {
     std::size_t size{0};
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+    void* mapping{nullptr};
+    std::size_t mapping_size{0};
+#else
     boost::context::stack_context context{};
+#endif
 };
 
 struct StackCache {
     ~StackCache() noexcept {
         for (auto& entry : entries) {
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+            if (entry.mapping != nullptr) {
+                ::munmap(entry.mapping, entry.mapping_size);
+            }
+#else
             if (entry.context.sp != nullptr) {
                 boost::context::protected_fixedsize_stack allocator(entry.size);
                 allocator.deallocate(entry.context);
             }
+#endif
         }
     }
 
@@ -117,6 +134,13 @@ std::size_t normalize_stack_size(std::size_t requested) noexcept {
     if (requested == 0) {
         requested = Fiber::DefaultStackSize();
     }
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+    const auto minimum = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    const auto page_size = minimum;
+    return std::max(requested, minimum * 2U) +
+           ((page_size - (std::max(requested, minimum * 2U) % page_size)) %
+            page_size);
+#else
     const auto minimum = boost::context::stack_traits::minimum_size();
     const auto page_size = boost::context::stack_traits::page_size();
     const auto safe_maximum =
@@ -126,9 +150,114 @@ std::size_t normalize_stack_size(std::size_t requested) noexcept {
         result = std::min(result, boost::context::stack_traits::maximum_size());
     }
     return result;
+#endif
 }
 
 struct FiberStack {
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+    explicit FiberStack(std::size_t size)
+        : m_requested_size(size), m_page_size(page_size()), m_mapping_size(
+              m_requested_size + m_page_size),
+          m_mapping(acquire(m_requested_size, m_page_size, m_mapping_size)) {
+        if (m_mapping == MAP_FAILED) {
+            m_mapping = nullptr;
+            throw std::bad_alloc();
+        }
+    }
+
+    ~FiberStack() noexcept {
+        if (m_mapping != nullptr) {
+            release(m_requested_size, m_page_size, m_mapping_size, m_mapping);
+        }
+    }
+
+    FiberStack(const FiberStack&) = delete;
+    FiberStack& operator=(const FiberStack&) = delete;
+
+    std::size_t usable_size() const noexcept { return m_requested_size; }
+    const void* bottom() const noexcept {
+        return static_cast<const char*>(m_mapping) + m_page_size;
+    }
+    void* stack_pointer() const noexcept {
+        return static_cast<char*>(m_mapping) + m_mapping_size;
+    }
+
+private:
+    static std::size_t page_size() noexcept {
+        const auto value = ::sysconf(_SC_PAGESIZE);
+        return value > 0 ? static_cast<std::size_t>(value) : 4096U;
+    }
+
+    static void* acquire(std::size_t size, std::size_t page,
+                         std::size_t mapping_size) {
+        for (auto it = s_thread_stack_pool.entries.rbegin();
+             it != s_thread_stack_pool.entries.rend(); ++it) {
+            if (it->size == size && it->mapping != nullptr) {
+                void* mapping = it->mapping;
+                s_thread_stack_pool.entries.erase(std::next(it).base());
+                if (::mprotect(mapping, page, PROT_NONE) != 0) {
+                    ::munmap(mapping, mapping_size);
+                    throw std::system_error(errno, std::generic_category(),
+                                             "mprotect fiber guard page");
+                }
+                return mapping;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
+            for (auto it = s_stack_pool.entries.rbegin();
+                 it != s_stack_pool.entries.rend(); ++it) {
+                if (it->size == size && it->mapping != nullptr) {
+                    void* mapping = it->mapping;
+                    s_stack_pool.entries.erase(std::next(it).base());
+                    if (::mprotect(mapping, page, PROT_NONE) != 0) {
+                        ::munmap(mapping, mapping_size);
+                        throw std::system_error(
+                            errno, std::generic_category(),
+                            "mprotect fiber guard page");
+                    }
+                    return mapping;
+                }
+            }
+        }
+        void* mapping = ::mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED) {
+            return MAP_FAILED;
+        }
+        if (::mprotect(mapping, page, PROT_NONE) != 0) {
+            ::munmap(mapping, mapping_size);
+            throw std::system_error(errno, std::generic_category(),
+                                     "mprotect fiber guard page");
+        }
+        return mapping;
+    }
+
+    static void release(std::size_t size, std::size_t page,
+                        std::size_t mapping_size, void* mapping) noexcept {
+        (void)page;
+        try {
+            if (s_thread_stack_pool.entries.size() < 8U) {
+                s_thread_stack_pool.entries.push_back(
+                    CachedStack{size, mapping, mapping_size});
+                return;
+            }
+            std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
+            if (s_stack_pool.entries.size() < 128U) {
+                s_stack_pool.entries.push_back(
+                    CachedStack{size, mapping, mapping_size});
+                return;
+            }
+        } catch (...) {
+        }
+        ::munmap(mapping, mapping_size);
+    }
+
+    std::size_t m_requested_size;
+    std::size_t m_page_size;
+    std::size_t m_mapping_size;
+    void* m_mapping;
+#else
     explicit FiberStack(std::size_t size)
         : m_requested_size(size),
           m_allocator(size),
@@ -203,6 +332,7 @@ private:
     std::size_t m_requested_size;
     boost::context::protected_fixedsize_stack m_allocator;
     boost::context::stack_context m_context;
+#endif
 };
 
 // 父链只保存这份独立元数据，不保存父 Fiber 栈或 owner 的所有权。子 Fiber
@@ -336,10 +466,16 @@ struct Fiber::Impl {
         // 都违反 owner 生命周期契约；在本析构期间不会再有并发上下文访问。
     }
 
-    static void entry(boost::context::detail::transfer_t transfer) noexcept {
-        auto* const self = static_cast<Impl*>(transfer.data);
+    static void entry(
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+        detail::Transfer transfer
+#else
+        boost::context::detail::transfer_t transfer
+#endif
+    ) noexcept {
+        auto* const self = static_cast<Impl*>(const_cast<void*>(transfer.data));
         self->finish_switch_to_fiber();
-        self->m_caller = transfer.fctx;
+        self->m_caller = transfer.context;
         store_errno(self->m_saved_errno);
 
         FiberState terminal_state = FiberState::Completed;
@@ -373,7 +509,11 @@ struct Fiber::Impl {
 #if defined(GO2CPP_FIBER_TSAN)
         __tsan_switch_to_fiber(self->m_tsan_caller, 0);
 #endif
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+        detail::JumpContext(self->m_caller, self);
+#else
         boost::context::detail::jump_fcontext(self->m_caller, self);
+#endif
         std::terminate();
     }
 
@@ -507,7 +647,11 @@ struct Fiber::Impl {
             }
             store_errno(m_saved_errno);
 
+            #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+            detail::Transfer transfer{};
+            #else
             boost::context::detail::transfer_t transfer{};
+            #endif
             {
 #if defined(GO2CPP_FIBER_ASAN)
                 void* caller_fake_stack = nullptr;
@@ -519,7 +663,11 @@ struct Fiber::Impl {
                 m_tsan_caller = __tsan_get_current_fiber();
                 __tsan_switch_to_fiber(m_tsan_fiber, 0);
 #endif
+                #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+                transfer = detail::JumpContext(m_context, this);
+                #else
                 transfer = boost::context::detail::jump_fcontext(m_context, this);
+                #endif
 #if defined(GO2CPP_FIBER_ASAN)
                 __sanitizer_finish_switch_fiber(caller_fake_stack, nullptr,
                                                 nullptr);
@@ -528,7 +676,7 @@ struct Fiber::Impl {
                 m_context = next == FiberState::Completed ||
                                     next == FiberState::Failed
                                 ? nullptr
-                                : transfer.fctx;
+                                : transfer.context;
                 if (m_context == nullptr) {
                     // entry() has unwound all user frames before returning to
                     // the caller. The protected stack can now be returned to
@@ -595,10 +743,14 @@ struct Fiber::Impl {
 #if defined(GO2CPP_FIBER_TSAN)
         __tsan_switch_to_fiber(m_tsan_caller, 0);
 #endif
-        const boost::context::detail::transfer_t transfer =
-            boost::context::detail::jump_fcontext(m_caller, this);
+            #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+            const detail::Transfer transfer = detail::JumpContext(m_caller, this);
+            #else
+            const boost::context::detail::transfer_t transfer =
+                boost::context::detail::jump_fcontext(m_caller, this);
+            #endif
         finish_switch_to_fiber();
-        m_caller = transfer.fctx;
+        m_caller = transfer.context;
         store_errno(m_saved_errno);
         m_record->reason.store(SuspendReason::None, std::memory_order_release);
         m_scheduler_propagate.store(false, std::memory_order_release);
@@ -620,8 +772,13 @@ struct Fiber::Impl {
     bool initialize_context() noexcept {
         try {
             m_stack = std::make_unique<FiberStack>(m_stack_size);
+            #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+            m_context = detail::MakeContext(const_cast<void*>(m_stack->bottom()),
+                                            m_stack->usable_size(), &Impl::entry);
+            #else
             m_context = boost::context::detail::make_fcontext(
                 m_stack->stack_pointer(), m_stack->usable_size(), &Impl::entry);
+            #endif
             return true;
         } catch (...) {
             std::lock_guard<std::mutex> lock(m_failure_mutex);
@@ -637,8 +794,13 @@ struct Fiber::Impl {
     Function m_function;
     const std::size_t m_stack_size;
     std::unique_ptr<FiberStack> m_stack;
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+    detail::Context m_context{nullptr};
+    detail::Context m_caller{nullptr};
+#else
     boost::context::detail::fcontext_t m_context{nullptr};
     boost::context::detail::fcontext_t m_caller{nullptr};
+#endif
     std::atomic<bool> m_scheduler_propagate{false};
     bool m_scheduler_parent_bound{false};
     std::atomic<bool> m_resume_claim{false};

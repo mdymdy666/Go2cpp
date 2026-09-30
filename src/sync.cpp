@@ -1,5 +1,7 @@
 #include "go2cpp/sync.hpp"
 
+#include "go2cpp/core/hybrid_mutex.hpp"
+
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/scheduler.hpp"
 
@@ -35,7 +37,7 @@ public:
     ~WaitNode() { Disarm(); }
 
     bool Arm() noexcept {
-        std::lock_guard<std::mutex> lock(m_wake_mutex);
+        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
         if (result() != WaitResult::kWaiting) {
             return false;
         }
@@ -46,7 +48,7 @@ public:
     void Disarm() noexcept {
         // A callback may already have left DoneSignal's registry. Waiting for
         // its Wake call here prevents it from outliving Scheduler shutdown.
-        std::lock_guard<std::mutex> lock(m_wake_mutex);
+        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
         m_active = false;
         m_scheduler = nullptr;
     }
@@ -63,7 +65,7 @@ public:
     }
 
     void Wake() noexcept {
-        std::lock_guard<std::mutex> lock(m_wake_mutex);
+        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
         if (!m_active) {
             return;
         }
@@ -108,7 +110,7 @@ public:
     Scheduler* scheduler() const noexcept { return m_scheduler; }
 
     void Reset(Scheduler* scheduler, std::shared_ptr<Task> task) noexcept {
-        std::lock_guard<std::mutex> lock(m_wake_mutex);
+        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
         m_active = false;
         m_scheduler = scheduler;
         m_task = std::move(task);
@@ -119,7 +121,7 @@ private:
     Scheduler* m_scheduler{nullptr};
     std::shared_ptr<Task> m_task;
     std::atomic<WaitResult> m_result{WaitResult::kWaiting};
-    std::mutex m_wake_mutex;
+    core::HybridMutex m_wake_mutex;
     std::mutex m_native_mutex;
     std::condition_variable m_native_condition;
     bool m_active{false};

@@ -4,7 +4,8 @@
 
 Go2Cpp 是独立的 C++17 运行时/库，不是 Go 解析器、编译器或源码转译器。
 当前支持 Linux，使用标准库、POSIX 线程、Linux epoll/eventfd 和可替换的
-Boost.Context 栈式 Fiber 后端。公共名称位于 `go2cpp` 命名空间；0.x 不承诺
+Fiber Context 后端。Linux x86_64 默认使用 Go2Cpp 自有汇编后端，其余平台回退
+Boost.Context。公共名称位于 `go2cpp` 命名空间；0.x 不承诺
 二进制 ABI 稳定。默认构建为共享库并启用 Linux Hook，静态构建必须关闭
 `GO2CPP_BUILD_HOOK`，以保证进程内只有一份 FD/TLS 注册表。
 
@@ -75,7 +76,8 @@ M 严格不超过 P；默认模式下普通 runnable 峰值仍以 P 为上限。
 
 ## Fiber 与 FiberLocal
 
-`go2cpp::Fiber` 使用 Boost.Context `fcontext_t`、固定大小保护栈和 trampoline，状态
+`go2cpp::Fiber` 使用固定大小保护栈和 trampoline，Linux x86_64 由 Go2Cpp 自有
+Context ABI 完成切换，其他平台使用 Boost.Context，状态
 为 Ready/Running/Suspended/Completed/Failed。resume 串行化并保存/恢复 errno，Fiber
 可以迁移到不同 M；普通 `thread_local` 不应当当作 G-local。`FiberLocalCache<T>`
 （别名 `FiberLocal<T>`）按逻辑 Fiber 保存共享值，迁移不丢失，trampoline 完成后
@@ -113,6 +115,24 @@ Done 回调。`DoneSignal::Wait/WaitFor/WaitUntil`、Channel 和同步等待在 
 Context key 使用进程内 identity token，值是不可变 `std::any`；字符串 key 仅为
 动态转译代码提供便利。根 Context 的 DoneSignal 非空但永久不触发，这是与 Go
 根 context nil channel 的明确差异。取消不会隐式变为 panic。
+
+## x86_64 Linux Fiber Context 后端
+
+Linux x86_64 默认使用 `detail/context_backend.hpp` 声明的 Go2Cpp 自有
+上下文 ABI。其寄存器布局和首次 trampoline 参考 coost/TBOX 的
+`tb_context_make/jump`，但没有复制 coost 的 `_exit` 终止路径，也没有复制
+coost 的共享栈快照。每次 `JumpContext` 都返回保存的 caller context，因而
+Fiber 可以在执行权由 Task 的 execution claim 串行化后迁移到另一个 M。
+
+执行栈由 `FiberStack` 负责：底部保留 `mprotect(PROT_NONE)` guard page，映射
+按大小进入当前 M 的 TLS 小缓存，溢出后进入有界全局缓存。这样去除了运行时对
+Boost.Context 的链接依赖，同时保留越界保护和 ASan/TSan 的切换标记。非 Linux
+x86_64 平台继续使用 Boost.Context fallback。
+
+这里的 Context 指 Fiber 的寄存器/栈上下文；`src/context.cpp` 中的取消树、
+Done、deadline、value Context 仍是独立的 C++ 运行时设施，coost 没有对应实现。
+coost 的 Buffer 只是固定共享栈槽的挂起快照，不是自动动态栈，因此本项目仍不
+声称实现 Go 式 `morestack`/`copystack`。
 
 ### Context 局部回滚
 

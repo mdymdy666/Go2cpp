@@ -38,7 +38,7 @@ cd third_party/go-reference && sha256sum -c SHA256SUMS
 | Go 机制 | 本项目替代 | 明确边界 |
 |---|---|---|
 | GC、栈图和 Go heap ABI | `shared_ptr`、RAII、显式所有权、弱子节点 | 没有移动 GC、写屏障或 Go heap ABI |
-| `morestack`、分段栈 | Boost.Context 保护栈与 Task/Fiber 所有权 | 栈大小固定，不提供编译器生成的栈图和异步增长 |
+| `morestack`、分段栈 | mmap guard-page FiberStack 与自有 x86_64 Context/Boost fallback | 栈大小固定，不提供编译器生成的栈图和异步增长 |
 | `mcall`/`gogo`/`gopark` | 合作式 C++ worker 与显式 G/M/P 状态 | 没有汇编 ABI 和任意指令点抢占 |
 | `sudog`、futex、netpoller | 堆等待节点、ParkingCondition、TimerService、Linux epoll | 不复刻 Go netpoller 内部 ABI |
 | runtime 原子操作 | `std::atomic` 加状态转换互斥量 | 遵循 C++ 内存模型，不承诺 Go 内部顺序 |
@@ -48,9 +48,10 @@ cd third_party/go-reference && sha256sum -c SHA256SUMS
 
 ## 构建依赖
 
-运行时链接 `Threads::Threads` 和 Boost.Context（最低 1.70；当前工作区验证为
-1.83.0）。Linux Hook 额外使用系统 `dl`。Boost.Context 使用 Boost Software
-License 1.0；Go2Cpp 不携带或修改它，系统包许可证由部署者负责。IO 模块使用
+Linux x86_64 运行时链接 `Threads::Threads`，使用自有 Context 汇编；其他平台
+非 Linux x86_64 构建链接 Boost.Context（最低 1.70；当前工作区验证为 1.83.0）。Linux Hook 额外使用
+系统 `dl`。Boost.Context 使用 Boost Software License 1.0；Go2Cpp 不携带或修改它，
+系统包许可证由部署者负责。IO 模块使用
 Linux epoll/eventfd/syscall。检测到 Valgrind 头文件时会注册保护 Fiber 栈；ASan、
 UBSan、TSan 仅作为独立验证配置，不能混用互相冲突的 sanitizer。
 
@@ -60,3 +61,15 @@ Scheduler、Fiber backend、TimerService、Channel 等待后端、IOManager 和 
 均通过公共状态/结果契约隔离；0.x 没有稳定插件 ABI。替换实现必须保持 G/M/P
 状态转换、一次性 wake claim、对象所有权、取消和 shutdown 规则。项目不依赖 Go
 运行时、cgo、垃圾回收器、汇编或第三方 Sylar 代码。
+
+## 当前 Linux x86_64 Context 后端
+
+Linux x86_64 构建使用 `src/context_x64.S` 和 `FiberStack` 的 mmap/guard-page
+实现，不再链接 Boost.Context。汇编只保存 callee-saved 寄存器、RSP/RIP 和
+caller transfer；C++ 仍负责父链、resume claim、ASan/TSan 标记、stack cache
+和生命周期。其他平台继续使用 Boost.Context fallback，因此安装包在这些平台
+仍需要 Boost.Context。
+
+该后端借鉴 coost/TBOX 的上下文布局，但没有复制 coost 的共享栈 memcpy、固定
+8 槽调度器或 `_exit` 结束路径。它也没有 Go 式自动动态栈；Fiber 栈大小仍由
+`fiber_stack_size`/`TaskOptions::stack_size` 决定，guard page 只负责检测越界。
