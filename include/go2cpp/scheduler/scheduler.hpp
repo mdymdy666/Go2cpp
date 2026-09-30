@@ -207,6 +207,8 @@ public:
     void request_wake() noexcept;
     bool consume_wake() noexcept;
     bool try_register() noexcept;
+    // 仅供调度器唤醒快路径观察注册表强引用是否已经发布。
+    bool registered() const noexcept;
     // 将 owner、取消门和首次入队的状态转换合并为一次锁操作。
     // 外部生产者的热路径必须保持这个原子边界，避免在多个状态锁之间
     // 反复切换；失败时不会发布队列节点。
@@ -366,6 +368,10 @@ public:
     // may still represent an accepted pending wake for a currently running G;
     // that token is consumed by its next park.
     bool wake(const std::shared_ptr<Task>& task);
+    // 已经注册到调度器的挂起 G 使用此入口，跳过重复的所有权/注册表
+    // 校验，只把一个新的队列节点发布到 incoming 条带。等待原语使用它
+    // 以降低普通线程唤醒 Fiber 时的 admission 开销。
+    bool wake_registered(const std::shared_ptr<Task>& task);
     bool wake_io(const std::shared_ptr<Task>& task);
     // Notifier handoff used after a wait node chose a terminal outcome. It
     // preserves started Gs across shutdown/admission races instead of making

@@ -1,5 +1,78 @@
 # 性能整改与 Coost 对比
 
+## 2026-09-30 调度器与混合锁专项收尾
+
+本节是本轮代码变更后的最新结果，优先级高于本文早期采样。测试使用
+`build-release-current`，WSL2/Linux，Release 编译；宿主调度会造成明显抖动，
+因此只报告重复运行区间，不把单次最好成绩当作保证。
+
+### 调度器热路径
+
+本轮的实际执行链路为：
+
+1. 外部生产者先完成 G 的 owner、取消门、注册表 admission 和 queued 状态；
+   已注册的 IO/定时器唤醒跳过 registry 分片锁。
+2. 新任务进入 16 条 incoming 条带，生产者通过 TLS 固定条带；非空位图让
+   worker 不必为明显为空的条带逐一加锁。
+3. worker 先取当前 P 本地队列，再按亲和性预算处理 incoming，最后才进入全局
+   admission、窃取和救援队列。当前 worker 唤醒本地 G 时直接回本地 P，避免
+   再次走外部 admission。
+4. Fiber 返回后只在仍有 runnable G 时通知其他 M；维护周期中的 M 扩容、空闲
+   M 回收和 sysmon 观察不进入每次恢复的全局锁路径。
+
+公平调度基准为 50,000 个 G、每个 G 4 次 yield、8 个生产线程、8 个 P。当前
+Go2Cpp 的 `spawn_ms + elapsed_ms` 为 `84～103 ms`（5 次：84、92、101、103、
+95 ms）；同一份本机 coost 对照为 `18～36 ms`。中位数约为 coost 的 `3.0x`，
+尚未达到 1.25x 目标。关闭 `collect_metrics` 只改变几个百分点，说明主要成本
+不是计时器，而是每个 G 的 `shared_ptr`/注册表生命周期、Boost.Context 受保护
+栈以及 G 状态转换和跨 M admission。
+
+继续把这些状态改成无锁裸指针会破坏 shutdown、取消和跨线程最后一个引用的
+所有权；把受保护栈替换为 coost 的快照栈也会失去 guard page，并且要求禁止栈
+地址逃逸。当前没有在未证明安全前做这两类危险优化。
+
+### 混合 Mutex
+
+`go2cpp::sync::Mutex` 采用一个原子锁位加一条受 `m_mutex` 保护的 FIFO 等待队列。
+Fiber 和普通线程共用队列；Fiber 等待节点在调用栈上，带 Context 的节点使用
+线程本地小缓存。Unlock 始终在队列锁下完成线性化，并把锁位直接交给队头，避免
+“先清锁、后来者抢到、旧 owner 再误清锁”的竞态。已有 waiter 时禁止新的
+自旋者越过队头。
+
+专项混合基准（2,000 Fibers、32 普通线程、206,400 次临界区）当前为
+`8.5～8.8 s`；coost 为 `1.6～5.7 s`（一次宿主抖动离群），线程
+`std::mutex` 基准为 `39～40 ms`。因此该场景仍不适合高争用共享锁，不能宣称
+达到线程池或 coost 性能。原因是 Fiber 阻塞后必须经过 park、状态发布、跨 M
+唤醒和安全栈恢复；一次 CAS 优化无法消除这条链路。
+
+规范使用方式：
+
+- 短临界区、低到中等争用时可直接使用 `sync::Mutex`，普通线程和 managed Fiber
+  可以同时访问同一实例。
+- 不要在持锁期间执行 socket、文件、定时器等待或主动 park；先复制所需状态，
+  解锁后再做阻塞操作。
+- 高争用计数器优先使用原子变量或按 P/任务类别分片；普通线程独占的热点使用
+  `std::mutex`，不要为了统一接口把所有锁都换成混合锁。
+- `TryLock` 在存在 FIFO waiter 时返回 false，这是公平性约束，不是异常。
+
+### 栈后端结论
+
+本机 coost HEAD `c1cc11b32d5208912675a98fe091686848e60bc3` 使用固定约 1 MiB
+执行栈槽，挂起时把栈内容复制到可增长的 Buffer；Buffer 增长不等于执行栈自动
+扩容，深栈仍可能越过固定槽。它没有 Go 式 `morestack`/`copystack` 的保护页、
+完整 C++ RAII 展开和 ASan/TSan Fiber 标注。Boost 的 `segmented_stack` 又依赖
+`-fsplit-stack`/libgcc，工具链、异常和 sanitizer 兼容性受限。因此本项目继续
+使用 Boost.Context 受保护固定栈，自动动态栈列为未完成能力；不能以 coost 的
+快照机制冒充已解决。
+
+### 其他高负载结果
+
+同一轮 `go2cpp_high_load_stress` 三次：计算 Fiber `1415～1522 ms`、线程池
+`1372～1414 ms`；IO 多路等待 Fiber `646～786 ms`、线程 poll
+`1785～1919 ms`；Channel Fiber `21～27 ms`、线程 `67～88 ms`。这些结果说明
+IO、Channel 和低争用计算场景仍有优势，但不能推导混合锁和公平调度已经全面
+超过 coost。
+
 本文记录本轮调度器和混合锁优化的实际结果。所有数据来自同一台
 WSL2/Linux 主机、同一份源码和同一条 `go2cpp_high_load_stress` 命令；
 时间单位为毫秒。

@@ -10,8 +10,13 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 namespace go2cpp::sync {
 namespace {
@@ -65,9 +70,9 @@ public:
         try {
             if (m_scheduler != nullptr && m_task) {
                 // A managed waiter resumes through its owning scheduler.
-                // Scheduler::wake_or_cancel also retains started Gs when
-                // shutdown or queue allocation races this callback.
-                (void)m_scheduler->wake(m_task);
+                // 已注册 G 走 wake_registered()；该入口仍保留 started G，
+                // 即使 shutdown 或队列分配与这个回调并发。
+                (void)m_scheduler->wake_registered(m_task);
             } else {
                 // Native callers wait on this node's private condition
                 // variable. The result is the predicate, so a notify that
@@ -134,6 +139,14 @@ std::shared_ptr<WaitNode> AcquireWaitNode(Scheduler* scheduler,
         return waiter;
     }
     return std::make_shared<WaitNode>(scheduler, std::move(task));
+}
+
+inline void RelaxCpu() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
 }
 
 void ReleaseWaitNode(std::shared_ptr<WaitNode> waiter) noexcept {
@@ -351,6 +364,9 @@ bool Mutex::Lock(const ContextPtr& context) {
         // 单 P 不走这条路径，因此不会把唯一 M 忙等住。
         constexpr int kCooperativeAttempts = 1024;
         for (int attempt = 0; attempt < kCooperativeAttempts; ++attempt) {
+            // 等待者一旦发布，后来的竞争者不能越过 FIFO 队头。
+            // 这次检查必须放在每轮 CAS 前，避免自旋期间新 waiter
+            // 入队后仍然直接取得锁。
             if (m_impl->m_has_waiters.load(std::memory_order_acquire)) {
                 break;
             }
@@ -360,10 +376,31 @@ bool Mutex::Lock(const ContextPtr& context) {
                     std::memory_order_relaxed)) {
                 return true;
             }
-            if (target.task->cancellation_requested() ||
-                !target.scheduler->yield_current()) {
+            if (target.task->cancellation_requested()) {
                 break;
             }
+            // 保持当前 M 继续运行，避免每次失败都切换 Fiber。短临界区
+            // 通常在这段自旋内完成；超时后进入 FIFO 等待队列。
+            RelaxCpu();
+        }
+    }
+    // std::mutex 在 Linux 上也会先进行短暂自旋；混合锁的 native
+    // 调用者如果立即进入条件变量慢路径，会把很短的临界区放大成一次
+    // futex 唤醒。这里保留较小的有界自旋，并且一旦队列发布立即退出，
+    // 因而不会越过 FIFO waiter。
+    if (!target && !m_impl->m_has_waiters.load(std::memory_order_acquire)) {
+        constexpr int kNativeSpinAttempts = 256;
+        for (int attempt = 0; attempt < kNativeSpinAttempts; ++attempt) {
+            if (m_impl->m_has_waiters.load(std::memory_order_acquire)) {
+                break;
+            }
+            expected = false;
+            if (m_impl->m_fast_locked.compare_exchange_weak(
+                    expected, true, std::memory_order_acquire,
+                    std::memory_order_relaxed)) {
+                return true;
+            }
+            RelaxCpu();
         }
     }
     WaitNode stack_waiter(target.scheduler, target.task);
@@ -450,16 +487,11 @@ bool Mutex::TryLock() noexcept {
 }
 
 void Mutex::Unlock() {
-    if (!m_impl->m_has_waiters.load(std::memory_order_acquire)) {
-        bool expected = true;
-        if (m_impl->m_fast_locked.compare_exchange_strong(
-                expected, false, std::memory_order_release,
-                std::memory_order_relaxed)) {
-            return;
-        }
-    }
     WaitNode* selected = nullptr;
     {
+        // Unlock 与 waiter 发布必须共享同一把队列锁。原子快路径无法
+        // 同时覆盖 waiter 入队和另一个线程重新取得锁的交错，统一在此
+        // 线性化可以避免丢唤醒和“误解锁后来 owner”。
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
         if (!m_impl->m_fast_locked.load(std::memory_order_acquire)) {
             throw std::logic_error("go2cpp::sync::Mutex unlock of unlocked mutex");

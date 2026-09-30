@@ -646,3 +646,23 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
   但 Memcheck 放大时序导致 IO watchdog 超时，416 bytes still reachable 为进程级缓存。
 - Fiber Context 复核结论不变：自研自动扩栈上下文曾在嵌套恢复中破坏父链，已撤回；
   当前生产实现继续使用 Boost.Context 受保护固定栈，自动扩栈属于未完成边界。
+
+## 2026-09-30：调度器与混合 Mutex 专项优化收尾
+
+- 调度器新增 16 条 incoming 条带、非空位图、已注册 G 的唤醒快路径和 worker
+  本地 P 回队路径；worker 仅在仍有 runnable G 时通知，避免无效 futex 唤醒。
+- 混合 Mutex 的 Unlock 统一在队列锁下完成 FIFO handoff，修复丢唤醒和误清锁
+  竞态；已有 waiter 时禁止新的自旋者越过队头；无 Context 等待节点继续使用
+  调用栈对象，带 Context 节点使用线程本地缓存。
+- 当前公平调度基准（50,000 G、4 次 yield、8 个生产线程）总时延 84～103 ms，
+  coost 为 18～36 ms，约 3.0 倍；混合 Mutex（2,000 Fiber、32 线程）为 8.5～8.8 s，
+  coost 为 1.6～5.7 s，线程 `std::mutex` 为 39～40 ms。未达到 1.25 倍目标，
+  主要剩余成本是 shared_ptr/注册表、Boost 受保护栈和 park/wake 跨 M 链路，不能
+  通过无锁改动安全消除。
+- 明确使用规约：混合锁只用于短临界区；不得持锁等待 IO、定时器或 park；高争用
+  优先使用原子或按 P 分片，普通线程独占热点使用 `std::mutex`。
+- Coost 的 Buffer 只是固定执行栈槽的挂起快照，不是自动动态栈；Boost
+  `segmented_stack` 依赖受限工具链，故未替换当前受保护固定栈。
+- 验证：Release CTest 14/14、Debug CTest 13/13、Werror CTest 3/3、ASan CTest
+  3/3；高负载样例连续 3 次全部通过；TSan 仍受 WSL `unexpected memory mapping`
+  环境限制，未宣称通过。详细数据和调度环节见 `docs/performance.md`。
