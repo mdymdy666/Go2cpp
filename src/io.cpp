@@ -177,7 +177,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         void wake() noexcept {
             std::lock_guard<std::mutex> lock(wake_mutex);
             if (wake_active && scheduler && task) {
-                (void)scheduler->wake(task);
+                (void)scheduler->wake_io(task);
             }
         }
 
@@ -248,6 +248,8 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         bool registered{false};
         std::uint32_t interest{0};
         std::uint64_t registration_id{0};
+        bool pending_read{false};
+        bool pending_write{false};
     };
 
     struct Registration {
@@ -439,12 +441,37 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 found = m_slots.emplace(fd, std::move(slot)).first;
             }
             FdSlot& slot = *found->second;
+            if (descriptor && slot.generation != descriptor->generation()) {
+                if (!slot.readers.empty() || !slot.writers.empty()) {
+                    if (error != nullptr) {
+                        *error = ESTALE;
+                    }
+                    return {};
+                }
+                invalidate_registration_locked(slot);
+                slot.generation = descriptor->generation();
+                slot.pending_read = false;
+                slot.pending_write = false;
+            }
             node->id = next_node_id_locked();
             node->generation = slot.generation;
 
             try {
-                queue_for(slot, event).push_back(node);
-                if (deadline.has_value()) {
+                bool consume_pending = event == IOEvent::kRead
+                                           ? slot.pending_read
+                                           : slot.pending_write;
+                if (consume_pending) {
+                    if (event == IOEvent::kRead) {
+                        slot.pending_read = false;
+                    } else {
+                        slot.pending_write = false;
+                    }
+                    (void)claim(*node, WaitStatus::kReady, 0);
+                } else {
+                    queue_for(slot, event).push_back(node);
+                }
+                if (deadline.has_value() &&
+                    node->outcome.load(std::memory_order_relaxed) == 0) {
                     const auto order = m_deadline_order.emplace(*deadline, node->id);
                     try {
                         m_deadline_index.emplace(
@@ -700,27 +727,18 @@ private:
             interest |= kWriteMask;
         }
 
-        if (interest == 0) {
-            if (slot.registered && slot.registration_id != 0) {
-                epoll_event idle{};
-                idle.events = 0;
-                idle.data.u64 = slot.registration_id;
-                if (::epoll_ctl(m_epoll_fd, EPOLL_CTL_MOD, slot.fd, &idle) == 0) {
-                    slot.interest = 0;
-                    const auto registration = m_registrations.find(
-                        slot.registration_id);
-                    if (registration != m_registrations.end()) {
-                        registration->second.interest = 0;
-                    }
-                    return 0;
-                }
-            }
-            invalidate_registration_locked(slot);
+        if (interest == 0 && slot.registered) {
             return 0;
         }
 
+        if (slot.registered &&
+            (slot.interest & interest) == interest) {
+            return 0;
+        }
+        interest |= slot.interest;
+
         epoll_event event{};
-        event.events = EPOLLONESHOT | EPOLLERR | EPOLLHUP;
+        event.events = EPOLLET | EPOLLERR | EPOLLHUP;
         if ((interest & kReadMask) != 0) {
             event.events |= EPOLLIN | EPOLLRDHUP;
         }
@@ -811,8 +829,6 @@ private:
             }
 
             FdSlot& slot = *found->second;
-            // EPOLLONESHOT leaves the open-file registration present but
-            // disabled. update_interest_locked() therefore uses MOD.
             slot.registered = true;
 
             const bool error_or_hup =
@@ -823,11 +839,15 @@ private:
             if (read_ready && (snapshot.interest & kReadMask) != 0) {
                 if (auto node = take_ready_locked(slot.readers)) {
                     wake.push_back(std::move(node));
+                } else {
+                    slot.pending_read = true;
                 }
             }
             if (write_ready && (snapshot.interest & kWriteMask) != 0) {
                 if (auto node = take_ready_locked(slot.writers)) {
                     wake.push_back(std::move(node));
+                } else {
+                    slot.pending_write = true;
                 }
             }
 
@@ -969,6 +989,7 @@ private:
             for (int index = 0; index < count; ++index) {
                 if (events[index].data.u64 == kWakeRegistration) {
                     drain_wake_fd();
+                    m_tickle_pending.store(false, std::memory_order_release);
                 } else {
                     process_event(events[index].data.u64,
                                   events[index].events);
@@ -991,8 +1012,17 @@ private:
         if (!m_poller_waiting.load(std::memory_order_acquire)) {
             return;
         }
+        // Multiple registrations/completions can arrive while the poller is
+        // asleep. One eventfd counter is enough to force one epoll return;
+        // coalesce the rest until the poller drains it. This removes a write
+        // syscall per Fiber wait without changing the readiness protocol.
+        if (m_tickle_pending.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
         const std::uint64_t value = 1;
-        (void)::syscall(SYS_write, m_wake_fd, &value, sizeof(value));
+        if (::syscall(SYS_write, m_wake_fd, &value, sizeof(value)) < 0) {
+            m_tickle_pending.store(false, std::memory_order_release);
+        }
     }
 
     void wake_nodes(WakeList& nodes) noexcept {
@@ -1043,6 +1073,7 @@ private:
     int m_epoll_fd{-1};
     int m_wake_fd{-1};
     std::atomic<bool> m_poller_waiting{false};
+    std::atomic<bool> m_tickle_pending{false};
     int m_init_error{0};
 
     mutable std::mutex m_mutex;

@@ -594,3 +594,23 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
 - 验证：完整 `go2cpp_tests` 通过；Werror 构建通过；ASan/UBSan 全量 `go2cpp_tests`
   通过；Valgrind 日志测试通过，未报告 definite/indirect/possible leak；动态配置、
   Sylar 格式、层级传播和滚动文件均有回归测试。
+
+## 2026-09-30：coost 对比性能复核与 IO/调度器优化
+
+- `src/io.cpp` 采用持久 epoll ET 注册、读写方向 pending readiness 和 eventfd
+  tickle 合并；同一 FD 的连续等待不再重复 ADD/DEL，WaitNode 唤醒走
+  `Task::wake_io()` 的原子状态路径。Descriptor generation、关闭和超时仍保留
+  原有线性化检查。
+- `src/scheduler.cpp` 增加 worker 本地 yield 回队和 IO park/wake 快路径，维护
+  扩容采样，保留 BlockingRegion/sysmon 的替代 M 语义；`src/fiber.cpp` 延迟首次
+  栈分配、完成后立即回收并使用 M/TLS 栈缓存，避免短任务预先建立保护栈。
+- Release 公平基准（50,000 G、每 G 4 次 yield，执行时间不含 shutdown）本轮
+  Go2Cpp 42--71 ms，coost 18--30 ms；当前调度器仍约为 coost 的 1.4--2.0 倍，
+  尚未达到用户要求的 1.25 倍。主要剩余成本是每个 Fiber 独立受保护栈和 shared_ptr/
+  admission registry；直接替换为无保护栈会损失越界保护，未采用不安全伪优化。
+- Release IO 基准（4096 socketpair、25 轮）Go2Cpp 695--731 ms，coost
+  1356--1582 ms；本机该场景 Go2Cpp 已超过 coost。不同负载和机器仍需重新测量，
+  不能把单一基准外推为所有 IO 工作负载。
+- 验证：Debug/Release 全量 CTest 各 14/14 通过；scheduler、dynamic、io 过滤器
+  通过；`git diff --check` 通过。构建时仅有 WSL 文件时钟偏移警告。未改变用户的
+  `LOCAL_CODE_REVIEW_ORDER.md` 未跟踪文件。

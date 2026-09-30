@@ -112,6 +112,9 @@ struct SchedulerConfig {
     // Linux 上可将 M 绑定到与 P 对应的 CPU。默认关闭，避免嵌入宿主已有
     // CPU 配额/容器亲和性策略；打开后超出 CPU 数量的 P 不执行绑定。
     bool pin_workers_to_cpu = false;
+    // 性能敏感的部署可以关闭运行时累计计时；状态机和调度语义不受影响。
+    // 默认开启，便于诊断和性能报告。
+    bool collect_metrics = true;
 };
 
 using TaskClassId = std::uint64_t;
@@ -194,6 +197,10 @@ public:
     // Internal queue/run claims.  They are public so the replaceable worker
     // backend can enforce the same invariant without exposing data members.
     bool try_mark_queued() noexcept;
+    // 当前 worker 已经释放 execution claim 后的本地回队快路径。通过
+    // queued 原子位先占位，再校验状态；外部取消/唤醒仍使用同一位阻止
+    // 重复入队，因此不需要为每次 yield 获取 transition_mutex。
+    bool try_mark_queued_from_worker() noexcept;
     void clear_queued() noexcept;
     void defer_enqueue() noexcept;
     bool consume_deferred_enqueue() noexcept;
@@ -208,6 +215,10 @@ public:
         const std::shared_ptr<TaskCancellationGate>& gate) noexcept;
     bool promote_new() noexcept;
     WakeAction wake_for_scheduler() noexcept;
+    // IO poller fast path. The poller only publishes a wake token; a running
+    // worker consumes it after the Fiber returns from park, so this transition
+    // can use an atomic state CAS without taking the scheduler mutex.
+    WakeAction wake_for_io() noexcept;
     ParkAction park_for_scheduler() noexcept;
     bool try_mark_running();
     // Internal state transitions used by Scheduler. mark_runnable() only
@@ -215,6 +226,9 @@ public:
     // wake token and must use the current-G-only yield/park path below.
     bool mark_runnable();
     bool mark_yielded();
+    // 当前 G 明确执行 yield 时使用无锁 CAS 快路径。唤醒/取消仍通过
+    // 完整状态机处理；下一次成功出队会清理旧的 wake permit。
+    bool mark_yielded_fast() noexcept;
     bool mark_waiting();
     bool cancel();
     // Cancel only an unqueued runnable task. This is used after an internal
@@ -347,6 +361,7 @@ public:
     // may still represent an accepted pending wake for a currently running G;
     // that token is consumed by its next park.
     bool wake(const std::shared_ptr<Task>& task);
+    bool wake_io(const std::shared_ptr<Task>& task);
     // Notifier handoff used after a wait node chose a terminal outcome. It
     // preserves started Gs across shutdown/admission races instead of making
     // them terminal while their stack is still suspended.

@@ -233,10 +233,7 @@ struct Fiber::Impl {
           m_id(s_next_fiber_id.fetch_add(1, std::memory_order_relaxed)),
           m_record(std::make_shared<FiberRecord>(m_id)),
           m_function(std::move(function)),
-          m_stack_size(normalize_stack_size(stack_size)),
-          m_stack(m_stack_size) {
-        m_context = boost::context::detail::make_fcontext(
-            m_stack.stack_pointer(), m_stack.usable_size(), &Impl::entry);
+          m_stack_size(normalize_stack_size(stack_size)) {
 #if defined(GO2CPP_FIBER_TSAN)
         m_tsan_fiber = __tsan_create_fiber(0);
 #endif
@@ -406,7 +403,10 @@ struct Fiber::Impl {
             }
             m_scheduler_parent_bound = true;
         }
-        const bool result = resume_locked(false);
+        // 调度器已经通过 Task 的 execution claim 串行化恢复，并在迁移
+        // 到新 M 时显式发布执行绑定；因此恢复热路径不再重复更新
+        // FiberRecord 的 last_thread 元数据。
+        const bool result = resume_locked(false, true);
         m_resume_claim.store(false, std::memory_order_release);
         return result;
     }
@@ -464,7 +464,7 @@ struct Fiber::Impl {
         return true;
     }
 
-    bool resume_locked(bool validate_caller) noexcept {
+    bool resume_locked(bool validate_caller, bool scheduler_fast = false) noexcept {
         if (validate_caller && !bind_caller(s_current_fiber)) {
             return false;
         }
@@ -479,6 +479,11 @@ struct Fiber::Impl {
             if (current != FiberState::Ready && current != FiberState::Suspended) {
                 return false;
             }
+            if (current == FiberState::Ready && m_context == nullptr) {
+                if (!initialize_context()) {
+                    return false;
+                }
+            }
             if (m_context == nullptr) {
                 return false;
             }
@@ -489,9 +494,16 @@ struct Fiber::Impl {
             const int caller_errno = load_errno();
             Fiber* const previous_fiber = s_current_fiber;
             s_current_fiber = m_owner;
-            {
-                std::lock_guard<std::mutex> lock(m_metadata_mutex);
-                m_record->last_thread = std::this_thread::get_id();
+            if (!scheduler_fast) {
+                const auto thread_hash = std::hash<std::thread::id>{}(
+                    std::this_thread::get_id());
+                if (m_last_resume_thread_hash.load(std::memory_order_relaxed) !=
+                    thread_hash) {
+                    std::lock_guard<std::mutex> lock(m_metadata_mutex);
+                    m_record->last_thread = std::this_thread::get_id();
+                    m_last_resume_thread_hash.store(thread_hash,
+                                                    std::memory_order_relaxed);
+                }
             }
             store_errno(m_saved_errno);
 
@@ -500,8 +512,8 @@ struct Fiber::Impl {
 #if defined(GO2CPP_FIBER_ASAN)
                 void* caller_fake_stack = nullptr;
                 __sanitizer_start_switch_fiber(&caller_fake_stack,
-                                              m_stack.bottom(),
-                                              m_stack.usable_size());
+                                              m_stack->bottom(),
+                                              m_stack->usable_size());
 #endif
 #if defined(GO2CPP_FIBER_TSAN)
                 m_tsan_caller = __tsan_get_current_fiber();
@@ -517,6 +529,13 @@ struct Fiber::Impl {
                                     next == FiberState::Failed
                                 ? nullptr
                                 : transfer.fctx;
+                if (m_context == nullptr) {
+                    // entry() has unwound all user frames before returning to
+                    // the caller. The protected stack can now be returned to
+                    // the per-thread/global cache immediately, avoiding one
+                    // mapping per queued Fiber in burst workloads.
+                    m_stack.reset();
+                }
             }
 
             // jump 返回有两种语义：如果当前 Fiber 仍在 Running，说明
@@ -588,6 +607,7 @@ struct Fiber::Impl {
         return true;
     }
 
+
     void finish_switch_to_fiber() noexcept {
 #if defined(GO2CPP_FIBER_ASAN)
         // On migration these outputs describe the newly resuming OS thread,
@@ -597,18 +617,33 @@ struct Fiber::Impl {
 #endif
     }
 
+    bool initialize_context() noexcept {
+        try {
+            m_stack = std::make_unique<FiberStack>(m_stack_size);
+            m_context = boost::context::detail::make_fcontext(
+                m_stack->stack_pointer(), m_stack->usable_size(), &Impl::entry);
+            return true;
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(m_failure_mutex);
+            m_failure = std::current_exception();
+            m_record->state.store(FiberState::Failed, std::memory_order_release);
+            return false;
+        }
+    }
+
     Fiber* m_owner;
     const std::uint64_t m_id;
     std::shared_ptr<FiberRecord> m_record;
     Function m_function;
     const std::size_t m_stack_size;
-    FiberStack m_stack;
+    std::unique_ptr<FiberStack> m_stack;
     boost::context::detail::fcontext_t m_context{nullptr};
     boost::context::detail::fcontext_t m_caller{nullptr};
     std::atomic<bool> m_scheduler_propagate{false};
     bool m_scheduler_parent_bound{false};
     std::atomic<bool> m_resume_claim{false};
     mutable std::mutex m_metadata_mutex;
+    std::atomic<std::size_t> m_last_resume_thread_hash{0};
     Fiber* m_parent{nullptr};
     bool m_parent_bound{false};
     mutable std::mutex m_failure_mutex;
@@ -660,6 +695,7 @@ bool Fiber::SuspendForScheduler(SuspendReason reason) noexcept {
     Fiber* const current = Current();
     return current != nullptr && current->m_impl->suspend(reason, true);
 }
+
 
 GO2CPP_FIBER_NOINLINE Fiber* Fiber::Current() noexcept { return s_current_fiber; }
 

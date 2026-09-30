@@ -173,6 +173,22 @@ bool Task::try_mark_queued() noexcept {
     return true;
 }
 
+bool Task::try_mark_queued_from_worker() noexcept {
+    bool expected_queued = false;
+    if (!m_queued.compare_exchange_strong(expected_queued, true,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+        return false;
+    }
+    const auto state = m_state.load(std::memory_order_acquire);
+    if (state != GState::kRunnable ||
+        m_execution_claim.load(std::memory_order_acquire)) {
+        m_queued.store(false, std::memory_order_release);
+        return false;
+    }
+    return true;
+}
+
 void Task::clear_queued() noexcept {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     m_queued.store(false, std::memory_order_release);
@@ -260,6 +276,25 @@ WakeAction Task::wake_for_scheduler() noexcept {
     return WakeAction::kRejected;
 }
 
+WakeAction Task::wake_for_io() noexcept {
+    GState expected = GState::kWaiting;
+    if (m_state.compare_exchange_strong(expected, GState::kRunnable,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+        m_wake_pending.store(false, std::memory_order_release);
+        if (m_execution_claim.load(std::memory_order_acquire)) {
+            m_deferred_enqueue.store(true, std::memory_order_release);
+            return WakeAction::kPending;
+        }
+        return WakeAction::kEnqueue;
+    }
+    if (expected == GState::kRunning) {
+        m_wake_pending.store(true, std::memory_order_release);
+        return WakeAction::kPending;
+    }
+    return WakeAction::kRejected;
+}
+
 ParkAction Task::park_for_scheduler() noexcept {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
@@ -290,6 +325,7 @@ bool Task::try_mark_running() {
     return true;
 }
 
+
 bool Task::mark_runnable() {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     if (m_state.load(std::memory_order_relaxed) != GState::kWaiting) {
@@ -309,6 +345,17 @@ bool Task::mark_yielded() {
     // explicit yield: the G is already being requeued and must not consume
     // that old token on a later park.
     m_state.store(GState::kRunnable, std::memory_order_release);
+    m_wake_pending.store(false, std::memory_order_release);
+    return true;
+}
+
+bool Task::mark_yielded_fast() noexcept {
+    GState expected = GState::kRunning;
+    if (!m_state.compare_exchange_strong(expected, GState::kRunnable,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+        return false;
+    }
     m_wake_pending.store(false, std::memory_order_release);
     return true;
 }
@@ -598,6 +645,10 @@ public:
         for (std::size_t i = 0; i < config.processor_count; ++i) {
             processors.emplace_back(static_cast<PId>(i));
         }
+        // 高并发提交时 task_registry 是唯一需要持有 admission mutex 的
+        // 连续容器。预留常见批量规模，避免 producer burst 反复搬迁
+        // shared_ptr；超出后仍按 vector 原有策略增长，不改变上限语义。
+        task_registry.reserve(4096);
     }
 
     ~Impl() { stop_sysmon(true); }
@@ -1126,6 +1177,7 @@ public:
     std::atomic<std::size_t> running_workers{0};
     std::atomic<std::size_t> blocking_workers{0};
     std::atomic<std::size_t> next_processor{0};
+    std::atomic<std::uint64_t> enqueue_maintenance{0};
     std::atomic<std::uint64_t> metric_task_runs{0};
     std::atomic<std::uint64_t> metric_task_completions{0};
     std::atomic<std::uint64_t> metric_fiber_resume_ns{0};
@@ -1571,7 +1623,27 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     // Grow outside the admission critical section. The helper reaps workers
     // that already timed out, then admits only the amount of M needed for the
     // current runnable backlog.
-    m_impl->maybe_grow(this);
+    // Sample maintenance during producer bursts; the worker-side path still
+    // performs immediate growth while the initial P set is being filled.
+    const auto maintenance_ticket =
+        m_impl->enqueue_maintenance.fetch_add(1, std::memory_order_relaxed);
+    const bool initial_workers_missing =
+        m_impl->active_workers.load(std::memory_order_relaxed) <
+        m_impl->config.min_workers;
+    // 单 P 调度器在一个 M 被 Hook 标记为 blocking 时，替代 M 必须
+    // 立即启动；不能把这类低频但有进度要求的路径延迟到采样周期。
+    const bool replacement_may_be_needed =
+        m_impl->active_workers.load(std::memory_order_relaxed) <=
+            m_impl->config.min_workers &&
+        m_impl->runnable.load(std::memory_order_relaxed) != 0;
+    const bool processor_workers_missing =
+        m_impl->active_workers.load(std::memory_order_relaxed) <
+        m_impl->processors.size();
+    if (initial_workers_missing || replacement_may_be_needed ||
+        (processor_workers_missing && (maintenance_ticket & 63U) == 0U) ||
+        (!processor_workers_missing && (maintenance_ticket & 1023U) == 0U)) {
+        m_impl->maybe_grow(this);
+    }
     m_impl->condition.notify_one();
     return true;
 }
@@ -1600,7 +1672,7 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
             m_impl->draining.load(std::memory_order_acquire) ||
             m_impl->stopping.load(std::memory_order_acquire)) {
             retry_regular_enqueue = true;
-        } else if (task->try_mark_queued()) {
+        } else if (task->try_mark_queued_from_worker()) {
             // 计数必须先于节点发布，否则另一个 worker 可能先 pop 节点
             // 再递减尚未增加的 runnable，造成下溢。
             m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
@@ -1625,7 +1697,7 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
 bool Scheduler::yield(const std::shared_ptr<Task>& task) {
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get() || task->cancellation_requested() ||
-        !task->mark_yielded()) {
+        !task->mark_yielded_fast()) {
         return false;
     }
     task->defer_enqueue();
@@ -1644,7 +1716,33 @@ bool Scheduler::park(const std::shared_ptr<Task>& task) {
 }
 
 bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
-    return park_with_reason(task, SuspendReason::Io);
+    if (!task || current_scheduler() != this ||
+        current_task().get() != task.get()) {
+        return false;
+    }
+    if (m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire) ||
+        task->cancellation_requested()) {
+        return false;
+    }
+    // The IO poller changes Waiting -> Runnable with wake_io(). Publish the
+    // state before the second shutdown check; shutdown either observes it in
+    // its registry scan or is observed here without taking the scheduler
+    // admission mutex on every socket wait.
+    const auto action = task->park_for_scheduler();
+    if (action != ParkAction::kParked) {
+        return false;
+    }
+    if (m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire) ||
+        task->cancellation_requested()) {
+        (void)task->wake_for_io();
+        return false;
+    }
+    if (!Fiber::SuspendForScheduler(SuspendReason::Io)) {
+        return false;
+    }
+    return !task->cancellation_requested();
 }
 
 bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
@@ -1680,6 +1778,20 @@ bool Scheduler::park_current() {
 
 bool Scheduler::wake(const std::shared_ptr<Task>& task) {
     return wake_or_cancel(task);
+}
+
+bool Scheduler::wake_io(const std::shared_ptr<Task>& task) {
+    if (!task || !task->owned_by(m_impl->owner_token)) {
+        return false;
+    }
+    const auto action = task->wake_for_io();
+    if (action == WakeAction::kPending) {
+        return true;
+    }
+    if (action != WakeAction::kEnqueue) {
+        return false;
+    }
+    return enqueue(task);
 }
 
 bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
@@ -2183,21 +2295,25 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             Fiber::BindCurrentExecution(FiberExecutionBinding{
                 reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,
                 t_processor_id, true});
-            const auto run_started = steady_now_ns();
+            const bool collect_metrics = m_impl->config.collect_metrics;
+            const auto run_started = collect_metrics ? steady_now_ns() : 0;
             task->run();
-            const auto resume_elapsed =
-                static_cast<std::uint64_t>(std::max<std::int64_t>(
-                    0, steady_now_ns() - run_started));
-            m_impl->metric_task_runs.fetch_add(1, std::memory_order_relaxed);
-            m_impl->metric_fiber_resume_ns.fetch_add(
-                resume_elapsed, std::memory_order_relaxed);
-            if (task->terminal()) {
-                m_impl->metric_task_completions.fetch_add(
+            if (collect_metrics) {
+                const auto resume_elapsed =
+                    static_cast<std::uint64_t>(std::max<std::int64_t>(
+                        0, steady_now_ns() - run_started));
+                m_impl->metric_task_runs.fetch_add(
                     1, std::memory_order_relaxed);
-            }
-            if (local_queue_pop) {
-                m_impl->metric_local_queue_pops.fetch_add(
-                    1, std::memory_order_relaxed);
+                m_impl->metric_fiber_resume_ns.fetch_add(
+                    resume_elapsed, std::memory_order_relaxed);
+                if (task->terminal()) {
+                    m_impl->metric_task_completions.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                if (local_queue_pop) {
+                    m_impl->metric_local_queue_pops.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
             }
             t_task.reset();
             Fiber::BindCurrentExecution(FiberExecutionBinding{
