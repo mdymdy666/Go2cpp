@@ -801,3 +801,10 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
   `build-native-asan` CTest 14/14；Valgrind `ERROR SUMMARY: 0`，definite/indirect/
   possible leak 均为 0，仅 416 bytes/4 blocks still reachable。构建时 WSL 与 Windows
   文件时间有轻微偏差，出现 gmake clock skew 警告，不影响测试结果。
+
+## 2026-10-02：配置独立性规范
+
+- 在 `docs/configuration.md`、`docs/getting_started.md` 和 `go2cpp.ini` 中明确规范：
+  允许热更新的配置键必须独立解析、独立校验、独立生效，不能依赖同一文件中其他键
+  的非原子中间值。`min_workers`/`max_workers` 等相互约束的结构参数被限定为启动期
+  成组配置，必须通过完整快照一次替换并重新创建 Scheduler，禁止分别热更新。
