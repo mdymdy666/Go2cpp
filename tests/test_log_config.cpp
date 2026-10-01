@@ -100,7 +100,14 @@ void run_log_config_tests() {
         std::ofstream watch_file(watch_path, std::ios::trunc);
         watch_file << "[log]\nlevel=info\nstdout=false\nformat=%p:%m%n\n";
     }
-    GO2CPP_REQUIRE_EVENTUALLY(dynamic_logger->level() == log::Level::Info, 1s);
+    auto watcher_timeout = 1s;
+    if (RUNNING_ON_VALGRIND) {
+        // 文件监视线程在 Memcheck 下会被显著放慢；放大 watchdog，
+        // 但不改变配置热加载的轮询间隔和状态断言。
+        watcher_timeout *= 20;
+    }
+    GO2CPP_REQUIRE_EVENTUALLY(dynamic_logger->level() == log::Level::Info,
+                              watcher_timeout);
     registry.StopWatcher();
     std::filesystem::remove(watch_path);
 

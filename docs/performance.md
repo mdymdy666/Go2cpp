@@ -281,3 +281,35 @@ valgrind --leak-check=full --show-leak-kinds=definite,indirect,possible \
 ERROR SUMMARY 为 0，definite/indirect/possible leak 均为 0，仅有 288 bytes
 still reachable 的进程级缓存。TSan 仍受 WSL `unexpected memory mapping` 环境错误
 限制，不能宣称通过。
+
+## 2026-10-02：性能复测与混合 Mutex 生命周期修复
+
+本轮重新构建 Release，并使用 `taskset -c 0-7` 固定到同一组 CPU。高负载参数仍为
+50,000 个调度任务、8,000 个计算任务、2,000 个 Fiber + 32 个普通线程、
+32,000 条 Channel 消息和 4,096 个 socketpair reader。修复后的三轮代表性结果如下，
+单位为毫秒：
+
+| 场景 | Go2Cpp | 线程基准 | Go2Cpp/线程 |
+|---|---:|---:|---:|
+| 计算 | 1595 / 1614 / 1560 | 1616 / 1632 / 1555 | 中位数约 0.99x |
+| 调度与 yield | 93 / 150 / 107 | 55 / 55 / 50 | 中位数约 1.95x |
+| 混合 Mutex | 18 / 1784 / 1562 | 39 / 38 / 37 | 双峰，不能用单一稳定倍率表示 |
+| Channel | 17 / 18 / 20 | 53 / 69 / 56 | 中位数约 0.32x |
+| 多路 IO | 2896 / 2614 / 2725 | 2034 / 2016 / 2091 | 中位数约 1.34x |
+
+同机 Coost 对照使用 `build-coost/compare_*.cpp`，并以 `taskset -c 0-7`
+运行：调度 50,000×4 的中位数约 8 ms，IO 中位数约 1,686 ms，混合 Mutex
+中位数约 1,721 ms。两边的计时边界、线程数和编译选项仍不完全相同：Coost
+对照是本地 checkout 的 `-O2` 构建，Go2Cpp 为 `-O3 -DNDEBUG`；调度和
+混合锁结果还包含不同的 scheduler 初始化/关闭路径。因此这些数据用于工程
+定位，不是严格的同 ABI 基准。
+
+复测期间发现并修复了一个确定的混合 Mutex UAF。原实现把栈上 `WaitNode*`
+放进队列，`Unlock` 弹出后释放队列锁，再调用 `Wake()`；等待方可能已经
+返回并销毁栈节点，或把拥有节点重置后放回线程本地缓存，导致随机 SIGSEGV、
+永久等待和 20 ms/2 s 两种性能模式。现在队列持有 `shared_ptr<WaitNode>`，
+`Unlock` 在锁外唤醒期间继续持有该引用，唤醒完成后才允许节点复用。
+
+修复后 Release 高负载连续 5 轮全部完成，ASan/UBSan mutex-only 连续 5 轮无
+报告，Werror CTest 3/3、Release CTest 14/14 通过。混合 Mutex 仍有明显长尾，
+需要后续继续优化等待/调度路径；不能把偶发的 18 ms 样本当成稳定性能。

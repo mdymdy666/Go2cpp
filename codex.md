@@ -744,4 +744,26 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
   `build-native-context` CTest 14/14 均通过；高负载测试连续三轮通过；ASan/UBSan 全量
   单测通过；Valgrind `ERROR SUMMARY: 0`，definite/indirect/possible leak 均为 0，
   仅有 416 bytes/4 blocks 的进程级 still reachable 缓存。TSan 仍受 WSL
-  `unexpected memory mapping` 启动限制，未宣称 native Linux 竞态验证通过。
+`unexpected memory mapping` 启动限制，未宣称 native Linux 竞态验证通过。
+
+## 2026-10-02：性能复测发现并修复混合 Mutex UAF
+
+- Release 高负载复测曾在混合 Mutex 阶段出现 SIGSEGV，进一步定位到
+  `src/sync.cpp`：`Mutex::Impl::m_waiters` 保存裸 `WaitNode*`，
+  `Unlock()` 释放队列锁后才调用 `Wake()`，等待方可能已经销毁栈节点或
+  重置线程本地缓存节点，形成悬空访问。
+- 修复后等待队列改为 `std::deque<std::shared_ptr<WaitNode>>`，所有争用等待者
+  通过 `AcquireWaitNode()` 获取共享节点；`Unlock()` 将 shared ownership
+  保持到锁外 `Wake()` 完成，等待方按节点地址移除队列元素。
+- 修复验证：Release CTest 14/14、Werror CTest 3/3 通过；Release 高负载连续
+  5 轮无崩溃；ASan/UBSan mutex-only 连续 5 轮无报告；Valgrind 全量单测
+  `ERROR SUMMARY: 0`，definite/indirect/possible leak 均为 0，仅 416 bytes
+  still reachable。
+- 同一组 CPU 上的三轮性能样本：计算 Fiber/线程为
+  1595/1616、1614/1632、1560/1555 ms；调度为 93/55、150/55、107/50 ms；
+  Channel 为 17/53、18/69、20/56 ms；IO 为 2896/2034、2614/2016、
+  2725/2091 ms。混合 Mutex 为 18、1784、1562 ms，线程 `std::mutex`
+  为 39、38、37 ms，仍有明显长尾，不能宣称性能稳定。
+- Coost 本机对照（同 CPU 集合、历史 `-O2` 构建）调度中位数约 8 ms、
+  IO 约 1686 ms、混合 Mutex 约 1721 ms。计时边界和编译参数不完全相同，
+  这些数据只用于工程定位，不是严格同配置基准。

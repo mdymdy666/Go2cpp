@@ -105,3 +105,17 @@ Select 使用 `SelectWaitState::TrySelect`/`Cancel` 的单赢家。每个 armed 
 
 当前结论不覆盖 Go 编译器/ABI/GC 等价、异步抢占、Go 风格动态 segmented stack、任意未 Hook 的系统调用、跨 Fiber 持有原生锁、任意 C++ 栈的强制终止和 native Linux TSan 之外的宿主差异。IO 高负载仍可能受宿主调度和 epoll 事件形态影响；这不是把本轮状态机安全误写成性能保证的理由。
 
+## 复测后修复的混合 Mutex 生命周期竞态
+
+后续 Release 高负载复测发现一个此前未覆盖到的确定性风险：`Mutex::Impl::m_waiters`
+原来保存裸 `WaitNode*`，而 `Unlock()` 在弹出节点、释放队列锁后才调用 `Wake()`。
+等待方可能在这个窗口中结束等待并销毁栈节点，或把拥有节点重置后放回线程本地缓存，
+使解锁方访问悬空或已复用的对象。该链路解释了随机 SIGSEGV、永久等待和混合 Mutex
+性能长尾。
+
+当前实现让队列持有 `std::shared_ptr<WaitNode>`，所有争用等待者通过
+`AcquireWaitNode()` 获取节点，`Unlock()` 将 shared ownership 保持到锁外
+`Wake()` 返回后。修复后 Release CTest 14/14、Werror CTest 3/3、ASan/UBSan
+单测和 Valgrind 全量单测均通过；Valgrind `ERROR SUMMARY: 0`，definite、
+indirect、possible leak 均为 0。该修复增加了争用等待的引用计数开销，混合 Mutex
+仍有明显性能长尾，不能把安全修复误写成性能优化。

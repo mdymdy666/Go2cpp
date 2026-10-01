@@ -373,10 +373,12 @@ struct Mutex::Impl {
     // waiter 时可以采用有界协作重试，避免每次短临界区都 park；一旦有
     // native waiter，所有后续 G 回到 FIFO 队列，保证线程不会饥饿。
     std::atomic<std::size_t> m_native_waiters{0U};
-    // 等待节点由 Lock 调用栈或带 Context 的拥有者保存。指针队列避免
-    // 无 Context 的短等待反复分配 shared_ptr 控制块，生命周期由等待者
-    // 在挂起期间保证。
-    std::deque<WaitNode*> m_waiters;
+    // 队列必须持有 shared_ptr。Unlock 会先从队列取出等待者，再在释放
+    // 队列锁后调用 Wake；如果队列只保存裸指针，等待方可能在这段窗口
+    // 内返回并销毁栈上的 WaitNode，或把缓存节点重置给下一次等待，
+    // 从而形成悬空访问。队列持有的引用把节点生命周期延长到 Wake
+    // 完成，同时不改变锁外唤醒以避免锁反转的约束。
+    std::deque<std::shared_ptr<WaitNode>> m_waiters;
 };
 
 Mutex::Mutex() : m_impl(std::make_unique<Impl>()) {}
@@ -466,13 +468,11 @@ bool Mutex::Lock(const ContextPtr& context) {
             RelaxCpu();
         }
     }
-    WaitNode stack_waiter(target.scheduler, target.task);
-    std::shared_ptr<WaitNode> owned_waiter;
-    WaitNode* waiter = &stack_waiter;
-    if (context) {
-        owned_waiter = AcquireWaitNode(target.scheduler, target.task);
-        waiter = owned_waiter.get();
-    }
+    // Mutex::Unlock 会在释放 m_mutex 后异步执行 Wake，因此即使没有
+    // Context，也必须让队列持有一个 shared_ptr，不能使用栈上节点。
+    std::shared_ptr<WaitNode> owned_waiter =
+        AcquireWaitNode(target.scheduler, target.task);
+    WaitNode* waiter = owned_waiter.get();
     ContextSubscription subscription(context, owned_waiter);
     const auto release_waiter = [&] {
         subscription.Reset();
@@ -520,7 +520,7 @@ bool Mutex::Lock(const ContextPtr& context) {
             break;
         }
 
-        m_impl->m_waiters.push_back(waiter);
+        m_impl->m_waiters.push_back(owned_waiter);
         if (!target) {
             m_impl->m_native_waiters.fetch_add(1U, std::memory_order_release);
         }
@@ -544,9 +544,11 @@ bool Mutex::Lock(const ContextPtr& context) {
     subscription.Reset();
     if (result != WaitResult::kNotified) {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
-        const auto position =
-            std::find(m_impl->m_waiters.begin(), m_impl->m_waiters.end(),
-                      waiter);
+        const auto position = std::find_if(
+            m_impl->m_waiters.begin(), m_impl->m_waiters.end(),
+            [waiter](const std::shared_ptr<WaitNode>& candidate) {
+                return candidate.get() == waiter;
+            });
         if (position != m_impl->m_waiters.end()) {
             m_impl->m_waiters.erase(position);
             if (!waiter->managed()) {
@@ -604,7 +606,7 @@ void Mutex::Unlock() {
         return;
     }
 
-    WaitNode* selected = nullptr;
+    std::shared_ptr<WaitNode> selected;
     {
         // Unlock 与 waiter 发布必须共享同一把队列锁。原子快路径无法
         // 同时覆盖 waiter 入队和另一个线程重新取得锁的交错，统一在此
@@ -615,14 +617,15 @@ void Mutex::Unlock() {
             throw std::logic_error("go2cpp::sync::Mutex unlock of unlocked mutex");
         }
         while (!m_impl->m_waiters.empty()) {
-            WaitNode* candidate = m_impl->m_waiters.front();
+            std::shared_ptr<WaitNode> candidate =
+                std::move(m_impl->m_waiters.front());
             m_impl->m_waiters.pop_front();
             if (candidate && !candidate->managed()) {
                 m_impl->m_native_waiters.fetch_sub(
                     1U, std::memory_order_release);
             }
             if (candidate && candidate->TryFinish(WaitResult::kNotified)) {
-                selected = candidate;
+                selected = std::move(candidate);
                 break;
             }
         }
