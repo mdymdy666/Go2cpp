@@ -109,7 +109,8 @@ bool RuntimeConfig::FromIni(const IniFile& ini, RuntimeConfig* config, std::stri
         !ReadSize(ini, "scheduler", "min_workers", &result.scheduler.min_workers, error) ||
         !ReadSize(ini, "scheduler", "local_queue_limit", &result.scheduler.local_queue_limit, error) ||
         !ReadSize(ini, "scheduler", "fiber_stack_size", &result.scheduler.fiber_stack_size, error) ||
-        !ReadSize(ini, "scheduler", "task_affinity_budget", &result.scheduler.task_affinity_budget, error)) return false;
+        !ReadSize(ini, "scheduler", "task_affinity_budget", &result.scheduler.task_affinity_budget, error) ||
+        !ReadSize(ini, "scheduler", "fiber_bin_capacity", &result.scheduler.fiber_bin_capacity, error)) return false;
     std::size_t value = 0;
     if (ini.Has("scheduler", "idle_wait_ms")) { if (!ReadSize(ini, "scheduler", "idle_wait_ms", &value, error)) return false; result.scheduler.idle_wait = std::chrono::milliseconds(value); }
     if (ini.Has("scheduler", "idle_worker_timeout_ms")) { if (!ReadSize(ini, "scheduler", "idle_worker_timeout_ms", &value, error)) return false; result.scheduler.idle_worker_timeout = std::chrono::milliseconds(value); }
@@ -136,6 +137,7 @@ bool RuntimeConfig::Validate(std::string* error) const {
     if (value.max_workers != 0 && value.min_workers != 0 && value.max_workers < value.min_workers) return fail("scheduler.max_workers 不能小于 min_workers");
     if (value.processor_count > 32) return fail("scheduler.processor_count 不能超过 32");
     if (value.local_queue_limit == 0) return fail("scheduler.local_queue_limit 必须大于 0");
+    if (value.fiber_bin_capacity > 4096) return fail("scheduler.fiber_bin_capacity 不能超过 4096");
     if (log_directory.empty() || log_file.empty()) return fail("日志目录和文件名不能为空");
     return true;
 }
@@ -309,6 +311,18 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
     bind_size("scheduler.local_queue_limit", &target->scheduler.local_queue_limit, "P 本地队列容量");
     bind_size("scheduler.fiber_stack_size", &target->scheduler.fiber_stack_size, "Fiber 初始栈大小");
     bind_size("scheduler.task_affinity_budget", &target->scheduler.task_affinity_budget, "任务亲和预算");
+    auto fiber_bin_capacity = config.Lookup<std::size_t>(
+        "scheduler.fiber_bin_capacity", target->scheduler.fiber_bin_capacity,
+        "每个 M 的 FiberBin 容量，最多 4096");
+    if (!fiber_bin_capacity) {
+        valid = false;
+    } else {
+        fiber_bin_capacity->AddListener(
+            [target](const std::size_t&, const std::size_t& value) {
+                target->scheduler.fiber_bin_capacity =
+                    std::min<std::size_t>(value, 4096U);
+            });
+    }
     auto allow_oversubscription = config.Lookup<bool>("scheduler.allow_worker_oversubscription", target->scheduler.allow_worker_oversubscription, "允许 M 超过 P");
     auto enable_sysmon = config.Lookup<bool>("scheduler.enable_sysmon", target->scheduler.enable_sysmon, "启用 sysmon");
     auto pin_workers = config.Lookup<bool>("scheduler.pin_workers_to_cpu", target->scheduler.pin_workers_to_cpu, "绑定 CPU");

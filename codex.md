@@ -684,3 +684,24 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
 - 验证：Release CTest 14/14、Debug CTest 13/13、Werror CTest 3/3、ASan CTest
   3/3；高负载样例连续 3 次全部通过；TSan 仍受 WSL `unexpected memory mapping`
   环境限制，未宣称通过。详细数据和调度环节见 `docs/performance.md`。
+
+## 2026-10-01：FiberBin 复用与 M 本地队列复核
+
+- 调度器新增每个 M 的线程本地 FiberBin。只有已经完成或失败、上下文和栈都已
+  释放、且父记录没有被嵌套 Fiber 持有的内部 Fiber 才会进入缓存；复用时重新
+  创建 FiberRecord/ID，并清除父链、失败状态、调度标志及 sanitizer 状态。普通
+  用户 Fiber、挂起 Fiber 和跨 M 的活动 Fiber 不经过此路径。
+- FiberBin 默认容量为 32，配置上限为 4096，可通过 `scheduler.fiber_bin_capacity`
+  在 INI 和动态配置中修改。容量仅影响对象分配复用，不改变调度语义；容量过大
+  会增加每个 M 的常驻内存。
+- 曾尝试把任务从 P 队列进一步分为 MLocalTaskQueue、P 队列和全局队列，但在
+  50,000 G 的高负载 yield 压力下出现完成超时。该实现已撤回，没有把未经验证的
+  runnable 计数、shutdown 排空、sysmon 解绑和跨 M 唤醒状态机带入主线。当前仍以
+  P 本地队列、incoming 条带和全局窃取为生产实现；后续若重新实现 MLocal，必须先
+  补齐可证明的所有权、溢出和关闭协议。
+- 验证：Release CTest 14/14 通过，`go2cpp_tests` 连续运行通过；ASan 直接运行
+  和单测过滤重跑可以通过，但在重复压力运行中仍会间歇性触发既有
+  `test_readiness_timeout_race` 的 timeout/stack-use-after-scope（临时禁用 FiberBin
+  后仍可复现，确认不是 FiberBin 引入）。因此不能把 ASan 宣称为稳定全通过；TSan
+  仍受本机运行时映射限制。高负载混合 Mutex 仍明显慢于线程基准，FiberBin 只降低
+  创建/销毁分配开销，不宣称已经消除调度和混合锁的主要成本。

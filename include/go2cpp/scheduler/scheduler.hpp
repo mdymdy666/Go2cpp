@@ -112,6 +112,10 @@ struct SchedulerConfig {
     // Linux 上可将 M 绑定到与 P 对应的 CPU。默认关闭，避免嵌入宿主已有
     // CPU 配额/容器亲和性策略；打开后超出 CPU 数量的 P 不执行绑定。
     bool pin_workers_to_cpu = false;
+    // 每个 M 的 FiberBin 容量。只缓存已经完成/失败且上下文已释放的
+    // 调度器内部 Fiber；设为 0 表示使用运行时默认值，过大只会增加
+    // 每个 worker 的保留内存，不会改变 Fiber 语义。
+    std::size_t fiber_bin_capacity = 32;
     // 性能敏感的部署可以关闭运行时累计计时；状态机和调度语义不受影响。
     // 默认开启，便于诊断和性能报告。
     bool collect_metrics = true;
@@ -124,6 +128,9 @@ struct TaskCancellationGate;
 struct TaskOptions {
     std::size_t stack_size = 0;
     TaskClassId task_class = 0;
+    // 0 表示由 SchedulerConfig::fiber_bin_capacity 注入；直接构造并加入
+    // 调度器的 Task 在未注入时使用 Fiber 运行时默认容量。
+    std::size_t fiber_bin_capacity = 0;
 };
 
 struct ProcessorSnapshot {

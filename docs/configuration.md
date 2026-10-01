@@ -7,6 +7,8 @@
 调度器配置重点：`processor_count=0` 使用硬件并发数；`min_workers=0` 和
 `max_workers=0` 使用调度器自身的按需策略；显式 `max_workers` 不能超过 32，
 `min_workers` 不能小于 1（0 表示自动）。`local_queue_limit` 必须大于 0。
+`fiber_bin_capacity` 控制每个 M 的已完成 Fiber 对象缓存，默认 32，最大 4096，
+设置为 0 使用运行时默认值；它只影响分配回收，不改变 Fiber 的调度语义。
 
 日志配置重点：`level` 默认 `warn`，`stdout` 默认 `false`，`directory` 默认 `log`，
 `file` 默认 `go2cpp.log`。程序中的典型启动顺序是：

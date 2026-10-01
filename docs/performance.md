@@ -226,3 +226,17 @@ callback_active 和 operation 生命周期。它没有修改 Fiber 的 `fcontext
 约 6.7～6.9 s（该基准宿主抖动较大），线程 `std::mutex` 仍约 40 ms。HybridGate
 只能降低唤醒门开销，不能把 Fiber park/wake、FIFO handoff 和跨 M 调度变成一次
 原子操作；高争用共享锁仍应按本文件的分片/原子规约使用。
+
+## 2026-10-01 FiberBin 与 MLocalTaskQueue 复核
+
+FiberBin 只复用已完成 Fiber 的对象和 `Impl`，不会复用挂起栈或跨 M 共享对象；
+Fiber 栈映射仍由已有 TLS/全局受保护栈缓存处理。默认每个 M 保留 32 个对象，
+上限 4096，可通过 `SchedulerConfig`、INI 和动态配置绑定调整。Release 高负载功能
+测试和 CTest 通过；ASan/UBSan 单测可通过，但重复压力运行仍可能触发既有
+`test_readiness_timeout_race` 的时序失败，不能据此宣称 sanitizer 全部稳定通过。
+该失败在临时禁用 FiberBin 后仍可复现，未证明由本轮缓存引入。
+
+本轮尝试的 M 私有任务队列没有保留：在 50,000 个任务、每个任务 4 次 yield 的
+测试中出现任务完成超时。该方案需要重新设计 runnable 计数、局部配额、P/global
+批量转移、sysmon 脱离和 shutdown 排空的统一状态机，当前不能把未验证实现当成
+性能收益。现有高负载基线仍以 P 本地队列、incoming 分片和全局窃取为准。

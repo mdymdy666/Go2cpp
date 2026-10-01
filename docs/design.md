@@ -222,3 +222,18 @@ Fiber 栈仍是固定保护栈，尚未实现 Go 风格动态扩容。IOManager 
 继续使用原生 poll/select。
 
 SelectCaster 的函数对象可能被多个 Fiber 并发调用；若内部有可变状态，调用方必须自行加锁或为每个执行流创建独立实例。
+
+## 2026-10-01 FiberBin 与 M 私有队列评估
+
+调度器现在提供 `SchedulerConfig::fiber_bin_capacity` 和
+`TaskOptions::fiber_bin_capacity`。任务完成或失败、上下文已经失效、没有活动
+resume claim、且父记录没有其他持有者时，Fiber 对象只回收到当前 M 的线程本地
+FiberBin；默认容量为 32，配置上限为 4096。复用前会生成新的 FiberRecord 和 ID，
+清理父链、失败状态、取消标志和 sanitizer 状态。普通 Fiber 不进入该池，池中
+对象也不会跨 M 共享；Fiber 栈仍由原有的受保护栈缓存负责回收。
+
+曾验证过 M 私有任务队列方案：它需要同时改动 worker 消费优先级、yield 回队、
+P/global 批量回灌、sysmon 脱离和 shutdown 排空。首次接入在 50,000 个任务、每个
+任务 4 次 yield 的压力测试中出现完成超时，说明 runnable 计数、配额公平和等待
+唤醒尚未形成完整线性化协议。因此当前版本不启用 MLocalTaskQueue，也不在配置中
+暴露未实现的参数；现有 P 本地队列、incoming 分片和全局窃取路径保持为生产路径。

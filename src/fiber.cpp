@@ -111,6 +111,20 @@ std::mutex s_stack_pool_mutex;
 StackCache s_stack_pool;
 thread_local StackCache s_thread_stack_pool;
 
+// 仅由 Scheduler 内部使用的 FiberBin。一个 M 只访问自己的 TLS 池，
+// 因而不会把仍可能被其他 M resume 的 Fiber 放进共享容器。完成 Fiber
+// 的上下文已经失效，放回这里的对象只会在下一次 AcquireForScheduler
+// 时重新绑定任务；普通用户创建的 Fiber 不经过此路径。
+struct FiberBin {
+    std::vector<std::unique_ptr<Fiber>> entries;
+};
+
+thread_local FiberBin s_thread_fiber_bin;
+constexpr std::size_t kDefaultFiberBinCapacity = 32U;
+// 防止误配把每个 M 变成无界对象保留池。FiberBin 只应缓存短期突发，
+// 更大的容量不会带来线性收益，且会长期占用 Fiber/闭包对象内存。
+constexpr std::size_t kMaxFiberBinCapacity = 4096U;
+
 FiberContextFrame main_context_frame(
     const FiberExecutionBinding& binding) noexcept {
     FiberContextFrame frame;
@@ -366,6 +380,51 @@ struct Fiber::Impl {
           m_stack_size(normalize_stack_size(stack_size)) {
 #if defined(GO2CPP_FIBER_TSAN)
         m_tsan_fiber = __tsan_create_fiber(0);
+#endif
+    }
+
+    void reset_for_scheduler(Function function, std::size_t stack_size) {
+        // 只有 entry 已经返回 caller，且 resume_locked 已将 m_context 和
+        // m_stack 清空后才能重绑定。Scheduler 只在 terminal Fiber 上调用
+        // 该方法；若后端约束被破坏，宁可抛出也不能复用活动栈。
+        const auto state = m_record->state.load(std::memory_order_acquire);
+        if ((state != FiberState::Completed && state != FiberState::Failed) ||
+            m_context != nullptr || m_stack != nullptr ||
+            m_resume_claim.load(std::memory_order_acquire)) {
+            throw std::logic_error("cannot rebind an active Fiber");
+        }
+
+        const auto normalized_stack_size = normalize_stack_size(stack_size);
+        auto next_record = std::make_shared<FiberRecord>(
+            s_next_fiber_id.fetch_add(1, std::memory_order_relaxed));
+
+        m_function = std::move(function);
+        m_id = next_record->id;
+        m_record = std::move(next_record);
+        m_stack_size = normalized_stack_size;
+        m_caller = nullptr;
+        m_scheduler_propagate.store(false, std::memory_order_relaxed);
+        m_scheduler_parent_bound = false;
+        m_resume_claim.store(false, std::memory_order_relaxed);
+        m_last_resume_thread_hash.store(0, std::memory_order_relaxed);
+        m_parent = nullptr;
+        m_parent_bound = false;
+        m_saved_errno = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_failure_mutex);
+            m_failure = {};
+        }
+#if defined(GO2CPP_FIBER_TSAN)
+        if (m_tsan_fiber != nullptr) {
+            __tsan_destroy_fiber(m_tsan_fiber);
+        }
+        m_tsan_fiber = __tsan_create_fiber(0);
+        m_tsan_caller = nullptr;
+#endif
+#if defined(GO2CPP_FIBER_ASAN)
+        m_asan_fake_stack = nullptr;
+        m_asan_caller_bottom = nullptr;
+        m_asan_caller_size = 0;
 #endif
     }
 
@@ -789,10 +848,10 @@ struct Fiber::Impl {
     }
 
     Fiber* m_owner;
-    const std::uint64_t m_id;
+    std::uint64_t m_id;
     std::shared_ptr<FiberRecord> m_record;
     Function m_function;
-    const std::size_t m_stack_size;
+    std::size_t m_stack_size;
     std::unique_ptr<FiberStack> m_stack;
 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
     detail::Context m_context{nullptr};
@@ -824,6 +883,53 @@ struct Fiber::Impl {
 
 Fiber::Fiber(Function function, std::size_t stack_size)
     : m_impl(std::make_unique<Impl>(this, std::move(function), stack_size)) {}
+
+std::unique_ptr<Fiber> Fiber::AcquireForScheduler(
+    Function function, std::size_t stack_size, std::size_t bin_capacity) {
+    const auto capacity = std::min(
+        kMaxFiberBinCapacity,
+        bin_capacity == 0 ? kDefaultFiberBinCapacity : bin_capacity);
+    if (capacity != 0 && !s_thread_fiber_bin.entries.empty()) {
+        auto fiber = std::move(s_thread_fiber_bin.entries.back());
+        s_thread_fiber_bin.entries.pop_back();
+        try {
+            fiber->m_impl->reset_for_scheduler(std::move(function), stack_size);
+            return fiber;
+        } catch (...) {
+            // 重绑定失败时销毁该对象并走普通构造路径。失败不会把
+            // 一个状态不明的 Fiber 再次放回池中。
+        }
+    }
+    return std::make_unique<Fiber>(std::move(function), stack_size);
+}
+
+void Fiber::RecycleForScheduler(std::unique_ptr<Fiber> fiber,
+                                std::size_t bin_capacity) noexcept {
+    if (!fiber) {
+        return;
+    }
+    const auto capacity = std::min(
+        kMaxFiberBinCapacity,
+        bin_capacity == 0 ? kDefaultFiberBinCapacity : bin_capacity);
+    const auto state = fiber->state();
+    if (capacity == 0 ||
+        (state != FiberState::Completed && state != FiberState::Failed) ||
+        s_current_fiber == fiber.get() ||
+        // 嵌套 Fiber 的子记录会持有 parent shared_ptr。只要仍有外部
+        // 持有者，就不能把这个 Fiber 的父记录替换成下一项任务，避免
+        // 子 Fiber 之后恢复时观察到被复用的父对象。
+        !fiber->m_impl || fiber->m_impl->m_record.use_count() != 1) {
+        return;
+    }
+    try {
+        if (s_thread_fiber_bin.entries.size() < capacity) {
+            s_thread_fiber_bin.entries.emplace_back(std::move(fiber));
+        }
+    } catch (...) {
+        // FiberBin 只是分配优化；容量不足或 OOM 时由 unique_ptr 正常
+        // 销毁对象，FiberStack 仍会回收到原有栈缓存。
+    }
+}
 
 Fiber::~Fiber() = default;
 

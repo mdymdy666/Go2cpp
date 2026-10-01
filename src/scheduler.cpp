@@ -501,7 +501,7 @@ void Task::run() {
             const auto stack_size = m_options.stack_size == 0
                                         ? Fiber::DefaultStackSize()
                                         : m_options.stack_size;
-            auto created_fiber = std::make_unique<Fiber>(
+            auto created_fiber = Fiber::AcquireForScheduler(
                 [this] {
                     // Move the callable onto the G stack. Its captures are
                     // released without any scheduler lock held when the body
@@ -514,7 +514,7 @@ void Task::run() {
                         body();
                     }
                 },
-                stack_size);
+                stack_size, m_options.fiber_bin_capacity);
             {
                 std::lock_guard<std::mutex> lock(m_transition_mutex);
                 if (!m_fiber) {
@@ -635,7 +635,8 @@ void Task::run() {
                                      << " failed with an uncaught exception";
         }
         notify_terminal();
-        completed_fiber.reset();
+        Fiber::RecycleForScheduler(std::move(completed_fiber),
+                                   m_options.fiber_bin_capacity);
     }
 }
 
@@ -740,6 +741,10 @@ public:
         requested.min_workers = std::max<std::size_t>(1, requested.min_workers);
         requested.min_workers = std::min(requested.min_workers,
                                          requested.max_workers);
+        // FiberBin 只用于短期突发复用；限制单个 M 的保留对象数，避免
+        // 配置误写为极大值后让每个 worker 长期占用大量堆内存。
+        requested.fiber_bin_capacity = std::min<std::size_t>(
+            requested.fiber_bin_capacity, 4096U);
         if (requested.idle_wait <= std::chrono::milliseconds::zero()) {
             requested.idle_wait = std::chrono::milliseconds(1);
         }
@@ -1588,6 +1593,9 @@ std::shared_ptr<Task> Scheduler::spawn(Task::Function function,
                                       TaskOptions options) {
     if (options.stack_size == 0) {
         options.stack_size = m_impl->config.fiber_stack_size;
+    }
+    if (options.fiber_bin_capacity == 0) {
+        options.fiber_bin_capacity = m_impl->config.fiber_bin_capacity;
     }
     auto task = std::make_shared<Task>(std::move(function), options);
     if (!enqueue(task)) {

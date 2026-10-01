@@ -90,6 +90,15 @@ public:
 
     explicit Fiber(Function function,
                    std::size_t stack_size = DefaultStackSize());
+    // Scheduler 专用的 FiberBin 接口。只有已经完成或失败、且不再有
+    // 可恢复上下文的内部 G Fiber 才允许回收到创建它的 M 的线程本地池。
+    // 普通用户 Fiber 不应调用这两个接口；它们不会跨线程转移仍挂起的
+    // Fiber，也不会改变 Fiber 的公开所有权规则。
+    static std::unique_ptr<Fiber> AcquireForScheduler(
+        Function function, std::size_t stack_size,
+        std::size_t bin_capacity = 32U);
+    static void RecycleForScheduler(std::unique_ptr<Fiber> fiber,
+                                    std::size_t bin_capacity = 32U) noexcept;
     // 析构会请求取消并等待 Fiber 自然返回。Ready Fiber 会跳过主体；
     // Suspended Fiber 只有在固定父级/调用方仍可恢复时才会继续执行。
     // owner 必须长于所有 resume()；不能在 Fiber 自身执行期间析构。
