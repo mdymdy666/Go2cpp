@@ -39,6 +39,11 @@ ctest --test-dir build --output-on-failure
 [`docs/dependencies.md`](docs/dependencies.md) 和
 [`third_party/go-reference/README.md`](third_party/go-reference/README.md)。
 
+第一次使用请先阅读
+[`docs/getting_started.md`](docs/getting_started.md)。该文档包含环境要求、最短
+可运行程序、Fiber/线程混合规则、Channel/Context/IO 生命周期、配置校验和常见
+错误排查步骤。
+
 可运行示例位于 `example/`：`runtime_demo.cpp`、`fiber_sync_demo.cpp`、
 `mixed_runtime_demo.cpp`、`managed_pipeline_demo.cpp`、`dynamic_gmp_demo.cpp`
 以及 Linux Hook 构建下的 `io_hook_demo.cpp`。其中

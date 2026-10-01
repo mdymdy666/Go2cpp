@@ -47,7 +47,7 @@ void join_with_watchdog(std::thread& thread,
     watchdog.join();
 }
 
-}  // namespace
+}  // 匿名命名空间
 
 int main() {
     using namespace std::chrono_literals;
@@ -92,8 +92,7 @@ int main() {
     scheduler.Start();
     group.Add(3);
 
-    // This native thread owns the mutex first, then waits for the Fiber to
-    // acquire and release it. The same FIFO queue is used in both directions.
+    // 普通线程先持有互斥锁，再等待 Fiber 获取并释放它；两个方向都使用同一条 FIFO 等待队列。
     std::thread native_owner([&] {
         go2cpp::ScopedThreadParticipation participation(
             scheduler, go2cpp::ThreadParticipationMode::kGmpEligible);
@@ -136,8 +135,7 @@ int main() {
         return 1;
     }
 
-    // The first Fiber waits on a mutex held by the native thread, then keeps
-    // it long enough for the native thread to wait on the Fiber-owned lock.
+    // 第一个 Fiber 等待普通线程持有的锁，随后保持锁一段时间，让普通线程等待 Fiber 持有的锁。
     auto mutex_fiber = scheduler.Go([&] {
         fiber_waiting.store(true, std::memory_order_release);
         int& value = fiber_value.GetOrCreate(10);
@@ -159,7 +157,7 @@ int main() {
         group.Done();
     });
 
-    // A native condition-variable notifier wakes a managed Fiber waiter.
+    // 普通线程的条件变量通知会唤醒正在调度器中等待的 Fiber。
     std::thread native_notifier([&] {
         if (!wait_flag(condition_waiting, 2s) || stop.load(std::memory_order_acquire)) {
             stop.store(true, std::memory_order_release);
@@ -201,8 +199,7 @@ int main() {
         group.Done();
     });
 
-    // A declared blocking region allows a replacement M to run queued Gs
-    // while this M is inside a native blocking call.
+    // 声明阻塞区后，当前 M 进入原生阻塞调用期间，替代 M 可以继续执行队列中的 G。
     auto blocking_fiber = scheduler.Go([&] {
         go2cpp::BlockingRegion blocking;
         if (!blocking.active()) {

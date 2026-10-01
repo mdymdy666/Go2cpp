@@ -7,10 +7,9 @@ namespace go2cpp {
 
 namespace {
 
-// A long chain of the built-in WrappedError values otherwise releases one
-// shared_ptr member from inside the next destructor and can exhaust the
-// native stack. Destructors append their child to this thread-local worklist
-// while the outermost release drains it iteratively.
+// 内置 WrappedError 形成很长的链时，如果在下一个析构函数中释放 shared_ptr
+// 成员，会递归耗尽原生栈。析构函数把子对象加入线程本地工作表，最外层
+// 的释放过程再用迭代方式排空工作表。
 thread_local std::vector<ErrorPtr>* t_error_release_work = nullptr;
 
 void ReleaseWrappedCause(ErrorPtr cause) noexcept {
@@ -98,8 +97,8 @@ std::string WrappedError::Message() const {
       break;
     }
     current = wrapped;
-    // Advance the raw pointer before releasing the previous owner. The new
-    // owner keeps the object referenced by `current` alive for the next loop.
+    // 先推进裸指针，再释放前一个所有者。新的所有者会让 `current` 指向的
+    // 对象继续存活到下一轮循环。
     current_owner = std::move(cause);
   }
   return result;
@@ -115,9 +114,8 @@ JoinError::JoinError(std::vector<ErrorPtr> causes) {
 }
 
 std::string JoinError::Message() const {
-  // Flatten built-in nested joins with an explicit worklist. Calling
-  // Message() recursively for `Join({previous, next})` would exhaust the
-  // native stack for a generated deep error graph.
+  // 使用显式工作表展开内置的嵌套 Join。对于生成的深层错误图，递归调用
+  // `Join({previous, next})` 的 Message() 会耗尽原生栈。
   std::string result;
   std::vector<ErrorPtr> pending;
   for (auto it = m_causes.rbegin(); it != m_causes.rend(); ++it) {

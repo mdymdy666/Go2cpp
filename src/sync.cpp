@@ -46,8 +46,8 @@ public:
     }
 
     void Disarm() noexcept {
-        // A callback may already have left DoneSignal's registry. Waiting for
-        // its Wake call here prevents it from outliving Scheduler shutdown.
+        // 回调可能已经离开 DoneSignal 的注册表。这里等待其 Wake 调用完成，
+        // 防止回调生命周期超过 Scheduler 的关闭过程。
         std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
         m_active = false;
         m_scheduler = nullptr;
@@ -100,18 +100,17 @@ private:
         }
         try {
             if (m_scheduler != nullptr && m_task) {
-                // A managed waiter resumes through its owning scheduler.
+                // managed waiter 通过所属 Scheduler 恢复。
                 // 已注册 G 走 wake_registered()；该入口仍保留 started G，
                 // 即使 shutdown 或队列分配与这个回调并发。
                 (void)m_scheduler->wake_registered(m_task);
             } else {
-                // Native callers wait on this node's private condition
-                // variable. The result is the predicate, so a notify that
-                // arrives before wait() is not lost.
+                // 普通线程调用者在节点私有条件变量上等待。结果字段就是谓词，
+                // 因此 wait() 之前到达的通知不会丢失。
                 m_native_condition.notify_one();
             }
         } catch (...) {
-            // Scheduler's reliable wake handoff retains every started G.
+            // Scheduler 的可靠唤醒交接会保留所有已经启动的 G。
         }
     }
 
@@ -128,10 +127,9 @@ public:
                 return result() != WaitResult::kWaiting;
             });
         } catch (...) {
-            // condition_variable may report an implementation/system error.
-            // Never let that escape the runtime wait boundary (which is
-            // noexcept because scheduler and cancellation callbacks are
-            // advisory); convert it to the same terminal path as cancellation.
+            // condition_variable 可能报告实现或系统错误。不要让错误越过运行时
+            // 等待边界（该边界因调度器和取消回调只是通知而声明为 noexcept），
+            // 而应将其转换为与取消相同的终态路径。
             (void)TryFinish(WaitResult::kCancelled);
         }
         return result();
@@ -277,14 +275,13 @@ WaitResult Await(WaitNode* waiter) noexcept {
         return result;
     };
     if (!waiter->managed()) {
-        // Native callers consume the same result state but sleep on a
-        // condition_variable; this keeps a blocked OS thread out of the GMP
-        // worker pool while preserving notify-before-wait semantics.
+        // 普通线程调用者读取相同的结果状态，但在 condition_variable 上休眠；
+        // 这样阻塞的 OS 线程不会占用 GMP worker，同时保持先通知后等待的语义。
         return finish(waiter->WaitNative());
     }
 
-    // A managed G never waits on a native condition_variable: parking releases
-    // its M and the scheduler wake path requeues the same logical G.
+    // managed G 从不等待原生 condition_variable：park 会释放其 M，Scheduler
+    // 的唤醒路径会重新排入同一个逻辑 G。
     Scheduler* const scheduler = waiter->scheduler();
     const auto& task = waiter->task();
     for (;;) {
@@ -304,9 +301,8 @@ WaitResult Await(WaitNode* waiter) noexcept {
             return finish(waiter->result());
         }
 
-        // Always attempt park after publication, even if a notifier may have
-        // won already. A notify-before-park wake is stored as a pending token;
-        // park consumes that token and returns without suspending.
+        // 发布后始终尝试 park，即使通知者可能已经先一步完成。先通知后 park
+        // 的唤醒会保存为 pending token；park 消耗该 token 后直接返回，不会挂起。
         const bool suspended = scheduler->park_wait(task);
         const WaitResult result = waiter->result();
         if (result != WaitResult::kWaiting) {
@@ -319,8 +315,8 @@ WaitResult Await(WaitNode* waiter) noexcept {
             (void)waiter->TryFinish(WaitResult::kCancelled);
             return finish(waiter->result());
         }
-        // A false park can consume an unrelated pending permit. Both that
-        // permit and an unrelated unpark are spurious, not cancellation.
+        // false park 可能消耗无关的 pending permit。该 permit 和无关的 unpark
+        // 都属于伪唤醒，不代表取消。
     }
 }
 
@@ -339,18 +335,15 @@ ContextPtr TimeoutContext(ContextDuration timeout, const ContextPtr& parent,
     return std::move(pair.first);
 }
 
-// ConditionVariable::Wait is specified with the same precondition as
-// std::condition_variable::wait: the caller owns the mutex. Even an already
-// cancelled context or a zero timeout must perform the atomic-looking
-// unlock/relock boundary so another waiter can make progress and the caller
-// regains its lock before observing the false result. Mutex::Lock may decline
-// to re-park a G during scheduler shutdown; in that case the documented result
-// is false with the mutex left unlocked.
+// ConditionVariable::Wait 的前置条件与 std::condition_variable::wait 相同：
+// 调用者必须持有 mutex。即使 Context 已取消或超时为零，也要完成看似原子的
+// 解锁/重锁边界，让其他 waiter 有机会运行，并在看到 false 前重新获得锁。
+// Scheduler 关闭期间 Mutex::Lock 可能拒绝再次 park G；此时按文档返回 false，
+// mutex 保持未锁定。
 bool AbortConditionWait(Mutex& mutex, bool preserve_lock = false) {
-    // A manually resumed Fiber has no scheduler continuation. Unlocking and
-    // then blocking on relock could still park the carrier thread if another
-    // owner wins the race, so this explicitly constrained path keeps the
-    // caller's lock and reports false.
+    // 手动恢复的 Fiber 没有 Scheduler continuation。解锁后再阻塞重锁可能在
+    // 其他 owner 获胜时挂起 carrier 线程，因此这个受限路径保留调用者持有的
+    // 锁并返回 false。
     if (preserve_lock) {
         return false;
     }
@@ -398,8 +391,8 @@ bool Mutex::Lock(const ContextPtr& context) {
 
     const WaitTarget target = CurrentTarget();
     if (target.unsupported_manual_fiber) {
-        // A manually resumed Fiber has no scheduler continuation to park.
-        // Returning false is safer than blocking its carrier thread.
+        // 手动恢复的 Fiber 没有可用于 park 的 Scheduler continuation。返回 false
+        // 比阻塞 carrier 线程更安全。
         return false;
     }
     if (target && target.task->cancellation_requested()) {
@@ -576,9 +569,8 @@ bool Mutex::LockFor(ContextDuration timeout, const ContextPtr& parent) {
     if (parent && parent->IsDone()) {
         return false;
     }
-    // A zero/negative timed lock still gets the standard immediate try-lock
-    // opportunity. Routing it through an already-cancelled Context would
-    // incorrectly fail even when the mutex is free.
+    // 零或负超时的 timed lock 仍应先进行标准的立即 try-lock。如果把它转给
+    // 已取消的 Context，即使 mutex 空闲也会错误失败。
     if (timeout <= ContextDuration::zero()) {
         return TryLock();
     }
@@ -639,8 +631,8 @@ void Mutex::Unlock() {
                                                 : Impl::kWaiter)),
                 std::memory_order_release);
         }
-        // With a selected waiter the lock remains logically held: ownership
-        // is handed directly to the FIFO head, so a TryLock caller cannot barge.
+        // 选定 waiter 后锁在逻辑上仍保持持有：所有权直接交给 FIFO 队首，
+        // 因而 TryLock 调用者不能插队。
     }
     if (selected) {
         selected->Wake();
@@ -694,15 +686,14 @@ bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
         }
     }
     if (abort_before_publish) {
-        // Do this after releasing the CV registry lock. Unlock can wake a
-        // waiter that calls NotifyOne, which must be able to inspect the
-        // registry without a lock inversion.
+        // 释放 CV 注册表锁后再执行。Unlock 可能唤醒调用 NotifyOne 的 waiter，
+        // 它必须能够检查注册表，避免锁顺序反转。
         return AbortConditionWait(mutex);
     }
 
     try {
-        // Publication precedes unlock. A concurrent Notify may run here, but
-        // Scheduler pending-wake semantics make the subsequent park lossless.
+        // 先发布再解锁。并发 Notify 可能在此时运行，但 Scheduler 的 pending-wake
+        // 语义保证后续 park 不会丢失唤醒。
         mutex.Unlock();
     } catch (...) {
         (void)waiter->TryFinish(WaitResult::kCancelled);
@@ -716,15 +707,14 @@ bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
     const WaitResult result = Await(waiter.get());
     subscription.Reset();
     {
-        // Context-cancelled nodes are removed by their owner. Notify paths
-        // detach their winners first, so this is also safe after notification.
+        // 已取消 Context 的节点由其 owner 移除。Notify 路径会先摘除获胜节点，
+        // 因而通知后执行这里同样安全。
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
         RemoveWaiter(m_impl->m_waiters, waiter);
     }
 
-    // Cancellation of the Context does not waive the condition-variable
-    // relock rule. Scheduler shutdown is different: Mutex::Lock refuses to
-    // re-park a cancellation-requested G, but may still acquire immediately.
+    // Context 取消不会豁免条件变量的重锁规则。Scheduler 关闭不同：Mutex::Lock
+    // 拒绝再次 park 已请求取消的 G，但仍可能立即获取锁。
     const bool relocked = mutex.Lock();
     return relocked && result == WaitResult::kNotified;
 }
@@ -803,8 +793,8 @@ void WaitGroup::Add(std::int64_t delta) {
         }
     }
 
-    // Mark the old wave while its zero transition is locked. A later Add
-    // cannot change those results; arbitrary scheduler work stays outside.
+    // 在零值转换被锁保护时标记旧一轮结果。后续 Add 不能改变这些结果；
+    // 任意 Scheduler 工作都放在锁外执行。
     for (const auto& waiter : released) {
         if (waiter && waiter->result() == WaitResult::kNotified) {
             waiter->Wake();

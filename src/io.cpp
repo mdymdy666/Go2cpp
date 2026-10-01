@@ -628,7 +628,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             return node;
         }
 
-        // New timers may be earlier than epoll_wait's previous timeout.
+        // 新增定时器可能早于 epoll_wait 上一次计算出的超时时间。
         tickle();
         return node;
     }
@@ -1069,9 +1069,8 @@ private:
             return 0;
         }
         const auto remaining = m_deadline_order.begin()->first - now;
-        // Bound before converting from the clock's tick period. A max()
-        // deadline may be wider than milliseconds and a direct cast can wrap
-        // negative, which would make epoll_wait fail instead of polling.
+        // 在从时钟周期转换前先限制范围。max() 截止时间可能比毫秒类型更宽，
+        // 直接转换会回绕成负数，导致 epoll_wait 失败而不是进行轮询。
         constexpr auto kMaxPollSeconds =
             std::chrono::seconds(std::numeric_limits<int>::max());
         const auto bounded = std::min(
@@ -1165,10 +1164,9 @@ private:
         if (!m_poller_waiting.load(std::memory_order_acquire)) {
             return;
         }
-        // Multiple registrations/completions can arrive while the poller is
-        // asleep. One eventfd counter is enough to force one epoll return;
-        // coalesce the rest until the poller drains it. This removes a write
-        // syscall per Fiber wait without changing the readiness protocol.
+        // poller 休眠期间可能有多个注册或完成事件到达。一个 eventfd 计数就
+        // 足以触发一次 epoll 返回，其余事件合并到 poller 排空计数时处理。
+        // 这样每个 Fiber 等待都不必执行一次 write 系统调用，同时不改变就绪协议。
         if (m_tickle_pending.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
@@ -1277,9 +1275,8 @@ bool IOManager::start() {
     try {
         m_scheduler.start();
     } catch (...) {
-        // The poller must not outlive a failed worker start.  Otherwise a
-        // caller retrying or destroying the manager observes an accepting
-        // epoll state whose Scheduler has already rolled itself back.
+        // poller 不能超过失败的 worker 启动过程继续存活，否则重试或销毁管理器
+        // 的调用者会看到仍接受注册的 epoll 状态，而 Scheduler 已经回滚。
         m_state->shutdown();
         return false;
     }
@@ -1386,17 +1383,16 @@ WaitResult IOManager::wait(int fd, IOEvent event,
         (void)m_state->complete(node, WaitStatus::kTimeout, ETIMEDOUT);
     }
 
-    // Consume the pending handoff even for a completion that raced ahead of
-    // park. Unrelated permits and external wakeups are spurious, not cancel.
+    // 即使完成事件抢在 park 前到达，也要消耗 pending 交接令牌。无关 permit
+    // 和外部唤醒都是伪唤醒，不表示取消。
     for (;;) {
         const bool parked = m_scheduler.park_io(node->task);
         if (node->outcome.load(std::memory_order_acquire) != 0) {
             break;
         }
-        // A failed park normally means a pending wake was consumed without
-        // suspending. If the scheduler is no longer running, or the current
-        // G identity changed unexpectedly, do not spin forever with an armed
-        // IO node that can no longer be resumed.
+        // park 失败通常表示消耗了 pending 唤醒但没有挂起。如果 Scheduler 已
+        // 停止，或当前 G 身份意外变化，不要让仍 armed 且无法恢复的 IO 节点
+        // 无限自旋。
         if (node->task->cancellation_requested() ||
             Scheduler::current_scheduler() != &m_scheduler ||
             Scheduler::current_task().get() != node->task.get() ||
@@ -1535,10 +1531,8 @@ WaitManyResult IOManager::wait_many(
         nodes.push_back(std::move(node));
         const auto& registered = nodes.back();
         if (registered->outcome.load(std::memory_order_acquire) != 0) {
-            // pending readiness may be consumed synchronously during
-            // registration. It is a successful member of the set, not a
-            // reason to discard ready_indices; only an error/close result
-            // aborts the complete request set.
+            // 注册期间可能同步消耗 pending readiness。它仍是集合中的成功成员，
+            // 不能因此丢弃 ready_indices；只有错误或关闭结果才终止完整请求集合。
             const WaitResult terminal = decode_outcome(
                 registered->outcome.load(std::memory_order_acquire));
             if (terminal.status != WaitStatus::kReady) {
@@ -1554,9 +1548,8 @@ WaitManyResult IOManager::wait_many(
     if (context) {
         const std::weak_ptr<State> weak_state(m_state);
         const std::weak_ptr<Context> weak_context(context);
-        // Holding the nodes in this callback prevents a late cancellation
-        // callback from observing a destroyed node. RemoveCallback below
-        // removes the callback before this owner is released.
+        // 在该回调中持有节点，防止迟到的取消回调观察到已经销毁的节点。下面
+        // 的 RemoveCallback 会先移除回调，再释放这个所有者。
         std::shared_ptr<std::vector<State::NodePtr>> callback_nodes;
         try {
             callback_nodes =
@@ -1602,8 +1595,8 @@ WaitManyResult IOManager::wait_many(
         return false;
     };
 
-    // A deadline can become due between registration and park. Complete the
-    // set before parking so a zero-length race cannot leave the Fiber asleep.
+    // 注册与 park 之间截止时间可能到期。挂起前先完成请求集合，避免零长度
+    // 竞争让 Fiber 永久睡眠。
     if (deadline.has_value() && *deadline <= Clock::now()) {
         for (const auto& node : nodes) {
             (void)m_state->complete(node, WaitStatus::kTimeout, ETIMEDOUT);
@@ -1689,8 +1682,8 @@ WaitManyResult IOManager::wait_many(
         try {
             context->Done().RemoveCallback(callback_id);
         } catch (...) {
-            // RemoveCallback is non-throwing in the current implementation;
-            // preserve the wake result if a replaceable Context backend throws.
+    // 当前实现的 RemoveCallback 不抛出异常；如果可替换的 Context 后端抛出，
+    // 仍保留已经得到的唤醒结果。
         }
     }
 
@@ -1753,8 +1746,8 @@ WaitManyResult IOManager::wait_many(
         // 时保留原有单节点语义。
     }
 
-    // Ready wins over timeout/cancel when several epoll/timer callbacks race.
-    // This mirrors poll/select's rule that observed readiness is actionable.
+    // 多个 epoll/timer 回调竞争时，就绪优先于超时或取消。这与 poll/select
+    // 的规则一致：已经观察到的就绪事件可以执行。
     WaitStatus terminal_status = WaitStatus::kCancelled;
     int terminal_error = ECANCELED;
     bool have_terminal = false;
@@ -1866,9 +1859,8 @@ void IOManager::NotifyCloseAll(int fd) noexcept {
             callbacks.emplace_back(entry.second);
         }
     } catch (...) {
-        // Preserve wakeup progress even under allocation pressure. This is a
-        // last-resort path only; normal delivery never invokes user-visible
-        // callbacks while holding the registry mutex.
+        // 即使内存分配有压力也要保持唤醒进度。这只是最后的兜底路径；正常
+        // 交付不会在持有注册表互斥量时调用用户可见回调。
         std::lock_guard<std::mutex> lock(manager_registry_mutex());
         for (const auto& entry : close_registry()) {
             try {

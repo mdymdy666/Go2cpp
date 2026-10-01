@@ -1,7 +1,6 @@
 #pragma once
 
-// Convenience include for translated programs. Module-specific headers remain
-// available when a smaller dependency surface is preferred.
+// 面向转译程序的便捷总头文件。需要更小依赖面时仍可单独包含各模块头文件。
 #include "go2cpp/channel.hpp"
 #include "go2cpp/config.hpp"
 #include "go2cpp/context.hpp"

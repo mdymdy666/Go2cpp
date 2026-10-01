@@ -1,16 +1,16 @@
-# Verification Matrix
+# 测试与验收矩阵
 
-This document records commands executed against the canonical WSL checkout:
+本文记录在规范 WSL 工作区执行的构建、测试和工具检查命令：
 
 ```text
 /UserData/CodexWorkSpace/Go2Cpp
 ```
 
-The project is C++17. Builds use `-Wall -Wextra -Wpedantic`; every CTest
-target has a registered timeout and the stress loops use an external watchdog.
-Test-level joins and wait loops are also audited for bounded failure paths; the
-reference Go source is research input only and is not linked.
-## Environment
+项目使用 C++17。构建启用 `-Wall -Wextra -Wpedantic`；每个 CTest 目标都有
+超时，压力循环带外部 watchdog。测试中的 join 和等待循环也有有界失败路径；
+参考 Go 源码只用于研究，不参与链接。
+
+## 环境
 
 | Item | Observed value |
 |---|---|
@@ -23,7 +23,7 @@ reference Go source is research input only and is not linked.
 | Valgrind | 3.22.0 |
 | Go executable | not required for the C++ build |
 
-## Build and tests
+## 构建与测试
 
 GCC Debug shared build, Linux hook, all examples and all registered tests:
 
@@ -65,7 +65,7 @@ ctest --test-dir build-clang-current --output-on-failure --timeout 60
 
 Historical result: **7/7 passed**, warning-clean under the configured warning flags.
 
-## Focused boundary checks
+## 关键边界检查
 
 The test executable accepts one exact module name in `GO2CPP_TEST_FILTER`.
 The following current-source runs passed under a 45-second watchdog:
@@ -89,7 +89,7 @@ for the externally observable state transitions. The test support join helper
 aborts on a stuck thread instead of allowing a failed assertion to continue
 into an unbounded join.
 
-## Sanitizers
+## Sanitizer 检查
 
 ASan and UBSan were rebuilt from the current tree after the final scheduler,
 hook, and smoke-test changes. Both the full unit executable and scheduler
@@ -117,7 +117,7 @@ the final rebuilt run did not complete under the available WSL watchdog, and
 the full suite and `hook` filter are not claimed as clean TSan results. A
 native Linux runner remains the required independent TSan gate.
 
-## Valgrind Memcheck
+## Valgrind Memcheck 检查
 
 The required checks were run separately so leaks in one executable cannot hide
 in another:
@@ -138,7 +138,7 @@ The deliberate invalid-pointer `FIONBIO` test is skipped when
 `RUNNING_ON_VALGRIND` is set; the same `EFAULT` assertion runs in normal,
 ASan, and UBSan builds so Memcheck reports only runtime faults.
 
-## Stress and watchdog
+## 压力测试与 watchdog
 
 The following inline Python loop was used (no temporary script file):
 
@@ -156,7 +156,7 @@ All 40 unit runs and 80 scheduler-smoke runs passed in the current audit after
 the final scheduler and hook changes. Earlier 200/300-run watchdog campaigns
 are retained in `codex.md`.
 
-## Install/export smoke
+## 安装与导出冒烟测试
 
 The modular install was regenerated with:
 
@@ -177,7 +177,7 @@ directory on `LD_LIBRARY_PATH`; it exited zero (`installed package consumer
 passed`). The temporary source/build directory under
 `build-check/pkg-consumer-*` was removed after the run.
 
-## Coverage and known gaps
+## 覆盖范围与已知缺口
 
 The tests cover P=1 and multi-P scheduling, local/global queues, stealing,
 dynamic worker waves, cancellation/shutdown, context trees/deadlines/values,
@@ -610,3 +610,18 @@ Valgrind 栈登记已经重新构建验证。
 definite/indirect/possible leak 均为 0，416 bytes/4 blocks 是进程级
 still reachable 缓存。TSan 仍受 WSL 的 `unexpected memory mapping` 启动限制，
 不能作为本机全套竞态通过结论。
+
+## 收尾复核（2026-10-02）
+
+最终使用独立的 `build-final` 目录重新配置 Release 构建，并执行：
+
+- `ctest --test-dir build-final --output-on-failure -j2`：14/14 通过；
+- `build-engineering-werror`：3/3 通过，包含 `-Werror`；
+- `build-native-asan`：14/14 通过，ASan 与 UBSan 均无诊断；
+- Valgrind Memcheck 运行完整 `go2cpp_tests`：退出码 0，`ERROR SUMMARY: 0`，
+  definite/indirect/possible 均为 0，仅 416 bytes/4 blocks 仍可达；
+- 调度器 smoke 在 ASan 下单独重复 5 次均通过。第一次全量 ASan 运行中的
+  smoke 超时未能复现，按单独重复结果记录为检测器调度抖动，不把它隐瞒为通过。
+
+TSan 仍需在原生 Linux 机器复核；当前 WSL 会在运行时报告
+`unexpected memory mapping`，因此本项目没有伪造 TSan 通过结论。

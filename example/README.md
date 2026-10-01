@@ -1,5 +1,19 @@
 # 可运行示例
 
+第一次接触项目建议按以下顺序运行：
+
+1. `beginner_demo.cpp`：最短的 `go()`、Scheduler 和 Channel 示例；
+2. `runtime_demo.cpp`：Context、错误链和 Select 的组合用法；
+3. `fiber_sync_demo.cpp`：Fiber 与普通线程共用 Mutex、ConditionVariable 和
+   WaitGroup；
+4. `io_wait_many_demo.cpp`：多个 FD 的 epoll 等待、超时和取消；
+5. `context_rollback_demo.cpp`：Context 局部回滚和补偿动作。
+
+详细的环境准备、生命周期约束和故障排查请先阅读
+[`docs/getting_started.md`](../docs/getting_started.md)。示例都要求先构建
+`GO2CPP_BUILD_EXAMPLES=ON` 的构建目录；示例返回前会等待任务并关闭自己创建的
+Scheduler，便于复制到新项目。
+
 `example/runtime_demo.cpp` 是端到端示例。它创建 G/M/P 调度器，通过类型化
 channel 传递值，绑定 timeout context，演示 `WithValue` 和显式子节点取消，
 使用仅发送/仅接收视图执行 select，并格式化和检查包装错误的身份。显式控制流

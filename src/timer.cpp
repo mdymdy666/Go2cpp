@@ -35,8 +35,8 @@ public:
         m_cv.notify_all();
         if (m_thread.joinable() &&
             m_thread.get_id() == std::this_thread::get_id()) {
-            // The worker still executes member code and cannot outlive an
-            // Impl whose owner is being destroyed from its callback.
+            // worker 仍会执行成员函数，不能让它的生命周期超过回调中正在
+            // 销毁所有者的 Impl 对象。
             std::terminate();
         }
         if (m_thread.joinable()) {
@@ -60,8 +60,8 @@ public:
     }
 
     void Remove(const std::shared_ptr<Timer::State>& state) noexcept {
-        // Keep a strong local state so callback captures are never destroyed
-        // under the service queue lock, including reentrant cancellation.
+        // 保留一个强引用的局部状态，保证回调捕获对象不会在服务队列锁内
+        // 被销毁，包括发生重入取消的情况。
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             for (auto it = m_entries.begin(); it != m_entries.end(); ++it) {
@@ -116,7 +116,7 @@ private:
                 try {
                     callback();
                 } catch (...) {
-                    // A timer observer cannot terminate the shared worker.
+                    // 定时器观察者不能终止共享的 worker 线程。
                 }
             }
         }

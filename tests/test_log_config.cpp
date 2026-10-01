@@ -16,11 +16,12 @@ void run_log_config_tests() {
     using namespace std::chrono_literals;
     IniFile ini;
     std::string error;
-    GO2CPP_REQUIRE(ini.Parse("# 注释\n[scheduler]\nmin_workers=1\nmax_workers=4\n[log]\nlevel=info\nstdout=false\n", &error));
+    GO2CPP_REQUIRE(ini.Parse("# 注释\n[scheduler]\nmin_workers=1\nmax_workers=4\ncollect_metrics=false\n[log]\nlevel=info\nstdout=false\n", &error));
     RuntimeConfig config;
     GO2CPP_REQUIRE(RuntimeConfig::FromIni(ini, &config, &error));
     GO2CPP_CHECK(config.log_level == log::Level::Info);
     GO2CPP_CHECK(config.scheduler.max_workers == 4);
+    GO2CPP_CHECK(!config.scheduler.collect_metrics);
     config.scheduler.max_workers = 33;
     GO2CPP_CHECK(!config.Validate(&error));
     config.scheduler.max_workers = 4;
@@ -104,7 +105,7 @@ void run_log_config_tests() {
     if (RUNNING_ON_VALGRIND) {
         // 文件监视线程在 Memcheck 下会被显著放慢；放大 watchdog，
         // 但不改变配置热加载的轮询间隔和状态断言。
-        watcher_timeout *= 20;
+        watcher_timeout *= 120;
     }
     GO2CPP_REQUIRE_EVENTUALLY(dynamic_logger->level() == log::Level::Info,
                               watcher_timeout);
@@ -116,4 +117,21 @@ void run_log_config_tests() {
     auto max_workers = registry.Lookup<std::size_t>("scheduler.max_workers", 0, "最大 M");
     max_workers->SetValue(8);
     GO2CPP_CHECK(dynamic_runtime.scheduler.max_workers == 8);
+    // 运行时配置变量也执行同一套范围校验，非法值不会覆盖旧值。
+    std::string validation_error;
+    GO2CPP_CHECK(!max_workers->SetValue(33, &validation_error));
+    GO2CPP_CHECK(dynamic_runtime.scheduler.max_workers == 8);
+    GO2CPP_CHECK(!validation_error.empty());
+    auto min_workers = registry.Lookup<std::size_t>("scheduler.min_workers", 0, "最小 M");
+    GO2CPP_REQUIRE(min_workers != nullptr);
+    GO2CPP_CHECK(!min_workers->SetValue(9, &validation_error));
+    GO2CPP_CHECK(dynamic_runtime.scheduler.min_workers == 0);
+    IniFile invalid_runtime;
+    GO2CPP_REQUIRE(invalid_runtime.Parse("[scheduler]\nmax_workers=33\n", &validation_error));
+    GO2CPP_CHECK(!registry.LoadFromIni(invalid_runtime, &validation_error));
+    GO2CPP_CHECK(max_workers->GetValue() == 8);
+    auto metrics = registry.Lookup<bool>("scheduler.collect_metrics", true, "是否采集调度指标");
+    GO2CPP_REQUIRE(metrics != nullptr);
+    GO2CPP_CHECK(metrics->SetValue(false));
+    GO2CPP_CHECK(!dynamic_runtime.scheduler.collect_metrics);
 }

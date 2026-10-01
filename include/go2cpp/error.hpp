@@ -11,21 +11,20 @@
 namespace go2cpp {
 
 /**
- * Immutable error value used by the compatibility layer.
+ * 兼容层使用的不可变错误值。
  *
- * ErrorPtr is the library's nil-able equivalent of a Go error interface.
- * Error implementations must remain immutable after construction, which makes
- * a shared ErrorPtr safe to pass between goroutines.
+ * ErrorPtr 是可为空的 Go error 接口等价物。错误实现构造后必须保持不可变，
+ * 因此共享 ErrorPtr 可以安全地在线程和 Fiber 之间传递。
  */
 class Error {
  public:
   virtual ~Error() = default;
   virtual std::string Message() const = 0;
-  // Go-like spelling for callers that prefer Error().
+  // 接近 Go 的拼写，便于调用方使用 Error() 风格接口。
   virtual std::string ErrorString() const { return Message(); }
   virtual std::shared_ptr<const Error> Unwrap() const { return {}; }
   virtual std::vector<std::shared_ptr<const Error>> UnwrapAll() const;
-  // A custom error may override this to implement Go's Is method.
+  // 自定义错误可以重写此函数，实现 Go 的 Is 判断。
   virtual bool Is(const Error& target) const noexcept {
     return this == &target;
   }
@@ -33,6 +32,7 @@ class Error {
 
 using ErrorPtr = std::shared_ptr<const Error>;
 
+/** 只保存一条不可变文本的叶子错误。依赖 Error 接口，适合直接返回给上层。 */
 class StringError final : public Error {
  public:
   explicit StringError(std::string message) : m_message(std::move(message)) {}
@@ -42,6 +42,7 @@ class StringError final : public Error {
   std::string m_message;
 };
 
+/** 带单一 cause 的包装错误；Message 返回当前说明，Unwrap 返回原始原因。 */
 class WrappedError final : public Error {
  public:
   WrappedError(std::string message, ErrorPtr cause)
@@ -56,6 +57,7 @@ class WrappedError final : public Error {
   ErrorPtr m_cause;
 };
 
+/** 聚合多个原因的错误；UnwrapAll 返回全部非空原因，供 Is/As 遍历。 */
 class JoinError final : public Error {
  public:
   explicit JoinError(std::vector<ErrorPtr> causes);
@@ -78,8 +80,8 @@ std::vector<ErrorPtr> UnwrapAll(const ErrorPtr& error);
 std::string ErrorMessage(const ErrorPtr& error);
 
 /**
- * Traverse a single- or multi-cause chain.  Cycles are tolerated and ignored.
- * A null target matches only a null error, like errors.Is(err, nil).
+ * 遍历单原因或多原因错误链。允许并忽略环；空 target 只匹配空错误，
+ * 与 errors.Is(err, nil) 相同。
  */
 bool Is(const ErrorPtr& error, const ErrorPtr& target) noexcept;
 
@@ -124,9 +126,8 @@ std::shared_ptr<const T> As(const ErrorPtr& error) noexcept {
 
 template <typename T>
 std::shared_ptr<T> AsMutable(const ErrorPtr& error) noexcept {
-  // Explicit adapter escape hatch: mutating the returned object is not safe
-  // while the ErrorPtr is shared. Ordinary callers should use As<T>() and
-  // keep error values immutable.
+  // 显式适配出口：ErrorPtr 被共享时修改返回对象并不安全。普通调用方应
+  // 使用 As<T>()，并保持错误值不可变。
   static_assert(std::is_base_of<Error, T>::value,
                 "AsMutable<T> requires T to derive from go2cpp::Error");
   if (!error) {

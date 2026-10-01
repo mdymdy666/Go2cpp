@@ -9,8 +9,16 @@
 
 namespace go2cpp::core {
 
-// Predicate waits keep the external lock contract of condition_variable,
-// but a managed G parks its Fiber instead of blocking its machine thread.
+// 带谓词等待保持 condition_variable 的外部锁契约，同时让受管 G 挂起
+// Fiber，而不是阻塞承载它的 M 线程。
+/**
+ * 同时服务 Fiber 与普通线程的条件等待适配器。
+ *
+ * 依赖：Scheduler/Fiber 提供受管等待路径，std::condition_variable 提供
+ * 普通线程路径。对上层提供带谓词的 wait/wait_for/wait_until，并要求调用
+ * 方持有传入的外部互斥锁；它本身不拥有业务状态，也不负责通知条件的
+ * 产生。
+ */
 class ParkingCondition final {
 public:
     using Clock = std::chrono::steady_clock;

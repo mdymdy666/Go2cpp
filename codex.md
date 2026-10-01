@@ -767,3 +767,20 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
 - Coost 本机对照（同 CPU 集合、历史 `-O2` 构建）调度中位数约 8 ms、
   IO 约 1686 ms、混合 Mutex 约 1721 ms。计时边界和编译参数不完全相同，
   这些数据只用于工程定位，不是严格同配置基准。
+
+## 2026-10-02：收尾文档、中文注释与配置统一
+
+- 新增 `docs/getting_started.md`，从构建、最短 `go()`、Scheduler/Fiber 生命周期，
+  讲到 Fiber/线程混合同步、Channel/Select、Context、Linux IO/Hook、日志、配置
+  热更新和故障排查；README 与 example 入口均已链接该指南。
+- 为 Scheduler/Task、Fiber、IOManager、Context、Channel、Mutex、ConditionVariable、
+  WaitGroup、Future、Error、FiberLocal、Hook、线程策略、定时器、配置中心等公共类
+  补充中文的依赖、职责、生命周期、参数和返回值说明，并把公共头中的整段英文注释
+  翻译为中文；示例注释也已统一为中文。
+- `go2cpp.ini` 现在覆盖 SchedulerConfig 全部重要字段和日志字段；统一校验 P/M 数量、
+  本地队列、Fiber 栈、FiberBin、亲和预算及毫秒参数范围。ConfigVar 支持强类型校验器，
+  非法热更新会拒绝并保留旧值，min/max_workers 的单步修改也不会留下不可启动状态。
+- 最终验证：Release 独立构建 `build-final` CTest 14/14；`build-engineering-werror`
+  CTest 3/3；ASan+UBSan 构建 CTest 14/14；Valgrind 全量单测通过，`ERROR SUMMARY: 0`，
+  definite/indirect/possible leak 均为 0，仅 416 bytes/4 blocks 进程级 still reachable。
+  TSan 仍受 WSL 的 `unexpected memory mapping` 启动限制，未宣称通过。

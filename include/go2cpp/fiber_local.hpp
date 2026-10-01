@@ -12,8 +12,7 @@ namespace go2cpp::fiber_local::detail {
 
 using KeyId = std::uint64_t;
 
-// Key allocation is process-local and monotonically increasing. A key is
-// never reused during the lifetime of the process.
+// 键分配只在当前进程内进行并单调递增；进程存活期间不会复用键。
 KeyId AllocateKey() noexcept;
 
 std::shared_ptr<void> Get(Fiber* fiber, KeyId key) noexcept;
@@ -24,8 +23,8 @@ void Cleanup(Fiber* fiber) noexcept;
 using ThreadValueMap =
     std::unordered_map<KeyId, std::shared_ptr<void>>;
 
-// Defined in the Fiber module so all translation units/DSOs use one TLS map
-// per OS thread. A template-local static could silently create one map per DSO.
+// 在 Fiber 模块中定义，确保所有编译单元/DSO 每个 OS 线程只使用一张 TLS
+// 映射；模板局部静态变量可能悄悄为每个 DSO 创建不同映射。
 ThreadValueMap& ThreadValues() noexcept;
 
 }  // namespace go2cpp::fiber_local::detail
@@ -33,20 +32,19 @@ ThreadValueMap& ThreadValues() noexcept;
 namespace go2cpp {
 
 /**
- * A named value slot with Fiber-local lifetime.
+ * 具有 Fiber 局部生命周期的命名值槽。
  *
- * Values obtained inside a Fiber belong to that G, survive migration between
- * M threads, and are destroyed when the Fiber trampoline finishes. Calls made
- * outside a Fiber use a per-thread fallback destroyed at thread exit.
+ * 依赖：Fiber 提供当前 G，内部注册表保存值；Scheduler 迁移 G 时值随 G
+ * 迁移。对上层提供 GetOrCreate/TryGet/Reset。值在 Fiber 内属于该 G，跨 M
+ * 迁移仍然存在，并在 Fiber trampoline 结束时销毁；Fiber 外调用使用线程
+ * 局部后备值，于线程退出时销毁。
  *
- * Access the slot only from the current execution context. The registry is
- * mutex-protected for migration/teardown, but a raw T* returned by TryGet()
- * must not be retained after the current Fiber calls Reset or completes.
- * Value destructors should be noexcept and must not suspend the Fiber.
+ * 只能从当前执行上下文访问值槽。注册表在迁移/销毁时受互斥锁保护，
+ * 但 TryGet() 返回的裸 T* 在当前 Fiber 调用 Reset 或结束后不能继续保存。
+ * 值析构函数应为 noexcept，且不能挂起 Fiber。
  *
- * This stores values, not reusable Fiber stacks. Stack pooling is a separate
- * backend concern because a stack can finish on a different M and must retain
- * sanitizer/guard-page invariants.
+ * 该类存储值，不复用 Fiber 栈。栈池属于独立后端，因为栈可能在不同 M 上
+ * 结束，并且必须保持 sanitizer/保护页不变量。
  */
 template <typename T>
 class FiberLocalCache final {
@@ -54,10 +52,9 @@ class FiberLocalCache final {
 
 public:
     FiberLocalCache() noexcept : m_key(fiber_local::detail::AllocateKey()) {}
-    // Values intentionally outlive the key object and are reclaimed by the
-    // Fiber trampoline (or thread-exit TLS teardown). This avoids destroying a
-    // live Fiber's value merely because a cache wrapper went out of scope.
-    // Callers should keep a cache object alive while they still access it.
+    // 值刻意长于键对象，由 Fiber trampoline（或线程退出 TLS 清理）回收。
+    // 这样不会因为缓存包装器离开作用域就销毁仍存活 Fiber 的值。调用方在
+    // 仍需访问槽时应保持缓存对象存活。
     ~FiberLocalCache() = default;
 
     FiberLocalCache(const FiberLocalCache&) = delete;

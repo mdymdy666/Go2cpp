@@ -24,9 +24,8 @@ enum class ThreadHookMode : std::uint8_t {
     Enabled = kEnabled,
 };
 
-// A snapshot is observational. The scheduler pointer is non-owning and is only valid
-// while the associated Scheduler remains alive; querying the pointer does not
-// attach this thread to a worker or reserve a P.
+// 快照只用于观测。scheduler 指针不拥有对象，仅在关联 Scheduler 存活时有效；
+// 查询快照不会把线程挂接为 worker，也不会预留 P。
 struct ThreadPolicySnapshot {
     scheduler::Scheduler* scheduler{nullptr};
     ThreadParticipationMode participation{ThreadParticipationMode::kUnmanaged};
@@ -49,10 +48,16 @@ inline bool thread_participates_in_gmp() noexcept {
     return ThreadParticipatesInGMP();
 }
 
-// Marks the current OS thread as eligible for a scheduler policy for one scope.
-// This does not create an M, bind a P, install Scheduler::current_scheduler(),
-// or execute queued work. Move/destruction must stay on this same OS thread
-// because the state being restored is thread-local.
+// 在一个作用域内把当前 OS 线程标记为可参与调度器策略。它不会创建 M、
+// 绑定 P、安装 Scheduler::current_scheduler() 或执行队列任务。由于需要
+// 恢复线程局部状态，移动/析构必须发生在同一 OS 线程。
+/**
+ * 单个 OS 线程的 GMP 参与策略作用域。
+ *
+ * 依赖：Scheduler 身份和线程局部状态；对上层提供临时标记，使外部线程
+ * 可以声明自己是否允许参与 GMP。该类不创建 M/P、不执行任务，析构时恢复
+ * 进入前的 TLS 状态。
+ */
 class ScopedThreadParticipation final {
 public:
     explicit ScopedThreadParticipation(
@@ -67,8 +72,7 @@ public:
 
     ScopedThreadParticipation(const ScopedThreadParticipation&) = delete;
     ScopedThreadParticipation& operator=(const ScopedThreadParticipation&) = delete;
-    // TLS restoration is bound to the creating OS thread; do not move the
-    // scope into another thread or Fiber.
+    // TLS 恢复绑定到创建它的 OS 线程；不要把作用域移动到其他线程或 Fiber。
     ScopedThreadParticipation(ScopedThreadParticipation&&) = delete;
     ScopedThreadParticipation& operator=(ScopedThreadParticipation&&) = delete;
 
@@ -80,10 +84,15 @@ private:
 ThreadHookMode CurrentThreadHookMode() noexcept;
 void SetCurrentThreadHookMode(ThreadHookMode mode) noexcept;
 
-// Per-thread hook override. kInherit follows the process-wide hook switch;
-// kDisabled suppresses new cooperative admissions on this thread, while
-// kEnabled opts this thread into the hook path. Move/destruction must stay on
-// the same OS thread because the state being restored is thread-local.
+// 线程级 Hook 覆盖。kInherit 跟随进程级开关；kDisabled 禁止本线程新的
+// 协作式接纳；kEnabled 让本线程进入 Hook 路径。由于状态是线程局部的，
+// 移动/析构必须发生在同一 OS 线程。
+/**
+ * 单个 OS 线程的 Hook 开关作用域。
+ *
+ * 依赖：进程级 Hook 开关和线程局部覆盖；对上层提供继承、禁用或启用 Hook
+ * 的临时策略，析构时恢复之前的 TLS 状态。
+ */
 class ScopedThreadHookMode final {
 public:
     explicit ScopedThreadHookMode(ThreadHookMode mode) noexcept;
@@ -91,8 +100,7 @@ public:
 
     ScopedThreadHookMode(const ScopedThreadHookMode&) = delete;
     ScopedThreadHookMode& operator=(const ScopedThreadHookMode&) = delete;
-    // TLS restoration is bound to the creating OS thread; do not move the
-    // scope into another thread or Fiber.
+    // TLS 恢复绑定到创建它的 OS 线程；不要把作用域移动到其他线程或 Fiber。
     ScopedThreadHookMode(ScopedThreadHookMode&&) = delete;
     ScopedThreadHookMode& operator=(ScopedThreadHookMode&&) = delete;
 
@@ -103,13 +111,12 @@ private:
 
 namespace thread_policy::detail {
 
-// Called by scheduler worker entry/exit. This is a source-level hook, not an
-// ABI promise; external threads should use ScopedThreadParticipation and must
-// explicitly execute scheduler work through a future backend API.
+// 由调度器 worker 进入/退出时调用。这是源码级 Hook，不是 ABI 承诺；外部
+// 线程应使用 ScopedThreadParticipation，并通过未来后端 API 显式执行调度任务。
 void EnterRuntimeWorker(scheduler::Scheduler* scheduler) noexcept;
 void LeaveRuntimeWorker() noexcept;
 
-// Combines the process-wide hook switch with the current thread override.
+// 合并进程级 Hook 开关与当前线程覆盖选项。
 bool HookAllowed(bool process_enabled) noexcept;
 
 }  // namespace thread_policy::detail

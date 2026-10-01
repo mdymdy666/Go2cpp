@@ -76,10 +76,15 @@ struct FiberResumeResult {
     bool failed() const noexcept { return state == FiberState::Failed; }
 };
 
-// A movable execution stack with a protected guard page. A Fiber can migrate
-// between OS threads, provided resume() calls are sequential. The Linux
-// x86_64 build uses the internal context backend; other platforms may use
-// Boost.Context. The backend is not exposed by this interface.
+/**
+ * 可在受控边界挂起和恢复的用户态 Fiber。
+ *
+ * 依赖：内部 Context 后端提供寄存器/栈切换，Scheduler 负责把 Fiber 作为
+ * G 在 M/P 上排队；Fiber 不依赖调度器对象的生命周期，也不拥有 Scheduler。
+ * 对上层提供顺序 resume、主动 Suspend、取消标记、嵌套调用链快照和失败
+ * 结果。一个 Fiber 的 resume 调用必须串行；迁移到其他 OS 线程由调度器
+ * 保证。Linux x86_64 使用项目内的上下文后端，其他平台可由构建选择后端。
+ */
 class Fiber {
 public:
     using Function = std::function<void()>;
@@ -88,15 +93,22 @@ public:
         return 128U * 1024U;
     }
 
+    // 创建 Fiber。function 是主体回调；stack_size 是请求的栈容量（字节），
+    // 非法或过小值会由实现归一化为可用容量；构造失败会抛出异常。
     explicit Fiber(Function function,
                    std::size_t stack_size = DefaultStackSize());
     // Scheduler 专用的 FiberBin 接口。只有已经完成或失败、且不再有
     // 可恢复上下文的内部 G Fiber 才允许回收到创建它的 M 的线程本地池。
     // 普通用户 Fiber 不应调用这两个接口；它们不会跨线程转移仍挂起的
     // Fiber，也不会改变 Fiber 的公开所有权规则。
+    // 从调度器所属 M 的 FiberBin 获取或新建 Fiber。function 为新的主体，
+    // stack_size 为栈容量，bin_capacity 为回收池上限；返回拥有唯一所有权
+    // 的 Fiber 指针。
     static std::unique_ptr<Fiber> AcquireForScheduler(
         Function function, std::size_t stack_size,
         std::size_t bin_capacity = 32U);
+    // 把已终态且上下文已释放的 Fiber 放回当前 M 的缓存。fiber 为空或
+    // 不满足回收条件时会安全丢弃；bin_capacity 是缓存上限。
     static void RecycleForScheduler(std::unique_ptr<Fiber> fiber,
                                     std::size_t bin_capacity = 32U) noexcept;
     // 析构会请求取消并等待 Fiber 自然返回。Ready Fiber 会跳过主体；
@@ -112,9 +124,9 @@ public:
     Fiber(Fiber&&) = delete;
     Fiber& operator=(Fiber&&) = delete;
 
-    // Transfers control to this Fiber. Returns false for a running, completed,
-    // failed, or concurrently resumed Fiber. User exceptions never escape;
-    // they are retained by failure() and set state() to Failed.
+    // 转移执行权到本 Fiber。返回 false 表示 Fiber 正在运行、已经完成/失败
+    // 或被并发恢复；用户异常不会越过 Fiber 边界，而会保存到 failure()，
+    // 并将状态置为 Failed。
     bool resume() noexcept;
     // 调度器内部的快速恢复入口。G 已经由 Scheduler 串行化 resume，首次
     // 进入仍校验父级，后续恢复跳过重复的父链元数据锁；普通用户必须使用
@@ -124,8 +136,8 @@ public:
     // 按 try/catch 风格决定继续、转换错误或向上报告。
     FiberResumeResult resume_result() noexcept;
 
-    // Suspends the currently running Fiber. Returns false outside a Fiber or
-    // when reason is None. Execution continues here after the next resume().
+    // 挂起当前运行中的 Fiber。若当前线程不在 Fiber 中，或 reason 为 None，
+    // 返回 false；下一次 resume() 后从调用点继续执行。
     static bool Suspend(SuspendReason reason = SuspendReason::Yield) noexcept;
     // Scheduler 后端专用入口。当前实现与 Suspend 使用同一安全的上下文
     // 切换路径；独立出来是为了让 scheduler 在切换前先提交 G 的 park/
@@ -145,13 +157,17 @@ public:
     // 后也会重新记录该线程的实际绑定。
     static void BindCurrentExecution(
         FiberExecutionBinding binding) noexcept;
-    // Scheduler/task cancellation is cooperative. This sets the Fiber-local
-    // flag observed by CancellationRequested() before the next resume.
+    // Scheduler/Task 的取消是协作式的。该函数设置 Fiber 本地标记，主体在
+    // 下一次 resume 前后通过 CancellationRequested() 观察它。
     void RequestCancellation() noexcept;
 
+    // 查询当前状态；返回 FiberState 枚举值。
     FiberState state() const noexcept;
+    // 查询最近一次挂起原因；返回 SuspendReason 枚举值。
     SuspendReason suspend_reason() const noexcept;
+    // 返回 Fiber 捕获的异常；没有异常时返回空 exception_ptr。
     std::exception_ptr failure() const;
+    // 返回实际保留的栈容量（字节）。
     std::size_t stack_size() const noexcept;
 
     // Fiber 的唯一调试编号。编号只在当前进程内有意义，不复用。

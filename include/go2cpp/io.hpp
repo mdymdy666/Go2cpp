@@ -17,8 +17,14 @@ namespace go2cpp::io {
 
 struct DescriptorRegistryState;
 
-// A generation handle is captured before a nonblocking syscall and retained
-// until its wait completes. Numeric descriptor reuse never revives the handle.
+// 非阻塞系统调用前捕获的代际句柄，并一直保留到等待结束。数字 fd 被复用
+// 时不会重新激活旧句柄。
+/**
+ * fd 的代际令牌。
+ *
+ * 依赖：DescriptorRegistryState 的登记表；对上层/Hook 提供 fd、代际和
+ * 有效性查询。令牌不拥有 fd，只防止 close/复用后旧等待错误地唤醒。
+ */
 class DescriptorToken final {
 public:
     ~DescriptorToken();
@@ -38,9 +44,15 @@ private:
 
 using DescriptorTokenPtr = std::shared_ptr<const DescriptorToken>;
 
-// Short process-wide lifecycle gate. Never hold this guard across park or a
-// blocking syscall. Hooks hold it across invalidation plus close/dup2, and
-// IOManager holds it while validating a token and publishing epoll interest.
+// 进程级的短生命周期门。绝不能跨 park 或阻塞系统调用持有它。Hook 在
+// 失效标记与 close/dup2 期间持有；IOManager 在验证 token 并发布 epoll
+// interest 期间持有。
+/**
+ * fd 注册表的短生命周期保护。
+ *
+ * 依赖：DescriptorRegistryState 的递归互斥锁；对上层/Hook 提供 Capture
+ * 和 Invalidate 的原子窗口。不能跨阻塞系统调用或 Fiber park 持有。
+ */
 class DescriptorGuard final {
 public:
     DescriptorGuard();
@@ -126,16 +138,16 @@ struct WaitManyResult {
 };
 
 /**
- * Linux readiness manager for scheduler fibers.
+ * 面向调度器 Fiber 的 Linux fd 就绪管理器。
  *
- * IOManager owns its Scheduler. Wait() is valid only from a G currently
- * running on that scheduler. It registers readiness before parking the G, so
- * an event racing with park is retained by Scheduler's pending-wake token.
- *
- * Waiters for the same fd and direction are completed in FIFO order.
- * NotifyClose must be called before the actual close syscall; that is the hook
- * layer's contract and prevents a reused numeric fd from receiving a stale
- * readiness notification.
+ * 依赖：Scheduler 提供 G 的 park/wake 和 Timer/Context 的取消截止时间，
+ * DescriptorRegistryState 为 fd 提供代际校验，Linux epoll 提供读写就绪。
+ * 对上层提供单 fd、多 fd、超时、取消和关闭通知；不负责真正 read/write，
+ * 也不拥有调用方的 fd。Wait 只允许在当前 IOManager 管理的 G 中调用，
+ * 普通线程应使用系统 poll/select。就绪必须先注册再 park，竞态事件由
+ * Scheduler 的 pending 唤醒令牌保存；同一 fd/方向的等待按 FIFO 完成。
+ * Hook 层必须在真实 close 前调用 NotifyClose，避免数字 fd 复用后产生旧
+ * 事件误唤醒。
  */
 class IOManager final {
 public:
@@ -149,7 +161,9 @@ public:
     IOManager(const IOManager&) = delete;
     IOManager& operator=(const IOManager&) = delete;
 
+    // 启动内部 Scheduler 和 epoll 轮询线程；返回 true 表示本次完成启动。
     bool start();
+    // 停止接收新任务，唤醒等待者并回收内部线程；可重复调用。
     void shutdown();
     bool is_running() const noexcept;
 
@@ -162,20 +176,28 @@ public:
         return go(std::move(function));
     }
 
+    // 等待一个 fd 的读/写就绪。参数 fd 为数字描述符，event 为读或写，
+    // deadline 是可选的单调时钟截止点，context 可取消等待，token 用于
+    // 校验 fd 代际。返回 WaitResult：ready/timeout/cancelled/closed/error。
     WaitResult wait(int fd, IOEvent event,
                     std::optional<TimePoint> deadline = std::nullopt,
                     ContextPtr context = {},
                     DescriptorTokenPtr expected_descriptor = {});
+    // 以相对 timeout 等待 fd；timeout<=0 表示立即检查。其余参数和 wait
+    // 相同，返回值携带最终状态及 errno。
     WaitResult wait_for(int fd, IOEvent event, Duration timeout,
                         ContextPtr context = {});
 
-    // 一次等待多个 fd；仅允许在当前 IOManager 的 managed Fiber 中调用。
-    // 普通线程调用返回 kError/EPERM，应直接使用系统 poll/select。
+    // 一次等待多个 fd，返回第一个获胜项。requests 是 fd/方向请求列表，
+    // deadline/context 与 wait 相同；仅允许当前 IOManager 的 managed Fiber
+    // 调用，普通线程返回 kError/EPERM，应使用系统 poll/select。
     WaitAnyResult wait_any(const std::vector<WaitRequest>& requests,
                            std::optional<TimePoint> deadline = std::nullopt,
                            ContextPtr context = {});
     WaitAnyResult wait_any_for(const std::vector<WaitRequest>& requests,
                                Duration timeout, ContextPtr context = {});
+    // 等待多个请求中已经就绪的所有队头项，返回 ready_indices；它不是
+    // “所有请求都完成”的屏障。
     WaitManyResult wait_many(
         const std::vector<WaitRequest>& requests,
         std::optional<TimePoint> deadline = std::nullopt,
@@ -212,18 +234,18 @@ public:
         return wait_many_for(requests, timeout, std::move(context));
     }
 
-    // Explicit cancellation reports kCancelled. It does not close fd.
+    // 取消指定 fd/方向的等待并返回是否找到等待者；不会关闭 fd。
     bool cancel(int fd, IOEvent event);
     bool cancel_all(int fd);
     bool Cancel(int fd, IOEvent event) { return cancel(fd, event); }
     bool CancelAll(int fd) { return cancel_all(fd); }
 
-    // The hook layer calls this before the real close syscall. All current
-    // waiters receive kClosed/EBADF and stale epoll payloads are invalidated.
+    // Hook 层在真实 close 前调用。当前等待者收到 kClosed/EBADF，旧 epoll
+    // 载荷同时失效。
     bool notify_close(int fd);
     bool NotifyClose(int fd) { return notify_close(fd); }
-    // Safe cross-manager routing used by the hook; callbacks retain only weak
-    // State handles and do not dereference an IOManager during destruction.
+    // Hook 使用的跨 IOManager 安全路由；回调只保留 State 弱引用，析构中
+    // 不会解引用已经销毁的 IOManager。
     static void NotifyCloseAll(int fd) noexcept;
 
     Scheduler& scheduler() noexcept { return m_scheduler; }
@@ -231,7 +253,7 @@ public:
     Scheduler& GetScheduler() noexcept { return m_scheduler; }
     const Scheduler& GetScheduler() const noexcept { return m_scheduler; }
 
-    // Returns the manager which owns Scheduler::current_scheduler(), if any.
+    // 返回拥有 Scheduler::current_scheduler() 的 IOManager；没有时返回空。
     static IOManager* current() noexcept;
     static IOManager* Current() noexcept { return current(); }
 

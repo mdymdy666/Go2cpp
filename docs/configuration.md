@@ -1,14 +1,34 @@
-# Go2Cpp 配置
+# Go2Cpp 配置与热更新
 
 根目录的 `go2cpp.ini` 是可复制的默认模板。解析器支持 `[section]`、`key = value`、
 `#` 和 `;` 注释，不依赖 YAML。调用 `LoadRuntimeConfig` 后必须通过统一校验，校验
 失败应记录错误并停止启动调度器。
 
-调度器配置重点：`processor_count=0` 使用硬件并发数；`min_workers=0` 和
-`max_workers=0` 使用调度器自身的按需策略；显式 `max_workers` 不能超过 32，
-`min_workers` 不能小于 1（0 表示自动）。`local_queue_limit` 必须大于 0。
-`fiber_bin_capacity` 控制每个 M 的已完成 Fiber 对象缓存，默认 32，最大 4096，
-设置为 0 使用运行时默认值；它只影响分配回收，不改变 Fiber 的调度语义。
+配置文件使用简单的 `section`、`key = value` 格式。值在启动加载和热更新时都会
+进行类型与范围校验；被拒绝的变量保留旧值，不会将非法参数传给调度器。配置文件
+中其他已经通过校验的变量仍可能先完成更新，业务需要跨变量原子切换时应先停用
+配置监听，在业务锁内调用自有配置事务。
+
+调度器参数的正式范围如下：
+
+| 参数 | 默认值 | 允许范围 | 说明 |
+| --- | ---: | --- | --- |
+| `processor_count` | `0` | `0` 或 `1..32` | P 数量；0 使用硬件并发数。 |
+| `min_workers` | `0` | `0` 或 `1..32` | 最小 M 数量；0 使用运行时默认值 1。 |
+| `max_workers` | `0` | `0` 或 `1..32` | 最大 M 数量；0 按 P 和阻塞区策略计算。 |
+| `local_queue_limit` | `256` | `1..1048576` | 每个 P 的本地队列容量。 |
+| `fiber_stack_size` | `0` | `0` 或 `16384..67108864` 字节 | Fiber 初始栈；0 使用后端默认值。 |
+| `task_affinity_budget` | `4` | `0..1048576` | 同类任务优先留在最近 P 的次数预算。 |
+| `fiber_bin_capacity` | `32` | `0..4096` | 每个 M 缓存的已完成 Fiber 数量。 |
+| `idle_wait_ms` | `10` | `1..86400000` | 空闲 M 等待新任务的周期。 |
+| `idle_worker_timeout_ms` | `250` | `1..86400000` | 空闲 M 回收等待时间。 |
+| `sysmon_interval_ms` | `10` | `1..86400000` | sysmon 检查周期。 |
+| `long_syscall_threshold_ms` | `50` | `1..86400000` | 已声明阻塞区的长调用阈值。 |
+
+`allow_worker_oversubscription`、`enable_sysmon`、`pin_workers_to_cpu` 和
+`collect_metrics` 接受 `true/false`、`yes/no`、`on/off` 或 `1/0`。其中
+`collect_metrics=false` 只关闭累计指标，不改变调度语义；`fiber_bin_capacity`
+只影响对象复用，不改变 Fiber 生命周期和执行顺序。
 
 日志配置重点：`level` 默认 `warn`，`stdout` 默认 `false`，`directory` 默认 `log`，
 `file` 默认 `go2cpp.log`。程序中的典型启动顺序是：
@@ -55,9 +75,9 @@ if (!go2cpp::config::LoadAndWatch(config, "go2cpp.ini",
 一个 `RuntimeConfig` 对象；已经启动的 Scheduler 对 P/M 队列结构参数仍建议重新
 创建，避免在线改变队列拓扑。
 
-`RuntimeConfig` 由调用方持有时，必须保证它的生命周期覆盖 watcher 的整个运行期；
-停止 watcher 后再销毁该对象。通常每个配置中心只调用一次 `BindLoggingConfig` 和
-`BindRuntimeConfig`，避免重复注册监听器。不要在 watcher 自己的监听器回调中再次
+`RuntimeConfig` 由调用方持有时，必须保证它的生命周期覆盖配置监听的整个运行期；
+停止配置监听后再销毁该对象。通常每个配置中心只调用一次 `BindLoggingConfig` 和
+`BindRuntimeConfig`，避免重复注册监听器。不要在配置监听自己的回调中再次
 调用 `StartWatcher` 或 `StopWatcher`，需要重启时应由其他管理线程执行。
 `BindRuntimeConfig` 的监听器会更新目标对象字段；如果业务线程同时直接读取这些
 公开字段，调用方必须用自己的互斥量或在停用 watcher 后读取。Scheduler 已启动后

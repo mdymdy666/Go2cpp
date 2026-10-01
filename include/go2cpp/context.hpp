@@ -29,7 +29,13 @@ namespace detail {
 struct DoneSignalAccess;
 }
 
-/** A close-only, copyable notification corresponding to Context.Done(). */
+/**
+ * 只关闭一次、可复制的完成通知。
+ *
+ * 依赖：内部共享状态和 ParkingCondition；Context 以它表示 Done 信号。
+ * 对上层提供等待、截止时间等待及一次性回调注册，复制对象共享同一
+ * 信号状态；回调始终在信号锁外执行。
+ */
 class DoneSignal {
 public:
     using CallbackId = std::uint64_t;
@@ -41,18 +47,21 @@ public:
     DoneSignal& operator=(DoneSignal&&) noexcept = default;
     ~DoneSignal();
 
+    // 无限等待信号关闭。
     void Wait() const;
+    // 最多等待 timeout；返回 true 表示已经关闭。
     bool WaitFor(ContextDuration timeout) const;
+    // 等待到单调时钟 deadline；返回 true 表示已经关闭。
     bool WaitUntil(ContextTimePoint deadline) const;
+    // 查询信号是否已关闭，不阻塞。
     bool IsDone() const noexcept;
 
     bool wait_for(ContextDuration timeout) const { return WaitFor(timeout); }
     bool wait_until(ContextTimePoint deadline) const { return WaitUntil(deadline); }
     bool is_done() const noexcept { return IsDone(); }
 
-    // Callbacks are invoked at most once and always outside the signal lock.
-    // Call RemoveCallback before releasing the last owner when a callback
-    // captures that owner; the signal cannot infer callback ownership.
+    // 注册最多执行一次且在信号锁外调用的回调。若回调捕获了自身的最后
+    // owner，应先调用 RemoveCallback；信号无法推断回调的对象所有权。
     CallbackId AddCallback(std::function<void()> callback) const;
     void RemoveCallback(CallbackId id) const;
 
@@ -67,7 +76,11 @@ private:
     friend struct detail::DoneSignalAccess;
 };
 
-/** A typed identity key. Copies preserve identity; separate keys never collide. */
+/**
+ * Context 的类型化身份键。复制键保持同一身份，不同键不会碰撞。
+ * 依赖：shared_ptr 锚点维持键身份；Context 通过 Identity 查找值。
+ * 对上层提供类型安全的 Value 查询，Name 仅用于调试元数据。
+ */
 template <typename T>
 class ContextKey {
 public:
@@ -76,8 +89,8 @@ public:
 
     const std::string& Name() const noexcept { return m_name; }
     const void* Identity() const noexcept { return m_token.get(); }
-    // The context node retains this anchor while a typed value is present.
-    // That prevents allocator address reuse from making a later key collide.
+    // Context 节点在类型化值存在期间保留此锚点，避免分配器复用地址让
+    // 后续键发生碰撞。
     std::shared_ptr<const std::uint64_t> Anchor() const noexcept {
         return m_token;
     }
@@ -87,12 +100,24 @@ private:
     std::string m_name;
 };
 
+/**
+ * 可取消的父子上下文。
+ *
+ * 依赖：DoneSignal 负责通知，Error 表示取消原因，steady_clock 提供截止
+ * 时间，ContextRollback 可把临时子上下文和局部补偿动作绑定。
+ * 对上层提供 Background/TODO、WithCancel、WithDeadline、WithTimeout、
+ * WithValue、Done/Err/Cause/Value。Context 只管理取消树和值的生命周期，
+ * 不拥有 Scheduler、Fiber 或用户资源；取消是幂等的，子节点只能从父节点
+ * 继承取消而不能反向取消父节点。
+ */
 class Context final {
 public:
     using Clock = std::chrono::steady_clock;
     using NowFunction = std::function<ContextTimePoint()>;
     struct State;
 
+    // 返回永不自动取消的根上下文；Background 用于正式运行，TODO 用于
+    // 尚未确定父级的占位。
     static ContextPtr Background();
     static ContextPtr TODO();
 
@@ -112,25 +137,31 @@ public:
                                 std::any(std::move(value)));
     }
 
-    // String keys are provided for dynamically translated code. Typed keys
-    // are preferred because their identity cannot collide accidentally.
+    // 字符串键用于动态转译代码；优先使用类型化键，因为其身份不会意外
+    // 与父链中的其他键碰撞。
     static ContextPtr WithValue(const ContextPtr& parent, std::string key,
                                 std::any value);
 
+    // 返回只读 Done 信号；取消发生后所有等待者都会被唤醒。
     const DoneSignal& Done() const noexcept { return m_done; }
     DoneSignal& Done() noexcept { return m_done; }
+    // 查询是否已取消；返回值是当前快照。
     bool IsDone() const noexcept;
+    // 返回标准取消错误；未取消时返回空。
     ErrorPtr Err() const;
+    // 返回最初取消原因；未取消时返回空。
     ErrorPtr Cause() const;
+    // 返回截止时间；没有截止时间时为空。
     std::optional<ContextTimePoint> Deadline() const;
+    // 查询是否设置了截止时间。
     bool HasDeadline() const;
 
     std::any Value(const std::string& key) const;
 
     template <typename T>
     std::optional<T> Value(const ContextKey<T>& key) const {
-        // Typed lookup uses identity only; a string name is metadata and must
-        // not let unrelated keys collide across a parent chain.
+        // 类型化查询只比较 Identity；字符串名称只是元数据，不能让无关
+        // 的键在父链中发生碰撞。
         const std::any value = LookupValue(key.Identity(), {});
         if (!value.has_value()) {
             return std::nullopt;
@@ -142,12 +173,14 @@ public:
         return *converted;
     }
 
-    // Cancellation is idempotent. A null cause maps to CanceledError().
+    // 取消操作幂等；cause 为空时映射为 CanceledError()。
+    // 幂等取消当前上下文及其子树；cause 为空时使用 CanceledError。
     void Cancel(ErrorPtr cause = {});
+    // 以 DeadlineExceededError 取消当前上下文及其子树。
     void CancelDeadline();
 
-    // Tests and embedders may inject a monotonic clock for timeout creation.
-    // Existing timers retain their already calculated deadline.
+    // 测试和嵌入方可以注入单调时钟以创建超时；已经创建的定时器仍保留
+    // 原先计算出的截止时间。
     static void SetNowFunctionForTesting(NowFunction now);
     static void ResetNowFunctionForTesting();
     static ContextTimePoint Now();

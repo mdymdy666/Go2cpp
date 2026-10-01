@@ -582,6 +582,14 @@ struct FutureResult<void> {
 template <typename T>
 class Future;
 
+/**
+ * Future 的一次性生产端。
+ *
+ * 依赖：detail::FutureState 保存共享状态，Context/DoneSignal 负责取消和
+ * 等待唤醒，Error/exception_ptr 表示失败。对上层提供 SetValue、SetError、
+ * SetException、Cancel；Promise 析构时若仍未完成会发布 BrokenPromise，
+ * 保证消费者不会永久等待。Promise 不能复制，只能移动。
+ */
 template <typename T>
 class Promise final {
 public:
@@ -611,11 +619,13 @@ public:
     bool valid() const noexcept { return static_cast<bool>(m_state); }
     bool Valid() const noexcept { return valid(); }
 
+    // 返回与本 Promise 共享状态的 Future；多次调用得到的 Future 可并行等待。
     Future<T> GetFuture() const noexcept;
     Future<T> future() const noexcept { return GetFuture(); }
 
     template <typename U = T,
               typename = std::enable_if_t<!std::is_void_v<U>>>
+    // 发布成功值；只有第一个终态写入者返回 true，后续写入返回 false。
     bool SetValue(U value) {
         return m_state && m_state->SetValue(std::move(value));
     }
@@ -626,12 +636,15 @@ public:
         return m_state && m_state->SetValue();
     }
 
+    // 发布错误值；error 为空时由实现生成参数错误。
     bool SetError(ErrorPtr error) {
         return m_state && m_state->SetError(std::move(error));
     }
+    // 发布异常指针；空指针会转换为错误状态。
     bool SetException(std::exception_ptr exception) {
         return m_state && m_state->SetException(std::move(exception));
     }
+    // 发布取消终态；error 为空时使用 CanceledError。
     bool Cancel(ErrorPtr error = {}) {
         return m_state && m_state->Cancel(std::move(error));
     }
@@ -653,6 +666,14 @@ private:
     friend class Future<T>;
 };
 
+/**
+ * Future 的共享消费端。
+ *
+ * 依赖：Promise/ detail::FutureState 的一次性终态，Context 的取消和
+ * Deadline。对上层提供等待、超时等待、状态查询和 FutureResult；默认只
+ * 返回状态，不主动抛异常，调用者明确使用 GetOrThrow 时才转换为异常。
+ * Future 可复制并在线程与 Fiber 间共享，底层值在终态后保持只读。
+ */
 template <typename T>
 class Future final {
 public:
@@ -661,10 +682,12 @@ public:
     bool valid() const noexcept { return static_cast<bool>(m_state); }
     bool Valid() const noexcept { return valid(); }
 
+    // 无限等待终态；返回 FutureStatus。
     FutureStatus Wait(const ContextPtr& context = {}) const {
         return WaitUntil(context, std::nullopt);
     }
 
+    // 最多等待 timeout；超时只影响本次等待，不改变 Future 状态。
     FutureStatus WaitFor(ContextDuration timeout,
                          const ContextPtr& context = {}) const {
         return WaitUntil(context, detail::DeadlineAfter<T>(timeout));
@@ -679,10 +702,12 @@ public:
         return m_state->Wait(context, detail::MergeDeadline<T>(context, deadline));
     }
 
+    // 等待并返回值/错误/异常的结构化结果，不抛出异常。
     FutureResult<T> GetResult(const ContextPtr& context = {}) const {
         return GetResultUntil(context, std::nullopt);
     }
 
+    // 带相对超时取得结构化结果；超时返回 kTimedOut 或 kDeadlineExceeded。
     FutureResult<T> GetResultFor(ContextDuration timeout,
                                  const ContextPtr& context = {}) const {
         return GetResultUntil(context, detail::DeadlineAfter<T>(timeout));
@@ -711,10 +736,12 @@ public:
         return result;
     }
 
+    // 零超时探测当前结果；未完成时立即返回超时状态。
     FutureResult<T> TryGet() const {
         return GetResultFor(ContextDuration::zero());
     }
 
+    // 返回共享状态的当前终态快照；无状态 Future 返回 kInvalid。
     FutureStatus Status() const noexcept {
         return m_state ? m_state->Status() : FutureStatus::kInvalid;
     }

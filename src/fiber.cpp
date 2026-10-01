@@ -144,8 +144,8 @@ FiberContextFrame main_context_frame(
     return frame;
 }
 
-// Keep TLS address lookup outside the function that suspends. A compiler may
-// otherwise cache __errno_location() across a cross-thread context switch.
+// 将 TLS 地址查找放在挂起函数之外。否则编译器可能在跨线程上下文切换后仍
+// 缓存 __errno_location() 的结果。
 GO2CPP_FIBER_NOINLINE int load_errno() noexcept { return errno; }
 
 GO2CPP_FIBER_NOINLINE void store_errno(int value) noexcept { errno = value; }
@@ -565,24 +565,23 @@ struct Fiber::Impl {
                 self->m_function();
             }
         } catch (...) {
-            // This boundary contains accidental user throws only. Fiber
-            // suspension, cancellation and cleanup never use exceptions.
+            // 这里只隔离用户代码意外抛出的异常。Fiber 挂起、取消和清理流程
+            // 从不使用异常。
             std::lock_guard<std::mutex> lock(self->m_failure_mutex);
             self->m_failure = std::current_exception();
             terminal_state = FiberState::Failed;
         }
         self->m_function = {};
-        // Fiber-local values belong to the logical G, not to the worker M.
-        // Run their destructors after the body has unwound and before handing
-        // control back to the caller.
+        // Fiber-local 值属于逻辑 G，而不是 worker M。主体栈展开后、把控制权
+        // 交回调用者前，执行这些值的析构函数。
         fiber_local::detail::Cleanup(self->m_owner);
         self->m_record->reason.store(SuspendReason::None, std::memory_order_release);
         self->m_record->state.store(terminal_state, std::memory_order_release);
         self->m_saved_errno = load_errno();
 
 #if defined(GO2CPP_FIBER_ASAN)
-        // A completed execution stack is never resumed; discard its fake
-        // stack before the caller releases the protected allocation.
+        // 已完成的执行栈不会再次恢复；在调用者释放受保护分配前先丢弃 fake
+        // stack。
         __sanitizer_start_switch_fiber(nullptr, self->m_asan_caller_bottom,
                                       self->m_asan_caller_size);
 #endif
@@ -758,10 +757,9 @@ struct Fiber::Impl {
                                 ? nullptr
                                 : transfer.context;
                 if (m_context == nullptr) {
-                    // entry() has unwound all user frames before returning to
-                    // the caller. The protected stack can now be returned to
-                    // the per-thread/global cache immediately, avoiding one
-                    // mapping per queued Fiber in burst workloads.
+                    // entry() 返回调用者前已经展开全部用户栈帧。现在可以立即
+                    // 把受保护栈放回线程级或全局缓存，避免突发负载中每个排队
+                    // Fiber 都重新建立一次映射。
                     m_stack.reset();
                 }
             }
@@ -842,8 +840,8 @@ struct Fiber::Impl {
 
     void finish_switch_to_fiber() noexcept {
 #if defined(GO2CPP_FIBER_ASAN)
-        // On migration these outputs describe the newly resuming OS thread,
-        // not the thread that last suspended this Fiber.
+        // 迁移后这些输出描述的是当前恢复 Fiber 的新 OS 线程，而不是上次
+        // 挂起该 Fiber 的线程。
         __sanitizer_finish_switch_fiber(m_asan_fake_stack, &m_asan_caller_bottom,
                                        &m_asan_caller_size);
 #endif

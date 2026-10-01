@@ -189,10 +189,9 @@ auto invoke_real(Function function, Args&&... args)
     return function(std::forward<Args>(args)...);
 }
 
-// A disabled/unavailable IOManager still needs to account for a native call
-// made by a managed G. The region is a no-op on ordinary threads and on a
-// worker that is already inside another declared region. It lets the scheduler
-// publish M::Blocking and admit a replacement M before the syscall sleeps.
+// 被禁用或不可用的 IOManager 仍需记录 managed G 发起的原生调用。普通线程
+// 以及已经处于另一个声明区域内的 worker 会走空操作。该区域让 Scheduler 在
+// 系统调用休眠前发布 M::Blocking，并接纳替代的 M。
 template <typename Function, typename... Args>
 auto invoke_native_blocking(Function function, Args&&... args)
     -> decltype(function(std::forward<Args>(args)...)) {
@@ -316,9 +315,8 @@ std::shared_ptr<Descriptor> adopt_socket(int fd) {
         return {};
     }
 
-    // Serialize first adoption. Otherwise one adopter could observe the
-    // O_NONBLOCK bit installed by another and incorrectly classify it as a
-    // user request.
+    // 串行化第一次接管。否则一个接管者可能观察到另一个接管者设置的
+    // O_NONBLOCK 位，并错误地将其识别为用户请求。
     std::lock_guard<std::mutex> lock(s_descriptors_mutex);
     const auto found = s_descriptors.find(fd);
     if (found != s_descriptors.end()) {
@@ -359,8 +357,8 @@ std::shared_ptr<Descriptor> try_adopt_socket(int fd) noexcept {
     try {
         return adopt_socket(fd);
     } catch (...) {
-        // Metadata is an optimization around the real syscall. If allocation
-        // fails, leave the fd usable and let the caller fall back to libc.
+        // 元数据只是围绕真实系统调用的优化。分配失败时保持 fd 可用，让调用者
+        // 回退到 libc。
         return {};
     }
 }
@@ -401,8 +399,8 @@ void try_register_new_socket(int fd, bool user_nonblocking) noexcept {
     try {
         register_new_socket(fd, user_nonblocking);
     } catch (...) {
-        // The socket syscall already succeeded. An untracked descriptor can
-        // be adopted lazily by a later managed operation.
+        // socket 系统调用已经成功。未跟踪的描述符可以在后续 managed 操作中
+        // 延迟接管。
     }
 }
 
@@ -486,20 +484,17 @@ void try_clone_descriptor(int old_fd, int new_fd) noexcept {
     try {
         clone_descriptor(old_fd, new_fd);
     } catch (...) {
-        // Do not let a C++ allocation failure cross the C ABI. Remove any
-        // stale target entry; the next managed call may adopt it afresh.
+        // 不要让 C++ 分配失败越过 C ABI。移除过期的目标条目；下一次 managed
+        // 调用可以重新接管该描述符。
         std::lock_guard<std::mutex> lock(s_descriptors_mutex);
         s_descriptors.erase(new_fd);
     }
 }
 
-// dup2/dup3 close the target as part of the kernel operation. The hook must
-// publish that close before entering the syscall so an epoll event for the
-// previous open-file description cannot win the one-shot wait claim. If the
-// kernel rejects an otherwise valid replacement, the target remains open on
-// Linux; rebuild its descriptor token so subsequent managed calls can adopt
-// it again. Waiters already woken by the preflight close intentionally keep
-// their terminal result.
+// dup2/dup3 会把关闭目标作为内核操作的一部分。Hook 必须在进入系统调用前
+// 发布关闭，防止旧 open-file description 的 epoll 事件赢得一次性等待。若
+// Linux 内核拒绝本来有效的替换，目标仍保持打开；重新建立描述符 token，
+// 让后续 managed 调用可以再次接管。预检关闭已经唤醒的 waiter 保留其终态结果。
 void restore_failed_replacement(
     int fd, const std::shared_ptr<Descriptor>& descriptor) noexcept {
     if (!descriptor) {
@@ -509,9 +504,8 @@ void restore_failed_replacement(
     try {
         token = DescriptorGuard::Capture(fd);
     } catch (...) {
-        // Drop the stale entry if recovery itself runs out of memory. A later
-        // managed operation can then adopt the still-live descriptor instead
-        // of being permanently trapped behind a false closed flag.
+        // 如果恢复过程本身内存不足，丢弃过期条目。后续 managed 操作可以接管
+        // 仍存活的描述符，而不会被错误的 closed 标志永久阻塞。
     }
     if (token) {
         std::lock_guard<std::mutex> lock(descriptor->m_mutex);
@@ -590,9 +584,9 @@ std::optional<IOManager::TimePoint> deadline_from_timeout(
 int native_wait(int fd, IOEvent event,
                 const std::optional<IOManager::TimePoint>& deadline,
                 const std::shared_ptr<Descriptor>& descriptor) {
-    // poll on another thread is not reliably interrupted by close. Bounded
-    // poll slices let the retained generation detect close without retaining
-    // an IOManager or waiting forever on a reused numeric descriptor.
+    // 另一个线程中的 poll 不一定会被 close 可靠中断。有限时长的 poll 切片让
+    // 保留的代次检测 close，同时不持有 IOManager，也不会在复用的数字描述符
+    // 上永久等待。
     for (;;) {
         {
             DescriptorGuard lifecycle;
@@ -604,14 +598,12 @@ int native_wait(int fd, IOEvent event,
         if (deadline) {
             const auto now = IOManager::Clock::now();
             if (*deadline <= now) {
-                // The original blocking socket contract reports a socket
-                // timeout, not the internal nonblocking probe result.
+                // 原始阻塞 socket 契约报告 socket 超时，而不是内部非阻塞探测结果。
                 return ETIMEDOUT;
             }
             const auto remaining = *deadline - now;
-            // Poll in short slices so close/fd-reuse is observed promptly.
-            // Bound before converting: TimePoint::max() can exceed the
-            // representable range of a millisecond duration.
+            // 用短切片轮询，及时观察 close 或 fd 复用。转换前先限制范围：
+            // TimePoint::max() 可能超出毫秒 duration 的可表示范围。
             const auto slice = std::min(
                 remaining,
                 std::chrono::duration_cast<IOManager::Clock::duration>(
@@ -658,9 +650,8 @@ Result cooperative_io(int fd, Function function, IOEvent event,
         (hooks_enabled() && s_real_call_depth == 0 &&
          go2cpp::Scheduler::current_task() != nullptr &&
          go2cpp::Fiber::Current() != nullptr);
-    // A managed Fiber without an IOManager uses the same descriptor metadata
-    // and native poll fallback when hooks are enabled. A disabled hook keeps
-    // the caller's native blocking choice, but still accounts the M below.
+    // 启用 Hook 时，没有 IOManager 的 managed Fiber 使用相同的描述符元数据和
+    // 原生 poll 回退。禁用 Hook 时保留调用者的原生阻塞选择，但仍在下方记录 M。
     std::optional<go2cpp::BlockingRegion> blocking_region;
     if (manager == nullptr && go2cpp::Scheduler::current_task() != nullptr) {
         blocking_region.emplace();
@@ -748,9 +739,8 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
         (hooks_enabled() && s_real_call_depth == 0 &&
          go2cpp::Scheduler::current_task() != nullptr &&
          go2cpp::Fiber::Current() != nullptr);
-    // A managed Fiber without an IOManager can still use bounded native poll
-    // fallback when hooks are enabled. A disabled hook keeps native semantics
-    // and only publishes M::Blocking.
+    // 启用 Hook 时，没有 IOManager 的 managed Fiber 仍可使用有限时长的原生
+    // poll 回退。禁用 Hook 时保留原生语义，只发布 M::Blocking。
     std::optional<go2cpp::BlockingRegion> blocking_region;
     if (manager == nullptr && go2cpp::Scheduler::current_task() != nullptr) {
         blocking_region.emplace();
@@ -788,10 +778,8 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
         return result;
     }
 
-    // The configured connect timeout also applies to the native poll fallback
-    // after managed lazy adoption. If metadata allocation fails, or hooks are
-    // explicitly disabled, the original libc call remains the documented
-    // native-blocking boundary.
+    // 配置的 connect 超时同样适用于 managed 延迟接管后的原生 poll 回退。若
+    // 元数据分配失败或显式禁用 Hook，原始 libc 调用仍是文档规定的原生阻塞边界。
     const auto deadline =
         deadline_from_timeout(connect_wait_timeout(descriptor));
     const auto token = snapshot_descriptor(descriptor).m_token;
@@ -1243,9 +1231,8 @@ ssize_t readv(int fd, const iovec* vectors, int count) {
 
 ssize_t recv(int fd, void* buffer, size_t length, int flags) {
     initialize_originals();
-    // MSG_WAITALL requires byte-count accumulation across multiple reads;
-    // the bounded hook does not emulate that contract. Preserve libc's exact
-    // behavior rather than silently returning a short read after one wake.
+    // MSG_WAITALL 需要跨多次读取累计字节数；有限 Hook 不模拟该契约。保留
+    // libc 的确切行为，不要在一次唤醒后静默返回短读。
 #ifdef MSG_WAITALL
     if ((flags & MSG_WAITALL) != 0 && s_originals.m_recv) {
         if (cooperative_manager() != nullptr) {
@@ -1256,9 +1243,8 @@ ssize_t recv(int fd, void* buffer, size_t length, int flags) {
     }
 #endif
 #ifdef MSG_OOB
-    // EPOLLPRI is intentionally outside this bounded readiness surface. Do
-    // not park a managed G waiting for an urgent-data event the poller cannot
-    // report; ordinary threads retain libc's native semantics.
+    // EPOLLPRI 有意不属于当前有限的就绪能力。不要让 managed G 等待 poller
+    // 无法报告的紧急数据事件；普通线程保留 libc 的原生语义。
     if ((flags & MSG_OOB) != 0 && cooperative_manager() != nullptr) {
         errno = ENOTSUP;
         return static_cast<ssize_t>(-1);
@@ -1358,8 +1344,8 @@ int close(int fd) {
         plan = prepare_close(fd);
         notify_before_close(fd);
     }
-    // Do not hold the process-wide descriptor lifecycle gate across the real
-    // close: SO_LINGER and filesystem-backed descriptors may block here.
+    // 不要在真实 close 期间持有进程级描述符生命周期门；SO_LINGER 和文件系统
+    // 描述符可能在此处阻塞。
     const int result = s_originals.m_close
                            ? invoke_native_blocking(s_originals.m_close, fd)
                            : invoke_native_blocking(&raw_close_fallback, fd);
@@ -1391,15 +1377,14 @@ int dup2(int old_fd, int new_fd) {
         return -1;
     }
     DescriptorGuard lifecycle;
-    // dup2(old, old) is a documented no-op. Do not invalidate the descriptor
-    // token or wake an unrelated waiter in that case.
+    // dup2(old, old) 按文档是空操作。此时不要使描述符 token 失效，也不要
+    // 唤醒无关的 waiter。
     if (old_fd == new_fd || new_fd < 0 || !source_fd_is_valid(old_fd)) {
         return invoke_real(s_originals.m_dup2, old_fd, new_fd);
     }
 
-    // The target is closed by the kernel as part of dup2. Publish that close
-    // while the descriptor lifecycle gate is held, before the replacement
-    // syscall can produce a stale readiness event for the old description.
+    // 目标由内核作为 dup2 的一部分关闭。在持有描述符生命周期门时发布关闭，
+    // 之后替换系统调用才不会为旧描述产生过期就绪事件。
     const ClosePlan plan = prepare_close(new_fd);
     notify_before_close(new_fd);
     const int result = invoke_real(s_originals.m_dup2, old_fd, new_fd);
@@ -1407,8 +1392,8 @@ int dup2(int old_fd, int new_fd) {
         finish_close(new_fd, plan.m_descriptor);
         try_clone_descriptor(old_fd, result);
     } else {
-        // A valid source plus a valid target normally makes dup2 infallible on
-        // Linux. Preserve metadata if the kernel nevertheless rejects it.
+        // 有效源和有效目标通常使 Linux 上的 dup2 不会失败。若内核仍拒绝操作，
+        // 保留元数据。
         restore_failed_replacement(new_fd, plan.m_descriptor);
     }
     return result;
@@ -1421,9 +1406,8 @@ int dup3(int old_fd, int new_fd, int flags) {
         return -1;
     }
     DescriptorGuard lifecycle;
-    // dup3 rejects identical descriptors and unknown flags without touching
-    // the target. Avoid a spurious close notification for those deterministic
-    // failures; source validation also keeps dup3(-1, target, ...) transparent.
+    // dup3 会在不触碰目标的情况下拒绝相同描述符和未知标志。对这些确定性失败
+    // 不要发出伪关闭通知；源校验也让 dup3(-1, target, ...) 保持透明。
     if (old_fd == new_fd || new_fd < 0 ||
         (flags & ~O_CLOEXEC) != 0 || !source_fd_is_valid(old_fd)) {
         return invoke_real(s_originals.m_dup3, old_fd, new_fd, flags);
@@ -1450,8 +1434,8 @@ int fcntl(int fd, int command, ...) {
 
     const FcntlArgument kind = fcntl_argument(command);
     if (kind == FcntlArgument::Unknown) {
-        // Reading an unknown variadic argument is undefined behavior. Hosts
-        // needing additional commands must add their exact argument contract.
+        // 读取未知的可变参数属于未定义行为。需要额外命令的宿主必须补充其
+        // 确切的参数契约。
         errno = ENOTSUP;
         return -1;
     }
@@ -1528,21 +1512,18 @@ int ioctl(int fd, unsigned long request, ...) {
         DescriptorGuard lifecycle;
         auto descriptor = descriptor_for(fd);
         if (descriptor && argument) {
-            // Let the kernel validate/read the caller's pointer first. A
-            // wrapper-side dereference would turn the normal EFAULT contract
-            // into a process crash for an invalid user address.
+            // 先让内核校验并读取调用者指针。Wrapper 侧解引用会把正常的 EFAULT
+            // 契约变成无效用户地址导致的进程崩溃。
             const int result =
                 invoke_real(s_originals.m_ioctl, fd, request, argument);
             if (result != 0) {
                 return result;
             }
 
-            // Recover the requested state through the kernel-visible flags,
-            // then restore the runtime O_NONBLOCK bit. This avoids touching
-            // the user pointer while preserving the shared open-description
-            // metadata used by cooperative_io(). If raw fcntl is unavailable
-            // or fails, a local FIONBIO request is used as a final restore
-            // attempt; failure is recorded conservatively below.
+            // 通过内核可见标志恢复请求的状态，再恢复运行时的 O_NONBLOCK 位。
+            // 这样既不触碰用户指针，又保留 cooperative_io() 使用的共享打开
+            // 描述元数据。如果原始 fcntl 不可用或失败，最后尝试使用本地
+            // FIONBIO 请求恢复；失败情况在下方按保守策略记录。
             bool user_nonblocking = false;
             bool system_nonblocking = false;
             if (s_originals.m_fcntl) {

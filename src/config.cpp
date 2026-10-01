@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <sstream>
 #include <iostream>
+#include <string_view>
 
 namespace go2cpp::config {
 namespace {
@@ -40,10 +41,72 @@ bool ParseBool(const std::string& text, bool* value) {
     return true;
 }
 
+// 配置文件是外部输入。这里集中定义上限，避免某一个模块单独放宽
+// 参数后造成过量线程、内存或超长等待。0 只在文档明确说明时表示自动。
+constexpr std::size_t kMaxWorkers = 32U;
+constexpr std::size_t kMaxLocalQueue = 1U << 20U;
+constexpr std::size_t kMinFiberStack = 16U * 1024U;
+constexpr std::size_t kMaxFiberStack = 64U * 1024U * 1024U;
+constexpr std::size_t kMaxAffinityBudget = 1U << 20U;
+constexpr auto kMaxDuration = std::chrono::hours(24);
+constexpr std::size_t kMaxDurationMilliseconds =
+    static_cast<std::size_t>(std::chrono::duration_cast<std::chrono::milliseconds>(kMaxDuration).count());
+
+bool ValidateSchedulerSize(const char* key, std::size_t value,
+                           std::string* error) {
+    const auto fail = [error, key](const std::string& reason) {
+        if (error) *error = std::string("scheduler.") + key + reason;
+        return false;
+    };
+    if (std::string_view(key) == "processor_count" ||
+        std::string_view(key) == "min_workers" ||
+        std::string_view(key) == "max_workers") {
+        return value == 0 || value <= kMaxWorkers
+                   ? true
+                   : fail(" 不能超过 32");
+    }
+    if (std::string_view(key) == "local_queue_limit") {
+        if (value == 0) return fail(" 必须大于 0");
+        return value <= kMaxLocalQueue ? true : fail(" 不能超过 1048576");
+    }
+    if (std::string_view(key) == "fiber_stack_size") {
+        if (value == 0) return true;
+        if (value < kMinFiberStack) return fail(" 小于 16384 时可能无法建立安全栈");
+        return value <= kMaxFiberStack ? true : fail(" 不能超过 67108864");
+    }
+    if (std::string_view(key) == "task_affinity_budget") {
+        return value <= kMaxAffinityBudget ? true : fail(" 不能超过 1048576");
+    }
+    if (std::string_view(key) == "fiber_bin_capacity") {
+        return value <= 4096U ? true : fail(" 不能超过 4096");
+    }
+    return true;
+}
+
+bool ValidateDuration(const char* key, std::size_t value, std::string* error) {
+    if (value == 0) {
+        if (error) *error = std::string("scheduler.") + key + " 必须大于 0 毫秒";
+        return false;
+    }
+    if (value > kMaxDurationMilliseconds) {
+        if (error) *error = std::string("scheduler.") + key + " 不能超过 24 小时";
+        return false;
+    }
+    return true;
+}
+
 bool ReadSize(const IniFile& ini, const char* section, const char* key,
               std::size_t* target, std::string* error) {
     if (!ini.Has(section, key)) return true;
-    if (ParseSize(ini.Get(section, key), target)) return true;
+    if (ParseSize(ini.Get(section, key), target)) {
+        // 静态配置和热更新必须使用同一套范围规则；这样错误会在
+        // 读取具体字段时报告，而不是等到调度器已经部分初始化后才发现。
+        if (std::string_view(section) == "scheduler" &&
+            ValidateSchedulerSize(key, *target, error)) {
+            return true;
+        }
+        return false;
+    }
     if (error) *error = std::string("配置项不是非负整数: ") + section + "." + key;
     return false;
 }
@@ -112,13 +175,14 @@ bool RuntimeConfig::FromIni(const IniFile& ini, RuntimeConfig* config, std::stri
         !ReadSize(ini, "scheduler", "task_affinity_budget", &result.scheduler.task_affinity_budget, error) ||
         !ReadSize(ini, "scheduler", "fiber_bin_capacity", &result.scheduler.fiber_bin_capacity, error)) return false;
     std::size_t value = 0;
-    if (ini.Has("scheduler", "idle_wait_ms")) { if (!ReadSize(ini, "scheduler", "idle_wait_ms", &value, error)) return false; result.scheduler.idle_wait = std::chrono::milliseconds(value); }
-    if (ini.Has("scheduler", "idle_worker_timeout_ms")) { if (!ReadSize(ini, "scheduler", "idle_worker_timeout_ms", &value, error)) return false; result.scheduler.idle_worker_timeout = std::chrono::milliseconds(value); }
-    if (ini.Has("scheduler", "sysmon_interval_ms")) { if (!ReadSize(ini, "scheduler", "sysmon_interval_ms", &value, error)) return false; result.scheduler.sysmon_interval = std::chrono::milliseconds(value); }
-    if (ini.Has("scheduler", "long_syscall_threshold_ms")) { if (!ReadSize(ini, "scheduler", "long_syscall_threshold_ms", &value, error)) return false; result.scheduler.long_syscall_threshold = std::chrono::milliseconds(value); }
+    if (ini.Has("scheduler", "idle_wait_ms")) { if (!ReadSize(ini, "scheduler", "idle_wait_ms", &value, error) || !ValidateDuration("idle_wait_ms", value, error)) return false; result.scheduler.idle_wait = std::chrono::milliseconds(value); }
+    if (ini.Has("scheduler", "idle_worker_timeout_ms")) { if (!ReadSize(ini, "scheduler", "idle_worker_timeout_ms", &value, error) || !ValidateDuration("idle_worker_timeout_ms", value, error)) return false; result.scheduler.idle_worker_timeout = std::chrono::milliseconds(value); }
+    if (ini.Has("scheduler", "sysmon_interval_ms")) { if (!ReadSize(ini, "scheduler", "sysmon_interval_ms", &value, error) || !ValidateDuration("sysmon_interval_ms", value, error)) return false; result.scheduler.sysmon_interval = std::chrono::milliseconds(value); }
+    if (ini.Has("scheduler", "long_syscall_threshold_ms")) { if (!ReadSize(ini, "scheduler", "long_syscall_threshold_ms", &value, error) || !ValidateDuration("long_syscall_threshold_ms", value, error)) return false; result.scheduler.long_syscall_threshold = std::chrono::milliseconds(value); }
     if (ini.Has("scheduler", "allow_worker_oversubscription") && !ParseBool(ini.Get("scheduler", "allow_worker_oversubscription"), &result.scheduler.allow_worker_oversubscription)) { if (error) *error = "allow_worker_oversubscription 不是布尔值"; return false; }
     if (ini.Has("scheduler", "enable_sysmon") && !ParseBool(ini.Get("scheduler", "enable_sysmon"), &result.scheduler.enable_sysmon)) { if (error) *error = "enable_sysmon 不是布尔值"; return false; }
     if (ini.Has("scheduler", "pin_workers_to_cpu") && !ParseBool(ini.Get("scheduler", "pin_workers_to_cpu"), &result.scheduler.pin_workers_to_cpu)) { if (error) *error = "pin_workers_to_cpu 不是布尔值"; return false; }
+    if (ini.Has("scheduler", "collect_metrics") && !ParseBool(ini.Get("scheduler", "collect_metrics"), &result.scheduler.collect_metrics)) { if (error) *error = "collect_metrics 不是布尔值"; return false; }
     if (ini.Has("log", "level") && !log::ParseLevel(ini.Get("log", "level"), &result.log_level)) { if (error) *error = "log.level 不是有效级别"; return false; }
     if (ini.Has("log", "stdout") && !ParseBool(ini.Get("log", "stdout"), &result.log_stdout)) { if (error) *error = "log.stdout 不是布尔值"; return false; }
     result.log_directory = ini.Get("log", "directory", result.log_directory);
@@ -133,11 +197,22 @@ bool RuntimeConfig::Validate(std::string* error) const {
     const auto fail = [error](const std::string& message) { if (error) *error = message; return false; };
     const auto& value = scheduler;
     if (value.min_workers != 0 && value.min_workers < 1) return fail("scheduler.min_workers 必须至少为 1");
-    if (value.max_workers > 32) return fail("scheduler.max_workers 不能超过 32");
+    if (value.max_workers > kMaxWorkers) return fail("scheduler.max_workers 不能超过 32");
     if (value.max_workers != 0 && value.min_workers != 0 && value.max_workers < value.min_workers) return fail("scheduler.max_workers 不能小于 min_workers");
-    if (value.processor_count > 32) return fail("scheduler.processor_count 不能超过 32");
+    if (value.processor_count > kMaxWorkers) return fail("scheduler.processor_count 不能超过 32");
     if (value.local_queue_limit == 0) return fail("scheduler.local_queue_limit 必须大于 0");
+    if (value.local_queue_limit > kMaxLocalQueue) return fail("scheduler.local_queue_limit 不能超过 1048576");
+    if (value.fiber_stack_size != 0 &&
+        (value.fiber_stack_size < kMinFiberStack || value.fiber_stack_size > kMaxFiberStack)) {
+        return fail("scheduler.fiber_stack_size 必须为 0 或处于 16384..67108864 字节");
+    }
+    if (value.task_affinity_budget > kMaxAffinityBudget) return fail("scheduler.task_affinity_budget 不能超过 1048576");
     if (value.fiber_bin_capacity > 4096) return fail("scheduler.fiber_bin_capacity 不能超过 4096");
+    if (value.idle_wait <= std::chrono::milliseconds::zero() || value.idle_wait > kMaxDuration) return fail("scheduler.idle_wait_ms 必须处于 1 毫秒到 24 小时");
+    if (value.idle_worker_timeout <= std::chrono::milliseconds::zero() || value.idle_worker_timeout > kMaxDuration) return fail("scheduler.idle_worker_timeout_ms 必须处于 1 毫秒到 24 小时");
+    if (value.sysmon_interval <= std::chrono::milliseconds::zero() || value.sysmon_interval > kMaxDuration) return fail("scheduler.sysmon_interval_ms 必须处于 1 毫秒到 24 小时");
+    if (value.long_syscall_threshold <= std::chrono::milliseconds::zero() || value.long_syscall_threshold > kMaxDuration) return fail("scheduler.long_syscall_threshold_ms 必须处于 1 毫秒到 24 小时");
+    if (log_format.empty()) return fail("log.format 不能为空");
     if (log_directory.empty() || log_file.empty()) return fail("日志目录和文件名不能为空");
     return true;
 }
@@ -200,7 +275,7 @@ std::vector<ConfigVarBase::ptr> Config::List() const {
 
 bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds interval, std::string* error) {
     if (path.empty() || interval <= std::chrono::milliseconds::zero()) {
-        if (error) *error = "config watcher path or interval is invalid";
+        if (error) *error = "配置监听路径或周期无效";
         return false;
     }
     std::lock_guard<std::mutex> lifecycle_lock(m_watcher_lifecycle_mutex);
@@ -208,14 +283,14 @@ bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds int
     std::error_code read_error;
     auto stamp = std::filesystem::last_write_time(path, read_error);
     if (read_error) {
-        if (error) *error = "cannot read config timestamp: " + path;
+        if (error) *error = "无法读取配置文件时间戳: " + path;
         return false;
     }
     if (!LoadFromFile(path, error)) return false;
     m_watching.store(true, std::memory_order_release);
     m_watcher = std::thread([this, path, interval, stamp]() mutable {
         while (m_watching.load(std::memory_order_acquire)) {
-            // 条件变量让 StopWatcher 立即唤醒，不必等待一个完整刷新周期。
+            // 条件变量让停止监听操作立即唤醒，不必等待一个完整刷新周期。
             std::unique_lock<std::mutex> wait_lock(m_watcher_mutex);
             m_watcher_cv.wait_for(wait_lock, interval, [this] {
                 return !m_watching.load(std::memory_order_acquire);
@@ -234,7 +309,7 @@ bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds int
                     stamp = current;
                 }
             } catch (const std::exception& exception) {
-                // 监听器属于用户扩展点，异常不能逃出 watcher 线程；
+                // 监听器属于用户扩展点，异常不能逃出配置监听线程；
                 // 记录本次失败后继续监视后续文件变化。
                 std::cerr << "Go2Cpp 配置监听器异常: " << exception.what()
                           << '\n';
@@ -298,11 +373,35 @@ bool BindLoggingConfig(Config& config, std::string* error) {
 
 bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error) {
     if (!target) { if (error) *error = "RuntimeConfig 绑定目标为空"; return false; }
+    if (!target->Validate(error)) return false;
     if (!BindLoggingConfig(config, error)) return false;
     bool valid = true;
     const auto bind_size = [&config, target, &valid](const std::string& name, std::size_t* field, const char* description) {
         auto variable = config.Lookup<std::size_t>(name, *field, description);
         if (!variable) { valid = false; return; }
+        const auto separator = name.find('.');
+        const auto key = separator == std::string::npos ? name : name.substr(separator + 1);
+        variable->SetValidator([key, target](const std::size_t& value, std::string* validation_error) {
+            if (!ValidateSchedulerSize(key.c_str(), value, validation_error)) return false;
+            // 在线修改 min/max 时按当前另一侧的值做单步校验，避免监听器
+            // 将 RuntimeConfig 留在不可启动的状态。需要同时调整两者时，
+            // 先把 max_workers 设为 0（自动），再设置目标值。
+            if (key == "min_workers" && value != 0 &&
+                target->scheduler.max_workers != 0 &&
+                value > target->scheduler.max_workers) {
+                if (validation_error) *validation_error =
+                    "scheduler.min_workers 不能大于当前 max_workers";
+                return false;
+            }
+            if (key == "max_workers" && value != 0 &&
+                target->scheduler.min_workers != 0 &&
+                value < target->scheduler.min_workers) {
+                if (validation_error) *validation_error =
+                    "scheduler.max_workers 不能小于当前 min_workers";
+                return false;
+            }
+            return true;
+        });
         variable->AddListener([field](const std::size_t&, const std::size_t& value) { *field = value; });
     };
     bind_size("scheduler.processor_count", &target->scheduler.processor_count, "P 数量，0 为自动");
@@ -317,10 +416,12 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
     if (!fiber_bin_capacity) {
         valid = false;
     } else {
+        fiber_bin_capacity->SetValidator([](const std::size_t& value, std::string* validation_error) {
+            return ValidateSchedulerSize("fiber_bin_capacity", value, validation_error);
+        });
         fiber_bin_capacity->AddListener(
             [target](const std::size_t&, const std::size_t& value) {
-                target->scheduler.fiber_bin_capacity =
-                    std::min<std::size_t>(value, 4096U);
+                target->scheduler.fiber_bin_capacity = value;
             });
     }
     auto allow_oversubscription = config.Lookup<bool>("scheduler.allow_worker_oversubscription", target->scheduler.allow_worker_oversubscription, "允许 M 超过 P");
@@ -348,23 +449,45 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
     auto syscall_threshold = config.Lookup<std::size_t>("scheduler.long_syscall_threshold_ms", target->scheduler.long_syscall_threshold.count(), "长系统调用阈值毫秒");
     if (!idle_wait || !idle_timeout || !sysmon_interval || !syscall_threshold) valid = false;
     if (idle_wait) {
+        idle_wait->SetValidator([](const std::size_t& value, std::string* validation_error) {
+            return ValidateDuration("idle_wait_ms", value, validation_error);
+        });
         idle_wait->AddListener([target](const std::size_t&, const std::size_t& value) {
             target->scheduler.idle_wait = std::chrono::milliseconds(value);
         });
     }
     if (idle_timeout) {
+        idle_timeout->SetValidator([](const std::size_t& value, std::string* validation_error) {
+            return ValidateDuration("idle_worker_timeout_ms", value, validation_error);
+        });
         idle_timeout->AddListener([target](const std::size_t&, const std::size_t& value) {
             target->scheduler.idle_worker_timeout = std::chrono::milliseconds(value);
         });
     }
     if (sysmon_interval) {
+        sysmon_interval->SetValidator([](const std::size_t& value, std::string* validation_error) {
+            return ValidateDuration("sysmon_interval_ms", value, validation_error);
+        });
         sysmon_interval->AddListener([target](const std::size_t&, const std::size_t& value) {
             target->scheduler.sysmon_interval = std::chrono::milliseconds(value);
         });
     }
     if (syscall_threshold) {
+        syscall_threshold->SetValidator([](const std::size_t& value, std::string* validation_error) {
+            return ValidateDuration("long_syscall_threshold_ms", value, validation_error);
+        });
         syscall_threshold->AddListener([target](const std::size_t&, const std::size_t& value) {
             target->scheduler.long_syscall_threshold = std::chrono::milliseconds(value);
+        });
+    }
+    auto collect_metrics = config.Lookup<bool>(
+        "scheduler.collect_metrics", target->scheduler.collect_metrics,
+        "是否采集调度计时指标；关闭可降低少量热路径开销");
+    if (!collect_metrics) {
+        valid = false;
+    } else {
+        collect_metrics->AddListener([target](const bool&, const bool& value) {
+            target->scheduler.collect_metrics = value;
         });
     }
     if (!valid && error) *error = "运行时配置变量类型冲突";

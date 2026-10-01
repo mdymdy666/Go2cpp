@@ -8,9 +8,14 @@ namespace go2cpp::core {
 
 class TimerService;
 
-// Cancellation prevents a callback that has not started from being detached.
-// A callback already detached by the timer thread may still finish; callbacks
-// that reference a shorter-lived owner must use a weak pointer or wake gate.
+// 取消会阻止尚未开始的回调被分离。已经由定时器线程分离的回调仍可能
+// 执行完；引用短生命周期对象的回调必须使用弱指针或唤醒门。
+/**
+ * 可取消的单次定时器句柄。
+ *
+ * 依赖：TimerService 的共享状态；对上层提供 Cancel/Active。句柄析构会
+ * 取消尚未分离的回调，但已经由定时器线程取出的回调仍可能执行完成。
+ */
 class Timer final {
 public:
     struct State;
@@ -30,8 +35,14 @@ private:
     friend class TimerService;
 };
 
-// The explicitly named default service owns one process-wide timer thread.
-// Embedders can instead construct a service with an independent lifetime.
+// 显式命名的默认服务拥有一个进程级定时器线程。嵌入方也可以自行构造
+// 生命周期独立的服务实例。
+/**
+ * 基于 steady_clock 的定时器服务。
+ *
+ * 依赖：后台定时器线程和 Timer 状态；对上层提供默认进程级服务或独立
+ * 生命周期实例，并按绝对截止时间调度回调。服务析构会等待自身线程退出。
+ */
 class TimerService final {
 public:
     using Clock = std::chrono::steady_clock;

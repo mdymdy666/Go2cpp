@@ -82,8 +82,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
         try {
           item.disarm(state);
         } catch (...) {
-          // Disarm is cleanup. A user-supplied case must not prevent the
-          // remaining channel registrations from being removed.
+          // Disarm 只负责清理。用户提供的 case 不能阻止其余 channel 注册项
+          // 被移除。
         }
       }
     }
@@ -112,9 +112,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
       }
     }
 
-    // A channel operation that was ready competes with cancellation just as
-    // it does in Go's select. Check cancellation before default or sleeping
-    // when no channel case won this round.
+    // 已就绪的 channel 操作与取消之间存在竞争，语义与 Go 的 select 一致。
+    // 本轮没有 channel case 获胜时，在 default 或休眠前检查取消状态。
     if (context && context->IsDone()) {
       const auto err = context->Err();
       const bool deadline_error = err && Is(err, DeadlineExceededError());
@@ -231,8 +230,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
         break;
       }
 
-      // Armed channel cases must not be polled again: TryRecv/TrySend would
-      // consume a transfer without publishing the shared selection state.
+      // 已挂起的 channel case 不能再次轮询：TryRecv/TrySend 可能消耗一次
+      // 传输，却没有发布共享选择状态。
       for (std::size_t index = 0; index < cases.size(); ++index) {
         if (cases[index].is_default || cases[index].arm ||
             !cases[index].probe) {
@@ -297,8 +296,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
 
     remove_callback();
     if (!channel_selected && !custom_selected) {
-      // Linearize timeout/cancellation against a late channel handoff before
-      // removing wait nodes. If the handoff won the race, preserve it.
+      // 移除等待节点前，先把超时或取消与迟到的 channel 交接线性化；如果
+      // 交接已经赢得竞争，则保留交接结果。
       wait_state->Cancel();
       if (take_selected()) {
         channel_selected = true;

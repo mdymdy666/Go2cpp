@@ -50,6 +50,13 @@ ErrorPtr ChannelTimeoutError() noexcept;
 
 // SelectValue 是 select 结果使用的共享类型擦除载体。它不要求实际值可复制，
 // 用户可以通过 Get/Take 或 SelectCaster 将它转换成自己的业务类型。
+/**
+ * Select 结果的类型擦除值。
+ *
+ * 依赖：内部 Concept/Holder 保存实际对象，std::any 仅作为兼容桥；对上层
+ * 提供类型查询、只读 Get、独占 Take 和安全 As 转换。对象可在线程/Fiber
+ * 间共享，但只有唯一持有者才能 Take move-only 值。
+ */
 class SelectValue final {
  private:
   struct Concept {
@@ -226,6 +233,13 @@ class SelectValue final {
   std::shared_ptr<Concept> m_value;
 };
 
+/**
+ * SelectValue 的类型转换中介。
+ *
+ * 依赖：SelectValue 的类型擦除对象；Select/Channel 用它把不同通道的值
+ * 交给统一结果。对上层提供可插拔 Cast 接口，转换失败返回空值，不把用户
+ * 异常带入 select 状态机。
+ */
 class SelectCaster {
  public:
   virtual ~SelectCaster() = default;
@@ -382,10 +396,9 @@ struct SelectCase;
 
 namespace detail {
 
-// Channel value types come from user code and may throw while being copied or
-// moved. Keep such failures out of the wait-state machine: callers receive
-// kInvalid and the registration remains retryable. Error construction is
-// best-effort so the failure path cannot corrupt the channel lock invariant.
+// 通道值类型来自用户代码，复制或移动时可能抛异常。异常不能穿过等待状态
+// 机：调用方收到 kInvalid，注册仍可重试。错误对象构造尽力完成，失败路径
+// 不能破坏通道锁不变量。
 inline ErrorPtr ValueOperationError() noexcept {
   try {
     return NewError("channel value construction failed");
@@ -409,9 +422,8 @@ inline ContextTimePoint SaturatingDeadline(ContextDuration timeout) noexcept {
   return now + timeout;
 }
 
-// Shared by every armed case in one Select call. A channel operation must
-// claim this state before committing a transfer, which prevents two ready
-// channels from selecting the same caller concurrently.
+// 一个 Select 调用的所有已挂起 case 共享此状态。通道操作在提交传输前必须
+// 先取得它，避免两个就绪通道同时选中同一个调用者。
 class SelectWaitState final {
  public:
   bool TrySelect(std::size_t index, SelectProbe probe) {
@@ -422,8 +434,7 @@ class SelectWaitState final {
       }
       m_index = index;
       m_probe = std::move(probe);
-      // std::any assignment may allocate and throw. Publish selected only
-      // after the probe has been committed successfully.
+      // std::any 赋值可能分配并抛异常；只有 probe 提交成功后才发布 selected。
       m_selected = true;
     }
     m_cv.notify_one();
@@ -480,8 +491,8 @@ class SelectWaitState final {
 
   void Notify() { m_cv.notify_one(); }
 
-  // Prevent a late channel operation from claiming a select after the caller
-  // has committed to cancellation, timeout, or another non-channel case.
+  // 调用方已经选择取消、超时或其他非通道 case 后，阻止迟到的通道操作
+  // 再次认领本次 select。
   bool Cancel() {
     {
       std::lock_guard<std::mutex> lock(m_mutex);
@@ -550,12 +561,22 @@ struct ChannelRecvResult {
   }
   explicit operator bool() const noexcept { return Ok(); }
 
-  // A convenient zero-value accessor for code mirroring Go's <-ch assignment.
+  // 便于模拟 Go 的 <-ch 赋值：没有值时返回 T 的零值。
   T ValueOrDefault() const {
     return value.has_value() ? *value : T{};
   }
 };
 
+/**
+ * 支持 Fiber 与普通线程并发的 Go 风格通道。
+ *
+ * 依赖：Context 负责取消/截止时间，ParkingCondition 负责等待唤醒，
+ * SelectWaitState 负责多路 select 的单赢家。对上层提供容量为 0 的无缓冲
+ * 通道、容量大于 0 的 FIFO 缓冲通道、Send/Recv/Try/超时/关闭以及方向性
+ * 视图。Channel 拥有等待节点和缓冲值，不拥有生产者/消费者任务；对象必须
+ * 长于仍在使用它的等待者。T 必须可无异常移动构造和析构，内建 select 对
+ * T 还要求可复制；不可复制值可通过 SelectValue 自定义路径承载。
+ */
 template <typename T>
 class Channel final : public std::enable_shared_from_this<Channel<T>> {
   static_assert(std::is_nothrow_move_constructible<T>::value,
@@ -568,6 +589,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
   using Duration = ContextDuration;
   using TimePoint = ContextTimePoint;
 
+  // 创建容量为 capacity 的通道；capacity==0 表示无缓冲。
   static Ptr Create(std::size_t capacity = 0) {
     return std::make_shared<Channel<T>>(capacity);
   }
@@ -578,17 +600,21 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
   Channel(const Channel&) = delete;
   Channel& operator=(const Channel&) = delete;
 
+  // 返回固定容量（不含当前缓冲长度）。
   std::size_t Capacity() const noexcept { return m_capacity; }
+  // 返回当前缓冲区长度；不包含正在交接的等待者。
   std::size_t Len() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_buffer.size();
   }
+  // 查询通道是否已关闭。
   bool IsClosed() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_closed;
   }
   bool closed() const { return IsClosed(); }
 
+  // 发送 value；阻塞直到接收者/缓冲可用、关闭或 context 取消。
   ChannelSendResult Send(T value, const ContextPtr& context = {}) {
     try {
       return SendUntil(std::move(value), std::nullopt, context, false);
@@ -597,6 +623,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
   }
 
+  // 最多等待 timeout 发送；返回 ChannelSendResult 状态和错误。
   ChannelSendResult SendFor(T value, Duration timeout,
                             const ContextPtr& context = {}) {
     try {
@@ -610,6 +637,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
   }
 
+  // 非阻塞发送；当前不能完成时返回 kWouldBlock。
   ChannelSendResult TrySend(T value) {
     try {
       return SendUntil(std::move(value), std::chrono::steady_clock::now(), {}, true);
@@ -618,6 +646,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
   }
 
+  // 接收一个值；关闭后返回 kClosed 与零值/空 optional。
   ChannelRecvResult<T> Recv(const ContextPtr& context = {}) {
     try {
       return RecvUntil(std::nullopt, context, false);
@@ -627,6 +656,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
   }
 
+  // 最多等待 timeout 接收；超时不改变通道状态。
   ChannelRecvResult<T> RecvFor(Duration timeout, const ContextPtr& context = {}) {
     try {
       if (timeout < Duration::zero()) {
@@ -639,6 +669,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
   }
 
+  // 非阻塞接收；当前没有值且未关闭时返回 kWouldBlock。
   ChannelRecvResult<T> TryRecv() {
     try {
       return RecvUntil(std::chrono::steady_clock::now(), {}, true);
@@ -648,8 +679,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
   }
 
-  // Close is idempotent and wakes every blocked operation.  A repeated close
-  // returns kAlreadyClosed; no C++ exception is thrown.
+  // 关闭操作幂等并唤醒所有阻塞操作。重复关闭返回 kAlreadyClosed，不抛
+  // C++ 异常；关闭后发送返回关闭状态，接收在排空缓冲后返回零值。
   ChannelSendResult Close() noexcept {
     std::deque<std::shared_ptr<PendingSend>> senders;
     std::deque<std::shared_ptr<PendingRecv>> receivers;
@@ -714,9 +745,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     return {ChannelStatus::kReady, {}};
   }
 
-  // A monotonically increasing generation is useful to external select
-  // implementations.  It changes whenever a send, receive, or close changes
-  // channel readiness.
+  // 返回单调递增代际；每次发送、接收或关闭改变可用性时递增，供外部
+  // select 实现判断是否需要重新探测。
   std::uint64_t Generation() const noexcept {
     return m_generation.load(std::memory_order_acquire);
   }
@@ -728,10 +758,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     });
   }
 
-  // Register a select receive case. The registration rechecks readiness while
-  // holding the channel lock, so a sender cannot slip between the probe and
-  // waiter publication. A select node is removed by DisarmSelect when the
-  // caller chooses another case or its timeout/cancellation wins.
+  // 注册 select 接收 case。持有通道锁时再次检查就绪，避免发送者在探测
+  // 与发布等待节点之间插入；调用方选择其他 case 或超时/取消获胜后，
+  // DisarmSelect 会移除节点。
   bool ArmSelectRecv(const std::shared_ptr<detail::SelectWaitState>& state,
                      std::size_t index) {
     if (!state || state->IsSelected()) {
@@ -862,8 +891,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     return true;
   }
 
-  // Register a select send case. SendCase values are copyable by contract so
-  // a failed arm leaves the value available until another case is selected.
+  // 注册 select 发送 case。SendCase 按约定要求值可复制，使 arm 失败时值
+  // 仍保留到其他 case 被选中。
   bool ArmSelectSend(const std::shared_ptr<detail::SelectWaitState>& state,
                      std::size_t index, const T& value) {
     if (!state || state->IsSelected()) {
@@ -929,9 +958,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           return true;
         }
       }
-      // Construct the receiver value before publishing the select. If the
-      // user type throws, neither side has been selected and the waiter stays
-      // valid for a later sender.
+      // 在发布 select 之前先构造接收值。用户类型抛异常时，双方都不会
+      // 被选中，等待节点仍可由后续发送者重试。
       try {
         receiver->value.emplace(value);
       } catch (...) {
@@ -1128,7 +1156,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       return {ChannelStatus::kClosed, ChannelClosedError()};
     }
 
-    // Handoff to the oldest waiting receiver before using the buffer.
+    // 优先把值交接给最早等待的接收者，再使用缓冲区。
     while (!m_receivers.empty()) {
       auto receiver = m_receivers.front();
       if (receiver->cancelled) {
@@ -1175,8 +1203,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       try {
         receiver->value.emplace(std::move(value));
       } catch (...) {
-        // Keep the receiver queued. optional::emplace provides the strong
-        // empty-on-throw guarantee, so a later sender can retry it.
+        // 保留接收者在队列中。optional::emplace 提供抛异常时保持空值的
+        // 强保证，后续发送者可以重试。
         return {ChannelStatus::kInvalid, detail::ValueOperationError()};
       }
       m_receivers.pop_front();
@@ -1294,11 +1322,11 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     std::unique_lock<std::mutex> lock(m_mutex);
 
     if (!m_buffer.empty()) {
-      // Channel<T> requires a nothrow move constructor, so extracting the
-      // front value cannot leave a damaged element behind after an exception.
+      // Channel<T> 要求值类型移动构造不抛异常，因此提取队首值不会因异常
+      // 留下损坏的缓冲元素。
       T value = std::move(m_buffer.front());
       m_buffer.pop_front();
-      // Refill one blocked sender into a newly available buffer slot.
+      // 将一个被阻塞的发送者补入刚刚空出的缓冲槽位。
       RefillBufferLocked();
       ++m_generation;
       lock.unlock();
@@ -1307,7 +1335,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
               ChannelStatus::kReady, {}};
     }
 
-    // An unbuffered sender can rendezvous directly with this receiver.
+    // 无缓冲发送者可以直接与该接收者会合交接。
     while (!m_senders.empty()) {
       auto sender = m_senders.front();
       if (sender->cancelled) {
@@ -1315,10 +1343,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         continue;
       }
       if (sender->select_state) {
-        // A selected sender must not be claimed before its value can be
-        // transferred. For a potentially-throwing value type, require a
-        // noexcept copy/move path; otherwise leave the sender queued and
-        // report a recoverable operation failure.
+        // 在值可以传输前不能先认领已选中的发送者。对可能抛异常的值类型
+        // 要求存在 noexcept 的复制/移动路径；否则保留发送者在队列中，
+        // 返回可恢复的操作失败。
         if constexpr (!std::is_nothrow_move_constructible<T>::value &&
                       !std::is_nothrow_copy_constructible<T>::value) {
           return {std::nullopt, false, true, ChannelStatus::kInvalid,
@@ -1348,8 +1375,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         return {std::optional<T>(std::move(value)), true, true,
                 ChannelStatus::kReady, {}};
       } else {
-        // The only remaining accepted path is a noexcept copy. Returning a
-        // copy avoids invoking a potentially-throwing move after selection.
+        // 唯一剩余的可接受路径是 noexcept 复制。返回复制值，避免选中后
+        // 再调用可能抛异常的移动构造。
         T value = sender->value;
         m_senders.pop_front();
         sender->accepted = true;
@@ -1363,7 +1390,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       }
     }
 
-    // Closed channels drain buffered values first, then yield the zero value.
+    // 关闭通道先排空缓冲值，之后返回零值。
     if (m_closed) {
       return {std::nullopt, false, true, ChannelStatus::kClosed,
               ChannelClosedError()};
@@ -1467,8 +1494,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       if (sender->select_state) {
         if constexpr (!std::is_nothrow_move_constructible<T>::value &&
                       !std::is_nothrow_copy_constructible<T>::value) {
-          // Do not claim a select whose value cannot be transferred without
-          // risking a partially committed buffer.
+          // 不要认领一个无法在不冒缓冲区半提交风险的情况下传输值的 select。
           break;
         } else {
           try {
@@ -1551,10 +1577,14 @@ template <typename T>
 ChannelRecvResult<T> RecvChecked(const ChannelPtr<T>& channel,
                                 const ContextPtr& context = {});
 
-// Directional channel views mirror Go's chan<- and <-chan at the C++ type
-// level. They intentionally do not expose the underlying bidirectional handle:
-// a receive-only view cannot send or close, while a send-only view may send and
-// close but cannot receive.
+// 方向通道视图在 C++ 类型层模拟 Go 的 chan<- 与 <-chan。它们刻意不暴露
+// 双向句柄：只读视图不能发送或关闭；只写视图可以发送和关闭但不能接收。
+/**
+ * 只发送通道视图。
+ *
+ * 依赖：共享 Channel<T>；对上层仅暴露 Send/TrySend/Close 等发送侧能力，
+ * 不允许接收。视图不拥有独立缓冲区，底层 Channel 必须在使用期间存活。
+ */
 template <typename T>
 class SendOnlyChannel final {
  public:
@@ -1604,6 +1634,12 @@ class SendOnlyChannel final {
   friend SelectCase SendCase(const SendOnlyChannel<U>& channel, U value);
 };
 
+/**
+ * 只接收通道视图。
+ *
+ * 依赖：共享 Channel<T>；对上层仅暴露 Recv/TryRecv 等接收侧能力，不允许
+ * 发送或关闭。视图不拥有独立缓冲区，底层 Channel 必须在使用期间存活。
+ */
 template <typename T>
 class RecvOnlyChannel final {
  public:
@@ -1659,9 +1695,8 @@ RecvOnlyChannel<T> AsRecvOnly(const ChannelPtr<T>& channel) {
   return RecvOnlyChannel<T>(channel);
 }
 
-// Checked free functions make nil-channel behavior explicit when translated
-// code holds a nullable ChannelPtr (a null handle reports kNil instead of
-// waiting forever as a Go nil channel would).
+// 检查型自由函数把 nil 通道行为显式化：可空 ChannelPtr 返回 kNil，避免
+// 像 Go 的 nil 通道一样永久等待。
 template <typename T>
 ChannelSendResult SendChecked(const ChannelPtr<T>& channel, T value,
                              const ContextPtr& context) {
@@ -1680,6 +1715,13 @@ ChannelRecvResult<T> RecvChecked(const ChannelPtr<T>& channel,
   return channel->Recv(context);
 }
 
+/**
+ * Select 的一个候选分支。
+ *
+ * probe 用于非阻塞探测；arm/disarm 分别登记和撤销等待节点；is_default
+ * 表示默认分支。Select 会保证最多一个 case 提交成功，unsupported 用于
+ * 显式报告当前值类型不满足内建通道 select 的约束。
+ */
 struct SelectCase {
   std::function<SelectProbe()> probe;
   bool is_default{false};
@@ -1697,6 +1739,12 @@ struct SelectCase {
   }
 };
 
+/**
+ * Select 的结构化结果。
+ *
+ * index 是选中的 case 下标，selected 表示是否有分支完成，status/error
+ * 表示通道或超时/取消结果；typed_value 保留不可复制值的类型擦除对象。
+ */
 struct SelectResult {
   static constexpr std::size_t kNoSelection = static_cast<std::size_t>(-1);
 
@@ -1897,6 +1945,8 @@ inline SelectCase DefaultCase() {
                     {}};
 }
 
+// 执行多路 select。cases 是候选分支，context 可取消，timeout 是可选相对
+// 超时；返回选中下标、值和状态。没有就绪分支且无 default 时会等待。
 SelectResult Select(const std::vector<SelectCase>& cases,
                     const ContextPtr& context = {},
                     std::optional<ContextDuration> timeout = std::nullopt);

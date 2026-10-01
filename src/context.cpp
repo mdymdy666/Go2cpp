@@ -78,8 +78,8 @@ DoneSignal::CallbackId DoneSignal::AddCallbackImpl(
         }
     }
     if (invoke_now) {
-        // A notification callback is advisory. Cancellation itself has
-        // already been linearized, so a faulty observer cannot undo it.
+        // 通知回调只用于观察。取消状态已经完成线性化，因此有问题的观察者
+        // 不能撤销取消操作。
         try {
             callback();
         } catch (...) {
@@ -152,18 +152,16 @@ Context::NowFunction s_now_function;
 
 ContextTimePoint SaturatingDeadline(ContextTimePoint now,
                                     ContextDuration timeout) noexcept {
-    // Keep the addition in the time-point domain. In particular, a
-    // ContextDuration::max() timeout must not wrap into the past and become
-    // an accidental immediate cancellation.
+    // 始终在时间点域中完成加法。特别是 ContextDuration::max() 不能溢出回绕
+    // 到过去，否则会被误认为需要立即取消。
     using Rep = ContextDuration::rep;
     if (timeout > ContextDuration::zero() &&
         now > ContextTimePoint::max() - timeout) {
         return ContextTimePoint::max();
     }
     if (timeout < ContextDuration::zero()) {
-        // Negating duration::min() would overflow. It is already farther
-        // below any representable time point, so handle it explicitly before
-        // using the otherwise safe subtraction below.
+        // 对 duration::min() 取相反数会溢出。它已经小于所有可表示的时间点，
+        // 因而要先显式处理，再执行下面本来安全的减法。
         if constexpr (std::numeric_limits<Rep>::is_signed) {
             if (timeout.count() == std::numeric_limits<Rep>::min() ||
                 now < ContextTimePoint::min() - timeout) {
@@ -179,11 +177,9 @@ public:
     using Id = std::uint64_t;
 
     static TimerService& Instance() {
-        // Context states can be destroyed during arbitrary static teardown.
-        // Keep the service and its synchronization primitives alive until the
-        // process exits, so State::~State() can always remove a pending timer
-        // without touching a destroyed singleton. The exit hook stops the
-        // worker first, avoiding a live-thread Memcheck report.
+        // Context 状态可能在任意静态析构阶段被销毁。让服务及其同步原语一直
+        // 存活到进程退出，保证 State::~State() 移除挂起定时器时不会访问已经
+        // 析构的单例。退出钩子会先停止 worker，避免 Memcheck 报告存活线程。
         static TimerService* service = [] {
             auto* value = new TimerService();
             std::atexit(&TimerService::ShutdownAtExit);
@@ -242,9 +238,8 @@ struct Context::State : std::enable_shared_from_this<Context::State> {
     std::shared_ptr<State> parent;
     std::vector<std::weak_ptr<State>> children;
     std::unordered_map<const void*, std::any> typed_values;
-    // Keep the allocation that identifies each typed key alive for as long as
-    // its value is reachable.  Looking up by a raw pointer without this owner
-    // would allow an allocator reuse to alias a later, unrelated key.
+    // 只要值仍然可达，就保留用于标识类型化 key 的分配对象。若没有这个所有者
+    // 而仅按裸指针查找，分配器复用地址后可能错误地别名到无关的后续 key。
     std::unordered_map<const void*, std::shared_ptr<const std::uint64_t>>
         typed_key_anchors;
     std::unordered_map<std::string, std::any> named_values;
@@ -328,10 +323,8 @@ struct Context::State : std::enable_shared_from_this<Context::State> {
     }
 
     static void DrainCancellation(std::vector<CancellationWork> work) {
-        // Mark the complete subtree before invoking any user callback. Done
-        // callbacks are allowed to observe/wait on descendants; signaling a
-        // parent callback first would otherwise deadlock a synchronous
-        // parent->child wait during cancellation propagation.
+        // 调用用户回调前先标记完整子树。Done 回调可以观察或等待后代；如果
+        // 先通知父回调，取消传播期间同步的 parent->child 等待可能死锁。
         std::vector<std::shared_ptr<State>> to_signal;
         std::vector<std::function<void()>> before_done_callbacks;
         while (!work.empty()) {
@@ -475,11 +468,9 @@ struct Context::State : std::enable_shared_from_this<Context::State> {
 
 namespace {
 
-// A child retains its parent state so cancellation and values remain valid
-// after the caller drops the parent handle.  Releasing a long parent chain via
-// ordinary shared_ptr destruction is recursive, though.  Move each parent
-// into a thread-local release queue and drain it iteratively from the custom
-// deleter so deep context trees cannot overflow the native stack.
+// child 持有父状态，因此调用者释放父句柄后，取消状态和值仍然有效。但普通
+// shared_ptr 析构会递归释放很长的父链。把每个父对象移入线程本地释放队列，
+// 再由自定义删除器迭代排空，避免深层 Context 树耗尽原生栈。
 thread_local bool t_draining_state_releases = false;
 thread_local std::vector<std::shared_ptr<Context::State>>
     t_state_release_queue;
@@ -1129,8 +1120,8 @@ ContextPtr Context::TODO() {
 }
 
 ContextPtr Context::MakeChild(const ContextPtr& parent) {
-    // Go rejects a nil parent; translated C++ code receives an explicit root
-    // instead so the operation remains memory-safe and non-throwing.
+    // Go 会拒绝 nil parent；转译后的 C++ 使用显式 root，使操作保持内存安全
+    // 且不抛出异常。
     const auto actual_parent = parent ? parent : Background();
     auto state = MakeState();
     state->parent = actual_parent->m_state;  // child retains its parent anchor
@@ -1190,7 +1181,7 @@ std::pair<ContextPtr, CancelFunc> Context::WithDeadline(
         {
             std::lock_guard<std::mutex> lock(child->m_state->mutex);
             if (child->m_state->error) {
-                // Parent won the cancellation race while the child was made.
+                // 创建 child 的过程中，父 Context 赢得了取消竞争。
                 requested_deadline = ContextTimePoint::max();
             } else {
                 child->m_state->deadline = requested_deadline;
@@ -1198,9 +1189,8 @@ std::pair<ContextPtr, CancelFunc> Context::WithDeadline(
         }
         if (requested_deadline != ContextTimePoint::max()) {
             if (requested_deadline <= Now()) {
-                // Go closes an already-expired context before returning it;
-                // do this synchronously instead of relying on the timer
-                // worker's next scheduling turn.
+                // Go 会在返回已经过期的 Context 前关闭它；这里同步完成该操作，
+                // 不依赖 timer worker 的下一次调度。
                 child->m_state->Cancel({}, true);
             } else {
                 TimerService::Id id = 0;
