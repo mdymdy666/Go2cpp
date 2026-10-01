@@ -647,6 +647,27 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
 - Fiber Context 复核结论不变：自研自动扩栈上下文曾在嵌套恢复中破坏父链，已撤回；
   当前生产实现继续使用 Boost.Context 受保护固定栈，自动扩栈属于未完成边界。
 
+## 2026-10-01：混合 Mutex 关键路径优化
+
+- `src/sync.cpp` 将锁状态合并为单一原子字节，并把 `kWaiter` 的发布放在队列锁
+  内，修复等待者发布与 Unlock 交错造成的丢唤醒。WaitNode 增加 generation 和
+  `TryCancelAndWake` 门，修复 Context 旧回调污染缓存节点及取消与 `Arm()` 交错
+  永久挂起的问题。没有改变普通线程的阻塞语义，Fiber 等待仍按 FIFO handoff
+  进入调度器。
+- `src/scheduler.cpp` 和 `scheduler.hpp` 增加 `park_wait()` 原子挂起路径；同步
+  原语不再为每次等待获取 admission 锁。跨 M 唤醒按 G 最近运行的 P 投递，P 本地
+  回队仅在无运行 M 或队列积压时通知 worker，降低 futex 抖动。Task 最近 P 字段
+  改为原子快照，避免 worker 写与外部唤醒读之间的数据竞争。
+- 当前本机 Release 高负载混合 Mutex 样本 15～35 ms，完整样本 26/50 ms；线程
+  `std::mutex` 为 40～45 ms。计算、调度、Channel、IO 的完整样本仍分别约为
+  1.5 s、121～124 ms、24～26 ms、662～748 ms；IO 继续优于线程 poll。性能数字
+  仅代表本机重复运行，不能当作跨机器 SLA。
+- 验证结果：`build-native-context` CTest 14/14、`build-engineering-werror` CTest
+  3/3、ASan 单测全部通过；Valgrind ERROR SUMMARY 0，definite/indirect/possible
+  leak 均为 0（288 bytes still reachable 为进程级缓存）。TSan 仍因 WSL
+  `unexpected memory mapping` 无法运行，未宣称通过。构建期间仅出现 WSL 文件时钟
+  偏差警告，不影响目标生成。
+
 ## 2026-09-30：Context 后端与跨 M 唤醒门
 
 - Linux x86_64 新增 Go2Cpp 自有 Context ABI，布局借鉴 coost/TBOX，但保留

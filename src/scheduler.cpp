@@ -553,12 +553,15 @@ void Task::run() {
         // 同一个 M 上的连续 yield 不需要重复获取 Fiber 元数据锁。发生
         // 迁移时才更新调试绑定，保留跨 M 运行的可观测性。
         if (m_last_machine_id != t_machine_id ||
-            m_last_processor_id != t_processor_id || !m_binding_published) {
+            m_last_processor_id.load(std::memory_order_relaxed) !=
+                t_processor_id ||
+            !m_binding_published) {
             fiber->bind_execution(FiberExecutionBinding{
                 reinterpret_cast<std::uintptr_t>(scheduler), id(),
                 t_machine_id, t_processor_id, true});
             m_last_machine_id = t_machine_id;
-            m_last_processor_id = t_processor_id;
+            m_last_processor_id.store(t_processor_id,
+                                      std::memory_order_relaxed);
             m_binding_published = true;
         }
     }
@@ -1844,6 +1847,59 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     return true;
 }
 
+bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
+                                     PId processor_id) {
+    if (!task || processor_id >= m_impl->processors.size()) {
+        return false;
+    }
+    if (!m_impl->accepting.load(std::memory_order_acquire) ||
+        m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!task->try_mark_queued()) {
+        return task->queued();
+    }
+
+    auto& processor = m_impl->processors[processor_id];
+    bool retry_regular_enqueue = false;
+    bool notify_worker = false;
+    {
+        std::lock_guard<std::mutex> queue_lock(processor.mutex);
+        if (!m_impl->accepting.load(std::memory_order_acquire) ||
+            m_impl->draining.load(std::memory_order_acquire) ||
+            m_impl->stopping.load(std::memory_order_acquire)) {
+            retry_regular_enqueue = true;
+        } else {
+            m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+            try {
+                processor.queue.push_back(task);
+                // 该 P 已有运行中的 M 时，它会在当前 G 返回后消费本地
+                // 队列；此时唤醒额外 M 只会制造 futex 抖动。
+                const auto running = processor.running_machines.load(
+                    std::memory_order_relaxed);
+                const auto active = processor.active_machines.load(
+                    std::memory_order_relaxed);
+                notify_worker = running == 0 ||
+                                (processor.queue.size() >= 16U &&
+                                 running < active);
+            } catch (...) {
+                m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                task->clear_queued();
+                retry_regular_enqueue = true;
+            }
+        }
+    }
+    if (retry_regular_enqueue) {
+        task->clear_queued();
+        return false;
+    }
+    if (notify_worker) {
+        m_impl->condition.notify_one();
+    }
+    return true;
+}
+
 bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
     if (!task || current_scheduler() != this ||
         t_processor_id >= m_impl->processors.size()) {
@@ -1862,6 +1918,7 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
 
     auto& processor = m_impl->processors[t_processor_id];
     bool retry_regular_enqueue = false;
+    bool notify_worker = false;
     {
         std::lock_guard<std::mutex> queue_lock(processor.mutex);
         if (!m_impl->accepting.load(std::memory_order_acquire) ||
@@ -1874,6 +1931,15 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
             m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
             try {
                 processor.queue.push_back(task);
+                // 当前 M 正在执行这个 G；本地回队无需再次唤醒另一个
+                // M，减少每次 Fiber handoff 的条件变量切换。
+                const auto running = processor.running_machines.load(
+                    std::memory_order_relaxed);
+                const auto active = processor.active_machines.load(
+                    std::memory_order_relaxed);
+                notify_worker = running == 0 ||
+                                (processor.queue.size() >= 16U &&
+                                 running < active);
             } catch (...) {
                 m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
                 task->clear_queued();
@@ -1886,7 +1952,9 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
     if (retry_regular_enqueue) {
         return enqueue(task);
     }
-    m_impl->condition.notify_one();
+    if (notify_worker) {
+        m_impl->condition.notify_one();
+    }
     return true;
 }
 
@@ -1909,6 +1977,36 @@ bool Scheduler::yield_current() {
 
 bool Scheduler::park(const std::shared_ptr<Task>& task) {
     return park_with_reason(task, SuspendReason::Park);
+}
+
+bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
+    if (!task || current_scheduler() != this ||
+        current_task().get() != task.get()) {
+        return false;
+    }
+    if (m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire) ||
+        task->cancellation_requested()) {
+        return false;
+    }
+
+    // WaitNode 已经在线性化队列中发布，Task 的 Waiting 状态可以直接
+    // 原子提交。第二次检查覆盖 shutdown 与 park 的交错；若 shutdown
+    // 已开始，回滚 Waiting 状态并让调用方走取消路径，不能遗留悬挂 G。
+    const ParkAction action = task->park_for_scheduler();
+    if (action != ParkAction::kParked) {
+        return false;
+    }
+    if (m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire) ||
+        task->cancellation_requested()) {
+        (void)task->wake_for_wait();
+        return false;
+    }
+    if (!Fiber::SuspendForScheduler(SuspendReason::Park)) {
+        return false;
+    }
+    return !task->cancellation_requested();
 }
 
 bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
@@ -1996,6 +2094,14 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
     if (current_scheduler() == this &&
         t_processor_id < m_impl->processors.size() &&
         requeue_from_worker(task)) {
+        return true;
+    }
+    // 混合 Mutex 的 Unlock 通常来自普通线程。G 最近运行的 P 是稳定的
+    // 亲和性提示，把唤醒直接放入该 P 的本地队列，绕过 incoming stripe
+    // 和 scheduler admission 锁；P 失效或正在 shutdown 时仍走原回退路径。
+    const PId preferred_processor = task->last_processor_id();
+    if (preferred_processor < m_impl->processors.size() &&
+        requeue_to_processor(task, preferred_processor)) {
         return true;
     }
     if (!task->try_mark_queued()) {

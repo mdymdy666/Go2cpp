@@ -240,3 +240,44 @@ Fiber 栈映射仍由已有 TLS/全局受保护栈缓存处理。默认每个 M 
 测试中出现任务完成超时。该方案需要重新设计 runnable 计数、局部配额、P/global
 批量转移、sysmon 脱离和 shutdown 排空的统一状态机，当前不能把未验证实现当成
 性能收益。现有高负载基线仍以 P 本地队列、incoming 分片和全局窃取为准。
+
+## 2026-10-01：混合 Mutex 与同步等待快路径
+
+本轮修复了混合 Mutex 的三个实际问题。`m_fast_locked`/`m_has_waiters` 拆分为
+一个 `m_state` 原子字节；等待者在队列锁内发布 `kWaiter` 后再入队，避免
+Unlock 覆盖尚未入队的等待者标志而丢唤醒。带 Context 的 WaitNode 增加 generation，
+Context 旧回调不能污染 thread-local 缓存复用的下一代节点；取消与 `Arm()` 交错时
+先发布终态，避免 Fiber 永久挂起。
+
+性能路径增加了两项约束。已注册 G 被外部 M 唤醒时，优先投递到 G 最近运行的 P，
+避免每次 handoff 经过 incoming stripe；P 本地回队只有在没有运行 M 或队列积压时
+通知其他 worker，减少无效 futex 唤醒。同步等待新增 `Scheduler::park_wait()`，
+沿用 IO 的原子 Waiting→Runnable 交接和 shutdown 二次检查，跳过普通 Mutex 等待
+每次获取 scheduler admission 锁的开销。Fiber 在没有 native waiter 时最多协作重试
+64 次；出现普通线程 waiter 后最多再试 4 次即进入 FIFO 队列，保证普通线程不会
+被无限越过。
+
+当前 Release 高负载（2,000 Fiber、32 个普通线程、每个 Fiber 100 次、每个普通线程
+200 次）连续样本为 15、27、29、35 ms；完整高负载两次混合 Mutex 为 26/50 ms，
+对应线程 `std::mutex` 为 45/40 ms。同期完整样本中计算为 1,506/1,522 ms（线程
+1,443/1,411 ms），调度为 121/124 ms（线程 73/45 ms），Channel 为 24/26 ms
+（线程 67/78 ms），IO 为 662/748 ms（线程 poll 1,895/1,911 ms）。这些数字是
+本机重复运行结果，不是跨机器的性能承诺；调度器和 Fiber 栈切换仍可能受宿主调度
+抖动影响。
+
+验证命令：
+
+```sh
+cd /mnt/e/CodexWorkspace/NewGo2Cpp
+cmake --build build-native-context -j$(nproc)
+ctest --test-dir build-native-context --output-on-failure
+ctest --test-dir build-engineering-werror --output-on-failure
+ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 ./build-native-asan/go2cpp_tests
+valgrind --leak-check=full --show-leak-kinds=definite,indirect,possible \
+  --error-exitcode=99 ./build-native-context/go2cpp_fiber_sync_demo
+```
+
+本轮 Debug/Release 14 项 CTest、Werror 3 项 CTest 和 ASan 单测均通过；Valgrind
+ERROR SUMMARY 为 0，definite/indirect/possible leak 均为 0，仅有 288 bytes
+still reachable 的进程级缓存。TSan 仍受 WSL `unexpected memory mapping` 环境错误
+限制，不能宣称通过。

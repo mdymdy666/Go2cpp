@@ -66,6 +66,35 @@ public:
 
     void Wake() noexcept {
         std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
+        WakeLocked();
+    }
+
+    // Context 的取消回调可能已经通过 weak_ptr 取得了本节点，随后
+    // RemoveCallback 又与节点回收并发。取消、active 检查和唤醒必须在
+    // 同一把门锁内完成；否则旧回调可能在节点放回 thread-local cache
+    // 后，把下一次等待的 m_result 错误地改成 Cancelled。generation 用来
+    // 区分同一个缓存节点的不同等待代次。
+    bool TryCancelAndWake(std::uint64_t generation) noexcept {
+        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
+        if (generation != m_generation ||
+            !TryFinish(WaitResult::kCancelled)) {
+            return false;
+        }
+        // 取消可能与 Arm() 交错。未 Arm 时只发布终态，发布方会在
+        // 入队锁内观察到 Cancelled 并放弃挂起；已 Arm 时才需要实际唤醒。
+        if (m_active) {
+            WakeLocked();
+        }
+        return true;
+    }
+
+    std::uint64_t generation() noexcept {
+        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
+        return m_generation;
+    }
+
+private:
+    void WakeLocked() noexcept {
         if (!m_active) {
             return;
         }
@@ -85,6 +114,8 @@ public:
             // Scheduler's reliable wake handoff retains every started G.
         }
     }
+
+public:
 
     bool managed() const noexcept {
         return m_scheduler != nullptr && static_cast<bool>(m_task);
@@ -115,6 +146,10 @@ public:
         m_scheduler = scheduler;
         m_task = std::move(task);
         m_result.store(WaitResult::kWaiting, std::memory_order_release);
+        ++m_generation;
+        if (m_generation == 0U) {
+            m_generation = 1U;
+        }
     }
 
 private:
@@ -125,6 +160,7 @@ private:
     std::mutex m_native_mutex;
     std::condition_variable m_native_condition;
     bool m_active{false};
+    std::uint64_t m_generation{1U};
 };
 
 // WaitNode 只在等待期间被队列或取消回调引用。完成一次等待后将对象放回
@@ -188,10 +224,11 @@ public:
             return;
         }
         const std::weak_ptr<WaitNode> weak_waiter(waiter);
-        m_id = m_context->Done().AddCallback([weak_waiter] {
+        const std::uint64_t generation = waiter->generation();
+        m_id = m_context->Done().AddCallback([weak_waiter, generation] {
             const auto current = weak_waiter.lock();
-            if (current && current->TryFinish(WaitResult::kCancelled)) {
-                current->Wake();
+            if (current) {
+                (void)current->TryCancelAndWake(generation);
             }
         });
     }
@@ -251,6 +288,15 @@ WaitResult Await(WaitNode* waiter) noexcept {
     Scheduler* const scheduler = waiter->scheduler();
     const auto& task = waiter->task();
     for (;;) {
+        // Unlock() 可以在 waiter 刚发布、但尚未真正调用 park() 的窗口内
+        // 完成交接。此时 Wake 已把结果设为 Notified；若仍然进入
+        // park_with_reason()，会无谓获取 Scheduler admission 锁，短临界区
+        // 的每次交接都会被放大成一次调度慢路径。先读取终态还能保留
+        // notify-before-park 语义：结果已经线性化时无需再次挂起。
+        const WaitResult published = waiter->result();
+        if (published != WaitResult::kWaiting) {
+            return finish(published);
+        }
         if (task->cancellation_requested()) {
             if (waiter->result() == WaitResult::kWaiting) {
                 (void)waiter->TryFinish(WaitResult::kCancelled);
@@ -261,7 +307,7 @@ WaitResult Await(WaitNode* waiter) noexcept {
         // Always attempt park after publication, even if a notifier may have
         // won already. A notify-before-park wake is stored as a pending token;
         // park consumes that token and returns without suspending.
-        const bool suspended = scheduler->park(task);
+        const bool suspended = scheduler->park_wait(task);
         const WaitResult result = waiter->result();
         if (result != WaitResult::kWaiting) {
             return finish(result);
@@ -317,10 +363,16 @@ bool AbortConditionWait(Mutex& mutex, bool preserve_lock = false) {
 
 struct Mutex::Impl {
     std::mutex m_mutex;
-    // 无竞争路径只需一次 CAS，不再为每个 Fiber 的 Lock/Unlock 获取
-    // 慢路径互斥量；有等待者时仍由 m_mutex 串行化 FIFO handoff。
-    std::atomic<bool> m_fast_locked{false};
-    std::atomic<bool> m_has_waiters{false};
+    // 同一个原子字节同时发布“已持有”和“已有等待者/等待者正在入队”
+    // 两个状态。Unlock 的 compare_exchange 因此不会读取到旧的等待者
+    // 标记后错误地释放锁，避免丢失唤醒。
+    static constexpr std::uint8_t kLocked = 1U;
+    static constexpr std::uint8_t kWaiter = 2U;
+    std::atomic<std::uint8_t> m_state{0U};
+    // 只统计已经进入等待队列的普通线程。managed Fiber 在没有 native
+    // waiter 时可以采用有界协作重试，避免每次短临界区都 park；一旦有
+    // native waiter，所有后续 G 回到 FIFO 队列，保证线程不会饥饿。
+    std::atomic<std::size_t> m_native_waiters{0U};
     // 等待节点由 Lock 调用栈或带 Context 的拥有者保存。指针队列避免
     // 无 Context 的短等待反复分配 shared_ptr 控制块，生命周期由等待者
     // 在挂起期间保证。
@@ -335,10 +387,9 @@ bool Mutex::Lock(const ContextPtr& context) {
         return false;
     }
 
-    bool expected = false;
-    if (!m_impl->m_has_waiters.load(std::memory_order_acquire) &&
-        m_impl->m_fast_locked.compare_exchange_strong(
-            expected, true, std::memory_order_acquire,
+    std::uint8_t expected_state = 0U;
+    if (m_impl->m_state.compare_exchange_strong(
+            expected_state, Impl::kLocked, std::memory_order_acquire,
             std::memory_order_relaxed)) {
         return true;
     }
@@ -354,51 +405,61 @@ bool Mutex::Lock(const ContextPtr& context) {
     }
 
     // 混合并发下，短临界区通常只需要等待当前 Fiber 完成一小段工作。
-    // 先让受调度的 G 协作式让出执行权，避免为每一次短暂竞争分配
-    // WaitNode、注册取消回调并进入 Scheduler::park 的慢路径。只在没有
-    // 已发布等待者时使用该路径；一旦形成等待队列，仍由 FIFO handoff
-    // 保证公平和跨线程唤醒语义。单 P 调度器不启用重试，因此保留严格
-    // 的发布顺序；多 P 场景只在尚未发布等待节点时走该短路径。
+    // 没有 native waiter 时，managed G 走有界协作重试，避免每次短竞争
+    // 都进入 WaitNode + park。managed waiter 之间允许有限度地越过队列，
+    // 以换取吞吐；一旦有普通线程 waiter，最多再重试 4 次后回到 FIFO
+    // handoff，保证线程不会被 Fiber 长时间压住。预算耗尽后仍会进入
+    // WaitNode + park，不会无界占用 M。
     if (target && target.scheduler->processor_count() > 1 &&
-        !m_impl->m_has_waiters.load(std::memory_order_acquire)) {
-        // 竞争刚出现时，临界区通常仍在另一个 P 上运行。多做一小段
-        // 协作重试可以避免把短临界区升级为 WaitNode + park/unpark；
-        // 单 P 不走这条路径，因此不会把唯一 M 忙等住。
-        constexpr int kCooperativeAttempts = 1024;
+        m_impl->m_native_waiters.load(std::memory_order_acquire) ==
+            0U) {
+        // 竞争刚出现时，临界区通常仍在另一个 P 上运行。协作让出可以
+        // 避免把短临界区升级为 Fiber 挂起/恢复和跨 M 唤醒；单 P 不走
+        // 这条路径，因此不会把唯一 M 忙等住。预算耗尽后再进入 waiter。
+        constexpr int kCooperativeAttempts = 64;
         for (int attempt = 0; attempt < kCooperativeAttempts; ++attempt) {
-            // 等待者一旦发布，后来的竞争者不能越过 FIFO 队头。
-            // 这次检查必须放在每轮 CAS 前，避免自旋期间新 waiter
-            // 入队后仍然直接取得锁。
-            if (m_impl->m_has_waiters.load(std::memory_order_acquire)) {
+            // native waiter 出现后，重试预算被限制为 4 次，避免 Fiber
+            // 无限越过普通线程；这次检查放在每轮 CAS 前。
+            if (m_impl->m_native_waiters.load(std::memory_order_acquire) !=
+                    0U &&
+                attempt >= 4) {
                 break;
             }
-            expected = false;
-            if (m_impl->m_fast_locked.compare_exchange_weak(
-                    expected, true, std::memory_order_acquire,
+            expected_state = 0U;
+            if (m_impl->m_state.compare_exchange_weak(
+                    expected_state, Impl::kLocked,
+                    std::memory_order_acquire,
                     std::memory_order_relaxed)) {
                 return true;
             }
             if (target.task->cancellation_requested()) {
                 break;
             }
-            // 保持当前 M 继续运行，避免每次失败都切换 Fiber。短临界区
-            // 通常在这段自旋内完成；超时后进入 FIFO 等待队列。
-            RelaxCpu();
+            // 让出当前 G，使持锁者有机会在另一个 M 上完成短临界区。
+            // 次数有界，耗尽后进入 FIFO 等待队列，确保 native waiter
+            // 不会被无限期阻塞。
+            if (!target.scheduler->yield_current()) {
+                break;
+            }
         }
     }
     // std::mutex 在 Linux 上也会先进行短暂自旋；混合锁的 native
     // 调用者如果立即进入条件变量慢路径，会把很短的临界区放大成一次
     // futex 唤醒。这里保留较小的有界自旋，并且一旦队列发布立即退出，
     // 因而不会越过 FIFO waiter。
-    if (!target && !m_impl->m_has_waiters.load(std::memory_order_acquire)) {
+    if (!target &&
+        (m_impl->m_state.load(std::memory_order_acquire) & Impl::kWaiter) ==
+            0U) {
         constexpr int kNativeSpinAttempts = 256;
         for (int attempt = 0; attempt < kNativeSpinAttempts; ++attempt) {
-            if (m_impl->m_has_waiters.load(std::memory_order_acquire)) {
+            if ((m_impl->m_state.load(std::memory_order_acquire) &
+                 Impl::kWaiter) != 0U) {
                 break;
             }
-            expected = false;
-            if (m_impl->m_fast_locked.compare_exchange_weak(
-                    expected, true, std::memory_order_acquire,
+            expected_state = 0U;
+            if (m_impl->m_state.compare_exchange_weak(
+                    expected_state, Impl::kLocked,
+                    std::memory_order_acquire,
                     std::memory_order_relaxed)) {
                 return true;
             }
@@ -426,19 +487,54 @@ bool Mutex::Lock(const ContextPtr& context) {
             release_waiter();
             return false;
         }
-        expected = false;
-        if (m_impl->m_fast_locked.compare_exchange_strong(
-                    expected, true, std::memory_order_acquire,
-                    std::memory_order_relaxed)) {
-            release_waiter();
-            return true;
+
+        // 等待者位只在持有队列锁时发布。这样不会出现“等待者已经设置
+        // 标志但尚未入队，Unlock 却覆盖标志”的窗口：Unlock 的无竞争
+        // CAS 可以在本段之前把锁释放掉，当前调用随后重新观察到空闲锁
+        // 并直接取得；如果 CAS 发生在发布之后，则必然看到 kWaiter 并
+        // 进入同一把队列锁完成 FIFO 交接。
+        for (;;) {
+            expected_state = m_impl->m_state.load(std::memory_order_acquire);
+            if ((expected_state & Impl::kLocked) == 0U &&
+                m_impl->m_waiters.empty()) {
+                if (m_impl->m_state.compare_exchange_weak(
+                        expected_state, Impl::kLocked,
+                        std::memory_order_acquire,
+                        std::memory_order_relaxed)) {
+                    release_waiter();
+                    return true;
+                }
+                continue;
+            }
+
+            if ((expected_state & Impl::kWaiter) == 0U) {
+                const std::uint8_t published = static_cast<std::uint8_t>(
+                    expected_state | Impl::kWaiter);
+                if (!m_impl->m_state.compare_exchange_weak(
+                        expected_state, published,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    continue;
+                }
+            }
+            break;
         }
+
         m_impl->m_waiters.push_back(waiter);
-        m_impl->m_has_waiters.store(true, std::memory_order_release);
+        if (!target) {
+            m_impl->m_native_waiters.fetch_add(1U, std::memory_order_release);
+        }
         if (!waiter->Arm()) {
             m_impl->m_waiters.pop_back();
-            m_impl->m_has_waiters.store(!m_impl->m_waiters.empty(),
-                                        std::memory_order_release);
+            if (!target) {
+                m_impl->m_native_waiters.fetch_sub(1U,
+                                                    std::memory_order_release);
+            }
+            if (m_impl->m_waiters.empty()) {
+                m_impl->m_state.fetch_and(
+                    static_cast<std::uint8_t>(~Impl::kWaiter),
+                    std::memory_order_release);
+            }
             release_waiter();
             return false;
         }
@@ -448,9 +544,21 @@ bool Mutex::Lock(const ContextPtr& context) {
     subscription.Reset();
     if (result != WaitResult::kNotified) {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
-        RemoveWaiter(m_impl->m_waiters, waiter);
-        m_impl->m_has_waiters.store(!m_impl->m_waiters.empty(),
-                                    std::memory_order_release);
+        const auto position =
+            std::find(m_impl->m_waiters.begin(), m_impl->m_waiters.end(),
+                      waiter);
+        if (position != m_impl->m_waiters.end()) {
+            m_impl->m_waiters.erase(position);
+            if (!waiter->managed()) {
+                m_impl->m_native_waiters.fetch_sub(
+                    1U, std::memory_order_release);
+            }
+        }
+        if (m_impl->m_waiters.empty()) {
+            m_impl->m_state.fetch_and(
+                static_cast<std::uint8_t>(~Impl::kWaiter),
+                std::memory_order_release);
+        }
         if (owned_waiter) {
             ReleaseWaitNode(std::move(owned_waiter));
         }
@@ -479,40 +587,54 @@ bool Mutex::LockFor(ContextDuration timeout, const ContextPtr& parent) {
 }
 
 bool Mutex::TryLock() noexcept {
-    if (m_impl->m_has_waiters.load(std::memory_order_acquire)) {
-        return false;
-    }
-    bool expected = false;
-    return m_impl->m_fast_locked.compare_exchange_strong(
-        expected, true, std::memory_order_acquire,
+    std::uint8_t expected = 0U;
+    const bool acquired = m_impl->m_state.compare_exchange_strong(
+        expected, Impl::kLocked, std::memory_order_acquire,
         std::memory_order_relaxed);
+    return acquired;
 }
 
 void Mutex::Unlock() {
+    // 无等待者时只需一次 CAS，不进入队列互斥量。若等待者位同时存在，
+    // CAS 必定失败并转入下面的 FIFO 交接路径。
+    std::uint8_t expected_state = Impl::kLocked;
+    if (m_impl->m_state.compare_exchange_strong(
+            expected_state, 0U, std::memory_order_release,
+            std::memory_order_acquire)) {
+        return;
+    }
+
     WaitNode* selected = nullptr;
     {
         // Unlock 与 waiter 发布必须共享同一把队列锁。原子快路径无法
         // 同时覆盖 waiter 入队和另一个线程重新取得锁的交错，统一在此
         // 线性化可以避免丢唤醒和“误解锁后来 owner”。
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
-        if (!m_impl->m_fast_locked.load(std::memory_order_acquire)) {
+        if ((m_impl->m_state.load(std::memory_order_acquire) &
+             Impl::kLocked) == 0U) {
             throw std::logic_error("go2cpp::sync::Mutex unlock of unlocked mutex");
         }
         while (!m_impl->m_waiters.empty()) {
             WaitNode* candidate = m_impl->m_waiters.front();
             m_impl->m_waiters.pop_front();
-            if (candidate &&
-                candidate->TryFinish(WaitResult::kNotified)) {
+            if (candidate && !candidate->managed()) {
+                m_impl->m_native_waiters.fetch_sub(
+                    1U, std::memory_order_release);
+            }
+            if (candidate && candidate->TryFinish(WaitResult::kNotified)) {
                 selected = candidate;
                 break;
             }
         }
         if (!selected) {
-            m_impl->m_has_waiters.store(false, std::memory_order_release);
-            m_impl->m_fast_locked.store(false, std::memory_order_release);
+            m_impl->m_state.store(0U, std::memory_order_release);
         } else {
-            m_impl->m_has_waiters.store(!m_impl->m_waiters.empty(),
-                                        std::memory_order_release);
+            m_impl->m_state.store(
+                static_cast<std::uint8_t>(Impl::kLocked |
+                                           (m_impl->m_waiters.empty()
+                                                ? 0U
+                                                : Impl::kWaiter)),
+                std::memory_order_release);
         }
         // With a selected waiter the lock remains logically held: ownership
         // is handed directly to the FIFO head, so a TryLock caller cannot barge.

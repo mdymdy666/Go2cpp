@@ -180,6 +180,11 @@ public:
     bool queued() const noexcept;
     bool started() const noexcept;
     bool cancellation_requested() const noexcept;
+    // 最近一次运行该 G 的 P。外部唤醒者只把它作为亲和性提示，真正的
+    // 执行权仍由 Task 状态机串行化。
+    PId last_processor_id() const noexcept {
+        return m_last_processor_id.load(std::memory_order_relaxed);
+    }
     TaskClassId task_class() const noexcept;
     // 普通 C++ 异常导致的失败是可观察终态，不会静默当作正常完成。
     bool failed() const noexcept;
@@ -278,7 +283,7 @@ private:
     std::atomic<bool> m_started{false};
     std::atomic<bool> m_cancel_requested{false};
     MId m_last_machine_id{0};
-    PId m_last_processor_id{0};
+    std::atomic<PId> m_last_processor_id{0};
     bool m_binding_published{false};
     mutable std::mutex m_failure_mutex;
     std::exception_ptr m_failure;
@@ -370,6 +375,10 @@ public:
     }
     bool yield(const std::shared_ptr<Task>& task);
     bool park(const std::shared_ptr<Task>& task);
+    // 同步原语等待的轻量挂起路径。Task 已由 WaitNode 注册，使用与 IO
+    // 相同的原子 Waiting -> Runnable 交接，避免每次 Mutex handoff 获取
+    // scheduler admission 锁；shutdown 通过二次检查和 wake_for_wait 收敛。
+    bool park_wait(const std::shared_ptr<Task>& task);
     // IOManager 使用此入口记录 Fiber 正在等待 readiness；它与普通
     // park 共用同一 Task 状态和 wake 竞态，但诊断帧会保留 Io 原因。
     bool park_io(const std::shared_ptr<Task>& task);
@@ -451,6 +460,10 @@ public:
 private:
     // 仅供拥有该 G 执行权的 worker 在 resume 返回后调用。
     bool requeue_from_worker(const std::shared_ptr<Task>& task);
+    // 外部 M 唤醒 G 时优先投递到 G 最近运行的 P，失败时回退到普通
+    // admission 队列，避免混合锁交接每次争用全局 incoming stripe。
+    bool requeue_to_processor(const std::shared_ptr<Task>& task,
+                              PId processor_id);
     static void leave_blocking_for(Scheduler* scheduler,
                                    MId machine_id) noexcept;
     bool park_with_reason(const std::shared_ptr<Task>& task,

@@ -75,13 +75,21 @@ public:
         Scheduler* const scheduler = m_scheduler;
         const auto task = m_task;
         for (;;) {
+            // Notify 可能在当前 G 进入 park 前完成。终态已经通过
+            // WaitNode::Finish 发布时，直接返回可跳过 Scheduler admission
+            // 锁和一次无意义的挂起/恢复，减少 Fiber/线程混合条件变量的
+            // 短等待开销，同时不改变 notify-before-park 的语义。
+            const Result published = result();
+            if (published != Result::kWaiting) {
+                return published;
+            }
             if (task->cancellation_requested()) {
                 (void)Finish(Result::kCancelled);
                 return result();
             }
             // A notifier can run before park. Always consume its pending
             // wake permit, even when the terminal result is visible already.
-            const bool suspended = scheduler->park(task);
+            const bool suspended = scheduler->park_wait(task);
             if (result() != Result::kWaiting) {
                 return result();
             }
