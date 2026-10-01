@@ -93,6 +93,17 @@ void run_log_config_tests() {
         std::ofstream watch_file(watch_path);
         watch_file << "[log]\nlevel=error\nstdout=false\nformat={message}\\n\n";
     }
+    const auto edit_lock_path = watch_path.string() + ".lock";
+    {
+        std::ofstream edit_lock(edit_lock_path);
+        edit_lock << "editing";
+    }
+    std::string watcher_error;
+    GO2CPP_CHECK(!registry.StartWatcher(watch_path.string(),
+                                        std::chrono::milliseconds(20),
+                                        &watcher_error));
+    GO2CPP_CHECK(watcher_error.find("编辑锁") != std::string::npos);
+    std::filesystem::remove(edit_lock_path);
     GO2CPP_REQUIRE(registry.StartWatcher(watch_path.string(), std::chrono::milliseconds(20)));
     auto dynamic_logger = GO2CPP_LOG_NAME("dynamic");
     GO2CPP_CHECK(dynamic_logger->level() == log::Level::Error);
@@ -109,8 +120,39 @@ void run_log_config_tests() {
     }
     GO2CPP_REQUIRE_EVENTUALLY(dynamic_logger->level() == log::Level::Info,
                               watcher_timeout);
+    // 模拟编辑器的截断写入：半个配置不能覆盖旧快照，写完整后仍应继续生效。
+    {
+        std::ofstream watch_file(watch_path, std::ios::trunc);
+        watch_file << "[log]\nlevel=";
+        watch_file.flush();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    GO2CPP_CHECK(dynamic_logger->level() == log::Level::Info);
+    {
+        std::ofstream watch_file(watch_path, std::ios::trunc);
+        watch_file << "[log]\nlevel=warn\nstdout=false\nformat=%p:%m%n\n";
+    }
+    GO2CPP_REQUIRE_EVENTUALLY(dynamic_logger->level() == log::Level::Warn,
+                              watcher_timeout);
+    // 编辑锁非空期间不读取配置；清空锁文件是写入事务的提交点。
+    {
+        std::ofstream edit_lock(edit_lock_path, std::ios::trunc);
+        edit_lock << "editing";
+    }
+    {
+        std::ofstream watch_file(watch_path, std::ios::trunc);
+        watch_file << "[log]\nlevel=debug\nstdout=false\nformat=%p:%m%n\n";
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    GO2CPP_CHECK(dynamic_logger->level() == log::Level::Warn);
+    {
+        std::ofstream edit_lock(edit_lock_path, std::ios::trunc);
+    }
+    GO2CPP_REQUIRE_EVENTUALLY(dynamic_logger->level() == log::Level::Debug,
+                              watcher_timeout);
     registry.StopWatcher();
     std::filesystem::remove(watch_path);
+    std::filesystem::remove(edit_lock_path);
 
     RuntimeConfig dynamic_runtime;
     GO2CPP_REQUIRE(config::BindRuntimeConfig(registry, &dynamic_runtime, &error));

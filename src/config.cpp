@@ -7,6 +7,7 @@
 #include <sstream>
 #include <iostream>
 #include <string_view>
+#include <thread>
 
 namespace go2cpp::config {
 namespace {
@@ -111,13 +112,155 @@ bool ReadSize(const IniFile& ini, const char* section, const char* key,
     return false;
 }
 
+// 文件被编辑器直接截断并重写时，监听线程可能恰好读到半个文件。用
+// “元数据相同 + 内容相同”的两次快照确认稳定状态；确认失败只重试，绝不
+// 把半文件提交给配置中心。生产环境仍建议写临时文件后 rename 替换。
+struct FileStamp final {
+    std::filesystem::file_time_type modified{};
+    std::uintmax_t size{0};
+
+    bool operator==(const FileStamp& other) const noexcept {
+        return modified == other.modified && size == other.size;
+    }
+};
+
+bool ReadFileStamp(const std::string& path, FileStamp* stamp,
+                   std::string* error) {
+    if (!stamp) return false;
+    std::error_code ec;
+    stamp->modified = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        if (error) *error = "无法读取配置文件时间戳: " + path;
+        return false;
+    }
+    stamp->size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        if (error) *error = "无法读取配置文件大小: " + path;
+        return false;
+    }
+    return true;
+}
+
+std::string EditLockPath(const std::string& path) {
+    return path + ".lock";
+}
+
+// 配置写入方通过 path + ".lock" 声明编辑事务：锁文件非空表示配置仍在
+// 修改，空文件或不存在表示可以读取。这里只检查文件大小，不读取锁文件
+// 内容，避免监听线程因为锁文件本身被截断而误判为已提交。
+bool IsEditLocked(const std::string& path, bool* locked, std::string* error) {
+    if (!locked) return false;
+    const auto lock_path = EditLockPath(path);
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(lock_path, ec);
+    if (ec) {
+        if (error) *error = "无法检查配置编辑锁: " + lock_path;
+        return false;
+    }
+    if (!exists) {
+        *locked = false;
+        return true;
+    }
+    const auto size = std::filesystem::file_size(lock_path, ec);
+    if (ec) {
+        if (error) *error = "无法读取配置编辑锁大小: " + lock_path;
+        return false;
+    }
+    *locked = size != 0;
+    return true;
+}
+
+bool ReadFileContents(const std::string& path, std::string* contents,
+                      std::string* error) {
+    if (!contents) return false;
+    std::ifstream stream(path, std::ios::in | std::ios::binary);
+    if (!stream) {
+        if (error) *error = "无法打开配置文件: " + path;
+        return false;
+    }
+    std::ostringstream buffer;
+    buffer << stream.rdbuf();
+    if (!stream.good() && !stream.eof()) {
+        if (error) *error = "读取配置文件失败: " + path;
+        return false;
+    }
+    *contents = buffer.str();
+    return true;
+}
+
+bool ReadStableFileContents(const std::string& path, std::string* contents,
+                            std::string* error) {
+    constexpr int kAttempts = 8;
+    constexpr auto kRetryDelay = std::chrono::milliseconds(2);
+    std::string last_error;
+    bool lock_seen = false;
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        bool edit_locked = false;
+        if (!IsEditLocked(path, &edit_locked, &last_error)) {
+            std::this_thread::sleep_for(kRetryDelay);
+            continue;
+        }
+        if (edit_locked) {
+            lock_seen = true;
+            std::this_thread::sleep_for(kRetryDelay);
+            continue;
+        }
+        FileStamp before;
+        std::string first;
+        FileStamp after;
+        if (ReadFileStamp(path, &before, &last_error) &&
+            ReadFileContents(path, &first, &last_error) &&
+            ReadFileStamp(path, &after, &last_error) && before == after) {
+            bool locked_after_read = false;
+            if (!IsEditLocked(path, &locked_after_read, &last_error)) {
+                std::this_thread::sleep_for(kRetryDelay);
+                continue;
+            }
+            if (locked_after_read) {
+                lock_seen = true;
+                std::this_thread::sleep_for(kRetryDelay);
+                continue;
+            }
+            FileStamp verify_before;
+            std::string second;
+            FileStamp verify_after;
+            if (ReadFileStamp(path, &verify_before, &last_error) &&
+                ReadFileContents(path, &second, &last_error) &&
+                ReadFileStamp(path, &verify_after, &last_error) &&
+                after == verify_before && verify_before == verify_after &&
+                first == second) {
+                bool locked_after_verify = false;
+                if (!IsEditLocked(path, &locked_after_verify, &last_error)) {
+                    std::this_thread::sleep_for(kRetryDelay);
+                    continue;
+                }
+                if (locked_after_verify) {
+                    lock_seen = true;
+                    std::this_thread::sleep_for(kRetryDelay);
+                    continue;
+                }
+                *contents = std::move(second);
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(kRetryDelay);
+    }
+    if (error) {
+        *error = lock_seen
+                     ? "配置文件正在编辑，请先清空编辑锁: " + EditLockPath(path)
+                     : "配置文件在读取期间仍在变化，请使用临时文件加 rename 原子替换: " +
+                           path;
+        if (!last_error.empty()) *error += "（" + last_error + "）";
+    }
+    return false;
+}
+
 }  // namespace
 
 bool IniFile::Load(const std::string& path, std::string* error) {
-    std::ifstream stream(path);
-    if (!stream) { if (error) *error = "无法打开配置文件: " + path; return false; }
-    std::ostringstream contents; contents << stream.rdbuf();
-    return Parse(contents.str(), error);
+    std::string contents;
+    return ReadStableFileContents(path, &contents, error) &&
+           Parse(contents, error);
 }
 
 bool IniFile::Parse(const std::string& text, std::string* error) {
@@ -280,15 +423,25 @@ bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds int
     }
     std::lock_guard<std::mutex> lifecycle_lock(m_watcher_lifecycle_mutex);
     stop_watcher_locked();
-    std::error_code read_error;
-    auto stamp = std::filesystem::last_write_time(path, read_error);
-    if (read_error) {
-        if (error) *error = "无法读取配置文件时间戳: " + path;
+    bool edit_locked = false;
+    if (!IsEditLocked(path, &edit_locked, error)) return false;
+    if (edit_locked) {
+        if (error) {
+            *error = "配置文件正在编辑，请先清空编辑锁: " + EditLockPath(path);
+        }
+        return false;
+    }
+    FileStamp initial_stamp;
+    if (!ReadFileStamp(path, &initial_stamp, error)) {
         return false;
     }
     if (!LoadFromFile(path, error)) return false;
     m_watching.store(true, std::memory_order_release);
-    m_watcher = std::thread([this, path, interval, stamp]() mutable {
+    m_watcher = std::thread([this, path, interval, initial_stamp]() mutable {
+        auto stamp = initial_stamp;
+        // 锁从非空变为空时必须强制尝试一次，即使文件系统的时间戳和大小
+        // 没有变化；这样同尺寸原子替换也不会被旧基准短路。
+        bool retry_pending = false;
         while (m_watching.load(std::memory_order_acquire)) {
             // 条件变量让停止监听操作立即唤醒，不必等待一个完整刷新周期。
             std::unique_lock<std::mutex> wait_lock(m_watcher_mutex);
@@ -297,26 +450,40 @@ bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds int
             });
             wait_lock.unlock();
             if (!m_watching.load(std::memory_order_acquire)) break;
-            std::error_code read_error;
-            const auto current = std::filesystem::last_write_time(path, read_error);
-            if (read_error || current == stamp) continue;
+            bool edit_locked = false;
+            std::string lock_error;
+            if (!IsEditLocked(path, &edit_locked, &lock_error)) {
+                std::cerr << "Go2Cpp 配置编辑锁检查失败: " << lock_error << '\n';
+                continue;
+            }
+            if (edit_locked) {
+                retry_pending = true;
+                continue;
+            }
+            FileStamp current;
+            std::string stamp_error;
+            if (!ReadFileStamp(path, &current, &stamp_error) ||
+                (current == stamp && !retry_pending)) {
+                continue;
+            }
             std::string error;
             try {
                 if (LoadFromFile(path, &error)) {
                     stamp = current;
+                    retry_pending = false;
                 } else {
                     std::cerr << "Go2Cpp 配置热加载失败: " << error << '\n';
-                    stamp = current;
+                    retry_pending = true;
                 }
             } catch (const std::exception& exception) {
                 // 监听器属于用户扩展点，异常不能逃出配置监听线程；
                 // 记录本次失败后继续监视后续文件变化。
                 std::cerr << "Go2Cpp 配置监听器异常: " << exception.what()
                           << '\n';
-                stamp = current;
+                retry_pending = true;
             } catch (...) {
                 std::cerr << "Go2Cpp 配置监听器抛出未知异常\n";
-                stamp = current;
+                retry_pending = true;
             }
         }
     });

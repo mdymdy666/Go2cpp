@@ -227,11 +227,13 @@ public:
     ConfigVarBase::ptr LookupBase(const std::string& name) const;
     // 预检所有已注册变量后批量应用 INI 中出现的键。
     bool LoadFromIni(const IniFile& ini, std::string* error = nullptr);
-    // 读取 path 后调用 LoadFromIni。
+    // 对 path 做稳定快照后调用 LoadFromIni。快照失败或 INI 无效时不会
+    // 修改已注册变量；生产热更新应使用 path + ".lock" 编辑锁和原子 rename。
     bool LoadFromFile(const std::string& path, std::string* error = nullptr);
     // 返回当前已注册变量的共享指针快照。
     std::vector<ConfigVarBase::ptr> List() const;
-    // 立即加载 path，并按 interval 轮询修改时间；失败不会启动线程。
+    // 立即加载 path，并按 interval 轮询。监听前先检查 path + ".lock"：锁文件
+    // 非空时拒绝启动或暂缓刷新，空文件/不存在时才读取配置；失败不会启动线程。
     bool StartWatcher(const std::string& path, std::chrono::milliseconds interval = std::chrono::milliseconds(1000), std::string* error = nullptr);
     // 停止监听并等待监听线程退出；可重复调用。
     void StopWatcher();

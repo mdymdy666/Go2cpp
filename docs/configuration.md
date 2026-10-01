@@ -69,6 +69,24 @@ if (!go2cpp::config::LoadAndWatch(config, "go2cpp.ini",
 因此业务线程可以直接调用 `GetValue()`。监听器仍按注册顺序串行执行，
 监听器中不应长时间阻塞或再次等待业务锁。
 
+热更新使用配置文件旁边的编辑锁文件保护写入事务。监听
+`go2cpp.ini` 时，监听器会先检查 `go2cpp.ini.lock`：锁文件非空表示仍在编辑，
+此期间不会读取或提交目标配置；锁文件为空或不存在才会继续读取。写入方应先写入
+非空锁文件，再把完整内容写到同目录临时文件，关闭并校验后用 `rename` 原子替换
+目标文件，最后将 `.lock` 截断为空文件作为提交信号：
+
+```text
+写入 go2cpp.ini.lock（任意非空内容）
+写入 go2cpp.ini.tmp
+关闭并校验 go2cpp.ini.tmp
+rename(go2cpp.ini.tmp, go2cpp.ini)
+截断 go2cpp.ini.lock 为空
+```
+
+监听器还会对配置文件做连续快照确认，并在解析或校验失败时保留旧值、下一轮继续
+重试。这能避免常见的截断半文件；直接对正在监听的目标文件长时间 `truncate/write`
+仍可能留下语法上完整但尚未写完的前缀，因此不能替代上述锁文件和原子替换协议。
+
 `Config::LoadFromFile` 会先校验所有已注册变量的类型，再统一提交变更；监听器只
 在值真正改变后触发。`BindLoggingConfig` 将 `log.*` 变量绑定到 LoggerManager，
 因此热加载会更新已经存在的 Logger。`BindRuntimeConfig` 可以把调度参数绑定到

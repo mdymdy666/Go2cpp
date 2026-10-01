@@ -784,3 +784,20 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
   CTest 3/3；ASan+UBSan 构建 CTest 14/14；Valgrind 全量单测通过，`ERROR SUMMARY: 0`，
   definite/indirect/possible leak 均为 0，仅 416 bytes/4 blocks 进程级 still reachable。
   TSan 仍受 WSL 的 `unexpected memory mapping` 启动限制，未宣称通过。
+
+## 2026-10-02：配置热加载编辑锁与半文件保护
+
+- 修复配置监听可能读到编辑器截断文件、并在失败后错误确认文件版本的问题。
+  `IniFile::Load` 现在连续读取文件元数据和内容，只有快照稳定且 INI 解析成功才
+  进入配置中心；失败不会更新监听器基准，后续轮询会继续重试。
+- 配置监听增加固定的 `path + ".lock"` 编辑锁协议。锁文件非空时，启动监听会拒绝
+  读取，运行中的监听会跳过刷新；锁文件为空或不存在才允许加载。生产写入流程应为：
+  写入非空锁、写同目录临时文件、关闭并校验、`rename` 原子替换目标、最后清空锁文件。
+  文档和 `go2cpp.ini` 模板已写明该约束。稳定快照是兜底保护，不能判断语法上完整但仍
+  在继续写入的部分前缀，因此不支持绕过编辑锁直接长时间覆盖正式文件。
+- 测试新增启动时锁拒绝、锁定期间保持旧值、清空锁后更新，以及截断半文件恢复；覆盖
+  Release、`-Wall -Wextra -Wpedantic -Werror`、ASan/UBSan 和 Valgrind。
+- 验证结果：`build-final` CTest 14/14；`build-engineering-werror` CTest 3/3；
+  `build-native-asan` CTest 14/14；Valgrind `ERROR SUMMARY: 0`，definite/indirect/
+  possible leak 均为 0，仅 416 bytes/4 blocks still reachable。构建时 WSL 与 Windows
+  文件时间有轻微偏差，出现 gmake clock skew 警告，不影响测试结果。
