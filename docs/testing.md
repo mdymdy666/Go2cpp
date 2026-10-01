@@ -597,3 +597,16 @@ IO）：
 栈；直接用 memcpy 搬迁活动 C++ 栈会破坏指针、RAII 和 fcontext，不能作为
 可靠优化提交。后续若启用编译器 split-stack 或替换为支持 segmented stack
 的后端，才能继续推进自动扩容。
+## 逻辑链路审计（2026-10-02）
+
+本轮审计的状态机、不变量、线性化点和已知边界见
+[`docs/correctness_audit.md`](correctness_audit.md)。新增的 IO 代际二次校验、
+空 waiter 撤销 epoll registration、嵌套 Fiber IO 回归和 native context 的
+Valgrind 栈登记已经重新构建验证。
+
+当前证据：`build-context-test` CTest 13/13 通过，高负载测试连续 3 次通过；
+`build-engineering-werror` 3/3 通过；ASan/UBSan 全量单元测试通过；
+`build-native-context/valgrind-audit3.log` 为 `ERROR SUMMARY: 0`，
+definite/indirect/possible leak 均为 0，416 bytes/4 blocks 是进程级
+still reachable 缓存。TSan 仍受 WSL 的 `unexpected memory mapping` 启动限制，
+不能作为本机全套竞态通过结论。

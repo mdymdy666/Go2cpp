@@ -476,6 +476,20 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 }
                 return {};
             }
+            // 首次校验与取得 m_mutex 之间可能正好发生 close/dup2。
+            // 关闭路径先使 DescriptorToken 失效，再唤醒旧 waiter；如果
+            // 这里不在发布节点前再次检查，关闭完成后本次 wait 仍会把
+            // 旧 fd 放回队列，既没有新的 epoll 注册者，也没有后续关闭
+            // 事件可以唤醒它，最终形成永久挂起。该检查是 fd 代际门的
+            // 第二个线性化点；检查后到入队期间的失效仍由同一 m_mutex
+            // 下的 notify_close 排空处理。
+            if (descriptor &&
+                (!descriptor->valid() || descriptor->fd() != fd)) {
+                if (error != nullptr) {
+                    *error = EBADF;
+                }
+                return {};
+            }
 
             for (auto it = s_node_cache.begin(); it != s_node_cache.end(); ++it) {
                 if (it->first == this) {
@@ -848,7 +862,15 @@ private:
             interest |= kWriteMask;
         }
 
-        if (interest == 0 && slot.registered) {
+        if (interest == 0) {
+            // 没有任何等待者时必须撤销 epoll 注册。仅保留 registered
+            // 会让旧的 ET 注册持续产生事件；poller 每次虽然找不到
+            // waiter，却仍会反复处理同一个 fd，造成忙循环并阻止 fd
+            // 代际复用。pending_* 是已经观察到的就绪提示，仍由下一次
+            // register_wait 消费，因此撤销内核注册不会丢失该提示。
+            if (slot.registered) {
+                invalidate_registration_locked(slot);
+            }
             return 0;
         }
 

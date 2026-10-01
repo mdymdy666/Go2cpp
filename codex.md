@@ -726,3 +726,22 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
   后仍可复现，确认不是 FiberBin 引入）。因此不能把 ASan 宣称为稳定全通过；TSan
   仍受本机运行时映射限制。高负载混合 Mutex 仍明显慢于线程基准，FiberBin 只降低
   创建/销毁分配开销，不宣称已经消除调度和混合锁的主要成本。
+
+## 2026-10-02：逻辑链路审计与 IO 代际竞态修复
+
+- 对 Task 的状态转换、Runnable 计数、execution claim、P/M 绑定、sysmon、shutdown、
+  嵌套 Fiber 父链、混合同步原语、Context 取消、Channel/Select 以及 IO 等待分别记录
+  线性化点和不变量，详见 `docs/correctness_audit.md`。审计结论限定在文档列出的
+  API 使用契约内，未把“测试通过”表述成数学意义上的零 Bug。
+- `src/io.cpp` 在 descriptor token 首次检查后、取得 State 锁并发布 waiter 前增加第二次
+  generation/FD 检查；关闭或 dup2 与注册交错时不会把失效 fd 重新放入无后续事件的队列。
+  当 fd 已无 waiter 时撤销 epoll registration，避免旧 ET 注册造成忙循环和代际残留；仍有
+  waiter 时保留已发布的 interest 位，以吸收内核中已经排队的迟到 ET 事件。
+- `src/fiber.cpp` 的 native context 为 Memcheck 登记/注销自定义 Fiber 栈，修复换栈后
+  Valgrind 无法识别栈边界导致的误报。`tests/test_io.cpp` 新增嵌套 Fiber IO 唤醒回归，
+  并仅在 Valgrind 下放宽超时和轮数，保持同一状态机而避免检测器开销造成误报。
+- 重新验证：`build-context-test` CTest 13/13、`build-engineering-werror` CTest 3/3、
+  `build-native-context` CTest 14/14 均通过；高负载测试连续三轮通过；ASan/UBSan 全量
+  单测通过；Valgrind `ERROR SUMMARY: 0`，definite/indirect/possible leak 均为 0，
+  仅有 416 bytes/4 blocks 的进程级 still reachable 缓存。TSan 仍受 WSL
+  `unexpected memory mapping` 启动限制，未宣称 native Linux 竞态验证通过。

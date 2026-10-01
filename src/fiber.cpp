@@ -10,6 +10,12 @@
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#if defined(__has_include)
+#if __has_include(<valgrind/valgrind.h>)
+#include <valgrind/valgrind.h>
+#define GO2CPP_FIBER_HAVE_VALGRIND 1
+#endif
+#endif
 #endif
 
 #include <algorithm>
@@ -177,9 +183,21 @@ struct FiberStack {
             m_mapping = nullptr;
             throw std::bad_alloc();
         }
+#if defined(GO2CPP_FIBER_HAVE_VALGRIND)
+        // 自定义 context 汇编不会自动告诉 Memcheck 新栈边界。注册只在
+        // Memcheck 运行时生效，普通构建会被 Valgrind 客户端宏消除，
+        // 不改变 Fiber 的热路径和栈布局。
+        m_valgrind_stack_id = VALGRIND_STACK_REGISTER(bottom(), stack_pointer());
+#endif
     }
 
     ~FiberStack() noexcept {
+#if defined(GO2CPP_FIBER_HAVE_VALGRIND)
+        if (m_valgrind_stack_id != 0U) {
+            VALGRIND_STACK_DEREGISTER(m_valgrind_stack_id);
+            m_valgrind_stack_id = 0U;
+        }
+#endif
         if (m_mapping != nullptr) {
             release(m_requested_size, m_page_size, m_mapping_size, m_mapping);
         }
@@ -271,6 +289,9 @@ private:
     std::size_t m_page_size;
     std::size_t m_mapping_size;
     void* m_mapping;
+#if defined(GO2CPP_FIBER_HAVE_VALGRIND)
+    unsigned m_valgrind_stack_id{0U};
+#endif
 #else
     explicit FiberStack(std::size_t size)
         : m_requested_size(size),

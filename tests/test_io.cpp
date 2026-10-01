@@ -1,4 +1,5 @@
 #include "go2cpp/io.hpp"
+#include "go2cpp/fiber.hpp"
 #include "test_support.hpp"
 
 #include <sys/socket.h>
@@ -242,6 +243,46 @@ void test_shutdown_wakes_infinite_wait() {
     raw_close(fds[1]);
 }
 
+void test_nested_fiber_io_propagation() {
+    IOManager manager(one_worker_config());
+    GO2CPP_CHECK(manager.Start());
+    int fds[2]{-1, -1};
+    GO2CPP_CHECK(make_pair(fds));
+
+    std::atomic<int> stage{0};
+    std::atomic<bool> parent_done{false};
+    auto parent = manager.Go([&] {
+        go2cpp::Fiber outer([&] {
+            go2cpp::Fiber inner([&] {
+                stage.store(1, std::memory_order_release);
+                const auto result = manager.WaitFor(fds[0], IOEvent::kRead,
+                                                    1s);
+                GO2CPP_CHECK(result.status == IOWaitStatus::kReady);
+                stage.store(2, std::memory_order_release);
+            });
+            // inner 的 IO park 必须沿 inner -> outer -> Task Fiber 的父链
+            // 传播；唤醒后 inner 先继续，不能跳过 outer 直接结束任务。
+            GO2CPP_CHECK(inner.resume());
+            GO2CPP_CHECK(stage.load(std::memory_order_acquire) == 2);
+            stage.store(3, std::memory_order_release);
+        });
+        GO2CPP_CHECK(outer.resume());
+        GO2CPP_CHECK(stage.load(std::memory_order_acquire) == 3);
+        parent_done.store(true, std::memory_order_release);
+    });
+
+    GO2CPP_REQUIRE_EVENTUALLY(
+        stage.load(std::memory_order_acquire) == 1, 1s);
+    const char byte = 'n';
+    GO2CPP_CHECK(::syscall(SYS_write, fds[1], &byte, 1) == 1);
+    GO2CPP_CHECK(parent->wait_for(1s));
+    GO2CPP_CHECK(parent_done.load(std::memory_order_acquire));
+    GO2CPP_CHECK(stage.load(std::memory_order_acquire) == 3);
+
+    close_pair(manager, fds);
+    manager.Shutdown();
+}
+
 void test_readiness_timeout_race() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 4;
@@ -249,8 +290,15 @@ void test_readiness_timeout_race() {
     IOManager manager(config);
     GO2CPP_CHECK(manager.Start());
 
-    constexpr int kRounds = 10000;
+    int kRounds = 10000;
     constexpr int kBatch = 32;
+#if defined(GO2CPP_TEST_HAS_VALGRIND)
+    if (RUNNING_ON_VALGRIND) {
+        // Keep the same ready/timeout/cleanup state machine under Memcheck,
+        // while avoiding an hours-long run caused only by instrumentation.
+        kRounds = 1000;
+    }
+#endif
     std::atomic<int> ready{0};
     std::atomic<int> timed_out{0};
     std::atomic<int> invalid{0};
@@ -266,8 +314,14 @@ void test_readiness_timeout_race() {
             pairs.emplace_back(fds[0], fds[1]);
             const int read_fd = fds[0];
             manager.Go([&, read_fd] {
+                auto io_timeout = 2ms;
+#if defined(GO2CPP_TEST_HAS_VALGRIND)
+                if (RUNNING_ON_VALGRIND) {
+                    io_timeout = 20ms;
+                }
+#endif
                 const auto result =
-                    manager.WaitFor(read_fd, IOEvent::kRead, 2ms);
+                    manager.WaitFor(read_fd, IOEvent::kRead, io_timeout);
                 if (result.status == IOWaitStatus::kReady) {
                     ready.fetch_add(1, std::memory_order_relaxed);
                 } else if (result.status == IOWaitStatus::kTimeout) {
@@ -285,7 +339,17 @@ void test_readiness_timeout_race() {
                             &byte, 1);
         }
 
-        const auto watchdog = std::chrono::steady_clock::now() + 2s;
+        // Memcheck 会显著放大自定义 Fiber 上下文与 epoll 的切换成本；
+        // 这里的 watchdog 只用于防止永久挂起，不应把检测器的调度
+        // 放大误报为 IO 状态机失败。
+        auto watchdog_timeout = 2s;
+#if defined(GO2CPP_TEST_HAS_VALGRIND)
+        if (RUNNING_ON_VALGRIND) {
+            watchdog_timeout *= 20;
+        }
+#endif
+        const auto watchdog = std::chrono::steady_clock::now() +
+                              watchdog_timeout;
         while (done.load(std::memory_order_acquire) != count &&
                std::chrono::steady_clock::now() < watchdog) {
             std::this_thread::sleep_for(100us);
@@ -543,6 +607,7 @@ void run_io_tests() {
     go2cpp_tests::announce("Linux epoll IO manager and cancellation races");
     test_single_p_and_wait_results();
     test_shutdown_wakes_infinite_wait();
+    test_nested_fiber_io_propagation();
     test_readiness_timeout_race();
     test_sequential_and_spurious_waits();
     test_generation_reuse_and_cross_manager_close();
