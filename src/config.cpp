@@ -558,12 +558,13 @@ bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
             }
             if (variable->HasPending()) applied.push_back(variable);
         }
-        // 通知阶段位于所有值提交之后；监听器读取其他变量时只能看到同一
-        // 次文件加载的最终值，而不会读到顺序相关的中间状态。
-        for (const auto& variable : applied) variable->NotifyPending();
-        // ConfigVar 监听器已经看到完整的新值；提交级插件回调不再持有事务锁，
-        // 因而可以安全地触发下一次配置加载、查询注册表或重建外部模块。
+        // 所有变量已经完成第一阶段提交；通知阶段不持有事务锁，监听器可以
+        // 查询注册表或触发下一次配置加载，避免插件回调与事务锁形成死锁。
         transaction_lock.unlock();
+        // 监听器读取其他变量时只能看到本次文件提交后的值，不会读到本次
+        // ApplyString 顺序造成的半套状态。并发的新事务可能在此之后开始，
+        // 这是有意的：配置值已经完整发布，回调不阻塞配置刷新线程。
+        for (const auto& variable : applied) variable->NotifyPending();
         if (!applied.empty()) {
             std::map<std::uint64_t, CommitListener> listeners;
             try {

@@ -17,8 +17,9 @@
   便于新手接入自定义字段。
 - 配置中心增加 `ApplyString`/`NotifyPending`/`RollbackPending` 两阶段接口和
   `Config::AddCommitListener`。文件加载先整体校验，再整体发布值，失败恢复旧快照；
-  监听器逐个隔离异常，提交级回调在事务锁释放后执行，避免插件回调触发配置加载时
-  发生锁反转。配置文件的编辑锁、临时文件和原子 rename 约束同步补充到配置文档。
+  监听器逐个隔离异常，变量监听器和提交级回调均在事务锁释放后执行，避免插件回调
+  触发配置加载时发生锁反转。配置文件的编辑锁、临时文件和原子 rename 约束同步
+  补充到配置文档；未来批次、Fiber 栈和多平台 IO 的替换协议补充到设计文档。
 - 新增自定义 Item、重复注册、注销后快照、日期内置键保护、配置事务回滚和完整提交
   回调测试；更新 `example/log_config_demo.cpp` 和 `docs/logging.md` 新手示例。
 - 验证：`build-final` 全量 CTest 14/14 通过；`build-engineering-werror` 全量

@@ -183,6 +183,15 @@ Context 测试时钟、SelectCase、Descriptor token/guard 和 C Hook 控制是�
 边界。0.x 没有插件 ABI；替换实现必须保持上述状态转换、单次 wake claim、所有权
 和 shutdown 契约。
 
+后续扩展必须继续沿用“状态协议先于实现”的边界：配置批次通过预检、提交、通知、
+回滚四阶段表达原子处理，不允许插件直接修改多个公开字段；日志通过 Filter、Item
+工厂、Formatter 快照和 Sink 组合，不能把业务字段写死进核心解析器；Fiber 通过
+ContextBackend/栈分配器接口区分固定栈、分段栈和未来可验证的动态栈，不得复制正在
+运行的 C++ 栈来伪造 `morestack`；socket IO 通过 Poller/Hook 后端隔离 epoll、
+kqueue、IOCP 或 io_uring，所有后端都必须提供 readiness、timeout、cancel、close
+四类一次性 outcome。新增实现应先补充接口契约和故障注入测试，再接入默认路径，
+避免把平台特性、Fiber 类型或事务策略隐式耦合到 Scheduler 主循环。
+
 曾阅读 `/UserData/CodexWorkSpace/sylar2/sylar/` 中的 fiber/scheduler/IOManager/hook
 作为 clean-room 设计参考，只吸收栈切换、队列、epoll 和 readiness-before-timer
 等概念；该目录不是依赖，代码没有复制或参与构建。Go 上游参考、许可证和版本记录

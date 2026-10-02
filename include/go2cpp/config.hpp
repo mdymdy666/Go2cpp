@@ -308,8 +308,9 @@ public:
 
     /**
      * @brief 发布事务阶段暂存的监听通知。
-     * @details 回调在释放内部互斥锁后执行，允许回调再次读取配置；同一变量
-     *          在一次事务中只发布最终值，避免中间值触发模块重配置。
+     * @details 回调在释放内部互斥锁和 Config 事务锁后执行，允许回调再次读取
+     *          或提交配置；同一变量在一次事务中只发布最终值，避免中间值触发
+     *          模块重配置。
      */
     void NotifyPending() noexcept override {
         std::optional<PendingChange> change;
