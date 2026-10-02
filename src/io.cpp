@@ -2,12 +2,6 @@
 
 #include "go2cpp/core/hybrid_mutex.hpp"
 
-#ifndef __linux__
-#error "go2cpp::io currently requires Linux epoll"
-#endif
-
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -63,12 +57,6 @@ std::unordered_map<Scheduler*, IOManager*>& manager_registry() {
 /// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
 /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
 /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
-void raw_close(int fd) noexcept {
-    if (fd >= 0) {
-        (void)::syscall(SYS_close, fd);
-    }
-}
-
 /// 函数功能：完成 descriptor_is_open 调用，读取或更新相关运行时状态。
 /// 执行流程：
 /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
@@ -519,36 +507,23 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
     /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
-    explicit State(Scheduler* scheduler) : m_scheduler(scheduler) {
-        m_epoll_fd = ::epoll_create1(EPOLL_CLOEXEC);
-        if (m_epoll_fd < 0) {
-            m_init_error = errno;
-            return;
+    explicit State(Scheduler* scheduler, IOBackendPtr backend)
+        : m_scheduler(scheduler), m_backend(std::move(backend)) {
+        if (!m_backend) {
+            m_backend = CreateBackend();
         }
-        m_wake_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-        if (m_wake_fd < 0) {
-            m_init_error = errno;
-            raw_close(m_epoll_fd);
-            m_epoll_fd = -1;
-            return;
-        }
-
-        epoll_event event{};
-        event.events = EPOLLIN;
-        event.data.u64 = kWakeRegistration;
-        if (::epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, m_wake_fd, &event) != 0) {
-            m_init_error = errno;
-            raw_close(m_wake_fd);
-            raw_close(m_epoll_fd);
-            m_wake_fd = -1;
-            m_epoll_fd = -1;
+        if (!m_backend || !m_backend->initialize(&m_init_error)) {
+            if (m_init_error == 0) {
+                m_init_error = ENODEV;
+            }
         }
     }
 
     ~State() {
         shutdown();
-        raw_close(m_wake_fd);
-        raw_close(m_epoll_fd);
+        if (m_backend) {
+            m_backend->shutdown();
+        }
     }
 
     /// 函数功能：执行 start，完成本函数所属模块的单步操作。
@@ -1140,8 +1115,8 @@ private:
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void invalidate_registration_locked(FdSlot& slot) noexcept {
-        if (slot.registered) {
-            (void)::epoll_ctl(m_epoll_fd, EPOLL_CTL_DEL, slot.fd, nullptr);
+        if (slot.registered && m_backend) {
+            (void)m_backend->remove(slot.fd);
         }
         if (slot.registration_id != 0) {
             m_registrations.erase(slot.registration_id);
@@ -1189,17 +1164,7 @@ private:
         }
         interest |= slot.interest;
 
-        epoll_event event{};
-        event.events = EPOLLET | EPOLLERR | EPOLLHUP;
-        if ((interest & kReadMask) != 0) {
-            event.events |= EPOLLIN | EPOLLRDHUP;
-        }
-        if ((interest & kWriteMask) != 0) {
-            event.events |= EPOLLOUT;
-        }
-
         const std::uint64_t registration_id = next_registration_id_locked();
-        event.data.u64 = registration_id;
         try {
             m_registrations.emplace(
                 registration_id,
@@ -1208,14 +1173,13 @@ private:
             return ENOMEM;
         }
 
-        int operation = slot.registered ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
-        int result = ::epoll_ctl(m_epoll_fd, operation, slot.fd, &event);
-        if (result != 0 && operation == EPOLL_CTL_ADD && errno == EEXIST) {
-            operation = EPOLL_CTL_MOD;
-            result = ::epoll_ctl(m_epoll_fd, operation, slot.fd, &event);
-        }
+        const int result = m_backend
+                               ? m_backend->add_or_modify(
+                                     slot.fd, interest, registration_id,
+                                     slot.registered)
+                               : ENODEV;
         if (result != 0) {
-            const int saved_error = errno == 0 ? EIO : errno;
+            const int saved_error = result;
             m_registrations.erase(registration_id);
             return saved_error;
         }
@@ -1297,11 +1261,9 @@ private:
             FdSlot& slot = *found->second;
             slot.registered = true;
 
-            const bool error_or_hup =
-                (events & (EPOLLERR | EPOLLHUP)) != 0;
-            const bool read_ready =
-                error_or_hup || (events & (EPOLLIN | EPOLLRDHUP)) != 0;
-            const bool write_ready = error_or_hup || (events & EPOLLOUT) != 0;
+            const bool error_or_hup = (events & 0x0cU) != 0;
+            const bool read_ready = error_or_hup || (events & kReadMask) != 0;
+            const bool write_ready = error_or_hup || (events & kWriteMask) != 0;
             if (read_ready && (snapshot.interest & kReadMask) != 0) {
                 if (auto node = take_ready_locked(slot.readers)) {
                     // readiness 已交给具体 waiter；不要把同一个事件
@@ -1429,9 +1391,8 @@ private:
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void drain_wake_fd() noexcept {
-        std::uint64_t value = 0;
-        while (::syscall(SYS_read, m_wake_fd, &value, sizeof(value)) ==
-               static_cast<long>(sizeof(value))) {
+        if (m_backend) {
+            m_backend->drain_wake();
         }
     }
 
@@ -1445,7 +1406,7 @@ private:
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void poll_loop() noexcept {
         constexpr int kEventBatch = 64;
-        epoll_event events[kEventBatch]{};
+        BackendEvent events[kEventBatch]{};
         for (;;) {
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
@@ -1458,9 +1419,11 @@ private:
             }
             int count;
             do {
-                count = ::epoll_wait(m_epoll_fd, events, kEventBatch,
-                                     poll_timeout_ms());
-            } while (count < 0 && errno == EINTR);
+                count = m_backend
+                            ? m_backend->wait(events, kEventBatch,
+                                              poll_timeout_ms())
+                            : -ENODEV;
+            } while (count < 0 && -count == EINTR);
             m_poller_waiting.store(false, std::memory_order_release);
 
             if (count < 0) {
@@ -1468,7 +1431,7 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(m_mutex);
                     if (!m_stop_poller) {
-                        m_init_error = errno == 0 ? EIO : errno;
+                        m_init_error = count < 0 ? -count : EIO;
                         m_accepting = false;
                         m_stop_poller = true;
                         for (auto& entry : m_slots) {
@@ -1488,12 +1451,11 @@ private:
             }
 
             for (int index = 0; index < count; ++index) {
-                if (events[index].data.u64 == kWakeRegistration) {
+                if (events[index].token == kWakeRegistration) {
                     drain_wake_fd();
                     m_tickle_pending.store(false, std::memory_order_release);
                 } else {
-                    process_event(events[index].data.u64,
-                                  events[index].events);
+                    process_event(events[index].token, events[index].events);
                 }
             }
             expire_timers();
@@ -1515,7 +1477,7 @@ private:
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void tickle() noexcept {
-        if (m_wake_fd < 0) {
+        if (!m_backend) {
             return;
         }
         if (!m_poller_waiting.load(std::memory_order_acquire)) {
@@ -1527,10 +1489,7 @@ private:
         if (m_tickle_pending.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
-        const std::uint64_t value = 1;
-        if (::syscall(SYS_write, m_wake_fd, &value, sizeof(value)) < 0) {
-            m_tickle_pending.store(false, std::memory_order_release);
-        }
+        m_backend->wake();
     }
 
     /// 函数功能：执行 wake_nodes，完成本函数所属模块的单步操作。
@@ -1587,8 +1546,7 @@ private:
     }
 
     Scheduler* m_scheduler{nullptr};
-    int m_epoll_fd{-1};
-    int m_wake_fd{-1};
+    IOBackendPtr m_backend;
     std::atomic<bool> m_poller_waiting{false};
     std::atomic<bool> m_tickle_pending{false};
     int m_init_error{0};
@@ -1618,9 +1576,9 @@ private:
 /// @param[in] config 调用方传入的参数，具体约束以头文件声明为准。
 /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
 /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
-IOManager::IOManager(SchedulerConfig config)
+IOManager::IOManager(SchedulerConfig config, IOBackendPtr backend)
     : m_scheduler(std::move(config)),
-      m_state(std::make_shared<State>(&m_scheduler)) {
+      m_state(std::make_shared<State>(&m_scheduler, std::move(backend))) {
     std::lock_guard<std::mutex> lock(manager_registry_mutex());
     manager_registry()[&m_scheduler] = this;
     const std::weak_ptr<State> weak_state(m_state);

@@ -20,10 +20,48 @@ void run_scheduler_tests() {
     using namespace go2cpp;
     using namespace std::chrono_literals;
 
+    // 观察者是可选插件；测试只记录事件计数，不在 worker 回调中调用
+    // Scheduler，验证扩展点不会改变 G/M/P 状态机或引入回调重入。
+    struct Observer final : SchedulerObserver {
+        std::atomic<int> started{0};
+        std::atomic<int> stopping{0};
+        std::atomic<int> workers_started{0};
+        std::atomic<int> workers_stopped{0};
+        std::atomic<int> tasks_started{0};
+        std::atomic<int> tasks_terminal{0};
+
+        void OnEvent(const SchedulerEvent& event) noexcept override {
+            switch (event.type) {
+                case SchedulerEventType::kStarted:
+                    started.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case SchedulerEventType::kStopping:
+                    stopping.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case SchedulerEventType::kWorkerStarted:
+                    workers_started.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case SchedulerEventType::kWorkerStopped:
+                    workers_stopped.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case SchedulerEventType::kTaskStarted:
+                    tasks_started.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case SchedulerEventType::kTaskCompleted:
+                case SchedulerEventType::kTaskFailed:
+                case SchedulerEventType::kTaskSuspended:
+                    tasks_terminal.fetch_add(1, std::memory_order_relaxed);
+                    break;
+            }
+        }
+    };
+    auto observer = std::make_shared<Observer>();
+
     SchedulerConfig config;
     config.processor_count = 2;
     config.max_workers = 2;
     config.local_queue_limit = 4;
+    config.observer = observer;
     Scheduler scheduler(config);
     scheduler.start();
     GO2CPP_CHECK(scheduler.is_running());
@@ -131,6 +169,14 @@ void run_scheduler_tests() {
     scheduler.shutdown();
     GO2CPP_CHECK(!scheduler.is_running());
     GO2CPP_CHECK(scheduler.worker_count() == 0);
+    GO2CPP_CHECK(observer->started.load(std::memory_order_relaxed) == 1);
+    GO2CPP_CHECK(observer->stopping.load(std::memory_order_relaxed) == 1);
+    GO2CPP_CHECK(observer->workers_started.load(std::memory_order_relaxed) >= 1);
+    GO2CPP_CHECK(observer->workers_stopped.load(std::memory_order_relaxed) >= 1);
+    GO2CPP_CHECK(observer->tasks_started.load(std::memory_order_relaxed) >=
+                 task_count);
+    GO2CPP_CHECK(observer->tasks_terminal.load(std::memory_order_relaxed) >=
+                 task_count);
     for (const auto& processor : scheduler.processors()) {
         GO2CPP_CHECK(processor.state == PState::kDead);
     }

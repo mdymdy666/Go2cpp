@@ -23,6 +23,55 @@
 namespace go2cpp::sync {
 namespace {
 
+/**
+ * @brief Go2Cpp Scheduler 的默认同步等待适配器。
+ * @details Scheduler 类型只在 .cpp 内出现，公共 sync 头因此保持与调度器
+ *          解耦；其他 Fiber 后端只需实现 WaitBackend 协议即可接入。
+ */
+class SchedulerWaitBackend final : public WaitBackend {
+public:
+    bool Park(void* scheduler_ptr, const std::shared_ptr<void>& task_value,
+              std::optional<ContextTimePoint>,
+              const std::function<bool()>& predicate) override {
+        auto* scheduler = static_cast<Scheduler*>(scheduler_ptr);
+        auto task = std::static_pointer_cast<Task>(task_value);
+        if (scheduler == nullptr || !task) {
+            return false;
+        }
+        for (;;) {
+            if (predicate()) {
+                return true;
+            }
+            const bool suspended = scheduler->park_wait(task);
+            if (predicate()) {
+                return true;
+            }
+            if (task->cancellation_requested() ||
+                Scheduler::current_scheduler() != scheduler ||
+                Scheduler::current_task().get() != task.get() ||
+                (!suspended && !scheduler->is_running())) {
+                return false;
+            }
+        }
+    }
+
+    void Wake(void* scheduler_ptr,
+              const std::shared_ptr<void>& task_value) noexcept override {
+        try {
+            auto* scheduler = static_cast<Scheduler*>(scheduler_ptr);
+            auto task = std::static_pointer_cast<Task>(task_value);
+            if (scheduler != nullptr && task) {
+                (void)scheduler->wake_registered(task);
+            }
+        } catch (...) {
+            // 唤醒回调位于取消/通知路径，异常必须被隔离。
+        }
+    }
+};
+
+std::mutex s_wait_backend_mutex;
+WaitBackendFactory s_wait_backend_factory;
+
 enum class WaitResult : std::uint8_t {
     kWaiting,
     kNotified,
@@ -41,7 +90,8 @@ public:
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     WaitNode(Scheduler* scheduler, std::shared_ptr<Task> task)
-        : m_scheduler(scheduler), m_task(std::move(task)) {}
+        : m_scheduler(scheduler), m_task(std::move(task)),
+          m_backend(CreateWaitBackend()) {}
 
     ~WaitNode() { Disarm(); }
 
@@ -184,7 +234,10 @@ private:
                 // managed waiter 通过所属 Scheduler 恢复。
                 // 已注册 G 走 wake_registered()；该入口仍保留 started G，
                 // 即使 shutdown 或队列分配与这个回调并发。
-                (void)m_scheduler->wake_registered(m_task);
+                if (m_backend) {
+                    m_backend->Wake(m_scheduler,
+                                    std::static_pointer_cast<void>(m_task));
+                }
             } else {
                 // 普通线程调用者在节点私有条件变量上等待。结果字段就是谓词，
                 // 因此 wait() 之前到达的通知不会丢失。
@@ -234,6 +287,9 @@ public:
 
     const std::shared_ptr<Task>& task() const noexcept { return m_task; }
     Scheduler* scheduler() const noexcept { return m_scheduler; }
+    const std::shared_ptr<WaitBackend>& backend() const noexcept {
+        return m_backend;
+    }
 
     /// 函数功能：执行 Reset，完成本函数所属模块的单步操作。
     /// 执行流程：
@@ -249,6 +305,7 @@ public:
         m_active = false;
         m_scheduler = scheduler;
         m_task = std::move(task);
+        m_backend = CreateWaitBackend();
         m_result.store(WaitResult::kWaiting, std::memory_order_release);
         ++m_generation;
         if (m_generation == 0U) {
@@ -263,6 +320,7 @@ private:
     core::HybridMutex m_wake_mutex;
     std::mutex m_native_mutex;
     std::condition_variable m_native_condition;
+    std::shared_ptr<WaitBackend> m_backend;
     bool m_active{false};
     std::uint64_t m_generation{1U};
 };
@@ -474,7 +532,12 @@ WaitResult Await(WaitNode* waiter) noexcept {
 
         // 发布后始终尝试 park，即使通知者可能已经先一步完成。先通知后 park
         // 的唤醒会保存为 pending token；park 消耗该 token 后直接返回，不会挂起。
-        const bool suspended = scheduler->park_wait(task);
+        const bool suspended = waiter->backend()->Park(
+            scheduler, std::static_pointer_cast<void>(task), std::nullopt,
+            [waiter, task] {
+                return waiter->result() != WaitResult::kWaiting ||
+                       task->cancellation_requested();
+            });
         const WaitResult result = waiter->result();
         if (result != WaitResult::kWaiting) {
             return finish(result);
@@ -533,6 +596,52 @@ bool AbortConditionWait(Mutex& mutex, bool preserve_lock = false) {
 }
 
 }  // namespace
+
+/// 函数功能：注册同步等待后端工厂，隔离具体 Scheduler/Fiber 实现。
+/// 执行流程：在短临界区内替换工厂快照；实际工厂调用始终发生在锁外。
+/// @param[in] factory 新建等待节点使用的后端工厂。
+/// @return 成功发布返回 true；复制 std::function 失败返回 false。
+/// @note 已存在等待节点继续使用原后端，不会被强制迁移。
+bool SetWaitBackendFactory(WaitBackendFactory factory) {
+    try {
+        std::lock_guard<std::mutex> lock(s_wait_backend_mutex);
+        s_wait_backend_factory = std::move(factory);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+/// 函数功能：恢复默认 Scheduler 同步等待适配器。
+/// @return 无返回值。
+/// @note 只影响后续创建的等待节点。
+void ResetWaitBackendFactory() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(s_wait_backend_mutex);
+        s_wait_backend_factory = {};
+    } catch (...) {
+    }
+}
+
+/// 函数功能：创建同步等待节点的后端实例。
+/// @return 非空后端；用户工厂异常或返回空指针时回退 SchedulerWaitBackend。
+/// @note 用户工厂在锁外执行，避免注册函数重入造成锁反转。
+std::shared_ptr<WaitBackend> CreateWaitBackend() noexcept {
+    WaitBackendFactory factory;
+    try {
+        {
+            std::lock_guard<std::mutex> lock(s_wait_backend_mutex);
+            factory = s_wait_backend_factory;
+        }
+        if (factory) {
+            if (auto backend = factory()) {
+                return backend;
+            }
+        }
+    } catch (...) {
+    }
+    return std::make_shared<SchedulerWaitBackend>();
+}
 
 struct Mutex::Impl {
     std::mutex m_mutex;

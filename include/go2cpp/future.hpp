@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,6 +18,53 @@
 #include <utility>
 
 namespace go2cpp {
+
+/**
+ * Future 等待后端的可替换协议。
+ *
+ * 默认后端使用 ParkingCondition，因此受管 Fiber 会 park 而不会阻塞
+ * carrier 线程，普通线程仍使用原生条件等待。插件可以在创建新的
+ * Promise 之前注册自定义实现，例如接入其他 Fiber 调度器、事件循环或
+ * 平台专用等待原语。后端只负责等待和广播，不拥有 Future 状态。
+ */
+class FutureWaitBackend {
+public:
+    /** @brief 释放等待后端。 */
+    virtual ~FutureWaitBackend() = default;
+
+    /**
+     * @brief 等待谓词满足、到达截止时间或运行时取消。
+     * @param lock Future 状态锁；调用时必须已经加锁，返回时保持加锁。
+     * @param deadline 可选的 steady_clock 绝对截止时间。
+     * @param predicate 状态谓词；后端必须允许虚假唤醒并重复检查。
+     * @return 谓词满足返回 true，超时或取消返回 false。
+     */
+    virtual bool Wait(
+        std::unique_lock<std::mutex>& lock,
+        std::optional<ContextTimePoint> deadline,
+        const std::function<bool()>& predicate) = 0;
+
+    /** @brief 唤醒等待同一共享状态的全部调用者。 */
+    virtual void NotifyAll() noexcept = 0;
+};
+
+using FutureWaitBackendFactory =
+    std::function<std::shared_ptr<FutureWaitBackend>()>;
+
+/**
+ * @brief 注册新建 Future 使用的等待后端工厂。
+ * @details 工厂只影响注册成功后创建的共享状态；已存在的 Future 不迁移
+ *          后端，因此不会改变正在等待的调用者。传入空工厂恢复默认后端。
+ * @param factory 后端工厂；工厂抛异常或返回空指针时自动回退默认实现。
+ * @return 注册成功返回 true；并发注册时后一次调用覆盖前一次。
+ */
+bool SetFutureWaitBackendFactory(FutureWaitBackendFactory factory);
+
+/** @brief 清除自定义等待后端，恢复默认 ParkingCondition 实现。 */
+void ResetFutureWaitBackendFactory() noexcept;
+
+/** @brief 创建一个 Future 状态使用的等待后端；供模板状态内部调用。 */
+std::shared_ptr<FutureWaitBackend> CreateFutureWaitBackend() noexcept;
 
 /**
  * Future 等待或完成后的结果状态。
@@ -86,7 +134,7 @@ template <typename T>
 class FutureState<T, false> final
     : public std::enable_shared_from_this<FutureState<T, false>> {
 public:
-    FutureState() = default;
+    FutureState() : m_wait_backend(CreateFutureWaitBackend()) {}
     FutureState(const FutureState&) = delete;
     FutureState& operator=(const FutureState&) = delete;
 
@@ -101,7 +149,7 @@ public:
             m_value = std::move(stored);
             m_kind = FutureStateKind::kValue;
         }
-        m_condition.notify_all();
+        m_wait_backend->NotifyAll();
         return true;
     }
 
@@ -117,7 +165,7 @@ public:
             m_error = std::move(error);
             m_kind = FutureStateKind::kError;
         }
-        m_condition.notify_all();
+        m_wait_backend->NotifyAll();
         return true;
     }
 
@@ -134,7 +182,7 @@ public:
             m_exception = std::move(exception);
             m_kind = FutureStateKind::kException;
         }
-        m_condition.notify_all();
+        m_wait_backend->NotifyAll();
         return true;
     }
 
@@ -150,7 +198,7 @@ public:
             m_error = std::move(error);
             m_kind = FutureStateKind::kCancelled;
         }
-        m_condition.notify_all();
+        m_wait_backend->NotifyAll();
         return true;
     }
 
@@ -178,7 +226,7 @@ public:
                         registration->cancelled.store(
                             true, std::memory_order_release);
                     }
-                    state->m_condition.notify_all();
+                    state->m_wait_backend->NotifyAll();
                 });
         }
 
@@ -200,9 +248,9 @@ public:
             !(context && context->IsDone()) &&
             (!deadline || Context::Now() < *deadline)) {
             if (deadline) {
-                (void)m_condition.wait_until(lock, *deadline, predicate);
+                (void)m_wait_backend->Wait(lock, *deadline, predicate);
             } else {
-                (void)m_condition.wait(lock, predicate);
+                (void)m_wait_backend->Wait(lock, std::nullopt, predicate);
             }
         }
 
@@ -291,7 +339,7 @@ private:
     }
 
     mutable std::mutex m_mutex;
-    mutable core::ParkingCondition m_condition;
+    std::shared_ptr<FutureWaitBackend> m_wait_backend;
     FutureStateKind m_kind{FutureStateKind::kPending};
     std::shared_ptr<const T> m_value;
     ErrorPtr m_error;
@@ -302,7 +350,7 @@ template <typename T>
 class FutureState<T, true> final
     : public std::enable_shared_from_this<FutureState<T, true>> {
 public:
-    FutureState() = default;
+    FutureState() : m_wait_backend(CreateFutureWaitBackend()) {}
     FutureState(const FutureState&) = delete;
     FutureState& operator=(const FutureState&) = delete;
 
@@ -314,7 +362,7 @@ public:
             }
             m_kind = FutureStateKind::kValue;
         }
-        m_condition.notify_all();
+        m_wait_backend->NotifyAll();
         return true;
     }
 
@@ -330,7 +378,7 @@ public:
             m_error = std::move(error);
             m_kind = FutureStateKind::kError;
         }
-        m_condition.notify_all();
+        m_wait_backend->NotifyAll();
         return true;
     }
 
@@ -347,7 +395,7 @@ public:
             m_exception = std::move(exception);
             m_kind = FutureStateKind::kException;
         }
-        m_condition.notify_all();
+        m_wait_backend->NotifyAll();
         return true;
     }
 
@@ -363,7 +411,7 @@ public:
             m_error = std::move(error);
             m_kind = FutureStateKind::kCancelled;
         }
-        m_condition.notify_all();
+        m_wait_backend->NotifyAll();
         return true;
     }
 
@@ -386,7 +434,7 @@ public:
                         registration->cancelled.store(
                             true, std::memory_order_release);
                     }
-                    state->m_condition.notify_all();
+                    state->m_wait_backend->NotifyAll();
                 });
         }
         const auto remove_callback = [&] {
@@ -406,9 +454,9 @@ public:
             !(context && context->IsDone()) &&
             (!deadline || Context::Now() < *deadline)) {
             if (deadline) {
-                (void)m_condition.wait_until(lock, *deadline, predicate);
+                (void)m_wait_backend->Wait(lock, *deadline, predicate);
             } else {
-                (void)m_condition.wait(lock, predicate);
+                (void)m_wait_backend->Wait(lock, std::nullopt, predicate);
             }
         }
         const FutureStatus result = StatusLocked(
@@ -489,7 +537,7 @@ private:
     }
 
     mutable std::mutex m_mutex;
-    mutable core::ParkingCondition m_condition;
+    std::shared_ptr<FutureWaitBackend> m_wait_backend;
     FutureStateKind m_kind{FutureStateKind::kPending};
     ErrorPtr m_error;
     std::exception_ptr m_exception;

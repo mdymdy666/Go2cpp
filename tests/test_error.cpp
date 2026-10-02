@@ -3,6 +3,7 @@
 
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -47,6 +48,20 @@ void run_error_tests() {
                      nullptr);
     GO2CPP_CHECK(Is(singleton_join, base));
     GO2CPP_CHECK(!Join({}));
+
+    // WalkErrors 是面向日志、指标和错误转换插件的统一遍历出口；它应当
+    // 按图去重，并在访问器主动停止时返回 false。
+    std::vector<const Error*> visited;
+    const bool walked = WalkErrors(joined, [&visited](const ErrorPtr& current) {
+        visited.push_back(current.get());
+        return ErrorVisitResult::kContinue;
+    });
+    GO2CPP_CHECK(walked);
+    GO2CPP_CHECK(visited.size() == 4U);
+    GO2CPP_CHECK(!WalkErrors(joined, [](const ErrorPtr&) {
+        return ErrorVisitResult::kStop;
+    }));
+    GO2CPP_CHECK(!WalkErrors(joined, ErrorVisitor{}));
 
     // A custom cyclic unwrap graph must not recurse forever.
     class CycleError final : public Error {

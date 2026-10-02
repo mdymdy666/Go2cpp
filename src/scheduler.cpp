@@ -1060,7 +1060,8 @@ public:
     explicit Impl(SchedulerConfig requested, Scheduler* scheduler)
         : config(normalize(requested)),
           owner_token(std::make_shared<const std::uint8_t>(0)),
-          cancellation_gate(std::make_shared<TaskCancellationGate>(scheduler)) {
+          cancellation_gate(std::make_shared<TaskCancellationGate>(scheduler)),
+          observer(std::move(config.observer)) {
         for (std::size_t i = 0; i < config.processor_count; ++i) {
             processors.emplace_back(static_cast<PId>(i));
         }
@@ -1087,6 +1088,31 @@ public:
     }
 
     ~Impl() { stop_sysmon(true); }
+
+    /**
+     * @brief 向当前观察者发布调度器事件。
+     * @param event 已填充的事件快照。
+     * @note 复制观察者后再释放互斥锁，绝不在调度器内部状态锁上执行
+     *       外部代码；观察者异常被隔离，不能影响 worker 生命周期。
+     */
+    void emit_event(SchedulerEvent event) noexcept {
+        if (event.timestamp == std::chrono::steady_clock::time_point{}) {
+            event.timestamp = std::chrono::steady_clock::now();
+        }
+        SchedulerObserverPtr current;
+        {
+            std::lock_guard<std::mutex> lock(observer_mutex);
+            current = observer;
+        }
+        if (!current) {
+            return;
+        }
+        try {
+            current->OnEvent(event);
+        } catch (...) {
+            // 观察者属于可选插件，异常不能跨越调度器边界。
+        }
+    }
 
     /// 函数功能：执行 normalize，完成本函数所属模块的单步操作。
     /// 执行流程：
@@ -1752,6 +1778,10 @@ public:
     std::condition_variable sysmon_wait_condition;
     std::shared_ptr<const void> owner_token;
     std::shared_ptr<TaskCancellationGate> cancellation_gate;
+    // 观察者属于可选扩展；通过独立互斥量替换，避免配置/插件管理线程
+    // 与 worker 共享 Scheduler::mutex。事件回调永远在该锁释放后执行。
+    mutable std::mutex observer_mutex;
+    SchedulerObserverPtr observer;
     mutable std::mutex mutex;
     mutable std::array<std::mutex, kRegistryStripeCount> registry_mutexes;
     std::array<std::mutex, kIncomingStripeCount> incoming_mutexes;
@@ -1868,6 +1898,7 @@ void Scheduler::start() {
     }
     lock.unlock();
     m_impl->condition.notify_all();
+    m_impl->emit_event(SchedulerEvent{SchedulerEventType::kStarted});
 }
 
 bool Scheduler::shutdown_for(
@@ -1917,6 +1948,10 @@ bool Scheduler::shutdown_for(
             m_impl->begin_shutdown_locked(deferred_destruction,
                                            completion_notifications);
         }
+    }
+
+    if (was_started) {
+        m_impl->emit_event(SchedulerEvent{SchedulerEventType::kStopping});
     }
 
     // sysmon 在 draining 阶段仍保持运行，直到所有已启动 G 完成自然
@@ -2101,6 +2136,38 @@ bool Scheduler::is_running() const noexcept {
     return m_impl && m_impl->started.load(std::memory_order_acquire) &&
            !m_impl->draining.load(std::memory_order_acquire) &&
            !m_impl->stopping.load(std::memory_order_acquire);
+}
+
+/// 安装运行期调度器观察者；只替换插件指针，不改变任何 G/M/P 状态。
+/// @param observer 新观察者，空指针表示关闭事件通知。
+/// @return 无；观察者快照由 Impl 的独立锁保护。
+void Scheduler::set_observer(SchedulerObserverPtr observer) noexcept {
+    if (!m_impl) {
+        return;
+    }
+    try {
+        SchedulerObserverPtr replaced;
+        std::lock_guard<std::mutex> lock(m_impl->observer_mutex);
+        replaced = std::move(m_impl->observer);
+        m_impl->observer = std::move(observer);
+    } catch (...) {
+        // shared_ptr 交换不会主动分配；此处保持 noexcept 契约，异常时
+        // 保留原观察者，避免插件安装影响调度器运行。
+    }
+}
+
+/// 读取当前观察者快照；调用方可在返回后安全持有该 shared_ptr。
+/// @return 当前观察者；未安装时返回空指针。
+SchedulerObserverPtr Scheduler::observer() const noexcept {
+    if (!m_impl) {
+        return {};
+    }
+    try {
+        std::lock_guard<std::mutex> lock(m_impl->observer_mutex);
+        return m_impl->observer;
+    } catch (...) {
+        return {};
+    }
 }
 
 /// 函数功能：完成 spawn 调用，读取或更新相关运行时状态。
@@ -3209,6 +3276,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     thread_policy::detail::EnterRuntimeWorker(this);
     t_machine_id = machine->id;
     t_processor_id = machine->processor;
+    m_impl->emit_event(SchedulerEvent{SchedulerEventType::kWorkerStarted,
+                                      0, machine->id, machine->processor});
 #if defined(__linux__)
     if (m_impl->config.pin_workers_to_cpu &&
         machine->processor < static_cast<PId>(CPU_SETSIZE)) {
@@ -3537,9 +3606,22 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             Fiber::BindCurrentExecution(FiberExecutionBinding{
                 reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,
                 t_processor_id, true});
+            m_impl->emit_event(SchedulerEvent{
+                SchedulerEventType::kTaskStarted, task->id(), t_machine_id,
+                t_processor_id, GState::kRunning});
             const bool collect_metrics = m_impl->config.collect_metrics;
             const auto run_started = collect_metrics ? steady_now_ns() : 0;
             task->run();
+            const auto task_state_after_run = task->state();
+            const auto task_event_type =
+                task_state_after_run == GState::kDead
+                    ? SchedulerEventType::kTaskCompleted
+                : task_state_after_run == GState::kFailed
+                    ? SchedulerEventType::kTaskFailed
+                    : SchedulerEventType::kTaskSuspended;
+            m_impl->emit_event(SchedulerEvent{
+                task_event_type, task->id(), t_machine_id, t_processor_id,
+                task_state_after_run});
             if (collect_metrics) {
                 const auto resume_elapsed =
                     static_cast<std::uint64_t>(std::max<std::int64_t>(
@@ -3725,6 +3807,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         }
         machine->state.store(MState::kDead, std::memory_order_release);
     }
+    m_impl->emit_event(SchedulerEvent{SchedulerEventType::kWorkerStopped,
+                                      0, machine->id, machine->processor});
     m_impl->condition.notify_all();
     t_task.reset();
     Fiber::BindCurrentExecution(FiberExecutionBinding{});

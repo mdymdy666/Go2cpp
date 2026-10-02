@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <stdexcept>
 #include <thread>
@@ -13,6 +14,39 @@
 namespace {
 
 using namespace std::chrono_literals;
+
+/**
+ * @brief 测试用 Future 等待后端，验证状态模板不依赖固定 ParkingCondition。
+ * @details 该实现只使用原生条件变量，生产代码可以用同样的协议接入其它
+ *          Fiber 事件循环；计数器用于确认工厂确实参与了等待和通知。
+ */
+class CountingFutureWaitBackend final : public go2cpp::FutureWaitBackend {
+public:
+    CountingFutureWaitBackend(std::atomic<int>* waits,
+                              std::atomic<int>* notifications)
+        : m_waits(waits), m_notifications(notifications) {}
+
+    bool Wait(std::unique_lock<std::mutex>& lock,
+              std::optional<go2cpp::ContextTimePoint> deadline,
+              const std::function<bool()>& predicate) override {
+        m_waits->fetch_add(1, std::memory_order_relaxed);
+        if (deadline) {
+            return m_condition.wait_until(lock, *deadline, predicate);
+        }
+        m_condition.wait(lock, predicate);
+        return predicate();
+    }
+
+    void NotifyAll() noexcept override {
+        m_notifications->fetch_add(1, std::memory_order_relaxed);
+        m_condition.notify_all();
+    }
+
+private:
+    std::atomic<int>* m_waits;
+    std::atomic<int>* m_notifications;
+    std::condition_variable m_condition;
+};
 
 /**
  * @brief 构造 Future 测试使用的单处理器调度配置。
@@ -51,6 +85,34 @@ void TestNativeValueAndTimeout() {
     GO2CPP_CHECK(result.Value() != nullptr);
     GO2CPP_CHECK(*result.Value() == 42);
     GO2CPP_CHECK(result.CopyValue().value_or(0) == 42);
+}
+
+/**
+ * @brief 验证 Future 等待后端可替换且只影响新建共享状态。
+ * @return 无；测试失败由统一断言统计。
+ */
+void TestPluggableWaitBackend() {
+    std::atomic<int> waits{0};
+    std::atomic<int> notifications{0};
+    GO2CPP_CHECK(go2cpp::SetFutureWaitBackendFactory(
+        [&waits, &notifications] {
+            return std::make_shared<CountingFutureWaitBackend>(
+                &waits, &notifications);
+        }));
+
+    auto pair = go2cpp::MakePromise<int>();
+    auto promise = std::move(pair.first);
+    auto future = std::move(pair.second);
+    std::thread setter([promise = std::move(promise)]() mutable {
+        std::this_thread::sleep_for(10ms);
+        (void)promise.SetValue(123);
+    });
+    const auto result = future.GetResultFor(2s);
+    GO2CPP_JOIN_WITH_WATCHDOG(setter, 3s);
+    GO2CPP_CHECK(result.Ok() && result.Value() && *result.Value() == 123);
+    GO2CPP_CHECK(waits.load(std::memory_order_relaxed) > 0);
+    GO2CPP_CHECK(notifications.load(std::memory_order_relaxed) > 0);
+    go2cpp::ResetFutureWaitBackendFactory();
 }
 
 /**
@@ -229,6 +291,7 @@ void TestErrorExceptionBrokenPromiseAndSinglePublish() {
 void run_future_tests() {
     go2cpp_tests::announce("future");
     TestNativeValueAndTimeout();
+    TestPluggableWaitBackend();
     TestContextCancellationAndDeadline();
     TestManagedFiberWait();
     TestManagedCancellationAndVoid();

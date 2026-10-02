@@ -50,6 +50,47 @@ std::vector<ErrorPtr> Error::UnwrapAll() const {
   return cause ? std::vector<ErrorPtr>{cause} : std::vector<ErrorPtr>{};
 }
 
+/// 函数功能：以统一的环安全策略遍历错误图，供日志、指标和转换插件复用。
+/// 执行流程：
+/// 1. 将非空根错误放入显式工作表；
+/// 2. 以对象地址去重，调用访问器并读取 UnwrapAll() 原因；
+/// 3. 访问器停止或发生异常时立即结束，避免异常穿过 noexcept 边界。
+/// @param[in] error 遍历根节点，可以为空。
+/// @param[in] visitor 访问器；不得依赖临时 ErrorPtr 之外的生命周期。
+/// @return 完整遍历返回 true；访问器停止或抛出异常返回 false。
+/// @note 自定义 Error 的 UnwrapAll/访问器异常会被隔离，不会让错误处理路径终止进程。
+bool WalkErrors(const ErrorPtr& error, const ErrorVisitor& visitor) noexcept {
+  if (!visitor) {
+    return false;
+  }
+  try {
+    std::vector<ErrorPtr> pending;
+    std::unordered_set<const Error*> visited;
+    if (error) {
+      pending.push_back(error);
+    }
+    while (!pending.empty()) {
+      ErrorPtr current = std::move(pending.back());
+      pending.pop_back();
+      if (!current || !visited.insert(current.get()).second) {
+        continue;
+      }
+      if (visitor(current) == ErrorVisitResult::kStop) {
+        return false;
+      }
+      const auto causes = current->UnwrapAll();
+      for (auto it = causes.rbegin(); it != causes.rend(); ++it) {
+        if (*it) {
+          pending.push_back(*it);
+        }
+      }
+    }
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 /// 函数功能：完成 WrappedError 调用，读取或更新相关运行时状态。
 /// 执行流程：
 /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；

@@ -94,6 +94,63 @@ enum class PState : std::uint8_t {
 };
 
 /**
+ * @brief 调度器生命周期观测事件类型。
+ * @details 事件只描述已经发生的状态变化，不参与调度决策；实现方可以用
+ *          它接入指标、追踪、故障诊断或外部调度策略。新增事件类型时应
+ *          保持已有枚举值的语义不变。
+ */
+enum class SchedulerEventType : std::uint8_t {
+    kStarted,
+    kStopping,
+    kWorkerStarted,
+    kWorkerStopped,
+    kTaskStarted,
+    kTaskSuspended,
+    kTaskCompleted,
+    kTaskFailed,
+};
+
+/**
+ * @brief 调度器事件的只读快照。
+ * @details 未参与本事件的标识保持为 0；state 用于描述任务事件发生时
+ *          的 G 状态。timestamp 使用 steady_clock，不能直接转换为墙上
+ *          时间，但适合计算耗时和排序。
+ */
+struct SchedulerEvent {
+    SchedulerEventType type{SchedulerEventType::kStarted};
+    GId task_id{0};
+    MId machine_id{0};
+    PId processor_id{0};
+    GState task_state{GState::kNew};
+    std::chrono::steady_clock::time_point timestamp{};
+};
+
+/**
+ * @brief 调度器事件扩展点。
+ *
+ * 依赖：Scheduler 仅持有观察者的 shared_ptr，不依赖具体日志、指标或
+ *       tracing 实现。观察者不拥有 Scheduler，也不能通过事件回调控制
+ *       当前 G 的执行权。
+ * 对上层提供：一个稳定的插件边界，用于记录任务、M/P 生命周期，或将
+ *       事件转发给外部监控系统。回调必须短小且无阻塞；异常会被隔离。
+ */
+class SchedulerObserver {
+public:
+    virtual ~SchedulerObserver() = default;
+
+    /**
+     * @brief 接收一个已经发生的调度器事件。
+     * @param event 事件只读快照；调用返回后不会继续使用其引用。
+     * @note 观察者不应抛出异常；接口保留可抛出签名是为了让 Scheduler
+     *       在 emit_event() 中统一捕获第三方插件异常，不能让 worker
+     *       线程异常退出。
+     */
+    virtual void OnEvent(const SchedulerEvent& event) = 0;
+};
+
+using SchedulerObserverPtr = std::shared_ptr<SchedulerObserver>;
+
+/**
  * @brief Scheduler 启动和运行参数。
  * @details 字段可通过 config 模块加载；线程数、P 数和栈容量会在启动期
  *          校验，动态配置不得拆开修改相互依赖的结构参数。
@@ -128,6 +185,9 @@ struct SchedulerConfig {
     // 性能敏感的部署可以关闭运行时累计计时；状态机和调度语义不受影响。
     // 默认开启，便于诊断和性能报告。
     bool collect_metrics = true;
+    // 可选的生命周期观察者。观察者只在事件发生后被调用，不改变默认
+    // GMP 调度策略；空指针表示关闭观测，适合性能敏感部署。
+    SchedulerObserverPtr observer;
 };
 
 using TaskClassId = std::uint64_t;
@@ -390,6 +450,20 @@ public:
     }
     bool IsRunning() const noexcept { return is_running(); }
 
+    /**
+     * @brief 安装或替换运行期调度器观察者。
+     * @param observer 新观察者；传入空指针表示关闭事件通知。
+     * @note 替换只影响后续事件，已经发出的事件不会回放；回调在调度器
+     *       内部锁外执行，观察者可以安全地把数据转发到独立队列。
+     */
+    void set_observer(SchedulerObserverPtr observer) noexcept;
+    /** @brief 返回当前观察者快照；空指针表示未安装观察者。 */
+    SchedulerObserverPtr observer() const noexcept;
+    void SetObserver(SchedulerObserverPtr observer) noexcept {
+        set_observer(std::move(observer));
+    }
+    SchedulerObserverPtr Observer() const noexcept { return observer(); }
+
     std::shared_ptr<Task> spawn(Task::Function function);
     std::shared_ptr<Task> spawn(Task::Function function, TaskOptions options);
     std::shared_ptr<Task> go(Task::Function function) { return spawn(std::move(function)); }
@@ -527,6 +601,10 @@ using GId = scheduler::GId;
 using MId = scheduler::MId;
 using PId = scheduler::PId;
 using TaskClassId = scheduler::TaskClassId;
+using SchedulerEventType = scheduler::SchedulerEventType;
+using SchedulerEvent = scheduler::SchedulerEvent;
+using SchedulerObserver = scheduler::SchedulerObserver;
+using SchedulerObserverPtr = scheduler::SchedulerObserverPtr;
 using TaskOptions = scheduler::TaskOptions;
 using BlockingRegion = scheduler::Scheduler::BlockingRegion;
 using Goroutine = scheduler::Task;

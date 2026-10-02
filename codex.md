@@ -5,6 +5,25 @@
 > 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
 > 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
 
+## 2026-10-02：全模块职责与后端边界复核
+
+- 调度器增加 `SchedulerObserver` 事件协议。G/M/P 状态机仍由 Scheduler 独占，
+  观察器只接收启动、worker、任务运行/挂起/完成/失败事件；观察器指针独立加锁，
+  回调在调度器状态锁外执行并隔离异常，可接入日志、指标和追踪而不把业务代码
+  嵌入 worker 热路径。
+- IOManager 把 epoll/eventfd 抽成 `IOBackend`，新增线程安全的命名工厂和实例注入。
+  默认 Linux epoll 保持原行为；后续 kqueue、IOCP、io_uring 只能实现 readiness、
+  wait、wake、remove、shutdown 协议，不能直接恢复 Fiber 或修改 Context 状态。
+- sync 和 Future 增加等待后端工厂，默认后端仍分别适配 Scheduler/ParkingCondition；
+  已创建等待节点固定自己的后端，插件工厂在锁外执行，防止注册表重入和锁反转。
+  HybridGate 的自旋次数改为可配置实例策略，仍只允许保护短临界区。
+- error 增加 `WalkErrors` 环安全遍历扩展点，日志、指标和错误转换插件不再依赖
+  WrappedError/JoinError 的具体类型；异常和环图均在错误边界内隔离。
+- 新增 `docs/extensibility.md`，明确批次事务、Fiber/栈后端、跨平台 IO、插件
+  生命周期和故障注入测试协议；README、design、scheduler 文档同步链接和说明。
+- 验证：Release CTest 14/14 通过；`build-engineering-werror` CTest 3/3 通过；
+  自定义 IO/Future 后端、调度器观察器、错误遍历和原有高负载测试均通过。
+
 ## 2026-10-02：日志 Item 插件化与配置事务解耦
 
 - `LogFormatter` 新增 Sylar 风格的 `Item` 扩展边界。格式字符串在

@@ -106,6 +106,24 @@ join/shutdown 等待，这保证 C++ RAII 不被跳过；错误父级路径会�
 动态增长/收缩/再增长、严格 P 上限、BlockingRegion 替代 M、task class 计数、worker
 shutdown、析构重入和带 watchdog 的压力循环。精确命令见 `docs/testing.md`。
 
+### 观察者插件边界
+
+`SchedulerObserver` 是调度器与日志、指标、分布式追踪之间的职责边界。
+在 `SchedulerConfig::observer` 中注入实现，或在启动后调用
+`Scheduler::set_observer()` 热替换。观察者接收 `SchedulerEvent` 快照，事件包括
+调度器启动/停止、M 启停和 G 开始运行、挂起、完成、失败；快照中的时间使用
+`steady_clock`，适合计算区间但不能当作墙上时间。
+
+事件只读且不参与队列状态转换。Scheduler 先复制观察者指针、释放观察者锁，
+再执行 `OnEvent()`，因此插件不得依赖事件回调改变当前 G 的执行权，也不会在
+Scheduler/P/队列锁内执行用户代码。回调必须短小、无阻塞；第三方实现即使抛出
+异常，运行时也会在 `emit_event()` 边界隔离该异常并继续 worker 生命周期。
+
+该接口用于“观测”和策略适配，不伪装成可异步抢占的调度器替换点。若需要新的
+队列、Fiber 栈或 IO Poller 后端，应先实现各自的状态协议和独立后端，再把结果以
+事件或快照接入 Scheduler；不要在 `OnEvent()` 中直接操作内部队列。默认空观察者
+路径没有额外事件分配，性能敏感部署可以保持 `observer == nullptr`。
+
 ## 2026-09-23 监控活性与嵌套 IO 复核
 
 sysmon 的节拍等待使用独立的 sysmon_wait_condition，不再先获取 Scheduler 队列主锁；每一轮只在扫描阶段对主锁执行一次 try_to_lock。sysmon_pass_count() 在扫描尝试开始时递增，因此它是 monitor 活性心跳，不代表本轮一定完成了 detach 扫描。sysmon_running() 与该计数应一起用于部署自检。实现保持一个 monitor 线程，不会在高负载时复制多个 monitor；真正的扩容由 maybe_grow() 根据 runnable backlog、声明的阻塞 M 数量和 max_workers 有界执行。达到上限、线程资源耗尽或未声明的阻塞调用都不会被伪装成已扩容。

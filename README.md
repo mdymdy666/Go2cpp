@@ -35,6 +35,7 @@ ctest --test-dir build --output-on-failure
 
 兼容性矩阵、设计边界和可复现验证矩阵分别见
 [`docs/compatibility.md`](docs/compatibility.md)、[`docs/design.md`](docs/design.md)
+以及模块扩展契约 [`docs/extensibility.md`](docs/extensibility.md)
 和 [`docs/testing.md`](docs/testing.md)。源码/依赖清单及 Go 参考版本见
 [`docs/dependencies.md`](docs/dependencies.md) 和
 [`third_party/go-reference/README.md`](third_party/go-reference/README.md)。

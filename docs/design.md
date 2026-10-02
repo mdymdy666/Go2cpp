@@ -232,6 +232,20 @@ Fiber 栈仍是固定保护栈，尚未实现 Go 风格动态扩容。IOManager 
 
 SelectCaster 的函数对象可能被多个 Fiber 并发调用；若内部有可变状态，调用方必须自行加锁或为每个执行流创建独立实例。
 
+## IO 后端替换协议
+
+`include/go2cpp/io_backend.hpp` 定义 `IOBackend`，把平台多路复用器从
+`IOManager::State` 中隔离出来。后端只处理 fd 的 readiness 注册、等待、跨线程
+唤醒和关闭，不接触 Fiber、Task、Context 或超时状态；一次等待的最终结果仍由
+IOManager 的 `WaitNode` 原子 claim 决定。默认 Linux 后端是 epoll，通过
+`CreateBackend("epoll")` 创建；应用可以在创建 IOManager 前调用
+`RegisterBackend("name", factory)` 注册自定义后端，并通过构造参数注入实例。
+
+后端必须保证 token 原样回传、`wait()` 失败返回负 errno、`wake()` 不跨越
+`shutdown()` 唤醒已销毁 State。kqueue、IOCP、io_uring 的适配只需实现该接口，
+不能在后端直接恢复 Fiber 或修改 Channel/Context 状态。当前发行版只提供 epoll
+实现，其他平台适配属于后续插件，不伪造已完成的跨平台支持。
+
 ## 2026-10-01 FiberBin 与 M 私有队列评估
 
 调度器现在提供 `SchedulerConfig::fiber_bin_capacity` 和

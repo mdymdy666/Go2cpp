@@ -36,7 +36,9 @@ if (GO2CPP_NATIVE_CONTEXT)
 endif()
 add_library(go2cpp_sync ${CMAKE_CURRENT_SOURCE_DIR}/src/sync.cpp)
 add_library(go2cpp_future ${CMAKE_CURRENT_SOURCE_DIR}/src/future.cpp)
-add_library(go2cpp_io ${CMAKE_CURRENT_SOURCE_DIR}/src/io.cpp)
+add_library(go2cpp_io
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/io.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/io_backend.cpp)
 add_library(go2cpp_log ${CMAKE_CURRENT_SOURCE_DIR}/src/log.cpp)
 add_library(go2cpp_config ${CMAKE_CURRENT_SOURCE_DIR}/src/config.cpp)
 

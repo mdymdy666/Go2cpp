@@ -1,6 +1,7 @@
 #pragma once
 
 #include "go2cpp/context.hpp"
+#include "go2cpp/io_backend.hpp"
 #include "go2cpp/scheduler.hpp"
 
 #include <chrono>
@@ -173,8 +174,15 @@ public:
     using TimePoint = Clock::time_point;
     using Duration = Clock::duration;
 
-    /** @brief 创建 IOManager。@param config 调度器配置。 */
-    explicit IOManager(SchedulerConfig config = {});
+    /**
+     * @brief 创建 IOManager。
+     * @param config 调度器配置。
+     * @param backend 可选多路复用后端；为空时创建默认后端（Linux 为 epoll）。
+     * @details 后端只负责 fd readiness，Fiber 等待、超时、取消和 close 仍由
+     *          IOManager 状态机处理。后端对象必须支持线程安全 wake/remove。
+     */
+    explicit IOManager(SchedulerConfig config = {},
+                       IOBackendPtr backend = {});
     /** @brief 停止并释放内部资源。 */
     ~IOManager();
 

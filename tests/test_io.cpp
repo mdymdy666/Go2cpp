@@ -1,4 +1,5 @@
 #include "go2cpp/io.hpp"
+#include "go2cpp/io_backend.hpp"
 #include "go2cpp/fiber.hpp"
 #include "test_support.hpp"
 
@@ -653,6 +654,50 @@ void test_wait_any_cancellation_and_close() {
     manager.Shutdown();
 }
 
+/**
+ * @brief 验证 IO 后端工厂与默认 epoll 后端的独立生命周期。
+ * @details 后端接口不依赖 IOManager，后续可在此替换为其它平台 poller。
+ * @return 无；测试失败由统一断言统计。
+ */
+void test_backend_factory() {
+    auto backend = go2cpp::io::CreateBackend();
+    GO2CPP_CHECK(static_cast<bool>(backend));
+    if (!backend) {
+        return;
+    }
+    int error = 0;
+    GO2CPP_CHECK(backend->initialize(&error));
+    GO2CPP_CHECK(error == 0);
+    backend->shutdown();
+    GO2CPP_CHECK(!go2cpp::io::CreateBackend("unknown-backend"));
+
+    class TestBackend final : public go2cpp::io::IOBackend {
+    public:
+        bool initialize(int* error) noexcept override {
+            if (error) {
+                *error = 0;
+            }
+            return true;
+        }
+        int add_or_modify(int, std::uint32_t, std::uint64_t,
+                          bool) noexcept override {
+            return 0;
+        }
+        int remove(int) noexcept override { return 0; }
+        int wait(go2cpp::io::BackendEvent*, std::size_t,
+                 int) noexcept override {
+            return 0;
+        }
+        void wake() noexcept override {}
+        void drain_wake() noexcept override {}
+        void shutdown() noexcept override {}
+    };
+    GO2CPP_CHECK(go2cpp::io::RegisterBackend(
+        "test-null", [] { return std::make_shared<TestBackend>(); }));
+    GO2CPP_CHECK(static_cast<bool>(go2cpp::io::CreateBackend("test-null")));
+    GO2CPP_CHECK(go2cpp::io::UnregisterBackend("test-null"));
+}
+
 }  // namespace
 
 /**
@@ -669,4 +714,5 @@ void run_io_tests() {
     test_generation_reuse_and_cross_manager_close();
     test_wait_any_and_wait_many();
     test_wait_any_cancellation_and_close();
+    test_backend_factory();
 }

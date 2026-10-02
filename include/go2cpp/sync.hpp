@@ -3,9 +3,56 @@
 #include "go2cpp/context.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 
 namespace go2cpp::sync {
+
+/**
+ * @brief Fiber 等待后端的最小可替换协议。
+ * @details sync 公共头不依赖 Scheduler 的具体类，使用不透明指针和共享
+ *          Task 句柄传递运行时上下文。默认实现适配 Go2Cpp Scheduler；
+ *          其他 Fiber 后端可以注册工厂而不改动 Mutex/ConditionVariable。
+ */
+class WaitBackend {
+public:
+    /** @brief 释放等待后端。 */
+    virtual ~WaitBackend() = default;
+
+    /**
+     * @brief park 当前受管任务，直到谓词、取消或截止时间满足。
+     * @param scheduler 不透明调度器指针；由工厂与调用方约定其类型。
+     * @param task 不透明任务共享句柄；后端负责保持其生命周期。
+     * @param deadline 可选绝对截止时间。
+     * @param predicate 状态谓词，后端必须允许虚假唤醒后重复检查。
+     * @return 谓词满足返回 true；取消、停止或超时返回 false。
+     */
+    virtual bool Park(
+        void* scheduler, const std::shared_ptr<void>& task,
+        std::optional<ContextTimePoint> deadline,
+        const std::function<bool()>& predicate) = 0;
+
+    /** @brief 唤醒指定受管任务；失败不得抛出异常。 */
+    virtual void Wake(void* scheduler,
+                      const std::shared_ptr<void>& task) noexcept = 0;
+};
+
+using WaitBackendFactory = std::function<std::shared_ptr<WaitBackend>()>;
+
+/**
+ * @brief 注册新建同步等待节点所使用的后端工厂。
+ * @param factory 自定义后端；为空表示恢复默认 Scheduler 后端。
+ * @return 工厂发布成功返回 true。
+ * @note 只影响注册后创建的等待节点，正在等待的 Fiber 不会迁移后端。
+ */
+bool SetWaitBackendFactory(WaitBackendFactory factory);
+
+/** @brief 清除自定义同步等待后端。 */
+void ResetWaitBackendFactory() noexcept;
+
+/** @brief 为一个等待节点创建后端，失败时回退默认 Scheduler 适配器。 */
+std::shared_ptr<WaitBackend> CreateWaitBackend() noexcept;
 
 /**
  * 支持调度器的 FIFO 混合互斥锁。

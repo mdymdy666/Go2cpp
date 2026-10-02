@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <initializer_list>
+#include <functional>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -37,6 +39,32 @@ class Error {
 };
 
 using ErrorPtr = std::shared_ptr<const Error>;
+
+/**
+ * @brief 错误图遍历回调的返回值。
+ * @details Error 既可以形成单链，也可以通过 JoinError 形成有向图；遍历
+ *          使用地址去重，因此自定义错误中的环不会导致无限循环。
+ */
+enum class ErrorVisitResult : std::uint8_t {
+  /** 继续访问尚未访问的原因。 */
+  kContinue,
+  /** 停止访问并立即返回。 */
+  kStop,
+};
+
+using ErrorVisitor =
+    std::function<ErrorVisitResult(const ErrorPtr& error)>;
+
+/**
+ * @brief 迭代遍历错误及其全部原因。
+ * @param error 遍历起点；空指针不会调用 visitor。
+ * @param visitor 访问器；每个错误对象最多访问一次。
+ * @return visitor 全部返回 kContinue 且未发生异常时返回 true；访问器
+ *          返回 kStop 或抛出异常时返回 false。
+ * @note 该函数是 Is/As 之外的插件扩展出口，日志、指标和错误转换器可以
+ *       复用统一的环安全遍历规则，不需要依赖 WrappedError/JoinError。
+ */
+bool WalkErrors(const ErrorPtr& error, const ErrorVisitor& visitor) noexcept;
 
 /** 只保存一条不可变文本的叶子错误。依赖 Error 接口，适合直接返回给上层。 */
 class StringError final : public Error {
