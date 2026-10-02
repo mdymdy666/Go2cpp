@@ -25,11 +25,15 @@ struct DescriptorRegistryState;
  * 依赖：DescriptorRegistryState 的登记表；对上层/Hook 提供 fd、代际和
  * 有效性查询。令牌不拥有 fd，只防止 close/复用后旧等待错误地唤醒。
  */
+/** @brief 记录文件描述符代际，防止关闭后旧等待节点误唤醒。 */
 class DescriptorToken final {
 public:
     ~DescriptorToken();
+    /** @brief 返回关联 fd。 */
     int fd() const noexcept { return m_fd; }
+    /** @brief 返回 fd 当前代际编号。 */
     std::uint64_t generation() const noexcept { return m_generation; }
+    /** @brief 返回令牌是否仍有效。 */
     bool valid() const noexcept { return m_valid.load(std::memory_order_acquire); }
 
 private:
@@ -53,13 +57,16 @@ using DescriptorTokenPtr = std::shared_ptr<const DescriptorToken>;
  * 依赖：DescriptorRegistryState 的递归互斥锁；对上层/Hook 提供 Capture
  * 和 Invalidate 的原子窗口。不能跨阻塞系统调用或 Fiber park 持有。
  */
+/** @brief 持有描述符注册表锁并管理令牌生命周期的 RAII 守卫。 */
 class DescriptorGuard final {
 public:
     DescriptorGuard();
     ~DescriptorGuard();
     DescriptorGuard(const DescriptorGuard&) = delete;
     DescriptorGuard& operator=(const DescriptorGuard&) = delete;
+    /** @brief 捕获 fd 当前代际令牌。 */
     static DescriptorTokenPtr Capture(int fd);
+    /** @brief 使 fd 当前代际失效并唤醒相关等待。 */
     static void Invalidate(int fd) noexcept;
 
 private:
@@ -67,6 +74,7 @@ private:
     std::unique_lock<std::recursive_mutex> m_lock;
 };
 
+/** @brief IOManager 支持的可读、可写和错误事件。 */
 enum class IOEvent : std::uint8_t {
     kRead = 1,
     kWrite = 2,
@@ -75,6 +83,7 @@ enum class IOEvent : std::uint8_t {
     Write = kWrite,
 };
 
+/** @brief 单 fd 等待结果状态。 */
 enum class WaitStatus : std::uint8_t {
     kReady = 1,
     kTimeout,
@@ -89,6 +98,7 @@ enum class WaitStatus : std::uint8_t {
     Error = kError,
 };
 
+/** @brief 单 fd 等待的状态和系统错误码。 */
 struct WaitResult {
     WaitStatus status{WaitStatus::kError};
     int system_error{0};
@@ -99,12 +109,14 @@ struct WaitResult {
 
 // 一个等待项描述一个 fd 上的读/写就绪条件。expected_descriptor 可选，
 // 用于把数字 fd 与捕获时的代际绑定，避免 close+复用后误唤醒旧等待。
+/** @brief wait_many 请求项。 */
 struct WaitRequest {
     int fd{-1};
     IOEvent event{IOEvent::kRead};
     DescriptorTokenPtr expected_descriptor;
 };
 
+/** @brief wait_any 返回的第一个就绪 fd。 */
 struct WaitAnyResult {
     static constexpr std::size_t kNoIndex =
         static_cast<std::size_t>(-1);
@@ -126,6 +138,7 @@ struct WaitAnyResult {
 // 按请求注册顺序排列，调用方可以据此稳定地分发后续 Fiber 工作。
 // 同一集合内不得重复提交相同 fd/方向；补采样只完成该 fd/方向等待队列的
 // 队头节点，以保持多个 Fiber 之间的 FIFO。
+/** @brief wait_many 返回的全部就绪 fd 索引。 */
 struct WaitManyResult {
     WaitStatus status{WaitStatus::kError};
     int system_error{0};
@@ -149,28 +162,39 @@ struct WaitManyResult {
  * Hook 层必须在真实 close 前调用 NotifyClose，避免数字 fd 复用后产生旧
  * 事件误唤醒。
  */
+/**
+ * @brief 基于 epoll 的 Fiber IO 等待管理器。
+ * @details 将 fd 事件注册到 epoll，Fiber 阻塞时释放工作线程，事件触发后
+ *          重新入队；普通线程也可通过 wait 接口安全使用。
+ */
 class IOManager final {
 public:
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
     using Duration = Clock::duration;
 
+    /** @brief 创建 IOManager。@param config 调度器配置。 */
     explicit IOManager(SchedulerConfig config = {});
+    /** @brief 停止并释放内部资源。 */
     ~IOManager();
 
     IOManager(const IOManager&) = delete;
     IOManager& operator=(const IOManager&) = delete;
 
     // 启动内部 Scheduler 和 epoll 轮询线程；返回 true 表示本次完成启动。
+    /** @brief 启动调度线程与 epoll。 */
     bool start();
     // 停止接收新任务，唤醒等待者并回收内部线程；可重复调用。
+    /** @brief 停止 IOManager 并等待线程退出。 */
     void shutdown();
+    /** @brief 返回 IOManager 是否运行。 */
     bool is_running() const noexcept;
 
     bool Start() { return start(); }
     void Shutdown() { shutdown(); }
     bool IsRunning() const noexcept { return is_running(); }
 
+    /** @brief 提交一个由 IOManager 调度的 Fiber。 */
     std::shared_ptr<Task> go(Task::Function function);
     std::shared_ptr<Task> Go(Task::Function function) {
         return go(std::move(function));
@@ -235,17 +259,21 @@ public:
     }
 
     // 取消指定 fd/方向的等待并返回是否找到等待者；不会关闭 fd。
+    /** @brief 取消指定 fd 事件并唤醒等待 Fiber。 */
     bool cancel(int fd, IOEvent event);
+    /** @brief 取消 fd 的全部等待事件。 */
     bool cancel_all(int fd);
     bool Cancel(int fd, IOEvent event) { return cancel(fd, event); }
     bool CancelAll(int fd) { return cancel_all(fd); }
 
     // Hook 层在真实 close 前调用。当前等待者收到 kClosed/EBADF，旧 epoll
     // 载荷同时失效。
+    /** @brief 通知 fd 即将关闭并清理全部等待节点。 */
     bool notify_close(int fd);
     bool NotifyClose(int fd) { return notify_close(fd); }
     // Hook 使用的跨 IOManager 安全路由；回调只保留 State 弱引用，析构中
     // 不会解引用已经销毁的 IOManager。
+    /** @brief 通知全部 IOManager 某 fd 已关闭。 */
     static void NotifyCloseAll(int fd) noexcept;
 
     Scheduler& scheduler() noexcept { return m_scheduler; }
@@ -254,6 +282,7 @@ public:
     const Scheduler& GetScheduler() const noexcept { return m_scheduler; }
 
     // 返回拥有 Scheduler::current_scheduler() 的 IOManager；没有时返回空。
+    /** @brief 返回当前线程绑定的 IOManager。 */
     static IOManager* current() noexcept;
     static IOManager* Current() noexcept { return current(); }
 
