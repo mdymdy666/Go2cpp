@@ -7,6 +7,10 @@
 #include <thread>
 #include <stdexcept>
 
+/**
+ * @brief 验证面向新手的 go、SelectLoop 和默认调度器接口。
+ * @return 无；断言失败会由测试框架记录。
+ */
 void run_beginner_api_tests() {
     go2cpp_tests::announce("新手 go/fiber/select 接口");
     using namespace go2cpp;

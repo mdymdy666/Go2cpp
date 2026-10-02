@@ -59,6 +59,14 @@ public:
         m_cv.notify_all();
     }
 
+    /// 函数功能：执行 Remove，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] state 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void Remove(const std::shared_ptr<Timer::State>& state) noexcept {
         // 保留一个强引用的局部状态，保证回调捕获对象不会在服务队列锁内
         // 被销毁，包括发生重入取消的情况。
@@ -74,6 +82,14 @@ public:
         m_cv.notify_all();
     }
 
+    /// 函数功能：执行 Clear，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] state 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     static void Clear(const std::shared_ptr<Timer::State>& state) noexcept {
         std::function<void()> retired;
         {
@@ -84,6 +100,14 @@ public:
     }
 
 private:
+    /// 函数功能：执行 Run，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void Run() noexcept {
         for (;;) {
             std::shared_ptr<Timer::State> expired;
@@ -130,6 +154,14 @@ private:
 };
 
 Timer::Timer() noexcept = default;
+/// 函数功能：完成 Timer 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] state 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 Timer::Timer(std::shared_ptr<State> state) : m_state(std::move(state)) {}
 Timer::~Timer() { Cancel(); }
 Timer::Timer(Timer&&) noexcept = default;
@@ -142,6 +174,14 @@ Timer& Timer::operator=(Timer&& other) noexcept {
     return *this;
 }
 
+/// 函数功能：完成 Cancel 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Timer::Cancel() noexcept {
     auto state = std::move(m_state);
     if (!state) {
@@ -153,6 +193,14 @@ void Timer::Cancel() noexcept {
     }
 }
 
+/// 函数功能：完成 Active 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Timer::Active() const noexcept {
     const auto state = m_state;
     if (!state) {
@@ -162,14 +210,38 @@ bool Timer::Active() const noexcept {
     return state->m_active;
 }
 
+/// 函数功能：完成 TimerService 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 TimerService::TimerService() : m_impl(std::make_shared<Impl>()) {}
 TimerService::~TimerService() = default;
 
+/// 函数功能：完成 Default 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 TimerService& TimerService::Default() {
     static TimerService service;
     return service;
 }
 
+/// 函数功能：完成 Schedule 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] deadline 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 Timer TimerService::Schedule(Clock::time_point deadline,
                              std::function<void()> callback) {
     if (!callback) {

@@ -40,20 +40,26 @@ class DoneSignal {
 public:
     using CallbackId = std::uint64_t;
 
+    /** @brief 创建未完成的通知信号。 */
     DoneSignal();
     DoneSignal(const DoneSignal&) = default;
     DoneSignal& operator=(const DoneSignal&) = default;
     DoneSignal(DoneSignal&&) noexcept = default;
     DoneSignal& operator=(DoneSignal&&) noexcept = default;
+    /** @brief 释放信号状态。 */
     ~DoneSignal();
 
     // 无限等待信号关闭。
+    /** @brief 无限等待信号完成。 */
     void Wait() const;
     // 最多等待 timeout；返回 true 表示已经关闭。
+    /** @brief 等待相对时长。@return 已完成返回 true。 */
     bool WaitFor(ContextDuration timeout) const;
     // 等待到单调时钟 deadline；返回 true 表示已经关闭。
+    /** @brief 等待到绝对截止时间。@return 已完成返回 true。 */
     bool WaitUntil(ContextTimePoint deadline) const;
     // 查询信号是否已关闭，不阻塞。
+    /** @brief 返回信号是否已经完成。 */
     bool IsDone() const noexcept;
 
     bool wait_for(ContextDuration timeout) const { return WaitFor(timeout); }
@@ -62,7 +68,9 @@ public:
 
     // 注册最多执行一次且在信号锁外调用的回调。若回调捕获了自身的最后
     // owner，应先调用 RemoveCallback；信号无法推断回调的对象所有权。
+    /** @brief 添加完成回调并返回回调 ID。 */
     CallbackId AddCallback(std::function<void()> callback) const;
+    /** @brief 删除指定完成回调。 */
     void RemoveCallback(CallbackId id) const;
 
 private:
@@ -84,10 +92,14 @@ private:
 template <typename T>
 class ContextKey {
 public:
+    /** @brief 创建匿名类型安全键。 */
     ContextKey();
+    /** @brief 创建带诊断名称的类型安全键。 */
     explicit ContextKey(std::string name);
 
+    /** @brief 返回键名。 */
     const std::string& Name() const noexcept { return m_name; }
+    /** @brief 返回键的身份地址。 */
     const void* Identity() const noexcept { return m_token.get(); }
     // Context 节点在类型化值存在期间保留此锚点，避免分配器复用地址让
     // 后续键发生碰撞。
@@ -118,17 +130,24 @@ public:
 
     // 返回永不自动取消的根上下文；Background 用于正式运行，TODO 用于
     // 尚未确定父级的占位。
+    /** @brief 创建永不取消的根 Context。 */
     static ContextPtr Background();
+    /** @brief 创建用于占位的根 Context。 */
     static ContextPtr TODO();
 
+    /** @brief 创建可取消子 Context 和取消函数。 */
     static std::pair<ContextPtr, CancelFunc> WithCancel(const ContextPtr& parent);
+    /** @brief 创建支持 Cause 的可取消子 Context。 */
     static std::pair<ContextPtr, CancelCauseFunc> WithCancelCause(
         const ContextPtr& parent);
+    /** @brief 创建带绝对截止时间的子 Context。 */
     static std::pair<ContextPtr, CancelFunc> WithDeadline(
         const ContextPtr& parent, ContextTimePoint deadline);
+    /** @brief 创建带相对超时的子 Context。 */
     static std::pair<ContextPtr, CancelFunc> WithTimeout(
         const ContextPtr& parent, ContextDuration timeout);
 
+    /** @brief 创建携带类型安全值的子 Context。 */
     template <typename T>
     static ContextPtr WithValue(const ContextPtr& parent,
                                 const ContextKey<T>& key, T value) {
@@ -143,19 +162,27 @@ public:
                                 std::any value);
 
     // 返回只读 Done 信号；取消发生后所有等待者都会被唤醒。
+    /** @brief 返回取消完成通知信号。 */
     const DoneSignal& Done() const noexcept { return m_done; }
+    /** @brief 返回可供内部注册回调的完成信号。 */
     DoneSignal& Done() noexcept { return m_done; }
     // 查询是否已取消；返回值是当前快照。
+    /** @brief 返回 Context 是否已取消或到期。 */
     bool IsDone() const noexcept;
     // 返回标准取消错误；未取消时返回空。
+    /** @brief 返回标准 Canceled/DeadlineExceeded 错误。 */
     ErrorPtr Err() const;
     // 返回最初取消原因；未取消时返回空。
+    /** @brief 返回取消时记录的原始 Cause。 */
     ErrorPtr Cause() const;
     // 返回截止时间；没有截止时间时为空。
+    /** @brief 返回截止时间；没有截止时间时返回空值。 */
     std::optional<ContextTimePoint> Deadline() const;
     // 查询是否设置了截止时间。
+    /** @brief 判断 Context 是否设置了截止时间。 */
     bool HasDeadline() const;
 
+    /** @brief 使用字符串键查询类型擦除值。 */
     std::any Value(const std::string& key) const;
 
     template <typename T>
@@ -175,14 +202,19 @@ public:
 
     // 取消操作幂等；cause 为空时映射为 CanceledError()。
     // 幂等取消当前上下文及其子树；cause 为空时使用 CanceledError。
+    /** @brief 取消当前 Context 并向全部子节点传播。 */
     void Cancel(ErrorPtr cause = {});
     // 以 DeadlineExceededError 取消当前上下文及其子树。
+    /** @brief 以 DeadlineExceeded 原因取消当前 Context。 */
     void CancelDeadline();
 
     // 测试和嵌入方可以注入单调时钟以创建超时；已经创建的定时器仍保留
     // 原先计算出的截止时间。
+    /** @brief 注入测试时钟函数。 */
     static void SetNowFunctionForTesting(NowFunction now);
+    /** @brief 恢复默认 steady_clock。 */
     static void ResetNowFunctionForTesting();
+    /** @brief 读取当前上下文时钟。 */
     static ContextTimePoint Now();
 
 private:
@@ -313,13 +345,19 @@ using RollbackScope = ContextRollback;
 ContextRollback WithRollback(const ContextPtr& parent,
                              bool rollback_on_cancel = true);
 
+/** @brief 创建 Background 根 Context。 */
 ContextPtr Background();
+/** @brief 创建 TODO 根 Context。 */
 ContextPtr TODO();
+/** @brief 创建可取消子 Context。 */
 std::pair<ContextPtr, CancelFunc> WithCancel(const ContextPtr& parent);
+/** @brief 创建可记录 Cause 的可取消子 Context。 */
 std::pair<ContextPtr, CancelCauseFunc> WithCancelCause(
     const ContextPtr& parent);
+/** @brief 创建带截止时间的子 Context。 */
 std::pair<ContextPtr, CancelFunc> WithDeadline(const ContextPtr& parent,
                                                ContextTimePoint deadline);
+/** @brief 创建带超时的子 Context。 */
 std::pair<ContextPtr, CancelFunc> WithTimeout(const ContextPtr& parent,
                                              ContextDuration timeout);
 
@@ -328,9 +366,12 @@ ContextPtr WithValue(const ContextPtr& parent, const ContextKey<T>& key, T value
     return Context::WithValue(parent, key, std::move(value));
 }
 
+/** @brief 创建携带字符串键值的子 Context。 */
 ContextPtr WithValue(const ContextPtr& parent, std::string key, std::any value);
 
+/** @brief 返回标准 Canceled 错误。 */
 ErrorPtr CanceledError();
+/** @brief 返回标准 DeadlineExceeded 错误。 */
 ErrorPtr DeadlineExceededError();
 inline ErrorPtr ErrCanceled() { return CanceledError(); }
 inline ErrorPtr ErrDeadlineExceeded() { return DeadlineExceededError(); }

@@ -12,6 +12,14 @@
 namespace go2cpp::config {
 namespace {
 
+/// 函数功能：完成 Trim 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] value 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::string Trim(std::string value) {
     const auto first = value.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return {};
@@ -19,6 +27,15 @@ std::string Trim(std::string value) {
     return value.substr(first, last - first + 1);
 }
 
+/// 函数功能：完成 ParseSize 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] text 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] value 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool ParseSize(const std::string& text, std::size_t* value) {
     if (!value) return false;
     const auto clean = Trim(text);
@@ -30,6 +47,15 @@ bool ParseSize(const std::string& text, std::size_t* value) {
     return true;
 }
 
+/// 函数功能：完成 ParseBool 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] text 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] value 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool ParseBool(const std::string& text, bool* value) {
     if (!value) return false;
     auto clean = Trim(text);
@@ -84,6 +110,16 @@ bool ValidateSchedulerSize(const char* key, std::size_t value,
     return true;
 }
 
+/// 函数功能：完成 ValidateDuration 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] key 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] value 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool ValidateDuration(const char* key, std::size_t value, std::string* error) {
     if (value == 0) {
         if (error) *error = std::string("scheduler.") + key + " 必须大于 0 毫秒";
@@ -141,6 +177,14 @@ bool ReadFileStamp(const std::string& path, FileStamp* stamp,
     return true;
 }
 
+/// 函数功能：完成 EditLockPath 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] path 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::string EditLockPath(const std::string& path) {
     return path + ".lock";
 }
@@ -148,6 +192,16 @@ std::string EditLockPath(const std::string& path) {
 // 配置写入方通过 path + ".lock" 声明编辑事务：锁文件非空表示配置仍在
 // 修改，空文件或不存在表示可以读取。这里只检查文件大小，不读取锁文件
 // 内容，避免监听线程因为锁文件本身被截断而误判为已提交。
+/// 函数功能：完成 IsEditLocked 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] path 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] locked 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool IsEditLocked(const std::string& path, bool* locked, std::string* error) {
     if (!locked) return false;
     const auto lock_path = EditLockPath(path);
@@ -257,12 +311,30 @@ bool ReadStableFileContents(const std::string& path, std::string* contents,
 
 }  // namespace
 
+/// 函数功能：完成 Load 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] path 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool IniFile::Load(const std::string& path, std::string* error) {
     std::string contents;
     return ReadStableFileContents(path, &contents, error) &&
            Parse(contents, error);
 }
 
+/// 函数功能：完成 Parse 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] text 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool IniFile::Parse(const std::string& text, std::string* error) {
     m_sections.clear();
     std::string current = "global";
@@ -302,11 +374,30 @@ std::string IniFile::Get(const std::string& section, const std::string& key,
     return value_it == section_it->second.end() ? fallback : value_it->second;
 }
 
+/// 函数功能：完成 Has 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] section 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] key 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool IniFile::Has(const std::string& section, const std::string& key) const {
     const auto section_it = m_sections.find(section);
     return section_it != m_sections.end() && section_it->second.find(key) != section_it->second.end();
 }
 
+/// 函数功能：完成 FromIni 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] ini 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] config 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool RuntimeConfig::FromIni(const IniFile& ini, RuntimeConfig* config, std::string* error) {
     if (!config) { if (error) *error = "RuntimeConfig 输出指针为空"; return false; }
     RuntimeConfig result = *config;
@@ -336,6 +427,14 @@ bool RuntimeConfig::FromIni(const IniFile& ini, RuntimeConfig* config, std::stri
     return true;
 }
 
+/// 函数功能：完成 Validate 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool RuntimeConfig::Validate(std::string* error) const {
     const auto fail = [error](const std::string& message) { if (error) *error = message; return false; };
     const auto& value = scheduler;
@@ -360,17 +459,43 @@ bool RuntimeConfig::Validate(std::string* error) const {
     return true;
 }
 
+/// 函数功能：完成 ApplyLogging 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool RuntimeConfig::ApplyLogging(std::string* error) const {
     if (!Validate(error)) return false;
     log::LoggerManager::Instance().Configure(log_level, log_stdout, log_directory, log_file, log_format);
     return true;
 }
 
+/// 函数功能：完成 LoadRuntimeConfig 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] path 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] config 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool LoadRuntimeConfig(const std::string& path, RuntimeConfig* config, std::string* error) {
     IniFile ini;
     return ini.Load(path, error) && RuntimeConfig::FromIni(ini, config, error);
 }
 
+/// 函数功能：完成 Instance 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 Config& Config::Instance() {
     static Config instance;
     return instance;
@@ -378,12 +503,29 @@ Config& Config::Instance() {
 
 Config::~Config() { StopWatcher(); }
 
+/// 函数功能：完成 LookupBase 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] name 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ConfigVarBase::ptr Config::LookupBase(const std::string& name) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto it = m_vars.find(name);
     return it == m_vars.end() ? nullptr : it->second;
 }
 
+/// 函数功能：完成 LoadFromIni 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] ini 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
     const auto variables = List();
     // 先检查所有已注册项对应的文本能否转换；实际写入仍按变量顺序完成，
@@ -403,11 +545,28 @@ bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
     return true;
 }
 
+/// 函数功能：完成 LoadFromFile 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] path 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Config::LoadFromFile(const std::string& path, std::string* error) {
     IniFile ini;
     return ini.Load(path, error) && LoadFromIni(ini, error);
 }
 
+/// 函数功能：完成 List 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::vector<ConfigVarBase::ptr> Config::List() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     std::vector<ConfigVarBase::ptr> result;
@@ -416,6 +575,16 @@ std::vector<ConfigVarBase::ptr> Config::List() const {
     return result;
 }
 
+/// 函数功能：完成 StartWatcher 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] path 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] interval 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds interval, std::string* error) {
     if (path.empty() || interval <= std::chrono::milliseconds::zero()) {
         if (error) *error = "配置监听路径或周期无效";
@@ -490,6 +659,14 @@ bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds int
     return true;
 }
 
+/// 函数功能：完成 stop_watcher_locked 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Config::stop_watcher_locked() noexcept {
     m_watching.store(false, std::memory_order_release);
     m_watcher_cv.notify_all();
@@ -499,11 +676,28 @@ void Config::stop_watcher_locked() noexcept {
     }
 }
 
+/// 函数功能：完成 StopWatcher 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Config::StopWatcher() {
     std::lock_guard<std::mutex> lifecycle_lock(m_watcher_lifecycle_mutex);
     stop_watcher_locked();
 }
 
+/// 函数功能：完成 BindLoggingConfig 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] config 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool BindLoggingConfig(Config& config, std::string* error) {
     auto level = config.Lookup<log::Level>("log.level", log::Level::Warn, "日志最低级别");
     auto stdout_enabled = config.Lookup<bool>("log.stdout", false, "是否输出到 stdout");
@@ -538,6 +732,16 @@ bool BindLoggingConfig(Config& config, std::string* error) {
     return true;
 }
 
+/// 函数功能：完成 BindRuntimeConfig 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] config 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] target 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error) {
     if (!target) { if (error) *error = "RuntimeConfig 绑定目标为空"; return false; }
     if (!target->Validate(error)) return false;

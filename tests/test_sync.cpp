@@ -27,6 +27,11 @@ bool WaitUntil(Predicate predicate,
     return predicate();
 }
 
+/**
+ * @brief 构造同步原语测试使用的调度配置。
+ * @param processors 处理器数量，测试会据此验证单 P 和多 P 路径。
+ * @return 经过测试约束初始化的 SchedulerConfig 值。
+ */
 go2cpp::SchedulerConfig SchedulerConfig(std::size_t processors) {
     go2cpp::SchedulerConfig config;
     config.processor_count = processors;
@@ -35,6 +40,10 @@ go2cpp::SchedulerConfig SchedulerConfig(std::size_t processors) {
     return config;
 }
 
+/**
+ * @brief 验证未托管线程边界和 WaitGroup 计数错误处理。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestUnmanagedBoundaryAndCounterErrors() {
     go2cpp::sync::Mutex mutex;
     GO2CPP_CHECK(mutex.LockFor(0ms));
@@ -93,6 +102,10 @@ void TestUnmanagedBoundaryAndCounterErrors() {
 }
 
 
+/**
+ * @brief 验证普通线程与 managed Fiber 共享锁、条件变量和 WaitGroup。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestMixedThreadAndFiberSynchronization() {
     go2cpp::Scheduler scheduler(SchedulerConfig(1));
     scheduler.start();
@@ -306,6 +319,10 @@ void TestMixedThreadAndFiberSynchronization() {
     scheduler.shutdown();
 }
 
+/**
+ * @brief 验证已取消 Context 下条件变量和 WaitGroup 立即返回。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestImmediateConditionAndWaitGroupAbort() {
     go2cpp::sync::Mutex mutex;
     go2cpp::sync::ConditionVariable condition;
@@ -379,6 +396,10 @@ void TestImmediateConditionAndWaitGroupAbort() {
     scheduler.shutdown();
 }
 
+/**
+ * @brief 验证手动 Fiber 争用同步原语时不会永久阻塞承载线程。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestManualFiberDoesNotBlockCarrier() {
     go2cpp::sync::Mutex mutex;
     go2cpp::sync::ConditionVariable condition;
@@ -431,6 +452,10 @@ void TestManualFiberDoesNotBlockCarrier() {
     group.Done();
 }
 
+/**
+ * @brief 验证同步等待队列 FIFO 顺序和单 P 下的任务推进。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestFifoAndSingleProcessorProgress() {
     go2cpp::Scheduler scheduler(SchedulerConfig(1));
     go2cpp::sync::Mutex mutex;
@@ -502,6 +527,10 @@ void TestFifoAndSingleProcessorProgress() {
     scheduler.shutdown();
 }
 
+/**
+ * @brief 验证锁、条件变量和 WaitGroup 的 Context/超时行为。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestContextAndTimeout() {
     go2cpp::Scheduler scheduler(SchedulerConfig(1));
     scheduler.start();
@@ -565,6 +594,10 @@ struct NotifyRaceState {
     std::atomic<bool> wait_result{false};
 };
 
+/**
+ * @brief 验证通知先于等待 Fiber park 的竞态不会丢失唤醒。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestNotifyBeforeParkRace() {
     go2cpp::Scheduler scheduler(SchedulerConfig(2));
     scheduler.start();
@@ -600,6 +633,10 @@ void TestNotifyBeforeParkRace() {
     scheduler.shutdown();
 }
 
+/**
+ * @brief 验证无关唤醒令牌不会误结束新的等待。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestSpuriousWakeDoesNotCancelWait() {
     go2cpp::Scheduler scheduler(SchedulerConfig(1));
     go2cpp::sync::WaitGroup group;
@@ -617,6 +654,10 @@ void TestSpuriousWakeDoesNotCancelWait() {
     scheduler.shutdown();
 }
 
+/**
+ * @brief 验证 WaitGroup 的一轮释放完成后可以安全复用。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestWaitGroupWaveReleasedBeforeReuse() {
     go2cpp::Scheduler scheduler(SchedulerConfig(1));
     go2cpp::sync::WaitGroup group;
@@ -664,6 +705,10 @@ void TestWaitGroupWaveReleasedBeforeReuse() {
     scheduler.shutdown();
 }
 
+/**
+ * @brief 验证解锁与 Context 取消同时发生时等待者只完成一次。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestUnlockRacesContextCancellation() {
     go2cpp::Scheduler scheduler(SchedulerConfig(2));
     scheduler.start();
@@ -727,6 +772,10 @@ struct StackRelease final {
     std::atomic<int>& m_released;
 };
 
+/**
+ * @brief 验证 Context 回调与 Scheduler 销毁并发时资源完整释放。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestContextCallbackRacesSchedulerShutdown() {
     for (int iteration = 0; iteration < 64; ++iteration) {
         auto scheduler =
@@ -772,6 +821,10 @@ void TestContextCallbackRacesSchedulerShutdown() {
 
 }  // namespace
 
+/**
+ * @brief 运行混合同步原语和关闭竞态测试。
+ * @return 无；测试失败由统一断言统计。
+ */
 void run_sync_tests() {
     go2cpp_tests::announce("scheduler-aware synchronization");
     TestUnmanagedBoundaryAndCounterErrors();
@@ -790,6 +843,10 @@ void run_sync_tests() {
 #ifdef GO2CPP_SYNC_TEST_MAIN
 #include <iostream>
 
+/**
+ * @brief 同步测试的独立入口。
+ * @return 全部测试通过返回 0，否则返回非零值。
+ */
 int main() {
     run_sync_tests();
     const int failures =

@@ -19,14 +19,20 @@ class TimerService;
 class Timer final {
 public:
     struct State;
+    /** @brief 创建一个无效定时器句柄。 */
     Timer() noexcept;
+    /** @brief 取消并释放定时器句柄。 */
     ~Timer();
+    /** @brief 转移定时器所有权。 */
     Timer(Timer&&) noexcept;
+    /** @brief 转移赋值定时器所有权。 */
     Timer& operator=(Timer&&) noexcept;
     Timer(const Timer&) = delete;
     Timer& operator=(const Timer&) = delete;
 
+    /** @brief 取消尚未触发的回调。 */
     void Cancel() noexcept;
+    /** @brief 返回定时器是否仍处于活动状态。 */
     bool Active() const noexcept;
 
 private:
@@ -48,12 +54,21 @@ public:
     using Clock = std::chrono::steady_clock;
     class Impl;
 
+    /** @brief 启动定时器服务线程。 */
     TimerService();
+    /** @brief 停止服务并等待线程退出。 */
     ~TimerService();
     TimerService(const TimerService&) = delete;
     TimerService& operator=(const TimerService&) = delete;
 
+    /** @brief 返回进程内默认定时器服务。 */
     static TimerService& Default();
+    /**
+     * @brief 注册一次性定时回调。
+     * @param deadline steady_clock 截止时间。
+     * @param callback 到期后执行的回调。
+     * @return 可用于取消的 Timer 句柄。
+     */
     Timer Schedule(Clock::time_point deadline, std::function<void()> callback);
 
 private:

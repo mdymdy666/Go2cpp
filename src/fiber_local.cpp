@@ -18,6 +18,14 @@ struct Registry final {
     std::unordered_map<Fiber*, ValueMap> m_values;
 };
 
+/// 函数功能：完成 registry 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 Registry& registry() noexcept {
     // Keep the registry until process exit: Fiber objects may be destroyed
     // during static teardown, when ordinary static destruction order is not
@@ -32,6 +40,14 @@ std::atomic<KeyId> s_next_key{1};
 
 ThreadValueMap& ThreadValues() noexcept { return s_thread_values; }
 
+/// 函数功能：完成 AllocateKey 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 KeyId AllocateKey() noexcept {
     // Zero is reserved as the invalid/sentinel key.  A fetch_add based
     // allocator would wrap to an earlier live key after UINT64_MAX and could
@@ -53,6 +69,15 @@ KeyId AllocateKey() noexcept {
     }
 }
 
+/// 函数功能：完成 Get 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] fiber 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] key 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::shared_ptr<void> Get(Fiber* fiber, KeyId key) noexcept {
     if (!fiber || key == 0) {
         return {};
@@ -68,6 +93,16 @@ std::shared_ptr<void> Get(Fiber* fiber, KeyId key) noexcept {
                                                      : value_found->second;
 }
 
+/// 函数功能：完成 Set 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] fiber 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] key 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] value 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Set(Fiber* fiber, KeyId key, std::shared_ptr<void> value) {
     if (!fiber || key == 0) {
         return;
@@ -77,6 +112,15 @@ void Set(Fiber* fiber, KeyId key, std::shared_ptr<void> value) {
     store.m_values[fiber][key] = std::move(value);
 }
 
+/// 函数功能：完成 Reset 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] fiber 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] key 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Reset(Fiber* fiber, KeyId key) noexcept {
     if (!fiber || key == 0) {
         return;
@@ -105,6 +149,14 @@ void Reset(Fiber* fiber, KeyId key) noexcept {
     }
 }
 
+/// 函数功能：完成 Cleanup 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] fiber 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Cleanup(Fiber* fiber) noexcept {
     if (!fiber) {
         return;

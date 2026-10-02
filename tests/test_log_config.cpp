@@ -9,6 +9,10 @@
 #include <thread>
 #include <vector>
 
+/**
+ * @brief 验证日志格式化、并发写入和动态配置热加载。
+ * @return 无；测试失败由统一断言统计。
+ */
 void run_log_config_tests() {
     go2cpp_tests::announce("日志与配置工程化接口");
     using namespace go2cpp;

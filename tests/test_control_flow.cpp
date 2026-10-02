@@ -9,6 +9,10 @@
 #include <memory>
 #include <vector>
 
+/**
+ * @brief 验证 defer 的作用域执行、panic/recover 边界和 SelectCaster。
+ * @return 无；测试断言负责报告失败。
+ */
 void run_control_flow_tests() {
     go2cpp_tests::announce("defer/panic/recover");
     using namespace go2cpp;

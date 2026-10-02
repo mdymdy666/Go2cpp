@@ -31,11 +31,28 @@ enum class WaitResult : std::uint8_t {
 
 class WaitNode final {
 public:
+    /// 函数功能：执行 WaitNode，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
+    /// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     WaitNode(Scheduler* scheduler, std::shared_ptr<Task> task)
         : m_scheduler(scheduler), m_task(std::move(task)) {}
 
     ~WaitNode() { Disarm(); }
 
+    /// 函数功能：执行 Arm，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     bool Arm() noexcept {
         std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
         if (result() != WaitResult::kWaiting) {
@@ -45,6 +62,14 @@ public:
         return true;
     }
 
+    /// 函数功能：执行 Disarm，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void Disarm() noexcept {
         // 回调可能已经离开 DoneSignal 的注册表。这里等待其 Wake 调用完成，
         // 防止回调生命周期超过 Scheduler 的关闭过程。
@@ -53,10 +78,26 @@ public:
         m_scheduler = nullptr;
     }
 
+    /// 函数功能：执行 result，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     WaitResult result() const noexcept {
         return m_result.load(std::memory_order_acquire);
     }
 
+    /// 函数功能：执行 TryFinish，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] result 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     bool TryFinish(WaitResult result) noexcept {
         WaitResult expected = WaitResult::kWaiting;
         return m_result.compare_exchange_strong(
@@ -64,16 +105,40 @@ public:
             std::memory_order_acquire);
     }
 
+    /// 函数功能：执行 Wake，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void Wake() noexcept {
         std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
         WakeLocked();
     }
 
+    /// 函数功能：执行 TryCancelAndWake，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] generation 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     // Context 的取消回调可能已经通过 weak_ptr 取得了本节点，随后
     // RemoveCallback 又与节点回收并发。取消、active 检查和唤醒必须在
     // 同一把门锁内完成；否则旧回调可能在节点放回 thread-local cache
     // 后，把下一次等待的 m_result 错误地改成 Cancelled。generation 用来
     // 区分同一个缓存节点的不同等待代次。
+    /// 函数功能：完成 TryCancelAndWake 调用，读取或更新相关运行时状态。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+    /// @param[in] generation 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     bool TryCancelAndWake(std::uint64_t generation) noexcept {
         std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
         if (generation != m_generation ||
@@ -88,12 +153,28 @@ public:
         return true;
     }
 
+    /// 函数功能：执行 generation，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     std::uint64_t generation() noexcept {
         std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
         return m_generation;
     }
 
 private:
+    /// 函数功能：执行 WakeLocked，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void WakeLocked() noexcept {
         if (!m_active) {
             return;
@@ -116,10 +197,26 @@ private:
 
 public:
 
+    /// 函数功能：执行 managed，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     bool managed() const noexcept {
         return m_scheduler != nullptr && static_cast<bool>(m_task);
     }
 
+    /// 函数功能：执行 WaitNative，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     WaitResult WaitNative() noexcept {
         try {
             std::unique_lock<std::mutex> lock(m_native_mutex);
@@ -138,6 +235,15 @@ public:
     const std::shared_ptr<Task>& task() const noexcept { return m_task; }
     Scheduler* scheduler() const noexcept { return m_scheduler; }
 
+    /// 函数功能：执行 Reset，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
+    /// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void Reset(Scheduler* scheduler, std::shared_ptr<Task> task) noexcept {
         std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
         m_active = false;
@@ -177,6 +283,14 @@ std::shared_ptr<WaitNode> AcquireWaitNode(Scheduler* scheduler,
     return std::make_shared<WaitNode>(scheduler, std::move(task));
 }
 
+/// 函数功能：完成 RelaxCpu 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 inline void RelaxCpu() noexcept {
 #if defined(__x86_64__) || defined(__i386__)
     _mm_pause();
@@ -185,6 +299,14 @@ inline void RelaxCpu() noexcept {
 #endif
 }
 
+/// 函数功能：完成 ReleaseWaitNode 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] waiter 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void ReleaseWaitNode(std::shared_ptr<WaitNode> waiter) noexcept {
     if (!waiter) {
         return;
@@ -200,11 +322,27 @@ struct WaitTarget {
     std::shared_ptr<Task> task;
     bool unsupported_manual_fiber{false};
 
+    /// 函数功能：执行 bool，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     explicit operator bool() const noexcept {
         return scheduler != nullptr && static_cast<bool>(task);
     }
 };
 
+/// 函数功能：完成 CurrentTarget 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 WaitTarget CurrentTarget() noexcept {
     Scheduler* const scheduler = Scheduler::current_scheduler();
     auto task = Scheduler::current_task();
@@ -215,6 +353,15 @@ WaitTarget CurrentTarget() noexcept {
 
 class ContextSubscription final {
 public:
+    /// 函数功能：执行 ContextSubscription，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] context 调用方传入的参数，具体约束以头文件声明为准。
+    /// @param[in] waiter 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     ContextSubscription(const ContextPtr& context,
                         const std::shared_ptr<WaitNode>& waiter)
         : m_context(context) {
@@ -236,6 +383,14 @@ public:
 
     ~ContextSubscription() { Reset(); }
 
+    /// 函数功能：执行 Reset，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void Reset() noexcept {
         if (m_context && m_id != 0) {
             m_context->Done().RemoveCallback(m_id);
@@ -251,6 +406,14 @@ private:
 
 class CancelGuard final {
 public:
+    /// 函数功能：执行 CancelGuard，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] cancel 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     explicit CancelGuard(CancelFunc cancel) : m_cancel(std::move(cancel)) {}
     ~CancelGuard() {
         if (m_cancel) {
@@ -265,6 +428,14 @@ private:
     CancelFunc m_cancel;
 };
 
+/// 函数功能：完成 Await 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] waiter 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 WaitResult Await(WaitNode* waiter) noexcept {
     if (!waiter) {
         return WaitResult::kCancelled;
@@ -340,6 +511,15 @@ ContextPtr TimeoutContext(ContextDuration timeout, const ContextPtr& parent,
 // 解锁/重锁边界，让其他 waiter 有机会运行，并在看到 false 前重新获得锁。
 // Scheduler 关闭期间 Mutex::Lock 可能拒绝再次 park G；此时按文档返回 false，
 // mutex 保持未锁定。
+/// 函数功能：完成 AbortConditionWait 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] mutex 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] preserve_lock 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool AbortConditionWait(Mutex& mutex, bool preserve_lock = false) {
     // 手动恢复的 Fiber 没有 Scheduler continuation。解锁后再阻塞重锁可能在
     // 其他 owner 获胜时挂起 carrier 线程，因此这个受限路径保留调用者持有的
@@ -374,9 +554,25 @@ struct Mutex::Impl {
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
 };
 
+/// 函数功能：完成 Mutex 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 Mutex::Mutex() : m_impl(std::make_unique<Impl>()) {}
 Mutex::~Mutex() = default;
 
+/// 函数功能：完成 Lock 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] context 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Mutex::Lock(const ContextPtr& context) {
     if (context && context->IsDone()) {
         return false;
@@ -565,6 +761,15 @@ bool Mutex::Lock(const ContextPtr& context) {
     return true;
 }
 
+/// 函数功能：完成 LockFor 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] timeout 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] parent 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Mutex::LockFor(ContextDuration timeout, const ContextPtr& parent) {
     if (parent && parent->IsDone()) {
         return false;
@@ -580,6 +785,14 @@ bool Mutex::LockFor(ContextDuration timeout, const ContextPtr& parent) {
     return Lock(context);
 }
 
+/// 函数功能：完成 TryLock 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Mutex::TryLock() noexcept {
     std::uint8_t expected = 0U;
     const bool acquired = m_impl->m_state.compare_exchange_strong(
@@ -588,6 +801,14 @@ bool Mutex::TryLock() noexcept {
     return acquired;
 }
 
+/// 函数功能：完成 Unlock 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Mutex::Unlock() {
     // 无等待者时只需一次 CAS，不进入队列互斥量。若等待者位同时存在，
     // CAS 必定失败并转入下面的 FIFO 交接路径。
@@ -639,6 +860,14 @@ void Mutex::Unlock() {
     }
 }
 
+/// 函数功能：完成 lock 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Mutex::lock() {
     if (!Lock()) {
         throw std::logic_error(
@@ -651,9 +880,26 @@ struct ConditionVariable::Impl {
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
 };
 
+/// 函数功能：完成 ConditionVariable 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ConditionVariable::ConditionVariable() : m_impl(std::make_unique<Impl>()) {}
 ConditionVariable::~ConditionVariable() = default;
 
+/// 函数功能：完成 Wait 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] mutex 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] context 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
     // 必须先识别手动 Fiber。即使 Context 已取消，也不能走普通线程的
     // unlock/relock 路径，否则竞争中的重锁会阻塞 carrier 线程。
@@ -727,6 +973,14 @@ bool ConditionVariable::WaitFor(Mutex& mutex, ContextDuration timeout,
     return Wait(mutex, context);
 }
 
+/// 函数功能：完成 NotifyOne 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void ConditionVariable::NotifyOne() noexcept {
     std::shared_ptr<WaitNode> selected;
     {
@@ -746,6 +1000,14 @@ void ConditionVariable::NotifyOne() noexcept {
     }
 }
 
+/// 函数功能：完成 NotifyAll 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void ConditionVariable::NotifyAll() noexcept {
     std::deque<std::shared_ptr<WaitNode>> waiters;
     {
@@ -765,9 +1027,25 @@ struct WaitGroup::Impl {
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
 };
 
+/// 函数功能：完成 WaitGroup 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 WaitGroup::WaitGroup() : m_impl(std::make_unique<Impl>()) {}
 WaitGroup::~WaitGroup() = default;
 
+/// 函数功能：完成 Add 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] delta 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void WaitGroup::Add(std::int64_t delta) {
     std::deque<std::shared_ptr<WaitNode>> released;
     {
@@ -804,6 +1082,14 @@ void WaitGroup::Add(std::int64_t delta) {
 
 void WaitGroup::Done() { Add(-1); }
 
+/// 函数功能：完成 Wait 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] context 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool WaitGroup::Wait(const ContextPtr& context) {
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
@@ -851,6 +1137,15 @@ bool WaitGroup::Wait(const ContextPtr& context) {
     return true;
 }
 
+/// 函数功能：完成 WaitFor 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] timeout 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] parent 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool WaitGroup::WaitFor(ContextDuration timeout, const ContextPtr& parent) {
     CancelFunc cancel;
     const ContextPtr context = TimeoutContext(timeout, parent, &cancel);
@@ -858,6 +1153,14 @@ bool WaitGroup::WaitFor(ContextDuration timeout, const ContextPtr& parent) {
     return Wait(context);
 }
 
+/// 函数功能：完成 Count 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::int64_t WaitGroup::Count() const noexcept {
     std::lock_guard<std::mutex> lock(m_impl->m_mutex);
     return m_impl->m_count;

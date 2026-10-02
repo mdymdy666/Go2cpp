@@ -394,6 +394,10 @@ void test_shutdown_destroys_queue_tasks_outside_runtime_locks() {
 
 }  // namespace
 
+/**
+ * @brief 运行调度器最小烟囱测试集合。
+ * @return 所有烟囱测试通过返回 0，否则返回 1。
+ */
 int run_go2cpp_scheduler_smoke_tests() {
     test_single_processor_fifo_and_completion();
     test_steal_and_current_identity();

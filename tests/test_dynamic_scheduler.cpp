@@ -97,6 +97,10 @@ void Burst(go2cpp::Scheduler& scheduler, std::size_t worker_cap,
     GO2CPP_CHECK(scheduler.runnable_count() == 0);
 }
 
+/**
+ * @brief 验证 Worker 随负载增长、空闲回收并能再次扩容。
+ * @return 无；测试失败由统一断言统计。
+ */
 void GrowShrinkRegrow() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 4;
@@ -146,6 +150,10 @@ void GrowShrinkRegrow() {
     GO2CPP_CHECK(scheduler.worker_count() == 0);
 }
 
+/**
+ * @brief 验证处理器数量上限和最小 Worker 保留策略。
+ * @return 无；测试失败由统一断言统计。
+ */
 void ProcessorCapAndMinimumFloor() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 3;
@@ -167,6 +175,10 @@ void ProcessorCapAndMinimumFloor() {
     scheduler.shutdown();
 }
 
+/**
+ * @brief 验证阻塞区触发临时过量 Worker 以保持任务进度。
+ * @return 无；测试失败由统一断言统计。
+ */
 void BlockingRegionOvercommit() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 1;
@@ -225,6 +237,10 @@ void BlockingRegionOvercommit() {
     scheduler.shutdown();
 }
 
+/**
+ * @brief 验证 sysmon 发现长系统调用后解绑 M/P 并调度同伴任务。
+ * @return 无；测试失败由统一断言统计。
+ */
 void SysmonDetachesLongSyscall() {
     go2cpp::SchedulerConfig config;
     // 多 P 但只有一个长 syscall 时，sysmon 只应补一个替代 M，
@@ -297,6 +313,10 @@ void SysmonDetachesLongSyscall() {
     GO2CPP_CHECK(!scheduler.sysmon_running());
 }
 
+/**
+ * @brief 验证多个长系统调用同时发生时的解绑和补充 Worker。
+ * @return 无；测试失败由统一断言统计。
+ */
 void SysmonMultipleDetaches() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 2;
@@ -366,6 +386,10 @@ void SysmonMultipleDetaches() {
     GO2CPP_CHECK(!scheduler.sysmon_running());
 }
 
+/**
+ * @brief 验证高负载期间 sysmon 心跳仍能持续推进。
+ * @return 无；测试失败由统一断言统计。
+ */
 void SysmonHeartbeatUnderLoad() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 2;
@@ -408,6 +432,10 @@ void SysmonHeartbeatUnderLoad() {
     GO2CPP_CHECK(!scheduler.sysmon_running());
 }
 
+/**
+ * @brief 验证任务类别亲和预算有界且不会阻塞其他类别。
+ * @return 无；测试失败由统一断言统计。
+ */
 void BoundedClassAffinity() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 1;
@@ -447,6 +475,10 @@ void BoundedClassAffinity() {
     scheduler.shutdown();
 }
 
+/**
+ * @brief 验证取消、唤醒和调度器关闭并发发生时任务可安全收尾。
+ * @return 无；测试失败由统一断言统计。
+ */
 void CancelWakeShutdownRace() {
     for (int round = 0; round < 40; ++round) {
         go2cpp::SchedulerConfig config;
@@ -488,6 +520,10 @@ void CancelWakeShutdownRace() {
 
 }  // namespace
 
+/**
+ * @brief 运行动态 GMP 调度器和 sysmon 相关测试。
+ * @return 无；测试失败由统一断言统计。
+ */
 void run_dynamic_scheduler_tests() {
     Watchdog watchdog(20s);
     go2cpp_tests::announce("dynamic M growth/shrink, P cap, bounded affinity and wake drain");
@@ -502,6 +538,10 @@ void run_dynamic_scheduler_tests() {
 }
 
 #ifdef GO2CPP_DYNAMIC_SCHEDULER_MAIN
+/**
+ * @brief 动态调度器测试的独立入口。
+ * @return 全部测试通过返回 0，否则返回非零值。
+ */
 int main() {
     run_dynamic_scheduler_tests();
     return go2cpp_tests::g_failures.load(std::memory_order_relaxed) == 0 ? 0 : 1;

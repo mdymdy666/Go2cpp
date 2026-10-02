@@ -19,6 +19,10 @@ void run_beginner_api_tests();
 void run_log_config_tests();
 void run_hook_tests();
 
+/**
+ * @brief 统一运行默认测试集并根据过滤器选择测试模块。
+ * @return 所有选定测试通过返回 0，否则返回非零值。
+ */
 int main() {
     const char* const filter_value = std::getenv("GO2CPP_TEST_FILTER");
     const std::string_view filter = filter_value ? filter_value : "";

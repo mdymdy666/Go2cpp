@@ -14,6 +14,10 @@ namespace {
 
 using namespace std::chrono_literals;
 
+/**
+ * @brief 构造 Future 测试使用的单处理器调度配置。
+ * @return 适合测试的 SchedulerConfig 值。
+ */
 go2cpp::SchedulerConfig FutureSchedulerConfig() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 1;
@@ -23,6 +27,10 @@ go2cpp::SchedulerConfig FutureSchedulerConfig() {
     return config;
 }
 
+/**
+ * @brief 验证普通线程设置 Future 值以及超时读取。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestNativeValueAndTimeout() {
     auto pair = go2cpp::MakePromise<int>();
     auto promise = std::move(pair.first);
@@ -45,6 +53,10 @@ void TestNativeValueAndTimeout() {
     GO2CPP_CHECK(result.CopyValue().value_or(0) == 42);
 }
 
+/**
+ * @brief 验证 Future 等待对 Context 取消和截止时间的响应。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestContextCancellationAndDeadline() {
     auto cancel_pair = go2cpp::MakePromise<int>();
     auto cancel_promise = std::move(cancel_pair.first);
@@ -75,6 +87,10 @@ void TestContextCancellationAndDeadline() {
     GO2CPP_CHECK(deadline_promise.Cancel());
 }
 
+/**
+ * @brief 验证 managed Fiber 等待 Future 时不会阻塞承载线程。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestManagedFiberWait() {
     go2cpp::Scheduler scheduler(FutureSchedulerConfig());
     scheduler.start();
@@ -109,6 +125,10 @@ void TestManagedFiberWait() {
     scheduler.shutdown();
 }
 
+/**
+ * @brief 验证无返回值 Future 与 Fiber 取消路径。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestManagedCancellationAndVoid() {
     go2cpp::Scheduler scheduler(FutureSchedulerConfig());
     scheduler.start();
@@ -139,6 +159,10 @@ void TestManagedCancellationAndVoid() {
     scheduler.shutdown();
 }
 
+/**
+ * @brief 验证 Future 错误、异常、断裂 Promise 和单次发布约束。
+ * @return 无；测试失败由统一断言统计。
+ */
 void TestErrorExceptionBrokenPromiseAndSinglePublish() {
     auto error_pair = go2cpp::MakePromise<int>();
     auto error_promise = std::move(error_pair.first);
@@ -198,6 +222,10 @@ void TestErrorExceptionBrokenPromiseAndSinglePublish() {
 
 }  // namespace
 
+/**
+ * @brief 运行全部 Future 单元测试。
+ * @return 无；测试失败由统一断言统计。
+ */
 void run_future_tests() {
     go2cpp_tests::announce("future");
     TestNativeValueAndTimeout();

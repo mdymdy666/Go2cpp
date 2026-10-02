@@ -3,6 +3,12 @@
 
 #include <iostream>
 
+/**
+ * @brief 演示从 INI 文件加载运行时日志配置并创建命名 Logger。
+ * @details 配置文件决定输出目录、级别和格式；示例只记录警告与错误，避免
+ *          发布模式默认输出大量 Info 日志。
+ * @return 配置加载并完成日志演示后返回 0。
+ */
 int main() {
     go2cpp::config::RuntimeConfig config;
     std::string error;

@@ -23,6 +23,12 @@ namespace go2cpp {
 // 但只走协作式返回路径，不会强制销毁仍在等待的 Fiber 栈。
 // Handler 接收 const SelectResult&，并且内部保存的是并发安全快照；因此
 // move-only 结果只能通过 SelectValue::Get<T>() 观察，不能在 Handler 中 Take.
+/**
+ * @brief 可复用的事件批处理器。
+ * @details 将多个 SelectCase 与回调绑定为一轮一轮的等待任务，底层依赖
+ *          Channel、Select 和 sync::Mutex，支持 Fiber 与普通线程调用。
+ *          stop()/reset() 控制生命周期，超时和最大轮数用于限制长时间运行。
+ */
 class EventBatch final {
     struct StopControl final {
         ContextPtr context;
@@ -39,18 +45,22 @@ class EventBatch final {
 
 public:
     using Duration = ContextDuration;
+    /// 事件触发后的用户回调；参数包含被选中的 case 和结果值。
     using Handler = std::function<void(const SelectResult&)>;
 
+    /** @brief 创建空事件批次并初始化内部停止 Context。 */
     EventBatch() : m_stop_control(make_stop_control()) {}
     EventBatch(const EventBatch&) = delete;
     EventBatch& operator=(const EventBatch&) = delete;
 
     // bind 会清空旧事件并装载一个新事件；add_event/load 用于追加事件。
+    /** @brief 清空现有 case 后绑定一个初始事件。 */
     void bind(SelectCase event, Handler handler = {}) {
         clear();
         add_event(std::move(event), std::move(handler));
     }
 
+    /** @brief 向批次尾部追加一个事件及其可选回调。 */
     void add_event(SelectCase event, Handler handler = {}) {
         if (!m_mutex.Lock()) {
             return;
@@ -64,10 +74,12 @@ public:
         m_mutex.Unlock();
     }
 
+    /** @brief 兼容 Go 风格命名的 add_event 别名。 */
     void load(SelectCase event, Handler handler = {}) {
         add_event(std::move(event), std::move(handler));
     }
 
+    /** @brief 清空事件、结果和停止状态，准备重新绑定。 */
     void clear() {
         auto fresh_control = make_stop_control();
         if (!m_mutex.Lock()) {
@@ -85,6 +97,7 @@ public:
 
     // 设置单次 Select 的最长等待时间。超时后默认停止批次；可传 false
     // 继续下一轮，以便调用方自行决定降级策略。
+    /** @brief 设置每轮 Select 的最长等待时间及超时后是否停止。 */
     void make_loop_time(Duration timeout, bool stop_on_timeout = true) {
         if (!m_mutex.Lock()) {
             return;
@@ -95,6 +108,7 @@ public:
     }
 
     // 设置最多运行轮数和总工作时间；0 表示不限制对应条件。
+    /** @brief 设置批次总轮数和总运行时长上限，0/非正值表示不限制。 */
     void make_stop_config(std::size_t max_rounds, Duration max_duration) {
         if (!m_mutex.Lock()) {
             return;
@@ -105,12 +119,14 @@ public:
         m_mutex.Unlock();
     }
 
+    /** @brief 以秒为单位设置批次总运行限制。 */
     void make_stop_config(std::size_t max_rounds,
                           std::uint64_t max_seconds) {
         make_stop_config(max_rounds,
                          std::chrono::seconds(max_seconds));
     }
 
+    /** @brief 请求停止并唤醒当前等待中的 Fiber 或线程。 */
     void stop() noexcept {
         try {
             std::shared_ptr<StopControl> control;
@@ -129,6 +145,7 @@ public:
             // shutdown 期间不能再阻塞调用方；未能加锁时不触碰共享状态。
         }
     }
+    /** @brief 清除停止、结果和轮数，重新激活事件批次。 */
     void reset() {
         auto fresh_control = make_stop_control();
         if (!m_mutex.Lock()) {
@@ -143,6 +160,7 @@ public:
         m_mutex.Unlock();
     }
 
+    /** @brief 返回批次是否仍有事件且允许执行。 */
     bool runnable() const {
         if (!m_mutex.Lock()) {
             return false;
@@ -152,7 +170,9 @@ public:
         return result;
     }
     // 兼容用户习惯的拼写。
+    /** @brief runnable() 的兼容拼写别名。 */
     bool runable() const { return runnable(); }
+    /** @brief 返回最近一轮是否选中了事件。 */
     bool happened() const {
         if (!m_mutex.Lock()) {
             return false;
@@ -161,13 +181,21 @@ public:
         m_mutex.Unlock();
         return result;
     }
+    /** @brief happened() 的兼容拼写别名。 */
     bool happend() const { return happened(); }
 
+    /** @brief 构造一个表示批次停止的结果对象。 */
     static SelectResult stopped_result(const char* message) {
         return SelectResult{SelectResult::kNoSelection, false, false, {},
                             ChannelStatus::kCancelled, NewError(message)};
     }
 
+    /**
+     * @brief 执行一轮 Select 并保存结果。
+     * @param context 外部取消 Context，可为空。
+     * @param timeout 本轮覆盖默认 loop timeout 的时长。
+     * @return 本轮选择结果；停止、取消和错误通过 status/error 返回。
+     */
     SelectResult work(const ContextPtr& context = {},
                       std::optional<Duration> timeout = std::nullopt) {
         // 同一批次只允许一个 work 调用；sync::Mutex 会让竞争的 Fiber
@@ -314,6 +342,7 @@ public:
 
     // 返回最近一次结果；没有结果时返回空值。调用方也可以直接使用 work()
     // 的返回值，避免额外保存状态。
+    /** @brief 读取最近一轮结果，没有成功选择时返回空值。 */
     std::optional<SelectResult> handle() const {
         if (!m_mutex.Lock()) {
             return std::nullopt;
@@ -328,6 +357,7 @@ public:
     }
 
     // 返回快照，避免调用者在另一个 Fiber/thread 修改批次时持有内部引用。
+    /** @brief 返回最近一轮结果的线程安全副本。 */
     SelectResult last_result_copy() const {
         if (!m_mutex.Lock()) {
             return SelectResult{};
@@ -338,7 +368,9 @@ public:
     }
 
     // 返回独立快照；不把内部结果引用暴露给并发调用者。
+    /** @brief last_result_copy() 的简写接口。 */
     SelectResult last_result() const { return last_result_copy(); }
+    /** @brief 返回当前批次已绑定的事件数量。 */
     std::size_t size() const {
         if (!m_mutex.Lock()) {
             return 0;

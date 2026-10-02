@@ -123,6 +123,10 @@ void WaitUntil(Predicate predicate, std::chrono::seconds timeout,
     Check(predicate(), message);
 }
 
+/**
+ * @brief 构造高负载压力测试使用的调度配置。
+ * @return 适合大量任务、Fiber 和 IO 的 SchedulerConfig 值。
+ */
 go2cpp::SchedulerConfig StressConfig() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 8;
@@ -136,6 +140,12 @@ go2cpp::SchedulerConfig StressConfig() {
     return config;
 }
 
+/**
+ * @brief 执行可重复的计算内核，用于比较 Fiber 和线程池吞吐。
+ * @param value 输入种子值。
+ * @param rounds 迭代轮数。
+ * @return 计算后的校验值。
+ */
 std::uint64_t ComputeKernel(std::uint64_t value, int rounds) {
     for (int round = 0; round < rounds; ++round) {
         value ^= value >> 29U;
@@ -146,6 +156,10 @@ std::uint64_t ComputeKernel(std::uint64_t value, int rounds) {
     return value;
 }
 
+/**
+ * @brief 执行 Fiber 计算密集压力场景并返回耗时。
+ * @return 场景耗时的毫秒值。
+ */
 std::int64_t StressFiberCompute() {
     constexpr int kTaskCount = 8000;
     constexpr int kRounds = 100000;
@@ -177,6 +191,10 @@ std::int64_t StressFiberCompute() {
         .count();
 }
 
+/**
+ * @brief 执行传统线程池计算密集压力场景并返回耗时。
+ * @return 场景耗时的毫秒值。
+ */
 std::int64_t StressThreadCompute() {
     constexpr int kTaskCount = 8000;
     constexpr int kRounds = 100000;
@@ -205,6 +223,10 @@ std::int64_t StressThreadCompute() {
         .count();
 }
 
+/**
+ * @brief 执行 Scheduler 大量任务提交、窃取和完成压力场景。
+ * @return 场景耗时的毫秒值。
+ */
 std::int64_t StressScheduler() {
     constexpr int kTaskCount = 50000;
     constexpr int kProducerCount = 8;
@@ -275,6 +297,10 @@ std::int64_t StressScheduler() {
         .count();
 }
 
+/**
+ * @brief 执行 Fiber/线程混合 Mutex 竞争压力场景。
+ * @return 场景耗时的毫秒值。
+ */
 std::int64_t StressMixedMutex() {
     constexpr int kFiberCount = 2000;
     constexpr int kNativeCount = 32;
@@ -338,6 +364,10 @@ std::int64_t StressMixedMutex() {
         .count();
 }
 
+/**
+ * @brief 执行 Fiber Channel 多生产者/消费者压力场景。
+ * @return 场景耗时的毫秒值。
+ */
 std::int64_t StressFiberChannel() {
     constexpr int kProducerCount = 16;
     constexpr int kConsumerCount = 16;
@@ -412,6 +442,10 @@ std::int64_t StressFiberChannel() {
         .count();
 }
 
+/**
+ * @brief 执行线程池任务提交基准场景。
+ * @return 场景耗时的毫秒值。
+ */
 std::int64_t StressThreadPoolTasks() {
     constexpr int kTaskCount = 50000;
     constexpr int kProducerCount = 8;
@@ -455,6 +489,10 @@ std::int64_t StressThreadPoolTasks() {
         .count();
 }
 
+/**
+ * @brief 执行线程池 Mutex 竞争基准场景。
+ * @return 场景耗时的毫秒值。
+ */
 std::int64_t StressThreadPoolMutex() {
     constexpr int kTaskCount = 2000;
     constexpr int kNativeCount = 32;
@@ -494,6 +532,10 @@ std::int64_t StressThreadPoolMutex() {
         .count();
 }
 
+/**
+ * @brief 执行线程池消息队列基准场景。
+ * @return 场景耗时的毫秒值。
+ */
 std::int64_t StressThreadPoolChannel() {
     constexpr int kProducerCount = 16;
     constexpr int kConsumerCount = 16;
@@ -566,12 +608,22 @@ std::int64_t StressThreadPoolChannel() {
         .count();
 }
 
+/**
+ * @brief 创建并设置非阻塞管道，供 IO 压力测试使用。
+ * @param fds 输出读端和写端文件描述符。
+ * @return 创建成功返回 0，否则返回负值。
+ */
 int MakeNonBlockingPipe(int (&fds)[2]) {
     fds[0] = -1;
     fds[1] = -1;
     return static_cast<int>(::syscall(SYS_pipe2, fds, O_NONBLOCK | O_CLOEXEC));
 }
 
+/**
+ * @brief 关闭压力测试文件描述符并忽略重复关闭错误。
+ * @param fd 待关闭的文件描述符。
+ * @return 无。
+ */
 void RawClose(int fd) {
     if (fd >= 0) {
         (void)::syscall(SYS_close, fd);
@@ -592,6 +644,10 @@ void DriveIORounds(const std::vector<int>& write_fds, int rounds,
     }
 }
 
+/**
+ * @brief 执行 Fiber socket IO 多路等待压力场景。
+ * @return 场景耗时的毫秒值。
+ */
 std::int64_t StressFiberIO() {
     constexpr int kReaders = 4096;
     constexpr int kRounds = 25;
@@ -698,6 +754,10 @@ std::int64_t StressFiberIO() {
         .count();
 }
 
+/**
+ * @brief 执行传统线程 IO 多路等待基准场景。
+ * @return 场景耗时的毫秒值。
+ */
 std::int64_t StressThreadIO() {
     constexpr int kReaders = 4096;
     constexpr int kRounds = 25;
@@ -789,6 +849,12 @@ std::int64_t StressThreadIO() {
 
 }  // namespace
 
+/**
+ * @brief 高负载压力测试入口，可按命令行选择场景或全部运行。
+ * @param argc 命令行参数数量。
+ * @param argv 命令行参数数组。
+ * @return 所有场景通过返回 0，否则返回非零值。
+ */
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--compute-only") == 0) {
         const auto fiber_ms = StressFiberCompute();

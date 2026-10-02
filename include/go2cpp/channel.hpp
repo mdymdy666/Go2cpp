@@ -26,6 +26,11 @@
 
 namespace go2cpp {
 
+/**
+ * @brief Channel/Select 操作结果状态。
+ * @details kReady 表示成功，kClosed 表示已关闭读取，其他状态描述取消、
+ *          超时、空通道和参数错误。
+ */
 enum class ChannelStatus {
   kReady = 0,
   kWouldBlock,
@@ -38,14 +43,20 @@ enum class ChannelStatus {
   kInvalid,
 };
 
+/** @brief 判断状态是否代表一次可交付的结果。 */
 inline bool ChannelStatusIsReady(ChannelStatus status) noexcept {
   return status == ChannelStatus::kReady || status == ChannelStatus::kClosed;
 }
 
+/** @brief 创建通道已关闭错误。 */
 ErrorPtr ChannelClosedError() noexcept;
+/** @brief 创建重复关闭错误。 */
 ErrorPtr ChannelAlreadyClosedError() noexcept;
+/** @brief 创建非阻塞操作暂不可用错误。 */
 ErrorPtr ChannelWouldBlockError() noexcept;
+/** @brief 创建 nil channel 错误。 */
 ErrorPtr ChannelNilError() noexcept;
+/** @brief 创建通道超时错误。 */
 ErrorPtr ChannelTimeoutError() noexcept;
 
 // SelectValue 是 select 结果使用的共享类型擦除载体。它不要求实际值可复制，
@@ -332,6 +343,7 @@ std::shared_ptr<const SelectCaster> SelectCaster::Create(Function&& function) {
       std::forward<Function>(function));
 }
 
+/** @brief Channel 发送操作的状态和错误结果。 */
 struct ChannelSendResult {
   ChannelStatus status{ChannelStatus::kInvalid};
   ErrorPtr error;
@@ -350,6 +362,7 @@ struct ChannelSendResult {
   explicit operator bool() const noexcept { return Ok(); }
 };
 
+/** @brief Select case 试探结果，包含可选类型擦除值。 */
 struct SelectProbe {
   bool ready{false};
   bool ok{false};
@@ -542,6 +555,7 @@ class SelectWaitState final {
 
 }  // namespace detail
 
+/** @brief Channel 接收操作的值、成功标记和状态。 */
 template <typename T>
 struct ChannelRecvResult {
   std::optional<T> value;
@@ -577,6 +591,11 @@ struct ChannelRecvResult {
  * 长于仍在使用它的等待者。T 必须可无异常移动构造和析构，内建 select 对
  * T 还要求可复制；不可复制值可通过 SelectValue 自定义路径承载。
  */
+/**
+ * @brief 支持 Fiber 与线程并发的 FIFO Channel。
+ * @details capacity=0 时为无缓冲 rendezvous，正值时使用有界 FIFO 缓冲；
+ *          关闭会唤醒所有发送者和接收者，Select 通过内部等待节点接入。
+ */
 template <typename T>
 class Channel final : public std::enable_shared_from_this<Channel<T>> {
   static_assert(std::is_nothrow_move_constructible<T>::value,
@@ -590,6 +609,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
   using TimePoint = ContextTimePoint;
 
   // 创建容量为 capacity 的通道；capacity==0 表示无缓冲。
+  /** @brief 创建指定容量的 Channel。@param capacity 0 表示无缓冲。 */
   static Ptr Create(std::size_t capacity = 0) {
     return std::make_shared<Channel<T>>(capacity);
   }
@@ -601,13 +621,16 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
   Channel& operator=(const Channel&) = delete;
 
   // 返回固定容量（不含当前缓冲长度）。
+  /** @brief 返回 Channel 容量。 */
   std::size_t Capacity() const noexcept { return m_capacity; }
   // 返回当前缓冲区长度；不包含正在交接的等待者。
+  /** @brief 返回当前缓冲区内元素数量。 */
   std::size_t Len() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_buffer.size();
   }
   // 查询通道是否已关闭。
+  /** @brief 返回 Channel 是否已关闭。 */
   bool IsClosed() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_closed;

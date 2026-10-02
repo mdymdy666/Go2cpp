@@ -30,6 +30,10 @@ namespace {
 
 using namespace std::chrono_literals;
 
+/**
+ * @brief 构造 Hook 测试使用的单 Worker 配置。
+ * @return 适合测试 IO 阻塞转让的 SchedulerConfig 值。
+ */
 go2cpp::SchedulerConfig one_worker_config() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 1;
@@ -58,10 +62,20 @@ bool wait_until_predicate(Predicate predicate,
     return predicate();
 }
 
+/**
+ * @brief 创建一对供 Hook 测试使用的本地 socket。
+ * @param fds 输出的两个文件描述符，成功时均为非负值。
+ * @return 创建成功返回 true。
+ */
 bool make_pair(int (&fds)[2]) {
     return ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0;
 }
 
+/**
+ * @brief 关闭并清空 Hook 测试使用的 socket 对。
+ * @param fds 待关闭的两个文件描述符。
+ * @return 无。
+ */
 void close_pair(int (&fds)[2]) {
     if (fds[0] >= 0) {
         (void)::close(fds[0]);
@@ -765,6 +779,10 @@ void test_deep_nested_fiber_io_chain() {
     manager.Shutdown();
 }
 
+/**
+ * @brief 运行 socket Hook、超时、dup 和阻塞转移测试。
+ * @return 无；测试失败由统一断言统计。
+ */
 void run_hook_tests() {
     go2cpp_tests::announce("transparent Linux socket hook interposer");
     go2cpp::hook::ScopedEnable enable;

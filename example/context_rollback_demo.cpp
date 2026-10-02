@@ -3,6 +3,12 @@
 #include <chrono>
 #include <iostream>
 
+/**
+ * @brief 演示 ContextRollback 的作用域回滚、保存点和提交语义。
+ * @details 未提交的撤销动作会在作用域结束时执行；提交后的 Context 仍可
+ *          继续接收父 Context 的取消通知，但已提交资源不会重复回滚。
+ * @return 所有回滚断言通过时返回 0，否则返回 1。
+ */
 int main() {
     using namespace go2cpp;
     using namespace std::chrono_literals;

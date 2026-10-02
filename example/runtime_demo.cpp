@@ -6,6 +6,12 @@
 #include <chrono>
 #include <iostream>
 
+/**
+ * @brief 演示 Runtime、Context、Channel、Timer 和 Select 的组合用法。
+ * @details 该示例按运行时初始化、任务提交、超时取消、Channel 关闭和资源
+ *          回收的顺序组织，可作为完整程序的最小模板。
+ * @return 所有运行时操作完成时返回 0。
+ */
 int main() {
     using namespace std::chrono_literals;
     using namespace go2cpp;

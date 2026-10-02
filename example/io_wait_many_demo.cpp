@@ -8,6 +8,12 @@
 #include <iostream>
 #include <vector>
 
+/**
+ * @brief 演示 IOManager 同时等待多个 FD，并区分就绪和超时结果。
+ * @details 两个 socket 在同一次 WaitManyFor 中注册，消费数据后再用
+ *          WaitAnyFor 验证没有事件时按超时返回，而不是忙等。
+ * @return 两个 FD 均就绪且第二次等待超时时返回 0。
+ */
 int main() {
     using namespace std::chrono_literals;
 

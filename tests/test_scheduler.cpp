@@ -11,6 +11,10 @@
 #include <thread>
 #include <vector>
 
+/**
+ * @brief 验证调度器任务生命周期、取消、阻塞区和关闭流程。
+ * @return 无；测试失败由统一断言统计。
+ */
 void run_scheduler_tests() {
     go2cpp_tests::announce("GMP scheduler state and shutdown");
     using namespace go2cpp;

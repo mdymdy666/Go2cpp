@@ -18,13 +18,19 @@ namespace go2cpp {
  */
 class Error {
  public:
+  /** @brief 虚析构，允许通过 ErrorPtr 安全释放。 */
   virtual ~Error() = default;
+  /** @brief 返回面向用户的错误文本。 */
   virtual std::string Message() const = 0;
   // 接近 Go 的拼写，便于调用方使用 Error() 风格接口。
+  /** @brief Go 风格 Error() 文本别名。 */
   virtual std::string ErrorString() const { return Message(); }
+  /** @brief 返回直接包装的原因；无原因时返回空指针。 */
   virtual std::shared_ptr<const Error> Unwrap() const { return {}; }
+  /** @brief 返回全部直接原因，JoinError 可包含多个。 */
   virtual std::vector<std::shared_ptr<const Error>> UnwrapAll() const;
   // 自定义错误可以重写此函数，实现 Go 的 Is 判断。
+  /** @brief 判断当前错误是否匹配目标错误。 */
   virtual bool Is(const Error& target) const noexcept {
     return this == &target;
   }
@@ -35,7 +41,9 @@ using ErrorPtr = std::shared_ptr<const Error>;
 /** 只保存一条不可变文本的叶子错误。依赖 Error 接口，适合直接返回给上层。 */
 class StringError final : public Error {
  public:
+  /** @brief 创建不可变文本错误。 */
   explicit StringError(std::string message) : m_message(std::move(message)) {}
+  /** @brief 返回保存的错误文本。 */
   std::string Message() const override { return m_message; }
 
  private:
@@ -45,11 +53,14 @@ class StringError final : public Error {
 /** 带单一 cause 的包装错误；Message 返回当前说明，Unwrap 返回原始原因。 */
 class WrappedError final : public Error {
  public:
+  /** @brief 创建带原因的包装错误。@param message 当前层描述。@param cause 原因错误。 */
   WrappedError(std::string message, ErrorPtr cause)
       : m_message(std::move(message)), m_cause(std::move(cause)) {}
   ~WrappedError() override;
 
+  /** @brief 返回包装层描述。 */
   std::string Message() const override;
+  /** @brief 返回被包装的直接原因。 */
   ErrorPtr Unwrap() const override { return m_cause; }
 
  private:
@@ -60,29 +71,40 @@ class WrappedError final : public Error {
 /** 聚合多个原因的错误；UnwrapAll 返回全部非空原因，供 Is/As 遍历。 */
 class JoinError final : public Error {
  public:
+  /** @brief 创建包含多个原因的聚合错误。 */
   explicit JoinError(std::vector<ErrorPtr> causes);
   ~JoinError() override;
 
+  /** @brief 返回聚合错误文本。 */
   std::string Message() const override;
+  /** @brief 返回全部被聚合原因。 */
   std::vector<ErrorPtr> UnwrapAll() const override { return m_causes; }
 
  private:
   std::vector<ErrorPtr> m_causes;
 };
 
+/** @brief 创建文本错误。 */
 ErrorPtr NewError(std::string message);
+/** @brief 在 cause 外包装一层描述。 */
 ErrorPtr Wrap(ErrorPtr cause, std::string message);
+/** @brief 聚合多个原因错误。 */
 ErrorPtr Join(std::vector<ErrorPtr> causes);
+/** @brief 以初始化列表聚合多个原因。 */
 ErrorPtr Join(std::initializer_list<ErrorPtr> causes);
 
+/** @brief 返回错误的直接原因。 */
 ErrorPtr Unwrap(const ErrorPtr& error) noexcept;
+/** @brief 返回错误链中的全部原因。 */
 std::vector<ErrorPtr> UnwrapAll(const ErrorPtr& error);
+/** @brief 返回空安全的错误文本。 */
 std::string ErrorMessage(const ErrorPtr& error);
 
 /**
  * 遍历单原因或多原因错误链。允许并忽略环；空 target 只匹配空错误，
  * 与 errors.Is(err, nil) 相同。
  */
+/** @brief 按错误链判断 error 是否匹配 target。 */
 bool Is(const ErrorPtr& error, const ErrorPtr& target) noexcept;
 
 namespace detail {

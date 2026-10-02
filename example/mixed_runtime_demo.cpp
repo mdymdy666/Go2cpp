@@ -16,6 +16,13 @@
 
 namespace {
 
+/**
+ * @brief 为示例中的普通线程加入带超时的 join 看门狗。
+ * @param thread 待等待的线程对象。
+ * @param timeout 允许线程完成的最长时长。
+ * @param label 超时日志中使用的线程说明。
+ * @return 无；超时时终止示例进程，避免测试永久挂起。
+ */
 template <typename Rep, typename Period>
 void join_with_watchdog(std::thread& thread,
                         std::chrono::duration<Rep, Period> timeout,
@@ -49,6 +56,12 @@ void join_with_watchdog(std::thread& thread,
 
 }  // 匿名命名空间
 
+/**
+ * @brief 演示普通线程、参与 GMP 的外部线程和 managed Fiber 混合运行。
+ * @details 示例覆盖混合 Mutex、ConditionVariable、WaitGroup、FiberLocal、
+ *          Hook 开关以及 BlockingRegion，并为每个跨线程等待设置看门狗。
+ * @return 所有混合并发断言通过时返回 0。
+ */
 int main() {
     using namespace std::chrono_literals;
 

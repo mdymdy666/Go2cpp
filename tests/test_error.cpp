@@ -18,6 +18,10 @@ private:
 
 }  // namespace
 
+/**
+ * @brief 验证错误对象、包装链、Is/As 判断和并发访问。
+ * @return 无；测试失败由统一断言统计。
+ */
 void run_error_tests() {
     go2cpp_tests::announce("error values and chains");
     using namespace go2cpp;

@@ -6,6 +6,12 @@
 #include <chrono>
 #include <iostream>
 
+/**
+ * @brief 演示 Fiber 与调度器内的 Mutex、ConditionVariable、WaitGroup 协作。
+ * @details 前半段使用一个 P 驱动多个 Fiber 完成生产者/消费者同步，后半段
+ *          手动恢复 Fiber，说明 Fiber 也可以独立使用 Suspend/Resume。
+ * @return 同步计数和 Fiber 恢复结果符合预期时返回 0。
+ */
 int main() {
     using namespace std::chrono_literals;
     go2cpp::Scheduler scheduler(1);

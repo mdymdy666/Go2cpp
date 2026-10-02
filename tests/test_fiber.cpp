@@ -27,6 +27,10 @@ struct LifetimeProbe {
 
 }  // namespace
 
+/**
+ * @brief 验证 Fiber 的挂起恢复、迁移、嵌套栈、取消和本地缓存。
+ * @return 无；测试失败由统一断言统计。
+ */
 void run_fiber_tests() {
     go2cpp_tests::announce("stackful fiber and execution context migration");
     using go2cpp::Fiber;

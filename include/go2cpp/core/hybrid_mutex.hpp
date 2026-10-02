@@ -15,12 +15,23 @@
 
 namespace go2cpp::core::detail {
 
+/**
+ * @brief 面向短临界区的原子自旋与互斥锁混合门。
+ * @details 先在原子标志上短暂自旋，竞争持续时进入 std::mutex 慢路径，
+ *          避免 Fiber 热路径频繁进入内核等待；持锁期间不得执行阻塞 I/O。
+ * @note 依赖 C++ 原子操作和 std::mutex；向上层提供 BasicLockable 接口。
+ */
 class HybridGate final {
 public:
+    /** @brief 创建未加锁的混合门。 */
     HybridGate() noexcept = default;
     HybridGate(const HybridGate&) = delete;
     HybridGate& operator=(const HybridGate&) = delete;
 
+    /**
+     * @brief 获取门锁，竞争时先自旋再阻塞等待。
+     * @note 调用方必须保证成对调用 unlock()，不能递归加锁。
+     */
     void lock() noexcept {
         for (std::size_t attempt = 0; attempt < kFastAttempts; ++attempt) {
             if (!m_fast.test_and_set(std::memory_order_acquire)) {
@@ -41,6 +52,7 @@ public:
         }
     }
 
+    /** @brief 释放门锁并唤醒慢路径竞争者。 */
     void unlock() noexcept { m_fast.clear(std::memory_order_release); }
 
 private:

@@ -8,6 +8,10 @@
 #include <thread>
 #include <vector>
 
+/**
+ * @brief 验证 Context 的父子取消、截止时间、Value 和局部回滚。
+ * @return 无；失败项由测试支持代码累计，不通过时由调用方报告。
+ */
 void run_context_tests() {
     go2cpp_tests::announce("context cancellation, values and deadlines");
     using namespace go2cpp;

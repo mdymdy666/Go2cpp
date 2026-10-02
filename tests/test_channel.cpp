@@ -43,6 +43,10 @@ static_assert(std::is_nothrow_destructible<go2cpp::Channel<int>>::value);
 
 }  // namespace
 
+/**
+ * @brief 验证无缓冲/有缓冲 Channel、关闭、取消和 select 行为。
+ * @return 无；所有结果通过 GO2CPP_CHECK 记录。
+ */
 void run_channel_tests() {
     go2cpp_tests::announce("channels, close, select and cancellation");
     using namespace go2cpp;

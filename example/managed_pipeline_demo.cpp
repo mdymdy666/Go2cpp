@@ -6,6 +6,12 @@
 #include <chrono>
 #include <iostream>
 
+/**
+ * @brief 演示带超时 Context 的无缓冲 Channel 生产者/消费者管线。
+ * @details 消费者在 Context 允许期间读取并累加数据，生产者发送完毕后关闭
+ *          Channel；任一端失败都会通过结果状态报告给主线程。
+ * @return 管线完成且总和为 6 时返回 0。
+ */
 int main() {
     using namespace std::chrono_literals;
     go2cpp::Scheduler scheduler(1);

@@ -28,9 +28,12 @@ public:
     ParkingCondition(const ParkingCondition&) = delete;
     ParkingCondition& operator=(const ParkingCondition&) = delete;
 
+    /** @brief 唤醒一个等待者。 */
     void notify_one() noexcept;
+    /** @brief 唤醒全部等待者。 */
     void notify_all() noexcept;
 
+    /** @brief 持锁等待直到 predicate 成功或 Fiber 被取消。 */
     template <typename Predicate>
     bool wait(std::unique_lock<std::mutex>& lock, Predicate predicate) {
         while (!predicate()) {
@@ -42,6 +45,7 @@ public:
         return true;
     }
 
+    /** @brief 带相对超时的条件等待。 */
     template <typename Rep, typename Period, typename Predicate>
     bool wait_for(std::unique_lock<std::mutex>& lock,
                   std::chrono::duration<Rep, Period> timeout,
@@ -57,6 +61,7 @@ public:
         return wait_until(lock, deadline, std::move(predicate));
     }
 
+    /** @brief 等待到绝对截止时间或 predicate 成功。 */
     template <typename Predicate>
     bool wait_until(std::unique_lock<std::mutex>& lock,
                     Clock::time_point deadline, Predicate predicate) {
@@ -69,11 +74,13 @@ public:
         return true;
     }
 
+    /** @brief 返回当前 Fiber 是否收到取消请求。 */
     static bool CancellationRequested() noexcept;
 
     // 手动 Fiber（没有 Scheduler/Task 绑定）无法把等待交还给 carrier
     // 线程，因此禁止退回原生 condition_variable 造成整条线程阻塞。
     // 调用方应先绑定 Scheduler，或使用非阻塞接口处理该情况。
+    /** @brief 返回当前 Fiber 是否缺少可用 Scheduler 等待后端。 */
     static bool FiberWaitUnsupported() noexcept;
 
 private:

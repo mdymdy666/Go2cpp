@@ -3,6 +3,12 @@
 #include <chrono>
 #include <iostream>
 
+/**
+ * @brief 演示新手友好的 go、Channel 和 SelectLoop 基本用法。
+ * @details 先创建并启动 Scheduler，再用 go(scheduler, callback) 提交 Fiber；
+ *          同一个示例还展示默认调度器和无缓冲 Channel 的收发流程。
+ * @return 所有 Fiber 正常完成时返回 0。
+ */
 int main() {
     using namespace go2cpp;
     using namespace std::chrono_literals;

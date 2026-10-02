@@ -1,5 +1,12 @@
 #pragma once
 
+/**
+ * @file runtime.hpp
+ * @brief Go2Cpp 对外聚合头文件。
+ * @details 一次包含全部公开运行时模块；大型工程也可以按模块头文件分别
+ *          包含，以减少编译依赖。
+ */
+
 // 面向转译程序的便捷总头文件。需要更小依赖面时仍可单独包含各模块头文件。
 #include "go2cpp/channel.hpp"
 #include "go2cpp/config.hpp"

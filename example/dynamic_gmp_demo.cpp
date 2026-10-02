@@ -6,6 +6,12 @@
 #include <thread>
 #include <vector>
 
+/**
+ * @brief 演示 G/M/P 调度器在负载变化时扩展和回收 Worker。
+ * @details 任务被分配到两个任务类别，示例记录初始、峰值和空闲 Worker 数量，
+ *          同时观察同类任务在保留 Worker 上的亲和命中次数。
+ * @return 任务全部完成且 Worker 回收到最小值时返回 0。
+ */
 int main() {
     using namespace std::chrono_literals;
     go2cpp::SchedulerConfig config;

@@ -37,6 +37,11 @@ bool wait_until(const std::atomic<bool>& flag,
     return flag.load(std::memory_order_acquire);
 }
 
+/**
+ * @brief 创建一对供 IOManager 测试使用的本地 socket。
+ * @param fds 输出的两个文件描述符，成功时均为非负值。
+ * @return 创建成功返回 true。
+ */
 bool make_pair(int (&fds)[2]) {
     return ::socketpair(AF_UNIX,
                         SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
@@ -59,12 +64,23 @@ bool wait_for_task_state(const std::shared_ptr<go2cpp::Task>& task,
     return task && task->state() == expected;
 }
 
+/**
+ * @brief 关闭一个测试文件描述符并忽略已关闭错误。
+ * @param fd 待关闭的文件描述符。
+ * @return 无。
+ */
 void raw_close(int fd) {
     if (fd >= 0) {
         (void)::syscall(SYS_close, fd);
     }
 }
 
+/**
+ * @brief 通过 IOManager 注销并关闭一对测试 socket。
+ * @param manager 负责注销 FD 事件的 IOManager。
+ * @param fds 待关闭的两个文件描述符。
+ * @return 无。
+ */
 void close_pair(IOManager& manager, int (&fds)[2]) {
     go2cpp::io::DescriptorGuard guard;
     (void)manager.NotifyClose(fds[0]);
@@ -75,6 +91,10 @@ void close_pair(IOManager& manager, int (&fds)[2]) {
     fds[1] = -1;
 }
 
+/**
+ * @brief 构造 IO 等待测试使用的单 Worker 配置。
+ * @return 适合测试 Fiber 级等待的 SchedulerConfig 值。
+ */
 go2cpp::SchedulerConfig one_worker_config() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 1;
@@ -82,6 +102,10 @@ go2cpp::SchedulerConfig one_worker_config() {
     return config;
 }
 
+/**
+ * @brief 验证单 P 下的就绪、超时、取消和关闭结果。
+ * @return 无；测试失败由统一断言统计。
+ */
 void test_single_p_and_wait_results() {
     IOManager manager(one_worker_config());
     GO2CPP_CHECK(manager.Start());
@@ -219,6 +243,10 @@ void test_single_p_and_wait_results() {
     manager.Shutdown();
 }
 
+/**
+ * @brief 验证 IOManager 关闭时能唤醒无限等待的 Fiber。
+ * @return 无；测试失败由统一断言统计。
+ */
 void test_shutdown_wakes_infinite_wait() {
     IOManager manager(one_worker_config());
     GO2CPP_CHECK(manager.Start());
@@ -243,6 +271,10 @@ void test_shutdown_wakes_infinite_wait() {
     raw_close(fds[1]);
 }
 
+/**
+ * @brief 验证嵌套 Fiber 的 IO 超时和唤醒状态能向父级传播。
+ * @return 无；测试失败由统一断言统计。
+ */
 void test_nested_fiber_io_propagation() {
     IOManager manager(one_worker_config());
     GO2CPP_CHECK(manager.Start());
@@ -283,6 +315,10 @@ void test_nested_fiber_io_propagation() {
     manager.Shutdown();
 }
 
+/**
+ * @brief 验证 FD 就绪与超时同时发生时不会丢失或重复唤醒。
+ * @return 无；测试失败由统一断言统计。
+ */
 void test_readiness_timeout_race() {
     go2cpp::SchedulerConfig config;
     config.processor_count = 4;
@@ -370,6 +406,10 @@ void test_readiness_timeout_race() {
     manager.Shutdown();
 }
 
+/**
+ * @brief 验证顺序等待、伪唤醒和代际标记处理。
+ * @return 无；测试失败由统一断言统计。
+ */
 void test_sequential_and_spurious_waits() {
     IOManager manager(one_worker_config());
     GO2CPP_CHECK(manager.Start());
@@ -396,6 +436,10 @@ void test_sequential_and_spurious_waits() {
     manager.Shutdown();
 }
 
+/**
+ * @brief 验证 FD 代际复用及跨 IOManager 关闭时的隔离。
+ * @return 无；测试失败由统一断言统计。
+ */
 void test_generation_reuse_and_cross_manager_close() {
     IOManager first(one_worker_config());
     IOManager second(one_worker_config());
@@ -457,6 +501,10 @@ void test_generation_reuse_and_cross_manager_close() {
     second.Shutdown();
 }
 
+/**
+ * @brief 验证 WaitAnyFor 与 WaitManyFor 的多 FD 结果收集。
+ * @return 无；测试失败由统一断言统计。
+ */
 void test_wait_any_and_wait_many() {
     IOManager manager(one_worker_config());
     GO2CPP_CHECK(manager.Start());
@@ -540,6 +588,10 @@ void test_wait_any_and_wait_many() {
     manager.Shutdown();
 }
 
+/**
+ * @brief 验证多路等待对 Context 取消和 FD 关闭的响应。
+ * @return 无；测试失败由统一断言统计。
+ */
 void test_wait_any_cancellation_and_close() {
     IOManager manager(one_worker_config());
     GO2CPP_CHECK(manager.Start());
@@ -603,6 +655,10 @@ void test_wait_any_cancellation_and_close() {
 
 }  // namespace
 
+/**
+ * @brief 运行 IOManager、WaitAny/WaitMany 和关闭竞态测试。
+ * @return 无；测试失败由统一断言统计。
+ */
 void run_io_tests() {
     go2cpp_tests::announce("Linux epoll IO manager and cancellation races");
     test_single_p_and_wait_results();

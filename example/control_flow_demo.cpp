@@ -2,6 +2,12 @@
 
 #include <iostream>
 
+/**
+ * @brief 演示 defer、panic 和 recover 的状态式兼容接口。
+ * @details defer 在作用域离开时读取 panic 状态并调用 recover；本项目用显式
+ *          状态传递实现控制流，不依赖 C++ 异常或 longjmp。
+ * @return panic 已被 recover 时返回 0，否则返回 1。
+ */
 int main() {
     go2cpp::panic failure;
     go2cpp::recover recovery(failure);

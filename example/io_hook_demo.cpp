@@ -8,6 +8,12 @@
 #include <chrono>
 #include <iostream>
 
+/**
+ * @brief 演示 Hook 后的 socket 接收、发送和 SO_RCVTIMEO 超时行为。
+ * @details 读 Fiber 在没有数据时交还执行权，写 Fiber 发送数据后唤醒读者；
+ *          第二次读取验证系统级超时仍会转换为 ETIMEDOUT。
+ * @return 数据接收和超时检查均通过时返回 0。
+ */
 int main() {
     using namespace std::chrono_literals;
     int sockets[2];

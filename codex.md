@@ -808,3 +808,15 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
   允许热更新的配置键必须独立解析、独立校验、独立生效，不能依赖同一文件中其他键
   的非原子中间值。`min_workers`/`max_workers` 等相互约束的结构参数被限定为启动期
   成组配置，必须通过完整快照一次替换并重新创建 Scheduler，禁止分别热更新。
+
+## 2026-10-02：统一中文 Doxygen 注释规范
+
+- 按 Sylar 风格补充 public header：类/结构体职责、依赖、线程安全和生命周期，
+  公开函数的参数、返回值和失败边界，以及枚举和配置字段的含义；涉及文件包括
+  Context、Channel、Fiber、Future、IO、Scheduler、同步原语、日志、Hook、配置和
+  运行时入口。
+- 为 `src/*.cpp` 的实现函数补充中文 `///` 执行流程注释，覆盖参数校验、锁/状态机、
+  唤醒和资源释放等关键步骤；example 与 tests 的顶层入口也补充用途、流程和返回值。
+  注释修改不改变逻辑，已清理误插入函数体语句前的模板注释。
+- 验证：`git diff --check` 通过；Release CTest 14/14、Werror CTest 3/3 全部通过，
+  全部目标成功编译。

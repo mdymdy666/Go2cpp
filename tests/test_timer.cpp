@@ -7,6 +7,10 @@
 #include <chrono>
 #include <thread>
 
+/**
+ * @brief 验证定时器唤醒 Fiber、版本变化等待和取消。
+ * @return 无；测试失败由统一断言统计。
+ */
 void run_timer_tests() {
     go2cpp_tests::announce("定时器与 Fiber 等待");
     using namespace go2cpp;
