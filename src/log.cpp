@@ -14,94 +14,228 @@ namespace {
 
 std::string FormatTime(std::uint64_t timestamp_ms);
 
-/// 函数功能：完成 FormatPattern 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] pattern 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] record 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
-std::string FormatPattern(std::string pattern, const LogRecord& record) {
-    // 一次线性扫描同时支持 {message} 风格和 Sylar 的 %d/%p/%m 风格，
-    // 避免旧实现为每个字段建立 unordered_map 并反复 find/replace。
-    const auto append_token = [&record](std::string_view token, std::string& output) {
-        if (token == "time") output += FormatTime(record.timestamp_ms);
-        else if (token == "level") output += ToString(record.level);
-        else if (token == "logger") output += record.logger;
-        else if (token == "thread") output += std::to_string(record.thread_id);
-        else if (token == "fiber") output += std::to_string(record.fiber_id);
-        else if (token == "elapse") output += std::to_string(record.elapse_ms);
-        else if (token == "thread_name") output += record.thread_name;
-        else if (token == "file") output += record.file;
-        else if (token == "line") output += std::to_string(record.line);
-        else if (token == "function") output += record.function;
-        else if (token == "message") output += record.message;
-        else return false;
-        return true;
+/** @brief 将一个格式项对象追加到流中。 */
+class TextItem final : public LogFormatter::Item {
+public:
+    explicit TextItem(std::string text) : m_text(std::move(text)) {}
+
+    void Format(std::ostream& stream, const LogRecord&) const override {
+        stream << m_text;
+    }
+
+private:
+    std::string m_text;
+};
+
+/** @brief 输出日志记录中一个简单字符串或数字字段的格式项。 */
+class FieldItem final : public LogFormatter::Item {
+public:
+    enum class Field : std::uint8_t {
+        Level,
+        Logger,
+        Message,
+        Thread,
+        Fiber,
+        Elapse,
+        ThreadName,
+        File,
+        Line,
+        Function,
     };
-    std::string output;
-    output.reserve(pattern.size() + record.message.size());
-    for (std::size_t i = 0; i < pattern.size(); ++i) {
-        if (pattern[i] == '{') {
-            const auto end = pattern.find('}', i + 1);
-            if (end != std::string::npos && append_token(
-                    std::string_view(pattern).substr(i + 1, end - i - 1), output)) {
-                i = end;
+
+    explicit FieldItem(Field field) : m_field(field) {}
+
+    void Format(std::ostream& stream, const LogRecord& record) const override {
+        switch (m_field) {
+            case Field::Level: stream << ToString(record.level); break;
+            case Field::Logger: stream << record.logger; break;
+            case Field::Message: stream << record.message; break;
+            case Field::Thread: stream << record.thread_id; break;
+            case Field::Fiber: stream << record.fiber_id; break;
+            case Field::Elapse: stream << record.elapse_ms; break;
+            case Field::ThreadName: stream << record.thread_name; break;
+            case Field::File: stream << record.file; break;
+            case Field::Line: stream << record.line; break;
+            case Field::Function: stream << record.function; break;
+        }
+    }
+
+private:
+    Field m_field;
+};
+
+/** @brief 按 strftime 规则输出日志时间的格式项。 */
+class DateItem final : public LogFormatter::Item {
+public:
+    explicit DateItem(std::string format) : m_format(std::move(format)) {}
+
+    void Format(std::ostream& stream, const LogRecord& record) const override {
+        const auto seconds = static_cast<std::time_t>(record.timestamp_ms / 1000);
+        std::tm local_time{};
+#if defined(_WIN32)
+        localtime_s(&local_time, &seconds);
+#else
+        localtime_r(&seconds, &local_time);
+#endif
+        char buffer[128]{};
+        if (std::strftime(buffer, sizeof(buffer), m_format.c_str(), &local_time) != 0) {
+            stream << buffer;
+        }
+    }
+
+private:
+    std::string m_format;
+};
+
+/** @brief 输出带毫秒部分的默认时间格式项，对应 `{time}`。 */
+class TimeItem final : public LogFormatter::Item {
+public:
+    void Format(std::ostream& stream, const LogRecord& record) const override {
+        stream << FormatTime(record.timestamp_ms);
+    }
+};
+
+std::unordered_map<std::string, LogFormatter::ItemFactory>& FormatRegistry() {
+    static std::unordered_map<std::string, LogFormatter::ItemFactory> registry;
+    return registry;
+}
+
+std::mutex& FormatRegistryMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::once_flag& BuiltinFormatFlag() {
+    static std::once_flag flag;
+    return flag;
+}
+
+void EnsureBuiltinFormats() {
+    std::call_once(BuiltinFormatFlag(), [] {
+        // 内置项的工厂只保存不可变的字段枚举，构造后格式化无需查表。
+        const auto add = [](const char* key, FieldItem::Field field) {
+            std::lock_guard<std::mutex> lock(FormatRegistryMutex());
+            FormatRegistry().emplace(key, [field](const std::string&) {
+                return std::make_shared<FieldItem>(field);
+            });
+        };
+        add("m", FieldItem::Field::Message);
+        add("p", FieldItem::Field::Level);
+        add("N", FieldItem::Field::Logger);
+        add("e", FieldItem::Field::Elapse);
+        add("E", FieldItem::Field::Elapse);
+        add("f", FieldItem::Field::File);
+        add("l", FieldItem::Field::Line);
+        add("t", FieldItem::Field::Thread);
+        add("F", FieldItem::Field::Fiber);
+        add("c", FieldItem::Field::ThreadName);
+        add("logger", FieldItem::Field::Logger);
+        add("level", FieldItem::Field::Level);
+        add("message", FieldItem::Field::Message);
+        add("thread", FieldItem::Field::Thread);
+        add("fiber", FieldItem::Field::Fiber);
+        add("elapse", FieldItem::Field::Elapse);
+        add("thread_name", FieldItem::Field::ThreadName);
+        add("file", FieldItem::Field::File);
+        add("line", FieldItem::Field::Line);
+        add("function", FieldItem::Field::Function);
+        {
+            std::lock_guard<std::mutex> lock(FormatRegistryMutex());
+            FormatRegistry().emplace("d", [](const std::string& option) {
+                return std::make_shared<DateItem>(
+                    option.empty() ? "%Y-%m-%d %H:%M:%S" : option);
+            });
+            FormatRegistry().emplace("%", [](const std::string&) {
+                return std::make_shared<TextItem>("%");
+            });
+            FormatRegistry().emplace("T", [](const std::string&) {
+                return std::make_shared<TextItem>("\t");
+            });
+            FormatRegistry().emplace("n", [](const std::string&) {
+                return std::make_shared<TextItem>("\n");
+            });
+            FormatRegistry().emplace("__time", [](const std::string&) {
+                return std::make_shared<TimeItem>();
+            });
+        }
+    });
+}
+
+LogFormatter::Item::ptr FindFormatItem(const std::string& key, const std::string& option) {
+    LogFormatter::ItemFactory factory;
+    {
+        std::lock_guard<std::mutex> lock(FormatRegistryMutex());
+        const auto it = FormatRegistry().find(key);
+        if (it != FormatRegistry().end()) factory = it->second;
+    }
+    // 工厂属于用户代码，不能在注册表锁内执行，避免回调再次注册格式项时死锁。
+    return factory ? factory(option) : nullptr;
+}
+
+std::string ResolveBraceKey(std::string_view token) {
+    if (token == "time") return "__time";
+    return std::string(token);
+}
+
+std::vector<LogFormatter::Item::ptr> ParsePattern(const std::string& pattern, bool* error) {
+    EnsureBuiltinFormats();
+    std::vector<LogFormatter::Item::ptr> items;
+    std::string text;
+    const auto flush_text = [&] {
+        if (!text.empty()) {
+            items.push_back(std::make_shared<TextItem>(std::move(text)));
+            text.clear();
+        }
+    };
+    const auto append_item = [&](const std::string& key, const std::string& option,
+                                 const std::string& literal) {
+        auto item = FindFormatItem(key, option);
+        if (!item) {
+            text += literal;
+            if (error) *error = true;
+            return;
+        }
+        flush_text();
+        items.push_back(std::move(item));
+    };
+    for (std::size_t index = 0; index < pattern.size(); ++index) {
+        if (pattern[index] == '{') {
+            const auto end = pattern.find('}', index + 1);
+            if (end != std::string::npos) {
+                const auto token = pattern.substr(index + 1, end - index - 1);
+                const auto key = ResolveBraceKey(token);
+                append_item(key, {}, pattern.substr(index, end - index + 1));
+                index = end;
                 continue;
             }
         }
-        if (pattern[i] != '%') {
-            output.push_back(pattern[i]);
+        if (pattern[index] != '%') {
+            text.push_back(pattern[index]);
             continue;
         }
-        if (i + 1 >= pattern.size()) {
-            output.push_back('%');
+        if (index + 1 >= pattern.size()) {
+            text.push_back('%');
             continue;
         }
-        const char code = pattern[++i];
-        switch (code) {
-            case '%': output.push_back('%'); break;
-            case 'm': output += record.message; break;
-            case 'p': output += ToString(record.level); break;
-            case 'N': output += record.logger; break;
-            case 'f': output += record.file; break;
-            case 'l': output += std::to_string(record.line); break;
-            case 't': output += std::to_string(record.thread_id); break;
-            case 'F': output += std::to_string(record.fiber_id); break;
-            case 'T': output.push_back('\t'); break;
-            case 'n': output.push_back('\n'); break;
-            case 'E': output += std::to_string(record.elapse_ms); break;
-            case 'c': output += record.thread_name; break;
-            case 'd': {
-                // %d{...} 的完整 strftime 解析；没有格式时使用默认时间。
-                std::string format = "%Y-%m-%d %H:%M:%S";
-                if (i + 1 < pattern.size() && pattern[i + 1] == '{') {
-                    const auto end = pattern.find('}', i + 2);
-                    if (end != std::string::npos) {
-                        format = pattern.substr(i + 2, end - i - 2);
-                        i = end;
-                    }
-                }
-                const auto seconds = static_cast<std::time_t>(record.timestamp_ms / 1000);
-                std::tm tm{};
-#if defined(_WIN32)
-                localtime_s(&tm, &seconds);
-#else
-                localtime_r(&seconds, &tm);
-#endif
-                char buffer[128]{};
-                if (std::strftime(buffer, sizeof(buffer), format.c_str(), &tm) != 0) output += buffer;
-                break;
+        const auto token_start = index;
+        const char code = pattern[++index];
+        std::string key(1, code);
+        std::string option;
+        if (index + 1 < pattern.size() && pattern[index + 1] == '{') {
+            const auto end = pattern.find('}', index + 2);
+            if (end == std::string::npos) {
+                text.append(pattern, token_start, pattern.size() - token_start);
+                if (error) *error = true;
+                index = pattern.size();
+                continue;
             }
-            default:
-                output.push_back('%');
-                output.push_back(code);
-                break;
+            option = pattern.substr(index + 2, end - index - 2);
+            index = end;
         }
+        append_item(key, option, pattern.substr(token_start, index - token_start + 1));
     }
-    return output;
+    flush_text();
+    return items;
 }
 
 /// 函数功能：完成 FormatTime 调用，读取或更新相关运行时状态。
@@ -175,6 +309,62 @@ const char* ToString(Level level) noexcept {
     return "UNKNOWN";
 }
 
+/// 注册用户自定义日志格式项。
+/// 执行流程：
+/// 1. 校验 key 和工厂函数；
+/// 2. 获取格式项注册表锁；
+/// 3. 拒绝重复 key，成功后发布工厂；
+/// 4. 后续创建的 PatternFormatter 会把工厂实例化为 Item 链。
+/// @param key 格式项名称，可以是单字符或命名字符串。
+/// @param factory Item 工厂，参数为格式项附加选项。
+/// @return 注册成功返回 true，参数无效或名称冲突返回 false。
+bool LogFormatter::AddFormat(std::string key, ItemFactory factory) {
+    if (key.empty() || !factory) return false;
+    EnsureBuiltinFormats();
+    std::lock_guard<std::mutex> lock(FormatRegistryMutex());
+    return FormatRegistry().emplace(std::move(key), std::move(factory)).second;
+}
+
+/// 注册不带格式选项的日志格式项工厂。
+/// @param key 格式项名称。
+/// @param factory 无参数 Item 工厂。
+/// @return 注册成功返回 true，参数无效或名称冲突返回 false。
+bool LogFormatter::AddFormat(std::string key, std::function<Item::ptr()> factory) {
+    if (!factory) return false;
+    return AddFormat(std::move(key), [factory = std::move(factory)](const std::string&) {
+        return factory();
+    });
+}
+
+/// 删除日志格式项注册。
+/// @param key 要删除的格式项名称。
+/// @return 存在并删除返回 true，否则返回 false。
+bool LogFormatter::RemoveFormat(const std::string& key) {
+    EnsureBuiltinFormats();
+    std::lock_guard<std::mutex> lock(FormatRegistryMutex());
+    return FormatRegistry().erase(key) != 0;
+}
+
+/// 查询日志格式项是否已经注册。
+/// @param key 要查询的格式项名称。
+/// @return 已注册返回 true。
+bool LogFormatter::HasFormat(const std::string& key) {
+    EnsureBuiltinFormats();
+    std::lock_guard<std::mutex> lock(FormatRegistryMutex());
+    return FormatRegistry().find(key) != FormatRegistry().end();
+}
+
+/// 返回格式项注册表名称快照。
+/// @return 当前注册的名称列表；调用方可以安全地在锁外遍历。
+std::vector<std::string> LogFormatter::Formats() {
+    EnsureBuiltinFormats();
+    std::vector<std::string> result;
+    std::lock_guard<std::mutex> lock(FormatRegistryMutex());
+    result.reserve(FormatRegistry().size());
+    for (const auto& entry : FormatRegistry()) result.push_back(entry.first);
+    return result;
+}
+
 /// 函数功能：完成 ParseLevel 调用，读取或更新相关运行时状态。
 /// 执行流程：
 /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
@@ -225,7 +415,9 @@ bool MinimumLevelFilter::Accept(const LogRecord& record) const {
 /// @param[in] pattern 调用方传入的参数，具体约束以头文件声明为准。
 /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
 /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
-PatternFormatter::PatternFormatter(std::string pattern) : m_pattern(std::move(pattern)) {}
+PatternFormatter::PatternFormatter(std::string pattern) : m_pattern(std::move(pattern)) {
+    m_items = ParsePattern(m_pattern, &m_error);
+}
 
 /// 函数功能：完成 Format 调用，读取或更新相关运行时状态。
 /// 执行流程：
@@ -236,7 +428,11 @@ PatternFormatter::PatternFormatter(std::string pattern) : m_pattern(std::move(pa
 /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
 /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::string PatternFormatter::Format(const LogRecord& record) const {
-    return FormatPattern(m_pattern, record);
+    std::ostringstream stream;
+    for (const auto& item : m_items) {
+        if (item) item->Format(stream, record);
+    }
+    return stream.str();
 }
 
 /// 函数功能：完成 FileSink 调用，读取或更新相关运行时状态。

@@ -137,6 +137,28 @@ public:
     virtual std::string ToString() const = 0;
     virtual bool ValidateString(const std::string& value, std::string* error = nullptr) const = 0;
     virtual bool FromString(const std::string& value, std::string* error = nullptr) = 0;
+    /**
+     * @brief 在配置事务中应用文本值，但暂不调用监听器。
+     * @details Config::LoadFromIni 先对全部配置项做预检，再调用本接口完成
+     *          第一阶段提交；所有变量成功后由 NotifyPending 统一发布通知。
+     *          普通调用方应继续使用 FromString，不需要自行管理事务。
+     * @param value 待转换的文本值。
+     * @param error 失败时写入中文诊断，可为空。
+     * @return 转换、校验和写入均成功返回 true。
+     */
+    virtual bool ApplyString(const std::string& value, std::string* error = nullptr) = 0;
+    /** @brief 判断事务阶段是否产生了待发布变更。 */
+    virtual bool HasPending() const noexcept = 0;
+    /**
+     * @brief 发布本次事务中暂存的变更通知。
+     * @details 没有暂存变更时为空操作；调用顺序由 Config 事务管理器保证。
+     */
+    virtual void NotifyPending() noexcept = 0;
+    /**
+     * @brief 回滚本次事务中已经写入但尚未通知的值。
+     * @details 仅用于提交阶段发生异常或失败时恢复内存中的旧值。
+     */
+    virtual void RollbackPending() noexcept = 0;
 
 private:
     std::string m_name;
@@ -183,13 +205,26 @@ public:
         T old_value;
         std::map<std::uint64_t, Listener> listeners;
         { std::lock_guard<std::mutex> lock(m_mutex);
+          if (m_pending) {
+              if (error) *error = "配置变量正在等待上一事务通知: " + name();
+              return false;
+          }
           const auto current = std::atomic_load_explicit(&m_value, std::memory_order_acquire);
           if (current && *current == value) return true;
           old_value = current ? *current : T{};
           std::atomic_store_explicit(&m_value, std::make_shared<const T>(value),
                                      std::memory_order_release);
           listeners = m_listeners; }
-        for (const auto& [id, listener] : listeners) if (listener) listener(old_value, value);
+        for (const auto& [id, listener] : listeners) {
+            (void)id;
+            if (!listener) continue;
+            try {
+                listener(old_value, value);
+            } catch (...) {
+                // 用户监听器属于插件边界；单个监听器异常不应阻断其余
+                // 监听器，也不应把异常传播到配置调用方。
+            }
+        }
         return true;
     }
     // 安装强类型配置校验器。校验器不会在配置锁内执行，避免回调再次
@@ -230,12 +265,117 @@ public:
         return SetValue(parsed, error);
     }
 
+    /**
+     * @brief 在事务第一阶段写入值，不触发监听器。
+     * @param value 待转换的文本值。
+     * @param error 失败时写入中文诊断，可为空。
+     * @return 成功写入返回 true。
+     */
+    bool ApplyString(const std::string& value, std::string* error = nullptr) override {
+        T parsed{};
+        if (!ValueCodec<T>::Decode(value, &parsed)) {
+            if (error) *error = "配置值转换失败: " + name();
+            return false;
+        }
+        Validator validator;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            validator = m_validator;
+        }
+        if (validator && !validator(parsed, error)) return false;
+
+        // 先完成可能抛出 bad_alloc 的共享值构造，避免写入后才发现内存
+        // 分配失败而无法把本变量加入事务回滚列表。
+        auto next_value = std::make_shared<const T>(parsed);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_pending) {
+            if (error) *error = "配置变量正在等待上一事务通知: " + name();
+            return false;
+        }
+        const auto current = std::atomic_load_explicit(&m_value, std::memory_order_acquire);
+        if (current && *current == parsed) {
+            m_pending.reset();
+            return true;
+        }
+        PendingChange change;
+        change.old_value = current;
+        change.new_value = parsed;
+        m_pending = std::move(change);
+        std::atomic_store_explicit(&m_value, std::move(next_value),
+                                   std::memory_order_release);
+        return true;
+    }
+
+    /**
+     * @brief 发布事务阶段暂存的监听通知。
+     * @details 回调在释放内部互斥锁后执行，允许回调再次读取配置；同一变量
+     *          在一次事务中只发布最终值，避免中间值触发模块重配置。
+     */
+    void NotifyPending() noexcept override {
+        std::optional<PendingChange> change;
+        std::map<std::uint64_t, Listener> listeners;
+        try {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_pending) return;
+            listeners = m_listeners;
+            change = std::move(m_pending);
+            m_pending.reset();
+        } catch (...) {
+            // 监听器快照分配失败时仍清理暂存状态，配置值已经完整提交；
+            // 本次仅跳过回调，不能让热加载线程因为扩展点异常退出。
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_pending.reset();
+            return;
+        }
+        for (const auto& [id, listener] : listeners) {
+            (void)id;
+            if (!listener) continue;
+            try {
+                const T old_value = change->old_value ? *change->old_value : T{};
+                listener(old_value, change->new_value);
+            } catch (...) {
+                // 监听器属于扩展点，单个插件异常不能阻断同一变量的其余
+                // 监听器，也不能回滚已经完整提交的配置值。
+            }
+        }
+    }
+
+    /** @brief 返回当前变量是否存在尚未广播的事务变更。 */
+    bool HasPending() const noexcept override {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_pending.has_value();
+    }
+
+    /**
+     * @brief 回滚事务阶段暂存的值。
+     * @details 回滚只恢复值，不调用监听器；因为事务尚未对外发布。
+     */
+    void RollbackPending() noexcept override {
+        try {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_pending) return;
+            std::atomic_store_explicit(&m_value, m_pending->old_value,
+                                       std::memory_order_release);
+            m_pending.reset();
+        } catch (...) {
+            // 回滚路径不能向监听线程传播异常；若分配失败，保留当前值并
+            // 交由进程级错误处理记录，避免在 noexcept 路径中 terminate。
+        }
+    }
+
 private:
+    struct PendingChange {
+        // 保存旧快照而不是旧值副本，回滚时无需再次分配 T，能够在
+        // bad_alloc 等异常路径下保持 noexcept 回滚的确定性。
+        std::shared_ptr<const T> old_value;
+        T new_value{};
+    };
     mutable std::mutex m_mutex;
     std::shared_ptr<const T> m_value;
     std::map<std::uint64_t, Listener> m_listeners;
     Validator m_validator;
     std::atomic<std::uint64_t> m_next_listener{1};
+    std::optional<PendingChange> m_pending;
 };
 
 /**
@@ -245,6 +385,14 @@ private:
  */
 class Config final {
 public:
+    /**
+     * @brief 一次配置事务完成后的扩展回调。
+     * @details 回调执行时，本次文件提交涉及的全部 ConfigVar 已经写入；
+     *          适合 scheduler、logger 等需要整体重建快照的插件。回调在事务锁
+     *          释放后执行，可以查询或再次提交配置；回调异常会被配置中心隔离，
+     *          不会撤销已经提交的配置值。
+     */
+    using CommitListener = std::function<void(const std::vector<ConfigVarBase::ptr>& changed)>;
     // 返回进程内唯一配置注册表；注册表本身由调用方在进程退出前使用。
     /** @brief 返回进程内唯一配置注册表。 */
     static Config& Instance();
@@ -274,6 +422,14 @@ public:
     // 返回当前已注册变量的共享指针快照。
     /** @brief 返回当前已注册变量快照。 */
     std::vector<ConfigVarBase::ptr> List() const;
+    /**
+     * @brief 注册一次文件事务完成回调。
+     * @param listener 提交完成后接收变更变量快照的回调。
+     * @return 可用于 DelCommitListener 的监听器 ID。
+     */
+    std::uint64_t AddCommitListener(CommitListener listener);
+    /** @brief 删除指定的事务完成回调。 */
+    void DelCommitListener(std::uint64_t id);
     // 立即加载 path，并按 interval 轮询。监听前先检查 path + ".lock"：锁文件
     // 非空时拒绝启动或暂缓刷新，空文件/不存在时才读取配置；失败不会启动线程。
     /** @brief 启动后台监听线程。 */
@@ -289,7 +445,12 @@ private:
     ~Config();
     void stop_watcher_locked() noexcept;
     mutable std::mutex m_mutex;
+    // 文件事务锁串行化多个 LoadFromIni/LoadFromFile 调用，保证不同线程
+    // 不会交错写入同一批 ConfigVar 并互相覆盖暂存通知。
+    mutable std::mutex m_transaction_mutex;
     std::unordered_map<std::string, ConfigVarBase::ptr> m_vars;
+    std::map<std::uint64_t, CommitListener> m_commit_listeners;
+    std::atomic<std::uint64_t> m_next_commit_listener{1};
     std::atomic<bool> m_watching{false};
     // 保护 std::thread 对象本身；配置值读取不使用这把生命周期锁。
     mutable std::mutex m_watcher_lifecycle_mutex;

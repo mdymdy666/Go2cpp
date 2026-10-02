@@ -18,6 +18,7 @@
 #include <vector>
 #include <unordered_map>
 #include <optional>
+#include <type_traits>
 
 namespace go2cpp::log {
 
@@ -98,6 +99,101 @@ class LogFormatter {
 public:
     using ptr = std::shared_ptr<LogFormatter>;
     virtual ~LogFormatter() = default;
+
+    /**
+     * @brief 一个可插拔的格式化项。
+     * @details
+     * 格式字符串被解析成多个 Item，Formatter 只负责按顺序调用这些 Item。
+     * 用户可以继承该类读取 LogRecord 的扩展字段，并通过 AddFormat 注册到
+     * 全局格式项工厂表。例如注册 "g" 后，模式 "%g" 即可由用户 Item 生成。
+     * Item 对象在构造 PatternFormatter 时被创建，格式化热路径只调用 Format，
+     * 不会再次解析字符串或访问注册表。
+     */
+    class Item {
+    public:
+        using ptr = std::shared_ptr<Item>;
+        virtual ~Item() = default;
+
+        /**
+         * @brief 将一个日志字段追加到输出流。
+         * @param[out] stream 目标输出流。
+         * @param[in] record 待读取的结构化日志记录。
+         */
+        virtual void Format(std::ostream& stream, const LogRecord& record) const {
+            // 保留小写 format 入口，兼容 Sylar 风格的用户扩展类。
+            format(stream, record);
+        }
+
+        /**
+         * @brief Sylar 风格的小写格式化入口。
+         * @details 用户可以覆写 Format 或 format 其中一个；默认实现为空。
+         */
+        virtual void format(std::ostream&, const LogRecord&) const {}
+    };
+
+    /** @brief Item 工厂，参数为格式项后面的可选参数，例如 `%d{...}` 中的内容。 */
+    using ItemFactory = std::function<Item::ptr(const std::string& option)>;
+
+    /**
+     * @brief 注册一个自定义格式项。
+     * @param key 格式项名称，通常是一个字符，如 "g"；也支持命名项。
+     * @param factory 创建 Item 的工厂，参数是格式项选项文本。
+     * @return 注册成功返回 true；key 为空、工厂为空或 key 已存在时返回 false。
+     * @note 内置项在首次创建 PatternFormatter 时注册；不要覆盖内置 key，
+     *       如需替换请先 RemoveFormat 再注册。
+     */
+    static bool AddFormat(std::string key, ItemFactory factory);
+
+    /**
+     * @brief 注册不需要格式选项的简化工厂。
+     * @param key 格式项名称。
+     * @param factory 无参数 Item 工厂。
+     * @return 注册成功返回 true；名称冲突或参数为空返回 false。
+     * @details 该重载便于只输出固定业务字段的 Item，避免新手为未使用的
+     *          option 参数编写样板代码；带选项的格式仍使用 ItemFactory。
+     */
+    static bool AddFormat(std::string key, std::function<Item::ptr()> factory);
+
+    /** @brief 删除一个格式项注册。内置项也可以删除，删除后新 Formatter 会报告未知项。 */
+    static bool RemoveFormat(const std::string& key);
+
+    /** @brief 判断格式项是否已经注册。 */
+    static bool HasFormat(const std::string& key);
+
+    /** @brief 返回当前注册表中的格式项名称快照，主要用于调试和插件检查。 */
+    static std::vector<std::string> Formats();
+
+    /**
+     * @brief 用类型直接注册格式项，减少新手编写工厂的样板代码。
+     * @details 类型优先使用 `ItemType(const std::string&)`，否则使用默认构造函数。
+     */
+    template <class ItemType>
+    static bool AddFormat(std::string key) {
+        static_assert(std::is_base_of_v<Item, ItemType>,
+                      "ItemType must derive from go2cpp::log::LogFormatter::Item");
+        return AddFormat(std::move(key), [](const std::string& option) {
+            if constexpr (std::is_constructible_v<ItemType, const std::string&>) {
+                return std::make_shared<ItemType>(option);
+            } else {
+                return std::make_shared<ItemType>();
+            }
+        });
+    }
+
+    /** @brief Sylar 风格的注册别名。 */
+    static bool addFormat(std::string key, ItemFactory factory) {
+        return AddFormat(std::move(key), std::move(factory));
+    }
+    /** @brief Sylar 风格的无选项工厂注册别名。 */
+    static bool addFormat(std::string key, std::function<Item::ptr()> factory) {
+        return AddFormat(std::move(key), std::move(factory));
+    }
+    /** @brief 小写模板注册别名，兼容 Sylar 风格调用。 */
+    template <class ItemType>
+    static bool addFormat(std::string key) {
+        return AddFormat<ItemType>(std::move(key));
+    }
+
     /** @brief 格式化一条日志。@return 格式化后的文本。 */
     virtual std::string Format(const LogRecord& record) const = 0;
 };
@@ -115,11 +211,15 @@ public:
     std::string Format(const LogRecord& record) const override;
     /** @brief 返回当前模式文本。 */
     const std::string& pattern() const noexcept { return m_pattern; }
-    /** @brief 返回构造时是否发现未知或非法占位符。 */
+    /**
+     * @brief 返回构造时是否发现未知或非法占位符。
+     * @details 为 true 时，未知项会原样保留；配置系统可以据此拒绝错误模式。
+     */
     bool HasError() const noexcept { return m_error; }
 
 private:
     std::string m_pattern;
+    std::vector<Item::ptr> m_items;
     bool m_error{false};
 };
 

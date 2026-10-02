@@ -78,6 +78,67 @@ void run_log_config_tests() {
     GO2CPP_REQUIRE(lines.size() == 1);
     GO2CPP_CHECK(lines.front().find("INFO\tchild-test\t层级传播") != std::string::npos);
 
+    // 自定义格式项：用户只需继承 Item 并注册工厂，即可扩展 Sylar 风格占位符。
+    // 这里故意覆写小写 format，验证旧式扩展类无需改成大写 Format 接口。
+    struct UserItem final : public log::LogFormatter::Item {
+        void format(std::ostream& stream, const log::LogRecord& item_record) const override {
+            stream << "USER(" << item_record.logger << ")";
+        }
+    };
+    GO2CPP_CHECK(!log::LogFormatter::HasFormat("g"));
+    GO2CPP_REQUIRE(log::LogFormatter::AddFormat(
+        "g", [](const std::string&) {
+            return std::make_shared<UserItem>();
+        }));
+    GO2CPP_CHECK(log::LogFormatter::HasFormat("g"));
+    // 同一 key 不允许静默覆盖，避免不同模块之间的格式协议互相污染。
+    GO2CPP_CHECK(!log::LogFormatter::addFormat(
+        "g", [](const std::string&) {
+            return std::make_shared<UserItem>();
+        }));
+    log::PatternFormatter user_formatter("%g:%m|{g}");
+    GO2CPP_CHECK(!user_formatter.HasError());
+    GO2CPP_CHECK(user_formatter.Format(log::LogRecord{
+        log::Level::Info, "custom-logger", "扩展格式", {}, {}, 0, 0, 0, 0, {}, 0}) ==
+                 "USER(custom-logger):扩展格式|USER(custom-logger)");
+    GO2CPP_CHECK(log::LogFormatter::RemoveFormat("g"));
+    GO2CPP_CHECK(!log::LogFormatter::HasFormat("g"));
+
+    // 模板注册接口适合新手：只需提供一个带 option 构造函数的 Item 类型。
+    struct TagItem final : public log::LogFormatter::Item {
+        explicit TagItem(std::string option) : m_option(std::move(option)) {}
+        void Format(std::ostream& stream, const log::LogRecord&) const override {
+            stream << "TAG(" << m_option << ")";
+        }
+        std::string m_option;
+    };
+    GO2CPP_REQUIRE(log::LogFormatter::addFormat<TagItem>("q"));
+    log::PatternFormatter tag_formatter("%q{demo}");
+    GO2CPP_CHECK(!tag_formatter.HasError());
+    GO2CPP_CHECK(tag_formatter.Format(log::LogRecord{}) == "TAG(demo)");
+    GO2CPP_CHECK(log::LogFormatter::RemoveFormat("q"));
+
+    // 无选项工厂适合固定输出的 Item；内置 %d 已占用，不能被业务插件覆盖。
+    struct FixedItem final : public log::LogFormatter::Item {
+        void Format(std::ostream& stream, const log::LogRecord&) const override {
+            stream << "FIXED";
+        }
+    };
+    GO2CPP_REQUIRE(log::LogFormatter::addFormat(
+        "h", [] { return std::make_shared<FixedItem>(); }));
+    log::PatternFormatter fixed_formatter("%h");
+    GO2CPP_CHECK(fixed_formatter.Format(log::LogRecord{}) == "FIXED");
+    GO2CPP_CHECK(!log::LogFormatter::addFormat(
+        "d", [] { return std::make_shared<FixedItem>(); }));
+    GO2CPP_CHECK(log::LogFormatter::RemoveFormat("h"));
+
+    log::PatternFormatter function_formatter("{function}");
+    GO2CPP_CHECK(function_formatter.Format(log::LogRecord{
+        log::Level::Info, {}, {}, {}, "函数名", 0, 0, 0, 0, {}, 0}) == "函数名");
+    GO2CPP_CHECK(user_formatter.Format(log::LogRecord{
+        log::Level::Info, "custom-logger", "注销后仍可用", {}, {}, 0, 0, 0, 0, {}, 0}) ==
+                 "USER(custom-logger):注销后仍可用|USER(custom-logger)");
+
     const auto rotating_path = std::filesystem::temp_directory_path() / "go2cpp-rotate.log";
     std::filesystem::remove(rotating_path);
     auto rotating = std::make_shared<log::RotatingFileSink>(
@@ -180,4 +241,35 @@ void run_log_config_tests() {
     GO2CPP_REQUIRE(metrics != nullptr);
     GO2CPP_CHECK(metrics->SetValue(false));
     GO2CPP_CHECK(!dynamic_runtime.scheduler.collect_metrics);
+
+    // 文件配置采用两阶段提交：任何字段校验失败都不能留下半套值；
+    // 提交监听器只能看到完整的新快照，适合扩展模块一次性重建资源。
+    auto transaction_first = registry.Lookup<int>("test.transaction_first", 1, "事务测试字段一");
+    auto transaction_second = registry.Lookup<int>("test.transaction_second", 2, "事务测试字段二");
+    GO2CPP_REQUIRE(transaction_first != nullptr && transaction_second != nullptr);
+    std::atomic<int> commit_notifications{0};
+    std::atomic<bool> saw_complete_snapshot{false};
+    const auto commit_id = registry.AddCommitListener(
+        [&](const std::vector<ConfigVarBase::ptr>& changed) {
+            if (changed.size() == 2 && transaction_first->GetValue() == 10 &&
+                transaction_second->GetValue() == 20) {
+                saw_complete_snapshot.store(true);
+            }
+            commit_notifications.fetch_add(1);
+        });
+    IniFile invalid_transaction;
+    GO2CPP_REQUIRE(invalid_transaction.Parse(
+        "[test]\ntransaction_first=10\ntransaction_second=bad\n", &validation_error));
+    GO2CPP_CHECK(!registry.LoadFromIni(invalid_transaction, &validation_error));
+    GO2CPP_CHECK(transaction_first->GetValue() == 1);
+    GO2CPP_CHECK(transaction_second->GetValue() == 2);
+    IniFile valid_transaction;
+    GO2CPP_REQUIRE(valid_transaction.Parse(
+        "[test]\ntransaction_first=10\ntransaction_second=20\n", &validation_error));
+    GO2CPP_REQUIRE(registry.LoadFromIni(valid_transaction, &validation_error));
+    GO2CPP_CHECK(transaction_first->GetValue() == 10);
+    GO2CPP_CHECK(transaction_second->GetValue() == 20);
+    GO2CPP_CHECK(commit_notifications.load() == 1);
+    GO2CPP_CHECK(saw_complete_snapshot.load());
+    registry.DelCommitListener(commit_id);
 }

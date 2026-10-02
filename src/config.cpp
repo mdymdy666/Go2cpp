@@ -527,6 +527,9 @@ ConfigVarBase::ptr Config::LookupBase(const std::string& name) const {
 /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
 /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
+    // 预检和提交必须处于同一事务临界区。否则两个监听线程可能分别
+    // 通过预检，随后交错 ApplyString，破坏“整批配置一次发布”的约定。
+    std::unique_lock<std::mutex> transaction_lock(m_transaction_mutex);
     const auto variables = List();
     // 先检查所有已注册项对应的文本能否转换；实际写入仍按变量顺序完成，
     // 这样错误能指出具体变量，同时不要求所有类型都暴露内部临时值。
@@ -541,8 +544,53 @@ bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
         if (!variable->ValidateString(text, error)) return false;
         pending.emplace_back(variable, text);
     }
-    for (const auto& [variable, text] : pending) if (!variable->FromString(text, error)) return false;
-    return true;
+    // 第二阶段只写入变量，不触发监听器。这样 scheduler/log 等模块不会
+    // 看到“只更新了一半”的配置组合；全部变量写入成功后再统一广播。
+    std::vector<ConfigVarBase::ptr> applied;
+    applied.reserve(pending.size());
+    try {
+        for (const auto& [variable, text] : pending) {
+            if (!variable->ApplyString(text, error)) {
+                for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
+                    (*it)->RollbackPending();
+                }
+                return false;
+            }
+            if (variable->HasPending()) applied.push_back(variable);
+        }
+        // 通知阶段位于所有值提交之后；监听器读取其他变量时只能看到同一
+        // 次文件加载的最终值，而不会读到顺序相关的中间状态。
+        for (const auto& variable : applied) variable->NotifyPending();
+        // ConfigVar 监听器已经看到完整的新值；提交级插件回调不再持有事务锁，
+        // 因而可以安全地触发下一次配置加载、查询注册表或重建外部模块。
+        transaction_lock.unlock();
+        if (!applied.empty()) {
+            std::map<std::uint64_t, CommitListener> listeners;
+            try {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                listeners = m_commit_listeners;
+            } catch (...) {
+                // 仅影响提交后的插件通知，不影响已经提交的配置值。
+                listeners.clear();
+            }
+            for (const auto& [id, listener] : listeners) {
+                (void)id;
+                if (!listener) continue;
+                try {
+                    listener(applied);
+                } catch (...) {
+                    // 配置插件只能观察已提交快照；单个插件失败时继续
+                    // 执行其余插件，绝不能让配置监听线程退出。
+                }
+            }
+        }
+        return true;
+    } catch (...) {
+        for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
+            (*it)->RollbackPending();
+        }
+        throw;
+    }
 }
 
 /// 函数功能：完成 LoadFromFile 调用，读取或更新相关运行时状态。
@@ -573,6 +621,29 @@ std::vector<ConfigVarBase::ptr> Config::List() const {
     result.reserve(m_vars.size());
     for (const auto& [name, variable] : m_vars) result.push_back(variable);
     return result;
+}
+
+/// 函数功能：注册配置事务提交后的扩展回调。
+/// 执行流程：
+/// 1. 校验回调对象；
+/// 2. 加锁复制并登记回调；
+/// 3. 返回稳定的监听器 ID，供调用方稍后注销。
+/// @param[in] listener 事务完成后接收变更变量列表的回调。
+/// @return 可传给 DelCommitListener 的唯一 ID。
+std::uint64_t Config::AddCommitListener(CommitListener listener) {
+    const auto id = m_next_commit_listener.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_commit_listeners.emplace(id, std::move(listener));
+    return id;
+}
+
+/// 函数功能：注销配置事务提交回调。
+/// 执行流程：获取注册表锁并删除指定 ID；不存在时保持幂等。
+/// @param[in] id AddCommitListener 返回的监听器 ID。
+/// @return 无返回值。
+void Config::DelCommitListener(std::uint64_t id) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_commit_listeners.erase(id);
 }
 
 /// 函数功能：完成 StartWatcher 调用，读取或更新相关运行时状态。

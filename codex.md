@@ -5,6 +5,25 @@
 > 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
 > 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
 
+## 2026-10-02：日志 Item 插件化与配置事务解耦
+
+- `LogFormatter` 新增 Sylar 风格的 `Item` 扩展边界。格式字符串在
+  `PatternFormatter` 构造时预解析成 Item 链，日志热路径不再查表或解析文本；
+  `AddFormat`/`addFormat`、`RemoveFormat`、`HasFormat` 和 `Formats` 由线程安全
+  注册表提供，工厂在注册表锁外执行，允许插件在工厂中继续注册或查询格式项。
+- 内置 `{time}`、`{function}`、`%d{...}`、`%p/%m/%N/%T/%n` 等格式均通过同一
+  工厂协议创建；重复键拒绝覆盖，已构造 Formatter 持有自己的 Item 快照，注销
+  不会破坏正在使用的 Formatter。新增无选项工厂和带 option 构造函数的模板接口，
+  便于新手接入自定义字段。
+- 配置中心增加 `ApplyString`/`NotifyPending`/`RollbackPending` 两阶段接口和
+  `Config::AddCommitListener`。文件加载先整体校验，再整体发布值，失败恢复旧快照；
+  监听器逐个隔离异常，提交级回调在事务锁释放后执行，避免插件回调触发配置加载时
+  发生锁反转。配置文件的编辑锁、临时文件和原子 rename 约束同步补充到配置文档。
+- 新增自定义 Item、重复注册、注销后快照、日期内置键保护、配置事务回滚和完整提交
+  回调测试；更新 `example/log_config_demo.cpp` 和 `docs/logging.md` 新手示例。
+- 验证：`build-final` 全量 CTest 14/14 通过；`build-engineering-werror` 全量
+  CTest 3/3 通过；两套构建均使用现有项目警告策略，`git diff --check` 通过。
+
 ## 2026-09-29：调度器、混合锁与 Coost 对比
 
 - 本地 P 队列成功取到 G 后跳过调度器全局 admission 锁；G/M/P 计数统一在
