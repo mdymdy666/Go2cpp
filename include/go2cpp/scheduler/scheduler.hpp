@@ -28,18 +28,21 @@ using GId = std::uint64_t;
 using MId = std::uint64_t;
 using PId = std::uint32_t;
 
+/** @brief Fiber 唤醒请求的处理结果。 */
 enum class WakeAction : std::uint8_t {
     kRejected,
     kEnqueue,
     kPending,
 };
 
+/** @brief Fiber park 请求的处理结果。 */
 enum class ParkAction : std::uint8_t {
     kRejected,
     kParked,
     kRequeued,
 };
 
+/** @brief GMP 模型中 G（Fiber）状态。 */
 enum class GState : std::uint8_t {
     kNew,
     kRunnable,
@@ -60,6 +63,7 @@ enum class GState : std::uint8_t {
     Failed = kFailed,
 };
 
+/** @brief GMP 模型中 M（工作线程）状态。 */
 enum class MState : std::uint8_t {
     kIdle,
     kRunning,
@@ -76,6 +80,7 @@ enum class MState : std::uint8_t {
     Dead = kDead,
 };
 
+/** @brief GMP 模型中 P（处理器资源）状态。 */
 enum class PState : std::uint8_t {
     kIdle,
     kRunning,
@@ -88,6 +93,11 @@ enum class PState : std::uint8_t {
     Dead = kDead,
 };
 
+/**
+ * @brief Scheduler 启动和运行参数。
+ * @details 字段可通过 config 模块加载；线程数、P 数和栈容量会在启动期
+ *          校验，动态配置不得拆开修改相互依赖的结构参数。
+ */
 struct SchedulerConfig {
     std::size_t processor_count = 0;
     std::size_t max_workers = 0;
@@ -124,6 +134,7 @@ using TaskClassId = std::uint64_t;
 
 struct TaskCancellationGate;
 
+/** @brief 单个 G/Fiber 的调度选项。 */
 struct TaskOptions {
     std::size_t stack_size = 0;
     TaskClassId task_class = 0;
@@ -132,12 +143,14 @@ struct TaskOptions {
     std::size_t fiber_bin_capacity = 0;
 };
 
+/** @brief P 的只读运行快照。 */
 struct ProcessorSnapshot {
     PId id{0};
     PState state{PState::kIdle};
     std::size_t queued{0};
 };
 
+/** @brief M 的只读运行快照。 */
 struct MachineSnapshot {
     MId id{0};
     MState state{MState::kIdle};
@@ -156,6 +169,7 @@ struct MachineSnapshot {
 
 // 调度器热点计数器。所有时间均为 steady_clock 纳秒，采用累计值，便于
 // 调用方按两次快照的差值计算单次 Fiber 运行、切换和本地队列命中成本。
+/** @brief 调度器统计指标快照。 */
 struct SchedulerMetrics {
     std::uint64_t task_runs{0};
     std::uint64_t task_completions{0};
@@ -172,6 +186,11 @@ struct SchedulerMetrics {
  * 对上层提供：任务提交后的状态查询、取消、等待、失败传播和调度器内部
  * 的入队/执行权原子操作。职责边界是管理单个 G 的生命周期，不负责创建
  * worker 线程，也不直接操作 P 队列。
+ */
+/**
+ * @brief Scheduler 管理的 G/Fiber 任务对象。
+ * @details 保存入口函数、取消状态、生命周期和等待结果；Scheduler 负责
+ *          将任务放入本地、P 或全局队列并保证同一时刻只在一个 M 上运行。
  */
 class Task : public std::enable_shared_from_this<Task> {
 public:
@@ -315,6 +334,11 @@ private:
  * Scheduler 拥有 worker 生命周期和队列，但不拥有调用方保存的 Task 句柄。
  * 所有阻塞原生调用必须通过 BlockingRegion 或 Hook 边界声明，调度器不能
  * 从其他线程强制切断任意 C++ 调用栈。
+ */
+/**
+ * @brief Go2Cpp 的 GMP 调度器。
+ * @details 维护 G、M、P 的绑定和队列，提供 Fiber/线程混合的 park/wake、
+ *          work stealing、阻塞区段和 sysmon 观测接口。
  */
 class Scheduler {
 public:

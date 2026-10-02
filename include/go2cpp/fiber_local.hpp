@@ -51,6 +51,7 @@ class FiberLocalCache final {
     static_assert(!std::is_void_v<T>, "FiberLocalCache<void> is invalid");
 
 public:
+    /** @brief 分配当前实例的 Fiber-local 键。 */
     FiberLocalCache() noexcept : m_key(fiber_local::detail::AllocateKey()) {}
     // 值刻意长于键对象，由 Fiber trampoline（或线程退出 TLS 清理）回收。
     // 这样不会因为缓存包装器离开作用域就销毁仍存活 Fiber 的值。调用方在
@@ -62,6 +63,7 @@ public:
     FiberLocalCache(FiberLocalCache&&) = delete;
     FiberLocalCache& operator=(FiberLocalCache&&) = delete;
 
+    /** @brief 读取当前 Fiber 值，不存在时按参数构造并保存。 */
     template <typename... Args>
     T& GetOrCreate(Args&&... args) {
         if (auto value = load()) {
@@ -81,6 +83,7 @@ public:
         return GetOrCreate(std::forward<Args>(args)...);
     }
 
+    /** @brief 尝试读取当前 Fiber 值，不存在返回空指针。 */
     T* TryGet() const noexcept {
         if (Fiber* const fiber = Fiber::Current()) {
             auto value = fiber_local::detail::Get(fiber, m_key);
@@ -95,6 +98,7 @@ public:
 
     T* try_get() const noexcept { return TryGet(); }
 
+    /** @brief 删除当前 Fiber 或线程中的缓存值。 */
     void Reset() noexcept {
         if (Fiber* const fiber = Fiber::Current()) {
             fiber_local::detail::Reset(fiber, m_key);
@@ -104,6 +108,7 @@ public:
     }
 
     void reset() noexcept { Reset(); }
+    /** @brief 返回内部键 ID，仅用于诊断。 */
     std::uint64_t key_id() const noexcept { return m_key; }
 
 private:

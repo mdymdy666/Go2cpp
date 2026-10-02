@@ -19,7 +19,9 @@ namespace go2cpp::sync {
  */
 class Mutex final {
 public:
+    /** @brief 创建未加锁的混合 Mutex。 */
     Mutex();
+    /** @brief 销毁 Mutex；调用方必须先释放锁。 */
     ~Mutex();
 
     Mutex(const Mutex&) = delete;
@@ -28,13 +30,17 @@ public:
     Mutex& operator=(Mutex&&) = delete;
 
     // 阻塞直到获得锁或 context 取消；返回 true 表示已持有锁。
+    /** @brief 阻塞获取锁，支持 Context 取消。 */
     bool Lock(const ContextPtr& context = {});
     // 最多等待 timeout；parent/context 取消或超时返回 false。
+    /** @brief 在相对超时内获取锁。 */
     bool LockFor(ContextDuration timeout,
                  const ContextPtr& parent = {});
     // 不阻塞地尝试加锁；成功返回 true。
+    /** @brief 非阻塞尝试获取锁。 */
     bool TryLock() noexcept;
     // 释放锁并按 FIFO 唤醒下一个等待者；未持有锁时报告逻辑错误。
+    /** @brief 释放锁并唤醒一个 FIFO 等待者。 */
     void Unlock();
 
     // BasicLockable 兼容拼写。lock() 在普通线程上竞争时阻塞；受管 G
@@ -59,6 +65,7 @@ private:
  */
 class ConditionVariable final {
 public:
+    /** @brief 创建 Fiber/线程混合条件变量。 */
     ConditionVariable();
     ~ConditionVariable();
 
@@ -69,13 +76,17 @@ public:
 
     // 释放 mutex 并等待通知/取消，然后重新获得 mutex；返回是否正常
     // 完成重锁，mutex 参数必须由调用方在进入前持有。
+    /** @brief 原子释放 mutex 并等待通知或取消。 */
     bool Wait(Mutex& mutex, const ContextPtr& context = {});
     // 最多等待 timeout，参数 parent 为可选取消上下文；返回规则同 Wait。
+    /** @brief 带超时等待通知。 */
     bool WaitFor(Mutex& mutex, ContextDuration timeout,
                  const ContextPtr& parent = {});
     // 唤醒一个等待者；没有等待者时通知不会累积。
+    /** @brief 唤醒一个条件变量等待者。 */
     void NotifyOne() noexcept;
     // 唤醒当前所有等待者。
+    /** @brief 唤醒全部条件变量等待者。 */
     void NotifyAll() noexcept;
 
     bool wait(Mutex& mutex, const ContextPtr& context = {}) {
@@ -102,6 +113,7 @@ private:
  */
 class WaitGroup final {
 public:
+    /** @brief 创建计数为零的 WaitGroup。 */
     WaitGroup();
     ~WaitGroup();
 
@@ -111,15 +123,20 @@ public:
     WaitGroup& operator=(WaitGroup&&) = delete;
 
     // 将计数增加 delta；负值不能使计数下溢。
+    /** @brief 增减等待计数；计数不能变为负数。 */
     void Add(std::int64_t delta);
     // 将计数减少一；计数为零时唤醒等待者。
+    /** @brief 将计数减一并在归零时唤醒等待者。 */
     void Done();
     // 等待计数归零或 context 取消；返回 true 表示归零。
+    /** @brief 等待计数归零或 Context 取消。 */
     bool Wait(const ContextPtr& context = {});
     // 最多等待 timeout；parent/context 取消或超时返回 false。
+    /** @brief 在相对超时内等待计数归零。 */
     bool WaitFor(ContextDuration timeout,
                  const ContextPtr& parent = {});
     // 返回当前计数快照；结果仅表示调用时刻，不阻止随后 Add/Done。
+    /** @brief 返回当前等待计数。 */
     std::int64_t Count() const noexcept;
 
     void add(std::int64_t delta) { Add(delta); }
