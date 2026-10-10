@@ -11,6 +11,20 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：B-03 首轮（Context 测试中止保护、tools 前置断言、双拼写约定）
+
+- **本轮范围**：台账 B-03 第 1 批 3 条：**T-01**、**T-02**、**D-09**。B-03 共 5 条，T-05、T-06 留待下一轮（单轮预算内不硬塞，避免半成品）。
+- **改动文件**（4 个）：
+  - `tests/concurrency/test_context.cpp`：22 处「直接在主流程断言等待结果」的 `GO2CPP_CHECK` 改为 `GO2CPP_REQUIRE`（`:63`/`:81`/`:134`/`:156`/`:157`/`:176`/`:177`/`:198`/`:222`/`:223`/`:267`/`:288`/`:308`/`:328`/`:343`/`:359`/`:375`/`:391`/`:402`/`:410`/`:422`/`:423`）。这些点全部是 `Done().WaitFor(t)` 或 `Task::wait_for(t)`，等待失败后继续执行会让后续断言基于未达成的状态级联误报，改为 REQUIRE 后失败即中止。**未改**回调/线程内先存 atomic 再断言的写法（`:73`/`:217`/`:254`/`:300`）——在那里中止会破坏测试语义。宏统计：REQUIRE 0 → 22，CHECK 144 → 122。
+  - `tests/tools/test_control_flow.cpp:28`：`order.size() == 3` 由 CHECK 改 REQUIRE。**理由不是形式统一**：紧随的 `:29-31` 直接索引 `order[0]`~`order[2]`，size 断言失败后继续执行即为越界 UB。
+  - `tests/tools/test_error.cpp:104`：`formatted.size() == <期望值>` 由 CHECK 改 REQUIRE。同理，紧随的 `:107-108` 以 `formatted.size() - 16U` 作 `compare` 的起点，size 不足时该减法无符号下溢、`compare` 会抛 `out_of_range`，在测试里表现为未捕获异常终止进程。
+  - `docs/context_rollback.md`：在首个代码示例后补「命名约定」，说明 `RecordUndo`/`record_undo` 等五种 PascalCase 与小写形式并存、小写为内联转发且语义相同；并如实点明 `committed()`、`had_failure()` 只有小写形式（依据 `include/go2cpp/concurrency/context.hpp:307-346`）。
+- **U-01 处置**：本轮未触及 T-05，因此**未消费**该待决策项。下一轮处理 T-05 时按台账默认建议「保留 `errors::` 命名空间并补最小测试与示例」执行，并会在记录中标明用户可推翻。
+- **验证结果**：`cmake --build build-quality --parallel` 0 warning / 0 error；`ctest` **18/18 通过**；按规则对并发/超时用例重复运行——`GO2CPP_TEST_FILTER=context` **5/5**、`control_flow` **5/5**、`error` **5/5** 全部通过；`log/` 已恢复到轮初 md5。
+- **未通过/未覆盖（如实留白）**：本轮未跑 sanitizer 与 Valgrind；B-03 剩余 T-05、T-06 未处理。另外，22 处 REQUIRE 的**失败路径本身未被正向验证**——绿色构建不会触发 `watchdog_abort`，因此只能说这些宏的语义依据 `tests/test_support.hpp:140-150`，不能宣称「已证明失败时会干净中止」。
+- **提交**：`aa9d810`（test_context）、`0a8095b`（tools 测试）、`b3220e9`（context_rollback.md）。
+- **下一步**：B-03 剩余轮次——**T-05**（为在途新增的 `errors::` 补最小测试与示例，含 U-01 默认处置）、**T-06**（为 `event.hpp`/`go.hpp` 补独立 `run_xxx_tests()` 入口，需在 `test_main.cpp` 与 `cmake/Go2CppTests.cmake` 三处登记）。
+
 ## 2026-10-10：B-02 收尾（参考审计路径、协作记录路径说明、示例登记）
 
 - **本轮范围**：台账 B-02 第 3 批 3 条：**D-07**、**D-08**、**E-04**。至此 **B-02 批次全部完成**（D-01~D-08、D-11、D-12、E-04、I-01、X-02~X-04；D-09 台账原就归属 B-03）。
