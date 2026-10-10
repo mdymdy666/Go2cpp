@@ -11,11 +11,11 @@
 
 | ID | 类别 | 模块 | 问题 | 证据 | 严重度 | 归属批次 | 状态 | 备注 |
 |---|---|---|---|---|---|---|---|---|
-| I-01 | 不一致 | fiber / 文档 | Fiber 上下文后端表述互相矛盾：一处称已用自有汇编、不再链接 Boost.Context，另一处称"当前使用 Boost.Context 受保护固定栈"，第三处称自研汇编"已撤回" | `docs/design.md:121-130`（自有 ABI）vs `docs/design.md:221`（Boost.Context）；`docs/boundary_audit.md:25`（承认 native context）vs `:30`（称 Boost.Context）；`docs/performance.md:190-193`（已撤回）vs `:204-208`（已上线）；`docs/go_reference_audit.md:135` | 高 | B-02 | 待办 | **源码事实已定**：真身构建实际编译 `src/concurrency/context_x64.S` 并定义 `GO2CPP_USE_NATIVE_CONTEXT=1`（`cmake/Go2CppModules.cmake:33-36`；第 0 轮实测产出 `context_x64.S.o`）。同文件内 `design.md:121-130` 与 `:221` 自相矛盾 |
-| D-01 | 文档 | 跨模块 / README | `README.md` 三处示例路径失效（缺模块子目录前缀） | `README.md:54` → `example/log_config_demo.cpp`（实际 `example/logging/`）；`:97` → `example/beginner_demo.cpp`（实际 `example/concurrency/`）；`:48-52` 列出的示例名同样无前缀 | 高 | B-02 | 待办 | 自动扫描确认这 3 条 target 不存在 |
-| D-02 | 文档 | 跨模块 / README | `README.md:48-52` 只登记 6 个示例，实际有 15 个；9 个示例未在 README 登记 | `README.md:48-52` vs `ls example/*/*.cpp`（15 个）；未登记：`context_rollback_demo`、`control_flow_demo`、`io_wait_many_demo`、`network_demo`、`sse_demo`、`timer_task_demo`、`websocket_demo`、`beginner_demo`(仅 :97 提及)、`log_config_demo`(仅 :54 提及) | 中 | B-02 | 待办 | 能力清单不完整，影响新用户发现示例 |
-| D-03 | 文档 | 跨模块 / README | 模块 target 清单漏 `go2cpp::future` 与 `go2cpp::network` | `README.md:90-94` vs `cmake/Go2CppModules.cmake:38,43,89,91` | 中 | B-02 | 待办 | 实际共 14 个 target |
-| D-04 | 文档 | context | `docs/context_rollback.md` 的示例链接指向不存在的路径 | `docs/context_rollback.md:19` 链接 `../example/context_rollback_demo.cpp`；实际文件在 `example/concurrency/context_rollback_demo.cpp` | 中 | B-02 | 待办 | 目录重构（2026-10-07）后未更新 |
+| I-01 | 不一致 | fiber / 文档 | Fiber 上下文后端表述互相矛盾：`design.md` 与 `boundary_audit.md` 各自内部自相矛盾，`go_reference_audit.md` 与 `performance.md` 保留已撤回结论 | `docs/design.md:121-130` vs `:221`；`docs/boundary_audit.md:25` vs `:30`；`docs/go_reference_audit.md:135`；`docs/performance.md:190-193` vs `:204-208` | 高 | B-02 | **已完成** | 已按源码事实统一：Linux x86_64 默认自有上下文后端（`cmake/Go2CppModules.cmake:3-7` 平台判定、`:33-36` 编译 `context_x64.S` 并定义 `GO2CPP_USE_NATIVE_CONTEXT=1`、`:143-150` 仅在 OFF 时链接 `Boost::context`；本机实测存在 `context_x64.S.o` 且 `flags.make` 含该宏），其他平台回退 Boost.Context；`performance.md` 历史段加时效标注、原文保留不改写历史；commit `23677d6` |
+| D-01 | 文档 | 跨模块 / README | `README.md` 三处示例路径失效（缺模块子目录前缀） | `README.md:54`、`:97`、`:48-52` | 高 | B-02 | **已完成** | 已改为 `example/logging/log_config_demo.cpp` 与 `example/concurrency/beginner_demo.cpp`，示例段整体按模块目录重写；24 个 markdown 全量链接扫描，改动文件零失效（全库 3 处命中均为 lambda `[](...)` 正则误报，已逐条核实）；commit `36e4728` |
+| D-02 | 文档 | 跨模块 / README | `README.md:48-52` 只登记 6 个示例，实际有 15 个；9 个示例未在 README 登记 | `README.md:48-52` vs `ls example/*/*.cpp`（15 个） | 中 | B-02 | **已完成** | 已按 `example/{concurrency,network,logging,tools}` 分组列全 15 个示例，并指向 `example/README.md` 速查表；commit `36e4728` |
+| D-03 | 文档 | 跨模块 / README | 模块 target 清单漏 `go2cpp::future` 与 `go2cpp::network` | `README.md:90-94` vs `cmake/Go2CppModules.cmake:38,43,89,91` | 中 | B-02 | **已完成** | 已补齐两个 target；核对 `ALIAS` 共 14 项（13 个模块 target + `go2cpp::runtime`）；commit `36e4728` |
+| D-04 | 文档 | context | `docs/context_rollback.md` 的示例链接指向不存在的路径 | `docs/context_rollback.md:19`；实际文件在 `example/concurrency/context_rollback_demo.cpp` | 中 | B-02 | **已完成** | 链接已补 `concurrency/` 前缀，扫描确认 target 存在；commit `fa39566` |
 | D-05 | 不一致 | 文档 | `docs/modules.md` 称 `go2cpp_network` 依赖三个 target，漏记 `go2cpp_sync` | `docs/modules.md:11` vs `cmake/Go2CppModules.cmake:155`（依赖 `go2cpp_io go2cpp_context go2cpp_scheduler go2cpp_sync`） | 低 | B-02 | 待办 | `go2cpp_network` 本身确实存在，此处只是依赖描述不全 |
 | D-06 | 文档 | 测试文档 | `docs/testing.md` 引用重构前的测试路径，并提到非本仓工作树 | `docs/testing.md:415` → `tests/high_load_stress.cpp`（实际 `tests/concurrency/`）；同处提到 `NewGo2Cpp` 工作树 | 低 | B-02 | 待办 | 历史验证记录，改路径时需保留原始语义 |
 | D-07 | 文档 | 测试文档 | `docs/go_reference_audit.md` 引用重构前路径 | `docs/go_reference_audit.md:106` → `tests/test_control_flow.cpp`（实际 `tests/tools/`） | 低 | B-02 | 待办 | — |
@@ -34,6 +34,7 @@
 | D-10 | 文档 | 跨模块 | 项目**无** `AGENTS.md`/`CLAUDE.md`/`.agent/` 目录，协作规范此前只存在于 `codex.md` | `ls -a`（仅 `codex.md`）；`.agent` 不存在 | 低 | 本轮已处理 | 已完成 | 本轮新建 `.agent/quality_task_rules.md`，并在 `codex.md` 记录 |
 | E-04 | 示例 | 跨模块 / network | `sse_demo`、`websocket_demo`、`timer_task_demo` 仍未登记进 `example/README.md` 速查表；「批量运行全部示例」的 for 列表在 B-01 后仍只有 12 个（实际 15 个示例） | `example/README.md` 速查表现 12 行 vs `ls example/*/*.cpp`（15 个）；`cmake/Go2CppTests.cmake:56-73` | 中 | B-02 | 待办 | B-01 只登记了 `network_demo`，其余三个留待 B-02 统一处理 |
 | D-11 | 文档 | 跨模块 | `docs/modules.md` 作为"模块索引"过于简短（13 行），未覆盖 `include/go2cpp/core`、`detail` 子目录与新模块 target 全貌 | `docs/modules.md:5-13` vs `ls -R include/go2cpp` | 低 | B-02 | 待办 | 与本轮交付的四方矩阵可互补 |
+| D-12 | 文档 | 测试文档 | `docs/testing.md:595` 称「当前仍未在现有 Boost.Context fcontext 后端实现……」，与当前 Linux x86_64 自有上下文后端不符 | `docs/testing.md:595` vs `cmake/Go2CppModules.cmake:3-7`；同类问题见 I-01 | 低 | B-02 | 待办 | B-02 首轮未覆盖，留待下轮 |
 
 ## 2. 待用户决策项
 
@@ -49,8 +50,8 @@
 | 编号 | 模块 | 现象 | 证据 | 备注 |
 |---|---|---|---|---|
 | X-01 | 示例 / scheduler | `go2cpp_dynamic_gmp_demo` **间歇性失败**：`cancel()` 在任务已进入 Running 时返回 false，而示例把它当作硬失败条件 | `example/concurrency/dynamic_gmp_demo.cpp:99`（`cancel()` 返回值）、`:104-105`（`cancel_requested && state()==kCancelled` 同时成立才行）、`:114-115`（`cancel_ok` 计入返回码）。第 0 轮实测：直接运行 5 次 rc=1,1,0,1,0；`ctest` 单跑 5 次 3 败；全量 2 轮均 18/18 | 属**示例断言过严 + 竞态窗口**，不是调度器崩溃；与 `example/README.md:42` 声称"最终收敛为 Cancelled"矛盾 |
-| X-02 | 文档 | `docs/design.md` 同一文件内对 Fiber 后端的描述互相否定 | `docs/design.md:121-130` vs `:221` | 见 I-01 |
-| X-03 | 文档 | `docs/boundary_audit.md` 同一文件内自相矛盾 | `docs/boundary_audit.md:25`（native context 有溢出检查）vs `:30`（"当前使用 Boost.Context"） | 见 I-01 |
+| X-02 | 文档 | `docs/design.md` 同一文件内对 Fiber 后端的描述互相否定 | `docs/design.md:121-130` vs `:221` | 见 I-01；**B-02 已完成**（commit `23677d6`） |
+| X-03 | 文档 | `docs/boundary_audit.md` 同一文件内自相矛盾 | `docs/boundary_audit.md:25`（native context 有溢出检查）vs `:30`（称当前使用 Boost.Context） | 见 I-01；**B-02 已完成**（commit `23677d6`） |
 | X-04 | 文档 | `docs/performance.md` 内部性能结论数量级级矛盾（混合锁"快 10~18 倍" vs "8.5~8.8 s"；IO"慢 3.0~4.3 倍" vs "0.59x 已超过"） | `docs/performance.md:140` vs `:42-46`/`:183`/`:214-216`；`:141` vs `:184`；另 `:5-7` 自称"本节优先"但顶部小节早于后文 | 属历史记录累积冲突，需在 B-02 中加"数据时效与条件"标注 |
 | X-05 | 测试 | `tests/concurrency/test_context.cpp` 等以 CHECK 为主、缺超时保护，挂起式失败会拖到 CTest 30s TIMEOUT | 见 T-01/T-02；`cmake/Go2CppTests.cmake:31` TIMEOUT 30 | 属测试健壮性缺陷，非产品缺陷 |
 

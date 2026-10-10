@@ -5,6 +5,21 @@
 > 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
 > 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
 
+## 2026-10-10：B-02 首轮（README 路径与索引、Fiber 后端表述统一）
+
+- **本轮范围**：台账 B-02 的第 1 批，按「单轮 ≤5 条」取严重度最高的 5 条：**I-01**（含重复登记的 **X-02**、**X-03**）、**D-01**、**D-02**、**D-03**、**D-04**。B-02 共 12 条，本轮完成 5 条，剩余 7 条留待后续轮次。
+- **改动文件**（6 个，全部为文档；未触碰任何源码、测试或示例）：
+  - `README.md`：示例段按 `example/{concurrency,network,logging,tools}` 重写并列全 15 个示例；修正 `example/log_config_demo.cpp` → `example/logging/log_config_demo.cpp`、`example/beginner_demo.cpp` → `example/concurrency/beginner_demo.cpp`；模块 target 清单补 `go2cpp::future` 与 `go2cpp::network`。
+  - `docs/context_rollback.md`：示例链接补 `concurrency/` 前缀。
+  - `docs/design.md:221`、`docs/boundary_audit.md:30`、`docs/go_reference_audit.md:135`：统一为「Linux x86_64 由 Go2Cpp 自有上下文后端提供，其他平台回退 Boost.Context」。
+  - `docs/performance.md`：给「自研上下文已撤回」的历史段加**时效说明**引用块，指明其已被「2026-09-30 Context 与跨 M 唤醒专项」取代；**保留原文，不改写历史**，与台账 D-08 的处理原则一致。
+- **源码事实依据**：`cmake/Go2CppModules.cmake:3-7` 先置 `GO2CPP_NATIVE_CONTEXT OFF`，仅在 64 位非 aarch64/arm64/riscv/ppc/s390 的 Linux 上置 ON；`:33-36` 编译 `src/concurrency/context_x64.S` 并定义 `GO2CPP_USE_NATIVE_CONTEXT=1`；`:143-150` 仅在 OFF 时链接 `Boost::context`。本机 `build-quality` 实测存在 `CMakeFiles/go2cpp_fiber.dir/src/concurrency/context_x64.S.o`，且 `flags.make` 含 `-DGO2CPP_USE_NATIVE_CONTEXT=1`。
+- **验证结果**：24 个 markdown 文件全量相对链接扫描（按各文件所在目录解析相对路径），**本轮改动的 6 个文件零失效链接**；全库仅 3 处命中且均为 lambda 捕获 `[](...)` 被正则误判，已逐条核实为 `docs/configuration.md:60`、`docs/logging.md:53`、`docs/timer_usage.md:55`。README 引用的 8 个示例 target 在 `build-quality/CMakeFiles/` 下逐一确认存在。`cmake --build build-quality --parallel` 0 warning / 0 error；`ctest` **18/18 通过**（23.76 s）；`log/` 已恢复到轮初 md5。
+- **未通过/未覆盖**：B-02 剩余 7 条（D-05、D-06、D-07、D-08、D-11、X-04、D-12）本轮未处理；未跑 sanitizer 与 Valgrind；`docs/testing.md` 与 `codex.md` 记载的历史性能数字未复核。
+- **新登记**：**D-12**（`docs/testing.md:595` 仍称「现有 Boost.Context fcontext 后端」，与本轮统一后的表述冲突），归 B-02 下轮。
+- **提交**：`36e4728`（README）、`23677d6`（后端表述）、`fa39566`（回滚文档链接）。
+- **下一步**：B-02 第 2 批，取 D-05、D-06、D-07、D-08、D-11（D-12、E-04 视剩余预算可选）。
+
 ## 2026-10-10：B-01 示例质量（network_demo 三路径与登记）
 
 - **本轮范围**：台账批次 **B-01**，覆盖 **E-01**、**E-03**。运行模式为定时任务单轮执行；轮次互斥锁 `.agent/guard.sh` 由本轮首次创建（lock 目录已加入 `.gitignore`）。
