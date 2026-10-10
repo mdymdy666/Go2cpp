@@ -11,6 +11,21 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：源码回溯审计（第 4 批：future / context_backend / control_flow）
+
+- **本轮读完整实现**：`src/concurrency/future.cpp`(175)、`src/concurrency/context_backend.cpp`(45)、`src/tools/control_flow.cpp`(346)。
+- **核对结果**：
+  - `future.cpp:19-36` 默认等待后端只是 `ParkingCondition` 的适配器，`:25-28` 有 deadline 走 `wait_until`、否则 `wait` —— 与我在 `future_demo` 里「超时返回 kTimedOut」的观察一致；
+  - `future.cpp:79-129` 的可替换等待后端工厂在锁外构造实例、异常回退默认后端，与 `docs/extensibility.md` 的插件契约一致；
+  - `context_backend.cpp` 仅在 `__linux__ && __x86_64__` 转发到汇编符号，其余平台返回 `nullptr`/`{}`；Boost 回退路径由 `fiber.cpp` 的 `#if !defined(GO2CPP_USE_NATIVE_CONTEXT)` 承担，两者分工与 `cmake/Go2CppModules.cmake:33-36` 一致；
+  - `control_flow.hpp:97-101` 的 `CallableModel::run() noexcept` 内部有 `try { ... } catch (...) { RecordDeferException(...); }` —— **文档所称「defer 回调异常进 LastDeferException、不穿过 noexcept 析构」属实**，此前只是转述文档，本批已落到源码。
+- **本轮读源码发现的新问题**：
+  - **D-15（文档缺失）**：`future.cpp:168-173` 的 `BrokenPromiseError()` 是**函数局部 static 单例**，所有「Promise 被放弃」的 Future 拿到的是**同一个 ErrorPtr**，因此 `Is(errA, errB)` 为 true。头文件完全未提。
+  - **X-08（边界推论）**：`control_flow.cpp:15,28-38` 用 **thread_local** 的 `s_defer_depth` 判断「是否在 defer 回调内」。若违反「defer 回调不得挂起 Fiber」的约束、让 Fiber 在回调中迁移线程，`take()` 会在新线程上静默返回 `nullopt`。这是既有约束的必然推论，不是独立缺陷，登记以备查。
+- **验证结果**：本批为只读回溯，**未改任何源码或测试**，因此未触发构建；台账新增 D-15、X-08 两条。
+- **未通过/未覆盖**：累计回溯 **9 个实现文件、约 1,992 行**，占 `src/`（21,855 行）的 **9.1%**。四个大文件仍未读。`future_demo` 未覆盖可替换等待后端工厂这一扩展点（记为盲点，未补测）。
+- **下一步**：`src/concurrency/channel.cpp`(402) → `src/network/socket.cpp`(568) → `src/concurrency/timer.cpp`(778)。
+
 ## 2026-10-10：源码回溯审计（第 3 批：tools/error）
 
 - **本轮读完整实现**：`src/tools/error.cpp`(404)。
