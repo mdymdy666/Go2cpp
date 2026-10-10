@@ -101,7 +101,7 @@ void run_error_tests() {
         GO2CPP_CHECK(Is(deep, base));
         GO2CPP_CHECK(As<StringError>(deep) == base);
         const auto formatted = ErrorMessage(deep);
-        GO2CPP_CHECK(formatted.size() ==
+        GO2CPP_REQUIRE(formatted.size() ==
                      100000U * std::string("layer: ").size() +
                          std::string("disk unavailable").size());
         GO2CPP_CHECK(formatted.compare(formatted.size() - 16U, 16U,

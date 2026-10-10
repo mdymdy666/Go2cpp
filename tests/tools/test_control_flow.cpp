@@ -25,7 +25,7 @@ void run_control_flow_tests() {
         defer captured([&](int value) { order.push_back(value); }, evaluated);
         evaluated = 9;
     }
-    GO2CPP_CHECK(order.size() == 3);
+    GO2CPP_REQUIRE(order.size() == 3);
     GO2CPP_CHECK(order[0] == 3);
     GO2CPP_CHECK(order[1] == 2);
     GO2CPP_CHECK(order[2] == 1);
