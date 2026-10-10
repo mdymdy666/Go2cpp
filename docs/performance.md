@@ -281,3 +281,81 @@ valgrind --leak-check=full --show-leak-kinds=definite,indirect,possible \
 ERROR SUMMARY 为 0，definite/indirect/possible leak 均为 0，仅有 288 bytes
 still reachable 的进程级缓存。TSan 仍受 WSL `unexpected memory mapping` 环境错误
 限制，不能宣称通过。
+
+## 2026-10-02：性能复测与混合 Mutex 生命周期修复
+
+本轮重新构建 Release，并使用 `taskset -c 0-7` 固定到同一组 CPU。高负载参数仍为
+50,000 个调度任务、8,000 个计算任务、2,000 个 Fiber + 32 个普通线程、
+32,000 条 Channel 消息和 4,096 个 socketpair reader。修复后的三轮代表性结果如下，
+单位为毫秒：
+
+| 场景 | Go2Cpp | 线程基准 | Go2Cpp/线程 |
+|---|---:|---:|---:|
+| 计算 | 1595 / 1614 / 1560 | 1616 / 1632 / 1555 | 中位数约 0.99x |
+| 调度与 yield | 93 / 150 / 107 | 55 / 55 / 50 | 中位数约 1.95x |
+| 混合 Mutex | 18 / 1784 / 1562 | 39 / 38 / 37 | 双峰，不能用单一稳定倍率表示 |
+| Channel | 17 / 18 / 20 | 53 / 69 / 56 | 中位数约 0.32x |
+| 多路 IO | 2896 / 2614 / 2725 | 2034 / 2016 / 2091 | 中位数约 1.34x |
+
+同机 Coost 对照使用 `build-coost/compare_*.cpp`，并以 `taskset -c 0-7`
+运行：调度 50,000×4 的中位数约 8 ms，IO 中位数约 1,686 ms，混合 Mutex
+中位数约 1,721 ms。两边的计时边界、线程数和编译选项仍不完全相同：Coost
+对照是本地 checkout 的 `-O2` 构建，Go2Cpp 为 `-O3 -DNDEBUG`；调度和
+混合锁结果还包含不同的 scheduler 初始化/关闭路径。因此这些数据用于工程
+定位，不是严格的同 ABI 基准。
+
+复测期间发现并修复了一个确定的混合 Mutex UAF。原实现把栈上 `WaitNode*`
+放进队列，`Unlock` 弹出后释放队列锁，再调用 `Wake()`；等待方可能已经
+返回并销毁栈节点，或把拥有节点重置后放回线程本地缓存，导致随机 SIGSEGV、
+永久等待和 20 ms/2 s 两种性能模式。现在队列持有 `shared_ptr<WaitNode>`，
+`Unlock` 在锁外唤醒期间继续持有该引用，唤醒完成后才允许节点复用。
+
+修复后 Release 高负载连续 5 轮全部完成，ASan/UBSan mutex-only 连续 5 轮无
+报告，Werror CTest 3/3、Release CTest 14/14 通过。混合 Mutex 仍有明显长尾，
+需要后续继续优化等待/调度路径；不能把偶发的 18 ms 样本当成稳定性能。
+
+## 2026-10-08：混合 Mutex 快速等待路径
+
+针对上面的长尾，本轮没有放宽正确性检查，而是收窄了无取消受管 Fiber 的热路径：
+
+- `src/concurrency/sync.cpp` 中无 Context、受 Scheduler 管理的 Fiber 仍然使用
+  `shared_ptr<WaitNode>` 和 `Scheduler::park_wait()`；通用 `WaitNode` 的
+  `Arm/Disarm/Wake` 状态保护没有被删除，带 Context、普通线程、ConditionVariable
+  和手动 Fiber 继续走完整保护路径。本轮没有把通用节点替换为未经验证的裸节点。
+- 默认无状态 `SchedulerWaitBackend` 改为共享实例，避免每次短等待重复分配后端控制块；
+  自定义 `WaitBackendFactory` 的插件语义不变。
+- Fiber 竞争只保留有界的 256 次协作重试；重试失败才挂起到 FIFO 队列，避免旧版
+  64 次重试与等待节点慢路径之间反复切换。该预算不是公开语义，后续可通过策略对象
+  调整，但不能改为无界忙等。
+- `Unlock` 仍在队列锁外唤醒，队列引用在唤醒完成前不会释放；快速节点的 `Wake`、
+  `Disarm` 和缓存 `Reset` 仍共享同一 `HybridGate`，没有用性能优化破坏 UAF 防护。
+
+原始动态调度配置（2～16 worker、8 P）下，`go2cpp_high_load_stress --mutex-only`
+连续 30 轮得到 Fiber 混合锁耗时最小/中位数/P95/最大值为
+`9/19/31/51 ms`，同一完整高负载中的线程池 `std::mutex` 基线约 `36～40 ms`；
+30 轮均成功，无此前的 1～2 秒长尾。
+本轮完整 CTest 为 `17/17` 通过，ASan/UBSan 的同步过滤测试通过，Valgrind
+混合锁专项 `ERROR SUMMARY: 0`，definite/indirect/possible leak 均为 0，仍有
+96 bytes 的进程级缓存可达块。Valgrind 下耗时约 715 ms，不用于性能比较。
+
+验证命令：
+
+```sh
+cmake --build build-network -j2
+ctest --test-dir build-network --output-on-failure
+for i in $(seq 1 8); do
+  timeout 45s env LD_LIBRARY_PATH=build-network \
+    ./build-network/go2cpp_high_load_stress --mutex-only
+done
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+UBSAN_OPTIONS=halt_on_error=1 GO2CPP_TEST_FILTER=sync \
+  ./build-network-asan/go2cpp_tests
+valgrind --tool=memcheck --leak-check=full \
+  --show-leak-kinds=definite,indirect,possible --error-exitcode=99 \
+  ./build-network/go2cpp_high_load_stress --mutex-only
+```
+
+这组数据说明混合锁已经跨过线程基线 75% 的要求，但不是“无条件快于
+`std::mutex`”：Fiber 首次批量竞争仍包含上下文切换和调度成本，长临界区或带取消
+的等待会主动进入完整慢路径。调用方仍应把临界区保持短小，不在锁内执行阻塞 IO、日志
+回调或用户插件代码。

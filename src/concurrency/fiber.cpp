@@ -1,0 +1,1502 @@
+#include "go2cpp/fiber.hpp"
+
+#include "go2cpp/detail/context_backend.hpp"
+#include "go2cpp/fiber_local.hpp"
+
+#if !defined(GO2CPP_USE_NATIVE_CONTEXT)
+#include <boost/context/detail/fcontext.hpp>
+#include <boost/context/protected_fixedsize_stack.hpp>
+#include <boost/context/stack_traits.hpp>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#if defined(__has_include)
+#if __has_include(<valgrind/valgrind.h>)
+#include <valgrind/valgrind.h>
+#define GO2CPP_FIBER_HAVE_VALGRIND 1
+#endif
+#endif
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <exception>
+#include <iterator>
+#include <stdexcept>
+#include <limits>
+#include <mutex>
+#include <system_error>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define GO2CPP_FIBER_ASAN 1
+#endif
+#if __has_feature(thread_sanitizer)
+#define GO2CPP_FIBER_TSAN 1
+#endif
+#endif
+
+#if defined(__SANITIZE_ADDRESS__) && !defined(GO2CPP_FIBER_ASAN)
+#define GO2CPP_FIBER_ASAN 1
+#endif
+#if defined(__SANITIZE_THREAD__) && !defined(GO2CPP_FIBER_TSAN)
+#define GO2CPP_FIBER_TSAN 1
+#endif
+
+#if defined(GO2CPP_FIBER_ASAN)
+#include <sanitizer/common_interface_defs.h>
+#endif
+#if defined(GO2CPP_FIBER_TSAN)
+#include <sanitizer/tsan_interface.h>
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define GO2CPP_FIBER_NOINLINE __attribute__((noinline))
+#else
+#define GO2CPP_FIBER_NOINLINE
+#endif
+
+namespace go2cpp {
+namespace {
+
+thread_local Fiber* s_current_fiber = nullptr;
+// 没有运行真实 Fiber 时，每个 OS 线程仍有一个不可 resume 的根上下文。
+// 调度器在 worker 进入/离开 G 时更新这份元数据，Fiber 首次进入时继承它。
+thread_local FiberExecutionBinding s_main_execution{};
+
+// resume_locked 可能沿父链循环多次，任意失败/取消返回都必须恢复进入
+// resume 前的直接调用者，避免 TLS 残留成已完成或错误的 Fiber。
+struct FiberTlsRestore final {
+    /// 函数功能：执行 FiberTlsRestore，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] previous 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    explicit FiberTlsRestore(Fiber* previous) noexcept : m_previous(previous) {}
+    ~FiberTlsRestore() noexcept { s_current_fiber = m_previous; }
+
+    FiberTlsRestore(const FiberTlsRestore&) = delete;
+    FiberTlsRestore& operator=(const FiberTlsRestore&) = delete;
+
+    Fiber* m_previous;
+};
+
+std::atomic<std::uint64_t> s_next_fiber_id{1};
+
+// 受保护栈的映射/解除映射成本远高于一次 Fiber 上下文切换。栈不能在
+// Fiber 仍可恢复时复用，因此只在 Fiber 完成、且其 fcontext 已经失效后
+// 放回缓存。先使用当前 M 的 TLS 缓存，跨 M 销毁时再进入有界全局缓存。
+struct CachedStack {
+    std::size_t size{0};
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+    void* mapping{nullptr};
+    std::size_t mapping_size{0};
+#else
+    boost::context::stack_context context{};
+#endif
+};
+
+struct StackCache {
+    ~StackCache() noexcept {
+        for (auto& entry : entries) {
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+            if (entry.mapping != nullptr) {
+                ::munmap(entry.mapping, entry.mapping_size);
+            }
+#else
+            if (entry.context.sp != nullptr) {
+                boost::context::protected_fixedsize_stack allocator(entry.size);
+                allocator.deallocate(entry.context);
+            }
+#endif
+        }
+    }
+
+    std::vector<CachedStack> entries;
+};
+
+std::mutex s_stack_pool_mutex;
+StackCache s_stack_pool;
+thread_local StackCache s_thread_stack_pool;
+
+// 仅由 Scheduler 内部使用的 FiberBin。一个 M 只访问自己的 TLS 池，
+// 因而不会把仍可能被其他 M resume 的 Fiber 放进共享容器。完成 Fiber
+// 的上下文已经失效，放回这里的对象只会在下一次 AcquireForScheduler
+// 时重新绑定任务；普通用户创建的 Fiber 不经过此路径。
+struct FiberBin {
+    std::vector<std::unique_ptr<Fiber>> entries;
+};
+
+thread_local FiberBin s_thread_fiber_bin;
+constexpr std::size_t kDefaultFiberBinCapacity = 32U;
+// 防止误配把每个 M 变成无界对象保留池。FiberBin 只应缓存短期突发，
+// 更大的容量不会带来线性收益，且会长期占用 Fiber/闭包对象内存。
+constexpr std::size_t kMaxFiberBinCapacity = 4096U;
+
+FiberContextFrame main_context_frame(
+    const FiberExecutionBinding& binding) noexcept {
+    FiberContextFrame frame;
+    frame.main_fiber = true;
+    frame.alive = true;
+    frame.active = true;
+    frame.depth = 0;
+    frame.state = FiberState::Running;
+    frame.last_thread = std::this_thread::get_id();
+    frame.execution = binding;
+    return frame;
+}
+
+// 将 TLS 地址查找放在挂起函数之外。否则编译器可能在跨线程上下文切换后仍
+// 缓存 __errno_location() 的结果。
+GO2CPP_FIBER_NOINLINE int load_errno() noexcept { return errno; }
+
+GO2CPP_FIBER_NOINLINE void store_errno(int value) noexcept { errno = value; }
+
+/// 函数功能：完成 normalize_stack_size 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] requested 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+std::size_t native_page_size() {
+    const int saved_errno = errno;
+    const long raw_page_size = ::sysconf(_SC_PAGESIZE);
+    if (raw_page_size <= 0) {
+        const int error = errno == 0 ? EINVAL : errno;
+        errno = saved_errno;
+        throw std::system_error(error, std::generic_category(),
+                                 "query fiber page size");
+    }
+    errno = saved_errno;
+    const auto page_size = static_cast<unsigned long long>(raw_page_size);
+    if (page_size > std::numeric_limits<std::size_t>::max()) {
+        throw std::length_error("fiber page size is not representable");
+    }
+    return static_cast<std::size_t>(page_size);
+}
+#endif
+
+std::size_t checked_stack_mapping_size(std::size_t usable_size,
+                                       std::size_t page_size) {
+    if (page_size == 0 || usable_size >
+                             std::numeric_limits<std::size_t>::max() -
+                                 page_size) {
+        throw std::length_error("fiber stack mapping size overflow");
+    }
+    return usable_size + page_size;
+}
+
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+std::size_t align_stack_size(std::size_t requested, std::size_t page_size) {
+    const auto remainder = requested % page_size;
+    if (remainder == 0) {
+        return requested;
+    }
+    const auto padding = page_size - remainder;
+    if (requested > std::numeric_limits<std::size_t>::max() - padding) {
+        throw std::length_error("fiber stack size alignment overflow");
+    }
+    return requested + padding;
+}
+#endif
+
+std::size_t normalize_stack_size(std::size_t requested) {
+    if (requested == 0) {
+        requested = Fiber::DefaultStackSize();
+    }
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+    const auto page_size = native_page_size();
+    if (page_size > std::numeric_limits<std::size_t>::max() / 2U) {
+        throw std::length_error("fiber minimum stack size overflow");
+    }
+    const auto minimum = page_size * 2U;
+    const auto maximum_usable =
+        std::numeric_limits<std::size_t>::max() - page_size;
+    const auto at_least_minimum = std::max(requested, minimum);
+    if (at_least_minimum > maximum_usable) {
+        throw std::length_error("fiber stack size is too large");
+    }
+    const auto aligned = align_stack_size(at_least_minimum, page_size);
+    if (aligned > maximum_usable) {
+        throw std::length_error("fiber aligned stack size is too large");
+    }
+    // 提前检查 guard page 加法，确保尚未 resume 的 Fiber 也不会保存
+    // 一个随后会回绕的映射尺寸。
+    (void)checked_stack_mapping_size(aligned, page_size);
+    return aligned;
+#else
+    const auto minimum = boost::context::stack_traits::minimum_size();
+    const auto page_size = boost::context::stack_traits::page_size();
+    const auto maximum = std::numeric_limits<std::size_t>::max();
+    if (page_size == 0 || page_size > maximum / 2U) {
+        throw std::length_error("fiber page size is invalid");
+    }
+    const auto safe_maximum = maximum - 2U * page_size;
+    if (minimum > safe_maximum) {
+        throw std::length_error("fiber minimum stack size is invalid");
+    }
+    std::size_t result = std::min(std::max(requested, minimum), safe_maximum);
+    if (!boost::context::stack_traits::is_unbounded()) {
+        const auto configured_maximum =
+            boost::context::stack_traits::maximum_size();
+        if (configured_maximum < minimum) {
+            throw std::length_error("fiber maximum stack size is invalid");
+        }
+        result = std::min(result, configured_maximum);
+    }
+    return result;
+#endif
+}
+
+struct FiberStack {
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+    /// 函数功能：完成 FiberStack 调用，读取或更新相关运行时状态。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+    /// @param[in] size 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+    explicit FiberStack(std::size_t size)
+        : m_requested_size(size), m_page_size(page_size()), m_mapping_size(
+              checked_mapping_size(m_requested_size, m_page_size)),
+          m_mapping(acquire(m_requested_size, m_page_size, m_mapping_size)) {
+        if (m_mapping == MAP_FAILED) {
+            m_mapping = nullptr;
+            throw std::bad_alloc();
+        }
+#if defined(GO2CPP_FIBER_HAVE_VALGRIND)
+        // 自定义 context 汇编不会自动告诉 Memcheck 新栈边界。注册只在
+        // Memcheck 运行时生效，普通构建会被 Valgrind 客户端宏消除，
+        // 不改变 Fiber 的热路径和栈布局。
+        m_valgrind_stack_id = VALGRIND_STACK_REGISTER(bottom(), stack_pointer());
+#endif
+    }
+
+    ~FiberStack() noexcept {
+#if defined(GO2CPP_FIBER_HAVE_VALGRIND)
+        if (m_valgrind_stack_id != 0U) {
+            VALGRIND_STACK_DEREGISTER(m_valgrind_stack_id);
+            m_valgrind_stack_id = 0U;
+        }
+#endif
+        if (m_mapping != nullptr) {
+            release(m_requested_size, m_page_size, m_mapping_size, m_mapping);
+        }
+    }
+
+    FiberStack(const FiberStack&) = delete;
+    FiberStack& operator=(const FiberStack&) = delete;
+
+    std::size_t usable_size() const noexcept { return m_requested_size; }
+    /// 函数功能：执行 bottom，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    const void* bottom() const noexcept {
+        return static_cast<const char*>(m_mapping) + m_page_size;
+    }
+    /// 函数功能：执行 stack_pointer，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    void* stack_pointer() const noexcept {
+        return static_cast<char*>(m_mapping) + m_mapping_size;
+    }
+
+private:
+    /// 函数功能：执行 page_size，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    static std::size_t page_size() { return native_page_size(); }
+
+    static std::size_t checked_mapping_size(std::size_t usable_size,
+                                             std::size_t page) {
+        return checked_stack_mapping_size(usable_size, page);
+    }
+
+    static void* acquire(std::size_t size, std::size_t page,
+                         std::size_t mapping_size) {
+        for (auto it = s_thread_stack_pool.entries.rbegin();
+             it != s_thread_stack_pool.entries.rend(); ++it) {
+            if (it->size == size && it->mapping != nullptr) {
+                void* mapping = it->mapping;
+                s_thread_stack_pool.entries.erase(std::next(it).base());
+                if (::mprotect(mapping, page, PROT_NONE) != 0) {
+                    ::munmap(mapping, mapping_size);
+                    throw std::system_error(errno, std::generic_category(),
+                                             "mprotect fiber guard page");
+                }
+                return mapping;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
+            for (auto it = s_stack_pool.entries.rbegin();
+                 it != s_stack_pool.entries.rend(); ++it) {
+                if (it->size == size && it->mapping != nullptr) {
+                    void* mapping = it->mapping;
+                    s_stack_pool.entries.erase(std::next(it).base());
+                    if (::mprotect(mapping, page, PROT_NONE) != 0) {
+                        ::munmap(mapping, mapping_size);
+                        throw std::system_error(
+                            errno, std::generic_category(),
+                            "mprotect fiber guard page");
+                    }
+                    return mapping;
+                }
+            }
+        }
+        void* mapping = ::mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED) {
+            return MAP_FAILED;
+        }
+        if (::mprotect(mapping, page, PROT_NONE) != 0) {
+            ::munmap(mapping, mapping_size);
+            throw std::system_error(errno, std::generic_category(),
+                                     "mprotect fiber guard page");
+        }
+        return mapping;
+    }
+
+    static void release(std::size_t size, std::size_t page,
+                        std::size_t mapping_size, void* mapping) noexcept {
+        (void)page;
+        try {
+            if (s_thread_stack_pool.entries.size() < 8U) {
+                s_thread_stack_pool.entries.push_back(
+                    CachedStack{size, mapping, mapping_size});
+                return;
+            }
+            std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
+            if (s_stack_pool.entries.size() < 128U) {
+                s_stack_pool.entries.push_back(
+                    CachedStack{size, mapping, mapping_size});
+                return;
+            }
+        } catch (...) {
+        }
+        ::munmap(mapping, mapping_size);
+    }
+
+    std::size_t m_requested_size;
+    std::size_t m_page_size;
+    std::size_t m_mapping_size;
+    void* m_mapping;
+#if defined(GO2CPP_FIBER_HAVE_VALGRIND)
+    unsigned m_valgrind_stack_id{0U};
+#endif
+#else
+    /// 函数功能：完成 FiberStack 调用，读取或更新相关运行时状态。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+    /// @param[in] size 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+    explicit FiberStack(std::size_t size)
+        : m_requested_size(size),
+          m_allocator(size),
+          m_context(acquire(m_allocator, m_requested_size)) {}
+
+    ~FiberStack() noexcept { release(m_allocator, m_requested_size, m_context); }
+
+    FiberStack(const FiberStack&) = delete;
+    FiberStack& operator=(const FiberStack&) = delete;
+
+    /// 函数功能：执行 usable_size，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    std::size_t usable_size() const noexcept {
+        return m_context.size - boost::context::stack_traits::page_size();
+    }
+
+    /// 函数功能：执行 bottom，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    const void* bottom() const noexcept {
+        return static_cast<const char*>(m_context.sp) - usable_size();
+    }
+
+    void* stack_pointer() const noexcept { return m_context.sp; }
+
+private:
+    static boost::context::stack_context acquire(
+        boost::context::protected_fixedsize_stack& allocator,
+        std::size_t size) {
+        for (auto it = s_thread_stack_pool.entries.rbegin();
+             it != s_thread_stack_pool.entries.rend(); ++it) {
+            if (it->size == size) {
+                const auto context = it->context;
+                s_thread_stack_pool.entries.erase(std::next(it).base());
+                return context;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
+            for (auto it = s_stack_pool.entries.rbegin();
+                 it != s_stack_pool.entries.rend(); ++it) {
+                if (it->size == size) {
+                    const auto context = it->context;
+                    s_stack_pool.entries.erase(std::next(it).base());
+                    return context;
+                }
+            }
+        }
+        return allocator.allocate();
+    }
+
+    static void release(boost::context::protected_fixedsize_stack& allocator,
+                        std::size_t size,
+                        boost::context::stack_context& context) noexcept {
+        if (context.sp == nullptr) {
+            return;
+        }
+        try {
+            if (s_thread_stack_pool.entries.size() < 8U) {
+                s_thread_stack_pool.entries.push_back(CachedStack{size, context});
+                context = {};
+                return;
+            }
+            std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
+            if (s_stack_pool.entries.size() < 128U) {
+                s_stack_pool.entries.push_back(CachedStack{size, context});
+                context = {};
+                return;
+            }
+        } catch (...) {
+            // 缓存只用于性能优化；容量不足或分配失败时回收到系统。
+        }
+        allocator.deallocate(context);
+        context = {};
+    }
+
+    std::size_t m_requested_size;
+    boost::context::protected_fixedsize_stack m_allocator;
+    boost::context::stack_context m_context;
+#endif
+};
+
+// 父链只保存这份独立元数据，不保存父 Fiber 栈或 owner 的所有权。子 Fiber
+// 持有父记录，因此父对象结束后仍可生成一致的墓碑帧、传播取消状态；
+// 真正的 fcontext 恢复仍要求父 Fiber 对象存活。错误生命周期会进入 Failed
+// 放弃路径，不能把已经失效的父栈当作可恢复上下文。
+struct FiberRecord {
+    /// 函数功能：执行 FiberRecord，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] fiber_id 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    explicit FiberRecord(std::uint64_t fiber_id) : id(fiber_id) {}
+
+    const std::uint64_t id;
+    std::shared_ptr<FiberRecord> parent;
+    std::atomic<bool> alive{true};
+    std::atomic<FiberState> state{FiberState::Ready};
+    std::atomic<SuspendReason> reason{SuspendReason::None};
+    std::atomic<bool> cancellation_requested{false};
+    mutable std::mutex mutex;
+    std::uint64_t active_parent_id{0};
+    std::size_t depth{0};
+    std::thread::id last_thread{};
+    FiberExecutionBinding execution{};
+};
+
+}  // namespace
+
+struct Fiber::Impl {
+    /// 函数功能：执行 Impl，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] owner 调用方传入的参数，具体约束以头文件声明为准。
+    /// @param[in] function 调用方传入的参数，具体约束以头文件声明为准。
+    /// @param[in] stack_size 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    explicit Impl(Fiber* owner, Function function, std::size_t stack_size)
+        : m_owner(owner),
+          m_id(s_next_fiber_id.fetch_add(1, std::memory_order_relaxed)),
+          m_record(std::make_shared<FiberRecord>(m_id)),
+          m_function(std::move(function)),
+          m_stack_size(normalize_stack_size(stack_size)) {
+#if defined(GO2CPP_FIBER_TSAN)
+        m_tsan_fiber = __tsan_create_fiber(0);
+#endif
+    }
+
+    /// 函数功能：执行 reset_for_scheduler，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] function 调用方传入的参数，具体约束以头文件声明为准。
+    /// @param[in] stack_size 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    void reset_for_scheduler(Function function, std::size_t stack_size) {
+        // 只有 entry 已经返回 caller，且 resume_locked 已将 m_context 和
+        // m_stack 清空后才能重绑定。Scheduler 只在 terminal Fiber 上调用
+        // 该方法；若后端约束被破坏，宁可抛出也不能复用活动栈。
+        const auto state = m_record->state.load(std::memory_order_acquire);
+        if ((state != FiberState::Completed && state != FiberState::Failed) ||
+            m_context != nullptr || m_stack != nullptr ||
+            m_resume_claim.load(std::memory_order_acquire)) {
+            throw std::logic_error("cannot rebind an active Fiber");
+        }
+
+        const auto normalized_stack_size = normalize_stack_size(stack_size);
+        auto next_record = std::make_shared<FiberRecord>(
+            s_next_fiber_id.fetch_add(1, std::memory_order_relaxed));
+
+        m_function = std::move(function);
+        m_id = next_record->id;
+        m_record = std::move(next_record);
+        m_stack_size = normalized_stack_size;
+        m_caller = nullptr;
+        m_scheduler_propagate.store(false, std::memory_order_relaxed);
+        m_scheduler_parent_bound = false;
+        m_resume_claim.store(false, std::memory_order_relaxed);
+        m_last_resume_thread_hash.store(0, std::memory_order_relaxed);
+        m_parent = nullptr;
+        m_parent_bound = false;
+        m_saved_errno = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_failure_mutex);
+            m_failure = {};
+        }
+#if defined(GO2CPP_FIBER_TSAN)
+        if (m_tsan_fiber != nullptr) {
+            __tsan_destroy_fiber(m_tsan_fiber);
+        }
+        m_tsan_fiber = __tsan_create_fiber(0);
+        m_tsan_caller = nullptr;
+#endif
+#if defined(GO2CPP_FIBER_ASAN)
+        m_asan_fake_stack = nullptr;
+        m_asan_caller_bottom = nullptr;
+        m_asan_caller_size = 0;
+#endif
+    }
+
+    /// 函数功能：执行 abandon_suspended，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] message 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    void abandon_suspended(const char* message) noexcept {
+        // 挂起的 fcontext 没有正在执行的指令，释放其栈是安全的；但栈上
+        // 的 C++ 局部变量无法再展开。因此只能显式标记 Failed，并清理
+        // FiberLocal 值，不能伪造 Completed。这个路径只允许在已经取得
+        // m_resume_claim 后执行，避免与另一个 resume 并发访问上下文。
+        try {
+            const auto error = std::make_exception_ptr(std::runtime_error(message));
+            std::lock_guard<std::mutex> lock(m_failure_mutex);
+            if (!m_failure) {
+                m_failure = error;
+            }
+        } catch (...) {
+            // 诊断对象分配失败时仍必须完成上下文隔离。
+        }
+        m_function = {};
+        m_caller = nullptr;
+        m_context = nullptr;
+        m_record->reason.store(SuspendReason::None, std::memory_order_release);
+        m_scheduler_propagate.store(false, std::memory_order_release);
+        m_record->state.store(FiberState::Failed, std::memory_order_release);
+        fiber_local::detail::Cleanup(m_owner);
+    }
+
+    ~Impl() noexcept {
+        // 不能在 Fiber 自身栈上销毁自身；此约束保留为明确的 API 前置条件，
+        // 否则没有任何安全位置可以释放当前正在使用的栈。
+        if (s_current_fiber == m_owner) {
+            std::terminate();
+        }
+
+        // 先取得执行 claim，再观察终态。entry() 会先发布 Completed/Failed，
+        // 后由 resume() 释放 claim；若只检查 state，析构可能在这个窗口释放
+        // fcontext/保护栈，导致 resume_locked() 继续访问已释放对象。
+        bool expected_claim = false;
+        while (!m_resume_claim.compare_exchange_weak(
+            expected_claim, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+            expected_claim = false;
+            std::this_thread::yield();
+        }
+
+        // 先发布墓碑，再请求协作式收尾。父链记录不会悬空；析构线程
+        // 只有在能够回到原父 Fiber 的情况下才允许恢复挂起栈。
+        m_record->alive.store(false, std::memory_order_release);
+        m_record->cancellation_requested.store(true,
+                                                std::memory_order_release);
+
+        // Ready Fiber 尚未进入用户栈，没有需要展开的局部变量；可以在
+        // 任意调用方安全跳过主体。
+        if (m_record->state.load(std::memory_order_acquire) ==
+            FiberState::Ready) {
+            m_function = {};
+            m_record->reason.store(SuspendReason::None,
+                                   std::memory_order_release);
+            m_record->state.store(FiberState::Completed,
+                                  std::memory_order_release);
+        }
+
+        while (true) {
+            const FiberState state =
+                m_record->state.load(std::memory_order_acquire);
+            if (state == FiberState::Completed || state == FiberState::Failed) {
+                break;
+            }
+            if (state == FiberState::Running) {
+                // 取得 claim 后不应再观察到 Running；该分支只保护未来
+                // 后端扩展，不能释放仍在执行的栈。
+                std::terminate();
+            }
+            if (state != FiberState::Suspended) {
+                abandon_suspended("Fiber destroyed in an invalid state");
+                break;
+            }
+
+            const bool resumed = resume_locked(true);
+            if (!resumed) {
+                // 当前析构调用方不是固定父 Fiber，无法安全跳转到挂起栈。
+                // 记录失败并释放上下文，而不是让进程被 terminate。
+                abandon_suspended("Fiber parent is not resumable during destruction");
+                break;
+            }
+        }
+
+        const auto final_state = m_record->state.load(std::memory_order_acquire);
+        if (final_state == FiberState::Ready ||
+            final_state == FiberState::Suspended ||
+            final_state == FiberState::Running) {
+            // 取得独占 claim 后理论上不可达；保守地 fail-fast，避免 UAF。
+            std::terminate();
+        }
+#if defined(GO2CPP_FIBER_TSAN)
+        __tsan_destroy_fiber(m_tsan_fiber);
+#endif
+        // m_resume_claim 故意保持为 true，Impl 即将释放，任何后续 resume
+        // 都违反 owner 生命周期契约；在本析构期间不会再有并发上下文访问。
+    }
+
+    static void entry(
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+        detail::Transfer transfer
+#else
+        boost::context::detail::transfer_t transfer
+#endif
+    ) noexcept {
+        auto* const self = static_cast<Impl*>(const_cast<void*>(transfer.data));
+        self->finish_switch_to_fiber();
+        self->m_caller = transfer.context;
+        store_errno(self->m_saved_errno);
+
+        FiberState terminal_state = FiberState::Completed;
+        try {
+            if (!self->m_record->cancellation_requested.load(std::memory_order_acquire) &&
+                self->m_function) {
+                self->m_function();
+            }
+        } catch (...) {
+            // 这里只隔离用户代码意外抛出的异常。Fiber 挂起、取消和清理流程
+            // 从不使用异常。
+            std::lock_guard<std::mutex> lock(self->m_failure_mutex);
+            self->m_failure = std::current_exception();
+            terminal_state = FiberState::Failed;
+        }
+        self->m_function = {};
+        // Fiber-local 值属于逻辑 G，而不是 worker M。主体栈展开后、把控制权
+        // 交回调用者前，执行这些值的析构函数。
+        fiber_local::detail::Cleanup(self->m_owner);
+        self->m_record->reason.store(SuspendReason::None, std::memory_order_release);
+        self->m_record->state.store(terminal_state, std::memory_order_release);
+        self->m_saved_errno = load_errno();
+
+#if defined(GO2CPP_FIBER_ASAN)
+        // 已完成的执行栈不会再次恢复；在调用者释放受保护分配前先丢弃 fake
+        // stack。
+        __sanitizer_start_switch_fiber(nullptr, self->m_asan_caller_bottom,
+                                      self->m_asan_caller_size);
+#endif
+#if defined(GO2CPP_FIBER_TSAN)
+        __tsan_switch_to_fiber(self->m_tsan_caller, 0);
+#endif
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+        detail::JumpContext(self->m_caller, self);
+#else
+        boost::context::detail::jump_fcontext(self->m_caller, self);
+#endif
+        std::terminate();
+    }
+
+    /// 函数功能：执行 resume，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    bool resume() noexcept {
+        bool expected = false;
+        if (!m_resume_claim.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return false;
+        }
+        const bool result = resume_locked(true);
+        m_resume_claim.store(false, std::memory_order_release);
+        return result;
+    }
+
+    /// 函数功能：执行 resume_from_scheduler，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    bool resume_from_scheduler() noexcept {
+        bool expected = false;
+        if (!m_resume_claim.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return false;
+        }
+        if (!m_scheduler_parent_bound) {
+            if (!bind_caller(s_current_fiber)) {
+                m_resume_claim.store(false, std::memory_order_release);
+                return false;
+            }
+            m_scheduler_parent_bound = true;
+        }
+        // 调度器已经通过 Task 的 execution claim 串行化恢复，并在迁移
+        // 到新 M 时显式发布执行绑定；因此恢复热路径不再重复更新
+        // FiberRecord 的 last_thread 元数据。
+        const bool result = resume_locked(false, true);
+        m_resume_claim.store(false, std::memory_order_release);
+        return result;
+    }
+
+    // 首次进入时固定直接父 Fiber；之后只能由同一个父级恢复。
+    // 父链的可观测信息放在共享记录中，真正恢复仍验证父对象存活。
+    // 先复制父记录，再写入本 Fiber，避免同时锁两个 Fiber 的记录而形成
+    // 反向锁序；这样错误的并发 resume 会返回失败而不是制造死锁。
+    /// 函数功能：完成 bind_caller 调用，读取或更新相关运行时状态。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+    /// @param[in] caller 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+    bool bind_caller(Fiber* caller) noexcept {
+        if (caller == m_owner) {
+            return false;
+        }
+
+        std::shared_ptr<FiberRecord> parent_record;
+        {
+            std::lock_guard<std::mutex> lock(m_metadata_mutex);
+            if (!m_parent_bound) {
+                m_parent = caller;
+                m_parent_bound = true;
+            } else if (m_parent != caller) {
+                return false;
+            }
+            parent_record = caller == nullptr ? nullptr : caller->m_impl->m_record;
+        }
+
+        std::size_t depth = 1U;
+        std::uint64_t parent_id = 0;
+        FiberExecutionBinding execution{};
+        if (parent_record != nullptr) {
+            std::lock_guard<std::mutex> parent_lock(parent_record->mutex);
+            if (!parent_record->alive.load(std::memory_order_acquire)) {
+                return false;
+            }
+            depth = parent_record->depth + 1U;
+            parent_id = parent_record->id;
+            execution = parent_record->execution;
+        } else {
+            std::lock_guard<std::mutex> record_lock(m_record->mutex);
+            execution = m_record->execution;
+            if (!execution.managed) {
+                execution = s_main_execution;
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(m_metadata_mutex);
+        if (m_parent != caller) {
+            return false;
+        }
+        std::lock_guard<std::mutex> record_lock(m_record->mutex);
+        m_record->parent = std::move(parent_record);
+        m_record->depth = depth;
+        m_record->active_parent_id = parent_id;
+        m_record->execution = execution;
+        m_record->last_thread = std::this_thread::get_id();
+        return true;
+    }
+
+    /// 函数功能：执行 resume_locked，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] validate_caller 调用方传入的参数，具体约束以头文件声明为准。
+    /// @param[in] scheduler_fast 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    bool resume_locked(bool validate_caller, bool scheduler_fast = false) noexcept {
+        if (validate_caller && !bind_caller(s_current_fiber)) {
+            return false;
+        }
+        // Scheduler 级挂起可能在本函数内部沿父链循环多次。每一轮跳转
+        // 都暂时把 TLS 当前 Fiber 设为本对象，但完成后必须恢复最初的
+        // 调用者；否则父函数在同一栈帧里创建下一个子 Fiber 时，会把
+        // 已完成的前一个子 Fiber 错当成新子 Fiber 的父级。
+        Fiber* const original_caller = s_current_fiber;
+        const FiberTlsRestore tls_restore(original_caller);
+        for (;;) {
+            const FiberState current = m_record->state.load(std::memory_order_acquire);
+            if (current != FiberState::Ready && current != FiberState::Suspended) {
+                return false;
+            }
+            if (current == FiberState::Ready && m_context == nullptr) {
+                if (!initialize_context()) {
+                    return false;
+                }
+            }
+            if (m_context == nullptr) {
+                return false;
+            }
+            m_record->state.store(FiberState::Running, std::memory_order_release);
+            m_record->reason.store(SuspendReason::None, std::memory_order_release);
+            m_scheduler_propagate.store(false, std::memory_order_release);
+
+            const int caller_errno = load_errno();
+            Fiber* const previous_fiber = s_current_fiber;
+            s_current_fiber = m_owner;
+            if (!scheduler_fast) {
+                const auto thread_hash = std::hash<std::thread::id>{}(
+                    std::this_thread::get_id());
+                if (m_last_resume_thread_hash.load(std::memory_order_relaxed) !=
+                    thread_hash) {
+                    std::lock_guard<std::mutex> lock(m_metadata_mutex);
+                    m_record->last_thread = std::this_thread::get_id();
+                    m_last_resume_thread_hash.store(thread_hash,
+                                                    std::memory_order_relaxed);
+                }
+            }
+            store_errno(m_saved_errno);
+
+            #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+            detail::Transfer transfer{};
+            #else
+            boost::context::detail::transfer_t transfer{};
+            #endif
+            {
+#if defined(GO2CPP_FIBER_ASAN)
+                void* caller_fake_stack = nullptr;
+                __sanitizer_start_switch_fiber(&caller_fake_stack,
+                                              m_stack->bottom(),
+                                              m_stack->usable_size());
+#endif
+#if defined(GO2CPP_FIBER_TSAN)
+                m_tsan_caller = __tsan_get_current_fiber();
+                __tsan_switch_to_fiber(m_tsan_fiber, 0);
+#endif
+                #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+                transfer = detail::JumpContext(m_context, this);
+                #else
+                transfer = boost::context::detail::jump_fcontext(m_context, this);
+                #endif
+#if defined(GO2CPP_FIBER_ASAN)
+                __sanitizer_finish_switch_fiber(caller_fake_stack, nullptr,
+                                                nullptr);
+#endif
+                const auto next = m_record->state.load(std::memory_order_acquire);
+                m_context = next == FiberState::Completed ||
+                                    next == FiberState::Failed
+                                ? nullptr
+                                : transfer.context;
+                if (m_context == nullptr) {
+                    // entry() 返回调用者前已经展开全部用户栈帧。现在可以立即
+                    // 把受保护栈放回线程级或全局缓存，避免突发负载中每个排队
+                    // Fiber 都重新建立一次映射。
+                    m_stack.reset();
+                }
+            }
+
+            // jump 返回有两种语义：如果当前 Fiber 仍在 Running，说明
+            // 是它在自己的栈上恢复了嵌套子 Fiber，执行流仍属于当前
+            // owner；只有挂起/完成/失败并回到 caller 时，才恢复旧 TLS。
+            // 无条件恢复 previous_fiber 会让父 Fiber 后续创建的子 Fiber
+            // 错绑到根上下文，破坏父链并可能触发 fail-fast。
+            const FiberState returned_state =
+                m_record->state.load(std::memory_order_acquire);
+            s_current_fiber = returned_state == FiberState::Running
+                                  ? m_owner
+                                  : previous_fiber;
+            store_errno(caller_errno);
+
+            // 调度器挂起沿直接父链传播；普通 Suspend 不进入这个分支，
+            // 因而 fiber2 的普通 go_back 仍然只回到 fiber1。
+            if (m_record->state.load(std::memory_order_acquire) ==
+                    FiberState::Suspended &&
+                m_scheduler_propagate.load(std::memory_order_acquire) &&
+                m_parent != nullptr) {
+                const SuspendReason reason =
+                    m_record->reason.load(std::memory_order_acquire);
+                const auto parent_record = m_record->parent;
+                if (!parent_record ||
+                    !parent_record->alive.load(std::memory_order_acquire) ||
+                    m_parent == nullptr ||
+                    !m_parent->m_impl->suspend(reason, true)) {
+                    // 不能把仍挂起的子栈当作完成任务交给调度器。父级
+                    // 已失效时将当前 Fiber 标记失败并清理其局部值，让
+                    // Scheduler 走普通失败收尾；不再从这里 terminate。
+                    abandon_suspended("nested Fiber parent is not resumable");
+                    s_current_fiber = original_caller;
+                    return false;
+                }
+                s_current_fiber = m_owner;
+                continue;
+            }
+            s_current_fiber = original_caller;
+            return true;
+        }
+    }
+
+    /// 函数功能：执行 suspend，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] reason 调用方传入的参数，具体约束以头文件声明为准。
+    /// @param[in] propagate 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    bool suspend(SuspendReason reason, bool propagate) noexcept {
+        if (reason == SuspendReason::None ||
+            m_record->state.load(std::memory_order_acquire) != FiberState::Running) {
+            return false;
+        }
+        m_saved_errno = load_errno();
+        m_record->reason.store(reason, std::memory_order_release);
+        m_scheduler_propagate.store(propagate, std::memory_order_release);
+        m_record->state.store(FiberState::Suspended, std::memory_order_release);
+
+#if defined(GO2CPP_FIBER_ASAN)
+        __sanitizer_start_switch_fiber(&m_asan_fake_stack, m_asan_caller_bottom,
+                                      m_asan_caller_size);
+#endif
+#if defined(GO2CPP_FIBER_TSAN)
+        __tsan_switch_to_fiber(m_tsan_caller, 0);
+#endif
+            #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+            const detail::Transfer transfer = detail::JumpContext(m_caller, this);
+            #else
+            const boost::context::detail::transfer_t transfer =
+                boost::context::detail::jump_fcontext(m_caller, this);
+            #endif
+        finish_switch_to_fiber();
+        m_caller = transfer.context;
+        store_errno(m_saved_errno);
+        m_record->reason.store(SuspendReason::None, std::memory_order_release);
+        m_scheduler_propagate.store(false, std::memory_order_release);
+        m_record->state.store(FiberState::Running, std::memory_order_release);
+        s_current_fiber = m_owner;
+        return true;
+    }
+
+
+    /// 函数功能：执行 finish_switch_to_fiber，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    void finish_switch_to_fiber() noexcept {
+#if defined(GO2CPP_FIBER_ASAN)
+        // 迁移后这些输出描述的是当前恢复 Fiber 的新 OS 线程，而不是上次
+        // 挂起该 Fiber 的线程。
+        __sanitizer_finish_switch_fiber(m_asan_fake_stack, &m_asan_caller_bottom,
+                                       &m_asan_caller_size);
+#endif
+    }
+
+    /// 函数功能：执行 initialize_context，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    bool initialize_context() noexcept {
+        try {
+            m_stack = std::make_unique<FiberStack>(m_stack_size);
+            #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+            m_context = detail::MakeContext(const_cast<void*>(m_stack->bottom()),
+                                            m_stack->usable_size(), &Impl::entry);
+            #else
+            m_context = boost::context::detail::make_fcontext(
+                m_stack->stack_pointer(), m_stack->usable_size(), &Impl::entry);
+            #endif
+            return true;
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(m_failure_mutex);
+            m_failure = std::current_exception();
+            m_record->state.store(FiberState::Failed, std::memory_order_release);
+            return false;
+        }
+    }
+
+    Fiber* m_owner;
+    std::uint64_t m_id;
+    std::shared_ptr<FiberRecord> m_record;
+    Function m_function;
+    std::size_t m_stack_size;
+    std::unique_ptr<FiberStack> m_stack;
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+    detail::Context m_context{nullptr};
+    detail::Context m_caller{nullptr};
+#else
+    boost::context::detail::fcontext_t m_context{nullptr};
+    boost::context::detail::fcontext_t m_caller{nullptr};
+#endif
+    std::atomic<bool> m_scheduler_propagate{false};
+    bool m_scheduler_parent_bound{false};
+    std::atomic<bool> m_resume_claim{false};
+    mutable std::mutex m_metadata_mutex;
+    std::atomic<std::size_t> m_last_resume_thread_hash{0};
+    Fiber* m_parent{nullptr};
+    bool m_parent_bound{false};
+    mutable std::mutex m_failure_mutex;
+    std::exception_ptr m_failure;
+    int m_saved_errno{0};
+#if defined(GO2CPP_FIBER_ASAN)
+    void* m_asan_fake_stack{nullptr};
+    const void* m_asan_caller_bottom{nullptr};
+    std::size_t m_asan_caller_size{0};
+#endif
+#if defined(GO2CPP_FIBER_TSAN)
+    void* m_tsan_fiber{nullptr};
+    void* m_tsan_caller{nullptr};
+#endif
+};
+
+/// 函数功能：完成 Fiber 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] function 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] stack_size 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+Fiber::Fiber(Function function, std::size_t stack_size)
+    : m_impl(std::make_unique<Impl>(this, std::move(function), stack_size)) {}
+
+std::unique_ptr<Fiber> Fiber::AcquireForScheduler(
+    Function function, std::size_t stack_size, std::size_t bin_capacity) {
+    const auto capacity = std::min(
+        kMaxFiberBinCapacity,
+        bin_capacity == 0 ? kDefaultFiberBinCapacity : bin_capacity);
+    if (capacity != 0 && !s_thread_fiber_bin.entries.empty()) {
+        auto fiber = std::move(s_thread_fiber_bin.entries.back());
+        s_thread_fiber_bin.entries.pop_back();
+        try {
+            fiber->m_impl->reset_for_scheduler(std::move(function), stack_size);
+            return fiber;
+        } catch (...) {
+            // 重绑定失败时销毁该对象并走普通构造路径。失败不会把
+            // 一个状态不明的 Fiber 再次放回池中。
+        }
+    }
+    return std::make_unique<Fiber>(std::move(function), stack_size);
+}
+
+void Fiber::RecycleForScheduler(std::unique_ptr<Fiber> fiber,
+                                std::size_t bin_capacity) noexcept {
+    if (!fiber) {
+        return;
+    }
+    const auto capacity = std::min(
+        kMaxFiberBinCapacity,
+        bin_capacity == 0 ? kDefaultFiberBinCapacity : bin_capacity);
+    const auto state = fiber->state();
+    if (capacity == 0 ||
+        (state != FiberState::Completed && state != FiberState::Failed) ||
+        s_current_fiber == fiber.get() ||
+        // 嵌套 Fiber 的子记录会持有 parent shared_ptr。只要仍有外部
+        // 持有者，就不能把这个 Fiber 的父记录替换成下一项任务，避免
+        // 子 Fiber 之后恢复时观察到被复用的父对象。
+        !fiber->m_impl || fiber->m_impl->m_record.use_count() != 1) {
+        return;
+    }
+    try {
+        if (s_thread_fiber_bin.entries.size() < capacity) {
+            s_thread_fiber_bin.entries.emplace_back(std::move(fiber));
+        }
+    } catch (...) {
+        // FiberBin 只是分配优化；容量不足或 OOM 时由 unique_ptr 正常
+        // 销毁对象，FiberStack 仍会回收到原有栈缓存。
+    }
+}
+
+Fiber::~Fiber() = default;
+
+bool Fiber::resume() noexcept { return m_impl->resume(); }
+
+/// 函数功能：完成 resume_from_scheduler 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Fiber::resume_from_scheduler() noexcept {
+    return m_impl->resume_from_scheduler();
+}
+
+/// 函数功能：完成 resume_result 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+FiberResumeResult Fiber::resume_result() noexcept {
+    FiberResumeResult result;
+    result.accepted = resume();
+    result.state = state();
+    result.failure = failure();
+    try {
+        result.context_snapshot = context_snapshot();
+    } catch (...) {
+        // 快照只是诊断信息，不能因为 OOM 让 noexcept API terminate；
+        // state/failure 仍然有效，调用方可稍后再次请求快照。
+        result.context_snapshot.clear();
+    }
+    return result;
+}
+
+/// 函数功能：完成 Suspend 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] reason 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Fiber::Suspend(SuspendReason reason) noexcept {
+    Fiber* const current = Current();
+    return current != nullptr && current->m_impl->suspend(reason, false);
+}
+
+/// 函数功能：完成 SuspendForScheduler 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] reason 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Fiber::SuspendForScheduler(SuspendReason reason) noexcept {
+    Fiber* const current = Current();
+    return current != nullptr && current->m_impl->suspend(reason, true);
+}
+
+
+GO2CPP_FIBER_NOINLINE Fiber* Fiber::Current() noexcept { return s_current_fiber; }
+
+/// 函数功能：完成 CancellationRequested 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Fiber::CancellationRequested() noexcept {
+    Fiber* current = Current();
+    if (current == nullptr) {
+        return false;
+    }
+    std::shared_ptr<FiberRecord> record = current->m_impl->m_record;
+    while (record != nullptr) {
+        if (record->cancellation_requested.load(std::memory_order_acquire)) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(record->mutex);
+        record = record->parent;
+    }
+    return false;
+}
+
+/// 函数功能：完成 CurrentContext 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+FiberContextFrame Fiber::CurrentContext() {
+    if (Fiber* const current = Current()) {
+        return current->debug_info();
+    }
+    return main_context_frame(s_main_execution);
+}
+
+/// 函数功能：完成 CurrentContextSnapshot 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+FiberContextSnapshot Fiber::CurrentContextSnapshot() {
+    if (Fiber* const current = Current()) {
+        return current->context_snapshot();
+    }
+    return {main_context_frame(s_main_execution)};
+}
+
+/// 函数功能：完成 BindCurrentExecution 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] binding 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Fiber::BindCurrentExecution(FiberExecutionBinding binding) noexcept {
+    s_main_execution = binding;
+}
+
+/// 函数功能：完成 RequestCancellation 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Fiber::RequestCancellation() noexcept {
+    if (m_impl) {
+        m_impl->m_record->cancellation_requested.store(true, std::memory_order_release);
+    }
+}
+
+/// 函数功能：完成 state 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+FiberState Fiber::state() const noexcept {
+    return m_impl->m_record->state.load(std::memory_order_acquire);
+}
+
+/// 函数功能：完成 suspend_reason 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+SuspendReason Fiber::suspend_reason() const noexcept {
+    return m_impl->m_record->reason.load(std::memory_order_acquire);
+}
+
+/// 函数功能：完成 failure 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::exception_ptr Fiber::failure() const {
+    std::lock_guard<std::mutex> lock(m_impl->m_failure_mutex);
+    return m_impl->m_failure;
+}
+
+std::size_t Fiber::stack_size() const noexcept { return m_impl->m_stack_size; }
+
+std::uint64_t Fiber::id() const noexcept { return m_impl->m_id; }
+
+/// 函数功能：完成 debug_info 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+FiberContextFrame Fiber::debug_info() const {
+    FiberContextFrame frame;
+    const auto record = m_impl->m_record;
+    std::lock_guard<std::mutex> lock(record->mutex);
+    frame.id = record->id;
+    frame.parent_id = record->parent == nullptr ? 0 : record->parent->id;
+    frame.active_parent_id = record->active_parent_id;
+    frame.depth = record->depth;
+    frame.alive = record->alive.load(std::memory_order_acquire);
+    frame.active = Current() == this;
+    frame.cancellation_requested =
+        record->cancellation_requested.load(std::memory_order_acquire);
+    frame.state = record->state.load(std::memory_order_acquire);
+    frame.suspend_reason = record->reason.load(std::memory_order_acquire);
+    frame.last_thread = record->last_thread;
+    frame.execution = record->execution;
+    return frame;
+}
+
+/// 函数功能：完成 context_snapshot 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+FiberContextSnapshot Fiber::context_snapshot() const {
+    FiberContextSnapshot result;
+    std::shared_ptr<FiberRecord> cursor = m_impl->m_record;
+    FiberExecutionBinding root_binding{};
+    const auto current_id = m_impl->m_record->id;
+    while (cursor != nullptr) {
+        FiberContextFrame frame;
+        std::shared_ptr<FiberRecord> parent;
+        {
+            std::lock_guard<std::mutex> lock(cursor->mutex);
+            frame.id = cursor->id;
+            frame.parent_id = cursor->parent == nullptr ? 0 : cursor->parent->id;
+            frame.active_parent_id = cursor->active_parent_id;
+            frame.depth = cursor->depth;
+            frame.alive = cursor->alive.load(std::memory_order_acquire);
+            frame.active = cursor->id == current_id && Current() == this;
+            frame.cancellation_requested =
+                cursor->cancellation_requested.load(std::memory_order_acquire);
+            frame.state = cursor->state.load(std::memory_order_acquire);
+            frame.suspend_reason = cursor->reason.load(std::memory_order_acquire);
+            frame.last_thread = cursor->last_thread;
+            frame.execution = cursor->execution;
+            if (cursor->parent == nullptr) {
+                root_binding = cursor->execution;
+            }
+            parent = cursor->parent;
+        }
+        result.push_back(std::move(frame));
+        cursor = std::move(parent);
+    }
+    std::reverse(result.begin(), result.end());
+    // 这是从 main_fiber 进入目标 Fiber 后的调用链快照；main_fiber
+    // 只是根帧，不应与链中当前/目标 Fiber 同时标记 active。没有
+    // Fiber 时 CurrentContextSnapshot() 仍单独返回 active 的 main_fiber。
+    auto main_frame = main_context_frame(root_binding);
+    main_frame.active = false;
+    result.insert(result.begin(), std::move(main_frame));
+    return result;
+}
+
+/// 函数功能：完成 execution_binding 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+FiberExecutionBinding Fiber::execution_binding() const noexcept {
+    std::lock_guard<std::mutex> lock(m_impl->m_record->mutex);
+    return m_impl->m_record->execution;
+}
+
+/// 函数功能：完成 bind_execution 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] binding 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Fiber::bind_execution(FiberExecutionBinding binding) noexcept {
+    std::lock_guard<std::mutex> lock(m_impl->m_record->mutex);
+    m_impl->m_record->execution = binding;
+    m_impl->m_record->last_thread = std::this_thread::get_id();
+}
+
+/// 函数功能：完成 nesting_depth 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::size_t Fiber::nesting_depth() const noexcept {
+    std::lock_guard<std::mutex> lock(m_impl->m_record->mutex);
+    return m_impl->m_record->depth;
+}
+
+}  // namespace go2cpp

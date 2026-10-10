@@ -17,31 +17,41 @@ if (GO2CPP_BUILD_HOOK AND NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "The hook requires shared runtime modules to keep one TLS/FD registry; use GO2CPP_BUILD_HOOK=OFF for a static runtime")
 endif()
 
-add_library(go2cpp_error ${CMAKE_CURRENT_SOURCE_DIR}/src/error.cpp)
-add_library(go2cpp_control_flow ${CMAKE_CURRENT_SOURCE_DIR}/src/control_flow.cpp)
-add_library(go2cpp_context ${CMAKE_CURRENT_SOURCE_DIR}/src/context.cpp)
-add_library(go2cpp_channel ${CMAKE_CURRENT_SOURCE_DIR}/src/channel.cpp)
+add_library(go2cpp_error ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/error.cpp)
+add_library(go2cpp_control_flow ${CMAKE_CURRENT_SOURCE_DIR}/src/tools/control_flow.cpp)
+add_library(go2cpp_context ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/context.cpp)
+add_library(go2cpp_channel ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/channel.cpp)
 add_library(go2cpp_scheduler
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/scheduler.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/parking_condition.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/timer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/thread_policy.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/scheduler.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/parking_condition.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/timer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/thread_policy.cpp)
 add_library(go2cpp_fiber
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/fiber_local.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/context_backend.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/fiber.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/fiber_local.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/context_backend.cpp)
 if (GO2CPP_NATIVE_CONTEXT)
-    target_sources(go2cpp_fiber PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/context_x64.S)
+    target_sources(go2cpp_fiber PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/context_x64.S)
     target_compile_definitions(go2cpp_fiber PRIVATE GO2CPP_USE_NATIVE_CONTEXT=1)
 endif()
-add_library(go2cpp_sync ${CMAKE_CURRENT_SOURCE_DIR}/src/sync.cpp)
-add_library(go2cpp_future ${CMAKE_CURRENT_SOURCE_DIR}/src/future.cpp)
-add_library(go2cpp_io ${CMAKE_CURRENT_SOURCE_DIR}/src/io.cpp)
-add_library(go2cpp_log ${CMAKE_CURRENT_SOURCE_DIR}/src/log.cpp)
-add_library(go2cpp_config ${CMAKE_CURRENT_SOURCE_DIR}/src/config.cpp)
+add_library(go2cpp_sync ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/sync.cpp)
+add_library(go2cpp_future ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/future.cpp)
+add_library(go2cpp_io
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io_backend.cpp)
+add_library(go2cpp_log ${CMAKE_CURRENT_SOURCE_DIR}/src/logging/log.cpp)
+add_library(go2cpp_network
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/address.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/byte_array.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/fd_manager.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/socket.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/websocket.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/sse.cpp)
+add_library(go2cpp_config ${CMAKE_CURRENT_SOURCE_DIR}/src/config/config.cpp)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GO2CPP_BUILD_HOOK)
-    add_library(go2cpp_hook SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/hook.cpp)
+    add_library(go2cpp_hook SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/network/hook.cpp)
 endif()
 
 # The public umbrella target keeps one stable link name while the module
@@ -58,6 +68,7 @@ set_target_properties(go2cpp_fiber PROPERTIES EXPORT_NAME fiber)
 set_target_properties(go2cpp_sync PROPERTIES EXPORT_NAME sync)
 set_target_properties(go2cpp_future PROPERTIES EXPORT_NAME future)
 set_target_properties(go2cpp_io PROPERTIES EXPORT_NAME io)
+set_target_properties(go2cpp_network PROPERTIES EXPORT_NAME network)
 set_target_properties(go2cpp_log PROPERTIES EXPORT_NAME log)
 set_target_properties(go2cpp_config PROPERTIES EXPORT_NAME config)
 if (TARGET go2cpp_hook)
@@ -77,6 +88,7 @@ add_library(go2cpp::fiber ALIAS go2cpp_fiber)
 add_library(go2cpp::sync ALIAS go2cpp_sync)
 add_library(go2cpp::future ALIAS go2cpp_future)
 add_library(go2cpp::io ALIAS go2cpp_io)
+add_library(go2cpp::network ALIAS go2cpp_network)
 add_library(go2cpp::log ALIAS go2cpp_log)
 add_library(go2cpp::config ALIAS go2cpp_config)
 if (TARGET go2cpp_hook)
@@ -93,6 +105,7 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_sync
     go2cpp_future
     go2cpp_io
+    go2cpp_network
     go2cpp_log
     go2cpp_config
 )
@@ -139,13 +152,14 @@ endif()
 target_link_libraries(go2cpp_sync PUBLIC go2cpp_context go2cpp_scheduler)
 target_link_libraries(go2cpp_future PUBLIC go2cpp_context go2cpp_scheduler)
 target_link_libraries(go2cpp_io PUBLIC go2cpp_context go2cpp_scheduler)
+target_link_libraries(go2cpp_network PUBLIC go2cpp_io go2cpp_context go2cpp_scheduler go2cpp_sync)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_hook PUBLIC go2cpp_io go2cpp_fiber
                           ${CMAKE_DL_LIBS})
 endif()
 target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_error go2cpp_control_flow go2cpp_context go2cpp_channel go2cpp_scheduler
-    go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io go2cpp_log go2cpp_config
+    go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io go2cpp_network go2cpp_log go2cpp_config
     Threads::Threads)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_runtime INTERFACE go2cpp_hook)

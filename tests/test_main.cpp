@@ -17,8 +17,14 @@ void run_io_tests();
 void run_timer_tests();
 void run_beginner_api_tests();
 void run_log_config_tests();
+void run_network_tests();
+void run_sse_tests();
 void run_hook_tests();
 
+/**
+ * @brief 统一运行默认测试集并根据过滤器选择测试模块。
+ * @return 所有选定测试通过返回 0，否则返回非零值。
+ */
 int main() {
     const char* const filter_value = std::getenv("GO2CPP_TEST_FILTER");
     const std::string_view filter = filter_value ? filter_value : "";
@@ -38,6 +44,8 @@ int main() {
     if (selected("timer")) run_timer_tests();
     if (selected("beginner")) run_beginner_api_tests();
     if (selected("log")) run_log_config_tests();
+    if (selected("network")) run_network_tests();
+    if (selected("sse")) run_sse_tests();
 #ifdef GO2CPP_TEST_HOOK
     if (selected("hook")) run_hook_tests();
 #endif

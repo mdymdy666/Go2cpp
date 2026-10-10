@@ -34,6 +34,64 @@ void report() {
 挂载多个 Worker，每个 Worker 独立设置 Filter、Formatter、Sink，并可将记录传播到
 父 Logger。
 
+## 自定义格式项
+
+`LogFormatter::Item` 是格式器的插件边界。业务模块可以继承 `Item`，只负责把一个
+字段追加到输出流，再用 `AddFormat`（或兼容 Sylar 的 `addFormat`）注册工厂：
+
+```cpp
+class UserItem final : public GO2CPP::log::LogFormatter::Item {
+public:
+    // 也可以覆写大写 Format；覆写小写 format 可兼容 Sylar 风格代码。
+    void format(std::ostream& stream,
+                const GO2CPP::log::LogRecord& record) const override {
+        stream << "request=" << record.logger;
+    }
+};
+
+GO2CPP::log::LogFormatter::AddFormat(
+    "g", [](const std::string&) {
+        return std::make_shared<UserItem>();
+    });
+
+GO2CPP::log::PatternFormatter formatter("%g %m%n");
+```
+
+若自定义 Item 有 `Item(const std::string&)` 构造函数，也可以使用更短的模板接口：
+
+```cpp
+struct TagItem final : GO2CPP::log::LogFormatter::Item {
+    explicit TagItem(std::string option) : option_(std::move(option)) {}
+    void Format(std::ostream& out, const GO2CPP::log::LogRecord&) const override {
+        out << "tag=" << option_;
+    }
+    std::string option_;
+};
+GO2CPP::log::LogFormatter::addFormat<TagItem>("tag");
+GO2CPP::log::PatternFormatter formatter2("{tag}");
+```
+
+`AddFormat`、`RemoveFormat` 和 `HasFormat` 都受同一注册表互斥保护；格式工厂会在
+释放注册表锁后执行，因此工厂内部可以安全地加载其他插件。一个 Formatter 在构造
+时固定 Item 链，之后注销格式项不会影响已经创建的 Formatter。未知格式项会原样
+保留并将 `HasError()` 置为 `true`，便于配置加载阶段拒绝拼写错误。
+
+只需要输出固定内容时，可以注册无参数工厂：
+
+```cpp
+GO2CPP::log::LogFormatter::addFormat("g", [] {
+    return std::make_shared<UserItem>();
+});
+```
+
+`%d{...}` 是内置日期格式项，不能被业务注册覆盖；业务格式项应选择未占用的单字符
+或命名键。带选项的插件使用 `ItemFactory` 接收 `%g{option}` 中的 `option` 文本。
+
+注册表按名称区分格式项，重复注册会返回 `false`，不会静默覆盖其他模块的实现。
+格式项在 `PatternFormatter` 构造时实例化，后续每条日志只执行 `Item::Format`，不会
+在日志热路径再次访问注册表。使用完毕可调用 `RemoveFormat("g")`；已创建的
+`PatternFormatter` 保留自己的 Item 快照，不会被注销操作破坏。
+
 动态配置示例：
 
 ```cpp

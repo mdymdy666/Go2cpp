@@ -1,14 +1,43 @@
-# Go2Cpp 配置
+# Go2Cpp 配置与热更新
 
 根目录的 `go2cpp.ini` 是可复制的默认模板。解析器支持 `[section]`、`key = value`、
 `#` 和 `;` 注释，不依赖 YAML。调用 `LoadRuntimeConfig` 后必须通过统一校验，校验
 失败应记录错误并停止启动调度器。
 
-调度器配置重点：`processor_count=0` 使用硬件并发数；`min_workers=0` 和
-`max_workers=0` 使用调度器自身的按需策略；显式 `max_workers` 不能超过 32，
-`min_workers` 不能小于 1（0 表示自动）。`local_queue_limit` 必须大于 0。
-`fiber_bin_capacity` 控制每个 M 的已完成 Fiber 对象缓存，默认 32，最大 4096，
-设置为 0 使用运行时默认值；它只影响分配回收，不改变 Fiber 的调度语义。
+配置文件使用简单的 `section`、`key = value` 格式。值在启动加载和热更新时都会
+进行类型与范围校验；被拒绝的变量保留旧值，不会将非法参数传给调度器。配置规范
+要求允许热更新的每个键都能独立解析和校验，不能假设同一文件中的其他键会同时写完。
+配置文件被非原子写入时，任何一个键都不得依赖另一个键的中间状态。配置中心会先
+预检本次文件中所有已注册变量，再以两阶段事务写入；任一字段失败时整批回滚，成功
+后才统一触发变量监听器和提交监听器。跨键约束应放在预检器或显式事务中完成，不能
+在单个变量监听器里读取并发布半套业务状态。
+
+调度器参数的正式范围如下：
+
+| 参数 | 默认值 | 允许范围 | 说明 |
+| --- | ---: | --- | --- |
+| `processor_count` | `0` | `0` 或 `1..32` | P 数量；0 使用硬件并发数。 |
+| `min_workers` | `0` | `0` 或 `1..32` | 最小 M 数量；0 使用运行时默认值 1。 |
+| `max_workers` | `0` | `0` 或 `1..32` | 最大 M 数量；0 按 P 和阻塞区策略计算。 |
+| `local_queue_limit` | `256` | `1..1048576` | 每个 P 的本地队列容量。 |
+| `fiber_stack_size` | `0` | `0` 或 `16384..67108864` 字节 | Fiber 初始栈；0 使用后端默认值。 |
+| `task_affinity_budget` | `4` | `0..1048576` | 同类任务优先留在最近 P 的次数预算。 |
+| `fiber_bin_capacity` | `32` | `0..4096` | 每个 M 缓存的已完成 Fiber 数量。 |
+| `idle_wait_ms` | `10` | `1..86400000` | 空闲 M 等待新任务的周期。 |
+| `idle_worker_timeout_ms` | `250` | `1..86400000` | 空闲 M 回收等待时间。 |
+| `sysmon_interval_ms` | `10` | `1..86400000` | sysmon 检查周期。 |
+| `long_syscall_threshold_ms` | `50` | `1..86400000` | 已声明阻塞区的长调用阈值。 |
+
+`allow_worker_oversubscription`、`enable_sysmon`、`pin_workers_to_cpu` 和
+`collect_metrics` 接受 `true/false`、`yes/no`、`on/off` 或 `1/0`。其中
+`collect_metrics=false` 只关闭累计指标，不改变调度语义；`fiber_bin_capacity`
+只影响对象复用，不改变 Fiber 生命周期和执行顺序。
+
+`processor_count`、`min_workers`、`max_workers`、`local_queue_limit` 和 Fiber
+栈/队列参数属于启动期结构配置，不是独立的热更新参数；它们之间的调度约束只能在
+创建 Scheduler 时一起校验。不要在运行中分别修改 `min_workers` 和 `max_workers`，
+也不要用一个键的临时值去满足另一个键的校验。必须调整时，停用监听、生成完整配置
+快照并按编辑锁协议一次替换，然后重新创建 Scheduler。
 
 日志配置重点：`level` 默认 `warn`，`stdout` 默认 `false`，`directory` 默认 `log`，
 `file` 默认 `go2cpp.log`。程序中的典型启动顺序是：
@@ -46,18 +75,41 @@ if (!go2cpp::config::LoadAndWatch(config, "go2cpp.ini",
 ```
 
 配置变量的普通读取不再持有配置锁；刷新线程以不可变快照发布新值，
-因此业务线程可以直接调用 `GetValue()`。监听器仍按注册顺序串行执行，
-监听器中不应长时间阻塞或再次等待业务锁。
+因此业务线程可以直接调用 `GetValue()`。监听器仍按注册顺序串行执行，但
+不持有配置事务锁；监听器可以读取或提交配置，不应长时间阻塞业务线程或等待
+会反向获取业务锁的外部操作。
+
+热更新使用配置文件旁边的编辑锁文件保护写入事务。监听
+`go2cpp.ini` 时，监听器会先检查 `go2cpp.ini.lock`：锁文件非空表示仍在编辑，
+此期间不会读取或提交目标配置；锁文件为空或不存在才会继续读取。写入方应先写入
+非空锁文件，再把完整内容写到同目录临时文件，关闭并校验后用 `rename` 原子替换
+目标文件，最后将 `.lock` 截断为空文件作为提交信号：
+
+```text
+写入 go2cpp.ini.lock（任意非空内容）
+写入 go2cpp.ini.tmp
+关闭并校验 go2cpp.ini.tmp
+rename(go2cpp.ini.tmp, go2cpp.ini)
+截断 go2cpp.ini.lock 为空
+```
+
+监听器还会对配置文件做连续快照确认，并在解析或校验失败时保留旧值、下一轮继续
+重试。这能避免常见的截断半文件；直接对正在监听的目标文件长时间 `truncate/write`
+仍可能留下语法上完整但尚未写完的前缀，因此不能替代上述锁文件和原子替换协议。
 
 `Config::LoadFromFile` 会先校验所有已注册变量的类型，再统一提交变更；监听器只
-在值真正改变后触发。`BindLoggingConfig` 将 `log.*` 变量绑定到 LoggerManager，
+在值真正改变后触发。需要观察“一次文件提交完成”的插件可注册
+`Config::AddCommitListener`，回调参数是本次变更变量快照，且回调执行时所有变量
+已经是新值。提交回调在事务锁释放后执行，可以查询或再次提交配置；监听器异常会
+被配置中心隔离，不会回滚已提交值，也不会终止监听线程。
+`BindLoggingConfig` 将 `log.*` 变量绑定到 LoggerManager，
 因此热加载会更新已经存在的 Logger。`BindRuntimeConfig` 可以把调度参数绑定到
 一个 `RuntimeConfig` 对象；已经启动的 Scheduler 对 P/M 队列结构参数仍建议重新
 创建，避免在线改变队列拓扑。
 
-`RuntimeConfig` 由调用方持有时，必须保证它的生命周期覆盖 watcher 的整个运行期；
-停止 watcher 后再销毁该对象。通常每个配置中心只调用一次 `BindLoggingConfig` 和
-`BindRuntimeConfig`，避免重复注册监听器。不要在 watcher 自己的监听器回调中再次
+`RuntimeConfig` 由调用方持有时，必须保证它的生命周期覆盖配置监听的整个运行期；
+停止配置监听后再销毁该对象。通常每个配置中心只调用一次 `BindLoggingConfig` 和
+`BindRuntimeConfig`，避免重复注册监听器。不要在配置监听自己的回调中再次
 调用 `StartWatcher` 或 `StopWatcher`，需要重启时应由其他管理线程执行。
 `BindRuntimeConfig` 的监听器会更新目标对象字段；如果业务线程同时直接读取这些
 公开字段，调用方必须用自己的互斥量或在停用 watcher 后读取。Scheduler 已启动后

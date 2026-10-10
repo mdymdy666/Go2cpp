@@ -1,0 +1,4048 @@
+#include "go2cpp/scheduler/scheduler.hpp"
+
+#include "go2cpp/fiber.hpp"
+#include "go2cpp/log.hpp"
+#include "go2cpp/thread_policy.hpp"
+
+#include <algorithm>
+#include <array>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <iterator>
+#include <limits>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
+namespace go2cpp::scheduler {
+namespace {
+
+std::atomic<GId> s_next_g_id{1};
+std::atomic<MId> s_next_m_id{1};
+
+thread_local Scheduler* t_scheduler = nullptr;
+thread_local std::shared_ptr<Task> t_task;
+thread_local MId t_machine_id = 0;
+thread_local PId t_processor_id = 0;
+// BlockingRegion is deliberately non-nestable: one M has one state
+// transition, and rejecting nested scopes avoids double accounting. The
+// machine id is retained so a misuse that lets a Fiber migrate before its
+// region is destroyed can still clear the original M's state.
+thread_local MId t_blocking_machine_id = 0;
+
+/// 函数功能：完成 default_processor_count 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::size_t default_processor_count() noexcept {
+    const auto count = std::thread::hardware_concurrency();
+    return count == 0 ? 1U : static_cast<std::size_t>(count);
+}
+
+/// 函数功能：完成 steady_now_ns 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::int64_t steady_now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::int64_t milliseconds_to_ns(
+    std::chrono::milliseconds duration) noexcept {
+    constexpr auto max_value = std::numeric_limits<std::int64_t>::max();
+    const auto milliseconds = duration.count();
+    if (milliseconds <= 0) {
+        return 0;
+    }
+    constexpr auto scale = static_cast<std::int64_t>(1000000);
+    if (milliseconds > max_value / scale) {
+        return max_value;
+    }
+    return milliseconds * scale;
+}
+
+}  // namespace
+
+// Tasks retain only a weak handle. This short gate excludes Scheduler
+// destruction from an in-flight external Task::Cancel without retaining the
+// Scheduler itself or holding an admission lock while entering the gate.
+struct TaskCancellationGate {
+    /// 函数功能：执行 TaskCancellationGate，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    explicit TaskCancellationGate(Scheduler* scheduler)
+        : m_scheduler(scheduler) {}
+
+    std::mutex m_mutex;
+    Scheduler* m_scheduler;
+};
+
+/// 函数功能：完成 Task 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] function 调用方传入的参数，具体约束以头文件声明为准。
+/// @param[in] options 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+Task::Task(Function function, TaskOptions options)
+    : m_id(s_next_g_id.fetch_add(1, std::memory_order_relaxed)),
+      m_function(std::move(function)),
+      m_options(options),
+      m_state(GState::kNew) {}
+
+Task::~Task() = default;
+
+/// 函数功能：完成 release_callable 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+Task::Function Task::release_callable() noexcept {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    return std::move(m_function);
+}
+
+/// 函数功能：完成 id 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+GId Task::id() const noexcept {
+    return m_id;
+}
+
+/// 函数功能：完成 state 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+GState Task::state() const noexcept {
+    return m_state.load(std::memory_order_acquire);
+}
+
+/// 函数功能：完成 queued 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::queued() const noexcept {
+    return m_queued.load(std::memory_order_acquire);
+}
+
+/// 函数功能：完成 started 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::started() const noexcept {
+    return m_started.load(std::memory_order_acquire);
+}
+
+/// 函数功能：完成 cancellation_requested 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::cancellation_requested() const noexcept {
+    return m_cancel_requested.load(std::memory_order_acquire);
+}
+
+/// 函数功能：完成 task_class 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+TaskClassId Task::task_class() const noexcept {
+    return m_options.task_class;
+}
+
+/// 函数功能：完成 failed 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::failed() const noexcept {
+    return state() == GState::kFailed;
+}
+
+/// 函数功能：完成 failure 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::exception_ptr Task::failure() const {
+    std::lock_guard<std::mutex> lock(m_failure_mutex);
+    return m_failure;
+}
+
+/// 函数功能：完成 rethrow_failure 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Task::rethrow_failure() const {
+    const auto error = failure();
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
+/// 函数功能：完成 terminal 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::terminal() const noexcept {
+    const auto current = state();
+    return current == GState::kDead || current == GState::kCancelled ||
+           current == GState::kFailed;
+}
+
+/// 函数功能：完成 wait 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::wait() const {
+    if (Scheduler::current_task().get() == this) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(m_completion_mutex);
+    return m_completion_condition.wait(lock, [this] { return terminal(); });
+}
+
+/// 函数功能：完成 wait_for 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] timeout 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::wait_for(std::chrono::steady_clock::duration timeout) const {
+    if (Scheduler::current_task().get() == this) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(m_completion_mutex);
+    return m_completion_condition.wait_for(
+        lock, timeout, [this] { return terminal(); });
+}
+
+/// 函数功能：完成 notify_terminal 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Task::notify_terminal() noexcept {
+    if (m_completion_notified.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    // Synchronize with a waiter's predicate -> cv.wait transition. Merely
+    // notifying an atomic terminal flag can lose the notification between
+    // those two steps while the waiter still owns completion_mutex.
+    {
+        std::lock_guard<std::mutex> lock(m_completion_mutex);
+    }
+    m_completion_condition.notify_all();
+}
+
+/// 函数功能：完成 try_mark_queued 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::try_mark_queued() noexcept {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (m_state.load(std::memory_order_relaxed) != GState::kRunnable ||
+        m_execution_claim.load(std::memory_order_relaxed) ||
+        m_queued.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    m_queued.store(true, std::memory_order_release);
+    return true;
+}
+
+/// 函数功能：完成 try_mark_queued_from_worker 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::try_mark_queued_from_worker() noexcept {
+    bool expected_queued = false;
+    if (!m_queued.compare_exchange_strong(expected_queued, true,
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+        return false;
+    }
+    const auto state = m_state.load(std::memory_order_acquire);
+    if (state != GState::kRunnable ||
+        m_execution_claim.load(std::memory_order_acquire)) {
+        m_queued.store(false, std::memory_order_release);
+        return false;
+    }
+    return true;
+}
+
+/// 函数功能：完成 clear_queued 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Task::clear_queued() noexcept {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    m_queued.store(false, std::memory_order_release);
+}
+
+/// 函数功能：完成 defer_enqueue 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Task::defer_enqueue() noexcept {
+    m_deferred_enqueue.store(true, std::memory_order_release);
+}
+
+/// 函数功能：完成 consume_deferred_enqueue 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::consume_deferred_enqueue() noexcept {
+    return m_deferred_enqueue.exchange(false, std::memory_order_acq_rel);
+}
+
+/// 函数功能：完成 request_wake 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Task::request_wake() noexcept {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    m_wake_pending.store(true, std::memory_order_release);
+}
+
+/// 函数功能：完成 consume_wake 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::consume_wake() noexcept {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    return m_wake_pending.exchange(false, std::memory_order_acq_rel);
+}
+
+/// 函数功能：完成 try_register 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::try_register() noexcept {
+    bool expected = false;
+    return m_registered.compare_exchange_strong(expected, true,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_acquire);
+}
+
+/// 函数功能：完成 registered 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::registered() const noexcept {
+    return m_registered.load(std::memory_order_acquire);
+}
+
+/// 函数功能：完成 bind_owner 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] owner 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::bind_owner(const std::shared_ptr<const void>& owner) noexcept {
+    if (!owner) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (!m_owner_anchor) {
+        m_owner_anchor = owner;
+        return true;
+    }
+    return m_owner_anchor.get() == owner.get();
+}
+
+/// 函数功能：完成 owned_by 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] owner 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::owned_by(const std::shared_ptr<const void>& owner) const noexcept {
+    if (!owner) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    return m_owner_anchor && m_owner_anchor.get() == owner.get();
+}
+
+void Task::bind_cancellation_gate(
+    const std::shared_ptr<TaskCancellationGate>& gate) noexcept {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    m_cancellation_gate = gate;
+}
+
+bool Task::prepare_enqueue(
+    const std::shared_ptr<const void>& owner,
+    const std::shared_ptr<TaskCancellationGate>& gate) noexcept {
+    if (!owner || !gate) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (!m_owner_anchor) {
+        m_owner_anchor = owner;
+    } else if (m_owner_anchor.get() != owner.get()) {
+        return false;
+    }
+    m_cancellation_gate = gate;
+    const auto state = m_state.load(std::memory_order_relaxed);
+    if (state == GState::kNew) {
+        m_state.store(GState::kRunnable, std::memory_order_release);
+    } else if (state != GState::kRunnable) {
+        return false;
+    }
+    if (m_execution_claim.load(std::memory_order_relaxed) ||
+        m_queued.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    m_queued.store(true, std::memory_order_release);
+    return true;
+}
+
+/// 函数功能：完成 promote_new 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::promote_new() noexcept {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (m_state.load(std::memory_order_relaxed) != GState::kNew) {
+        return false;
+    }
+    m_state.store(GState::kRunnable, std::memory_order_release);
+    return true;
+}
+
+/// 函数功能：完成 wake_for_scheduler 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+WakeAction Task::wake_for_scheduler() noexcept {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    const auto state = m_state.load(std::memory_order_relaxed);
+    if (state == GState::kWaiting) {
+        m_wake_pending.store(false, std::memory_order_relaxed);
+        m_state.store(GState::kRunnable, std::memory_order_release);
+        if (m_execution_claim.load(std::memory_order_relaxed)) {
+            // park() changed the logical state before the cooperative callable
+            // returned. Let the owning worker publish the next run only after
+            // it releases the execution claim.
+            m_deferred_enqueue.store(true, std::memory_order_release);
+            return WakeAction::kPending;
+        }
+        return WakeAction::kEnqueue;
+    }
+    if (state == GState::kRunning) {
+        m_wake_pending.store(true, std::memory_order_release);
+        return WakeAction::kPending;
+    }
+    return WakeAction::kRejected;
+}
+
+/// 函数功能：完成 wake_for_io 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+WakeAction Task::wake_for_io() noexcept {
+    return wake_for_wait();
+}
+
+/// 函数功能：完成 wake_for_wait 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+WakeAction Task::wake_for_wait() noexcept {
+    // 与 park_for_scheduler() 共用转换锁。仅依赖原子状态不足以保护
+    // wake_pending：park 可能先读到 Running 和 pending=false，随后 wake
+    // 发布 pending=true，而 park 再把状态写成 Waiting，最终留下无人入队
+    // 的 G。锁内完成状态转换和 permit 发布，确保 wake 要么被 park 消耗，
+    // 要么观察到 Waiting 并负责将 G 转回 Runnable。
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    const GState state = m_state.load(std::memory_order_relaxed);
+    if (state == GState::kWaiting) {
+        m_wake_pending.store(false, std::memory_order_release);
+        m_state.store(GState::kRunnable, std::memory_order_release);
+        if (m_execution_claim.load(std::memory_order_acquire)) {
+            m_deferred_enqueue.store(true, std::memory_order_release);
+            return WakeAction::kPending;
+        }
+        return WakeAction::kEnqueue;
+    }
+    if (state == GState::kRunning) {
+        m_wake_pending.store(true, std::memory_order_release);
+        return WakeAction::kPending;
+    }
+    return WakeAction::kRejected;
+}
+
+/// 函数功能：完成 park_for_scheduler 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+ParkAction Task::park_for_scheduler() noexcept {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
+        return ParkAction::kRejected;
+    }
+    if (m_wake_pending.exchange(false, std::memory_order_acq_rel)) {
+        // Fiber 提交挂起前已经收到唤醒。消费该令牌并留在当前执行流，
+        // 避免先通知后挂起造成丢失唤醒。
+        return ParkAction::kRequeued;
+    }
+    m_state.store(GState::kWaiting, std::memory_order_release);
+    return ParkAction::kParked;
+}
+
+
+/// 函数功能：完成 try_mark_running 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::try_mark_running() {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (!m_queued.load(std::memory_order_relaxed) ||
+        m_execution_claim.load(std::memory_order_relaxed) ||
+        m_state.load(std::memory_order_relaxed) != GState::kRunnable) {
+        return false;
+    }
+    // Dequeue reservation and the runnable -> running transition are one
+    // indivisible Task operation. An external enqueue cannot republish the G
+    // between these updates.
+    m_queued.store(false, std::memory_order_relaxed);
+    m_execution_claim.store(true, std::memory_order_relaxed);
+    m_state.store(GState::kRunning, std::memory_order_release);
+    return true;
+}
+
+
+/// 函数功能：完成 mark_runnable 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::mark_runnable() {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (m_state.load(std::memory_order_relaxed) != GState::kWaiting) {
+        return false;
+    }
+    m_state.store(GState::kRunnable, std::memory_order_release);
+    m_wake_pending.store(false, std::memory_order_relaxed);
+    return true;
+}
+
+/// 函数功能：完成 mark_yielded 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::mark_yielded() {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
+        return false;
+    }
+    // A wake received while the G was running has been superseded by the
+    // explicit yield: the G is already being requeued and must not consume
+    // that old token on a later park.
+    m_state.store(GState::kRunnable, std::memory_order_release);
+    m_wake_pending.store(false, std::memory_order_release);
+    return true;
+}
+
+/// 函数功能：完成 mark_yielded_fast 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::mark_yielded_fast() noexcept {
+    GState expected = GState::kRunning;
+    if (!m_state.compare_exchange_strong(expected, GState::kRunnable,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+        return false;
+    }
+    m_wake_pending.store(false, std::memory_order_release);
+    return true;
+}
+
+/// 函数功能：完成 mark_waiting 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::mark_waiting() {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
+        return false;
+    }
+    m_state.store(GState::kWaiting, std::memory_order_release);
+    return true;
+}
+
+/// 函数功能：完成 cancel 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::cancel() {
+    std::shared_ptr<TaskCancellationGate> gate;
+    {
+        std::lock_guard<std::mutex> lock(m_transition_mutex);
+        gate = m_cancellation_gate.lock();
+    }
+    const auto self = weak_from_this().lock();
+    if (gate && self) {
+        std::lock_guard<std::mutex> lock(gate->m_mutex);
+        if (gate->m_scheduler) {
+            return gate->m_scheduler->cancel(self);
+        }
+    }
+    return request_cancel();
+}
+
+/// 函数功能：完成 request_cancel 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] notify 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::request_cancel(bool notify) noexcept {
+    bool became_terminal = false;
+    {
+        std::lock_guard<std::mutex> lock(m_transition_mutex);
+        const auto state = m_state.load(std::memory_order_relaxed);
+        if (state == GState::kDead || state == GState::kCancelled ||
+            state == GState::kFailed) {
+            return false;
+        }
+        m_cancel_requested.store(true, std::memory_order_release);
+        if (m_fiber) {
+            m_fiber->RequestCancellation();
+        }
+        // A started Fiber must resume to its trampoline so stack locals and
+        // stack cleanup finishes normally. Only an unstarted G is terminal immediately.
+        if (!m_started.load(std::memory_order_relaxed) &&
+            !m_execution_claim.load(std::memory_order_relaxed)) {
+            m_state.store(GState::kCancelled, std::memory_order_release);
+            m_queued.store(false, std::memory_order_release);
+            became_terminal = true;
+        }
+        m_wake_pending.store(false, std::memory_order_release);
+        if (became_terminal) {
+            m_deferred_enqueue.store(false, std::memory_order_release);
+        }
+    }
+    if (became_terminal && notify) {
+        notify_terminal();
+    }
+    return true;
+}
+
+/// 函数功能：完成 cancel_if_runnable_unqueued 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Task::cancel_if_runnable_unqueued() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(m_transition_mutex);
+        if (m_state.load(std::memory_order_relaxed) != GState::kRunnable ||
+            m_queued.load(std::memory_order_relaxed) ||
+            m_execution_claim.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        if (m_started.load(std::memory_order_relaxed)) {
+            // This helper is only an admission-failure rescue for an
+            // unstarted G. A started Fiber must remain runnable and be
+            // requeued/cancelled through Scheduler::cancel instead.
+            return false;
+        }
+        m_cancel_requested.store(true, std::memory_order_release);
+        m_state.store(GState::kCancelled, std::memory_order_release);
+        m_wake_pending.store(false, std::memory_order_relaxed);
+        m_deferred_enqueue.store(false, std::memory_order_relaxed);
+    }
+    notify_terminal();
+    return true;
+}
+
+/// 函数功能：完成 run 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Task::run() {
+    if (!m_execution_claim.load(std::memory_order_acquire)) {
+        return;
+    }
+    bool expected = false;
+    if (!m_run_claim.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+    struct RunClaimGuard final {
+        std::atomic<bool>& claim;
+        ~RunClaimGuard() { claim.store(false, std::memory_order_release); }
+    } run_claim_guard{m_run_claim};
+
+    Fiber* fiber = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_transition_mutex);
+        fiber = m_fiber.get();
+    }
+    if (fiber == nullptr) {
+        try {
+            const auto stack_size = m_options.stack_size == 0
+                                        ? Fiber::DefaultStackSize()
+                                        : m_options.stack_size;
+            auto created_fiber = Fiber::AcquireForScheduler(
+                [this] {
+                    // Move the callable onto the G stack. Its captures are
+                    // released without any scheduler lock held when the body
+                    // returns or the Fiber is deliberately unwound.
+                    auto body = std::move(m_function);
+                    if (body) {
+                        // Fiber::entry catches ordinary C++ exceptions and
+                        // exposes them through Fiber::failure(). User code must
+                        // handle ordinary C++ exceptions explicitly.
+                        body();
+                    }
+                },
+                stack_size, m_options.fiber_bin_capacity);
+            {
+                std::lock_guard<std::mutex> lock(m_transition_mutex);
+                if (!m_fiber) {
+                    m_fiber = std::move(created_fiber);
+                    m_started.store(true, std::memory_order_release);
+                }
+                fiber = m_fiber.get();
+            }
+        } catch (...) {
+            const auto error = std::current_exception();
+            {
+                std::lock_guard<std::mutex> lock(m_failure_mutex);
+                m_failure = error;
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_transition_mutex);
+                m_state.store(GState::kFailed, std::memory_order_release);
+                m_execution_claim.store(false, std::memory_order_release);
+            }
+            auto abandoned_function = release_callable();
+            notify_terminal();
+            return;
+        }
+    }
+
+    // Cancellation may have raced with Fiber construction before the new
+    // pointer was published. The task flag is authoritative; mirror it into
+    // the Fiber before entering its trampoline.
+    if (m_cancel_requested.load(std::memory_order_acquire)) {
+        fiber->RequestCancellation();
+    }
+    // 发布 G/M/P 绑定。Fiber 首次进入时会继承该绑定，嵌套 Fiber 之后
+    // 只能沿同一逻辑 G 的父链恢复，即使 G 迁移到另一个 M 也不会丢失
+    // 调度器归属。
+    if (Scheduler* const scheduler = Scheduler::current_scheduler()) {
+        // 同一个 M 上的连续 yield 不需要重复获取 Fiber 元数据锁。发生
+        // 迁移时才更新调试绑定，保留跨 M 运行的可观测性。
+        if (m_last_machine_id != t_machine_id ||
+            m_last_processor_id.load(std::memory_order_relaxed) !=
+                t_processor_id ||
+            !m_binding_published) {
+            fiber->bind_execution(FiberExecutionBinding{
+                reinterpret_cast<std::uintptr_t>(scheduler), id(),
+                t_machine_id, t_processor_id, true});
+            m_last_machine_id = t_machine_id;
+            m_last_processor_id.store(t_processor_id,
+                                      std::memory_order_relaxed);
+            m_binding_published = true;
+        }
+    }
+    // Only this run claim can move/destroy m_fiber, and it does so after
+    // resume() returns while holding m_transition_mutex. A concurrent cancel
+    // can therefore safely request cancellation on this stable pointer.
+    const bool resumed = Scheduler::current_scheduler() != nullptr
+                             ? fiber->resume_from_scheduler()
+                             : fiber->resume();
+    const FiberState fiber_state = fiber->state();
+    const auto fiber_failure = fiber_state == FiberState::Failed
+                                   ? fiber->failure()
+                                   : std::exception_ptr{};
+    bool became_terminal = false;
+    Function completed_function;
+    std::unique_ptr<Fiber> completed_fiber;
+    {
+        std::lock_guard<std::mutex> lock(m_transition_mutex);
+        if (!resumed || fiber_state == FiberState::Completed ||
+            fiber_state == FiberState::Failed) {
+            m_deferred_enqueue.store(false, std::memory_order_relaxed);
+            m_wake_pending.store(false, std::memory_order_relaxed);
+            if (fiber_failure) {
+                std::lock_guard<std::mutex> failure_lock(m_failure_mutex);
+                m_failure = fiber_failure;
+            }
+            const auto terminal_state = fiber_state == FiberState::Failed
+                                            ? GState::kFailed
+                                            : (m_cancel_requested.load(
+                                                   std::memory_order_relaxed)
+                                                   ? GState::kCancelled
+                                                   : GState::kDead);
+            m_state.store(terminal_state, std::memory_order_release);
+            // A cancelled-before-first-resume Fiber can still retain the
+            // callable. Move it out while updating state, then destroy it
+            // after the transition lock is released.
+            completed_function = std::move(m_function);
+            became_terminal = true;
+            // The trampoline has returned, so no C++ stack is still active on
+            // this Fiber. Release its protected stack even when a caller
+            // retains the public Task handle after completion; retaining a
+            // Task must not retain an already-finished G stack.
+            completed_fiber = std::move(m_fiber);
+        } else if (fiber_state == FiberState::Suspended &&
+                   m_state.load(std::memory_order_relaxed) ==
+                       GState::kRunning) {
+            // Direct Fiber::Suspend calls are supported for advanced users.
+            // Scheduler helpers set the state before switching, while this
+            // fallback maps a raw suspension to the matching queue state.
+            // A cancellation/wake can race with the context switch before
+            // the Fiber has published Suspended. In that window the notifier
+            // records a pending permit while the state is still Running;
+            // never overwrite that permit with Waiting or shutdown can strand
+            // the G forever.
+            const bool pending_wake =
+                m_wake_pending.load(std::memory_order_relaxed);
+            const bool cancellation_requested =
+                m_cancel_requested.load(std::memory_order_relaxed);
+            if (fiber->suspend_reason() == SuspendReason::Yield ||
+                pending_wake || cancellation_requested) {
+                m_state.store(GState::kRunnable, std::memory_order_release);
+                m_deferred_enqueue.store(true, std::memory_order_release);
+                m_wake_pending.store(false, std::memory_order_release);
+            } else {
+                m_state.store(GState::kWaiting, std::memory_order_release);
+            }
+        }
+        m_execution_claim.store(false, std::memory_order_release);
+    }
+    if (became_terminal) {
+        if (fiber_failure) {
+            auto logger = GO2CPP_LOG_NAME("Scheduler");
+            GO2CPP_LOG_ERROR(logger) << "Fiber task " << m_id
+                                     << " failed with an uncaught exception";
+        }
+        notify_terminal();
+        Fiber::RecycleForScheduler(std::move(completed_fiber),
+                                   m_options.fiber_bin_capacity);
+    }
+}
+
+class Scheduler::Impl {
+public:
+    // 任务注册表按固定条带拆分，避免大量外部生产者在提交短任务时
+    // 争用同一把互斥量。每个条带仍然是普通 vector + mutex，关闭和
+    // 回收阶段按条带逐一加锁，因此不会改变注册表的强所有权语义。
+    static constexpr std::size_t kRegistryStripeCount = 16;
+    // 外部生产者入队也按固定条带拆分。它们只负责发布尚未绑定 P
+    // 的新 G，worker 会轮询这些条带并按原有的状态机认领任务。
+    static constexpr std::size_t kIncomingStripeCount = 16;
+
+    struct Processor {
+        /// 函数功能：执行 Processor，完成本函数所属模块的单步操作。
+        /// 执行流程：
+        /// 1. 校验传入参数以及当前对象/线程状态；
+        /// 2. 按状态机规则获取必要的锁并更新内部数据；
+        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+        /// @param[in] processor_id 调用方传入的参数，具体约束以头文件声明为准。
+        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+        explicit Processor(PId processor_id) : id(processor_id) {}
+
+        PId id;
+        mutable std::mutex mutex;
+        std::deque<std::shared_ptr<Task>> queue;
+        std::atomic<PState> state{PState::kIdle};
+        std::atomic<std::size_t> active_machines{0};
+        std::atomic<std::size_t> running_machines{0};
+    };
+
+    struct Machine {
+        /// 函数功能：执行 Machine，完成本函数所属模块的单步操作。
+        /// 执行流程：
+        /// 1. 校验传入参数以及当前对象/线程状态；
+        /// 2. 按状态机规则获取必要的锁并更新内部数据；
+        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+        /// @param[in] machine_id 调用方传入的参数，具体约束以头文件声明为准。
+        /// @param[in] processor_id 调用方传入的参数，具体约束以头文件声明为准。
+        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+        explicit Machine(MId machine_id, PId processor_id)
+            : id(machine_id), processor(processor_id) {}
+
+        MId id;
+        PId processor;
+        std::thread thread;
+        std::atomic<MState> state{MState::kIdle};
+        // 这些字段由对应 worker 更新，同时允许 machines() 在另一个线程
+        // 读取；即使 worker 不持有调度器总锁，也必须使用原子访问。
+        std::atomic<TaskClassId> last_task_class{0};
+        std::atomic<std::size_t> affinity_budget{0};
+        std::atomic<std::size_t> affinity_hits{0};
+        std::atomic<std::size_t> affinity_misses{0};
+        // 这些原子字段由 worker、BlockingRegion 和 sysmon 共同观察；
+        // P 计数的增减仍在 Impl::mutex 下完成。
+        std::atomic<bool> processor_detached{false};
+        std::atomic<std::int64_t> blocking_since_ns{0};
+        std::atomic<GId> blocking_task{0};
+        std::atomic<std::uint64_t> long_syscall_count{0};
+    };
+
+    /// 函数功能：执行 Impl，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] requested 调用方传入的参数，具体约束以头文件声明为准。
+    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    explicit Impl(SchedulerConfig requested, Scheduler* scheduler)
+        : config(normalize(requested)),
+          owner_token(std::make_shared<const std::uint8_t>(0)),
+          cancellation_gate(std::make_shared<TaskCancellationGate>(scheduler)),
+          observer(std::move(config.observer)) {
+        for (std::size_t i = 0; i < config.processor_count; ++i) {
+            processors.emplace_back(static_cast<PId>(i));
+        }
+        // 高并发提交时注册表按条带分别扩容，避免 producer burst 反复搬迁
+        // shared_ptr；超出后仍按 vector 原有策略增长，不改变上限语义。
+        for (auto& registry : task_registries) {
+            registry.reserve(4096 / kRegistryStripeCount);
+        }
+    }
+
+    /// 函数功能：执行 registry_stripe，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    static std::size_t registry_stripe(const Task& task) noexcept {
+        // GId 单调递增，低位分片即可；条带数为 2 的幂，编译器会将
+        // 模运算优化为按位与。
+        return static_cast<std::size_t>(task.id()) &
+               (kRegistryStripeCount - 1);
+    }
+
+    ~Impl() { stop_sysmon(true); }
+
+    /**
+     * @brief 向当前观察者发布调度器事件。
+     * @param event 已填充的事件快照。
+     * @note 复制观察者后再释放互斥锁，绝不在调度器内部状态锁上执行
+     *       外部代码；观察者异常被隔离，不能影响 worker 生命周期。
+     */
+    void emit_event(SchedulerEvent event) noexcept {
+        if (event.timestamp == std::chrono::steady_clock::time_point{}) {
+            event.timestamp = std::chrono::steady_clock::now();
+        }
+        SchedulerObserverPtr current;
+        {
+            std::lock_guard<std::mutex> lock(observer_mutex);
+            current = observer;
+        }
+        if (!current) {
+            return;
+        }
+        try {
+            current->OnEvent(event);
+        } catch (...) {
+            // 观察者属于可选插件，异常不能跨越调度器边界。
+        }
+    }
+
+    /// 函数功能：执行 normalize，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] requested 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    static SchedulerConfig normalize(SchedulerConfig requested) {
+        if (requested.processor_count == 0) {
+            requested.processor_count = default_processor_count();
+        }
+        requested.processor_count = std::max<std::size_t>(1,
+                                                           requested.processor_count);
+        if (requested.max_workers == 0) {
+            // Keep ordinary runnable demand P-bounded, but reserve a bounded
+            // replacement ceiling for explicitly declared native blocking M's.
+            // This lets the default scheduler make progress without requiring
+            // every caller to guess a max-worker value; callers can still set
+            // an exact max or disable overcommit below.
+            requested.max_workers =
+                requested.allow_worker_oversubscription &&
+                        requested.processor_count <=
+                            std::numeric_limits<std::size_t>::max() / 2
+                    ? requested.processor_count * 2
+                    : std::numeric_limits<std::size_t>::max();
+        }
+        requested.max_workers = std::max<std::size_t>(1, requested.max_workers);
+        // A strict one-M-per-P ceiling is still available for deployments
+        // that set allow_worker_oversubscription=false.  The default permits
+        // declared native blocking regions to grow replacement M workers;
+        // this is an intentional overcommit, not a claim of asynchronous
+        // preemption for arbitrary native calls.
+        if (!requested.allow_worker_oversubscription) {
+            requested.max_workers =
+                std::min(requested.max_workers, requested.processor_count);
+        }
+        if (requested.min_workers == 0) {
+            requested.min_workers = 1;
+        }
+        requested.min_workers = std::max<std::size_t>(1, requested.min_workers);
+        requested.min_workers = std::min(requested.min_workers,
+                                         requested.max_workers);
+        // FiberBin 只用于短期突发复用；限制单个 M 的保留对象数，避免
+        // 配置误写为极大值后让每个 worker 长期占用大量堆内存。
+        requested.fiber_bin_capacity = std::min<std::size_t>(
+            requested.fiber_bin_capacity, 4096U);
+        if (requested.idle_wait <= std::chrono::milliseconds::zero()) {
+            requested.idle_wait = std::chrono::milliseconds(1);
+        }
+        if (requested.idle_worker_timeout <= std::chrono::milliseconds::zero()) {
+            requested.idle_worker_timeout = std::chrono::milliseconds(1);
+        }
+        if (requested.sysmon_interval <= std::chrono::milliseconds::zero()) {
+            requested.sysmon_interval = std::chrono::milliseconds(1);
+        }
+        if (requested.long_syscall_threshold <=
+            std::chrono::milliseconds::zero()) {
+            requested.long_syscall_threshold = requested.sysmon_interval;
+        }
+        return requested;
+    }
+
+    // Create one worker while mutex is held. The thread starts only after its
+    // shared Machine object has been published, so snapshots and shutdown can
+    // safely retain the same object even when later workers are appended.
+    /// 函数功能：完成 spawn_worker_locked 调用，读取或更新相关运行时状态。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+    bool spawn_worker_locked(Scheduler* scheduler) {
+        if (!scheduler || stopping.load(std::memory_order_acquire) ||
+            machines.size() >= std::numeric_limits<std::size_t>::max() ||
+            active_workers.load(std::memory_order_relaxed) >=
+                config.max_workers) {
+            return false;
+        }
+
+        PId processor_id = 0;
+        std::size_t least = std::numeric_limits<std::size_t>::max();
+        for (const auto& processor : processors) {
+            const auto active =
+                processor.active_machines.load(std::memory_order_relaxed);
+            if (active < least) {
+                least = active;
+                processor_id = processor.id;
+            }
+        }
+
+        auto machine = std::make_shared<Machine>(
+            s_next_m_id.fetch_add(1, std::memory_order_relaxed), processor_id);
+        machines.emplace_back(machine);
+        active_workers.fetch_add(1, std::memory_order_relaxed);
+        processors[processor_id].active_machines.fetch_add(
+            1, std::memory_order_relaxed);
+        try {
+            machine->thread = std::thread([scheduler, machine] {
+                scheduler->worker_loop(std::static_pointer_cast<void>(machine));
+            });
+        } catch (...) {
+            processors[processor_id].active_machines.fetch_sub(
+                1, std::memory_order_relaxed);
+            active_workers.fetch_sub(1, std::memory_order_relaxed);
+            machines.pop_back();
+            throw;
+        }
+        return true;
+    }
+
+    /// 函数功能：执行 reap_dead_workers，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    void reap_dead_workers() {
+        std::vector<std::thread> retired;
+        const auto self = std::this_thread::get_id();
+        // shutdown() owns join_mutex while draining Gs. A worker must not
+        // block here during requeue, or shutdown would be waiting for a G
+        // whose M is waiting for shutdown's join lock.
+        std::unique_lock<std::mutex> join_lock(join_mutex, std::try_to_lock);
+        if (!join_lock.owns_lock()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            // Reserve before moving any joinable std::thread. If allocation
+            // fails, maybe_grow() can leave the dead records for a later
+            // retry; after this point thread moves are noexcept and cannot
+            // make vector destruction terminate the process.
+            retired.reserve(machines.size());
+            for (auto it = machines.begin(); it != machines.end();) {
+                const auto& machine = *it;
+                if (!machine) {
+                    it = machines.erase(it);
+                } else if (machine->state.load(std::memory_order_acquire) ==
+                               MState::kDead &&
+                           machine->thread.get_id() != self) {
+                    if (machine->thread.joinable()) {
+                        retired.emplace_back(std::move(machine->thread));
+                    }
+                    it = machines.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (auto& thread : retired) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+        // Keep shutdown/reaper serialization through the actual join. The
+        // retired worker records are already erased, but releasing the gate
+        // earlier would let an owner observe a half-finished maintenance pass.
+        join_lock.unlock();
+    }
+
+    /// 函数功能：执行 detached_machine_count_locked，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    // 统计当前仍处于 sysmon 逻辑解绑状态的 M。调用方必须持有 mutex；
+    // 这样 sysmon 标记后、原 G 返回前的短竞态不会使用过期计数扩容。
+    /// 函数功能：完成 detached_machine_count_locked 调用，读取或更新相关运行时状态。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+    std::size_t detached_machine_count_locked() const noexcept {
+        std::size_t count = 0;
+        for (const auto& machine : machines) {
+            if (machine &&
+                machine->processor_detached.load(std::memory_order_acquire)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    // 普通入队只按 runnable demand 扩容；每个仍 detached 的长阻塞 M
+    // 预留一个替代槽，即便当前队列暂时为空，也不会让 P 长时间失去
+    // 可运行的 M。
+    /// 函数功能：完成 maybe_grow 调用，读取或更新相关运行时状态。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+    void maybe_grow(Scheduler* scheduler) {
+        if (!scheduler) {
+            return;
+        }
+        if (!started.load(std::memory_order_acquire) ||
+            draining.load(std::memory_order_acquire) ||
+            stopping.load(std::memory_order_acquire)) {
+            return;
+        }
+        try {
+            reap_dead_workers();
+        } catch (...) {
+            // Failure to allocate a temporary join list cannot invalidate
+            // accepted Gs. The dead records remain safe for shutdown/retry.
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!started.load(std::memory_order_acquire) ||
+            draining.load(std::memory_order_acquire) ||
+            stopping.load(std::memory_order_acquire)) {
+            return;
+        }
+        const auto queued = runnable.load(std::memory_order_acquire);
+        const auto busy = running_workers.load(std::memory_order_acquire);
+        const auto active = active_workers.load(std::memory_order_relaxed);
+        const auto blocking = blocking_workers.load(std::memory_order_acquire);
+        const auto detached = detached_machine_count_locked();
+        const auto effective_blocking = std::max(blocking, detached);
+        // Normal runnable bursts stay P-bounded.  Each explicitly declared
+        // native blocking M contributes one replacement slot, up to the
+        // configured max; this prevents a large queue from creating dozens
+        // of threads merely because max_workers is generous.
+        const auto extra_ceiling =
+            effective_blocking > std::numeric_limits<std::size_t>::max() -
+                              config.processor_count
+                ? std::numeric_limits<std::size_t>::max()
+                : config.processor_count + effective_blocking;
+        const auto worker_ceiling = std::min(config.max_workers, extra_ceiling);
+        const auto demand =
+            queued > std::numeric_limits<std::size_t>::max() - busy
+                ? std::numeric_limits<std::size_t>::max()
+                : queued + busy;
+        auto desired = std::min(worker_ceiling,
+                                std::max(config.min_workers, demand));
+        if (detached != 0) {
+            // 替代槽只需要补足当前的最小 worker 底线；普通 runnable
+            // 需求仍由上面的 P 有界 ceiling 控制。不能因为机器有很多
+            // 个 P，就为一个长 syscall 无条件启动 P+1 个 M。
+            const auto handoff_target = std::min(
+                worker_ceiling,
+                detached > std::numeric_limits<std::size_t>::max() -
+                                  config.min_workers
+                    ? std::numeric_limits<std::size_t>::max()
+                    : config.min_workers + detached);
+            desired = std::max(desired, handoff_target);
+        }
+        if (desired <= active) {
+            return;
+        }
+        const auto to_add = desired - active;
+        for (std::size_t i = 0; i < to_add; ++i) {
+            try {
+                if (!spawn_worker_locked(scheduler)) {
+                    break;
+                }
+            } catch (...) {
+                // Thread-resource exhaustion degrades parallelism, not the
+                // accepted Task lifetime. Existing M's retain all queue work.
+                break;
+            }
+        }
+        lock.unlock();
+        condition.notify_all();
+    }
+
+    // sysmon 只做可逆的资源记账：它不会从别的线程跳转或终止正在
+    // syscall 中的 C++ 栈。达到阈值后，M 继续执行原生调用，但从 P 的
+    // attached 计数中移除，并按阻塞数申请替代 M。
+    /// 函数功能：完成 sysmon_pass 调用，读取或更新相关运行时状态。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+    void sysmon_pass(Scheduler* scheduler) noexcept {
+        if (!scheduler || !config.enable_sysmon) {
+            return;
+        }
+        // 心跳先于调度器锁更新。高负载时即使本轮无法取得锁，
+        // monitor 线程也不会永久卡在业务队列上，调用者仍能观察到它在线。
+        const auto now = steady_now_ns();
+        sysmon_pass_count.fetch_add(1, std::memory_order_relaxed);
+        const auto threshold = milliseconds_to_ns(config.long_syscall_threshold);
+        std::size_t detached_count = 0;
+        {
+            std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+            if (!lock.owns_lock()) {
+                // 不要把一次锁竞争当成“本轮扫描完成”。worker 在高负载
+                // 下可能连续持有主锁；保留重试标记让 monitor 缩短下一
+                // 个周期，而不是静默丢失长 syscall 的解绑机会。
+                sysmon_retry_pending.store(true, std::memory_order_release);
+                return;
+            }
+            sysmon_retry_pending.store(false, std::memory_order_release);
+            for (const auto& machine : machines) {
+                if (!machine ||
+                    machine->state.load(std::memory_order_acquire) !=
+                        MState::kBlocking) {
+                    continue;
+                }
+                const auto since = machine->blocking_since_ns.load(
+                    std::memory_order_acquire);
+                if (since <= 0 || now < since || now - since < threshold ||
+                    machine->processor_detached.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                machine->processor_detached.store(true,
+                                                   std::memory_order_release);
+                machine->long_syscall_count.fetch_add(
+                    1, std::memory_order_relaxed);
+                const auto processor_id = machine->processor % processors.size();
+                auto& processor = processors[processor_id];
+                if (processor.active_machines.load(
+                        std::memory_order_relaxed) != 0) {
+                    processor.active_machines.fetch_sub(
+                        1, std::memory_order_acq_rel);
+                }
+                if (processor.active_machines.load(
+                        std::memory_order_relaxed) == 0 &&
+                    !stopping.load(std::memory_order_acquire)) {
+                    processor.state.store(PState::kIdle,
+                                          std::memory_order_release);
+                }
+                ++detached_count;
+            }
+        }
+        if (detached_count != 0) {
+            maybe_grow(scheduler);
+            condition.notify_all();
+        }
+    }
+
+    /// 函数功能：执行 sysmon_loop，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    void sysmon_loop(Scheduler* scheduler) noexcept {
+        while (!sysmon_stop.load(std::memory_order_acquire)) {
+            // sysmon 的节拍等待不能争用调度器主锁。worker 在高负载下可能
+            // 持有主锁进行队列/生命周期处理；监控线程只应等待自己的停止
+            // 条件，然后在扫描阶段用 try_to_lock 做一次有界尝试。
+            const bool retry =
+                sysmon_retry_pending.exchange(false, std::memory_order_acq_rel);
+            // 锁竞争后的重试保持有界退避，避免 monitor 在主锁长期繁忙
+            // 时忙等，同时确保一次失败扫描不会被完整周期掩盖。
+            const auto wait_interval = retry
+                                           ? std::min(
+                                                 config.sysmon_interval,
+                                                 std::chrono::milliseconds(1))
+                                           : config.sysmon_interval;
+            std::unique_lock<std::mutex> lock(sysmon_wait_mutex);
+            sysmon_wait_condition.wait_for(lock, wait_interval, [this] {
+                return sysmon_stop.load(std::memory_order_acquire) ||
+                       stopping.load(std::memory_order_acquire) ||
+                       sysmon_retry_pending.load(std::memory_order_acquire);
+            });
+            const bool stop = sysmon_stop.load(std::memory_order_acquire) ||
+                              stopping.load(std::memory_order_acquire);
+            lock.unlock();
+            if (stop) {
+                break;
+            }
+            sysmon_pass(scheduler);
+        }
+        sysmon_active.store(false, std::memory_order_release);
+    }
+
+    /// 函数功能：执行 stop_sysmon，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] join 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    void stop_sysmon(bool join) noexcept {
+        sysmon_stop.store(true, std::memory_order_release);
+        sysmon_wait_condition.notify_all();
+        if (join && sysmon_thread.joinable() &&
+            sysmon_thread.get_id() != std::this_thread::get_id()) {
+            sysmon_thread.join();
+        }
+    }
+
+    void collect_terminal_locked(
+        std::vector<std::shared_ptr<Task>>& deferred_destruction) noexcept {
+        // The registry strongly owns every non-terminal G, including a Fiber
+        // parked outside a run queue. This prevents destruction of a suspended
+        // stack. Move terminal entries to caller-owned storage so arbitrary
+        // user captures are never destroyed while the scheduler lock is held.
+        for (std::size_t stripe = 0; stripe < kRegistryStripeCount;
+             ++stripe) {
+            auto& task_registry = task_registries[stripe];
+            std::lock_guard<std::mutex> registry_lock(
+                registry_mutexes[stripe]);
+            try {
+                deferred_destruction.reserve(deferred_destruction.size() +
+                                             task_registry.size());
+            } catch (...) {
+                // Retaining a terminal entry is safe. A later worker/shutdown
+                // pass can reclaim it when allocation succeeds.
+                continue;
+            }
+            // 单次稳定压缩是 O(n)。逐项 vector::erase 会把大批任务完成时的
+            // 回收变成 O(n²)，且整段移动发生在调度器总锁内。
+            auto output = task_registry.begin();
+            for (auto it = task_registry.begin(); it != task_registry.end();
+                 ++it) {
+                if (!*it || (*it)->terminal()) {
+                    if (*it) {
+                        deferred_destruction.emplace_back(std::move(*it));
+                    }
+                } else {
+                    if (output != it) {
+                        *output = std::move(*it);
+                    }
+                    ++output;
+                }
+            }
+            task_registry.erase(output, task_registry.end());
+        }
+    }
+
+    /// 函数功能：执行 emergency_enqueue_locked，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    void emergency_enqueue_locked(const std::shared_ptr<Task>& task) noexcept {
+        if (!task) {
+            return;
+        }
+        task->m_emergency_next.reset();
+        if (emergency_tail) {
+            emergency_tail->m_emergency_next = task;
+        } else {
+            emergency_head = task;
+        }
+        emergency_tail = task;
+    }
+
+    /// 函数功能：执行 emergency_pop_locked，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    std::shared_ptr<Task> emergency_pop_locked() noexcept {
+        if (!emergency_head) {
+            return {};
+        }
+        auto task = std::move(emergency_head);
+        emergency_head = std::move(task->m_emergency_next);
+        if (!emergency_head) {
+            emergency_tail.reset();
+        }
+        return task;
+    }
+
+    void begin_shutdown_locked(
+        std::vector<std::shared_ptr<Task>>& deferred_destruction,
+        std::vector<std::shared_ptr<Task>>& completion_notifications) {
+        // Unstarted Gs have no suspended stack and can be cancelled in place.
+        // Started Gs must remain runnable so their Fiber can return through its
+        // trampoline and execute stack-local destructors.
+        for (auto& processor : processors) {
+            std::lock_guard<std::mutex> queue_lock(processor.mutex);
+            std::deque<std::shared_ptr<Task>> resumable;
+            while (!processor.queue.empty()) {
+                auto task = std::move(processor.queue.front());
+                processor.queue.pop_front();
+                if (task->started()) {
+                    task->request_cancel(false);
+                    resumable.emplace_back(std::move(task));
+                } else {
+                    task->clear_queued();
+                    task->request_cancel(false);
+                    completion_notifications.emplace_back(task);
+                    runnable.fetch_sub(1, std::memory_order_relaxed);
+                    deferred_destruction.emplace_back(std::move(task));
+                }
+            }
+            processor.queue.swap(resumable);
+        }
+
+        std::deque<std::shared_ptr<Task>> resumable_global;
+        while (!global_queue.empty()) {
+            auto task = std::move(global_queue.front());
+            global_queue.pop_front();
+            if (task->started()) {
+                task->request_cancel(false);
+                resumable_global.emplace_back(std::move(task));
+            } else {
+                task->clear_queued();
+                task->request_cancel(false);
+                completion_notifications.emplace_back(task);
+                runnable.fetch_sub(1, std::memory_order_relaxed);
+                deferred_destruction.emplace_back(std::move(task));
+            }
+        }
+        global_queue.swap(resumable_global);
+
+        // external producers do not hold scheduler mutex. Each incoming
+        // stripe is drained independently so shutdown never needs one global
+        // producer lock while a burst is being accepted.
+        for (std::size_t stripe = 0; stripe < kIncomingStripeCount;
+             ++stripe) {
+            std::deque<std::shared_ptr<Task>> incoming;
+            bool incoming_empty = false;
+            {
+                std::lock_guard<std::mutex> incoming_lock(
+                    incoming_mutexes[stripe]);
+                incoming.swap(incoming_queues[stripe]);
+                incoming_empty = incoming_queues[stripe].empty();
+            }
+            if (incoming_empty) {
+                incoming_nonempty_mask.fetch_and(
+                    ~(std::uint32_t{1} << stripe), std::memory_order_release);
+            }
+            incoming_count.fetch_sub(incoming.size(),
+                                     std::memory_order_relaxed);
+            for (auto& task : incoming) {
+                if (!task) continue;
+                if (task->started()) {
+                    task->request_cancel(false);
+                    global_queue.emplace_back(std::move(task));
+                } else {
+                    task->clear_queued();
+                    task->request_cancel(false);
+                    completion_notifications.emplace_back(task);
+                    runnable.fetch_sub(1, std::memory_order_relaxed);
+                    deferred_destruction.emplace_back(std::move(task));
+                }
+            }
+        }
+
+        // The rescue queue contains only previously started Gs when a normal
+        // queue allocation failed. Keep them runnable and request cooperative
+        // cancellation; no new node allocation is required here.
+        for (auto task = emergency_head; task; task = task->m_emergency_next) {
+            task->request_cancel(false);
+        }
+
+        // Waiting Gs are not in a queue. Request cancellation and perform the
+        // same pending-wake handoff used by I/O readiness so a park racing
+        // this scan cannot be lost.
+        for (std::size_t stripe = 0; stripe < kRegistryStripeCount;
+             ++stripe) {
+            std::lock_guard<std::mutex> registry_lock(
+                registry_mutexes[stripe]);
+            for (const auto& task : task_registries[stripe]) {
+                if (!task) {
+                    continue;
+                }
+                const auto state = task->state();
+                if (state == GState::kDead || state == GState::kCancelled ||
+                    state == GState::kFailed) {
+                    continue;
+                }
+                task->request_cancel(false);
+                if (task->terminal()) {
+                    completion_notifications.emplace_back(task);
+                }
+                if (!task->started()) {
+                    continue;
+                }
+                const auto action = task->wake_for_scheduler();
+                if (action == WakeAction::kEnqueue && task->try_mark_queued()) {
+                    runnable.fetch_add(1, std::memory_order_relaxed);
+                    try {
+                        global_queue.emplace_back(task);
+                    } catch (...) {
+                        emergency_enqueue_locked(task);
+                    }
+                } else if (task->state() == GState::kRunnable &&
+                           !task->queued() && task->try_mark_queued()) {
+                    // A notifier may have changed Waiting -> Runnable before it
+                    // acquired this admission mutex. Shutdown must claim that G
+                    // itself rather than leave a suspended Runnable unqueued.
+                    runnable.fetch_add(1, std::memory_order_relaxed);
+                    emergency_enqueue_locked(task);
+                }
+            }
+        }
+        collect_terminal_locked(deferred_destruction);
+    }
+
+    /// 函数功能：执行 all_tasks_terminal_locked，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    bool all_tasks_terminal_locked() const {
+        for (std::size_t stripe = 0; stripe < kRegistryStripeCount;
+             ++stripe) {
+            std::lock_guard<std::mutex> registry_lock(
+                registry_mutexes[stripe]);
+            if (!std::all_of(task_registries[stripe].begin(),
+                             task_registries[stripe].end(),
+                             [](const auto& task) {
+                                 return !task || task->terminal();
+                             })) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// 函数功能：执行 finish_draining_locked，完成本函数所属模块的单步操作。
+    /// 执行流程：
+    /// 1. 校验传入参数以及当前对象/线程状态；
+    /// 2. 按状态机规则获取必要的锁并更新内部数据；
+    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
+    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
+    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
+    bool finish_draining_locked() noexcept {
+        if (!draining.load(std::memory_order_acquire) ||
+            !all_tasks_terminal_locked()) {
+            return false;
+        }
+        draining.store(false, std::memory_order_release);
+        stopping.store(true, std::memory_order_release);
+        return true;
+    }
+
+    SchedulerConfig config;
+    std::thread sysmon_thread;
+    std::atomic<bool> sysmon_stop{false};
+    std::atomic<bool> sysmon_active{false};
+    std::atomic<bool> sysmon_retry_pending{false};
+    std::atomic<std::uint64_t> sysmon_pass_count{0};
+    std::mutex sysmon_wait_mutex;
+    std::condition_variable sysmon_wait_condition;
+    std::shared_ptr<const void> owner_token;
+    std::shared_ptr<TaskCancellationGate> cancellation_gate;
+    // 观察者属于可选扩展；通过独立互斥量替换，避免配置/插件管理线程
+    // 与 worker 共享 Scheduler::mutex。事件回调永远在该锁释放后执行。
+    mutable std::mutex observer_mutex;
+    SchedulerObserverPtr observer;
+    mutable std::mutex mutex;
+    mutable std::array<std::mutex, kRegistryStripeCount> registry_mutexes;
+    std::array<std::mutex, kIncomingStripeCount> incoming_mutexes;
+    std::array<std::deque<std::shared_ptr<Task>>, kIncomingStripeCount>
+        incoming_queues;
+    std::atomic<std::size_t> incoming_count{0};
+    std::atomic<std::size_t> next_incoming_stripe{0};
+    std::atomic<std::size_t> incoming_probe{0};
+    std::atomic<std::uint32_t> incoming_nonempty_mask{0};
+    std::condition_variable condition;
+    std::deque<std::shared_ptr<Task>> global_queue;
+    std::shared_ptr<Task> emergency_head;
+    std::shared_ptr<Task> emergency_tail;
+    std::array<std::vector<std::shared_ptr<Task>>, kRegistryStripeCount>
+        task_registries;
+    std::deque<Processor> processors;
+    // Machine records outlive their worker thread. Keeping shared slots makes
+    // machine indices/references stable while dynamic growth appends workers,
+    // and lets snapshots safely observe a worker that is being reaped.
+    // A deque keeps published machine slots stable while dynamic M growth
+    // appends records; snapshots and BlockingRegion lookup never observe a
+    // vector relocation of an existing shared_ptr slot.
+    std::deque<std::shared_ptr<Machine>> machines;
+    std::atomic<bool> started{false};
+    std::atomic<bool> draining{false};
+    std::atomic<bool> stopping{false};
+    std::atomic<bool> accepting{true};
+    std::atomic<std::size_t> runnable{0};
+    std::atomic<std::size_t> active_workers{0};
+    std::atomic<std::size_t> running_workers{0};
+    std::atomic<std::size_t> blocking_workers{0};
+    std::atomic<std::size_t> next_processor{0};
+    std::atomic<std::uint64_t> enqueue_maintenance{0};
+    std::atomic<std::uint64_t> metric_task_runs{0};
+    std::atomic<std::uint64_t> metric_task_completions{0};
+    std::atomic<std::uint64_t> metric_fiber_resume_ns{0};
+    std::atomic<std::uint64_t> metric_local_queue_pops{0};
+    std::atomic<std::uint64_t> metric_steal_pops{0};
+    std::mutex join_mutex;
+};
+
+/// 函数功能：完成 Scheduler 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] config 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+struct Scheduler::Lifetime final {
+    explicit Lifetime(Scheduler* value) : owner(value) {}
+    mutable std::mutex mutex;
+    Scheduler* owner{nullptr};
+};
+
+class Scheduler::TimerExecutorAdapter final : public core::TimerExecutor {
+public:
+    explicit TimerExecutorAdapter(const std::shared_ptr<Lifetime>& lifetime)
+        : m_lifetime(lifetime) {}
+
+    bool Submit(std::function<void()> callback) override {
+        const auto lifetime = m_lifetime.lock();
+        if (!lifetime) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(lifetime->mutex);
+        if (!lifetime->owner || !lifetime->owner->is_running()) {
+            return false;
+        }
+        return static_cast<bool>(lifetime->owner->spawn(std::move(callback)));
+    }
+
+private:
+    std::weak_ptr<Lifetime> m_lifetime;
+};
+
+Scheduler::Scheduler(SchedulerConfig config)
+    : m_lifetime(std::make_shared<Lifetime>(this)),
+      m_impl(std::make_unique<Impl>(config, this)) {}
+
+Scheduler::Scheduler(std::size_t processor_count)
+    : Scheduler([processor_count] {
+          SchedulerConfig config;
+          config.processor_count = processor_count;
+          return config;
+      }()) {}
+
+Scheduler::~Scheduler() {
+    if (m_lifetime) {
+        std::lock_guard<std::mutex> lock(m_lifetime->mutex);
+        m_lifetime->owner = nullptr;
+    }
+    // The worker loop stores this object as its scheduler identity. Destroying
+    // the owner from one of its own Gs would otherwise free m_impl while that
+    // loop is still using it. There is no safe implicit "delete later" point
+    // for a stack-allocated Scheduler, so fail fast instead of permitting a
+    // use-after-free. The documented ownership contract is that the Scheduler
+    // (and IOManager) outlives all worker threads.
+    if (current_scheduler() == this) {
+        std::terminate();
+    }
+    shutdown();
+    if (m_impl && m_impl->cancellation_gate) {
+        std::lock_guard<std::mutex> lock(m_impl->cancellation_gate->m_mutex);
+        m_impl->cancellation_gate->m_scheduler = nullptr;
+    }
+}
+
+/// 函数功能：完成 start 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Scheduler::start() {
+    std::unique_lock<std::mutex> lock(m_impl->mutex);
+    if (m_impl->started.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    m_impl->started.store(true, std::memory_order_release);
+    m_impl->accepting.store(true, std::memory_order_release);
+    m_impl->sysmon_stop.store(false, std::memory_order_release);
+    try {
+        for (std::size_t i = 0; i < m_impl->config.min_workers; ++i) {
+            (void)m_impl->spawn_worker_locked(this);
+        }
+        if (m_impl->config.enable_sysmon) {
+            m_impl->sysmon_active.store(true, std::memory_order_release);
+            m_impl->sysmon_thread = std::thread([impl = m_impl.get(), this] {
+                impl->sysmon_loop(this);
+            });
+        }
+    } catch (...) {
+        m_impl->sysmon_active.store(false, std::memory_order_release);
+        m_impl->accepting.store(false, std::memory_order_release);
+        lock.unlock();
+        // Drain and join the workers that were successfully created before
+        // propagating the thread-creation failure. Leaving a partially
+        // started scheduler in draining state would strand accepted Gs.
+        shutdown();
+        throw;
+    }
+    lock.unlock();
+    m_impl->condition.notify_all();
+    m_impl->emit_event(SchedulerEvent{SchedulerEventType::kStarted});
+}
+
+bool Scheduler::shutdown_for(
+    std::chrono::steady_clock::duration timeout) {
+    if (!m_impl) {
+        return true;
+    }
+
+    const auto clock_now = std::chrono::steady_clock::now();
+    const bool bounded =
+        timeout != std::chrono::steady_clock::duration::max();
+    const auto nonnegative_timeout =
+        timeout < std::chrono::steady_clock::duration::zero()
+            ? std::chrono::steady_clock::duration::zero()
+            : timeout;
+    const auto max_time = std::chrono::steady_clock::time_point::max();
+    const auto deadline =
+        bounded && nonnegative_timeout < max_time - clock_now
+            ? clock_now + nonnegative_timeout
+            : max_time;
+
+    // A worker may initiate shutdown, but it must never join another M: two
+    // workers doing so concurrently would each wait for the other to return
+    // from shutdown. Worker callers only publish the stop request; a later
+    // external caller (normally the owner/destructor) performs all joins.
+    const bool called_from_worker = current_scheduler() == this;
+    std::unique_lock<std::mutex> join_lock(m_impl->join_mutex,
+                                           std::defer_lock);
+    if (!called_from_worker) {
+        join_lock.lock();
+    }
+
+    // Keep cancelled queue-owned tasks alive until all scheduler locks have
+    // been released. A user capture's destructor is arbitrary C++ code and
+    // must not run while it can re-enter this Scheduler.
+    std::vector<std::shared_ptr<Task>> deferred_destruction;
+    std::vector<std::shared_ptr<Task>> completion_notifications;
+    bool was_started = false;
+
+    {
+        std::unique_lock<std::mutex> lock(m_impl->mutex);
+        was_started = m_impl->started.load(std::memory_order_acquire);
+        if (!m_impl->draining.load(std::memory_order_acquire) &&
+            !m_impl->stopping.load(std::memory_order_acquire)) {
+            m_impl->accepting.store(false, std::memory_order_release);
+            m_impl->draining.store(true, std::memory_order_release);
+            m_impl->begin_shutdown_locked(deferred_destruction,
+                                           completion_notifications);
+        }
+    }
+
+    if (was_started) {
+        m_impl->emit_event(SchedulerEvent{SchedulerEventType::kStopping});
+    }
+
+    // sysmon 在 draining 阶段仍保持运行，直到所有已启动 G 完成自然
+    // 取消/唤醒。这样长系统调用返回前，监控不会提前丢失替代 M。
+    for (const auto& task : completion_notifications) {
+        if (task) {
+            task->notify_terminal();
+        }
+    }
+
+    if (!was_started) {
+        {
+            std::lock_guard<std::mutex> lock(m_impl->mutex);
+            m_impl->stopping.store(true, std::memory_order_release);
+            m_impl->draining.store(false, std::memory_order_release);
+            m_impl->collect_terminal_locked(deferred_destruction);
+            for (auto& processor : m_impl->processors) {
+                processor.state.store(PState::kDead,
+                                      std::memory_order_release);
+            }
+        }
+        m_impl->stop_sysmon(true);
+        if (join_lock.owns_lock()) {
+            join_lock.unlock();
+        }
+        for (auto& task : deferred_destruction) {
+            if (task) {
+                auto abandoned_function = task->release_callable();
+            }
+        }
+        deferred_destruction.clear();
+        completion_notifications.clear();
+        return true;
+    }
+    m_impl->condition.notify_all();
+
+    if (called_from_worker) {
+        for (auto& task : deferred_destruction) {
+            if (task) {
+                auto abandoned_function = task->release_callable();
+            }
+        }
+        deferred_destruction.clear();
+        return false;
+    }
+
+    // Keep workers alive while every started Fiber observes cancellation and
+    // returns through its trampoline. This can wait indefinitely for a G that
+    // never reaches a cooperative boundary, just as joining an uncooperative
+    // std::thread can; discarding its suspended stack would skip RAII.
+    {
+        std::unique_lock<std::mutex> lock(m_impl->mutex);
+        const auto terminal = [this] {
+            return m_impl->all_tasks_terminal_locked();
+        };
+        const bool completed =
+            bounded ? m_impl->condition.wait_until(lock, deadline, terminal)
+                    : (m_impl->condition.wait(lock, terminal), true);
+        m_impl->collect_terminal_locked(deferred_destruction);
+        if (!completed) {
+            // 保持 draining 状态和已发布的取消请求；Fiber 栈仍由 worker
+            // 拥有，不能因为超时而强制释放。后续 shutdown_for()/shutdown()
+            // 会从这里继续收尾。
+            lock.unlock();
+            for (auto& task : deferred_destruction) {
+                if (task) {
+                    auto abandoned_function = task->release_callable();
+                }
+            }
+            deferred_destruction.clear();
+            completion_notifications.clear();
+            return false;
+        }
+        m_impl->stopping.store(true, std::memory_order_release);
+        m_impl->draining.store(false, std::memory_order_release);
+    }
+    m_impl->stop_sysmon(true);
+    m_impl->condition.notify_all();
+
+    // 先等待 worker 主动退出；这样有界调用不会在 timeout 后把仍运行的
+    // std::thread 留给析构路径。若本轮超时，stopping 保持为 true，后续
+    // 调用可以继续等待并完成 join。
+    if (bounded) {
+        std::unique_lock<std::mutex> lock(m_impl->mutex);
+        const bool workers_stopped = m_impl->condition.wait_until(
+            lock, deadline, [this] {
+                return m_impl->active_workers.load(std::memory_order_acquire) ==
+                       0;
+            });
+        if (!workers_stopped) {
+            lock.unlock();
+            for (auto& task : deferred_destruction) {
+                if (task) {
+                    auto abandoned_function = task->release_callable();
+                }
+            }
+            deferred_destruction.clear();
+            completion_notifications.clear();
+            return false;
+        }
+    }
+
+    // The external caller owns join_mutex, which prevents the worker-side
+    // reaper from moving or erasing thread objects while they are joined.
+    // Extract one std::thread at a time while holding Impl::mutex, then join
+    // it after releasing that mutex because worker epilogues take the mutex
+    // before exit. Moving a std::thread is noexcept, so shutdown does not
+    // need a temporary vector allocation that could fail during OOM cleanup.
+    for (;;) {
+        std::thread worker;
+        {
+            std::lock_guard<std::mutex> lock(m_impl->mutex);
+            for (const auto& machine : m_impl->machines) {
+                if (machine && machine->thread.joinable()) {
+                    worker = std::move(machine->thread);
+                    break;
+                }
+            }
+        }
+        if (!worker.joinable()) {
+            break;
+        }
+        // Worker-initiated shutdown returned above, so this path is always an
+        // external owner. Join every remaining thread; comparing reusable
+        // std::thread::id values here could otherwise leave a joinable record.
+        worker.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        for (auto& processor : m_impl->processors) {
+            if (processor.active_machines.load(std::memory_order_acquire) ==
+                0) {
+                processor.state.store(PState::kDead,
+                                      std::memory_order_release);
+            }
+        }
+
+        bool any_joinable = false;
+        for (const auto& machine : m_impl->machines) {
+            any_joinable = any_joinable ||
+                           (machine && machine->thread.joinable());
+        }
+        if (!any_joinable) {
+            m_impl->started.store(false, std::memory_order_release);
+        }
+    }
+    if (join_lock.owns_lock()) {
+        join_lock.unlock();
+    }
+    for (auto& task : deferred_destruction) {
+        if (task) {
+            auto abandoned_function = task->release_callable();
+        }
+    }
+    deferred_destruction.clear();
+    completion_notifications.clear();
+    return true;
+}
+
+/// 函数功能：完成 shutdown 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Scheduler::shutdown() {
+    (void)shutdown_for(std::chrono::steady_clock::duration::max());
+}
+
+/// 函数功能：完成 is_running 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::is_running() const noexcept {
+    return m_impl && m_impl->started.load(std::memory_order_acquire) &&
+           !m_impl->draining.load(std::memory_order_acquire) &&
+           !m_impl->stopping.load(std::memory_order_acquire);
+}
+
+
+core::Timer Scheduler::schedule_at(
+    std::chrono::steady_clock::time_point deadline,
+    Task::Function function) {
+    if (!function || !m_impl) {
+        return {};
+    }
+    if (!is_running()) {
+        start();
+    }
+    auto executor = std::make_shared<TimerExecutorAdapter>(m_lifetime);
+    return core::TimerService::Default().ScheduleOn(
+        deadline, std::move(function), std::move(executor));
+}
+
+core::Timer Scheduler::schedule_after(
+    std::chrono::steady_clock::duration delay,
+    Task::Function function) {
+    return schedule_at(std::chrono::steady_clock::now() +
+                           (delay < std::chrono::steady_clock::duration::zero()
+                                ? std::chrono::steady_clock::duration::zero()
+                                : delay),
+                       std::move(function));
+}
+
+core::Timer Scheduler::schedule_every(
+    std::chrono::steady_clock::duration period,
+    Task::Function function,
+    core::TimerOptions options) {
+    if (!function) {
+        return {};
+    }
+    if (!is_running()) {
+        start();
+    }
+    auto executor = std::make_shared<TimerExecutorAdapter>(m_lifetime);
+    return core::TimerService::Default().ScheduleEveryOn(
+        period, std::move(function), std::move(executor), options);
+}
+
+
+/// 安装运行期调度器观察者；只替换插件指针，不改变任何 G/M/P 状态。
+/// @param observer 新观察者，空指针表示关闭事件通知。
+/// @return 无；观察者快照由 Impl 的独立锁保护。
+void Scheduler::set_observer(SchedulerObserverPtr observer) noexcept {
+    if (!m_impl) {
+        return;
+    }
+    try {
+        SchedulerObserverPtr replaced;
+        std::lock_guard<std::mutex> lock(m_impl->observer_mutex);
+        replaced = std::move(m_impl->observer);
+        m_impl->observer = std::move(observer);
+    } catch (...) {
+        // shared_ptr 交换不会主动分配；此处保持 noexcept 契约，异常时
+        // 保留原观察者，避免插件安装影响调度器运行。
+    }
+}
+
+/// 读取当前观察者快照；调用方可在返回后安全持有该 shared_ptr。
+/// @return 当前观察者；未安装时返回空指针。
+SchedulerObserverPtr Scheduler::observer() const noexcept {
+    if (!m_impl) {
+        return {};
+    }
+    try {
+        std::lock_guard<std::mutex> lock(m_impl->observer_mutex);
+        return m_impl->observer;
+    } catch (...) {
+        return {};
+    }
+}
+
+/// 函数功能：完成 spawn 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] function 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::shared_ptr<Task> Scheduler::spawn(Task::Function function) {
+    return spawn(std::move(function), TaskOptions{});
+}
+
+std::shared_ptr<Task> Scheduler::spawn(Task::Function function,
+                                      TaskOptions options) {
+    if (options.stack_size == 0) {
+        options.stack_size = m_impl->config.fiber_stack_size;
+    }
+    if (options.fiber_bin_capacity == 0) {
+        options.fiber_bin_capacity = m_impl->config.fiber_bin_capacity;
+    }
+    auto task = std::make_shared<Task>(std::move(function), options);
+    if (!enqueue(task)) {
+        task->cancel();
+    }
+    return task;
+}
+
+/// 函数功能：完成 enqueue 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
+    if (!task || !m_impl) {
+        return false;
+    }
+    const auto initial_state = task->state();
+    if (initial_state == GState::kDead || initial_state == GState::kCancelled ||
+        initial_state == GState::kFailed) {
+        return false;
+    }
+
+    const bool from_worker =
+        current_scheduler() == this && t_processor_id < m_impl->processors.size();
+    const bool drain_resume =
+        m_impl->draining.load(std::memory_order_acquire) &&
+        task->started() && task->cancellation_requested();
+    if ((!m_impl->accepting.load(std::memory_order_acquire) && !drain_resume) ||
+        m_impl->stopping.load(std::memory_order_acquire)) {
+        bool notify = false;
+        if (task->owned_by(m_impl->owner_token)) {
+            task->request_cancel(false);
+            notify = task->terminal();
+        }
+        if (notify) {
+            task->notify_terminal();
+        }
+        return false;
+    }
+
+    const auto admission_state = task->state();
+    if (!drain_resume && admission_state != GState::kNew &&
+        admission_state != GState::kRunnable) {
+        return false;
+    }
+    if (!task->prepare_enqueue(m_impl->owner_token,
+                               m_impl->cancellation_gate)) {
+        return false;
+    }
+
+    bool registered_here = false;
+    bool registry_admission_failed = false;
+    // IO/定时器唤醒的 G 通常已经在注册表中。已注册任务只需重新发布
+    // 队列节点，不再为每次 wake 争用对应条带的 registry mutex；首次
+    // 入队仍在锁内完成 try_register + vector 发布的原子边界。
+    if (!task->registered()) {
+        const auto registry_stripe = Scheduler::Impl::registry_stripe(*task);
+        std::lock_guard<std::mutex> registry_lock(
+            m_impl->registry_mutexes[registry_stripe]);
+        if (!task->registered()) {
+            registered_here = task->try_register();
+            if (registered_here) {
+                try {
+                    m_impl->task_registries[registry_stripe].emplace_back(task);
+                } catch (...) {
+                    task->m_registered.store(false, std::memory_order_release);
+                    registered_here = false;
+                    registry_admission_failed = true;
+                }
+            }
+        }
+    }
+    // 注册表是挂起 G 的最后一个强所有权。首次注册分配失败时绝不能
+    // 继续发布队列节点，否则任务第一次 park 后可能只剩调用方的裸句柄，
+    // Fiber 栈会在无人持有时被销毁。将这次入队报告为失败，让 spawn()
+    // 按普通取消路径处理。
+    if (registry_admission_failed) {
+        task->clear_queued();
+        task->request_cancel(false);
+        task->notify_terminal();
+        return false;
+    }
+
+    if (task->state() != GState::kRunnable || !task->queued()) {
+        if (registered_here) {
+            std::shared_ptr<Task> abandoned;
+            {
+                const auto registry_stripe =
+                    Scheduler::Impl::registry_stripe(*task);
+                std::lock_guard<std::mutex> registry_lock(
+                    m_impl->registry_mutexes[registry_stripe]);
+                auto& task_registry =
+                    m_impl->task_registries[registry_stripe];
+                auto found = std::find(task_registry.begin(),
+                                       task_registry.end(), task);
+                if (found != task_registry.end()) {
+                    if (task->terminal()) {
+                        abandoned = std::move(*found);
+                    }
+                    task_registry.erase(found);
+                }
+            }
+            task->m_registered.store(false, std::memory_order_release);
+            if (abandoned) {
+                auto abandoned_function = abandoned->release_callable();
+            }
+        }
+        return false;
+    }
+
+    // Worker-issued shutdown resumes must use the admission-locked queues so
+    // shutdown's draining scan and the resume are ordered. Normal producers
+    // use the short incoming queue and never contend with worker dequeue.
+    if (!from_worker && !drain_resume) {
+        bool published = false;
+        // 同一生产者固定到同一条带，保留单生产者提交的 FIFO；第一次
+        // 进入时才从全局分配条带，后续任务不再为选择条带做原子递增。
+        static thread_local std::size_t t_incoming_stripe =
+            std::numeric_limits<std::size_t>::max();
+        if (t_incoming_stripe == std::numeric_limits<std::size_t>::max()) {
+            t_incoming_stripe =
+                m_impl->next_incoming_stripe.fetch_add(
+                    1, std::memory_order_relaxed) &
+                (Scheduler::Impl::kIncomingStripeCount - 1);
+        }
+        const auto incoming_stripe = t_incoming_stripe;
+        {
+            std::lock_guard<std::mutex> incoming_lock(
+                m_impl->incoming_mutexes[incoming_stripe]);
+            if (m_impl->accepting.load(std::memory_order_acquire) &&
+                !m_impl->stopping.load(std::memory_order_acquire)) {
+                m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+                try {
+                    m_impl->incoming_queues[incoming_stripe].emplace_back(task);
+                    m_impl->incoming_count.fetch_add(1,
+                                                     std::memory_order_release);
+                    m_impl->incoming_nonempty_mask.fetch_or(
+                        std::uint32_t{1} << incoming_stripe,
+                        std::memory_order_release);
+                    published = true;
+                } catch (...) {
+                    m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (!published) {
+            if (task->started()) {
+                // incoming_queue 的计数在 emplace 失败时已经回滚；救援链
+                // 仍需要重新计入 runnable，worker 取出它时才会配对递减。
+                std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
+                m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+                m_impl->emergency_enqueue_locked(task);
+                m_impl->condition.notify_one();
+                return true;
+            }
+            task->clear_queued();
+            task->request_cancel(false);
+            if (registered_here) {
+                const auto registry_stripe =
+                    Scheduler::Impl::registry_stripe(*task);
+                std::lock_guard<std::mutex> registry_lock(
+                    m_impl->registry_mutexes[registry_stripe]);
+                auto& task_registry =
+                    m_impl->task_registries[registry_stripe];
+                auto found = std::find(task_registry.begin(),
+                                       task_registry.end(), task);
+                if (found != task_registry.end()) {
+                    task_registry.erase(found);
+                }
+                task->m_registered.store(false, std::memory_order_release);
+            }
+            task->notify_terminal();
+            return false;
+        }
+    } else {
+        std::unique_lock<std::mutex> admission_lock(m_impl->mutex);
+        if ((!m_impl->accepting.load(std::memory_order_acquire) && !drain_resume) ||
+            m_impl->stopping.load(std::memory_order_acquire)) {
+            task->clear_queued();
+            task->request_cancel(false);
+            admission_lock.unlock();
+            task->notify_terminal();
+            return false;
+        }
+        const auto preferred =
+            from_worker ? static_cast<std::size_t>(t_processor_id)
+                        : m_impl->next_processor.fetch_add(
+                              1, std::memory_order_relaxed);
+        auto& processor =
+            m_impl->processors[preferred % m_impl->processors.size()];
+        std::lock_guard<std::mutex> queue_lock(processor.mutex);
+        const bool use_global =
+            processor.queue.size() >= m_impl->config.local_queue_limit;
+        m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+        try {
+            if (!use_global) {
+                processor.queue.push_back(task);
+            } else {
+                m_impl->global_queue.push_back(task);
+            }
+        } catch (...) {
+            if (task->started()) {
+                // 已启动 Fiber 不能在分配失败时丢失。救援队列复用
+                // Task 内嵌链，不需要再次分配节点，仍保留 runnable/queued
+                // 计数，后续 worker 会从这里恢复并完成取消收尾。
+                m_impl->emergency_enqueue_locked(task);
+            } else {
+                m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                task->clear_queued();
+                task->request_cancel(false);
+                admission_lock.unlock();
+                if (registered_here) {
+                    const auto registry_stripe =
+                        Scheduler::Impl::registry_stripe(*task);
+                    std::lock_guard<std::mutex> registry_lock(
+                        m_impl->registry_mutexes[registry_stripe]);
+                    auto& task_registry =
+                        m_impl->task_registries[registry_stripe];
+                    const auto found = std::find(task_registry.begin(),
+                                                 task_registry.end(), task);
+                    if (found != task_registry.end()) {
+                        task_registry.erase(found);
+                    }
+                    task->m_registered.store(false, std::memory_order_release);
+                }
+                task->notify_terminal();
+                return false;
+            }
+        }
+    }
+
+    const auto maintenance_ticket =
+        m_impl->enqueue_maintenance.fetch_add(1, std::memory_order_relaxed);
+    const bool initial_workers_missing =
+        m_impl->active_workers.load(std::memory_order_relaxed) <
+        m_impl->config.min_workers;
+    const bool replacement_may_be_needed =
+        m_impl->active_workers.load(std::memory_order_relaxed) <=
+            m_impl->config.min_workers &&
+        m_impl->runnable.load(std::memory_order_relaxed) != 0;
+    const bool processor_workers_missing =
+        m_impl->active_workers.load(std::memory_order_relaxed) <
+        m_impl->processors.size();
+    if (initial_workers_missing || replacement_may_be_needed ||
+        (processor_workers_missing && (maintenance_ticket & 63U) == 0U) ||
+        (!processor_workers_missing && (maintenance_ticket & 1023U) == 0U)) {
+        m_impl->maybe_grow(this);
+    }
+    m_impl->condition.notify_one();
+    return true;
+}
+
+bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
+                                     PId processor_id) {
+    if (!task || processor_id >= m_impl->processors.size()) {
+        return false;
+    }
+    if (!m_impl->accepting.load(std::memory_order_acquire) ||
+        m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!task->try_mark_queued()) {
+        return task->queued();
+    }
+
+    auto& processor = m_impl->processors[processor_id];
+    bool retry_regular_enqueue = false;
+    bool notify_worker = false;
+    {
+        std::lock_guard<std::mutex> queue_lock(processor.mutex);
+        if (!m_impl->accepting.load(std::memory_order_acquire) ||
+            m_impl->draining.load(std::memory_order_acquire) ||
+            m_impl->stopping.load(std::memory_order_acquire)) {
+            retry_regular_enqueue = true;
+        } else {
+            m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+            try {
+                processor.queue.push_back(task);
+                // 该 P 已有运行中的 M 时，它会在当前 G 返回后消费本地
+                // 队列；此时唤醒额外 M 只会制造 futex 抖动。
+                const auto running = processor.running_machines.load(
+                    std::memory_order_relaxed);
+                const auto active = processor.active_machines.load(
+                    std::memory_order_relaxed);
+                notify_worker = running == 0 ||
+                                (processor.queue.size() >= 16U &&
+                                 running < active);
+            } catch (...) {
+                m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                task->clear_queued();
+                retry_regular_enqueue = true;
+            }
+        }
+    }
+    if (retry_regular_enqueue) {
+        task->clear_queued();
+        return false;
+    }
+    if (notify_worker) {
+        m_impl->condition.notify_one();
+    }
+    return true;
+}
+
+/// 函数功能：完成 requeue_from_worker 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
+    if (!task || current_scheduler() != this ||
+        t_processor_id >= m_impl->processors.size()) {
+        return enqueue(task);
+    }
+
+    // Worker 自己把刚刚 yield 的 G 放回原 P 时，不需要重新做 owner、
+    // registry 和全局 admission。只使用 P 队列锁，避免每次 Fiber 切换
+    // 都争用调度器总锁。shutdown 仍通过 draining/stopping 的二次检查与
+    // P 队列锁建立一致的排空顺序。
+    if (!m_impl->accepting.load(std::memory_order_acquire) ||
+        m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire)) {
+        return enqueue(task);
+    }
+
+    auto& processor = m_impl->processors[t_processor_id];
+    bool retry_regular_enqueue = false;
+    bool notify_worker = false;
+    {
+        std::lock_guard<std::mutex> queue_lock(processor.mutex);
+        if (!m_impl->accepting.load(std::memory_order_acquire) ||
+            m_impl->draining.load(std::memory_order_acquire) ||
+            m_impl->stopping.load(std::memory_order_acquire)) {
+            retry_regular_enqueue = true;
+        } else if (task->try_mark_queued_from_worker()) {
+            // 计数必须先于节点发布，否则另一个 worker 可能先 pop 节点
+            // 再递减尚未增加的 runnable，造成下溢。
+            m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+            try {
+                processor.queue.push_back(task);
+                // 当前 M 正在执行这个 G；本地回队无需再次唤醒另一个
+                // M，减少每次 Fiber handoff 的条件变量切换。
+                const auto running = processor.running_machines.load(
+                    std::memory_order_relaxed);
+                const auto active = processor.active_machines.load(
+                    std::memory_order_relaxed);
+                notify_worker = running == 0 ||
+                                (processor.queue.size() >= 16U &&
+                                 running < active);
+            } catch (...) {
+                m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                task->clear_queued();
+                retry_regular_enqueue = true;
+            }
+        } else {
+            return false;
+        }
+    }
+    if (retry_regular_enqueue) {
+        return enqueue(task);
+    }
+    if (notify_worker) {
+        m_impl->condition.notify_one();
+    }
+    return true;
+}
+
+/// 函数功能：完成 yield 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::yield(const std::shared_ptr<Task>& task) {
+    if (!task || current_scheduler() != this ||
+        current_task().get() != task.get() || task->cancellation_requested() ||
+        !task->mark_yielded_fast()) {
+        return false;
+    }
+    task->defer_enqueue();
+    if (!Fiber::SuspendForScheduler(SuspendReason::Yield)) {
+        return false;
+    }
+    return !task->cancellation_requested();
+}
+
+/// 函数功能：完成 yield_current 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::yield_current() {
+    return yield(current_task());
+}
+
+/// 函数功能：完成 park 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::park(const std::shared_ptr<Task>& task) {
+    return park_with_reason(task, SuspendReason::Park);
+}
+
+/// 函数功能：完成 park_wait 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
+    if (!task || current_scheduler() != this ||
+        current_task().get() != task.get()) {
+        return false;
+    }
+    if (m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire) ||
+        task->cancellation_requested()) {
+        return false;
+    }
+
+    // WaitNode 已经在线性化队列中发布，Task 的 Waiting 状态可以直接
+    // 原子提交。第二次检查覆盖 shutdown 与 park 的交错；若 shutdown
+    // 已开始，回滚 Waiting 状态并让调用方走取消路径，不能遗留悬挂 G。
+    const ParkAction action = task->park_for_scheduler();
+    if (action != ParkAction::kParked) {
+        return false;
+    }
+    if (m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire) ||
+        task->cancellation_requested()) {
+        (void)task->wake_for_wait();
+        return false;
+    }
+    if (!Fiber::SuspendForScheduler(SuspendReason::Park)) {
+        return false;
+    }
+    return !task->cancellation_requested();
+}
+
+/// 函数功能：完成 park_wait_for_cleanup 调用，供条件变量重锁阶段使用。
+/// 执行流程：校验当前 G 归属，提交 Waiting 状态并挂起当前 Fiber；该路径刻意
+/// 不因 G 的取消标记或 draining 状态拒绝 park，因为等待目标是释放用户 mutex。
+/// @param[in] task 当前受管任务。
+/// @return Fiber 恢复后返回 true；错误上下文或状态转换失败返回 false。
+/// @note 调用方必须已经在线性化等待队列中注册了唤醒节点。
+bool Scheduler::park_wait_for_cleanup(const std::shared_ptr<Task>& task) {
+    if (!task || current_scheduler() != this ||
+        current_task().get() != task.get()) {
+        return false;
+    }
+    const ParkAction action = task->park_for_scheduler();
+    if (action != ParkAction::kParked) {
+        return false;
+    }
+    if (!Fiber::SuspendForScheduler(SuspendReason::Park)) {
+        return false;
+    }
+    return true;
+}
+
+/// 函数功能：完成 park_io 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
+    if (!task || current_scheduler() != this ||
+        current_task().get() != task.get()) {
+        return false;
+    }
+    if (m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire) ||
+        task->cancellation_requested()) {
+        return false;
+    }
+    // The IO poller changes Waiting -> Runnable with wake_io(). Publish the
+    // state before the second shutdown check; shutdown either observes it in
+    // its registry scan or is observed here without taking the scheduler
+    // admission mutex on every socket wait.
+    const auto action = task->park_for_scheduler();
+    if (action != ParkAction::kParked) {
+        return false;
+    }
+    if (m_impl->draining.load(std::memory_order_acquire) ||
+        m_impl->stopping.load(std::memory_order_acquire) ||
+        task->cancellation_requested()) {
+        (void)task->wake_for_io();
+        return false;
+    }
+    if (!Fiber::SuspendForScheduler(SuspendReason::Io)) {
+        return false;
+    }
+    return !task->cancellation_requested();
+}
+
+bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
+                                  SuspendReason reason) {
+    if (!task || current_scheduler() != this ||
+        current_task().get() != task.get()) {
+        return false;
+    }
+    // Shutdown scans waiting Gs under this same mutex. Do not enter waiting
+    // after the scan has begun.
+    ParkAction action = ParkAction::kRejected;
+    {
+        std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
+        if (m_impl->draining.load(std::memory_order_acquire) ||
+            m_impl->stopping.load(std::memory_order_acquire) ||
+            task->cancellation_requested()) {
+            return false;
+        }
+        action = task->park_for_scheduler();
+    }
+    if (action != ParkAction::kParked) {
+        return false;
+    }
+    if (!Fiber::SuspendForScheduler(reason)) {
+        return false;
+    }
+    return !task->cancellation_requested();
+}
+
+/// 函数功能：完成 park_current 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::park_current() {
+    return park(current_task());
+}
+
+/// 函数功能：完成 wake 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::wake(const std::shared_ptr<Task>& task) {
+    return wake_or_cancel(task);
+}
+
+/// 函数功能：完成 wake_registered 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
+    if (!task || !m_impl || !task->owned_by(m_impl->owner_token)) {
+        return false;
+    }
+    const auto action = task->wake_for_wait();
+    if (action == WakeAction::kPending) {
+        return false;
+    }
+    if (action != WakeAction::kEnqueue) {
+        return false;
+    }
+    if (!task->registered()) {
+        // A task can leave the registry while its final wake callback is
+        // racing with shutdown.  Fall back to the fully checked path rather
+        // than publishing a node without a lifetime anchor.
+        return enqueue(task);
+    }
+    if (current_scheduler() == this &&
+        t_processor_id < m_impl->processors.size() &&
+        requeue_from_worker(task)) {
+        return true;
+    }
+    // 混合 Mutex 的 Unlock 通常来自普通线程。G 最近运行的 P 是稳定的
+    // 亲和性提示，把唤醒直接放入该 P 的本地队列，绕过 incoming stripe
+    // 和 scheduler admission 锁；P 失效或正在 shutdown 时仍走原回退路径。
+    const PId preferred_processor = task->last_processor_id();
+    if (preferred_processor < m_impl->processors.size() &&
+        requeue_to_processor(task, preferred_processor)) {
+        return true;
+    }
+    if (!task->try_mark_queued()) {
+        // Another notifier may have won the queue publication.  It is safe to
+        // report success when the task is already queued; otherwise let the
+        // regular admission path repair the state.
+        if (task->queued()) {
+            return true;
+        }
+        return enqueue(task);
+    }
+
+    static thread_local std::size_t t_incoming_stripe =
+        std::numeric_limits<std::size_t>::max();
+    if (t_incoming_stripe == std::numeric_limits<std::size_t>::max()) {
+        t_incoming_stripe =
+            m_impl->next_incoming_stripe.fetch_add(1, std::memory_order_relaxed) &
+            (Scheduler::Impl::kIncomingStripeCount - 1);
+    }
+    const auto stripe = t_incoming_stripe;
+    bool published = false;
+    {
+        std::lock_guard<std::mutex> lock(m_impl->incoming_mutexes[stripe]);
+        if (m_impl->accepting.load(std::memory_order_acquire) &&
+            !m_impl->stopping.load(std::memory_order_acquire)) {
+            m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+            try {
+                m_impl->incoming_queues[stripe].emplace_back(task);
+                m_impl->incoming_count.fetch_add(1, std::memory_order_release);
+                m_impl->incoming_nonempty_mask.fetch_or(
+                    std::uint32_t{1} << stripe, std::memory_order_release);
+                published = true;
+            } catch (...) {
+                m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (!published) {
+        task->clear_queued();
+        return enqueue(task);
+    }
+    m_impl->condition.notify_one();
+    return true;
+}
+
+/// 函数功能：完成 wake_io 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::wake_io(const std::shared_ptr<Task>& task) {
+    if (!task || !task->owned_by(m_impl->owner_token)) {
+        return false;
+    }
+    const auto action = task->wake_for_io();
+    if (action == WakeAction::kPending) {
+        return true;
+    }
+    if (action != WakeAction::kEnqueue) {
+        return false;
+    }
+    // A worker waking another G can publish directly to its current P.  The
+    // task is already registered and owned by this scheduler, so routing the
+    // handoff through external admission would reacquire the registry stripe
+    // and incoming-queue locks on every IO completion.
+    if (current_scheduler() == this &&
+        t_processor_id < m_impl->processors.size()) {
+        if (requeue_from_worker(task)) {
+            return true;
+        }
+    }
+    // IO 轮询线程优先投递到任务最近运行的 P，减少跨队列调度开销。
+    const PId preferred_processor = task->last_processor_id();
+    if (preferred_processor < m_impl->processors.size() &&
+        requeue_to_processor(task, preferred_processor)) {
+        return true;
+    }
+    return enqueue(task);
+}
+
+bool Scheduler::wake_io_batch(
+    const std::vector<std::shared_ptr<Task>>& tasks) {
+    if (tasks.empty()) {
+        return true;
+    }
+    struct Pending final {
+        std::shared_ptr<Task> task;
+        PId processor{0};
+    };
+    std::vector<Pending> pending;
+    std::vector<std::shared_ptr<Task>> fallback;
+    try {
+        pending.reserve(tasks.size());
+        fallback.reserve(tasks.size());
+        for (const auto& task : tasks) {
+            // 调用方是 IOManager::State 的 WaitNode；该节点只有在本
+            // Scheduler 注册成功后才会进入 wake list，因此这里不再为
+            // 每个 readiness 事件重复获取 Task 的 owner 互斥量。公开
+            // wake_io() 仍保留完整 owned_by 校验，批量入口只接受内部
+            // 已登记节点，减少高频 IO 的无效锁竞争。
+            if (!task) {
+                continue;
+            }
+            const auto action = task->wake_for_io();
+            if (action == WakeAction::kPending ||
+                action == WakeAction::kRejected) {
+                continue;
+            }
+            pending.push_back(Pending{task, task->last_processor_id()});
+        }
+        std::sort(pending.begin(), pending.end(),
+                  [](const Pending& left, const Pending& right) {
+                      return left.processor < right.processor;
+                  });
+    } catch (...) {
+        for (const auto& task : tasks) {
+            if (task) {
+                if (task->state() == GState::kRunnable) {
+                    (void)enqueue(task);
+                } else {
+                    (void)wake_io(task);
+                }
+            }
+        }
+        return false;
+    }
+
+    std::size_t index = 0;
+    while (index < pending.size()) {
+        const PId processor_id = pending[index].processor;
+        std::size_t end = index;
+        while (end < pending.size() &&
+               pending[end].processor == processor_id) {
+            ++end;
+        }
+        if (processor_id >= m_impl->processors.size() ||
+            !m_impl->accepting.load(std::memory_order_acquire) ||
+            m_impl->draining.load(std::memory_order_acquire) ||
+            m_impl->stopping.load(std::memory_order_acquire)) {
+            for (std::size_t item = index; item < end; ++item) {
+                fallback.push_back(pending[item].task);
+            }
+            index = end;
+            continue;
+        }
+
+        auto& processor = m_impl->processors[processor_id];
+        bool notify_worker = false;
+        std::size_t published = 0;
+        {
+            std::lock_guard<std::mutex> queue_lock(processor.mutex);
+            if (!m_impl->accepting.load(std::memory_order_acquire) ||
+                m_impl->draining.load(std::memory_order_acquire) ||
+                m_impl->stopping.load(std::memory_order_acquire)) {
+                for (std::size_t item = index; item < end; ++item) {
+                    fallback.push_back(pending[item].task);
+                }
+            } else {
+                for (std::size_t item = index; item < end; ++item) {
+                    const auto& task = pending[item].task;
+                    // wake_for_io 已经完成 Waiting -> Runnable；此处没有
+                    // execution claim，直接复用原子入队门，避免批量 IO
+                    // 每个事件再获取 Task transition_mutex。
+                    if (!task->try_mark_queued_from_worker()) {
+                        continue;
+                    }
+                    try {
+                        processor.queue.push_back(task);
+                        ++published;
+                        m_impl->runnable.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                    } catch (...) {
+                        task->clear_queued();
+                        fallback.push_back(task);
+                    }
+                }
+                const auto running = processor.running_machines.load(
+                    std::memory_order_relaxed);
+                const auto active = processor.active_machines.load(
+                    std::memory_order_relaxed);
+                notify_worker = published != 0 &&
+                                (running == 0 || running < active);
+            }
+        }
+        if (notify_worker) {
+            m_impl->condition.notify_one();
+        }
+        index = end;
+    }
+
+    for (const auto& task : fallback) {
+        if (task) {
+            (void)enqueue(task);
+        }
+    }
+    return fallback.empty();
+}
+
+/// 函数功能：完成 wake_or_cancel 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
+    if (!task || !task->owned_by(m_impl->owner_token)) {
+        return false;
+    }
+    const auto action = task->wake_for_wait();
+    if (action == WakeAction::kPending) {
+        // The running G will consume the permit if it parks. It is not
+        // immediately runnable because its C++ callable still owns the M.
+        return false;
+    }
+    if (action == WakeAction::kRejected) {
+        return false;
+    }
+    if (current_scheduler() == this &&
+        t_processor_id < m_impl->processors.size()) {
+        if (requeue_from_worker(task)) {
+            return true;
+        }
+    }
+    if (!enqueue(task)) {
+        // An accepted concurrent/shutdown handoff may already have queued the
+        // G. Cancel only unstarted work; started Gs must be retained for drain.
+        if (!task->started()) {
+            (void)task->cancel_if_runnable_unqueued();
+        } else if (task->state() == GState::kRunnable && !task->queued()) {
+            bool notify = false;
+            {
+                std::lock_guard<std::mutex> lock(m_impl->mutex);
+                if (task->try_mark_queued()) {
+                    task->request_cancel(false);
+                    m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+                    m_impl->emergency_enqueue_locked(task);
+                    notify = task->terminal();
+                }
+            }
+            if (notify) {
+                task->notify_terminal();
+            }
+        }
+        m_impl->condition.notify_all();
+        return false;
+    }
+    return true;
+}
+
+/// 函数功能：完成 cancel 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::cancel(const std::shared_ptr<Task>& task) {
+    if (!task || !m_impl || !task->owned_by(m_impl->owner_token)) {
+        return false;
+    }
+    const bool changed = task->request_cancel();
+    if (!changed || !task->started()) {
+        if (changed) {
+            // Unstarted cancellation changes the shutdown predicate without
+            // necessarily enqueueing or waking a worker.
+            m_impl->condition.notify_all();
+        }
+        return changed;
+    }
+
+    const auto action = task->wake_for_wait();
+    if (action == WakeAction::kEnqueue) {
+        if (!enqueue(task)) {
+            (void)task->cancel_if_runnable_unqueued();
+        }
+    }
+    // A running G consumes the pending token at its next park. A waiting G is
+    // now queued, while an already-runnable G needs no additional node.
+    return true;
+}
+
+Scheduler::BlockingRegion::BlockingRegion(Scheduler* scheduler) noexcept
+    : m_scheduler(scheduler != nullptr ? scheduler
+                                       : Scheduler::current_scheduler()) {
+    if (m_scheduler == nullptr ||
+        m_scheduler != Scheduler::current_scheduler()) {
+        return;
+    }
+    m_active = Scheduler::enter_blocking();
+    if (m_active) {
+        m_machine_id = Scheduler::current_machine_id();
+    }
+}
+
+Scheduler::BlockingRegion::~BlockingRegion() noexcept {
+    if (m_active && m_scheduler != nullptr) {
+        Scheduler::leave_blocking_for(m_scheduler, m_machine_id);
+        if (t_blocking_machine_id == m_machine_id) {
+            t_blocking_machine_id = 0;
+        }
+        m_active = false;
+    }
+}
+
+/// 函数功能：完成 enter_blocking 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::enter_blocking() noexcept {
+    Scheduler* const scheduler = current_scheduler();
+    if (scheduler == nullptr || !scheduler->m_impl || !current_task()) {
+        return false;
+    }
+    bool entered = false;
+    {
+        std::lock_guard<std::mutex> lock(scheduler->m_impl->mutex);
+        for (const auto& machine : scheduler->m_impl->machines) {
+            if (!machine || machine->id != t_machine_id) {
+                continue;
+            }
+            const auto state = machine->state.load(std::memory_order_relaxed);
+            if (state == MState::kRunning) {
+                machine->state.store(MState::kBlocking,
+                                     std::memory_order_release);
+                machine->blocking_since_ns.store(steady_now_ns(),
+                                                std::memory_order_release);
+                const auto task = current_task();
+                machine->blocking_task.store(
+                    task ? task->id() : 0, std::memory_order_release);
+                machine->processor_detached.store(false,
+                                                   std::memory_order_release);
+                scheduler->m_impl->blocking_workers.fetch_add(
+                    1, std::memory_order_relaxed);
+                entered = true;
+            }
+            break;
+        }
+    }
+    if (entered) {
+        t_blocking_machine_id = t_machine_id;
+        // Growth is deliberately outside the admission lock.  A queued G can
+        // now obtain a replacement M even when this M enters a native call.
+        scheduler->m_impl->maybe_grow(scheduler);
+    }
+    return entered;
+}
+
+/// 函数功能：完成 leave_blocking 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Scheduler::leave_blocking() noexcept {
+    Scheduler* const scheduler = current_scheduler();
+    if (scheduler == nullptr || !scheduler->m_impl ||
+        t_blocking_machine_id == 0) {
+        return;
+    }
+    leave_blocking_for(scheduler, t_blocking_machine_id);
+    t_blocking_machine_id = 0;
+}
+
+void Scheduler::leave_blocking_for(Scheduler* scheduler,
+                                   MId machine_id) noexcept {
+    if (scheduler == nullptr || !scheduler->m_impl || machine_id == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(scheduler->m_impl->mutex);
+    for (const auto& machine : scheduler->m_impl->machines) {
+        if (!machine || machine->id != machine_id) {
+            continue;
+        }
+        if (machine->state.load(std::memory_order_relaxed) ==
+            MState::kBlocking) {
+            const bool detached = machine->processor_detached.exchange(
+                false, std::memory_order_acq_rel);
+            machine->blocking_since_ns.store(0, std::memory_order_release);
+            machine->blocking_task.store(0, std::memory_order_release);
+            machine->state.store(MState::kRunning,
+                                 std::memory_order_release);
+            scheduler->m_impl->blocking_workers.fetch_sub(
+                1, std::memory_order_relaxed);
+            if (detached) {
+                auto& processor = scheduler->m_impl->processors[
+                    machine->processor % scheduler->m_impl->processors.size()];
+                processor.active_machines.fetch_add(1,
+                                                    std::memory_order_acq_rel);
+                processor.state.store(PState::kRunning,
+                                      std::memory_order_release);
+            }
+        }
+        break;
+    }
+}
+
+/// 函数功能：完成 processor_count 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::size_t Scheduler::processor_count() const noexcept {
+    return m_impl ? m_impl->processors.size() : 0;
+}
+
+/// 函数功能：完成 worker_count 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::size_t Scheduler::worker_count() const noexcept {
+    return m_impl ? m_impl->active_workers.load(std::memory_order_acquire) : 0;
+}
+
+/// 函数功能：完成 runnable_count 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::size_t Scheduler::runnable_count() const noexcept {
+    return m_impl ? m_impl->runnable.load(std::memory_order_acquire) : 0;
+}
+
+/// 函数功能：完成 global_runnable_count 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::size_t Scheduler::global_runnable_count() const noexcept {
+    if (!m_impl) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(m_impl->mutex);
+    return m_impl->global_queue.size();
+}
+
+/// 函数功能：完成 processors 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::vector<ProcessorSnapshot> Scheduler::processors() const {
+    std::vector<ProcessorSnapshot> result;
+    if (!m_impl) {
+        return result;
+    }
+    result.reserve(m_impl->processors.size());
+    for (const auto& processor : m_impl->processors) {
+        std::lock_guard<std::mutex> lock(processor.mutex);
+        result.push_back(ProcessorSnapshot{
+            processor.id, processor.state.load(std::memory_order_acquire),
+            processor.queue.size()});
+    }
+    return result;
+}
+
+/// 函数功能：完成 machines 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::vector<MachineSnapshot> Scheduler::machines() const {
+    std::vector<MachineSnapshot> result;
+    if (!m_impl) {
+        return result;
+    }
+    // start() appends to this deque while holding the scheduler mutex.  Take
+    // the same lock for snapshots so embedders can inspect machines while a
+    // scheduler is being started without racing container mutation.
+    std::lock_guard<std::mutex> scheduler_lock(m_impl->mutex);
+    result.reserve(m_impl->machines.size());
+    for (const auto& machine : m_impl->machines) {
+        if (!machine) {
+            continue;
+        }
+        result.push_back(MachineSnapshot{
+            machine->id, machine->state.load(std::memory_order_acquire),
+            machine->processor,
+            machine->last_task_class.load(std::memory_order_relaxed),
+            machine->affinity_hits.load(std::memory_order_relaxed),
+            machine->affinity_misses.load(std::memory_order_relaxed),
+            machine->processor_detached.load(std::memory_order_acquire),
+            machine->blocking_task.load(std::memory_order_acquire),
+            machine->long_syscall_count.load(std::memory_order_acquire)});
+    }
+    return result;
+}
+
+/// 函数功能：完成 sysmon_running 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+bool Scheduler::sysmon_running() const noexcept {
+    return m_impl && m_impl->sysmon_active.load(std::memory_order_acquire) &&
+           !m_impl->sysmon_stop.load(std::memory_order_acquire);
+}
+
+/// 函数功能：完成 sysmon_pass_count 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::uint64_t Scheduler::sysmon_pass_count() const noexcept {
+    return m_impl ? m_impl->sysmon_pass_count.load(std::memory_order_acquire)
+                  : 0;
+}
+
+/// 函数功能：完成 metrics 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+SchedulerMetrics Scheduler::metrics() const noexcept {
+    if (!m_impl) {
+        return {};
+    }
+    return {m_impl->metric_task_runs.load(std::memory_order_acquire),
+            m_impl->metric_task_completions.load(std::memory_order_acquire),
+            m_impl->metric_fiber_resume_ns.load(std::memory_order_acquire),
+            m_impl->metric_local_queue_pops.load(std::memory_order_acquire),
+            m_impl->metric_steal_pops.load(std::memory_order_acquire)};
+}
+
+/// 函数功能：完成 current_task 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+std::shared_ptr<Task> Scheduler::current_task() noexcept {
+    return t_task;
+}
+
+/// 函数功能：完成 current_scheduler 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+Scheduler* Scheduler::current_scheduler() noexcept {
+    return t_scheduler;
+}
+
+/// 函数功能：完成 current_machine_id 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+MId Scheduler::current_machine_id() noexcept {
+    return t_machine_id;
+}
+
+/// 函数功能：完成 current_processor_id 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+PId Scheduler::current_processor_id() noexcept {
+    return t_processor_id;
+}
+
+/// 函数功能：完成 worker_loop 调用，读取或更新相关运行时状态。
+/// 执行流程：
+/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
+/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
+/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
+/// @param[in] opaque_machine 调用方传入的参数，具体约束以头文件声明为准。
+/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
+/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
+    auto machine = std::static_pointer_cast<Impl::Machine>(opaque_machine);
+    if (!machine) {
+        return;
+    }
+    t_scheduler = this;
+    thread_policy::detail::EnterRuntimeWorker(this);
+    t_machine_id = machine->id;
+    t_processor_id = machine->processor;
+    m_impl->emit_event(SchedulerEvent{SchedulerEventType::kWorkerStarted,
+                                      0, machine->id, machine->processor});
+#if defined(__linux__)
+    if (m_impl->config.pin_workers_to_cpu &&
+        machine->processor < static_cast<PId>(CPU_SETSIZE)) {
+        cpu_set_t cpu_set;
+        CPU_ZERO(&cpu_set);
+        CPU_SET(static_cast<int>(machine->processor), &cpu_set);
+        // 亲和性是优化提示；容器或 cpuset 拒绝时继续运行，不改变语义。
+        (void)::pthread_setaffinity_np(pthread_self(), sizeof(cpu_set),
+                                       &cpu_set);
+    }
+#endif
+    auto& own_processor =
+        m_impl->processors[machine->processor % m_impl->processors.size()];
+    bool retired = false;
+    std::size_t maintenance_budget = 0;
+
+    for (;;) {
+        std::shared_ptr<Task> task;
+        bool claimed = false;
+        bool local_queue_pop = false;
+        // 绝大多数 yield 回来的 G 都会回到原 P。本地队列由同一 P 的
+        // worker 独占消费，先走无调度器总锁路径；只有本地为空时才进入
+        // 需要全局 admission 锁的全局队列/窃取路径。
+        if (!m_impl->stopping.load(std::memory_order_acquire) &&
+            m_impl->running_workers.load(std::memory_order_acquire) != 0 &&
+            m_impl->runnable.load(std::memory_order_acquire) >
+                m_impl->processors.size()) {
+            {
+                std::lock_guard<std::mutex> queue_lock(own_processor.mutex);
+                if (!own_processor.queue.empty()) {
+                    task = std::move(own_processor.queue.front());
+                    own_processor.queue.pop_front();
+                    local_queue_pop = true;
+                }
+            }
+            if (task) {
+                m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                claimed = task->try_mark_running();
+                if (!claimed) {
+                    task->clear_queued();
+                }
+            }
+        }
+        if (task && m_impl->stopping.load(std::memory_order_acquire)) {
+            task->request_cancel(false);
+        }
+        if (!task && !m_impl->stopping.load(std::memory_order_acquire)) {
+            if (m_impl->incoming_count.load(std::memory_order_acquire) != 0) {
+                const auto start = m_impl->incoming_probe.fetch_add(
+                    1, std::memory_order_relaxed);
+                const auto preferred_class = machine->last_task_class.load(
+                    std::memory_order_relaxed);
+                const bool prefer_class =
+                    preferred_class != 0 &&
+                    machine->affinity_budget.load(std::memory_order_relaxed) !=
+                        0 &&
+                    m_impl->config.task_affinity_budget != 0;
+                const auto take_incoming = [&](std::size_t stripe,
+                                               bool require_class) {
+                    std::lock_guard<std::mutex> incoming_lock(
+                        m_impl->incoming_mutexes[stripe]);
+                    auto& incoming_queue = m_impl->incoming_queues[stripe];
+                    if (incoming_queue.empty()) {
+                        return false;
+                    }
+                    auto selected = incoming_queue.begin();
+                    if (require_class) {
+                        std::size_t scanned = 0;
+                        for (auto it = selected;
+                             it != incoming_queue.end() &&
+                             scanned < m_impl->config.task_affinity_budget;
+                             ++it, ++scanned) {
+                            if (*it && (*it)->task_class() == preferred_class) {
+                                selected = it;
+                                break;
+                            }
+                        }
+                        if (!*selected ||
+                            (*selected)->task_class() != preferred_class) {
+                            return false;
+                        }
+                    }
+                    task = std::move(*selected);
+                    incoming_queue.erase(selected);
+                    if (incoming_queue.empty()) {
+                        m_impl->incoming_nonempty_mask.fetch_and(
+                            ~(std::uint32_t{1} << stripe),
+                            std::memory_order_release);
+                    }
+                    m_impl->incoming_count.fetch_sub(
+                        1, std::memory_order_release);
+                    m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                    claimed = task->try_mark_running();
+                    if (!claimed) {
+                        task->clear_queued();
+                    }
+                    return true;
+                };
+                // Preserve task-class locality despite sharded producers: try
+                // all stripes for a matching class before accepting another
+                // class. The fallback keeps FIFO-like progress if no match
+                // is currently available.
+                const auto scan_mask = [&] {
+                    return m_impl->incoming_nonempty_mask.load(
+                        std::memory_order_acquire);
+                };
+                auto mask = scan_mask();
+                if (prefer_class) {
+                    for (std::size_t offset = 0;
+                         offset < Scheduler::Impl::kIncomingStripeCount &&
+                         !task;
+                         ++offset) {
+                        const auto stripe =
+                            (start + offset) &
+                            (Scheduler::Impl::kIncomingStripeCount - 1);
+                        if ((mask & (std::uint32_t{1} << stripe)) == 0) {
+                            continue;
+                        }
+                        (void)take_incoming(stripe, true);
+                        mask = scan_mask();
+                    }
+                }
+                if (!task) {
+                    for (std::size_t offset = 0;
+                         offset < Scheduler::Impl::kIncomingStripeCount &&
+                         !task;
+                         ++offset) {
+                        const auto stripe =
+                            (start + offset) &
+                            (Scheduler::Impl::kIncomingStripeCount - 1);
+                        if (mask != 0 &&
+                            (mask & (std::uint32_t{1} << stripe)) == 0) {
+                            continue;
+                        }
+                        (void)take_incoming(stripe, false);
+                        mask = scan_mask();
+                    }
+                }
+            }
+        }
+        if (task && m_impl->stopping.load(std::memory_order_acquire)) {
+            task->request_cancel(false);
+        }
+        if (!task) {
+            // Queue removal, the shutdown check, and the runnable->running
+            // claim form one admission transaction.  A task already claimed
+            // from this worker's local queue skips this global mutex entirely:
+            // the worker owns the execution claim and the local queue lock has
+            // already made the node invisible to stealers.
+            std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
+            if (!m_impl->stopping.load(std::memory_order_acquire)) {
+                const bool prefer_class =
+                    machine->last_task_class.load(std::memory_order_relaxed) != 0 &&
+                    machine->affinity_budget.load(std::memory_order_relaxed) != 0 &&
+                    m_impl->config.task_affinity_budget != 0;
+                const auto preferred_class =
+                    machine->last_task_class.load(std::memory_order_relaxed);
+                const auto scan_limit = m_impl->config.task_affinity_budget;
+                const auto take_local = [&](auto& queue) {
+                    if (prefer_class) {
+                        auto it = queue.begin();
+                        std::size_t scanned = 0;
+                        for (; it != queue.end() && scanned < scan_limit;
+                             ++it, ++scanned) {
+                            if (*it && (*it)->task_class() == preferred_class) {
+                                auto selected = std::move(*it);
+                                queue.erase(it);
+                                return selected;
+                            }
+                        }
+                    }
+                    if (queue.empty()) {
+                        return std::shared_ptr<Task>{};
+                    }
+                    auto selected = std::move(queue.front());
+                    queue.pop_front();
+                    return selected;
+                };
+                const auto take_global = [&](auto& queue) {
+                    if (prefer_class) {
+                        auto it = queue.begin();
+                        std::size_t scanned = 0;
+                        for (; it != queue.end() && scanned < scan_limit;
+                             ++it, ++scanned) {
+                            if (*it && (*it)->task_class() == preferred_class) {
+                                auto selected = std::move(*it);
+                                queue.erase(it);
+                                return selected;
+                            }
+                        }
+                    }
+                    if (queue.empty()) {
+                        return std::shared_ptr<Task>{};
+                    }
+                    auto selected = std::move(queue.front());
+                    queue.pop_front();
+                    return selected;
+                };
+                const auto take_victim = [&](auto& queue) {
+                    if (prefer_class) {
+                        auto it = queue.rbegin();
+                        std::size_t scanned = 0;
+                        for (; it != queue.rend() && scanned < scan_limit;
+                             ++it, ++scanned) {
+                            if (*it && (*it)->task_class() == preferred_class) {
+                                auto base = std::next(it).base();
+                                auto selected = std::move(*base);
+                                queue.erase(base);
+                                return selected;
+                            }
+                        }
+                    }
+                    if (queue.empty()) {
+                        return std::shared_ptr<Task>{};
+                    }
+                    auto selected = std::move(queue.back());
+                    queue.pop_back();
+                    return selected;
+                };
+
+                // Rescue resumes are serviced first: they exist only after
+                // queue allocation failure or a shutdown wake handoff.
+                task = m_impl->emergency_pop_locked();
+
+                // Prefer the local FIFO queue.
+                if (!task) {
+                    std::lock_guard<std::mutex> queue_lock(own_processor.mutex);
+                    if (!own_processor.queue.empty()) {
+                        task = take_local(own_processor.queue);
+                    }
+                }
+
+                // Then inspect the global FIFO queue.
+                if (!task && !m_impl->global_queue.empty()) {
+                    task = take_global(m_impl->global_queue);
+                }
+
+                // Finally steal from the back of another P. A bounded scan
+                // avoids monopolizing the scheduler when all processors are
+                // busy.
+                if (!task && m_impl->processors.size() > 1) {
+                    const auto start = m_impl->next_processor.fetch_add(
+                        1, std::memory_order_relaxed);
+                    for (std::size_t offset = 0;
+                         offset < m_impl->processors.size(); ++offset) {
+                        auto& victim = m_impl->processors[
+                            (start + offset) % m_impl->processors.size()];
+                        if (&victim == &own_processor) {
+                            continue;
+                        }
+                        std::lock_guard<std::mutex> queue_lock(victim.mutex);
+                        if (!victim.queue.empty()) {
+                            task = take_victim(victim.queue);
+                            if (task) {
+                                m_impl->metric_steal_pops.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                if (task) {
+                    m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+                    claimed = task->try_mark_running();
+                    if (!claimed) {
+                        // The node is no longer present in a queue. Clear its
+                        // reservation even when cancellation or a stale
+                        // duplicate made the execution claim fail.
+                        task->clear_queued();
+                    }
+                }
+            }
+        }
+
+        // Both the local fast path and the admission path arrive here with a
+        // claimed G. Keep the M/P accounting in one place so a local dequeue
+        // cannot skip running_workers/affinity bookkeeping.
+        if (task && claimed) {
+            m_impl->running_workers.fetch_add(1, std::memory_order_relaxed);
+            machine->state.store(MState::kRunning, std::memory_order_release);
+            const auto task_class = task->task_class();
+            const auto last_task_class =
+                machine->last_task_class.load(std::memory_order_relaxed);
+            if (task_class != 0 && task_class == last_task_class &&
+                machine->affinity_budget.load(std::memory_order_relaxed) != 0) {
+                machine->affinity_hits.fetch_add(1, std::memory_order_relaxed);
+                machine->affinity_budget.fetch_sub(1, std::memory_order_relaxed);
+            } else {
+                if (last_task_class != 0 && task_class != last_task_class) {
+                    machine->affinity_misses.fetch_add(1,
+                                                       std::memory_order_relaxed);
+                }
+                machine->last_task_class.store(task_class,
+                                               std::memory_order_relaxed);
+                machine->affinity_budget.store(
+                    task_class == 0 ? 0 : m_impl->config.task_affinity_budget,
+                    std::memory_order_relaxed);
+            }
+        }
+
+        if (task && claimed) {
+            // Growth is maintenance, not part of the Fiber switch hot path.
+            // A previous implementation scanned/reaped under scheduler locks
+            // for every resume, which dominated short yield workloads. Check
+            // quickly on a backlog and otherwise amortize the scan.
+            ++maintenance_budget;
+            const auto growth_period =
+                m_impl->runnable.load(std::memory_order_relaxed) >
+                        m_impl->processors.size()
+                    ? std::size_t{8}
+                    : std::size_t{64};
+            const bool needs_initial_worker =
+                m_impl->active_workers.load(std::memory_order_relaxed) <
+                    m_impl->processors.size() &&
+                m_impl->runnable.load(std::memory_order_relaxed) != 0;
+            if (needs_initial_worker || maintenance_budget >= growth_period) {
+                m_impl->maybe_grow(this);
+                maintenance_budget = 0;
+            }
+            own_processor.running_machines.fetch_add(1,
+                                                     std::memory_order_relaxed);
+            own_processor.state.store(PState::kRunning,
+                                      std::memory_order_release);
+            t_task = task;
+            Fiber::BindCurrentExecution(FiberExecutionBinding{
+                reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,
+                t_processor_id, true});
+            m_impl->emit_event(SchedulerEvent{
+                SchedulerEventType::kTaskStarted, task->id(), t_machine_id,
+                t_processor_id, GState::kRunning});
+            const bool collect_metrics = m_impl->config.collect_metrics;
+            const auto run_started = collect_metrics ? steady_now_ns() : 0;
+            task->run();
+            const auto task_state_after_run = task->state();
+            const auto task_event_type =
+                task_state_after_run == GState::kDead
+                    ? SchedulerEventType::kTaskCompleted
+                : task_state_after_run == GState::kFailed
+                    ? SchedulerEventType::kTaskFailed
+                : task_state_after_run == GState::kCancelled
+                    ? SchedulerEventType::kTaskCancelled
+                    : SchedulerEventType::kTaskSuspended;
+            m_impl->emit_event(SchedulerEvent{
+                task_event_type, task->id(), t_machine_id, t_processor_id,
+                task_state_after_run});
+            if (collect_metrics) {
+                const auto resume_elapsed =
+                    static_cast<std::uint64_t>(std::max<std::int64_t>(
+                        0, steady_now_ns() - run_started));
+                m_impl->metric_task_runs.fetch_add(
+                    1, std::memory_order_relaxed);
+                m_impl->metric_fiber_resume_ns.fetch_add(
+                    resume_elapsed, std::memory_order_relaxed);
+                if (task->terminal()) {
+                    m_impl->metric_task_completions.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                if (local_queue_pop) {
+                    m_impl->metric_local_queue_pops.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+            }
+            t_task.reset();
+            Fiber::BindCurrentExecution(FiberExecutionBinding{
+                reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,
+                t_processor_id, true});
+            // BlockingRegion 不能跨 Fiber yield/park 或 G 的任务边界。若
+            // 仍有活动标记，继续调度会让 blocking_workers 和 P 的 attached
+            // 计数永久失真；宁可在边界处 fail-fast，也不能静默清掉 TLS 后
+            // 把不一致状态传给后续 G。正常 Hook/RAII 路径在这里必为 0。
+            if (t_blocking_machine_id != 0) {
+                std::terminate();
+            }
+            if (own_processor.running_machines.fetch_sub(
+                    1, std::memory_order_acq_rel) == 1) {
+                own_processor.state.store(PState::kIdle,
+                                          std::memory_order_release);
+            }
+            machine->state.store(MState::kIdle, std::memory_order_release);
+            m_impl->running_workers.fetch_sub(1, std::memory_order_acq_rel);
+
+            // A yield issued by the running G is committed only after its
+            // execution claim is released, preventing a second M from
+            // entering the same callable concurrently.
+            if (task->state() == GState::kRunnable &&
+                !task->queued()) {
+                (void)task->consume_deferred_enqueue();
+                if (!requeue_from_worker(task)) {
+                    (void)task->cancel_if_runnable_unqueued();
+                }
+            } else {
+                (void)task->consume_deferred_enqueue();
+            }
+            std::vector<std::shared_ptr<Task>> deferred_destruction;
+            const bool draining =
+                m_impl->draining.load(std::memory_order_acquire);
+            if (draining || maintenance_budget >= 64) {
+                std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
+                m_impl->collect_terminal_locked(deferred_destruction);
+                (void)m_impl->finish_draining_locked();
+                maintenance_budget = 0;
+            }
+            if (draining) {
+                m_impl->condition.notify_all();
+            } else if (m_impl->runnable.load(std::memory_order_relaxed) != 0) {
+                // 没有待运行 G 时无需为每次 Fiber 返回唤醒一个空闲 M。
+                // runnable 发布发生在入队之前，并由 enqueue()/wake() 的
+                // notify_one 覆盖；这里仅在当前 worker 产生了后继工作
+                // 或仍有其他队列任务时通知，减少无效 futex 唤醒。
+                m_impl->condition.notify_one();
+            }
+            for (auto& retained_task : deferred_destruction) {
+                if (retained_task) {
+                    auto abandoned_function =
+                        retained_task->release_callable();
+                }
+            }
+            deferred_destruction.clear();
+            continue;
+        }
+
+        if (task && !claimed) {
+            // A cancelled/unstarted queue node can lose its execution claim
+            // after dequeue. It still has a registry entry; prune it here so
+            // a quiet scheduler does not retain terminal callables forever.
+            std::vector<std::shared_ptr<Task>> deferred_destruction;
+            {
+                std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
+                m_impl->collect_terminal_locked(deferred_destruction);
+            }
+            for (auto& retained_task : deferred_destruction) {
+                if (retained_task) {
+                    auto abandoned_function =
+                        retained_task->release_callable();
+                }
+            }
+            deferred_destruction.clear();
+            // A concurrent external cancellation can make the registry
+            // terminal without touching the scheduler condition variable.
+            // Wake an owner waiting for the final terminal transition after
+            // this stale queue node has been consumed.
+            m_impl->condition.notify_all();
+        }
+
+        if (m_impl->stopping.load(std::memory_order_acquire)) {
+            machine->state.store(MState::kStopping, std::memory_order_release);
+            break;
+        }
+
+        machine->state.store(MState::kParked, std::memory_order_release);
+        if (own_processor.running_machines.load(std::memory_order_acquire) ==
+            0) {
+            own_processor.state.store(PState::kIdle,
+                                      std::memory_order_release);
+        }
+        std::unique_lock<std::mutex> lock(m_impl->mutex);
+        if (m_impl->finish_draining_locked()) {
+            lock.unlock();
+            m_impl->condition.notify_all();
+            machine->state.store(MState::kStopping,
+                                 std::memory_order_release);
+            break;
+        }
+        // 长 syscall 的原 M 仍计入 active_workers，但已经从 P 的
+        // attached 计数中移除。替代 M 在原 M 返回前必须保留，不能被
+        // 普通 idle timeout 提前回收。
+        const auto required_workers = [this] {
+            const auto detached = m_impl->detached_machine_count_locked();
+            if (detached == 0) {
+                return m_impl->config.min_workers;
+            }
+            const auto handoff_floor =
+                detached > std::numeric_limits<std::size_t>::max() -
+                              m_impl->config.min_workers
+                    ? std::numeric_limits<std::size_t>::max()
+                    : m_impl->config.min_workers + detached;
+            return std::max(
+                m_impl->config.min_workers,
+                std::min(m_impl->config.max_workers, handoff_floor));
+        };
+        const auto worker_floor = required_workers();
+        const bool can_shrink =
+            m_impl->active_workers.load(std::memory_order_relaxed) >
+            worker_floor;
+        const auto idle_timeout = can_shrink
+                                    ? m_impl->config.idle_worker_timeout
+                                    : m_impl->config.idle_wait;
+        const bool woke = m_impl->condition.wait_for(lock, idle_timeout, [this] {
+            return m_impl->stopping.load(std::memory_order_acquire) ||
+                   m_impl->runnable.load(std::memory_order_acquire) != 0;
+        });
+        const auto current_floor = required_workers();
+        if (!woke && can_shrink &&
+            m_impl->runnable.load(std::memory_order_acquire) == 0 &&
+            !m_impl->stopping.load(std::memory_order_acquire) &&
+            m_impl->active_workers.load(std::memory_order_relaxed) >
+                current_floor) {
+            machine->state.store(MState::kStopping, std::memory_order_release);
+            // Reserve the retirement while still holding mutex. Otherwise
+            // several idle M's can all observe active > min and shrink below
+            // the configured floor before their epilogues run.
+            m_impl->active_workers.fetch_sub(1, std::memory_order_relaxed);
+            own_processor.active_machines.fetch_sub(1,
+                                                    std::memory_order_relaxed);
+            retired = true;
+            break;
+        }
+        machine->state.store(MState::kIdle, std::memory_order_release);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mutex);
+        if (!retired) {
+            // sysmon 可能已经从 P 的 attached 计数中移除了这个 M。
+            // 退出时只撤销仍然 attached 的计数，避免 size_t 下溢。
+            if (!machine->processor_detached.load(std::memory_order_acquire)) {
+                own_processor.active_machines.fetch_sub(
+                    1, std::memory_order_relaxed);
+            }
+            m_impl->active_workers.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (own_processor.active_machines.load(std::memory_order_relaxed) == 0) {
+            own_processor.state.store(
+                m_impl->stopping.load(std::memory_order_acquire)
+                    ? PState::kDead
+                    : PState::kIdle,
+                std::memory_order_release);
+        }
+        machine->state.store(MState::kDead, std::memory_order_release);
+    }
+    m_impl->emit_event(SchedulerEvent{SchedulerEventType::kWorkerStopped,
+                                      0, machine->id, machine->processor});
+    m_impl->condition.notify_all();
+    t_task.reset();
+    Fiber::BindCurrentExecution(FiberExecutionBinding{});
+    thread_policy::detail::LeaveRuntimeWorker();
+    t_scheduler = nullptr;
+    t_machine_id = 0;
+    t_processor_id = 0;
+    t_blocking_machine_id = 0;
+}
+
+}  // namespace go2cpp::scheduler

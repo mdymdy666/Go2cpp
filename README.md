@@ -35,9 +35,15 @@ ctest --test-dir build --output-on-failure
 
 兼容性矩阵、设计边界和可复现验证矩阵分别见
 [`docs/compatibility.md`](docs/compatibility.md)、[`docs/design.md`](docs/design.md)
+以及模块扩展契约 [`docs/extensibility.md`](docs/extensibility.md)
 和 [`docs/testing.md`](docs/testing.md)。源码/依赖清单及 Go 参考版本见
 [`docs/dependencies.md`](docs/dependencies.md) 和
 [`third_party/go-reference/README.md`](third_party/go-reference/README.md)。
+
+第一次使用请先阅读
+[`docs/getting_started.md`](docs/getting_started.md)。该文档包含环境要求、最短
+可运行程序、Fiber/线程混合规则、Channel/Context/IO 生命周期、配置校验和常见
+错误排查步骤。
 
 可运行示例位于 `example/`：`runtime_demo.cpp`、`fiber_sync_demo.cpp`、
 `mixed_runtime_demo.cpp`、`managed_pipeline_demo.cpp`、`dynamic_gmp_demo.cpp`

@@ -5,6 +5,45 @@
 > 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
 > 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
 
+## 2026-10-02：全模块职责与后端边界复核
+
+- 调度器增加 `SchedulerObserver` 事件协议。G/M/P 状态机仍由 Scheduler 独占，
+  观察器只接收启动、worker、任务运行/挂起/完成/失败事件；观察器指针独立加锁，
+  回调在调度器状态锁外执行并隔离异常，可接入日志、指标和追踪而不把业务代码
+  嵌入 worker 热路径。
+- IOManager 把 epoll/eventfd 抽成 `IOBackend`，新增线程安全的命名工厂和实例注入。
+  默认 Linux epoll 保持原行为；后续 kqueue、IOCP、io_uring 只能实现 readiness、
+  wait、wake、remove、shutdown 协议，不能直接恢复 Fiber 或修改 Context 状态。
+- sync 和 Future 增加等待后端工厂，默认后端仍分别适配 Scheduler/ParkingCondition；
+  已创建等待节点固定自己的后端，插件工厂在锁外执行，防止注册表重入和锁反转。
+  HybridGate 的自旋次数改为可配置实例策略，仍只允许保护短临界区。
+- error 增加 `WalkErrors` 环安全遍历扩展点，日志、指标和错误转换插件不再依赖
+  WrappedError/JoinError 的具体类型；异常和环图均在错误边界内隔离。
+- 新增 `docs/extensibility.md`，明确批次事务、Fiber/栈后端、跨平台 IO、插件
+  生命周期和故障注入测试协议；README、design、scheduler 文档同步链接和说明。
+- 验证：Release CTest 14/14 通过；`build-engineering-werror` CTest 3/3 通过；
+  自定义 IO/Future 后端、调度器观察器、错误遍历和原有高负载测试均通过。
+
+## 2026-10-02：日志 Item 插件化与配置事务解耦
+
+- `LogFormatter` 新增 Sylar 风格的 `Item` 扩展边界。格式字符串在
+  `PatternFormatter` 构造时预解析成 Item 链，日志热路径不再查表或解析文本；
+  `AddFormat`/`addFormat`、`RemoveFormat`、`HasFormat` 和 `Formats` 由线程安全
+  注册表提供，工厂在注册表锁外执行，允许插件在工厂中继续注册或查询格式项。
+- 内置 `{time}`、`{function}`、`%d{...}`、`%p/%m/%N/%T/%n` 等格式均通过同一
+  工厂协议创建；重复键拒绝覆盖，已构造 Formatter 持有自己的 Item 快照，注销
+  不会破坏正在使用的 Formatter。新增无选项工厂和带 option 构造函数的模板接口，
+  便于新手接入自定义字段。
+- 配置中心增加 `ApplyString`/`NotifyPending`/`RollbackPending` 两阶段接口和
+  `Config::AddCommitListener`。文件加载先整体校验，再整体发布值，失败恢复旧快照；
+  监听器逐个隔离异常，变量监听器和提交级回调均在事务锁释放后执行，避免插件回调
+  触发配置加载时发生锁反转。配置文件的编辑锁、临时文件和原子 rename 约束同步
+  补充到配置文档；未来批次、Fiber 栈和多平台 IO 的替换协议补充到设计文档。
+- 新增自定义 Item、重复注册、注销后快照、日期内置键保护、配置事务回滚和完整提交
+  回调测试；更新 `example/log_config_demo.cpp` 和 `docs/logging.md` 新手示例。
+- 验证：`build-final` 全量 CTest 14/14 通过；`build-engineering-werror` 全量
+  CTest 3/3 通过；两套构建均使用现有项目警告策略，`git diff --check` 通过。
+
 ## 2026-09-29：调度器、混合锁与 Coost 对比
 
 - 本地 P 队列成功取到 G 后跳过调度器全局 admission 锁；G/M/P 计数统一在
@@ -726,3 +765,352 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
   后仍可复现，确认不是 FiberBin 引入）。因此不能把 ASan 宣称为稳定全通过；TSan
   仍受本机运行时映射限制。高负载混合 Mutex 仍明显慢于线程基准，FiberBin 只降低
   创建/销毁分配开销，不宣称已经消除调度和混合锁的主要成本。
+
+## 2026-10-02：逻辑链路审计与 IO 代际竞态修复
+
+- 对 Task 的状态转换、Runnable 计数、execution claim、P/M 绑定、sysmon、shutdown、
+  嵌套 Fiber 父链、混合同步原语、Context 取消、Channel/Select 以及 IO 等待分别记录
+  线性化点和不变量，详见 `docs/correctness_audit.md`。审计结论限定在文档列出的
+  API 使用契约内，未把“测试通过”表述成数学意义上的零 Bug。
+- `src/io.cpp` 在 descriptor token 首次检查后、取得 State 锁并发布 waiter 前增加第二次
+  generation/FD 检查；关闭或 dup2 与注册交错时不会把失效 fd 重新放入无后续事件的队列。
+  当 fd 已无 waiter 时撤销 epoll registration，避免旧 ET 注册造成忙循环和代际残留；仍有
+  waiter 时保留已发布的 interest 位，以吸收内核中已经排队的迟到 ET 事件。
+- `src/fiber.cpp` 的 native context 为 Memcheck 登记/注销自定义 Fiber 栈，修复换栈后
+  Valgrind 无法识别栈边界导致的误报。`tests/test_io.cpp` 新增嵌套 Fiber IO 唤醒回归，
+  并仅在 Valgrind 下放宽超时和轮数，保持同一状态机而避免检测器开销造成误报。
+- 重新验证：`build-context-test` CTest 13/13、`build-engineering-werror` CTest 3/3、
+  `build-native-context` CTest 14/14 均通过；高负载测试连续三轮通过；ASan/UBSan 全量
+  单测通过；Valgrind `ERROR SUMMARY: 0`，definite/indirect/possible leak 均为 0，
+  仅有 416 bytes/4 blocks 的进程级 still reachable 缓存。TSan 仍受 WSL
+`unexpected memory mapping` 启动限制，未宣称 native Linux 竞态验证通过。
+
+## 2026-10-02：性能复测发现并修复混合 Mutex UAF
+
+- Release 高负载复测曾在混合 Mutex 阶段出现 SIGSEGV，进一步定位到
+  `src/sync.cpp`：`Mutex::Impl::m_waiters` 保存裸 `WaitNode*`，
+  `Unlock()` 释放队列锁后才调用 `Wake()`，等待方可能已经销毁栈节点或
+  重置线程本地缓存节点，形成悬空访问。
+- 修复后等待队列改为 `std::deque<std::shared_ptr<WaitNode>>`，所有争用等待者
+  通过 `AcquireWaitNode()` 获取共享节点；`Unlock()` 将 shared ownership
+  保持到锁外 `Wake()` 完成，等待方按节点地址移除队列元素。
+- 修复验证：Release CTest 14/14、Werror CTest 3/3 通过；Release 高负载连续
+  5 轮无崩溃；ASan/UBSan mutex-only 连续 5 轮无报告；Valgrind 全量单测
+  `ERROR SUMMARY: 0`，definite/indirect/possible leak 均为 0，仅 416 bytes
+  still reachable。
+- 同一组 CPU 上的三轮性能样本：计算 Fiber/线程为
+  1595/1616、1614/1632、1560/1555 ms；调度为 93/55、150/55、107/50 ms；
+  Channel 为 17/53、18/69、20/56 ms；IO 为 2896/2034、2614/2016、
+  2725/2091 ms。混合 Mutex 为 18、1784、1562 ms，线程 `std::mutex`
+  为 39、38、37 ms，仍有明显长尾，不能宣称性能稳定。
+- Coost 本机对照（同 CPU 集合、历史 `-O2` 构建）调度中位数约 8 ms、
+  IO 约 1686 ms、混合 Mutex 约 1721 ms。计时边界和编译参数不完全相同，
+  这些数据只用于工程定位，不是严格同配置基准。
+
+## 2026-10-02：收尾文档、中文注释与配置统一
+
+- 新增 `docs/getting_started.md`，从构建、最短 `go()`、Scheduler/Fiber 生命周期，
+  讲到 Fiber/线程混合同步、Channel/Select、Context、Linux IO/Hook、日志、配置
+  热更新和故障排查；README 与 example 入口均已链接该指南。
+- 为 Scheduler/Task、Fiber、IOManager、Context、Channel、Mutex、ConditionVariable、
+  WaitGroup、Future、Error、FiberLocal、Hook、线程策略、定时器、配置中心等公共类
+  补充中文的依赖、职责、生命周期、参数和返回值说明，并把公共头中的整段英文注释
+  翻译为中文；示例注释也已统一为中文。
+- `go2cpp.ini` 现在覆盖 SchedulerConfig 全部重要字段和日志字段；统一校验 P/M 数量、
+  本地队列、Fiber 栈、FiberBin、亲和预算及毫秒参数范围。ConfigVar 支持强类型校验器，
+  非法热更新会拒绝并保留旧值，min/max_workers 的单步修改也不会留下不可启动状态。
+- 最终验证：Release 独立构建 `build-final` CTest 14/14；`build-engineering-werror`
+  CTest 3/3；ASan+UBSan 构建 CTest 14/14；Valgrind 全量单测通过，`ERROR SUMMARY: 0`，
+  definite/indirect/possible leak 均为 0，仅 416 bytes/4 blocks 进程级 still reachable。
+  TSan 仍受 WSL 的 `unexpected memory mapping` 启动限制，未宣称通过。
+
+## 2026-10-02：配置热加载编辑锁与半文件保护
+
+- 修复配置监听可能读到编辑器截断文件、并在失败后错误确认文件版本的问题。
+  `IniFile::Load` 现在连续读取文件元数据和内容，只有快照稳定且 INI 解析成功才
+  进入配置中心；失败不会更新监听器基准，后续轮询会继续重试。
+- 配置监听增加固定的 `path + ".lock"` 编辑锁协议。锁文件非空时，启动监听会拒绝
+  读取，运行中的监听会跳过刷新；锁文件为空或不存在才允许加载。生产写入流程应为：
+  写入非空锁、写同目录临时文件、关闭并校验、`rename` 原子替换目标、最后清空锁文件。
+  文档和 `go2cpp.ini` 模板已写明该约束。稳定快照是兜底保护，不能判断语法上完整但仍
+  在继续写入的部分前缀，因此不支持绕过编辑锁直接长时间覆盖正式文件。
+- 测试新增启动时锁拒绝、锁定期间保持旧值、清空锁后更新，以及截断半文件恢复；覆盖
+  Release、`-Wall -Wextra -Wpedantic -Werror`、ASan/UBSan 和 Valgrind。
+- 验证结果：`build-final` CTest 14/14；`build-engineering-werror` CTest 3/3；
+  `build-native-asan` CTest 14/14；Valgrind `ERROR SUMMARY: 0`，definite/indirect/
+  possible leak 均为 0，仅 416 bytes/4 blocks still reachable。构建时 WSL 与 Windows
+  文件时间有轻微偏差，出现 gmake clock skew 警告，不影响测试结果。
+
+## 2026-10-02：配置独立性规范
+
+- 在 `docs/configuration.md`、`docs/getting_started.md` 和 `go2cpp.ini` 中明确规范：
+  允许热更新的配置键必须独立解析、独立校验、独立生效，不能依赖同一文件中其他键
+  的非原子中间值。`min_workers`/`max_workers` 等相互约束的结构参数被限定为启动期
+  成组配置，必须通过完整快照一次替换并重新创建 Scheduler，禁止分别热更新。
+
+## 2026-10-02：统一中文 Doxygen 注释规范
+
+- 按 Sylar 风格补充 public header：类/结构体职责、依赖、线程安全和生命周期，
+  公开函数的参数、返回值和失败边界，以及枚举和配置字段的含义；涉及文件包括
+  Context、Channel、Fiber、Future、IO、Scheduler、同步原语、日志、Hook、配置和
+  运行时入口。
+- 为 `src/*.cpp` 的实现函数补充中文 `///` 执行流程注释，覆盖参数校验、锁/状态机、
+  唤醒和资源释放等关键步骤；example 与 tests 的顶层入口也补充用途、流程和返回值。
+  注释修改不改变逻辑，已清理误插入函数体语句前的模板注释。
+- 验证：`git diff --check` 通过；Release CTest 14/14、Werror CTest 3/3 全部通过，
+  全部目标成功编译。
+
+## 2026-10-03：模块边界复核与可验证缺陷修复
+
+- 对 GMP、Fiber/Context、Timer、混合同步、Future、Channel/Select、IOBackend/Hook、
+  Error、Config 和 Logger 逐模块复核状态机、生命周期、锁顺序、扩展点异常和等待
+  超时边界，结果记录在 `docs/boundary_audit.md`。文档把已修复问题、必须遵守的使用
+  契约和仍无法安全等价实现的 C++/Go 语义差异分开，避免把测试通过误写成完全无条件
+  正确。
+- 修复 Error 自定义 `Unwrap/Is/As` 抛异常导致终止的问题；默认 IOBackend 禁止注销；
+  IOBackend 实例按 IOManager 单 owner 检查；epoll 改为 level-triggered，避免同一 fd
+  多等待者部分消费后丢唤醒；`wait_for(0)`、`WaitAnyFor(0)`、`WaitManyFor(0)` 增加
+  原生非阻塞 readiness 探测。
+- Fiber native 栈检查 sysconf、页对齐、guard page 映射尺寸溢出；Scheduler 观察事件
+  增加 cancelled；Future/Sync 后端注册表改用锁外不可变快照，Future Context 回调
+  增加异常展开清理守卫；IniFile 解析失败保持旧快照；Logger parent 拒绝自环和间接环。
+- 新增同 fd 多等待者、零超时 readiness、共享 backend、极端 Fiber 栈尺寸、Future
+  后端异常清理、Logger 环检测和 IniFile 失败快照测试。
+- 验证：`cmake --build build-final --parallel 1` 成功；`ctest --test-dir build-final
+  --output-on-failure` 串行 14/14 通过（13.36 秒）；IO、Error 过滤测试通过。
+  NTFS/WSL 构建目录禁止在多个构建或 CTest 进程并发读写，避免共享库文件被并发链接
+  时出现短文件；本轮未把并行加载错误误判为代码测试失败。
+- 未宣称完全无条件正确：固定 Fiber 栈、显式 panic/recover、未 Hook 阻塞调用、
+  单线程 TimerService、配置跨变量无锁快照和 watcher/插件生命周期约束仍按文档限制。
+- 追加修复 Channel Select 的注册失败边界：内建 case 使用带结果的
+  `arm_checked`，复制/注册失败会取消已注册节点并返回 `kInvalid`，不会在零节点
+  上永久 park；新增回归测试并通过 `build-final` 与 `build-engineering-werror`。
+- 当前 Memcheck：`build-final/valgrind-boundary-audit.log`，1,322,815 次分配、
+  1,322,811 次释放；definite/indirect/possible 均为 0，416 bytes/4 blocks
+  为进程级 still reachable，`ERROR SUMMARY: 0`。ASan `build-native-asan`
+  的 `go2cpp_tests` 也通过；TSan 仍按既有记录受 WSL 映射限制，未伪造通过结论。
+
+## 2026-10-06：定时任务模块文档补充
+
+- 补充 `docs/timer_usage.md`，说明 TimerService 的一次性、周期、动态决策、弱引用、忙等待和 Scheduler/Fiber 投递边界。
+- 明确取消与 Running 竞态、readiness 与 timeout 单次 claim、回调锁约束及 TimerManager 与 Scheduler 的解耦。
+
+## 2026-10-06：定时任务模块实现与验证
+
+- 重构 include/go2cpp/core/timer.hpp、src/timer.cpp：增加 TimerState、固定延迟/固定速率、
+  TimerDecision、最大次数、忙等待窗口、Reset/Refresh、弱引用任务、异常观察器、执行器
+  插件和 PendingCount/NextDeadline；队列使用 multimap 加状态索引，取消和重排为对数复杂度。
+- Scheduler 增加 schedule_at/schedule_after/schedule_every 及大写别名，通过
+  TimerExecutorAdapter 只把到期回调提交为 Fiber；TimerService 不继承 Scheduler，避免跨 M
+  恢复 Fiber 栈。go2cpp::after/every 提供默认调度器的傻瓜式入口。
+- 修复关闭竞态：TimerService 停止时正在返回的周期回调不会重新插入已关闭队列；异常回调
+  在锁外隔离并将任务标记为 kFailed。明确记录慢回调会阻塞同一服务、服务析构等待回调、
+  不能从自身计时回调销毁服务的边界。
+- 新增 tests/test_timer.cpp 的 FIFO、非法周期、Reset、固定/动态周期、BusyWait、弱引用、
+  异常、并发注册、Scheduler/Fiber 投递和 shutdown 竞态测试；新增
+  example/timer_task_demo.cpp 六个线程/Fiber 场景。
+- 新增 benchmarks/timer_task_benchmark.cpp、GO2CPP_BUILD_BENCHMARKS 和
+  docs/timer_benchmark.md。200 任务实测：普通线程 27.91 ms、TimerService 5.50 ms、
+  Scheduler+Fiber 6.41 ms；同机 coost 独立对照 7.11 ms（接口语义不同，仅作量级参考）。
+- 验证命令：build-timer-final RelWithDebInfo 构建；CTest 14/14 通过（11.47 s）；
+  timer 过滤测试连续 3 次通过；ASan+UBSan timer 过滤通过；Valgrind timer 过滤通过
+  且返回码为 0，但当前 Fiber/上下文后端没有产生 Memcheck 退出摘要，未将其误报为完整
+  leak 统计。git diff --check 通过。
+
+- 收尾复核：runtime.hpp 显式聚合 core/timer.hpp；示例新增“业务事件提前完成取消超时”场景；
+  测试新增可插拔执行器拒绝、同截止时间先进先出和正在执行周期任务的关闭竞态。
+
+## 2026-10-07：网络基础设施与模块目录整理
+
+- 目录按 logging、config、concurrency、tools、network 拆分；旧 include/go2cpp 根路径保留中文兼容转发头，命名空间和原有 target 名不变。测试与示例按模块目录维护，CMake 使用显式源文件列表。
+- 新增 network 模块：Address/IPv4Address/IPv6Address/UnixAddress、endian、ByteArray、FdManager、Socket/SocketStream、Framer 和 HTTP/1.x message/parser/client/server。Socket 统一 RAII fd 生命周期，Fiber 中优先 IOManager 等待，普通线程回退 poll；fd 元数据与 close 通知保持代际安全。
+- HTTP parser 支持半包、粘包、Content-Length、chunked、重复头、多值 Cookie/Set-Cookie 基础能力和流水线剩余字节，默认头体上限；冲突的 CL/TE、非法头和超限返回错误。HTTP/2/3、WebSocket upgrade、无限流式 Body 暂不在核心实现。
+- 验证：`build-network` RelWithDebInfo、静态库、`-Wall -Wextra -Wpedantic` 构建通过；网络过滤测试、network demo 和全量 CTest 15/15 通过（11.05 秒）；`git diff --check` 需在最终提交前再次执行。
+- 后续：补充真实 loopback TCP/UDP、Fiber IOManager、多请求 keep-alive、chunked trailer、fd close/reuse、ASan/UBSan/Valgrind 网络专项；HTTP 大文件/SSE 应使用流式 ResponseWriter 扩展。
+
+## 2026-10-07：网络模块第二轮边界验证
+
+- 增加 Framer 分隔符/固定长度/大端长度前缀，补充 Go 风格 ResolveTCPAddr、ResolveUDPAddr、DialTCP、DialUDP、ListenTCP、ListenUDP，以及 Socket 半关闭接口；根路径和 Sylar 风格 `.h` 入口均保留。
+- HTTP 增加 CanonicalHeaderKey、ParseHTTPVersion、ParseTime、Get/Head/Post/NewRequest 便捷入口；客户端使用 write_all 处理短写，服务端循环读取分片请求并保留流水线剩余，URL 端口解析失败返回 InvalidUrl。
+- 第二轮测试增加 chunked、重复 Content-Length、查询参数重复键、TCP 回环 accept、UDP 无连接 send_to/recv_from、Framer 长度帧和非法 URL。
+- 实际验证：RelWithDebInfo 静态构建 `build-network`、Debug 共享+Hook 构建 `build-network-hook`、ASan+UBSan 构建 `build-network-asan` 均成功；网络过滤测试和 Hook 网络测试通过；全量 CTest `build-network` 15/15 通过（约 11 秒）；`-Wall -Wextra -Wpedantic` 无警告；Valgrind 网络过滤返回 0 且无错误退出，但 Fiber 上下文路径未产生 Memcheck 汇总，因此没有宣称完整泄漏统计。
+- 保留限制：核心 HTTP 只实现受限 HTTP/1.x 消息缓冲，不包含 HTTP/2/3、WebSocket upgrade、Expect:100、无限 SSE/大文件 ResponseWriter；DNS 为同步 getaddrinfo；ByteArray 单所有者，Socket 同一连接的协议读写需由调用方串行化。
+
+- 网络第二轮还增加了受管 Fiber 读写验证：Fiber 中 Socket 遇 EAGAIN 通过当前 IOManager park，普通发送线程写入后恢复，测试有 2 秒有限 watchdog；Hook、ASan/UBSan 和全量测试均再次通过。
+
+## 2026-10-07：P0 Socket 生命周期与 HTTP 流式基础加固
+
+- `include/go2cpp/network/socket.hpp`、`src/network/socket.cpp` 为读写、accept、connect、
+  地址查询、选项查询和半关闭统一加入 in-flight 生命周期。每次操作固定 fd 快照；
+  `close/release` 先设置 closing、递增代际、通知 IOManager，等待旧操作退出后再关闭或转移
+  fd，并处理重复 close/release。受管 Fiber 和普通线程都覆盖关闭期间的取消路径。
+- 修复普通线程无限期 poll 无法被 close 唤醒、Fiber readiness 注册与 close 竞态、关闭后
+  旧操作继续使用 fd 等边界；关闭中的新操作返回 `ECANCELED/EBADF`。普通线程和 IOManager
+  等待以非忙等待的小片检查关闭状态，保留 deadline 语义。
+- `include/go2cpp/network/http.hpp`、`src/network/http.cpp` 增加严格 Transfer-Encoding
+  校验、十六进制 chunk 溢出检查、chunk 扩展和 trailer 保存、body 长度溢出保护，以及
+  1xx/204/304/HEAD 无 body 规则；Parser append 分配失败转为 ParseState::Error。
+- 增加 `http::ResponseWriter`：以 `Idle -> HeadersCommitted -> Closed` 状态输出 chunked
+  流，适用于 SSE/大响应的后续封装；每次 write 使用 SocketStream::write_all 处理短写，
+  不允许未 start 或 close 后写入。Server 停止标志原子化，handler 异常隔离为 500 响应。
+- 新增普通线程和 Fiber 并发 close、HTTP 严格 chunk/trailer、无体响应、HEAD、流式 writer
+  状态机回归测试。验证：`build-network` 全量 CTest 15/15；`build-network-hook` 网络
+  测试 2/2；`build-network-asan` 网络总测试通过；TSan 构建成功但网络过滤启动时受当前
+  WSL 运行时限制报 `unexpected memory mapping`，因此未将 TSan 计为通过；Valgrind 网络
+  过滤返回 0，definite/indirect/possible leak 均为 0，still reachable 96 bytes/1 block，
+  错误汇总为 0。
+- P0 仍不宣称完整 WebSocket/SSE/NetService：ResponseWriter 只是 HTTP/1.1 chunked 基础，
+  WebSocket 握手/帧状态机、SSE 心跳/重连、路由治理和分布式组件留在后续阶段；DNS 仍为同步
+  getaddrinfo，Fiber 栈和 C++ 异常边界保持现有文档限制。
+
+## 2026-10-07：P1 WebSocket 协议层
+
+- 新增 `include/go2cpp/network/websocket.hpp/.h`、根路径兼容头和
+  `src/network/websocket.cpp`。协议对象独立于 Scheduler/IOManager，复用 Socket 的 Fiber/线程
+  等待；读方向串行化，写方向由内部锁串行化，避免并发调用交错帧。
+- 实现 RFC 6455 HTTP/1.1 Upgrade 校验：GET、HTTP/1.1、Upgrade/Connection token、版本 13、
+  16 字节 Base64 key、SHA-1 Accept；提供 `Accept`、`AcceptWithPending` 和 `Connect`。后者不预读
+  WebSocket 帧，服务端可用 `AcceptWithPending` 接管 HTTP Parser 的剩余字节，避免升级边界丢数据。
+- 实现掩码方向、7/16/64 位长度、高位溢出、RSV/opcode、控制帧、分片重组、最大帧/消息大小、
+  Ping 自动 Pong、Pong 忽略、Close 双向确认、Close code/reason 和 UTF-8 校验。
+- 新增 `example/network/websocket_demo.cpp`、`docs/websocket.md`；测试覆盖 RFC 握手向量、
+  socketpair 客户端/服务端、126 字节扩展长度、文本/二进制、分片、HTTP+首帧同批到达和关闭。
+- 验证：WebSocket/网络过滤测试、Hook 构建 `go2cpp_tests` 与 WebSocket 示例 2/2、ASan/UBSan
+  网络测试均通过；Valgrind 网络过滤返回 0，definite/indirect/possible leak 均为 0，still
+  reachable 96 bytes/1 block，错误汇总为 0。高负载测试单独运行通过。一次整套运行中已有
+  `test_io.cpp:439/449` readiness 压力断言出现时间敏感失败，随后等待系统负载稳定后重跑，
+  `build-network` 全量 CTest 16/16（11.26 秒）通过；`GO2CPP_TEST_FILTER=io` 也连续 3 次
+  通过。TSan 仍受当前 WSL `unexpected memory mapping` 启动限制，未宣称通过。
+- P1 明确限制：暂不支持 TLS、HTTP/2 CONNECT、permessage-deflate、扩展/子协议协商和发送端
+  主动分片；SSE、鉴权、限流、审计和 NetService 治理继续分阶段实现。
+
+## 2026-10-07：P2 SSE 流式事件
+
+- 新增 `include/go2cpp/network/sse.hpp/.h`、根路径兼容头和 `src/network/sse.cpp`，并加入
+  `go2cpp_network`。`sse::Event` 负责字段校验和多行 data 编码；`sse::Parser` 支持任意
+  分片、LF/CRLF/CR、UTF-8 BOM、注释、retry、Last-Event-ID 以及行/事件/缓冲区上限；EOF
+  不会把未以空行结束的半事件误报为完整消息。
+- 新增 `sse::Stream`：复用 `http::ResponseWriter` 输出 200、`text/event-stream`、缓存控制、
+  keep-alive 和 chunked 响应；事件/注释写入串行化，心跳通过 `tick()` 显式触发，失败后锁定
+  为不可复用状态。Context 取消回调使用 weak 状态，不捕获裸 this，并调用 Socket::cancel_write
+  唤醒受阻 Fiber/线程；Socket 的读写取消代际不依赖取消线程当前的 IOManager。不建立无界
+  事件队列，慢消费者由写超时或 IO 错误反馈。
+- 新增 `tests/network/test_sse.cpp`、`example/network/sse_demo.cpp`、`docs/sse.md`，覆盖
+  编码注入、空事件、多行 data、半包解析、空 id 清除 Last-Event-ID、超长限制、chunked
+  生命周期、心跳、重复 close、Context 取消、并发生产者以及普通线程跨线程取消 Socket
+  等待。
+- 验证：`cmake --build build-network -j2`、Hook 和 ASan/UBSan 的 `GO2CPP_TEST_FILTER=sse`
+  均通过；普通线程、并发生产者和 Context 取消路径都已实际运行。最终 `ctest --test-dir
+  build-network --output-on-failure` 为 17/17 通过（11.80 秒）；Valgrind 全量测试返回 0，
+  definite/indirect/possible leak 均为 0，still reachable 416 bytes/4 blocks，错误汇总为 0。
+  TSan 仍受当前 WSL `unexpected memory mapping` 启动限制，不能宣称通过。
+- 已知边界：SSE 不包含 TLS、HTTP/2/3、自动重连、跨连接事件存储或有界异步队列；这些能力
+  由上层 NetService/事件日志注入。`ResponseWriter::flush()` 在 TCP 上只是状态检查，每次
+  `send/comment` 已经立即写入 chunk；调用方不得用零长度 chunk 冒充 flush。
+
+## 2026-10-07：P0/P1/P2 第二轮审查与增强
+
+- 根据 Socket/HTTP、WebSocket、SSE 三个只读审查结果修正了实际缺陷：`ResponseWriter` 的
+  start/write/close 任一部分写失败后进入 sticky `Failed` 状态，禁止继续污染半个 header 或
+  chunk；204/1xx/304 不再生成实体 Content-Length；出站 HTTP 头执行 token、控制字符和 CRLF
+  校验；Parser 严格校验请求起始行、三位状态码、响应无体 framing，并拒绝端口溢出。
+- `io.cpp` 的 `update_interest_locked` 改为按当前读写等待队列精确更新 epoll interest，修复
+  READ|WRITE 收缩时遗留 READ 注册造成的水平触发忙循环；`descriptor_is_open` 只接受 F_GETFD
+  成功，并对 EINTR 重试。
+- WebSocket 写锁和 SSE 流锁统一改为 `go2cpp::sync::Mutex`，使阻塞写在受管 Fiber 中 park
+  而不会卡住同一 M 的其他 Fiber。WebSocket 关闭、析构和写入失败会发布 Socket 读写取消代际；
+  握手写入继承 `io_timeout`；要求 Host、拒绝 body/Transfer-Encoding/控制字符，拒绝非最小长度
+  编码，并对协议错误、非法 UTF-8、超限消息发送 1002/1007/1009 Close。
+- SSE 统一 `max_event_bytes=0` 为不限长，Parser 在解析 `id:` 行时立即发布 Last-Event-ID，
+  并明确 Parser 为单消费者状态机；示例新增元数据游标、注释心跳、Context 取消和 WebSocket
+  Ping/Pong 场景，网络示例增加 204 无实体演示。测试补充出站头注入、204 body、端口边界和
+  WebSocket Host 检查。
+- 最终验证：`cmake --build build-network -j2` 通过；`GO2CPP_TEST_FILTER=network`、`sse` 均通过；
+  全量 CTest 17/17 通过（11.47 秒）；network/websocket/sse 三个示例均返回 0；Hook 构建的
+  network+sse 过滤测试通过；ASan+UBSan 构建的 network+sse 过滤测试通过；Valgrind network
+  和 sse 专项返回 0，definite/indirect/possible 均为 0，错误汇总为 0。TSan 仍受当前 WSL 的
+  `unexpected memory mapping` 启动限制，未宣称通过。
+- 本轮仍保留的边界：DNS 解析同步、Server 路由只允许初始化阶段修改、Socket 自定义 waiter
+  没有强制取消协议、Fiber 中主动 close 与 Scheduler shutdown 的极端生命周期需要调用方遵循
+  文档约束；这些不应被误报为已完全等价 Go runtime。
+- 追加修正 HTTP Client：发送方向继承 Client timeout，ETIMEDOUT/ECANCELED 映射为公开的
+  Timeout/Cancelled，并在同一批字节中正确跳过 100 Continue 等 informational 响应；全量网络
+  回归再次通过。
+- IO 专项新增单 P/单 worker 的读写双 interest 收缩回归：先同时等待同一 fd 的 READ/WRITE，
+  消费立即就绪的 WRITE 后再验证 READ，`GO2CPP_TEST_FILTER=io` 通过。
+- SSE 查询状态接口增加异常隔离：混合锁在 Scheduler 停止阶段无法 park 时，`noexcept` 查询
+  返回 Failed/false/max，不会让异常穿过 `noexcept` 触发进程 terminate。
+# 2026-10-08 混合 Mutex 专项优化
+
+- `src/concurrency/sync.cpp` 保留无竞争原子快路径、FIFO 等待队列、`shared_ptr<WaitNode>` 生命周期锚点和跨 M `park_wait/wake_registered` 交接；没有采用会跳过 Scheduler 状态机的裸指针或未经验证的独立 Fiber 队列。
+- 默认无状态 `SchedulerWaitBackend` 改为进程内共享实例，减少每次等待的控制块分配；受管 Fiber 的协作重试限定为有界 256 次，随后一次性进入等待路径，避免旧版反复调度造成的长尾。
+- 失败的实验方案已撤回：提前把普通线程竞争计入等待者、Fiber/native 双队列优先级交接、专用轻量 waiter 都在压力或竞态测试中出现长尾或唤醒风险，没有保留在最终实现中。
+- Release 专项 `go2cpp_high_load_stress --mutex-only` 30 轮：耗时最小/中位数/P95/最大值为 `9/19/31/51 ms`，无超时；同一完整高负载线程池 `std::mutex` 约 `36～40 ms`。按吞吐换算满足线程基线 75% 门槛。
+- 验证：`build-network` 全量 CTest `17/17`；同步过滤测试连续 5 次通过；ASan/UBSan 同步过滤通过；Valgrind 混合锁专项 `ERROR SUMMARY: 0`，definite/indirect/possible leak 均为 0，96 bytes still reachable 为进程级缓存。
+- 已知边界：带 Context、长临界区、ConditionVariable/WaitGroup 和手动 Fiber 仍走完整等待节点路径；锁内禁止阻塞 IO、日志回调和插件回调。TSan 受当前 WSL `unexpected memory mapping` 环境限制，未宣称通过。
+
+
+## IO 性能优化记录（2026-10-08 12:16:07 UTC）
+
+- 变更：Epoll 后端的 `EPOLLONESHOT` 能力声明与事件位保持一致；默认 Linux 后端启用 ONESHOT，由 `IOManager` 显式重新布防；事件批处理保持 256；注册表记录 `FdSlot*`，仅在 `m_mutex` 下解引用并在删除注册项前失效。
+- 文件：`src/network/io.cpp`、`src/network/io_backend.cpp`、`include/go2cpp/network/io_backend.hpp`、`benchmarks/io_epoll_fair_benchmark.cpp`、`cmake/Go2CppTests.cmake`。
+- 正确性：`ctest --test-dir build-network --output-on-failure` 最新一次曾在实验性调度快路径下暴露 high-load channel 失败，随后已撤销该快路径；撤销后 `go2cpp_high_load_stress` 通过，IO 专项通过；ASan/UBSan IO 专项通过。
+- 公平基准：4096 fd、25 waves、8 workers、1 poller，线程 epoll 稳态中位数约 2172 ms，IOManager+Fiber 约 3626 ms，Fiber/线程约 1.67；事件完整 102400/102400，无超时。目标 1.25 倍尚未达到，不能宣称完成。
+- 后续：需要针对 Fiber 调度/任务状态转换和跨 M 入队继续做受控 profiling；当前已知低风险优化未能消除调度开销。
+
+## IO 性能优化记录（2026-10-10）
+
+- 正确性修复：`src/network/io.cpp` 的 `drain_queue_locked`、`take_ready_locked` 和
+  `complete_if_head` 统一采用“先取得队头、登记 operation、完成 claim、再移出队列”的
+  线性化顺序，避免取消/超时与 epoll 就绪并发时把未完成节点弹出后永久丢失。新增
+  `test_wait_many_immediate_ready_race`，双 fd 已就绪场景循环 1000 次，验证 `WaitMany`
+  不少返回 ready 项。
+- 热路径优化：WaitNode 的 operation 生命周期改为 0/1/2/3 原子状态机；无 Context 等待
+  跳过回调互斥量清理；FdSlot 复用 DescriptorToken，去掉重复 F_GETFD/descriptor registry
+  校验；IO poller 一次批量唤醒按最近 P 分桶，减少 P 队列锁次数；已 claim 的 WaitNode
+  采用无锁任务快照；批量入队复用原子 queued 门，跳过每事件的 transition_mutex；epoll
+  注册 token 改为 `fd + 32 位序号`编码，移除每次 ONESHOT rearm 的 `m_registrations`
+  哈希表节点分配。
+- 构建与回归：`build-network` 全量 CTest 17/17 通过；IO 过滤测试通过；ASan/UBSan IO
+  过滤测试通过；`go2cpp_high_load_stress --io-only` 通过，Fiber 1239 ms、thread-poll
+  1992 ms；没有发现错误、超时或泄漏报告。
+- 公平基准（Release，4096 fd、25 waves、8 workers、1 poller、102400 事件）：Go2Cpp
+  thread-pool+epoll 中位数约 2013 ms，IOManager+Fiber 约 703 ms，Fiber/thread 约 0.349，
+  所有事件完整且无超时。独立 coost 适配器同口径实测 thread-epoll 约 143 ms、coost 约
+  1155 ms；因此本轮数据在该 WSL 运行环境下 Fiber 小于独立 coost 适配器，但仍不能把
+  Go2Cpp 结论外推到所有线程池实现。单 worker/低并发时 Fiber 仍明显慢于线程基线，说明
+  上下文切换和调度固定成本尚未消除。
+- 追加压力口径（4096 fd、10 waves、16 workers、40960 事件）：thread-pool+epoll 中位数
+  约 723 ms，IOManager+Fiber 中位数约 296 ms，Fiber/thread 约 0.410；对应 coost 适配器
+  thread-epoll 约 66 ms、coost 约 525 ms。高并发 Fiber 仍明显优于本项目线程基线和该
+  适配器的 coost 协程，但相对最快三方线程 epoll 仍有固定调度成本。
+- 约束与后续：WSL CPU/调度噪声会使同一基准出现较大波动；所有模型均串行运行并记录完整
+  事件数后才纳入比较。用户要求的“对任意线程 epoll 与 coost 均不超过 1.25 倍”尚未被
+  全场景证明，不能宣称达标；下一步应继续做上下文切换、P 队列入队和 ONESHOT rearm 的
+  受控 profiling，而不能通过削弱正确性校验来降低数字。
+
+## 2026-10-10：全模块边界回归与生命周期修复
+
+- 修复 `src/network/io.cpp` 的 `WaitMany` 零超时路径：所有未完成节点都执行零超时
+  `poll` 探测，不再因已有终态节点而跳过其他 fd，避免多 fd 同时就绪时丢失结果。
+- 修复 `src/concurrency/scheduler.cpp` 的等待交接：`Task::wake_for_wait()` 与 park
+  使用同一 `m_transition_mutex`，防止唤醒先到时被后续 park 覆盖；同步测试扩大为固定种子
+  256 轮并加入 yield 抖动。
+- 修复 Socket 延迟 close/release 的生命周期：进行中的操作持有 `shared_ptr` 自保持，关闭
+  请求只发布取消代际，最后一个操作退出后再由唯一 owner 关闭 fd、移除 FdManager 并通知
+  等待者；新增阻塞等待下 close/release 回归。
+- 修复动态定时器配置的引用环：`ConfigVar` 监听器改为弱引用自身变量，避免
+  `ConfigVar -> Listener -> ConfigVar` 泄漏；测试绑定全局 `Config::Instance()` 时使用进程
+  生命周期的 `static RuntimeConfig`，遵守 `BindRuntimeConfig` 的目标生命周期契约。
+- 变更文件：`src/network/io.cpp`、`src/network/socket.cpp`、`include/go2cpp/network/socket.hpp`、
+  `src/concurrency/scheduler.cpp`、`tests/concurrency/test_sync.cpp`、`tests/network/test_network.cpp`、
+  `src/config/config.cpp`、`tests/logging/test_log_config.cpp`。
+- 验证结果：`cmake --build build-review -j2` 成功；Release 全量 CTest 随机顺序重复 2 轮，
+  18/18、共 36 次通过；`go2cpp_tests` 全量通过；高负载场景 50000 yielding tasks、
+  8000×100000 计算、2000 Fiber+32 线程混合锁、32000 channel 消息、4096×25 IO 均通过；
+  新 ASan/UBSan 全量运行通过；新二进制 Valgrind Memcheck 返回 0，definite/indirect/possible
+  leak 均为 0，still reachable 416 bytes/4 blocks，错误汇总为 0。
+- 未通过/未覆盖：TSan 构建成功但运行被当前 WSL 环境的
+  `ThreadSanitizer: unexpected memory mapping` 启动限制拒绝，不能据此宣称 TSan 通过；
+  `BindRuntimeConfig` 仍要求调用方保证裸指针目标覆盖整个监听生命周期，接口文档已明确，
+  后续可增加 RAII 绑定句柄以降低误用风险。

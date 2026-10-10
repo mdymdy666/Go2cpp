@@ -1,11 +1,18 @@
 #pragma once
 
-// Convenience include for translated programs. Module-specific headers remain
-// available when a smaller dependency surface is preferred.
+/**
+ * @file runtime.hpp
+ * @brief Go2Cpp 对外聚合头文件。
+ * @details 一次包含全部公开运行时模块；大型工程也可以按模块头文件分别
+ *          包含，以减少编译依赖。
+ */
+
+// 面向转译程序的便捷总头文件。需要更小依赖面时仍可单独包含各模块头文件。
 #include "go2cpp/channel.hpp"
 #include "go2cpp/config.hpp"
 #include "go2cpp/context.hpp"
 #include "go2cpp/control_flow.hpp"
+#include "go2cpp/core/timer.hpp"
 #include "go2cpp/error.hpp"
 #include "go2cpp/future.hpp"
 #include "go2cpp/fiber.hpp"
@@ -14,6 +21,15 @@
 #include "go2cpp/event.hpp"
 #include "go2cpp/hook.hpp"
 #include "go2cpp/io.hpp"
+#include "go2cpp/network/address.hpp"
+#include "go2cpp/network/byte_array.hpp"
+#include "go2cpp/network/endian.hpp"
+#include "go2cpp/network/fd_manager.hpp"
+#include "go2cpp/network/framing.hpp"
+#include "go2cpp/network/http.hpp"
+#include "go2cpp/network/socket.hpp"
+#include "go2cpp/network/websocket.hpp"
+#include "go2cpp/network/sse.hpp"
 #include "go2cpp/log.hpp"
 #include "go2cpp/scheduler.hpp"
 #include "go2cpp/sync.hpp"

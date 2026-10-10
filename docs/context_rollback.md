@@ -6,12 +6,58 @@
 ```cpp
 go2cpp::ContextRollback scope(parent);
 auto child = scope.context();
-scope.record_undo([resource] noexcept { resource->unregister(); });
+scope.record_undo([resource]() noexcept { resource->unregister(); });
 auto mark = scope.savepoint();
-scope.record_undo([resource] noexcept { resource->reset(); });
+scope.record_undo([resource]() noexcept { resource->reset(); });
 scope.rollback_to(mark);
 scope.commit();
 ```
+
+## 示例如何验证结果
+
+可运行的完整示例在
+[`example/context_rollback_demo.cpp`](../example/context_rollback_demo.cpp)。它把
+回滚结果拆成以下六条可观察路径，建议新手按日志顺序阅读：
+
+| 场景 | 关键调用 | 成功判据 | 常见错误 |
+| --- | --- | --- | --- |
+| 成功提交 | `commit()` | `RollbackDone()` 完成，资源仍由业务持有 | 把 `commit()` 当成取消 child，导致下游 Context 被误用 |
+| 分阶段失败 | `savepoint()`、`rollback_to()`、`rollback()` | 后半段先撤销，最终只留下已经提交的资源 | 重复使用旧 savepoint；一次局部回滚后 token 已失效 |
+| 父取消/超时 | 父 `Cancel()` 或 deadline | child `Done()`、`RollbackDone()` 都完成，`Err()` 为取消原因 | 只等 `Done()` 就访问已注销资源，和 undo 并发产生 UAF |
+| 截止时间 | `WithTimeout()`、`WithDeadline()` | 定时器触发后自动回滚，`Err()` 为 `DeadlineExceeded` | 把 deadline 当成业务成功，继续使用已撤销租约 |
+| undo 异常 | undo 抛出异常 | 后续动作仍执行，`status()==kFailed` 且 `had_failure()` 为真 | 只检查 `rollback()` 返回值，忽略补偿失败 |
+| 非法调用 | 无效 token、已提交后再次登记 | 调用立即返回 false，不重复执行补偿 | 把 false 当作“稍后会成功”，继续使用已结束事务 |
+
+最小的成功/失败分支可以这样写。关键是先判断业务结果，再决定提交还是回滚，
+并在需要使用已清理资源之前等待 `rollback_done()`：
+
+```cpp
+go2cpp::ContextRollback scope(parent);
+resource.acquire();
+if (!scope.record_undo([&resource]() noexcept { resource.release(); })) {
+    resource.release();  // 登记失败时 scope 没有可执行的 undo，必须手动释放
+    return;
+}
+
+if (request_ok) {
+    if (!scope.commit()) {
+        // 可能已经被 parent cancel 抢先领取，必须转入失败路径。
+        GO2CPP_LOG_ERROR(logger) << "commit 与取消竞争，检查 scope.status()";
+    }
+} else {
+    scope.rollback(go2cpp::NewError("业务校验失败"));
+    scope.rollback_done().WaitFor(1s);
+    if (scope.had_failure()) {
+        // failure() 是 std::exception_ptr；业务可在这里接入自己的异常日志。
+        GO2CPP_LOG_ERROR(logger) << "补偿动作失败，必须进入人工补偿或重试";
+    }
+}
+```
+
+示例中的日志同时输出“动作完成”“取消原因”“补偿结束”和“最终资源数”。如果
+看到 `rollback()` 返回 true 但最终状态为 `kFailed`，这是一个可预期的错误场景：
+回滚请求已经被领取，但某个 undo 没有成功；业务必须记录并采取人工补偿或重试，
+不能把它当成完整事务回滚。
 
 - 构造函数创建临时子 Context。父取消或 deadline 取消时，尚未提交的 undo
   按同一回滚路径执行。
