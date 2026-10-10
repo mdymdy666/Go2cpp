@@ -4,6 +4,12 @@
 > 栈展开。Channel select 新增 SelectValue/SelectCaster/SetAny，IOManager
 > 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
 > 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
+> 另注：历史条目中的源码/测试/示例路径反映**当时**的目录结构——早期为
+> `src/*.cpp`、`tests/*.cpp`、`example/*.cpp` 的扁平布局，现已重构为
+> `src/{concurrency,network,logging,config,tools}/`、
+> `tests/{concurrency,network,logging,tools}/`、
+> `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
+> 换算；这些条目不改写，以保留演进过程。
 
 ## 2026-10-10：B-02 次轮（模块索引、测试文档路径、性能文档阅读须知）
 
