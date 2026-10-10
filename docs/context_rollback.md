@@ -16,7 +16,7 @@ scope.commit();
 ## 示例如何验证结果
 
 可运行的完整示例在
-[`example/context_rollback_demo.cpp`](../example/context_rollback_demo.cpp)。它把
+[`example/concurrency/context_rollback_demo.cpp`](../example/concurrency/context_rollback_demo.cpp)。它把
 回滚结果拆成以下六条可观察路径，建议新手按日志顺序阅读：
 
 | 场景 | 关键调用 | 成功判据 | 常见错误 |
