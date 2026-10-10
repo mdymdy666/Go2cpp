@@ -11,6 +11,24 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：源码回溯审计（第 5 批：channel / socket）
+
+- **本轮读完整实现**：`src/concurrency/channel.cpp`(402)、`src/network/socket.cpp`(568)。
+- **核对结果——断言站得住**：
+  - `channel.cpp:167-174,382-393` 取消/deadline 的优先级与状态映射，与我在 `test_event_go.cpp` 中断言的 `kTimedOut`/`kCancelled` 一致；
+  - `channel.cpp:106-111` move-only case 在进入等待前就返回 `kInvalid`，与文档「不会登记一个无法回滚的等待者」一致；
+  - `socket.cpp:535-539` `SocketStream::read/write` 失败返回**负 errno**、`write_all` 循环补齐短写，与 `docs/network.md` 的描述一致；
+  - `socket.cpp:87-122` `begin_operation`/`end_operation` 的 in-flight 计数与self-reference 保活，印证了文档「每个读、写、accept、connect、选项查询和地址查询都会先固定当前 fd」；
+  - `socket.cpp:32-45` `poll_wait` 用 `min(count, INT_MAX)` 防溢出并重试 EINTR，`remaining()` 保证绝对 deadline——与文档「不会为每次 recv 重新获得完整超时」一致。
+- **本轮读源码发现的新问题**：
+  - **D-15 扩展**：`channel.cpp:39-91` 的 5 个 channel 错误工厂（closed / already closed / would block / nil / timeout）**各自是函数局部 static 单例**，与 `future.cpp` 的 `BrokenPromiseError()` 是同一模式。两个不同 channel 的「already closed」错误是同一对象，`Is` 无法区分。
+  - **D-16（文档缺失）**：`socket.cpp:151` 的 `Socket::fd()` 只加锁读 `m_fd`，**不进入 `begin_operation` 的 in-flight 保护**。调用方长期持有该值会与 `close()`/fd 复用竞争。`docs/network.md` 列出的「会固定 fd」的操作里不含 `fd()`。
+- **补测（新覆盖的边界）**：`channel.cpp:189-193` 在进入等待前检查 `ParkingCondition::FiberWaitUnsupported()`——**手动 Fiber 中调用 Select 会立即返回 `kInvalid`**，而不是退化到 native 等待占住 carrier 线程。已在 `test_event_go.cpp` 补 `check_manual_fiber_select_rejected` 实测通过。注意它与 `ParkingCondition` 自身在同类情形返回 `kCancelled` 不同，Select 在更外层提前失败。
+- **性能观察（未登记为缺陷）**：`channel.cpp:126` 的 `Select` 轮询游标是**函数局部 `static std::atomic<std::size_t>`**，即进程级共享。设计意图是让每轮轮询起点轮转、避免固定顺序偏向；代价是高并发 Select 时多核争用同一缓存行。属可观测的开销点，非正确性问题，仅此记录。
+- **验证结果**：构建 0 warning / 0 error；`GO2CPP_TEST_FILTER=event_go` 通过（含新增的手动 Fiber 用例）。
+- **未通过/未覆盖**：累计回溯 **11 个实现文件、约 2,962 行**，占 `src/`（21,855）的 **13.6%**。四个大文件（`scheduler.cpp`/`io.cpp`/`hook.cpp`/`context.cpp`）仍未读；`socket.cpp` 的 `wait_ready` 三路分支（自定义 waiter / IOManager / native poll）只做了静态核对，未做动态验证。
+- **下一步**：`src/concurrency/timer.cpp`(778) → `src/concurrency/sync.cpp`(1324) → 四个大文件。
+
 ## 2026-10-10：源码回溯审计（第 4 批：future / context_backend / control_flow）
 
 - **本轮读完整实现**：`src/concurrency/future.cpp`(175)、`src/concurrency/context_backend.cpp`(45)、`src/tools/control_flow.cpp`(346)。
