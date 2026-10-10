@@ -31,7 +31,7 @@ third_party/go1.23.0-full/
 
 当前 C++ 实现：
 
-- `src/scheduler.cpp`
+- `src/concurrency/scheduler.cpp`
 - `include/go2cpp/scheduler/scheduler.hpp`
 - `include/go2cpp/fiber.hpp`
 
@@ -54,7 +54,7 @@ third_party/go1.23.0-full/
 
 当前 C++ 实现：
 
-- `src/context.cpp`
+- `src/concurrency/context.cpp`
 - `include/go2cpp/context.hpp`
 
 不是原实现的地方：
@@ -78,7 +78,7 @@ third_party/go1.23.0-full/
 当前 C++ 实现：
 
 - `include/go2cpp/channel.hpp`
-- `src/channel.cpp`
+- `src/concurrency/channel.cpp`
 
 不是原实现的地方：
 
@@ -102,8 +102,8 @@ third_party/go1.23.0-full/
 当前 C++ 实现：
 
 - include/go2cpp/control_flow.hpp
-- src/control_flow.cpp
-- tests/test_control_flow.cpp
+- src/tools/control_flow.cpp
+- tests/tools/test_control_flow.cpp
 
 这里实现的是可测试的显式等价层，而不是 Go 编译器/runtime 的逐帧复制：
 
@@ -119,7 +119,7 @@ third_party/go1.23.0-full/
 当前 C++ 实现：
 
 - `include/go2cpp/error.hpp`
-- `src/error.cpp`
+- `src/tools/error.cpp`
 
 不是原实现的地方：
 
