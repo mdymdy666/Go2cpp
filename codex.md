@@ -11,6 +11,22 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：源码回溯审计（第 3 批：tools/error）
+
+- **本轮读完整实现**：`src/tools/error.cpp`(404)。
+- **核对结果——我在 `test_errors_ns.cpp` 里的断言全部与源码一致**：
+  - `:260-262` `NewError` = `make_shared<StringError>`；`:273-278` `Wrap` 对空 cause 直接返回 `{}`；
+  - `:155-186` `WrappedError::Message()` 用 `": "` 逐层拼接，与我的 `"read config: disk unavailable"` 断言一致；
+  - `:213-250` `JoinError::Message()` 用 `'\n'` 连接并**迭代展开**嵌套 Join，与我的 `"first\nsecond"` 断言一致；
+  - `:296-298` `Join` 对全空输入返回 `{}`，空 vector 断言成立；
+  - `:355-378,390-402` `IsImpl` 以 `next.get() == target.get()` 做**对象身份**判定，印证我「消息相同但对象不同不匹配」的断言。
+- **本轮读源码发现的新问题**：
+  - **D-14（文档缺失）**：`error.cpp:392-394` 中 `Is(error, target)` 在 target 为空时**语义完全不同**——返回 `!error`，即退化成「error 是否为空」的判断。而 `include/go2cpp/tools/error.hpp:136` 是**裸声明、零注释**，调用方极易把 `Is(x, nullptr)` 误当成「与 null 比身份」而恒为 false。已登记并补测。
+- **补充观察（未登记，记为优质设计）**：`:10-13,102-110,120-145` 用**线程局部工作表**把 `WrappedError`/`JoinError` 的析构改成迭代式释放，避免十万层深链递归析构爆栈；`:147,181-183` 的行内注释解释了「先推进裸指针再释放前一个所有者」的原因。这类行内注释是真正有信息量的，与文件里大量模板化函数头注释形成鲜明对比。
+- **验证结果**：构建 0 warning / 0 error；`GO2CPP_TEST_FILTER=errors_ns` 通过（含新增的空 target 语义用例）。
+- **未通过/未覆盖**：累计回溯 **6 个实现文件、约 1426 行**，占 `src/` 总行数（21,855）的 **6.5%**。四个最大的文件（`scheduler.cpp` 4048、`io.cpp` 2646、`hook.cpp` 2161、`context.cpp` 1895）仍未读；D-13、D-14、X-06、X-07 均**只登记未修复**；未跑 sanitizer 与 Valgrind。
+- **下一步**：`src/concurrency/fiber.cpp`(1502) → `src/network/socket.cpp`(568) → `src/concurrency/sync.cpp`(1324)，之后才进入四个大文件。
+
 ## 2026-10-10：源码回溯审计（第 2 批：io_backend / thread_policy）
 
 - **本轮读完整实现**：`src/network/io_backend.cpp`(228)、`src/concurrency/thread_policy.cpp`(202)。

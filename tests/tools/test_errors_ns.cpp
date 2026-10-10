@@ -52,6 +52,20 @@ void check_as() {
  * @brief 错误身份按对象而非消息判定，薄封装不改变该语义。
  * @details 两条消息相同但对象不同的错误必须互不匹配，否则包装链会失去意义。
  */
+/**
+ * @brief 空 target 的特殊语义：`Is(error, nullptr)` 等价于「error 是否为空」。
+ * @details 源码 `src/tools/error.cpp:392-394` 明确 `if (!target) return !error;`。
+ *          头文件 `include/go2cpp/tools/error.hpp:136` 只有裸声明、没有任何注释，
+ *          调用方无从得知这条与常规「身份匹配」完全不同的语义（台账 D-14）。
+ */
+void check_null_target_semantics() {
+    const go2cpp::ErrorPtr empty;
+    const auto base = go2cpp::errors::New("base");
+    GO2CPP_CHECK(go2cpp::errors::Is(empty, nullptr));
+    GO2CPP_CHECK(!go2cpp::errors::Is(base, nullptr));
+    GO2CPP_CHECK(go2cpp::errors::Is(nullptr, nullptr));
+}
+
 void check_identity_semantics() {
     const auto camel = go2cpp::Wrap(go2cpp::NewError("base"), "ctx");
     const auto snake = go2cpp::errors::Wrap(go2cpp::errors::New("base"), "ctx");
@@ -77,4 +91,5 @@ void run_errors_namespace_tests() {
     check_join_overloads();
     check_as();
     check_identity_semantics();
+    check_null_target_semantics();
 }
