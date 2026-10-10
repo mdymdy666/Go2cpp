@@ -13,6 +13,13 @@ scope.rollback_to(mark);
 scope.commit();
 ```
 
+> **命名约定**：`ContextRollback` 的成员同时提供 PascalCase 与
+> 小写下划线两种拼写——`RecordUndo`/`record_undo`、`Mark`/`savepoint`、
+> `RollbackTo`/`rollback_to`、`Commit`/`commit`、`RollbackDone`/`rollback_done`。
+> 小写形式是前者的内联转发，语义完全相同，本文示例统一使用小写形式。
+> 另有 `committed()`、`had_failure()` 只提供小写形式，没有 PascalCase 版本
+> （见 `include/go2cpp/concurrency/context.hpp:307-346`）。
+
 ## 示例如何验证结果
 
 可运行的完整示例在
