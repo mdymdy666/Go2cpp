@@ -132,7 +132,7 @@ third_party/go1.23.0-full/
 
 这些能力没有对应的 Go runtime 逐行移植：
 
-- Fiber 使用 Boost.Context 和固定保护栈，不是 Go 的可增长用户栈和 GC 栈扫描。
+- Fiber 使用固定保护栈（Linux x86_64 为 Go2Cpp 自有上下文后端，其他平台回退 Boost.Context），不是 Go 的可增长用户栈和 GC 栈扫描。
 - Timer 使用 C++ `TimerService` 专用线程，不是 Go runtime timer heap/netpoller 的完整实现。
 - Mutex、ConditionVariable、WaitGroup 是 Fiber-aware C++ 同步原语，不是 Go `sync` 包的内部实现。
 - Socket Hook 是 Linux interposer + epoll，不能覆盖 raw syscall、io_uring、所有 libc 变体和全部阻塞入口。

@@ -218,7 +218,7 @@ sysmon 的等待锁与 Scheduler 主锁分离，监控线程在队列锁竞争�
 
 ### 栈策略与多 FD 等待
 
-Fiber 使用带保护页的固定大小 Boost.Context 栈（默认 128 KiB，可通过配置指定）。当前没有 Go morestack/newstack/copystack 式自动扩容：C++ 编译器不会提供 Go 栈图和可安全重写的挂起指针，直接复制正在运行的 C++ 栈会破坏 RAII、引用和 fcontext。需要更深调用栈时必须显式提高 fiber_stack_size，栈保护页会把越界变成可诊断故障，而不是声称已经实现 Go 栈增长。
+Fiber 使用带保护页的固定大小栈（默认 128 KiB，可通过配置指定）；Linux x86_64 走 Go2Cpp 自有上下文后端，其他平台回退 Boost.Context，见上文「x86_64 Linux Fiber Context 后端」一节。当前没有 Go morestack/newstack/copystack 式自动扩容：C++ 编译器不会提供 Go 栈图和可安全重写的挂起指针，直接复制正在运行的 C++ 栈会破坏 RAII、引用和 fcontext。需要更深调用栈时必须显式提高 fiber_stack_size，栈保护页会把越界变成可诊断故障，而不是声称已经实现 Go 栈增长。
 
 Fiber 栈仍是固定保护栈，尚未实现 Go 风格动态扩容。IOManager 提供
 `WaitAny/WaitMany`：每个请求对应一个带 generation 的 WaitNode，全部登记在

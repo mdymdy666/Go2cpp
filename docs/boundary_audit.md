@@ -27,7 +27,7 @@
 
 ### 使用契约与限制
 
-- 当前使用 Boost.Context 受保护固定栈，没有 Go `morestack/newstack/copystack` 自动扩容。必须根据最深调用链设置 `fiber_stack_size`；栈越界会触发保护页故障。
+- 当前使用受保护固定栈：Linux x86_64 由 Go2Cpp 自有上下文后端提供，其他平台回退 Boost.Context（平台判定见 `cmake/Go2CppModules.cmake:3-10`，后端说明见 `docs/design.md` 的「x86_64 Linux Fiber Context 后端」）。没有 Go `morestack/newstack/copystack` 自动扩容。必须根据最深调用链设置 `fiber_stack_size`；栈越界会触发保护页故障。
 - 销毁仍可恢复的挂起 Fiber 不能安全执行其 C++ 栈上的析构函数或 defer；调用方必须先让 Fiber 完成、取消并回到稳定边界，再释放拥有者。
 - `panic/recover` 是显式状态记录设施，不会进行语言级栈展开，也不能跳过 C++ 析构函数；不能把它当作 Go panic 的完全替代。
 - defer/recover 的精确边界是当前执行状态和 API 规定的受控调用范围，不支持任意跨 Fiber、跨 M 的隐式恢复。
