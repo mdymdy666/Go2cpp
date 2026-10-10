@@ -11,6 +11,19 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：B-02 收尾（参考审计路径、协作记录路径说明、示例登记）
+
+- **本轮范围**：台账 B-02 第 3 批 3 条：**D-07**、**D-08**、**E-04**。至此 **B-02 批次全部完成**（D-01~D-08、D-11、D-12、E-04、I-01、X-02~X-04；D-09 台账原就归属 B-03）。
+- **改动文件**（3 个）：
+  - `docs/go_reference_audit.md`：修正 **6 处**扁平源码/测试路径——`:34` `src/scheduler.cpp`→`src/concurrency/scheduler.cpp`、`:57` context、`:81` channel、`:105` `src/control_flow.cpp`→`src/tools/`、`:106` `tests/test_control_flow.cpp`→`tests/tools/`、`:122` `src/error.cpp`→`src/tools/`。台账 D-07 只登记了 `:106` 一处，本轮按同类问题一并处置；该文件用的是「当前 C++ 实现位于」式陈述（非历史快照），故直接修正，不套用 D-08 的加注方式。
+  - `codex.md`：在顶部快照引用块追加历史路径说明——早期为 `src/*.cpp`、`tests/*.cpp`、`example/*.cpp` 扁平布局，现已分模块，引用旧路径时按当前结构换算；**历史条目不改写**，以保留演进过程。
+  - `example/README.md`：速查表补 `timer_task_demo`（concurrency 组末尾）、`websocket_demo` 与 `sse_demo`（network 组末尾）；批量运行列表 12 → 15 项。
+- **验证结果**：`docs/go_reference_audit.md` 全部 12 处路径引用逐一 `test -e` 确认存在（missing = 0）；`example/README.md` 速查表 15 行、批量列表 15 项，与磁盘 15 个示例文件数一致；`cmake --build build-quality --parallel` 0 warning / 0 error；`ctest` **18/18 通过**；`log/` 已恢复到轮初 md5。
+- **一处验证脚本失误（如实记录）**：本轮第一次验证在 `wsl bash -lc` 内拼了含反引号与嵌套单引号的 `sed`/`while` 管道，反引号被 bash 当作命令替换，输出退化为 `MISS` 空路径。**修改本身未受影响**（文件、构建、ctest 均正常）；随后改用 Python 侧读取解析重做验证，结论以上一段为准。教训：验证逻辑不要在 shell 字符串里嵌套反引号，改为 Python 读文件后逐项检查。
+- **未通过/未覆盖**：未跑 sanitizer 与 Valgrind；`codex.md` 历史条目中的 15 处失效路径按 D-08 约定**不改写**，仅由顶部说明覆盖。
+- **提交**：`d263b90`（参考审计路径）、`15c74fb`（示例登记）、`eb64a75`（codex.md 路径说明）。
+- **下一步**：**B-03**（tools + context：断言健壮性与新 API 覆盖），覆盖 T-01、T-02、T-05、T-06、D-09。其中 T-05 依赖待决策项 **U-01**（在途改动新增的 `errors::` 命名空间是否保留），按台账默认建议「保留并补最小测试与示例」执行，用户可推翻。
+
 ## 2026-10-10：B-02 次轮（模块索引、测试文档路径、性能文档阅读须知）
 
 - **本轮范围**：台账 B-02 第 2 批 5 条：**X-04**、**D-05**、**D-11**、**D-06**、**D-12**（按同文件聚合：`modules.md` 两条、`testing.md` 两条、`performance.md` 一条）。
