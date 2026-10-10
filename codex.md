@@ -11,6 +11,21 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：源码回溯审计（第 8 批：scheduler.cpp 关键区间）
+
+- **本批范围说明（重要）**：`scheduler.cpp` 共 4048 行，本批**只读了关键区间约 1,060 行**（`:560-840` 的 Task 唤醒/挂起状态机、`:2654-3140` 的 park/wake 实现），**不是全文**。这与前七批「读完整实现」的口径不同，结论覆盖面相应收窄。
+- **核对结果——`codex.md` 历史记录与源码一致**：
+  - `:586` 与 `:613` 确认 `Task::wake_for_wait()` 与 `park_for_scheduler()` **共用同一把 `m_transition_mutex`**，行内注释明确解释「仅依赖原子状态不足以保护 `wake_pending`」，与 `codex.md` 中「全模块边界回归」那条修复记录吻合；
+  - `:580-602` 的三种返回（kEnqueue/kPending/kRejected）与 `:612-624` 的三种返回（kParked/kRequeued/kRejected）构成完整的先通知后挂起协议；
+  - `:2864-2917` `wake_registered` 的三级回退（worker 直接回本 P → 按 `last_processor_id` 亲和 → incoming 条带 + `thread_local` 固定条带）与 `docs/scheduler.md` 的队列描述一致。
+- **本轮读源码发现的新问题**：
+  - **D-17**：`wake_io_batch` 是**公开 API**（`scheduler.hpp:537`，public 区起于 `:408`），但实现 `:2972-2987` 跳过 `owned_by` 校验，而头文件没有声明「仅接受本 Scheduler 已登记节点」这一前置条件。误用会把异属 G 放进本调度器队列。
+  - **X-10**：同一个 `WakeAction::kPending` 在 `wake_registered`/`wake_or_cancel` 里是**失败**（返回 false），在 `wake_io` 里却是**成功**（返回 true）。三者都是 public API，调用方无法从返回值判断「是否已入队」。
+- **未完成部分**：本批**没有**读 `Scheduler::Impl`（`:997-1840`，核心状态机）、`enqueue`（`:2287-2527`）、`shutdown_for`（`:1942-2161`）、`worker_loop`（`:3494-4048`），以及 `Task::run`（`:830-996`）的 Fiber trampoline。这些区间是调度器真正的主体，**目前仍属未读**。
+- **验证结果**：本批为只读回溯，未改动任何源码或测试。
+- **累计进度（按已读行数）**：前七批完整读 5,959 行 + 本批约 1,060 行 ≈ 7,019 行，占 `src/`（21,855）约 **32%**。`io.cpp`(2646)、`hook.cpp`(2161) 与 `scheduler.cpp` 未读区间合计仍远超一半。
+- **下一步**：先补完 `scheduler.cpp` 的 `Impl` / `enqueue` / `shutdown_for` / `worker_loop`，再进 `io.cpp` 与 `hook.cpp`。
+
 ## 2026-10-10：源码回溯审计（第 7 批：context.cpp，1895 行）
 
 - **本轮读完整实现**：`src/concurrency/context.cpp`(1895)——四个大文件中第一个，也是 channel / future / timer / sync 的共同依赖。
