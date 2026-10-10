@@ -1,5 +1,12 @@
 # 测试与验收矩阵
 
+> **路径约定（2026-10-10 追加）**：本文跨越多次目录重构。**历史条目中的路径反映
+> 当时的结构**，扁平形式（如 `example/io_wait_many_demo.cpp`、`tests/test_io.cpp`）
+> 已被模块子目录取代：当前测试位于 `tests/{tools,concurrency,logging,network}/`，
+> 示例位于 `example/{tools,concurrency,logging,network}/`。历史路径按原样保留以
+> 反映演进过程，引用时请按当前结构核对；确需表示当前有效路径的段落已就地修正
+> 或加注。
+
 本文记录在规范 WSL 工作区执行的构建、测试和工具检查命令：
 
 ```text
@@ -381,7 +388,7 @@ WSL + Boost.Context 偶发的 `unexpected memory mapping` 已在本轮绕过地�
 - Release Hook-on：`cmake --build build-final-release --parallel 4`；CTest 9/9 通过。
 - ASan+UBSan Debug：`build-final-asan`，使用 `-fsanitize=address,undefined -fno-omit-frame-pointer`，CTest 9/9 通过；未报告 sanitizer 错误。
 - Valgrind Memcheck：`LD_LIBRARY_PATH=build-final-release valgrind --tool=memcheck --leak-check=full --show-leak-kinds=definite,indirect,possible --error-exitcode=99 --log-file=build-final-release/valgrind-final.log build-final-release/go2cpp_tests`，ERROR SUMMARY 0；definite/indirect/possible 均为 0；416 bytes/4 blocks 仍可达，属于 FiberLocal/TimerService 进程级状态。
-- TSan：普通启动仍在当前 WSL 失败于 `unexpected memory mapping`；`setarch x86_64 -R` 启动可运行 scheduler/fiber 过滤，但最终 sync 过滤在 `tests/test_sync.cpp:158` 的 native waiter watchdog 超时，未产生 race 报告。因此本次不宣称 TSan 全量通过，native Linux 仍需作为发布门槛。
+- TSan：普通启动仍在当前 WSL 失败于 `unexpected memory mapping`；`setarch x86_64 -R` 启动可运行 scheduler/fiber 过滤，但最终 sync 过滤在 `tests/concurrency/test_sync.cpp:158` 的 native waiter watchdog 超时，未产生 race 报告。因此本次不宣称 TSan 全量通过，native Linux 仍需作为发布门槛。
 - 构建期间仅见 WSL 挂载时间偏差的 clock skew 警告，不影响上述退出码和测试结果。
 
 ## 2026-09-24 显式控制流、Caster 与多 FD 复测
@@ -411,6 +418,11 @@ poll/select。后续 sanitizer 和 Memcheck 结果以本节追加记录为准。
 - 为避免 Memcheck 下启动放大造成假失败，IO 用例先等待任务进入 GState::Waiting 再写入测试 fd；同时增加重复 fd/方向和混合无效 fd 的 WaitMany 边界用例。
 
 ## 2026-09-28 高负载调度与 IO 对比复测
+
+> **路径与工作树说明（2026-10-10 追加）**：本轮记录产生于当时的 `NewGo2Cpp`
+> 工作树，不是当前 `Go2Cpp` 工作树；文中 `tests/high_load_stress.cpp` 现已迁移为
+> `tests/concurrency/high_load_stress.cpp`。本节数字与路径按当时状态保留，此处
+> 仅补充当前对应位置。
 
 本轮在 `NewGo2Cpp` 工作树新增 `tests/high_load_stress.cpp`，用于大数据量
 验证和线程池基线对比：50,000 个任务各执行 4 次 Fiber yield，2,000 个
@@ -592,8 +604,8 @@ IO）：
   全部测试通过，无 ASan 报告；高负载 scheduler/IO ASan 测试也通过。
 - 完整高负载 Release 通过，包含所有结果校验。
 
-当前仍未在现有 Boost.Context fcontext 后端实现可安全的运行中栈搬迁和
-真正的 segmented stack。栈复用已经完成，但 Fiber 仍使用带保护页的固定容量
+当前仍未在现有 Fiber 上下文后端（Linux x86_64 为 Go2Cpp 自有 ABI，其他平台为
+Boost.Context）实现可安全的运行中栈搬迁和真正的 segmented stack。栈复用已经完成，但 Fiber 仍使用带保护页的固定容量
 栈；直接用 memcpy 搬迁活动 C++ 栈会破坏指针、RAII 和 fcontext，不能作为
 可靠优化提交。后续若启用编译器 split-stack 或替换为支持 segmented stack
 的后端，才能继续推进自动扩容。
