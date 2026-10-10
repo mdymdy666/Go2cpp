@@ -1,5 +1,7 @@
 #include "go2cpp/core/parking_condition.hpp"
 
+#include "go2cpp/fiber.hpp"
+
 #include "test_support.hpp"
 
 #include <chrono>
@@ -84,6 +86,34 @@ void check_immediate_predicate() {
     GO2CPP_CHECK(elapsed < 1s);
 }
 
+/**
+ * @brief 手动 Fiber（无 Scheduler 归属）中的等待必须立即取消而不是阻塞 carrier。
+ * @details 源码 `src/concurrency/parking_condition.cpp:260-264` 对
+ *          「是 Fiber 但没有 Scheduler/Task」的情况直接返回 kCancelled，
+ *          并保持调用方的外部 mutex 锁定。若该分支退化为 native 阻塞，
+ *          carrier OS 线程会被整条占住，这是最危险的回归之一。
+ */
+void check_manual_fiber_wait_is_cancelled() {
+    go2cpp::core::ParkingCondition condition;
+    std::mutex mutex;
+    bool ready = false;
+    bool wait_returned_true = true;
+    bool lock_still_held = false;
+    bool ran = false;
+
+    go2cpp::Fiber fiber([&] {
+        ran = true;
+        std::unique_lock<std::mutex> lock(mutex);
+        wait_returned_true =
+            condition.wait_for(lock, 50ms, [&ready] { return ready; });
+        lock_still_held = lock.owns_lock();
+    });
+    GO2CPP_REQUIRE(fiber.resume());
+    GO2CPP_REQUIRE(ran);
+    GO2CPP_CHECK(!wait_returned_true);
+    GO2CPP_CHECK(lock_still_held);
+}
+
 /** @brief 普通线程上的静态查询入口不抛异常且语义稳定。 */
 void check_static_queries() {
     GO2CPP_CHECK(!go2cpp::core::ParkingCondition::CancellationRequested());
@@ -103,5 +133,6 @@ void run_parking_condition_tests() {
     check_timeout();
     check_notify_all();
     check_immediate_predicate();
+    check_manual_fiber_wait_is_cancelled();
     check_static_queries();
 }

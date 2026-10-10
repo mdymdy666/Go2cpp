@@ -55,6 +55,8 @@
 | X-03 | 文档 | `docs/boundary_audit.md` 同一文件内自相矛盾 | `docs/boundary_audit.md:25`（native context 有溢出检查）vs `:30`（称当前使用 Boost.Context） | 见 I-01；**B-02 已完成**（commit `23677d6`） |
 | X-04 | 文档 | `docs/performance.md` 内部性能结论数量级矛盾（混合锁「快 10~18 倍」vs「8.5~8.8 s」；IO「慢 3.0~4.3 倍」vs「0.59x 已超过」） | `docs/performance.md:140` vs `:42-46`/`:183`/`:214-216`；`:141` vs `:184`；另 `:5-7` 自称「本节优先」但顶部小节早于后文 | **B-02 已完成**（commit `64a0cdc`）：核实为**累积记录性质**而非错误数据——同参数在不同轮次的记录差异来自调度配置、编译选项与宿主抖动；已在文首补「阅读须知」说明不得跨节比较，当前结论以日期最新一节为准 |
 | X-05 | 测试 | `tests/concurrency/test_context.cpp` 等以 CHECK 为主、缺超时保护，挂起式失败会拖到 CTest 30s TIMEOUT | 见 T-01/T-02；`cmake/Go2CppTests.cmake:31` TIMEOUT 30 | 属测试健壮性缺陷，非产品缺陷 |
+| X-06 | 网络 / fd_manager | `FdContext` 的字段 getter 全部无锁读，而 `FdManager` 写侧持 `m_mutex`；头文件 `fd_manager.hpp:18` 却声称「字段访问由 FdManager 内部互斥保护」。跨线程「一边 `set_nonblock`/`set_timeout`、一边读 getter」构成 data race（UB） | `include/go2cpp/network/fd_manager.hpp:19-39`（getter 无锁）vs `src/network/fd_manager.cpp:57-59,66-68`（写在 `m_mutex` 下）；类注释见 `fd_manager.hpp:18` | 中 | 待定 | 待办 | **本轮读源码发现**（文档不可得）。建议修复：把 4 个 bool + 2 个 `milliseconds` 改为 `std::atomic`（注意 `duplicate` 的 `*result = *old->second` 需改为逐字段 load/store），或把 getter 收回 FdManager 并加锁。因本环境 TSan 受 WSL 限制无法运行、缺可复现失败现场，按修复门槛**暂不修改**，仅登记 |
+| X-07 | 并发 / fiber_local | `FiberLocalCache::Reset()` 两条路径行为不对称：Fiber 路径走 `detail::Reset`，有 `for(;;)` 循环并把用户析构挪到锁外；线程路径只是 `ThreadValues().erase(m_key)`，**在 erase 内直接析构**。若值的析构函数重入并写回同一 key，线程路径会修改正在 erase 的容器，违反关联容器「元素析构函数不得修改容器」的约定（UB） | `include/go2cpp/concurrency/fiber_local.hpp:102-108`（Reset 的两条分支）vs `src/concurrency/fiber_local.cpp:124-150`（Fiber 路径的循环回收）；`src/concurrency/fiber_local.cpp:147` 的行内注释明确承认该约束 | 中 | 待定 | 待办 | **本轮读源码发现**。修复方向：让线程路径复用同一套「先摘出、锁外析构、循环复检」协议。同样因缺可复现失败现场而暂不修改 |
 
 > 说明：本节只登记现象与证据，**本轮不做任何修复**。
 

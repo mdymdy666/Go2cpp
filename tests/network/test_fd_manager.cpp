@@ -84,6 +84,30 @@ void check_erase_marks_closed() {
     manager.erase(kFd);
 }
 
+/**
+ * @brief duplicate 在源 fd 不存在时创建全新的空元数据。
+ * @details 源码 `src/network/fd_manager.cpp:40-45` 对缺失源有独立分支：
+ *          新对象 `initialized=true` 且不继承任何状态。此分支此前未覆盖。
+ */
+void check_duplicate_missing_source() {
+    auto& manager = go2cpp::net::FdManager::instance();
+    constexpr int kMissingFd = 90107;
+    constexpr int kTargetFd = 90108;
+    manager.erase(kMissingFd);
+    manager.erase(kTargetFd);
+
+    auto copied = manager.duplicate(kMissingFd, kTargetFd);
+    GO2CPP_REQUIRE(copied != nullptr);
+    GO2CPP_CHECK(copied->fd() == kTargetFd);
+    GO2CPP_CHECK(copied->initialized());
+    GO2CPP_CHECK(!copied->user_nonblock());
+    GO2CPP_CHECK(!copied->system_nonblock());
+    GO2CPP_CHECK(copied->recv_timeout() == 0ms);
+
+    manager.erase(kMissingFd);
+    manager.erase(kTargetFd);
+}
+
 /** @brief duplicate 把旧 fd 的非阻塞状态复制到新 fd。 */
 void check_duplicate() {
     auto& manager = go2cpp::net::FdManager::instance();
@@ -117,4 +141,5 @@ void run_fd_manager_tests() {
     check_timeouts();
     check_erase_marks_closed();
     check_duplicate();
+    check_duplicate_missing_source();
 }

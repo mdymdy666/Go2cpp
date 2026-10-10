@@ -11,6 +11,29 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：源码回溯审计（第 1 批：已写测试的四个小模块）
+
+- **背景**：用户质疑此前工作「主要靠头文件与文档梳理，而非源码」。该质疑成立——上一轮的 13 个新文件是按头文件接口 + 文档语义写的，四个最大实现文件（`scheduler.cpp`/`io.cpp`/`hook.cpp`/`context.cpp`）一行未读。本轮起改为**先读完整实现、再核对断言依据**的回溯方式。
+- **本轮读完整实现的文件**：`src/network/fd_manager.cpp`(72)、`src/concurrency/fiber_local.cpp`(183)、`src/concurrency/parking_condition.cpp`(337)。三者都是此前写过测试但未读实现的模块。
+- **核对结果——断言站得住的部分**：
+  - `fd_manager.cpp:23` `result->m_initialized = true`，印证我先猜错后修正的断言；
+  - `fd_manager.cpp:31-34` erase 先置 `m_closed` 再 `m_contexts.erase`，我的 closed/新对象两条断言与实现一致；
+  - `fiber_local.cpp:87,112` 按 `Fiber*` 分表存储，Fiber 隔离与结束后回收断言成立；
+  - `parking_condition.cpp:202-242` notify_one/notify_all 的队列处理与 Finish 单赢家语义，与我的断言一致；
+  - `parking_condition.cpp:177-192` 两个静态查询在普通线程下均返回 false，断言成立。
+- **核对结果——我的测试盲点（源码有分支、我未覆盖），已在本轮补齐**：
+  1. `fd_manager.cpp:40-45`：`duplicate` 在源 fd 不存在时走独立分支，创建`initialized=true` 的全新元数据。补 `check_duplicate_missing_source`。
+  2. `parking_condition.cpp:260-264`：**手动 Fiber（无 Scheduler 归属）中的等待直接返回 `kCancelled` 并保持外部 mutex 锁定**，绝不阻塞 carrier OS 线程。这是最危险的回归点之一，补 `check_manual_fiber_wait_is_cancelled`，用手动 `Fiber` + `resume()` 实测通过。
+  3. `fiber_local.cpp:147,176`：`Reset`/`Cleanup` 用 `for(;;)` 循环处理「值析构函数再创建值」的重入。本轮未补测（重入析构属高风险用法），但由此发现缺陷 X-07，见下。
+- **本轮读源码发现的两条新缺陷（已登记，暂不修改）**：
+  - **X-06**：`FdContext` 的 getter 全部无锁读，而写侧持 `FdManager::m_mutex`；`fd_manager.hpp:18` 的类注释「字段访问由 FdManager 内部互斥保护」与接口实际不符，跨线程读写构成 data race。
+  - **X-07**：`FiberLocalCache::Reset()` 的 Fiber 路径与线程路径行为不对称——前者有「锁外析构 + 循环复检」防护，后者直接 `ThreadValues().erase(m_key)`，若值析构重入写回同一 key 即构成 UB。
+  两条都**只有读实现才能发现**，文档与头文件都不会暴露。按用户既定的缺陷修复门槛（需台账 ID + 可复现证据 + 失败现场），因本环境 TSan 受 WSL `unexpected memory mapping` 限制无法运行、暂未构造出可复现失败现场，故本轮**只登记不修改**。
+- **一处质量问题（读源码才可见）**：`fiber_local.cpp` 与 `parking_condition.cpp` 存在大量模板化套话注释——每个函数头都写着「函数功能：完成 X 调用…执行流程：1. 校验传入参数…2. 按状态机规则…3. 发布返回结果…」，同一段文字被复制到 `AllocateKey`、`Get`、`Set`、`Reset`、`Cleanup` 上，零信息量。真正有价值的设计意图（`AllocateKey` 为何用 CAS 而非 `fetch_add`、耗尽时为何 `terminate` 而非回绕）只写在**行内注释**里。这类注释营造了「已被理解」的假象，仅读头文件与文档无法察觉。
+- **验证结果**：`cmake --build build-quality --target go2cpp_tests` 0 warning / 0 error；`GO2CPP_TEST_FILTER=fd_manager` 与 `parking_condition` 均通过（校验 `announce` 文本，防空跑）。
+- **未通过/未覆盖**：本批只回溯了 3 个实现文件（合计 592 行）；`scheduler.cpp`、`io.cpp`、`hook.cpp`、`context.cpp`、`fiber.cpp`、`sync.cpp`、`config.cpp`、`log.cpp` 等仍未读；X-06/X-07 未修复也未构造出复现用例；未跑 sanitizer 与 Valgrind。
+- **下一步**：继续回溯——优先 `src/network/io_backend.cpp`(228)、`src/tools/error.cpp`(404)、`src/concurrency/thread_policy.cpp`(202)（三者都是我已写测试或示例但未读实现的模块）。
+
 ## 2026-10-10：一次性补齐台账剩余测试与示例（B-03/B-04/B-05 收尾）
 
 - **本轮范围**：用户要求一次性执行完全部剩余条目。完成 **T-03、T-04、T-05、T-06、T-07、E-02** 共 6 条；台账 B-00~B-05 六个批次至此**全部完成**。
