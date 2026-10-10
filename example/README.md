@@ -9,6 +9,8 @@
 4. `io_wait_many_demo.cpp`：多个 FD 的 epoll 等待、超时和取消；
 5. `context_rollback_demo.cpp`：Context 局部回滚和补偿动作。
 
+上面只是入门主线，**完整示例清单与场景说明见下方「示例场景速查」表**。
+
 详细的环境准备、生命周期约束和故障排查请先阅读
 [`docs/getting_started.md`](../docs/getting_started.md)。示例都要求先构建
 `GO2CPP_BUILD_EXAMPLES=ON` 的构建目录；示例返回前会等待任务并关闭自己创建的
@@ -42,6 +44,7 @@ cmake --build build --target go2cpp_runtime_demo
 | `dynamic_gmp_demo` | P/M 扩展和任务亲和 | 空闲 Worker 回收到最小值 | 取消请求与启动竞争，最终收敛为 `Cancelled` |
 | `mixed_runtime_demo` | 普通线程与 Fiber 交接混合锁 | 条件变量通知、BlockingRegion | Lock/Wait 失败立即终止，避免未持锁解锁 |
 | `control_flow_demo` | defer LIFO 与参数求值 | defer 内 recover | move-only 内建 Select 返回 `kInvalid` |
+| `network_demo` | Framer 粘包分帧、HTTP 完整请求解析 | 半包：分隔符跨两次输入；HTTP 逐字节 NeedMore | 超长帧进入失败态并丢弃缓冲、非法请求行报错 |
 | `io_wait_many_demo` | WaitMany 收集多个 socket | socket→channel→Select 多源等待 | DefaultCase、Context 取消 |
 | `io_hook_demo` | Hook socket 收发 | Fiber 让出 M 等待 readiness | `SO_RCVTIMEO` 转换为 `ETIMEDOUT` |
 | `context_rollback_demo` | commit 保留已提交资源 | 父取消/deadline 驱动补偿 | undo 异常、失效 savepoint |
@@ -51,7 +54,7 @@ cmake --build build --target go2cpp_runtime_demo
 
 ```sh
 for demo in beginner runtime fiber_sync managed_pipeline dynamic_gmp \
-  mixed_runtime control_flow io_wait_many context_rollback log_config io_hook; do
+  mixed_runtime control_flow network io_wait_many context_rollback log_config io_hook; do
   timeout 20s ./build/go2cpp_${demo}_demo || exit $?
 done
 ```
