@@ -60,7 +60,7 @@ void run_context_tests() {
     const auto parent_pair = WithCancel(root);
     const auto grandchild_pair = WithCancel(parent_pair.first);
     parent_pair.second();
-    GO2CPP_CHECK(grandchild_pair.first->Done().WaitFor(100ms));
+    GO2CPP_REQUIRE(grandchild_pair.first->Done().WaitFor(100ms));
     GO2CPP_CHECK(Is(grandchild_pair.first->Err(), CanceledError()));
 
     // Descendant cancellation is committed before parent callbacks run. A
@@ -78,7 +78,7 @@ void run_context_tests() {
 
     const auto deadline_pair = WithTimeout(root, 20ms);
     GO2CPP_CHECK(!deadline_pair.first->Done().IsDone());
-    GO2CPP_CHECK(deadline_pair.first->Done().WaitFor(500ms));
+    GO2CPP_REQUIRE(deadline_pair.first->Done().WaitFor(500ms));
     GO2CPP_CHECK(Is(deadline_pair.first->Err(), DeadlineExceededError()));
     deadline_pair.second();
 
@@ -131,7 +131,7 @@ void run_context_tests() {
         deep_leaf = WithCancel(deep_leaf).first;
     }
     deep_pair.second();
-    GO2CPP_CHECK(deep_leaf->Done().WaitFor(2s));
+    GO2CPP_REQUIRE(deep_leaf->Done().WaitFor(2s));
     GO2CPP_CHECK(Is(deep_leaf->Err(), CanceledError()));
 
     // Done().Wait/WaitFor must park a managed G. With one P the cancelling
@@ -153,8 +153,8 @@ void run_context_tests() {
         go2cpp_tests::yield_for_watchdog();
     }
     auto managed_canceller = managed.spawn([&] { managed_cancel.second(); });
-    GO2CPP_CHECK(managed_waiter->wait_for(2s));
-    GO2CPP_CHECK(managed_canceller->wait_for(2s));
+    GO2CPP_REQUIRE(managed_waiter->wait_for(2s));
+    GO2CPP_REQUIRE(managed_canceller->wait_for(2s));
     GO2CPP_CHECK(managed_result.load(std::memory_order_acquire));
 
     // RollbackDone 也必须让 managed G 让出 M；否则 P=1 时执行 rollback
@@ -173,8 +173,8 @@ void run_context_tests() {
     auto managed_rollback_worker = managed.spawn([&] {
         (void)managed_scope.rollback();
     });
-    GO2CPP_CHECK(managed_rollback_waiter->wait_for(2s));
-    GO2CPP_CHECK(managed_rollback_worker->wait_for(2s));
+    GO2CPP_REQUIRE(managed_rollback_waiter->wait_for(2s));
+    GO2CPP_REQUIRE(managed_rollback_worker->wait_for(2s));
     GO2CPP_CHECK(managed_rollback_waited.load(std::memory_order_acquire));
     GO2CPP_CHECK(managed_undo_count.load(std::memory_order_acquire) == 1);
     managed.shutdown();
@@ -195,7 +195,7 @@ void run_context_tests() {
         GO2CPP_CHECK(scope.active());
         GO2CPP_CHECK(scope.record_undo([&] { order.push_back(4); }));
         GO2CPP_CHECK(scope.rollback());
-        GO2CPP_CHECK(scope.rollback_done().WaitFor(1s));
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
         GO2CPP_CHECK(order.size() == 4 && order[2] == 4 && order[3] == 1);
         GO2CPP_CHECK(scope.rolled_back());
         GO2CPP_CHECK(!mark.valid());
@@ -219,8 +219,8 @@ void run_context_tests() {
                 undo_count.fetch_add(1, std::memory_order_relaxed);
             }));
         parent_pair.second();
-        GO2CPP_CHECK(child_scope->Done().WaitFor(1s));
-        GO2CPP_CHECK(scope.rollback_done().WaitFor(1s));
+        GO2CPP_REQUIRE(child_scope->Done().WaitFor(1s));
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
         GO2CPP_CHECK(undo_observed_done.load(std::memory_order_acquire));
         GO2CPP_CHECK(undo_count.load(std::memory_order_relaxed) == 1);
         GO2CPP_CHECK(scope.rolled_back());
@@ -264,7 +264,7 @@ void run_context_tests() {
                                        std::memory_order_release);
         });
         parent_pair.second();
-        GO2CPP_CHECK(scope.rollback_done().WaitFor(1s));
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
         GO2CPP_CHECK(!late_record_accepted.load(std::memory_order_acquire));
         GO2CPP_CHECK(done_callback_waited.load(std::memory_order_acquire));
         GO2CPP_CHECK(
@@ -285,7 +285,7 @@ void run_context_tests() {
         GO2CPP_CHECK(scope.rollback_done().IsDone());
         GO2CPP_CHECK(!child_scope->IsDone());
         parent_pair.second();
-        GO2CPP_CHECK(child_scope->Done().WaitFor(1s));
+        GO2CPP_REQUIRE(child_scope->Done().WaitFor(1s));
         GO2CPP_CHECK(undo_count.load(std::memory_order_relaxed) == 0);
         GO2CPP_CHECK(!scope.rollback());
     }
@@ -305,7 +305,7 @@ void run_context_tests() {
         GO2CPP_CHECK(scope.record_undo(
             [&] { completed.fetch_add(10, std::memory_order_relaxed); }));
         GO2CPP_CHECK(scope.rollback());
-        GO2CPP_CHECK(scope.rollback_done().WaitFor(1s));
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
         GO2CPP_CHECK(undo_observed_done.load(std::memory_order_acquire));
         GO2CPP_CHECK(completed.load(std::memory_order_relaxed) == 11);
         GO2CPP_CHECK(scope.had_failure());
@@ -325,7 +325,7 @@ void run_context_tests() {
         GO2CPP_JOIN_WITH_WATCHDOG(rollbacker, 2s);
         GO2CPP_CHECK(!scope.active());
         GO2CPP_CHECK(undo_count.load(std::memory_order_relaxed) <= 1);
-        GO2CPP_CHECK(scope.rollback_done().WaitFor(1s));
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
     }
 
     // 父取消与显式 rollback 同时发生时，前置 claim/Done 回调不能丢失
@@ -340,7 +340,7 @@ void run_context_tests() {
         std::thread explicit_rollback([&scope] { (void)scope.rollback(); });
         GO2CPP_JOIN_WITH_WATCHDOG(parent_canceller, 2s);
         GO2CPP_JOIN_WITH_WATCHDOG(explicit_rollback, 2s);
-        GO2CPP_CHECK(scope.rollback_done().WaitFor(1s));
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
         GO2CPP_CHECK(undo_count.load(std::memory_order_relaxed) <= 1);
     }
 
@@ -356,7 +356,7 @@ void run_context_tests() {
         std::thread committer([&scope] { (void)scope.commit(); });
         GO2CPP_JOIN_WITH_WATCHDOG(parent_canceller, 2s);
         GO2CPP_JOIN_WITH_WATCHDOG(committer, 2s);
-        GO2CPP_CHECK(scope.rollback_done().WaitFor(1s));
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
         GO2CPP_CHECK(undo_count.load(std::memory_order_relaxed) <= 1);
         GO2CPP_CHECK(!scope.active());
     }
@@ -372,7 +372,7 @@ void run_context_tests() {
         GO2CPP_CHECK(!source.rollback());
         GO2CPP_CHECK(!child_scope->IsDone());
         GO2CPP_CHECK(moved.rollback());
-        GO2CPP_CHECK(moved.rollback_done().WaitFor(1s));
+        GO2CPP_REQUIRE(moved.rollback_done().WaitFor(1s));
         GO2CPP_CHECK(undo_count.load(std::memory_order_relaxed) == 1);
         GO2CPP_CHECK(child_scope->IsDone());
 
@@ -388,7 +388,7 @@ void run_context_tests() {
         destination = std::move(incoming);
         GO2CPP_CHECK(assigned_count.load(std::memory_order_relaxed) == 10);
         GO2CPP_CHECK(destination.rollback());
-        GO2CPP_CHECK(destination.rollback_done().WaitFor(1s));
+        GO2CPP_REQUIRE(destination.rollback_done().WaitFor(1s));
         GO2CPP_CHECK(assigned_count.load(std::memory_order_relaxed) == 11);
     }
 
@@ -399,7 +399,7 @@ void run_context_tests() {
         std::atomic<int> undo_count{0};
         GO2CPP_CHECK(scope.record_undo(
             [&] { undo_count.fetch_add(1, std::memory_order_relaxed); }));
-        GO2CPP_CHECK(scope.context()->Done().WaitFor(2s));
+        GO2CPP_REQUIRE(scope.context()->Done().WaitFor(2s));
         GO2CPP_CHECK(Is(scope.context()->Err(), DeadlineExceededError()));
         GO2CPP_CHECK(scope.active());
         GO2CPP_CHECK(!scope.rollback_done().IsDone());
@@ -407,7 +407,7 @@ void run_context_tests() {
         GO2CPP_CHECK(scope.record_undo(
             [&] { undo_count.fetch_add(10, std::memory_order_relaxed); }));
         GO2CPP_CHECK(scope.rollback());
-        GO2CPP_CHECK(scope.rollback_done().WaitFor(1s));
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
         GO2CPP_CHECK(undo_count.load(std::memory_order_relaxed) == 11);
         parent_pair.second();
     }
@@ -419,8 +419,8 @@ void run_context_tests() {
         std::atomic<int> undo_count{0};
         GO2CPP_CHECK(scope.record_undo(
             [&] { undo_count.fetch_add(1, std::memory_order_relaxed); }));
-        GO2CPP_CHECK(scope.context()->Done().WaitFor(2s));
-        GO2CPP_CHECK(scope.rollback_done().WaitFor(2s));
+        GO2CPP_REQUIRE(scope.context()->Done().WaitFor(2s));
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(2s));
         GO2CPP_CHECK(scope.rolled_back());
         GO2CPP_CHECK(Is(scope.context()->Err(), DeadlineExceededError()));
         GO2CPP_CHECK(undo_count.load(std::memory_order_relaxed) == 1);
