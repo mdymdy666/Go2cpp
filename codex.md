@@ -5,6 +5,20 @@
 > 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
 > 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
 
+## 2026-10-10：B-01 示例质量（network_demo 三路径与登记）
+
+- **本轮范围**：台账批次 **B-01**，覆盖 **E-01**、**E-03**。运行模式为定时任务单轮执行；轮次互斥锁 `.agent/guard.sh` 由本轮首次创建（lock 目录已加入 `.gitignore`）。
+- **改动文件**：
+  - `example/network/network_demo.cpp`：19 行 → 157 行。从「只有成功路径」扩为五个场景：场景一粘包，一次输入交付全部完整帧；场景二半包，分隔符跨两次输入，`take_frames()` 为空但 `buffered_size()==6`；场景三超长帧，`max_frame=4` 触发 `FeedError::FrameTooLarge`，缓冲被清空、失败态拒绝后续输入、`reset()` 后可复用；场景四 HTTP 逐字节喂入累积到 `Complete`；场景五非法请求行返回 `Error`，未 `reset()` 时坏缓冲继续报错。
+  - `example/README.md`：速查表新增 `network_demo` 行；批量运行列表加入 `network`；推荐阅读顺序后补「完整示例清单见下方速查表」指引。
+- **实现取舍**：`network_demo` 保持「纯解析、无 IO」定位，未引入 Scheduler/socket；epoll 上的等待、超时与取消由既有的 `io_wait_many_demo.cpp`、`sse_demo.cpp`、`websocket_demo.cpp` 覆盖，并在新示例的 Doxygen 注释中做了交叉指引。
+- **一处如实说明**：HTTP 解析器**没有**粘性错误态。`Parser::feed_impl` 入口只检查 `m_finished`，不检查 `m_error`；返回 `Error` 后重复喂入仍报错的真正原因是出错时的缓冲区未被丢弃。示例注释与场景名按此事实书写，未表述为「失败态粘性」。
+- **验证结果**：`build-quality`（Debug，TESTS+EXAMPLES ON）全量构建 0 warning / 0 error；`ctest` **18/18 通过**，总耗时 23.86 s，其中 `go2cpp_network_demo` Passed；示例单独运行退出码 0，五个场景全部报告「通过」。开发过程中示例曾因自身测试数据不合 `max_frame=4` 约束而 abort（`std::length_error: frame too large`），已改用合法短帧修正——属示例数据问题，非库缺陷。
+- **未通过/未覆盖**：本轮未跑 sanitizer 与 Valgrind；未做多次重复运行（示例为确定性纯解析、无并发或超时路径，不适用「≥5 次重复」要求）；未验证根 `README.md` 的示例清单——那是台账 D-02，归 B-02。
+- **新登记**：`E-04`（`sse_demo` / `websocket_demo` / `timer_task_demo` 仍未登记进速查表与批量列表），归 B-02。
+- **提交**：`8ff0e6f`（示例）、`79d7b71`（索引登记）。
+- **下一步**：B-02 文档重构后路径与索引同步（D-01~D-09、D-11、I-01、X-02~X-04），条目多于 5 条，须拆多轮。
+
 ## 2026-10-10：文档/测试/示例质量审计与建账
 
 - **本轮范围**：只读审计 + 建账，**未修改任何既有源码/文档/测试/示例**。新增 3 个文件：
