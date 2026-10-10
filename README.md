@@ -45,14 +45,20 @@ ctest --test-dir build --output-on-failure
 可运行程序、Fiber/线程混合规则、Channel/Context/IO 生命周期、配置校验和常见
 错误排查步骤。
 
-可运行示例位于 `example/`：`runtime_demo.cpp`、`fiber_sync_demo.cpp`、
-`mixed_runtime_demo.cpp`、`managed_pipeline_demo.cpp`、`dynamic_gmp_demo.cpp`
-以及 Linux Hook 构建下的 `io_hook_demo.cpp`。其中
-`mixed_runtime_demo.cpp` 展示普通线程与 Fiber 的同步、FiberLocal 值、
-线程级 Hook 策略和显式 `BlockingRegion`。
+可运行示例位于 `example/`，按模块子目录维护；完整清单、场景说明与运行方式见
+[`example/README.md`](example/README.md)：
 
-日志和配置的完整新手示例是 `example/log_config_demo.cpp`，工程配置模板是根目录
-的 `go2cpp.ini`，详细说明见 [`docs/logging.md`](docs/logging.md) 和
+- `example/concurrency/`：`beginner_demo.cpp`、`runtime_demo.cpp`、
+  `fiber_sync_demo.cpp`、`managed_pipeline_demo.cpp`、`dynamic_gmp_demo.cpp`、
+  `mixed_runtime_demo.cpp`、`context_rollback_demo.cpp`、`timer_task_demo.cpp`；
+- `example/network/`：`network_demo.cpp`、`io_wait_many_demo.cpp`、
+  `io_hook_demo.cpp`（仅 Linux Hook 构建）、`sse_demo.cpp`、`websocket_demo.cpp`；
+- `example/logging/log_config_demo.cpp`、`example/tools/control_flow_demo.cpp`。
+
+其中 `mixed_runtime_demo.cpp` 展示普通线程与 Fiber 的同步、FiberLocal 值、
+线程级 Hook 策略和显式 `BlockingRegion`。日志和配置的完整新手示例是
+`example/logging/log_config_demo.cpp`，工程配置模板是根目录的 `go2cpp.ini`，
+详细说明见 [`docs/logging.md`](docs/logging.md) 和
 [`docs/configuration.md`](docs/configuration.md)。
 
 配置中心支持强类型 `ConfigVar<T>`、变更监听器和文件热加载；日志模块支持多
@@ -87,14 +93,14 @@ go2cpp::shutdown_default_scheduler();
 再通过 channel 传递结果。事件状态访问支持普通线程与 Fiber 并发，结构修改
 采用锁保护和快照语义；批次对象仍须长于所有调用者，`stop()` 通过内部 Context 唤醒等待，并只发出协作式停止请求。
 
-转译代码需要完整公共接口时，包含 `go2cpp/runtime.hpp`。模块 target
-（`go2cpp::error`、`go2cpp::control_flow`、`go2cpp::context`、`go2cpp::channel`、
-`go2cpp::scheduler`、`go2cpp::fiber`、`go2cpp::sync`、`go2cpp::io`、
-`go2cpp::log`、`go2cpp::config`、`go2cpp::hook`）既可在源码树中单独使用，
-也会与 `go2cpp::runtime` umbrella target 一起导出。
+转译代码需要完整公共接口时，包含 `go2cpp/runtime.hpp`。模块 target（`go2cpp::error`、
+`go2cpp::control_flow`、`go2cpp::context`、`go2cpp::channel`、`go2cpp::scheduler`、
+`go2cpp::fiber`、`go2cpp::sync`、`go2cpp::future`、`go2cpp::io`、`go2cpp::network`、
+`go2cpp::log`、`go2cpp::config`，以及 Hook 构建下的 `go2cpp::hook`）既可在源码树中
+单独使用，也会与 `go2cpp::runtime` umbrella target 一起导出。
 
 
-新手完整示例是 `example/beginner_demo.cpp`，构建后运行：
+新手完整示例是 `example/concurrency/beginner_demo.cpp`，构建后运行：
 
 ```sh
 cmake --build build --target go2cpp_beginner_demo
