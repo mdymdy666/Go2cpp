@@ -45,20 +45,27 @@ cmake --build build --target go2cpp_runtime_demo
 | `mixed_runtime_demo` | 普通线程与 Fiber 交接混合锁 | 条件变量通知、BlockingRegion | Lock/Wait 失败立即终止，避免未持锁解锁 |
 | `control_flow_demo` | defer LIFO 与参数求值 | defer 内 recover | move-only 内建 Select 返回 `kInvalid` |
 | `timer_task_demo` | 一次性任务；固定速率周期执行三次后自动结束 | 动态重排间隔、到期回调投递为 Fiber | 取消竞态、weak_ptr 资源消失、回调异常不杀死定时器线程 |
+| `hybrid_mutex_demo` | HybridGate 短临界区加解锁、lock_guard 兼容 | 多线程竞争下计数不丢更新 | 自旋次数为 0 被归一化为 1 |
+| `future_demo` | Promise 发布值、Future 读取结构化结果 | 生产者线程延迟发布后等待完成 | 超时、SetError、SetException、Promise 先析构得到 broken promise |
 | `network_demo` | Framer 粘包分帧、HTTP 完整请求解析 | 半包：分隔符跨两次输入；HTTP 逐字节 NeedMore | 超长帧进入失败态并丢弃缓冲、非法请求行报错 |
 | `io_wait_many_demo` | WaitMany 收集多个 socket | socket→channel→Select 多源等待 | DefaultCase、Context 取消 |
 | `io_hook_demo` | Hook socket 收发 | Fiber 让出 M 等待 readiness | `SO_RCVTIMEO` 转换为 `ETIMEDOUT` |
 | `websocket_demo` | RFC 6455 握手与文本消息 echo | 服务端线程 recv 循环等待请求 | 握手失败直接返回非零；两端显式关闭 |
 | `sse_demo` | 事件编码与解析、socketpair 上的流生命周期 | 半包增量解析、心跳写入 | Context 取消后拒绝新事件 |
+| `fd_manager_demo` | fd 元数据自动创建与更新 | 非阻塞/超时状态记录 | erase 标记 closed、auto_create=false 返回空 |
+| `io_backend_demo` | 默认后端名与自定义后端注册 | 命名后端实例化并调用协议 | 同名重复注册失败、注销后创建返回空 |
+| `address_bytearray_demo` | IPv4 解析、子网计算、字节缓冲往返 | Unix 地址经工厂复制为正确子类 | 越界读取显式抛出 |
 | `context_rollback_demo` | commit 保留已提交资源 | 父取消/deadline 驱动补偿 | undo 异常、失效 savepoint |
 | `log_config_demo` | 自定义 Formatter Item | 配置加载后应用日志 | 非法 INI 保留旧快照 |
+| `errors_demo` | errors:: 构造、包装与聚合 | Unwrap 逐层下降到底 | 消息相同但身份不同不匹配 |
 
 一次构建后可以批量运行全部示例（每个命令都有 20 秒看门狗）：
 
 ```sh
 for demo in beginner runtime fiber_sync managed_pipeline dynamic_gmp \
   mixed_runtime control_flow timer_task network io_wait_many websocket sse \
-  context_rollback log_config io_hook; do
+  context_rollback log_config future hybrid_mutex fd_manager io_backend \
+  address_bytearray errors io_hook; do
   timeout 20s ./build/go2cpp_${demo}_demo || exit $?
 done
 ```

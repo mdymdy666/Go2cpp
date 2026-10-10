@@ -19,6 +19,13 @@ void run_beginner_api_tests();
 void run_log_config_tests();
 void run_network_tests();
 void run_sse_tests();
+void run_hybrid_gate_tests();
+void run_parking_condition_tests();
+void run_thread_policy_tests();
+void run_fiber_local_tests();
+void run_event_go_tests();
+void run_fd_manager_tests();
+void run_errors_namespace_tests();
 void run_hook_tests();
 
 /**
@@ -46,6 +53,13 @@ int main() {
     if (selected("log")) run_log_config_tests();
     if (selected("network")) run_network_tests();
     if (selected("sse")) run_sse_tests();
+    if (selected("hybrid_gate")) run_hybrid_gate_tests();
+    if (selected("parking_condition")) run_parking_condition_tests();
+    if (selected("thread_policy")) run_thread_policy_tests();
+    if (selected("fiber_local")) run_fiber_local_tests();
+    if (selected("event_go")) run_event_go_tests();
+    if (selected("fd_manager")) run_fd_manager_tests();
+    if (selected("errors_ns")) run_errors_namespace_tests();
 #ifdef GO2CPP_TEST_HOOK
     if (selected("hook")) run_hook_tests();
 #endif

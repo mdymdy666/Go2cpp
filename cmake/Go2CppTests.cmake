@@ -18,6 +18,13 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_timer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_beginner_api.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/logging/test_log_config.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_errors_ns.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_event_go.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_hybrid_gate.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_parking_condition.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_thread_policy.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_fiber_local.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_fd_manager.cpp
     )
     target_link_libraries(go2cpp_tests PRIVATE go2cpp_runtime)
     target_include_directories(go2cpp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -67,7 +74,13 @@ if (GO2CPP_BUILD_EXAMPLES)
         network/sse_demo
         concurrency/context_rollback_demo
         logging/log_config_demo
-        concurrency/timer_task_demo)
+        concurrency/timer_task_demo
+        concurrency/future_demo
+        concurrency/hybrid_mutex_demo
+        network/fd_manager_demo
+        network/io_backend_demo
+        network/address_bytearray_demo
+        tools/errors_demo)
     if (TARGET go2cpp_hook)
         list(APPEND GO2CPP_EXAMPLES network/io_hook_demo)
     endif()
