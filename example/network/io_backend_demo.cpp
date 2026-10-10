@@ -89,7 +89,15 @@ int main() {
               << " create_after_remove=null -> " << (after_remove == nullptr)
               << '\n';
 
-    // 场景五（默认后端）：空名称创建平台默认实例。
+    // 场景五（约束边界）：平台默认后端不能被注销。
+    // 源码 `src/network/io_backend.cpp:197` 明确拒绝注销默认后端，因为它
+    // 是 IOManager 的启动依赖；若允许注销，后续默认创建会静默得到空实例。
+    // 此约束在 `io_backend.hpp` 中没有记录（台账 D-13）。
+    const bool default_protected = !UnregisterBackend(default_name);
+    std::cout << "[io_backend][场景五] unregister_default_rejected="
+              << default_protected << "（预期 true）\n";
+
+    // 场景六（默认后端）：空名称创建平台默认实例。
     auto fallback = CreateBackend();
     const bool fallback_ok = fallback != nullptr;
     if (fallback) {
@@ -97,7 +105,7 @@ int main() {
     }
 
     const bool all = default_ok && registered && created && protocol_ok &&
-                     boundary_ok && fallback_ok;
+                     boundary_ok && default_protected && fallback_ok;
     std::cout << "[io_backend][汇总] all=" << std::boolalpha << all << '\n';
     return all ? 0 : 1;
 }

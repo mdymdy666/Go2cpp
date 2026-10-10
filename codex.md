@@ -11,6 +11,23 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：源码回溯审计（第 2 批：io_backend / thread_policy）
+
+- **本轮读完整实现**：`src/network/io_backend.cpp`(228)、`src/concurrency/thread_policy.cpp`(202)。
+- **核对结果——断言站得住**：
+  - `io_backend.cpp:181-186` `RegisterBackend` 用 `emplace(...).second` 判定首次注册，我的示例断言「同名重复注册返回 false」成立；
+  - `io_backend.cpp:206-217` `CreateBackend` 空名称回落 `DefaultBackendName()`、工厂在注册表锁外执行并吞掉工厂异常，我的示例断言成立；
+  - `io_backend.cpp:221-227` Linux 默认名即 `epoll`，非 Linux 返回空串；
+  - `thread_policy.cpp:6-10,37-40` 四个 `thread_local` 的初值与快照字段顺序完全对应我的断言；`:64-79` 构造在非 worker 线程上按 mode 写入、worker 线程上保持 M/P 绑定不变；`:78` 把 `runtime_worker` 写回 previous 值；
+  - `thread_policy.cpp:102-106,143-147` 两个作用域析构都只在 `m_active` 时恢复，`restore_policy` 恢复全部四个字段——我的「保存/恢复」断言成立；
+  - `thread_policy.cpp:159-165` `EnterRuntimeWorker` 置 `s_runtime_worker=true`，印证我在 worker 线程上观察到的 `runtime_worker` 标记。
+- **本轮读源码发现的新问题**：
+  - **D-13（文档缺失）**：`io_backend.cpp:197` 有一条硬约束——**平台默认后端不可注销**（`if (name == DefaultBackendName()) return false;`），理由是它是 IOManager 的启动依赖，允许注销会让后续默认创建静默拿到空实例。但 `include/go2cpp/io_backend.hpp:77` 只写了「注销后端；只影响后续 CreateBackend」，完全没有这条约束。调用方按头文件语义调用 `UnregisterBackend("epoll")` 只会拿到 false 而不明原因。已登记并就地补齐示例场景五。
+- **一处轻量观察（未登记）**：`io_backend.cpp:216` 用 `try { ... } catch (...) { return {}; }` 吞掉工厂抛出的所有异常，头文件 `:79` 未说明这一点。影响较小（返回空指针是明确的失败信号），故只在此记录，不单列条目。
+- **验证结果**：`cmake --build build-quality --target go2cpp_io_backend_demo` 0 warning / 0 error；示例运行退出码 0，新增「默认后端不可注销」场景断言通过。
+- **未通过/未覆盖**：本批只回溯 2 个文件（430 行）；累计回溯 5 个实现文件（约 1022 行），占 `src/` 总行数（21,855）的 **4.7%**。`scheduler.cpp`、`io.cpp`、`hook.cpp`、`context.cpp`、`fiber.cpp`、`sync.cpp`、`channel.cpp`、`timer.cpp`、`http.cpp` 等仍未读。
+- **下一步**：继续按「已写测试/示例但未读实现」的优先级回溯——`src/tools/error.cpp`(404) 已在读取中，其后为 `src/concurrency/fiber.cpp`(1502)与 `src/network/socket.cpp`(568)。
+
 ## 2026-10-10：源码回溯审计（第 1 批：已写测试的四个小模块）
 
 - **背景**：用户质疑此前工作「主要靠头文件与文档梳理，而非源码」。该质疑成立——上一轮的 13 个新文件是按头文件接口 + 文档语义写的，四个最大实现文件（`scheduler.cpp`/`io.cpp`/`hook.cpp`/`context.cpp`）一行未读。本轮起改为**先读完整实现、再核对断言依据**的回溯方式。
