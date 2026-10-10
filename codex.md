@@ -11,6 +11,22 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：源码回溯审计（第 7 批：context.cpp，1895 行）
+
+- **本轮读完整实现**：`src/concurrency/context.cpp`(1895)——四个大文件中第一个，也是 channel / future / timer / sync 的共同依赖。
+- **核对结果——文档承诺与实现一致**：
+  - `:17-26,47-79` `DoneSignal::State::cv` 就是 `core::ParkingCondition`，因此 `Done().Wait/WaitFor/WaitUntil` 在 managed G 中确实 park 而非阻塞 M，与 `docs/design.md` 一致；
+  - `:1598-1611` `MakeChild` 对空 parent 回退 `Background()`，与 `docs/compatibility.md`「空 parent 映射为 Background()（Go 会 panic）」一致；
+  - `:1666-1695` `WithDeadline` 对**已过期**deadline 同步取消，不依赖 timer worker 下一次调度；且 TimerService 停止中（`id == 0`）时转为显式取消，不留永久 pending 的 child；
+  - `:653-706` 用 `thread_local` 释放队列 + 自定义 `StateDeleter` 把父链析构改成**迭代式**，避免深 Context 树递归析构爆栈——与 `error.cpp` 的深链释放是同一套思路；
+  - `:172-205` `Signal()` 先搬出两组回调（internal 优先于普通）、清空 map，再在锁外 notify + 逐个 try/catch 执行；`:1428-1433` 移动后的空对象`RollbackDone()` 返回一个**已完成的静态信号**，避免调用方永久等待。
+- **对前几批结论的修正（重要）**：`context.cpp:1877-1893` 的 `CanceledError()` 与 `DeadlineExceededError()` **同样是函数局部 static 单例**。这说明 D-15 描述的「共享单例错误」并非偶然：**哨兵错误（sentinel error）共享单例正是 Go 的惯用语义**（`errors.Is(err, context.Canceled)` 就是靠它成立）。因此 D-15 的定位从「可疑行为」修正为「**需要文档说明的信息项**」，不涉及实现修改。
+- **本轮读源码发现的新问题**：
+  - **X-09**：两处 TimerService 对「在自身定时器线程内停止服务」策略不一致——`timer.cpp:120-123` 直接 `std::terminate()`，`context.cpp:307-318` 则跳过 join 继续返回。context 中的实例是内部实现、用户无法直接析构，实际影响有限，但策略差异值得统一或注明理由。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建；台账修正 D-15、新增 X-09。
+- **未通过/未覆盖**：累计回溯 **14 个实现文件、约 5,959 行**，占 `src/`（21,855）的 **27.3%**。三个大文件仍未读——`scheduler.cpp`(4048)、`io.cpp`(2646)、`hook.cpp`(2161)，合计 **8,855 行、占 40.5%**。
+- **下一步**：`scheduler.cpp`(4048)——它是唯一还没读的核心调度状态机，且 `Await`/`park_wait`/`wake_registered` 等被 sync 与 io 依赖的接口实现都在里面。
+
 ## 2026-10-10：源码回溯审计（第 6 批：timer / sync）
 
 - **本轮读完整实现**：`src/concurrency/timer.cpp`(778)、`src/concurrency/sync.cpp`(1324)，合计 2,102 行。
