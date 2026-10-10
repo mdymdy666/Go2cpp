@@ -11,6 +11,30 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：一次性补齐台账剩余测试与示例（B-03/B-04/B-05 收尾）
+
+- **本轮范围**：用户要求一次性执行完全部剩余条目。完成 **T-03、T-04、T-05、T-06、T-07、E-02** 共 6 条；台账 B-00~B-05 六个批次至此**全部完成**。
+- **新增测试（7 个文件）**：
+  - `tests/concurrency/test_hybrid_gate.cpp`（T-03）：默认策略归一化（0 → 1）、BasicLockable 与 `std::lock_guard` 兼容、8 线程 × 20,000 次读-改-写互斥校验、最小自旋实例互斥。
+  - `tests/concurrency/test_parking_condition.cpp`（T-07）：notify_one / notify_all、超时返回、谓词已成立时立即返回、两个静态查询入口。
+  - `tests/concurrency/test_thread_policy.cpp`（T-07）：默认 TLS 状态、参与作用域保存与恢复、Hook 模式保存与恢复、worker 线程的 `runtime_worker` 标记。
+  - `tests/concurrency/test_fiber_local.cpp`（T-07）：线程 TLS fallback、键唯一性、两个 Fiber 的值隔离、阻塞 park 后值保持、Fiber 结束后回收。
+  - `tests/concurrency/test_event_go.cpp`（T-06）：EventBatch 簿记、handler 调用、超时自动停止、`max_rounds`、handler 异常隔离、stop/reset，以及 `go(scheduler,fn)`、`go(fn)`、小写 `fiber` 描述器 bind。
+  - `tests/network/test_fd_manager.cpp`（T-04）：auto_create 语义、非阻塞与超时元数据、erase 标记 closed、duplicate 复制用户状态。
+  - `tests/tools/test_errors_ns.cpp`（T-05）：`errors::` 的 New / Wrap / Join / Unwrap / Is / As 与 CamelCase 版等价性，以及按对象而非消息判定的身份语义。
+- **新增示例（6 个文件）**，全部满足「成功 + 等待/生命周期 + 错误/边界」三路径：`future_demo`、`hybrid_mutex_demo`、`fd_manager_demo`、`io_backend_demo`、`address_bytearray_demo`、`errors_demo`。
+- **登记**：`tests/test_main.cpp` 加 7 个声明与注册；`cmake/Go2CppTests.cmake` 加 7 个测试源与 6 个 `GO2CPP_EXAMPLES`；`example/README.md` 速查表加 6 行、批量运行列表 15 → 21 项。
+- **U-01 处置（按默认执行，用户可推翻）**：在途改动新增的 `errors::` 命名空间按台账默认建议**保留**，并补齐最小测试与示例。若用户决定撤回该 API，需要删除 `tests/tools/test_errors_ns.cpp`、`example/tools/errors_demo.cpp` 并回退 `test_main.cpp`、`cmake/Go2CppTests.cmake`、`example/README.md` 中的登记。
+- **开发中修正的三处 API 误判（如实记录，均为我的假设错误而非库缺陷）**：
+  1. `ChannelStatus` 没有 `kOk`，可交付状态是 `kReady`；
+  2. `Channel::Send` 返回 `ChannelSendResult`（用 `.Ok()` 判断），不是 `ChannelStatus`；
+  3. `FdManager::get(fd, auto_create=true)` 创建的元数据**立即** `initialized()==true`，我先按 false 断言导致一次失败。
+- **一处基础设施缺陷（新登记 T-08）**：`GO2CPP_TEST_FILTER` 指定不存在的名字时，`tests/test_main.cpp` 不执行任何模块却仍返回 0。本轮第一次编译失败后，验证脚本用**旧二进制**跑 7 个新 filter 全部显示「通过」，实为空跑；后在验证脚本中加入 `announce` 文本校验才暴露该问题。建议后续改为「过滤器非空且未匹配任何模块时返回非零」。
+- **验证结果**：全量构建 0 warning / 0 error；`ctest` **24/24 通过**（原 18 + 6 个新示例）；7 个新测试在 `GO2CPP_TEST_FILTER` 下各**重复运行 5/5 通过**（含 16 万次加锁竞争与超时路径，验证脚本同时校验 `announce` 文本）；6 个新示例逐个运行退出码 0 且输出齐全；`log/` 已恢复到轮初 md5；用户 3 处在途改动 md5 未变。
+- **未通过/未覆盖**：未跑 sanitizer 与 Valgrind——新增测试包含大量多线程竞争与超时路径，ASan/TSan 下仍值得进一步验证，本轮不能宣称「无竞态」；`third_party/` 与 RFC 合规性仍未覆盖；台账 **X-01**（`dynamic_gmp_demo` 间歇失败，需重复 ≥10 次复现取证）仍然待办。
+- **提交**：`f8156e5`（13 个新文件 + 3 处登记，一次提交——因为 `cmake/Go2CppTests.cmake` 同时承载测试与示例登记，无法在不产生不可构建中间态的前提下拆分）。
+- **下一步建议**：处理 T-08（过滤器空跑）与 X-01（示例间歇失败复现），再考虑进入「自主扩账模式」审计尚未覆盖的区域（大文件逐行、sanitizer、RFC 合规、`third_party`）。
+
 ## 2026-10-10：全模块认知通读（只读，无源码改动）
 
 - **本轮性质**：对话内手动触发的认知轮，**不属于定时任务轮次**，因此未改动 `.agent/state.json`。全程只读，**未修改任何源码、测试、示例或文档**，仅追加本条记录。
