@@ -11,6 +11,22 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：全模块认知通读（只读，无源码改动）
+
+- **本轮性质**：对话内手动触发的认知轮，**不属于定时任务轮次**，因此未改动 `.agent/state.json`。全程只读，**未修改任何源码、测试、示例或文档**，仅追加本条记录。
+- **通读方式**：源码/头文件规模盘点 → 分层提取公共类型声明（tools / concurrency / network / logging / config / core+detail）→ 精读 `docs/{design,scheduler,network,compatibility,extensibility,logging,configuration}.md` → 交叉核对测试/示例/文档的四方覆盖。
+- **规模基线**：源码 25 个 `.cpp` + 1 个 `.S` 共 **21,855** 行；模块头 34 个共 **9,421** 行；测试 20 个文件 **9,280** 行；示例 15 个 **2,027** 行；文档 22 篇 **3,273** 行。
+- **分层结论**：
+  - **基础层 `tools`**：`error`（不可变 shared error + `Wrap`/`Join`/`Is`/`As`/`WalkErrors`）、`control_flow`（显式 defer/panic/recover，`PanicInfo`/`defer`/`panic`/`recover`）、`event`（`EventBatch`/`SelectLoop` 包装 channel SelectCase）、`go`（进程级默认调度器 + 小写 `fiber` 描述器）。
+  - **并发层 `concurrency`**：`scheduler`（G/M/P、`Task`/`Scheduler`、`SchedulerObserver`、`BlockingRegion`、BlockingRegion 替代 M 与 sysmon 逻辑脱绑）、`fiber` + `detail/context_backend`（Linux x86_64 自有 ABI，其他平台 Boost 回退）、`fiber_local`、`context`（取消树 + `DoneSignal` + `ContextRollback`）、`channel`（含 `SelectValue`/`SelectCaster`/`SelectProbe`）、`sync`（Fiber 与普通线程共用 FIFO 等待队列）、`future`、`core/timer`（`TimerService` + `TimerExecutor`）、`thread_policy`、`core/parking_condition`、`core/hybrid_mutex`（`HybridGate`）。
+  - **网络层 `network`**：`io`（`IOManager` + `DescriptorToken`/`DescriptorGuard` + `WaitAny`/`WaitMany`）、`io_backend`（可替换 Poller 协议）、`socket`（`Socket`/`SocketStream` + 读写取消代际）、`hook`（libc interposer）、`fd_manager`、`address`、`byte_array`、`framing`（`Framer`）、`endian`、`http`（`Parser`/`Client`/`Server`/`ResponseWriter`）、`sse`、`websocket`。
+  - **工程层**：`logging`（Filter → ItemWorker → Formatter → Sink 四段可替换，Item 工厂 + Sylar 风格 `PatternFormatter`）、`config`（`ConfigVar<T>` + 两阶段事务 + `.lock`/临时文件/原子 `rename` 热加载协议）。
+  - **内部设施**：`core/status`（`StatusCode` 枚举：kOk/kCancelled/kDeadlineExceeded/kClosed/kAlreadyClosed/kInvalidState/kShutdown）；`include/go2cpp/core/*.hpp` 与 `detail/context_backend.hpp` 顶层为**转发头**（4 行），真实定义在 `concurrency/core/`、`concurrency/detail/` 下。
+- **一处核实（避免误报）**：`docs/logging.md` 使用大写命名空间 `GO2CPP::Logger::ptr`，初看疑似过时命名；核实 `include/go2cpp/logging/log.hpp:495` 确有 `namespace GO2CPP = ::go2cpp;` 别名，且 `example/logging/log_config_demo.cpp:49` 同样使用，**文档无误**，故本次不登记任何条目。
+- **验证结果**：本轮为只读认知，**未运行构建与 `ctest`**，未跑 sanitizer 与 Valgrind。
+- **未通过/未覆盖（如实留白）**：未逐行通读四个大文件——`src/concurrency/scheduler.cpp`(4048)、`src/network/io.cpp`(2646)、`src/network/hook.cpp`(2161)、`src/concurrency/context.cpp`(1895)；上述模块结论来自**头文件契约 + 设计文档**，属「接口层已读 + 文档记载」，**不是逐行审计结论**。另外未校验 `third_party/` 内容与 SHA-256，未评估 RFC 6455 / SSE 逐条合规性，`docs/getting_started.md` 与 `docs/*_audit.md` 仅部分阅读。
+- **对后续的价值**：本次通读确认了 `docs/extensibility.md` 的模块↔可替换边界映射与 `cmake/Go2CppModules.cmake` 的 target 依赖图一致，也确认了台账 T-03（`HybridGate` 无测试）、T-04（`FdManager` 无测试）、T-07（`parking_condition`/`thread_policy`/`fiber_local` 仅间接覆盖）、E-02（`future`/`io_backend`/`fd_manager`/`address`/`byte_array` 无示例）这几条缺口判断成立。
+
 ## 2026-10-10：B-03 首轮（Context 测试中止保护、tools 前置断言、双拼写约定）
 
 - **本轮范围**：台账 B-03 第 1 批 3 条：**T-01**、**T-02**、**D-09**。B-03 共 5 条，T-05、T-06 留待下一轮（单轮预算内不硬塞，避免半成品）。
