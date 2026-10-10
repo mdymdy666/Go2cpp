@@ -5,6 +5,20 @@
 > 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
 > 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
 
+## 2026-10-10：B-02 次轮（模块索引、测试文档路径、性能文档阅读须知）
+
+- **本轮范围**：台账 B-02 第 2 批 5 条：**X-04**、**D-05**、**D-11**、**D-06**、**D-12**（按同文件聚合：`modules.md` 两条、`testing.md` 两条、`performance.md` 一条）。
+- **改动文件**（3 个，全部为文档）：
+  - `docs/modules.md`：13 行 → 59 行。补全 13 个模块 target 与 `go2cpp::runtime` 的对应关系、`include/go2cpp/core` 与 `detail` 子目录定位、完整的 `target_link_libraries` 依赖表；修正 `go2cpp_network` 漏记的 `go2cpp_sync`（`cmake/Go2CppModules.cmake:155`）。
+  - `docs/testing.md`：`:384` 的 `tests/test_sync.cpp` → `tests/concurrency/test_sync.cpp`；为 `:415` 段补工作树与路径迁移说明；`:595` 的「现有 Boost.Context fcontext 后端」改为「现有 Fiber 上下文后端（Linux x86_64 为自有 ABI，其他平台为 Boost.Context）」；文首新增**路径约定**，统一说明历史条目中的扁平路径（覆盖本轮新发现的 `:490` `example/io_wait_many_demo.cpp`）。
+  - `docs/performance.md`：文首新增**阅读须知**；就地修正 `:27`、`:63-65`、`:144` 三处残留的 Boost.Context 表述。
+- **X-04 的处置判断**：该条目描述为「内部性能结论数量级矛盾」，核实后确认**不是错误数据，而是累积记录的性质**。同一负载参数（2,000 Fiber / 32 普通线程 / 206,400 次临界区）在不同轮次分别记录过 `99～107 ms`、`8.5～8.8 s`、`6.7～6.9 s`、`9/19/31/51 ms`，差异来自轮次间的调度配置、编译选项与 WSL 宿主抖动。因此按「不改写历史、补时效与阅读指引」处置，与 D-08 的处理原则一致；文首明确「不存在单一当前值」，并指定以日期最新一节为当前结论。
+- **一处过程失误（如实记录）**：上一轮 I-01 的验证使用了 `grep -v '性能\|performance\|...'` 按行过滤，而 `grep -rn` 的输出行以文件名为前缀，`docs/performance.md` 的**每一行**都含 `performance`，导致整个文件的命中被过滤掉，漏检 `:27`、`:63-65`、`:144`。本轮已补齐。教训：按行排除必须匹配内容而非路径，或改用 `--include`/结构化扫描。
+- **验证结果**：24 个 markdown 全量相对链接扫描，**本轮改动文件零真实失效**（唯一命中 `docs/quality_backlog.md:15` 是本项目自己写入的 `[](...)` 文本被正则误判，已核实）；`cmake --build build-quality --parallel` 0 warning / 0 error；`ctest` **18/18 通过**；`log/` 已恢复到轮初 md5。
+- **未通过/未覆盖**：B-02 剩余 2 条（D-07、D-08）与 E-04 未处理；未跑 sanitizer 与 Valgrind；`docs/testing.md`、`codex.md` 记载的历史性能数字未复核。
+- **提交**：`23eccd0`（modules.md）、`6cb11fb`（testing.md）、`64a0cdc`（performance.md）。
+- **下一步**：B-02 收尾轮，处理 D-07（`docs/go_reference_audit.md` 重构前路径）、D-08（`codex.md` 历史路径加时效说明）、E-04（`sse`/`websocket`/`timer_task` 登记进速查表与批量列表）。
+
 ## 2026-10-10：B-02 首轮（README 路径与索引、Fiber 后端表述统一）
 
 - **本轮范围**：台账 B-02 的第 1 批，按「单轮 ≤5 条」取严重度最高的 5 条：**I-01**（含重复登记的 **X-02**、**X-03**）、**D-01**、**D-02**、**D-03**、**D-04**。B-02 共 12 条，本轮完成 5 条，剩余 7 条留待后续轮次。
