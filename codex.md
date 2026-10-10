@@ -11,6 +11,25 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-10：源码回溯审计（第 6 批：timer / sync）
+
+- **本轮读完整实现**：`src/concurrency/timer.cpp`(778)、`src/concurrency/sync.cpp`(1324)，合计 2,102 行。
+- **结论：本批未发现新的缺陷或文档缺失。** 两处此前存疑的点经核实**文档已充分覆盖**，故不登记条目——这本身是一个有效结论。
+- **timer.cpp 核对要点**：
+  - `:599-602` `TimerService::Default()` 是函数局部 static 单例，与文档「默认单线程串行执行到期回调」一致；
+  - `:120-123` 在定时器线程内析构 TimerService 直接 `std::terminate()`，与 `docs/timer_usage.md`「回调不得销毁正在执行回调的所属 TimerService」一致；
+  - `:464-475` 的 `kBusyWait` 忙等路径（yield 自旋）**有充分文档**：`docs/timer_usage.md:62` 明确「只在截止时间前的 spin_window 内自旋，适合极低延迟、且能接受占用一个 CPU 的场景」，`docs/timer_design_review.md:170` 另有「忙等待不能成为默认配置」的要求。**故不作为文档缺失登记**；
+  - `:179`、`:203`、`:293-294` 三处「先 `m_mutex` 再 `state->m_mutex`」的锁序完全一致，无锁反转风险；
+  - `:362-372` 周期为 0 的 kContinue 收敛为 `kFailed` + `invalid_argument`；`:133-135` 在锁外取消被遗弃条目，避免在锁内跑用户析构。
+- **sync.cpp 核对要点**：
+  - `:360,397-405` 线程本地 WaitNode 缓存上限 32；`:401` 在放回缓存前执行 `Reset(nullptr, {})` 清空 scheduler/task，不延长用户对象生命周期；
+  - `:753,785` 的协作重试预算（256 / 4 次）为硬编码常量，与 `docs/performance.md:331-333`「该预算不是公开语义，后续可通过策略对象调整」一致；
+  - `:741` 只在 `processor_count() > 1` 时走协作重试，避免忙等唯一 M，与 `docs/scheduler.md` 的 P 上限描述一致；
+  - `:1208-1217` WaitGroup 的负计数与溢出检查抛 `logic_error`；`:971-973` Mutex 未持锁 Unlock 同样抛异常——两者都与头文件契约一致。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，因此未触发构建。
+- **未通过/未覆盖（关键比例）**：累计回溯 **13 个实现文件、约 4,064 行**，占 `src/`（21,855 行）的 **18.6%**。四个大文件仍未读——`scheduler.cpp`(4048)、`io.cpp`(2646)、`hook.cpp`(2161)、`context.cpp`(1895)，合计 **10,750 行、占 `src/` 的 49.2%**。也就是说：**接近一半、且是最复杂的那一半代码，我的结论仍然只来自头文件与文档**。这一点在没有读完之前不会改变。
+- **下一步**：进入四个大文件，优先 `context.cpp`(1895)——Context 是 channel / future / timer / sync 的共同依赖，读它收益最大。
+
 ## 2026-10-10：源码回溯审计（第 5 批：channel / socket）
 
 - **本轮读完整实现**：`src/concurrency/channel.cpp`(402)、`src/network/socket.cpp`(568)。
