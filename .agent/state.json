@@ -1,0 +1,11 @@
+{
+  "round": 0,
+  "current_batch": null,
+  "current_items": [],
+  "last_batch": null,
+  "last_result": "none",
+  "last_commit": null,
+  "consecutive_failures": {},
+  "blocked_items": [],
+  "updated_at": "2026-10-10T16:20:00+08:00"
+}
