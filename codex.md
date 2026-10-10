@@ -5,6 +5,88 @@
 > 新增 Fiber-only WaitAny/WaitMany；普通线程多 fd 等待应使用原生 poll/select。
 > 下方历史记录中的“未实现”结论以本说明和最新兼容性矩阵为准。
 
+## 2026-10-10：文档/测试/示例质量审计与建账
+
+- **本轮范围**：只读审计 + 建账，**未修改任何既有源码/文档/测试/示例**。新增 3 个文件：
+  `.agent/quality_task_rules.md`（执行规则）、`docs/quality_backlog.md`（问题台账）、本条记录。
+  真身路径 `/UserData/CodexWorkSpace/Go2Cpp`（ext4，dev 2096）。
+- **基线**：分支 `main`，HEAD `d0fdf70`；`git status --short` 为 4 项——用户 3 处在途改动
+  （`go2cpp.ini`、`include/go2cpp/logging/log.hpp`、`include/go2cpp/tools/error.hpp`）
+  加上一轮追加的 `codex.md`。`git diff` 指纹轮初为 `757a9920...`。项目无
+  `AGENTS.md`/`CLAUDE.md`/`.agent/`，协作记录沿用 `codex.md`。
+- **重要纠正（工具链导致的历史误判）**：内置 `read` 工具把项目路径解析到 E 盘旧副本，
+  导致上一轮得出"`go2cpp_network` target 不存在、网络源码并入 `go2cpp_io`"的**错误结论**。
+  本轮以 WSL 直读 + `git show HEAD:` 双重取证确认：`cmake/Go2CppModules.cmake` 真身为
+  **177 行**，`go2cpp_network` 在 `:43-50` 定义、`:71` 导出 `EXPORT_NAME network`、
+  `:91` 建别名、`:155` 依赖 `go2cpp_io go2cpp_context go2cpp_scheduler go2cpp_sync`，
+  且该文件工作区与 HEAD **无差异**。故 `docs/modules.md:11` 关于 `go2cpp_network` 的
+  说法本身是**正确**的（仅漏记 `go2cpp_sync` 依赖）。上一轮的相反结论已作废。
+- **同步纠正第二项**：上一轮称"WebSocket 无测试覆盖"亦为旧副本数据所致。真身
+  `tests/network/test_network.cpp` 中有 51 处 websocket 命中，含 RFC 6455 握手向量与
+  socketpair 端到端闭环（`:560-598`）。
+- **四方覆盖矩阵（文档/测试/示例）结论**：30 个模块中
+  - **四维齐备**：error、control_flow、context、channel、scheduler、fiber、sync、timer、
+    io、hook、socket、http、sse、websocket、logging、config、framing；
+  - **缺示例**：future、io_backend、fd_manager、parking_condition、hybrid_mutex、
+    address、byte_array（共 7 个）；
+  - **缺独立测试入口**（功能已被间接覆盖）：event、go、fiber_local、parking_condition、
+    thread_policy；
+  - **完全无测试引用**：`HybridGate`/`HybridMutex`（`concurrency/core/hybrid_mutex.hpp`）、
+    `FdManager`（`src/network/fd_manager.cpp`）。
+- **测试框架事实**：自研框架，`tests/test_main.cpp:7-22` 声明 16 个 `run_xxx_tests()`，
+  与 16 个实现一一对应，支持 `GO2CPP_TEST_FILTER`。宏用量实测：`GO2CPP_CHECK` 1301、
+  `GO2CPP_REQUIRE` 86、`GO2CPP_REQUIRE_EVENTUALLY` 74、`GO2CPP_JOIN_WITH_WATCHDOG` 60。
+  **`tests/concurrency/test_context.cpp` 有 144 个 CHECK 却 0 个 REQUIRE 系列**，
+  `tests/tools/test_control_flow.cpp`(39) 与 `test_error.cpp`(27) 同样无看门狗保护。
+- **关键不一致（台账 I-01）**：Fiber 上下文后端在文档间严重矛盾，且**同一文件内自相矛盾**——
+  `docs/design.md:121-130`（自有汇编、不再链接 Boost.Context）vs `:221`（称 Boost.Context）；
+  `docs/boundary_audit.md:25` vs `:30`；`docs/performance.md:190-193`（自研汇编已撤回）
+  vs `:204-208`（已上线）。源码事实：构建实际编译 `src/concurrency/context_x64.S` 并定义
+  `GO2CPP_USE_NATIVE_CONTEXT=1`（`cmake/Go2CppModules.cmake:33-36`）。
+- **关键不一致（文档 D-01~D-09）**：`README.md:54/97` 与 `:48-52` 的示例路径因目录重构失效
+  （缺 `concurrency/`、`logging/` 前缀）；`README.md:90-94` 模块清单漏 `go2cpp::future`、
+  `go2cpp::network`；`docs/context_rollback.md:19` 链接指向不存在的
+  `../example/context_rollback_demo.cpp`；`docs/testing.md:415`、`docs/go_reference_audit.md:106`
+  引用重构前测试路径；`codex.md` 历史条目有 15 处失效路径（属历史记录，建议加时效说明而非改写）。
+- **示例质量（E-01）**：`example/network/network_demo.cpp` 仅 20 行、只有成功路径，
+  缺等待/取消与错误路径，且未出现在 `example/README.md:36-48` 速查表——违反项目自定的
+  「每个示例至少含成功 + 等待/取消 + 错误/边界三条路径」标准（`example/README.md:30-34`）。
+- **台账统计**：共 **22** 条。按类别：文档 11（D-01~D-11）、测试 7（T-01~T-07）、
+  示例 3（E-01~E-03）、不一致 1（I-01）；另列疑似缺陷 5 条（X-01~X-05）与待用户决策 4 条
+  （U-01~U-04）。按严重度：高 4、中 8、低 10。
+- **批次划分与建议顺序**：B-01 示例三路径与登记 → B-02 文档路径/索引/后端表述同步 →
+  B-03 tools+context 断言健壮性与新 API 覆盖 → B-04 并发核心缺口（HybridGate 等）→
+  B-05 network 缺口（fd_manager/io_backend/address/byte_array）→ B-06 logging+config 与
+  跨模块总入口。每批均可独立构建与 `ctest` 验证，无跨批依赖。
+- **待用户决策要点**：U-01 在途新增的 `errors::` 命名空间是否保留（决定是否补测试/示例）；
+  U-02 `docs/performance.md` 中 `/mnt/e/CodexWorkspace/...` 的 coost 基准路径是否视为有效；
+  U-03 `codex.md` 历史失效路径是否改写；U-04 是否要求示例间歇失败修复后才能进 `ctest` 门禁。
+- **未覆盖范围**：本轮未构建、未跑 `ctest`、未跑任何 sanitizer；台账中的间歇失败引用上一轮
+  实测数据（本轮未复现）；未逐行通读 scheduler.cpp(4048)/io.cpp(2646)/hook.cpp(2161) 等大文件；
+  未探查 `/mnt/e/...` 引用路径；未校验 `third_party` SHA-256；未触碰 `build/`、`log/`、`third_party/`。
+- **工具陷阱（已固化进规则文件 §1.1）**：T1 内置 `read`/`grep` 解析到 E 盘旧副本
+  （`E:\UserData\CodexWorkSpace\Go2Cpp`），必须走 `wsl bash -lc` 或 UNC 路径；
+  T2 经 `pwsh` 下发 `wsl bash -lc` 时双引号内 `$` 被 PowerShell 插值吞掉（本轮再次触发，
+  导致一次统计全空），含 shell 变量或 `$?` 必须改走 Python subprocess 通道；
+  T3 工具会"成功返回错误内容"，关键结论需双通道交叉验证。
+
+## 2026-10-10：项目认知梳理（只读，无源码改动）
+
+- **本轮范围**：只做认知梳理与实测验证，未修改任何源码/配置/测试/文档；唯一写入是本条记录。工作路径为 WSL 真身 `/UserData/CodexWorkSpace/Go2Cpp`（ext4，`stat -c %d` = 2096）。
+- **重要环境结论（工具层，非项目缺陷）**：DSH 的 `read`/`grep` 工具会把 `/UserData/CodexWorkSpace/Go2Cpp/...` 解析到 E 盘另一份陈旧副本 `E:\UserData\CodexWorkSpace\Go2Cpp`（9p，dev 72）。该副本缺 7 个文档（`docs/modules.md`、`docs/boundary_audit.md`、`docs/network.md`、`docs/sse.md`、`docs/websocket.md`、`docs/timer_usage.md`、`docs/timer_benchmark.md`），且 `cmake/Go2CppModules.cmake` 仍引用重构前的扁平源码路径（`src/error.cpp`、`src/io.cpp` 等）。本轮 31 个抽样文件中 17 个 md5 与真身不同，`codex.md` 真身 1116 行 vs 该副本 861 行。**后续在本工作区读取项目文件必须走 `wsl bash -lc` 通道，否则读到的不是真身。**
+- **第二类工具陷阱**：经 `pwsh` 下发 `wsl bash -lc "..."` 时，双引号内的 `$` 会被 PowerShell 变量插值吞掉（`$f` 变空导致 `ambiguous redirect`，`$?` 无法取得退出码）。凡命令含 shell 变量或 `$?`，改走 Python→`subprocess(["wsl","bash","-lc",...])` 通道。
+- **git 状态可信性核验**：`git show HEAD:include/go2cpp/runtime.hpp` 为 36 行、与工作区一致；`git ls-files -v | grep -v '^H '` 为空（无 skip-worktree / assume-unchanged）。故 `read` 的内容差异确认为工具解析问题，与索引无关。
+- **公共 API 修正**：`include/go2cpp/runtime.hpp` 真身为 36 行、include 26 个模块头（含 `core/timer.hpp` 与 `network/*`）。`include/go2cpp/sync.hpp`（219 行）是根路径下**唯一非转发壳**的真实公共头，被 9 处引用；`include/go2cpp/concurrency/sync.hpp`（203 行）已与其发散且**全仓零引用**。
+- **构建系统事实**：CMake 无 `-Werror`，也无任何开关可将其打开；警告策略仅 `-Wall -Wextra -Wpedantic`（`cmake/Go2CppModules.cmake:119`、`cmake/Go2CppTests.cmake:29,39,48,79`）。`GO2CPP_NATIVE_CONTEXT` 在 Linux x86_64 置 ON，编译 `src/concurrency/context_x64.S` 并定义 `GO2CPP_USE_NATIVE_CONTEXT=1`（同文件 `:33-35`）；网络源文件并入 `go2cpp_io`，`docs/modules.md:11` 所称 `go2cpp_network` target 并不存在。
+- **Fiber 上下文后端判定（源码 + 实测）**：本轮构建实际产出 `context_x64.S.o`，且 `flags.make` 含 `-DGO2CPP_USE_NATIVE_CONTEXT=1`；`src/concurrency/fiber.cpp:6-9` 仅在未定义该宏时才引入 Boost.Context。即**当前默认后端是自研 x86_64 汇编，不链接 Boost.Context**。据此判定 `docs/design.md:221`、`docs/boundary_audit.md:30`、`docs/go_reference_audit.md:135`、`docs/performance.md:27/65/144/191` 为过期表述；其中 `docs/design.md:221` 与其自身 `:121-130` 直接冲突，`docs/boundary_audit.md:30` 与其自身 `:25` 冲突。
+- **构建实测**：`cmake -S . -B build-orientation -DCMAKE_BUILD_TYPE=Debug` → `cmake --build build-orientation --parallel` 成功，**31 个 target，零警告零报错**；构建目录被 `.gitignore:2` 覆盖，未入库。
+- **测试实测**：`ctest --test-dir build-orientation --output-on-failure` → **18 个用例，17 通过 / 1 失败**（25.21 s）。失败项 `go2cpp_dynamic_gmp_demo`，输出 `[gmp][场景3] cancel_requested=0 cancel_finished=1 body_ran=1 cancelled=0`。复现：直接运行 5 次 rc = 1,1,0,1,0；ctest 单跑 5 次 = 通过/通过/失败/失败/失败；全量 ctest 连续 2 轮均 18/18 通过 → **间歇性、与负载相关**。
+- **失败根因（已定位到行）**：`example/concurrency/dynamic_gmp_demo.cpp:99` 的 `cancel()` 在任务已进入 Running 时返回 false，而 `:104-105` 把 `cancel_requested==true` 与 `state()==kCancelled` 同时当作硬条件，`:114-115` 又把 `cancel_ok` 计入返回码。属**过度断言 + 竞态窗口预期**，非运行时缺陷。另与 `example/README.md:42` 声称的"最终收敛为 `Cancelled`"矛盾。
+- **技术栈确认**：cmake 3.28.3、gcc 13.3.0、12 核；源码 `.cpp/.S` 合计 21,938 行、头文件 9,771 行，最大文件 `src/concurrency/scheduler.cpp`(4048)。
+- **发现的其他不一致**：`benchmarks/io_coost_fair_benchmark.cpp` 未被任何 CMake target 引用（孤儿文件）；`src/concurrency/context.cpp:255` 与 `src/concurrency/timer.cpp:84` 各有一个同名 `TimerService`；`docs/performance.md` 内部混合锁/IO 倍率存在两个数量级的自相矛盾（`:140` 快 10~18 倍 vs `:42-46` 8.5~8.8 s；`:141` 慢 3.0~4.3 倍 vs `:184` 0.59x）。
+- **未覆盖范围**：未跑压测/随机测试/基准；未运行任何 sanitizer；未验证历史验证数字；未逐行通读 scheduler.cpp/io.cpp/hook.cpp/channel.hpp 等大文件；只测 Debug+共享+Hook-ON 一种构建矩阵；未校验 third_party 归档 SHA-256；未探查 `/mnt/e/...` 下文档引用的 coost 路径。以上均按"未确认"留白，不作结论。
+- **清理**：临时脚本置于工作区 `.dsh_tmp/`（非项目内），构建产物在 `build-orientation/`（已被忽略）；项目根 `log/` 两个文件的 md5 与 mtime 均未变化。`git diff` 指纹前后同为 `355c390592702d857518763895db93287a98d1dbd8546d53a04282285fdcd9b4`，用户 3 处在途改动零丢失。
+
 ## 2026-10-02：全模块职责与后端边界复核
 
 - 调度器增加 `SchedulerObserver` 事件协议。G/M/P 状态机仍由 Scheduler 独占，
