@@ -103,7 +103,17 @@ public:
         if (Fiber* const fiber = Fiber::Current()) {
             fiber_local::detail::Reset(fiber, m_key);
         } else {
-            fiber_local::detail::ThreadValues().erase(m_key);
+            // 与 Fiber 路径保持一致：先把值从表中摘出，再让它在表外析构。
+            // 直接 `erase(m_key)` 会在容器内部析构该值，一旦用户析构函数
+            // 重入本 API，就是「在 erase 进行期间修改同一容器」，属未定义行为。
+            auto& values = fiber_local::detail::ThreadValues();
+            std::shared_ptr<void> value;
+            const auto found = values.find(m_key);
+            if (found != values.end()) {
+                value = std::move(found->second);
+                values.erase(found);
+            }
+            (void)value;  // 在函数返回时（表外）析构
         }
     }
 

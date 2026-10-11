@@ -15,7 +15,14 @@
 
 namespace go2cpp::net {
 
-/** @brief 单个 fd 的元数据，字段访问由 FdManager 内部互斥保护。 */
+/**
+ * @brief 单个 fd 的元数据。
+ * @warning 这些 getter **没有任何同步保护**：`FdManager` 只在写入侧
+ *          （`get()` 设置 `initialized`、`erase()` 设置 `closed`）持有内部互斥，
+ *          读取侧是无锁直读。因此当同一 fd 的元数据被并发改写时，
+ *          「读字段」与「改字段」构成**数据竞争**（C++ 内存模型下为未定义行为）。
+ *          调用方应只在确认该 fd 没有并发写入时读取，或在更高层自行同步。
+ */
 class FdContext final {
 public:
     explicit FdContext(int fd) noexcept : m_fd(fd) {}
