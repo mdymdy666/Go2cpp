@@ -11,6 +11,33 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 25 批：address/byte_array/context_x64.S）—— **`src/` 全部读完**
+
+- **本轮读完整实现**：`src/network/address.cpp`(280)、`src/network/byte_array.cpp`(196)、`src/concurrency/context_x64.S`(83)，合计 559 行。**至此 `src/` 下 25 个 `.cpp` + 1 个 `.S` 共 22,012 行全部读完。**
+- **address.cpp 核对通过的要点**：
+  - `:61-70` 对 `AF_UNIX` **先按调用方给的 `length` 拷贝到完整的 `sockaddr_un`** 再构造，注释明确「调用方传入的缓冲区也可能恰好只有 length 字节，不能直接按整结构引用」——避免越界读；`:64` 同时拒绝过短与过长的 length；
+  - `:228-243` `UnixAddress` 区分抽象命名空间（首字节 NUL，`path.size() > capacity` 才报错）与文件系统路径（**拒绝内嵌 NUL**，`size() >= capacity` 即报错，因为还需结尾 NUL）；`:244-263` 反向构造时校验 family/length 长度，并在 `:253-262` 检查「NUL 之后不能夹带非填充字节」；
+  - `:151`/`:157`/`:162` 的 IPv4 掩码都写成 `prefix_len == 0 ? 0U : 0xffffffffU << (32 - prefix_len)` —— **`prefix_len == 0` 的特判是必需的**，否则 `<< 32` 是移位未定义行为；IPv6 三处（`:206-226`）改用逐 bit 循环，同样先检查 `prefix_len > 128`；
+  - `:22-41` `service_host`/`service_port` 完整处理 `[v6]:port`、`host:port` 与裸 host 三种形式，并用「只有一个冒号」判定避免误切 IPv6 字面量。
+- **byte_array.cpp 核对通过的要点**：
+  - `:119-128` `read_varuint32` 在第 5 字节用 `byte & 0x70U` 拒绝溢出（32 位最多 5 字节，第 5 字节仅低 4 位有效），循环耗尽后再抛 `too long`；`:129-138` `read_varuint64` 同理用 `byte & 0x7eU` （64 位最多 10 字节，第 10 字节仅第 0 位有效）——两处都**同时防溢出与防超长**；
+  - `:139-154` zigzag 编解码对 32/64 位分别用 `0xffffffffU`/`0xffffffffffffffffULL`，无符号回绕语义正确；
+  - `:168-172` `read_string_vint` 在分配前检查 `length > 64MB` 并抛 `length_error`——**长度前缀先校验再分配**，避免恶意长度触发巨额分配；`:40-48` `ensure_write`/`ensure_read` 分别在写前查加法溢出、读前查可读范围；
+  - `:49-61` `write`/`read` 对「非零长度 + 空指针」抛 `invalid_argument`。
+- **context_x64.S 核对通过的要点**：
+  - 栈布局自洽：`context_make` 预留 56 字节（6 个 callee-saved 寄存器）并把 entry/context_end/context_entry 分别放在 +32/+40/+48；`context_jump` 按 r12,r13,r14,r15,rbx,rbp,r8 顺序弹出 7 个值（56 字节）后 `jmp *%r8`，偏移完全对应；
+  - `:37` `movq %rax, %rdi` 传入的是 `context_jump` 中 `:60` 保存的**旧 rsp**，正是 `Transfer.context` 所需的「被挂起调用者的上下文」，使 `entry(Transfer)` 能正确回跳——该约定经逐条核对无误；
+  - `:41-46` `go2cpp_context_end` 在入口函数**意外返回**时调用 `_exit(0)` 而非沿任意栈地址返回，注释明确「Treat a violation as a process exit」；`:81-83` 声明 `.note.GNU-stack` 标记非可执行栈；`:1-12` 注明寄存器布局来源（coost/TBOX 与 Boost.Context，Apache-2.0）并只暴露 `go2cpp_` 前缀 ABI。
+- **结论：本批未发现新的缺陷或文档缺失。**
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建。
+- **累计进度**：**22,012 / 22,012 行 = 100%**。`src/` 下 26 个源文件（25 个 `.cpp` + 1 个 `.S`）**全部逐行读完**。
+- **台账状态**：本轮无新增条目；待办 **27 条**，其中 **22 条来自这 25 批源码回溯**（D-13~D-18、D-22~D-23、X-06~X-22），另 5 条为更早期的文档/测试类条目。**全部只登记未修。**
+- **下一步（源码已读完，转入处置阶段）**：
+  1. 27 条待办中，`D-13`~`D-18`、`D-22`、`D-23` 共 8 条是**纯文档问题**（文档与实现矛盾或缺失），无修复门槛限制，可优先批量修正；
+  2. `X-06`~`X-22` 共 17 条是实现层面的可疑点，其中多条已在登记时**核实为当前不可达**（X-20、X-21 等），建议逐条判定「记录即可」或「需修」；
+  3. `T-08`（`GO2CPP_TEST_FILTER` 未知名字静默返回 0）与 `X-01`（`dynamic_gmp_demo` 间歇失败）是两项独立的待办。
+  以上需要用户对处置策略给出方向；无人值守下按「默认只登记不修」保持不变。
+
 ## 2026-10-11：源码回溯审计（第 24 批：websocket.cpp + sse.cpp 全文）
 
 - **本轮读完整实现**：`src/network/websocket.cpp`(715) 与 `src/network/sse.cpp`(613)，合计 1,328 行。
