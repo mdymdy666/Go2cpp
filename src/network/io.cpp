@@ -1450,7 +1450,6 @@ private:
             if (!slot.registered || slot.registration_id != registration_id) {
                 return;
             }
-            slot.registered = true;
             const bool one_shot =
                 m_backend && m_backend->supports_one_shot();
             if (one_shot) {
@@ -2483,11 +2482,9 @@ WaitManyResult IOManager::wait_many(
             }
             continue;
         }
-        if (!have_terminal && current.status != WaitStatus::kError) {
-            terminal_status = current.status;
-            terminal_error = current.system_error;
-            have_terminal = true;
-        } else if (!have_terminal) {
+        // 只记录第一个终态；就绪（kReady）已在上面 continue 掉，
+        // 因此这里遇到的都是终态，不需要再区分 kError 的优先级。
+        if (!have_terminal) {
             terminal_status = current.status;
             terminal_error = current.system_error;
             have_terminal = true;

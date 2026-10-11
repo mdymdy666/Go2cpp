@@ -445,7 +445,6 @@ bool RuntimeConfig::FromIni(const IniFile& ini, RuntimeConfig* config, std::stri
 bool RuntimeConfig::Validate(std::string* error) const {
     const auto fail = [error](const std::string& message) { if (error) *error = message; return false; };
     const auto& value = scheduler;
-    if (value.min_workers != 0 && value.min_workers < 1) return fail("scheduler.min_workers 必须至少为 1");
     if (value.max_workers > kMaxWorkers) return fail("scheduler.max_workers 不能超过 32");
     if (value.max_workers != 0 && value.min_workers != 0 && value.max_workers < value.min_workers) return fail("scheduler.max_workers 不能小于 min_workers");
     if (value.processor_count > kMaxWorkers) return fail("scheduler.processor_count 不能超过 32");
