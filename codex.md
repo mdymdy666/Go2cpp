@@ -11,6 +11,24 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 22 批：log.cpp 全文 1026 行）
+
+- **本轮读完整实现**：`src/logging/log.cpp`(1026)。
+- **核对结果——无锁快照与回调隔离设计一致**：
+  - `:654-767` `LogItemWorker` 用 `std::atomic_load/store_explicit` 交换 `shared_ptr<const Snapshot>`（filter/formatter/sink 三元组），`Submit` **不在任何锁内调用用户 Formatter/Sink**，注释 `:670-671` 明确「这样自定义 Sink 再次记录日志时不会形成同一 Worker 的递归锁死」；`:687-743` 的三个 `Set*` 都在 `m_mutex` 内做 copy-on-write 后原子发布；
+  - `:166-175` `FindFormatItem` **先在锁内取出工厂、再到锁外调用**，注释 `:173` 解释「工厂属于用户代码，不能在注册表锁内执行，避免回调再次注册格式项时死锁」——与 `Config::LoadFromIni` 的「通知阶段不释放事务锁」是同一类隔离原则；
+  - `:878-897` `Logger::SetParent` 用**函数局部 static** 的 `parent_graph_mutex` 串行化父链修改，并沿父链同时检测「自环」（`current.get() == this`）与「已存在的环」（`visited`），注释说明「禁止自环和间接环，避免 `Log()` 递归永不返回」；`:909-917` `Log` 的递归传播依赖这一不变式；
+  - `:878-897` 与 `:909-917` 的锁序核对无反转：父链修改走 `parent_graph_mutex → logger.m_mutex`，日志传播走 `logger.m_mutex → parent->m_mutex`，两条路径都只向**父方向**深入；
+  - `:519-529` `RotatingFileSink` 构造时用 `file_size` 初始化 `m_bytes`，注释明确「进程重启后继续追加同一个文件时，旋转阈值必须包含已有字节数；否则第一次写入会暂时突破 max_bytes」；`:541-558` 的轮转按 `max_files` 从高到低 rename，最后重建文件；
+  - `:1021-1024` `LogLine::~LogLine` 在 `noexcept` 析构中把「取消息 + 提交」整体包在 try/catch 中，不让用户 Sink 异常导致 terminate；`:1014-1015` 先判 `ShouldLog` 再填充记录，未启用时零开销。
+- **本轮读源码发现的新问题**：
+  - **X-21（低）**：同一文件内 4 处 `dynamic_cast<std::ofstream*>` 的 nullptr 检查不一致 —— `FileSink::Write`（`:464-465`）与 `FileSink::Flush`（`:483`）有检查，而 `RotatingFileSink::Write` 的 `:542`、`:560-561` **直接解引用**。另 `FileSink::Write` 每次调用都做一次 RTTI 转换（含高频 Info/Debug 路径）。**可达性已核实**：`m_stream` 仅由两处赋为 `std::ofstream`，故空指针当前不可达。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建。
+- **累计进度**：前二十一批 18,479 行 + 本批 1,026 行 ≈ **19,505 行，占 `src/`（22,012）约 88.6%**。已**全文读完 21 个文件**。
+  - **仍未读**：`websocket.cpp`(715)、`http.cpp`(620)、`sse.cpp`(613)、`address.cpp`(280)、`byte_array.cpp`(196)、`context_x64.S`(83)，合计约 **2,507 行**。
+- **台账状态**：新增 **X-21**；待办共 **24 条**，其中 **21 条来自源码回溯**（D-13~D-18、X-06~X-21），**全部只登记未修**。
+- **下一步**：三个网络协议文件（`websocket.cpp` / `http.cpp` / `sse.cpp`，合计 1,948 行），之后是两个小工具文件与汇编。
+
 ## 2026-10-11：源码回溯审计（第 21 批：config.cpp 全文 1089 行）
 
 - **本轮读完整实现**：`src/config/config.cpp`(1089)，并交叉核对了 `include/go2cpp/config/config.hpp` 的 `Config` 类声明（`:400-470`）与 `include/go2cpp/config.hpp`（确认它只是转发头，实现在 `go2cpp/config/config.hpp`）。
