@@ -41,7 +41,7 @@ cmake --build build --target go2cpp_runtime_demo
 | `runtime_demo` | Context.Value、Channel、错误包装 | 两个 Fiber 发送/接收并等待完成 | Select 超时、关闭后发送 |
 | `fiber_sync_demo` | Mutex/ConditionVariable/WaitGroup | P=1 下 Fiber park 后由生产者通知 | ConditionVariable 超时、手动 Fiber 恢复 |
 | `managed_pipeline_demo` | 无缓冲生产者/消费者 | Context 绑定的 Channel 等待 | 超时取消、关闭后发送 |
-| `dynamic_gmp_demo` | P/M 扩展和任务亲和 | 空闲 Worker 回收到最小值 | 取消请求与启动竞争，最终收敛为 `Cancelled` |
+| `dynamic_gmp_demo` | P/M 扩展和任务亲和 | 空闲 Worker 回收到最小值 | 取消请求与启动竞争：请求被接受则收敛为 `Cancelled`，任务先完成则 `cancel()` 返回 false 且任务已处于终态 |
 | `mixed_runtime_demo` | 普通线程与 Fiber 交接混合锁 | 条件变量通知、BlockingRegion | Lock/Wait 失败立即终止，避免未持锁解锁 |
 | `control_flow_demo` | defer LIFO 与参数求值 | defer 内 recover | move-only 内建 Select 返回 `kInvalid` |
 | `timer_task_demo` | 一次性任务；固定速率周期执行三次后自动结束 | 动态重排间隔、到期回调投递为 Fiber | 取消竞态、weak_ptr 资源消失、回调异常不杀死定时器线程 |

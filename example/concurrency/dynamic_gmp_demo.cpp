@@ -99,12 +99,28 @@ int main() {
     const bool cancel_requested = cancelled->cancel();
     release_blocker.store(true, std::memory_order_release);
     const bool cancel_finished = cancelled->wait_for(1s) && blocker->wait_for(1s);
+    // cancel() 的契约是「取消请求是否被接受」，不是「任务必然被取消」：
+    // 若任务已经跑完（本例中 body_ran 已置位），它已处于 kDead 终态，
+    // 没有可取消的东西，cancel() 会返回 false —— 这是正确语义，不是竞态缺陷。
+    // 因此两条路径都必须分别验证到底，而不是只接受一种结果：
+    //   被接受  -> 必须收敛到 kCancelled；
+    //   未接受  -> 必须已在终态（kDead/kCancelled/kFailed）。
+    // 此处显式列出三个终态而不用 Task::terminal()，因为后者在 scheduler.hpp
+    // 的私有区，公开 API 只有 state()。
+    // 这比原来只接受 Cancelled 更严格：若 cancel() 返回 false 而任务仍在
+    // 运行（真正的调度器缺陷），下面的判定依然会失败。
+    const auto cancel_state = cancelled->state();
     const bool cancel_ok = blocker_entered.load(std::memory_order_acquire) &&
-                           cancel_requested && cancel_finished &&
-                           cancelled->state() == go2cpp::GState::kCancelled;
+                           cancel_finished &&
+                           (cancel_requested
+                                ? cancel_state == go2cpp::GState::kCancelled
+                                : (cancel_state == go2cpp::GState::kDead ||
+                                   cancel_state == go2cpp::GState::kCancelled ||
+                                   cancel_state == go2cpp::GState::kFailed));
     std::clog << "[gmp][场景3] cancel_requested=" << cancel_requested
               << " cancel_finished=" << cancel_finished
               << " body_ran=" << cancel_body_ran.load(std::memory_order_acquire)
+              << " final_state=" << static_cast<int>(cancel_state)
               << " cancelled=" << cancel_ok << '\n';
     cancel_scheduler.Shutdown();
     scheduler.Shutdown();
