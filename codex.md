@@ -11,6 +11,26 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 9 批：scheduler.cpp Impl 与 shutdown_for）
+
+- **本轮范围说明**：继续 `scheduler.cpp`，本轮读 `:997-1840`（`Scheduler::Impl` 全部成员与 sysmon/begin_shutdown/collect_terminal）与 `:1942-2161`（`shutdown_for` 全文），约 **1,062 行**。仍未读：`Task::run`(`:830-996`)、`enqueue`(`:2287-2527`)、`worker_loop`(`:3494-4048`)。
+- **结论：本批未发现新的缺陷或文档缺失。** 以下四点经逐条核对与文档/既有记录一致：
+  - `:1002-1005` 两条 16 路条带（`kRegistryStripeCount` / `kIncomingStripeCount`）分别用于注册表与外部生产者入队，`:1076-1078` 每条带 `reserve(256)`，与 `docs/scheduler.md`「入队、出队、runnable 计数在 admission mutex 下串行」的分层描述一致——它是**分条带**串行，而非单锁；
+  - `:1961-1970` 明确区分「worker 发起 shutdown」（不取 `join_mutex`、不做任何 join，只发布停止请求后返回 false）与「外部 owner 发起」（取 `join_mutex` 并负责全部 join）；`:2029-2037` 的 worker 分支与 `:2101-2119` 的逐个提取-锁外-join 构成完整闭环，注释解释了为何不能用可复用的 `thread::id` 判重；
+  - `:1995-1996` sysmon 在 draining 阶段**继续运行**，直到所有已启动 G 自然收尾，避免长系统调用返回前提前丢失替代 M——与 `docs/scheduler.md` 的 sysmon 章节一致；
+  - `:1691-1731` 对 waiting G 的扫描复用了与 IO readiness 相同的 pending-wake 交接（`wake_for_scheduler` + `try_mark_queued`，失败时转 emergency 队列），印证了 `park_wait` 双重检查的必要性；`:1527-1564` 的 `collect_terminal_locked` 用**稳定压缩**把回收从 O(n²) 降为 O(n)，且 `reserve` 失败时 `continue` 保留终态条目等待下次回收（异常安全）。
+- **一处观察（未登记为缺陷）**：`shutdown_for` 中有 **5 处**结构相同的片段
+  ```cpp
+  for (auto& task : deferred_destruction) {
+      if (task) { auto abandoned_function = task->release_callable(); }
+  }
+  ```
+  （`:2018-2022`、`:2030-2034`、`:2057-2061`、`:2084-2088`、`:2143-2147`）。语义是「在锁外销毁用户 callable」，模式正确但重复了 5 次；抽取为局部 lambda 会更容易保证五条退出路径行为一致。属可维护性观察，非缺陷，故不单列台账条目。
+- **验证结果**：本批为只读回溯，未改动任何源码或测试，未触发构建。
+- **累计进度（按已读行数）**：前七批完整读 5,959 行 + 第 8 批约 1,060 行 + 本批约 1,062 行 ≈ **8,081 行，占 `src/`（21,855）约 37%**。仍未读：`scheduler.cpp` 剩余约 1,900 行、`io.cpp`(2646)、`hook.cpp`(2161)，合计约 6,700 行。
+- **台账状态**：本轮无新增条目；待办仍为 D-13~D-17、T-08、X-06~X-10（含 X-01）。其中 **9 条来自源码回溯**，全部只登记未修。
+- **下一步**：补完 `scheduler.cpp` 的 `Task::run`、`enqueue`、`worker_loop`，再进 `io.cpp`。
+
 ## 2026-10-10：源码回溯审计（第 8 批：scheduler.cpp 关键区间）
 
 - **本批范围说明（重要）**：`scheduler.cpp` 共 4048 行，本批**只读了关键区间约 1,060 行**（`:560-840` 的 Task 唤醒/挂起状态机、`:2654-3140` 的 park/wake 实现），**不是全文**。这与前七批「读完整实现」的口径不同，结论覆盖面相应收窄。
