@@ -11,6 +11,31 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：修复 X-01 —— dynamic_gmp_demo 的取消契约假设
+
+- **本轮性质**：按项目对 X-01 的既定要求执行 —— **先重复运行 ≥10 次复现取证，再用证据区分「示例断言过严」与「调度器真实竞态」，不得直接放宽断言**。
+- **复现取证（20 次）**：失败 **9/20**（45%），失败模式 **100% 一致**：
+  ```
+  [gmp][场景3] cancel_requested=0 cancel_finished=1 body_ran=1 cancelled=0
+  ```
+  同时观察到成功样本 `cancel_requested=1 body_ran=1 cancelled=1` —— **任务体同样执行了，但 `cancel()` 返回 true 且最终 Cancelled**。这一对照直接否定了「Running 导致 cancel 失败」的解释。
+- **源码裁定（推翻第 0 轮根因判定）**：
+  - `Scheduler::cancel`（`src/concurrency/scheduler.cpp:3137-3160`）三个出口：所有权不符 → false；`request_cancel` 返回 false → false；否则 true；
+  - `Task::request_cancel`（`:759-789`）在 `kDead`/`kCancelled`/`kFailed` 时返回 false，**任务 Running 时返回 true**（不立即置终态，注释说明「A started Fiber must resume to its trampoline so stack locals and stack cleanup finishes normally」）；
+  - `GState::kDead`（`include/go2cpp/concurrency/scheduler/scheduler.hpp:52`）是**正常完成**的终态；
+  - 故失败样本 `body_ran=1` + `cancel_requested=0` 的含义是**任务已正常跑完**，`cancel()` 返回 false 是**正确语义**。**第 0 轮记的「Running 时返回 false」是错的** —— 在 P=1 且 blocker 处于 yield 循环时，新 spawn 的短任务完全可能在主线程调用 `cancel()` 之前就跑完。
+- **修复方式（未放宽断言，反而更严格）**：原断言只接受「请求被接受并取消成功」一条路径；改为分别验证两条路径的下界：被接受 → **必须** `kCancelled`；未被接受 → **必须**处于 `kDead`/`kCancelled`/`kFailed` 之一。若 `cancel()` 返回 false 而任务**仍在运行**（真正的调度器缺陷），判定依然失败。日志增加 `final_state` 便于后续定位。
+- **一个 API 可见性修正**：初版我用 `cancelled->terminal()` 表达「已终态」，编译报错 —— `Task::terminal()` 位于 `scheduler.hpp:358` 的**私有区**（我此前 grep 到行号却没确认其所属访问区）。公开 API 只有 `state()`，故改为显式列出三个终态。**教训：引用符号前要确认其访问级别，而不是只看它存在**。
+- **同步修正文档**：`example/README.md:44` 原称「最终收敛为 `Cancelled`」，与源码语义矛盾（任务可能先正常完成），已改为准确表述。
+- **验证结果**：
+  - `cmake --build build-quality --parallel` → **0 warning / 0 error**（本轮第一次构建实际是失败的，脚本已据 `errors=0` 断言拦截，并额外打印二进制与源码时间戳，避免再拿旧二进制下结论）；
+  - 修复后**连续运行 30 次，失败 0 次**（修复前 9/20）；
+  - `ctest --test-dir build-quality` → **26/26 通过**；
+  - 本轮只改示例与 `example/README.md`，未触碰 `src/` 与 `include/`。
+- **台账更新**：`X-01` 改为 `已修复`，备注中**显式记录对第 0 轮根因判定的推翻**。
+- **剩余待办 17 条**：`D-14`（1，阻塞于用户在途文件）、`X-06`~`X-22`（16，实现类）。
+- **下一步**：按缺陷修复门槛（台账 ID + 可复现证据 + 失败现场）逐条判定 `X-` 条目：能构造可复现现场的才修，其余保持登记。
+
 ## 2026-10-11：修复 T-08 —— 未知 GO2CPP_TEST_FILTER 不再静默通过
 
 - **本轮性质**：上轮修复 7 条文档问题后用户未指定下一项，按无人值守规则采用我给出的**默认建议**（`T-08`），**用户可推翻**。
