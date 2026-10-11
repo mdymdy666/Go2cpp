@@ -11,6 +11,24 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 16 批：io.cpp :1400-1760）
+
+- **本轮读实现**：`src/network/io.cpp` 的 `:1400-1760`，约 **360 行**，覆盖 `fail_slot_locked`、`take_ready_locked`、`process_event_locked`、`process_event`/`process_events_batch`、`expire_timers`、`poll_timeout_ms`、`drain_wake_fd`、`poll_loop`、`tickle`、`wake_nodes` 开头。
+- **核对结果——epoll 就绪与超时路径设计严谨**：
+  - `:1419-1439` `take_ready_locked` 与 `:1420-1437` 的队头不跨越规则：「队头正在由取消、超时或零超时补采样路径处理；不能越过它，否则会破坏同一 fd/方向上的 FIFO」——与 `drain_queue_locked`、`complete_if_head` 的「先 `begin_operation` 再 pop」三处互相印证，构成完整的 FIFO + 操作令牌协议；
+  - `:1465-1476` 对 `interest == 0` 且收到 ERR/HUP 的情形**直接失效该代际注册**，注释说明「Linux 仍会为已关闭 fd 报告 EPOLLERR/EPOLLHUP。此时不能把错误写入 pending 位，否则 poller 会反复收到同一个 HUP 并忙循环」；
+  - `:1478-1480` `error_or_hup` 时把读与写**同时**置为 ready，保证错误会唤醒两个方向的全部等待者；`:1481-1498` 若成功交接给具体 waiter 则清 pending（「避免下一次注册得到伪 ready」），否则才置 pending 位；
+  - `:1604-1633` `poll_timeout_ms` **先限制范围再转换**（`:1617-1623` 注释：「max() 截止时间可能比毫秒类型更宽，直接转换会回绕成负数，导致 epoll_wait 失败而不是进行轮询」），并在 `:1627-1629` 对截断结果**向上取整**，避免提前唤醒造成空转；
+  - `:1359-1373` 与 `:1500-1507` 的 `update_interest_locked` 调用后都检查 `fail_slot_locked` 并清理空 slot；`:1679-1701` 后端 `wait` 失败时统一置 `m_init_error`、停止接收并 drain 所有队列，不留下永久挂起的 waiter；
+  - `:1731-1745` `tickle` 与 `:1666-1668`、`:1677`、`:1708-1711` 的 `m_poller_waiting`/`m_tickle_pending` 协议经**时序推演核对为严密**：`m_poller_waiting` 在持 `m_mutex` 时置位、在 `wait` 返回后立即清除；`poll_timeout_ms()` 作为 `wait()` 的实参在调用前求值且同样持 `m_mutex`，因此「新注册的 timer 早于上一次算出的超时」这一窗口不可能被漏掉，`tickle_pending` 的合并语义也只会丢失**无害**的重复唤醒。
+- **本轮读源码发现的新问题**：
+  - **X-16（低）**：`:1450-1452` 的条件已排除 `slot.registered == false`，紧接着 `:1453` 的 `slot.registered = true;` 是**死存储**（两行之间无其他语句）。疑似重构残留，或本意是写 `slot.armed`。不影响正确性，但会误导读者以为此处存在一次状态转换。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建。
+- **累计进度**：前十五批 13,983 行 + 本批约 360 行 ≈ **14,343 行，占 `src/`（22,012）约 65.2%**。
+  - **仍未读**：`io.cpp` 余约 886 行（`:1760-2646`，含 `wake_nodes` 主体、`WaitAny/WaitMany`、公开 `IOManager` 方法）、`hook.cpp`(2161)、`config.cpp`(1089)、`log.cpp`(1026)、`websocket.cpp`(715)、`http.cpp`(620)、`sse.cpp`(613)、`address.cpp`(280)、`byte_array.cpp`(196)、`context_x64.S`(83)。
+- **台账状态**：新增 **X-16**；待办共 **19 条**，其中 **16 条来自源码回溯**。
+- **下一步**：`io.cpp` 的 `:1760-2646`（读完该文件）。
+
 ## 2026-10-11：源码回溯审计（第 15 批：io.cpp :700-1400）
 
 - **本轮读实现**：`src/network/io.cpp` 的 `:700-1400`，约 **700 行**，覆盖 `State::shutdown`、`register_wait`（核心注册路径）、`complete`、`recycle_node`、`complete_if_head`、`cancel`/`cancel_all`/`notify_close`、私有工具（`claim`/`purge_terminal_locked`/`erase_timer_locked`/`invalidate_registration_locked`/`update_interest_locked`/`drain_queue_locked`）。
