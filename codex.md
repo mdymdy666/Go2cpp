@@ -11,6 +11,26 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 21 批：config.cpp 全文 1089 行）
+
+- **本轮读完整实现**：`src/config/config.cpp`(1089)，并交叉核对了 `include/go2cpp/config/config.hpp` 的 `Config` 类声明（`:400-470`）与 `include/go2cpp/config.hpp`（确认它只是转发头，实现在 `go2cpp/config/config.hpp`）。
+- **核对结果——配置事务与热更新设计严谨**：
+  - `:245-310` `ReadStableFileContents` 用**双重快照**（`before/after` + `verify_before/verify_after` + `first == second`，外加三次 edit-lock 检查）确认文件稳定，最多 8 次 × 2ms 重试后失败并给出「正在编辑」或「请用临时文件 + rename 原子替换」两种可操作提示；与 `docs/configuration.md` 的编辑锁协议一致；
+  - `:338-370` `IniFile::Parse` **先构造临时快照、全部成功后 `swap`**，注释明确「语法错误不能让调用方看到『前半段已更新、后半段丢失』的半解析状态」；`:44-45` `ParseSize` 要求 `from_chars` **消费全部字符**（`result.ptr == end`），故 `123abc` 会被拒绝；
+  - `:543-623` `Config::LoadFromIni` 的三阶段事务：预检（`ValidateString` + 跨字段 `m_transaction_validators` 基于**完整候选快照**）→ 写入（失败则逆序 `RollbackPending`）→ **解锁后**才 `NotifyPending` 与调用 `CommitListener`；`:589-590` 注释解释「通知阶段不持有事务锁，监听器可以查询注册表或触发下一次配置加载，避免插件回调与事务锁形成死锁」，`:608-613` 再逐个隔离监听器异常。`:617-622` 的 catch 分支同样逆序回滚后重抛；
+  - `:706-778` `StartWatcher` 引入 `retry_pending` 标志（`:729-731` 注释：「锁从非空变为空时必须强制尝试一次，即使文件系统的时间戳和大小没有变化；这样同尺寸原子替换也不会被旧基准短路」），并在监听循环内 `catch (const std::exception&)` 与 `catch (...)` 双保险，保证用户插件异常不会终止监听线程；
+  - `:1060-1063` 用 `weak_ptr` 保存 `ConfigVar` 以**打破 `ConfigVar -> Listener -> ConfigVar` 的引用环**，并在 `:1076-1083` 让两个阈值共享同一个 `apply_timer_limits`，`:1040-1059` 再注册事务级校验器使用户能在同一份文件里同时迁移两个阈值；
+  - `:71-80` 用集中常量（`kMaxWorkers=32`、`kMaxLocalQueue=1<<20`、`kMinFiberStack=16KB`、`kMaxFiberStack=64MB`、`kMaxAffinityBudget=1<<20`、`kMaxDuration=24h`）统一定义上限，注释写明「配置文件是外部输入…避免某一个模块单独放宽参数后造成过量线程、内存或超长等待」；
+  - `:873-893` 对在线修改 `min_workers`/`max_workers` 做**单步跨字段校验**（按另一侧的当前值），并给出可操作指引「需要同时调整两者时，先把 `max_workers` 设为 0（自动），再设置目标值」。
+- **本轮读源码发现的新问题**：
+  - **X-19（低）**：`:448` 的 `min_workers != 0 && min_workers < 1` 是**恒不成立的死条件**（`size_t` 上二者不可同时成立），因此「min_workers 必须至少为 1」这条报错**永不触发**。行为上无害（0 本就是合法的自动值），但属误导性死代码。
+  - **X-20（低）**：`stop_watcher_locked` 在监听线程自身调用时 `detach()`（`:792`）。这是本项目**第四种**「在自身线程内停止服务」策略 —— 另有 `timer.cpp:120-123` 的 `std::terminate()`、`io.cpp:729-731` 与 `context.cpp:314-317` 的跳过 join。**可达性已核实**：`Config()` 为 private、唯一入口是进程级 static 的 `Instance()`，故 detach 后的 UAF 窗口**当前不可达**；仅在将来允许用户构造 `Config` 时才会变成真实缺陷。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建。
+- **累计进度**：前二十批 17,390 行 + 本批 1,089 行 ≈ **18,479 行，占 `src/`（22,012）约 83.9%**。已**全文读完 20 个文件**。
+  - **仍未读**：`log.cpp`(1026)、`websocket.cpp`(715)、`http.cpp`(620)、`sse.cpp`(613)、`address.cpp`(280)、`byte_array.cpp`(196)、`context_x64.S`(83)，合计约 **3,533 行**。
+- **台账状态**：新增 **X-19、X-20**；待办共 **23 条**，其中 **20 条来自源码回溯**（D-13~D-18、X-06~X-20），**全部只登记未修**。
+- **下一步**：`log.cpp`(1026)，之后是三个网络协议文件与两个小工具文件。
+
 ## 2026-10-11：源码回溯审计（第 20 批：hook.cpp :1100-2161，全文读毕）
 
 - **本轮读实现**：`src/network/hook.cpp` 的 `:1100-2161`，约 **1,061 行**，覆盖 `fcntl_argument` 余下、`ioctl_has_{pointer,no}_argument`、`go2cpp::hook::*` 全部公开入口与 `ScopedEnable`/`ScopedIOManagerBinding`、以及**全部 33 个 `extern "C"` interposer**（sleep/usleep/nanosleep、poll/ppoll/select/pselect/epoll_wait/epoll_pwait、socket/socketpair/connect/accept/accept4、read/readv/recv/recvfrom/recvmsg、write/writev/send/sendto/sendmsg、close/dup/dup2/dup3、fcntl/ioctl、getsockopt/setsockopt）。**至此 `hook.cpp` 2,161 行全文读完。**
