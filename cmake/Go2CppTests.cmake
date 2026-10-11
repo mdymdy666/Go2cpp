@@ -36,6 +36,22 @@ if (GO2CPP_BUILD_TESTS)
     target_compile_options(go2cpp_tests PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_tests COMMAND go2cpp_tests)
     set_tests_properties(go2cpp_tests PROPERTIES TIMEOUT 30)
+    # T-08 回归：未知的 GO2CPP_TEST_FILTER 必须被拒绝。此前它会静默跑 0 个模块
+    # 却返回 0，把「空跑」伪装成「通过」。
+    # 用 `sh -c` 把「退出码必须是 2」显式断言出来，而不是用 WILL_FAIL：
+    # 后者与 PASS_REGULAR_EXPRESSION 会互相反转（正则匹配=通过，WILL_FAIL 再反转
+    # 一次=失败），实测该组合无法表达「退出码非零且输出含指定信息」。
+    add_test(NAME go2cpp_unknown_filter_rejected
+             COMMAND sh -c "GO2CPP_TEST_FILTER=__no_such_module__ $<TARGET_FILE:go2cpp_tests>; test $? -eq 2")
+    set_tests_properties(go2cpp_unknown_filter_rejected PROPERTIES
+        PASS_REGULAR_EXPRESSION "未匹配任何测试模块"
+        TIMEOUT 30)
+    # 配对验证：已知的 filter 仍然只跑该模块并正常通过。
+    add_test(NAME go2cpp_known_filter_runs COMMAND go2cpp_tests)
+    set_tests_properties(go2cpp_known_filter_runs PROPERTIES
+        ENVIRONMENT "GO2CPP_TEST_FILTER=error"
+        PASS_REGULAR_EXPRESSION "error values and chains"
+        TIMEOUT 30)
 
     add_executable(go2cpp_scheduler_smoke
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/scheduler_smoke.cpp)

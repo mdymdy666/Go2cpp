@@ -35,8 +35,16 @@ void run_hook_tests();
 int main() {
     const char* const filter_value = std::getenv("GO2CPP_TEST_FILTER");
     const std::string_view filter = filter_value ? filter_value : "";
-    const auto selected = [filter](std::string_view name) {
-        return filter.empty() || filter == name;
+    // 记录过滤器是否真的命中过某个模块。未知名字会让下面每个 selected() 都返回
+    // false，于是不执行任何模块却仍然打印 "all checks passed" 并返回 0，把「空跑」
+    // 伪装成「通过」（台账 T-08）。这里显式检测并返回非零。
+    bool any_selected = false;
+    const auto selected = [filter, &any_selected](std::string_view name) {
+        const bool match = filter.empty() || filter == name;
+        if (match && !filter.empty()) {
+            any_selected = true;
+        }
+        return match;
     };
     if (selected("error")) run_error_tests();
     if (selected("control_flow") || selected("defer")) run_control_flow_tests();
@@ -67,6 +75,13 @@ int main() {
     if (failures != 0) {
         std::cerr << "[test] failures=" << failures << '\n';
         return 1;
+    }
+    if (!filter.empty() && !any_selected) {
+        // 返回 2 以便与「有用例失败」的 1 区分；调用方与 CI 都能据此发现
+        // 过滤器拼错，而不是把 0 个用例当成全部通过。
+        std::cerr << "[test] GO2CPP_TEST_FILTER=\"" << filter
+                  << "\" 未匹配任何测试模块；本次没有执行任何用例\n";
+        return 2;
     }
     std::cout << "[test] all checks passed\n";
     return 0;
