@@ -11,6 +11,26 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：修复 T-08 —— 未知 GO2CPP_TEST_FILTER 不再静默通过
+
+- **本轮性质**：上轮修复 7 条文档问题后用户未指定下一项，按无人值守规则采用我给出的**默认建议**（`T-08`），**用户可推翻**。
+- **缺陷复述**：`tests/test_main.cpp` 用 `filter.empty() || filter == name` 决定是否运行模块。当 `GO2CPP_TEST_FILTER` 指定不存在的名字时，所有 `selected()` 都返回 false，**一个用例都不跑**，`g_failures` 仍为 0，程序打印 `[test] all checks passed` 并**返回 0** —— 空跑被伪装成通过。
+- **修复方式**：`selected()` 增加 `any_selected` 引用捕获，命中任一名字时置位；`main()` 末尾在 `g_failures` 检查之后，若 `filter` 非空且 `any_selected == false`，向 stderr 输出 `GO2CPP_TEST_FILTER="<值>" 未匹配任何测试模块；本次没有执行任何用例` 并 **`return 2`**（用 2 与「有用例失败」的 1 区分）。**未引入模块名白名单** —— 那会与 23 行 `selected(...)` 调用形成第二份清单、容易不同步；计数器方案天然跟随实际调用点。
+- **回归测试**（`cmake/Go2CppTests.cmake` 新增两条 CTest）：
+  - `go2cpp_unknown_filter_rejected`：`sh -c "GO2CPP_TEST_FILTER=__no_such_module__ <bin>; test $? -eq 2"` + `PASS_REGULAR_EXPRESSION "未匹配任何测试模块"`；
+  - `go2cpp_known_filter_runs`：`GO2CPP_TEST_FILTER=error` + `PASS_REGULAR_EXPRESSION "error values and chains"`（配对验证已知 filter 仍真正跑到对应模块，防止修复把正常路径堵死）。
+- **过程中踩到的两个坑（都已解决并留痕）**：
+  1. **`WILL_FAIL` 与 `PASS_REGULAR_EXPRESSION` 会互相反转**。第一版写成 `WILL_FAIL TRUE` + `PASS_REGULAR_EXPRESSION`，实测 CTest 报 `***Failed  Required regular expression found.` —— 正则匹配使测试判为通过，`WILL_FAIL` 再把通过反转成失败，于是永远不通过。该组合**无法表达**「退出码非零 **且** 输出含指定信息」；改用 `sh -c ... ; test $? -eq 2` 显式断言退出码后才正确。
+  2. **多层 shell 嵌套中的 `$?` 不可信**。验证时用 `cmd 2>&1; echo "rc=$?"` 得到 `rc=0`，据此误判「修复未生效」，差点去改一个本来正确的实现；改用 `subprocess` 直接读 `returncode` 后立刻确认为 2。这与本项目已登记的 T2（PowerShell 吞 `$`）是同类陷阱的延伸：**验证退出码必须直接读进程返回码**。
+- **验证结果**：
+  - 重新 configure + `cmake --build build-quality --parallel` → **0 warning / 0 error**；
+  - `subprocess` 直接读取：未知 filter → **returncode 2** 且打印未匹配信息；`error` → **0** 且输出 `[test] error values and chains`；
+  - `ctest --test-dir build-quality` → **26/26 通过**（原 24 + 新增 2）；
+  - 未涉及并发/超时路径，无需重复运行 ≥5 次。
+- **台账更新**：`T-08` 状态改为 `已修复`，附 commit `6fd451a`。
+- **剩余待办 18 条**：`D-14`（1，阻塞于用户在途文件 `include/go2cpp/tools/error.hpp`）、`X-06`~`X-22`（17，实现类）。`X-01` 仍未复现。
+- **下一步建议**：`X-01`（`dynamic_gmp_demo` 间歇失败）是剩余条目中唯一**还可能通过实验拿到证据**的 —— 按项目既定要求先重复运行 ≥10 次尝试复现，若复现再用日志区分「示例断言过严」与「调度器真实竞态」，**不得直接放宽断言**。
+
 ## 2026-10-11：源码回溯第 26 批 —— 修复 7 条文档缺失与矛盾
 
 - **本轮性质**：`src/` 已全部读完（第 25 批），本轮转入**修复**。只处理台账中**纯文档类**条目 —— 它们没有「可复现证据 + 失败现场」的修复门槛要求，每处都有明确的源码行号依据。
