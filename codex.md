@@ -11,6 +11,26 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 12 批：fiber.cpp 全文 1502 行）
+
+- **本轮读完整实现**：`src/concurrency/fiber.cpp`(1502)。这是依赖图里 `scheduler` 的唯一实质前提，也是「阅读顺序」中优先级最高的未读文件。
+- **核对结果——文档承诺与实现一致**：
+  - `:727-775` `entry()` 在用户主体返回后先 `m_function = {}`，再 `fiber_local::detail::Cleanup(m_owner)`（`:752-755`），即 **FiberLocal 值的主体栈展开后、交回控制权前销毁**，与 `docs/design.md`「FiberLocalCache 按逻辑 Fiber 保存共享值…trampoline 完成后释放」一致；`:745-751` 只捕获用户异常并置 `Failed`，挂起/取消/清理流程不抛异常；
+  - `:897-1016` `resume_locked` 用 `FiberTlsRestore` RAII（`:73-89`）+ 显式 `s_current_fiber` 恢复；`:978-987` 的注释解释了为何**不能**无条件恢复 `previous_fiber`——否则父 Fiber 之后创建的子 Fiber 会错绑到根上下文、破坏父链；
+  - `:992-1012` 调度器挂起沿**直接父链**传播（`m_scheduler_propagate`），普通 `Suspend` 不进入该分支，与 `docs/scheduler.md`「嵌套 Fiber 的父链由共享元数据记录保存」一致；`:1003-1009` 父级失效时走 `abandon_suspended` 而**不** terminate；
+  - `:630-651` `abandon_suspended` 显式标记 `Failed` 并清理 FiberLocal，注释写明「不能伪造 Completed」；`:653-725` 析构协议覆盖 Ready（可安全跳过主体）、Suspended（沿父链恢复）、Running（fail-fast）三种情形；
+  - `:1189-1196`/`:1170-1187` `FiberBin` 回收要求 `m_record.use_count() == 1`，避免嵌套子 Fiber 仍持有父记录时被复用；`:577-586` `reset_for_scheduler` 在状态或 claim 不符时抛 `logic_error` 而非复用活动栈；
+  - `:213-259` `normalize_stack_size` 与 `:189-210` 的对齐/映射尺寸检查覆盖了页面大小、最小值、最大值和加法回绕，与 `docs/correctness_audit.md` 记录的边界一致；`:387-405` 栈缓存按 TLS 8 个 + 全局 128 个分层，与 `docs/design.md` 的「TLS 小缓存溢出后进入有界全局缓存」一致。
+- **本轮读源码发现的新问题**：
+  - **X-13（中）**：`Impl::~Impl` 获取 `m_resume_claim` 时是**无界 yield 自旋**（`:663-669`），无超时、不阻塞睡眠。目标 Fiber 若正在别的 M 上长时间运行，析构线程会持续占一个 CPU 核心自旋。对照 `parking_condition.cpp` 用条件变量、`shutdown_for` 提供有界 `wait_until`，此处是唯一的例外。文档只说「可能阻塞析构」，未说明是忙等。
+- **关于本文件里已声明的边界**：`:654-658` 在 Fiber 自身栈上析构 `Impl` 直接 `std::terminate()`、`:694-698` 取得 claim 后仍观察到 Running 也 terminate —— 这两条与 `docs/compatibility.md`「Fiber 自身不能析构自身」的公开约束一致，**不作为新问题登记**。
+- **验证结果**：本批为只读回溯，未改动任何源码或测试，未触发构建。
+- **累计进度**：前十一批约 9,082 行 + 本批 1,502 行 ≈ **10,584 行，占 `src/`（21,855）约 48.4%**。
+  - 已完整读 15 个文件；`scheduler.cpp` 部分读（约 2,061/4,048）。
+  - **仍未读**：`scheduler.cpp` 余约 1,987 行（`:3910-4048`、`sysmon_pass` `:1413-1466`、`requeue_*` `:2527-2654`）、`io.cpp`(2646)、`hook.cpp`(2161)、`logging/log.cpp`(1026)、`config/config.cpp`(1089)、`http.cpp`(620)、`sse.cpp`(613)、`websocket.cpp`(715)、`address.cpp`(280)、`byte_array.cpp`(196)。
+- **台账状态**：新增 **X-13**；待办增至 **16 条**，其中 **13 条来自源码回溯**（D-13~D-18、X-06~X-13），**全部只登记未修**。
+- **下一步**：按依赖顺序回到 `scheduler.cpp` 收尾（`sysmon_pass` + `requeue_*` + `:3910-4048`），然后进 `io.cpp`。
+
 ## 2026-10-11：源码回溯审计（第 11 批：worker_loop 主体与 maybe_grow）
 
 - **本轮读的实现**：`worker_loop` 主体(`:3720-3910`)、`reap_dead_workers`(`:1244-1286`)、`detached_machine_count_locked`(`:1306-1315`)、`maybe_grow` 全文(`:1328-1400`)，约 **365 行**。
