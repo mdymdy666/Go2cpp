@@ -11,6 +11,27 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 13 批：scheduler.cpp 剩余区间，全文读毕）
+
+- **本轮读实现**：`sysmon_pass`(`:1413-1470`)、`requeue_to_processor` 与 `requeue_from_worker`(`:2527-2644`)、`worker_loop` 收尾(`:3910-4046`)，约 **322 行**。**至此 `scheduler.cpp` 4,048 行全文读完**。
+- **核对结果——与文档一致**：
+  - `:1424-1432` `sysmon_pass` 用 `try_to_lock`，抢不到锁时置 `sysmon_retry_pending` 并缩短下一周期，而不是把一次锁竞争当成本轮扫描完成；与 `docs/scheduler.md`「扫描本身采用 try_to_lock，因此可能跳过一轮，但不会无限等待」一致；`:1441-1442` 还用 `since <= 0 || now < since` 双重防护时间回退；
+  - `:2532-2536` 与 `:2598-2602` 都先做不变检查、`:2546-2549` 与 `:2609-2612` 在**持有 P 队列锁后再次检查** `accepting/draining/stopping`，与 shutdown 的排空顺序一致（shutdown 在同一 admission mutex 下扫描 waiting G）；
+  - `:2614-2616` 注释明确「计数必须先于节点发布，否则另一个 worker 可能先 pop 节点再递减尚未增加的 runnable，造成下溢」；`:2537-2539` `try_mark_queued()` 失败时返回 `task->queued()`，使重复入队幂等；
+  - `:3990-4012` 空闲 M 回收：`idle_timeout` 按 `can_shrink` 选择 `idle_worker_timeout` 或 `idle_wait`；被唤醒后**重新计算** `current_floor` （`:3997`）而不是复用唤醒前的值；并在**持锁时预留退休**（`:4004-4010`，注释说明否则多个空闲 M 可能都看到 `active > min` 而缩到下限以下）；
+  - `:4018-4026` 退出时只撤销**仍 attached** 的 P 计数，避免 sysmon 已 detached 时 `size_t` 下溢；`:4027-4033` 按 `stopping` 决定 P 进入 `kDead` 还是 `kIdle`。
+- **对既有条目的修正（重要）**：读到 `:3927-3948` 后发现，**X-12 描述的「终态回收被抑制」还有一条例外路径** —— 当 worker 取到任务却 `!claimed`（出队后失去执行 claim）时，会**直接**调用 `collect_terminal_locked`，不经过 `maintenance_budget`。但该分支只在取消/竞态造成的陈旧队列节点上触发，属罕见路径，**X-12 的结论不变**，已就地补充说明。
+- **另处理用户未决事项**：上一轮我提出「台账行号会因用户重排失效」，并给出方案 A（补符号名）/B（等重排完统一重定位）。用户在 30 分钟窗口内未回复，按无人值守规则**采用默认方案 A**：
+  - 台账顶部新增**行号引用约定**：`路径:行号` 一律以符号名/代码片段为主定位，行号仅作参考；并记录了 `src/tools/error.cpp` 由 404 → 478 行、`Is()` 的空 target 分支由 `:392-394` → `:463` 这一具体漂移；
+  - D-14 的行号引用已同时给出重排前后的位置。
+  - **用户可推翻**：若希望改回方案 B，删除顶部该段约定即可。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建。
+- **累计进度（重新核算）**：完整读完的**16 个文件**共 **12,507 行**，占 `src/`（21,855 行）约 **57.2%**。
+  - 已全文读完：`error` `control_flow` `fd_manager` `fiber_local` `parking_condition` `io_backend` `thread_policy` `future` `context_backend` `channel` `socket` `timer` `sync` `context` `fiber` `scheduler`。
+  - **仍未读**：`io.cpp`(2646)、`hook.cpp`(2161)、`config.cpp`(1089)、`log.cpp`(1026)、`websocket.cpp`(715)、`http.cpp`(620)、`sse.cpp`(613)、`address.cpp`(280)、`byte_array.cpp`(196)——合计约 9,346 行。
+- **另注**：用户在途新增 `src/tools/error.cpp` 的改动，上一轮已做过只读验证（构建 0 warning、全部 23 个测试模块通过、`ctest` 24/24），**本轮未再触碰**。
+- **下一步**：`io.cpp`(2646)——现存最大的未读单文件。
+
 ## 2026-10-11：源码回溯审计（第 12 批：fiber.cpp 全文 1502 行）
 
 - **本轮读完整实现**：`src/concurrency/fiber.cpp`(1502)。这是依赖图里 `scheduler` 的唯一实质前提，也是「阅读顺序」中优先级最高的未读文件。
