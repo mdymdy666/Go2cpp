@@ -11,6 +11,22 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 15 批：io.cpp :700-1400）
+
+- **本轮读实现**：`src/network/io.cpp` 的 `:700-1400`，约 **700 行**，覆盖 `State::shutdown`、`register_wait`（核心注册路径）、`complete`、`recycle_node`、`complete_if_head`、`cancel`/`cancel_all`/`notify_close`、私有工具（`claim`/`purge_terminal_locked`/`erase_timer_locked`/`invalidate_registration_locked`/`update_interest_locked`/`drain_queue_locked`）。
+- **结论：本批未发现新的缺陷或文档缺失。** 以下要点经逐条核对：
+  - `:702-734` `shutdown()` 用 `m_lifecycle_mutex` + `m_mutex` 双层保护，先在锁内 `invalidate_registration_locked` + `drain_queue_locked` 清空所有等待队列，**锁外** `wake_nodes` + `tickle`，最后才 join poller；`:729-731` 检查 `m_poller.get_id() != std::this_thread::get_id()`，避免在 poller 线程内自我 join 死锁；
+  - `:776-788` 先用本地 `FdSlot` 缓存的 descriptor token，避免每轮等待都做 `F_GETFD` + 全局 registry 锁；`:813-826` 是**第二个线性化点** —— 注释明确「检查后到入队期间的失效仍由同一 `m_mutex` 下的 `notify_close` 排空处理」，否则「旧 fd 放回队列，既没有新的 epoll 注册者，也没有后续关闭事件可以唤醒它，最终形成永久挂起」；
+  - `:891-917` pending 只是 epoll 的**候选提示**，用零超时 `::syscall(SYS_poll, ...)` 最终确认，防 stale ready；该 syscall 与 `:123-135` 的 `probe_immediate` 一致地**绕过 Hook**；
+  - `:1348-1354` `update_interest_locked` 要求 interest 是队列的**精确投影**，注释记录了历史缺陷：「旧实现只在『新集合是旧集合子集』时直接返回，导致 READ|WRITE 收缩为 WRITE 后仍保留 READ 注册；水平触发下会持续收到无消费者的 READ 事件并忙循环」。**本轮已交叉核对：该修复在 `docs/correctness_audit.md:90`、`codex.md:1466`、`codex.md:1487` 均有留痕**，文档链路完整，**不是文档缺失**；
+  - `:1379-1381` `drain_queue_locked` 强调「先登记操作，再从队列移除」，因为 `complete_if_head` 可能已在队列外取得操作令牌并等待 `m_mutex`，先 pop 会让它获取锁后找不到节点而**永久遗留未完成节点**；`:1394-1397` 遇到另一完成路径正在处理队头时 `break` 以保持 FIFO。两处注释与 `:1070-1072` 形成完整闭环；
+  - `:792-795` `Capture` 已在描述符注册表锁内做过 `F_GETFD`，`m_mutex` 下的二次检查只作为 close/dup2 与发布节点之间的线性化门，缓存 token 失效时直接返回 `EBADF` 而不把旧代际放回队列。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建。
+- **累计进度**：前十四批 13,283 行 + 本批约 700 行 ≈ **13,983 行，占 `src/`（22,012 行，含用户改动后的 `error.cpp` 与 `context_x64.S`）约 63.5%**。
+  - **仍未读**：`io.cpp` 余 1,246 行（`:1400-2646`，含 `poll_loop`、`WaitAny/WaitMany`、公开 `IOManager` 方法）、`hook.cpp`(2161)、`config.cpp`(1089)、`log.cpp`(1026)、`websocket.cpp`(715)、`http.cpp`(620)、`sse.cpp`(613)、`address.cpp`(280)、`byte_array.cpp`(196)、`context_x64.S`(83)，合计约 **8,029 行**。
+- **台账状态**：本轮无新增条目；待办仍为 **18 条**，其中 15 条来自源码回溯。
+- **下一步**：`io.cpp` 的 `:1400-2646`。
+
 ## 2026-10-11：源码回溯审计（第 14 批：io.cpp 前 700 行）
 
 - **本轮读实现**：`src/network/io.cpp` 的 `:1-320`（工具函数、`probe_immediate`、token 编码、`WaitNode` 全部成员）与 `:320-700`（`WaitNode` 的 callback/operation 生命周期、`WakeList`、`FdSlot`、`State` 构造与 `start()`/`shutdown()` 开头），约 **700 行**。**io.cpp 共 2,646 行，未读完。**
