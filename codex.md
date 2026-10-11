@@ -11,6 +11,23 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 19 批：hook.cpp :620-1100）
+
+- **本轮读实现**：`src/network/hook.cpp` 的 `:620-1100`，约 **480 行**，覆盖 `clone_descriptor`/`try_clone_descriptor`、`restore_failed_replacement`、`source_fd_is_valid`、`operation_timeout`、`can_wait`、`wait_error`、`wait_for_io`、`deadline_from_timeout`、`native_wait`、`cooperative_io` 模板、`has_dontwait`、`connect_wait_timeout`、`cooperative_connect`、`cooperative_sleep_for`、`saturating_duration`、`fcntl_argument` 开头。
+- **结论：本批未发现新的缺陷或文档缺失。** 要点：
+  - `:725-730` `can_wait` 要求**三个条件同时成立**（是 socket、系统级非阻塞、用户未请求非阻塞），与 `docs/network.md`「只接管用户未显式设置非阻塞的 socket」一致；`:864` 再用 `!per_call_nonblocking && can_wait(...)` 决定是否进入等待循环，使 `MSG_DONTWAIT`/`O_NONBLOCK` 的每一次调用都能保持原生语义；
+  - `:867-897` `cooperative_io` 的循环结构完整：`DescriptorGuard` 生命周期门 → 真实调用 → （仅在有 manager 时）EINTR 重试 → 非阻塞直接返回 → 成功/非 EAGAIN 返回 → 交给 `wait_for_io`（有 manager）或 `native_wait` 回退。`:877` 把 EINTR 重试限定在 `manager != nullptr`，无 manager 时把 EINTR 原样返回调用者，保留了原生语义；
+  - `:775-829` `native_wait` 的 **10ms 切片轮询**有明确理由（`:778-780`：「另一个线程中的 poll 不一定会被 close 可靠中断。有限时长的 poll 切片让保留的代次检测 close」），且两次 `descriptor_closed` 检查分别位于 poll 前与就绪后，`:819-821` 注释解释「close/dup2 Hook 在就绪通知与真正读写之间不能把旧 generation 伪装成新的同号 fd」。**文档核对**：`docs/network.md:12` 已写明「等待后端最多经过一个有限轮询片段就会…」，虽未给出具体毫秒数（属实现细节），但概念已在文档中，故**不登记为文档缺失**；
+  - `:1033-1055` `cooperative_sleep_for` 用临时 `eventfd` + `manager->WaitFor` 把 `sleep`/`usleep`/`nanosleep` 变成协作式等待，并在 `:1047-1048` 用 `NotifyClose` + `syscall(SYS_close)` 清理；`:1049-1051` 把 `kTimeout` 与 `kReady` 都视为正常完成（eventfd 无人写入，故正常路径就是超时），失败才置 errno 并报告中断；
+  - `:665-693` `restore_failed_replacement` 精确处理 dup2/dup3 的语义（注释 `:661-664`：「Hook 必须在进入系统调用前发布关闭…若 Linux 内核拒绝本来有效的替换，目标仍保持打开」），恢复成功则重建 token 并清 `m_closed`，恢复失败则清 token、置 `m_closed` 并从 map 擦除（且校验 `found->second == descriptor`）；
+  - `:1065-1078` `saturating_duration` 与 `:318-337` `timeval_duration` 使用**同一套除法+减法溢出预检模式**，两处都避免了 `seconds * 1e9` 回绕；
+  - `:930-1021` `cooperative_connect` 完整处理 `EINPROGRESS`/`EALREADY`/`EAGAIN` 三态，等待后用 `getsockopt(SO_ERROR)` 取真实结果，并在等待前后各做一次 `descriptor_closed` 检查；`:990-993` 说明「配置的 connect 超时同样适用于 managed 延迟接管后的原生 poll 回退」。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建。
+- **累计进度**：前十八批 15,849 行 + 本批约 480 行 ≈ **16,329 行，占 `src/`（22,012）约 74.2%**。
+  - **仍未读**：`hook.cpp` 余约 1,061 行（`:1100-2161`，含 `fcntl_argument` 余下、`ioctl_has_*_argument`、`set_enabled`/`enabled`/`bind_io_manager`/`set_connect_timeout`、以及全部 33 个 interposer 入口函数体）、`config.cpp`(1089)、`log.cpp`(1026)、`websocket.cpp`(715)、`http.cpp`(620)、`sse.cpp`(613)、`address.cpp`(280)、`byte_array.cpp`(196)、`context_x64.S`(83)，合计约 **5,683 行**。
+- **台账状态**：本轮无新增条目；待办仍为 **21 条**，其中 18 条来自源码回溯。
+- **下一步**：`hook.cpp` 的 `:1100-2161`，读完该文件。
+
 ## 2026-10-11：源码回溯审计（第 18 批：hook.cpp :1-620）
 
 - **本轮读实现**：`src/network/hook.cpp` 的 `:1-620`，约 **620 行**，覆盖 `Originals` 全部 33 个函数指针、`initialize_originals`、`invoke_real`、`invoke_native_blocking`、`hooks_enabled`、`current_manager`/`cooperative_manager`、`OpenDescription`/`Descriptor`、`adopt_socket`/`try_adopt_socket`、`register_new_socket`/`try_register_new_socket`、`prepare_close`/`finish_close`/`notify_before_close`、`snapshot_descriptor`、`clone_descriptor` 开头。
