@@ -11,6 +11,32 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯第 26 批 —— 修复 7 条文档缺失与矛盾
+
+- **本轮性质**：`src/` 已全部读完（第 25 批），本轮转入**修复**。只处理台账中**纯文档类**条目 —— 它们没有「可复现证据 + 失败现场」的修复门槛要求，每处都有明确的源码行号依据。
+- **已修 7 条**（commit `36342ac`）：
+  | 台账 | 改动 |
+  |---|---|
+  | D-13 | `include/go2cpp/network/io_backend.hpp`：为 `UnregisterBackend` 补「平台默认后端不可注销」及其理由 |
+  | D-15 | `include/go2cpp/concurrency/future.hpp`：说明 `BrokenPromiseError()` 返回**进程级共享单例**，故 `Is(errA, errB)` 对两个 broken promise 为 true |
+  | D-16 | `include/go2cpp/network/socket.hpp`：为 `fd()` 补「瞬时值、不进 in-flight 保护、不得跨操作持有」 |
+  | D-17 | `include/go2cpp/concurrency/scheduler/scheduler.hpp`：为 `wake_io_batch` 补前置条件「只接受本 Scheduler 已登记节点」及跳过 `owned_by` 校验的事实 |
+  | D-18 | `docs/compatibility.md`：把「**不做 CPU 绑核**」改为「默认不绑核，`pin_workers_to_cpu = true` 时会用 `pthread_setaffinity_np`」——以 `src/concurrency/scheduler.cpp:3505-3515` 为准 |
+  | D-22 | `docs/network.md` 与 `include/go2cpp/network/http.hpp`：说明 `Server::serve_connection` **不对 recv/write 施加超时**，与 `Client` 的绝对 deadline 不同 |
+  | D-23 | `docs/network.md`：说明 `ResponseWriter::flush()` 只做状态校验、不写出内容 |
+- **本轮明确未做的一条：D-14**（`Is(error, nullptr)` 的空 target 语义）。原因是其目标文件 `include/go2cpp/tools/error.hpp` **正是用户当前的在途改动文件**（用户在 `:204-246` 新增了 Go 风格 `errors::` 命名空间）。由于 `git add` 以整文件为单位，提交该文件的注释修改必然会**把用户尚未完成的改动一并带入提交**，违反「在途改动原样保留、不动、不提交」的约束。**故本轮跳过，等用户提交或撤销该文件后再补。**
+- **验证结果**：
+  - `cmake --build build-quality --parallel` → **0 warning / 0 error**（改动含 4 个头文件，故必须重建验证）；
+  - `ctest --test-dir build-quality` → **24/24 通过**，总耗时 24.42s；
+  - 本轮只改注释与 Markdown，未触碰任何实现语句。
+- **台账更新**：D-13、D-15、D-16、D-17、D-18、D-22、D-23 状态改为 `已修复` 并附 commit hash；同时**修正 D-13 的路径引用** —— 此前误记为 `include/go2cpp/io_backend.hpp:77`，实际该文件只是 4 行转发头，真实声明在 `include/go2cpp/network/io_backend.hpp:76`。
+- **剩余待办 20 条**：
+  - `D-14`（1 条，文档类）—— 阻塞于用户在途改动，见上；
+  - `X-06`~`X-22`（17 条，实现类）—— 需按缺陷修复门槛逐条判定，其中多条已核实「当前不可达」；
+  - `T-08`（1 条，测试类）—— `GO2CPP_TEST_FILTER` 未知名字静默返回 0；
+  - `X-01`（1 条）—— `dynamic_gmp_demo` 间歇失败，尚未复现。
+- **下一步建议**：`T-08` 是**测试基础设施缺陷**，修复它不涉及并发正确性、也不需要失败现场 —— 只需要让未知 filter 返回非零并加一条回归。这可能是剩余条目里最容易安全落地的一条。
+
 ## 2026-10-11：源码回溯审计（第 25 批：address/byte_array/context_x64.S）—— **`src/` 全部读完**
 
 - **本轮读完整实现**：`src/network/address.cpp`(280)、`src/network/byte_array.cpp`(196)、`src/concurrency/context_x64.S`(83)，合计 559 行。**至此 `src/` 下 25 个 `.cpp` + 1 个 `.S` 共 22,012 行全部读完。**
