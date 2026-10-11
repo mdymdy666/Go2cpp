@@ -58,6 +58,13 @@ public:
 
     Socket(const Socket&) = delete;
     Socket& operator=(const Socket&) = delete;
+    /**
+     * @brief 返回当前底层文件描述符，供诊断或传给外部系统调用。
+     * @note 返回的是**瞬时值**，不进入 `begin_operation` 的 in-flight 保护：
+     *       取到之后若发生 `close()` 或 fd 复用，该值即失效（ABA）。库内部的
+     *       读写、accept、connect、选项查询与地址查询都会自行固定 fd，
+     *       **调用方不应跨操作持有本返回值**。
+     */
     int fd() const noexcept;
     int family() const noexcept { return m_family; }
     int type() const noexcept { return m_type; }

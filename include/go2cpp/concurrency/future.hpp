@@ -150,7 +150,13 @@ private:
 };
 
 /** Promise 被销毁时仍未完成，对应 Future 收到的错误。 */
-/** @brief 创建 Promise 在销毁前未完成时的错误。 */
+/**
+ * @brief 创建 Promise 在销毁前未完成时的错误。
+ * @note 本函数返回的是**进程级共享单例**：所有因 Promise 被放弃而产生的错误
+ *       都是同一个对象，因此 `Is(errA, errB)` 对两个不同的 broken promise 会
+ *       返回 true。这是为避免每次 Promise 析构重复分配而做的有意设计，
+ *       与 `CanceledError()` / `DeadlineExceededError()` 等哨兵错误的用法一致。
+ */
 ErrorPtr BrokenPromiseError();
 
 namespace detail {

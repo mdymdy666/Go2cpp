@@ -534,6 +534,10 @@ public:
     // IO poller 在一次 epoll_wait 中批量唤醒多个 G。实现先逐任务发布
     // Waiting->Runnable，再按最近 P 分桶、一次持有一个 P 队列锁，降低
     // 高频 IO 下的锁竞争；无法批量接纳的任务回退到 wake_io。
+    // 前置条件：**只接受本 Scheduler 已登记（registered）的 G**。为降低批量
+    // 路径的锁竞争，实现跳过 wake_io 的 owned_by 所有权校验，因此传入未注册
+    // 或异属 task 会把不属于本调度器的 G 放进本调度器的 P 队列，破坏 owner
+    // 不变量。当前唯一调用点是 IOManager::State::wake_nodes 的批量分支。
     bool wake_io_batch(const std::vector<std::shared_ptr<Task>>& tasks);
     // 等待节点选出终态后使用的通知交接。它跨越 shutdown/admission 竞态
     // 保留已经启动但仍挂起栈上的 G，避免提前标记为终态。

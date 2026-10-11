@@ -217,7 +217,12 @@ public:
     explicit Server(net::Socket::Ptr listener);
     void route(Method method, std::string path, Handler handler);
     void set_fallback(Handler handler);
-    /** @brief 同步处理一个连接；每个连接只在一个 Fiber 中串行使用。 */
+    /**
+     * @brief 同步处理一个连接；每个连接只在一个 Fiber 中串行使用。
+     * @note 本函数**不设置 recv/write 超时**（走无限等待），连接级超时需由
+     *       调用方在 handler 内或上层负责；对比 `http::Client` 有覆盖
+     *       connect/send/recv 的绝对 deadline。
+     */
     void serve_connection(net::Socket::Ptr connection,
                           std::size_t max_requests = 100);
     void stop() noexcept { m_stopped = true; }

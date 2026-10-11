@@ -73,7 +73,13 @@ using IOBackendPtr = std::shared_ptr<IOBackend>;
 using IOBackendFactory = std::function<IOBackendPtr()>;
 /** @brief 注册命名后端；同名注册失败，注册表进程级线程安全。 */
 bool RegisterBackend(std::string name, IOBackendFactory factory);
-/** @brief 注销后端；只影响后续 CreateBackend。 */
+/**
+ * @brief 注销后端；只影响后续 CreateBackend。
+ * @return 注销成功返回 true。
+ * @note **平台默认后端不可注销**：传入 `DefaultBackendName()` 返回的名字一律
+ *       返回 false。默认后端是 IOManager 的启动依赖，允许注销会让后续的默认
+ *       创建静默拿到空实例。
+ */
 bool UnregisterBackend(const std::string& name) noexcept;
 /** @brief 创建后端实例；空名称使用默认后端。 */
 IOBackendPtr CreateBackend(const std::string& name = {});

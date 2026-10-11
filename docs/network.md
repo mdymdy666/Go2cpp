@@ -27,7 +27,7 @@ TCP 是有序字节流，不保证一次 `recv` 对应一次消息。使用 `Fra
 
 `http::Parser` 增量解析 HTTP/1.x，支持分片头、Content-Length、严格的单一 `chunked`、chunk 扩展、trailer 和流水线剩余字节；默认头上限 64 KiB、body 上限 64 MiB、trailer 上限 16 KiB，可通过 `ParserLimits` 调整。重复但不一致的 Content-Length、Content-Length 与 chunked 同时出现、未知 Transfer-Encoding、非法头、非法 chunk 和超限输入会返回 `ParseState::Error`。1xx、204、304 以及通过 `set_response_to_head(true)` 标记的 HEAD 响应不会等待 body。模块不实现 HTTP/2、HTTP/3、WebSocket upgrade 和 Expect:100；需要这些协议时应注入独立 ParserBackend。
 
-`http::ResponseWriter` 提供有限状态的 HTTP/1.1 chunked 输出：`Idle -> start() -> write()/flush() -> close()`。它适合 SSE、大文件和业务流式响应，所有 Socket 短写都会由 `SocketStream::write_all` 处理；重复 start、close 后 write、未 start 的 write 都返回失败。一个 writer 只能由一个线程或 Fiber 持有，业务需要并发发送时必须在上层串行化。
+`http::ResponseWriter` 提供有限状态的 HTTP/1.1 chunked 输出：`Idle -> start() -> write()/flush() -> close()`（其中 `flush()` 只做状态校验、不写出内容，因为 `write()` 已按 chunk 直接写入 Socket、全程无缓冲）。它适合 SSE、大文件和业务流式响应，所有 Socket 短写都会由 `SocketStream::write_all` 处理；重复 start、close 后 write、未 start 的 write 都返回失败。一个 writer 只能由一个线程或 Fiber 持有，业务需要并发发送时必须在上层串行化。
 
 ## WebSocket
 
@@ -43,7 +43,7 @@ SSE 位于独立的 `go2cpp::sse`，完整用法详见 [sse.md](sse.md)。`sse::
 后取消会唤醒等待写入并使后续操作返回 Cancelled/DeadlineExceeded。SSE 本身不提供跨连接事件
 存储和自动重连，重连时由业务把 `Parser::last_event_id()` 设置到 HTTP 的 Last-Event-ID。
 
-客户端提供 `http::Client::get/post/head` 以及 `http::Get/Post/Head` 便捷函数；每个 Client 请求独占连接，超时覆盖 connect、send、recv，并按单个请求的绝对 deadline 计算剩余时间，慢速逐字节响应不会为每次 recv 重新获得完整超时。DNS 目前通过 `getaddrinfo` 同步完成：在 Fiber 中会占用当前 M/worker，deadline 不能中断内核解析；高并发或需要取消的场景应预解析地址，或注入独立的有界异步 Resolver/解析线程池，避免在持有业务锁时解析。服务端 `http::Server::serve_connection` 对单连接串行处理，路由回调在锁外执行；生产程序应让 accept、IOManager 和业务 worker 分层，并在 handler 中避免持有线程锁等待网络。
+客户端提供 `http::Client::get/post/head` 以及 `http::Get/Post/Head` 便捷函数；每个 Client 请求独占连接，超时覆盖 connect、send、recv，并按单个请求的绝对 deadline 计算剩余时间，慢速逐字节响应不会为每次 recv 重新获得完整超时。DNS 目前通过 `getaddrinfo` 同步完成：在 Fiber 中会占用当前 M/worker，deadline 不能中断内核解析；高并发或需要取消的场景应预解析地址，或注入独立的有界异步 Resolver/解析线程池，避免在持有业务锁时解析。服务端 `http::Server::serve_connection` 对单连接串行处理，路由回调在锁外执行；**它不对连接的 recv/write 施加超时**（与上面的 Client 不同，使用无限等待），连接级超时需由调用方在 handler 内或上层负责；生产程序应让 accept、IOManager 和业务 worker 分层，并在 handler 中避免持有线程锁等待网络。
 
 ## 错误与限制
 
