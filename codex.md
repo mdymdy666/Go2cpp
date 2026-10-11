@@ -11,6 +11,28 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 17 批：io.cpp :1760-2646，全文读毕）
+
+- **本轮读实现**：`src/network/io.cpp` 的 `:1760-2646`，约 **886 行**，覆盖 `wake_nodes` 主体、`finish_fd`、`State` 全部成员、`IOManager` 构造/析构/`start`/`shutdown`/`go`/`wait`/`wait_for`/`wait_many`/`wait_any`/`wait_any_for`/`wait_many_for`/`cancel`/`cancel_all`/`notify_close`/`NotifyCloseAll`/`current`。**至此 `io.cpp` 2,646 行全文读完。**
+- **核对结果——与文档一致**：
+  - `:1755-1814` `wake_nodes` 有完整的异常安全：辅助容器分配失败时回退单节点唤醒，且**不丢失已经从 `WakeList` 取出的节点**；`:1800-1808` 只在 `tasks.size() > 1` 时走 `wake_io_batch`，这正是 D-17 所述批量入口的**唯一调用点**（节点均已 claim，故实现跳过 `owned_by` 校验是有依据的）；`:1809-1813` 所有节点统一配对 `end_operation()`；
+  - `:1976-1979` 与 `:2108-2114` 都要求 `Scheduler::current_scheduler() == &m_scheduler` 且存在当前 task，否则返回 `EPERM`；`:2110-2111` 注释明确「普通线程请使用原生 poll/select；这里不偷偷阻塞调用方线程」，与 `docs/network.md` 一致；
+  - `:2056-2072`（单 fd）与 `:2378-2393`（多 fd）的 park 循环都在伪唤醒后重新检查 outcome，并在「任务被取消 / scheduler 身份变化 / task 身份变化 / park 失败且调度器已停止」时转入取消，**不会无限自旋**；与文档「park 循环处理伪唤醒」一致；
+  - `:2133-2147` `wait_many` **先验证完整请求集合再发布任何 epoll 节点**，注释说明「否则前面的可读 FD 可能先触发并让 WaitMany 返回，后面的无效 FD 就会被静默跳过」；`:2121-2131` 的 O(n²) 重复检测同样给出理由（「否则一次 readiness 可能同时消费多个请求，无法给外部 waiter 提供可验证的 FIFO」）；
+  - `:2322-2376` 与 `:2404-2461` 是**两处零超时补探测**，分别位于 park 之前和恢复之后：前者避免「数据在第一个节点注册后、第二个注册前到达」导致只唤醒一个 Fiber，后者避免 epoll 回调分批到达时 cleanup 取消掉已就绪节点。两处都用 `::syscall(SYS_poll, ...)` **绕过 Hook**，`:2426-2427` 明确解释「否则 Hook-on 构建会再次进入阻塞封装并可能递归 park 当前 Fiber」；
+  - `:2395-2402` 移除 Context 回调时用 try/catch 保护并保留已得结果，`:2267-2272` 用 `shared_ptr<vector<NodePtr>>` 持有节点以防迟到回调观察到已销毁节点；
+  - `:1883-1904` `IOManager` 在构造时向全局 `manager_registry`/`close_registry` 登记，析构时**校验 `found->second == this`** 后才擦除，避免误删同地址的新实例。
+- **本轮读源码发现的新问题**：
+  - **X-17（低）**：`:2486-2494` 的终态选择是**两个分支完全相同的 if-else**，可合并为单个 `if (!have_terminal)`。结构暗示「非 Error 的终态优先于 Error」，但实际是**先到先得**。不影响就绪优先（`:2496`），但存在意图歧义。
+- **一处未登记的可读性观察**：`:1828-1836` `finish_fd` 先 `drain_queue_locked(queue_for(slot, event))`，再在 `both` 时 drain writers、并在 `event != kRead` 时 drain readers。当 `event == kWrite && both` 时 writers 会被 drain 两次 —— 因 `drain_queue_locked` 对空队列是幂等的故无害，且当前唯一以 `both=true` 调用它的 `cancel_all` 传的是 `kRead`，**该组合当前无调用者**。不登记为条目。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建。
+- **累计进度**：前十六批 14,343 行 + 本批约 886 行 ≈ **15,229 行，占 `src/`（22,012）约 69.2%**。
+  - 已**全文读完 18 个文件**（含 `io.cpp`）。
+  - **仍未读**：`hook.cpp`(2161)、`config.cpp`(1089)、`log.cpp`(1026)、`websocket.cpp`(715)、`http.cpp`(620)、`sse.cpp`(613)、`address.cpp`(280)、`byte_array.cpp`(196)、`context_x64.S`(83)，合计约 **6,783 行**。
+- **台账状态**：新增 **X-17**；待办共 **20 条**，其中 **17 条来自源码回溯**
+  （D-13~D-18、X-06~X-17），**全部只登记未修**。
+- **下一步**：`hook.cpp`(2161)——现存最大的未读文件。
+
 ## 2026-10-11：源码回溯审计（第 16 批：io.cpp :1400-1760）
 
 - **本轮读实现**：`src/network/io.cpp` 的 `:1400-1760`，约 **360 行**，覆盖 `fail_slot_locked`、`take_ready_locked`、`process_event_locked`、`process_event`/`process_events_batch`、`expire_timers`、`poll_timeout_ms`、`drain_wake_fd`、`poll_loop`、`tickle`、`wake_nodes` 开头。
