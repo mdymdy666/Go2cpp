@@ -11,6 +11,27 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 23 批：http.cpp 全文 620 行）
+
+- **本轮读完整实现**：`src/network/http.cpp`(620)。
+- **核对结果——解析器与出站校验的安全性突出**：
+  - `:239-244` `Headers::add` 对**出站头**也执行 `valid_header_name`/`valid_header_value` 校验，注释明确「只依赖解析器校验…业务字符串中的 CRLF 会造成响应拆分或请求走私」——这是防注入的关键一环；
+  - `:369` 拒绝「chunked 与 Content-Length 同时出现」（请求走私经典手法）；`:359` 拒绝重复且不一致的 `Content-Length`；`:360-364` 拒绝任何非 `chunked` 的 `Transfer-Encoding`（注释：「任何未知编码都不能被当作明文 body」）；`:119` 对重复的 `chunked` 也返回失败；
+  - 溢出检查覆盖全部长度计算：`:312-315`（输入总量）、`:391`/`:433`（body_start + content_length）、`:400`（chunk 累计）、`:428`（cursor + chunk_size + 2）、`:140`（parse_chunk_size 的 `×16`）；`:102` `parse_size` 也在乘 10 前预检；
+  - `:379-387` 响应缺少 CL/TE 时进入 **close-delimited** 模式并返回 `NeedMore`，注释说明「不能在收到头部的同一次 recv 中错误地把 body 当成空并宣布 Complete」；`:292-308` `finish()` 才在 EOF 时收尾，`:299` 还检查 `m_body_start` 合法性；
+  - `:266-286` `Response::to_string` 对 1xx/204/304 过滤用户手工设置的 CL/TE（注释：「避免下游继续等待一个永远不会出现的 body」），HEAD 请求不输出 body；`:255-263` `Request::to_string` 在 start-line 非法时返回空串而非发出坏请求；
+  - `:508-519` `Client::do_request` 处理 informational 响应：`status >= 100 && status < 200 && status != 101` 时保留同一 recv 中的流水线剩余（`take_remaining`）并重建 `Response` 继续解析，**正确地把 101 Switching Protocols 视为最终响应**；
+  - `:60-76` `make_deadline`/`remaining_time` 用 `duration<long double>` 预检溢出并保证「剩余时间不为 0 时至少返回 1ms」，避免忙轮询；
+  - `:150-201` `split_url` 完整处理了 IPv6 方括号、端口缺省、query/fragment 组合（`:194-199` 对 `?` 与 `#` 的四种组合分别给出正确 target）。
+- **本轮读源码发现的新问题**：
+  - **D-22（中）**：`Server::serve_connection`（`:596-618`）的 `recv` 与 `write_all` **都不传超时**，而 `Client` 有完整的绝对 deadline。文档（`docs/network.md:46`、`http.hpp:220`）未说明这一差异。
+  - **D-23（低）**：`ResponseWriter::flush()`（`:579`）是**空操作**（仅返回状态检查），但 `docs/network.md:30` 把 `flush()` 与 `write()` 并列为输出步骤。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建。
+- **累计进度**：前二十二批 19,505 行 + 本批 620 行 ≈ **20,125 行，占 `src/`（22,012）约 91.4%**。已**全文读完 22 个文件**。
+  - **仍未读**：`websocket.cpp`(715)、`sse.cpp`(613)、`address.cpp`(280)、`byte_array.cpp`(196)、`context_x64.S`(83)，合计约 **1,887 行**。
+- **台账状态**：新增 **D-22、D-23**；待办共 **26 条**，其中 **21 条来自源码回溯**（D-13~D-18、D-22~D-23、X-06~X-21），5 条为早期文档类条目。
+- **下一步**：`websocket.cpp`(715) 与 `sse.cpp`(613)，之后是两个小文件与汇编。
+
 ## 2026-10-11：源码回溯审计（第 22 批：log.cpp 全文 1026 行）
 
 - **本轮读完整实现**：`src/logging/log.cpp`(1026)。
