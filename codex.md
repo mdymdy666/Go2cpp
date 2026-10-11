@@ -11,6 +11,26 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 20 批：hook.cpp :1100-2161，全文读毕）
+
+- **本轮读实现**：`src/network/hook.cpp` 的 `:1100-2161`，约 **1,061 行**，覆盖 `fcntl_argument` 余下、`ioctl_has_{pointer,no}_argument`、`go2cpp::hook::*` 全部公开入口与 `ScopedEnable`/`ScopedIOManagerBinding`、以及**全部 33 个 `extern "C"` interposer**（sleep/usleep/nanosleep、poll/ppoll/select/pselect/epoll_wait/epoll_pwait、socket/socketpair/connect/accept/accept4、read/readv/recv/recvfrom/recvmsg、write/writev/send/sendto/sendmsg、close/dup/dup2/dup3、fcntl/ioctl、getsockopt/setsockopt）。**至此 `hook.cpp` 2,161 行全文读完。**
+- **结论：本批未发现新的缺陷或文档缺失。** 以下三点是本文件最值得记录的设计：
+  - **「用户视角透明」机制（fcntl F_GETFL/F_SETFL，`:1996-2006` 与 `:2028-2035`）**：库接管 socket 时会强制加上内核级 `O_NONBLOCK`，但当用户 `F_GETFL` 查询时，返回的是 `m_user_nonblocking ? result | O_NONBLOCK : result & ~O_NONBLOCK` —— **把库代设的非阻塞位对用户隐藏**；用户 `F_SETFL` 时库又把 `O_NONBLOCK` 重新强制加上。这与 `can_wait`（`:725-730`）要求 `!m_user_nonblocking` 是同一套设计的两个面：**只有用户从未表达过阻塞意图的 socket 才被协作化**。`ioctl(FIONBIO)` 分支（`:2067-2111`）同样在成功后回读内核 flags 重建这份元数据；
+  - **`poll`/`select`/`epoll_wait` 一律透传（`:1473-1538`）**，注释 `:1458-1462` 明确「保持 libc ABI 和 timeout、EINTR、信号掩码、revents 语义，**不把一次多路等待偷偷拆成多个顺序等待**」；需要多 fd 协作时必须显式调用 `IOManager::WaitAny/WaitMany`。这是**拒绝语义降级**的正面例子；
+  - **`read`/`write` 的初始化期回退（`:1650-1652`、`:1777-1779`）**：`s_resolving && !s_originals.m_read` 时直接走 `::syscall(SYS_read, ...)`，避免 `dlsym` 自身触发的 `read`/`write` 递归进入 Hook 路径。
+- **其余核对通过的要点**：
+  - `:1850-1868` `close` 是**三段式**：`DescriptorGuard` 内 `prepare_close` + `notify_before_close`（后者经 `NotifyCloseAll` 完成 `Invalidate` 线性化）→ **锁外**执行真实 close → 再在 `DescriptorGuard` 内 `finish_close`。注释 `:1858-1859` 解释「不要在真实 close 期间持有进程级描述符生命周期门；SO_LINGER 和文件系统描述符可能在此处阻塞」。**这解答了第 18 批读 `prepare_close` 时留下的「`m_closed` 与线性化点分离」疑问**；
+  - `:1908-1912` 与 `:1947-1952` 对 `dup2`/`dup3` 的确定性失败（`old == new`、负 `new`、非法 flags、源无效）**直接透传内核**，不发出伪关闭通知；成功路径才 `finish_close` + `try_clone_descriptor`，失败路径走 `restore_failed_replacement`；
+  - `:1686-1704`、`:1713-1728`、`:1746-1760` 对 `MSG_WAITALL` 与 `MSG_OOB` 在 managed G 中返回 **`ENOTSUP`**（而非静默降级为短读或忽略），普通线程保持 libc 原生语义 —— 属于**显式声明不支持**的正确做法；
+  - `:1430-1456` `nanosleep` 在参数非法时**直接透传真实调用**让内核返回 `EINVAL`，并且在协作成功时按 POSIX 清零 `*remaining`；`:1379-1419` `sleep`/`usleep` 在 `Interrupted` 时分别返回剩余秒数与 `-1`，符合各自 POSIX 契约；
+  - `:1982-1988` `fcntl` 对未知命令返回 `ENOTSUP` 而不 `va_arg`，注释「读取未知的可变参数属于未定义行为」；`:2070-2077` `ioctl(FIONBIO)` **先让内核校验并读取调用者指针**，避免 Wrapper 侧解引用把正常 `EFAULT` 变成段错误；`:2139-2143` `setsockopt` 只在成功后、且 `length >= sizeof(timeval)` 时才更新接收/发送超时元数据。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建。
+- **累计进度**：前十九批 16,329 行 + 本批约 1,061 行 ≈ **17,390 行，占 `src/`（22,012）约 79.0%**。
+  - 已**全文读完 19 个文件**。
+  - **仍未读**：`config.cpp`(1089)、`log.cpp`(1026)、`websocket.cpp`(715)、`http.cpp`(620)、`sse.cpp`(613)、`address.cpp`(280)、`byte_array.cpp`(196)、`context_x64.S`(83)，合计约 **4,622 行**。
+- **台账状态**：本轮无新增条目；待办仍为 **21 条**，其中 18 条来自源码回溯。
+- **下一步**：`config.cpp`(1089) 或 `log.cpp`(1026)，之后是三个网络协议文件。
+
 ## 2026-10-11：源码回溯审计（第 19 批：hook.cpp :620-1100）
 
 - **本轮读实现**：`src/network/hook.cpp` 的 `:620-1100`，约 **480 行**，覆盖 `clone_descriptor`/`try_clone_descriptor`、`restore_failed_replacement`、`source_fd_is_valid`、`operation_timeout`、`can_wait`、`wait_error`、`wait_for_io`、`deadline_from_timeout`、`native_wait`、`cooperative_io` 模板、`has_dontwait`、`connect_wait_timeout`、`cooperative_connect`、`cooperative_sleep_for`、`saturating_duration`、`fcntl_argument` 开头。
