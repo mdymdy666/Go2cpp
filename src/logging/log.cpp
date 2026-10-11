@@ -539,7 +539,7 @@ RotatingFileSink::RotatingFileSink(std::string path, std::size_t max_bytes,
 void RotatingFileSink::Write(const LogRecord&, std::string_view formatted) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_max_bytes != 0 && m_bytes + formatted.size() > m_max_bytes) {
-        if (m_stream) dynamic_cast<std::ofstream*>(m_stream.get())->close();
+        if (auto* stream = dynamic_cast<std::ofstream*>(m_stream.get())) stream->close();
         for (std::size_t i = m_max_files; i > 0; --i) {
             const auto source = i == 1 ? m_path : m_path + "." + std::to_string(i - 1);
             const auto target = m_path + "." + std::to_string(i);
@@ -556,8 +556,7 @@ void RotatingFileSink::Write(const LogRecord&, std::string_view formatted) {
         if (stream->is_open()) m_stream = std::move(stream);
         m_bytes = 0;
     }
-    if (m_stream) {
-        auto* stream = dynamic_cast<std::ofstream*>(m_stream.get());
+    if (auto* stream = dynamic_cast<std::ofstream*>(m_stream.get())) {
         stream->write(formatted.data(), static_cast<std::streamsize>(formatted.size()));
         m_bytes += formatted.size();
     }
