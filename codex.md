@@ -11,6 +11,22 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 11 批：worker_loop 主体与 maybe_grow）
+
+- **本轮读的实现**：`worker_loop` 主体(`:3720-3910`)、`reap_dead_workers`(`:1244-1286`)、`detached_machine_count_locked`(`:1306-1315`)、`maybe_grow` 全文(`:1328-1400`)，约 **365 行**。
+- **核对结果——与文档一致**：
+  - `:3725-3765` 的取任务顺序（救援链 → 本地 FIFO → 全局 FIFO → 有界窃取 victim 队尾）与 `docs/scheduler.md`「worker 依次尝试本地队列、全局队列和受限的 victim 窃取」完全对应，`:3745` 用 `processors.size() > 1` 守卫窃取；
+  - `:3872-3878` 在 G 任务边界发现仍活动的 `BlockingRegion` 时 `std::terminate()`，注释解释「宁可在边界处 fail-fast，也不能静默清掉 TLS 后把不一致状态传给后续 G」，与 `docs/scheduler.md` 的 fail-fast 约定一致；
+  - `:1359-1382` `maybe_grow` 的扩容上限：普通 runnable 峰值以 P 为界，每个 detached M 只补一个替代槽，且替代目标按 `min_workers + detached` 计算并受 `max_workers` 限制——正是 `docs/scheduler.md`「不会因为整机 P 数量很大而无条件创建 P 个线程」的源码依据；
+  - `:1250-1253` `reap_dead_workers` 用 `try_to_lock` 拿 `join_mutex`，拿不到就返回，避免 worker 与 shutdown 互等（注释明确）；`:1260` 先 `reserve` 再 move `std::thread`，保证后续 move 是 noexcept。
+- **本轮读源码发现的新问题**：
+  - **X-12（中）**：`maintenance_budget` 被**两个维护目的共用且互相重置**。`growth_period` 在积压时是 8、空闲时是 64；collect 的阈值固定为 64。于是**持续积压期间计数器每 8 次就被 grow 清零，永远达不到 collect 的 64**，终态 Task 只能等 `draining` 或积压消退才被回收，注册表强引用长期不释放。关键在于 `maybe_grow` 只回收 dead **worker 线程**（`reap_dead_workers`），**不**回收终态 Task——这条是我读了 `:1328-1400` 才确认的。
+    - **可验证的旁证**：`go2cpp_high_load_stress` 有 50,000 个任务，运行时 `runnable` 很可能长期大于 P 数，即长期处于 `growth_period == 8`，因此该压测的**内存峰值**应当明显偏高。本轮**未实测**这一点，仅作为后续验证方向的记录，不作结论。
+- **验证结果**：本批为只读回溯，未改动任何源码或测试，未触发构建。
+- **累计进度**：前十批约 8,717 行 + 本批约 365 行 ≈ **9,082 行，占 `src/`（21,855）约 41.6%**。`scheduler.cpp` 尚余 `:3910-4048`（worker 收尾与退休）与 `sysmon_pass` 主体(`:1413-1466`)未读；`io.cpp`(2646)、`hook.cpp`(2161) 完全未读。
+- **台账状态**：新增 **X-12**；待办增至 **15 条**，其中 **12 条来自源码回溯**（D-13~D-18、X-06~X-12），**全部只登记未修**。
+- **下一步**：`scheduler.cpp` 收尾（`:3910-4048` + `sysmon_pass` `:1413-1466`），然后进 `io.cpp`。
+
 ## 2026-10-11：源码回溯审计（第 10 批：Task::run / enqueue / worker_loop）
 
 - **本轮读的实现**：`Task::run`(`:830-996`)、`enqueue` 全文(`:2287-2525`)、`worker_loop` 前半(`:3494-3720`)，约 **636 行**。
