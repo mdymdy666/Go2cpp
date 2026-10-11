@@ -11,6 +11,24 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 14 批：io.cpp 前 700 行）
+
+- **本轮读实现**：`src/network/io.cpp` 的 `:1-320`（工具函数、`probe_immediate`、token 编码、`WaitNode` 全部成员）与 `:320-700`（`WaitNode` 的 callback/operation 生命周期、`WakeList`、`FdSlot`、`State` 构造与 `start()`/`shutdown()` 开头），约 **700 行**。**io.cpp 共 2,646 行，未读完。**
+- **核对结果——与文档一致**：
+  - `:79-96` `descriptor_is_open` 只认 `F_GETFD` 成功（`EINTR` 重试），注释写明「把 EIO/EINTR 等误判为仍打开会把无效 fd 注册到 epoll，最终造成永久等待」；`:123-135` `probe_immediate` 用**原生 `poll` 零超时**探测、不进入 Hook，避免递归注册 Fiber 等待——与 `docs/network.md`「epoll pending readiness 在下一次消费时用零超时原生 `poll` 再验证」描述吻合；
+  - `:303-318` 把 fd 与注册序号编码进 `epoll` token（高 32 位 `fd+1`、低 32 位序号，`token=0` 保留给内部 eventfd），注释说明目的是「避免每次 ONESHOT rearm 都在哈希表中分配/释放节点」，与 `docs/extensibility.md` 的「每个等待请求使用 FD generation/token 和一次性 outcome claim」一致；
+  - `:484-505` `begin_operation`/`end_operation` 的 0/1/2/3 无锁状态机（空闲/有一个操作/停止中/已停止）与 `:491-504` 注释「1→0 是正常完成；若回收线程已改为 2 则发布 3，不能无条件 store(0)」精确对应 `docs/network.md` 的「移除 Context 回调或回收节点前，会等待正在执行的取消/完成回调退出」；
+  - `:621-642` `State` 构造时在 `backend_owners()` 中登记 `IOBackend*` → `State*`，冲突时置 `EBUSY` 并放弃后端，落实了 `docs/extensibility.md`「一个后端实例只能绑定一个 IOManager」；`:666-692` `start()` 用 `m_lifecycle_mutex` + `m_mutex` 双层锁，线程创建失败时回滚 `accepting` 并置 `EAGAIN`。
+- **本轮读源码发现的新问题**：
+  - **X-14（低）**：`WaitNode::stop_operations`（`:507-532`）在等待活动操作结束时用**无界 yield 自旋**（`:528-530`）。这是与 X-13 同一「用 yield 代替条件等待」模式的**第二处**实例。注释承认理由是「避免为每个节点创建 condition_variable」且操作「通常很短」，但 `wake_io` 内部会取 admission 锁与 P 队列锁，竞争严重时耗时不可忽略。
+  - **X-15（低）**：`State::s_node_cache`（`:541-542`）是 `inline static thread_local` 且以**裸 `State*` 指针**为键复用 WaitNode，但 `~State()`（`:644-656`）**不清理**自己的缓存项。新 State 若落到相同地址，`:828-835` 会命中旧实例遗留的节点。因取出即 `reset()`（`:832`）且有 4096 上限（`:1042`），实际无害，但 `:538-540` 的注释只提「不形成反向生命周期」，未说明这一地址复用依赖。
+- **一处未登记的观察**：`:1260-1264` `next_registration_id_locked` 把序号截断到 低 32 位并把 0 映射为 1，因此理论上累计 2^32 次注册后会与序号 1 的 token 冲突（`0xffffffff` 掩码）。考虑到需要数十亿次 fd 注册/注销，**本轮不登记为条目**，仅在此记录备查。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建；用户在途的 `src/tools/error.cpp` 改动已加入提交门禁拦截名单，本轮未触碰。
+- **累计进度**：前十三批 12,507 行 + 本批约 700 行 ≈ **13,207 行，占 `src/`（21,855）约 60.4%**。
+  - **仍未读**：`io.cpp` 余约 1,946 行（`:700-2646`，含 `poll_loop`、`WaitAny/WaitMany`、`complete_*`、`IOManager` 公开方法）、`hook.cpp`(2161)、`config.cpp`(1089)、`log.cpp`(1026)、`websocket.cpp`(715)、`http.cpp`(620)、`sse.cpp`(613)、`address.cpp`(280)、`byte_array.cpp`(196)。
+- **台账状态**：新增 **X-14、X-15**；待办共 **18 条**，其中 **15 条来自源码回溯**（D-13~D-18、X-06~X-15），**全部只登记未修**。
+- **下一步**：继续 `io.cpp` 的 `:700-2646`。
+
 ## 2026-10-11：源码回溯审计（第 13 批：scheduler.cpp 剩余区间，全文读毕）
 
 - **本轮读实现**：`sysmon_pass`(`:1413-1470`)、`requeue_to_processor` 与 `requeue_from_worker`(`:2527-2644`)、`worker_loop` 收尾(`:3910-4046`)，约 **322 行**。**至此 `scheduler.cpp` 4,048 行全文读完**。
