@@ -11,6 +11,23 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 18 批：hook.cpp :1-620）
+
+- **本轮读实现**：`src/network/hook.cpp` 的 `:1-620`，约 **620 行**，覆盖 `Originals` 全部 33 个函数指针、`initialize_originals`、`invoke_real`、`invoke_native_blocking`、`hooks_enabled`、`current_manager`/`cooperative_manager`、`OpenDescription`/`Descriptor`、`adopt_socket`/`try_adopt_socket`、`register_new_socket`/`try_register_new_socket`、`prepare_close`/`finish_close`/`notify_before_close`、`snapshot_descriptor`、`clone_descriptor` 开头。
+- **核对结果——与文档一致**：
+  - `:148-191` `initialize_originals` 用 `std::call_once` + `thread_local s_resolving` **双重防重入**（`dlsym` 自身可能触发 hook）；`:131-138` 用 `memcpy` 在函数指针与 `void*` 之间转换并配 `static_assert` 检查 ABI 尺寸，规避了 ISO C++ 里函数指针与对象指针互转的未定义行为；`RealCallGuard`（`:124-128`）用 TLS 深度标记「正在执行真实调用」，供 `cooperative_manager` 判据使用；
+  - `:268-275` `cooperative_manager` 的四重条件（hook 启用 **且** 不在真实调用中 **且** 有当前 Fiber **且** 有当前 task）与 `docs/network.md`「只有 managed G 才走协作路径，普通线程直接透传」一致；`:238-243` `hooks_enabled` 再把进程级开关交给 `thread_policy::detail::HookAllowed` 做线程级判定，与 `thread_policy.cpp:189-199` 对应；
+  - `:402-444` `adopt_socket` 在 `:428-432` 把用户未设 `O_NONBLOCK` 的 socket 改为系统级非阻塞，并**分别记录** `m_user_nonblocking` 与 `m_system_nonblocking`，使「用户显式设置的非阻塞」与「库代设的非阻塞」在后续 `read`/`poll` 语义上可区分；`:438-443` 与 `:497-502` 的异常路径都会**把 `O_NONBLOCK` 恢复成原始 flags** 后重新抛出，不留半接管的 fd；`:454-462`/`:514-521` 的 `try_*` 包装把元数据失败降级为「fd 仍可用，回退 libc」，注释明确；
+  - `:318-337` `timeval_duration` 对 `tv_sec`/`tv_usec` 做合法性检查、把全零解读为「无超时」（符合 `SO_RCVTIMEO` 语义），并在 `:331-334` 用**除法与减法**做乘法溢出预检，避免 `seconds * 1000000` 回绕；
+  - `:528-539` `snapshot_descriptor` 把 `m_closed || !token || !token->valid()` 合并为单一 `m_closed` 判据，`:591-600` `finish_close` 只在 `found->second == descriptor` 时擦除，避免误删同 fd 的新代际。
+- **本轮读源码发现的新问题**：
+  - **X-18（低）**：`adopt_socket` 在**首次接管**期间持有全局 `s_descriptors_mutex`（`:410`）并执行 3~4 次真实系统调用，使新 fd 接管成为全进程串行点。注释说明串行化是有意的，但未说明持锁范围包含系统调用；热路径（已接管 fd）命中 map 即返回，不受影响。
+- **验证结果**：本批为只读回溯，**未改动任何源码或测试**，未触发构建。
+- **累计进度**：前十七批 15,229 行 + 本批约 620 行 ≈ **15,849 行，占 `src/`（22,012）约 72.0%**。
+  - **仍未读**：`hook.cpp` 余约 1,541 行（`:620-2161`，含 `clone_descriptor` 余下、`native_wait`、`cooperative_io`、`cooperative_connect`、`cooperative_sleep_for`、`fcntl`/`ioctl` 参数处理与全部 33 个 interposer 入口）、`config.cpp`(1089)、`log.cpp`(1026)、`websocket.cpp`(715)、`http.cpp`(620)、`sse.cpp`(613)、`address.cpp`(280)、`byte_array.cpp`(196)、`context_x64.S`(83)，合计约 **6,163 行**。
+- **台账状态**：新增 **X-18**；待办共 **21 条**，其中 **18 条来自源码回溯**（D-13~D-18、X-06~X-18），**全部只登记未修**。
+- **下一步**：`hook.cpp` 的 `:620-2161`。
+
 ## 2026-10-11：源码回溯审计（第 17 批：io.cpp :1760-2646，全文读毕）
 
 - **本轮读实现**：`src/network/io.cpp` 的 `:1760-2646`，约 **886 行**，覆盖 `wake_nodes` 主体、`finish_fd`、`State` 全部成员、`IOManager` 构造/析构/`start`/`shutdown`/`go`/`wait`/`wait_for`/`wait_many`/`wait_any`/`wait_any_for`/`wait_many_for`/`cancel`/`cancel_all`/`notify_close`/`NotifyCloseAll`/`current`。**至此 `io.cpp` 2,646 行全文读完。**
