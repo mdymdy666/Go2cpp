@@ -11,6 +11,22 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-11：源码回溯审计（第 10 批：Task::run / enqueue / worker_loop）
+
+- **本轮读的实现**：`Task::run`(`:830-996`)、`enqueue` 全文(`:2287-2525`)、`worker_loop` 前半(`:3494-3720`)，约 **636 行**。
+- **核对结果——与文档/既有记录一致**：
+  - `:860-866` callable 被 move 到 G 栈上执行，注释明确「captures 在无任何调度器锁持有时释放」；`:954-958` 在 trampoline 返回后立即把 `m_fiber` move 出去并`:992` 回收——「retaining a Task must not retain an already-finished G stack」与文档一致；
+  - `:959-981` 对「用户直接调用 `Fiber::Suspend`」的兜底：检查 `pending_wake` 与 `cancellation_requested` 后决定 Runnable/Waiting，注释解释了为何**不能**把已发布的唤醒许可覆盖成 Waiting（否则 shutdown 可能永久搁置该 G）；
+  - `:2347-2356` 首次注册分配失败时**绝不继续发布队列节点**，而是走取消路径——避免 Fiber 栈在无人持有时被销毁；`:2476-2482` 分配失败时已启动 G 进救援链、未启动 G 走取消，两者计数配对正确；
+  - `:3528-3531` 本地队列无锁快速路径要求 `runnable > processors.size()`（有积压才走），`:2506-2522` 的扩容检查按 `maintenance_ticket & 63/1023` 采样，与 `docs/scheduler.md` 的「有界扩展」描述一致。
+- **本轮读源码发现的新问题**：
+  - **D-18（文档矛盾）**：`docs/compatibility.md` 称 affinity「**不做 CPU 绑核**」，但 `scheduler.cpp:3505-3515` 在 `pin_workers_to_cpu == true` 时确实调用 `pthread_setaffinity_np`；`docs/configuration.md` 又把它列为合法布尔项。默认值为 `false`，所以默认行为不绑核，但文档的绝对表述与实现冲突。
+  - **X-11**：`:2392-2399` 的 `static thread_local t_incoming_stripe` 是**函数局部 static**，跨 Scheduler 实例共享，导致第二个 Scheduler 的条带号分布依赖第一个的分配结果，且其 `next_incoming_stripe` 计数失真。不影响正确性，仅影响分布均匀性。
+- **验证结果**：本批为只读回溯，未改动任何源码或测试，未触发构建。
+- **累计进度**：前九批约 8,081 行 + 本批约 636 行 ≈ **8,717 行，占 `src/`（21,855）约 40%**。`scheduler.cpp` 仍有约 1,200 行未读（`worker_loop` 后半 `:3720-4048`、`wake_io_batch` 主体已读但 `maybe_grow`/`sysmon_pass` 未读）；`io.cpp`(2646)、`hook.cpp`(2161) 完全未读。
+- **台账状态**：新增 D-18、X-11；待办增至 **14 条**，其中 **11 条来自源码回溯**（D-13~D-18、X-06~X-11），全部只登记未修。`X-01`（示例间歇失败）仍未复现。
+- **下一步**：`worker_loop` 后半与 `maybe_grow`/`sysmon_pass`，然后进 `io.cpp`。
+
 ## 2026-10-11：源码回溯审计（第 9 批：scheduler.cpp Impl 与 shutdown_for）
 
 - **本轮范围说明**：继续 `scheduler.cpp`，本轮读 `:997-1840`（`Scheduler::Impl` 全部成员与 sysmon/begin_shutdown/collect_terminal）与 `:1942-2161`（`shutdown_for` 全文），约 **1,062 行**。仍未读：`Task::run`(`:830-996`)、`enqueue`(`:2287-2527`)、`worker_loop`(`:3494-4048`)。
