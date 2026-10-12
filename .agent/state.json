@@ -1,13 +1,13 @@
 {
-  "round": 43,
+  "round": 44,
   "current_batch": null,
   "current_items": [],
-  "last_batch": "include 定向审计（future.hpp 全文读毕）",
+  "last_batch": "include 重复头文件全树扫描 + 修复 concurrency/sync.hpp",
   "last_result": "success",
-  "last_commit": "1e79a77",
+  "last_commit": "0316ad2",
   "consecutive_failures": {},
   "blocked_items": [
     "D-14"
   ],
-  "updated_at": "2026-10-12T12:33:00+08:00"
+  "updated_at": "2026-10-12T12:38:00+08:00"
 }
