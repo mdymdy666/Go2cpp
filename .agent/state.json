@@ -1,11 +1,11 @@
 {
-  "round": 62,
+  "round": 63,
   "current_batch": null,
   "current_items": [],
-  "last_batch": "fiber.cpp 收尾读完（100%）+ scheduler.cpp 骨架与计划",
+  "last_batch": "增强 ContextRollback（带回滚原因 + 失败聚合 + 观测接口）",
   "last_result": "success",
-  "last_commit": "4c0ecac",
+  "last_commit": "e4a1a56",
   "consecutive_failures": {},
   "blocked_items": [],
-  "updated_at": "2026-10-12T14:25:00+08:00"
+  "updated_at": "2026-10-12T15:50:00+08:00"
 }
