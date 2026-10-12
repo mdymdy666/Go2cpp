@@ -11,6 +11,31 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 通读（context.hpp 408 + log.hpp 506 全文）
+
+- **本轮读实现**：`include/go2cpp/concurrency/context.hpp`(408) 与 `include/go2cpp/logging/log.hpp`(506)，**均全文读毕**。
+- **结论：本批未发现新的缺陷或文档缺失。** 以下要点经逐条核对。
+- **context.hpp 核对通过的要点**：
+  - `:108-113` `ContextKey::Anchor()` 的设计解释了为什么类型化键需要持有一个 `shared_ptr<const std::uint64_t>`：注释写明「Context 节点在类型化值存在期间保留此锚点，**避免分配器复用地址让后续键发生碰撞**」—— 即身份用的是 token 的**地址**，而 anchor 的存在是为了让该地址在值存活期内不被复用；`:195-211` 的类型化 `Value()` 因此只比较 `Identity()`、给 `LookupValue` 传空 name（注释：「字符串名称只是元数据，不能让无关的键在父链中发生碰撞」）；
+  - `:240-242` 私有的 `AddBeforeDoneCallback`/`RemoveBeforeDoneCallback` 与 `src/concurrency/context.cpp:22-23` 的「内部回调（例如 ContextRollback）必须先于用户观察回调执行」一致；`DoneSignal::Signal()` 为 private 且`friend struct detail::DoneSignalAccess`（`:85-87`），**外部无法主动触发完成信号**；
+  - `:261-356` `ContextRollback` **允许移动**（`:301-302`），而 `Scheduler::BlockingRegion` **刻意禁止移动** —— 这个差异是合理的：`BlockingRegion` 的析构必须发生在**进入它的 M** 上（否则原 M 永久保持 Blocking），而 `ContextRollback` 的析构只是取消 + 执行 undo，可在任意线程完成；
+  - `:342-345` `RollbackDone()` 的语义边界写得很明确：「与 child Context 的 Done **分离**：该信号表示 commit 或完整 rollback 的补偿动作**已经执行完毕**」，并给出两条禁令「undo 不得等待自身的 RollbackDone，也不应在回调中阻塞或再次取得外部锁」；
+  - `:306`/`:310`/`:313-315` 对 undo 动作与 Savepoint 的约束完整：「动作应幂等、短小、非阻塞，最好声明为 noexcept」、「一次成功的局部回滚会使已有 Savepoint **全部失效**，调用方应重新创建令牌」。
+- **log.hpp 核对通过的要点**：
+  - `:112-132` `LogFormatter::Item` 有意同时提供 `Format` 与 `format`，默认实现互相转发，注释写明「兼容 Sylar 风格的用户扩展类」；`:170-181` 的模板版 `AddFormat<ItemType>` 用 `if constexpr` 判断「类型优先使用 `ItemType(const std::string&)`，否则使用默认构造函数」，把新手样板代码降到一行；
+  - `:109-110` 明确性能契约：「Item 对象在构造 `PatternFormatter` 时被创建，**格式化热路径只调用 `Format`，不会再次解析字符串或访问注册表**」—— 与 `src/logging/log.cpp` 的 `FindFormatItem` 只在构造期调用一致；
+  - `:326-327` `CallbackSink` 的并发契约写明：「回调对象在构造后不可变，**Write 不再为每条日志加内部锁**；若回调访问共享状态，应由回调自己选择合适的同步策略」—— 这是**把责任明确交给调用方**的写法，比隐式加锁更诚实；
+  - `:363-364` 与 `:426-427` 两处都注明了「原子快照」的意图：「热路径只做一次原子 shared_ptr 读取…因此格式化器和 Sink 不会在每条日志上争用 Worker 配置锁」/「`m_workers` 只在配置时修改；日志线程通过原子快照无锁读取」；
+  - `:494-495` `namespace GO2CPP = ::go2cpp;` 附注释「兼容用户给出的大小写命名示例。实现仍然位于规范的 go2cpp 命名空间」—— **该别名真实存在**，本会话早期已核实 `docs/logging.md` 对它的描述是准确的；
+  - `:27-40` `Level` 枚举把 `Fatal = Critical` 做成别名（而非新枚举值），`ToString`/`ParseLevel` 因此对二者返回同一名称 —— 与实现一致。
+- **顺带确认了用户两处在途改动的具体内容**（只观察，未改动）：
+  - `log.hpp:224-228` 之间确实存在**连续三个空行**（`:225-228`），对应用户在途改动；
+  - `concurrency/context.hpp` 的缩进风格已经是 4 空格 + `namespace go2cpp\n{`（`:19-20`），与用户在 `src/tools/error.cpp` 的重排风格一致，而它**不在 `git status` 中** —— 说明用户的风格统一工作**已部分提交**，当前仅剩 `src/tools/error.cpp` 等少数文件未提交。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建；在途 4 处文件 diff md5 与轮初一致。
+- **累计进度（include 通读）**：已完成 **21 个文件全文**，合计 **7,421 / 9,850 行 ≈ 75%**。
+  - **下一步**：`io.hpp`(314) → `go.hpp`(220) → `control_flow.hpp`(241) → `socket.hpp`(225) → `http.hpp`(246) → `websocket.hpp`(176) → `io_backend.hpp`(87) → `fd_manager.hpp`(69) → `parking_condition.hpp`(98) → `error.hpp`(250，用户在途文件，只读) → 余下零散转发头。
+- **台账状态**：本轮无新增条目；待办仍为 **8 条**（`D-14` 阻塞；`X-23`~`X-29` 待定）。
+
 ## 2026-10-12：include 通读（timer.hpp + config.hpp 全文，885 行）—— X-25 扩至 7 处
 
 - **本轮读实现**：`include/go2cpp/concurrency/core/timer.hpp`(344) 与 `include/go2cpp/config/config.hpp`(541)，**均全文读毕**。
