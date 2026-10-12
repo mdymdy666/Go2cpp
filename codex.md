@@ -13,6 +13,45 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：模块讲解（基础模块 3 · context）—— 新增 X-32、T-16
+
+- **用户指示**：讲解下一个基础模块。本轮完成 **`context`**，产出 **`docs/context_guide.md`（536 行，12 节）**，与 `error_guide.md`、`control_flow_guide.md` 同一标准。
+- **本轮读**：`tests/concurrency/test_context.cpp`(462，**全文**)、`example/concurrency/context_rollback_demo.cpp`(232，**全文**)、`docs/context_rollback.md`(121)，并回查 `src/concurrency/context.cpp` 的 `Context::Cancel`/`Now`/`s_now_function`、`recover` 以外的取消传播路径。
+- **用量地图（本轮最有信息量的部分）**：对 `src/` 全量统计后得到一个与 `Error` 讲解**相互印证**的结论 ——
+  | API | src/ 次数 | 说明 |
+  |---|---:|---|
+  | `ContextRollback` | **36** | **看似最高，但全部在 `context.cpp` 自身** |
+  | `->Cancel()` | 21 | |
+  | `->Done()` | 17 | |
+  | `->IsDone()` | 13 | |
+  | `DeadlineExceededError()` | 9 | 与 Error 讲解的判别配对 |
+  | `->Err()` | 7 | |
+  | `->Deadline()` | **1** | 运行时几乎不查询截止时间，只用 IsDone/Err |
+  **分文件看**：`channel.cpp` 19（`Cancel`7/`IsDone`3/`CanceledError`3/`Err`2）、`io.cpp` 14（`Err`4/`Done`4/`DeadlineExceededError`4）、`sync.cpp` 11、`sse.cpp` 5、`timer.cpp` 1。
+  **结论**：运行时对 Context 的依赖可概括为 —— 「每个阻塞点持有一个可取消、可超时的信号，醒来用 `Err()` 区分原因」；而 `ContextRollback` 虽出现次数最高，**运行时一处都不用**，与 `control_flow` 同属「为使用者准备的 API」。
+- **★ 新发现：X-32（低-中，性能）—— `Context::Now()` 在热路径上加全局锁**。`src/concurrency/context.cpp:1818-1825` 的实现每次都要 `lock_guard(s_clock_mutex)` + **复制一个 `std::function`**，而 `s_now_function`（`:231`）**只在测试中被设置**、正常运行时恒为空 —— 即每次调用都在为不存在的自定义时钟付出全局锁 + function 拷贝。
+  - **调用点已 grep 全量确认在热路径上**：`future.hpp:291`（`Wait` 的谓词）、`:363`/`:558`（`StatusLocked`）、`:492`、`:601`（`DeadlineAfter`），以及 `context.cpp:1667`/`:1704`（`WithDeadline`/`WithTimeout`）—— **每一次 `Future::Wait`、每一次创建超时上下文都会走这里**；
+  - **对照证据（很有力）**：项目在 `log.hpp:363-364` 明确写出正确做法 —— 「热路径只做一次原子 shared_ptr 读取…因此格式化器和 Sink **不会在每条日志上争用 Worker 配置锁**」。**同一个项目知道怎么做，这一处没做**；
+  - 修复只需 `std::atomic<std::shared_ptr<NowFunction>>` 或先做一次廉价的 `std::atomic<bool>` 判断，测试接口不变。
+- **★ 新发现：T-16（低，测试盲点）**：`ContextRollback::committed()` **零覆盖**，而其镜像方法 `rolled_back()` 被断言四处（`:200`/`:226`/`:237`/`:424`）。`docs/context_rollback.md:16-21` 的命名约定表专门提过 `committed()` 与 `had_failure()`「只提供小写形式」，而 `had_failure()` 已在测试与示例场景五中被验证，`committed()` 则在两处**一次都没出现**。
+- **文档讲透的七个场景**：
+  - **场景一 取消树的三条硬规则**：① **先全树标记、再跑回调**（测试注释：「Descendant cancellation is committed before parent callbacks run」—— 若边走边回调，父回调里同步等子节点会**死锁**）；② **幂等**（含 8 线程 first-wins）；③ **迭代传播**（**20000 层**深树不爆栈，与 Error 的 10 万层深链同一设计关切）；
+  - **场景二 根 Context 与 Go 的三处有意差别**：根暴露 `Cancel()` 但无效；`Done()` 非 nil 而是**永久 pending 的 `DoneSignal`**；空 parent 映射为 `Background()`（Go 会 panic）。三处均与 `docs/compatibility.md:13` 一致；
+  - **场景三 截止时间的三个边界**：正常到期、**已过期立即完成**、**`ContextDuration::max()` 饱和**（不饱和则 `now + max` 回绕成过去，让「永久」的 Context 立刻超时——极隐蔽的 bug），以及可注入时钟；
+  - **场景四 `ContextKey` 的 anchor 为何必要**：身份用 token 的**地址**，若 Key 出作用域后 token 被释放、地址被复用，新键就会**冒充旧键**（ABA）。`WithValue` 把 `Anchor()` 存进节点以钉住地址。测试用 **64 次循环**验证防别名；
+  - **场景五 P=1 反证 park**：这是我认为整个测试文件里最有价值的一处 —— 只给 1 个 P，等待者若用原生 condition_variable 就会**占住唯一的 M**，兄弟取消者永远跑不起来、测试超时；**测试通过即证明走的是 park 路径**。同一手法在 `ContextRollback::rollback_done()` 上又用了一次；
+  - **场景六 `ContextRollback`**：它是「临时 child + undo 栈」的受限封装（`docs/context_rollback.md` 开篇即声明「不是数据库事务，也不是 longjmp」）；关键是 **`child.Done()` 与 `rollback_done()` 是两个不同信号** ——前者表示取消已线性化、后者表示补偿已跑完，只等前者会 **UAF**（文档「常见错误」列专门警告）。另有 commit/rollback 竞争、undo 异常不中断、savepoint 的 ABA 防护等不变量；
+  - **场景七 与 Error 的汇合**：完整链路 `WithTimeout → TimerService → 状态标记 → 发布 CanceledError/DeadlineExceededError 单例 → Done().Signal() → 各模块 Err() + Is() 判别 → 映射状态码/errno/枚举`，**横跨 context→timer→error→channel/io/sse 四个模块**，是本项目最核心的贯穿设计。
+- **测试评述**：`test_context.cpp`(462) 是**本项目最细致的并发测试**——两处 **32 轮竞争循环**（父取消 vs 显式 rollback、commit vs 父取消），在没有 TSan 的环境下用真实重复竞争提高覆盖概率。
+- **示例与文档评述**：`context_rollback_demo.cpp` 六个场景每个都有明确失败判据，并在场景五主动警告「业务必须检查 `had_failure`，不能只看 `rollback()` 返回值」。**`docs/context_rollback.md` 的六行表格额外给出「常见错误」一列**，这种「成功判据 + 常见错误」并列的写法对使用者非常友好，**已建议作为项目其他文档的范本**（写入文档第 10.3 节）。
+- **验证结果**：本批为**只读回溯 + 文档产出**，未改动任何源码或测试，未触发构建；在途 4 处文件 diff md5 与轮初一致（`94a798af…`）。
+- **台账状态**：新增 **X-32**、**T-16**；待办 **19 条**。
+- **下一步**：基础模块讲解线的候选 ——
+  - **`fiber` / `fiber_local` / `thread_policy`**（并发执行单元，`tests/concurrency/test_fiber.cpp` 439 行 + `test_fiber_local.cpp` 124 + `test_thread_policy.cpp` 94）；
+  - 或 **`config`**（INI + 原子快照 + 两阶段提交，其测试已在上一轮 config/logging 审查中读过大部分）；
+  - 或 **`sync`**（`Mutex`/`ConditionVariable`/`WaitGroup`，`tests/concurrency/test_sync.cpp` 969 行）；
+  按依赖顺序，`fiber` 是 `context` 之后最自然的下一步（`FiberLog`/`fiber_local` 都要先理解 Fiber 的执行模型）。
+
 ## 2026-10-12：用户质疑引发复核 —— X-30 判断过重，已修正定位
 
 - **用户质疑原文**：「这一块你觉得有必要重做吗，panic 和 recover 都是语言级别的东西，C++ 只能实现相似的」。
