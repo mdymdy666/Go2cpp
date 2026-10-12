@@ -11,6 +11,21 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：全 include 树重复头文件扫描 —— 发现并修复 X-26
+
+- **本轮性质**：原计划按行数顺序继续通读 include，但读 `tools/event.hpp` 时注意到它 `#include "go2cpp/sync.hpp"`（根路径），而 `include/` 下同时存在 `go2cpp/concurrency/sync.hpp`，两者**都有实质内容**。这促使本轮改为先做一次**全 include 树的同名头文件扫描**，以免在继续通读时误把过时副本当成真身。
+- **扫描方法**：按 basename 分组列出 `include/` 下全部 79 个头文件，对出现 ≥2 次的同名文件分别统计行数并 grep 其被包含次数，行数不同者列为待核对项。
+- **扫描结果：27 对同名文件，26 对正常，1 对异常**。
+  - **26 对正常**：全部遵循统一约定 —— **子目录持有真身、根目录是 4 行转发头**（`#pragma once` + 注释 + `#include "go2cpp/模块/文件.hpp"`）。转发头的被包含次数普遍高于真身（如 `context.hpp` 转发头 13 次 / 真身 2 次、`fiber.hpp` 转发头 16 次 / 真身 1 次），说明项目内部代码与测试都在用**根路径**，而模块内互引用用**子目录路径**。
+  - **1 对异常（X-26）**：`sync` 的方向**反了** —— 真身在**根目录** `include/go2cpp/sync.hpp`（219 行，被包含 9 次），而子目录 `include/go2cpp/concurrency/sync.hpp` **不是转发头**，是一份**少 16 行的过时副本**（203 行，被包含 **0** 次）。
+  - `diff` 显示副本缺少：`WaitBackend::ParkForCleanup` 虚函数（真身 `:37-46`，注释说明它「为条件变量重锁执行不可被 G 取消中断的 park」，`Scheduler` 后端会覆盖它）与 `Mutex` 的 `friend class ConditionVariable` / `LockForConditionWait()` / `LockImpl(context, ignore_task_cancellation)` （真身 `:111-115`）。
+- **风险论证**：因为全仓库**无人包含**该副本，当前**不存在** ODR 违规。但路径方向与全项目其余 26 对相反 —— `go2cpp/concurrency/sync.hpp` 看起来比 `go2cpp/sync.hpp` **更符合模块化惯例**，任何人（包括未来的我）按模块路径书写 include 都会拿到**过时的类定义**；一旦它与真身出现在同一程序内，就是 **ODR 违规**（ill-formed, no diagnostic required，编译器不会报错）。
+- **已修复**：把 `include/go2cpp/concurrency/sync.hpp` 替换为 4 行转发头（指向 `go2cpp/sync.hpp`），并在注释中写明「本文件此前携带过时副本，已改为转发，避免两处定义漂移」。**改动零影响**（该文件被包含 0 次）。
+- **验证结果**：`cmake --build build-quality --parallel` → **0 warning / 0 error**；`ctest --test-dir build-quality` → **26/26 通过**。
+- **附带的清扫结果（无需处理）**：另有 3 个**被包含 0 次的根目录转发头**（`sse.hpp` 3 行、`websocket.hpp` 3 行、`concurrency/scheduler.hpp` 4 行）。它们只是冗余、不构成风险，**未改动** —— 删除公共头文件可能影响外部使用者，不在本任务授权范围内。
+- **台账状态**：新增 **X-26**；待办 **5 条**（`D-14` 阻塞于用户文件；`X-23`~`X-26` 待定）。
+- **下一步**：回到 include 通读主线。已完成 2 个大文件（`channel.hpp` 2007、`future.hpp` 952）；本轮读了 `tools/event.hpp` 前 250 行，下轮继续 `event.hpp` 余下并用同一方法快速过其余文件。
+
 ## 2026-10-12：include 审计（future.hpp :560-952）—— future.hpp 全文读毕，扩充 X-25
 
 - **本轮读实现**：`include/go2cpp/concurrency/future.hpp` 的 `:560-952`，约 392 行，覆盖 `FutureState<T,true>` 余下、`MergeDeadline`/`DeadlineAfter`、`FutureResult<T>` 与其 `void` 特化、`Promise<T>` 全文、`Future<T>` 全文、`Promise::GetFuture` 与 `MakePromise`。**至此 `future.hpp` 952 行全部读完。**
