@@ -186,11 +186,13 @@ void run_log_config_tests() {
         watch_file << "[log]\nlevel=info\nstdout=false\nformat=%p:%m%n\n";
     }
     auto watcher_timeout = 1s;
+#if defined(GO2CPP_TEST_HAS_VALGRIND)
     if (RUNNING_ON_VALGRIND) {
         // 文件监视线程在 Memcheck 下会被显著放慢；放大 watchdog，
         // 但不改变配置热加载的轮询间隔和状态断言。
         watcher_timeout *= 120;
     }
+#endif
     GO2CPP_REQUIRE_EVENTUALLY(dynamic_logger->level() == log::Level::Info,
                               watcher_timeout);
     // 模拟编辑器的截断写入：半个配置不能覆盖旧快照，写完整后仍应继续生效。

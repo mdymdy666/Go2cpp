@@ -13,6 +13,33 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：tests 审查（config + logging）—— 发现并修复 T-15
+
+- **本轮读**：`tests/logging/test_log_config.cpp`(321)、`example/logging/log_config_demo.cpp`(80)。
+- **★ 新发现并已修复：T-15（中，编译期/移植性）**。`test_log_config.cpp:189` 的 `if (RUNNING_ON_VALGRIND)` **没有宏守卫**，而同族代码**七处全有**：`test_support.hpp:52`/`:60`、`test_io.cpp:27`/`:55`/`:377`/`:400`/`:428`、`test_hook.cpp:310` 都是 `#if defined(GO2CPP_TEST_HAS_VALGRIND)` 包裹。
+  - `RUNNING_ON_VALGRIND` 由 `<valgrind/valgrind.h>` 提供，而 `test_support.hpp:13-18` **只在 `__has_include(<valgrind/valgrind.h>)` 成立时**才包含该头并定义 `GO2CPP_TEST_HAS_VALGRIND`；
+  - **后果**：在未安装 valgrind 开发头文件的环境（常见于 CI 容器）中，该行因标识符未定义而**编译失败**，整套测试无法构建；
+  - **本环境掩盖了它**：`/usr/include/valgrind/valgrind.h` 与 `/usr/bin/valgrind` 都存在（本轮实测确认）；
+  - **已修复**：补上 `#if defined(GO2CPP_TEST_HAS_VALGRIND)` / `#endif` 守卫。**验证**：build-quality 构建 **0 warning / 0 error**，`ctest` **26/26 全部通过**。属提示词所列「测试/示例类改动」的即时修复例外。
+- **test_log_config.cpp 其余核对通过的要点**（该文件是本项目覆盖最扎实的测试之一）：
+  - `:23-26` 验证「**解析失败不得覆盖之前的完整快照**」（先解析合法 INI，再用 `[broken` 触发失败，然后断言旧值仍在）—— 这正是 `IniFile::Parse` 「重复调用会先清空旧节和旧键」注释的反面对照，即**失败时不破坏已有状态**；
+  - `:45-54` 用 **8 线程 × 250 条**并发写日志，断言 `callback_count == kThreads * kMessages` —— **精确相等，即不允许丢日志**；这是对 `LogItemWorker` 原子快照设计的有效压力验证；
+  - `:83-87` 验证**父链无环**：`root->SetParent(child)` 被拒绝后，日志仍只向 root 传播一次（`Snapshot().size() == 2`），注释点明「不会递归耗尽调用栈」；
+  - `:96-113` 覆盖自定义格式项的**四个契约**：`HasFormat` 前后状态、重复注册返回 false（注释：「同一 key 不允许静默覆盖，避免不同模块之间的格式协议互相污染」）、`%g` 与 `{g}` **两种语法**都生效、`RemoveFormat` 后状态清除；`:146-148` 还验证了「**注销后已构造的 formatter 仍可用**」（快照语义）；
+  - `:139-140` 验证**内置格式项不可被业务插件覆盖**（`addFormat("d", ...)` 返回 false）；
+  - `:194-225` 热加载测试**覆盖了三种编辑器行为**：截断写入（只写 `level=` 不生效）、编辑锁非空期间不读取、**清空锁文件是写入事务的提交点**（清空后配置才生效）；
+  - `:230-232` 用 **`static RuntimeConfig dynamic_runtime`** 并注明理由「registry 是进程级单例，绑定目标也必须覆盖它所持有的监听器生命周期」—— **这是正确的静态生命周期推理**；
+  - `:258-259` 与 `:272-275` **跨模块集成断言**：配置改动后直接检查 `core::TimerService::Default().DurationLimits()` 已同步，把「配置 → 运行时资源」这条链路也纳入测试；
+  - `:291-320` 两阶段提交验证：非法输入（`transaction_second=bad`）后两个字段**都**保持旧值，合法输入后 `commit_notifications == 1` 且监听器**看到的是完整新快照**（`saw_complete_snapshot`）。
+- **示例评述（`log_config_demo.cpp`）**：三个场景（注册自定义格式项、合法 INI 读取、非法节名不覆盖旧配置）划分合理，且 `:44-48` 主动处理了「示例目录不一定有 `go2cpp.ini`」并回退默认值（注释：「不能把『文件不存在』误当成日志系统崩溃」）。两处小瑕疵（**均未登记**，仅记录）：① `:49` 用 `static GO2CPP::Logger::ptr` **没有注释说明**为何需要 static（应是为避免退出期写入已析构的 manager）；② `:77` 的结语「配置 log.stdout=true 后才开启」有些误导 —— 示例 `:62` **只解析了**该 INI 并未应用它（`stdout=true` 一行在示例中不产生效果）。
+- **验证结果**：本批**改动了 `tests/logging/test_log_config.cpp`**（1 处 4 行），已通过 build-quality 构建（0 warning / 0 error）与 `ctest` 26/26 全绿。在途 4 处文件 diff md5 与轮初一致（`94a798af…`）。
+- **台账状态**：新增 **T-15（已修复）**；待办 **17 条**（其中 T-15 已了结，实际未结 16 条）。
+- **★ 主任务提醒（供后续轮次对齐）**：用户已于 2026-10-12 变更主任务 ——
+  1. `include/` **已全部读完**（33 个有内容文件 9,493 行 + 46 个转发头 160 行，完成度 100%），定时任务提示词里「include 待读约 6,500 行」的描述**已过时**；
+  2. **模块讲解任务只做 `Error` 一项，已交付 `docs/error_guide.md`(577 行)，到此收尾**；
+  3. **当前主任务是「按模块顺序查找 tests 与 example 的问题」**，产出为**台账登记项**而非讲解。**请后续轮次以本条为准。**
+- **下一步**：按模块顺序继续审查 —— `context`（`tests/concurrency/test_context.cpp` 462 行 + `example/concurrency/context_rollback_demo.cpp` 232 行），其后 `fiber`/`fiber_local`/`thread_policy` → `sync` → `scheduler` → `future`/`channel`/`event` → `timer` → `io`/`hook`/`fd_manager` → 网络层 → `go`/`runtime`。
+
 ## 2026-10-12：Error 模块场景化深度讲解（用户指定「只讲解 Error」）
 
 - **用户指示**：讲解**只做 `Error`**；要求把「配合使用的代码、实现的细节、测试」一并讲清，并**以多场景说明它在各处起什么作用**。因此本轮把 `docs/module_tour.md`（此前含模块 1/2）**`git mv` 为 `docs/error_guide.md` 并整体重写为 577 行的场景化深度讲解**。
