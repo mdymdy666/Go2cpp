@@ -11,6 +11,22 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 通读（8 个小文件，619 行）—— 新增 X-29，扩展 X-25
+
+- **本轮读实现**（均全文读毕）：`network/framing.hpp`(129)、`concurrency/core/hybrid_mutex.hpp`(114)、`network/hook.hpp`(102)、`network/byte_array.hpp`(94)、`network/endian.hpp`(80)、`concurrency/detail/context_backend.hpp`(44)、`runtime.hpp`(36)、`core/status.hpp`(20)。
+- **新发现：X-29（低，约束声明不对称）**。`Framer` 的 `m_buffer`/`m_frames`/`m_failed` 全部无锁读写，是有状态的单所有者解析器，但类注释（`framing.hpp:21`）**没写任何并发约束**。而项目内同类对象都写了：`sse.hpp:91-92` 明确「Parser 是有状态的单消费者对象…否则会产生数据竞争」，`byte_array.hpp:7` 明确「是单所有者对象，读写游标不能被多个线程同时修改」。**三者的声明不对称**。
+- **X-25 第二次扩充（现在共 5 处）**：新发现 `hybrid_mutex.hpp:63-82` 的 `HybridGate::lock()` 也标为 `noexcept`，却在自旋失败后调用 `m_slow.lock()`（`std::mutex::lock`，可抛 `std::system_error`）。同文件的 `unlock()` 只做 `m_fast.clear()`，无风险。**5 处 = future 侧 4 处 + hybrid_mutex 1 处**。
+- **本批核对通过的要点**：
+  - `framing.hpp:39-91` `try_feed` 是 `noexcept` 且**内部把三类异常全部转成 `FeedError`**（`length_error`→`FrameTooLarge`、`bad_alloc`→`ResourceExhausted`、其余→`ResourceExhausted`），`:110-115` 的 `fail()` 用 `std::string().swap(...)`/`std::vector<std::string>().swap(...)` **真正释放**缓冲与已解析帧（注释说明「避免调用方把部分处理结果误认为完整批次」）；三种模式的边界检查都到位（`:49`/`:54` 分隔符模式双向检查、`:71-72` 长度前缀同时查 `max_frame` 与 `SIZE_MAX-4` 溢出、`:60`/`:64`/`:75` 不足时返回 `None` 等待更多数据）；`:94-103` 的 `feed()` 把 `FeedError` 转回异常以兼容旧接口；
+  - `hybrid_mutex.hpp:63-82` 的慢路径设计正确：只有竞争者进入，`m_slow` 保证**同一时刻只有一个线程在等原子标志**（注释：「避免多个失败者同时忙等」），`:95-101` 用 `_mm_pause()`（x86）或 `yield()` 退避，`:88-93` 把 `fast_attempts == 0` 归一化为 1；`:106` 默认值用 `inline static std::atomic` 支持运行期调整（`:48-57`），且注释明确「不会修改已经构造的门」；
+  - `hook.hpp:23-30` 用一整段注释交代了 Hook 的**完整语义边界**（哪些路径走 epoll、哪些回退原生 poll、关闭 Hook 后已有元数据的处置、未知 fcntl/ioctl 命令返回 `ENOTSUP` 而不读未知参数）；`:96-102` 的三个 `extern "C"` 控制项写明了设计理由「使 preload/interposer 宿主无需依赖 C++ 名字修饰」，并声明 `manager` 必须由调用方拥有且存活 —— 这是**跨 ABI 边界**的正确交付方式；
+  - `context_backend.hpp:24-25` 把入口类型定为 `void (*)(Transfer) noexcept`，与 `fiber.cpp:727-733` 的 `entry(...) noexcept` 定义一致，**编译期强制**了「用户异常不得穿过上下文入口」这一契约；`:7-11` 说明 ABI 借鉴 coost 的 callee-saved 布局但「接口名称和数据类型属于 Go2Cpp，避免把第三方符号暴露到公共 ABI」——与 `context_x64.S:1-12` 的许可声明互相印证；
+  - `endian.hpp` 六个转换函数全部 `constexpr`，用 `__BYTE_ORDER__` 编译期分支，无运行期开销；`status.hpp` 的 `StatusCode` 注释说明「具体 API 仍会同时返回更详细的 ErrorPtr」，与各模块的实际返回类型一致。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建。
+- **累计进度（include 通读）**：已完成 **16 个文件全文**，合计 **4,960 / 9,850 行 ≈ 50%**。
+  - **下一步**：`scheduler.hpp`(662) → `timer.hpp`(344) → `config.hpp`(541) → `context.hpp`(408) → `log.hpp`(506) → `io.hpp`(314) → `go.hpp`(220) → `control_flow.hpp`(241) → `socket.hpp`(225) → `http.hpp`(246) → `websocket.hpp`(176) → `io_backend.hpp`(87) → `fd_manager.hpp`(69) → `parking_condition.hpp`(98) → `error.hpp`(250，用户在途文件，只读) → `context_backend.cpp` 对照 → 余下零散。
+- **台账状态**：新增 **X-29**；待办 **8 条**（`D-14` 阻塞；`X-23`~`X-29` 待定）。
+
 ## 2026-10-12：include 通读（sync / thread_policy / sse / address 全文）—— 新增 X-28
 
 - **本轮读实现**：`include/go2cpp/sync.hpp`(219，真身)、`include/go2cpp/concurrency/thread_policy.hpp`(153)、`include/go2cpp/network/sse.hpp`(205)、`include/go2cpp/network/address.hpp`(153)。四者**均全文读毕**，合计 730 行。
