@@ -814,8 +814,12 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
     }
 
     std::size_t PendingCount() const noexcept {
-        std::lock_guard<std::mutex> lock(mutex);
-        return actions.size() + pending_context_actions.size();
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            return actions.size() + pending_context_actions.size();
+        } catch (...) {
+            return 0U;
+        }
     }
 
     std::vector<std::exception_ptr> Failures() const {
@@ -824,8 +828,12 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
     }
 
     ErrorPtr ManualCause() const noexcept {
-        std::lock_guard<std::mutex> lock(mutex);
-        return manual_cause;
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            return manual_cause;
+        } catch (...) {
+            return {};
+        }
     }
 
     /// 函数功能：执行 Mark，完成本函数所属模块的单步操作。
@@ -887,17 +895,26 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
         if (!failure) {
             return;
         }
-        std::lock_guard<std::mutex> lock(mutex);
-        if (status == Status::kCommitted || status == Status::kRolledBack ||
-            status == Status::kFailed) {
-            return;
-        }
-        had_failure = true;
-        // first_failure 保持「只记第一个」的历史语义（failure() 依赖它），
-        // 另外单独累积全部失败，供 failures() 完整诊断。
-        failures.push_back(failure);
-        if (!first_failure) {
-            first_failure = std::move(failure);
+        // 本函数在 noexcept 路径上被调用（Execute 与取消回调），因此
+        // 加锁失败、容器扩容失败都不能向外抛 —— 它是最后一道记录手段，
+        // 宁可丢掉部分诊断信息，也不能让进程 terminate。
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (status == Status::kCommitted || status == Status::kRolledBack ||
+                status == Status::kFailed) {
+                return;
+            }
+            had_failure = true;
+            // first_failure 保持「只记第一个」的历史语义（failure() 依赖它）。
+            // 先写它：exception_ptr 赋值不会抛，这样即使随后的 failures
+            // 扩容失败，failure()/had_failure() 这一对仍然自洽。
+            if (!first_failure) {
+                first_failure = failure;
+            }
+            // 再累积全部失败，供 failures() 完整诊断；这一步可能抛。
+            failures.push_back(failure);
+        } catch (...) {
+            // 尽力而为：诊断记录失败不影响已经完成的状态转换。
         }
     }
 
@@ -1225,10 +1242,16 @@ bool ContextRollback::Savepoint::valid() const noexcept {
     if (!state) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(state->mutex);
-    return state->status == Status::kActive &&
-           state->generation == m_generation && m_depth <= state->actions.size() &&
-           (!state->rollback_on_cancel || !state->ContextCanceled());
+    try {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        return state->status == Status::kActive &&
+               state->generation == m_generation &&
+               m_depth <= state->actions.size() &&
+               (!state->rollback_on_cancel || !state->ContextCanceled());
+    } catch (...) {
+        // 查询型 noexcept 接口：拿不到锁时保守地报告「令牌无效」。
+        return false;
+    }
 }
 
 /// 函数功能：完成 Mark 调用，读取或更新相关运行时状态。
@@ -1409,8 +1432,14 @@ ContextRollback::Status ContextRollback::status() const noexcept {
     if (!m_state) {
         return Status::kRolledBack;
     }
-    std::lock_guard<std::mutex> lock(m_state->mutex);
-    return m_state->status;
+    // 本接口是 noexcept，且 active()/committed()/rolled_back()/status_name()
+    // 全部依赖它；加锁失败时必须给出确定答案而不是终止进程。
+    try {
+        std::lock_guard<std::mutex> lock(m_state->mutex);
+        return m_state->status;
+    } catch (...) {
+        return Status::kRolledBack;
+    }
 }
 
 /// 函数功能：完成 active 调用，读取或更新相关运行时状态。
@@ -1462,8 +1491,12 @@ bool ContextRollback::had_failure() const noexcept {
     if (!m_state) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(m_state->mutex);
-    return m_state->had_failure;
+    try {
+        std::lock_guard<std::mutex> lock(m_state->mutex);
+        return m_state->had_failure;
+    } catch (...) {
+        return false;
+    }
 }
 
 /// 函数功能：完成 failure 调用，读取或更新相关运行时状态。
@@ -1497,12 +1530,26 @@ ErrorPtr ContextRollback::rollback_cause() const noexcept {
     if (!m_state) {
         return {};
     }
-    // 显式 Rollback(cause) 记在事务状态上；自动回滚（父取消 /
-    // deadline 到期）没有显式原因，回退到 child Context 的 Err。
+    // 显式 Rollback(cause) 记在事务状态上。
     if (const auto manual = m_state->ManualCause()) {
         return manual;
     }
-    return m_context ? m_context->Err() : ErrorPtr{};
+    // 只有确实进入过回滚的事务才有「回滚原因」。已提交（或仍活动）的事务
+    // 即使 child Context 之后被取消，也不应把那次取消报告成本事务的回滚
+    // 原因 —— 否则 commit 之后父级取消会让本接口返回与本事务无关的错误。
+    const auto current = status();
+    if (current == Status::kCommitted || current == Status::kActive) {
+        return {};
+    }
+    // 自动回滚（父取消 / deadline 到期）没有显式原因，回退到 child Context 的 Err。
+    if (!m_context) {
+        return {};
+    }
+    try {
+        return m_context->Err();
+    } catch (...) {
+        return {};
+    }
 }
 
 const char* ContextRollback::StatusName(Status status) noexcept {
@@ -1517,8 +1564,11 @@ const char* ContextRollback::StatusName(Status status) noexcept {
         return "rolled_back";
     case Status::kFailed:
         return "failed";
+    default:
+        // 显式 default：越界的 Status（例如日志里打印反序列化结果）应给出
+        // 确定答案，而不是依赖「枚举值总是有效」这一假设。
+        return "unknown";
     }
-    return "unknown";
 }
 
 /// 函数功能：完成 RollbackDone 调用，读取或更新相关运行时状态。

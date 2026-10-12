@@ -82,6 +82,32 @@ scope.record_undo_with_cause([&](const go2cpp::ErrorPtr& cause) {
 > 因此取消之后调用 `record_undo` 多半命中「事务已结束」而不是「已被取消」；
 > 后者只在取消与登记恰好竞态时出现。
 
+### 审查与加固（同日）
+
+本批接口完成后做了一轮**自我审查**（不凭记忆，先把改动后的代码读回来），
+发现并修复 **8 处**问题：
+
+**本次新增代码引入的 5 处**：
+
+| 问题 | 严重度 | 修复 |
+| --- | --- | --- |
+| 补偿失败记录 `RecordFailure` 标 `noexcept`，内部却加锁并做容器扩容 —— 而它正是在「补偿失败」处理路径上被同样 `noexcept` 的 `Execute` 调用 | **中** | 整体 try/catch；并**先写 `first_failure` 再 `push_back`**，使扩容失败时 `had_failure()`/`failure()` 仍自洽 |
+| `rollback_cause()` 未区分事务是否真的回滚过：`commit()` 之后 child 再被取消会被**误报**为本事务的回滚原因 | **中** | 先看 `status()`，`kCommitted`/`kActive` 直接返回空 |
+| `PendingCount()` / `ManualCause()` 标 `noexcept` 但加锁 | 低 | try/catch 兜底 |
+| `StatusName()` 的 `switch` 缺 `default`，枚举越界是 UB | 低 | 补 `default:` |
+
+**审查中一并发现的既有 3 处**（非本批引入，属台账 **X-25** 同类）：
+
+`ContextRollback::status()`（**`active()`/`committed()`/`rolled_back()`/`status_name()` 全部转发到它**）、
+`ContextRollback::had_failure()`、`Savepoint::valid()` 都是 `noexcept` 却内部加锁。
+三处已按查询型接口的惯例兜底：**拿不到锁时返回保守答案**（`kRolledBack` / `false` / 令牌无效），
+而不是 terminate。**台账 X-25 因此由 7 处扩充到 10 处。**
+
+**测试同时由 8 组加强到 16 组**，新增内容包括：`commit()` 后取消不得污染
+`rollback_cause()` 的回归、移动赋值（被覆盖方**先回滚自身**）、小写别名等价性、
+部分补偿失败的聚合、状态族与 `status_name()` 一致性、**4 线程 × 32 次并发登记与观测**、
+以及「显式 `rollback()` 不带 cause」时原因回退到 `CanceledError` 的验证。
+
 ## 示例如何验证结果
 
 可运行的完整示例在

@@ -163,6 +163,139 @@ void check_rollback_enhancements() {
         GO2CPP_CHECK(moved.rollback());
         GO2CPP_REQUIRE(moved.rollback_done().WaitFor(1s));
     }
+
+    // 9) 【回归】commit 之后 child 再被取消，不得把该取消报告成本事务的回滚原因。
+    {
+        auto parent_pair = WithCancel(root);
+        Rollback scope(parent_pair.first);
+        GO2CPP_CHECK(scope.record_undo([] {}));
+        GO2CPP_CHECK(scope.commit());
+        GO2CPP_CHECK(scope.committed());
+        GO2CPP_CHECK(scope.rollback_cause() == nullptr);
+        parent_pair.second();                              // 提交之后才取消
+        GO2CPP_REQUIRE(scope.context()->Done().WaitFor(1s));
+        GO2CPP_CHECK(scope.rollback_cause() == nullptr);   // 仍必须为空
+        GO2CPP_CHECK(scope.committed());
+    }
+
+    // 10) 移动赋值：被覆盖的目标先回滚自身，源随后变为空对象。
+    {
+        Rollback destination(root, false);
+        int destination_undo = 0;
+        GO2CPP_CHECK(destination.record_undo([&] { ++destination_undo; }));
+        {
+            Rollback incoming(root, false);
+            int incoming_undo = 0;
+            GO2CPP_CHECK(incoming.record_undo([&] { ++incoming_undo; }));
+            destination = std::move(incoming);
+            GO2CPP_CHECK(incoming.pending_undo_count() == 0U);
+            GO2CPP_CHECK(destination.pending_undo_count() == 1U);
+            GO2CPP_CHECK(destination_undo == 1);   // 被覆盖时旧事务已回滚
+            GO2CPP_CHECK(destination.rollback());
+            GO2CPP_REQUIRE(destination.rollback_done().WaitFor(1s));
+            GO2CPP_CHECK(incoming_undo == 1);
+        }
+    }
+
+    // 11) 小写别名与控制路径等价：空动作、带原因动作都要走到同一条实现。
+    {
+        Rollback scope(root, false);
+        std::string reason;
+        GO2CPP_CHECK(!scope.record_undo_with_cause(Rollback::UndoActionWithCause{}, &reason));
+        GO2CPP_CHECK(reason.find("空") != std::string::npos);
+        reason.clear();
+        GO2CPP_CHECK(!scope.record_undo(Rollback::UndoAction{}, &reason));
+        GO2CPP_CHECK(reason.find("空") != std::string::npos);
+
+        ErrorPtr seen{NewError("sentinel")};
+        GO2CPP_CHECK(scope.record_undo_with_cause([&](const ErrorPtr& cause) { seen = cause; }));
+        GO2CPP_CHECK(scope.rollback(NewError("alias-check")));
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
+        GO2CPP_REQUIRE(seen != nullptr);
+        GO2CPP_CHECK(ErrorMessage(seen) == "alias-check");
+    }
+
+    // 12) 无失败时 failures() 为空，且与 had_failure() 一致。
+    {
+        Rollback scope(root, false);
+        GO2CPP_CHECK(scope.failures().empty());
+        GO2CPP_CHECK(!scope.had_failure());
+        GO2CPP_CHECK(scope.record_undo([] {}));
+        GO2CPP_CHECK(scope.rollback());
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
+        GO2CPP_CHECK(scope.failures().empty());
+        GO2CPP_CHECK(!scope.had_failure());
+        GO2CPP_CHECK(scope.rolled_back());
+        GO2CPP_CHECK(!scope.record_undo([] {}));   // 终态拒绝登记
+    }
+
+    // 13) 部分补偿失败：failures() 只收失败的那些，成功的不计入。
+    {
+        Rollback scope(root, false);
+        int ok_runs = 0;
+        GO2CPP_CHECK(scope.record_undo([&] { ++ok_runs; }));
+        GO2CPP_CHECK(scope.record_undo([] { throw std::runtime_error("boom"); }));
+        GO2CPP_CHECK(scope.record_undo([&] { ++ok_runs; }));
+        GO2CPP_CHECK(scope.rollback());
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
+        GO2CPP_CHECK(ok_runs == 2);
+        GO2CPP_CHECK(scope.failures().size() == 1U);
+        GO2CPP_CHECK(scope.had_failure());
+        GO2CPP_CHECK(scope.status() == Rollback::Status::kFailed);
+        // rolled_back() 对 kFailed 也返回 true：补偿已跑完，只是有失败。
+        GO2CPP_CHECK(scope.rolled_back());
+        GO2CPP_CHECK(!scope.committed());
+    }
+
+    // 14) 状态查询族与 status_name() 保持同一真相来源。
+    {
+        Rollback scope(root, false);
+        GO2CPP_CHECK(scope.active() && !scope.committed() && !scope.rolled_back());
+        GO2CPP_CHECK(std::string(scope.status_name()) == "active");
+        GO2CPP_CHECK(scope.record_undo([] {}));
+        GO2CPP_CHECK(scope.commit());
+        GO2CPP_CHECK(!scope.active() && scope.committed() && !scope.rolled_back());
+        GO2CPP_CHECK(std::string(scope.status_name()) == "committed");
+    }
+
+    // 15) 并发登记与观测：文档明确允许 record_undo 与观测接口并发调用。
+    {
+        Rollback scope(root, false);
+        constexpr int kThreads = 4;
+        constexpr int kPerThread = 32;
+        std::vector<std::thread> writers;
+        for (int i = 0; i < kThreads; ++i) {
+            writers.emplace_back([&scope] {
+                for (int j = 0; j < kPerThread; ++j) {
+                    (void)scope.pending_undo_count();   // 与登记并发观测
+                    GO2CPP_CHECK(scope.record_undo([] {}));
+                }
+            });
+        }
+        for (auto& writer : writers) {
+            GO2CPP_JOIN_WITH_WATCHDOG(writer, 3s);
+        }
+        GO2CPP_CHECK(scope.pending_undo_count() ==
+                     static_cast<std::size_t>(kThreads * kPerThread));
+        GO2CPP_CHECK(scope.rollback());
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
+        GO2CPP_CHECK(scope.pending_undo_count() == 0U);
+        GO2CPP_CHECK(scope.failures().empty());
+    }
+
+    // 16) 显式 rollback 无 cause 时：带原因动作收到空 cause，
+    //     rollback_cause() 回退到 child Context 的 Err（显式回滚会取消 child）。
+    {
+        Rollback scope(root, false);
+        bool cause_was_empty = false;
+        GO2CPP_CHECK(scope.RecordUndoWithCause(
+            [&](const ErrorPtr& cause) { cause_was_empty = (cause == nullptr); }));
+        GO2CPP_CHECK(scope.rollback());            // 不传 cause
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
+        GO2CPP_CHECK(cause_was_empty);
+        GO2CPP_REQUIRE(scope.rollback_cause() != nullptr);
+        GO2CPP_CHECK(Is(scope.rollback_cause(), CanceledError()));
+    }
 }
 
 }  // namespace

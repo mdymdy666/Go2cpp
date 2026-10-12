@@ -13,6 +13,72 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：ContextRollback 增强的自我审查 —— 修复 8 处问题，测试加强到 16 组
+
+- **用户指示**：「加强刚刚实现部分的测试，并且代码重新审查和修正，确保这部分内部不存在问题」。
+- **审查方法**：**不凭记忆**，先把改动后的代码读回来（`context.hpp` 新 API 段、
+  `context.cpp` 的 `State::Record/RecordWithCause/RecordImpl/PendingCount/Failures/
+  ManualCause/RecordFailure/Execute`），再逐项核对并发、异常、边界与语义。
+
+### 发现的 8 处问题（全部已修复）
+
+**本批新增代码引入的 5 处**：
+
+| # | 问题 | 严重度 | 修复 |
+|---|---|---|---|
+| **P1** | `RecordFailure` 标 `noexcept`，内部却**加锁**且 `failures.push_back` **可能抛**；而它正是在「补偿失败」路径上被同样 `noexcept` 的 `Execute` 调用 —— **在最不该崩的地方崩** | **中** | 整体 try/catch；并**调整顺序**为先写 `first_failure`（`exception_ptr` 赋值不抛）再 `push_back`，使扩容失败时 `had_failure()`/`failure()` 仍自洽 |
+| **P7** | `rollback_cause()` 未区分事务是否真的回滚过：`commit()` 之后 child 再被取消会**误报**成本事务的回滚原因 | **中** | 先取 `status()`；`kCommitted`/`kActive` 直接返回空 |
+| **P2** | `State::PendingCount()` 标 `noexcept` 但加锁 | 低 | try/catch，失败返回 0 |
+| **P3** | `State::ManualCause()` 标 `noexcept` 但加锁 | 低 | try/catch，失败返回空 |
+| **P4** | `StatusName()` 的 `switch` **无 `default`** → 枚举越界 UB，编译器可把 `return "unknown"` 视为不可达而优化掉 | 低 | 补 `default:` |
+
+**审查中一并发现的既有 3 处**（非本批引入，属台账 **X-25** 同类）：
+
+| # | 位置 | 说明 |
+|---|---|---|
+| **P8** | `ContextRollback::status()` | `noexcept` + 加锁；**且 `active()`/`committed()`/`rolled_back()`/`status_name()` 全部转发到它**，影响面最大 |
+| **P9** | `ContextRollback::had_failure()` | `noexcept` + 加锁 |
+| **P10** | `ContextRollback::Savepoint::valid()` | `noexcept` + 加锁 |
+
+三处均兜底为查询型接口的**保守答案**（`kRolledBack` / `false` / 令牌无效），不 terminate。
+**台账 X-25 由 7 处扩充到 10 处（第四次扩充）。**
+
+### 测试加强：8 组 → 16 组
+
+| # | 覆盖 |
+|---|---|
+| 9 | **【P7 回归】** commit 后 child 再取消，`rollback_cause()` 必须**始终为空** |
+| 10 | **移动赋值**：被覆盖方**先回滚自身**（核实过 `operator=` 在 `:1160` 调 `Rollback()`），源随后变空 |
+| 11 | 小写别名等价：`record_undo_with_cause` 与 `RecordUndoWithCause` 的空动作/带原因路径一致 |
+| 12 | 无失败时 `failures()` 为空且与 `had_failure()` 一致；终态拒绝再登记 |
+| 13 | **部分补偿失败**：3 个动作里 1 个抛 → `failures().size()==1`、两个成功的照常执行、`status()==kFailed` 且 `rolled_back()` 仍为真 |
+| 14 | 状态族（`active`/`committed`/`rolled_back`）与 `status_name()` 同一真相来源 |
+| 15 | **并发**：4 线程 × 32 次并发 `record_undo` + 并发 `pending_undo_count()`，终值必须精确等于 128 |
+| 16 | 显式 `rollback()` **不带 cause**：带原因动作收到空 cause，而 `rollback_cause()` 回退到 `CanceledError` |
+
+### 验证结果
+
+- 构建 **0 warning / 0 error**；
+- `ctest` → **26/26 全绿**；
+- `GO2CPP_TEST_FILTER=context` 单跑并**校验 announce 文本**，排除空跑；
+- context 模块**重复 5 次全通过**；**全量二进制重复 3 次全通过**；
+- `GO2CPP_TEST_FILTER=__nope__` 返回 **2**（T-08 回归确认有效）。
+
+### 一点反思（值得留档）
+
+**P1/P2/P3 是我自己刚写的代码，却踩了项目里已经登记过的 X-25 同一个坑**
+（`noexcept` 路径下加锁/分配）。这说明：**"知道一个模式有问题"不等于"写的时候不会犯"**——
+真正有效的防线是**在同一批改动内做一次针对该模式的专项检查**
+（本次正是靠"逐个 `noexcept` 函数看有没有锁或分配"这条尺子才发现的；
+审查时顺手量出既有 3 处 P8/P9/P10 也是同一把尺子）。
+
+### 规模与状态
+
+- `src/concurrency/context.cpp`：8 处修复；
+- `tests/concurrency/test_context.cpp`：624 → 757 行；
+- `docs/context_rollback.md`：新增「审查与加固」小节；
+- 台账 **X-25 → 10 处**；待办仍 **20 条**。
+
 ## 2026-10-12：增强 ContextRollback（用户下达的一次性完成任务）
 
 - **用户指示**：「现在着手完成这部分的工作，增强 ContextRollBack 的功能，一次对话内完成」。
