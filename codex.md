@@ -13,6 +13,37 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：模块讲解（基础模块 2 · control_flow）—— 新增 docs/control_flow_guide.md
+
+- **用户指示**：继续讲解「下一个基础模块」。Error 之后按依赖顺序的基础模块是 **`control_flow`**（`defer`/`panic`/`recover`），与 Error 同属 `tools/` 基础层。本轮按 `error_guide.md` 的同样标准产出 **`docs/control_flow_guide.md`（502 行，12 节）**。
+- **写作方法仍是「先扫描用量，再讲设计」**，扫描结果出现了一个**决定性事实**：
+  | 检查项 | 结果 |
+  |---|---|
+  | 包含 `control_flow.hpp` 的文件 | `example/tools/control_flow_demo.cpp`、`runtime.hpp`、`src/tools/control_flow.cpp`、`tests/tools/test_control_flow.cpp` |
+  | **`src/` 中 `defer` 的使用** | **0**（除自身实现） |
+  | **`src/` 中 `panic`/`recover` 的使用** | **0** |
+  | `tests/`+`example/` 中的使用 | `defer` 27、`panic` 13、`recover` 14 |
+  **结论：运行时自身完全不用这套 API，它是纯粹为使用者（转译代码/业务代码）准备的。**这与 Error 模块「运行时重度使用但只用了它一小部分能力」的形态**正好互补**，也决定了本文的叙述重心 —— 讲「它被设计成怎么用、使用者会遇到什么」，而不是「运行时的哪条热路径依赖它」。
+- **★ 本轮最重要的收获：为 X-30 补上了决定性证据，使其从「实现有隐患」升级为「契约违反」**。
+  - 头文件 `include/go2cpp/tools/control_flow.hpp:199-200` **明确承诺**：「take() 只有在活动的 defer 回调期间才会返回状态；**其他线程或 Fiber 不能越过恢复边界捕获 panic**」；
+  - 同文件 `:143` 声明 `panic` 是「**可随 Fiber 迁移**的显式 panic 状态」—— 这一点确实被满足（`shared_ptr<PanicState>` + 内部 `mutex`）；
+  - **即设计意图明确是「panic 状态可跨 Fiber 迁移，但恢复边界必须是 Fiber 局部的」**，而实现把边界做成了**线程局部**（`thread_local unsigned int s_defer_depth`）。**两者直接矛盾**：触发后违反的是**对外文档化契约**，不只是内部一致性；
+  - 据此已就地更新台账：X-30 的严重度写明为「**中（契约违反）**」并附上述文档出处。
+- **文档讲透的六个场景**：
+  - **场景一 `defer` 作为 RAII**：析构即执行点（`defer::~defer() { run_now(); }`），回调擦除进 `Callable`；**LIFO 顺序不需要实现——C++ 局部对象析构顺序天然逆序**；`run()` 是 `noexcept` 且内 try/catch，因为它在析构里被调用；类**删除复制与移动**，保证一次注册只执行一次；
+  - **场景二 参数注册时求值**：`MakeCallableWithArgs` 把函数与参数搬进 `std::tuple` 再 **move 进 lambda**，执行时 `std::move(args)` 移出 —— 安全性来自「一个 defer 最多执行一次」。**该语义与 Go 一致**（Go 的 `defer f(x)` 也是注册时求值），示例注释特意点明这一点；
+  - **场景三 显式边界**：`panic` 持 `shared_ptr`（拥有状态）、`recover` 持 **`weak_ptr`**（不延长寿命，故 `panic` 先析构时安静失效）；**与 Go 的三条关键差别**已列表对比 —— 尤其第三条：**panic 无人 recover 时程序不崩溃**，只是留下一个状态对象（第 4.3 节）；
+  - **场景四 panic 可跨 Fiber 迁移**：`PanicState` 被 `shared_ptr` 持有且所有字段访问都在 `mutex` 下，故跨线程/跨 Fiber 安全；测试用真实 `std::thread` 验证了跨线程 `active()` 的可见性；
+  - **场景五 恢复边界（X-30 的舞台）**：完整给出 `InDeferCallback()` 的三行实现与四步泄漏时序；
+  - **场景六 defer 异常记录**：为何不能传播（`~defer()` 是 `noexcept`，栈展开中抛出即 terminate），以及 `LastDeferException()`/`ClearDeferException()` 的用法；
+- **另有一处设计分寸值得记**：`PanicState` 的五个读取/操作入口对边界检查的态度**不同**——`take()` 与 `operator()()` **检查**（消费型操作必须守住边界），而 `peek()`/`active()`/`clear()` **不检查**（只读或由持有者主动重置）。这不是遗漏而是有意的分级，已整理成表写入文档第 8 节。
+- **测试与示例评述**：`test_control_flow.cpp` 覆盖了 11 条关键断言（含**栈展开路径**下 defer 仍执行、`run_now()` 幂等、`dismiss()` 取消）；盲点即前述 T-12/T-13/T-14。示例的三个场景划分合理，注释主动解释设计意图；**一个运行副作用**：它写日志到 `log/control_flow_demo.log`，与「`log/` 基线 md5 保持一致」的审计约束冲突，故本流程只做静态审读。
+- **验证结果**：本批为**只读回溯 + 文档产出**，未改动任何源码或测试，未触发构建；在途 4 处文件 diff md5 与轮初一致（`94a798af…`）。
+- **台账状态**：本轮无新增条目（X-30 就地强化）；待办 **17 条**。
+- **下一步（供后续轮次对齐）**：
+  - **讲解线**：下一个基础模块候选 —— `config`（INI 解析 + `ConfigVar` 原子快照 + 两阶段提交事务）或 `context`（取消树 + 截止时间 + 值传递）。按依赖，`config` 只依赖 `log` 与 `scheduler` 的转发头，而 `context` 是并发层的地基，两者都可作为「基础模块 3」；
+  - **测试审查线**：`tests/concurrency/test_context.cpp`(462) + `example/concurrency/context_rollback_demo.cpp`(232) 尚未审读。
+
 ## 2026-10-12：tests 审查（config + logging）—— 发现并修复 T-15
 
 - **本轮读**：`tests/logging/test_log_config.cpp`(321)、`example/logging/log_config_demo.cpp`(80)。
