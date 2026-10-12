@@ -11,6 +11,24 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 审计（future.hpp :1-560）—— 新增 X-25
+
+- **本轮读实现**：`include/go2cpp/concurrency/future.hpp` 的 `:1-560`，约 560 行，覆盖 `FutureWaitBackend` 协议、`FutureCallbackGuard`、三个后端工厂声明、`FutureStatus`、`FutureError`、`BrokenPromiseError`、`FutureStateKind`/`FutureWaitRegistration`、`FutureState<T,false>` 全文、`FutureState<T,true>`（void 特化）至 `StatusLocked` 中段。
+- **新发现：X-25（低，noexcept 保护不一致）**。`FutureState` 的两个特化的 `Status()`（`:307-322`、`:507-522`）都是 `noexcept`，却在函数体第一行构造 `std::lock_guard<std::mutex>`。`std::mutex::lock()` 失败时会抛 `std::system_error`，穿过 `noexcept` 就是 `std::terminate`。
+  - **对照证据**：同一项目在 `src/network/sse.cpp:548-589` 对 `state()`/`heartbeat_due()`/`next_heartbeat()` 三个 `noexcept` 查询接口**全部用 try/catch 包住加锁**，并写明了理由（「不能让 C++ 异常穿过 noexcept 导致进程 terminate」）。**即项目已确立该策略，此处是遗漏**。
+  - **边界说明**：触发条件是 mutex 加锁失败，属极罕见路径，故严重度为低；且同类的 `Value()`/`ErrorValue()`/`ExceptionValue()` **未标 `noexcept`**，不受影响 —— 只有 `Status()` 两处需要处理。
+- **本段核对通过的要点**：
+  - `:253-305`（非 void）与 `:460-505`（void）的 `Wait` 设计严谨：`:261-262` **先注册 Context 回调、再取状态锁**，注释说明「若取消已经发生，AddCallback 会同步执行回调；此时尚未持有状态锁，不会发生自锁」；回调内 `:272-276` 又**先取 `state->m_mutex` 再置 `registration->cancelled`**，注释说明「保证取消不会落在发布窗口之前」—— 这把「回调注册」与「等待发布」两个窗口都堵住了；
+  - `:189-202` `SetValue` **在持锁之前就完成值构造**（`auto stored = std::make_shared<const T>(std::move(value));`），注释明确「避免用户类型的构造函数阻塞其他等待者」；四个终结函数（`SetValue`/`SetError`/`SetException`/`Cancel`）都遵循「锁内改状态 → 锁外 `NotifyAll`」；
+  - `:340-381` `StatusLocked` 的优先级链完整且有据：先看 `m_kind` 终态 → 再看 `registration_cancelled`/`context->IsDone()`（并区分 `DeadlineExceeded` 与 `Cancelled`）→ `:364-370` **Context 的截止时间优先于本次等待的本地 deadline**（注释：「定时器线程可能尚未来得及把 done 标志发布到回调观察者」）→ 本地 deadline → `ParkingCondition::CancellationRequested()`（注释：「不能继续假装阻塞；调用者可再次等待」）；
+  - `:172-176` `FutureWaitRegistration` 的注释点出了一个关键设计约束：「每个 Future 等待者有独立的取消标记。不能把标记放在共享状态中，否则一个调用者的超时会误唤醒并影响其他等待者」—— 这正是多等待者共享同一 `FutureState` 时的正确做法；
+  - `:22-49` `FutureWaitBackend` 的契约声明完整：明确要求实现「必须允许虚假唤醒并重复检查」，且 `Wait` 的注释规定「lock 调用时必须已加锁，返回时保持加锁」；`:98-100` 说明工厂「只影响注册成功后创建的共享状态；已存在的 Future 不迁移后端」，与 `src/concurrency/future.cpp:79-129` 的实现一致。
+- **一处未登记的观察**：`FutureState<T,false>`（`:181-389`）与 `FutureState<T,true>`（`:391-532`）有约 140 行**几乎逐行相同**（`SetError`/`SetException`/`Cancel`/`Wait`/`Status`/`StatusLocked`/`ErrorValue`/`ExceptionValue`）。这使 X-25 的修复必须**同时改两处**。**不登记为条目**：模板对 `T` 与 `void` 的双特化是 C++ 常规取舍，提取公共基类会增加间接层；但它是「同族代码需同步修改」的典型，修 X-25 时务必两处都改。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建。
+- **累计进度（include 审计）**：`future.hpp` 已读 560 / 952 行（59%）；`include/` 整体约 **2,567 / 9,850 行 ≈ 26%**。
+- **台账状态**：新增 **X-25**；待办 **4 条**（`D-14` 阻塞于用户文件、`X-23`/`X-24`/`X-25` 为待定的改进项）。
+- **下一步**：读完 `future.hpp :560-952`。
+
 ## 2026-10-12：include 审计（channel.hpp :1600-2007）—— channel.hpp 全文读毕，新增 X-24
 
 - **本轮读实现**：`include/go2cpp/concurrency/channel.hpp` 的 `:1600-2007`，约 407 行，覆盖 `RecvChecked`/`SendChecked` 声明与定义、`SendOnlyChannel`/`RecvOnlyChannel` 全文、`SelectCase`/`SelectResult` 定义、`RecvCase`/`SendCase`/`DefaultCase` 与 `Select` 的重载声明。**至此 `channel.hpp` 2,007 行全部读完。**
