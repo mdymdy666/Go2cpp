@@ -13,6 +13,37 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：Fiber 收尾（100% 读完）+ Scheduler 骨架提取与阅读计划
+
+- **用户指示**：「不要留白，给我继续读，还有 Scheduler 的也要同步完成」。
+- **★ `fiber.cpp` 现已 100% 逐行读完（1502/1502 行，无留白）**。本轮补读 `:261-545`（`FiberStack` 全文）、**:720-820（此前遗漏的析构尾部与 `entry()`）**、`:1000-1147`（父链传播余下）、`:1148-1502`（`Fiber` 公开方法）。文档 `docs/fiber_guide.md` 追加 **11.5/11.6/11.7** 三节（现约 830 行）。
+- **本轮新读出的关键机制**：
+  - **`entry()`（`:727-775`）**：入口**先查 `cancellation_requested`**（启动前已取消则用户函数根本不执行）；异常只隔离用户代码的（注释：「Fiber 挂起、取消和清理流程**从不使用异常**」）；**`fiber_local::detail::Cleanup` 在主栈展开后、交还控制权之前**（「Fiber-local 值属于**逻辑 G**，而不是 worker M」）；结尾 `std::terminate()` 防御；
+  - **`resume()` vs `resume_from_scheduler()`（`:785-824`）**：后者**只绑一次父级**（`m_scheduler_parent_bound` 缓存）且传 `scheduler_fast=true` —— **跳过 `last_thread` 更新**（调度器已通过 Task 的 execution claim 串行化，并在迁移时显式发布绑定），配合 `m_last_resume_thread_hash` 用哈希比较避免加锁；
+  - **★ `RecycleForScheduler` 的五个回收条件（`:1170-1196`）** —— 其中第 ④ 条 **`m_impl->m_record.use_count() != 1` 是全项目最精细的一处引用计数运用**：`FiberRecord` 是 `shared_ptr`，而**嵌套子 Fiber 会持有父的 record**；若父被回收复用而某个子仍持有旧 record 引用，子之后恢复时会「观察到被复用的父对象」。注释原文：「只要仍有外部持有者，就不能把这个 Fiber 的父记录替换成下一项任务」。**这条正是 T-17 要补测的核心不变量**；
+  - **`FiberStack` 的两级栈缓存（`:342-405`）**：线程本地池上限 **8**（无锁）、全局池上限 **128**（`s_stack_pool_mutex`）、都满则 `munmap`。native 栈布局为 `[guard page (PROT_NONE)][可用栈区]`，**最低一页不可访问**，栈向下溢出时立刻 `SIGSEGV`；
+  - **Valgrind 栈注册（`:279-284`）**：因为**自定义汇编切换栈时 Memcheck 不知道边界**，必须 `VALGRIND_STACK_REGISTER(bottom(), stack_pointer())`；注释同时说明零成本（客户端宏在非 Memcheck 环境被消除）；
+  - **`context_snapshot()` 的墓碑实现（`:1422-1460`）**：用 **`shared_ptr` 逐级拷贝保活**父记录（所以父 Fiber 对象销毁后仍可查询），收集后 `std::reverse` 成「根 → 当前」；`main_frame.active = false` 的理由是「main_fiber 只是根帧，**不应与链中当前/目标 Fiber 同时标记 active**」；
+  - **`CancellationRequested()`（`:1274-1288`）沿父链向上查**，所以**子 Fiber 能感知父级取消**，与只置自身标记的 `RequestCancellation()` 配对。
+- **Fiber 精读总结（写入文档 11.7）**：这份实现的「硬」体现在四层 —— ① 上下文层（自研汇编 + 三级工具链 + 零成本抽象）；② 栈管理层（页对齐/guard page/两级受限缓存/构造期拒绝溢出）；③ TLS 层（errno 双向保存 + `NOINLINE` 防地址缓存 —— 跨线程迁移最隐蔽的陷阱）；④ 生命周期层（claim 作闸门、record 引用计数作复用条件、墓碑用 shared_ptr 保活、放弃路径宁可标 `Failed` 也不伪造 `Completed`）。**唯一明确问题是 X-13；其余各处都体现「宁可 fail-fast 也不静默降级」的一致取向**（`std::terminate()` 只出现在四个明确的契约违反点）。
+- **Scheduler 骨架已提取**（为下一阶段的通读做准备）：
+  - 顶层类型 4 个：`TaskCancellationGate`(`:85`)、**`Scheduler::Impl`(`:997`，核心)**、`Scheduler::Lifetime`(`:1840`)、`Scheduler::TimerExecutorAdapter`(`:1846`)；
+  - `Task` 方法 **30+ 个**（`:126-830`），其中 `Task::run()`(`:830`) 是 G 的执行入口；
+  - `Scheduler` 方法 **40+ 个**（`:1907-3494`），关键节点：`start`(`:1907`)、`shutdown`(`:2161`)、`enqueue`(`:2287`)、**`wake` 一族（`wake`/`wake_registered`/`wake_io`/`wake_or_cancel`，`:2835-3136`，正是 X-10 的主题）**、`worker_loop`(`:3494`，M 主循环)；
+  - 原语统计：`std::mutex` **92** 次、`atomic<` **38** 次、`wake` **61**、`park` **33**、`sysmon` **59**、`steal` 5；
+  - **骨架里已浮现的硬约束注释**（下一阶段要逐一核实的）：`:584`「锁内完成状态转换和 permit 发布，确保 wake 要么被 park 消耗」；`:901`「只能沿同一逻辑 G 的父链恢复，即使 G 迁移到另一个 M 也不会丢失」；`:2347-2348`「首次注册分配失败时**绝不能**继续发布队列节点，否则任务第一次 park 后可能只剩调用方的裸句柄」；`:2477`「已启动 Fiber 不能在分配失败时丢失。救援队列复用」；`:2614`「计数必须先于节点发布，否则另一个 worker 可能先 pop 节点」；`:3872-3874`「BlockingRegion 不能跨 Fiber yield/park 或 G 的任务边界…**宁可在边界处 fail-fast**」；`:3970`「替代 M 在原 M 返回前必须保留」。
+- **验证结果**：本批为**只读回溯 + 文档产出**，未改动任何源码或测试，未触发构建；在途 4 处文件 diff md5 与轮初一致。
+- **台账状态**：本轮**无新增条目**；待办仍为 **21 条**。
+- **下一步（Scheduler 通读计划，分段推进）**：
+  1. `:1-500`（`Task` 的状态机：queued/wake/park/register/cancel 一族）；
+  2. `:500-1000`（`Task::run()` + `Scheduler::Impl` 开头）；
+  3. `:1000-1500`（`Impl` 的队列、steal、sysmon 记账）；
+  4. `:1500-1907`（`Impl` 余下 + `Lifetime`/`TimerExecutorAdapter`）；
+  5. `:1907-2600`（`start`/`shutdown`/`spawn`/`enqueue`/`requeue_from_worker`）；
+  6. `:2600-3200`（yield/park 一族 + **`wake` 一族，X-10 的核心**）；
+  7. `:3200-4048`（blocking/sysmon/metrics/`worker_loop`/`BlockingRegion`）。
+  另需并行读 `tests/concurrency/test_scheduler.cpp`(542)、`test_dynamic_scheduler.cpp`(549)、`scheduler_smoke.cpp`(418)、`high_load_stress.cpp`(942)、`test_beginner_api.cpp`(162)、`test_event_go.cpp`(202)。
+
 ## 2026-10-12：Fiber 专题筹备 —— 重读 `fiber.cpp` 并补充机制章节
 
 - **用户指示**：「Fiber 模块是个重磅硬骨头，你提前再筹备一下」。本轮**不产出新条目**，而是对 `src/concurrency/fiber.cpp`(1502) 做系统性重读，并在 `docs/fiber_guide.md` 追加 **11.5 实现机制补充**（文档由 471 行增至 **679 行**）。

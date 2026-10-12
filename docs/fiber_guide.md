@@ -638,6 +638,188 @@ fiber_local::detail::Cleanup(m_owner);
 
 ---
 
+### 11.6 实现机制补充（二）：`fiber.cpp` 现已 **100% 逐行读完**
+
+> 本轮补读 `:261-545`（`FiberStack` 全文）、`:720-820`（此前遗漏的析构尾部与 `entry()`）、
+> `:1000-1147`（父链传播余下）、`:1148-1502`（`Fiber` 公开方法）。**至此 `fiber.cpp` 1502 行无留白。**
+
+#### `entry()`：G 的执行入口（`:727-775`）
+
+```cpp
+static void entry(Transfer transfer) noexcept {
+    auto* const self = static_cast<Impl*>(const_cast<void*>(transfer.data));
+    self->finish_switch_to_fiber();
+    self->m_caller = transfer.context;
+    store_errno(self->m_saved_errno);
+
+    FiberState terminal_state = FiberState::Completed;
+    try {
+        if (!self->m_record->cancellation_requested.load(...) &&
+            self->m_function) {
+            self->m_function();
+        }
+    } catch (...) {
+        // 这里只隔离用户代码意外抛出的异常。Fiber 挂起、取消和清理流程
+        // 从不使用异常。
+        ...
+        terminal_state = FiberState::Failed;
+    }
+    self->m_function = {};
+    // Fiber-local 值属于逻辑 G，而不是 worker M。主体栈展开后、把控制权
+    // 交回调用者前，执行这些值的析构函数。
+    fiber_local::detail::Cleanup(self->m_owner);
+    self->m_record->reason.store(SuspendReason::None, ...);
+    self->m_record->state.store(terminal_state, ...);
+    self->m_saved_errno = load_errno();
+    ... ASan / TSan 收尾 ...
+    JumpContext(self->m_caller, self);
+    std::terminate();      // ← 防御性：跳回 caller 后永不返回
+}
+```
+
+**四个值得记的点**：
+
+1. **入口先查 `cancellation_requested`** —— 若 Fiber 在启动前就被取消，
+   **用户函数根本不会执行**（而不是"执行了再取消"）；
+2. **异常只隔离用户代码的** —— 注释明确「Fiber 挂起、取消和清理流程**从不使用异常**」；
+3. **`fiber_local::detail::Cleanup` 的位置**：在**主体栈展开之后、交还控制权之前** ——
+   注释解释「Fiber-local 值属于**逻辑 G**，而不是 worker M」；
+4. **结尾 `std::terminate()`** —— 因为 jump 之后确实不该回来。
+
+#### `resume()` 与 `resume_from_scheduler()` 的分工（`:785-824`）
+
+| | `resume()` | `resume_from_scheduler()` |
+|---|---|---|
+| claim 获取 | CAS `m_resume_claim`，失败即返回 false | 同 |
+| 父级验证 | **每次**调 `resume_locked(true)` → `bind_caller` | **只绑一次**（`m_scheduler_parent_bound` 缓存） |
+| 内部调用 | `resume_locked(false/true)` | `resume_locked(false, **scheduler_fast=true**)` |
+| `last_thread` 更新 | 是 | **跳过**（`:927` 的分支） |
+
+**`scheduler_fast=true` 的意义**：调度器已通过 `Task` 的 execution claim 串行化恢复，
+并在迁移到新 M 时显式发布执行绑定，所以**恢复热路径不再重复更新 `FiberRecord::last_thread`**。
+配合 `m_last_resume_thread_hash`（`:930-935`）用哈希比较避免每次加锁。
+
+#### ★ `RecycleForScheduler` 的五个回收条件（`:1170-1196`）
+
+```cpp
+if (capacity == 0 ||
+    (state != FiberState::Completed && state != FiberState::Failed) ||
+    s_current_fiber == fiber.get() ||
+    // 嵌套 Fiber 的子记录会持有 parent shared_ptr。只要仍有外部
+    // 持有者，就不能把这个 Fiber 的父记录替换成下一项任务，避免
+    // 子 Fiber 之后恢复时观察到被复用的父对象。
+    !fiber->m_impl || fiber->m_impl->m_record.use_count() != 1) {
+    return;      // ← 静默丢弃（由 unique_ptr 正常销毁，FiberStack 仍回收到栈缓存）
+}
+```
+
+**第 ④ 条 `m_record.use_count() != 1` 是全项目最精细的一处引用计数运用**：
+`FiberRecord` 是 `shared_ptr`，而**嵌套子 Fiber 会持有父的 record**。
+若父 Fiber 被回收复用、而某个子仍持有旧 record 的引用，
+子之后恢复时就会"观察到被复用的父对象"——**语义错乱**。
+所以：**只有 record 的引用计数恰好为 1（即没有任何子持有它）才允许复用。**
+
+**这条约束解释了 T-17 为什么值得补测**：它正是"调度器侧回收路径"的核心不变量。
+
+#### `FiberStack` 的两级栈缓存（`:342-405`）
+
+| 层级 | 名称 | 上限 | 同步 |
+|---|---|---|---|
+| 线程本地 | `s_thread_stack_pool` | **8** | 无锁（`thread_local`） |
+| 全局 | `s_stack_pool` | **128** | `s_stack_pool_mutex` |
+| 溢出 | — | — | `munmap` / `deallocate` |
+
+`acquire` 的查找顺序是**先线程本地、再全局**，都未命中才真正 `mmap`。
+`release` 时若两级都满则直接还给系统。**注释（`:504`）说明定位**：
+「缓存只用于性能优化；容量不足或分配失败时回收到系统」。
+
+**native 路径的栈布局**（`:311-324`）：
+
+```
+m_mapping ──► [ guard page (PROT_NONE) ][ 可用栈区 ]
+                ▲ m_page_size           ▲ m_requested_size
+                bottom()                stack_pointer()
+```
+
+`mprotect(mapping, page, PROT_NONE)` 把**最低一页**设为不可访问，
+栈向下溢出时立刻 `SIGSEGV` 而不是静默破坏相邻内存。
+
+#### Valgrind 的栈注册（`:279-284`）
+
+```cpp
+#if defined(GO2CPP_FIBER_HAVE_VALGRIND)
+    // 自定义 context 汇编不会自动告诉 Memcheck 新栈边界。注册只在
+    // Memcheck 运行时生效，普通构建会被 Valgrind 客户端宏消除，
+    // 不改变 Fiber 的热路径和栈布局。
+    m_valgrind_stack_id = VALGRIND_STACK_REGISTER(bottom(), stack_pointer());
+#endif
+```
+
+**为什么需要**：项目用的是**自己的汇编**切换栈，Memcheck 完全不知道栈边界变了 ——
+若不注册，它会按"线程原栈"来判定地址合法性，产生大量误报。
+**注释同时说明了零成本**：Valgrind 客户端宏在非 Memcheck 环境下会被消除。
+
+#### `context_snapshot()`：墓碑帧是怎么拼出来的（`:1422-1460`）
+
+```cpp
+std::shared_ptr<FiberRecord> cursor = m_impl->m_record;
+while (cursor != nullptr) {
+    FiberContextFrame frame;
+    std::shared_ptr<FiberRecord> parent;
+    {
+        std::lock_guard<std::mutex> lock(cursor->mutex);
+        ... 填 frame ...
+        parent = cursor->parent;      // ← 取出父记录（shared_ptr 拷贝，保活）
+    }
+    result.push_back(std::move(frame));
+    cursor = std::move(parent);
+}
+std::reverse(result.begin(), result.end());        // ← 反转成「根 → 当前」
+auto main_frame = main_context_frame(root_binding);
+main_frame.active = false;                          // ← main 帧不标 active
+result.insert(result.begin(), std::move(main_frame));
+```
+
+**两个要点**：
+
+1. **用 `shared_ptr` 拷贝逐级上传** —— 所以**父 Fiber 对象已销毁也不影响**，
+   这正是"墓碑帧"的实现方式（`FiberRecord` 的注释：`fiber.cpp:516-519`：
+   「父链只保存这份独立元数据，**不保存父 Fiber 栈或 owner 的所有权**。
+   子 Fiber 持有父记录，因此父对象结束后仍可生成一致的墓碑帧」）；
+2. **`main_frame.active = false`** 有明确理由（注释）：
+   「这是从 main_fiber 进入目标 Fiber 后的调用链快照；main_fiber 只是根帧，
+   **不应与链中当前/目标 Fiber 同时标记 active**」。
+
+#### `CancellationRequested()` 沿父链向上查（`:1274-1288`）
+
+```cpp
+while (record != nullptr) {
+    if (record->cancellation_requested.load(std::memory_order_acquire)) return true;
+    std::lock_guard<std::mutex> lock(record->mutex);
+    record = record->parent;
+}
+```
+
+**子 Fiber 能感知父级取消** —— 与 `RequestCancellation()`（只置自己的标记）配对。
+
+### 11.7 `fiber.cpp` 的精读结论
+
+**这份实现的"硬"体现在四个层面**：
+
+1. **上下文层**：自研汇编 + 三级工具链集成（ASan 官方 Fiber 协议 / TSan / Valgrind），
+   且**零成本抽象**（客户端宏消除、哈希比较避免加锁）；
+2. **栈管理层**：页对齐 + guard page + 两级容量受限缓存 + **构造期拒绝溢出**；
+3. **TLS 层**：`errno` 的双向保存/恢复 + `NOINLINE` 防止 `__errno_location()` 被缓存
+   —— **这是跨线程迁移最隐蔽的正确性陷阱**；
+4. **生命周期层**：`m_resume_claim` 作为闸门、`FiberRecord` 引用计数作为复用条件、
+   墓碑帧用 `shared_ptr` 保活、放弃路径**宁可标 `Failed` 也不伪造 `Completed``。
+
+**唯一明确的问题是 X-13**（两处无界等待 + 文档低估强度），
+其余各处都体现出**"宁可 fail-fast 也不静默降级"**的一致取向
+（`std::terminate()` 出现在四个明确的契约违反点）。
+
+---
+
 ## 12. 本模块发现的问题
 
 | 编号 | 严重度 | 摘要 |
