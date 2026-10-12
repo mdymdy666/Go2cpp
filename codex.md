@@ -11,6 +11,34 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 通读（io.hpp 314 + go.hpp 220 全文）—— 含一次**核实后撤回**的条目
+
+- **本轮读实现**：`include/go2cpp/network/io.hpp`(314) 与 `include/go2cpp/tools/go.hpp`(220)，**均全文读毕**。
+- **重要：一次「拟登记 → 核实 → 撤回」的过程（如实记录）**。
+  - 读 `go.hpp:208-210` 时看到 `fiber::state()` 在 `m_task` 为空时返回 `GState::kCancelled`，我据此**准备登记**一条「三处 API 对『无任务』各有不同占位值」的条目，并凭记忆写下了另两处（`scheduler.hpp` 的 `current_task()` 返回 `kDead`、`current_task_state()` 返回 `kNew`）。
+  - **落笔前先核实**，结果是**我的记忆错了**：
+    - `scheduler.hpp:607` `current_task()` 的返回类型是 `std::shared_ptr<Task>`，**不是 `GState`**；
+    - **根本不存在** `current_task_state()` 这个函数（`grep` 全文件无匹配）；
+    - 全仓库 `grep -rn "return GState::kDead\|return GState::kNew\|return GState::kCancelled"`（`src/` + `include/`）**零匹配** —— 即除 `go.hpp:209` 外没有任何此类占位返回；
+    - `scheduler.hpp` 中只有 `Task::state()`(`:269`) 返回 `GState`。
+  - **结论：X-30 不成立，已撤回，不写入台账。** `go.hpp:209` 的 `kCancelled` 分支**本身也不可达**：`fiber` 的构造函数（`:165-166`）总是 `make_shared<Task>`，且该类**删除了复制与移动**（`:168-171`），因此 `m_task` 恒非空。
+  - **这条记录的价值**：它演示了本项目「以源码为唯一裁决、不凭印象登记」的规范在起作用 —— 若按记忆登记，台账里就会多出一条**指向不存在函数**的错误条目，后续修复者会被误导。**撤回一条错误条目与新增一条正确条目同样是产出。**
+- **io.hpp 核对通过的要点**：
+  - `:21-22` 与 `:52-54` 两处约束写得非常明确：`DescriptorToken` 是「非阻塞系统调用前捕获的代际句柄…数字 fd 被复用时不会重新激活旧句柄」；`DescriptorGuard`「**绝不能跨 park 或阻塞系统调用持有它**」，并逐条列出两个持有者（Hook 在失效标记与 close/dup2 期间、IOManager 在验证 token 并发布 epoll interest 期间）；
+  - `:137-141` 把 `wait_many` 的语义边界讲清了：「**它不是『等待所有请求都完成』的屏障**；需要屏障时应使用多个任务或 `WaitGroup`」，并约束「同一集合内不得重复提交相同 fd/方向；补采样只完成该 fd/方向等待队列的**队头节点**，以保持多个 Fiber 之间的 FIFO」—— 这与 `src/network/io.cpp` 的补采样实现一致；
+  - `:154-165` `IOManager` 的依赖段完整，其中「`Wait` 只允许在当前 IOManager 管理的 G 中调用，**普通线程应使用系统 poll/select**」与 `:224-225` `wait_any` 的「仅允许 managed Fiber 调用，普通线程返回 `kError`/`EPERM`」互相印证；而 `:169` 说「普通线程也可通过 **wait 接口**安全使用」—— 指的正是单 fd 的 `wait`，**并不矛盾**；
+  - `:282-285` `NotifyCloseAll` 的注释点出实现约束：「回调只保留 State **弱引用**，析构中不会解引用已经销毁的 IOManager」—— 与 `io.cpp` 用 `weak_ptr` 遍历注册表一致。
+- **go.hpp 核对通过的要点**：
+  - `:16-17` 解释了默认调度器为何用 `new` 且不析构：「故意采用进程生命周期句柄，**避免静态析构顺序导致工作线程访问已销毁对象**」；
+  - `:31-36` 处理了一个容易写错的状态机细节：「`Scheduler::shutdown()` 是**终态**，不能对同一个实例再次 `start`。关闭后创建新的句柄，**旧句柄继续由持有者负责等待/释放**」；`:57-73` `shutdown_default_scheduler` 先把句柄**移出**再关闭，注释说明「不会把任务提交到已经进入 stopping 状态的旧实例」，并把 `shutdown()` 包在 try/catch 中以满足 `noexcept`；
+  - `:82-87` `go(Scheduler&, ...)` 在未运行时自动 `start()`，与 `:45-47` 的默认调度器路径语义一致；
+  - `:149-171` `fiber` 类**删除复制与移动**并在注释中说明理由（「以避免重复提交」）；`m_scheduler` 是**裸指针**但只做相等比较（`:183`）**从不解引用**，因此 Scheduler 先析构也不会悬空访问；
+  - `:100-107` 与 `:141-147` 的模板重载用 `std::enable_if_t<std::is_invocable_r_v<void, std::decay_t<Function>&>>` 约束，使 lambda 无需手动构造 `std::function`。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建；在途 4 处文件 diff md5 与轮初一致。
+- **累计进度（include 通读）**：已完成 **23 个文件全文**，合计 **7,955 / 9,850 行 ≈ 81%**。
+  - **下一步**：`control_flow.hpp`(241) → `socket.hpp`(225) → `http.hpp`(246) → `websocket.hpp`(176) → `io_backend.hpp`(87) → `fd_manager.hpp`(69) → `parking_condition.hpp`(98) → `error.hpp`(250，用户在途文件，只读) → 余下零散。
+- **台账状态**：本轮**无新增条目**（含一次撤回）；待办仍为 **8 条**。
+
 ## 2026-10-12：include 通读（context.hpp 408 + log.hpp 506 全文）
 
 - **本轮读实现**：`include/go2cpp/concurrency/context.hpp`(408) 与 `include/go2cpp/logging/log.hpp`(506)，**均全文读毕**。
