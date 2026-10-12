@@ -11,6 +11,35 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+# ★ include 通读全部完成（用户要求「两轮一起做」）
+
+## 2026-10-12：include 100% 读完 + D-14 结案 + 新增 D-24/D-25 + X-06 补充
+
+- **本轮读实现**（一次性读完 include 剩余全部）：
+  - `network/control_flow.hpp`… 更正：`tools/control_flow.hpp`(241)、`concurrency/core/parking_condition.hpp`(98)、`network/io_backend.hpp`(87)、`network/fd_manager.hpp`(69)、`network/socket.hpp`(225)、`network/http.hpp`(246)、`network/websocket.hpp`(176)、`tools/error.hpp`(250，用户在途文件，只读)。
+- **★ include 通读完成度：100%**。实测 `include/` 共 **9,653 行 / 79 个文件**：
+  - **33 个「有实质内容」的文件全部逐行读完**，合计 **9,493 行**；
+  - **其余 46 个是 2-8 行的转发头**（合计 160 行），本轮也**逐个 dump 全文核对**，全部指向正确真身：根目录版用「兼容旧版公共头文件路径；实际实现位于模块目录」，`.h` 版用「Sylar 风格头文件名兼容入口」，`network/socket_stream.h` 正确地指向 `socket.hpp`（`SocketStream` 定义在此）而非不存在的 `socket_stream.hpp`。**X-26 修复后的 `concurrency/sync.hpp` 内容也已确认正确。**
+- **★ D-14 结案（核实后推翻其前提）**。D-14 原文称「`Is(error, target)` 在 target 为空时有特殊语义…但头文件**只有裸声明、无任何注释**」。本轮读 `error.hpp` 全文并 `git blame` 核实：
+  - `error.hpp:131-134` **早有注释**：「遍历单原因或多原因错误链。允许并忽略环；**空 target 只匹配空错误，与 errors.Is(err, nil) 相同**」；
+  - `git log -S` 与 `git blame` 一致显示该块由 **`d0fdf70`**（"fix: complete full module boundary audit"，2026-10-10 12:52）加入；
+  - 与实现 `src/tools/error.cpp:463-465` 的 `if (!target) { return !error; }` 一致；
+  - **结论**：D-14 的前提在当前 HEAD 不成立，**无需再改 `error.hpp`，故结案**。两种可能都如实写明：要么该注释是 D-14 登记之后由 `d0fdf70` 补上的，要么登记时漏看了这两行。**D-14 的阻塞状态（等用户提交在途文件）随之解除。**
+- **新增 D-24（低，Doxygen 绑定错位）**：`http.hpp:177-181` 是 `ResponseWriter` 的类文档，但它**紧邻的下一个声明是 `enum class StreamState`**（`:182-188`）而非 `class ResponseWriter`（`:189`）—— 文档会被绑到枚举上。对照 `io.hpp:154-170`（两段文档连续且紧邻 `class IOManager`，绑定正确）与 `websocket.hpp:73-80`（位置正确)两个正面样本。
+- **新增 D-25（低，边界未声明）**：`WalkErrors` 的注释（`error.hpp:58-66`）说明了「空指针不会调用 visitor」与「访问器抛异常时返回 false」，但**没说传入空 `visitor`（`std::function` 无目标）会怎样**。实际是抛 `std::bad_function_call` 后被 `noexcept` 兜底捕获、返回 false —— 返回值恰好安全，但调用方无法从注释预知。此项即 D-14 修复建议的后半句，因 D-14 主体已了结而单独立项。
+- **X-06 补充（原修复不完整）**：`FdContext` 的 `@warning`（`:20-24`）已如实声明 getter 无同步保护，但同文件 `:48` 的 `FdManager` 类注释**仍写着「线程安全的 fd 元数据表」**，两处矛盾：`FdManager` 的互斥只保护**表结构**与写入侧字段赋值，不保护 `FdContext` 的 getter。
+- **本批其余核对通过的要点**：
+  - `error.hpp:172-181` `As<T>` 是**noexcept + try/catch 的正确范例**（注释：「Is/As 是查询型 noexcept API…不能让异常穿过边界并触发 terminate」）—— 它正是 X-25 里「项目已有既定策略」的又一处正面证据；
+  - `socket.hpp:47` 明确并发约束「支持线程与 Fiber 共同访问，但不允许同一方向多处消费协议」；`:162-164` 说明 `ParkingCondition` 复用 `m_mutex` 的理由「close/release 等待在途操作时不会占住 M，也不会丢通知」；
+  - `parking_condition.hpp:80-84` 写明了拒绝手动 Fiber 的理由「无法把等待交还给 carrier 线程，因此禁止退回原生 condition_variable 造成整条线程阻塞」；`:39-46`/`:68-75` 两个循环在非 `kNotified` 时都**重新求值 predicate** 再返回，与文档语义一致；
+  - `io_backend.hpp:29-30` 明确「一个后端实例只能绑定一个 IOManager，不得跨管理器共享」；`:39-45` 两个 `supports_*` 能力探测默认返回 false 以保持第三方后端兼容；`:76-83` 的 D-13 修复（平台默认后端不可注销）仍在位；
+  - `control_flow.hpp:97-103` `defer` 的执行体把异常记入 `RecordDeferException` 而非传播，与 `~defer() noexcept` 一致；`:195-196` 明确 `recover::take()`「只有在 defer 回调期间才会成功，以保留最重要的恢复边界；它不会捕获普通 C++ 异常」；
+  - `websocket.hpp:75-78` 并发契约精确：「一个对象允许**一个读方向和多个并发写**调用，读操作之间、写操作之间分别串行化」；`:156-158` 用项目混合 `sync::Mutex` 的理由也写明了；
+  - `http.hpp:220-225` 的 D-22 修复（`serve_connection` 不设 recv/write 超时）与 `socket.hpp:61-67` 的 D-16 修复（`fd()` 是瞬时值）均仍在位。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建；在途 4 处文件 diff md5 与轮初一致。
+- **台账状态**：**D-14 → 已了结**；新增 **D-24**、**D-25**；**X-06 补充**。当前待办 **9 条**：`D-24`、`D-25`、`X-06`、`X-23`~`X-29`。`state.json` 的 `blocked_items` 已清空（D-14 解除后**不再有阻塞项**）。
+- **★ 下一步（用户指定的主任务下一阶段）**：`include/` 已读完，**转入 `tests/` 的校验部分**（10,215 行，本项目唯一系统性未通读的大块）。建议顺序：先 `tests/test_support.hpp`（测试框架本体）→ `tests/test_main.cpp`（入口与 filter）→ 各模块测试文件（按并发/网络/配置/日志分组）→ 边读边记录**测试盲点**（源码中存在但测试未覆盖的分支）与**断言依据核查**（断言依赖的是设计意图还是碰巧的实现行为）。
+
 ## 2026-10-12：include 通读（io.hpp 314 + go.hpp 220 全文）—— 含一次**核实后撤回**的条目
 
 - **本轮读实现**：`include/go2cpp/network/io.hpp`(314) 与 `include/go2cpp/tools/go.hpp`(220)，**均全文读毕**。
