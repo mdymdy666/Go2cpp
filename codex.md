@@ -11,6 +11,30 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 通读（event.hpp + fiber.hpp 全文）—— 新增 X-27
+
+- **本轮读实现**：`include/go2cpp/tools/event.hpp`(424，本轮补齐 `:250-424`) 与 `include/go2cpp/concurrency/fiber.hpp`(228)。两者**均全文读毕**。
+- **新发现：X-27（低，未声明的静默失败）**。`EventBatch` 的**每个方法**在 `sync::Mutex::Lock()` 返回 false 时都静默 `return`。查询方法返回默认值尚可接受，但**写方法会静默丢弃用户数据**：`add_event` 加锁失败时事件不入队、无任何反馈；`bind`/`clear`/`reset`/`make_loop_time`/`make_stop_config` 同理。
+  - **现实触发路径**：`sync::Mutex::LockImpl`（`src/concurrency/sync.cpp:711-905`）对 `ParkingCondition::FiberWaitUnsupported()`（即**手动 Fiber、无 Scheduler 归属**）直接返回 false。而 `EventBatch` 的类注释只声明「支持 Fiber 与普通线程调用」，**未提及该失败模式**。
+  - 同一类注释 `:22-23` 还说「对象必须一直存活到所有 work/bind/add_event 调用返回」，这说明作者意识到调用可能失败/阻塞，但没有为失败提供出口。
+- **event.hpp 核对通过的要点**：
+  - `:267-296` `work()` 的 **Context 桥接**设计完整：当调用方传入 `context` 时，先用 `Context::WithCancel(context)` 建子 Context，再把**子 Context 的取消注册到批次自身的 stop Context 上**（`:272-275`），于是「用户取消」与「`stop()`」两条路径都能唤醒正在 `Select` 的 Fiber；`:291-296` 在 finally 语义位置移除回调并调用 `stop_bridge_cancel()`，且**都在锁外**；
+  - `:279-290` 把 `Select` 抛出的异常（含 `std::exception` 与未知异常）**统一转换成 `kInvalid` + ErrorPtr**，注释明确「异常不能穿过 scheduler worker 或 Fiber 边界」；`:320-339` 的用户回调同样在**锁外**执行并把异常转成结果，仅在更新 `m_last` 时短暂加锁（`:327-330`、`:334-337`）；
+  - `:239-248` 把 `max_duration` 作为**硬上限**：即使未设置 loop timeout，也把剩余时间传给 `Select`（注释：「不能无限等待」），并在剩余时间 ≤0 时把 timeout 压成 0 以立即返回；
+  - `:212-216` 与 `:298-302`、`:203-205` 的锁序统一为 `m_work_mutex` → `m_mutex`，且三处失败路径都**配对了 `m_work_mutex.Unlock()`**，无泄漏；`:130-147` `stop()` 在自己的 try/catch 内完成，注释「shutdown 期间不能再阻塞调用方」；
+  - `:306-309` 只有 `kTimedOut` 且 `stop_on_timeout` 才置停止位，`kCancelled`/`kDeadlineExceeded` 不置位 —— 与 `:98-100` 的语义说明一致。
+- **fiber.hpp 核对通过的要点**：
+  - `:32-34` 明确 `FiberExecutionBinding` **只保存不拥有对象的标识**（`scheduler_token` 是 Scheduler 地址的整数形式），理由是「避免 Fiber 模块依赖 scheduler 模块，也避免调度器生命周期被调试信息反向延长」—— 这正是 `Fiber::Impl` 里 `m_last_machine_id`/`m_binding_published` 那套调试元数据不持锁、不延长生命周期的依据；
+  - `:125-131` 析构契约写得很实：Ready 会跳过主体、Suspended 只有在「固定父级/调用方仍可恢复」时才继续、**错误父级下安全放弃并标记 `Failed`**（「无法展开挂起栈上的局部 RAII」），并明确警告「**忽略取消的主体可能阻塞析构**」；
+    - **与本会话已登记的 X-13 呼应**：X-13 记录的正是这条「阻塞」在实现层是**无界 yield 自旋**（`src/concurrency/fiber.cpp:660-669`）。**该注释只说「可能阻塞」，未说明是忙等且无上限**，故 X-13 仍然成立，此处补充其文档出处；
+  - `:206-208` 描述墓碑帧：父对象结束后仍由共享记录保留 `alive=false` 的帧，「只用于观测、取消和诊断，**不能恢复已销毁的父栈**」—— 与 `fiber.cpp` 的 `FiberRecord` 实现及 `abandon_suspended` 的失败路径一致；
+  - `:50-52` 区分 `parent_id`（首次进入时固定）与 `active_parent_id`（最近一次 resume 的实际调用者），与 `FiberContextFrame` 字段及 `fiber.cpp:1422-1460` 的 `context_snapshot()` 构建逻辑对应；
+  - `:104-105` 声明「非法或过小值会由实现归一化为可用容量；构造失败会抛出异常」，与 `fiber.cpp:213-259` 的 `normalize_stack_size` 一致。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建。
+- **累计进度（include 通读）**：已完成 4 个文件全文 —— `channel.hpp` 2007 + `future.hpp` 952 + `event.hpp` 424 + `fiber.hpp` 228 = **3,611 / 9,850 行 ≈ 37%**。
+  - **下一步**：`sync.hpp`(219) → `thread_policy.hpp`(153) → `sse.hpp`(205) → `address.hpp`(153) → `framing.hpp`(129) → `hybrid_mutex.hpp`(114) → `hook.hpp`(102) → `byte_array.hpp`(94) → `endian.hpp`(80) → `scheduler.hpp`(662) → 其余。
+- **台账状态**：新增 **X-27**；待办 **6 条**（`D-14` 阻塞；`X-23`~`X-27` 待定）。
+
 ## 2026-10-12：全 include 树重复头文件扫描 —— 发现并修复 X-26
 
 - **本轮性质**：原计划按行数顺序继续通读 include，但读 `tools/event.hpp` 时注意到它 `#include "go2cpp/sync.hpp"`（根路径），而 `include/` 下同时存在 `go2cpp/concurrency/sync.hpp`，两者**都有实质内容**。这促使本轮改为先做一次**全 include 树的同名头文件扫描**，以免在继续通读时误把过时副本当成真身。
