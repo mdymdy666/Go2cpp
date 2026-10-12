@@ -13,6 +13,87 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：登记 HybridGate 移除决策（X-35）；讲解 DoneSignal 并发现 X-36
+
+### 一、X-35：用户决策「框架绝对不允许 HybridGate」
+
+**在用户指示下完成全项目定位（仅调查，未改代码）**：
+
+**真实使用点：3 个生产文件、4 处成员、12 个加锁点**
+
+| 文件 | 成员 | 加锁点 |
+|---|---|---|
+| `src/concurrency/parking_condition.cpp` | `:161` `HybridMutex m_wake_mutex;` | `:69`/`:92`/`:99` |
+| `src/concurrency/sync.cpp` | `:349` `core::HybridMutex m_wake_mutex;` | `:135`/`:154`/`:195`/`:221`/`:243`/`:332` |
+| `src/network/io.cpp` | `:327` `core::HybridMutex wake_mutex;` | `:354`/`:363`/`:383` |
+
+**三处同构**，都是「**唤醒门**」：锁保护 `{scheduler, task, wake_active}` 一组裸指针，
+`wake()` 锁内调 Scheduler、`disarm()` 锁内清指针，目的是**不让对 `Scheduler*` 的访问越过等待 G 的栈清理**。
+
+**用户否定的理由**：`HybridGate::lock()` 慢路径是 `for(;;)` **无界自旋**（`:75-81`），
+持有者一旦拖延（例如在 Fiber 上被 park），自旋方无上限烧 CPU。
+**这也解释了作者当初为何选它**：它用 `atomic_flag`，**天然没有 owner 概念，可跨线程解锁**。
+
+**★ 用户同时指出 `std::mutex` 不能作为替代**：hook 会把 `connect_with_timeout`
+封装成「已保存上下文的定时任务」交给其他线程，造成 `lock()` 在线程 1、`unlock()` 在线程 2。
+
+**项目已有正确方案：`sync::Mutex`**（`include/go2cpp/sync.hpp:78`）。类文档明文：
+「两类调用者共享一个 FIFO 交接队列，因此 **Fiber 加锁后可以由其他 Fiber 或 OS 线程解锁**」
+「**Unlock 不要求由同一 G/线程调用，采用 Go 风格所有权**」。
+实现证据：`src/concurrency/sync.cpp:955` 的 `Unlock()` **无 owner 检查**
+（只查「锁是否被持有」），锁状态是 `atomic<uint8_t>`，
+内部 `std::mutex` 仅保护等待队列、同线程短暂进出，故跨线程解锁完全安全。
+
+**替换注意三点**：用返回 `bool` 的 `Lock()`（`lock()` 会抛 `logic_error`）；
+`Unlock()` 在 `noexcept` 路径需兜异常；`Lock()` 返回 false 时不能当作已加锁。
+
+### 二、DONE SIGNAL：它到底是干啥的
+
+**「只关闭一次、可复制的完成通知」**——`Context` 用它表示 Done 信号。
+它是 `ParkingCondition` 之上的一层**专用一次性标志**，自带状态与回调注册，
+调用方**不必自己准备外部锁与谓词**。
+
+**State**（`context.cpp:17-35`）：`mutex` + `mutable core::ParkingCondition cv` + `bool done`
++ `next_id` + **两组回调表**（`internal_callbacks` / `callbacks`）。
+
+**三个关键设计**：
+
+1. **一次性 + 幂等**：`Signal()` 先查 `done`，重复调用直接返回（`:177-179`）。
+2. **「已完成后再注册」→ 立即调用**（`AddCallbackImpl` `:124-143`）：锁内只标记
+   `invoke_now`，**回调在锁外调用**并吞异常；`CallbackId` 从 1 起、跳过 0。
+3. **★ 执行顺序：`notify_all()` → `internal_callbacks` → `callbacks`**（`:192-204`），
+   回调全在**锁外**跑（注释：「避免回调重入信号对象」），异常一律隔离。
+
+**★★ 最有价值的一点：`notify_all()` 在回调之前** ——
+所以「**等 `Done()` 返回**」与「**回调已执行完**」**没有任何顺序保证**。
+**这正是 `ContextRollback` 必须另提供一个独立 `RollbackDone()` 信号的根本原因**：
+`context_rollback.md` 中「与 child `Done()` 分离」那句话的机制就在这里，
+**想等 undo 跑完只能等 `rollback_done()`**。
+而**两组回调**的设计目的，是让**内部机制（如 `ContextRollback` 的 undo）先于用户观察回调执行**。
+
+**谁在用它**（全项目的取消/完成通知总线）：作为成员有 `Context::State::m_done`
+（`context.hpp:245` / `context.cpp:342`）与 `ContextRollback::State::completion`（`context.cpp:749`）；
+注册 `CallbackId` 的调用方共 9 处：`sync.cpp:491`、`channel.cpp:254`、`io.cpp:2011`/`:2256`、
+`channel.hpp:1123`、`future.hpp:74`/`:91`、`sse.hpp:188`、`event.hpp:264`，
+以及 `ContextRollback` 自己的 `m_callback_id`/`m_before_callback_id`。
+
+### 三、本轮发现的两个问题
+
+| # | 问题 | 严重度 |
+|---|---|---|
+| **X-25⑫** | `DoneSignal::IsDone()`（`context.cpp:89-92`）标 `noexcept` 却加锁，且在 `Context::IsDone()` 一类高频查询路径上 | 低 |
+| **X-36** | **移动后的 `DoneSignal` 是空壳，但 `Wait`/`WaitFor`/`WaitUntil`/`IsDone` 四处都直接解引用 `m_state`**，无空检查；移动语义是 `= default`（`context.hpp:50-51`）。**对照**：`ContextRollback::RollbackDone()`（`:1582-1590`）**特意**处理了该情况 | 低-中 |
+
+**实际影响有限**（常规用法中被移动的临时对象立即析构），
+但 `auto s = std::move(other); other.IsDone();` 会崩。
+
+### 四、状态
+
+- 台账：**新增 X-35（用户决策，含完整移除清单与替换约束）、X-36**；
+  **X-25 第六次扩充 → 12 处**。
+- 待办 **24 条**。
+- **本轮仅读代码 + 写台账，未改动任何源码**（遵守用户「先不要修改代码」）。
+
 ## 2026-10-12：审查 HybridGate 并盘点全项目混合同步设施（新增 X-33/X-34，X-25 扩至 11 处）
 
 - **用户指令**：「HybridGate 这个东西实现真的没有问题吗」+「尝试在整个项目里面找到混合并发的锁还有哪些」。
