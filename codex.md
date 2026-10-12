@@ -13,6 +13,27 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：模块讲解（基础模块 4 · fiber / fiber_local / thread_policy）—— 新增 T-17、T-18
+
+- **本轮读（全部全文）**：`tests/concurrency/test_fiber.cpp`(439)、`tests/concurrency/test_fiber_local.cpp`(124)、`tests/concurrency/test_thread_policy.cpp`(94)。产出 **`docs/fiber_guide.md`（471 行，13 节）**。
+- **★ 新发现：T-17（中）—— `FiberBin` 的两个调度器专用接口零覆盖**。`Fiber::AcquireForScheduler(Function, stack_size, bin_capacity = 32)` 与 `Fiber::RecycleForScheduler(...)` 在 `tests/` 与 `example/` 中**`grep` 零匹配**。而头文件对它们的约束相当具体：「只有**已经完成或失败、且不再有可恢复上下文**的内部 G Fiber 才允许回收到创建它的 M 的线程本地池」「**不会跨线程转移仍挂起的 Fiber**」。这三条（**回收条件 / `bin_capacity` 上限 / 跨线程拒绝**）全无测试固化 —— 而它们正是 **`scheduler` 的依赖面**。
+  - 值得强调的对比：`test_fiber.cpp` 枚举了 **18 类边界**（见 `docs/fiber_guide.md` 第 11 节的表格），是我在项目里见过的**边界覆盖最全的测试**，**唯独在「调度器侧回收路径」上是空白**。
+- **★ 新发现：T-18（低）—— `thread_policy` 两处未覆盖**：① `ScopedThreadParticipation` 的**引用版构造**（`ScopedThreadParticipation(Scheduler&, mode)`）未测，测试只用指针版；② `ThreadHookMode::kInherit` 的**继承语义**未验证 —— 测试只覆盖了 `kDisabled`/`kEnabled`，而类注释声明「`kInherit` 跟随进程级开关」，该「跟随」行为无任何断言。
+- **文档讲透的九个场景**：
+  - **场景一 挂起/恢复 + errno 双向保存**：这是**很容易漏的正确性点** —— `errno` 是线程局部的，而 Fiber 复用同一线程；测试验证了 Fiber 内部挂起前后 `EAGAIN` 保持、外部 `resume` 前后 `EDOM`/`ERANGE` 保持。同场景还讲了栈尺寸**归一化**与**溢出必须在构造期拒绝**（`size + guard` 的加法在 `SIZE_MAX` 下会回绕成小值，「不能等到首次 resume 才破坏上下文」）；
+  - **场景二 跨线程迁移**：用两个真实 `std::thread` + 双 `gettid` 确认Fiber 从线程一挂起、线程二恢复，且**栈上局部变量与 FiberLocal 值都保持**。文档解释了物理基础：Go2Cpp 用的是**自己分配的栈**而非 OS 线程栈，上下文里保存的是栈指针，所以换线程继续跑只是换了个指针值；
+  - **场景三 嵌套与墓碑帧**：父 Fiber 栈上可以再起子 Fiber；父结束后的诊断链由共享记录保留 `alive=false` 的墓碑帧，头文件明确「**只能用于观测、取消和诊断，不能恢复已销毁的父栈**」；
+  - **场景四 析构语义**：未启动（Ready）→ **跳过主体但释放捕获**；挂起中 → **取消 + 恢复 + 等它自然结束**（这样它栈上的局部对象才能析构），因此**析构可能阻塞**；
+  - **场景五 错误父级下的销毁——安全优先的取舍**：子 Fiber 挂在父栈上时，若父已不在当前执行链，恢复子就等于**跳进不可达的调用链**（上下文层面的 UB）。运行时选择「**放弃子上下文 + 标记 `Failed`**」，宁可泄漏子栈上的 RAII，也不做可能崩溃的栈跳转。第二处是「错误父级析构**也必须摘除 FiberLocal 值**，不能因地址复用把旧 G 的值带给后续 Fiber」——**与 `ContextKey` 的 anchor 同一类问题**；
+  - **场景六 异常边界**：用 `resume_result()` 而非 `resume()`，「Fiber 不把 C++ 异常抛出到调度器」。**这与 `control_flow` 讲解里「为何不宜用异常实现 panic」是同一条理由**（`scheduler` 在 Fiber 入口有 `catch (...)`，异常逃出即整个任务 `kFailed`）；
+  - **场景七 `FiberLocal` 的六种回退**：线程 TLS fallback、跨 Fiber 隔离、park 后保持、Fiber 结束后回收、key 唯一、跨线程迁移保持；最值得讲的是**「key 对象生命周期可短于 logical G」**——`FiberLocalCache` 只是句柄，值的所有权在 **G 的 trampoline**，所以销毁 wrapper 不会使 Fiber 中的值失效（测试用真实析构计数验证）。**这与 `ContextKey` 是同一思路的两个方向**：`ContextKey` 是「值钉住键」，`FiberLocalCache` 是「G 拥有值」；
+  - **场景八 `thread_policy`**：四个检查；文档特别记下该模块的**设计克制** —— 这两个作用域**只写 TLS 元数据**，「不会创建 M、绑定 P、安装 `current_scheduler()` 或执行队列任务」，即「声明我是谁」而非「把我变成 worker」；
+  - **场景九/实现细节**：`FiberExecutionBinding` 只存**不拥有的标识**（`scheduler_token` 是地址整数形式），避免 Fiber 依赖 scheduler 模块、避免调度器生命周期被调试信息反向延长。
+- **测试评述中最有价值的一处**（文档第 11 节第 13 项）：**嵌套 park 的唤醒顺序验证** —— inner 在调度器里 park 时，outer 与根 G 都只保存 continuation；唤醒后必须**先回 inner 再回 outer**。测试用一条「在 inner park 期间不能执行」的断言来检测这一点：若唤醒顺序错了，outer 的后续代码会在 inner 还没跑完时被执行，断言即失败。**这是「用手写断言检测执行顺序错误」的范例。**
+- **验证结果**：本批为**只读回溯 + 文档产出**，未改动任何源码或测试，未触发构建；在途 4 处文件 diff md5 与轮初一致（`94a798af…`）。
+- **台账状态**：新增 **T-17**、**T-18**；待办 **21 条**。
+- **下一步**：基础模块讲解线还剩 `sync`（`Mutex`/`ConditionVariable`/`WaitGroup`，`test_sync.cpp` 969 行）、`config`、`logging`、`timer`，以及更大的 `scheduler`。按依赖，`sync` 是 `fiber` 之后最自然的一步（它直接建立在 Fiber park 之上，且 X-25 的多处 noexcept 问题也在这一族）。
+
 ## 2026-10-12：模块讲解（基础模块 3 · context）—— 新增 X-32、T-16
 
 - **用户指示**：讲解下一个基础模块。本轮完成 **`context`**，产出 **`docs/context_guide.md`（536 行，12 节）**，与 `error_guide.md`、`control_flow_guide.md` 同一标准。
