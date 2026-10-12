@@ -11,6 +11,22 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 定向审计（channel.hpp :300-900）
+
+- **本轮读实现**：`include/go2cpp/concurrency/channel.hpp` 的 `:300-900`，约 600 行，覆盖 `FunctionSelectCaster`、`ChannelSendResult`、`SelectProbe`、`SaturatingDeadline`、`SelectWaitState` 全文、`ChannelRecvResult`、`Channel<T>` 类头与 `Create`/`Capacity`/`Len`/`IsClosed`/`Send*`/`Recv*`/`TrySend`/`TryRecv`/`Close`/`Generation`/`WaitForChange`/`ArmSelectRecv` 开头。
+- **结论：本段未发现新的缺陷或文档缺失。** 以下要点经逐条核对：
+  - `:457-482` `SelectWaitState::TrySelectPair` 用 `std::scoped_lock lock(first->m_mutex, second->m_mutex)` **同时获取两把锁**（`std::lock` 算法，无死锁风险），在临界区内一次性设置双方，使「一手交钱一手交货」的双向配对具备原子性；`:463` 还先排除 `first == second`。这是 select 单赢家语义的关键实现；
+  - `:521-544` `Take` 的字段搬运是**分两路**的：`ready/ok/status/error` 直接复制，`typed_value` 用 `std::move`（保住 move-only 结果的所有权），`value`（`std::any`）单独 try/catch（复制可能抛）。注释（`:527-528`）明确「`std::any` 的复制可能失败；`typed_value` 使用共享载体，可以在这种情况下仍然把选择结果交给用户的 Caster」——**降级路径是有意保留的**；
+  - `:707-769` `Close` 在锁内 `swap` 出两个等待队列并逐节点提交 `kClosed` probe，对 select 节点额外用 try/catch 包裹 `TrySelect`，异常时改走 `Cancel()`（注释：`Close` 仍须唤醒该 select；选择结果不可提交时把节点取消掉，避免异常穿过 `Close` 并留下永远等待的 Fiber）；**通知全部移到锁外**（`:761-767`）；
+  - `:787-892` `ArmSelectRecv` 使用**双重检查**（`:789-791` 无锁预检 + `:793-795` 持锁复查），与 `src/concurrency/channel.cpp` 的注册路径一致；扫描 senders 时用 `sender_scan_limit = m_senders.size()` **限制扫描轮数**，并把「自己的节点」`pop_front` 后 `emplace_back` 到队尾以避免自匹配 —— 这个「轮转跳过自己」的写法配合计数上限，**不存在无限循环**；
+  - `:798`/`:834`/`:870` 三处 `if constexpr (!std::is_copy_constructible<T>::value) return false;` 与类注释 `:591-592`「内建 select 对 T 还要求可复制；不可复制值可通过 SelectValue 自定义路径承载」**完全对应**，即不可复制类型在 select 路径上的限制是**已声明的契约**，不是遗漏；
+  - `:601-604` 两个 `static_assert` 把 `T` 的「可无异常移动构造」与「可无异常析构」变成**编译期契约**，与注释 `:591` 一致；`:423-436` `SaturatingDeadline` 同时处理正向与负向溢出（含 `Duration::rep::min()` 特判），无未定义行为。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建。
+- **累计进度（include 审计）**：`channel.hpp` 已读 900 / 2007 行（45%）；`include/` 整体已读约 **1,200 / 9,850 行 ≈ 12%**（首轮 300 行 + 本轮 600 行 + 此前各批 grep 与交叉核对涉及的片段）。
+  - **仍未读**：`channel.hpp` 余约 1,107 行（含 `ArmSelectRecv` 余下、`ArmSelectSend`、`DisarmSelect`、`Select`/`RecvCase`/`SendCase` 等）；以及 `future.hpp`(952)、`config.hpp`(541)、`log.hpp`(506)、`event.hpp`(424)、`context.hpp`(408)、`timer.hpp`(344)、`io.hpp`(314) 与其余 20 个头文件。
+- **台账状态**：本轮无新增条目；待办仍为 **1 条**（`D-14`，阻塞于用户在途文件 `include/go2cpp/tools/error.hpp`）。
+- **下一步**：继续 `channel.hpp :900-2007`，然后按体量依次审 `future.hpp`、`config.hpp`、`log.hpp`。审计重点是「注释与实现矛盾」与「契约未声明的前置条件」两类 —— X-06（注释称字段受互斥保护，实为无锁）与 D-17（public 接口未声明前置条件）正是这两类的样本。
+
 ## 2026-10-12：补齐 `.agent/state.json` 并转入 `include/` 定向审计
 
 - **本轮性质**：台账已无「进行中」条目（仅剩 `D-14`，阻塞于用户在途文件），故按提示词步骤 4 进入**自主扩账模式**：对尚未审计的区域做定向审计。同时补上一项**长期欠账**。
