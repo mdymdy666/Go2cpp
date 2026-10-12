@@ -13,6 +13,37 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：Error 模块场景化深度讲解（用户指定「只讲解 Error」）
+
+- **用户指示**：讲解**只做 `Error`**；要求把「配合使用的代码、实现的细节、测试」一并讲清，并**以多场景说明它在各处起什么作用**。因此本轮把 `docs/module_tour.md`（此前含模块 1/2）**`git mv` 为 `docs/error_guide.md` 并整体重写为 577 行的场景化深度讲解**。
+- **写作方法：先扫描用量，再讲设计**。对 `src/` 全量统计各 error API 的出现次数，得到一张**决定叙述重点**的表：
+  | API | 次数 | 含义 |
+  |---|---:|---|
+  | `ErrorPtr` | 75 | 绝大多数是类型标注——它是贯穿全运行时的错误载体 |
+  | `Is(` | 9 | **真实主用途** |
+  | `DeadlineExceededError()` | 9 | 与上一行配对 |
+  | `NewError(` | 8 | 只在 4 个文件里创建 |
+  | `Wrap(` | **1** | 运行时几乎不用 |
+  | `Join(` | 4 | 少量 |
+  | `As<` | **0** | **运行时从不使用** |
+  | `WalkErrors(` | **0** | 运行时从不使用 |
+  **结论**：`Error` 对外提供完整的 Go 风格错误树工具，但**运行时真正依赖的只有一个能力——区分「超时」与「取消」**；其余 API 是为使用者与插件准备的。**这张表本身就是讲解的骨架。**
+- **文档结构（13 节）**：定位与核心契约 → 场景地图（用量表）→ **场景一：区分超时/取消（含 3 个真实调用现场）** → **场景二：单例 + 身份比较（枢纽机制，8 个单例清单）** → 场景三：nil 语义 → 场景四：包装链 → 场景五：聚合 → 场景六：类型化提取（含 `AsMutable` 高危兄弟）→ 场景七：插件遍历 → 场景八：跨线程/Fiber 无锁传递 → 测试证据汇总 → 示例评述 → 问题清单 → 一页总结。
+- **本轮讲透的三个枢纽事实**：
+  - **① 三个真实调用现场的模式完全一致**：`channel.cpp`（`Context::Err()` → `Is(err, DeadlineExceededError())` → `ChannelStatus::kDeadlineExceeded/kCancelled`）、`io.cpp`（→ `WaitStatus` + `ETIMEDOUT`/`ECANCELED`）、`sse.cpp`（→ `sse::Error::DeadlineExceeded/Cancelled`）。**差异在于前两者写法不同**：`channel` 写成 `err && Is(err, ...)`（先判空），`io` 直接 `Is(context->Err(), ...)`（依赖 `Is(nullptr, X) == false`）—— **两者都正确，但展示了 `Is` 空安全的两种用法**；
+  - **② `Is` 能工作的前提是「单例 + 身份比较」这对组合**。`Error::Is` 默认是 `this == &target`，而 `DeadlineExceededError()` 返回 `static const ErrorPtr` —— **若它每次返回新对象，超时判别会静默失效且不报错**。这是全模块最脆弱的接缝，已写入文档的「最脆弱处」；
+  - **③ 遍历算法的两个极端后果都有测试背书**：`AsImpl` 用显式容器 + `unordered_set<const Error*>` 去重，因此 **10 万层 `Wrap` 深链不爆栈**（测试还精确校验格式化长度）且**自指错误图不死循环**。
+- **★ 新发现：X-31（低）—— 8 个错误单例的静态析构顺序问题**。为写本文做全仓库扫描时发现，**8 个标准错误全部是函数局部 `static const ErrorPtr`**（`context.cpp` 2 个、`channel.cpp` 5 个、`future.cpp` 1 个）。函数局部 static 在**程序退出阶段会被析构**，此后该函数返回**空 `ErrorPtr`**，而 `Is(err, {})` 的语义是 **`!err`** —— **「超时」会被静默误判为非超时**（走取消分支）。
+  - **项目其实认识这个风险**：`include/go2cpp/tools/go.hpp:16-17` 对默认调度器**刻意用 `new` 且永不析构**，注释写明「避免静态析构顺序导致工作线程访问已销毁对象」—— **但 8 个错误单例没有做同样处理**；
+  - 正常路径安全（`Scheduler::shutdown()` 一般先停线程），但 `shutdown_for()` **超时会返回 false 且线程可能仍在运行**，此时恰好发生 Context 超时即可命中；
+  - **修复建议**：改为 `static const ErrorPtr* const error = new ErrorPtr(...)`（同 `go.hpp` 的做法）或 leaky singleton 惯用法。
+- **文档同时沉淀了两条「方法教训」**：
+  - `tests/tools/test_errors_ns.cpp` 那段声称「头文件只有裸声明、没有注释」的测试注释，**本身曾是 D-14 的登记依据**，而它是错的 —— **以测试注释为证据去登记文档缺陷，等于把二手信息当一手证据**（已登记 T-09）；
+  - `Wrap` 在运行时只出现 1 次、`As`/`WalkErrors` 出现 0 次，说明「**接口面向使用者、实现面向性能**」的分工 —— 运行时宁可用「单例错误 + 状态码」，也不在热路径上构造包装链。
+- **验证结果**：本批为**只读回溯 + 文档产出**，未改动任何源码或测试，未触发构建；在途 4 处文件 diff md5 与轮初一致（`94a798af…`）。
+- **台账状态**：新增 **X-31**；待办 **17 条**。
+- **下一步**：按用户「只讲解 Error」的指示，**模块讲解任务到此收尾**；后续轮次回到「查找 test 和 example 的问题」这条线上的其余模块（`config`/`logging` → `context` → `fiber`/`thread_policy` → `sync` → `scheduler` → `future`/`channel`/`event` → `timer` → `io`/`hook`/`fd_manager` → 网络层 → `go`/`runtime`），产出仍是登记项而非讲解。
+
 ## 2026-10-12：模块讲解（模块 2 · control_flow）—— 新增 X-30、T-12~T-14
 
 - **本轮读**：`tests/tools/test_control_flow.cpp`(177)、`example/tools/control_flow_demo.cpp`(94)，并回查 `src/tools/control_flow.cpp` 的关键实现（`s_defer_depth` 用法链、`recover` 各方法、`panic::clear`、`PanicState`）。
