@@ -11,6 +11,30 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 审计（future.hpp :560-952）—— future.hpp 全文读毕，扩充 X-25
+
+- **本轮读实现**：`include/go2cpp/concurrency/future.hpp` 的 `:560-952`，约 392 行，覆盖 `FutureState<T,true>` 余下、`MergeDeadline`/`DeadlineAfter`、`FutureResult<T>` 与其 `void` 特化、`Promise<T>` 全文、`Future<T>` 全文、`Promise::GetFuture` 与 `MakePromise`。**至此 `future.hpp` 952 行全部读完。**
+- **X-25 范围扩充（重要）**：上轮我只登记了 `FutureState` 两个特化的 `Status()`。读完全文后确认该问题**共四处**，且其中两处比 `Status()` 更危险：
+  | # | 位置 | 说明 |
+  |---|---|---|
+  | ① | `:307-322` | `FutureState<T,false>::Status() noexcept` 直接加锁 |
+  | ② | `:507-522` | `FutureState<T,true>::Status() noexcept` 直接加锁 |
+  | ③ | `:867-869` | `Future::Status() noexcept` 转发到 ①② |
+  | ④ | `:697-703`、`:709-717` | `Promise::~Promise()`（隐式 `noexcept`）与 `Promise::operator=(Promise&&) noexcept` 都调 `m_state->SetError(...)` 发布 broken-promise，**而 `SetError` 内部会加锁** |
+  ④ 尤其值得注意：它出现在**析构**与**移动赋值**这两条最难排查的路径上，一旦加锁失败就是 `std::terminate`，而不是可捕获的异常。
+- **本段核对通过的要点**：
+  - `:697-717` `Promise` 的 broken-promise 语义完整：析构与移动赋值**都会**对尚未完成的共享状态发布 `BrokenPromiseError()`，且移动构造函数 `Promise(Promise&&) noexcept` **只搬运指针、不发布错误**（`:708`）—— 即「移动走之后由新的持有者负责完成」，语义正确；
+  - `:583-597` `MergeDeadline` 取 Context 截止时间与本地 deadline 的**较小者**，`:599-609` `DeadlineAfter` 有溢出检查（`now > max - timeout` → `max`），两者配合 `Wait` 内部再次比较 `Context::Now() < *deadline`，构成一致的绝对时间语义；
+  - `:841-856` `GetResultUntil` **只在终态**（`kReady`/`kError`/`kException`/`kCancelled`）才读取 value/error/exception，因此超时返回的 `FutureResult` 不会携带半成品数据；`:850-852` 用 `if constexpr (!std::is_void_v<T>)` 保证 void 特化不实例化 `m_state->Value()`；
+  - `:908-935` `ThrowResult` 标 `[[noreturn]]`，且**异常优先于错误**（`:911-913` 先 `rethrow_exception`），再按状态补默认错误（`CanceledError`/`DeadlineExceededError`/`NewError`），与注释 `:871-872`「只有调用者明确选择 GetOrThrow 时，error/exception 才会转换为 C++ 异常」一致；`:876-878` 还用 `static_assert` 限制 `GetOrThrow` 只能用于可复制类型，并在消息里指向 `GetResult().Value()` 作为 move-only 的出路；
+  - `:632-635` 与 `:669-672` `FutureResult::Cancelled()` 把 `kDeadlineExceeded` 同时算作**超时与取消**，与 `TimedOut()`（`:628-631`）在 `kDeadlineExceeded` 上重叠 —— 这是有意的语义设计（deadline 既超时也取消），但调用方若写成 `if (TimedOut()) ... else if (Cancelled()) ...` 会只命中前者。**不登记为条目**（属合理设计），此处记录以备查；
+  - `:946-951` `MakePromise` 先 `GetFuture()` 再移动 promise，保证返回对的两端共享同一状态；`Future` 的构造函数为 private 且 `friend class Promise<T>`（`:938`），外部无法凭空构造有效 `Future`。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建。
+- **累计进度（include 审计）**：**`future.hpp` 952 / 952 行 = 100%**；`include/` 整体约 **2,959 / 9,850 行 ≈ 30%**（`channel.hpp` 2007 + `future.hpp` 952）。
+  - **仍未逐行读**：`scheduler.hpp`(662)、`config.hpp`(541)、`log.hpp`(506)、`event.hpp`(424)、`context.hpp`(408)、`timer.hpp`(344)、`io.hpp`(314)、`sync.hpp`(219)、`go.hpp`(220) 等 28 个文件，合计约 6,891 行。
+- **台账状态**：X-25 已扩充；待办仍为 **4 条**（`D-14` 阻塞于用户文件、`X-23`/`X-24`/`X-25` 待定）。
+- **下一步**：转入 `scheduler.hpp`(662)——它是并发侧最后一个大文件，且与已读的 `scheduler.cpp`(4048) 直接对应，可交叉核对声明与实现的契约一致性。
+
 ## 2026-10-12：include 审计（future.hpp :1-560）—— 新增 X-25
 
 - **本轮读实现**：`include/go2cpp/concurrency/future.hpp` 的 `:1-560`，约 560 行，覆盖 `FutureWaitBackend` 协议、`FutureCallbackGuard`、三个后端工厂声明、`FutureStatus`、`FutureError`、`BrokenPromiseError`、`FutureStateKind`/`FutureWaitRegistration`、`FutureState<T,false>` 全文、`FutureState<T,true>`（void 特化）至 `StatusLocked` 中段。
