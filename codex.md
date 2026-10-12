@@ -13,6 +13,30 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：模块讲解（模块 1 · error）+ tests/example 审查 —— 新增 T-09/T-10/T-11
+
+- **本轮性质转变**：用户指定新主任务「一边按模块顺序讲解项目，一边查找 test 和 example 的问题」，并要求「先完成 error 的部分」。本轮完成 **模块 1（基础工具层：`error`）**。
+- **产出文档**：新建 `docs/module_tour.md`（138 行），作为模块讲解的**持续载体**，按依赖从底向上逐模块累积。error 章节含：模块定位、类层次表、三个必须讲清的细节（迭代遍历+地址去重、noexcept 兜底、`Is(error,nullptr)` 退化语义）、测试覆盖表（10 条关键断言）、测试盲点、问题清单、示例评述。
+- **★ 本轮最重要的发现：T-10（高，HEAD 无法构建）**。
+  - `tests/tools/test_errors_ns.cpp`（已提交 `f8156e5`、`4f93672`，且存在于 HEAD）与 `example/tools/errors_demo.cpp`（已提交）都调用 `go2cpp::errors::*`；
+  - 但该命名空间**只在用户的在途改动中**：`git show HEAD:include/go2cpp/tools/error.hpp | grep -c "namespace errors"` → **0**；
+  - 而 `git cat-file -e HEAD:tests/tools/test_errors_ns.cpp` 成功 → 文件在 HEAD 中；
+  - **结论：任何从 HEAD 全新 checkout 的构建都会编译失败**。当前 `ctest` 通过仅因为工作区恰好带着未提交的 `error.hpp`；
+  - **成因追溯（这是我自己的遗留）**：B-03 批次按台账 U-01 的默认建议「保留该 API 并在 B-03 补最小测试与示例」行动时，**提交了测试与示例，却没有提交它所依赖的头文件** —— 因为该文件是用户在途文件，AI 不得代为提交。于是仓库进入「测试已提交、被测代码未提交」的中间态；
+  - **修复需用户执行**：提交 `include/go2cpp/tools/error.hpp` 的 `errors::` 命名空间。若决定撤回该 API，则须删除两个文件并回退 `cmake/Go2CppTests.cmake:21`/`:99` 与 `tests/test_main.cpp:28`/`:70`。**按无人值守规则，此项标「需用户决策」而非擅自处理** —— 提交用户的在途文件是明确禁止的。
+- **T-09（低）**：`tests/tools/test_errors_ns.cpp:55-60` 的注释**与事实相反** —— 它称「头文件 `error.hpp:136` 只有裸声明、没有任何注释」，但 `:131-134` 早有注释（`d0fdf70` 于 2026-10-10 12:52 加入）。**该测试注释正是当初 D-14 登记的依据**，D-14 已据 `git blame` 结案，此处须同步修正。它另外还引用了**已过时的行号** `src/tools/error.cpp:392-394`（重排后为 `:463-465`），违反 2026-10-11 确立的引用约定。
+- **T-11（低）**：三个公开接口**零测试覆盖** —— ① `AsMutable<T>()`（`error.hpp:183-193`，用 `const_pointer_cast` 返回**可变**指针，与全局「错误不可变」契约有张力，注释自己都说「普通调用方应使用 `As<T>()`」，属**高危却无覆盖**）；② `errors_is()`（`:195-197`）；③ `errors_as<T>()`（`:199-202`）。
+- **error 模块讲解要点（已在 `docs/module_tour.md` 展开）**：
+  - **核心契约**：`ErrorPtr = shared_ptr<const Error>`，「错误实现构造后必须保持不可变，因此共享 ErrorPtr 可以安全地在线程和 Fiber 之间传递」（`error.hpp:17-20`）—— 这条不可变性是所有跨线程共享无需加锁的前提；
+  - **`Is` 默认按对象地址比较**（`:36-38` `this == &target`），而非按消息。`test_error.cpp:36` 专门断言「消息相同但对象不同的错误互不匹配」—— 这不是疏漏，而是包装链有意义的前提；
+  - **遍历是迭代的 + 按地址去重**（`As` 的实现 `:140-167` 用显式栈 + `unordered_set<const Error*>`，不用递归）。两个后果都被测试固化：**10 万层深链不爆栈**（`test_error.cpp:96-109` 构造 100,000 层 `Wrap`）、**自指错误图不死循环**（`:82-92` 的 `CycleError`）；
+  - **`As<T>` 是 noexcept + try/catch 的正面范本**（`:172-181`），注释写明「Is/As 是查询型 noexcept API…不能让异常穿过边界并触发 terminate」。`test_error.cpp:68-79` 用 `ThrowingUnwrapError` 验证 `Is`/`As`/`Unwrap` 三条路径都返回安全值。**这也是 X-25 所引用的「项目已有既定策略」的又一正面证据**；
+  - **测试质量评述**：`test_error.cpp` 覆盖得相当扎实，十项通常会被漏掉的断言都有（见文档表格），包括**空 visitor**（`:65`）、**精确格式化长度**（`:104-108`、`:120-124`）。**这也是 D-25 的核实结果**：空 visitor 的**行为已被测试固化**，D-25 只是文档缺失，严重度维持「低」；
+  - **示例评述**：`example/tools/errors_demo.cpp` 5 个场景划分合理（构造/包装、身份语义、聚合含空输入、类型提取命中与未命中、Unwrap 边界），`example/README.md:60` 有对应登记行。除 T-10 的依赖问题外无其他发现。
+- **验证结果**：本批为**只读回溯 + 文档产出**，未改动任何源码或测试，未触发构建。
+- **台账状态**：新增 **T-09**、**T-10**、**T-11**；待办 **12 条**（`D-24`、`D-25`、`X-06`、`X-23`~`X-29`、`T-09`~`T-11`）。其中 **T-10 标为「需用户决策」且严重度为高**，是本项目当前唯一影响可构建性的问题。
+- **下一步**：模块 2 —— `control_flow`（`defer`/`panic`/`recover`），对应 `tests/tools/test_control_flow.cpp`(177) 与 `example/tools/control_flow_demo.cpp`(94)；随后按依赖继续 `config` → `logging` → `context` → `fiber`/`fiber_local`/`thread_policy` → `sync` → `scheduler` → `future`/`channel`/`event` → `timer` → `io`/`hook`/`fd_manager` → `address`/`socket`/`byte_array`/`endian`/`framing` → `http`/`websocket`/`sse` → `go`/`runtime`。
+
 ## 2026-10-12：include 100% 读完 + D-14 结案 + 新增 D-24/D-25 + X-06 补充
 
 - **本轮读实现**（一次性读完 include 剩余全部）：
