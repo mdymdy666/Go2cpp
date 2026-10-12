@@ -13,6 +13,78 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：审查 HybridGate 并盘点全项目混合同步设施（新增 X-33/X-34，X-25 扩至 11 处）
+
+- **用户指令**：「HybridGate 这个东西实现真的没有问题吗」+「尝试在整个项目里面找到混合并发的锁还有哪些」。
+
+### 一、HybridGate 审查结论
+
+**读全文**：`include/go2cpp/concurrency/core/hybrid_mutex.hpp`(114)，无配套 `.cpp`。
+
+| # | 发现 | 严重度 |
+|---|---|---|
+| **H6/X-33** | **命名与实际混合维度不符**：`HybridGate` 的「混合」是**「有限自旋 + `std::mutex` 慢路径」两种策略**，**不是「线程/Fiber」两种执行体**。它**内部没有任何 park**，因此若被当作混合锁使用，受管 G 会**在自己的 M 上自旋并占满 carrier 线程**，比裸 `std::mutex` 更糟。头文件 `:4-5` 已划红线（「只用于非常短的 Fiber 唤醒/撤销临界区，**不得保护可能阻塞、执行用户回调或执行系统调用的代码**」），但项目里**另有真正的混合锁 `sync::Mutex`（`sync.hpp:69` 自称 FIFO 混合互斥锁）**，两者共用「混合」一词 | **低-中（认知风险）** |
+| **H1/X-25⑪** | `lock()` 标 `noexcept`，慢路径 `m_slow.lock()`（`:74`）**可抛**。**且它在 `ParkingCondition::WaitNode::Wake()` 的链上**（`parking_condition.cpp:69` 的 `lock_guard<HybridMutex>`），而 `Wake()` **本身也是 `noexcept`** —— 两层的 `noexcept` 叠加。同文件 `Wake()` 对 `wake_or_cancel` 已有 try/catch，属项目既有策略，故此为实现遗漏 | **中** |
+| H2 | 慢路径 `for(;;)` **无界自旋** —— 依赖「极短临界区」这一**文档契约**，无强制手段；违反时烧 CPU 无上限 | 低-中 |
+| H3 | `unlock()` 只 `m_fast.clear()`，**不检查所有权**（没持锁也能解锁，静默破坏互斥）。对比 `sync::Mutex::Unlock()` 会「报告逻辑错误」 | 低 |
+| H5 | **快路径可插队慢路径**：`m_fast` 一释放，新来者能在快路径直接拿到，而 `m_slow` 上排队的还要等 → **无公平性保证**（`sync::Mutex` 承诺 FIFO） | 低 |
+| — | **正确的部分**：慢路径用 `m_slow` 保证「同一时间只有一个线程等原子标志，避免多个失败者同时忙等」（`:72-73` 注释）；`m_slow` 只在 `lock()` 内部短暂持有，`unlock()` 不需碰它；`Normalize` 把 `fast_attempts==0` 修正为 1；默认值用 `inline static atomic` 支持运行期调整且不改动已构造的门 | — |
+
+### 二、全项目「混合并发」设施盘点
+
+**先厘清一件事：「混合」在本项目里有两种完全不同的含义。**
+
+| 设施 | 混合的是 | `src/`+`include/` 引用数 |
+|---|---|---|
+| **`core::ParkingCondition`** | **线程 ↔ Fiber**（park / native CV） | **46** ← 主力 |
+| **`sync::Mutex`** | **线程 ↔ Fiber**（FIFO，park / native） | **23** |
+| `sync::WaitBackend` | 线程 ↔ Fiber（`sync::Mutex` 的可替换后端） | 11 |
+| **`FutureWaitBackend`** | 线程 ↔ Fiber（**`ParkingCondition` 之上的抽象层**） | 8 |
+| **`core::HybridGate`/`HybridMutex`** | **自旋 ↔ 阻塞**（**不是**线程/Fiber） | 25 |
+| `std::condition_variable(_any)` | 原生 | 9 |
+| `sync::ConditionVariable` | 线程 ↔ Fiber（**但零使用**） | 0 |
+| `sync::WaitGroup` | 线程 ↔ Fiber（**但零使用**，2 处引用都在实现自身） | 2 |
+
+**真正的混合锁持有者清单**：
+
+**A. `core::ParkingCondition`（12 处成员）**
+
+| 位置 | 用途 |
+|---|---|
+| `channel.hpp:548` `m_cv` | 通道等待 |
+| `channel.hpp:1106` / `:1118` `PendingSend/Recv::cv` | select 节点等待 |
+| `channel.hpp:1579` `m_change_cv` | 变更通知 |
+| `scheduler.hpp:389` `Task::m_completion_condition` | 任务完成等待 |
+| `socket.hpp:164` `m_operation_condition` | 关闭时等在途操作 |
+| `context.hpp` `DoneSignal` 内部状态 | 取消通知 |
+| `future.hpp`（`FutureState` 内） | Future 等待 |
+| `event.hpp`（内部） | 批次唤醒 |
+
+**B. `sync::Mutex`（4 处成员）**
+
+| 位置 | 用途 |
+|---|---|
+| `sse.hpp:185` `m_mutex` | SSE 流写入串行化（注释：「写入可能在 Fiber 中 park，**必须使用 Fiber/线程混合锁**」） |
+| `websocket.hpp:157-158` `m_read_mutex`/`m_write_mutex` | WS 读写串行化（「避免受管 Fiber 在同一个 M 上阻塞 OS 线程」） |
+| `event.hpp:406-407` `m_mutex`/`m_work_mutex` | EventBatch 状态 |
+
+**C. `HybridMutex`（少量，短临界区）**：`parking_condition.cpp` 的 `WaitNode::m_wake_mutex`、`scheduler.cpp:2869` 一带、`sync.cpp:358`/`:778`。
+
+### 三、附带发现（X-34）：三个「零运行时使用」的公开设施
+
+`sync::ConditionVariable`（**0 次**）、`sync::WaitGroup`（2 处**全在实现自身**）、
+`sync::WaitBackend`（11 处基本在实现/声明）。加上本会话早先确认的
+`control_flow`（`src/` 零使用）与 `ContextRollback`（36 处全在 `context.cpp` 自身）——
+**共五处属「面向使用者、运行时自身不用」**。这不是缺陷，但**建议在 `docs/` 中统一标注定位**，
+避免后续审计反复把它们当死代码重新调查。
+
+### 四、状态
+
+- 台账：**X-25 第五次扩充（11 处）**；**新增 X-33（HybridGate 命名歧义）、X-34（零使用设施定位）**。
+- **本轮只登记不改动代码**（H1 虽满足即时修复的例外③，但属既有基础设施，
+  且用户本轮是提问而非下达修改任务，故登记待命）。
+- 待办：**22 条**。
+
 ## 2026-10-12：ContextRollback 增强的自我审查 —— 修复 8 处问题，测试加强到 16 组
 
 - **用户指示**：「加强刚刚实现部分的测试，并且代码重新审查和修正，确保这部分内部不存在问题」。
