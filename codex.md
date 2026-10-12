@@ -11,6 +11,23 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 定向审计（channel.hpp :900-1600）—— 新增 X-23
+
+- **本轮读实现**：`include/go2cpp/concurrency/channel.hpp` 的 `:900-1600`，约 700 行，覆盖 `ArmSelectRecv` 余下、`ArmSelectSend` 全文、`DisarmSelect`、`PendingSend`/`PendingRecv`/`CallbackGuard`、`ContextSendStatus`/`ContextRecvStatus`、`DeadlineReached`/`NotifyGeneration`、`SendUntil`、`RecvUntil`、`RefillBufferLocked`、`ErasePending` 与全部成员字段。
+- **新发现：X-23（低，命名误用）**。`SendUntil`（`:1297`）调用 `ContextRecvStatus`，而 `RecvUntil`（`:1339`）调用 `ContextSendStatus` —— **两个辅助函数被交叉复用**。经逐行比对确认二者逻辑完全等价，**仅返回类型不同**（`:1135-1144` 返回 `ChannelSendResult`；`:1146-1159` 返回 `ChannelStatus` 并写 `ErrorPtr*`），因此**当前行为正确**，不是缺陷，而是**可维护性风险**：若将来有人只改 `ContextSendStatus`（顾名思义以为只影响发送），会连带改变接收路径。已登记，建议合并为中性命名的单一辅助函数。
+- **本段核对通过的要点**：
+  - `:919-1059` `ArmSelectSend` 与 `ArmSelectRecv` 结构对称：双重检查（`:921-927`）、`receiver_scan_limit` 限制轮数、把自己的节点 `pop_front` + `emplace_back` 转到队尾避免自匹配；`:984-990` 与 `:1024-1035` 都遵循「**先构造值、再发布 select**」的顺序，并在 `TrySelect` 失败时回滚（`receiver->value.reset()` / `m_buffer.pop_back()`），保证用户类型抛异常时不留下半提交状态；
+  - `:1061-1093` `DisarmSelect` 遍历两个队列标记 `cancelled` 并 erase，只有确实删除过才 `++m_generation`，通知放在锁外；
+  - `:1170-1335` `SendUntil` 的优先级正确：先与最早等待的接收者会合，再使用缓冲，最后才挂起；`:1198-1200` 与 `:1207-1209` 两处 catch 都**保留接收节点**（注释说明「值复制失败时保留接收节点，后续发送仍可重试」、「选择状态未发布时节点仍然有效，不能先把它从队列移除」）；`:1229-1231` 强调 `optional::emplace` 抛异常时保持空值的强保证；
+  - `:1262-1264` 与 `:1434-1437` 都用 `core::ParkingCondition::FiberWaitUnsupported()` **提前拒绝**手动 Fiber，与 `src/concurrency/channel.cpp:189-193` 的 Select 路径一致 —— 即 Channel 的每条等待路径都不会在无法 park 时静默阻塞 carrier 线程；
+  - `:1372-1375`、`:1389-1413`、`:1518-1528`、`:1554-1559` 四处按 `is_nothrow_move_constructible` / `is_nothrow_copy_constructible` **分派移动或复制**，并只在存在 nothrow 路径时才认领 select 节点，与类注释 `:591-592` 的契约一致；`:1347-1359` 提取缓冲值时依赖「`Channel<T>` 要求移动构造不抛异常」这一 `static_assert` 前提（注释 `:1348-1349` 已说明）；
+  - `:1571-1575` `ErasePending` 用 `remove` + `erase` 而非直接 erase，对 deque 是正确的；`:1584` `m_generation` 是 `atomic<uint64_t>`，而 `:774` 的 `Generation()` 用 acquire 读、`:1166` 的 `NotifyGeneration` 用 release 递增，配对正确。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建。
+- **累计进度（include 审计）**：`channel.hpp` 已读 1,600 / 2,007 行（80%）；`include/` 整体约 **1,900 / 9,850 行 ≈ 19%**。
+  - **仍未读**：`channel.hpp` 余约 407 行（`:1600-2007`，含 `RecvChecked`/`SendChecked` 余下、`Select`/`RecvCase`/`SendCase`/`SelectResult` 等）；以及 `future.hpp`(952)、`config.hpp`(541)、`log.hpp`(506)、`event.hpp`(424)、`context.hpp`(408)、`timer.hpp`(344)、`io.hpp`(314) 与其余 20 个头文件。
+- **台账状态**：新增 **X-23**；待办 **2 条**（`D-14` 阻塞于用户文件、`X-23` 为待定的命名改进）。
+- **下一步**：读完 `channel.hpp :1600-2007`，然后转入 `future.hpp`(952)。
+
 ## 2026-10-12：include 定向审计（channel.hpp :300-900）
 
 - **本轮读实现**：`include/go2cpp/concurrency/channel.hpp` 的 `:300-900`，约 600 行，覆盖 `FunctionSelectCaster`、`ChannelSendResult`、`SelectProbe`、`SaturatingDeadline`、`SelectWaitState` 全文、`ChannelRecvResult`、`Channel<T>` 类头与 `Create`/`Capacity`/`Len`/`IsClosed`/`Send*`/`Recv*`/`TrySend`/`TryRecv`/`Close`/`Generation`/`WaitForChange`/`ArmSelectRecv` 开头。
