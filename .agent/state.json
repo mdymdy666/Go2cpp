@@ -1,13 +1,13 @@
 {
-  "round": 46,
+  "round": 47,
   "current_batch": null,
   "current_items": [],
-  "last_batch": "include 通读（sync/thread_policy/sse/address 全文）",
+  "last_batch": "include 通读（framing/hybrid_mutex/hook/byte_array/endian/context_backend/runtime/status）",
   "last_result": "success",
-  "last_commit": "b44e5f9",
+  "last_commit": "7635ad0",
   "consecutive_failures": {},
   "blocked_items": [
     "D-14"
   ],
-  "updated_at": "2026-10-12T12:52:00+08:00"
+  "updated_at": "2026-10-12T12:56:00+08:00"
 }
