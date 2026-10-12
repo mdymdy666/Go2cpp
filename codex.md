@@ -11,6 +11,24 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 通读（scheduler.hpp 全文 662 行）
+
+- **本轮读实现**：`include/go2cpp/concurrency/scheduler/scheduler.hpp`(662)，**全文读毕**。它是 include 侧倒数第二个大文件，且与已全文读过的 `src/concurrency/scheduler.cpp`(4048) 直接对应，因此本轮做了**声明与实现的交叉核对**。
+- **X-10 精确化（无新条目）**：读全文后发现文档不对称的范围比我先前登记的更精确 —— `scheduler.hpp:525-527` **只为 `wake()` 写了返回值说明**，而 `wake_registered`(`:532`)/`wake_io`(`:533`)/`wake_io_batch`(`:541`)/`wake_or_cancel`(`:544`) **都没有**，尽管 `wake_io` 的返回语义与另外三者相反。**这说明项目已知道需要解释这件事，只是只解释了一个入口** —— 问题因此更应定位为「文档补齐」而非「实现有误」，已就地补充该论据。
+- **交叉核对通过的要点（头文件声明 vs 已读实现）**：
+  - `:443-447` `shutdown_for` 的注释与实现一致：声明「返回 false 表示**超时或从 worker 自身调用**」，而 `scheduler.cpp:2029-2037` 的 worker 分支确实直接返回 false（注释「Worker callers only publish the stop request; a later external caller performs all joins」）；「超时不会释放仍在运行的 Fiber 栈，可稍后再次调用」也与 `shutdown_for` 不销毁 `deferred_destruction` 中任务的行为吻合；
+  - `:304-305` `try_mark_queued_from_worker` 的注释（「通过 queued 原子位先占位，再校验状态…不需要为每次 yield 或 IO 批量唤醒获取 transition_mutex」）与实现 `scheduler.cpp:338-360` 逐条对应；
+  - `:327-334` 三个 `wake_for_*` 的注释准确描述了「不访问 Fiber 栈」「状态转换与 park 共用转换锁」「真正 resume 仍由 execution_claim 串行化，因此不会让两个 M 同时进入同一个 Fiber」—— 这正是实现中 `m_transition_mutex` + `m_execution_claim` 双闸门的用意；
+  - `:181-183` 头文件**明确写出 `pin_workers_to_cpu` 会绑核**（「Linux 上可将 M 绑定到与 P 对应的 CPU。默认关闭…打开后超出 CPU 数量的 P 不执行绑定」）—— 与我在 D-18 里依据 `scheduler.cpp:3505-3515` 修正 `docs/compatibility.md` 的动作**互相印证**：错的是文档，头文件一直是对的；
+  - `:379-381` `m_emergency_next` 的注释「无分配救援队列链接。只在所属 Scheduler 的接纳互斥锁下修改，且不会形成环」与 `emergency_enqueue_locked`/`emergency_pop_locked` 实现一致；`:630-631` `worker_loop` 用 `std::shared_ptr<void>` 的理由也写明了（「不透明共享槽在 Scheduler 增删 machine 记录时保持动态 worker 的地址稳定」）；
+  - `:144-150` `SchedulerObserver::OnEvent` **有意保留可抛出签名**并解释了理由（「让 Scheduler 在 `emit_event()` 中统一捕获第三方插件异常，不能让 worker 线程异常退出」）—— 这与 `scheduler.cpp` 里 `emit_event` 的 try/catch 一致；`:98-101` 还要求「新增事件类型时应保持已有枚举值的语义不变」，是对枚举稳定性的显式承诺；
+  - `:420-421` `BlockingRegion` **刻意禁止移动**并写明理由（「区域绑定到进入它的 M。移动可能让析构发生在其他 Fiber/线程，使原 M 永久保持 Blocking」）—— 这是一个容易被「顺手加个移动构造」破坏的设计；
+  - `Task` 的私有成员中 `m_last_machine_id`/`m_binding_published`（`:374`/`:376`）是**非原子**的，但只在 `Task::run()` 内访问，而 `run()` 由 `m_execution_claim` 串行化 —— 与实现一致，无数据竞争。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建。
+- **累计进度（include 通读）**：已完成 **17 个文件全文**，合计 **5,622 / 9,850 行 ≈ 57%**。
+  - **下一步**：`timer.hpp`(344) → `config.hpp`(541) → `context.hpp`(408) → `log.hpp`(506) → `io.hpp`(314) → `go.hpp`(220) → `control_flow.hpp`(241) → `socket.hpp`(225) → `http.hpp`(246) → `websocket.hpp`(176) → `io_backend.hpp`(87) → `fd_manager.hpp`(69) → `parking_condition.hpp`(98) → `error.hpp`(250，用户在途文件，只读) → 余下零散。
+- **台账状态**：本轮无新增条目（X-10 已存在，仅扩充论据）；待办仍为 **8 条**（`D-14` 阻塞；`X-23`~`X-29` 待定）。
+
 ## 2026-10-12：include 通读（8 个小文件，619 行）—— 新增 X-29，扩展 X-25
 
 - **本轮读实现**（均全文读毕）：`network/framing.hpp`(129)、`concurrency/core/hybrid_mutex.hpp`(114)、`network/hook.hpp`(102)、`network/byte_array.hpp`(94)、`network/endian.hpp`(80)、`concurrency/detail/context_backend.hpp`(44)、`runtime.hpp`(36)、`core/status.hpp`(20)。
