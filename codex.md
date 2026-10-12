@@ -13,6 +13,31 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：模块讲解（模块 2 · control_flow）—— 新增 X-30、T-12~T-14
+
+- **本轮读**：`tests/tools/test_control_flow.cpp`(177)、`example/tools/control_flow_demo.cpp`(94)，并回查 `src/tools/control_flow.cpp` 的关键实现（`s_defer_depth` 用法链、`recover` 各方法、`panic::clear`、`PanicState`）。
+- **★ 新发现：X-30（中）—— panic 恢复边界用 `thread_local` 而非 Fiber 局部**。
+  - `src/tools/control_flow.cpp:15-16` 定义 `thread_local unsigned int s_defer_depth` 与 `thread_local std::exception_ptr s_defer_exception`；
+  - `DeferCallbackScope` 构造 `++s_defer_depth`、析构恢复（`:28-32`），`InDeferCallback()` 即 `s_defer_depth != 0`（`:38`）；
+  - **`recover::take()`（`:257-260`）与 `recover::operator()()`（`:284-287`）都以 `InDeferCallback()` 为唯一的「是否在 defer 回调内」判据** —— 这正是 panic 恢复边界的守门条件；
+  - **而 Go2Cpp 的 Fiber 在同一 OS 线程上多路复用**。当 Fiber A 在其 defer 回调中 **park** 让出 M（回调里等 channel/锁/IO 皆可），Fiber B 在同线程运行并调用 `recover::take()` 时，`s_defer_depth` 因 A 尚未退出回调而**非 0** → B 被判为「在 defer 回调内」，**可以消费掉本不属于它的 panic 状态**；
+  - `s_defer_exception` 同理：A 记录的 defer 异常会被 B 通过 `LastDeferException()` 读到，B 的 `ClearDeferException()` 会抹掉 A 的记录（`:48-64`）；
+  - **最有说服力的一点：项目自己有正确的工具。** `include/go2cpp/concurrency/fiber_local.hpp` 提供 `FiberLocal<T>` —— Fiber 内返回 Fiber 局部值、普通线程内回退为线程局部值，**语义正好覆盖本场景**，`control_flow` 却用了 `thread_local`；
+  - **为何只登记不修**：修改它属于**行为性改动**，不满足「零行为变化」的即时修复例外；且触发需构造特定交错，本环境 TSan 不可用（WSL `unexpected memory mapping`）无法给出运行期现场。头文件侧证据：`control_flow.hpp:17-19` 只说「不负责**跨线程**传播」，**未声明 Fiber 维度的约束**。
+- **T-12（低）测试职责混杂**：`tests/tools/test_control_flow.cpp` `#include "go2cpp/channel.hpp"`（`:1`），其后 **60 行（`:118-177`）全部在测 `Channel`/`Select`/`SelectValue`/`SelectCaster`**，与被测模块无关；而 `announce` 名是 `"defer/panic/recover"`（`:17`）。**后果**：`GO2CPP_TEST_FILTER=control_flow` 会连带跑这些 Select 测试，`filter=channel` 却跑不到。
+- **T-13（低）无信息量断言**：`:97-103` 的 `ordinary_exception_seen` 只依赖 C++ 语言本身的 try/catch，**恒为 true**，无论 `defer`/`panic` 实现是否正确都会通过，无法证伪任何实现。作者意图应是「验证 defer 记录的异常不污染普通异常处理」，但写法没做到。
+- **T-14（低）四处接口零覆盖**：`panic::clear()`（`:184`，实现 `:206-217` 重置全部六个字段）、`recover::bind()`（`:215`，实现返回 `!expired()`，即**绑定时 panic 已析构返回 false**，该语义未验证）、`recover::reset()`/`bound()`、`recover::peek()`（`:228`）—— 后者与 `take()` 的关键差异是**不检查 `InDeferCallback()`**（对比 `:258` 与 `:313-320`），即**可在 defer 边界外读取状态**，这一有意设计未被固化。
+- **模块 2 讲解要点（已写入 `docs/module_tour.md`，现 253 行）**：
+  - **设计选择**：Go2Cpp 把 `panic` 做成**显式状态**而非栈跳转 —— 头文件明说「call() 只记录状态，**不使用 longjmp 或破坏栈的跳转**；用户应在 defer 回调中通过 recover 读取和处理状态」（`control_flow.hpp:143-145`）。所以这里的 recover 不是「捕获并继续」，而是「在 defer 回调里读走状态对象」，调用方必须自己 return/分支；
+  - `recover` 持 **`weak_ptr`**（`control_flow.hpp:231`）是刻意的：`bound()` 用 `!expired()` 判断，三个读取方法都先 `m_state.lock()`，因此 **panic 先析构时 recover 安静失效，不会把状态钉在内存里**；
+  - `defer` 参数**构造时按值保存**（`MakeCallableWithArgs` 把函数与 `std::tuple` 一起捕获，`control_flow.hpp:115-132`），测试 `:25-31` 验证注册时的 `3` 不会随后续改为 `9` 而变化；执行顺序为 C++ 作用域逆序，测试断言 `order == [3, 2, 1]`；
+  - `defer` 回调体被包在 `CallableModel::run() noexcept` 里（`control_flow.hpp:97-103`），异常被 `RecordDeferException()` 记录而非传播 —— 否则会从析构函数抛出。用户要取该异常须主动调 `LastDeferException()`；
+  - **`peek()` 是恢复边界守门条件的唯一例外**：它不检查 `InDeferCallback()`，因为只读不改，用作诊断。
+- **示例评述**：`control_flow_demo.cpp` 三个场景划分合理，且注释主动解释了「panic 是显式状态发布，C++ 不会自动跳转」（`:63-64`）与「不会伪造 longjmp」（`:72-73`），对新手友好。唯一瑕疵是它写日志到 `log/control_flow_demo.log`（`:37-38`），运行示例会改动 `log/` 目录；本流程因此**只做静态审读、不运行 example**，以维持「`log/` 基线 md5 不变」的约束。
+- **验证结果**：本批为**只读回溯 + 文档产出**，未改动任何源码或测试，未触发构建；在途 4 处文件 diff md5 与轮初一致（`94a798af…`）。
+- **台账状态**：新增 **X-30**、**T-12**、**T-13**、**T-14**；待办 **16 条**。
+- **下一步**：模块 3 —— `config`（INI 解析 + `ConfigVar` 原子快照 + 事务回滚），对应 `tests/logging/test_log_config.cpp`(321，含配置部分) 与 `example/logging/log_config_demo.cpp`(80)；随后 `logging` → `context` → `fiber`/`fiber_local`/`thread_policy` → `sync` → `scheduler` → `future`/`channel`/`event` → `timer` → `io`/`hook`/`fd_manager` → 网络层 → `go`/`runtime`。
+
 ## 2026-10-12：模块讲解（模块 1 · error）+ tests/example 审查 —— 新增 T-09/T-10/T-11
 
 - **本轮性质转变**：用户指定新主任务「一边按模块顺序讲解项目，一边查找 test 和 example 的问题」，并要求「先完成 error 的部分」。本轮完成 **模块 1（基础工具层：`error`）**。

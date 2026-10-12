@@ -136,3 +136,118 @@ std::shared_ptr<const T> As(const ErrorPtr& error) noexcept {
 唯一问题是与 T-10 相同的依赖：它同样调用 `errors::`，因此 HEAD 版本编译不过。
 
 ---
+
+## 模块 2 / 基础工具层：`control_flow`
+
+**源码**：`include/go2cpp/tools/control_flow.hpp`(241) + `src/tools/control_flow.cpp`(346)
+**状态**：源码已读、测试已读（`tests/tools/test_control_flow.cpp` 177 行 + `example/tools/control_flow_demo.cpp` 94 行）
+**位置**：仅依赖 `error` 的转发头与标准库；被 `src/tools/` 与示例使用
+
+### 2.1 它解决什么问题
+
+Go 的 `defer`/`panic`/`recover` 是一套**基于栈展开**的控制流。C++ 里 `defer` 可以用 RAII
+天然表达（析构即执行），但 `panic`/`recover` 不能直接映射 —— 用 `longjmp` 会破坏
+C++ 析构，用异常则要求用户代码到处写 try/catch，且异常穿过 Fiber 边界很危险。
+
+Go2Cpp 的选择是：**把 panic 做成显式状态，不做栈跳转**。头文件说得非常直白：
+
+> call() 只记录状态，不使用 longjmp 或破坏栈的跳转；用户应在 defer 回调中通过
+> recover 读取和处理状态。（`control_flow.hpp:143-145`）
+
+所以这里的 "recover" **不是**捕获并继续执行，而是「在 defer 回调里读走那个状态对象」。
+调用方必须自己在 `panic` 之后 return / 分支 —— 这一点示例里也点明了
+（`control_flow_demo.cpp:63-64`）。
+
+### 2.2 三个组件
+
+| 组件 | 角色 | 关键实现 |
+|---|---|---|
+| `defer` | RAII 作用域回调 | 类型擦除的 `Callable`/`CallableModel`（`control_flow.hpp:88-106`），`run() noexcept` 内部 try/catch |
+| `panic` | 显式状态容器 | `shared_ptr<PanicState>`；`call()` 只是写状态 |
+| `recover` | 状态读取句柄 | 持 **`weak_ptr`**（`control_flow.hpp:231`），所以**不延长 panic 生命周期** |
+
+**`defer` 的参数语义**：参数在**构造时按值保存**（`MakeCallableWithArgs` 把函数与
+`std::tuple` 一起捕获进 lambda，`control_flow.hpp:115-132`）。测试 `:25-31` 专门验证：
+`captured` 注册时 `evaluated == 3`，之后改成 9，回调仍收到 **3**。
+执行顺序是 C++ 作用域的**逆序**（LIFO），测试断言 `order == [3, 2, 1]`。
+
+**`defer` 的异常处理**：回调体被包在 `CallableModel::run() noexcept` 里
+（`control_flow.hpp:97-103`），异常被 `RecordDeferException()` 记录而**不是传播** ——
+否则会从析构函数里抛出。用户要取这次异常得主动调 `LastDeferException()`。
+
+**`recover` 用 `weak_ptr` 是刻意的**：`bound()` 用 `!m_state.expired()` 判断
+（`control_flow.hpp:219`），`take()`/`active()`/`peek()` 都先 `m_state.lock()`。
+这样 `panic` 先析构时，`recover` 会安静地失效，而不是把状态对象钉在内存里。
+
+### 2.3 恢复边界的守门条件（本模块的核心设计）
+
+`recover::take()` 与 `recover::operator()()` 的**第一件事**是：
+
+```cpp
+if (!detail::InDeferCallback()) {
+    return std::nullopt;      // take()
+    return false;             // operator()
+}
+```
+
+`InDeferCallback()` 就是 `s_defer_depth != 0`（`control_flow.cpp:38`），
+而 `s_defer_depth` 由 `DeferCallbackScope` 在回调执行期间递增、结束递减
+（`:28-32`）。也就是说：**panic 只能在 defer 回调执行期间被消费** ——
+这正是「恢复边界」的实现。测试 `:63-74` 验证了边界内 `take()` 成功、
+**边界外 `take()` 返回 `nullopt`**。
+
+**`peek()` 是唯一的例外**：它**不检查** `InDeferCallback()`
+（对比 `:258` 与 `:313-320`），因为它只读不改，用作诊断。
+
+### 2.4 ★ 本模块发现的问题
+
+| 编号 | 严重度 | 摘要 |
+|---|---|---|
+| **X-30** | **中** | **恢复边界用 `thread_local` 而非 Fiber 局部，同线程多 Fiber 下会跨 Fiber 泄漏** |
+| T-12 | 低 | `test_control_flow.cpp` 后 60 行测的是 `Channel`/`Select`，与文件归属和 announce 名不符 |
+| T-13 | 低 | `:97-103` 的 `ordinary_exception_seen` 断言恒为 true，无信息量 |
+| T-14 | 低 | `panic::clear()`、`recover::bind()`/`reset()`/`bound()`/`peek()` 无测试覆盖 |
+
+#### X-30 详述
+
+`control_flow.cpp:15-16` 定义了两个 **`thread_local`**：
+
+```cpp
+thread_local unsigned int s_defer_depth = 0;
+thread_local std::exception_ptr s_defer_exception;
+```
+
+而 **Go2Cpp 的 Fiber 在同一 OS 线程上多路复用**（这是整个运行时的基础）。
+`thread_local` 只能区分线程，**不能区分同线程的不同 Fiber**。于是：
+
+1. Fiber A 进入某个 `defer` 回调 → `s_defer_depth` 变成 1；
+2. A 在回调中 **park**（例如回调里等 channel、等锁、等 IO）→ M 被让给 Fiber B；
+3. B 调用 `recover::take()` 或 `recover()` → 看到 `s_defer_depth == 1`
+   → **被判为「在 defer 回调内」**，可以消费掉不属于它的 panic 状态。
+
+`s_defer_exception` 同理：A 在回调中抛出的异常会被 B 通过 `LastDeferException()`
+读到，B 的 `ClearDeferException()` 也会抹掉 A 的记录。
+
+**最有说服力的地方在于：项目自己有正确的工具。**
+`include/go2cpp/concurrency/fiber_local.hpp` 提供了 `FiberLocal<T>` ——
+它在 Fiber 内返回 Fiber 局部值、在普通线程内回退为线程局部值，**正是本场景所需**。
+`control_flow` 却用了 `thread_local`。
+
+**触发条件**是「同线程 Fiber A 在 defer 回调内 park」，在 Fiber 运行时里并非罕见路径；
+但需要构造特定交错，本环境 TSan 不可用（WSL `unexpected memory mapping`），
+因此**作为登记项而非即时修复** —— 修改 `control_flow.cpp` 属行为性改动，
+不满足「零行为变化」的即时修复例外。
+
+### 2.5 示例评述
+
+`example/tools/control_flow_demo.cpp` 三个场景：defer 的参数求值与 LIFO、
+defer 边界内 recover（边界外拒绝）、move-only Select 的错误路径。
+场景划分合理，且**注释里主动解释了「panic 是显式状态发布；C++ 不会自动跳转」**
+（`:63-64`）与「不会伪造 longjmp」（`:72-73`），对新手友好。
+
+一个小瑕疵：示例用 `LoggerManager` 写日志到 `log/control_flow_demo.log`
+（`:37-38`），运行示例会改动 `log/` 目录 —— 在质量审计流程中这属于**运行副作用**，
+需要与「`log/` 基线 md5 必须保持一致」的约束协调（本流程因此**不运行** example，
+只做静态审读）。
+
+---
