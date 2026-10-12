@@ -14,11 +14,73 @@ scope.commit();
 ```
 
 > **命名约定**：`ContextRollback` 的成员同时提供 PascalCase 与
-> 小写下划线两种拼写——`RecordUndo`/`record_undo`、`Mark`/`savepoint`、
+> 小写下划线两种拼写——`RecordUndo`/`record_undo`、
+> `RecordUndoWithCause`/`record_undo_with_cause`、`Mark`/`savepoint`、
 > `RollbackTo`/`rollback_to`、`Commit`/`commit`、`RollbackDone`/`rollback_done`。
 > 小写形式是前者的内联转发，语义完全相同，本文示例统一使用小写形式。
-> 另有 `committed()`、`had_failure()` 只提供小写形式，没有 PascalCase 版本
-> （见 `include/go2cpp/concurrency/context.hpp:307-346`）。
+> 另有 `committed()`、`had_failure()`、`pending_undo_count()`、`failures()`、
+> `rollback_cause()`、`status_name()` 只提供小写形式，没有 PascalCase 版本
+> （见 `include/go2cpp/concurrency/context.hpp` 的 `ContextRollback` 段）。
+
+## 增强接口（2026-10-12）
+
+以下接口在原有能力之上补齐了「**知道为什么回滚**」与「**完整诊断**」两件事，
+全部为**新增**，不改变任何既有调用与行为。
+
+### 带回滚原因的补偿动作
+
+`record_undo_with_cause` 登记的补偿动作在执行时会收到本次回滚的原因，
+便于按「超时 / 取消 / 业务失败」做不同处置：
+
+```cpp
+scope.record_undo_with_cause([&](const go2cpp::ErrorPtr& cause) {
+    if (cause && go2cpp::Is(cause, go2cpp::DeadlineExceededError())) {
+        metrics_.count_timeout();        // 超时：记指标、不告警
+    } else {
+        audit_.record_failure(cause);    // 其他：写审计
+    }
+    resource_.release();
+});
+```
+
+`cause` 的取值按触发路径区分：
+
+| 触发路径 | `cause` |
+| --- | --- |
+| 显式 `rollback(cause)` | 传入的该 `cause` |
+| 父级取消 / deadline 到期（**自动**回滚） | `nullptr`（原因见 `context()->Err()`） |
+| `rollback_to(mark)` 局部回滚 | `nullptr` |
+| 析构自动回滚 | `nullptr` |
+
+**两种动作共用同一条 LIFO 队列，可以混用**：先登记 `record_undo` 再登记
+`record_undo_with_cause`，回滚时后者先执行。
+
+### 观测接口
+
+| 接口 | 作用 |
+| --- | --- |
+| `pending_undo_count()` | 尚未执行（或被领取执行）的补偿动作数量 |
+| `failures()` | **全部**补偿异常，按发生顺序；`failure()` 仍只给第一个（历史语义不变） |
+| `rollback_cause()` | 本次回滚原因；显式路径返回传入的 `cause`，自动路径回退为 `context()->Err()` |
+| `status_name()` / `StatusName(s)` | 状态可读名：`active` / `rolling_back` / `committed` / `rolled_back` / `failed`，未知值返回 `unknown` |
+
+**`failure()` 与 `failures()` 的分工**：前者的「只记第一个」是既有行为，
+为兼容而保留；需要知道**所有**补偿是否失败时应使用 `failures()`。
+
+### 登记失败的原因
+
+`record_undo(action, &reason)` 会在失败时写入可读原因：
+
+| 情形 | 原因文本 |
+| --- | --- |
+| 动作为空 | 补偿动作为空 |
+| 事务已提交 | 事务已提交 |
+| 事务回滚中或已回滚 | 事务已结束（回滚中或已回滚） |
+| child Context 已被取消 | child Context 已被取消，事务转入回滚 |
+
+> **注意**：父级取消通常会**先**把事务推入回滚（`status` 离开活动态），
+> 因此取消之后调用 `record_undo` 多半命中「事务已结束」而不是「已被取消」；
+> 后者只在取消与登记恰好竞态时出现。
 
 ## 示例如何验证结果
 

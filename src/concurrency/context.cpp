@@ -729,9 +729,12 @@ Context::State::~State() {
 }
 
 struct ContextRollback::State : std::enable_shared_from_this<State> {
+    // 内部统一按「接收原因」的签名存储，因此带原因与不带原因的补偿动作
+    // 共用同一条 LIFO 队列；旧式 UndoAction 只需在登记时包一层适配。
+    using Action = std::function<void(const ErrorPtr&)>;
     mutable std::mutex mutex;
     std::weak_ptr<Context::State> context_state;
-    std::vector<UndoAction> actions;
+    std::vector<Action> actions;
     Status status{Status::kActive};
     std::uint64_t generation{1};
     bool rollback_on_cancel{true};
@@ -740,7 +743,9 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
     bool manual_rollback_claimed{false};
     bool had_failure{false};
     std::exception_ptr first_failure;
-    std::vector<UndoAction> pending_context_actions;
+    std::vector<std::exception_ptr> failures;
+    ErrorPtr manual_cause;
+    std::vector<Action> pending_context_actions;
     DoneSignal completion;
 
     /// 函数功能：执行 ContextCanceled，完成本函数所属模块的单步操作。
@@ -764,22 +769,63 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
     /// @param[in] action 调用方传入的参数，具体约束以头文件声明为准。
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
-    bool Record(UndoAction action) {
+    bool Record(UndoAction action, std::string* reason) {
         if (!action) {
+            if (reason) {
+                *reason = "补偿动作为空";
+            }
             return false;
         }
+        return RecordImpl(Action([stored = std::move(action)](const ErrorPtr&) {
+            stored();
+        }), reason);
+    }
+
+    bool RecordWithCause(UndoActionWithCause action, std::string* reason) {
+        if (!action) {
+            if (reason) {
+                *reason = "补偿动作为空";
+            }
+            return false;
+        }
+        return RecordImpl(Action(std::move(action)), reason);
+    }
+
+    bool RecordImpl(Action action, std::string* reason) {
         std::lock_guard<std::mutex> lock(mutex);
         if (status != Status::kActive) {
+            if (reason) {
+                *reason = status == Status::kCommitted ? "事务已提交"
+                                                       : "事务已结束（回滚中或已回滚）";
+            }
             return false;
         }
         if (rollback_on_cancel && ContextCanceled()) {
             status = Status::kRollingBack;
             pending_context_actions.swap(actions);
             context_cancel_claimed = true;
+            if (reason) {
+                *reason = "child Context 已被取消，事务转入回滚";
+            }
             return false;
         }
         actions.emplace_back(std::move(action));
         return true;
+    }
+
+    std::size_t PendingCount() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        return actions.size() + pending_context_actions.size();
+    }
+
+    std::vector<std::exception_ptr> Failures() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return failures;
+    }
+
+    ErrorPtr ManualCause() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        return manual_cause;
     }
 
     /// 函数功能：执行 Mark，完成本函数所属模块的单步操作。
@@ -803,7 +849,7 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
     }
 
     bool BeginPartial(const ContextRollback::Savepoint& mark,
-                      std::vector<UndoAction>& extracted) {
+                      std::vector<Action>& extracted) {
         std::lock_guard<std::mutex> lock(mutex);
         if (status == Status::kRollingBack) {
             abort_requested = true;
@@ -847,6 +893,9 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
             return;
         }
         had_failure = true;
+        // first_failure 保持「只记第一个」的历史语义（failure() 依赖它），
+        // 另外单独累积全部失败，供 failures() 完整诊断。
+        failures.push_back(failure);
         if (!first_failure) {
             first_failure = std::move(failure);
         }
@@ -860,13 +909,13 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
     /// @param[in] extracted 调用方传入的参数，具体约束以头文件声明为准。
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
-    void Execute(std::vector<UndoAction>& extracted) noexcept {
+    void Execute(std::vector<Action>& extracted, const ErrorPtr& cause) noexcept {
         for (auto it = extracted.rbegin(); it != extracted.rend(); ++it) {
             if (!*it) {
                 continue;
             }
             try {
-                (*it)();
+                (*it)(cause);
             } catch (...) {
                 RecordFailure(std::current_exception());
             }
@@ -882,7 +931,7 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
     /// @param[in] remaining 调用方传入的参数，具体约束以头文件声明为准。
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
-    bool FinishPartial(std::vector<UndoAction>& remaining) noexcept {
+    bool FinishPartial(std::vector<Action>& remaining) noexcept {
         std::lock_guard<std::mutex> lock(mutex);
         if (abort_requested) {
             abort_requested = false;
@@ -956,7 +1005,7 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
     /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
-    bool BeginManualRollback() noexcept {
+    bool BeginManualRollback(const ErrorPtr& cause) noexcept {
         std::lock_guard<std::mutex> lock(mutex);
         if (status == Status::kCommitted || status == Status::kRolledBack ||
             status == Status::kFailed) {
@@ -965,6 +1014,11 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
         if (status == Status::kRollingBack) {
             abort_requested = true;
             return false;
+        }
+        // 记录显式回滚原因（拷贝，调用方随后仍要把它交给 Cancel）；
+        // 自动回滚路径不设置它，调用方可从 context()->Err() 取得原因。
+        if (!manual_cause) {
+            manual_cause = cause;
         }
         status = Status::kRollingBack;
         pending_context_actions.swap(actions);
@@ -981,7 +1035,7 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void OnContextDone() noexcept {
-        std::vector<UndoAction> extracted;
+        std::vector<Action> extracted;
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (status == Status::kCommitted || status == Status::kRolledBack ||
@@ -1011,7 +1065,7 @@ struct ContextRollback::State : std::enable_shared_from_this<State> {
                 extracted.swap(actions);
             }
         }
-        Execute(extracted);
+        Execute(extracted, ManualCause());
         FinishFull();
     }
 };
@@ -1137,8 +1191,25 @@ void ContextRollback::DisarmCallback() noexcept {
 /// @param[in] action 调用方传入的参数，具体约束以头文件声明为准。
 /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
 /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
-bool ContextRollback::RecordUndo(UndoAction action) {
-    return m_state && m_state->Record(std::move(action));
+bool ContextRollback::RecordUndo(UndoAction action, std::string* reason) {
+    if (!m_state) {
+        if (reason) {
+            *reason = "事务状态不存在（对象已被移动）";
+        }
+        return false;
+    }
+    return m_state->Record(std::move(action), reason);
+}
+
+bool ContextRollback::RecordUndoWithCause(UndoActionWithCause action,
+                                          std::string* reason) {
+    if (!m_state) {
+        if (reason) {
+            *reason = "事务状态不存在（对象已被移动）";
+        }
+        return false;
+    }
+    return m_state->RecordWithCause(std::move(action), reason);
 }
 
 /// 函数功能：完成 valid 调用，读取或更新相关运行时状态。
@@ -1184,7 +1255,7 @@ bool ContextRollback::RollbackTo(const Savepoint& mark) noexcept {
     if (!m_state || mark.m_state.lock() != m_state) {
         return false;
     }
-    std::vector<UndoAction> extracted;
+    std::vector<State::Action> extracted;
     try {
         if (!m_state->BeginPartial(mark, extracted)) {
             return false;
@@ -1193,11 +1264,12 @@ bool ContextRollback::RollbackTo(const Savepoint& mark) noexcept {
         m_state->RecordFailure(std::current_exception());
         return false;
     }
-    m_state->Execute(extracted);
+    // 局部回滚没有单一的回滚原因，带原因的补偿动作会收到空 cause。
+    m_state->Execute(extracted, {});
 
-    std::vector<UndoAction> remaining;
+    std::vector<State::Action> remaining;
     if (m_state->FinishPartial(remaining)) {
-        m_state->Execute(remaining);
+        m_state->Execute(remaining, {});
         m_state->FinishFull();
         DisarmCallback();
     }
@@ -1216,7 +1288,7 @@ bool ContextRollback::Rollback(ErrorPtr cause) noexcept {
     if (!m_state) {
         return false;
     }
-    const bool owner = m_state->BeginManualRollback();
+    const bool owner = m_state->BeginManualRollback(cause);
     if (!owner) {
         Status current;
         {
@@ -1285,7 +1357,7 @@ bool ContextRollback::Commit() noexcept {
     }
     bool committed = false;
     bool context_claimed = false;
-    std::vector<UndoAction> discarded;
+    std::vector<State::Action> discarded;
     {
         std::lock_guard<std::mutex> lock(m_state->mutex);
         if (m_state->status == Status::kActive && !m_state->had_failure) {
@@ -1408,6 +1480,45 @@ std::exception_ptr ContextRollback::failure() const noexcept {
     }
     std::lock_guard<std::mutex> lock(m_state->mutex);
     return m_state->first_failure;
+}
+
+std::size_t ContextRollback::pending_undo_count() const noexcept {
+    return m_state ? m_state->PendingCount() : 0U;
+}
+
+std::vector<std::exception_ptr> ContextRollback::failures() const {
+    if (!m_state) {
+        return {};
+    }
+    return m_state->Failures();
+}
+
+ErrorPtr ContextRollback::rollback_cause() const noexcept {
+    if (!m_state) {
+        return {};
+    }
+    // 显式 Rollback(cause) 记在事务状态上；自动回滚（父取消 /
+    // deadline 到期）没有显式原因，回退到 child Context 的 Err。
+    if (const auto manual = m_state->ManualCause()) {
+        return manual;
+    }
+    return m_context ? m_context->Err() : ErrorPtr{};
+}
+
+const char* ContextRollback::StatusName(Status status) noexcept {
+    switch (status) {
+    case Status::kActive:
+        return "active";
+    case Status::kRollingBack:
+        return "rolling_back";
+    case Status::kCommitted:
+        return "committed";
+    case Status::kRolledBack:
+        return "rolled_back";
+    case Status::kFailed:
+        return "failed";
+    }
+    return "unknown";
 }
 
 /// 函数功能：完成 RollbackDone 调用，读取或更新相关运行时状态。

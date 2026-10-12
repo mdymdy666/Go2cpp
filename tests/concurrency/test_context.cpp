@@ -5,8 +5,167 @@
 #include <atomic>
 #include <chrono>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
+
+namespace {
+
+/**
+ * @brief 验证 ContextRollback 的增强接口。
+ * @details 覆盖：带回滚原因的补偿动作（RecordUndoWithCause）、
+ *          record_undo 的失败原因、pending_undo_count、failures 聚合、
+ *          rollback_cause 与 StatusName。
+ * @return 无；失败项由测试支持代码累计。
+ */
+void check_rollback_enhancements() {
+    using namespace go2cpp;
+    using namespace std::chrono_literals;
+    using Rollback = ContextRollback;
+    const auto root = Background();
+
+    // 1) StatusName 覆盖全部五态，并对未知值返回 unknown。
+    GO2CPP_CHECK(std::string(Rollback::StatusName(Rollback::Status::kActive)) == "active");
+    GO2CPP_CHECK(std::string(Rollback::StatusName(Rollback::Status::kRollingBack)) == "rolling_back");
+    GO2CPP_CHECK(std::string(Rollback::StatusName(Rollback::Status::kCommitted)) == "committed");
+    GO2CPP_CHECK(std::string(Rollback::StatusName(Rollback::Status::kRolledBack)) == "rolled_back");
+    GO2CPP_CHECK(std::string(Rollback::StatusName(Rollback::Status::kFailed)) == "failed");
+    GO2CPP_CHECK(std::string(Rollback::StatusName(static_cast<Rollback::Status>(99))) == "unknown");
+
+    // 2) record_undo 的三条失败路径各自给出可读原因；成功后计数可查。
+    {
+        Rollback scope(root, false);
+        GO2CPP_CHECK(std::string(scope.status_name()) == "active");
+        std::string reason;
+        GO2CPP_CHECK(!scope.record_undo(Rollback::UndoAction{}, &reason));
+        GO2CPP_CHECK(reason.find("空") != std::string::npos);
+        GO2CPP_CHECK(scope.pending_undo_count() == 0U);
+
+        GO2CPP_CHECK(scope.record_undo([] {}));
+        GO2CPP_CHECK(scope.pending_undo_count() == 1U);
+        GO2CPP_CHECK(!scope.committed());
+        GO2CPP_CHECK(scope.commit());
+        GO2CPP_CHECK(scope.committed());
+        GO2CPP_CHECK(!scope.rolled_back());
+        GO2CPP_CHECK(std::string(scope.status_name()) == "committed");
+
+        reason.clear();
+        GO2CPP_CHECK(!scope.record_undo([] {}, &reason));
+        GO2CPP_CHECK(reason.find("提交") != std::string::npos);
+        // commit 会丢弃 undo，因此待办归零。
+        GO2CPP_CHECK(scope.pending_undo_count() == 0U);
+    }
+
+    // 3) 带原因的补偿动作在显式回滚时收到该原因；旧式动作照常执行；
+    //    两种动作共用同一条 LIFO 队列。
+    {
+        Rollback scope(root, false);
+        std::vector<int> order;
+        ErrorPtr seen_cause;
+        GO2CPP_CHECK(scope.RecordUndoWithCause(
+            [&](const ErrorPtr& cause) { seen_cause = cause; order.push_back(1); }));
+        GO2CPP_CHECK(scope.record_undo([&] { order.push_back(2); }));
+        GO2CPP_CHECK(scope.pending_undo_count() == 2U);
+
+        const auto cause = NewError("业务步骤失败");
+        GO2CPP_CHECK(scope.rollback(cause));
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
+        GO2CPP_CHECK(order == (std::vector<int>{2, 1}));   // LIFO
+        GO2CPP_CHECK(seen_cause == cause);
+        GO2CPP_CHECK(scope.rolled_back());
+        GO2CPP_CHECK(!scope.committed());
+        GO2CPP_CHECK(scope.rollback_cause() == cause);
+        GO2CPP_CHECK(scope.pending_undo_count() == 0U);
+    }
+
+    // 4) 自动回滚（父取消）没有显式原因：带原因动作收到空 cause，
+    //    rollback_cause() 回退到 child Context 的 Err()。
+    {
+        auto parent_pair = WithCancel(root);
+        Rollback scope(parent_pair.first);
+        bool cause_was_empty = false;
+        GO2CPP_CHECK(scope.RecordUndoWithCause(
+            [&](const ErrorPtr& cause) { cause_was_empty = (cause == nullptr); }));
+        parent_pair.second();
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
+        GO2CPP_CHECK(cause_was_empty);
+        GO2CPP_REQUIRE(scope.rollback_cause() != nullptr);
+        GO2CPP_CHECK(Is(scope.rollback_cause(), CanceledError()));
+    }
+
+    // 5) failures() 聚合全部补偿异常；failure() 保持「只给第一个」的旧语义。
+    {
+        Rollback scope(root, false);
+        GO2CPP_CHECK(scope.record_undo([] { throw std::runtime_error("first"); }));
+        GO2CPP_CHECK(scope.record_undo([] { throw std::runtime_error("second"); }));
+        GO2CPP_CHECK(scope.record_undo([] { throw std::runtime_error("third"); }));
+        GO2CPP_CHECK(scope.rollback());
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
+        GO2CPP_CHECK(scope.had_failure());
+        GO2CPP_CHECK(scope.status() == Rollback::Status::kFailed);
+
+        const auto all = scope.failures();
+        GO2CPP_CHECK(all.size() == 3U);
+        GO2CPP_CHECK(scope.failure() != nullptr);
+        // LIFO：最后登记的 third 最先执行，因此它是聚合结果的第一项。
+        std::string first_message;
+        try {
+            std::rethrow_exception(all.front());
+        } catch (const std::runtime_error& error) {
+            first_message = error.what();
+        }
+        GO2CPP_CHECK(first_message == "third");
+    }
+
+    // 6) 局部回滚（rollback_to）没有单一原因，带原因动作收到空 cause，
+    //    事务保持 active，且剩余动作数量正确。
+    {
+        Rollback scope(root, false);
+        ErrorPtr seen{NewError("sentinel")};
+        GO2CPP_CHECK(scope.record_undo([] {}));
+        const auto mark = scope.savepoint();
+        GO2CPP_CHECK(mark.valid());
+        GO2CPP_CHECK(scope.RecordUndoWithCause(
+            [&](const ErrorPtr& cause) { seen = cause; }));
+        GO2CPP_CHECK(scope.pending_undo_count() == 2U);
+        GO2CPP_CHECK(scope.rollback_to(mark));
+        GO2CPP_CHECK(seen == nullptr);
+        GO2CPP_CHECK(scope.active());
+        GO2CPP_CHECK(scope.pending_undo_count() == 1U);
+        GO2CPP_CHECK(scope.rollback());
+        GO2CPP_REQUIRE(scope.rollback_done().WaitFor(1s));
+    }
+
+    // 7) 已取消的事务里登记补偿会被拒绝，并给出可读原因。
+    {
+        auto parent_pair = WithCancel(root);
+        Rollback scope(parent_pair.first);
+        parent_pair.second();
+        GO2CPP_REQUIRE(scope.context()->Done().WaitFor(1s));
+        std::string reason;
+        GO2CPP_CHECK(!scope.record_undo([] {}, &reason));
+        // 父取消会先把事务推入回滚（status 离开 kActive），所以此处命中
+        // 「事务已结束」分支；「child Context 已被取消」那条文案只在取消与
+        // 登记恰好竞态时才出现，无法在测试中稳定构造。
+        GO2CPP_CHECK(reason.find("事务") != std::string::npos);
+    }
+
+    // 8) 移动后的空对象：观测接口安全返回默认值。
+    {
+        Rollback source(root, false);
+        GO2CPP_CHECK(source.record_undo([] {}));
+        Rollback moved(std::move(source));
+        GO2CPP_CHECK(source.pending_undo_count() == 0U);
+        GO2CPP_CHECK(source.failures().empty());
+        GO2CPP_CHECK(source.rollback_cause() == nullptr);
+        GO2CPP_CHECK(std::string(source.status_name()) == "rolled_back");
+        GO2CPP_CHECK(moved.pending_undo_count() == 1U);
+        GO2CPP_CHECK(moved.rollback());
+        GO2CPP_REQUIRE(moved.rollback_done().WaitFor(1s));
+    }
+}
+
+}  // namespace
 
 /**
  * @brief 验证 Context 的父子取消、截止时间、Value 和局部回滚。
@@ -460,4 +619,6 @@ void run_context_tests() {
         GO2CPP_CHECK(!scope.rollback_to(stale));
         GO2CPP_CHECK(scope.rollback());
     }
+
+    check_rollback_enhancements();
 }

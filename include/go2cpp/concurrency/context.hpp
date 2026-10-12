@@ -274,6 +274,15 @@ namespace go2cpp
 
         using UndoAction = std::function<void()>;
 
+        /**
+         * @brief 可接收回滚原因的补偿动作。
+         * @details cause 是触发本次回滚的原因：显式 Rollback(cause) 时为该 cause；
+         *          父级取消或 deadline 到期触发的自动回滚时为 nullptr（原因可从
+         *          context()->Err() 取得）；RollbackTo() 局部回滚与析构回滚时
+         *          同样为 nullptr。
+         */
+        using UndoActionWithCause = std::function<void(const ErrorPtr &cause)>;
+
         class Savepoint final
         {
         public:
@@ -304,8 +313,27 @@ namespace go2cpp
         ContextPtr context() const noexcept { return m_context; }
 
         // 成功返回 true。动作应幂等、短小、非阻塞，最好声明为 noexcept。
-        bool RecordUndo(UndoAction action);
-        bool record_undo(UndoAction action) { return RecordUndo(std::move(action)); }
+        // reason 可选；失败时写入可读原因（动作为空 / 事务已结束 /
+        // child Context 已被取消而转入回滚）。
+        bool RecordUndo(UndoAction action, std::string *reason = nullptr);
+        bool record_undo(UndoAction action, std::string *reason = nullptr)
+        {
+            return RecordUndo(std::move(action), reason);
+        }
+
+        /**
+         * @brief 登记一个会在回滚时收到「回滚原因」的补偿动作。
+         * @details 语义与 RecordUndo 完全一致，唯一区别是执行时会把本次回滚的
+         *          原因作为参数传入，便于按超时/取消/业务失败做不同处置。
+         *          两种动作共用同一条 LIFO 队列，可以混用。
+         */
+        bool RecordUndoWithCause(UndoActionWithCause action,
+                                 std::string *reason = nullptr);
+        bool record_undo_with_cause(UndoActionWithCause action,
+                                    std::string *reason = nullptr)
+        {
+            return RecordUndoWithCause(std::move(action), reason);
+        }
 
         Savepoint Mark() const noexcept;
         Savepoint savepoint() const noexcept { return Mark(); }
@@ -334,6 +362,24 @@ namespace go2cpp
 
         Status status() const noexcept;
         bool active() const noexcept;
+
+        /** @brief 返回尚未执行（或被领取执行）的补偿动作数量。 */
+        std::size_t pending_undo_count() const noexcept;
+        /**
+         * @brief 返回全部补偿动作抛出的异常，按发生顺序。
+         * @details 与 failure() 的区别：failure() 只给第一个（历史行为，保持不变），
+         *          本接口给出全部，便于完整诊断。
+         */
+        std::vector<std::exception_ptr> failures() const;
+        /**
+         * @brief 返回本次回滚的原因。
+         * @details 显式 Rollback(cause) 返回该 cause；自动回滚（父取消/deadline）
+         *          返回 context()->Err()；尚未回滚或无法确定时返回空。
+         */
+        ErrorPtr rollback_cause() const noexcept;
+        /** @brief 返回状态名称；未知值返回 "unknown"。 */
+        static const char *StatusName(Status status) noexcept;
+        const char *status_name() const noexcept { return StatusName(status()); }
         bool committed() const noexcept;
         bool rolled_back() const noexcept;
         bool had_failure() const noexcept;

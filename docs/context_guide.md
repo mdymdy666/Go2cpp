@@ -387,6 +387,42 @@ commit   vs 父取消          （32 轮，断言线性化顺序决定结果，�
 
 ---
 
+### 7.6 增强接口（2026-10-12）
+
+`ContextRollback` 补齐了两块：**知道为什么回滚** 与 **完整诊断**。
+
+**① 带回滚原因的补偿动作**
+
+```cpp
+scope.record_undo_with_cause([&](const ErrorPtr& cause) {
+    // 显式 rollback(cause) -> 收到该 cause
+    // 父取消 / deadline  -> 收到 nullptr（原因在 context()->Err()）
+    // rollback_to / 析构 -> 收到 nullptr
+    ...
+});
+```
+
+两种动作（`record_undo` 与 `record_undo_with_cause`）**共用同一条 LIFO 队列**，
+可混用。实现上把内部队列统一为 `function<void(const ErrorPtr&)>`，
+旧式 `UndoAction` 在登记时包一层适配——因此**旧调用完全不受影响**。
+
+**② 观测接口**
+
+| 接口 | 作用 |
+|---|---|
+| `pending_undo_count()` | 待执行补偿数量（测试可直接断言，不必再靠副作用计数器） |
+| `failures()` | **全部**补偿异常；`failure()` 保持「只给第一个」的旧语义 |
+| `rollback_cause()` | 回滚原因；自动路径回退为 `context()->Err()` |
+| `status_name()` | 状态可读名，含 `unknown` |
+
+**③ 登记失败给原因**：`record_undo(action, &reason)`。
+
+**一个实现细节值得记**：父级取消**先**把 `status` 推离活动态，
+所以取消之后登记补偿命中的是「事务已结束」而非「已被取消」——
+后者只在竞态窗口出现。**这一点在补测时先写错了一次断言，是实测纠正的。**
+
+---
+
 ## 8. 场景七：与 `Error` 的集成 —— 两条主线在这里汇合
 
 `Error` 讲解里的核心结论是「运行时只依赖 `Is(err, DeadlineExceededError())` 这一个能力」。

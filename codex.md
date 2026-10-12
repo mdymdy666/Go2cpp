@@ -13,6 +13,74 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：增强 ContextRollback（用户下达的一次性完成任务）
+
+- **用户指示**：「现在着手完成这部分的工作，增强 ContextRollBack 的功能，一次对话内完成」。
+- **背景**：本轮之前已确认 `ContextRollback` 覆盖了 `panic`/`recover` 最有价值的
+  「失败时执行补偿链」那一半，且更强（能自动响应父取消/deadline）；它缺的恰好是
+  「**知道为什么回滚**」。因此本次增强聚焦两个方向：**带回滚原因** 与 **完整诊断**。
+- **改动清单（全部为新增，不改变任何既有调用与行为）**：
+
+  | 新增 | 说明 |
+  |---|---|
+  | `RecordUndoWithCause` / `record_undo_with_cause` | 补偿动作执行时收到本次回滚原因 |
+  | `failures()` | **全部**补偿异常（按发生顺序） |
+  | `pending_undo_count()` | 待执行补偿数量 |
+  | `rollback_cause()` | 回滚原因；自动路径回退为 `context()->Err()` |
+  | `StatusName()` / `status_name()` | 状态可读名（含 `unknown`） |
+  | `record_undo(action, &reason)` | 登记失败给出可读原因（**默认参数**，旧调用不变） |
+
+- **`cause` 的取值按触发路径区分**（已在文档中列表格）：
+  显式 `rollback(cause)` → 该 cause；父取消 / deadline → `nullptr`
+  （原因见 `context()->Err()`）；`rollback_to` 局部回滚 → `nullptr`；析构 → `nullptr`。
+
+- **关键实现选择**：把 `ContextRollback::State` 内部的动作队列从
+  `std::vector<std::function<void()>>` **统一为
+  `std::vector<std::function<void(const ErrorPtr&)>>`**，旧式 `UndoAction`
+  在登记时包一层适配。这样**两种动作共用同一条 LIFO 队列**，可以混用，
+  且 `Mark`/`BeginPartial`/`Execute`/`FinishPartial`/`OnContextDone` 只需改类型，
+  **不引入第二条队列**。
+
+- **改动规模**：`context.hpp` 408 → 454 行；`context.cpp` 1895 → 2006 行；
+  `test_context.cpp` 463 → 617 行。
+
+- **★ 过程中的一次自我纠错（如实记录）**：新测试第一次运行**失败**，
+  失败点是 `test_context.cpp:143` 的 `reason.find("取消")`。
+  排查后确认**是我的测试假设错了，不是实现错了**——
+  父级取消会**先**通过 DoneSignal 回调把 `status` 推离 `kActive`，
+  因此取消之后再调 `record_undo` 命中的是「**事务已结束**」分支，
+  而「child Context 已被取消」那条文案只在取消与登记恰好竞态时才出现，
+  **无法在测试中稳定构造**。已修正断言并把这个语义差异写进两份文档。
+  **这次失败反而证明了新测试有区分力（不是空跑）。**
+
+- **测试覆盖**：新增 `check_rollback_enhancements()`，8 组场景：
+  ① `StatusName` 五态 + 未知值；② `record_undo` 三类失败原因 + 计数；
+  ③ 带原因动作收到显式 `cause` + 旧式动作照常执行 + **LIFO 混用顺序**；
+  ④ 自动回滚（父取消）收到空 cause 且 `rollback_cause()` 回退到 `CanceledError`；
+  ⑤ `failures()` 聚合三个异常且顺序为 LIFO、`failure()` 仍可取第一个；
+  ⑥ 局部回滚无原因且事务保持 active、计数正确；
+  ⑦ 取消后登记被拒且给出原因；⑧ **移动后的空对象**观测接口安全返回默认值。
+  **顺带补上 `committed()` 断言（台账 T-16 结案）**：commit 前 `!committed()`、
+  commit 后 `committed()` 且 `!rolled_back()`、显式 rollback 后 `!committed()`。
+
+- **验证结果**：
+  - `cmake --build build-quality --parallel` → **0 warning / 0 error**；
+  - `ctest --test-dir build-quality` → **26/26 全部通过**；
+  - `GO2CPP_TEST_FILTER=context` 单跑并**校验 announce 文本**
+    （`context cancellation, values and deadlines`），排除空跑；
+  - context 模块**重复运行 5 次全部通过**（Python 驱动，避免 shell 变量被吞）。
+  - 在途 4 处文件全程未触碰。
+
+- **文档同步**：`docs/context_rollback.md` 122 → 184 行（新增「增强接口」章节，
+  含 `cause` 取值表、观测接口表、登记失败原因表，并更新命名约定与过时行号引用）；
+  `docs/context_guide.md` 536 → 572 行（新增 7.6 节）。
+
+- **台账状态**：**T-16 → 已修复/已了结**；待办 **20 条**。本次为纯功能增强，
+  按台账定位（问题台账）**不新增条目**。
+
+- **下一步**：回到 Scheduler 通读计划（7 段，见上一轮记录），
+  或按用户指示继续其他模块。
+
 ## 2026-10-12：Fiber 收尾（100% 读完）+ Scheduler 骨架提取与阅读计划
 
 - **用户指示**：「不要留白，给我继续读，还有 Scheduler 的也要同步完成」。
