@@ -11,6 +11,30 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 通读（timer.hpp + config.hpp 全文，885 行）—— X-25 扩至 7 处
+
+- **本轮读实现**：`include/go2cpp/concurrency/core/timer.hpp`(344) 与 `include/go2cpp/config/config.hpp`(541)，**均全文读毕**。
+- **X-25 第三次扩充（现共 7 处）**。`config.hpp` 内又发现 2 处同类问题，其中一处的形态**比前面几处更值得修**：
+  - ① `:357-360` `ConfigVar<T>::HasPending() const noexcept` 直接构造 `std::lock_guard`；
+  - ② `:327-342` `ConfigVar<T>::NotifyPending() noexcept` 的 **`catch (...)` 块内部再次构造 `std::lock_guard`** —— 「**处理异常的分支本身还可能抛异常**」，一旦发生就是 `noexcept` 逃逸 + `terminate`，而且发生在最不该失败的恢复路径上；
+  - 对照：同文件 `RollbackPending()`（`:366-377`）的加锁**放在 try 内**，异常会被捕获并降级为「保留当前值」，**属正确处理** —— 说明作者在 config.hpp 里是知道要包住加锁异常的，只是漏了两处；
+  - **7 处 = future.hpp 4 + hybrid_mutex.hpp 1 + config.hpp 2**。
+- **config.hpp 另有两处值得记的正面设计（都写了理由）**：
+  - `:299-301` `ApplyString` **先在锁外完成可能抛 `bad_alloc` 的 `make_shared<const T>`**，再进锁写入，注释：「避免写入后才发现内存分配失败而无法把本变量加入事务回滚列表」—— 这是对强异常安全的正确运用；
+  - `:380-385` `PendingChange` **保存 `shared_ptr<const T> old_value` 而不是值的副本**，注释：「回滚时无需再次分配 T，能够在 `bad_alloc` 等异常路径下保持 noexcept 回滚的确定性」—— 用共享所有权把回滚做成无分配操作；
+  - `:327-354` `NotifyPending` 把监听器快照与 `m_pending` 搬出后在**锁外**逐个调用，且每个都独立 try/catch（注释：「单个插件异常不能阻断同一变量的其余监听器，也不能回滚已经完整提交的配置值」）；
+  - `:469-488` `Config` 的私有成员把**三把锁的职责**分别注明：`m_mutex`（变量表与监听器）、`m_transaction_mutex`（「串行化多个 LoadFromIni/LoadFromFile 调用，保证不同线程不会交错写入同一批 ConfigVar 并互相覆盖暂存通知」）、`m_watcher_lifecycle_mutex`（「保护 `std::thread` 对象本身；配置值读取不使用这把生命周期锁」）。
+- **timer.hpp 核对通过的要点**：
+  - `:16-18` `TimerState` 的取消语义写得很实：「取消只保证阻止**尚未领取**的回调；已经进入 Running 的回调需要业务自行协作停止」；`:159-161` 再次重申「回调已经进入 Running 后，Cancel 不会强行打断 C++ 调用栈」；
+  - `:49-51` `TimerOptions` 的注解包含一条**针对数据竞争的设计约束**：「结构体可复制，**创建后不再修改**，避免热路径读取数据竞争」—— 这与 `timer.cpp` 里把 `TimerOptions` 按值存入 `Timer::State` 的做法一致；
+  - `:64-67` `TimerDurationLimits` 明确「达到阈值时记录 WARN/ERROR，但**两者都不拒绝任务**；一年及更长任务仍可正常注册」，与 `timer.cpp:43-66` 的 `log_long_duration` 只记日志不拒绝一致；
+  - `:136-141` `TimerExecutor` 的后端契约写明「Submit **必须快速返回**，返回 false 表示后端停止接收任务」，`:282` 还补了一条关键约束「**不得在 Submit 内恢复别的线程的 Fiber 栈**」—— 这正是 `Scheduler::TimerExecutorAdapter` 采用「提交为 Fiber」而非「直接 resume」的原因；
+  - `:203-206` `TimerService` 说明「回调在服务锁外执行…但会占用该服务线程」与「服务不继承 Scheduler，Scheduler 也不拥有服务，双方通过执行器接口解耦」，与实现一致；`:224-225` 注明默认服务「只在进程结束时回收」。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建。
+- **累计进度（include 通读）**：已完成 **19 个文件全文**，合计 **6,507 / 9,850 行 ≈ 66%**。
+  - **下一步**：`context.hpp`(408) → `log.hpp`(506) → `io.hpp`(314) → `go.hpp`(220) → `control_flow.hpp`(241) → `socket.hpp`(225) → `http.hpp`(246) → `websocket.hpp`(176) → `io_backend.hpp`(87) → `fd_manager.hpp`(69) → `parking_condition.hpp`(98) → `error.hpp`(250，用户在途文件，只读) → 余下零散。
+- **台账状态**：本轮无新增条目（X-25 扩充）；待办仍为 **8 条**。
+
 ## 2026-10-12：include 通读（scheduler.hpp 全文 662 行）
 
 - **本轮读实现**：`include/go2cpp/concurrency/scheduler/scheduler.hpp`(662)，**全文读毕**。它是 include 侧倒数第二个大文件，且与已全文读过的 `src/concurrency/scheduler.cpp`(4048) 直接对应，因此本轮做了**声明与实现的交叉核对**。
