@@ -1,11 +1,11 @@
 {
-  "round": 60,
+  "round": 61,
   "current_batch": null,
   "current_items": [],
-  "last_batch": "模块讲解（fiber + fiber_local + thread_policy）+ T-17/T-18",
+  "last_batch": "Fiber 专题筹备：重读 fiber.cpp 并补充机制章节",
   "last_result": "success",
-  "last_commit": "aafc4d2",
+  "last_commit": "c72ed91",
   "consecutive_failures": {},
   "blocked_items": [],
-  "updated_at": "2026-10-12T14:00:00+08:00"
+  "updated_at": "2026-10-12T14:10:00+08:00"
 }
