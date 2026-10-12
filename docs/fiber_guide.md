@@ -429,6 +429,215 @@ Fiber 外部 `resume` 前后 `errno` 保持（`EDOM` / `ERANGE`）。
 
 ---
 
+### 11.5 实现机制补充（2026-10-12 为 Fiber 专题重读 `fiber.cpp` 所得）
+
+> 本节是应「Fiber 是硬骨头，提前筹备」的要求，对 `src/concurrency/fiber.cpp`(1502)
+> 做的一次系统性重读。**已精读**：`:1-260`（含 `FiberTlsRestore`/`CachedStack`/
+> `StackCache`/`FiberBin`）、`:546-1000`（`Fiber::Impl` 核心：构造、
+> `reset_for_scheduler`、`abandon_suspended`、`~Impl`、`bind_caller`、`resume_locked` 前半）。
+> **尚未精读（留白）**：`:261-545`（`FiberStack` 全文与 `:480-512` 一带的结构）、
+> `:1000-1147`（父链传播余下）、`:1148-1502`（`Fiber` 公开方法实现与取消）。
+
+#### 结构清单
+
+| 结构 | 位置 | 职责 |
+|---|---|---|
+| `FiberTlsRestore` | `:73` | RAII 守卫：`resume_locked` 无论从哪条路径返回都恢复 `s_current_fiber` |
+| `CachedStack` / `StackCache` | `:96` / `:106` | 栈缓存 |
+| **`FiberBin`** | `:133` | **调度器回收池**（`thread_local`，见下） |
+| **`FiberStack`** | `:261` | 栈映射/保护/工具链登记（含 `m_valgrind_stack_id`） |
+| `FiberRecord` | `:520` | 共享诊断记录（墓碑帧的来源） |
+| **`Fiber::Impl`** | `:546` | 全部核心状态与状态机 |
+
+#### ★ 最精妙的一处：errno 的 `NOINLINE` 陷阱
+
+```cpp
+// 将 TLS 地址查找放在挂起函数之外。否则编译器可能在跨线程上下文切换后仍
+// 缓存 __errno_location() 的结果。
+GO2CPP_FIBER_NOINLINE int load_errno() noexcept { return errno; }
+GO2CPP_FIBER_NOINLINE void store_errno(int value) noexcept { errno = value; }
+```
+
+**这行注释点出了一个绝大多数人不会想到的陷阱**：`errno` 在 glibc 里是
+`*__errno_location()`，而 `__errno_location()` 返回的是**线程本地地址**。
+如果编译器把这次调用的结果**缓存在寄存器里**，那么 Fiber 从线程 A 迁移到线程 B 之后，
+读写 `errno` 仍会命中**线程 A 的**存储 —— 静默的错误结果。
+
+**`NOINLINE` + 把读写封成函数**，强迫每次真正重新查询。
+配套的是 `resume_locked` 里的四步（`:924-938`、`:988`）：
+
+```cpp
+const int caller_errno = load_errno();     // 1. 存下调用方的
+...
+store_errno(m_saved_errno);                // 2. 装回本 Fiber 上次的
+... 上下文切换 ...
+store_errno(caller_errno);                 // 3. 恢复调用方的
+```
+
+**这是"Fiber 复用同一 OS 线程"这一事实最隐蔽的后果之一**。
+
+#### `FiberBin` 的真实形态
+
+```cpp
+struct FiberBin {
+    std::vector<std::unique_ptr<Fiber>> entries;
+};
+thread_local FiberBin s_thread_fiber_bin;
+constexpr std::size_t kDefaultFiberBinCapacity = 32U;
+// 防止误配把每个 M 变成无界对象保留池。FiberBin 只应缓存短期突发，
+// 更大的容量不会带来线性收益，且会长期占用 Fiber/闭包对象内存。
+constexpr std::size_t kMaxFiberBinCapacity = 4096U;
+```
+
+**两点**：① 它是 **`thread_local`**——与头文件「回收到**创建它的 M** 的线程本地池」严格对应；
+② **有硬上限 4096**，且注释写明了"为什么不该更大"（缓存只对短期突发有意义）。
+
+#### 栈尺寸归一化的完整链路（`:189-259`）
+
+```
+normalize_stack_size(requested)
+  ├─ requested == 0 → 取 DefaultStackSize()
+  ├─ native 路径：
+  │   ├─ page_size > SIZE_MAX/2        → length_error
+  │   ├─ minimum = page_size * 2
+  │   ├─ maximum_usable = SIZE_MAX - page_size
+  │   ├─ max(requested, minimum) > maximum_usable → length_error
+  │   ├─ align_stack_size(...)         （对齐加法也查溢出）
+  │   └─ checked_stack_mapping_size(...)  ← 提前验证 guard page 加法
+  └─ boost 路径：stack_traits 的 minimum/page/maximum，逐项查
+```
+
+`:233-234` 的注释解释为何要**提前**算映射尺寸：「确保**尚未 resume** 的 Fiber
+也不会保存一个随后会回绕的映射尺寸」——即把一个会在首次 resume 才爆的 bug
+提前到构造期。
+
+#### `bind_caller` 的锁序设计（`:839-886`）
+
+注释（`:829-830`）说明了一个刻意的顺序：
+
+> 先复制父记录，再写入本 Fiber，**避免同时锁两个 Fiber 的记录而形成反向锁序**；
+> 这样错误的并发 resume 会返回失败而不是制造死锁。
+
+实现是：在 `m_metadata_mutex` 下**只读取**父记录指针 → **释放** →
+再去锁父记录取 `depth`/`id`/`execution` → **重新**取自己的 `m_metadata_mutex`
+并复查 `m_parent != caller`（`:876-878`）。**用"释放-重取-复查"换掉了嵌套锁。**
+
+#### `resume_locked` 里三个极易写错的点（`:897-988`）
+
+**① `jump` 返回的两种语义**（`:978-987`）——注释原文：
+
+> jump 返回有两种语义：如果当前 Fiber **仍在 Running**，说明是**它在自己的栈上
+> 恢复了嵌套子 Fiber**，执行流仍属于当前 owner；只有挂起/完成/失败并回到 caller 时，
+> 才恢复旧 TLS。**无条件恢复 `previous_fiber` 会让父 Fiber 后续创建的子 Fiber
+> 错绑到根上下文**，破坏父链并可能触发 fail-fast。
+
+即：`s_current_fiber = (returned_state == Running) ? m_owner : previous_fiber;`
+—— 这一行写错就会**破坏整条父链**。
+
+**② TLS 的 RAII 恢复**（`:901-906`）：因为"调度器级挂起可能在本函数内部
+**沿父链循环多次**"，所以必须用守卫对象保证**最终**恢复最初的调用者，
+否则"父函数在同一栈帧里创建下一个子 Fiber 时，会把**已完成的前一个子 Fiber**
+错当成新子 Fiber 的父级"。
+
+**③ 调度器挂起 vs 普通挂起的分流**（`:990-1000`）：
+
+```
+if (state == Suspended && m_scheduler_propagate && m_parent != nullptr) {
+    → 继续沿父链向上传播（把控制权交回调度器）
+}
+// 否则：普通 Suspend 只回到直接父
+```
+
+注释点明了意图：「普通 `Suspend` 不进入这个分支，因而 fiber2 的普通 `go_back`
+**仍然只回到 fiber1**」。**这正是 `test_fiber.cpp` 那个"嵌套 park"用例所验证的语义。**
+
+#### 工具链集成（生产级标志）
+
+| 工具 | 集成点 |
+|---|---|
+| **ASan** | `m_asan_fake_stack`/`m_asan_caller_bottom`/`m_asan_caller_size`；切换前后调用 **`__sanitizer_start_switch_fiber` / `__sanitizer_finish_switch_fiber`**（ASan 官方的 Fiber 协议） |
+| **TSan** | `m_tsan_fiber`/`m_tsan_caller`；`__tsan_create_fiber` / `__tsan_switch_to_fiber` / `__tsan_get_current_fiber` |
+| **Valgrind** | `FiberStack` 的 `m_valgrind_stack_id` |
+
+**能同时正确接入三套工具链**，说明这份实现是按"会被真实用户拿去跑 sanitizer"
+的标准写的——**而本环境的 TSan 恰恰因为 WSL 限制跑不起来**（`unexpected memory mapping`），
+这也解释了为什么测试里那些 `RUNNING_ON_VALGRIND` 分支（见 T-15）是有意保留的。
+
+#### 栈的回收时机（`:965-975`）
+
+```cpp
+m_context = (next == Completed || next == Failed) ? nullptr : transfer.context;
+if (m_context == nullptr) {
+    // entry() 返回调用者前已经展开全部用户栈帧。现在可以立即
+    // 把受保护栈放回线程级或全局缓存，避免突发负载中每个排队
+    // Fiber 都重新建立一次映射。
+    m_stack.reset();
+}
+```
+
+**「`entry()` 返回后立即回收」** —— 因为那时用户栈帧已全部展开，
+栈上没有活对象了，可以安全地还给缓存。
+
+#### `abandon_suspended`：**不能伪造 `Completed`**（`:630-651`）
+
+```cpp
+// 挂起的 fcontext 没有正在执行的指令，释放其栈是安全的；但栈上
+// 的 C++ 局部变量无法再展开。因此只能显式标记 Failed，并清理
+// FiberLocal 值，不能伪造 Completed。
+...
+} catch (...) {
+    // 诊断对象分配失败时仍必须完成上下文隔离。
+}
+...
+m_record->state.store(FiberState::Failed, std::memory_order_release);
+fiber_local::detail::Cleanup(m_owner);
+```
+
+**三个设计决定都值得记**：
+1. **标 `Failed` 而不是 `Completed`** —— 因为栈上的局部对象**没有**析构（一次资源泄漏），
+   把它报告成"正常完成"是在撒谎；
+2. **`catch (...)` 兜住异常构造失败** —— 诊断失败不能妨碍"上下文隔离"这件正事；
+3. **主动清理 `FiberLocal`** —— 否则 G 的逻辑身份被复用时会串味（与 `ContextKey` 的 ABA 同类）。
+
+#### `~Impl()` 的状态机（`:653-720`）
+
+```
+1. if (s_current_fiber == m_owner) terminate();
+      ← 不能在自身栈上销毁自身（正确的 fail-fast）
+2. 自旋取得 m_resume_claim                     ← ★ 无界等待 ①
+3. 发布墓碑 + 取消标记（先于一切恢复动作）
+4. Ready → 跳过主体，直接标 Completed
+5. while (true):
+      Completed/Failed → break
+      Running          → terminate()（"取得 claim 后不应再观察到"）
+      其他非法         → abandon_suspended()
+      Suspended        → resume_locked(true)
+                           成功 → 继续循环        ← ★ 无界等待 ②
+                           失败 → abandon_suspended("parent is not resumable...")
+6. 终态复查：若仍是 Ready/Suspended/Running → terminate()（"保守地 fail-fast，避免 UAF"）
+```
+
+**第 2 步的一句注释值得单独引**（`:660-662`）：
+
+> 先取得执行 claim，再观察终态。`entry()` 会先发布 `Completed`/`Failed`，
+> 后由 `resume()` 释放 claim；**若只检查 state，析构可能在这个窗口释放
+> fcontext/保护栈，导致 `resume_locked()` 继续访问已释放对象。**
+
+即：**claim 才是真正的生命周期闸门，state 只是可观测的影子**。
+
+#### X-13 的精确证据（本轮补全）
+
+上述第 2 步与第 5 步就是 **X-13** 所说的"阻塞"的真身，**两处都是无界的**：
+
+- 第 2 步：`while (!CAS) { yield(); }` —— 无超时、无退避、无上限；
+- 第 5 步：循环退出**唯一**依赖主体自己进入 `Completed`/`Failed`。
+  一个 `while (true) Suspend(Park);` 且不检查取消标记的主体，会让析构**永不返回**。
+
+**头文件只说"可能阻塞析构"，未说明是无界忙等/无界循环** —— 这是 X-13 的核心：
+**文档低估了强度**，调用方无法据此判断"到底会不会返回"。
+
+---
+
 ## 12. 本模块发现的问题
 
 | 编号 | 严重度 | 摘要 |

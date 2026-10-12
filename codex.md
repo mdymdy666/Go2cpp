@@ -13,6 +13,26 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：Fiber 专题筹备 —— 重读 `fiber.cpp` 并补充机制章节
+
+- **用户指示**：「Fiber 模块是个重磅硬骨头，你提前再筹备一下」。本轮**不产出新条目**，而是对 `src/concurrency/fiber.cpp`(1502) 做系统性重读，并在 `docs/fiber_guide.md` 追加 **11.5 实现机制补充**（文档由 471 行增至 **679 行**）。
+- **阅读范围（本轮已精读）**：`:1-260`（`FiberTlsRestore` / `CachedStack` / `StackCache` / `FiberBin` / `FiberStack` 开头 / `normalize_stack_size` 全链路）、`:546-1000`（`Fiber::Impl` 的构造、`reset_for_scheduler`、`abandon_suspended`、`~Impl` 全文、`bind_caller`、`resume_locked` 前半）。
+  - **尚未精读（已在文档中明确留白）**：`:261-545`（`FiberStack` 全文与 `:480-512` 一带结构）、`:1000-1147`（父链传播余下）、`:1148-1502`（`Fiber` 公开方法实现与取消路径）。
+- **★ 本轮最值得记的发现（已写入文档）**：
+  - **① errno 的 `NOINLINE` 陷阱（`:156-160`）** —— 代码注释原文：「将 TLS 地址查找放在挂起函数之外。**否则编译器可能在跨线程上下文切换后仍缓存 `__errno_location()` 的结果**」。`errno` 在 glibc 里是 `*__errno_location()`，而它返回**线程本地地址**；若编译器把该地址缓存在寄存器里，Fiber 从线程 A 迁到 B 之后仍会命中**线程 A 的**存储 —— 静默错误。**这是「Fiber 复用同一 OS 线程」最隐蔽的后果之一**，配套的是 `resume_locked` 里的三步存/装/恢复（`:924`/`:938`/`:988`）；
+  - **② 三套 sanitizer 的集成** —— `FiberStack` 带 `m_valgrind_stack_id`；`Fiber::Impl` 带 `m_asan_fake_stack`/`m_asan_caller_bottom`/`m_asan_caller_size` 与 `m_tsan_fiber`/`m_tsan_caller`；切换前后调用 **`__sanitizer_start_switch_fiber` / `__sanitizer_finish_switch_fiber`**（ASan 官方的 Fiber 协议）与 `__tsan_switch_to_fiber`。**能同时正确接入三套工具链**，说明这是按「会被真实用户拿去跑 sanitizer」的标准写的 —— 这也解释了测试里那些 `RUNNING_ON_VALGRIND` 分支（见 T-15）是有意保留的；
+  - **③ `resume_locked` 里三个极易写错的点**（`:897-1000`）：**(a) `jump` 返回的两种语义** —— 注释原文：「如果当前 Fiber **仍在 Running**，说明是**它在自己的栈上恢复了嵌套子 Fiber**……只有挂起/完成/失败并回到 caller 时，才恢复旧 TLS。**无条件恢复 `previous_fiber` 会让父 Fiber 后续创建的子 Fiber 错绑到根上下文**，破坏父链并可能触发 fail-fast」；**(b) TLS 的 RAII 恢复** —— 因为「调度器级挂起可能在本函数内部沿父链循环多次」，必须用 `FiberTlsRestore` 守卫保证最终恢复最初调用者；**(c) 调度器挂起与普通挂起的分流** —— `m_scheduler_propagate` 为真时沿父链继续上传，否则普通 `Suspend` **只回到直接父**（注释：「因而 fiber2 的普通 `go_back` 仍然只回到 fiber1」）—— **这正是测试里那个「嵌套 park」用例所验证的语义**；
+  - **④ `~Impl()` 的状态机与「claim 才是生命周期闸门」**（`:653-720`）：注释原文：「先取得执行 claim，再观察终态。`entry()` 会先发布 `Completed`/`Failed`，后由 `resume()` 释放 claim；**若只检查 state，析构可能在这个窗口释放 fcontext/保护栈，导致 `resume_locked()` 继续访问已释放对象**」。即 **claim 是真正的闸门，state 只是可观测的影子**；
+  - **⑤ `abandon_suspended` 的三个设计决定**（`:630-651`）：**标 `Failed` 而不是 `Completed`**（因为栈上局部对象**没有**析构，报告成正常完成是在撒谎，注释：「不能伪造 Completed」）；**`catch (...)` 兜住异常构造失败**（「诊断对象分配失败时仍必须完成上下文隔离」）；**主动清理 `FiberLocal`**（否则 G 的逻辑身份被复用时串味，与 `ContextKey` 的 ABA 同类）；
+  - **⑥ `bind_caller` 的锁序设计**（`:829-854`）：注释说明「**先复制父记录，再写入本 Fiber，避免同时锁两个 Fiber 的记录而形成反向锁序**；这样错误的并发 resume 会返回失败而不是制造死锁」—— 实现上是「在 `m_metadata_mutex` 下只读父记录指针 → 释放 → 再锁父记录 → 重新取自己的锁并复查 `m_parent != caller`」，**用「释放-重取-复查」换掉嵌套锁**；
+  - **⑦ `FiberBin` 的真实形态**：`thread_local FiberBin s_thread_fiber_bin;`（与头文件「回收到**创建它的 M** 的线程本地池」严格对应），且**有硬上限 `kMaxFiberBinCapacity = 4096`**，注释写明理由「防止误配把每个 M 变成无界对象保留池。FiberBin 只应缓存短期突发，更大的容量不会带来线性收益」；
+  - **⑧ 栈回收时机**（`:965-975`）：`entry()` 返回后**立即** `m_stack.reset()`，注释：「已展开全部用户栈帧。现在可以立即把受保护栈放回线程级或全局缓存，避免突发负载中每个排队 Fiber 都重新建立一次映射」。
+- **★ X-13 补上精确证据（本项因此从「描述」升级为「定位到两处代码」）**：`~Impl()` 里有**两处无界等待** —— ① `:663-669` 用 `while (!m_resume_claim.compare_exchange_weak(...)) { std::this_thread::yield(); }` 自旋等 claim，**无超时、无退避、无上限**；② `:688-711` 的收尾循环，退出**唯一**依赖主体自己进入 `Completed`/`Failed` —— 一个 `while (true) Suspend(Park);` 且不检查取消标记的主体会让析构**永不返回**。**核心问题收窄为「文档低估了强度」**：头文件只说「可能阻塞析构」，而实际是**无界忙等 + 无界循环**，调用方无法据此判断「到底会不会返回」。
+  - 同时记录了一处**相关但正确**的设计（**不构成问题**）：`:656-658` 用 `if (s_current_fiber == m_owner) std::terminate();` 拒绝「在 Fiber 自身栈上销毁自身」，注释说明「否则没有任何安全位置可以释放当前正在使用的栈」—— 这是**正确的 fail-fast**，因为该情形是明确的 API 前置条件违反；
+- **验证结果**：本批为**只读回溯 + 文档产出**，未改动任何源码或测试，未触发构建；在途 4 处文件 diff md5 与轮初一致。
+- **台账状态**：本轮**无新增条目**（X-13 就地补充精确证据）；待办仍为 **21 条**。
+- **下一步（Fiber 专题的剩余留白）**：若用户继续就 Fiber 提问或下达任务，尚有以下未精读部分可作为补充准备：`fiber.cpp:261-545`（`FiberStack` 全文，含 valgrind 登记、保护页、缓存回收）、`:1000-1147`（父链传播余下）、`:1148-1502`（`Fiber` 公开方法、`RequestCancellation`、`FiberLocal` 清理调用点）、以及 `include/go2cpp/concurrency/fiber_local.hpp` 与 `fiber_local.cpp` 的 trampoline 所有权实现。
+
 ## 2026-10-12：模块讲解（基础模块 4 · fiber / fiber_local / thread_policy）—— 新增 T-17、T-18
 
 - **本轮读（全部全文）**：`tests/concurrency/test_fiber.cpp`(439)、`tests/concurrency/test_fiber_local.cpp`(124)、`tests/concurrency/test_thread_policy.cpp`(94)。产出 **`docs/fiber_guide.md`（471 行，13 节）**。
