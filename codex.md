@@ -11,6 +11,27 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 通读（sync / thread_policy / sse / address 全文）—— 新增 X-28
+
+- **本轮读实现**：`include/go2cpp/sync.hpp`(219，真身)、`include/go2cpp/concurrency/thread_policy.hpp`(153)、`include/go2cpp/network/sse.hpp`(205)、`include/go2cpp/network/address.hpp`(153)。四者**均全文读毕**，合计 730 行。
+- **新发现：X-28（低，命名对 IPv6 误导）**。`address.hpp:60` 把 `broadcast_address` 定为 `IPAddress` 的纯虚函数，迫使 `IPv6Address` 也实现；但 IPv6 无广播概念，实现（`address.cpp:206-212`）其实是「host 位全置 1」= **子网最后一个地址**，与 IPv4 版本的真广播（`host | ~mask`）语义不同质，而头文件与实现都没说明。
+- **sync.hpp 核对通过的要点**：
+  - `:100-106` 有意区分了两种加锁接口的**失败语义**：`Lock()` 返回 bool（供可容忍失败的调用方），`lock()` 在无法继续等待时**抛 `std::logic_error`**（满足 BasicLockable 契约，不能返回 bool）。注释把这一差异写明了 —— 这与 X-27 指出的 `EventBatch` 静默失败形成对照：**接口本身提供了抛异常的选择，是用例方选了静默版**；
+  - `:126-127` 把两个易踩的边界写进了类注释：「**没有 Scheduler 的手动 resume Fiber 不受支持**」与「关闭阶段如果无法立即重锁，Wait 返回 false **且 mutex 已解锁**」—— 后者是调用方必须知道的所有权状态，值得赞许；
+  - `:36-45` `WaitBackend::ParkForCleanup` 的默认实现转发到 `Park` 并传 `std::nullopt`，注释说明「Scheduler 后端覆盖此方法，以允许 draining 中已启动 G 暂停等待锁 owner 释放锁，保证重锁后再退出」—— 这正是 X-26 里那份过时副本**缺失**的成员，也是它一旦被误用就会行为不同的原因；
+  - `:74-76` `Mutex` 的契约完整：不支持递归、成功 `Lock` 恰好对应一次 `Unlock`、**`Unlock` 不要求同一 G/线程**（Go 风格所有权）；`:174-175` `WaitGroup` 声明「计数下溢或溢出抛 `std::logic_error` 且计数保持不变」，与 `sync.cpp:1208-1217` 实现一致。
+- **thread_policy.hpp 核对通过的要点**：
+  - `:29-30` 快照注释明确「只用于观测；scheduler 指针不拥有对象；查询快照**不会把线程挂接为 worker，也不会预留 P**」—— 与 `thread_policy.cpp` 的 `CurrentThreadPolicy()` 只读 TLS 的实现一致；
+  - `:61-63` 与 `:110-112` 两处重复强调「由于状态是线程局部的，**移动/析构必须发生在同一 OS 线程**」，并提供了引用版与指针版两个构造函数；`:143-144` 明确 `EnterRuntimeWorker`/`LeaveRuntimeWorker` 「**这是源码级 Hook，不是 ABI 承诺**」—— 这类主动交付边界声明很有价值。
+- **sse.hpp 核对通过的要点**：
+  - `:91-92` 明确 `Parser` 是**有状态单消费者对象**，「多个线程/Fiber 同时 feed 必须由调用方使用 `sync::Mutex` 或把输入集中到一个 Fiber，否则会产生数据竞争」—— 该约束在实现中确实没有内部加锁，**声明到位**；
+  - `:137-141` `Stream` 说明「一个实例内部串行化写入，所以可以由多个生产者安全调用 `send`；**互斥只保证字节不交错，不承诺业务事件顺序**」；`:184-185` 还写明了选型理由「写入可能在 Fiber 中 park，**必须使用 Fiber/线程混合锁，不能使用裸 `std::mutex`**」；
+  - `:89-90` 「EOF 不会把没有空行结束的半个事件强行派发」与实现一致；`:164-167` 的 `state()`/`heartbeat_due()`/`next_heartbeat()` 三个 `noexcept` 查询接口正是 **X-25 所引用的「项目已有既定策略」的出处**（`src/network/sse.cpp:548-589` 对它们都加了 try/catch 兜住加锁异常），本批读头文件进一步确认其 `noexcept` 声明与实现策略是配套的。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建。
+- **累计进度（include 通读）**：已完成 **8 个文件全文** —— `channel.hpp` 2007 + `future.hpp` 952 + `event.hpp` 424 + `fiber.hpp` 228 + `sync.hpp` 219 + `sse.hpp` 205 + `thread_policy.hpp` 153 + `address.hpp` 153 = **4,341 / 9,850 行 ≈ 44%**。
+  - **下一步**：`framing.hpp`(129) → `hybrid_mutex.hpp`(114) → `hook.hpp`(102) → `byte_array.hpp`(94) → `endian.hpp`(80) → `context_backend.hpp`(44) → `runtime.hpp`(36) → `status.hpp`(20) → `scheduler.hpp`(662) → `timer.hpp`(344) → `config.hpp`(541) → `context.hpp`(408) → `log.hpp`(506) → `io.hpp`(314) → `go.hpp`(220) → `control_flow.hpp`(241) → `socket.hpp`(225) → `http.hpp`(246) → `websocket.hpp`(176) → `io_backend.hpp`(87) → `fd_manager.hpp`(69) → `parking_condition.hpp`(98) → 其余。
+- **台账状态**：新增 **X-28**；待办 **7 条**（`D-14` 阻塞；`X-23`~`X-28` 待定）。
+
 ## 2026-10-12：include 通读（event.hpp + fiber.hpp 全文）—— 新增 X-27
 
 - **本轮读实现**：`include/go2cpp/tools/event.hpp`(424，本轮补齐 `:250-424`) 与 `include/go2cpp/concurrency/fiber.hpp`(228)。两者**均全文读毕**。
