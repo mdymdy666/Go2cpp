@@ -13,6 +13,57 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-12：逐块讲解 Context::State（用户要求「详细讲解，包括场景/功能/源码实现」）
+
+- **读全文**：`src/concurrency/context.cpp:382-747`（字段 + 10 个成员函数）。
+
+### 讲解的核心结论（供后续审计复用）
+
+**`DrainCancellation`（`:533-638`）是 `State` 的心脏**，取消一棵子树严格分三段：
+
+1. **遍历整棵子树，只做标记**（显式 `work` 栈迭代，非递归）：
+   锁内只改状态（写 `error`/`cause`、摘 `timer_id`、搬走 `before_done_callbacks`、
+   `children.clear()`、收集 descendants），**锁外**才做动作（`TimerService::Remove`、
+   `parent->RemoveChild`、下推子节点）。**`root || error` 两条提前 continue 实现
+   「root 免疫」与「取消幂等」。** 原因（`error`/`cause`）随工作项**沿子树下传**，
+   所以整棵子树共享同一根因——这正是 Go 的 `Err()`/`Cause()` 双层语义。
+2. **逆序执行 `before_done_callbacks`**（`:623-633`，`rbegin/rend`）：
+   **「冻结」从最内层开始**，保证 `ContextRollback` 在 `done=true` 前进入回滚态，
+   使观察者/`RecordUndo`/`Commit` 不会在取消窗口里误把新动作当作可提交。
+3. **逆序 `Signal()`**（`:634-637`，`rbegin/rend`）：**叶子先通知、根最后**。
+   原因是 `:540-541` 注释点明的死锁场景——**Done 回调可以观察或等待后代**，
+   若父先 `Signal`，父的观察者在子尚未 `Signal` 时去等子就会被卡住，
+   而这段等待发生在**取消传播的同步路径**上，于是传播本身死锁。
+
+**其他值得记录的实现要点**：
+
+- **`CancellationWork` 必须持 `shared_ptr<State>`**：因为父的 `children` 是 `weak_ptr`，
+  传播途中节点可能被销毁，工作项必须自持强引用。
+- **`AddChild` 处理「父已取消后才创建的子」**：不在 `children` 登记，而是**锁内拷贝**
+  `error`/`cause`，**锁外**调 `child->CancelFromParent(...)` —— 避免持自身锁去传播整棵树（锁序安全）。
+- **`Cancel` 与 `CancelFromParent` 的三点差异**：`error`（空 vs 继承）、`deadline_error`
+  （调用方指定 vs false）、`remove_from_parent`（true vs false，主动取消者从父的登记表摘除自己）。
+- **`RemoveChildRaw` 兼职惰性清理**：`remove_if` 同时移除 `expired()` 项，
+  与 `AddChild` 开头的清理配合，防止 `weak_ptr` 空槽无限膨胀。
+- **`Lookup` 的锁序**：**每次只锁一个节点**（锁内取 `parent` 到局部强引用后立即解锁），
+  再锁父节点，**从不嵌套加锁**；并用 `shared_from_this()` 保活自身。
+  且 **`token != nullptr` 与 `token == nullptr` 是二选一**——
+  类型化键**只**查 `typed_values`，字符串键**只**查 `named_values`，两者互不回退
+  （因为 `ContextKey::Name()` 仅用于调试，不参与查找）。
+
+### 本轮发现
+
+| # | 问题 | 严重度 |
+|---|---|---|
+| **X-25⑬** | `Context::State::IsCanceled()`（`:485-489`）标 `noexcept` 却加锁。它是取消状态的**基础查询**，被 `ParkingCondition::ContextCanceled()`、`ContextRollback::State::ContextCanceled()` 等调用 | 低 |
+
+**X-25 累计 13 处。**
+
+### 状态
+
+- 台账：**X-25 第七次扩充 → 13 处**；待办仍 **24 条**（本轮未新增条目）。
+- **仅读代码 + 写台账，未改动源码。**
+
 ## 2026-10-12：登记 HybridGate 移除决策（X-35）；讲解 DoneSignal 并发现 X-36
 
 ### 一、X-35：用户决策「框架绝对不允许 HybridGate」
