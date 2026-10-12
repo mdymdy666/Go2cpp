@@ -11,6 +11,27 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+## 2026-10-12：include 审计（channel.hpp :1600-2007）—— channel.hpp 全文读毕，新增 X-24
+
+- **本轮读实现**：`include/go2cpp/concurrency/channel.hpp` 的 `:1600-2007`，约 407 行，覆盖 `RecvChecked`/`SendChecked` 声明与定义、`SendOnlyChannel`/`RecvOnlyChannel` 全文、`SelectCase`/`SelectResult` 定义、`RecvCase`/`SendCase`/`DefaultCase` 与 `Select` 的重载声明。**至此 `channel.hpp` 2,007 行全部读完。**
+- **新发现：X-24（低，不对称）**。`RecvCase` 与 `SendCase` 的 `arm_checked` 对**不可复制 `T`** 的处理不一致：
+  - `RecvCase`（`:1898-1902`）：`return !channel || channel->ArmSelectRecv(state, index);` —— 不可复制时 `ArmSelectRecv` 内部直接 `return false`，即**如实报告注册失败**；
+  - `SendCase`（`:1959-1966`）：`if constexpr (is_copy_constructible<T>) {...} return true;` —— 不可复制时**无条件返回 true**，**声称成功却未 arm 任何节点**。
+  - 两者都设置了 `unsupported = !is_copy_constructible<T>::value`（`:1903`、`:1967`），而内置 `Select` 在 `src/concurrency/channel.cpp:106-111` 遇到 `unsupported` 就**提前返回错误**，因此**在内置路径上不可达**；
+  - **但风险是真实的**：`arm_checked` 是 `SelectCase` 的**公开字段**（`:1758-1762`），其注释明确其契约是「false 表示注册失败」。**自定义 Select 实现若不检查 `unsupported` 就直接调用 `arm_checked`**，`SendCase` 会让它以为注册成功，随后等待一个永不到来的唤醒 —— 这与 `RecvCase` 的行为形成鲜明反差。已登记，建议两者对称。
+- **本段核对通过的要点**：
+  - `:1603-1609` 与 `:1660-1669` 的方向性视图注释准确：`SendOnlyChannel` 仅暴露 `Send`/`SendFor`/`TrySend`/`Close`/`Capacity`/`IsClosed`，**无任何接收能力**；`RecvOnlyChannel` 仅暴露 `Recv`/`RecvFor`/`TryRecv` 与查询，**无发送且无 `Close`** —— 与注释「只读视图不能发送或关闭」逐条对应；
+  - `:1649-1657` 与 `:1700-1708` 用 `friend` 精确放行 `AsSendOnly`/`AsRecvOnly`/`SendCase`/`RecvCase` 四个构造入口，构造函数保持 private，**外部无法绕过方向约束直接构造视图**；
+  - `:1721-1739` `SendChecked`/`RecvChecked` 把 nil 通道显式化为 `kNil` + `ChannelNilError()`，注释说明「避免像 Go 的 nil 通道一样永久等待」——这正是 `channel.cpp:189-193` 那条 `FiberWaitUnsupported` 检查的同族设计；
+  - `:1802-1819` `SelectResult::Value<T>()` 对 move-only 类型用 `if constexpr` **不实例化 `std::any_cast`**，注释指向 `TakeValue<T>()`；`:1813-1817` 在 `any_cast` 失败时**回退到 `typed_value.As<T>()`**，与 `Take` 的「分路搬运」思路一致；
+  - `:1833-1852` `Cast<T>` 用 try/catch 隔离 Caster 异常并返回 `nullopt`，与 `SelectCaster` 注释（`:258-259`）「不要把异常带入 select 状态机」一致；
+  - `:1858-1882` `RecvCase` 的 probe：nil 通道先返回 `kNil` 探针；`TryRecv` 不 ready 时返回**空 SelectProbe**（表示不可立即完成）；`SetValue` 失败时改报 `kInvalid` —— 三条路径都设 `probe.ready = true`，与 `SelectCase::operator bool`（`:1764-1767`）的判据一致。
+- **验证结果**：本批为**只读回溯**，未改动任何源码或测试，未触发构建。
+- **累计进度（include 审计）**：**`channel.hpp` 2,007 / 2,007 行 = 100%**；`include/` 整体约 **2,007 / 9,850 行 ≈ 20%**（另有若干文件被定向查阅，不计入逐行通读）。
+  - **仍未逐行读**：`future.hpp`(952)、`scheduler.hpp`(662)、`config.hpp`(541)、`log.hpp`(506)、`event.hpp`(424)、`context.hpp`(408)、`timer.hpp`(344)、`io.hpp`(314)、`sync.hpp`(219)、`go.hpp`(220) 等 29 个文件，合计约 7,843 行。
+- **台账状态**：新增 **X-24**；待办 **3 条**（`D-14` 阻塞于用户文件、`X-23`/`X-24` 均为待定的改进项）。
+- **下一步**：转入 `future.hpp`(952)——它含 `Future`/`Promise`/`SharedFuture` 等模板实现，是 include 侧最后几个大文件之一。
+
 ## 2026-10-12：include 定向审计（channel.hpp :900-1600）—— 新增 X-23
 
 - **本轮读实现**：`include/go2cpp/concurrency/channel.hpp` 的 `:900-1600`，约 700 行，覆盖 `ArmSelectRecv` 余下、`ArmSelectSend` 全文、`DisarmSelect`、`PendingSend`/`PendingRecv`/`CallbackGuard`、`ContextSendStatus`/`ContextRecvStatus`、`DeadlineReached`/`NotifyGeneration`、`SendUntil`、`RecvUntil`、`RefillBufferLocked`、`ErasePending` 与全部成员字段。
