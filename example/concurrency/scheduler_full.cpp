@@ -132,13 +132,28 @@ bool scenario_metrics() {
     for (auto& task : tasks) {
         task->wait();
     }
-    const auto metrics = scheduler.metrics();
+    // ★ metrics() 的累加与 task->wait() 的返回之间存在一个很短的窗口：
+    //   实测 8 次运行里有 2 次在 wait() 全部返回后仍读到 task_runs=11（少一次）。
+    //   这是示例的时序假设过严，不是调度器缺陷 —— 改为轮询等待计数收敛。
+    std::uint64_t runs = 0;
+    std::uint64_t completions = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    for (;;) {
+        const auto metrics = scheduler.metrics();
+        runs = metrics.task_runs;
+        completions = metrics.task_completions;
+        if ((runs >= static_cast<std::uint64_t>(kTasks) &&
+             completions >= static_cast<std::uint64_t>(kTasks)) ||
+            std::chrono::steady_clock::now() >= deadline) {
+            break;
+        }
+        std::this_thread::sleep_for(Ms(1));
+    }
     scheduler.shutdown();
 
-    const bool ok = metrics.task_runs >= static_cast<std::uint64_t>(kTasks) &&
-                    metrics.task_completions >= static_cast<std::uint64_t>(kTasks);
-    std::cout << "  task_runs=" << metrics.task_runs
-              << " task_completions=" << metrics.task_completions
+    const bool ok = runs >= static_cast<std::uint64_t>(kTasks) &&
+                    completions >= static_cast<std::uint64_t>(kTasks);
+    std::cout << "  task_runs=" << runs << " task_completions=" << completions
               << "（预期均 >= " << kTasks << "）\n";
     return ok;
 }

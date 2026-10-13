@@ -13,6 +13,67 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：修复 —— scheduler 示例对 metrics 时序的过严假设（flaky）
+
+### 现象
+
+写完 SSE 修复后跑全量 ctest，**`go2cpp_scheduler_full` 开始失败**
+（此前它一直通过）。
+
+**先判定是否 flaky**：连续跑 8 次，
+**2 次失败（run#1、run#5），6 次通过 —— 25% 失败率，确认是 flaky。**
+
+失败点固定是场景 5：
+
+```
+task_runs=11 task_completions=11（预期均 >= 12）
+```
+
+### 根因：示例的时序假设过严，不是调度器缺陷
+
+```cpp
+for (auto& task : tasks) { task->wait(); }   // 全部返回
+const auto metrics = scheduler.metrics();    // 立刻采样 → 有时还差一次
+```
+
+**`metrics()` 的计数累加与 `task->wait()` 的返回之间有一个很短的窗口。**
+`wait()` 返回不代表计数已经写完 —— 采样撞上这个窗口就会少一次。
+
+### 修复：轮询等待计数收敛
+
+```cpp
+const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+for (;;) {
+    const auto metrics = scheduler.metrics();
+    runs = metrics.task_runs;
+    completions = metrics.task_completions;
+    if ((runs >= kTasks && completions >= kTasks) ||
+        std::chrono::steady_clock::now() >= deadline) break;
+    std::this_thread::sleep_for(Ms(1));
+}
+```
+
+### ★ 这一轮暴露的模式：我的示例里有一类"时序过严"的断言
+
+连续三轮都栽在同一类问题上：
+
+| 轮次 | 断言 | 真实情况 |
+|---|---|---|
+| 第 20 轮 | `read_message` 会把 Ping/Pong 交给调用者 | 控制帧由库内部处理 |
+| 本轮 SSE | `"data: cr\r\r"` 直接派发 | 末尾 `\r` 需后续字节确认 |
+| 本轮 scheduler | `wait()` 返回后 metrics 已更新 | 计数与返回之间有窗口 |
+
+**共同点：把"通常成立"当成了"必然成立"。**
+
+**规范（已固化）**：**凡是涉及"另一个执行流 / 后台线程 / 异步计数"的断言，
+都必须用「轮询 + 超时」而不是「一次采样」。**
+
+### 验证
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_scheduler_full`：**连续 10 次全部通过**（修复前 25% 失败）
+- 全量 ctest：**67 个测试全部通过**
+
 ## 2026-10-13：修复 —— SSE 示例对 CR-only 换行的错误假设（并定位一个设计缺口）
 
 ### 现象
