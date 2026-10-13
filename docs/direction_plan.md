@@ -85,7 +85,7 @@
 |---|---|
 | **A-0** | 核实台账 24 条待办与代码的一致性（已完成一轮，发现 2 处不符） |
 | **A-1** | **P0**：`HybridGate` 家族移除（X-35/X-33/T-03：3 个生产文件 12 个加锁点）+ **X-13**（`~Impl` 析构无界自旋）+ **X-14**（I/O 无界自旋） |
-| — | **⚠️ 替换约束（两条，均经第 6 轮自检核实）**：<br>**① `std::mutex` 不可用** —— hook 会把 `connect_with_timeout` 变成跨线程定时任务，`lock()` 与 `unlock()` 可能在不同 M 上；`sync::Mutex` 的 `Unlock()` 无 owner 检查（Go 风格所有权），可用。<br>**② 但 `parking_condition.cpp` 不能换成 `sync::Mutex`** —— `sync::Mutex` 内部的等待后端就是 `core::ParkingCondition`，直接替换会造成 **`core → sync → core` 循环依赖**。<br>**→ 结论：`core` 层需要一个自己的、无自旋的 gate 实现**（原子状态 + 条件变量；或最低限度去掉 `hybrid_mutex.hpp:75-81` 慢路径的 `for(;;)` 无界自旋）。`io.cpp`（network 层）与 `sync.cpp`（同类内部）两处可直接换 `sync::Mutex`。 |
+| — | **⚠️ 替换约束（两条，均经第 6 轮自检核实）**：<br>**① `std::mutex` 不可用** —— hook 会把 `connect_with_timeout` 变成跨线程定时任务，`lock()` 与 `unlock()` 可能在不同 M 上；`sync::Mutex` 的 `Unlock()` 无 owner 检查（Go 风格所有权），可用。<br>**② 但 `parking_condition.cpp` 不能换成 `sync::Mutex`** —— `sync::Mutex` 内部的等待后端就是 `core::ParkingCondition`，直接替换会造成 **`core → sync → core` 循环依赖**。<br>**→ 结论：`core` 层需要一个自己的、无自旋的 gate 实现**（原子状态 + `std::condition_variable`）。**★ 第 8 轮实测修正**：原先写的备选「或最低限度去掉 `hybrid_mutex.hpp:75-81` 慢路径的 `for(;;)` 无界自旋」**已被实验否定** —— `lock()` 的 BasicLockable 契约是"返回时必持有锁"，而去掉 `for(;;)` 后只有两条出路：重新尝试（仍是自旋）或直接返回（未持锁，互斥失效）。**没有第三条路。**因此必须引入条件变量，连带要改 `lock()` 的双锁释放与 `unlock()` 的 `notify_one`，**实际成本约 30~50 行，不是"删掉 6 行循环"**。`io.cpp`（network 层）与 `sync.cpp`（同类内部）两处可直接换 `sync::Mutex`。 |
 | **A-2** | **P1**：**X-11**（`t_incoming_stripe` 是 `thread_local`，属"隐藏调度输入"）+ **X-10**（`kPending` 语义相反）—— 这两条是**第三层 C 的确定性前提** + X-14 |
 | **A-3** | **P2**：**X-25**（13 处 `noexcept` 内加锁/分配）+ **X-12**（维护预算被两处清零）+ **X-32**（`Context::Now()` 热路径锁） |
 
