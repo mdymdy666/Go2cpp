@@ -13,6 +13,95 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 15 轮（A 组 · dynamic_gmp 模块）
+
+### 本轮完成：`concurrency/dynamic_gmp`
+
+| 文件 | 说明 |
+|---|---|
+| `example/concurrency/dynamic_gmp_demo_new.cpp` | **新建 · 简单版**（既有 `dynamic_gmp_demo.cpp` 为 131 行，超出简单版规格） |
+| `example/concurrency/dynamic_gmp_full.cpp` | **新建 · 全面版 7 个场景** |
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **配置上下界** —— `min=max=2` 时 `P=2 Worker=2`，启动数被配置锁死
+2. **负载下扩展** —— **`启动 Worker=1 峰值=4`**（实测确实向上扩展）
+3. **空闲回收** —— **`完成=32 空闲后 Worker=1 已回落=1`**
+4. **★ 保底不被回收** —— `min_workers=3` 时**长时间空闲后仍是 3**
+   （回收目标是下界，**不是 0**）
+5. **任务类别与亲和** —— 40 个同类任务，`affinity_hits=30`，4 个 M 记录过类别
+6. **★ `cancel` 被接受** —— `requested=1 final_state=5`（`kCancelled`）
+7. **★ `cancel` 未被接受** —— `requested=0 final_state=4`（`kDead`）；
+   **任务已完成时取消请求返回 false 是正确的，不是竞态缺陷**
+
+### ★★ 本示例的核心贡献：把 cancel 的"两条路径"都验证到底
+
+既有 demo 的注释里点出了这个契约，但**本示例把它拆成两个独立场景分别断言**：
+
+- **被接受**（`requested == true`）→ **必须收敛到 `kCancelled`**
+- **未被接受**（`requested == false`）→ **必须已在终态**（`kDead`/`kCancelled`/`kFailed`）
+
+**关键在于第二条也要断言"已在终态"** —— 如果 `cancel()` 返回 false 而任务**仍在运行**，
+那就真的是调度器缺陷。只接受"返回 false 也算通过"会漏掉这种缺陷。
+
+### ★ 施工细节：抹掉了一处我自己写下的死代码
+
+场景 2 首版里我写了一段毫无意义的判断：
+
+```cpp
+if (std::chrono::steady_clock::now() >
+    std::chrono::steady_clock::now() + std::chrono::seconds(0)) { break; }
+```
+
+`now() > now()` 恒为假，永远不会 break —— 是我写"边等边采样"时留下的残渣。
+已改为**带明确总超时的正常写法**：
+
+```cpp
+const auto sample_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+while (completed.load() != 64 && std::chrono::steady_clock::now() < sample_deadline) {
+    peak = std::max(peak, scheduler.WorkerCount());
+    std::this_thread::sleep_for(Ms(1));
+}
+```
+
+**示例代码本身就是文档，不该留这种读不通的片段** —— 即使它"能跑、不报警告"。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_dynamic_gmp_demo_new` → **EXIT=0**（3 个片段）
+- `go2cpp_dynamic_gmp_full` → **EXIT=0**（7 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`
+- 5 个原始在途文件未触碰；`future_full.cpp` 也未触碰
+
+### 进度（15 轮完成 16 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 |
+| `concurrency/future` | ✅ 沿用 82 行 | ✅ 186 行 / 6 场景 |
+| `tools/control_flow` | ✅ 沿用 94 行 | ✅ 185 行 / 6 场景 |
+| `concurrency/timer` | ✅ 沿用 178 行 | ✅ 171 行 / 6 场景 |
+| `core/parking_condition` | ✅ 新建 67 行 | ✅ 210 行 / 6 场景 |
+| `concurrency/scheduler` | ✅ 新建 57 行 | ✅ 188 行 / 6 场景 |
+| `network/address` | ✅ 沿用 72 行 | ✅ 138 行 / 6 场景 |
+| `network/bytearray` | ✅ 沿用 72 行 | ✅ 179 行 / 6 场景 |
+| `network/fd_manager` | ✅ 沿用 56 行 | ✅ 209 行 / 7 场景 |
+| `concurrency/thread_policy` | ✅ 新建 70 行 | ✅ 210 行 / 7 场景 |
+| `concurrency/fiber_local` | ✅ 新建 61 行 | ✅ 192 行 / 7 场景 |
+| `network/sse` | ✅ 新建 69 行 | ✅ 210 行 / 8 场景 |
+| `network/http` | ✅ 新建 66 行 | ✅ 232 行 / 8 场景 |
+| `concurrency/dynamic_gmp` | ✅ 新建 | ✅ 新建 / 7 场景 |
+
+### 剩余模块
+
+- **A 组**：`network/websocket`（需 socket）、`network/io_backend`、`network/io_hook`、
+  `concurrency/runtime`
+- **B 组**：`network/socket`（需端口）、**`config`**（25KB 头文件，需先专项读一轮）
+- **C 组（依赖在途文件）**：`logging/log`、`tools/error`
+
 ## 2026-10-13：example 完善 · 第 14 轮（B 组 · network/http 模块）
 
 ### 本轮完成：`network/http`（此前**完全没有示例**）

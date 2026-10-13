@@ -81,6 +81,8 @@ if (GO2CPP_BUILD_EXAMPLES)
         concurrency/fiber_sync_demo
         concurrency/managed_pipeline_demo
         concurrency/dynamic_gmp_demo
+        concurrency/dynamic_gmp_demo_new
+        concurrency/dynamic_gmp_full
         concurrency/mixed_runtime_demo
         concurrency/beginner_demo
         concurrency/channel_demo
