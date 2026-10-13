@@ -13,6 +13,66 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 5 轮（A 组 · control_flow 模块）
+
+### 本轮完成：`tools/control_flow`
+
+| 文件 | 说明 |
+|---|---|
+| `example/tools/control_flow_full.cpp` | **新增 · 全面版 6 个场景** |
+| `example/tools/control_flow_demo.cpp` | **沿用既有** —— 94 行，已满足简单版规范 |
+
+### 全面版的 6 个场景（全部实跑通过）
+
+1. **`defer` 的 LIFO 逆序** —— `body → third → second → first`
+2. **`defer` 的求值时机** —— 值参数在**注册时**求值（`by_value=1`），
+   引用捕获在**执行时**读取（`by_reference=9`）→ **与 Go 的 `defer` 一致**
+3. **`dismiss()` / `run_now()`** —— 已取消的不执行、提前执行的已执行，
+   且 `run_now()` 后 `active()` 变 false
+4. **★ `panic` 是显式状态发布，控制流继续** —— 实测
+   `call 之后仍继续执行=1`，明确标注与 Go 的差异
+5. **★ `recover` 的边界** —— 实测
+   `边界外取到=0 边界外取后仍 active=1 边界内取到=1`
+   （边界外 `take()` 返回空且**不消费状态**，边界内才能取到）
+6. **`defer` 回调抛异常不中断** —— 三个回调（含抛异常的那个）全部执行
+
+### ★★★ 本示例刻意承担的说明责任
+
+场景 4 和 5 是本文件最重要的部分。项目的 `panic`/`recover` 是
+**「显式状态记录」而非 Go 的栈展开**：不展开 C++ 栈、不自动执行外层 `defer`、
+无人 `recover` 时也不终止进程。**业务代码必须自己检查状态并 return/分支。**
+
+这个差异在台账里登记为 **X-30**（头文件措辞过强）。本示例把正确认识写进注释，
+**让示例本身成为"不要误用"的第一道教育**。
+
+### 施工细节
+
+- **不依赖 `Logger`**：既有 `control_flow_demo.cpp` 用了 `Logger`，
+  而 `include/go2cpp/logging/log.hpp` 是当前 5 个在途文件之一（API 可能变动）。
+  本轮全面版**改用 `std::clog` + 一个全局 `std::vector<std::string>` 记录器**，
+  完全不碰日志模块 —— 避免示例随在途文件一起失效。
+- 一次编译通过，0 warning（延续第 2 轮确立的 chrono 规范；本文件未用时间字面量）。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_control_flow_full` → **EXIT=0**，6 场景输出与注释预期逐条一致
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途 5 个文件全程未触碰
+
+### 进度（5 轮完成 5 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 |
+| `concurrency/future` | ✅ 沿用 82 行 | ✅ 186 行 / 6 场景 |
+| `tools/control_flow` | ✅ 沿用 94 行 | ✅ 新增 / 6 场景 |
+
+**下一轮建议**：`concurrency/timer`（需先读 `timer.hpp` 确认 API），
+或 `network/socket`（有 `network_demo` 可作简单版）。
+
 ## 2026-10-13：example 完善 · 第 4 轮（A 组 · future 模块）
 
 ### 本轮完成：`concurrency/future`
