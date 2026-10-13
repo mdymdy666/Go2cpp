@@ -13,6 +13,56 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 18 轮（A 组 · network/io_backend）
+
+### 本轮完成：`network/io_backend`（A 组 2/4）
+
+| 文件 | 说明 |
+|---|---|
+| `example/network/io_backend_basic_demo.cpp` | **新建 · 简单版 3 个片段** |
+| `example/network/io_backend_full.cpp` | **新建 · 全面版 7 个场景** |
+
+既有 `io_backend_demo.cpp` 110 行超简单版规格，故简单版也新建。
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **平台默认后端名** —— 实测 **`default="epoll"`**
+2. **注册与创建** —— `registered=1 created=1 类型正确=1`
+3. **协议调用序列** —— `initialize/add_or_modify/remove/wait/wake/drain_wake/shutdown`
+   各调用一次，**且参数原样透传到后端**（`fd=7 events=0x1 data=0xABCD enable=true
+   wait capacity=4 timeout=25`）
+4. **★ 同名重复注册被拒** —— `首次注册=1 重复注册=0`
+5. **★ 注销后创建返回 nullptr** —— `注销前创建=有实例 注销=1 注销后创建=nullptr`
+6. **★ 默认后端不可注销** —— `注销默认后端被拒=1 默认创建仍可用=1`
+   （该约束只存在于实现中，头文件未记录，属**台账 D-13**）
+7. **空名创建平台默认实例** —— `空名创建=1 可初始化=1`
+
+**场景 3 是本轮最完整的一个**：不只验证"调用了几次"，还验证
+**参数是否原样透传到后端**（fd / events / data / enable / capacity / timeout），
+这比只数调用次数更能发现"参数被吞掉或搞错顺序"的问题。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_io_backend_basic_demo` → **EXIT=0**
+- `go2cpp_io_backend_full` → **EXIT=0**（7 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`
+- **7 个在途文件全程未触碰**
+
+### 进度（18 轮完成 20 个模块）
+
+`concurrency`(9) / `core`(1) / `network`(7，新增 io_backend) / `tools`(1) / `config`(1)
+
+### A 组剩余（2 个）
+
+- **`concurrency/runtime`** —— 注意 `runtime.hpp` 是 **36 行聚合头，自身无 API**，
+  所以"全面版"本质是**综合演示**（一次包含全部模块并能协同使用）；
+  既有 `runtime_demo.cpp` 115 行超规格，两版需新建
+- **`network/websocket`** —— 帧编解码为 private，公开的只有两个握手入口
+  （`ValidateUpgradeRequest` / `BuildUpgradeResponse`）需要 `http::Request`；
+  **下一轮先核实能否用 socketpair 构造出可用的握手路径**，
+  若可行则沿用 io_hook 的经验（不监听端口）
+
 ## 2026-10-13：example 完善 · 第 17 轮（A 组 · network/io_hook）
 
 ### 用户要求：完成 A 组

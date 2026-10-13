@@ -121,6 +121,8 @@ if (GO2CPP_BUILD_EXAMPLES)
         network/http_full
         network/fd_manager_full
         network/io_backend_demo
+        network/io_backend_basic_demo
+        network/io_backend_full
         network/address_bytearray_demo
         network/address_full
         network/bytearray_full
