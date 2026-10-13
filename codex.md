@@ -13,6 +13,97 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：补充分析 ——「跨线程解锁」是独立于「混合等待」的第二约束
+
+### 用户提醒
+
+> 「对于混合锁，需要的是**跨线程解锁**。」
+
+**这个提醒纠正了上一轮建议里的一个疏漏**：我上一轮说"最优解是 `parking_lot::WordLock`"，
+但**只论证了"性能与 lost-wakeup 的正解"，没有把"跨线程解锁"当成筛选条件来用**。
+
+### ★ 关键认识：这是两个独立的需求
+
+**需求 A「混合等待」**：受管 G 拿不到锁时要 **park 让出 M**，普通线程走原生 CV。
+→ 约束的是**等待原语的实现**。
+
+**需求 B「跨线程解锁」**：`lock()` 与 `unlock()` 可能落在**不同的 M / 不同的 OS 线程**上
+（因为 hook 会把 `connect_with_timeout` 变成跨线程定时任务）。
+→ 约束的是**锁状态里能不能记录 owner**。
+
+**两者互不蕴含。** 一个锁可以满足混合等待却仍是 owner-bound，
+也可以无 owner 却在等待时阻塞 carrier 线程。
+
+### 用这两条重新筛一遍候选方案
+
+| 方案 | 需求 A 混合等待 | 需求 B 跨线程解锁 | Go2Cpp 可用？ |
+|---|---|---|---|
+| `std::mutex` | ❌ 阻塞 M | ❌ **owner-bound** | ❌ |
+| glibc adaptive mutex | ❌ 阻塞 M | ❌ **owner-bound** | ❌ |
+| **`HybridGate`（现状）** | ⚠️ 不区分（靠"临界区极短"规避） | ✅ **`atomic_flag` 无 owner** | ✅ 但**无界自旋** |
+| **`parking_lot::WordLock`** | ❌ 直接 futex，会阻塞 M | ✅ **只有 `LOCKED_BIT`，无 owner** | ⚠️ **通过 B，卡在 A** |
+| **`sync::Mutex`** | ✅ **受管 G → park**（`WaitBackend`） | ✅ **「Unlock 不要求由同一 G/线程调用，采用 Go 风格所有权」** | ✅ **A、B 都满足** |
+| `folly::DistributedMutex` | ❌ | ⚠️ 未确认 | ❌ |
+
+**★ 结论：项目里唯一同时满足 A 和 B 的现成设施是 `sync::Mutex`。**
+
+### ★★ 但 `sync::Mutex` 用不到 `core` 层 —— 循环依赖
+
+`sync::Mutex` 的等待后端就是 `core::ParkingCondition`。若 `core` 反过来用它：
+
+```
+core::ParkingCondition  ←  sync::Mutex 的等待后端
+        ↑
+        └── core 层的 gate 若用 sync::Mutex  →  core → sync → core
+```
+
+**所以 `core` 层需要自己实现一个同时满足 A 和 B 的 gate。**
+
+### ★★★ 这个组合没有现成开源实现 —— 原因值得记下
+
+- **Rust / C++ 生态的混合锁都不需要 B**：它们的线程模型里，锁的持有者与释放者天然在同一执行流；
+- **Go 的 `sync.Mutex` 满足 B**（不记录 owner），但**它跑在自己的 runtime 上，不需要 A**；
+- **`parking_lot` 满足 B，但没有 A**。
+
+**"Fiber 可在 M 间迁移" + "锁可能跨 M 解锁" 是 Go2Cpp 独有的组合**，
+所以这里**不存在可以直接照搬的实现** —— 但**可以借鉴两个成熟技巧**。
+
+### 可借鉴的两项，与一项必须自己做的
+
+**可借鉴 ①：`parking_lot::WordLock` 的状态融合**
+用一个字承载「锁位 + 队列锁位 + 队列头指针」，
+并让**快路径 `unlock` 从 `fetch_sub` 的返回值里读出"是否有等待者"** —— 零额外原子操作。
+
+**可借鉴 ②：`prepare_park()` 令牌机制**
+先声明"我准备好被唤醒了"，再发布到队列，最后才等待 —— 封闭 lost-wakeup 窗口
+（我们的 G5 已实证缺这一步会挂死）。
+
+**必须自己做 ③：把等待原语换成双模式**
+`WordLock` 的 `park()`/`unpark()` 是 Linux futex，**会阻塞 carrier 线程**（违反需求 A）。
+`core` 层的 gate 必须把它换成 `ParkingCondition` 的双模式等待：
+**受管 G → park 让出 M；普通线程 → 原生 CV**。
+**并且要用谓词式等待（`wait(lock, pred)`）重查状态**，把令牌机制与双模式等待接起来。
+
+### ★ 对第 4 轮「移除 HybridGate」决策的修正
+
+先前 P0 项的表述是"移除 `HybridGate`，12 个加锁点改用 `sync::Mutex`"。
+**经本轮分析，这个表述对 `core` 层不成立**，应改为：
+
+- **`io.cpp`（network 层）** → 可以换 `sync::Mutex`（A、B 都满足，且无循环依赖）；
+- **`sync.cpp`（同类内部）** → 可以换（或直接用真身）；
+- **`parking_condition.cpp`（core 层）** → **必须新写一个 gate**：
+  **保留 `HybridGate` 的"无 owner / 跨线程解锁"语义（需求 B），
+  去掉无界自旋，等待改为 `ParkingCondition` 双模式（需求 A）**。
+
+**换句话说：`HybridGate` 不该被"删除"，而该被"改造"** ——
+它的**跨线程解锁语义是必需的**，要丢掉的只是那个 `for(;;)` 无界自旋。
+
+### 状态
+
+- 本轮**只做分析与记录，未改动任何源码**。
+- 在途 5 个文件全程未触碰；台账待办 24 条不变。
+- 本结论已补入 `docs/direction_plan.md` 阶段 0 的 A-1 附近。
+
 ## 2026-10-13：混合锁方案调研（用户要求「去技术帖和 GitHub 找是否存在更好的方案」）
 
 ### 用户提出的方案与实测结论
