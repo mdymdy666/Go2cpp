@@ -13,6 +13,86 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 21 轮（C 组 · logging/log 模块）
+
+### 本轮完成：`logging/log`
+
+| 文件 | 说明 |
+|---|---|
+| `example/logging/log_demo.cpp` | **新建 · 简单版 3 个片段** |
+| `example/logging/log_full.cpp` | **新建 · 全面版 7 个场景** |
+| `example/logging/log_config_demo.cpp` | **沿用既有** —— 80 行，但它其实是"config + log"混合示例 |
+
+### ★ 关键设计：零文件依赖
+
+既有 demo 从 `go2cpp.ini` 加载配置并写日志文件。**本示例完全不碰文件**：
+
+- 用 **`MemorySink`**（内存输出目标）收集日志，`Snapshot()` 取回
+- 用 **自定义 `LogSink` 子类**接管写入
+- **直接调 `sink->Write(record, formatted)`**，绕过 `LoggerManager` 的接线 API
+- **不读 `go2cpp.ini`**、不写 `log/` 目录
+
+**这样示例只依赖"格式化"与"输出目标"两组稳定接口，不会因日志配置的变动而失效。**
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **级别解析** —— 7 个合法级别名全部解析正确，非法名被拒
+2. **★ 级别过滤** —— `MinimumLevelFilter(Warn)` 放行 Error/Warn、拦截 Info/Debug；
+   `SetLevel(Debug)` 之后原来被拒的放行
+3. **格式化模式** —— `%m%n` 输出 `hello`，`[%m]%n` 输出 `[hello]`
+4. **★ 自定义格式项** —— `AddFormat` 注册 → `HasFormat`/`Formats` 可见 →
+   渲染 → `RemoveFormat` 注销
+5. **★ 内存输出目标** —— 3 条记录，`Snapshot()` 首末一致
+6. **自定义输出目标** —— `LogSink` 子类记录写入次数、flush 次数与最后级别
+7. **`LogRecord` 字段** —— 11 个字段中 7 个被格式项读到并精确断言
+
+### ★★ 第 10 类坑：格式项键是"单字符"，且多数单字母键已被内置占用
+
+场景 4 改了三版才对，每版都揭示一层事实：
+
+| 版本 | 写法 | 实测 | 揭示的事实 |
+|---|---|---|---|
+| v1 | 硬编码 `"T"` / `"F"` | `AddFormat` **返回 false**；`%T` 渲染成 **制表符**、`%F` 渲染成 **99** | **`T`（tab）与 `F`（fiber_id）已是内置格式项** |
+| v2 | `HasFormat` 探测出多字符键 `"zz"` | `AddFormat` 成功，但渲染输出 **`"%zz/%zzb"` 原样** | **键必须是单字符** —— `%zz` 被解析成 `%z` + 字面 `z` |
+| v3 | **在字母表里扫描空闲单字符键** | 注册成功、渲染 `worker-1/99`、注销生效 | ✅ |
+
+**最终写法**（示例里保留了这个探测循环，并用注释说明为什么不能硬编码）：
+
+```cpp
+for (char ch = 'a'; ch <= 'z'; ++ch) {
+    const std::string candidate(1, ch);
+    if (LogFormatter::HasFormat(candidate)) continue;
+    // 取前两个空闲键
+}
+```
+
+**这一条的普遍意义**：**示例不应该依赖"哪些名字还没被占用"这种实现细节。**
+用 `HasFormat` 探测，示例就能在格式项集合变化后继续工作。
+
+### 另外修正的两处自己的预期错误
+
+1. **简单版场景 1**：我把 `Level::Warn` 的枚举值猜成 2，实际是 **4**（枚举顺序决定）
+2. **全面版场景 3**：我假设 `PatternFormatter("%")` 会报错，实测 `HasError()` 为 **false**
+   —— `%` 被当作字面量。改为验证"不同模式产出不同结果"
+
+**两处都是"把猜测写成断言"。** 这与第 20 轮的教训一致。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_log_demo` → **CODE=0**
+- `go2cpp_log_full` → **CODE=0**（7 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途文件（6 个，用户在查看）**全程未触碰**
+
+### 进度：21 轮完成 23 个模块
+
+### C 组剩余：1 个
+
+- **`tools/error`** —— `error.hpp` 已新增 `go2cpp::errors` 命名空间
+  （Go 风格薄封装：`errors::New` / `Wrap` / `Join` / `Is` / `As`）；
+  既有 `errors_demo.cpp` 仅 54 行，在简单版区间内 → 只需补全面版
+
 ## 2026-10-13：example 完善 · 第 20 轮（A 组 · network/websocket，4/4 收官）
 
 ### ★ A 组完成

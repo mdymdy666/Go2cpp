@@ -107,6 +107,8 @@ if (GO2CPP_BUILD_EXAMPLES)
         network/sse_full
         concurrency/context_rollback_demo
         logging/log_config_demo
+        logging/log_demo
+        logging/log_full
         concurrency/timer_task_demo
         concurrency/timer_full
         concurrency/parking_condition_demo
