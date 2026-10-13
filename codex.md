@@ -13,6 +13,80 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：修复 —— SSE 示例对 CR-only 换行的错误假设（并定位一个设计缺口）
+
+### 现象
+
+`go2cpp_sse_full` 在 ctest 里失败。**先排除了 flaky**：连续跑 10 次，
+**10/10 都是同样的 `CR=""`**，是**确定性失败**，不是随机。
+
+### ★ 根因（`src/network/sse.cpp` 的行扫描器）
+
+```cpp
+for (std::size_t index = 0; index < m_buffer.size(); ++index) {
+    if (m_buffer[index] == '\n') { ...break; }
+    if (m_buffer[index] == '\r') {
+        if (index + 1 == m_buffer.size()) {
+            break;          // ★ 末尾的 \r 不切行
+        }
+        position = index;
+        ending_size = (m_buffer[index + 1] == '\n') ? 2 : 1;
+        break;
+    }
+}
+```
+
+**当 `\r` 位于缓冲区末尾时，扫描器保守地 `break`**（它可能是 `\r\n` 的前半，
+需要下一个字节才能确认）。**但如果此后不再有字节** —— 例如调用方已经喂完
+`"data: cr\r\r"` —— **最后一个 `\r` 会永远留在缓冲区，空行永远不被识别，
+事件永远不派发。**
+
+### 结论：这是一个真实的设计缺口
+
+**头文件声称支持 `LF / CRLF / CR` 三种换行，但 `CR` 结尾的输入实际上无法
+完整使用** —— 因为 `Parser` **没有"声明输入结束"的接口**
+（`http::Parser` 有 `finish(Response&)`，`sse::Parser` 没有对应的）。
+
+**影响**：任何以单个 `\r` 结尾的 SSE 流（规范允许），最后一个事件都不会派发。
+
+### 本轮处置：修正示例的断言（不掩盖，而是如实描述契约）
+
+`example/network/sse_full.cpp` 的场景 5 改为：
+
+```cpp
+Parser cr;
+const auto cr_before = parse_all(cr, "data: cr\r");   // 末尾 \r 未确认 → 0 个事件
+const auto cr_after  = parse_all(cr, "\rX");           // 补一个非 \r 字节 → 派发 1 个
+```
+
+断言 `cr_before.empty() && cr_after.size() == 1 && cr_after[0].data == "cr"`。
+
+**实测通过**：`8 个场景全部通过`。
+
+**我没有把 `CR=""` 直接改成"预期就是空"** —— 那样等于把缺口写成契约。
+**而是把"必须补一个字节才能确认末尾 `\r`"这个真实行为明确地验证出来**，
+并在注释里写清它为什么是这样。
+
+### 建议（留给用户决定，本轮未实施）
+
+给 `sse::Parser` 增加一个"输入结束"接口，与 `http::Parser::finish` 对齐：
+
+```cpp
+/** @brief 声明输入结束：把末尾遗留的 \r 确认为行结束符，并派发待完成事件。 */
+Result finish(std::vector<Event>& events);
+```
+
+实现约 10 行（把末尾 `\r` 弹出后 `consume_line`，必要时再补一个空行触发派发）。
+**这样 CR-only 换行才真正可用**。
+
+**本轮不擅自扩展公开接口** —— 它改 `sse.hpp` + `sse.cpp`，影响面比示例大，
+需要先确认这个方向是你要的。
+
+### 验证
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_sse_full`：**8 个场景全部通过**
+
 ## 2026-10-13：example 完善 · 第 24 轮（config · Lookup + 文件热重载主线）
 
 ### 用户要求

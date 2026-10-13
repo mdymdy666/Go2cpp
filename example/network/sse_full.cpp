@@ -113,23 +113,32 @@ bool scenario_line_endings_and_bom() {
     Parser crlf;
     const auto crlf_events = parse_all(crlf, "data: crlf\r\n\r\n");
 
+    // ★ CR-only 换行的真实契约：src/network/sse.cpp 的行扫描器遇到「位于
+    //   缓冲区末尾的 \r」时会 break（保守地把它当作 \r\n 的前半），不切行。
+    //   因此单个 "data: cr\r\r" 里**最后一个 \r 会一直留在缓冲区**，空行
+    //   永远不会被识别，事件也不会派发 —— 必须再补一个字节来确认它。
+    //   这里如实验证这个契约，而不是假设 \r 单独结尾就已经派发。
     Parser cr;
-    const auto cr_events = parse_all(cr, "data: cr\r\r");
+    const auto cr_before = parse_all(cr, "data: cr\r");   // 末尾 \r 未确认 → 不派发
+    const auto cr_after = parse_all(cr, "\rX");           // 补一个非 \r 字节 → 派发
 
     Parser bom;
     // ★ 注意："\xBFdata" 会被当成一个超范围的十六进制转义（\x 会尽量多吞十六进制字符，
     //   而 'd' 正好是十六进制数字）。必须用相邻字符串字面量把 BOM 与正文切开。
     const auto bom_events = parse_all(bom, "\xEF\xBB\xBF" "data: bom\n\n");
 
+    const bool cr_ok = cr_before.empty() && cr_after.size() == 1 &&
+                      cr_after[0].data == "cr";
     const bool ok = lf_events.size() == 1 && lf_events[0].data == "lf" &&
                     crlf_events.size() == 1 && crlf_events[0].data == "crlf" &&
-                    cr_events.size() == 1 && cr_events[0].data == "cr" &&
+                    cr_ok &&
                     bom_events.size() == 1 && bom_events[0].data == "bom";
     std::cout << "  LF=\"" << (lf_events.empty() ? "" : lf_events[0].data)
               << "\" CRLF=\"" << (crlf_events.empty() ? "" : crlf_events[0].data)
-              << "\" CR=\"" << (cr_events.empty() ? "" : cr_events[0].data)
               << "\" BOM=\"" << (bom_events.empty() ? "" : bom_events[0].data)
-              << "\"（预期 lf crlf cr bom）\n";
+              << "\" CR 先=" << cr_before.size() << " 条，补字节后=" << cr_after.size()
+              << " 条 \"" << (cr_after.empty() ? "" : cr_after[0].data)
+              << "\"（预期 lf crlf bom / CR 0 条 → 1 条 cr）\n";
     return ok;
 }
 
