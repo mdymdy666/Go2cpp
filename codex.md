@@ -13,6 +13,62 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 19 轮（A 组 · concurrency/runtime，3/4）
+
+### 本轮完成：`concurrency/runtime`
+
+**先说清这个模块的性质**：`include/go2cpp/runtime.hpp` 只有 **36 行**，
+是**聚合头**（"一次包含全部公开模块"，面向转译程序），**它自身没有任何 API**。
+
+因此它的"全面版"**不应该重复单模块演示**，而应展示**跨模块协同**。
+本示例按这个定位写的。
+
+| 文件 | 说明 |
+|---|---|
+| `example/concurrency/runtime_basic_demo.cpp` | **新建 · 简单版 3 个片段** |
+| `example/concurrency/runtime_full.cpp` | **新建 · 全面版 7 个协同场景** |
+
+既有 `runtime_demo.cpp` 115 行超简单版规格，故简单版也新建。
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **多子系统并存** —— 一个聚合头同时用上 `channel` / `future` / `context`：
+   `channel=7 future=9 context 未取消=1`
+2. **★ 取消驱动收敛** —— `Context` 取消 → 阻塞在无缓冲 Channel 上的接收方退出：
+   `接收方退出=1 判定为取消=1 都结束=1`
+3. **提交与汇合** —— `Scheduler + go + WaitGroup + Timer`：
+   `WaitGroup 汇合=1 完成=5 定时器触发=1`
+4. **★ 配置驱动运行时** —— INI 里的 `processors = 3` 直接决定调度器 P 数量：
+   `配置读出=3 实际 P=3`
+5. **`Future` + `Context`** —— 挂起的 Future 等待被取消打断：`status=cancelled`
+6. **`control_flow` 作用域** —— Fiber 内 `defer` 保证清理：`顺序=body second first`
+7. **`fiber_local` 隔离** —— 多个 Fiber 各持一份：`A="A" B="B"`
+
+**场景 2 和 4 最能体现"聚合头"的价值**：它们跨越了三个模块
+（Context + Channel + Scheduler / Config + Scheduler），
+**只有一次包含全部模块时才写得这么自然**。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_runtime_basic_demo` → **EXIT=0**
+- `go2cpp_runtime_full` → **EXIT=0**（7 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`
+- **7 个在途文件全程未触碰**
+
+### 进度（19 轮完成 21 个模块）
+
+`concurrency`(10) / `core`(1) / `network`(7) / `tools`(1) / `config`(1)
+
+### A 组剩余：1 个
+
+- **`network/websocket`** —— 帧编解码为 private；公开的只有
+  `ValidateUpgradeRequest` / `BuildUpgradeResponse` 两个握手入口（需 `http::Request`），
+  其余 API 需要真实 `Socket`。
+  **下一轮先核实 `WebSocket::Accept` 是否必须真实 listener** ——
+  若能用 `socketpair` 走通握手 + 收发（如同 io_hook 的做法），
+  就能在无端口环境下完成它；否则只演示握手路径并在示例中注明边界。
+
 ## 2026-10-13：example 完善 · 第 18 轮（A 组 · network/io_backend）
 
 ### 本轮完成：`network/io_backend`（A 组 2/4）
