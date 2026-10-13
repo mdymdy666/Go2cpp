@@ -13,6 +13,68 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 17 轮（A 组 · network/io_hook）
+
+### 用户要求：完成 A 组
+
+**A 组剩余 4 个模块**：`concurrency/runtime`、`network/io_backend`、
+`network/io_hook`、`network/websocket`。**本轮完成其中 1 个（io_hook）**。
+
+### 本轮完成：`network/io_hook`
+
+| 文件 | 说明 |
+|---|---|
+| `example/network/io_hook_full.cpp` | **新建 · 全面版 7 个场景** |
+| `example/network/io_hook_demo.cpp` | **沿用既有** —— 65 行，在简单版区间内 |
+
+**登记方式**沿用既有约定：放进 `if (TARGET go2cpp_hook)` 条件块
+（与 `io_hook_demo` 一致）。
+
+### ★ 关键设计：全部用 socketpair，不监听任何端口
+
+既有 demo 已经示范了这个做法，本轮沿用并扩展：
+
+- **`::socketpair(AF_UNIX, SOCK_STREAM, 0, fds)`** —— 纯进程内，**无需端口、无需外部网络**
+- 配一个 RAII 的 `SocketPair` 结构确保两条 fd 一定被 `close`
+
+**这解决了此前对 `socket` / `websocket` 那条线"需要真实端口、受限环境可能起不来"的顾虑** ——
+**hook 与 IOManager 的验证完全可以用 socketpair 完成。**
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **Hook 开关与作用域守卫** —— `进入前=1 作用域内=1 退出后恢复=1`
+2. **受管 Fiber 里的 hook recv** —— `recv 成功=1 都结束=1`
+3. **hook send 送达对端** —— `send 返回=4 对端收到=1`
+4. **★ 读 Fiber 不阻塞 M（P=1 反证）** —— `读者完成=1 读者结束=1 写者结束=1`
+5. **`SO_RCVTIMEO` 转换为 `ETIMEDOUT`** —— `超时=1 errno=110`
+6. **`ScopedIOManagerBinding` 作用域绑定** —— 绑定期间收发正常
+7. **`connect_timeout` 配置读写** —— `原值=5000ms 设为 1234ms 后=1234ms 还原后=5000ms`
+
+**场景 4 是本轮最有价值的**：P=1 且读者先启动并在无数据时等待 ——
+**若 hook 未生效、`recv` 直接阻塞了唯一的 M，写者就永远排不上，`reader->wait_for` 会超时失败。**
+实测三者全部完成，**证明 syscall 确实被接管并把执行权交还给了 M**。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_io_hook_full` → **EXIT=0**（7 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`（条件块内）
+- **7 个在途文件全程未触碰**
+
+### 进度（17 轮完成 19 个模块）
+
+`concurrency`(9) / `core`(1) / `network`(6，新增 io_hook) / `tools`(1) / `config`(1)
+
+### A 组剩余（下一轮继续）
+
+- **`concurrency/runtime`** —— 注意：`runtime.hpp` 是 **36 行的聚合头，本身没有 API**，
+  所以它的"全面版"本质是**综合演示**（一次包含全部模块）；既有 `runtime_demo.cpp`
+  115 行超简单版规格，两版都需新建
+- **`network/io_backend`** —— 既有 `io_backend_demo.cpp` 110 行，需先核实 API
+- **`network/websocket`** —— 帧编解码为 private，需真实 socket；
+  **但本轮 io_hook 的经验说明：socketpair 也许能覆盖一部分握手/读写路径**，
+  下一轮先核实 `WebSocket::Accept` 是否必须真实 listener
+
 ## 2026-10-13：example 完善 · 第 16 轮（B 组 · config 模块）
 
 ### 本轮完成：`config`（此前**完全没有示例**）
