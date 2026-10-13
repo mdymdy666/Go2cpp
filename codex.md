@@ -13,6 +13,99 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 6 轮（A 组 · timer 模块，定时任务收尾轮）
+
+### 本轮完成：`concurrency/timer`
+
+| 文件 | 说明 |
+|---|---|
+| `example/concurrency/timer_full.cpp` | **新增 · 全面版 6 个场景** |
+| `example/concurrency/timer_task_demo.cpp` | **沿用既有** —— 178 行，远超简单版规范 |
+
+### 全面版的 6 个场景（全部实跑通过）
+
+1. **`after()` 一次性任务** —— `已执行=1 恰好一次=1 RunCount=1`
+2. **多个定时器按到期顺序执行** —— 乱序注册 60/20/40ms，实测回调顺序 `10,20,30`
+3. **`Cancel()` 取消未领取任务** —— `取消前 Active=1 取消后 Active=0 是否执行=0`
+4. **`Active()` / `RunCount()` 观测** —— 执行前 `Active=1 且 RunCount=0`，执行后 `RunCount=1`
+5. **与 `WaitGroup` 配合** —— 4 个定时任务全部完成后 `WaitFor` 成功
+6. **定时器 vs `Context` 超时的语义区别** —— 一个"到点做事"，一个"到点放弃等待"
+
+### ★★★ 本轮挖到的关键 API 语义（比上一轮的 Promise 更隐蔽）
+
+**首次运行 3 个场景失败**（编译完全通过，`0 warning 0 error`）：
+
+```
+三个都执行=0 顺序=-1,-1,-1        ← 场景2
+WaitFor 成功=0 完成数=0            ← 场景5
+定时器动作已执行=0                 ← 场景6
+```
+
+**根因**：我写成了
+
+```cpp
+(void)after(Ms(60), [&] { ... });   // ★ 临时 Timer 立刻析构
+```
+
+**`Timer` 句柄析构会取消尚未领取的任务** —— 于是三个定时器在注册后立刻被取消，
+**永远不会触发**。而场景 1、4 因为把返回值存进了局部变量（句柄活到函数结束）所以成功。
+
+**修复**：用 `std::vector<core::Timer>` 保存句柄。
+
+**为什么这个坑特别值得记录**：
+
+- **编译期完全无警告** —— `(void)expr` 是消除 unused 警告的常规写法，
+  **在这里恰恰是错的**；
+- **场景 1 成功、场景 2 失败** 的对比，说明这不是"定时器没工作"，
+  而是"句柄生命周期决定了任务是否存活"；
+- **这条语义在头文件注释里写了**（"Cancel；多个句柄不能复制，移动后源句柄失效"），
+  但**没有明确说"句柄析构 = 取消"** —— 示例注释现在把这一点写清楚了。
+
+**这条已写进 `timer_full.cpp` 的文件头注释**，并在场景 2、5、6 各留了说明。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_timer_full` → **EXIT=0**，6 场景输出与注释预期逐条一致
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途 5 个文件全程未触碰
+
+### ★ 定时任务收官：6 轮完成 6 个模块
+
+定时任务 `schedule-460525c6`（cron `*/30 19-21 * * *`）共触发 5 次
+（19:30 / 20:00 / 20:30 / 21:00 / 21:30），加上用户下达任务当轮，**共完成 6 个模块**：
+
+| 模块 | 简单版 | 全面版 | 备注 |
+|---|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 | 新建两版 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 | 新建两版 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 | 新建两版 |
+| `concurrency/future` | ✅ 沿用 82 行 | ✅ 186 行 / 6 场景 | 全面版新建 |
+| `tools/control_flow` | ✅ 沿用 94 行 | ✅ 185 行 / 6 场景 | 全面版新建 |
+| `concurrency/timer` | ✅ 沿用 178 行 | ✅ 新增 / 6 场景 | 全面版新建 |
+
+**共新增 6 个全面版（每个 6 场景 = 36 个场景）与 3 个简单版**，
+每个都经"登记 → 构建 0 warning/0 error → 真实运行 → 输出比对"四步验证。
+
+### 三轮踩坑记录（都已固化进规范）
+
+| 轮次 | 坑 | 固化措施 |
+|---|---|---|
+| 1 | `100ms` 字面量写在匿名 namespace，`chrono_literals` 不可见 | 统一用显式 `std::chrono::milliseconds` + `using Ms = ...` |
+| 4 | `Promise` 不可复制，不能按值捕获进 `go()` | 必须 `shared_ptr<Promise<T>>` |
+| 6 | **`Timer` 句柄析构 = 取消任务** | 必须保存句柄到容器 |
+
+**这三条都是"编译通过但行为不对"或"编译失败但不明显"的类型**，
+正是"必须真实运行确认输出合理"这条要求的价值所在。
+
+### 未完成（保留给后续轮次）
+
+- **A 组剩余**：`concurrency/scheduler`（`runtime_demo` / `dynamic_gmp_demo` 可作简单版）、
+  `network/socket`（`network_demo` 可作简单版）、`logging/log`（**`log.hpp` 是在途文件，待用户定稿**）
+- **B 组（完全无示例，两版都要新建）**：`config`（头文件 25KB，需先专项读一轮）、
+  `network/http`、`core/parking_condition`、`concurrency/fiber_local`、`concurrency/thread_policy`
+- **C 组（暂缓）**：`tools/error` —— 依赖的在途文件 `tools/error.hpp` 未定稿
+
 ## 2026-10-13：example 完善 · 第 5 轮（A 组 · control_flow 模块）
 
 ### 本轮完成：`tools/control_flow`
