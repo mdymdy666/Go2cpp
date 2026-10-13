@@ -13,6 +13,66 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 2 轮（A 组 · context 模块）
+
+### 本轮完成：`concurrency/context`
+
+| 文件 | 内容 |
+|---|---|
+| `example/concurrency/context_demo.cpp` | 简单版：WithCancel / WithTimeout / WithValue 三件最常用的事 |
+| `example/concurrency/context_full.cpp` | **全面版：6 个场景** |
+
+**为什么选 context 而不是原计划的 config**：`config` 模块比预期复杂得多
+（`include/go2cpp/config/config.hpp` 有 **25 KB**，含 `IniFile` / `ValueCodec<T>` /
+`ConfigVarBase` / `ConfigVar<T>` / `RuntimeConfig`，还有 watcher 相关虚函数）。
+**在 API 不熟的情况下动手，很可能浪费掉一整轮定时窗口。**
+而 `context` 的 API 我在本会话前段已通读，且 `context.hpp` 不在 5 个在途文件之列 ——
+**风险最低、产出最确定**。`config` 挪到后续轮次，届时先专门读一轮它的头文件。
+
+**与既有 `context_rollback_demo` 不重复**：那个示例演示的是 `ContextRollback`（补偿事务），
+本轮两个文件演示的是 `Context` 本身（取消树、超时、取值、根因、等待信号）。
+
+### 全面版的 6 个场景
+
+1. **`WithCancel` 级联** —— 只取消中间层，上下的 `IsDone()` 都变真
+2. **`WithTimeout` 自动取消** —— `Err()` 是 `DeadlineExceededError`，
+   **且主动再取消一次仍是 `DeadlineExceeded`**（验证取消幂等 + 超时不被覆盖）
+3. **`WithValue` 沿父链查找** —— 子级覆盖 `t-002`，父级仍是 `t-001`，
+   未设置的键返回空 `optional`
+4. **`WithCancelCause`：`Err()` vs `Cause()`** —— 两级的 `Err()` 都是 `Canceled`，
+   而 `Cause()` 都指向最初传入的那个根因
+5. **`Background()` 免疫取消** —— 它没有取消函数，`Done()` 在 30 ms 内不完成
+6. **`Done()` 信号等待** —— 在另一个执行流里稍后取消，主执行流阻塞在 `Done()` 上
+   （而不是轮询 `IsDone()`）
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_context_demo` → **EXIT=0**，3 个场景输出与注释中的"预期"逐条一致
+- `go2cpp_context_full` → **EXIT=0**，6 个场景全部通过
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途 5 个文件全程未触碰
+
+### ★ 本轮主动规避了第 1 轮踩过的坑
+
+第 1 轮因为 `100ms` 字面量写在匿名 namespace 里（`chrono_literals` 只在 `main()` 内可见）
+而编译失败。本轮**统一改用显式 `std::chrono::milliseconds(20)` 写法**，
+并在匿名 namespace 里定义 `using Ms = std::chrono::milliseconds;` ——
+**一次编译通过，0 warning**。
+
+**这条已固化为本任务的施工规范**：示例里不依赖 `chrono` 字面量，
+避免作用域陷阱。
+
+### 进度小结（两轮已完成 2 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ | ✅ / 6 场景 |
+
+**下一轮建议**：`concurrency/sync`（`sync.hpp` 我已通读：`Mutex` / `ConditionVariable` /
+`WaitGroup` / `WaitBackend`，且不在在途清单内），或先花一轮专门读 `config` 再动它。
+
 ## 2026-10-13：example 完善 · 第 1 轮（建立规范 + 完成 channel 模块）
 
 ### 用户任务（定时推进，19:14 → 22:00 每 30 分钟一次）
