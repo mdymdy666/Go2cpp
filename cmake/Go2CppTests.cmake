@@ -96,6 +96,8 @@ if (GO2CPP_BUILD_EXAMPLES)
         concurrency/future_full
         config/config_demo
         config/config_full
+        config/runtime_config_demo
+        config/runtime_config_full
         tools/control_flow_demo
         tools/control_flow_full
         network/io_wait_many_demo

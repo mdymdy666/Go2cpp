@@ -13,6 +13,103 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 23 轮（config · RuntimeConfig，★ 发现真实缺陷）
+
+### 本轮完成：`config` 的 `RuntimeConfig`（此前未覆盖）
+
+| 文件 | 说明 |
+|---|---|
+| `example/config/runtime_config_demo.cpp` | **新建 · 简单版 3 个片段** |
+| `example/config/runtime_config_full.cpp` | **新建 · 全面版 7 个场景** |
+
+### ★★★ 本轮发现一个真实的框架缺陷（已实证）
+
+**`src/config/config.cpp` 的 `ReadSize` 实现：**
+
+```cpp
+bool ReadSize(const IniFile& ini, const char* section, const char* key,
+              std::size_t* target, std::string* error) {
+    if (!ini.Has(section, key)) return true;
+    if (ParseSize(ini.Get(section, key), target)) {
+        if (std::string_view(section) == "scheduler" &&
+            ValidateSchedulerSize(key, *target, error)) {
+            return true;
+        }
+        return false;          // ← 非 scheduler 段的值解析成功后，必定落到这里
+    }
+    if (error) *error = std::string("配置项不是非负整数: ") + section + "." + key;
+    return false;
+}
+```
+
+**`FromIni` 用 `ReadSize` 读取 `[timer]` 的 `warn_after_days` / `error_after_days`。**
+由于 `section` 是 `"timer"` 而非 `"scheduler"`，`if` 条件为假 → **跳过 `return true` → 直落 `return false`**。
+
+> **结论：只要 INI 里出现 `[timer]` 段，`RuntimeConfig::FromIni` 必定失败，且不设置 `error`。**
+
+**实测证据（场景 7）**：
+
+```
+带 [timer] 的 FromIni=0 error="" 保持默认(30)=1
+去掉 [timer] 后 FromIni=1
+```
+
+**这个缺陷解释了两个既有现象**：
+
+1. **仓库自带的 `go2cpp.ini` 含 `[timer]` 段**（`warn_after_days` / `error_after_days`），
+   所以 **`LoadRuntimeConfig("go2cpp.ini")` 从来无法成功**；
+2. **既有 `log_config_demo` 把"未加载 go2cpp.ini"当作常态分支** ——
+   它的注释写着"示例目录不一定有 go2cpp.ini，缺少可选配置时仍使用默认安全值"，
+   **恰好绕过（并掩盖）了这个缺陷**。
+
+**影响面**：`[timer]` 段的所有配置**实际上完全不可用**；
+用户改这些值不会有任何效果，且失败是**静默的**（`error` 为空），很难排查。
+
+**本轮只做记录，没有修改 `src/`** —— 按既有约定，源码改动不属示例任务范围。
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **`FromIni` 从内存构造** —— `解析=1 FromIni=1 P=6`（不需要文件）
+2. **`scheduler` 组字段** —— P/M/queue/stack/oversub/sysmon/pin/metrics 全部按文件值
+3. **`log` 组字段** —— `level/stdout/dir/file/format` 全部读到
+   （`log` 段不经 `ReadSize`，所以**不受上面那个缺陷影响**）
+4. **★ 事务性** —— `首次成功=1 值=5 第二次=0 之后值=5 失败时保持不变=1`
+5. **默认值** —— 空 INI 得到 `timer=30/365 dir=log file=go2cpp.log`
+6. **`Validate` 边界** —— 合法通过；`P=99` 与 `queue=0` 被拒（错误文本可取回）
+7. **★★ 缺陷记录** —— 见上
+
+### ★ 第 12 类坑（第 11 类的重演）：未打印的断言静默失败
+
+首版 `runtime_config_full` 报「存在失败场景」，但**每一行打印出来的条件都是 1**。
+
+**根因**：场景 3 里我断言 `log_format == "{level}: {message}\n"`，
+**而这个条件恰好没有打印**。实测格式串长度是 **18**（`{level}: {message}` 正好 18 字符）——
+**INI 解析把 `\n` 当成了行尾**，格式串里并没有换行符，逐字节相等自然失败。
+
+**修复**：把每个影响 `ok` 的条件都单独提取、单独打印，并把格式串断言放宽为
+"确实包含两个占位符"（尾部换行不属于契约）。
+
+> **这条教训这是第二次出现**：上一轮（`tools/error`）也是"输出全对但整体失败"。
+> **规范：凡进入 `ok` 的条件，必须在输出里有对应的可见项。**
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**；两个示例均 **CODE=0**
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途文件（6 个，用户在查看）全程未触碰
+
+### 总进度：23 轮完成 25 个模块
+
+`concurrency`(10) / `core`(1) / `network`(8) / `tools`(2) / `logging`(1) / **`config`(2)**
+
+**`config` 模块至此完整覆盖**（`IniFile`/`ConfigVar`/`ValueCodec` + `RuntimeConfig`）。
+
+### 剩余
+
+- **已判定不做**：`core/hybrid_mutex`（用户明确"绝对不允许 HybridGate"）
+
+**A 组、C 组已清空；`RuntimeConfig` 已补完。**
+
 ## 2026-10-13：example 完善 · 第 22 轮（C 组 · tools/error，★ C 组完成）
 
 ### 本轮完成：`tools/error`
