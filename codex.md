@@ -13,6 +13,70 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：方向决策分析 · 第 1 轮（GitHub 对标调研）
+
+- **用户指令**：多轮定时（每 30 分钟）分析项目，对比 GitHub 同类项目与国内就业情况，
+  综合开发成本与市场认可度，决定后续方向。**已建立定时任务 `schedule-6010b30e` 与长期目标 `goal-a816534d`**。
+- **用户偏好**：**不预设主线**（等前三轮数据出来再定）；**目标市场为国内**。
+
+### 环境发现（重要，后续轮次复用）
+
+**WSL 侧完全没有外网**：`getent hosts api.github.com` 返回 `::1`（DNS 被指向本机环回），
+`curl` 一律 `http_code=000`。**因此所有联网调研必须走 `web_fetch` 工具，不能用 WSL 的 curl/wget。**
+逐步记录：`.dsh_tmp/_gh_survey.py`（因上述原因失效，保留备查）。
+
+### 本轮数据（GitHub REST API，2026-10-13 实测）
+
+| repo | stars | 最后推送 | 定位 |
+|---|---:|---|---|
+| swoole/swoole-src | 18,918 | 2026-10-13 | PHP 协程（仅作赛道热度参考） |
+| ZLMediaKit/ZLMediaKit | 17,607 | 2026-10-12 | 流媒体服务器，非通用框架 |
+| scylladb/seastar | 9,391 | 2026-10-12 | 高性能服务器框架；活跃但重、与 ScyllaDB 强绑定 |
+| Tencent/libco | 8,690 | **2024-03-07** | 微信后端协程库；**已停更** |
+| **sylar-yin/sylar** | **4,718** | **2023-12-08** | **与 Go2Cpp 最同构；已停更** |
+| idealvin/coost | 4,218 | 2026-09-28 | 极简基础库，topics 含 goroutine；活跃 |
+| jbaldwin/libcoro | 969 | 2026-05-02 | C++20 协程；活跃 |
+| ConorWilliams/libfork | 903 | 2026-05-25 | C++20 无锁任务库；活跃 |
+| owent/libcopp | 866 | 2026-09-15 | 跨平台协程；活跃 |
+| Naios/continuable | 853 | 2023-09-12 | C++14 future；**已停更** |
+
+### ★★ 本轮三个关键发现
+
+**1. 赛道需求真实，但头部项目已经老化停更。**
+`libco`（8,690★，腾讯，微信后端）停在 **2024-03**；`sylar`（4,718★）停在 **2023-12**；
+`continuable`（853★）停在 2023-09。**而仍在活跃的，要么是重型框架（seastar，与 ScyllaDB 强绑定），
+要么是"基础库"（coost、libcoro、libfork、libcopp，都不含完整服务器栈）。**
+→ **"带完整取消语义的通用并发运行时"这个位置出现了空档。**
+
+**2. `sylar` 与 Go2Cpp 的对比最有信息量——它恰好是"Go2Cpp 加上生态"的形态。**
+sylar 自带：日志、配置、线程、协程、协程调度、IO 协程调度、hook、socket、bytearray 序列化、
+http、TcpServer、Websocket、Https、Smtp、**MySQL、SQLite3、ORM、Redis、Zookeeper**。
+→ **Go2Cpp 缺的（TLS、JSON/序列化、DB）正是 sylar 补上的那一半；**
+→ **而 Go2Cpp 有的（`Context` 取消树、`ContextRollback` 补偿、`Error::Join/Is/As`、
+   确定性模拟潜力、Go 语义保真）是 sylar 完全没有的。**
+→ **结论：Go2Cpp 不该去补 sylar 已经做过的"生态堆叠"，而应当强化 sylar 与 libco 都没有的那一层。**
+
+**3. 国内 C++ 后端面试的"项目认可度"有一条清晰路径。**
+sylar、muduo、libco、TinyWebServer 这类项目在国内面试中是被普遍认可的"硬项目"。
+→ **"写一个 C++ 并发服务器框架"这件事本身是被市场接受的**；
+→ **但必须在 sylar/libco 之外有**可讲述的差异化**，否则就是第 N 个同类。**
+
+### 对后续方向的初步启示（待第 2、3 轮数据验证）
+
+- **不要做"又一个 sylar"**：生态堆叠是它的强项，追赶成本高且同质。
+- **要做"它们没有的那一层"**：
+  ① **Go 语义完整性**（`Context`/`ContextRollback`/`defer`/`Error` 这一套是竞品普遍缺失的）；
+  ② **可验证性**（协作式调度 → 可记录/可重放/可穷举，这是 libco/sylar 结构上做不到的）；
+  ③ **hook 的系统性**（sylar 有 hook，但 Go2Cpp 的 hook 覆盖 + `BlockingRegion` + sysmon 联动更完整）。
+- **待验证**：这一层在国内招聘市场的"可讲述性"与"被认可度"究竟如何——**第 2 轮就业调研要回答这个**。
+
+### 状态
+
+- **本轮只做调研与记录，未改动任何项目源码。**
+- 台账待办仍 **24 条**（本轮无新增条目）。
+- **下一轮（约 30 分钟后）**：国内 C++ / Go 后端就业市场调研 —— 岗位量、薪资区间、
+  以及"协程""异步 IO""分布式""确定性测试"等关键词在 JD 中的出现情况。
+
 ## 2026-10-12：逐块讲解 Context::State（用户要求「详细讲解，包括场景/功能/源码实现」）
 
 - **读全文**：`src/concurrency/context.cpp:382-747`（字段 + 10 个成员函数）。
