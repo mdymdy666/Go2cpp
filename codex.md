@@ -13,6 +13,68 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 16 轮（B 组 · config 模块）
+
+### 本轮完成：`config`（此前**完全没有示例**）
+
+| 文件 | 说明 |
+|---|---|
+| `example/config/config_demo.cpp` | **新建 · 简单版 3 个片段** |
+| `example/config/config_full.cpp` | **新建 · 全面版 7 个场景** |
+
+**首次建立 `example/config/` 目录**，已登记进 `GO2CPP_EXAMPLES`。
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **INI 分段解析** —— 同名键按段隔离；支持 `#` 与 `;` 注释
+2. **缺失键返回默认值** —— `存在键=yes 缺失键=D 缺失段=D2`
+3. **`ConfigVar` 元信息与读写**
+4. **★ 字符串往返** —— `int "-42" / bool "true" / string "hello world"`
+5. **多种值类型** —— `vector<int>` 编码为 `1,2,3,4`，解码 4 个元素
+6. **★ 校验器** —— 非法设置被拒且**值不变**，错误文本可取回
+7. **★ 变更监听** —— 回调 2 次、`(old,new)=(2,3)`、注销后不再触发
+
+### ★ 本轮踩到第 7 类坑：C++ 求值顺序污染了示例输出
+
+简单版首版打印 `设置后=16`（应为 8）——**我把 `GetValue()` 和 `FromString("16")`
+写在了同一个 `<<` 链里**，`FromString` 先求值改掉了值。
+
+**特别之处**：`ok` 断言是对的、程序 `EXIT=0`、编译器 **0 warning**、
+运行时自报"通过" —— **只有把输出逐字与注释里的"预期"对照，才能发现。**
+
+### ★★ 门禁拦下一次真实风险
+
+本轮开工时 `git status` 显示新增在途文件
+`include/go2cpp/concurrency/context.hpp`（**非我所改**）。
+**门禁中止了整轮，未提交任何东西**；加入不碰清单后才继续。
+
+**不碰清单已增至 7 个**。
+
+### ★ 一次自己的失误：Python 锚点转义
+
+修上面那处输出时，我在 `OLD` 锚点里写了 `\"` 而文件里是 `"`，
+**锚点 count=0** —— 这正是本会话早前记录过的坑，**我重复犯了**。
+处置：该文件很短，**改为整份重写**，比继续调转义更可靠。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_config_demo` → **EXIT=0**（3 个片段）
+- `go2cpp_config_full` → **EXIT=0**（7 场景全部符合预期）
+- **7 个在途文件全程未触碰**
+
+### 进度（16 轮完成 18 个模块）
+
+`concurrency`(9) / `core`(1) / `network`(5) / `tools`(1) / **`config`(1)**
+
+### 剩余模块
+
+- **A 组**：`network/websocket`（需 socket）、`network/io_backend`、`network/io_hook`、
+  `concurrency/runtime`
+- **B 组**：`network/socket`（需端口）
+- **C 组（依赖在途文件）**：`logging/log`、`tools/error`
+- **未覆盖**：`config` 的 `RuntimeConfig`（pending/watcher 路径）
+
 ## 2026-10-13：example 完善 · 第 15 轮（A 组 · dynamic_gmp 模块）
 
 ### 本轮完成：`concurrency/dynamic_gmp`
