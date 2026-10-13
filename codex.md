@@ -13,6 +13,85 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 4 轮（A 组 · future 模块）
+
+### 本轮完成：`concurrency/future`
+
+| 文件 | 说明 |
+|---|---|
+| `example/concurrency/future_full.cpp` | **新增 · 全面版 6 个场景** |
+| `example/concurrency/future_demo.cpp` | **沿用既有** —— 实测 82 行，已满足简单版规范（50~80 行量级），不重复造 |
+
+### 全面版的 6 个场景（全部实跑通过）
+
+1. **基本取值** —— 另一个 Fiber 里 `SetValue`，主执行流 `GetResult` → `kReady 2026`
+2. **错误传递** —— `SetError` → `kError`，`error` 字段可取回（**不抛异常**）
+3. **异常传递** —— `SetException` → `kException`；
+   **`GetResult` 不抛，只有显式 `GetOrThrow` 才抛**（实测抛出=1）
+4. **等待超时** —— `WaitFor(20ms)` 返回 `kTimedOut`，之后再 `GetResult` 仍能拿到 `kReady`
+   （**超时只影响本次等待，不改变 Future 状态**）
+5. **`Context` 取消** —— `Wait(ctx)` 返回 `kCancelled`
+6. **Promise 被放弃** —— 未 `SetValue`/`SetError` 就析构 → `kError` 且
+   `Is(error, BrokenPromiseError())` 为真
+
+### ★★ 本轮挖到一条重要的 API 约束（值得写进示例注释）
+
+**首次编译失败 9 处**，根因是同一个：
+
+```
+error: use of deleted function 'go2cpp::Promise<T>::Promise(const Promise<T>&)'
+error: static assertion failed: std::function target must be copy-constructible
+```
+
+**`Promise<T>` 不可复制，而 `go()` 的 `Task::Function` 是 `std::function`
+（标准要求目标可复制）** —— 因此：
+
+> **不能把 `Promise` 按值捕获进 `go()` 的 lambda。**
+
+错误写法（我第一版就是这样）：
+```cpp
+auto promise = pair.first;                              // 拷贝 → 已删除
+go(scheduler, [promise] { (void)promise.SetValue(1); }); // 再拷一次 → std::function 拒绝
+```
+
+正确写法：
+```cpp
+auto promise = std::make_shared<Promise<int>>(std::move(pair.first));
+go(scheduler, [promise] { (void)promise->SetValue(1); });
+```
+
+**为什么既有 `future_demo.cpp` 没暴露这个问题**：它**全程在主执行流里
+`MakePromise` + 直接 `SetValue`，没有用 `go()`** —— 所以从未遇到 lambda 捕获。
+这解释了"为什么 82 行的旧示例看起来能用，但照它的写法搬到 Fiber 里就编不过"。
+
+**这条约束已写进 `future_full.cpp` 的文件头注释**，示例本身就承担了说明责任。
+
+### 附带修掉的一处隐性拷贝
+
+场景 5 原本写 `const auto promise = pair.first;` —— `auto` 推导成 `Promise<int>`，
+同样是拷贝。改为 `shared_ptr` 持有后统一消除。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_future_full` → **EXIT=0**，6 场景输出与注释预期逐条一致
+  （`kReady/value=2026`、`kError`、`kException` + 抛出、`kTimedOut`→`kReady`、
+  `kCancelled`、`BrokenPromiseError`）
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途 5 个文件全程未触碰
+
+### 进度（4 轮完成 4 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 |
+| `concurrency/future` | ✅ 沿用既有 82 行 | ✅ 新增 / 6 场景 |
+
+**下一轮建议**：`concurrency/timer`（`TimerService` / `after()`），
+或 `logging/log`（注意 `log.hpp` 是在途文件，需先确认用户是否已定稿）。
+
 ## 2026-10-13：example 完善 · 第 3 轮（A 组 · sync 模块）
 
 ### 本轮完成：`concurrency/sync`

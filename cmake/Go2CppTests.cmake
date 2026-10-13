@@ -89,6 +89,7 @@ if (GO2CPP_BUILD_EXAMPLES)
         concurrency/context_full
         concurrency/sync_demo
         concurrency/sync_full
+        concurrency/future_full
         tools/control_flow_demo
         network/io_wait_many_demo
         network/network_demo
