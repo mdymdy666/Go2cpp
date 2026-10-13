@@ -13,6 +13,98 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：方向分析 · 第 9 轮（验证 C-L1「约 50 行」—— 四次验证里第一次成立）
+
+### 验证命题
+
+路线文档阶段 1 的 C-L1 写的是：「在 `Scheduler` 决策点插默认空回调，
+记录谁 park、就绪候选、选中谁、唤醒顺序。**约 50 行**（生产零开销）。」
+
+**这是前几轮里最后一个未经检验的低成本断言。**
+
+### 量化：决策点到底有多少
+
+`grep` 统计 `scheduler.cpp`（4048 行）中与调度决策相关的引用：
+
+| 类别 | 出现次数 |
+|---|---:|
+| park 相关（`park_for_scheduler` / `ParkAction` / `kParked` / `park_wait` / `park_io`） | 22 |
+| wake 相关（`wake_for_scheduler` / `WakeAction` / `wake_or_cancel` / `wake_registered` / `wake_io`） | 34 |
+| 就绪队列选择（`.front()` / `.back()` / `steal`） | 11 |
+| 任务状态转换（`mark_runnable` / `try_mark_running` / `mark_waiting` / `mark_yielded` / `promote_new`） | 16 |
+| `select` 决策（`TrySelect` / `SelectWaitState`，位于 `channel.cpp`） | 3 |
+| **合计** | **86** |
+
+**另有 `Scheduler` 的 30+ 个公开方法**（`spawn` / `enqueue` / `park_*` / `wake_*` / `requeue_*` / `yield_*` …）。
+
+**初见这个数字会以为 C-L1 要改上百处 —— 但那是误解。**
+
+### ★ 结论：只有 4 类埋点，约 47 行，「约 50 行」成立
+
+| 埋点 | 精确位置 | 约计 |
+|---|---|---|
+| **park 决策** | `Task::park_for_scheduler()`（`scheduler.cpp:612-625`），3 个返回点 `kRejected`/`kRequeued`/`kParked` | ~5 行 |
+| **唤醒决策** | `Task::wake_for_scheduler` / `wake_for_io` / `wake_for_wait`（`:538`/`:568`/`:580`） | ~8 行 |
+| **选中决策** | `worker_loop` 的 4 处队列 pop（`:3535`、`:3679`、`:3699`、`:3721`） | ~8 行 |
+| **`select` 决策** | **另一个文件**：`channel.hpp:442` `TrySelect`、`:457` `TrySelectPair` | ~6 行 |
+| 回调接口 + 默认空实现 | 新增 | ~20 行 |
+| **合计** | | **~47 行** |
+
+**→ 这是第 6/7/8/9 轮四次动手验证里，第一次估算站得住的。**
+
+### ★★ 但发现一处埋点位置与直觉相反（本轮最有价值的发现）
+
+**「唤醒顺序」不能埋在 `wake_*` 里。**
+
+`Task::wake_for_scheduler()`（`scheduler.cpp:538`）实测只做**标记**：
+
+```cpp
+ParkAction Task::park_for_scheduler() noexcept {          // :612
+    ...
+    if (m_wake_pending.exchange(false, std::memory_order_acq_rel)) {
+        return ParkAction::kRequeued;                     // ← 消费令牌
+    }
+    m_state.store(GState::kWaiting, std::memory_order_release);
+    return ParkAction::kParked;                           // ← 只改状态
+}
+```
+
+它返回的是 `WakeAction` / `ParkAction` **枚举**，**没有触及就绪队列**。
+**真正的"入队"发生在 `Scheduler::requeue_to_processor()`（`:2527`）。**
+
+→ **要记录"谁先被放进就绪队列"，埋点必须在 `requeue_to_processor`，而不是 `wake_*`。**
+
+**若不验证这一点会怎样**：trace 里会记录一堆"唤醒意图"，**却没有顺序** ——
+而**顺序恰恰是重放的全部意义**。这会导致 C-L1 交付后才发现 trace 无法用于重放。
+
+### 三个前提（写入实施注意事项）
+
+1. **只记录这 4 类决策** —— 不要试图覆盖全部 86 处，那才是真正昂贵的原因；
+2. **必须跨文件插桩**（`scheduler.cpp` + `channel.hpp`），不能只在调度器里做；
+3. **「生产零开销」尚未验证** —— 需要确认 `if (trace) trace(...)`
+   （默认空 `std::function` + 一次分支）在热路径上确实可忽略。
+
+### 四轮验证的汇总（这是本目标最有价值的副产品）
+
+| 轮次 | 原估算 | 实测 | 结论 |
+|---|---|---|---|
+| 6 | 引用 `Context::SetNowFunction` | 该名字**不存在** | 推翻 |
+| 7 | C-L2 虚拟时钟「约 0 行」 | **约 50~100 行**（`TimerService` 硬编码 `steady_clock`） | 推翻 |
+| 8 | 「最低限度去掉慢路径自旋」 | **语义走不通**，约 30~50 行（实验：丢 5.45% 更新） | 推翻 |
+| **9** | **C-L1「约 50 行」** | **约 47 行** | **✅ 成立** |
+
+**前三次低估的共同原因**：估算时看的是"要改的那几行"，
+而不是"**这条数据流经哪几个组件、每个组件的契约是什么**"。
+**第 9 轮之所以估准，是因为这次真的去 grep 了决策点的分布，而不是凭"埋几个回调"的直觉。**
+
+### 状态
+
+- 本轮**只读代码 + 编辑文档/记录，未改动任何源码**。
+- 在途 5 个文件全程未触碰；台账待办 24 条不变。
+- 修正已写入 `docs/direction_plan.md` 阶段 1（C-L1 行 + 新增「第 9 轮实测」小节）。
+- **下一轮（第 10 轮）候选**：① 验证前提 3（"生产零开销"是否成立，可写微基准）；
+  ② 深化阶段 2（FSM 框架）的接口设计与成本估算；③ 竞品源码深挖。
+
 ## 2026-10-13：方向分析 · 第 8 轮（动手验证阶段 0 的「最低限度去掉自旋」是否成立）
 
 ### 本轮验证的命题

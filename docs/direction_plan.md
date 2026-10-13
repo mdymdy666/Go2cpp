@@ -95,6 +95,37 @@
 - **`grep -rn "HybridGate\|HybridMutex" src/ include/` 返回 0**（第 6 轮自检实测当前为 **29 处**）<br>
   **且**：`tests/concurrency/test_hybrid_gate.cpp`、`example/concurrency/hybrid_mutex_demo.cpp`、`cmake/Go2CppTests.cmake:23`/`:95` 的登记、以及 `example/README.md` 中相关行**一并移除** —— 否则删掉定义后测试与示例会编译失败
 - **`grep -rn "for (;;)" src/concurrency/` 中不再有自旋等待**（迭代循环可保留）
+
+**★ 第 9 轮实测：C-L1 的埋点清单（量化后只有 4 类）**
+
+`grep` 统计 `scheduler.cpp`（4048 行）里与决策相关的引用共 **86 处**
+（park 22 / wake 34 / 队列选择 11 / 状态转换 16 / select 3）。
+**但 86 处引用不等于 86 个埋点** —— 真正需要记录的决策只有 4 类：
+
+| 埋点 | 精确位置 | 约计 |
+|---|---|---|
+| **park 决策** | `Task::park_for_scheduler()`（`scheduler.cpp:612-625`，3 个返回点 `kRejected`/`kRequeued`/`kParked`） | ~5 行 |
+| **唤醒决策** | `Task::wake_for_scheduler` / `wake_for_io` / `wake_for_wait`（`:538`/`:568`/`:580`） | ~8 行 |
+| **选中决策** | `worker_loop` 的 4 处队列 pop（`:3535`、`:3679`、`:3699`、`:3721`） | ~8 行 |
+| **select 决策** | **在另一个文件**：`include/go2cpp/concurrency/channel.hpp:442` `TrySelect`、`:457` `TrySelectPair` | ~6 行 |
+| 回调接口 + 默认空实现 | 新增 | ~20 行 |
+| **合计** | | **~47 行** ✅ |
+
+**→ 「约 50 行」的估算成立**（这是第 6/7/8/9 轮四次动手验证里**第一次**站得住的估算）。
+
+**★ 但发现一处埋点位置与直觉相反 —— 值得单独记下**：
+
+**「唤醒顺序」不能埋在 `wake_*` 里。** 因为 `Task::wake_for_scheduler()` 只是**标记可唤醒**
+（返回 `WakeAction`），**真正的"入队"发生在 `Scheduler::requeue_to_processor()`（`:2527`）**。
+
+→ **要记录"谁先被放进就绪队列"，埋点必须在 `requeue_to_processor`，而不是 `wake_*`。**
+若不验证这一点，trace 会记录一堆"唤醒意图"却**没有顺序** —— 而顺序恰恰是重放的全部意义。
+
+**三个前提（写进实施注意事项）**：
+1. **只记录这 4 类决策**，不要试图覆盖全部 86 处 —— 那才是真正昂贵的原因；
+2. **必须跨文件插桩**（`scheduler.cpp` + `channel.hpp`），不能只在调度器里做；
+3. **「生产零开销」尚未验证** —— 需要确认 `if (trace) trace(...)` 这种
+   "默认空 `std::function` + 一次分支"在热路径上确实可忽略（第 10 轮可验）。
 - `X-25` 的 13 处全部有 try/catch 兜底
 
 ---
@@ -106,7 +137,7 @@
 
 | 步骤 | 内容 | 工作量 |
 |---|---|---|
-| **C-L1** | 在 `Scheduler` 决策点插**默认空**回调，记录：谁 park、就绪候选、选中谁、唤醒顺序 | **约 50 行**（生产零开销） |
+| **C-L1** | 在 **4 类**决策点插**默认空**回调，记录：谁 park、谁被唤醒**入队**、选中谁、`select` 命中哪一路 | **约 50 行**（第 9 轮已量化为 **约 47 行**，埋点清单见下方「第 9 轮实测」） |
 | **C-L2** | 虚拟时钟：**必须让运行时的时间源整体可注入** —— 实测发现存在**两个独立时间源**（见下方「第 7 轮实测修正」） | **约 50~100 行**（不是原先估计的 0 行。`Context::SetNowFunctionForTesting` 只能伪造 deadline 的**计算**；`TimerService` 硬编码 `steady_clock` 且无测试钩子，必须一并改造） |
 
 **验收标准**：
