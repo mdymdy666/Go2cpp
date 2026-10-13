@@ -113,6 +113,8 @@ if (GO2CPP_BUILD_EXAMPLES)
         concurrency/future_demo
         concurrency/hybrid_mutex_demo
         network/fd_manager_demo
+        network/http_demo
+        network/http_full
         network/fd_manager_full
         network/io_backend_demo
         network/address_bytearray_demo

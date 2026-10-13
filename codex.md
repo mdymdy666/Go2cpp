@@ -13,6 +13,101 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 14 轮（B 组 · network/http 模块）
+
+### 本轮完成：`network/http`（此前**完全没有示例**）
+
+| 文件 | 说明 |
+|---|---|
+| `example/network/http_demo.cpp` | **新建 · 简单版 3 个片段** |
+| `example/network/http_full.cpp` | **新建 · 全面版 8 个场景** |
+
+### 一个选型说明：为什么先做 http 而不是 websocket
+
+原计划做 `network/websocket`，但读头文件后发现**它的帧编解码全是 private**
+（`make_accept_key` / `make_client_key` / `read_frame` / `write_frame` /
+`valid_utf8` / `valid_close_code` 都在 private 段），公开的只有两个握手入口
+`ValidateUpgradeRequest` + `BuildUpgradeResponse`，**凑不满 3 个无网络场景**；
+其余 API 都需要真实 `Socket`。所以改为 `network/http` ——
+它的 `Headers` / `Request` / `Response` / `Parser` **全是纯计算**，
+且这个模块此前完全没有示例。
+
+**websocket 留待后续**：需要真实 socket 环境（届时先验证端口可用性）。
+
+### 全面版的 8 个场景（全部实跑通过）
+
+1. **请求往返** —— `Request::to_string` → `Parser::feed`：
+   `target=/v1/notes/42 body="hello" host=example.test`，方法/版本/头全部还原
+2. **头名大小写不敏感** —— 三种写法都能命中，`erase("CONTENT-type")` 也生效
+3. **同名单头多值** —— `set` 覆盖后值数 1；`add` 三次后值数 3 且顺序为 `abc`
+4. **路径与查询串拆分** —— `path()` / `query()` 正确切分
+   （`/a/b/c`、`/search` + `q=box&page=2`、`/`）
+5. **★ 增量分片解析** —— 逐字节 feed，中途出现 `NeedMore`，最后 `Complete`
+6. **响应序列化** —— `204` 状态行、头字段；
+   **`to_string(true)`（HEAD 请求）会省略正文**
+7. **`redirect` 与 `set_cookie`** —— `302 Location=/login`、`sid=abc; HttpOnly`
+8. **`Parser` 复用** —— `reset()` 后可解析下一个报文
+
+### ★★ 本轮发现一个未查清的异常，已如实记录
+
+**首版场景 8 用的是"管道化"（一次喂入两个请求 + `take_remaining`）**，实测：
+
+```
+第一个 target=/ 剩余字节=42
+```
+
+我设的 target 是 `/one`，两个请求总长约 44 字节，**而 `剩余=42` 说明解析器只消费了
+2 字节就返回 `Complete`**。
+
+**对照实验定位了边界**：场景 1 用「`PUT` + body」往返**完全正常**；
+把场景 8 换成「`POST` + body」后**也完全正常**（`/one aaa /two bbb`）。
+**差异只在于我首版那两个请求是「无 body 的 GET」。**
+
+**我的处置**：
+
+1. **把场景 8 改成确定成立的「`Parser` 复用」**，不让示例依赖未查清的行为；
+2. **在 `http_full.cpp` 文件头留了一条 `⚠️ 未解决的观察`**，写明现象与对照结论；
+3. **没有下"这是框架 bug"的结论** —— 也可能是我对 `to_string()` 在无 body
+   情况下的终止约定理解有误。
+
+**这条留给后续轮次深挖**（需要打印实际报文逐字节比对）。
+**宁可标注未解决，也不把它写成"已验证"或"已确认是 bug"。**
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_http_demo` → **EXIT=0**（3 个片段）
+- `go2cpp_http_full` → **EXIT=0**（8 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`
+- 5 个原始在途文件未触碰；`future_full.cpp` 也未触碰
+
+### 进度（14 轮完成 15 个模块、约 130 个场景）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 |
+| `concurrency/future` | ✅ 沿用 82 行 | ✅ 186 行 / 6 场景 |
+| `tools/control_flow` | ✅ 沿用 94 行 | ✅ 185 行 / 6 场景 |
+| `concurrency/timer` | ✅ 沿用 178 行 | ✅ 171 行 / 6 场景 |
+| `core/parking_condition` | ✅ 新建 67 行 | ✅ 210 行 / 6 场景 |
+| `concurrency/scheduler` | ✅ 新建 57 行 | ✅ 188 行 / 6 场景 |
+| `network/address` | ✅ 沿用 72 行 | ✅ 138 行 / 6 场景 |
+| `network/bytearray` | ✅ 沿用 72 行 | ✅ 179 行 / 6 场景 |
+| `network/fd_manager` | ✅ 沿用 56 行 | ✅ 209 行 / 7 场景 |
+| `concurrency/thread_policy` | ✅ 新建 70 行 | ✅ 210 行 / 7 场景 |
+| `concurrency/fiber_local` | ✅ 新建 61 行 | ✅ 192 行 / 7 场景 |
+| `network/sse` | ✅ 新建 69 行 | ✅ 210 行 / 8 场景 |
+| `network/http` | ✅ 新建 | ✅ 新建 / 8 场景 |
+
+### 剩余模块
+
+- **A 组**：`network/websocket`（需 socket）、`network/io_backend`、`network/io_hook`、
+  `concurrency/runtime`、`concurrency/dynamic_gmp`
+- **B 组**：`network/socket`（需端口）、**`config`**（头文件 25KB，需先专项读一轮）
+- **C 组（依赖在途文件）**：`logging/log`、`tools/error`
+
 ## 2026-10-13：example 完善 · 第 13 轮（A 组 · network/sse 模块）
 
 ### ⚠️ 先说一件重要的事：在途文件从 5 个变成了 6 个
