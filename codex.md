@@ -13,6 +13,90 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 11 轮（B 组 · thread_policy 模块）
+
+### 本轮完成：`concurrency/thread_policy`（此前**完全没有示例**）
+
+| 文件 | 说明 |
+|---|---|
+| `example/concurrency/thread_policy_demo.cpp` | **新建 · 简单版 3 个片段** |
+| `example/concurrency/thread_policy_full.cpp` | **新建 · 全面版 7 个场景** |
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **默认状态** —— 普通线程 = `kUnmanaged` + `kInherit`，`scheduler == nullptr`
+2. **`ScopedThreadParticipation`** —— 作用域内绑定调度器后 `participates_in_gmp=1`，
+   退出后恢复
+3. **`ScopedThreadHookMode`** —— 禁用 / 启用都能生效，退出后恢复
+4. **`SetCurrentThreadHookMode`** 直接设置 —— **不会被自动还原，必须手工恢复**
+5. **嵌套守卫** —— 内层退出恢复**外层状态**（`kEnabled`），而不是默认值
+6. **`HookAllowed` 合并语义** —— `inherit(1,0) disabled(0,0) enabled(1,1)`
+7. **`Scheduler` worker 内** —— `runtime_worker=1`、`participates_in_gmp=1`，
+   且 worker 内的 Hook 覆盖**不影响主线程**（TLS 隔离）
+
+### ★★ 本轮两处需要纠正的地方（都是我的问题）
+
+**① 编译错误：`ScopedThreadParticipation` 必须传调度器身份**
+
+首版我写成 `ScopedThreadParticipation(ThreadParticipationMode::kGmpEligible)`，
+编译失败。读头文件后发现两个重载都要求 `scheduler::Scheduler*`（或引用）：
+
+```cpp
+explicit ScopedThreadParticipation(scheduler::Scheduler* scheduler,
+                                   ThreadParticipationMode mode = kGmpEligible) noexcept;
+```
+
+**根因**：`participates_in_gmp()` 的实现是
+`scheduler != nullptr && participation == kGmpEligible` ——
+**只把 participation 改成 `kGmpEligible` 而不绑定调度器，仍然不算"参与 GMP"**。
+这一点现在写进了示例注释。
+
+**② 断言错误：`kEnabled` 是覆盖，不是跟随**
+
+场景 6 首版实测 `enabled(1,1)`，我预期的是 `(1,0)`。
+**框架是对的**：`kEnabled` 表示"线程级显式启用"，**优先级高于进程级开关**，
+所以进程级为 `false` 时结果仍是允许。
+
+**合并语义汇总（已写进示例）**：
+
+| 线程模式 | 进程 true | 进程 false |
+|---|---|---|
+| `kInherit` | 1 | 0 |
+| `kDisabled` | 0 | 0 |
+| **`kEnabled`** | 1 | **1** |
+
+**这两处合起来说明同一件事**：`thread_policy` 的两个维度
+（"参与 GMP" 与 "Hook 开关"）**都不是单一布尔量**，
+前者要求"模式 + 调度器身份"同时成立，后者是"进程级 + 线程级覆盖"的合并。
+**示例把这两层语义都显式展开了，这正是它比头文件注释更有用的地方。**
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_thread_policy_demo` → **EXIT=0**（3 个片段）
+- `go2cpp_thread_policy_full` → **EXIT=0**（7 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途 5 个文件全程未触碰
+
+### 进度（11 轮完成 12 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 |
+| `concurrency/future` | ✅ 沿用 82 行 | ✅ 186 行 / 6 场景 |
+| `tools/control_flow` | ✅ 沿用 94 行 | ✅ 185 行 / 6 场景 |
+| `concurrency/timer` | ✅ 沿用 178 行 | ✅ 171 行 / 6 场景 |
+| `core/parking_condition` | ✅ 新建 67 行 | ✅ 210 行 / 6 场景 |
+| `concurrency/scheduler` | ✅ 新建 57 行 | ✅ 188 行 / 6 场景 |
+| `network/address` | ✅ 沿用 72 行 | ✅ 138 行 / 6 场景 |
+| `network/bytearray` | ✅ 沿用 72 行 | ✅ 179 行 / 6 场景 |
+| `network/fd_manager` | ✅ 沿用 56 行 | ✅ 209 行 / 7 场景 |
+| `concurrency/thread_policy` | ✅ 新建 | ✅ 新建 / 7 场景 |
+
+**下一轮建议**：`concurrency/fiber_local`（B 组，无环境依赖）。
+
 ## 2026-10-13：example 完善 · 第 10 轮（A 组 · network/fd_manager 模块）
 
 ### 本轮完成：`network/fd_manager`
