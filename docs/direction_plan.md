@@ -92,7 +92,8 @@
 **验收标准**：
 - 构建 `-Wall -Wextra -Wpedantic` 下 **0 warning / 0 error**
 - `ctest` **全绿**
-- **`grep -rn "HybridGate\|HybridMutex" src/ include/` 返回 0**
+- **`grep -rn "HybridGate\|HybridMutex" src/ include/` 返回 0**（第 6 轮自检实测当前为 **29 处**）<br>
+  **且**：`tests/concurrency/test_hybrid_gate.cpp`、`example/concurrency/hybrid_mutex_demo.cpp`、`cmake/Go2CppTests.cmake:23`/`:95` 的登记、以及 `example/README.md` 中相关行**一并移除** —— 否则删掉定义后测试与示例会编译失败
 - **`grep -rn "for (;;)" src/concurrency/` 中不再有自旋等待**（迭代循环可保留）
 - `X-25` 的 13 处全部有 try/catch 兜底
 
