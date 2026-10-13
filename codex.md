@@ -13,6 +13,74 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 7 轮（B 组 · core/parking_condition 模块）
+
+### 本轮完成：`core/parking_condition`（此前**完全没有示例**）
+
+| 文件 | 说明 |
+|---|---|
+| `example/concurrency/parking_condition_demo.cpp` | **新建 · 简单版 3 个片段** |
+| `example/concurrency/parking_condition_full.cpp` | **新建 · 全面版 6 个场景** |
+
+### API 要点（本轮核实）
+
+- **谓词式**：`wait(lock, pred)` / `wait_for(lock, timeout, pred)` /
+  `wait_until(lock, deadline, pred)`，**都要求调用方持有
+  `std::unique_lock<std::mutex>`**（不是 `sync::Mutex`）
+- `notify_one()` / `notify_all()`
+- 静态查询：`FiberWaitUnsupported()` / `CancellationRequested()`
+
+### 全面版的 6 个场景（全部实跑通过）
+
+1. **★ 受管 G 等待不阻塞 M（P=1 反证）** —— 只给一个 P，让一个 Fiber 等待、
+   另一个 Fiber 通知。实测 `等待者已完成=1`：
+   **证明等待确实把执行权交还给了 M**（若阻塞，通知者永远排不上，会超时）
+2. **谓词式等待** —— 谓词要求 `counter >= 3`，中间值 1、2 被挡回去继续等
+   → `谓词最终成立=1 counter=3`
+3. **`notify_all`** —— 4 个等待者一次全醒 → `被唤醒=4`
+4. **`wait_for` 超时** —— 条件永不成立时 `返回=0 耗时约 30ms`
+5. **普通线程等待路径** —— **同一个对象**也能被普通线程使用（走原生 CV）
+6. **静态查询** —— 普通线程与受管 Fiber 内 `FiberWaitUnsupported()` 均为 0
+
+### ★ 本轮的错误也在示例自己的测试代码里（如实记录）
+
+首版场景 1 失败：`等待者已完成=0`。排查后确认**是我的测试写错了**，不是框架问题：
+
+```cpp
+const bool finished = waiter_done.load();   // ★ 在 wait() 之前就读了
+waiter->wait();
+```
+
+`go()` 是异步的，主执行流立即检查当然还是 false。**正确写法是先 `waiter->wait()`
+再读标志**。真正的反证在于：**若受管 G 的等待会阻塞唯一的 M，那么 `waiter->wait()`
+本身就会挂住** —— 由外部 `timeout 60` 兜底。
+
+这个错误本身也有教育价值：**"用 P=1 反证不阻塞 M"的写法必须让等待者的完成
+成为真正的阻塞点**，而不是提前读一个还没被写入的标志。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_parking_condition_demo` → **EXIT=0**（3 个片段）
+- `go2cpp_parking_condition_full` → **EXIT=0**（6 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途 5 个文件全程未触碰
+
+### 进度（7 轮完成 7 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 |
+| `concurrency/future` | ✅ 沿用 82 行 | ✅ 186 行 / 6 场景 |
+| `tools/control_flow` | ✅ 沿用 94 行 | ✅ 185 行 / 6 场景 |
+| `concurrency/timer` | ✅ 沿用 178 行 | ✅ 171 行 / 6 场景 |
+| `core/parking_condition` | ✅ 新建 | ✅ 新建 / 6 场景 |
+
+**下一轮建议**：`network/socket`（有 `network_demo` 可作简单版），
+或 B 组的 `concurrency/thread_policy` / `fiber_local`。
+
 ## 2026-10-13：example 完善 · 第 6 轮（A 组 · timer 模块，定时任务收尾轮）
 
 ### 本轮完成：`concurrency/timer`

@@ -100,6 +100,8 @@ if (GO2CPP_BUILD_EXAMPLES)
         logging/log_config_demo
         concurrency/timer_task_demo
         concurrency/timer_full
+        concurrency/parking_condition_demo
+        concurrency/parking_condition_full
         concurrency/future_demo
         concurrency/hybrid_mutex_demo
         network/fd_manager_demo
