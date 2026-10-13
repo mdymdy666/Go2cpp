@@ -13,6 +13,76 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 10 轮（A 组 · network/fd_manager 模块）
+
+### 本轮完成：`network/fd_manager`
+
+| 文件 | 说明 |
+|---|---|
+| `example/network/fd_manager_full.cpp` | **新建 · 全面版 7 个场景** |
+| `example/network/fd_manager_demo.cpp` | **沿用既有** —— 56 行、4 个场景，作简单版 |
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **首次 `get(fd, true)` 自动创建** —— `创建前=nullptr 创建后 fd=91001 initialized=1`
+2. **非阻塞的两个独立维度** —— `user` 与 `system` 可分别设置：
+   只设 user / 两个都设 / 都清掉，三种组合都验证
+3. **超时的两个独立方向** —— `recv=250ms send=500ms`
+4. **`erase` 生命周期** —— `旧句柄 closed=1 新对象=1 编号相同=1`
+   （erase 把已发出的 `shared_ptr` 标记为 `closed()`，编号复用得到新对象）
+5. **只读查询边界** —— `auto_create=false` 时不存在返回 `nullptr`，
+   且**连续两次只读都不会意外创建**
+6. **`duplicate` 复制元数据** —— `目标 fd=91007 继承 user_nonblock=1
+   继承 recv_timeout=120ms 源仍存在=1`
+7. **多 fd 隔离** —— 两个编号状态独立；擦掉一个后另一个仍在（且未被动 closed）
+
+### ★ 本轮一次编译通过 —— 第 9 轮的教训生效了
+
+第 9 轮我因为"从既有 demo 出现的片段外推未出现的成员"而臆造了
+`ByteArray::data()`，导致 4 处编译错误。**本轮严格按修正后的规范执行**：
+
+**先读 `include/go2cpp/network/fd_manager.hpp` 的公开接口
+（确认 `ContextPtr` 在该头文件里是 `shared_ptr<FdContext>` 的局部别名，
+不是 `go2cpp::ContextPtr`），再读既有 demo 学用法，然后才动笔。**
+
+结果：**一次编译通过，0 warning，7 个场景全部符合预期。**
+
+**→ 规范验证有效。后续轮次继续沿用"读头文件 + 读既有 demo"两道前置。**
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_fd_manager_full` → **EXIT=0**，7 场景全部符合预期
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途 5 个文件全程未触碰
+
+### 说明：为什么本轮没做 `network/socket`
+
+原计划做 `network/socket`，但它需要真实监听端口 / `connect`，
+**在受限环境里可能起不来**（WSL 无外网，端口行为不确定）。
+`fd_manager` 只操作元数据表（示例还刻意用远离真实 fd 空间的 91001 起编号），
+**无任何环境依赖**，是更稳的选择。`socket` 留到后续轮次，
+届时需要先验证监听端口能否在当前环境建立。
+
+### 进度（10 轮完成 11 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 |
+| `concurrency/future` | ✅ 沿用 82 行 | ✅ 186 行 / 6 场景 |
+| `tools/control_flow` | ✅ 沿用 94 行 | ✅ 185 行 / 6 场景 |
+| `concurrency/timer` | ✅ 沿用 178 行 | ✅ 171 行 / 6 场景 |
+| `core/parking_condition` | ✅ 新建 67 行 | ✅ 210 行 / 6 场景 |
+| `concurrency/scheduler` | ✅ 新建 57 行 | ✅ 188 行 / 6 场景 |
+| `network/address` | ✅ 沿用 72 行 | ✅ 138 行 / 6 场景 |
+| `network/bytearray` | ✅ 沿用 72 行 | ✅ 179 行 / 6 场景 |
+| `network/fd_manager` | ✅ 沿用 56 行 | ✅ 新建 / 7 场景 |
+
+**下一轮建议**：`concurrency/thread_policy` 或 `concurrency/fiber_local`（B 组，无环境依赖），
+或先验证 `network/socket` 的端口可用性。
+
 ## 2026-10-13：example 完善 · 第 9 轮（A 组 · address + bytearray 两个模块）
 
 ### 本轮完成
