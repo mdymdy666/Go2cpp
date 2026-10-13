@@ -96,6 +96,8 @@ if (GO2CPP_BUILD_EXAMPLES)
         network/network_demo
         network/websocket_demo
         network/sse_demo
+        network/sse_basic_demo
+        network/sse_full
         concurrency/context_rollback_demo
         logging/log_config_demo
         concurrency/timer_task_demo

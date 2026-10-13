@@ -13,6 +13,102 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 13 轮（A 组 · network/sse 模块）
+
+### ⚠️ 先说一件重要的事：在途文件从 5 个变成了 6 个
+
+本轮开工前的 `git status` 显示多了一个被修改的文件：
+
+```
+ M example/concurrency/future_full.cpp     ← 第 4 轮我创建的示例
+```
+
+**这不是我改的。** `git diff` 显示改动只有 **1 行删除**：
+文件头注释块里的一个空 `//` 行被删掉了（疑似编辑器自动格式化）。
+
+**处理**：**我没有碰它，也没有提交它**，并在本轮脚本里把「在途文件」清单从 5 个
+扩充为 6 个，门禁会拦截它的误提交。**如果这是你有意改的，它需要单独提交；
+如果是误改，可以 `git checkout` 还原。**
+
+### 本轮完成：`network/sse`
+
+| 文件 | 说明 |
+|---|---|
+| `example/network/sse_basic_demo.cpp` | **新建 · 简单版**（既有 `sse_demo.cpp` 为 115 行，超出简单版规格） |
+| `example/network/sse_full.cpp` | **新建 · 全面版 8 个场景** |
+
+### 全面版的 8 个场景（全部实跑通过）
+
+1. **基本事件** —— `data: hello` + 空行 → 1 个事件
+2. **重复 `data` 字段合并** —— 三行 `data:` 合并为 `"line1\nline2\nline3"`
+3. **`event` / `id` / `retry` 字段** —— 落到 `Event` 上，同时解析器记住
+   `last_event_id()` 与 `retry_after()` 供重连使用
+4. **★ 任意字节分片** —— **逐字节**喂入与整段喂入得到完全一致的事件
+   （`data="alpha\nbeta"`，`last_event_id="9"`）
+5. **换行变体与 BOM** —— `LF` / `CRLF` / `CR` 三种换行 + UTF-8 BOM 都能识别
+6. **注释行** —— 以冒号开头的行被忽略，不产生事件
+7. **★ 半个事件不派发** —— `"data: incomplete\n"`（缺结尾空行）**事件数 0**；
+   补上空行后才派发。**避免把网络截断误报成完整业务消息**
+8. **`encode` 往返** —— 编码后再解析得到等价事件
+
+### ★ 本轮踩到第 6 类坑：编译警告（不是错误）
+
+构建报 **0 error 但 1 warning**：
+
+```
+warning: hex escape sequence out of range
+```
+
+**根因**：我写了 `"\xEF\xBB\xBFdata: bom\n\n"` 表示 BOM + 正文。
+但 **`\x` 转义会尽可能多地吞掉十六进制字符，而 `d` 恰好是十六进制数字** ——
+于是 `\xBFd` 被解析成一个超范围的数值。
+
+**修复**：用相邻字符串字面量把 BOM 与正文切开：
+
+```cpp
+parse_all(bom, "\xEF\xBB\xBF" "data: bom\n\n");
+```
+
+**为什么值得记**：项目基线是 **0 warning**，而这个警告**不影响正确性**
+（编译产物照样能跑），如果只检查"有没有编译失败"就会漏掉。
+**"零警告"这条纪律真正起作用的地方，正是这种"能跑但不干净"的情况。**
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**（修复警告后）
+- `go2cpp_sse_basic_demo` → **EXIT=0**（3 个片段）
+- `go2cpp_sse_full` → **EXIT=0**（8 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`
+- 5 个原始在途文件全程未触碰；`future_full.cpp` 也未触碰
+
+### 进度（13 轮完成 14 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 |
+| `concurrency/future` | ✅ 沿用 82 行 | ✅ 186 行 / 6 场景 |
+| `tools/control_flow` | ✅ 沿用 94 行 | ✅ 185 行 / 6 场景 |
+| `concurrency/timer` | ✅ 沿用 178 行 | ✅ 171 行 / 6 场景 |
+| `core/parking_condition` | ✅ 新建 67 行 | ✅ 210 行 / 6 场景 |
+| `concurrency/scheduler` | ✅ 新建 57 行 | ✅ 188 行 / 6 场景 |
+| `network/address` | ✅ 沿用 72 行 | ✅ 138 行 / 6 场景 |
+| `network/bytearray` | ✅ 沿用 72 行 | ✅ 179 行 / 6 场景 |
+| `network/fd_manager` | ✅ 沿用 56 行 | ✅ 209 行 / 7 场景 |
+| `concurrency/thread_policy` | ✅ 新建 70 行 | ✅ 210 行 / 7 场景 |
+| `concurrency/fiber_local` | ✅ 新建 61 行 | ✅ 192 行 / 7 场景 |
+| `network/sse` | ✅ 新建 | ✅ 新建 / 8 场景 |
+
+### 目标状态：仍 active，未完成
+
+已完成 **14 个模块**，`include/go2cpp/` 下约 **27 个模块**。剩余：
+
+- **A 组**：`network/websocket`、`network/io_backend`、`network/io_hook`、
+  `concurrency/runtime`、`concurrency/dynamic_gmp`
+- **B 组**：`network/socket`、**`network/http`**、**`config`**
+- **C 组（依赖在途文件）**：`logging/log`、`tools/error`
+
 ## 2026-10-13：example 完善 · 第 12 轮（B 组 · fiber_local 模块）
 
 ### 本轮完成：`concurrency/fiber_local`（此前**完全没有示例**）
