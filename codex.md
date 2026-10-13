@@ -13,6 +13,52 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 3 轮（A 组 · sync 模块）
+
+### 本轮完成：`concurrency/sync`
+
+| 文件 | 内容 |
+|---|---|
+| `example/concurrency/sync_demo.cpp` | 简单版：Mutex 计数 / 跨执行流解锁 / WaitGroup |
+| `example/concurrency/sync_full.cpp` | **全面版：6 个场景** |
+
+### 全面版的 6 个场景（全部实跑通过）
+
+1. **`Mutex` 互斥** —— 8 Fiber × 2000 次累加，结果 16000 不丢更新
+2. **★ 跨执行流解锁** —— 主执行流加锁，**另一个 Fiber 调用 `Unlock()`**，
+   之后能重新 `Lock()` 且 `TryLock()` 成功 → 实证了 `sync::Mutex`
+   「Unlock 不要求由同一 G/线程调用」的 Go 风格所有权
+   （**普通 `std::mutex` 在这里是 UB**）
+3. **`LockFor` 超时** —— 锁被占用时 30ms 后返回 false，而不是一直等
+4. **`Mutex` + `ConditionVariable` 生产者/消费者** —— 用**谓词循环**对抗虚假唤醒
+   （`while (queue.empty()) cv.Wait(mutex)`），消费 5 项
+5. **`WaitGroup` 汇合** —— 6 个 Fiber 全部结束，`Count()` 归零
+6. **`Context` 取消打断 `Wait`** —— 取消后条件变量等待立即返回（`Wait` 返回，
+   不再永久阻塞）
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_sync_demo` → **EXIT=0**（计数 8000、跨执行流解锁=1、完成数 3/Count 0）
+- `go2cpp_sync_full` → **EXIT=0**，6 场景全部通过
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途 5 个文件全程未触碰
+- **连续两轮（context、sync）一次编译通过** —— 第 2 轮确立的
+  「示例里不用 `chrono` 字面量、统一 `using Ms = std::chrono::milliseconds`」
+  规范生效
+
+### 进度（3 轮完成 3 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ | ✅ / 6 场景 |
+
+**下一轮建议**：`concurrency/future`（`future.hpp` 已通读，不在在途清单），
+或 `concurrency/timer`；`config` 与 `network/http` 属于"无示例"的 B 组，
+建议先花一轮读头文件再动手。
+
 ## 2026-10-13：example 完善 · 第 2 轮（A 组 · context 模块）
 
 ### 本轮完成：`concurrency/context`
