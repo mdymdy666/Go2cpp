@@ -131,7 +131,8 @@ if (GO2CPP_BUILD_EXAMPLES)
         network/address_bytearray_demo
         network/address_full
         network/bytearray_full
-        tools/errors_demo)
+        tools/errors_demo
+        tools/error_full)
     if (TARGET go2cpp_hook)
         list(APPEND GO2CPP_EXAMPLES network/io_hook_demo)
         list(APPEND GO2CPP_EXAMPLES network/io_hook_full)

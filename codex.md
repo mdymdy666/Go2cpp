@@ -13,6 +13,96 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 22 轮（C 组 · tools/error，★ C 组完成）
+
+### 本轮完成：`tools/error`
+
+| 文件 | 说明 |
+|---|---|
+| `example/tools/error_full.cpp` | **新建 · 全面版 7 个场景** |
+| `example/tools/errors_demo.cpp` | **沿用既有** —— 54 行，在简单版区间内 |
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **创建** —— `errors::New` 产出带消息的错误，`Unwrap()` 为空
+2. **★ 包装与展开** —— `Wrap` 建三层链，`Unwrap` 逐层回退到 `nullptr`
+3. **★ 沿链识别根因** —— `Is` 穿透两层包装命中最初的错误；
+   且**同文本的新对象不命中**（身份而非文本比较）
+4. **nil 语义** —— `Is(nil,nil)=1`、`Is(err,nil)=0`、`Is(nil,err)=0`
+5. **★ 聚合** —— `Join` 三条错误，每条都能被 `Is` 识别；
+   **`vector` 重载与 `initializer_list` 重载产出等价结果**
+6. **★ 按类型提取** —— `As<TimeoutError>` 从包装中取出自定义错误类型
+   （读到 `milliseconds()==250`）；类型不符返回空
+7. **★★ 薄封装等价性** —— 专门验证头文件那句承诺
+
+### ★ 场景 7 是本轮的核心价值
+
+`errors::` 这批新 API 的**唯一价值主张就是"等价于既有 API"**，所以用**交叉验证**测实：
+
+```cpp
+const bool cross_1 = Is(lower_wrapped, lower_root);          // 大写判小写链
+const bool cross_2 = errors::Is(camel_wrapped, camel_root);  // 小写判大写链
+const bool cross_3 = Is(camel_wrapped, camel_root) ==
+                     errors::Is(camel_wrapped, camel_root);  // 结果一致
+```
+
+再验证两条链的 `Message()` 一致、`Unwrap` 深度都是 3。
+**这样"薄封装"就从一句声明变成了被实测钉住的契约。**
+
+### ★ 第 11 类坑：错误链的 `Message()` 是整条链，不是单层
+
+首版场景 2 的断言：
+
+```cpp
+level1->Message() == "write failed"   // ✗ 实测是 "write failed: disk full"
+```
+
+**`Wrap` 产出的错误，其 `Message()` 是「外层: 内层」的完整拼接**：
+
+```
+链="save config failed: write failed: disk full"
+     "write failed: disk full"
+     "disk full"
+```
+
+**修复**：**改用身份（`shared_ptr` 指针）比较判断层级**，只对最内层的
+`root->Message()` 做文本断言。
+
+**这次的现象尤其值得记**：**所有打印出来的断言都是 1，但整体报"存在失败场景"** ——
+因为失败的那个断言**恰好没被打印**。**"输出看起来全对"不等于断言全对**；
+代码里必须保证每个影响 `ok` 的条件都能在输出里被看到。
+
+### 关于 `tools/error` 的在途文件
+
+`include/go2cpp/tools/error.hpp` 与 `src/tools/error.cpp` 用户在查看中。
+本轮**只读不改** —— `errors::` 的内容与既有 API 签名都取自当前工作区真实代码，
+**没有基于旧版本做任何假设**。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**；`go2cpp_error_full` → **CODE=0**
+- 已登记进 `GO2CPP_EXAMPLES`
+  （注意 `tools/errors_demo` 在列表**末尾且带右括号**，锚点必须包含 `)`）
+- 在途文件（6 个）全程未触碰
+
+### ★★ C 组完成
+
+| C 组模块 | 轮次 |
+|---|---|
+| `logging/log` | 第 21 轮 |
+| **`tools/error`** | **本轮** |
+
+### 总进度：22 轮完成 24 个模块
+
+`concurrency`(10) / `core`(1) / `network`(8) / `tools`(2) / `logging`(1) / `config`(1)
+
+### 剩余
+
+- **已判定不做**：`core/hybrid_mutex`（用户明确"绝对不允许 HybridGate"）
+- **未覆盖**：`config` 的 `RuntimeConfig`（pending/watcher 路径）
+
+**A 组、C 组均已清空。**
+
 ## 2026-10-13：example 完善 · 第 21 轮（C 组 · logging/log 模块）
 
 ### 本轮完成：`logging/log`
