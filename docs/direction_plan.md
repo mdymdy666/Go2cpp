@@ -107,13 +107,35 @@
 | 步骤 | 内容 | 工作量 |
 |---|---|---|
 | **C-L1** | 在 `Scheduler` 决策点插**默认空**回调，记录：谁 park、就绪候选、选中谁、唤醒顺序 | **约 50 行**（生产零开销） |
-| **C-L2** | 虚拟时钟：测试里用 **`Context::SetNowFunctionForTesting`**（`include/go2cpp/concurrency/context.hpp:224`，配套 `ResetNowFunctionForTesting` 在 `:226`，时间源类型 `using NowFunction` 在 `:134`）替换时间源，让"30 秒超时"瞬间到达 | **约 0 行**（接口现成，第 6 轮自检已核实存在） |
+| **C-L2** | 虚拟时钟：**必须让运行时的时间源整体可注入** —— 实测发现存在**两个独立时间源**（见下方「第 7 轮实测修正」） | **约 50~100 行**（不是原先估计的 0 行。`Context::SetNowFunctionForTesting` 只能伪造 deadline 的**计算**；`TimerService` 硬编码 `steady_clock` 且无测试钩子，必须一并改造） |
 
 **验收标准**：
 - **同一 seed 两次运行，产出逐字节相同的 trace**
 - **一个原本需要 30 秒的超时测试，在 <100 ms 内跑完**
 - 生产路径**零开销**（回调默认为空，`grep` 确认无额外分支）
 - **trace 能解释一次真实的 flaky 失败**（抓一个现存的间歇性失败，用它定位）
+
+**★ 第 7 轮实测修正（本阶段最大的成本被低估了）**：
+
+动手验证时发现**运行时有两个互相独立的时间源**：
+
+| 时间源 | 是否可注入 | 证据 |
+|---|---|---|
+| `Context::Now()` | ✅ **可以**（尊重 `SetNowFunctionForTesting`） | `context.cpp:2317-2322` 取 `s_now_function`；`WithTimeout` 在 `:2195` 用它算 deadline |
+| **`TimerService` 的时钟** | ❌ **不可以** | **`timer.cpp:32` 硬编码 `using Clock = std::chrono::steady_clock`**；`timer.hpp` 有 **11 处** `steady_clock` 类型；全仓库**没有**任何 `AdvanceTo` / `FireDue` / `Pump` 之类的测试钩子 |
+
+**后果**：`WithTimeout(parent, 30s)` 的 deadline 会被"假时间"算出，
+**但定时器仍按真实 `steady_clock` 等待** —— **测试还是真等 30 秒。**
+原估算的"约 0 行"因此不成立。
+
+**修正后的做法**：让 `TimerService` 的时钟也成为可注入的（或提供一个"推进到指定时刻"的测试钩子）。
+工作量约 **50~100 行**，需要动 `timer.hpp` / `timer.cpp`。
+
+**★ 但这反而印证了 C 的价值**：**"两套时间源"本身就是一个非确定性来源** ——
+`Context` 认为现在是 T1，`TimerService` 按 T2 触发，两者的相对关系取决于真实调度。
+**这正属于 C 要消除的那一类问题。** 换句话说，做 C-L2 的过程会顺手修掉一个真实的时序缺陷。
+
+**结论不变**：C-L2 仍是低成本项（相比阶段 2/3 的周级工作），但**从"0 行"改为"约 100 行"**。
 
 ---
 
