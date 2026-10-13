@@ -202,11 +202,10 @@ bool scenario_validate_bounds() {
     return ok;
 }
 
-// ★★ 场景 7：记录一个已确认的框架缺陷
+// ★★ 场景 7：回归验证 —— [timer] 段曾经完全无法被读取
 //
-// src/config/config.cpp 的 ReadSize 实现：
+// 修复前的 ReadSize 实现（src/config/config.cpp）：
 //
-//     if (!ini.Has(section, key)) return true;
 //     if (ParseSize(ini.Get(section, key), target)) {
 //         if (std::string_view(section) == "scheduler" &&
 //             ValidateSchedulerSize(key, *target, error)) {
@@ -214,44 +213,53 @@ bool scenario_validate_bounds() {
 //         }
 //         return false;          // ← 非 scheduler 段必定走到这里
 //     }
-//     ...
 //
 // 而 FromIni 用 ReadSize 读取 [timer] 的 warn_after_days / error_after_days。
-// 因此：**只要 INI 里出现 [timer] 段，FromIni 必定失败，且不设置 error。**
+// 因此只要 INI 里出现 [timer] 段，FromIni 必定失败，且不设置 error（静默）。
 //
 // 这解释了两个既有现象：
 //   ① 仓库自带的 go2cpp.ini 含 [timer] 段，所以 LoadRuntimeConfig("go2cpp.ini")
 //      从来无法成功；
 //   ② 既有 log_config_demo 把"未加载 go2cpp.ini"当作常态分支，恰好绕过了它。
-bool scenario_timer_defect() {
-    std::clog << "[full][场景7] ★ 已确认缺陷：[timer] 段导致 FromIni 失败\n";
+//
+// 现已修复（ReadSize 按段分流：只有 scheduler 段才走 ValidateSchedulerSize）。
+// 本场景作为回归验证：带 [timer] 的 INI 必须能成功构造，且值确实来自文件。
+bool scenario_timer_regression() {
+    std::clog << "[full][场景7] ★ 回归验证：[timer] 段可被正确读取\n";
 
-    // 只给 [timer]，其余全默认
     bool parsed = false;
-    const auto ini = make_ini("[timer]\nwarn_after_days = 5\n", &parsed);
+    const auto ini = make_ini(
+        "[timer]\n"
+        "warn_after_days = 5\n"
+        "error_after_days = 9\n",
+        &parsed);
 
     RuntimeConfig config;
     std::string error;
     const bool loaded = RuntimeConfig::FromIni(ini, &config, &error);
 
-    // 缺陷特征：失败，但既不报错、也不改变默认值
-    const bool failed = !loaded;
+    const bool warn_ok = config.timer_warn_after_days == 5;    // 默认是 30
+    const bool error_ok = config.timer_error_after_days == 9;  // 默认是 365
     const bool silent = error.empty();
-    const bool kept_default = config.timer_warn_after_days == 30;
 
-    // 对照：同一条 INI 去掉 [timer] 段就能成功
-    bool parsed_ok = false;
-    const auto without_timer = make_ini("", &parsed_ok);
-    RuntimeConfig ok_config;
-    std::string ok_error;
-    const bool ok_loaded = RuntimeConfig::FromIni(without_timer, &ok_config, &ok_error);
+    // 对照：不写 [timer] 时仍应保持默认值
+    bool parsed_default = false;
+    const auto empty_ini = make_ini("", &parsed_default);
+    RuntimeConfig default_config;
+    std::string default_error;
+    const bool default_loaded = RuntimeConfig::FromIni(empty_ini, &default_config,
+                                                       &default_error);
+    const bool defaults_kept = default_config.timer_warn_after_days == 30 &&
+                               default_config.timer_error_after_days == 365;
 
-    const bool ok = failed && silent && kept_default && ok_loaded;
-    std::cout << "  带 [timer] 的 FromIni=" << loaded << " error=\"" << error
-              << "\" 保持默认(" << config.timer_warn_after_days << ")=" << kept_default
-              << '\n'
-              << "  去掉 [timer] 后 FromIni=" << ok_loaded
-              << "（预期 带 timer 时失败且静默；去掉后成功）\n";
+    const bool ok = parsed && loaded && warn_ok && error_ok && silent &&
+                    default_loaded && defaults_kept;
+    std::cout << "  带 [timer] 的 FromIni=" << loaded
+              << " warn=" << config.timer_warn_after_days << "(=" << warn_ok
+              << ") error=" << config.timer_error_after_days << "(=" << error_ok
+              << ") 无报错=" << silent
+              << " 空 INI 仍用默认=" << defaults_kept
+              << "（预期 1 5 9 1 1）\n";
     return ok;
 }
 
@@ -270,7 +278,7 @@ int main() {
     ok = scenario_transactional() && ok;
     ok = scenario_defaults() && ok;
     ok = scenario_validate_bounds() && ok;
-    ok = scenario_timer_defect() && ok;
+    ok = scenario_timer_regression() && ok;
 
     std::clog << (ok ? "[full] 7 个场景全部通过\n" : "[full] 存在失败场景\n");
     return ok ? 0 : 1;

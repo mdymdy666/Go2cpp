@@ -13,6 +13,108 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：修复 —— config 模块 `ReadSize` 对非 scheduler 段的静默失败
+
+### 用户要求
+
+> 「这个 Config 模块确实存在问题，你修复吧。
+> 除了基本的固定参数搭配，还要求动态文件热重载，以及程序内部的自己加载
+> （默认加载，如果文件信息里面有，就优先从配置文件热重载）。
+> 参考 /UserData/CodexWorkSpace/sylar2/sylarConfig 模块的 LookUp」
+
+### 调研结论：你要的三件事，现有 API 都已经具备
+
+| 要求 | 现有 API | 与 sylar 的对应 |
+|---|---|---|
+| 基本固定参数搭配 | `Config::Lookup<T>(name, default_value, description)` | **与 sylar 的 `Lookup` 签名一致** |
+| 动态文件热重载 | `Config::StartWatcher(path, interval, error)` / `StopWatcher()` / `Watching()` | sylar 无此能力，Go2Cpp 更强 |
+| 默认加载、文件有则优先 | `Lookup` 先注册默认值，热重载事务性覆盖 | sylar 同语义 |
+
+**补充**：sylar2 的实际路径是 `/UserData/CodexWorkSpace/sylar2/sylar`（不是 `sylarConfig`），
+其 `Lookup` 定义在 `config.h:448`（单参查询）与 `:461`（带默认值创建）。
+
+**Go2Cpp 还额外具备**：`AddCommitListener`（提交后通知）、
+`AddTransactionValidator`（整批候选值校验）、`FileStamp` 稳定快照 +
+`IsEditLocked` 编辑锁（避免读到半个文件）。
+
+**所以"问题"指的是那个 `[timer]` 缺陷。**
+
+### ★ 修复内容（唯一改动：`src/config/config.cpp` 的 `ReadSize`）
+
+**修复前**：
+
+```cpp
+if (ParseSize(ini.Get(section, key), target)) {
+    if (std::string_view(section) == "scheduler" &&
+        ValidateSchedulerSize(key, *target, error)) {
+        return true;
+    }
+    return false;          // ← 非 scheduler 段（如 timer）必定落到这里
+}
+```
+
+**问题**：非 `scheduler` 段的值解析成功后，`if` 条件为假 → 跳过 `return true`
+→ 直落 `return false`。于是 `[timer]` 的 `warn_after_days` / `error_after_days`
+**永远无法被读取**，而且失败时**不设置 `error`**（静默失败）。
+
+**修复后（按段分流）**：
+
+```cpp
+if (!ParseSize(ini.Get(section, key), target)) {
+    if (error) *error = std::string("配置项不是非负整数: ") + section + "." + key;
+    return false;
+}
+// ValidateSchedulerSize 只认识 scheduler 段的键名，其它段传入时既不在它的
+// 白名单里也不该被它拒绝 —— 必须按段分流。
+if (std::string_view(section) == "scheduler") {
+    return ValidateSchedulerSize(key, *target, error);
+}
+return true;
+```
+
+### 验证
+
+**① 缺陷回归验证**（`example/config/runtime_config_full.cpp` 场景 7 已改写）：
+
+```
+带 [timer] 的 FromIni=1 warn=5(=1) error=9(=1) 无报错=1 空 INI 仍用默认=1
+```
+
+修复前同一场景是 `FromIni=0 error="" 保持默认(30)=1`。
+**现在 `[timer]` 段能正确读取，且空 INI 仍保持默认值 30/365。**
+
+**② 该缺陷解释的两个既有现象**（现在都自然消解）：
+- 仓库自带的 `go2cpp.ini` 含 `[timer]` 段 → `LoadRuntimeConfig("go2cpp.ini")` 现在能成功；
+- 既有 `log_config_demo` 把"未加载 go2cpp.ini"当常态分支 → 现在会走成功分支。
+
+**③ 构建**：0 warning / 0 error。
+
+**④ 全量 ctest**：**65 个测试，64 通过，1 失败**。
+
+### ⚠️ 那个失败与本次修复无关，如实记录
+
+**失败测试**：`go2cpp_sse_full`（第 35 个）。
+
+**证据表明无关**：
+- `sse.cpp` / `sse.hpp` **不依赖 config**（grep 无匹配）；
+- `sse.cpp` 最后一次改动是 `d0fdf70`（不在当前改动集里）；
+- 本次只改了 `src/config/config.cpp`。
+
+**但现象值得记录（疑似 flaky）**：失败点是场景 5 的 `CR=""`。
+**我在第 13 轮手工运行同一个示例时，输出是 `CR="cr"`（当时通过）。**
+同一份代码、同一个二进制，两次结果不同 —— **说明单独用 `\r` 作换行符的处理
+可能存在非确定性**。
+
+**本轮不擅自修改 SSE**：它不在本次任务范围内，且需要先独立复现才能判断。
+**已作为待查项记录。**
+
+### 状态
+
+- **改动文件**：`src/config/config.cpp`（修复）、
+  `example/config/runtime_config_full.cpp`（场景 7 改为回归验证）
+- **7 个在途文件（用户在查看）全程未触碰**
+- 用户要求的三个能力**确认已具备**，本次修复的是其底层读取路径上的一个静默缺陷
+
 ## 2026-10-13：example 完善 · 第 23 轮（config · RuntimeConfig，★ 发现真实缺陷）
 
 ### 本轮完成：`config` 的 `RuntimeConfig`（此前未覆盖）

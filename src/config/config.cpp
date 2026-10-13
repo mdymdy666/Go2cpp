@@ -135,17 +135,25 @@ bool ValidateDuration(const char* key, std::size_t value, std::string* error) {
 bool ReadSize(const IniFile& ini, const char* section, const char* key,
               std::size_t* target, std::string* error) {
     if (!ini.Has(section, key)) return true;
-    if (ParseSize(ini.Get(section, key), target)) {
-        // 静态配置和热更新必须使用同一套范围规则；这样错误会在
-        // 读取具体字段时报告，而不是等到调度器已经部分初始化后才发现。
-        if (std::string_view(section) == "scheduler" &&
-            ValidateSchedulerSize(key, *target, error)) {
-            return true;
-        }
+    if (!ParseSize(ini.Get(section, key), target)) {
+        if (error) *error = std::string("配置项不是非负整数: ") + section + "." + key;
         return false;
     }
-    if (error) *error = std::string("配置项不是非负整数: ") + section + "." + key;
-    return false;
+    // 静态配置和热更新必须使用同一套范围规则；这样错误会在读取具体字段时
+    // 报告，而不是等到调度器已经部分初始化后才发现。
+    //
+    // 注意：ValidateSchedulerSize 只认识 scheduler 段的键名，其它段（例如
+    // timer 的 warn_after_days / error_after_days）传入时既不在它的白名单里
+    // 也不该被它拒绝。因此这里必须按段分流：只有 scheduler 段才走那套范围
+    // 规则，其它段解析成功即成功。
+    //
+    // 修复前写成「if (section == "scheduler" && Validate(...)) return true;
+    // return false;」——非 scheduler 段会跳过 return true 直落 return false，
+    // 导致 [timer] 段的值永远无法被读取，而且失败时不设置 error（静默失败）。
+    if (std::string_view(section) == "scheduler") {
+        return ValidateSchedulerSize(key, *target, error);
+    }
+    return true;
 }
 
 // 文件被编辑器直接截断并重写时，监听线程可能恰好读到半个文件。用
