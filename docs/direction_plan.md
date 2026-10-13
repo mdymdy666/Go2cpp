@@ -296,3 +296,66 @@
 >
 > **四年内所有 C++ 协程库都在解决"怎么写得更快"，而"这个并发系统到底有没有死锁"至今没有廉价答案。**
 > **Go2Cpp 的协作式调度恰好让这个问题变得可回答——这就是它唯一的位置。**
+
+
+---
+
+## 九、阶段 0 的修正（第 14 轮）：`core` 层的 gate 应「改造」而非「删除」
+
+### 两个互不蕴含的约束
+
+先前把「混合锁」当成一个需求，实际是两个：
+
+| | 需求 | 约束的是 |
+|---|---|---|
+| **A 混合等待** | 受管 G 拿不到锁要 **park 让出 M**，普通线程走原生 CV | **等待原语的实现** |
+| **B 跨线程解锁** | `lock()` / `unlock()` 可能落在不同 M（hook 把 `connect_with_timeout` 变成跨线程定时任务） | **锁状态里能不能记录 owner** |
+
+### 用 A + B 重新筛选
+
+| 方案 | A | B | 可用？ |
+|---|---|---|---|
+| `std::mutex` / glibc adaptive mutex | ❌ 阻塞 M | ❌ **owner-bound** | ❌ |
+| **`HybridGate`（现状）** | ⚠️ 靠"临界区极短"规避 | ✅ **`atomic_flag`，无 owner** | ✅ **但有无界自旋** |
+| **`parking_lot::WordLock`** | ❌ **futex 会阻塞 M** | ✅ 只有 `LOCKED_BIT`，无 owner | ⚠️ **过了 B，卡在 A** |
+| **`sync::Mutex`** | ✅ park（`WaitBackend`） | ✅ 「Unlock 不要求由同一 G/线程调用，Go 风格所有权」 | ✅ **唯一同时满足** |
+| `folly::DistributedMutex` | ❌ | ⚠️ 未确认 | ❌ |
+
+**但 `sync::Mutex` 进不了 `core`** —— 它的等待后端就是 `core::ParkingCondition`，
+`core` 反过来用它就形成 `core → sync → core` 循环依赖。
+
+### ★ 这个组合没有现成开源实现
+
+- **Rust / C++ 生态的混合锁都不需要 B**：它们的锁，持有者与释放者天然在同一执行流；
+- **Go 的 `sync.Mutex` 满足 B**（不记录 owner），但它跑在自己的 runtime 上，**不需要 A**；
+- **`parking_lot` 满足 B 但没有 A**。
+
+**「Fiber 可在 M 间迁移」+「锁可跨 M 解锁」是 Go2Cpp 独有的组合** ——
+所以这里没有可直接照搬的实现。
+
+### 可借鉴两项 + 必须自做一项
+
+**① 借鉴 `parking_lot::WordLock` 的状态融合**
+用一个字承载「锁位 + 队列锁位 + 队列头指针」，
+**快路径 `unlock` 从 `fetch_sub` 的返回值里读"是否有等待者"** —— 零额外原子操作。
+（我们实测：在 `unlock` 里多加一次原子读，无竞争时慢 **54%**。）
+
+**② 借鉴 `prepare_park()` 令牌机制**
+先声明"我准备好被唤醒了"，再发布到队列，最后才等待 —— 封闭 lost-wakeup 窗口。
+（我们实测：缺这一步的 G5 **直接挂死**。）
+
+**③ 必须自己做：把等待原语换成 `ParkingCondition` 双模式 + 谓词式等待**
+`WordLock` 的 `park()`/`unpark()` 是 Linux futex，**会阻塞 carrier 线程**（违反需求 A）。
+`core` 层必须换成：**受管 G → park 让出 M；普通线程 → 原生 CV**，
+并用 `wait(lock, pred)` **重查状态**，把令牌机制与双模式等待接起来。
+
+### ★ 对 A-1 清单的修正
+
+| 位置 | 原表述 | 修正后 |
+|---|---|---|
+| `src/network/io.cpp` | 换 `sync::Mutex` | **不变**（A、B 都满足，无循环依赖） |
+| `src/concurrency/sync.cpp` | 换 `sync::Mutex` | **不变**（同类内部） |
+| **`src/concurrency/parking_condition.cpp`** | ~~换 `sync::Mutex`~~ | **必须新写/改造一个 gate**：**保留无 owner 的跨线程解锁语义，去掉 `for(;;)` 无界自旋，等待改为双模式** |
+
+**→ 一句话：`HybridGate` 在 `core` 层不该被"删除"，而该被"改造"。**
+**它的跨线程解锁语义是必需的，要丢掉的只是那个无界自旋。**
