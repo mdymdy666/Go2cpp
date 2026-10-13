@@ -106,6 +106,8 @@ if (GO2CPP_BUILD_EXAMPLES)
         concurrency/scheduler_full
         concurrency/thread_policy_demo
         concurrency/thread_policy_full
+        concurrency/fiber_local_demo
+        concurrency/fiber_local_full
         concurrency/future_demo
         concurrency/hybrid_mutex_demo
         network/fd_manager_demo

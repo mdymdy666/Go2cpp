@@ -13,6 +13,83 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 12 轮（B 组 · fiber_local 模块）
+
+### 本轮完成：`concurrency/fiber_local`（此前**完全没有示例**）
+
+| 文件 | 说明 |
+|---|---|
+| `example/concurrency/fiber_local_demo.cpp` | **新建 · 简单版 3 个片段** |
+| `example/concurrency/fiber_local_full.cpp` | **新建 · 全面版 7 个场景** |
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **`GetOrCreate` 按需就地构造** —— 再次调用返回**同一对象**（`同一对象=1`）
+2. **两个 Fiber 的值互相隔离** —— `A="alpha" B="beta"`
+3. **★ park/resume 后值仍然存在** —— 在无缓冲 Channel 上阻塞、
+   唤醒后读到 `4242`。**实证了"值属于 G 而不是某次执行片段"**
+4. **`Reset` 后可重建** —— `Reset 前有值=1 Reset 后为空=1 重建后="second"`
+5. **Fiber 之外的线程局部后备** —— `新线程初次读到 -1 主线程仍为 11`
+   （后备值按线程隔离，新线程看不到主线程存的 11）
+6. **`key_id` 单调唯一** —— `key_id=6,7,8 严格递增且互不相同=1`
+7. **多实例互不干扰** —— 数值槽 99 与文本槽同时正确
+
+### ★ 本示例说明的关键语义
+
+`fiber_local` 与 `thread_local` 的区别是本模块存在的全部理由：
+
+| | `thread_local` | `FiberLocal<T>` |
+|---|---|---|
+| 作用域 | 当前 OS 线程 | **当前 Fiber（G）** |
+| G 被迁移到另一个 M 时 | 值留在原线程，**丢失** | **值随 G 迁移，保留** |
+| 生命周期终点 | 线程退出 | **Fiber trampoline 结束** |
+| 在 Fiber 外使用 | 正常 | **退化为线程局部后备值** |
+
+**场景 3 就是对第 2 行的实证**；**场景 5 是对第 4 行的实证**。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_fiber_local_demo` → **EXIT=0**（3 个片段）
+- `go2cpp_fiber_local_full` → **EXIT=0**（7 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途 5 个文件全程未触碰
+- **本轮一次编译通过**（严格沿用"先读头文件、再读既有 demo"两道前置）
+
+### 进度（12 轮完成 13 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 |
+| `concurrency/future` | ✅ 沿用 82 行 | ✅ 186 行 / 6 场景 |
+| `tools/control_flow` | ✅ 沿用 94 行 | ✅ 185 行 / 6 场景 |
+| `concurrency/timer` | ✅ 沿用 178 行 | ✅ 171 行 / 6 场景 |
+| `core/parking_condition` | ✅ 新建 67 行 | ✅ 210 行 / 6 场景 |
+| `concurrency/scheduler` | ✅ 新建 57 行 | ✅ 188 行 / 6 场景 |
+| `network/address` | ✅ 沿用 72 行 | ✅ 138 行 / 6 场景 |
+| `network/bytearray` | ✅ 沿用 72 行 | ✅ 179 行 / 6 场景 |
+| `network/fd_manager` | ✅ 沿用 56 行 | ✅ 209 行 / 7 场景 |
+| `concurrency/thread_policy` | ✅ 新建 70 行 | ✅ 210 行 / 7 场景 |
+| `concurrency/fiber_local` | ✅ 新建 | ✅ 新建 / 7 场景 |
+
+### 目标状态：仍 active，未完成
+
+目标要求「为 Go2Cpp 的**每个模块**完善 example」。当前已完成 13 个模块，
+而 `include/go2cpp/` 下约有 **27 个模块**。**剩余未覆盖的模块**：
+
+- **A 组（有 demo、待补全面版）**：`network/io_backend`、`network/io_hook`、
+  `network/websocket`、`network/sse`、`concurrency/runtime`（`runtime_demo` 115 行
+  已可作简单版）、`concurrency/dynamic_gmp`
+- **B 组（完全无示例）**：`network/socket`、**`network/http`**、**`config`**、
+  `core/hybrid_mutex`（`HybridGate`，**用户已判定不保留，暂不写**）
+- **C 组（依赖在途文件，等用户定稿）**：`logging/log`（`log.hpp`）、
+  `tools/error`（`error.hpp`）
+
+**按时序推算，12 轮目标轮次用完，但目标远未达成** —— 目标保持 active，
+后续可继续推进剩余模块。
+
 ## 2026-10-13：example 完善 · 第 11 轮（B 组 · thread_policy 模块）
 
 ### 本轮完成：`concurrency/thread_policy`（此前**完全没有示例**）
