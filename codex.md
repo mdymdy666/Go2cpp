@@ -13,6 +13,77 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：方向决策分析 · 第 6 轮（交付自检 —— 发现 3 处问题并修正）
+
+### 自检方法：不读一遍就下结论，而是把文档引用的每个"现成能力"逐条 grep 验证
+
+| 前提 | 文档原写法 | grep 实测 | 判定 |
+|---|---|---|---|
+| 虚拟时钟接口 | `Context::SetNowFunction` | **实为 `SetNowFunctionForTesting`**（`context.hpp:224`），配套 `ResetNowFunctionForTesting`（`:226`）、`Now()`（`:228`）、`using NowFunction`（`:134`） | ❌ **名字写错** |
+| `HybridGate` 引用数 | "3 个生产文件、12 个加锁点" | **共 29 处**（含定义、别名、注释、测试、示例） | ⚠️ **M0 标准不完整** |
+| 第 1~2 轮实现的增强 API | 假定仍在 | **全部仍在**：`RecordUndoWithCause`(`:330`)、`record_undo_with_cause`(`:332`)、`pending_undo_count`(`:367`)、`rollback_cause`(`:379`)、`StatusName`(`:381`)、`status_name`(`:382`) | ✅ **用户的重排保留了它们** |
+| `ContextRollback` / `Framer` / `sync::Mutex` | 引用 | 均存在（`context.hpp:261` / `framing.hpp:22` / `sync.hpp:78`） | ✅ |
+
+### 修正一：`SetNowFunction` → `SetNowFunctionForTesting`
+
+文档写的 API 名**不存在**。实际接口带 `ForTesting` 后缀 —— 这恰好说明它是为测试场景设计的，
+与 C-L2 的用途一致。**照原文去写会编译失败**，这正是自检的价值。
+
+### 修正二：M0 的"grep 归零"标准不完整
+
+原标准只要求 `src/` 与 `include/` 归零。但**实测 29 处引用分布**在：定义
+（`core/hybrid_mutex.hpp`）、4 行转发头、3 个生产文件的 4 处成员 + 12 个加锁点、
+`tests/concurrency/test_hybrid_gate.cpp`、`example/concurrency/hybrid_mutex_demo.cpp`。
+**→ 删掉定义后测试与示例会编译失败。** 标准已补全：连同测试/示例文件、CMake 登记、
+`example/README.md` 相关行一并移除。
+
+### ★★★ 修正三（架构级，本轮最有价值的发现）：替换 `HybridGate` 有一个不能踩的坑
+
+第 4 轮清单里我写的是"3 个生产文件 12 个加锁点统一改用 `sync::Mutex`"。
+**自检发现这在 `parking_condition.cpp` 上行不通**：
+
+```
+core::ParkingCondition   ←  sync::Mutex 的等待后端就是它
+        ↑
+        └── parking_condition.cpp 现用 HybridMutex 保护 WaitNode::m_wake_mutex
+            若改成 sync::Mutex  →  core → sync → core  循环依赖
+```
+
+**三个使用点的结论因此不同**：
+
+| 文件 | 层次 | 能否直接换 `sync::Mutex` |
+|---|---|---|
+| `src/network/io.cpp` | network | ✅ 可以 |
+| `src/concurrency/sync.cpp` | sync（同类内部） | ✅ 可以 |
+| **`src/concurrency/parking_condition.cpp`** | **core** | **❌ 不可以 —— 循环依赖** |
+
+**→ `core` 层需要一个自己的、无自旋的 gate 实现**（原子状态 + 条件变量；
+或最低限度去掉慢路径 `hybrid_mutex.hpp:75-81` 的 `for(;;)` 无界自旋）。
+
+**附带澄清一个此前的误解**：`HybridGate` 内部那个 `std::mutex m_slow` **本身是安全的** ——
+它的加解锁全在同一次 `lock()` 调用内完成（拿不到 `m_fast` 就 `m_slow.unlock()` 返回），
+**不涉及跨 M 解锁**。跨线程解锁问题针对的是**被 `HybridGate` 保护的业务临界区**，
+不是 `m_slow` 自己。**所以真正要修的只是慢路径的无界自旋循环。**
+
+### 目标完成度复核
+
+| 要素 | 状态 | 证据 |
+|---|---|---|
+| ① 分析项目 | ✅ | 本会话通读 `src/` 22,004 行 + `include/` 9,653 行 |
+| ② 对比 GitHub 同类项目 | ✅ | 第 1 轮，10 个项目实测 star / 最后推送 |
+| ③ 就业市场认可度 | ✅ | 第 2 轮，含薪资区间与"协程"的岗位定位 |
+| ④ 方向 + 可落地路线 | ✅ | 第 3~5 轮；`docs/direction_plan.md`（211 行）已提交（`c51f64a`） |
+| ⑤ 交付自检 | ✅ | 本轮，发现 3 处问题并全部修正 |
+
+**五要素全部达成。**
+
+### 状态
+
+- 本轮**只编辑 `docs/direction_plan.md` 与写记录，未改动任何源码**。
+- 在途 5 个文件全程未触碰；台账待办 24 条不变。
+- **定时任务 `schedule-6010b30e`（每 30 分钟）保持启用** —— 用户要求的是"多轮定时对话"，
+  即使本目标结项，定时推进仍按定时任务自带的 prompt 继续。
+
 ## 2026-10-13：方向决策分析 · 第 5 轮（产出可落地路线文档 —— 目标核心交付物）
 
 ### 本轮产出
