@@ -13,6 +13,92 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 9 轮（A 组 · address + bytearray 两个模块）
+
+### 本轮完成
+
+| 文件 | 说明 |
+|---|---|
+| `example/network/address_full.cpp` | **新建 · 全面版 6 个场景** |
+| `example/network/bytearray_full.cpp` | **新建 · 全面版 6 个场景** |
+| `example/network/address_bytearray_demo.cpp` | **沿用既有** —— 72 行、5 个场景，作简单版 |
+
+### address 全面版的 6 个场景（全部实跑通过）
+
+1. **IPv4 解析与端口** —— `192.168.1.10:8443`，`family()==AF_INET`
+2. **子网计算 /24** —— `mask=255.255.255.0 network=192.168.1.0 broadcast=192.168.1.255`
+3. **掩码长度两端 /0 与 /32** —— `/0 mask=0.0.0.0 net=0.0.0.0`、
+   `/32 mask=255.255.255.255 net=10.20.30.40`
+4. **Unix 域地址** —— `family=AF_UNIX 长度=27`
+5. **`Address::Create` 工厂** —— 从 `sockaddr` 复制出正确子类（`family=1 / 2`）
+6. **非法输入** —— `Create("not-an-ip")` 返回空指针；掩码超范围（64）返回空
+
+### bytearray 全面版的 6 个场景（全部实跑通过）
+
+1. **大端定长整数往返** —— `16/32/64` 位原值往返
+2. **★ 字节序确实生效** —— **`大端 hex=11223344 小端 hex=44332211`**
+3. **长度前缀字符串** —— `"hello" / ""（空串）/ "中文也支持"` 都能往返
+4. **变长整数** —— `1 占 1 字节，300 占 2 字节`（编码长度随值变化）
+5. **顺序读写与定位** —— 三个字段顺序读回，`set_position(0)` 可回退重读
+6. **越界读取显式抛异常** —— 实测异常文本 `ByteArray read beyond end`；
+   空缓冲读整数、声明长度超出实际数据两条路径都抛
+
+### ★ 本轮我犯了一个明确的错误（第 5 类坑）
+
+首版编译失败 4 处：**我臆造了 `ByteArray::data()`**（实际 `m_data` 是私有成员）。
+
+```
+error: 'class go2cpp::net::ByteArray' has no member named 'data';
+       did you mean 'std::vector<unsigned char> ByteArray::m_data'?
+```
+
+**这违反了"绝不臆造接口"这条自定规范** —— 我看到既有 demo 里用了
+`write_fuint16`/`read_fuint16` 就推测有 `data()`，而没有去读头文件。
+
+**修复方式**：读 `include/go2cpp/network/byte_array.hpp` 的公开接口，发现真实可用的是：
+- **`to_hex_string()`** —— 用来观察实际字节序（比 `data()` 更适合示例）
+- **`size()`** —— 用来断言编码长度
+
+**这次错误带来一个额外收获**：用 `to_hex_string()` 反而把"字节序是否真的生效"
+验证得更直观 —— **`11223344` vs `44332211` 一眼就能看出**，
+比读原始字节数组更有说服力。
+
+**教训（第 5 类坑）**：
+- 第 1/4 轮：编译失败（作用域 / 类型系统）
+- 第 6 轮：编译通过但行为静默错误（`Timer` 句柄）
+- 第 8 轮：编译通过、运行正常，但断言基于错误假设（`worker_count` / `PId` 从 0 起）
+- **第 9 轮：从"同类 API 的存在"外推到"这个类也有同名方法"** ——
+  **`ByteArray` 与 `std::vector` 无关，不该假设它有 `data()`**
+
+**→ 修正后的施工规范：写示例前必须读目标类的真实头文件，不得从既有 demo
+的用片段反推未出现的成员。**
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_address_full` → **EXIT=0**，6 场景全部符合预期
+- `go2cpp_bytearray_full` → **EXIT=0**，6 场景全部符合预期
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途 5 个文件全程未触碰
+
+### 进度（9 轮完成 10 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 |
+| `concurrency/future` | ✅ 沿用 82 行 | ✅ 186 行 / 6 场景 |
+| `tools/control_flow` | ✅ 沿用 94 行 | ✅ 185 行 / 6 场景 |
+| `concurrency/timer` | ✅ 沿用 178 行 | ✅ 171 行 / 6 场景 |
+| `core/parking_condition` | ✅ 新建 67 行 | ✅ 210 行 / 6 场景 |
+| `concurrency/scheduler` | ✅ 新建 57 行 | ✅ 188 行 / 6 场景 |
+| `network/address` | ✅ 沿用 72 行 | ✅ 新建 / 6 场景 |
+| `network/bytearray` | ✅ 沿用 72 行 | ✅ 新建 / 6 场景 |
+
+**下一轮建议**：`network/socket`（有 `network_demo` 可作简单版），
+或 B 组的 `concurrency/thread_policy` / `fiber_local`。
+
 ## 2026-10-13：example 完善 · 第 8 轮（A 组 · scheduler 模块）
 
 ### 本轮完成：`concurrency/scheduler`
