@@ -13,6 +13,135 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：混合锁方案调研（用户要求「去技术帖和 GitHub 找是否存在更好的方案」）
+
+### 用户提出的方案与实测结论
+
+用户建议把 `HybridGate` 慢路径改成「尝试锁 64 次，然后 `std::this_thread::yield()` 让出」，
+规则是「压测性能提升则保留，降低则回滚」。
+
+**先回答用户直接问的那个问题**：`std::this_thread::yield()` **不是挂起** ——
+Linux 上它就是 `sched_yield()`，语义是"把当前线程移到同优先级就绪队列末尾"，
+**线程始终是 `R`（runnable）状态，不是 `S`（sleeping）**；
+**没有同优先级竞争者时立即返回**。所以"64 次后 yield"的本质是
+**从"独占空转"改成"轮流空转"**，比 `_mm_pause` 好，但不是"让出等待重新调度"。
+**真正进入 `S` 状态的是 `futex(FUTEX_WAIT)`**（`condition_variable` 的底层）。
+
+### 压测数据（三轮，全在 WSL /tmp 独立编译，未动项目源码）
+
+G2 = 用户的方案（64 次 `_mm_pause` 后循环 `{CAS; yield()}`），相对现行 G1 的提升：
+
+| 线程 | 第 1 轮 | 第 2 轮 |
+|---:|---:|---:|
+| 1（无竞争） | +1.9% | +4.2% |
+| 2 | +85.8% | +15.7% |
+| 4 | −3.9% | +49.1% |
+| 8 | +73.6% | **−27.5%** |
+| 16 | +1.8% | +4.3% |
+| 32 | −1.2% | −2.5% |
+
+**波动 −27.5% ~ +85.8%，中位数约 +3%。且基线本身不稳**（G1 在 2 线程两轮分别是
+36.24 与 76.61 Mops/s）—— **测量噪声本身超过了待测差异**。
+**→ 不满足「性能提升则保留」的条件，不采用。**
+**→ 无需回滚：全程未修改项目任何源码，今天 13 个提交全部是 `docs:`。**
+
+### ★★★ 调研结论：业界最优解是 `parking_lot::WordLock`
+
+**来源**：`parking_lot_core/src/word_lock.rs`（作者 Amanieu d'Antras），
+见 [Firefox 源码树镜像](https://xref.palemoon.org/firefox-esr91/source/third_party/rust/parking_lot_core/src/word_lock.rs)。
+另参考 [folly::DistributedMutex](https://archive.softwareheritage.org/browse/content/sha1_git:6bca2794ec9efd7d6ac47c4dd22370e8e3b2384a/?branch=refs/tags/v2021.04.19.00&path=folly/synchronization/DistributedMutex.h&snapshot_id=a23c0ce8792bc8a7a894ace66eaed22daa7f8a9b)
+与 glibc 的 adaptive mutex 讨论。业界共识是**三段式**：
+**fast CAS → adaptive spin → futex sleep**，难点全在"如何以零额外开销判断是否有人等待"。
+
+**`WordLock` 的关键设计（逐条对应我们三次失败的实验）**：
+
+**① 一个字承载全部状态**
+
+```rust
+const LOCKED_BIT: usize = 1;
+const QUEUE_LOCKED_BIT: usize = 2;
+const QUEUE_MASK: usize = !3;
+pub struct WordLock { state: AtomicUsize }   // 锁位 + 队列锁位 + 队列头指针
+```
+
+**② 快路径 `unlock` 从 `fetch_sub` 的返回值里读等待者信息**
+
+```rust
+let state = self.state.fetch_sub(LOCKED_BIT, Release);
+if state.is_queue_locked() || state.queue_head().is_null() { return; }
+self.unlock_slow();
+```
+
+**★ 这是关键**：`fetch_sub` 返回旧值，**从旧值就能读出"有没有等待者排队"，
+不需要任何额外的原子读**。→ **无竞争时零额外操作。**
+
+**这正是我们 G4 失败的原因**：G4 在 `unlock()` 里额外加了一次 `m_waiters.load()`，
+在 **2 ns/lock（约 6 个周期）** 的临界区上，这次额外原子读就是 **−54%** 的代价。
+`WordLock` 把它融合进了那一次 `fetch_sub`。
+
+**③ 慢路径互斥用「一个位」而不是 `std::mutex`**
+
+`QUEUE_LOCKED_BIT = 2`，慢路径之间靠 CAS 抢这一位。
+→ 我们的 G4/G5 用了 `std::mutex m_slow` + `std::condition_variable m_cv`，**重量级原语**；
+`WordLock` 直接 `park()`/`unpark()`（futex），中间没有额外锁对象。
+
+**④ ★★★ `prepare_park()` 令牌 —— lost wakeup 的正解**
+
+```rust
+thread_data.parker.prepare_park();     // 先准备「停车令牌」
+... 挂到队列头 ...
+self.state.compare_exchange_weak(...); // 再发布到队列
+thread_data.parker.park();             // 最后才 park
+```
+
+**先声明"我准备好被叫醒了"，再发布，最后 park** —— 窗口被令牌封闭。
+→ **我们的 G5 正是因为缺这一步而挂死**：`fetch_or(kWaiter)` 之后、`cv.wait()` 之前，
+`notify_one()` 会从窗口里漏掉。
+
+**⑤ 只在"队列为空"时自旋**
+
+```rust
+if state.queue_head().is_null() && spinwait.spin() { ... }
+```
+
+**有等待者排队时自旋毫无意义**（锁不可能空出来给你），直接去排队。
+**这才是"自适应"的真正含义** —— 不是"固定次数后放弃"。
+
+### 对照表：我们三次实验的每个失败点，都能对上 `WordLock` 的一个设计
+
+| 设计点 | `parking_lot` | 我们的实现 | 后果 |
+|---|---|---|---|
+| 状态载体 | 1 个 `AtomicUsize`（锁位+队列锁位+队列头） | `atomic<uint8_t>`（2 位） | 少了队列指针，无法把队列塞进同一个字 |
+| 快路径 unlock | `fetch_sub` 返回值里读等待者 | 额外一次 `m_waiters.load()` | ❌ −54% |
+| 慢路径互斥 | bit 2 做队列锁（CAS） | `std::mutex` | ❌ 重量级 |
+| 等待原语 | 直接 futex park/unpark | `std::condition_variable` | ❌ 重量级 |
+| lost wakeup | `prepare_park()` 令牌 | 无 | ❌ G5 挂死 |
+| 自旋条件 | 仅队列为空时 | 固定 64 次 | 有队列时白烧 |
+
+### 对 Go2Cpp 的落地建议（修正第 8 轮的 P0 项）
+
+第 8 轮结论是"`core` 层需要一个自己的、无自旋的 gate"。
+**本轮调研给出了正确做法，且比原先设想更具体**：
+
+1. **不要用 `std::mutex` + `condition_variable`** —— 它们是本轮所有实验退化的根源；
+2. **用一个字的位域承载「锁 + 队列锁 + 队列头」**；
+3. **快路径 `unlock` 必须从 `fetch_sub`/`fetch_and` 的返回值里读等待者**，不能额外读一次；
+4. **必须实现 `prepare_park()` 等价的令牌机制**，否则一定会 lost wakeup（G5 已实证挂死）；
+5. **自旋只在队列为空时进行**。
+
+**★ 但有一个 Go2Cpp 特有的约束需要解决**：`WordLock` 直接调 futex 是 Linux 专属，
+而 Go2Cpp 的 `core::ParkingCondition` 还必须区分**受管 G（要 park 让出 M）**与
+**普通线程（走原生 CV）**。因此**不能照抄 `WordLock`**，需要把第 5 步的
+`park()`/`unpark()` 换成 `ParkingCondition` 的双模式等待 —— **这是本项工作的真正难点，
+也是它区别于"直接抄一个锁库"的地方**。
+
+### 状态
+
+- 本轮**只做调研与记录，未改动任何源码**；三轮压测的临时实验均在 `/tmp` 且已删除。
+- 在途 5 个文件全程未触碰；台账待办 24 条不变。
+- **建议**：把上述"落地建议"补进 `docs/direction_plan.md` 阶段 0 的 A-1，
+  替换原先"最低限度去掉自旋"的表述（第 8 轮已否定该表述）。
+
 ## 2026-10-13：方向分析 · 第 12 轮（设计 C-L1 的 trace 格式）
 
 ### 为什么这一轮必须做
