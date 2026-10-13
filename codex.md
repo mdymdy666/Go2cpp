@@ -13,6 +13,89 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 1 轮（建立规范 + 完成 channel 模块）
+
+### 用户任务（定时推进，19:14 → 22:00 每 30 分钟一次）
+
+> 「每 30 分钟完成一次 example 完善，分为两种：一种简单版，一种全面版，
+> 两种都要有简要注释。全面版要求每个模块多使用场景覆盖（至少三个场景）。」
+
+**已建立**：定时 `schedule-460525c6`（cron `*/30 19-21 * * *`，将在 19:30/20:00/20:30/21:00/21:30 触发）
+与目标 `goal-fba91d5e`（上限 12 轮）。
+
+### 规范（本轮确立，后续轮次沿用）
+
+```
+example/<module>/<topic>_demo.cpp   ← 简单版：50~80 行，最小可用，简要注释
+example/<module>/<topic>_full.cpp   ← 全面版：200~400 行，≥3 个场景，每场景一段带注释
+```
+
+**保持现有目录结构不动** —— 现有 21 个示例天然就是"简单版"，
+只在新增文件上用 `_full` 后缀区分全面版，不破坏任何既有构建。
+
+**输出风格**沿用现有约定：`std::clog << "[模块][场景N] ..."`，`main` 返回 0/1 表示成败。
+
+### 本轮完成：`concurrency/channel`
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `example/concurrency/channel_demo.cpp` | ~72 | 3 个最小片段：无缓冲交接 / 有缓冲 / Close 后 range 语义 |
+| `example/concurrency/channel_full.cpp` | ~150 | **6 个场景** |
+
+**全面版的 6 个场景**：
+1. 无缓冲 Channel 的同步交接（发送方阻塞到接收方取走）
+2. 有缓冲 + 生产者/消费者 + `Close` 收尾（10 项 / 合计 55）
+3. `select` 多路复用（两个 case 只有一个就绪，命中 index=1）
+4. `select` + `DefaultCase` 非阻塞探测
+5. `select` + 超时（`status = kTimedOut`）
+6. `Context` 取消传播到 `Recv`（`Cancelled()`，不再永久等待）
+
+### 过程中纠正的两处自己的错误（如实记录）
+
+首次编译失败，4 error + 1 warning，两处都是我的疏忽：
+
+1. **`100ms` / `0ms` / `30ms` 写在匿名 namespace 的函数里**，而
+   `using namespace std::chrono_literals;` 只在 `main()` 内 —— 字面量在那个作用域不可见。
+   → 修复：把 `using namespace std::chrono_literals;` 提到匿名 namespace 内。
+2. **`scenario_select_multiplex` 声明了 `Scheduler&` 参数但没用到** → `-Wunused-parameter`。
+   → 修复：去掉该参数并同步调用处。
+
+**教训**：`-Wall -Wextra -Wpedantic` 是零容忍的（项目基线 0 warning），
+写示例时不能依赖"大概能编过"，**必须真编**。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- 运行 `go2cpp_channel_demo` → **EXIT=0**，输出与注释中的"预期"逐条一致
+- 运行 `go2cpp_channel_full` → **EXIT=0**，6 个场景全部通过
+  （场景 5 实测 `selected=0 status=6`，场景 6 实测 `Cancelled=1 status=4`）
+- CMake：两个目标已登记进 `GO2CPP_EXAMPLES`（`concurrency/channel_demo`、`concurrency/channel_full`）
+- 在途 5 个文件全程未触碰
+
+### 后续轮次的任务清单（按优先级，供定时轮次取用）
+
+**A 组：已有 `_demo` 但缺 `_full` 全面版**
+- `concurrency/future`（现有 `future_demo`）
+- `concurrency/scheduler` / `runtime`（现有 `runtime_demo`、`dynamic_gmp_demo`）
+- `concurrency/sync`（现有 `fiber_sync_demo`）
+- `concurrency/context`（现有 `context_rollback_demo`）
+- `concurrency/timer`（现有 `timer_task_demo`）
+- `network/socket`（现有 `network_demo`）
+- `logging/log`（现有 `log_config_demo`）
+- `tools/control_flow`（现有 `control_flow_demo`）
+
+**B 组：完全没有示例，两版都要新建**
+- **`config`**（INI 配置，`include/go2cpp/config`）
+- **`network/http`**（`http::Server` / `http::Client` / `Parser`）
+- `core/parking_condition`
+- `concurrency/fiber_local`
+- `concurrency/thread_policy`
+- `network/address` + `bytearray`（现有 `address_bytearray_demo`，可只补全面版）
+
+**C 组：暂缓，等用户定稿**
+- `tools/error` —— 依赖的 `include/go2cpp/tools/error.hpp` **是当前 5 个在途文件之一**，
+  API 可能变化，**在其定稿前不写新示例**（现有 `errors_demo` 保持原样）
+
 ## 2026-10-13：补充分析 ——「跨线程解锁」是独立于「混合等待」的第二约束
 
 ### 用户提醒

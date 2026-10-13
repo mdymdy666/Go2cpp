@@ -83,6 +83,8 @@ if (GO2CPP_BUILD_EXAMPLES)
         concurrency/dynamic_gmp_demo
         concurrency/mixed_runtime_demo
         concurrency/beginner_demo
+        concurrency/channel_demo
+        concurrency/channel_full
         tools/control_flow_demo
         network/io_wait_many_demo
         network/network_demo
