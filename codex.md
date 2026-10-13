@@ -13,6 +13,70 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 8 轮（A 组 · scheduler 模块）
+
+### 本轮完成：`concurrency/scheduler`
+
+| 文件 | 说明 |
+|---|---|
+| `example/concurrency/scheduler_demo.cpp` | **新建 · 简单版 3 个片段** |
+| `example/concurrency/scheduler_full.cpp` | **新建 · 全面版 6 个场景** |
+
+**为什么两版都新建**：既有 `runtime_demo.cpp` 有 115 行，**超出简单版 50~80 行的规格**，
+且它演示的是"运行时综合用法"而非 Scheduler 本身。所以简单版也另写了一个聚焦的。
+
+### 全面版的 6 个场景（全部实跑通过）
+
+1. **启动与关闭** —— `is_running` 在 `start`/`shutdown` 前后翻转 `0 → 1 → 0`
+2. **`spawn` 与 `wait` / `wait_for`** —— 包含"任务未完成时 `wait_for` 超时返回 false"
+   与"放行后正常完成"两条路径
+3. **并行度观测** —— `P=4 M=1 空闲时可运行=0 结束后可运行=0 实际执行=8`
+4. **快照** —— `processors()` / `machines()` 返回运行时视图
+5. **指标** —— `metrics()` 累计 `task_runs=12 task_completions=12`
+6. **Fiber 内自省** —— `current_task()` 在 Fiber 内非空、在主线程内为空
+
+### ★★ 本轮挖到两条真实的 API 语义（我原先的断言写错了，不是框架问题）
+
+首版编译 0 warning，但 3 个场景断言不符：
+
+| 场景 | 实测 | 我的错误假设 | 正确认识 |
+|---|---|---|---|
+| 3 | `P=4 M=1` | 以为 `worker_count()` 等于 P 的数量 | **`worker_count()` 是"当前存活的工作线程（M）数"，且 M 按需惰性创建** —— 它既不等于 P 数，也不保证达到 P 的上限 |
+| 4 | `id 均非 0=0` | 以为 ID 从 1 开始 | **`PId` / `MId` 从 0 开始编号，`0` 是合法 ID 而不是"无效值"** |
+| 6 | `有当前 P=0` | 用 `!= 0` 判断当前 P | 同上；改用 `current_processor_id() < processor_count()` 判断 |
+
+**这两条都写进了示例注释**，因为它们正是使用者最容易踩的坑：
+- 想"看看开了几个 P"的人会去读 `worker_count()`，然后困惑为什么是 1；
+- 想"判断有没有当前 P"的人会写 `!= 0`，然后在 P0 上得到错误结论。
+
+**教训（第四类坑）**：前几轮的坑是"编译失败"或"行为静默错误"，
+本轮是**"编译通过、运行正常，但断言基于错误假设"** —— 这一类只有靠
+**真实运行并逐条核对预期值**才能发现，无法靠编译器或类型系统拦截。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_scheduler_demo` → **EXIT=0**（3 个片段）
+- `go2cpp_scheduler_full` → **EXIT=0**（6 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`
+- 在途 5 个文件全程未触碰
+
+### 进度（8 轮完成 8 个模块）
+
+| 模块 | 简单版 | 全面版 |
+|---|---|---|
+| `concurrency/channel` | ✅ 63 行 | ✅ 147 行 / 6 场景 |
+| `concurrency/context` | ✅ 62 行 | ✅ 165 行 / 6 场景 |
+| `concurrency/sync` | ✅ 77 行 | ✅ 206 行 / 6 场景 |
+| `concurrency/future` | ✅ 沿用 82 行 | ✅ 186 行 / 6 场景 |
+| `tools/control_flow` | ✅ 沿用 94 行 | ✅ 185 行 / 6 场景 |
+| `concurrency/timer` | ✅ 沿用 178 行 | ✅ 171 行 / 6 场景 |
+| `core/parking_condition` | ✅ 新建 67 行 | ✅ 210 行 / 6 场景 |
+| `concurrency/scheduler` | ✅ 新建 | ✅ 新建 / 6 场景 |
+
+**下一轮建议**：`network/socket`（有 `network_demo` 可作简单版），
+或 B 组的 `concurrency/thread_policy` / `fiber_local`。
+
 ## 2026-10-13：example 完善 · 第 7 轮（B 组 · core/parking_condition 模块）
 
 ### 本轮完成：`core/parking_condition`（此前**完全没有示例**）
