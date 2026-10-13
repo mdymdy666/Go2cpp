@@ -13,6 +13,109 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 20 轮（A 组 · network/websocket，4/4 收官）
+
+### ★ A 组完成
+
+| 模块 | 轮次 |
+|---|---|
+| `network/io_hook` | 第 17 轮 |
+| `network/io_backend` | 第 18 轮 |
+| `concurrency/runtime` | 第 19 轮 |
+| **`network/websocket`** | **本轮** |
+
+### 本轮完成：`network/websocket`
+
+| 文件 | 说明 |
+|---|---|
+| `example/network/websocket_full.cpp` | **新建 · 全面版 7 个场景** |
+| `example/network/websocket_demo.cpp` | **沿用既有** —— 58 行，在简单版区间内 |
+
+### ★ 关键突破：`Socket::FromFd` 让 websocket 不需要监听端口
+
+此前判断"websocket 需要真实 socket 环境"**保守了**。既有 demo 揭示了正解：
+
+```cpp
+::socketpair(AF_UNIX, SOCK_STREAM, 0, pair);
+auto server_socket = Socket::FromFd(pair[0], AF_UNIX, SOCK_STREAM);
+auto client_socket = Socket::FromFd(pair[1], AF_UNIX, SOCK_STREAM);
+```
+
+**于是完整握手 + 收发 + 关闭都能在 socketpair 上跑通，不监听任何端口。**
+
+### 全面版的 7 个场景（全部实跑通过）
+
+1. **握手校验（纯计算）** —— 合法请求接受、缺 Key / 版本错 / Upgrade 错均被拒
+2. **握手响应（纯计算）** —— `状态=101 Accept=s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`
+   （**RFC 6455 规定的固定 Accept 值，可精确断言**）
+3. **完整握手 + 文本收发** —— `发送=1 服务端读到="hello" 回显=1 客户端读到="echo: hello"`
+4. **二进制消息** —— 含 `\x00\x01\x02\xFF`，校验 opcode 非 Text 且内容一致
+5. **控制帧** —— `ping 发送=1 pong 发送=1 连接仍开启=1 控制帧后数据仍可收发=1`
+6. **关闭语义** —— `关闭前 closed()=0 close() 成功=1 关闭后 closed()=1 对端读到 Close 帧=1`
+7. **角色与底层套接字** —— `客户端角色=Client 服务端角色=Server 都有底层 Socket=1`
+
+### ★★ 第 8 类坑：库 API 缺少超时上界导致静默挂起
+
+首版现象**极其迷惑**：`std::cout` 输出**全部消失**，只剩 `std::clog` 的 5 行标题，
+而 `EXIT=0`。
+
+**两步定位**：
+
+1. **`stdbuf -o0` 强制无缓冲重跑** —— 立刻看到场景 1–4 **全部通过**；
+   `stdout` 丢失纯属**缓冲未刷新**（进程没走正常退出路径），真正停住的是**场景 5**
+2. **根因**：`WebSocket::read_message()` **没有超时参数**，对端不回帧就**无限阻塞**
+
+**修复**：给 `WebSocketConfig::io_timeout` 设上界，**让所有读写都有界**。
+
+**三条可复用的教训**：
+- **"EXIT=0 但输出缺失"不等于成功**
+- **`stdbuf -o0` 是排查此类问题的第一手段**（区分"缓冲丢失"与"真的没执行"）
+- **凡是"读"接口，先确认它有没有上界**
+
+### ★★ 第 9 类坑：把实现细节当成了契约
+
+场景 5 先后写了两版错误断言：
+
+| 版本 | 断言 | 实测 |
+|---|---|---|
+| v1 | `read_message` 会把收到的 **Ping** 交给调用者 | **服务端读到 Ping=0** |
+| v2 | 对端显式 `pong` 后客户端能读到 **Pong** | **客户端读到 Pong=0** |
+
+**两次合起来得出正确结论**：
+
+> **`read_message` 不向调用者交付控制帧**（由库内部处理），它只交付数据帧。
+
+**最终写法**：**不断言控制帧能被读到**，改为验证一个我能确证、也更有价值的性质 ——
+**发出控制帧之后，普通数据帧的收发不受影响**。
+
+**这一条的普遍意义**：**断言必须建立在"已被验证的契约"上，而不是"实现看起来应该这样"。**
+两次失败都是因为我把"合理猜测"直接写成了断言。
+
+**另外，守卫两次都正确阻止了提交**（脚本里写死 `if 未通过 then 不提交`），
+所以这两个错误假设**都没有进入提交历史**。
+
+### 修正的两处签名误用（编译期拦截）
+
+1. **`ValidateUpgradeRequest(request, std::string& key, std::string* reason)`** ——
+   第二个参数是**输出参数**，必须传 `std::string` 左值
+2. **`WebSocketRole` 没有导出到 `go2cpp`** —— 必须写 `go2cpp::net::WebSocketRole`
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**
+- `go2cpp_websocket_full` → **CODE=0**（7 场景全部符合预期）
+- 已登记进 `GO2CPP_EXAMPLES`；**7 个在途文件全程未触碰**
+
+### 总进度：20 轮完成 22 个模块（A 组全部完成）
+
+`concurrency`(10) / `core`(1) / `network`(8) / `tools`(1) / `config`(1)
+
+### 剩余
+
+- **C 组（依赖在途文件，等用户定稿）**：`logging/log`、`tools/error`
+- **已判定不做**：`core/hybrid_mutex`（用户明确"绝对不允许 HybridGate"）
+- **未覆盖**：`config` 的 `RuntimeConfig`（pending/watcher 路径）
+
 ## 2026-10-13：example 完善 · 第 19 轮（A 组 · concurrency/runtime，3/4）
 
 ### 本轮完成：`concurrency/runtime`

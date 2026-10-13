@@ -101,6 +101,7 @@ if (GO2CPP_BUILD_EXAMPLES)
         network/io_wait_many_demo
         network/network_demo
         network/websocket_demo
+        network/websocket_full
         network/sse_demo
         network/sse_basic_demo
         network/sse_full
