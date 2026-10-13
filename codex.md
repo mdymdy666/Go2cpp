@@ -13,6 +13,75 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-13：example 完善 · 第 24 轮（config · Lookup + 文件热重载主线）
+
+### 用户要求
+
+> 「先完成示例」—— 即补上 `Config::Lookup` + `StartWatcher` 这条
+> 「**程序内置默认值 → 配置文件存在则覆盖**」主线的示例
+> （此前 `config_full` 覆盖 `IniFile`/`ConfigVar`/`ValueCodec`，
+> `runtime_config_full` 覆盖 `RuntimeConfig`，但这条主线没有专门示例）。
+
+### 本轮完成
+
+| 文件 | 说明 |
+|---|---|
+| `example/config/config_center_demo.cpp` | **新建 · 简单版 3 个片段** |
+| `example/config/config_center_full.cpp` | **新建 · 全面版 7 个场景（含真实文件热重载）** |
+
+### 全面版的 7 个场景（全部实跑通过，CODE=0）
+
+1. **`Lookup` 注册内置默认值** —— `threads=4 name=default-service enabled=0`
+2. **★ `Lookup` 幂等** —— 同名再次调用（默认值 999）返回**同一实例**、
+   值保持 16、**描述沿用首次注册**
+3. **`LookupBase` + `List`** —— 按名查询命中/未命中；`List` 列出全部（总数 3）
+4. **★ INI 覆盖默认值** —— `加载前=16/default-service 加载后=32/from-ini`
+5. **★ 提交监听** —— `AddCommitListener` 收到本次变更的两个变量；
+   `DelCommitListener` 之后不再通知
+6. **★ 事务校验** —— `AddTransactionValidator` 拒绝 `threads=99` 整批，
+   **旧值保持 10 不变**、错误文本可取回；合法批次 `threads=12` 通过并应用
+7. **★★ 真实文件热重载** —— 写临时文件 → `StartWatcher(path, 50ms)` →
+   `Watching()=1` → **首次加载 64** → **改文件后自动重载为 128** →
+   `StopWatcher()` → `!Watching()` 成立
+
+### 场景 7 是这一轮的核心
+
+它验证的是**真实的异步热重载**，而不是用 `LoadFromIni` 手工模拟：
+
+```cpp
+config.StartWatcher("/tmp/go2cpp-config-center-demo.ini", Ms(50), &error);
+// 轮询等热重载把文件里的 64 应用进来
+// 改写文件为 128，再等它自动重载
+config.StopWatcher();
+```
+
+**两次加载都成功**（64 → 128），说明 watcher 线程、
+`FileStamp` 稳定快照与事务性提交这条链路是通的。
+
+### 三件事的最终确认
+
+| 用户要求 | 结论 | 证据 |
+|---|---|---|
+| 基本固定参数搭配 | **已具备** | `Lookup<T>(name, default, desc)`，签名与 sylar 一致（场景 1、2） |
+| 动态文件热重载 | **已具备** | `StartWatcher`/`Watching`/`StopWatcher`（场景 7，实测两次重载） |
+| 默认加载、文件有则优先 | **已具备** | `Lookup` 先注册默认值 → `LoadFromIni`/热重载覆盖（场景 4、7） |
+
+**加上前一轮修掉的 `ReadSize` 缺陷**（`[timer]` 段无法读取），
+`config` 模块现在是**完整可用**的：
+`IniFile` / `ConfigVar` / `ValueCodec` / `Config` 中心（Lookup + 热重载 + 事务）
+/ `RuntimeConfig` 全部有覆盖。
+
+### 验证结果
+
+- 构建：**0 warning / 0 error**；两个示例均 **CODE=0**
+- 已登记进 `GO2CPP_EXAMPLES`
+- 6 个在途文件（用户在查看）全程未触碰
+
+### 进度：24 轮完成 27 个模块 / 约 235 个场景
+
+`config` 现在有 **4 个示例**（`config_demo` / `config_full` / `runtime_config_*` /
+`config_center_*`），是该模块覆盖最完整的一块。
+
 ## 2026-10-13：修复 —— config 模块 `ReadSize` 对非 scheduler 段的静默失败
 
 ### 用户要求
