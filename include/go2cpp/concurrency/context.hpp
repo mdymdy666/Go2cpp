@@ -78,6 +78,12 @@ namespace go2cpp
 
     private:
         struct State;
+
+        // 通知的内部状态，多份 DoneSignal 句柄共享同一份。
+        // - 保护：State::mutex（见 .cpp）；本句柄自身无锁。
+        // - 不变式：复制 DoneSignal 会共享此指针（因此副本是"同一个信号"），
+        //   这正是 Context 能用一份镜像成员表达同一信号的前提。
+        // - 可空？构造时必然分配（见 DoneSignal() 实现），运行期不为空。
         std::shared_ptr<State> m_state;
 
         CallbackId AddCallbackImpl(std::function<void()> callback,
@@ -87,11 +93,11 @@ namespace go2cpp
         friend struct detail::DoneSignalAccess;
     };
 
-/**
- * Context 的类型化身份键。复制键保持同一身份，不同键不会碰撞。
- * 依赖：shared_ptr 锚点维持键身份；Context 通过 Identity 查找值。
- * 对上层提供类型安全的 Value 查询，Name 仅用于调试元数据。
- */
+    /**
+     * Context 的类型化身份键。复制键保持同一身份，不同键不会碰撞。
+     * 依赖：shared_ptr 锚点维持键身份；Context 通过 Identity 查找值。
+     * 对上层提供类型安全的 Value 查询，Name 仅用于调试元数据。
+     */
     template <typename T>
     class ContextKey
     {
@@ -113,7 +119,17 @@ namespace go2cpp
         }
 
     private:
+        // 键的身份载体。**身份取的是这个堆对象的地址**（Identity() 返回
+        // m_token.get()），而不是它保存的数值——数值只是用 this 填充的占位。
+        // - 保护：无锁。构造后 m_token 不再改变（const），拷贝共享同一对象。
+        // - 不变式：只要本键存活，该堆地址就被占用，因此不会被分配器复用给
+        //   别的键；不同 ContextKey 实例必然拿到不同地址，故身份永不碰撞。
+        //   Context 侧另存一份锚点（typed_key_anchors）把这一保证延伸到
+        //   "值仍然存在"的整个期间。
         std::shared_ptr<const std::uint64_t> m_token;
+
+        // 仅用于诊断与日志的键名。**不参与身份匹配**——类型化查询只比较
+        // m_token.get()，否则父链中同名的无关键会互相命中。
         std::string m_name;
     };
 
@@ -241,7 +257,21 @@ namespace go2cpp
             std::function<void()> callback);
         void RemoveBeforeDoneCallback(DoneSignal::CallbackId id) const noexcept;
 
+        // 取消树的节点状态，由本句柄与所有派生句柄共享。
+        // - 保护：State 自带 mutex（见 .cpp 中 State 定义），本指针本身只读。
+        // - 不变式：构造后再不改指；Context 的私有构造函数是唯一入口，
+        //   外部只能经 Background/TODO/WithCancel 等工厂拿到实例。
+        // - 生命周期：与 State 同步；CancelFunc 另持有 State 的 weak_ptr，
+        //   所以句柄全部销毁后取消能力是否仍在取决于 State 是否还有owner。
         std::shared_ptr<State> m_state;
+
+        // **镜像成员**：值是 m_state->done 的拷贝。DoneSignal 复制时共享内部
+        // State，所以它与 m_state->done 实际是同一个信号，不会出现两份状态。
+        // - 存在理由：State 是 .cpp 内的不完整类型，头文件无法写出
+        //   "const DoneSignal&" 的返回；这里放一份完整类型成员，让 Done()
+        //   能在头文件内联返回引用。
+        // - 不变式：必须与 m_state 同步构造（见 Context 构造函数初始化列表），
+        //   且此后再不重新赋值。
         DoneSignal m_done;
 
         friend ContextPtr Background();
@@ -392,9 +422,31 @@ namespace go2cpp
         DoneSignal rollback_done() const { return RollbackDone(); }
 
     private:
+        // 补偿事务的内部状态（savepoint 栈、undo 队列、失败聚合），
+        // 由 Savepoint 与本对象共享。
+        // - 保护：State 自带 mutex（见 .cpp）。
+        // - 不变式：构造后再不改指；Savepoint 持有它的 weak_ptr，因此
+        //   ContextRollback 销毁后旧 savepoint 会自动失效（valid() 为假），
+        //   不会访问已释放的状态。
         std::shared_ptr<State> m_state;
+
+        // 本事务绑定的子 Context（由工厂创建的临时子节点）。
+        // - 保护：只读，构造后不再改变。
+        // - 不变式：用于对外暴露 context() 以及从 context()->Err() 取回
+        //   自动回滚时的原因（此时 UndoActionWithCause 收到的是 nullptr）。
         ContextPtr m_context;
+
+        // 保护下面两个回调 ID 的注销动作。
+        // - 为何需要独立一把锁：DisarmCallback() 可能在析构路径上被调用，
+        //   而它要修改本对象；若复用 State 的锁，会与"回调在锁外执行"
+        //   的约定冲突（回调里可能再次触发 DisarmCallback）。
+        // - mutable 的原因：DisarmCallback() 语义上不改变事务状态，
+        //   仅解除登记，故可在 const 语境下调用。
         mutable std::mutex m_callback_mutex;
+
+        // 注册在父/自身 DoneSignal 上的取消回调 ID；0 表示"未登记"，
+        // 与 DoneSignal 用 0 作为无效 ID 的约定一致。DisarmCallback()
+        // 会把它清零，因此"是否为 0"就是"回调是否仍然armed"的判定依据。
         DoneSignal::CallbackId m_callback_id{0};
         DoneSignal::CallbackId m_before_callback_id{0};
 
@@ -403,24 +455,24 @@ namespace go2cpp
 
     using RollbackScope = ContextRollback;
 
-ContextRollback WithRollback(const ContextPtr &parent,
-                             bool rollback_on_cancel = true);
+    ContextRollback WithRollback(const ContextPtr &parent,
+                                 bool rollback_on_cancel = true);
 
-/** @brief 创建 Background 根 Context。 */
-ContextPtr Background();
-/** @brief 创建 TODO 根 Context。 */
-ContextPtr TODO();
-/** @brief 创建可取消子 Context。 */
-std::pair<ContextPtr, CancelFunc> WithCancel(const ContextPtr &parent);
-/** @brief 创建可记录 Cause 的可取消子 Context。 */
-std::pair<ContextPtr, CancelCauseFunc> WithCancelCause(
-    const ContextPtr &parent);
-/** @brief 创建带截止时间的子 Context。 */
-std::pair<ContextPtr, CancelFunc> WithDeadline(const ContextPtr &parent,
-                                               ContextTimePoint deadline);
-/** @brief 创建带超时的子 Context。 */
-std::pair<ContextPtr, CancelFunc> WithTimeout(const ContextPtr &parent,
-                                              ContextDuration timeout);
+    /** @brief 创建 Background 根 Context。 */
+    ContextPtr Background();
+    /** @brief 创建 TODO 根 Context。 */
+    ContextPtr TODO();
+    /** @brief 创建可取消子 Context。 */
+    std::pair<ContextPtr, CancelFunc> WithCancel(const ContextPtr &parent);
+    /** @brief 创建可记录 Cause 的可取消子 Context。 */
+    std::pair<ContextPtr, CancelCauseFunc> WithCancelCause(
+        const ContextPtr &parent);
+    /** @brief 创建带截止时间的子 Context。 */
+    std::pair<ContextPtr, CancelFunc> WithDeadline(const ContextPtr &parent,
+                                                   ContextTimePoint deadline);
+    /** @brief 创建带超时的子 Context。 */
+    std::pair<ContextPtr, CancelFunc> WithTimeout(const ContextPtr &parent,
+                                                  ContextDuration timeout);
 
     template <typename T>
     ContextPtr WithValue(const ContextPtr &parent, const ContextKey<T> &key, T value)
