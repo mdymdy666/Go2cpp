@@ -64,6 +64,8 @@ cmake --build build --target go2cpp_runtime_demo
 | `strings_full` | 六场景：切分/CSV/URL/头名比较/Builder+UTF-8/10 万字段往返 | 10 万字段 Join↔Split 往返（打印耗时） | Cut 族未命中分支、rune 计数与 `Count(s,"")` 边界 |
 | `strconv_demo` | 配置解析、指标格式化、base=0 进制推断 | — | `ErrSyntax` 身份判定、非法布尔与数字 |
 | `strconv_full` | 六场景：错误分类/格式化/JSON 往返/十六进制 ID/权限位/边界规模 | 10 万次 Itoa↔Atoi 往返（打印耗时） | `ErrRange` 钳制值、下划线规则、`Inf`/`NaN`/hex float |
+| `fmt_demo` | 日志行构造、SQL 拼接与 `%q` 转义、错误包装链 | — | 零填充位于符号之后、`%q` 对引号与换行的转义、`%w` 身份判定 |
+| `fmt_full` | 六场景：日志/取数/错误链/表格对齐/指标/结构化+10 万次 | 10 万次格式化（打印耗时） | `%v` 浮点最短表示、`%!d(string=abc)` 标记、容器与 pair 递归、`% X` 逐字节 hex |
 
 一次构建后可以批量运行全部示例（每个命令都有 20 秒看门狗）：
 

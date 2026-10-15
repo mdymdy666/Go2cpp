@@ -21,6 +21,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_errors_ns.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_strings.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_strconv.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_fmt.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_event_go.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_hybrid_gate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_parking_condition.cpp
@@ -144,7 +145,9 @@ if (GO2CPP_BUILD_EXAMPLES)
         tools/strings_demo
         tools/strings_full
         tools/strconv_demo
-        tools/strconv_full)
+        tools/strconv_full
+        tools/fmt_demo
+        tools/fmt_full)
     if (TARGET go2cpp_hook)
         list(APPEND GO2CPP_EXAMPLES network/io_hook_demo)
         list(APPEND GO2CPP_EXAMPLES network/io_hook_full)

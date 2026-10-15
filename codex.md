@@ -13,6 +13,79 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-15：新增 `tools/fmt`（Go 标准库对齐第二批，第 27 轮）
+
+### 交付清单
+
+| 文件 | 行数 | 说明 |
+|---|---:|---|
+| `include/go2cpp/tools/fmt.hpp` | **~612** | 格式串解析 + 类型分派（可变参数模板 + `if constexpr`）+ 全部公开 API |
+| `include/go2cpp/fmt.hpp` | 5 | 根路径转发头 |
+| `tests/tools/test_fmt.cpp` | 214 | 6 个真实场景 + 10 万次×2 大数据量 + 3 组随机属性测试 |
+| `example/tools/fmt_demo.cpp` | 75 | 简单版 3 场景 |
+| `example/tools/fmt_full.cpp` | 140 | 全面版 6 场景 |
+| `tests/test_main.cpp` | — | 登记：声明 + `selected("fmt")` |
+| `cmake/Go2CppTests.cmake` | — | 登记：测试源 + `GO2CPP_EXAMPLES`（CRLF） |
+| `example/README.md` | — | 登记：速查表 2 行 |
+
+### 复用优先的检索结论
+
+| 候选 | 许可证 | 结论 |
+|---|---|---|
+| [fmtlib/fmt](https://github.com/fmtlib/fmt) | MIT | **不采用为直接依赖**：语法是 `{}`，与 Go 的 `%v` 指令集不同；要用它必须先写「Go 格式串 → fmt 格式串」转换层，而转换层本身就要实现本文件的解析器（双份复杂度）。**保留为底层候选**（将来可在 `detail` 层替换实现） |
+| libc `printf` 家族 | — | **不采用**：类型不安全；Go 的 width/precision 以 **rune** 计、C 的以字节计；无 `%v` |
+| **自研** | — | **采用**：Go 语义 1:1，且复用本研究已有的 `strconv.hpp`（整数/浮点格式化、`Quote`）与 `error.hpp`（`ErrorPtr`/`Wrap`/`Join`） |
+
+语义对照来源：`third_party/go1.23.0.src.tar.gz` 的 `go/src/fmt/doc.go`（Go 1.23.0，BSD-3-Clause），**独立实现**。
+
+### 能力与对齐的 Go 语义
+
+- **动词**：`v` `d` `s` `q` `t` `f` `e` `g` `x` `X` `b` `o` `c` `T`（`Errorf` 另支持 `w`）
+- **flags**：`-`（左对齐）、`0`（零填充，**数字时在符号之后**）、`+`、空格、`#`（`0b`/`0`/`0x` 前缀、浮点保留小数点）
+- **width/precision 按 rune 计算**（与 Go 一致，不是字节）；字符串 precision 按 rune 截断（`%.2s` 对 `"中文测试"` 得 `"中文"`）
+- **`%v` 对浮点用最短唯一表示**（`0.1+0.2` → `0.30000000000000004`，`1e6` → `1e+06`）
+- **`ErrorPtr` 按 `Message()` 输出**（对齐 Go 的 error 接口优先规则）；`std::vector<T>` 与 `std::pair` 递归 `%v`
+- **错误标记**：`%!d(string=abc)`（类型不匹配）、`%!d(MISSING)`（缺参数）、`%!(EXTRA int=2)`（多余参数）
+- **边界**（文件头已列）：不实现 `Formatter`/`GoStringer` 分派（C++ 无反射）、`%U`、复数、`%p` 的 `#` 细节；`*` 宽度/精度**抛 `std::logic_error` 明确拒绝**
+
+### 验证（实测）
+
+```sh
+# 头文件级验证
+g++ -std=c++17 -Wall -Wextra -Wpedantic -I include /tmp/fmt_check.cpp src/tools/error.cpp -o /tmp/fmt_check
+# → 编译诊断 0 行；fmt.hpp check: failures=0
+
+# 项目内正式测试（已登记）
+GO2CPP_TEST_FILTER=fmt ./build-quality/go2cpp_tests      # → all checks passed
+
+# 示例
+./build-quality/go2cpp_fmt_demo    # rc=0，输出逐条与注释「预期」一致
+./build-quality/go2cpp_fmt_full    # rc=0，6 场景全部通过
+```
+
+测试覆盖：6 个真实场景（日志行、SQL 拼接与转义、错误包装链、表格对齐、指标与百分号、结构化展示）、
+10 万次日志构造、10 万次错误构造（并断言 `use_count` 回到基线，确认无泄漏）、
+3 组随机属性测试（随机值×6 模板不得出现未预期标记、随机 int64 的 `%d`→`Atoi` 往返、随机 double 的 `%v`→`ParseFloat` **位相等**往返）。
+
+### 本轮修掉的问题
+
+| # | 问题 | 处置 |
+|---:|---|---|
+| 1 | `((expr, 0), ...)` 触发 `-Wunused-value` ×3 | 直接用逗号折叠 |
+| 2 | `TypeName` 用 `sizeof` 推断 → `int` 报成 `int32`（Go 输出 `int`）；`char[2]` 衰变为 `char*` 落不到分支 | 改为按 **C++ 类型名**映射；字符串类判定用 `is_convertible_v<..., string_view>` |
+| 3 | vector 分支**漏了 `%q`**（Go 对 `[]string` 的 `%q` 逐个引用） | 递归传递 verb |
+| 4 | 三目写进逗号折叠 → **编译错误** `binary expression in operand of fold-expression` | 移入 `emit` lambda |
+| 5 | 零参数 `Sprint()`/`Sprintln()` 触发模板诊断 | `if constexpr (sizeof...(Args) > 0)` 保护 |
+| 6 | **流程教训**：一次「修正后输出未变」的真因是**编译失败**，而命令写成 `g++ ... \| grep -c warning ; ./check`（`;` 分隔）→ 掩盖错误并运行了**旧二进制** | 全部验证命令改为 `&&` 串联；已记入 `NextStep/dev-progress.md` |
+
+> 第 6 条是通用教训：**"看到输出"不等于"跑的是新代码"**。宁可在命令里多写一个 `&&`。
+
+### 未覆盖 / 后续
+
+- `*` 形式的 width/precision（Go 允许从操作数取）暂未实现，明确抛异常而非静默给错结果。
+- 未实现 Go 的 `Formatter`/`GoStringer` 接口分派（需要反射/虚接口约定，C++ 侧留给后续设计）。
+- 性能未测：示例打印的耗时来自 Debug 构建、仅供参考；正式结论须用 `build-bench`（Release）。
+
 ## 2026-10-15：新增 `tools/strings` + `tools/strconv`（Go 标准库对齐第一批，第 26 轮）
 
 ### 背景

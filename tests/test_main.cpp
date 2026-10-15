@@ -28,6 +28,7 @@ void run_fd_manager_tests();
 void run_errors_namespace_tests();
 void run_strings_tests();
 void run_strconv_tests();
+void run_fmt_tests();
 void run_hook_tests();
 
 /**
@@ -72,6 +73,7 @@ int main() {
     if (selected("errors_ns")) run_errors_namespace_tests();
     if (selected("strings")) run_strings_tests();
     if (selected("strconv")) run_strconv_tests();
+    if (selected("fmt")) run_fmt_tests();
 #ifdef GO2CPP_TEST_HOOK
     if (selected("hook")) run_hook_tests();
 #endif

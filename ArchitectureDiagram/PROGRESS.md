@@ -36,6 +36,10 @@
 | 25 | 开发：`tools/strconv.hpp`（Go strconv 对应） | `../include/go2cpp/tools/strconv.hpp` | **已完成（第 11 轮）**：546 行；0 warning；60 条边界断言；待补测试/示例登记 |
 | 26 | 开发测试：`tests/tools/test_strings.cpp` | `../tests/tools/test_strings.cpp` | **已完成（第 12 轮）**：6 场景 + 10 万字段 + 2 万/1 万随机对拍；已通过 |
 | 27 | 开发测试：`tests/tools/test_strconv.cpp` | `../tests/tools/test_strconv.cpp` | **已完成（第 12 轮）**：6 场景 + 20 万×2 + 4 组随机属性；已通过 |
+| 28 | 开发示例：strings/strconv 各两版（demo/full） | `../example/tools/` | **已完成（第 13 轮）**：4 个示例（88/140/90/153 行），3/6 场景；登记 `GO2CPP_EXAMPLES` 与 `example/README.md`；退出码均为 0 |
+| 29 | 修复既有 flaky：timer_task_demo 时序断言 | `../example/concurrency/timer_task_demo.cpp` | **已完成（第 13 轮）**：4 处「回调/计数满足后立即单次采样 StateValue」改为分别轮询；全量 ctest 撞到 1 次 → 单独重跑 5/5 通过确认 flaky → 修复后 5/5 通过 |
+| 30 | 本轮提交 | commit `a88290d` | **已完成**：38 文件 / +7235 行；全量构建 0 warning、ctest 73/73（29.23 s） |
+| 31 | 开发：`tools/fmt.hpp`（Go fmt 核心子集） | `../include/go2cpp/tools/fmt.hpp` | **已完成（第 14 轮）**：~612 行；0 诊断 + 全部断言通过；待补测试/示例登记 |
 | 22 | NextStep：第三方库预研（候选/许可证/可移植性） | `../NextStep/third-party-plan.md` | **已完成**：T1~T4 分层候选 + 五项可移植性判据 + 已核验 gin/cobra/gorm 的 LICENSE 原文 |
 | 23 | NextStep：路线图与里程碑 | `../NextStep/roadmap.md` | **已完成**：关键路径 + S1~S7/T1~T4 阶段计划 + M1~M5 里程碑 + 风险缓解 |
 
@@ -56,12 +60,14 @@
 | 11 | 开发：`tools/strings.hpp`（Go strings 对应） | **已完成** | 检索 4 个 C++ 候选后决定自研薄封装；654 行 header-only + 5 行转发头；编译 0 warning、49 条 Go 语义边界断言全通过（含 `Count(s,"")==rune+1` 等反直觉边界） |
 | 12 | 开发：`tools/strconv.hpp`（Go strconv 对应） | **已完成** | 546 行 header-only + 5 行转发头；编译 0 warning、60 条 Go 语义边界断言通过（base=0 八进制推断 / 下划线仅 base=0 / ErrRange 钳制值 / ParseBool 精确接受集）；修掉 1 个实现 bug（from_chars hex 前缀） |
 | 13 | 开发：strings/strconv 的正式测试与登记 | **已完成** | `tests/tools/test_strings.cpp`（242 行）+ `test_strconv.cpp`（245 行）；各 6 个真实场景；10 万字段 Join/Split 往返、20 万×2 数值往返、2 万/1 万/10 万轮随机对拍；`GO2CPP_TEST_FILTER=strings|strconv` 均 all checks passed（0 warning） |
-| 14 | 后续轮 | 开发：大数据量 + 随机 + 多场景测试 | 待办 | |
-| 15 | 后续轮 | 开发：example（延续风格）+ 登记 | 待办 | |
-| 16 | 22:00 前 | 收尾：G10 汇总 + codex.md + 提交 + 最终报告 | 待办 | |
+| 14 | 开发：示例（demo/full）+ 登记 | **已完成（第 13 轮）** | 4 个示例部署并登记；输出逐条与注释预期一致 |
+| 15 | 全量验证：构建 0 warning + ctest 73/73 | **已完成（第 13 轮）** | 发现并修复 timer_task_demo flaky；ctest 73/73（29.23 s） |
+| 16 | 收尾：codex.md 第 26 轮 + 提交 | **已完成（第 13 轮）** | commit `a88290d`；工作树仅剩在途 4 文件与 `.dsh_tmp/` |
 
 ## 证据索引
 
 - 构建/测试证据：`build-quality`（0 warning / 0 error）、`ctest` 69/69（2026-10-15 17:40 全量重建后）。
 - 上游文档：`docs/HANDOFF.md`、`codex.md`（第 25 轮）、`docs/modules.md`、`docs/design.md`、`docs/dependencies.md`。
 - 已实测纠正项：MId 从 1 开始；nlohmann 3.11.3 的 `parse()` 是迭代实现（会爆栈的是 `dump()`/拷贝）。
+| 17 | 开发：`tools/fmt.hpp`（Go fmt 核心子集） | **已完成（第 14 轮）** | ~612 行 header-only + 转发头；动词 v/d/s/q/t/f/e/g/x/X/b/o/c/T(+Errorf 的 w)；flags -/0/+/空格/#；width·precision 按 rune；容器与 pair 递归、ErrorPtr 按 Message()；对齐 %!verb(...) 三类错误标记；编译 0 诊断、fmt_check failures=0 |
+| 18 | 下一轮 | `fmt` 的测试与示例 + 登记 + 全量验证 | 待办 | tests/tools/test_fmt.cpp（大数据量/随机/≥5 场景）、example/tools/fmt_{demo,full}.cpp、build-quality 全量 + ctest、codex.md 第 27 轮、提交 |
