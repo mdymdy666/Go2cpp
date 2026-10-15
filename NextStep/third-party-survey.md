@@ -48,6 +48,15 @@ Go2Cpp 当前只有前三块的**解析/传输层**，没有反射与 GC，
 | 12 | `allegro/bigcache` | **Apache-2.0** | 8,168 | 进程内大容量缓存 |
 | 13 | `rs/zerolog` | **MIT** | 12,519 | 零分配 JSON 日志 |
 | 14 | `sirupsen/logrus` | **MIT** | 25,763 | 结构化日志 |
+| 15 | `spf13/pflag` | **BSD-3-Clause** | 2,779 | GNU 风格参数解析（`cobra` 的依赖） |
+| 16 | `google/uuid` | **BSD-3-Clause** | 6,148 | UUID（RFC 4122） |
+| 17 | `shopspring/decimal` | **MIT**（GitHub 显示 `NOASSERTION`，详见第 6.2 节） | 7,492 | 任意精度定点十进制 |
+| 18 | `golang/time`（`x/time`） | **BSD-3-Clause** | 426 | 限流器等补充包 |
+| 19 | `natefinch/lumberjack` | **MIT** | 5,478 | 日志轮转（`io.Writer`） |
+| 20 | `joho/godotenv` | **MIT** | 10,661 | `.env` 解析 |
+| 21 | `robfig/cron` | **MIT** | 14,196 | cron 表达式调度 |
+
+（序号 1~14 见上表；**累计一手核验 21 个**，全部为宽松许可。）
 
 **样本的许可证分布**：MIT 8 / Apache-2.0 3 / BSD-3-Clause 1 / BSD-2-Clause 1 —— **全部为宽松许可**，
 没有一个 GPL/AGPL。这与 Go 生态的整体情况一致：**许可证风险极低，真正的门槛是技术可移植性**。
@@ -274,22 +283,49 @@ Go2Cpp 当前只有前三块的**解析/传输层**，没有反射与 GC，
 
 ---
 
-## 6. 下一步核验清单（待办）
+## 6. 许可证核验进度（截至 2026-10-15）
 
-按「可较早推进」的优先级，下一批应核验许可证与依赖的库：
+### 6.1 已完成核验（21 个，全部宽松许可）
+
+| 领域 | 库 | 许可证（SPDX） |
+|---|---|---|
+| Web / 路由 | `gin`、`echo`、`fiber`、`chi`、`gorilla/mux` | MIT x4 + BSD-3-Clause x1 |
+| CLI | `cobra`、`pflag` | Apache-2.0、BSD-3-Clause |
+| ORM / DB | `gorm`、`ent`、`sqlx`、`pgx` | MIT x3 + Apache-2.0 x1 |
+| 缓存 / 消息 | `go-redis`、`bigcache` | BSD-2-Clause、Apache-2.0 |
+| 日志 | `zerolog`、`logrus`、`lumberjack` | MIT x3 |
+| 配置 / 工具 | `godotenv`、`decimal`、`uuid`、`x/time`、`cron` | MIT x4 + BSD-3 x1 |
+
+结论：**全部为宽松许可（MIT / Apache-2.0 / BSD-2 / BSD-3），无一传染性许可**。
+但**未核验的库不能默认沿用这个结论**，移植前仍需逐个核验。
+
+### 6.2 核验经验（踩过的坑，供后续复用）
+
+1. **`NOASSERTION` 必须回落到 LICENSE 原文** —— `shopspring/decimal` 的 GitHub 许可证字段是
+   `NOASSERTION`（无法自动识别），但它其实是 **MIT**：LICENSE 文件里同时含自身 MIT 文本**和**
+   一段引自 `oguzbilgic/fpd` 的 MIT 文本，检测器因此放弃断言。只看 SPDX 字段会误判为
+   「许可证不明」，进而放弃一个 7.5k star 的优质库。
+2. **端点可用性（本环境实测）**：WSL 内**无网络**（`curl` 无输出）；
+   `web_fetch` 抓 `raw.githubusercontent.com` 会 **30 秒超时**；
+   而 **`api.github.com` 稳定可用**：
+   - `GET /repos/{owner}/{repo}` → `license.spdx_id` + `stargazers_count` + `default_branch`（**最省，推荐**）
+   - `GET /repos/{owner}/{repo}/license` → LICENSE 原文的 base64（需要原文时用）
+3. **注意 `default_branch`**：`natefinch/lumberjack` 的默认分支是 **`v2.0`**（不是 `master`/`main`）——
+   自行拼 `raw.githubusercontent.com/.../master/LICENSE` 会 404；用 API 端点则自动跟随默认分支。
+4. **分清 fork 与事实上游**：`spf13/pflag` 是 `ogier/pflag` 的 fork，但被广泛依赖的是 **spf13 版**
+   （`cobra` 依赖它）。核验要认准**实际被依赖的那个仓库**，而不是 star 更高的老仓库。
+5. **核验要记录日期与版本**：本报告的核验日期是 **2026-10-15**；
+   移植时必须按 `third-party-plan.md` 第 5 节的流程重核一次，并把 commit/tag 与日期写进 `docs/dependencies.md`。
+
+### 6.3 待核验清单（下一批）
 
 | 优先级 | 库 | 要核验的内容 |
 |---:|---|---|
-| 1 | `spf13/pflag` | LICENSE + `go.mod` 依赖闭包 |
-| 2 | `google/uuid` | LICENSE + 是否仅依赖标准库 |
-| 3 | `shopspring/decimal` | LICENSE + 是否强依赖 `math/big` |
-| 4 | `golang.org/x/time`（rate） | LICENSE（BSD-3）+ 依赖 |
-| 5 | `natefinch/lumberjack` | LICENSE + 依赖 |
-| 6 | `allegro/bigcache` ★已核验 | 依赖闭包（它自己是否只依赖标准库） |
-| 7 | `nats-io/nats.go` | LICENSE + 协议文档 |
-| 8 | `redis/go-redis` ★已核验 | 依赖闭包（连接池用了哪些 `sync` 原语） |
-| 9 | `joho/godotenv` | LICENSE + 行数 |
-| 10 | `robfig/cron` | LICENSE + 时区处理依赖 |
-
-> 核验方式：`curl -s https://api.github.com/repos/{owner}/{repo}/license`（SPDX 字段）
-> 或抓 `LICENSE` 原文；两者都要**记录 commit/tag 与日期**，写进 `docs/dependencies.md`。
+| 1 | `nats-io/nats.go` | LICENSE（预期 Apache-2.0）+ 协议文档 |
+| 2 | `prometheus/client_golang` | LICENSE（预期 Apache-2.0）+ 是否强依赖 `net/http` |
+| 3 | `golang-jwt/jwt` | LICENSE（预期 MIT）+ 依赖 |
+| 4 | `sony/gobreaker` | LICENSE（预期 MIT）+ 行数 |
+| 5 | `qax-os/excelize` | LICENSE（预期 BSD-3）+ ZIP/XML 依赖面 |
+| 6 | `gocolly/colly` 与 `PuerkitoBio/goquery` | LICENSE + HTML 解析器能否独立移植 |
+| 7 | `disintegration/imaging`、`fogleman/gg` | LICENSE + 是否只依赖标准库 `image` |
+| 8 | `open-telemetry/opentelemetry-go` | LICENSE + 依赖闭包重量 |

@@ -710,3 +710,44 @@ ctest --test-dir build-quality                           # 79/79 通过（30.52 
 |---|---|
 | 按 §6 核验下一批库 | `pflag`/`uuid`/`decimal`/`x-time`/`lumberjack`/`nats.go`/`godotenv`/`cron` 的 LICENSE 与依赖闭包 |
 | 核验结论落地 | 写进 `docs/dependencies.md`（来源 + commit/tag + 许可证 + 日期） |
+
+---
+
+## 第 25 轮（2026-10-15 21:2x）：第三方库第二批许可证核验（累计 21 个）
+
+### 核验方式
+
+`api.github.com`（`/repos/{owner}/{repo}` 给 SPDX + star + 默认分支；`/license` 给 LICENSE 原文）。
+**执行日期 2026-10-15**。
+
+### 本轮结果（8 个）
+
+| 库 | 许可证 | Star | 备注 |
+|---|---|---:|---|
+| `spf13/pflag` | **BSD-3-Clause** | 2,779 | 是 `ogier/pflag` 的 fork，但事实标准是 spf13 版 |
+| `google/uuid` | **BSD-3-Clause** | 6,148 | |
+| `shopspring/decimal` | **MIT**（GitHub 显示 `NOASSERTION`） | 7,492 | 需抓原文才能确认 |
+| `golang/time`（`x/time`） | **BSD-3-Clause** | 426 | |
+| `natefinch/lumberjack` | **MIT** | 5,478 | 默认分支是 `v2.0`，不是 master/main |
+| `joho/godotenv` | **MIT** | 10,661 | |
+| `robfig/cron` | **MIT** | 14,196 | |
+| **累计** | **21 个全部宽松许可** | | MIT / Apache-2.0 / BSD-2 / BSD-3 |
+
+### 本轮最有价值的发现
+
+**`NOASSERTION` 不等于「许可证不明」**：`shopspring/decimal` 的 GitHub SPDX 字段是
+`NOASSERTION`，抓 LICENSE 原文才发现**实际是 MIT** —— 该文件同时包含自身 MIT 文本与
+一段引自 `oguzbilgic/fpd` 的 MIT 文本，自动检测器因此放弃断言。
+**结论：SPDX 字段只作快速筛选，遇 `NOASSERTION` 必须回落到 LICENSE 原文。**
+
+另两条经验（已写进 survey 第 6.2 节）：
+
+- **端点可用性**：WSL 内无网络；`raw.githubusercontent.com` 经 `web_fetch` 会 30 秒超时；
+  `api.github.com` 稳定可用，其中 `/repos` 端点一次拿到 SPDX + star + 默认分支，最省；
+- **注意 `default_branch`**：lumberjack 的默认分支是 `v2.0`，自行拼 raw URL 会 404。
+
+### 待办
+
+下一批核验：`nats.go`、`prometheus/client_golang`、`golang-jwt/jwt`、`gobreaker`、
+`excelize`、`colly`+`goquery`、`imaging`+`gg`、`opentelemetry-go`；
+核验结论最终要写进 `docs/dependencies.md`（含 commit/tag 与日期）。
