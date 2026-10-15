@@ -58,6 +58,7 @@
 | 47 | 第三方库调查报告（15 领域 / 100+ 库） | `../NextStep/third-party-survey.md` | **已完成（第 24 轮）**：约 400 行；14 个库的许可证与 star 经 GitHub API 一手核验（全为 MIT/Apache-2.0/BSD 系）；四类处置建议（可早推进 16 / 需底座 6 / 不建议 13 / 自研优先 4）+ 下一步核验清单 |
 | 48 | 第三方库第二批许可证核验（累计 21 个） | `../NextStep/third-party-survey.md` 第 2/6 节 | **已完成（第 25 轮）**：pflag/uuid/decimal/x-time/lumberjack/godotenv/cron 经 GitHub API 核验（BSD-3 x3、MIT x4；累计 21 个全为宽松许可）；发现 `shopspring/decimal` 的 SPDX 为 NOASSERTION 但原文实为 MIT；记录端点可用性与 default_branch 两条经验 |
 | 49 | 第三方库第三、四批核验（累计 29 个） | `../NextStep/third-party-survey.md` 第 2/6 节 | **已完成（第 26 轮）**：nats.go/prometheus/jwt/gobreaker/excelize/colly/goquery/imaging 经 GitHub API 核验（Apache-2.0 x3、MIT x3、BSD-3 x2）；累计 29 个全为宽松许可；观察：高 star 与可移植性不相关（colly 25.5k=B、bigcache 8.2k=A） |
+| 50 | **最终交付报告**（三项交付的清单与实测证据） | `FINAL-REPORT.md` | **已完成（第 27 轮）**：约 220 行；含执行摘要、每项交付的规模与位置、质量证据（ctest 79/79）、11 次提交清单、未完成项与后续建议、7 条方法论经验 |
 | 22 | NextStep：第三方库预研（候选/许可证/可移植性） | `../NextStep/third-party-plan.md` | **已完成**：T1~T4 分层候选 + 五项可移植性判据 + 已核验 gin/cobra/gorm 的 LICENSE 原文 |
 | 23 | NextStep：路线图与里程碑 | `../NextStep/roadmap.md` | **已完成**：关键路径 + S1~S7/T1~T4 阶段计划 + M1~M5 里程碑 + 风险缓解 |
 
