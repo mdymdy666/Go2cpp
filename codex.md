@@ -13,6 +13,140 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-15：nlohmann/json 薄封装 + fiber_stack_limit 两版示例（第 25 轮）
+
+### 用户要求
+
+> 「按 `docs/HANDOFF.md` §2.4 执行待办：写 `tools/json.hpp`（真身）+ `json.hpp`（转发头）、
+> `cmake/Go2CppModules.cmake` 加 `${CMAKE_SOURCE_DIR}/third_party`、构建验证
+> （0 warning / 0 error）、部署 `fiber_stack_limit_{demo,full}.cpp` 并注册
+> `GO2CPP_EXAMPLES`、跑通并逐条比对输出与注释里的"预期"、更新 `codex.md`、提交」
+
+### 改动清单（关键文件）
+
+| 文件 | 改动 |
+|---|---|
+| `include/go2cpp/tools/json.hpp` | **新增**（222 行，header-only 真身）：`Json` 别名、`kDefaultJsonMaxDepth = 64`、`JsonDepthExceededError()`、`JsonScanDepth()`（迭代扫描 + 早退）、`JsonParseResult`、`ParseJson()` |
+| `include/go2cpp/json.hpp` | **新增**（5 行转发头，指向 `tools/json.hpp`） |
+| `cmake/Go2CppModules.cmake` | `go2cpp_runtime` 的 `BUILD_INTERFACE` 增加 `${CMAKE_SOURCE_DIR}/third_party`（**+1 行**） |
+| `cmake/Go2CppTests.cmake` | `GO2CPP_EXAMPLES` 登记两个新示例（+2 行）；该文件同时带入上一轮的 benchmark 注册（+12 行） |
+| `example/concurrency/fiber_stack_limit_demo.cpp` | **新增**（136 行，3 场景） |
+| `example/concurrency/fiber_stack_limit_full.cpp` | **新增**（640 行，6 场景） |
+| `example/README.md` | 速查表登记两行（+2 行，规范要求新增示例必须登记） |
+| `docs/dependencies.md` | 新增 nlohmann/json 一节：来源/版本/许可证/暴露方式/限深实测依据（+19 行） |
+| `docs/HANDOFF.md` | **新增**（上一轮产物）并修正其中"nlohmann 是递归下降解析器"的错误结论（2 处） |
+| `benchmarks/fiber_stack_probe.cpp` | **新增**（上一轮产物）+ 修 3 处编译警告 |
+| `benchmarks/gmp_compute_benchmark.cpp` | **新增**（上一轮产物）+ 修 1 处编译警告 |
+
+### ★ 推翻上一轮的一个结论：nlohmann 3.11.3 的**解析器是迭代的**
+
+上一轮 `docs/HANDOFF.md` 记着「递归下降 `parse_internal` 已确认」。该结论来自
+**grep 到 `parse_internal` 字样**，但实际调用链是
+`parse()` → **`sax_parse_internal`**（`third_party/nlohmann/json.hpp:12348`），
+其实现用 **`std::vector<bool> states` 显式状态栈 + `while (true)` 循环**
+（`:12401` / `:12426`），**没有递归下降**。
+
+实测（fork 隔离 + 二分，128 KiB Fiber 栈，本轮亲测）：
+
+| 操作 | Release/-O2 | 无优化 |
+|---|---|---|
+| 解析（`ParseJson` 内部） | ≥ 524288 层 | ≥ 524288 层 |
+| `dump()` | 1162 层 | 609 层 |
+| 拷贝一份 `json` | 816 层 | 185 层 |
+
+**结论修正**：「深 JSON 会在解析时爆栈」**不成立**；真正让进程消失的是
+**解析之后的递归操作**（`dump()`、拷贝）。因此 `ParseJson` 的限深栅栏仍然必要，
+但理由是「拦截深文档进入程序后的递归操作 + O(深度) 资源放大 + 版本稳健性」，
+而不是「防解析爆栈」。`docs/HANDOFF.md`、`docs/dependencies.md` 与本条记录都已
+按实测修正；`fiber_stack_limit_full.cpp` 场景 5 把这个反证做成了可运行示例
+（20 万层解析成功 → 同一文档 dump/拷贝被信号杀死 → 临界深度实测）。
+
+### 示例设计
+
+- **简单版**（`fiber_stack_limit_demo.cpp`，3 场景）：128 KiB 栈的安全递归深度采样、
+  递归改迭代、深层 JSON 被限深拒绝（错误身份判定）。
+- **全面版**（`fiber_stack_limit_full.cpp`，6 场景）：
+  ① fork 二分探深（Fiber 帧 0 / 帧 256B / 8 MiB pthread 对照，本机实测 1021 / 339 / 65496）；
+  ② 递归改迭代；
+  ③ ★ 换 Fiber 续跑（每 300 层换一块新栈，目标 4000 层 → 13 次换栈、最深嵌套 14）；
+  ④ 显式限深（深度错误与语法错误用 `Is` 身份区分）；
+  ⑤ 解析 vs 递归（20 万层解析成功、dump/拷贝被信号杀死、两者临界深度实测）；
+  ⑥ JSON 深层嵌套实战（64/65 边界、随机 500 组、5 万层攻击载荷早退 0 µs、3000 次稳定性重复）。
+- 所有"会不会崩"的判定都在 **fork 子进程**里做，用 `waitpid` 终止状态判结局；
+  探深前 `setrlimit(RLIMIT_CORE, 0)`，避免在构建目录留下 core 文件。
+
+### 过程中发现并修掉的两个缺陷（都在本轮新增的示例自身）
+
+1. **fork 导致父进程输出重复一次**：子进程 `freopen` 会 flush 从父进程继承来的
+   stdio 缓冲，把父进程尚未写出的内容再写一遍。修法：fork **前** `std::fflush(nullptr)`，
+   子进程改用 `dup2` 指向 `/dev/null`，结束用 `_exit()`（而不是 `exit()`）。
+2. **错误文本误导**：`JsonScanDepth` 早退时返回值只是真实深度的**下界**，
+   旧文本写成「JSON 嵌套深度 65 超过上限 64」，会让人以为输入只有 65 层。
+   已改为「扫描到第 N 层即早退，完整深度未统计」。
+
+### 验证（全部实际运行过）
+
+- `build-quality` 全量 `--clean-first` 重建：**0 warning / 0 error**
+  （`grep -c -i warning` = **0**；覆盖 13 个库 + 全部示例 + 测试）
+- `ctest --test-dir build-quality`：**69/69 通过**，总耗时 **27.89 s**
+  （其中新增 `go2cpp_fiber_stack_limit_demo` 0.01 s、
+  `go2cpp_fiber_stack_limit_full` 1.37 s，远低于 30 s 超时）
+- `build-bench`（Release）下三个 benchmark 重编译：**0 warning**
+  （修掉 4 处：`freopen` 返回值 2 处、`PTHREAD_STACK_MIN` 符号比较 1 处、
+  `main` 未使用参数 2 个 —— 这些警告此前从未被发现，因为 `benchmarks/*`
+  只在 `GO2CPP_BUILD_BENCHMARKS=ON` 时编译，而历次"0 warning"门禁跑的是
+  `build-quality`（benchmarks OFF））
+- 两个示例单独运行退出码均 0，输出逐条与注释里的"预期"一致
+
+### 一次行尾事故与修复（教训）
+
+用 Windows 侧 Python 以 **text 模式**回写 `cmake/Go2CppModules.cmake` 时，
+`subprocess` 把 `\n` 转成了 `\r\n`，`git diff` 显示**整文件变化**。
+已用 `tr -d "\r"` 还原为 LF，diff 恢复为"仅 +1 行"。
+后续所有脚本改为**全程 bytes 读写**；并确认了两个事实：
+`cmake/Go2CppTests.cmake` 在 HEAD 里本来就是 **CRLF**，而 C++ 源码是 LF
+（仓库行尾并不统一，改动前必须先 `file` 确认）。
+
+### ★ 提交前的自洽性检查（避免"提交了示例、没提交被测 API"）
+
+提交后复核时发现：两个示例用了 `go2cpp::errors::Is(...)`，而 `errors::` 命名空间
+**只存在于用户在途未提交的 `include/go2cpp/tools/error.hpp`** ——
+`git show HEAD:include/go2cpp/tools/error.hpp | grep "namespace errors"` **无结果**。
+若原样提交，**从 HEAD 全新 checkout 构建会失败**。这正是本文件早前记录过的
+事故模式（"提交了测试与示例，却没提交它所依赖的头文件"）。
+
+处置：把 6 处 `go2cpp::errors::Is` 全部换成 HEAD 里已存在的 `go2cpp::Is`
+（语义完全相同；`git show HEAD:include/go2cpp/tools/error.hpp:136` 有
+`bool Is(const ErrorPtr& error, const ErrorPtr& target) noexcept;`），
+并补做了**提交后快照验证**：
+
+```sh
+git archive HEAD | tar -x -C /tmp/headverify
+g++ -std=c++17 -fsyntax-only -Wall -Wextra -Wpedantic \
+    -I include -I third_party example/concurrency/fiber_stack_limit_demo.cpp
+g++ -std=c++17 -fsyntax-only -Wall -Wextra -Wpedantic \
+    -I include -I third_party example/concurrency/fiber_stack_limit_full.cpp
+```
+
+两个 TU 均 **0 warning 通过**，`go2cpp/json.hpp` 单独包含也可编译 ——
+证明本次提交自洽、不依赖任何在途文件。
+
+**留下的检查动作**：凡新增示例/测试引用了什么 API，提交前都要确认该 API
+在 `HEAD` 里存在（而不是只存在于工作区的在途文件里）。
+
+### 未覆盖 / 后续状态
+
+- 未跑 sanitizer（ASan/UBSan/TSan）与 Valgrind。
+- **未新增 `tests/tools/test_json.cpp`**：本轮以「示例 + ctest」承载验证
+  （demo 3 场景 + full 6 场景 + 随机 500 组 + 稳定性 3000 次 + fork 反证）。
+  若要纳入 `go2cpp_tests`，需新增测试文件并在 `tests/test_main.cpp` 与
+  `cmake/Go2CppTests.cmake` 两处登记。
+- `benchmarks/fiber_stack_probe.cpp` 的 45 组数据**未在本轮重跑**（沿用上一轮结果）；
+  本轮只重编译并复现了其中的临界深度量级（1021/339/65496 vs 1022/340/65497）。
+- 在途未提交、**本轮未触碰**的用户文件：`include/go2cpp/tools/error.hpp`、
+  `src/tools/error.cpp`、`include/go2cpp/logging/log.hpp`、
+  `example/concurrency/future_full.cpp`（其中 error 两件是注释改造进行中）。
+
 ## 2026-10-14：Context 模块注释改造（第 1 批）
 
 ### 用户要求

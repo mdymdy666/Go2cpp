@@ -58,6 +58,8 @@ cmake --build build --target go2cpp_runtime_demo
 | `context_rollback_demo` | commit 保留已提交资源 | 父取消/deadline 驱动补偿 | undo 异常、失效 savepoint |
 | `log_config_demo` | 自定义 Formatter Item | 配置加载后应用日志 | 非法 INI 保留旧快照 |
 | `errors_demo` | errors:: 构造、包装与聚合 | Unwrap 逐层下降到底 | 消息相同但身份不同不匹配 |
+| `fiber_stack_limit_demo` | 默认 128 KiB 栈的安全递归深度、递归改迭代 | 手动 resume 的 Fiber 串行执行（不涉及并发） | 深层 JSON 在入口被限深拒绝，而不是崩栈 |
+| `fiber_stack_limit_full` | fork 二分实测临界调用深度（Fiber 与 pthread 对照）、换 Fiber 续跑突破单栈上限 | 迭代式解析 20 万层嵌套；dump/拷贝临界深度实测 | 「解析成功但 dump/拷贝爆栈」的反证、随机深度输入、攻击载荷 |
 
 一次构建后可以批量运行全部示例（每个命令都有 20 秒看门狗）：
 

@@ -33,6 +33,25 @@ Go 1.5 发布后才完成用 Go 重写编译器和 runtime 的自举转换。因
 cd third_party/go-reference && sha256sum -c SHA256SUMS
 ```
 
+## 第三方 C++ 依赖：nlohmann/json（JSON 薄封装）
+
+- 项目：`https://github.com/nlohmann/json`
+- 版本：**v3.11.3** 单头文件（`single_include/nlohmann/json.hpp`，919,975 字节）
+- 许可证：MIT（文件头 `SPDX-License-Identifier: MIT`）；本地副本未做任何修改
+- 本地位置：`third_party/nlohmann/json.hpp`
+- 暴露方式：`cmake/Go2CppModules.cmake` 把 `${CMAKE_SOURCE_DIR}/third_party` 加入
+  `go2cpp_runtime` 的 `BUILD_INTERFACE` 包含路径；需显式 `#include "go2cpp/json.hpp"`
+- 薄封装：`include/go2cpp/tools/json.hpp`（真身，header-only）+ `include/go2cpp/json.hpp`
+  （转发头），提供 `JsonScanDepth` / `ParseJson`：**在进入上游之前**做迭代深度栅栏，
+  超限即返回 `ErrorPtr`，默认上限 64 层
+- **为什么必须限深（128 KiB 固定 Fiber 栈上的实测，2026-10-15）**：上游 `parse()` 是
+  **迭代**实现（`sax_parse_internal` 用堆上的 `std::vector<bool> states` 显式栈），
+  20 万层嵌套可正常解析；但 **`dump()` 与拷贝仍是递归的**，临界深度分别约
+  `1162 / 816` 层（Release）与 `609 / 185` 层（无优化）。即：深文档一旦进入程序，
+  之后任意一次 dump/拷贝都会触碰 guard page，而项目没有 SIGSEGV handler，
+  进程被信号杀死且**不可捕获**
+- 完整实测与六个应对场景见 `example/concurrency/fiber_stack_limit_full.cpp`
+
 ## Go 能力的 C++ 替代
 
 | Go 机制 | 本项目替代 | 明确边界 |

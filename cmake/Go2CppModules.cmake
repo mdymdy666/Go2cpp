@@ -133,6 +133,7 @@ endforeach()
 
 target_include_directories(go2cpp_runtime INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/third_party>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 

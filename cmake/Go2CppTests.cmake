@@ -123,6 +123,8 @@ if (GO2CPP_BUILD_EXAMPLES)
         concurrency/thread_policy_full
         concurrency/fiber_local_demo
         concurrency/fiber_local_full
+        concurrency/fiber_stack_limit_demo
+        concurrency/fiber_stack_limit_full
         concurrency/future_demo
         concurrency/hybrid_mutex_demo
         network/fd_manager_demo
@@ -160,6 +162,18 @@ if (GO2CPP_BUILD_BENCHMARKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/timer_task_benchmark.cpp)
     target_link_libraries(go2cpp_timer_task_benchmark PRIVATE go2cpp_runtime)
     target_compile_options(go2cpp_timer_task_benchmark PRIVATE -O2 -Wall -Wextra -Wpedantic)
+
+    add_executable(go2cpp_gmp_compute_benchmark
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/gmp_compute_benchmark.cpp)
+    target_link_libraries(go2cpp_gmp_compute_benchmark PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_gmp_compute_benchmark PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+
+    add_executable(go2cpp_fiber_stack_probe
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/fiber_stack_probe.cpp)
+    target_link_libraries(go2cpp_fiber_stack_probe PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_fiber_stack_probe PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
 
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_executable(go2cpp_io_epoll_fair_benchmark
