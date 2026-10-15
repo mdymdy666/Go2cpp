@@ -13,6 +13,81 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-15：新增 `tools/streams`（Go `io` 接口族，第 28 轮）
+
+### 交付清单
+
+| 文件 | 行数 | 说明 |
+|---|---:|---|
+| `include/go2cpp/tools/streams.hpp` | **664** | 18 个接口 + 5 个错误锚点 + 7 个核心函数 + 6 个适配器 + 2 个内存底座 |
+| `include/go2cpp/streams.hpp` | 6 | 根路径转发头 |
+| `tests/tools/test_streams.cpp` | 333 | 8 个真实场景 + 大数据量（1 MiB / 10 万次小块 / 2 万帧短读）+ 3 组随机属性测试 |
+| `example/tools/streams_demo.cpp` | 103 | 简单版 3 场景 |
+| `example/tools/streams_full.cpp` | 179 | 全面版 6 场景 |
+| `tests/test_main.cpp` | — | 登记：声明 + `selected("streams")` |
+| `cmake/Go2CppTests.cmake` | — | 登记：测试源 + `GO2CPP_EXAMPLES`（CRLF） |
+| `example/README.md` | — | 登记：速查表 2 行 |
+
+### 命名偏差（重要）
+
+Go 的 `io` 包提供的是**流式读写接口族**（`io.Reader`/`io.Writer`/`io.Copy`…），
+而本项目已经把这个名字用于**描述符与多路复用调度层**
+（`go2cpp::io::IOManager` / `FdManager`，见 `include/go2cpp/network/io.hpp`；
+且 `include/go2cpp/io.hpp` 已作为该模块的转发头存在）。两者语义不同、不可合并，因此：
+
+- 文件：`include/go2cpp/tools/streams.hpp`；命名空间：**`go2cpp::streams`**
+- 其余 API 与 Go 同名同义：`io.Reader` → `streams::Reader`，`io.EOF` → `streams::IoEof()`
+
+该偏差已写入文件头注释与 `NextStep/dev-progress.md`，避免后来者误以为漏实现。
+
+### 复用优先的结论
+
+C++ 侧没有与 Go `io` 语义对齐的现成库：`std::istream`/`std::ostream` 用**状态位**表达失败，
+不返回错误值，也不支持 Go 的「`n > 0` 同时带错误」契约；`ReadFull`/`CopyN`/`TeeReader` 这类组合语义更无处对应。
+因此自研。语义对照来源：`third_party/go1.23.0.src.tar.gz` 的 `go/src/io/`（Go 1.23.0，BSD-3-Clause），**独立实现**。
+
+### 对齐的非显然 Go 语义
+
+- `ReadAtLeast`：`size < minimum` → `ErrShortBuffer`；**读够 minimum 后清除 `EOF`**；
+  `0 < n < minimum` 且遇 `EOF` → `ErrUnexpectedEOF`（`n == 0` 时原样返回 `EOF`）；
+- `ReadAll`：把 `EOF` **归一化为成功**（错误为空）；
+- `Copy`：优先使用源端 `WriterTo` / 目标端 `ReaderFrom`，否则 32 KiB 缓冲循环；
+  **短写 → `ErrShortWrite`**；连续 100 次空读 → `ErrNoProgress`；
+- `CopyN`：写满 `n` 成功；`written < n` 且无错 → `EOF`；
+- `MultiReader`：某个源「读到数据同时遇 `EOF`」时**清掉 EOF 先交付数据**，下次调用再切源；
+- `CopyBuffer`：Go 在缓冲长度为 0 时 panic，这里返回 `ErrShortBuffer`（明确拒绝而非崩溃）。
+
+### 验证（实测）
+
+```sh
+g++ -std=c++17 -Wall -Wextra -Wpedantic -I include /tmp/streams_check.cpp src/tools/error.cpp -o /tmp/streams_check
+# → 编译诊断 0 行；streams.hpp check: failures=0
+
+GO2CPP_TEST_FILTER=streams ./build-quality/go2cpp_tests   # → all checks passed
+./build-quality/go2cpp_streams_demo / go2cpp_streams_full  # rc=0，输出与注释预期一致
+```
+
+测试特意实现了两个「恶劣源」：`ChunkedReader`（每次只给 1–37 字节）与 `DripReader`（每次只给 1 字节），
+用来**强制走短读路径** —— 这是 Go `io` 契约里最容易写错的地方；配合 3 组随机属性测试
+（随机分块 Copy 逐字节一致、2 万次随机偏移 `SectionReader`、2 万次随机 `LimitReader` 上限）。
+
+### 本轮修掉的问题（全部在验证/示例侧）
+
+| # | 问题 | 处置 |
+|---:|---|---|
+| 1 | 头文件级验证程序把字符串字面量 `const_cast` 后当可写缓冲传给 `Read` → `memcpy` 写入只读页 → **段错误**（现象是"编译通过但无输出"，又被 `set -e` 掩盖） | 改用真实可写缓冲；验证命令显式打印退出码 |
+| 2 | `SectionReader(source, 2, 4)` 内容为 `"2345"`，`ReadAt(buf,2,1)` 期望写成 `"45"`（应为 `"34"`） | 修正测试期望 |
+| 3 | 测试里 `"MAGIC:0011"` 按 11 字节断言（实际 10 字节 + 换行） | 修正断言 |
+| 4 | 测试场景 8 出现 `new StringReader(...)` 且从不释放（废代码） | 重写为「`Discard()` 作 `TeeReader` 旁路」的有效断言 |
+| 5 | 两个示例的帧数据只有 9 字节却期望「2 个完整帧」（9 字节只能成 1 帧） | 改为 17 字节 = 2 帧 + 1 字节尾帧 |
+
+### 未覆盖 / 后续
+
+- `io.Pipe`（Go 用 goroutine 实现的同步管道）未实现：C++ 侧需与 `core::ParkingCondition` 协作，留待后续；
+- `SectionReader` 未提供 `Outer` 语义；`RuneReader`/`RuneScanner` 只定义了接口，尚未给出标准实现；
+- 内存底座 `StringReader`/`BufferWriter` 是 `bytes.Reader`/`bytes.Buffer` 的**最小版本**，完整版留给 `bytes` 模块；
+- 性能未测：示例里的耗时来自 Debug 构建、仅供参考；正式结论须用 `build-bench`（Release）。
+
 ## 2026-10-15：新增 `tools/fmt`（Go 标准库对齐第二批，第 27 轮）
 
 ### 交付清单

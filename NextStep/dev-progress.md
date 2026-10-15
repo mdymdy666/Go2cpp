@@ -225,3 +225,115 @@ g++ -std=c++17 -Wall -Wextra -Wpedantic -I include /tmp/fmt_check.cpp src/tools/
 | 正式测试 | `tests/tools/test_fmt.cpp`：大数据量（10 万次格式化）+ 随机（随机格式串/参数对拍）+ ≥5 真实场景（日志、SQL 拼接、错误包装链、表格对齐、指标）；登记 `test_main.cpp` 与 CMake |
 | 示例 | `example/tools/fmt_{demo,full}.cpp`（3 / 6 场景）+ `GO2CPP_EXAMPLES` 与 `example/README.md` 登记 |
 | 收尾 | 全量构建 0 warning + `ctest` 全绿 + `codex.md` 第 27 轮 + 提交 |
+
+---
+
+## 第 16 轮（2026-10-15 18:4x）：`tools/streams.hpp`（Go `io` 接口族）
+
+### 命名偏差（重要，必须记录）
+
+Go 的 `io` 包提供「流式读写接口族」（`io.Reader`/`io.Writer`/`io.Copy`…），
+而**本项目已经把这个名字用于描述符与多路复用调度层**（`go2cpp::io::IOManager` / `FdManager`，
+见 `include/go2cpp/network/io.hpp`）。两者语义不同、不可合并，因此：
+
+- 文件：`include/go2cpp/tools/streams.hpp` + 转发头 `include/go2cpp/streams.hpp`
+- 命名空间：**`go2cpp::streams`**（而不是 `go2cpp::io`）
+
+| Go | 本实现 |
+|---|---|
+| `io.Reader` | `streams::Reader` |
+| `io.WriteString(w, s)` | `streams::WriteString(w, s)` |
+| `io.EOF` | `streams::IoEof()` |
+
+这是**有意保留的命名偏差**，其余 API 与 Go 同名同义。
+
+### 复用优先的结论
+
+C++ 侧没有与 Go `io` 语义对齐的现成库：`std::istream`/`std::ostream` 用**状态位**表达失败，
+既不返回错误值，也不支持 Go 的「`n > 0` 同时带错误」契约，`ReadFull`/`CopyN` 这类组合语义更无处对应。
+因此自研。语义对照来源：`third_party/go1.23.0.src.tar.gz` 的 `go/src/io/`（Go 1.23.0，BSD-3-Clause），**独立实现**。
+
+### 实现（664 行）
+
+| 类别 | 内容 |
+|---|---|
+| 结果类型 | `ReadResult`/`WriteResult`/`SeekResult`/`ByteResult`/`RuneResult`（对应 Go 的多返回值） |
+| 接口 | `Reader`/`Writer`/`Closer`/`Seeker`/`ReaderAt`/`WriterAt`/`ByteReader`/`ByteWriter`/`RuneReader`/`StringWriter`/`WriterTo`/`ReaderFrom` |
+| 错误锚点 | `IoEof()`/`IoErrUnexpectedEof()`/`IoErrShortWrite()`/`IoErrShortBuffer()`/`IoErrNoProgress()`（身份比较） |
+| 核心函数 | `ReadAtLeast`/`ReadFull`/`ReadAll`/`WriteString`/`Copy`/`CopyBuffer`/`CopyN` |
+| 适配器 | `LimitedReader`/`MultiReader`/`MultiWriter`/`TeeReader`/`SectionReader`/`DiscardWriter`（+`Discard()`） |
+| 内存底座 | `StringReader`（bytes.Reader 最小版）、`BufferWriter`（bytes.Buffer 最小版） |
+| 常量 | `kSeekStart`/`kSeekCurrent`/`kSeekEnd`（对应 `io.SeekStart` 等） |
+
+### 对齐的非显然语义
+
+- `ReadAtLeast`：`size < minimum` → `ErrShortBuffer`；**读够 minimum 后清除 `EOF`**；
+  `0 < n < minimum` 且遇 `EOF` → `ErrUnexpectedEOF`（`n == 0` 时原样返回 `EOF`）；
+- `ReadAll`：把 `EOF` **归一化为成功**（错误为空）；
+- `Copy`：优先使用源端 `WriterTo` / 目标端 `ReaderFrom`，否则 32 KiB 缓冲循环；
+  **短写 → `ErrShortWrite`**；连续 100 次空读 → `ErrNoProgress`；
+- `CopyN`：写满 `n` 成功；`written < n` 且无错 → `EOF`；
+- `MultiReader`：某个源「读到数据同时遇 `EOF`」时**清掉 EOF 先交付数据**，下次调用再切源；
+- `CopyBuffer`：Go 在缓冲长度为 0 时 panic，这里返回 `ErrShortBuffer`（明确拒绝而非崩溃）。
+
+### 验证
+
+```sh
+g++ -std=c++17 -Wall -Wextra -Wpedantic -I include /tmp/streams_check.cpp src/tools/error.cpp -o /tmp/streams_check
+# → 编译诊断 0 行；streams.hpp check: failures=0（约 40 条断言）
+```
+
+覆盖：`ReadFull` 的三种结果、`ErrShortBuffer`、`ErrUnexpectedEOF`、读够后清除 `EOF`、
+`ReadAll` 的 EOF 归一化、`Copy`/`CopyN`/`CopyBuffer`（含短写检测）、`LimitReader`、
+`MultiReader` 跨源、`MultiWriter`、`TeeReader`、`Discard`、`SectionReader`（Read/ReadAt/Seek/Size）、
+`ByteReader`/`WriteByte`/`StringWriter` 优化路径、`BufferWriter` 的 `Reset`/`Len`/消费式 `Read`。
+
+### 本轮修掉的两个问题（都在验证侧）
+
+1. **验证程序 bug**：把字符串字面量 `const_cast` 后当作可写缓冲传给 `Read` → `memcpy` 写入只读页 → **段错误**。
+   现象是「编译通过但运行无输出」，又因为命令用了 `set -e` 被掩盖成静默失败 —— 与第 14 轮的教训同源：
+   **验证脚本必须显式报告退出码与输出**。
+2. **测试期望算错**：`SectionReader(source, 2, 4)` 的内容是 `"2345"`，`ReadAt(buf, 2, 1)` 应得 `"34"`（我写成 `"45"`），实现无误。
+
+### 待办（下一轮）
+
+| 项 | 说明 |
+|---|---|
+| 正式测试 | `tests/tools/test_streams.cpp`：大数据量（1 MiB 级复制 + 10 万次小块读写）+ 随机（随机分块/随机偏移/随机短读）/ ≥5 真实场景（文件式复制、压缩流模拟、多段拼接、限流读取、分片校验） |
+| 示例 | `example/tools/streams_{demo,full}.cpp` + `GO2CPP_EXAMPLES` 与 `example/README.md` 登记 |
+| 收尾 | 全量构建 0 warning + `ctest` 全绿 + `codex.md` 第 28 轮 + 提交 |
+
+---
+
+## 第 17 轮（2026-10-15 18:5x）：streams 的正式测试与两处登记
+
+### 交付
+
+| 文件 | 行数 | 内容 |
+|---|---:|---|
+| `tests/tools/test_streams.cpp` | 333 | **8 个真实场景**（1 MiB 复制、定长帧解析、配置头部限流、多段拼接、边读边算、多路输出、文件区间+Seek、丢弃旁路）+ **大数据量**（1 MiB、10 万次小块读写、2 万帧最恶劣短读）+ **3 组随机**（随机分块源 Copy、2 万次随机偏移 SectionReader、2 万次随机 LimitReader 上限） |
+| `tests/test_main.cpp` | 登记 | `run_streams_tests()` 声明 + `selected("streams")` 分支 |
+| `cmake/Go2CppTests.cmake` | 登记 | 测试源文件列表（**CRLF 文件，插入行按 CRLF**） |
+
+### 验证（实测）
+
+```sh
+cmake --build build-quality --target go2cpp_tests      # 0 warning / 0 error
+GO2CPP_TEST_FILTER=streams ./build-quality/go2cpp_tests   # → all checks passed
+```
+
+随机测试的设计要点：`ChunkedReader`（每次只给 1..37 字节）与 `DripReader`（每次只给 1 字节）
+用来**强制触发短读路径**，断言 `Copy`/`ReadFull` 在任意分块下结果仍逐字节正确 ——
+这是 Go `io` 契约里最容易写错的部分。
+
+### 本轮修掉的两个问题（都在测试侧）
+
+1. 场景 8 里我用 `new StringReader(...)` 造了个临时对象且从不释放（**内存泄漏的废代码**），自查后重写为「`Discard()` 作为 `TeeReader` 旁路」的有效断言。
+2. 测试期望算错：`"MAGIC:0011"` 是 **10** 字节，而我按 11 写（第 11 字节是换行）→ 改为按「11 字节 = 10 字节头部 + 换行」断言。
+
+### 待办（下一轮）
+
+| 项 | 说明 |
+|---|---|
+| 示例 | `example/tools/streams_{demo,full}.cpp`（3 / 6 场景）+ `GO2CPP_EXAMPLES` 与 `example/README.md` 登记 |
+| 收尾 | `build-quality` 全量 0 warning + `ctest` 全绿 + `codex.md` 第 28 轮 + 按明确路径提交 |

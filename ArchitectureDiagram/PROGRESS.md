@@ -21,11 +21,11 @@
 | 10 | 模块报告 G7 应用协议 | `modules/G7-protocols.md` | **已完成**（281 行） |
 | 11 | 模块报告 G8 横切设施 | `modules/G8-log-config.md` | **已完成**（325 行） |
 | 12 | 模块报告 G9 工具与新手层 | `modules/G9-tools.md` | **已完成**（278 行） |
-| 13 | 模块报告 G10 汇总 | `modules/G10-summary.md` | 未开始 |
-| 14 | NextStep 总览 | `../NextStep/README.md` | 未开始 |
-| 15 | Go 标准库映射与计划 | `../NextStep/go-stdlib-map.md` | 未开始 |
-| 16 | 第三方库预研与计划 | `../NextStep/third-party-plan.md` | 未开始 |
-| 17 | 开发尝试与进度记录 | `../NextStep/dev-progress.md` | 未开始 |
+| 13 | 模块报告 G10 汇总 | `modules/G10-summary.md` | **已完成**（见后续权威条目） |
+| 14 | NextStep 总览 | `../NextStep/README.md` | **已完成**（见后续权威条目） |
+| 15 | Go 标准库映射与计划 | `../NextStep/go-stdlib-map.md` | **已完成**（见后续权威条目） |
+| 16 | 第三方库预研与计划 | `../NextStep/third-party-plan.md` | **已完成**（见后续权威条目） |
+| 17 | 开发尝试与进度记录 | `../NextStep/dev-progress.md` | **已完成**（见后续权威条目） |
 | 18 | 架构图数据模型（节点/边/文字块清单） | `notes/nodes-edges.md` | **已完成** | 由 G1~G9 九份报告的「对架构图的贡献」汇总：42 个节点、45 条边、4 块图内文字 |
 | 19 | 模块报告 G10 全项目汇总 | `modules/G10-summary.md` | **已完成**：一句话架构 + 模块索引 + 关键数字 + 横切差异总表 + 台账汇总 + 覆盖声明 |
 | 20 | NextStep：Go 标准库逐包映射与缺口计划 | `../NextStep/go-stdlib-map.md` | **已完成**：本地 Go 1.23.0 源码扫描（638 包）+ 7 域映射 + S1~S7 阶段计划 |
@@ -40,6 +40,11 @@
 | 29 | 修复既有 flaky：timer_task_demo 时序断言 | `../example/concurrency/timer_task_demo.cpp` | **已完成（第 13 轮）**：4 处「回调/计数满足后立即单次采样 StateValue」改为分别轮询；全量 ctest 撞到 1 次 → 单独重跑 5/5 通过确认 flaky → 修复后 5/5 通过 |
 | 30 | 本轮提交 | commit `a88290d` | **已完成**：38 文件 / +7235 行；全量构建 0 warning、ctest 73/73（29.23 s） |
 | 31 | 开发：`tools/fmt.hpp`（Go fmt 核心子集） | `../include/go2cpp/tools/fmt.hpp` | **已完成（第 14 轮）**：~612 行；0 诊断 + 全部断言通过；待补测试/示例登记 |
+| 32 | 开发测试：`tests/tools/test_fmt.cpp` | `../tests/tools/test_fmt.cpp` | **已完成（第 15 轮）**：6 场景 + 10 万×2 + 3 组随机属性；已通过 |
+| 33 | 开发示例：`example/tools/fmt_{demo,full}.cpp` | `../example/tools/` | **已完成（第 15 轮）**：3/6 场景；退出码均 0 |
+| 34 | 本轮提交 | commit `c64b2ec` | **已完成**：11 文件 / +1204 行；ctest 75/75（29.63 s） |
+| 35 | 开发：`tools/streams.hpp`（Go io 接口族） | `../include/go2cpp/tools/streams.hpp` | **已完成（第 16 轮）**：664 行；0 诊断 + 全部断言通过；待补测试/示例登记 |
+| 36 | 开发测试：`tests/tools/test_streams.cpp` | `../tests/tools/test_streams.cpp` | **已完成（第 17 轮）**：8 场景 + 大数据量 + 3 组随机；已通过 |
 | 22 | NextStep：第三方库预研（候选/许可证/可移植性） | `../NextStep/third-party-plan.md` | **已完成**：T1~T4 分层候选 + 五项可移植性判据 + 已核验 gin/cobra/gorm 的 LICENSE 原文 |
 | 23 | NextStep：路线图与里程碑 | `../NextStep/roadmap.md` | **已完成**：关键路径 + S1~S7/T1~T4 阶段计划 + M1~M5 里程碑 + 风险缓解 |
 
@@ -70,4 +75,7 @@
 - 上游文档：`docs/HANDOFF.md`、`codex.md`（第 25 轮）、`docs/modules.md`、`docs/design.md`、`docs/dependencies.md`。
 - 已实测纠正项：MId 从 1 开始；nlohmann 3.11.3 的 `parse()` 是迭代实现（会爆栈的是 `dump()`/拷贝）。
 | 17 | 开发：`tools/fmt.hpp`（Go fmt 核心子集） | **已完成（第 14 轮）** | ~612 行 header-only + 转发头；动词 v/d/s/q/t/f/e/g/x/X/b/o/c/T(+Errorf 的 w)；flags -/0/+/空格/#；width·precision 按 rune；容器与 pair 递归、ErrorPtr 按 Message()；对齐 %!verb(...) 三类错误标记；编译 0 诊断、fmt_check failures=0 |
-| 18 | 下一轮 | `fmt` 的测试与示例 + 登记 + 全量验证 | 待办 | tests/tools/test_fmt.cpp（大数据量/随机/≥5 场景）、example/tools/fmt_{demo,full}.cpp、build-quality 全量 + ctest、codex.md 第 27 轮、提交 |
+| 18 | `fmt` 的测试与示例 + 登记 + 全量验证 | **已完成（第 15 轮）** | `tests/tools/test_fmt.cpp`（214 行，6 场景 + 10 万×2 + 3 组随机属性）、`example/tools/fmt_{demo,full}.cpp`（75/140 行）、两处登记；全量构建 0 warning、ctest 75/75（29.63 s）；commit `c64b2ec` |
+| 19 | 开发：`tools/streams.hpp`（Go io 接口族；命名空间为 streams） | **已完成（第 16 轮）** | 664 行 + 转发头；18 个接口 + 5 个错误锚点 + 7 个核心函数 + 6 个适配器 + 2 个内存底座；编译 0 诊断、streams_check failures=0；命名偏差（io 已被调度层占用）已记入 dev-progress |
+| 20 | `streams` 的测试与登记 | **已完成（第 17 轮）** | `tests/tools/test_streams.cpp`（333 行，8 场景 + 1 MiB + 10 万次小块 + 2 万帧短读 + 3 组随机）；0 warning、`GO2CPP_TEST_FILTER=streams` all checks passed |
+| 21 | 下一轮 | `streams` 示例 + 全量验证 + codex.md + 提交 | 待办 | example/tools/streams_{demo,full}.cpp、ctest、codex.md 第 28 轮、提交 |
