@@ -55,8 +55,16 @@ Go2Cpp 当前只有前三块的**解析/传输层**，没有反射与 GC，
 | 19 | `natefinch/lumberjack` | **MIT** | 5,478 | 日志轮转（`io.Writer`） |
 | 20 | `joho/godotenv` | **MIT** | 10,661 | `.env` 解析 |
 | 21 | `robfig/cron` | **MIT** | 14,196 | cron 表达式调度 |
+| 22 | `nats-io/nats.go` | **Apache-2.0** | 6,778 | NATS 客户端（文本协议） |
+| 23 | `prometheus/client_golang` | **Apache-2.0** | 6,042 | 指标暴露 |
+| 24 | `golang-jwt/jwt` | **MIT** | 9,241 | JWT（JSON Web Token） |
+| 25 | `sony/gobreaker` | **MIT** | 3,705 | 熔断器 |
+| 26 | `qax-os/excelize` | **BSD-3-Clause** | 20,994 | Excel 读写 |
+| 27 | `gocolly/colly` | **Apache-2.0** | 25,551 | 爬虫框架 |
+| 28 | `PuerkitoBio/goquery` | **BSD-3-Clause** | 14,988 | jQuery 风格 HTML 解析 |
+| 29 | `disintegration/imaging` | **MIT** | 5,766 | 图像处理 |
 
-（序号 1~14 见上表；**累计一手核验 21 个**，全部为宽松许可。）
+（**累计一手核验 29 个**，全部为宽松许可：MIT / Apache-2.0 / BSD-2 / BSD-3。）
 
 **样本的许可证分布**：MIT 8 / Apache-2.0 3 / BSD-3-Clause 1 / BSD-2-Clause 1 —— **全部为宽松许可**，
 没有一个 GPL/AGPL。这与 Go 生态的整体情况一致：**许可证风险极低，真正的门槛是技术可移植性**。
@@ -295,6 +303,9 @@ Go2Cpp 当前只有前三块的**解析/传输层**，没有反射与 GC，
 | 缓存 / 消息 | `go-redis`、`bigcache` | BSD-2-Clause、Apache-2.0 |
 | 日志 | `zerolog`、`logrus`、`lumberjack` | MIT x3 |
 | 配置 / 工具 | `godotenv`、`decimal`、`uuid`、`x/time`、`cron` | MIT x4 + BSD-3 x1 |
+| 可观测 / 安全 | `prometheus/client_golang`、`golang-jwt/jwt`、`gobreaker` | Apache-2.0 + MIT x2 |
+| 爬虫 / 文档 / 图像 | `colly`、`goquery`、`excelize`、`imaging` | Apache-2.0 + BSD-3 x2 + MIT x1 |
+| 消息 | `nats.go` | Apache-2.0 |
 
 结论：**全部为宽松许可（MIT / Apache-2.0 / BSD-2 / BSD-3），无一传染性许可**。
 但**未核验的库不能默认沿用这个结论**，移植前仍需逐个核验。
@@ -321,11 +332,15 @@ Go2Cpp 当前只有前三块的**解析/传输层**，没有反射与 GC，
 
 | 优先级 | 库 | 要核验的内容 |
 |---:|---|---|
-| 1 | `nats-io/nats.go` | LICENSE（预期 Apache-2.0）+ 协议文档 |
-| 2 | `prometheus/client_golang` | LICENSE（预期 Apache-2.0）+ 是否强依赖 `net/http` |
-| 3 | `golang-jwt/jwt` | LICENSE（预期 MIT）+ 依赖 |
-| 4 | `sony/gobreaker` | LICENSE（预期 MIT）+ 行数 |
-| 5 | `qax-os/excelize` | LICENSE（预期 BSD-3）+ ZIP/XML 依赖面 |
-| 6 | `gocolly/colly` 与 `PuerkitoBio/goquery` | LICENSE + HTML 解析器能否独立移植 |
-| 7 | `disintegration/imaging`、`fogleman/gg` | LICENSE + 是否只依赖标准库 `image` |
-| 8 | `open-telemetry/opentelemetry-go` | LICENSE + 依赖闭包重量 |
+| 1 | `open-telemetry/opentelemetry-go` | LICENSE + 依赖闭包重量 |
+| 2 | `IBM/sarama`（Kafka） | LICENSE + 协议面大小 |
+| 3 | `rabbitmq/amqp091-go` | LICENSE + AMQP 协议文档 |
+| 4 | `hibiken/asynq` | LICENSE + 对 `go-redis` 的依赖形态 |
+| 5 | `fsnotify/fsnotify` | LICENSE（预期 BSD-3）+ inotify 依赖 |
+| 6 | `spf13/viper` | LICENSE（预期 MIT）+ 依赖闭包（含 mapstructure 等反射依赖） |
+| 7 | `uber-go/zap` | LICENSE（预期 MIT）+ `Any` 字段的反射依赖范围 |
+| 8 | `stretchr/testify` | LICENSE（预期 MIT）+ 断言部分的反射依赖范围 |
+
+> 核验方式：本环境 WSL 内无网络（`curl` 无输出），改用 `web_fetch` 访问
+> `https://api.github.com/repos/{owner}/{repo}`（返回 SPDX + star + default_branch）；
+> 遇 `NOASSERTION` 时再请求 `/license` 端点取原文。
