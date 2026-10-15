@@ -68,6 +68,8 @@ cmake --build build --target go2cpp_runtime_demo
 | `fmt_full` | 六场景：日志/取数/错误链/表格对齐/指标/结构化+10 万次 | 10 万次格式化（打印耗时） | `%v` 浮点最短表示、`%!d(string=abc)` 标记、容器与 pair 递归、`% X` 逐字节 hex |
 | `streams_demo` | 1 MiB 复制与校验、定长帧解析、配置头部限流读取 | 1 MiB 数据复制 | `ReadFull` 的不完整尾帧（`ErrUnexpectedEOF`）与空源（`EOF`）之分、`LimitReader` 不吞掉后续数据 |
 | `streams_full` | 六场景：复制/帧/限流/多段拼接/边读边算/多路输出+规模 | 1 MiB 复制（打印耗时） | `MultiReader` 段间清 `EOF`（逐字节跨段）、`TeeReader` 落盘一致、`MultiWriter` 三路一致、`Discard` 旁路 |
+| `time_demo` | 超时预算、重试退避序列、耗时统计 | — | `Until` 的正负号语义、`Duration` 的指数退避与封顶、`Since` 的单调性 |
+| `time_full` | 六场景：截止/退避/窗口/时间戳/节拍/格式化对照+10 万次 | 10 万次 Duration 格式化（打印耗时） | `Duration.String` 的 15 条对照（ns/µs/ms/s/m/h 与负数）、零 Time 与 Unix 0 的区别、1000 拍零漂移 |
 
 一次构建后可以批量运行全部示例（每个命令都有 20 秒看门狗）：
 

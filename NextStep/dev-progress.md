@@ -411,3 +411,58 @@ g++ -std=c++17 -Wall -Wextra -Wpedantic -I include /tmp/time_check.cpp -o /tmp/t
 | 示例 | `example/tools/time_{demo,full}.cpp` + `GO2CPP_EXAMPLES` 与 `example/README.md` 登记 |
 | 收尾 | 全量构建 0 warning + `ctest` + `codex.md` 第 29 轮 + 提交 |
 | 未实现的 `time` 成员 | `After`/`Tick`/`Ticker`/`Timer`（需与 `Channel<Time>` 和 `core::TimerService` 对接）、`Format`/`Parse`（布局串小语言）、`LoadLocation`、`Duration.Parse` —— 已在头文件末尾列成表 |
+
+---
+
+## 第 20 轮（2026-10-15 19:5x）：`time` 的正式测试与示例（模块闭环）
+
+### 交付
+
+| 文件 | 行数 | 内容 |
+|---|---:|---|
+| `tests/tools/test_time.cpp` | 282 | **6 个真实场景**（超时预算、重试退避、指标窗口、日志时间戳、周期节拍零漂移、耗时统计）+ **大数据量**（10 万次格式化、10 万次纳秒换算往返）+ **3 组随机性质测试** |
+| `example/tools/time_demo.cpp` | 81 | 简单版 3 场景 |
+| `example/tools/time_full.cpp` | 169 | 全面版 6 场景（含 `Duration.String` 的 **15 条对照表**） |
+| `tests/test_main.cpp`、`cmake/Go2CppTests.cmake`、`example/README.md` | — | 三处登记（测试模块 + 示例） |
+
+随机测试的三组性质：
+① 随机纳秒 → `String()` 与**独立参考实现**对拍（10 万轮）；
+② 随机 `Add`/`Sub` 往返（10 万轮，含 `Add(-d)` 抵消）；
+③ 随机比较的**三分律** + `Truncate` 是单位整数倍且不超过原值 + `Round`-`Truncate` 差值不超过一个单位（10 万轮）。
+
+### 验证（实测）
+
+```sh
+GO2CPP_TEST_FILTER=time ./build-quality/go2cpp_tests     # → all checks passed
+./build-quality/go2cpp_time_demo / go2cpp_time_full      # rc=0，输出逐条与注释预期一致
+cmake --build build-quality --parallel                   # 0 warning / 0 error
+ctest --test-dir build-quality                           # 79/79 通过（30.52 s）
+```
+
+### 本轮修掉的问题（都在测试代码里；实现经 10 万轮对拍证明无误）
+
+1. `Minute / 2` 的期望写成 `"30m0s"` —— 它其实是 **30 秒**（`"30s"`）；
+2. 单位换算断言多除了一次：应为 `FromNanoseconds(nanos).Microseconds()` 而不是 `FromNanoseconds(nanos/1000).Microseconds()`；
+3. `Round`-`Truncate` 差值性质对**负数**不成立（差为负），应判断绝对值 ≤ 一个单位。
+
+> 定位方式：先写独立诊断程序，用**同一随机种子**对拍 `Duration.String()` 与参考实现 ——
+> 得到「0 差异」，从而把怀疑方向从实现转到测试，避免了盲改实现。
+
+### 当前开发进度总览（目标③）
+
+| 模块 | 源码 | 测试 | 示例 | 提交 |
+|---|---:|---:|---:|---|
+| `strings` | 654 | 245 | 228 | `a88290d` |
+| `strconv` | 550 | 244 | 243 | `a88290d` |
+| `fmt` | 619 | 214 | 215 | `c64b2ec` |
+| `streams` | 664 | 333 | 282 | `c2fe880` |
+| `time` | 414 | 282 | 250 | 本轮提交 |
+| **合计** | **2901** | **1318** | **1218** | 5 次提交 |
+
+### 待办（后续轮次）
+
+| 项 | 说明 |
+|---|---|
+| `time` 的剩余成员 | `After`/`Tick`/`Ticker`/`Timer`（需与 `Channel<Time>` + `core::TimerService` 对接）、`Format`/`Parse`、`Duration.Parse` |
+| S1/S2 其余标准库 | `bytes`、`sort`、`path/filepath`、`os`、`bufio`、`slices`/`maps`/`cmp` |
+| S5 决策 | `encoding/json` 的结构体编解码策略（代码生成 vs 显式绑定）—— 它是 T4 生态的前置条件 |

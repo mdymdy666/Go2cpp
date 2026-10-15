@@ -48,6 +48,9 @@
 | 37 | 开发示例：`example/tools/streams_{demo,full}.cpp` | `../example/tools/` | **已完成（第 18 轮）**：3/6 场景；退出码均 0 |
 | 38 | 本轮提交 | commit `c2fe880` | **已完成**：11 文件 / +1497 行；ctest 77/77（29.67 s） |
 | 39 | 开发：`tools/time.hpp`（Go time 核心） | `../include/go2cpp/tools/time.hpp` | **已完成（第 19 轮）**：~410 行；0 warning + 全部断言通过；待补测试/示例登记 |
+| 40 | 开发测试：`tests/tools/test_time.cpp` | `../tests/tools/test_time.cpp` | **已完成（第 20 轮）**：6 场景 + 10 万×2 + 3 组随机性质；已通过 |
+| 41 | 开发示例：`example/tools/time_{demo,full}.cpp` | `../example/tools/` | **已完成（第 20 轮）**：3/6 场景；退出码均 0 |
+| 42 | 必须项②缺口修复：第三方库逐库计划产出时间 | `../NextStep/third-party-plan.md` §3.5 + `roadmap.md` T 表 | **已完成**：18 行逐库表（时间 + 前置 + 验收物）；commit `f3f965f` |
 | 22 | NextStep：第三方库预研（候选/许可证/可移植性） | `../NextStep/third-party-plan.md` | **已完成**：T1~T4 分层候选 + 五项可移植性判据 + 已核验 gin/cobra/gorm 的 LICENSE 原文 |
 | 23 | NextStep：路线图与里程碑 | `../NextStep/roadmap.md` | **已完成**：关键路径 + S1~S7/T1~T4 阶段计划 + M1~M5 里程碑 + 风险缓解 |
 
@@ -83,4 +86,5 @@
 | 20 | `streams` 的测试与登记 | **已完成（第 17 轮）** | `tests/tools/test_streams.cpp`（333 行，8 场景 + 1 MiB + 10 万次小块 + 2 万帧短读 + 3 组随机）；0 warning、`GO2CPP_TEST_FILTER=streams` all checks passed |
 | 21 | `streams` 示例 + 全量验证 + codex.md + 提交 | **已完成（第 18 轮）** | `example/tools/streams_{demo,full}.cpp`（103/179 行，3/6 场景）；全量构建 0 warning、ctest 77/77（29.67 s）；`codex.md` 第 28 轮；commit `c2fe880`（11 文件 / +1497） |
 | 22 | 开发：`tools/time.hpp`（Go time 核心子集） | **已完成（第 19 轮）** | ~410 行 + 转发头；Duration（int64 纳秒 + Go 格式 String + 单位换算 + Truncate/Round/Abs + 运算符，含 int*Duration）、Time（墙钟+单调读数、Add/Sub/Unix*/比较/IsZero/String）、Since/Until/Sleep（走 Hook 拦截的 nanosleep → 协作式）；编译 0 warning、time_check failures=0 |
-| 23 | 下一轮 | `time` 的测试与示例 + 登记 + 全量验证 | 待办 | tests/tools/test_time.cpp（10 万次格式化 + 随机纳秒往返 + ≥5 场景）、example/tools/time_{demo,full}.cpp、ctest、codex.md 第 29 轮、提交 |
+| 23 | `time` 的测试与示例 + 登记 + 全量验证 | **已完成（第 20 轮）** | `tests/tools/test_time.cpp`（282 行，6 场景 + 10 万×2 + 3 组随机）、`example/tools/time_{demo,full}.cpp`（81/169 行）、三处登记；全量构建 0 warning、ctest 79/79（30.52 s） |
+| 24 | 下一轮 | 继续 S1/S2：`tools/sort.hpp` + `tools/bytes.hpp` | 待办 | Go sort 的排序接口（Slice/Stable/IsSorted/Search）+ bytes 的 Buffer/Compare/Contains/Trim 家族；两者都是纯函数，投产比高，可一轮做完实现+验证 |

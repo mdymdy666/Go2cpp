@@ -13,6 +13,80 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-15：新增 `tools/time`（Go `time` 核心子集）+ 补齐第三方库逐库计划产出时间（第 29 轮）
+
+### 交付清单
+
+| 文件 | 行数 | 说明 |
+|---|---:|---|
+| `include/go2cpp/tools/time.hpp` | **~414** | `Duration` + `Time` + `Since`/`Until`/`Sleep` |
+| `include/go2cpp/time.hpp` | 5 | 根路径转发头（部署前确认该路径未被占用） |
+| `tests/tools/test_time.cpp` | 282 | 6 个真实场景 + 10 万次×2 大数据量 + 3 组随机属性测试 |
+| `example/tools/time_demo.cpp` | 81 | 简单版 3 场景 |
+| `example/tools/time_full.cpp` | 169 | 全面版 6 场景 |
+| `NextStep/third-party-plan.md` | +36 | **新增 §3.5「计划产出时间（逐库/逐层）」**（必须项缺口修复） |
+| `NextStep/roadmap.md` | +12/-7 | T 阶段表补「计划产出时间」列 |
+| `tests/test_main.cpp`、`cmake/Go2CppTests.cmake`、`example/README.md` | — | 三处登记 |
+
+### 复用优先：这一轮复用的是**运行时能力**，不是第三方库
+
+`time.Sleep` 在 Go 里挂起的是 **goroutine 而不是线程**。调研后发现项目**已经具备**该能力：
+`src/network/hook.cpp` 已拦截 `sleep`/`usleep`/`nanosleep`，其中的 `cooperative_sleep_for`
+（临时 `eventfd` + `manager->WaitFor`）会把睡眠变成**协作式等待**。因此 `time::Sleep` 直接调用
+`::nanosleep` 就得到正确语义 —— **不需要新造任何调度机制**。
+
+其余取舍：C++ 的 `std::chrono` 与 Go `time` 语义不匹配（`Duration` 是强类型且带特定 `String()` 格式、
+`Time` 带单调读数），故自研；语义对照 `go/src/time/`（Go 1.23.0，BSD-3-Clause），独立实现，
+`Duration.String()` 的算法逐分支对照了上游 `time.go` 的 `Duration.format`。
+
+### 对齐的非显然语义
+
+- `Duration.String()`：`< 1s` 时按 ns/µs/ms 选单位与精度（`prec = 0/3/6`），`0 → "0s"`；
+  否则秒带最多 9 位小数、**去尾随零**，再按需补 `m`/`h`；微秒符号用 **U+00B5 `µ`（两字节 UTF-8）**；
+- `Time.Sub()` **优先用单调读数**，`Equal()` **只用墙钟**（与 Go 一致）；
+- **零 `Time` 是「1 年 1 月 1 日」而不是 Unix 0**；
+- `Sleep` 对**非正时长立即返回**；
+- 补了**非成员** `int * Duration`，因为 Go 里 `2 * time.Second` 是常见写法。
+
+### 验证（实测）
+
+```sh
+GO2CPP_TEST_FILTER=time ./build-quality/go2cpp_tests      # → all checks passed（6 场景 + 10 万×2 + 3 组随机）
+./build-quality/go2cpp_time_demo / go2cpp_time_full       # rc=0，输出逐条与注释预期一致
+```
+
+随机测试的三组性质：随机纳秒 → `String()` 与**独立参考实现**对拍（10 万轮，0 差异）、
+随机 `Add`/`Sub` 往返（10 万轮）、随机比较三分律与 `Truncate`/`Round` 的边界性质（10 万轮）。
+
+### 本轮修掉的问题
+
+| # | 问题 | 位置 | 处置 |
+|---:|---|---|---|
+| 1 | 缺 `int * Duration` 重载（`2 * time.Second` 无法编译） | 实现 | 补非成员 `operator*` |
+| 2 | **真 bug**：`Duration.String()` 的 `< 1s` 分支漏了「小数之后补整数部分」（Go 是 `fmtFrac` 后还要 `fmtInt`）→ `1ns`/`1µs`/`1.5ms` 全输出空串 | 实现 | 补 `AppendInteger` |
+| 3 | **语义 bug**：`IsZero()` 用 `time_point{}`（Unix 0）当零值，而 Go 的零值是「1 年 1 月」 | 实现 | 改为显式零标记 `m_is_zero` |
+| 4 | 编译命令用 `set -e`，编译失败时诊断被吞、只剩空输出 | 流程 | 改为显式打印 `compile_rc`/`warn`/`error` 计数与诊断头部 |
+| 5 | `Minute / 2` 期望写成 `"30m0s"`（实为 30 **秒**） | 测试 | 修正期望为 `"30s"` |
+| 6 | 单位换算断言多除了一次（`FromNanoseconds(nanos/1000).Microseconds()`） | 测试 | 改为 `FromNanoseconds(nanos).Microseconds()` |
+| 7 | `Round`-`Truncate` 差值性质对负数不成立（差为负） | 测试 | 改为判断绝对值 ≤ 单位 |
+
+> 5~7 都在**测试代码**里，实现经独立参考实现 10 万轮对拍证明无误（诊断程序 0 差异）。
+
+### 同时补齐的必须项缺口
+
+`NextStep/third-party-plan.md` 原先只有「依赖顺序」列、**没有时间列**，与「每个模块的计划产出时间」要求不符。
+现已新增 **§3.5（18 行表）**：逐库给出计划产出时间（第 4 周起）、前置依赖与**验收物**
+（源码 + 测试 + 示例 + `docs/dependencies.md` 登记），时间轴与 `roadmap.md` 的 S1~S7 共用同一套「第 N 周」；
+`roadmap.md` 的 T 阶段表也补了「计划产出时间」列（T1 第 4–5 周 / T2 第 6–7 周 / T3 第 8–9 周 / T4 第 9 周起）。
+
+### 未覆盖 / 后续
+
+- `After`/`Tick`/`Ticker`/`Timer`（需与 `Channel<Time>` 和 `core::TimerService` 对接）、
+  `Format`/`Parse`（布局串是一套独立小语言）、`LoadLocation`、`Duration.Parse` —— 已在头文件末尾列成待办表；
+- `Sleep` 在**未启用 Hook / 纯线程上下文**中会退化为真实线程睡眠（Go 不会），已写入文件头边界；
+- `Time.String()` 采用简化形式（`YYYY-MM-DD HH:MM:SS[.fffffffff] +0000`），不含时区名与 RFC3339 家族；
+- 性能未测：示例打印的耗时来自 Debug 构建、仅供参考。
+
 ## 2026-10-15：新增 `tools/streams`（Go `io` 接口族，第 28 轮）
 
 ### 交付清单
