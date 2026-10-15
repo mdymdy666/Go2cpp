@@ -55,6 +55,7 @@
 | 44 | 开发：`tools/bytes.hpp`（Go bytes 对应） | `../include/go2cpp/tools/bytes.hpp` | **已完成（第 21 轮）**：532 行；0 warning + 全部断言通过（含 Buffer 全方法与 Reader 定位）；待补测试/示例登记 |
 | 45 | 按反馈做减法：删除 C++ 标准库已有的重复实现 | `../NextStep/go-stdlib-map.md` §4.4 + `roadmap.md` + 两个头文件 | **已完成（第 22 轮）**：计划移除 slices/maps/cmp/math-bits/container/path* 等 12 项（给出 C++ 替代写法）；`bytes.hpp` 532→269 行（只留 Buffer）、`sort.hpp` 删 6 个纯转发（只留 Float64LessNaN）；两个验证程序复验 0 warning / failures=0 |
 | 46 | 按澄清恢复 + 确立「薄封装」原则 | `../NextStep/go-stdlib-map.md` §4.4 + `roadmap.md` + 两个头文件 | **已完成（第 23 轮）**：恢复 `bytes.hpp`（532 行，函数家族 + Reader）与 `sort.hpp` 的六个便捷函数；§4.4 重写为「不重写算法 + 薄封装 + 差别核对」三条原则并附 7 项差别对照表；S3 恢复 8 个模块（薄封装）、S6 恢复 `container/*`；两个验证程序复验 0 warning / failures=0 |
+| 47 | 第三方库调查报告（15 领域 / 100+ 库） | `../NextStep/third-party-survey.md` | **已完成（第 24 轮）**：约 400 行；14 个库的许可证与 star 经 GitHub API 一手核验（全为 MIT/Apache-2.0/BSD 系）；四类处置建议（可早推进 16 / 需底座 6 / 不建议 13 / 自研优先 4）+ 下一步核验清单 |
 | 22 | NextStep：第三方库预研（候选/许可证/可移植性） | `../NextStep/third-party-plan.md` | **已完成**：T1~T4 分层候选 + 五项可移植性判据 + 已核验 gin/cobra/gorm 的 LICENSE 原文 |
 | 23 | NextStep：路线图与里程碑 | `../NextStep/roadmap.md` | **已完成**：关键路径 + S1~S7/T1~T4 阶段计划 + M1~M5 里程碑 + 风险缓解 |
 
