@@ -107,12 +107,12 @@ DoD：用 Go2Cpp 写一个**真实小服务**（路由 + JSON API + 优雅关闭
 
 > 详细取舍见 `third-party-plan.md`。这里只给**依赖顺序**。
 
-| 阶段 | 前置 | 第三方目标 | 说明 |
-|---|---|---|---|
-| **T1** | S1+S2+S4 | 工具类：`google/uuid`、`shopspring/decimal`、`yaml.v3`、`pflag`、`toml` | 无 Web 依赖、纯算法/解析，**最容易移植** |
-| **T2** | T1+S5 | 配置与日志：`viper`、`zap`、`zerolog` | 依赖 `encoding/json`/`yaml`/`reflect`；`zap` 需要 `sync/atomic` 与结构化字段 |
-| **T3** | S6 | CLI 与服务：`cobra`、`urfave/cli`、`grpc-go`（评估） | `cobra` 依赖 `pflag`；`grpc` 依赖 HTTP/2（Go2Cpp 无）→ **暂不移植** |
-| **T4** | T2+S6 | Web 与数据：`gin`/`chi`/`echo`、`gorm`/`sqlx`、`go-redis` | `gin` 依赖 `net/http`+`reflect`+`validator`；ORM 依赖 `database/sql`+反射 → **需先有 S5 的策略决策** |
+| 阶段 | 计划产出时间 | 前置 | 第三方目标 | 说明 |
+|---|---|---|---|---|
+| **T1** | **第 4–5 周** | S1+S2+S4 | 工具类：`google/uuid`、`shopspring/decimal`、`yaml.v3`、`pflag`、`toml` | 无 Web 依赖、纯算法/解析，**最容易移植**；逐库时间见 `third-party-plan.md` §3.5 |
+| **T2** | **第 6–7 周** | T1+S5 | 配置与日志：`viper`（改为自研薄层）、`zap`、`zerolog` | 依赖 `encoding/json`/`yaml`/`reflect`；`zap` 需要 `sync/atomic` 与结构化字段 |
+| **T3** | **第 8–9 周** | S6 | CLI 与服务：`cobra`、`urfave/cli`、`grpc-go`（评估） | `cobra` 依赖 `pflag`；`grpc` 依赖 HTTP/2（Go2Cpp 无）→ **暂不移植** |
+| **T4** | **第 9 周起** | T2+S6+S5 决策 | Web 与数据：`chi`/`gin`/`echo`、`go-redis`、`nats.go`、`prometheus` | `gin` 依赖 `net/http`+`reflect`+`validator`；ORM 依赖 `database/sql`+反射 → **需先有 S5 的策略决策** |
 
 **结论**：第三方库的移植**不可能早于标准库底座**，且 Web/ORM 类还额外要求 `reflect` 替代方案
 （本项目用代码生成/显式绑定，见 `go-stdlib-map.md` §4.3）。

@@ -45,6 +45,9 @@
 | 34 | 本轮提交 | commit `c64b2ec` | **已完成**：11 文件 / +1204 行；ctest 75/75（29.63 s） |
 | 35 | 开发：`tools/streams.hpp`（Go io 接口族） | `../include/go2cpp/tools/streams.hpp` | **已完成（第 16 轮）**：664 行；0 诊断 + 全部断言通过；待补测试/示例登记 |
 | 36 | 开发测试：`tests/tools/test_streams.cpp` | `../tests/tools/test_streams.cpp` | **已完成（第 17 轮）**：8 场景 + 大数据量 + 3 组随机；已通过 |
+| 37 | 开发示例：`example/tools/streams_{demo,full}.cpp` | `../example/tools/` | **已完成（第 18 轮）**：3/6 场景；退出码均 0 |
+| 38 | 本轮提交 | commit `c2fe880` | **已完成**：11 文件 / +1497 行；ctest 77/77（29.67 s） |
+| 39 | 开发：`tools/time.hpp`（Go time 核心） | `../include/go2cpp/tools/time.hpp` | **已完成（第 19 轮）**：~410 行；0 warning + 全部断言通过；待补测试/示例登记 |
 | 22 | NextStep：第三方库预研（候选/许可证/可移植性） | `../NextStep/third-party-plan.md` | **已完成**：T1~T4 分层候选 + 五项可移植性判据 + 已核验 gin/cobra/gorm 的 LICENSE 原文 |
 | 23 | NextStep：路线图与里程碑 | `../NextStep/roadmap.md` | **已完成**：关键路径 + S1~S7/T1~T4 阶段计划 + M1~M5 里程碑 + 风险缓解 |
 
@@ -78,4 +81,6 @@
 | 18 | `fmt` 的测试与示例 + 登记 + 全量验证 | **已完成（第 15 轮）** | `tests/tools/test_fmt.cpp`（214 行，6 场景 + 10 万×2 + 3 组随机属性）、`example/tools/fmt_{demo,full}.cpp`（75/140 行）、两处登记；全量构建 0 warning、ctest 75/75（29.63 s）；commit `c64b2ec` |
 | 19 | 开发：`tools/streams.hpp`（Go io 接口族；命名空间为 streams） | **已完成（第 16 轮）** | 664 行 + 转发头；18 个接口 + 5 个错误锚点 + 7 个核心函数 + 6 个适配器 + 2 个内存底座；编译 0 诊断、streams_check failures=0；命名偏差（io 已被调度层占用）已记入 dev-progress |
 | 20 | `streams` 的测试与登记 | **已完成（第 17 轮）** | `tests/tools/test_streams.cpp`（333 行，8 场景 + 1 MiB + 10 万次小块 + 2 万帧短读 + 3 组随机）；0 warning、`GO2CPP_TEST_FILTER=streams` all checks passed |
-| 21 | 下一轮 | `streams` 示例 + 全量验证 + codex.md + 提交 | 待办 | example/tools/streams_{demo,full}.cpp、ctest、codex.md 第 28 轮、提交 |
+| 21 | `streams` 示例 + 全量验证 + codex.md + 提交 | **已完成（第 18 轮）** | `example/tools/streams_{demo,full}.cpp`（103/179 行，3/6 场景）；全量构建 0 warning、ctest 77/77（29.67 s）；`codex.md` 第 28 轮；commit `c2fe880`（11 文件 / +1497） |
+| 22 | 开发：`tools/time.hpp`（Go time 核心子集） | **已完成（第 19 轮）** | ~410 行 + 转发头；Duration（int64 纳秒 + Go 格式 String + 单位换算 + Truncate/Round/Abs + 运算符，含 int*Duration）、Time（墙钟+单调读数、Add/Sub/Unix*/比较/IsZero/String）、Since/Until/Sleep（走 Hook 拦截的 nanosleep → 协作式）；编译 0 warning、time_check failures=0 |
+| 23 | 下一轮 | `time` 的测试与示例 + 登记 + 全量验证 | 待办 | tests/tools/test_time.cpp（10 万次格式化 + 随机纳秒往返 + ≥5 场景）、example/tools/time_{demo,full}.cpp、ctest、codex.md 第 29 轮、提交 |

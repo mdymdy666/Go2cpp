@@ -89,6 +89,42 @@
 
 ---
 
+
+---
+
+### 3.5 计划产出时间（逐库 / 逐层）
+
+> 时间轴与 `roadmap.md` §2 的 S1~S7 **共用同一套「第 N 周」**，因此两侧可直接对照。
+> 「产出物」一列是**验收物**：按项目规范，每个移植件都必须同时落到源码、测试、示例与登记处。
+
+| 计划产出时间 | 层 | 目标（库/子集） | 前置 | 产出物（验收） |
+|---|---|---|---|---|
+| **第 4 周** | T1 | `spf13/pflag`（GNU 风格参数解析） | S1（`strings`/`strconv`，已完成）+ S6 的 `flag` 骨架 | `tools/pflag.hpp` + 测试 + `example/tools/pflag_{demo,full}.cpp` + `docs/dependencies.md` 记录（来源/commit/许可证） |
+| **第 4 周** | T1 | `google/uuid`（生成/解析/变体判定） | S1 + S2 的 `crypto/rand` 替代（`getrandom`） | `tools/uuid.hpp` + 随机与大数据量测试（≥10 万次生成/解析往返） |
+| **第 4–5 周** | T1 | `shopspring/decimal`（定点十进制） | S1（`strconv`）+ `math/big` 的最小子集或 `__int128` | `tools/decimal.hpp` + 边界测试（进位/舍入/超长小数）+ 金融场景示例 |
+| **第 5 周** | T1 | `BurntSushi/toml` 或 `pelletier/go-toml`（解析子集） | S1 + S3 | `tools/toml.hpp`（**只做解析**，映射到结构体走 S5 策略） |
+| **第 5 周** | T1 | `gopkg.in/yaml.v3`（**只移植解析器**） | S1 + S3 | `tools/yaml.hpp` + 与 libyaml 的对拍测试（若引入，按 nlohmann 先例登记） |
+| **第 6 周** | T2 | `rs/zerolog` 风格链式日志（适配到现有 `log` 模块） | T1 + S5 | 现有 `log` 模块的 sink 适配层 + 示例（**不新增依赖**） |
+| **第 6–7 周** | T2 | `uber-go/zap` 核心（`Logger`/`Field`/`SugaredLogger`） | T1 + S5 + S4（`sync/atomic`） | `tools/zap.hpp`（`Any` 走显式绑定，不做反射）+ 结构化字段测试 |
+| **第 7 周** | T2 | `spf13/viper` → **改为自研薄层** | 现有 `config` 模块 | 多格式读取 + 优先级合并的薄层（复用 `config` 的两阶段事务，不移植 viper） |
+| **第 8 周** | T3 | `spf13/cobra`（命令树） | T1 的 `pflag` + S6 的 `flag` | `tools/cobra.hpp` + 子命令/补全示例；或按 `urfave/cli` 的更小形态实现 |
+| **第 8–9 周** | T3 | `urfave/cli`（备选，比 cobra 更小） | 同上 | 二选一落地，另一个只留评估记录 |
+| **第 9 周** | T4 | `go-chi/chi`（**无反射路由**，T4 首发） | S6（`net/http` 生态）+ S5 | `net/http` 风格 `ServeMux` 增强 + 中间件链 + 真实小服务示例 |
+| **第 9 周** | T4 | `go-redis/redis`（RESP2/3 协议子集） | S6 + `streams`（已完成）+ `Channel` | `net/redis.hpp` + 连接池（接 `sync`/`Channel`）+ 集群外场景测试 |
+| **第 9–10 周** | T4 | `gin-gonic/gin`（路由 + Context；`binding` 走显式绑定） | 同 chi，且必须先有 S5 的绑定策略 | 路由树（radix）+ Context + 显式绑定（**不用 validator 反射**）+ JSON API 示例 |
+| **第 10 周起（按需）** | T4 | `nats-io/nats.go`（文本协议） | S6 + `streams` | 协议编解码 + 订阅/发布示例（**协议最简单，适合作为消息方向首个目标**） |
+| **第 10 周起（按需）** | T4 | `prometheus/client_golang`（指标模型） | S6 | 指标注册/导出 + 与 `net/http` 的 `/metrics` 端点示例 |
+| **第 10 周起（按需）** | T4 | `IBM/sarama`（Kafka 协议） | S6 + `streams` | 协议子集（按业务需要裁剪） |
+| **不做（当前）** | T4 | `gorm.io/gorm`、`jmoiron/sqlx` | 需要 `reflect` + `database/sql` | 已在 §4 说明根因；除非先交付「反射替代 + `database/sql` 抽象」 |
+| **不做（当前）** | T3 | `grpc-go`、`google.golang.org/protobuf` | 需要 HTTP/2 与 protoc 插件 | 已在 §4 说明；若要做，先走「代码生成路线」 |
+| **不重复造** | — | `gorilla/websocket` | 已有自研 `net::WebSocket`（RFC 6455） | 只按 RFC 补齐边界，不引入该库 |
+
+**排期原则**：
+
+1. **T1 不早于第 4 周** —— 它依赖 S1~S2 的基础工具与 IO，提前做会反复返工（见 §4 的根因分析）；
+2. **T4 的启动条件是 S5 的绑定策略落地**（代码生成 or 显式绑定），而不是「有空就做」；
+3. 每层的第一个目标都选**依赖面最小**的那个（T1→`pflag`/`uuid`，T3→`cobra`，T4→`chi`/`go-redis`），
+   先用它打通「源码+测试+示例+登记」的完整流程，再铺开同层其它库。
 ## 4. 为什么 Web 框架 / ORM 现在不能移植（根因）
 
 ```text

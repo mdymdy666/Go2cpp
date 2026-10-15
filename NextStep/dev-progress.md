@@ -337,3 +337,77 @@ GO2CPP_TEST_FILTER=streams ./build-quality/go2cpp_tests   # → all checks passe
 |---|---|
 | 示例 | `example/tools/streams_{demo,full}.cpp`（3 / 6 场景）+ `GO2CPP_EXAMPLES` 与 `example/README.md` 登记 |
 | 收尾 | `build-quality` 全量 0 warning + `ctest` 全绿 + `codex.md` 第 28 轮 + 按明确路径提交 |
+
+---
+
+## 第 19 轮（2026-10-15 19:3x）：`tools/time.hpp`（Go `time` 核心子集）
+
+### 复用优先的结论
+
+C++ 有 `std::chrono`，但与 Go 的 `time` **语义不匹配**，因此自研：
+
+| 差异点 | Go | `std::chrono` |
+|---|---|---|
+| 时长类型 | `Duration` 是**强类型 int64 纳秒**，带 `String()` 的特定格式（`1h2m3.5s` / `1.5ms` / `300ns`） | 模板化的 `duration<Rep, Period>`，无统一字符串格式 |
+| 时间点 | `Time` 带**单调时钟**读数，`Sub` 优先用单调读数 | `system_clock` 与 `steady_clock` 是两个不同的类型，需自己组合 |
+| 睡眠语义 | `Sleep` 挂起 **goroutine** | —— |
+
+但本模块**复用了项目已有的两处能力**：
+① 时钟用 `std::chrono`（`system_clock` 取墙钟 + `steady_clock` 取单调读数）；
+② **`Sleep` 直接调用 `::nanosleep`** —— 项目的 Hook 已拦截 `sleep`/`usleep`/`nanosleep`
+（`src/network/hook.cpp` 的 `cooperative_sleep_for`：临时 `eventfd` + `manager->WaitFor`），
+在 Fiber 上下文中会变成**协作式等待**，M 会被让给其他可运行的 G。这正是 Go「挂起当前 goroutine」的语义，
+**不需要新造调度机制**。
+
+语义对照来源：`third_party/go1.23.0.src.tar.gz` 的 `go/src/time/`（Go 1.23.0，BSD-3-Clause），**独立实现**；
+`Duration.String()` 的算法逐分支对照了上游 `time.go` 的 `Duration.format`。
+
+### 实现
+
+| 文件 | 行数 | 说明 |
+|---|---:|---|
+| `include/go2cpp/tools/time.hpp` | ~410 | `Duration` + `Time` + `Since`/`Until`/`Sleep` |
+| `include/go2cpp/time.hpp` | 6 | 根路径转发头（部署前确认该路径未被占用） |
+
+- **`Duration`**：`int64` 纳秒；`Nanoseconds/Microseconds/Milliseconds/Seconds/Minutes/Hours`、
+  `Abs/Truncate/Round`、`String()`、全套运算符（含**非成员** `int * Duration`，支持 Go 的 `2 * time.Second` 写法）；
+  单位常量 `Nanosecond`~`Hour`。
+- **`Time`**：`Now()`（同时取墙钟与单调读数）、`FromUnix()`、`Unix/UnixMilli/UnixMicro/UnixNano`、
+  `Add/Sub/Before/After/Equal/IsZero`、`String()`、`ToSystemClock()`。
+- **`Since`/`Until`/`Sleep`**：`Sleep` 对非正时长立即返回（Go 语义）。
+
+### 对齐的非显然语义
+
+- `Duration.String()`：`< 1s` 时按 ns/µs/ms 选单位与精度（`prec = 0/3/6`），`0 → "0s"`；
+  否则秒带最多 9 位小数、**去掉尾随零**，再按需补 `m`/`h`（`1h1m1.5s`、`1m0s`、`1m30s`）；
+  微秒符号用 **U+00B5 `µ`（两字节 UTF-8）**；
+- `Time.Sub()` **优先用单调读数**（两端都有时），否则回落墙钟；`Equal()` **只用墙钟**（与 Go 一致）；
+- **零 `Time` 是「1 年 1 月 1 日」而不是 Unix 0** —— `Time::FromUnix(0).IsZero()` 必须为 false。
+
+### 验证（实测）
+
+```sh
+g++ -std=c++17 -Wall -Wextra -Wpedantic -I include /tmp/time_check.cpp -o /tmp/time_check
+# → 0 warning / 0 error；time.hpp check: failures=0（约 50 条断言）
+```
+
+其中 `Duration.String()` 有 **18 条逐条对照**：`0s`/`1ns`/`999ns`/`1µs`/`1.5µs`/`1ms`/`1.5ms`/`1s`/`1.5s`/
+`1.0000005s`/`1m0s`/`1m30s`/`1h0m0s`/`1h1m1.5s`/`-1.5s`/`-1ns`/`2m0s`。
+
+### 本轮修掉的问题
+
+| # | 问题 | 处置 |
+|---:|---|---|
+| 1 | 缺 `int * Duration` 重载（Go 里 `2 * time.Second` 是常见写法） | 补非成员 `operator*` |
+| 2 | **真 bug**：`Duration.String()` 的 `< 1s` 分支漏了「小数之后补整数部分」（Go 是 `fmtFrac` 之后还要 `fmtInt`）→ `1ns`/`1µs`/`1.5ms` 全部输出成空串 | 补 `AppendInteger` |
+| 3 | **语义 bug**：`IsZero()` 用 `SystemClock::time_point{}`（即 Unix 0）当零值，而 Go 的零 Time 是「1 年 1 月 1 日」→ `FromUnix(0).IsZero()` 误判为 true | 改为显式零标记 `m_is_zero` |
+| 4 | 编译命令用了 `set -e`，编译失败时诊断被吞掉、只剩空输出 | 改为显式打印 `compile_rc`/`warn`/`error` 计数与诊断头部 |
+
+### 待办（下一轮）
+
+| 项 | 说明 |
+|---|---|
+| 正式测试 | `tests/tools/test_time.cpp`：大数据量（10 万次 `Duration` 格式化与纳秒往返）+ 随机（随机纳秒 → `String()` → 语义校验、随机 `Add`/`Sub` 往返）+ ≥5 场景（超时预算、重试退避、指标窗口、日志时间戳、周期任务节拍） |
+| 示例 | `example/tools/time_{demo,full}.cpp` + `GO2CPP_EXAMPLES` 与 `example/README.md` 登记 |
+| 收尾 | 全量构建 0 warning + `ctest` + `codex.md` 第 29 轮 + 提交 |
+| 未实现的 `time` 成员 | `After`/`Tick`/`Ticker`/`Timer`（需与 `Channel<Time>` 和 `core::TimerService` 对接）、`Format`/`Parse`（布局串小语言）、`LoadLocation`、`Duration.Parse` —— 已在头文件末尾列成表 |
