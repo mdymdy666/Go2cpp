@@ -818,3 +818,19 @@ ctest --test-dir build-quality                           # 79/79 通过（30.52 
 ### 待办
 
 `sort`/`bytes` 的测试与示例；第三方库下一批 8 个核验；按「薄封装 + 差别核对」推进 S3 的 8 个模块。
+
+---
+
+## 收尾（2026-10-15 22:00）
+
+| 项 | 结果 |
+|---|---|
+| 删除定时任务 | **已完成**：`schedule_list` 确认 `schedule-0dc1d41c-9751-4d22-b2c3-339ac5762538` （每 900 秒、至 22:00），`schedule_delete` 返回 `deleted: true` |
+| 标记目标完成 | **未完成（受工具策略限制）**：`update_goal action=complete` 返回 「complete and blocked require a direct human turn or the current goal round」。本次触发是**定时提醒消息**，既非直接人工轮次也非 goal round，因此被拒。目标当前状态：`phase=paused`、`activation=disarmed`、`roundsStarted=16/18`。 |
+| 三项交付内容 | **均已完成**（见最终交付报告的 §0 执行摘要） |
+| 22:00 前的最后核对 | 交付物完整性核对通过：ArchitectureDiagram 17 文件、NextStep 8 文件；SVG 48,731 字节 / 151 个 text 元素；工作树只剩使用者在途的 4 个文件与 `.dsh_tmp/` |
+
+### 说明
+
+任务的「到点收尾」包含两个动作：删除定时任务（已执行）与标记目标完成（被策略拒绝）。后者只需在使用者直接指令下再执行一次 `update_goal action=complete` 即可；
+**在此之前，交付物本身已经全部就位**，不存在未落盘的产出。
