@@ -1,0 +1,260 @@
+// Go2Cpp 运行时架构与运行流程 —— Graphviz 源
+// 渲染：dot -Tsvg 00-architecture.dot -o 00-architecture.svg
+// 数据模型：notes/nodes-edges.md（由 G1~G9 九份模块报告汇总）
+// 字体：Droid Sans Fallback（本机唯一 CJK 字体，fc-list :lang=zh 实测）
+//
+// 布局三要素（v3）：
+//   ① 锚点链 anchor_L9→…→anchor_L0 强制层序（每层 rank=same），跨层弱依赖边一律 constraint=false；
+//   ② 5 个内部设施并入父节点标签第二行，压缩节点数；
+//   ③ 说明栏 5 块横排在 L0 之下（v2 曾竖排在右侧，会留下大片左侧空白）。
+digraph go2cpp {
+    rankdir=TB;
+    compound=true;
+    splines=polyline;
+    nodesep=0.30;
+    ranksep=0.50;
+    fontname="Droid Sans Fallback";
+    label="Go2Cpp 运行时架构与运行流程（C++17 实现的 Go 运行时语义 · 27 个公开模块 · L0 底层 → L9 顶层）";
+    labelloc=t;
+    fontsize=24;
+
+    node [shape=box, style="rounded,filled", fontname="Droid Sans Fallback", fontsize=11,
+          fillcolor="#eef3fb", color="#4a6fa5", penwidth=1.0, margin="0.13,0.08"];
+    edge [fontname="Droid Sans Fallback", fontsize=9, color="#5a5a5a", arrowsize=0.7];
+
+    // ---------------------------------------------------------------- 层锚点
+    anchor_L9 [shape=point, style=invis, width=0.01, label=""];
+    anchor_L8 [shape=point, style=invis, width=0.01, label=""];
+    anchor_L7 [shape=point, style=invis, width=0.01, label=""];
+    anchor_L6 [shape=point, style=invis, width=0.01, label=""];
+    anchor_L5 [shape=point, style=invis, width=0.01, label=""];
+    anchor_L4 [shape=point, style=invis, width=0.01, label=""];
+    anchor_L3 [shape=point, style=invis, width=0.01, label=""];
+    anchor_L2 [shape=point, style=invis, width=0.01, label=""];
+    anchor_L1 [shape=point, style=invis, width=0.01, label=""];
+    anchor_L0 [shape=point, style=invis, width=0.01, label=""];
+    anchor_L9 -> anchor_L8 -> anchor_L7 -> anchor_L6 -> anchor_L5 -> anchor_L4 -> anchor_L3
+             -> anchor_L2 -> anchor_L1 -> anchor_L0 [style=invis, weight=10000];
+
+    // ============================================================ L9 横切设施
+    subgraph cluster_L9 {
+        label="L9 横切设施（被所有层使用）";
+        fontsize=13; color="#b9c6da"; style="rounded";
+        log    [label="Log：Filter × Formatter(Item 注册表) × Sink × Worker\n同步落盘；内置单字符键 m/p/N/e/E/f/l/t/F/c/d；未知键原样保留", fillcolor="#f3ecff"];
+        config [label="Config：INI + ConfigVar<T>（原子快照无锁读）\n两阶段事务（预检 → ApplyString → NotifyPending/Rollback）+ 锁文件热重载", fillcolor="#f3ecff"];
+    }
+
+    // ============================================================ L8 工具与新手层
+    subgraph cluster_L8 {
+        label="L8 工具与新手层（转译代码直接使用）";
+        fontsize=13; color="#b9c6da"; style="rounded";
+        go_new       [label="go() / after() / every() / fiber\n默认调度器进程级、new 且不析构", penwidth=2.5, fillcolor="#dce9ff"];
+        control_flow [label="defer / panic / recover\n显式状态协议，无栈展开"];
+        event_batch  [label="EventBatch\nSelectCase 集合；work() 单消费者"];
+        fiber_local  [label="FiberLocal<T>\nG 局部存储（按 Fiber 指针隔离）"];
+        thread_policy[label="thread_policy scope\n线程参与 + 线程级 Hook 模式"];
+    }
+
+    // ============================================================ L7 应用协议
+    subgraph cluster_L7 {
+        label="L7 应用协议（协议边界组件：不做路由/鉴权/连接池）";
+        fontsize=13; color="#b9c6da"; style="rounded";
+        http      [label="HTTP/1.x\nParser：Content-Length + chunked + trailer + EOF 定界\nClient / Server / ResponseWriter", fillcolor="#dce9ff"];
+        websocket [label="WebSocket（RFC 6455）\n一读多写双锁；分片重组；Ping/Pong 内部消化"];
+        sse       [label="SSE\nLF/CRLF/CR 三种换行；EOF 不派发半事件；心跳用注释"];
+    }
+
+    // ============================================================ L6 网络基础
+    subgraph cluster_L6 {
+        label="L6 网络基础（除 Socket 外都不依赖调度器）";
+        fontsize=13; color="#b9c6da"; style="rounded";
+        socket     [label="Socket（RAII fd）\nin-flight 保护 + 延迟关闭 + 取消代际；fd() 是瞬时值", penwidth=2.5, fillcolor="#dce9ff"];
+        net_utils  [label="Address 族 / ByteArray / Framer / endian\n保留 getaddrinfo 顺序；ByteArray 默认小端；Framer 失败即清空"];
+    }
+
+    // ============================================================ L5 IO 后端
+    subgraph cluster_L5 {
+        label="L5 IO 后端（epoll + libc 拦截）";
+        fontsize=13; color="#b9c6da"; style="rounded";
+        iomanager  [label="IOManager（内含一个 Scheduler + 独立 poller 线程）\n先注册 readiness → 再发布 deadline → 最后 park；四类唤醒单赢家", penwidth=2.5, fillcolor="#dce9ff"];
+        io_backend [label="IOBackend → EpollBackend\nepoll_create1 + eventfd（token 0 保留）；ONESHOT；可替换协议", style="rounded,dashed,filled"];
+        hook       [label="Hook（31 个 libc 函数，LD_PRELOAD 式拦截）\n真调用 → EAGAIN → park；无 IOManager 退化原生 poll 切片", style="rounded,dashed,filled"];
+    }
+
+    // ============================================================ L4 并发原语
+    subgraph cluster_L4 {
+        label="L4 并发原语（等待统一委托 ParkingCondition）";
+        fontsize=13; color="#b9c6da"; style="rounded";
+        channel    [label="Channel<T>\ncap 0 rendezvous / >0 FIFO；发送/接收等待队列", penwidth=2.5, fillcolor="#dce9ff"];
+        select     [label="Select\n轮转 cursor + TrySelectPair 单赢家；内建 case 只接受可复制 T"];
+        future     [label="Future / Promise\n一次性结果，无 then 链"];
+        sync_prims [label="sync::Mutex / ConditionVariable / WaitGroup\nFIFO 混合队列；Go 风格所有权（可跨 Fiber/线程 Unlock）"];
+    }
+
+    // ============================================================ L3 取消与错误
+    subgraph cluster_L3 {
+        label="L3 取消与错误";
+        fontsize=13; color="#b9c6da"; style="rounded";
+        context     [label="Context（取消树）\nroot 单例 + WithCancel/WithDeadline/WithTimeout/WithValue", penwidth=2.5, fillcolor="#dce9ff"];
+        done_signal [label="DoneSignal + ContextRollback/Savepoint\n一次性关闭；internal 回调先于 user；补偿看 RollbackDone()"];
+        error       [label="Error（不可变错误图）\nString / Wrapped(链式 Message) / Join(多原因)；判定用 Is()", fillcolor="#ffeef0"];
+    }
+
+    // ============================================================ L2 调度
+    subgraph cluster_L2 {
+        label="L2 GMP 调度器（全项目最大模块：scheduler.cpp 4048 行）";
+        fontsize=13; color="#b9c6da"; style="rounded";
+        scheduler   [label="Scheduler\n入队/出队/窃取/park-wake/取消收敛/有界 shutdown", penwidth=2.5, fillcolor="#dce9ff"];
+        task_g      [label="Task = G\nNew→Runnable→Running→{Runnable|Waiting|Dead|Cancelled|Failed}\n入队权 + 执行权 + pending 唤醒令牌"];
+        machine_m   [label="Machine = M（std::thread）\n绑定 P；可被 sysmon 逻辑 detach（不切栈）"];
+        processor_p [label="Processor = P\n本地 deque（上限 256）+ attached 计数；P 从 0 编号"];
+        sysmon      [label="sysmon + Metrics/Observer\n阻塞记账 + maybe_grow；累计计数时序敏感"];
+    }
+
+    // ============================================================ L1 地基
+    subgraph cluster_L1 {
+        label="L1 地基（context_backend → Fiber → Timer → ParkingCondition）";
+        fontsize=13; color="#b9c6da"; style="rounded";
+        context_backend [label="detail::context_backend\nMakeContext / JumpContext / Transfer / Entry"];
+        fiber           [label="Fiber = G 的执行栈（默认 128 KiB，固定不增长）\n栈：mmap + 1 页 PROT_NONE guard；池：FiberBin（32 / 上限 4096）", penwidth=2.5, fillcolor="#dce9ff"];
+        timer_service   [label="TimerService（独立定时线程）\nmultimap + generation；回调经 TimerExecutor 外置（不直接恢复 Fiber 栈）"];
+        parking_cond    [label="ParkingCondition（三分支枢纽）\n受管 G park 让出 M / 原生线程 cv / 手动 Fiber 直接失败", fillcolor="#e8f7ee"];
+    }
+
+    // ============================================================ L0 平台
+    subgraph cluster_L0 {
+        label="L0 平台（不由本项目实现）";
+        fontsize=13; color="#cfcfcf"; style="rounded";
+        asm_ctx  [label="context_x64.S（项目自有汇编后端）\n保存 rbp/rbx/r12-r15 + rsp/rip；jmp *%r8 切换；entry 返回即 _exit", fillcolor="#f2f2f2", color="#9a9a9a"];
+        platform [label="Linux 内核 + libc/pthread\n被 Scheduler / TimerService / Hook / ParkingCondition 间接使用\nepoll / eventfd / socket 系统调用\nstd::thread / mutex / condition_variable；Boost.Context 回退", fillcolor="#f2f2f2", color="#9a9a9a"];
+    }
+
+    // ---------------------------------------------------------------- 层内同 rank
+    { rank=same; anchor_L9; log; config; }
+    { rank=same; anchor_L8; go_new; control_flow; event_batch; fiber_local; thread_policy; }
+    { rank=same; anchor_L7; http; websocket; sse; }
+    { rank=same; anchor_L6; socket; net_utils; }
+    { rank=same; anchor_L5; iomanager; io_backend; hook; }
+    { rank=same; anchor_L4; channel; select; future; sync_prims; }
+    { rank=same; anchor_L3; context; done_signal; error; }
+    { rank=same; anchor_L2; scheduler; task_g; machine_m; processor_p; sysmon; }
+    { rank=same; anchor_L1; context_backend; fiber; timer_service; parking_cond; }
+    { rank=same; anchor_L0; asm_ctx; platform; }
+
+    // ============================================================ 依赖边（向上）
+    // L1 → L0
+    context_backend -> asm_ctx [label="汇编切换"];
+
+    // L2 → L1
+    scheduler -> task_g        [label="持有/推进"];
+    scheduler -> machine_m     [label="创建/join"];
+    scheduler -> processor_p   [label="本地队列"];
+    scheduler -> timer_service [label="schedule_*"];
+    machine_m -> fiber         [label="resume_from_scheduler"];
+    task_g    -> fiber         [label="1:1（FiberBin 回收）"];
+    sysmon    -> machine_m     [style=dashed, constraint=false];
+
+    // ParkingCondition 枢纽
+    parking_cond -> fiber     [label="SuspendForScheduler"];
+    parking_cond -> scheduler [label="park_wait / wake_or_cancel", color="#1f7a4d", penwidth=1.8];
+
+    // L3 → L1
+    context -> done_signal   [label="Signal 恰好一次"];
+    context -> timer_service [label="deadline"];
+    context -> error         [style=dashed, constraint=false];
+
+    // L4 → L1
+    channel    -> parking_cond [label="PendingSend/Recv"];
+    sync_prims -> parking_cond [label="WaitBackend"];
+    future     -> parking_cond [label="FutureWaitBackend"];
+    select     -> channel      [label="TrySelectPair"];
+
+    // L5 → L2/L4
+    iomanager -> scheduler [label="park_io / wake_io"];
+    hook      -> iomanager [label="EAGAIN → park"];
+
+    // L6 → L5
+    socket -> iomanager [label="wait_ready"];
+
+    // L7 → L6/L5
+    http      -> socket    [label="读写"];
+    websocket -> socket    [label="读锁/写锁"];
+    websocket -> http      [constraint=false];
+    sse       -> http      [constraint=false];
+
+    // L8 → 下层
+    go_new      -> scheduler [label="spawn()"];
+    event_batch -> select    [constraint=false];
+
+    // L9 横切
+    config -> scheduler [style=dashed, constraint=false];
+    config -> log       [style=dashed, constraint=false];
+
+    // ============================================================ 说明栏（图内文字描述，横排在 L0 之下）
+    { rank=same; note_flow; note_protocol; note_numbers; note_bounds; note_legend; }
+    anchor_L0 -> note_flow [style=invis, weight=10000];
+
+    note_flow [shape=note, fillcolor="#fffdf0", color="#b0a060", fontsize=11, margin="0.18,0.12",
+        label=<<B>运行流程：一次 go() 到任务结束</B><BR ALIGN="LEFT"/>
+① go(fn) → Scheduler::spawn → Task(G) 入队<BR ALIGN="LEFT"/>
+   （P 本地队列 / 16 条 incoming 条带 / 全局队列）<BR ALIGN="LEFT"/>
+② worker(M) 取任务：救援链 → 本地队首 → 全局 → 窃取其他 P 队尾<BR ALIGN="LEFT"/>
+③ Fiber::resume_from_scheduler 切入独立栈（128 KiB + guard）<BR ALIGN="LEFT"/>
+④ 等待统一进 ParkingCondition：受管 G park（让出 M）<BR ALIGN="LEFT"/>
+   / 原生线程 cv / 手动 Fiber 直接失败<BR ALIGN="LEFT"/>
+⑤ 唤醒（channel 对端 / timer / epoll / context 取消）<BR ALIGN="LEFT"/>
+   → WaitNode 原子单赢家 → Scheduler::wake_* → 重新入队<BR ALIGN="LEFT"/>
+⑥ 主体返回 → Fiber Completed → Task 终态 → 唤醒 wait()<BR ALIGN="LEFT"/>
+   → FiberBin 回收<BR ALIGN="LEFT"/> >];
+
+    note_protocol [shape=note, fillcolor="#fffdf0", color="#b0a060", fontsize=11, margin="0.18,0.12",
+        label=<<B>五条不可违反的协议</B><BR ALIGN="LEFT"/>
+· 取消：先整棵子树标记（摘 timer / 摘 parent 登记 /<BR ALIGN="LEFT"/>
+  搬走 before-done），再逆序（子→父）线性化 DoneSignal；<BR ALIGN="LEFT"/>
+  补偿是否跑完看 RollbackDone() 而非 Done()<BR ALIGN="LEFT"/>
+· 错误：ErrorPtr 不可变共享；Wrap 的 Message 是整条链<BR ALIGN="LEFT"/>
+  → 种类与层级判定一律用身份比较 Is()<BR ALIGN="LEFT"/>
+· IO：先注册 readiness → 再发布 deadline → 最后 park；<BR ALIGN="LEFT"/>
+  四类唤醒靠一个原子 outcome claim 决出唯一赢家<BR ALIGN="LEFT"/>
+· fd：数字 fd 会复用（ABA）→ DescriptorToken 代际<BR ALIGN="LEFT"/>
+  + Hook 在真实 close 前 NotifyClose<BR ALIGN="LEFT"/>
+· 栈：固定 128 KiB 不增长；越界 = SIGSEGV = 进程死亡<BR ALIGN="LEFT"/>
+  （全项目无 SIGSEGV handler、无 sigaltstack）<BR ALIGN="LEFT"/> >];
+
+    note_numbers [shape=note, fillcolor="#fffdf0", color="#b0a060", fontsize=11, margin="0.18,0.12",
+        label=<<B>关键数字（本工作区实测）</B><BR ALIGN="LEFT"/>
+深度 ≈ 栈容量 / (每帧字节 + 128)：<BR ALIGN="LEFT"/>
+  128 KiB 栈，帧 0 → 1021 层；帧 256 B → 339 层<BR ALIGN="LEFT"/>
+  8 MiB pthread 对照 → 65496 层<BR ALIGN="LEFT"/>
+G/M 编号从 1 开始（0 = 非 worker 哨兵）；P 从 0 开始<BR ALIGN="LEFT"/>
+P 数 = processor_count（0 → hardware_concurrency）；<BR ALIGN="LEFT"/>
+  M ≈ P，声明阻塞区时可 &gt; P<BR ALIGN="LEFT"/>
+incoming 条带 16；本地队列上限 256；FiberBin 32/4096；<BR ALIGN="LEFT"/>
+  栈缓存 TLS 8 + 全局 128<BR ALIGN="LEFT"/>
+Hook 拦截 31 个 libc 函数；epoll token 0 保留给 eventfd<BR ALIGN="LEFT"/>
+模块报告 9 组共 2650 行；主图节点/边清单见 notes/<BR ALIGN="LEFT"/> >];
+
+    note_bounds [shape=note, fillcolor="#fff5f5", color="#c08080", fontsize=11, margin="0.18,0.12",
+        label=<<B>明确边界（本实现不做）</B><BR ALIGN="LEFT"/>
+无 GC、无异步抢占、无 morestack/copystack 自动栈增长、<BR ALIGN="LEFT"/>
+  无 cgo<BR ALIGN="LEFT"/>
+无 TLS、无 HTTP/2、无 HTTP/3；协议层不做路由/鉴权/<BR ALIGN="LEFT"/>
+  连接池/服务发现<BR ALIGN="LEFT"/>
+panic/recover 不是栈展开（显式状态协议）；<BR ALIGN="LEFT"/>
+  defer 是作用域级而非函数级<BR ALIGN="LEFT"/>
+未 Hook 的阻塞调用调度器看不见 —— 必须显式<BR ALIGN="LEFT"/>
+  BlockingRegion 声明<BR ALIGN="LEFT"/>
+poll/select/epoll_wait 不被 park；wait_any/wait_many<BR ALIGN="LEFT"/>
+  仅限受管 Fiber<BR ALIGN="LEFT"/> >];
+
+    note_legend [shape=note, fillcolor="#f7f7f7", color="#9a9a9a", fontsize=10, margin="0.18,0.12",
+        label=<<B>图例</B><BR ALIGN="LEFT"/>
+粗边框 = 最常直接使用的入口<BR ALIGN="LEFT"/>
+  （go / Channel / Context / Socket / Scheduler /<BR ALIGN="LEFT"/>
+   IOManager / Fiber）<BR ALIGN="LEFT"/>
+灰色节点 = 平台与内核（不由本项目实现）<BR ALIGN="LEFT"/>
+点线边框 = 内部设施（非稳定公共 API）<BR ALIGN="LEFT"/>
+实线 = 调用 / 数据流；虚线 = 横切或弱依赖<BR ALIGN="LEFT"/>
+L0（底）→ L9（顶）为依赖的向上方向<BR ALIGN="LEFT"/>
+完整依据见 modules/G1~G9 九份模块报告<BR ALIGN="LEFT"/> >];
+}

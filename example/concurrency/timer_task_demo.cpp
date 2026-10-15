@@ -56,9 +56,14 @@ int main() {
         ++once_count;
         std::cout << "[timer][一次性] 在线程中执行\n";
     });
-    const bool once_ok = wait_until(
-        [&] { return once_count.load() == 1; }, 1s) &&
-        once.StateValue() == go2cpp::core::TimerState::kCompleted;
+    // 注意：回调体内就已满足 once_count == 1，而 kCompleted 要等回调返回后由
+    // TimerService::Finish() 置位 —— 两者之间存在窗口，必须**分别轮询**，
+    // 否则在 ctest 并发压力下会偶发失败（与 commit 351f756 修过的 metrics 时序同类）。
+    const bool once_counted = wait_until(
+        [&] { return once_count.load() == 1; }, 1s);
+    const bool once_finished = wait_until(
+        [&] { return once.StateValue() == go2cpp::core::TimerState::kCompleted; }, 1s);
+    const bool once_ok = once_counted && once_finished;
     print_result("一次性", once_ok);
 
     std::atomic<bool> cancelled_called{false};
@@ -94,9 +99,11 @@ int main() {
         const int count = repeat_count.fetch_add(1) + 1;
         std::cout << "[timer][周期] 第 " << count << " 次\n";
     }, repeat_options);
-    const bool repeat_ok = wait_until(
-        [&] { return repeat_count.load() == 3; }, 1s) &&
-        repeated.StateValue() == go2cpp::core::TimerState::kCompleted;
+    const bool repeat_counted = wait_until(
+        [&] { return repeat_count.load() == 3; }, 1s);
+    const bool repeat_finished = wait_until(
+        [&] { return repeated.StateValue() == go2cpp::core::TimerState::kCompleted; }, 1s);
+    const bool repeat_ok = repeat_counted && repeat_finished;
     print_result("固定速率", repeat_ok);
 
     // 场景三：动态回调根据资源状态改变下一次间隔，最后主动停止。
@@ -151,9 +158,11 @@ int main() {
         ++fiber_count;
         std::cout << "[timer][Fiber] 在 Scheduler worker 中执行\n";
     });
-    const bool fiber_ok = wait_until(
-        [&] { return fiber_count.load() == 1; }, 1s) &&
-        fiber_timer.StateValue() == go2cpp::core::TimerState::kCompleted;
+    const bool fiber_ran = wait_until(
+        [&] { return fiber_count.load() == 1; }, 1s);
+    const bool fiber_finished = wait_until(
+        [&] { return fiber_timer.StateValue() == go2cpp::core::TimerState::kCompleted; }, 1s);
+    const bool fiber_ok = fiber_ran && fiber_finished;
     print_result("Scheduler/Fiber", fiber_ok);
 
     // 场景六：异常不会杀死定时器线程；空回调返回无效句柄。
@@ -161,10 +170,13 @@ int main() {
         throw std::runtime_error("示例异常");
     });
     const Timer invalid = service.ScheduleAfter(1ms, {});
-    const bool error_ok = wait_until(
-        [&] { return exception_count.load() == 1; }, 1s) &&
-        throwing.StateValue() == go2cpp::core::TimerState::kFailed &&
-        !invalid.Active();
+    const bool exception_seen = wait_until(
+        [&] { return exception_count.load() == 1; }, 1s);
+    const bool failure_recorded = wait_until(
+        [&] { return throwing.StateValue() == go2cpp::core::TimerState::kFailed; }, 1s);
+    const bool invalid_rejected = wait_until(
+        [&] { return !invalid.Active(); }, 1s);
+    const bool error_ok = exception_seen && failure_recorded && invalid_rejected;
     print_result("异常隔离", error_ok);
 
     scheduler.shutdown();

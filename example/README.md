@@ -60,6 +60,10 @@ cmake --build build --target go2cpp_runtime_demo
 | `errors_demo` | errors:: 构造、包装与聚合 | Unwrap 逐层下降到底 | 消息相同但身份不同不匹配 |
 | `fiber_stack_limit_demo` | 默认 128 KiB 栈的安全递归深度、递归改迭代 | 手动 resume 的 Fiber 串行执行（不涉及并发） | 深层 JSON 在入口被限深拒绝，而不是崩栈 |
 | `fiber_stack_limit_full` | fork 二分实测临界调用深度（Fiber 与 pthread 对照）、换 Fiber 续跑突破单栈上限 | 迭代式解析 20 万层嵌套；dump/拷贝临界深度实测 | 「解析成功但 dump/拷贝爆栈」的反证、随机深度输入、攻击载荷 |
+| `strings_demo` | 日志行切分与字段清洗、Builder 拼接与脱敏 | — | 空子串语义（Contains/Index/Count）、`SplitN(...,0)` 返回空 |
+| `strings_full` | 六场景：切分/CSV/URL/头名比较/Builder+UTF-8/10 万字段往返 | 10 万字段 Join↔Split 往返（打印耗时） | Cut 族未命中分支、rune 计数与 `Count(s,"")` 边界 |
+| `strconv_demo` | 配置解析、指标格式化、base=0 进制推断 | — | `ErrSyntax` 身份判定、非法布尔与数字 |
+| `strconv_full` | 六场景：错误分类/格式化/JSON 往返/十六进制 ID/权限位/边界规模 | 10 万次 Itoa↔Atoi 往返（打印耗时） | `ErrRange` 钳制值、下划线规则、`Inf`/`NaN`/hex float |
 
 一次构建后可以批量运行全部示例（每个命令都有 20 秒看门狗）：
 

@@ -1,0 +1,67 @@
+# 进度总表（每轮更新）
+
+- 目标：22:00 前完成「模块报告 → 一张架构图」与「Go 标准库/第三方库预研 → NextStep 计划」，
+  有余力则按项目规则开发并记录。
+- 定时任务：每 15 分钟一轮（`schedule-0dc1d41c-9751-4d22-b2c3-339ac5762538`）。
+- 起始时间：2026-10-15 18:00（第 1 轮）；截止：2026-10-15 22:00。
+
+## 交付物状态
+
+| # | 交付物 | 路径 | 状态 |
+|---|---|---|---|
+| 1 | **架构主图（最终成果，含图内文字描述）** | `00-architecture.svg` | **已完成（v5 定稿）**：48,731 字节 / 151 个文本元素 / 28 条边 / 画布 3401×1035 pt；中文为真文本（可搜索、可缩放） |
+| 2 | 架构图源（可再生成） | `00-architecture.dot` | **已完成**（Graphviz dot；`dot -Tsvg 00-architecture.dot -o 00-architecture.svg`） |
+| 3 | 运行流程说明（与图内文字块双向对应） | `01-runtime-flow.md` | **已完成**（11,283 字节）：六阶段 go() 生命周期 + 取消/IO/错误三条横向流程 + 四类边界 |
+| 4 | 模块报告 G1 地基层 | `modules/G1-foundation.md` | **已完成**（353 行） |
+| 5 | 模块报告 G2 调度器 | `modules/G2-scheduler.md` | **已完成**（309 行） |
+| 6 | 模块报告 G3 取消与错误 | `modules/G3-context-error.md` | **已完成**（260 行） |
+| 7 | 模块报告 G4 并发原语 | `modules/G4-channel-future-sync.md` | **已完成**（280 行） |
+| 8 | 模块报告 G5 IO 后端 | `modules/G5-io-backend.md` | **已完成**（285 行） |
+| 9 | 模块报告 G6 网络基础 | `modules/G6-network-base.md` | **已完成**（279 行） |
+| 10 | 模块报告 G7 应用协议 | `modules/G7-protocols.md` | **已完成**（281 行） |
+| 11 | 模块报告 G8 横切设施 | `modules/G8-log-config.md` | **已完成**（325 行） |
+| 12 | 模块报告 G9 工具与新手层 | `modules/G9-tools.md` | **已完成**（278 行） |
+| 13 | 模块报告 G10 汇总 | `modules/G10-summary.md` | 未开始 |
+| 14 | NextStep 总览 | `../NextStep/README.md` | 未开始 |
+| 15 | Go 标准库映射与计划 | `../NextStep/go-stdlib-map.md` | 未开始 |
+| 16 | 第三方库预研与计划 | `../NextStep/third-party-plan.md` | 未开始 |
+| 17 | 开发尝试与进度记录 | `../NextStep/dev-progress.md` | 未开始 |
+| 18 | 架构图数据模型（节点/边/文字块清单） | `notes/nodes-edges.md` | **已完成** | 由 G1~G9 九份报告的「对架构图的贡献」汇总：42 个节点、45 条边、4 块图内文字 |
+| 19 | 模块报告 G10 全项目汇总 | `modules/G10-summary.md` | **已完成**：一句话架构 + 模块索引 + 关键数字 + 横切差异总表 + 台账汇总 + 覆盖声明 |
+| 20 | NextStep：Go 标准库逐包映射与缺口计划 | `../NextStep/go-stdlib-map.md` | **已完成**：本地 Go 1.23.0 源码扫描（638 包）+ 7 域映射 + S1~S7 阶段计划 |
+| 21 | NextStep：import 统计原始数据（可复现） | `../NextStep/notes/stdlib-import-stats.md` | **已完成**：Top 60 排行 + 复现命令 + 与 go101 交叉验证 |
+| 22 | NextStep：第三方库预研（候选/许可证/可移植性） | `../NextStep/third-party-plan.md` | **已完成**：T1~T4 分层候选 + 五项可移植性判据 + 一手核验 gin=MIT、cobra=Apache-2.0、gorm=MIT |
+| 23 | NextStep：路线图与里程碑 | `../NextStep/roadmap.md` | **已完成**：关键路径 + S1~S7/T1~T4 阶段计划 + M1~M5 里程碑 + 风险缓解 |
+| 24 | 开发：`tools/strings.hpp`（Go strings 对应） | `../include/go2cpp/tools/strings.hpp` | **已完成（第 10 轮）**：654 行 header-only；0 warning；49 条边界断言通过；待补测试/示例登记 |
+| 25 | 开发：`tools/strconv.hpp`（Go strconv 对应） | `../include/go2cpp/tools/strconv.hpp` | **已完成（第 11 轮）**：546 行；0 warning；60 条边界断言；待补测试/示例登记 |
+| 26 | 开发测试：`tests/tools/test_strings.cpp` | `../tests/tools/test_strings.cpp` | **已完成（第 12 轮）**：6 场景 + 10 万字段 + 2 万/1 万随机对拍；已通过 |
+| 27 | 开发测试：`tests/tools/test_strconv.cpp` | `../tests/tools/test_strconv.cpp` | **已完成（第 12 轮）**：6 场景 + 20 万×2 + 4 组随机属性；已通过 |
+| 22 | NextStep：第三方库预研（候选/许可证/可移植性） | `../NextStep/third-party-plan.md` | **已完成**：T1~T4 分层候选 + 五项可移植性判据 + 已核验 gin/cobra/gorm 的 LICENSE 原文 |
+| 23 | NextStep：路线图与里程碑 | `../NextStep/roadmap.md` | **已完成**：关键路径 + S1~S7/T1~T4 阶段计划 + M1~M5 里程碑 + 风险缓解 |
+
+## 轮次日志
+
+| 轮 | 时刻 | 本轮交付单元 | 状态 | 证据/备注 |
+|---:|---|---|---|---|
+| 1 | 18:00 | 骨架（README/PROGRESS/SCHEDULE）+ G1 地基层报告 + G2 调度器报告 | **已完成** | 产出 6 个文件共 837 行；`find ArchitectureDiagram NextStep -type f` 已核对；G1/G2 含「对架构图的贡献」节，可直接供 G10/架构图取用 |
+| 2 | 18:15 | G3 取消与错误 + G4 并发原语 | **已完成** | G3 覆盖 Context/DoneSignal/ContextKey/ContextRollback 与错误图（Wrap 链式 Message、Is 身份语义）；G4 覆盖 Channel/Select/Future/sync 的等待协议与边界。模块报告累计 1202 行 |
+| 3 | 18:30 | G5 IO 后端 | **已完成** | 覆盖 IOManager（独立 poller 线程/代际 token/wait_any-many 边界）、IOBackend 协议与 EpollBackend、Hook 的 31 个拦截点与 cooperative_io 固定顺序、fd_manager 无锁读警告 |
+| 4 | 18:45 | G6 网络基础 + G7 应用协议 | **已完成** | G6：Socket 的 in-flight 保护与延迟关闭、fd() 瞬时值、Address 族（IPv6 broadcast 语义坑）、ByteArray 默认小端、Framer 失败即清空；G7：HTTP 增量解析（CL/chunked/trailer/EOF 定界）、WebSocket 读写双锁与角色掩码、SSE 三种换行与 EOF 不派发半事件 |
+| 5 | G8 横切设施 + G9 工具层 | **已完成** | G8：日志四层组合 + **内置格式项键实测清单**（m/p/N/e/E/f/l/t/F/c/d 与命名别名；未知键原样保留且 HasError）＋ 配置两阶段事务/锁文件热重载/ReadSize 边界；G9：defer/panic/recover 显式协议、go()/fiber、EventBatch 单消费者与静默失败(X-27)、FiberLocal 的 G 局部隔离、HybridGate 定位与 X-35 决策。9 份报告合计 2650 行 |
+| 6 | 架构图数据模型 + 首次渲染 | **已完成** | 产出 `notes/nodes-edges.md`（节点/边/文字块清单）与 `00-architecture.dot`；`dot` 渲染 v2 SVG 成功（图 5316×1849，层级 L9→L0 正确，说明栏 5 块在右）；v2 相比 v1 用锚点链固定了层序、把 5 个内部设施并入父节点标签 |
+| 7 | 主图精修 + 运行流程说明 | **已完成** | 迭代 v3→v4→v5（说明栏移到底部横排、L0 平台节点合并、平台边收敛为标签说明、弱依赖虚线删除）；每版都用 `dot -Tpng` 导出并**实际查看**确认层级与中文；同步产出 `01-runtime-flow.md` |
+| 8 | G10 全项目汇总 + Go 标准库映射 | **已完成** | `modules/G10-summary.md`（收口）+ `NextStep/go-stdlib-map.md`（638 包扫描 / 7 域映射 / S1~S7 计划）+ `NextStep/notes/stdlib-import-stats.md`（原始数据） |
+| 9 | NextStep：第三方库预研与取舍 | **已完成** | `NextStep/third-party-plan.md`：分层候选（工具/配置日志/CLI/Web 数据）+ 可移植性判据 + **一手核验** gin=MIT、cobra=Apache-2.0、gorm=MIT；结论：Web/ORM 受限于反射与 database/sql，须先定 S5 绑定策略 |
+| 10 | NextStep：路线图与里程碑 | **已完成** | `NextStep/roadmap.md`：关键路径（io 必须先于 os/bufio/http）、S1~S7 与 T1~T4 依赖顺序、M1~M5 里程碑验收、6 类风险缓解 |
+| 11 | 开发：`tools/strings.hpp`（Go strings 对应） | **已完成** | 检索 4 个 C++ 候选后决定自研薄封装；654 行 header-only + 5 行转发头；编译 0 warning、49 条 Go 语义边界断言全通过（含 `Count(s,"")==rune+1` 等反直觉边界） |
+| 12 | 开发：`tools/strconv.hpp`（Go strconv 对应） | **已完成** | 546 行 header-only + 5 行转发头；编译 0 warning、60 条 Go 语义边界断言通过（base=0 八进制推断 / 下划线仅 base=0 / ErrRange 钳制值 / ParseBool 精确接受集）；修掉 1 个实现 bug（from_chars hex 前缀） |
+| 13 | 开发：strings/strconv 的正式测试与登记 | **已完成** | `tests/tools/test_strings.cpp`（242 行）+ `test_strconv.cpp`（245 行）；各 6 个真实场景；10 万字段 Join/Split 往返、20 万×2 数值往返、2 万/1 万/10 万轮随机对拍；`GO2CPP_TEST_FILTER=strings|strconv` 均 all checks passed（0 warning） |
+| 14 | 后续轮 | 开发：大数据量 + 随机 + 多场景测试 | 待办 | |
+| 15 | 后续轮 | 开发：example（延续风格）+ 登记 | 待办 | |
+| 16 | 22:00 前 | 收尾：G10 汇总 + codex.md + 提交 + 最终报告 | 待办 | |
+
+## 证据索引
+
+- 构建/测试证据：`build-quality`（0 warning / 0 error）、`ctest` 69/69（2026-10-15 17:40 全量重建后）。
+- 上游文档：`docs/HANDOFF.md`、`codex.md`（第 25 轮）、`docs/modules.md`、`docs/design.md`、`docs/dependencies.md`。
+- 已实测纠正项：MId 从 1 开始；nlohmann 3.11.3 的 `parse()` 是迭代实现（会爆栈的是 `dump()`/拷贝）。

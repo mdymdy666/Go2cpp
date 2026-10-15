@@ -13,6 +13,88 @@
 
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
+## 2026-10-15：新增 `tools/strings` + `tools/strconv`（Go 标准库对齐第一批，第 26 轮）
+
+### 背景
+
+本日 18:00–22:00 的定时任务（每 15 分钟一轮）有三项目标：
+① 模块化架构报告 + 一张含文字描述的架构图 → `ArchitectureDiagram/`；
+② Go 标准库与第三方库预研 + 后续计划（含计划产出时间）→ `NextStep/`；
+③ 有余力时按项目规则开发并记录进度 —— **本轮是 ③ 的第一个实际代码交付**。
+
+### 交付清单
+
+| 文件 | 行数 | 说明 |
+|---|---:|---|
+| `include/go2cpp/tools/strings.hpp` | **654** | Go `strings` 的 32 个同名 API + 最小 UTF-8 工具（`DecodeRune`/`RuneCount`/`IsSpaceRune`）+ `StringBuilder` |
+| `include/go2cpp/strings.hpp` | 5 | 根路径转发头 |
+| `include/go2cpp/tools/strconv.hpp` | **546** | `Atoi`/`Itoa`/`ParseInt`/`ParseUint`/`FormatInt`/`FormatUint`/`ParseBool`/`FormatBool`/`ParseFloat`/`FormatFloat`/`Quote` + `ErrSyntax`/`ErrRange` 锚点 |
+| `include/go2cpp/strconv.hpp` | 5 | 根路径转发头 |
+| `tests/tools/test_strings.cpp` | 242 | 6 个真实场景 + 10 万字段往返 + 2 万/1 万轮随机对拍 |
+| `tests/tools/test_strconv.cpp` | 245 | 6 个真实场景 + 20 万×2 往返 + 4 组随机属性测试 |
+| `example/tools/strings_demo.cpp` | 88 | 简单版 3 场景 |
+| `example/tools/strings_full.cpp` | 140 | 全面版 6 场景 |
+| `example/tools/strconv_demo.cpp` | 90 | 简单版 3 场景 |
+| `example/tools/strconv_full.cpp` | 153 | 全面版 6 场景 |
+| `tests/test_main.cpp` | — | 登记：函数声明 + `selected("strings")`/`selected("strconv")` |
+| `cmake/Go2CppTests.cmake` | — | 登记：测试源文件 2 项 + `GO2CPP_EXAMPLES` 4 项（**文件为 CRLF，插入按 CRLF**） |
+| `example/README.md` | — | 登记：速查表 4 行 |
+
+### 复用优先的检索结论（项目规范第 2 节）
+
+- **strings**：候选 `absl/strings`（Apache-2.0，需完整构建集成）、`boostorg/algorithm`（Boost 1.0，重依赖）、
+  `fmtlib/fmt`（MIT，但那是**格式化**库、对应 Go 的 `fmt`）、`tgalaj/strutil`（MIT，功能集与 Go 不对齐）
+  → **结论：自研薄封装**（目标是 Go 语义 1:1，而不是通用字符串库）。
+- **strconv**：C++ 侧没有语义对齐实现（`std::stoi` 不做 `base=0` 推断、不返回范围错误、不返回钳制值；
+  `std::from_chars` 不认识下划线）→ **自研**，底层复用 `std::from_chars`/`std::to_chars` 保证 round-trip 精度。
+- **语义对照来源**：项目内 `third_party/go1.23.0.src.tar.gz` 的 `go/src/strings/` 与 `go/src/strconv/`
+  （Go 1.23.0，BSD-3-Clause）。**仅对照行为，代码为独立实现**；对照命令写在 `NextStep/dev-progress.md`。
+
+### 验证（全部实际运行过）
+
+```sh
+# 头文件级验证（独立 TU，含 Go 的反直觉边界）
+g++ -std=c++17 -Wall -Wextra -Wpedantic -I include /tmp/strings_check.cpp -o /tmp/strings_check && /tmp/strings_check
+g++ -std=c++17 -Wall -Wextra -Wpedantic -I include /tmp/strconv_check.cpp src/tools/error.cpp -o /tmp/strconv_check && /tmp/strconv_check
+# → failures=0（strings 49 条、strconv 60 条边界断言），0 warning
+
+# 项目内正式测试（已登记）
+GO2CPP_TEST_FILTER=strings ./build-quality/go2cpp_tests   # → all checks passed
+GO2CPP_TEST_FILTER=strconv ./build-quality/go2cpp_tests   # → all checks passed
+
+# 示例（4 个，退出码均为 0，输出逐条与注释「预期」一致）
+./build-quality/go2cpp_strings_demo / go2cpp_strings_full / go2cpp_strconv_demo / go2cpp_strconv_full
+```
+
+对齐的**非显然 Go 语义**（都写进了测试）：`Count(s,"") == rune+1`、`Split(s,"")` 按 rune 切分、
+`Replace(s,"",new,-1)` 在每个 rune 前后插入、`base=0` 时前导 `0` 为**八进制**（`"0755"` → 493）、
+下划线**只在 `base=0`** 且必须在数字之间、越界返回 `ErrRange` **并给出钳制值**、
+`ParseBool` 精确 12 个接受值、`ParseUint` 不接受符号前缀、`ParseFloat` 的 `Inf`/`NaN`/hex float。
+
+### 过程中修掉的问题（全部由工具或断言暴露，非事后声称）
+
+| # | 位置 | 问题 | 处置 |
+|---:|---|---|---|
+| 1 | `strings.hpp` | 注释里写 `go/src/strings/*.go`，`/*` 触发 GCC `-Wcomment` | 改措辞 |
+| 2 | `strconv.hpp` | **实现 bug**：`std::from_chars(chars_format::hex)` 的输入**不含 `0x` 前缀** | 检出后先 `erase(0,2)` |
+| 3 | `test_strings.cpp` | 用 `Index`（首次出现）判断 `HasSuffix`，重复子串必然误判 | 改用 `LastIndex` |
+| 4 | `test_strconv.cpp` | 参考实现直接用 `from_chars`：它**不接受前导 `+`** | 参考实现先剥离 |
+| 5 | `test_strconv.cpp` | 剥离 `+` 后 `from_chars` 把 `"+-5"` 当合法负数 | 改为**显式语法检查** + 无符号范围复核 |
+| 6 | `test_strings.cpp` | 测试期望写错：`SplitAfter("a,b,c","")` 应为 `a|,|b|,|c` | 用诊断程序确认真实行为后修测试 |
+| 7 | `PROGRESS.md` 更新脚本 | 锚点漏了「后续轮」列 → 一次更新未写入 | 改为按行首前缀匹配 |
+
+> 3~6 都发生在**测试代码**里，实现无误 —— 这正是「随机对拍 + 独立参考实现」的价值：
+> 它暴露的是「参考实现应当等价于谁」的理解偏差。
+
+### 未覆盖 / 后续
+
+- `FormatFloat` 未实现 Go 的 `'b'`/`'x'`/`'X'` 格式（明确抛 `std::logic_error`，已在文件头列为边界）。
+- `ToUpper`/`ToLower`/`EqualFold` 只覆盖 ASCII + Latin-1（完整 Unicode 表留给后续 `unicode` 模块）。
+- **未做「Go 与 Go2Cpp 同输入对拍」**：需要 Go 工具链参与，计划在 `NextStep/roadmap.md` 的 S5 阶段引入
+  （离线参考，不进构建依赖）。
+- 性能未测：`strings_full`/`strconv_full` 里打印的耗时是 Debug 构建、仅供参考；
+  正式性能结论必须用 `build-bench`（Release）测量后写入 `docs/performance.md`。
+
 ## 2026-10-15：nlohmann/json 薄封装 + fiber_stack_limit 两版示例（第 25 轮）
 
 ### 用户要求
