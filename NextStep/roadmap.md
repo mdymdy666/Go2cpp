@@ -67,17 +67,19 @@
 | 验收 | 示例覆盖：文件读写往返、超大文件分块、`Sleep` 在 Fiber 中让出 M（用 `Scheduler::metrics()` 轮询验证） |
 | 风险 | `os::File` 与 `FdManager`/Hook 的非阻塞标志交互 → 复用 `FdContext{m_user_nonblock, m_system_nonblock}` 语义 |
 
-### S3｜IO 工具补齐（P1，第 2–3 周）
+### S3｜容器与工具补齐（P1，第 2–3 周）—— **全部按薄封装实施**
 
-`bufio.hpp`（`Reader`/`Writer`/`Scanner`，其中 Scanner 的分词语义是 Go 特有的）、
+`bufio.hpp`、`path/filepath.hpp`、`slices.hpp`、`maps.hpp`、`cmp.hpp`、`math.hpp`、`math/bits.hpp`、
 `encoding/binary.hpp`（补 `Read`/`Write`/`Varint`）。
 
-> 原计划中的 `path/filepath`、`slices`、`maps`、`cmp`、`math`、`math/bits` **已移出**：
-> C++ 标准库（`std::filesystem`、`std::ranges`、`std::unordered_map`、C++20 `operator<=>`、
-> `<cmath>`、C++20 `<bit>`）已提供等价物，再封装只会得到「同一个实现的第二个名字」。
-> 映射表见 `go-stdlib-map.md` §4.4「不实现：C++ 标准库已提供」。
+> **实现方式已定为「薄封装」**（2026-10-15 经两轮反馈收敛）：不重写算法，只提供与 Go 同名的 API
+> 并在内部一行调用 C++ 标准库（`std::ranges`、`std::unordered_map`、C++20 `operator<=>`、
+> `std::filesystem`、`<cmath>`、`<bit>`）。这样转译后 API 名一一对应，转译器不必硬编码标准库类型。
+> **每个模块动手前必须先做「差别核对」**（逐项对比 Go 与标准库语义，有差别处显式处理；
+> 已知差别：`sort.Float64s` 的 NaN 语义、`sort.Search`/`Find` 的返回语义、`math.Mod` 与 `%` 的符号规则），
+> 核对结果写进该模块文件头。差别清单见 `go-stdlib-map.md` §4.4。
 
-DoD：薄封装（基于 C++ 标准库/现有 `ByteArray`），每个模块 ≤300 行 + 示例 + 测试。
+DoD：每个模块 ≤300 行（薄封装通常远小于此）+ 示例 + 测试 + **差别说明**。
 
 ### S4｜并发与编码补齐（P1，第 3–4 周）
 
@@ -97,10 +99,10 @@ DoD：`sync::Map` 必须给出「Fiber + 线程混合」的并发测试（≥3 �
 ### S6｜HTTP 生态与模板（P2，第 6–8 周）
 
 `http` 补 `ServeMux`/`Handler`/`HandleFunc`/中间件链/`Client` 连接池与 keep-alive/重定向/Cookie；
-`text/template`；`os/exec`；`flag`；`hash/*`（`fnv`/`crc32` 无标准等价物，需实现）。
+`text/template`；`os/exec`；`flag`；`container/*`（薄封装：`heap`→`std::priority_queue`、
+`list`→`std::list`，`ring` 无等价物需自行实现约 30 行）；`hash/*`（`fnv`/`crc32` 无标准等价物，需实现）。
 
-> `container/*` **已移出**：`heap`/`list` 分别对应 `std::priority_queue`/`std::list`
-> （`ring` 无直接等价物，保留评估）。见 `go-stdlib-map.md` §4.4。
+> `container/*` 按薄封装实施，见 `go-stdlib-map.md` §4.4。
 
 DoD：用 Go2Cpp 写一个**真实小服务**（路由 + JSON API + 优雅关闭），并作为示例登记。
 

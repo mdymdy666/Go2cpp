@@ -120,23 +120,22 @@ inline bool SliceIsSorted(const std::vector<T>& values, Less less) {
 }
 
 // ============================================================================
-// 关于 Go 的 Ints / Float64s / Strings 及 *AreSorted（**不封装**）
+// 常用类型的便捷排序（对应 Ints / Float64s / Strings 及 *AreSorted）—— 薄封装
 // ============================================================================
 //
-// 这几个 Go API 在 C++ 里就是标准库的一行调用，再封装一层只会多一次没有价值的间接：
+// 这些函数内部就是一行标准库调用（**不重写算法**），存在的价值是让 Go 源里的
+// `sort.Ints(x)` 在转译后仍有一一对应的 API 名，而不是要求转译器硬编码 `std::sort`。
 //
 //   sort.Ints(x)              ->  std::sort(x.begin(), x.end());
 //   sort.IntsAreSorted(x)     ->  std::is_sorted(x.begin(), x.end());
 //   sort.Strings(x)           ->  std::sort(x.begin(), x.end());        // std::string 可比较
 //   sort.StringsAreSorted(x)  ->  std::is_sorted(x.begin(), x.end());
-//   sort.Float64s(x)          ->  std::sort(x.begin(), x.end(), Float64LessNaN{});
+//   sort.Float64s(x)          ->  std::sort(x.begin(), x.end(), Float64LessNaN{});   // ★ 差别在这
 //   sort.Float64sAreSorted(x) ->  std::is_sorted(x.begin(), x.end(), Float64LessNaN{});
 //
-// 唯一带 Go 特有语义的是**浮点的 NaN 处理**（Go 的 lessFloat64 把 NaN 视为最小），
-// 因此这里只保留一个比较器 `Float64LessNaN`，其余一律交给标准库。
-//
-//   （2026-10-15 按使用者反馈删除：原先实现的 Ints/Strings/IntsAreSorted/StringsAreSorted/
-//     Float64s/Float64sAreSorted 六个函数都只是标准库的转发。）
+// **严谨考虑过的差别**：浮点排序上 Go 的 `lessFloat64` 把 **NaN 视为最小**，
+// 而 C++ 的 `operator<` 对 NaN 恒为 false（会得到未定义序）。因此这里必须显式传入
+// `Float64LessNaN`，这也是唯一不能"直接转发"的地方。
 
 /** @brief 对应 Go 的 `lessFloat64`：NaN 视为**小于**任何其它值（因此排在最前）。 */
 struct Float64LessNaN {
@@ -146,6 +145,34 @@ struct Float64LessNaN {
         return left < right;
     }
 };
+
+/// 对应 `sort.Ints`（薄封装：一行 `std::sort`）。
+inline void Ints(std::vector<int>& values) { std::sort(values.begin(), values.end()); }
+
+/// 对应 `sort.IntsAreSorted`。
+inline bool IntsAreSorted(const std::vector<int>& values) {
+    return std::is_sorted(values.begin(), values.end());
+}
+
+/// 对应 `sort.Strings`。
+inline void Strings(std::vector<std::string>& values) {
+    std::sort(values.begin(), values.end());
+}
+
+/// 对应 `sort.StringsAreSorted`。
+inline bool StringsAreSorted(const std::vector<std::string>& values) {
+    return std::is_sorted(values.begin(), values.end());
+}
+
+/// 对应 `sort.Float64s`（**必须**用 `Float64LessNaN`，见上面的差别说明）。
+inline void Float64s(std::vector<double>& values) {
+    std::sort(values.begin(), values.end(), Float64LessNaN{});
+}
+
+/// 对应 `sort.Float64sAreSorted`。
+inline bool Float64sAreSorted(const std::vector<double>& values) {
+    return std::is_sorted(values.begin(), values.end(), Float64LessNaN{});
+}
 
 // ============================================================================
 // 搜索（对应 sort.Search / Find / SearchInts / SearchStrings / SearchFloat64s）
