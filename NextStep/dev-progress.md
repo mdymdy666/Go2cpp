@@ -466,3 +466,135 @@ ctest --test-dir build-quality                           # 79/79 通过（30.52 
 | `time` 的剩余成员 | `After`/`Tick`/`Ticker`/`Timer`（需与 `Channel<Time>` + `core::TimerService` 对接）、`Format`/`Parse`、`Duration.Parse` |
 | S1/S2 其余标准库 | `bytes`、`sort`、`path/filepath`、`os`、`bufio`、`slices`/`maps`/`cmp` |
 | S5 决策 | `encoding/json` 的结构体编解码策略（代码生成 vs 显式绑定）—— 它是 T4 生态的前置条件 |
+
+---
+
+## 第 21 轮（2026-10-15 19:5x）：`tools/sort.hpp` + `tools/bytes.hpp`（S1 继续）
+
+### 交付
+
+| 文件 | 行数 | 说明 |
+|---|---:|---|
+| `include/go2cpp/tools/sort.hpp` | **260** | `Sort`/`Stable`/`IsSorted`、`Slice`/`SliceStable`/`SliceIsSorted`、`Ints`/`Float64s`/`Strings` + `*AreSorted`、`Search`/`Find`/`SearchInts`/`SearchStrings`/`SearchFloat64s`、`ReverseLess`/`Reverse` |
+| `include/go2cpp/sort.hpp` | 5 | 根路径转发头 |
+| `include/go2cpp/tools/bytes.hpp` | **532** | 函数家族（比较/查找/切分/变换/修剪，共 30+ 个）+ `Buffer`（含 `Next`/`ReadBytes`/`ReadString`/`UnreadByte`/`UnreadRune`/`ReadFrom`/`WriteTo`/`Truncate`/`Grow`）+ `Reader`（定位读取） |
+| `include/go2cpp/bytes.hpp` | 5 | 根路径转发头 |
+
+### 复用优先的结论
+
+- **sort**：底层复用 `std::sort`/`stable_sort`/`is_sorted`/`lower_bound` —— Go 的 `sort.Sort` 是不稳定排序
+  （1.19+ 为 pdqsort）、`sort.Stable` 是稳定排序（symmerge），与 C++ 的 `std::sort`（introsort，不稳定）/
+  `std::stable_sort`（稳定）**语义正好对应**。**不引入** pdqsort 之类的第三方实现：那是性能优化而非语义，
+  而性能结论必须由 `build-bench`（Release）实测后决定。接口形态上，Go 的 `sort.Interface`（`Len`/`Less`/`Swap`）
+  映射为「容器/迭代器 + 比较器」的模板形式，避免为每次比较付出虚调用。
+- **bytes**：Go 的 `bytes` 与 `strings` 是**同一套算法作用于不同类型**（`bytes.Split` 与 `strings.Split` 行为一致），
+  因此函数家族**直接转发到 `go2cpp/strings.hpp`**，避免两份实现漂移；`Buffer`/`Reader` 独立实现
+  （`streams` 的 `BufferWriter`/`StringReader` 是 `final` 且只覆盖最小子集，而 `bytes.Buffer` 还需要
+  `Next`/`ReadBytes`/`ReadString`/`UnreadByte`/`Truncate`/`Grow`/`WriterTo`/`ReadFrom`），
+  但**复用 `streams` 的接口**以保证互操作（验证里就把 `Buffer` 当 `streams::Reader` 交给了 `ReadAll`）。
+
+### 对齐的非显然语义
+
+- `sort.Search(n, f)`：返回**最小的** `i ∈ [0, n]` 使 `f(i)` 为真；**全为假时返回 `n`**（未找到用 `n` 表达，不是 -1）；
+- `sort.Find(n, cmp)`：三向比较，命中返回 `(下标, true)`，未命中返回 `(插入位置, false)`；
+- `sort.Float64s`：把 **NaN 视为小于任何其它值**（对齐 Go 的 `lessFloat64`），因此 NaN 排在最前；
+- `bytes.Buffer.Read`：**缓冲为空时返回 `io.EOF`**（不是 0 字节且无错误）；
+- `bytes.Buffer.Next(n)`：`n > Len()` 时返回剩余全部并清空；空缓冲返回空切片且**不带错误**；
+- `bytes.Buffer.ReadBytes`/`ReadString`：**包含分隔符**；未找到时返回剩余全部并带 `io.EOF`；
+- `bytes.Buffer.UnreadByte`/`UnreadRune`：只在**上一次操作是成功读**时有效，否则报错（与 Go 的报错语义一致）；
+- `bytes.Trim(s, cutset)` 的 `cutset` 是**字符集合**（与 `strings.Trim` 同义）。
+
+### 验证（实测）
+
+两个模块各有独立验证程序，均 `0 warning / 0 error` 且 `failures=0`：
+
+- `sort`：基础排序、`IsSorted`、反向比较器、`Stable` 的稳定性（10 万对同键元素的原序保持）、
+  `Slice*` 的下标式比较器、`Ints`/`Strings`/`Float64s`、**NaN 最小**、`Search` 的四种边界（含全假返回 n）、
+  `Find` 命中/未命中、`SearchInts`/`SearchStrings`/`SearchFloat64s`、**100 万个随机整数排序 + 有序性校验**；
+- `bytes`：比较/查找/切分/变换/修剪家族、`Buffer` 的写读往返与空缓冲 `io.EOF`、`Next` 的边界、
+  `ReadBytes` 的含分隔符与未找到语义、`UnreadByte`/`UnreadRune` 的前置条件、`Truncate`/`Grow`/`Reset`/`Cap`、
+  `ReadFrom`/`WriteTo` 与 `streams` 互操作、`Reader` 的 `ReadAt`/`Seek`/`ReadRune`（UTF-8 三字节）。
+
+### 本轮修掉的问题
+
+| # | 位置 | 问题 | 处置 |
+|---:|---|---|---|
+| 1 | `sort.hpp` | `Slice*` 系列的 lambda **漏捕获基址**（`values` 未捕获），无法编译 | 提前取 `base` 指针并按值捕获 |
+| 2 | `sort.hpp` | `Float64sAreSorted` 的比较器用了 `<=`，不是**严格弱序** | 改为与 `Float64s` 同一个 less |
+| 3 | `sort` 验证 | `less(i, j) = i < j` 只比较位置，不是有效的排序谓词 | 改为通过下标访问元素比较 |
+| 4 | `bytes.hpp` | 写了 `strings::Contains` 等前缀 —— `strings.hpp` 的函数在 **`go2cpp` 顶层**（无 `strings` 子命名空间），且同名会命中 `bytes::Contains` 自身导致**无限递归** | 全部改为显式 `go2cpp::` 限定（36 处） |
+
+### 待办（下一轮）
+
+| 项 | 说明 |
+|---|---|
+| 正式测试 | `tests/tools/test_sort.cpp` + `test_bytes.cpp`（大数据量 + 随机 + ≥5 场景）|
+| 示例 | `example/tools/sort_{demo,full}.cpp`、`bytes_{demo,full}.cpp` + `GO2CPP_EXAMPLES` 与 `example/README.md` 登记 |
+| 收尾 | 全量构建 0 warning + `ctest` + `codex.md` 第 30 轮 + 提交 |
+
+---
+
+## 第 22 轮（2026-10-15 20:2x）：按反馈做减法 —— 删除 C++ 标准库已有的重复实现
+
+### 使用者反馈
+
+> 「有的标准库其实有了，比如 map，完全不需要自己做。你把不需要的删掉，这些没什么用。」
+
+### 采用的判据（新增，写进计划文档）
+
+**一个 Go 包如果其功能在 C++ 标准库里已有等价物，就不该再封装一层。**
+封装只会得到「同一个实现的第二个名字」：增加维护面、让转译器多一层无意义的间接，
+而且一旦 C++ 标准库演进，还得跟着改两份。
+
+### 从计划中移除（并给出替代写法）
+
+| 移除项 | C++ 等价物 |
+|---|---|
+| `slices` | `std::ranges` / STL 算法（`std::sort`/`std::find`/`std::ranges::contains`） |
+| `maps` | `std::unordered_map` / `std::map`（`contains`/`erase_if`/range-for） |
+| `cmp` | C++20 `operator<=>` |
+| `math/bits` | C++20 `<bit>`（`std::popcount`/`std::rotl`/`std::countl_zero`/`std::bit_width`） |
+| `container/heap` | `std::priority_queue`（或 `std::push_heap`/`pop_heap`） |
+| `container/list` | `std::list` |
+| `path` / `path/filepath` | `std::filesystem::path` + `recursive_directory_iterator` |
+| `math` 的大部分 | `<cmath>`（只保留 Go 特有且易写错的，按需再加） |
+| `bytes` 的函数家族 | `go2cpp/strings.hpp` 同名函数（C++ 里 `std::string` 就是字节序列） |
+| `bytes.Reader` | `go2cpp::streams::StringReader` |
+| `sort` 的 `Ints`/`Strings`/`Float64s`/`*AreSorted` | `std::sort` / `std::is_sorted` |
+| `sync/atomic` | `std::atomic` |
+
+（`container/ring` 无直接等价物，保留评估。）
+
+### 代码精简（本次实际执行）
+
+| 文件 | 变化 | 说明 |
+|---|---|---|
+| `include/go2cpp/tools/bytes.hpp` | **532 → 269 行** | 删除 30+ 个函数家族转发（与 `strings` 同类型，纯转发）与重复的 `bytes::Reader`；只保留 Go 特有的 `Buffer`，并在文件头列出每个被删 API 的替代写法 |
+| `include/go2cpp/tools/sort.hpp` | 删除 6 个函数 | 删掉 `Ints`/`Strings`/`Float64s`/`IntsAreSorted`/`StringsAreSorted`/`Float64sAreSorted`（都是标准库一行调用）；**只保留** `Float64LessNaN` 比较器，因为「NaN 视为最小」是 Go 特有语义、容易写错 |
+
+### 文档更新
+
+- `NextStep/go-stdlib-map.md`：新增 **§4.4「不实现：C++ 标准库已提供」**（15 行映射表 + 判据 + 本次精简记录）；
+  §3 表格中 `slices`/`maps`/`cmp`/`math/bits`/`path`/`path/filepath`/`container/*` 的结论列由「缺」改为「**不实现**」，
+  `sort`/`bytes` 改为「**部分**」并写明只做哪部分；S1/S3/S6 的阶段清单同步收缩。
+- `NextStep/roadmap.md`：S3 从「容器与工具补齐（8 个模块）」收缩为「**IO 工具补齐**（`bufio` + `encoding/binary`）」；
+  S6 移除 `container/*`，`hash/*` 标注为「无标准等价物，需实现」。
+
+### 保留（这些有真实的 Go 特有语义，不删）
+
+`strings`（Go 的 `Split`/`Trim` 语义与 STL 不同）、`strconv`（`base=0` 推断、下划线、`ErrRange` 钳制值）、
+`fmt`（`%v`/`%w` 指令集与 `%!verb(...)` 标记）、`streams`（Go 的 `n>0` 同时带错误契约）、
+`time`（`Duration.String()` 格式、单调读数、零值语义）、
+`sort` 的 `Slice*`/`Search`/`Find`（Go 特有返回语义）、`bytes::Buffer`（读写游标分离与 `Next`/`UnreadByte` 等）。
+
+### 验证
+
+两个模块的验证程序在精简后重新编译运行：**0 warning / 0 error，failures=0**
+（`sort` 的断言改为直接用 `std::sort`/`std::is_sorted` + `Float64LessNaN`；`bytes` 只断言 `Buffer`）。
+
+### 待办
+
+| 项 | 说明 |
+|---|---|
+| `sort`/`bytes` 的正式测试与示例 | 按项目规范仍需补齐（源码与头文件级验证已就绪） |
+| 后续标准库模块 | 按收缩后的 S3 只做 `bufio` + `encoding/binary`；再往后是 S5（JSON 绑定策略决策） |

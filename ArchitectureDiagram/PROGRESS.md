@@ -51,6 +51,9 @@
 | 40 | 开发测试：`tests/tools/test_time.cpp` | `../tests/tools/test_time.cpp` | **已完成（第 20 轮）**：6 场景 + 10 万×2 + 3 组随机性质；已通过 |
 | 41 | 开发示例：`example/tools/time_{demo,full}.cpp` | `../example/tools/` | **已完成（第 20 轮）**：3/6 场景；退出码均 0 |
 | 42 | 必须项②缺口修复：第三方库逐库计划产出时间 | `../NextStep/third-party-plan.md` §3.5 + `roadmap.md` T 表 | **已完成**：18 行逐库表（时间 + 前置 + 验收物）；commit `f3f965f` |
+| 43 | 开发：`tools/sort.hpp`（Go sort 对应） | `../include/go2cpp/tools/sort.hpp` | **已完成（第 21 轮）**：260 行；0 warning + 全部断言通过（含 100 万随机排序与 10 万对稳定性）；待补测试/示例登记 |
+| 44 | 开发：`tools/bytes.hpp`（Go bytes 对应） | `../include/go2cpp/tools/bytes.hpp` | **已完成（第 21 轮）**：532 行；0 warning + 全部断言通过（含 Buffer 全方法与 Reader 定位）；待补测试/示例登记 |
+| 45 | 按反馈做减法：删除 C++ 标准库已有的重复实现 | `../NextStep/go-stdlib-map.md` §4.4 + `roadmap.md` + 两个头文件 | **已完成（第 22 轮）**：计划移除 slices/maps/cmp/math-bits/container/path* 等 12 项（给出 C++ 替代写法）；`bytes.hpp` 532→269 行（只留 Buffer）、`sort.hpp` 删 6 个纯转发（只留 Float64LessNaN）；两个验证程序复验 0 warning / failures=0 |
 | 22 | NextStep：第三方库预研（候选/许可证/可移植性） | `../NextStep/third-party-plan.md` | **已完成**：T1~T4 分层候选 + 五项可移植性判据 + 已核验 gin/cobra/gorm 的 LICENSE 原文 |
 | 23 | NextStep：路线图与里程碑 | `../NextStep/roadmap.md` | **已完成**：关键路径 + S1~S7/T1~T4 阶段计划 + M1~M5 里程碑 + 风险缓解 |
 
@@ -87,4 +90,5 @@
 | 21 | `streams` 示例 + 全量验证 + codex.md + 提交 | **已完成（第 18 轮）** | `example/tools/streams_{demo,full}.cpp`（103/179 行，3/6 场景）；全量构建 0 warning、ctest 77/77（29.67 s）；`codex.md` 第 28 轮；commit `c2fe880`（11 文件 / +1497） |
 | 22 | 开发：`tools/time.hpp`（Go time 核心子集） | **已完成（第 19 轮）** | ~410 行 + 转发头；Duration（int64 纳秒 + Go 格式 String + 单位换算 + Truncate/Round/Abs + 运算符，含 int*Duration）、Time（墙钟+单调读数、Add/Sub/Unix*/比较/IsZero/String）、Since/Until/Sleep（走 Hook 拦截的 nanosleep → 协作式）；编译 0 warning、time_check failures=0 |
 | 23 | `time` 的测试与示例 + 登记 + 全量验证 | **已完成（第 20 轮）** | `tests/tools/test_time.cpp`（282 行，6 场景 + 10 万×2 + 3 组随机）、`example/tools/time_{demo,full}.cpp`（81/169 行）、三处登记；全量构建 0 warning、ctest 79/79（30.52 s） |
-| 24 | 下一轮 | 继续 S1/S2：`tools/sort.hpp` + `tools/bytes.hpp` | 待办 | Go sort 的排序接口（Slice/Stable/IsSorted/Search）+ bytes 的 Buffer/Compare/Contains/Trim 家族；两者都是纯函数，投产比高，可一轮做完实现+验证 |
+| 24 | 开发：`tools/sort.hpp` + `tools/bytes.hpp` | **已完成（第 21 轮）** | `sort.hpp` 260 行（Sort/Stable/IsSorted、Slice*、Ints/Strings/Float64s、Search/Find/Search*、ReverseLess）；`bytes.hpp` 532 行（30+ 函数转发 strings + 完整 Buffer + Reader）；两个验证程序均 0 warning / failures=0 |
+| 25 | 下一轮 | sort + bytes 的测试与示例 + 登记 + 提交 | 待办 | tests/tools/test_{sort,bytes}.cpp（大数据量/随机/≥5 场景）、example/tools/{sort,bytes}_{demo,full}.cpp、ctest、codex.md 第 30 轮、提交 |

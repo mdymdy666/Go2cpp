@@ -82,15 +82,15 @@ python3 /tmp/stdlib_stats.py        # 脚本逻辑见本文件 §1.2
 | `fmt` | 337 | 无（示例用 `std::cout`/`GO2CPP_LOG_*`） | **缺** | `Sprintf`/`Sprintln`/`Printf`/`Errorf`（含 `%v`/`%w`） |
 | `strings` | 268 | 无（直接用 `std::string`） | **缺** | `Contains`/`Split`/`Join`/`Trim*`/`HasPrefix`/`Replace*`/`Builder` |
 | `strconv` | 163 | 无 | **缺** | `Atoi`/`Itoa`/`ParseInt`/`ParseFloat`/`FormatFloat`/`Quote` |
-| `bytes` | 183 | `net::ByteArray`（协议用） | **部分** | `Buffer`（读写游标+`String()`）、`Contains`/`Split`/`Fields`、`Equal` |
-| `sort` | 103 | 无（可用 `std::sort`） | **缺** | `Slice`/`SliceStable`/`Search`/`Strings`/`Ints` |
-| `slices` | 67 | 无（Go 1.21+ 泛型） | **缺** | `Contains`/`Index`/`Sort`/`SortFunc`/`Clone`/`Delete` |
-| `maps` | 22 | 无 | **缺** | `Keys`/`Values`/`Clone`/`Equal` |
+| `bytes` | 183 | `std::string` + `go2cpp/strings.hpp` | **部分（只做 `Buffer`）** | 函数家族直接映射到 `strings.hpp`；`Reader` 用 `streams::StringReader`（见 §4.4） |
+| `sort` | 103 | `std::sort`（`Ints`/`Strings`/`Float64s` 直接用） | **部分** | 只做 Go 特有语义：`Slice*`（下标式 less）、`Search`/`Find`（返回 `n`/三向）、`Float64LessNaN` |
+| `slices` | 67 | `std::ranges` / STL 算法 | **不实现** | 见 §4.4：直接用标准库算法 |
+| `maps` | 22 | `std::unordered_map` / `std::map` | **不实现** | 见 §4.4 |
 | `unicode/utf8` | 87 | 无 | **缺** | `RuneCount`/`DecodeRune`/`Valid`/`RuneLen` |
 | `unicode` | 64 | 无 | **缺** | `IsLetter`/`IsDigit`/`ToUpper`/`ToLower`（可薄封装 `<cctype>`+UTF-8） |
-| `cmp` | 19 | 无 | **缺** | `Compare`/`Or`/`Less`（三行模板） |
+| `cmp` | 19 | C++20 `operator<=>` | **不实现** | 见 §4.4 |
 | `math` | 76 | 无 | **缺** | `Sqrt`/`Pow`/`Abs`/`Floor`/`Ceil`/`Max`/`Min`/常量 |
-| `math/bits` | 52 | 无 | **缺** | `Len`/`OnesCount`/`RotateLeft`（直接映射 `std::popcount` 等） |
+| `math/bits` | 52 | C++20 `<bit>`（`std::popcount` 等） | **不实现** | 见 §4.4 |
 | `math/big` | 20 | 无 | **缺（大工程）** | `Int`/`Float`/`Rat`；建议**不实现**或用 GMP 移植（见 §4 P3） |
 | `regexp` | 50 | 无 | **缺（中工程）** | RE2 语义；可移植 [google/re2](https://github.com/google/re2)（BSD-3） |
 | `reflect` | 59 | 无 | **明确不实现** | Go 的反射依赖运行时类型信息；Go2Cpp 用「代码生成/模板」替代 |
@@ -113,8 +113,8 @@ python3 /tmp/stdlib_stats.py        # 脚本逻辑见本文件 §1.2
 | `os` | 213 | 部分：`FdManager`（fd 元数据）；Hook 已拦截 syscall | **部分** | `os::File`（`Open/Create/Read/Write/Seek/Stat`）、`ReadFile`/`WriteFile`、`Getenv`/`Setenv`、`Args`、`Exit` |
 | `bufio` | 77 | 无（http 自己带缓冲） | **缺** | `Reader`（`ReadString`/`ReadBytes`/`Peek`）、`Writer`（`Flush`）、`Scanner` |
 | `io/fs` | 51 | 无 | **缺** | `FS`/`File` 接口抽象（虚拟文件系统） |
-| `path/filepath` | 103 | 无 | **缺** | `Join`/`Dir`/`Base`/`Ext`/`Clean`/`Abs`/`Walk` |
-| `path` | 42 | 无 | **缺** | 与 filepath 共用（URL 路径版） |
+| `path/filepath` | 103 | `std::filesystem::path` 与 `recursive_directory_iterator` | **不实现** | 见 §4.4 |
+| `path` | 42 | `std::filesystem::path` | **不实现** | 见 §4.4 |
 | `os/exec` | 49 | 无 | **缺（中工程）** | `Command`/`Run`/`Output`（`fork`+`exec`+管道） |
 | `embed` | 24 | 无 | **缺（小工程）** | 编译期嵌入文件（代码生成即可） |
 | `testing` | 19 | 项目自研 `tests/test_support.hpp`（`check`/`require`/watchdog） | **部分** | 转译 Go 测试需要 `testing.T` 风格（`t.Fatalf`/`t.Run`/表驱动） |
@@ -160,7 +160,7 @@ python3 /tmp/stdlib_stats.py        # 脚本逻辑见本文件 §1.2
 |---|---:|---|---|---|
 | `flag` | 62 | 部分：`config` 模块（INI） | **部分** | `flag::String`/`Int`/`Parse`（命令行） |
 | `math/rand` | 19 | 无 | **缺** | `rand::Intn`/`Float64`/`Seed`（Go 1.20+ 全局源自动随机） |
-| `container/heap`/`list`/`ring` | 3/3/0 | 无 | **缺（小）** | 泛型容器（`list`/`ring` 各约 100 行） |
+| `container/heap`/`list`/`ring` | 3/3/0 | `std::priority_queue` / `std::list`（ring 无等价物） | **不实现**（ring 保留评估） | 见 §4.4 |
 | `hash/crc32`/`fnv`/`adler32` | 3/3/1 | 无 | **缺（小）** | 校验和工具 |
 | `database/sql` | 0 | 无 | **明确不做** | 需要驱动生态（Go2Cpp 定位是运行时，不是驱动） |
 | `debug/*`（elf/dwarf/pe） | 23..1 | 无 | **明确不做** | 工具链用途 |
@@ -181,12 +181,12 @@ python3 /tmp/stdlib_stats.py        # 脚本逻辑见本文件 §1.2
 
 | 阶段 | 计划产出时间 | 模块（新建文件） | 预计工时 | 产出物 |
 |---|---|---|---|---|
-| **S1（P0）** | 第 1 周 | `tools/fmt.hpp`、`tools/strings.hpp`、`tools/strconv.hpp`、`tools/bytes.hpp`、`tools/sort.hpp` | 5×0.5–1 天 | 5 个头文件 + 5 个 `tools/*` 示例（demo/full）+ 登记 CMake |
+| **S1（P0）** | 第 1 周 | `tools/fmt.hpp`、`tools/strings.hpp`、`tools/strconv.hpp`、`tools/bytes.hpp`（**只做 `Buffer`**）、`tools/sort.hpp`（**只做 Go 特有语义**） | 5×0.5–1 天 | 5 个头文件 + 示例（demo/full）+ 登记 CMake；`slices`/`maps`/`cmp`/`math/bits` 等**不做**（见 §4.4） |
 | **S2（P0）** | 第 1–2 周 | `io.hpp`（Reader/Writer 接口 + Copy/ReadAll）、`os.hpp`（File/Getenv/Args）、`time.hpp`（Duration/Now/Sleep/Ticker） | 3×1–1.5 天 | 3 个模块 + 与 Hook 的协作式 Sleep 打通 |
-| **S3（P1）** | 第 2–3 周 | `bufio.hpp`、`path/filepath.hpp`、`slices.hpp`、`maps.hpp`、`cmp.hpp`、`math.hpp`、`math/bits`、`encoding/binary` 补全 | 8×0.5–1 天 | 8 个薄封装模块 |
+| **S3（P1）** | 第 2–3 周 | `bufio.hpp`（`Reader`/`Writer`/`Scanner`，Scanner 的分词语义 Go 特有）、`encoding/binary` 补全（`Read`/`Write`/`Varint`） | 2×0.5–1 天 | 2 个薄封装模块；`slices`/`maps`/`cmp`/`math`/`math/bits`/`path/filepath` **不做**（见 §4.4） |
 | **S4（P1）** | 第 3–4 周 | `sync` 补 `Once`/`Pool`/`Map`；`sync/atomic` 薄封装；`math/rand`；`encoding/base64`/`hex` | 6×0.5–1 天 | 现有模块扩展 + 新小模块 |
 | **S5（P1）** | 第 4–6 周 | `encoding/json` 的 `Marshal`/`Unmarshal`（结构体映射，**需先定策略**：代码生成 vs 手写 tag 注册）、`net` 的 `Conn`/`Listener` 抽象、`net/url` 独立模块 | 3×2–3 天 | 转译可用性最大的一块（JSON 是 Web 业务的核心） |
-| **S6（P2）** | 第 6–8 周 | `http` 的 `ServeMux`/`Handler`/中间件、`Client` 连接池、`text/template`、`os/exec`、`flag`、`container/*`、`hash/*` | 7×1–2 天 | 从「有协议解析」到「能写 Web 服务」 |
+| **S6（P2）** | 第 6–8 周 | `http` 的 `ServeMux`/`Handler`/中间件、`Client` 连接池、`text/template`、`os/exec`、`flag`、`hash/*`（`fnv`/`crc32` 无标准等价物） | 6×1–2 天 | 从「有协议解析」到「能写 Web 服务」；`container/*` **不做**（见 §4.4） |
 | **S7（P3/边界）** | 第 9 周起 | `regexp`（移植 RE2）、`crypto/sha256`·`hmac`·`rand`（移植成熟 C 实现）、`testing` 风格、`math/big`（评估 GMP） | 按需 | 逐项写清移植来源与许可证 |
 
 ### 4.3 不建议实现（写进文档边界，避免误期待）
@@ -202,6 +202,36 @@ python3 /tmp/stdlib_stats.py        # 脚本逻辑见本文件 §1.2
 
 ---
 
+### 4.4 不实现：C++ 标准库已提供（2026-10-15 按使用者反馈精简）
+
+**判据**：一个 Go 包如果其功能在 C++ 标准库里已有**等价物**，就不该再封装一层 ——
+封装只会得到「同一个实现的第二个名字」，既增加维护面，也让转译器多一层无意义的间接。
+下面是这些包与其 C++ 对应写法（**计划中已移除，不再排期**）：
+
+| Go 包 | C++ 等价物 | 说明 |
+|---|---|---|
+| `slices`（Go 1.21+ 泛型切片工具） | `std::ranges` / STL 算法（`std::sort`、`std::find`、`std::ranges::contains`） | `slices.Contains`/`Index`/`Sort`/`Clone` 都是一行算法调用 |
+| `maps`（泛型 map 工具） | `std::unordered_map` / `std::map`（遍历、`contains`、`erase_if`） | `maps.Keys`/`Values` 用 range-for 或 `std::views` 即可 |
+| `cmp`（三向比较） | C++20 `operator<=>`（或本项目 `strings::Compare` 风格的 `-1/0/+1`） | `cmp.Compare`/`Less`/`Or` 共约三行模板 |
+| `math/bits` | C++20 `<bit>`：`std::popcount`/`std::rotl`/`std::countl_zero`/`std::bit_width` | 一一对应 |
+| `container/heap` | `std::priority_queue`（或 `std::push_heap`/`pop_heap`） | 需要自定义比较时用后者 |
+| `container/list` | `std::list` | 双向链表 |
+| `container/ring` | 无直接等价物，但实现约 30 行 | **保留评估**（用到再说） |
+| `path` / `path/filepath` | `std::filesystem::path`（`/`、`filename()`、`extension()`、`lexically_normal()`） | `filepath.Join`/`Dir`/`Base`/`Ext`/`Clean` 均有对应；`filepath.Walk` 用 `std::filesystem::recursive_directory_iterator` |
+| `sort` 的 `Ints`/`Strings`/`Float64s`/`*AreSorted` | `std::sort` / `std::is_sorted` | 仅浮点的 **NaN 语义**是 Go 特有，已在本项目 `tools/sort.hpp` 保留为 `Float64LessNaN` 比较器 |
+| `bytes` 的函数家族（`Contains`/`Split`/`Trim*`/…） | `go2cpp/strings.hpp` 的同名函数（参数传 `std::string`） | C++ 里 `std::string` 就是字节序列，`bytes`/`strings` 是**同一个类型**，无需两份 API |
+| `bytes.Reader` | `go2cpp::streams::StringReader` | 功能覆盖 `Read`/`ReadAt`/`Seek`/`ReadByte`/`ReadRune` |
+| `sync/atomic` | `std::atomic` | 仅在需要 Go 的 `AddInt64` 风格名字时再加薄别名 |
+| `math` 的大部分 | `<cmath>`（`std::fabs`/`std::floor`/`std::pow`/`std::sqrt`/`std::isnan`…） | 只保留 Go 特有且易写错的（如 `math.Mod` 与 `%` 的差异、`math.Round` 的半值规则）**在需要时**再补 |
+
+**据此调整的计划**：S1 里 `bytes.hpp` 收缩为「只做 `Buffer`」；S3 移除 `slices`/`maps`/`cmp`/`math`/`math/bits`/
+`path/filepath`，只留 `bufio` 与 `encoding/binary` 补全；S6 移除 `container/*`。
+
+**已经落地为代码的精简**（同一次修订）：
+
+- `include/go2cpp/tools/bytes.hpp`：**532 → 269 行**，删除 30+ 个函数家族转发与重复的 `bytes::Reader`，只留 Go 特有的 `Buffer`；
+- `include/go2cpp/tools/sort.hpp`：删除 `Ints`/`Strings`/`Float64s`/`IntsAreSorted`/`StringsAreSorted`/`Float64sAreSorted` 六个纯转发，
+  只保留 Go 特有的 `Float64LessNaN` 比较器（并把替代写法写进文件头）。
 ## 5. 结论：如果只做 6 件事
 
 按「转译阻断度 × 复用度」排序，**最该先做的六个模块**：
