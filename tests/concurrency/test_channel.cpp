@@ -4,6 +4,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
+#include <random>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -456,4 +458,84 @@ void run_channel_tests() {
     GO2CPP_CHECK(shutdown_task->state() == GState::kCancelled ||
                  shutdown_task->state() == GState::kDead);
     GO2CPP_CHECK(shutdown_returned.load(std::memory_order_acquire));
+
+    // 环形缓冲专项：索引回绕、容量边界与随机对拍（对齐 Go hchan 的
+    // buf/sendx/recvx/qcount 模型）。替换 deque 后这些是最容易出错的地方。
+    {
+        // 场景 1：容量 2 反复回绕 200 轮，验证 FIFO 与索引回绕。
+        auto ring = MakeChannel<int>(2);
+        bool ring_ok = true;
+        for (int round = 0; round < 200; ++round) {
+            ring_ok = ring_ok && ring->Send(round * 2).Ok();
+            ring_ok = ring_ok && ring->Send(round * 2 + 1).Ok();
+            ring_ok = ring_ok && ring->Recv().ValueOrDefault() == round * 2;
+            ring_ok = ring_ok && ring->Recv().ValueOrDefault() == round * 2 + 1;
+        }
+        GO2CPP_CHECK(ring_ok);
+        GO2CPP_CHECK(ring->Len() == 0);
+
+        // 场景 2：容量 1 的满/空交替（最容易暴露 head 前进与计数错误）。
+        auto single = MakeChannel<int>(1);
+        bool single_ok = true;
+        for (int i = 0; i < 1000; ++i) {
+            single_ok = single_ok && single->TrySend(i).Ok();
+            single_ok = single_ok &&
+                        single->TrySend(-1).status == ChannelStatus::kWouldBlock;
+            single_ok = single_ok && single->TryRecv().ValueOrDefault() == i;
+            single_ok = single_ok &&
+                        single->TryRecv().status == ChannelStatus::kWouldBlock;
+        }
+        GO2CPP_CHECK(single_ok);
+
+        // 场景 3：容量取非 2 的幂（7），强制回绕不整齐；2 万个值跨线程传递
+        // 并校验总和，覆盖大数据量与生产者/消费者并行两种压力。
+        constexpr int kRingTotal = 20000;
+        auto bulk = MakeChannel<int>(7);
+        std::atomic<long long> bulk_sum{0};
+        std::thread bulk_producer([&] {
+            for (int i = 0; i < kRingTotal; ++i) {
+                bulk->Send(i);
+            }
+        });
+        std::thread bulk_consumer([&] {
+            long long local = 0;
+            for (int i = 0; i < kRingTotal; ++i) {
+                local += bulk->Recv().ValueOrDefault();
+            }
+            bulk_sum.store(local, std::memory_order_relaxed);
+        });
+        GO2CPP_JOIN_WITH_WATCHDOG(bulk_producer, 10s);
+        GO2CPP_JOIN_WITH_WATCHDOG(bulk_consumer, 10s);
+        GO2CPP_CHECK(bulk_sum.load(std::memory_order_relaxed) ==
+                     static_cast<long long>(kRingTotal) * (kRingTotal - 1) / 2);
+        GO2CPP_CHECK(bulk->Len() == 0);
+
+        // 场景 4：随机操作与 std::deque 参考模型对拍 —— 通道的输出序列必须
+        // 与参考队列完全一致（2 万步，容量 5）。
+        std::mt19937 rng(20261015);
+        auto model_channel = MakeChannel<int>(5);
+        std::deque<int> model;
+        int next_value = 0;
+        bool model_ok = true;
+        for (int step = 0; step < 20000; ++step) {
+            const bool do_send = (rng() % 2U) == 0U;
+            if (do_send && model.size() < 5) {
+                const int value = next_value++;
+                model_ok = model_ok && model_channel->TrySend(value).Ok();
+                model.push_back(value);
+            } else if (!model.empty()) {
+                const int expected = model.front();
+                model.pop_front();
+                model_ok = model_ok &&
+                           model_channel->TryRecv().ValueOrDefault() == expected;
+            }
+        }
+        GO2CPP_CHECK(model_ok);
+        GO2CPP_CHECK(model_channel->Len() == model.size());
+        while (!model.empty()) {
+            GO2CPP_CHECK(model_channel->TryRecv().ValueOrDefault() == model.front());
+            model.pop_front();
+        }
+        GO2CPP_CHECK(model_channel->Len() == 0);
+    }
 }

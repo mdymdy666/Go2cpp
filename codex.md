@@ -6549,3 +6549,42 @@ Final verification from /UserData/CodexWorkSpace/Go2Cpp:
   `ThreadSanitizer: unexpected memory mapping` 启动限制拒绝，不能据此宣称 TSan 通过；
   `BindRuntimeConfig` 仍要求调用方保证裸指针目标覆盖整个监听生命周期，接口文档已明确，
   后续可增加 RAII 绑定句柄以降低误用风险。
+---
+
+## 2026-10-15：Channel 缓冲由 std::deque 改为环形结构（对齐 Go hchan）
+
+**背景**：使用者指出 Channel「包含太多东西」，要求做性能测试并与传统「线程 + 异步队列」对比。
+对比结果显示 Channel 的空探测慢约 13 倍、有缓冲吞吐慢 3–4 倍（详见 `docs/performance.md`），
+使用者要求「按 Go 源码设计，把状态考虑清楚」后再优化。
+
+**设计依据（读 Go 源码后确定）**：`go/src/runtime/chan.go` 的 `hchan` 用
+`buf`（预分配数组）+ `dataqsiz` + `sendx`/`recvx`（环形索引）+ `qcount`，
+**不是** `deque`；且索引推进用 `sendx++ / if sendx == dataqsiz { sendx = 0 }`，**不做取模**。
+原 C++ 实现的等待队列/大锁/单赢家仲裁都与 Go 一致，唯独缓冲用了 `std::deque<T>` —— 这是差距来源。
+
+**改动**：
+
+- 新增 `detail::RingBuffer<T>`（channel.hpp）：原始存储 + 就地构造，`capacity == 0` 不分配；
+  接口保持 `deque` 子集，通道内部 15 个调用点零改动；
+- `Channel<T>::m_buffer` 类型替换，构造函数增加 `m_buffer(capacity)` 初始化；
+- 槽位推进改为「索引 ++ 后回绕」，去掉锁内取模（初版用 `%`，MPMC 场景被拖慢）。
+
+**测试**：`ctest` 79/79 通过（29.55 s），构建 0 warning；`test_channel.cpp` 新增 4 个环形缓冲专项
+（容量 2 回绕 200 轮、容量 1 满空交替 1000 轮、容量 7 跨线程 2 万值求和、2 万步随机与 deque 参考模型对拍）。
+
+**性能（build-bench / Release / -O2，3 次运行 × 3 轮）**：
+
+- 改善：SPSC 缓冲 64 由 735 → 588–629 ns（14–20%）；SPSC 缓冲 1024 由 268 → 226–239 ns（11–16%）；
+  MPMC 缓冲 1024 由 738 → 652–694 ns（6–12%）；ping-pong 双向约改善 4–24%；
+- **未解决**：MPMC 缓冲 64 由 4,892 → 5,598–5,898 ns（**退化 14–21%**）；已排除锁内取模因素，
+  原因待单独剖析；
+- 空探测（51–53 ns）未变，该路径不进缓冲。
+
+**被否决的方案**：曾设计「原子标志 + `Try*` 无锁快速路径」以优化空探测，最终放弃 ——
+Go 的 `hchan` 无此机制（偏离上游设计），需插桩十余处且漏一处即偶发丢值，收益仅覆盖「必然失败」的路径。
+
+**关键文件**：`include/go2cpp/concurrency/channel.hpp`、`tests/concurrency/test_channel.cpp`、
+`benchmarks/channel_vs_queue_benchmark.cpp`、`docs/performance.md`。
+
+**后续**：单独剖析 MPMC 小容量场景（容量 64）的退化来源；如无法收敛，评估是否对
+小容量回退到 `deque` 或调整等待路径。

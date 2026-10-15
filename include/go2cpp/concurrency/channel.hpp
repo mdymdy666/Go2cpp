@@ -591,8 +591,108 @@ struct ChannelRecvResult {
  * 长于仍在使用它的等待者。T 必须可无异常移动构造和析构，内建 select 对
  * T 还要求可复制；不可复制值可通过 SelectValue 自定义路径承载。
  */
-/**
- * @brief 支持 Fiber 与线程并发的 FIFO Channel。
+namespace detail {
+
+// 与 Go hchan 的 buf/dataqsiz/sendx/recvx/qcount 对应的环形缓冲。
+//
+// 依赖：使用未初始化存储 + 就地构造，因此 T 只需要可移动构造与析构；
+// capacity == 0 时不分配任何内存（对应 Go 的 dataqsiz == 0，即无缓冲通道）。
+// 接口刻意保持 std::deque 的子集，使通道内部的调用点无需改动。
+//
+// 不变量：m_count == 0 表示空；m_count == m_capacity 表示满；
+//         有效元素位于 [m_head, m_head + m_count) 按 m_capacity 取模的区间内。
+template <typename T>
+class RingBuffer final {
+ public:
+  RingBuffer() noexcept = default;
+
+  explicit RingBuffer(std::size_t capacity) { Reset(capacity); }
+
+  ~RingBuffer() noexcept { Release(); }
+
+  RingBuffer(const RingBuffer&) = delete;
+  RingBuffer& operator=(const RingBuffer&) = delete;
+
+  std::size_t size() const noexcept { return m_count; }
+  bool empty() const noexcept { return m_count == 0; }
+  std::size_t capacity() const noexcept { return m_capacity; }
+
+  T& front() noexcept { return m_slots[m_head]; }
+  const T& front() const noexcept { return m_slots[m_head]; }
+
+  // 调用点保证未满（size() < capacity）。构造失败时不推进计数，
+  // 因此不会留下半个元素 —— 与原来 std::deque::emplace_back 的强保证一致。
+  template <typename U>
+  void emplace_back(U&& value) {
+    ::new (static_cast<void*>(m_slots + m_tail)) T(std::forward<U>(value));
+    ++m_tail;
+    if (m_tail == m_capacity) {
+      m_tail = 0;
+    }
+    ++m_count;
+  }
+
+  void pop_front() noexcept {
+    m_slots[m_head].~T();
+    ++m_head;
+    if (m_head == m_capacity) {
+      m_head = 0;
+    }
+    --m_count;
+  }
+
+  // 回滚最后一次 emplace_back：对应“先占位、认领失败再撤回”的路径。
+  void pop_back() noexcept {
+    std::size_t index = m_tail;
+    if (index == 0) {
+      index = m_capacity - 1;
+    } else {
+      --index;
+    }
+    m_slots[index].~T();
+    m_tail = index;
+    --m_count;
+  }
+
+ private:
+  void Reset(std::size_t capacity) {
+    m_capacity = capacity;
+    m_head = 0;
+    m_tail = 0;
+    m_count = 0;
+    if (capacity == 0) {
+      return;
+    }
+    // 只分配原始存储，不构造任何元素。
+    m_slots = std::allocator_traits<std::allocator<T>>::allocate(m_allocator,
+                                                                capacity);
+    m_allocated = true;
+  }
+
+  void Release() noexcept {
+    while (m_count > 0) {
+      pop_front();
+    }
+    if (m_allocated) {
+      std::allocator_traits<std::allocator<T>>::deallocate(m_allocator, m_slots,
+                                                          m_capacity);
+      m_allocated = false;
+    }
+    m_slots = nullptr;
+  }
+
+  std::allocator<T> m_allocator;
+  T* m_slots{nullptr};
+  std::size_t m_capacity{0};
+  std::size_t m_head{0};
+  std::size_t m_tail{0};
+  std::size_t m_count{0};
+  bool m_allocated{false};
+};
+
+}  // namespace detail
+
+/** * @brief 支持 Fiber 与线程并发的 FIFO Channel。
  * @details capacity=0 时为无缓冲 rendezvous，正值时使用有界 FIFO 缓冲；
  *          关闭会唤醒所有发送者和接收者，Select 通过内部等待节点接入。
  */
@@ -614,7 +714,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     return std::make_shared<Channel<T>>(capacity);
   }
 
-  explicit Channel(std::size_t capacity = 0) : m_capacity(capacity) {}
+  explicit Channel(std::size_t capacity = 0)
+      : m_capacity(capacity), m_buffer(capacity) {}
   ~Channel() noexcept { (void)Close(); }
 
   Channel(const Channel&) = delete;
@@ -1577,7 +1678,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
   std::size_t m_capacity{0};
   mutable std::mutex m_mutex;
   mutable core::ParkingCondition m_change_cv;
-  std::deque<T> m_buffer;
+  detail::RingBuffer<T> m_buffer;
   std::deque<std::shared_ptr<PendingSend>> m_senders;
   std::deque<std::shared_ptr<PendingRecv>> m_receivers;
   bool m_closed{false};
