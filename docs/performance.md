@@ -10,6 +10,95 @@
 > 「2026-10-08：混合 Mutex 快速等待路径」）。更早各节保留原文，用以反映演进
 > 过程与失败尝试。
 
+## 2026-10-15 Channel 与「线程 + 阻塞队列」对比
+
+> **本节条件**：`build-bench`（`CMAKE_BUILD_TYPE=Release`，基准目标另加 `-O2`）；
+> 宿主 AMD Ryzen 9 8945HX（12 线程）/ WSL2；每项跑 **3 轮**，下表给 **median**（区间见括号）；
+> 数据量：SPSC 50,000 个 int；MPMC 4 生产 × 12,500（合计 50,000）；ping-pong 往返 10,000；空探测 100,000。
+> 与本文其它章节**不可横向比较**。
+
+基准程序：`benchmarks/channel_vs_queue_benchmark.cpp`（由 CMake 在 `GO2CPP_BUILD_BENCHMARKS` 下登记）。
+
+对比三种实现（都是 FIFO）：
+
+| 代号 | 实现 |
+|---|---|
+| **A** | `go2cpp::Channel<int>`（本节被考察对象） |
+| **B** | `std::mutex` + **两个** `condition_variable`（`not_empty`/`not_full`）+ `deque`，`notify_one`（教科书式有界队列） |
+| **C** | `std::mutex` + **一个** `condition_variable` + `notify_all`（常见粗糙写法，用于量化惊群代价） |
+
+### 结果（ns/op，越低越好）
+
+**① SPSC 吞吐（1 生产 + 1 消费）**
+
+| 实现 | 容量 | median | min–max |
+|---|---:|---:|---|
+| A Channel | 0 | 29,704 | 29,668–30,136 |
+| A Channel | 64 | 735 | 700–759 |
+| A Channel | 1024 | 268 | 258–270 |
+| B 双 cv 队列 | 1 | 54,724 | 54,037–59,905 |
+| B 双 cv 队列 | 64 | 848 | 802–860 |
+| B 双 cv 队列 | 1024 | **84** | 73–101 |
+| C 单 cv 队列 | 64 | 764 | 730–770 |
+| C 单 cv 队列 | 1024 | 79 | 76–81 |
+
+**② MPMC 吞吐（4 生产 + 4 消费）**
+
+| 实现 | 容量 | median | min–max |
+|---|---:|---:|---|
+| A Channel | 0 | 35,225 | 35,162–35,655 |
+| A Channel | 64 | **4,892** | 4,537–4,972 |
+| B 双 cv 队列 | 64 | **9,253** | 6,590–12,242 |
+| A Channel | 1024 | 738 | 634–913 |
+| B 双 cv 队列 | 1024 | 502 | 435–891 |
+| C 单 cv 队列 | 1024 | 206 | 177–224 |
+
+**③ ping-pong 往返延迟（无缓冲会合，双向）**
+
+| 实现 | median | min–max |
+|---|---:|---|
+| A Channel 无缓冲(0) | 64,937 | 59,740–65,545 |
+| A Channel 有缓冲(1) | 59,976 | 56,244–63,302 |
+| B 双 cv 队列(1) | 52,682 | 52,170–56,279 |
+| C 单 cv 队列(1) | 53,974 | 53,934–54,129 |
+
+**④ 空容器探测成本（`TryRecv` / `TryPop`）**
+
+| 实现 | median | min–max |
+|---|---:|---|
+| A `Channel::TryRecv()` | 53.2 | 53.1–53.7 |
+| B `BoundedQueue::TryPop()` | 4.1 | 4.1–4.3 |
+| C `NaiveQueue::TryPop()` | 4.1 | 4.1–4.1 |
+
+### 结论
+
+1. **Channel 的抽象确实有代价，且可量化**：空探测慢约 **13 倍**（53 ns vs 4 ns，因为要过完整状态机：加锁、查 context、构造结果结构体）；
+   高吞吐有缓冲场景慢 **3–4 倍**（SPSC 1024：268 vs 84 ns）。
+2. **但在「多生产者 + 小缓冲」下 Channel 反而快约 1.9 倍**（MPMC 64：4,892 vs 9,253 ns）：
+   传统队列的 `not_full.notify_one()` 可能叫醒**另一个**生产者（而非刚阻塞的那个），产生「被唤醒→发现无空位→重新等待」的循环；
+   Channel 每个等待节点自带 `ParkingCondition`，可**精确唤醒**目标等待者。这正是多出来的那部分结构换来的收益。
+3. **无缓冲会合（rendezvous）的成本与实现基本无关**：三者都在 52–65 µs 量级（Channel 略慢约 20%），
+   因为该路径由**内核唤醒/调度**主导，而不是由用户态代码路径主导。
+4. **朴素单 cv + `notify_all` 在单生产者场景并不吃亏**（C 与 B 的 64/1024 档基本持平），
+   说明「惊群」的代价主要体现在多等待者竞争时；本轮 MPMC 只跑了 64/1024 两档，未单独量化 C 的 MPMC 小缓冲表现。
+
+### 可优化点（未实施）
+
+- `Channel::TryRecv()` / `TrySend()` 的空容器快速路径：用一个原子标志（或 `m_generation` + 缓冲/队列长度的原子快照）
+  在**不进锁**的情况下判断「必然无值」，可把 53 ns 降到个位数纳秒。当前实现每次都要进锁并构造结果结构体。
+- 缓冲容量的选择对性能影响远大于实现差异（A 从 64 → 1024 提升约 2.7 倍），
+  实际使用中**优先加大容量**比换实现更有效。
+
+### 复现方式
+
+```sh
+cmake -S . -B build-bench -DGO2CPP_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-bench --target go2cpp_channel_vs_queue_benchmark --parallel
+./build-bench/go2cpp_channel_vs_queue_benchmark 3
+```
+
+---
+
 ## 2026-09-30 调度器与混合锁专项收尾
 
 本节是本轮代码变更后的最新结果，优先级高于本文早期采样。测试使用

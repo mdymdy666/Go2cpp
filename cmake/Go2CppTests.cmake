@@ -173,6 +173,12 @@ if (GO2CPP_BUILD_EXAMPLES)
 endif()
 
 if (GO2CPP_BUILD_BENCHMARKS)
+
+    add_executable(go2cpp_channel_vs_queue_benchmark
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/channel_vs_queue_benchmark.cpp)
+    target_link_libraries(go2cpp_channel_vs_queue_benchmark PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_channel_vs_queue_benchmark PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
     add_executable(go2cpp_timer_task_benchmark
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/timer_task_benchmark.cpp)
     target_link_libraries(go2cpp_timer_task_benchmark PRIVATE go2cpp_runtime)
