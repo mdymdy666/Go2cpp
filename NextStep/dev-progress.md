@@ -751,3 +751,43 @@ ctest --test-dir build-quality                           # 79/79 通过（30.52 
 下一批核验：`nats.go`、`prometheus/client_golang`、`golang-jwt/jwt`、`gobreaker`、
 `excelize`、`colly`+`goquery`、`imaging`+`gg`、`opentelemetry-go`；
 核验结论最终要写进 `docs/dependencies.md`（含 commit/tag 与日期）。
+
+---
+
+## 第 26 轮（2026-10-15 20:5x）：第三方库第三、四批核验（累计 29 个）
+
+### 本轮核验（8 个）
+
+| 库 | 许可证 | Star |
+|---|---|---:|
+| `nats-io/nats.go` | **Apache-2.0** | 6,778 |
+| `prometheus/client_golang` | **Apache-2.0** | 6,042 |
+| `golang-jwt/jwt` | **MIT** | 9,241 |
+| `sony/gobreaker` | **MIT** | 3,705 |
+| `qax-os/excelize` | **BSD-3-Clause** | 20,994 |
+| `gocolly/colly` | **Apache-2.0** | 25,551 |
+| `PuerkitoBio/goquery` | **BSD-3-Clause** | 14,988 |
+| `disintegration/imaging` | **MIT** | 5,766 |
+
+**累计 29 个库全部为宽松许可**（MIT / Apache-2.0 / BSD-2 / BSD-3），无一传染性许可。
+
+### 观察
+
+- 本轮 8 个**未再出现 `NOASSERTION`**（上一轮的 `shopspring/decimal` 是特例），
+  说明 GitHub 的自动识别总体可靠，但**不能因此省略原文核验**这一步；
+- `default_branch` 又是两种写法（`main` 3 个、`master` 5 个），进一步印证
+  「不要自行拼 raw URL，用 API 端点」这条经验；
+- **高 star 与可移植性不相关**：`colly`（25.5k）与 `excelize`（21k）体量大、依赖重，
+  可移植性只有 B；而 `bigcache`（8.2k）因设计取向与 Go2Cpp 无 GC 的世界观一致，反而评 A。
+
+### 流程教训（记一笔）
+
+本轮的记录脚本先写 `survey`、后判 `dev-progress` 是否已有内容，判断条件是
+`"第 26 轮" not in 文件内容` —— 但文件里**早在第 10~12 轮的待办里就出现过「第 26 轮」字样**，
+于是脚本误判为「已存在」而跳过写入，导致记录缺失。**改用更精确的锚点（`## 第 26 轮`）后补写。**
+教训与之前那次「编译失败的旧二进制」同源：**用于判断的锚点必须唯一且足够精确**。
+
+### 待办
+
+下一批：`opentelemetry-go`、`sarama`、`amqp091-go`、`asynq`、`fsnotify`、`viper`、`zap`、`testify`；
+核验结论最终要写进 `docs/dependencies.md`（含 commit/tag 与日期）。
