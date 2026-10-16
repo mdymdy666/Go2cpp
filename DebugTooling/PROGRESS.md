@@ -31,11 +31,11 @@
 | 15 | 10-16 核验③：条件变量与 sysmon 阻塞观测 | 读 `ConditionVariable`（`Implement`/`Wait`/`NotifyOne`/`NotifyAll`，`sync.cpp:1021-1180`）：确认 `NotifyOne` 与 `Mutex::Unlock` **完全同构**（队首取 + TryFinish 认领 + 失效跳过 + 锁外 Wake），`NotifyAll` 用 `swap` 端出队列后锁外逐个唤醒（与 `Scheduler::Close` 同手法）；读 sysmon 阻塞观测的**完整生命周期**（声明 `3200-3218` → 超阈 detach `1432-1458` → 退出清理 `3255-3270`，阈值默认 50ms）；**订正 A6 三个易误读点**：`blocking_task` 是阻塞中的 G id、`long_syscall_count` 是累计次数而非时长、detach 会减 `active_machines` 从而可能启动替代 M；并指出「当前阻塞时长」需新增字段（`blocking_since_ns` 未导出） | `sync.cpp:1021-1180`；`scheduler.cpp:1051-1054,1432-1458,3200-3218,3255-3270,3386-3388`；`scheduler.hpp:178-181` |
 | 16 | 10-16 核验④：Context 回调与 Hook 阻塞协作 | 读 `DoneSignal`/`Context` 回调机制（`context.hpp:41-89,256`；`context.cpp:23-27,105-176,266,409-410`）：确认回调分**三类**（internal / before-done / 普通）且**生命周期由调用方负责**（注释原文：信号无法推断回调的对象所有权）→ 调试插件必须用 RAII（与 `CallbackGuard` 同纪律）；读 `hook.cpp`：确认被拦截的 syscall（io/connect/sleep）在 managed G 上用 `BlockingRegion` 声明阻塞，**普通线程保持原生语义**（`hook.cpp:963` 注释）→ 据此指出 A6 的**观测覆盖边界**（未声明的原生阻塞不可见）；补 B6 建议（优先用 `kTaskCancelled` 事件而非自行挂钩回调）；并给出第 13-16 轮核验小结（订正 9 处、解除 1 个阻塞项、4 条易误读、1 条覆盖边界） | `context.hpp:41-89,256-258`；`context.cpp:23-27,105,126,176,266,409-410`；`hook.cpp:206,832-846,940-963,1025` |
 | 17 | 10-16 收官准备 | 采集最新规模（`wc -l`，全部交付 md 合计 3066 行）并更新 `design/05-architecture-summary.md` 的实测行数块；把核验阶段成果合并进 `FINAL-REPORT.md`（新增第 10 节）：四项核验结论、对第 6 节的修正（任意行断点边界**量化为 5 个挂起点**、新增第 7 项**观测覆盖边界**）、四条易误读提示、并把待定案事项**精确分为 A 硬阻塞 3 项 + B 偏好确认 4 项**，同时记录核验净成果（订正 9 处、解除 1 个阻塞、4 条易误读、1 条覆盖边界） | `wc -l DebugTooling/**/*.md`；`design/08-verified-details.md` 小结 |
+| 18 | 10-16 一致性复核与速览 | 跨文档一致性复核：**安全点 5 处、事件 9 类、场景 34、接口 15 全部一致**；发现并修正**一处文档内冲突**（`FINAL-REPORT` 第 7 节写 7 项、第 10.4 节写 3+4 项）——第 7 节标题改为保留初版记录并指向 §10.4 的精确分类；新增 `QUICKSTART.md`（一页速览：先读什么、3 项硬阻塞、现在就能开工的 24 个场景与第一步、做不到的 7 件事、交付物地图） | `grep -rn "5 个挂起点\|9 类\|34 个\|15 个接口"` 复核输出 |
 
-## 下一轮任务（第 18 轮）
+## 下一轮任务（第 19 轮）
 
-1. 复核 `FINAL-REPORT.md` 与 `design/05-architecture-summary.md` 的**内部一致性**
-   （待定案项数量、场景数量、事件数量、安全点数量在各文档中是否一致）；
-2. 复核全部文档的行号引用是否有失效（抽查核验过的行）；
-3. 若时间允许，补一份**一页速览**（`QUICKSTART.md`）：使用者最需要先看什么、三项定案如何影响后续。
-4. 到 14:00 后：删除定时任务并向使用者做收官汇报。
+1. 抽查核验过的源码行号是否仍然有效（例如 `scheduler.cpp:1529`、`sync.cpp:955`、
+   `fiber.hpp:206`、`hybrid_mutex.hpp:23`、`context.hpp:73`、`hook.cpp:963`）；
+2. 若发现行号漂移则订正；
+3. 准备 14:00 的收官汇报（届时删除定时任务）。
