@@ -15,6 +15,8 @@
 | **E** | 远程、多机与工具链 | 6 | 如何跨进程/跨机器/与 gdb 协同 |
 | | **合计** | **34** | |
 
+> **展开进度**（第 7 轮）：A 类 → `A-observability.md`；B 类 → `B-mutation.md`；C 类 → `C-visualization.md`；D 类 → `D-locks.md`；E 类 → `E-remote-and-tooling.md`。**34 个场景已全部展开**。
+
 ## A. 只读观测（8 个）
 
 | 编号 | 场景 | 现有能力（证据） |
