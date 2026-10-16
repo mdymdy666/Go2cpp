@@ -6588,3 +6588,39 @@ Go 的 `hchan` 无此机制（偏离上游设计），需插桩十余处且漏�
 
 **后续**：单独剖析 MPMC 小容量场景（容量 64）的退化来源；如无法收敛，评估是否对
 小容量回退到 `deque` 或调整等待路径。
+
+---
+
+## 2026-10-16 13:00–13:55：GMP 调试模块开发启动（分支 feature/gmp-debug-module）
+
+**背景**：前阶段已完成 DebugTooling/ 的设计文档（20 个文件、34 场景、20 dump 选项）。
+使用者确认三项定案并补充架构约定后，进入编码阶段。
+
+**使用者定案**：① 元数据用 `DebugFiber` 继承 `Fiber`，调试信息放 `DebugFiber`，不影响原框架；
+② 多机时钟用双时间戳并声明不做绝对对齐；③ 运行期可改参数只开放观测/节律类。
+**补充约定**：所有 Debug 类尽量**继承原类 + 加 `Debug` 前缀**，避免重复实现。
+
+**新增文件（3 个，原框架零改动）**：
+- `include/go2cpp/debug/debug_fiber.hpp`（183 行）：`FiberDebugInfo`、`DebugFiber : public Fiber`、
+  `DebugRegistry`（独立 `std::mutex` 注册表，刻意不用 `sync::Mutex` 以免依赖调度器上下文）；
+- `include/go2cpp/debug.hpp`（5 行转发头）；
+- `tests/debug/test_debug_fiber.cpp`（232 行）。
+另登记 `cmake/Go2CppTests.cmake` 与 `tests/test_main.cpp`。
+
+**编译探针实测（决定安全用法）**：`Fiber` 的 `is_polymorphic` = **0**（无虚析构）、
+`is_final` = 0（可继承）、无默认构造、不可拷贝/移动；子类可正常实例化并访问继承来的 `id()`。
+→ 硬约束：**`DebugFiber` 绝不可通过 `Fiber*`/`unique_ptr<Fiber>` 销毁**，
+因此**不得**放入 `Task::m_fiber`（`scheduler.hpp:364` 是 `unique_ptr<Fiber>`）。
+
+**可继承性核实（重要发现）**：`grep -rn "class [A-Za-z_]* final" include/` 显示
+**多数类被标记 `final`**，包括调试最关心的 `sync::Mutex`、`ConditionVariable`、`WaitGroup`、
+`Channel`、`Context`、`Timer`/`TimerService`、`HybridGate`、`ParkingCondition`、`BlockingRegion`、
+`Future`/`Promise`、`FiberLocalCache` 等。可继承的只有 `Fiber`/`Task`/`Scheduler`/`SchedulerObserver`。
+→ 已写 `design/09-debug-class-conventions.md` 给出三档策略：A 继承 / B 组合 / C 只读快照，
+并明确**不去掉原类的 `final`**（那等于改原框架，违反使用者要求）。
+
+**测试设计（按项目规范）**：5 个真实场景（带描述构造与查询、未注册语义区分、特殊字符承载、
+`Fiber::id()` 关联、4 线程并发注册查询）+ 压测（1000 次创建注册、20000 次注册查询，只报量级）
++ 随机（500 组随机元数据逐组校验读回一致）。
+
+**后续状态**：P0 进行中；下一步跑全量验证并做 `emit_event` 微基准。
