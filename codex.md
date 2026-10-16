@@ -6687,3 +6687,26 @@ worker 数增加时比例上升（4 worker 档1 为 +22.7%），其中包含 `ob
 压测（仅报量级）：`Snapshot` ×2000 = 2.5 ms（≈1.26 µs/次）；三种 `Dump` ×200 = 2.3 ms（≈11.6 µs/次）。
 
 **后续**：P1 剩余（CLI 入口 + 文件 sink）、"枚举全部 G"接口（需在原类加私有 Debug 方法 + friend）。
+
+---
+
+## 2026-10-16 14:45–15:05：调试模块开发第 7 轮 —— dump CLI 与原子文件 sink
+
+**新增**：`include/go2cpp/debug/debug_cli.hpp`（219 行）与 `tests/debug/test_debug_cli.cpp`（214 行），
+更新 `debug.hpp` 转发头，登记 CMake 与 `test_main`。
+
+**能力**：`ParseDumpCommand` 解析 `dump scheduler [--format=text|ini|json] [--output=<file>|-] [-o file]`
+`[--append|--truncate] [--summary|--processors|--machines|--metrics] [--no-processors|--no-machines|--no-metrics] [name]`；
+`WriteDumpFile` 用**临时文件 + rename** 实现原子写（避免半截 dump），append 模式退化为直接追加并在文档中
+如实说明"追加无法原子完成"；`RunDump` / `RunDumpCli` 完成端到端。
+
+**诚实标注（重要）**：本 CLI 是**进程内**形态 —— 调用方把自己的 `Scheduler&` 交给它。
+「跨进程 dump 另一个正在运行的进程」需要**信号或注入机制**（例如注册 SIGUSR1 写文件），
+属后续阶段，**本模块不声称具备该能力**。同时 `scheduler_name` 仅作标识：项目没有"调度器名字"概念，
+`SchedulerConfig` 无 name 字段。
+
+**测试**：5 个场景（三种格式解析 / output 与 -o 与位置参数 / 非法选项与 --help 必须报错 /
+原子写与临时文件不残留与 append / 端到端解析到文件且内容与返回值一致）+ 压测（10000 次解析）
++ 随机（500 组随机选项组合，校验 valid 与 error 互斥）。**全量 ctest 79/79 通过**。
+
+**顺手修正**：text 输出的状态列用定宽填充对齐（原先固定空格导致列不齐）。

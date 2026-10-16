@@ -158,16 +158,17 @@ public:
         if (options.include_processors) {
             out += "\nprocessor  state      queued\n";
             for (const auto& p : s.processors) {
-                out += "  " + std::to_string(p.id) + "        " +
-                       ProcessorStateName(p.state) + "  " +
+                out += "  " + Pad(std::to_string(p.id).c_str(), 9) +
+                       Pad(ProcessorStateName(p.state), 11) +
                        std::to_string(p.queued) + "\n";
             }
         }
         if (options.include_machines) {
             out += "\nmachine  state      P  detached  blocking  long_syscalls  affinity(h/m)\n";
             for (const auto& m : s.machines) {
-                out += "  " + std::to_string(m.id) + "      " + MachineStateName(m.state) +
-                       "  " + std::to_string(m.processor) + "  " +
+                out += "  " + Pad(std::to_string(m.id).c_str(), 7) +
+                       Pad(MachineStateName(m.state), 11) +
+                       std::to_string(m.processor) + "  " +
                        std::string(m.processor_detached ? "true " : "false") + "     " +
                        std::to_string(m.blocking_task) + "         " +
                        std::to_string(m.long_syscall_count) + "              " +
@@ -290,6 +291,14 @@ public:
     }
 
 private:
+    static std::string Pad(const char* text, std::size_t width) {
+        std::string out = (text != nullptr) ? text : "";
+        while (out.size() < width) {
+            out.push_back(' ');
+        }
+        return out;
+    }
+
     static const char* ProcessorStateName(PState state) noexcept {
         switch (state) {
             case PState::kIdle: return "Idle";
