@@ -24,6 +24,7 @@
 | 2 | 核实**原类可继承性**并写成约定：仅 `Fiber`/`Task`/`Scheduler`/`SchedulerObserver` 可继承；`Mutex`/`ConditionVariable`/`Channel`/`Context`/`Timer`/`HybridGate`/`ParkingCondition` 等**被标记 `final`**，不可继承也不改原框架 | `grep -rn "class [A-Za-z_]* final" include/`；新增 `design/09-debug-class-conventions.md` |
 | 3 | 实现 **`DebugFiber`（继承 `Fiber`）+ `DebugRegistry`**（独立注册表，原框架零改动）；补测试（5 场景 + 压测 + 随机）；登记 CMake 与 `test_main`；构建通过 | `include/go2cpp/debug/debug_fiber.hpp`（183 行）、`tests/debug/test_debug_fiber.cpp`（232 行）、`cmake/Go2CppTests.cmake`、`tests/test_main.cpp` |
 | 4 | 生成 **final 类清单**（81 个，含各自是否含虚函数）：**自身含 `virtual` 的只有 2 个**（`SelectValue`、`tools::defer`），其余 79 个为非虚 → 去掉 `final` 对它们零影响（已有实测支持）；核心相关类 16 个；确认**代理方案**并写入 `design/09` §2.4 | `design/10-final-class-inventory.md`（132 行）；`design/09` §2.4；脚本按花括号切类体逐个判定 |
+| 5 | 观察者开销三档对照基准：新建 benchmarks/debug_observer_overhead_benchmark.cpp（222 行）并登记 CMake；**发现并修正一处测量错误**（缺热身轮导致先测档偏慢约 20 倍）；实测 1/2/4 worker 三档；**关键结论**：单 worker 下观察者净开销仅 +3~6%（约 27 ns/事件），而 **4 worker 基线本身异常**（1,602 → 19,914 ns，约 12 倍）属调度器自身扩展性问题、与观察者无关；建议插件用线程局部缓冲规避 observer_mutex 争用 | `DebugTooling/perf-observer-overhead.md`；`docs/performance.md` 新节；`./build-bench/go2cpp_debug_observer_benchmark 3 20000 {1,2,4}` |
 
 ## 下一步（第 4 轮）
 
