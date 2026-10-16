@@ -37,19 +37,25 @@ Go2Cpp 的 GMP 与协程层**已经具备一套完整的只读观测基础设施
 
 ```text
 167 DebugTooling/01-existing-infrastructure.md
-    30 DebugTooling/PROGRESS.md
+   135 DebugTooling/FINAL-REPORT.md
+    42 DebugTooling/PROGRESS.md
     56 DebugTooling/README.md
    258 DebugTooling/design/01-capability-matrix.md
    243 DebugTooling/design/02-dump-cli.md
    127 DebugTooling/design/03-enumeration-and-registry.md
    215 DebugTooling/design/04-encoding-roadmap.md
+   185 DebugTooling/design/05-architecture-summary.md
+   264 DebugTooling/design/06-interface-signatures.md
+   174 DebugTooling/design/07-test-strategy.md
+   365 DebugTooling/design/08-verified-details.md
    123 DebugTooling/scenarios/00-scenario-index.md
-   107 DebugTooling/scenarios/A-observability.md
+   115 DebugTooling/scenarios/A-observability.md
    132 DebugTooling/scenarios/B-mutation.md
     97 DebugTooling/scenarios/C-visualization.md
    142 DebugTooling/scenarios/D-locks.md
    116 DebugTooling/scenarios/E-remote-and-tooling.md
-  1813 total
+   110 DebugTooling/scenarios/verification-matrix.md
+  3066 total
 ```
 
 ## 3. 能力现状（三句话）
