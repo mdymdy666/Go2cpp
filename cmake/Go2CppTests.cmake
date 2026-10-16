@@ -45,7 +45,10 @@ if (GO2CPP_BUILD_TESTS)
     endif()
     target_compile_options(go2cpp_tests PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_tests COMMAND go2cpp_tests)
-    set_tests_properties(go2cpp_tests PROPERTIES TIMEOUT 30)
+    # 超时从 30 提到 60：go2cpp_tests 是全部单元测试的集合，随调试模块新增
+    # 测试（debug_* 五个）后整体耗时已到 ~18s，30s 的余量在机器有其它负载时
+    # 会被打爆（实测与 build-bench 并行跑时触发过一次 Timeout）。
+    set_tests_properties(go2cpp_tests PROPERTIES TIMEOUT 60)
     # T-08 回归：未知的 GO2CPP_TEST_FILTER 必须被拒绝。此前它会静默跑 0 个模块
     # 却返回 0，把「空跑」伪装成「通过」。
     # 用 `sh -c` 把「退出码必须是 2」显式断言出来，而不是用 WILL_FAIL：
@@ -186,6 +189,10 @@ if (GO2CPP_BUILD_BENCHMARKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/debug_observer_overhead_benchmark.cpp)
     target_link_libraries(go2cpp_debug_observer_benchmark PRIVATE go2cpp_runtime)
     target_compile_options(go2cpp_debug_observer_benchmark PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_executable(go2cpp_debug_lock_selector_benchmark
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/debug_lock_selector_overhead_benchmark.cpp)
+    target_link_libraries(go2cpp_debug_lock_selector_benchmark PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_debug_lock_selector_benchmark PRIVATE -O2 -Wall -Wextra -Wpedantic)
     target_compile_options(go2cpp_channel_vs_queue_benchmark PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
     add_executable(go2cpp_timer_task_benchmark

@@ -67,4 +67,27 @@ private:
     sync::ConditionVariable* m_cond{nullptr};
 };
 
+
+/**
+ * @brief `sync::WaitGroup` 的调试代理。
+ */
+class DebugWaitGroup final {
+public:
+    explicit DebugWaitGroup(sync::WaitGroup& group) noexcept : m_group(&group) {}
+    explicit DebugWaitGroup(sync::WaitGroup* group) noexcept : m_group(group) {}
+
+    sync::WaitGroupDebugSnapshot Snapshot() const {
+        if (m_group == nullptr) {
+            return {};
+        }
+        return m_group->DebugSnapshotInternal();
+    }
+    sync::WaitGroupDebugSnapshot Dump() const { return Snapshot(); }
+    std::int64_t Count() const { return Snapshot().count; }
+    std::size_t Waiters() const { return Snapshot().waiters; }
+
+private:
+    sync::WaitGroup* m_group{nullptr};
+};
+
 }  // namespace go2cpp::debug

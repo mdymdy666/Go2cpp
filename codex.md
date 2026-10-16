@@ -6780,3 +6780,39 @@ worker 数增加时比例上升（4 worker 档1 为 +22.7%），其中包含 `ob
 断言其第一个拿到锁）/ 返回 `nullopt` 与越界下标退化为默认 / 抛异常被隔离且锁仍正常移交 /
 `Reset` 后恢复默认且 `TryLock` 仍不能插队）+ 压测（无竞争 100000 次 ≈2896 µs、
 4 线程竞争 20000 次 3 ms 且 completed=20000 无丢失）+ 随机（随机指派下标 8 轮不放死）。
+
+---
+
+## 2026-10-16 15:45–16:05：调试模块开发第 10 轮 —— WaitGroup 观测 + 两处自查纠错
+
+**新增能力（P3 收尾）**：`WaitGroup` 的调试快照。
+`WaitGroup::Impl` 本来就持有 `m_count` 与 `m_waiters`（`sync.cpp:1274-1278`），
+而 `Count()` **已经是 public**，所以这轮只补了 `waiters` 的可见性：
+`WaitGroupDebugSnapshot { count, waiters }` + `WaitGroup::DebugSnapshotInternal()` +
+`debug_sync.hpp` 里的 `DebugWaitGroup` 代理（含空指针安全）。测试补 1 个场景。
+至此 P3 的三件套（`Mutex` / `ConditionVariable` / `WaitGroup`）加上 D3 选择钩子全部完成。
+
+**自查纠错一（重要，实现与文档不符）**：
+`WaitSelector::Select` 我原先声明为 `noexcept`，但头文件注释又写"抛出的异常会被隔离" ——
+这两者**不可能同时成立**：`noexcept` 函数里 `throw` 会直接 `std::terminate`，
+**永远到不了** `Mutex::Unlock` 里的 `try/catch`。编译器的 `-Wterminate` 告警把这个矛盾暴露了出来。
+更糟的是：原场景 4 只放了 **1 个**等待者，而 `ReorderWaitersForSelector` 在 `size<2` 时提前返回，
+**选择器根本没被调用** —— 也就是说那条"异常被隔离"的测试**是空跑**，通过了也不能说明任何事。
+已修正：接口去掉 `noexcept`、注释改成自洽的表述、场景 4 改为 2 个等待者并用调试代理等到
+`waiters >= 2` 后再触发，确保选择器真的被调用。
+
+**自查纠错二（测试基础设施）**：`ctest` 里 `go2cpp_tests` 报过一次 Timeout。
+定位过程：先怀疑自己的测试慢，实测五个 debug 测试合计仅 **1.26 s**（`debug_lock_selector` 最大 0.89 s），
+不是元凶；真正原因是 `set_tests_properties(go2cpp_tests PROPERTIES TIMEOUT 30)` 的**余量不足** ——
+整体 `go2cpp_tests` 已到 ~18 s，而当时我还并行跑着 `build-bench`，CPU 被抢后直接打爆 30 s。
+已把超时放宽到 **60**，并在 CMake 注释里写明理由。
+
+**又一次替换事故（记录以避免重犯）**：修命名空间歧义时，我用 `str.replace` 把
+`go2cpp::debug::DebugMutex` 全量替换为 `::go2cpp::debug::DebugMutex`，
+结果把**本来就是** `::go2cpp::debug::DebugMutex` 的地方替换成了 `::::go2cpp::...`。
+教训：**替换必须带边界**（前缀 `(`/空格或使用正则 `\b`），否则会命中已有正确写法的子串。
+
+**验证**：构建 0 warning；`debug_lock_selector` 全场景通过（不含异常场景空跑）；
+**全量 ctest 79/79 通过**（29.78 s）。
+另注：竞争压测在有选择器参与时从 3 ms 变为 298 ms（20000 次），
+两者不可直接比较 —— 后者是**选择器真的被调用且含异常路径**的代价，不是回归。

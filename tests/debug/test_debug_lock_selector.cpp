@@ -61,7 +61,9 @@ public:
 /// 抛异常（测试隔离）。
 class ThrowingSelector final : public WaitSelector {
 public:
-    std::optional<std::size_t> Select(const std::vector<WaiterCandidate>&) noexcept override {
+    // 刻意不加 noexcept：接口本身也没有 noexcept，所以这里抛出的异常
+    // 真的能到达 Mutex::Unlock 的 catch 分支，从而验证"异常被隔离"。
+    std::optional<std::size_t> Select(const std::vector<WaiterCandidate>&) override {
         throw std::runtime_error("selector failure");
     }
 };
@@ -174,21 +176,29 @@ void run_debug_lock_selector_tests() {
     }
 
     // 场景 4：选择器抛异常被隔离
+    // 注意：必须让队列里**至少有两个**等待者，否则 ReorderWaitersForSelector 会因
+    // size<2 提前返回，选择器根本不会被调用，这个场景就成了空跑。
     {
         Mutex mutex;
-        GO2CPP_CHECK(SetWaitSelectorFactory([] { return std::make_shared<ThrowingSelector>(); }));
         GO2CPP_CHECK(mutex.TryLock());
         std::atomic<int> acquired{0};
-        std::thread worker([&] {
-            if (mutex.Lock()) {
-                acquired.fetch_add(1, std::memory_order_relaxed);
-                mutex.Unlock();
-            }
-        });
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::vector<std::thread> workers;
+        for (int i = 0; i < 2; ++i) {
+            workers.emplace_back([&] {
+                if (mutex.Lock()) {
+                    acquired.fetch_add(1, std::memory_order_relaxed);
+                    mutex.Unlock();
+                }
+            });
+        }
+        ::go2cpp::debug::DebugMutex probe(mutex);
+        GO2CPP_REQUIRE_EVENTUALLY(probe.Snapshot().waiters >= 2, std::chrono::seconds(3));
+        GO2CPP_CHECK(SetWaitSelectorFactory([] { return std::make_shared<ThrowingSelector>(); }));
         mutex.Unlock();          // 这里会调用抛异常的选择器：必须被隔离
-        worker.join();
-        GO2CPP_CHECK(acquired.load(std::memory_order_relaxed) == 1);
+        for (auto& worker : workers) {
+            worker.join();
+        }
+        GO2CPP_CHECK(acquired.load(std::memory_order_relaxed) == 2);
         ResetWaitSelectorFactory();
     }
 

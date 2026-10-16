@@ -188,4 +188,50 @@ void run_debug_sync_tests() {
         }
         GO2CPP_CHECK(ok);
     }
+
+    // WaitGroup 观测（第 10 轮补充）
+    {
+        using go2cpp::sync::WaitGroup;
+        WaitGroup group;
+        DebugWaitGroup probe(group);
+        auto snapshot = probe.Snapshot();
+        GO2CPP_CHECK(snapshot.count == 0);
+        GO2CPP_CHECK(snapshot.waiters == 0);
+        GO2CPP_CHECK(probe.Count() == 0);
+
+        group.Add(3);
+        GO2CPP_CHECK(probe.Snapshot().count == 3);
+        GO2CPP_CHECK(probe.Snapshot().count == static_cast<std::int64_t>(group.Count()));
+
+        // 一个线程进入 Wait：waiters 应变为 1
+        std::atomic<bool> woken{false};
+        std::thread waiter([&] {
+            if (group.Wait()) {
+                woken.store(true, std::memory_order_release);
+            }
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        bool saw_waiter = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (probe.Snapshot().waiters > 0) {
+                saw_waiter = true;
+                break;
+            }
+            std::this_thread::yield();
+        }
+        GO2CPP_CHECK(saw_waiter);
+
+        group.Done();
+        group.Done();
+        GO2CPP_CHECK(probe.Snapshot().count == 1);
+        group.Done();   // 归零 -> 唤醒
+        waiter.join();
+        GO2CPP_CHECK(woken.load(std::memory_order_acquire));
+        GO2CPP_REQUIRE_EVENTUALLY(probe.Snapshot().waiters == 0, std::chrono::seconds(2));
+        GO2CPP_CHECK(probe.Snapshot().count == 0);
+
+        // 空指针代理安全
+        DebugWaitGroup null_probe(static_cast<WaitGroup*>(nullptr));
+        GO2CPP_CHECK(null_probe.Count() == 0 && null_probe.Waiters() == 0);
+    }
 }

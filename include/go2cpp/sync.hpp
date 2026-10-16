@@ -38,6 +38,16 @@ struct ConditionVariableDebugSnapshot {
     std::size_t waiters{0};  ///< 等待队列长度（含 Fiber 与普通线程）。
 };
 
+/**
+ * @brief WaitGroup 的调试只读快照。
+ * @note `count` 与 `Count()` 同一来源；`waiters` 需持内部锁读取。
+ */
+struct WaitGroupDebugSnapshot {
+    std::int64_t count{0};     ///< 当前计数（>0 表示仍有未完成的 Done）。
+    std::size_t waiters{0};    ///< 正在 Wait 的等待者数量。
+};
+
+
 
 /**
  * @brief Fiber 等待后端的最小可替换协议。
@@ -100,8 +110,10 @@ struct WaiterCandidate {
  *   因此「所有权**无缝转移**给下一个持有者、`TryLock` 调用者**不能插队**」
  *   这两条既有语义**完全不受影响**。
  *
- * **调用约束**：在**持队列锁**时同步调用；实现**不得阻塞、不得抛异常**
- *   （抛出的异常会被运行时隔离并退化为默认 FIFO）。
+ * **调用约束**：在**持队列锁**时同步调用，**不得阻塞**。
+ *   实现应当不抛异常；万一抛出，`Mutex::Unlock` 会在调用点捕获并退化为默认 FIFO。
+ *   （注意：接口**刻意不加 `noexcept`** —— 若加了，`throw` 会直接 `std::terminate`，
+ *    那样"异常被隔离"就只是空话。）
  *
  * **饥饿**：本接口不做饥饿保护。若策略可能长期跳过某个等待者，
  *   实现方需自行加入"跳过次数上限后强制 FIFO"的机制 —— 这是**策略的责任**。
@@ -112,7 +124,7 @@ public:
 
     /// @return 要优先的候选下标；返回 `std::nullopt` 表示**不干预**（保持 FIFO）。
     virtual std::optional<std::size_t> Select(
-        const std::vector<WaiterCandidate>& candidates) noexcept = 0;
+        const std::vector<WaiterCandidate>& candidates) = 0;
 };
 
 using WaitSelectorFactory = std::function<std::shared_ptr<WaitSelector>()>;
@@ -289,6 +301,9 @@ public:
                  const ContextPtr& parent = {});
     // 返回当前计数快照；结果仅表示调用时刻，不阻止随后 Add/Done。
     /** @brief 返回当前等待计数。 */
+    // 调试只读快照，说明见 Mutex 中的同名方法。
+    WaitGroupDebugSnapshot DebugSnapshotInternal() const;
+
     std::int64_t Count() const noexcept;
 
     void add(std::int64_t delta) { Add(delta); }
