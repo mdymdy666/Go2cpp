@@ -152,34 +152,60 @@ int main(int argc, char** argv) {
     if (argc > 1) { const int v = std::atoi(argv[1]); if (v > 0) repeats = v; }
     if (argc > 2) { const long v = std::atol(argv[2]); if (v > 0) free_iterations = v; }
     if (argc > 3) { const long v = std::atol(argv[3]); if (v > 0) contended_iterations = v; }
+    std::string mode = "all";
+    if (argc > 4) { mode = argv[4]; }
+    const bool want_none = (mode == "all" || mode == "0");
+    const bool want_passive = (mode == "all" || mode == "1");
+    const bool want_last = (mode == "all" || mode == "2");
 
     std::printf("=== D3 锁选择钩子开销（build-bench / Release） ===\n");
     std::printf("参数：轮数=%d 无竞争迭代=%ld 有竞争每线程迭代=%ld\n", repeats,
                 free_iterations, contended_iterations);
 
     std::printf("\n[A] 无竞争（单线程 TryLock/Unlock）—— 预期三档无差异\n");
-    for (Mode mode : {Mode::kNone, Mode::kPassive, Mode::kLast}) {
+    for (Mode m : {Mode::kNone, Mode::kPassive, Mode::kLast}) {
+        if ((m == Mode::kNone && !want_none) || (m == Mode::kPassive && !want_passive) ||
+            (m == Mode::kLast && !want_last)) {
+            continue;
+        }
         // 热身一轮（避免首轮冷启动影响，与 observer 基准同一个教训）
-        (void)ContendedFree(mode, free_iterations / 10);
-        Report(ModeName(mode), repeats, [mode, free_iterations] {
-            return ContendedFree(mode, free_iterations);
+        (void)ContendedFree(m, free_iterations / 10);
+        const auto t0 = Clock::now();
+        Report(ModeName(m), repeats, [m, free_iterations] {
+            return ContendedFree(m, free_iterations);
         });
+        std::printf("        （该档总耗时 %.2f s）\n",
+                    std::chrono::duration<double>(Clock::now() - t0).count());
+        std::fflush(stdout);
     }
 
     std::printf("\n[B] 有竞争（4 线程 Lock/Unlock）—— 选择器在此被真正调用\n");
-    for (Mode mode : {Mode::kNone, Mode::kPassive, Mode::kLast}) {
-        (void)Contended(mode, contended_iterations / 10, 4);
+    for (Mode m : {Mode::kNone, Mode::kPassive, Mode::kLast}) {
+        if ((m == Mode::kNone && !want_none) || (m == Mode::kPassive && !want_passive) ||
+            (m == Mode::kLast && !want_last)) {
+            continue;
+        }
+        const auto warm = Contended(m, contended_iterations / 10, 4);
+        std::printf("  [%s] 热身完成 %ld 次，继续 %d 轮...\n", ModeName(m), warm.completed, repeats);
+        std::fflush(stdout);
         std::vector<double> samples;
         long last_completed = 0;
+        const auto t0 = Clock::now();
         for (int i = 0; i < repeats; ++i) {
-            const auto result = Contended(mode, contended_iterations, 4);
+            const auto result = Contended(m, contended_iterations, 4);
             samples.push_back(result.ns_per_op);
             last_completed = result.completed;
+            std::printf("      第 %d 轮: %.2f ns/op (完成 %ld)\n", i + 1,
+                        result.ns_per_op, result.completed);
+            std::fflush(stdout);
         }
+        const double seconds = std::chrono::duration<double>(Clock::now() - t0).count();
         std::sort(samples.begin(), samples.end());
         std::printf("  %-38s min %9.2f  median %9.2f  max %9.2f  ns/op  [完成=%ld]\n",
-                    ModeName(mode), samples.front(), samples[samples.size() / 2], samples.back(),
+                    ModeName(m), samples.front(), samples[samples.size() / 2], samples.back(),
                     last_completed);
+        std::printf("        （该档 %d 轮总耗时 %.2f s）\n", repeats, seconds);
+        std::fflush(stdout);
     }
 
     go2cpp::sync::ResetWaitSelectorFactory();
