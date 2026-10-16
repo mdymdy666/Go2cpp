@@ -8,6 +8,35 @@
 #include <optional>
 
 namespace go2cpp::sync {
+namespace go2cpp::debug {
+class DebugMutex;
+class DebugConditionVariable;
+}  // namespace go2cpp::debug
+
+
+/**
+ * @brief Mutex 的调试只读快照（第 8 轮，P3 锁观测）。
+ *
+ * @note **持有者身份不可知**：`Mutex::Impl::m_state` 只记录「已持有」与
+ *       「有等待者」两个位，不记录 owner（Go 风格所有权允许 A 加锁、B 解锁）。
+ *       因此本快照**不包含** owner 字段；要支持它必须新增 owner 追踪并声明行为差异。
+ */
+struct MutexDebugSnapshot {
+    bool held{false};                  ///< 是否已被持有。
+    bool has_waiters{false};           ///< 队列标记位是否置位。
+    std::size_t waiters{0};            ///< 等待队列长度（含 Fiber 与普通线程）。
+    std::size_t native_waiters{0};     ///< 其中普通线程的数量。
+    std::size_t fiber_waiters{0};      ///< 其中受管 Fiber 的数量（= waiters - native_waiters）。
+};
+
+/**
+ * @brief ConditionVariable 的调试只读快照。
+ * @note 通知次数需要额外计数，当前实现**未提供**，故不在此结构中虚构字段。
+ */
+struct ConditionVariableDebugSnapshot {
+    std::size_t waiters{0};  ///< 等待队列长度（含 Fiber 与普通线程）。
+};
+
 
 /**
  * @brief Fiber 等待后端的最小可替换协议。
@@ -107,7 +136,14 @@ public:
     bool try_lock() noexcept { return TryLock(); }
     void unlock() { Unlock(); }
 
+    // 调试只读快照。**放在 public 并冠以 Debug 前缀**：原设计是 friend + private，
+    // 但在本项目的包含顺序下 friend 未对该内联代理生效（编译报 private 访问错误）。
+    // 为保持零行为影响，选择公开 + 显式命名，而不是去掉原类的 final 或改动包含结构。
+    // 调用方应仅由 go2cpp::debug 模块使用。
+    MutexDebugSnapshot DebugSnapshotInternal() const;
+
 private:
+
     friend class ConditionVariable;
     /** @brief 条件变量返回前使用；忽略 G 取消标记并完成不可中断重锁。 */
     bool LockForConditionWait();
@@ -162,7 +198,11 @@ public:
     void notify_one() noexcept { NotifyOne(); }
     void notify_all() noexcept { NotifyAll(); }
 
+    // 调试只读快照，说明见 Mutex 中的同名方法。
+    ConditionVariableDebugSnapshot DebugSnapshotInternal() const;
+
 private:
+
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

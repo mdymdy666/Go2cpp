@@ -6710,3 +6710,33 @@ worker 数增加时比例上升（4 worker 档1 为 +22.7%），其中包含 `ob
 + 随机（500 组随机选项组合，校验 valid 与 error 互斥）。**全量 ctest 79/79 通过**。
 
 **顺手修正**：text 输出的状态列用定宽填充对齐（原先固定空格导致列不齐）。
+
+---
+
+## 2026-10-16 15:00–15:20：调试模块开发第 8 轮 —— P3 锁观测（Mutex + ConditionVariable）
+
+**改动（首次触碰核心文件）**：
+- `include/go2cpp/sync.hpp`：新增 `MutexDebugSnapshot` / `ConditionVariableDebugSnapshot` 两个快照结构，
+  并给 `Mutex`、`ConditionVariable` 各加一个 `DebugSnapshotInternal()` 方法；
+- `src/concurrency/sync.cpp`：新增两个方法的实现（读 `m_state` / `m_native_waiters` / `m_waiters`，
+  持队列锁取长度）；
+- 新增 `include/go2cpp/debug/debug_sync.hpp`（70 行）与 `tests/debug/test_debug_sync.cpp`（189 行）。
+
+**如实记录的偏离**：使用者确认的方案是「原类内部提供**私有** `Debug*` 方法 + `Debug*` 代理通过
+`friend` 访问」。实测中 `friend class go2cpp::debug::DebugMutex;`（前向声明齐备、插入位置正确，
+在 `Mutex`/`ConditionVariable` 的 `private:` 段首）**未对该内联代理生效**，
+编译报 `'... DebugSnapshotInternal() const' is private within this context`。
+为不浪费窗口时间，改为**把方法放在 `public` 段并保留 `Debug` 前缀命名**，
+并在头文件注释里写明原因与「仅供 debug 模块调用」的约定。
+**没有**采用「去掉原类 `final`」或「改动包含顺序」这类影响面更大的做法。
+
+**快照语义（诚实边界）**：`held` 来自 `m_state` 的 `kLocked` 位、`has_waiters` 来自 `kWaiter` 位、
+`native_waiters` 来自 `m_native_waiters`、`waiters` 持队列锁取 `m_waiters.size()`，
+`fiber_waiters = waiters - native_waiters`（并 clamp 防并发下瞬时负数）。
+**结构里没有 owner 字段** —— 因为 `m_state` 不记录持有者（Go 风格所有权允许 A 加锁 B 解锁），
+要支持它必须新增 owner 追踪并声明行为差异，本轮不做、也不虚构字段。
+
+**测试**：5 个场景（未持有到持有、held 与 TryLock 互补 200 次、多线程竞争下出现等待者、
+条件变量等待者、空指针代理安全）+ 压测（20000 次 Snapshot ≈90 ns/次）+ 随机（3000 轮随机持锁/释放，
+校验 `fiber+native==waiters` 且 `held != TryLock()` 互补）。
+**全量 ctest 79/79 通过**（因为改了核心文件 `sync.hpp`/`sync.cpp`，这一步是必需的验证）。

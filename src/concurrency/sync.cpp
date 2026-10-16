@@ -690,6 +690,25 @@ struct Mutex::Impl {
 /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
 /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 Mutex::Mutex() : m_impl(std::make_unique<Impl>()) {}
+
+MutexDebugSnapshot Mutex::DebugSnapshotInternal() const {
+    MutexDebugSnapshot snapshot;
+    const std::uint8_t state = m_impl->m_state.load(std::memory_order_acquire);
+    snapshot.held = (state & Impl::kLocked) != 0U;
+    snapshot.has_waiters = (state & Impl::kWaiter) != 0U;
+    snapshot.native_waiters = m_impl->m_native_waiters.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lock(m_impl->m_mutex);
+        snapshot.waiters = m_impl->m_waiters.size();
+    }
+    // fiber_waiters 由总量减去普通线程数；两者都来自同一把队列锁下的观测，
+    // 因此不会出现 native > total 的情形（除非并发中队列正在变化，此时 clamp）。
+    snapshot.fiber_waiters = snapshot.waiters > snapshot.native_waiters
+                                 ? snapshot.waiters - snapshot.native_waiters
+                                 : 0U;
+    return snapshot;
+}
+
 Mutex::~Mutex() = default;
 
 /// 函数功能：完成 Lock 调用，读取或更新相关运行时状态。
@@ -1032,6 +1051,14 @@ struct ConditionVariable::Impl {
 /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
 /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ConditionVariable::ConditionVariable() : m_impl(std::make_unique<Impl>()) {}
+
+ConditionVariableDebugSnapshot ConditionVariable::DebugSnapshotInternal() const {
+    ConditionVariableDebugSnapshot snapshot;
+    std::lock_guard<std::mutex> lock(m_impl->m_mutex);
+    snapshot.waiters = m_impl->m_waiters.size();
+    return snapshot;
+}
+
 ConditionVariable::~ConditionVariable() = default;
 
 /// 函数功能：完成 Wait 调用，读取或更新相关运行时状态。
