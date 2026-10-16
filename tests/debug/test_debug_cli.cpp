@@ -211,4 +211,66 @@ void run_debug_cli_tests() {
         }
         GO2CPP_CHECK(consistent);
     }
+
+    // dump events 集成（第 13 轮补充）
+    {
+        Fixture fixture(1);
+        DebugEventCollector collector(256);
+        for (int i = 0; i < 7; ++i) {
+            SchedulerEvent event;
+            event.type = SchedulerEventType::kTaskStarted;
+            event.task_id = static_cast<GId>(i + 1);
+            event.machine_id = 1;
+            event.timestamp = std::chrono::steady_clock::now();
+            collector.OnEvent(event);
+        }
+        GO2CPP_CHECK(collector.Pending() == 7);
+
+        // 解析：dump events 必须把 target 定为 kEvents，且不影响默认的 scheduler
+        const auto events_text = ParseDumpCommand({"dump", "events", "--format=text"});
+        const auto events_json = ParseDumpCommand({"dump", "events", "--format=json"});
+        const auto default_target = ParseDumpCommand({"dump", "--format=ini"});
+        GO2CPP_CHECK(events_text.valid && events_text.target == DumpTarget::kEvents);
+        GO2CPP_CHECK(events_json.valid && events_json.target == DumpTarget::kEvents);
+        GO2CPP_CHECK(default_target.valid && default_target.target == DumpTarget::kScheduler);
+        // dump scheduler 仍然显式可写
+        const auto sched = ParseDumpCommand({"dump", "scheduler", "--format=json"});
+        GO2CPP_CHECK(sched.valid && sched.target == DumpTarget::kScheduler);
+        // 非法 target 必须报错（不静默当成 scheduler）
+        const auto bad = ParseDumpCommand({"dump", "bogus", "--format=text"});
+        GO2CPP_CHECK(!bad.valid && Contains(bad.error, "unknown target"));
+
+        // 端到端：写到文件并与返回值一致
+        const std::string path = TempPath("e2e_events_ini");
+        std::remove(path.c_str());
+        auto cmd = ParseDumpCommand({"dump", "events", "--format=ini", "--output=" + path});
+        std::string text;
+        std::string error;
+        GO2CPP_CHECK(RunEventsDump(cmd, collector, &text, &error));
+        GO2CPP_CHECK(error.empty());
+        GO2CPP_CHECK(Contains(text, "[events]"));
+        GO2CPP_CHECK(Contains(text, "[event.0]"));
+        GO2CPP_CHECK(ReadFile(path) == text);
+        std::remove(path.c_str());
+        // Peek 语义：dump 不应消耗事件
+        GO2CPP_CHECK(collector.Pending() == 7);
+
+        // json 产物可解析
+        auto json_cmd = ParseDumpCommand({"dump", "events", "--format=json"});
+        std::string json_text;
+        GO2CPP_CHECK(RunEventsDump(json_cmd, collector, &json_text, &error));
+        bool parsed = false;
+        try {
+            const auto value = go2cpp::Json::parse(json_text);
+            parsed = value.contains("events") && value["events"].size() == 7;
+        } catch (...) {
+            parsed = false;
+        }
+        GO2CPP_CHECK(parsed);
+
+        // 统一入口 RunDump 也应支持 events（带 collector 重载）
+        std::string unified;
+        GO2CPP_CHECK(RunDump(events_text, *fixture.scheduler, collector, &unified, &error));
+        GO2CPP_CHECK(Contains(unified, "[events]"));
+    }
 }

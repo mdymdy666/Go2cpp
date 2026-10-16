@@ -6894,3 +6894,32 @@ worker 数增加时比例上升（4 worker 档1 为 +22.7%），其中包含 `ob
 **我自己的重复错误（第三次）**：用 `for n in ...; do ... timeout ... ; done` 时，
 `$n` 被 pwsh 吞掉导致循环体实际只执行最后一次。此前已遇到过同类问题（`$f`、`$n`），
 本次仍未规避 —— 记录在案，后续 shell 循环里不再依赖 pwsh 传递的变量，而是在 Python 侧展开。
+
+---
+
+## 2026-10-16 16:45–17:05：调试模块开发第 13 轮 —— dump events 接入 CLI
+
+**改动**：
+- `debug_cli.hpp`：新增 `DumpTarget { kScheduler, kEvents }`；`ParseDumpCommand` 支持
+  `dump scheduler` 与 `dump events` 两种目标，**缺省保持 scheduler**（向后兼容已有调用与测试）；
+  新增 `RunEventsDump`（内部用 `DebugEventCollector::Peek`，因此 dump **不会消耗**采集器里的事件）
+  与统一入口 `RunDump(command, scheduler, collector, ...)` 按 target 分派。
+- `debug_scheduler.hpp`：`DumpOptions` 增加 `event_limit`（0 表示全部）。
+- `test_debug_cli.cpp`：补充 dump events 相关场景。
+
+**一个刻意的严格性选择**：当位置参数出现在目标位置却**不是** `scheduler`/`events` 时，
+解析器**报错**（`unknown target: ...`）而**不是静默当成 scheduler**。
+理由与项目既有约定一致 —— `test_main.cpp` 里就专门处理过"过滤器拼错却把空跑伪装成通过"的问题；
+静默降级会把用户打错的目标名变成"看起来成功"的错误结果。测试里对此有专门断言。
+
+**新增测试断言**：`dump events` 的 target 必须为 `kEvents`；`dump --format=ini`（不带目标）
+必须默认为 `kScheduler`；`dump scheduler` 仍显式可用；非法目标必须 `!valid` 且 error 含
+`unknown target`；端到端写文件后文件内容与返回值一致；**dump 之后 `Pending()` 仍为 7**
+（证明只读快照不消耗事件）；json 产物能被 `go2cpp::Json` 解析且事件数为 7。
+
+**验证**：构建 0 warning；`debug_cli` 全部通过；实机输出可见 7 条 `kTaskStarted`
+（含 task_id / machine_id / processor_id / task_state / steady_ns 各列）；
+**全量 ctest 79/79 通过**。
+
+**至此 P0 / P1 / P2 / P3 四个阶段全部打通**：快照 → 序列化 → CLI → 事件采集 → 锁观测（含 D3 钩子）
+都可从同一套 `dump` 接口使用。

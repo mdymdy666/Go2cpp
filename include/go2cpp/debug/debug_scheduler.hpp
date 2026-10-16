@@ -52,6 +52,7 @@ struct DumpOptions {
     bool include_machines{true};
     bool include_metrics{true};
     bool include_fibers{false};  ///< 需“枚举全部 G”接口，本轮尚未提供。
+    std::size_t event_limit{0};  ///< dump events 的条数上限；0 表示全部。
 };
 
 /// 调度器调试快照（纯数据，可自由拷贝）。

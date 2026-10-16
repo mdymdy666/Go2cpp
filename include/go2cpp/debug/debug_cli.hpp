@@ -18,6 +18,7 @@
  *   传入，缺省为 `main`。这一点在设计文档里也标注过。
  */
 
+#include "go2cpp/debug/debug_events.hpp"
 #include "go2cpp/debug/debug_scheduler.hpp"
 
 #include <cstdio>
@@ -30,9 +31,16 @@
 
 namespace go2cpp::debug {
 
+/// dump 的目标对象。
+enum class DumpTarget {
+    kScheduler,  ///< dump scheduler（默认，保持向后兼容）。
+    kEvents,     ///< dump events（需要调用方提供 DebugEventCollector）。
+};
+
 /// 解析后的 dump 命令。
 struct DumpCommand {
     bool valid{false};
+    DumpTarget target{DumpTarget::kScheduler};
     DumpFormat format{DumpFormat::kText};
     std::string output;      ///< 空或 "-" 表示 stdout。
     bool append{false};      ///< 追加而非覆盖（仅对文件输出有效）。
@@ -50,7 +58,16 @@ inline DumpCommand ParseDumpCommand(const std::vector<std::string>& args) {
         ++index;
     }
     if (index < args.size() && args[index] == "scheduler") {
+        command.target = DumpTarget::kScheduler;
         ++index;
+    } else if (index < args.size() && args[index] == "events") {
+        command.target = DumpTarget::kEvents;
+        ++index;
+    } else if (index < args.size() && !args[index].empty() && args[index][0] != '-') {
+        // 位置参数出现在这里说明它是目标名而不是 scheduler_name。
+        // 此时若它不是合法目标，必须报错，**不能**静默当成 scheduler。
+        command.error = "unknown target: " + args[index];
+        return command;
     }
     for (; index < args.size(); ++index) {
         const std::string& arg = args[index];
@@ -93,7 +110,7 @@ inline DumpCommand ParseDumpCommand(const std::vector<std::string>& args) {
         } else if (arg == "--no-metrics") {
             command.options.include_metrics = false;
         } else if (arg == "--help" || arg == "-h") {
-            command.error = "usage: dump scheduler [--format=text|ini|json] "
+            command.error = "usage: dump {scheduler|events} [--format=text|ini|json] "
                             "[--output=<file>|-] [--append|--truncate] "
                             "[--summary|--processors|--machines|--metrics] "
                             "[--no-processors] [--no-machines] [--no-metrics] [name]";
@@ -171,6 +188,40 @@ inline bool WriteDumpFile(const std::string& path, const std::string& text,
     return true;
 }
 
+/// 执行一次 events dump：序列化事件缓冲并写到 stdout 或文件。
+/// @note 使用只读快照（Peek），**不会消耗**采集器里的事件。
+inline bool RunEventsDump(const DumpCommand& command, DebugEventCollector& collector,
+                          std::string* text_out, std::string* error) {
+    if (!command.valid) {
+        if (error) *error = command.error.empty() ? "invalid command" : command.error;
+        return false;
+    }
+    std::string text;
+    switch (command.format) {
+        case DumpFormat::kIni:
+            text = collector.DumpIni(command.options.event_limit);
+            break;
+        case DumpFormat::kJson:
+            text = collector.DumpJson(command.options.event_limit);
+            break;
+        case DumpFormat::kText:
+            text = collector.DumpText(command.options.event_limit);
+            break;
+    }
+    if (text_out != nullptr) {
+        *text_out = text;
+    }
+    if (command.output.empty() || command.output == "-") {
+        const std::size_t written = std::fwrite(text.data(), 1, text.size(), stdout);
+        if (written != text.size()) {
+            if (error) *error = "short write to stdout";
+            return false;
+        }
+        return true;
+    }
+    return WriteDumpFile(command.output, text, command.append, error);
+}
+
 /// 执行一次 dump：序列化并写到 stdout 或文件。
 /// @return 成功返回 true；失败时 `error` 填原因。
 inline bool RunDump(const DumpCommand& command, Scheduler& scheduler,
@@ -193,6 +244,16 @@ inline bool RunDump(const DumpCommand& command, Scheduler& scheduler,
         return true;
     }
     return WriteDumpFile(command.output, text, command.append, error);
+}
+
+/// 统一入口：按 command.target 分派到 scheduler 或 events。
+inline bool RunDump(const DumpCommand& command, Scheduler& scheduler,
+                    DebugEventCollector& collector, std::string* text_out,
+                    std::string* error) {
+    if (command.target == DumpTarget::kEvents) {
+        return RunEventsDump(command, collector, text_out, error);
+    }
+    return RunDump(command, scheduler, text_out, error);
 }
 
 /// 便捷入口：直接吃 argc/argv。
