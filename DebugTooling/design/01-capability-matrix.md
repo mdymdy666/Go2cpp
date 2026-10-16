@@ -148,8 +148,28 @@ class HybridGate final {
 - 注释限定了使用范围：「只用于**非常短**的 Fiber 唤醒/撤销临界区，**不得**保护可能阻塞、
   执行用户回调或执行系统调用的代码」（`hybrid_mutex.hpp:3-5`）。
 
-**未确认**：`src/concurrency/sync.cpp`（1324 行）里的用户可见 `Mutex`/`RWMutex`/`Cond` 是否
-有等待者队列、是否有可替换的公平性策略 —— **本轮未读，留待第 3 轮**。
+**第 3 轮已确认**（`include/go2cpp/sync.hpp` 219 行 + `src/concurrency/sync.cpp` 关键段）：
+
+- 用户可见锁是 `sync::Mutex`（`sync.hpp:78`），语义为「**FIFO 混合互斥锁**」：
+  「两类调用者共享一个 FIFO 交接队列，因此 Fiber 加锁后可以由其他 Fiber 或 OS 线程解锁」，
+  且「Unlock **不要求**由同一 G/线程调用，采用 Go 风格所有权」（`sync.hpp:70-77`）；
+- 等待队列确实存在：`std::deque<std::shared_ptr<WaitNode>> m_waiters`（`sync.cpp:686`），
+  用 `shared_ptr` 的原因写在注释里：「Unlock 会先从队列取出等待者，再在释放队列锁后调用 Wake；
+  如果队列只保存裸指针，等待方可能在这段窗口内返回并销毁栈上的 WaitNode」；
+- **有一个官方可替换点**：`WaitBackend`（`sync.hpp:13-44`）与
+  `SetWaitBackendFactory()` / `ResetWaitBackendFactory()`（`sync.hpp:46-66`、`sync.cpp:612/627`）。
+  注释原文：「其他 Fiber 后端**可以注册工厂而不改动 Mutex/ConditionVariable**」，
+  但「只影响**注册后创建的等待节点**，正在等待的 Fiber **不会迁移后端**」；
+- **但"选谁获得锁"不可替换**：`WaitBackend` 只定义 `Park`/`ParkForCleanup`/`Wake`
+  （即"怎么等/怎么唤醒"），FIFO 出队发生在 `Unlock` 路径；
+- 现有争用策略是**硬编码且克制**的（`sync.cpp:711-760` 注释）：
+  managed G 在「`processor_count() > 1`、无 native waiter、无 context」时做
+  **有界协作重试（`kCooperativeAttempts = 256`）**，一旦出现普通线程等待者就把重试
+  **限制为 4 次**并回到 FIFO handoff；**单 P 不走这条路径**（避免忙等住唯一的 M）。
+  原文：「managed waiter 之间允许有限度地越过队列，以换取吞吐」。
+
+**结论（对需求 D3「锁争用决策」）**：需要**新增**"选择等待者"的接口，且必须与上述既有策略共存，
+不能简单替换成另一套公平性模型。
 
 ### 2.4 dump 的序列化与 CLI —— **完全不存在**
 
@@ -183,7 +203,12 @@ class HybridGate final {
 ## 4. 未确认事项（不推测，留待后续轮次）
 
 1. `src/concurrency/sync.cpp`（1324 行）：用户可见锁是否有等待者队列与可替换策略；
-2. `src/concurrency/context.cpp`（2412 行）：是否维护可查询的**执行位置（行号）**；
+2. ~~`context.cpp` 是否维护执行位置（行号）~~ —— **第 3 轮已确认：没有**。
+   证据：`include/go2cpp/concurrency/context.hpp` 中检索 `line|symbol|source|debug|pc` 只命中
+   无关的 `deadline`/`WaitUntil` 等；`grep -c "source_location|__builtin_return_address|dladdr|backtrace"
+   src/concurrency/context.cpp` 的结果为 **0**。即 Fiber 运行时**不保存任何执行位置信息**，
+   使用者要的「函数行号」必须由**新增机制**提供（转译期注入或独立符号表），
+   不能指望从上下文里查出来；
 3. `src/concurrency/scheduler.cpp`（4048 行）：`emit_event()` 的实际调用点与锁外保证；
 4. 转译器（Go→C++）是否能提供函数名/文件/行号（决定元数据是转译期注入还是运行期注册）；
 5. `Task` 的 `m_fiber`（`scheduler.hpp:364`）与 `Fiber::Impl` 是否留有可挂钩的调试位。
