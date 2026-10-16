@@ -183,6 +183,50 @@ class HybridGate final {
 - 未见任何 gdb 脚本、线程/协程映射导出、符号表导出；
 - 未见任何网络化调试通道（Stratum 式 topic 传输需要新设计）。
 
+### 2.6 事件发射的锁边界（第 4 轮已确认）
+
+`emit_event`（`src/concurrency/scheduler.cpp:1104-1122`）的实现：
+
+```cpp
+void emit_event(SchedulerEvent event) noexcept {
+    if (event.timestamp == steady_clock::time_point{}) {
+        event.timestamp = steady_clock::now();
+    }
+    SchedulerObserverPtr current;
+    {
+        std::lock_guard<std::mutex> lock(observer_mutex);
+        current = observer;          // 先复制观察者
+    }                                // 立刻释放互斥锁
+    if (!current) { return; }        // 无观察者时零开销返回
+    try { current->OnEvent(event); } catch (...) { }   // 锁外调用 + 异常隔离
+}
+```
+
+注释原文：「复制观察者后再释放互斥锁，**绝不在调度器内部状态锁上执行外部代码**；
+观察者异常被隔离，不能影响 worker 生命周期。」
+
+**设计含义**：
+1. 插件回调**在 worker 线程上同步执行** → 插件必须只做「快速入队」，
+   由独立线程消费（这也正是 `set_observer` 注释建议的做法）；
+2. 无观察者时开销极低（一次加锁 + 一次 `shared_ptr` 拷贝 + 判空）；
+3. 事件发射点仅有 6 处（`scheduler.cpp:1939/1992/3503/3833/3848/4036`），
+   而事件类型有 10 种 → 部分类型可能在同一处按 switch 分发，**第 5 轮需确认**。
+
+### 2.7 锁的 FIFO 交接细节（第 4 轮已确认）
+
+`Mutex::Unlock`（`src/concurrency/sync.cpp:955-1005`）：
+
+- 无等待者时**一次 CAS** 即释放（`m_state: kLocked → 0`），不进队列锁；
+- 有等待者时进入队列锁，**严格从队首取**，`TryFinish(kNotified)` 认领成功者即被选定，
+  已取消/超时的节点被跳过（继续取下一个）；
+- **选定的 waiter 使锁在逻辑上保持持有**，所有权直接交给队首；
+  注释原文：「因而 **`TryLock` 调用者不能插队**」；
+- 唤醒在**队列锁之外**执行（`selected->Wake()`）。
+
+**对需求 D3（锁争用决策）的设计约束**：
+策略钩子的形态应该是「**从等待队列中选谁**」，而不是「先释放锁再让所有人重新竞争」——
+后者会破坏"所有权无缝转移、`TryLock` 不能插队"这一既有语义。
+
 ## 3. 需求 → 机制 的归属划分（本文件最重要的结论）
 
 | 使用者需求 | 归属机制 | 现有基础 |
