@@ -75,7 +75,103 @@
 
 ---
 
-## 核验 3 · 待办（后续轮次）
+---
+
+## 核验 3 · `WaitNode` 的等待/唤醒机制（第 14 轮）
+
+**源码**：`src/concurrency/sync.cpp:31-100`（`SchedulerWaitBackend`）、`132-235`（`WaitNode` 核心）、
+`296-345`（`WaitNative`/`Reset`）、`360`（`t_wait_node_cache`）。
+
+### 3.1 默认后端只有三件事
+
+| 方法 | 实现要点 |
+|---|---|
+| `Park` | 循环：**谓词先查** → `scheduler->park_wait(task)` → **再查谓词**；退出条件三条：取消、**上下文漂移**（`current_scheduler()`/`current_task()` 已不是原来那个）、未挂起且调度器已停 |
+| `Wake` | `wake_registered(task)`；若返回 false 且任务处于 `kRunnable` 且未入队，再 `enqueue(task)` 收口；**异常被 `catch (...)` 隔离** |
+| `ParkForCleanup` | 循环 `park_wait_for_cleanup` 直到谓词满足（用于条件变量重锁，**不可被取消中断**） |
+
+> `Wake` 的二次尝试对应注释里说的「`wake_registered` 可能在 Running/Waiting → Runnable 的 pending 窗口返回 false」；
+> 若 execution claim 仍被持有，则留给所属 worker 的 post-Fiber 清理路径。
+
+### 3.2 单赢家靠一次 CAS
+
+```cpp
+bool TryFinish(WaitResult result) noexcept {
+    WaitResult expected = WaitResult::kWaiting;
+    return m_result.compare_exchange_strong(expected, result,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_acquire);
+}
+```
+
+`m_result` 是 `std::atomic<WaitResult>`（三态：`kWaiting`/`kNotified`/`kCancelled`）。
+**与 `SelectWaitState::TrySelect` 同构** —— 整个同步层的"谁赢"都收敛到"一次 CAS"。
+
+### 3.3 **新发现：`WaitNode` 有 generation 机制**（此前文档未记录）
+
+`TryCancelAndWake(generation)`（`sync.cpp:215-230`）的注释原文说明了原因：
+
+> Context 的取消回调可能已经通过 weak_ptr 取得了本节点，随后 `RemoveCallback` 又与节点回收并发。
+> 取消、active 检查和唤醒必须在**同一把门锁内**完成；否则旧回调可能在节点放回 thread-local cache 后，
+> 把下一次等待的 `m_result` 错误地改成 Cancelled。**generation 用来区分同一个缓存节点的不同等待代次。**
+
+**这对调试模块有直接影响**：
+
+1. `WaitNode` 会被**缓存复用**（`t_wait_node_cache`，`sync.cpp:360`）；
+2. 因此**调试快照绝不能把"缓存中的节点"当成"活跃等待者"** ——
+   否则等待者数量会被**虚报**；
+3. 判断活跃的正确依据是 `m_active`（仅在 `Arm()` 成功时为 true，`136-140`）与 `m_result == kWaiting`；
+4. **订正**：`scenarios/D-locks.md` 的 D1 只写了"读 `m_waiters` 需要持队列锁"，
+   **补充**：还需排除缓存节点，建议只在 `Arm` 成功后才把节点计入快照（即队列里的节点本身已是 active 的，
+   但**已取消未清理**的节点需要单独呈现）。
+
+### 3.4 两条等待路径（D2 的实现基础）
+
+| 路径 | 机制 | 对应计数 |
+|---|---|---|
+| **Fiber** | `backend->Park(...)` → `Scheduler::park_wait(task)` | `m_waiters.size() - m_native_waiters` |
+| **普通线程** | `WaitNative()`：`m_native_mutex` + `m_native_condition.wait(谓词)` | `m_native_waiters` |
+
+另有一个细节：`WaitNative()` 把 `condition_variable` 的异常**转成 `kCancelled` 终态**，
+理由是"不要让错误越过运行时等待边界"（该边界声明为 `noexcept`）。
+
+---
+
+## 核验 4 · 安全点统计（第 14 轮）—— **解除 B5 的阻塞项**
+
+**命令**：`grep -rn "SuspendForScheduler" src/ include/` 与相关的挂起入口检索。
+
+### 4.1 实测：真实挂起点共 **5 处**（全部在 `src/concurrency/scheduler.cpp`）
+
+| # | 行 | `SuspendReason` | 语义 |
+|---:|---:|---|---|
+| 1 | 2661 | `Yield` | 主动让出（`yield_current` 路径） |
+| 2 | 2723 | `Park` | 挂起等待 |
+| 3 | 2744 | `Park` | 挂起等待（另一条 park 路径） |
+| 4 | 2782 | `Io` | IO 就绪等待 |
+| 5 | 2809 | 传入的 `reason` | 通用 `park_with_reason` |
+
+（另有定义处 `src/concurrency/fiber.cpp:1258`。）
+
+### 4.2 对 B5（断点）的**可承诺范围**
+
+- ✅ **可以承诺**：断点能停在以下**四类语义位置** ——
+  **Yield（让出）/ Park（挂起）/ Io（IO 等待）/ 通用挂起点**；
+- ❌ **不能承诺**：任意行、任意函数调用点、循环体内 —— 这是设计使然（项目明确不切断 C++ 调用栈）；
+- **精度结论**：断点粒度 = **"一次挂起/让出"**，而不是"一行代码"。
+
+### 4.3 因此的**文档订正**
+
+1. `scenarios/verification-matrix.md` 中 B5 的"阻塞项"列原本写 **安全点未统计**
+   → **现改为"已统计（5 处）"**，B5 **不再是阻塞项**；
+2. `scenarios/B-mutation.md` 的 B5 原本只写"只能停在安全点"
+   → **补充**具体是**哪四类**位置与"粒度 = 一次挂起"的量化描述；
+3. 但 `FINAL-REPORT.md` §6 第 4 项「任意行断点做不到」**保持不变** ——
+   这是**永久限制**，不是"待统计"的临时状态。
+
+---
+
+## 核验 5 · 待办（后续轮次）
 
 | # | 待核验 | 影响 |
 |---:|---|---|

@@ -27,14 +27,13 @@
 | 11 | 10-16 深化②：测试策略 | 新增 `design/07-test-strategy.md`：提出**两个验收维度**（功能正确性 + **观察者效应**，后者是项目规范未覆盖、调试工具特有的）；压测给出 5 项指标与 5 维条件矩阵（G 数/P 数/负载类型/事件速率/并发 dump）；随机测试 7 项（含并发竞态与转义 fuzz）；真实场景 6 个（覆盖 A–E 全部类别）；**零开销证明设计为三档对照实验 + emit_event 微基准 + 最坏停顿测量**，并给出待校准的建议阈值与「拿到数据前不得宣称零开销」的约束；破坏性测试 7 项与失败判据 5 条 | `design/07-test-strategy.md`；依据 `scheduler.cpp:1104-1122`（无观察者路径与异常隔离） |
 | 12 | 10-16 深化③：场景×验证矩阵 | 新增 `scenarios/verification-matrix.md`：34 个场景逐条映射「验证方式/测试类型/验收判据/依赖接口/阻塞项」；统计出 **24 个无阻塞项**、7 个依赖未定案；给出**发布前检查清单**（功能层/干扰层/控制面/文档记录 四组共 18 项）与编码阶段 10 步推进顺序 | `scenarios/verification-matrix.md`；接口编号引自 `design/06`；测试类型代号引自 `design/07` |
 | 13 | 10-16 核验①：worker 出队路径与事件发射锁边界 | 读 `worker_loop`（`scheduler.cpp:3494` 起）确认**四级出队顺序**：本地 P 队列（队首 `pop_front`，FIFO）→ incoming 条带（`incoming_probe` 轮转）→ 全局队列 → **work stealing 从其他 P 的队尾偷**（注释原文 steal from the back）；并确认**本地快路径有门槛**（`runnable > processors.size()`）；`grep -B4 -A3 emit_event` 确认 **6 个发射点全部不持调度器状态锁**，且 `kWorkerStarted` 在 thread-local 的 M/P 赋值之后发出（插件可在回调中安全读 `current_*`）；据此**订正** B4/C2（插队需考虑偷取方向）与 `design/04` §3（非阻塞要求来自时序而非锁竞争）；新增 `design/08-verified-details.md` | `scheduler.cpp:1939,1992,3503,3519-3541,3742,3833,3848,4036` |
+| 14 | 10-16 核验②：等待机制与安全点统计 | 读默认 `WaitBackend`（`sync.cpp:31-100`）与 `WaitNode` 核心（`167-235`、`296-345`）：确认 `TryFinish` 是 `m_result` 的 **CAS 单赢家**（与 `SelectWaitState::TrySelect` 同构）、存在**两条等待路径**（Fiber 走 `park_wait`、线程走 `WaitNative`）；**新发现** `WaitNode` 有 `generation` 机制解决「缓存节点 + 迟到取消回调」竞态，且节点会被 `t_wait_node_cache` 复用→ 调试快照**必须排除缓存节点**以免虚报等待者；**统计安全点：真实挂起点仅 5 处**（`scheduler.cpp:2661/2723/2744/2782/2809`，对应 Yield/Park/Park/Io/通用）→ **解除 B5 的阻塞项**并给出可承诺精度（四类语义位置，粒度=一次挂起） | `sync.cpp:31-100,167-185,194-235,301-314,360`；`scheduler.cpp:2661-2823`；`fiber.cpp:1258` |
 
-## 下一轮任务（第 14 轮）
+## 下一轮任务（第 15 轮）
 
-**核验②**：继续消除「未确认」——
+**核验③**（收官前的最后一批未确认项）：
 
-1. 读 `WaitNode::Wake()` 与 `WaitBackend` 默认实现（`SchedulerWaitBackend`，`sync.cpp:31` 起），
-   弄清 `m_wake_mutex` / `m_active` / `TryFinish` 的配合，补 D1/D2/D3 的实现细节；
-2. 读 `ConditionVariable::NotifyOne/NotifyAll`（`sync.cpp:1139` 附近），补 D5；
-3. 统计安全点的**调用点数量**（`Suspend`/`SuspendForScheduler`/`park_for_scheduler`/`mark_yielded*`），
-   给出 B5 断点精度的**可承诺范围**；
-4. 结论回填 `design/08-verified-details.md`。
+1. 读 `ConditionVariable::NotifyOne/NotifyAll`（`sync.cpp:1139` 附近）与 `CondVar::Impl`，补 D5；
+2. 读 `Hook` 与 `sysmon` 对阻塞区的观测方式，补 A6 的 `processor_detached`/`long_syscall_count` 来源；
+3. 读 `Context` 的取消传播与 `DoneSignal` 回调注册/移除的锁边界（影响 B6 与 `CallbackGuard`）；
+4. 回填 `design/08-verified-details.md`，并把新一轮解除的阻塞项同步到验证矩阵。
