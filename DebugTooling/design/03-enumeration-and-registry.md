@@ -92,7 +92,7 @@ struct Processor {
 
 ## 5. 事件类型数量的更正（诚实性修正）
 
-前几轮我在文档里写过「10 类事件」——**这是错的**。`scheduler.hpp:103-120` 实际定义了 **9 类**：
+前几轮我在文档里写过「9 类事件」——**这是错的**。`scheduler.hpp:103-120` 实际定义了 **9 类**：
 
 ```
 kStarted, kStopping, kWorkerStarted, kWorkerStopped,

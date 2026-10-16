@@ -89,7 +89,7 @@ using FiberContextSnapshot = std::vector<FiberContextFrame>;
 ### 1.5 事件流与观察者插件
 
 - `SchedulerObserver::OnEvent(const SchedulerEvent&)`（`scheduler.hpp:173`），
-  10 类事件（`103-120`）：`kStarted`/`kStopping`/`kWorkerStarted`/`kWorkerStopped`/
+  9 类事件（`103-120`）：`kStarted`/`kStopping`/`kWorkerStarted`/`kWorkerStopped`/
   `kTaskStarted`/`kTaskSuspended`/`kTaskCompleted`/`kTaskFailed`/`kTaskCancelled`；
 - `SchedulerEvent` 同时携带 `task_id`/`machine_id`/`processor_id`/`task_state`/`timestamp`（`122-138`）；
 - **可在运行期替换**：`set_observer()` / `observer()`（`scheduler.hpp:463-465`），

@@ -79,7 +79,7 @@
 
 - **目的**：还原"什么时候发生了什么"。
 - **触发**：`dump scheduler --events=1000`（历史）或 `--follow`（实时）
-- **期望信息**：`SchedulerEventType`（10 类）+ `task_id`/`machine_id`/`processor_id`/
+- **期望信息**：`SchedulerEventType`（9 类）+ `task_id`/`machine_id`/`processor_id`/
   `task_state`/`timestamp`
 - **现有能力**：✅ 事件类型与结构（`scheduler.hpp:103-138`）+ 观察者（`173`）
 - **缺口**：❌ **没有历史缓冲**（Observer 只有推送），需插件侧实现有界环形缓冲
