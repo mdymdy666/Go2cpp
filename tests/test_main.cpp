@@ -37,6 +37,7 @@ void run_debug_scheduler_tests();
 void run_debug_cli_tests();
 void run_debug_sync_tests();
 void run_debug_lock_selector_tests();
+void run_debug_events_tests();
 
 /**
  * @brief 统一运行默认测试集并根据过滤器选择测试模块。
@@ -88,6 +89,7 @@ int main() {
     if (selected("debug_cli")) run_debug_cli_tests();
     if (selected("debug_sync")) run_debug_sync_tests();
     if (selected("debug_lock_selector")) run_debug_lock_selector_tests();
+    if (selected("debug_events")) run_debug_events_tests();
 #ifdef GO2CPP_TEST_HOOK
     if (selected("hook")) run_hook_tests();
 #endif

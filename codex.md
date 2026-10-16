@@ -6816,3 +6816,47 @@ worker 数增加时比例上升（4 worker 档1 为 +22.7%），其中包含 `ob
 **全量 ctest 79/79 通过**（29.78 s）。
 另注：竞争压测在有选择器参与时从 3 ms 变为 298 ms（20000 次），
 两者不可直接比较 —— 后者是**选择器真的被调用且含异常路径**的代价，不是回归。
+
+---
+
+## 2026-10-16 16:05–16:30：调试模块开发第 11 轮 —— P2 事件采集
+
+**新增**：`include/go2cpp/debug/debug_events.hpp`（270 行）与 `tests/debug/test_debug_events.cpp`（265 行），
+更新转发头、登记 CMake 与 `test_main`。
+
+**组成**：
+- `EventBuffer`：有界环形缓冲（内部数组 capacity+1 以区分满/空），
+  `Push`/`Pop` **非阻塞、不抛异常、不分配**；满时 `Push` 返回 false 并累加 `dropped`；
+  另有 `PeekAt` 供只读快照使用。
+- `DebugEventCollector : SchedulerObserver`：回调里**只做一次非阻塞入队**，
+  严格遵守 `scheduler.hpp` 对观察者的约束（回调必须短小且无阻塞）；
+  提供 `Drain`/`Peek`/`Pending`/`Captured`/`Dropped` 与三种序列化。
+
+**如实声明的边界**：① 只采集 `SchedulerObserver` 能看到的**已声明事件**，
+即设计文档反复强调的「没显示阻塞 ≠ 没有阻塞」；
+② 采集器**不是**线程局部的。按 `perf-observer-overhead.md` §4 的建议，
+降低多 worker 争用的下一步是「每 worker 线程局部暂存 + 批量发布」，
+那需要 per-instance/per-thread 状态管理，**本轮未实现**，在头文件里标注为后续优化，
+而不是声称已经做到。
+
+**顺带印证**：`SchedulerObserver::OnEvent` 自身**没有 `noexcept`**，
+注释明确写「接口保留可抛出签名是为了让 Scheduler 在 emit_event() 中统一捕获第三方插件异常」——
+这与第 10 轮把 `WaitSelector::Select` 的 `noexcept` 去掉是同一个道理，说明当时的修正是对的。
+
+**测试**：6 个场景（空/满/回绕与 FIFO 顺序、满时丢弃并满足 captured+dropped 守恒、
+**接真实调度器**能采到 `kTaskStarted`/`kTaskCompleted` 与 `kWorkerStarted`/`kWorkerStopped`、
+容量 8 的采集器在 300 个任务下必然丢弃从而证明有界、Drain 消耗与 Peek 不消耗、
+三种序列化且 json 能被子项目 `go2cpp::Json` 解析回来并校验事件数与类型名）
++ 压测（`EventBuffer` Push/Pop 100 万次 = **43 ms**）+ 随机（200 组随机容量与数量，
+校验 `captured + dropped == 总推送量` 且 `Size() <= Capacity()`）。
+构建 0 warning；**全量 ctest 79/79 通过**。
+
+**D3 选择器开销基准（部分完成，如实记录未决项）**：
+- **无竞争场景（单线程 TryLock/Unlock）**：档 0/1/2 分别为 5.25 / 4.36 / 4.52 ns/op ——
+  三档一致（差异在噪声量级），**证实在 `Unlock` 的 `compare_exchange` 快路径上选择器零开销**
+  （该路径根本不会进入选择器分支）。
+- **有竞争场景**：小参数（1 轮、500 次/线程）可正常完成并给出数字；
+  但**大参数（5 轮、20,000 次/线程，约 80,000 次/档）在 15 分钟内未完成**，
+  与早前一次同类超时一致。**根因尚未定位**，因此本轮**不下任何有竞争场景的性能结论**，
+  已启动增量定位（2,000 / 5,000 / 10,000 / 20,000 逐级）留待下一轮。
+  这是必须如实说明的未决项，不能因为"小参数看起来正常"就当作已完成。
