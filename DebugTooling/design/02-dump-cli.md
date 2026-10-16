@@ -194,3 +194,50 @@ execution.managed = true
 - 把 §6 的两个结构性问题写成独立的**前置设计任务**；
 - 补 text 渲染的示例输出（人类可读形态）；
 - 定 `--include` 的字段命名规范（与 json 路径一致）。
+
+
+## 8. text 渲染示例（与 `scenarios/C-visualization.md` 的 C1 对齐）
+
+```text
+$ Go2Cpp dump scheduler --format=text --stacks --stack-depth=4
+scheduler: main   processors=4 workers=6  runnable=12 (global 3)  running=true
+sysmon: running=true passes=4210
+metrics: runs=100234 completions=100200 resume_ns=884213001 local=91234 steal=431
+snapshot: per-stripe consistent, NOT globally atomic (16 registry stripes)
+
+processor  state    queued  active  running
+  0        Running     3      1       1
+  1        Idle        0      1       0
+  2        Running     0      1       1
+  3        Idle        1      0       0
+
+machine  state     P  affinity(h/m)  detached  blocking  long_syscalls
+  0      Running   0   812/44         false     0         0
+  1      Idle      1   -              false     0         0
+  2      Running   2   77/3           false     0         0
+  3      Blocking  3   -              true      42        1
+
+fiber  state      reason           depth  M  P  name            function                  line
+  1    Running    None               1    0  0  s_main_task     task::worker_loop         128
+  2    Waiting    Synchronization    2    0  0  (unregistered)  -(no metadata)             -
+  3    Suspended  Park               1    3  3  (unregistered)  -(no metadata)             -
+  4    Runnable   None               1    -  -  (unregistered)  -(no metadata)             -
+
+stacks (fiber 2):
+  [0] fiber=2  depth=2  state=Waiting    reason=Synchronization  alive=true  active=true
+  [1] fiber=1  depth=1  state=Running    reason=None             alive=true  active=false
+  [2] main_fiber depth=0  state=Running  reason=None             alive=true  active=false
+```
+
+**渲染约定（必须遵守）**：
+
+1. **缺信息如实呈现**：`(unregistered)` 表示没有该 G 的元数据、`-(no metadata)` 表示该字段无来源；
+   **不得**用 `unknown`/`N/A` 之类混同"已查询但为空"与"机制尚不存在"；
+2. **快照一致性必须显式标注**：`snapshot: per-stripe consistent, NOT globally atomic`
+   —— 让使用者知道这不是同一瞬间的全景（依据：`task_registries` 为 16 分片、逐把加锁，
+   `scheduler.cpp:1694-1705`）；
+3. **`kTaskSuspended` 的语义**在时间线类输出里必须标注为**兜底类别**
+   （`scheduler.cpp:3843-3851`），不能在图上画成"阻塞中"；
+4. **`collect_metrics=false` 时** metrics 全为 0，输出应显示
+   `metrics: disabled (collect_metrics=false)` 而不是一串 0（依据：`3852-3862` 才有累计）；
+5. 列宽按内容自适应；`--color=never` 时不输出任何 ANSI 序列。
