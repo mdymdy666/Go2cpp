@@ -73,7 +73,15 @@
 - **现有能力**：✅ `machines()` → `MachineSnapshot`（`scheduler.hpp:217-233,593`）
 - **风险**：低
 - **价值**：`processor_detached` + `blocking_task` + `long_syscall_count` 三者组合，
-  已足够定位"哪个 M 卡在原生调用上"——**这是现成的高价值诊断**
+  已足够定位「哪个 M 卡在原生调用上」——**这是现成的高价值诊断**
+- **第 15 轮核验补充（三个易误读点）**：
+  1. `blocking_task` 是**当前被阻塞的 G 的 id**（`scheduler.cpp:3212` 取 `current_task()->id()`），
+     即能直接回答「是哪个 Fiber 卡住了 M」；
+  2. `long_syscall_count` 是**累计超阈次数**（detach 时 `fetch_add(1)`，退出不清零），
+     **不是「已阻塞多久」** —— 输出必须标注为次数；
+  3. **detach 会减少 `processor.active_machines`**，可能触发替代 M 启动，
+     因此「worker 数上升」可能是长阻塞的正常后果；
+  4. 「**当前阻塞时长**」需要新增字段（`blocking_since_ns` 未在 `MachineSnapshot` 中导出）。
 
 ## A7 · 事件时间线
 

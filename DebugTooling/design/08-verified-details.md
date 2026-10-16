@@ -171,7 +171,93 @@ bool TryFinish(WaitResult result) noexcept {
 
 ---
 
-## 核验 5 · 待办（后续轮次）
+---
+
+## 核验 5 · `ConditionVariable` 的通知模式（第 15 轮）
+
+**源码**：`src/concurrency/sync.cpp:1021`（`Impl`）、`1046`（`Wait`）、`1123`（`WaitFor`）、
+`1139`（`NotifyOne`）、`1166`（`NotifyAll`）。
+
+### 5.1 `NotifyOne` 与 `Mutex::Unlock` **完全同构**
+
+```cpp
+void ConditionVariable::NotifyOne() noexcept {
+    std::shared_ptr<WaitNode> selected;
+    {
+        std::lock_guard<std::mutex> lock(m_impl->m_mutex);
+        while (!m_impl->m_waiters.empty()) {
+            auto candidate = std::move(m_impl->m_waiters.front());
+            m_impl->m_waiters.pop_front();
+            if (candidate && candidate->TryFinish(WaitResult::kNotified)) {
+                selected = std::move(candidate);
+                break;
+            }
+        }
+    }
+    if (selected) { selected->Wake(); }     // 锁外唤醒
+}
+```
+
+**四点与 `Mutex::Unlock`（`955-1005`）一致**：队首取、`TryFinish` 认领、失效节点跳过、**锁外 `Wake`**。
+→ 说明整个同步层的出队是一套统一模式（可复用同一份"选择钩子"设计，见 D3）。
+
+### 5.2 `NotifyAll` 用 swap 端出队列
+
+```cpp
+std::deque<std::shared_ptr<WaitNode>> waiters;
+{ std::lock_guard<std::mutex> lock(m_impl->m_mutex); waiters.swap(m_impl->m_waiters); }
+for (const auto& waiter : waiters) { /* 锁外逐个唤醒 */ }
+```
+与 `Scheduler::Close()`（把队列整个端出来、锁外统一唤醒）是同一手法。
+
+### 5.3 对 D5 的补充
+
+- D5 需要的"等待者快照"可直接读 `m_waiters`（持 `m_impl->m_mutex`）；
+- **通知统计**（`notify_one_calls`/`notify_all_calls`/实际唤醒数）需要新增计数，
+  但位置很清楚：`NotifyOne` 的 `selected` 是否为空 + `NotifyAll` 的 `waiters.size()`；
+- **唤醒失败**（`TryFinish` 返回 false，即节点已被取消/超时）也应计数 ——
+  这能回答"通知是否打空"这个常见疑问。
+
+---
+
+## 核验 6 · sysmon 阻塞观测的完整生命周期（第 15 轮）
+
+**源码**：`scheduler.cpp:1051-1054`（字段）、`3200-3218`（声明阻塞）、
+`1432-1458`（sysmon 超阈 detach）、`3255-3270`（退出阻塞）、`3386-3388`（导出快照）。
+
+### 6.1 三个阶段
+
+| 阶段 | 位置 | 做了什么 |
+|---|---|---|
+| **① 声明阻塞** | `3200-3218` | 仅当 M 处于 `kRunning` 才进入 `MState::kBlocking`；记 `blocking_since_ns = steady_now_ns()`；**`blocking_task = current_task()->id()`**；复位 `processor_detached`；`blocking_workers++` |
+| **② 超阈 detach** | `1432-1458` | sysmon 周期扫描；对 `kBlocking` 且 `now - blocking_since_ns >= threshold` 且尚未 detached 的 M：置 `processor_detached = true`、**`long_syscall_count++`**、**`processor.active_machines--`**（可能因此启动替代 M） |
+| **③ 退出清理** | `3255-3270` | `processor_detached.exchange(false)`、`blocking_since_ns = 0`、`blocking_task = 0`、状态回 `kRunning`、`blocking_workers--` |
+
+`threshold` 来自 `SchedulerConfig::long_syscall_threshold`（默认 **50 ms**，`scheduler.hpp:178-181`）。
+
+### 6.2 **两个易误读点（订正 A6 的解读）**
+
+1. **`long_syscall_count` 是「累计超阈次数」，不是「已阻塞多久」** ——
+   它在 detach 时 `fetch_add(1)`（`1447`），退出阻塞时**不会清零**。
+   → 调试输出必须标注为"次数"；想知道"当前阻塞了多久"，要用
+   `blocking_since_ns`（但**该字段不在 `MachineSnapshot` 里**，需新增或另算）。
+2. **`blocking_task` 是「当前被阻塞的那个 G 的 id」**（`3212`：`current_task()->id()`），
+   而**不是**"机器 id"或"任务类别"。→ 这让 A6 能直接回答
+   **「是哪个 Fiber 把 M 卡住了」**，比此前文档的表述更有用。
+3. **detach 会减少 `processor.active_machines`** → 可能触发**替代 M 的启动**。
+   → 因此调试时看到"worker 数量上升"可能正是长阻塞导致的，**不应误判为异常**。
+
+### 6.3 对 `scenarios/A-observability.md` 的**订正**
+
+A6 原文只写「`processor_detached` + `blocking_task` + `long_syscall_count` 三者组合，
+已足够定位"哪个 M 卡在原生调用上"」。**补充**：
+- `blocking_task` 直接给出**阻塞中的 G id**；
+- `long_syscall_count` 是**次数**（易误读）；
+- **"当前阻塞时长"需要新增字段**（`blocking_since_ns` 未导出）→ 归入 R 组接口的补充项。
+
+---
+
+## 核验 7 · 待办（后续轮次）
 
 | # | 待核验 | 影响 |
 |---:|---|---|

@@ -28,12 +28,13 @@
 | 12 | 10-16 深化③：场景×验证矩阵 | 新增 `scenarios/verification-matrix.md`：34 个场景逐条映射「验证方式/测试类型/验收判据/依赖接口/阻塞项」；统计出 **24 个无阻塞项**、7 个依赖未定案；给出**发布前检查清单**（功能层/干扰层/控制面/文档记录 四组共 18 项）与编码阶段 10 步推进顺序 | `scenarios/verification-matrix.md`；接口编号引自 `design/06`；测试类型代号引自 `design/07` |
 | 13 | 10-16 核验①：worker 出队路径与事件发射锁边界 | 读 `worker_loop`（`scheduler.cpp:3494` 起）确认**四级出队顺序**：本地 P 队列（队首 `pop_front`，FIFO）→ incoming 条带（`incoming_probe` 轮转）→ 全局队列 → **work stealing 从其他 P 的队尾偷**（注释原文 steal from the back）；并确认**本地快路径有门槛**（`runnable > processors.size()`）；`grep -B4 -A3 emit_event` 确认 **6 个发射点全部不持调度器状态锁**，且 `kWorkerStarted` 在 thread-local 的 M/P 赋值之后发出（插件可在回调中安全读 `current_*`）；据此**订正** B4/C2（插队需考虑偷取方向）与 `design/04` §3（非阻塞要求来自时序而非锁竞争）；新增 `design/08-verified-details.md` | `scheduler.cpp:1939,1992,3503,3519-3541,3742,3833,3848,4036` |
 | 14 | 10-16 核验②：等待机制与安全点统计 | 读默认 `WaitBackend`（`sync.cpp:31-100`）与 `WaitNode` 核心（`167-235`、`296-345`）：确认 `TryFinish` 是 `m_result` 的 **CAS 单赢家**（与 `SelectWaitState::TrySelect` 同构）、存在**两条等待路径**（Fiber 走 `park_wait`、线程走 `WaitNative`）；**新发现** `WaitNode` 有 `generation` 机制解决「缓存节点 + 迟到取消回调」竞态，且节点会被 `t_wait_node_cache` 复用→ 调试快照**必须排除缓存节点**以免虚报等待者；**统计安全点：真实挂起点仅 5 处**（`scheduler.cpp:2661/2723/2744/2782/2809`，对应 Yield/Park/Park/Io/通用）→ **解除 B5 的阻塞项**并给出可承诺精度（四类语义位置，粒度=一次挂起） | `sync.cpp:31-100,167-185,194-235,301-314,360`；`scheduler.cpp:2661-2823`；`fiber.cpp:1258` |
+| 15 | 10-16 核验③：条件变量与 sysmon 阻塞观测 | 读 `ConditionVariable`（`Implement`/`Wait`/`NotifyOne`/`NotifyAll`，`sync.cpp:1021-1180`）：确认 `NotifyOne` 与 `Mutex::Unlock` **完全同构**（队首取 + TryFinish 认领 + 失效跳过 + 锁外 Wake），`NotifyAll` 用 `swap` 端出队列后锁外逐个唤醒（与 `Scheduler::Close` 同手法）；读 sysmon 阻塞观测的**完整生命周期**（声明 `3200-3218` → 超阈 detach `1432-1458` → 退出清理 `3255-3270`，阈值默认 50ms）；**订正 A6 三个易误读点**：`blocking_task` 是阻塞中的 G id、`long_syscall_count` 是累计次数而非时长、detach 会减 `active_machines` 从而可能启动替代 M；并指出「当前阻塞时长」需新增字段（`blocking_since_ns` 未导出） | `sync.cpp:1021-1180`；`scheduler.cpp:1051-1054,1432-1458,3200-3218,3255-3270,3386-3388`；`scheduler.hpp:178-181` |
 
-## 下一轮任务（第 15 轮）
+## 下一轮任务（第 16 轮）
 
-**核验③**（收官前的最后一批未确认项）：
+**核验④**（Context 与 Hook，本轮为核验阶段收尾）：
 
-1. 读 `ConditionVariable::NotifyOne/NotifyAll`（`sync.cpp:1139` 附近）与 `CondVar::Impl`，补 D5；
-2. 读 `Hook` 与 `sysmon` 对阻塞区的观测方式，补 A6 的 `processor_detached`/`long_syscall_count` 来源；
-3. 读 `Context` 的取消传播与 `DoneSignal` 回调注册/移除的锁边界（影响 B6 与 `CallbackGuard`）；
-4. 回填 `design/08-verified-details.md`，并把新一轮解除的阻塞项同步到验证矩阵。
+1. 读 `Context` 的取消传播与 `DoneSignal` 回调注册/移除的锁边界（影响 B6 与 `CallbackGuard` 语义）；
+2. 读 `Hook`（`src/network/hook.cpp` 与本会话早前确认的 `cooperative_sleep_for`）如何与调度器阻塞区协作；
+3. 把两块结论回填 `design/08-verified-details.md`；
+4. 鉴于 14:00 临近，准备**收官汇报**：汇总全部核验成果、更新最终待定案清单。
