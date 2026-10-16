@@ -609,6 +609,71 @@ ContextPtr TimeoutContext(ContextDuration timeout, const ContextPtr& parent,
 /// @param[in] factory 新建等待节点使用的后端工厂。
 /// @return 成功发布返回 true；复制 std::function 失败返回 false。
 /// @note 已存在等待节点继续使用原后端，不会被强制迁移。
+
+namespace {
+
+/// 全局选择器工厂（与 WaitBackend 工厂同风格）。默认空 = 纯 FIFO。
+std::mutex s_selector_mutex;
+std::shared_ptr<WaitSelector> s_selector;
+
+/// 取当前选择器（无锁快路径：先用原子标志判断是否可能为空）。
+std::shared_ptr<WaitSelector> CurrentWaitSelector() noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(s_selector_mutex);
+        return s_selector;
+    } catch (...) {
+        return {};
+    }
+}
+
+/// 让选择器重排等待队列：**只把被选中的节点换到队首**，不改认领语义。
+/// @note 该函数在持队列锁时调用；异常与越界一律退化为不干预。
+void ReorderWaitersForSelector(std::deque<std::shared_ptr<WaitNode>>& waiters) {
+    if (waiters.size() < 2U) {
+        return;
+    }
+    auto selector = CurrentWaitSelector();
+    if (!selector) {
+        return;
+    }
+    std::vector<WaiterCandidate> candidates;
+    candidates.reserve(waiters.size());
+    for (std::size_t index = 0; index < waiters.size(); ++index) {
+        candidates.push_back(WaiterCandidate{index, waiters[index] && waiters[index]->managed()});
+    }
+    std::optional<std::size_t> chosen;
+    try {
+        chosen = selector->Select(candidates);
+    } catch (...) {
+        return;   // 策略异常必须被隔离，退化为默认 FIFO
+    }
+    if (!chosen.has_value() || *chosen == 0U || *chosen >= waiters.size()) {
+        return;   // 不干预或下标非法
+    }
+    std::swap(waiters[0], waiters[*chosen]);
+}
+
+}  // namespace
+
+bool SetWaitSelectorFactory(WaitSelectorFactory factory) {
+    try {
+        std::shared_ptr<WaitSelector> selector;
+        if (factory) {
+            selector = factory();
+        }
+        std::lock_guard<std::mutex> lock(s_selector_mutex);
+        s_selector = std::move(selector);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void ResetWaitSelectorFactory() noexcept {
+    std::lock_guard<std::mutex> lock(s_selector_mutex);
+    s_selector.reset();
+}
+
 bool SetWaitBackendFactory(WaitBackendFactory factory) {
     try {
         auto next = std::make_shared<const WaitBackendFactory>(
@@ -991,6 +1056,9 @@ void Mutex::Unlock() {
              Impl::kLocked) == 0U) {
             throw std::logic_error("go2cpp::sync::Mutex unlock of unlocked mutex");
         }
+        // D3：先让选择器重排队列（只换位置，不改认领语义）；默认无选择器时
+        // 只多一次指针判空，热路径开销可忽略。
+        ReorderWaitersForSelector(m_impl->m_waiters);
         while (!m_impl->m_waiters.empty()) {
             std::shared_ptr<WaitNode> candidate =
                 std::move(m_impl->m_waiters.front());

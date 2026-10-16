@@ -34,6 +34,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_scheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_cli.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_sync.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_lock_selector.cpp
     )
     target_link_libraries(go2cpp_tests PRIVATE go2cpp_runtime)
     target_include_directories(go2cpp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

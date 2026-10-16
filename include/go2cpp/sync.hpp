@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace go2cpp::sync {
 namespace go2cpp::debug {
@@ -79,6 +80,54 @@ public:
 };
 
 using WaitBackendFactory = std::function<std::shared_ptr<WaitBackend>()>;
+
+/**
+ * @brief 等待队列中的一个候选者（**不含内部节点类型**，因此可安全暴露）。
+ * @note `wait_ns`（已等待时长）当前**没有**提供：`WaitNode` 未记录等待起点，
+ *       要支持它需要改动节点结构，本轮不做，也不虚构字段。
+ */
+struct WaiterCandidate {
+    std::size_t index{0};    ///< 在等待队列中的位置（0 = FIFO 队首）。
+    bool is_fiber{false};    ///< 是否受管 Fiber（false 表示普通线程）。
+};
+
+/**
+ * @brief 锁争用时的等待者选择策略（D3）。
+ *
+ * **语义边界（必须遵守）**：
+ *   选择器**只能改变等待队列的顺序**，不能改变"谁最终获得锁"的裁决方式 ——
+ *   排序之后仍然由 `Mutex::Unlock` 按 FIFO 逐个 `TryFinish` 认领，
+ *   因此「所有权**无缝转移**给下一个持有者、`TryLock` 调用者**不能插队**」
+ *   这两条既有语义**完全不受影响**。
+ *
+ * **调用约束**：在**持队列锁**时同步调用；实现**不得阻塞、不得抛异常**
+ *   （抛出的异常会被运行时隔离并退化为默认 FIFO）。
+ *
+ * **饥饿**：本接口不做饥饿保护。若策略可能长期跳过某个等待者，
+ *   实现方需自行加入"跳过次数上限后强制 FIFO"的机制 —— 这是**策略的责任**。
+ */
+class WaitSelector {
+public:
+    virtual ~WaitSelector() = default;
+
+    /// @return 要优先的候选下标；返回 `std::nullopt` 表示**不干预**（保持 FIFO）。
+    virtual std::optional<std::size_t> Select(
+        const std::vector<WaiterCandidate>& candidates) noexcept = 0;
+};
+
+using WaitSelectorFactory = std::function<std::shared_ptr<WaitSelector>()>;
+
+/**
+ * @brief 注册锁争用选择器工厂。
+ * @param factory 自定义选择器；为空表示恢复默认（纯 FIFO）。
+ * @note 与 `SetWaitBackendFactory` 同风格：**只影响之后发生的争用**，
+ *       且默认（未注册）时热路径只多一次原子判空。
+ */
+bool SetWaitSelectorFactory(WaitSelectorFactory factory);
+
+/** @brief 清除自定义选择器，恢复纯 FIFO。 */
+void ResetWaitSelectorFactory() noexcept;
+
 
 /**
  * @brief 注册新建同步等待节点所使用的后端工厂。

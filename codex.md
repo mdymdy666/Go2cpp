@@ -6740,3 +6740,43 @@ worker 数增加时比例上升（4 worker 档1 为 +22.7%），其中包含 `ob
 条件变量等待者、空指针代理安全）+ 压测（20000 次 Snapshot ≈90 ns/次）+ 随机（3000 轮随机持锁/释放，
 校验 `fiber+native==waiters` 且 `held != TryLock()` 互补）。
 **全量 ctest 79/79 通过**（因为改了核心文件 `sync.hpp`/`sync.cpp`，这一步是必需的验证）。
+
+---
+
+## 2026-10-16 15:20–15:45：调试模块开发第 9 轮 —— D3 锁争用选择钩子
+
+**这是使用者最初需求里点名的能力**：「在锁争抢的时候决定哪个 Fiber 能获取权限」。
+
+**接口**（`include/go2cpp/sync.hpp`）：
+- `WaiterCandidate { index, is_fiber }` —— **刻意不暴露内部的 `WaitNode`**，
+  因此插件只需依赖这两个字段即可写策略；也**没有**虚构 `wait_ns`（`WaitNode` 未记录等待起点，
+  要支持它得改节点结构，本轮不做）；
+- `WaitSelector::Select(const std::vector<WaiterCandidate>&) -> std::optional<std::size_t>`，
+  返回 `nullopt` 表示不干预；
+- `SetWaitSelectorFactory` / `ResetWaitSelectorFactory`（与既有的 `WaitBackend` 工厂同风格）。
+
+**接入方式（关键设计）**：`Mutex::Unlock` 在**取得队列锁之后、FIFO 认领循环之前**调用
+`ReorderWaitersForSelector(m_waiters)`，该函数**只把选中的节点与队首交换**，
+之后仍由原有循环逐个 `TryFinish(kNotified)` 认领。
+→ 因此「**所有权无缝转移给下一个持有者**」「**`TryLock` 调用者不能插队**」这两条既有语义
+**完全不受影响**；选择器只改变**顺序**，不改变**裁决方式**。
+默认（未注册）时热路径只多一次 `CurrentWaitSelector()`（一次加锁取 `shared_ptr`）——**待补实测**。
+
+**约束（写在头文件里）**：选择器在**持队列锁**时被同步调用，**不得阻塞、不得抛异常**
+（抛出的异常被 `try/catch` 隔离并退化为默认 FIFO）；**不做饥饿保护**，
+若策略会长期跳过某等待者，需实现方自行加上限并强制 FIFO —— 这是**策略的责任**。
+
+**本轮四处纠错（全部是我的问题，不是框架的）**：
+1. `go2cpp::debug::DebugMutex` 与函数内的 `using namespace go2cpp::sync;` 冲突，
+   报 "reference to 'go2cpp' is ambiguous" → 改用 `::go2cpp::` 全限定；
+2. **测试自己写错了**：随机场景里主线程连续 `Unlock()` 三次，
+   但只有一次是释放自己持有的锁，后两次解的是已被 worker 释放的锁，
+   触发 `std::logic_error: unlock of unlocked mutex` → 改为主线程只释放一次、后续由 worker 链式交接；
+3. 一次构建耗时超过工具超时（600s）被移到后台，我当时**误判为"测试卡死"**，
+   单独用 `timeout 60` 复跑后确认测试其实是**通过的** —— 根因是**改了核心头 `sync.hpp` 触发大量重编**；
+4. 记录教训：改核心头文件后，构建时间的预期必须放宽，且验证命令要带 `timeout` 以免真的卡住时占用窗口。
+
+**测试**：5 个场景（未注册时与默认 FIFO 一致 / 选择器让**指定等待者优先**（3 线程排队后指定最后一个，
+断言其第一个拿到锁）/ 返回 `nullopt` 与越界下标退化为默认 / 抛异常被隔离且锁仍正常移交 /
+`Reset` 后恢复默认且 `TryLock` 仍不能插队）+ 压测（无竞争 100000 次 ≈2896 µs、
+4 线程竞争 20000 次 3 ms 且 completed=20000 无丢失）+ 随机（随机指派下标 8 轮不放死）。
