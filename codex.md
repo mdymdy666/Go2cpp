@@ -6652,3 +6652,38 @@ worker 数增加时比例上升（4 worker 档1 为 +22.7%），其中包含 `ob
 
 **后续状态**：P0 的"零开销证明"端到端部分完成；下一步做 `DebugTask`/`DebugScheduler`（继承路径），
 以及等使用者圈定锁的代理范围后实现 `DebugMutex`。
+
+---
+
+## 2026-10-16 14:00–14:45：调试模块开发第 6 轮 —— DebugScheduler 代理与三种序列化
+
+**设计判断（先说清楚）**：`DebugTask`/`DebugScheduler` 采用**代理**而非继承。
+原因：调试侧要包装的是**框架已创建的对象**（`spawn()` 返回 `shared_ptr<Task>`，无法塞入子类），
+继承既无法替换它，`Scheduler`/`Task` 又都是非虚析构，继承反而有误删风险。
+对比：`DebugFiber` 用继承是**恰当**的，因为它是用户**自己创建并真实执行**的对象。
+
+**新增**：`include/go2cpp/debug/debug_scheduler.hpp`（311 行）+ 更新 `debug.hpp` +
+`tests/debug/test_debug_scheduler.cpp`（205 行，5 场景 + 压测 + 随机）；
+登记 `cmake/Go2CppTests.cmake` 与 `tests/test_main.cpp`。
+**零侵入**：只调用 `Scheduler` 已有的 public 接口
+（计数/`is_running`/sysmon/`metrics`/`processors`/`machines`），未修改框架任何一行。
+
+**序列化**：text / ini / json 三种；json 字段名对齐 `design/02` 的 schema；
+双时间戳（steady + wall）按使用者定案输出，并在三种格式里都**显式标注**
+「steady 不可跨机比较」「快照为 per-call 一致而非全局原子」
+「`long_syscall_count` 是次数不是时长」「metrics 全 0 可能是 collect_metrics=false」。
+
+**三处编译纠错**：① `SchedulerMetrics`/`ProcessorSnapshot`/`MachineSnapshot` 在
+`go2cpp::scheduler` 命名空间（`scheduler.hpp` 顶层别名未覆盖），需显式 `using`；
+② `"state=" + ProcessorStateName(...)` 是 `const char* + const char*`（非法），
+改 `std::string("state=") + ...`；③ json 的真实别名是 `go2cpp::Json`（`tools/json.hpp:69`），
+`json.hpp` 只是转发头。
+
+**一处测试假设纠错（有价值）**：原断言 `Contains(ini, "[machine.0]")` 失败。
+加诊断后实测 **`machines[0].id = 5`** —— machine id 是**全局递增**、**不从 0 开始**。
+改为按快照里的**实际 id** 断言，并通过。教训：断言要用实际值，不能假设从 0 起。
+
+**验证**：构建 0 warning；`debug_scheduler` 单模块 all checks passed；**全量 ctest 79/79 通过**。
+压测（仅报量级）：`Snapshot` ×2000 = 2.5 ms（≈1.26 µs/次）；三种 `Dump` ×200 = 2.3 ms（≈11.6 µs/次）。
+
+**后续**：P1 剩余（CLI 入口 + 文件 sink）、"枚举全部 G"接口（需在原类加私有 Debug 方法 + friend）。

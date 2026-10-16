@@ -1,0 +1,317 @@
+#pragma once
+
+/**
+ * @file debug_scheduler.hpp
+ * @brief 调度器调试代理与序列化（P0/P1）。
+ *
+ * 设计依据：
+ *   - DebugTooling/design/04-encoding-roadmap.md（五层架构：采集/快照/序列化）
+ *   - DebugTooling/design/09-debug-class-conventions.md §2.4（代理方案）
+ *
+ * 为什么用**代理**而不是继承 `Scheduler`：
+ *   `Scheduler` 虽无 `final`，但调试侧要包装的是**框架已创建的对象**
+ *   （用户代码自己 new 的 `Scheduler`），继承无法替换它，且 `Scheduler`
+ *   非虚析构（实测 `is_polymorphic = 0`），继承反而有误删风险。
+ *   因此这里是：`DebugScheduler` 组合持有 `Scheduler&` + 只读查询。
+ *
+ * **零侵入**：本文件只使用 `Scheduler` 已有的 public 接口
+ *   （`processor_count()`/`worker_count()`/`runnable_count()`/`global_runnable_count()`/
+ *    `is_running()`/`sysmon_running()`/`sysmon_pass_count()`/`metrics()`/
+ *    `processors()`/`machines()`），不修改框架任何一行。
+ *
+ * 双时间戳：使用者已定案 —— 记录时刻同时取 `steady_clock` 与 `system_clock`，
+ *   并**明确声明不做跨机绝对对齐**（`steady` 跨机不可比）。
+ */
+
+#include "go2cpp/scheduler.hpp"
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace go2cpp::debug {
+
+// 短别名：scheduler.hpp 在 go2cpp 顶层提供的别名未覆盖这三个类型
+// （只有 Machine/Processor），因此这里显式引入，避免全名噪音。
+using SchedulerMetrics = scheduler::SchedulerMetrics;
+using ProcessorSnapshot = scheduler::ProcessorSnapshot;
+using MachineSnapshot = scheduler::MachineSnapshot;
+
+/// 序列化格式。
+enum class DumpFormat {
+    kText,  ///< 人类可读。
+    kIni,   ///< ini 节结构。
+    kJson,  ///< JSON（字段名与 design/02 的 schema 一致）。
+};
+
+/// dump 选项（对应 design/02 的 CLI 选项，本轮支持子集）。
+struct DumpOptions {
+    bool include_processors{true};
+    bool include_machines{true};
+    bool include_metrics{true};
+    bool include_fibers{false};  ///< 需“枚举全部 G”接口，本轮尚未提供。
+};
+
+/// 调度器调试快照（纯数据，可自由拷贝）。
+struct SchedulerDebugSnapshot {
+    std::size_t processor_count{0};
+    std::size_t worker_count{0};
+    std::size_t runnable_total{0};
+    std::size_t runnable_global{0};
+    bool running{false};
+    bool sysmon_running{false};
+    std::uint64_t sysmon_passes{0};
+    SchedulerMetrics metrics{};
+    std::vector<ProcessorSnapshot> processors;
+    std::vector<MachineSnapshot> machines;
+
+    /// 双时间戳（使用者定案）。`steady` 仅用于**同机**排序与耗时，
+    /// **不可跨机比较**；`wall` 用于跨机粗对齐。输出中必须标注此限制。
+    std::chrono::steady_clock::time_point steady_at{};
+    std::chrono::system_clock::time_point wall_at{};
+
+    /// 快照一致性声明：本快照由**多次独立读取**拼成，不是同一瞬间的全景。
+    bool per_call_consistent{false};
+};
+
+/**
+ * @brief 调度器调试代理。
+ *
+ * 依赖：调用方持有并保证 `Scheduler` 的生命周期长于本代理。
+ * 对上层提供：一致读取的快照、以及 text/ini/json 三种序列化。
+ */
+class DebugScheduler final {
+public:
+    explicit DebugScheduler(Scheduler& scheduler) noexcept : m_scheduler(&scheduler) {}
+    explicit DebugScheduler(Scheduler* scheduler) noexcept : m_scheduler(scheduler) {}
+
+    /// 采集一份快照。
+    /// @note 由多次独立读取拼成；`per_call_consistent` 为 false 正是要**如实标注**
+    ///       它不是同一瞬间的全景（避免使用者误读）。
+    SchedulerDebugSnapshot Snapshot() const {
+        SchedulerDebugSnapshot snapshot;
+        if (m_scheduler == nullptr) {
+            return snapshot;
+        }
+        snapshot.steady_at = std::chrono::steady_clock::now();
+        snapshot.wall_at = std::chrono::system_clock::now();
+        snapshot.processor_count = m_scheduler->processor_count();
+        snapshot.worker_count = m_scheduler->worker_count();
+        snapshot.runnable_total = m_scheduler->runnable_count();
+        snapshot.runnable_global = m_scheduler->global_runnable_count();
+        snapshot.running = m_scheduler->is_running();
+        snapshot.sysmon_running = m_scheduler->sysmon_running();
+        snapshot.sysmon_passes = m_scheduler->sysmon_pass_count();
+        snapshot.metrics = m_scheduler->metrics();
+        snapshot.processors = m_scheduler->processors();
+        snapshot.machines = m_scheduler->machines();
+        snapshot.per_call_consistent = false;
+        return snapshot;
+    }
+
+    /// 按格式导出。
+    std::string Dump(DumpFormat format, const DumpOptions& options = {}) const {
+        switch (format) {
+            case DumpFormat::kIni: return DumpIni(options);
+            case DumpFormat::kJson: return DumpJson(options);
+            case DumpFormat::kText: break;
+        }
+        return DumpText(options);
+    }
+    std::string Dump(const DumpOptions& options = {}) const { return DumpText(options); }
+
+    /// 文本格式（人类可读，缺信息如实标注）。
+    std::string DumpText(const DumpOptions& options = {}) const {
+        const auto s = Snapshot();
+        std::string out;
+        out += "[scheduler]\n";
+        out += "  processors=" + std::to_string(s.processor_count) +
+               " workers=" + std::to_string(s.worker_count) +
+               " runnable=" + std::to_string(s.runnable_total) +
+               " (global " + std::to_string(s.runnable_global) + ")" +
+               " running=" + (s.running ? "true" : "false") + "\n";
+        out += "  sysmon: running=" + std::string(s.sysmon_running ? "true" : "false") +
+               " passes=" + std::to_string(s.sysmon_passes) + "\n";
+        out += "  snapshot: per-call consistent, NOT globally atomic\n";
+        out += "  clocks: steady_ns=" +
+               std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  s.steady_at.time_since_epoch())
+                                  .count()) +
+               " wall_unix_ns=" +
+               std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  s.wall_at.time_since_epoch())
+                                  .count()) +
+               "  (steady is NOT cross-machine comparable)\n";
+        if (options.include_metrics) {
+            out += "  metrics: runs=" + std::to_string(s.metrics.task_runs) +
+                   " completions=" + std::to_string(s.metrics.task_completions) +
+                   " resume_ns=" + std::to_string(s.metrics.fiber_resume_ns) +
+                   " local=" + std::to_string(s.metrics.local_queue_pops) +
+                   " steal=" + std::to_string(s.metrics.steal_pops);
+            if (s.metrics.task_runs == 0) {
+                out += "   [note: all-zero may mean collect_metrics=false, not 'no tasks']";
+            }
+            out += "\n";
+        }
+        if (options.include_processors) {
+            out += "\nprocessor  state      queued\n";
+            for (const auto& p : s.processors) {
+                out += "  " + std::to_string(p.id) + "        " +
+                       ProcessorStateName(p.state) + "  " +
+                       std::to_string(p.queued) + "\n";
+            }
+        }
+        if (options.include_machines) {
+            out += "\nmachine  state      P  detached  blocking  long_syscalls  affinity(h/m)\n";
+            for (const auto& m : s.machines) {
+                out += "  " + std::to_string(m.id) + "      " + MachineStateName(m.state) +
+                       "  " + std::to_string(m.processor) + "  " +
+                       std::string(m.processor_detached ? "true " : "false") + "     " +
+                       std::to_string(m.blocking_task) + "         " +
+                       std::to_string(m.long_syscall_count) + "              " +
+                       std::to_string(m.affinity_hits) + "/" +
+                       std::to_string(m.affinity_misses) + "\n";
+            }
+            out += "(long_syscalls is a COUNT of threshold-exceeding blocks, not a duration)\n";
+        }
+        return out;
+    }
+
+    /// ini 节结构（字段名与 design/02 的 schema 一致）。
+    std::string DumpIni(const DumpOptions& options = {}) const {
+        const auto s = Snapshot();
+        std::string out;
+        out += "[scheduler]\n";
+        out += "processor_count=" + std::to_string(s.processor_count) + "\n";
+        out += "worker_count=" + std::to_string(s.worker_count) + "\n";
+        out += "runnable_total=" + std::to_string(s.runnable_total) + "\n";
+        out += "runnable_global=" + std::to_string(s.runnable_global) + "\n";
+        out += "is_running=" + std::string(s.running ? "true" : "false") + "\n";
+        out += "sysmon_running=" + std::string(s.sysmon_running ? "true" : "false") + "\n";
+        out += "sysmon_passes=" + std::to_string(s.sysmon_passes) + "\n";
+        out += "steady_ns=" + std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               s.steady_at.time_since_epoch()).count()) + "\n";
+        out += "wall_unix_ns=" + std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  s.wall_at.time_since_epoch()).count()) + "\n";
+        out += "snapshot_consistency=per_call\n\n";
+        if (options.include_metrics) {
+            out += "[scheduler.metrics]\n";
+            out += "task_runs=" + std::to_string(s.metrics.task_runs) + "\n";
+            out += "task_completions=" + std::to_string(s.metrics.task_completions) + "\n";
+            out += "fiber_resume_ns=" + std::to_string(s.metrics.fiber_resume_ns) + "\n";
+            out += "local_queue_pops=" + std::to_string(s.metrics.local_queue_pops) + "\n";
+            out += "steal_pops=" + std::to_string(s.metrics.steal_pops) + "\n\n";
+        }
+        if (options.include_processors) {
+            for (const auto& p : s.processors) {
+                out += "[processor." + std::to_string(p.id) + "]\n";
+                out += "id=" + std::to_string(p.id) + "\n";
+                out += std::string("state=") + ProcessorStateName(p.state) + "\n";
+                out += "queued=" + std::to_string(p.queued) + "\n\n";
+            }
+        }
+        if (options.include_machines) {
+            for (const auto& m : s.machines) {
+                out += "[machine." + std::to_string(m.id) + "]\n";
+                out += "id=" + std::to_string(m.id) + "\n";
+                out += std::string("state=") + MachineStateName(m.state) + "\n";
+                out += "processor=" + std::to_string(m.processor) + "\n";
+                out += "last_task_class=" + std::to_string(m.last_task_class) + "\n";
+                out += "affinity_hits=" + std::to_string(m.affinity_hits) + "\n";
+                out += "affinity_misses=" + std::to_string(m.affinity_misses) + "\n";
+                out += "processor_detached=" + std::string(m.processor_detached ? "true" : "false") + "\n";
+                out += "blocking_task=" + std::to_string(m.blocking_task) + "\n";
+                out += "long_syscall_count=" + std::to_string(m.long_syscall_count) + "\n\n";
+            }
+        }
+        return out;
+    }
+
+    /// JSON（字段名与 design/02 §3 的 schema 对齐）。
+    std::string DumpJson(const DumpOptions& options = {}) const {
+        const auto s = Snapshot();
+        std::string out;
+        out += "{\n";
+        out += "  \"schema\": \"go2cpp.dump.scheduler/1\",\n";
+        out += "  \"snapshot_consistency\": \"per_call\",\n";
+        out += "  \"clocks\": {\"steady_ns\": " +
+               std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  s.steady_at.time_since_epoch()).count()) +
+               ", \"wall_unix_ns\": " +
+               std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  s.wall_at.time_since_epoch()).count()) +
+               ", \"cross_machine_aligned\": false},\n";
+        out += "  \"scheduler\": {\n";
+        out += "    \"processor_count\": " + std::to_string(s.processor_count) + ",\n";
+        out += "    \"worker_count\": " + std::to_string(s.worker_count) + ",\n";
+        out += "    \"runnable_total\": " + std::to_string(s.runnable_total) + ",\n";
+        out += "    \"runnable_global\": " + std::to_string(s.runnable_global) + ",\n";
+        out += "    \"is_running\": " + std::string(s.running ? "true" : "false") + ",\n";
+        out += "    \"sysmon\": {\"running\": " + std::string(s.sysmon_running ? "true" : "false") +
+               ", \"passes\": " + std::to_string(s.sysmon_passes) + "}";
+        if (options.include_metrics) {
+            out += ",\n    \"metrics\": {\"task_runs\": " + std::to_string(s.metrics.task_runs) +
+                   ", \"task_completions\": " + std::to_string(s.metrics.task_completions) +
+                   ", \"fiber_resume_ns\": " + std::to_string(s.metrics.fiber_resume_ns) +
+                   ", \"local_queue_pops\": " + std::to_string(s.metrics.local_queue_pops) +
+                   ", \"steal_pops\": " + std::to_string(s.metrics.steal_pops) + "}";
+        }
+        out += "\n  }";
+        if (options.include_processors) {
+            out += ",\n  \"processors\": [";
+            for (std::size_t i = 0; i < s.processors.size(); ++i) {
+                const auto& p = s.processors[i];
+                if (i != 0) out += ", ";
+                out += "{\"id\": " + std::to_string(p.id) + ", \"state\": \"" +
+                       ProcessorStateName(p.state) + "\", \"queued\": " + std::to_string(p.queued) + "}";
+            }
+            out += "]";
+        }
+        if (options.include_machines) {
+            out += ",\n  \"machines\": [";
+            for (std::size_t i = 0; i < s.machines.size(); ++i) {
+                const auto& m = s.machines[i];
+                if (i != 0) out += ", ";
+                out += "{\"id\": " + std::to_string(m.id) + ", \"state\": \"" +
+                       MachineStateName(m.state) + "\", \"processor\": " + std::to_string(m.processor) +
+                       ", \"last_task_class\": " + std::to_string(m.last_task_class) +
+                       ", \"affinity_hits\": " + std::to_string(m.affinity_hits) +
+                       ", \"affinity_misses\": " + std::to_string(m.affinity_misses) +
+                       ", \"processor_detached\": " + (m.processor_detached ? "true" : "false") +
+                       ", \"blocking_task\": " + std::to_string(m.blocking_task) +
+                       ", \"long_syscall_count\": " + std::to_string(m.long_syscall_count) + "}";
+            }
+            out += "]";
+        }
+        out += ",\n  \"fibers\": null\n}\n";
+        return out;
+    }
+
+private:
+    static const char* ProcessorStateName(PState state) noexcept {
+        switch (state) {
+            case PState::kIdle: return "Idle";
+            case PState::kRunning: return "Running";
+            case PState::kStopping: return "Stopping";
+            case PState::kDead: return "Dead";
+        }
+        return "Unknown";
+    }
+    static const char* MachineStateName(MState state) noexcept {
+        switch (state) {
+            case MState::kIdle: return "Idle";
+            case MState::kRunning: return "Running";
+            case MState::kBlocking: return "Blocking";
+            case MState::kParked: return "Parked";
+            case MState::kStopping: return "Stopping";
+            case MState::kDead: return "Dead";
+        }
+        return "Unknown";
+    }
+
+    Scheduler* m_scheduler{nullptr};
+};
+
+}  // namespace go2cpp::debug

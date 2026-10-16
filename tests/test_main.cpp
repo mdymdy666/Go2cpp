@@ -33,6 +33,7 @@ void run_streams_tests();
 void run_time_tests();
 void run_hook_tests();
 void run_debug_fiber_tests();
+void run_debug_scheduler_tests();
 
 /**
  * @brief 统一运行默认测试集并根据过滤器选择测试模块。
@@ -80,6 +81,7 @@ int main() {
     if (selected("streams")) run_streams_tests();
     if (selected("time")) run_time_tests();
     if (selected("debug_fiber")) run_debug_fiber_tests();
+    if (selected("debug_scheduler")) run_debug_scheduler_tests();
 #ifdef GO2CPP_TEST_HOOK
     if (selected("hook")) run_hook_tests();
 #endif

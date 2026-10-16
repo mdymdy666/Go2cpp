@@ -25,6 +25,7 @@
 | 3 | 实现 **`DebugFiber`（继承 `Fiber`）+ `DebugRegistry`**（独立注册表，原框架零改动）；补测试（5 场景 + 压测 + 随机）；登记 CMake 与 `test_main`；构建通过 | `include/go2cpp/debug/debug_fiber.hpp`（183 行）、`tests/debug/test_debug_fiber.cpp`（232 行）、`cmake/Go2CppTests.cmake`、`tests/test_main.cpp` |
 | 4 | 生成 **final 类清单**（81 个，含各自是否含虚函数）：**自身含 `virtual` 的只有 2 个**（`SelectValue`、`tools::defer`），其余 79 个为非虚 → 去掉 `final` 对它们零影响（已有实测支持）；核心相关类 16 个；确认**代理方案**并写入 `design/09` §2.4 | `design/10-final-class-inventory.md`（132 行）；`design/09` §2.4；脚本按花括号切类体逐个判定 |
 | 5 | 观察者开销三档对照基准：新建 benchmarks/debug_observer_overhead_benchmark.cpp（222 行）并登记 CMake；**发现并修正一处测量错误**（缺热身轮导致先测档偏慢约 20 倍）；实测 1/2/4 worker 三档；**关键结论**：单 worker 下观察者净开销仅 +3~6%（约 27 ns/事件），而 **4 worker 基线本身异常**（1,602 → 19,914 ns，约 12 倍）属调度器自身扩展性问题、与观察者无关；建议插件用线程局部缓冲规避 observer_mutex 争用 | `DebugTooling/perf-observer-overhead.md`；`docs/performance.md` 新节；`./build-bench/go2cpp_debug_observer_benchmark 3 20000 {1,2,4}` |
+| 6 | **`DebugScheduler` 代理 + text/ini/json 序列化**（P0 核心 + P1 起步）：新建 `include/go2cpp/debug/debug_scheduler.hpp`（311 行，**只用 Scheduler 现有 public 接口，零侵入**）；`tests/debug/test_debug_scheduler.cpp`（5 场景 + 压测 + 随机）；登记 CMake 与 test_main；**全量 ctest 79/79 通过**；压测：Snapshot 1.26 us/次、三种 Dump 约 11.6 us/次 | `debug_scheduler.hpp`；三处编译纠错（命名空间别名、`const char*+const char*`、`go2cpp::Json`）与一处**测试假设纠错**（machine id 不从 0 开始，实测为 5） |
 
 ## 下一步（第 4 轮）
 
