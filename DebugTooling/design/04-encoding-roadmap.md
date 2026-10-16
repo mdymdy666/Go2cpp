@@ -133,7 +133,7 @@ auto created_fiber = Fiber::AcquireForScheduler(
 
 ### 5.3 插队（B4）—— 插入点已定位
 
-`processor.queue.push_back(task)`（`scheduler.cpp:2547`）是**唯一的本地入队点**；
+本地入队有**两条**路径：`processor.queue.push_back(task)` 分别在 `scheduler.cpp:2471`（`Scheduler::enqueue`，受 `local_queue_limit` 约束，超限改投全局队列）与 `2553`（`requeue_to_processor`，唤醒路径）；
 队列是 `std::deque`，支持中间插入。
 → 插队接口的形态：`enqueue_before(GId moving, GId target)`，
 **必须持 `processor.mutex`**，且**默认关闭**（破坏 FIFO 公平性）。

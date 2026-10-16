@@ -163,11 +163,11 @@ dump 选项：**20 个**（要求 ≥15），见 `design/02-dump-cli.md` §5。
 | **`m_function` 私有、无元数据** | `scheduler.hpp:356,362` |
 | 快照/计数接口 | `scheduler.hpp:582-610` |
 | `emit_event` 锁外回调 | `scheduler.cpp:1104-1122` |
-| 任务事件三元分发（`kTaskSuspended` 兜底） | `scheduler.cpp:3843-3851` |
+| 任务事件三元分发（`kTaskSuspended` 兜底） | `scheduler.cpp:3839-3848` |
 | 指标仅在 `collect_metrics` 时累计 | `scheduler.cpp:3852-3862` |
 | **`m_function` 首次进入时被移出** | `scheduler.cpp:830-905` |
 | `requeue_to_processor`（迁移基础） | `scheduler.cpp:2527-2574` |
-| 本地入队点（插队插入点） | `scheduler.cpp:2547` |
+| 本地入队点（插队插入点，**共两处**） | `scheduler.cpp:2471`（`enqueue` 路径）与 `2553`（`requeue_to_processor`） |
 | **注册表强持有全部非终态 G** | `scheduler.cpp:1529,1792-1805` |
 | 注册表遍历范式 | `scheduler.cpp:1694-1705,1743-1750` |
 | `Processor::queue`（本地队列明细来源） | `scheduler.cpp:1007-1021` |

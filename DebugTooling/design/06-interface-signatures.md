@@ -159,7 +159,7 @@ bool Scheduler::enqueue_before(GId moving, GId target);
 | 项 | 内容 |
 |---|---|
 | 前置 | 二者都在**同一个 P 的队列**中（否则报错而非静默失败） |
-| 实现位置 | 唯一本地入队点是 `processor.queue.push_back`（`scheduler.cpp:2547`）；`deque` 支持中间插入 |
+| 实现位置 | 本地入队有**两条**路径：`scheduler.cpp:2471`（`enqueue`）与 `2553`（`requeue_to_processor`）——**插队实现必须同时覆盖，否则另一条路径仍会追加到队尾**；`deque` 支持中间插入 |
 | 必须持锁 | `Processor::mutex` |
 | **默认关闭原因** | 破坏 FIFO 公平性（现有设计的隐含约定） |
 | 风险 | 中高（影响延迟分布，测试需覆盖顺序性与饥饿） |

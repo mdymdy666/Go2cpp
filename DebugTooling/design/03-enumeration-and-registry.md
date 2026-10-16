@@ -99,7 +99,7 @@ kStarted, kStopping, kWorkerStarted, kWorkerStopped,
 kTaskStarted, kTaskSuspended, kTaskCompleted, kTaskFailed, kTaskCancelled
 ```
 
-而发射点有 6 处，其中 `scheduler.cpp:3843-3851` 用三元判断**一次覆盖 4 种任务事件**：
+而发射点有 6 处，其中 `scheduler.cpp:3839-3848` 用三元判断**一次覆盖 4 种任务事件**：
 
 ```cpp
 const auto task_event_type =

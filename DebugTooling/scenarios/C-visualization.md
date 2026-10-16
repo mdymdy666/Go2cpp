@@ -72,7 +72,7 @@ fiber    state     reason        depth  M  P  name            function          
   - 每个 M 的忙碌/空闲时段（`kWorkerStarted`/`kWorkerStopped` + 任务区间）；
   - 每个 G 的生命周期条（`kTaskStarted` → `kTaskCompleted/kTaskFailed/kTaskCancelled/kTaskSuspended`）；
   - G 在 M 之间的迁移（同一 `task_id` 出现在不同 `machine_id`）；
-- **必须标注的坑**：`kTaskSuspended` 是**兜底类别**（`scheduler.cpp:3843-3851`），
+- **必须标注的坑**：`kTaskSuspended` 是**兜底类别**（`scheduler.cpp:3839-3848`），
   它包含 `kWaiting`/`kRunnable` 等多种情形 → 图上**不能**把它简单画成"阻塞中"。
 - **现状**：需新增渲染器；项目已有 SVG 生成经验（`ArchitectureDiagram/00-architecture.svg`）。
 

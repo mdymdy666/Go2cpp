@@ -237,7 +237,7 @@ stacks (fiber 2):
    —— 让使用者知道这不是同一瞬间的全景（依据：`task_registries` 为 16 分片、逐把加锁，
    `scheduler.cpp:1694-1705`）；
 3. **`kTaskSuspended` 的语义**在时间线类输出里必须标注为**兜底类别**
-   （`scheduler.cpp:3843-3851`），不能在图上画成"阻塞中"；
+   （`scheduler.cpp:3839-3848`），不能在图上画成"阻塞中"；
 4. **`collect_metrics=false` 时** metrics 全为 0，输出应显示
    `metrics: disabled (collect_metrics=false)` 而不是一串 0（依据：`3852-3862` 才有累计）；
 5. 列宽按内容自适应；`--color=never` 时不输出任何 ANSI 序列。
