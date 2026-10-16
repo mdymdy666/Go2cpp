@@ -92,6 +92,7 @@ endif()
 if (GO2CPP_BUILD_EXAMPLES)
     # 示例按模块目录维护；目标名取文件名以保持旧版构建接口稳定.
     set(GO2CPP_EXAMPLES
+        debug/debug_module_demo
         concurrency/runtime_demo
         concurrency/runtime_basic_demo
         concurrency/runtime_full

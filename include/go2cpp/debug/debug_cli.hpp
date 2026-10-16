@@ -262,6 +262,13 @@ inline int RunDumpCli(int argc, const char* const* argv, Scheduler& scheduler,
                       std::string* error) {
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
+        // 防御：调用方把 argc 写得比实际数组长时，argv[i] 可能越界读到 nullptr，
+        // 直接 emplace_back 会抛 basic_string: construction from null 并终止进程。
+        // 这里遇到 nullptr 就停止解析，返回参数错误而不是崩溃。
+        if (argv == nullptr || argv[i] == nullptr) {
+            if (error) *error = "null argument in argv";
+            return 1;
+        }
         args.emplace_back(argv[i]);
     }
     const auto command = ParseDumpCommand(args);
