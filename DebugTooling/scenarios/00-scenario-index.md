@@ -25,7 +25,7 @@
 | A4 | 调度器全局概览：Fiber 总数、worker 数、P 数 | ✅ `runnable_count()`/`worker_count()`/`processor_count()`（`scheduler.hpp:582-585`） |
 | A5 | 每个 P 的本地队列长度与状态 | ✅ `processors()` → `ProcessorSnapshot{id,state,queued}`（`scheduler.hpp:210-214,592`） |
 | A6 | 每个 M 的状态与阻塞诊断（已脱离 P、正在阻塞的任务、长系统调用计数） | ✅ `machines()` → `MachineSnapshot`（`scheduler.hpp:217-233,593`） |
-| A7 | 订阅调度事件流（10 类）并还原时间线 | ✅ `SchedulerObserver::OnEvent`（`scheduler.hpp:140-183`） |
+| A7 | 订阅调度事件流（9 类）并还原时间线 | ✅ `SchedulerObserver::OnEvent`（`scheduler.hpp:140-183`） |
 | A8 | 采集/差分性能指标（resume 次数、偷取次数、本地队列命中） | ✅ `metrics()`（`scheduler.hpp:236-243,599`） |
 
 **A 类的共同缺口**：数据齐备，但**没有统一的序列化出口**，也没有"取一份一致快照"的组合接口
