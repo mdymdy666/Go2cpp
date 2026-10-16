@@ -26,15 +26,15 @@
 | 10 | 10-16 深化①：接口签名汇总 | 新增 `design/06-interface-signatures.md`：把散落在各文档的接口设计汇总为 **15 个接口**（R 只读 6 / C 受控 5 / P 插件 4 / T 传输 3），每个标注归属层、前置条件、失败语义、线程安全、默认开关与源码依据；给出接口依赖顺序与关键路径（R1/R2 → T1 → P3 即可产出可用 dump）；把 C1 的语义收窄、C3 的改栈禁止、C5 的禁止重新竞争标为**硬约束** | `design/06-interface-signatures.md`（依据列复用第 2-7 轮已核验的行号） |
 | 11 | 10-16 深化②：测试策略 | 新增 `design/07-test-strategy.md`：提出**两个验收维度**（功能正确性 + **观察者效应**，后者是项目规范未覆盖、调试工具特有的）；压测给出 5 项指标与 5 维条件矩阵（G 数/P 数/负载类型/事件速率/并发 dump）；随机测试 7 项（含并发竞态与转义 fuzz）；真实场景 6 个（覆盖 A–E 全部类别）；**零开销证明设计为三档对照实验 + emit_event 微基准 + 最坏停顿测量**，并给出待校准的建议阈值与「拿到数据前不得宣称零开销」的约束；破坏性测试 7 项与失败判据 5 条 | `design/07-test-strategy.md`；依据 `scheduler.cpp:1104-1122`（无观察者路径与异常隔离） |
 | 12 | 10-16 深化③：场景×验证矩阵 | 新增 `scenarios/verification-matrix.md`：34 个场景逐条映射「验证方式/测试类型/验收判据/依赖接口/阻塞项」；统计出 **24 个无阻塞项**、7 个依赖未定案；给出**发布前检查清单**（功能层/干扰层/控制面/文档记录 四组共 18 项）与编码阶段 10 步推进顺序 | `scenarios/verification-matrix.md`；接口编号引自 `design/06`；测试类型代号引自 `design/07` |
+| 13 | 10-16 核验①：worker 出队路径与事件发射锁边界 | 读 `worker_loop`（`scheduler.cpp:3494` 起）确认**四级出队顺序**：本地 P 队列（队首 `pop_front`，FIFO）→ incoming 条带（`incoming_probe` 轮转）→ 全局队列 → **work stealing 从其他 P 的队尾偷**（注释原文 steal from the back）；并确认**本地快路径有门槛**（`runnable > processors.size()`）；`grep -B4 -A3 emit_event` 确认 **6 个发射点全部不持调度器状态锁**，且 `kWorkerStarted` 在 thread-local 的 M/P 赋值之后发出（插件可在回调中安全读 `current_*`）；据此**订正** B4/C2（插队需考虑偷取方向）与 `design/04` §3（非阻塞要求来自时序而非锁竞争）；新增 `design/08-verified-details.md` | `scheduler.cpp:1939,1992,3503,3519-3541,3742,3833,3848,4036` |
 
-## 下一轮任务（第 13 轮）
+## 下一轮任务（第 14 轮）
 
-**方向调整：逐轮读源码消除文档中的「未确认」项**（比继续产出新文档更能提高可信度）。
+**核验②**：继续消除「未确认」——
 
-第 13 轮先做两件：
-1. 读 `Scheduler::worker_loop`（`scheduler.cpp:3494` 起）的**出队路径**，
-   补齐 C2（插队）的插入点分析，并确认 work stealing 与本地队列的交互；
-2. 读 `src/concurrency/scheduler.cpp` 中 `emit_event` 的 6 个发射点的**各自上下文**，
-   确认哪些事件在持锁路径上（影响插件的开销模型）。
-3. 把结论回填到 `design/03-enumeration-and-registry.md` 与 `design/04-encoding-roadmap.md`，
-   并**订正**此前的「未确认」标注。
+1. 读 `WaitNode::Wake()` 与 `WaitBackend` 默认实现（`SchedulerWaitBackend`，`sync.cpp:31` 起），
+   弄清 `m_wake_mutex` / `m_active` / `TryFinish` 的配合，补 D1/D2/D3 的实现细节；
+2. 读 `ConditionVariable::NotifyOne/NotifyAll`（`sync.cpp:1139` 附近），补 D5；
+3. 统计安全点的**调用点数量**（`Suspend`/`SuspendForScheduler`/`park_for_scheduler`/`mark_yielded*`），
+   给出 B5 断点精度的**可承诺范围**；
+4. 结论回填 `design/08-verified-details.md`。
