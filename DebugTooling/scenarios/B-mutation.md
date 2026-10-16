@@ -60,6 +60,10 @@
   （`try_mark_queued*`，`301-308`）也没有位置概念。
 - **数据层可行性**：✅ 队列是 `std::deque<std::shared_ptr<Task>>`（`Processor::queue`，`scheduler.cpp:1020`）
   与 `std::vector<...> task_registries` —— **都支持中间插入**。
+- **第 19 轮订正（关键约束）**：本地入队有**两条**路径 ——
+  `scheduler.cpp:2471`（`Scheduler::enqueue`，受 `local_queue_limit` 约束，超限改投全局队列）
+  与 `2553`（`requeue_to_processor`，唤醒路径）。
+  **插队实现必须同时覆盖两条路径**，否则另一条路径仍会把任务追加到队尾，导致行为不一致。
 - **安全边界**：
   - 必须持 `Processor::mutex`（`scheduler.cpp:1018`）修改队列；
   - 目标 Fiber 必须**确实在同一个 P 的队列里**，否则语义不成立（应报错而非静默失败）；

@@ -33,10 +33,11 @@
 | 17 | 10-16 收官准备 | 采集最新规模（`wc -l`，全部交付 md 合计 3066 行）并更新 `design/05-architecture-summary.md` 的实测行数块；把核验阶段成果合并进 `FINAL-REPORT.md`（新增第 10 节）：四项核验结论、对第 6 节的修正（任意行断点边界**量化为 5 个挂起点**、新增第 7 项**观测覆盖边界**）、四条易误读提示、并把待定案事项**精确分为 A 硬阻塞 3 项 + B 偏好确认 4 项**，同时记录核验净成果（订正 9 处、解除 1 个阻塞、4 条易误读、1 条覆盖边界） | `wc -l DebugTooling/**/*.md`；`design/08-verified-details.md` 小结 |
 | 18 | 10-16 一致性复核与速览 | 跨文档一致性复核：**安全点 5 处、事件 9 类、场景 34、接口 15 全部一致**；发现并修正**一处文档内冲突**（`FINAL-REPORT` 第 7 节写 7 项、第 10.4 节写 3+4 项）——第 7 节标题改为保留初版记录并指向 §10.4 的精确分类；新增 `QUICKSTART.md`（一页速览：先读什么、3 项硬阻塞、现在就能开工的 24 个场景与第一步、做不到的 7 件事、交付物地图） | `grep -rn "5 个挂起点\|9 类\|34 个\|15 个接口"` 复核输出 |
 | 19 | 10-16 行号引用抽查 | 用脚本对 38 条源码引用逐条断言（±2 行容差）：**HIT 35 / DRIFT 2 / MISS 1**；**订正一处实质性错误** —— 此前写「唯一的本地入队点 `scheduler.cpp:2547`」，实际本地入队有**两条**路径：`2471`（`Scheduler::enqueue`，受 `local_queue_limit` 约束、超限改投全局队列）与 `2553`（`requeue_to_processor`），已同步订正 `design/04`/`05`/`06` 与 `scenarios/B-mutation.md`，并指出**插队实现必须同时覆盖两条路径**；另订正任务事件三元分发行号 `3843-3851` → `3839-3848`（`design/02`/`03`/`05` 与 `scenarios/C-visualization.md`）；`fiber.hpp:200` 的漂移在既有范围 `199-201` 内，无需改 | `grep -n "queue.push_back" scheduler.cpp` = 2471/2553；`grep -n task_state_after_run` = 3839/3841/3843/3845; 抽查脚本输出 38 条判定 |
+| 20 | 10-16 订正同步与复核记录 | 复核上一轮订正的同步情况：确认 `B-mutation.md` 的 B4 **原本就没有**那句「唯一入队点」的错误表述（故上轮「无需订正」是正确的），但缺少「两条入队路径」这一关键约束 → **已补入 B4**；确认残留的 `2547` 只出现在 `design/08` 与 `PROGRESS` 的**记录性文字**中（应当保留，不是有害残留）；把行号抽查与两处订正**记入 `FINAL-REPORT.md` 的自我复核记录**（第 8 节第 4 条） | `grep -n -A 10 "## B4 · 把 Fiber 插队" scenarios/B-mutation.md`；`grep -rn "2547" DebugTooling/` |
 
-## 下一轮任务（第 20 轮）
+## 下一轮任务（第 21 轮）
 
-1. 复核 `design/08-verified-details.md` 的核验 9 结论是否已同步到所有受影响文档
-   （特别是 `design/06` 的 C2 与 `scenarios/B-mutation.md` 的 B4 是否都已写明「两条入队路径」）；
-2. 汇总本轮全部行号订正，更新 `FINAL-REPORT.md` 的自我复核记录；
+1. 最后一次全文核对：交付物清单（20 个文件）与 README/PROGRESS/QUICKSTART 的描述是否一致；
+2. 复核 `design/05-architecture-summary.md` 的交付物全景表是否已包含 `QUICKSTART.md` 与
+   `design/08-verified-details.md`（这两份是后加的，可能未列入）；
 3. 准备 14:00 收官汇报（届时删除定时任务）。
