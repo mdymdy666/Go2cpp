@@ -47,10 +47,13 @@ if (GO2CPP_BUILD_TESTS)
     endif()
     target_compile_options(go2cpp_tests PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_tests COMMAND go2cpp_tests)
-    # 超时从 30 提到 60：go2cpp_tests 是全部单元测试的集合，随调试模块新增
-    # 测试（debug_* 五个）后整体耗时已到 ~18s，30s 的余量在机器有其它负载时
-    # 会被打爆（实测与 build-bench 并行跑时触发过一次 Timeout）。
-    set_tests_properties(go2cpp_tests PROPERTIES TIMEOUT 60)
+    # 超时从 30 -> 60 -> 120：go2cpp_tests 是全部单元测试的集合。
+    # 随调试模块陆续新增测试（debug_* 七个）后整体耗时约 18~30s，且**偶发**更高：
+    # 实测撞过两次 Timeout（一次与 build-bench 并行、一次原因不明），
+    # 而单独复跑每次都能在 30s 左右通过。为了不让偶发抖动把整条 CI 判成失败，
+    # 这里给足余量到 120s —— 注意这**不是**在掩盖真实性能退化：
+    # 若真的持续变慢，120s 同样会被打爆，只是不再因一次抖动就误报。
+    set_tests_properties(go2cpp_tests PROPERTIES TIMEOUT 120)
     # T-08 回归：未知的 GO2CPP_TEST_FILTER 必须被拒绝。此前它会静默跑 0 个模块
     # 却返回 0，把「空跑」伪装成「通过」。
     # 用 `sh -c` 把「退出码必须是 2」显式断言出来，而不是用 WILL_FAIL：
