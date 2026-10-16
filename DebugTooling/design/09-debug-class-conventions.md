@@ -86,3 +86,45 @@ MutexDebugSnapshot Mutex::DebugSnapshot() const;
 > 有两条路：① 在原类上加**只读** `const` 方法（极小侵入，但确实改了原类）；
 > ② 让 `Debug` 侧成为 `friend`（同样改原类）。**这一取舍留待 P3 阶段按实际情况定**，
 > 本轮不擅自决定。
+
+## 2.4 使用者确认的方案：**代理 + 原类私有 `Debug*` 方法**（第 4 轮）
+
+使用者在看到"复制 `Mutex` 需连带 350–1000 行、且上游一改就漂移"的数据后，确认采用：
+
+1. **`final` 类不继承、不复制实现**；
+2. 需要观测或改行为的，建 `Debug*` **代理**（组合持有原类的引用或共享指针）；
+3. **在原类内部新增私有 `Debug*` 方法**（由 `Debug*` 代理通过 `friend` 访问）；
+4. 侵入极小（每个类几行），**不复制实现、无上游漂移**。
+
+> 与 §2 三档策略的关系：**§2.4 取代了档 C 的"只读快照"**（快照只能读、无法表达
+> "原类内部提供的调试动作"）；档 A（继承）仍适用于无 `final` 的 `Fiber`/`Task`/`Scheduler`；
+> 档 B（组合）即本节的代理形式的特例。
+>
+> 也就是说最终策略是两档：**能继承的继承（`Debug* : public 原类`）；
+> 不能继承的用代理（`Debug*` 组合原类 + 原类内私有 `Debug*` 方法 + `friend`）**。
+
+### 命名与接口约定
+
+| 项 | 约定 |
+|---|---|
+| 代理类名 | `Debug` + 原类名（`DebugMutex`、`DebugConditionVariable`、`DebugChannel`…） |
+| 代理位置 | `include/go2cpp/debug/` 下，按模块分文件 |
+| 原类内的方法名 | `Debug*`，**私有**（例如 `Mutex::DebugWaiters()`），并在原类内 `friend class DebugMutex;` |
+| 默认开销 | 私有方法只在被代理调用时执行；代理不存在则**零开销** |
+| 命名空间 | `go2cpp::debug` |
+
+### 侵入清单（每个 `final` 类需要改的行）
+
+```cpp
+// 在 sync.hpp 的 Mutex 类内
+class Mutex final {
+public:
+    // ... 原有内容不变 ...
+private:
+    friend class go2cpp::debug::DebugMutex;   // ← 新增 1 行
+    DebugMutexSnapshot DebugSnapshotInternal() const;  // ← 新增 1 行声明
+};
+```
+（实现在 `sync.cpp` 内新增约 5–10 行。）
+
+→ **每个类净增 2 行声明 + 5–10 行实现**，原行为与语义**完全不变**。
