@@ -257,7 +257,92 @@ A6 原文只写「`processor_detached` + `blocking_task` + `long_syscall_count` 
 
 ---
 
-## 核验 7 · 待办（后续轮次）
+---
+
+## 核验 7 · `Context` 的回调机制（第 16 轮）
+
+**源码**：`include/go2cpp/concurrency/context.hpp:41-89,256-258,450-451`；
+`src/concurrency/context.cpp:23-27,105,126,176,266,409-410`。
+
+### 7.1 回调有**三类**，不是一类
+
+| 类别 | 容器 | 注册接口 |
+|---|---|---|
+| **内部回调** | `internal_callbacks`（`context.cpp:26`） | `AddInternalCallback`（`266`） |
+| **before-done 回调** | `before_done_callbacks`（`context.cpp:410`） | `Context::AddBeforeDoneCallback`（`context.hpp:256`） |
+| **普通回调** | `callbacks`（`context.cpp:27`） | `DoneSignal::AddCallback`（`context.hpp:75`） |
+
+另有 `next_id{1}`（`context.cpp:23`）与 `next_before_done_id{1}`（`409`）两套 id 计数器。
+
+**对调试模块的含义**：调试插件若要观测"上下文何时结束"，必须**明确注册到哪一类** ——
+三类回调的调用时机与顺序不同（**具体顺序本会话未读，标注为未确认，不推测**）。
+
+### 7.2 **回调生命周期由调用方负责**（关键约束）
+
+`context.hpp:73` 的注释原文：
+
+> owner，应先调用 `RemoveCallback`；信号**无法推断回调的对象所有权**。
+
+**这是硬约束**：`DoneSignal` 不会替你管理回调的存活期。项目内部已经给出了正确做法 ——
+`channel.hpp` 的 `CallbackGuard`（RAII：析构时 `RemoveCallback`）。
+→ **调试插件必须采用同样的 RAII 纪律**，否则会在 context 上留下悬挂回调（且是悬空指针级的问题）。
+
+### 7.3 对 B6（取消收敛）的补充
+
+- 自定义 `WaitBackend`（`scenarios/B-mutation.md` 的 B8）与调试订阅都要在当前 G 的
+  context 上注册回调 → **必须用 RAII**；
+- 观测"取消是否收敛"可依赖已有的 `kTaskCancelled` 事件（`scheduler.hpp:117`），
+  而不必自己挂钩回调 —— **推荐做法**，避免额外生命周期负担。
+
+---
+
+## 核验 8 · `Hook` 与 `BlockingRegion` 的协作（第 16 轮）
+
+**源码**：`src/network/hook.cpp:206,832-846,940-963,1025`。
+
+### 8.1 Hook 在拦截点临时构造 `BlockingRegion`
+
+```cpp
+std::optional<go2cpp::BlockingRegion> blocking_region;   // hook.cpp:206 / 846 / 953
+```
+
+出现在 `cooperative_io`（`832`）、`cooperative_connect`（`940`）、`cooperative_sleep_for`（`1025`）等
+拦截函数中 —— 即**被拦截的系统调用执行期间**用一个 `BlockingRegion` 声明"可能阻塞当前 M"。
+
+### 8.2 **只对 managed G 生效**（易误判点）
+
+`hook.cpp:963` 的注释原文：
+
+> managed G 中补齐 `BlockingRegion`，普通线程保持原生语义。
+
+**含义**：同一个被 Hook 的调用，**在 Fiber 里**会声明阻塞区（进而可能被 sysmon 观测、可能触发
+M 与 P 解绑），**在普通线程里**则保持原生阻塞语义（不进调度器账本）。
+→ **调试时同一段代码在不同上下文中的表现不同**，看到 `processor_detached` 与否取决于执行者是不是 managed G。
+这一点必须写进调试文档，否则会被误判为"行为不稳定"。
+
+### 8.3 与 A6 的关系
+
+A6 的三个字段（`processor_detached` / `blocking_task` / `long_syscall_count`）的**数据来源就是这里**：
+Hook（或显式 `BlockingRegion`）声明 → 记录 `blocking_since_ns` 与 `blocking_task` →
+sysmon 超阈置 detached 并计数（详见核验 6）。
+→ 因此 **A6 能看到的阻塞，仅限"已声明"的阻塞**；未被 Hook 覆盖、也未显式声明的原生阻塞
+（例如第三方库里直接调用的阻塞 syscall）**不会进入这套观测**。这是观测的**覆盖边界**，
+应当明确写在文档里，避免使用者以为"没显示阻塞就没有阻塞"。
+
+---
+
+## 核验阶段小结（第 13–16 轮）
+
+| 轮次 | 核验内容 | 产出 |
+|---:|---|---|
+| 13 | `worker_loop` 出队路径（四级 + 本地 FIFO + 偷取从队尾）；6 个事件发射点的锁边界（**全部不持锁**） | 订正 B4/C2 与 `design/04` §3 |
+| 14 | `WaitNode`/`WaitBackend` 机制（CAS 单赢家、两条等待路径、**`generation` 防缓存节点误唤醒**）；**安全点统计（5 处）** | **解除 B5 阻塞项** |
+| 15 | `ConditionVariable` 与 `Mutex::Unlock` **同构**；sysmon 阻塞观测三阶段 | 订正 A6 三处易误读 |
+| 16 | `Context` 回调**三类** + **生命周期由调用方负责**；`Hook` 的 `BlockingRegion` **仅对 managed G 生效** | 补充 B6 与 A6 的**覆盖边界** |
+
+**净成果**：订正 **9 处**结论、解除 **1 个**阻塞项（安全点统计）、新增 **4 条**易误读提示
+（`long_syscall_count` 语义、detach 与 worker 数、缓存 `WaitNode`、Hook 的 managed G 分支）、
+以及 **1 条观测覆盖边界**（未声明的原生阻塞不可见）。
 
 | # | 待核验 | 影响 |
 |---:|---|---|
