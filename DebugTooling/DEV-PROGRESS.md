@@ -52,3 +52,57 @@
 - 测试必须含压测 + 随机 + ≥5 真实场景，新增测试必须登记 CMake；
 - 性能结论只用 `build-bench`（Release）；每个逻辑单元跑 `build-quality` + `ctest`；
 - git 只 add 明确路径；不提交使用者此前在途的 4 个文件。
+
+---
+
+## 收尾状态（2026-10-16 17:50，按使用者要求停止定时任务）
+
+**本段为任务状态的快速记录。**
+
+### 交付状态
+
+| 项 | 值 |
+|---|---|
+| 分支 | `feature/gmp-debug-module` |
+| 提交数 | **16**（`b7f172a` → `39fa255`） |
+| 阶段完成度 | **P0 / P1 / P2 / P3（含 D3）/ P5 全部完成**；**P4 按使用者定案不做**（属结构类） |
+| 全量测试 | **ctest 80/80 通过**（含新增的可运行示例用例） |
+| 主交付报告 | `DebugTooling/DEV-FINAL-REPORT.md` |
+| 对原框架改动 | 仅 `sync.hpp` **+104** 与 `sync.cpp` **+104**（**纯新增、0 删除**），其余全部为新增文件 |
+
+### 主要交付物
+
+- 源码：`include/go2cpp/debug.hpp` + `debug/{fiber,scheduler,cli,sync,events,breakpoints}.hpp`（6 个子模块）
+- 测试：`tests/debug/test_debug_{fiber,scheduler,cli,sync,lock_selector,events,breakpoints}.cpp`（7 个）
+- 基准：`benchmarks/debug_{observer,lock_selector}_overhead_benchmark.cpp`（2 个）
+- 示例：`example/debug/debug_module_demo.cpp`（可运行，一条命令看全部能力）
+- 文档：`DEV-FINAL-REPORT.md`、`DEV-PROGRESS.md`、`diag-worker-scaling.md`、
+  `perf-observer-overhead.md`、`design/09-debug-class-conventions.md`、`design/10-final-class-inventory.md`
+
+### 未决项（3 项，均**未**解决，详见最终报告 §7）
+
+1. 调度器 **3 worker 起数量级劣化**（1→2 正常，2→3 跳变约 9.8 倍，4 worker 约 13~16 倍）；
+   已诊断并**排除**固定启动开销，但**未做 profiling**，具体机制未确认；
+   与调试模块无关（全程 `observer=nullptr`）。
+2. `sync::Mutex` 4 线程竞争约 **18 µs/op**（单线程无竞争仅 3.7 ns/op），属其自身行为。
+3. 一次默认参数基准运行超 15 分钟未结束，根因未定位；结论不依赖该次运行。
+
+### 未做项（已在报告中标注原因）
+
+- P2 的 `--follow`（持续跟随输出）；
+- "枚举全部 G" 接口（`dump scheduler` 的 `fibers` 字段输出为 `null`）；
+- 跨进程 dump（需信号/注入机制）；
+- 事件采集的"每 worker 线程局部暂存 + 批量发布"（已标注为后续优化）。
+
+### 工作树
+
+仅有使用者此前在途的 4 个文件未提交，**本次开发没有误带入**：
+`example/concurrency/future_full.cpp`、`include/go2cpp/logging/log.hpp`、
+`include/go2cpp/tools/error.hpp`、`src/tools/error.cpp`。
+`.dsh_tmp/` 仅含一个 2026-10-15 的旧文件 `stack_probe.csv`（非本次会话产生，未改动）。
+
+### 定时任务
+
+按使用者要求**已停止**（`schedule-102ff7f6-f909-4a29-958e-5bdcd6855f4c` 已删除）。
+**注意**：目标（goal）保持 `active`，未标记完成 —— 因为使用者只要求停止定时任务，
+未表示整体目标已达成；如需继续开发，恢复该目标即可接着做上面的未做项。
