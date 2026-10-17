@@ -1068,6 +1068,11 @@ public:
           owner_token(std::make_shared<const std::uint8_t>(0)),
           cancellation_gate(std::make_shared<TaskCancellationGate>(scheduler)),
           observer(std::move(config.observer)) {
+        // 观察者也可能是**通过 config 装入**的（测试与生产代码都这么做），
+        // 因此这里必须同样置位快路径标志；只覆盖 set_observer() 会让
+        // config 路径装进来的观察者被 emit_event 的快路径静默跳过。
+        has_observer.store(observer != nullptr,
+                           std::memory_order_release);
         for (std::size_t i = 0; i < config.processor_count; ++i) {
             processors.emplace_back(static_cast<PId>(i));
         }
@@ -1102,6 +1107,11 @@ public:
      *       外部代码；观察者异常被隔离，不能影响 worker 生命周期。
      */
     void emit_event(SchedulerEvent event) noexcept {
+        // 快路径：没有观察者就直接返回（不取时钟、不加锁、不拷贝 shared_ptr）。
+        // 安装观察者之后走原有完整路径，语义不变。
+        if (!has_observer.load(std::memory_order_acquire)) {
+            return;
+        }
         if (event.timestamp == std::chrono::steady_clock::time_point{}) {
             event.timestamp = std::chrono::steady_clock::now();
         }
@@ -1788,6 +1798,11 @@ public:
     // 与 worker 共享 Scheduler::mutex。事件回调永远在该锁释放后执行。
     mutable std::mutex observer_mutex;
     SchedulerObserverPtr observer;
+    // 零开销快路径标志：绝大多数程序从不安装观察者，而 emit_event 在 worker_loop 里
+    // **每个任务被调用两次**（开始 / 结束）。没有这个标志时，即使 observer 为空，
+    // 每次也要取一次 steady_clock::now()（~25ns）、加一把全局 mutex、拷一次 shared_ptr，
+    // 多 worker 时所有线程串行化在同一把锁上 —— 这是 3+ worker 数量级劣化的强嫌疑。
+    std::atomic<bool> has_observer{false};
     mutable std::mutex mutex;
     mutable std::array<std::mutex, kRegistryStripeCount> registry_mutexes;
     std::array<std::mutex, kIncomingStripeCount> incoming_mutexes;
@@ -2229,6 +2244,9 @@ void Scheduler::set_observer(SchedulerObserverPtr observer) noexcept {
         std::lock_guard<std::mutex> lock(m_impl->observer_mutex);
         replaced = std::move(m_impl->observer);
         m_impl->observer = std::move(observer);
+        // 先发布对象、再置标志，保证读到 true 的线程一定能看到非空观察者。
+        m_impl->has_observer.store(m_impl->observer != nullptr,
+                                   std::memory_order_release);
     } catch (...) {
         // shared_ptr 交换不会主动分配；此处保持 noexcept 契约，异常时
         // 保留原观察者，避免插件安装影响调度器运行。
