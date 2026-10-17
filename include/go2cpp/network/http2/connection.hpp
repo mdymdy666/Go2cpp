@@ -30,8 +30,10 @@
  *   （HEADERS + 若干 CONTINUATION），接收时自动拼接直到 `END_HEADERS`；
  *   实现上依赖"同一时刻只有一条流在发 header block"这一约束 —— 因为 `Connection`
  *   是单驱动者（一个 Fiber）且发送是同步的，这个约束天然成立；
- * - **精细流控**：当前只在收到 DATA 后立刻把窗口补回去（等价于"不真正限流"）。
- *   真正的流控需要按 `SETTINGS_INITIAL_WINDOW_SIZE` 与接收方读取速度配平；
+ * - **流控**：**已实现窗口跟踪**。发送 DATA 前检查对端窗口，不足返回
+ *   `kFlowControl`（不阻塞等待，调用方自行重试）；接收 DATA 扣减本地窗口，
+ *   当消耗超过一半时发 WINDOW_UPDATE 补回。**未实现**按读取速度自适应配平
+ *   （见下）；
  * - **优先级**：PRIORITY 帧被解析但不参与调度（RFC 9113 已弃用）；
  * - **服务器推送的实际使用**：PUSH_PROMISE 能解析，但没有推送 API。
  */
@@ -66,6 +68,8 @@ enum class ConnStatus : std::uint8_t {
     kClosed,
     kProtocolError,
     kUnsupported,
+    /// 发送窗口不足（对端还没给 WINDOW_UPDATE）。调用方应等待后重试。
+    kFlowControl,
 };
 
 const char* ToString(ConnStatus status) noexcept;
@@ -206,6 +210,23 @@ private:
     /// 握手期间暂存的 SETTINGS 是否已收到/已发送。
     bool m_peer_settings_received{false};
     bool m_local_settings_sent{false};
+
+    // ---- 流控（RFC 9113 §6.9）----
+    // 窗口可以为负（对端可能一次发来超过初始窗口的 DATA 之前先扣减），
+    // 所以用有符号 64 位。
+    /// 我方允许对端发送的剩余字节数（连接级）。
+    std::int64_t m_local_window{65535};
+    /// 对端允许我方发送的剩余字节数（连接级）。
+    std::int64_t m_remote_window{65535};
+    /// 每条流的本地窗口。
+    std::map<std::uint32_t, std::int64_t> m_stream_local_window;
+    /// 每条流的对端窗口。
+    std::map<std::uint32_t, std::int64_t> m_stream_remote_window;
+
+    /// 初始化/重置某条流的窗口。
+    void ResetStreamWindows(std::uint32_t stream_id);
+    /// 检查并扣减发送窗口；不足返回 false。
+    bool ConsumeSendWindow(std::uint32_t stream_id, std::size_t bytes);
 };
 
 }  // namespace go2cpp::net::http2

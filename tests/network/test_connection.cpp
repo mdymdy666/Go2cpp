@@ -534,6 +534,119 @@ void ScenarioContinuation() {
     Check(got, "server never received the split header block");
 }
 
+
+// ---------------------------------------------------------------------------
+// 场景 10：流控 —— 窗口耗尽、WINDOW_UPDATE 恢复、接收侧阈值补窗口
+// ---------------------------------------------------------------------------
+void ScenarioFlowControl() {
+    // 用很小的初始窗口，让几字节就把额度用完
+    ConnectionConfig config;
+    config.initial_window_size = 64;
+
+    MemoryTransport client_transport;
+    MemoryTransport server_transport;
+
+    std::vector<std::uint8_t> server_inbound(kPreface, kPreface + kPrefaceLen);
+    // 服务端 SETTINGS 里声明 initial_window_size = 64
+    const auto peer_settings =
+        Bytes(MakeSettings({{static_cast<std::uint16_t>(SettingsId::kInitialWindowSize), 64}}));
+    server_inbound.insert(server_inbound.end(), peer_settings.begin(), peer_settings.end());
+    server_transport.PushInbound(server_inbound);
+
+    Connection server(&server_transport, Role::kServer, config);
+    std::string error;
+    Check(server.Handshake(&error) == ConnStatus::kOk, "server handshake failed");
+    client_transport.PushInbound(server_transport.TakeOutbound());
+    Connection client(&client_transport, Role::kClient, config);
+    Check(client.Handshake(&error) == ConnStatus::kOk, "client handshake failed");
+
+    std::uint32_t stream_id = 0;
+    Check(client.StartRequest({{":method", "POST"}, {":path", "/fc"},
+                               {":authority", "h"}},
+                              false, &stream_id, &error) == ConnStatus::kOk,
+          "StartRequest failed");
+
+    // 1) 窗口 64，发 64 字节恰好用完
+    Check(client.WriteData(stream_id, std::vector<std::uint8_t>(64, 'a'), false, &error) ==
+              ConnStatus::kOk,
+          "sending exactly the window should succeed");
+
+    // 2) 窗口已耗尽，再发 1 字节必须 kFlowControl
+    const auto over =
+        client.WriteData(stream_id, std::vector<std::uint8_t>(1, 'b'), false, &error);
+    Check(over == ConnStatus::kFlowControl,
+          "sending past the window must return kFlowControl");
+    Check(!error.empty(), "flow control rejection should explain itself");
+
+    // 3) 恢复额度：RFC 9113 §6.9 要求**连接级与流级窗口都有额度**才能发，
+    //    所以两个 WINDOW_UPDATE 都要补，只补流级是不够的。
+    {
+        const auto stream_update = Bytes(MakeWindowUpdate(stream_id, 16));
+        client_transport.PushInbound(stream_update);
+        const auto conn_update = Bytes(MakeWindowUpdate(0, 16));
+        client_transport.PushInbound(conn_update);
+    }
+    IncomingEvent event;
+    // 注意：握手后缓冲区里可能还有对端的 SETTINGS ACK 等事件帧，
+    // 所以要循环读到 WINDOW_UPDATE 为止，不能假设第一次就是它。
+    // 发了两个 WINDOW_UPDATE（流级 + 连接级），必须把两个都读掉，
+    // 只读一个的话另一个还留在缓冲区里，连接级窗口不会恢复。
+    int updates_seen = 0;
+    for (int guard = 0; guard < 8 && updates_seen < 2; ++guard) {
+        if (client.ReadEvent(&event, &error) != ConnStatus::kOk) {
+            break;
+        }
+        if (event.kind == IncomingEvent::Kind::kWindowUpdate) {
+            ++updates_seen;
+        }
+    }
+    Check(updates_seen == 2, "should see two WINDOW_UPDATE (stream + connection)");
+
+    // 4) 现在又能发 16 字节
+    Check(client.WriteData(stream_id, std::vector<std::uint8_t>(16, 'c'), true, &error) ==
+              ConnStatus::kOk,
+          "sending after WINDOW_UPDATE should succeed");
+
+    // 5) 接收侧：服务端收到 DATA 后应扣减本地窗口，并在低于一半时发 WINDOW_UPDATE
+    const auto client_out = client_transport.TakeOutbound();
+    server_transport.PushInbound({client_out.begin() + static_cast<std::ptrdiff_t>(kPrefaceLen),
+                                  client_out.end()});
+    std::size_t data_bytes = 0;
+    bool got_data = false;
+    for (int guard = 0; guard < 14; ++guard) {
+        if (server.ReadEvent(&event, &error) != ConnStatus::kOk) {
+            break;
+        }
+        if (event.kind == IncomingEvent::Kind::kData) {
+            got_data = true;
+            data_bytes += event.data.size();
+            if (event.end_stream) break;
+        }
+    }
+    Check(got_data, "server should receive DATA");
+    Check(data_bytes == 80, "server should see 64 + 16 bytes");
+
+    // 服务端写出的帧里应当有 WINDOW_UPDATE（因为 64 字节就把 64 的窗口耗尽到 0）
+    const auto server_out = server_transport.TakeOutbound();
+    int window_updates = 0;
+    {
+        std::size_t offset = 0;
+        while (offset + kFrameHeaderSize <= server_out.size()) {
+            FrameHeader header;
+            if (DecodeFrameHeader(server_out.data() + offset, server_out.size() - offset,
+                                  &header) != FrameStatus::kOk) {
+                break;
+            }
+            const std::size_t total = kFrameHeaderSize + header.length;
+            if (offset + total > server_out.size()) break;
+            if (header.type == FrameType::kWindowUpdate) ++window_updates;
+            offset += total;
+        }
+    }
+    std::printf("[conn] 流控: 服务端补窗口 WINDOW_UPDATE=%d\n", window_updates);
+    Check(window_updates >= 1, "receiver should replenish the window via WINDOW_UPDATE");
+}
+
 }  // namespace
 
 int main() {
@@ -556,6 +669,8 @@ int main() {
     ScenarioErrors();
     std::printf("[conn][场景9] CONTINUATION 大 header\n");
     ScenarioContinuation();
+    std::printf("[conn][场景10] 流控\n");
+    ScenarioFlowControl();
 
     if (g_failures == 0) {
         std::printf("\n[conn] failures=0\n");

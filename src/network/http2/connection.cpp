@@ -23,6 +23,7 @@ const char* ToString(ConnStatus status) noexcept {
         case ConnStatus::kClosed: return "closed";
         case ConnStatus::kProtocolError: return "protocol-error";
         case ConnStatus::kUnsupported: return "unsupported";
+        case ConnStatus::kFlowControl: return "flow-control";
     }
     return "unknown";
 }
@@ -32,6 +33,8 @@ Connection::Connection(Transport* transport, Role role, ConnectionConfig config)
       m_role(role),
       m_config(config),
       m_peer_max_frame_size(config.max_frame_size),
+      m_local_window(config.initial_window_size),
+      m_remote_window(config.initial_window_size),
       m_decoder(config.header_table_size),
       m_encoder(config.header_table_size) {}
 
@@ -189,6 +192,14 @@ ConnStatus Connection::FinishSettingsHandshake(std::string* error) {
                             m_peer_max_frame_size = entry.value;
                         }
                         break;
+                    case SettingsId::kInitialWindowSize:
+                        // 对端声明的初始流窗口：重置所有已存在流的发送窗口
+                        m_remote_window = entry.value;
+                        for (auto& [sid, win] : m_stream_remote_window) {
+                            (void)sid;
+                            win = entry.value;
+                        }
+                        break;
                     default:
                         break;
                 }
@@ -242,6 +253,7 @@ ConnStatus Connection::StartRequest(const std::vector<HeaderField>& headers, boo
         if (error != nullptr) *error = "流状态机拒绝发送 HEADERS";
         return ConnStatus::kProtocolError;
     }
+    ResetStreamWindows(stream_id);
     // 超过一帧时自动拆成 HEADERS + CONTINUATION
     const auto status = WriteHeaderBlock(stream_id, block, end_stream, error);
     if (status != ConnStatus::kOk) {
@@ -268,6 +280,11 @@ ConnStatus Connection::WriteData(std::uint32_t stream_id,
     if (data.size() + kFrameHeaderSize > m_peer_max_frame_size) {
         if (error != nullptr) *error = "DATA 超过帧上限（未实现分片）";
         return ConnStatus::kUnsupported;
+    }
+    // 流控：窗口不足时拒绝（不阻塞等待，调用方等 WINDOW_UPDATE 后重试）
+    if (!ConsumeSendWindow(stream_id, data.size())) {
+        if (error != nullptr) *error = "流控窗口不足";
+        return ConnStatus::kFlowControl;
     }
     return WriteFrame(MakeData(stream_id, end_stream, data), error);
 }
@@ -303,6 +320,28 @@ ConnStatus Connection::ResetStream(std::uint32_t stream_id, ErrorCode code,
     return WriteFrame(MakeRstStream(stream_id, code), error);
 }
 
+
+void Connection::ResetStreamWindows(std::uint32_t stream_id) {
+    m_stream_local_window[stream_id] = m_config.initial_window_size;
+    m_stream_remote_window[stream_id] = m_config.initial_window_size;
+}
+
+bool Connection::ConsumeSendWindow(std::uint32_t stream_id, std::size_t bytes) {
+    const auto amount = static_cast<std::int64_t>(bytes);
+    if (m_remote_window < amount) {
+        return false;
+    }
+    auto it = m_stream_remote_window.find(stream_id);
+    if (it == m_stream_remote_window.end()) {
+        return false;
+    }
+    if (it->second < amount) {
+        return false;
+    }
+    m_remote_window -= amount;
+    it->second -= amount;
+    return true;
+}
 
 ConnStatus Connection::WriteHeaderBlock(std::uint32_t stream_id,
                                         const std::vector<std::uint8_t>& block,
@@ -419,8 +458,15 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
                 return ConnStatus::kProtocolError;
             }
             // 流状态推进
+            const bool fresh_stream =
+                m_streams.find(headers.stream_id) == m_streams.end();
             auto& machine =
                 m_streams.try_emplace(headers.stream_id, headers.stream_id).first->second;
+            // 被动接受的流（服务端侧）也要初始化流控窗口，否则回响应时
+            // ConsumeSendWindow 找不到该流会直接失败。
+            if (fresh_stream) {
+                ResetStreamWindows(headers.stream_id);
+            }
             if (machine.ReceiveHeaders(headers.end_stream) != StreamEventResult::kOk) {
                 if (error != nullptr) *error = "流状态机拒绝接收 HEADERS";
                 return ConnStatus::kProtocolError;
@@ -448,15 +494,39 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
             out->kind = IncomingEvent::Kind::kData;
             out->stream_id = data.stream_id;
             out->end_stream = data.end_stream;
+            const std::size_t received = data.data.size();
             out->data = std::move(data.data);
-            // 简化流控：立刻把收到的字节数补回窗口
-            if (!out->data.empty()) {
-                status = WriteFrame(
-                    MakeWindowUpdate(data.stream_id,
-                                     static_cast<std::uint32_t>(out->data.size())),
-                    error);
-                if (status != ConnStatus::kOk) {
-                    return status;
+            // 流控：扣减本地窗口（连接级 + 流级）。允许变负 —— 对端可能先
+            // 超发再补 WINDOW_UPDATE，RFC 允许窗口在收到更新前暂时为负。
+            m_local_window -= static_cast<std::int64_t>(received);
+            auto lit = m_stream_local_window.find(data.stream_id);
+            if (lit != m_stream_local_window.end()) {
+                lit->second -= static_cast<std::int64_t>(received);
+            }
+            // 只有消费掉超过一半才补窗口，避免每帧都发 WINDOW_UPDATE
+            // （那会让流控形同虚设，还浪费带宽）。
+            const auto threshold = static_cast<std::int64_t>(m_config.initial_window_size / 2);
+            if (received > 0 && lit != m_stream_local_window.end() &&
+                lit->second <= threshold) {
+                const auto increment = static_cast<std::uint32_t>(
+                    m_config.initial_window_size - lit->second);
+                if (increment > 0) {
+                    status = WriteFrame(MakeWindowUpdate(data.stream_id, increment), error);
+                    if (status != ConnStatus::kOk) {
+                        return status;
+                    }
+                    lit->second += static_cast<std::int64_t>(increment);
+                }
+            }
+            if (received > 0 && m_local_window <= threshold) {
+                const auto increment =
+                    static_cast<std::uint32_t>(m_config.initial_window_size - m_local_window);
+                if (increment > 0) {
+                    status = WriteFrame(MakeWindowUpdate(0, increment), error);
+                    if (status != ConnStatus::kOk) {
+                        return status;
+                    }
+                    m_local_window += static_cast<std::int64_t>(increment);
                 }
             }
             return ConnStatus::kOk;
@@ -517,6 +587,15 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
             WindowUpdateFrame update;
             if (ParseWindowUpdate(frame, &update, error) != FrameStatus::kOk) {
                 return ConnStatus::kProtocolError;
+            }
+            // 流控：对端给了额度
+            if (update.stream_id == 0) {
+                m_remote_window += static_cast<std::int64_t>(update.increment);
+            } else {
+                auto it = m_stream_remote_window.find(update.stream_id);
+                if (it != m_stream_remote_window.end()) {
+                    it->second += static_cast<std::int64_t>(update.increment);
+                }
             }
             out->kind = IncomingEvent::Kind::kWindowUpdate;
             out->stream_id = update.stream_id;

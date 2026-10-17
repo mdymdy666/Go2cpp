@@ -8740,3 +8740,52 @@ Python 服务端侧日志（独立解析我的请求）：
 
 - **精细流控**：收到 DATA 立刻补窗口，等价于不真正限流；
 - **TLS/ALPN**：仅 h2c。
+
+---
+
+## 2026-10-17 方向三：HTTP/2 流控（RFC 9113 §6.9）
+
+### 之前的问题
+
+收到 DATA 后**立刻**把收到的字节数补回窗口 —— 等价于"不真正限流"，
+对端可以无限量灌数据，本地内存不受控。
+
+### 实现
+
+窗口状态（连接级 + 流级各一对，有符号 64 位，因为窗口允许暂时为负）：
+
+- `m_local_window` / `m_stream_local_window`：我方允许对端发送的剩余额度；
+- `m_remote_window` / `m_stream_remote_window`：对端允许我方发送的剩余额度。
+
+三处改动：
+
+1. **发送前检查**（`ConsumeSendWindow`）：连接级与流级都必须够，否则返回新加的
+   `ConnStatus::kFlowControl`。**不阻塞等待** —— 调用方应等 WINDOW_UPDATE 后重试
+   （阻塞等待需要 Fiber 条件变量，属后续工作）；
+2. **接收时扣减**：收到 DATA 同时扣两级本地窗口，**只有消耗超过一半**才发
+   WINDOW_UPDATE 补回（每帧都补会让流控形同虚设且浪费带宽）；
+3. **收到 WINDOW_UPDATE**：按 `stream_id` 是否为 0 分别加到连接级或流级。
+
+握手时应用对端 `SETTINGS_INITIAL_WINDOW_SIZE` 重置所有流的发送窗口；
+新建流（客户端 `StartRequest` 与**服务端被动收 HEADERS**）都调 `ResetStreamWindows`。
+
+### 排错记录（三个真实问题）
+
+1. **服务端被动创建的流没有窗口** → `WriteData` 直接失败。修法：`ReadEvent` 的
+   HEADERS 分支在流是全新时调 `ResetStreamWindows`；
+2. 测试只补了**流级** WINDOW_UPDATE，但 RFC 要求连接级与流级都有额度才能发；
+3. 测试只读了**一个** WINDOW_UPDATE 就退出循环，第二个还在缓冲区里，
+   连接级窗口没恢复。改成必须读满两个。
+
+### 测试：`test_connection.cpp` 场景 10（failures=0）
+
+用 `initial_window_size = 64` 的小窗口：
+- 发 64 字节恰好成功；再发 1 字节返回 `kFlowControl` 且带诊断；
+- 补流级 + 连接级两个 WINDOW_UPDATE(16) 后能再发 16 字节；
+- 服务端收到 64 + 16 字节后，本地窗口耗尽到 0，实测发出 **2 个 WINDOW_UPDATE**。
+
+### 仍未做
+
+- **TLS/ALPN**：仅 h2c（明文）。真实互联网的 HTTP/2 几乎都跑在 TLS 上，
+  需要 ALPN 协商出 `h2`，这是 HTTP/2 板块唯一剩下的实质性缺口；
+- **流控的阻塞等待**：窗口不足时立即返回错误，而不是挂起等待 WINDOW_UPDATE。
