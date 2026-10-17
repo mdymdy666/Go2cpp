@@ -1,3 +1,23 @@
+/**
+ * @file future.cpp
+ * @brief Future 的与类型无关部分：等待后端注册与结果封装。
+ *
+ * ## 这个文件实现什么
+ *
+ * `future.hpp` 里大部分逻辑是模板（要按类型实例化），本文件只放
+ * **与类型无关**的部分：
+ *
+ * - `FutureWaitBackend` 的全局注册表：默认实现基于 `ParkingCondition`，
+ *   插件可以在创建新 Promise 之前替换成别的调度器/事件循环的等待原语；
+ * - 计时辅助（`SaturatingDeadline` 一类）：把相对超时换算成绝对时间点，
+ *   用饱和加法避免溢出成"已过期"；
+ * - 错误构造与状态映射。
+ *
+ * ## 为什么后端要可替换
+ *
+ * Future 不应该假设自己跑在本项目的 Fiber 里：把它嵌进别的运行时（或纯线程
+ * 程序）时，等待方式必须能换。后端只负责"等待"和"广播"，不拥有状态。
+ */
 #include "go2cpp/future.hpp"
 
 #include "go2cpp/core/parking_condition.hpp"
@@ -38,14 +58,6 @@ private:
 std::mutex s_wait_backend_mutex;
 std::shared_ptr<const FutureWaitBackendFactory> s_wait_backend_factory;
 
-/// 函数功能：完成 StatusName 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] status 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 const char* StatusName(FutureStatus status) noexcept {
     switch (status) {
     case FutureStatus::kReady:
@@ -128,27 +140,10 @@ std::shared_ptr<FutureWaitBackend> CreateFutureWaitBackend() noexcept {
     return std::make_shared<DefaultFutureWaitBackend>();
 }
 
-/// 函数功能：完成 FutureStatusName 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] status 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 const char* FutureStatusName(FutureStatus status) noexcept {
     return StatusName(status);
 }
 
-/// 函数功能：完成 FutureError 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] status 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 FutureError::FutureError(FutureStatus status, ErrorPtr error)
     : std::runtime_error(error ? error->Message()
                                : std::string("go2cpp future error")),
@@ -157,14 +152,6 @@ FutureError::FutureError(FutureStatus status, ErrorPtr error)
 
 FutureError::~FutureError() = default;
 
-/// 函数功能：完成 BrokenPromiseError 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ErrorPtr BrokenPromiseError() {
     // 共享不可变错误对象，避免每个未完成 Promise 析构时重复分配。
     static const ErrorPtr error =

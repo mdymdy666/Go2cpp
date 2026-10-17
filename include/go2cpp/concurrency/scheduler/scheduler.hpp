@@ -1,3 +1,32 @@
+/**
+ * @file scheduler/scheduler.hpp
+ * @brief Scheduler 的完整公开接口（本文件是真身）。
+ *
+ * ## 模块定位
+ *
+ * 调度器是整个并发运行时的心脏：它把用户提交的 `Task` 包装成 **G**，交给
+ * **P**（逻辑处理器）排队，由 **M**（OS 线程）执行。GMP 三层分离的意义在于：
+ * G 可以在不同 M 之间迁移，P 的数量决定真正的并行度，M 可以因系统调用膨胀
+ * 或收缩。
+ *
+ * ## 本文件定义什么
+ *
+ * 全部是**接口与状态枚举**，实现都在 `src/concurrency/scheduler.cpp`：
+ *
+ * - `GState` / `MState` / `PState`：三层的状态机枚举。这三个枚举是排查调度
+ *   问题的第一手线索 —— 打印快照时应总是把它们带上；
+ * - `WakeAction` / `ParkAction`：park/wake 时要求调度器执行的动作
+ *   （例如 park 期间是否允许被抢占、唤醒后是否立刻重排）；
+ * - `SchedulerEventType` / `SchedulerEvent` / `SchedulerObserver`：
+ *   可观测性钩子，用于 debug 模块与压测时的事件追踪；
+ * - `SchedulerConfig`：P 数量、栈大小、队列上限、sysmon 周期等所有可调参数；
+ * - `Scheduler`：对外门面（spawn / yield / park / shutdown 等）。
+ *
+ * ## 阅读建议
+ *
+ * 先看三个状态枚举建立"一个 G 现在在哪、一个 M 在干什么"的心智模型，
+ * 再看 `Scheduler` 的公开方法，最后才进 .cpp 看队列与窃取细节。
+ */
 #pragma once
 
 #include "go2cpp/core/parking_condition.hpp"

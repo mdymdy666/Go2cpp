@@ -20,6 +20,7 @@ namespace go2cpp {
  */
 class Error {
  public:
+ 
   /** @brief 虚析构，允许通过 ErrorPtr 安全释放。 */
   virtual ~Error() = default;
   /** @brief 返回面向用户的错误文本。 */
@@ -200,5 +201,51 @@ template <typename T>
 std::shared_ptr<const T> errors_as(const ErrorPtr& error) noexcept {
   return As<T>(error);
 }
+
+/**
+ * @brief Go 风格的错误函数命名空间。
+ * @details 这些函数只是现有 NewError/Wrap/Join/Is/As 的薄封装，不改变错误
+ *          对象的不可变和共享所有权约束。新手可以直接使用 errors::New、
+ *          errors::Wrap 和 errors::Is；既有 CamelCase API 继续保留。
+ */
+namespace errors {
+
+/** @brief 创建一条文本错误，等价于 NewError。 */
+inline ErrorPtr New(std::string message) {
+  return NewError(std::move(message));
+}
+
+/** @brief 在 cause 外增加一层描述，等价于 Wrap。 */
+inline ErrorPtr Wrap(ErrorPtr cause, std::string message) {
+  return go2cpp::Wrap(std::move(cause), std::move(message));
+}
+
+/** @brief 聚合多条错误，等价于 Join。 */
+inline ErrorPtr Join(std::vector<ErrorPtr> causes) {
+  return go2cpp::Join(std::move(causes));
+}
+
+/** @brief 以初始化列表聚合多条错误。 */
+inline ErrorPtr Join(std::initializer_list<ErrorPtr> causes) {
+  return go2cpp::Join(causes);
+}
+
+/** @brief 读取直接包装原因，等价于 Unwrap。 */
+inline ErrorPtr Unwrap(const ErrorPtr& error) noexcept {
+  return go2cpp::Unwrap(error);
+}
+
+/** @brief 判断错误链是否匹配目标，等价于 Is。 */
+inline bool Is(const ErrorPtr& error, const ErrorPtr& target) noexcept {
+  return go2cpp::Is(error, target);
+}
+
+/** @brief 按类型提取错误，等价于 As。 */
+template <typename T>
+inline std::shared_ptr<const T> As(const ErrorPtr& error) noexcept {
+  return go2cpp::As<T>(error);
+}
+
+}  // namespace errors
 
 }  // namespace go2cpp

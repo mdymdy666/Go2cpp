@@ -223,6 +223,9 @@ private:
     bool m_error{false};
 };
 
+
+
+
 /**
  * @brief 日志输出目标接口。
  * @details Sink 负责线程安全地写入文件、标准流或外部日志系统。
@@ -234,10 +237,115 @@ public:
     /** @brief 写入已格式化记录。 */
     virtual void Write(const LogRecord& record,
                        std::string_view formatted) = 0;
+    /**
+     * @brief 批量写入已格式化的原始字节（可能是多条记录拼在一起）。
+     * @details 缓冲型 Sink（`BufferedSink`）会优先走这条路径以摊薄系统调用。
+     *          默认实现返回 false，表示"本 Sink 不支持批量"，此时缓冲层会退化为
+     *          把整批文本当作一条记录交给 `Write`。**新增该虚函数不会破坏既有
+     *          Sink 实现**，因为它们无需覆写。
+     * @return 是否成功批量写入。
+     */
+    virtual bool WriteRaw(std::string_view /*bytes*/) { return false; }
     /** @brief 刷新缓冲区；默认无操作。 */
     virtual void Flush() {}
     /** @brief 重新打开输出资源；默认认为无需操作。 */
     virtual bool Reopen() { return true; }
+};
+
+/**
+ * @brief 带缓冲的输出目标装饰器：把多条已格式化记录合并成批量写入。
+ *
+ * ## 为什么需要它
+ *
+ * `LogItemWorker::Submit` 是同步的：每条日志都会直接调用 `Sink::Write`，也就是
+ * 每条日志一次系统调用（或一次文件锁）。高并发下这是主要开销之一。
+ * `BufferedSink` 在中间加一层缓冲，把 N 条记录合并成一次批量写。
+ *
+ * ## 刷新策略
+ *
+ * - `kImmediate`：每条立即写，等价于不缓冲（便于对照测试）；
+ * - `kBySize`：缓冲区达到 `capacity_bytes` 时刷；
+ * - `kByTime`：距上次刷新超过 `flush_interval` 时刷 —— **注意这是惰性检查**，
+ *   只在有 `Write` 或显式 `Flush` 时判断。若长时间没有日志，缓冲区不会被自动
+ *   刷出；需要确定性刷新时请调用 `Flush()`；
+ * - `kBySizeOrTime`：两者任一满足即刷。
+ *
+ * ## 并发安全（这是本类最需要想清楚的地方）
+ *
+ * - `m_mutex` 只保护缓冲区与统计字段，**持锁期间不做任何 IO**；
+ * - `Write` 在锁内把缓冲区 `swap` 到局部变量，随即释放 `m_mutex`，再在锁外
+ *   写底层 Sink；
+ * - `m_io_mutex` 单独串行化"对底层 Sink 的调用"，因为 `LogSink` 的线程安全
+ *   契约由具体实现决定，缓冲层不能假设它可以并发调用；
+ * - 两把锁**不嵌套**（先释放 `m_mutex` 再取 `m_io_mutex`），因此不存在锁序死锁；
+ * - 多个线程同时触发刷新时，只有一个线程拿到 `m_io_mutex`，其余线程的批量数据
+ *   已经在各自的局部变量里，会依次写入 —— 顺序不保证，但不会丢、不会交错到
+ *   半条记录（每次批量是一个完整字符串）。
+ *
+ * ## 已知限制
+ *
+ * - `WriteRaw` 得到的 record 上下文是最后一条记录的（批量写时无法保留每条
+ *   record 的完整信息）。对只使用 `formatted` 的 Sink 无影响；若某个 Sink
+ *   依赖 `LogRecord` 的字段区分每一条，请让该 Sink 覆写 `WriteRaw` 或不要包缓冲。
+ */
+class BufferedSink final : public LogSink {
+public:
+    /** @brief 刷新策略。 */
+    enum class FlushPolicy : std::uint8_t {
+        kImmediate,
+        kBySize,
+        kByTime,
+        kBySizeOrTime,
+    };
+
+    /** @brief 缓冲配置。 */
+    struct Config {
+        /** @brief 触发刷新的缓冲字节数（kBySize / kBySizeOrTime 使用）。 */
+        std::size_t capacity_bytes{64 * 1024};
+        FlushPolicy policy{FlushPolicy::kBySize};
+        /** @brief 触发刷新的时间间隔（kByTime / kBySizeOrTime 使用）。 */
+        std::chrono::milliseconds flush_interval{1000};
+        /**
+         * @brief 单条记录达到该字节数时绕过缓冲直接写（0 表示不绕过）。
+         * @details 防止单条超大记录把缓冲区瞬间撑爆、或长时间滞留在内存里。
+         */
+        std::size_t bypass_threshold{0};
+    };
+
+    /**
+     * @brief 创建缓冲装饰器。
+     * @param inner 实际写入的目标，不能为空。
+     * @param config 缓冲配置。
+     */
+    BufferedSink(LogSink::ptr inner, Config config);
+
+    void Write(const LogRecord& record, std::string_view formatted) override;
+    void Flush() override;
+    bool Reopen() override;
+
+    // ---- 诊断（测试与运行时观测用）----
+    /** @brief 累计刷新批次数。 */
+    std::size_t FlushCount() const noexcept;
+    /** @brief 当前缓冲区里的字节数。 */
+    std::size_t BufferedBytes() const noexcept;
+    /** @brief 当前配置。 */
+    const Config& config() const noexcept { return m_config; }
+
+private:
+    /// 在持锁状态下判断是否该刷。
+    bool ShouldFlushLocked() const noexcept;
+    /// 锁外执行一次批量写。
+    void FlushBatch(std::string batch, const LogRecord& last_record);
+
+    LogSink::ptr m_inner;
+    Config m_config;
+    /// 保护 m_buffer / m_last_flush。
+    mutable std::mutex m_mutex;
+    /// 串行化对 m_inner 的调用（不嵌套 m_mutex）。
+    std::mutex m_io_mutex;
+    std::string m_buffer;
+    std::chrono::steady_clock::time_point m_last_flush;
+    std::atomic<std::size_t> m_flush_count{0};
 };
 
 /** @brief 写入普通文件的 Sink，使用互斥锁保护流对象。 */

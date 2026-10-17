@@ -75,9 +75,13 @@ void ScenarioNormalLifecycle() {
         done.store(true, std::memory_order_release);
     });
     Check(task != nullptr, "spawn returned null");
-    // 刚 spawn 时不能是终态
-    Check(!IsTerminal(task->state()), "fresh task must not be terminal");
-
+    // 注意：这里**不能**断言"刚 spawn 的任务不是终态"。
+    // 那是错的假设 —— 任务由另一个 worker 线程并发执行，一个足够快的任务
+    // 完全可能在 `spawn` 返回后、本行检查前就跑完（state 变成 kDead）。
+    // 早期版本写了 `Check(!IsTerminal(...))`，在 load≈1.4 时会偶发失败，
+    // 属测试自身的竞态假设错误，不是运行时缺陷。
+    //
+    // 真正该检查的是：状态必须是**合法的枚举值**之一（防止未初始化/被踩）。
     Check(WaitUntil([&] { return done.load(std::memory_order_acquire); }, 10s),
           "task did not run");
     Check(task->wait_for(10s), "wait_for failed");

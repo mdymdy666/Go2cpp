@@ -647,6 +647,139 @@ void ScenarioFlowControl() {
     Check(window_updates >= 1, "receiver should replenish the window via WINDOW_UPDATE");
 }
 
+
+// ---------------------------------------------------------------------------
+// 场景 11：header 大小上限（防 CONTINUATION 泛滥与 HPACK 解压炸弹）
+// ---------------------------------------------------------------------------
+void ScenarioHeaderLimits() {
+    std::string error;
+
+    // 起一对已握手的连接（用给定 config）
+    const auto make_pair = [&error](const ConnectionConfig& config,
+                                    MemoryTransport* ct, MemoryTransport* st,
+                                    Connection** client_out, Connection** server_out) {
+        std::vector<std::uint8_t> in(kPreface, kPreface + kPrefaceLen);
+        const auto settings = PeerSettings();
+        in.insert(in.end(), settings.begin(), settings.end());
+        st->PushInbound(in);
+        auto* server = new Connection(st, Role::kServer, config);
+        if (server->Handshake(&error) != ConnStatus::kOk) return false;
+        ct->PushInbound(st->TakeOutbound());
+        auto* client = new Connection(ct, Role::kClient, config);
+        if (client->Handshake(&error) != ConnStatus::kOk) return false;
+        *client_out = client;
+        *server_out = server;
+        return true;
+    };
+
+    // ---------- 情况 1：压缩后的 header block 超限 ----------
+    {
+        ConnectionConfig config;
+        config.max_header_block_size = 256;          // 很小
+        config.max_header_list_size = 1u << 20;      // 这一项不设限
+        MemoryTransport ct;
+        MemoryTransport st;
+        Connection* client = nullptr;
+        Connection* server = nullptr;
+        Check(make_pair(config, &ct, &st, &client, &server), "case1 handshake failed");
+        if (client != nullptr) {
+            const std::string big(4000, 'x');        // 压缩后仍远大于 256
+            std::uint32_t sid = 0;
+            Check(client->StartRequest({{":method", "GET"}, {":path", "/"},
+                                        {"x-big", big}},
+                                       true, &sid, &error) == ConnStatus::kOk,
+                  "case1 send big header failed");
+            const auto out = ct.TakeOutbound();
+            st.PushInbound({out.begin() + static_cast<std::ptrdiff_t>(kPrefaceLen),
+                            out.end()});
+            ConnStatus status = ConnStatus::kOk;
+            IncomingEvent ev;
+            for (int i = 0; i < 12; ++i) {
+                status = server->ReadEvent(&ev, &error);
+                if (status != ConnStatus::kOk) break;
+                if (ev.kind == IncomingEvent::Kind::kHeaders) break;
+            }
+            std::printf("[conn] header 上限-压缩块: status=%s\n",
+                        ToString(status));
+            Check(status == ConnStatus::kHeaderListTooLarge,
+                  "oversized compressed header block must be kHeaderListTooLarge");
+            Check(!error.empty(), "oversized header block should explain itself");
+            delete client;
+            delete server;
+        }
+    }
+
+    // ---------- 情况 2：解压后 header list 超限 ----------
+    {
+        ConnectionConfig config;
+        config.max_header_block_size = 1u << 20;     // 压缩块不设限
+        config.max_header_list_size = 100;           // 解压后很小
+        MemoryTransport ct;
+        MemoryTransport st;
+        Connection* client = nullptr;
+        Connection* server = nullptr;
+        Check(make_pair(config, &ct, &st, &client, &server), "case2 handshake failed");
+        if (client != nullptr) {
+            // 200 字节的 value：压缩后约 60 字节（远小于 1MB），
+            // 但解压后 6 + 200 + 32 > 100。
+            const std::string mid(200, 'y');
+            std::uint32_t sid = 0;
+            Check(client->StartRequest({{":method", "GET"}, {":path", "/"},
+                                        {"x-mid", mid}},
+                                       true, &sid, &error) == ConnStatus::kOk,
+                  "case2 send mid header failed");
+            const auto out = ct.TakeOutbound();
+            st.PushInbound({out.begin() + static_cast<std::ptrdiff_t>(kPrefaceLen),
+                            out.end()});
+            ConnStatus status = ConnStatus::kOk;
+            IncomingEvent ev;
+            for (int i = 0; i < 12; ++i) {
+                status = server->ReadEvent(&ev, &error);
+                if (status != ConnStatus::kOk) break;
+                if (ev.kind == IncomingEvent::Kind::kHeaders) break;
+            }
+            std::printf("[conn] header 上限-解压后: status=%s\n", ToString(status));
+            Check(status == ConnStatus::kHeaderListTooLarge,
+                  "oversized decoded header list must be kHeaderListTooLarge");
+            delete client;
+            delete server;
+        }
+    }
+
+    // ---------- 情况 3：限内应当成功 ----------
+    {
+        ConnectionConfig config;                     // 默认 65536
+        MemoryTransport ct;
+        MemoryTransport st;
+        Connection* client = nullptr;
+        Connection* server = nullptr;
+        Check(make_pair(config, &ct, &st, &client, &server), "case3 handshake failed");
+        if (client != nullptr) {
+            const std::string small(200, 'z');
+            std::uint32_t sid = 0;
+            Check(client->StartRequest({{":method", "GET"}, {":path", "/ok"},
+                                        {"x-small", small}},
+                                       true, &sid, &error) == ConnStatus::kOk,
+                  "case3 send small header failed");
+            const auto out = ct.TakeOutbound();
+            st.PushInbound({out.begin() + static_cast<std::ptrdiff_t>(kPrefaceLen),
+                            out.end()});
+            bool got = false;
+            IncomingEvent ev;
+            for (int i = 0; i < 12 && !got; ++i) {
+                if (server->ReadEvent(&ev, &error) != ConnStatus::kOk) break;
+                if (ev.kind == IncomingEvent::Kind::kHeaders) {
+                    got = true;
+                    Check(ev.headers.size() == 3, "case3 header count wrong");
+                }
+            }
+            Check(got, "header within limits must be accepted");
+            delete client;
+            delete server;
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -671,6 +804,8 @@ int main() {
     ScenarioContinuation();
     std::printf("[conn][场景10] 流控\n");
     ScenarioFlowControl();
+    std::printf("[conn][场景11] header 大小上限\n");
+    ScenarioHeaderLimits();
 
     if (g_failures == 0) {
         std::printf("\n[conn] failures=0\n");

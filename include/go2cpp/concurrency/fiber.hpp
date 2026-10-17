@@ -1,3 +1,30 @@
+/**
+ * @file fiber.hpp
+ * @brief Fiber（用户态协程）的公开接口与执行上下文结构。
+ *
+ * ## 模块定位
+ *
+ * Fiber 是 G 的**执行载体**：它持有一段独立栈和一份保存的寄存器上下文。
+ * `Scheduler` 决定"下一个跑谁"，`Fiber` 负责"怎么把 CPU 交给它/从它拿回来"。
+ *
+ * 本文件只定义**数据与接口**，真正的换栈在 `context_backend`（汇编）里。
+ *
+ * ## 本文件定义什么
+ *
+ * - `FiberState`：Fiber 自身的生命周期状态（可运行/运行中/挂起/终止）；
+ * - `SuspendReason`：挂起原因（yield / park / io wait / 被取消…）。
+ *   这个枚举决定了恢复时走哪条路径，调试时非常有价值；
+ * - `FiberExecutionBinding`：Fiber 与它当前所在的 M/P 的绑定信息；
+ * - `FiberContextFrame`：一份保存的寄存器上下文；换栈就是换它；
+ * - `FiberResumeResult`：恢复一个 Fiber 后的返回信息（是否已终止等）；
+ * - `Fiber`：Fiber 对象本身（创建、启动、恢复、销毁）。
+ *
+ * ## 栈的来源
+ *
+ * 本项目用**每 Fiber 独立栈 + 池化复用**（`FiberBin`）。这与 coost 的
+ * "共享栈"是相反的取舍：独立栈换来更低的切换成本，代价是更大的内存占用；
+ * 池化则把重复建栈的开销摊掉。
+ */
 #pragma once
 
 #include <cstddef>

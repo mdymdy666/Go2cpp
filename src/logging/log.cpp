@@ -1022,4 +1022,127 @@ LogLine::~LogLine() noexcept {
     try { m_record.message = m_stream.str(); m_logger->Log(std::move(m_record)); } catch (...) {}
 }
 
+namespace {
+
+/// 无 record 上下文时的占位记录（批量写时底层 Sink 通常只用 formatted）。
+LogRecord MakePlaceholderRecord() {
+    LogRecord record;
+    return record;
+}
+
+}  // namespace
+
+BufferedSink::BufferedSink(LogSink::ptr inner, Config config)
+    : m_inner(std::move(inner)), m_config(config), m_last_flush(std::chrono::steady_clock::now()) {
+    if (m_config.capacity_bytes == 0) {
+        // 容量为 0 会让 kBySize 立刻触发，等价于立即刷新，这里显式兜底成 1
+        m_config.capacity_bytes = 1;
+    }
+}
+
+bool BufferedSink::ShouldFlushLocked() const noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    const bool size_full = m_buffer.size() >= m_config.capacity_bytes;
+    const bool time_due = (now - m_last_flush) >= m_config.flush_interval;
+    switch (m_config.policy) {
+        case FlushPolicy::kImmediate: return true;
+        case FlushPolicy::kBySize: return size_full;
+        case FlushPolicy::kByTime: return time_due;
+        case FlushPolicy::kBySizeOrTime: return size_full || time_due;
+    }
+    return false;
+}
+
+void BufferedSink::FlushBatch(std::string batch, const LogRecord& last_record) {
+    if (batch.empty() || !m_inner) {
+        return;
+    }
+    // 锁外串行化对底层 Sink 的调用。注意 m_mutex 此时已经释放，
+    // 两把锁不嵌套，因此不存在死锁。
+    std::lock_guard<std::mutex> io_lock(m_io_mutex);
+    if (!m_inner->WriteRaw(batch)) {
+        // 底层不支持批量：退化为把它当作一条记录写下去。
+        m_inner->Write(last_record, batch);
+    }
+    m_inner->Flush();
+    m_flush_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void BufferedSink::Write(const LogRecord& record, std::string_view formatted) {
+    if (!m_inner) {
+        return;
+    }
+    // 超大单条记录：绕过缓冲，避免撑爆缓冲区或长期滞留。
+    if (m_config.bypass_threshold > 0 && formatted.size() >= m_config.bypass_threshold) {
+        std::lock_guard<std::mutex> io_lock(m_io_mutex);
+        m_inner->Write(record, formatted);
+        m_inner->Flush();
+        m_flush_count.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // 立即策略：不缓冲。
+    if (m_config.policy == FlushPolicy::kImmediate) {
+        std::lock_guard<std::mutex> io_lock(m_io_mutex);
+        m_inner->Write(record, formatted);
+        m_inner->Flush();
+        m_flush_count.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    std::string batch;
+    bool should_flush = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_buffer.append(formatted.data(), formatted.size());
+        // 保证批量文本以换行结尾，便于按行解析的 Sink 使用。
+        if (m_buffer.empty() || m_buffer.back() != '\n') {
+            m_buffer.push_back('\n');
+        }
+        should_flush = ShouldFlushLocked();
+        if (should_flush) {
+            batch.swap(m_buffer);
+            m_last_flush = std::chrono::steady_clock::now();
+        }
+    }
+    if (should_flush) {
+        FlushBatch(std::move(batch), record);
+    }
+}
+
+void BufferedSink::Flush() {
+    if (!m_inner) {
+        return;
+    }
+    std::string batch;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        batch.swap(m_buffer);
+        m_last_flush = std::chrono::steady_clock::now();
+    }
+    if (!batch.empty()) {
+        FlushBatch(std::move(batch), MakePlaceholderRecord());
+    } else {
+        std::lock_guard<std::mutex> io_lock(m_io_mutex);
+        m_inner->Flush();
+    }
+}
+
+bool BufferedSink::Reopen() {
+    Flush();
+    if (!m_inner) {
+        return false;
+    }
+    std::lock_guard<std::mutex> io_lock(m_io_mutex);
+    return m_inner->Reopen();
+}
+
+std::size_t BufferedSink::FlushCount() const noexcept {
+    return m_flush_count.load(std::memory_order_relaxed);
+}
+
+std::size_t BufferedSink::BufferedBytes() const noexcept {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_buffer.size();
+}
+
 }  // namespace go2cpp::log

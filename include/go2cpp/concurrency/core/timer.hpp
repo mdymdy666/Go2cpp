@@ -1,3 +1,32 @@
+/**
+ * @file core/timer.hpp
+ * @brief Timer / TimerService：定时与超时设施。
+ *
+ * ## 模块定位
+ *
+ * Timer 是运行时里**唯一自带后台线程**的并发设施，刻意**不依赖 Scheduler**。
+ * 原因是调度器自己需要"超时"能力（`wait_for`），如果 Timer 反过来依赖调度器
+ * 就形成循环依赖。
+ *
+ * 这样分层还有一个好处：Timer 可以在 Scheduler 尚未启动的初始化阶段使用。
+ *
+ * ## 本文件定义什么
+ *
+ * - `TimerState` / `TimerRepeatMode` / `TimerWaitMode`：定时器的状态与周期语义；
+ * - `TimerOptions` / `TimerDurationLimits` / `TimerContext`：调度选项、
+ *   分级告警阈值、回调拿到的上下文；
+ * - `TimerDecision`：周期回调的**返回值**，用来自我决定下一次触发时间
+ *   （相对延迟 / 绝对时间 / 沿用周期 / 停止）；
+ * - `TimerExecutor`：可插拔的执行器，把回调交给调度器跑而不是 Timer 线程；
+ * - `Timer`：轻量句柄，**析构即取消**；
+ * - `TimerService`：单例服务，负责真正的调度。
+ *
+ * ## 最容易被误用的地方
+ *
+ * `~Timer()` 等价于 `Cancel()`。所以 `service.ScheduleAfter(...)` 的返回值
+ * 如果立刻作为临时对象析构，定时器会被当场取消 —— 调用方必须持有句柄。
+ * 写定时器测试时若不保存返回值，会观察到"回调从不触发"。
+ */
 #pragma once
 
 #include <chrono>

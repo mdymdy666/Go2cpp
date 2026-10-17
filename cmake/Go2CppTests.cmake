@@ -180,6 +180,45 @@ if (GO2CPP_BUILD_TESTS)
              COMMAND go2cpp_fiber_transport_test)
     set_tests_properties(go2cpp_fiber_transport_test PROPERTIES TIMEOUT 180)
 
+    # ---- HTTP/2 压力与边界测试（子代理新增）----
+    add_executable(go2cpp_http2_stress
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_http2_stress.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/connection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/frame.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/hpack.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/huffman.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/stream_state.cpp)
+    target_include_directories(go2cpp_http2_stress PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(go2cpp_http2_stress PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_http2_stress COMMAND go2cpp_http2_stress)
+    set_tests_properties(go2cpp_http2_stress PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_http2_boundary
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_http2_boundary.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/connection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/frame.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/hpack.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/huffman.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/stream_state.cpp)
+    target_include_directories(go2cpp_http2_boundary PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(go2cpp_http2_boundary PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_http2_boundary COMMAND go2cpp_http2_boundary)
+    set_tests_properties(go2cpp_http2_boundary PROPERTIES TIMEOUT 180)
+
+    # ---- log 缓冲区与 Formatter（子代理新增）----
+    add_executable(go2cpp_log_buffer_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/logging/test_log_buffer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/logging/log.cpp)
+    target_include_directories(go2cpp_log_buffer_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(go2cpp_log_buffer_test PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_log_buffer_test COMMAND go2cpp_log_buffer_test)
+    set_tests_properties(go2cpp_log_buffer_test PROPERTIES TIMEOUT 120)
+
+
+
     add_executable(go2cpp_config_registry_macro_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/test_config_registry_macro.cpp)
     target_link_libraries(go2cpp_config_registry_macro_test PRIVATE go2cpp_config)

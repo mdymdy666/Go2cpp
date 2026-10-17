@@ -1,3 +1,44 @@
+/**
+ * @file future.hpp
+ * @brief Future / Promise：一次性的异步结果传递原语。
+ *
+ * ## 模块定位
+ *
+ * Future 解决的是「一个线程/Fiber 产出结果，另一个（或多个）等待并读取」。
+ * 它在运行时的位置介于**同步原语**与**调度器**之间：
+ *
+ * - 等待本身走 `FutureWaitBackend` —— 默认实现基于 `ParkingCondition`，
+ *   所以在受管 Fiber 里等待会 **park 当前协程**而不是阻塞 carrier 线程；
+ *   普通线程上则退化为原生条件等待；
+ * - 它**不拥有**调度器，也不要求调用方在 Fiber 里，因此可以在初始化阶段、
+ *   回调里、甚至别的调度器实现中使用（通过替换后端）。
+ *
+ * ## 与 Channel 的分工
+ *
+ * - `Channel`：可多次收发、有缓冲、面向"流"；
+ * - `Future`：**只完成一次**、面向"单个结果 + 错误"。
+ *   需要一次性结果时不要用容量 1 的 channel 代替 —— 会丢掉
+ *   broken-promise（生产者提前消失）这个语义。
+ *
+ * ## 能力清单
+ *
+ * - `Promise::SetValue/SetError/SetException/Cancel` 四种完成方式；
+ * - `Promise` 析构时若仍未完成，自动发布 broken-promise 错误，
+ *   保证消费者**永远不会永久等待**；
+ * - `Future::Get/GetFor/GetUntil/WaitFor` 阻塞读取，支持超时；
+ * - 与 `Context` 集成：Context 取消会让等待方被唤醒并返回取消状态；
+ * - `Future` 可复制、可跨线程/Fiber 共享，底层值在终态后只读。
+ *
+ * ## 实现层次
+ *
+ * | 层 | 职责 |
+ * |---|---|
+ * | `FutureWaitBackend` | 可替换的等待/唤醒协议（默认 ParkingCondition）|
+ * | `detail::FutureState<T>` | 共享状态：值/错误/异常 + 一次性终态机 |
+ * | `detail::FutureResult<T>` | 读取结果的返回值封装（含状态与错误）|
+ * | `Promise<T>` | 写端，唯一完成者 |
+ * | `Future<T>` | 读端，可复制、多等待者 |
+ */
 #pragma once
 
 #include "go2cpp/context.hpp"
@@ -178,6 +219,37 @@ struct FutureWaitRegistration final {
 template <typename T, bool IsVoid = std::is_void_v<T>>
 class FutureState;
 
+/**
+ * @brief 非 void Future 的共享状态（引用计数的核心）。
+ *
+ * ## 作用
+ *
+ * `Promise` 与所有 `Future` 副本共享同一个 `FutureState`：
+ * 写端只负责把它推进到**某个终态**，读端等待并读取。生命周期由
+ * `shared_ptr` 管理，因此读写两端的销毁顺序不需要协调。
+ *
+ * ## 一次性终态机
+ *
+ * `m_kind`（`FutureStateKind`）从 `kPending` 出发，只能**成功迁移一次**：
+ * `SetValue`、`SetError`、`SetException`、`Cancel` 四者互斥，
+ * 后到者返回 false 并被忽略。这个"先到先得"由 `m_mutex` 保证，
+ * 是 Future 语义的核心 —— 不存在"第二次完成"。
+ *
+ * ## 能力
+ *
+ * - `SetValue`：先构造值再持锁，避免用户类型的构造/移动在锁内阻塞等待者；
+ * - `SetError` / `SetException` / `Cancel`：分别对应业务错误、异常、取消；
+ * - `Wait` / `WaitUntil`：通过 `m_wait_backend` 等待终态，支持超时与
+ *   `Context` 取消；
+ * - `TakeResult` / `Get`：终态后读取，未完成时按 API 约定阻塞或返回无效。
+ *
+ * ## 并发要点
+ *
+ * - 所有字段由 `m_mutex` 保护，但**值的构造在锁外**；
+ * - 推进终态后调用 `m_wait_backend->NotifyAll()`，唤醒全部等待者 ——
+ *   唤醒发生在锁外，避免"唤醒时等待者还要抢锁"的抖动；
+ * - `m_wait_backend` 在构造时从全局注册表取，之后不再变化。
+ */
 template <typename T>
 class FutureState<T, false> final
     : public std::enable_shared_from_this<FutureState<T, false>> {
@@ -388,6 +460,19 @@ private:
     std::exception_ptr m_exception;
 };
 
+/**
+ * @brief void Future 的共享状态特化。
+ *
+ * ## 与 `FutureState<T, false>` 的差异
+ *
+ * 只有一个：**没有 `m_value`**。`SetValue()` 无参，仅用于"成功完成"这个
+ * 信号本身。其余部分（一次性终态机、等待后端、错误/异常/取消、
+ * 唤醒时机）与非 void 版本**完全一致**。
+ *
+ * 单独特化而不是用 `std::optional<T>` 包一层，是为了让 void Future 不产生
+ * 任何值存储开销 —— `Future<void>` 常见于"只关心完成信号"的场景
+ * （如一组任务的汇合点）。
+ */
 template <typename T>
 class FutureState<T, true> final
     : public std::enable_shared_from_this<FutureState<T, true>> {
@@ -676,19 +761,17 @@ struct FutureResult<void> {
 template <typename T>
 class Future;
 
-/**
- * Future 的一次性生产端。
- *
- * 依赖：detail::FutureState 保存共享状态，Context/DoneSignal 负责取消和
- * 等待唤醒，Error/exception_ptr 表示失败。对上层提供 SetValue、SetError、
- * SetException、Cancel；Promise 析构时若仍未完成会发布 BrokenPromise，
- * 保证消费者不会永久等待。Promise 不能复制，只能移动。
- */
 template <typename T>
 /**
- * @brief Future 的唯一完成端。
+ * @brief Future 的唯一完成端（一次性生产端）。
  * @details Promise 可由一个线程/Fiber 设置值、错误或异常；对应 Future 可
  *          被多个等待方安全读取。
+ *
+ *          依赖 `detail::FutureState` 保存共享状态，`Context` / `DoneSignal`
+ *          负责取消和等待唤醒，`Error` / `exception_ptr` 表示失败。
+ *          对上层提供 SetValue / SetError / SetException / Cancel。
+ *          Promise 析构时若仍未完成会发布 BrokenPromise，保证消费者不会
+ *          永久等待。Promise 不能复制，只能移动。
  */
 class Promise final {
 public:
@@ -773,19 +856,17 @@ private:
     friend class Future<T>;
 };
 
-/**
- * Future 的共享消费端。
- *
- * 依赖：Promise/ detail::FutureState 的一次性终态，Context 的取消和
- * Deadline。对上层提供等待、超时等待、状态查询和 FutureResult；默认只
- * 返回状态，不主动抛异常，调用者明确使用 GetOrThrow 时才转换为异常。
- * Future 可复制并在线程与 Fiber 间共享，底层值在终态后保持只读。
- */
 template <typename T>
 /**
- * @brief 可复制的异步结果读取端。
+ * @brief 可复制的异步结果读取端（共享消费端）。
  * @details 支持阻塞、超时、Context 取消和 GetOrThrow；底层状态通过共享
- *          FutureState 管理生命周期。
+ *          `FutureState` 管理生命周期。
+ *
+ *          依赖 `Promise` / `detail::FutureState` 的一次性终态，以及
+ *          `Context` 的取消和 Deadline。对上层提供等待、超时等待、状态
+ *          查询和 `FutureResult`；默认只返回状态，不主动抛异常，调用者
+ *          明确使用 GetOrThrow 时才转换为异常。
+ *          Future 可复制并在线程与 Fiber 间共享，底层值在终态后只读。
  */
 class Future final {
 public:

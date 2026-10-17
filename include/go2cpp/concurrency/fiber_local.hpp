@@ -1,3 +1,34 @@
+/**
+ * @file fiber_local.hpp
+ * @brief Fiber（Goroutine）局部存储。
+ *
+ * ## 模块定位
+ *
+ * C++ 的 `thread_local` 绑定的是 **OS 线程**（M），而本项目里一个 G 会在
+ * 不同 M 之间迁移。`FiberLocal` 提供的是**绑定到 G** 的存储：值随 G 一起
+ * 搬家，G 结束时销毁，与它当时跑在哪个 M 上无关。
+ *
+ * 这对应 Go 里的 goroutine-local 语义 —— Go 没有官方 API，但常见做法
+ * （比如 `gls` 库）就是这个模型。本项目把它做成一等设施。
+ *
+ * ## 三条生命周期规则
+ *
+ * 1. **在 Fiber 内**：值存在该 G 的映射表里，跨 M 迁移仍然存在；
+ * 2. **G 结束时**：由 Fiber trampoline 调 `Cleanup` 销毁，即便值还在别的
+ *    地方被引用也不会泄漏（`shared_ptr` 语义保证）；
+ * 3. **在 Fiber 外**（普通线程上）：退化为线程局部后备值，随线程退出销毁。
+ *
+ * ## 键的分配
+ *
+ * `AllocateKey()` 返回进程内单调递增、**永不复用**的 key。这一点是必须的：
+ * 如果复用，一个已销毁的 `FiberLocal<T>` 的新实例可能读到旧实例的残留值。
+ *
+ * ## 一个容易被忽略的实现坑
+ *
+ * `ThreadValues()` 定义在 `fiber.cpp` 而不是头文件里的函数局部 static。
+ * 原因是：函数局部静态变量在**每个 DSO** 里各有一份，插件化的编译单元会
+ * 悄悄拿到不同的 TLS 映射。显式定义在单个实现文件里保证全进程唯一。
+ */
 #pragma once
 
 #include "go2cpp/fiber.hpp"

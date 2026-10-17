@@ -18,3 +18,10 @@ compile_commands.json
 
 # 定时任务轮次锁（运行时目录，不入库）
 .agent/run.lock/
+
+# 临时脚本与备份（不参与提交）
+.dsh_tmp/
+
+# 运行时导出的配置
+app.ini
+app.ini.tmp

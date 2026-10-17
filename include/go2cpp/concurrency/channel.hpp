@@ -555,6 +555,7 @@ class SelectWaitState final {
 
 }  // namespace detail
 
+
 /** @brief Channel 接收操作的值、成功标记和状态。 */
 template <typename T>
 struct ChannelRecvResult {

@@ -14,7 +14,6 @@
 //   4  等待超时      WaitFor 未完成时返回 kTimedOut，且不改变 Future 自身状态
 //   5  Context 取消  取消后等待返回 kCancelled
 //   6  Promise 被放弃  未 SetValue 就析构 → 消费者收到 BrokenPromiseError
-//
 // ★ 所有权要点：Promise 不可复制，而 go() 的 Task::Function 是 std::function
 //   （要求目标可复制），所以要把 Promise 放进 shared_ptr 再捕获进 lambda。
 //   直接用 auto promise = pair.first 会触发已删除的拷贝构造。

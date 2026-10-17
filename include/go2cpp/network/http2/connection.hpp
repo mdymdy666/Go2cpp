@@ -57,6 +57,23 @@ enum class Role : std::uint8_t { kClient, kServer };
 /** @brief 连接配置。 */
 struct ConnectionConfig final {
     std::uint32_t max_frame_size{kDefaultMaxFrameSize};
+    /**
+     * @brief 单个 header block（HEADERS + 其全部 CONTINUATION）允许的**压缩后**
+     *        字节数上限。
+     * @details 这是防 CONTINUATION 泛滥的第一道闸：对端可以用无数个
+     *          CONTINUATION 帧凑出一个巨大的 header block，若不在拼接过程中
+     *          就累计检查，内存会随输入线性膨胀。默认 64 KiB —— 与 RFC 语境下
+     *          常见的 `SETTINGS_MAX_HEADER_LIST_SIZE` 同量级，且远小于会让
+     *          VmRSS 明显上升的规模。
+     */
+    std::uint32_t max_header_block_size{65536};
+    /**
+     * @brief 解压后 header 列表的大小上限（RFC 9113 §6.5.2 的语义）。
+     * @details 每项按 `name.size() + value.size() + 32` 计（与 HPACK 动态表
+     *          的条目开销一致）。这一道防的是 **HPACK 解压炸弹**：压缩块可能
+     *          很小，解压后却极大（大量重复头 + Huffman）。两道限制缺一不可。
+     */
+    std::uint32_t max_header_list_size{65536};
     std::uint32_t header_table_size{4096};
     std::uint32_t initial_window_size{65535};
     std::uint32_t max_concurrent_streams{100};
@@ -70,6 +87,9 @@ enum class ConnStatus : std::uint8_t {
     kUnsupported,
     /// 发送窗口不足（对端还没给 WINDOW_UPDATE）。调用方应等待后重试。
     kFlowControl,
+    /// header 块或解压后的 header 列表超过配置上限（防 CONTINUATION 泛滥与
+    /// HPACK 解压炸弹）。收到它时应当主动断开连接。
+    kHeaderListTooLarge,
 };
 
 const char* ToString(ConnStatus status) noexcept;

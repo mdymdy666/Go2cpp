@@ -1,3 +1,27 @@
+/**
+ * @file parking_condition.cpp
+ * @brief ParkingCondition 的 futex 无状态等待实现。
+ *
+ * ## 这个文件实现什么
+ *
+ * 把 `parking_condition.hpp` 声明的"Fiber / 普通线程共用条件等待"落到具体
+ * 机制上：
+ *
+ * - **Fiber 路径**：Linux futex 无状态等待。用 32 位代际字 `m_futex_seq` 作为
+ *   等待条件 —— 等待者记下代际后 `FUTEX_WAIT`，唤醒方 +1 后 `FUTEX_WAKE`。
+ *   "无状态"指不需要为每个等待者分配内核对象，避免"先建没建"的竞态；
+ * - **线程路径**：`m_waiters` 队列 + `std::mutex`；
+ * - **park 前自旋**：`kSpinBudget = 128` 次。这不是可有可无的优化 ——
+ *   无自旋时 2 个等待者的场景实测比 `std::condition_variable` 慢 3.3 倍，
+ *   因为"检查完条件、还没进内核"的窗口里到达的唤醒会丢失，等待者被迫睡到超时；
+ * - `FiberWaitUnsupported()`：平台能力探测，让上层在不支持时安全降级。
+ *
+ * ## 锁契约（最容易写错的地方）
+ *
+ * `wait*` 系列要求调用方**持有传入的外部 `unique_lock`**，返回时锁仍被持有
+ * （与 `std::condition_variable` 一致）。实现内部会先释放再等待、被唤醒后
+ * 重新获取，但**谓词判断永远在持锁状态下进行**，否则会出现丢失唤醒。
+ */
 #include "go2cpp/core/parking_condition.hpp"
 
 #include "go2cpp/core/hybrid_mutex.hpp"
@@ -64,53 +88,20 @@ class ParkingCondition::WaitNode final {
 public:
     enum class Result { kWaiting, kNotified, kTimedOut, kCancelled };
 
-    /// 函数功能：执行 WaitNode，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
-    /// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     WaitNode(ParkingCondition* owner, Scheduler* scheduler,
              std::shared_ptr<Task> task)
         : owner(owner), m_scheduler(scheduler), m_task(std::move(task)) {}
 
-    /// 函数功能：执行 Finish，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] result 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     bool Finish(Result result) noexcept {
         auto expected = Result::kWaiting;
         return m_result.compare_exchange_strong(
             expected, result, std::memory_order_acq_rel);
     }
 
-    /// 函数功能：执行 result，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     Result result() const noexcept {
         return m_result.load(std::memory_order_acquire);
     }
 
-    /// 函数功能：执行 Wake，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void Wake() noexcept {
         // Disarm waits for any in-flight callback to leave this gate, so no
         // raw Scheduler access survives the waiting G's stack cleanup.
@@ -135,14 +126,6 @@ public:
         }
     }
 
-    /// 函数功能：执行 Disarm，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void Disarm() noexcept {
         std::lock_guard<HybridMutex> lock(m_wake_mutex);
         m_active = false;
@@ -246,14 +229,6 @@ public:
 #endif
     }
 
-    /// 函数功能：执行 WaitManaged，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     Result WaitManaged() {
         Scheduler* const scheduler = m_scheduler;
         const auto task = m_task;
@@ -301,39 +276,15 @@ private:
 ParkingCondition::ParkingCondition() = default;
 ParkingCondition::~ParkingCondition() = default;
 
-/// 函数功能：完成 CancellationRequested 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool ParkingCondition::CancellationRequested() noexcept {
     const auto task = Scheduler::current_task();
     return task && task->cancellation_requested();
 }
 
-/// 函数功能：完成 FiberWaitUnsupported 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool ParkingCondition::FiberWaitUnsupported() noexcept {
     return Fiber::Current() != nullptr && !Scheduler::current_task();
 }
 
-/// 函数功能：完成 notify_one 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void ParkingCondition::notify_one() noexcept {
     std::shared_ptr<WaitNode> selected;
     {
@@ -352,14 +303,6 @@ void ParkingCondition::notify_one() noexcept {
     }
 }
 
-/// 函数功能：完成 notify_all 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void ParkingCondition::notify_all() noexcept {
     std::deque<std::shared_ptr<WaitNode>> waiters;
     {
@@ -376,15 +319,6 @@ void ParkingCondition::notify_all() noexcept {
     }
 }
 
-/// 函数功能：完成 WaitOnce 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] lock 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] deadline 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ParkingCondition::WaitStatus ParkingCondition::WaitOnce(
     std::unique_lock<std::mutex>& lock,
     std::optional<Clock::time_point> deadline,

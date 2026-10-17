@@ -24,6 +24,7 @@ const char* ToString(ConnStatus status) noexcept {
         case ConnStatus::kProtocolError: return "protocol-error";
         case ConnStatus::kUnsupported: return "unsupported";
         case ConnStatus::kFlowControl: return "flow-control";
+        case ConnStatus::kHeaderListTooLarge: return "header-list-too-large";
     }
     return "unknown";
 }
@@ -381,6 +382,14 @@ ConnStatus Connection::AssembleHeaderBlock(std::uint32_t stream_id,
                                            std::vector<std::uint8_t>* out,
                                            std::string* error) {
     out->clear();
+    // 第一片本身也要算进上限（单个 HEADERS 就能超限）。
+    if (first_block.size() > m_config.max_header_block_size) {
+        if (error != nullptr) {
+            *error = "header block 超过上限: " + std::to_string(first_block.size()) +
+                     " > " + std::to_string(m_config.max_header_block_size);
+        }
+        return ConnStatus::kHeaderListTooLarge;
+    }
     out->insert(out->end(), first_block.begin(), first_block.end());
     // 循环读后续帧，直到遇到 END_HEADERS。
     for (;;) {
@@ -404,6 +413,16 @@ ConnStatus Connection::AssembleHeaderBlock(std::uint32_t stream_id,
         if (cont.stream_id != stream_id) {
             if (error != nullptr) *error = "CONTINUATION 的流 id 与 HEADERS 不一致";
             return ConnStatus::kProtocolError;
+        }
+        // 关键：边拼边累计检查。不能等收完再判 —— 那正是 CONTINUATION
+        // 泛滥攻击想要的（先把内存撑爆）。
+        if (out->size() + cont.header_block.size() > m_config.max_header_block_size) {
+            if (error != nullptr) {
+                *error = "header block 超过上限: " +
+                         std::to_string(out->size() + cont.header_block.size()) + " > " +
+                         std::to_string(m_config.max_header_block_size);
+            }
+            return ConnStatus::kHeaderListTooLarge;
         }
         out->insert(out->end(), cont.header_block.begin(), cont.header_block.end());
         if (cont.end_headers) {
@@ -451,11 +470,36 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
                 }
             } else {
                 full_block = std::move(headers.header_block);
+                // 单片 HEADERS 走的是另一条路径（不经 AssembleHeaderBlock），
+                // 所以这里必须**独立**再检查一次上限 —— 否则一个 10MB 的
+                // 单帧 HEADERS 可以绕过限制。
+                if (full_block.size() > m_config.max_header_block_size) {
+                    if (error != nullptr) {
+                        *error = "header block 超过上限: " +
+                                 std::to_string(full_block.size()) + " > " +
+                                 std::to_string(m_config.max_header_block_size);
+                    }
+                    return ConnStatus::kHeaderListTooLarge;
+                }
             }
             std::vector<HeaderField> decoded;
             if (m_decoder.DecodeBlock(full_block.data(), full_block.size(), &decoded,
                                       error) != HpackStatus::kOk) {
                 return ConnStatus::kProtocolError;
+            }
+            // 第二道闸：解压后的大小。压缩块可能很小而解压后极大
+            // （HPACK 解压炸弹），所以这里按 RFC 9113 §6.5.2 的口径再算一次。
+            std::size_t header_list_size = 0;
+            for (const auto& field : decoded) {
+                header_list_size += field.name.size() + field.value.size() + 32;
+            }
+            if (header_list_size > m_config.max_header_list_size) {
+                if (error != nullptr) {
+                    *error = "解压后 header 列表超过上限: " +
+                             std::to_string(header_list_size) + " > " +
+                             std::to_string(m_config.max_header_list_size);
+                }
+                return ConnStatus::kHeaderListTooLarge;
             }
             // 流状态推进
             const bool fresh_stream =

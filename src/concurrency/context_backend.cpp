@@ -1,3 +1,28 @@
+/**
+ * @file context_backend.cpp
+ * @brief 栈切换汇编原语的 C++ 桥接层。
+ *
+ * ## 模块定位
+ *
+ * Fiber 的挂起/恢复本质上是**换栈**：保存当前寄存器与栈指针，加载目标的
+ * 寄存器与栈指针。这一步必须用汇编写（`context_x64.S`），本文件只做
+ * C++ 侧的转发与平台判断。
+ *
+ * ## 两个原语
+ *
+ * - `go2cpp_context_make(stack_bottom, stack_size, entry)`：在一段栈上
+ *   搭出"第一次被 jump 进去就会调用 entry"的初始上下文（按 x86-64 SysV
+ *   调用约定布置好返回地址与参数寄存器）；
+ * - `go2cpp_context_jump(target, data)`：保存当前上下文并切到 `target`，
+ *   把 `data` 作为 `entry` 的参数传过去；被切回时返回一个
+ *   `Transfer`（携带对方交给我们的数据）。
+ *
+ * ## 平台策略
+ *
+ * 只在 Linux + x86-64 上启用汇编实现；其它平台返回空上下文/空传输，
+ * 让上层的 Fiber 创建安全失败，而不是在运行时踩到未实现的入口。
+ * 这样移植时只需要补一份汇编，不用改 Fiber 逻辑。
+ */
 #include "go2cpp/detail/context_backend.hpp"
 
 #if defined(__linux__) && defined(__x86_64__)
@@ -23,15 +48,6 @@ Context MakeContext(void* stack_bottom, std::size_t stack_size,
 #endif
 }
 
-/// 函数功能：完成 JumpContext 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] target 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] data 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 Transfer JumpContext(Context target, const void* data) noexcept {
 #if defined(__linux__) && defined(__x86_64__)
     return go2cpp_context_jump(target, data);

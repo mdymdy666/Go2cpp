@@ -1,3 +1,23 @@
+/**
+ * @file context.cpp
+ * @brief Context 取消树与 DoneSignal 的实现。
+ *
+ * ## 这个文件实现什么
+ *
+ * - `Context` 的取消树：`WithCancel` / `WithTimeout` / `WithDeadline` 派生
+ *   子节点，父节点取消时级联取消所有子节点；
+ * - `DoneSignal`：回调注册与批量通知。Fiber 等待取消就挂在这里；
+ * - 取消原因错误的构造与按身份比较。
+ *
+ * ## 关键设计
+ *
+ * **级联发生在取消线程上、同步执行**。也就是说 `cancel()` 返回时，所有子
+ * Context 都已经被标记为完成、所有注册的回调都已执行。这让"取消后立刻
+ * 观察状态"是可预期的，但也意味着**回调里不能做阻塞操作** ——
+ * 典型写法是回调只 `Notify()` 一个等待原语。
+ *
+ * 取消是**单向且幂等**的：一旦完成就不会回退，重复取消是安全的空操作。
+ */
 #include "go2cpp/context.hpp"
 #include "go2cpp/core/parking_condition.hpp"
 
@@ -27,14 +47,6 @@ namespace go2cpp
         std::unordered_map<CallbackId, std::function<void()>> callbacks;
     };
 
-    /// 函数功能：完成 DoneSignal 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     DoneSignal::DoneSignal() : m_state(std::make_shared<State>()) {}
     DoneSignal::~DoneSignal() = default;
 
@@ -255,14 +267,6 @@ namespace go2cpp
         {
             static void Signal(DoneSignal &signal) noexcept { signal.Signal(); }
 
-            /// 函数功能：执行 AddInternalCallback，完成本函数所属模块的单步操作。
-            /// 执行流程：
-            /// 1. 校验传入参数以及当前对象/线程状态；
-            /// 2. 按状态机规则获取必要的锁并更新内部数据；
-            /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-            /// @param[in] signal 调用方传入的参数，具体约束以头文件声明为准。
-            /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-            /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
             static DoneSignal::CallbackId AddInternalCallback(
                 const DoneSignal &signal, std::function<void()> callback)
             {
@@ -310,14 +314,6 @@ namespace go2cpp
         public:
             using Id = std::uint64_t;
 
-            /// 函数功能：执行 Instance，完成本函数所属模块的单步操作。
-            /// 执行流程：
-            /// 1. 校验传入参数以及当前对象/线程状态；
-            /// 2. 按状态机规则获取必要的锁并更新内部数据；
-            /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-            /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-            /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-            /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
             static TimerService &Instance()
             {
                 // Context 状态可能在任意静态析构阶段被销毁。让服务及其同步原语一直
@@ -354,14 +350,6 @@ namespace go2cpp
 
             static void ShutdownAtExit() noexcept { Instance().Shutdown(); }
 
-            /// 函数功能：执行 Shutdown，完成本函数所属模块的单步操作。
-            /// 执行流程：
-            /// 1. 校验传入参数以及当前对象/线程状态；
-            /// 2. 按状态机规则获取必要的锁并更新内部数据；
-            /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-            /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-            /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-            /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
             void Shutdown() noexcept
             {
                 {
@@ -421,14 +409,6 @@ namespace go2cpp
             bool remove_from_parent{false};
         };
 
-        /// 函数功能：执行 AddBeforeDoneCallback，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         DoneSignal::CallbackId AddBeforeDoneCallback(
             std::function<void()> callback)
         {
@@ -468,14 +448,6 @@ namespace go2cpp
             return id;
         }
 
-        /// 函数功能：执行 RemoveBeforeDoneCallback，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] id 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         void RemoveBeforeDoneCallback(DoneSignal::CallbackId id) noexcept
         {
             if (id == 0)
@@ -486,28 +458,12 @@ namespace go2cpp
             before_done_callbacks.erase(id);
         }
 
-        /// 函数功能：执行 IsCanceled，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         bool IsCanceled() const noexcept
         {
             std::lock_guard<std::mutex> lock(mutex);
             return error != nullptr;
         }
 
-        /// 函数功能：执行 RemoveChildRaw，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] child 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         void RemoveChildRaw(const State *child)
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -521,14 +477,6 @@ namespace go2cpp
                 children.end());
         }
 
-        /// 函数功能：执行 RemoveChild，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] child 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         void RemoveChild(const std::shared_ptr<State> &child)
         {
             if (child)
@@ -537,14 +485,6 @@ namespace go2cpp
             }
         }
 
-        /// 函数功能：执行 DrainCancellation，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] work 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         static void DrainCancellation(std::vector<CancellationWork> work)
         {
             // 调用用户回调前先标记完整子树。Done 回调可以观察或等待后代；如果
@@ -647,14 +587,6 @@ namespace go2cpp
             }
         }
 
-        /// 函数功能：执行 AddChild，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] child 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         void AddChild(const std::shared_ptr<State> &child)
         {
             ErrorPtr inherited_error;
@@ -679,15 +611,6 @@ namespace go2cpp
                                     std::move(inherited_cause));
         }
 
-        /// 函数功能：执行 Cancel，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] requested_cause 调用方传入的参数，具体约束以头文件声明为准。
-        /// @param[in] deadline_error 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         void Cancel(ErrorPtr requested_cause, bool deadline_error = false)
         {
             std::vector<CancellationWork> work;
@@ -695,15 +618,6 @@ namespace go2cpp
             DrainCancellation(std::move(work));
         }
 
-        /// 函数功能：执行 CancelFromParent，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] inherited_error 调用方传入的参数，具体约束以头文件声明为准。
-        /// @param[in] inherited_cause 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         void CancelFromParent(ErrorPtr inherited_error, ErrorPtr inherited_cause)
         {
             std::vector<CancellationWork> work;
@@ -712,15 +626,6 @@ namespace go2cpp
             DrainCancellation(std::move(work));
         }
 
-        /// 函数功能：执行 Lookup，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] token 调用方传入的参数，具体约束以头文件声明为准。
-        /// @param[in] name 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         std::any Lookup(const void *token, const std::string &name) const
         {
             auto owner = const_cast<State *>(this)->shared_from_this();
@@ -763,14 +668,6 @@ namespace go2cpp
         thread_local std::vector<std::shared_ptr<Context::State>>
             t_state_release_queue;
 
-        /// 函数功能：完成 QueueStateParent 调用，读取或更新相关运行时状态。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-        /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-        /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-        /// @param[in] parent 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-        /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
         void QueueStateParent(std::shared_ptr<Context::State> parent) noexcept
         {
             if (parent)
@@ -781,14 +678,6 @@ namespace go2cpp
 
         struct StateDeleter
         {
-            /// 函数功能：执行 operator，完成本函数所属模块的单步操作。
-            /// 执行流程：
-            /// 1. 校验传入参数以及当前对象/线程状态；
-            /// 2. 按状态机规则获取必要的锁并更新内部数据；
-            /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-            /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-            /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-            /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
             void operator()(Context::State *state) const noexcept
             {
                 delete state;
@@ -807,14 +696,6 @@ namespace go2cpp
             }
         };
 
-        /// 函数功能：完成 MakeState 调用，读取或更新相关运行时状态。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-        /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-        /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-        /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-        /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-        /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
         std::shared_ptr<Context::State> MakeState()
         {
             return std::shared_ptr<Context::State>(new Context::State(),
@@ -868,28 +749,12 @@ namespace go2cpp
         std::vector<Action> pending_context_actions;
         DoneSignal completion;
 
-        /// 函数功能：执行 ContextCanceled，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         bool ContextCanceled() const noexcept
         {
             const auto context = context_state.lock();
             return context && context->IsCanceled();
         }
 
-        /// 函数功能：执行 Record，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] action 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         bool Record(UndoAction action, std::string *reason)
         {
             if (!action)
@@ -977,14 +842,6 @@ namespace go2cpp
             }
         }
 
-        /// 函数功能：执行 Mark，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         ContextRollback::Savepoint Mark() const noexcept
         {
             ContextRollback::Savepoint mark;
@@ -1031,14 +888,6 @@ namespace go2cpp
             return true;
         }
 
-        /// 函数功能：执行 RecordFailure，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] failure 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         void RecordFailure(std::exception_ptr failure) noexcept
         {
             if (!failure)
@@ -1073,14 +922,6 @@ namespace go2cpp
             }
         }
 
-        /// 函数功能：执行 Execute，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] extracted 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         void Execute(std::vector<Action> &extracted, const ErrorPtr &cause) noexcept
         {
             for (auto it = extracted.rbegin(); it != extracted.rend(); ++it)
@@ -1101,14 +942,6 @@ namespace go2cpp
             extracted.clear();
         }
 
-        /// 函数功能：执行 FinishPartial，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] remaining 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         bool FinishPartial(std::vector<Action> &remaining) noexcept
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1128,14 +961,6 @@ namespace go2cpp
             return false;
         }
 
-        /// 函数功能：执行 FinishFull，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         void FinishFull() noexcept
         {
             {
@@ -1150,14 +975,6 @@ namespace go2cpp
             detail::DoneSignalAccess::Signal(completion);
         }
 
-        /// 函数功能：执行 ClaimContextCancellation，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         void ClaimContextCancellation() noexcept
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1184,14 +1001,6 @@ namespace go2cpp
         // 回调尚未开始，因此等待 RollbackDone 不会和内部回调互相阻塞。
         void ClaimContextCancellationOnly() noexcept { ClaimContextCancellation(); }
 
-        /// 函数功能：执行 BeginManualRollback，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         bool BeginManualRollback(const ErrorPtr &cause) noexcept
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1217,14 +1026,6 @@ namespace go2cpp
             return true;
         }
 
-        /// 函数功能：执行 OnContextDone，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         void OnContextDone() noexcept
         {
             std::vector<Action> extracted;
@@ -1275,15 +1076,6 @@ namespace go2cpp
 
     // ContextRollback 的公开方法定义放在 Context::State 完整定义之后，
     // 这样回调只依赖自己的共享状态，不需要暴露 Context 的内部节点。
-    /// 函数功能：完成 ContextRollback 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] parent 调用方传入的参数，具体约束以头文件声明为准。
-    /// @param[in] rollback_on_cancel 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ContextRollback::ContextRollback(ContextPtr parent, bool rollback_on_cancel)
         : m_state(std::make_shared<State>())
     {
@@ -1329,14 +1121,6 @@ namespace go2cpp
         }
     }
 
-    /// 函数功能：完成 ContextRollback 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] other 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ContextRollback::ContextRollback(ContextRollback &&other) noexcept
     {
         std::lock_guard<std::mutex> lock(other.m_callback_mutex);
@@ -1371,14 +1155,6 @@ namespace go2cpp
         return *this;
     }
 
-    /// 函数功能：完成 DisarmCallback 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     void ContextRollback::DisarmCallback() noexcept
     {
         ContextPtr context;
@@ -1402,14 +1178,6 @@ namespace go2cpp
         }
     }
 
-    /// 函数功能：完成 RecordUndo 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] action 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     bool ContextRollback::RecordUndo(UndoAction action, std::string *reason)
     {
         if (!m_state)
@@ -1437,14 +1205,6 @@ namespace go2cpp
         return m_state->RecordWithCause(std::move(action), reason);
     }
 
-    /// 函数功能：完成 valid 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     bool ContextRollback::Savepoint::valid() const noexcept
     {
         const auto state = m_state.lock();
@@ -1467,27 +1227,11 @@ namespace go2cpp
         }
     }
 
-    /// 函数功能：完成 Mark 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ContextRollback::Savepoint ContextRollback::Mark() const noexcept
     {
         return m_state ? m_state->Mark() : Savepoint{};
     }
 
-    /// 函数功能：完成 RollbackTo 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] mark 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     bool ContextRollback::RollbackTo(const Savepoint &mark) noexcept
     {
         if (!m_state || mark.m_state.lock() != m_state)
@@ -1520,14 +1264,6 @@ namespace go2cpp
         return true;
     }
 
-    /// 函数功能：完成 Rollback 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] cause 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     bool ContextRollback::Rollback(ErrorPtr cause) noexcept
     {
         if (!m_state)
@@ -1601,14 +1337,6 @@ namespace go2cpp
         return true;
     }
 
-    /// 函数功能：完成 Commit 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     bool ContextRollback::Commit() noexcept
     {
         if (!m_state)
@@ -1667,14 +1395,6 @@ namespace go2cpp
         return committed;
     }
 
-    /// 函数功能：完成 status 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ContextRollback::Status ContextRollback::status() const noexcept
     {
         if (!m_state)
@@ -1694,54 +1414,22 @@ namespace go2cpp
         }
     }
 
-    /// 函数功能：完成 active 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     bool ContextRollback::active() const noexcept
     {
         return status() == Status::kActive;
     }
 
-    /// 函数功能：完成 committed 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     bool ContextRollback::committed() const noexcept
     {
         return status() == Status::kCommitted;
     }
 
-    /// 函数功能：完成 rolled_back 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     bool ContextRollback::rolled_back() const noexcept
     {
         const auto current = status();
         return current == Status::kRolledBack || current == Status::kFailed;
     }
 
-    /// 函数功能：完成 had_failure 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     bool ContextRollback::had_failure() const noexcept
     {
         if (!m_state)
@@ -1759,14 +1447,6 @@ namespace go2cpp
         }
     }
 
-    /// 函数功能：完成 failure 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     std::exception_ptr ContextRollback::failure() const noexcept
     {
         if (!m_state)
@@ -1846,14 +1526,6 @@ namespace go2cpp
         }
     }
 
-    /// 函数功能：完成 RollbackDone 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     DoneSignal ContextRollback::RollbackDone() const
     {
         if (m_state)
@@ -1893,14 +1565,6 @@ namespace go2cpp
             return actual_id;
         }
 
-        /// 函数功能：完成 Remove 调用，读取或更新相关运行时状态。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-        /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-        /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-        /// @param[in] id 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-        /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
         void TimerService::Remove(Id id)
         {
             if (id == 0)
@@ -1924,14 +1588,6 @@ namespace go2cpp
             m_cv.notify_all();
         }
 
-        /// 函数功能：完成 Run 调用，读取或更新相关运行时状态。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-        /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-        /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-        /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-        /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-        /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
         void TimerService::Run()
         {
             for (;;)
@@ -1974,52 +1630,20 @@ namespace go2cpp
 
     } // namespace
 
-    /// 函数功能：完成 Context 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] state 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     Context::Context(std::shared_ptr<State> state)
         : m_state(std::move(state)), m_done(m_state->done) {}
 
-    /// 函数功能：完成 AddBeforeDoneCallback 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     DoneSignal::CallbackId Context::AddBeforeDoneCallback(
         std::function<void()> callback)
     {
         return m_state->AddBeforeDoneCallback(std::move(callback));
     }
 
-    /// 函数功能：完成 RemoveBeforeDoneCallback 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] id 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     void Context::RemoveBeforeDoneCallback(DoneSignal::CallbackId id) const noexcept
     {
         m_state->RemoveBeforeDoneCallback(id);
     }
 
-    /// 函数功能：完成 Background 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ContextPtr Context::Background()
     {
         static const ContextPtr root = []
@@ -2031,14 +1655,6 @@ namespace go2cpp
         return root;
     }
 
-    /// 函数功能：完成 TODO 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ContextPtr Context::TODO()
     {
         static const ContextPtr root = []
@@ -2050,14 +1666,6 @@ namespace go2cpp
         return root;
     }
 
-    /// 函数功能：完成 MakeChild 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] parent 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ContextPtr Context::MakeChild(const ContextPtr &parent)
     {
         // Go 会拒绝 nil parent；转译后的 C++ 使用显式 root，使操作保持内存安全
@@ -2213,42 +1821,18 @@ namespace go2cpp
 
     bool Context::IsDone() const noexcept { return m_state->done.IsDone(); }
 
-    /// 函数功能：完成 Err 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ErrorPtr Context::Err() const
     {
         std::lock_guard<std::mutex> lock(m_state->mutex);
         return m_state->error;
     }
 
-    /// 函数功能：完成 Cause 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ErrorPtr Context::Cause() const
     {
         std::lock_guard<std::mutex> lock(m_state->mutex);
         return m_state->cause;
     }
 
-    /// 函数功能：完成 Deadline 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     std::optional<ContextTimePoint> Context::Deadline() const
     {
         std::lock_guard<std::mutex> lock(m_state->mutex);
@@ -2257,28 +1841,11 @@ namespace go2cpp
 
     bool Context::HasDeadline() const { return Deadline().has_value(); }
 
-    /// 函数功能：完成 LookupValue 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] token 调用方传入的参数，具体约束以头文件声明为准。
-    /// @param[in] name 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     std::any Context::LookupValue(const void *token, const std::string &name) const
     {
         return m_state->Lookup(token, name);
     }
 
-    /// 函数功能：完成 Value 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] key 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     std::any Context::Value(const std::string &key) const
     {
         return LookupValue(nullptr, key);
@@ -2288,42 +1855,18 @@ namespace go2cpp
 
     void Context::CancelDeadline() { m_state->Cancel({}, true); }
 
-    /// 函数功能：完成 SetNowFunctionForTesting 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] now 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     void Context::SetNowFunctionForTesting(NowFunction now)
     {
         std::lock_guard<std::mutex> lock(s_clock_mutex);
         s_now_function = std::move(now);
     }
 
-    /// 函数功能：完成 ResetNowFunctionForTesting 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     void Context::ResetNowFunctionForTesting()
     {
         std::lock_guard<std::mutex> lock(s_clock_mutex);
         s_now_function = {};
     }
 
-    /// 函数功能：完成 Now 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ContextTimePoint Context::Now()
     {
         NowFunction now;
@@ -2354,56 +1897,21 @@ namespace go2cpp
     {
         return Context::WithTimeout(parent, timeout);
     }
-    /// 函数功能：完成 WithRollback 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] parent 调用方传入的参数，具体约束以头文件声明为准。
-    /// @param[in] rollback_on_cancel 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ContextRollback WithRollback(const ContextPtr &parent, bool rollback_on_cancel)
     {
         return ContextRollback(parent, rollback_on_cancel);
     }
-    /// 函数功能：完成 WithValue 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] parent 调用方传入的参数，具体约束以头文件声明为准。
-    /// @param[in] key 调用方传入的参数，具体约束以头文件声明为准。
-    /// @param[in] value 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ContextPtr WithValue(const ContextPtr &parent, std::string key, std::any value)
     {
         return Context::WithValue(parent, std::move(key), std::move(value));
     }
 
-    /// 函数功能：完成 CanceledError 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ErrorPtr CanceledError()
     {
         static const ErrorPtr error = NewError("context canceled");
         return error;
     }
 
-    /// 函数功能：完成 DeadlineExceededError 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     ErrorPtr DeadlineExceededError()
     {
         static const ErrorPtr error = NewError("context deadline exceeded");

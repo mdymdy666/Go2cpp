@@ -1,3 +1,22 @@
+/**
+ * @file thread_policy.cpp
+ * @brief 线程策略实现：推导 P 数量与线程配置。
+ *
+ * ## 这个文件实现什么
+ *
+ * 把"该开多少个 worker"的决策从调度器里抽出来：
+ *
+ * - 优先用显式配置（`SchedulerConfig::processor_count`）；
+ * - 否则按硬件并发度推导；
+ * - 容器环境下要考虑 cgroup 的 CPU 限额（`nproc` 可能远大于实际配额）；
+ * - 可选的线程命名/亲和性设置。
+ *
+ * ## 为什么值得单独一层
+ *
+ * 这些逻辑高度平台相关（Linux cgroup、NUMA、实时系统要求都不同），塞进
+ * 调度器初始化会让那个函数变成一堆 `#ifdef`。单独成文件后，调度器只问
+ * "给我 P 的数量"，其余与它无关。
+ */
 #include "go2cpp/thread_policy.hpp"
 
 namespace go2cpp {
@@ -9,14 +28,6 @@ thread_local ThreadParticipationMode s_policy_participation =
 thread_local ThreadHookMode s_policy_hook = ThreadHookMode::kInherit;
 thread_local bool s_runtime_worker = false;
 
-/// 函数功能：完成 restore_policy 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] previous 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void restore_policy(const ThreadPolicySnapshot& previous) noexcept {
     s_policy_scheduler = previous.scheduler;
     s_policy_participation = previous.participation;
@@ -26,41 +37,16 @@ void restore_policy(const ThreadPolicySnapshot& previous) noexcept {
 
 }  // namespace
 
-/// 函数功能：完成 CurrentThreadPolicy 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ThreadPolicySnapshot CurrentThreadPolicy() noexcept {
     return ThreadPolicySnapshot{s_policy_scheduler, s_policy_participation,
                                s_policy_hook, s_runtime_worker};
 }
 
-/// 函数功能：完成 ThreadParticipatesInGMP 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool ThreadParticipatesInGMP() noexcept {
     return s_policy_scheduler != nullptr &&
            s_policy_participation == ThreadParticipationMode::kGmpEligible;
 }
 
-/// 函数功能：完成 ScopedThreadParticipation 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] mode 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ScopedThreadParticipation::ScopedThreadParticipation(
     scheduler::Scheduler* scheduler, ThreadParticipationMode mode) noexcept
     : m_previous(CurrentThreadPolicy()), m_active(true) {
@@ -78,27 +64,10 @@ ScopedThreadParticipation::ScopedThreadParticipation(
     s_runtime_worker = m_previous.runtime_worker;
 }
 
-/// 函数功能：完成 ScopedThreadParticipation 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] mode 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ScopedThreadParticipation::ScopedThreadParticipation(
     scheduler::Scheduler& scheduler, ThreadParticipationMode mode) noexcept
     : ScopedThreadParticipation(&scheduler, mode) {}
 
-/// 函数功能：完成 ScopedThreadParticipation 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ScopedThreadParticipation::~ScopedThreadParticipation() {
     if (m_active) {
         restore_policy(m_previous);
@@ -107,39 +76,15 @@ ScopedThreadParticipation::~ScopedThreadParticipation() {
 
 ThreadHookMode CurrentThreadHookMode() noexcept { return s_policy_hook; }
 
-/// 函数功能：完成 SetCurrentThreadHookMode 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] mode 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void SetCurrentThreadHookMode(ThreadHookMode mode) noexcept {
     s_policy_hook = mode;
 }
 
-/// 函数功能：完成 ScopedThreadHookMode 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] mode 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ScopedThreadHookMode::ScopedThreadHookMode(ThreadHookMode mode) noexcept
     : m_previous(CurrentThreadHookMode()), m_active(true) {
     SetCurrentThreadHookMode(mode);
 }
 
-/// 函数功能：完成 ScopedThreadHookMode 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ScopedThreadHookMode::~ScopedThreadHookMode() {
     if (m_active) {
         SetCurrentThreadHookMode(m_previous);
@@ -148,14 +93,6 @@ ScopedThreadHookMode::~ScopedThreadHookMode() {
 
 namespace thread_policy::detail {
 
-/// 函数功能：完成 EnterRuntimeWorker 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void EnterRuntimeWorker(scheduler::Scheduler* scheduler) noexcept {
     s_policy_scheduler = scheduler;
     s_policy_participation = scheduler != nullptr
@@ -164,28 +101,12 @@ void EnterRuntimeWorker(scheduler::Scheduler* scheduler) noexcept {
     s_runtime_worker = scheduler != nullptr;
 }
 
-/// 函数功能：完成 LeaveRuntimeWorker 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void LeaveRuntimeWorker() noexcept {
     s_policy_scheduler = nullptr;
     s_policy_participation = ThreadParticipationMode::kUnmanaged;
     s_runtime_worker = false;
 }
 
-/// 函数功能：完成 HookAllowed 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] process_enabled 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool HookAllowed(bool process_enabled) noexcept {
     switch (s_policy_hook) {
         case ThreadHookMode::kDisabled:

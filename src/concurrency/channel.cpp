@@ -1,3 +1,33 @@
+/**
+ * @file channel.cpp
+ * @brief Channel 与 Select 的实现（Go 风格的协程间通信）。
+ *
+ * ## 模块定位
+ *
+ * Channel 是运行时里**唯一同时承担同步与数据传递**的原语：它既可以当
+ * "队列"用（有缓冲），也可以当"会合点"用（无缓冲）。在 GMP 模型里它属于
+ * 用户态的同步设施，**不经过调度器内部队列** —— 等待方是 park 在自己的
+ * `ParkingCondition` 上，由 channel 在状态变化时主动唤醒。
+ *
+ * ## 这个文件承担什么
+ *
+ * 头文件 `channel.hpp` 定义了模板化的 `Channel<T>`（收发都在头里，因为要
+ * 按类型实例化）；本文件只放**与类型无关**的部分：
+ *
+ * - 一组错误构造器（closed / already-closed / would-block / nil / timeout）：
+ *   都返回**共享的静态 ErrorPtr**，让相同的错误可以按指针快速比较，
+ *   而不用比字符串；
+ * - `Select(...)`：多路复用核心，类型无关所以能从模板里抽出来。
+ *
+ * ## Select 的语义（与 Go 对齐）
+ *
+ * - 多个 case 同时就绪时**随机选一个**（用轮转游标近似公平，避免固定优先
+ *   级饿死后面的 case）；
+ * - 有 `default` 且无 case 就绪时立刻走 default，不阻塞；
+ * - 无 `default` 时注册到各 channel 的等待队列并 park，被任意一方唤醒后
+ *   抢占式地"取走"结果 —— 多个 channel 同时唤醒它时只有一个能拿到；
+ * - `Context` 取消与超时都会唤醒等待方并返回对应状态。
+ */
 #include "go2cpp/channel.hpp"
 
 #include <atomic>
@@ -8,14 +38,6 @@
 namespace go2cpp {
 namespace {
 
-/// 函数功能：完成 make_channel_error 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] message 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ErrorPtr make_channel_error(const char* message) noexcept {
   try {
     return NewError(message);
@@ -27,71 +49,57 @@ ErrorPtr make_channel_error(const char* message) noexcept {
 
 }  // namespace
 
-/// 函数功能：完成 ChannelClosedError 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ErrorPtr ChannelClosedError() noexcept {
   static const ErrorPtr error = make_channel_error("channel closed");
   return error;
 }
 
-/// 函数功能：完成 ChannelAlreadyClosedError 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ErrorPtr ChannelAlreadyClosedError() noexcept {
   static const ErrorPtr error = make_channel_error("channel already closed");
   return error;
 }
 
-/// 函数功能：完成 ChannelWouldBlockError 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ErrorPtr ChannelWouldBlockError() noexcept {
   static const ErrorPtr error = make_channel_error("channel operation would block");
   return error;
 }
 
-/// 函数功能：完成 ChannelNilError 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ErrorPtr ChannelNilError() noexcept {
   static const ErrorPtr error = make_channel_error("nil channel");
   return error;
 }
 
-/// 函数功能：完成 ChannelTimeoutError 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ErrorPtr ChannelTimeoutError() noexcept {
   static const ErrorPtr error = make_channel_error("channel operation timed out");
   return error;
 }
 
+/**
+ * @brief 在多个 channel 操作之间做多路复用（Go 的 `select`）。
+ *
+ * 主要功能：等待一组 case 中任意一个就绪，返回它的下标与结果；支持
+ * default 分支、超时与 `Context` 取消。
+ *
+ * step1: **校验与预处理** —— 拒绝空 case 表、拒绝"不可复制值"的 case
+ *        （那种情况应直接用 Send/Recv），确认至少有一个可用 case；
+ *        把相对超时换算成绝对 deadline（饱和加法，避免溢出成"已过期"）。
+ * step2: **探测阶段** —— 每轮用 `cursor` 轮转起始下标（近似随机，保证
+ *        公平），逐个调用 `probe()` 看是否已就绪；就绪则立即返回。
+ *        探测完检查 `Context` 是否已取消（与 Go 一致：就绪与取消之间存在
+ *        竞争，取消在"本轮无 case 获胜"之后才处理），再检查超时；
+ *        有 default 就走 default。
+ * step3: **注册阶段** —— 创建一个 `SelectWaitState` 并把所有 case arm 到
+ *        各自 channel 的等待队列上。任一 arm 失败或抛异常，必须
+ *        `Cancel()` + `disarm()` 完整回滚，否则会留下指向已返回 Select 的
+ *        悬空节点，下一次发送会去唤醒一个不存在的等待者。
+ * step4: **抢占结果** —— arm 之后要再 `Take()` 一次：在我们 arm 的同时
+ *        可能有 channel 已经就绪并选了我们，这次 Take 就是把那个结果拿
+ *        回来。Take 抛异常时不能当成"未发生"，要走统一拆除路径。
+ * step5: **挂起等待** —— 注册 `Context` 完成回调（回调里 `Notify`），
+ *        然后 park 直到被唤醒、超时或取消。
+ * step6: **拆除与返回** —— 无论从哪条路径返回，都要移除 Context 回调并
+ *        disarm 所有 case，保证不泄漏注册节点。
+ */
 SelectResult Select(const std::vector<SelectCase>& cases,
                     const ContextPtr& context,
                     std::optional<ContextDuration> timeout) {
@@ -125,6 +133,9 @@ SelectResult Select(const std::vector<SelectCase>& cases,
                            : std::nullopt;
   static std::atomic<std::size_t> cursor{0};
 
+  // step1 的一部分：统一的拆除器。Disarm 只负责清理，所以即使某个
+  // 用户提供的 case 在拆除时抛异常，也不能阻止其余 channel 的注册项
+  // 被移除 —— 否则会泄漏等待节点。
   const auto disarm = [](const std::vector<SelectCase>& select_cases,
                          const std::shared_ptr<detail::SelectWaitState>& state) {
     for (const auto& item : select_cases) {
@@ -139,6 +150,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
     }
   };
 
+  // step2 开始：主循环。每次重试都换一个轮转起点，近似 Go 的随机选择，
+  // 避免"永远从下标 0 开始"导致后面的 case 被饿死。
   for (;;) {
     const std::size_t offset = cursor.fetch_add(1, std::memory_order_relaxed);
     for (std::size_t n = 0; n < cases.size(); ++n) {
@@ -192,6 +205,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
               detail::ValueOperationError()};
     }
 
+    // step3 开始：注册阶段。为本次等待创建共享状态，然后把每个 case
+    // arm 到对应 channel 的等待队列上。任何一个失败都必须完整回滚。
     bool has_poll_case = false;
     auto wait_state = std::make_shared<detail::SelectWaitState>();
     try {
@@ -221,6 +236,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
               ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
 
+    // step4：arm 期间可能已经有 channel 就绪并选中了我们，
+    // 这里立即尝试把结果取走，避免多睡一轮。
     std::size_t selected_index = SelectResult::kNoSelection;
     SelectProbe selected_probe;
     bool take_failed = false;
@@ -251,6 +268,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
               ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
 
+    // step5：注册取消回调后挂起等待。回调里只做 Notify，
+    // 真正的状态判断留给被唤醒之后。
     DoneSignal::CallbackId callback_id = 0;
     if (context) {
       try {

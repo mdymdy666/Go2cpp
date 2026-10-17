@@ -1,3 +1,30 @@
+/**
+ * @file context.hpp
+ * @brief Context 与 DoneSignal：取消传播的基础设施。
+ *
+ * ## 模块定位
+ *
+ * `Context` 是 Go 里 `context.Context` 的对应物，解决的是**"一个任务链条上的
+ * 所有等待方如何同时被叫停"**：超时、显式取消、上游失败，都需要沿着调用链
+ * 传播到所有正在等待的 Fiber。
+ *
+ * 它位于**同步原语之上、业务代码之下**：不参与调度决策，但它的 `Done()`
+ * 信号会被 `Future`、`Channel`、`Timer` 等设施用来注册唤醒回调。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Context`：不可变的取消树节点（WithCancel / WithTimeout / WithDeadline
+ *   派生出子节点，父取消会级联到全部子节点）；
+ * - `DoneSignal`：完成信号，支持注册回调（`AddCallback`）与批量通知。
+ *   这是 Fiber 等待取消的挂载点；
+ * - 一组取消原因错误（`CanceledError` / `DeadlineExceededError`），
+ *   比较时按错误身份而非文本，避免把不同来源的取消混为一谈。
+ *
+ * ## 一个容易踩的点
+ *
+ * `DoneSignal` 的回调在**通知线程**上同步执行，所以回调里不能做阻塞操作 ——
+ * 典型写法是在回调里只 `Notify()` 一个等待原语，把真正的处理留给被唤醒方。
+ */
 #pragma once
 
 #include "go2cpp/error.hpp"

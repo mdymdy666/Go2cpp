@@ -15,6 +15,7 @@
 //
 // 每个场景独立成段，互不依赖；校验失败只记 ok=false，最后统一报告。
 
+
 namespace {
 
 using namespace std::chrono_literals;

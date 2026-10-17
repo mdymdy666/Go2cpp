@@ -1,3 +1,37 @@
+/**
+ * @file scheduler.cpp
+ * @brief GMP 调度器的完整实现（P/M/G 管理、窃取、park/wake、sysmon）。
+ *
+ * ## 这个文件实现什么
+ *
+ * 它是整个并发运行时最大也最核心的实现文件，把 `scheduler.hpp` 里的接口
+ * 落到具体的数据结构与算法上：
+ *
+ * - **P（Processor）**：逻辑处理器，每个 P 一条本地队列，`processor_count`
+ *   决定真正的并行度；
+ * - **M（Machine）**：OS 线程，从 P 队列取任务执行；阻塞时可以把 P 交出去
+ *   （handoff），由空闲 M 接管，避免一个阻塞调用拖死整个 P；
+ * - **G（Goroutine/Task）**：用户提交的工作单元，状态机是 `GState`。
+ *
+ * ## 关键机制
+ *
+ * 1. **本地队列 + work stealing**：线程优先取自己 P 的队列，空闲时从别的 P
+ *    "偷"一半（`take_victim`）。本地队列有长度上限，超了溢出到全局队列；
+ * 2. **park / wake**：Fiber 因等待而挂起时通过 `ParkingCondition` park，
+ *    唤醒方把它重新入队。这条路径的正确性直接决定死锁与否；
+ * 3. **sysmon**：Go 风格的阻塞监控，观察长时间阻塞的 M 并做记录/handoff；
+ * 4. **yield**：主动让出，走 `Task::defer_enqueue` → 本地队列**尾部**，
+ *    不经过全局锁。
+ *
+ * ## 性能相关的历史结论（避免重复踩坑）
+ *
+ * - 全局队列锁的临界区里含 `find` + 队列操作，**加自旋预算会让整体慢 36%** ——
+ *   自旋只适合极短临界区（见 `hybrid_mutex.hpp`）；
+ * - 把 `runnable` 预检查提到 park 之前会让忙等在窗口里空转，慢 37%；
+ * - 把窃取移到锁外会慢 34%。
+ *
+ * 这些结论都来自 `build-bench`（Release）实测，改动这块之前请先看 codex.md。
+ */
 #include "go2cpp/scheduler/scheduler.hpp"
 
 #include "go2cpp/fiber.hpp"
@@ -75,27 +109,11 @@ thread_local PId t_processor_id = 0;
 // region is destroyed can still clear the original M's state.
 thread_local MId t_blocking_machine_id = 0;
 
-/// 函数功能：完成 default_processor_count 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::size_t default_processor_count() noexcept {
     const auto count = std::thread::hardware_concurrency();
     return count == 0 ? 1U : static_cast<std::size_t>(count);
 }
 
-/// 函数功能：完成 steady_now_ns 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::int64_t steady_now_ns() noexcept {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -122,14 +140,6 @@ std::int64_t milliseconds_to_ns(
 // destruction from an in-flight external Task::Cancel without retaining the
 // Scheduler itself or holding an admission lock while entering the gate.
 struct TaskCancellationGate {
-    /// 函数功能：执行 TaskCancellationGate，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     explicit TaskCancellationGate(Scheduler* scheduler)
         : m_scheduler(scheduler) {}
 
@@ -137,15 +147,6 @@ struct TaskCancellationGate {
     Scheduler* m_scheduler;
 };
 
-/// 函数功能：完成 Task 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] function 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] options 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 Task::Task(Function function, TaskOptions options)
     : m_id(s_next_g_id.fetch_add(1, std::memory_order_relaxed)),
       m_function(std::move(function)),
@@ -154,124 +155,44 @@ Task::Task(Function function, TaskOptions options)
 
 Task::~Task() = default;
 
-/// 函数功能：完成 release_callable 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 Task::Function Task::release_callable() noexcept {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     return std::move(m_function);
 }
 
-/// 函数功能：完成 id 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 GId Task::id() const noexcept {
     return m_id;
 }
 
-/// 函数功能：完成 state 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 GState Task::state() const noexcept {
     return m_state.load(std::memory_order_acquire);
 }
 
-/// 函数功能：完成 queued 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::queued() const noexcept {
     return m_queued.load(std::memory_order_acquire);
 }
 
-/// 函数功能：完成 started 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::started() const noexcept {
     return m_started.load(std::memory_order_acquire);
 }
 
-/// 函数功能：完成 cancellation_requested 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::cancellation_requested() const noexcept {
     return m_cancel_requested.load(std::memory_order_acquire);
 }
 
-/// 函数功能：完成 task_class 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 TaskClassId Task::task_class() const noexcept {
     return m_options.task_class;
 }
 
-/// 函数功能：完成 failed 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::failed() const noexcept {
     return state() == GState::kFailed;
 }
 
-/// 函数功能：完成 failure 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::exception_ptr Task::failure() const {
     std::lock_guard<std::mutex> lock(m_failure_mutex);
     return m_failure;
 }
 
-/// 函数功能：完成 rethrow_failure 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Task::rethrow_failure() const {
     const auto error = failure();
     if (error) {
@@ -279,28 +200,12 @@ void Task::rethrow_failure() const {
     }
 }
 
-/// 函数功能：完成 terminal 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::terminal() const noexcept {
     const auto current = state();
     return current == GState::kDead || current == GState::kCancelled ||
            current == GState::kFailed;
 }
 
-/// 函数功能：完成 wait 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::wait() const {
     if (Scheduler::current_task().get() == this) {
         return false;
@@ -309,14 +214,6 @@ bool Task::wait() const {
     return m_completion_condition.wait(lock, [this] { return terminal(); });
 }
 
-/// 函数功能：完成 wait_for 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] timeout 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::wait_for(std::chrono::steady_clock::duration timeout) const {
     if (Scheduler::current_task().get() == this) {
         return false;
@@ -326,14 +223,6 @@ bool Task::wait_for(std::chrono::steady_clock::duration timeout) const {
         lock, timeout, [this] { return terminal(); });
 }
 
-/// 函数功能：完成 notify_terminal 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Task::notify_terminal() noexcept {
     if (m_completion_notified.exchange(true, std::memory_order_acq_rel)) {
         return;
@@ -347,14 +236,6 @@ void Task::notify_terminal() noexcept {
     m_completion_condition.notify_all();
 }
 
-/// 函数功能：完成 try_mark_queued 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::try_mark_queued() noexcept {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     if (m_state.load(std::memory_order_relaxed) != GState::kRunnable ||
@@ -366,14 +247,6 @@ bool Task::try_mark_queued() noexcept {
     return true;
 }
 
-/// 函数功能：完成 try_mark_queued_from_worker 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::try_mark_queued_from_worker() noexcept {
     bool expected_queued = false;
     if (!m_queued.compare_exchange_strong(expected_queued, true,
@@ -390,77 +263,29 @@ bool Task::try_mark_queued_from_worker() noexcept {
     return true;
 }
 
-/// 函数功能：完成 clear_queued 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Task::clear_queued() noexcept {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     m_queued.store(false, std::memory_order_release);
 }
 
-/// 函数功能：完成 defer_enqueue 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Task::defer_enqueue() noexcept {
     m_deferred_enqueue.store(true, std::memory_order_release);
 }
 
-/// 函数功能：完成 consume_deferred_enqueue 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::consume_deferred_enqueue() noexcept {
     return m_deferred_enqueue.exchange(false, std::memory_order_acq_rel);
 }
 
-/// 函数功能：完成 request_wake 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Task::request_wake() noexcept {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     m_wake_pending.store(true, std::memory_order_release);
 }
 
-/// 函数功能：完成 consume_wake 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::consume_wake() noexcept {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     return m_wake_pending.exchange(false, std::memory_order_acq_rel);
 }
 
-/// 函数功能：完成 try_register 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::try_register() noexcept {
     bool expected = false;
     return m_registered.compare_exchange_strong(expected, true,
@@ -468,26 +293,10 @@ bool Task::try_register() noexcept {
                                                 std::memory_order_acquire);
 }
 
-/// 函数功能：完成 registered 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::registered() const noexcept {
     return m_registered.load(std::memory_order_acquire);
 }
 
-/// 函数功能：完成 bind_owner 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] owner 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::bind_owner(const std::shared_ptr<const void>& owner) noexcept {
     if (!owner) {
         return false;
@@ -500,14 +309,6 @@ bool Task::bind_owner(const std::shared_ptr<const void>& owner) noexcept {
     return m_owner_anchor.get() == owner.get();
 }
 
-/// 函数功能：完成 owned_by 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] owner 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::owned_by(const std::shared_ptr<const void>& owner) const noexcept {
     if (!owner) {
         return false;
@@ -549,14 +350,6 @@ bool Task::prepare_enqueue(
     return true;
 }
 
-/// 函数功能：完成 promote_new 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::promote_new() noexcept {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     if (m_state.load(std::memory_order_relaxed) != GState::kNew) {
@@ -566,14 +359,6 @@ bool Task::promote_new() noexcept {
     return true;
 }
 
-/// 函数功能：完成 wake_for_scheduler 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 WakeAction Task::wake_for_scheduler() noexcept {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     const auto state = m_state.load(std::memory_order_relaxed);
@@ -596,26 +381,10 @@ WakeAction Task::wake_for_scheduler() noexcept {
     return WakeAction::kRejected;
 }
 
-/// 函数功能：完成 wake_for_io 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 WakeAction Task::wake_for_io() noexcept {
     return wake_for_wait();
 }
 
-/// 函数功能：完成 wake_for_wait 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 WakeAction Task::wake_for_wait() noexcept {
     // 与 park_for_scheduler() 共用转换锁。仅依赖原子状态不足以保护
     // wake_pending：park 可能先读到 Running 和 pending=false，随后 wake
@@ -640,14 +409,6 @@ WakeAction Task::wake_for_wait() noexcept {
     return WakeAction::kRejected;
 }
 
-/// 函数功能：完成 park_for_scheduler 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ParkAction Task::park_for_scheduler() noexcept {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
@@ -663,14 +424,6 @@ ParkAction Task::park_for_scheduler() noexcept {
 }
 
 
-/// 函数功能：完成 try_mark_running 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::try_mark_running() {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     if (!m_queued.load(std::memory_order_relaxed) ||
@@ -688,14 +441,6 @@ bool Task::try_mark_running() {
 }
 
 
-/// 函数功能：完成 mark_runnable 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::mark_runnable() {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     if (m_state.load(std::memory_order_relaxed) != GState::kWaiting) {
@@ -706,14 +451,6 @@ bool Task::mark_runnable() {
     return true;
 }
 
-/// 函数功能：完成 mark_yielded 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::mark_yielded() {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
@@ -727,14 +464,6 @@ bool Task::mark_yielded() {
     return true;
 }
 
-/// 函数功能：完成 mark_yielded_fast 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::mark_yielded_fast() noexcept {
     GState expected = GState::kRunning;
     if (!m_state.compare_exchange_strong(expected, GState::kRunnable,
@@ -746,14 +475,6 @@ bool Task::mark_yielded_fast() noexcept {
     return true;
 }
 
-/// 函数功能：完成 mark_waiting 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::mark_waiting() {
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
@@ -763,14 +484,6 @@ bool Task::mark_waiting() {
     return true;
 }
 
-/// 函数功能：完成 cancel 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::cancel() {
     std::shared_ptr<TaskCancellationGate> gate;
     {
@@ -787,14 +500,6 @@ bool Task::cancel() {
     return request_cancel();
 }
 
-/// 函数功能：完成 request_cancel 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] notify 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::request_cancel(bool notify) noexcept {
     bool became_terminal = false;
     {
@@ -827,14 +532,6 @@ bool Task::request_cancel(bool notify) noexcept {
     return true;
 }
 
-/// 函数功能：完成 cancel_if_runnable_unqueued 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Task::cancel_if_runnable_unqueued() noexcept {
     {
         std::lock_guard<std::mutex> lock(m_transition_mutex);
@@ -858,14 +555,6 @@ bool Task::cancel_if_runnable_unqueued() noexcept {
     return true;
 }
 
-/// 函数功能：完成 run 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Task::run() {
     if (!m_execution_claim.load(std::memory_order_acquire)) {
         return;
@@ -1044,14 +733,6 @@ public:
     static constexpr std::size_t kIncomingStripeCount = 16;
 
     struct Processor {
-        /// 函数功能：执行 Processor，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] processor_id 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         explicit Processor(PId processor_id) : id(processor_id) {}
 
         PId id;
@@ -1063,15 +744,6 @@ public:
     };
 
     struct Machine {
-        /// 函数功能：执行 Machine，完成本函数所属模块的单步操作。
-        /// 执行流程：
-        /// 1. 校验传入参数以及当前对象/线程状态；
-        /// 2. 按状态机规则获取必要的锁并更新内部数据；
-        /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-        /// @param[in] machine_id 调用方传入的参数，具体约束以头文件声明为准。
-        /// @param[in] processor_id 调用方传入的参数，具体约束以头文件声明为准。
-        /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-        /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
         explicit Machine(MId machine_id, PId processor_id)
             : id(machine_id), processor(processor_id) {}
 
@@ -1093,15 +765,6 @@ public:
         std::atomic<std::uint64_t> long_syscall_count{0};
     };
 
-    /// 函数功能：执行 Impl，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] requested 调用方传入的参数，具体约束以头文件声明为准。
-    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     explicit Impl(SchedulerConfig requested, Scheduler* scheduler)
         : config(normalize(requested)),
           owner_token(std::make_shared<const std::uint8_t>(0)),
@@ -1122,14 +785,6 @@ public:
         }
     }
 
-    /// 函数功能：执行 registry_stripe，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     static std::size_t registry_stripe(const Task& task) noexcept {
         // GId 单调递增，低位分片即可；条带数为 2 的幂，编译器会将
         // 模运算优化为按位与。
@@ -1169,14 +824,6 @@ public:
         }
     }
 
-    /// 函数功能：执行 normalize，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] requested 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     static SchedulerConfig normalize(SchedulerConfig requested) {
         if (requested.processor_count == 0) {
             requested.processor_count = default_processor_count();
@@ -1235,14 +882,6 @@ public:
     // Create one worker while mutex is held. The thread starts only after its
     // shared Machine object has been published, so snapshots and shutdown can
     // safely retain the same object even when later workers are appended.
-    /// 函数功能：完成 spawn_worker_locked 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     bool spawn_worker_locked(Scheduler* scheduler) {
         if (!scheduler || stopping.load(std::memory_order_acquire) ||
             machines.size() >= std::numeric_limits<std::size_t>::max() ||
@@ -1282,14 +921,6 @@ public:
         return true;
     }
 
-    /// 函数功能：执行 reap_dead_workers，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void reap_dead_workers() {
         std::vector<std::thread> retired;
         const auto self = std::this_thread::get_id();
@@ -1334,24 +965,8 @@ public:
         join_lock.unlock();
     }
 
-    /// 函数功能：执行 detached_machine_count_locked，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     // 统计当前仍处于 sysmon 逻辑解绑状态的 M。调用方必须持有 mutex；
     // 这样 sysmon 标记后、原 G 返回前的短竞态不会使用过期计数扩容。
-    /// 函数功能：完成 detached_machine_count_locked 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     std::size_t detached_machine_count_locked() const noexcept {
         std::size_t count = 0;
         for (const auto& machine : machines) {
@@ -1366,14 +981,6 @@ public:
     // 普通入队只按 runnable demand 扩容；每个仍 detached 的长阻塞 M
     // 预留一个替代槽，即便当前队列暂时为空，也不会让 P 长时间失去
     // 可运行的 M。
-    /// 函数功能：完成 maybe_grow 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     void maybe_grow(Scheduler* scheduler) {
         if (!scheduler) {
             return;
@@ -1460,14 +1067,6 @@ public:
     // sysmon 只做可逆的资源记账：它不会从别的线程跳转或终止正在
     // syscall 中的 C++ 栈。达到阈值后，M 继续执行原生调用，但从 P 的
     // attached 计数中移除，并按阻塞数申请替代 M。
-    /// 函数功能：完成 sysmon_pass 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     void sysmon_pass(Scheduler* scheduler) noexcept {
         if (!scheduler || !config.enable_sysmon) {
             return;
@@ -1526,14 +1125,6 @@ public:
         }
     }
 
-    /// 函数功能：执行 sysmon_loop，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] scheduler 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void sysmon_loop(Scheduler* scheduler) noexcept {
         while (!sysmon_stop.load(std::memory_order_acquire)) {
             // sysmon 的节拍等待不能争用调度器主锁。worker 在高负载下可能
@@ -1565,14 +1156,6 @@ public:
         sysmon_active.store(false, std::memory_order_release);
     }
 
-    /// 函数功能：执行 stop_sysmon，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] join 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void stop_sysmon(bool join) noexcept {
         sysmon_stop.store(true, std::memory_order_release);
         sysmon_wait_condition.notify_all();
@@ -1621,14 +1204,6 @@ public:
         }
     }
 
-    /// 函数功能：执行 emergency_enqueue_locked，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     void emergency_enqueue_locked(const std::shared_ptr<Task>& task) noexcept {
         if (!task) {
             return;
@@ -1642,14 +1217,6 @@ public:
         emergency_tail = task;
     }
 
-    /// 函数功能：执行 emergency_pop_locked，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     std::shared_ptr<Task> emergency_pop_locked() noexcept {
         if (!emergency_head) {
             return {};
@@ -1790,14 +1357,6 @@ public:
         collect_terminal_locked(deferred_destruction);
     }
 
-    /// 函数功能：执行 all_tasks_terminal_locked，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     bool all_tasks_terminal_locked() const {
         for (std::size_t stripe = 0; stripe < kRegistryStripeCount;
              ++stripe) {
@@ -1814,14 +1373,6 @@ public:
         return true;
     }
 
-    /// 函数功能：执行 finish_draining_locked，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     bool finish_draining_locked() noexcept {
         if (!draining.load(std::memory_order_acquire) ||
             !all_tasks_terminal_locked()) {
@@ -1896,14 +1447,6 @@ public:
     std::mutex join_mutex;
 };
 
-/// 函数功能：完成 Scheduler 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] config 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 struct Scheduler::Lifetime final {
     explicit Lifetime(Scheduler* value) : owner(value) {}
     mutable std::mutex mutex;
@@ -1963,14 +1506,6 @@ Scheduler::~Scheduler() {
     }
 }
 
-/// 函数功能：完成 start 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Scheduler::start() {
     std::unique_lock<std::mutex> lock(m_impl->mutex);
     if (m_impl->started.load(std::memory_order_acquire) ||
@@ -2217,26 +1752,10 @@ bool Scheduler::shutdown_for(
     return true;
 }
 
-/// 函数功能：完成 shutdown 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Scheduler::shutdown() {
     (void)shutdown_for(std::chrono::steady_clock::duration::max());
 }
 
-/// 函数功能：完成 is_running 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::is_running() const noexcept {
     return m_impl && m_impl->started.load(std::memory_order_acquire) &&
            !m_impl->draining.load(std::memory_order_acquire) &&
@@ -2319,14 +1838,6 @@ SchedulerObserverPtr Scheduler::observer() const noexcept {
     }
 }
 
-/// 函数功能：完成 spawn 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] function 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::shared_ptr<Task> Scheduler::spawn(Task::Function function) {
     return spawn(std::move(function), TaskOptions{});
 }
@@ -2346,14 +1857,6 @@ std::shared_ptr<Task> Scheduler::spawn(Task::Function function,
     return task;
 }
 
-/// 函数功能：完成 enqueue 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     if (!task || !m_impl) {
         return false;
@@ -2647,14 +2150,6 @@ bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
     return true;
 }
 
-/// 函数功能：完成 requeue_from_worker 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
     if (!task || current_scheduler() != this ||
         t_processor_id >= m_impl->processors.size()) {
@@ -2713,14 +2208,6 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
     return true;
 }
 
-/// 函数功能：完成 yield 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::yield(const std::shared_ptr<Task>& task) {
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get() || task->cancellation_requested() ||
@@ -2734,38 +2221,14 @@ bool Scheduler::yield(const std::shared_ptr<Task>& task) {
     return !task->cancellation_requested();
 }
 
-/// 函数功能：完成 yield_current 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::yield_current() {
     return yield(current_task());
 }
 
-/// 函数功能：完成 park 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::park(const std::shared_ptr<Task>& task) {
     return park_with_reason(task, SuspendReason::Park);
 }
 
-/// 函数功能：完成 park_wait 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get()) {
@@ -2817,14 +2280,6 @@ bool Scheduler::park_wait_for_cleanup(const std::shared_ptr<Task>& task) {
     return true;
 }
 
-/// 函数功能：完成 park_io 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get()) {
@@ -2882,38 +2337,14 @@ bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
     return !task->cancellation_requested();
 }
 
-/// 函数功能：完成 park_current 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::park_current() {
     return park(current_task());
 }
 
-/// 函数功能：完成 wake 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::wake(const std::shared_ptr<Task>& task) {
     return wake_or_cancel(task);
 }
 
-/// 函数功能：完成 wake_registered 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
     if (!task || !m_impl || !task->owned_by(m_impl->owner_token)) {
         return false;
@@ -2987,14 +2418,6 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
     return true;
 }
 
-/// 函数功能：完成 wake_io 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::wake_io(const std::shared_ptr<Task>& task) {
     if (!task || !task->owned_by(m_impl->owner_token)) {
         return false;
@@ -3143,14 +2566,6 @@ bool Scheduler::wake_io_batch(
     return fallback.empty();
 }
 
-/// 函数功能：完成 wake_or_cancel 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
     if (!task || !task->owned_by(m_impl->owner_token)) {
         return false;
@@ -3196,14 +2611,6 @@ bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
     return true;
 }
 
-/// 函数功能：完成 cancel 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::cancel(const std::shared_ptr<Task>& task) {
     if (!task || !m_impl || !task->owned_by(m_impl->owner_token)) {
         return false;
@@ -3252,14 +2659,6 @@ Scheduler::BlockingRegion::~BlockingRegion() noexcept {
     }
 }
 
-/// 函数功能：完成 enter_blocking 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::enter_blocking() noexcept {
     Scheduler* const scheduler = current_scheduler();
     if (scheduler == nullptr || !scheduler->m_impl || !current_task()) {
@@ -3299,14 +2698,6 @@ bool Scheduler::enter_blocking() noexcept {
     return entered;
 }
 
-/// 函数功能：完成 leave_blocking 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Scheduler::leave_blocking() noexcept {
     Scheduler* const scheduler = current_scheduler();
     if (scheduler == nullptr || !scheduler->m_impl ||
@@ -3350,50 +2741,18 @@ void Scheduler::leave_blocking_for(Scheduler* scheduler,
     }
 }
 
-/// 函数功能：完成 processor_count 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::size_t Scheduler::processor_count() const noexcept {
     return m_impl ? m_impl->processors.size() : 0;
 }
 
-/// 函数功能：完成 worker_count 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::size_t Scheduler::worker_count() const noexcept {
     return m_impl ? m_impl->active_workers.load(std::memory_order_acquire) : 0;
 }
 
-/// 函数功能：完成 runnable_count 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::size_t Scheduler::runnable_count() const noexcept {
     return m_impl ? m_impl->runnable.load(std::memory_order_acquire) : 0;
 }
 
-/// 函数功能：完成 global_runnable_count 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::size_t Scheduler::global_runnable_count() const noexcept {
     if (!m_impl) {
         return 0;
@@ -3402,14 +2761,6 @@ std::size_t Scheduler::global_runnable_count() const noexcept {
     return m_impl->global_queue.size();
 }
 
-/// 函数功能：完成 processors 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::vector<ProcessorSnapshot> Scheduler::processors() const {
     std::vector<ProcessorSnapshot> result;
     if (!m_impl) {
@@ -3425,14 +2776,6 @@ std::vector<ProcessorSnapshot> Scheduler::processors() const {
     return result;
 }
 
-/// 函数功能：完成 machines 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 
 std::vector<TaskSnapshot> Scheduler::DebugSnapshotTasks() const {
     std::vector<TaskSnapshot> result;
@@ -3490,40 +2833,16 @@ std::vector<MachineSnapshot> Scheduler::machines() const {
     return result;
 }
 
-/// 函数功能：完成 sysmon_running 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool Scheduler::sysmon_running() const noexcept {
     return m_impl && m_impl->sysmon_active.load(std::memory_order_acquire) &&
            !m_impl->sysmon_stop.load(std::memory_order_acquire);
 }
 
-/// 函数功能：完成 sysmon_pass_count 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::uint64_t Scheduler::sysmon_pass_count() const noexcept {
     return m_impl ? m_impl->sysmon_pass_count.load(std::memory_order_acquire)
                   : 0;
 }
 
-/// 函数功能：完成 metrics 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 SchedulerMetrics Scheduler::metrics() const noexcept {
     if (!m_impl) {
         return {};
@@ -3535,62 +2854,22 @@ SchedulerMetrics Scheduler::metrics() const noexcept {
             m_impl->metric_steal_pops.load(std::memory_order_acquire)};
 }
 
-/// 函数功能：完成 current_task 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::shared_ptr<Task> Scheduler::current_task() noexcept {
     return t_task;
 }
 
-/// 函数功能：完成 current_scheduler 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 Scheduler* Scheduler::current_scheduler() noexcept {
     return t_scheduler;
 }
 
-/// 函数功能：完成 current_machine_id 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 MId Scheduler::current_machine_id() noexcept {
     return t_machine_id;
 }
 
-/// 函数功能：完成 current_processor_id 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 PId Scheduler::current_processor_id() noexcept {
     return t_processor_id;
 }
 
-/// 函数功能：完成 worker_loop 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] opaque_machine 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     auto machine = std::static_pointer_cast<Impl::Machine>(opaque_machine);
     if (!machine) {
