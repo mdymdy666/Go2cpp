@@ -2517,13 +2517,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
             return false;
         }
     } else {
-#ifdef GO2CPP_COUNT_GLOBAL_LOCK
-        LockStatGuard admission_stat(m_impl->mutex);
-        std::unique_lock<std::mutex> admission_lock(m_impl->mutex,
-                                                    std::adopt_lock);
-#else
         std::unique_lock<std::mutex> admission_lock(m_impl->mutex);
-#endif
         if ((!m_impl->accepting.load(std::memory_order_acquire) && !drain_resume) ||
             m_impl->stopping.load(std::memory_order_acquire)) {
             task->clear_queued();
@@ -3757,7 +3751,15 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             // from this worker's local queue skips this global mutex entirely:
             // the worker owns the execution claim and the local queue lock has
             // already made the node invisible to stealers.
+#ifdef GO2CPP_COUNT_GLOBAL_LOCK
+            LockStatGuard admission_stat(m_impl->mutex);
+            std::unique_lock<std::mutex> admission_lock(m_impl->mutex,
+                                                        std::adopt_lock);
+            const auto stat_lock = &admission_lock;
+            (void)stat_lock;
+#else
             std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
+#endif
             if (!m_impl->stopping.load(std::memory_order_acquire)) {
                 const bool prefer_class =
                     machine->last_task_class.load(std::memory_order_relaxed) != 0 &&
@@ -4064,7 +4066,12 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             own_processor.state.store(PState::kIdle,
                                       std::memory_order_release);
         }
+#ifdef GO2CPP_COUNT_GLOBAL_LOCK
+        LockStatGuard park_stat(m_impl->mutex);
+        std::unique_lock<std::mutex> lock(m_impl->mutex, std::adopt_lock);
+#else
         std::unique_lock<std::mutex> lock(m_impl->mutex);
+#endif
         if (m_impl->finish_draining_locked()) {
             lock.unlock();
             m_impl->condition.notify_all();

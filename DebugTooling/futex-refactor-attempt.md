@@ -417,3 +417,65 @@ if (m_impl->runnable.load(std::memory_order_acquire) != 0) {
 **未做**：真正有效的方向是**重构 admission 事务本身**（让"本地队列入队"完全脱离全局锁的
 保护范围，同时保持 `accepting`/`stopping` 的检查语义），这需要重新设计锁协议，
 不是局部调整能达成的 —— 超出本次任务时间预算，应作为独立的、有护栏支撑的重构任务。
+
+---
+
+## 2026-10-17 24:00–24:30：**锁统计数据到手 —— 瓶颈是持有时长，不是争用**
+
+把插桩从 `emergency` 稀有路径移到 `worker_loop` 的两个真正热点（找活的 `admission_lock`、
+park 的 `lock`）后，终于拿到了数据（`build-profile` 带 `-DGO2CPP_COUNT_GLOBAL_LOCK`）：
+
+| 指标 | workers=1 | **workers=4** |
+|---|---:|---:|
+| 每任务锁获取次数 | 0.06 | **1.02** |
+| 每次**等待** | 76.5 ns | 1,182.3 ns |
+| 每次**持有** | 7,453.2 ns | **30,542.0 ns** |
+| 等待/持有 | 0.01 | **0.04** |
+| 锁时间占总耗时 | 14.5% | **323.8%** |
+
+### 结论：**瓶颈是「持有时长」，不是「争用」**
+
+**每次持有 30 µs，而等待只有 1.2 µs —— 等待/持有 = 0.04。**
+
+这意味着：worker 抢锁几乎不用等，但**一旦拿到锁就持有 30 µs**。4 个 worker 累加起来的
+锁时间（323.8%）远超总耗时，说明这把锁是吞吐的绝对瓶颈。
+
+### 这解释了之前两次失败的全部原因
+
+| 尝试 | 为什么失败 |
+|---|---|
+| 加自旋预算 | 自旋只能缓解"抢不到"，对"持有太久"毫无作用，反而浪费 CPU |
+| park 前 runnable 预判 | 预判没有缩短任何临界区，只多加了一次判断 |
+
+**"加自旋"和"预判"都是在优化错误的维度。** 真正的杠杆是**缩短临界区**。
+
+### 30 µs 的临界区里在做什么（推断，待验证）
+
+`worker_loop` 找活的 `admission_lock` 内部依次做：
+1. `emergency_pop_locked()`
+2. `take_local`（拿 `own_processor.mutex`）
+3. `take_global`
+4. **work stealing** —— 遍历所有 P，对每个 victim 拿 `victim.mutex` 再检查队列
+
+第 4 步是唯一"长度随并发度增长"的操作：4 个 P 时要遍历并抢最多 3 把 victim 锁。
+这能同时解释两件事：
+- 为什么 `workers=1` 时持有只有 7.4 µs（`processors.size() > 1` 为假，**根本不走 steal**）；
+- 为什么 `workers=4` 时持有暴涨到 30 µs。
+
+### 下一步的正确方向
+
+**把 work stealing 移出 `admission_lock`**：
+- 先只持 `admission_lock` 做 `emergency` + `take_global` + 认领，然后放锁；
+- 再在**锁外**做 stealing（它本来就只操作 `victim.mutex`，不需要全局锁保护）；
+- 需要重新论证：认领事务（`runnable` 计数 + `try_mark_running`）与 steal 之间的顺序，
+  以及 `stopping` 检查的时机。
+
+这是一个**局部但需要谨慎设计**的改动，不是"调参数"。本轮时间不够做安全实现，
+所以只提交数据与结论 —— **但这是本次性能任务最重要的产出：方向被数据钉死了。**
+
+### 插桩现在的位置（默认关闭，零影响）
+
+- `worker_loop` 找活的 `admission_lock`；
+- `worker_loop` park 的 `lock`；
+- 计数器在 `go2cpp::scheduler::profiling` 命名空间，可由外部读取；
+- 开关：`-DGO2CPP_COUNT_GLOBAL_LOCK`。
