@@ -123,3 +123,86 @@ N 个线程反复 lock/unlock 同一把 `sync::Mutex`。
 两者的差别正好说明：**等待原语的优化只在"等待本身是瓶颈"时有效**。
 `ParkingCondition` 的基准场景（多等待者轮流被唤醒）符合这个条件；
 `sync::Mutex` 的基准场景（争用同一把锁）不符合。
+
+---
+
+## 2026-10-17 21:00–21:45：把 `m_impl->mutex` 换成 `HybridMutex` 的尝试（失败，已回退）
+
+使用者同意继续优化残余的 2.81x（瓶颈已定位为全局 `m_impl->mutex`）。
+方案是把它换成本项目的 `core::HybridMutex`（`atomic_flag` 自旋 + `std::mutex` 慢路径）。
+
+### 卡住的第一个障碍：接口不兼容
+
+`ParkingCondition::wait` 的签名写死了 `std::unique_lock<std::mutex>&`：
+
+```cpp
+std::unique_lock<std::mutex> lock(m_impl->mutex);   // scheduler.cpp:2070
+m_impl->condition.wait(lock, terminal);
+```
+
+换成 `HybridMutex` 后 `unique_lock<HybridMutex>` 传不进去。
+所以必须先**把 `ParkingCondition` 的等待接口模板化**，让它接受任意锁类型。
+
+### 模板化改造（已完成但引入回归）
+
+把 `wait` / `wait_for` / `wait_until` 改成 `template <typename Lock>`，
+把 `WaitOnce` 的 `std::unique_lock<std::mutex>&` 参数改为 `std::function<void()> unlock` 回调，
+并约定**`WaitOnce` 返回时外部锁保持解锁**（由模板自己 `lock()`）。
+
+编译通过，`ParkingCondition` 的 6 场景专项护栏也 **`failures=0`**。
+但**集成测试失败**：
+
+- `go2cpp_fiber_local_full` — Failed
+- `go2cpp_io_hook_full` — **Subprocess aborted**
+
+**已按红线回退**（`parking_condition.hpp` / `.cpp` 恢复到 `a564663`），
+回退后 **ctest 100% passed, 80/80, 35.43 s**。
+
+### 失败原因（我的推断，未查证）
+
+护栏只覆盖了 `ParkingCondition` 自身的语义，但集成路径上有我没考虑到的锁状态依赖：
+
+1. **`WaitOnce` 的既有契约是「返回时已加锁」**（因为原实现把锁交给 `cv.wait`，唤醒后 cv 会重新加锁）；
+   我改成"返回时保持解锁"，但 `WaitOnce` 内部的 `cleanup()` 与末尾的 `predicate()` 检查
+   **仍然假设外部锁是持有的**；
+2. `wait` 模板里的 `lock.lock()` 与 `WaitNative`/`WaitManaged` 内部的状态可能重复加锁或漏解锁，
+   在 `io_hook_full` 这种混合路径上触发崩溃；
+3. **护栏不够**：`test_parking_condition_stress.cpp` 测的是"ParkingCondition 作为独立原语"的行为，
+   没有覆盖"被调度器当作 condition 使用时与外部锁的交互"。
+
+### 从这次失败得到的三条实际教训
+
+1. **`cmake --build <dir> --parallel` 的默认 target 不含所有库** —— 我一度以为"构建成功"，
+   实际上 `libgo2cpp_scheduler.so` 根本没重编（时间戳停在 17:27）。
+   **必须显式 `--target go2cpp_scheduler`**，否则改动不生效还会误导判断；
+2. **改锁契约等于改所有调用方的隐含假设**。`ParkingCondition` 的 `wait` 系列是模板，
+   但 `WaitOnce` 是普通函数，它的锁契约是隐式的、没有类型系统保护；
+3. **护栏的覆盖面比覆盖面"看起来"的要窄**：独立原语测试全绿，集成照样崩。
+
+### 下一步（如果要继续）
+
+- **不要再用"改 WaitOnce 契约"这种方式**。更稳的做法：
+  给 `HybridMutex` 加一个**暴露内部 `std::mutex` 的适配层**，让 `condition` 继续用
+  `unique_lock<std::mutex>`，但**自旋发生在获取这把内部 mutex 之前**：
+  ```cpp
+  class SpinBackedMutex {
+      std::atomic_flag m_spin;
+      std::mutex m_native;      // 仍然暴露给 condition 用
+  public:
+      std::mutex& native() noexcept { return m_native; }
+      // 自旋获取 m_spin，失败再 m_native.lock()
+  };
+  ```
+  但这条路要保证"自旋成功后不再阻塞在 m_native 上"，语义需要重新设计，工作量不低于模板化；
+- **或者放弃换锁，改缩短持有时间**：把 `condition` 的 predicate 计算移到锁外、
+  把 admission 事务拆成"锁内只做入队/认领"+"锁外唤醒"。这条路不碰锁类型，风险低得多。
+
+### 本次净产出
+
+| 项 | 状态 |
+|---|---|
+| 残余瓶颈定位（全局 `m_impl->mutex`，P=1/P=4 倍率接近）| ✅ 已记录 |
+| `ParkingCondition` 模板化 | ❌ **失败，已完整回退** |
+| 代码状态 | 回到 `a564663`，ctest 80/80 |
+| 失败分析 | ✅ 本文档（推断 + 三条实际教训）|
+| 下一步方案 | ✅ 两条（SpinBackedMutex 适配层 / 缩短持有时间）|

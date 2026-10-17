@@ -7706,3 +7706,29 @@ condition 换 futex 后 4 worker 仍 2.81x。用 benchmark 第 6 参数解耦 pr
 
 **最有价值的经验**：不要把「等待原语」和「锁交接逻辑」混为一谈 —— 前者只在「等待本身是瓶颈」时有效
 （ParkingCondition 的基准），后者在多线程争用时才是关键（sync::Mutex 的自旋额度、调度器的全局锁）。
+
+---
+
+## 2026-10-17 21:45：替换 m_impl->mutex 尝试失败（已回退）
+
+使用者同意继续优化残余 2.81x。方案：把全局 `m_impl->mutex`（`std::mutex`）换成本项目的
+`core::HybridMutex`（自旋 + std::mutex 慢路径）。
+
+**卡在两个障碍上**：
+1. `ParkingCondition::wait` 签名写死 `unique_lock<std::mutex>`，换锁前必须先模板化它；
+2. 模板化后我把 `WaitOnce` 的锁契约从「返回时已加锁」改成「返回时保持解锁」，
+   编译通过、`ParkingCondition` 的 6 场景护栏全绿，但**集成测试崩溃**
+   （`fiber_local_full` Failed、`io_hook_full` Subprocess aborted）。
+
+**已按红线回退**，ctest 恢复 80/80。
+
+**三条实际教训**：
+1. **`cmake --build <dir> --parallel` 的默认 target 不含所有库** —— 我一度以为构建成功，
+   实际 `libgo2cpp_scheduler.so` 时间戳停在 17:27，改动根本没编进去。必须显式 `--target`；
+2. **改锁契约 = 改所有调用方的隐含假设**。`WaitOnce` 是普通函数，它的锁契约没有类型保护，
+   护栏也测不到；
+3. **护栏覆盖面比看起来窄**：独立原语全绿，集成照样崩。
+
+**下一步两条路**（都不碰 `WaitOnce` 契约）：① 给 HybridMutex 加"暴露内部 std::mutex"的适配层，
+让 condition 继续用 `unique_lock<std::mutex>` 而自旋发生在获取它之前；
+② 放弃换锁，改缩短持有时间（predicate 移锁外 / admission 拆分）。**推荐 ②**，风险低得多。
