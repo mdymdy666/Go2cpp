@@ -39,6 +39,7 @@ void run_debug_sync_tests();
 void run_debug_lock_selector_tests();
 void run_debug_events_tests();
 void run_debug_breakpoints_tests();
+void run_debug_signal_dump_tests();
 
 /**
  * @brief 统一运行默认测试集并根据过滤器选择测试模块。
@@ -92,6 +93,7 @@ int main() {
     if (selected("debug_lock_selector")) run_debug_lock_selector_tests();
     if (selected("debug_events")) run_debug_events_tests();
     if (selected("debug_breakpoints")) run_debug_breakpoints_tests();
+    if (selected("debug_signal_dump")) run_debug_signal_dump_tests();
 #ifdef GO2CPP_TEST_HOOK
     if (selected("hook")) run_hook_tests();
 #endif

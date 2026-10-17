@@ -37,6 +37,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_lock_selector.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_events.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_breakpoints.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_signal_dump.cpp
     )
     target_link_libraries(go2cpp_tests PRIVATE go2cpp_runtime)
     target_include_directories(go2cpp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
