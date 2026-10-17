@@ -1339,6 +1339,15 @@ public:
         if (!scheduler) {
             return;
         }
+        // 诊断旁路（默认不生效）：GO2CPP_NO_GROW=1 时直接跳过维护，
+        // 用于判断 maybe_grow/reap_dead_workers 是否是 worker 劣化的来源。
+        static const bool no_grow = [] {
+            const char* v = std::getenv("GO2CPP_NO_GROW");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (no_grow) {
+            return;
+        }
         if (!started.load(std::memory_order_acquire) ||
             draining.load(std::memory_order_acquire) ||
             stopping.load(std::memory_order_acquire)) {
