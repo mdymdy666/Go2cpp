@@ -8862,3 +8862,168 @@ h2c server / client | 157 / 161 | 与 curl(nghttp2) / Python 手写服务端双�
 5. **优先级**：PRIORITY 能解析但不参与调度（RFC 9113 已弃用）；
 6. **服务器推送 API**：PUSH_PROMISE 能解析，无推送接口；
 7. **会话复用 / 0-RTT**：未做。
+
+---
+
+## 2026-10-17 高危漏洞：`os::File` 放行了所有会阻塞的 fd（已修复）
+
+> 提交：`f57df31`（commit message 是简版，完整说明在本节）
+
+### 漏洞
+
+`os::File` 的读写走**裸 `syscall(SYS_read/SYS_write/...)`** 绕开 Hook。这个设计的前提是
+「只有普通文件能进来」—— 普通文件 IO 在内核同步完成、不会 `EAGAIN`。
+
+但原 `Adopt` / `Open` **只拒绝 socket**，于是下列 fd 全部放行，而它们在上面 `Read`
+会**真阻塞、卡死整个 worker 线程**（该 P 上所有 Fiber 停摆）：
+
+| fd 类型 | `st_mode & S_IFMT` | Hook 接管 | 修复前 |
+|---|---|---|---|
+普通文件 | `S_IFREG` | 否 | 接受（正确）|
+**FIFO / pipe** | `S_IFIFO` | 否 | ⚠️ 接受 |
+**eventfd / timerfd / signalfd** | **`0`** | 否 | ⚠️ 接受 |
+**字符设备**（`/dev/tty` 等）| `S_IFCHR` | 否 | ⚠️ 接受 |
+socket | `S_IFSOCK` | 是 | 拒绝（正确）|
+
+**与 socket 完全同类的风险，但 socket 被拦了、这些没拦。**
+
+### 为什么必须用白名单，不能用黑名单（本轮最有价值的知识点）
+
+Linux 的 `anon_inodefs`（`eventfd`/`timerfd`/`signalfd`）**不给 `st_mode` 类型位**：
+
+```
+eventfd   st_mode=0000600   S_IFMT=0   ISREG=0 ISFIFO=0 ISSOCK=0 ISCHR=0
+timerfd   st_mode=0000600   S_IFMT=0   ISREG=0 ISFIFO=0 ISSOCK=0 ISCHR=0
+signalfd  st_mode=0000600   S_IFMT=0   ...
+```
+
+**任何基于 `S_ISxxx` 的黑名单都必然漏掉它们**，而它们恰好都是会阻塞的 fd。
+所以只能反过来：**只接受 `S_ISREG`**，让 `S_IFMT == 0` 天然被排除。
+
+### 修法（三个入口全覆盖）
+
+```cpp
+if (S_ISSOCK(info.st_mode)) { status.code = OsError::kIsSocket; return status; }
+if (!S_ISREG(info.st_mode)) { status.code = OsError::kNotRegularFile; return status; }
+```
+
+- `kIsSocket` **保留** —— "这是 socket"比"这不是普通文件"对使用者更有用
+- 新增 `OsError::kNotRegularFile`，`ToString` 返回 `"not-a-regular-file"`
+- **`RawOpen` 补 `O_NONBLOCK`** —— 这一条比上面更隐蔽（见下）
+
+`Create` 无需单独修：它只有 4 行，`return Open(path, flags, mode, out);`，
+**完全走 `Open` 路径**，自动继承校验。用 `grep 'm_fd ='` 核对过：只有 `Open` 与 `Adopt`
+会设置新 fd，公开工厂只有 3 个（`Open` / `Create`→`Open` / `Adopt`），**没有第四条路**。
+
+### 比「没校验」更隐蔽的一层：`RawOpen` 缺 `O_NONBLOCK`
+
+`open("/tmp/some_fifo")` 在无写端时会**阻塞在 `open` 本身**，
+**根本到不了后面的 `fstat` 校验** —— 所以只加校验是不够的。
+
+加 `O_NONBLOCK`（对普通文件是 no-op，POSIX 保证）后：
+
+```
+Open(FIFO)   -> not-a-regular-file, 耗时 0 ms
+Create(FIFO) -> not-a-regular-file, 耗时 0 ms
+```
+
+### 验证（全部实测，不是推断）
+
+**9 种 fd 光谱**（逐一断言 `getsockopt` / `S_IFMT` / `Adopt` 结果与错误码）：
+
+```
+普通文件        ISREG    ENOTSOCK     接受    -
+FIFO            ISFIFO   ENOTSOCK     拒绝    not-a-regular-file
+pipe 读端       ISFIFO   ENOTSOCK     拒绝    not-a-regular-file
+/dev/urandom    ISCHR    ENOTSOCK     拒绝    not-a-regular-file
+eventfd         0        ENOTSOCK     拒绝    not-a-regular-file
+timerfd         0        ENOTSOCK     拒绝    not-a-regular-file
+signalfd        0        ENOTSOCK     拒绝    not-a-regular-file
+AF_UNIX socket  ISSOCK   SOCK_STREAM  拒绝    is-socket
+AF_INET socket  ISSOCK   SOCK_STREAM  拒绝    is-socket
+```
+
+**Hook 开关与 os 正交**（实测）：关闭 `kRead` 后 `os::File` 仍能正常 `Open`+`Read`
+（走裸 syscall，完全不经过 Hook）；`kClose` 被硬拒绝（预期）。
+
+**`readdir` 走 `getdents64` 已用 strace 实证**：
+```
+getdents64 调用次数 = 2
+getdents   调用次数 = 0
+read       调用次数 = 9    ← 全部是 ELF 加载器在读共享库（ELF magic），与目录遍历无关
+```
+所以 `os::Dir` 用 libc 的 `opendir`/`readdir` 是**正确**的：底层不发 `read`，Hook 碰不到它。
+
+### 反思（这是本轮最重要的教训）
+
+**这个漏洞是我上一轮验收 os 模块时漏掉的。**
+
+当时看的是「11 个测试场景通过」，**没有做 fd 类型光谱这种系统性探查** ——
+所以只看到「普通文件读写正常」，看不到「FIFO/eventfd 会卡死 worker」。
+
+**边界正确性不能靠「正向用例通过」证明，得靠系统性枚举。**
+这与之前状态机那个「84 组合穷举矩阵」是同一个道理 ——
+**当时对状态机做了，对 fd 类型没做。**
+
+### 一个构建陷阱（留给后来者）
+
+`cmake --build --target <test>` **不会顺带重编它链接的库**（如果测试是直接编译源文件）。
+所以改了 `src/os/file.cpp` 之后，**必须单独 `--target go2cpp_os` 建库**，
+否则手工跑探针时链接的是旧 `.so`，会看到 `unknown` 之类的假象。
+
+### 顺带修的既有 flaky
+
+`example/concurrency/scheduler_demo.cpp` 偶发失败：`worker_count=2` 而配置是 3。
+连跑 3 次全过 → **是测试的时序假设问题**，不是调度器缺陷：`start()` 里的工作线程是
+**异步创建**的，紧接着查数量可能少 1~2 个。加了一个有界等待（最多 100×10ms）。
+
+---
+
+## 2026-10-17 `*_f` 原始调用 API（19 个）
+
+> 提交：`b2af05b`
+
+使用者的架构决策：从「运行时配置开关」转向「显式 API 区分」。
+
+```
+read_f / readv_f / recv_f / recvfrom_f
+write_f / writev_f / send_f / sendto_f
+connect_f / accept_f
+sleep_f
+poll_f / select_f / epoll_wait_f
+close_f / shutdown_f / fcntl_f / dup_f / dup2_f
+```
+
+`_f` = **raw / non-hooked**。头文件明确写了 **「`_f` 不代表更快」** ——
+它只是"不参与协程调度"。在 Fiber 里调 `read_f` 会**真的阻塞整个 worker 线程**。
+
+### 为什么比配置开关好
+
+| 维度 | 运行时开关 | `*_f` |
+|---|---|---|
+可见性 | 运行时才知道 | **编译期可见** |
+作用域 | **进程级全局** | 只影响显式调用的那一处 |
+遗忘风险 | 改了忘恢复 → 全程序静默变慢 | 不存在 |
+普通线程 | 需额外判断 | **同一 API 处处可用** |
+
+### 决定性验证
+
+```
+[hook-raw] 场景3: read_f 阻塞期间心跳增量 = 0（阻塞时预期 < 8）
+```
+200ms 观察窗内心跳**完全没动** —— 证明 `read_f` 真把 worker 卡住了。
+对比 hook 版 `read` 会 park，心跳会走 15~20 次。**一个数字分清了两种语义。**
+
+用 `SO_RCVTIMEO` 设 200ms 超时，既证明真阻塞过、又不挂死测试。
+
+### 开关已按使用者要求降级
+
+`SetOpEnabled` 加了 `@warning`：有了 `*_f` 之后，进程级全局开关是**危险且不必要的**
+（编译期不可见 / 影响所有线程 / 容易忘恢复），保留**只为诊断便利**。
+开关行为本身**完全未动**。
+
+### 附带发现的已有不一致
+
+`hook.enable_shutdown` 配置项存在，但 `shutdown` **从来没有被 hook**
+（`Originals` 里没有 `m_shutdown`）—— 对 `shutdown` 设开关是**无效的**。
+不是本次引入的，只在 `shutdown_f` 注释里说明了事实。
