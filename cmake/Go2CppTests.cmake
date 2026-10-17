@@ -99,6 +99,14 @@ if (GO2CPP_BUILD_TESTS)
         -O2 -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_timer_stress COMMAND go2cpp_timer_stress)
     set_tests_properties(go2cpp_timer_stress PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_state_machine
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_state_machine.cpp)
+    target_link_libraries(go2cpp_state_machine PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_state_machine PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_state_machine COMMAND go2cpp_state_machine)
+    set_tests_properties(go2cpp_state_machine PROPERTIES TIMEOUT 300)
     set_tests_properties(go2cpp_high_load_stress PROPERTIES TIMEOUT 180)
 endif()
 

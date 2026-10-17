@@ -8032,3 +8032,46 @@ multimap 删除。**池化选错了优化点。**
 
 必须先确认 443 ns 里有多少是分配/析构。如果分配占比很低（当前结果暗示如此），
 那么无论用 `allocate_shared` 还是分档池都不会有效果 —— 应先测分配占比，再决定。
+
+---
+
+## 2026-10-17 方向一：状态机审计 + 边界测试
+
+### 审计方法与结论
+
+对 7 组状态机（`GState`/`MState`/`PState`/`FiberState`/`TimerState`/`WaitStatus`/
+`TimerRepeatMode`）做静态审计，重点是 GState 的 14 处 `m_state.store()`。
+
+**结论：14 处赋值全部具备「前置状态检查 + `m_transition_mutex` 保护」，未发现
+非法转换、终态后误操作或漏加锁的路径。**
+
+逐处核对了入口条件，例如：
+- `promote_new`：要求 `state == kNew`；
+- `try_mark_running`：要求 `kRunnable && queued && !execution_claim`；
+- `mark_running`/`mark_waiting`：要求 `state == kRunning`；
+- `cancel_if_runnable_unqueued`：要求 `kRunnable && !queued && !claimed && !started`；
+- trampoline 终态：在 `m_transition_mutex` 内按 `FiberState` 决定 Dead/Cancelled/Failed。
+
+**这是一个正面结论**：状态机的防护是完备的。但「代码看起来对」不等于「行为确实对」，
+所以补了行为测试。
+
+### 新增 `tests/concurrency/test_state_machine.cpp`（已注册 CMake）
+
+7 个场景，全部通过（`failures=0`）：
+
+1. 正常生命周期 `New → Runnable → Running → Dead`；
+2. **终态不可变 + 重复操作幂等**：已 Dead 的任务再 cancel / 重复 cancel / 再 wait，
+   状态必须不变；
+3. 取消未开始的任务：终态必须是 Cancelled 或 Dead；
+4. **取消 vs 完成竞态 400 轮**：实测 `dead=132 / cancelled=268`，**两种终态都真实
+   出现过**，且没有出现第三种状态 —— 直接验证了「终态二选一」不变量；
+5. **取消后不可复活**：已 Cancelled 的任务经 cancel/wait 后仍必须是 Cancelled；
+6. `TimerState` 转移与终态互斥（Pending → 完成/取消，重复 Cancel 幂等）；
+7. `MState`/`PState` 取值在枚举范围内（200 轮观测）。
+
+### 未做
+
+- 没有为「状态机加统一转换封装」做重构（使用者要求「不要求大改」）；
+  当前 14 处裸 `store` 是隐患（无法集中校验），已记录为后续改进项；
+- `FiberState` 只有 `Completed/Failed` 等少量取值，未单独建测试场景，
+  由场景 1/6 间接覆盖。
