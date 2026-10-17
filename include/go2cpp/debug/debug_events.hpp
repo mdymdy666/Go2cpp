@@ -20,6 +20,9 @@
 #include "go2cpp/scheduler.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <functional>
+#include <thread>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -266,5 +269,55 @@ public:
 private:
     EventBuffer m_buffer;
 };
+
+
+/**
+ * @brief 事件跟随的接收端：每拿到一批事件调用一次。
+ * @return 返回 false 表示"请停止跟随"。
+ */
+using EventFollowSink = std::function<bool(const std::vector<SchedulerEvent>&)>;
+
+/**
+ * @brief 持续跟随采集器：轮询取走已入队事件并交给 sink（第 20 轮，P2 收尾）。
+ *
+ * @param collector   事件采集器。
+ * @param sink        每批回调一次；返回 false 即停止。
+ * @param interval    两次拉取之间的间隔（避免忙等空转）。
+ * @param max_batches 最多输出多少批；**0 表示不限制**（真实使用需配合信号/外部退出条件）。
+ * @param overall_timeout 总超时；0 表示不限。**强烈建议非 0** ——
+ *        若采集器一直为空，`batches` 永远到不了 `max_batches`，没有超时就会无限循环。
+ * @return 实际输出的批次数。
+ *
+ * @note **进程内**跟随：只能跟随本进程里挂在该采集器上的事件；跨进程需要信号或管道，属后续项。
+ * @note `Drain()` 是**消耗性**的：被跟随取走的事件不再留在采集器里，
+ *       因此跟随期间缓冲只作短期暂存，`Pending()` 会随之归零 —— 这是刻意的。
+ */
+inline std::size_t FollowEvents(DebugEventCollector& collector, const EventFollowSink& sink,
+                                std::chrono::milliseconds interval, std::size_t max_batches = 0,
+                                std::chrono::milliseconds overall_timeout =
+                                    std::chrono::milliseconds(0)) {
+    std::size_t batches = 0;
+    const auto started = std::chrono::steady_clock::now();
+    for (;;) {
+        const auto events = collector.Drain();
+        if (!events.empty()) {
+            ++batches;
+            if (sink && !sink(events)) {
+                break;
+            }
+        }
+        if (max_batches != 0 && batches >= max_batches) {
+            break;
+        }
+        // 总超时是**必需的**兜底：若采集器一直为空，batches 永远到不了 max_batches，
+        // 旧实现会在此处无限循环（实测导致 debug_events 卡住、进而让整条 ctest 超时）。
+        if (overall_timeout.count() > 0 &&
+            std::chrono::steady_clock::now() - started >= overall_timeout) {
+            break;
+        }
+        std::this_thread::sleep_for(interval);
+    }
+    return batches;
+}
 
 }  // namespace go2cpp::debug

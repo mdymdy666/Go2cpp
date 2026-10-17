@@ -273,4 +273,53 @@ void run_debug_cli_tests() {
         GO2CPP_CHECK(RunDump(events_text, *fixture.scheduler, collector, &unified, &error));
         GO2CPP_CHECK(Contains(unified, "[events]"));
     }
+
+    // --follow 解析与端到端（第 20 轮）
+    {
+        Fixture fixture(1);
+        const auto bare = ParseDumpCommand({"dump", "events", "--follow"});
+        GO2CPP_CHECK(bare.valid && bare.follow && bare.follow_batches == 0);
+
+        const auto limited = ParseDumpCommand({"dump", "events", "--follow=7"});
+        GO2CPP_CHECK(limited.valid && limited.follow && limited.follow_batches == 7);
+
+        const auto interval = ParseDumpCommand({"dump", "events", "--follow=2",
+                                                "--follow-interval=3"});
+        GO2CPP_CHECK(interval.valid && interval.follow_interval.count() == 3);
+
+        // 非法值必须报错，不能静默当成不跟随
+        const auto zero = ParseDumpCommand({"dump", "events", "--follow=0"});
+        const auto junk = ParseDumpCommand({"dump", "events", "--follow=abc"});
+        const auto negative = ParseDumpCommand({"dump", "events", "--follow-interval=-1"});
+        GO2CPP_CHECK(!zero.valid && !zero.error.empty());
+        GO2CPP_CHECK(!junk.valid && Contains(junk.error, "不是整数"));
+        GO2CPP_CHECK(!negative.valid && Contains(negative.error, "不能为负"));
+        const auto bad_timeout = ParseDumpCommand({"dump", "events", "--follow-timeout=-5"});
+        GO2CPP_CHECK(!bad_timeout.valid &&
+                     Contains(bad_timeout.error, "不能为负"));
+
+        // 不带 follow 时行为不变
+        const auto plain = ParseDumpCommand({"dump", "events", "--format=json"});
+        GO2CPP_CHECK(plain.valid && !plain.follow);
+
+        // 端到端：预先放 3 个事件，follow 上限 1 批，应报告 followed 1 batches
+        DebugEventCollector collector(64);
+        for (int i = 0; i < 3; ++i) {
+            SchedulerEvent event;
+            event.type = SchedulerEventType::kTaskCompleted;
+            event.task_id = static_cast<GId>(i + 1);
+            event.timestamp = std::chrono::steady_clock::now();
+            collector.OnEvent(event);
+        }
+        auto follow_cmd = ParseDumpCommand({"dump", "events", "--follow=1",
+                                            "--follow-interval=0",
+                                            "--follow-timeout=200"});
+        GO2CPP_CHECK(follow_cmd.valid);
+        std::string note;
+        std::string error;
+        GO2CPP_CHECK(RunEventsDump(follow_cmd, collector, &note, &error));
+        GO2CPP_CHECK(Contains(note, "followed 1 batches"));
+        GO2CPP_CHECK(collector.Pending() == 0);   // 跟随会消耗事件
+        (void)fixture;
+    }
 }

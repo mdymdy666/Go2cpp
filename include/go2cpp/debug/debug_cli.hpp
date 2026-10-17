@@ -46,6 +46,14 @@ struct DumpCommand {
     bool append{false};      ///< 追加而非覆盖（仅对文件输出有效）。
     std::string name{"main"};///< scheduler_name（仅作标识）。
     DumpOptions options;
+    /// --follow[=N]：是否持续跟随输出。
+    bool follow{false};
+    /// 跟随上限批数；仅当 follow 为真时有意义，0 表示不限制。
+    std::size_t follow_batches{0};
+    /// 跟随轮询间隔（--follow-interval=ms）。
+    std::chrono::milliseconds follow_interval{10};
+    /// 跟随总超时（--follow-timeout=ms）；默认 1000ms，避免空进程永不退出。
+    std::chrono::milliseconds follow_timeout{1000};
     std::string error;       ///< 解析失败原因（valid=false 时有效）。
 };
 
@@ -84,6 +92,52 @@ inline DumpCommand ParseDumpCommand(const std::vector<std::string>& args) {
             command.output = arg.substr(9);
         } else if (arg == "-o" && index + 1 < args.size()) {
             command.output = args[++index];
+        } else if (arg == "--follow") {
+            command.follow = true;
+            command.follow_batches = 0;   // 0 = 不限制
+        } else if (arg.rfind("--follow=", 0) == 0) {
+            const std::string value = arg.substr(9);
+            long parsed = 0;
+            try {
+                parsed = std::stol(value);
+            } catch (...) {
+                command.error = "--follow 的值不是整数: " + value;
+                return command;
+            }
+            if (parsed <= 0) {
+                command.error = "--follow=N 需要正整数";
+                return command;
+            }
+            command.follow = true;
+            command.follow_batches = static_cast<std::size_t>(parsed);
+        } else if (arg.rfind("--follow-interval=", 0) == 0) {
+            const std::string value = arg.substr(18);
+            long parsed = 0;
+            try {
+                parsed = std::stol(value);
+            } catch (...) {
+                command.error = "--follow-interval 的值不是整数: " + value;
+                return command;
+            }
+            if (parsed < 0) {
+                command.error = "--follow-interval 不能为负";
+                return command;
+            }
+            command.follow_interval = std::chrono::milliseconds(parsed);
+        } else if (arg.rfind("--follow-timeout=", 0) == 0) {
+            const std::string value = arg.substr(17);
+            long parsed = 0;
+            try {
+                parsed = std::stol(value);
+            } catch (...) {
+                command.error = "--follow-timeout 的值不是整数: " + value;
+                return command;
+            }
+            if (parsed < 0) {
+                command.error = "--follow-timeout 不能为负";
+                return command;
+            }
+            command.follow_timeout = std::chrono::milliseconds(parsed);
         } else if (arg == "--append") {
             command.append = true;
         } else if (arg == "--truncate") {
@@ -113,7 +167,7 @@ inline DumpCommand ParseDumpCommand(const std::vector<std::string>& args) {
             command.error = "usage: dump {scheduler|events} [--format=text|ini|json] "
                             "[--output=<file>|-] [--append|--truncate] "
                             "[--summary|--processors|--machines|--metrics] "
-                            "[--no-processors] [--no-machines] [--no-metrics] [name]";
+                            "[--no-processors] [--no-machines] [--no-metrics] [--follow[=N]] [--follow-interval=ms] [name]";
             return command;
         } else if (!arg.empty() && arg[0] == '-') {
             command.error = "unknown option: " + arg;
@@ -207,6 +261,37 @@ inline bool RunEventsDump(const DumpCommand& command, DebugEventCollector& colle
         case DumpFormat::kText:
             text = collector.DumpText(command.options.event_limit);
             break;
+    }
+    // --follow：逐批写出（每事件一行 JSON），不走一次性写文件的路径。
+    if (command.follow) {
+        const std::size_t batches = FollowEvents(
+            collector,
+            [](const std::vector<SchedulerEvent>& events) {
+                for (const auto& event : events) {
+                    std::string line = "{\"type\": \"";
+                    line += EventTypeName(event.type);
+                    line += "\", \"task_id\": ";
+                    line += std::to_string(event.task_id);
+                    line += ", \"machine_id\": ";
+                    line += std::to_string(event.machine_id);
+                    line += ", \"processor_id\": ";
+                    line += std::to_string(event.processor_id);
+                    line += ", \"task_state\": ";
+                    line += std::to_string(static_cast<int>(event.task_state));
+                    line += ", \"steady_ns\": ";
+                    line += std::to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               event.timestamp.time_since_epoch()).count());
+                    line += "}\n";
+                    (void)std::fwrite(line.data(), 1, line.size(), stdout);
+                }
+                (void)std::fflush(stdout);
+                return true;
+            },
+            command.follow_interval, command.follow_batches, command.follow_timeout);
+        if (text_out != nullptr) {
+            *text_out = "(followed " + std::to_string(batches) + " batches)";
+        }
+        return true;
     }
     if (text_out != nullptr) {
         *text_out = text;

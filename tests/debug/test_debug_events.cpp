@@ -262,4 +262,103 @@ void run_debug_events_tests() {
         }
         GO2CPP_CHECK(ok);
     }
+
+    // FollowEvents（第 20 轮，--follow 的底层实现）
+    {
+        // 1) 有事件 + 上限 1 批：应取走全部并返回 1
+        DebugEventCollector collector(256);
+        for (int i = 0; i < 5; ++i) {
+            SchedulerEvent event;
+            event.type = SchedulerEventType::kTaskStarted;
+            event.task_id = static_cast<go2cpp::GId>(i + 1);
+            event.timestamp = std::chrono::steady_clock::now();
+            collector.OnEvent(event);
+        }
+        GO2CPP_CHECK(collector.Pending() == 5);
+        std::size_t received = 0;
+        const auto batches = FollowEvents(
+            collector,
+            [&received](const std::vector<SchedulerEvent>& events) {
+                received += events.size();
+                return true;
+            },
+            std::chrono::milliseconds(1), 1, std::chrono::milliseconds(200));
+        GO2CPP_CHECK(batches == 1);
+        GO2CPP_CHECK(received == 5);
+        // Drain 是消耗性的：跟随之后缓冲应归零
+        GO2CPP_CHECK(collector.Pending() == 0);
+
+        // 2) 空采集器 + 上限 1：返回 0（不产生空批）
+        DebugEventCollector empty_collector(16);
+        const auto zero = FollowEvents(empty_collector, [](const std::vector<SchedulerEvent>&) {
+            return true;
+        }, std::chrono::milliseconds(1), 1, std::chrono::milliseconds(200));
+        GO2CPP_CHECK(zero == 0);
+
+        // 3) sink 返回 false 应提前停止
+        DebugEventCollector stopping(64);
+        for (int round = 0; round < 3; ++round) {
+            SchedulerEvent event;
+            event.type = SchedulerEventType::kTaskCompleted;
+            event.task_id = static_cast<go2cpp::GId>(round + 1);
+            event.timestamp = std::chrono::steady_clock::now();
+            stopping.OnEvent(event);
+            std::size_t calls = 0;
+            const auto stopped = FollowEvents(
+                stopping,
+                [&calls](const std::vector<SchedulerEvent>&) {
+                    ++calls;
+                    return false;   // 第一批后就要求停止
+                },
+                std::chrono::milliseconds(1), 0, std::chrono::milliseconds(200));
+            GO2CPP_CHECK(stopped == 1);
+            GO2CPP_CHECK(calls == 1);
+        }
+
+        // 4) 压测：1000 批（每批 1 个事件）
+        DebugEventCollector bench(2048);
+        constexpr int kBatches = 1000;
+        std::size_t sink_count = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < kBatches; ++i) {
+            SchedulerEvent event;
+            event.type = SchedulerEventType::kTaskStarted;
+            event.task_id = static_cast<go2cpp::GId>(i + 1);
+            event.timestamp = std::chrono::steady_clock::now();
+            bench.OnEvent(event);
+            (void)FollowEvents(bench, [&sink_count](const std::vector<SchedulerEvent>& events) {
+                sink_count += events.size();
+                return true;
+            }, std::chrono::milliseconds(0), 1, std::chrono::milliseconds(200));
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        std::clog << "  [压测] FollowEvents x" << kBatches << " 批: "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()
+                  << " us (sink=" << sink_count << ")" << std::endl;
+        GO2CPP_CHECK(sink_count == static_cast<std::size_t>(kBatches));
+
+        // 5) 随机：随机事件数与随机上限，批数不得超过上限
+        std::mt19937 rng(20261016);
+        std::uniform_int_distribution<int> count_dist(0, 40);
+        std::uniform_int_distribution<int> limit_dist(1, 5);
+        bool ok = true;
+        for (int round = 0; round < 50; ++round) {
+            const int events_count = count_dist(rng);
+            const auto limit = static_cast<std::size_t>(limit_dist(rng));
+            DebugEventCollector random_collector(128);
+            for (int i = 0; i < events_count; ++i) {
+                SchedulerEvent event;
+                event.type = SchedulerEventType::kTaskStarted;
+                event.task_id = static_cast<go2cpp::GId>(i + 1);
+                event.timestamp = std::chrono::steady_clock::now();
+                random_collector.OnEvent(event);
+            }
+            const auto made = FollowEvents(random_collector,
+                                           [](const std::vector<SchedulerEvent>&) { return true; },
+                                           std::chrono::milliseconds(0), limit, std::chrono::milliseconds(500));
+            ok = ok && made <= limit;
+            ok = ok && random_collector.Pending() == 0;
+        }
+        GO2CPP_CHECK(ok);
+    }
 }
