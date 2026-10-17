@@ -119,7 +119,8 @@ if (GO2CPP_BUILD_TESTS)
 
     add_executable(go2cpp_hpack_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hpack.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/hpack.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/hpack.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/huffman.cpp)
     target_include_directories(go2cpp_hpack_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(go2cpp_hpack_test PRIVATE

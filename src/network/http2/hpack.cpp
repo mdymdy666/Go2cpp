@@ -3,6 +3,7 @@
  * @brief HPACK 实现（RFC 7541）。仅作协议逻辑，不涉及 IO 或线程。
  */
 #include "go2cpp/network/http2/hpack.hpp"
+#include "go2cpp/network/http2/huffman.hpp"
 
 #include <array>
 #include <cstring>
@@ -17,6 +18,7 @@ const char* ToString(HpackStatus status) noexcept {
         case HpackStatus::kInvalidInteger: return "invalid-integer";
         case HpackStatus::kTruncatedString: return "truncated-string";
         case HpackStatus::kHuffmanUnsupported: return "huffman-unsupported";
+        case HpackStatus::kHuffmanInvalid: return "huffman-invalid";
         case HpackStatus::kInvalidTableSize: return "invalid-table-size";
     }
     return "unknown";
@@ -299,10 +301,23 @@ HpackStatus DecodeString(const std::uint8_t* in, std::size_t length,
         return HpackStatus::kTruncatedString;
     }
     if (huffman) {
-        if (error != nullptr) {
-            *error = "HPACK 字符串使用 Huffman 编码，本实现尚未支持（需补 RFC 7541 附录 B 码表）";
+        std::string decoded;
+        const auto huffman_status =
+            HuffmanDecode(in + total, static_cast<std::size_t>(str_len), &decoded);
+        if (huffman_status != HuffmanStatus::kOk) {
+            if (error != nullptr) {
+                *error = "HPACK Huffman 字符串解码失败: ";
+                *error += ToString(huffman_status);
+            }
+            return HpackStatus::kHuffmanInvalid;
         }
-        return HpackStatus::kHuffmanUnsupported;
+        if (decoded.size() != str_len) {
+            // 解码后长度与声明的编码长度不同是正常现象（Huffman 是变长压缩），
+            // 这里只保留原编码长度用于 consumed 计算，不做长度相等断言。
+        }
+        *out = std::move(decoded);
+        *consumed = total + static_cast<std::size_t>(str_len);
+        return HpackStatus::kOk;
     }
     out->assign(reinterpret_cast<const char*>(in + total), static_cast<std::size_t>(str_len));
     *consumed = total + static_cast<std::size_t>(str_len);
@@ -533,13 +548,24 @@ HpackStatus Encoder::EncodeBlock(const std::vector<HeaderField>& fields,
             out->insert(out->end(), buffer, buffer + written);
             out->insert(out->end(), field.name.begin(), field.name.end());
         }
-        // 值：原样字面量（不做 Huffman）
-        status = EncodeInteger(field.value.size(), 7, 0x00U, buffer, sizeof(buffer), &written);
+        // 值：编码端可选 Huffman（§5.2）。仅当结果不更长时才用，避免膨胀。
+        std::vector<std::uint8_t> huffman_value;
+        bool use_huffman = false;
+        if (HuffmanEncode(field.value, &huffman_value) == HuffmanStatus::kOk) {
+            use_huffman = huffman_value.size() < field.value.size();
+        }
+        const std::size_t value_len = use_huffman ? huffman_value.size() : field.value.size();
+        const std::uint8_t value_prefix = use_huffman ? 0x80U : 0x00U;
+        status = EncodeInteger(value_len, 7, value_prefix, buffer, sizeof(buffer), &written);
         if (status != HpackStatus::kOk) {
             return status;
         }
         out->insert(out->end(), buffer, buffer + written);
-        out->insert(out->end(), field.value.begin(), field.value.end());
+        if (use_huffman) {
+            out->insert(out->end(), huffman_value.begin(), huffman_value.end());
+        } else {
+            out->insert(out->end(), field.value.begin(), field.value.end());
+        }
         m_table.Add(field.name, field.value);
     }
     (void)error;

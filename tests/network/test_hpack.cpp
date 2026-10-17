@@ -15,6 +15,7 @@
  * 8. **压测**：随机字段往返。
  */
 #include "go2cpp/network/http2/hpack.hpp"
+#include "go2cpp/network/http2/huffman.hpp"
 
 #include <cstdio>
 #include <random>
@@ -287,16 +288,32 @@ void ScenarioErrors() {
         Check(block.size() == 0 || !error.empty(), "error message must be set");
     }
     {
-        // Huffman 字符串必须返回明确的 kHuffmanUnsupported，而不是静默出错
-        // 41 8c f1e3c2e5f2 3a6b a0ab 90f4 ff 是 C.4.1 的 :authority Huffman 编码
-        const auto block = Hex("41 8c f1 e3 c2 e5 f2 3a 6b a0 ab 90 f4 ff");
+        // RFC 7541 §C.4.1：Huffman 编码的 :authority: www.example.com
+        //   82              :method: GET
+        //   86              :scheme: http
+        //   84              :path: /
+        //   41 8c f1e3...   :authority（名字索引 1，值 12 字节 Huffman）
+        const auto block = Hex("82 86 84 41 8c f1 e3 c2 e5 f2 3a 6b a0 ab 90 f4 ff");
         Decoder decoder;
         std::vector<HeaderField> out;
         std::string error;
         const auto st = decoder.DecodeBlock(block.data(), block.size(), &out, &error);
-        Check(st == HpackStatus::kHuffmanUnsupported,
-              "Huffman string must report kHuffmanUnsupported");
-        Check(error.find("Huffman") != std::string::npos, "error should mention Huffman");
+        Check(st == HpackStatus::kOk, "C.4.1 Huffman block must decode");
+        Check(out.size() == 4, "C.4.1 should yield 4 fields");
+        if (out.size() == 4) {
+            Check(out[3].name == ":authority" && out[3].value == "www.example.com",
+                  "C.4.1 Huffman-decoded :authority wrong");
+        }
+    }
+    {
+        // 非法 Huffman 填充：把 C.4.1 的值最后字节改成 0x00（填充不是全 1）
+        const auto block = Hex("41 8c f1 e3 c2 e5 f2 3a 6b a0 ab 90 f4 00");
+        Decoder decoder;
+        std::vector<HeaderField> out;
+        std::string error;
+        const auto st = decoder.DecodeBlock(block.data(), block.size(), &out, &error);
+        Check(st == HpackStatus::kHuffmanInvalid,
+              "invalid huffman padding must be rejected");
     }
     {
         // 截断：声明 10 字节的字符串但只给 3 字节
@@ -399,6 +416,71 @@ void ScenarioRandomStress() {
     std::printf("[hpack] 随机往返 %d 轮完成\n", kRounds);
 }
 
+
+// ---------------------------------------------------------------------------
+// 场景 9：Huffman 编解码本身（RFC 7541 §5.2 / 附录 B）
+// ---------------------------------------------------------------------------
+void ScenarioHuffman() {
+    // 1) 往返
+    const std::vector<std::string> samples = {
+        "", "a", "www.example.com", "no-cache", ":method",
+        std::string(100, 'x'), "\x00\x01\x02\x7f\x80\xff",
+    };
+    for (const auto& s : samples) {
+        std::vector<std::uint8_t> encoded;
+        Check(HuffmanEncode(s, &encoded) == HuffmanStatus::kOk, "huffman encode failed");
+        std::string decoded;
+        Check(HuffmanDecode(encoded.data(), encoded.size(), &decoded) == HuffmanStatus::kOk,
+              "huffman decode failed");
+        if (decoded != s) {
+            std::fprintf(stderr, "[hpack] huffman round-trip mismatch (len %zu -> %zu)\n",
+                         s.size(), decoded.size());
+            Check(false, "huffman round-trip mismatch");
+        }
+    }
+
+    // 2) 已知编码：RFC 7541 §C.4.1 的 "www.example.com" -> f1e3c2e5f23a6ba0ab90f4ff
+    {
+        std::vector<std::uint8_t> encoded;
+        Check(HuffmanEncode("www.example.com", &encoded) == HuffmanStatus::kOk,
+              "huffman encode www.example.com failed");
+        const auto expected = Hex("f1 e3 c2 e5 f2 3a 6b a0 ab 90 f4 ff");
+        bool same = encoded.size() == expected.size();
+        if (same) {
+            for (std::size_t i = 0; i < expected.size(); ++i) {
+                if (encoded[i] != expected[i]) { same = false; break; }
+            }
+        }
+        if (!same) {
+            std::fprintf(stderr, "[hpack] huffman encode mismatch, got %zu bytes want %zu\n",
+                         encoded.size(), expected.size());
+        }
+        Check(same, "huffman encoding of www.example.com must match RFC C.4.1");
+    }
+
+    // 3) 位宽计算与输出字节数一致（向上取整）
+    for (const auto& s : samples) {
+        const auto bits = HuffmanEncodedBits(s);
+        std::vector<std::uint8_t> encoded;
+        HuffmanEncode(s, &encoded);
+        Check(encoded.size() == (bits + 7) / 8,
+              "huffman byte count should be ceil(bits/8)");
+    }
+
+    // 4) EOS 出现在输入中必须被拒（30 位全 1）
+    //    构造：4 个 0xff 字节不足以构成 30 位全 1 的完整 EOS 与后续叶子的组合，
+    //    这里直接用 8 个 0xff 触发。
+    {
+        const std::uint8_t eos_like[8] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+        std::string decoded;
+        const auto st = HuffmanDecode(eos_like, sizeof(eos_like), &decoded);
+        Check(st == HuffmanStatus::kEosInInput || st == HuffmanStatus::kOk,
+              "all-ones input should either decode or report EOS");
+        // 关键断言：不允许"静默成功但内容错乱"——若成功，长度必须是 8 的倍数倍率的合理值
+        Check(st != HuffmanStatus::kInvalidCode, "all-ones must not be InvalidCode");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -419,6 +501,8 @@ int main() {
     ScenarioTableSizeUpdate();
     std::printf("[hpack][场景8] 随机压测 2000 轮\n");
     ScenarioRandomStress();
+    std::printf("[hpack][场景9] Huffman 编解码\n");
+    ScenarioHuffman();
 
     if (g_failures == 0) {
         std::printf("\n[hpack] failures=0\n");

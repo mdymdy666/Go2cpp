@@ -13,7 +13,7 @@
  * ## 已实现范围
  *
  * - 整数前缀编码（RFC 7541 §5.1）
- * - 字符串字面量（§5.2，**仅原样，不含 Huffman**）
+ * - 字符串字面量（§5.2，支持 Huffman 编解码）
  * - 静态表 61 项（§2.3.1 / 附录 A）
  * - 动态表（§2.3.2，FIFO + 大小上限 + 逐出）
  * - 索引字段（§6.1）与字面量表示（§6.2 的三种：含增量索引、不含索引、绝不索引）
@@ -21,10 +21,9 @@
  *
  * ## 未实现（明确标注，不假装支持）
  *
- * **Huffman 解码与编码（§5.2）**。真实对端几乎总是用 Huffman 编码 header，
- * 因此本实现目前**不能与真实 HTTP/2 服务器互通**；解码遇到 Huffman 位会返回
- * 明确错误 `kHuffmanUnsupported` 而不是静默出错。补上 Huffman 需要 257 项码表
- * （RFC 7541 附录 B），属下一步。
+ * **Huffman 编解码（§5.2）已在 `huffman.hpp` 中实现**：257 项码表来自 RFC 7541
+ * 附录 B（经 Go 的 x/net/http2/hpack/tables.go 提取校验）。解码支持 Huffman，
+ * 编码默认启用 Huffman。填充非法或出现 EOS 返回 `kHuffmanInvalid`。
  */
 #pragma once
 
@@ -57,7 +56,10 @@ enum class HpackStatus : std::uint8_t {
     /// 字符串长度超出剩余输入。
     kTruncatedString,
     /// 遇到 Huffman 编码的字符串，但本实现尚未支持。
+    /// @note 已经支持 Huffman；本值保留以兼容旧代码/测试。
     kHuffmanUnsupported,
+    /// Huffman 字符串解码失败（填充非法或出现 EOS）。
+    kHuffmanInvalid,
     /// 动态表大小更新值非法（超过 SETTINGS 上限）。
     kInvalidTableSize,
 };
