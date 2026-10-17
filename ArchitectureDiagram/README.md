@@ -1,37 +1,69 @@
-# Go2Cpp 架构图与模块报告（ArchitectureDiagram）
+# Go2Cpp 架构图（ArchitectureDiagram）
 
-> 本目录是「熟悉项目模块 → 产出模块化详细报告 → 汇总为一张含文字描述的架构/运行流程图」
-> 这条任务链的交付位置。
-> 生成方式：定时任务（每 15 分钟一轮，截至 2026-10-15 22:00）。
-> 进度与轮次安排见 [PROGRESS.md](PROGRESS.md)。
+> **交付主体已变更为 [`diagrams/`](diagrams/)** ——「**每个模块一张图**」。
+> 旧的 `modules/G1..G10-*.md`（约 178KB 纯文字讲解）**保留**，作为图的**注解来源**，
+> 但它们不是使用者要求的交付形态。
 
-## 交付物
+## 一、该看什么
 
-| # | 交付物 | 路径 | 说明 |
-|---|---|---|---|
-| 1 | **架构主图（最终成果）** | `00-architecture.svg` | 一张图承载整个运行流程/架构，**图内直接写有文字描述**；自包含 SVG，浏览器/图片查看器可直接打开 |
-| 2 | 架构图源（可再生成/可编辑） | `00-architecture.mmd` | Mermaid 源，便于后续修改与二次渲染 |
-| 3 | 运行流程说明 | `01-runtime-flow.md` | 图内文字对应的完整叙述：一次 `go()` 到任务结束的逐段落 |
-| 4 | 模块详细报告（10 组） | `modules/G1..G10-*.md` | 按依赖方向分组；每组含职责、符号清单、机制、不变量、坑点、与 Go 的差异、**对架构图的贡献** |
-| 5 | 进度总表 | `PROGRESS.md` | 每轮更新：已完成/进行中/下一轮/证据 |
+| 想看什么 | 去哪里 |
+|---|---|
+| **每个模块的架构图（主交付）** | [`diagrams/`](diagrams/) —— 10 个文件、**52 个 Mermaid 图** |
+| 一次性看整个运行流程 | [`00-architecture.svg`](00-architecture.svg)（总览图，含文字描述） |
+| 一次 `go()` 到任务结束的逐段叙述 | [`01-runtime-flow.md`](01-runtime-flow.md) |
+| 某个模块的**详细文字讲解**（职责/符号/机制/不变量/坑点/与 Go 差异） | `modules/G1..G10-*.md` |
+| 节点与边的原始清单 | [`notes/nodes-edges.md`](notes/nodes-edges.md) |
+| 本轮开发进度与证据 | [`../DebugTooling/DEV-PROGRESS.md`](../DebugTooling/DEV-PROGRESS.md) |
 
-## 模块报告分组（按依赖方向，与 `docs/HANDOFF.md` §4.3 一致）
+## 二、每张图固定包含四类内容
 
-| 组 | 主题 | 覆盖模块 | 依赖位置 |
-|---|---|---|---|
-| G1 | 地基层 | `detail/context_backend`、`fiber`、`core/timer`、`core/parking_condition` | 最底层，只依赖 libc/pthread |
-| G2 | GMP 调度 | `scheduler`（Task/M/P/worker_loop/sysmon/FiberBin） | 依赖 G1 |
-| G3 | 取消与错误 | `context`、`error` | 依赖 G1+G2 |
-| G4 | 并发原语 | `channel`、`future`、`sync` | 依赖 G1~G3 |
-| G5 | IO 后端 | `io`、`io_backend`、`fd_manager`、`hook` | 依赖 G1~G4 |
-| G6 | 网络基础 | `socket`、`address`、`bytearray`、`framing`、`endian`/`myendian`、`socket_stream` | 部分独立于调度器 |
-| G7 | 应用协议 | `http`、`websocket`、`sse` | 依赖 G5+G6 |
-| G8 | 横切设施 | `log`、`config` | 被几乎所有模块使用 |
-| G9 | 工具与新手层 | `tools/control_flow`、`tools/go`、`tools/event`、`thread_policy`、`fiber_local`、`runtime`、`core/hybrid_mutex`、`core/status` | 跨层 |
-| G10 | 汇总 | 架构图 + 运行流程 + 全项目结论 | 收口 |
+使用者明确要求「一图至少包含类架构 + 重要函数的功能与具体实现 + 向上层提供什么 + 关键函数/状态流转的流程图」，
+因此 `diagrams/` 下每个文件都按同一结构组织：
 
-## 约定
+| 章节 | 内容 | 图型 |
+|---|---|---|
+| ① 类架构 | 每个类**用了底层哪些能力**、**主要职责**是什么 | `classDiagram` |
+| ② 重要函数 | 关键函数的**功能**与**具体实现要点**（含真实现分支） | `flowchart` |
+| ③ 向上层提供 | 本模块**最终向上层提供了什么功能**，以及谁在用 | `graph LR` |
+| ④ 状态流转 | 关键**状态机**与**执行流程**（如 Fiber 在 Scheduler 中如何流转与调度） | `stateDiagram-v2` × 2~3 |
+| 附 | 与 Go 的差异表 + 必要的 ASCII 时序/栈变化图 | — |
 
-- 所有结论都以 **代码与实测** 为依据；引用处给符号名（行号会漂移）。
-- 每份模块报告的最后一节固定为「对架构图的贡献」：给出该模块在图中的**节点名、连线、以及图内文字**，供 G10 汇总时直接取用。
-- 与交接文档不一致的地方，一律标注「本轮实测修正」并给出证据。
+## 三、10 个模块图
+
+| 组 | 主题 | 文件 | 行数 | Mermaid |
+|---|---|---|---:|---:|
+| G1 | 地基层（Fiber / Timer / ParkingCondition） | [`diagrams/G1-foundation.md`](diagrams/G1-foundation.md) | 308 | 5 |
+| G2 | **GMP 调度**（Task / Scheduler / P / M / worker_loop / sysmon） | [`diagrams/G2-scheduler.md`](diagrams/G2-scheduler.md) | 325 | 5 |
+| G3 | 取消与错误（Context / DoneSignal / Error 家族） | [`diagrams/G3-context-error.md`](diagrams/G3-context-error.md) | 218 | 5 |
+| G4 | 并发原语（Channel / Future / sync / WaitSelector） | [`diagrams/G4-concurrency.md`](diagrams/G4-concurrency.md) | 247 | 5 |
+| G5 | IO 后端（IOBackend / FdManager / hook） | [`diagrams/G5-io-backend.md`](diagrams/G5-io-backend.md) | 195 | 5 |
+| G6 | 网络基础（Socket / Address / Framer） | [`diagrams/G6-network-base.md`](diagrams/G6-network-base.md) | 239 | 5 |
+| G7 | 应用协议（HTTP / WebSocket / SSE） | [`diagrams/G7-protocols.md`](diagrams/G7-protocols.md) | 269 | 6 |
+| G8 | 横切设施（log / config） | [`diagrams/G8-log-config.md`](diagrams/G8-log-config.md) | 246 | 5 |
+| G9 | 工具与新手层（go / defer / select / HybridMutex / FiberLocal / thread_policy） | [`diagrams/G9-tools.md`](diagrams/G9-tools.md) | 249 | 5 |
+| G10 | **调试模块**（本次新增的 go2cpp::debug） | [`diagrams/G10-debug.md`](diagrams/G10-debug.md) | 315 | 6 |
+| | **合计** | | **2611** | **52** |
+
+## 四、怎么渲染
+
+Mermaid 在以下环境**直接可见**，无需额外工具：
+
+- GitHub / GitLab 的 Markdown 预览；
+- VS Code（内置 Markdown 预览 + Mermaid 扩展）；
+- JetBrains 系列（Markdown 插件支持）；
+- Typora / Obsidian 等本地编辑器。
+
+命令行渲染（可选）：
+
+```sh
+# 需要 Node 环境；把单个 md 里所有 mermaid 块导出为 svg
+npx -y @mermaid-js/mermaid-cli -i diagrams/G2-scheduler.md -o G2-scheduler.svg
+```
+
+## 五、约定（后续维护者请注意）
+
+1. **一模块一文件**，文件名 `G<组>-<主题>.md`，与 `modules/` 的组号一致；
+2. **固定四章节 + 固定图型**，便于横向对比；
+3. 图里只写**从源码核实过**的内容；拿不到精确签名时**只描述语义**，并注明"未逐一核对"；
+4. **每张图都要与 Go 做差异对照** —— 这个项目最容易出错的地方就是「按 Go 语义误用」；
+5. 状态机必须写清**触发条件**（谁在什么情况下推动状态转移），不能只画箭头。
