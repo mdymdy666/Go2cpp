@@ -13,6 +13,11 @@
 
 ## ① 类架构：每个类用的底层能力 + 主要职责
 
+> 本模块共 **18 个类型**，一次性画会被 Mermaid 横向铺开（实测 784×230，文字不可读）。
+> 按职责拆成 **3 张**（每张 5~7 类，一屏可读）。
+
+### ①-A 启动协程：`go()` 与 `defer`
+
 ```mermaid
 classDiagram
     direction TB
@@ -26,10 +31,9 @@ classDiagram
         +instance() Scheduler&
         ← go() 不指定调度器时用它
     }
-
     class go_fn {
         <<自由函数 go(fn, ...)>>
-        +go(fn)  -> shared_ptr~Task~
+        +go(fn) -> shared_ptr~Task~
         +go(scheduler, fn)
     }
     class fiber {
@@ -38,30 +42,51 @@ classDiagram
         +cancel() void
         +join()
     }
-
     class defer_guard {
         <<RAII：作用域退出时执行>>
         +defer() 注册
-        ← 只能"函数退出时执行"，不是任意块
+        ← 只能作用域级，不是 Go 的函数级
     }
 
+    go_fn ..> Scheduler : 调 spawn
+    go_fn ..> DefaultSchedulerState : 缺省调度器
+    go_fn ..> fiber : 返回包装
+```
+
+### ①-B `select` 近似物与混合互斥
+
+```mermaid
+classDiagram
+    direction TB
+
+    class Channel {
+        <<G4>>
+    }
+    class TimerService {
+        <<G1>>
+    }
+    class Context {
+        <<G3>>
+    }
+    class ParkingCondition {
+        <<G1>>
+    }
     class EventBatch {
         <<select 的近似物>>
         +AddChannel(ch, op, handler)
         +AddTimer(deadline, handler)
         +AddContext(ctx, handler)
-        +Wait() 
-        ← 每次 Wait 只取**一个**就绪事件
+        +Wait()
+        ← 每次 Wait 只取一个就绪事件
     }
     class SelectLoop {
         <<EventBatch 的别名>>
     }
-
     class HybridGateOptions {
         <<策略>>
     }
     class HybridGate {
-        <<混合互斥：G 用 park，普通线程用 futex/condvar>>
+        <<混合互斥：G 用 park，普通线程用 condvar>>
         +lock / unlock
         +try_lock
     }
@@ -69,8 +94,26 @@ classDiagram
         <<HybridGate 的别名>>
     }
 
+    SelectLoop ..> EventBatch : 别名
+    EventBatch ..> Channel : 监听可读/可写
+    EventBatch ..> TimerService : 定时分支
+    EventBatch ..> Context : 取消分支
+    HybridMutex ..> HybridGate : 别名
+    HybridGate ..> ParkingCondition : 受管 G 路径
+    HybridGateOptions ..> HybridGate : 配置
+```
+
+### ①-C 协程局部存储与线程参与策略
+
+```mermaid
+classDiagram
+    direction TB
+
     class KeyId {
         <<协程局部变量键>>
+    }
+    class Fiber {
+        <<G1>>
     }
     class FiberLocalCache {
         <<按 G 隔离的存储>>
@@ -81,7 +124,6 @@ classDiagram
     class FiberLocal {
         <<FiberLocal~T~ 别名>>
     }
-
     class ThreadParticipationMode {
         <<线程是否参与运行时>>
     }
@@ -98,31 +140,30 @@ classDiagram
         <<RAII 切换 hook 模式>>
     }
 
-    go_fn ..> Scheduler : 调 spawn
-    go_fn ..> DefaultSchedulerState : 缺省调度器
-    go_fn ..> fiber : 返回包装
-    fiber ..> Task : 内部持有
-    EventBatch ..> Channel : 监听可读/可写
-    EventBatch ..> TimerService : 定时分支
-    EventBatch ..> Context : 取消分支
-    HybridGate ..> ParkingCondition : 受管 G 路径
-    HybridGate ..> std_mutex : 普通线程路径
-    FiberLocalCache ..> Fiber : 按 G id 索引
+    FiberLocal ..> FiberLocalCache : 别名
     FiberLocalCache ..> KeyId
-    FiberLocal ..> FiberLocalCache
+    FiberLocalCache ..> Fiber : 按 G id 索引
     ScopedThreadParticipation ..> ThreadParticipationMode
     ScopedThreadHookMode ..> ThreadHookMode
+    ThreadPolicySnapshot ..> ThreadParticipationMode
 ```
+
+
+**类职责汇总（18 个类型）**
 
 | 类/函数 | 主要职责 | 用的底层能力 |
 |---|---|---|
-| `go(fn)` / `go(scheduler, fn)` | Go 风格启动协程；返回可 `wait/cancel` 的 `fiber` | `Scheduler::spawn`、`DefaultSchedulerState` |
-| `default` 调度器 | 未显式传 scheduler 时的进程级默认实例 | `Scheduler` |
-| `defer` | **作用域退出时执行**的 RAII 守卫（**不是** Go 的"函数级 defer"语义完全一致，见差异表） | 析构函数 |
+| `go(fn)` / `go(scheduler, fn)` | Go 风格启动协程；返回可 `wait`/`cancel` 的 `fiber` | `Scheduler::spawn`、`DefaultSchedulerState` |
+| `DefaultSchedulerState` | 未显式传 scheduler 时的进程级默认实例 | `Scheduler` |
+| `fiber` | `go()` 的返回值包装，提供 `wait`/`cancel`/`join` | `Task` |
+| `defer` | **作用域退出时执行**的 RAII 守卫 | 析构函数 |
 | `EventBatch`（`SelectLoop`） | `select` 的近似：注册多个 channel/timer/context 分支，`Wait` 取**一个**就绪 | `Channel`、`TimerService`、`Context` |
-| `HybridGate`（`HybridMutex`） | **两种等待路径**：受管 G 走 park（不占线程），普通线程走原生 mutex/condvar | `ParkingCondition` + `std::mutex` |
+| `HybridGate`（`HybridMutex`） | **两种等待路径**：受管 G 走 park（不占线程），普通线程走原生 condvar | `ParkingCondition` + `std::mutex` |
 | `FiberLocalCache`（`FiberLocal<T>`） | 按 **G** 隔离的存储（普通线程则按线程隔离） | G id → 值表 |
-| `thread_policy` 系列 | 显式声明"这个线程参不参与运行时 / hook"，RAII 恢复 | 线程局部标志 |
+| `KeyId` | 协程局部变量的键类型 | 无 |
+| `ThreadParticipationMode` / `ThreadHookMode` | 声明「这个线程参不参与运行时 / hook」 | 线程局部标志 |
+| `ThreadPolicySnapshot` | 策略快照（用于观测） | 无 |
+| `ScopedThreadParticipation` / `ScopedThreadHookMode` | RAII 切换并自动恢复 | 线程局部标志 |
 
 ## ② 重要函数：功能与实现要点
 

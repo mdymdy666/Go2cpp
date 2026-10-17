@@ -11,6 +11,11 @@
 
 ## ① 类架构：每个类用的底层能力 + 主要职责
 
+> 本模块共 **21 个类型**，一次性画会被 Mermaid 横向铺开（实测 784×253，文字不可读）。
+> 按职责拆成 **3 张**（每张 6~8 类，一屏可读）。
+
+### ①-A 日志输出链路（Sink 家族）
+
 ```mermaid
 classDiagram
     direction TB
@@ -36,6 +41,28 @@ classDiagram
         <<转发到用户回调>>
     }
 
+    FileSink --|> LogSink
+    RotatingFileSink --|> FileSink
+    StdoutSink --|> LogSink
+    StderrSink --|> LogSink
+    MemorySink --|> LogSink
+    CallbackSink --|> LogSink
+```
+
+| 类 | 主要职责 | 用的底层能力 |
+|---|---|---|
+| `LogSink` | **输出目标抽象**（写/刷新/重开） | 纯虚接口 |
+| `FileSink` / `RotatingFileSink` | 写文件 / 按大小轮转 | `std::ofstream` + **互斥锁**（多线程安全） |
+| `StdoutSink` / `StderrSink` | 标准输出/错误 | libc 流 |
+| `MemorySink` | 内存里留最近 N 条（**测试与自检用**） | 环形缓冲 |
+| `CallbackSink` | 转发给用户回调（接外部系统） | `std::function` |
+
+### ①-B 过滤 / 格式化 / 写入路径
+
+```mermaid
+classDiagram
+    direction TB
+
     class LogFilter {
         <<过滤抽象>>
         +ShouldLog(record)* bool
@@ -50,7 +77,6 @@ classDiagram
     class PatternFormatter {
         <<按 pattern 展开>>
     }
-
     class LogRecord {
         <<一条日志的原始字段>>
         +level / time / file / line / thread
@@ -70,6 +96,25 @@ classDiagram
         <<全局注册表>>
         +GetOrCreate(name) Logger
     }
+    class LogSink {
+        <<G8-A 的输出目标>>
+    }
+
+    MinimumLevelFilter --|> LogFilter
+    PatternFormatter --|> LogFormatter
+    Logger ..> LogSink : 持有
+    Logger ..> LogFilter
+    Logger ..> LogFormatter
+    LoggerManager *-- Logger
+    LogLine ..> LogRecord
+    LogLine ..> Logger
+```
+
+### ①-C 配置（INI → 类型安全变量 → 运行时快照）
+
+```mermaid
+classDiagram
+    direction TB
 
     class IniFile {
         <<INI 解析>>
@@ -102,39 +147,12 @@ classDiagram
         <<运行时配置快照>>
     }
 
-    FileSink --|> LogSink
-    RotatingFileSink --|> FileSink
-    StdoutSink --|> LogSink
-    StderrSink --|> LogSink
-    MemorySink --|> LogSink
-    CallbackSink --|> LogSink
-    MinimumLevelFilter --|> LogFilter
-    PatternFormatter --|> LogFormatter
-    Logger ..> LogSink : 持有
-    Logger ..> LogFilter
-    Logger ..> LogFormatter
-    LoggerManager *-- Logger
-    LogLine ..> LogRecord
-    LogLine ..> Logger
     ConfigVar --|> ConfigVarBase
     Config *-- ConfigVarBase
     ConfigVar ..> ValueCodec : 读/写用 codec
     Config ..> IniFile : 从 INI 装载
     Config ..> RuntimeConfig : 生成运行时快照
 ```
-
-| 类 | 主要职责 | 用的底层能力 |
-|---|---|---|
-| `LogSink` | **输出目标抽象**（写/刷新/重开） | 纯虚接口 |
-| `FileSink` / `RotatingFileSink` | 写文件 / 按大小轮转 | `std::ofstream` + **互斥锁**（多线程安全） |
-| `StdoutSink` / `StderrSink` | 标准输出/错误 | libc 流 |
-| `MemorySink` | 内存里留最近 N 条（**测试与自检用**） | 环形缓冲 |
-| `CallbackSink` | 转发给用户回调（接外部系统） | `std::function` |
-| `LogFilter` / `MinimumLevelFilter` | 过滤（低于阈值丢弃） | 级别比较 |
-| `LogFormatter` / `PatternFormatter` | 格式化（按 pattern 展开字段） | 字符串替换 |
-| `Logger` / `LoggerManager` | 命名 logger 与全局注册表 | 互斥锁 + map |
-| `ConfigVar<T>` | 类型安全的配置项，**值变化通知监听者** | `ValueCodec<T>` 特化 |
-| `Config` / `IniFile` | 从 INI 装载、按名字查找 | 解析器 |
 
 ## ② 重要函数：功能与实现要点
 
