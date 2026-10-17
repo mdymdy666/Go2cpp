@@ -162,6 +162,31 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_connection_test COMMAND go2cpp_connection_test)
     set_tests_properties(go2cpp_connection_test PROPERTIES TIMEOUT 180)
 
+    # ---- os 模块（开荒版）：文件 + 环境变量 + 命令行参数 ----
+    add_executable(go2cpp_os_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/os/test_os_file.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/file.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/os.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/config.cpp)
+    target_include_directories(go2cpp_os_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(go2cpp_os_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    target_link_libraries(go2cpp_os_test PRIVATE go2cpp_config)
+    add_test(NAME go2cpp_os_test COMMAND go2cpp_os_test)
+    set_tests_properties(go2cpp_os_test PROPERTIES TIMEOUT 180)
+
+    add_executable(go2cpp_quic_packet_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_quic_packet.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/quic/varint.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/quic/packet.cpp)
+    target_include_directories(go2cpp_quic_packet_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(go2cpp_quic_packet_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_quic_packet_test COMMAND go2cpp_quic_packet_test)
+    set_tests_properties(go2cpp_quic_packet_test PROPERTIES TIMEOUT 300)
+
     add_executable(go2cpp_fiber_transport_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_fiber_transport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/connection.cpp

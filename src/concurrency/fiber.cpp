@@ -175,6 +175,10 @@ GO2CPP_FIBER_NOINLINE int load_errno() noexcept { return errno; }
 GO2CPP_FIBER_NOINLINE void store_errno(int value) noexcept { errno = value; }
 
 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+// 查询系统页大小。两个细节：
+// 1. `sysconf` 失败时可能**覆盖 errno**，所以进入前保存、返回前恢复，
+//    否则会把无关的 errno 泄漏给调用方；
+// 2. 结果要检查能否放进 `size_t`（32 位平台上 long 可能更宽）。
 std::size_t native_page_size() {
     const int saved_errno = errno;
     const long raw_page_size = ::sysconf(_SC_PAGESIZE);
@@ -204,6 +208,9 @@ std::size_t checked_stack_mapping_size(std::size_t usable_size,
 }
 
 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+// 把栈大小向上对齐到页边界。`mmap`/`mprotect` 要求页对齐，
+// 不对齐会让 guard page 落不到正确位置。
+// 加法前检查溢出 —— 接近 `SIZE_MAX` 的请求直接抛 length_error 而不是回绕成小值。
 std::size_t align_stack_size(std::size_t requested, std::size_t page_size) {
     const auto remainder = requested % page_size;
     if (remainder == 0) {
@@ -217,6 +224,9 @@ std::size_t align_stack_size(std::size_t requested, std::size_t page_size) {
 }
 #endif
 
+// 归一化用户请求的栈大小：0 用默认值；有原生上下文时至少 2 页
+// （1 页可用 + 1 页 guard），并检查上限。
+// 2 页下限的原因：guard page 要从总大小里扣掉，小于 2 页就没有可用栈了。
 std::size_t normalize_stack_size(std::size_t requested) {
     if (requested == 0) {
         requested = Fiber::DefaultStackSize();

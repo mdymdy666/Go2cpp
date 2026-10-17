@@ -14,14 +14,6 @@ namespace go2cpp
     // 的释放过程再用迭代方式排空工作表。
     thread_local std::vector<ErrorPtr> *t_error_release_work = nullptr;
 
-    /// 函数功能：完成 ReleaseWrappedCause 调用，读取或更新相关运行时状态。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-    /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-    /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-    /// @param[in] cause 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-    /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
     void ReleaseWrappedCause(ErrorPtr cause) noexcept
     {
       std::vector<ErrorPtr> pending;
@@ -42,14 +34,6 @@ namespace go2cpp
 
   } // namespace
 
-  /// 函数功能：完成 UnwrapAll 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   std::vector<ErrorPtr> Error::UnwrapAll() const
   {
     const auto cause = Unwrap();
@@ -108,14 +92,6 @@ namespace go2cpp
     }
   }
 
-  /// 函数功能：完成 WrappedError 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   WrappedError::~WrappedError()
   {
     if (t_error_release_work != nullptr)
@@ -129,14 +105,6 @@ namespace go2cpp
     ReleaseWrappedCause(std::move(m_cause));
   }
 
-  /// 函数功能：完成 JoinError 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   JoinError::~JoinError()
   {
     if (t_error_release_work != nullptr)
@@ -171,14 +139,6 @@ namespace go2cpp
     t_error_release_work = previous;
   }
 
-  /// 函数功能：完成 Message 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   std::string WrappedError::Message() const
   {
     std::string result;
@@ -219,14 +179,6 @@ namespace go2cpp
     return result;
   }
 
-  /// 函数功能：完成 JoinError 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] causes 调用方传入的参数，具体约束以头文件声明为准。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   JoinError::JoinError(std::vector<ErrorPtr> causes)
   {
     m_causes.reserve(causes.size());
@@ -239,14 +191,6 @@ namespace go2cpp
     }
   }
 
-  /// 函数功能：完成 Message 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   std::string JoinError::Message() const
   {
     // 使用显式工作表展开内置的嵌套 Join。对于生成的深层错误图，递归调用
@@ -296,28 +240,11 @@ namespace go2cpp
     return result;
   }
 
-  /// 函数功能：完成 NewError 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] message 调用方传入的参数，具体约束以头文件声明为准。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   ErrorPtr NewError(std::string message)
   {
     return std::make_shared<StringError>(std::move(message));
   }
 
-  /// 函数功能：完成 Wrap 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] cause 调用方传入的参数，具体约束以头文件声明为准。
-  /// @param[in] message 调用方传入的参数，具体约束以头文件声明为准。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   ErrorPtr Wrap(ErrorPtr cause, std::string message)
   {
     if (!cause)
@@ -327,14 +254,6 @@ namespace go2cpp
     return std::make_shared<WrappedError>(std::move(message), std::move(cause));
   }
 
-  /// 函数功能：完成 Join 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] causes 调用方传入的参数，具体约束以头文件声明为准。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   ErrorPtr Join(std::vector<ErrorPtr> causes)
   {
     std::vector<ErrorPtr> filtered;
@@ -353,27 +272,11 @@ namespace go2cpp
     return std::make_shared<JoinError>(std::move(filtered));
   }
 
-  /// 函数功能：完成 Join 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] causes 调用方传入的参数，具体约束以头文件声明为准。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   ErrorPtr Join(std::initializer_list<ErrorPtr> causes)
   {
     return Join(std::vector<ErrorPtr>(causes));
   }
 
-  /// 函数功能：完成 Unwrap 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   ErrorPtr Unwrap(const ErrorPtr &error) noexcept
   {
     try
@@ -386,27 +289,11 @@ namespace go2cpp
     }
   }
 
-  /// 函数功能：完成 UnwrapAll 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   std::vector<ErrorPtr> UnwrapAll(const ErrorPtr &error)
   {
     return error ? error->UnwrapAll() : std::vector<ErrorPtr>{};
   }
 
-  /// 函数功能：完成 ErrorMessage 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   std::string ErrorMessage(const ErrorPtr &error)
   {
     return error ? error->Message() : std::string{};
@@ -447,15 +334,6 @@ namespace go2cpp
     }
   } // namespace
 
-  /// 函数功能：完成 Is 调用，读取或更新相关运行时状态。
-  /// 执行流程：
-  /// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-  /// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-  /// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-  /// @param[in] error 调用方传入的参数，具体约束以头文件声明为准。
-  /// @param[in] target 调用方传入的参数，具体约束以头文件声明为准。
-  /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-  /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
   bool Is(const ErrorPtr &error, const ErrorPtr &target) noexcept
   {
     try

@@ -156,7 +156,7 @@ target_link_libraries(go2cpp_io PUBLIC go2cpp_context go2cpp_scheduler)
 target_link_libraries(go2cpp_network PUBLIC go2cpp_io go2cpp_context go2cpp_scheduler go2cpp_sync)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_hook PUBLIC go2cpp_io go2cpp_fiber
-                          ${CMAKE_DL_LIBS})
+                          go2cpp_config ${CMAKE_DL_LIBS})
 endif()
 target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_error go2cpp_control_flow go2cpp_context go2cpp_channel go2cpp_scheduler

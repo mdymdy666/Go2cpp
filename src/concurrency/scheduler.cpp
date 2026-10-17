@@ -109,6 +109,8 @@ thread_local PId t_processor_id = 0;
 // region is destroyed can still clear the original M's state.
 thread_local MId t_blocking_machine_id = 0;
 
+// 默认 P 数量 = 硬件并发度。`hardware_concurrency()` 在无法确定时返回 0，
+// 这里兜底为 1 —— 返回 0 会让调度器算出 0 个 P，worker 一个都不启。
 std::size_t default_processor_count() noexcept {
     const auto count = std::thread::hardware_concurrency();
     return count == 0 ? 1U : static_cast<std::size_t>(count);
@@ -120,6 +122,9 @@ std::int64_t steady_now_ns() noexcept {
         .count();
 }
 
+// 毫秒转纳秒，**饱和**而非回绕：超过可表示范围时返回 int64 最大值。
+// 这样"超长超时"会被当成"几乎无限"；若回绕成负数，等待会立即返回，
+// 语义就从"等很久"变成"不等"，是最危险的那种错。
 std::int64_t milliseconds_to_ns(
     std::chrono::milliseconds duration) noexcept {
     constexpr auto max_value = std::numeric_limits<std::int64_t>::max();
@@ -1204,6 +1209,10 @@ public:
         }
     }
 
+// 把 G 放进**紧急队列**，专供 cannot-fail 的收尾路径（取消、shutdown、
+// 信号处理）。不走普通 enqueue 的原因：那条路要做队列分配、可能抛
+// bad_alloc、还要抢 P 队列锁；而在收尾路径里失败就意味着 G 永久悬挂。
+// 这里只改三个裸指针，O(1)、不分配、不抛异常。
     void emergency_enqueue_locked(const std::shared_ptr<Task>& task) noexcept {
         if (!task) {
             return;
@@ -1217,6 +1226,9 @@ public:
         emergency_tail = task;
     }
 
+// 从紧急队列头部摘一个 G，并在摘空时把 tail 一起清掉（否则 tail
+// 会悬空指向已弹出的节点）。与 emergency_enqueue_locked 配对，
+// 两者都假定调用方已持有 m_impl->mutex。
     std::shared_ptr<Task> emergency_pop_locked() noexcept {
         if (!emergency_head) {
             return {};
@@ -2659,6 +2671,12 @@ Scheduler::BlockingRegion::~BlockingRegion() noexcept {
     }
 }
 
+// 进入 BlockingRegion：把当前 M 从 kRunning 标到 kBlocking，记录起始时间
+// 与所属 G，并让 blocking_workers +1。
+// 这一步是 **handoff 的触发点** —— sysmon 看到某台 M 在 kBlocking 停留过久，
+// 就会把它的 P 转交给别的 M，保证即使这台 M 卡在原生调用（阻塞 read/
+// 第三方库）里，队列中的 G 仍有人执行。
+// 只有当前 M 处于 kRunning 才成功；其它状态说明已有别的路径在管它。
 bool Scheduler::enter_blocking() noexcept {
     Scheduler* const scheduler = current_scheduler();
     if (scheduler == nullptr || !scheduler->m_impl || !current_task()) {
@@ -2698,6 +2716,10 @@ bool Scheduler::enter_blocking() noexcept {
     return entered;
 }
 
+// 离开 BlockingRegion：按 thread_local 记下的 machine id 恢复 M 状态。
+// 用 t_blocking_machine_id 而不是重新查 current，是因为进入与离开之间
+// 可能发生过 Fiber 迁移 —— 必须恢复**进入时那台 M**，否则会留下
+// 一台永远停在 kBlocking 的 M，sysmon 会反复尝试 handoff 它。
 void Scheduler::leave_blocking() noexcept {
     Scheduler* const scheduler = current_scheduler();
     if (scheduler == nullptr || !scheduler->m_impl ||

@@ -1,4 +1,5 @@
 #include "go2cpp/hook.hpp"
+#include "go2cpp/config/config.hpp"
 
 #ifndef __linux__
 #error "go2cpp hook interposition currently requires Linux"
@@ -24,6 +25,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <string>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
@@ -137,14 +139,6 @@ Function load_symbol(const char* name) noexcept {
     return function;
 }
 
-/// 函数功能：完成 initialize_originals 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void initialize_originals() noexcept {
     if (s_resolving) {
         return;
@@ -210,14 +204,6 @@ auto invoke_native_blocking(Function function, Args&&... args)
     return invoke_real(function, std::forward<Args>(args)...);
 }
 
-/// 函数功能：完成 raw_close_fallback 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int raw_close_fallback(int fd) noexcept {
     return static_cast<int>(::syscall(SYS_close, fd));
 }
@@ -227,14 +213,6 @@ std::atomic<std::uint64_t> s_scoped_enable_count{0};
 std::atomic<std::int64_t> s_connect_timeout_ms{5000};
 thread_local IOManager* s_bound_manager = nullptr;
 
-/// 函数功能：完成 hooks_enabled 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool hooks_enabled() noexcept {
     const bool process_enabled =
         s_enabled.load(std::memory_order_acquire) ||
@@ -242,14 +220,6 @@ bool hooks_enabled() noexcept {
     return go2cpp::thread_policy::detail::HookAllowed(process_enabled);
 }
 
-/// 函数功能：完成 current_manager 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 IOManager* current_manager() noexcept {
     if (IOManager* manager = IOManager::Current()) {
         return manager;
@@ -257,14 +227,6 @@ IOManager* current_manager() noexcept {
     return s_bound_manager;
 }
 
-/// 函数功能：完成 cooperative_manager 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 IOManager* cooperative_manager() noexcept {
     if (!hooks_enabled() || s_real_call_depth != 0 ||
         go2cpp::Fiber::Current() == nullptr ||
@@ -284,15 +246,6 @@ struct OpenDescription {
 };
 
 struct Descriptor {
-    /// 函数功能：执行 Descriptor，完成本函数所属模块的单步操作。
-    /// 执行流程：
-    /// 1. 校验传入参数以及当前对象/线程状态；
-    /// 2. 按状态机规则获取必要的锁并更新内部数据；
-    /// 3. 发布结果、唤醒等待者并保持资源生命周期完整。
-    /// @param[in] description 调用方传入的参数，具体约束以头文件声明为准。
-    /// @param[in] descriptor_token 调用方传入的参数，具体约束以头文件声明为准。
-    /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
-    /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     Descriptor(std::shared_ptr<OpenDescription> description,
                DescriptorTokenPtr descriptor_token)
         : m_open(std::move(description)),
@@ -307,14 +260,6 @@ struct Descriptor {
 std::mutex s_descriptors_mutex;
 std::unordered_map<int, std::shared_ptr<Descriptor>> s_descriptors;
 
-/// 函数功能：完成 timeval_duration 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] value 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::optional<Duration> timeval_duration(const timeval& value) noexcept {
     if (value.tv_sec < 0 || value.tv_usec < 0 || value.tv_usec >= 1000000) {
         return std::nullopt;
@@ -336,15 +281,6 @@ std::optional<Duration> timeval_duration(const timeval& value) noexcept {
         Microseconds(seconds * 1000000ULL + microseconds));
 }
 
-/// 函数功能：完成 socket_timeout 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] option 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::optional<Duration> socket_timeout(int fd, int option) noexcept {
     if (!s_originals.m_getsockopt) {
         return std::nullopt;
@@ -359,28 +295,12 @@ std::optional<Duration> socket_timeout(int fd, int option) noexcept {
     return timeval_duration(value);
 }
 
-/// 函数功能：完成 descriptor_for 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::shared_ptr<Descriptor> descriptor_for(int fd) {
     std::lock_guard<std::mutex> lock(s_descriptors_mutex);
     const auto found = s_descriptors.find(fd);
     return found == s_descriptors.end() ? nullptr : found->second;
 }
 
-/// 函数功能：完成 inspect_socket 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool inspect_socket(int fd) noexcept {
     if (!s_originals.m_getsockopt) {
         return false;
@@ -391,14 +311,6 @@ bool inspect_socket(int fd) noexcept {
                        &size) == 0;
 }
 
-/// 函数功能：完成 adopt_socket 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::shared_ptr<Descriptor> adopt_socket(int fd) {
     DescriptorGuard lifecycle;
     if (fd < 0 || !s_originals.m_fcntl || !inspect_socket(fd)) {
@@ -443,14 +355,6 @@ std::shared_ptr<Descriptor> adopt_socket(int fd) {
     }
 }
 
-/// 函数功能：完成 try_adopt_socket 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::shared_ptr<Descriptor> try_adopt_socket(int fd) noexcept {
     try {
         return adopt_socket(fd);
@@ -461,15 +365,6 @@ std::shared_ptr<Descriptor> try_adopt_socket(int fd) noexcept {
     }
 }
 
-/// 函数功能：完成 register_new_socket 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] user_nonblocking 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void register_new_socket(int fd, bool user_nonblocking) {
     DescriptorGuard lifecycle;
     if (fd < 0 || !s_originals.m_fcntl) {
@@ -502,15 +397,6 @@ void register_new_socket(int fd, bool user_nonblocking) {
     }
 }
 
-/// 函数功能：完成 try_register_new_socket 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] user_nonblocking 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void try_register_new_socket(int fd, bool user_nonblocking) noexcept {
     try {
         register_new_socket(fd, user_nonblocking);
@@ -538,14 +424,6 @@ DescriptorSnapshot snapshot_descriptor(
     return snapshot;
 }
 
-/// 函数功能：完成 descriptor_closed 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] descriptor 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool descriptor_closed(const std::shared_ptr<Descriptor>& descriptor) noexcept {
     return snapshot_descriptor(descriptor).m_closed;
 }
@@ -554,14 +432,6 @@ struct ClosePlan {
     std::shared_ptr<Descriptor> m_descriptor;
 };
 
-/// 函数功能：完成 prepare_close 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ClosePlan prepare_close(int fd) {
     ClosePlan plan;
     {
@@ -579,15 +449,6 @@ ClosePlan prepare_close(int fd) {
     return plan;
 }
 
-/// 函数功能：完成 finish_close 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] descriptor 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void finish_close(int fd, const std::shared_ptr<Descriptor>& descriptor) {
     if (!descriptor) {
         return;
@@ -599,27 +460,10 @@ void finish_close(int fd, const std::shared_ptr<Descriptor>& descriptor) {
     }
 }
 
-/// 函数功能：完成 notify_before_close 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void notify_before_close(int fd) {
     IOManager::NotifyCloseAll(fd);
 }
 
-/// 函数功能：完成 clone_descriptor 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] old_fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] new_fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void clone_descriptor(int old_fd, int new_fd) {
     auto source = descriptor_for(old_fd);
     if (!source && cooperative_manager()) {
@@ -638,15 +482,6 @@ void clone_descriptor(int old_fd, int new_fd) {
     }
 }
 
-/// 函数功能：完成 try_clone_descriptor 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] old_fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] new_fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void try_clone_descriptor(int old_fd, int new_fd) noexcept {
     try {
         clone_descriptor(old_fd, new_fd);
@@ -692,14 +527,6 @@ void restore_failed_replacement(
     }
 }
 
-/// 函数功能：完成 source_fd_is_valid 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool source_fd_is_valid(int fd) noexcept {
     if (fd < 0 || !s_originals.m_fcntl) {
         return false;
@@ -714,14 +541,6 @@ std::optional<Duration> operation_timeout(
                                    : descriptor->m_open->m_send_timeout;
 }
 
-/// 函数功能：完成 can_wait 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] descriptor 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool can_wait(const std::shared_ptr<Descriptor>& descriptor) noexcept {
     std::lock_guard<std::mutex> lock(descriptor->m_open->m_mutex);
     return descriptor->m_open->m_socket &&
@@ -729,14 +548,6 @@ bool can_wait(const std::shared_ptr<Descriptor>& descriptor) noexcept {
            !descriptor->m_open->m_user_nonblocking;
 }
 
-/// 函数功能：完成 wait_error 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] result 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int wait_error(const go2cpp::IOWaitResult& result) noexcept {
     switch (result.status) {
         case IOWaitStatus::kReady:
@@ -897,14 +708,6 @@ Result cooperative_io(int fd, Function function, IOEvent event,
     }
 }
 
-/// 函数功能：完成 has_dontwait 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] flags 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool has_dontwait(int flags) noexcept {
 #ifdef MSG_DONTWAIT
     return (flags & MSG_DONTWAIT) != 0;
@@ -927,16 +730,6 @@ std::optional<Duration> connect_wait_timeout(
     return std::chrono::milliseconds(milliseconds);
 }
 
-/// 函数功能：完成 cooperative_connect 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] address 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] length 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
     if (!s_originals.m_connect) {
         errno = ENOSYS;
@@ -1022,14 +815,6 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
 
 enum class SleepOutcome { Unavailable, Completed, Interrupted };
 
-/// 函数功能：完成 cooperative_sleep_for 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] duration 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 SleepOutcome cooperative_sleep_for(Duration duration) {
     IOManager* manager = cooperative_manager();
     if (duration <= Duration::zero()) {
@@ -1054,14 +839,6 @@ SleepOutcome cooperative_sleep_for(Duration duration) {
     return SleepOutcome::Interrupted;
 }
 
-/// 函数功能：完成 saturating_duration 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] value 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 Duration saturating_duration(const timespec& value) noexcept {
     using Nanoseconds = std::chrono::nanoseconds;
     const auto max_ns =
@@ -1079,14 +856,6 @@ Duration saturating_duration(const timespec& value) noexcept {
 
 enum class FcntlArgument { None, Integer, Pointer, Unknown };
 
-/// 函数功能：完成 fcntl_argument 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] command 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 FcntlArgument fcntl_argument(int command) noexcept {
     switch (command) {
         case F_GETFD:
@@ -1156,14 +925,6 @@ FcntlArgument fcntl_argument(int command) noexcept {
     }
 }
 
-/// 函数功能：完成 ioctl_has_pointer_argument 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] request 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool ioctl_has_pointer_argument(unsigned long request) noexcept {
     if (request == FIONBIO || request == FIONREAD) {
         return true;
@@ -1176,14 +937,6 @@ bool ioctl_has_pointer_argument(unsigned long request) noexcept {
     return false;
 }
 
-/// 函数功能：完成 ioctl_has_no_argument 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] request 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 bool ioctl_has_no_argument(unsigned long request) noexcept {
 #ifdef FIOCLEX
     if (request == FIOCLEX) {
@@ -1207,42 +960,18 @@ bool ioctl_has_no_argument(unsigned long request) noexcept {
 
 namespace go2cpp::hook {
 
-/// 函数功能：完成 set_enabled 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] enabled_value 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void set_enabled(bool enabled_value) noexcept {
     s_enabled.store(enabled_value, std::memory_order_release);
 }
 
 bool enabled() noexcept { return hooks_enabled(); }
 
-/// 函数功能：完成 bind_io_manager 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] manager 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void bind_io_manager(IOManager* manager) noexcept {
     s_bound_manager = manager;
 }
 
 IOManager* bound_io_manager() noexcept { return s_bound_manager; }
 
-/// 函数功能：完成 set_connect_timeout 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] timeout 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void set_connect_timeout(std::chrono::milliseconds timeout) noexcept {
     s_connect_timeout_ms.store(timeout == std::chrono::milliseconds::max()
                                    ? -1
@@ -1250,132 +979,262 @@ void set_connect_timeout(std::chrono::milliseconds timeout) noexcept {
                                std::memory_order_release);
 }
 
-/// 函数功能：完成 connect_timeout 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 std::chrono::milliseconds connect_timeout() noexcept {
     const auto value = s_connect_timeout_ms.load(std::memory_order_acquire);
     return value < 0 ? std::chrono::milliseconds::max()
                      : std::chrono::milliseconds(value);
 }
 
-/// 函数功能：完成 ScopedEnable 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ScopedEnable::ScopedEnable() noexcept {
     s_scoped_enable_count.fetch_add(1, std::memory_order_acq_rel);
 }
 
-/// 函数功能：完成 ScopedEnable 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ScopedEnable::~ScopedEnable() {
     if (m_active) {
         s_scoped_enable_count.fetch_sub(1, std::memory_order_acq_rel);
     }
 }
 
-/// 函数功能：完成 ScopedEnable 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] other 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ScopedEnable::ScopedEnable(ScopedEnable&& other) noexcept
     : m_active(other.m_active) {
     other.m_active = false;
 }
 
-/// 函数功能：完成 ScopedIOManagerBinding 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] manager 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ScopedIOManagerBinding::ScopedIOManagerBinding(IOManager* manager) noexcept
     : m_previous(s_bound_manager) {
     s_bound_manager = manager;
 }
 
-/// 函数功能：完成 ScopedIOManagerBinding 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ScopedIOManagerBinding::~ScopedIOManagerBinding() {
     s_bound_manager = m_previous;
+}
+
+
+// ---------------------------------------------------------------------------
+// 每函数动态开关
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr std::size_t kHookOpCount = static_cast<std::size_t>(HookOp::kCount);
+static_assert(kHookOpCount <= 32,
+              "HookOp 位图用 uint32_t 承载，最多 32 个操作；超了要换 uint64_t");
+
+/// 默认**全开**：保持与引入开关之前完全一致的行为。
+constexpr std::uint32_t kAllHookOpsMask =
+    (kHookOpCount >= 32) ? 0xFFFFFFFFu : ((1u << kHookOpCount) - 1u);
+
+std::atomic<std::uint32_t> g_hook_op_mask{kAllHookOpsMask};
+
+constexpr const char* kHookOpNames[kHookOpCount] = {
+    "read", "readv", "recv", "recvfrom",
+    "write", "writev", "send", "sendto",
+    "connect", "accept", "sleep", "poll", "select", "epoll_wait",
+    "close", "shutdown", "fcntl", "dup", "dup2",
+};
+
+}  // namespace
+
+const char* ToString(HookOp op) noexcept {
+    const auto index = static_cast<std::size_t>(op);
+    return index < kHookOpCount ? kHookOpNames[index] : "unknown";
+}
+
+bool OpFromString(const std::string& name, HookOp* out) noexcept {
+    if (out == nullptr) {
+        return false;
+    }
+    for (std::size_t i = 0; i < kHookOpCount; ++i) {
+        if (name == kHookOpNames[i]) {
+            *out = static_cast<HookOp>(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool OpEnabled(HookOp op) noexcept {
+    const auto bit = static_cast<std::uint32_t>(op);
+    if (bit >= kHookOpCount) {
+        // 越界视为启用：宁可多 Hook 也不要因为无效枚举把 IO 路径静默关掉。
+        return true;
+    }
+    return (g_hook_op_mask.load(std::memory_order_relaxed) >> bit) & 1u;
+}
+
+void SetOpEnabled(HookOp op, bool enabled) noexcept {
+    const auto bit = static_cast<std::uint32_t>(op);
+    if (bit >= kHookOpCount) {
+        return;
+    }
+    if (enabled) {
+        g_hook_op_mask.fetch_or(1u << bit, std::memory_order_relaxed);
+    } else {
+        g_hook_op_mask.fetch_and(~(1u << bit), std::memory_order_relaxed);
+    }
+}
+
+void SetAllOpsEnabled(bool enabled) noexcept {
+    g_hook_op_mask.store(enabled ? kAllHookOpsMask : 0u, std::memory_order_relaxed);
+}
+
+std::uint32_t OpMask() noexcept {
+    return g_hook_op_mask.load(std::memory_order_relaxed);
+}
+
+
+// ---------------------------------------------------------------------------
+// 配置接入
+// ---------------------------------------------------------------------------
+
+// 每个开关的醒目警告。**这个开关是为了诊断，不是为了优化** ——
+// 关掉不会让任何东西变快，只会让协程退化成阻塞线程。
+namespace {
+
+struct HookOpDoc final {
+    const char* op_name;
+    const char* description;   // 多行：Config::DumpIni 会按 \n 拆成多条 `#` 注释
+};
+
+constexpr HookOpDoc kHookOpDocs[kHookOpCount] = {
+    {"read",
+     "!!! 危险：不建议关闭 read 的 Hook !!!\n"
+     "关闭后 read 不再 park Fiber，而是真的阻塞调用它的线程。\n"
+     "具体后果：\n"
+     "  1. 若在 Fiber 内调用：整个 worker 线程被阻塞，该线程上其余 Fiber 全部停摆；\n"
+     "  2. 与 write 开关不对称时：同一连接的收发路径一侧 park、一侧阻塞，吞吐骤降甚至卡住；\n"
+     "  3. 已 park 在 read 上的 Fiber 不会被这个开关影响（唤醒路径不查它），\n"
+     "     但新发起的 read 会走原生阻塞。\n"
+     "只在确认调用方是普通线程、或纯诊断场景下关闭。默认 true 是安全配置。"},
+    {"readv",
+     "!!! 危险：不建议关闭 readv 的 Hook !!!\n"
+     "后果同 read：关闭后在 Fiber 内会阻塞整个 worker 线程；\n"
+     "与 write/writev 不对称时可能导致收发路径行为不一致。\n"
+     "默认 true 是安全配置。"},
+    {"recv",
+     "!!! 危险：不建议关闭 recv 的 Hook !!!\n"
+     "关闭后 recv 不再 park Fiber，在协程内调用会阻塞整个 worker 线程。\n"
+     "注意：recv 常用于 socket，与 send 必须保持对称开关。\n"
+     "默认 true 是安全配置。"},
+    {"recvfrom",
+     "!!! 危险：不建议关闭 recvfrom 的 Hook !!!\n"
+     "后果同 recv：在 Fiber 内会阻塞 worker 线程。\n"
+     "与 sendto 必须保持对称开关。默认 true 是安全配置。"},
+    {"write",
+     "!!! 危险：不建议关闭 write 的 Hook !!!\n"
+     "关闭后 write 不再 park Fiber，在协程内调用会阻塞整个 worker 线程。\n"
+     "具体后果：\n"
+     "  1. 对端不读、发送缓冲区满时，write 会卡住整个 worker，而非只是这条流；\n"
+     "  2. 与 read 不对称时收发路径行为不一致。\n"
+     "默认 true 是安全配置。"},
+    {"writev",
+     "!!! 危险：不建议关闭 writev 的 Hook !!!\n"
+     "后果同 write：在 Fiber 内会阻塞 worker 线程。\n"
+     "与 readv 必须保持对称开关。默认 true 是安全配置。"},
+    {"send",
+     "!!! 危险：不建议关闭 send 的 Hook !!!\n"
+     "关闭后 send 不再 park Fiber，在协程内调用会阻塞整个 worker 线程。\n"
+     "与 recv 必须保持对称开关。默认 true 是安全配置。"},
+    {"sendto",
+     "!!! 危险：不建议关闭 sendto 的 Hook !!!\n"
+     "后果同 send：在 Fiber 内会阻塞 worker 线程。\n"
+     "与 recvfrom 必须保持对称开关。默认 true 是安全配置。"},
+    {"connect",
+     "!!! 危险：不建议关闭 connect 的 Hook !!!\n"
+     "关闭后 connect 不再 park Fiber。\n"
+     "具体后果：连接一个慢速/不可达的对端时，整个 worker 线程会被阻塞，\n"
+     "直到内核超时（可能数十秒），期间该 P 上的所有 Fiber 停摆。\n"
+     "默认 true 是安全配置。"},
+    {"accept",
+     "!!! 危险：不建议关闭 accept 的 Hook !!!\n"
+     "关闭后在无新连接时，accept 会阻塞整个 worker 线程。\n"
+     "典型症状：整个调度器看起来「卡住」，实际是一个 worker 卡在 accept 上。\n"
+     "默认 true 是安全配置。"},
+    {"sleep",
+     "!!! 危险：不建议关闭 sleep 的 Hook !!!\n"
+     "关闭后 sleep_for / nanosleep 会真实阻塞 worker 线程。\n"
+     "具体后果：一个 Fiber 里 sleep 1 秒，该 worker 上的所有 Fiber 都停 1 秒。\n"
+     "这是最能暴露「关掉 Hook 的代价」的一个开关，仅供诊断对比使用。\n"
+     "默认 true 是安全配置。"},
+    {"poll",
+     "!!! 危险：不建议关闭 poll 的 Hook !!!\n"
+     "关闭后 poll 会阻塞 worker 线程直到有事件或超时。\n"
+     "典型场景：自带事件循环的第三方库只希望 poll 不被接管 —— 那种情况建议\n"
+     "用 BlockingRegion 明确标注，而不是关闭这个开关。\n"
+     "与 select / epoll_wait 应保持一致。默认 true 是安全配置。"},
+    {"select",
+     "!!! 危险：不建议关闭 select 的 Hook !!!\n"
+     "后果同 poll：会阻塞 worker 线程。\n"
+     "与 poll / epoll_wait 应保持一致。默认 true 是安全配置。"},
+    {"epoll_wait",
+     "!!! 危险：不建议关闭 epoll_wait 的 Hook !!!\n"
+     "关闭后 epoll_wait 会阻塞 worker 线程。\n"
+     "注意：IOManager 自身的等待也走 epoll —— 关掉它会让依赖 IOManager 的\n"
+     "所有 Fiber 无法被正常调度。**这一项几乎总是应该保持开启**。\n"
+     "默认 true 是安全配置。"},
+    {"close",
+     "!!! 不应关闭 close 的 Hook !!!\n"
+     "关闭后关闭的 fd 不会从 FdManager 元数据里摘除。\n"
+     "具体后果：fd 号被复用时，Hook 会拿**过期**的 descriptor 做判断\n"
+     "（可能把普通文件当 socket，或把新 socket 当已关闭），行为不可预测。\n"
+     "**这一项没有安全的关闭场景**，请保持 true。"},
+    {"shutdown",
+     "!!! 不应关闭 shutdown 的 Hook !!!\n"
+     "同 close：跳过 Hook 会让连接状态与元数据脱节，后续读写路径可能误判。\n"
+     "**没有安全的关闭场景**，请保持 true。"},
+    {"fcntl",
+     "!!! 危险：不建议关闭 fcntl 的 Hook !!!\n"
+     "关闭后 fd 的非阻塞标志与 Hook 元数据（m_system_nonblock / m_user_nonblock）\n"
+     "不再同步。后果：Hook 以为自己设了非阻塞，实际被外部改回阻塞。\n"
+     "默认 true 是安全配置。"},
+    {"dup",
+     "!!! 不应关闭 dup 的 Hook !!!\n"
+     "关闭后新 fd 不会继承 descriptor 元数据（token、事件订阅、超时配置）。\n"
+     "后果：新 fd 上的读写走不到正确的 park 路径。**请保持 true**。"},
+    {"dup2",
+     "!!! 不应关闭 dup2 的 Hook !!!\n"
+     "同 dup：元数据不继承，且目标 fd 若已被跟踪会造成元数据错位。\n"
+     "**请保持 true**。"},
+};
+
+}  // namespace
+
+void RegisterHookConfig(::go2cpp::config::Config& config) {
+    constexpr const char* kPrefix = "hook.enable_";
+    for (std::size_t i = 0; i < kHookOpCount; ++i) {
+        const auto op = static_cast<HookOp>(i);
+        const std::string key = std::string(kPrefix) + kHookOpDocs[i].op_name;
+        // 默认 true = 全开，与引入开关前的行为完全一致。
+        auto variable = config.Lookup<bool>(key, true, kHookOpDocs[i].description);
+        if (variable == nullptr) {
+            continue;   // 同名不同类型冲突：跳过，不改变现状
+        }
+        // 双向绑定：先按配置当前值设一次，再挂监听器保持后续同步。
+        SetOpEnabled(op, variable->GetValue());
+        variable->AddListener([op](const bool& /*old_value*/, const bool& new_value) {
+            SetOpEnabled(op, new_value);
+        });
+    }
 }
 
 }  // namespace go2cpp::hook
 
 extern "C" {
+using go2cpp::hook::HookOp;
+using go2cpp::hook::OpEnabled;
 
-/// 函数功能：完成 go2cpp_hook_set_enabled 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] enabled 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void go2cpp_hook_set_enabled(int enabled) noexcept {
     go2cpp::hook::set_enabled(enabled != 0);
 }
 
-/// 函数功能：完成 go2cpp_hook_is_enabled 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] 无；该函数仅使用所属对象或线程局部状态。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int go2cpp_hook_is_enabled() noexcept {
     return go2cpp::hook::enabled() ? 1 : 0;
 }
 
-/// 函数功能：完成 go2cpp_hook_bind_io_manager 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] manager 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 void go2cpp_hook_bind_io_manager(void* manager) noexcept {
     go2cpp::hook::bind_io_manager(static_cast<IOManager*>(manager));
 }
 
-/// 函数功能：完成 sleep 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] seconds 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 unsigned int sleep(unsigned int seconds) {
     initialize_originals();
     const SleepOutcome outcome =
@@ -1393,14 +1252,6 @@ unsigned int sleep(unsigned int seconds) {
     return invoke_native_blocking(s_originals.m_sleep, seconds);
 }
 
-/// 函数功能：完成 usleep 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] microseconds 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int usleep(useconds_t microseconds) {
     initialize_originals();
     const SleepOutcome outcome =
@@ -1418,15 +1269,6 @@ int usleep(useconds_t microseconds) {
     return invoke_native_blocking(s_originals.m_usleep, microseconds);
 }
 
-/// 函数功能：完成 nanosleep 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] request 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] remaining 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int nanosleep(const timespec* request, timespec* remaining) {
     initialize_originals();
     if (!request || request->tv_sec < 0 || request->tv_nsec < 0 ||
@@ -1460,16 +1302,6 @@ int nanosleep(const timespec* request, timespec* remaining) {
 // 通过 epoll 注册多个 fd 并由任一事件唤醒时，显式调用 IOManager::WaitAny/
 // WaitMany；普通线程继续使用原生 poll/select，长时间 native 调用仍由
 // BlockingRegion/sysmon 记录其 M 状态。
-/// 函数功能：完成 poll 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] descriptors 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] count 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] timeout 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int poll(struct pollfd* descriptors, nfds_t count, int timeout) {
     initialize_originals();
     if (!s_originals.m_poll) {
@@ -1537,16 +1369,6 @@ int epoll_pwait(int epoll_descriptor, epoll_event* events, int max_events,
                                   events, max_events, timeout, signal_mask);
 }
 
-/// 函数功能：完成 socket 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] domain 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] type 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] protocol 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int socket(int domain, int type, int protocol) {
     initialize_originals();
     if (!s_originals.m_socket) {
@@ -1576,31 +1398,15 @@ int socketpair(int domain, int type, int protocol, int descriptors[2]) {
     return result;
 }
 
-/// 函数功能：完成 connect 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] address 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] length 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int connect(int fd, const sockaddr* address, socklen_t length) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kConnect)) {
+        if (s_originals.m_connect) return s_originals.m_connect(fd, address, length);
+        return static_cast<int>(::syscall(SYS_connect, fd, address, length));
+    }
     return cooperative_connect(fd, address, length);
 }
 
-/// 函数功能：完成 accept 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] address 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] length 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int accept(int fd, sockaddr* address, socklen_t* length) {
     initialize_originals();
     const int accepted = cooperative_io<int>(fd, s_originals.m_accept,
@@ -1612,17 +1418,6 @@ int accept(int fd, sockaddr* address, socklen_t* length) {
     return accepted;
 }
 
-/// 函数功能：完成 accept4 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] address 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] length 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] flags 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int accept4(int fd, sockaddr* address, socklen_t* length, int flags) {
     initialize_originals();
     const int accepted = cooperative_io<int>(
@@ -1635,18 +1430,12 @@ int accept4(int fd, sockaddr* address, socklen_t* length, int flags) {
     return accepted;
 }
 
-/// 函数功能：完成 read 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] buffer 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] count 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ssize_t read(int fd, void* buffer, size_t count) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kRead)) {
+        if (s_originals.m_read) return s_originals.m_read(fd, buffer, count);
+        return static_cast<ssize_t>(::syscall(SYS_read, fd, buffer, count));
+    }
     if (s_resolving && !s_originals.m_read) {
         return static_cast<ssize_t>(::syscall(SYS_read, fd, buffer, count));
     }
@@ -1654,35 +1443,18 @@ ssize_t read(int fd, void* buffer, size_t count) {
                                     false, buffer, count);
 }
 
-/// 函数功能：完成 readv 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] vectors 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] count 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ssize_t readv(int fd, const iovec* vectors, int count) {
     initialize_originals();
     return cooperative_io<ssize_t>(fd, s_originals.m_readv, IOEvent::kRead,
                                     false, vectors, count);
 }
 
-/// 函数功能：完成 recv 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] buffer 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] length 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] flags 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ssize_t recv(int fd, void* buffer, size_t length, int flags) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kRecv)) {
+        if (s_originals.m_recv) return s_originals.m_recv(fd, buffer, length, flags);
+        return static_cast<ssize_t>(::syscall(SYS_recvfrom, fd, buffer, length, flags, nullptr, nullptr));
+    }
     // MSG_WAITALL 需要跨多次读取累计字节数；有限 Hook 不模拟该契约。保留
     // libc 的确切行为，不要在一次唤醒后静默返回短读。
 #ifdef MSG_WAITALL
@@ -1731,16 +1503,6 @@ ssize_t recvfrom(int fd, void* buffer, size_t length, int flags,
         length, flags, source, source_length);
 }
 
-/// 函数功能：完成 recvmsg 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] message 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] flags 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ssize_t recvmsg(int fd, msghdr* message, int flags) {
     initialize_originals();
 #ifdef MSG_WAITALL
@@ -1762,18 +1524,12 @@ ssize_t recvmsg(int fd, msghdr* message, int flags) {
                                     has_dontwait(flags), message, flags);
 }
 
-/// 函数功能：完成 write 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] buffer 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] count 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ssize_t write(int fd, const void* buffer, size_t count) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kWrite)) {
+        if (s_originals.m_write) return s_originals.m_write(fd, buffer, count);
+        return static_cast<ssize_t>(::syscall(SYS_write, fd, buffer, count));
+    }
     if (s_resolving && !s_originals.m_write) {
         return static_cast<ssize_t>(::syscall(SYS_write, fd, buffer, count));
     }
@@ -1781,35 +1537,18 @@ ssize_t write(int fd, const void* buffer, size_t count) {
                                     false, buffer, count);
 }
 
-/// 函数功能：完成 writev 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] vectors 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] count 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ssize_t writev(int fd, const iovec* vectors, int count) {
     initialize_originals();
     return cooperative_io<ssize_t>(fd, s_originals.m_writev, IOEvent::kWrite,
                                     false, vectors, count);
 }
 
-/// 函数功能：完成 send 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] buffer 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] length 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] flags 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ssize_t send(int fd, const void* buffer, size_t length, int flags) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kSend)) {
+        if (s_originals.m_send) return s_originals.m_send(fd, buffer, length, flags);
+        return static_cast<ssize_t>(::syscall(SYS_sendto, fd, buffer, length, flags, nullptr, 0));
+    }
     return cooperative_io<ssize_t>(fd, s_originals.m_send, IOEvent::kWrite,
                                     has_dontwait(flags), buffer, length,
                                     flags);
@@ -1823,30 +1562,12 @@ ssize_t sendto(int fd, const void* buffer, size_t length, int flags,
         length, flags, destination, destination_length);
 }
 
-/// 函数功能：完成 sendmsg 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] message 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] flags 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 ssize_t sendmsg(int fd, const msghdr* message, int flags) {
     initialize_originals();
     return cooperative_io<ssize_t>(fd, s_originals.m_sendmsg, IOEvent::kWrite,
                                     has_dontwait(flags), message, flags);
 }
 
-/// 函数功能：完成 close 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int close(int fd) {
     initialize_originals();
     ClosePlan plan;
@@ -1867,14 +1588,6 @@ int close(int fd) {
     return result;
 }
 
-/// 函数功能：完成 dup 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] old_fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int dup(int old_fd) {
     initialize_originals();
     if (!s_originals.m_dup) {
@@ -1889,15 +1602,6 @@ int dup(int old_fd) {
     return new_fd;
 }
 
-/// 函数功能：完成 dup2 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] old_fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] new_fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int dup2(int old_fd, int new_fd) {
     initialize_originals();
     if (!s_originals.m_dup2) {
@@ -1927,16 +1631,6 @@ int dup2(int old_fd, int new_fd) {
     return result;
 }
 
-/// 函数功能：完成 dup3 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] old_fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] new_fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] flags 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int dup3(int old_fd, int new_fd, int flags) {
     initialize_originals();
     if (!s_originals.m_dup3) {
@@ -1963,15 +1657,6 @@ int dup3(int old_fd, int new_fd, int flags) {
     return result;
 }
 
-/// 函数功能：完成 fcntl 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] command 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int fcntl(int fd, int command, ...) {
     initialize_originals();
     if (!s_originals.m_fcntl) {
@@ -2036,15 +1721,6 @@ int fcntl(int fd, int command, ...) {
     return result;
 }
 
-/// 函数功能：完成 ioctl 调用，读取或更新相关运行时状态。
-/// 执行流程：
-/// 1. 校验传入参数以及当前对象、线程和 Fiber 状态；
-/// 2. 按状态机规则获取必要的同步保护并执行核心操作；
-/// 3. 发布返回结果、处理异常或取消，并通知相关等待者。
-/// @param[in] fd 调用方传入的参数，具体约束以头文件声明为准。
-/// @param[in] request 调用方传入的参数，具体约束以头文件声明为准。
-/// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
-/// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
 int ioctl(int fd, unsigned long request, ...) {
     initialize_originals();
     if (!s_originals.m_ioctl) {

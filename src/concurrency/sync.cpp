@@ -62,6 +62,11 @@ namespace {
 /// condition_variable 慢 3.3 倍。
 constexpr int kWaitSpinBudget = 128;
 
+// 裸 `FUTEX_WAIT_PRIVATE`：原子地比较 *word == expected 后睡眠，
+// 值已变则立即返回 EAGAIN（"我不该睡"）。
+// **PRIVATE 后缀**表示只在本进程内等待 —— 不经过跨进程的 futex 哈希表，
+// 更快；这个条件变量从不跨进程共享，所以 PRIVATE 正确。
+// 调用方负责在 EAGAIN 时重新检查谓词，不能把它当成错误。
 int WaitFutex(std::atomic<std::uint32_t>* word, std::uint32_t expected) {
     return static_cast<int>(::syscall(SYS_futex,
                                       reinterpret_cast<std::uint32_t*>(word),
@@ -69,6 +74,9 @@ int WaitFutex(std::atomic<std::uint32_t>* word, std::uint32_t expected) {
                                       nullptr, 0));
 }
 
+// 唤醒最多 n 个在 *word 上等待的线程（PRIVATE 版，配合 WaitFutex）。
+// 返回值是**实际唤醒数**，可能小于 n —— 调用方不能据此推断等待者数量，
+// 因为唤醒与等待之间存在竞态（等待者可能刚决定睡下还没进内核）。
 int WakeFutex(std::atomic<std::uint32_t>* word, int n) {
     return static_cast<int>(::syscall(SYS_futex,
                                       reinterpret_cast<std::uint32_t*>(word),
@@ -193,6 +201,9 @@ public:
         return m_result.load(std::memory_order_acquire);
     }
 
+    // CAS 把等待结果从 kWaiting 推到终态，返回是否**本次**完成了转移。
+    // 非阻塞且幂等：多个通知者并发调用时只有一个返回 true，
+    // 其余看到已终态返回 false —— 这保证了"先到先赢、不会覆盖对方的结论"。
     bool TryFinish(WaitResult result) noexcept {
         WaitResult expected = WaitResult::kWaiting;
         return m_result.compare_exchange_strong(
@@ -224,6 +235,8 @@ public:
         return true;
     }
 
+    // 读取唤醒代际。每次 Wake 递增；等待者用它判断"我记下的代际是否已过期"
+    // （过期说明通知已发生，无需再 park）。读时持锁，与 WakeLocked 的写互斥。
     std::uint64_t generation() noexcept {
         std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
         return m_generation;
@@ -365,6 +378,10 @@ std::shared_ptr<WaitNode> AcquireWaitNode(Scheduler* scheduler,
     return std::make_shared<WaitNode>(scheduler, std::move(task));
 }
 
+// 自旋等待时的 CPU 提示。x86 用 `_mm_pause`：让流水线知道这是自旋，
+// 减少分支预测失败导致的流水线冲刷，也降低功耗与超线程争用。
+// **刻意不用** `sched_yield()`：后者会把 CPU 让给别的线程，
+// 在本项目只有几十次迭代的自旋预算里，让出/换回的开销远大于收益。
 inline void RelaxCpu() noexcept {
 #if defined(__x86_64__) || defined(__i386__)
     _mm_pause();
