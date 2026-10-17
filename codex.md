@@ -7677,3 +7677,32 @@ alignas(64) std::atomic<std::uint32_t> m_futex_seq{0};   // 在 WaitNode 里
 
 改动极小：一行声明 + 一个 include，27 处调用点**一行未改** —— 因为 ParkingCondition 的
 wait/wait_for/wait_until/notify_* 签名与 cv 完全一致，这正是「不改变上层接口」的体现。
+
+---
+
+## 2026-10-17 20:55：残余瓶颈 = 全局 m_impl->mutex（本轮收尾）
+
+condition 换 futex 后 4 worker 仍 2.81x。用 benchmark 第 6 参数解耦 processor_count 与 worker 数：
+
+| 配置 | 4/1 倍率 |
+|---|---|
+| P=4（原配置）| 2.54x |
+| P=1（消除 P 间争用）| 3.00x |
+
+**两者接近** → 残余瓶颈是全局 `m_impl->mutex`（1815 行，95 处调用点），不是 P 间争用。
+
+下一步两个方向：① 换成本项目的 `core::HybridMutex`（有自旋 + futex 慢路径，但接口不同、95 处要改）；
+② 保留 `std::mutex` 但缩短持有时间（predicate 移锁外 / admission 拆成锁内认领 + 锁外唤醒）。
+
+**经验支持方向 ①**：`sync::Mutex` 上把「有等待者时的自旋额度」从 0 放宽到 4 就带来了 21 倍改善
+（36,014 → 1,710 ns），`HybridMutex` 的自旋正是同一机制。
+
+**本日性能任务最终成果**：
+- worker 劣化 3 worker：7.85x → **1.60x**（5.63 倍）；
+- 4 worker：15.70x → **2.81x**（6.39 倍），绝对耗时 24,376.7 → **3,817.5 ns**；
+- `ParkingCondition` futex 化：C4 快 **152%**、C2 快 21%；
+- `sync::Mutex` futex 化 + 自旋额度修复：B4 快 **21 倍**；
+- 全量 ctest 始终 **80/80**。
+
+**最有价值的经验**：不要把「等待原语」和「锁交接逻辑」混为一谈 —— 前者只在「等待本身是瓶颈」时有效
+（ParkingCondition 的基准），后者在多线程争用时才是关键（sync::Mutex 的自旋额度、调度器的全局锁）。

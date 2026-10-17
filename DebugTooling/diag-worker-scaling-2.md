@@ -302,3 +302,43 @@ core::ParkingCondition condition;   // 已 futex 化（commit 1972d4d）
   （95 处调用点，工作量大但方向明确）；
 - 或按本轮的做法，先给 `m_impl->mutex` 的争用路径加自旋预算
   （`sync::Mutex` 上这一手带来了 21 倍改善）。
+
+---
+
+## 2026-10-17 20:40–20:55：残余瓶颈定位
+
+condition 换 futex 后 4 worker 仍有 2.81x（3,817 vs 1,357 ns）。用 benchmark 的第 6 参数
+把 `processor_count` 与 worker 数解耦，判断残余来自 P 间争用还是全局锁：
+
+| 配置 | 1 worker | 4 worker | 4/1 |
+|---|---:|---:|---:|
+| **P=4**（原配置）| 1,559.3 | 3,955.1 | **2.54x** |
+| **P=1**（消除 P 间争用）| 1,342.2 | 4,022.8 | **3.00x** |
+
+**两者接近**（P=1 甚至略差）→ **残余瓶颈在全局 `m_impl->mutex`**，不在
+`processor.mutex` 或 work stealing。
+
+### 下一步（明确但工作量大）
+
+`src/concurrency/scheduler.cpp:1815` 的 `mutable std::mutex mutex;` 是调度器的全局锁，
+`admission` 事务、`condition` 的 predicate、`maybe_grow` 全部在它上面，**95 处调用点**。
+
+两个可选方向：
+1. **换成 `core::HybridMutex`**（本项目已有：`atomic_flag` 自旋 + `std::mutex` 慢路径）；
+   但它的 `lock()` 是 `noexcept` 且非 `std::mutex` 接口，`std::unique_lock<std::mutex>` /
+   `std::lock_guard<std::mutex>` 的写法都要改，95 处工作量大且有风险；
+2. **保留 `std::mutex` 但缩短持有时间**：把 `condition` 的 predicate 计算移到锁外、
+   或把 `admission` 事务拆成"锁内只做入队/认领"+"锁外做唤醒"。
+
+**经验支持方向 1**：`sync::Mutex` 上把"有等待者时的自旋额度"从 0 放宽到 4，
+就带来了 **21 倍**改善（36,014 → 1,710 ns）。`HybridMutex` 的自旋正是同一机制。
+
+### 本轮结束时的完整状态
+
+| 项 | 值 |
+|---|---|
+| worker 劣化 3 worker | 7.85x → **1.60x**（5.63 倍改善）|
+| worker 劣化 4 worker | 15.70x → **2.81x**（6.39 倍改善）|
+| 绝对耗时 4 worker | 24,376.7 → **3,817.5 ns** |
+| 残余瓶颈 | 全局 `m_impl->mutex`（P=1 与 P=4 接近，2.54x vs 3.00x）|
+| 全量 ctest | **80/80** |
