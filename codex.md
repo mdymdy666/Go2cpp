@@ -8075,3 +8075,83 @@ multimap 删除。**池化选错了优化点。**
   当前 14 处裸 `store` 是隐患（无法集中校验），已记录为后续改进项；
 - `FiberState` 只有 `Completed/Failed` 等少量取值，未单独建测试场景，
   由场景 1/6 间接覆盖。
+
+---
+
+## 2026-10-17 方向二/三现状：config 可变性分层尝试失败并回退
+
+### 一、现有 config 模块的能力盘点（不是缺口，是已具备）
+
+读 `include/go2cpp/config/config.hpp`（541 行）+ `src/config/config.cpp`（1095 行）后确认，
+项目已有的 config 模块**比我原以为的完整得多**：
+
+| 能力 | 状态 |
+|---|---|
+INI 解析（`IniFile`）| ✅ |
+类型编解码（`ValueCodec<T>`，含 `bool`/`level`/`vector`）| ✅ |
+强类型配置变量（`ConfigVar<T>`）| ✅ |
+**Validator / DirectValidator** | ✅ |
+**Listener（带 token 的增删）** | ✅ |
+**事务式批量提交**（`ApplyString` → `HasPending` → `NotifyPending` / `RollbackPending`）| ✅ |
+**原子快照无锁读**（`std::atomic_load` 发布 `shared_ptr<const T>`）| ✅ |
+文件热重载（`LoadFromFile` + watcher）| ✅ |
+
+**我此前新建的 `ConfigRegistry` 是完全重复的实现，已删除。这是违反「复用优先」的失误。**
+
+### 二、唯一真实缺口：可变性分层
+
+`grep 'structural|Mutability|restart'` 在 config 模块里**零命中**。也就是说：
+
+对结构性配置（P 数量、栈大小、队列容量）调 `SetValue` / `FromString` 会**返回成功**，
+但已创建的对象不会重建 —— 调用方看到「设置成功」却观察不到效果。这是静默错误。
+
+### 三、尝试与失败（如实记录）
+
+按最小侵入方案实现：给 `ConfigVarBase` 加 `virtual Mutability mutability()`
+（默认 `kRuntime`，向后兼容）、`ConfigVar<T>` 加成员与构造参数、
+在 `SetValue` 与 `ApplyString` 开头拦截 `kStructural`。
+
+写了自己的测试（6 场景，`failures=0` 通过）。**但全量 ctest 出现回归**：
+
+- `go2cpp_config_center_demo` — Failed
+- `go2cpp_config_center_full` — Failed
+
+失败现象（`config_center_full`）：
+- 场景 4：`加载前=16 加载后=16`（预期 `加载后 32`），且 `error=""`；
+- 场景 5：`收到变更数=0`（预期收到两项变更）；
+- 场景 7：`启动成功=0 首次加载 64=0`。
+
+**已确认是我引入的**：把 `config.hpp` 回退到 `3b0d1f8` 后，这两个测试立刻恢复 2/2 通过。
+
+**未定位到根因**（时间不足）。可疑方向：
+1. `Config::Lookup<T>` 用 `make_shared<ConfigVar<T>>(name, value, desc)` 三参构造，
+   新加的默认参数理论上不影响，但 `m_mutability` 的成员声明位置可能落在
+   `ConfigVar<T>` 的不同访问区，导致某些路径未初始化；
+2. `LoadFromIni` 的事务路径对 `ApplyString` 的返回值/error 有特定依赖，
+   我的提前返回改变了它的语义（`error` 为空说明失败没有传递出去）。
+
+**按红线回退**：`config.hpp` 与 `cmake/Go2CppTests.cmake` 均从 `3b0d1f8` 恢复，
+删除新增测试文件。**全量 ctest 恢复 82/82。**
+
+### 四、我在这个任务里犯的两个操作错误（必须记住）
+
+1. **用 `sed` 按名字删 CMake 行会破坏文件结构**。我因此两次弄坏 `Go2CppTests.cmake`：
+   一次留下孤立的 `-O2 -Wall -Wextra -Wpedantic)`，一次误删了
+   `go2cpp_high_load_stress` 的 `set_tests_properties`。
+   **正确做法：用 `git show <commit>:<path> > <path>` 整体恢复，不要按名字过滤删行。**
+2. **`echo rc=$?` 在 pwsh 里被吃掉**，导致我误判「构建成功」。
+   应改为检查产物是否存在，或全程用 Python 脚本读 `subprocess` 的返回码。
+
+### 五、方向三（net / QUIC / HTTP3）状态
+
+**完全未做**。QUIC 是数万行工程，本轮时间（1.5 小时）不足以开始。
+没有写设计文档，也没有假装实现。
+
+### 六、如果继续做方向二，正确的下一步
+
+1. 先跑通「只编译 `go2cpp_config` + 两个 config_center 测试」的最小循环，
+   再逐行加改动，确认每一步都不破坏 `config_center`；
+2. 或者换更小的切入点：**不改 `ConfigVarBase`**，而是在 `Config` 层维护
+   「结构性配置名」集合，在 `LoadFromIni` 前过滤并给出诊断 —— 侵入面小得多；
+3. 也要考虑：也许**不需要**可变性分层。如果项目约定「结构性配置只在构造期设置」，
+   那正确的做法是文档化这条约定，而不是加运行时检查。
