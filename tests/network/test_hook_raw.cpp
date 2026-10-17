@@ -156,7 +156,14 @@ void ScenarioDoesNotPark() {
     (void)close_f(fds[0]);
     (void)close_f(fds[1]);
 
-    std::printf("[hook-raw] 场景3: read_f 阻塞期间心跳增量 = %d（阻塞时预期 < 8）\n", delta);
+    std::printf("[hook-raw] 场景3: before=%d（探针：必须 > 0，否则心跳根本没跑）, "
+                "after=%d, delta=%d（阻塞时预期 < 8）\n",
+                before, after, delta);
+    // **探针断言**：先证明「心跳机制本身在工作」，否则 delta == 0 毫无意义。
+    // 60ms / 10ms 一跳 约 6 次，阈值取 3 容纳启动抖动。
+    // 这一条是 agentT 发现的假阳性修复核心：原版只断言 delta < 8，
+    // 而「心跳没跑」和「心跳被阻塞」都会让 delta == 0，无法区分。
+    Check(before >= 3, "heartbeat fiber must be running before measuring (probe)");
     // read_f 真阻塞 worker → 心跳在这 200ms 内几乎不动。
     // 阈值放宽到 8，容纳调度抖动；如果 read_f 走了 park 路径，增量会有 15~20。
     Check(delta < 8, "read_f must block the worker (heartbeats should be nearly flat)");
