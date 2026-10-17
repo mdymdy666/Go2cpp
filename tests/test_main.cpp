@@ -9,6 +9,7 @@ void run_control_flow_tests();
 void run_context_tests();
 void run_channel_tests();
 void run_scheduler_tests();
+void run_scheduler_stress_tests();
 void run_dynamic_scheduler_tests();
 void run_fiber_tests();
 void run_sync_tests();
@@ -64,6 +65,7 @@ int main() {
     if (selected("context")) run_context_tests();
     if (selected("channel")) run_channel_tests();
     if (selected("scheduler")) run_scheduler_tests();
+    if (selected("scheduler_stress")) run_scheduler_stress_tests();
     if (selected("dynamic")) run_dynamic_scheduler_tests();
     if (selected("fiber")) run_fiber_tests();
     if (selected("sync")) run_sync_tests();
