@@ -215,6 +215,14 @@ public:
     HpackStatus AppendTableSizeUpdate(std::size_t new_size,
                                       std::vector<std::uint8_t>* out);
 
+    /**
+     * @brief 只修改本地动态表上限，不发送表大小更新帧。
+     * @details 用于应用对端 SETTINGS 里的 `SETTINGS_HEADER_TABLE_SIZE` ——
+     *          对端声明的是"它愿意接收多大"，编码器据此收缩自己的表。
+     *          需要主动通知对端时用 `AppendTableSizeUpdate`。
+     */
+    void SetTableSize(std::size_t max_size) noexcept { m_table.SetMaxSize(max_size); }
+
     /** @brief 当前动态表（只读，便于测试断言）。 */
     const DynamicTable& Table() const noexcept { return m_table; }
 

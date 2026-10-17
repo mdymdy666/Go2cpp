@@ -8428,3 +8428,79 @@ sysmon 监控长阻塞 | ✅ | `enable_sysmon` / `sysmon_interval` |
    —— 纯逻辑，可照 Go 的 `frame.go` 抄；
 3. **流状态机 + 流控** —— 这里开始需要适配 Fiber（但状态机本身仍是纯逻辑）；
 4. **并发/IO 适配** —— 用 `IOManager::wait` 替代异步回调，这是使用者说的「把并发部分改改」。
+
+---
+
+## 2026-10-17 方向三：HTTP/2 连接层完成 —— 板块闭环
+
+### 设计核心：把 IO 抽成 Transport
+
+连接层 90% 是协议逻辑（握手、帧循环、流表、状态推进），只有"从哪读、往哪写"
+与环境相关。把它抽成 `Transport` 接口后：
+
+- **测试**用 `MemoryTransport`（双向内存缓冲），单线程就能跑完整闭环，
+  不需要真实 socket、不需要 Fiber；
+- **生产**换成 `IOManager` + Fiber 的实现，**连接层代码一行不改**。
+
+这正是使用者说的「把并发部分改改」——**并发只体现在 Transport 的实现里**。
+
+### 已实现（`connection.hpp` 193 行 + `connection.cpp` 459 行）
+
+| 能力 | 说明 |
+|---|---|
+客户端/服务端握手 | preface + SETTINGS 交换 + ACK |
+客户端发起请求 | `StartRequest` 分配奇数流 id，HPACK 编码，发 HEADERS |
+发送 DATA | `WriteData`，流状态机校验 |
+服务端回响应 | `SendResponseHeaders` |
+事件读取 | `ReadEvent` 返回 HEADERS/DATA/SETTINGS/PING/GOAWAY/RST_STREAM/WINDOW_UPDATE |
+流表 | `map<stream_id, StreamStateMachine>` |
+自动处理 | PING 自动回 ACK、SETTINGS 自动 ACK、收到 DATA 自动回 WINDOW_UPDATE |
+GOAWAY / RST_STREAM | `SendGoAway` / `ResetStream` |
+
+### 明确未实现（不假装支持，都在头文件里标注）
+
+- **CONTINUATION**：header block 超过一帧时返回 `kUnsupported`。它要求"同一时刻
+  只允许一条流发 header block"的互斥状态，属独立工作；
+- **精细流控**：当前收到 DATA 立刻把窗口补回（等价于不真正限流）。真正流控要按
+  `SETTINGS_INITIAL_WINDOW_SIZE` 与接收方读取速度配平；
+- **优先级**：PRIORITY 能解析但不参与调度（RFC 9113 已弃用）；
+- **服务器推送的实际使用**：PUSH_PROMISE 能解析，无推送 API。
+
+### 测试：`tests/network/test_connection.cpp`（8 场景，failures=0）
+
+1. 客户端握手（检查 preface 开头、1 个 SETTINGS、1 个 ACK）；
+2. 服务端握手；
+3. preface 错误（用完整 HTTP/1.1 请求触发不匹配）+ **数据不足 24 字节且 EOF 应报 kClosed 而非协议错误**；
+4. **请求闭环**：客户端发 HEADERS → 字节喂给服务端 → 服务端解出全部 5 个头部并逐项比对；
+5. **响应闭环**：客户端 HEADERS+DATA → 服务端收 → 服务端回 HEADERS+DATA → 客户端收，
+   验证 `:status: 200` 与响应体；
+6. 流状态与流表（stream id 1/3 递增、end_stream 后 half-closed(local)、未知流拒绝 DATA）；
+7. GOAWAY 与 RST_STREAM；
+8. 错误处理（未握手发请求、服务端不能发请求、EOF 后 ReadEvent 返回 kClosed）。
+
+### 排错记录（两处真实问题）
+
+1. **`std::map::operator[]` 需要默认构造**，而 `StreamStateMachine` 没有（流 id 必须确定）。
+   改用 `try_emplace(stream_id, stream_id)`；
+2. **`Encoder` 缺 `SetTableSize`**（只改本地表上限、不发帧），补上以便应用对端
+   `SETTINGS_HEADER_TABLE_SIZE`。
+
+### HTTP/2 板块现状：协议闭环已通
+
+| 模块 | 行数 | 状态 |
+|---|---:|---|
+HPACK | 224 + 549 | ✅ 完整（含 Huffman）|
+Huffman | 63 + 162 | ✅ 完整 |
+帧层 | 275 + 538 | ✅ 完整 |
+流状态机 | 132 + 192 | ✅ 完整 |
+连接层 | 193 + 459 | ✅ 闭环（未做 CONTINUATION / 精细流控）|
+
+**全量 ctest 通过。**
+
+### 下一步（若要接入真实网络）
+
+1. 写 `FiberTransport`：用 `IOManager::wait(fd, kRead)` + `read/write` 实现
+   `Transport`，把阻塞变成 Fiber 挂起；
+2. 补 CONTINUATION（大 header 必需）；
+3. 补精细流控；
+4. 做 HTTP/2 客户端 Demo 与 `curl --http2` 对抓包验证。
