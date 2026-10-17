@@ -7855,3 +7855,26 @@ victim 锁）。这同时解释了 workers=1 时持有仅 7.4 µs（processors.s
 降到约 1,400 ns（倍率 2.81x → 1.0~1.2x）。**若达不到就说明归因错了，应回退并重新定位。**
 
 完整设计与验证清单见 `DebugTooling/futex-refactor-attempt.md`。
+
+---
+
+## 2026-10-17 25:15：steal 移锁实施后归因被证伪（第五次失败，已回退）
+
+实施了把 work stealing 移出全局锁（lock_guard→unique_lock、steal 抽 lambda 放锁外、认领搬运）。
+护栏通过、ctest 80/80（**正确性无问题**），但性能全面变差：
+1 worker 1357→2144（-37%）、3 worker 2166→5130、4 worker 3818→5769。
+
+**我的强预测失败了**（预测 4 worker 降到 ~1400，实际 5769）。**更强的反证**：连 workers=1 都慢 37%，
+而 workers=1 根本不走 steal —— 说明变慢来自改动本身的额外开销（lambda 构造、unique_lock 状态维护），
+**那 30 µs 的持有时间不在 steal 上**。已回退。
+
+**教训**：我把「随并发度增长」直接等同于「steal」，这是**跳跃推理**。
+workers=4 持有 30 µs、workers=1 是 7 µs，差别确实与并发度相关，但**不是只有 steal 与并发度相关** ——
+`take_local` 的 `prefer_class` 扫描长度（`scan_limit = task_affinity_budget`）、队列长度分布
+都随并发度变化。**应该先测再改，而不是先推断再改。**
+
+**五连失败**：换锁类型（集成崩溃）、加自旋（-36%）、拆 global_queue（锁序死锁）、
+park 前预判（-37%）、steal 移锁（-34%，归因被证伪）。
+
+**下一步唯一正确的做法**：精确测量「30 µs 里各段占比」（take_local / take_global / emergency / steal
+各自耗时），而不是继续猜。这需要更细的插桩，不是改代码。
