@@ -7146,3 +7146,31 @@ median 分别为 **19,199 / 21,183 / 23,088 ns**。任务数扩大 40 倍，
 **准确性处理**：`LogSink` 的三个虚方法（`Write`/`Flush`/`Reopen`）是从头文件实际读到的签名，
 如实使用；`ConfigVar<T>` 的 `AddListener` 与 `Config::Lookup` 我按头文件里出现的类型名描述，
 具体参数未逐一核对，图里只写语义不写签名。
+
+---
+
+## 2026-10-17 14:50–15:10：任务2 —— G9 与 G10 两图（10 张模块图完成）
+
+**产出**：`diagrams/G9-tools.md`（249 行）、`diagrams/G10-debug.md`（315 行）。
+**至此 G1~G10 十组模块图全部完成。**
+
+**G9（工具与新手层）**：覆盖 `go()`/`fiber`/`DefaultSchedulerState`、`defer`、`EventBatch`(`SelectLoop`)、
+`HybridGate`(`HybridMutex`)、`FiberLocalCache`/`FiberLocal<T>`、`thread_policy` 系列。
+其中两条**必须知道的差异**已明确标注：
+① `defer` 是 RAII **作用域级**（不是 Go 的函数级），且**析构函数不能抛异常，所以 defer 里的异常会被吞掉**；
+② `select` 的"随机选一个就绪分支"**没有实现**，本项目是先到先得（与 G4 的标注一致）。
+
+**G10（调试模块）**：这是本次新增模块的架构图。类架构覆盖 7 个头文件的全部主要类型，
+并用**表格明确标出每个类的侵入性**：`DebugFiber` 是**唯一使用继承**的点（因为它是用户自己创建并真实执行的对象），
+其余全部是**代理**（因为它们包装框架已创建的对象）；对原框架的改动只有 `sync.hpp`/`sync.cpp` 各约 8 行（快照）
+加约 20 行（D3 选择器），`scheduler.hpp`/`scheduler.cpp` 新增只读的 `DebugSnapshotTasks`。
+
+图上保留了几条**设计硬约束**：`DebugFiber` 绝不能放进 `Task::m_fiber`（`Fiber` 无虚析构，实测
+`is_polymorphic == 0`）；D3 只重排队列顺序所以"所有权无缝转移、TryLock 不能插队"不受影响；
+`FollowEvents` 必须带总超时（首版缺它就无限循环并导致整条 ctest 超时）；信号处理器只置原子标志；
+`include_fibers` 默认关闭因为要遍历 16 个分片。
+
+**一处自查修正**：G10 初稿把 `DebugEventCollector` 误写为 `EventTCollector`，已改。
+
+**准确性处理**：`runtime.hpp` 与 `concurrency/core/status.hpp` 这轮没取到任何类型名，
+因此 **G9 里没有写它们**，不编造不存在的类。

@@ -24,8 +24,8 @@
 | G6 | 网络基础（socket / address / framing / endian） | `G6-network-base.md` | ✅ 已完成 |
 | G7 | 应用协议（http / websocket / sse） | `G7-protocols.md` | ✅ 已完成 |
 | G8 | 横切设施（log / config） | `G8-log-config.md` | ✅ 已完成 |
-| G9 | 工具与新手层（control_flow / go / event / thread_policy） | `G9-tools.md` | 待做 |
-| G10 | 调试模块（本次新增的 go2cpp::debug） | `G10-debug.md` | 待做 |
+| G9 | 工具与新手层（control_flow / go / event / thread_policy） | `G9-tools.md` | ✅ 已完成 |
+| G10 | 调试模块（本次新增的 go2cpp::debug） | `G10-debug.md` | ✅ 已完成 |
 
 > 说明：原 `modules/G1..G10-*.md` 是**分析讲解文档**（约 178KB 文字），保留作为图的**文字注解来源**；
 > 本目录的图才是使用者要求的交付主体。
