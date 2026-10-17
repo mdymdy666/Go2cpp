@@ -7501,3 +7501,28 @@ hook 21、channel 17、**parking_condition 7**。
 按无状态 futex 模式重构 `WaitNative`：用一个 `atomic<uint32_t> m_seq` 做代际计数，
 `notify_*` 递增后 `FUTEX_WAKE`，等待方读旧值后 `FUTEX_WAIT(expected)`；
 外部 `std::unique_lock<std::mutex>` 契约保持不变（futex 只替代"等待"，不替代外部锁）。
+
+---
+
+## 2026-10-17 18:05–19:00：futex 重构第一次尝试（失败，已回退）
+
+按使用者指定方向，尝试把 `ParkingCondition` 的普通线程等待从 `condition_variable_any`
+改为**直接基于 futex 的无状态等待**。
+
+**设计**：加两个私有成员 `m_futex_seq`（代际计数）与 `m_futex_waiters`（等待者计数，0 时跳过
+系统调用）；`notify_*` 递增代际后 `FUTEX_WAKE`，等待方读旧值后 `FUTEX_WAIT(expected)`。
+关键洞察是 `cond.wait(pred)` 本来就允许虚假唤醒，所以**不需要等待者队列**，一个共享代际字即可。
+
+**结果**：编译通过，但全量 ctest 失败（`io_hook_demo` / `io_hook_full` **Subprocess aborted**，
+是崩溃而非超时）。按红线立即回退，回退后 **ctest 100% passed, 80/80, 33.89 s**。
+
+**失败原因（推断，未验证）**：① 读 `expected` 在 `unlock` 之前，而 `FUTEX_WAIT` 返回 `EAGAIN`
+时我的循环没有再判一次谓词，可能错失唤醒；② `notify` 侧"读等待者计数 → 唤醒"不是原子的，
+存在唤醒丢失窗口；③ `io_hook` 路径可能依赖 `ParkingCondition` 的某个非显然重入语义。
+
+**净产出**：基线基准已入库（`4d174f2`，量化出 4 等待者比 2 等待者慢 48 倍）；
+完整的失败分析、后续正确做法（双字段编码或 MCS/CLH + 精确唤醒、护栏先行、分步验证）
+写入 `DebugTooling/futex-refactor-attempt.md`。`ParkingCondition` 本身无改动残留。
+
+**教训**：并发原语的无锁改造不能靠"最小改动"完成。唤醒丢失的窗口极窄，但一旦命中就是偶发崩溃。
+这次按红线回退是对的，但不该在没有专项护栏的情况下直接改实现。
