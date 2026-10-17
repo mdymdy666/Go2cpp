@@ -448,6 +448,92 @@ void ScenarioErrors() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 场景 9：CONTINUATION —— 大 header 自动分片与拼接
+// ---------------------------------------------------------------------------
+void ScenarioContinuation() {
+    MemoryTransport client_transport;
+    MemoryTransport server_transport;
+
+    std::vector<std::uint8_t> server_inbound(kPreface, kPreface + kPrefaceLen);
+    const auto settings = PeerSettings();
+    server_inbound.insert(server_inbound.end(), settings.begin(), settings.end());
+    server_transport.PushInbound(server_inbound);
+
+    Connection server(&server_transport, Role::kServer);
+    std::string error;
+    Check(server.Handshake(&error) == ConnStatus::kOk, "server handshake failed");
+    client_transport.PushInbound(server_transport.TakeOutbound());
+    Connection client(&client_transport, Role::kClient);
+    Check(client.Handshake(&error) == ConnStatus::kOk, "client handshake failed");
+
+    // 造一个 HPACK 编码后必定超过一帧（16384）的 header：
+    // 50000 个 'x'，Huffman 对 'x' 是 5 位，编码后仍约 31250 字节 > 16384。
+    const std::string big_value(50000, 'x');
+    const std::vector<HeaderField> request = {
+        {":method", "POST"},
+        {":path", "/big"},
+        {":authority", "example.com"},
+        {"x-big-payload", big_value},
+    };
+    std::uint32_t stream_id = 0;
+    Check(client.StartRequest(request, true, &stream_id, &error) == ConnStatus::kOk,
+          "StartRequest with huge header failed");
+    if (!error.empty()) {
+        std::fprintf(stderr, "[conn] 大 header 发送错误: %s\n", error.c_str());
+    }
+
+    // 客户端写出的字节里，除了 preface/SETTINGS/ACK，应该有 HEADERS + 至少 1 个 CONTINUATION
+    const auto client_out = client_transport.TakeOutbound();
+    int headers_frames = 0;
+    int continuation_frames = 0;
+    {
+        std::size_t offset = kPrefaceLen;
+        while (offset + kFrameHeaderSize <= client_out.size()) {
+            FrameHeader header;
+            if (DecodeFrameHeader(client_out.data() + offset,
+                                  client_out.size() - offset, &header) != FrameStatus::kOk) {
+                break;
+            }
+            const std::size_t total = kFrameHeaderSize + header.length;
+            if (offset + total > client_out.size()) {
+                break;
+            }
+            if (header.type == FrameType::kHeaders) ++headers_frames;
+            if (header.type == FrameType::kContinuation) ++continuation_frames;
+            offset += total;
+        }
+    }
+    std::printf("[conn] 大 header 分片: HEADERS=%d CONTINUATION=%d\n", headers_frames,
+                continuation_frames);
+    Check(headers_frames == 1, "should emit exactly one HEADERS");
+    Check(continuation_frames >= 1, "big header must be split into CONTINUATION");
+
+    // 服务端应能拼回完整 header
+    server_transport.PushInbound({client_out.begin() + static_cast<std::ptrdiff_t>(kPrefaceLen),
+                                  client_out.end()});
+    bool got = false;
+    for (int guard = 0; guard < 12 && !got; ++guard) {
+        IncomingEvent event;
+        if (server.ReadEvent(&event, &error) != ConnStatus::kOk) {
+            std::fprintf(stderr, "[conn] 服务端读大 header 失败: %s\n", error.c_str());
+            break;
+        }
+        if (event.kind == IncomingEvent::Kind::kHeaders) {
+            got = true;
+            std::string seen_big;
+            for (const auto& field : event.headers) {
+                if (field.name == "x-big-payload") seen_big = field.value;
+            }
+            Check(seen_big.size() == big_value.size(),
+                  "assembled big header value has wrong length");
+            Check(seen_big == big_value, "assembled big header value mismatch");
+        }
+    }
+    Check(got, "server never received the split header block");
+}
+
 }  // namespace
 
 int main() {
@@ -468,6 +554,8 @@ int main() {
     ScenarioGoAwayAndRst();
     std::printf("[conn][场景8] 错误处理\n");
     ScenarioErrors();
+    std::printf("[conn][场景9] CONTINUATION 大 header\n");
+    ScenarioContinuation();
 
     if (g_failures == 0) {
         std::printf("\n[conn] failures=0\n");

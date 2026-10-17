@@ -26,9 +26,10 @@
  *
  * ## 明确未实现（不假装支持）
  *
- * - **CONTINUATION**：header block 超过一个帧时返回 `kUnsupported`。真实场景
- *   需要它（大 header），但它要求"同一时刻只允许一条流在发 header block"的
- *   互斥状态，属独立工作；
+ * - **CONTINUATION**：**已支持**。发送时按 `SETTINGS_MAX_FRAME_SIZE` 自动分片
+ *   （HEADERS + 若干 CONTINUATION），接收时自动拼接直到 `END_HEADERS`；
+ *   实现上依赖"同一时刻只有一条流在发 header block"这一约束 —— 因为 `Connection`
+ *   是单驱动者（一个 Fiber）且发送是同步的，这个约束天然成立；
  * - **精细流控**：当前只在收到 DATA 后立刻把窗口补回去（等价于"不真正限流"）。
  *   真正的流控需要按 `SETTINGS_INITIAL_WINDOW_SIZE` 与接收方读取速度配平；
  * - **优先级**：PRIORITY 帧被解析但不参与调度（RFC 9113 已弃用）；
@@ -169,6 +170,23 @@ private:
     ConnStatus TakeFrame(Frame* out, std::string* error);
     /// 写一帧（直接经 Transport）。
     ConnStatus WriteFrame(const Frame& frame, std::string* error);
+    /**
+     * @brief 写一个 header block，必要时拆成 HEADERS + CONTINUATION。
+     * @details 单个帧的 payload 上限是 `m_peer_max_frame_size - 9`（去掉帧头）。
+     *          只有最后一片带 `END_HEADERS`；`end_stream` 只加在 HEADERS 上。
+     */
+    ConnStatus WriteHeaderBlock(std::uint32_t stream_id,
+                                const std::vector<std::uint8_t>& block, bool end_stream,
+                                std::string* error);
+    /**
+     * @brief 读取并拼接完整的 header block（处理零个或多个 CONTINUATION）。
+     * @param first_block 首个 HEADERS 携带的片段。
+     * @param stream_id 期望的流 id（CONTINUATION 必须同一条流）。
+     * @param out 拼接结果。
+     */
+    ConnStatus AssembleHeaderBlock(std::uint32_t stream_id,
+                                   const std::vector<std::uint8_t>& first_block,
+                                   std::vector<std::uint8_t>* out, std::string* error);
     /// 处理握手期的 SETTINGS 交换。
     ConnStatus FinishSettingsHandshake(std::string* error);
     /// 取或创建流状态机。

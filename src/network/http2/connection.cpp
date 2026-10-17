@@ -235,10 +235,6 @@ ConnStatus Connection::StartRequest(const std::vector<HeaderField>& headers, boo
         if (error != nullptr) *error = "HPACK 编码失败";
         return ConnStatus::kProtocolError;
     }
-    if (block.size() + kFrameHeaderSize > m_peer_max_frame_size) {
-        if (error != nullptr) *error = "header block 超过帧上限（未实现 CONTINUATION）";
-        return ConnStatus::kUnsupported;
-    }
     // 用 try_emplace 而不是 operator[]：StreamStateMachine 没有默认构造，
     // 而且流 id 总是确定的，无需"先默认构造再赋值"。
     auto& machine = m_streams.try_emplace(stream_id, stream_id).first->second;
@@ -246,7 +242,8 @@ ConnStatus Connection::StartRequest(const std::vector<HeaderField>& headers, boo
         if (error != nullptr) *error = "流状态机拒绝发送 HEADERS";
         return ConnStatus::kProtocolError;
     }
-    const auto status = WriteFrame(MakeHeaders(stream_id, end_stream, true, block), error);
+    // 超过一帧时自动拆成 HEADERS + CONTINUATION
+    const auto status = WriteHeaderBlock(stream_id, block, end_stream, error);
     if (status != ConnStatus::kOk) {
         return status;
     }
@@ -292,7 +289,7 @@ ConnStatus Connection::SendResponseHeaders(std::uint32_t stream_id,
         if (error != nullptr) *error = "HPACK 编码失败";
         return ConnStatus::kProtocolError;
     }
-    return WriteFrame(MakeHeaders(stream_id, end_stream, true, block), error);
+    return WriteHeaderBlock(stream_id, block, end_stream, error);
 }
 
 ConnStatus Connection::ResetStream(std::uint32_t stream_id, ErrorCode code,
@@ -304,6 +301,76 @@ ConnStatus Connection::ResetStream(std::uint32_t stream_id, ErrorCode code,
     }
     machine->SendRstStream();
     return WriteFrame(MakeRstStream(stream_id, code), error);
+}
+
+
+ConnStatus Connection::WriteHeaderBlock(std::uint32_t stream_id,
+                                        const std::vector<std::uint8_t>& block,
+                                        bool end_stream, std::string* error) {
+    if (m_peer_max_frame_size <= kFrameHeaderSize) {
+        if (error != nullptr) *error = "对端 max_frame_size 过小";
+        return ConnStatus::kProtocolError;
+    }
+    const std::size_t chunk = m_peer_max_frame_size - kFrameHeaderSize;
+    // 能一帧装下就走快路径（也是绝大多数情况）
+    if (block.size() <= chunk) {
+        return WriteFrame(MakeHeaders(stream_id, end_stream, true, block), error);
+    }
+    // 分片：HEADERS(无 END_HEADERS) + CONTINUATION... 最后一片带 END_HEADERS
+    std::size_t offset = 0;
+    bool first = true;
+    while (offset < block.size()) {
+        const std::size_t take = std::min(chunk, block.size() - offset);
+        std::vector<std::uint8_t> piece(block.begin() + static_cast<std::ptrdiff_t>(offset),
+                                        block.begin() + static_cast<std::ptrdiff_t>(offset + take));
+        offset += take;
+        const bool last = (offset >= block.size());
+        const auto status = first
+                                ? WriteFrame(MakeHeaders(stream_id, end_stream, last, piece),
+                                             error)
+                                : WriteFrame(MakeContinuation(stream_id, last, piece), error);
+        if (status != ConnStatus::kOk) {
+            return status;
+        }
+        first = false;
+    }
+    return ConnStatus::kOk;
+}
+
+ConnStatus Connection::AssembleHeaderBlock(std::uint32_t stream_id,
+                                           const std::vector<std::uint8_t>& first_block,
+                                           std::vector<std::uint8_t>* out,
+                                           std::string* error) {
+    out->clear();
+    out->insert(out->end(), first_block.begin(), first_block.end());
+    // 循环读后续帧，直到遇到 END_HEADERS。
+    for (;;) {
+        Frame frame;
+        const auto status = TakeFrame(&frame, error);
+        if (status != ConnStatus::kOk) {
+            return status;
+        }
+        if (frame.header.type != FrameType::kContinuation) {
+            // RFC 9113 §6.10：header block 未结束前出现其它帧是协议错误
+            if (error != nullptr) {
+                *error = std::string("期望 CONTINUATION，收到 ") +
+                         ToString(frame.header.type);
+            }
+            return ConnStatus::kProtocolError;
+        }
+        HeadersFrame cont;
+        if (ParseContinuation(frame, &cont, error) != FrameStatus::kOk) {
+            return ConnStatus::kProtocolError;
+        }
+        if (cont.stream_id != stream_id) {
+            if (error != nullptr) *error = "CONTINUATION 的流 id 与 HEADERS 不一致";
+            return ConnStatus::kProtocolError;
+        }
+        out->insert(out->end(), cont.header_block.begin(), cont.header_block.end());
+        if (cont.end_headers) {
+            return ConnStatus::kOk;
+        }
+    }
 }
 
 ConnStatus Connection::SendGoAway(ErrorCode code, std::string* error) {
@@ -335,13 +402,19 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
             if (ParseHeaders(frame, &headers, error) != FrameStatus::kOk) {
                 return ConnStatus::kProtocolError;
             }
+            std::vector<std::uint8_t> full_block;
             if (!headers.end_headers) {
-                if (error != nullptr) *error = "不支持 CONTINUATION 分片的 header block";
-                return ConnStatus::kUnsupported;
+                const auto assemble =
+                    AssembleHeaderBlock(headers.stream_id, headers.header_block,
+                                        &full_block, error);
+                if (assemble != ConnStatus::kOk) {
+                    return assemble;
+                }
+            } else {
+                full_block = std::move(headers.header_block);
             }
             std::vector<HeaderField> decoded;
-            if (m_decoder.DecodeBlock(headers.header_block.data(),
-                                      headers.header_block.size(), &decoded,
+            if (m_decoder.DecodeBlock(full_block.data(), full_block.size(), &decoded,
                                       error) != HpackStatus::kOk) {
                 return ConnStatus::kProtocolError;
             }

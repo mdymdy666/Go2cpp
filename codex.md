@@ -8698,3 +8698,45 @@ Python 服务端侧日志（独立解析我的请求）：
 - **CONTINUATION**：大 header（超过一帧）返回 `kUnsupported`；
 - **精细流控**：收到 DATA 立刻补窗口，等价于不真正限流；
 - **TLS/ALPN**：仅 h2c（明文）；真实互联网的 HTTP/2 几乎都在 TLS 上。
+
+---
+
+## 2026-10-17 方向三：CONTINUATION 支持（大 header 分片与拼接）
+
+### 之前
+
+`Connection` 在 header block 超过一帧时返回 `kUnsupported`。真实场景里大 header
+是存在的（长 cookie、大 token、超长 user-agent 链），缺它就不能算完整。
+
+### 实现
+
+两个私有辅助函数（`connection.cpp`）：
+
+- **`WriteHeaderBlock`**：按 `m_peer_max_frame_size - 9` 分片。
+  第一片是 `HEADERS`（带 `end_stream`，只有最后一片带 `END_HEADERS`），
+  后续是 `CONTINUATION`。能一帧装下时走快路径（绝大多数情况）。
+- **`AssembleHeaderBlock`**：接收侧循环读帧直到 `END_HEADERS`，
+  校验每个 CONTINUATION 的流 id 与 HEADERS 一致；中间出现其它帧按
+  RFC 9113 §6.10 报协议错误。
+
+`StartRequest` 与 `SendResponseHeaders` 都改走 `WriteHeaderBlock`；
+`ReadEvent` 的 HEADERS 分支在 `!end_headers` 时调 `AssembleHeaderBlock`。
+
+**关于"同一时刻只允许一条流发 header block"的约束**（RFC 要求）：
+`Connection` 是单驱动者（一个 Fiber）且发送是同步的，所以这个约束天然成立，
+无需额外加锁。
+
+### 测试：`test_connection.cpp` 新增场景 9
+
+构造 50000 字节的 `x-big-payload`（Huffman 对 'x' 是 5 位，编码后仍约 31250
+字节 > 16384 帧上限），验证：
+
+- 客户端发出的帧里 `HEADERS=1 CONTINUATION=2`（实测输出）；
+- 服务端拼回的值长度与内容与原始完全一致。
+
+**结果：`failures=0`。**
+
+### 仍未做
+
+- **精细流控**：收到 DATA 立刻补窗口，等价于不真正限流；
+- **TLS/ALPN**：仅 h2c。
