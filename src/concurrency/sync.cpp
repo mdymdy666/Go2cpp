@@ -20,6 +20,36 @@
 #include <immintrin.h>
 #endif
 
+
+#if defined(__linux__)
+#include <cerrno>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+namespace {
+
+/// FUTEX_WAIT 前的自旋预算：唤醒已在路上时完全避开系统调用。
+/// 经验来自 ParkingCondition 的改造 —— 不加自旋时 2 等待者场景会比
+/// condition_variable 慢 3.3 倍。
+constexpr int kWaitSpinBudget = 128;
+
+int WaitFutex(std::atomic<std::uint32_t>* word, std::uint32_t expected) {
+    return static_cast<int>(::syscall(SYS_futex,
+                                      reinterpret_cast<std::uint32_t*>(word),
+                                      FUTEX_WAIT_PRIVATE, expected, nullptr,
+                                      nullptr, 0));
+}
+
+int WakeFutex(std::atomic<std::uint32_t>* word, int n) {
+    return static_cast<int>(::syscall(SYS_futex,
+                                      reinterpret_cast<std::uint32_t*>(word),
+                                      FUTEX_WAKE_PRIVATE, n, nullptr, nullptr, 0));
+}
+
+}  // namespace
+#endif  // __linux__
+
 namespace go2cpp::sync {
 namespace {
 
@@ -269,7 +299,12 @@ private:
             } else {
                 // 普通线程调用者在节点私有条件变量上等待。结果字段就是谓词，
                 // 因此 wait() 之前到达的通知不会丢失。
+#if defined(__linux__)
+                m_futex_seq.fetch_add(1, std::memory_order_release);
+                (void)WakeFutex(&m_futex_seq, 1);
+#else
                 m_native_condition.notify_one();
+#endif
             }
         } catch (...) {
             // Scheduler 的可靠唤醒交接会保留所有已经启动的 G。
@@ -299,6 +334,38 @@ public:
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
     WaitResult WaitNative() noexcept {
+#if defined(__linux__)
+        // futex 无状态等待：自旋预算 -> FUTEX_WAIT(代际) -> 重判终态。
+        std::uint32_t expected = m_futex_seq.load(std::memory_order_acquire);
+        for (;;) {
+            if (result() != WaitResult::kWaiting) {
+                return result();
+            }
+            bool spun_through = false;
+            for (int spin = 0; spin < kWaitSpinBudget; ++spin) {
+                if (result() != WaitResult::kWaiting) {
+                    return result();
+                }
+                if (m_futex_seq.load(std::memory_order_acquire) != expected) {
+                    spun_through = true;
+                    break;
+                }
+                std::atomic_signal_fence(std::memory_order_seq_cst);
+            }
+            if (result() != WaitResult::kWaiting) {
+                return result();
+            }
+            if (spun_through) {
+                expected = m_futex_seq.load(std::memory_order_acquire);
+                continue;
+            }
+            (void)WaitFutex(&m_futex_seq, expected);
+            const std::uint32_t latest = m_futex_seq.load(std::memory_order_acquire);
+            if (latest != expected) {
+                expected = latest;
+            }
+        }
+#else
         try {
             std::unique_lock<std::mutex> lock(m_native_mutex);
             m_native_condition.wait(lock, [this] {
@@ -311,6 +378,7 @@ public:
             (void)TryFinish(WaitResult::kCancelled);
         }
         return result();
+#endif
     }
 
     const std::shared_ptr<Task>& task() const noexcept { return m_task; }
@@ -347,6 +415,11 @@ private:
     std::shared_ptr<Task> m_task;
     std::atomic<WaitResult> m_result{WaitResult::kWaiting};
     core::HybridMutex m_wake_mutex;
+#if defined(__linux__)
+    // 每个等待者自己的 futex 代际字：notify_one 只推进这一个 node，
+    // 所以不需要共享代际/等待者计数（比 ParkingCondition 的形态更简单）。
+    alignas(64) std::atomic<std::uint32_t> m_futex_seq{0};
+#endif
     std::mutex m_native_mutex;
     std::condition_variable m_native_condition;
     std::shared_ptr<WaitBackend> m_backend;

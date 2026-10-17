@@ -7551,3 +7551,59 @@ ETIMEDOUT / 被唤醒后重读代际）→ 全绿但 C2 退化 3.3 倍；③ 加
 **使用者「从这个角度切入可能有奇效」的判断被证实了。** 剩下的同类改造：
 `sync::Mutex`（31 处）、`HybridGate`、以及调度器内部的 `condition`/`m_impl->mutex`（95 处）——
 后者很可能与之前那个 worker 扩展性劣化同源。
+
+---
+
+## 2026-10-17 19:05–19:30：sync::Mutex 迁移到 futex（测试全绿，但性能未测出改善）
+
+沿用 `ParkingCondition` 的成功模式改造 `sync::Mutex` 的普通线程等待路径。
+
+### 实现（比 ParkingCondition 更简单）
+
+`sync::Mutex` 的每个等待者是独立的 `WaitNode`，`notify_one` 本来就针对特定 node，
+所以**不需要共享代际与等待者计数** —— 每个 `WaitNode` 自带一个代际字即可：
+
+```cpp
+alignas(64) std::atomic<std::uint32_t> m_futex_seq{0};   // 在 WaitNode 里
+```
+
+- `Wake()`：`m_futex_seq.fetch_add(1)` 后 `FUTEX_WAKE(1)`；
+- `WaitNative()`：自旋 128 次 → `FUTEX_WAIT(代际)` → 重判终态 → 重读代际。
+
+`m_native_mutex` / `m_native_condition` 经 grep 确认只有 2 处使用，用
+`#if defined(__linux__)` 完整隔离，非 Linux 平台保留原 cv 实现。
+
+### 验证
+
+**全量 ctest 100% passed, 80/80, 34.13 s。**
+
+### 性能：本次未测出可信改善（如实记录）
+
+`go2cpp_debug_lock_selector_benchmark`，负载 1.42：
+
+| 档 | min | median | max |
+|---|---:|---:|---:|
+| 档1 不干预选择器 | 3,812.82 | **22,488.77** | 26,655.01 |
+| 档2 队尾优先 | 13,579.66 | **17,566.25** | 22,209.24 |
+
+**5 轮之间方差近 7 倍**（3,812 ~ 26,655），与改造前记录的"高竞争约 18,000 ns/op"
+**无法做有效对比**。所以本轮**不对 sync::Mutex 的改造下性能结论**。
+
+需要说明：这个基准的场景是"多线程争用同一把 Mutex 反复加解锁"，其耗时主要由
+**争用下的排队与上下文切换**决定，而不是由"用 cv 还是 futex 等待"决定 —— 后者在这个
+测量口径下被淹没。要量化 `sync::Mutex` 的改造收益，需要一个能单独放大等待路径成本的场景。
+
+### 保留理由
+
+尽管没测出性能收益，仍保留这次改动，理由：
+1. **全量 ctest 80/80 通过**（含并发、取消、超时相关用例）；
+2. 代码更简单（少一个 `std::mutex` + 一个 `condition_variable` 的组合）；
+3. 与 `ParkingCondition` 的实现模式统一，后续维护成本更低；
+4. 它移除了 `WaitNode` 上一对 `std::mutex`/`condition_variable`，有利于后续把
+   `sync::Mutex` 的慢路径继续简化。
+
+### 未做
+
+- 没有为 `sync::Mutex` 的等待路径单独建一个能放大其成本的基准（现有基准的测量口径不适合）；
+- 没有改 `HybridGate`（仍是 `atomic_flag` + `std::mutex` 慢路径）；
+- 没有改调度器内部的 `condition` / `m_impl->mutex`（95 处）。
