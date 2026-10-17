@@ -11,6 +11,11 @@
 
 ## ① 类架构：每个类用的底层能力 + 主要职责
 
+> 本模块共 19 个类型，一次性画在一张图上会被 Mermaid 横向铺开、文字小到不可读。
+> 因此按职责拆成 **3 张**（每张 7~8 类，一屏可读）。
+
+### ①-A 核心链路（原 Fiber/Task/Scheduler → 调试侧）
+
 ```mermaid
 classDiagram
     direction TB
@@ -24,15 +29,6 @@ classDiagram
     class Scheduler {
         <<G2>>
     }
-    class sync_Mutex {
-        <<G4>>
-    }
-    class sync_CondVar {
-        <<G4>>
-    }
-    class sync_WaitGroup {
-        <<G4>>
-    }
     class SchedulerObserver {
         <<G2 只读插件边界>>
     }
@@ -43,20 +39,19 @@ classDiagram
         +description() / name()
         +set_source_location(file, line)
         ← 只加字段，不改 Fiber 行为
-        ← **无虚析构，绝不能放进 Task::m_fiber**
+        ← 无虚析构，绝不能放进 Task::m_fiber
     }
     class DebugRegistry {
         <<元数据注册表>>
         +Register(id, info) / Lookup(id)
         +Snapshot() / Size()
-        ← 独立 std::mutex（不用 sync::Mutex，避免依赖调度器）
+        ← 独立 std::mutex
     }
-
     class DebugScheduler {
         <<代理 Scheduler>>
         +Snapshot() / SnapshotWith(options)
         +DumpText / DumpIni / DumpJson
-        ← 只用 Scheduler 的 public 只读接口
+        ← 只用 public 只读接口
     }
     class TaskSnapshot {
         <<一个 G 的只读快照>>
@@ -65,13 +60,27 @@ classDiagram
         failed / cancellation_requested
     }
 
-    class DumpCommand {
-        <<CLI 解析结果>>
-        target / format / output
-        follow / follow_batches / follow_timeout
+    DebugFiber --|> Fiber : 继承（仅此处）
+    DebugFiber ..> DebugRegistry : 元数据登记
+    DebugScheduler ..> Scheduler : 代理（只读）
+    DebugScheduler ..> TaskSnapshot
+    DebugScheduler ..> Task : 读状态
+```
+
+### ①-B 锁观测与 D3 争用选择（原 sync → 调试侧）
+
+```mermaid
+classDiagram
+    direction TB
+
+    class sync_Mutex {
+        <<G4>>
     }
-    class DebugFileSink {
-        <<原子写：临时文件 + rename>>
+    class sync_CondVar {
+        <<G4>>
+    }
+    class sync_WaitGroup {
+        <<G4>>
     }
 
     class DebugMutex {
@@ -90,6 +99,25 @@ classDiagram
         ← 只重排队列，不改认领语义
     }
 
+    DebugMutex ..> sync_Mutex : 代理 + public Debug 方法
+    DebugConditionVariable ..> sync_CondVar
+    DebugWaitGroup ..> sync_WaitGroup
+    WaitSelector ..> sync_Mutex : Unlock 时被调用（只重排）
+```
+
+### ①-C 事件采集 / CLI / 断点 / 信号 dump
+
+```mermaid
+classDiagram
+    direction TB
+
+    class SchedulerObserver {
+        <<G2 只读边界>>
+    }
+    class DebugScheduler {
+        <<代理 Scheduler>>
+    }
+
     class EventBuffer {
         <<无锁有界环形缓冲>>
         +Push / PushBatch / Pop / PeekAt
@@ -104,9 +132,16 @@ classDiagram
     class FollowEvents {
         <<持续跟随>>
         +sink(events) -> bool
-        ← 必须带 overall_timeout，否则空缓冲会无限循环
+        ← 必须带 overall_timeout
     }
-
+    class DumpCommand {
+        <<CLI 解析结果>>
+        target / format / output
+        follow / follow_batches / follow_timeout
+    }
+    class DebugFileSink {
+        <<原子写：临时文件 + rename>>
+    }
     class DebugBreakpoints {
         <<协作式断点注册表>>
         +Add(spec) / Remove(id)
@@ -118,44 +153,23 @@ classDiagram
         +Checkpoint(name, task_id) -> id
         +ScopedCheckpoint（RAII 自动 Resume）
     }
-
     class DebugSignalDumper {
         <<SIGUSR1 驱动·跨进程>>
         +Install / Uninstall
-        +PollOnce() 
+        +PollOnce()
         +StartWatcher / StopWatcher
-        ← handler 只置 atomic 标志（async-signal-safe）
+        ← handler 只置 atomic 标志
     }
 
-    DebugFiber --|> Fiber : 继承（仅此处）
-    DebugFiber ..> DebugRegistry : 元数据登记
-    DebugScheduler ..> Scheduler : 代理（只读）
-    DebugScheduler ..> TaskSnapshot
-    DumpCommand ..> DebugScheduler : 分派
-    DumpCommand ..> DebugFileSink
-    DebugMutex ..> sync_Mutex : 代理 + public Debug 方法
-    DebugConditionVariable ..> sync_CondVar
-    DebugWaitGroup ..> sync_WaitGroup
-    WaitSelector ..> sync_Mutex : Unlock 时被调用（只重排）
     DebugEventCollector --|> SchedulerObserver : 实现只读边界
     DebugEventCollector *-- EventBuffer
     DebugEventCollector ..> FollowEvents
+    DumpCommand ..> DebugScheduler : 分派
+    DumpCommand ..> DebugFileSink
     DebugBreakpoints ..> Checkpoint
     DebugSignalDumper ..> DebugScheduler : 生成快照
     DebugSignalDumper ..> DebugEventCollector : 可选导出事件
 ```
-
-| 类 | 主要职责 | 用的底层能力 | 侵入性 |
-|---|---|---|---|
-| `DebugFiber` | 带元数据的 Fiber（`description`/`name`/`file`/`line`） | **继承 `Fiber`** | **零**（新文件） |
-| `DebugRegistry` | G id → 元数据；独立 `std::mutex` | 标准库 | **零** |
-| `DebugScheduler` | 三种格式 dump 调度器快照（含可选全 G 枚举） | **只用 `Scheduler` public 只读接口** | **零** |
-| `DumpCommand` / `DebugFileSink` | CLI 解析 + **原子写**（tmp+rename） | 标准库 | **零** |
-| `DebugMutex` 等三个代理 | 锁/条件变量/等待组的只读快照 | 原类的 `DebugSnapshotInternal()` | 原类**各加约 8 行** |
-| `WaitSelector`（D3） | 锁争用时决定谁先获得权限 | `Mutex::Unlock` 里一处调用 | 原类 **约 20 行** |
-| `EventBuffer` / `DebugEventCollector` | 非阻塞有界事件采集 | 实现 `SchedulerObserver`（**只读边界**） | **零** |
-| `DebugBreakpoints` / `Checkpoint` | **协作式**断点（**不在调度器热路径加钩子**） | 使用者代码里手动调用 | **零** |
-| `DebugSignalDumper` | `SIGUSR1` 触发跨进程 dump | POSIX `signal()` + 原子标志 | **零** |
 
 ## ② 重要函数：功能与实现要点
 

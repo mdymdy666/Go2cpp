@@ -7336,3 +7336,45 @@ $ grep -rn "go2cpp/debug" include/go2cpp/ src/ --include=*.hpp --include=*.cpp  
 提交 36 个；ctest 80/80；架构图 11 文件 / 56 张图 / **全部实机渲染通过**；
 零影响验证通过（被改动路径 0.95~1.03x）。三项未决项（3 worker 劣化、Mutex 高竞争、
 一次基准超时）仍未解决，且不由这两天的工作引入。
+
+---
+
+## 2026-10-17 15:20–16:00：实机视觉检查 —— 发现两处"能渲染但不可读/不正确"
+
+**背景**：此前只验证了"能渲染成非空 SVG"，我明确说过"未做逐张视觉检查"。这轮补做，
+把关键图转 PNG 用肉眼确认，结果又发现**两个静态检查和数量比对都发现不了的问题**。
+
+### 1. G2 的 G 状态机：顶部出现一排孤立节点
+
+渲染出来后在图顶部多出："（可立即继续，不进 park）"、"（真正切换回 worker）"、
+"或被取消后重新入队"、"（在 Fiber 边界捕获）"等**独立节点**。
+
+**根因**：我写状态转移标签时用了 `\n` 想表达换行，但 Python 三引号里 `\n` 是**真换行**，
+于是 Mermaid 把这些续行当成了**新的状态/节点**。正确写法是 `<br/>`。
+
+**修复后**：4 处标签正确合并（`park_wait 返回 kRequeued<br/>（可立即继续，不进 park）` 等），
+PNG 从 31,582 字节变为 76,943 字节（图变高、内容合并），视觉确认 7 个状态齐全、note 框正常。
+
+### 2. G10 的 classDiagram：19 类被横向铺开，文字不可读
+
+19 个类 / 132 行一次性画，Mermaid 渲染成 **784×242 的极扁横条** —— 违反"一图一屏可读"。
+
+**修复**：拆成 **3 张**（每张 7~8 类）：
+- ①-A 核心链路：`Fiber`/`Task`/`Scheduler`/`SchedulerObserver` + `DebugFiber`/`DebugRegistry`/
+  `DebugScheduler`/`TaskSnapshot`；
+- ①-B 锁与 D3 争用：三个 `sync::*` + 三个 `Debug*` 代理 + `WaitSelector`；
+- ①-C 事件/CLI/断点/信号：`SchedulerObserver`/`EventBuffer`/`DebugEventCollector`/`FollowEvents`/
+  `DumpCommand`/`DebugFileSink`/`DebugBreakpoints`/`Checkpoint`/`DebugSignalDumper`。
+
+修复后第一张是 784×428，文字清晰、箭头标注可读（"继承（仅此处）"/"元数据登记"/"代理（只读）"/"读状态"）。
+
+### 3. 一次我自己造成的破坏（必须记录）
+
+我写了个批量脚本"合并续行"，试图统一把裸换行改成 `<br/>`，**一口气改了 148 处** ——
+结果把 `subgraph` 后面的节点定义也合并了，**11 个文件全部解析失败**（`subgraph X["..."]<br/>A1["..."]`）。
+
+**恢复**：用 `git show 82f8c91:ArchitectureDiagram/diagrams/<file> > <file>` 逐个恢复
+（**刻意不用** `git checkout`/`git restore`，遵守项目对危险 git 命令的禁令），
+然后**只精确修 G2 的那 4 处**，重新渲染 **56/56 全部成功**。
+
+**教训**：批量文本替换必须先验证边界。148 处里绝大多数是误伤。
