@@ -7027,3 +7027,48 @@ median 分别为 **19,199 / 21,183 / 23,088 ns**。任务数扩大 40 倍，
 **过程自查**：本轮我在生成实验脚本后一度陷入**重复输出、没有实际发起工具调用**的状态，
 浪费了一次轮次预算；随后改为**直接用展开好的命令**（不依赖 shell 变量、不写中间脚本）
 完成了关键实验。这条记录在案：**当发现自己在重复时，应立即改为最小可执行的命令**。
+
+---
+
+## 2026-10-17 13:23 起：新任务启动（定时任务 schedule-955e5624，15 分钟一轮至 18:00）
+
+**使用者提出两项任务**（承接昨天）：
+1. 继续完整实现调试模块，补齐未做项并完善测试与 example；
+2. **重绘 ArchitectureDiagram** —— 明确指出原来的「每模块分析讲解文档」不符合要求，
+   要的是**每个模块一张图**：图内至少含 ① 类架构（每个类用了底层哪些能力、主要职责）
+   ② 重要函数的功能与具体实现 ③ 向上层提供了什么 ④ 关键函数/状态流转的**流程图**
+   （举例：Fiber 的各状态如何在 Scheduler 流转、如何被调度）。
+
+**现状核实**：`ArchitectureDiagram/` 原有 17 个文件、3486 行 Markdown、**0 个 Mermaid**、
+仅 1 个总览 `00-architecture.svg`；`modules/G1..G10-*.md` 合计约 178KB 全是**文字讲解** ——
+印证了使用者的判断。
+
+**方案**：新建 `ArchitectureDiagram/diagrams/`，每模块一个 Markdown，**固定含四类 Mermaid 图**
+（类架构 / 重要函数 / 向上层提供 / 状态流转），Mermaid 优先以便 GitHub 与编辑器直接渲染；
+原 `modules/` 保留作为图的文字注解来源。
+
+### 第 1 轮（13:23–13:50）
+
+- `diagrams/README.md`：10 组模块图清单与状态表，写明四类图的用途；
+- `diagrams/G2-scheduler.md`（325 行、**5 个 Mermaid**）：完成 GMP 调度模块。
+  类架构覆盖 `Task`/`Fiber`/`Impl`/`Processor`/`Machine`/`TaskRegistry`/`SchedulerObserver`/`SchedulerEvent`，
+  箭头标注「用底层什么能力」；重要函数画 `spawn` 的本地队列 vs 全局队列分叉、
+  `Task::run` 三终态、`worker_loop` 的本地 FIFO 与 **从队尾偷**、`park_wait` 三种返回
+  （`kRejected`/`kParked`/`kRequeued`）、`emit_event` 的短锁拷贝 + 锁外回调 + 捕获异常；
+  状态流转按使用者点名给出 **G 完整状态机**（并注明只有 5 个安全点可挂起、绝不强制 detach 任意 C++ 调用栈）
+  与 **M / P 各自状态机**；另附 spawn→结束的 ASCII 时序图与「与 Go 的差异」表。
+
+### 第 2 轮（13:50–14:05）
+
+- `diagrams/G1-foundation.md`（308 行、**5 个 Mermaid**）：完成地基层。
+  类架构含 `Fiber`/`FiberBin`/`FiberContextFrame`/`FiberExecutionBinding`/`FiberResumeResult`/
+  `ParkingCondition`/`Timer`/`TimerService`/`TimerDecision`/`TimerExecutor`；
+  重要函数画 `AcquireForScheduler` 的**栈池复用**、`resume_from_scheduler` 的**三分支返回**、
+  `Suspend` 的协作式让出、`ParkingCondition` 的**受管 G 与普通线程双路径**；
+  状态流转给出 **Fiber 状态机**（并与 G 的 `kWaiting` 对应）与 **Timer 状态机**（含续期语义）；
+  另附「挂起→唤醒」的栈变化 ASCII 图与「与 Go 的差异」表（固定栈 vs 可增长栈、纯协作 vs 抢占）。
+
+**校验方式**：每张图都用 Python 读回文件统计 `mermaid` 块数与图型数量，
+不依赖 shell 的引号/变量（本环境里反引号与 `$var` 会被 pwsh 吃掉，已多次踩坑）。
+
+**剩余**：G3~G10 共 8 个模块图；任务1（调试模块未做项）待穿插推进。

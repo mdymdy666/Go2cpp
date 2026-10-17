@@ -16,7 +16,7 @@
 
 | 组 | 主题 | 图文件 | 状态 |
 |---|---|---|---|
-| G1 | 地基层（fiber / timer / parking_condition / context_backend） | `G1-foundation.md` | 待做 |
+| G1 | 地基层（fiber / timer / parking_condition / context_backend） | `G1-foundation.md` | ✅ 已完成 |
 | **G2** | **GMP 调度（Task/Scheduler/P/M/worker_loop/sysmon）** | **`G2-scheduler.md`** | **✅ 已完成** |
 | G3 | 取消与错误（context / error） | `G3-context-error.md` | 待做 |
 | G4 | 并发原语（channel / future / sync） | `G4-concurrency.md` | 待做 |
