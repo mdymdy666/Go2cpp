@@ -167,3 +167,32 @@ Check(delta < 8, "read_f must block the worker (heartbeats should be nearly flat
 **fsync/wait4/nanosleep** | 需 eventfd/signalfd/timerfd 桥接，**未实现**（方案已给）|
 **poll/select/epoll_wait** | 不该 hook（事件循环入口）|
 **已知缺陷** | `test_hook_raw.cpp` 场景 3 是假阳性（缺 `manager.start()`）|
+
+### 补充实测：`*_f` 的承诺成立，且 `BlockingRegion` 确实在工作
+
+用探针（**不改项目文件**，`/tmp` 编译）在单 worker 上实测：
+
+```
+[probe] read_f(pipe)       300ms 内心跳增量 = 0    (返回=1)
+[probe] hook read(pipe)    300ms 内心跳增量 = 14   (返回=1)
+```
+
+| 调用 | 心跳增量 | 说明 |
+|---|---|---|
+`read_f(pipe)` | **0** | 直调 libc，**无** `BlockingRegion` → worker 真阻塞 ✅ 证明 `*_f` 的"不 park、不退让"承诺成立 |
+`hook read(pipe)`（回退后）| **14** | 走 `invoke_native_blocking` → **`BlockingRegion` → sysmon 申请替代 M** → 心跳在新 M 上继续 |
+
+**14 而不是 30 的原因**：心跳设计是每 10ms 一次，300ms 应约 30 次。
+少了将近一半，是因为 `BlockingRegion` → sysmon 检测 → 申请替代 M → Fiber 迁移
+这一串有延迟；迁移完成后心跳才恢复。
+
+**这组数据同时证明了三件事**：
+1. `*_f` 系列确实绕过 Hook（心跳 0 是硬证据）
+2. `BlockingRegion` + sysmon 替代 M 机制在 pipe 上**真的生效**（这是 `test_hook.cpp`
+   依赖的设计）
+3. 因此 **FIFO/pipe 走 `BlockingRegion` 是"能工作"的** —— 代价是多一个线程，
+   而不是"worker 卡死没人管"
+
+**对上一节的修正**：`test_hook_raw.cpp` 场景 3 的**断言结论是对的**
+（`read_f` 确实阻塞 worker），只是**证据无效**（心跳从未运行）。
+修好 `manager.start()` 之后，它会真的通过。
