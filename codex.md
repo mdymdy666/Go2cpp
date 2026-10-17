@@ -8504,3 +8504,64 @@ Huffman | 63 + 162 | ✅ 完整 |
 2. 补 CONTINUATION（大 header 必需）；
 3. 补精细流控；
 4. 做 HTTP/2 客户端 Demo 与 `curl --http2` 对抓包验证。
+
+---
+
+## 2026-10-17 方向三：与 curl（nghttp2）互通验证通过
+
+### 这是 HTTP/2 板块最关键的验证
+
+此前所有测试都是「我的客户端 ↔ 我的服务端」，只能证明**自洽**。
+互通必须让一个**独立实现**来对话 —— `curl` 内置 nghttp2，正好可用。
+
+### 做法
+
+新增 `example/network/http2_h2c_server.cpp`（157 行）：明文 HTTP/2（h2c）服务器。
+主线程阻塞 `accept`，每个连接交给一个 Fiber（`Scheduler::spawn`），连接内是
+**同步写法**，IO 由 `FiberTransport` 在 `Socket::recv/send` 上挂起
+—— 与 Go 里"每连接一个 goroutine"的写法一致。
+
+验证命令：
+```sh
+./build-quality/go2cpp_http2_h2c_server 18080
+curl -v --http2-prior-knowledge http://127.0.0.1:18080/hello
+```
+
+### 实测结果（curl 8.5.0 + nghttp2 1.59.0）
+
+```
+* [HTTP/2] [1] OPENED stream for http://127.0.0.1:18080/hello
+* [HTTP/2] [1] [:method: GET]
+* [HTTP/2] [1] [:scheme: http]
+* [HTTP/2] [1] [:authority: 127.0.0.1:18080]
+* [HTTP/2] [1] [:path: /hello]
+> GET /hello HTTP/2
+< HTTP/2 200
+< content-type: text/plain; charset=utf-8
+< server: go2cpp-http2
+hello from go2cpp http2
+method=GET
+path=/hello
+```
+
+第二个请求（`/second?x=1`）同样成功。
+
+**这证明了**（全部由 nghttp2 独立解析，不是我自说自话）：
+1. **preface + SETTINGS 交换**正确（curl 完成了握手并 OPENED stream）；
+2. **HPACK 编码**正确（curl 正确解出 `:status 200`、`content-type`、`server` 三个响应头；
+   请求侧的 5 个头我们也正确解出）；
+3. **帧层**正确（HEADERS/DATA 的 flags 与长度都对）；
+4. **流状态机**正确（stream 1 的 open → 响应 END_STREAM 被接受，连接保持可复用）。
+
+### 未覆盖的反向验证
+
+**我的客户端连外部 h2c 服务器**还没做：环境里没有 `nghttp`/`nghttpd`
+命令行工具，Python 也没有 `h2` 模块。要么装 nghttp2 工具链，要么用 curl 起不了
+服务端。当前方向（curl 当客户端、我当服务端）已经能证明编码/帧/状态机正确，
+**但我方的 `StartRequest` 路径还没被独立实现验证过** —— 这条要在有 nghttpd 的环境补。
+
+### 环境记录
+
+- `curl 8.5.0`，Features 含 `HTTP2`，链接 `nghttp2/1.59.0`；
+- 无 `nghttp`/`nghttpd` 可执行文件；
+- 无 Python `h2` 模块。
