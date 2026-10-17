@@ -615,6 +615,10 @@ namespace {
 /// 全局选择器工厂（与 WaitBackend 工厂同风格）。默认空 = 纯 FIFO。
 std::mutex s_selector_mutex;
 std::shared_ptr<WaitSelector> s_selector;
+// 快速判空标志：绝大多数程序**从不**注册选择器，而 Unlock 的慢路径在被多线程争用时
+// 会被频繁执行。若不先做一次原子读，每次都要加 s_selector_mutex 并拷贝 shared_ptr
+// （约 30~60 ns）。有了这个标志，未注册时热路径只剩**一次原子读**，做到真正零开销。
+std::atomic<bool> s_has_selector{false};
 
 /// 取当前选择器（无锁快路径：先用原子标志判断是否可能为空）。
 std::shared_ptr<WaitSelector> CurrentWaitSelector() noexcept {
@@ -630,6 +634,10 @@ std::shared_ptr<WaitSelector> CurrentWaitSelector() noexcept {
 /// @note 该函数在持队列锁时调用；异常与越界一律退化为不干预。
 void ReorderWaitersForSelector(std::deque<std::shared_ptr<WaitNode>>& waiters) {
     if (waiters.size() < 2U) {
+        return;
+    }
+    // 零开销快路径：没有注册过选择器时只读一次原子量（不取锁、不拷 shared_ptr）。
+    if (!s_has_selector.load(std::memory_order_acquire)) {
         return;
     }
     auto selector = CurrentWaitSelector();
@@ -663,6 +671,8 @@ bool SetWaitSelectorFactory(WaitSelectorFactory factory) {
         }
         std::lock_guard<std::mutex> lock(s_selector_mutex);
         s_selector = std::move(selector);
+        // 先发布对象、再置标志，保证读到 true 的线程一定能看到非空选择器。
+        s_has_selector.store(s_selector != nullptr, std::memory_order_release);
         return true;
     } catch (...) {
         return false;
@@ -670,6 +680,8 @@ bool SetWaitSelectorFactory(WaitSelectorFactory factory) {
 }
 
 void ResetWaitSelectorFactory() noexcept {
+    // 先清标志再清对象：之后的 Unlock 走零开销快路径，不会再去加锁。
+    s_has_selector.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> lock(s_selector_mutex);
     s_selector.reset();
 }

@@ -7240,3 +7240,49 @@ flush_batch = 1/16/32 × 单线程/4 线程，每档 200000 事件、5 轮取区
 
 **未做的事**：没有拆分 `PushBatch` 内部（一次预留 N 条是否值得用 CAS 而非"读-判-写"三段），
 也没有测更大 `flush_batch`（64/128）或更高并发（8/16 线程）。
+
+---
+
+## 2026-10-17 14:05–14:55：按使用者要求 —— 调试模块不影响原框架性能
+
+**使用者指示**：「调试部分不怎么需要性能，你需要保证不影响原来的模块性能即可」。
+
+这与前几轮的方向不同：我之前在优化**调试模块自身**的性能（批量化那 12.5%），
+而使用者要的是**证明并保证它不影响原框架**。本轮据此重做重点。
+
+### 发现并修掉一处真实残留开销
+
+复查 `Mutex::Unlock` 的慢路径（`sync.cpp:1061`）发现：
+`ReorderWaitersForSelector` 虽然有 `waiters.size() < 2` 的快速返回，但**当等待者 ≥2 时**
+仍会调用 `CurrentWaitSelector()`，而它内部是
+`std::lock_guard(s_selector_mutex)` + **拷贝 `shared_ptr`**（约 30~60 ns）。
+
+相对竞争下 `Unlock` 的 13~24 µs，这只占 <0.5%，但**按"必须不影响"的要求就应当归零**。
+因此新增 `std::atomic<bool> s_has_selector` 做**二级快判**：
+未注册选择器时**只读一次原子量**，不取锁、不拷 `shared_ptr`。
+
+发布顺序也考虑到了：`SetWaitSelectorFactory` **先**在锁内赋 `shared_ptr`、**再** release 置标志；
+`ResetWaitSelectorFactory` **先** release 清标志、**再**锁内清对象。
+这样"读到 true 的线程一定能看到非空选择器"，不会出现"标志为真但指针为空"的窗口。
+
+### 结构性验证（比性能数字更硬的证据）
+
+```
+$ grep -rn "go2cpp/debug" include/go2cpp/ src/ --include=*.hpp --include=*.cpp       | grep -v "^include/go2cpp/debug/"
+（无输出）
+```
+
+- 框架代码**零处** include debug 头；
+- debug 模块只单向引用 `scheduler.hpp` / `fiber.hpp` / `sync.hpp`；
+- → **删掉整个 `debug/` 目录，框架仍可编译、行为不变**。
+
+### 对照组实验（进行中）
+
+把 `main`（**完全没有 debug 模块**）用 `git archive` 导出到 `/tmp` 独立构建，
+与当前分支（含 debug 模块但**运行时不启用任何插件**）跑同一批 `build-bench` 基准对比。
+`channel_vs_queue_benchmark` 提供了**内建对照组**：它同时测 `Channel`（框架代码）与
+`BoundedQueue`/`NaiveQueue`（**该基准自己实现的队列，完全不含本次改动**）。
+实测中后者波动反而更大（1.36x / 0.53x）且**方向相反** —— 这是噪声的典型特征，
+说明那些 >10% 的差异不能归因于代码退化。
+
+**注意**：按使用者要求，此后**不再**为调试模块自身追加性能优化。
