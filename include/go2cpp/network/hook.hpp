@@ -111,6 +111,11 @@ enum class HookOp : std::uint8_t {
     kConnect,
     kAccept,
     kSleep,
+    // 下面三个与 sleep 同源：都走 `cooperative_sleep_for`（eventfd + WaitFor 带超时），
+    // 即「等到某个时间点」这条唤醒路径，不需要 timerfd 桥接。
+    kNanosleep,
+    kUsleep,
+    kClockNanosleep,
     kPoll,
     kSelect,
     kEpollWait,
@@ -292,8 +297,15 @@ ssize_t sendto_f(int fd, const void* buffer, std::size_t length, int flags,
 int connect_f(int fd, const struct sockaddr* address, socklen_t address_length);
 /** @brief `accept` 的原始版本：新 fd 不会被登记到 FdManager。 */
 int accept_f(int fd, struct sockaddr* address, socklen_t* address_length);
-/** @brief `sleep` 的原始版本：会真的阻塞整个 worker 线程。 */
+/// @brief `sleep` 的原始版本：会真的阻塞整个 worker 线程。
 unsigned int sleep_f(unsigned int seconds);
+/// @brief `nanosleep` 的原始版本：会真的阻塞整个 worker 线程。
+int nanosleep_f(const struct timespec* request, struct timespec* remaining);
+/// @brief `usleep` 的原始版本：会真的阻塞整个 worker 线程。
+int usleep_f(unsigned int microseconds);
+/// @brief `clock_nanosleep` 的原始版本：会真的阻塞整个 worker 线程。
+int clock_nanosleep_f(int clock_id, int flags, const struct timespec* request,
+                      struct timespec* remaining);
 /** @brief `poll` 的原始版本。 */
 int poll_f(struct pollfd* descriptors, nfds_t count, int timeout);
 /** @brief `select` 的原始版本。 */

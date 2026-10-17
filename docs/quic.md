@@ -178,3 +178,42 @@ TLS 1.3 握手、Initial 密钥派生与 AEAD、Header Protection、Packet Numbe
 > **选型评估**：5 个候选库（msquic/picoquic/ngtcp2/lsquic/quiche）的对比、
 > 为什么 picoquic 是唯一不需要更换系统 TLS 的库、以及分步打通的卡点，
 > 见 [`quic-lib-evaluation.md`](quic-lib-evaluation.md)。
+
+---
+
+## 自实现已删除（2026-10-18）
+
+**`network/quic/` 下的自实现（varint / 包头 / 帧层，1702 行）已全部删除**，
+只保留 `picoquic_connection.hpp/cpp`（对 picoquic 的薄封装）。
+
+### 为什么删
+
+自实现那套**只能解析字节，不能建立连接、不能传输数据** —— 缺 TLS 1.3 握手、
+密钥派生、Header Protection、丢包恢复、拥塞控制、流状态机、QPACK。
+它既不能用于生产，又要占 1702 行需要维护的代码，**而且容易让后来者
+看到 `network/quic/` 就以为项目支持 QUIC** —— 这个误导风险比代码本身更糟。
+
+而 picoquic 薄封装已经**端到端验证通过**（TLS 1.3 握手 + 收发 46 字节正确响应），
+它借用了成熟的协议实现，只需要我们提供 `Transport`（IO 由 Fiber 驱动）。
+**两套 QUIC 共存没有意义，留真的那个。**
+
+### 保留什么
+
+| 保留 | 理由 |
+|---|---|
+`include/go2cpp/network/quic/picoquic_connection.hpp` | 薄封装接口（pimpl，头文件不依赖 picoquic）|
+`src/network/quic/picoquic_connection.cpp` | 唯一 include picoquic 头的地方 |
+`example/network/picoquic_hq_client.cpp` | 端到端验证 + 用法示范 |
+`docs/quic.md`（本文件） | **教训记录**：为什么自实现是错的方向、怎么选库 |
+`docs/quic-lib-evaluation.md` | 5 个候选库的对比与卡点 |
+
+### 教训（这才是删掉代码后要留下的东西）
+
+1. **使用者的要求是「找一个库，不要自己实现」** —— 我在 60 分钟预算内
+   无法完成库集成时，选择了"自己写一个骨架"，这是错的。正确做法是
+   **报告"这个时间窗做不了"**，而不是自作主张改变方向。
+2. **"能解析字节"和"能用"是两个数量级的差距** —— varint 编码 30 行就写完了，
+   但一个能建连的 QUIC 实现是数万行 + 多年迭代。
+3. **选型的硬约束要先查** —— 本机 OpenSSL 3.0.13 **不支持 QUIC API**
+   （`SSL_set_quic_method` 不存在），这一条直接排除了 ngtcp2/lsquic/msquic(默认)，
+   只剩 picoquic（自带 picotls 做 TLS 1.3）。**这个约束花了很久才发现。**

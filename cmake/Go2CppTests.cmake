@@ -240,29 +240,18 @@ if (GO2CPP_BUILD_TESTS)
     set_tests_properties(go2cpp_hook_correctness_test PROPERTIES TIMEOUT 180)
 
 
-    add_executable(go2cpp_quic_packet_test
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_quic_packet.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/quic/varint.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/quic/packet.cpp)
-    target_include_directories(go2cpp_quic_packet_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_compile_options(go2cpp_quic_packet_test PRIVATE
-        -O2 -Wall -Wextra -Wpedantic)
-    add_test(NAME go2cpp_quic_packet_test COMMAND go2cpp_quic_packet_test)
-    set_tests_properties(go2cpp_quic_packet_test PROPERTIES TIMEOUT 300)
+    # nanosleep / usleep / clock_nanosleep 的 hook 行为：Fiber 里应 park，
+    # 普通线程里真阻塞；clock_nanosleep 还要验证 TIMER_ABSTIME 的两种分支。
+    add_executable(go2cpp_hook_sleep_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_sleep.cpp)
+    target_link_libraries(go2cpp_hook_sleep_test PRIVATE go2cpp::runtime go2cpp_hook pthread)
+    target_include_directories(go2cpp_hook_sleep_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    add_test(NAME go2cpp_hook_sleep_test COMMAND go2cpp_hook_sleep_test)
+    set_tests_properties(go2cpp_hook_sleep_test PROPERTIES TIMEOUT 180)
 
-    add_executable(go2cpp_quic_frame_test
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_quic_frame.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/quic/varint.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/quic/frame.cpp)
-    target_include_directories(go2cpp_quic_frame_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_compile_options(go2cpp_quic_frame_test PRIVATE
-        -O2 -Wall -Wextra -Wpedantic)
-    add_test(NAME go2cpp_quic_frame_test COMMAND go2cpp_quic_frame_test)
-    set_tests_properties(go2cpp_quic_frame_test PROPERTIES TIMEOUT 300)
 
-    add_executable(go2cpp_fiber_transport_test
+        add_executable(go2cpp_fiber_transport_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_fiber_transport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/connection.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/frame.cpp

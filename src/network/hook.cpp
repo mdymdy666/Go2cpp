@@ -50,6 +50,9 @@ using go2cpp::io::DescriptorTokenPtr;
 using SleepFn = unsigned int (*)(unsigned int);
 using UsleepFn = int (*)(useconds_t);
 using NanosleepFn = int (*)(const timespec*, timespec*);
+// clock_nanosleep 的返回值语义与 nanosleep 不同：成功返回 0，
+// 失败返回 **errno 本身**（不是 -1 + errno）。
+using ClockNanosleepFn = int (*)(clockid_t, int, const timespec*, timespec*);
 using SocketFn = int (*)(int, int, int);
 using SocketPairFn = int (*)(int, int, int, int*);
 using ConnectFn = int (*)(int, const sockaddr*, socklen_t);
@@ -87,6 +90,7 @@ struct Originals {
     SleepFn m_sleep{nullptr};
     UsleepFn m_usleep{nullptr};
     NanosleepFn m_nanosleep{nullptr};
+    ClockNanosleepFn m_clock_nanosleep{nullptr};
     SocketFn m_socket{nullptr};
     SocketPairFn m_socketpair{nullptr};
     ConnectFn m_connect{nullptr};
@@ -148,6 +152,8 @@ void initialize_originals() noexcept {
         s_originals.m_sleep = load_symbol<SleepFn>("sleep");
         s_originals.m_usleep = load_symbol<UsleepFn>("usleep");
         s_originals.m_nanosleep = load_symbol<NanosleepFn>("nanosleep");
+        s_originals.m_clock_nanosleep =
+            load_symbol<ClockNanosleepFn>("clock_nanosleep");
         s_originals.m_socket = load_symbol<SocketFn>("socket");
         s_originals.m_socketpair = load_symbol<SocketPairFn>("socketpair");
         s_originals.m_connect = load_symbol<ConnectFn>("connect");
@@ -839,6 +845,23 @@ SleepOutcome cooperative_sleep_for(Duration duration) {
     return SleepOutcome::Interrupted;
 }
 
+/// `Duration` -> `timespec`，供 `nanosleep` 的 `remaining` 输出使用。
+///
+/// 为什么需要它：`cooperative_sleep_for` 在被唤醒时不返回「已等待多久」，
+/// 而 POSIX 要求 `nanosleep` 被打断时把**剩余时间**写回 `rem`。所以调用方
+/// 自己记起止时刻，用这个函数把差值转回去。
+timespec duration_to_timespec(Duration value) noexcept {
+    if (value < Duration::zero()) {
+        value = Duration::zero();
+    }
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(value);
+    const auto nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(value - seconds);
+    timespec result{};
+    result.tv_sec = static_cast<time_t>(seconds.count());
+    result.tv_nsec = static_cast<long>(nanos.count());
+    return result;
+}
+
 Duration saturating_duration(const timespec& value) noexcept {
     using Nanoseconds = std::chrono::nanoseconds;
     const auto max_ns =
@@ -1029,7 +1052,8 @@ std::atomic<std::uint32_t> g_hook_op_mask{kAllHookOpsMask};
 constexpr const char* kHookOpNames[kHookOpCount] = {
     "read", "readv", "recv", "recvfrom",
     "write", "writev", "send", "sendto",
-    "connect", "accept", "sleep", "poll", "select", "epoll_wait",
+    "connect", "accept", "sleep", "nanosleep", "usleep", "clock_nanosleep",
+    "poll", "select", "epoll_wait",
     "close", "shutdown", "fcntl", "dup", "dup2",
 };
 
@@ -1205,6 +1229,21 @@ constexpr HookOpDoc kHookOpDocs[kHookOpCount] = {
      "具体后果：一个 Fiber 里 sleep 1 秒，该 worker 上的所有 Fiber 都停 1 秒。\n"
      "这是最能暴露「关掉 Hook 的代价」的一个开关，仅供诊断对比使用。\n"
      "默认 true 是安全配置。"},
+    {"nanosleep",
+     "!!! 危险：不建议关闭 nanosleep 的 Hook !!!\n"
+     "关闭后在 Fiber 内调用会真的阻塞整个 worker 线程（该 P 上其余 Fiber 停摆）。\n"
+     "与 sleep 同源：开启时走 `cooperative_sleep_for`（eventfd + WaitFor 带超时），\n"
+     "不需要 timerfd 桥接。\n"
+     "默认 true 是安全配置。"},
+    {"usleep",
+     "!!! 危险：不建议关闭 usleep 的 Hook !!!\n"
+     "后果同 nanosleep。注意 `usleep` 是 POSIX.1-2001 废弃接口，新代码请用 nanosleep。\n"
+     "默认 true 是安全配置。"},
+    {"clock_nanosleep",
+     "!!! 危险：不建议关闭 clock_nanosleep 的 Hook !!!\n"
+     "关闭后在 Fiber 内调用会真的阻塞整个 worker 线程。\n"
+     "支持 CLOCK_REALTIME / CLOCK_MONOTONIC，含 TIMER_ABSTIME 语义。\n"
+     "默认 true 是安全配置。"},
     {"poll",
      "!!! 危险：不建议关闭 poll 的 Hook !!!\n"
      "关闭后 poll 会阻塞 worker 线程直到有事件或超时。\n"
@@ -1325,12 +1364,23 @@ unsigned int sleep(unsigned int seconds) {
 
 int usleep(useconds_t microseconds) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kUsleep)) {
+        // 关闭后真的阻塞整个 worker 线程 —— 这正是这个开关要暴露的代价。
+        if (s_originals.m_usleep) return s_originals.m_usleep(microseconds);
+        const timespec request{static_cast<time_t>(microseconds / 1000000),
+                               static_cast<long>((microseconds % 1000000) * 1000)};
+        ::nanosleep(&request, nullptr);
+        return 0;
+    }
     const SleepOutcome outcome =
         cooperative_sleep_for(std::chrono::microseconds(microseconds));
     if (outcome == SleepOutcome::Completed) {
         return 0;
     }
     if (outcome == SleepOutcome::Interrupted) {
+        // POSIX：被信号打断时返回 -1 且 errno == EINTR（旧实现漏了这一句，
+        // 会让调用方拿到 -1 但 errno 是上一次的值，无法区分真错误与打断）。
+        errno = EINTR;
         return -1;
     }
     if (!s_originals.m_usleep) {
@@ -1350,8 +1400,21 @@ int nanosleep(const timespec* request, timespec* remaining) {
         }
         return invoke_real(s_originals.m_nanosleep, request, remaining);
     }
-    const SleepOutcome outcome =
-        cooperative_sleep_for(saturating_duration(*request));
+    if (!OpEnabled(HookOp::kNanosleep)) {
+        // 关闭后真的阻塞整个 worker 线程。
+        if (s_originals.m_nanosleep) {
+            return s_originals.m_nanosleep(request, remaining);
+        }
+        struct timespec native_remaining{};
+        ::nanosleep(request, &native_remaining);
+        if (remaining) {
+            *remaining = native_remaining;
+        }
+        return 0;
+    }
+    const Duration requested = saturating_duration(*request);
+    const auto started = std::chrono::steady_clock::now();
+    const SleepOutcome outcome = cooperative_sleep_for(requested);
     if (outcome == SleepOutcome::Completed) {
         if (remaining) {
             *remaining = timespec{};
@@ -1359,6 +1422,15 @@ int nanosleep(const timespec* request, timespec* remaining) {
         return 0;
     }
     if (outcome == SleepOutcome::Interrupted) {
+        // POSIX：被打断时返回 -1、errno == EINTR，并把**剩余时间**写回 rem。
+        // `cooperative_sleep_for` 不返回「已等待多久」，所以这里自己计时算差值。
+        errno = EINTR;
+        if (remaining) {
+            const auto elapsed = std::chrono::duration_cast<Duration>(
+                std::chrono::steady_clock::now() - started);
+            *remaining = duration_to_timespec(requested > elapsed ? requested - elapsed
+                                                                  : Duration::zero());
+        }
         return -1;
     }
     if (!s_originals.m_nanosleep) {
@@ -1366,6 +1438,73 @@ int nanosleep(const timespec* request, timespec* remaining) {
         return -1;
     }
     return invoke_native_blocking(s_originals.m_nanosleep, request, remaining);
+}
+
+/// `clock_nanosleep` 与 `nanosleep` 的两处语义差异（容易写错）：
+///
+/// 1. **返回值**：成功返回 0，失败返回 **errno 本身**（不是 -1 + errno）。
+///    所以下面所有错误分支都 `return EINVAL;` 而不是 `errno = EINVAL; return -1;`
+/// 2. **`TIMER_ABSTIME`**：`request` 是**绝对时刻**。此时：
+///    - 目标时刻已过 → **立即返回 0**（不 park、不睡）
+///    - `rem` **不使用**（POSIX 明确要求）
+///    非绝对时间才把 `rem` 当作剩余时间输出。
+int clock_nanosleep(clockid_t clock_id, int flags, const timespec* request,
+                    timespec* remaining) {
+    initialize_originals();
+    if (!request || request->tv_nsec < 0 || request->tv_nsec >= 1000000000L) {
+        return EINVAL;
+    }
+    // 只支持这两个时钟；其它（如 CLOCK_PROCESS_CPUTIME_ID）本层不接管。
+    if (clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC) {
+        return EINVAL;
+    }
+    if (!OpEnabled(HookOp::kClockNanosleep)) {
+        if (s_originals.m_clock_nanosleep) {
+            return s_originals.m_clock_nanosleep(clock_id, flags, request, remaining);
+        }
+        return ENOSYS;
+    }
+
+    const bool absolute = (flags & TIMER_ABSTIME) != 0;
+    Duration wait_for = Duration::zero();
+    if (absolute) {
+        // 绝对时刻减去「现在」才是要等多久；已经过了就立即返回 0。
+        timespec now{};
+        if (::clock_gettime(clock_id, &now) != 0) {
+            return errno;
+        }
+        const Duration target = saturating_duration(*request);
+        const Duration current = saturating_duration(now);
+        if (target <= current) {
+            return 0;
+        }
+        wait_for = target - current;
+    } else {
+        if (request->tv_sec < 0) {
+            return EINVAL;
+        }
+        wait_for = saturating_duration(*request);
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    const SleepOutcome outcome = cooperative_sleep_for(wait_for);
+    if (outcome == SleepOutcome::Completed) {
+        return 0;
+    }
+    if (outcome == SleepOutcome::Interrupted) {
+        if (!absolute && remaining) {
+            const auto elapsed = std::chrono::duration_cast<Duration>(
+                std::chrono::steady_clock::now() - started);
+            *remaining = duration_to_timespec(wait_for > elapsed ? wait_for - elapsed
+                                                                 : Duration::zero());
+        }
+        return EINTR;
+    }
+    // 退化：没有 IOManager 时走原生（原生的返回值语义就是 errno）。
+    if (!s_originals.m_clock_nanosleep) {
+        return ENOSYS;
+    }
+    return s_originals.m_clock_nanosleep(clock_id, flags, request, remaining);
 }
 
 // poll/select/epoll_wait Hook 保持 libc ABI 和 timeout、EINTR、信号掩码、
@@ -2027,6 +2166,33 @@ int accept_f(int fd, struct sockaddr* address, socklen_t* address_length) {
     // 注意：**不**调 try_register_new_socket —— 原始版本产生的 fd 不进 FdManager，
     // 后续读写也走原生路径，与「显式不 hook」的语义一致。
     return s_originals.m_accept(fd, address, address_length);
+}
+
+int nanosleep_f(const timespec* request, timespec* remaining) {
+    initialize_originals();
+    if (s_originals.m_nanosleep != nullptr) {
+        return s_originals.m_nanosleep(request, remaining);
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+int usleep_f(unsigned int microseconds) {
+    initialize_originals();
+    if (s_originals.m_usleep != nullptr) {
+        return s_originals.m_usleep(microseconds);
+    }
+    errno = ENOSYS;
+    return -1;
+}
+
+int clock_nanosleep_f(int clock_id, int flags, const timespec* request,
+                      timespec* remaining) {
+    initialize_originals();
+    if (s_originals.m_clock_nanosleep != nullptr) {
+        return s_originals.m_clock_nanosleep(clock_id, flags, request, remaining);
+    }
+    return ENOSYS;
 }
 
 unsigned int sleep_f(unsigned int seconds) {
