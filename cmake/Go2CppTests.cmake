@@ -8,6 +8,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_context.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_channel.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_scheduler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_scheduler_stress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_dynamic_scheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_fiber.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_sync.cpp
@@ -204,6 +205,10 @@ if (GO2CPP_BUILD_BENCHMARKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/debug_event_collector_benchmark.cpp)
     target_link_libraries(go2cpp_debug_event_collector_benchmark PRIVATE go2cpp_runtime)
     target_compile_options(go2cpp_debug_event_collector_benchmark PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_executable(go2cpp_parking_condition_benchmark
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/parking_condition_benchmark.cpp)
+    target_link_libraries(go2cpp_parking_condition_benchmark PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_parking_condition_benchmark PRIVATE -O2 -Wall -Wextra -Wpedantic)
     target_compile_options(go2cpp_channel_vs_queue_benchmark PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
     add_executable(go2cpp_timer_task_benchmark

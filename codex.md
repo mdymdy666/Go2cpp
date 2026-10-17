@@ -7440,3 +7440,64 @@ PNG 从 31,582 字节变为 76,943 字节（图变高、内容合并），视觉
 **方法学结论**：对 Mermaid 这类自动布局，「一屏可读」可以量化为两个方向的门槛 ——
 **宽高比 > 2.5 视为扁条（文字过小）**，**宽高比 < 0.35 视为竖条（需滚动）**。
 本轮只消除扁条，竖条留作已知限制。
+
+---
+
+## 2026-10-17 17:00–18:00：新任务 —— 基础并发组件 futex 无状态锁重构
+
+### 使用者指定方向
+
+> 「基础并发组件（比如 sync::Mutex，ParkingCondition，这些完全不应该基于原子锁和 std::mutex 的，
+> 直接基于 futex 无状态锁重构更好）的无痛重构，不改变向上层的接口，但是功能相同。
+> 现在我认为先从这个角度切入，可能有奇效。」
+
+我认为这个判断有依据：`std::mutex` / `condition_variable` 每次 park/unpark 要穿 glibc 的封装层
++ 系统调用，而 futex 本身是**内核哈希表里的无状态等待**，用户态只需一个 32 位字。
+
+### 现状调查（已完成）
+
+`src/concurrency/parking_condition.cpp`（337 行）当前实现：
+
+| 成员 | 类型 | 用途 |
+|---|---|---|
+| `m_mutex` | `std::mutex` | 保护 `m_waiters` 队列 |
+| `m_waiters` | `deque<shared_ptr<WaitNode>>` | 每个等待者一个节点 |
+| `m_wake_mutex`（在 WaitNode 里）| **`HybridMutex`** | 保护唤醒/撤销临界区 |
+| `m_native_cv`（在 WaitNode 里）| **`std::condition_variable_any`** | 普通线程等待 |
+| `m_result` | `atomic<Result>` | 终态 |
+
+两条等待路径：
+- **受管 G**（`m_scheduler`/`m_task` 非空）→ `WaitManaged()` → `scheduler->park_wait(task)`
+  —— **不经过 `m_native_cv`**，但 `Wake()`/`Disarm()` 每次要拿 `HybridMutex`；
+- **普通线程**（`m_scheduler` 为空）→ `WaitNative()` → **`condition_variable_any`** ← futex 的主要目标。
+
+全项目 `std::mutex`/`condition_variable` 用量（排除 debug）：
+scheduler 95、context 56、io 38、log 36、**sync 31**、timer 30、socket 25、fiber 25、future 22、
+hook 21、channel 17、**parking_condition 7**。
+→ 全改不现实，聚焦使用者点名的 **ParkingCondition（7 处）与 sync::Mutex（31 处）**。
+
+### 基线基准（新增，已登记 CMake）
+
+`benchmarks/parking_condition_benchmark.cpp`，走**普通线程路径**（即 cv 那条路）。
+负载 0.08（极干净）：
+
+| 场景 | 成本 |
+|---|---:|
+| A notify 空转（无等待者）| **15.30 ns/次** |
+| C 争用（2 消费者）| **90.76 ns/次** |
+| C 争用（4 消费者）| **4,351.02 ns/次** |
+
+**4 个等待者比 2 个慢 48 倍** —— 这是 `condition_variable_any` 在多样等待者下的退化，
+也是本次重构要解决的量化目标。
+
+### 一次失败：B 场景（ping-pong）已删除
+
+我先写了个 ping-pong 场景，测得 58 µs/往返，但那是**我的基准设计缺陷**（双向 spin 等待）。
+改成交接式后又出现死锁（输出只有 A）。两次都是我基准的问题，不是被测代码的问题，
+已删除该场景，只保留 A 与 C。**不把错误数据留在文档里。**
+
+### 下一步
+
+按无状态 futex 模式重构 `WaitNative`：用一个 `atomic<uint32_t> m_seq` 做代际计数，
+`notify_*` 递增后 `FUTEX_WAKE`，等待方读旧值后 `FUTEX_WAIT(expected)`；
+外部 `std::unique_lock<std::mutex>` 契约保持不变（futex 只替代"等待"，不替代外部锁）。
