@@ -91,6 +91,14 @@ if (GO2CPP_BUILD_TESTS)
     target_compile_options(go2cpp_high_load_stress PRIVATE
         -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_high_load_stress COMMAND go2cpp_high_load_stress)
+
+    add_executable(go2cpp_timer_bin_stress
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_timer_bin_stress.cpp)
+    target_link_libraries(go2cpp_timer_bin_stress PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_timer_bin_stress PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_timer_bin_stress COMMAND go2cpp_timer_bin_stress)
+    set_tests_properties(go2cpp_timer_bin_stress PROPERTIES TIMEOUT 300)
     set_tests_properties(go2cpp_high_load_stress PROPERTIES TIMEOUT 180)
 endif()
 

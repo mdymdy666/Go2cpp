@@ -79,7 +79,91 @@ struct Timer::State final {
     std::size_t m_run_count{0};
     std::chrono::steady_clock::time_point m_next_deadline{};
     std::exception_ptr m_failure;
+
+    /// @brief 把对象恢复到刚构造的状态，供对象池复用。
+    /// @details m_mutex 刻意不复位：它只是一把空闲的锁，重置既不必要也不安全
+    ///          （重置期间若有线程持锁会破坏互斥）。其余字段全部回到默认值，
+    ///          确保复用的 State 不会泄漏上一次的回调或执行器。
+    void reset_for_pool() noexcept {
+        m_owner.reset();
+        m_callback = nullptr;
+        m_repeat_callback = nullptr;
+        m_executor.reset();
+        m_options = TimerOptions{};
+        m_status = TimerState::kPending;
+        m_active = true;
+        m_run_count = 0;
+        m_next_deadline = std::chrono::steady_clock::time_point{};
+        m_failure = nullptr;
+    }
 };
+
+// ---------------------------------------------------------------------------
+// TimerBin：Timer::State 的 thread_local 对象池
+// ---------------------------------------------------------------------------
+//
+// 动机：每次带 deadline 的等待都会 Schedule 一个定时器，触发一次
+// Timer::State 的 new/delete。State 约 200 字节且含 mutex/function/options，
+// 分配与析构都在热路径上。池化后省掉 new/delete 这一对操作。
+//
+// 与 FiberBin 的差别：Fiber 是 unique_ptr 独占，可直接移动复用；State 通过
+// shared_ptr 被 TimerService 的 multimap 与用户句柄共同持有，只能等引用计数
+// 归零后借助自定义 deleter 归还，因此复用的是"对象本身 + reset"而非"直接转交"。
+//
+// 已知限制：归还发生在最后一个持有者所在的线程，而池是 thread_local，
+// 所以跨线程归还时会把对象放进"归还线程"的池，可能造成各线程池利用率不均。
+// 这不会比无池更差，只是收益打折；如需更好利用率应改为全局分档池。
+namespace {
+
+class TimerStateBin final {
+public:
+    static constexpr std::size_t kCapacity = 128;
+
+    /// @brief 取一个可用的 State（已重置），用自定义 deleter 绑定归还。
+    static std::shared_ptr<Timer::State> Acquire() {
+        Timer::State* raw = nullptr;
+        if (!entries().empty()) {
+            auto owned = std::move(entries().back());
+            entries().pop_back();
+            raw = owned.release();
+            raw->reset_for_pool();
+        } else {
+            raw = new Timer::State();
+        }
+        return std::shared_ptr<Timer::State>(raw, [](Timer::State* p) noexcept {
+            Recycle(p);
+        });
+    }
+
+    /// @brief 归还一个 State；池满则直接销毁。
+    static void Recycle(Timer::State* state) noexcept {
+        if (state == nullptr) {
+            return;
+        }
+        try {
+            if (entries().size() < kCapacity) {
+                entries().emplace_back(state);
+                return;
+            }
+        } catch (...) {
+            // 池扩容失败时退化为正常释放，不能因为优化路径抛异常
+        }
+        delete state;
+    }
+
+    /// @brief 当前线程池中的对象数（诊断用）。
+    static std::size_t Size() noexcept { return entries().size(); }
+
+private:
+    static std::vector<std::unique_ptr<Timer::State>>& entries() {
+        static thread_local std::vector<std::unique_ptr<Timer::State>> bin;
+        return bin;
+    }
+};
+
+}  // namespace
+
+std::size_t TimerStateBinSize() noexcept { return TimerStateBin::Size(); }
 
 class TimerService::Impl final {
 public:
@@ -610,7 +694,7 @@ Timer TimerService::Schedule(Clock::time_point deadline,
     if (deadline > now) {
         m_impl->LogLongDuration(deadline - now, "TimerService::Schedule");
     }
-    const auto state = std::make_shared<Timer::State>();
+    const auto state = TimerStateBin::Acquire();
     state->m_owner = m_impl;
     state->m_callback = std::move(callback);
     state->m_options.repeat = TimerRepeatMode::kOnce;
@@ -660,7 +744,7 @@ Timer TimerService::ScheduleRepeat(std::chrono::steady_clock::duration initial_d
     }
     m_impl->LogLongDuration(std::max(nonnegative(initial_delay), options.period),
                             "TimerService::ScheduleRepeat");
-    const auto state = std::make_shared<Timer::State>();
+    const auto state = TimerStateBin::Acquire();
     state->m_owner = m_impl;
     state->m_repeat_callback = std::move(callback);
     state->m_options = options;
@@ -680,7 +764,7 @@ Timer TimerService::ScheduleOn(Clock::time_point deadline,
     if (deadline > now) {
         m_impl->LogLongDuration(deadline - now, "TimerService::ScheduleOn");
     }
-    const auto state = std::make_shared<Timer::State>();
+    const auto state = TimerStateBin::Acquire();
     state->m_owner = m_impl;
     state->m_callback = std::move(callback);
     state->m_executor = std::move(executor);

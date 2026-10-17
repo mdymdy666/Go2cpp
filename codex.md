@@ -7927,3 +7927,63 @@ park 前预判（-37%）、steal 移锁（-34%，归因被证伪）。
    与此前测得的 30 µs 一致，仍待细分数据定位。
 
 完整报告见 `DebugTooling/performance-report.md`。
+
+---
+
+## 2026-10-17 TimerBin：Timer::State 对象池
+
+### 动机
+
+每次带 deadline 的等待都会 `Schedule` 一个定时器（`parking_condition.cpp:437`），
+每次触发一次 `std::make_shared<Timer::State>()` + 一次析构。`State` 约 200 字节，
+含 `std::mutex` / `std::function` / `TimerOptions` / `weak_ptr`，分配析构都在热路径上。
+
+### 为什么不能照搬 FiberBin
+
+| | FiberBin | TimerBin |
+|---|---|---|
+| 持有方式 | `unique_ptr` **独占** | `shared_ptr`，被 TimerService 的 `multimap` + 用户句柄共同持有 |
+| 复用方式 | 直接转交对象 | **等引用计数归零**，借自定义 deleter 归还 |
+| 可否移动 | 可以 | **不可以**（`State` 含 `std::mutex`）|
+
+所以 TimerBin 复用的是"对象本身 + reset"，不是"直接转交"。`mutex` 刻意不复位
+（它只是一把空闲锁，重置既不必要也不安全），其余字段全部回到默认值。
+
+### 实现
+
+- `src/concurrency/timer.cpp`：新增 `TimerStateBin`（thread_local，容量 128），
+  `State::reset_for_pool()`，三处 `make_shared` 改为 `TimerStateBin::Acquire()`；
+- `acquire` 返回的 `shared_ptr` 带自定义 deleter，引用计数归零时 `Recycle`，
+  池满则真正 `delete`；
+- `include/go2cpp/concurrency/core/timer.hpp`：新增 `TimerStateBinSize()` 诊断接口。
+
+### 测试（`tests/concurrency/test_timer_bin_stress.cpp`，已注册 CMake）
+
+七个场景，重点验证**复用时不会残留上一次的回调**（这类 bug 不会崩，只会多触发一次，
+极难发现）：
+
+1. 高频一次性定时器 2000 次；
+2. **状态不残留**：A 触发完后复用同一槽位给 B，验证 B 不继承 A 的回调（300 轮）；
+3. 并发 8 线程 × 300 定时器；
+4. 随机取消 500 次（验证取消后绝不触发）；
+5. 周期定时器 + 取消；
+6. 混合随机压力 1200 次；
+7. 池复用校验（实测池稳定在容量上限 128）。
+
+**结果：`failures=0`，七场景全过。全量 ctest 81/81 通过（新增 1 个测试）。**
+
+### 写测试时踩的坑（值得记住）
+
+第一版场景 1/3 **全部失败**（`actual=0`），原因不是 TimerBin 有 bug，而是
+**`Timer` 的析构等价于 `Cancel`**：`auto timer = ScheduleAfter(1ms, ...)` 在循环
+迭代结束就析构，等于立即取消，回调一个都不会跑。修法是先把句柄存进容器，
+等全部触发后再释放。这个语义在写任何定时器测试时都必须记住。
+
+### 未完成
+
+- **没有做 before/after 性能对比**。改动已直接应用，且临时回退会污染工作区，
+  所以本文只报告"机制生效的证据"（池稳定在 128、七场景通过），
+  **不声称性能提升的具体数字**。要量化应另建一个 timer 创建吞吐微基准，
+  并在两个构建目录下分别测。
+- 跨线程归还时对象落在"归还线程"的 thread_local 池，可能造成各线程池利用率不均。
+  这不会比无池更差，只是收益打折；如需更好利用率应改为全局分档池。
