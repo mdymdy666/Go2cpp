@@ -175,3 +175,6 @@ PADDING 合并、**96 个前缀截断**（至少一次 kNeedMore）、10 例畸�
 TLS 1.3 握手、Initial 密钥派生与 AEAD、Header Protection、Packet Number 真实值、
 丢包检测/PTO、拥塞控制、流状态机与流控、QPACK、连接迁移/0-RTT 防重放。
 
+> **选型评估**：5 个候选库（msquic/picoquic/ngtcp2/lsquic/quiche）的对比、
+> 为什么 picoquic 是唯一不需要更换系统 TLS 的库、以及分步打通的卡点，
+> 见 [`quic-lib-evaluation.md`](quic-lib-evaluation.md)。
