@@ -7096,3 +7096,27 @@ median 分别为 **19,199 / 21,183 / 23,088 ns**。任务数扩大 40 倍，
 
 **与前两张图的一致性**：G4 里关于 `Mutex` 与 `WaitSelector` 的描述与第 9 轮实现（`b037417`）
 以及第 11/12 轮的实测结论一致（无竞争三档一致、有竞争的 13~24 µs 是 `Mutex` 自身成本）。
+
+---
+
+## 2026-10-17 14:05–14:25：任务2 —— G5 与 G6 两图
+
+**产出**：`diagrams/G5-io-backend.md`（195 行）、`diagrams/G6-network-base.md`（239 行），各含 5 个 Mermaid。
+
+**G5（IO 后端与 fd 管理）**：类架构覆盖 `IOBackend`（可替换事件循环 + 工厂）、`BackendEvent`/
+`BackendEventFlag`、`FdManager`/`FdContext`、`ThreadHookMode` 与两个 RAII 类型。
+重要函数画出「看起来阻塞」的读如何变成 **试一次 → EAGAIN → 注册事件 → park → 就绪后重试** 的循环。
+**最关键的一点**：`FdContext` 区分 `user_nonblock` 与 `system_nonblock` ——
+运行时为了挂起会把 fd 设成非阻塞，但**用户自己设的非阻塞不能因此变成"会等待"**，
+这个区分是正确性的关键，图上明确标出。
+
+**G6（网络基础）**：类架构覆盖 `Address` 继承体系（IPv4/IPv6/Unix/Unknown）、`Socket`、`SocketResult`、
+`SocketType`、`SocketWaiter`、`SocketStream`、`Framer`、`ByteArray`、`EndianCodec`。
+重要函数画出 `Accept` 的 park-重试循环、**`Framer` 的拆包流程与 `max_frame_size` 超长防护**
+（没有它，一个声明 4GB 长度的帧就能把内存吃光）、`ReadFull` 在对端提前关闭时的**短读**语义、
+`SetDeadline` **只影响等待、超时不关闭连接**。
+
+**准确性处理**：`IOBackend` 的 `Add/Mod/Del/Wait` 我这轮只在头文件里看到类型名（`IOBackend`、
+`BackendEvent`、`IOBackendFactory`），**没有逐一核对四个方法的精确签名**，
+所以图上按"注册/修改/删除/等待事件"的通用语义描述，并在提交信息里注明这一点，
+不编造参数列表。
