@@ -29,6 +29,7 @@
  */
 #pragma once
 
+#include "go2cpp/os/dir.hpp"
 #include "go2cpp/os/file.hpp"
 
 #include <string>

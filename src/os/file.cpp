@@ -83,6 +83,46 @@ File& File::operator=(File&& other) noexcept {
     return *this;
 }
 
+bool File::Sync() noexcept {
+    if (!valid()) {
+        m_last_error = EBADF;
+        return false;
+    }
+    const long result = ::syscall(SYS_fsync, m_fd);
+    if (IsSyscallError(result)) {
+        m_last_error = errno;
+        return false;
+    }
+    m_last_error = 0;
+    return true;
+}
+
+FileStatus File::Truncate(off_t size) noexcept {
+    FileStatus status;
+    if (!valid()) {
+        status.code = OsError::kInvalidHandle;
+        status.system_error = EBADF;
+        m_last_error = EBADF;
+        return status;
+    }
+    if (size < 0) {
+        // 负大小在 ftruncate 里会返回 EINVAL，但先自己判掉能给出更准的错因。
+        status.code = OsError::kInvalidArgument;
+        status.system_error = EINVAL;
+        m_last_error = EINVAL;
+        return status;
+    }
+    const long result = ::syscall(SYS_ftruncate, m_fd, size);
+    if (IsSyscallError(result)) {
+        status.code = OsError::kIoFailed;
+        status.system_error = errno;
+        m_last_error = errno;
+        return status;
+    }
+    m_last_error = 0;
+    return status;
+}
+
 void File::Close() noexcept {
     if (m_fd >= 0) {
         if (m_owned) {

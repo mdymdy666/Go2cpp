@@ -1,3 +1,7 @@
+> ⚠️ **本文件是上一轮的渲染记录，部分数字已过时。**
+> 最新完整数据（69 块真实渲染、宽高比、0 扁条/6 竖条的判定）见
+> [`../ArchitectureDiagram/render-verification.md`](../ArchitectureDiagram/render-verification.md)。
+
 # Mermaid 渲染验证报告（第 32 轮）
 
 > **结论先行**：11 个文件、**当时的 56 张图（现为 63 张，见文末补充）**，全部用 `@mermaid-js/mermaid-cli` 实际渲染为 SVG 成功**。

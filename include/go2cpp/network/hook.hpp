@@ -123,8 +123,18 @@ bool OpFromString(const std::string& name, HookOp* out) noexcept;
 
 /** @brief 查询某个操作当前是否接受 Hook。 */
 bool OpEnabled(HookOp op) noexcept;
-/** @brief 设置某个操作的开关（线程安全，无锁）。 */
-void SetOpEnabled(HookOp op, bool enabled) noexcept;
+/**
+ * @brief 设置某个操作的开关（线程安全，无锁）。
+ * @param op 目标操作。
+ * @param enabled 是否接受 Hook。
+ * @return `true` 表示设置已生效；`false` 表示**请求被拒绝**。
+ * @details 有一组操作**不允许被关闭**（`close` / `shutdown` / `fcntl` /
+ *          `dup` / `dup2`），因为关闭它们会让 fd 元数据与内核状态脱节 ——
+ *          fd 号被复用时 Hook 会拿过期 descriptor 做判断（把普通文件当
+ *          socket，或把新 socket 当已关闭）。对它们传 `false` 一律返回
+ *          `false` 且**不改变位图**，保持永远启用。
+ */
+bool SetOpEnabled(HookOp op, bool enabled) noexcept;
 /** @brief 一次性设置全部操作（等价于粗粒度总闸）。 */
 void SetAllOpsEnabled(bool enabled) noexcept;
 /** @brief 当前位图快照（诊断/测试用）。 */

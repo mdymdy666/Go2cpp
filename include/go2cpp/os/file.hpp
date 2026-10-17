@@ -244,6 +244,37 @@ public:
     bool IsRegular() const noexcept;
 
     /** @brief 手动关闭。可重复调用（幂等）。 */
+    /**
+     * @brief 把该文件的所有已写数据与元数据刷到持久存储（`fsync`）。
+     * @return 是否成功；失败原因在 `last_error()`。
+     *
+     * @details 走 `syscall(SYS_fsync)` —— 与读写路径一致，绕过 Hook。
+     *
+     * **`fsync` 与 `fdatasync` 的区别**：`fsync` 连元数据（mtime / size /
+     * 块映射）一起刷，`fdatasync` 只刷数据。本方法用 `fsync`，因为
+     * 「写日志/配置文件后崩溃，重启要能读到完整内容」通常也需要 size 已落盘
+     * —— 只刷数据而 size 没落盘的话，崩溃后可能看到一个短文件。
+     *
+     * @warning `fsync` 会**真实等待磁盘**（可能几十毫秒到几秒）。在 Fiber 里
+     *          调用它会阻塞整个 worker 线程 —— 这与本模块其他操作的性质不同
+     *          （普通 `read`/`write` 通常几微秒）。如果要在热路径上写文件并
+     *          `Sync`，应显式包一层 `Scheduler::BlockingRegion` 让 sysmon
+     *          申请替代 M，或把它交给独立的普通线程。
+     */
+    bool Sync() noexcept;
+
+    /**
+     * @brief 把文件截断或扩展到 `size` 字节（`ftruncate`）。
+     * @param size 目标大小，必须 `>= 0`；扩展时新增区域读出来是 0。
+     * @return 状态。`size < 0` 返回 `kInvalidArgument`（`EINVAL`）；
+     *         句柄无效返回 `kInvalidHandle`（`EBADF`）。
+     *
+     * @details 走 `syscall(SYS_ftruncate)`。注意它**不改变当前文件偏移** ——
+     *          若之前偏移在 1 MiB、截断到 4 KiB，后续 `Write` 会在 1 MiB 处
+     *          写（文件被重新"扩展"出空洞）。这是 POSIX 语义，不是 bug。
+     */
+    FileStatus Truncate(off_t size) noexcept;
+
     void Close() noexcept;
 
     /** @brief 底层 fd；已关闭时返回 -1。 */

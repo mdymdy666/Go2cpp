@@ -1062,20 +1062,69 @@ bool OpEnabled(HookOp op) noexcept {
     return (g_hook_op_mask.load(std::memory_order_relaxed) >> bit) & 1u;
 }
 
-void SetOpEnabled(HookOp op, bool enabled) noexcept {
+namespace {
+
+/**
+ * @brief 该操作是否**不允许被关闭**。
+ * @details 两类：
+ *  1. `close` / `shutdown` / `dup` / `dup2` —— 关闭后 fd 元数据与内核状态脱节，
+ *     fd 复用时 Hook 拿过期 descriptor 判断类型，行为不可预测；
+ *  2. `fcntl` —— 它承载 `F_SETFL`/`F_DUPFD` 等对 fd 标志与描述符表的修改，
+ *     关闭后 `FdContext{m_user_nonblock, m_system_nonblock}` 会与实际状态脱节，
+ *     后续 `close` 的还原逻辑会写错标志。
+ * 这些操作**没有安全的关闭场景**，所以硬拒绝比留一个能开的洞好。
+ */
+constexpr bool IsNonDisableable(HookOp op) noexcept {
+    switch (op) {
+        case HookOp::kClose:
+        case HookOp::kShutdown:
+        case HookOp::kFcntl:
+        case HookOp::kDup:
+        case HookOp::kDup2:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// 不可关闭操作对应位的掩码（用于 SetAllOpsEnabled 保留它们）。
+constexpr std::uint32_t NonDisableableMask() noexcept {
+    std::uint32_t mask = 0;
+    for (std::size_t i = 0; i < kHookOpCount; ++i) {
+        if (IsNonDisableable(static_cast<HookOp>(i))) {
+            mask |= (1u << i);
+        }
+    }
+    return mask;
+}
+
+}  // namespace
+
+bool SetOpEnabled(HookOp op, bool enabled) noexcept {
     const auto bit = static_cast<std::uint32_t>(op);
     if (bit >= kHookOpCount) {
-        return;
+        return false;
+    }
+    if (!enabled && IsNonDisableable(op)) {
+        // 硬拒绝：不改变位图，保持启用。调用方可以从返回值知道请求被拒。
+        return false;
     }
     if (enabled) {
         g_hook_op_mask.fetch_or(1u << bit, std::memory_order_relaxed);
     } else {
         g_hook_op_mask.fetch_and(~(1u << bit), std::memory_order_relaxed);
     }
+    return true;
 }
 
 void SetAllOpsEnabled(bool enabled) noexcept {
-    g_hook_op_mask.store(enabled ? kAllHookOpsMask : 0u, std::memory_order_relaxed);
+    if (enabled) {
+        g_hook_op_mask.store(kAllHookOpsMask, std::memory_order_relaxed);
+        return;
+    }
+    // 关闭全部时**保留不可关闭操作的位** —— 否则一个 SetAllOpsEnabled(false)
+    // 就能绕过硬拒绝。
+    g_hook_op_mask.store(NonDisableableMask(), std::memory_order_relaxed);
 }
 
 std::uint32_t OpMask() noexcept {
@@ -1210,9 +1259,23 @@ void RegisterHookConfig(::go2cpp::config::Config& config) {
             continue;   // 同名不同类型冲突：跳过，不改变现状
         }
         // 双向绑定：先按配置当前值设一次，再挂监听器保持后续同步。
-        SetOpEnabled(op, variable->GetValue());
-        variable->AddListener([op](const bool& /*old_value*/, const bool& new_value) {
-            SetOpEnabled(op, new_value);
+        //
+        // 注意 `SetOpEnabled` 可能**拒绝**（close/shutdown/fcntl/dup/dup2
+        // 不允许关闭）。被拒时必须把配置项改回 true，否则配置文件会显示
+        // false 而实际仍在 Hook —— 那种不一致比没有开关更危险。
+        if (!SetOpEnabled(op, variable->GetValue())) {
+            variable->SetValue(true);
+        }
+        // 用 weak_ptr 捕获，避免 ConfigVar -> listener -> ConfigVar 的循环引用。
+        std::weak_ptr<::go2cpp::config::ConfigVar<bool>> weak_variable = variable;
+        variable->AddListener([op, weak_variable](const bool& /*old_value*/,
+                                                  const bool& new_value) {
+            if (!SetOpEnabled(op, new_value)) {
+                // 回滚。递归一次后终止：启用总是被允许，所以第二次不会再回滚。
+                if (auto variable_locked = weak_variable.lock()) {
+                    variable_locked->SetValue(true);
+                }
+            }
         });
     }
 }
@@ -1237,6 +1300,14 @@ void go2cpp_hook_bind_io_manager(void* manager) noexcept {
 
 unsigned int sleep(unsigned int seconds) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kSleep)) {
+        // 关闭后真的阻塞整个 worker 线程 —— 这正是这个开关要暴露的代价。
+        if (s_originals.m_sleep) return s_originals.m_sleep(seconds);
+        const timespec request{static_cast<time_t>(seconds), 0};
+        timespec remaining{};
+        ::nanosleep(&request, &remaining);
+        return static_cast<unsigned int>(remaining.tv_sec);
+    }
     const SleepOutcome outcome =
         cooperative_sleep_for(std::chrono::seconds(seconds));
     if (outcome == SleepOutcome::Completed) {
@@ -1409,6 +1480,13 @@ int connect(int fd, const sockaddr* address, socklen_t length) {
 
 int accept(int fd, sockaddr* address, socklen_t* length) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kAccept)) {
+        // 关闭后直接走原生 accept：**不** try_register_new_socket ——
+        // 新 fd 不进 FdManager，后续读写也会落到原生路径，保持一致。
+        if (s_originals.m_accept) return s_originals.m_accept(fd, address, length);
+        errno = ENOSYS;
+        return -1;
+    }
     const int accepted = cooperative_io<int>(fd, s_originals.m_accept,
                                               IOEvent::kRead, false, address,
                                               length);
@@ -1445,6 +1523,11 @@ ssize_t read(int fd, void* buffer, size_t count) {
 
 ssize_t readv(int fd, const iovec* vectors, int count) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kReadv)) {
+        if (s_originals.m_readv) return s_originals.m_readv(fd, vectors, count);
+        errno = ENOSYS;
+        return static_cast<ssize_t>(-1);
+    }
     return cooperative_io<ssize_t>(fd, s_originals.m_readv, IOEvent::kRead,
                                     false, vectors, count);
 }
@@ -1482,6 +1565,16 @@ ssize_t recv(int fd, void* buffer, size_t length, int flags) {
 ssize_t recvfrom(int fd, void* buffer, size_t length, int flags,
                  sockaddr* source, socklen_t* source_length) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kRecvfrom)) {
+        // 关闭后连 MSG_WAITALL / MSG_OOB 的特殊分支也一并跳过 ——
+        // 它们存在的意义是"在协程里正确处理这些标志"，不走 hook 就不需要。
+        if (s_originals.m_recvfrom) {
+            return s_originals.m_recvfrom(fd, buffer, length, flags, source,
+                                          source_length);
+        }
+        errno = ENOSYS;
+        return static_cast<ssize_t>(-1);
+    }
 #ifdef MSG_WAITALL
     if ((flags & MSG_WAITALL) != 0 && s_originals.m_recvfrom) {
         if (cooperative_manager() != nullptr) {
@@ -1539,6 +1632,11 @@ ssize_t write(int fd, const void* buffer, size_t count) {
 
 ssize_t writev(int fd, const iovec* vectors, int count) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kWritev)) {
+        if (s_originals.m_writev) return s_originals.m_writev(fd, vectors, count);
+        errno = ENOSYS;
+        return static_cast<ssize_t>(-1);
+    }
     return cooperative_io<ssize_t>(fd, s_originals.m_writev, IOEvent::kWrite,
                                     false, vectors, count);
 }
@@ -1557,6 +1655,14 @@ ssize_t send(int fd, const void* buffer, size_t length, int flags) {
 ssize_t sendto(int fd, const void* buffer, size_t length, int flags,
                const sockaddr* destination, socklen_t destination_length) {
     initialize_originals();
+    if (!OpEnabled(HookOp::kSendto)) {
+        if (s_originals.m_sendto) {
+            return s_originals.m_sendto(fd, buffer, length, flags, destination,
+                                         destination_length);
+        }
+        errno = ENOSYS;
+        return static_cast<ssize_t>(-1);
+    }
     return cooperative_io<ssize_t>(
         fd, s_originals.m_sendto, IOEvent::kWrite, has_dontwait(flags), buffer,
         length, flags, destination, destination_length);

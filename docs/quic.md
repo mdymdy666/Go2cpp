@@ -110,3 +110,45 @@ RFC 9001 §5.4 的 header protection 会加密**首字节的低 4 位**和**整�
    "用固定 DCID 派生 initial secrets" → 解出第一包；
 4. TLS 集成 —— 这一步要么接 OpenSSL 的 QUIC API（3.2+ 才有完整支持），
    要么接 picotls，是本模块之外的最大工程。
+
+---
+
+## 帧层（RFC 9000 §19）—— 已实现
+
+`include/go2cpp/network/quic/frame.hpp` + `src/network/quic/frame.cpp`。
+
+覆盖 22 种帧类型：PADDING / PING / ACK / ACK_ECN / RESET_STREAM / STOP_SENDING /
+CRYPTO / NEW_TOKEN / STREAM（**8 个变体**）/ MAX_DATA / MAX_STREAM_DATA /
+MAX_STREAMS(bidi,uni) / DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED(bidi,uni) /
+NEW_CONNECTION_ID / RETIRE_CONNECTION_ID / PATH_CHALLENGE / PATH_RESPONSE /
+CONNECTION_CLOSE(transport,app) / HANDSHAKE_DONE。
+
+### 两个关键语义
+
+**1. `length` 参数必须是「包的剩余字节数」，不是缓冲区容量。**
+RFC 9000 §19.8 规定 STREAM 帧的 LEN 位为 0 时，数据**延伸到包尾**。调用方必须
+保证传入的 `length` 恰好到包尾，否则解析边界会错。
+
+**2. 未知帧类型必须当连接错误处理，不能跳过。**
+RFC 9000 §12.4：*An endpoint MUST treat the receipt of a frame of unknown type as a
+connection error of type FRAME_ENCODING_ERROR.*
+QUIC 的扩展帧靠**双方提前协商**，不是靠"接收方忽略不认识的东西"。本模块返回
+`kUnknownType` 只是为了诊断时能区分"新扩展"和"垃圾字节"，**调用方仍应关闭连接**。
+
+### PADDING 的合并消费
+
+连续 N 个 `0x00` 在语义上等于 N 个独立 PADDING 帧。本实现合并消费成一个
+`padding_count = N` 的帧，语义等价且避免上层为空填充做 N 次循环。
+
+### 验证
+
+`tests/network/test_quic_frame.cpp`（10 场景，`failures=0`）：
+22 种帧往返、STREAM 8 变体、无 LEN 位延伸到包尾、ACK/ACK_ECN/Range 列表、
+PADDING 合并、**96 个前缀截断**（至少一次 kNeedMore）、10 例畸形输入、
+未知类型、随机往返 **20,000 次**、随机变异 fuzz **100,000 次**。
+
+### 仍未实现
+
+TLS 1.3 握手、Initial 密钥派生与 AEAD、Header Protection、Packet Number 真实值、
+丢包检测/PTO、拥塞控制、流状态机与流控、QPACK、连接迁移/0-RTT 防重放。
+
