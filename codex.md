@@ -7120,3 +7120,29 @@ median 分别为 **19,199 / 21,183 / 23,088 ns**。任务数扩大 40 倍，
 `BackendEvent`、`IOBackendFactory`），**没有逐一核对四个方法的精确签名**，
 所以图上按"注册/修改/删除/等待事件"的通用语义描述，并在提交信息里注明这一点，
 不编造参数列表。
+
+---
+
+## 2026-10-17 14:25–14:50：任务2 —— G7 与 G8 两图
+
+**产出**：`diagrams/G7-protocols.md`（269 行）、`diagrams/G8-log-config.md`（246 行）。
+
+**G7（应用协议）**：类架构覆盖 HTTP 七件（`Headers`/`Request`/`Response`/`Parser`/`ResponseWriter`/
+`Server`/`Client`）、WebSocket 七件、SSE 六件。重要函数画出一次请求的完整链路
+（accept → Feed → 解析 → handler → 写响应 → keep-alive 循环）、WebSocket 的握手校验与
+**Ping 自动回 Pong**、以及 SSE 里最关键的一条：**必须 `Flush`，不 flush 客户端根本收不到**
+（数据留在用户态缓冲里 —— 这是 SSE 最容易踩的坑，图上专门标出）。
+防护上强调 `ParserLimits` 与 `WebSocketConfig::max_message_size` 与 G6 的 `Framer::max_frame_size`
+是同一类"防内存耗尽"设计。状态流转给了 HTTP 连接、WebSocket 连接、SSE 流三个独立状态机。
+
+**G8（横切设施）**：类架构覆盖日志三抽象（`LogSink`/`LogFilter`/`LogFormatter`）与七个 sink、
+两个 filter、一个 formatter，以及 `Logger`/`LoggerManager`/`LogRecord`/`LogLine`；
+配置部分覆盖 `IniFile`/`ValueCodec<T>`（含 string/bool/log::Level/vector 特化）/`ConfigVarBase`/
+`ConfigVar<T>`/`Config`/`RuntimeConfig`。重要函数画出一条日志的路径，其中最关键的优化是
+**过滤发生在格式化之前**（被丢的日志不做字符串拼接）；另一个是 `ConfigVar` 值变化会**通知监听者**，
+所以改配置立即可生效；并且**解码失败保留旧值并报错，绝不静默丢弃配置** —— 这类静默降级是配置
+系统最常见的事故来源，已在图上明确。
+
+**准确性处理**：`LogSink` 的三个虚方法（`Write`/`Flush`/`Reopen`）是从头文件实际读到的签名，
+如实使用；`ConfigVar<T>` 的 `AddListener` 与 `Config::Lookup` 我按头文件里出现的类型名描述，
+具体参数未逐一核对，图里只写语义不写签名。
