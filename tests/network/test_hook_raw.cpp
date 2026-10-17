@@ -117,7 +117,7 @@ void ScenarioDoesNotPark() {
     go2cpp::IOManager manager(config);
     // 探针：必须先启动调度器，否则 Go() 只是入队、心跳 Fiber 不会运行。
     // 缺这一行会让下面的「心跳增量 == 0」断言恒成立（假阳性）。
-    GO2CPP_CHECK(manager.Start());
+    Check(manager.Start());
     go2cpp::hook::ScopedIOManagerBinding binding(&manager);
 
     int fds[2] = {-1, -1};
