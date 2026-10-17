@@ -7838,3 +7838,20 @@ victim 锁）。这同时解释了 workers=1 时持有仅 7.4 µs（processors.s
 **正解：把 work stealing 移出 admission_lock**（它只操作 victim.mutex，不需要全局锁），
 并重新论证认领事务与 stopping 检查的时机。本轮时间不够做安全实现，只提交数据与结论 ——
 但**方向被数据钉死了**，这是本次任务最重要的产出。
+
+---
+
+## 2026-10-17 24:45：steal 移出全局锁的设计（未落地）
+
+依据锁统计（workers=4 每次持有 30,542 ns、workers=1 仅 7,453 ns，差别就在是否走 steal），
+把 work stealing 移出全局锁是数据指向的正解。本轮写完了设计但**没实施** ——
+只剩 15 分钟，改完 + 全量验证 + 量化的完整循环做不完，按红线不留半成品。
+
+设计要点：`lock_guard` → `unique_lock` 以便提前放锁；steal 循环 + 认领
+（`runnable.fetch_sub` + `try_mark_running`，都是 atomic 不需全局锁）整体搬到锁外；
+锁外 steal 前重读 `stopping`。
+
+**强预测（可验证）**：若 steal 确实是 30 µs 的来源，改完 4 worker 每任务应从 3,817 ns
+降到约 1,400 ns（倍率 2.81x → 1.0~1.2x）。**若达不到就说明归因错了，应回退并重新定位。**
+
+完整设计与验证清单见 `DebugTooling/futex-refactor-attempt.md`。

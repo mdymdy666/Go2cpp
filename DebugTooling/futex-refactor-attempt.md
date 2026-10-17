@@ -479,3 +479,91 @@ park 的 `lock`）后，终于拿到了数据（`build-profile` 带 `-DGO2CPP_CO
 - `worker_loop` park 的 `lock`；
 - 计数器在 `go2cpp::scheduler::profiling` 命名空间，可由外部读取；
 - 开关：`-DGO2CPP_COUNT_GLOBAL_LOCK`。
+
+---
+
+## 2026-10-17 24:30–24:45：steal 移出全局锁 —— 设计与实施清单（时间不足，未落地）
+
+### 依据（数据）
+
+锁统计显示 `workers=4` 时全局锁**每次持有 30,542 ns**，而等待只有 1,182 ns（等待/持有 = 0.04）。
+`workers=1` 时持有仅 7,453 ns —— 因为 `processors.size() > 1` 为假，**根本不走 work stealing**。
+
+`30 µs` 的持有时间里，唯一随并发度增长的操作就是 steal：要遍历至多 `P-1` 个 victim 并逐个抢
+`victim.mutex`。**这就是要移出全局锁的东西。**
+
+### 现状代码结构（`worker_loop` 找活段）
+
+```cpp
+if (!task) {
+    std::lock_guard<std::mutex> admission_lock(m_impl->mutex);   // ← 全局锁，持 30 µs
+    if (!m_impl->stopping.load(...)) {
+        ...
+        task = m_impl->emergency_pop_locked();
+        if (!task) { lock(own_processor.mutex); take_local; }
+        if (!task) { take_global; }
+        if (!task && processors.size() > 1) {
+            const auto start = next_processor.fetch_add(1, relaxed);
+            for (offset...) {                          // ← 这一段要移出去
+                auto& victim = processors[(start+offset) % size];
+                if (&victim == &own_processor) continue;
+                std::lock_guard<std::mutex> queue_lock(victim.mutex);
+                if (!victim.queue.empty()) { task = take_victim(victim.queue); break; }
+            }
+        }
+        if (task) {
+            runnable.fetch_sub(1, relaxed);            // ← atomic，无需全局锁
+            claimed = task->try_mark_running();        // ← atomic，无需全局锁
+            if (!claimed) task->clear_queued();
+        }
+    }
+}
+```
+
+**关键观察**：steal 之后的两步（`runnable.fetch_sub` + `try_mark_running`）**都是原子操作**，
+不需要全局锁保护。所以 steal + 认领可以整体移到 `admission_lock` 之外。
+
+### 实施步骤
+
+1. **`lock_guard` → `unique_lock`**：为了能提前 `unlock()`，把
+   `std::lock_guard<std::mutex> admission_lock(...)` 改成
+   `std::unique_lock<std::mutex> admission_lock(...)`；
+2. **把 steal 循环整段搬出 `if (!task) { ... }` 的作用域**，放到全局锁释放之后，
+   条件改为"全局锁内没取到任务时不放弃，锁外再试 steal"；
+3. **认领也一起搬出去**：`runnable.fetch_sub` + `try_mark_running` + `clear_queued`
+   跟在 steal 之后，同样在锁外；
+4. **保留锁内的 `stopping` 检查**：锁外 steal 之前再读一次 `stopping`（atomic），
+   若已置位则跳过 steal（避免在 shutdown 期间从别的 P 偷任务）；
+5. **`own_processor` 的 `take_local` 保持在锁内**？—— 不需要，它只用 `own_processor.mutex`，
+   也可以搬出去；但**为降低本轮改动面，只搬 steal**。
+
+### 必须重新论证的点
+
+- **`runnable` 计数的配对**：steal 成功要 `fetch_sub(1)`，这个"取走"动作在锁外发生，
+  而 `enqueue` 的 `fetch_add(1)` 在锁内。两者都是 relaxed/acq_rel 原子，配对语义不变，
+  但要确认「steal 与 enqueue 竞争同一任务」不会导致计数错乱 —— 由 `victim.mutex` 串行化，成立。
+- **`try_mark_running` 失败时**：`clear_queued()` 后该任务仍在注册表，由既有的
+  `collect_terminal_locked` 清理路径回收（已在 `task && !claimed` 分支上）。
+- **`stopping` 与 steal 的竞态**：锁外 steal 前重读 `stopping` 只是缩小窗口，
+  并非严格互斥；但 steal 只搬动"还没被认领的任务"，shutdown 本身会 drain 队列，
+  所以我判断是安全的 —— **但这一点必须在压力测试下验证**。
+
+### 验证要求（红线）
+
+1. 显式 `cmake --build --target go2cpp_scheduler go2cpp_fiber go2cpp_sync go2cpp_tests`；
+2. 全量 ctest **必须 80/80**；
+3. 两个专项护栏（`test_scheduler_stress` / `test_parking_condition_stress`）`failures=0`；
+4. `build-bench` 量化 `workers=1/3/4` 的 before/after，**load 必须 < 1.5**；
+5. 若 `workers=4` 的倍率没有从 2.81x 明显下降，**回退**（说明 30 µs 不在 steal 上）。
+
+### 为什么本轮没做
+
+距 20:00 只剩约 15 分钟。这个改动要动 `admission_lock` 的作用域与类型（`lock_guard` → `unique_lock`），
+还涉及认领事务的顺序，**做不到"改完 + 全量验证 + 量化"的完整循环**。
+按红线「测试不全绿就回退」的要求，宁可不动，也不留半成品。
+
+### 预期收益（若 steal 确实是 30 µs 的来源）
+
+`workers=4` 时全局锁持有从 30 µs 降到约 `workers=1` 的量级（7 µs），
+即**每任务耗时从 3,817 ns 降到接近 1,400 ns**，倍率从 2.81x 拉回 1.0~1.2x。
+这是一个可验证的强预测 —— 若改完没达到，说明我的归因错了，应回退并重新定位。
