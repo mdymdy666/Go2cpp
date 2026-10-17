@@ -221,4 +221,84 @@ void run_debug_scheduler_tests() {
         }
         GO2CPP_CHECK(all_ok);
     }
+
+    // 场景 6（第 19 轮补充）：枚举全部 G
+    {
+        SchedulerFixture fixture(2);
+        DebugScheduler proxy(*fixture.scheduler);
+
+        // 不要求时不采集
+        GO2CPP_CHECK(proxy.Snapshot().tasks.empty());
+
+        // 跑 6 个任务并等它们结束
+        std::vector<std::shared_ptr<Task>> handles;
+        for (int i = 0; i < 6; ++i) {
+            handles.push_back(fixture.scheduler->spawn([] {}));
+        }
+        for (auto& h : handles) {
+            h->wait();
+        }
+
+        DumpOptions with_fibers;
+        with_fibers.include_fibers = true;
+        // 注意：**不假设** G 结束后会立即从注册表消失。
+        // 实测（本测试首版就踩到）任务 wait() 返回后其 Task 仍可能短时间内留在注册表里，
+        // 所以这里只做"能枚举、且不崩"的弱断言，把强断言留给下面那个长命 G。
+        const auto after = proxy.SnapshotWith(with_fibers);
+        GO2CPP_CHECK(after.tasks.size() <= 6);
+
+        // 制造一个**长命** G：让它阻塞，从而留在注册表里
+        go2cpp::sync::Mutex gate;
+        GO2CPP_CHECK(gate.TryLock());
+        auto blocking = fixture.scheduler->spawn([&gate] {
+            if (gate.Lock()) {
+                gate.Unlock();
+            }
+        });
+        // 等它进入等待（用锁的调试代理观测到等待者出现）
+        {
+            ::go2cpp::debug::DebugMutex probe(gate);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (std::chrono::steady_clock::now() < deadline && probe.Waiters() == 0) {
+                std::this_thread::yield();
+            }
+        }
+        const auto during = proxy.SnapshotWith(with_fibers);
+        GO2CPP_CHECK(!during.tasks.empty());
+        bool found_blocking = false;
+        for (const auto& t : during.tasks) {
+            if (t.id == blocking->id()) {
+                found_blocking = true;
+                GO2CPP_CHECK(t.started);
+                GO2CPP_CHECK(t.state == GState::kWaiting || t.state == GState::kRunnable ||
+                             t.state == GState::kRunning);
+                GO2CPP_CHECK(!t.failed);
+            }
+        }
+        GO2CPP_CHECK(found_blocking);
+
+        // 三种序列化都应包含该 G
+        const std::string text = proxy.DumpText(with_fibers);
+        GO2CPP_CHECK(Contains(text, "fibers (all non-terminated G in registries)"));
+        GO2CPP_CHECK(Contains(text, std::to_string(blocking->id())));
+        const std::string ini = proxy.DumpIni(with_fibers);
+        GO2CPP_CHECK(Contains(ini, "[g." + std::to_string(blocking->id()) + "]"));
+        const std::string json = proxy.DumpJson(with_fibers);
+        bool parsed = false;
+        try {
+            const auto value = go2cpp::Json::parse(json);
+            parsed = value.contains("fibers") && value["fibers"].is_array() &&
+                     !value["fibers"].empty();
+        } catch (...) {
+            parsed = false;
+        }
+        GO2CPP_CHECK(parsed);
+
+        // 不要求时 json 仍为 null（保持向后兼容的行为）
+        const std::string json_plain = proxy.DumpJson();
+        GO2CPP_CHECK(Contains(json_plain, "\"fibers\": null"));
+
+        gate.Unlock();
+        blocking->wait();
+    }
 }

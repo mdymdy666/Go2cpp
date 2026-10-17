@@ -233,6 +233,24 @@ struct MachineSnapshot {
 // 调度器热点计数器。所有时间均为 steady_clock 纳秒，采用累计值，便于
 // 调用方按两次快照的差值计算单次 Fiber 运行、切换和本地队列命中成本。
 /** @brief 调度器统计指标快照。 */
+
+/**
+ * @brief 单个 G（Task）的只读快照（第 19 轮，任务1 补齐「枚举全部 G」）。
+ * @note 全部字段都来自 `Task` 的**公开只读**方法，不访问任何私有状态。
+ *       不包含「当前阻塞在哪个锁/哪个 channel」这类信息 —— 现有实现没有记录，
+ *       因此**不虚构**（这也是设计文档里声明的观测边界之一）。
+ */
+struct TaskSnapshot {
+    GId id{0};                             ///< G 的编号。
+    GState state{GState::kNew};            ///< 状态机当前状态。
+    bool queued{false};                    ///< 是否在某个可运行队列里。
+    bool started{false};                   ///< 是否已经开始执行过。
+    PId last_processor_id{0};              ///< 最近一次运行所在的 P。
+    TaskClassId task_class{0};             ///< 任务类别（用于亲和性）。
+    bool failed{false};                    ///< 是否以失败终态结束。
+    bool cancellation_requested{false};    ///< 是否已请求取消。
+};
+
 struct SchedulerMetrics {
     std::uint64_t task_runs{0};
     std::uint64_t task_completions{0};
@@ -591,6 +609,13 @@ public:
     }
     std::vector<ProcessorSnapshot> processors() const;
     std::vector<MachineSnapshot> machines() const;
+    /**
+     * @brief 枚举当前仍在注册表里的全部 G（只读快照）。
+     * @details 遍历 16 个分片并逐个加锁读取；返回的是一组**分别读取**的结果，
+     *          不是同一瞬间的全景（与其它快照一致，需如实标注 per-call 一致）。
+     *          已进入终态并被回收的 G **不会**出现。
+     */
+    std::vector<TaskSnapshot> DebugSnapshotTasks() const;
     // 返回 sysmon 线程是否正在运行，便于部署自检和测试。
     bool sysmon_running() const noexcept;
     // 每次监控周期都会递增，即使调度器互斥量正被高负载路径占用。

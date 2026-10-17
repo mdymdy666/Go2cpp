@@ -3363,6 +3363,36 @@ std::vector<ProcessorSnapshot> Scheduler::processors() const {
 /// @param[in] 无；该函数仅使用所属对象或线程局部状态。
 /// @return 返回值表示操作结果；void、构造函数和析构函数通过对象状态完成工作。
 /// @note 该函数遵循所属模块的生命周期与并发约束；失败路径不会遗留等待节点或锁。
+
+std::vector<TaskSnapshot> Scheduler::DebugSnapshotTasks() const {
+    std::vector<TaskSnapshot> result;
+    if (!m_impl) {
+        return result;
+    }
+    // 分片遍历：每片单独持锁，不长时间阻塞其它分片的新增/回收。
+    // 用 task_registries.size() 而不是硬编码 16，避免与常量漂移。
+    for (std::size_t stripe = 0; stripe < m_impl->task_registries.size(); ++stripe) {
+        std::lock_guard<std::mutex> lock(m_impl->registry_mutexes[stripe]);
+        result.reserve(result.size() + m_impl->task_registries[stripe].size());
+        for (const auto& task : m_impl->task_registries[stripe]) {
+            if (!task) {
+                continue;
+            }
+            TaskSnapshot snapshot;
+            snapshot.id = task->id();
+            snapshot.state = task->state();
+            snapshot.queued = task->queued();
+            snapshot.started = task->started();
+            snapshot.last_processor_id = task->last_processor_id();
+            snapshot.task_class = task->task_class();
+            snapshot.failed = task->failed();
+            snapshot.cancellation_requested = task->cancellation_requested();
+            result.push_back(snapshot);
+        }
+    }
+    return result;
+}
+
 std::vector<MachineSnapshot> Scheduler::machines() const {
     std::vector<MachineSnapshot> result;
     if (!m_impl) {

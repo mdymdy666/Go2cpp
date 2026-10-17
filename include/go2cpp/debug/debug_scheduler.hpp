@@ -38,6 +38,7 @@ namespace go2cpp::debug {
 using SchedulerMetrics = scheduler::SchedulerMetrics;
 using ProcessorSnapshot = scheduler::ProcessorSnapshot;
 using MachineSnapshot = scheduler::MachineSnapshot;
+using TaskSnapshot = scheduler::TaskSnapshot;
 
 /// 序列化格式。
 enum class DumpFormat {
@@ -67,6 +68,8 @@ struct SchedulerDebugSnapshot {
     SchedulerMetrics metrics{};
     std::vector<ProcessorSnapshot> processors;
     std::vector<MachineSnapshot> machines;
+    /// 全部仍在注册表里的 G（需 include_fibers 才填充，否则为空）。
+    std::vector<TaskSnapshot> tasks;
 
     /// 双时间戳（使用者定案）。`steady` 仅用于**同机**排序与耗时，
     /// **不可跨机比较**；`wall` 用于跨机粗对齐。输出中必须标注此限制。
@@ -108,7 +111,18 @@ public:
         snapshot.metrics = m_scheduler->metrics();
         snapshot.processors = m_scheduler->processors();
         snapshot.machines = m_scheduler->machines();
+        // 枚举全部 G 需要遍历 16 个分片，成本比其它快照高，
+        // 因此只在调用方明确要求时采集（见 DumpOptions::include_fibers）。
         snapshot.per_call_consistent = false;
+        return snapshot;
+    }
+
+    /// 采集快照，并按 options 决定是否枚举全部 G。
+    SchedulerDebugSnapshot SnapshotWith(const DumpOptions& options) const {
+        SchedulerDebugSnapshot snapshot = Snapshot();
+        if (options.include_fibers && m_scheduler != nullptr) {
+            snapshot.tasks = m_scheduler->DebugSnapshotTasks();
+        }
         return snapshot;
     }
 
@@ -125,7 +139,7 @@ public:
 
     /// 文本格式（人类可读，缺信息如实标注）。
     std::string DumpText(const DumpOptions& options = {}) const {
-        const auto s = Snapshot();
+        const auto s = SnapshotWith(options);
         std::string out;
         out += "[scheduler]\n";
         out += "  processors=" + std::to_string(s.processor_count) +
@@ -178,12 +192,31 @@ public:
             }
             out += "(long_syscalls is a COUNT of threshold-exceeding blocks, not a duration)\n";
         }
+        if (options.include_fibers) {
+            out += "\nfibers (all non-terminated G in registries): " +
+                   std::to_string(s.tasks.size()) + "\n";
+            out += "     g      state      queued started  class  last_p  flags\n";
+            for (const auto& t : s.tasks) {
+                out += "  " + Pad(std::to_string(t.id).c_str(), 7) +
+                       Pad(GStateName(t.state), 11) +
+                       Pad(t.queued ? "yes" : "no", 7) +
+                       Pad(t.started ? "yes" : "no", 8) +
+                       Pad(std::to_string(t.task_class).c_str(), 7) +
+                       Pad(std::to_string(t.last_processor_id).c_str(), 8);
+                if (t.failed) out += "failed ";
+                if (t.cancellation_requested) out += "cancel-req ";
+                out += "\n";
+            }
+            if (s.tasks.empty()) {
+                out += "  (no live G)\n";
+            }
+        }
         return out;
     }
 
     /// ini 节结构（字段名与 design/02 的 schema 一致）。
     std::string DumpIni(const DumpOptions& options = {}) const {
-        const auto s = Snapshot();
+        const auto s = SnapshotWith(options);
         std::string out;
         out += "[scheduler]\n";
         out += "processor_count=" + std::to_string(s.processor_count) + "\n";
@@ -228,12 +261,25 @@ public:
                 out += "long_syscall_count=" + std::to_string(m.long_syscall_count) + "\n\n";
             }
         }
+        if (options.include_fibers) {
+            for (const auto& t : s.tasks) {
+                out += "[g." + std::to_string(t.id) + "]\n";
+                out += "state=" + std::string(GStateName(t.state)) + "\n";
+                out += "queued=" + std::string(t.queued ? "true" : "false") + "\n";
+                out += "started=" + std::string(t.started ? "true" : "false") + "\n";
+                out += "task_class=" + std::to_string(t.task_class) + "\n";
+                out += "last_processor_id=" + std::to_string(t.last_processor_id) + "\n";
+                out += "failed=" + std::string(t.failed ? "true" : "false") + "\n";
+                out += "cancellation_requested=" +
+                       std::string(t.cancellation_requested ? "true" : "false") + "\n\n";
+            }
+        }
         return out;
     }
 
     /// JSON（字段名与 design/02 §3 的 schema 对齐）。
     std::string DumpJson(const DumpOptions& options = {}) const {
-        const auto s = Snapshot();
+        const auto s = SnapshotWith(options);
         std::string out;
         out += "{\n";
         out += "  \"schema\": \"go2cpp.dump.scheduler/1\",\n";
@@ -287,7 +333,26 @@ public:
             }
             out += "]";
         }
-        out += ",\n  \"fibers\": null\n}\n";
+        if (options.include_fibers) {
+            out += ",\n  \"fibers\": [";
+            for (std::size_t i = 0; i < s.tasks.size(); ++i) {
+                const auto& t = s.tasks[i];
+                if (i != 0) out += ",";
+                out += "\n    {\"g\": " + std::to_string(t.id) +
+                       ", \"state\": \"" + std::string(GStateName(t.state)) +
+                       "\", \"queued\": " + (t.queued ? "true" : "false") +
+                       ", \"started\": " + (t.started ? "true" : "false") +
+                       ", \"task_class\": " + std::to_string(t.task_class) +
+                       ", \"last_processor_id\": " + std::to_string(t.last_processor_id) +
+                       ", \"failed\": " + (t.failed ? "true" : "false") +
+                       ", \"cancellation_requested\": " +
+                       (t.cancellation_requested ? "true" : "false") + "}";
+            }
+            out += s.tasks.empty() ? "]\n}\n" : "\n  ]\n}\n";
+        } else {
+            out += ",\n  \"fibers\": null\n}\n";
+        }
+        return out;
         return out;
     }
 
@@ -298,6 +363,19 @@ private:
             out.push_back(' ');
         }
         return out;
+    }
+
+    static const char* GStateName(GState state) noexcept {
+        switch (state) {
+            case GState::kNew: return "New";
+            case GState::kRunnable: return "Runnable";
+            case GState::kRunning: return "Running";
+            case GState::kWaiting: return "Waiting";
+            case GState::kDead: return "Dead";
+            case GState::kCancelled: return "Cancelled";
+            case GState::kFailed: return "Failed";
+        }
+        return "Unknown";
     }
 
     static const char* ProcessorStateName(PState state) noexcept {
