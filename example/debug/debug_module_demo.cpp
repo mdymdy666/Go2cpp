@@ -19,6 +19,8 @@
 #include "go2cpp/scheduler.hpp"
 #include "go2cpp/sync.hpp"
 
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -28,6 +30,20 @@
 namespace {
 
 int g_failures = 0;
+
+/// G 状态的可读名（示例里只用于打印）。
+const char* GStateLabel(go2cpp::GState state) {
+    switch (state) {
+        case go2cpp::GState::kNew: return "New";
+        case go2cpp::GState::kRunnable: return "Runnable";
+        case go2cpp::GState::kRunning: return "Running";
+        case go2cpp::GState::kWaiting: return "Waiting";
+        case go2cpp::GState::kDead: return "Dead";
+        case go2cpp::GState::kCancelled: return "Cancelled";
+        case go2cpp::GState::kFailed: return "Failed";
+    }
+    return "Unknown";
+}
 
 void Check(bool condition, const char* what) {
     if (!condition) {
@@ -233,6 +249,100 @@ int main() {
         Check(DebugBreakpoints::Instance().Waiting().empty(),
               "ScopedCheckpoint 应已自动恢复，waiting 为空");
         DebugBreakpoints::Instance().Clear();
+    }
+
+
+    // ---------- 8. 枚举全部 G（dump scheduler --include-fibers）----------
+    Section("8. 枚举全部 G（fibers 段）");
+    {
+        // 制造一个长命阻塞 G，让它留在注册表里
+        sync::Mutex gate;
+        (void)gate.TryLock();
+        auto blocked = scheduler.spawn([&gate] {
+            if (gate.Lock()) {
+                gate.Unlock();
+            }
+        });
+        {
+            DebugMutex probe(gate);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (std::chrono::steady_clock::now() < deadline && probe.Waiters() == 0) {
+                std::this_thread::yield();
+            }
+        }
+
+        DumpOptions with_fibers;
+        with_fibers.include_fibers = true;
+        const auto snap = proxy.SnapshotWith(with_fibers);
+        std::printf("  枚举到 %zu 个存活 G：\n", snap.tasks.size());
+        std::size_t shown = 0;
+        for (const auto& t : snap.tasks) {
+            if (shown++ >= 6) {
+                break;
+            }
+            std::printf("    g=%-4llu state=%-9s queued=%-3s started=%-3s failed=%s\n",
+                        static_cast<unsigned long long>(t.id), GStateLabel(t.state),
+                        t.queued ? "yes" : "no", t.started ? "yes" : "no",
+                        t.failed ? "yes" : "no");
+        }
+        Check(!snap.tasks.empty(), "应能枚举到存活 G");
+        // 文本输出的 fibers 段
+        const std::string text_with = proxy.DumpText(with_fibers);
+        Check(text_with.find("fibers (all non-terminated G in registries)") != std::string::npos,
+              "text 应含 fibers 段");
+        // 默认（不要求）时 json 仍为 null
+        Check(proxy.DumpJson().find("\"fibers\": null") != std::string::npos,
+              "默认 json 的 fibers 应为 null");
+
+        gate.Unlock();
+        blocked->wait();
+    }
+
+    // ---------- 9. dump events --follow ----------
+    Section("9. dump events --follow（跟随 2 批）");
+    {
+        auto follow_cmd = ParseDumpCommand({"dump", "events", "--follow=2",
+                                            "--follow-interval=0", "--follow-timeout=300"});
+        Check(follow_cmd.valid, "--follow 解析应成功");
+        Check(follow_cmd.follow, "follow 标志应为真");
+        Check(follow_cmd.follow_batches == 2, "批次上限应为 2");
+        // 造几个事件再跟随
+        for (int i = 0; i < 3; ++i) {
+            SchedulerEvent event;
+            event.type = SchedulerEventType::kTaskCompleted;
+            event.task_id = static_cast<GId>(i + 1);
+            event.timestamp = std::chrono::steady_clock::now();
+            collector->OnEvent(event);
+        }
+        std::string note;
+        std::string error;
+        const bool ok = RunEventsDump(follow_cmd, *collector, &note, &error);
+        Check(ok, "RunEventsDump(follow) 应成功");
+        std::printf("  跟随结果: %s\n", note.c_str());
+        Check(note.find("followed") != std::string::npos, "应报告跟随批数");
+    }
+
+    // ---------- 10. 信号驱动的跨进程 dump ----------
+    Section("10. 跨进程 dump（SIGUSR1）");
+    {
+        std::string error;
+        const bool installed = DebugSignalDumper::Install(scheduler, collector.get(), "/tmp", &error);
+        Check(installed, "Install 应成功");
+        std::printf("  已安装 SIGUSR1 处理器（signal=%d）；真实场景下用 `kill -USR1 <pid>` 触发\n",
+                    DebugSignalDumper::SignalNumber());
+        if (installed) {
+            // 进程内直接 raise 模拟外部信号；处理器只置位，真正 dump 在 PollOnce 里做
+            Check(std::raise(DebugSignalDumper::SignalNumber()) == 0, "raise 应成功");
+            Check(DebugSignalDumper::Pending(), "应检测到待处理请求");
+            std::string path;
+            const auto produced = DebugSignalDumper::PollOnce(&path, &error);
+            Check(produced == 1, "PollOnce 应执行一次 dump");
+            std::printf("  已写出快照: %s\n", path.c_str());
+            Check(path.find("go2cpp-signal-dump-") != std::string::npos, "文件名应含前缀");
+            std::remove(path.c_str());
+            std::remove((path + ".events.ini").c_str());
+            DebugSignalDumper::Uninstall();
+        }
     }
 
     // ---------- 收尾 ----------
