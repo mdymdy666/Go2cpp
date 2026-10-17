@@ -3702,19 +3702,6 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         if (task && m_impl->stopping.load(std::memory_order_acquire)) {
             task->request_cancel(false);
         }
-        // 快速路径：本 P 队列非空时直接取，**只持本 P 自己的锁**，不碰全局
-        // admission mutex。原先连这一步都在全局锁内，导致 min_workers=N 时
-        // N 个 worker 只要本地队列一空就串行化在同一把全局锁上 —— 这是
-        // min_workers=N 下数量级劣化的主因（见 DebugTooling/diag-worker-scaling-2.md）。
-        // 这里只做纯 FIFO 取，不做 task_class 亲和（亲和逻辑仍留在慢路径）。
-        if (!task) {
-            std::lock_guard<std::mutex> local_lock(own_processor.mutex);
-            if (!own_processor.queue.empty()) {
-                task = std::move(own_processor.queue.front());
-                own_processor.queue.pop_front();
-            }
-        }
-
         if (!task) {
             // Queue removal, the shutdown check, and the runnable->running
             // claim form one admission transaction.  A task already claimed
