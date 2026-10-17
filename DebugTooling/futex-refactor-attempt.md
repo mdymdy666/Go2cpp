@@ -257,3 +257,44 @@ m_impl->condition.wait(lock, terminal);
 ### 代码状态
 
 `src/concurrency/scheduler.cpp` 已恢复到 `14491ae`，全量 ctest 80/80。
+
+---
+
+## 2026-10-17 22:30–23:05：拆分 global_queue 的可行性分析 + 锁计数插桩
+
+### 拆分 `global_queue` 的保护对象：分析后放弃
+
+原以为给 `global_queue` 一个独立 mutex 就能让"入本地队列"不碰全局锁。读到锁嵌套后否定了这个设想：
+
+| 路径 | 锁顺序 |
+|---|---|
+| `enqueue` | `m_impl->mutex` → `processor.mutex`（→ 必要时 `global_queue`）|
+| `worker_loop` 找活 | `m_impl->mutex` → `victim.mutex` |
+
+顺序统一为 `全局 → P`。即使把 `global_queue` 拆出独立锁，`enqueue` **仍然**必须拿
+`m_impl->mutex` —— 因为 `accepting` / `stopping` 的检查与 `global_queue` 都在它的保护范围内。
+
+要真正省掉"本地队列路径的全局锁"，就必须让 `enqueue` 只拿 `processor.mutex`，
+但这样它的锁顺序就与 `worker_loop`（`全局 → P`）相反，会死锁；除非加"拿不到就重试放锁"
+的协议，复杂度和风险都超出本轮剩余时间。**所以这一轮没有改代码，只做了下面这件事。**
+
+### 锁计数插桩（新增，默认关闭）
+
+加了 `GO2CPP_COUNT_GLOBAL_LOCK` 编译开关下的统计：`g_lock_acquires` / `g_lock_wait_ns` /
+`g_lock_hold_ns`，配 `LockStatGuard`（构造时测等待时长，析构时测持有时长）。
+
+**默认不编译**，所以对性能零影响；要拿数据需要以
+`-DGO2CPP_COUNT_GLOBAL_LOCK` 重编整个库 —— 这一步留到下一轮（要重建 build-bench 全部依赖）。
+
+它能回答两个关键问题：
+1. **每任务到底拿几次全局锁**（若 > 2，说明有可合并的获取）；
+2. **等待时长 vs 持有时长的比例**（若等待 >> 持有，说明是争用；若持有 >> 等待，
+   说明是临界区太长，该拆事务而不是加自旋 —— 正好对应上一轮"加自旋变差"的实验结果）。
+
+### 本轮净产出
+
+| 项 | 状态 |
+|---|---|
+| 拆分 `global_queue` 保护 | ❌ 分析后放弃（锁顺序反转会死锁）|
+| 锁计数插桩 | ✅ 已加，默认关闭 |
+| 代码状态 | ctest 80/80 |

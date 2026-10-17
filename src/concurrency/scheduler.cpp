@@ -23,6 +23,38 @@
 
 namespace go2cpp::scheduler {
 namespace {
+#ifdef GO2CPP_COUNT_GLOBAL_LOCK
+// 诊断插桩（默认关闭）：统计调度器全局锁的获取次数与持有时间，
+// 用于判断"每任务拿几次锁"以及锁是不是真正的瓶颈。
+std::atomic<std::uint64_t> g_lock_acquires{0};
+std::atomic<std::uint64_t> g_lock_wait_ns{0};
+std::atomic<std::uint64_t> g_lock_hold_ns{0};
+
+struct LockStatGuard {
+    std::chrono::steady_clock::time_point begin;
+    explicit LockStatGuard(std::mutex& m) {
+        const auto t0 = std::chrono::steady_clock::now();
+        m.lock();
+        const auto t1 = std::chrono::steady_clock::now();
+        g_lock_wait_ns.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
+            std::memory_order_relaxed);
+        g_lock_acquires.fetch_add(1, std::memory_order_relaxed);
+        begin = t1;
+    }
+    ~LockStatGuard() {
+        const auto t2 = std::chrono::steady_clock::now();
+        g_lock_hold_ns.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - begin).count()),
+            std::memory_order_relaxed);
+    }
+    LockStatGuard(const LockStatGuard&) = delete;
+    LockStatGuard& operator=(const LockStatGuard&) = delete;
+};
+#endif
+
 
 std::atomic<GId> s_next_g_id{1};
 std::atomic<MId> s_next_m_id{1};
