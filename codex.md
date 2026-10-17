@@ -7732,3 +7732,23 @@ condition 换 futex 后 4 worker 仍 2.81x。用 benchmark 第 6 参数解耦 pr
 **下一步两条路**（都不碰 `WaitOnce` 契约）：① 给 HybridMutex 加"暴露内部 std::mutex"的适配层，
 让 condition 继续用 `unique_lock<std::mutex>` 而自旋发生在获取它之前；
 ② 放弃换锁，改缩短持有时间（predicate 移锁外 / admission 拆分）。**推荐 ②**，风险低得多。
+
+---
+
+## 2026-10-17 22:30：调度器自旋尝试失败（已回退）
+
+先确认 `local_queue_limit` 与残余瓶颈无关（256/2048/8192 → 3.49x/3.36x/3.47x，无单调关系）。
+
+然后给 `m_impl->mutex` 加自旋预算（try_lock 128 次再阻塞），只改 worker_loop 的 park 点与
+enqueue 的 admission。结果**变差**：3 worker 1.60x→2.18x、4 worker 2.81x→3.48x。
+ctest 仍 80/80（不影响正确性），按红线回退。
+
+**关键认识：自旋预算不是通用优化，它依赖临界区长度。**
+- `sync::Mutex` 的临界区是「加解锁一个计数器」（几十 ns）→ 自旋 +21 倍；
+- 调度器 `enqueue` 的临界区含 `find` + 队列操作（上百 ns）→ 自旋 -36%。
+
+自旋是「用 CPU 换上下文切换」，只有临界区比上下文切换短得多时才划算。
+临界区长时，自旋线程持续抢 CPU 反而拖慢持锁者。
+
+**讽刺的是 `worker_loop` 的注释里早就写了**：「不能使用长自旋，否则一个 P 上的持锁 G
+可能被同一 P 的等待 G 阻塞」。我这次又踩了一遍 —— 读注释时看到了，但没把它当成约束。
