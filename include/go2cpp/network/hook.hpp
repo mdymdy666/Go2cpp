@@ -3,6 +3,12 @@
 #include "go2cpp/io.hpp"
 #include "go2cpp/thread_policy.hpp"
 
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <poll.h>
+#include <sys/select.h>
+#include <sys/epoll.h>
+#include <ctime>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -128,6 +134,20 @@ bool OpEnabled(HookOp op) noexcept;
  * @param op 目标操作。
  * @param enabled 是否接受 Hook。
  * @return `true` 表示设置已生效；`false` 表示**请求被拒绝**。
+ *
+ * @warning **有了 `*_f` 之后，这个开关是危险且不必要的。**
+ *
+ *          它是**进程级全局状态**：改一处会影响**所有线程**、所有已 park 的
+ *          Fiber，而且**编译期不可见** —— 看代码不知道走哪条路，要查运行时
+ *          配置；更糟的是容易**忘恢复**（`SetOpEnabled(false)` 之后忘了设回来，
+ *          后续代码静默变慢，且很难定位）。
+ *
+ *          需要"这一次不 hook"时，**请用 `<函数名>_f`**（如 `read_f`）：
+ *          它只影响你显式调用的那一处，看代码就知道，也不需要恢复。
+ *
+ *          这个开关保留下来**只为诊断便利**（临时全局关闭以对比行为），
+ *          **不建议在任何生产路径上依赖它。**
+ *
  * @details 有一组操作**不允许被关闭**（`close` / `shutdown` / `fcntl` /
  *          `dup` / `dup2`），因为关闭它们会让 fd 元数据与内核状态脱节 ——
  *          fd 号被复用时 Hook 会拿过期 descriptor 做判断（把普通文件当
@@ -201,3 +221,100 @@ void go2cpp_hook_set_enabled(int enabled) noexcept;
 int go2cpp_hook_is_enabled() noexcept;
 void go2cpp_hook_bind_io_manager(void* manager) noexcept;
 }
+
+// ============================================================================
+// 原始调用 API（`*_f`）—— 显式选择「不参与协程调度」
+// ============================================================================
+//
+// ## 命名与语义
+//
+// 每个被 hook 的 libc 函数都有一个 `_f` 后缀的原始版本（`_f` = **raw /
+// non-hooked**）。`read_f(...)` 与 `read(...)` 的区别：
+//
+// | 维度 | `read(...)` | `read_f(...)` |
+// |---|---|---|
+// | 参与协程调度 | 是（socket 上会 park Fiber）| **否** |
+// | 受进程级 `hook.enable_*` 开关影响 | 是 | **否** |
+// | 在普通线程可用 | 是（退化为阻塞）| **是** |
+// | 行为 | 取决于 hook 启用状态与 fd 类型 | **永远是 libc 原始行为** |
+//
+// **`_f` 不代表更快。** 它只是"不参与协程调度"。在 Fiber 里调 `read_f`
+// 会**真的阻塞整个 worker 线程** —— 该 P 上所有 Fiber 全部停摆。
+//
+// 只在这些场景用它：
+// - 明确知道该 fd 不会阻塞（普通文件、已就绪的 socket）
+// - 明确知道自己在普通线程上，不需要协程调度
+// - 诊断 / 对照实验
+//
+// ## 为什么用显式 API 而不是只靠运行时开关
+//
+// 进程级 `hook.enable_*` 开关仍然保留（诊断用），但它有三个问题：
+// 1. **编译期不可见**：看代码不知道走哪条路，要查运行时配置；
+// 2. **影响全局**：改一处会影响所有线程与已 park 的 Fiber；
+// 3. **容易忘恢复**：`SetOpEnabled(false)` 之后忘了设回来，后续代码静默变慢。
+//
+// `*_f` 解决了这三点：它只影响**你显式调用的那一处**，看代码就知道。
+// **生产路径优先用 `*_f`，不要依赖全局开关。**
+//
+// ## 实现保证
+//
+// - 直接调 `dlsym(RTLD_NEXT)` 拿到的真实 libc 函数，**不经过** hook 的任何分支；
+// - **不递归**：绝不调同名 libc 函数（那会再次进入 hook）；
+// - 参数、返回值、`errno` 语义与 libc 完全一致；
+// - **不依赖** Fiber / IOManager / `hooks_enabled()`，普通线程可直接调用。
+//
+// ## 关于 `shutdown_f`
+//
+// `shutdown` 在本层**从未被 hook**（`Originals` 里没有对应项；只有
+// `hook.enable_shutdown` 这个配置项，是配置表的完整性遗留）。
+// 所以 `shutdown_f` 与 `shutdown` 行为完全一致，提供它只是为了**命名统一**，
+// 让调用方不必记"哪些函数有 `_f` 版本"。
+
+/** @brief `read` 的原始版本：不 park Fiber、不受 hook 开关影响。 */
+ssize_t read_f(int fd, void* buffer, std::size_t count);
+/** @brief `readv` 的原始版本。 */
+ssize_t readv_f(int fd, const struct iovec* iov, int iovcount);
+/** @brief `recv` 的原始版本。 */
+ssize_t recv_f(int fd, void* buffer, std::size_t length, int flags);
+/** @brief `recvfrom` 的原始版本。 */
+ssize_t recvfrom_f(int fd, void* buffer, std::size_t length, int flags,
+                   struct sockaddr* address, socklen_t* address_length);
+/** @brief `write` 的原始版本。 */
+ssize_t write_f(int fd, const void* buffer, std::size_t count);
+/** @brief `writev` 的原始版本。 */
+ssize_t writev_f(int fd, const struct iovec* iov, int iovcount);
+/** @brief `send` 的原始版本。 */
+ssize_t send_f(int fd, const void* buffer, std::size_t length, int flags);
+/** @brief `sendto` 的原始版本。 */
+ssize_t sendto_f(int fd, const void* buffer, std::size_t length, int flags,
+                 const struct sockaddr* destination, socklen_t address_length);
+/** @brief `connect` 的原始版本：不受 connect 超时配置影响。 */
+int connect_f(int fd, const struct sockaddr* address, socklen_t address_length);
+/** @brief `accept` 的原始版本：新 fd 不会被登记到 FdManager。 */
+int accept_f(int fd, struct sockaddr* address, socklen_t* address_length);
+/** @brief `sleep` 的原始版本：会真的阻塞整个 worker 线程。 */
+unsigned int sleep_f(unsigned int seconds);
+/** @brief `poll` 的原始版本。 */
+int poll_f(struct pollfd* descriptors, nfds_t count, int timeout);
+/** @brief `select` 的原始版本。 */
+int select_f(int descriptor_count, fd_set* read_set, fd_set* write_set,
+             fd_set* except_set, struct timeval* timeout);
+/** @brief `epoll_wait` 的原始版本。 */
+int epoll_wait_f(int epoll_fd, struct epoll_event* events, int max_events,
+                 int timeout);
+/** @brief `close` 的原始版本：不清理 FdManager 元数据。 */
+int close_f(int fd);
+/** @brief `shutdown` 的原始版本（`shutdown` 本来就没被 hook，仅为命名统一）。 */
+int shutdown_f(int fd, int how);
+/**
+ * @brief `fcntl` 的原始版本。
+ * @note 变参命令按现有 hook 的同一套契约解析（`FcntlArgument`）；
+ *       未知命令返回 `ENOTSUP`，不会读取未知类型参数。
+ */
+int fcntl_f(int fd, int command, ...);
+/** @brief `dup` 的原始版本。 */
+int dup_f(int fd);
+/** @brief `dup2` 的原始版本。 */
+int dup2_f(int fd, int new_fd);
+
+

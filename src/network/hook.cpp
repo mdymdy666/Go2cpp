@@ -1941,3 +1941,178 @@ int setsockopt(int fd, int level, int option, const void* value,
 }
 
 }  // extern "C"
+
+// ============================================================================
+// 原始调用 API（`*_f`）实现
+//
+// 每个 `_f` 直接调 `s_originals.m_xxx`（`dlsym(RTLD_NEXT)` 拿到的真实 libc），
+// **绝不调同名 libc 函数** —— 那会再次进入 hook，造成无限递归。
+//
+// 它们不读 `hooks_enabled()`、不碰 IOManager、不 park Fiber，
+// 所以在普通线程与 Fiber 里行为一致：都是 libc 的原始阻塞语义。
+// ============================================================================
+
+namespace {
+
+/// 原始函数指针不可用（dlsym 失败）时统一报 ENOSYS。
+bool RawUnavailable(const void* function) noexcept {
+    if (function == nullptr) {
+        errno = ENOSYS;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+ssize_t read_f(int fd, void* buffer, std::size_t count) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_read))) return -1;
+    return s_originals.m_read(fd, buffer, count);
+}
+
+ssize_t readv_f(int fd, const struct iovec* iov, int iovcount) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_readv))) return -1;
+    return s_originals.m_readv(fd, iov, iovcount);
+}
+
+ssize_t recv_f(int fd, void* buffer, std::size_t length, int flags) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_recv))) return -1;
+    return s_originals.m_recv(fd, buffer, length, flags);
+}
+
+ssize_t recvfrom_f(int fd, void* buffer, std::size_t length, int flags,
+                   struct sockaddr* address, socklen_t* address_length) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_recvfrom))) return -1;
+    return s_originals.m_recvfrom(fd, buffer, length, flags, address, address_length);
+}
+
+ssize_t write_f(int fd, const void* buffer, std::size_t count) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_write))) return -1;
+    return s_originals.m_write(fd, buffer, count);
+}
+
+ssize_t writev_f(int fd, const struct iovec* iov, int iovcount) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_writev))) return -1;
+    return s_originals.m_writev(fd, iov, iovcount);
+}
+
+ssize_t send_f(int fd, const void* buffer, std::size_t length, int flags) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_send))) return -1;
+    return s_originals.m_send(fd, buffer, length, flags);
+}
+
+ssize_t sendto_f(int fd, const void* buffer, std::size_t length, int flags,
+                 const struct sockaddr* destination, socklen_t address_length) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_sendto))) return -1;
+    return s_originals.m_sendto(fd, buffer, length, flags, destination, address_length);
+}
+
+int connect_f(int fd, const struct sockaddr* address, socklen_t address_length) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_connect))) return -1;
+    return s_originals.m_connect(fd, address, address_length);
+}
+
+int accept_f(int fd, struct sockaddr* address, socklen_t* address_length) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_accept))) return -1;
+    // 注意：**不**调 try_register_new_socket —— 原始版本产生的 fd 不进 FdManager，
+    // 后续读写也走原生路径，与「显式不 hook」的语义一致。
+    return s_originals.m_accept(fd, address, address_length);
+}
+
+unsigned int sleep_f(unsigned int seconds) {
+    initialize_originals();
+    if (s_originals.m_sleep != nullptr) {
+        return s_originals.m_sleep(seconds);
+    }
+    // 退化路径：用 nanosleep 实现 sleep 的语义（返回未睡完的秒数）。
+    const timespec request{static_cast<time_t>(seconds), 0};
+    timespec remaining{};
+    if (::nanosleep(&request, &remaining) == 0) {
+        return 0;
+    }
+    return static_cast<unsigned int>(remaining.tv_sec);
+}
+
+int poll_f(struct pollfd* descriptors, nfds_t count, int timeout) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_poll))) return -1;
+    return s_originals.m_poll(descriptors, count, timeout);
+}
+
+int select_f(int descriptor_count, fd_set* read_set, fd_set* write_set,
+             fd_set* except_set, struct timeval* timeout) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_select))) return -1;
+    return s_originals.m_select(descriptor_count, read_set, write_set, except_set,
+                                timeout);
+}
+
+int epoll_wait_f(int epoll_fd, struct epoll_event* events, int max_events,
+                 int timeout) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_epoll_wait))) return -1;
+    return s_originals.m_epoll_wait(epoll_fd, events, max_events, timeout);
+}
+
+int close_f(int fd) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_close))) return -1;
+    // 注意：**不**清理 FdManager 元数据 —— 那正是「显式不 hook」的代价。
+    return s_originals.m_close(fd);
+}
+
+int shutdown_f(int fd, int how) {
+    // `shutdown` 在本层**从未被 hook**（Originals 里没有对应项，只有
+    // hook.enable_shutdown 这个配置项是配置表完整性遗留）。
+    // 所以 ::shutdown 就是原始版本，直接调它即可。
+    return ::shutdown(fd, how);
+}
+
+int fcntl_f(int fd, int command, ...) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_fcntl))) return -1;
+
+    // 变参命令按与 hook 版本完全相同的契约解析；未知命令返回 ENOTSUP，
+    // 不读取未知类型的参数（那是未定义行为）。
+    const FcntlArgument kind = fcntl_argument(command);
+    if (kind == FcntlArgument::Unknown) {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    va_list arguments;
+    va_start(arguments, command);
+    int result = -1;
+    if (kind == FcntlArgument::Integer) {
+        const int argument = va_arg(arguments, int);
+        va_end(arguments);
+        result = s_originals.m_fcntl(fd, command, argument);
+    } else {
+        void* argument = va_arg(arguments, void*);
+        va_end(arguments);
+        result = s_originals.m_fcntl(fd, command, argument);
+    }
+    return result;
+}
+
+int dup_f(int fd) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_dup))) return -1;
+    return s_originals.m_dup(fd);
+}
+
+int dup2_f(int fd, int new_fd) {
+    initialize_originals();
+    if (RawUnavailable(reinterpret_cast<const void*>(s_originals.m_dup2))) return -1;
+    return s_originals.m_dup2(fd, new_fd);
+}
