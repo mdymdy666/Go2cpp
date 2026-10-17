@@ -282,7 +282,7 @@ void run_debug_events_tests() {
                 received += events.size();
                 return true;
             },
-            std::chrono::milliseconds(1), 1, std::chrono::milliseconds(200));
+            std::chrono::milliseconds(1), 1, std::chrono::milliseconds(20));
         GO2CPP_CHECK(batches == 1);
         GO2CPP_CHECK(received == 5);
         // Drain 是消耗性的：跟随之后缓冲应归零
@@ -292,7 +292,7 @@ void run_debug_events_tests() {
         DebugEventCollector empty_collector(16);
         const auto zero = FollowEvents(empty_collector, [](const std::vector<SchedulerEvent>&) {
             return true;
-        }, std::chrono::milliseconds(1), 1, std::chrono::milliseconds(200));
+        }, std::chrono::milliseconds(1), 1, std::chrono::milliseconds(20));
         GO2CPP_CHECK(zero == 0);
 
         // 3) sink 返回 false 应提前停止
@@ -310,7 +310,7 @@ void run_debug_events_tests() {
                     ++calls;
                     return false;   // 第一批后就要求停止
                 },
-                std::chrono::milliseconds(1), 0, std::chrono::milliseconds(200));
+                std::chrono::milliseconds(1), 0, std::chrono::milliseconds(20));
             GO2CPP_CHECK(stopped == 1);
             GO2CPP_CHECK(calls == 1);
         }
@@ -339,7 +339,10 @@ void run_debug_events_tests() {
 
         // 5) 随机：随机事件数与随机上限，批数不得超过上限
         std::mt19937 rng(20261016);
-        std::uniform_int_distribution<int> count_dist(0, 40);
+        // 从 1 开始：若事件数为 0，FollowEvents 会一直等到超时；
+        // 50 组 x 500ms 曾把 ctest 拖到 Timeout（实测），故这里既保证有事件、
+        // 又把超时压到 20ms。
+        std::uniform_int_distribution<int> count_dist(1, 40);
         std::uniform_int_distribution<int> limit_dist(1, 5);
         bool ok = true;
         for (int round = 0; round < 50; ++round) {
@@ -355,7 +358,7 @@ void run_debug_events_tests() {
             }
             const auto made = FollowEvents(random_collector,
                                            [](const std::vector<SchedulerEvent>&) { return true; },
-                                           std::chrono::milliseconds(0), limit, std::chrono::milliseconds(500));
+                                           std::chrono::milliseconds(0), limit, std::chrono::milliseconds(20));
             ok = ok && made <= limit;
             ok = ok && random_collector.Pending() == 0;
         }

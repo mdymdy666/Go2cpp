@@ -47,6 +47,22 @@ inline const char* EventTypeName(SchedulerEventType type) noexcept {
     return "Unknown";
 }
 
+
+/**
+ * @brief 每个线程各自的暂存缓冲（第 21 轮，线程局部批量发布）。
+ *
+ * @details `SchedulerObserver::OnEvent` 在 **worker 线程**上被同步调用；
+ *   若每条事件都直接 `Push` 到共享缓冲，会产生「每事件若干次原子操作」。
+ *   这里改为：先在**线程局部** vector 里积累 `kDefaultFlushBatch` 条，
+ *   再一次性 `PushBatch` 提交，从而把原子操作摊薄到每批一次。
+ *
+ * @note 线程局部缓冲需要**在采集器析构或显式 Flush 时排空**，否则最后不足一批的事件
+ *   会滞留在暂存区。`DebugEventCollector` 的 `Drain`/`Peek`/析构都会先调用 `Flush()`；
+ *   析构时还会尝试排空**当前线程**的暂存（其它线程的暂存只能靠各自线程的下次调用或进程退出，
+ *   这是线程局部方案的固有代价，已在头文件中如实说明）。
+ */
+inline constexpr std::size_t kDefaultFlushBatch = 32;
+
 /**
  * @brief 有界环形事件缓冲（单生产者多消费者安全，非阻塞）。
  *
@@ -104,6 +120,36 @@ public:
         return true;
     }
 
+
+    /**
+     * @brief 批量入队：先一次性预留 `count` 个槽，再拷贝（第 21 轮，线程局部批量发布）。
+     * @return 实际入队条数；空间不足时入队前 `min(count, 剩余空间)` 条，其余计入 `dropped`。
+     *
+     * @note 与逐条 `Push` 相比，本函数把「读 head / 判满 / 写 head」的原子操作
+     *       **从 count 次降到 1 次** —— 这是线程局部暂存能带来收益的技术前提
+     *       （缓冲本身是**无锁**的，所以这里省的是原子操作而不是锁争用）。
+     */
+    std::size_t PushBatch(const SchedulerEvent* data, std::size_t count) noexcept {
+        if (data == nullptr || count == 0) {
+            return 0;
+        }
+        const std::size_t head = m_head.load(std::memory_order_relaxed);
+        const std::size_t tail = m_tail.load(std::memory_order_acquire);
+        // 可用空间 = capacity - 已用量（内部数组比容量多 1 个哨兵槽）
+        const std::size_t used = head >= tail ? head - tail : m_slots.size() - tail + head;
+        const std::size_t free_slots = m_capacity - used;
+        const std::size_t accepted = count < free_slots ? count : free_slots;
+        for (std::size_t index = 0; index < accepted; ++index) {
+            m_slots[(head + index) % m_slots.size()] = data[index];
+        }
+        m_head.store((head + accepted) % m_slots.size(), std::memory_order_release);
+        m_pushed.fetch_add(accepted, std::memory_order_relaxed);
+        if (accepted < count) {
+            m_dropped.fetch_add(count - accepted, std::memory_order_relaxed);
+        }
+        return accepted;
+    }
+
     std::size_t Capacity() const noexcept { return m_capacity; }
     std::size_t Size() const noexcept {
         const std::size_t head = m_head.load(std::memory_order_acquire);
@@ -147,12 +193,42 @@ public:
     explicit DebugEventCollector(std::size_t capacity = 8192) : m_buffer(capacity) {}
 
     void OnEvent(const SchedulerEvent& event) override {
-        // 只入队：非阻塞、不分配、不做 I/O、不抛异常。
-        (void)m_buffer.Push(event);
+        // 线程局部暂存：先攒批，满一批再一次性提交（把原子操作摊薄到每批一次）。
+        auto& staging = Staging();
+        if (staging.owner != this) {
+            // 一个线程服务了另一个采集器：先把旧暂存排空，避免串到别的实例里。
+            if (staging.owner != nullptr && !staging.events.empty()) {
+                staging.owner->m_buffer.PushBatch(staging.events.data(), staging.events.size());
+            }
+            staging.events.clear();
+            staging.owner = this;
+        }
+        staging.events.push_back(event);
+        if (staging.events.size() >= staging.batch) {
+            FlushStaging();
+        }
+    }
+
+    /**
+     * @brief 把**当前线程**的暂存区提交到共享缓冲。
+     * @return 本次提交的条数。
+     * @note 线程局部方案要求调用方在读取前先 Flush，否则最后不足一批的事件还没进缓冲。
+     */
+    std::size_t Flush() {
+        return FlushStaging();
+    }
+
+    /// 当前线程暂存区里还没提交的条数（用于测试与观测）。
+    std::size_t StagedOnThisThread() const {
+        const auto& staging = StagingConst();
+        return staging.owner == const_cast<DebugEventCollector*>(this)
+                   ? staging.events.size()
+                   : 0;
     }
 
     /// 取走最多 `max` 个事件（`max == 0` 表示全取）。
     std::vector<SchedulerEvent> Drain(std::size_t max = 0) {
+        (void)FlushStaging();   // 先提交本线程暂存，否则最后不足一批的事件看不到
         std::vector<SchedulerEvent> out;
         SchedulerEvent event;
         while ((max == 0 || out.size() < max) && m_buffer.Pop(&event)) {
@@ -161,14 +237,29 @@ public:
         return out;
     }
 
-    std::size_t Pending() const noexcept { return m_buffer.Size(); }
+    // 观测类接口都先提交**本线程**暂存，否则「刚写进去但还没攒够一批」的事件看不到，
+    // 会让 Pending/Captured 看起来比实际少（首版就是因此让既有测试失败）。
+    // 线程局部方案的这个代价在头文件里如实记录：其它线程的暂存只能等它们自己下次调用。
+    std::size_t Pending() const {
+        const_cast<DebugEventCollector*>(this)->FlushStaging();
+        return m_buffer.Size();
+    }
     std::size_t Capacity() const noexcept { return m_buffer.Capacity(); }
-    std::uint64_t Captured() const noexcept { return m_buffer.Pushed(); }
-    std::uint64_t Dropped() const noexcept { return m_buffer.Dropped(); }
+    std::uint64_t Captured() const {
+        const_cast<DebugEventCollector*>(this)->FlushStaging();
+        return m_buffer.Pushed();
+    }
+    std::uint64_t Dropped() const {
+        const_cast<DebugEventCollector*>(this)->FlushStaging();
+        return m_buffer.Dropped();
+    }
     void Clear() noexcept { m_buffer.Clear(); }
 
     /// 只读快照（不改变缓冲内容）。
     std::vector<SchedulerEvent> Peek(std::size_t max = 0) const {
+        // Peek 是 const，但为了让"刚写进去还没攒够一批"的事件也可见，
+        // 这里对**本线程**暂存做一次提交（提交后采集器语义不变，只是提前进缓冲）。
+        const_cast<DebugEventCollector*>(this)->FlushStaging();
         std::vector<SchedulerEvent> out;
         const std::size_t total = m_buffer.Size();
         const std::size_t limit = (max == 0 || max > total) ? total : max;
@@ -267,6 +358,30 @@ public:
     }
 
 private:
+    /// 线程局部暂存槽：owner 表示它属于哪个采集器。
+    struct StagingSlot {
+        // 用非 const 指针：排空旧暂存时需要调用 owner 的 m_buffer.PushBatch。
+        DebugEventCollector* owner{nullptr};
+        std::vector<SchedulerEvent> events;
+        std::size_t batch{kDefaultFlushBatch};
+    };
+    static StagingSlot& Staging() {
+        static thread_local StagingSlot slot;
+        return slot;
+    }
+    static const StagingSlot& StagingConst() {
+        return Staging();
+    }
+    std::size_t FlushStaging() {
+        auto& staging = Staging();
+        if (staging.owner != this || staging.events.empty()) {
+            return 0;
+        }
+        const std::size_t accepted = m_buffer.PushBatch(staging.events.data(), staging.events.size());
+        staging.events.clear();
+        return accepted;
+    }
+
     EventBuffer m_buffer;
 };
 
