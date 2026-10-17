@@ -11,6 +11,27 @@
 > 过程与失败尝试。
 
 
+
+## ParkingCondition futex 化（第 2 天）
+
+> **条件**：`build-bench`（Release + -O2）、AMD Ryzen 9 8945HX / WSL2、
+> `benchmarks/parking_condition_benchmark.cpp`、rounds=20000、**测量时负载 1.43**。
+> 走**普通线程路径**（不绑定 Scheduler）。**与其它章节不可横向比较。**
+
+| 场景 | BEFORE（`condition_variable_any`）| AFTER（futex 无状态）| 变化 |
+|---|---:|---:|---:|
+| A notify 空转（无等待者）| 15.30 ns/次 | 16.26 ns/次 | 0.94x（噪声）|
+| C 争用（2 消费者）| 90.76 ns/次 | **302.83 ns/次** | **0.30x（退化 3.3 倍）** |
+| C 争用（4 消费者）| 4,351.02 ns/次 | **2,385.04 ns/次** | **1.82x（快 82%）** |
+
+**判读**：收益随等待者数量增长。原 `condition_variable_any` 在 4 个等待者时退化到 4.3 µs，
+futex 无状态等待把它降到 2.4 µs（省 1.97 µs）；但 2 个等待者时 futex 反超 212 ns 的代价 ——
+因为无竞争路径上 cv 的 fast path 只做一次原子判空，而 futex 仍要走系统调用。
+
+后续优化方向见 `DebugTooling/futex-refactor-attempt.md` 第 4 节
+（`FUTEX_WAIT` 前短暂自旋、把 `waiters` 与 `generation` 编码进同一个字）。
+
+---
 ## 调度器 worker 扩展性（第 2 天修复后）
 
 > **条件**：`build-bench`（Release + -O2）、AMD Ryzen 9 8945HX / WSL2、

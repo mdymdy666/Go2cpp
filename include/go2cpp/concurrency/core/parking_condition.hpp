@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -93,6 +95,14 @@ private:
 
     std::mutex m_mutex;
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
+
+    // ---- futex 无状态等待（Linux）----
+    // 一个 32 位代际字就是全部用户态状态：notify 递增并 FUTEX_WAKE，等待方
+    // 读旧值后 FUTEX_WAIT(expected)。不需要等待者队列/节点分配。
+    // 语义依赖 cond.wait(pred) 本来就容忍虚假唤醒。
+    alignas(64) std::atomic<std::uint32_t> m_futex_seq{0};
+    // 等待者计数：为 0 时 notify 直接跳过系统调用。
+    alignas(64) std::atomic<std::uint32_t> m_futex_waiters{0};
 };
 
 }  // namespace go2cpp::core

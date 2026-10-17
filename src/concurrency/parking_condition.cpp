@@ -11,6 +11,47 @@
 #include <condition_variable>
 #include <utility>
 
+
+#if defined(__linux__)
+#include <cerrno>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+namespace {
+
+/// 在 futex 字上等待。
+/// @return 0 被唤醒；-1 且 errno==EAGAIN 表示值已变；-1 且 errno==ETIMEDOUT 表示超时。
+int FutexWait(std::atomic<std::uint32_t>* word, std::uint32_t expected,
+              const std::optional<std::chrono::steady_clock::time_point>& deadline) {
+    timespec rel{};
+    const timespec* ts = nullptr;
+    if (deadline) {
+        const auto now = std::chrono::steady_clock::now();
+        if (*deadline <= now) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        const auto diff =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(*deadline - now);
+        rel.tv_sec = static_cast<time_t>(diff.count() / 1000000000LL);
+        rel.tv_nsec = static_cast<long>(diff.count() % 1000000000LL);
+        ts = &rel;
+    }
+    return static_cast<int>(::syscall(SYS_futex,
+                                      reinterpret_cast<std::uint32_t*>(word),
+                                      FUTEX_WAIT_PRIVATE, expected, ts, nullptr, 0));
+}
+
+int FutexWake(std::atomic<std::uint32_t>* word, int n) {
+    return static_cast<int>(::syscall(SYS_futex,
+                                      reinterpret_cast<std::uint32_t*>(word),
+                                      FUTEX_WAKE_PRIVATE, n, nullptr, nullptr, 0));
+}
+
+}  // namespace
+#endif  // __linux__
+
 namespace go2cpp::core {
 
 class ParkingCondition::WaitNode final {
@@ -26,8 +67,9 @@ public:
     /// @param[in] task 调用方传入的参数，具体约束以头文件声明为准。
     /// @return 通过返回值或对象状态报告执行结果；void/构造析构函数无返回值。
     /// @note 函数不改变公开接口；异常、取消和并发边界由实现中的保护路径处理。
-    WaitNode(Scheduler* scheduler, std::shared_ptr<Task> task)
-        : m_scheduler(scheduler), m_task(std::move(task)) {}
+    WaitNode(ParkingCondition* owner, Scheduler* scheduler,
+             std::shared_ptr<Task> task)
+        : owner(owner), m_scheduler(scheduler), m_task(std::move(task)) {}
 
     /// 函数功能：执行 Finish，完成本函数所属模块的单步操作。
     /// 执行流程：
@@ -76,7 +118,14 @@ public:
             } catch (...) {
             }
         } else {
+#if defined(__linux__)
+            owner->m_futex_seq.fetch_add(1, std::memory_order_release);
+            if (owner->m_futex_waiters.load(std::memory_order_acquire) != 0) {
+                (void)FutexWake(&owner->m_futex_seq, 1);
+            }
+#else
             m_native_cv.notify_one();
+#endif
         }
     }
 
@@ -96,6 +145,56 @@ public:
 
     Result WaitNative(std::unique_lock<std::mutex>& outer,
                       std::optional<Clock::time_point> deadline) {
+#if defined(__linux__)
+        // futex 无状态等待。三个关键点（第一版曾因此崩溃）：
+        //   1. 每轮循环**先判终态**，不能只依赖 FUTEX_WAIT 的返回码；
+        //   2. 区分 EAGAIN（值已变，继续等）与 ETIMEDOUT（真超时）；
+        //   3. 被唤醒后重读代际，作为下一轮 FUTEX_WAIT 的 expected。
+        std::uint32_t expected =
+            owner->m_futex_seq.load(std::memory_order_acquire);
+        owner->m_futex_waiters.fetch_add(1, std::memory_order_acq_rel);
+        outer.unlock();
+        for (;;) {
+            if (result() != Result::kWaiting) {
+                break;
+            }
+            if (deadline && Clock::now() >= *deadline) {
+                (void)Finish(Result::kTimedOut);
+                break;
+            }
+            errno = 0;
+            const int rc = FutexWait(&owner->m_futex_seq, expected, deadline);
+            if (result() != Result::kWaiting) {
+                break;
+            }
+            const std::uint32_t latest =
+                owner->m_futex_seq.load(std::memory_order_acquire);
+            if (latest != expected) {
+                expected = latest;
+            }
+            if (rc == 0) {
+                continue;  // 被唤醒：重判终态
+            }
+            if (errno == EAGAIN) {
+                continue;  // 值已变（可能是别人推进的代际）：重判
+            }
+            if (errno == ETIMEDOUT || errno == EINTR) {
+                // 超时或被信号打断：交给下一轮循环判 deadline / 终态
+                continue;
+            }
+            // 其它错误：保守地再判一次终态，仍等待就按超时处理，绝不空转。
+            if (result() == Result::kWaiting) {
+                (void)Finish(Result::kTimedOut);
+            }
+            break;
+        }
+        owner->m_futex_waiters.fetch_sub(1, std::memory_order_acq_rel);
+        // 注意：**不重新加锁**。WaitOnce 的契约是「WaitNative 返回时外部锁仍处于
+        // 解锁状态，由 WaitOnce 自己关锁」。原实现把锁交给 cv.wait 管理，返回时
+        // outer 也是解锁的；这里若 outer.lock() 会与 WaitOnce 的后续 lock 冲突，
+        // 触发 EDEADLK（"Resource deadlock avoided"）。
+        return result();
+#else
         std::unique_lock<HybridMutex> lock(m_wake_mutex);
         outer.unlock();
         if (deadline) {
@@ -110,6 +209,7 @@ public:
             });
         }
         return result();
+#endif
     }
 
     /// 函数功能：执行 WaitManaged，完成本函数所属模块的单步操作。
@@ -155,6 +255,7 @@ public:
     }
 
 private:
+    ParkingCondition* const owner;
     Scheduler* m_scheduler;
     std::shared_ptr<Task> m_task;
     std::atomic<Result> m_result{Result::kWaiting};
@@ -269,7 +370,7 @@ ParkingCondition::WaitStatus ParkingCondition::WaitOnce(
         return WaitStatus::kTimedOut;
     }
 
-    const auto node = std::make_shared<WaitNode>(
+    const auto node = std::make_shared<WaitNode>(this, 
         managed ? scheduler : nullptr, managed ? task : nullptr);
     {
         std::lock_guard<std::mutex> queue_lock(m_mutex);
