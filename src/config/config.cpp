@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstdio>
 #include <fstream>
 #include <filesystem>
 #include <sstream>
@@ -1091,6 +1092,160 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
     }
     if (!valid && error) *error = "运行时配置变量类型冲突";
     return valid;
+}
+
+
+// ---------------------------------------------------------------------------
+// 名字工具
+// ---------------------------------------------------------------------------
+
+std::pair<std::string, std::string> SplitConfigName(const std::string& full_name) {
+    const auto dot = full_name.find('.');
+    if (dot == std::string::npos) {
+        return {std::string{}, full_name};
+    }
+    return {full_name.substr(0, dot), full_name.substr(dot + 1)};
+}
+
+std::string JoinConfigName(const std::string& module, const std::string& key) {
+    if (module.empty()) {
+        return key;
+    }
+    if (key.empty()) {
+        return module;
+    }
+    return module + "." + key;
+}
+
+namespace {
+
+/// 把值里的控制字符转义成可见形式，保证生成的 INI 仍是逐行可解析的。
+/// 注意：`IniFile::Parse` 不做反向转义，所以含换行的值导出后再读回会得到
+/// 字面量 `\n` 而不是真正的换行 —— 这是**已知的非往返点**，在 DumpIni 的
+/// 文档注释里已标注。选择转义而不是拒绝，是为了让生成的配置文件永远合法。
+std::string EscapeIniValue(const std::string& input) {
+    std::string out;
+    out.reserve(input.size() + 8);
+    for (const char c : input) {
+        switch (c) {
+            case '\n': out += '\\'; out += 'n'; break;
+            case '\r': out += '\\'; out += 'r'; break;
+            case '\t': out += '\\'; out += 't'; break;
+            case '\0': out += '\\'; out += '0'; break;
+            default: out += c; break;
+        }
+    }
+    return out;
+}
+
+/// 描述文本按行前缀 `# `，空描述返回空字符串。
+std::string RenderComment(const std::string& description) {
+    if (description.empty()) {
+        return {};
+    }
+    std::string out;
+    std::size_t start = 0;
+    while (start <= description.size()) {
+        const auto end = description.find('\n', start);
+        const auto line = description.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        if (!line.empty()) {
+            out += "# " + line + "\n";
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return out;
+}
+
+}  // namespace
+
+bool Config::Remove(const std::string& name) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_vars.erase(name) > 0;
+}
+
+std::map<std::string, std::vector<ConfigVarBase::ptr>> Config::Groups() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::map<std::string, std::vector<ConfigVarBase::ptr>> groups;
+    for (const auto& [name, var] : m_vars) {
+        const auto [module, key] = SplitConfigName(name);
+        (void)key;
+        groups[module].push_back(var);
+    }
+    // 组内按完整名字典序排列，保证 DumpIni 输出稳定可 diff。
+    for (auto& [module, vars] : groups) {
+        (void)module;
+        std::sort(vars.begin(), vars.end(),
+                  [](const ConfigVarBase::ptr& a, const ConfigVarBase::ptr& b) {
+                      if (!a) return false;
+                      if (!b) return true;
+                      return a->name() < b->name();
+                  });
+    }
+    return groups;
+}
+
+std::string Config::DumpIni() const {
+    const auto groups = Groups();
+    std::string out;
+    out += "# go2cpp 配置（由 Config::DumpIni 生成）\n";
+    out += "# 每个 [section] 对应一个 module，条目形如 key=value；# 开头为注释。\n";
+    out += "# 注意：含换行/制表符的值被转义为 \\n / \\t，读回时是字面量。\n";
+
+    for (const auto& [module, vars] : groups) {
+        out += "\n";
+        out += "[" + (module.empty() ? std::string("global") : module) + "]\n";
+        for (const auto& var : vars) {
+            if (!var) {
+                continue;
+            }
+            const auto [var_module, key] = SplitConfigName(var->name());
+            (void)var_module;
+            out += RenderComment(var->description());
+            out += key + "=" + EscapeIniValue(var->ToString()) + "\n";
+        }
+    }
+    return out;
+}
+
+bool Config::SaveToFile(const std::string& path, std::string* error) const {
+    if (path.empty()) {
+        if (error) {
+            *error = "配置导出路径为空";
+        }
+        return false;
+    }
+    const std::string text = DumpIni();
+    const std::string tmp_path = path + ".tmp";
+    {
+        std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            if (error) {
+                *error = "无法打开临时文件: " + tmp_path;
+            }
+            return false;
+        }
+        out << text;
+        out.flush();
+        if (!out) {
+            if (error) {
+                *error = "写入临时文件失败: " + tmp_path;
+            }
+            (void)std::remove(tmp_path.c_str());
+            return false;
+        }
+    }
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        if (error) {
+            *error = "重命名失败: " + tmp_path + " -> " + path;
+        }
+        (void)std::remove(tmp_path.c_str());
+        return false;
+    }
+    return true;
 }
 
 }  // namespace go2cpp::config

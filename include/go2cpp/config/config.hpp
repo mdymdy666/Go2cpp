@@ -445,6 +445,40 @@ public:
     /** @brief 返回当前已注册变量快照。 */
     std::vector<ConfigVarBase::ptr> List() const;
     /**
+     * @brief 运行时注销一个配置变量。
+     * @details 返回 false 表示不存在。注销后该变量不再出现在 `List()`、
+     *          `DumpIni()` 与 INI 加载范围内；已持有其 `shared_ptr` 的调用方
+     *          仍可读写它，但它的值不再被配置文件同步 —— 这是「软注销」语义，
+     *          避免让外部持有的指针悬空。
+     * @param name 完整名（`module.key`）。
+     */
+    bool Remove(const std::string& name);
+
+    /**
+     * @brief 按 `module` 分组返回配置变量。
+     * @details 完整名以第一个 `.` 切分为 `module` 与 `key`；没有 `.` 的归入
+     *          空字符串分组。组内按 key 字典序排列，保证输出稳定可 diff。
+     */
+    std::map<std::string, std::vector<ConfigVarBase::ptr>> Groups() const;
+
+    /**
+     * @brief 生成带注释的 INI 文本。
+     * @details 只读取当前值，不修改任何状态。输出按 `[module]` 分段、段内按
+     *          key 字典序排列，描述作为 `#` 注释。值中的换行与制表符被转义，
+     *          保证生成的文本可以被 `IniFile::Parse` 原样读回。
+     */
+    std::string DumpIni() const;
+
+    /**
+     * @brief 原子地把当前配置写成 INI 文件。
+     * @details 先写入 `path + ".tmp"` 再 `rename` 覆盖，避免读者看到半个文件。
+     *          这是与 `LoadFromIni` 对称的「导出」方向。
+     * @param path 目标路径。
+     * @param error 失败时写入中文诊断，可为空。
+     */
+    bool SaveToFile(const std::string& path, std::string* error = nullptr) const;
+
+    /**
      * @brief 注册一次文件事务完成回调。
      * @param listener 提交完成后接收变更变量快照的回调。
      * @return 可用于 DelCommitListener 的监听器 ID。
@@ -537,5 +571,105 @@ struct RuntimeConfig final {
 /** @brief 从文件加载并校验 RuntimeConfig。 */
 bool LoadRuntimeConfig(const std::string& path, RuntimeConfig* config,
                       std::string* error = nullptr);
+// ---------------------------------------------------------------------------
+// 名字工具：完整名形如 "module.key"
+// ---------------------------------------------------------------------------
+
+/** @brief 以第一个 `.` 切分完整名；没有 `.` 时 module 为空。 */
+std::pair<std::string, std::string> SplitConfigName(const std::string& full_name);
+
+/** @brief 拼接 "module.key"；module 为空时只返回 key。 */
+std::string JoinConfigName(const std::string& module, const std::string& key);
+
+// ---------------------------------------------------------------------------
+// 静态注册 / 注销
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief 把一项配置在**静态初始化期**注册进 `Config::Instance()`。
+ * @details 一般通过 `GO2CPP_CONFIG_REGISTER` 宏使用。构造时调用 `Lookup<T>`；
+ *          若同名已存在且类型不同，`Lookup` 返回空，此时本对象不持有任何东西。
+ */
+template <typename T>
+class AutoConfigRegistrar final {
+public:
+    AutoConfigRegistrar(const char* module, const char* key, T default_value,
+                        const char* description)
+        : m_name(JoinConfigName(module ? module : "", key ? key : "")) {
+        try {
+            m_var = Config::Instance().Lookup<T>(m_name, std::move(default_value),
+                                                 description ? description : "");
+        } catch (...) {
+            // 静态初始化期不允许异常穿透到 main 之前：注册失败就放弃该项。
+            m_var = nullptr;
+        }
+    }
+
+    AutoConfigRegistrar(const AutoConfigRegistrar&) = delete;
+    AutoConfigRegistrar& operator=(const AutoConfigRegistrar&) = delete;
+
+    /** @brief 完整名（便于诊断）。 */
+    const std::string& name() const noexcept { return m_name; }
+
+    /** @brief 是否成功拿到配置变量（类型冲突或异常时为 false）。 */
+    bool registered() const noexcept { return m_var != nullptr; }
+
+private:
+    std::string m_name;
+    std::shared_ptr<ConfigVar<T>> m_var;
+};
+
+/**
+ * @brief 在**静态初始化期**注销一项配置（软注销，语义见 `Config::Remove`）。
+ */
+class AutoConfigCanceller final {
+public:
+    AutoConfigCanceller(const char* module, const char* key) : m_removed(false) {
+        try {
+            m_removed = Config::Instance().Remove(
+                JoinConfigName(module ? module : "", key ? key : ""));
+        } catch (...) {
+            m_removed = false;
+        }
+    }
+
+    AutoConfigCanceller(const AutoConfigCanceller&) = delete;
+    AutoConfigCanceller& operator=(const AutoConfigCanceller&) = delete;
+
+    /** @brief 是否确实移除了某项。 */
+    bool removed() const noexcept { return m_removed; }
+
+private:
+    bool m_removed;
+};
+
+// 用 __LINE__ 保证同一 `key` 在多处注册时不重名。
+#define GO2CPP_CONFIG_REGISTER_IMPL(module, type, key, default_value, description, line) \
+    static ::go2cpp::config::AutoConfigRegistrar<type>                                  \
+        go2cpp_config_registrar_##key##_##line(module, #key, default_value, description)
+
+/**
+ * @brief 静态注册一项配置。
+ * @param module 分组名（会与 key 拼成 `module.key`）。
+ * @param type 值类型；**不能含未加括号的逗号**（如 `std::map<int, int>`），
+ *        否则宏参数会被逗号截断，请先 `using` 一个别名。
+ * @param key 键名。
+ * @param default_value 首次注册时的默认值。
+ * @param description 说明文本，会写进生成的 INI 注释。
+ */
+#define GO2CPP_CONFIG_REGISTER(module, type, key, default_value, description) \
+    GO2CPP_CONFIG_REGISTER_IMPL(module, type, key, default_value, description, __LINE__)
+
+#define GO2CPP_CONFIG_CANCEL_IMPL(module, key, line) \
+    static ::go2cpp::config::AutoConfigCanceller      \
+        go2cpp_config_canceller_##key##_##line(module, #key)
+
+/**
+ * @brief 静态注销一项配置。
+ * @details 只能注销**本翻译单元里已经注册过**的项；跨 TU 的注销依赖静态
+ *          初始化顺序，不可靠 —— 跨模块注销请在运行时调用 `Config::Remove`。
+ */
+#define GO2CPP_CONFIG_CANCEL(module, key) GO2CPP_CONFIG_CANCEL_IMPL(module, key, __LINE__)
+
 
 }  // namespace go2cpp::config

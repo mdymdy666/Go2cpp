@@ -8155,3 +8155,103 @@ INI 解析（`IniFile`）| ✅ |
    「结构性配置名」集合，在 `LoadFromIni` 前过滤并给出诊断 —— 侵入面小得多；
 3. 也要考虑：也许**不需要**可变性分层。如果项目约定「结构性配置只在构造期设置」，
    那正确的做法是文档化这条约定，而不是加运行时检查。
+
+---
+
+## 2026-10-17 方向二（重做）：config 模块增强 —— 宏注册 / 注销 / 分组导出 / app.ini
+
+### 背景
+
+上一次尝试给 `ConfigVarBase` 补「可变性分层」，因破坏 `config_center` 两个测试而回退。
+本轮换策略：**只做增量添加，不动任何现有方法的逻辑** —— 结果零回归。
+
+### 新增能力（全部为新接口）
+
+| 能力 | 接口 |
+|---|---|
+静态注册（静态初始化期生效）| `GO2CPP_CONFIG_REGISTER(module, type, key, default, description)` |
+静态注销（软注销）| `GO2CPP_CONFIG_CANCEL(module, key)` |
+运行时注销 | `Config::Remove(name)` |
+按 module 分组 | `Config::Groups()` |
+生成带注释的 INI | `Config::DumpIni()` |
+原子导出（tmp + rename）| `Config::SaveToFile(path, error)` |
+名字工具 | `SplitConfigName` / `JoinConfigName` |
+
+**设计要点**：
+- `AutoConfigRegistrar<T>` 在构造时调 `Config::Instance().Lookup<T>()`；静态初始化期
+  不让异常穿透（`try/catch` 后放弃该项），避免 main 之前崩；
+- 注销是**软注销**：从注册表移除，但已持有 `shared_ptr` 的调用方仍可读写，
+  不会让外部指针悬空；
+- `DumpIni` 按 `[module]` 分段、段内按完整名字典序排列，保证输出**稳定可 diff**；
+- `SaveToFile` 先写 `path + ".tmp"` 再 `rename`，读者不会看到半个文件；
+- 宏用 `__LINE__` 保证同名 key 在多处注册时不冲突；
+- 宏的已知限制：`type` 不能含未加括号的逗号（如 `std::map<int,int>`），需先 `using` 别名。
+
+### 测试：`tests/config/test_config_registry_macro.cpp`（9 场景，已进 ctest）
+
+1. 静态注册与默认值 / 描述保留；
+2. 静态注销宏生效；
+3. 运行时注销 + 再注册（新默认值生效）；
+4. 同名不同类型 → `Lookup` 返回空，原值不变；
+5. `Groups()` 分组 + 组内排序；
+6. **`DumpIni` 输出可被 `IniFile::Parse` 读回**，且自我 round-trip 后值不变；
+7. `SaveToFile` 原子写（临时文件不残留、空路径报错）；
+8. 含控制字符的值——**保证生成的 INI 结构合法**（见下方已知限制）；
+9. 并发注册/注销/导出 6 线程 × 120 次，注销数与注册数严格平衡。
+
+**结果：`failures=0`，全量 ctest 83/83 通过（新增 1 个测试），`config_center` 零回归。**
+
+### 示例：`example/config/config_app_ini.cpp`
+
+在项目根目录运行会生成 `app.ini`（536 字节），实测输出：
+
+```ini
+# go2cpp 配置（由 Config::DumpIni 生成）
+# 每个 [section] 对应一个 module，条目形如 key=value；# 开头为注释。
+# 注意：含换行/制表符的值被转义为 \n / \t，读回时是字面量。
+
+[app]
+# 是否开启调试日志
+debug=false
+# 服务名字，会出现在日志里
+name=go2cpp-demo
+# HTTP 监听端口
+port=9090
+
+[log]
+# 日志缓冲区字节数
+# 必须是 2 的幂
+buffer_size=4096
+# 日志级别: debug|info|warn|error
+level=info
+
+[workers]
+# 工作线程/P 数量（需重启生效）
+count=8
+```
+
+示例还演示了 `SetValidator` 拒绝非法值（`log.level=verbose` 被拒并给出诊断），
+以及「先读既有 app.ini → 运行时调整 → 写回」的闭环。
+
+### 已知限制（如实记录，未解决）
+
+**含控制字符的值导出后读回形态不一致。** 实测：
+- `ToString()` 返回 `a<LF>b<TAB>c`（真换行 + 真制表符）；
+- `DumpIni` 输出 `value=a\nb\tc`（转义正确，已是单行）；
+- 但 `IniFile::Parse` 读回后得到 6 个字符（原值 5 个），说明**换行被还原、制表符没有**，
+  即转义与解析**不对称**。
+
+我查了 `DumpIni`（调用正确）、`IniFile::Get`（纯查找不转义）、`IniFile::Parse`
+（代码里看不到反转义逻辑），但没能定位这个不对称的来源。因此测试只断言
+**「生成的 INI 结构合法且键存在」**这个真正重要的性质，不假装值逐字节往返一致。
+
+后续若要用配置保存含换行的值（如日志格式串），需要先查清这一点。
+
+### 与上一次失败的对比（教训）
+
+| | 上次（可变性分层）| 本次（宏注册/导出）|
+|---|---|---|
+改动方式 | **修改** `ConfigVarBase` 与 `ApplyString` | **纯新增**接口，不动现有逻辑 |
+结果 | `config_center` 2 个测试回归 | **零回归** |
+
+**结论：在这个模块上，增量添加远比修改既有类安全。**

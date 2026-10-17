@@ -107,6 +107,15 @@ if (GO2CPP_BUILD_TESTS)
         -O2 -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_state_machine COMMAND go2cpp_state_machine)
     set_tests_properties(go2cpp_state_machine PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_config_registry_macro_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/test_config_registry_macro.cpp)
+    target_link_libraries(go2cpp_config_registry_macro_test PRIVATE go2cpp_config)
+    target_compile_options(go2cpp_config_registry_macro_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_config_registry_macro_test
+             COMMAND go2cpp_config_registry_macro_test)
+    set_tests_properties(go2cpp_config_registry_macro_test PROPERTIES TIMEOUT 120)
     set_tests_properties(go2cpp_high_load_stress PROPERTIES TIMEOUT 180)
 endif()
 
