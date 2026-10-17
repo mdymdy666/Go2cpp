@@ -224,6 +224,22 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_hook_raw_test COMMAND go2cpp_hook_raw_test)
     set_tests_properties(go2cpp_hook_raw_test PROPERTIES TIMEOUT 120)
 
+    # hook 正确性验证：结合 os::File / hook / 网络 socket，用心跳 Fiber 判定
+    # 「park 了 Fiber」还是「阻塞了 worker」。验证使用者的红线：
+    # hook 绝不能影响正常的系统调用（非 socket fd 必须零影响）。
+    add_executable(go2cpp_hook_correctness_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_correctness.cpp)
+    target_include_directories(go2cpp_hook_correctness_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(go2cpp_hook_correctness_test PRIVATE
+        go2cpp_hook go2cpp_os go2cpp_io go2cpp_network go2cpp_config
+        go2cpp_scheduler go2cpp_fiber go2cpp_sync go2cpp_error)
+    target_compile_options(go2cpp_hook_correctness_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_hook_correctness_test COMMAND go2cpp_hook_correctness_test)
+    set_tests_properties(go2cpp_hook_correctness_test PROPERTIES TIMEOUT 180)
+
+
     add_executable(go2cpp_quic_packet_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_quic_packet.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/network/quic/varint.cpp

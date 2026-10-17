@@ -187,3 +187,54 @@ if (GO2CPP_ENABLE_TSAN)
         target_link_options(${module_target} PUBLIC -fsanitize=thread)
     endforeach()
 endif()
+
+
+# ---------------------------------------------------------------------------
+# 可选的 picoquic 薄封装
+#
+# 为什么默认 OFF：picoquic + picotls 是外部依赖（合计约 240 万字节静态库），
+# 且头文件路径因机器而异。强制依赖会让每个开发者都要先装它们。
+#
+# 打开方式：
+#   cmake -S . -B build -DGO2CPP_WITH_PICOQUIC=ON \
+#         -DPICOQUIC_ROOT=/path/to/picoquic \
+#         -DPICOTLS_ROOT=/path/to/picotls
+#
+# 关着的时候 `picoquic_connection.cpp` 不参与编译；头文件仍在但**不提供实现**
+# （使用者会得到链接期 undefined reference —— 这是正确的，不会静默用到空实现）。
+# ---------------------------------------------------------------------------
+option(GO2CPP_WITH_PICOQUIC "Build the picoquic-based QUIC transport" OFF)
+set(PICOQUIC_ROOT "" CACHE PATH "picoquic source root (contains picoquic/picoquic.h)")
+set(PICOTLS_ROOT "" CACHE PATH "picotls root (contains include/picotls/ and libpicotls-*.a)")
+
+if (GO2CPP_WITH_PICOQUIC)
+    if (NOT PICOQUIC_ROOT OR NOT PICOTLS_ROOT)
+        message(FATAL_ERROR
+            "GO2CPP_WITH_PICOQUIC=ON 需要同时设置 PICOQUIC_ROOT 与 PICOTLS_ROOT")
+    endif()
+
+    add_library(go2cpp_quic_picoquic
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/quic/picoquic_connection.cpp)
+    target_include_directories(go2cpp_quic_picoquic
+        PRIVATE
+        ${PICOQUIC_ROOT}/picoquic
+        ${PICOTLS_ROOT}/include)
+    target_link_libraries(go2cpp_quic_picoquic
+        PUBLIC go2cpp_network
+        PRIVATE
+        ${PICOQUIC_ROOT}/build/libpicoquic-core.a
+        ${PICOQUIC_ROOT}/build/libpicoquic-log.a
+        ${PICOTLS_ROOT}/libpicotls-core.a
+        ${PICOTLS_ROOT}/libpicotls-openssl.a
+        ${PICOTLS_ROOT}/libpicotls-minicrypto.a
+        ${PICOTLS_ROOT}/libpicotls-fusion.a
+        ssl crypto pthread)
+
+    add_executable(go2cpp_picoquic_hq_client
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/network/picoquic_hq_client.cpp)
+    target_link_libraries(go2cpp_picoquic_hq_client PRIVATE go2cpp_quic_picoquic)
+
+    message(STATUS "picoquic QUIC transport: ON (picoquic=${PICOQUIC_ROOT})")
+else()
+    message(STATUS "picoquic QUIC transport: OFF (set GO2CPP_WITH_PICOQUIC=ON to enable)")
+endif()
