@@ -8565,3 +8565,57 @@ path=/hello
 - `curl 8.5.0`，Features 含 `HTTP2`，链接 `nghttp2/1.59.0`；
 - 无 `nghttp`/`nghttpd` 可执行文件；
 - 无 Python `h2` 模块。
+
+---
+
+## 2026-10-17 基础设施：WSL / Windows 双仓库同步的正确姿势（反复踩过的坑）
+
+### 事实
+
+`/UserData/CodexWorkSpace/Go2Cpp`（WSL）与 `E:\CodexWorkspace\Go2Cpp`（Windows）
+**是两个独立的 git 仓库副本**，各自有 `.git`。它们通过 rsync 同步工作树，
+但**不共享 `.git`** —— 除非显式同步。
+
+### 曾经踩的三个坑
+
+1. **rsync 用 `-a` 会同步权限位**，导致 git 把 60+ 文件标为 `M`
+   （`git diff --numstat` 是 `0 0`，只有 `old mode 100755 / new mode 100644`）。
+   → 改用 `-rlD`（不含 `-p`），并设 `git config core.fileMode false`。
+
+2. **rsync 默认会同步 `.git`**，把 Windows 的 `.git/config` 覆盖掉，
+   `core.fileMode false` 被重置回 `true`，于是下次 status 又全脏。
+
+3. **为了修坑 2 而 `--exclude '.git/'`，反而更糟**：WSL 里 `git commit`
+   产生的提交只存在于 WSL 的 `.git`，Windows 的 `.git` 不认识它，
+   `git push` 显示 "Everything up-to-date" 而**提交根本没推上去**。
+
+### 正确流程（每次改完代码后）
+
+```sh
+# 1) 在 WSL 侧做本地 git 操作：add / commit（WSL 内访问 GitHub 会解析成 ::1，不能 push）
+cd /UserData/CodexWorkSpace/Go2Cpp && git add <files> && git commit -m "..."
+
+# 2) 同步工作树到 Windows（不含 .git，避免覆盖 config）
+rsync -rlD --delete --exclude '.git/' --exclude 'build-quality/' --exclude 'build-bench/' \
+      --exclude 'build-profile/' --exclude '.dsh_tmp/' --exclude 'app.ini' \
+      /UserData/CodexWorkSpace/Go2Cpp/ /mnt/e/CodexWorkspace/Go2Cpp/
+
+# 3) 同步 .git，让 Windows 侧认识刚才的提交
+rsync -rlD --delete /UserData/CodexWorkSpace/Go2Cpp/.git/ /mnt/e/CodexWorkspace/Go2Cpp/.git/
+
+# 4) .git/config 被覆盖了，重置 fileMode 并刷新索引
+cd /mnt/e/CodexWorkspace/Go2Cpp
+git config core.fileMode false
+git update-index --refresh
+
+# 5) 在 Windows 侧 push（唯一能访问 GitHub 的地方）
+git push origin feature/gmp-debug-module
+```
+
+### 关键点
+
+- **`.git` 必须同步**，否则 Windows 推的是旧提交（表现为 "Everything up-to-date"
+  但远端 HEAD 没变 —— 这是最容易误判为"推送成功"的假象）；
+- **同步 `.git` 之后必须重置 `core.fileMode false`**，因为 `.git/config` 被覆盖；
+- **始终用 `rsync -rlD` 而不是 `-a`**，避免权限位污染工作树；
+- 推送后**用 `git log --oneline -1 origin/<branch>` 核对远端 HEAD**，不要只看 rc=0。
