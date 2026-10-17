@@ -72,7 +72,7 @@ classDiagram
         +park_wait(node)
     }
 
-    IOBackend <-.. IOBackendFactory : 由工厂创建
+    IOBackendFactory ..> IOBackend : 创建
     IOBackend ..> BackendEvent : 输出就绪事件
     BackendEvent ..> BackendEventFlag : events 位
     FdManager *-- FdContext : 一 fd 一上下文
@@ -94,7 +94,7 @@ classDiagram
 
 ```mermaid
 flowchart TB
-    subgraph READ["一次"看起来阻塞"的 socket 读"]
+    subgraph READ["一次「看起来阻塞」的 socket 读"]
         R1["业务代码调用 read()/recv()"] --> R2{"当前线程参与 hook?<br/>（ThreadHookMode）"}
         R2 -- 否 --> R3["直接走系统调用（真阻塞）<br/>—— 普通线程不受影响"]
         R2 -- 是 --> R4{"当前是否受管 G?"}
@@ -116,7 +116,7 @@ flowchart TB
     end
 
     subgraph NB["非阻塞语义的保持"]
-        N1["若用户自己设了非阻塞（user_nonblock）"] --> N2["hook 不把它变成"会等待"<br/>而是直接返回 EAGAIN"]
+        N1["若用户自己设了非阻塞（user_nonblock）"] --> N2["hook 不把它变成「会等待」<br/>而是直接返回 EAGAIN"]
         N2 --> N3["因此用户的非阻塞语义**不被 hook 破坏**"]
     end
 

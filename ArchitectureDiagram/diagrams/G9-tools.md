@@ -192,7 +192,7 @@ graph LR
         U1["迁移 Go 代码：几乎可以直接写 go/defer"]
         U2["需要在 select 里等多种事件：EventBatch"]
         U3["库代码同时被 G 与普通线程调用：HybridMutex"]
-        U4["要"每协程一份"状态：FiberLocal"]
+        U4["要「每协程一份」状态：FiberLocal"]
         U5["嵌入到已有线程模型的宿主：thread_policy"]
         U6["调试模块：不直接用它们；<br/>但示例与测试用 go() 起任务"]
     end

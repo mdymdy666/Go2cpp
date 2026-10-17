@@ -194,7 +194,7 @@ flowchart TB
         F2 --> F3{"满一批?"}
         F3 -- 否 --> F4["返回（不碰共享缓冲）"]
         F3 -- 是 --> F5["EventBuffer::PushBatch(data, count)<br/>**一次预留，原子操作从 count 次降到 1 次**"]
-        F5 --> F6["Pending/Captured/Peek/Drain 读取前先 FlushStaging<br/>否则"刚写未攒够一批"不可见"]
+        F5 --> F6["Pending/Captured/Peek/Drain 读取前先 FlushStaging<br/>否则「刚写未攒够一批」不可见"]
     end
 
     subgraph SIG["跨进程 dump"]
@@ -271,7 +271,7 @@ stateDiagram-v2
 
 ```mermaid
 stateDiagram-v2
-    [*] --> kRegistered : DebugBreakpoints::Add(spec)
+    [*] --> kRegistered : DebugBreakpoints.Add(spec)
     kRegistered --> kSkipping : Checkpoint 命中但 skip 未用完
     kSkipping --> kRegistered : skip 递减
     kRegistered --> kWaiting : Checkpoint 命中（skip 用完）

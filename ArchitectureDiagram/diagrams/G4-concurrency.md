@@ -131,7 +131,7 @@ flowchart TB
         L6 --> L7{"有等者?"}
         L7 -- 否 --> L8["直接返回"]
         L7 -- 是 --> L9["持队列锁：**若有 WaitSelector 先重排队列**<br/>然后逐个 TryFinish 认领"]
-        L9 --> L10["锁外 Wake 获胜者<br/>（所有权无缝转移，不经过"解锁再抢锁"）"]
+        L9 --> L10["锁外 Wake 获胜者<br/>（所有权无缝转移，不经过「解锁再抢锁」）"]
     end
 
     subgraph CH["Channel 的 send/recv"]
