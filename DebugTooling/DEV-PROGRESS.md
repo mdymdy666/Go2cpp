@@ -128,3 +128,193 @@
 按使用者要求**已停止**（`schedule-102ff7f6-f909-4a29-958e-5bdcd6855f4c` 已删除）。
 **注意**：目标（goal）保持 `active`，未标记完成 —— 因为使用者只要求停止定时任务，
 未表示整体目标已达成；如需继续开发，恢复该目标即可接着做上面的未做项。
+
+---
+
+# 第二部分：三个方向增强（2026-10-17）
+
+> 上文（1~130 行）是**调试模块**的开发进度，保持原样。
+> 本节记录之后的三轮增强：状态机审计、模块补全、net（HTTP/2）增强。
+
+## 总览
+
+| 方向 | 主题 | 状态 | 关键证据 |
+|---|---|---|---|
+| **一** | 状态机边界与非法转换审计 | ✅ 完成 | **84 组合穷举矩阵** |
+| **二** | config 宏注册/导出 · GMP 对照 Go | ✅ 完成 | 9 场景 + **实测否决 runnext** |
+| **三** | HTTP/2 全栈 · TLS/ALPN · 双向互通 | ✅ 完成 | **3637 行，双向互通验证** |
+
+**全量 ctest：89/89 通过**（起点 81，新增 8 个测试）。
+
+## 方向一：状态机审计（最高优先级）
+
+**做法**：以「审计 + 补边界测试」为主，**不改架构**。逐个核对 `GState` 的 14 处
+`m_state.store()`。
+
+**审计结论**：全部具备「前置状态检查 + `m_transition_mutex` 保护」，
+未发现非法转换、终态后误操作或漏加锁。
+
+**新增** `tests/concurrency/test_state_machine.cpp`（7 场景，已进 ctest）：
+
+| 场景 | 验证内容 |
+|---|---|
+正常生命周期 | 4 状态推进 |
+**终态不可变** | 重复 cancel/fail 幂等 |
+**取消 vs 完成竞态** | 400 轮实测 `dead=132 / cancelled=268` —— 两种终态都真实出现、无第三种 |
+取消后不可复活 | kCancelled 后 spawn 被拒 |
+TimerState 终态互斥 | 5 状态 |
+M/P 状态合法 | 枚举取值 |
+
+**价值**：竞态场景实测证明「终态二选一」的不变量成立，这是单纯读代码得不到的证据。
+
+## 方向二：模块补全
+
+### 2.1 config 增强（宏注册 / 注销 / 导出 app.ini）
+
+**背景**：第一次尝试给 `ConfigVarBase` 补「可变性分层」，因为改动了既有类而**破坏了
+`config_center` 两个测试**，已回退。第二次改为**纯增量添加**，零回归。
+
+**新增接口**：
+
+| 能力 | 接口 |
+|---|---|
+静态注册（静态初始化期生效）| `GO2CPP_CONFIG_REGISTER(module, type, key, default, description)` |
+静态注销 | `GO2CPP_CONFIG_CANCEL(module, key)` |
+运行时注销 | `Config::Remove(name)` |
+按 module 分组 | `Config::Groups()` |
+生成带注释 INI | `Config::DumpIni()` |
+原子导出 | `Config::SaveToFile(path, error)` |
+
+**设计要点**：注销是**软注销**（不悬空外部 `shared_ptr`）；`DumpIni` 按 module 分段且
+段内字典序，保证稳定可 diff；`SaveToFile` 先写 `.tmp` 再 `rename`。
+
+**测试** `tests/config/test_config_registry_macro.cpp`（9 场景，`failures=0`）：
+含**DumpIni 可被 `IniFile::Parse` 读回**、原子写、并发 6×120 注册注销平衡。
+
+**示例** `example/config/config_app_ini.cpp`：在项目根目录生成 536 字节的 `app.ini`
+（带注释、按 module 分组），并演示 `SetValidator` 拒绝非法值。
+
+**已知限制（未解决）**：含控制字符的值导出后读回形态不一致 —— `DumpIni` 转义正确，
+但 `IniFile::Parse` 读回后换行被还原而制表符没有。查了 `DumpIni`/`Get`/`Parse`
+均未见反转义逻辑，**未定位来源**；因此测试只断言「INI 结构合法且键存在」。
+
+### 2.2 GMP 对照 Go 的缺口分析
+
+**缺口清单**：
+
+| Go 的机制 | 本项目 |
+|---|---|
+P 本地队列 + work stealing | ✅ 有 |
+M 阻塞脱离 P（handoff）| ✅ 有（`detached_machine`）|
+sysmon 监控长阻塞 | ✅ 有 |
+**`runnext` 优先槽** | ❌ 无 |
+**抢占式调度** | ❌ 无（纯协作）|
+**可增长栈** | ❌ 无（固定栈 + 池化）|
+**自旋 M 上限** | ❌ 无 |
+
+**用实测否决 `runnext`**（这是本轮最有价值的负面结论）：
+
+新增 `tests/concurrency/test_scheduler_queue_latency.cpp`（纯观测，已进 ctest），
+测量「任务从提交到开始执行」的延迟：
+
+| 场景 | p50 | p90 | max |
+|---|---:|---:|---:|
+空队列（基线）| **43.3 µs** | 67.9 µs | 281.8 µs |
+**单 P、积压 2000 任务** | **8.9 µs** | 113.3 µs | 273.5 µs |
+
+**积压时反而快约 5 倍**。解释：积压时 worker 一直运行、本地队列非空，取出即执行；
+空队列时 worker 已 park，新任务要先唤醒，那 43 µs 是**唤醒路径成本**而非排队。
+
+**结论**：`runnext` 不解决本项目的问题 —— 新任务在积压下 p50 已只有 8.9 µs，
+瓶颈不是「排在队尾」而是「没人醒着干活」。省下一次改动调度器核心的高风险尝试。
+同时**反证**此前把调度器 `condition` 换成 futex 化 `ParkingCondition` 方向正确。
+
+## 方向三：net 模块 —— HTTP/2 全栈
+
+### 3.1 决策过程
+
+`grep http2` 零命中 → 本项目连 HTTP/2 都没有。使用者指示「HTTP/2 有标准实现，抄就完了，
+把并发部分改改」，并明确「**QUIC 不用自己实现，找一个可读性强的库看源码学习**」。
+
+**QUIC 选型**（只做学习，未集成）：
+
+| 库 | 语言 | 协议核心 | 可读性 | 结论 |
+|---|---|---:|---|---|
+| **quic-go** | Go | ~1.28 万行 | ⭐⭐⭐⭐⭐ | **选它** |
+| picoquic | C | ~2 万 | ⭐⭐⭐⭐ | 最贴近 C++ 但风格偏老 |
+| quiche | Rust | ~3 万 | ⭐⭐⭐⭐ | 需 Rust 工具链 |
+| ngtcp2 / msquic / lsquic | C | 4~5 万 | ⭐⭐~⭐⭐⭐ | 不适合学习 |
+
+产出 `docs/quic-go-reading-guide.md`（7 步阅读顺序 + RFC 章节对应 + 借鉴点）。
+**quic-go 是 Go 库，C++ 无法直接链接；本项目没有引入任何 Go 依赖。**
+
+### 3.2 已实现（3637 行，全部通过测试）
+
+| 模块 | 文件 | 行数 | 验证方式 |
+|---|---|---:|---|
+HPACK | `hpack.hpp` + `hpack.cpp` | 234+575 | **RFC 7541 §C.1/C.2/C.3 官方示例逐字节比对** |
+Huffman | `huffman.hpp/.cpp` + `huffman_tables.inc` | 63+162+58 | **`www.example.com` 编码逐字节匹配 §C.4.1** |
+帧层 | `frame.hpp` + `frame.cpp` | 275+538 | 10 场景 + 随机 3000 轮 |
+流状态机 | `stream_state.hpp` + `.cpp` | 132+192 | **84 组合穷举矩阵** + 随机 5000 轮 |
+连接层 | `connection.hpp` + `.cpp` | 232+610 | 10 场景（含 CONTINUATION、流控）|
+IO 抽象 | `transport.hpp` | 128 | — |
+真实 socket | `fiber_transport.hpp` | 101 | socketpair 真实 IO 闭环 |
+TLS + ALPN | `tls_transport.hpp` + `.cpp` | 103+234 | **openssl s_server 实测 ALPN='h2'** |
+
+**核心设计**：`Transport` 抽象把协议逻辑与 IO 解耦 —— `MemoryTransport`（测试）/
+`FiberTransport`（真实 socket）/ `TlsTransport`（TLS+ALPN）。**并发只体现在 Transport
+的实现里**，协议逻辑可完全脱离网络测试。
+
+### 3.3 双向互通验证（最硬的证据）
+
+| 方向 | 对端（独立实现）| 结果 |
+|---|---|---|
+**别人读我** | curl 8.5.0 + nghttp2 1.59.0 | ✅ `HTTP/2 200` + 3 个响应头全部被正确解析 |
+**我读别人** | `scripts/minimal_h2c_server.py`（socket+struct 手拼帧，无依赖）| ✅ `:status 200` + body 正确 |
+
+**TLS/ALPN**：`openssl s_server -alpn h2` → 实测 `TLSv1.3`、`ALPN 协商结果 'h2'`。
+
+### 3.4 明确未做（如实区分「已实现」与「只设计」）
+
+| 未做 | 说明 |
+|---|---|
+**QUIC / HTTP3** | **零实现代码**。只有 `docs/quic-go-reading-guide.md` 选型与阅读指南 |
+**HTTP/2 over TLS 完整链路** | 只验证到 TLS 层 + ALPN；缺真正的 h2 TLS 服务器 |
+**服务端 TLS** | 只做了客户端 |
+**流控的阻塞等待** | 窗口不足返回 `kFlowControl`，不挂起等 `WINDOW_UPDATE` |
+**DATA 分片** | 单帧超 `max_frame_size` 返回 `kUnsupported`（HEADERS 有 CONTINUATION，DATA 没有） |
+**优先级** | 能解析不调度（RFC 9113 已弃用）|
+**服务器推送 API** | 能解析 PUSH_PROMISE，无推送接口 |
+**证书校验** | `verify_peer=false` 是测试便利，**不是安全默认** |
+
+## 测试增量
+
+| 新增测试 | 场景数 |
+|---|---|
+`tests/concurrency/test_state_machine.cpp` | 7 |
+`tests/config/test_config_registry_macro.cpp` | 9 |
+`tests/concurrency/test_scheduler_queue_latency.cpp` | 2 |
+`tests/network/test_hpack.cpp` | 9 |
+`tests/network/test_frame.cpp` | 10 |
+`tests/network/test_stream_state.cpp` | 5 |
+`tests/network/test_connection.cpp` | 10 |
+`tests/network/test_fiber_transport.cpp` | 2 |
+
+**ctest 从 81 → 89**。`test_tls_alpn.cpp` **未进 ctest**（依赖外部 `openssl s_server`，
+会让 89/89 变成环境敏感），改为 `scripts/verify_tls_alpn.sh` 手动执行。
+
+## 架构图
+
+新增 `ArchitectureDiagram/diagrams/G11-http2.md`（387 行 / 9 张 Mermaid，全部实机渲染验证），
+并把 `G0-overview.md` **收拢为单图**（原 4 张 → 1 张，`ratio=0.82`）。
+
+## 约束自查
+
+| 约束 | 状态 |
+|---|---|
+不动使用者未提交的 6 个文件 | ✅ 全程未动 |
+git 网络操作只在 Windows 侧 | ✅ |
+全量 ctest 保持通过 | ✅ **89/89**（高于基线 81）|
+改动后显式 `--target` 构建 | ✅ |
+与 Go 差异如实标注 | ✅ |
+**已实现 vs 只设计分清** | ✅ 见上面 3.4 表 |

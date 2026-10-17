@@ -58,7 +58,7 @@
 | panic/recover | 栈展开 | **显式状态协议**（无展开） | 必须手工在 defer 回调里 recover |
 | defer | 函数级 | **作用域级** RAII | 循环里每次都注册一个 |
 | IO | netpoller + `net.Conn` | epoll readiness + `WaitStatus`/errno + Hook 拦截 | 调用方需自己重试 syscall |
-| TLS/HTTP2 | 标准库内建 | **无** | 边界已声明 |
+| TLS/HTTP2 | 标准库内建 | **有**（`go2cpp::net::http2`：HPACK/帧层/流状态机/连接层/TLS+ALPN）| 见 G11 与 `../docs/network.md` |
 | 调度器调参 | `GOMAXPROCS()` 运行期 | 启动期配置（`SchedulerConfig::processor_count`） | 不能热改结构参数 |
 
 ## 5. 已知缺陷与台账（来自 `docs/quality_backlog.md` + 本轮复核）

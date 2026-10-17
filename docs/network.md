@@ -25,7 +25,7 @@ TCP 是有序字节流，不保证一次 `recv` 对应一次消息。使用 `Fra
 
 ## HTTP
 
-`http::Parser` 增量解析 HTTP/1.x，支持分片头、Content-Length、严格的单一 `chunked`、chunk 扩展、trailer 和流水线剩余字节；默认头上限 64 KiB、body 上限 64 MiB、trailer 上限 16 KiB，可通过 `ParserLimits` 调整。重复但不一致的 Content-Length、Content-Length 与 chunked 同时出现、未知 Transfer-Encoding、非法头、非法 chunk 和超限输入会返回 `ParseState::Error`。1xx、204、304 以及通过 `set_response_to_head(true)` 标记的 HEAD 响应不会等待 body。模块不实现 HTTP/2、HTTP/3、WebSocket upgrade 和 Expect:100；需要这些协议时应注入独立 ParserBackend。
+`http::Parser` 增量解析 HTTP/1.x，支持分片头、Content-Length、严格的单一 `chunked`、chunk 扩展、trailer 和流水线剩余字节；默认头上限 64 KiB、body 上限 64 MiB、trailer 上限 16 KiB，可通过 `ParserLimits` 调整。重复但不一致的 Content-Length、Content-Length 与 chunked 同时出现、未知 Transfer-Encoding、非法头、非法 chunk 和超限输入会返回 `ParseState::Error`。1xx、204、304 以及通过 `set_response_to_head(true)` 标记的 HEAD 响应不会等待 body。模块**不实现 HTTP/3**、WebSocket upgrade 和 Expect:100；需要这些协议时应注入独立 ParserBackend。**HTTP/2 已由独立子模块 `go2cpp::net::http2` 提供**（不复用本 Parser，见下节 `## HTTP/2`）。
 
 `http::ResponseWriter` 提供有限状态的 HTTP/1.1 chunked 输出：`Idle -> start() -> write()/flush() -> close()`（其中 `flush()` 只做状态校验、不写出内容，因为 `write()` 已按 chunk 直接写入 Socket、全程无缓冲）。它适合 SSE、大文件和业务流式响应，所有 Socket 短写都会由 `SocketStream::write_all` 处理；重复 start、close 后 write、未 start 的 write 都返回失败。一个 writer 只能由一个线程或 Fiber 持有，业务需要并发发送时必须在上层串行化。
 
@@ -44,6 +44,98 @@ SSE 位于独立的 `go2cpp::sse`，完整用法详见 [sse.md](sse.md)。`sse::
 存储和自动重连，重连时由业务把 `Parser::last_event_id()` 设置到 HTTP 的 Last-Event-ID。
 
 客户端提供 `http::Client::get/post/head` 以及 `http::Get/Post/Head` 便捷函数；每个 Client 请求独占连接，超时覆盖 connect、send、recv，并按单个请求的绝对 deadline 计算剩余时间，慢速逐字节响应不会为每次 recv 重新获得完整超时。DNS 目前通过 `getaddrinfo` 同步完成：在 Fiber 中会占用当前 M/worker，deadline 不能中断内核解析；高并发或需要取消的场景应预解析地址，或注入独立的有界异步 Resolver/解析线程池，避免在持有业务锁时解析。服务端 `http::Server::serve_connection` 对单连接串行处理，路由回调在锁外执行；**它不对连接的 recv/write 施加超时**（与上面的 Client 不同，使用无限等待），连接级超时需由调用方在 handler 内或上层负责；生产程序应让 accept、IOManager 和业务 worker 分层，并在 handler 中避免持有线程锁等待网络。
+
+## HTTP/2
+
+HTTP/2 是**独立子模块** `go2cpp::net::http2`（`include/go2cpp/network/http2/` +
+`src/network/http2/`，共 3637 行），**不复用** `http::Parser` —— 二进制帧与 HPACK
+压缩和 HTTP/1.x 的文本解析没有可复用的部分。
+
+### 分层（从下往上）
+
+| 层 | 文件 | 职责 |
+|---|---|---|
+Huffman | `huffman.hpp/.cpp` + `huffman_tables.inc` | RFC 7541 附录 B 的 257 项码表，头部的值压缩 |
+HPACK | `hpack.hpp/.cpp` | 静态表 61 项、动态表（FIFO + 大小上限）、整数前缀编码、三种字面量表示 |
+帧层 | `frame.hpp/.cpp` | 10 种帧的解析与构造；帧长、stream id、固定长度的校验都在这一层 |
+流状态机 | `stream_state.hpp/.cpp` | RFC 9113 §5.1 的 7 个状态与非法转换拒绝 |
+连接层 | `connection.hpp/.cpp` | 握手、流表、CONTINUATION 分片、流控窗口 |
+IO 抽象 | `transport.hpp` | `Read` / `Write` / `Closed` 三个方法，**协议逻辑只认它** |
+真实 IO | `fiber_transport.hpp` / `tls_transport.hpp` | 前者走 `Socket`（Fiber 挂起），后者走 OpenSSL（TLS 1.2+ / SNI / ALPN=h2） |
+
+### 为什么有 `Transport` 抽象
+
+连接层里的协议逻辑**不知道字节从哪来**，因此三种实现可以互换：
+
+- `MemoryTransport` —— 双向内存缓冲，**单线程就能跑完整闭环**，不需要 socket、不需要 Fiber；
+- `FiberTransport` —— 真实 socket，`recv`/`send` 经 hook 让出 Fiber；
+- `TlsTransport` —— TLS 之上的同一套逻辑。
+
+这是本模块能"先测协议、再接网络"的关键。**并发只体现在 Transport 的实现里。**
+
+### 用法（同步阻塞写法）
+
+```cpp
+go2cpp::net::http2::FiberTransport transport(socket, 10s);
+go2cpp::net::http2::Connection connection(&transport, go2cpp::net::http2::Role::kClient);
+std::string error;
+connection.Handshake(&error);                       // 阻塞到 SETTINGS 交换完成
+
+uint32_t stream_id = 0;
+connection.StartRequest({{":method", "GET"},
+                         {":scheme", "https"},
+                         {":path", "/"},
+                         {":authority", "example.com"}},
+                        /*end_stream=*/true, &stream_id, &error);
+
+go2cpp::net::http2::IncomingEvent event;
+while (connection.ReadEvent(&event, &error) == ConnStatus::kOk) {
+    if (event.kind == IncomingEvent::Kind::kHeaders) { /* :status ... */ }
+    if (event.kind == IncomingEvent::Kind::kData)    { /* event.data */ }
+}
+```
+
+**TLS + ALPN**：把 `FiberTransport` 换成 `TlsTransport::CreateClient(socket, "example.com")`，
+`Handshake()` 之后用 `NegotiatedProtocol()` 读 ALPN 结果（应为 `"h2"`）。
+**证书校验默认关闭**（`verify_peer=false`），这是为自签名证书测试的便利，**不是安全默认**，
+生产必须打开并配置 CA。
+
+### 已实现并验证
+
+| 能力 | 验证方式 |
+|---|---|
+HPACK | **RFC 7541 §C.1/C.2/C.3 官方示例逐字节比对** |
+Huffman | **`www.example.com` 编码逐字节匹配 §C.4.1** |
+帧层 | 10 场景 + 随机 3000 轮 |
+流状态机 | **84 组合穷举矩阵** + 随机 5000 轮 |
+连接层 | 10 场景（含 CONTINUATION 50000 字节 header、流控窗口耗尽/恢复）|
+`FiberTransport` | socketpair 真实 IO 闭环 |
+`TlsTransport` | `openssl s_server -alpn h2` 实测 `TLSv1.3` / `ALPN='h2'` |
+**双向互通** | curl 8.5.0（内置 nghttp2 1.59.0）当客户端 → 我的服务端 ✅；我的客户端 → `scripts/minimal_h2c_server.py`（手拼帧的独立实现）✅ |
+
+示例与脚本：
+- `example/network/http2_h2c_server.cpp` —— 明文 h2c 服务端；
+- `example/network/http2_h2c_client.cpp` —— h2c 客户端；
+- `scripts/minimal_h2c_server.py` —— 用 socket + struct 手拼帧的最小服务端，用于反向验证；
+- `scripts/verify_tls_alpn.sh` —— TLS + ALPN 验证（需 `openssl s_server`）。
+
+### 未实现（如实标注）
+
+| 未做 | 说明 |
+|---|---|
+**QUIC / HTTP3** | **零实现代码**。只有选型与阅读指南 `docs/quic-go-reading-guide.md`；quic-go 是 Go 库，C++ 无法直接链接，本项目**没有引入任何 Go 依赖** |
+**HTTP/2 over TLS 完整链路** | 只验证到 TLS 层 + ALPN 协商；缺真正的 h2 TLS 服务器（nginx/nghttpd）|
+**服务端 TLS** | 只做了客户端 |
+**流控的阻塞等待** | 窗口不足返回 `ConnStatus::kFlowControl`，不挂起等 `WINDOW_UPDATE`，由调用方重试 |
+**DATA 分片** | 单帧超过 `SETTINGS_MAX_FRAME_SIZE` 返回 `kUnsupported`（HEADERS 有 CONTINUATION，DATA 没有对应机制）|
+**优先级** | PRIORITY 帧能解析但不参与调度（RFC 9113 已弃用）|
+**服务器推送 API** | 能解析 PUSH_PROMISE，无推送接口 |
+**会话复用 / 0-RTT** | 未做 |
+
+### 线程与 Fiber 约束
+
+`Connection` **不是线程安全的**，与 Go 的 `http2` 一致：一个连接只能由一个 Fiber/线程驱动。
+`TlsTransport` 同理。若要并发处理多条连接，每条连接一个 Fiber。
 
 ## 错误与限制
 

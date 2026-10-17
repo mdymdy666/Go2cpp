@@ -5,7 +5,8 @@
 > 规模（实测）：`network/http.hpp` 246 + `src/network/http.cpp` 620；
 > `network/websocket.hpp` 176 + `src/network/websocket.cpp` 715；
 > `network/sse.hpp` 205 + `src/network/sse.cpp` 613。
-> 三者共同的协议边界：**HTTP/2、HTTP/3、TLS 均不在范围内**（`http.hpp` 头注释明确声明）。
+> 三者共同的协议边界：**HTTP/3 不在范围内**（`http.hpp` 头注释明确声明）。
+> **HTTP/2 与 TLS 已由独立子模块 `go2cpp::net::http2` 提供**，见 `../diagrams/G11-http2.md` 与 `../docs/network.md` 的 `## HTTP/2` 一节。
 
 ---
 
@@ -106,7 +107,7 @@ class Server {                     // 可替换的线程/Fiber 服务端核心
 
 ### 1.4 坑点
 
-1. `split_url` **强制 `http://` 前缀**（无 TLS）；`Client` 每次新建 `Socket` 且默认
+1. `split_url` **强制 `http://` 前缀**（**HTTP/1.1 客户端**无 TLS —— 这条对 `http::Client` 仍然成立；**HTTP/2 有独立的 TLS 通道**，见 G11）；`Client` 每次新建 `Socket` 且默认
    `Connection: close` —— **无连接池、无 keep-alive**。
 2. `Server::serve_connection` **不设置 recv/write 超时**（无限等待），
    连接级超时需由调用方在 handler 内或上层负责（`Client` 则有覆盖 connect/send/recv 的绝对 deadline）。
@@ -278,4 +279,4 @@ std::string LastEventId(const http::Request&);
 > Ping/Pong 由库内部消化、分片在库内重组，角色错向的掩码即协议错。
 > `SSE` 支持 LF/CRLF/CR 三种换行与 UTF-8 BOM，EOF 不派发未以空行结束的半个事件；
 > 流写入用 Fiber/线程混合锁，模块不建立无界队列（背压交给生产者）。
-> 三者共同边界：**无 TLS、无 HTTP/2/3**。
+> 三者共同边界：**无 HTTP/3**；HTTP/2 与 TLS 见 G11（`go2cpp::net::http2`）。

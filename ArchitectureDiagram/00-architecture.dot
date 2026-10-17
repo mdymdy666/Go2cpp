@@ -238,7 +238,7 @@ Hook 拦截 31 个 libc 函数；epoll token 0 保留给 eventfd<BR ALIGN="LEFT"
         label=<<B>明确边界（本实现不做）</B><BR ALIGN="LEFT"/>
 无 GC、无异步抢占、无 morestack/copystack 自动栈增长、<BR ALIGN="LEFT"/>
   无 cgo<BR ALIGN="LEFT"/>
-无 TLS、无 HTTP/2、无 HTTP/3；协议层不做路由/鉴权/<BR ALIGN="LEFT"/>
+无 HTTP/3（HTTP/2 与 TLS 已由 go2cpp::net::http2 提供）；协议层不做路由/鉴权/<BR ALIGN="LEFT"/>
   连接池/服务发现<BR ALIGN="LEFT"/>
 panic/recover 不是栈展开（显式状态协议）；<BR ALIGN="LEFT"/>
   defer 是作用域级而非函数级<BR ALIGN="LEFT"/>

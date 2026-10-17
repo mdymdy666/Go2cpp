@@ -12,7 +12,7 @@
 | 维度 | 现状 | 证据 |
 |---|---|---|
 | 运行时语义 | **已完整**：Fiber/GMP/Channel/Select/Context/同步原语/Timer/EPOLL+Hook | 架构图 L1~L5 与 9 份模块报告 |
-| 协议层 | **解析完整、生态缺失**：HTTP/WebSocket/SSE 的解析与基本收发有；无 TLS、无连接池、无路由/中间件 | `modules/G7-protocols.md` |
+| 协议层 | **解析完整、生态缺失**：HTTP/WebSocket/SSE 的解析与基本收发有；HTTP/2 全栈已实现并双向互通验证（`docs/network.md`）；TLS 客户端 + ALPN 已实现但只验证到握手层；**仍缺**连接池、路由/中间件、服务端 TLS、HTTP/2 over TLS 的端到端验证 | `docs/network.md`、`ArchitectureDiagram/diagrams/G11-http2.md` |
 | 标准库 | **基本空白**：`fmt`/`strings`/`strconv`/`io`/`os`/`time`/`sort` 均无对应 | `NextStep/go-stdlib-map.md` |
 | 第三方生态 | **无** | 本文件 §3 |
 | 工程保障 | 构建 0 warning、ctest 69/69、示例 40+ | 2026-10-15 全量验证 |

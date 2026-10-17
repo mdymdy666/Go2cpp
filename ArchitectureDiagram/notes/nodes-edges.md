@@ -224,7 +224,7 @@ Hook 拦截 31 个 libc 函数；epoll token 0 保留给 eventfd 唤醒
 
 ```text
 无 GC、无异步抢占、无 morestack/copystack 自动栈增长、无 cgo
-无 TLS、无 HTTP/2、无 HTTP/3；协议层不做路由/鉴权/连接池/服务发现
+无 HTTP/3；HTTP/2 与 TLS 已由 go2cpp::net::http2 提供；协议层不做路由/鉴权/连接池/服务发现
 panic/recover 不是栈展开（显式状态协议）；defer 是作用域级而非函数级
 未 Hook 的阻塞调用调度器看不见 —— 必须显式 BlockingRegion 声明
 poll/select/epoll_wait 不被 park；IOManager 的 wait_any/wait_many 仅限受管 Fiber

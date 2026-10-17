@@ -8,7 +8,7 @@
 
 | 想看什么 | 去哪里 |
 |---|---|
-| **每个模块的架构图（主交付）** | [`diagrams/`](diagrams/) —— 10 个文件、**52 个 Mermaid 图** |
+| **每个模块的架构图（主交付）** | [`diagrams/`](diagrams/) —— **12 个文件、69 个 Mermaid 图** |
 | 一次性看整个运行流程 | [`00-architecture.svg`](00-architecture.svg)（总览图，含文字描述） |
 | 一次 `go()` 到任务结束的逐段叙述 | [`01-runtime-flow.md`](01-runtime-flow.md) |
 | 某个模块的**详细文字讲解**（职责/符号/机制/不变量/坑点/与 Go 差异） | `modules/G1..G10-*.md` |
@@ -32,17 +32,24 @@
 
 | 组 | 主题 | 文件 | 行数 | Mermaid |
 |---|---|---|---:|---:|
+| **G0** | **总览：一张图看懂（分层 + 依赖 + 生命周期）** | [`diagrams/G0-overview.md`](diagrams/G0-overview.md) | **112** | **1** |
 | G1 | 地基层（Fiber / Timer / ParkingCondition） | [`diagrams/G1-foundation.md`](diagrams/G1-foundation.md) | 308 | 5 |
-| G2 | **GMP 调度**（Task / Scheduler / P / M / worker_loop / sysmon） | [`diagrams/G2-scheduler.md`](diagrams/G2-scheduler.md) | 325 | 5 |
+| G2 | **GMP 调度**（Task / Scheduler / P / M / worker_loop / sysmon） | [`diagrams/G2-scheduler.md`](diagrams/G2-scheduler.md) | 321 | 5 |
 | G3 | 取消与错误（Context / DoneSignal / Error 家族） | [`diagrams/G3-context-error.md`](diagrams/G3-context-error.md) | 218 | 5 |
 | G4 | 并发原语（Channel / Future / sync / WaitSelector） | [`diagrams/G4-concurrency.md`](diagrams/G4-concurrency.md) | 247 | 5 |
 | G5 | IO 后端（IOBackend / FdManager / hook） | [`diagrams/G5-io-backend.md`](diagrams/G5-io-backend.md) | 195 | 5 |
 | G6 | 网络基础（Socket / Address / Framer） | [`diagrams/G6-network-base.md`](diagrams/G6-network-base.md) | 239 | 5 |
-| G7 | 应用协议（HTTP / WebSocket / SSE） | [`diagrams/G7-protocols.md`](diagrams/G7-protocols.md) | 269 | 6 |
-| G8 | 横切设施（log / config） | [`diagrams/G8-log-config.md`](diagrams/G8-log-config.md) | 246 | 5 |
-| G9 | 工具与新手层（go / defer / select / HybridMutex / FiberLocal / thread_policy） | [`diagrams/G9-tools.md`](diagrams/G9-tools.md) | 249 | 5 |
-| G10 | **调试模块**（本次新增的 go2cpp::debug） | [`diagrams/G10-debug.md`](diagrams/G10-debug.md) | 315 | 6 |
-| | **合计** | | **2611** | **52** |
+| G7 | 应用协议（HTTP/1.1 / WebSocket / SSE） | [`diagrams/G7-protocols.md`](diagrams/G7-protocols.md) | 269 | 6 |
+| G8 | 横切设施（log / config） | [`diagrams/G8-log-config.md`](diagrams/G8-log-config.md) | 264 | 7 |
+| G9 | 工具与新手层（go / defer / select / HybridMutex / FiberLocal / thread_policy） | [`diagrams/G9-tools.md`](diagrams/G9-tools.md) | 290 | 7 |
+| G10 | **调试模块**（go2cpp::debug） | [`diagrams/G10-debug.md`](diagrams/G10-debug.md) | 348 | 9 |
+| **G11** | **HTTP/2 全栈**（HPACK / Huffman / 帧层 / 流状态机 / 连接层 / Transport / TLS） | [`diagrams/G11-http2.md`](diagrams/G11-http2.md) | **387** | **9** |
+| | **合计 12 张图 + 2 个 README** | | **3198** | **69** |
+
+> **G0 只有 1 张图**，这是刻意的：它的职责是让读者**一屏之内**建立
+> 「有哪些层、谁能依赖谁、一次协程怎么穿过它们」的整体感。
+> 时序、状态机、阻塞细节都在 G1~G11 的下钻图里。原来的 G0 有 4 张图，
+> 「一图看懂」名不副实，已收拢为单图（渲染后 784×956，宽高比 0.82）。
 
 ## 四、怎么渲染
 

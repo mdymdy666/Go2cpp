@@ -175,7 +175,7 @@ Cancel(cause) / CancelDeadline() / deadline 到期
 |---|---|---|
 | **栈** | 固定 128 KiB 不增长；越界 = SIGSEGV = 进程立即死亡（无 handler、无 sigaltstack）。手动等价物：到阈值 `resume` 一个新 Fiber 换栈 | `fiber.hpp`、`benchmarks/fiber_stack_probe.cpp` 45 组实测 |
 | **调度** | 协作式让出（无异步抢占）；未 Hook 的阻塞调用调度器看不见，必须显式 `BlockingRegion`；`BlockingRegion` 禁嵌套、禁跨 park | `scheduler.hpp`、`docs/design.md` |
-| **协议** | 无 TLS、无 HTTP/2/3；`http::split_url` 强制 `http://`；协议层不做路由/鉴权/连接池/服务发现 | `http.hpp`/`websocket.hpp`/`sse.hpp` 头注释 |
+| **协议** | **无 HTTP/3**；HTTP/2 与 TLS 已实现（`go2cpp::net::http2`，见 `../docs/network.md` 的 `## HTTP/2` 一节）；`http::split_url` 强制 `http://`；协议层不做路由/鉴权/连接池/服务发现 | `http2/`、`http.hpp`/`websocket.hpp`/`sse.hpp` 头注释 |
 | **控制流** | `panic/recover` 是显式状态协议（不展开栈）；`defer` 是作用域级；`recover` 的边界是 `thread_local` 深度（跨 Fiber 需调用方自律） | `control_flow.hpp`、`docs/compatibility.md` |
 
 ---

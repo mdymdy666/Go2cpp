@@ -515,13 +515,13 @@
 <!-- note_bounds -->
 <g id="node47" class="node">
 <title>note_bounds</title>
-<polygon fill="#fff5f5" stroke="#c08080" points="1455.5,-155.5 1123.5,-155.5 1123.5,-5.5 1461.5,-5.5 1461.5,-149.5 1455.5,-155.5"/>
-<polyline fill="none" stroke="#c08080" points="1455.5,-155.5 1455.5,-149.5 "/>
-<polyline fill="none" stroke="#c08080" points="1461.5,-149.5 1455.5,-149.5 "/>
+<polygon fill="#fff5f5" stroke="#c08080" points="1573.5,-155.5 1123.5,-155.5 1123.5,-5.5 1579.5,-5.5 1579.5,-149.5 1573.5,-155.5"/>
+<polyline fill="none" stroke="#c08080" points="1573.5,-155.5 1573.5,-149.5 "/>
+<polyline fill="none" stroke="#c08080" points="1579.5,-149.5 1573.5,-149.5 "/>
 <text text-anchor="start" x="1136.5" y="-138.7" font-family="Droid Sans Fallback" font-weight="bold" font-size="11.00">明确边界（本实现不做）</text>
 <text text-anchor="start" x="1136.5" y="-127.7" font-family="Droid Sans Fallback" font-size="11.00">无 GC、无异步抢占、无 morestack/copystack 自动栈增长、</text>
 <text text-anchor="start" x="1136.5" y="-116.7" font-family="Droid Sans Fallback" font-size="11.00"> &#160;无 cgo</text>
-<text text-anchor="start" x="1136.5" y="-105.7" font-family="Droid Sans Fallback" font-size="11.00">无 TLS、无 HTTP/2、无 HTTP/3；协议层不做路由/鉴权/</text>
+<text text-anchor="start" x="1136.5" y="-105.7" font-family="Droid Sans Fallback" font-size="11.00">无 HTTP/3（HTTP/2 与 TLS 已由 go2cpp::net::http2 提供）；协议层不做路由/鉴权/</text>
 <text text-anchor="start" x="1136.5" y="-94.7" font-family="Droid Sans Fallback" font-size="11.00"> &#160;连接池/服务发现</text>
 <text text-anchor="start" x="1136.5" y="-83.7" font-family="Droid Sans Fallback" font-size="11.00">panic/recover 不是栈展开（显式状态协议）；</text>
 <text text-anchor="start" x="1136.5" y="-72.7" font-family="Droid Sans Fallback" font-size="11.00"> &#160;defer 是作用域级而非函数级</text>
@@ -529,24 +529,24 @@
 <text text-anchor="start" x="1136.5" y="-50.7" font-family="Droid Sans Fallback" font-size="11.00"> &#160;BlockingRegion 声明</text>
 <text text-anchor="start" x="1136.5" y="-39.7" font-family="Droid Sans Fallback" font-size="11.00">poll/select/epoll_wait 不被 park；wait_any/wait_many</text>
 <text text-anchor="start" x="1136.5" y="-28.7" font-family="Droid Sans Fallback" font-size="11.00"> &#160;仅限受管 Fiber</text>
-<text text-anchor="start" x="1290.5" y="-17.7" font-family="Droid Sans Fallback" font-size="11.00"> </text>
+<text text-anchor="start" x="1349.5" y="-17.7" font-family="Droid Sans Fallback" font-size="11.00"> </text>
 </g>
 <!-- note_legend -->
 <g id="node48" class="node">
 <title>note_legend</title>
-<polygon fill="#f7f7f7" stroke="#9a9a9a" points="1731,-139.5 1484,-139.5 1484,-21.5 1737,-21.5 1737,-133.5 1731,-139.5"/>
-<polyline fill="none" stroke="#9a9a9a" points="1731,-139.5 1731,-133.5 "/>
-<polyline fill="none" stroke="#9a9a9a" points="1737,-133.5 1731,-133.5 "/>
-<text text-anchor="start" x="1497" y="-123.5" font-family="Droid Sans Fallback" font-weight="bold" font-size="10.00">图例</text>
-<text text-anchor="start" x="1497" y="-113.5" font-family="Droid Sans Fallback" font-size="10.00">粗边框 = 最常直接使用的入口</text>
-<text text-anchor="start" x="1497" y="-103.5" font-family="Droid Sans Fallback" font-size="10.00"> &#160;（go / Channel / Context / Socket / Scheduler /</text>
-<text text-anchor="start" x="1497" y="-93.5" font-family="Droid Sans Fallback" font-size="10.00"> &#160;&#160;IOManager / Fiber）</text>
-<text text-anchor="start" x="1497" y="-83.5" font-family="Droid Sans Fallback" font-size="10.00">灰色节点 = 平台与内核（不由本项目实现）</text>
-<text text-anchor="start" x="1497" y="-73.5" font-family="Droid Sans Fallback" font-size="10.00">点线边框 = 内部设施（非稳定公共 API）</text>
-<text text-anchor="start" x="1497" y="-63.5" font-family="Droid Sans Fallback" font-size="10.00">实线 = 调用 / 数据流；虚线 = 横切或弱依赖</text>
-<text text-anchor="start" x="1497" y="-53.5" font-family="Droid Sans Fallback" font-size="10.00">L0（底）→ L9（顶）为依赖的向上方向</text>
-<text text-anchor="start" x="1497" y="-43.5" font-family="Droid Sans Fallback" font-size="10.00">完整依据见 modules/G1~G9 九份模块报告</text>
-<text text-anchor="start" x="1609" y="-33.5" font-family="Droid Sans Fallback" font-size="10.00"> </text>
+<polygon fill="#f7f7f7" stroke="#9a9a9a" points="1849,-139.5 1602,-139.5 1602,-21.5 1855,-21.5 1855,-133.5 1849,-139.5"/>
+<polyline fill="none" stroke="#9a9a9a" points="1849,-139.5 1849,-133.5 "/>
+<polyline fill="none" stroke="#9a9a9a" points="1855,-133.5 1849,-133.5 "/>
+<text text-anchor="start" x="1615" y="-123.5" font-family="Droid Sans Fallback" font-weight="bold" font-size="10.00">图例</text>
+<text text-anchor="start" x="1615" y="-113.5" font-family="Droid Sans Fallback" font-size="10.00">粗边框 = 最常直接使用的入口</text>
+<text text-anchor="start" x="1615" y="-103.5" font-family="Droid Sans Fallback" font-size="10.00"> &#160;（go / Channel / Context / Socket / Scheduler /</text>
+<text text-anchor="start" x="1615" y="-93.5" font-family="Droid Sans Fallback" font-size="10.00"> &#160;&#160;IOManager / Fiber）</text>
+<text text-anchor="start" x="1615" y="-83.5" font-family="Droid Sans Fallback" font-size="10.00">灰色节点 = 平台与内核（不由本项目实现）</text>
+<text text-anchor="start" x="1615" y="-73.5" font-family="Droid Sans Fallback" font-size="10.00">点线边框 = 内部设施（非稳定公共 API）</text>
+<text text-anchor="start" x="1615" y="-63.5" font-family="Droid Sans Fallback" font-size="10.00">实线 = 调用 / 数据流；虚线 = 横切或弱依赖</text>
+<text text-anchor="start" x="1615" y="-53.5" font-family="Droid Sans Fallback" font-size="10.00">L0（底）→ L9（顶）为依赖的向上方向</text>
+<text text-anchor="start" x="1615" y="-43.5" font-family="Droid Sans Fallback" font-size="10.00">完整依据见 modules/G1~G9 九份模块报告</text>
+<text text-anchor="start" x="1727" y="-33.5" font-family="Droid Sans Fallback" font-size="10.00"> </text>
 </g>
 </g>
 </svg>
