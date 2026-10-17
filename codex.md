@@ -7072,3 +7072,27 @@ median 分别为 **19,199 / 21,183 / 23,088 ns**。任务数扩大 40 倍，
 不依赖 shell 的引号/变量（本环境里反引号与 `$var` 会被 pwsh 吃掉，已多次踩坑）。
 
 **剩余**：G3~G10 共 8 个模块图；任务1（调试模块未做项）待穿插推进。
+
+---
+
+## 2026-10-17 13:50–14:05：任务2 —— G3 与 G4 两图
+
+**产出**：`diagrams/G3-context-error.md`（218 行）、`diagrams/G4-concurrency.md`（247 行），
+各含 5 个 Mermaid（classDiagram / flowchart / graph LR / stateDiagram-v2 ×2）。
+
+**G3（取消与错误）**：类架构覆盖 `Context`（取消沿父子链向下传播）、`DoneSignal`（可等待 + 可撤销回调）、
+`ContextRollback`（undo 逆序回滚 + Savepoint）、`Error`/`StringError`/`WrappedError`/`JoinError`；
+重要函数画出 `Cancel` 的三步（置位→传播→**锁外执行回调**）、`Signal` 的"回调表整体移出再执行"、
+`Wait` 用 `ParkingCondition`（受管 G 不占线程）、`Rollback` 的逆序与"记录第一个失败原因但不中断"。
+
+**G4（并发原语）**：类架构覆盖 `Mutex`/`ConditionVariable`/`WaitGroup`/`WaitSelector`/`RingBuffer`/
+`SelectWaitState`/`Channel<T>`/`FutureState<T>`/`Promise`/`Future`；重要函数画出
+`Mutex::Lock` 的 CAS 快路径 → **受管 G 有界协作重试（256/4）** → park，`Unlock` 的
+**所有权无缝转移**（并明确说明 D3 的 `WaitSelector` 只重排队列顺序，因此"TryLock 不能插队"这条语义不受影响）、
+`Channel` 的有缓冲（`RingBuffer` 索引回绕）与无缓冲（同步握手）两路、`select` 的逐个 TrySelect →
+全部 Arm → CAS 单赢家 + `m_generation` 防陈旧唤醒、`Future` 的 `variant` 值/错误/异常三选一。
+
+**状态流转**：Channel 的 9 种状态（含关闭后的收发语义）、`WaitNode` 的 Armed→Notified/Cancelled/Requeued。
+
+**与前两张图的一致性**：G4 里关于 `Mutex` 与 `WaitSelector` 的描述与第 9 轮实现（`b037417`）
+以及第 11/12 轮的实测结论一致（无竞争三档一致、有竞争的 13~24 µs 是 `Mutex` 自身成本）。

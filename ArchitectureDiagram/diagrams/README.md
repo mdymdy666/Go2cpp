@@ -18,8 +18,8 @@
 |---|---|---|---|
 | G1 | 地基层（fiber / timer / parking_condition / context_backend） | `G1-foundation.md` | ✅ 已完成 |
 | **G2** | **GMP 调度（Task/Scheduler/P/M/worker_loop/sysmon）** | **`G2-scheduler.md`** | **✅ 已完成** |
-| G3 | 取消与错误（context / error） | `G3-context-error.md` | 待做 |
-| G4 | 并发原语（channel / future / sync） | `G4-concurrency.md` | 待做 |
+| G3 | 取消与错误（context / error） | `G3-context-error.md` | ✅ 已完成 |
+| G4 | 并发原语（channel / future / sync） | `G4-concurrency.md` | ✅ 已完成 |
 | G5 | IO 后端（io / io_backend / fd_manager / hook） | `G5-io-backend.md` | 待做 |
 | G6 | 网络基础（socket / address / framing / endian） | `G6-network-base.md` | 待做 |
 | G7 | 应用协议（http / websocket / sse） | `G7-protocols.md` | 待做 |
