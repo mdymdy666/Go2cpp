@@ -8619,3 +8619,82 @@ git push origin feature/gmp-debug-module
 - **同步 `.git` 之后必须重置 `core.fileMode false`**，因为 `.git/config` 被覆盖；
 - **始终用 `rsync -rlD` 而不是 `-a`**，避免权限位污染工作树；
 - 推送后**用 `git log --oneline -1 origin/<branch>` 核对远端 HEAD**，不要只看 rc=0。
+
+---
+
+## 2026-10-17 方向三：HTTP/2 双向互通验证全部通过
+
+### 之前的状态
+
+- ✅ **别人能读我**：curl（nghttp2 1.59.0）当客户端，我的 h2c 服务端响应正确；
+- ❌ **我能读别人**：未验证（环境无 nghttpd / Node / Python h2）。
+
+### 这一轮补上了反方向
+
+**尝试过的路径与失败原因**（记录下来，避免以后重复踩）：
+
+| 方案 | 结果 |
+|---|---|
+`apt install nghttp2-client nghttp2-server` | ❌ sudo 需要密码 |
+自己编译 nghttp2 源码 | ❌ 需要 C++23 `<print>`（g++ 13 默认不支持）+ `urlparse` submodule 缺失 |
+Node.js 内置 `http2` 模块 | ❌ 环境无 node |
+Python `h2` 包 | ❌ 未安装 |
+**Python 手写 h2c 服务端** | ✅ **成功** |
+
+**最终方案**：`scripts/minimal_h2c_server.py`（208 行）—— 用 socket + struct
+**手工拼 HTTP/2 帧**，不依赖任何 h2 库。它只做三件协议必需的事：
+1. 读客户端前言；
+2. SETTINGS 交换（收对端 SETTINGS、回自己的、回 ACK）；
+3. 收到 HEADERS 后回 `:status: 200`（用 HPACK 静态表索引 8，单字节 `0x88`）
+   + 一个 DATA 帧带 body 并置 END_STREAM。
+
+配套 `example/network/http2_h2c_client.cpp`（161 行）：我的客户端，在 Fiber 里
+用 `Socket::connect` + `FiberTransport` 走真实 TCP。
+
+### 实测结果
+
+客户端：
+```
+[client] 已连接 127.0.0.1:18085
+[client] 握手完成
+[client] 已发送请求 /from-go2cpp（stream=1）
+[client] 响应头: :status: 200
+[client] 收到 DATA 29 字节 (end_stream=1)
+[client] :status = 200
+[client] body = hello from python h2c server
+[client] 反向互通验证通过
+```
+
+Python 服务端侧日志（独立解析我的请求）：
+```
+[python-h2c] 收到客户端前言
+[python-h2c] 已发送 SETTINGS
+[python-h2c] 收到 SETTINGS 并回 ACK
+[python-h2c] 收到 HEADERS: stream=1 flags=0x5 len=41
+[python-h2c]   :method: GET
+[python-h2c]   :scheme: http
+[python-h2c]   :path: <huffman 9 bytes>
+[python-h2c]   :authority: <huffman 11 bytes>
+[python-h2c]   <name 58>: <huffman 13 bytes>
+[python-h2c] 已响应 stream=1: :status 200 + 29 字节 body
+```
+
+**附带发现**：Python 侧看到的 `:path` / `:authority` 都是 `<huffman N bytes>`，
+这**独立印证了我的编码器确实启用了 Huffman**（编码端对短串会退化到原样，
+但这两个字段足够长，Huffman 更短，所以走了 Huffman 路径）。
+`<name 58>` 是 `user-agent`（静态表索引 58），也印证了名字索引复用生效。
+
+### 双向互通结论
+
+| 方向 | 验证者 | 结果 |
+|---|---|---|
+**别人读我** | curl 8.5.0 + nghttp2 1.59.0 | ✅ |
+**我读别人** | Python 手写 h2c 服务端 | ✅ |
+
+至此 HTTP/2 的**编码、解码、帧层、流状态机**都被独立实现双向验证过。
+
+### 仍未做
+
+- **CONTINUATION**：大 header（超过一帧）返回 `kUnsupported`；
+- **精细流控**：收到 DATA 立刻补窗口，等价于不真正限流；
+- **TLS/ALPN**：仅 h2c（明文）；真实互联网的 HTTP/2 几乎都在 TLS 上。
