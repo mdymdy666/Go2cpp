@@ -8789,3 +8789,76 @@ Python 服务端侧日志（独立解析我的请求）：
 - **TLS/ALPN**：仅 h2c（明文）。真实互联网的 HTTP/2 几乎都跑在 TLS 上，
   需要 ALPN 协商出 `h2`，这是 HTTP/2 板块唯一剩下的实质性缺口；
 - **流控的阻塞等待**：窗口不足时立即返回错误，而不是挂起等待 WINDOW_UPDATE。
+
+---
+
+## 2026-10-17 方向三：HTTP/2 over TLS + ALPN（HTTP/2 板块最后一块）
+
+### 为什么必须做
+
+此前 HTTP/2 只在 h2c（明文）上验证过。但**真实互联网的 HTTP/2 几乎全部跑在
+TLS 上**，且必须通过 ALPN 协商出 `h2` —— 否则对端会当作 HTTP/1.1 处理。
+缺这一块，实现无法与真实站点对话。
+
+### 实现
+
+`include/go2cpp/network/http2/tls_transport.hpp` + `src/network/http2/tls_transport.cpp`
+（233 行）：OpenSSL 客户端，TLS 1.2+、SNI、ALPN 优先 `h2`。
+
+**并发模型**（关键）：底层 socket 设为**非阻塞**，`SSL_connect`/`SSL_read`/
+`SSL_write` 返回 `WANT_READ`/`WANT_WRITE` 时用 `poll` 等待后重试。本项目的 hook
+会拦截 `poll`，所以在 Fiber 里等待会**挂起协程**而不是卡住 worker 线程 ——
+与 `FiberTransport` 行为一致。**不能用阻塞 fd**，那会让 SSL 内部阻塞整个线程。
+
+**证书校验默认关闭**（`verify_peer=false`）。这是为自签名证书本地测试的便利，
+**不是安全默认**；生产必须打开并配置 CA 路径。已在头文件明确标注。
+
+### 验证
+
+`tests/network/test_tls_alpn.cpp` + `scripts/verify_tls_alpn.sh`：用
+`openssl s_server -alpn h2` 作为**独立实现**的对端。
+
+实测输出：
+```
+[tls-alpn] TLS 版本: TLSv1.3
+[tls-alpn] ALPN 协商结果: 'h2'
+[tls-alpn] TLS 上读到 512 字节
+[tls-alpn] failures=0
+```
+
+### 这个测试为什么不进 ctest
+
+它依赖外部 `openssl s_server` 可执行文件与动态生成的自签名证书。放进 ctest
+会让 89/89 变成**环境敏感**的 —— 在没有 openssl 的机器上无端失败。改为
+`scripts/verify_tls_alpn.sh`，需要时手动执行或在 CI 里作为独立步骤。
+
+### 范围说明（诚实）
+
+`openssl s_server` 不懂 HTTP/2 帧，所以这次只验证到 **TLS 层与 ALPN 协商**。
+但 ALPN 谈不出 `h2` 就永远不可能有 HTTP/2 over TLS，所以这是**必要前提**。
+HTTP/2 over TLS 的完整链路（TLS 之上再跑 Connection）需要一个真正的 h2 TLS
+服务器（nginx / nghttpd），本环境没有。
+
+### HTTP/2 板块最终清单
+
+| 模块 | 行数 | 验证 |
+|---|---:|---|
+HPACK | 224+549 | RFC 7541 §C.1/C.2/C.3/C.4.1 官方向量 |
+Huffman | 63+162 | `www.example.com` 编码逐字节匹配 |
+帧层 | 275+538 | 10 场景 + 随机 3000 轮 |
+流状态机 | 132+192 | 84 组合穷举矩阵 |
+连接层 | 193+459 | 10 场景（含 CONTINUATION、流控）|
+FiberTransport | 101 | 真实 socket |
+**TlsTransport** | **103+233** | **TLS1.3 + ALPN=h2（openssl s_server）** |
+h2c server / client | 157 / 161 | 与 curl(nghttp2) / Python 手写服务端双向互通 |
+
+### 仍缺（全部列出，不隐瞒）
+
+1. **HTTP/2 over TLS 的完整链路未验证**：缺少真正的 h2 TLS 服务器；
+2. **服务端 TLS**：只实现了客户端；
+3. **证书校验**：已有开关但默认关闭，生产要打开；
+4. **流控的阻塞等待**：窗口不足时立即返回 `kFlowControl`，不挂起等待
+   WINDOW_UPDATE（需要 Fiber 条件变量）；
+5. **优先级**：PRIORITY 能解析但不参与调度（RFC 9113 已弃用）；
+6. **服务器推送 API**：PUSH_PROMISE 能解析，无推送接口；
+7. **会话复用 / 0-RTT**：未做。
