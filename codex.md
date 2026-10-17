@@ -9027,3 +9027,7 @@ close_f / shutdown_f / fcntl_f / dup_f / dup2_f
 `hook.enable_shutdown` 配置项存在，但 `shutdown` **从来没有被 hook**
 （`Originals` 里没有 `m_shutdown`）—— 对 `shutdown` 设开关是**无效的**。
 不是本次引入的，只在 `shutdown_f` 注释里说明了事实。
+
+## 2026-10-18
+
+本轮（QUIC 薄封装 + hook 完善 + os 收尾 + 架构图渲染验证）的完整记录、未完成项、已知陷阱见 \docs/NEXT-STEPS.md\。
