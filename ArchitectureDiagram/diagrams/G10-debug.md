@@ -67,22 +67,21 @@ classDiagram
     DebugScheduler ..> Task : 读状态
 ```
 
-### ①-B 锁观测与 D3 争用选择（原 sync → 调试侧）
+### ①-B 锁观测代理（原 sync → 调试侧）
 
 ```mermaid
 classDiagram
     direction TB
 
     class sync_Mutex {
-        <<G4>>
+        <<G4 锁>>
     }
     class sync_CondVar {
-        <<G4>>
+        <<G4 条件变量>>
     }
     class sync_WaitGroup {
-        <<G4>>
+        <<G4 计数等待>>
     }
-
     class DebugMutex {
         <<代理 Mutex>>
         +Snapshot() MutexDebugSnapshot
@@ -93,15 +92,35 @@ classDiagram
     class DebugWaitGroup {
         <<代理 WaitGroup>>
     }
+
+    DebugMutex ..> sync_Mutex : 代理 + public Debug 方法
+    DebugConditionVariable ..> sync_CondVar : 代理
+    DebugWaitGroup ..> sync_WaitGroup : 代理
+```
+
+### ①-B′ D3：锁争用选择钩子
+
+```mermaid
+classDiagram
+    direction TB
+
+    class sync_Mutex {
+        <<G4 锁>>
+        +Unlock()
+    }
     class WaitSelector {
         <<D3 争用选择钩子>>
         +Select(candidates) optional~size_t~
         ← 只重排队列，不改认领语义
     }
+    class WaiterCandidate {
+        <<选择器的输入视图>>
+        +index
+        +is_fiber
+        ← 不暴露内部 WaitNode
+    }
 
-    DebugMutex ..> sync_Mutex : 代理 + public Debug 方法
-    DebugConditionVariable ..> sync_CondVar
-    DebugWaitGroup ..> sync_WaitGroup
+    WaitSelector ..> WaiterCandidate : 读取候选
     WaitSelector ..> sync_Mutex : Unlock 时被调用（只重排）
 ```
 
