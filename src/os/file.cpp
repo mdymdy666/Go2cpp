@@ -26,8 +26,12 @@ namespace {
 
 /// 绕过 Hook 的 `openat`。失败返回 -1 且 errno 有效。
 int RawOpen(const char* path, int flags, mode_t mode) noexcept {
-    const long result =
-        ::syscall(SYS_openat, AT_FDCWD, path, flags | O_CLOEXEC, mode);
+    // O_NONBLOCK 的作用：**避免 open(2) 自己阻塞**。
+    // 关键场景：`Open("/tmp/some_fifo")` 若不加 O_NONBLOCK，`open` 会一直等到
+    // 有写端才返回 —— 根本到不了后面的 fstat 类型校验，worker 会卡在 open 里。
+    // 对普通文件 O_NONBLOCK 是 no-op（POSIX 保证），所以加了无副作用。
+    const long result = ::syscall(SYS_openat, AT_FDCWD, path,
+                                  flags | O_CLOEXEC | O_NONBLOCK, mode);
     return static_cast<int>(result);
 }
 
@@ -51,6 +55,7 @@ const char* ToString(OsError error) noexcept {
         case OsError::kOpenFailed: return "open-failed";
         case OsError::kIoFailed: return "io-failed";
         case OsError::kIsSocket: return "is-socket";
+        case OsError::kNotRegularFile: return "not-a-regular-file";
         case OsError::kInvalidHandle: return "invalid-handle";
         case OsError::kInvalidArgument: return "invalid-argument";
     }
@@ -156,13 +161,22 @@ FileStatus File::Open(const std::string& path, OpenFlag flags, mode_t mode, File
         status.system_error = errno;
         return status;
     }
-    // 校验确实是「非 socket」：即便 open 不可能返回 socket，这里也做一次类型确认，
-    // 让 Adopt/Open 的类型检查口径一致。
+    // 类型校验：只接受**普通文件**。理由见 OsError::kNotRegularFile 的文档 ——
+    // 非普通文件（FIFO/pipe/字符设备/eventfd/timerfd/signalfd）的 read 会真阻塞，
+    // 而本类走裸 syscall 绕过 Hook，会卡死整个 worker。
+    // 先判 socket 是为了给出更精确的错误码。
     struct ::stat info {};
-    if (static_cast<int>(::syscall(SYS_fstat, fd, &info)) == 0 && S_ISSOCK(info.st_mode)) {
-        (void)RawClose(fd);
-        status.code = OsError::kIsSocket;
-        return status;
+    if (static_cast<int>(::syscall(SYS_fstat, fd, &info)) == 0) {
+        if (S_ISSOCK(info.st_mode)) {
+            (void)RawClose(fd);
+            status.code = OsError::kIsSocket;
+            return status;
+        }
+        if (!S_ISREG(info.st_mode)) {
+            (void)RawClose(fd);
+            status.code = OsError::kNotRegularFile;
+            return status;
+        }
     }
     *out = File{};
     out->m_fd = fd;
@@ -198,10 +212,18 @@ FileStatus File::Adopt(int fd, bool take_ownership, File* out) {
         status.system_error = errno;
         return status;
     }
-    // ★ 高危误用拦截：socket fd 若被装进 File，读写会走裸 syscall 绕过 Hook，
-    //   从而把整个 M 线程阻塞在 socket 上、拖死调度器。见 file.hpp 1.4。
+    // ★ 高危误用拦截：`File::Read/Write` 走裸 syscall 绕过 Hook，前提是
+    //   "普通文件的 IO 在内核里同步完成、不会 EAGAIN"。凡是**可能阻塞**的 fd
+    //   都不满足这个前提，塞进来就会把整个 M 线程卡死。见 file.hpp 1.4。
+    //
+    //   先判 socket（错误码更精确），再判非普通文件（覆盖 FIFO/pipe/字符设备/
+    //   eventfd/timerfd/signalfd —— 后三者的类型位是 0，黑名单必然漏掉）。
     if (S_ISSOCK(info.st_mode)) {
         status.code = OsError::kIsSocket;
+        return status;
+    }
+    if (!S_ISREG(info.st_mode)) {
+        status.code = OsError::kNotRegularFile;
         return status;
     }
     *out = File{};

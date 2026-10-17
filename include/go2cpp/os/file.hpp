@@ -115,6 +115,30 @@ enum class OsError : std::uint8_t {
     kIoFailed,
     /// 尝试接管一个 socket fd —— 见 file.hpp 1.4，这是高危误用，必须拒绝。
     kIsSocket,
+    /**
+     * @brief 尝试接管一个**非普通文件**（FIFO、pipe、字符设备、eventfd、
+     *        timerfd、signalfd 等）。
+     * @details 与 `kIsSocket` 同类风险，但覆盖范围更广。实测 `st_mode & S_IFMT`：
+     *
+     *          | fd | 类型位 |
+     *          |---|---|
+     *          | 普通文件 | `S_IFREG` |
+     *          | FIFO / pipe | `S_IFIFO` |
+     *          | 字符设备 | `S_IFCHR` |
+     *          | **eventfd / timerfd / signalfd** | **`0`**（无类型位！）|
+     *          | socket | `S_IFSOCK` |
+     *
+     *          这些 fd 上的 `read` **会真阻塞**（FIFO 无数据、eventfd 未 signal、
+     *          timerfd 未到期、`/dev/tty` 无输入），而 `os::File::Read` 走裸
+     *          `syscall(SYS_read)` 绕过 Hook —— 结果是**整个 worker 线程卡死**，
+     *          等价于一个本地 DoS。
+     *
+     *          **为什么必须用白名单**：Linux 的 `anon_inodefs`（`eventfd`/
+     *          `timerfd`/`signalfd`）**不给 `st_mode` 类型位**（`type_bits == 0`）。
+     *          任何基于 `S_ISxxx` 的**黑名单**都会漏掉它们，而它们恰好都是会阻塞
+     *          的 fd。所以只能反过来：**只接受 `S_ISREG`**。
+     */
+    kNotRegularFile,
     /// 无效的 fd / 已关闭的句柄。
     kInvalidHandle,
     /// 参数非法（路径为空、缓冲区为空指针等）。

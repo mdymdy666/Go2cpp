@@ -1,6 +1,8 @@
 #include "go2cpp/runtime.hpp"
 
+#include <chrono>
 #include <iostream>
+#include <thread>
 
 /**
  * @brief Scheduler 简单版：启动、提交任务、等待、查询规模、关闭。
@@ -21,6 +23,14 @@ int main() {
     Scheduler scheduler(3);
     std::cout << "  is_running（启动前）=" << scheduler.is_running() << '\n';
     scheduler.start();
+    // **等 worker 全部启动**：`start()` 里的工作线程是**异步创建**的，
+    // 紧接着查 `worker_count()` 可能少 1~2 个（实测偶发 2 而配置是 3）。
+    // 这是测试的时序假设问题，不是调度器缺陷 —— 多等几毫秒即可。
+    for (int attempt = 0;
+         attempt < 100 && scheduler.worker_count() < scheduler.processor_count();
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     const bool running = scheduler.is_running();
     std::cout << "  is_running（启动后）=" << running
               << " processor_count=" << scheduler.processor_count() << "（预期 1 3）\n";
