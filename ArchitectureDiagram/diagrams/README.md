@@ -16,6 +16,7 @@
 
 | 组 | 主题 | 图文件 | 状态 |
 |---|---|---|---|
+| **G0** | **总览：10 组如何拼成一次 go()（建议先看）** | **`G0-overview.md`** | **✅ 已完成** |
 | G1 | 地基层（fiber / timer / parking_condition / context_backend） | `G1-foundation.md` | ✅ 已完成 |
 | **G2** | **GMP 调度（Task/Scheduler/P/M/worker_loop/sysmon）** | **`G2-scheduler.md`** | **✅ 已完成** |
 | G3 | 取消与错误（context / error） | `G3-context-error.md` | ✅ 已完成 |

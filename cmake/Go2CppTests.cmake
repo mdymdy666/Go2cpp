@@ -200,6 +200,10 @@ if (GO2CPP_BUILD_BENCHMARKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/debug_lock_selector_overhead_benchmark.cpp)
     target_link_libraries(go2cpp_debug_lock_selector_benchmark PRIVATE go2cpp_runtime)
     target_compile_options(go2cpp_debug_lock_selector_benchmark PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_executable(go2cpp_debug_event_collector_benchmark
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/debug_event_collector_benchmark.cpp)
+    target_link_libraries(go2cpp_debug_event_collector_benchmark PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_debug_event_collector_benchmark PRIVATE -O2 -Wall -Wextra -Wpedantic)
     target_compile_options(go2cpp_channel_vs_queue_benchmark PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
     add_executable(go2cpp_timer_task_benchmark

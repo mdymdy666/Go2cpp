@@ -218,6 +218,17 @@ public:
         return FlushStaging();
     }
 
+    /// 设置每批提交条数（1 = 退化为逐条提交，便于与批量化对比）。
+    /// @note 只影响**当前线程**的暂存槽（线程局部），不影响其它线程已生效的设置。
+    void SetFlushBatch(std::size_t batch) {
+        auto& staging = Staging();
+        staging.batch = batch == 0 ? 1 : batch;
+    }
+    /// 读取当前线程的每批提交条数。
+    std::size_t FlushBatch() const {
+        return StagingConst().batch;
+    }
+
     /// 当前线程暂存区里还没提交的条数（用于测试与观测）。
     std::size_t StagedOnThisThread() const {
         const auto& staging = StagingConst();
