@@ -162,6 +162,24 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_connection_test COMMAND go2cpp_connection_test)
     set_tests_properties(go2cpp_connection_test PROPERTIES TIMEOUT 180)
 
+    add_executable(go2cpp_fiber_transport_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_fiber_transport.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/connection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/frame.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/hpack.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/huffman.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/stream_state.cpp)
+    target_include_directories(go2cpp_fiber_transport_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(go2cpp_fiber_transport_test PRIVATE
+        go2cpp_scheduler go2cpp_network go2cpp_io go2cpp_hook
+        go2cpp_fiber go2cpp_sync)
+    target_compile_options(go2cpp_fiber_transport_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_fiber_transport_test
+             COMMAND go2cpp_fiber_transport_test)
+    set_tests_properties(go2cpp_fiber_transport_test PROPERTIES TIMEOUT 180)
+
     add_executable(go2cpp_config_registry_macro_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/test_config_registry_macro.cpp)
     target_link_libraries(go2cpp_config_registry_macro_test PRIVATE go2cpp_config)
