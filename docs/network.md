@@ -137,6 +137,64 @@ Huffman | **`www.example.com` 编码逐字节匹配 §C.4.1** |
 `Connection` **不是线程安全的**，与 Go 的 `http2` 一致：一个连接只能由一个 Fiber/线程驱动。
 `TlsTransport` 同理。若要并发处理多条连接，每条连接一个 Fiber。
 
+## Hook 的按函数动态开关
+
+`hook` 模块的每个被拦截的 libc 函数都有**运行时开关**：`hook.enable_<op>`。
+
+### 能力
+
+- **19 个 `HookOp`**：read / readv / recv / recvfrom / write / writev / send / sendto /
+  connect / accept / sleep / poll / select / epoll_wait / close / shutdown / fcntl /
+  dup / dup2
+- 存储是**单个 `std::atomic<uint32_t>` 位图**，检查开销约 1~2 ns
+  （relaxed load + 移位 + 与），**无锁、无系统调用**
+- 默认**全开**，与引入开关前的行为完全一致
+- 支持**运行时热切换**（配置项挂 `AddListener`）
+
+### 已接线（关闭后直调原始 libc，不拦截、不 park Fiber）
+
+`read` / `write` / `recv` / `send` / `connect` / `readv` / `writev` / `sendto` /
+`accept` / `recvfrom` / `sleep` —— 共 **11 个**。
+
+### 不可关闭（硬拒绝）
+
+`close` / `shutdown` / `fcntl` / `dup` / `dup2`。
+
+理由：关闭它们会让 fd 元数据与内核状态**脱节**，fd 复用时 Hook 会拿**过期
+descriptor** 做判断（例如把普通文件当 socket）。`SetOpEnabled(op, false)` 对这 5 个
+返回 `false`，且 `SetAllOpsEnabled(false)` 也会保留它们的位，避免一句话绕过硬拒绝。
+
+### `poll` / `select` / `epoll_wait` 的开关在语义上是空的
+
+它们本来就是 `invoke_native_blocking`（**从不做协程让出**）。关掉只有两种写法：
+
+1. 去掉 `BlockingRegion` → sysmon 收不到「这个 M 在阻塞」的信号，`poll(-1)` 会让 M
+   **卡死且无人接管**，比不接线更危险；
+2. 保留 → 与现在行为**完全相同**，等于没做。
+
+所以这三个**没有接线**。配置项虽然注册了，但没有实际效果。
+
+### 四个必须知道的危险点
+
+1. **不对称**：`read`/`write`、`recv`/`send`、`recvfrom`/`sendto`、`readv`/`writev`
+   是**四对**，必须成对设置。只关一侧会让同一个 fd 的收发路径行为不一致。
+2. **在 Fiber 内关 `read`/`recv` 会阻塞整个 worker 线程** —— 该 P 上所有 Fiber 停摆。
+   这正是 Hook 存在的理由。
+3. **`sleep` 被禁**最能暴露代价：一个 Fiber `sleep_for(1s)`，整个 worker 停 1 秒。
+4. **运行中从开→关不会让已 park 的 Fiber 卡死** —— 唤醒路径**不查**这个开关，
+   已 park 的 Fiber 仍挂在 fd 等待队列里，可读时照常被 `IOManager` 唤醒。
+   开关只影响**新发起**的调用。副作用：可能同时存在「Fiber park 着」与
+   「新调用在 worker 上阻塞」。
+
+### 警告文案写在配置里
+
+每个开关的 `description` 都写了**具体的破坏后果**（不是笼统的「危险」），
+分两级措辞：「**!!! 危险：不建议关闭 !!!**」与「**!!! 不应关闭 !!!**」。
+生成到 `app.ini` 后是普通文本注释（INI 没有颜色），用大写与感叹号做视觉强调。
+
+**一句话原则**：这个开关的存在是为了**诊断**，不是为了**优化**。
+关掉它不会让程序更快，只会让协程退化成阻塞线程。
+
 ## 错误与限制
 
 Socket 原始调用返回 `SocketResult` 并携带 errno，`SocketStream` 的负返回值为负 errno；短读和短写是正常情况。解析器 body 仍是有限内存缓冲，不能把它用于不受限的大文件；大文件、SSE、multipart 应使用 `ResponseWriter` 并自行设置业务级上限和取消策略。DNS 目前通过 `getaddrinfo` 同步完成，若需要 Fiber 可取消 DNS，应注入异步 Resolver。`sendmsg` 默认加 `MSG_NOSIGNAL`，避免单次写入触发 SIGPIPE 终止进程，但其他裸 fd 写入仍需由调用方遵守平台信号策略。

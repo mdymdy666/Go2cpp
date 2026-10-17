@@ -50,6 +50,15 @@ add_library(go2cpp_network
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/sse.cpp)
 add_library(go2cpp_config ${CMAKE_CURRENT_SOURCE_DIR}/src/config/config.cpp)
 
+# os 模块：文件/目录/环境变量/参数。走 syscall 绕过 Hook（见 os/file.hpp 的边界论证），
+# 依赖 config（src/os/config.cpp 用 Config::SaveToFile 导出 app.ini）。
+add_library(go2cpp_os
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/dir.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/file.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/os.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/config.cpp)
+target_link_libraries(go2cpp_os PUBLIC go2cpp_config)
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GO2CPP_BUILD_HOOK)
     add_library(go2cpp_hook SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/network/hook.cpp)
 endif()
@@ -91,6 +100,7 @@ add_library(go2cpp::io ALIAS go2cpp_io)
 add_library(go2cpp::network ALIAS go2cpp_network)
 add_library(go2cpp::log ALIAS go2cpp_log)
 add_library(go2cpp::config ALIAS go2cpp_config)
+add_library(go2cpp::os ALIAS go2cpp_os)
 if (TARGET go2cpp_hook)
     add_library(go2cpp::hook ALIAS go2cpp_hook)
 endif()
@@ -108,6 +118,7 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_network
     go2cpp_log
     go2cpp_config
+    go2cpp_os
 )
 if (TARGET go2cpp_hook)
     list(APPEND GO2CPP_MODULE_TARGETS go2cpp_hook)
