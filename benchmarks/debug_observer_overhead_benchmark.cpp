@@ -103,11 +103,15 @@ struct RunResult {
     std::size_t consumed{0};
 };
 
-RunResult RunOnce(Mode mode, std::size_t task_count, std::size_t workers) {
+RunResult RunOnce(Mode mode, std::size_t task_count, std::size_t workers,
+                    std::size_t local_queue_limit) {
     go2cpp::SchedulerConfig config;
     config.processor_count = workers;
     config.max_workers = workers;
     config.min_workers = workers;
+    if (local_queue_limit != 0) {
+        config.local_queue_limit = local_queue_limit;
+    }
     config.collect_metrics = false;  // 隔离 observer 的影响
     go2cpp::Scheduler scheduler(config);
 
@@ -194,6 +198,11 @@ int main(int argc, char** argv) {
         const long v = std::atol(argv[3]);
         if (v > 0) workers = static_cast<std::size_t>(v);
     }
+    std::size_t local_queue_limit = 0;   // 0 = 用默认(256)
+    if (argc > 5) {
+        const long v = std::atol(argv[5]);
+        if (v > 0) local_queue_limit = static_cast<std::size_t>(v);
+    }
 
     std::printf("=== 调度器观察者开销三档对照（build-bench / Release） ===\n");
     std::printf("参数：任务数=%zu  工作线程=%zu  每档轮数=%d\n\n", task_count, workers, repeats);
@@ -202,11 +211,11 @@ int main(int argc, char** argv) {
         // 热身轮：不计入统计。首轮包含 Fiber 栈池、worker 线程与调度器结构的
         // 冷启动成本，若不排除会让"先测的档"显著偏慢（实测过：档0 曾因冷启动
         // 比档1 慢约 20 倍，属测量错误而非真实开销）。
-        (void)RunOnce(mode, task_count, workers);
+        (void)RunOnce(mode, task_count, workers, local_queue_limit);
         std::vector<double> samples;
         RunResult last;
         for (int i = 0; i < repeats; ++i) {
-            last = RunOnce(mode, task_count, workers);
+            last = RunOnce(mode, task_count, workers, local_queue_limit);
             samples.push_back(last.ns_per_task);
         }
         std::sort(samples.begin(), samples.end());
