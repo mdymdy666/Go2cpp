@@ -236,3 +236,69 @@ cross-worker 交接，所以正常。
   并重新论证 `stopping`/`draining`/`emergency` 在该拆分下的语义；
 - 必须先有**并发压力测试**（多 worker + 频繁 spawn/shutdown + 混合 park/resume）作为护栏，
   再动这段代码。
+
+---
+
+## 2026-10-17 20:15–20:35：**worker 劣化的根因确认 —— 调度器的 `std::condition_variable`**
+
+### 结论
+
+把调度器的 `std::condition_variable condition`
+（`src/concurrency/scheduler.cpp:1824`，27 处调用点）
+换成**已 futex 化的 `core::ParkingCondition`** 后：
+
+| workers | BEFORE | AFTER | 改善 |
+|---:|---:|---:|---:|
+| 1 | 1,553.0 | 1,357.3 | 1.14x |
+| 2 | 2,031.8 | **949.0** | **2.14x** |
+| **3** | 12,196.9 | **2,165.7** | **5.63x** |
+| **4** | 24,376.7 | **3,817.5** | **6.39x** |
+
+**倍率对比**：
+
+| | BEFORE | AFTER |
+|---|---|---|
+| 1 worker | 1.00x | 1.00x |
+| 2 worker | 1.31x | **0.70x** |
+| **3 worker** | **7.85x** | **1.60x** |
+| **4 worker** | **15.70x** | **2.81x** |
+
+**全量 ctest 100% passed, 80/80, 33.76 s。**
+
+### 为什么是它
+
+这解释了此前所有观察：
+- **`min_workers=1` 时正常**：只有一个 worker，`condition` 上只有一个等待者，cv 的开销可控；
+- **`min_workers=N` 时劣化**：N 个 worker 全部 park 在**同一个 `std::condition_variable`** 上，
+  每次唤醒都穿 glibc 的 cv 层（内部还要走 futex 系统调用 + 重新抢 mutex）；
+- **劣化与任务长度无关但与并发度强相关**：因为开销在"唤醒等待者"这条路径上，
+  每个任务都要付一次。
+
+此前的 6 个假设（emit_event / 忙等 / idle_wait / 惊群 / 队列溢出 / maybe_grow）都排除了，
+但都没触及这一点 —— 因为它们都在检查"谁在抢锁"或"唤醒多少次"，
+而真正的问题在**"每次唤醒本身有多贵"**。
+
+### 改动
+
+只改一行声明 + 一个 include：
+
+```cpp
+// 原来
+std::condition_variable condition;
+// 现在
+core::ParkingCondition condition;   // 已 futex 化（commit 1972d4d）
+```
+
+`ParkingCondition` 的 `wait` / `wait_for` / `wait_until` / `notify_one` / `notify_all`
+签名与 `std::condition_variable` **完全一致**，所以 27 处调用点**一行未改** ——
+这正是使用者要求「不改变向上层接口」的直接体现。
+
+### 仍未完全消除
+
+4 worker 仍有 **2.81x**（3,817 vs 1,357 ns）。合理的下一步：
+- 调度器内部的 `m_impl->mutex`（`std::mutex`，1815 行）仍是共享点，
+  `admission` 事务与 `condition` 的 predicate 都在它上面；
+- 可考虑把 `m_impl->mutex` 换成本项目有自旋 + futex 慢路径的 `core::HybridMutex`
+  （95 处调用点，工作量大但方向明确）；
+- 或按本轮的做法，先给 `m_impl->mutex` 的争用路径加自旋预算
+  （`sync::Mutex` 上这一手带来了 21 倍改善）。

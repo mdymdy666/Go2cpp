@@ -13,6 +13,29 @@
 
 
 
+
+## 调度器 worker 扩展性（condition 换 futex 后）
+
+> **条件**：`build-bench`（Release + -O2）、AMD Ryzen 9 8945HX / WSL2、
+> `debug_observer_benchmark` 档 0（不装观察者）、20,000 任务、3 轮取 median、
+> **测量时负载 1.44**。
+
+| workers | BEFORE | AFTER | 改善 |
+|---:|---:|---:|---:|
+| 1 | 1,553.0 | 1,357.3 | 1.14x |
+| 2 | 2,031.8 | **949.0** | **2.14x** |
+| 3 | 12,196.9 | **2,165.7** | **5.63x** |
+| 4 | 24,376.7 | **3,817.5** | **6.39x** |
+
+**倍率**：BEFORE 1.00 / 1.31 / 7.85 / 15.70x → **AFTER 1.00 / 0.70 / 1.60 / 2.81x**。
+
+**改动**：调度器的 `std::condition_variable condition` 换成 futex 化的
+`core::ParkingCondition`（接口签名完全一致，27 处调用点未改）。
+
+**判读**：这确认了 worker 数量级劣化的根因是**调度器 park/unpark 走 glibc cv**。
+4 worker 仍有 2.81x，剩余共享点是 `m_impl->mutex`。
+
+---
 ## sync::Mutex 的高竞争（专项探针）
 
 > **条件**：临时探针（`/tmp`，未入库）、`build-quality` 库、N 线程反复 lock/unlock 同一把

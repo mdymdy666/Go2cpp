@@ -3,6 +3,7 @@
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/log.hpp"
 #include "go2cpp/thread_policy.hpp"
+#include "go2cpp/core/parking_condition.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1821,7 +1822,11 @@ public:
     std::atomic<std::size_t> next_incoming_stripe{0};
     std::atomic<std::size_t> incoming_probe{0};
     std::atomic<std::uint32_t> incoming_nonempty_mask{0};
-    std::condition_variable condition;
+    // 用已 futex 化的 ParkingCondition 替代 std::condition_variable：
+    // worker 的 park/unpark 全部汇聚到这里，原实现每次都要穿 glibc 的 cv 层。
+    // 接口（wait / wait_for / wait_until / notify_*）与 cv 完全一致，
+    // 因此调度器其余 27 处调用点无需改动。
+    core::ParkingCondition condition;
     std::deque<std::shared_ptr<Task>> global_queue;
     std::shared_ptr<Task> emergency_head;
     std::shared_ptr<Task> emergency_tail;

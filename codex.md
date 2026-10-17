@@ -7650,3 +7650,30 @@ alignas(64) std::atomic<std::uint32_t> m_futex_seq{0};   // 在 WaitNode 里
 **B3 没改善**：4 次额度对 3 线程不够。下一步可试 8/16 次，或按"当前是否队首"决定额度。
 
 **全量 ctest 100% passed, 80/80, 33.81 s。**
+
+---
+
+## 2026-10-17 20:35：worker 劣化根因确认（5.6 倍改善）
+
+把调度器的 `std::condition_variable`（27 处调用点）换成已 futex 化的 `core::ParkingCondition`：
+
+| 倍率 | BEFORE | AFTER |
+|---|---|---|
+| 3 worker | 7.85x | **1.60x** |
+| 4 worker | 15.70x | **2.81x** |
+
+绝对耗时：3 worker 12,196.9 → **2,165.7 ns**（5.63 倍）、4 worker 24,376.7 → **3,817.5 ns**（6.39 倍）。
+全量 ctest 80/80。
+
+**这就是之前所有观察的答案**：`min_workers=1` 时只有一个等待者，cv 开销可控；
+`min_workers=N` 时 N 个 worker 全 park 在同一个 cv 上，每次唤醒都穿 glibc 层 + 重新抢 mutex。
+
+此前排除的 6 个假设（emit_event / 忙等 / idle_wait / 惊群 / 队列溢出 / maybe_grow）都在查
+「谁在抢锁」或「唤醒多少次」，而真正的问题是「**每次唤醒本身有多贵**」。
+
+**使用者最初的判断（从 futex 切入）最终命中了这个根因。** 中间走了弯路
+（先去改 ParkingCondition / sync::Mutex 的等待原语），但那两步积累的自旋预算经验
+（`sync::Mutex` 上带来 21 倍改善）正是最后一击所需。
+
+改动极小：一行声明 + 一个 include，27 处调用点**一行未改** —— 因为 ParkingCondition 的
+wait/wait_for/wait_until/notify_* 签名与 cv 完全一致，这正是「不改变上层接口」的体现。
