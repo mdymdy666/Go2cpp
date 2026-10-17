@@ -234,5 +234,11 @@ if (GO2CPP_BUILD_BENCHMARKS)
         target_link_libraries(go2cpp_io_epoll_fair_benchmark PRIVATE go2cpp_runtime)
         target_compile_options(go2cpp_io_epoll_fair_benchmark PRIVATE
             -O2 -Wall -Wextra -Wpedantic)
+
+        add_executable(go2cpp_mixed_random_benchmark
+            ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/mixed_random_benchmark.cpp)
+        target_link_libraries(go2cpp_mixed_random_benchmark PRIVATE go2cpp_runtime)
+        target_compile_options(go2cpp_mixed_random_benchmark PRIVATE
+            -O2 -Wall -Wextra -Wpedantic)
     endif()
 endif()
