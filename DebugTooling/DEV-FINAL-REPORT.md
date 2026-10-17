@@ -174,3 +174,85 @@ include/go2cpp/sync.hpp  | 104 +++++++++++++++++++++++++++++++++++++++++++++++
 104	0	include/go2cpp/sync.hpp
 104	0	src/concurrency/sync.cpp
 ```
+
+
+---
+
+# 附录 A · 第 2 天续做（2026-10-17）
+
+> 上文主体写于 2026-10-16，当时有 **4 项未做项**。本附录记录第 2 天的补齐情况，
+> 以及新增的架构图与「零影响」验证。**主体章节保留原样，作为当时的真实状态记录**，
+> 本附录才是当前状态。
+
+## A.1 四项未做项已全部完成
+
+| # | 未做项（原 §8） | 完成情况 | 提交 |
+|---|---|---|---|
+| 1 | 「枚举全部 G」接口 | `TaskSnapshot` + `Scheduler::DebugSnapshotTasks()`（按 16 分片逐个持锁遍历）；`dump scheduler` 的 `fibers` 段真正有数据，text/ini/json 三格式，默认仍为 `null` 保持兼容 | `77f566d` |
+| 2 | P2 的 `--follow` | `FollowEvents(collector, sink, interval, max_batches, overall_timeout)` + `--follow[=N]` / `--follow-interval` / `--follow-timeout`；逐事件输出 JSON 且每批 `fflush` | `84a3757` |
+| 3 | 事件采集线程局部批量发布 | `EventBuffer::PushBatch`（原子操作从 count 次降到 1 次）+ `OnEvent` 线程局部暂存满 32 条提交；`SetFlushBatch` 可对比 | `56e92e8`、`b0eb49b` |
+| 4 | 跨进程 dump | `DebugSignalDumper`（`SIGUSR1`）；**信号处理器只置原子标志**（async-signal-safe），真正 dump 在 `PollOnce`/watcher 线程 | `c2ed422` |
+
+`example/debug/debug_module_demo.cpp` 同步从 7 节扩到 **10 节**，覆盖上述全部新能力（`505ede5`）。
+
+## A.2 新增：每模块一张图（任务 2）
+
+原任务链交付的是 `modules/G1..G10-*.md`（约 178KB **文字**讲解）。使用者的实际要求是
+**每个模块一张图**，因此重建了 [`../ArchitectureDiagram/diagrams/`](../ArchitectureDiagram/diagrams/)：
+
+| 组 | 文件 | 行数 | Mermaid |
+|---|---|---:|---:|
+| **G0** | 总览：10 组如何拼成一次 `go()` | 163 | 4 |
+| G1 | 地基层（Fiber / Timer / ParkingCondition） | 308 | 5 |
+| G2 | **GMP 调度**（Task/Scheduler/P/M/worker_loop/sysmon） | 325 | 5 |
+| G3 | 取消与错误 | 218 | 5 |
+| G4 | 并发原语（Channel / Future / sync / WaitSelector） | 247 | 5 |
+| G5 | IO 后端 | 195 | 5 |
+| G6 | 网络基础 | 239 | 5 |
+| G7 | 应用协议（HTTP / WebSocket / SSE） | 269 | 6 |
+| G8 | 横切设施（log / config） | 246 | 5 |
+| G9 | 工具与新手层 | 249 | 5 |
+| G10 | **调试模块**（本次新增的 go2cpp::debug） | 315 | 6 |
+| | **合计 11 个文件** | **2774** | **56** |
+
+每张图固定四段，对应使用者的四点要求：① 类架构（每个类用了底层哪些能力 + 职责）
+② 重要函数的功能与实现（含真实现分支）③ 向上层提供了什么 ④ 状态流转/流程图。
+G2 里含使用者点名的 **G 完整状态机**（`kNew→kRunnable→kRunning→kWaiting/kRequeued→kDead/kFailed/kCancelled`，
+含「只有 5 个安全点可挂起」说明），G1 里含 **Fiber 状态机与栈变化图**。
+
+**核对**：文件 11/11 齐全、Mermaid 块 **56 个**经静态检查（图型合法、括号配对、stateDiagram 有转移、无全角引号）、
+三章节齐全、索引 11/11。
+
+## A.3 新增：「不影响原框架性能」的验证
+
+使用者明确要求「调试部分不怎么需要性能，但**必须保证不影响原来的模块性能**」。
+为此做了三件事，详见 [`zero-overhead-verification.md`](zero-overhead-verification.md)：
+
+1. **修掉一处真实残留开销**：`Mutex::Unlock` 慢路径在等待者 ≥2 时仍会加锁并拷贝 `shared_ptr`，
+   改为 `std::atomic<bool>` 二级快判，**未注册选择器时只读一次原子量**（`b8ff33d`）；
+2. **结构性保证 + 实证**：`grep` 确认框架**零处** `include` debug 头；并把源码树复制到 `/tmp`、
+   **剔除全部 debug 文件与 CMake 条目后，configure 与构建均成功** —— 即删掉整个 debug 模块框架照常编译；
+3. **对照组实测**（`main` 无 debug vs HEAD 含 debug 但不启用）：被改动的框架路径全部
+   **0.95~1.03x**（调度器扩展 w=1/2/4/8/12、spawn 开销、Fiber 计算并行、TimerService、Scheduler+Fiber）；
+   超过 10% 的只有**不含本次改动**的对照组（原生 `std::thread` 1.41x、基准自带 `BoundedQueue` 1.36x /
+   `NaiveQueue` 0.53x），且**方向不一致** → 判定为噪声，不能归因于 debug 模块。
+
+## A.4 当前状态
+
+| 项 | 值 |
+|---|---|
+| 分支 | `feature/gmp-debug-module` |
+| 提交数 | **33** |
+| 全量测试 | **ctest 80/80** |
+| 调试模块文件 | 7 个头文件、8 个测试、3 个基准、1 个示例（10 节） |
+| 架构图 | **11 个文件 / 2774 行 / 56 个 Mermaid** |
+| 对原框架改动 | `sync.hpp` +104、`sync.cpp` +104（纯新增）+ `scheduler` 侧只读接口 |
+
+## A.5 仍未解决的（不由调试模块引入）
+
+1. **调度器 3 worker 起数量级劣化**：已诊断并排除启动开销（任务数 ×40 而每任务耗时未下降），
+   但**未做 profiling**，具体机制未确认（见 `diag-worker-scaling.md`）；
+2. `sync::Mutex` 4 线程竞争约 18 µs/op（单线程无竞争 3.7 ns/op）；
+3. 一次默认参数基准运行超 15 分钟未结束，根因未定位。
+
+这三项在昨天就存在，第 2 天的改动**没有触及**它们，也没有变得更差或更好。
