@@ -138,6 +138,16 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_frame_test COMMAND go2cpp_frame_test)
     set_tests_properties(go2cpp_frame_test PROPERTIES TIMEOUT 180)
 
+    add_executable(go2cpp_stream_state_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_stream_state.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/stream_state.cpp)
+    target_include_directories(go2cpp_stream_state_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(go2cpp_stream_state_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_stream_state_test COMMAND go2cpp_stream_state_test)
+    set_tests_properties(go2cpp_stream_state_test PROPERTIES TIMEOUT 180)
+
     add_executable(go2cpp_config_registry_macro_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/test_config_registry_macro.cpp)
     target_link_libraries(go2cpp_config_registry_macro_test PRIVATE go2cpp_config)
