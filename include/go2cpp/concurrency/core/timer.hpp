@@ -341,12 +341,4 @@ private:
     friend class Timer;
 };
 
-/**
- * @brief 返回**当前线程** TimerBin 中缓存的 Timer::State 数量。
- * @details 仅用于诊断与测试：正常情况下这个数字反映对象池的复用情况，
- *          不应随定时器总量无界增长。跨线程归还时对象会落到归还线程的池，
- *          因此各线程看到的数值不同是预期行为。
- */
-std::size_t TimerStateBinSize() noexcept;
-
 }  // go2cpp::core 命名空间
