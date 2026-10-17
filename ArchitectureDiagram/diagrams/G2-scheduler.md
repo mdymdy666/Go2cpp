@@ -233,15 +233,11 @@ stateDiagram-v2
 
     kNew --> kRunnable : enqueue（本地队列或全局队列）
     kRunnable --> kRunning : worker_loop resume 该 Fiber
-    kRunning --> kRunnable : park_wait 返回 kRequeued
-（可立即继续，不进 park）
-    kRunning --> kWaiting : park_wait 返回 kParked
-（真正切换回 worker）
-    kWaiting --> kRunnable : Wake（pending-wake）
-或被取消后重新入队
+    kRunning --> kRunnable : park_wait 返回 kRequeued<br/>（可立即继续，不进 park）
+    kRunning --> kWaiting : park_wait 返回 kParked<br/>（真正切换回 worker）
+    kWaiting --> kRunnable : Wake（pending-wake）<br/>或被取消后重新入队
     kRunning --> kDead : 用户函数正常返回
-    kRunning --> kFailed : 用户函数抛出异常
-（在 Fiber 边界捕获）
+    kRunning --> kFailed : 用户函数抛出异常<br/>（在 Fiber 边界捕获）
     kNew --> kCancelled : 未运行即被取消
     kRunnable --> kCancelled : 排队期间被取消
     kWaiting --> kCancelled : 等待期间被取消
