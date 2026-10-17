@@ -54,6 +54,12 @@ int FutexWake(std::atomic<std::uint32_t>* word, int n) {
 
 namespace go2cpp::core {
 
+namespace {
+/// FUTEX_WAIT 前的自旋预算。
+/// 取较小值：只覆盖「唤醒已在路上」的窄窗口；过大则真需要睡眠时白烧 CPU。
+constexpr int kSpinBudget = 128;
+}  // namespace
+
 class ParkingCondition::WaitNode final {
 public:
     enum class Result { kWaiting, kNotified, kTimedOut, kCancelled };
@@ -157,6 +163,34 @@ public:
         for (;;) {
             if (result() != Result::kWaiting) {
                 break;
+            }
+            if (deadline && Clock::now() >= *deadline) {
+                (void)Finish(Result::kTimedOut);
+                break;
+            }
+            // 短暂自旋：无竞争时（唤醒就在眼前）完全避免 FUTEX_WAIT 系统调用。
+            // 这是 Go runtime / parking_lot 的标准做法，也是本实现在「等待者少」
+            // 场景下相对 condition_variable_any 唯一的劣势来源。
+            bool spun_through = false;
+            for (int spin = 0; spin < kSpinBudget; ++spin) {
+                if (result() != Result::kWaiting) {
+                    break;
+                }
+                if (owner->m_futex_seq.load(std::memory_order_acquire) != expected) {
+                    spun_through = true;
+                    break;
+                }
+                if (deadline && Clock::now() >= *deadline) {
+                    break;
+                }
+                std::atomic_signal_fence(std::memory_order_seq_cst);
+            }
+            if (result() != Result::kWaiting) {
+                break;
+            }
+            if (spun_through) {
+                expected = owner->m_futex_seq.load(std::memory_order_acquire);
+                continue;
             }
             if (deadline && Clock::now() >= *deadline) {
                 (void)Finish(Result::kTimedOut);
