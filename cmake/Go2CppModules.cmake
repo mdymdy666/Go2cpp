@@ -66,6 +66,19 @@ add_library(go2cpp_os
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/config.cpp)
 target_link_libraries(go2cpp_os PUBLIC go2cpp_config)
 
+# path 模块：Go `path`（POSIX 纯字符串）+ `path/filepath`（平台相关）。
+# 不依赖 os 模块 —— 边界清晰：os 不做路径规范化，path 不做文件读写。
+# path.cpp 零外部依赖；filepath.cpp 只用 libc 的 lstat/readlink/getcwd/opendir。
+add_library(go2cpp_path
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/path/path.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/path/filepath.cpp)
+
+# container 模块：Go `container/heap`、`container/list`、`container/ring`。
+# 三个容器都是 header-only 模板；container.cpp 只做头文件自包含检查，
+# 同时提供真实 library target，以复用项目按模块安装/导出的机制。
+add_library(go2cpp_container
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/container/container.cpp)
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GO2CPP_BUILD_HOOK)
     add_library(go2cpp_hook SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/network/hook.cpp)
 endif()
@@ -89,6 +102,8 @@ set_target_properties(go2cpp_log PROPERTIES EXPORT_NAME log)
 set_target_properties(go2cpp_config PROPERTIES EXPORT_NAME config)
 set_target_properties(go2cpp_math PROPERTIES EXPORT_NAME math)
 set_target_properties(go2cpp_rand PROPERTIES EXPORT_NAME rand)
+set_target_properties(go2cpp_path PROPERTIES EXPORT_NAME path)
+set_target_properties(go2cpp_container PROPERTIES EXPORT_NAME container)
 if (TARGET go2cpp_hook)
     set_target_properties(go2cpp_hook PROPERTIES EXPORT_NAME hook)
 endif()
@@ -112,6 +127,8 @@ add_library(go2cpp::config ALIAS go2cpp_config)
 add_library(go2cpp::os ALIAS go2cpp_os)
 add_library(go2cpp::math ALIAS go2cpp_math)
 add_library(go2cpp::rand ALIAS go2cpp_rand)
+add_library(go2cpp::path ALIAS go2cpp_path)
+add_library(go2cpp::container ALIAS go2cpp_container)
 if (TARGET go2cpp_hook)
     add_library(go2cpp::hook ALIAS go2cpp_hook)
 endif()
@@ -132,6 +149,8 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_os
     go2cpp_math
     go2cpp_rand
+    go2cpp_path
+    go2cpp_container
 )
 if (TARGET go2cpp_hook)
     list(APPEND GO2CPP_MODULE_TARGETS go2cpp_hook)
@@ -191,7 +210,7 @@ endif()
 target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_error go2cpp_control_flow go2cpp_context go2cpp_channel go2cpp_scheduler
     go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io go2cpp_network go2cpp_log go2cpp_config
-    go2cpp_math go2cpp_rand
+    go2cpp_math go2cpp_rand go2cpp_path go2cpp_container
     Threads::Threads)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_runtime INTERFACE go2cpp_hook)

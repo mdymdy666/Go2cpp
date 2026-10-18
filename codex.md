@@ -9181,3 +9181,51 @@ ctest --test-dir build-quality --output-on-failure
   修复前为 7 个失败断言。
 - 全量 ctest：**104/104 通过**；TSan 复跑：regression/connection/stream_state/
   http2_stress/state_matrix 0 报告，http2_state_matrix 仅剩 1 条故意的双线程探针。
+
+## 2026-10-18 path 模块（Go `path` / `path/filepath`）
+
+### 改动内容
+
+- 新增 `include/go2cpp/path/{path,filepath}.hpp`、`src/path/{path.cpp,filepath.cpp,match_impl.hpp}`；
+- 新增 `tests/path/`：
+  - `test_path.cpp`：Go `path_test.go`/`match_test.go` 全量语义表 + 20 万随机属性
+    + 1 万条 Go 对拍 + `Join`/`Clean`/`Match` 各 100 万次压测；
+  - `test_path_filepath.cpp`：`Abs`/`Rel`/`Walk`/`Glob`/`EvalSymlinks` 的 7 个真实场景；
+  - `oracle/clean_oracle.go`（Go oracle）、`scripts/cross_check.py`（1 万条对拍脚本）、
+    `testdata/go_path_clean_10000.txt`（Go `path.Clean` 结果，供 ctest 离线复验）。
+- 注册 `go2cpp_path` 到 `cmake/Go2CppModules.cmake`（EXPORT_NAME/alias/模块清单/runtime 接口）
+  与两个 ctest 目标到 `cmake/Go2CppTests.cmake`。
+
+### 实现来源与边界
+
+- 逐函数移植 Go 1.27.1 `src/path/path.go`、`src/path/match.go`、
+  `src/path/filepath/{path,match,symlink}.go`（BSD-3-Clause）；保留 lazybuf 零分配策略、
+  Rel 逐段对齐、Walk 的 SkipDir/SkipAll 传播、EvalSymlinks 255 层上限、Glob 10000 层上限；
+- **未改 `os` 模块**；`path` 不做文件系统操作，`Filepath` 只用 libc，不依赖 os/config；
+- Windows 分支（`#ifdef _WIN32`：反斜杠/盘符/UNC）按 Go 文档编写，**未在 Windows 真机验证**。
+
+### 测试结果（实测）
+
+```sh
+cd /UserData/CodexWorkSpace/Go2Cpp
+flock /tmp/go2cpp_build.lock cmake -S . -B build-quality     # CMake Error 0
+flock /tmp/go2cpp_build.lock cmake --build build-quality -j 12  # 全量成功，0 warning/0 error
+python3 tests/path/scripts/cross_check.py                    # 本模块 vs Go 0 不一致
+./build-quality/go2cpp_path_test                             # all checks passed
+./build-quality/go2cpp_path_filepath_test                    # all checks passed
+ctest --test-dir build-quality --output-on-failure           # 107/107 passed
+```
+
+- Go 对拍：10000 条（种子 20261018，含 `..`/`.`/重复分隔符/空段/超长段/非 ASCII/反斜杠），
+  **本模块 vs Go `path.Clean` 不一致 0 条**；Python `posixpath.normpath` vs Go
+  仅 884 条「恰好两个前导斜杠」的已知 POSIX 差异，其它 0 条；
+- 压测（Release/-O2，AMD Ryzen 9 8945HX，WSL2，g++ 13.3.0，各 100 万次）：
+  `Join` 18.18 Mops/s、`Clean` 26.49 Mops/s、`Match` 47.15 Mops/s；
+- ASan+UBSan 下两个测试均通过（随机 20 万 + 压测 300 万次）；
+- 全量 ctest 107/107（含并发新增的 container 测试）；`go2cpp_path_*` 两个测试在列。
+
+### 后续 / 未做
+
+- Windows 分支未真机验证；
+- 未实现 `filepath.SplitList`/`VolumeName`/`ToSlash`/`FromSlash`/`IsLocal`/`Localize`/`WalkDir`；
+- 未更新 `docs/NEXT-STEPS.md` 里 os 缺口表的「路径规范化」一行（留待文档维护统一处理）。

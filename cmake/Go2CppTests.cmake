@@ -370,6 +370,46 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_rand_test COMMAND go2cpp_rand_test)
     set_tests_properties(go2cpp_rand_test PROPERTIES TIMEOUT 300)
 
+    # ---- path / path/filepath 模块 ----
+    # path 是纯字符串模块，测试不拖入 runtime；filepath 测试走真实文件系统。
+    # 对拍数据由 tests/path/scripts/cross_check.py 生成（Go path.Clean 为 oracle），
+    # 平时 ctest 只读数据文件，不依赖本机安装 Go。
+    add_executable(go2cpp_path_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/path/test_path.cpp)
+    target_link_libraries(go2cpp_path_test PRIVATE go2cpp_path)
+    target_compile_definitions(go2cpp_path_test PRIVATE
+        GO2CPP_PATH_TESTDATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/path/testdata")
+    target_compile_options(go2cpp_path_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_path_test COMMAND go2cpp_path_test)
+    set_tests_properties(go2cpp_path_test PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_path_filepath_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/path/test_path_filepath.cpp)
+    target_link_libraries(go2cpp_path_filepath_test PRIVATE go2cpp_path)
+    target_compile_options(go2cpp_path_filepath_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_path_filepath_test COMMAND go2cpp_path_filepath_test)
+    set_tests_properties(go2cpp_path_filepath_test PROPERTIES TIMEOUT 300)
+
+    # ---- container 模块：Heap / List / Ring ----
+    # 纯模板容器，测试直接编译头文件；含单元、随机、6 个真实场景与 1M 规模压测。
+    add_executable(go2cpp_container_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/container/container_test_main.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/container/test_heap.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/container/test_list.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/container/test_ring.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/container/test_random.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/container/test_scenarios.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/container/test_stress.cpp)
+    target_include_directories(go2cpp_container_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(go2cpp_container_test PRIVATE go2cpp_container)
+    target_compile_options(go2cpp_container_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_container_test COMMAND go2cpp_container_test)
+    set_tests_properties(go2cpp_container_test PROPERTIES TIMEOUT 300)
+
     add_executable(go2cpp_config_registry_macro_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/test_config_registry_macro.cpp)
     target_link_libraries(go2cpp_config_registry_macro_test PRIVATE go2cpp_config)
