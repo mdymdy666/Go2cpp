@@ -178,6 +178,13 @@ if (TARGET go2cpp_hook)
     add_library(go2cpp::hook ALIAS go2cpp_hook)
 endif()
 
+# metrics 模块：Counter / Gauge / Histogram + Prometheus 文本导出。
+# 并发安全：Counter/Gauge 用 atomic，Histogram 每桶一个 atomic。
+# 无外部依赖；Render() 输出符合 Prometheus 文本格式（已用 prometheus_client 验证）。
+add_library(go2cpp_metrics src/metrics/metrics.cpp)
+set_target_properties(go2cpp_metrics PROPERTIES EXPORT_NAME metrics)
+add_library(go2cpp::metrics ALIAS go2cpp_metrics)
+
 set(GO2CPP_MODULE_TARGETS
     go2cpp_error
     go2cpp_control_flow
@@ -199,6 +206,7 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_compress
     go2cpp_encoding
     go2cpp_hash
+    go2cpp_metrics
 )
 if (TARGET go2cpp_hook)
     list(APPEND GO2CPP_MODULE_TARGETS go2cpp_hook)
@@ -259,7 +267,9 @@ target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_error go2cpp_control_flow go2cpp_context go2cpp_channel go2cpp_scheduler
     go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io go2cpp_network go2cpp_log go2cpp_config
     go2cpp_math go2cpp_rand go2cpp_path go2cpp_container go2cpp_compress go2cpp_encoding go2cpp_hash
-    Threads::Threads)
+    Threads::Threads
+    go2cpp_metrics
+)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_runtime INTERFACE go2cpp_hook)
     # An interposer provides symbols through libc calls, not explicit API
@@ -351,6 +361,7 @@ endif()
 
 # bufio 模块：带缓冲的 IO（Reader/Writer/Scanner，语义对齐 Go 的 bufio 包）。
 add_library(go2cpp_bufio src/bufio/bufio.cpp)
+
 target_link_libraries(go2cpp_bufio PUBLIC go2cpp_error)
 set_target_properties(go2cpp_bufio PROPERTIES EXPORT_NAME bufio)
 add_library(go2cpp::bufio ALIAS go2cpp_bufio)

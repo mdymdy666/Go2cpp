@@ -486,6 +486,18 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_hash_test COMMAND go2cpp_hash_test)
     set_tests_properties(go2cpp_hash_test PROPERTIES TIMEOUT 300)
 
+    # ---- metrics 模块：Counter / Gauge / Histogram + Prometheus 导出 ----
+    add_executable(go2cpp_metrics_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/metrics/test_metrics.cpp)
+    target_link_libraries(go2cpp_metrics_test PRIVATE
+        go2cpp_metrics go2cpp_runtime)
+    target_include_directories(go2cpp_metrics_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(go2cpp_metrics_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_metrics_test COMMAND go2cpp_metrics_test)
+    set_tests_properties(go2cpp_metrics_test PROPERTIES TIMEOUT 300)
+
     set_tests_properties(go2cpp_high_load_stress PROPERTIES TIMEOUT 180)
 endif()
 

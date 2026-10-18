@@ -1,0 +1,988 @@
+/**
+ * @file metrics.cpp
+ * @brief `go2cpp::metrics` 的实现：原子计数、标签缓存、直方图与文本导出。
+ *
+ * 设计约束：
+ *   - Counter 的 `Inc` 必须是单条 `lock xadd`，不能用互斥锁或非原子自增；
+ *   - Histogram 的每个桶也必须是原子计数，`Sum` 用位模式 CAS 维护；
+ *   - 标签子指标存放在根对象的 `std::map` 中，引用稳定、按标签缓存；
+ *   - 渲染时先把元数据与序列拼进一个 `std::string`，避免调用方逐行加锁。
+ */
+#include "go2cpp/metrics/metrics.hpp"
+
+#include <algorithm>
+#include <charconv>
+#include <cctype>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <utility>
+
+namespace go2cpp {
+namespace metrics {
+
+namespace {
+
+constexpr double kPosInf = std::numeric_limits<double>::infinity();
+constexpr double kNegInf = -std::numeric_limits<double>::infinity();
+constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+
+bool IsValidMetricName(std::string_view name) {
+    if (name.empty()) {
+        return false;
+    }
+    const auto first = static_cast<unsigned char>(name.front());
+    if (!(std::isalpha(first) || first == '_' || first == ':')) {
+        return false;
+    }
+    for (const char ch : name) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (!(std::isalnum(c) || c == '_' || c == ':')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsValidLabelName(std::string_view name) {
+    if (name.empty()) {
+        return false;
+    }
+    const auto first = static_cast<unsigned char>(name.front());
+    if (!(std::isalpha(first) || first == '_')) {
+        return false;
+    }
+    for (const char ch : name) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (!(std::isalnum(c) || c == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ValidateMetricName(const std::string& name) {
+    if (!IsValidMetricName(name)) {
+        throw std::invalid_argument(
+            "go2cpp::metrics: invalid metric name: \"" + name + "\"");
+    }
+}
+
+void ValidateHelp(const std::string& help) {
+    for (const char ch : help) {
+        if (ch == '\0' || ch == '\r') {
+            throw std::invalid_argument(
+                "go2cpp::metrics: help text contains NUL or CR");
+        }
+    }
+}
+
+void ValidateLabelValues(const std::vector<std::string>& values) {
+    for (const auto& value : values) {
+        for (const char ch : value) {
+            const auto c = static_cast<unsigned char>(ch);
+            if (ch == '\0' || ch == '\r' || (c < 0x20 && ch != '\n')) {
+                throw std::invalid_argument(
+                    "go2cpp::metrics: label value contains an unsupported "
+                    "control character");
+            }
+        }
+    }
+}
+
+void ValidateLabelNames(const std::vector<std::string>& names,
+                        bool histogram) {
+    std::set<std::string> seen;
+    for (const auto& name : names) {
+        if (!IsValidLabelName(name)) {
+            throw std::invalid_argument(
+                "go2cpp::metrics: invalid label name: \"" + name + "\"");
+        }
+        if (name.size() >= 2 && name[0] == '_' && name[1] == '_') {
+            throw std::invalid_argument(
+                "go2cpp::metrics: label names beginning with \"__\" are "
+                "reserved: \"" + name + "\"");
+        }
+        if (histogram && name == "le") {
+            throw std::invalid_argument(
+                "go2cpp::metrics: histogram label name \"le\" is reserved");
+        }
+        if (!seen.insert(name).second) {
+            throw std::invalid_argument(
+                "go2cpp::metrics: duplicate label name: \"" + name + "\"");
+        }
+    }
+}
+
+void ValidateBuckets(const std::vector<double>& buckets) {
+    if (buckets.empty()) {
+        throw std::invalid_argument(
+            "go2cpp::metrics: histogram requires at least one bucket bound");
+    }
+    for (std::size_t i = 0; i < buckets.size(); ++i) {
+        if (!std::isfinite(buckets[i])) {
+            throw std::invalid_argument(
+                "go2cpp::metrics: histogram bucket bounds must be finite");
+        }
+        if (i != 0 && !(buckets[i] > buckets[i - 1])) {
+            throw std::invalid_argument(
+                "go2cpp::metrics: histogram bucket bounds must be strictly "
+                "increasing");
+        }
+    }
+}
+
+detail::MetricInfo MakeInfo(std::string name, std::string help,
+                            MetricType type,
+                            std::vector<std::string> label_names,
+                            bool validate_name) {
+    if (validate_name) {
+        ValidateMetricName(name);
+        ValidateHelp(help);
+        ValidateLabelNames(label_names, type == MetricType::kHistogram);
+    }
+    return detail::MetricInfo{std::move(name), std::move(help), type,
+                              std::move(label_names)};
+}
+
+detail::MetricInfo StandaloneInfo(MetricType type,
+                                  std::vector<std::string> label_names) {
+    ValidateLabelNames(label_names, type == MetricType::kHistogram);
+    return detail::MetricInfo{"", "", type, std::move(label_names)};
+}
+
+// 标签缓存的键必须无歧义：只用分隔符无法区分 {"a,b"} 与 {"a","b"}。
+// 这里对每个值做长度前缀（"3:GET2:/x"），值里出现任何字节都不会串键。
+std::string EncodeLabelValues(const std::vector<std::string>& values) {
+    std::string key;
+    for (const auto& value : values) {
+        key.append(std::to_string(value.size()));
+        key.push_back(':');
+        key.append(value);
+    }
+    return key;
+}
+
+std::string FormatDouble(double value) {
+    if (std::isnan(value)) {
+        return "NaN";
+    }
+    if (std::isinf(value)) {
+        return value > 0.0 ? "+Inf" : "-Inf";
+    }
+    char buffer[64];
+    const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value,
+                                      std::chars_format::general);
+    if (result.ec != std::errc{}) {
+        return "0";
+    }
+    return std::string(buffer, result.ptr);
+}
+
+std::string FormatUint(std::uint64_t value) {
+    char buffer[32];
+    const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value);
+    if (result.ec != std::errc{}) {
+        return "0";
+    }
+    return std::string(buffer, result.ptr);
+}
+
+void AppendEscapedLabelValue(std::string& out, std::string_view value) {
+    out.push_back('"');
+    for (const char ch : value) {
+        switch (ch) {
+            case '\\':
+                out.append("\\\\");
+                break;
+            case '"':
+                out.append("\\\"");
+                break;
+            case '\n':
+                out.append("\\n");
+                break;
+            default:
+                out.push_back(ch);
+                break;
+        }
+    }
+    out.push_back('"');
+}
+
+void AppendEscapedHelp(std::string& out, std::string_view help) {
+    for (const char ch : help) {
+        switch (ch) {
+            case '\\':
+                out.append("\\\\");
+                break;
+            case '\n':
+                out.append("\\n");
+                break;
+            default:
+                out.push_back(ch);
+                break;
+        }
+    }
+}
+
+void AppendHeader(std::string& out, const detail::MetricInfo& info) {
+    out.append("# HELP ");
+    out.append(info.name);
+    out.push_back(' ');
+    AppendEscapedHelp(out, info.help);
+    out.push_back('\n');
+    out.append("# TYPE ");
+    out.append(info.name);
+    out.push_back(' ');
+    out.append(MetricTypeName(info.type));
+    out.push_back('\n');
+}
+
+void AppendSample(std::string& out, std::string_view name,
+                  const std::vector<std::string>& label_names,
+                  const std::vector<std::string>& label_values,
+                  std::string_view value, std::string_view extra_name = {},
+                  std::string_view extra_value = {}) {
+    out.append(name.data(), name.size());
+    if (!label_names.empty() || !extra_name.empty()) {
+        out.push_back('{');
+        bool first = true;
+        for (std::size_t i = 0; i < label_names.size(); ++i) {
+            if (!first) {
+                out.push_back(',');
+            }
+            first = false;
+            out.append(label_names[i]);
+            out.push_back('=');
+            AppendEscapedLabelValue(out, label_values[i]);
+        }
+        if (!extra_name.empty()) {
+            if (!first) {
+                out.push_back(',');
+            }
+            out.append(extra_name.data(), extra_name.size());
+            out.push_back('=');
+            AppendEscapedLabelValue(out, extra_value);
+        }
+        out.push_back('}');
+    }
+    out.push_back(' ');
+    out.append(value.data(), value.size());
+    out.push_back('\n');
+}
+
+// 用位模式保存 double，绕开 C++17 没有 atomic<double>::fetch_add 的限制，
+// 同时避免 NaN != NaN 让 compare_exchange 永远失败。
+static_assert(sizeof(double) == sizeof(std::uint64_t),
+              "metrics requires 64-bit IEEE-754 double");
+
+double BitsToDouble(std::uint64_t bits) noexcept {
+    double value = 0.0;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+std::uint64_t DoubleToBits(double value) noexcept {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+double LoadDouble(const std::atomic<std::uint64_t>& bits) noexcept {
+    return BitsToDouble(bits.load(std::memory_order_relaxed));
+}
+
+void StoreDouble(std::atomic<std::uint64_t>& bits, double value) noexcept {
+    bits.store(DoubleToBits(value), std::memory_order_relaxed);
+}
+
+void AddDouble(std::atomic<std::uint64_t>& bits, double delta) noexcept {
+    if (delta == 0.0) {
+        return;
+    }
+    std::uint64_t expected = bits.load(std::memory_order_relaxed);
+    for (;;) {
+        const double next = BitsToDouble(expected) + delta;
+        const std::uint64_t desired = DoubleToBits(next);
+        if (bits.compare_exchange_weak(expected, desired,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+std::size_t BucketIndex(const std::vector<double>& boundaries, double value) {
+    return static_cast<std::size_t>(
+        std::lower_bound(boundaries.begin(), boundaries.end(), value) -
+        boundaries.begin());
+}
+
+// Prometheus 客户端的默认延迟桶（秒）。Registry 与独立 Histogram 共用同一份
+// 定义，避免两处字面量漂移导致“默认桶不一致”的注册冲突。
+std::vector<double> DefaultHistogramBuckets() {
+    // 前 13 个是 Prometheus 客户端惯用的延迟桶（秒）；后面向上扩展到
+    // 10000，覆盖毫秒/秒级数值以及通用的 1..1000 数据，避免默认直方图
+    // 把大值全部塞进 +Inf 桶后失去分位数的分辨能力。
+    return {0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+            0.5,   1.0,    2.5,   5.0,  10.0,  25.0, 50.0, 100.0,
+            250.0, 500.0,  1000.0, 2500.0, 5000.0, 10000.0};
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Counter
+// ---------------------------------------------------------------------------
+
+struct Counter::Family {
+    detail::MetricInfo info;
+    mutable std::mutex mutex;
+    std::map<std::string, std::unique_ptr<Counter>> children;
+};
+
+std::unique_ptr<Counter::Family> Counter::CreateFamily(
+    detail::MetricInfo info) {
+    auto family = std::unique_ptr<Family>(new Family());
+    family->info = std::move(info);
+    return family;
+}
+
+Counter::Counter()
+    : Counter(CreateFamily(
+          StandaloneInfo(MetricType::kCounter, {}))) {}
+
+Counter::Counter(std::vector<std::string> label_names)
+    : Counter(CreateFamily(
+          StandaloneInfo(MetricType::kCounter, std::move(label_names)))) {}
+
+Counter::Counter(std::unique_ptr<Family> family)
+    : Metric(&family->info),
+      m_owned_family(std::move(family)),
+      m_family(m_owned_family.get()),
+      m_is_root(true) {}
+
+Counter::Counter(Family* family, std::vector<std::string> label_values)
+    : Metric(&family->info),
+      m_family(family),
+      m_label_values(std::move(label_values)),
+      m_is_root(false) {}
+
+Counter::~Counter() = default;
+
+void Counter::EnsureSeries(const char* operation) const {
+    if (m_is_root && !m_family->info.label_names.empty()) {
+        throw std::logic_error(
+            std::string("go2cpp::metrics::Counter::") + operation +
+            " on a labeled metric family requires With({...})");
+    }
+}
+
+void Counter::Inc() {
+    Add(1);
+}
+
+void Counter::Add(std::uint64_t n) {
+    EnsureSeries("Add");
+    // 计数场景不需要与其他内存操作同步；relaxed 的 RMW 仍然保证
+    // 每次 fetch_add 都是原子的，终值精确等于所有增量之和。
+    m_value.fetch_add(n, std::memory_order_relaxed);
+}
+
+std::uint64_t Counter::Value() const {
+    EnsureSeries("Value");
+    return m_value.load(std::memory_order_relaxed);
+}
+
+Counter& Counter::With(std::initializer_list<std::string_view> labels) {
+    std::vector<std::string> values;
+    values.reserve(labels.size());
+    for (const auto label : labels) {
+        values.emplace_back(label);
+    }
+    return With(values);
+}
+
+Counter& Counter::With(const std::vector<std::string>& labels) {
+    ValidateLabelValues(labels);
+    if (!m_is_root) {
+        if (labels != m_label_values) {
+            throw std::invalid_argument(
+                "go2cpp::metrics::Counter::With: child metric only accepts "
+                "its own label values");
+        }
+        return *this;
+    }
+
+    const auto& names = m_family->info.label_names;
+    if (labels.size() != names.size()) {
+        throw std::invalid_argument(
+            "go2cpp::metrics::Counter::With: expected " +
+            std::to_string(names.size()) + " label values, got " +
+            std::to_string(labels.size()));
+    }
+    if (names.empty()) {
+        return *this;
+    }
+
+    const std::string key = EncodeLabelValues(labels);
+    std::lock_guard<std::mutex> lock(m_family->mutex);
+    const auto found = m_family->children.find(key);
+    if (found != m_family->children.end()) {
+        return *found->second;
+    }
+    auto child = std::unique_ptr<Counter>(new Counter(m_family, labels));
+    Counter* raw = child.get();
+    m_family->children.emplace(key, std::move(child));
+    return *raw;
+}
+
+std::size_t Counter::SeriesCount() const {
+    if (!m_is_root) {
+        return 1;
+    }
+    if (m_family->info.label_names.empty()) {
+        return 1;
+    }
+    std::lock_guard<std::mutex> lock(m_family->mutex);
+    return m_family->children.size();
+}
+
+void Counter::AppendPrometheus(std::string& out) const {
+    AppendHeader(out, m_family->info);
+    if (!m_is_root) {
+        AppendSample(out, m_family->info.name, m_family->info.label_names,
+                     m_label_values, FormatUint(Value()));
+        return;
+    }
+    if (m_family->info.label_names.empty()) {
+        AppendSample(out, m_family->info.name, m_family->info.label_names,
+                     m_label_values, FormatUint(Value()));
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_family->mutex);
+    for (const auto& entry : m_family->children) {
+        const Counter& child = *entry.second;
+        AppendSample(out, m_family->info.name, m_family->info.label_names,
+                     child.m_label_values, FormatUint(child.m_value.load(
+                                               std::memory_order_relaxed)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gauge
+// ---------------------------------------------------------------------------
+
+struct Gauge::Family {
+    detail::MetricInfo info;
+    mutable std::mutex mutex;
+    std::map<std::string, std::unique_ptr<Gauge>> children;
+};
+
+std::unique_ptr<Gauge::Family> Gauge::CreateFamily(detail::MetricInfo info) {
+    auto family = std::unique_ptr<Family>(new Family());
+    family->info = std::move(info);
+    return family;
+}
+
+Gauge::Gauge()
+    : Gauge(CreateFamily(StandaloneInfo(MetricType::kGauge, {}))) {}
+
+Gauge::Gauge(std::vector<std::string> label_names)
+    : Gauge(CreateFamily(
+          StandaloneInfo(MetricType::kGauge, std::move(label_names)))) {}
+
+Gauge::Gauge(std::unique_ptr<Family> family)
+    : Metric(&family->info),
+      m_owned_family(std::move(family)),
+      m_family(m_owned_family.get()),
+      m_is_root(true) {}
+
+Gauge::Gauge(Family* family, std::vector<std::string> label_values)
+    : Metric(&family->info),
+      m_family(family),
+      m_label_values(std::move(label_values)),
+      m_is_root(false) {}
+
+Gauge::~Gauge() = default;
+
+void Gauge::EnsureSeries(const char* operation) const {
+    if (m_is_root && !m_family->info.label_names.empty()) {
+        throw std::logic_error(
+            std::string("go2cpp::metrics::Gauge::") + operation +
+            " on a labeled metric family requires With({...})");
+    }
+}
+
+void Gauge::Set(double value) {
+    EnsureSeries("Set");
+    StoreDouble(m_bits, value);
+}
+
+void Gauge::Inc() {
+    Add(1.0);
+}
+
+void Gauge::Dec() {
+    Add(-1.0);
+}
+
+void Gauge::Add(double delta) {
+    EnsureSeries("Add");
+    AddDouble(m_bits, delta);
+}
+
+double Gauge::Value() const {
+    EnsureSeries("Value");
+    return LoadDouble(m_bits);
+}
+
+Gauge& Gauge::With(std::initializer_list<std::string_view> labels) {
+    std::vector<std::string> values;
+    values.reserve(labels.size());
+    for (const auto label : labels) {
+        values.emplace_back(label);
+    }
+    return With(values);
+}
+
+Gauge& Gauge::With(const std::vector<std::string>& labels) {
+    ValidateLabelValues(labels);
+    if (!m_is_root) {
+        if (labels != m_label_values) {
+            throw std::invalid_argument(
+                "go2cpp::metrics::Gauge::With: child metric only accepts its "
+                "own label values");
+        }
+        return *this;
+    }
+
+    const auto& names = m_family->info.label_names;
+    if (labels.size() != names.size()) {
+        throw std::invalid_argument(
+            "go2cpp::metrics::Gauge::With: expected " +
+            std::to_string(names.size()) + " label values, got " +
+            std::to_string(labels.size()));
+    }
+    if (names.empty()) {
+        return *this;
+    }
+
+    const std::string key = EncodeLabelValues(labels);
+    std::lock_guard<std::mutex> lock(m_family->mutex);
+    const auto found = m_family->children.find(key);
+    if (found != m_family->children.end()) {
+        return *found->second;
+    }
+    auto child = std::unique_ptr<Gauge>(new Gauge(m_family, labels));
+    Gauge* raw = child.get();
+    m_family->children.emplace(key, std::move(child));
+    return *raw;
+}
+
+std::size_t Gauge::SeriesCount() const {
+    if (!m_is_root) {
+        return 1;
+    }
+    if (m_family->info.label_names.empty()) {
+        return 1;
+    }
+    std::lock_guard<std::mutex> lock(m_family->mutex);
+    return m_family->children.size();
+}
+
+void Gauge::AppendPrometheus(std::string& out) const {
+    AppendHeader(out, m_family->info);
+    if (!m_is_root) {
+        AppendSample(out, m_family->info.name, m_family->info.label_names,
+                     m_label_values, FormatDouble(Value()));
+        return;
+    }
+    if (m_family->info.label_names.empty()) {
+        AppendSample(out, m_family->info.name, m_family->info.label_names,
+                     m_label_values, FormatDouble(Value()));
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_family->mutex);
+    for (const auto& entry : m_family->children) {
+        const Gauge& child = *entry.second;
+        AppendSample(out, m_family->info.name, m_family->info.label_names,
+                     child.m_label_values,
+                     FormatDouble(LoadDouble(child.m_bits)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Histogram
+// ---------------------------------------------------------------------------
+
+struct Histogram::Family {
+    detail::MetricInfo info;
+    std::vector<double> boundaries;
+    mutable std::mutex mutex;
+    std::map<std::string, std::unique_ptr<Histogram>> children;
+};
+
+std::unique_ptr<Histogram::Family> Histogram::CreateFamily(
+    detail::MetricInfo info, std::vector<double> buckets) {
+    ValidateBuckets(buckets);
+    auto family = std::unique_ptr<Family>(new Family());
+    family->info = std::move(info);
+    family->boundaries = std::move(buckets);
+    return family;
+}
+
+Histogram::Histogram()
+    : Histogram(CreateFamily(
+          StandaloneInfo(MetricType::kHistogram, {}),
+          DefaultHistogramBuckets())) {}
+
+Histogram::Histogram(std::vector<double> buckets)
+    : Histogram(CreateFamily(
+          StandaloneInfo(MetricType::kHistogram, {}), std::move(buckets))) {}
+
+Histogram::Histogram(std::vector<double> buckets,
+                     std::vector<std::string> label_names)
+    : Histogram(CreateFamily(
+          StandaloneInfo(MetricType::kHistogram, std::move(label_names)),
+          std::move(buckets))) {}
+
+Histogram::Histogram(std::unique_ptr<Family> family)
+    : Metric(&family->info),
+      m_owned_family(std::move(family)),
+      m_family(m_owned_family.get()),
+      m_is_root(true) {
+    InitBuckets();
+}
+
+Histogram::Histogram(Family* family, std::vector<std::string> label_values)
+    : Metric(&family->info),
+      m_family(family),
+      m_label_values(std::move(label_values)),
+      m_is_root(false) {
+    InitBuckets();
+}
+
+Histogram::~Histogram() = default;
+
+void Histogram::InitBuckets() {
+    m_bucket_count = m_family->boundaries.size() + 1;
+    m_bucket_counts.reset(
+        new std::atomic<std::uint64_t>[m_bucket_count]);
+    for (std::size_t i = 0; i < m_bucket_count; ++i) {
+        m_bucket_counts[i].store(0, std::memory_order_relaxed);
+    }
+}
+
+void Histogram::EnsureSeries(const char* operation) const {
+    if (m_is_root && !m_family->info.label_names.empty()) {
+        throw std::logic_error(
+            std::string("go2cpp::metrics::Histogram::") + operation +
+            " on a labeled metric family requires With({...})");
+    }
+}
+
+void Histogram::Observe(double value) {
+    EnsureSeries("Observe");
+    if (std::isnan(value)) {
+        // NaN 会污染 Sum 与分位数；Prometheus 客户端同样忽略 NaN 观测。
+        return;
+    }
+    const std::size_t index = BucketIndex(m_family->boundaries, value);
+    m_bucket_counts[index].fetch_add(1, std::memory_order_relaxed);
+    AddDouble(m_sum_bits, value);
+    m_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t Histogram::Count() const {
+    EnsureSeries("Count");
+    return m_count.load(std::memory_order_relaxed);
+}
+
+double Histogram::Sum() const {
+    EnsureSeries("Sum");
+    return LoadDouble(m_sum_bits);
+}
+
+const std::vector<double>& Histogram::Buckets() const {
+    return m_family->boundaries;
+}
+
+std::vector<std::uint64_t> Histogram::CumulativeBucketCounts() const {
+    EnsureSeries("CumulativeBucketCounts");
+    std::vector<std::uint64_t> result(m_bucket_count, 0);
+    std::uint64_t running = 0;
+    for (std::size_t i = 0; i < m_bucket_count; ++i) {
+        running += m_bucket_counts[i].load(std::memory_order_relaxed);
+        result[i] = running;
+    }
+    return result;
+}
+
+double Histogram::Quantile(double q) const {
+    EnsureSeries("Quantile");
+    if (std::isnan(q)) {
+        return kNaN;
+    }
+    if (q < 0.0) {
+        return kNegInf;
+    }
+    if (q > 1.0) {
+        return kPosInf;
+    }
+
+    const std::uint64_t total = m_count.load(std::memory_order_relaxed);
+    if (total == 0) {
+        return kNaN;
+    }
+
+    const auto cumulative = CumulativeBucketCounts();
+    const double rank = q * static_cast<double>(total);
+    std::size_t index = 0;
+    while (index < m_bucket_count &&
+           static_cast<double>(cumulative[index]) < rank) {
+        ++index;
+    }
+    if (index >= m_bucket_count) {
+        index = m_bucket_count - 1;
+    }
+
+    // 目标落在隐式 +Inf 桶：Prometheus 的经典行为是返回最后一个有限上界。
+    if (index == m_bucket_count - 1) {
+        return m_family->boundaries.back();
+    }
+
+    const double upper = m_family->boundaries[index];
+    // Prometheus 假设第一个桶的下界是 0；若桶上界本身为负，则退化为该上界，
+    // 避免出现 lower > upper 的负宽度插值。
+    const double lower =
+        index == 0 ? std::min(0.0, upper) : m_family->boundaries[index - 1];
+    const std::uint64_t prior = index == 0 ? 0 : cumulative[index - 1];
+    const std::uint64_t bucket_count = cumulative[index] - prior;
+    if (bucket_count == 0) {
+        return lower;
+    }
+    const double fraction =
+        (rank - static_cast<double>(prior)) /
+        static_cast<double>(bucket_count);
+    return lower + fraction * (upper - lower);
+}
+
+Histogram& Histogram::With(
+    std::initializer_list<std::string_view> labels) {
+    std::vector<std::string> values;
+    values.reserve(labels.size());
+    for (const auto label : labels) {
+        values.emplace_back(label);
+    }
+    return With(values);
+}
+
+Histogram& Histogram::With(const std::vector<std::string>& labels) {
+    ValidateLabelValues(labels);
+    if (!m_is_root) {
+        if (labels != m_label_values) {
+            throw std::invalid_argument(
+                "go2cpp::metrics::Histogram::With: child metric only accepts "
+                "its own label values");
+        }
+        return *this;
+    }
+
+    const auto& names = m_family->info.label_names;
+    if (labels.size() != names.size()) {
+        throw std::invalid_argument(
+            "go2cpp::metrics::Histogram::With: expected " +
+            std::to_string(names.size()) + " label values, got " +
+            std::to_string(labels.size()));
+    }
+    if (names.empty()) {
+        return *this;
+    }
+
+    const std::string key = EncodeLabelValues(labels);
+    std::lock_guard<std::mutex> lock(m_family->mutex);
+    const auto found = m_family->children.find(key);
+    if (found != m_family->children.end()) {
+        return *found->second;
+    }
+    auto child = std::unique_ptr<Histogram>(new Histogram(m_family, labels));
+    Histogram* raw = child.get();
+    m_family->children.emplace(key, std::move(child));
+    return *raw;
+}
+
+std::size_t Histogram::SeriesCount() const {
+    if (!m_is_root) {
+        return 1;
+    }
+    if (m_family->info.label_names.empty()) {
+        return 1;
+    }
+    std::lock_guard<std::mutex> lock(m_family->mutex);
+    return m_family->children.size();
+}
+
+void Histogram::AppendPrometheus(std::string& out) const {
+    AppendHeader(out, m_family->info);
+
+    const auto append_series = [&out, this](const Histogram& series) {
+        const auto cumulative = series.CumulativeBucketCounts();
+        const std::string bucket_name = m_family->info.name + "_bucket";
+        for (std::size_t i = 0; i < cumulative.size() - 1; ++i) {
+            AppendSample(out, bucket_name, m_family->info.label_names,
+                         series.m_label_values, FormatUint(cumulative[i]),
+                         "le", FormatDouble(m_family->boundaries[i]));
+        }
+        AppendSample(out, bucket_name, m_family->info.label_names,
+                     series.m_label_values, FormatUint(cumulative.back()),
+                     "le", "+Inf");
+        AppendSample(out, m_family->info.name + "_sum",
+                     m_family->info.label_names, series.m_label_values,
+                     FormatDouble(series.Sum()));
+        AppendSample(out, m_family->info.name + "_count",
+                     m_family->info.label_names, series.m_label_values,
+                     FormatUint(series.Count()));
+    };
+
+    if (!m_is_root) {
+        append_series(*this);
+        return;
+    }
+    if (m_family->info.label_names.empty()) {
+        append_series(*this);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_family->mutex);
+    for (const auto& entry : m_family->children) {
+        append_series(*entry.second);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+
+Registry::Registry() = default;
+Registry::~Registry() = default;
+
+Registry& Registry::Default() {
+    static Registry registry;
+    return registry;
+}
+
+Metric& Registry::RegisterImpl(const std::string& name,
+                               const std::string& help, MetricType type,
+                               std::vector<std::string> label_names,
+                               std::vector<double> buckets) {
+    const detail::MetricInfo info =
+        MakeInfo(name, help, type, std::move(label_names), true);
+    if (type == MetricType::kHistogram) {
+        if (buckets.empty()) {
+            buckets = DefaultHistogramBuckets();
+        }
+        ValidateBuckets(buckets);
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto found = m_metrics.find(name);
+    if (found != m_metrics.end()) {
+        Metric& existing = *found->second;
+        if (existing.Type() != type) {
+            throw std::invalid_argument(
+                "go2cpp::metrics: metric \"" + name +
+                "\" already registered with a different type");
+        }
+        if (existing.Help() != help) {
+            throw std::invalid_argument(
+                "go2cpp::metrics: metric \"" + name +
+                "\" already registered with different help text");
+        }
+        if (existing.LabelNames() != info.label_names) {
+            throw std::invalid_argument(
+                "go2cpp::metrics: metric \"" + name +
+                "\" already registered with different label names");
+        }
+        if (type == MetricType::kHistogram) {
+            const auto* histogram = static_cast<const Histogram*>(&existing);
+            if (histogram->Buckets() != buckets) {
+                throw std::invalid_argument(
+                    "go2cpp::metrics: histogram \"" + name +
+                    "\" already registered with different buckets");
+            }
+        }
+        return existing;
+    }
+
+    std::unique_ptr<Metric> metric;
+    switch (type) {
+        case MetricType::kCounter:
+            metric = std::unique_ptr<Metric>(
+                new Counter(Counter::CreateFamily(info)));
+            break;
+        case MetricType::kGauge:
+            metric = std::unique_ptr<Metric>(
+                new Gauge(Gauge::CreateFamily(info)));
+            break;
+        case MetricType::kHistogram:
+            metric = std::unique_ptr<Metric>(
+                new Histogram(Histogram::CreateFamily(info, buckets)));
+            break;
+        default:
+            throw std::invalid_argument(
+                "go2cpp::metrics: invalid metric type");
+    }
+    Metric* raw = metric.get();
+    m_metrics.emplace(name, std::move(metric));
+    return *raw;
+}
+
+Counter& Registry::GetCounter(const std::string& name,
+                              const std::string& help,
+                              std::vector<std::string> label_names) {
+    return static_cast<Counter&>(RegisterImpl(
+        name, help, MetricType::kCounter, std::move(label_names), {}));
+}
+
+Gauge& Registry::GetGauge(const std::string& name, const std::string& help,
+                          std::vector<std::string> label_names) {
+    return static_cast<Gauge&>(RegisterImpl(
+        name, help, MetricType::kGauge, std::move(label_names), {}));
+}
+
+Histogram& Registry::GetHistogram(const std::string& name,
+                                  const std::string& help,
+                                  std::vector<std::string> label_names,
+                                  std::vector<double> buckets) {
+    return static_cast<Histogram&>(RegisterImpl(
+        name, help, MetricType::kHistogram, std::move(label_names),
+        std::move(buckets)));
+}
+
+Metric& Registry::Register(const std::string& name, const std::string& help,
+                           MetricType type,
+                           std::vector<std::string> label_names) {
+    return RegisterImpl(name, help, type, std::move(label_names), {});
+}
+
+std::string Registry::Render() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::string out;
+    out.reserve(m_metrics.size() * 256);
+    for (const auto& entry : m_metrics) {
+        entry.second->AppendPrometheus(out);
+    }
+    return out;
+}
+
+std::size_t Registry::Size() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_metrics.size();
+}
+
+}  // namespace metrics
+}  // namespace go2cpp
