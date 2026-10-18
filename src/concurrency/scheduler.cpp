@@ -944,6 +944,36 @@ void Task::run() {
     }
 }
 
+/**
+ * @brief `Scheduler` 的完整实现（PIMPL；`Scheduler` 本身只是门面）。
+ *
+ * ## 组成（GMP 三层 + 两个条带表）
+ *
+ * | 成员 | 角色 |
+ * |---|---|
+ * | `m_processors` | P 数组（`processor_count` 个），每个带本地 runqueue |
+ * | `m_machines` | M 数组（基础 M + 按需补充的 replacement M） |
+ * | `m_registry`（16 条带） | 所有**未终态** G 的强引用；shutdown 靠它等终态 |
+ * | `m_incoming`（16 条带） | 外部生产者投递的新 G，worker 轮询认领 |
+ * | `m_tasks`/`m_state` | admission 计数与运行状态 |
+ *
+ * ## 锁层次（严格顺序，违反就会死锁）
+ *
+ * ```text
+ * m_lifecycle_mutex -> m_mutex -> 条带锁（registry/incoming）
+ *                  -> P 的 mutex -> m_task_mutex（单 G 状态）
+ * ```
+ *
+ * 任何路径都**不能反向**。`expire_timers` 特意分两阶段（定时器锁内摘节点、
+ * 释放后逐条带处理）就是为了不出现「条带锁 → 定时器锁」的反向嵌套。
+ *
+ * ## 关键不变式
+ *
+ * - 注册表条目 = 一个尚未终态的 G；G 进终态时移除并 `notify_terminal()`；
+ * - `incoming` 里的 G 一定**没有 P**（`processor == kInvalidPId`）；
+ * - `blocking_workers` 归零前 sysmon 不会再申请补充 M；
+ * - `shutdown` 期间 admission 关闭，`enqueue` 失败后调用方必须 `cancel()`。
+ */
 class Scheduler::Impl {
 public:
     // 任务注册表按固定条带拆分，避免大量外部生产者在提交短任务时
