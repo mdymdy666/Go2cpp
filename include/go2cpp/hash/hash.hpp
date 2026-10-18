@@ -70,6 +70,35 @@
  * | CRC32 的 SSE4.2 / PCLMUL 硬件加速 | 纯可移植实现已达 **3~5 GB/s**（slicing-by-8），远超本项目 IO 路径需求；运行时 CPU 分派会引入编译期特性宏与平台分支，收益不匹配。 |
  * | `encoding.BinaryMarshaler` / `BinaryUnmarshaler` 序列化 | Go 用它做哈希状态缓存（`MarshalBinary`）。C++ 侧可直接拷贝对象（`Sha256`/`Sha512` 都是值类型），不需要额外序列化协议。 |
  * | 各算法的 `New()` 工厂（返回 `hash.Hash` 接口） | C++ 侧构造函数/默认构造已完成同一职责（`Sha256 h;`），再提供 `New()` 只会多一层无意义的间接；需要接口多态时用 `std::unique_ptr<Hash>` 或 `Hash&`。 |
+ *
+ * ## 模块定位
+ *
+ * 本文件（`include/go2cpp/hash/hash.hpp`）定义 `hash` 模块的**公共契约层**。
+ * `hash` 位于项目最底层：不依赖调度器、IO 或任何其它业务模块，只依赖 C++
+ * 标准库；上层按需 include 具体算法头即可，不会反向被依赖。当前仓库里引用
+ * 本目录的**唯一**入口是 `tests/hash/hash_test_support.hpp`（标准向量、随机
+ * 对拍与压测）；`compress`、`http2`、`websocket` 等模块目前各自实现或尚未
+ * 接入校验和，因此本模块没有生产调用方，也没有 IO/线程依赖。
+ *
+ * ## 本文件定义什么
+ *
+ * - `ByteSpan`：非拥有字节视图，是本模块所有输入/输出参数的统一载体；
+ * - `AsBytes` 重载族：把裸指针、`std::string`、`std::string_view`、
+ *   `std::vector`、`std::array` 适配成 `ByteSpan`，并用参数的 `const` 性
+ *   区分「可写（给 `Sum` 输出）」与「只读（给 `Write`/`Checksum` 输入）」；
+ * - `Hash`：Go `hash.Hash` 的五个方法（`Write`/`Sum`/`Reset`/`Size`/
+ *   `BlockSize`）加上三个 C++ 便利重载，是六个具体摘要的共同基类。
+ *
+ * 具体算法分别在 `adler32.hpp`、`crc32.hpp`、`md5.hpp`、`sha1.hpp`、
+ * `sha256.hpp`、`sha512.hpp`；本文件不含任何算法实现。
+ *
+ * ## 阅读建议
+ *
+ * 先读 `Hash` 对 `Write`/`Sum` 的语义约定 —— 尤其是 **`Sum` 不改变自身
+ * 状态**、**`out.size() >= Size()` 是调用方前置条件** 这两条，它们决定了
+ * 「取完摘要还能不能继续写」；再看 `ByteSpan` 的所有权契约；最后才按需跳到
+ * 具体算法。只要一次性摘要时，直接用各算法的静态 `Digest`/`Checksum` 即可，
+ * 不必经过 `Hash` 接口。
  */
 #pragma once
 
@@ -90,6 +119,13 @@ namespace go2cpp::hash {
  *
  *          为什么不用 `std::span`：项目统一 `cxx_std_17`，标准库还没有；
  *          `std::string_view` 只读且绑定 `char`，无法承载 `Sum` 的输出参数。
+ *
+ * ## 定位
+ *
+ * 本模块所有公共 API 的参数类型：`Hash::Write`/`Hash::Sum`、各算法的
+ * `Write`/`Digest`/`Checksum`/`Update` 都收发 `ByteSpan`。它被 `Hash` 接口
+ * 与六个具体摘要共同使用，本身不含算法。因为不拥有数据，视图只能在底层
+ * 缓冲有效期内使用（契约见文件头）；`Sum(out)` 传入的视图必须指向可写内存。
  */
 class ByteSpan {
  public:
@@ -136,8 +172,8 @@ class ByteSpan {
     }
 
  private:
-    std::uint8_t* m_data{nullptr};
-    std::size_t m_size{0};
+    std::uint8_t* m_data{nullptr};  ///< 起始字节（非拥有）；构造函数写入，data()/operator[]/subspan 读取
+    std::size_t m_size{0};          ///< 字节数；构造函数写入，size()/empty()/subspan 读取
 };
 
 // ============================================================================
@@ -208,6 +244,19 @@ inline ByteSpan AsBytes(const std::array<std::uint8_t, N>& buffer) noexcept {
  * @details 纯虚接口，五个摘要实现均继承它；用于「一次遍历、多个哈希」以及
  *          需要擦除具体算法类型的场景（例如配置驱动的校验器）。
  *          **接口本身不提供线程安全**：与 Go 一样，同一实例被多线程写需要外部同步。
+ *
+ * ## 定位
+ *
+ * `go2cpp::hash` 的唯一多态入口：`Adler32`、`Crc32`、`Md5`、`Sha1`、
+ * `Sha256`、`Sha512` 六个具体摘要都继承它。只有「运行时选择算法」或
+ * 「一次遍历喂多个摘要」的场景才需要持有 `Hash&` / `Hash*`；否则直接用具体
+ * 类型，避免虚调用并让编译器内联。
+ *
+ * ## 生命周期与线程模型
+ *
+ * 接口本身无状态，线程安全性由具体实现决定。当前六个实现都**不加内部锁**：
+ * 同一实例被多线程同时 `Write`/`Sum` 需要调用方加锁；不同实例互不影响。
+ * 通过 `Hash&` 持有实现时，实现的析构函数必须是虚的（本接口已声明）。
  */
 class Hash {
  public:

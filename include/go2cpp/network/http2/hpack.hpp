@@ -24,6 +24,24 @@
  * **Huffman 编解码（§5.2）已在 `huffman.hpp` 中实现**：257 项码表来自 RFC 7541
  * 附录 B（经 Go 的 x/net/http2/hpack/tables.go 提取校验）。解码支持 Huffman，
  * 编码默认启用 Huffman。填充非法或出现 EOS 返回 `kHuffmanInvalid`。
+ *
+ * ## 本文件定义什么
+ * - `HeaderField`：一个 header 名值对（HTTP/2 里名字必须小写）；
+ * - `HpackStatus`：编解码结果码；
+ * - `DecodeInteger()` / `EncodeInteger()`：RFC 7541 §5.1 的前缀整数；
+ * - `StaticTableEntry()` / `FindStaticIndex()` / `FindStaticNameIndex()`：61 项静态表；
+ * - `DynamicTable`：FIFO 动态表（含 O(1) 的「名字+值」查找）；
+ * - `Decoder` / `Encoder`：整块 header block 的编解码。
+ *
+ * ## 阅读建议
+ * 先看 `DynamicTable` 的索引口径（相对索引 1 是表首最新条目），再看
+ * `Decoder::DecodeBlock()` 的四种表示（索引 / 含增量索引 / 不含索引 / 绝不索引），
+ * 最后看 `Encoder::EncodeBlock()` 的择优顺序。
+ *
+ * ## 边界与陷阱
+ * - 静态表索引 **1-based**，动态表相对索引 **1 表示最新**，拼接时容易差 61；
+ * - 编码器会写动态表、解码器也会；两侧表必须同步，否则索引解释错位；
+ * - `DecodeBlock()` 的 `kNeedMore` 表示「输入不完整」，调用方可以等更多字节后重试。
  */
 #pragma once
 
@@ -37,6 +55,12 @@
 namespace go2cpp::net::http2 {
 
 /** @brief 一个头部字段。 */
+/**
+ * @brief 一个头部字段。
+ *
+ * ## 定位
+ * `Connection` 与 `IncomingEvent` 之间的通用 header 表示，也是 HPACK 层的输入输出单位。
+ */
 struct HeaderField final {
     std::string name;
     std::string value;
@@ -123,6 +147,15 @@ std::size_t FindStaticNameIndex(const std::string& name) noexcept;
  * @details 条目大小按 RFC 7541 §4.1 计算：`name.size() + value.size() + 32`。
  *          插入导致超限时按 FIFO 逐出，直到装得下或表为空。**不修改调用方传入的
  *          name/value**（内部拷贝）。
+ *
+ * ## 定位
+ * 被 `Decoder` 与 `Encoder` 各持有一份（收发方向的表互相独立）；
+ * `Connection` 通过 SETTINGS_HEADER_TABLE_SIZE 间接控制它的大小。
+ *
+ * ## 不变量
+ * - `m_size` 恒等于所有条目 `name+value+32` 之和，且 `<= m_max_size`；
+ * - `m_entries[0]` 永远是最新条目（HPACK 相对索引 1）；
+ * - `m_seqs` 与 `m_entries` 等长，序号单调递增，逐出只从尾部发生。
  */
 class DynamicTable final {
 public:
@@ -184,6 +217,14 @@ private:
  * @details 持有动态表与当前上限。解码过程中若遇到未知索引或 Huffman 字符串，
  *          返回错误并**不修改**动态表已成功应用的部分（HPACK 要求整块要么
  *          全部成功，要么连接出错；这里保守地先解析到临时表再提交）。
+ *
+ * ## 定位
+ * 由 `Connection::m_decoder` 持有，只在 `ReadEvent()` 的 HEADERS 分支调用；
+ * 测试里可单独用来验证 RFC 7541 附录 C 的样例。
+ *
+ * ## 不变量
+ * - `m_settings_max` 是本端声明的接收上限，表大小更新超过它即 `kInvalidTableSize`；
+ * - 解码失败时动态表可能已部分变更（不做事后回滚），因此失败后应断连而不是重试。
  */
 class Decoder final {
 public:
@@ -218,6 +259,15 @@ private:
  * @brief HPACK 编码器。
  * @details 默认策略：能命中静态表就用索引；否则用「含增量索引的字面量」，
  *          并写入动态表。**不做 Huffman 编码**（见文件头说明）。
+ *
+ * ## 定位
+ * 由 `Connection::m_encoder` 持有，`StartRequest()` 与 `SendResponseHeaders()` 调用；
+ * 对端 SETTINGS 到达后由 `FinishSettingsHandshake()` 调 `SetTableSize()` 收缩。
+ *
+ * ## 不变量
+ * - 命中静态表 -> 索引用 7 位前缀；否则「含增量索引字面量」用 6 位前缀；
+ * - 值只在 Huffman 结果更短时才用 Huffman（避免长随机串膨胀）；
+ * - 每次写「含增量索引」表示都会同步 `m_table.Add()`，两端表因此保持一致。
  */
 class Encoder final {
 public:

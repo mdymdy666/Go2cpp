@@ -44,6 +44,35 @@
  *      但攻击者可以构造任意 CRC 值的数据。防篡改请用 SHA-256（或 HMAC）。
  * @note `Crc32` 内部保存指向 `Table` 的指针，`table` 的生命周期必须覆盖
  *       `Crc32` 实例；三个内建表是静态存储，永不失效。
+ *
+ * ## 模块定位
+ *
+ * 本文件（`include/go2cpp/hash/crc32.hpp`）是 `hash` 模块里唯一带「多项式
+ * 选择」的算法：gzip/ZIP/PNG 用 IEEE，iSCSI/ext4 元数据用 Castagnoli，
+ * 误码检测要求更高时用 Koopman。因此除了摘要器 `Crc32`，这里还公开可复用的
+ * 查表类型 `Table` 与一次性函数。实现位于协议栈最底层，不依赖其它模块；
+ * 当前仓库的直接调用方只有 `tests/hash/hash_test_support.hpp`（与 Python
+ * `zlib.crc32` 对拍），生产代码尚未接入。
+ *
+ * ## 本文件定义什么
+ *
+ * - `IEEE`/`Castagnoli`/`Koopman`：三个反射形式的多项式常量；
+ * - `Table`：基础 256 表 + 7 张 slicing-by-8 派生表；
+ * - `MakeTable`：编译期生成查表（三个内建表因此是常量初始化，无运行期竞态）；
+ * - `IEEETable`/`CastagnoliTable`/`KoopmanTable`：进程级静态表；
+ * - `Crc32`：流式摘要器（`Hash` 子类），持有 `const Table*`。
+ *
+ * ## 阅读建议
+ *
+ * 先读 `Update` 的「进入取反 / 离开取反」语义（它决定分段计算能否拼接），
+ * 再看 `Table` 的内存布局与 `Crc32` 的指针生命周期约束；slicing-by-8 的
+ * 循环可以最后看 —— 它只是同一公式的一次 8 字节展开。
+ *
+ * ## 边界与陷阱
+ *
+ * - 空输入 `Checksum` 返回 0：`Update(0, ...)` 进入取反再离开取反，正好抵消；
+ * - `Crc32` 只存 `Table*`，表先于摘要器销毁就是悬垂指针（内建表除外）；
+ * - 分段计算必须用 `Update` 串接；两个 `Checksum` 结果不能相加/异或。
  */
 #pragma once
 
@@ -68,6 +97,17 @@ inline constexpr std::uint32_t Koopman = 0xeb31d82eu;
  * @details 内存布局：`entries[0..255]` 是基础表（与 Go `MakeTable` 完全一致），
  *          `entries[k * 256 + i]`（k=1..7）是第 k 张派生表。公开 `operator[]`
  *          只访问基础表，避免把内部布局暴露给调用方。
+ *
+ * ## 定位
+ *
+ * CRC 热路径上的只读数据结构。`Crc32` 只持有一个 `const Table*`，因此表的
+ * 生命周期必须长于摘要器；三个内建表是静态存储，永远满足这一条件。自定义
+ * 表通常由调用方持有（或声明成 `static const`），不要传临时对象。
+ *
+ * ## 不变量
+ *
+ * `entries` 一旦构造完成就不再变化（`MakeTable` 返回后即只读）；所有派生表
+ * 都能由基础表逐级推出，因此不存在「只改一张表」的合法用法。
  */
 struct Table {
     /// 基础表项数（与 Go 一致）。
@@ -124,6 +164,19 @@ extern const Table KoopmanTable;
  *
  * @details `Write` 可任意拆分；`Sum32()` 是当前 CRC；`Sum` 写入 **大端** 4 字节
  *          （与 Go `crc32.digest.Sum` 一致：`byte(s>>24), ..., byte(s)`）。
+ *
+ * ## 定位
+ *
+ * 给需要**流式** CRC 的调用方使用：每收到一段数据 `Write` 一次，最后用
+ * `Sum32()`/`Sum()` 取结果；一次性场景直接用静态 `ChecksumIEEE`/
+ * `Checksum`/`Update`，不必构造对象。作为 `Hash&` 擦除后也可参与「一次遍历
+ * 多个摘要」。当前仓库调用方仅为 `tests/hash/`；`compress` 的 gzip 编码器
+ * 是预期的生产调用方（帧尾 CRC32）。
+ *
+ * ## 生命周期与线程模型
+ *
+ * 构造时绑定 `Table`（存指针，不拥有）；调用方必须保证表比实例活得久。
+ * 实例本身无锁：同一实例被多线程写需要外部同步，不同实例可并行。
  */
 class Crc32 final : public Hash {
  public:
@@ -178,8 +231,8 @@ class Crc32 final : public Hash {
     }
 
  private:
-    const Table* m_table;
-    std::uint32_t m_crc{0};
+    const Table* m_table;      ///< 指向构造时传入的查表（不拥有）；Write 解引用传给 Update，构造后不再改
+    std::uint32_t m_crc{0};    ///< 当前 CRC（已含离开取反）；Write 累加、Reset 清零、Sum32/Sum 读取
 };
 
 }  // namespace go2cpp::hash

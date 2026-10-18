@@ -1,3 +1,61 @@
+/**
+ * @file network/hook.cpp
+ * @brief libc IO 函数的 interposition 实现：GMP「同步写法、异步执行」的落地层。
+ *
+ * ## 模块定位
+ *
+ * 本文件把 `read/write/recv/send/connect/accept/poll/sleep…` 截下来，替调用方
+ * 决定「这次调用该 park 还是该让 worker 真阻塞」，从而让业务代码里看起来是
+ * 同步阻塞的写法（`socket.recv()`）在受管 G 中自动让出 M。
+ *
+ * 上下游：
+ *
+ * - 上游是**用户的同步代码**与 `net::Socket`（`Socket::recv/send/accept` 最终
+ *   落到这里）；
+ * - 下游是 `io::IOManager`（`WaitFor` + epoll）与 `Scheduler`（park/wake）；
+ * - 旁路是**未接管 fd**：走 `BlockingRegion` + sysmon 申请替代 M（见
+ *   `docs/hook-blocking-policy.md` 的 C 类）。
+ *
+ * ## 三条处置路径（判定准则只有一条：能不能归约为「等某个 fd 就绪」）
+ *
+ * | 路径 | 判定 | 行为 |
+ * |---|---|---|
+ * | **park** | socket / FIFO 上的 read/write/connect/accept | fd 切 `O_NONBLOCK`，先试一次，`EAGAIN` 才注册 epoll 并 park |
+ * | **BlockingRegion** | 非 fd 就绪可等（`poll/select/epoll_wait` 本身、未接管 fd、`fsync`、`getaddrinfo`…） | 标记 M 阻塞，sysmon 检测后申请替代 M |
+ * | **直调** | 普通文件（`S_ISREG`，内核同步完成）与 `*_f` | 直接调 libc，不 park、不标记 |
+ *
+ * ## fd 类型识别（只能白名单）
+ *
+ * `anon_inodefs`（eventfd/timerfd/signalfd）**不给 `st_mode` 类型位**
+ * （`S_IFMT == 0`），任何黑名单都会漏掉它们；因此先 `getsockopt(SO_TYPE)`
+ * 判 socket，再用 `fstat + S_ISFIFO` 判 FIFO，其余一律不接管。
+ *
+ * ## `*_f` 系列（22 个）
+ *
+ * `read_f/write_f/recv_f/send_f/connect_f/accept_f/…` 是**显式 raw 调用**：
+ * 直调 libc、不 park、会真阻塞整个 worker。它们不在 `go2cpp::hook` 命名空间里
+ * （全局 `extern "C"` 符号）。**`_f` 不代表更快**，只代表「我知道自己在阻塞」。
+ *
+ * ## 关键不变量
+ *
+ * - 接管 socket/FIFO 后必须把 fd 切 `O_NONBLOCK`，并通过 `fcntl` hook 对用户
+ *   隐藏该位（`OpenDescription::m_system_nonblocking` vs `m_user_nonblocking`）；
+ * - 每个 hook 调用期间持有 `DescriptorGuard`（fd 条带锁）：保证 close/dup2 不会
+ *   在系统调用中途抽走 fd；**绝不能跨 park 持有**；
+ * - `hooks_enabled()` 为假或符号没解析出来时，所有 hook 必须退化为直调 libc ——
+ *   这是「运行时关闭 hook 仍然正确」的唯一保证。
+ *
+ * ## 阅读建议
+ *
+ * 先看 `Originals`（符号表）→ `OpenDescription`/`Descriptor`/`DescriptorStripe`
+ * （fd 元数据与分条）→ `inspect_socket`/`inspect_fifo`/`can_wait`（判定链）→
+ * `cooperative_io`（park 主循环）→ 最后看各 hook 函数（它们几乎都是薄壳）。
+ *
+ * ## 相关文档
+ *
+ * - `docs/hook-blocking-policy.md`：判定准则与 FIFO park 的实测数据；
+ * - `docs/concurrency-park-points.md`：哪些函数会 park、哪些阻塞 M、哪些是纯计算。
+ */
 #include "go2cpp/hook.hpp"
 #include "go2cpp/config/config.hpp"
 
@@ -88,40 +146,94 @@ using PselectFn = int (*)(int, fd_set*, fd_set*, fd_set*, const timespec*,
 using EpollWaitFn = int (*)(int, epoll_event*, int, int);
 using EpollPwaitFn = int (*)(int, epoll_event*, int, int, const sigset_t*);
 
+/**
+ * @brief libc 原始函数的符号表（`dlsym(RTLD_NEXT, ...)` 的结果）。
+ *
+ * ## 定位
+ *
+ * 每个 hook 在「决定不接管」时必须调用原始 libc 实现。这里缓存全部 33 个符号，
+ * 避免每次调用都 `dlsym`（`dlsym` 会取加载器锁，在 recv/send 热路径上不可接受）。
+ *
+ * ## 为什么用 `std::call_once` 惰性解析
+ *
+ * `initialize_originals()` 在**第一次 hook 调用时**执行，而不是静态初始化：
+ * - hook 符号可能在别的 DSO 的静态初始化阶段就被调用，那时本文件的全局对象
+ *   还没构造，不能依赖静态初始化顺序；
+ * - `dlsym` 自身可能再次进入被 hook 的函数，所以解析期间置 `s_resolving`，
+ *   hook 看到它就直接走 raw syscall（见 `read`/`write` 的实现）。
+ *
+ * ## 调用约定
+ *
+ * 所有成员只在 `call_once` 内写一次，之后只读 ⇒ 读取不需要锁。
+ * `RealCallGuard` 在调用原始函数期间递增 `s_real_call_depth`，让内层 hook 判断
+ * 「当前是在替 libc 干活」而不是用户调用。
+ *
+ * ## 成员分组（顺序与下方声明一致）
+ *
+ * - sleep 族：`m_sleep/m_usleep/m_nanosleep/m_clock_nanosleep`；
+ * - socket 创建与连接：`m_socket/m_socketpair/m_connect/m_accept/m_accept4`；
+ * - read 族：`m_read/m_readv/m_recv/m_recvfrom/m_recvmsg`；
+ * - write 族：`m_write/m_writev/m_send/m_sendto/m_sendmsg`；
+ * - fd 生命周期：`m_close/m_dup/m_dup2/m_dup3`；
+ * - fd 属性：`m_fcntl/m_ioctl/m_getsockopt/m_setsockopt`；
+ * - 事件循环入口：`m_poll/m_ppoll/m_select/m_pselect/m_epoll_wait/m_epoll_pwait`
+ *   （这些**本身不 park**，只包 BlockingRegion 后直调）。
+ */
 struct Originals {
+    /// @name sleep 族
+    /// @{
     SleepFn m_sleep{nullptr};
     UsleepFn m_usleep{nullptr};
     NanosleepFn m_nanosleep{nullptr};
     ClockNanosleepFn m_clock_nanosleep{nullptr};
+    /// @}
+    /// @name socket 创建与连接
+    /// @{
     SocketFn m_socket{nullptr};
     SocketPairFn m_socketpair{nullptr};
     ConnectFn m_connect{nullptr};
     AcceptFn m_accept{nullptr};
     Accept4Fn m_accept4{nullptr};
+    /// @}
+    /// @name read 族
+    /// @{
     ReadFn m_read{nullptr};
     ReadvFn m_readv{nullptr};
     RecvFn m_recv{nullptr};
     RecvFromFn m_recvfrom{nullptr};
     RecvMsgFn m_recvmsg{nullptr};
+    /// @}
+    /// @name write 族
+    /// @{
     WriteFn m_write{nullptr};
     WritevFn m_writev{nullptr};
     SendFn m_send{nullptr};
     SendToFn m_sendto{nullptr};
     SendMsgFn m_sendmsg{nullptr};
+    /// @}
+    /// @name fd 生命周期
+    /// @{
     CloseFn m_close{nullptr};
     DupFn m_dup{nullptr};
     Dup2Fn m_dup2{nullptr};
     Dup3Fn m_dup3{nullptr};
+    /// @}
+    /// @name fd 属性
+    /// @{
     FcntlFn m_fcntl{nullptr};
     IoctlFn m_ioctl{nullptr};
     GetSockOptFn m_getsockopt{nullptr};
     SetSockOptFn m_setsockopt{nullptr};
+    /// @}
+    /// @name 事件循环入口（不 park，只包 BlockingRegion）
+    /// @{
     PollFn m_poll{nullptr};
     PpollFn m_ppoll{nullptr};
     SelectFn m_select{nullptr};
     PselectFn m_pselect{nullptr};
     EpollWaitFn m_epoll_wait{nullptr};
     EpollPwaitFn m_epoll_pwait{nullptr};
+    /// @}
 };
 
 Originals s_originals;
@@ -244,29 +356,80 @@ IOManager* cooperative_manager() noexcept {
     return current_manager();
 }
 
+/**
+ * @brief 一个「打开描述符」的共享元数据（dup/dup2 产生的副本共享同一份）。
+ *
+ * ## 定位
+ *
+ * `Descriptor`（句柄）通过 `m_open` 指向它；`dup/dup2/dup3` 只复制句柄、**不复制本结构**，
+ * 所以「同一个 open file description 的多个 fd」共享 nonblocking 与超时元数据 ——
+ * 这正是 POSIX 语义，也是 `clone_descriptor` 必须支持的原因（否则下一代会把 hook
+ * 自己设置的 `O_NONBLOCK` 误判成用户意图而失去 park 能力）。
+ *
+ * ## 三个布尔位的组合决定处置路径（见 inspect_socket/inspect_fifo/can_wait）
+ *
+ * | m_pollable | m_system_nonblocking | m_user_nonblocking | 行为 |
+ * |---|---|---|---|
+ * | true | true | false | **park**：先试一次 syscall，EAGAIN 才注册 epoll |
+ * | true | true | true | 用户显式要求非阻塞：保持 EAGAIN 语义，**不 park** |
+ * | false | — | — | 走 `BlockingRegion` + sysmon（park 会永久挂起） |
+ *
+ * ## 并发
+ *
+ * 所有字段由 `m_mutex` 保护。`DescriptorGuard` 只锁 fd 所在的注册表条带，
+ * **不代替本锁** —— 两者保护的对象不同（前者是 fd 代际，后者是元数据）。
+ */
 struct OpenDescription {
+    /// @brief 保护本结构全部字段；fcntl/setsockopt hook 与 can_wait 竞争它。
     mutable std::mutex m_mutex;
     // 来源类型，仅用于诊断：socket 与 FIFO 走同一条 park 路径。
+    /// @brief 来源标记（只用于诊断）：true=socket、false=FIFO。
     bool m_socket{true};
     // 该 fd 的阻塞原因能否归约为「epoll 能报的 fd 就绪」。
     // 只有 pollable 的 fd 才能 park Fiber；false 必须走 BlockingRegion，
     // 否则 park 之后没有任何东西能唤醒它（变成 Fiber 永久挂起）。
+    /// @brief 能否 park（判定准则的唯一一条）；false 必须走 BlockingRegion。
     bool m_pollable{true};
+    /// @brief 用户通过 fcntl 设置的 `O_NONBLOCK`（对用户可见的那一层）。
     bool m_user_nonblocking{false};
+    /// @brief hook 自己设置的 `O_NONBLOCK`（对用户隐藏，park 的前提）。
     bool m_system_nonblocking{false};
+    /// @brief `SO_RCVTIMEO` 映射的接收超时；`nullopt` 表示无限等待。
     std::optional<Duration> m_receive_timeout;
+    /// @brief `SO_SNDTIMEO` 映射的发送超时；`nullopt` 表示无限等待。
     std::optional<Duration> m_send_timeout;
 };
 
+/**
+ * @brief 单个 fd 的句柄记录（hook 的 fd → 元数据映射里的值）。
+ *
+ * ## 定位
+ *
+ * `DescriptorStripe::descriptors[fd]` 存的就是它，把「fd 的属性」与「fd 的代际令牌」
+ * 绑在一起：
+ * - `m_open`：共享的打开描述元数据；`dup` 出来的副本共享同一份（POSIX 语义）；
+ * - `m_token`：`io::DescriptorToken`，代际号用于拒绝 close/dup2 之后迟到的 epoll
+ *   事件 —— `IOManager` 的 `FdSlot` 用同一个令牌做二次校验。
+ *
+ * ## 生命周期
+ *
+ * 由 `DescriptorStripe::descriptors` 的 `shared_ptr` 持有；hook 每次调用通过
+ * `descriptor_for(fd)` 取一份临时强引用，保证调用期间元数据不被释放。
+ * `m_closed` 一旦置真，后续 hook 直接把该 fd 当未接管处理（走 native 路径）。
+ */
 struct Descriptor {
     Descriptor(std::shared_ptr<OpenDescription> description,
                DescriptorTokenPtr descriptor_token)
         : m_open(std::move(description)),
           m_token(std::move(descriptor_token)) {}
 
+    /// @brief 共享的打开描述元数据；dup 副本共享同一份（POSIX open file description）。
     std::shared_ptr<OpenDescription> m_open;
+    /// @brief 代际令牌；close/dup2 之后的迟到事件靠它被拒绝（与 IOManager 的 FdSlot 共用）。
     DescriptorTokenPtr m_token;
+    /// @brief 保护 m_closed；close 路径置位，descriptor_closed() 读取。
     mutable std::mutex m_mutex;
+    /// @brief 已关闭标记；置真后 hook 把该 fd 当未接管（走 native 路径）。
     bool m_closed{false};
 };
 
@@ -287,8 +450,26 @@ struct Descriptor {
 // 否则两条同 fd 路径会互相等待。
 constexpr std::size_t kDescriptorStripeCount = 64;
 
+/**
+ * @brief fd 注册表的一个条带（按 fd 哈希分片，减少 hook 热路径的锁争用）。
+ *
+ * ## 为什么分条
+ *
+ * hook 的每个 recv/send/fcntl/setsockopt 都要查一次 fd 元数据；单一全局锁在 12 个
+ * worker 下会把它们串行化（WSL2 上一次竞争约 55~75µs，短连接 accept 路径上的两次
+ * setsockopt 实测 168µs）。分条后只有**同一个 fd** 的调用互相阻塞，不同 fd 互不影响，
+ * 而「同一 fd 的 Capture/Invalidate/在途 syscall 互斥」这个不变式仍然成立。
+ *
+ * ## 不变式
+ *
+ * - 同一 fd 永远落在同一条带（`fd % kStripeCount`），所以「查/改/删」天然互斥；
+ * - 条带锁只在查询/更新元数据时短暂持有，**绝不跨系统调用或 park 持有**；
+ * - `descriptors` 里没有条目 ⇒ 该 fd 未被接管，hook 走 native 路径。
+ */
 struct DescriptorStripe {
+    /// @brief 保护 descriptors；descriptor_for/adopt_socket/adopt_fifo/close 路径竞争它。
     std::mutex mutex;
+    /// @brief fd → 句柄记录；没有条目表示该 fd 未被 hook 接管。
     std::unordered_map<int, std::shared_ptr<Descriptor>> descriptors;
 };
 
@@ -680,6 +861,30 @@ std::optional<Duration> operation_timeout(
                                    : descriptor->m_open->m_send_timeout;
 }
 
+/**
+ * @brief 判定「这个 fd 上的调用可以 park 吗」—— 整个 hook 层唯一的决策点。
+ *
+ * ## 判定链（三步，从粗到细）
+ *
+ * step1. `inspect_socket(fd)`：`getsockopt(SOL_SOCKET, SO_TYPE)` 成功 ⇒ socket；
+ * step2. 失败则 `inspect_fifo(fd)`：`fstat` + `S_ISFIFO` ⇒ FIFO/pipe；
+ *        两者都不成立 ⇒ 不接管，走 `BlockingRegion` 或直调；
+ * step3. 本函数：接管成功的 fd 还要同时满足三个布尔位才 park。
+ *
+ * ## 为什么只能白名单
+ *
+ * `anon_inodefs`（`eventfd`/`timerfd`/`signalfd`）**不给 `st_mode` 类型位**
+ * （`S_IFMT == 0`，`ISREG/ISFIFO/ISSOCK/ISCHR` 全为 0），任何黑名单都必然漏掉
+ * 它们 —— 而它们恰好都会阻塞。所以只能「先认 socket、再认 FIFO，其余一律不碰」。
+ *
+ * ## 三个条件的含义
+ *
+ * | 条件 | 为什么必须 |
+ * |---|---|
+ * | `m_pollable` | 阻塞原因必须能归约为「某个 fd 就绪」；否则 park 之后没有任何东西能唤醒它（Fiber 永久挂起，比 worker 被阻塞更难查） |
+ * | `m_system_nonblocking` | hook 必须已经把 fd 切成 `O_NONBLOCK`，否则「先试一次」会直接阻塞 M |
+ * | `!m_user_nonblocking` | 用户显式要非阻塞时保持 `EAGAIN` 语义，**替他 park 会违反他的契约** |
+ */
 bool can_wait(const std::shared_ptr<Descriptor>& descriptor) noexcept {
     std::lock_guard<std::mutex> lock(descriptor->m_open->m_mutex);
     return descriptor->m_open->m_pollable &&
@@ -778,6 +983,40 @@ int native_wait(int fd, IOEvent event,
     }
 }
 
+/**
+ * @brief 所有可 park 的 hook 共用的主循环：「先真调一次，EAGAIN 才 park」。
+ *
+ * ## 定位
+ *
+ * `read/write/recv/send/recvfrom/sendto/recvmsg/sendmsg/connect/accept/accept4`
+ * 的 hook 全是薄壳，最终都汇聚到这里。它负责三件事：① 判定该 fd 走 park 还是
+ * native；② 执行真实 syscall；③ 在 `EAGAIN` 时注册到 `IOManager` 并 park 当前 G。
+ *
+ * ## 步骤
+ *
+ * step1. 取 `cooperative_manager()`；若没有 manager 但当前是 managed G，说明 hook
+ *        已启用却没有 IOManager —— 退化为 `BlockingRegion` + 原生调用；
+ * step2. `descriptor_for(fd)` 查元数据；未接管时先试 `try_adopt_socket`
+ *        （`getsockopt(SO_TYPE)`）、再试 `try_adopt_fifo`（`fstat + S_ISFIFO`）；
+ *        都失败则原生调用，并**显式发布 `M::Blocking`**（否则 sysmon 看不见这个长调用）；
+ * step3. `can_wait()` 决定本次是否可 park（用户显式非阻塞时 `blocking=false`）；
+ * step4. 循环体内持 `DescriptorGuard`（fd 条带锁）做一次真实 syscall ——
+ *        持门保证 close/dup2 不会在调用中途抽走 fd，**但绝不跨 park 持有**；
+ * step5. 成功、或错误不是 `EAGAIN/EWOULDBLOCK` ⇒ 直接返回；
+ * step6. `EAGAIN` ⇒ 注册 epoll 等待并 park；被唤醒后回到 step4 **重试** ——
+ *        数据可能已被别的读者取走，所以不能假设「唤醒 = 有数据」。
+ *
+ * ## 为什么第一次一定要真调
+ *
+ * 「先试后等」省掉「数据已在缓冲里却还去 park」的往返；它也是 `O_NONBLOCK`
+ * 语义的来源 —— 用户看到的是 `EAGAIN`，我们拿到的是 park 点。
+ *
+ * ## 参数
+ *
+ * @param per_call_nonblocking 本次调用是否由 `SOCK_NONBLOCK`/`MSG_DONTWAIT` 等
+ *        单次标志要求非阻塞（此时即使 `can_wait` 为真也不 park）；
+ * @param args 透传给原始 libc 函数。
+ */
 template <typename Result, typename Function, typename... Args>
 Result cooperative_io(int fd, Function function, IOEvent event,
                       bool per_call_nonblocking, Args... args) {
@@ -817,12 +1056,14 @@ Result cooperative_io(int fd, Function function, IOEvent event,
         return invoke_real(function, fd, args...);
     }
 
+    // step3: 只有 can_wait 且本次没有单次非阻塞标志，才允许 park。
     const bool blocking = !per_call_nonblocking && can_wait(descriptor);
     const auto deadline =
         deadline_from_timeout(operation_timeout(descriptor, event));
     for (;;) {
         Result result;
         {
+            // step4: 持条带锁做真实 syscall；锁只覆盖这一次调用，不跨 park。
             DescriptorGuard lifecycle(fd);
             if (snapshot_descriptor(descriptor).m_closed) {
                 errno = EBADF;

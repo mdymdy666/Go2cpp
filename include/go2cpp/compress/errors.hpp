@@ -26,6 +26,27 @@
  *   | `ErrClosed` | `flate.ErrClosed` / `gzip.ErrClosed` | `Close()` 之后继续写，或重复 `Close()` |
  *   | `ErrDictionary` | `zlib.ErrDictionary` | zlib 流要求预置字典（本模块不支持） |
  *   | `ErrInternal` | （Go 无） | zlib 初始化失败、内存不足等内部错误 |
+ *
+ * ## 模块定位与调用方
+ *
+ * 本文件是 `compress` 的错误基础设施层：`Flate` / `Zlib` / `Gzip` 三个公开类
+ * 不各自造错误，而是从下面这些实现点转发出来，排查时按调用点跳转即可：
+ *
+ * - `detail::Inflater::Inflate`：把 zlib 返回码翻译成 `ErrDictionary`
+ *   （`Z_NEED_DICT`）与 `ErrInternal`（`Z_MEM_ERROR` / 参数非法）；
+ * - `detail::Inflater` 内部的 `MapDataError`：把 `Z_DATA_ERROR` 细分为
+ *   `ErrChecksum` / `ErrHeader` / `ErrCorrupt`，是模块里唯一读 `strm.msg`
+ *   文本的地方（详见 `src/compress/inflater.cpp` 文件头）；
+ * - `detail::ReaderEngine::FinishOnSourceEof`：流未结束但源已尽 →
+ *   `ErrUnexpectedEof`；`detail::ReaderEngine::Refill` 的空转上限 →
+ *   `streams::IoErrNoProgress()`（不属于本文件）；
+ * - `detail::WriterEngine` 的构造与 `Reset`（`ErrInvalidLevel`）、
+ *   `Write`/`Flush`/`Close`（`ErrClosed`）、sink 失败或无进展
+ *   （`ErrInternal`）。
+ *
+ * ## 阅读建议
+ * 先看上面的表格确认「该用哪个哨兵」，需要定位来源时再按「调用方」跳到实现点。
+ * `errors.cpp` 里为什么是八份独立 static、为什么故意泄漏，见本文件开头。
  */
 #pragma once
 

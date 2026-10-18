@@ -44,6 +44,13 @@
  *   writer.Write(go2cpp::compress::AsBytes(payload));
  *   if (auto err = writer.Close()) { ... }
  *   @endcode
+ *
+ * ## 阅读建议
+ * 本文件只是聚合入口，没有实现。建议顺序：
+ * 1. 先看 `level.hpp`（级别取值与合法性），选一个级别；
+ * 2. 再按所需格式读 `flate.hpp` / `zlib.hpp` / `gzip.hpp` 的 `Writer`/`Reader`；
+ * 3. 需要理解短读、短写、多成员、错误粘性时，进 `detail/writer_engine.hpp`
+ *    与 `detail/reader_engine.hpp`——三个格式的差异只有 windowBits。
  */
 #pragma once
 

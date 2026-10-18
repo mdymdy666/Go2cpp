@@ -86,6 +86,26 @@ Socket::Ptr Socket::CreateUnix(bool datagram) {
     const int fd = ::socket(AF_UNIX, type | SOCK_CLOEXEC, 0);
     return fd < 0 ? Ptr{} : FromFd(fd, AF_UNIX, type, 0);
 }
+/**
+ * @brief 登记一次在途操作，并把当前 fd 交给调用方。
+ *
+ * ## 定位
+ * `Socket` 的每个系统调用（recv/send/accept/connect/bind/listen/set_option…）
+ * 都必须先走这里：它保证「关闭」不会在系统调用中途把 fd 抽走。上层的
+ * `SocketStream`、`http2::FiberTransport`、benchmark 的服务端循环都依赖它。
+ *
+ * ## 步骤
+ * step1. `shared_from_this()` 取一份自引用 —— 即使调用方随后释放最后一个
+ *        `Socket::Ptr`，对象也会活到 `end_operation()`；
+ * step2. 在 `m_mutex` 下检查 `m_closing`/`m_fd`，已关闭则 EBADF 返回；
+ * step3. 首个在途操作把自引用存进 `m_inflight_keepalive`（只在 inflight==0
+ *        时写，避免每次操作都改这个字段）；
+ * step4. `++m_inflight` 后把 fd 拷给调用方。
+ *
+ * ## 配对
+ * 必须与 `end_operation()` 成对；漏掉会让 `release()` 永远等不到 inflight 归零，
+ * 关闭路径卡死。
+ */
 bool Socket::begin_operation(int& fd) noexcept {
     std::shared_ptr<Socket> keep_alive;
     try {
@@ -103,6 +123,17 @@ bool Socket::begin_operation(int& fd) noexcept {
     ++m_inflight;
     return true;
 }
+/**
+ * @brief 结束一次在途操作；关闭正在等待时，这里是收尾点。
+ *
+ * ## 步骤
+ * step1. `--m_inflight`，在锁内判断是否成为最后一个在途操作；
+ * step2. 归零时把 `m_inflight_keepalive` 移到局部变量 —— 保证锁外收尾期间
+ *        对象不被析构；
+ * step3. 若 `m_closing` 且归零：**先** `notify_all` 唤醒 `wait_close_state()`
+ *        的等待者，**再** `finalize_deferred_close()`（顺序不能反：关闭者需要
+ *        先看到 inflight==0 的谓词成立才继续）。
+ */
 void Socket::end_operation() noexcept {
     bool notify = false;
     std::shared_ptr<Socket> keep_alive;

@@ -17,6 +17,16 @@
  *   `HuffmanOnly` 是 Go `compress/flate` 的正式常量（`-2`）。zlib 的
  *   `deflateInit2` 不接受 `level = -2`，因此实现里把它翻译成
  *   「`Z_DEFAULT_COMPRESSION` + `Z_HUFFMAN_ONLY` 策略」，语义与 Go 相同。
+ *
+ * ## 模块定位
+ * 本文件是 `compress` 最底层的常量层，只依赖字面量，被所有格式共享：
+ * `Flate` / `Zlib` / `Gzip` 把这里的常量再导出一次（同名 `static constexpr`），
+ * `detail::WriterEngine` 的构造与 `Reset` 用 `IsValidLevel` 做入参校验，
+ * `detail::Deflater` 用 `HuffmanOnly` 决定是否改走 `Z_HUFFMAN_ONLY` 策略。
+ *
+ * ## 阅读建议
+ * 只需记住「数值就是 zlib `deflateInit2` 的 level」这一件事；随后看
+ * `IsValidLevel` 的 `@note`——非法级别是粘性错误而不是静默降级。
  */
 #pragma once
 

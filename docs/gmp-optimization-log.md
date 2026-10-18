@@ -1526,3 +1526,15 @@ p50 也同步改善（s2 2.84 → 2.63ms；s4 2.76 → 2.63ms）。
 
 - 放开 `perf_event_paranoid`（内核态归因）；
 - 决定投入 `io_uring` IO 后端（唯一能真正减少 syscall 条数的路）。
+
+---
+
+## 附：2026-10-19 全项目注释工作启动（每 15 分钟一轮）
+
+后续轮次记录转见 `docs/annotation-progress.md`（进度表与轮次记录）与
+`docs/annotation-style.md`（格式规范）。不再往本文件追加。
+
+- 第 1 轮：提交 32 轮优化成果（`e566b4b`）；写规范（136 行）；派 2 个子 agent
+  （bufio/compress/hash/encoding、http2/websocket/sse/quic）；确认 GMP 侧注释缺口：
+  `context.cpp`（1,920 行 / 注释 9%）、`channel.hpp`（2,127 行）、`future.hpp`（1,061 行）、
+  `src/network/io.cpp`、`hook.cpp`、`socket.cpp`。

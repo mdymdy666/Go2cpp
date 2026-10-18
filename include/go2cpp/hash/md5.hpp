@@ -34,6 +34,27 @@
  *
  * @note 未实现 Go 的 `New()` 工厂返回接口指针、以及 `encoding.BinaryMarshaler`
  *       （`MarshalBinary`/`UnmarshalBinary`）——它们不属于摘要算法的核心语义。
+ *
+ * ## 模块定位
+ *
+ * 本文件（`include/go2cpp/hash/md5.hpp`）定义 MD5 摘要器。MD5 属于「历史
+ * 兼容」算法：新代码不应使用（安全警告见上），它存在的价值是解析旧协议、
+ * 复现旧哈希结果、非安全去重。位于 `hash` 模块最底层，不依赖其它模块；
+ * 当前仓库引用方只有 `tests/hash/`（RFC 1321 向量 + 与 Python
+ * `hashlib.md5` 对拍），生产代码尚无调用方。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Md5`：流式摘要器（`Hash` 子类），内部 4 个 32 位链接变量 + 64 字节缓冲；
+ * - `kSize`/`kBlockSize`：摘要 16 字节、块 64 字节，对应 Go `md5.Size`/`BlockSize`；
+ * - `Md5::Digest`：一次性入口（对应 Go `md5.Sum`）。
+ *
+ * ## 阅读建议
+ *
+ * 先记住文件头里「最容易写错」的两条约定：消息字与长度字段都是
+ * **little-endian**，且 `Sum` 不改变状态（在副本上收尾）。然后按
+ * `Write` → `Transform` → `Finish` 的顺序读 `src/hash/md5.cpp`。状态转化见
+ * `docs/state-machines/Sha256.md`（该文档同时覆盖 `Md5`/`Sha1`/`Sha256`）。
  */
 #pragma once
 
@@ -48,6 +69,24 @@ namespace go2cpp::hash {
 /**
  * @brief MD5 摘要器（RFC 1321）。
  * @warning 不安全，见文件头。仅用于校验/兼容。
+ *
+ * ## 定位
+ *
+ * 被需要 MD5 兼容性的调用方直接使用，也可作为 `Hash&` 参与「一次遍历多个
+ * 摘要」；当前仓库调用方仅为 `tests/hash/`。因为算法已不安全，**不要**用它
+ * 的输出做完整性或身份校验。
+ *
+ * ## 状态机
+ *
+ * update/final 生命周期与 `Sha1`/`Sha256` 完全同构：正常对象始终处于「吸收
+ * 中」，`Sum()` 在副本上进入「收尾」并输出，原对象可继续写。状态转化表见
+ * `docs/state-machines/Sha256.md`。
+ *
+ * ## 不变量
+ *
+ * - `0 <= m_buffer_len < 64`，`m_buffer[0, m_buffer_len)` 是尚未凑满一块的尾部；
+ * - `m_length` 等于历史所有 `Write` 的字节数之和，`Finish` 之前不受填充影响；
+ * - `Sum()` 不改变 `*this`，因此可任意次取摘要，也可 `Sum` 之后继续 `Write`。
  */
 class Md5 final : public Hash {
  public:
@@ -86,10 +125,10 @@ class Md5 final : public Hash {
     /// 收尾并写出摘要；会改变 `*this`，仅供 `Sum` 在副本上调用。
     void Finish(std::uint8_t* out) noexcept;
 
-    std::uint32_t m_state[4]{};
-    std::uint64_t m_length{0};  ///< 已写入的总字节数（收尾时换算成比特数）。
-    std::uint8_t m_buffer[kBlockSize]{};
-    std::size_t m_buffer_len{0};
+    std::uint32_t m_state[4]{};  ///< A/B/C/D 四个链接变量；Reset 置初值、Transform 更新、Finish 输出
+    std::uint64_t m_length{0};  ///< 已写入的总字节数（收尾时换算成比特数）；Write 累加、Reset 清零、Finish 读取。
+    std::uint8_t m_buffer[kBlockSize]{};  ///< 未满 64 字节的尾部输入；Write 追加、Transform 消费、Reset 只清长度
+    std::size_t m_buffer_len{0};  ///< m_buffer 中有效字节数（0..63）；Write 增加、Transform 后归零、Reset 清零
 };
 
 }  // namespace go2cpp::hash

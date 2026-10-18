@@ -1,3 +1,58 @@
+/**
+ * @file concurrency/channel.hpp
+ * @brief Go 风格 channel 与 select 的完整实现（模板，header-only）。
+ *
+ * ## 模块定位
+ *
+ * `Channel<T>` 是 Go `chan T` 的对应物：带缓冲/无缓冲、`Send/Recv/TrySend/
+ * TryRecv/Close/Range`，语义与 Go 的 `hchan` 对齐（预分配环形缓冲 +
+ * `sendx/recvx/dataqsiz`，**刻意不用 `std::deque`**，见 §缓冲策略）。
+ *
+ * 它建在同步原语之上、业务代码之下：
+ *
+ * - 业务层（`example/concurrency/channel_full.cpp`、`http2` 的流控实验、
+ *   压测的 ping-pong）直接使用 `Channel<T>`；
+ * - `Select` 系列（`SelectValue`/`SelectCase`/`SelectWaitState`）把「多个
+ *   channel 同时等待」编译成一次轮询 + 一个等待节点，供 `select { case <-ch: }`
+ *   形态的代码使用；
+ * - 底层 park/wake 走 `core::ParkingCondition`：受管 G 在此 park 并让出 M，
+ *   普通线程走原生条件变量 —— 因此 channel 阻塞**不会占住 worker**。
+ *
+ * ## 本文件定义什么
+ *
+ * - `ChannelStatus`：操作结果（Ready/WouldBlock/Closed/AlreadyClosed/Cancelled/
+ *   DeadlineExceeded/Empty/Invalid）；
+ * - `ChannelSendResult<T>` / `ChannelRecvResult<T>`：带状态与值的返回结构；
+ * - `SelectValue` / `SelectCaster` / `SelectCase` / `SelectProbe` /
+ *   `SelectWaitState`：select 的编译期分发与运行期等待节点；
+ * - `RingBuffer<T>`：`Channel<T>` 的环形缓冲（就地构造，`cap==0` 不分配）；
+ * - `Channel<T>` 及其只读/只写视图（`SendOnlyChannel`/`RecvOnlyChannel`）。
+ *
+ * ## 缓冲策略（为什么不用 std::deque）
+ *
+ * Go 的 `hchan` 是「预分配数组 + sendx/recvx/dataqsiz」，索引 `++` 后回绕，
+ * **锁内不做取模**（MPMC 下取模更慢）。我们保持同样的布局，这样：
+ * 1. 与 Go 的语义、内存布局直觉一致，便于对照；
+ * 2. 避免 `deque` 的额外一层间接与节点分配；
+ * 3. 关闭/排空时的遍历顺序与 Go 相同。
+ * 曾评估「原子标志 + Try* 无锁快路径」，**否决**：偏离 hchan，且漏一处就是
+ * 偶发丢值（这类 bug 不崩溃、只丢数据）。
+ *
+ * ## 阅读建议
+ *
+ * 先看 `ChannelStatus` 与两个 Result 结构建立「操作可能返回什么」的心智模型；
+ * 再看 `Channel<T>` 的 Send/Recv/Close；最后看 `Select*` —— 它把 N 个 channel
+ * 的等待折叠成一个 `SelectWaitState`，理解关键是「先轮询、再登记、最后 park」。
+ *
+ * ## 边界与陷阱
+ *
+ * - 无缓冲 channel 的 `Send` 会等到有接收者（会 park），`cap==0` 不分配缓冲；
+ * - `Close` 后 `Recv` 返回 `kClosed`；对已关闭的 channel `Send` 返回
+ *   `kAlreadyClosed`（不抛异常）；
+ * - `Range` 语义：关闭后仍能把缓冲区里的剩余值读完，再退出；
+ * - 手动 Fiber（未归属 Scheduler）里 `Select` 返回 `kInvalid`，而
+ *   `ParkingCondition` 返回 `kCancelled` —— 两者语义不同，别当成等价。
+ */
 #pragma once
 
 #include "go2cpp/context.hpp"
@@ -1693,14 +1748,23 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     queue.erase(std::remove(queue.begin(), queue.end(), node), queue.end());
   }
 
+  /// @brief 固定容量（创建后不变）；0 表示无缓冲 rendezvous。
   std::size_t m_capacity{0};
+  /// @brief 保护 buffer/senders/receivers/closed；Send/Recv/Close/Select 全部竞争它。
   mutable std::mutex m_mutex;
+  /// @brief 状态变化通知（有值可收 / 有空间可发 / 已关闭）；等待者在锁外 park 在它上面。
   mutable core::ParkingCondition m_change_cv;
+  /// @brief 正在 m_change_cv 上等待的线程/G 数量；为 0 时省掉一次 notify_all。
   mutable std::atomic<std::uint32_t> m_change_waiters{0};
+  /// @brief 环形缓冲（cap==0 时不分配）；Send 入队、Recv 出队，索引回绕在 RingBuffer 内部。
   detail::RingBuffer<T> m_buffer;
+  /// @brief 已登记但尚未拿到接收者的发送者队列；Recv 从这里直接取走值完成交接（绕过缓冲）。
   std::deque<std::shared_ptr<PendingSend>> m_senders;
+  /// @brief 已登记但尚未拿到值的接收者队列；Send 直接把值塞给它完成交接。
   std::deque<std::shared_ptr<PendingRecv>> m_receivers;
+  /// @brief 已关闭标记；Close 后 Send 返回 kAlreadyClosed，Recv 读完缓冲后返回 kClosed。
   bool m_closed{false};
+  /// @brief 关闭代际（每次 Close +1）；Select 用它判断等待节点是否跨代失效。
   std::atomic<std::uint64_t> m_generation{0};
 };
 

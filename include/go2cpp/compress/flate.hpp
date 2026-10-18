@@ -44,6 +44,11 @@
  *   | 预置字典（Go `flate.NewReaderDict` / `NewWriterDict`） | 需要在 `Writer`/`Reader` 构造时额外传字典并在 `Z_NEED_DICT` 时 `inflateSetDictionary`；当前没有调用场景，且会让 API 出现两个构造重载。需要时可基于 zlib 的 `deflateSetDictionary`/`inflateSetDictionary` 增补。 |
  *   | `Writer.Flush` 的 `Z_FULL_FLUSH` / 字节对齐细节 | Go 的 `Flush` 只保证「当前数据可解」，本模块用 `Z_SYNC_FLUSH` 达到同一目的；没有 `Z_FULL_FLUSH`（重置历史窗口）的公开 API。 |
  *   | 自定义 `dict` 与硬件加速 | DEFLATE 完全委托 zlib，硬件加速（如 zlib-ng）由系统库决定；本模块不参与。 |
+ *
+ * ## 阅读建议
+ * 先看 `Flate::Writer` 的 `Write` / `Flush` / `Close` 生命周期（最容易踩坑的是
+ * 忘记 `Close()`，会得到半截流），再看 `Reader`；想弄清「为什么三个格式共用
+ * 一个引擎」时进 `detail/reader_engine.hpp` 与 `detail/writer_engine.hpp`。
  */
 #pragma once
 
@@ -65,6 +70,16 @@ namespace go2cpp::compress {
  * @details 类本身没有状态，只提供嵌套的 `Reader<ReaderT>` / `Writer<WriterT>`
  *   与级别常量。这样写法与 Go 的 `flate.NewReader` / `flate.NewWriter` 对应，
  *   同时让 `compress::Flate::Reader<Source>` 的读法明确表达「格式 + 传输方向」。
+ *
+ * ## 定位
+ * `compress` 公开门面的第一层：调用方通过它拿到 raw deflate 的 `Reader` /
+ * `Writer`，实际解压/压缩分别委托给 `detail::ReaderEngine<ReaderT>` 与
+ * `detail::WriterEngine<WriterT>`（构造参数 `-15` 表示 raw deflate）。
+ * 与 `Zlib` / `Gzip` 并列，三者只在 windowBits 上不同。
+ *
+ * ## 生命周期与线程模型
+ * 无状态、无成员，嵌套类可在任意线程构造；线程安全性由每个 `Reader` /
+ * `Writer` 实例自己决定（实例之间不共享任何状态）。
  */
 class Flate {
  public:
@@ -83,6 +98,17 @@ class Flate {
   /**
    * @brief raw DEFLATE 解压器。
    * @tparam ReaderT 底层 Reader（`streams::ReadResult Read(char*, size_t)`）。
+   *
+   * ## 定位
+   * 供需要 raw deflate 的调用方（`tests/compress` 的往返测试、以及要自己包
+   * 一层容器格式的代码）读取压缩数据。本类只做转发：把 `source` 交给
+   * `detail::ReaderEngine<ReaderT>`，`Read` / `Err` / `Reset` 全部委托过去，
+   * 真正的拉取循环在 `reader_engine.hpp`。
+   *
+   * ## 生命周期与线程模型
+   * 不拥有 `source`（调用方保证其生命周期覆盖读取），引擎是成员、随本对象
+   * 析构释放。非线程安全：与 `bufio::Reader` 一样，一个实例同一时刻只应被
+   * 一个线程使用。
    *
    * @warning 只引用 `source`，不拥有它。
    */
@@ -120,7 +146,7 @@ class Flate {
     }
 
    private:
-    detail::ReaderEngine<ReaderT> m_engine;
+    detail::ReaderEngine<ReaderT> m_engine;  ///< 解压循环 + 粘性错误；`Read`/`Reset`/`Err` 都转发给它，随本对象析构，非共享
   };
 
   /**
@@ -129,6 +155,15 @@ class Flate {
    *
    * @note `Writer` 析构**不会**自动 `Close()`：与 `bufio::Writer` 不自动
    *       `Flush()` 同理，`Close()` 失败必须能被调用方看到。
+   *
+   * ## 定位
+   * 供需要产出 raw deflate 的调用方使用；压缩状态、冲刷与短写重试全部在
+   * `detail::WriterEngine<WriterT>` 里，本类只暴露 Go 风格的
+   * `Write` / `Flush` / `Close`。
+   *
+   * ## 生命周期与线程模型
+   * 构造即初始化 zlib（非法级别变成粘性错误，不抛异常）；必须显式 `Close()`
+   * 才能得到完整流。非线程安全：每个实例独占一个 `WriterEngine`。
    */
   template <typename WriterT>
   class Writer {
@@ -177,7 +212,7 @@ class Flate {
     }
 
    private:
-    detail::WriterEngine<WriterT> m_engine;
+    detail::WriterEngine<WriterT> m_engine;  ///< 压缩循环 + 粘性错误；`Write`/`Flush`/`Close` 都转发给它，随本对象析构，非共享
   };
 };
 

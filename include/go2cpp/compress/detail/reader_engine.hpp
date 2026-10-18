@@ -26,6 +26,20 @@
  *   `DeflateStatus` 是本模块自己的枚举。好处有两点：一是 `zlib.h` 会把
  *   `Byte` / `uInt` / `Bytef` 等 typedef 塞进全局命名空间，容易与使用者冲突；
  *   二是「换实现」（例如以后接 zlib-ng 或 libdeflate）只改 `src/compress/`。
+ *
+ * ## 本文件定义什么
+ * - `InflateStatus`：一次 `inflate` 的三分类（`kOk` / `kMemberEnd` / `kError`），
+ *   把 zlib 的 `Z_OK` 与 `Z_BUF_ERROR` 合并成「继续」；
+ * - `Inflater`：zlib inflate 状态的 RAII 封装（非模板），负责输入缓冲、
+ *   `uInt` 截断防护、错误码翻译与多成员 reset；
+ * - `ReaderEngine<ReaderT>`：三个格式共用的拉取式解压循环 + 状态机；
+ * - `ReadAsStream`：把引擎适配成 `streams::ReadResult` 的薄适配器。
+ *
+ * ## 阅读建议
+ * 先看 `InflateStatus` 与 `Inflater::Inflate` 的返回约定，再读
+ * `ReaderEngine::Read` 的循环（状态机总览见
+ * `docs/state-machines/ReaderEngine.md`）。`Refill` 是「源耗尽 / 成员边界」
+ * 两种语义的分叉点，建议和 `FinishOnSourceEof` 对照着读。
  */
 #pragma once
 
@@ -54,6 +68,17 @@ enum class InflateStatus : std::uint8_t {
 
 /**
  * @brief zlib `inflate` 状态的 RAII 封装（非模板，实现在 .cpp）。
+ *
+ * ## 定位
+ * `detail` 层对 zlib inflate 的唯一接触面：`ReaderEngine<ReaderT>` 持有它，
+ * 并决定「什么时候向源要数据、什么时候调用 inflate」；本类只负责输入缓冲、
+ * 把新字节挂到 `next_in`、调用 `inflate`、把返回码归类。格式差异
+ * （`-15` / `15` / `31`）由构造参数决定，所以三个 Reader 能共用一个实现。
+ *
+ * ## 生命周期与线程模型
+ * 由 `ReaderEngine` 在构造时创建（通过 `unique_ptr` 持有），随引擎析构调用
+ * `inflateEnd`；`Reset` / `ResetForNextMember` 复用同一个 zlib 流。
+ * 非线程安全：一个实例只能被持有它的那个 Reader 线程使用。
  *
  * @warning 非线程安全：每个 `Reader` 各持一个实例。
  */
@@ -121,6 +146,28 @@ class Inflater {
  * @brief 三个格式共用的解压循环。
  * @tparam ReaderT 底层 Reader 类型（需满足文件头的 `Read(char*, size_t)` 契约）。
  *
+ * ## 定位
+ * 三个公开 Reader（`Flate::Reader` / `Zlib::Reader` / `Gzip::Reader`）的共同
+ * 实现：它们只把 `source`、windowBits、multistream 传进来，之后 `Read` /
+ * `Err` / `Reset` / `Multistream` 全部由本类完成。上层通过 `ReadAsStream`
+ * 组合到 `bufio::Reader` 时，也是转发到本类。
+ *
+ * ## 生命周期与线程模型
+ * 由公开 Reader 以成员方式持有，引用 `ReaderT` 但不拥有它；不共享、不加锁，
+ * 一个实例同一时刻只应被一个线程驱动。zlib 状态全部在 `m_inflater` 里，
+ * 随本对象析构释放。
+ *
+ * ## 状态机
+ * 有明确的多状态（等待输入 / 解压中 / 成员结束 / EOF / 失败），状态转化表见
+ * `docs/state-machines/ReaderEngine.md`。`Read` 是唯一驱动入口，`Refill` 与
+ * `FinishOnSourceEof` 负责「源耗尽」的两种解释。
+ *
+ * ## 不变量
+ * - `m_error` 一旦非空即粘性：`Read` 直接返回 0，`Refill` 直接返回 false；
+ * - `m_stream_end == true` 时不会再向 `m_source` 读数据；
+ * - `m_deferred_error` 非空只表示「本次数据已交付，错误等下次取输入时再报」；
+ * - `m_inflater.input_available() > 0` 时不会调用 `Refill`（先把输入消费完）。
+ *
  * @warning `ReaderEngine` 只**引用** `ReaderT`，不拥有它；底层对象生命周期
  *          必须覆盖本对象。
  */
@@ -153,8 +200,21 @@ class ReaderEngine {
    *         只在极少数情况下返回「0 且无错误」，调用方按 `io.Reader` 惯例重试即可。
    * @note 一次调用可能填满整个 `destination`，也可能只返回一部分：底层数据
    *       不足时提前返回，不会空转等待。
+   *
+   * ## 步骤
+   * step1. 粘性错误 / 空目标：直接返回 0，不碰底层（空目标不触发读）；
+   * step2. 逻辑流已结束：本轮还没产出就写 `streams::IoEof()`，否则带着已有
+   *        数据返回，把 EOF 留给下一次调用；
+   * step3. 输入耗尽先 `Refill`；返回 false 表示错误/EOF 已定，回到循环顶部
+   *        由统一出口决定返回值；
+   * step4. 调 `Inflater::Inflate` 把数据写进 `destination`，再按
+   *        `kError` / `kMemberEnd` / `kOk` 分类；
+   * step5. 成员结束时：单流直接标 `m_stream_end`；多流且缓冲有余量就
+   *        `ResetForNextMember`，否则 `Refill(true)` 判断后面还有没有成员；
+   * step6. `kOk` 却既不消费输入也不产出 → 判定 zlib 卡死，报 `ErrCorrupt`。
    */
   std::size_t Read(ByteSpan destination) {
+    // step1: 粘性错误与空目标都在这里短路，避免无意义地下探底层。
     if (m_error) {
       return 0;
     }
@@ -163,6 +223,7 @@ class ReaderEngine {
     }
     std::size_t total = 0;
     while (total < destination.size()) {
+      // step2: 流已结束；EOF 只在「本次没有数据可交」时报告。
       if (m_stream_end) {
         // 流已完整结束：把 EOF 留给「没有数据可交」的那次调用，避免
         // 同时返回数据 + EOF（Go 的 Reader 也允许，但分开更不容易用错）。
@@ -171,12 +232,14 @@ class ReaderEngine {
         }
         break;
       }
+      // step3: 输入耗尽，向源要下一块；Refill 会区分 EOF / 错误 / 截断。
       if (m_inflater.input_available() == 0) {
         if (!Refill(false)) {
           break;  // Refill 已写 m_error 或置 m_stream_end
         }
         continue;
       }
+      // step4: 真正的解压；调用方缓冲直接作为 avail_out，中间不拷贝。
       std::size_t produced = 0;
       ErrorPtr error;
       const std::size_t available_before = m_inflater.input_available();
@@ -188,6 +251,7 @@ class ReaderEngine {
         m_error = error ? error : ErrCorrupt();
         break;
       }
+      // step5: 成员结束——单流直接结束，多流可能接下一个成员。
       if (status == InflateStatus::kMemberEnd) {
         if (!m_multistream) {
           m_stream_end = true;
@@ -209,6 +273,7 @@ class ReaderEngine {
         m_inflater.ResetForNextMember();
         continue;
       }
+      // step6: zlib 不再前进（既不吃输入也不产出）时不能死等，直接判损坏。
       // kOk 但没有消费输入也没有产出：zlib 不再前进（例如非法块被容错吞掉），
       // 继续循环会死等，直接判损坏。
       if (produced == 0 && m_inflater.input_available() == available_before) {
@@ -248,8 +313,17 @@ class ReaderEngine {
    * @return 拿到至少 1 字节返回 true；否则 false（`m_error` 或 `m_stream_end` 已定）。
    * @details 两种边界对「源已耗尽」的解释不同：流没结束就耗尽 → 数据被截断
    *   （`ErrUnexpectedEof`）；成员刚结束就耗尽 → 正常 EOF。
+   *
+   * ## 步骤
+   * step1. 快速出口：已有粘性错误 / 延迟错误 / 源已 EOF；
+   * step2. 循环向 `m_source` 要一块输入（容量 32 KiB）；
+   * step3. `count > 0`：`CommitInput` 后立即返回 true；若同时带错误，EOF 只
+   *        做标记，其他错误延迟到下一次取输入再报（Go 的 Reader 契约）；
+   * step4. `count == 0`：EOF 标记、致命错误直接记录、连续空转 100 次报
+   *        `IoErrNoProgress`；任一路径导致源耗尽都走 `FinishOnSourceEof`。
    */
   bool Refill(bool after_member_end) {
+    // step1: 任何已决状态都不再读源，避免把粘性错误覆盖成别的错误。
     if (m_error) {
       return false;
     }
@@ -261,11 +335,13 @@ class ReaderEngine {
       FinishOnSourceEof(after_member_end);
       return false;
     }
+    // step2: 拉取循环；空读由 idle 计数兜底，防止对端永远返回 (0, nil)。
     int idle = 0;
     for (;;) {
       const streams::ReadResult result = m_source->Read(
           reinterpret_cast<char*>(m_inflater.input_buffer()),
           m_inflater.input_capacity());
+      // step3: 有数据先交付；错误（包括 EOF）留到下一次需要输入时处理。
       if (result.count > 0) {
         m_inflater.CommitInput(result.count);
         if (result.error) {
@@ -278,6 +354,7 @@ class ReaderEngine {
         }
         return true;
       }
+      // step4: 没有数据时的错误分类：EOF / 致命错误 / 空转上限。
       if (result.error) {
         if (go2cpp::Is(result.error, streams::IoEof())) {
           m_source_eof = true;
@@ -305,13 +382,13 @@ class ReaderEngine {
     m_error = ErrUnexpectedEof();
   }
 
-  ReaderT* m_source;
-  Inflater m_inflater;
-  bool m_multistream;
-  bool m_source_eof{false};
-  bool m_stream_end{false};
-  ErrorPtr m_deferred_error;
-  ErrorPtr m_error;
+  ReaderT* m_source;              ///< 底层数据源，只引用不拥有；构造/Reset 改绑，Refill 调用其 Read
+  Inflater m_inflater;            ///< zlib 状态 + 32 KiB 输入缓冲；Read/Reset/Refill 使用，随本对象析构
+  bool m_multistream;             ///< 是否解析拼接成员（gzip 默认 true）；构造设定，SetMultistream 修改，Read 在成员结束时读取
+  bool m_source_eof{false};       ///< 底层 Reader 是否已报 EOF；Refill 置位，Reset 清零，FinishOnSourceEof 读取
+  bool m_stream_end{false};       ///< 逻辑流是否已完整结束；非多成员命中成员结束或源在成员边界耗尽时置位，Read 据此交 EOF
+  ErrorPtr m_deferred_error;      ///< 「count>0 且带错误」时暂存的错误；Refill 写入，下次 Refill 优先转成 m_error，Reset 清空
+  ErrorPtr m_error;               ///< 粘性错误（正常结束存 IoEof）；Err 读取，Read/Refill 入口检查，Reset 清空
 };
 
 /**

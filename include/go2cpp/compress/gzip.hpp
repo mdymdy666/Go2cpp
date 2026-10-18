@@ -38,6 +38,12 @@
  *      「可复现的 MTIME/OS/文件名」，当前不需要。）
  *   2. `Resetter` 已支持：`Reader::Reset(source)` / `Writer::Reset(destination)`。
  *   3. 只支持单个 gzip 头部的 10 字节基础字段；不解析 FHCRC/FEXTRA。
+ *
+ * ## 阅读建议
+ * 先看「多成员（concatenated gzip）」一节——这是 gzip 与 zlib 最大的行为
+ * 差异，也是 `Reader::Multistream` 与 `ReaderEngine` 状态机的来源；再看
+ * `Gzip::Writer`，它的生命周期与 `Zlib::Writer` / `Flate::Writer` 完全一致。
+ * 头/尾字节的解析与 crc32/ISIZE 校验全部由 zlib 完成，本模块只选 windowBits。
  */
 #pragma once
 
@@ -55,6 +61,16 @@ namespace go2cpp::compress {
 
 /**
  * @brief gzip 格式的 Reader / Writer 工厂类。
+ *
+ * ## 定位
+ * `compress` 公开门面的 gzip 分支：向调用方提供 `Gzip::Reader` /
+ * `Gzip::Writer`，二者分别委托给 `detail::ReaderEngine<ReaderT>` 与
+ * `detail::WriterEngine<WriterT>`（构造参数 `15 + 16 = 31`）。
+ * 与 `Flate` / `Zlib` 并列；gzip 是三者中唯一支持多成员拼接的格式。
+ *
+ * ## 生命周期与线程模型
+ * 工厂本身无状态；线程安全性由每个 `Reader` / `Writer` 实例自己决定
+ * （实例之间不共享任何状态）。
  */
 class Gzip {
  public:
@@ -73,6 +89,21 @@ class Gzip {
   /**
    * @brief gzip 解压器（默认支持多成员）。
    * @tparam ReaderT 底层 Reader（`streams::ReadResult Read(char*, size_t)`）。
+   *
+   * ## 定位
+   * 供需要读 gzip 的调用方使用（尤其是 `cat a.gz b.gz > ab.gz` 这类拼接流）：
+   * 构造时把 `multistream` 置 true，其余全部转给
+   * `detail::ReaderEngine<ReaderT>`。默认多成员是刻意与 Go `gzip.Reader`
+   * 对齐的行为，不要在没有理由时关掉。
+   *
+   * ## 状态机
+   * 「读头 / 读 body / 读尾 / 成员结束 / 下一个成员 / EOF」由 `ReaderEngine`
+   * 统一管理，状态转化表见 `docs/state-machines/ReaderEngine.md`。
+   * `Multistream(false)` 会把「成员结束」直接导向 EOF。
+   *
+   * ## 生命周期与线程模型
+   * 只引用 `source`（生命周期由调用方保证）；zlib 状态在构造时创建、随对象
+   * 析构释放。非线程安全：一个实例同一时刻只应被一个线程使用。
    *
    * @warning 只引用 `source`，不拥有它。
    */
@@ -123,7 +154,7 @@ class Gzip {
     }
 
    private:
-    detail::ReaderEngine<ReaderT> m_engine;
+    detail::ReaderEngine<ReaderT> m_engine;  ///< 解压循环 + 粘性错误 + 多成员状态；`Read`/`Multistream`/`Reset` 都转发给它
   };
 
   /**
@@ -132,6 +163,15 @@ class Gzip {
    *
    * @note 析构不自动 `Close()`：忘记 `Close()` 会得到**没有 crc32 尾**的
    *       半截 gzip 文件，解压方报 `ErrUnexpectedEof`。
+   *
+   * ## 定位
+   * 供需要产出 gzip 的调用方使用；头 10 字节、deflate 体、crc32/ISIZE 尾都由
+   * zlib 按 windowBits=31 生成，本类只负责把 `Write`/`Flush`/`Close` 转给
+   * `detail::WriterEngine<WriterT>`。
+   *
+   * ## 生命周期与线程模型
+   * 构造即初始化 zlib（非法级别变成粘性错误）；必须显式 `Close()` 才会写出
+   * 尾部。非线程安全：每个实例独占一个 `WriterEngine`。
    */
   template <typename WriterT>
   class Writer {
@@ -180,7 +220,7 @@ class Gzip {
     }
 
    private:
-    detail::WriterEngine<WriterT> m_engine;
+    detail::WriterEngine<WriterT> m_engine;  ///< 压缩循环 + 粘性错误；`Write`/`Flush`/`Close` 都转发给它，随本对象析构，非共享
   };
 };
 

@@ -13,6 +13,27 @@
  *
  *   **错误判空**：`ok()` 为真表示没有错误。`Value()` 在失败时返回
  *   默认构造的值（不会抛异常、不会崩溃），调用方应先看 `ok()`。
+ *
+ * ## 模块定位
+ *
+ * `bufio` 的返回约定层：`Reader`/`Writer`/`Scanner` 中所有可能失败的方法都返回
+ * 它，调用方因此可以不使用异常、统一写 `if (!res.ok())`。错误本身来自
+ * `errors.hpp` 或 `streams`，本文件只负责「值 + 错误」的打包。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Result<T>`：可同时携带值与错误（部分成功）；
+ * - `Result<void>`：只表达成功/失败，避免为 `Flush`/`WriteByte` 这类 API 造无意义的值。
+ *
+ * ## 阅读建议
+ *
+ * 先读「为什么允许带值失败」——`Peek`/`ReadString`/`ReadSlice` 在 EOF 或缓冲满时
+ * 都靠它交付「已有数据 + 错误」；再看 `Value()` 在失败态的行为（返回默认值而非抛异常）。
+ *
+ * ## 边界与陷阱
+ *
+ * `T` 必须可默认构造；`Value()` 不检查 `ok()`，失败态读到的是默认值；`Err()` 返回
+ * 引用，`Result` 一旦移动/析构就不要再持有该引用。
  */
 #pragma once
 
@@ -28,6 +49,20 @@ namespace go2cpp::bufio {
 /**
  * @brief 携带一个值或一条错误的返回包装。
  * @tparam T 值类型；必须可默认构造（`ByteSpan`、`std::string`、整数均满足）。
+ *
+ * ## 定位
+ * `bufio` 三个装饰器的统一返回包装：`Reader::ReadByte`/`ReadLine`/`ReadString`/
+ * `ReadSlice`/`Peek`，`Writer::WriteByte`/`WriteString`/`Flush`/`ReadFrom`，
+ * 以及 `Scanner` 的调用方都通过它取值与判错。
+ *
+ * ## 生命周期与线程模型
+ * 纯值类型：可拷贝、可移动、按值返回；内部 `ErrorPtr` 是共享所有权的不可变错误，
+ * 把错误跨线程传递本身是安全的。`Result` 自身不提供任何同步。
+ *
+ * ## 不变量
+ * - `ok()` 等价于 `!m_error`；
+ * - 失败态下 `m_value` 必为默认构造值（「带值失败」构造是唯一例外）；
+ * - `Err()` 返回的引用在 `Result` 存活期内有效，且指向不可变对象。
  */
 template <typename T>
 class Result {
@@ -58,8 +93,8 @@ public:
     }
 
 private:
-    T m_value{};
-    ErrorPtr m_error;
+    T m_value{};    ///< 成功/部分成功时的值；失败时保持默认构造，由 Value()/ValueOr() 读取
+    ErrorPtr m_error; ///< 空表示成功；由 ok()/Err() 读取，构造后不再改变
 };
 
 /**
@@ -67,6 +102,13 @@ private:
  * @details 显式特化而不是用 `Result<std::monostate>`，避免在
  *          `Writer::WriteByte`、`Flush` 这类「只关心错误」的 API 上
  *          引入无意义的值。
+ *
+ * ## 定位
+ * 只关心成败的 API（`Writer::WriteByte`/`WriteString`/`Flush`、`Reader::UnreadByte`/
+ * `UnreadRune`）的返回类型。
+ *
+ * ## 不变量
+ * `ok()` 等价于 `!m_error`；没有「带值失败」形态。
  */
 template <>
 class Result<void> {
@@ -84,7 +126,7 @@ public:
     const ErrorPtr& Err() const noexcept { return m_error; }
 
 private:
-    ErrorPtr m_error;
+    ErrorPtr m_error; ///< 空表示成功；由 ok()/Err() 读取，构造后不再改变
 };
 
 }  // namespace go2cpp::bufio

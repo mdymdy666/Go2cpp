@@ -36,6 +36,24 @@
  *   （见下）；
  * - **优先级**：PRIORITY 帧被解析但不参与调度（RFC 9113 已弃用）；
  * - **服务器推送的实际使用**：PUSH_PROMISE 能解析，但没有推送 API。
+ *
+ * ## 本文件定义什么
+ * - `Role` / `ConnectionConfig`：角色与全部可调参数（帧尺寸、header 上限、
+ *   HPACK 表大小、初始窗口、并发流上限）；
+ * - `ConnStatus` / `ConnState`：操作结果与连接生命周期状态；
+ * - `IncomingEvent`：`ReadEvent()` 交付给上层的统一事件结构；
+ * - `Connection`：握手、请求/响应、流表、流控、GOAWAY 的唯一入口。
+ *
+ * ## 阅读建议
+ * 先看 `ConnState` 与公开方法的同步阻塞语义，再看
+ * `docs/state-machines/Http2Connection.md`，最后进 `connection.cpp` 的
+ * `ReadEvent()` —— 它是整个协议的分发中心。
+ *
+ * ## 边界与陷阱
+ * - 所有接口同步阻塞：`ReadEvent()` 会等到下一个帧才返回；
+ * - **单驱动者**：一个 `Connection` 只能由一个线程/Fiber 使用，类内没有锁；
+ * - `WriteData()` 返回 `kFlowControl` 不是错误：等 `WINDOW_UPDATE`（再读一次
+ *   事件）后重试；被拒绝的调用不会消耗 END_STREAM。
  */
 #pragma once
 
@@ -139,6 +157,21 @@ struct IncomingEvent final {
  * @details 非线程安全：一个连接只能由一个线程/Fiber 驱动（与 Go 的 `http2`
  *          用法一致 —— 单 goroutine 读，写需外部同步）。这一点在类注释里
  *          说明而不加锁，是为了让协议逻辑保持简单、可测。
+ *
+ * ## 定位
+ * 被 `http::Client`（HTTP/2 路径）、示例与测试直接构造；向下依赖 `Transport`
+ * 取字节，同层用 `Decoder`/`Encoder`（HPACK）与 `StreamStateMachine`（流状态），
+ * 向上交付 `IncomingEvent`。它不关心字节从哪来，因此可脱离网络测试。
+ *
+ * ## 不变量
+ * - `handshaked()` 为真之前不分配流号，也不发 HEADERS/DATA；
+ * - `StartRequest()` 只在 `kOpen` + 已握手时成功，客户端流号按奇数递增；
+ * - `WriteFrame()` 失败即置 `kClosed`：绝不留下写了一半的帧却仍宣称可用；
+ * - 发送窗口 = 连接级 + 流级；接收侧在扣减前先校验，窗口不会为负。
+ *
+ * ## 状态机
+ * 状态转化表见 `docs/state-machines/Http2Connection.md`；
+ * 流级转化见 `docs/state-machines/Http2StreamState.md`。
  */
 class Connection final {
 public:
@@ -162,6 +195,15 @@ public:
      * @brief 完成握手（客户端发 preface+SETTINGS 并等对端 SETTINGS；
      *        服务端反之）。
      * @return 状态。
+     *
+     * ## 步骤
+     * step1. 客户端先写 24 字节 preface（服务端则读并逐字节比对）；
+     * step2. 写本地 SETTINGS（表大小 / 帧上限 / 初始窗口 / 并发流数）；
+     * step3. `FinishSettingsHandshake()` 循环收对端 SETTINGS，回 ACK 后置
+     *         `m_handshaked = true`。
+     *
+     * ## 失败语义
+     * 写失败立即把连接置 `kClosed`；preface 不匹配返回 `kProtocolError`。
      */
     ConnStatus Handshake(std::string* error = nullptr);
 
@@ -172,11 +214,26 @@ public:
      * @param out_stream_id 成功时写入分配的流 id。
      * @return 状态。非客户端调用返回 `kUnsupported`；连接非 `kOpen`
      *         （draining/closed）时返回 `kProtocolError`。
+     *
+     * ## 步骤
+     * step1. 校验角色（仅客户端）、连接 `kOpen`、已握手；
+     * step2. 分配奇数流号（每次 +2）；
+     * step3. `EncodeBlock()` 编码 HEADERS，`try_emplace` 建流并 `SendHeaders()`；
+     * step4. 初始化该流窗口，`WriteHeaderBlock()` 在必要时拆 CONTINUATION。
      */
     ConnStatus StartRequest(const std::vector<HeaderField>& headers, bool end_stream,
                             std::uint32_t* out_stream_id, std::string* error = nullptr);
 
     /** @brief 在已打开的流上发送 DATA。 */
+    /**
+     * @brief 在已打开的流上发送 DATA。
+     *
+     * ## 步骤
+     * step1. 只读预检：`CanSendData()`、帧尺寸、流控（都不修改状态）；
+     * step2. 提交：`SendData()` 推进状态机；
+     * step3. 扣减窗口；失败时 `ForceClose()`，不留「状态已变、帧没发」的中间态；
+     * step4. 写帧；写失败同样 `ForceClose()`。
+     */
     ConnStatus WriteData(std::uint32_t stream_id, const std::vector<std::uint8_t>& data,
                          bool end_stream, std::string* error = nullptr);
 
@@ -190,12 +247,31 @@ public:
                            std::string* error = nullptr);
 
     /** @brief 发送 GOAWAY 并把连接置为 kDraining（不再接受新流）。 */
+    /**
+     * @brief 发送 GOAWAY 并把连接置为 kDraining（不再接受新流）。
+     *
+     * ## 步骤
+     * step1. 取当前最大流 id 作为 `last_stream_id`（已知偏差见实现注释）；
+     * step2. 写 GOAWAY；
+     * step3. 成功后把连接迁到 `kDraining`（已有流仍可收尾）。
+     */
     ConnStatus SendGoAway(ErrorCode code, std::string* error = nullptr);
 
     /**
      * @brief 读取下一个事件（阻塞）。
      * @param out 成功时写入事件。
      * @return `kOk` 表示拿到事件；`kClosed` 表示对端关闭。
+     *
+     * ## 步骤
+     * step1. `TakeFrame()` 取一个完整帧（不足则继续 `FillBuffer()`）；
+     * step2. 按帧类型分发：HEADERS / DATA / SETTINGS / PING / RST_STREAM /
+     *         GOAWAY / WINDOW_UPDATE / 未知；
+     * step3. HEADERS 先拼 CONTINUATION 再 HPACK 解码，并做两道大小上限校验；
+     *         DATA 先做接收流控预检，超过半窗再回 WINDOW_UPDATE；
+     * step4. 推进对应流的 `StreamStateMachine`（新流初建窗口），填充 `IncomingEvent`。
+     *
+     * ## 失败语义
+     * 协议错误返回 `kProtocolError` 且不自动发 GOAWAY：调用方应停止使用该连接。
      */
     ConnStatus ReadEvent(IncomingEvent* out, std::string* error = nullptr);
 
@@ -218,6 +294,11 @@ private:
      * @brief 写一个 header block，必要时拆成 HEADERS + CONTINUATION。
      * @details 单个帧的 payload 上限是 `m_peer_max_frame_size - 9`（去掉帧头）。
      *          只有最后一片带 `END_HEADERS`；`end_stream` 只加在 HEADERS 上。
+     *
+     * ## 步骤
+     * step1. 用 `m_peer_max_frame_size - 9` 算单片上限；
+     * step2. 一帧装得下走快路径（绝大多数情况）；
+     * step3. 否则 HEADERS(无 END_HEADERS) + 若干 CONTINUATION，最后一片带 END_HEADERS。
      */
     ConnStatus WriteHeaderBlock(std::uint32_t stream_id,
                                 const std::vector<std::uint8_t>& block, bool end_stream,
@@ -227,6 +308,12 @@ private:
      * @param first_block 首个 HEADERS 携带的片段。
      * @param stream_id 期望的流 id（CONTINUATION 必须同一条流）。
      * @param out 拼接结果。
+     *
+     * ## 步骤
+     * step1. 清空输出并检查首片是否已超限；
+     * step2. 循环取帧，直到遇到 `END_HEADERS`；
+     * step3. 校验帧类型必须是 CONTINUATION、流 id 必须与 HEADERS 一致；
+     * step4. 边拼边累计上限（不能等收完再判，否则 CONTINUATION 泛滥可撑爆内存）。
      */
     ConnStatus AssembleHeaderBlock(std::uint32_t stream_id,
                                    const std::vector<std::uint8_t>& first_block,
@@ -236,9 +323,13 @@ private:
     /// 取或创建流状态机。
     StreamStateMachine* StreamFor(std::uint32_t stream_id);
 
+    /// 字节通道；构造注入，所有 Read/Write 都经它，连接不拥有其生命周期。
     Transport* m_transport{nullptr};
+    /// 角色；构造时决定，role() 只读，影响 preface 与流号奇偶。
     Role m_role{Role::kClient};
+    /// 构造时的配置快照；config() 只读，握手/流控上限都取自它。
     ConnectionConfig m_config;
+    /// 握手完成标记；仅 FinishSettingsHandshake() 置真，Handshake() 读取。
     bool m_handshaked{false};
     /// 连接生命周期状态；由本类内部迁移（见 ConnState）。
     ConnState m_state{ConnState::kOpen};
@@ -246,13 +337,20 @@ private:
     std::uint32_t m_peer_last_stream_id{0};
     /// 下一个可用的客户端流 id（奇数）。
     std::uint32_t m_next_stream_id{1};
+    /// 对端允许的单帧上限；SETTINGS 到达时更新，WriteHeaderBlock()/WriteData() 使用。
     std::uint32_t m_peer_max_frame_size{kDefaultMaxFrameSize};
+    /// 读方向缓冲；FillBuffer() 追加、TakeFrame() 消费并 erase。
     std::vector<std::uint8_t> m_read_buffer;
+    /// HPACK 解码器（含动态表）；只在 ReadEvent() 的 HEADERS 分支使用。
     Decoder m_decoder;
+    /// HPACK 编码器（含动态表）；StartRequest()/SendResponseHeaders() 写，SETTINGS 到达时收缩。
     Encoder m_encoder;
+    /// 流表（键为流 id）；StreamFor() 查找、StartRequest()/ReadEvent() 插入、Streams() 只读暴露。
     std::map<std::uint32_t, StreamStateMachine> m_streams;
     /// 握手期间暂存的 SETTINGS 是否已收到/已发送。
+    /// 是否已收到对端非 ACK SETTINGS；FinishSettingsHandshake() 置位。
     bool m_peer_settings_received{false};
+    /// 本地 SETTINGS 是否已写出；Handshake() 置位（当前仅用于诊断）。
     bool m_local_settings_sent{false};
 
     // ---- 流控（RFC 9113 §6.9）----

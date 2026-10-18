@@ -53,6 +53,35 @@
  *   `src/bufio/bufio.cpp`。使用方必须链接 `go2cpp::bufio`（CMake 目标
  *   `go2cpp_bufio`）。与 `go2cpp::os` 一样，它**不在** `go2cpp::runtime`
  *   的导出表里，需要显式链接。
+ *
+ * ## 模块定位
+ *
+ * `bufio` 处在「原始字节流」与「协议解析」之间：上游是 `go2cpp::streams`
+ * （`ReadResult`/`WriteResult` 契约、`IoEof()` 等哨兵错误），下游是 `net`、
+ * `http`、`os` 等按行/按词/按块读协议的模块。本文件不含实现，只把三个装饰器
+ * 与它们的公共部件聚合成一个入口头文件。
+ *
+ * ## 本文件定义什么
+ *
+ * 本文件**不定义任何类型**，只聚合 7 个头文件：
+ *
+ * - `reader.hpp`：`Reader<ReaderT>`、`ReadRuneResult`、`Rune`/`RuneError`；
+ * - `writer.hpp`：`Writer<WriterT>`；
+ * - `scanner.hpp`：`Scanner<ReaderT>`、`SplitResult`/`SplitFunc` 与三个预置
+ *   `SplitFunc` 的声明；
+ * - `byte_span.hpp`：`ByteSpan` 与 `AsBytes`/`AsStringView`/`ToString`；
+ * - `result.hpp`：`Result<T>`/`Result<void>`；
+ * - `errors.hpp`：7 个哨兵错误工厂；
+ * - `limits.hpp`：4096/16/100/64 KiB 四个常量与 `detail::ClampBufferSize`。
+ *
+ * ## 阅读建议
+ *
+ * 1. 先读 `reader.hpp` 的文件头：缓冲区游标、`Peek` 零拷贝、EOF 粘性，
+ *    以及三处与 Go 有意的差异；
+ * 2. 再读 `scanner.hpp`：`SplitFunc` 的 `advance`/`token` 契约，配合
+ *    `docs/state-machines/Scanner.md` 理解终止路径；
+ * 3. 最后读 `writer.hpp`：`Flush()` 的部分写循环与「析构不 flush」的取舍；
+ * 4. `byte_span.hpp`/`result.hpp`/`errors.hpp`/`limits.hpp` 是工具件，用到再查。
  */
 #pragma once
 

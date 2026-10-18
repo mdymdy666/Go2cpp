@@ -12,6 +12,29 @@
  *
  *   **EOF 不在这里**：`bufio` 与 `io` 用的是**同一个** EOF 值
  *   （`streams::IoEof()`），否则「读到末尾」会在模块边界上变成两种身份。
+ *
+ * ## 模块定位
+ *
+ * `bufio` 的错误身份层，是整个模块唯一的错误来源。`reader.hpp` 在 `ReadLine`/
+ * `ReadSlice`/`UnreadByte`/`UnreadRune` 中返回这里的产品，`scanner.hpp` 在
+ * `Scan`/`ReadMore` 中用它终止扫描，调用方则用 `go2cpp::Is(err, bufio::ErrXxx())`
+ * 做身份判断。
+ *
+ * ## 本文件定义什么
+ *
+ * 7 个哨兵错误工厂函数（定义在 `src/bufio/bufio.cpp`）：`ErrBufferFull`、
+ * `ErrTooLong`、`ErrNegativeCount`、`ErrInvalidAdvance`、`ErrInvalidUnreadByte`、
+ * `ErrInvalidUnreadRune`、`ErrFinalToken`。EOF 不在其中，复用 `streams::IoEof()`。
+ *
+ * ## 阅读建议
+ *
+ * 只需记住两件事：返回的指针**进程内唯一**（不要自己 `new` 同类错误）；
+ * 判断一律用 `go2cpp::Is`，不要比较错误文本。
+ *
+ * ## 边界与陷阱
+ *
+ * 这些函数故意 `new` 后不析构（见 `@details`），因此指针在首次调用后恒定；
+ * 不要在静态初始化阶段把它们当作「尚未创建」的东西使用。
  */
 #pragma once
 

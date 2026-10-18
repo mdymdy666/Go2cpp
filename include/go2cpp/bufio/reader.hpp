@@ -46,6 +46,28 @@
  *      `ReadString('\n')`**（它是无界的）。
  *   3. 连续 100 次「0 字节且无错误」的底层读 → `streams::IoErrNoProgress`，
  *      与项目 `streams` 模块的防挂死策略一致（Go 的 `bufio` 会无限循环）。
+ *
+ * ## 模块定位
+ *
+ * `bufio` 的核心：把「每次都要系统调用/网络往返」的底层读，变成「一次读一大块、
+ * 之后只动内存」的缓冲读。上游是任意满足 `Read(char*, size_t)` 契约的类型
+ * （`streams::Reader` 家族、`os::File`、`bufio::Reader` 自身、测试桩），下游是
+ * `bufio::Scanner` 与所有逐行/逐字节/逐 rune 的协议解析。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Rune`/`RuneError`：UTF-8 码位与替换码位（U+FFFD）；
+ * - `ReadRuneResult`：`ReadRune` 的 `(rune, size, error)` 三件套；
+ * - `detail::DecodeUtf8`：header-only 的 UTF-8 解码器（供 `ReadRune` 使用）；
+ * - `Reader<ReaderT>`：本模块最重要的类型，见其类注释。
+ *
+ * ## 阅读建议
+ *
+ * 1. 先读类的「不变量」与 `docs/state-machines/Reader.md`：游标与 Unread 子状态
+ *    是所有难缠 bug 的来源；
+ * 2. 再看 `Read` 的快慢路径与 `fill()` 的压缩逻辑；
+ * 3. 最后看 `ReadLine`/`ReadSlice`/`Peek` 在「超长」「缓冲满」「EOF」三种边界下
+ *    各自的返回形态（它们故意不一致）。
  */
 #pragma once
 
@@ -150,6 +172,29 @@ inline int DecodeUtf8(const std::uint8_t* data, std::size_t available,
  *
  * @warning `Reader` 只**引用**底层对象，不拥有它。底层 Reader 的生命周期
  *          必须覆盖本对象。
+ *
+ * ## 定位
+ * `bufio` 的核心装饰器：把「每次都要系统调用/网络往返」的底层读变成「一次读一大块、
+ * 之后只动内存」。上游是任意满足 `Read(char*, size_t)` 契约的类型（`streams::Reader`
+ * 家族、`os::File`、另一个 `Reader`、测试桩），下游是 `bufio::Scanner` 与所有
+ * 逐行/逐字节/逐 rune 的协议解析。
+ *
+ * ## 生命周期与线程模型
+ * 构造时按引用绑定底层 Reader 并分配固定容量缓冲；`Reader` 不可拷贝/赋值（游标与
+ * 缓冲必须一一对应）。谁创建谁销毁，底层对象必须比它活得久。所有公开方法都假定
+ * 同一线程串行调用，内部**不加锁**；把同一个 `Reader` 跨线程共享是未定义行为。
+ *
+ * ## 状态机
+ * 缓冲区游标状态（Empty/Buffered/Terminated）与 Unread 子状态（None/Byte/Rune）
+ * 的转化表见 `docs/state-machines/Reader.md`。
+ *
+ * ## 不变量
+ * - `0 <= m_r <= m_w <= m_buffer.size()`；
+ * - `Buffered() == m_w - m_r` 恒成立；
+ * - `m_err` 非空后 `fill()` 不再调用底层，所有读方法最终都以该错误收尾（粘性）；
+ * - `m_can_unread_byte` 为真时 `m_r > 0`；`m_last_rune_size > 0` 时
+ *   `m_r >= m_last_rune_size`（回退不会越界）；
+ * - 快路径直接读进调用方缓冲时不经过 `m_buffer`，此时 `m_r == m_w`。
  */
 template <typename ReaderT>
 class Reader {
@@ -176,8 +221,16 @@ public:
      * @param p 目标缓冲。
      * @return 实际写入 `p` 的字节数；`0` 表示「当前没有数据」，
      *         用 `Err()` 区分正常 EOF 与错误。
+     *
+     * ## 步骤
+     * step1. 先让 Unread 子状态失效；空目标直接返回 0；
+     * step2. 缓冲为空且 `p` 不小于 `Size()` 时走快路径：直接读进调用方缓冲，
+     *        省掉一次内部缓冲拷贝；
+     * step3. 否则 `fill()`；仍无数据就返回 0（错误由 `Err()` 暴露）；
+     * step4. 从内部缓冲拷贝 `min(p.size(), Buffered())` 字节并推进 `m_r`。
      */
     std::size_t Read(ByteSpan p) {
+        // step1: 任何读操作都让上一次 Unread 失效
         InvalidateUnread();
         if (p.empty()) {
             return 0;
@@ -186,7 +239,7 @@ public:
             if (m_err) {
                 return 0;
             }
-            // Go 的快路径：缓冲区空且目标足够大时直接读进目标，少一次拷贝。
+            // step2: Go 的快路径——缓冲区空且目标足够大时直接读进目标，少一次拷贝
             if (p.size() >= m_buffer.size()) {
                 const streams::ReadResult result =
                     m_source->Read(reinterpret_cast<char*>(p.data()), p.size());
@@ -200,11 +253,13 @@ public:
                 NoteIdleRead(result.error);
                 return 0;
             }
+            // step3: 目标不够大，走内部缓冲
             fill();
             if (m_r == m_w) {
                 return 0;
             }
         }
+        // step4: 从内部缓冲交付，最多一次拷贝
         const std::size_t take = std::min(p.size(), m_w - m_r);
         std::memcpy(p.data(), m_buffer.data() + m_r, take);
         m_r += take;
@@ -320,12 +375,24 @@ public:
      * @note 末行**没有** `\n` 时，行尾的 `\r` 会保留——这是 Go `ReadLine`
      *       的原始行为（只有 `\r\n` 成对时才丢 `\r`）。`Scanner` 的
      *       `ScanLines` 则会在 EOF 时也丢掉 `\r`（同样对齐 Go）。
+     *
+     * ## 步骤
+     * step1. 在 `[m_r, m_w)` 内找 `\n`；找到则按「行长预算」判断是否超长，
+     *        未超长就追加本段（去掉行尾 `\r`）并消费；
+     * step2. 没找到换行符，则整段并入行缓冲（同样先估上限），并把缓冲读空；
+     * step3. 缓冲空后若已有粘性错误：有内容先交付、无内容才报错；
+     * step4. 否则 `fill()` 继续向底层要数据，直到换行、超长或 EOF。
+     *
+     * ## 失败语义
+     * 返回 `ErrTooLong()` 时已消费的字节**不回滚**，Reader 停在溢出点附近；
+     * 调用方通常应丢弃该 Reader，而不是继续读。
      */
     Result<std::string> ReadLine() {
         InvalidateUnread();
         std::string line;
         const std::size_t max_length = m_buffer.size();
         while (true) {
+            // step1: 先在当前缓冲内找换行符，找到即按行长预算交付
             if (m_r < m_w) {
                 const std::uint8_t* const start = m_buffer.data() + m_r;
                 const std::size_t available = m_w - m_r;
@@ -357,7 +424,7 @@ public:
                     }
                     return Result<std::string>(std::move(line));
                 }
-                // 没有换行符：整段并入行缓冲。先判上限，避免「先吃后报」。
+                // step2: 没有换行符，整段并入行缓冲；先判上限，避免「先吃后报」
                 // 末字节可能是即将被丢掉的 '\r'，先按「可能丢」估算，宁可少算 1
                 // 也不要把合法的 CRLF 长行误判成超长（真正的上限仍由上面的
                 // projected 精确检查兜底）。
@@ -371,6 +438,7 @@ public:
                 line.append(reinterpret_cast<const char*>(start), available);
                 m_r = m_w;
             }
+            // step3: 缓冲空且已有粘性错误：有内容先交付、无内容才报错
             if (m_err) {
                 // 与 Go 一致：末行没有换行符时照常交付，下次调用才是 EOF。
                 if (!line.empty()) {
@@ -378,6 +446,7 @@ public:
                 }
                 return Result<std::string>(m_err);
             }
+            // step4: 继续向底层要数据
             fill();
         }
     }
@@ -427,11 +496,18 @@ public:
      *           只返回 EOF。
      * @note 与 Go 一致：`ReadSlice` 不剥离 `\r`，也不跨 `ErrBufferFull` 拼接；
      *       需要「一次拿到整行」请用 `ReadBytes`/`ReadString`。
+     *
+     * ## 步骤
+     * step1. 在 `[m_r, m_w)` 内找分隔符；找到就返回包含分隔符的零拷贝切片并消费；
+     * step2. 没找到且可读区恰好等于缓冲容量：返回已有全部数据 + `ErrBufferFull()`；
+     * step3. 否则先看粘性错误：有剩余数据就「数据 + 错误」，完全没数据才返回纯错误；
+     * step4. 既没找到也没错误才 `fill()`，继续下一轮。
      */
     Result<ByteSpan> ReadSlice(char delim) {
         InvalidateUnread();
         const std::uint8_t target = static_cast<std::uint8_t>(delim);
         for (;;) {
+            // step1: 当前缓冲内命中分隔符
             if (m_r < m_w) {
                 const std::uint8_t* const start = m_buffer.data() + m_r;
                 const std::size_t available = m_w - m_r;
@@ -445,12 +521,14 @@ public:
                     m_r += take;
                     return Result<ByteSpan>(slice);
                 }
+                // step2: 缓冲满仍无分隔符，交付全部数据并报 ErrBufferFull
                 if (available == m_buffer.size()) {
                     const ByteSpan slice(m_buffer.data() + m_r, available);
                     m_r = m_w;
                     return Result<ByteSpan>(slice, ErrBufferFull());
                 }
             }
+            // step3: 已有粘性错误，交付剩余数据（可能为空）并带上错误
             if (m_err) {
                 const std::size_t available = m_w - m_r;
                 if (available > 0) {
@@ -460,6 +538,7 @@ public:
                 }
                 return Result<ByteSpan>(m_err);
             }
+            // step4: 缓冲还有空间，补一次数据
             fill();
         }
     }
@@ -479,16 +558,25 @@ public:
      *         `ErrBufferFull`；数据不足且已 EOF 时为「已有部分 + EOF」。
      * @warning 返回的 span 在下一次 `Read`/`Peek`/`ReadLine`/`Discard`
      *          之后失效。不要改写它指向的内容。
+     *
+     * ## 步骤
+     * step1. `n > Size()` 直接返回 `ErrBufferFull()`——本实现**不预读**
+     *        （与 Go 的差异，理由见文件头）；
+     * step2. 反复 `fill()`，直到缓冲内至少有 `n` 字节或出现粘性错误；
+     * step3. 够 `n` 字节返回零拷贝视图；否则返回「已有部分 + 错误」。
      */
     Result<ByteSpan> Peek(std::size_t n) {
         InvalidateUnread();
+        // step1: 超出缓冲容量，直接报错而不是先把源读掉一截
         if (n > m_buffer.size()) {
             return Result<ByteSpan>(ErrBufferFull());
         }
+        // step2: 补数据，直到够 n 字节或遇到粘性错误
         while (m_w - m_r < n && !m_err) {
             fill();
         }
         const std::size_t available = m_w - m_r;
+        // step3: 够数返回视图；不够则带上已有数据与错误
         if (available >= n) {
             return Result<ByteSpan>(ByteSpan(m_buffer.data() + m_r, n));
         }
@@ -551,11 +639,19 @@ private:
      * @brief 向底层要一次数据，尽量把缓冲填满。
      * @details 先把已消费的前缀压掉（`memmove`），再读到剩余空间。只在
      *          `m_err` 为空、缓冲未满时才会真正调用底层 `Read`。
+     *
+     * ## 步骤
+     * step1. 已有粘性错误直接返回：EOF/错误之后不再碰底层；
+     * step2. 把 `[m_r, m_w)` 的有效数据搬到缓冲头部，游标归零；
+     * step3. 读入剩余空间；有数据先入缓冲，错误记住、等缓冲耗尽再交付；
+     * step4. 0 字节读交给 `NoteIdleRead()`，连续 100 次判 `IoErrNoProgress`。
      */
     void fill() {
+        // step1: 粘性错误后不再调用底层
         if (m_err) {
             return;
         }
+        // step2: 压缩已消费前缀，让写入空间连续
         if (m_r > 0) {
             const std::size_t buffered = m_w - m_r;
             if (buffered > 0) {
@@ -568,6 +664,7 @@ private:
         if (room == 0) {
             return;
         }
+        // step3: 一次底层读；数据先入缓冲，错误延后交付
         const streams::ReadResult result = m_source->Read(
             reinterpret_cast<char*>(m_buffer.data() + m_w), room);
         if (result.count > 0) {
@@ -579,17 +676,18 @@ private:
             }
             return;
         }
+        // step4: 无进展读累计，过多则判定底层违约
         NoteIdleRead(result.error);
     }
 
-    ReaderT* m_source;
-    std::vector<std::uint8_t> m_buffer;
-    std::size_t m_r{0};          ///< 读游标（已交付给调用方的位置）
-    std::size_t m_w{0};          ///< 写游标（已从底层读到的位置）
-    std::size_t m_empty_reads{0};  ///< 连续「0 字节无错误」次数
-    ErrorPtr m_err;              ///< 粘性错误（含 EOF）
-    bool m_can_unread_byte{false};  ///< 上一次操作是否是可撤销的 ReadByte
-    int m_last_rune_size{-1};       ///< ReadRune 消耗的字节数（-1 表示不可撤销）
+    ReaderT* m_source;              ///< 底层 Reader（不拥有）；fill() 与 Read() 快路径调用其 Read()
+    std::vector<std::uint8_t> m_buffer; ///< 缓冲区本体，容量固定=Size()；fill() 写 [m_w, end)，读操作消费 [m_r, m_w)
+    std::size_t m_r{0};          ///< 读游标（已交付给调用方的位置）；读操作推进、Unread* 回退、fill() 压缩时归零
+    std::size_t m_w{0};          ///< 写游标（已从底层读到的位置）；fill()/Read() 快路径推进，m_r==m_w 表示缓冲空
+    std::size_t m_empty_reads{0};  ///< 连续「0 字节无错误」次数；fill()/NoteIdleRead 累加、读到数据清零，达 100 终止
+    ErrorPtr m_err;              ///< 粘性错误（含 EOF）；fill()/NoteIdleRead/Read() 快路径写入，Err() 读取；非空后不再碰底层
+    bool m_can_unread_byte{false};  ///< 上一次操作是否是可撤销的 ReadByte；ReadByte() 置真，InvalidateUnread()/UnreadByte() 置假
+    int m_last_rune_size{-1};       ///< ReadRune 消耗的字节数（-1 表示不可撤销）；ReadRune() 写，UnreadRune() 读并复位
 };
 
 }  // namespace go2cpp::bufio

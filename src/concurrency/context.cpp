@@ -35,15 +35,40 @@
 namespace go2cpp
 {
 
+    /**
+     * @brief `DoneSignal` 的共享状态（句柄可复制，状态只有一份）。
+     *
+     * ## 定位
+     *
+     * `DoneSignal` 是对外句柄（可拷贝、可跨 Fiber 传递），真正被等待/通知的是本结构。
+     * 使用者：`Context::State::done`（取消信号）、`ContextRollback`（自己的完成信号）、
+     * `Future`/`Channel`/`Timer`（通过 `Context::Done()` 间接注册回调）。
+     *
+     * ## 状态机（只有两态）
+     *
+     * `Pending -(Signal())-> Done`：单向、幂等。`Signal()` 之后所有 `Wait*` 立即返回，
+     * 再注册的回调会被立刻执行一次（见 `AddCallbackImpl`）。
+     *
+     * ## 两组回调的顺序
+     *
+     * `internal_callbacks` 先于 `callbacks`：`ContextRollback` 依赖它在用户观察到取消
+     * 之前先冻结 undo 记录。两组都在**释放 mutex 之后**调用，避免回调重入信号对象死锁。
+     */
     struct DoneSignal::State
     {
+        /// @brief 保护 done 与两张回调表；Signal 与 AddCallback/RemoveCallback 竞争它。
         mutable std::mutex mutex;
+        /// @brief 等待载体：受管 G 在此 park、普通线程走原生条件变量（ParkingCondition 分流）。
         mutable core::ParkingCondition cv;
+        /// @brief 完成标志；置真后不可回退（单向）。
         bool done{false};
+        /// @brief 下一个回调 Id（从 1 起，0 表示无效）。
         CallbackId next_id{1};
         // 内部回调（例如 ContextRollback）必须先于用户观察回调执行。
         // 两组回调仍然都在 Signal() 的锁外调用，避免回调重入信号对象。
+        /// @brief 内部回调表（先执行）；由 AddCallbackImpl 写入、Signal 一次性搬出。
         std::unordered_map<CallbackId, std::function<void()>> internal_callbacks;
+        /// @brief 用户回调表（后执行）；由 AddCallback/RemoveCallback 维护、Signal 搬出。
         std::unordered_map<CallbackId, std::function<void()>> callbacks;
     };
 
@@ -215,13 +240,15 @@ namespace go2cpp
     /// @warning 声明为 noexcept，但实现会加锁（同属 X-25 系列）。
     void DoneSignal::Signal() const noexcept
     {
+        // step1: 先把两组回调搬到局部 vector，锁内只做状态翻转与搬运，
+        //        绝不在持锁状态下执行用户代码（回调可能重入本对象）。
         std::vector<std::function<void()>> internal_callbacks;
         std::vector<std::function<void()>> callbacks;
         {
             std::lock_guard<std::mutex> lock(m_state->mutex);
             if (m_state->done)
             {
-                return;
+                return;  // 幂等：已完成则直接返回，不重复通知
             }
             m_state->done = true;
             internal_callbacks.reserve(m_state->internal_callbacks.size());
@@ -237,7 +264,9 @@ namespace go2cpp
             }
             m_state->callbacks.clear();
         }
+        // step2: 唤醒所有 Wait 者。放在执行回调之前，让等待方尽早恢复。
         m_state->cv.notify_all();
+        // step3: 内部回调先执行（ContextRollback 依赖这个顺序）。
         for (auto &callback : internal_callbacks)
         {
             try
@@ -248,6 +277,7 @@ namespace go2cpp
             {
             }
         }
+        // step4: 用户回调后执行；单个回调抛异常被吞掉，不阻断其余回调。
         for (auto &callback : callbacks)
         {
             try
@@ -377,24 +407,59 @@ namespace go2cpp
 
     } // namespace
 
+    /**
+     * @brief Context 取消树节点的共享状态（`ContextPtr` 背后的真身）。
+     *
+     * ## 定位
+     *
+     * 本结构只在 `context.cpp` 内部可见。对上层暴露的是 `Context` 门面：
+     * `Future`、`Channel`、`Timer`、`io::IOManager` 通过 `Context::Done()`
+     * 注册取消回调，通过 `Err()/Cause()` 判断取消原因；`Scheduler` 本身不
+     * 感知 Context（它只负责 park/wake）。
+     *
+     * ## 取消树
+     *
+     * `WithCancel/WithTimeout/WithDeadline` 创建的子节点通过 `parent` 挂到父节点，
+     * 父节点在 `children` 里记录**弱引用**（避免父子环导致谁都释放不掉）。
+     * 父取消时沿 `children` 遍历逐个 Cancel，级联在**调用 cancel 的线程**上同步完成。
+     *
+     * ## 线程模型
+     *
+     * 除 `done` 有自己的同步外，全部字段由 `mutex` 保护。`cancel()` 返回时
+     * 所有子节点都已是完成态；回调里不能做阻塞操作（典型写法只 `Notify()` 一个等待原语）。
+     */
     struct Context::State : std::enable_shared_from_this<Context::State>
     {
+        /// @brief 保护本结构除 `done` 外的全部字段；Cancel/WithValue/Err/Children 读写。
         mutable std::mutex mutex;
+        /// @brief 父节点（根节点为空）；用于取消向上传播与 Values 向上查找。
         std::shared_ptr<State> parent;
+        /// @brief 子节点弱引用集合；父取消时遍历逐个 Cancel。弱引用避免父子环。
         std::vector<std::weak_ptr<State>> children;
+        /// @brief `WithValue` 的类型化键值表；键是类型标识对象的地址。
         std::unordered_map<const void *, std::any> typed_values;
         // 只要值仍然可达，就保留用于标识类型化 key 的分配对象。若没有这个所有者
         // 而仅按裸指针查找，分配器复用地址后可能错误地别名到无关的后续 key。
+        /// @brief typed_values 的键所有者：持有 key 对象本身，防止地址被复用后键混淆。
         std::unordered_map<const void *, std::shared_ptr<const std::uint64_t>>
             typed_key_anchors;
+        /// @brief `WithNamedValue` 的字符串键值表（诊断/配置这类按名字取值的场景）。
         std::unordered_map<std::string, std::any> named_values;
+        /// @brief 完成信号：`Wait/WaitFor/AddCallback` 都挂在这里，是 Fiber 等待取消的唯一挂载点。
         DoneSignal done;
+        /// @brief 取消原因（非空即已取消，幂等写入一次）；`Err()` 返回它。
         ErrorPtr error;
+        /// @brief `WithCancelCause` 记录的首个原因；普通取消为空，`Cause()` 返回它。
         ErrorPtr cause;
+        /// @brief 绝对截止时间（`WithDeadline/WithTimeout` 设置）；到期由定时器线程调 Cancel。
         std::optional<ContextTimePoint> deadline;
+        /// @brief 定时器 Id（0 表示未注册）；Cancel 成功后用它 `TimerService::Remove`。
         TimerService::Id timer_id{0};
+        /// @brief 是否是根节点（Background/TODO）；根节点不会因父级联被取消。
         bool root{false};
+        /// @brief 下一个 before-done 回调 Id（从 1 起，0 是无效 Id）。
         DoneSignal::CallbackId next_before_done_id{1};
+        /// @brief 在 `done.Signal()` 之前执行的回调表；用于取消前必须先改内部状态的钩子。
         std::unordered_map<DoneSignal::CallbackId, std::function<void()>>
             before_done_callbacks;
 

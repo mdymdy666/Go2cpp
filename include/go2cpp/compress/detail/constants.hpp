@@ -15,6 +15,15 @@
  *
  *   取 15 是最大窗口（32 KiB 历史窗口，压缩率最好），也是 Go 的 compress
  *   系列包与 zlib 默认值；没有理由调小。
+ *
+ * ## 模块定位
+ * 只被 `detail` 层使用，公开头文件不暴露这里的任何名字：
+ * - `Inflater` / `Deflater` 的构造函数取缓冲尺寸、memLevel、windowBits；
+ * - `ReaderEngine` / `WriterEngine` 用 `kMaxIdleTransfers` 做空转保护，
+ *   用 `kMaxChunkSize` 防止 `avail_in` / `avail_out` 的 `uInt` 截断。
+ *
+ * 因此改这里的值只会影响吞吐与内存，不会改变任何格式语义（windowBits 除外，
+ * 它决定格式）。
  */
 #pragma once
 

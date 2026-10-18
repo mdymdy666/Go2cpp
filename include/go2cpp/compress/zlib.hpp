@@ -18,6 +18,11 @@
  *      （C 类：需要时用 zlib 的 `inflateSetDictionary`/`deflateSetDictionary` 补齐。）
  *   2. `Resetter` 已支持：`Reader::Reset(source)` / `Writer::Reset(destination)`
  *      复用 zlib 状态；`Writer.Flush` 语义与 Go 相同（`Z_SYNC_FLUSH`）。
+ *
+ * ## 阅读建议
+ * 先看 `Reader` 的「单流」语义（到 `Z_STREAM_END` 即结束，尾后多余字节忽略），
+ * 再对比 `gzip.hpp` 的多成员；`Writer` 侧与 `Flate::Writer` 完全同构，只是
+ * windowBits 为 15、尾部多一个 adler32。错误码翻译在 `inflater.cpp` 文件头。
  */
 #pragma once
 
@@ -38,6 +43,15 @@ namespace go2cpp::compress {
  *
  * @note zlib 是**单流**格式：解压到 `Z_STREAM_END` 即结束，流尾之后若还有
  *   多余字节会被忽略（与 Go `zlib.Reader` 一致）。需要拼接多段请用 `Gzip`。
+ *
+ * ## 定位
+ * `compress` 公开门面的 zlib 分支：向调用方提供 `Zlib::Reader` /
+ * `Zlib::Writer`，二者分别委托给 `detail::ReaderEngine<ReaderT>` 与
+ * `detail::WriterEngine<WriterT>`（构造参数 `15`）。与 `Flate` / `Gzip` 并列；
+ * 它是三者中「有校验和、但只支持单流」的折中选择。
+ *
+ * ## 生命周期与线程模型
+ * 工厂本身无状态；线程安全性由每个 `Reader` / `Writer` 实例自己决定。
  */
 class Zlib {
  public:
@@ -56,6 +70,19 @@ class Zlib {
   /**
    * @brief zlib 格式解压器。
    * @tparam ReaderT 底层 Reader（`streams::ReadResult Read(char*, size_t)`）。
+   *
+   * ## 定位
+   * 供需要 adler32 校验、且数据只有单个 zlib 流的调用方使用；构造时
+   * `multistream=false`，全部工作转给 `detail::ReaderEngine<ReaderT>`。
+   * 流结束后的剩余字节不会被读取（留在底层 Reader 里）。
+   *
+   * ## 状态机
+   * 「读头 / 解 body / 读尾 / 结束」同样由 `ReaderEngine` 管理，但单流模式下
+   * 命中 `Z_STREAM_END` 就直接进入 EOF，不经过「成员结束」分支；
+   * 状态转化表见 `docs/state-machines/ReaderEngine.md`。
+   *
+   * ## 生命周期与线程模型
+   * 只引用 `source`；zlib 状态随对象析构释放。非线程安全。
    *
    * @warning 只引用 `source`，不拥有它。
    */
@@ -87,7 +114,7 @@ class Zlib {
     }
 
    private:
-    detail::ReaderEngine<ReaderT> m_engine;
+    detail::ReaderEngine<ReaderT> m_engine;  ///< 解压循环 + 粘性错误；`Read`/`Reset`/`Err` 都转发给它，随本对象析构，非共享
   };
 
   /**
@@ -95,6 +122,15 @@ class Zlib {
    * @tparam WriterT 底层 Writer。
    *
    * @note 与 `Flate::Writer` 一样，析构不自动 `Close()`。
+   *
+   * ## 定位
+   * 供需要产出 zlib 流的调用方使用；头 2 字节与 adler32 尾由 zlib 按
+   * windowBits=15 生成，本类只把 `Write`/`Flush`/`Close` 转给
+   * `detail::WriterEngine<WriterT>`。
+   *
+   * ## 生命周期与线程模型
+   * 构造即初始化 zlib（非法级别变成粘性错误）；必须显式 `Close()` 才会写出
+   * adler32 尾。非线程安全：每个实例独占一个 `WriterEngine`。
    */
   template <typename WriterT>
   class Writer {
@@ -143,7 +179,7 @@ class Zlib {
     }
 
    private:
-    detail::WriterEngine<WriterT> m_engine;
+    detail::WriterEngine<WriterT> m_engine;  ///< 压缩循环 + 粘性错误；`Write`/`Flush`/`Close` 都转发给它，随本对象析构，非共享
   };
 };
 

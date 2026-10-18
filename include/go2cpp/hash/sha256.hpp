@@ -25,6 +25,26 @@
  *       与 Go 的 `crypto/sha256` 一致（64 字节块）。
  * @note `Sum(ByteSpan)` 不改变状态，实现方式与 `Md5`/`Sha1` 相同。
  * @note 未实现 Go 的 `New()` 工厂、`New224()` 与二进制序列化接口。
+ *
+ * ## 模块定位
+ *
+ * 本文件（`include/go2cpp/hash/sha256.hpp`）定义 SHA-256 摘要器，是本模块
+ * 推荐的默认安全摘要：新设计需要抗碰撞时优先用它（或 `Sha512`）。位于
+ * `hash` 模块最底层，不依赖其它模块；当前仓库引用方只有 `tests/hash/`
+ * （FIPS 向量 + 与 Python `hashlib.sha256` 对拍、压测），生产代码尚无调用方
+ * —— 不排除将来作为内容寻址/ETag/协议握手的摘要实现接入。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Sha256`：流式摘要器（`Hash` 子类），8 个 32 位链接变量 + 64 字节缓冲；
+ * - `kSize`/`kBlockSize`：摘要 32 字节、块 64 字节，对应 Go 的 `Size`/`BlockSize`；
+ * - `Sha256::Digest`：一次性入口（对应 Go `sha256.Sum256`）。
+ *
+ * ## 阅读建议
+ *
+ * 先看 `Write` 的三段式缓冲（补块 → 整块 → 存余），再读 `Transform` 的
+ * 消息扩展与 64 轮压缩，最后看 `Finish` 的填充与比特长度。状态转化见
+ * `docs/state-machines/Sha256.md`（同时覆盖 `Md5`/`Sha1`）。
  */
 #pragma once
 
@@ -42,6 +62,23 @@ namespace go2cpp::hash {
  * @details 性能预期：Release（`-O3`）下 200~500 MB/s 属正常范围（标量实现，
  *          未用 SHA-NI 指令）；与 Go 的汇编实现相比会有差距，但满足「纯 C++、
  *          零依赖」的约束。压测数据见 `tests/hash/test_hash_stress.cpp`。
+ *
+ * ## 定位
+ *
+ * 本模块的默认安全摘要，供需要抗碰撞的调用方直接使用（一次性用 `Digest`，
+ * 流式用 `Write`+`Sum`），也可作为 `Hash&` 擦除；当前仓库调用方仅为
+ * `tests/hash/`。
+ *
+ * ## 状态机
+ *
+ * 与 `Md5`/`Sha1` 同构：对象常驻「吸收中」，`Sum()` 在副本上「收尾」，
+ * 原对象状态不变。状态转化表见 `docs/state-machines/Sha256.md`。
+ *
+ * ## 不变量
+ *
+ * - `0 <= m_buffer_len < 64`，`m_buffer[0, m_buffer_len)` 是未满块的尾部输入；
+ * - `m_length` 是历史 `Write` 字节数之和，与填充无关；
+ * - `Sum()` 在副本上 `Finish`，不改变 `*this`，可重复调用。
  */
 class Sha256 final : public Hash {
  public:
@@ -77,10 +114,10 @@ class Sha256 final : public Hash {
     void Transform(const std::uint8_t* block) noexcept;
     void Finish(std::uint8_t* out) noexcept;
 
-    std::uint32_t m_state[8]{};
-    std::uint64_t m_length{0};  ///< 已写入的总字节数。
-    std::uint8_t m_buffer[kBlockSize]{};
-    std::size_t m_buffer_len{0};
+    std::uint32_t m_state[8]{};  ///< A..H 八个链接变量；Reset 置初值、Transform 更新、Finish 输出
+    std::uint64_t m_length{0};  ///< 已写入的总字节数；Write 累加、Reset 清零、Finish 换算成比特数。
+    std::uint8_t m_buffer[kBlockSize]{};  ///< 未满 64 字节的尾部输入；Write 追加、Transform 消费、Reset 只清长度
+    std::size_t m_buffer_len{0};  ///< m_buffer 中有效字节数（0..63）；Write 增加、Transform 后归零、Reset 清零
 };
 
 }  // namespace go2cpp::hash

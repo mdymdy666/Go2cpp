@@ -27,6 +27,22 @@
  * - PING payload 必须恰好 8 字节；
  * - RST_STREAM / WINDOW_UPDATE 的 payload 长度必须分别恰好 4 字节；
  * - **增量解析**：数据不完整时返回 `kNeedMore` 而非报错（这是流式解析的必需）。
+ *
+ * ## 本文件定义什么
+ * - `FrameType` / `FrameFlags` / `ErrorCode` / `FrameStatus`：线上常量与结果码；
+ * - `FrameHeader` / `Frame`：通用帧（9 字节头 + 原始 payload），是 IO 与语义层的分界；
+ * - 各帧的语义视图（`SettingsFrame`、`PingFrame`、`DataFrame`、`HeadersFrame`、
+ *   `RstStreamFrame`、`GoAwayFrame`、`WindowUpdateFrame`、`PriorityFrame`）；
+ * - 每对 `Decode*`/`Parse*` 与 `Make*`：字节 <-> 结构体的双向转换。
+ *
+ * ## 阅读建议
+ * 先看 `FrameHeader` 与 `DecodeFrame()`（增量解析的核心），再看任一帧的
+ * `ParseXxx` —— 它们的形状完全一致：校验类型/流 id/payload 长度，再取字段。
+ *
+ * ## 边界与陷阱
+ * - `DecodeFrame()` 的 `kNeedMore` 必须**先于**其它错误判断：帧可能只是没收全；
+ * - payload 长度上限来自对端 SETTINGS（`Connection::m_peer_max_frame_size`），不是常量；
+ * - `ParseXxx` 不做状态机判断（例如 DATA 落在 closed 流），那是 `Connection` 的职责。
  */
 #pragma once
 
@@ -95,6 +111,13 @@ const char* ToString(FrameStatus status) noexcept;
 const char* ToString(FrameType type) noexcept;
 
 /** @brief 帧头（9 字节线上格式）。 */
+/**
+ * @brief 帧头（9 字节线上格式）。
+ *
+ * ## 定位
+ * 被 `DecodeFrameHeader()` 填充、`EncodeFrameHeader()` 序列化；
+ * `Connection::TakeFrame()` 先解析它，再据此决定还要读多少字节。
+ */
 struct FrameHeader final {
     /// 24 位 payload 长度（不含 9 字节帧头）。
     std::uint32_t length{0};
@@ -105,6 +128,16 @@ struct FrameHeader final {
 };
 
 /** @brief 一个完整帧：帧头 + 原始 payload。 */
+/**
+ * @brief 一个完整帧：帧头 + 原始 payload。
+ *
+ * ## 定位
+ * `Connection` 与 `Transport` 之间的通用单位：`TakeFrame()` 产出，
+ * `WriteFrame()` 消费；语义层只通过 `ParseXxx`/`MakeXxx` 触碰它。
+ *
+ * ## 不变量
+ * `payload.size() == header.length`（`MakeXxx` 维护，`DecodeFrame()` 保证）。
+ */
 struct Frame final {
     FrameHeader header;
     std::vector<std::uint8_t> payload;
@@ -167,6 +200,12 @@ struct SettingsEntry final {
 };
 
 /** @brief SETTINGS 帧的语义视图。 */
+/**
+ * @brief SETTINGS 帧的语义视图。
+ *
+ * ## 定位
+ * `Connection::FinishSettingsHandshake()` 与 `ReadEvent()` 的 SETTINGS 分支使用。
+ */
 struct SettingsFrame final {
     bool ack{false};
     std::vector<SettingsEntry> entries;
@@ -186,6 +225,34 @@ Frame MakeSettingsAck();
 // ---------------------------------------------------------------------------
 
 /** @brief PING 帧语义视图。 */
+/**
+ * @brief PING 帧语义视图。
+ *
+ * ## 定位
+ * `Connection` 在两处自动回 ACK：握手期 `FinishSettingsHandshake()` 与
+ * `ReadEvent()` 的 PING 分支。
+ *
+ * ## 定位
+ * `Connection::WriteData()` 构造；`ReadEvent()` 的 DATA 分支解析并做接收流控。
+ *
+ * ## 定位
+ * 同时承载 HEADERS 与 CONTINUATION 的语义（`ParseHeaders`/`ParseContinuation`）；
+ * `Connection::AssembleHeaderBlock()` 把多片 `header_block` 拼成一整块。
+ *
+ * ## 定位
+ * `Connection::ResetStream()` 发送；`ReadEvent()` 用它把对应流置 closed。
+ *
+ * ## 定位
+ * `Connection::SendGoAway()` 构造；`ReadEvent()` 收到后记录 `last_stream_id`
+ * 并把连接迁到 `kDraining`。
+ *
+ * ## 定位
+ * `ReadEvent()` 用它补回发送窗口（`stream_id == 0` 时是连接级窗口）。
+ *
+ * ## 定位
+ * 能解析但**不参与调度**（RFC 9113 已弃用优先级树）；保留是为了不把
+ * PRIORITY 帧当未知帧丢弃。
+ */
 struct PingFrame final {
     bool ack{false};
     /// 恰好 8 字节不透明数据。

@@ -18,6 +18,17 @@
  *   `bufio/byte_span.hpp` 只依赖标准库、没有任何链接期符号，因此该复用
  *   **不引入模块间链接依赖**：`go2cpp_compress` 不需要 `target_link_libraries`
  *   到 `go2cpp_bufio`。
+ *
+ * ## 本文件定义什么
+ * - `ByteSpan`：`bufio::ByteSpan` 的别名。`compress` 的全部 `Read`/`Write`
+ *   都用它，所以压缩流可以直接串到 `bufio::Reader` / `bufio::Writer` 上；
+ * - `AsBytes` / `AsStringView` / `ToString`：与 `bufio` 共用同一组转换
+ *   helper，避免两套语义略有差异的 span 工具并存。
+ *
+ * ## 阅读建议
+ * 先看 `bufio/byte_span.hpp` 里「span 不拥有内存、生命周期由调用方保证」
+ * 的说明，再回来看这里：本文件没有逻辑，只有四个转发的 `using`。
+ * 之后读 `detail/reader_engine.hpp` 时，所有 `destination` 都是这个类型。
  */
 #pragma once
 

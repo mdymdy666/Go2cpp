@@ -962,28 +962,49 @@ struct Fiber::Impl {
         }
     }
 
+    /// @brief 反向指针（Impl 属于 Fiber）；trampoline 靠它从栈入口找回句柄。
     Fiber* m_owner;
+    /// @brief 全局单调 Fiber Id；供 FiberRecord 与诊断使用，reset 时换成新 Id。
     std::uint64_t m_id;
+    /// @brief 与外部观察者共享的元数据（状态/父链/时间戳）；快照跨线程读它。
     std::shared_ptr<FiberRecord> m_record;
+    /// @brief Fiber 主体；`reset_for_scheduler` 会替换成新提交的可调用对象。
     Function m_function;
+    /// @brief 规范化后的栈大小（页对齐 + 上下界夹紧，见 normalize_stack_size）。
     std::size_t m_stack_size;
+    /// @brief 独立栈（FiberStack 内部走池化）；Fiber 结束后由 resume_locked 清空，
+    ///        非空表示仍在活动 —— reset_for_scheduler 会据此拒绝重绑定。
     std::unique_ptr<FiberStack> m_stack;
 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+    /// @brief 当前 Fiber 的上下文；首次 resume 前为 nullptr，结束后清空。
     detail::Context m_context{nullptr};
+    /// @brief 切换前的调用方上下文；Suspend 时切回它。
     detail::Context m_caller{nullptr};
 #else
+    /// @brief 当前 Fiber 的 fcontext；首次 resume 前为 nullptr，结束后清空。
     boost::context::detail::fcontext_t m_context{nullptr};
+    /// @brief 切换前的调用方 fcontext；Suspend 时切回它。
     boost::context::detail::fcontext_t m_caller{nullptr};
 #endif
+    /// @brief 是否把 SuspendReason 向上传播给父 Fiber（嵌套 Fiber 的取消传播）。
     std::atomic<bool> m_scheduler_propagate{false};
+    /// @brief Scheduler 父链是否已绑定；绑定后不允许跨父级恢复。
     bool m_scheduler_parent_bound{false};
+    /// @brief 恢复权门的原子 claim；防止两个线程同时 resume 同一个 Fiber。
     std::atomic<bool> m_resume_claim{false};
+    /// @brief 保护元数据拷贝（快照/父链读写）；与 m_failure_mutex 分开，避免锁嵌套。
     mutable std::mutex m_metadata_mutex;
+    /// @brief 上次 resume 所在线程的哈希；用于检测跨线程恢复（诊断与断言）。
     std::atomic<std::size_t> m_last_resume_thread_hash{0};
+    /// @brief 嵌套 Fiber 的父指针（手工父子链）；顶层为 nullptr。
     Fiber* m_parent{nullptr};
+    /// @brief 父链是否已绑定；未绑定时的挂起会被标记 Failed（防跳错栈）。
     bool m_parent_bound{false};
+    /// @brief 保护 m_failure；initialize_context/entry 捕获异常时写入。
     mutable std::mutex m_failure_mutex;
+    /// @brief Fiber 内抛出的异常；由 resume 重新抛给调用方。
     std::exception_ptr m_failure;
+    /// @brief 进入 Fiber 时保存的 errno；切回调用方时恢复，避免污染对方。
     int m_saved_errno{0};
 #if defined(GO2CPP_FIBER_ASAN)
     void* m_asan_fake_stack{nullptr};
