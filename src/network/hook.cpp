@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -244,7 +245,12 @@ IOManager* cooperative_manager() noexcept {
 
 struct OpenDescription {
     mutable std::mutex m_mutex;
+    // 来源类型，仅用于诊断：socket 与 FIFO 走同一条 park 路径。
     bool m_socket{true};
+    // 该 fd 的阻塞原因能否归约为「epoll 能报的 fd 就绪」。
+    // 只有 pollable 的 fd 才能 park Fiber；false 必须走 BlockingRegion，
+    // 否则 park 之后没有任何东西能唤醒它（变成 Fiber 永久挂起）。
+    bool m_pollable{true};
     bool m_user_nonblocking{false};
     bool m_system_nonblocking{false};
     std::optional<Duration> m_receive_timeout;
@@ -371,6 +377,76 @@ std::shared_ptr<Descriptor> try_adopt_socket(int fd) noexcept {
     }
 }
 
+// FIFO/pipe 的阻塞原因同样是「fd 可读/可写」，epoll 能报，因此可以 park。
+// getsockopt(SO_TYPE) 对它们必然返回 ENOTSOCK，只能用 fstat 的类型位识别。
+bool inspect_fifo(int fd) noexcept {
+    struct stat status {};
+    if (::fstat(fd, &status) != 0) {
+        return false;
+    }
+    return S_ISFIFO(status.st_mode) != 0;
+}
+
+// 与 adopt_socket 同构，差异只有两点：
+//   1. 不读 SO_RCVTIMEO/SO_SNDTIMEO —— FIFO 没有 socket 超时语义，
+//      保持 nullopt（等到数据就绪或对端关闭）；
+//   2. m_socket=false，只标记来源。
+// 同样把 fd 切到 O_NONBLOCK：这是 park 的前提（先试一次 syscall，
+// EAGAIN 才去 epoll 等），并且 fcntl hook 会对用户隐藏这个内部位。
+std::shared_ptr<Descriptor> adopt_fifo(int fd) {
+    DescriptorGuard lifecycle;
+    if (fd < 0 || !s_originals.m_fcntl || !inspect_fifo(fd)) {
+        return {};
+    }
+
+    // 与 socket 接管使用同一把串行化锁：并发接管时不能把内部设置的
+    // O_NONBLOCK 误判成用户请求。
+    std::lock_guard<std::mutex> lock(s_descriptors_mutex);
+    const auto found = s_descriptors.find(fd);
+    if (found != s_descriptors.end()) {
+        return found->second;
+    }
+
+    const int flags = invoke_real(s_originals.m_fcntl, fd, F_GETFL);
+    if (flags < 0) {
+        return {};
+    }
+
+    const bool originally_nonblocking = (flags & O_NONBLOCK) != 0;
+    bool changed_system_nonblocking = false;
+    auto open = std::make_shared<OpenDescription>();
+    open->m_socket = false;
+    open->m_pollable = true;
+    open->m_user_nonblocking = originally_nonblocking;
+    open->m_system_nonblocking = originally_nonblocking;
+    if (!open->m_system_nonblocking &&
+        invoke_real(s_originals.m_fcntl, fd, F_SETFL, flags | O_NONBLOCK) == 0) {
+        open->m_system_nonblocking = true;
+        changed_system_nonblocking = true;
+    }
+    try {
+        auto descriptor = std::make_shared<Descriptor>(
+            std::move(open), DescriptorGuard::Capture(fd));
+        s_descriptors.emplace(fd, descriptor);
+        return descriptor;
+    } catch (...) {
+        if (changed_system_nonblocking) {
+            (void)invoke_real(s_originals.m_fcntl, fd, F_SETFL, flags);
+        }
+        throw;
+    }
+}
+
+std::shared_ptr<Descriptor> try_adopt_fifo(int fd) noexcept {
+    try {
+        return adopt_fifo(fd);
+    } catch (...) {
+        // 元数据分配失败不能影响 fd 本身：回退到 libc 阻塞语义，
+        // 由 BlockingRegion/sysmon 兜底。
+        return {};
+    }
+}
+
 void register_new_socket(int fd, bool user_nonblocking) {
     DescriptorGuard lifecycle;
     if (fd < 0 || !s_originals.m_fcntl) {
@@ -474,6 +550,12 @@ void clone_descriptor(int old_fd, int new_fd) {
     auto source = descriptor_for(old_fd);
     if (!source && cooperative_manager()) {
         source = adopt_socket(old_fd);
+        if (!source) {
+            // dup 出来的 FIFO 副本共享同一 open file description；必须沿用
+            // FIFO 接管规则，否则下一代会把运行时的 O_NONBLOCK 当成用户意图，
+            // 从而静默失去 park 能力。
+            source = adopt_fifo(old_fd);
+        }
     }
     if (source && snapshot_descriptor(source).m_closed) {
         source.reset();
@@ -549,7 +631,7 @@ std::optional<Duration> operation_timeout(
 
 bool can_wait(const std::shared_ptr<Descriptor>& descriptor) noexcept {
     std::lock_guard<std::mutex> lock(descriptor->m_open->m_mutex);
-    return descriptor->m_open->m_socket &&
+    return descriptor->m_open->m_pollable &&
            descriptor->m_open->m_system_nonblocking &&
            !descriptor->m_open->m_user_nonblocking;
 }
@@ -667,6 +749,12 @@ Result cooperative_io(int fd, Function function, IOEvent event,
     auto descriptor = descriptor_for(fd);
     if (!descriptor && managed_hook_admission) {
         descriptor = try_adopt_socket(fd);
+        if (!descriptor) {
+            // FIFO/pipe 同样是「等 fd 就绪」：getsockopt 认不出它们，
+            // 但 fstat 能识别 S_ISFIFO。接管后 read/write 会 park，
+            // worker 立即空出，而不是靠 sysmon 补一个线程。
+            descriptor = try_adopt_fifo(fd);
+        }
     }
     if (!descriptor) {
         // IOManager 正常路径把 socket 设为 nonblocking 并 park Fiber；

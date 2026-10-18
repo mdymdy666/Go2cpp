@@ -690,3 +690,89 @@ valgrind --tool=memcheck --leak-check=full \
 `std::mutex`”：Fiber 首次批量竞争仍包含上下文切换和调度成本，长临界区或带取消
 的等待会主动进入完整慢路径。调用方仍应把临界区保持短小，不在锁内执行阻塞 IO、日志
 回调或用户插件代码。
+
+## 2026-10-18：sync::Mutex 250 倍退化的根因与修复；HybridGate 删除
+
+> **条件**：`build-bench`（Release + `-O3 -DNDEBUG`）、AMD Ryzen 9 8945HX / WSL2、
+> 新增 `benchmarks/sync_mutex_contention_benchmark.cpp`、N 线程反复 lock/unlock
+> 同一把 `sync::Mutex`、rounds/thread=20000、`taskset -c 0-7`、A/B 交替各 5 轮、
+> 取中位数。**测量时 loadavg 1.37～2.34**（>1.5 的轮次已在原始数据中标注）。
+
+### 根因：不是 `Unlock` 的 O(n) 队列遍历，而是「每个操作睡一次」
+
+用线程局部探针（临时加、已删除）在 4 线程 × 20000 ops 下观测到：
+
+| 计数（每线程） | 值 |
+|---|---:|
+| `lock` 调用 | 20000 |
+| 进入等待队列 | 19793 |
+| `FUTEX_WAIT` 次数 | **19793** |
+| `FUTEX_WAKE`（`Unlock` 侧） | 19793 |
+
+即**除开头几个操作外，每次加锁都真实睡在 futex 上**。配合 `strace -c` 的
+`FUTEX_WAKE` 调用数可以看到：8 线程时如果所有线程都留在自旋路径，futex 调用为 0，
+单次加解锁是 100～300 ns；一旦有人转入等待队列，`kWaiter` 常驻，后续竞争者
+「见到 kWaiter 只自旋 4 次」→ 立即入队 → `WaitNative` 的自旋预算 128（≈1.1 µs）
+覆盖不了一次完整交接 → 每次操作一次睡眠。睡眠/唤醒在本机空闲时约 0.4 µs，
+在 loadavg 3～4 时实测被放大到 ~96 µs，这就是 25～30 µs/op 的来源。
+
+`Unlock` 的队列遍历是 O(队列长度)，但队列长度只有 3（4 线程）或 7（8 线程），
+**不是** 250 倍退化的主因。
+
+### 修复（`src/concurrency/sync.cpp`）
+
+1. 普通线程入队前的自旋预算 `kNativeSpinAttempts`：256 → **2048**（≈18 µs）。
+   它必须覆盖「N 个线程轮流抢同一把锁」的整个窗口；128/256 会让 8 线程中有人
+   256 次全失败而转入睡眠。
+2. `WaitNode::WaitNative` 的自旋预算：128 → **2048**，并改为「连续无进展才睡」；
+   另设绝对上限 262144（≈2.3 ms）保证**严格有界**（X-35 红线）。
+3. 新增 `m_futex_waiters` 计数：只有确实有线程睡在 futex 上时才调用
+   `FUTEX_WAKE`，纯自旋交接完全在用户态完成。
+4. 标定数据（同一轮 A/B，8 线程）：256→~23 µs、1024→321 ns、
+   **2048→225 ns**、4096→349 ns（多出的空转无收益）。最终取 2048。
+
+### 修复前后（中位数，taskset 0-7，A/B 交替 × 5）
+
+| 线程 | BEFORE | AFTER | 加速 |
+|---:|---:|---:|---:|
+| 2 | 25.62 ns | 25.46 ns | 1.0x |
+| 4 | **15,954.74 ns** | **60.33 ns** | **264x** |
+| 8 | **20,777.13 ns** | **166.45 ns** | **125x** |
+
+4 线程达到任务要求的「≤1 µs/op」。8 线程有两个高负载轮次（loadavg 2.29）
+回退到 5.3～5.7 µs，中位数仍为 166 ns；这不是稳定态，报告保留原始轮次。
+
+### HybridGate：按用户决策删除（X-35）
+
+- 删除 `include/go2cpp/core/hybrid_mutex.hpp` 与
+  `include/go2cpp/concurrency/core/hybrid_mutex.hpp`；
+- 3 个生产文件、12 个加锁点、3 个成员改为 `core::FutexMutex`
+  （`include/go2cpp/concurrency/core/futex_mutex.hpp`）：
+  `parking_condition.cpp` 3+1、`sync.cpp` 6+1、`io.cpp` 3+1；
+- 新实现：状态字 `0/1/2`（空闲/已锁/有等待者）+ Linux futex。
+  **无自旋、无 condition_variable**；`exchange(2)` 抢锁保证每次
+  `unlock()` 看到 2 时必定 `FUTEX_WAKE`，不会丢唤醒链；保留跨线程解锁。
+- 测试/示例/基准同步替换：`test_futex_mutex.cpp`、`example/concurrency/futex_mutex_demo.cpp`、
+  `benchmarks/futex_mutex_contention_benchmark.cpp`。
+
+同一口径对比（`taskset -c 0-7`、loadavg 2.83；旧实现为删除前的
+`HybridGate` 头文件独立编译）：
+
+| 场景 | 旧 HybridGate | 新 FutexMutex |
+|---|---:|---:|
+| 2 线程争用 | 16.90 ns/op | 12.01 ns/op |
+| 4 线程争用 | 82.41 ns/op | 13.63 ns/op |
+| 8 线程争用 | 169.09 ns/op | 17.10 ns/op |
+| 2 ms 长临界区 + 2 等待者的进程 CPU | 1.355 ms | 0.044 ms |
+| 2 ms 长临界区 + 8 等待者的进程 CPU | 0.398 ms | 0.139 ms |
+
+长临界区一列证明旧实现的慢路径会在持有者不推进时烧 CPU；新实现等待者直接睡眠。
+
+### 死锁与回归
+
+- `2×100`、`2×20000`、`4×20000`、`8×20000` 各 5 轮，共 **20/20 全部完成**，
+  无挂死；`GO2CPP_TEST_FILTER=sync` 连续 5 轮通过。
+- **全量 ctest：113/113 通过**（`/UserData/CodexWorkSpace/Go2Cpp/build-quality`，
+  负载 4.8 下运行，Release）。性能对比的 A/B 数据在另一份 checkout
+  （`/mnt/e/CodexWorkspace/Go2Cpp`，同一基线提交）上测量；两棵树的
+  `sync.cpp` 基线一致，改动逐行 diff 核对过。

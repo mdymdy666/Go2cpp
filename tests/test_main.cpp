@@ -20,7 +20,7 @@ void run_beginner_api_tests();
 void run_log_config_tests();
 void run_network_tests();
 void run_sse_tests();
-void run_hybrid_gate_tests();
+void run_futex_mutex_tests();
 void run_parking_condition_tests();
 void run_thread_policy_tests();
 void run_fiber_local_tests();
@@ -76,7 +76,7 @@ int main() {
     if (selected("log")) run_log_config_tests();
     if (selected("network")) run_network_tests();
     if (selected("sse")) run_sse_tests();
-    if (selected("hybrid_gate")) run_hybrid_gate_tests();
+    if (selected("futex_mutex")) run_futex_mutex_tests();
     if (selected("parking_condition")) run_parking_condition_tests();
     if (selected("thread_policy")) run_thread_policy_tests();
     if (selected("fiber_local")) run_fiber_local_tests();

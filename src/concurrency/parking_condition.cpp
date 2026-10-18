@@ -24,7 +24,7 @@
  */
 #include "go2cpp/core/parking_condition.hpp"
 
-#include "go2cpp/core/hybrid_mutex.hpp"
+#include "go2cpp/concurrency/core/futex_mutex.hpp"
 
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/core/timer.hpp"
@@ -105,7 +105,7 @@ public:
     void Wake() noexcept {
         // Disarm waits for any in-flight callback to leave this gate, so no
         // raw Scheduler access survives the waiting G's stack cleanup.
-        std::lock_guard<HybridMutex> lock(m_wake_mutex);
+        std::lock_guard<FutexMutex> lock(m_wake_mutex);
         if (!m_active) {
             return;
         }
@@ -127,7 +127,7 @@ public:
     }
 
     void Disarm() noexcept {
-        std::lock_guard<HybridMutex> lock(m_wake_mutex);
+        std::lock_guard<FutexMutex> lock(m_wake_mutex);
         m_active = false;
         m_scheduler = nullptr;
     }
@@ -212,7 +212,7 @@ public:
         // 触发 EDEADLK（"Resource deadlock avoided"）。
         return result();
 #else
-        std::unique_lock<HybridMutex> lock(m_wake_mutex);
+        std::unique_lock<FutexMutex> lock(m_wake_mutex);
         outer.unlock();
         if (deadline) {
             if (!m_native_cv.wait_until(lock, *deadline, [this] {
@@ -268,7 +268,7 @@ private:
     Scheduler* m_scheduler;
     std::shared_ptr<Task> m_task;
     std::atomic<Result> m_result{Result::kWaiting};
-    HybridMutex m_wake_mutex;
+    FutexMutex m_wake_mutex;
     std::condition_variable_any m_native_cv;
     bool m_active{true};
 };

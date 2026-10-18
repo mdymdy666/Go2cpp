@@ -54,13 +54,18 @@ void Check(bool condition, const char* what) {
 }
 
 /// 测试用的临时目录（ctest 在 build-quality 下跑，用 /tmp 更稳）。
-const char* kTmpDir = "/tmp/go2cpp_os_test";
+///
+/// **必须按 pid 隔离**：并发执行两份全量 ctest 时，同一个测试二进制会被两个
+/// 进程同时运行；固定目录会让它们互相覆盖 large.bin / stress.bin，实测表现为
+/// "random ReadAt returned wrong data"，与 os 模块的实现无关。
+const std::string kTmpDir =
+    std::string("/tmp/go2cpp_os_test_") + std::to_string(::getpid());
 
-std::string Path(const std::string& name) { return std::string(kTmpDir) + "/" + name; }
+std::string Path(const std::string& name) { return kTmpDir + "/" + name; }
 
 void EnsureTmpDir() {
     // 用 os 模块自己的能力建目录不可行（未实现 MkdDir），直接调 mkdir(2)。
-    ::mkdir(kTmpDir, 0755);
+    ::mkdir(kTmpDir.c_str(), 0755);
 }
 
 // ---------------------------------------------------------------------------

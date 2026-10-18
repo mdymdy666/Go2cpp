@@ -19,6 +19,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <unistd.h>
 #include <fstream>
 #include <random>
 #include <sstream>
@@ -61,7 +62,8 @@ struct Fixture {
 };
 
 std::string TempPath(const std::string& tag) {
-    return "/tmp/go2cpp-debug-cli-" + tag + ".txt";
+    return "/tmp/go2cpp-debug-cli-" + tag + "-" +
+           std::to_string(::getpid()) + ".txt";
 }
 
 }  // namespace

@@ -66,6 +66,13 @@ using Ms = std::chrono::milliseconds;
 
 int g_failures = 0;
 
+/// 并发执行两份全量 ctest 时同一个测试二进制会同时运行；临时文件与
+/// FIFO 路径必须按 pid 隔离，否则会互相 unlink，制造与代码无关的失败。
+std::string ProcessScopedPath(const char* name) {
+    return "/tmp/" + std::string(name) + "-" +
+           std::to_string(::getpid());
+}
+
 void Check(bool condition, const char* what) {
     if (!condition) {
         std::fprintf(stderr, "[hook-correct] FAILED: %s\n", what);
@@ -146,7 +153,7 @@ void ScenarioNonSocketZeroImpact() {
     go2cpp::hook::ScopedIOManagerBinding binding(manager);
 
     // 准备一个普通文件
-    const std::string path = "/tmp/hook_correct_regular.txt";
+    const std::string path = ProcessScopedPath("hook_correct_regular.txt");
     const std::string payload = "hello-hook-correctness-payload";
     {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -208,7 +215,7 @@ void ScenarioNonSocketZeroImpact() {
 
     // --- 1c. FIFO：read 与 read_f 都阻塞（因为 FIFO 不能被 Hook 接管）---
     {
-        const std::string fifo = "/tmp/hook_correct_fifo";
+        const std::string fifo = ProcessScopedPath("hook_correct_fifo");
         (void)::unlink(fifo.c_str());
         if (::mkfifo(fifo.c_str(), 0600) == 0) {
             // 用 O_NONBLOCK 打开写端，保证 read 不会永久等
@@ -339,7 +346,7 @@ void ScenarioOsCoexists() {
     go2cpp::hook::ScopedEnable hook_scope;
     go2cpp::hook::ScopedIOManagerBinding binding(manager);
 
-    const std::string path = "/tmp/hook_correct_osmix.txt";
+    const std::string path = ProcessScopedPath("hook_correct_osmix.txt");
     {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         out << "os-file-content";

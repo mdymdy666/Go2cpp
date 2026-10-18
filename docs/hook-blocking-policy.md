@@ -34,17 +34,19 @@
 `connect` | 等连接建立 | fd 可写 | ✅ 已 hook |
 `accept` | 等新连接 | fd 可读 | ✅ 已 hook |
 
-### A'. 可 park 但**当前未 hook**（FIFO/pipe）
+### A'. 可 park 且**已 hook**（FIFO/pipe）
 
 | 函数 | 阻塞原因 | 就绪事件 | 状态 |
 |---|---|---|---|
-**FIFO/pipe 上的 `read`** | 等数据 | **fd 可读** | ⚠️ 未 hook |
-**FIFO/pipe 上的 `write`** | 等缓冲空间 | **fd 可写** | ⚠️ 未 hook |
+**FIFO/pipe 上的 `read`** | 等数据 | **fd 可读** | ✅ 已 hook |
+**FIFO/pipe 上的 `write`** | 等缓冲空间 | **fd 可写** | ✅ 已 hook |
 
-**现状**：hook 用 `getsockopt(fd, SOL_SOCKET, SO_TYPE)` 判定是否接管，
-对 FIFO/pipe 必然返回 `ENOTSOCK` → 落到 libc → **真阻塞 worker**。
+**识别方式**：`getsockopt(SO_TYPE)` 对 FIFO/pipe 返回 `ENOTSOCK`，所以 socket
+接管失败后再用 `fstat` 的 `S_ISFIFO` 判定（`inspect_fifo`）。接管后同样把 fd
+切到 `O_NONBLOCK`：先试一次 syscall，`EAGAIN` 才去 epoll 等 —— **park Fiber**，
+worker 立即空出。
 
-**为什么没改**：见第四节「与既有设计的冲突」。
+**实测（Release，400ms 心跳增量）**：FIFO park **39**，旧的 `BlockingRegion` 路径只有 **14~18**。详见第四节。
 
 ### B. 需桥接（**未实现**，只给方案）
 
@@ -85,51 +87,65 @@
 - park：Fiber 挂起，**工作线程立即空出来**，代价是 ~1µs 调度往返
 - BlockingRegion + detach：worker **真的阻塞**，但 sysmon 会补一个新 M，代价是线程创建
 
-**`tests/network/test_hook.cpp:435-470` 明确依赖后者**：它建一个 pipe，
-一个 Fiber 调 `read`（无数据），期望 `processor_detached` 被置位。
+**`tests/network/test_hook.cpp` 的
+`test_iomanager_untracked_fd_publishes_blocking` 明确依赖后者**：它必须用一个
+hook **不接管** 的 fd（现在是 `eventfd`：既不是 socket 也不是 FIFO），在 Fiber
+里 `read`，期望 `processor_detached` 被置位。FIFO/pipe 已改走 park，不再覆盖
+这条路径 —— 契约本身（未接管 fd 发布 `M::Blocking`）没有改变。
 
 ---
 
-## 四、FIFO park：已实测可行，但与既有设计冲突（**未合入**）
+## 四、FIFO park：已合入（Release 实测 39 vs 14~18）
 
-### 实测数据（加 `manager.start()` 之后）
+### 实测数据（Release，单 worker，400ms 观察窗）
 
 ```
-[hook-fifo] hook read(pipe):     400ms 内心跳增量 = 39，读到 5 字节
-[hook-fifo] read_f(pipe) [对照]: 400ms 内心跳增量 = 0，读到 5 字节
+[hook] FIFO read(pipe) 400ms 心跳增量=39   ← 本实现（park）
+[hook] read_f(pipe)    400ms 心跳增量= 0   ← 对照：直调 libc，真阻塞
 ```
 
-**39 vs 0** —— 说明实现是有效的：`read` 在 pipe 上 park 了（worker 空闲，心跳照走），
-`read_f` 真阻塞了 worker（心跳停）。
+旧行为（`BlockingRegion` + sysmon 替代 M）在同一观察窗只有 **14~18**：
+worker 真的阻塞，靠 sysmon 检测后申请替代 M，差值是「检测 → 申请 → 迁移」
+的延迟。park 让 worker **立即空出**，因此快 2 倍以上。
 
-### 实现方式（约 90 行）
+### 实现（`src/network/hook.cpp`，约 90 行）
 
-1. `OpenDescription` 加 `bool m_pollable{true}`，`can_wait` 用它替代 `m_socket`
-2. 加 `inspect_fifo(fd)`：`::fstat` + `S_ISFIFO`（`getsockopt` 认不出 FIFO）
-3. 加 `adopt_fifo(fd)`：照 `adopt_socket` 的结构，但不读 `SO_RCVTIMEO`，`m_socket=false`
-4. `cooperative_io` 里 socket 接管失败后再试 FIFO
+1. `OpenDescription` 增加 `bool m_pollable{true}`；`can_wait` 判定改用
+   `m_pollable && m_system_nonblocking && !m_user_nonblocking`
+   （`m_socket` 退化为来源标记，只用于诊断）。
+2. `inspect_fifo(fd)`：`::fstat` + `S_ISFIFO`。`getsockopt(SO_TYPE)` 认不出
+   FIFO（返回 `ENOTSOCK`），只能用类型位识别。
+3. `adopt_fifo(fd)`：与 `adopt_socket` 同构，但不读 `SO_RCVTIMEO`
+   （FIFO 没有 socket 超时语义，保持 `nullopt`），并置 `m_socket=false`。
+   同样把 fd 切到 `O_NONBLOCK`（park 的前提），`fcntl` hook 对用户隐藏该位。
+4. `cooperative_io`：socket 接管失败后再试 FIFO；`dup/dup2/dup3` 的
+   `clone_descriptor` 回退同样支持 FIFO（dup 出来的副本共享 open file
+   description，否则下一代会把内部 `O_NONBLOCK` 误判成用户意图而失去 park
+   能力）。
 
-### 为什么没合入
+### 与 `processor_detached` 冲突的解决（方案 A）
 
-**它改变了既有契约**：`tests/network/test_hook.cpp:449` 断言 pipe 上的 `read`
-会触发 `machine.processor_detached`。一旦 park，worker 不再阻塞，
-sysmon 就不会 detach，该断言失败。
+旧契约：`test_hook.cpp` 用 pipe 上的 `read` 验证「未接管的 fd 会发布
+`M::Blocking`，sysmon 申请替代 M」。FIFO park 后 worker 不再阻塞，该断言
+必然失败 —— 这是**契约变了**，不是 bug。
 
-**这是架构选择，不是 bug**：
+**采用方案 A**：把该用例改成用一个 **hook 明确不接管** 的 fd —— `eventfd`
+（既不是 socket 也不是 FIFO），它的 `read` 依旧真阻塞 worker。契约本身
+（未接管 fd 必须发布 `BlockingRegion`）保持不变，覆盖对象换成真正未接管的
+fd。不用 `/dev/tty`：CI 没有控制终端，`open("/dev/tty")` 会 `ENXIO`。
 
-| 方案 | 优点 | 缺点 |
-|---|---|---|
-park（我实现的） | worker 立即空出，无线程创建开销 | 绕过 `BlockingRegion`/sysmon 设计；需改既有测试 |
-BlockingRegion（现行） | 统一机制；`sysmon` 可观测 | 真的占一个线程，靠补 M 维持 |
+**为什么不选方案 B（park 前也构造 `BlockingRegion`）**：那会让 sysmon 把每次
+FIFO 等待都当成「worker 被长系统调用占住」，从而无谓地创建替代 M ——
+park 的性能收益正好被抵消，还会污染 sysmon 的判断依据。
 
-**如果将来要合入**，需要同时：
-1. 明确 `BlockingRegion` 与 park 的适用边界（哪些 fd 走哪条）
-2. 修改 `test_hook.cpp` 的断言（或让它覆盖两条路径）
-3. 补 `*_f` 的对照测试
+### 适用边界（保持唯一准则）
 
----
+- socket / FIFO 上 `read`/`write`（fd 就绪可等）→ **park**。
+- 其它 fd（普通文件、eventfd、timerfd、字符设备……）→ **不接管**，
+  `BlockingRegion` + sysmon 兜底。
+- `*_f` 系列 → 永远直调 libc、真阻塞，作为对照组。
 
-## 五、一个**假阳性**测试（需要修）
+## 五、一个**假阳性**测试（已修）
 
 `tests/network/test_hook_raw.cpp` 场景 3 断言：
 
@@ -150,8 +166,9 @@ Check(delta < 8, "read_f must block the worker (heartbeats should be nearly flat
 [diag] 第 3 个 100ms 后心跳 = 0                 ← 心跳完全没跑
 ```
 
-**修法**：在构造 `IOManager` 之后加 `manager.start()`，
-并先断言"空转 100ms 后心跳 > 3"作为探针，再断言阻塞期间心跳变平。
+**修法（已落地）**：在构造 `IOManager` 之后加 `manager.start()`，
+并先断言"空转 60ms 后心跳 >= 3"作为探针，再断言阻塞期间心跳变平。
+`tests/network/test_hook_raw.cpp` 场景 3 现在同时具备二者。
 
 **同一个坑也可能影响其它用「心跳增量」做证据的测试** —— 建议排查。
 
@@ -162,14 +179,17 @@ Check(delta < 8, "read_f must block the worker (heartbeats should be nearly flat
 | 项 | 结论 |
 |---|---|
 **判断准则** | 能归约为「fd 就绪」才能 park，否则会变成 Fiber 永久挂起 |
-**已 hook** | socket 上的 read/write/connect/accept + sleep |
-**FIFO/pipe** | 技术上可 park（已实测 39 vs 0），但与 `BlockingRegion`/sysmon 现有设计冲突，**未合入** |
+**已 hook** | socket 上的 read/write/connect/accept + sleep + **FIFO/pipe 上的 read/write** |
+**FIFO/pipe** | ✅ 已合入：`fstat(S_ISFIFO)` 识别后 park；Release 400ms 心跳 **39**，旧 `BlockingRegion` 路径仅 14~18 |
 **fsync/wait4/nanosleep** | 需 eventfd/signalfd/timerfd 桥接，**未实现**（方案已给）|
 **poll/select/epoll_wait** | 不该 hook（事件循环入口）|
-**已知缺陷** | `test_hook_raw.cpp` 场景 3 是假阳性（缺 `manager.start()`）|
+| **已知缺陷** | 无（`test_hook_raw.cpp` 场景 3 的 `manager.start()` 与探针均已补齐）|
 
 ### 补充实测：`*_f` 的承诺成立，且 `BlockingRegion` 确实在工作
 
+
+> 下面是 FIFO park **合入前**的对照基线（300ms 观察窗），保留用于与
+> 400ms 的 39 对比。
 用探针（**不改项目文件**，`/tmp` 编译）在单 worker 上实测：
 
 ```
@@ -180,7 +200,7 @@ Check(delta < 8, "read_f must block the worker (heartbeats should be nearly flat
 | 调用 | 心跳增量 | 说明 |
 |---|---|---|
 `read_f(pipe)` | **0** | 直调 libc，**无** `BlockingRegion` → worker 真阻塞 ✅ 证明 `*_f` 的"不 park、不退让"承诺成立 |
-`hook read(pipe)`（回退后）| **14** | 走 `invoke_native_blocking` → **`BlockingRegion` → sysmon 申请替代 M** → 心跳在新 M 上继续 |
+`hook read(pipe)`（FIFO park 之前）| **14** | 走 `invoke_native_blocking` → **`BlockingRegion` → sysmon 申请替代 M** → 心跳在新 M 上继续 |
 
 **14 而不是 30 的原因**：心跳设计是每 10ms 一次，300ms 应约 30 次。
 少了将近一半，是因为 `BlockingRegion` → sysmon 检测 → 申请替代 M → Fiber 迁移

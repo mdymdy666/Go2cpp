@@ -26,7 +26,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_streams.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_time.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_event_go.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_hybrid_gate.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_futex_mutex.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_parking_condition.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_thread_policy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_fiber_local.cpp
@@ -573,7 +573,7 @@ if (GO2CPP_BUILD_EXAMPLES)
         concurrency/fiber_stack_limit_demo
         concurrency/fiber_stack_limit_full
         concurrency/future_demo
-        concurrency/hybrid_mutex_demo
+        concurrency/futex_mutex_demo
         network/fd_manager_demo
         network/http_demo
         network/http_full
@@ -635,6 +635,14 @@ if (GO2CPP_BUILD_BENCHMARKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/parking_condition_benchmark.cpp)
     target_link_libraries(go2cpp_parking_condition_benchmark PRIVATE go2cpp_runtime)
     target_compile_options(go2cpp_parking_condition_benchmark PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_executable(go2cpp_sync_mutex_contention_benchmark
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/sync_mutex_contention_benchmark.cpp)
+    target_link_libraries(go2cpp_sync_mutex_contention_benchmark PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_sync_mutex_contention_benchmark PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_executable(go2cpp_futex_mutex_contention_benchmark
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/futex_mutex_contention_benchmark.cpp)
+    target_link_libraries(go2cpp_futex_mutex_contention_benchmark PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_futex_mutex_contention_benchmark PRIVATE -O2 -Wall -Wextra -Wpedantic)
     target_compile_options(go2cpp_channel_vs_queue_benchmark PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
     add_executable(go2cpp_timer_task_benchmark

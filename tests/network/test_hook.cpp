@@ -3,6 +3,7 @@
 #include "test_support.hpp"
 
 #include <fcntl.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <sys/mman.h>
@@ -13,6 +14,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <chrono>
@@ -435,15 +437,26 @@ void test_iomanager_untracked_fd_publishes_blocking() {
     go2cpp::IOManager manager(config);
     GO2CPP_CHECK(manager.Start());
 
-    int pipe_fds[2]{-1, -1};
-    GO2CPP_CHECK(::pipe(pipe_fds) == 0);
+    // FIFO/pipe 现在会被 hook 接管并 park（见 test_fifo_read_parks），不再走
+    // BlockingRegion/sysmon。这个用例要守住的契约仍然成立：**未接管的 fd**
+    // 必须发布 M::Blocking，sysmon 才能为长系统调用申请替代 M。
+    //
+    // 因此换用 hook 明确不接管的 fd：eventfd 既不是 socket
+    // （getsockopt → ENOTSOCK）也不是 FIFO（fstat → S_IFIFO 为假），
+    // 它的 read 会真阻塞 worker —— 与改动前的 pipe 完全同类。
+    // 不用 /dev/tty：CI 里没有控制终端，open 会 ENXIO。
+    const int blocking_fd = ::eventfd(0, 0);
+    GO2CPP_CHECK(blocking_fd >= 0);
     std::atomic<bool> entered{false};
     std::atomic<bool> peer_done{false};
     std::atomic<bool> detached{false};
+    std::atomic<ssize_t> read_result{-2};
     auto reader = manager.Go([&] {
         entered.store(true, std::memory_order_release);
-        char value = 0;
-        GO2CPP_CHECK(::read(pipe_fds[0], &value, 1) == 1);
+        std::uint64_t counter = 0;
+        read_result.store(::read(blocking_fd, &counter, sizeof(counter)),
+                          std::memory_order_release);
+        GO2CPP_CHECK(counter == 1);
     });
     GO2CPP_CHECK(wait_until(entered));
     GO2CPP_CHECK(wait_until_predicate([&] {
@@ -460,12 +473,14 @@ void test_iomanager_untracked_fd_publishes_blocking() {
     });
     GO2CPP_CHECK(wait_until(peer_done));
     GO2CPP_CHECK(detached.load(std::memory_order_acquire));
-    const char value = 'p';
-    GO2CPP_CHECK(::write(pipe_fds[1], &value, 1) == 1);
+    const std::uint64_t signal = 1;
+    GO2CPP_CHECK(::write(blocking_fd, &signal, sizeof(signal)) ==
+                 static_cast<ssize_t>(sizeof(signal)));
     GO2CPP_CHECK(reader->wait_for(2s));
+    GO2CPP_CHECK(read_result.load(std::memory_order_acquire) ==
+                 static_cast<ssize_t>(sizeof(signal)));
     GO2CPP_CHECK(peer->wait_for(2s));
-    (void)::close(pipe_fds[0]);
-    (void)::close(pipe_fds[1]);
+    (void)::close(blocking_fd);
     manager.Shutdown();
 }
 
@@ -780,6 +795,80 @@ void test_deep_nested_fiber_io_chain() {
 }
 
 /**
+ * @brief 验证 FIFO/pipe 上的 read 会 park Fiber，而不是阻塞 worker。
+ *
+ * @details 判定指标是单 worker 上每 10ms 一次的心跳 Fiber：
+ *   - FIFO park：worker 立即空出，400ms 观察窗应接近 40 次心跳；
+ *   - BlockingRegion + sysmon 替代 M：前段真阻塞，实测只有 14~18 次
+ *     （差值是「检测 → 申请替代 M → 迁移」的延迟）。
+ *   先断言探针 before >= 3，证明心跳机制本身在跑，否则 delta 没有意义。
+ *
+ *   观察窗内同时断言 read 仍未返回：确保窗口测到的是「等待中的 park」，
+ *   而不是读已经完成后的空转。
+ */
+void test_fifo_read_parks() {
+    go2cpp::IOManager manager(one_worker_config());
+    GO2CPP_CHECK(manager.Start());
+
+    int pipe_fds[2]{-1, -1};
+    GO2CPP_CHECK(::pipe(pipe_fds) == 0);
+
+    std::atomic<int> heartbeats{0};
+    std::atomic<bool> stop{false};
+    manager.Go([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            heartbeats.fetch_add(1, std::memory_order_relaxed);
+            std::this_thread::sleep_for(10ms);
+        }
+    });
+    std::this_thread::sleep_for(60ms);
+
+    // 基线：先测 200ms 的心跳速率。断言用「同进程内的相对速率」而不是写死
+    // 的绝对次数 —— 绝对阈值在并发 ctest / 慢机器上会把调度抖动误判成
+    // 「没有 park」，那正是本测试要避免的时序假设。
+    const int baseline_begin = heartbeats.load(std::memory_order_relaxed);
+    std::this_thread::sleep_for(200ms);
+    const int baseline =
+        heartbeats.load(std::memory_order_relaxed) - baseline_begin;
+    // 探针：200ms / 10ms ≈ 20 跳；留 2.5 倍余量，证明心跳机制真的在跑。
+    GO2CPP_CHECK(baseline >= 8);
+
+    std::atomic<bool> entered{false};
+    std::atomic<ssize_t> read_result{-2};
+    std::atomic<char> received{0};
+    auto reader = manager.Go([&] {
+        entered.store(true, std::memory_order_release);
+        char value = 0;
+        const ssize_t result = ::read(pipe_fds[0], &value, 1);
+        received.store(value, std::memory_order_release);
+        read_result.store(result, std::memory_order_release);
+    });
+    GO2CPP_CHECK(wait_until(entered));
+
+    // 观察窗是基线的两倍。park：worker 空闲，速率不变 → 约 2x 基线；
+    // 退化为 BlockingRegion + sysmon 替代 M：worker 真阻塞一段，
+    // 实测只有 0.4~0.9x 基线（差值是「检测 → 申请 M → 迁移」的延迟）。
+    std::this_thread::sleep_for(400ms);
+    const int delta = heartbeats.load(std::memory_order_relaxed) -
+                      baseline_begin - baseline;
+    GO2CPP_CHECK(read_result.load(std::memory_order_acquire) == -2);
+    GO2CPP_CHECK(delta * 2 >= baseline * 3);
+    std::printf(
+        "[hook] FIFO read(pipe): 基线 200ms=%d，观察 400ms=%d（park 预期 2x）\n",
+        baseline, delta);
+
+    stop.store(true, std::memory_order_release);
+    const char value = 'p';
+    GO2CPP_CHECK(::write(pipe_fds[1], &value, 1) == 1);
+    GO2CPP_CHECK(reader->wait_for(2s));
+    GO2CPP_CHECK(read_result.load(std::memory_order_acquire) == 1);
+    GO2CPP_CHECK(received.load(std::memory_order_acquire) == value);
+    (void)::close(pipe_fds[0]);
+    (void)::close(pipe_fds[1]);
+    manager.Shutdown();
+}
+
+/**
  * @brief 运行 socket Hook、超时、dup 和阻塞转移测试。
  * @return 无；测试失败由统一断言统计。
  */
@@ -807,6 +896,7 @@ void run_hook_tests() {
     test_plain_scheduler_lazy_adoption_timeout();
     test_native_fallback_grows_replacement_m();
     test_iomanager_untracked_fd_publishes_blocking();
+    test_fifo_read_parks();
     test_managed_poll_fallback_publishes_blocking();
     test_managed_write_error_is_reported();
     test_nested_fiber_io_timeout_and_wake();

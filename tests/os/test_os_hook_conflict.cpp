@@ -50,6 +50,13 @@ using go2cpp::os::OsError;
 
 int g_failures = 0;
 
+/// 并发执行两份全量 ctest 时同一个测试二进制会同时运行；所有临时
+/// 文件/FIFO 路径按 pid 隔离，避免互相 unlink 造成的假失败。
+std::string ProcessScopedPath(const char* name) {
+    return "/tmp/" + std::string(name) + "-" +
+           std::to_string(::getpid());
+}
+
 void Check(bool condition, const char* what) {
     if (!condition) {
         std::fprintf(stderr, "[os-hook] FAILED: %s\n", what);
@@ -87,13 +94,15 @@ void ScenarioFdSpectrum() {
     std::vector<Entry> entries;
     std::vector<int> owned;
 
-    const char* reg = "/tmp/os_hook_regular.txt";
+    const std::string reg_path = ProcessScopedPath("os_hook_regular.txt");
+    const char* reg = reg_path.c_str();
     int fd = ::open(reg, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) { ::write(fd, "x", 1); ::lseek(fd, 0, SEEK_SET); }
     owned.push_back(fd);
     entries.push_back({"普通文件", fd, false, true, OsError::kOk});
 
-    const char* fifo = "/tmp/os_hook_fifo";
+    const std::string fifo_path = ProcessScopedPath("os_hook_fifo");
+    const char* fifo = fifo_path.c_str();
     ::unlink(fifo);
     ::mkfifo(fifo, 0644);
     fd = ::open(fifo, O_RDWR | O_NONBLOCK);   // O_RDWR 避免 open 阻塞
@@ -182,7 +191,8 @@ void ScenarioFdSpectrum() {
 // 场景 2：Open 一个 FIFO 路径 —— 必须被拒绝，且不能阻塞在 open 本身
 // ---------------------------------------------------------------------------
 void ScenarioOpenFifo() {
-    const char* fifo = "/tmp/os_hook_open_fifo";
+    const std::string fifo_path = ProcessScopedPath("os_hook_open_fifo");
+    const char* fifo = fifo_path.c_str();
     ::unlink(fifo);
     Check(::mkfifo(fifo, 0644) == 0, "mkfifo failed");
 
@@ -208,7 +218,8 @@ void ScenarioOpenFifo() {
 // 场景 3：Hook 开关不影响 os::File（os 走裸 syscall）
 // ---------------------------------------------------------------------------
 void ScenarioHookSwitchDoesNotAffectOs() {
-    const char* path = "/tmp/os_hook_switch.txt";
+    const std::string switch_path = ProcessScopedPath("os_hook_switch.txt");
+    const char* path = switch_path.c_str();
     {
         File create;
         const auto st = File::Create(path, 0644, &create);
@@ -249,7 +260,8 @@ void ScenarioHookSwitchDoesNotAffectOs() {
 // 场景 4：Create 一个已存在的 FIFO 路径 —— 必须拒绝且不阻塞
 // ---------------------------------------------------------------------------
 void ScenarioCreateExistingFifo() {
-    const char* fifo = "/tmp/os_hook_create_fifo";
+    const std::string fifo_path = ProcessScopedPath("os_hook_create_fifo");
+    const char* fifo = fifo_path.c_str();
     ::unlink(fifo);
     Check(::mkfifo(fifo, 0644) == 0, "mkfifo for Create test failed");
 
@@ -271,7 +283,8 @@ void ScenarioCreateExistingFifo() {
     Check(elapsed < 2000, "Create on FIFO must not block (O_NONBLOCK 必须生效)");
 
     // 同一路径下 Create 一个普通文件仍应成功（确认没误伤正常路径）
-    const char* reg = "/tmp/os_hook_create_reg.txt";
+    const std::string reg_path = ProcessScopedPath("os_hook_create_reg.txt");
+    const char* reg = reg_path.c_str();
     ::unlink(reg);
     File reg_file;
     const FileStatus reg_st = File::Create(reg, 0644, &reg_file);

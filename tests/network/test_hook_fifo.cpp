@@ -17,7 +17,7 @@
  *
  * | 调用 | 行为 | 400ms 内心跳增量 |
  * |---|---|---|
- * | `::read`（hook 版，FIFO） | **park**，worker 空闲 | 应该 > 15 |
+ * | `::read`（hook 版，FIFO） | **park**，worker 空闲 | 应该 ≥ 25（实测 39）|
  * | `read_f`（raw 版，FIFO） | **真阻塞** worker | 应该 < 8 |
  *
  * 同一个 pipe 分别用两种方式读，用**同一个指标**对比 —— 这是最直接的证据。
@@ -129,18 +129,15 @@ void ScenarioReadParks() {
     ssize_t value = -2;
     const int delta = RunReadScenario(false, &value, "hook read(pipe)");
     // park 时 worker 空闲，心跳应该走了 30~40 次（400ms / 10ms）。
-    // 阈值取 15，留足调度抖动余量。
-    // **修正后的预期**：hook 不接管 FIFO/pipe（`getsockopt(SO_TYPE)` 对它们返回
-    // `ENOTSOCK`），所以 `read` 不走 park 路径，而是 `invoke_native_blocking`
-    // —— 标记 `BlockingRegion` + 调原生。此时 worker 真的阻塞，但 sysmon 会
-    // 检测到长阻塞并**申请替代 M**，心跳 Fiber 迁移过去继续跑。
+    // FIFO 现在由 `adopt_fifo` 接管：fstat(S_ISFIFO) 识别 + O_NONBLOCK +
+    // epoll 等待，`read` 直接 park Fiber，worker 立即空出。
     //
-    // 实测：300ms 内约 14 次（理论 30 次，少的一半是「检测 → 申请 M → 迁移」的延迟）。
-    // 所以断言「心跳仍在走」（> 5）而不是「park 了」（> 15）。
-    //
-    // 这与 FIFO park 的实现方案不同：那个方案实测心跳 39（真 park），
-    // 但它改变了 `test_hook.cpp:449` 依赖的 `processor_detached` 契约，所以已回退。
-    Check(delta > 5, "hook read must let sysmon take over (heartbeats should continue)");
+    // 对照数据（同一观察窗）：
+    //   - FIFO park（本实现）：约 39 次；
+    //   - BlockingRegion + sysmon 替代 M（旧行为）：14~18 次，
+    //     差值是「检测 → 申请替代 M → 迁移」的延迟。
+    // 因此阈值取 25：既能明确区分两条路径，又给调度抖动留余量。
+    Check(delta >= 25, "FIFO read must park the fiber (heartbeats should keep ticking)");
     Check(value == 5, "parked read must return the 5 bytes written by the peer");
 }
 

@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdio>
 #include <fstream>
+#include <unistd.h>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -157,7 +158,8 @@ void ScenarioDumpRoundTrip() {
 // ---------------------------------------------------------------------------
 void ScenarioSaveToFile() {
     auto& cfg = go2cpp::config::Config::Instance();
-    const std::string path = "/tmp/go2cpp_app_test.ini";
+    const std::string path = "/tmp/go2cpp_app_test_" +
+                             std::to_string(::getpid()) + ".ini";
     std::string error;
     Check(cfg.SaveToFile(path, &error), "SaveToFile failed");
 

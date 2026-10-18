@@ -29,6 +29,24 @@ bool WaitUntil(Predicate predicate,
 }
 
 /**
+ * @brief 关闭调度器，但绝不无限期等待失去唤醒的 G。
+ *
+ * @details `Scheduler::shutdown()` 会一直等到所有已启动 G 进入终态。一旦某个
+ *   G 因丢唤醒永久停在 waiting，测试进程会卡到 ctest 的 120s 超时，日志里
+ *   没有任何定位信息。这里把它限制为 5s：超时说明有 G 失去唤醒，立即 abort
+ *   并带出测试位置。**这不是放宽断言** —— 失败仍然是失败，只是失败得更快、
+ *   更能定位。
+ */
+void ShutdownOrReportLostWakeup(go2cpp::Scheduler& scheduler) {
+    if (scheduler.shutdown_for(5s)) {
+        return;
+    }
+    go2cpp_tests::watchdog_abort(
+        "scheduler shutdown timed out: a started G lost its wakeup", __FILE__,
+        __LINE__);
+}
+
+/**
  * @brief 构造同步原语测试使用的调度配置。
  * @param processors 处理器数量，测试会据此验证单 P 和多 P 路径。
  * @return 经过测试约束初始化的 SchedulerConfig 值。
@@ -317,7 +335,7 @@ void TestMixedThreadAndFiberSynchronization() {
     GO2CPP_CHECK(managed_group_waiter->wait_for(2s));
     GO2CPP_CHECK(managed_group_result.load(std::memory_order_acquire));
 
-    scheduler.shutdown();
+    ShutdownOrReportLostWakeup(scheduler);
 }
 
 /**
@@ -394,7 +412,7 @@ void TestImmediateConditionAndWaitGroupAbort() {
     GO2CPP_CHECK(!managed_group_result.load(std::memory_order_acquire));
     group.Done();
     GO2CPP_CHECK(group.Wait());
-    scheduler.shutdown();
+    ShutdownOrReportLostWakeup(scheduler);
 }
 
 /**
@@ -525,7 +543,7 @@ void TestFifoAndSingleProcessorProgress() {
     GO2CPP_CHECK(WaitUntil(
         [&] { return second_wave.load(std::memory_order_acquire); }));
 
-    scheduler.shutdown();
+    ShutdownOrReportLostWakeup(scheduler);
 }
 
 /**
@@ -584,7 +602,7 @@ void TestContextAndTimeout() {
         [&] { return condition_done.load(std::memory_order_acquire); }));
     GO2CPP_CHECK(!condition_result.load(std::memory_order_acquire));
 
-    scheduler.shutdown();
+    ShutdownOrReportLostWakeup(scheduler);
 }
 
 struct NotifyRaceState {
@@ -644,7 +662,7 @@ void TestNotifyBeforeParkRace() {
         GO2CPP_CHECK(state->wait_result.load(std::memory_order_acquire));
     }
 
-    scheduler.shutdown();
+    ShutdownOrReportLostWakeup(scheduler);
 }
 
 /**
@@ -737,7 +755,7 @@ void TestConditionCancellationAlwaysRelocks() {
         GO2CPP_CHECK(owns_mutex.load(std::memory_order_acquire));
     }
 
-    scheduler.shutdown();
+    ShutdownOrReportLostWakeup(scheduler);
 }
 
 /**
@@ -758,7 +776,7 @@ void TestSpuriousWakeDoesNotCancelWait() {
     scheduler.start();
     GO2CPP_CHECK(WaitUntil(
         [&] { return result.load(std::memory_order_acquire); }));
-    scheduler.shutdown();
+    ShutdownOrReportLostWakeup(scheduler);
 }
 
 /**
@@ -809,7 +827,7 @@ void TestWaitGroupWaveReleasedBeforeReuse() {
     group.Done();
     GO2CPP_CHECK(second->wait_for(2s));
     GO2CPP_CHECK(second_result.load(std::memory_order_acquire));
-    scheduler.shutdown();
+    ShutdownOrReportLostWakeup(scheduler);
 }
 
 /**
@@ -870,7 +888,7 @@ void TestUnlockRacesContextCancellation() {
             mutex.Unlock();
         }
     }
-    scheduler.shutdown();
+    ShutdownOrReportLostWakeup(scheduler);
 }
 
 struct StackRelease final {
@@ -915,7 +933,7 @@ void TestContextCallbackRacesSchedulerShutdown() {
             cancellation.second();
         });
         race.store(true, std::memory_order_release);
-        scheduler->shutdown();
+        ShutdownOrReportLostWakeup(*scheduler);
         scheduler.reset();
         GO2CPP_JOIN_WITH_WATCHDOG(canceller, 3s);
         GO2CPP_CHECK(returned.load(std::memory_order_acquire));

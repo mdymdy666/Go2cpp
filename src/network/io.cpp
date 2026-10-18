@@ -1,6 +1,6 @@
 #include "go2cpp/io.hpp"
 
-#include "go2cpp/core/hybrid_mutex.hpp"
+#include "go2cpp/concurrency/core/futex_mutex.hpp"
 
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -233,7 +233,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         Scheduler* scheduler{nullptr};
         std::shared_ptr<Task> task;
         DescriptorTokenPtr descriptor;
-        core::HybridMutex wake_mutex;
+        core::FutexMutex wake_mutex;
         bool wake_active{true};
         std::atomic<std::uint64_t> outcome{0};
         std::shared_ptr<WaitNode> wake_next;
@@ -252,7 +252,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         std::atomic<std::uint8_t> operation_state{0};
 
         void wake() noexcept {
-            std::lock_guard<core::HybridMutex> lock(wake_mutex);
+            std::lock_guard<core::FutexMutex> lock(wake_mutex);
             if (wake_active && scheduler && task) {
                 (void)scheduler->wake_io(task);
             }
@@ -261,7 +261,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         /// 返回当前仍可唤醒的任务快照；不执行调度操作，供批量唤醒路径
         /// 在释放每个节点锁后统一按 P 分桶入队。
         std::shared_ptr<Task> wake_task() noexcept {
-            std::lock_guard<core::HybridMutex> lock(wake_mutex);
+            std::lock_guard<core::FutexMutex> lock(wake_mutex);
             return wake_active ? task : std::shared_ptr<Task>{};
         }
 
@@ -273,7 +273,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         }
 
         void disarm() noexcept {
-            std::lock_guard<core::HybridMutex> lock(wake_mutex);
+            std::lock_guard<core::FutexMutex> lock(wake_mutex);
             wake_active = false;
             scheduler = nullptr;
         }

@@ -9458,3 +9458,131 @@ ctest --test-dir /tmp/go2cpp_build_encoding --output-on-failure
 - 未实现：SHA-224、SHA-512、HMAC、`encoding.BinaryMarshaler` 兼容序列化、CRC32
   的 SSE4.2/PCLMUL 硬件加速（纯 C++ 可移植实现，当前已 >3 GB/s）。
 - MD5/SHA-1 仅用于校验/兼容；两个头文件均以 `@warning` 写明其安全性已失效。
+
+### 补充（父 agent 合并 CMake 后实测，2026-10-18）
+
+- 父 agent 已把 `go2cpp_hash` / `go2cpp_hash_test` 合并进共享 cmake；本流随后在
+  `build-quality`（Release）执行 `cmake -S . -B build-quality` + `cmake --build`，
+  成功；`go2cpp_hash_test` 出现在 ctest 列表（#35）。
+- **全量 ctest：112/112 passed（48.29 s）**。基线 109 条；新增的 3 条为并行交付的
+  hash / compress / encoding，其中 hash 测试 `go2cpp_hash_test` 单跑 5.37 s 通过。
+- Release 构建实测吞吐（1 GiB 流，4 MiB 缓冲，单线程）：
+  **CRC32 3421.38 MB/s**（3262.88 MiB/s）、**Adler32 5098.66 MB/s**、
+  **SHA-256 442.40 MB/s**；参考 MD5 984.93 MB/s、SHA-1 290.86 MB/s。
+- ASan+UBSan（`-O1 -fsanitize=address,undefined`）全测试通过，无 sanitizer 报告、
+  无泄漏；插桩构建会自动跳过吞吐下限断言（仅打印实测值），避免把插桩开销误判为退化。
+
+## 2026-10-18：修复 sync::Mutex 250 倍退化；按 X-35 删除 HybridGate
+
+### 一、sync::Mutex 4/8 线程退化（P0）
+
+**根因**（探针实测，4 线程×20000 ops，每线程）：进入等待队列 19793 次、
+`FUTEX_WAIT` 19793 次 —— 除开头几个操作外**每次加锁都睡一次**。
+不是 `Unlock` 的 O(n) 队列遍历（队列只有 3～7 个元素）。链路是：
+`kWaiter` 常驻 → 竞争者只自旋 4 次就入队 → `WaitNative` 自旋 128（≈1.1µs）
+覆盖不了一次完整交接 → 每次操作一次睡眠；本机空闲 futex 往返 ~0.4µs，
+loadavg 3～4 时实测放大到 ~96µs。
+
+**修复**（`src/concurrency/sync.cpp`）：
+- 入队前自旋 256 → 2048（≈18µs）；标定：1024→321ns、2048→225ns、4096→349ns；
+- `WaitNative` 自旋 128 → 2048（连续无进展才睡），另有 262144 绝对上限，严格有界；
+- 新增 `m_futex_waiters`：只在确有人睡在 futex 上时 `FUTEX_WAKE`。
+
+**数据**（`benchmarks/sync_mutex_contention_benchmark.cpp`，Release，taskset 0-7，
+A/B 交替 ×5 中位数，loadavg 1.37～2.34）：2 线程 25.62→25.46 ns；
+4 线程 15,954→60.33 ns（264x）；8 线程 20,777→166.45 ns（125x）。
+详见 `docs/performance.md` 同日章节。
+
+### 二、HybridGate 删除（X-35，用户明确决策）
+
+- 删除 `include/go2cpp/{core,concurrency/core}/hybrid_mutex.hpp`；
+- 12 个加锁点 + 3 个成员改为 `core::FutexMutex`：
+  `parking_condition.cpp`、`sync.cpp`、`io.cpp`；跨线程解锁语义保留；
+- 新头文件 `include/go2cpp/concurrency/core/futex_mutex.hpp`：0/1/2 状态 +
+  futex，**无自旋、无 CV**；`exchange(2)` 保证不丢唤醒链；
+- 测试/示例/基准：`test_futex_mutex.cpp`、`futex_mutex_demo.cpp`、
+  `futex_mutex_contention_benchmark.cpp`（原 HybridGate 三个文件删除）。
+
+### 三、验证
+
+- 死锁：2×100、2×20000、4×20000、8×20000 各 5 轮，20/20 完成；
+  `GO2CPP_TEST_FILTER=sync` ×5 通过；IO 过滤 ×10 通过。
+- 全量 ctest `/UserData` 主树 `build-quality`：**113/113 全绿**
+  （Release，负载 4.8）。死锁验证 20/20 完成。
+- 未执行任何 git 命令。
+
+### 四、遗留风险（如实记录）
+
+- 状态流反馈 `TestConditionCancellationAlwaysRelocks` 偶发挂起，
+  疑点在 `Await(cleanup_relock=true)` 无退出条件 +
+  `park_wait_for_cleanup` 的 `kRejected` 分支（`sync.cpp`/`scheduler.cpp`）。
+  本轮 5 次 sync 过滤 + 2 次全量 ctest 未复现，且删除 CV 版 HybridGate 后
+  未再出现；需状态流用 watchdog 继续验证，**不要仅凭放宽超时判定修复**。
+- 8 线程在 loadavg > 2.2 时仍有 5.3～5.7µs 的轮次（睡眠回退），
+  中位数 166ns；若要求极端负载下也稳定，需要另做自适应/让出策略。
+
+## 2026-10-18 并发 ctest flaky 修复 + FIFO park 合入
+
+### 1. 并发 ctest 失败根因（测试隔离，不是 test_sync 时序）
+
+- 复现：同时启动两个 `ctest --test-dir build-quality`，两个 go2cpp_tests 同时失败。
+- 失败点 `tests/logging/test_log_config.cpp:205/222`（另一次 `:226` watchdog abort）。
+- 根因：热加载测试用**固定** `/tmp/go2cpp-dynamic.ini` + `.lock`，两个测试进程
+  互相写/删对方的配置文件。**这是测试间的隐式共享状态**，与同步原语无关。
+- 同类固定路径（并发下同样会炸，已逐个修复为按 pid 隔离）：
+  `tests/os/test_os_file.cpp` 的 `/tmp/go2cpp_os_test`（4 并发实测 3/12 次
+  `random ReadAt returned wrong data`）、`test_bufio` 场景 3（3/12 次）、
+  以及 `test_hook_correctness` / `test_os_hook_conflict` / `test_bufio_stress` /
+  `test_config_registry_macro` / `test_debug_cli` / `test_hash_scenarios`。
+- **未放宽任何断言**。
+
+### 2. test_sync 低频失败：确认是真丢唤醒，已移交性能流
+
+- gdb attach 证据（12 并发 sync 过滤，2/12 命中）：
+  main 停在 `Scheduler::shutdown_for -> ParkingCondition::WaitOnce`；
+  两个 worker 均空闲；sysmon / TimerService 空闲。
+  **没有任何 G 在跑，却有一个已启动 G 永不进入终态** ⇒ 丢失唤醒，不是调度延迟。
+- 失败点 `test_sync.cpp:734/736/737`（TestConditionCancellationAlwaysRelocks
+  第二个循环：cancel 后 cleanup 重锁）。4 并发全量时另一个入口是
+  `TestNotifyBeforeParkRace:643/644`。
+- 独立复现器：`tests/concurrency/test_sync_cancel_stress.cpp`（**暂未注册 ctest**），
+  12 份并发 × 5000 轮时主树实测 1/36 命中；单进程 3000 轮稳定通过。
+- 测试侧只做可观测性：test_sync 结尾无限 `scheduler.shutdown()` →
+  `shutdown_for(5s)` + 超时 `watchdog_abort`（120s 静默超时 → 5s 带定位失败）。
+- bisect（`git worktree`，不碰主工作树）：`894ab82~1` 0/36、`894ab82` 0/72、
+  当前主树 1/36。样本不足以归因；且 894ab82 的 diff 只改 `WaitNative`
+  （普通线程路径），本缺陷发生在 Fiber 路径（`Await` / `park_for_scheduler` /
+  cancel），代码层面不可能由它引入。**倾向：老 bug 被新测试强度暴露。**
+
+### 3. FIFO park 合入（`src/network/hook.cpp`，约 90 行）
+
+- `OpenDescription` 加 `bool m_pollable{true}`；`can_wait` 改判 pollable；
+  新增 `inspect_fifo`（`fstat` + `S_ISFIFO`）、`adopt_fifo`（不读 `SO_RCVTIMEO`，
+  `m_socket=false`）；`cooperative_io` 在 socket 接管失败后试 FIFO；
+  `clone_descriptor` 的 dup 回退同样支持 FIFO。
+- 契约冲突用**方案 A**：`test_hook.cpp` 的
+  `test_iomanager_untracked_fd_publishes_blocking` 改用 eventfd（hook 明确不接管
+  的 fd），继续验证 `BlockingRegion` + `processor_detached`。
+- `test_hook.cpp` 新增 `test_fifo_read_parks`：先测 200ms 基线心跳，再测 400ms
+  观察窗，断言**相对速率**（park ≈2x 基线；BlockingRegion 只有 0.4~0.9x），
+  避免绝对阈值在并发/慢机器上误判。
+- Release 实测：基线 20（200ms）→ 观察 **39**（400ms）；旧 14~18。
+
+### 4. 验证
+
+- Release（`-O3 -DNDEBUG`）`build-quality`。
+- 单跑：`go2cpp_tests` 全绿；`GO2CPP_TEST_FILTER=hook` 打印心跳 39；
+  `filter=sync`、`go2cpp_hook_correctness_test`、`go2cpp_os_hook_conflict_test`、
+  `go2cpp_bufio_test` 等全部通过。
+- 2 并发全量 ctest × 3 轮：**6/6 全绿**（当时 112/112）。
+- 4 并发全量 ctest × 3 轮（113 条，因并行流新增 metrics 测试/示例）：
+  round1 4/4、round2 4/4、round3 2/4；round3 的 2 个失败均为
+  `libgo2cpp_io.so.0: file too short`（另一 agent 正在重建，环境竞态），
+  与测试/代码无关。**尚未在干净窗口重跑。**
+
+### 状态 / 待办
+
+- 等性能流修掉 Fiber 丢唤醒后，重跑 4× 全量 ctest × 3 作为回归门槛；
+  并考虑把 `test_sync_cancel_stress.cpp` 注册进 ctest。
+- 当前并行流正在改 `sync.cpp` / `scheduler.cpp` / `hybrid_mutex`（工作树有未提交
+  改动），最终数字需在稳定树上复核。

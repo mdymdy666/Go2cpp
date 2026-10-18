@@ -4,14 +4,15 @@
  *
  * ## 这个文件实现什么
  *
- * 面向**用户代码**的同步原语。与调度器内部用的 `HybridGate` 不同，这里的
- * 原语要求完整语义（支持超时、跨线程、可被 Fiber 使用），所以实现更重。
+ * 面向**用户代码**的同步原语。与内部唤醒门 `core::FutexMutex`（只做
+ * CAS + futex、零点几条赋值）不同，这里的原语要求完整语义（支持超时、
+ * 跨线程、可被 Fiber 使用），所以实现更重。
  *
  * ## 已实现的机制
  *
  * - `sync::Mutex`：混合锁 —— 无竞争时走原子 CAS 快路径，有等待者时才 park。
  *   关键参数是"何时从自旋转入 park"：对极短临界区（计数器）加自旋预算能快
- *   21 倍，但这个结论**不能推广**到长临界区（见 `hybrid_mutex.hpp` 的限制）；
+ *   21 倍，但这个结论**不能推广**到长临界区（见 `futex_mutex.hpp` 的限制）；
  * - 等待/唤醒走 `ParkingCondition`，因此同一份代码在 Fiber 里会 park 协程、
  *   在普通线程里退化为原生等待；
  * - 其余原语（WaitGroup / Once 等）建立在上述两者之上。
@@ -28,7 +29,7 @@
  */
 #include "go2cpp/sync.hpp"
 
-#include "go2cpp/core/hybrid_mutex.hpp"
+#include "go2cpp/concurrency/core/futex_mutex.hpp"
 
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/scheduler.hpp"
@@ -57,10 +58,20 @@
 
 namespace {
 
-/// FUTEX_WAIT 前的自旋预算：唤醒已在路上时完全避开系统调用。
-/// 经验来自 ParkingCondition 的改造 —— 不加自旋时 2 等待者场景会比
-/// condition_variable 慢 3.3 倍。
-constexpr int kWaitSpinBudget = 128;
+/// FUTEX_WAIT 前的"无进展"自旋预算：唤醒已在路上时完全避开系统调用。
+///
+/// 128（≈1.1µs）只够覆盖「通知已经发出」的窄窗口，却覆盖不了
+/// **一次完整的 FIFO 交接**：4 线程争用时每个等待者都会先睡一次，
+/// 实测 25~30µs/op（见 docs/performance.md 的 250 倍退化）。
+/// 2048 次 PAUSE（本机实测每次 8.7ns，约 18µs）足以让「持锁者解锁 →
+/// TryFinish 选中队首 → 队首看到终态」整个过程在用户态完成。
+/// 只要观察到交接进展（代际推进）就重置该计数，因此不会因为排队人数多
+/// 而误睡。预算仍然**有界**：连续无进展超限就 FUTEX_WAIT。
+constexpr int kWaitSpinBudget = 2048;
+
+/// 单次连续自旋的绝对上限（≈2.3ms）。防止"代际持续被别人推进、自己却
+/// 永远排不到"的异常情况把线程变成无界忙等（X-35 的红线）。睡醒后重置。
+constexpr long long kWaitSpinTotalBudget = 262144;
 
 // 裸 `FUTEX_WAIT_PRIVATE`：原子地比较 *word == expected 后睡眠，
 // 值已变则立即返回 EAGAIN（"我不该睡"）。
@@ -172,6 +183,18 @@ enum class WaitResult : std::uint8_t {
     kCancelled,
 };
 
+// 自旋等待时的 CPU 提示。x86 用 `_mm_pause`：让流水线知道这是自旋，
+// 减少分支预测失败导致的流水线冲刷，也降低功耗与超线程争用。
+// **刻意不用** `sched_yield()`：后者会把 CPU 让给别的线程，
+// 在几十次迭代的自旋预算里，让出/换回的开销远大于收益。
+inline void RelaxCpu() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
 class WaitNode final {
 public:
     WaitNode(Scheduler* scheduler, std::shared_ptr<Task> task)
@@ -181,7 +204,7 @@ public:
     ~WaitNode() { Disarm(); }
 
     bool Arm() noexcept {
-        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
+        std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
         if (result() != WaitResult::kWaiting) {
             return false;
         }
@@ -192,7 +215,7 @@ public:
     void Disarm() noexcept {
         // 回调可能已经离开 DoneSignal 的注册表。这里等待其 Wake 调用完成，
         // 防止回调生命周期超过 Scheduler 的关闭过程。
-        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
+        std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
         m_active = false;
         m_scheduler = nullptr;
     }
@@ -212,7 +235,7 @@ public:
     }
 
     void Wake() noexcept {
-        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
+        std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
         WakeLocked();
     }
 
@@ -222,7 +245,7 @@ public:
     // 后，把下一次等待的 m_result 错误地改成 Cancelled。generation 用来
     // 区分同一个缓存节点的不同等待代次。
     bool TryCancelAndWake(std::uint64_t generation) noexcept {
-        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
+        std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
         if (generation != m_generation ||
             !TryFinish(WaitResult::kCancelled)) {
             return false;
@@ -238,7 +261,7 @@ public:
     // 读取唤醒代际。每次 Wake 递增；等待者用它判断"我记下的代际是否已过期"
     // （过期说明通知已发生，无需再 park）。读时持锁，与 WakeLocked 的写互斥。
     std::uint64_t generation() noexcept {
-        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
+        std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
         return m_generation;
     }
 
@@ -260,8 +283,13 @@ private:
                 // 普通线程调用者在节点私有条件变量上等待。结果字段就是谓词，
                 // 因此 wait() 之前到达的通知不会丢失。
 #if defined(__linux__)
+                // 代际推进必须无条件执行：它既是等待者的"通知已发生"信号，
+                // 也是 FUTEX_WAIT 的唤醒字。只有确实有人睡在 futex 上时才付
+                // 一次系统调用；正在自旋的等待者会通过代际/结果自行发现。
                 m_futex_seq.fetch_add(1, std::memory_order_release);
-                (void)WakeFutex(&m_futex_seq, 1);
+                if (m_futex_waiters.load(std::memory_order_acquire) != 0U) {
+                    (void)WakeFutex(&m_futex_seq, 1);
+                }
 #else
                 m_native_condition.notify_one();
 #endif
@@ -279,34 +307,76 @@ public:
 
     WaitResult WaitNative() noexcept {
 #if defined(__linux__)
-        // futex 无状态等待：自旋预算 -> FUTEX_WAIT(代际) -> 重判终态。
+        // futex 无状态等待：有界自适应自旋 -> FUTEX_WAIT(代际) -> 重判终态。
+        //
+        // ## 为什么自旋必须覆盖"一次完整交接"
+        //
+        // 这里的自旋不是可有可无的优化，而是**避免整个 Mutex 退化成
+        // "每个操作睡一次"** 的关键：解锁方在这段时间内把所有权直接交给
+        // 队首（TryFinish + Wake），正在自旋的等待者一看到终态就返回，
+        // 完全不需要 FUTEX_WAIT/WAKE 两次系统调用。
+        //
+        // ## 为什么用"无进展"而不是"固定次数"
+        //
+        // 固定预算（历史值 128 ≈ 1.1µs）覆盖不了一次完整交接：4 线程争用
+        // 时每个操作都恰好睡一次，实测 25~30µs/op（`docs/performance.md`
+        // 记录的 250 倍退化）。只把固定值调大又会在真正需要睡眠时白烧 CPU。
+        //
+        // 因此这里统计的是**连续没有观察到交接进展**的次数：只要队首还在
+        // 被唤醒（m_futex_seq 推进），说明持有者仍在推进，继续自旋；
+        // 连续 kWaitSpinBudget 次（约 18µs，PAUSE 实测 8.7ns）没有任何进展，
+        // 才判定"持锁者可能被换出"，转入 FUTEX_WAIT。
+        //
+        // 仍然严格有界：总自旋次数另有 kWaitSpinTotalBudget 上限，
+        // 不会出现 X-35 禁止的无界自旋；睡醒后重新计数。
         std::uint32_t expected = m_futex_seq.load(std::memory_order_acquire);
         for (;;) {
             if (result() != WaitResult::kWaiting) {
                 return result();
             }
-            bool spun_through = false;
-            for (int spin = 0; spin < kWaitSpinBudget; ++spin) {
+            int idle_spins = 0;
+            long long total_spins = 0;
+            while (idle_spins < kWaitSpinBudget &&
+                   total_spins < kWaitSpinTotalBudget) {
                 if (result() != WaitResult::kWaiting) {
                     return result();
                 }
-                if (m_futex_seq.load(std::memory_order_acquire) != expected) {
-                    spun_through = true;
-                    break;
+                const std::uint32_t observed =
+                    m_futex_seq.load(std::memory_order_acquire);
+                if (observed != expected) {
+                    // 有别的等待者被交接：这是进展，重置"无进展"计数。
+                    expected = observed;
+                    idle_spins = 0;
+                } else {
+                    ++idle_spins;
                 }
-                std::atomic_signal_fence(std::memory_order_seq_cst);
+                ++total_spins;
+                RelaxCpu();
             }
             if (result() != WaitResult::kWaiting) {
                 return result();
             }
-            if (spun_through) {
-                expected = m_futex_seq.load(std::memory_order_acquire);
+            // 发布"我将睡在 futex 上"，再复核一次终态。顺序很重要：
+            // 唤醒方先 TryFinish 再读 m_futex_waiters；等待方先自增再读结果。
+            // 二者至少有一方能看到对方，因此不会丢失唤醒。
+            m_futex_waiters.fetch_add(1U, std::memory_order_acq_rel);
+            if (result() != WaitResult::kWaiting) {
+                m_futex_waiters.fetch_sub(1U, std::memory_order_acq_rel);
+                return result();
+            }
+            const std::uint32_t latest =
+                m_futex_seq.load(std::memory_order_acquire);
+            if (latest != expected) {
+                expected = latest;
+                m_futex_waiters.fetch_sub(1U, std::memory_order_acq_rel);
                 continue;
             }
             (void)WaitFutex(&m_futex_seq, expected);
-            const std::uint32_t latest = m_futex_seq.load(std::memory_order_acquire);
-            if (latest != expected) {
-                expected = latest;
+            m_futex_waiters.fetch_sub(1U, std::memory_order_acq_rel);
+            const std::uint32_t after_wake =
+                m_futex_seq.load(std::memory_order_acquire);
+            if (after_wake != expected) {
+                expected = after_wake;
             }
         }
 #else
@@ -332,12 +402,18 @@ public:
     }
 
     void Reset(Scheduler* scheduler, std::shared_ptr<Task> task) noexcept {
-        std::lock_guard<core::HybridMutex> lock(m_wake_mutex);
+        std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
         m_active = false;
         m_scheduler = scheduler;
         m_task = std::move(task);
         m_backend = CreateWaitBackend();
         m_result.store(WaitResult::kWaiting, std::memory_order_release);
+#if defined(__linux__)
+        // 复用的节点必须回到「没有线程睡在 futex 上」的状态；正常路径在
+        // WaitNative 返回前已归零，这里再显式清一次，避免上一代异常退出
+        // 让唤醒方误判仍需 FUTEX_WAKE。
+        m_futex_waiters.store(0U, std::memory_order_relaxed);
+#endif
         ++m_generation;
         if (m_generation == 0U) {
             m_generation = 1U;
@@ -349,11 +425,15 @@ private:
     Scheduler* m_scheduler{nullptr};
     std::shared_ptr<Task> m_task;
     std::atomic<WaitResult> m_result{WaitResult::kWaiting};
-    core::HybridMutex m_wake_mutex;
+    core::FutexMutex m_wake_mutex;
 #if defined(__linux__)
     // 每个等待者自己的 futex 代际字：notify_one 只推进这一个 node，
     // 所以不需要共享代际/等待者计数（比 ParkingCondition 的形态更简单）。
     alignas(64) std::atomic<std::uint32_t> m_futex_seq{0};
+    // 当前真正睡在 m_futex_seq 上的线程数。唤醒方先发布终态、再读本计数：
+    // 计数为 0 说明等待者仍在自旋（会自行看到终态），可以省掉一次
+    // FUTEX_WAKE 系统调用；计数非 0 才必须唤醒。
+    std::atomic<std::uint32_t> m_futex_waiters{0};
 #endif
     std::mutex m_native_mutex;
     std::condition_variable m_native_condition;
@@ -376,18 +456,6 @@ std::shared_ptr<WaitNode> AcquireWaitNode(Scheduler* scheduler,
         return waiter;
     }
     return std::make_shared<WaitNode>(scheduler, std::move(task));
-}
-
-// 自旋等待时的 CPU 提示。x86 用 `_mm_pause`：让流水线知道这是自旋，
-// 减少分支预测失败导致的流水线冲刷，也降低功耗与超线程争用。
-// **刻意不用** `sched_yield()`：后者会把 CPU 让给别的线程，
-// 在本项目只有几十次迭代的自旋预算里，让出/换回的开销远大于收益。
-inline void RelaxCpu() noexcept {
-#if defined(__x86_64__) || defined(__i386__)
-    _mm_pause();
-#else
-    std::this_thread::yield();
-#endif
 }
 
 void ReleaseWaitNode(std::shared_ptr<WaitNode> waiter) noexcept {
@@ -807,16 +875,18 @@ bool Mutex::LockImpl(const ContextPtr& context,
     // futex 唤醒。这里保留较小的有界自旋，并且一旦队列发布立即退出，
     // 因而不会越过 FIFO waiter。
     if (!target) {
-        // 自旋预算分两段：
-        //   1. 没有等待者时给足 256 次（纯竞争，不会越过 FIFO）；
-        //   2. 已有等待者时只给 4 次 —— 这是本函数注释里**已经承诺**的额度
-        //      （"一旦有普通线程 waiter，最多再重试 4 次后回到 FIFO handoff"），
-        //      原实现却在见到 kWaiter 的第一时间就退出，等于把这份额度浪费了。
-        //      实测 3 线程争用时因 kWaiter 常驻，普通线程完全得不到自旋机会，
-        //      每次都直接挂起，使每次加解锁高达 6,097 ns（4 线程 36,014 ns）。
-        // 越过额度后仍严格回到 FIFO：绝不改变"TryLock 不能插队"的对外语义，
-        // 因为 TryLock 走的是另一条路径。
-        constexpr int kNativeSpinAttempts = 256;
+        // 自旋预算分两段（2026-10-18 实测重新标定）：
+        //   1. 没有等待者时给足 2048 次（≈18µs，PAUSE 实测 8.7ns）。这一档
+        //      必须覆盖"N 个线程轮流抢同一把锁"的整个窗口：太小（128/256）
+        //      时 8 线程争用会有人 256 次全失败、转入等待队列并睡一次，
+        //      之后每个操作都要付一次 futex 唤醒延迟 —— 这就是
+        //      docs/performance.md 里 4 线程 25~30µs/op 的来源。
+        //      实测 2048 时 8 线程 median 225ns/op；4096 反而更慢（349ns，
+        //      多出来的空转没有收益），1024 则回退到 321ns。
+        //   2. 已有等待者时只给 4 次 —— 严格回到 FIFO handoff，不越过
+        //      队列里的等待者，保持既有公平性承诺。
+        // 越界后进入 WaitNode 等待；WaitNative 侧还有一层有界自旋。
+        constexpr int kNativeSpinAttempts = 2048;
         constexpr int kNativeSpinWithWaiters = 4;
         for (int attempt = 0; attempt < kNativeSpinAttempts; ++attempt) {
             if ((m_impl->m_state.load(std::memory_order_acquire) &

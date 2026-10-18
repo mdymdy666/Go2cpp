@@ -7,6 +7,7 @@
 #include <fstream>
 #include <sstream>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 /**
@@ -52,7 +53,12 @@ void run_log_config_tests() {
     }
     for (auto& worker : workers) worker.join();
     GO2CPP_CHECK(callback_count.load() == kThreads * kMessages);
-    const auto directory = std::filesystem::temp_directory_path() / "go2cpp-log-test";
+    // 并发执行两份全量 ctest 时，同一个测试二进制会被两个进程同时运行；
+    // 固定文件名会让它们互相 remove_all / 截断，热加载断言随机失败。
+    // 临时路径按 pid 隔离，测试之间不再共享任何可写文件。
+    const std::string process_tag = std::to_string(::getpid());
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("go2cpp-log-test-" + process_tag);
     std::filesystem::remove_all(directory);
     config.log_directory = directory.string(); config.log_file = "runtime.log"; config.log_level = log::Level::Warn;
     GO2CPP_REQUIRE(config.ApplyLogging(&error));
@@ -147,7 +153,8 @@ void run_log_config_tests() {
         log::Level::Info, "custom-logger", "注销后仍可用", {}, {}, 0, 0, 0, 0, {}, 0}) ==
                  "USER(custom-logger):注销后仍可用|USER(custom-logger)");
 
-    const auto rotating_path = std::filesystem::temp_directory_path() / "go2cpp-rotate.log";
+    const auto rotating_path = std::filesystem::temp_directory_path() /
+                               ("go2cpp-rotate-" + process_tag + ".log");
     std::filesystem::remove(rotating_path);
     auto rotating = std::make_shared<log::RotatingFileSink>(
         rotating_path.string(), 32, 2);
@@ -161,7 +168,8 @@ void run_log_config_tests() {
     // ConfigVar 监听器和文件热加载：修改 ini 后已创建 Logger 立即切换级别。
     auto& registry = config::Config::Instance();
     GO2CPP_REQUIRE(config::BindLoggingConfig(registry, &error));
-    const auto watch_path = std::filesystem::temp_directory_path() / "go2cpp-dynamic.ini";
+    const auto watch_path = std::filesystem::temp_directory_path() /
+                            ("go2cpp-dynamic-" + process_tag + ".ini");
     {
         std::ofstream watch_file(watch_path);
         watch_file << "[log]\nlevel=error\nstdout=false\nformat={message}\\n\n";
