@@ -216,6 +216,20 @@ thread_local PId t_processor_id = 0;
 // region is destroyed can still clear the original M's state.
 thread_local MId t_blocking_machine_id = 0;
 
+/// @brief 当前线程是否正处在 worker 的 IO 空闲轮询里。
+/// @details poll 内部会处理就绪事件并把 G 投回本 P；投递者随后立刻 `continue`
+///          回主循环取任务，因此不需要再唤醒别的 worker。只在
+///          `requeue_from_worker`（本 P 投递）里短路，跨 P 投递照常通知。
+thread_local bool t_in_idle_poll = false;
+
+/// @brief 在作用域内置位 `t_in_idle_poll` 的 RAII 守卫。
+struct IdlePollScope final {
+    IdlePollScope() noexcept { t_in_idle_poll = true; }
+    ~IdlePollScope() noexcept { t_in_idle_poll = false; }
+    IdlePollScope(const IdlePollScope&) = delete;
+    IdlePollScope& operator=(const IdlePollScope&) = delete;
+};
+
 // 默认 P 数量 = 硬件并发度。`hardware_concurrency()` 在无法确定时返回 0，
 // 这里兜底为 1 —— 返回 0 会让调度器算出 0 个 P，worker 一个都不启。
 std::size_t default_processor_count() noexcept {
@@ -2462,7 +2476,7 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
                 const auto active = processor.active_machines.load(
                     std::memory_order_relaxed);
                 notify_worker =
-                    allow_notify &&
+                    allow_notify && !t_in_idle_poll &&
                     (running == 0 ||
                      (processor.queue.size() >= 16U && running < active));
             } catch (...) {
@@ -3740,6 +3754,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 if (timeout_ms < 1) {
                     timeout_ms = 1;
                 }
+                const IdlePollScope poll_scope;
                 polled = idle_poller->poll(timeout_ms);
             }
             m_impl->io_waiting_workers.fetch_sub(1, std::memory_order_release);

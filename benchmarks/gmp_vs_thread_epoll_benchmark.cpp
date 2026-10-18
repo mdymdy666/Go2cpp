@@ -1712,7 +1712,11 @@ void usage() {
         "  client --scenario s1|s2|s3|s4|s5 --port N [--host 127.0.0.1]\n"
         "         [--conns 64] [--duration-ms 5000] [--warmup-ms 1000]\n"
         "         [--interval-ms 1000] [--depth 1]\n"
-        "  run [--repeats 5] [--scenarios s1,s2,...] [--models gmp,thread,epoll]\n",
+        "  run [--repeats 5] [--scenarios s1,s2,...] [--models gmp,thread,epoll]\n"
+        "\n"
+        "注意：s1（短连接）的客户端是单线程 epoll，单客户端在 ~8k QPS 就会成为瓶颈\n"
+        "      （实测 GMP 7.6k、thread 10.5k）。测服务端上限请起 2~4 个客户端进程，\n"
+        "      例如各 16 连接：GMP 20.2k、thread 19.5k。其余场景单客户端足够。\n",
         stderr);
 }
 

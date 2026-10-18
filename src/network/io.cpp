@@ -225,6 +225,12 @@ void DescriptorGuard::Invalidate(int fd) noexcept {
     }
 }
 
+/// @brief 当前线程是否正处在 `State::poll_once()` 内部。
+/// @details 只用于 `tickle()` 的短路：poll 的调用者处理完事件就会回主循环
+///          取本 P 队列，不需要再唤醒别的 M。thread_local 而非成员计数，
+///          因为一个线程不可能同时处于两次 poll 内部。
+thread_local bool t_inside_poll = false;
+
 struct IOManager::State : public std::enable_shared_from_this<State> {
     // IOManager 在构造期把 poll_once/tickle 装进 Scheduler；lambda 的访问
     // 权限与所在成员函数相同，因此这里放开给 IOManager。
@@ -856,10 +862,16 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 if (arm_error != 0) {
                     fail_slot_locked(slot, arm_error, wake);
                 }
-                if (slot.readers.empty() && slot.writers.empty() &&
-                    !slot.registered) {
-                    stripe.slots.erase(found);
-                }
+                // 不在这里删除空闲 slot。
+                //
+                // s3（1 万空闲连接）每次请求完成后都会走到这里：删掉 slot
+                // 会让下一次 wait 重新 Capture（一次 F_GETFD = fcntl）并
+                // 重新走 EPOLL_CTL_ADD，实测每请求 6.1 次 fcntl + 10.8 次
+                // epoll_ctl（s2 只有 1.26 / 2.50）。保留 slot 后这两项都
+                // 降为「命中缓存 + MOD」。
+                //
+                // 回收责任由 fd 真正关闭时的 notify_close/lock 排空与
+                // purge_terminal_locked 承担；空闲连接常驻成本约 120B/条。
             }
         }
         wake_nodes(wake);
@@ -1527,6 +1539,13 @@ private:
         if (!m_backend) {
             return;
         }
+        // 本线程正在 poll（处理事件或到期定时器）时不必叫醒别人：它处理完
+        // 这批事件就回到 worker_loop 从本 P 队列取任务，而 wake_io() 一律把
+        // G 投回本 P。s1 每请求因此少掉数次 eventfd 写入 + 对端 epoll_wait
+        // 返回 + drain_wake() 的 read 系统调用。
+        if (t_inside_poll) {
+            return;
+        }
         if (m_waiters.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -1568,12 +1587,14 @@ private:
         constexpr int kEventBatch = 256;
         BackendEvent events[kEventBatch]{};
         m_waiters.fetch_add(1, std::memory_order_release);
+        t_inside_poll = true;
         int count;
         do {
             count = m_backend->wait(events, kEventBatch, effective);
         } while (count < 0 && -count == EINTR);
         m_waiters.fetch_sub(1, std::memory_order_release);
         if (count < 0) {
+            t_inside_poll = false;
             return -1;
         }
         bool saw_wake = false;
@@ -1589,6 +1610,7 @@ private:
             process_events_batch(events, static_cast<std::size_t>(count));
         }
         expire_timers();
+        t_inside_poll = false;
         return count;
     }
 

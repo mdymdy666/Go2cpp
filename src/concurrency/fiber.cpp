@@ -331,11 +331,9 @@ private:
             if (it->size == size && it->mapping != nullptr) {
                 void* mapping = it->mapping;
                 s_thread_stack_pool.entries.erase(std::next(it).base());
-                if (::mprotect(mapping, page, PROT_NONE) != 0) {
-                    ::munmap(mapping, mapping_size);
-                    throw std::system_error(errno, std::generic_category(),
-                                             "mprotect fiber guard page");
-                }
+                // 池里的栈在 allocate() 时已经设好 guard page（PROT_NONE），
+                // release() 只缓存 mapping、从不改动它，所以复用时不需要再
+                // mprotect 一次。实测每次 go() 都白付一次（5000 任务 = 5038 次）。
                 return mapping;
             }
         }
@@ -346,12 +344,6 @@ private:
                 if (it->size == size && it->mapping != nullptr) {
                     void* mapping = it->mapping;
                     s_stack_pool.entries.erase(std::next(it).base());
-                    if (::mprotect(mapping, page, PROT_NONE) != 0) {
-                        ::munmap(mapping, mapping_size);
-                        throw std::system_error(
-                            errno, std::generic_category(),
-                            "mprotect fiber guard page");
-                    }
                     return mapping;
                 }
             }

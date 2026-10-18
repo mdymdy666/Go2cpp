@@ -407,6 +407,7 @@ SocketResult Socket::send_impl(int fd, const msghdr* message, int flags,
                                                  cancel_generation)) return {-1, errno};
     }
 }
+
 SocketResult Socket::recv_impl(int fd, msghdr* message, int flags, Duration timeout,
                                std::uint64_t cancel_generation) {
     const auto start = std::chrono::steady_clock::now();
