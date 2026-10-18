@@ -12,6 +12,34 @@
  *   - `bufio.ErrBufferFull` = "bufio: buffer full"
  *   - `bufio.ErrNegativeCount` = "bufio: negative count"
  *   - `bufio.ErrTooLong` = "bufio.Scanner: token too long"
+ *
+ * ## 模块定位
+ *
+ * `bufio` 唯一的 `.cpp`：头文件里的 `Reader`/`Writer`/`Scanner` 都是模板，
+ * 但哨兵错误的**身份**与三个预置 `SplitFunc` 的函数体必须全进程唯一，因此
+ * 落在这里。任何使用 `bufio` 的程序都必须链接 `go2cpp_bufio`，否则会在
+ * 链接期缺少这些符号。
+ *
+ * ## 本文件定义什么
+ *
+ * - 7 个哨兵错误工厂：`ErrBufferFull` / `ErrTooLong` / `ErrNegativeCount` /
+ *   `ErrInvalidAdvance` / `ErrInvalidUnreadByte` / `ErrInvalidUnreadRune` /
+ *   `ErrFinalToken`；
+ * - 3 个预置 `SplitFunc`：`ScanLines`（按行）、`ScanWords`（按 ASCII 空白）、
+ *   `ScanBytes`（逐字节）；
+ * - 内部工具：`DropCarriageReturn`（去行尾 `\r`）与 `IsAsciiSpace`。
+ *
+ * ## 阅读建议
+ *
+ * 先看上面「为什么不能放头文件」——错误身份与 `std::function` 目标都要求
+ * 唯一定义；再逐个看 `SplitFunc` 如何填 `advance`/`token`，特别是
+ * `advance == 0`（继续攒数据）与 `atEOF`（交付最后一段）两条路径。
+ *
+ * ## 边界与陷阱
+ *
+ * 哨兵错误对象故意泄漏、每个函数**各自**持有静态指针；不要抽成公共 helper，
+ * 否则不同错误会共享同一个 `static`。`ScanWords` 只识别 ASCII 空白，与 Go 的
+ * Unicode `IsSpace` 不同（见 `scanner.hpp` 文件头）。
  */
 #include "go2cpp/bufio/errors.hpp"
 #include "go2cpp/bufio/scanner.hpp"
@@ -80,10 +108,24 @@ ErrorPtr ErrFinalToken() {
     return *kOwned;
 }
 
+/**
+ * @brief 按行切分：消费到 `\n`（含），token 去掉行尾 `\r`。
+ * @details 对应 Go 的 `ScanLines`；EOF 时最后一段没有 `\n` 也照常交付。
+ *
+ * ## 步骤
+ * step1. `atEOF` 且窗口为空：没有更多 token，返回全零；
+ * step2. 窗口内找 `\n`：找到就把 token 定为 `[0, index)`（去 `\r`），
+ *        `advance = index + 1` 消费掉换行符；
+ * step3. 没找到但已 `atEOF`：剩余全部作为最后一个 token（同样去 `\r`），
+ *        `advance = data.size()`；
+ * step4. 否则 `advance = 0`、无 token，告诉 Scanner「继续攒数据」。
+ */
 SplitResult ScanLines(ByteSpan data, bool at_eof) {
+    // step1: 流末尾且没有残留数据
     if (at_eof && data.empty()) {
         return SplitResult{};
     }
+    // step2: 找到换行符，交付本行
     if (!data.empty()) {
         const void* const found = std::memchr(data.data(), '\n', data.size());
         if (found != nullptr) {
@@ -95,21 +137,36 @@ SplitResult ScanLines(ByteSpan data, bool at_eof) {
             return result;
         }
     }
+    // step3: EOF 时最后一段没有换行符，也要交付
     if (at_eof) {
         SplitResult result;
         result.advance = data.size();
         result.token = DropCarriageReturn(data);
         return result;
     }
-    // 没有换行符且未到 EOF：继续攒数据。
+    // step4: 没有换行符且未到 EOF：继续攒数据。
     return SplitResult{};
 }
 
+/**
+ * @brief 按 ASCII 空白切词：跳过前导空白，token 为连续非空白字节。
+ * @details `atEOF` 时最后一段没有尾随空白也照常交付；只消费前导空白时
+ *          返回 `advance > 0` 且无 token，让 Scanner 继续读。
+ *
+ * ## 步骤
+ * step1. 跳过前导 ASCII 空白，记下词首 `start`；
+ * step2. 从 `start` 找下一个空白：找到则 token 为 `[start, index)`，
+ *        `advance = index + 1` 消费掉分隔空白；
+ * step3. 没找到但已 `atEOF` 且还有内容：整段作为最后一个词；
+ * step4. 否则只消费前导空白（`advance = start`），等更多数据。
+ */
 SplitResult ScanWords(ByteSpan data, bool at_eof) {
+    // step1: 跳过前导空白
     std::size_t start = 0;
     while (start < data.size() && IsAsciiSpace(data[start])) {
         ++start;
     }
+    // step2: 找词尾空白
     for (std::size_t index = start; index < data.size(); ++index) {
         if (IsAsciiSpace(data[index])) {
             SplitResult result;
@@ -118,22 +175,33 @@ SplitResult ScanWords(ByteSpan data, bool at_eof) {
             return result;
         }
     }
+    // step3: EOF 时最后一段没有尾随空白，也要交付
     if (at_eof && data.size() > start) {
         SplitResult result;
         result.advance = data.size();
         result.token = data.subspan(start);
         return result;
     }
-    // 只消费前导空白，为下一个词腾出空间。
+    // step4: 只消费前导空白，为下一个词腾出空间。
     SplitResult result;
     result.advance = start;
     return result;
 }
 
+/**
+ * @brief 逐字节切分：每次交付 1 字节。
+ * @details 对应 Go 的 `ScanBytes`，主要用于把 Scanner 当「带缓冲的逐字节读」用。
+ *
+ * ## 步骤
+ * step1. `atEOF` 且窗口为空：扫描结束；
+ * step2. 否则消费 1 字节，token 就是该字节。
+ */
 SplitResult ScanBytes(ByteSpan data, bool at_eof) {
+    // step1: 没有更多字节
     if (at_eof && data.empty()) {
         return SplitResult{};
     }
+    // step2: 每次交付一个字节
     SplitResult result;
     result.advance = 1;
     result.token = data.first(1);

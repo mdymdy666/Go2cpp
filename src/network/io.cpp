@@ -456,20 +456,61 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         std::size_t m_size{0};
     };
 
+    /**
+     * @brief 单个 fd 的等待状态：谁在这个 fd 上等、内核注册到什么程度。
+     *
+     * ## 定位
+     *
+     * `SlotStripe::slots[fd]` 存的就是它。它是 park 的**第二类等待记录**
+     * （第一类是 `sync::Mutex` 的 `m_waiters`）：**fd 就绪的等待者挂在这里，
+     * 由 epoll 事件唤醒**。两类记录不能合并 —— 合并会让「一方漏唤醒、
+     * 另一方永远等」。
+     *
+     * ## 为什么空闲 slot 不立即删除（s3 优化的核心）
+     *
+     * `complete()` 消费完最后一个等待者后曾立即删除 slot。对 s3（1 万空闲连接）
+     * 这等于每次请求都删/建一次：下一次 wait 要重新 `Capture`（一次
+     * `fcntl(F_GETFD)`）并重新 `EPOLL_CTL_ADD`。实测 s3 每请求 **6.13 次 fcntl +
+     * 10.75 次 epoll_ctl**（是 s2 的 2~4 倍）。改为保留后这两项降为「命中缓存 +
+     * MOD」，**s3 QPS 6,270 → 9,823（+56%）、P50 445ms → 3.4ms**。
+     * 真正的关闭仍由 `notify_close` 删除。
+     *
+     * ## 代际
+     *
+     * `generation` 与 `DescriptorToken` 的代际号对应：close/dup2 之后迟到的事件
+     * 因 `slot.generation != node->generation` 被丢弃，避免把旧 fd 的事件交给新连接。
+     *
+     * ## 不变式
+     *
+     * - `readers/writers` 为空且 `registered == false` ⇒ 这个 slot 可以被回收；
+     * - 同一 fd 的等待者按 FIFO 消费（同一事件只唤醒队头，剩余靠下一次就绪）；
+     * - 所有字段都在所属条带的 `mutex` 内读写。
+     */
     struct FdSlot {
+        /// @brief 该槽位对应的 fd（-1 表示空）。
         int fd{-1};
+        /// @brief 代际号；与 `DescriptorToken` 对齐，用于拒绝 close/dup2 后的迟到事件。
         std::uint64_t generation{0};
         // 强引用跨越同一 fd 的多轮等待，避免每次注册重新分配
         // DescriptorToken；slot 删除时自然释放，fd 代际变化时替换。
+        /// @brief 强引用令牌（跨多轮等待复用，避免每轮重新分配）。
         DescriptorTokenPtr descriptor;
+        /// @brief 读等待队列（FIFO）；`register_wait` 入队、`process_event_locked` 出队。
         Queue readers;
+        /// @brief 写等待队列（FIFO）；同上。
         Queue writers;
+        /// @brief 内核里是否已存在该 fd 的 epoll 注册 —— 决定下一次用 ADD 还是 MOD。
         bool registered{false};
         // 一次性后端事件返回后，armed 表示内核是否仍在监听。
+        /// @brief 一次性后端事件返回后，内核是否仍在监听（ONESHOT 下事件后自动 disarm）。
         bool armed{false};
+        /// @brief 当前注册的 interest 位（0 表示「停用注册」但保留 fd 在 epoll 实例中）。
         std::uint32_t interest{0};
+        /// @brief 当前注册的 token（编码 fd + 序号）；用于忽略旧注册的迟到事件。
         std::uint64_t registration_id{0};
+        /// @brief 最近事件报告了可读但当时没有等待者；下一次 wait 直接消费它。
         bool pending_read{false};
+        /// @brief 同上，写方向。
         bool pending_write{false};
     };
 
@@ -1006,6 +1047,21 @@ private:
     // 与后面的定义一致，因此同样放在 private 区。
     struct SlotStripe;
 
+    /**
+     * @brief 把等待节点的终态从「未完成」原子地改成 `(status, system_error)`。
+     *
+     * ## 为什么必须 CAS（不能用普通赋值 + 锁）
+     *
+     * 一个节点可能被**两个源**同时完成：epoll 事件（`process_event_locked`）与
+     * 定时器到期（`expire_timers`）或 Context 取消回调。`outcome == 0` 表示
+     * 「还没有人认领」，CAS 成功者才算真正完成 —— 这同时保证了 IO 完成序
+     * （**就绪优先于超时/取消**）不依赖锁的获取顺序。
+     *
+     * 失败方必须放弃：重复 `wake` 会把同一个 G 放回队列两次，表现为「一个 G
+     * 被两个 worker 同时执行」，比丢唤醒更难查。
+     *
+     * @return true 表示本次调用赢得了节点；false 表示别的源已先完成。
+     */
     static bool claim(WaitNode& node, WaitStatus status,
                       int system_error) noexcept {
         std::uint64_t expected = 0;
@@ -1739,11 +1795,31 @@ private:
     // alignas(64) 让每条带独占 cacheline：不带对齐时 SlotStripe 约 112 字节，
     // 相邻条带的锁与 map 会共用 cacheline，一个条带的正常写就会 invalidate
     // 另一个条带正在持有的锁，实测会把每请求 CPU 抬高 2 倍以上。
+    /**
+     * @brief fd 槽位表的一个条带（按 fd 低 6 位分片，共 64 条）。
+     *
+     * ## 定位
+     *
+     * `m_stripes[fd & 63]`。它与 hook 层的 `DescriptorStripe` 是**同一思路的两处实现**：
+     * 前者保护「fd → 元数据」（hook 用），后者保护「fd → 等待队列」（IOManager 用）。
+     * 两者都要求「同一 fd 永远落同一条带」，从而让同一 fd 的查/改/删天然互斥。
+     *
+     * ## 为什么分条（实测依据）
+     *
+     * 早期实现用一把全局 `m_mutex` 保护所有 fd 的槽位，`process_events_batch` 把
+     * 整批 256 个事件放在同一把锁内处理（**锁内还有 `epoll_ctl`**），12 个 M 实际
+     * 只有一个能推进，实测并行度约 1.7 核。分条后不同 fd 的事件可由不同 M 真并行，
+     * 同一 fd 仍由条带锁串行化，FIFO 与代际不变式不变。
+     */
     struct alignas(64) SlotStripe {
+        /// @brief 保护本条带的 slots 与 next_generation；register_wait/complete/notify_close 竞争它。
         mutable std::mutex mutex;
+        /// @brief fd → 等待状态；没有条目表示该 fd 当前没有等待者（或槽位已被回收）。
         std::unordered_map<int, std::unique_ptr<FdSlot>> slots;
+        /// @brief 本条带的下一个代际号；close/dup2 时递增，用于拒绝迟到事件。
         std::uint64_t next_generation{0};
     };
+    /// @brief 取 fd 所属条带（`fd & 63`）；同一 fd 永远落在同一条带，取模用掩码避免除法。
     SlotStripe& stripe_for(int fd) noexcept {
         return m_stripes[static_cast<std::size_t>(
                              static_cast<unsigned int>(fd)) &

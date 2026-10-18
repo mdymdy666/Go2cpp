@@ -34,6 +34,32 @@
  *   等于丢数据**，这是有意保留的与 Go 相同的坑，测试 `ScenarioLogWrite`
  *   专门验证了「不 flush 就析构 → 数据确实没落地」。
  *
+ * ## 模块定位
+ *
+ * `bufio` 的输出侧，与 `Reader` 对称：上游是「一次只写几个字节」的调用方
+ * （日志行、协议序列化、HTTP 响应头），下游是任意满足
+ * `Write(const char*, size_t)` 契约的 `WriterT`（`streams::Writer` 家族、
+ * `os::File`、socket 适配器）。它把 N 次小写合并成 1 次大写，减少系统调用。
+ *
+ * ## 本文件定义什么
+ *
+ * `Writer<WriterT>`：缓冲、自动 flush、部分写循环、粘性错误、`ReadFrom`。
+ * 没有独立的错误类型，失败一律复用 `streams::IoErrShortWrite()` /
+ * `IoErrNoProgress()` 或底层透传的错误。
+ *
+ * ## 阅读建议
+ *
+ * 1. 先读上面的「析构**不**自动 flush」——这是本类最容易踩的坑；
+ * 2. 再看 `Write` 的大块快路径与 `Flush` 的部分写循环；
+ * 3. 最后看 `ReadFrom` 如何处理「数据 + 错误」与连续空读。
+ *
+ * ## 边界与陷阱
+ *
+ * - 忘记 `Flush()` 等于丢数据，析构不会补救；
+ * - `Write` 返回的字节数只表示「本对象已接受」，不代表已到达底层；
+ * - 底层短写会被循环重试，但返回 0 字节且无错误会被视为违约；
+ * - `Reset()` 会**丢弃**未 flush 的缓冲并清除粘性错误。
+ *
  * @warning `Writer` 只**引用**底层对象，不拥有它。
  */
 #pragma once
@@ -56,6 +82,22 @@ namespace go2cpp::bufio {
 /**
  * @brief 带缓冲的 Writer 装饰器。
  * @tparam WriterT 底层 Writer 类型（需满足上面文件注释里的 `Write` 契约）。
+ *
+ * ## 定位
+ * `bufio` 的输出侧装饰器：调用方写入的记录先落在 `m_buffer`，缓冲满或显式
+ * `Flush()` 时才调用 `WriterT::Write`。`Writer::ReadFrom` 还可把任意
+ * `Read(char*, size_t)` 源直接泵进来，供 `streams::Copy` 一类工具复用。
+ *
+ * ## 生命周期与线程模型
+ * 构造时按引用绑定底层 Writer 并分配固定容量缓冲；不可拷贝/赋值。谁创建谁
+ * 销毁，底层对象必须比它活得久。析构**不** flush（理由见文件头）。所有方法
+ * 假定同一线程串行调用，内部不加锁。
+ *
+ * ## 不变量
+ * - `0 <= m_n <= m_buffer.size()`，待写数据总在 `[0, m_n)`；
+ * - `Buffered() == m_n`、`Available() == Size() - m_n`；
+ * - `m_err` 非空后所有写操作直接失败，不再调用底层（粘性）；
+ * - `m_err` 非空时缓冲里可能仍有未写出的数据，`Reset()` 会丢弃它们。
  */
 template <typename WriterT>
 class Writer {
@@ -88,12 +130,21 @@ public:
      * @return 被本对象**接受**的字节数。成功时等于 `p.size()`；失败时是
      *         出错前已接受的字节数（见 `Err()`）。
      * @note 返回值不代表「已到达底层」——只有 `Flush()` 成功才保证这一点。
+     *
+     * ## 步骤
+     * step1. 已有粘性错误直接返回 0；
+     * step2. 剩余数据放不进缓冲时：缓冲空则把整块直写底层（Go 快路径），
+     *        否则先填满缓冲再 `Flush()`，循环直到放得下或出错；
+     * step3. 每轮只用「实际接受」的 `step` 推进输入；0 字节且无错误按短写报错；
+     * step4. 最后把剩余数据拷入缓冲，返回累计接受字节数。
      */
     std::size_t Write(ByteSpan p) {
+        // step1: 粘性错误后不再接受任何数据
         if (m_err) {
             return 0;
         }
         std::size_t accepted = 0;
+        // step2: 数据放不进缓冲时，先腾空间（直写或填满后 Flush）
         while (p.size() > Available() && !m_err) {
             std::size_t step = 0;
             if (Buffered() == 0) {
@@ -114,12 +165,14 @@ public:
                 m_n += step;
                 Flush();  // 失败时 m_err 已置，循环条件会退出
             }
+            // step3: 只按实际接受的字节数推进，短写/零写都走同一路径
             accepted += step;
             p = p.subspan(step);
         }
         if (m_err) {
             return accepted;
         }
+        // step4: 剩余数据一定放得下，拷入缓冲即完成
         const std::size_t step = std::min(p.size(), Available());
         if (step > 0) {
             std::memcpy(m_buffer.data() + m_n, p.data(), step);
@@ -173,17 +226,26 @@ public:
      *          100 次仍未进展才报，给「暂时不可写」的实现留余地）。
      *          失败时**已写出的部分不回退**，未写出的部分仍留在缓冲里，
      *          错误保持粘性。
+     *
+     * ## 步骤
+     * step1. 已有粘性错误直接返回；
+     * step2. 循环把 `[0, m_n)` 写到底层；成功写 `k` 字节就把剩余数据前移；
+     * step3. 底层返回的计数超过 `m_n` 视为违约，直接报短写（防止下溢）；
+     * step4. 有错误立即粘住；连续 100 次 0 字节无错才报短写。
      */
     Result<void> Flush() {
+        // step1: 出错后不再尝试
         if (m_err) {
             return Result<void>(m_err);
         }
         std::size_t idle_writes = 0;
+        // step2: 循环直到缓冲清空
         while (m_n > 0) {
             const streams::WriteResult result = m_destination->Write(
                 reinterpret_cast<const char*>(m_buffer.data()), m_n);
             // 只接受 [0, m_n] 范围内的计数：超出说明底层违反契约，按短写报错，
             // 否则 m_n 会下溢成天文数字并触发越界读。
+            // step3: 不信任底层计数，超出本次请求即判违约
             if (result.count > m_n) {
                 m_err = streams::IoErrShortWrite();
                 return Result<void>(m_err);
@@ -202,6 +264,7 @@ public:
                 m_err = result.error;
                 return Result<void>(m_err);
             }
+            // step4: 连续无进展达到上限才报错，给「暂时不可写」留余地
             if (result.count == 0 &&
                 idle_writes >= kMaxConsecutiveEmptyReads) {
                 m_err = streams::IoErrShortWrite();
@@ -218,9 +281,17 @@ public:
      * @note 数据先经过本 Writer 的缓冲：调用方仍需 `Flush()` 才能保证落地。
      *       底层 Reader 连续 100 次返回 `(0, nil)` 时返回
      *       `streams::IoErrNoProgress()`，避免挂死。
+     *
+     * ## 步骤
+     * step1. 已有粘性错误直接返回；用栈上 4 KiB 块做中转；
+     * step2. 读一块；`count > chunk` 视为 Reader 违约（否则会越界读栈）；
+     * step3. 有数据先 `Write`（缓冲满会自动 `Flush`）；「数据 + 错误」时
+     *        数据先交付，错误留到下一轮或本次末尾返回；
+     * step4. EOF 视为正常结束；其它错误返回；连续 100 次空读报 NoProgress。
      */
     template <typename SourceT>
     Result<std::size_t> ReadFrom(SourceT& source) {
+        // step1: 粘性错误优先；chunk 放栈上，避免为拷贝分配
         if (m_err) {
             return Result<std::size_t>(m_err);
         }
@@ -230,11 +301,13 @@ public:
         for (;;) {
             const streams::ReadResult result =
                 source.Read(reinterpret_cast<char*>(chunk), sizeof(chunk));
+            // step2: 校验 Reader 契约：n 不能超过本次请求
             if (result.count > sizeof(chunk)) {
                 // io.Reader 契约要求 n <= len(p)。谎报更大的 n 会让我们
                 // 越界读栈缓冲，必须拒绝而不是信任。
                 return Result<std::size_t>(total, streams::IoErrShortWrite());
             }
+            // step3: 有数据先写入本对象；错误按「数据优先」延后
             if (result.count > 0) {
                 empty_reads = 0;
                 total += Write(ByteSpan(chunk, result.count));
@@ -256,6 +329,7 @@ public:
                 }
                 return Result<std::size_t>(total, result.error);
             }
+            // step4: 连续空读达到上限，判定源违约
             if (++empty_reads >= kMaxConsecutiveEmptyReads) {
                 return Result<std::size_t>(total, streams::IoErrNoProgress());
             }
@@ -286,10 +360,10 @@ public:
     const ErrorPtr& Err() const noexcept { return m_err; }
 
 private:
-    WriterT* m_destination;
-    std::vector<std::uint8_t> m_buffer;
-    std::size_t m_n{0};  ///< 缓冲内待写字节数（数据总在 [0, m_n)）
-    ErrorPtr m_err;      ///< 粘性错误
+    WriterT* m_destination;            ///< 底层 Writer（不拥有）；Write()/Flush() 调用其 Write()
+    std::vector<std::uint8_t> m_buffer; ///< 缓冲本体，容量固定=Size()；Write() 写 [m_n, end)，Flush() 写出 [0, m_n)
+    std::size_t m_n{0};  ///< 缓冲内待写字节数（数据总在 [0, m_n)）；Write()/Flush()/Reset() 修改，Buffered() 读取
+    ErrorPtr m_err;      ///< 粘性错误；Write()/Flush()/ReadFrom() 写入，Err() 读取；非空后写操作直接失败
 };
 
 }  // namespace go2cpp::bufio
