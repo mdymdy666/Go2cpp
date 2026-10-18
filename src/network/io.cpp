@@ -1082,27 +1082,48 @@ private:
 
     void drain_queue_locked(Queue& queue, WaitStatus status, int system_error,
                             WakeList& wake) noexcept {
-        while (!queue.empty()) {
-            // 先登记操作，再从队列移除。complete_if_head 可能已经在
-            // 队列外取得该节点的操作令牌并等待 m_mutex；先 pop 会让它
-            // 获取锁后找不到节点，最终把未完成节点永久遗留。
-            NodePtr node = queue.front();
-            const bool started = node && node->begin_operation();
-            if (started && claim(*node, status, system_error)) {
-                queue.pop_front();
-                erase_timer_locked(*node);
-                wake.push_back(std::move(node));
-            } else if (started) {
-                // 只有成功登记活动操作的路径才允许配对结束。
-                if (node->outcome.load(std::memory_order_acquire) != 0) {
-                    queue.pop_front();
-                }
-                node->end_operation();
-            } else {
-                // 另一个完成路径正在处理队头，保持 FIFO，交给它在
-                // 释放操作令牌后完成移除和唤醒。
-                break;
+        // 终止性排空（close / 取消 / 超时 / 错误 / 停止）的契约是
+        // **唤醒该队列中的每一个等待者**，不是只处理到第一个忙节点。
+        //
+        // 旧实现从队头逐个 pop，遇到 begin_operation() 失败的队头就
+        // break。该队头正被另一条完成路径（典型是 Context 取消回调的
+        // complete()，它先在锁外 begin_operation + claim，再取 m_mutex）
+        // 处理，于是队列里其余的等待者被留在原地；而 notify_close()
+        // 紧接着无条件删除 FdSlot，这些节点既没有 epoll 注册、也不在
+        // 任何定时器里（无 deadline 时），最终永久 park。
+        //
+        // 这里的规则与 take_ready_locked() 不同：就绪事件必须保持同一
+        // fd/方向上的 FIFO（不越过队头），而关闭/取消是终止状态，必须
+        // 覆盖整个队列。忙节点保留原位，交给它自己的完成路径唤醒；
+        // 其余节点在本函数内 claim 并移出。
+        for (auto it = queue.begin(); it != queue.end();) {
+            NodePtr node = *it;
+            if (!node) {
+                it = queue.erase(it);
+                continue;
             }
+            const bool started = node->begin_operation();
+            if (!started) {
+                // 另一条完成路径正持有该节点的操作令牌：它会在完成后
+                // 自行唤醒并移除节点。跳过它，继续处理后面的等待者。
+                ++it;
+                continue;
+            }
+            if (claim(*node, status, system_error)) {
+                it = queue.erase(it);
+                erase_timer_locked(*node);
+                // 成功 claim 的节点由 WakeList 的唤醒路径统一
+                // end_operation()，这里不能提前结束操作。
+                wake.push_back(std::move(node));
+                continue;
+            }
+            // 节点已被另一路径抢先 claim：移除但不再重复唤醒。
+            if (node->outcome.load(std::memory_order_acquire) != 0) {
+                it = queue.erase(it);
+            } else {
+                ++it;
+            }
+            node->end_operation();
         }
     }
 

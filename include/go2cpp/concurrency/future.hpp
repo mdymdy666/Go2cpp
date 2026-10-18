@@ -324,6 +324,20 @@ public:
 
     FutureStatus Wait(const ContextPtr& context,
                       std::optional<ContextTimePoint> deadline) const {
+        // 热路径：终态已发布时不需要等待票据，也不需要 Context 回调。
+        // Get 绝大多数发生在 SetValue 之后，这里省掉一次 make_shared
+        // 和一次 weak_from_this。
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_kind != FutureStateKind::kPending) {
+                return StatusLocked(false, context, deadline);
+            }
+            // 无 Context 的零时长/已过期等待（TryGet、GetFor(0)）：
+            // 直接按本地 deadline 返回，不分配等待票据。
+            if (!context && deadline && Context::Now() >= *deadline) {
+                return FutureStatus::kTimedOut;
+            }
+        }
         const auto registration =
             std::make_shared<FutureWaitRegistration>();
         const std::weak_ptr<const FutureState> weak_state =
@@ -544,6 +558,20 @@ public:
 
     FutureStatus Wait(const ContextPtr& context,
                       std::optional<ContextTimePoint> deadline) const {
+        // 热路径：终态已发布时不需要等待票据，也不需要 Context 回调。
+        // Get 绝大多数发生在 SetValue 之后，这里省掉一次 make_shared
+        // 和一次 weak_from_this。
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_kind != FutureStateKind::kPending) {
+                return StatusLocked(false, context, deadline);
+            }
+            // 无 Context 的零时长/已过期等待（TryGet、GetFor(0)）：
+            // 直接按本地 deadline 返回，不分配等待票据。
+            if (!context && deadline && Context::Now() >= *deadline) {
+                return FutureStatus::kTimedOut;
+            }
+        }
         const auto registration =
             std::make_shared<FutureWaitRegistration>();
         const std::weak_ptr<const FutureState> weak_state =

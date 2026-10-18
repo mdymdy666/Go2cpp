@@ -866,7 +866,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     for (auto& receiver : receivers) {
       receiver->cv.notify_one();
     }
-    m_change_cv.notify_all();
+    NotifyChange();
     return {ChannelStatus::kReady, {}};
   }
 
@@ -876,11 +876,19 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     return m_generation.load(std::memory_order_acquire);
   }
 
+  // 等待 m_generation 变化。观察者计数用于让热路径的 send/recv 在
+  // 没有观察者时跳过 ParkingCondition 的互斥量：等待者持 m_mutex 先
+  // 递增计数，再检查 generation；通知者持 m_mutex 先递增 generation，
+  // 解锁后读计数。两者由同一把锁排序，因此不会漏掉已注册的观察者，
+  // 也不会把 generation 变化漏给已经在等待的调用者。
   bool WaitForChange(std::uint64_t generation, Duration timeout) const {
     std::unique_lock<std::mutex> lock(m_mutex);
-    return m_change_cv.wait_for(lock, timeout, [this, generation] {
+    m_change_waiters.fetch_add(1, std::memory_order_acq_rel);
+    const bool changed = m_change_cv.wait_for(lock, timeout, [this, generation] {
       return m_generation.load(std::memory_order_relaxed) != generation;
     });
+    m_change_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    return changed;
   }
 
   // 注册 select 接收 case。持有通道锁时再次检查就绪，避免发送者在探测
@@ -914,7 +922,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         RefillBufferLocked();
         ++m_generation;
         lock.unlock();
-        m_change_cv.notify_all();
+        NotifyChange();
         return true;
       }
     }
@@ -965,7 +973,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           m_senders.pop_front();
           ++m_generation;
           lock.unlock();
-          m_change_cv.notify_all();
+          NotifyChange();
           return true;
         }
       }
@@ -988,7 +996,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         sender->cv.notify_one();
         ++m_generation;
         lock.unlock();
-        m_change_cv.notify_all();
+        NotifyChange();
         return true;
       }
     }
@@ -1001,7 +1009,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       const bool selected = state->TrySelect(index, std::move(probe));
       lock.unlock();
       if (selected) {
-        m_change_cv.notify_all();
+        NotifyChange();
       }
       return selected;
     }
@@ -1012,7 +1020,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     m_receivers.emplace_back(std::move(pending));
     ++m_generation;
     lock.unlock();
-    m_change_cv.notify_all();
+    NotifyChange();
     return true;
   }
 
@@ -1079,7 +1087,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           m_receivers.pop_front();
           ++m_generation;
           lock.unlock();
-          m_change_cv.notify_all();
+          NotifyChange();
           return true;
         }
       }
@@ -1101,7 +1109,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       receiver->cv.notify_one();
       ++m_generation;
       lock.unlock();
-      m_change_cv.notify_all();
+      NotifyChange();
       return true;
     }
 
@@ -1113,7 +1121,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       const bool selected = state->TrySelect(index, std::move(probe));
       lock.unlock();
       if (selected) {
-        m_change_cv.notify_all();
+        NotifyChange();
       }
       return selected;
     }
@@ -1141,7 +1149,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       }
       ++m_generation;
       lock.unlock();
-      m_change_cv.notify_all();
+      NotifyChange();
       return true;
     }
 
@@ -1156,7 +1164,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     m_senders.emplace_back(std::move(pending));
     ++m_generation;
     lock.unlock();
-    m_change_cv.notify_all();
+    NotifyChange();
     return true;
   }
 
@@ -1190,7 +1198,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       }
     }
     if (changed) {
-      m_change_cv.notify_all();
+      NotifyChange();
     }
   }
 
@@ -1264,9 +1272,18 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     return deadline.has_value() && std::chrono::steady_clock::now() >= *deadline;
   }
 
+  // 锁外调用：只在确有 WaitForChange 观察者时才唤醒，避免每次
+  // send/recv 快速路径都为一个空等待队列支付一次互斥量。
+  void NotifyChange() noexcept {
+    if (m_change_waiters.load(std::memory_order_acquire) == 0) {
+      return;
+    }
+    m_change_cv.notify_all();
+  }
+
   void NotifyGeneration() {
     m_generation.fetch_add(1, std::memory_order_release);
-    m_change_cv.notify_all();
+    NotifyChange();
   }
 
   ChannelSendResult SendUntil(T value, std::optional<TimePoint> deadline,
@@ -1317,7 +1334,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           }
           ++m_generation;
           lock.unlock();
-          m_change_cv.notify_all();
+          NotifyChange();
           return {ChannelStatus::kReady, {}};
         } else {
           receiver->cancelled = true;
@@ -1339,7 +1356,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       receiver->cv.notify_one();
       ++m_generation;
       lock.unlock();
-      m_change_cv.notify_all();
+      NotifyChange();
       return {ChannelStatus::kReady, {}};
     }
 
@@ -1351,7 +1368,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       }
       ++m_generation;
       lock.unlock();
-      m_change_cv.notify_all();
+      NotifyChange();
       return {ChannelStatus::kReady, {}};
     }
 
@@ -1407,7 +1424,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         ErasePending(m_senders, pending);
         ++m_generation;
         lock.unlock();
-        m_change_cv.notify_all();
+        NotifyChange();
         return {pending->status, pending->error};
       }
       if (DeadlineReached(deadline)) {
@@ -1417,7 +1434,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         ErasePending(m_senders, pending);
         ++m_generation;
         lock.unlock();
-        m_change_cv.notify_all();
+        NotifyChange();
         return {ChannelStatus::kTimedOut, pending->error};
       }
 
@@ -1455,7 +1472,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       RefillBufferLocked();
       ++m_generation;
       lock.unlock();
-      m_change_cv.notify_all();
+      NotifyChange();
       return {std::optional<T>(std::move(value)), true, true,
               ChannelStatus::kReady, {}};
     }
@@ -1496,7 +1513,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         sender->cv.notify_one();
         ++m_generation;
         lock.unlock();
-        m_change_cv.notify_all();
+        NotifyChange();
         return {std::optional<T>(std::move(value)), true, true,
                 ChannelStatus::kReady, {}};
       } else {
@@ -1509,7 +1526,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         sender->cv.notify_one();
         ++m_generation;
         lock.unlock();
-        m_change_cv.notify_all();
+        NotifyChange();
         return {std::optional<T>(value), true, true,
                 ChannelStatus::kReady, {}};
       }
@@ -1579,7 +1596,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         ErasePending(m_receivers, pending);
         ++m_generation;
         lock.unlock();
-        m_change_cv.notify_all();
+        NotifyChange();
         return {std::nullopt, false, true, pending->status, pending->error};
       }
       if (DeadlineReached(deadline)) {
@@ -1589,7 +1606,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         ErasePending(m_receivers, pending);
         ++m_generation;
         lock.unlock();
-        m_change_cv.notify_all();
+        NotifyChange();
         return {std::nullopt, false, false, ChannelStatus::kTimedOut,
                 pending->error};
       }
@@ -1679,6 +1696,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
   std::size_t m_capacity{0};
   mutable std::mutex m_mutex;
   mutable core::ParkingCondition m_change_cv;
+  mutable std::atomic<std::uint32_t> m_change_waiters{0};
   detail::RingBuffer<T> m_buffer;
   std::deque<std::shared_ptr<PendingSend>> m_senders;
   std::deque<std::shared_ptr<PendingRecv>> m_receivers;
