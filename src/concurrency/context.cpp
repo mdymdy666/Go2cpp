@@ -506,12 +506,28 @@ namespace go2cpp
 
         ~State();
 
+        /**
+         * @brief 一个等待被执行的取消动作（`Cancel` 级联时的「待办项」）。
+         *
+         * ## 为什么把取消做成工作项而不是边遍历边递归
+         *
+         * 取消会沿 `children` 级联：如果边遍历边递归，调用栈深度等于取消树深度
+         * （深链会爆栈），而且持锁遍历容易与子节点自己的取消竞争。做法是把待取消
+         * 的节点收集成队列，**在锁外**逐个处理。
+         *
+         * ## 字段
+         */
         struct CancellationWork
         {
+            /// @brief 待取消的状态（强引用，保证处理时它仍活着）。
             std::shared_ptr<State> state;
+            /// @brief 要写入 `state->error` 的错误（幂等：已有 error 则跳过）。
             ErrorPtr error;
+            /// @brief 要写入 `state->cause` 的原因（仅 `WithCancelCause` 使用）。
             ErrorPtr cause;
+            /// @brief 本次取消是否由 deadline 触发（决定错误类型为 DeadlineExceeded）。
             bool deadline_error{false};
+            /// @brief 处理完是否从父节点 `children` 中移除（减少后续遍历开销）。
             bool remove_from_parent{false};
         };
 
@@ -782,6 +798,22 @@ namespace go2cpp
             }
         }
 
+        /**
+         * @brief `Context::State` 的自定义删除器：析构时排空「延迟释放队列」。
+         *
+         * ## 为什么需要它
+         *
+         * `State::~State()` 会取消所有子节点，而取消回调可能又析构别的 `State` ——
+         * 直接递归 `delete` 会让调用栈深度等于取消树深度（深链爆栈），也可能在
+         * 某个回调里重入释放逻辑。
+         *
+         * ## 做法
+         *
+         * 删除器把「刚删掉的 State 带出的派生释放」（`next.reset()`）推迟到
+         * 一个 **thread_local 队列**，并在第一次进入时循环排空；
+         * `t_draining_state_releases` 防重入 —— 排空过程中又触发的删除只入队，
+         * 不再嵌套排空。
+         */
         struct StateDeleter
         {
             void operator()(Context::State *state) const noexcept

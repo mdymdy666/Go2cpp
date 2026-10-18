@@ -118,6 +118,32 @@ struct CachedStack {
 #endif
 };
 
+/**
+ * @brief 受保护栈的缓存（TLS 一份 + 进程级一份兜底）。
+ *
+ * ## 定位
+ *
+ * `FiberStack` 的工厂与回收站。每次 `go()` 都要 mmap 一段带 guard page 的栈
+ * （`mprotect` 的成本远高于一次上下文切换 —— 实测去掉两次冗余调用后
+ * `go()` 17.6µs → 14.5µs），所以 Fiber 结束后把映射放回缓存，下一次直接复用。
+ *
+ * ## 两层缓存
+ *
+ * | 缓存 | 位置 | 无锁？ | 用途 |
+ * |---|---|---|---|
+ * | `s_thread_stack_pool` | thread_local | 是 | 同 M 上的 Fiber 复用（绝大多数） |
+ * | `s_stack_pool` | 全局 + `s_stack_pool_mutex` | 否 | 跨 M 销毁时的兜底，有界 |
+ *
+ * ## 为什么必须等 fcontext 失效
+ *
+ * 栈在 Fiber **仍可恢复时绝不能复用** —— 会把旧栈帧的数据暴露给新 Fiber。
+ * 只有「Fiber 已完成、`reset_for_scheduler` 已清空 m_context/m_stack」的栈
+ * 才进缓存。
+ *
+ * ## 析构
+ *
+ * 把缓存里所有映射 `munmap`（或交还 boost 的 allocator），不泄漏。
+ */
 struct StackCache {
     ~StackCache() noexcept {
         for (auto& entry : entries) {
@@ -275,6 +301,31 @@ std::size_t normalize_stack_size(std::size_t requested) {
 #endif
 }
 
+/**
+ * @brief 一个 Fiber 的独立栈：映射 + guard page + 可选 Valgrind 注册。
+ *
+ * ## 定位
+ *
+ * 每个 `Fiber::Impl` 持有一个。固定大小（`kDefaultFiberStackSize`，默认 128KiB，
+ * 经 `normalize_stack_size` 页对齐与上下界夹紧后使用）。
+ *
+ * ## 为什么是固定独立栈而不是共享栈
+ *
+ * 共享栈（coost 风格）每次切换要拷栈，独立栈不用；代价是内存。本项目选
+ * 「独立栈 + 池化」，把建栈成本摊掉（见文件头的「与 coost 的取舍差异」）。
+ * 这也是 s2/s4 这些短连接场景能跑满的前提。
+ *
+ * ## guard page
+ *
+ * `checked_mapping_size` 在映射里额外的保护页（`mprotect(PROT_NONE)`），
+ * 栈溢出会立刻 SIGSEGV 而不是静默破坏相邻映射 —— 这类 bug 没有 guard page
+ * 时表现为「毫不相关的对象被写坏」，排查成本极高。
+ *
+ * ## 生命周期
+ *
+ * 构造时映射；析构时**交给 `StackCache`** 而不是直接 `munmap`（除非缓存满）。
+ * Valgrind 构建会注册/注销栈边界，普通构建被客户端宏消除、不影响热路径。
+ */
 struct FiberStack {
 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
     explicit FiberStack(std::size_t size)

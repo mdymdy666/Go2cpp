@@ -339,6 +339,18 @@ double Tanh(double x) noexcept;
 // ============================================================================
 
 /// `math.Modf` 的返回值：`integral + fractional == f`（有限值时）。
+/**
+ * ## 定位
+ *
+ * `Modf` 的双返回值载体，供 `tests/math/test_math.cpp` 逐分支校验；Go 侧对应
+ * `func Modf(f float64) (int float64, frac float64)`。
+ *
+ * ## 不变量
+ *
+ * - 有限输入下 `integral + fractional == f` 严格成立，两部分符号都与 `f` 相同。
+ * - `f` 为 `±Inf` 时 `fractional` 是 NaN（Go 文档要求），此时上面的等式不成立。
+ * - `f` 为 NaN 时两部分都是 NaN。
+ */
 struct ModfResult final {
     /// 整数部分，符号与 `f` 相同（`f = -0` 时为 `-0`）。
     double integral;
