@@ -36,6 +36,32 @@
  *
  * @note `New(n)` 与默认构造都要求 `T` 可默认构造（Go 的零值语义）；若 `T` 不可默认
  *       构造，请先用 `Ring<T>(value)` 创建单个节点再 `Link`。
+ *
+ * ## 模块定位
+ *
+ * 属于「Go 标准库容器语义」适配层，是三个容器里唯一**手工管理节点生命周期**的一个：
+ * 上游是 Go `container/ring` 的指针语义，下游（当前仓库内）是 `tests/container/test_ring.cpp`
+ * （逐项移植 Go 官方测试）、`test_random.cpp`、`test_stress.cpp` 与 `test_scenarios.cpp`
+ * 的轮转分配场景。不依赖运行时，可作为纯数据结构单独使用。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Ring<T>`：环形链表节点兼容器句柄。环没有头/尾，任意节点指针都代表整个环；
+ * - `Ring::New` / `Ring::DeleteRing`：整环的创建与释放（C++ 侧必须显式提供）；
+ * - `Next` / `Prev` / `Move` / `Link` / `Unlink` / `Len` / `Do`：与 Go 一一对应的操作。
+ *
+ * ## 阅读建议
+ *
+ * 先读文件头「关键语义」里 `Link` 的三种分支（尤其**同环自链接切出子环**），这是唯一
+ * 反直觉的地方；再看 `Unlink` 如何用 `Link(Move(n + 1))` 一行表达；最后看析构函数与
+ * `DeleteRing`，理解 C++ 侧为什么要额外约定释放方式。
+ *
+ * ## 边界与陷阱
+ *
+ * - 环是循环引用，`shared_ptr` 永远回收不了，所以本类只能用裸指针；**释放整环必须调
+ *   `DeleteRing`**，逐个 `delete` 只会把节点依次摘掉。
+ * - `Link` / `Unlink` 只搬指针，不分配、不释放；跨环拼接后，原来的指针不再代表原来的环。
+ * - `Do(f)` 期间若 `f` 修改环结构，行为未定义（与 Go 文档一致），因为遍历依赖 `m_next`。
  */
 #pragma once
 
@@ -51,6 +77,18 @@ namespace go2cpp::container {
  *
  * @details `Value` 是公开字段（Go `r.Value`）；`next`/`prev` 私有，只能通过
  *          `Next`/`Prev`/`Move`/`Link`/`Unlink` 操作。
+ *
+ * ## 定位
+ *
+ * 节点与容器合一：调用方拿到的每个 `Ring*` 既是元素句柄，也是「整个环」的唯一入口。
+ * 供 `tests/container/*` 与未来的轮转调度/工作窃取游标使用，不依赖运行时。
+ *
+ * ## 不变量
+ *
+ * - `m_next` / `m_prev` 恒非空，且互为逆：`m_next->m_prev == this` 且
+ *   `m_prev->m_next == this`（单元素环时两者都等于 `this`）。
+ * - 环中不存在头/尾标记，`Len()` 从 `this` 起绕一圈计数，结果与起点无关。
+ * - 除析构函数与 `DeleteRing` 外，任何操作都不改变节点数量。
  */
 template <typename T>
 class Ring {

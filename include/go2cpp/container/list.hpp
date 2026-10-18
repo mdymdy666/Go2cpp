@@ -35,6 +35,33 @@
  *
  * @note 复杂度：`PushFront/PushBack/InsertBefore/InsertAfter/Remove/Move*` 均为 O(1)；
  *       `InsertValue(index, ...)` 为 O(index)；`Len` 为 O(1)；`Clear` 为 O(n)。
+ *
+ * ## 模块定位
+ *
+ * 属于「Go 标准库容器语义」适配层：上游是 Go `container/list` 的 API 形状，下游
+ * （当前仓库内）是 `tests/container/test_list.cpp`、`test_random.cpp`、`test_stress.cpp`
+ * 与 `test_scenarios.cpp`（其中 `container::List<LruEntry>` 就是 LRU 场景）。
+ * 本模块不依赖运行时，可作为纯数据结构单独使用。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Element<T>`：链表节点，公开 `Value`（对应 Go `Element.Value`），私有 `m_list`/`m_it`
+ *   记录「属于哪个链表、自己在哪」；
+ * - `List<T>`：双向链表门面，Push/Insert/Remove/Move 全部映射到 `std::list` 的 O(1) 操作。
+ *
+ * ## 阅读建议
+ *
+ * 先看 `Element::Next/Prev` 的 nil 语义（空链表、头尾节点的边界都在这里）；
+ * 再看 `List::Adopt` 与 `Belongs` —— `Element*` 的稳定性全部依赖这两处维护的元数据；
+ * 最后看 `Remove` 的「跨链表元素」分支，那是与 Go 唯一有实质差异的地方。
+ *
+ * ## 边界与陷阱
+ *
+ * - `Remove(e)` 之后 **`e` 自身立即失效**（节点已 `erase`），只有其它 `Element*` 保持有效。
+ *   Go 有 GC 所以能继续读 `e.Value`；C++ 侧照抄会在 ASan 下直接报 use-after-free。
+ * - `List` 不可复制/移动：节点由链表独占持有，复制语义需要额外约定。
+ * - `InsertBefore` / `InsertAfter` 对 `nullptr` 或外部元素返回 `nullptr` 且不改链表，
+ *   不抛异常；`Remove(nullptr)` 才抛 `std::invalid_argument`（对应 Go 的 panic）。
  */
 #pragma once
 
@@ -56,6 +83,19 @@ class List;
  *
  * @details `Value` 是公开字段（与 Go 的 `e.Value` 对应）；节点元数据私有，只有
  *          `List<T>` 能修改。节点地址由 `std::list` 保证在插入/删除其他元素时不变。
+ *
+ * ## 定位
+ *
+ * 供 `List<T>` 实现全部结构性操作，并作为调用方持有的**稳定句柄**：LRU 缓存就是
+ * `unordered_map<Key, Element*>` + `List`，淘汰时只动链表、不改映射里的指针。
+ *
+ * ## 不变量
+ *
+ * - `m_list == nullptr` 表示「游离节点」（默认构造、尚未 `Adopt`）；此时 `Next()` 返回
+ *   `nullptr`，`Prev()` 也返回 `nullptr`。
+ * - 一旦 `m_list != nullptr`，则 `m_it` 必然指向 `m_list` 中本对象自身；两者由
+ *   `List::Adopt` 一次性写入，之后不再单独改动。
+ * - `m_list` 指向的 `std::list` 必须比本节点活得久：节点由该链表 `erase/clear` 销毁。
  */
 template <typename T>
 struct Element {
@@ -96,8 +136,8 @@ struct Element {
     using list_type = std::list<Element<T>>;
     using iterator = typename list_type::iterator;
 
-    list_type* m_list = nullptr;
-    iterator m_it{};
+    list_type* m_list = nullptr;  ///< 所属链表；`Adopt` 写入，`Belongs` 只读，nullptr 表示游离
+    iterator m_it{};              ///< 指向本节点的迭代器；由 `Adopt` 写入，`Next/Prev/Insert*/Move*` 据此做 ++/--
 };
 
 /**
@@ -114,6 +154,19 @@ struct Element {
  * l.MoveToBack(e);       // 0, 1
  * int v = l.Remove(e);   // 0，e 本身失效；其它 Element* 不受影响
  * @endcode
+ *
+ * ## 定位
+ *
+ * 双向链表的门面，向 `tests/container/*` 与未来的缓存/工作队列提供 Go 形态的 API；
+ * 不提供迭代器，遍历必须走 `Front()` + `Element::Next()`（与 Go 写法一致）。
+ *
+ * ## 不变量
+ *
+ * - `m_data` 中每个节点的 `m_list == &m_data`、`m_it` 指向自身；只有 `Adopt` 会写入，
+ *   因此不存在「节点属于 A 链表但元数据说 B」的状态。
+ * - `Len() == m_data.size()`，两者不会分离（没有延迟删除）。
+ * - `Front()` / `Back()` 在空链表上返回 `nullptr`，绝不返回悬垂指针。
+ * - 拷贝/移动构造与赋值全部 `= delete`：节点所有权唯一。
  */
 template <typename T>
 class List {

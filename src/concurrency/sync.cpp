@@ -223,6 +223,33 @@ inline void RelaxCpu() noexcept {
 #endif
 }
 
+/**
+ * @brief `sync` 层的等待节点：一次阻塞（等锁 / 等通知 / 等 WaitGroup 归零）对应一个。
+ *
+ * ## 定位
+ *
+ * 由 `Mutex::LockImpl`、`ConditionVariable::Wait`、`WaitGroup::Wait` 创建，挂到各自的
+ * `m_waiters` 队列（存 `shared_ptr`，理由见 `Mutex::Impl` 的说明）。
+ *
+ * ⚠️ 它与 `io::IOManager::State::WaitNode` 是**两套不同的节点**：
+ *
+ * | | 本节点 | `io::IOManager::State::WaitNode` |
+ * |---|---|---|
+ * | 等什么 | 锁 / 通知 / 计数归零 | fd 就绪 |
+ * | 谁唤醒 | `Unlock` / `Notify` / `Done` | epoll 事件 / 定时器 / close |
+ * | 队列 | `Mutex::Impl::m_waiters` 等 | `FdSlot::readers/writers` |
+ *
+ * ## 生命周期
+ *
+ * `kWaiting` → `Arm()`（标记活跃）→ 被 `TryFinish(...)` 认领（CAS，只有第一个源成功）
+ * → 析构 `Disarm()`。
+ *
+ * ## 为什么 Arm/Disarm 要加锁
+ *
+ * `DoneSignal` 的回调可能已经离开注册表、但它的 `Wake()` 仍在执行。`Disarm` 持
+ * `m_wake_mutex` 等它完成，再把 `m_scheduler` 置空 —— 防止回调生命周期超过
+ * Scheduler 的关闭过程（**UAF**）。这与 `io` 层那个节点的 disarm 门是同一手法。
+ */
 class WaitNode final {
 public:
     WaitNode(Scheduler* scheduler, std::shared_ptr<Task> task)
@@ -496,9 +523,21 @@ void ReleaseWaitNode(std::shared_ptr<WaitNode> waiter) noexcept {
     }
 }
 
+/**
+ * @brief 一次等待的「执行者」三元组：调度器 + Task + 是否是手动 Fiber。
+ *
+ * ## 为什么需要 `unsupported_manual_fiber`
+ *
+ * 用手动 `Fiber`（`Fiber::resume()`，未归属 Scheduler）的代码也会走到阻塞原语，
+ * 但那时**没有 M 可以 park**。必须返回「不支持」而不是硬等或崩溃 —— 这个标志让
+ * `wait_*` 能区分「普通线程」（可以走原生条件变量）与「手动 Fiber」（只能报错）。
+ */
 struct WaitTarget {
+    /// @brief 当前调度器；nullptr 表示不在受管上下文。
     Scheduler* scheduler{nullptr};
+    /// @brief 当前 G；nullptr 表示普通线程或手动 Fiber。
     std::shared_ptr<Task> task;
+    /// @brief 是否在「手动 Fiber 且无调度器」上下文（此时不能 park）。
     bool unsupported_manual_fiber{false};
 
     explicit operator bool() const noexcept {
@@ -514,6 +553,26 @@ WaitTarget CurrentTarget() noexcept {
     return {scheduler, std::move(task), manual_fiber};
 }
 
+/**
+ * @brief 把等待节点注册到 Context 的取消信号上，析构时自动注销（RAII）。
+ *
+ * ## 定位
+ *
+ * `Mutex::LockImpl`、`ConditionVariable::Wait`、`WaitGroup::Wait` 在 park 前构造它：
+ * Context 被取消时，回调会 `TryCancelAndWake` 认领等待节点，让等待方从 park 返回
+ * 并看到 `kCancelled`。没有它，取消一个正在等锁的 G 只能等锁自己释放。
+ *
+ * ## 为什么回调捕获 `weak_ptr` + `generation`
+ *
+ * - `weak_ptr`：等待节点可能已被回收并复用到下一次等待，强引用会延长它的生命周期；
+ * - `generation`：节点被复用时 `m_generation` 会 +1，回调据此拒绝「上一轮」的取消 ——
+ *   否则一个迟到的取消会把下一次等待误杀。
+ *
+ * ## RAII
+ *
+ * 析构调 `Reset()` 注销回调。不注销虽然靠 `weak_ptr` + generation 也不会出错，
+ * 但会让 Context 一直持有回调（浪费内存），且每次取消都要多跑一次空回调。
+ */
 class ContextSubscription final {
 public:
     ContextSubscription(const ContextPtr& context,
@@ -550,6 +609,21 @@ private:
     DoneSignal::CallbackId m_id{0};
 };
 
+/**
+ * @brief RAII 取消守卫：析构时调用 `CancelFunc`（句柄为空则什么都不做）。
+ *
+ * ## 定位
+ *
+ * `ConditionVariable::WaitFor`、`WaitGroup::WaitFor`、`Timer` 的超时路径用它：
+ * 先 `TimeoutContext(...)` 拿到一个带取消的 Context，再用本守卫保证**函数任何
+ * 退出路径**（正常返回、抛异常、提前 `return`）都会取消那个临时 Context ——
+ * 否则它会一直活着、其定时器不释放，且 `Context` 的取消树多一个孤儿节点。
+ *
+ * ## 为什么 `CancelFunc` 可以为空
+ *
+ * `TimeoutContext` 在「没有超时」的分支返回空 cancel，此时守卫退化为无操作；
+ * 调用方因此不需要在每条路径上写 `if (cancel) cancel();`。
+ */
 class CancelGuard final {
 public:
     explicit CancelGuard(CancelFunc cancel) : m_cancel(std::move(cancel)) {}

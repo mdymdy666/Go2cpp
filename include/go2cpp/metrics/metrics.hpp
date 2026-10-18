@@ -40,6 +40,27 @@
  *   **直方图分位数**：桶是固定上界（`le`），另有一个隐式 `+Inf` 桶。分位数
  *   采用 Prometheus 的桶内线性插值；当目标落在 `+Inf` 桶时返回最后一个有限
  *   上界（Prometheus 的经典语义）。桶越细，误差越小；误差上界是一个桶宽。
+ *
+ * ## 模块定位
+ * 轻量指标层：Counter / Gauge / Histogram 与 Prometheus 文本导出。不引入 Prometheus
+ * 客户端依赖，只依赖 C++17；被服务端、压测与示例用来暴露运行指标。
+ *
+ * ## 本文件定义什么
+ * - `MetricType` / `MetricTypeName`：三种指标类型与文本名；
+ * - `detail::MetricInfo`：指标族共享元数据；
+ * - `Metric`（公共基类）与 `Counter` / `Gauge` / `Histogram`；
+ * - `Registry`：按名字注册、`Render()` 输出 Prometheus 文本、`Default()` 进程级单例。
+ *
+ * ## 阅读建议
+ * 先看 `Metric` 的标签族语义（根对象只用于 `With()`），再看 `Counter`/`Gauge` 的
+ * 原子写法，最后看 `Histogram` 的「为什么分桶」与 `Quantile()` 的插值公式。
+ *
+ * ## 边界与陷阱
+ * - 带标签的**根对象**不能直接 `Inc()`/`Set()`/`Observe()`，会抛 `std::logic_error`；
+ *   必须先 `With({...})` 拿到子序列；
+ * - `Observe(NaN)` 被忽略（不污染 Sum/分位数）；`Gauge` 允许 NaN；
+ * - 文本导出只做最小转义（`\\`、`\"`、`\n`），标签值里的其它控制字符按原样输出；
+ * - 注册按名字唯一：同名但类型/help/标签/bucket 不同会抛 `std::invalid_argument`。
  */
 #pragma once
 
@@ -103,6 +124,14 @@ class Registry;
  * `Metric` 不提供 `With()`：三种指标的子指标类型不同（`Counter&` /
  * `Gauge&` / `Histogram&`），C++ 无法用同一个返回类型表达。请使用
  * `Registry::GetCounter` / `GetGauge` / `GetHistogram` 取得具体类型。
+ *
+ * ## 定位
+ * 被 `Registry` 统一持有（`map<string, unique_ptr<Metric>>`），向上暴露名字/help/
+ * 类型/标签名；三种具体指标在它之上提供各自的修改接口。
+ *
+ * ## 不变量
+ * - `m_info` 指向所属 Family 的元数据，生命周期与 Family 一致；
+ * - `Metric` 不提供 `With()`：三种子指标类型不同，C++ 无法用统一返回类型表达。
  */
 class Metric {
 public:
@@ -143,6 +172,7 @@ protected:
      */
     virtual void AppendPrometheus(std::string& out) const = 0;
 
+    /// 指向 Family 的元数据；Name/Help/Type/LabelNames 都读它。
     const detail::MetricInfo* m_info;
 
 private:
@@ -154,6 +184,14 @@ private:
  *
  * 所有修改走 `fetch_add(..., memory_order_relaxed)`：计数场景不需要与其他
  * 内存操作建立 happens-before 关系，relaxed 已足以保证“不丢更新”。
+ *
+ * ## 定位
+ * 被业务代码 `Inc()`/`Add()` 累加，被 `Registry::Render()` 导出为 `name value`；
+ * 带标签时通过 `With()` 取子计数器。
+ *
+ * ## 不变量
+ * - `m_value` 只做 `fetch_add(relaxed)`：计数不需要 happens-before，只要不丢更新；
+ * - 根对象的 `m_is_root == true`；子对象共享 `m_family` 且持有标签值。
  */
 class Counter final : public Metric {
 public:
@@ -198,10 +236,15 @@ private:
     void AppendPrometheus(std::string& out) const override;
     void EnsureSeries(const char* operation) const;
 
+    /// 根对象拥有的 Family（元数据 + 子序列表）；Counter 析构时释放。
     std::unique_ptr<Family> m_owned_family;
+    /// 指向所属 Family；根对象指向自己的 m_owned_family，子序列指向父对象。
     Family* m_family{nullptr};
+    /// 本序列的标签值（顺序与 label_names 一致）；根对象为空。
     std::vector<std::string> m_label_values;
+    /// 是否为根对象；根对象带标签时禁止直接修改（EnsureSeries 检查）。
     bool m_is_root{false};
+    /// 计数值；Inc/Add 只做 fetch_add(relaxed)，Value 读。
     std::atomic<std::uint64_t> m_value{0};
 };
 
@@ -211,6 +254,13 @@ private:
  * 值以 IEEE-754 位模式保存在 `std::atomic<uint64_t>` 中，通过 CAS 循环做
  * 浮点加法。这样在 C++17 下也能实现无锁 `Inc`/`Dec`，且 `Set(NaN)` 之后
  * 的加法不会因为 NaN != NaN 而卡死。
+ *
+ * ## 定位
+ * 被业务代码 `Set()`/`Inc()`/`Dec()`/`Add()`；用于瞬时值（连接数、队列长度）。
+ *
+ * ## 不变量
+ * - 浮点值以 IEEE-754 位模式存 `atomic<uint64_t>`，`Add()` 用 CAS 循环；
+ * - `Set(NaN)` 后 `Inc()`/`Dec()` 仍能安全返回（不会因 NaN != NaN 卡死循环）。
  */
 class Gauge final : public Metric {
 public:
@@ -251,10 +301,15 @@ private:
     void AppendPrometheus(std::string& out) const override;
     void EnsureSeries(const char* operation) const;
 
+    /// 根对象拥有的 Family（元数据 + 子序列表）；Gauge 析构时释放。
     std::unique_ptr<Family> m_owned_family;
+    /// 指向所属 Family；根对象指向自己的 m_owned_family，子序列指向父对象。
     Family* m_family{nullptr};
+    /// 本序列的标签值（顺序与 label_names 一致）；根对象为空。
     std::vector<std::string> m_label_values;
+    /// 是否为根对象；根对象带标签时禁止直接修改（EnsureSeries 检查）。
     bool m_is_root{false};
+    /// 当前值的 IEEE-754 位模式；Set/Add 用 CAS 循环写，Value 读。
     std::atomic<std::uint64_t> m_bits{0};
 };
 
@@ -264,6 +319,22 @@ private:
  * 桶边界是升序的有限上界，语义为 `le`（小于等于）。所有序列都隐含一个
  * `+Inf` 桶，因此桶数 = `Buckets().size() + 1`。`Observe(NaN)` 被忽略；
  * 负值、+Inf、-Inf 按边界落桶，`Sum()` 如实累计。
+ *
+ * ## 定位
+ * 被业务代码 `Observe()` 记录延迟/大小分布；`Registry::Render()` 展开为
+ * `_bucket`（累计）/`_sum`/`_count` 三组序列。
+ *
+ * ## 为什么不存原始样本、而是固定分桶
+ * - **并发成本恒定**：一次 `Observe` 只做「二分找桶 + 桶计数 fetch_add + Sum CAS +
+ *   Count fetch_add」，不需要锁、不需要维护有序样本；
+ * - **内存有界**：占用 O(buckets)，与请求量无关；存原始样本会随流量无界增长；
+ * - **与 Prometheus 文本格式同构**：`le` 桶就是导出格式本身，`Render()` 不需要再聚合；
+ * - 代价是分位数只是**估算**（桶内线性插值，误差上界约一个桶宽）—— 对监控足够。
+ *
+ * ## 不变量
+ * - `m_bucket_count == Buckets().size() + 1`（末尾是隐式 `+Inf` 桶）；
+ * - `Count()` 等于所有桶计数之和（NaN 不计入）；
+ * - 桶边界构造后不可变，`CumulativeBucketCounts()` 单调不减。
  */
 class Histogram final : public Metric {
 public:
@@ -340,13 +411,21 @@ private:
     void AppendPrometheus(std::string& out) const override;
     void EnsureSeries(const char* operation) const;
 
+    /// 根对象拥有的 Family（元数据 + 子序列表）；Histogram 析构时释放。
     std::unique_ptr<Family> m_owned_family;
+    /// 指向所属 Family；根对象指向自己的 m_owned_family，子序列指向父对象。
     Family* m_family{nullptr};
+    /// 本序列的标签值（顺序与 label_names 一致）；根对象为空。
     std::vector<std::string> m_label_values;
+    /// 是否为根对象；根对象带标签时禁止直接修改（EnsureSeries 检查）。
     bool m_is_root{false};
+    /// 样本数（NaN 不计）；Observe 递增，Count/Quantile 读。
     std::atomic<std::uint64_t> m_count{0};
+    /// 样本和的位模式；Observe 用 AddDouble(CAS) 累加，Sum 读。
     std::atomic<std::uint64_t> m_sum_bits{0};
+    /// 各桶计数（含 +Inf 桶）；InitBuckets 分配，Observe 递增。
     std::unique_ptr<std::atomic<std::uint64_t>[]> m_bucket_counts;
+    /// 桶数量 = 有限边界数 + 1（隐式 +Inf）；InitBuckets 设置。
     std::size_t m_bucket_count{0};
 };
 
@@ -359,6 +438,15 @@ private:
  *
  * 测试或需要隔离的场景可以构造独立 `Registry`；进程级监控使用
  * `Registry::Default()`。
+ *
+ * ## 定位
+ * 进程级指标注册表：`Default()` 给业务用，测试可构造独立实例做隔离；
+ * `Render()` 是 HTTP 指标端点的唯一数据来源。
+ *
+ * ## 不变量
+ * - 注册与名字查重都在 `m_mutex` 内；返回的指标引用在注册表生命周期内稳定；
+ * - 同名重复注册时，类型/help/标签名/bucket 任一不同即抛 `invalid_argument`，
+ *   避免两个调用方静默写进同一条序列。
  */
 class Registry final {
 public:
@@ -408,7 +496,9 @@ private:
                          MetricType type, std::vector<std::string> label_names,
                          std::vector<double> buckets);
 
+    /// 保护 m_metrics；Register/Render/Size 都在它内部操作。
     mutable std::mutex m_mutex;
+    /// 按名字保存指标族；注册后指针稳定，返回的引用随注册表存活。
     std::map<std::string, std::unique_ptr<Metric>> m_metrics;
 };
 

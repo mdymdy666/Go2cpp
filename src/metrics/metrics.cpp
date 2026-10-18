@@ -7,6 +7,27 @@
  *   - Histogram 的每个桶也必须是原子计数，`Sum` 用位模式 CAS 维护；
  *   - 标签子指标存放在根对象的 `std::map` 中，引用稳定、按标签缓存；
  *   - 渲染时先把元数据与序列拼进一个 `std::string`，避免调用方逐行加锁。
+ *
+ * ## 模块定位
+ * `metrics.hpp` 的实现：名字/标签校验、double 的原子位运算、三种指标的族管理与
+ * Prometheus 文本渲染。无第三方依赖。
+ *
+ * ## 本文件定义什么
+ * - 匿名命名空间的校验/转义/格式化工具（`IsValidMetricName`、`AppendEscapedLabelValue`、
+ *   `FormatDouble`、`AppendSample`）；
+ * - double 原子读写与 CAS 加法（`LoadDouble`/`StoreDouble`/`AddDouble`）；
+ * - 三种指标的 Family、`With()`、`Observe()`、`Quantile()` 与 `AppendPrometheus()`；
+ * - `Registry::RegisterImpl()` 与 `Render()`。
+ *
+ * ## 阅读建议
+ * 先看 `FormatDouble`/`AppendEscapedLabelValue`（文本格式的边界），再看 `BucketIndex`
+ * 与 `AddDouble`（分桶与无锁浮点加），最后看 `Histogram::Quantile()` 的插值。
+ *
+ * ## 边界与陷阱
+ * - 标签值转义只覆盖 `\\`、`\"`、`\n`；其它字节原样输出（Prometheus 允许但需自担风险）；
+ * - `FormatDouble` 对 NaN/Inf 输出 `NaN`/`+Inf`/`-Inf`（Prometheus 文本格式要求）；
+ * - `Quantile()` 是估算：桶内线性插值，目标落 `+Inf` 桶时返回最后一个有限上界；
+ * - `Render()` 持 `m_mutex` 输出全部指标：注册表大时会拉长注册临界区，但保证快照一致。
  */
 #include "go2cpp/metrics/metrics.hpp"
 
@@ -167,6 +188,14 @@ std::string EncodeLabelValues(const std::vector<std::string>& values) {
     return key;
 }
 
+/**
+ * @brief 把 double 格式化为 Prometheus 文本（含 NaN/Inf 特例）。
+ *
+ * ## 步骤
+ * step1. NaN -> `NaN`；+/-Inf -> `+Inf`/`-Inf`；
+ * step2. 其余用 `std::to_chars(general)` 输出最短表示（无 locale 依赖）；
+ * step3. `to_chars` 失败返回 "0"（缓冲区足够，正常不会发生）。
+ */
 std::string FormatDouble(double value) {
     if (std::isnan(value)) {
         return "NaN";
@@ -192,6 +221,13 @@ std::string FormatUint(std::uint64_t value) {
     return std::string(buffer, result.ptr);
 }
 
+/**
+ * @brief 按 Prometheus 文本格式转义并输出一个标签值。
+ *
+ * ## 说明
+ * 只转义 `\\`、`\"`、换行三种：这是 Prometheus 文本解析器要求的**最小集合**；
+ * 其余控制字符会原样进入输出，抓取端可能拒绝整行 —— 标签值应保持简短可打印。
+ */
 void AppendEscapedLabelValue(std::string& out, std::string_view value) {
     out.push_back('"');
     for (const char ch : value) {
@@ -300,6 +336,17 @@ void StoreDouble(std::atomic<std::uint64_t>& bits, double value) noexcept {
     bits.store(DoubleToBits(value), std::memory_order_relaxed);
 }
 
+/**
+ * @brief 对以位模式存储的 double 做无锁加法（CAS 循环）。
+ *
+ * ## 步骤
+ * step1. `delta == 0` 直接返回；
+ * step2. 读当前位模式并转成 double，加上 delta 后转回位模式；
+ * step3. `compare_exchange_weak` 成功则返回，失败用新值重试。
+ *
+ * ## 为什么不用 `atomic<double>`
+ * C++17 没有 `fetch_add` 的浮点特化；位模式 + CAS 可移植，且 `Set(NaN)` 后仍能终止。
+ */
 void AddDouble(std::atomic<std::uint64_t>& bits, double delta) noexcept {
     if (delta == 0.0) {
         return;
@@ -308,6 +355,7 @@ void AddDouble(std::atomic<std::uint64_t>& bits, double delta) noexcept {
     for (;;) {
         const double next = BitsToDouble(expected) + delta;
         const std::uint64_t desired = DoubleToBits(next);
+        /// step3: 失败时 expected 已被更新，直接进入下一轮重算。
         if (bits.compare_exchange_weak(expected, desired,
                                        std::memory_order_relaxed,
                                        std::memory_order_relaxed)) {
@@ -316,6 +364,13 @@ void AddDouble(std::atomic<std::uint64_t>& bits, double delta) noexcept {
     }
 }
 
+/**
+ * @brief 二分查找 value 应落入的桶下标（le 语义）。
+ *
+ * ## 说明
+ * `lower_bound` 返回第一个 `boundary >= value` 的位置，正好对应 `le` 桶；
+ * 返回 `boundaries.size()` 表示落进隐式 `+Inf` 桶。
+ */
 std::size_t BucketIndex(const std::vector<double>& boundaries, double value) {
     return static_cast<std::size_t>(
         std::lower_bound(boundaries.begin(), boundaries.end(), value) -
@@ -686,13 +741,24 @@ void Histogram::EnsureSeries(const char* operation) const {
     }
 }
 
+/**
+ * @brief 观察一个样本（NaN 被忽略）。
+ *
+ * ## 步骤
+ * step1. `EnsureSeries()`：带标签的根对象直接拒绝；
+ * step2. `NaN` 直接返回（会污染 Sum 与分位数）；
+ * step3. 二分找桶并递增桶计数；
+ * step4. CAS 累加 Sum、递增 Count（三者都是 relaxed 原子操作）。
+ */
 void Histogram::Observe(double value) {
     EnsureSeries("Observe");
     if (std::isnan(value)) {
         // NaN 会污染 Sum 与分位数；Prometheus 客户端同样忽略 NaN 观测。
         return;
     }
+    /// step3: 落桶是 `le` 语义（第一个 >= value 的边界）。
     const std::size_t index = BucketIndex(m_family->boundaries, value);
+    /// step4: 桶计数/Sum/Count 均为 relaxed —— 监控允许近似，但不能丢更新。
     m_bucket_counts[index].fetch_add(1, std::memory_order_relaxed);
     AddDouble(m_sum_bits, value);
     m_count.fetch_add(1, std::memory_order_relaxed);
@@ -723,6 +789,18 @@ std::vector<std::uint64_t> Histogram::CumulativeBucketCounts() const {
     return result;
 }
 
+/**
+ * @brief 估算 q 分位数（Prometheus 桶内线性插值）。
+ *
+ * ## 步骤
+ * step1. 参数校验：NaN -> NaN；q<0 -> -Inf；q>1 -> +Inf；空直方图 -> NaN；
+ * step2. 取累计桶计数，算目标 rank = q * total；
+ * step3. 找第一个累计计数 >= rank 的桶；落 `+Inf` 桶时返回最后一个有限上界；
+ * step4. 桶内线性插值：`lower + (rank - prior) / bucket_count * (upper - lower)`。
+ *
+ * ## 边界
+ * 第一个桶的下界按 Prometheus 习惯取 `min(0, upper)`；空桶返回下界，避免除零。
+ */
 double Histogram::Quantile(double q) const {
     EnsureSeries("Quantile");
     if (std::isnan(q)) {
@@ -740,6 +818,7 @@ double Histogram::Quantile(double q) const {
         return kNaN;
     }
 
+    /// step2: 取一次快照，保证后续计算自洽。
     const auto cumulative = CumulativeBucketCounts();
     const double rank = q * static_cast<double>(total);
     std::size_t index = 0;
@@ -752,6 +831,7 @@ double Histogram::Quantile(double q) const {
     }
 
     // 目标落在隐式 +Inf 桶：Prometheus 的经典行为是返回最后一个有限上界。
+    /// step3: 落在隐式 +Inf 桶。
     if (index == m_bucket_count - 1) {
         return m_family->boundaries.back();
     }
@@ -759,6 +839,7 @@ double Histogram::Quantile(double q) const {
     const double upper = m_family->boundaries[index];
     // Prometheus 假设第一个桶的下界是 0；若桶上界本身为负，则退化为该上界，
     // 避免出现 lower > upper 的负宽度插值。
+    /// step4: 第一个桶下界取 min(0, upper)，避免负宽度。
     const double lower =
         index == 0 ? std::min(0.0, upper) : m_family->boundaries[index - 1];
     const std::uint64_t prior = index == 0 ? 0 : cumulative[index - 1];
@@ -969,10 +1050,22 @@ Metric& Registry::Register(const std::string& name, const std::string& help,
     return RegisterImpl(name, help, type, std::move(label_names), {});
 }
 
+/**
+ * @brief 渲染全部指标为 Prometheus 文本格式。
+ *
+ * ## 步骤
+ * step1. 取 `m_mutex`（保证注册表快照一致）；
+ * step2. 预分配输出，逐个调用 `AppendPrometheus()`（各自写 HELP/TYPE 与序列）；
+ * step3. 返回整段文本。
+ *
+ * ## 边界
+ * 持锁时间与指标数量成正比；抓取频率高、指标多时应避免频繁 `Render()`。
+ */
 std::string Registry::Render() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     std::string out;
     out.reserve(m_metrics.size() * 256);
+    /// step2: 指标按名字有序（std::map），输出稳定。
     for (const auto& entry : m_metrics) {
         entry.second->AppendPrometheus(out);
     }

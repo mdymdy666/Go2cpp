@@ -1,3 +1,26 @@
+/**
+ * @brief 轻量日志实现：格式项注册表、内置 Sink、Worker 快照与 Logger 分发。
+ *
+ * ## 模块定位
+ * `log.hpp` 的实现：格式项解析与注册表、内置 Formatter/Sink、Worker 快照、
+ * Logger 分发与 LoggerManager 配置。全部只依赖 C++17 标准库。
+ *
+ * ## 本文件定义什么
+ * - 格式项注册表与内置项（`EnsureBuiltinFormats()` / `ParsePattern()`）；
+ * - `PatternFormatter`、`MinimumLevelFilter`、`ParseLevel`；
+ * - 全部 Sink 的写入与刷盘实现（含 `BufferedSink` 的批量逻辑）；
+ * - `LogItemWorker` 的快照替换、`Logger`/`LoggerManager` 的生命周期与传播。
+ *
+ * ## 阅读建议
+ * 先看 `FileSink::Write()` 的刷盘时机，再看 `BufferedSink::Write()` 的三条路径
+ * （绕过 / 立即 / 缓冲）与 `FlushBatch()` 的锁外 IO，最后看 `Logger::Log()`。
+ *
+ * ## 边界与陷阱
+ * - 所有 Sink 在锁内只做写流/追加，**不刷盘**（`Warn`+ 的 FileSink 例外）；
+ * - `BufferedSink` 的两把锁不嵌套：先释放 `m_mutex` 再取 `m_io_mutex`，无锁序死锁；
+ * - `LogItemWorker::Submit()` 不在锁内调用用户代码，避免自定义 Sink 重入死锁；
+ * - `LogLine` 析构吞异常：日志失败不影响业务，但也意味着错误被静默。
+ */
 #include "go2cpp/log.hpp"
 
 #include <filesystem>
@@ -384,9 +407,23 @@ FileSink::FileSink(std::string path) : m_path(std::move(path)) {
     Reopen();
 }
 
+/**
+ * @brief 写一条日志到文件（锁内只写，Warn+ 立即刷盘）。
+ *
+ * ## 步骤
+ * step1. 取锁；流为空或状态不 good 时直接返回（静默丢弃）；
+ * step2. 一次 `stream->write()` 写出整条格式化文本；
+ * step3. `Warn` 及以上立即 `flush()`，保证错误日志可被外部收集器马上读到；
+ *         `Info`/`Debug` 留在流缓冲，避免高吞吐退化成每条一次系统调用。
+ *
+ * ## 为什么不在这里无条件 flush
+ * 无条件 flush 等价于每条日志一次 `write(2)` + 一次磁盘同步；放在锁内还会把
+ * 临界区拉长到 IO 完成。需要确定性落盘时由调用方显式 `Logger::Flush()`。
+ */
 void FileSink::Write(const LogRecord& record, std::string_view formatted) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_stream) return;
+    // step2: 锁内只做一次写，不做额外 IO。
     auto* stream = dynamic_cast<std::ofstream*>(m_stream.get());
     if (!stream || !stream->good()) return;
     stream->write(formatted.data(), static_cast<std::streamsize>(formatted.size()));
@@ -428,8 +465,21 @@ RotatingFileSink::RotatingFileSink(std::string path, std::size_t max_bytes,
     }
 }
 
+/**
+ * @brief 写日志并在超过容量时滚动备份。
+ *
+ * ## 步骤
+ * step1. 取锁，判断 `m_bytes + 本次长度` 是否超限；
+ * step2. 超限时关闭流，从高到低重命名 `path.N-1 -> path.N`；
+ * step3. 删除当前文件并以 `app` 模式重建，`m_bytes` 清零；
+ * step4. 写入本次文本并累加 `m_bytes`。
+ *
+ * ## 边界
+ * 单条记录本身就超过 `max_bytes` 时仍会写入（滚动后从空文件开始，不会死循环）。
+ */
 void RotatingFileSink::Write(const LogRecord&, std::string_view formatted) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    // step2: 先滚动再写，避免本次记录被拆到两个文件。
     if (m_max_bytes != 0 && m_bytes + formatted.size() > m_max_bytes) {
         if (auto* stream = dynamic_cast<std::ofstream*>(m_stream.get())) stream->close();
         for (std::size_t i = m_max_files; i > 0; --i) {
@@ -488,13 +538,27 @@ LogItemWorker::LogItemWorker(LogFilter::ptr filter, LogFormatter::ptr formatter,
     : m_snapshot(std::make_shared<const Snapshot>(Snapshot{
           std::move(filter), std::move(formatter), std::move(sink)})) {}
 
+/**
+ * @brief 提交一条记录：过滤 -> 格式化 -> 写 Sink。
+ *
+ * ## 步骤
+ * step1. 原子读一次配置快照（热路径不加锁）；
+ * step2. 任一组件为空或 filter 拒绝 -> 返回 false，不格式化；
+ * step3. 调用户 Formatter 与 Sink —— 此时**没有持有任何 Worker 锁**；
+ * step4. 返回是否真正写出。
+ *
+ * ## 为什么不在锁内调用用户代码
+ * 自定义 Sink 可能在 Write 里再次打日志，若持锁调用会形成同一 Worker 的递归锁死。
+ */
 bool LogItemWorker::Submit(const LogRecord& record) {
     const auto snapshot = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
     if (!snapshot) return false;
     // 不在 Worker 锁内调用用户 Formatter/Sink；这样自定义 Sink 再次记录
     // 日志时不会形成同一 Worker 的递归锁死。
+    // step2: 先过滤，省掉未通过记录的格式化开销。
     if (!snapshot->filter || !snapshot->formatter || !snapshot->sink ||
         !snapshot->filter->Accept(record)) return false;
+    // step3: 锁外调用用户代码，允许 Sink 重入日志系统。
     const auto formatted = snapshot->formatter->Format(record);
     snapshot->sink->Write(record, formatted);
     return true;
@@ -626,13 +690,23 @@ void Logger::SetParent(Logger::ptr parent) {
 void Logger::SetPropagate(bool propagate) noexcept { m_propagate.store(propagate, std::memory_order_release); }
 bool Logger::propagate() const noexcept { return m_propagate.load(std::memory_order_acquire); }
 void Logger::Flush() const { const auto workers = std::atomic_load_explicit(&m_worker_snapshot, std::memory_order_acquire); for (const auto& worker : *workers) if (worker) worker->Flush(); }
+/**
+ * @brief 分发一条记录给所有 worker，并按需向父记录器传播。
+ *
+ * ## 步骤
+ * step1. `ShouldLog()` 级别过滤（原子读，无锁）；
+ * step2. 原子读 worker 快照，逐个 `Submit()`；
+ * step3. 若开启 propagate，取父记录器（弱引用加锁提升）并递归 `Log()`。
+ */
 void Logger::Log(LogRecord record) const {
     Logger::ptr parent;
     if (!ShouldLog(record.level)) return;
+    // step2: 无锁读取 worker 快照并逐个提交。
     const auto workers = std::atomic_load_explicit(&m_worker_snapshot, std::memory_order_acquire);
     for (const auto& worker : *workers) (void)worker->Submit(record);
     const bool propagate = m_propagate.load(std::memory_order_acquire);
     if (propagate) { std::lock_guard<std::mutex> lock(m_mutex); parent = m_parent.lock(); }
+    // step3: 传播到父记录器（调用方负责避免环）。
     if (propagate && parent) parent->Log(std::move(record));
 }
 
@@ -693,6 +767,12 @@ void LoggerManager::Remove(const std::string& name) {
 std::vector<Logger::ptr> LoggerManager::List() const { std::lock_guard<std::mutex> lock(m_mutex); return m_loggers; }
 void LoggerManager::Flush() { for (const auto& logger : List()) if (logger) logger->Flush(); }
 
+/**
+ * @brief 构造日志行：抓位置/时间/线程，级别未通过则不启用。
+ *
+ * ## 说明
+ * 构造只做开销很小的字段拷贝；格式化与输出推迟到析构，避免未通过过滤时浪费。
+ */
 LogLine::LogLine(Logger::ptr logger, Level level, const char* file, int line, const char* function)
     : m_logger(std::move(logger)) {
     m_enabled = m_logger && m_logger->ShouldLog(level);
@@ -702,6 +782,13 @@ LogLine::LogLine(Logger::ptr logger, Level level, const char* file, int line, co
     m_record.timestamp_ms = CurrentTimeMs(); m_record.thread_id = CurrentThreadId();
 }
 
+/**
+ * @brief 析构时把流内容提交给 Logger。
+ *
+ * ## 说明
+ * 整体 `try/catch(...)`：日志失败不能影响业务。`m_stream.str()` 可能分配，
+ * 因此这里的 catch 不是装饰。
+ */
 LogLine::~LogLine() noexcept {
     if (!m_enabled || !m_logger) return;
     try { m_record.message = m_stream.str(); m_logger->Log(std::move(m_record)); } catch (...) {}
@@ -738,12 +825,22 @@ bool BufferedSink::ShouldFlushLocked() const noexcept {
     return false;
 }
 
+/**
+ * @brief 锁外执行一次批量写。
+ *
+ * ## 步骤
+ * step1. 空批次或 inner 为空直接返回；
+ * step2. 取 `m_io_mutex`（此时 `m_mutex` 已释放，两锁不嵌套）；
+ * step3. 优先 `WriteRaw()` 批量写；不支持则退化为把整批当一条 `Write()`；
+ * step4. `Flush()` 并累加刷新计数。
+ */
 void BufferedSink::FlushBatch(std::string batch, const LogRecord& last_record) {
     if (batch.empty() || !m_inner) {
         return;
     }
     // 锁外串行化对底层 Sink 的调用。注意 m_mutex 此时已经释放，
     // 两把锁不嵌套，因此不存在死锁。
+    // step2: 在此串行化对底层 Sink 的调用（Sink 的线程安全契约由实现决定）。
     std::lock_guard<std::mutex> io_lock(m_io_mutex);
     if (!m_inner->WriteRaw(batch)) {
         // 底层不支持批量：退化为把它当作一条记录写下去。
@@ -753,11 +850,24 @@ void BufferedSink::FlushBatch(std::string batch, const LogRecord& last_record) {
     m_flush_count.fetch_add(1, std::memory_order_relaxed);
 }
 
+/**
+ * @brief 写一条日志（绕过 / 立即 / 缓冲三条路径）。
+ *
+ * ## 步骤
+ * step1. 单条记录 >= `bypass_threshold` -> 绕过缓冲直接写并 flush；
+ * step2. `kImmediate` 策略 -> 直接写并 flush（等价于不缓冲）；
+ * step3. 否则在 `m_mutex` 内 append，补换行，`ShouldFlushLocked()` 判定是否该刷；
+ * step4. 需要刷时把缓冲 `swap` 到局部变量，出锁后 `FlushBatch()`。
+ *
+ * ## 并发要点
+ * 锁内只碰缓冲与统计；IO 全在锁外，多个线程可各自持有自己的批次依次写入。
+ */
 void BufferedSink::Write(const LogRecord& record, std::string_view formatted) {
     if (!m_inner) {
         return;
     }
     // 超大单条记录：绕过缓冲，避免撑爆缓冲区或长期滞留。
+    // step1: 超大单条记录绕过缓冲，避免撑爆或长期滞留。
     if (m_config.bypass_threshold > 0 && formatted.size() >= m_config.bypass_threshold) {
         std::lock_guard<std::mutex> io_lock(m_io_mutex);
         m_inner->Write(record, formatted);
@@ -766,6 +876,7 @@ void BufferedSink::Write(const LogRecord& record, std::string_view formatted) {
         return;
     }
     // 立即策略：不缓冲。
+    // step2: 立即策略不缓冲。
     if (m_config.policy == FlushPolicy::kImmediate) {
         std::lock_guard<std::mutex> io_lock(m_io_mutex);
         m_inner->Write(record, formatted);
@@ -783,6 +894,7 @@ void BufferedSink::Write(const LogRecord& record, std::string_view formatted) {
         if (m_buffer.empty() || m_buffer.back() != '\n') {
             m_buffer.push_back('\n');
         }
+        // step3: 只有尺寸/时间条件满足才刷（kByTime 是惰性检查）。
         should_flush = ShouldFlushLocked();
         if (should_flush) {
             batch.swap(m_buffer);

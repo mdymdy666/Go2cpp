@@ -59,6 +59,44 @@
 #include <string>
 #include <string_view>
 
+/**
+ * ## 模块定位
+ *
+ * JSON 的**边界层 / 防爆栈栅栏**，位于「外部不可信文本」与「进程内值」之间。上游是
+ * nlohmann/json v3.11.3（未修改），下游是 `example/concurrency/fiber_stack_limit_demo.cpp`
+ * 与 `fiber_stack_limit_full.cpp`（两者都用它演示/压测深度攻击），以及
+ * `tests/debug/test_debug_*.cpp`（通过 `go2cpp/json.hpp` 使用 nlohmann 类型）。
+ * 本模块不进入 `go2cpp/runtime.hpp` 聚合头，也不参与运行时语义。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Json`：直接别名到 `nlohmann::json`，不做二次包装；
+ * - `kDefaultJsonMaxDepth` / `kJsonDepthUnlimited`：默认深度上限（64）与扫描哨兵；
+ * - `JsonDepthExceededError()`：深度超限的**身份锚点**（用 `Is()` 判定，不比较文本）；
+ * - `JsonScanDepth`：迭代式深度扫描器（3 状态，见状态机文档）；
+ * - `JsonParseResult` / `ParseJson`：结构化结果的解析入口（扫描 → 解析）。
+ *
+ * ## 阅读建议
+ *
+ * 先读上面「为什么需要这一层」的三条论据与实测表，理解栅栏拦的不是解析而是解析**之后**
+ * 的递归操作；再看 `JsonScanDepth`（一个循环 + 3 个状态，字符串里跳过括号）；
+ * 最后看 `ParseJson` 的两步顺序 —— 顺序反过来就失去保护意义。
+ *
+ * ## 边界与陷阱
+ *
+ * - **限深栅栏必须保留**：`parse()` 在上游是迭代的（显式栈），然而 `dump()` 与拷贝
+ *   都是递归的，128 KiB Fiber 栈上分别约 1162 / 816 层（无优化下 609 / 185 层）就会
+ *   踩 guard page；项目没有 SIGSEGV handler 与 sigaltstack，越界即进程被内核杀掉
+ *   （退出码 139）。深文档一旦进程序，崩点可能在很远之后的某次日志序列化里，
+ *   届时无法定位来源。入口是唯一能把「不可捕获的崩溃」换成「可处理的 ErrorPtr」的位置。
+ * - 栅栏**只限深度**，不限总大小与节点数：宽而浅的文档仍能按 O(n) 放大内存/时间。
+ *   需要对体积设限时应在调用前检查 `text.size()`，本模块不替调用方决定。
+ * - `JsonScanDepth` 不做语法校验：括号不匹配、非法 UTF-8 都不会在这里报错，合法性
+ *   由上游客忍解析器判断；带 `stop_at` 时的返回值只是真实深度的**下界**。
+ * - 判定解析成功只能用 `result.ok()`：合法输入 `null` 解析成功后 `value` 同样是 null。
+ * - 放宽 `max_depth` 等于放弃这层保护；放大后必须自行确认目标执行流的栈容量。
+ */
+
 namespace go2cpp {
 
 /**
@@ -121,16 +159,28 @@ inline ErrorPtr JsonDepthExceededError() {
  * @return 观测到的最大嵌套深度；空输入或纯标量返回 0。
  * @note 该函数是 `noexcept` 且无分配：可以安全地用在「必须先判断再决定是否
  *       解析」的栅栏位置。
+ *
+ * ## 步骤
+ * step1. 逐字符扫描，维护 `depth`（未闭合容器数）与 `deepest`（历史最大值）；
+ * step2. 处于字符串内部时只处理 `\` 转义与结束引号，内容里的括号一律不计深度；
+ * step3. 遇到 `{`/`[` 增加深度，刷新 `deepest`；一旦超过 `stop_at` 立即早退；
+ * step4. 遇到 `}`/`]` 且深度大于 0 时减少深度（多余的右括号被忽略，不做校验）；
+ * step5. 扫描结束返回 `deepest`。
+ *
+ * ## 状态机
+ * 扫描器有 Normal / InString / Escaped 三个状态，由输入字符驱动；
+ * 完整转化表见 `docs/state-machines/JsonDepthScanner.md`。
  */
 inline std::size_t JsonScanDepth(std::string_view text,
                                  std::size_t stop_at = kJsonDepthUnlimited) noexcept {
+    // step1: 两个计数器 + 两个状态位，整个扫描只用一个循环。
     std::size_t depth = 0;    // 当前尚未闭合的容器层数
     std::size_t deepest = 0;  // 历史最大层数
-    bool in_string = false;
-    bool escaped = false;
+    bool in_string = false;   // 状态位：是否位于字符串字面量内部
+    bool escaped = false;     // 状态位：字符串内是否刚读到反斜杠
     for (const char ch : text) {
+        // step2: 字符串内部只关心转义与结束引号，括号不计深度。
         if (in_string) {
-            // 字符串内部只关心转义与结束引号：内容里的括号不计入深度。
             if (escaped) {
                 escaped = false;
             } else if (ch == '\\') {
@@ -144,6 +194,7 @@ inline std::size_t JsonScanDepth(std::string_view text,
             in_string = true;
             continue;
         }
+        // step3: 左括号加深度；超过阈值立即早退（返回值只是下界）。
         if (ch == '{' || ch == '[') {
             ++depth;
             if (depth > deepest) {
@@ -154,10 +205,12 @@ inline std::size_t JsonScanDepth(std::string_view text,
             }
             continue;
         }
+        // step4: 右括号减深度；深度已为 0 时忽略（不做语法校验）。
         if ((ch == '}' || ch == ']') && depth > 0) {
             --depth;
         }
     }
+    // step5: 返回历史最大深度。
     return deepest;
 }
 
@@ -167,6 +220,17 @@ inline std::size_t JsonScanDepth(std::string_view text,
  *          不使用异常表达解析失败。
  * @note 判定成功请用 `ok()`，**不要**用 `value.is_null()` —— 合法输入 `"null"`
  *       解析成功后 `value` 同样是 null。
+ *
+ * ## 定位
+ *
+ * `ParseJson` 的返回值载体，供示例与测试做「不抛异常」的错误处理；与
+ * `ChannelRecvResult<T>` / `FutureResult<T>` 是同一种结构化结果风格。
+ *
+ * ## 不变量
+ *
+ * - `error == nullptr` ⟺ `ok()` 为真；
+ * - 成功时 `value` 可能是任意 JSON 值，**包括 null**；
+ * - 失败时 `value` 保持默认构造的 null，调用方不应读取。
  */
 struct JsonParseResult {
     /** @brief 成功时的解析结果；失败时为 null。 */
@@ -196,6 +260,16 @@ struct JsonParseResult {
  * @return 结构化结果；失败信息在 `result.error`，不抛异常。
  * @note 上游的所有异常（`json::parse_error` 等）都在这里被转换成 `ErrorPtr`，
  *       与项目「不用异常做控制流」的约定一致。
+ *
+ * ## 步骤
+ * step1. 用 `JsonScanDepth(text, max_depth)` 迭代扫描深度，超限立即返回
+ *        `Wrap(JsonDepthExceededError(), ...)`，**不进入**上游解析器；
+ * step2. 只有未超限才调用 `nlohmann::json::parse`，并把它可能抛出的所有异常
+ *        转换成 `ErrorPtr`。
+ *
+ * ## 为什么顺序不可交换
+ * 先解析再检查深度没有意义：深文档一旦解析成功就已经在堆上，随后任意一次 `dump()`
+ * 或拷贝都可能踩爆 Fiber 栈；而栈溢出不可捕获，进程会直接被杀。栅栏必须挡在入口。
  */
 inline JsonParseResult ParseJson(std::string_view text,
                                  std::size_t max_depth = kDefaultJsonMaxDepth) {

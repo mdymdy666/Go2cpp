@@ -1,3 +1,36 @@
+/**
+ * @file src/config/config.cpp
+ * @brief 配置中心的实现：INI 语法、事务式热加载、监听线程与运行时绑定。
+ *
+ * ## 模块定位
+ *
+ * 配置中心的**实现层**。上游是 `example/config/`、`tests/config/`、
+ * `tests/logging/test_log_config.cpp` 以及 `src/network/hook.cpp` 的
+ * `RegisterHookConfig`；下游只使用标准库（`std::filesystem`、`std::thread`、
+ * `std::from_chars`），不依赖网络/调度器实现。
+ *
+ * ## 本文件定义什么
+ *
+ * - `IniFile::Load/Parse/Get/Has` 与内部 `Trim`/`ParseSize`/`ParseBool`；
+ * - 稳定快照读取（`ReadStableFileContents` + `.lock` 协议）与 `FileStamp`；
+ * - `RuntimeConfig::FromIni/Validate/ApplyLogging` 与范围常量；
+ * - `Config` 的注册、事务提交、监听线程、导出；
+ * - `BindLoggingConfig`/`BindRuntimeConfig`/`LoadRuntimeConfig`；
+ * - `SplitConfigName`/`JoinConfigName` 与 INI 转义辅助。
+ *
+ * ## 阅读建议
+ *
+ * 先读 `ReadStableFileContents`（为什么需要两次元数据+内容比对），再读
+ * `Config::LoadFromIni`（预检、跨字段校验、写入、广播四段），最后看
+ * `StartWatcher` 的轮询与 `.lock` 处理。事务状态见 `docs/state-machines/Config.md`。
+ *
+ * ## 边界与陷阱
+ *
+ * - `IniFile::Parse` 先构造临时表，成功才 swap，语法错误不会留下半解析状态；
+ * - `RuntimeConfig::FromIni` 在副本上操作，校验通过才写回，失败不动原对象；
+ * - 监听线程吞掉所有监听器异常并继续轮询，避免一次插件错误终止热加载；
+ * - `DumpIni` 的转义不可逆，`IniFile::Parse` 只做 `\n` 到换行的单向替换。
+ */
 #include "go2cpp/config.hpp"
 
 #include <algorithm>
@@ -197,13 +230,32 @@ bool ReadFileContents(const std::string& path, std::string* contents,
     return true;
 }
 
+/**
+ * @brief 读取「编辑中不会变化」的配置文件快照，配合 `path + ".lock"` 协议。
+ *
+ * ## 步骤
+ * step1. 最多尝试 8 次，每次失败间隔 2 ms；
+ * step2. 每轮先查编辑锁：锁非空说明写入方仍在编辑，等待后重试；
+ * step3. 记录 before 时间戳/大小并读第一份内容；
+ * step4. 再次记录 after，要求 before == after；读完后再查一次锁；
+ * step5. 再读第二份内容与前后时间戳，要求两次元数据一致且内容完全相同；
+ * step6. 校验通过才把第二份内容交给调用方；
+ * step7. 全部重试失败时区分「锁未清空」与「文件持续变化」给出中文诊断。
+ *
+ * ## 为什么需要两次快照
+ * 编辑器可能直接截断重写；只读一次会拿到半个文件。双快照 + 双锁检查把
+ * 「读到半文件」的概率压到可接受范围，生产环境仍建议临时文件 + 原子 rename。
+ */
 bool ReadStableFileContents(const std::string& path, std::string* contents,
                             std::string* error) {
+    // step1: 重试上限；超过后宁可失败也不提交可能不完整的配置
     constexpr int kAttempts = 8;
     constexpr auto kRetryDelay = std::chrono::milliseconds(2);
     std::string last_error;
     bool lock_seen = false;
+    // step2: 每轮都重新检查编辑锁，锁释放后允许重试
     for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        // step3: 锁文件非空 = 写入方仍持有编辑事务
         bool edit_locked = false;
         if (!IsEditLocked(path, &edit_locked, &last_error)) {
             std::this_thread::sleep_for(kRetryDelay);
@@ -214,12 +266,14 @@ bool ReadStableFileContents(const std::string& path, std::string* contents,
             std::this_thread::sleep_for(kRetryDelay);
             continue;
         }
+        // step4: 第一份快照：元数据前后一致 + 内容读成功
         FileStamp before;
         std::string first;
         FileStamp after;
         if (ReadFileStamp(path, &before, &last_error) &&
             ReadFileContents(path, &first, &last_error) &&
             ReadFileStamp(path, &after, &last_error) && before == after) {
+            // step5: 读完后锁可能刚被写入方拿到，必须再确认一次
             bool locked_after_read = false;
             if (!IsEditLocked(path, &locked_after_read, &last_error)) {
                 std::this_thread::sleep_for(kRetryDelay);
@@ -230,6 +284,7 @@ bool ReadStableFileContents(const std::string& path, std::string* contents,
                 std::this_thread::sleep_for(kRetryDelay);
                 continue;
             }
+            // step6: 第二份快照必须与第一份逐字节相同，排除读期间变化
             FileStamp verify_before;
             std::string second;
             FileStamp verify_after;
@@ -248,12 +303,14 @@ bool ReadStableFileContents(const std::string& path, std::string* contents,
                     std::this_thread::sleep_for(kRetryDelay);
                     continue;
                 }
+                // step7: 只有双快照与双锁检查全部通过才提交内容
                 *contents = std::move(second);
                 return true;
             }
         }
         std::this_thread::sleep_for(kRetryDelay);
     }
+    // step8: 明确告诉调用方是锁未清还是文件仍在变化
     if (error) {
         *error = lock_seen
                      ? "配置文件正在编辑，请先清空编辑锁: " + EditLockPath(path)
@@ -272,9 +329,24 @@ bool IniFile::Load(const std::string& path, std::string* error) {
            Parse(contents, error);
 }
 
+/**
+ * @brief 解析内存中的 INI 文本；成功才替换当前节表。
+ *
+ * ## 步骤
+ * step1. 构造临时 `parsed_sections`，任何语法错误都不影响旧内容；
+ * step2. 逐行 trim；空行/`#`/`;` 注释跳过；`[...]` 切换当前节；
+ * step3. `key=value` 按第一个 `=` 切分，空键名报错；
+ * step4. 值在第一个 `#`/`;` 处截断，并把字面量 `\n` 还原为换行；
+ * step5. 完整解析成功后 `swap` 到 `m_sections`。
+ *
+ * ## 边界
+ * `Load` 会先经过稳定快照读取，因此本函数拿到的应是完整文本；直接调用 `Parse`
+ * 的调用方需自己保证文本完整性。
+ */
 bool IniFile::Parse(const std::string& text, std::string* error) {
     // 先构造临时快照，只有完整解析成功才替换当前内容；语法错误不能
     // 让调用方看到“前半段已更新、后半段丢失”的半解析状态。
+    // step1: 临时快照，语法错误时旧内容保持不变
     decltype(m_sections) parsed_sections;
     std::string current = "global";
     std::istringstream stream(text);
@@ -283,18 +355,21 @@ bool IniFile::Parse(const std::string& text, std::string* error) {
         ++line_number;
         auto clean = Trim(line);
         if (clean.empty() || clean.front() == '#' || clean.front() == ';') continue;
+        // step2: 节标题必须闭合；空节名直接失败
         if (clean.front() == '[') {
             if (clean.back() != ']') { if (error) *error = "节标题缺少 ]，行 " + std::to_string(line_number); return false; }
             current = Trim(clean.substr(1, clean.size() - 2));
             if (current.empty()) { if (error) *error = "节标题为空，行 " + std::to_string(line_number); return false; }
             continue;
         }
+        // step3: 只按第一个 `=` 切分，值里允许再出现 `=`
         const auto equal = clean.find('=');
         if (equal == std::string::npos) { if (error) *error = "配置项缺少 =，行 " + std::to_string(line_number); return false; }
         const auto key = Trim(clean.substr(0, equal));
         auto value = Trim(clean.substr(equal + 1));
         const auto comment = value.find_first_of("#;");
         if (comment != std::string::npos) value = Trim(value.substr(0, comment));
+        // step4: 仅还原字面量 `\n`；`DumpIni` 的转义是单向的
         for (std::size_t position = 0; (position = value.find("\\n", position)) != std::string::npos;) {
             value.replace(position, 2, "\n");
             ++position;
@@ -302,6 +377,7 @@ bool IniFile::Parse(const std::string& text, std::string* error) {
         if (key.empty()) { if (error) *error = "配置键为空，行 " + std::to_string(line_number); return false; }
         parsed_sections[current][key] = value;
     }
+    // step5: 全部成功后一次性替换，读者不会看到半解析状态
     m_sections.swap(parsed_sections);
     return true;
 }
@@ -319,8 +395,20 @@ bool IniFile::Has(const std::string& section, const std::string& key) const {
     return section_it != m_sections.end() && section_it->second.find(key) != section_it->second.end();
 }
 
+/**
+ * @brief 从 INI 构造一份校验通过的 RuntimeConfig 快照。
+ *
+ * ## 步骤
+ * step1. 以传入对象为基准拷贝到 `result`，失败时不污染原对象；
+ * step2. 读取 `scheduler.*` 的尺寸/时长/布尔项；尺寸走统一范围规则；
+ * step3. 读取 `log.*` 级别、stdout 与文本字段；
+ * step4. 读取 `timer.*` 两个天数阈值；
+ * step5. 调用 `Validate()` 做跨字段校验（min/max、warn/error、空格式串等）；
+ * step6. 全部通过后才 `*config = std::move(result)`。
+ */
 bool RuntimeConfig::FromIni(const IniFile& ini, RuntimeConfig* config, std::string* error) {
     if (!config) { if (error) *error = "RuntimeConfig 输出指针为空"; return false; }
+    // step1: 在副本上构造；任何失败都不改动调用方对象
     RuntimeConfig result = *config;
     if (!ReadSize(ini, "scheduler", "processor_count", &result.scheduler.processor_count, error) ||
         !ReadSize(ini, "scheduler", "max_workers", &result.scheduler.max_workers, error) ||
@@ -329,6 +417,7 @@ bool RuntimeConfig::FromIni(const IniFile& ini, RuntimeConfig* config, std::stri
         !ReadSize(ini, "scheduler", "fiber_stack_size", &result.scheduler.fiber_stack_size, error) ||
         !ReadSize(ini, "scheduler", "task_affinity_budget", &result.scheduler.task_affinity_budget, error) ||
         !ReadSize(ini, "scheduler", "fiber_bin_capacity", &result.scheduler.fiber_bin_capacity, error)) return false;
+    // step2: 时长项先按毫秒读取，再走 ValidateDuration 的 24 小时上限
     std::size_t value = 0;
     if (ini.Has("scheduler", "idle_wait_ms")) { if (!ReadSize(ini, "scheduler", "idle_wait_ms", &value, error) || !ValidateDuration("idle_wait_ms", value, error)) return false; result.scheduler.idle_wait = std::chrono::milliseconds(value); }
     if (ini.Has("scheduler", "idle_worker_timeout_ms")) { if (!ReadSize(ini, "scheduler", "idle_worker_timeout_ms", &value, error) || !ValidateDuration("idle_worker_timeout_ms", value, error)) return false; result.scheduler.idle_worker_timeout = std::chrono::milliseconds(value); }
@@ -338,20 +427,32 @@ bool RuntimeConfig::FromIni(const IniFile& ini, RuntimeConfig* config, std::stri
     if (ini.Has("scheduler", "enable_sysmon") && !ParseBool(ini.Get("scheduler", "enable_sysmon"), &result.scheduler.enable_sysmon)) { if (error) *error = "enable_sysmon 不是布尔值"; return false; }
     if (ini.Has("scheduler", "pin_workers_to_cpu") && !ParseBool(ini.Get("scheduler", "pin_workers_to_cpu"), &result.scheduler.pin_workers_to_cpu)) { if (error) *error = "pin_workers_to_cpu 不是布尔值"; return false; }
     if (ini.Has("scheduler", "collect_metrics") && !ParseBool(ini.Get("scheduler", "collect_metrics"), &result.scheduler.collect_metrics)) { if (error) *error = "collect_metrics 不是布尔值"; return false; }
+    // step3: 日志字段允许缺省，缺省时沿用调用方当前值
     if (ini.Has("log", "level") && !log::ParseLevel(ini.Get("log", "level"), &result.log_level)) { if (error) *error = "log.level 不是有效级别"; return false; }
     if (ini.Has("log", "stdout") && !ParseBool(ini.Get("log", "stdout"), &result.log_stdout)) { if (error) *error = "log.stdout 不是布尔值"; return false; }
+    // step4: 文本字段不做 trim 之外的改写，空值留给 Validate 统一拒绝
     result.log_directory = ini.Get("log", "directory", result.log_directory);
     result.log_file = ini.Get("log", "file", result.log_file);
     result.log_format = ini.Get("log", "format", result.log_format);
+    // step5: timer 段只接受非负整数，跨字段关系在 Validate 中检查
     if (ini.Has("timer", "warn_after_days") &&
         !ReadSize(ini, "timer", "warn_after_days", &result.timer_warn_after_days, error)) return false;
     if (ini.Has("timer", "error_after_days") &&
         !ReadSize(ini, "timer", "error_after_days", &result.timer_error_after_days, error)) return false;
+    // step6: 校验先于写回，保证对象要么全旧要么全新
     if (!result.Validate(error)) return false;
     *config = std::move(result);
     return true;
 }
 
+/**
+ * @brief 统一校验调度器/日志/定时器参数边界。
+ *
+ * @details 这里是配置文件与启动路径的**最后一道闸**：线程数上限、队列上限、
+ * Fiber 栈范围、四个时长上限、日志目录/文件名/格式非空、timer 阈值关系都在
+ * 此集中判断。错误信息带字段名，便于直接打印给用户。
+ * @return 全部合法返回 true；否则写 `error`（可为空）并返回 false。
+ */
 bool RuntimeConfig::Validate(std::string* error) const {
     const auto fail = [error](const std::string& message) { if (error) *error = message; return false; };
     const auto& value = scheduler;
@@ -406,13 +507,33 @@ ConfigVarBase::ptr Config::LookupBase(const std::string& name) const {
     return it == m_vars.end() ? nullptr : it->second;
 }
 
+/**
+ * @brief 把 INI 中的键批量应用到已注册变量；两阶段提交。
+ *
+ * ## 步骤
+ * step1. 取得事务锁，保证预检+写入不被另一个 `LoadFromIni` 交错；
+ * step2. 快照全部变量，构造候选值表（未出现的键用当前值）；
+ * step3. 逐变量做单字段 `ValidateString`，收集待应用列表；
+ * step4. 用完整候选快照跑跨字段事务校验器（任何写入之前）；
+ * step5. 逐变量 `ApplyString` 写入但不通知；任一失败则逆序 `RollbackPending`；
+ * step6. 释放事务锁（监听器可以再次读/提交配置）；
+ * step7. 统一 `NotifyPending`，让模块看到完整的新配置；
+ * step8. 执行提交回调；单个回调异常不影响已提交的值。
+ *
+ * ## 失败语义
+ * 预检/事务校验失败时没有任何变量被写入；`ApplyString` 失败时已写变量全部回滚。
+ * 通知阶段即使回调抛异常也不回滚（配置值已经对外可见）。
+ */
 bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
     // 预检和提交必须处于同一事务临界区。否则两个监听线程可能分别
     // 通过预检，随后交错 ApplyString，破坏“整批配置一次发布”的约定。
+    // step1: 事务锁覆盖预检与写入，通知阶段会提前释放
     std::unique_lock<std::mutex> transaction_lock(m_transaction_mutex);
+    // step2: 先取变量快照，避免持锁遍历时被 Lookup/Remove 改变
     const auto variables = List();
     // 先检查所有已注册项对应的文本能否转换；实际写入仍按变量顺序完成，
     // 这样错误能指出具体变量，同时不要求所有类型都暴露内部临时值。
+    // step3: pending 保存「变量 + 待应用文本」，顺序即写入顺序
     std::vector<std::pair<ConfigVarBase::ptr, std::string>> pending;
     std::map<std::string, std::string> candidates;
     for (const auto& variable : variables) {
@@ -429,6 +550,7 @@ bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
     }
     // 单字段校验只能检查类型和取值范围，跨字段关系必须基于本次文件的
     // 完整候选快照判断。校验发生在任何 ApplyString 之前，失败时不留下半套值。
+    // step4: 跨字段校验基于候选快照，必须在任何 ApplyString 之前
     std::map<std::uint64_t, TransactionValidator> validators;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -440,6 +562,7 @@ bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
     }
     // 第二阶段只写入变量，不触发监听器。这样 scheduler/log 等模块不会
     // 看到“只更新了一半”的配置组合；全部变量写入成功后再统一广播。
+    // step5: applied 兼作回滚栈；只记录真正产生 pending 的变量
     std::vector<ConfigVarBase::ptr> applied;
     applied.reserve(pending.size());
     try {
@@ -454,11 +577,14 @@ bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
         }
         // 所有变量已经完成第一阶段提交；通知阶段不持有事务锁，监听器可以
         // 查询注册表或触发下一次配置加载，避免插件回调与事务锁形成死锁。
+        // step6: 释放事务锁后再广播，允许监听器再次提交配置
         transaction_lock.unlock();
         // 监听器读取其他变量时只能看到本次文件提交后的值，不会读到本次
         // ApplyString 顺序造成的半套状态。并发的新事务可能在此之后开始，
         // 这是有意的：配置值已经完整发布，回调不阻塞配置刷新线程。
+        // step7: 所有变量已写入，监听器只能看到完整的新值集合
         for (const auto& variable : applied) variable->NotifyPending();
+        // step8: 提交回调属于扩展点，逐个隔离异常
         if (!applied.empty()) {
             std::map<std::uint64_t, CommitListener> listeners;
             try {
@@ -542,13 +668,32 @@ void Config::DelTransactionValidator(std::uint64_t id) {
     m_transaction_validators.erase(id);
 }
 
+/**
+ * @brief 立即加载文件，并启动按周期轮询的后台监听线程。
+ *
+ * ## 步骤
+ * step1. 校验路径/周期，取生命周期锁并先停掉旧线程；
+ * step2. 启动前检查 `.lock`：非空说明文件正在编辑，拒绝启动；
+ * step3. 记录初始时间戳并做一次同步加载（失败不启动线程）；
+ * step4. 置 `m_watching` 后创建线程；
+ * step5. 线程用条件变量按 interval 等待，停止时可被立即唤醒；
+ * step6. 每轮检查编辑锁；锁非空时标记 retry_pending 并跳过；
+ * step7. 时间戳/大小未变化且没有待重试时跳过；
+ * step8. 变化则 `LoadFromFile`；成功更新基准，失败/异常打印并保持重试。
+ *
+ * ## 为什么不只用 mtime
+ * 编辑器可能做同尺寸原子替换，mtime 也可能因精度相同而不变；`retry_pending`
+ * 在「锁从非空变空」时强制再试一次，覆盖这两种情况。
+ */
 bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds interval, std::string* error) {
     if (path.empty() || interval <= std::chrono::milliseconds::zero()) {
         if (error) *error = "配置监听路径或周期无效";
         return false;
     }
+    // step1: 生命周期锁保护 std::thread 对象；先确保旧线程已退出
     std::lock_guard<std::mutex> lifecycle_lock(m_watcher_lifecycle_mutex);
     stop_watcher_locked();
+    // step2: 启动前就有编辑锁时直接失败，避免把半文件当作初始配置
     bool edit_locked = false;
     if (!IsEditLocked(path, &edit_locked, error)) return false;
     if (edit_locked) {
@@ -561,8 +706,10 @@ bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds int
     if (!ReadFileStamp(path, &initial_stamp, error)) {
         return false;
     }
+    // step3: 初始加载失败不启动线程；调用方会看到具体错误
     if (!LoadFromFile(path, error)) return false;
     m_watching.store(true, std::memory_order_release);
+    // step4: m_watching 先置位，线程启动后即可看到运行状态
     m_watcher = std::thread([this, path, interval, initial_stamp]() mutable {
         auto stamp = initial_stamp;
         // 锁从非空变为空时必须强制尝试一次，即使文件系统的时间戳和大小
@@ -571,11 +718,13 @@ bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds int
         while (m_watching.load(std::memory_order_acquire)) {
             // 条件变量让停止监听操作立即唤醒，不必等待一个完整刷新周期。
             std::unique_lock<std::mutex> wait_lock(m_watcher_mutex);
+            // step5: 条件变量让 StopWatcher 立即唤醒，不必等满一个周期
             m_watcher_cv.wait_for(wait_lock, interval, [this] {
                 return !m_watching.load(std::memory_order_acquire);
             });
             wait_lock.unlock();
             if (!m_watching.load(std::memory_order_acquire)) break;
+            // step6: 锁非空时不能读文件；置 retry_pending 保证锁释放后会重试
             bool edit_locked = false;
             std::string lock_error;
             if (!IsEditLocked(path, &edit_locked, &lock_error)) {
@@ -586,6 +735,7 @@ bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds int
                 retry_pending = true;
                 continue;
             }
+            // step7: 同尺寸原子替换可能不改变 mtime，靠 retry_pending 兜底
             FileStamp current;
             std::string stamp_error;
             if (!ReadFileStamp(path, &current, &stamp_error) ||
@@ -593,6 +743,7 @@ bool Config::StartWatcher(const std::string& path, std::chrono::milliseconds int
                 continue;
             }
             std::string error;
+            // step8: 监听器异常不能终止监听线程，记录后继续下一轮
             try {
                 if (LoadFromFile(path, &error)) {
                     stamp = current;
@@ -630,6 +781,14 @@ void Config::StopWatcher() {
     stop_watcher_locked();
 }
 
+/**
+ * @brief 把 `log.*` 注册为配置变量，并让任意一项变化都重建 LoggerManager 配置。
+ *
+ * @details 用 `weak_ptr` 捕获配置变量，避免 `ConfigVar -> Listener -> ConfigVar`
+ * 引用环；`apply` 每次读取全部五项再调用一次 `Configure`，避免逐项更新造成
+ * 「新级别 + 旧格式」的中间态。
+ * @return 全部变量注册成功返回 true；类型冲突写 error 并返回 false。
+ */
 bool BindLoggingConfig(Config& config, std::string* error) {
     auto level = config.Lookup<log::Level>("log.level", log::Level::Warn, "日志最低级别");
     auto stdout_enabled = config.Lookup<bool>("log.stdout", false, "是否输出到 stdout");
@@ -664,11 +823,31 @@ bool BindLoggingConfig(Config& config, std::string* error) {
     return true;
 }
 
+/**
+ * @brief 把 `scheduler.*`/`timer.*` 配置项绑定到 `RuntimeConfig` 目标。
+ *
+ * ## 步骤
+ * step1. 先校验目标当前值，避免把监听器装到非法快照上；
+ * step2. 绑定日志字段（复用 `BindLoggingConfig`）；
+ * step3. 逐个绑定尺寸字段：`Lookup<size_t>` + 范围校验器 + 写回监听器；
+ * step4. 绑定 `fiber_bin_capacity`；
+ * step5. 绑定三个布尔开关；
+ * step6. 绑定四个毫秒时长字段，校验器检查 1 ms..24 h；
+ * step7. 绑定 `collect_metrics`；
+ * step8. 绑定 timer 两个天数阈值，并安装单值与候选快照两类校验器；
+ * step9. 任一 `Lookup` 类型冲突则整体返回 false（已装的监听器保留）。
+ *
+ * ## 生命周期
+ * `target` 必须比所有监听器活得久；监听器用裸指针捕获目标字段。
+ */
 bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error) {
     if (!target) { if (error) *error = "RuntimeConfig 绑定目标为空"; return false; }
+    // step1: 目标快照非法时直接失败，避免监听器把运行态改得更乱
     if (!target->Validate(error)) return false;
+    // step2: 日志字段沿用同一套绑定逻辑，避免两处规则漂移
     if (!BindLoggingConfig(config, error)) return false;
     bool valid = true;
+    // step3: 尺寸字段共用同一套范围规则，避免各字段边界漂移
     const auto bind_size = [&config, target, &valid](const std::string& name, std::size_t* field, const char* description) {
         auto variable = config.Lookup<std::size_t>(name, *field, description);
         if (!variable) { valid = false; return; }
@@ -697,12 +876,14 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
         });
         variable->AddListener([field](const std::size_t&, const std::size_t& value) { *field = value; });
     };
+    // 每个字段一个校验器 + 一个写回监听器
     bind_size("scheduler.processor_count", &target->scheduler.processor_count, "P 数量，0 为自动");
     bind_size("scheduler.min_workers", &target->scheduler.min_workers, "最小 M 数量");
     bind_size("scheduler.max_workers", &target->scheduler.max_workers, "最大 M 数量");
     bind_size("scheduler.local_queue_limit", &target->scheduler.local_queue_limit, "P 本地队列容量");
     bind_size("scheduler.fiber_stack_size", &target->scheduler.fiber_stack_size, "Fiber 初始栈大小");
     bind_size("scheduler.task_affinity_budget", &target->scheduler.task_affinity_budget, "任务亲和预算");
+    // step4: fiber_bin_capacity 上限 4096，与 ValidateSchedulerSize 保持一致
     auto fiber_bin_capacity = config.Lookup<std::size_t>(
         "scheduler.fiber_bin_capacity", target->scheduler.fiber_bin_capacity,
         "每个 M 的 FiberBin 容量，最多 4096");
@@ -717,6 +898,7 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
                 target->scheduler.fiber_bin_capacity = value;
             });
     }
+    // step5: 三个布尔开关只做写入，范围由 bool 类型本身保证
     auto allow_oversubscription = config.Lookup<bool>("scheduler.allow_worker_oversubscription", target->scheduler.allow_worker_oversubscription, "允许 M 超过 P");
     auto enable_sysmon = config.Lookup<bool>("scheduler.enable_sysmon", target->scheduler.enable_sysmon, "启用 sysmon");
     auto pin_workers = config.Lookup<bool>("scheduler.pin_workers_to_cpu", target->scheduler.pin_workers_to_cpu, "绑定 CPU");
@@ -736,6 +918,7 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
             target->scheduler.pin_workers_to_cpu = value;
         });
     }
+    // step6: 时长字段存毫秒，监听器转换为 chrono::milliseconds
     auto idle_wait = config.Lookup<std::size_t>("scheduler.idle_wait_ms", target->scheduler.idle_wait.count(), "空闲等待毫秒");
     auto idle_timeout = config.Lookup<std::size_t>("scheduler.idle_worker_timeout_ms", target->scheduler.idle_worker_timeout.count(), "空闲 M 回收毫秒");
     auto sysmon_interval = config.Lookup<std::size_t>("scheduler.sysmon_interval_ms", target->scheduler.sysmon_interval.count(), "sysmon 周期毫秒");
@@ -773,6 +956,7 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
             target->scheduler.long_syscall_threshold = std::chrono::milliseconds(value);
         });
     }
+    // step7: collect_metrics 关闭可降低热路径开销，热更新允许即时切换
     auto collect_metrics = config.Lookup<bool>(
         "scheduler.collect_metrics", target->scheduler.collect_metrics,
         "是否采集调度计时指标；关闭可降低少量热路径开销");
@@ -783,6 +967,7 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
             target->scheduler.collect_metrics = value;
         });
     }
+    // step8: timer 阈值存在跨字段约束，需要两类校验器配合
     auto timer_warn = config.Lookup<std::size_t>(
         "timer.warn_after_days", target->timer_warn_after_days,
         "定时器长时长 WARN 阈值，单位天，0 关闭");
@@ -886,6 +1071,7 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
                 apply_timer_limits();
             });
     }
+    // step9: 汇总类型冲突；已注册的监听器不回滚，调用方可重新绑定
     if (!valid && error) *error = "运行时配置变量类型冲突";
     return valid;
 }

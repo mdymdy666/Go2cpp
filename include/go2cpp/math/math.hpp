@@ -48,6 +48,34 @@
  *          `math::Inf(1)` 走 `operator()`，`double x = math::Inf;` 走隐式转换。
  *          注意 `auto x = math::Inf;` 得到的是对象而不是 `double`，需要显式写成
  *          `double x = math::Inf;`（或直接调用 `math::Inf(1)`）。
+ *
+ * ## 模块定位
+ *
+ * Go 标准库的**纯计算适配层**，位于最底层且**零依赖**（不碰 error、不碰运行时）。
+ * 上游是 Go `math` 包的函数与常量语义，下游是 `src/math/math.cpp` 的实现与
+ * `tests/math/test_math.cpp` 的逐值对拍；业务代码若要做数值计算可直接使用。
+ *
+ * ## 本文件定义什么
+ *
+ * - 常量：`Pi`/`E`/`Sqrt2` 等超越常数，`MaxFloat64`/`SmallestNonzeroFloat64` 等浮点边界，
+ *   `MaxInt8`…`MaxUint64`/`MaxInt` 等整数边界；
+ * - 特殊值与位级转换：`Inf`（可调用常量）、`NaN`、`IsNaN`、`IsInf`、`Signbit`、
+ *   `Copysign`、`Float32bits`/`Float64bits` 及其反向构造；
+ * - 初等函数声明：基本运算、指数对数、三角/双曲、`Modf`/`Frexp`/`Ldexp`。
+ *
+ * ## 阅读建议
+ *
+ * 先读 @details 里「哪些直接委托 libm、哪些必须自己写」的清单，理解 `Max`/`Min` 的
+ * 判断顺序与 `Modf` 对 `±Inf` 的修正；再到 `src/math/math.cpp` 看实现。位级转换
+ * （`Float64bits` 等）建议先看 `std::memcpy` 那段注释，理解为什么不能用 `union`。
+ *
+ * ## 边界与陷阱
+ *
+ * - 超越函数只保证与**系统 libm** 逐位一致，不保证与 Go 纯 Go 实现一致（末位可能差
+ *   1 ULP）；需要跨平台可复现的数值请自行固定实现，不要把本模块当 oracle。
+ * - `math::Inf` 是对象而非函数：`auto x = math::Inf;` 的类型是 `InfConstant`，
+ *   参与重载解析时可能与 `double` 版本不同，写 `double x = math::Inf;` 最稳。
+ * - 所有函数都标了 `noexcept`：NaN/Inf 输入不会抛异常，而是按 IEEE-754 传播。
  */
 
 #pragma once

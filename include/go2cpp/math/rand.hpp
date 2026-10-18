@@ -64,6 +64,39 @@
  *       - 全局源在首次使用时用 `std::random_device` + 时钟 + 栈地址混合播种；需要可复现
  *         序列时先调用 `Seed(...)`；
  *       - 没有实现 `jump()`/`long_jump()` 等并行子序列 API。
+ *
+ * ## 模块定位
+ *
+ * Go 标准库适配层中的**纯计算模块**：上游是 Go `math/rand` 的 API 与分布语义，
+ * 下游是 `src/math/rand.cpp` 的实现与 `tests/math/test_rand.cpp` 的分布/已知向量测试。
+ * 不依赖运行时，可脱离 Fiber 使用；实例版 `Rand` 供需要可复现序列的调用方私有持有，
+ * 全局函数供与 Go 顶层函数一一对应的场景使用。
+ *
+ * ## 本文件定义什么
+ *
+ * - `span<T>` / `ByteSpan`：`Read` 需要的**非拥有**字节视图（C++17 没有 `std::span`）；
+ * - `Rand`：带独立状态的生成器（对应 `*rand.Rand`），xoshiro256** + splitmix64 播种；
+ * - 全局函数 `Seed`/`Intn`/`Float64`/`Read`/`Shuffle` 等：一个进程级实例 + 互斥锁。
+ *
+ * ## 阅读建议
+ *
+ * 先读文件头「算法选择」与「并发策略」两段，理解为什么是 xoshiro 而不是 mt19937、
+ * 为什么全局函数加锁而实例不加锁；再看 `Rand` 的成员与 `Read` 的 7 字节规则
+ * （最容易误改成 8 字节的地方）；最后看全局函数区，注意 `Shuffle` 是唯一不整段持锁的。
+ *
+ * ## 边界与陷阱
+ *
+ * - **与 Go 的随机序列不互通，这是设计使然而非缺陷**：Go 1.23 的默认源是运行时
+ *   ChaCha8（`runtimeSource`），兼容旧值的 `rngSource` 则是 lagged-Fibonacci；
+ *   本模块是 xoshiro256**。同一个 `Seed(42)` 在 Go 与本模块会得到不同序列，
+ *   因此**不存在**跨语言的 golden vector。只保证 API 语义与分布一致。
+ *   Go 自己也在 1.20+ 改过默认播种行为，跨版本序列同样不保证，所以这不是本模块的欠账。
+ * - 实例 `Rand` 不加锁：多线程共享必须外部同步；全局函数才加锁（对齐 Go 的
+ *   「顶层函数并发安全、`*Rand` 实例不安全」划分）。
+ * - `Read` 每次只取 7 字节（Go 的 `readPos` 从 7 递减到 0），未用完的字节跨调用保留；
+ *   改成 8 字节会改变随机流消耗，与 Go 的 `readVal/readPos` 语义脱节。
+ * - `NormFloat64` 缓存第二个 Box–Muller 结果；`Seed` 必须清缓存，否则重新播种后的
+ *   第一个正态值来自旧状态。
  */
 
 #pragma once
@@ -85,6 +118,16 @@ using byte = std::uint8_t;
  * @details 只提供 `Read` 需要的接口：`data()`、`size()`、`operator[]`、迭代器。
  *          支持从指针+长度、C 数组、`std::vector`、`std::array` 构造。
  *          生命周期与底层容器一致，**不拥有**数据。
+ *
+ * ## 定位
+ *
+ * `Rand::Read` / 全局 `Read` 的参数类型；仅为避开 C++17 缺少 `std::span` 而存在。
+ *
+ * ## 不变量
+ *
+ * - `m_data` 要么为空、要么指向至少 `m_size` 个可写元素；本类不校验，责任在构造方。
+ * - `m_size == 0` 时 `begin() == end()`，`Read` 不消耗随机数。
+ * - 不延长底层容器的生命周期：容器析构后继续使用本视图是悬垂访问。
  */
 template <typename T>
 class span final {
@@ -134,6 +177,19 @@ using ByteSpan = span<byte>;
  * @details **不是**线程安全的；多个线程共享同一实例需要外部同步（与 Go 一致）。
  *          拷贝会复制完整状态（包括 `Read` 的未用完字节），因此拷贝后的两个实例
  *          会产生相同序列。
+ *
+ * ## 定位
+ *
+ * 实例形态的生成器，供需要「私有可复现序列」的调用方使用（例如每个测试用例、
+ * 每个 worker 各自持有一个）。`src/math/rand.cpp` 的全局函数区把它包在
+ * `std::mutex` 后面，模拟 Go 顶层函数的并发安全。
+ *
+ * ## 不变量
+ *
+ * - `m_state` 四字不全为零（`Seed` 显式兜底），否则 xoshiro 会退化为恒零输出。
+ * - `m_read_pos ∈ [0, 7]`：0 表示需要重新抽取 `m_read_val`，7 表示刚抽满 7 个待用字节。
+ * - `m_has_norm_cache == false` 时 `m_norm_cache` 无意义；`Seed` 二者一并清零。
+ * - 同一实例的两个副本状态相同（拷贝即复制全部私有成员），因此序列相同。
  */
 class Rand final {
 public:

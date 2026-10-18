@@ -13,6 +13,32 @@
  *
  * @author Go2Cpp project
  * @date 2026-10-18
+ *
+ * ## 模块定位
+ *
+ * `go2cpp_rand` library target 的唯一实现单元，向上支撑 `include/go2cpp/math/rand.hpp`。
+ * 纯计算：不依赖 error、调度器或 IO，可脱离运行时使用。
+ *
+ * ## 本文件定义什么
+ *
+ * - 匿名命名空间的 `Rotl` / `SplitMix64` / `EntropySeed` / `GlobalMutex` / `GlobalRand`：
+ *   xoshiro 的旋转、播种、全局实例与它的锁；
+ * - `Rand` 的成员实现：状态推进、拒绝采样、浮点与分布变换、`Read` 的字节缓冲；
+ * - 全局函数：对同一把进程级互斥锁逐个加锁后转调实例方法。
+ *
+ * ## 阅读建议
+ *
+ * 先看 `Uint64`（xoshiro 的六步状态推进，顺序不能动），再看 `Seed`（splitmix64 扩散 +
+ * 全零兜底），然后看 `Int63n`/`Int31n` 的拒绝采样，最后看 `Read` 的 7 字节规则。
+ * 全局函数区是机械转调，扫一眼即可。
+ *
+ * ## 边界与陷阱
+ *
+ * - `Uint64` 的六行状态更新**不能重排**：xoshiro 的参考实现依赖逐行覆盖，
+ *   任何「看起来等价」的合并都会改变序列。
+ * - 全局函数共用同一把 `std::mutex`，彼此之间**不可重入**；`Shuffle` 故意不整段持锁，
+ *   否则用户在 `swap` 回调里再调 `rand.Intn` 会自锁。
+ * - 本文件的序列与 Go 不互通（见头文件「边界与陷阱」），不要拿 Go 的输出做基准断言。
  */
 
 #include "go2cpp/math/rand.hpp"
@@ -76,30 +102,58 @@ Rand& GlobalRand() {
 
 Rand::Rand(std::uint64_t seed) noexcept { Seed(seed); }
 
+/**
+ * @brief 用 splitmix64 把 64 位种子扩散成四个状态字，并清空所有缓冲。
+ *
+ * ## 步骤
+ * step1. 对同一个局部状态 `x` 连续调用四次 `SplitMix64`，依次写入 `m_state[0..3]`；
+ *        （不能对每个字都用原始种子，否则状态字高度相关）
+ * step2. 兜底：若四字全零则改写 `m_state[0]`。xoshiro 要求状态非零，而 splitmix64
+ *        的输出在理论上可能连续四个 0；
+ * step3. 清空 `Read` 的未用完字节与 Box–Muller 缓存 —— 重新播种后旧缓存必须失效，
+ *        否则第一个正态值会来自旧状态。
+ */
 void Rand::Seed(std::uint64_t seed) noexcept {
+    // step1: splitmix64 连续扩散四次。
     std::uint64_t x = seed;
     for (auto& word : m_state) {
         word = SplitMix64(x);
     }
-    // xoshiro 要求状态不能全零（概率极低，但 splitmix64 的输出序列在理论上可能
-    // 连续四个 0；显式兜底，避免生成器退化为恒零）。
+    // step2: xoshiro 要求状态不能全零；显式兜底，避免生成器退化为恒零。
     if ((m_state[0] | m_state[1] | m_state[2] | m_state[3]) == 0) {
         m_state[0] = 0x9e3779b97f4a7c15ULL;
     }
+    // step3: 清空 Read 缓冲与正态缓存。
     m_read_val = 0;
     m_read_pos = 0;
     m_norm_cache = 0.0;
     m_has_norm_cache = false;
 }
 
+/**
+ * @brief 推进一步 xoshiro256** 并返回 64 位输出。
+ *
+ * ## 步骤
+ * step1. 先用**旧状态**算出 `result = rotl(s[1] * 5, 7) * 9`（** 输出函数）；
+ * step2. 记下 `t = s[1] << 17`，它要在状态推进的后半段才参与异或；
+ * step3. 依次执行 `s[2]^=s[0]`、`s[3]^=s[1]`、`s[1]^=s[2]`、`s[0]^=s[3]` ——
+ *        必须逐行覆盖、顺序固定，合并或重排都会改变序列；
+ * step4. `s[2]^=t`、`s[3]=rotl(s[3],45)` 完成本轮推进。
+ *
+ * ## 并发/失败语义
+ * 无锁、无分配、不抛异常；并发调用同一实例是数据竞争（见类注释）。
+ */
 std::uint64_t Rand::Uint64() noexcept {
-    // xoshiro256** 1.0 的 next()（逐行对照官方参考实现）。
+    // step1: 用旧状态产出结果（** 输出）。
     const std::uint64_t result = Rotl(m_state[1] * 5, 7) * 9;
+    // step2: 先保存 t，后半段才用。
     const std::uint64_t t = m_state[1] << 17;
+    // step3: 四步交叉异或，逐行对照官方 next()。
     m_state[2] ^= m_state[0];
     m_state[3] ^= m_state[1];
     m_state[1] ^= m_state[2];
     m_state[0] ^= m_state[3];
+    // step4: 补上 t 与最后一次旋转。
     m_state[2] ^= t;
     m_state[3] = Rotl(m_state[3], 45);
     return result;
@@ -124,22 +178,37 @@ std::int64_t Rand::Int() noexcept {
     return Int63();
 }
 
+/**
+ * @brief 返回 `[0, n)` 的均匀整数（63 位版）。
+ *
+ * ## 步骤
+ * step1. 校验 `n > 0`，否则抛 `std::invalid_argument`（对应 Go 的 panic）；
+ * step2. `n` 是 2 的幂时直接 `Int63() & (n-1)` —— 掩码天然均匀，省掉取模；
+ * step3. 否则算上限 `max = (2^63-1) - (2^63 mod n)`，只接受 `<= max` 的样本；
+ * step4. 对接受的样本取 `% n` 返回。
+ *
+ * ## 为什么必须拒绝采样
+ * `Int63() % n` 在 `n` 不整除 2^63 时会偏向小余数；Go 的实现同样拒绝尾部样本。
+ * 拒绝概率 < 0.5，期望迭代次数 < 2。
+ */
 std::int64_t Rand::Int63n(std::int64_t n) {
+    // step1: 参数校验。
     if (n <= 0) {
         throw std::invalid_argument("rand.Int63n: n must be positive");
     }
-    // 2 的幂直接掩码；Go 的实现也是这条快速路径。
+    // step2: 2 的幂走掩码快速路径（Go 的实现相同）。
     if ((n & (n - 1)) == 0) {
         return Int63() & (n - 1);
     }
+    // step3: 拒绝采样区间，保证取模后均匀。
     const std::uint64_t un = static_cast<std::uint64_t>(n);
-    // 拒绝采样：只接受 <= (2^63-1) - (2^63 mod n) 的值，保证取模后均匀。
     const std::int64_t max_value = static_cast<std::int64_t>(
         (std::uint64_t{1} << 63) - 1ULL - ((std::uint64_t{1} << 63) % un));
     std::int64_t value = Int63();
     while (value > max_value) {
         value = Int63();
     }
+    // step4: 取模得到结果。
     return value % n;
 }
 
@@ -193,21 +262,36 @@ float Rand::Float32() noexcept {
     }
 }
 
+/**
+ * @brief 标准正态分布（Box–Muller，成对产出并缓存第二个）。
+ *
+ * ## 步骤
+ * step1. 若缓存有效，取走缓存并清除标记 —— 一次 Box–Muller 产出两个值，这是第二个；
+ * step2. 抽 `u1` 并拒绝 `u1 <= 0`：`Float64()` 可能返回 0，而 `log(0) = -Inf`；
+ * step3. 抽 `u2`，算半径 `sqrt(-2 ln u1)` 与角度 `2π u2`；
+ * step4. `cos` 分量立即返回，`sin` 分量存入 `m_norm_cache` 并置位标记。
+ *
+ * ## 边界
+ * 只保证**分布**与 Go 一致（标准正态），不逐位一致：Go 用 ziggurat，本实现用 Box–Muller。
+ * `Seed()` 会清空缓存，否则重新播种后的第一个值来自旧状态。
+ */
 double Rand::NormFloat64() noexcept {
-    // Box–Muller：两个独立的 U(0,1) 生成一对标准正态值，缓存第二个。
-    // 拒绝 u1 == 0（Float64 可以返回 0，而 log(0) = -Inf）。
+    // step1: 命中缓存直接返回。
     if (m_has_norm_cache) {
         m_has_norm_cache = false;
         return m_norm_cache;
     }
+    // step2: u1 必须 > 0。
     double u1 = 0.0;
     do {
         u1 = Float64();
     } while (u1 <= 0.0);
+    // step3: 半径与角度。
     const double u2 = Float64();
     constexpr double kTwoPi = 6.283185307179586476925286766559;
     const double radius = std::sqrt(-2.0 * std::log(u1));
     const double angle = kTwoPi * u2;
+    // step4: 缓存 sin 分量，返回 cos 分量。
     m_norm_cache = radius * std::sin(angle);
     m_has_norm_cache = true;
     return radius * std::cos(angle);

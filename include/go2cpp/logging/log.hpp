@@ -4,6 +4,37 @@
 // 日志模块只依赖 C++17 标准库，借助 Filter、Formatter、Worker、Sink 四层
 // 组合实现扩展。这样既能独立使用，也能通过 CallbackSink 接入 spdlog/fmt。
 
+/**
+ * @brief 轻量日志接口（Filter / Formatter / Worker / Sink 四层组合）。
+ *
+ * ## 模块定位
+ * 日志模块对外的唯一入口头：只依赖 C++17 标准库，通过 Filter、Formatter、
+ * Worker、Sink 四层组合实现扩展；`CallbackSink` 可把日志转发给 spdlog/fmt。
+ *
+ * ## 本文件定义什么
+ * - `Level` / `LogRecord` / `LogFilter` / `MinimumLevelFilter`；
+ * - `LogFormatter` / `LogFormatter::Item` / `PatternFormatter`（占位符模式）；
+ * - `LogSink` 与内置 Sink：`FileSink` / `RotatingFileSink` / `StdoutSink` /
+ *   `StderrSink` / `MemorySink` / `CallbackSink`，以及批量装饰器 `BufferedSink`；
+ * - `LogItemWorker` / `Logger` / `LoggerManager` / `LogLine` 与 `GO2CPP_LOG_*` 宏。
+ *
+ * ## 阅读建议
+ * 先看 `LogItemWorker::Submit()` 的三字段快照（热路径只做一次原子读），
+ * 再看 `BufferedSink` 的刷新策略与「两把锁不嵌套」的设计，最后看 `Logger::Log()`
+ * 的 worker 分发与父记录器传播。
+ *
+ * ## 边界与陷阱
+ * - **`bufio::Writer` 不自动 Flush 是刻意一致的语义**：日志的 `BufferedSink` 同样只在
+ *   容量/时间条件满足或显式 `Flush()` 时刷盘；不要假设「写完就落盘」，进程崩溃前
+ *   必须 `Flush()`（`LoggerManager::Flush()` 会遍历所有 Logger）；
+ * - **不要在持锁期间打日志**：`fprintf`/`std::ostream` 自身会加锁并可能触发刷盘，
+ *   在锁内调用会把「业务锁 -> stdio 锁 -> 磁盘 IO」串成一条链，放大临界区，
+ *   还可能与正在刷盘的线程互等。本模块的 Sink 在锁内只做 `write`/`append`，
+ *   刷盘放在锁外或交给调用方的显式 `Flush()`；
+ * - `BufferedSink::kByTime` 是**惰性检查**：长时间没有日志时缓冲不会自动刷出；
+ * - 批量写时 `WriteRaw` 的 `LogRecord` 上下文只保留最后一条（见 `BufferedSink` 注释）；
+ * - `LogLine` 在析构时提交，且吞掉所有异常（日志失败不能影响业务）。
+ */
 #include <chrono>
 #include <ctime>
 #include <cstdint>
@@ -349,6 +380,19 @@ private:
 };
 
 /** @brief 写入普通文件的 Sink，使用互斥锁保护流对象。 */
+/**
+ * @brief 写入普通文件的 Sink，使用互斥锁保护流对象。
+ *
+ * ## 定位
+ * 默认输出目标（`LoggerManager` 为每个 Logger 建一个）；`RotatingFileSink` 在它
+ * 之上加滚动。`m_mutex` 串行化同一文件的写入。
+ *
+ * ## 不变量
+ * - 锁内只做一次 `stream->write()`，不做额外 IO；
+ * - `Warn` 及以上在写完后立即 `flush()`（保证错误日志能被外部收集器马上读到），
+ *   `Info`/`Debug` 留在流缓冲里，避免高吞吐退化成每条一次 flush；
+ * - `Reopen()` 失败后 `m_stream == nullptr`，后续 `Write` 直接丢弃。
+ */
 class FileSink : public LogSink {
 public:
     /** @brief 创建文件输出。@param path 日志文件路径。 */
@@ -363,12 +407,26 @@ public:
     const std::string& path() const noexcept { return m_path; }
 
 protected:
+    /// 日志文件路径；构造时固定，Reopen()/path() 使用。
     std::string m_path;
     std::mutex m_mutex;
+    /// 输出流；Reopen() 创建/替换，Write/Flush 使用，失败时为 nullptr。
     std::unique_ptr<std::ostream> m_stream;
 };
 
 /** @brief 达到容量上限后滚动备份文件的文件 Sink。 */
+/**
+ * @brief 达到容量上限后滚动备份文件的文件 Sink。
+ *
+ * ## 定位
+ * 需要按大小归档的日志文件（生产常用）；继承 `FileSink` 的锁与流管理。
+ *
+ * ## 不变量
+ * - `m_bytes` 是当前文件的**近似**字节数（构造时用 `file_size` 初始化，保证重启后
+ *   不会先突破 `max_bytes`）；
+ * - 滚动时先关闭流、从高到低重命名备份、再重建文件；
+ * - 单条记录超过 `max_bytes` 时仍会写入（滚动后从空文件开始，不会无限重试）。
+ */
 class RotatingFileSink final : public FileSink {
 public:
     /**
@@ -383,8 +441,11 @@ public:
     void Write(const LogRecord& record, std::string_view formatted) override;
 
 private:
+    /// 单文件字节上限；Write 判断是否滚动（0 表示不滚动）。
     std::size_t m_max_bytes;
+    /// 保留的备份数量；滚动时重命名 .1...N。
     std::size_t m_max_files;
+    /// 当前文件近似字节数；构造用 file_size 初始化，Write 累加、滚动清零。
     std::size_t m_bytes{0};
 };
 
@@ -442,6 +503,16 @@ private:
  * @brief 组合 Filter、Formatter、Sink 的日志工作单元。
  * @details Submit() 对单条记录执行过滤、格式化和输出；配置快照以共享指针
  *          原子替换，避免日志热路径长时间持有配置锁。
+ *
+ * ## 定位
+ * 被 `Logger` 的 worker 列表持有，是「过滤 -> 格式化 -> 写 Sink」的一次完整流水线；
+ * `LoggerManager` 为每个 Logger 建默认 worker（FileSink + 可选 StdoutSink）。
+ *
+ * ## 不变量
+ * - 热路径只做一次 `atomic_load` 拿快照，配置变更走「复制-替换」（见 .cpp）；
+ * - `Submit()` **不在锁内**调用用户 Formatter/Sink，避免自定义 Sink 再次打日志时
+ *   递归锁死；
+ * - 过滤未通过时返回 false 且不格式化（省掉字符串构造）。
  */
 class LogItemWorker {
 public:
@@ -480,6 +551,15 @@ private:
  * @brief 同名日志记录器。
  * @details 管理多个 LogItemWorker、日志级别和可选父记录器；Log() 只负责
  *          分发，具体输出由工作单元完成。
+ *
+ * ## 定位
+ * 同名日志记录器：持有多个 worker，按级别过滤后分发；`LoggerManager::Get()` 创建，
+ * `GO2CPP_LOG_*` 宏通过 `LogLine` 间接使用它。
+ *
+ * ## 不变量
+ * - `m_level` 是原子量，`ShouldLog()` 无锁读；
+ * - `m_worker_snapshot` 是原子共享指针，配置变更时整体替换，日志线程无锁读取；
+ * - 只有 `m_propagate` 为真且父记录器仍存活（`weak_ptr` 未过期）才向上传播。
  */
 class Logger final : public std::enable_shared_from_this<Logger> {
 public:
@@ -520,19 +600,34 @@ public:
     void Log(LogRecord record) const;
 
 private:
+    /// 记录器名；构造时固定，name()/LogRecord.logger 使用。
     std::string m_name;
     mutable std::mutex m_mutex;
     std::atomic<Level> m_level{Level::Warn};
     std::vector<LogItemWorker::ptr> m_workers;
     std::vector<LogItemWorker::ptr> m_default_workers;
     std::vector<LogItemWorker::ptr> m_custom_workers;
+    /// 父记录器（弱引用，避免环）；SetParent 写，Log 传播时读。
     std::weak_ptr<Logger> m_parent;
     std::atomic<bool> m_propagate{false};
     // m_workers 只在配置时修改；日志线程通过原子快照无锁读取。
+    /// worker 列表快照；配置变更时整体替换，Log/Flush 原子读取。
     std::shared_ptr<const std::vector<LogItemWorker::ptr>> m_worker_snapshot;
 };
 
 /** @brief 全局 Logger 注册表及默认输出配置管理器。 */
+/**
+ * @brief 全局 Logger 注册表及默认输出配置管理器。
+ *
+ * ## 定位
+ * 进程级单例（`Instance()`）：维护 Logger 注册表、根记录器与默认配置
+ * （级别/是否 stdout/目录/文件名/格式）。
+ *
+ * ## 不变量
+ * - 注册表操作全部在 `m_mutex` 内；
+ * - `Configure()` 会重建每个 Logger 的默认 worker（已有的自定义 worker 保留）；
+ * - 根 Logger 不可删除（`Remove("root")` 被忽略）。
+ */
 class LoggerManager final {
 public:
     /** @brief 返回进程内唯一的 LoggerManager。 */
@@ -557,12 +652,17 @@ public:
 private:
     LoggerManager();
     mutable std::mutex m_mutex;
+    /// 已注册 Logger；Get/Remove/List 在 m_mutex 内读写。
     std::vector<Logger::ptr> m_loggers;
+    /// 根记录器；构造时创建，其它 Logger 默认以它为父。
     Logger::ptr m_root;
     Level m_level{Level::Warn};
     bool m_stdout_enabled{false};
+    /// 默认日志目录；Configure 写，Get 拼文件路径。
     std::string m_directory{"log"};
+    /// 默认文件名；Configure 写，Get 拼文件路径。
     std::string m_file{"go2cpp.log"};
+    /// 默认格式模式；为空时用 PatternFormatter 的内置默认值。
     std::string m_pattern;
 };
 
@@ -570,6 +670,15 @@ private:
  * @brief 流式日志临时对象。
  * @details 构造时记录调用位置，析构时将 stream() 中的文本提交给 Logger；
  *          级别被过滤时 stream 仍可安全使用但不会产生输出。
+ *
+ * ## 定位
+ * `GO2CPP_LOG_INFO(logger) << ...` 的临时对象：构造时抓时间/线程/位置，析构时
+ * 把流里的文本提交给 Logger。
+ *
+ * ## 不变量
+ * - 级别被过滤时 `m_enabled == false`，流仍可写但析构不提交；
+ * - 析构是 `noexcept` 且内部 `try/catch(...)`，日志异常绝不外泄；
+ *   因此不要在日志表达式里做有副作用且可能抛异常的重要操作。
  */
 class LogLine final {
 public:
@@ -582,9 +691,12 @@ public:
     std::ostream& stream() noexcept { return m_stream; }
 
 private:
+    /// 目标记录器；构造时绑定，析构时提交。
     Logger::ptr m_logger;
+    /// 构造时填好级别/位置/时间，析构前补 message。
     LogRecord m_record;
     std::ostringstream m_stream;
+    /// 级别是否通过；false 时析构不提交（但流仍可写）。
     bool m_enabled{false};
 };
 

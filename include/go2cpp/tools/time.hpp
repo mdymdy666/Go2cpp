@@ -24,6 +24,30 @@
  *       - `After`/`Tick`/`Ticker`/`Timer`（需要与 `Channel<Time>` 和 `core::TimerService` 对接）
  *         本轮未实现，见文件末尾的待办说明；
  *       - 未实现 `Parse`/`Format`/`LoadLocation`/`Duration.Parse`。
+ *
+ * ## 模块定位
+ *
+ * `tools` 的时间语义层：提供 Go 风格的 `Duration`/`Time`/`Sleep`，供业务代码
+ * 与需要「同机单调计时 + 墙钟显示」的模块使用。下游只依赖 C++ 标准库与
+ * 项目 Hook 对 `nanosleep` 的拦截。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Duration`：强类型 int64 纳秒 + Go 格式的 `String()`；
+ * - `Time`：墙钟 + 单调读数的双时间戳，`Sub`/`Before`/`After` 优先单调；
+ * - 单位常量 `Nanosecond` ~ `Hour`；
+ * - `Since`/`Until`/`Sleep`。
+ *
+ * ## 阅读建议
+ *
+ * 先读 `Duration::String` 的 4 个步骤（Go 的格式算法），再看 `Time` 的
+ * 双时间戳不变量，最后看 `Sleep` 依赖 Hook 的协作式语义。
+ *
+ * ## 边界与陷阱
+ *
+ * `Sleep` 在非 Hook/非 Fiber 上下文会真的睡线程；`Time::String()` 是简化
+ * 形式、不实现 Go 布局串；`Equal` 只用墙钟，`Sub`/`Before`/`After` 优先
+ * 单调读数。
  */
 
 #pragma once
@@ -44,6 +68,15 @@ namespace go2cpp::time {
 /**
  * @brief 对应 `time.Duration`。
  * @details 单位与 Go 一致：底层是 **int64 纳秒**；`String()` 输出 Go 的紧凑形式。
+ *
+ * ## 定位
+ * `time` 模块的时长类型：运算、单位换算与格式化；被 `Time::Add/Sub`、
+ * `Sleep` 及业务超时参数使用。
+ *
+ * ## 不变量
+ * - `m_nanoseconds` 是唯一状态，所有运算返回新值、不修改自身；
+ * - 单位换算按整数除法向零截断（与 Go 一致）；
+ * - `Truncate`/`Round` 的 `unit == 0` 时原样返回。
  */
 class Duration final {
 public:
@@ -104,7 +137,15 @@ public:
         return truncated;
     }
 
-    /// 对应 `Duration.String()`（格式算法逐分支对照 Go 的 `Duration.format`）。
+    /**
+     * @brief 对应 `Duration.String()`（格式算法逐分支对照 Go 的 `Duration.format`）。
+     *
+     * ## 步骤
+     * step1. 取绝对值并记录符号；
+     * step2. `< 1s`：按 ns/µs/ms 选精度，`AppendFraction` 输出小数部分；
+     * step3. `>= 1s`：秒带最多 9 位小数，再补 `m`/`h`；
+     * step4. 反转逆序累积的 digits，拼上符号与后缀。
+     */
     std::string String() const {
         constexpr std::int64_t kSecond = 1000000000LL;
         constexpr std::int64_t kMillisecond = 1000000LL;
@@ -117,6 +158,7 @@ public:
         std::string digits;                     // 逆序累积，最后翻转
         std::string suffix;
 
+        // step2: 小于 1 秒，按 ns/µs/ms 选精度
         if (value < static_cast<std::uint64_t>(kSecond)) {
             int precision = 0;
             if (value == 0) return "0s";
@@ -133,6 +175,7 @@ public:
             value = AppendFraction(digits, value, precision);
             AppendInteger(digits, value);      // Go 在 fmtFrac 之后还会调用 fmtInt 补整数部分
         } else {
+            // step3: 秒级：9 位小数 + 秒/分/时
             suffix = "s";
             value = AppendFraction(digits, value, 9);       // 秒带最多 9 位小数
             AppendInteger(digits, value % 60);              // 整数秒
@@ -148,6 +191,7 @@ public:
             }
         }
 
+        // step4: 反转 digits 并拼符号/后缀
         std::string out;
         if (negative) out.push_back('-');
         for (auto it = digits.rbegin(); it != digits.rend(); ++it) out.push_back(*it);
@@ -197,6 +241,7 @@ private:
     /// 把 `value / 10^precision` 的小数部分（去掉尾随零、必要时含小数点）追加到 `digits`，
     /// 返回剩下的小数位（即整数部分）。对应 Go 的 `fmtFrac`。
     static std::uint64_t AppendFraction(std::string& digits, std::uint64_t value, int precision) {
+        // 从最低位向上累积小数位，去掉尾随零；printing 为真后才开始输出。
         bool printing = false;
         for (int i = 0; i < precision; ++i) {
             const std::uint64_t digit = value % 10;
@@ -220,7 +265,7 @@ private:
         }
     }
 
-    std::int64_t m_nanoseconds{0};
+    std::int64_t m_nanoseconds{0}; ///< 时长（纳秒）；构造/运算写入，所有取值接口读取
 };
 
 /// 对应 Go 的 `2 * time.Second` 写法（Go 允许整数在左、Duration 在右）。
@@ -246,6 +291,19 @@ inline constexpr Duration Hour{std::int64_t{3600} * 1000000000LL};
  *          （`steady_clock`，用于 `Sub`/`Since`）—— 与 Go 的 `Time` 同时带 wall/ext 字段同理，
  *          这样系统时钟被调整时 `Since` 仍然单调。
  * @note `IsZero()` 对应 Go 的零值判断（Go 的零 Time 是 1 年 1 月 1 日 00:00:00 UTC）。
+ *
+ * ## 定位
+ * `time` 模块的时间点类型：同时携带墙钟与单调读数，供超时、耗时统计与
+ * 日志时间戳使用。
+ *
+ * ## 生命周期与线程模型
+ * 纯值类型，可拷贝；不可变语义（所有修改返回新对象）。不提供线程安全承诺，
+ * 但拷贝/只读可并发。
+ *
+ * ## 不变量
+ * - `m_has_monotonic` 为真时 `m_monotonic` 有效；`From*`/默认构造为假；
+ * - `m_is_zero` 只对默认构造为真；`Time()` 与 Unix 0 不是同一概念；
+ * - `Equal` 只比较墙钟；`Sub`/`Before`/`After` 在双方都有单调读数时优先用它。
  */
 class Time final {
 public:
@@ -325,8 +383,17 @@ public:
     /// 返回底层 `system_clock` 时间点（便于与 C++ 生态互操作）。
     SystemClock::time_point ToSystemClock() const noexcept { return m_wall; }
 
-    /// 对应 `Time.String()` 的**简化形式**（见文件头边界说明）。
+    /**
+     * @brief 对应 `Time.String()` 的**简化形式**（见文件头边界说明）。
+     *
+     * ## 步骤
+     * step1. 取墙钟秒数与纳秒余数；
+     * step2. `gmtime_r` 拆成年月日时分秒；
+     * step3. 纳秒非零时追加 9 位小数并去掉尾随零；
+     * step4. 追加固定 `+0000` 时区。
+     */
     std::string String() const {
+        // step1: 秒 + 纳秒余数
         const std::time_t seconds = static_cast<std::time_t>(Unix());
         const std::int64_t nanos = UnixNano() - static_cast<std::int64_t>(seconds) * 1000000000LL;
         std::tm broken{};
@@ -335,6 +402,7 @@ public:
         std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d", broken.tm_year + 1900,
                       broken.tm_mon + 1, broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec);
         std::string out(buffer);
+        // step3: 可选小数秒
         if (nanos != 0) {
             char fraction[24];
             std::snprintf(fraction, sizeof(fraction), ".%09lld", static_cast<long long>(nanos));
@@ -343,6 +411,7 @@ public:
             if (digits == ".") digits.clear();
             out += digits;
         }
+        // step4: 固定 UTC 偏移
         out += " +0000";
         return out;
     }
@@ -388,6 +457,7 @@ inline Duration Until(const Time& deadline) { return deadline.Sub(Time::Now()); 
  *       已写入文件头边界；跨平台方面 `nanosleep` 是 POSIX 接口（本项目目标平台为 Linux）。
  */
 inline void Sleep(Duration duration) {
+    // 非正时长立即返回；Hook 启用时 nanosleep 会被转成协作式等待。
     if (duration <= Duration{}) return;                 // Go：非正时长立即返回
     const std::int64_t total = duration.Nanoseconds();
     timespec request{};

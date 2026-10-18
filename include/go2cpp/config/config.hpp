@@ -1,3 +1,42 @@
+/**
+ * @file include/go2cpp/config/config.hpp
+ * @brief 配置中心：INI 解析、类型安全的 ConfigVar、事务式热加载与运行时快照。
+ *
+ * ## 模块定位
+ *
+ * 位于**基础设施服务层**，向下只依赖 C++17 标准库与 `log`/`scheduler` 的类型；
+ * 向上被这些地方使用：
+ * - `BindRuntimeConfig` 把 `scheduler.*`、`timer.*` 接到 `RuntimeConfig`
+ *   （见 `example/config/runtime_config_full.cpp`）；
+ * - `BindLoggingConfig`/`LoadAndWatch` 把 `log.*` 接到 `log::LoggerManager`；
+ * - `src/network/hook.cpp` 的 `RegisterHookConfig` 用 `ConfigVar<bool>` 注册
+ *   `hook.*` 开关；
+ * - `src/os/config.cpp` 在静态初始化期注册 `os.*` 两项。
+ *
+ * ## 本文件定义什么
+ *
+ * - `IniFile`：section/key/value 解析与查询，不做类型转换、范围校验或同步；
+ * - `ValueCodec`：字符串与 bool/Level/vector 等类型的编解码；
+ * - `ConfigVarBase`/`ConfigVar<T>`：强类型、可校验、可监听、支持事务暂存的配置项；
+ * - `Config`：进程级注册表 + 文件监听 + 两阶段提交（预检→写入→统一通知）；
+ * - `RuntimeConfig`/`LoadRuntimeConfig`：调度器/日志/定时器阈值的只读快照；
+ * - `AutoConfigRegistrar`/`AutoConfigCanceller` 与注册/注销宏。
+ *
+ * ## 阅读建议
+ *
+ * 先看 `ConfigVar::ApplyString`/`NotifyPending`/`RollbackPending`，理解「为什么
+ * 热加载必须分两阶段」；再看 `Config::LoadFromIni` 的预检→写入→广播；最后看
+ * `StartWatcher` 的稳定快照与 `.lock` 协议。状态转化表见
+ * `docs/state-machines/Config.md`。
+ *
+ * ## 边界与陷阱
+ *
+ * - 配置文件是**外部输入**：范围上限集中在 `config.cpp` 的 `kMax*`，各模块不要放宽；
+ * - 监听器在配置锁外执行，允许回调再次读/提交配置；单个监听器异常会被吞掉；
+ * - `DumpIni` 会转义换行/制表符，但 `IniFile::Parse` 不做反向反转义 —— 含换行的值
+ *   导出再读回会得到字面量，这是已知的非往返点；
+ * - 静态注册发生在 `main` 之前，跨 TU 注销依赖初始化顺序，不可靠。
+ */
 #pragma once
 
 // 简单、可审查的 ini 配置。解析器只处理 section、key=value 和注释，避免
@@ -29,6 +68,17 @@ namespace go2cpp::config {
 // 轻量 INI 解析器。依赖标准文件流和字符串容器，为上层配置中心提供
 // section/key/value 查询；它不负责类型转换、范围校验或线程同步。
 /** @brief 简单 INI 文件解析器，负责 section/key/value 的读取与查询。 */
+/**
+ * ## 定位
+ * `Config::LoadFromIni` 与 `RuntimeConfig::FromIni` 的输入载体；也被 examples
+ * 用来从内存文本构造配置。它只负责**语法**，类型转换/范围校验由 ConfigVar 与
+ * RuntimeConfig 完成。
+ *
+ * ## 不变量
+ * - `Parse` 成功前不修改 `m_sections`：先解析到临时表，成功才 `swap`；
+ * - 节名缺 `]`、键名缺 `=`、空键名都直接失败并带行号；
+ * - 值在第一个 `#`/`;` 处截断，`\n` 转义在此被还原为换行。
+ */
 class IniFile final {
 public:
     // 从文件读取并解析配置。path 为 UTF-8 路径；成功返回 true，失败时
@@ -48,10 +98,21 @@ public:
 
 private:
     using Section = std::unordered_map<std::string, std::string>;
-    std::unordered_map<std::string, Section> m_sections;
+    std::unordered_map<std::string, Section> m_sections;  ///< 节/键/值表；Load/Parse 整体替换（swap），Get/Has 只读；无锁，调用方需自行同步
 };
 
 /** @brief 默认配置值与字符串之间的流式转换器。 */
+/**
+ * ## 定位
+ * `ConfigVar<T>` 的文本编解码策略：`ToString`/`ValidateString`/`FromString` 都经
+ * 由它。主模板面向可流式输入输出的标量，`std::string`/`bool`/`log::Level`/
+ * `std::vector<T>` 各有特化。
+ *
+ * ## 不变量
+ * - `Decode` 必须消费**整个**文本（`stream >> ws` 后要求 eof），否则 `"1x"` 会
+ *   被误读成 `1`；
+ * - `Decode` 失败不得修改输出参数；`Encode` 的结果必须能被同一 `Decode` 读回。
+ */
 template <typename T>
 struct ValueCodec {
     /** @brief 将配置值编码为文本。 */
@@ -127,6 +188,17 @@ struct ValueCodec<std::vector<T>> {
 // 配置变量的非模板接口。Config 中保存它的智能指针，热加载器通过本类
 // 完成枚举、字符串校验和写入，而具体类型由 ConfigVar<T> 提供。
 /** @brief 配置变量的非模板基类，提供统一字符串校验和加载接口。 */
+/**
+ * ## 定位
+ * `Config` 注册表用基类指针保存所有类型的变量，从而在不知道 `T` 的情况下完成
+ * 枚举、文本校验和事务提交。`LoadFromIni` 只通过这个接口工作。
+ *
+ * ## 不变量
+ * - 构造后 `name`/`description` 不再变化；
+ * - `HasPending`/`NotifyPending`/`RollbackPending` 必须成对使用：只有
+ *   `ApplyString` 成功且 `HasPending()` 为真的变量才能进入通知/回滚列表；
+ * - 事务接口只允许 `Config::LoadFromIni` 调用，普通调用方应使用 `FromString`。
+ */
 class ConfigVarBase {
 public:
     using ptr = std::shared_ptr<ConfigVarBase>;
@@ -161,8 +233,8 @@ public:
     virtual void RollbackPending() noexcept = 0;
 
 private:
-    std::string m_name;
-    std::string m_description;
+    std::string m_name;  ///< 完整名 module.key；构造后不变，name() 读取
+    std::string m_description;  ///< 人类可读说明；构造后不变，DumpIni 把它写成 # 注释
 };
 
 struct RuntimeConfig;
@@ -175,6 +247,28 @@ template <typename T>
  * @brief 线程安全的强类型配置变量。
  * @details Validator 在提交前校验，Listener 在成功变更后通知；值以共享
  *          指针原子发布，读操作不长时间持有配置锁。
+ */
+/**
+ * ## 定位
+ * 被 `Scheduler`（通过 `BindRuntimeConfig` 的监听器）、`log::LoggerManager`
+ * （`BindLoggingConfig`）、`src/network/hook.cpp` 的 `RegisterHookConfig` 与
+ * `src/os/config.cpp` 静态注册项使用；读取方通过 `GetValue()` 拿不可变快照。
+ *
+ * ## 生命周期与线程模型
+ * 通常由 `Config::Lookup<T>` 创建并持有，`Config` 析构时统一释放；外部可持有
+ * `shared_ptr`（`Remove` 是软注销）。`GetValue` 走原子 `shared_ptr` 读，不拿锁；
+ * `SetValue`/`ApplyString`/`NotifyPending` 用 `m_mutex` 串行化写入与通知快照。
+ *
+ * ## 状态机
+ * 单变量事务有 Idle / Pending 两个稳定状态与 Notified/RolledBack 两个出口，
+ * 完整转化表见 `docs/state-machines/Config.md`（触发函数：`ApplyString`、
+ * `NotifyPending`、`RollbackPending`、`SetValue`）。
+ *
+ * ## 不变量
+ * - `m_pending` 存在期间 `SetValue`/第二次 `ApplyString` 一律拒绝，避免两个事务
+ *   交错覆盖同一变量；
+ * - `m_value` 永远指向不可变对象，读方无需加锁；
+ * - 监听器在 `m_mutex` 释放后执行，且单个监听器异常不影响其余监听器。
  */
 class ConfigVar final : public ConfigVarBase {
 public:
@@ -380,22 +474,43 @@ private:
     struct PendingChange {
         // 保存旧快照而不是旧值副本，回滚时无需再次分配 T，能够在
         // bad_alloc 等异常路径下保持 noexcept 回滚的确定性。
-        std::shared_ptr<const T> old_value;
-        T new_value{};
+        std::shared_ptr<const T> old_value;  ///< 变更前值的不可变快照；ApplyString 写入，RollbackPending 原子恢复，NotifyPending 读取
+        T new_value{};  ///< 事务中待广播的新值；ApplyString 拷贝，NotifyPending 传给监听器
     };
-    mutable std::mutex m_mutex;
-    std::shared_ptr<const T> m_value;
-    std::map<std::uint64_t, Listener> m_listeners;
-    Validator m_validator;
-    Validator m_direct_validator;
-    std::atomic<std::uint64_t> m_next_listener{1};
-    std::optional<PendingChange> m_pending;
+    mutable std::mutex m_mutex;  ///< 保护 m_value/m_listeners/m_validator/m_direct_validator/m_pending；SetValue/ApplyString/NotifyPending 使用
+    std::shared_ptr<const T> m_value;  ///< 当前值的不可变快照；atomic_load/store 读写，GetValue 读路径不加锁
+    std::map<std::uint64_t, Listener> m_listeners;  ///< 监听器表（按 ID 升序）；AddListener/DelListener 与 SetValue/NotifyPending 快照使用
+    Validator m_validator;  ///< 事务/常规校验器；SetValidator 写，SetValue/ValidateString/ApplyString 读
+    Validator m_direct_validator;  ///< 仅单值直接更新使用的校验器；SetDirectValidator 写，SetValue 读
+    std::atomic<std::uint64_t> m_next_listener{1};  ///< 监听器 ID 分配器；AddListener fetch_add，ID 不复用
+    std::optional<PendingChange> m_pending;  ///< 事务暂存变更；ApplyString 置位，HasPending/NotifyPending/RollbackPending 读或清
 };
 
 /**
  * @brief 全局配置变量注册表和动态文件监听器。
  * @details 文件加载使用先校验后提交和 lock 文件协议，避免编辑中的半文件
  *          影响运行时配置。
+ */
+/**
+ * ## 定位
+ * 进程级配置注册表与热加载入口：`BindLoggingConfig`/`BindRuntimeConfig` 往这里
+ * 注册变量与监听器，examples/tests 用 `StartWatcher` 验证热更新，
+ * `src/network/hook.cpp` 通过 `Config::Instance()` 取得注册表。
+ *
+ * ## 生命周期与线程模型
+ * `Instance()` 是函数内静态对象，析构时 `StopWatcher()`；注册表读写由 `m_mutex`
+ * 保护，整批文件事务由 `m_transaction_mutex` 串行化。热加载线程只在本类内部创建，
+ * 监听器与提交回调都在**释放事务锁之后**执行。
+ *
+ * ## 状态机
+ * 文件事务有 Idle / Validating / Applying / Pending / Committed / RolledBack
+ * 六个状态，状态转化表见 `docs/state-machines/Config.md`（触发函数：
+ * `LoadFromIni`、`ApplyString`、`NotifyPending`、`RollbackPending`、`StartWatcher`）。
+ *
+ * ## 不变量
+ * - 一次 `LoadFromIni` 中，所有变量要么全部写入并广播，要么全部回滚；
+ * - 事务锁只保护预检+写入，**绝不**包住监听器回调；
+ * - `m_watching == true` 时 `m_watcher` 一定是可 join 的线程（除非在自身线程内停止）。
  */
 class Config final {
 public:
@@ -504,21 +619,21 @@ private:
     Config() = default;
     ~Config();
     void stop_watcher_locked() noexcept;
-    mutable std::mutex m_mutex;
+    mutable std::mutex m_mutex;  ///< 保护 m_vars/m_commit_listeners/m_transaction_validators；Lookup/List/Groups/Add* 使用
     // 文件事务锁串行化多个 LoadFromIni/LoadFromFile 调用，保证不同线程
     // 不会交错写入同一批 ConfigVar 并互相覆盖暂存通知。
-    mutable std::mutex m_transaction_mutex;
-    std::unordered_map<std::string, ConfigVarBase::ptr> m_vars;
-    std::map<std::uint64_t, CommitListener> m_commit_listeners;
-    std::atomic<std::uint64_t> m_next_commit_listener{1};
-    std::map<std::uint64_t, TransactionValidator> m_transaction_validators;
-    std::atomic<std::uint64_t> m_next_transaction_validator{1};
-    std::atomic<bool> m_watching{false};
+    mutable std::mutex m_transaction_mutex;  ///< 串行化整批 LoadFromIni/LoadFromFile；保证预检与提交不被其他事务交错
+    std::unordered_map<std::string, ConfigVarBase::ptr> m_vars;  ///< 完整名到变量的注册表；Lookup/LookupBase/List/Remove/Groups 使用
+    std::map<std::uint64_t, CommitListener> m_commit_listeners;  ///< 事务提交后的扩展回调；Add/DelCommitListener 与 LoadFromIni 的快照使用
+    std::atomic<std::uint64_t> m_next_commit_listener{1};  ///< 提交监听器 ID 分配器；AddCommitListener fetch_add
+    std::map<std::uint64_t, TransactionValidator> m_transaction_validators;  ///< 跨字段候选快照校验器；Add/DelTransactionValidator 与 LoadFromIni 使用
+    std::atomic<std::uint64_t> m_next_transaction_validator{1};  ///< 事务校验器 ID 分配器；AddTransactionValidator fetch_add
+    std::atomic<bool> m_watching{false};  ///< 监听线程运行标志；StartWatcher 置 true，stop_watcher_locked 置 false，Watching 读取
     // 保护 std::thread 对象本身；配置值读取不使用这把生命周期锁。
-    mutable std::mutex m_watcher_lifecycle_mutex;
-    mutable std::mutex m_watcher_mutex;
-    std::condition_variable m_watcher_cv;
-    std::thread m_watcher;
+    mutable std::mutex m_watcher_lifecycle_mutex;  ///< 保护 m_watcher 的创建/停止；StartWatcher/StopWatcher/析构使用
+    mutable std::mutex m_watcher_mutex;  ///< 配合 m_watcher_cv 等待刷新周期；监听线程与 stop_watcher_locked 使用
+    std::condition_variable m_watcher_cv;  ///< 停止监听时立即唤醒等待中的监听线程；只在启停路径 notify_all
+    std::thread m_watcher;  ///< 后台监听线程；StartWatcher 创建，stop_watcher_locked join 或 detach
 };
 
 // 把配置中心的动态变量接到 LoggerManager。config 为注册表；error 可为空。
@@ -543,17 +658,28 @@ inline bool LoadAndWatch(Config& config, const std::string& path,
 }
 
 /** @brief 调度器、栈和日志的统一运行时配置快照。 */
+/**
+ * ## 定位
+ * 启动路径与热更新共用的**只读参数快照**：`LoadRuntimeConfig`/`FromIni` 负责
+ * 构造，`Validate` 负责范围检查，`ApplyLogging` 把日志字段推给
+ * `log::LoggerManager`。`BindRuntimeConfig` 则把其中字段绑定为可变监听目标。
+ *
+ * ## 不变量
+ * - `Validate()` 返回 true 后，调度器/日志/定时器字段都处于文档允许的范围；
+ * - `FromIni` 在副本上构造，失败不改动传入对象；
+ * - `ApplyLogging` 只改全局 LoggerManager，不触碰调度器。
+ */
 struct RuntimeConfig final {
-    scheduler::SchedulerConfig scheduler{};
-    log::Level log_level{log::Level::Warn};
-    bool log_stdout{false};
-    std::string log_directory{"log"};
-    std::string log_file{"go2cpp.log"};
-    std::string log_format{"{time} [{level}] {logger} ({file}:{line}) {message}\n"};
+    scheduler::SchedulerConfig scheduler{};  ///< 调度器参数子结构；FromIni/Validate 读写，BindRuntimeConfig 把监听器接到各字段
+    log::Level log_level{log::Level::Warn};  ///< 日志最低级别快照；FromIni 解析，ApplyLogging 应用
+    bool log_stdout{false};  ///< 是否同时输出 stdout；FromIni 解析，ApplyLogging 应用
+    std::string log_directory{"log"};  ///< 日志目录；FromIni 覆盖，ApplyLogging 传给 LoggerManager
+    std::string log_file{"go2cpp.log"};  ///< 日志文件名；FromIni 覆盖，ApplyLogging 传给 LoggerManager
+    std::string log_format{"{time} [{level}] {logger} ({file}:{line}) {message}\n"};  ///< PatternFormatter 模式；FromIni 覆盖，ApplyLogging 传给 LoggerManager
     /** @brief 定时器时长告警阈值，单位为天；0 关闭对应级别。 */
-    std::size_t timer_warn_after_days{30};
+    std::size_t timer_warn_after_days{30};  ///< 定时器 WARN 阈值（天，0 关闭）；FromIni/Validate 与 BindRuntimeConfig 的 timer 监听器使用
     /** @brief 定时器时长错误阈值，单位为天；0 关闭对应级别。 */
-    std::size_t timer_error_after_days{365};
+    std::size_t timer_error_after_days{365};  ///< 定时器 ERROR 阈值（天，0 关闭）；FromIni/Validate 与 BindRuntimeConfig 的 timer 监听器使用
 
     // 从 INI 读取并校验运行时配置；失败时不修改 config。
     /** @brief 从 INI 构造配置快照但不修改外部对象。 */
@@ -591,6 +717,15 @@ std::string JoinConfigName(const std::string& module, const std::string& key);
  *          若同名已存在且类型不同，`Lookup` 返回空，此时本对象不持有任何东西。
  */
 template <typename T>
+/**
+ * ## 定位
+ * 静态注册宏 `GO2CPP_CONFIG_REGISTER` 的载体：在 `main` 之前调用
+ * `Config::Lookup<T>` 把配置项放进注册表。
+ *
+ * ## 不变量
+ * - 构造期间绝不抛异常（静态初始化期异常会直接 terminate）；
+ * - `m_var` 为空表示类型冲突或注册异常，`registered()` 可查询。
+ */
 class AutoConfigRegistrar final {
 public:
     AutoConfigRegistrar(const char* module, const char* key, T default_value,
@@ -615,12 +750,20 @@ public:
     bool registered() const noexcept { return m_var != nullptr; }
 
 private:
-    std::string m_name;
-    std::shared_ptr<ConfigVar<T>> m_var;
+    std::string m_name;  ///< 完整名；构造时 JoinConfigName 生成，name() 读取
+    std::shared_ptr<ConfigVar<T>> m_var;  ///< 注册得到的变量；类型冲突或异常时为空，registered() 判断
 };
 
 /**
  * @brief 在**静态初始化期**注销一项配置（软注销，语义见 `Config::Remove`）。
+ */
+/**
+ * ## 定位
+ * 静态注销宏 `GO2CPP_CONFIG_CANCEL` 的载体，语义是 `Config::Remove` 的软注销。
+ *
+ * ## 不变量
+ * - 只影响当前翻译单元已注册的项；跨 TU 顺序不可靠；
+ * - 构造期间吞掉异常，`removed()` 表示是否真的删除。
  */
 class AutoConfigCanceller final {
 public:
@@ -640,7 +783,7 @@ public:
     bool removed() const noexcept { return m_removed; }
 
 private:
-    bool m_removed;
+    bool m_removed;  ///< 是否确实移除；构造时 Config::Remove 的结果，removed() 读取
 };
 
 // 用 __LINE__ 保证同一 `key` 在多处注册时不重名。

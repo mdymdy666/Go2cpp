@@ -35,6 +35,39 @@
  *       - 模板式 `Heap` **不**参与接口式自由函数（它的成员 `Push`/`Pop` 已自带 sift，
  *         再套自由函数虽然幂等但语义混乱）；两套 API 请勿交叉使用。
  *       - 内部固定 `std::vector`，不提供 `std::priority_queue` 那样的底层容器模板参数。
+ *
+ * ## 模块定位
+ *
+ * 属于「Go 标准库容器语义」适配层的最底层：上游是 Go `container/heap` 的
+ * `Init/Push/Pop/Remove/Fix` 契约，下游（当前仓库内）是 `tests/container/test_heap.cpp`
+ * 的语义单元测试与 `tests/container/test_scenarios.cpp` 里的定时任务堆、K 路归并等场景。
+ * 本模块**不依赖**运行时、调度器或 IO —— 容器可以脱离 Fiber/EventLoop 单独使用；
+ * 上层（例如未来的定时器任务队列）只把它当成「可按下标修堆的 `std::vector`」。
+ *
+ * ## 本文件定义什么
+ *
+ * - `detail::HeapDown` / `detail::HeapUp`：接口式的两个 sift 原语，只依赖用户容器的
+ *   `Len/Less/Swap` 鸭子类型，不认识迭代器；
+ * - `Init` / `Push` / `Pop` / `Remove` / `Fix`：Go `container/heap` 的自由函数形态；
+ * - `Heap<T, Less>`：模板式二叉堆，底层 `std::vector` + 标准库 `std::*_heap`；
+ * - `Heap::Inverted` / `Heap::SiftDown` / `Heap::SiftUp`（私有）：前者做 min-heap 与
+ *   标准库 max-heap 的比较器语义换算，后两者补上标准库缺失的「按下标修堆」能力。
+ *
+ * ## 阅读建议
+ *
+ * 先读文件头的复用结论，弄清「接口式为什么必须手写 sift、模板式为什么能复用标准库」；
+ * 再看 `detail::HeapDown` 与 `Fix` 的「先 down、未移动再 up」顺序（Go 唯一的非显然约定）；
+ * 最后看 `Heap<T, Less>`，注意它通过 `Inverted` 把 min-heap 语义翻转给标准库。
+ *
+ * ## 边界与陷阱
+ *
+ * - 两套 API **不可交叉使用**：模板式 `Heap` 的成员 `Push/Pop/Fix/Remove` 已自带 sift，
+ *   再套一层自由函数会重复 sift。结果通常仍正确，但多付一次 O(log n)，且读代码的人
+ *   会误以为堆可能处于「未修复」状态。
+ * - 接口式 `Pop(h)` / `Remove(h, i)` 假定用户的 `Pop()` **只删末尾、不做 sift**；若用户
+ *   实现自己又 sift 一次，等于在已修好的堆上再动一次下标，堆性质可能被破坏。
+ * - 空堆 / 越界在 Go 是 panic（不可恢复），这里抛 `std::out_of_range`。逐行转译 Go 代码时
+ *   必须自己决定是否捕获 —— 把异常当正常分支会掩盖真正的逻辑错误。
  */
 #pragma once
 
@@ -202,6 +235,22 @@ inline void Fix(H& h, std::size_t i) {
  *
  * container::Heap<int, std::greater<>> max_heap;
  * @endcode
+ *
+ * ## 定位
+ *
+ * 模板式容器层，供**不适合接口式鸭子类型**的调用方使用（元素是普通结构体、比较器是
+ * 普通函数对象）。当前仓库内由 `tests/container/test_heap.cpp` 与
+ * `tests/container/test_scenarios.cpp` 直接实例化；上层复用时应当把它当作
+ * 「可以按下标 `Fix`/`Remove` 的 `std::vector`」，而不是 `std::priority_queue` 的替代品。
+ *
+ * ## 不变量
+ *
+ * - `m_data` 始终满足 `m_less` 意义下的**小根堆**性质：任一父节点不大于其孩子；
+ *   唯一能破坏它的入口是 `T& Top()` 返回的可写引用（改完必须自行调 `Fix(0)`）。
+ * - `Inverted` 只持有 `m_less` 的**指针**，所以比较器必须在本对象生命周期内有效；
+ *   默认构造的 `Heap` 用成员 `m_less`，天然满足。
+ * - `Fix` / `Remove` 先用 `SiftDown` 的返回值判断是否移动：移动过就不再 up
+ *   （元素变大只会下沉），未移动才 up（元素变小只会上升）。
  */
 template <typename T, typename Less = std::less<>>
 class Heap {
