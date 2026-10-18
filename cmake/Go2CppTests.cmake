@@ -421,6 +421,25 @@ if (GO2CPP_BUILD_TESTS)
     set_tests_properties(go2cpp_high_load_stress PROPERTIES TIMEOUT 180)
 endif()
 
+    # ---- bufio 模块：带缓冲的 IO（语义对齐 Go bufio）----
+    add_executable(go2cpp_bufio_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/bufio/test_bufio.cpp)
+    target_link_libraries(go2cpp_bufio_test PRIVATE go2cpp_bufio)
+    target_include_directories(go2cpp_bufio_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_bufio_test PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_bufio_test COMMAND go2cpp_bufio_test)
+    set_tests_properties(go2cpp_bufio_test PROPERTIES TIMEOUT 180)
+
+    add_executable(go2cpp_bufio_stress
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/bufio/test_bufio_stress.cpp)
+    target_link_libraries(go2cpp_bufio_stress PRIVATE go2cpp_bufio)
+    target_include_directories(go2cpp_bufio_stress PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_bufio_stress PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_bufio_stress COMMAND go2cpp_bufio_stress)
+    set_tests_properties(go2cpp_bufio_stress PROPERTIES TIMEOUT 300)
+
 if (GO2CPP_BUILD_EXAMPLES)
     # 示例按模块目录维护；目标名取文件名以保持旧版构建接口稳定.
     set(GO2CPP_EXAMPLES

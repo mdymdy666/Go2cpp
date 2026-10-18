@@ -277,3 +277,10 @@ if (GO2CPP_WITH_PICOQUIC)
 else()
     message(STATUS "picoquic QUIC transport: OFF (set GO2CPP_WITH_PICOQUIC=ON to enable)")
 endif()
+
+# bufio 模块：带缓冲的 IO（Reader/Writer/Scanner，语义对齐 Go 的 bufio 包）。
+add_library(go2cpp_bufio src/bufio/bufio.cpp)
+target_link_libraries(go2cpp_bufio PUBLIC go2cpp_error)
+set_target_properties(go2cpp_bufio PROPERTIES EXPORT_NAME bufio)
+add_library(go2cpp::bufio ALIAS go2cpp_bufio)
+list(APPEND GO2CPP_MODULE_TARGETS go2cpp_bufio)
