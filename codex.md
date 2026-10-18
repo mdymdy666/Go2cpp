@@ -9402,3 +9402,59 @@ ctest --test-dir /tmp/go2cpp_build_encoding --output-on-failure
 - 未在 Windows/MSVC 验证。
 - 未跑 ASan/UBSan（随机/fuzz 已覆盖边界，但未做 sanitizer 构建）。
 - 本次未执行任何 git 命令。
+## 2026-10-18：新增 `hash` 模块（CRC32 / Adler32 / MD5 / SHA-1 / SHA-256）
+
+### 交付清单
+
+| 文件 | 说明 |
+|---|---|
+| `include/go2cpp/hash/hash.hpp` | 统一 `Hash` 接口（对齐 Go `hash.Hash`）+ 非拥有 `ByteSpan` + `AsBytes` |
+| `include/go2cpp/hash/crc32.hpp` | 三多项式、`Table`/`MakeTable`/`Crc32`/`Checksum*`/`Update`/`New` |
+| `include/go2cpp/hash/adler32.hpp` | `Adler32`/`Checksum`/`New`（5552 分块） |
+| `include/go2cpp/hash/md5.hpp` | MD5（RFC 1321），文件头明确「不安全、仅校验/兼容」 |
+| `include/go2cpp/hash/sha1.hpp` | SHA-1（FIPS 180-4），文件头明确「有实际碰撞、不安全」 |
+| `include/go2cpp/hash/sha256.hpp` | SHA-256（FIPS 180-4） |
+| `src/hash/{hash,crc32,adler32,md5,sha1,sha256}.cpp` | 实现；`hash.cpp` 做头文件自包含检查 + 模块锚点 |
+| `tests/hash/{hash_test_main,test_hash_vectors,test_hash_random,test_hash_scenarios,test_hash_stress}.cpp` | 向量 / 随机对拍 / 6 场景 / 压测 |
+| `tests/hash/hash_test_support.hpp` | 断言、十六进制、与 Python 一致的 LCG 数据生成器 |
+| `tests/hash/scripts/gen_oracle.py` | Python oracle 生成器（`zlib`/`hashlib` + 逐位 CRC32C/K） |
+| `tests/hash/testdata/oracle.tsv` | 45 条边界/大文件用例（0 B ~ 10 MiB，共 17,356,114 B） |
+| `tests/hash/testdata/oracle_random.tsv` | 10,000 条随机长度（0~1024 B）/随机内容用例（5,149,513 B） |
+
+### 实现方式
+
+- **CRC32**：基础 256 表 + slicing-by-8 派生表（`Table` 内部 8×256，`operator[]` 仍暴露
+  基础表），与 Go 一样「进入取反 / 离开取反」；IEEE `0xedb88320`、Castagnoli
+  `0x82f63b78`、Koopman `0xeb31d82e` 的 `"123456789"` 检查值分别为
+  `cbf43926` / `e3069283` / `2d3dd0ae`。
+- **Adler32**：`a/b` 初始 1/0，5552 字节分块 + 16 字节展开，块末取模 65521。
+- **MD5/SHA-1/SHA-256**：按 RFC 1321 / FIPS 180-4 独立实现；MD5 小端、SHA 系列大端；
+  padding `0x80` + 零到 56 (mod 64) + 64 位比特长度；`Sum` 用拷贝状态收尾，
+  **不改变自身状态**（对齐 Go）。
+- **统一接口**：`Write(ByteSpan)` / `Sum(ByteSpan out) const` / `Reset` / `Size` /
+  `BlockSize`；另提供 `Hash::Sum()`（等价 Go `Sum(nil)`）与 `Write(string_view)` 便利重载。
+
+### 验证（实测）
+
+- 标准向量：RFC 1321 的 7 条 + quick brown fox；FIPS 的 `abc`/空串/448-bit/896-bit/
+  1,000,000 个 `a`；CRC32 三多项式检查值；Adler32 空串/Wikipedia/123456789。
+- 随机对拍：45 条边界/大文件 + 10,000 条随机输入，CRC32/Adler32/MD5/SHA-1/SHA-256
+  全部与 Python `zlib`/`hashlib` 逐位一致；CRC32C/K 与脚本内逐位参考实现一致。
+- 独立参考：测试内再实现逐位 CRC（三多项式）与逐字节 Adler，300 组随机数据交叉验证。
+- 6 个真实场景：文件 SHA-256、1 MiB 分块流式（5 种算法）、增量 Write、CRC32 传输校验
+  （单比特翻转全部检出、分片 Update 链式校验）、16 MiB 文件 MD5+SHA-256 交替、
+  `unique_ptr<Hash>` 一次遍历五算法。
+- 压测（单线程，4 MiB 缓冲，1 GiB 流）：CRC32 **3104.94 MB/s**（2961.10 MiB/s）、
+  Adler32 **4683.31 MB/s**、SHA-256 **428.05 MB/s**（408.22 MiB/s）；
+  参考：MD5 688.78 MB/s、SHA-1 271.91 MB/s（256 MiB）。
+- 独立 CMake 验证工程（`/tmp/go2cpp_hash_cmake`，Release）：build 0 warning，
+  `ctest` 1/1 Passed（5.49 s）。
+
+### 状态 / 未做
+
+- 本流按父 agent 协调**未修改**共享的 `cmake/Go2CppModules.cmake` 与
+  `cmake/Go2CppTests.cmake`；注册片段已单独提交，由父 agent 统一合并。
+  合并后预期 ctest 从 109 增至 110；全量 ctest 由父 agent 在合并后统一执行。
+- 未实现：SHA-224、SHA-512、HMAC、`encoding.BinaryMarshaler` 兼容序列化、CRC32
+  的 SSE4.2/PCLMUL 硬件加速（纯 C++ 可移植实现，当前已 >3 GB/s）。
+- MD5/SHA-1 仅用于校验/兼容；两个头文件均以 `@warning` 写明其安全性已失效。

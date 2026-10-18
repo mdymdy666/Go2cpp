@@ -443,6 +443,49 @@ if (GO2CPP_BUILD_TESTS)
     # 300s：压测 + 随机测试在 -O2 下约 10s，留足慢机器/Sanitizer 余量。
     set_tests_properties(go2cpp_compress_test PROPERTIES TIMEOUT 300)
 
+    # ---- encoding 模块：base64 / hex / binary / csv ----
+    # 四个子模块只依赖 error；测试是单个可执行文件，内含单元 / 随机 /
+    # 6 个真实场景 / 1 MiB 压测。Python 对拍数据由
+    # tests/encoding/scripts/gen_python_vectors.py 生成，ctest 只读文件。
+    add_executable(go2cpp_encoding_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/encoding/encoding_test_main.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/encoding/test_base64.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/encoding/test_hex.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/encoding/test_binary.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/encoding/test_csv.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/encoding/test_random.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/encoding/test_scenarios.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/encoding/test_stress.cpp)
+    target_include_directories(go2cpp_encoding_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(go2cpp_encoding_test PRIVATE go2cpp_encoding)
+    target_compile_definitions(go2cpp_encoding_test PRIVATE
+        GO2CPP_ENCODING_TESTDATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/encoding/testdata")
+    target_compile_options(go2cpp_encoding_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_encoding_test COMMAND go2cpp_encoding_test)
+    set_tests_properties(go2cpp_encoding_test PROPERTIES TIMEOUT 300)
+
+    # ---- hash 模块：CRC32 / Adler32 / MD5 / SHA-1 / SHA-256 ----
+    # oracle 由 tests/hash/scripts/gen_oracle.py 预生成（Python zlib/hashlib +
+    # 逐位 CRC32C/K 参考实现），ctest 运行时不依赖本机 Python。
+    add_executable(go2cpp_hash_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hash/hash_test_main.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hash/test_hash_vectors.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hash/test_hash_random.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hash/test_hash_scenarios.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/hash/test_hash_stress.cpp)
+    target_link_libraries(go2cpp_hash_test PRIVATE go2cpp_hash)
+    target_include_directories(go2cpp_hash_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(go2cpp_hash_test PRIVATE
+        GO2CPP_HASH_ORACLE_FILE=${CMAKE_CURRENT_SOURCE_DIR}/tests/hash/testdata/oracle.tsv
+        GO2CPP_HASH_ORACLE_RANDOM_FILE=${CMAKE_CURRENT_SOURCE_DIR}/tests/hash/testdata/oracle_random.tsv)
+    target_compile_options(go2cpp_hash_test PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_hash_test COMMAND go2cpp_hash_test)
+    set_tests_properties(go2cpp_hash_test PROPERTIES TIMEOUT 300)
+
     set_tests_properties(go2cpp_high_load_stress PROPERTIES TIMEOUT 180)
 endif()
 

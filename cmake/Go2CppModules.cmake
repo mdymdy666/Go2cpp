@@ -97,6 +97,31 @@ add_library(go2cpp_compress
 # go2cpp::Is / streams::IoEof，使用方必须能链接到 error 模块。
 target_link_libraries(go2cpp_compress PUBLIC go2cpp_error ZLIB::ZLIB)
 
+# encoding 模块：Go `encoding/{base64,hex,binary,csv}` 的 C++ 对应实现。
+# 纯 CPU、无 IO / 调度依赖，只链接 error（错误身份锚点）。
+add_library(go2cpp_encoding
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/encoding/base64.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/encoding/hex.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/encoding/binary.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/encoding/csv.cpp)
+target_link_libraries(go2cpp_encoding PUBLIC go2cpp_error)
+set_target_properties(go2cpp_encoding PROPERTIES EXPORT_NAME encoding)
+add_library(go2cpp::encoding ALIAS go2cpp_encoding)
+
+# hash 模块：Go hash/crc32、hash/adler32 与 crypto/md5|sha1|sha256 的零依赖实现。
+# CRC32 = 基础 256 表 + slicing-by-8；Adler32 = 5552 分块；MD5/SHA-1/SHA-256 按
+# RFC 1321 / FIPS 180-4 自实现。统一 Hash 接口对齐 Go hash.Hash 的 Sum/Write 语义。
+# 无 error 依赖：本模块不返回 go2cpp::Error，只返回摘要字节。
+add_library(go2cpp_hash
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hash/adler32.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hash/crc32.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hash/hash.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hash/md5.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hash/sha1.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hash/sha256.cpp)
+set_target_properties(go2cpp_hash PROPERTIES EXPORT_NAME hash)
+add_library(go2cpp::hash ALIAS go2cpp_hash)
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GO2CPP_BUILD_HOOK)
     add_library(go2cpp_hook SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/network/hook.cpp)
 endif()
@@ -172,6 +197,8 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_path
     go2cpp_container
     go2cpp_compress
+    go2cpp_encoding
+    go2cpp_hash
 )
 if (TARGET go2cpp_hook)
     list(APPEND GO2CPP_MODULE_TARGETS go2cpp_hook)
@@ -231,7 +258,7 @@ endif()
 target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_error go2cpp_control_flow go2cpp_context go2cpp_channel go2cpp_scheduler
     go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io go2cpp_network go2cpp_log go2cpp_config
-    go2cpp_math go2cpp_rand go2cpp_path go2cpp_container go2cpp_compress
+    go2cpp_math go2cpp_rand go2cpp_path go2cpp_container go2cpp_compress go2cpp_encoding go2cpp_hash
     Threads::Threads)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_runtime INTERFACE go2cpp_hook)
