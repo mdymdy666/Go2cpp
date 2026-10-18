@@ -259,17 +259,55 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         const auto fd_bits = static_cast<std::uint32_t>(token >> 32U);
         return fd_bits == 0 ? -1 : static_cast<int>(fd_bits - 1U);
     }
+    /**
+     * @brief 一个 fd 等待请求（挂在 `FdSlot::readers` / `writers` 队列里）。
+     *
+     * ## 定位
+     *
+     * park 的**第二类等待记录**（第一类是 `sync::Mutex` 的 `m_waiters`）：
+     * fd 就绪的等待者挂在这里，由 epoll 事件（`process_event_locked`）或定时器
+     * （`expire_timers`）或关闭通知（`notify_close`）通过 `claim()` 认领，
+     * 再 `wake()` 唤醒对应 G。
+     *
+     * ## 生命周期
+     *
+     * `register_wait` 创建（优先从 `s_node_cache` 取，避免每次分配）；
+     * `complete`/`expire_timers` 认领；`recycle_node` 回收进缓存。
+     * `outcome == 0` 表示「还没有人被认领」。**同一个节点只能被认领一次**。
+     *
+     * ## 与 `sync::WaitNode` 的区别（不要混）
+     *
+     * | | `sync::WaitNode` | 本节点 |
+     * |---|---|---|
+     * | 等什么 | 锁 / 通知 | fd 就绪 |
+     * | 谁唤醒 | `Unlock` / `Notify` | epoll 事件 / 定时器 / close |
+     * | 队列 | `Mutex::Impl::m_waiters` | `FdSlot::readers/writers` |
+     *
+     * 两者都用 CAS 认领（`Finish` / `claim`），但**唤醒源和队列完全不同**，
+     * 合并会导致「一方漏唤醒，另一方永远等」。
+     */
     struct WaitNode {
+        /// @brief 全局单调节点 id；同时作为 `m_deadline_index` 的键。
         std::uint64_t id{0};
+        /// @brief 等待的 fd（-1 表示已失效）。
         int fd{-1};
+        /// @brief 注册时的 fd 代际；与 slot/descriptor 对不上就丢弃事件。
         std::uint64_t generation{0};
+        /// @brief 等读还是等写（决定挂 readers 还是 writers 队列）。
         IOEvent event{IOEvent::kRead};
+        /// @brief 所属调度器（唤醒时用）；disarm 门保证回收后不会被迟到回调解引用。
         Scheduler* scheduler{nullptr};
+        /// @brief 被唤醒的 G；`wake_task_claimed()` 之后所有权转移给调度器。
         std::shared_ptr<Task> task;
+        /// @brief 代际令牌；close/dup2 之后用它拒绝旧事件。
         DescriptorTokenPtr descriptor;
+        /// @brief 唤醒门（极短临界区）；与 `wake_active` 配合，保证不跨 park 持有调度器指针。
         core::FutexMutex wake_mutex;
+        /// @brief 门内标记：false 表示已 disarm，后续 wake 直接返回。
         bool wake_active{true};
+        /// @brief 终态（0=未完成）；`claim()` 用 CAS 写，只有第一个源成功。
         std::atomic<std::uint64_t> outcome{0};
+        /// @brief 批量唤醒链（侵入式单链表，避免每次 wake 分配容器）。
         std::shared_ptr<WaitNode> wake_next;
         std::mutex callback_mutex;
         std::condition_variable callback_cv;

@@ -232,7 +232,7 @@ public:
     std::size_t Read(ByteSpan p) noexcept;
 
 private:
-    std::uint64_t m_state[4]{};
+    std::uint64_t m_state[4]{};  ///< xoshiro256** 的四个状态字；Seed 写入，Uint64 每步推进
     std::int64_t m_read_val{0};   ///< `Read` 尚未用完的 63 位随机值
     std::int8_t m_read_pos{0};    ///< `m_read_val` 还剩几个有效字节（0 表示需要重新抽取）
     double m_norm_cache{0.0};     ///< Box–Muller 成对结果中暂存的第二个值

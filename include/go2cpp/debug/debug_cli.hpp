@@ -16,6 +16,29 @@
  *   其中 `scheduler_name` 当前**仅作标识显示**：项目没有"调度器名字"这一概念
  *   （`SchedulerConfig` 无 name 字段），因此名称由调用方通过 `DumpOptions::name`
  *   传入，缺省为 `main`。这一点在设计文档里也标注过。
+ *
+ * ## 模块定位
+ *
+ * `debug` 的命令行层：解析 `dump scheduler|events` 参数，调用
+ * `DebugScheduler`/`DebugEventCollector` 序列化，并写到 stdout 或文件。
+ * 它是**进程内** CLI，不提供跨进程 dump 能力。
+ *
+ * ## 本文件定义什么
+ *
+ * - `DumpTarget` / `DumpCommand`：目标与解析结果；
+ * - `ParseDumpCommand`：纯函数参数解析；
+ * - `DefaultDumpFileName` / `WriteDumpFile`：默认文件名与原子写文件；
+ * - `RunEventsDump` / `RunDump` / `RunDumpCli`：执行入口。
+ *
+ * ## 阅读建议
+ *
+ * 先看 `ParseDumpCommand` 的 5 个步骤，再看 `WriteDumpFile` 的临时文件 +
+ * rename 原子替换，最后看 `RunDumpCli` 如何把 argc/argv 转成参数列表。
+ *
+ * ## 边界与陷阱
+ *
+ * `--follow-timeout` 默认 1000ms，避免空进程永不退出；`append=true` 时
+ * 退化为直接追加、不保证原子；未知目标/选项一律解析失败，不会静默降级。
  */
 
 #include "go2cpp/debug/debug_events.hpp"
@@ -31,13 +54,28 @@
 
 namespace go2cpp::debug {
 
-/// dump 的目标对象。
+/**
+ * @brief dump 的目标对象。
+ *
+ * ## 定位
+ * `DumpCommand::target` 的取值，决定 `RunDump` 分派到 scheduler 还是 events。
+ */
 enum class DumpTarget {
     kScheduler,  ///< dump scheduler（默认，保持向后兼容）。
     kEvents,     ///< dump events（需要调用方提供 DebugEventCollector）。
 };
 
-/// 解析后的 dump 命令。
+/**
+ * @brief 解析后的 dump 命令。
+ *
+ * ## 定位
+ * `ParseDumpCommand` 的输出、`RunDump`/`RunEventsDump` 的输入；纯数据。
+ *
+ * ## 不变量
+ * - `valid == true` 时 `error` 为空；失败时 `error` 说明原因；
+ * - `follow == true` 时 `follow_batches == 0` 表示不限批数；
+ * - `output` 为空或 `"-"` 表示 stdout。
+ */
 struct DumpCommand {
     bool valid{false};
     DumpTarget target{DumpTarget::kScheduler};
@@ -59,7 +97,18 @@ struct DumpCommand {
 
 /// 解析形如 ["dump","scheduler","--format=json","--output=f"] 的参数列表。
 /// @note 只解析，不产生任何副作用；失败时 `valid=false` 且 `error` 说明原因。
+/**
+ * @brief 解析 `dump ...` 参数列表。
+ *
+ * ## 步骤
+ * step1. 消费可选的 `dump` 前缀与目标名；非法目标立即报错，不静默降级；
+ * step2. 逐项解析格式/输出/追加/段裁剪等选项；
+ * step3. 解析 follow 的数值参数并做范围校验；
+ * step4. 未知选项报错；不带 `-` 的位置参数作为 scheduler_name；
+ * step5. 全部通过后置 `valid=true`。
+ */
 inline DumpCommand ParseDumpCommand(const std::vector<std::string>& args) {
+    // step1: 目标名
     DumpCommand command;
     std::size_t index = 0;
     if (index < args.size() && args[index] == "dump") {
@@ -77,6 +126,7 @@ inline DumpCommand ParseDumpCommand(const std::vector<std::string>& args) {
         command.error = "unknown target: " + args[index];
         return command;
     }
+    // step2/step3: 逐项解析选项与数值参数
     for (; index < args.size(); ++index) {
         const std::string& arg = args[index];
         if (arg == "--format=text") {
@@ -176,6 +226,7 @@ inline DumpCommand ParseDumpCommand(const std::vector<std::string>& args) {
             command.name = arg;  // 位置参数：scheduler_name
         }
     }
+    // step5: 全部参数合法
     command.valid = true;
     return command;
 }
@@ -205,8 +256,18 @@ inline std::string DefaultDumpFileName() {
  *       这一点在文档中明确说明，不隐瞒。
  * @return 成功返回 true；失败时 `error` 填原因。
  */
+/**
+ * @brief 把文本写到文件（覆盖模式用临时文件 + rename）。
+ *
+ * ## 步骤
+ * step1. `append=true`：直接以 `"ab"` 追加，短写报错；
+ * step2. 覆盖模式：先写 `path + ".tmp"`；
+ * step3. 短写则删除临时文件并报错，避免留下半截 dump；
+ * step4. `rename` 原子替换目标；失败同样删除临时文件。
+ */
 inline bool WriteDumpFile(const std::string& path, const std::string& text,
                           bool append, std::string* error) {
+    // step1: 追加模式无法原子，退化为直接写
     if (append) {
         std::FILE* file = std::fopen(path.c_str(), "ab");
         if (file == nullptr) {
@@ -221,6 +282,7 @@ inline bool WriteDumpFile(const std::string& path, const std::string& text,
         }
         return true;
     }
+    // step2: 覆盖模式先写临时文件
     const std::string temporary = path + ".tmp";
     std::FILE* file = std::fopen(temporary.c_str(), "wb");
     if (file == nullptr) {
@@ -229,11 +291,13 @@ inline bool WriteDumpFile(const std::string& path, const std::string& text,
     }
     const std::size_t written = std::fwrite(text.data(), 1, text.size(), file);
     std::fclose(file);
+    // step3: 短写则清理临时文件
     if (written != text.size()) {
         std::remove(temporary.c_str());
         if (error) *error = "short write: " + temporary;
         return false;
     }
+    // step4: 原子替换
     if (std::rename(temporary.c_str(), path.c_str()) != 0) {
         std::remove(temporary.c_str());
         if (error) *error = "rename failed: " + path;
@@ -244,8 +308,18 @@ inline bool WriteDumpFile(const std::string& path, const std::string& text,
 
 /// 执行一次 events dump：序列化事件缓冲并写到 stdout 或文件。
 /// @note 使用只读快照（Peek），**不会消耗**采集器里的事件。
+/**
+ * @brief 执行一次 events dump。
+ *
+ * ## 步骤
+ * step1. 校验命令；
+ * step2. 按格式序列化只读快照（`Peek` 不消耗事件）；
+ * step3. `--follow` 时逐批输出每事件一行 JSON；
+ * step4. 否则写 stdout 或文件。
+ */
 inline bool RunEventsDump(const DumpCommand& command, DebugEventCollector& collector,
                           std::string* text_out, std::string* error) {
+    // step1: 命令必须已通过解析
     if (!command.valid) {
         if (error) *error = command.error.empty() ? "invalid command" : command.error;
         return false;
@@ -262,7 +336,7 @@ inline bool RunEventsDump(const DumpCommand& command, DebugEventCollector& colle
             text = collector.DumpText(command.options.event_limit);
             break;
     }
-    // --follow：逐批写出（每事件一行 JSON），不走一次性写文件的路径。
+    // step3: --follow 逐批写出（每事件一行 JSON），不走一次性写文件
     if (command.follow) {
         const std::size_t batches = FollowEvents(
             collector,
@@ -296,6 +370,7 @@ inline bool RunEventsDump(const DumpCommand& command, DebugEventCollector& colle
     if (text_out != nullptr) {
         *text_out = text;
     }
+    // step4: 输出到 stdout 或文件
     if (command.output.empty() || command.output == "-") {
         const std::size_t written = std::fwrite(text.data(), 1, text.size(), stdout);
         if (written != text.size()) {

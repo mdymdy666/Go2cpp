@@ -24,6 +24,27 @@
  *     这是 POSIX 默认行为，本模块不改。
  *   - 调用 `Install` 后，`SIGUSR1` 被接管，进程不会被终止。
  *   - 本模块不处理 `SIGUSR2`、`SIGQUIT` 等其它信号。
+ *
+ * ## 模块定位
+ *
+ * `debug` 的跨进程 dump 入口：进程内安装 `SIGUSR1` 处理器，外部 `kill -USR1`
+ * 后由主循环或 watcher 线程落盘。上游是运维信号，下游是 `DebugScheduler`
+ * 与 `DebugEventCollector`。
+ *
+ * ## 本文件定义什么
+ *
+ * - `DebugSignalDumper`：安装/卸载、`PollOnce`、后台 watcher；
+ * - 内部 `State`：原子标志、被 dump 对象指针、输出目录与线程。
+ *
+ * ## 阅读建议
+ *
+ * 先读文件头「信号处理器只能做 async-signal-safe 的事」，再看 `PollOnce`
+ * 如何消费请求并落盘；`StartWatcher` 只是轮询 `PollOnce` 的后台线程。
+ *
+ * ## 边界与陷阱
+ *
+ * 未 `Install` 时 `SIGUSR1` 走内核默认动作（终止进程）；处理器内只做一次
+ * 原子置位，绝不能在信号上下文里 dump；`Install` 重复调用会替换绑定。
  */
 
 #include "go2cpp/debug/debug_events.hpp"
@@ -49,6 +70,20 @@ namespace go2cpp::debug {
  *
  * 依赖：POSIX `signal()`；被 dump 的对象由 `Install` 时的参数决定，**生命周期由调用方保证**。
  * 对上层提供：`Install`/`Uninstall`、`PollOnce`（主循环）、`StartWatcher`/`StopWatcher`（后台线程）。
+ *
+ * ## 定位
+ * 跨进程排障的唯一入口：把外部信号转换成一次调度器/事件快照落盘。
+ *
+ * ## 生命周期与线程模型
+ * 状态在进程内单例 `State` 中；`Install` 绑定 `Scheduler&` 与可选采集器，
+ * `Uninstall` 解绑并恢复默认信号动作。`PollOnce` 必须在普通上下文调用；
+ * watcher 线程只轮询 `PollOnce`，不直接碰信号处理逻辑。
+ *
+ * ## 不变量
+ * - `installed == false` 时 `PollOnce` 直接返回 0；
+ * - 信号处理器只写 `requested`（原子 store），不读其它状态；
+ * - `requested` 由 `PollOnce` 以 exchange 消费，一次信号只 dump 一次；
+ * - `scheduler` 非空由 `Install` 保证，生命周期由调用方保证。
  */
 class DebugSignalDumper final {
 public:
@@ -106,15 +141,28 @@ public:
      * @return 本次执行的 dump 次数（0 或 1）。
      * @note 必须在**普通上下文**（主循环或 watcher 线程）调用，绝不能在信号处理器里调用。
      */
+    /**
+     * @brief 若收到过信号则执行一次 dump（消费该请求）。
+     *
+     * ## 步骤
+     * step1. 未安装则失败返回；
+     * step2. 用 exchange 消费 `requested`，没有请求返回 0；
+     * step3. 校验调度器绑定，生成输出路径；
+     * step4. 采集带 G 列表的调度器快照并原子写文件；可选再写事件 ini；
+     * step5. 递增 dump 计数并返回 1。
+     */
     static std::size_t PollOnce(std::string* last_path = nullptr, std::string* error = nullptr) {
+        // step1: 必须已安装
         State& state = Get();
         if (!state.installed.load(std::memory_order_acquire)) {
             if (error) *error = "未安装信号处理器";
             return 0;
         }
+        // step2: 消费一次信号请求
         if (!state.requested.exchange(false, std::memory_order_acq_rel)) {
             return 0;
         }
+        // step3: 校验绑定并生成路径
         if (state.scheduler == nullptr) {
             if (error) *error = "未绑定调度器";
             return 0;
@@ -122,6 +170,7 @@ public:
         const std::string path = BuildPath(state.output_dir);
         DumpOptions options;
         options.include_fibers = true;   // 跨进程排障最需要看清"有哪些 G"
+        // step4: 采集并原子落盘
         const std::string text = DebugScheduler(*state.scheduler).DumpText(options);
         std::string write_error;
         if (!WriteDumpFile(path, text, false, &write_error)) {
@@ -133,6 +182,7 @@ public:
             std::string events_error;
             (void)WriteDumpFile(events_path, state.collector->DumpIni(0), false, &events_error);
         }
+        // step5: 计数并返回路径
         ++state.dump_count;
         if (last_path != nullptr) {
             *last_path = path;
@@ -189,14 +239,14 @@ private:
 #endif
 
     struct State {
-        std::atomic<bool> installed{false};
-        std::atomic<bool> requested{false};
-        std::atomic<bool> stopping{false};
-        std::atomic<std::size_t> dump_count{0};
-        Scheduler* scheduler{nullptr};
-        DebugEventCollector* collector{nullptr};
-        std::string output_dir;
-        std::thread watcher;
+        std::atomic<bool> installed{false}; ///< 是否已安装处理器；Install/Uninstall 写，PollOnce 读
+        std::atomic<bool> requested{false}; ///< 是否收到信号；OnSignal 置真，PollOnce exchange 消费
+        std::atomic<bool> stopping{false};  ///< watcher 停止标志；StopWatcher 置真，线程循环读
+        std::atomic<std::size_t> dump_count{0}; ///< 已执行 dump 次数；PollOnce 递增，DumpCount 读
+        Scheduler* scheduler{nullptr};      ///< 被 dump 的调度器（不拥有）；Install 绑定
+        DebugEventCollector* collector{nullptr}; ///< 可选事件采集器（不拥有）；Install 绑定
+        std::string output_dir;             ///< dump 输出目录；Install 设置，BuildPath 使用
+        std::thread watcher;                ///< 后台轮询线程；StartWatcher 创建，StopWatcher join
     };
 
     static State& Get() noexcept {

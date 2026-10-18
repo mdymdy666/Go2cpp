@@ -30,6 +30,7 @@
  */
 #pragma once
 
+#include "go2cpp/channel.hpp"
 #include "go2cpp/sync.hpp"
 
 #include <chrono>

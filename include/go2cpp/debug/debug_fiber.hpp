@@ -15,6 +15,27 @@
  *
  * 与框架的关系：`DebugFiber` 与 `DebugRegistry` 全部位于 `go2cpp::debug` 命名空间，
  * 原框架（Fiber/Task/Scheduler）对本文件**零依赖**。
+ *
+ * ## 模块定位
+ *
+ * `debug` 的 Fiber 元数据层：给执行体附加任务名/描述/源码位置，并通过进程内
+ * 注册表按 Fiber id 查询。上游是业务任务创建与调试 CLI，下游是 `Fiber`。
+ *
+ * ## 本文件定义什么
+ *
+ * - `FiberDebugInfo`：可拷贝的元数据（含 `present` 区分「未注册」与「空值」）；
+ * - `DebugFiber`：继承 `Fiber` 并附加元数据的执行体；
+ * - `DebugRegistry`：Fiber id → 元数据的线程安全注册表（单例）。
+ *
+ * ## 阅读建议
+ *
+ * 先读文件头「绝不可通过 Fiber* 销毁 DebugFiber」的生命周期硬约束，再看
+ * `FiberDebugInfo::present` 的两种“查不到”，最后看注册表的快照语义。
+ *
+ * ## 边界与陷阱
+ *
+ * `Fiber` 无虚析构：`DebugFiber` 只能由 `unique_ptr<DebugFiber>` 或值语义
+ * 持有，绝不能放进 `Task::m_fiber`。注册表不拥有 Fiber，条目需要调用方注销。
  */
 
 #include "go2cpp/fiber.hpp"
@@ -35,6 +56,14 @@ namespace go2cpp::debug {
  *          - `present == false`：该 Fiber **从未注册**过元数据；
  *          - `present == true` 但字段为空：**已注册**，只是该项没有来源。
  *          调试输出必须区分这两者，不得都用 unknown 表示。
+ *
+ * ## 定位
+ * `DebugFiber` 与 `DebugRegistry` 共用的元数据值类型；调试 CLI 输出与测试
+ * 断言都读取它。
+ *
+ * ## 不变量
+ * - `present` 由注册/构造路径置真，不会自动变假；
+ * - `line == 0` 表示无源码行号；空字符串表示该项无来源。
  */
 struct FiberDebugInfo {
     std::string name;         ///< 任务名，例如 s_main_task。
@@ -59,6 +88,19 @@ struct FiberDebugInfo {
  * @note **生命周期约束**：本类没有（也不能有）虚析构，
  *       因此只能由 `std::unique_ptr<DebugFiber>` 或值语义持有；
  *       传给任何接受 `Fiber&`/`Fiber*` 的接口时**必须保证不会被其删除**。
+ *
+ * ## 定位
+ * 带调试元数据的执行体：业务创建任务时用 `DebugFiber` 记录任务名/描述/
+ * 源码位置，调试工具再通过 `DebugRegistry` 按 id 查询。
+ *
+ * ## 生命周期与线程模型
+ * 构造即注册元数据（`present=true`），`m_id` 记录 `Fiber::id()`；不可拷贝/
+ * 移动。对象析构不会自动注销注册表条目（墓碑信息是刻意保留的）。
+ *
+ * ## 不变量
+ * - `m_info.present` 在构造后恒为真；
+ * - `m_id` 在构造时固定，等于 `Fiber::id()`；
+ * - 元数据修改只影响本对象，注册表需要显式 `Register` 才看得到。
  */
 class DebugFiber : public Fiber {
 public:
@@ -100,8 +142,8 @@ public:
     std::uint64_t debug_id() const noexcept { return m_id; }
 
 private:
-    FiberDebugInfo m_info;
-    std::uint64_t m_id{0};
+    FiberDebugInfo m_info;      ///< 调试元数据；构造时设置，set_* 修改，info()/description()/name() 读取
+    std::uint64_t m_id{0};      ///< 构造时记录的 Fiber::id()；debug_id() 读取
 };
 
 /**
@@ -115,6 +157,19 @@ private:
  * @note 注册表**不拥有** `DebugFiber`，只保存元数据副本，
  *       因此 `DebugFiber` 析构后条目仍在（需调用方注销），这是刻意的：
  *       观测"已结束的 Fiber"（墓碑信息）是调试的常见需求。
+ *
+ * ## 定位
+ * 进程内 Fiber 元数据注册表：业务注册、调试 CLI/测试按 id 查询；不依赖
+ * 调度器，可在任意线程访问。
+ *
+ * ## 生命周期与线程模型
+ * `Instance()` 返回静态单例；`std::mutex` 保护全部条目。`Snapshot()`/
+ * `Lookup()` 返回副本，调用后不再持锁。
+ *
+ * ## 不变量
+ * - `Register` 写入的条目的 `present` 恒为真；
+ * - `Unregister`/`Clear` 只影响注册表，不影响 `DebugFiber` 对象；
+ * - 注册表只存值，不持有任何 Fiber 指针。
  */
 class DebugRegistry final {
 public:
@@ -176,8 +231,8 @@ private:
     DebugRegistry(const DebugRegistry&) = delete;
     DebugRegistry& operator=(const DebugRegistry&) = delete;
 
-    mutable std::mutex m_mutex;
-    std::unordered_map<std::uint64_t, FiberDebugInfo> m_entries;
+    mutable std::mutex m_mutex; ///< 保护 m_entries；Register/Unregister/Lookup/Snapshot 都持锁
+    std::unordered_map<std::uint64_t, FiberDebugInfo> m_entries; ///< Fiber id → 元数据副本；Register 写，Unregister/Clear 删
 };
 
 }  // namespace go2cpp::debug

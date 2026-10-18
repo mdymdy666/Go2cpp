@@ -234,16 +234,26 @@ std::vector<std::int64_t> Rand::Perm(std::int64_t n) {
     return result;
 }
 
+/**
+ * @brief 用随机字节填满 `p`，保留未用完的字节供下次调用。
+ *
+ * ## 步骤
+ * step1. 逐字节循环；仅当 `m_read_pos == 0` 时才消耗一个新的 `Int63()` 并把
+ *        `m_read_pos` 置为 7；
+ * step2. 取 `m_read_val` 的最低字节写入 `p[i]`，右移 8 位、计数减一。
+ *
+ * ## 为什么是 7 字节而不是 8
+ * `Int63()` 只有 63 位，Go 的 `readPos` 从 7 递减到 0、每次只产出 7 字节（只用低 56 位）。
+ * 改成 8 会改变随机流消耗，与 Go 的 `readVal/readPos` 语义脱节；空 `p` 不消耗随机数。
+ */
 std::size_t Rand::Read(ByteSpan p) noexcept {
-    // 与 Go 的 read() 一致：每次从 Int63() 取 7 个字节（63 位中只用低 56 位），
-    // 未用完的字节保存在 m_read_val / m_read_pos 里，跨调用继续使用。
-    // 不要把 m_read_pos 改成 8：Go 的 readPos 从 7 递减到 0，每次只产出 7 字节；
-    // 实测 Go 1.27 的 Rand.Read 也是这个行为。
     for (std::size_t i = 0; i < p.size(); ++i) {
+        // step1: 缓冲用尽才重新抽取 7 个字节。
         if (m_read_pos == 0) {
             m_read_val = Int63();
             m_read_pos = 7;
         }
+        // step2: 取最低字节，右移后计数减一。
         p[i] = static_cast<byte>(m_read_val);
         m_read_val >>= 8;
         --m_read_pos;

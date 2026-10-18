@@ -24,6 +24,29 @@
  *   - 未调用 `Checkpoint` 的代码路径**永远不会**命中断点；
  *   - `Checkpoint` **本身不阻塞**，它只返回命中的断点 id；是否等待由调用方决定
  *     （`WaitForResume` 才阻塞，且只应在受管 G 内使用）。
+ *
+ * ## 模块定位
+ *
+ * `debug` 的协作式断点层：使用者在自己代码的关键位置调用 `Checkpoint()`，
+ * 由进程内单例注册表决定是否命中。它不接触 `Scheduler`/`Fiber` 热路径，
+ * 供调试 CLI、测试与排障工具使用。
+ *
+ * ## 本文件定义什么
+ *
+ * - `BreakpointSpec` / `BreakpointHit`：断点条件与命中记录；
+ * - `DebugBreakpoints`：线程安全的进程内注册表（单例）；
+ * - `Checkpoint` / `ScopedCheckpoint`：使用者插入的检查点与 RAII 版本。
+ *
+ * ## 阅读建议
+ *
+ * 先读文件头「为什么是协作式」，再读 `ShouldStop` 的匹配顺序
+ * （enabled → name → task_id → skip → once），最后看 `ScopedCheckpoint`
+ * 如何在析构时自动 `Resume`。
+ *
+ * ## 边界与陷阱
+ *
+ * 只能停在调用过 `Checkpoint` 的位置，**不是任意行断点**；`Checkpoint`
+ * 本身不阻塞；`Clear()` 刻意不重置命中统计，需清零请调 `ResetStats()`。
  */
 
 #include <atomic>
@@ -36,7 +59,17 @@
 
 namespace go2cpp::debug {
 
-/// 断点条件。
+/**
+ * @brief 断点条件。
+ *
+ * ## 定位
+ * `DebugBreakpoints::Add`/`Snapshot` 的值类型；调用方描述「在哪个位置、
+ * 对哪个 G、跳过几次、是否一次」。
+ *
+ * ## 不变量
+ * - `skip` 是命中前的跳过次数；`once` 触发后自动置 `enabled=false`；
+ * - `task_id == 0` 表示任意 G。
+ */
 struct BreakpointSpec {
     std::string name;             ///< 逻辑位置名（由使用者自己定义，例如 "before_commit"）。
     std::uint64_t task_id{0};     ///< 只对指定 G 生效；0 表示任意 G。
@@ -50,7 +83,12 @@ struct BreakpointSpec {
     }
 };
 
-/// 一次命中的记录。
+/**
+ * @brief 一次命中的记录。
+ *
+ * ## 定位
+ * `DebugBreakpoints::Waiting()` 的返回元素，表示「已命中、尚未 Resume」。
+ */
 struct BreakpointHit {
     std::uint64_t id{0};      ///< 断点 id（>0）。
     std::string name;         ///< 命中的位置名。
@@ -66,6 +104,21 @@ struct BreakpointHit {
  * 对上层提供：注册/清除/命中判定/恢复/观测，全部线程安全。
  *
  * @note 命中判定是**幂等可重入**的：同一位置被多个 G 同时经过时各自独立计数。
+ *
+ * ## 定位
+ * 进程内单例断点注册表：被 `Checkpoint()`/`ScopedCheckpoint` 调用，也被
+ * 调试 CLI 与测试用于注册、查询、恢复断点。
+ *
+ * ## 生命周期与线程模型
+ * `Instance()` 返回静态单例，首次调用构造；`Add`/`Remove`/`Clear` 修改
+ * 注册表，所有操作由 `std::mutex` 保护，可在任意线程（含非受管线程）调用。
+ * 刻意不用 `sync::Mutex`，因为它需要调度器上下文。
+ *
+ * ## 不变量
+ * - 断点 id 从 1 递增、永不复用（即使 Remove 后）；
+ * - `m_total_hits` 只由 `ShouldStop` 递增、`ResetStats` 清零，`Clear` 不动它；
+ * - `m_waiting` 中的 id 必定仍存在于 `m_entries`（除非先 Remove 再 Resume）；
+ * - `once` 断点命中后 `enabled=false`，但仍留在注册表中供观测。
  */
 class DebugBreakpoints {
 public:
@@ -122,8 +175,19 @@ public:
      * @return 命中的断点 id（>0）；未命中返回 0。
      * @note 命中后：`skip` 递减；`once` 的断点会自动失效；命中的断点会登记到 waiting 表。
      */
+    /**
+     * @brief 判断某个检查点是否应命中。
+     *
+     * ## 步骤
+     * step1. 加锁遍历全部断点；
+     * step2. 依次过滤：未启用、名字不匹配、task_id 不匹配；
+     * step3. 未达到 `skip` 次数则只递增 skipped；
+     * step4. 命中：累加 hits/total_hits，`once` 自动失效，登记到 waiting 并返回 id。
+     */
     std::uint64_t ShouldStop(const std::string& name, std::uint64_t task_id) {
+        // step1: 全表加锁
         std::lock_guard<std::mutex> lock(m_mutex);
+        // step2: 过滤不匹配的断点
         for (auto& pair : m_entries) {
             Entry& entry = pair.second;
             if (!entry.spec.enabled || entry.spec.name != name) {
@@ -132,10 +196,12 @@ public:
             if (entry.spec.task_id != 0 && entry.spec.task_id != task_id) {
                 continue;
             }
+            // step3: 先跳过 N 次
             if (entry.skipped < entry.spec.skip) {
                 ++entry.skipped;
                 continue;
             }
+            // step4: 命中并登记
             const std::uint64_t id = pair.first;
             ++entry.hits;
             ++m_total_hits;
@@ -251,21 +317,21 @@ private:
     DebugBreakpoints& operator=(const DebugBreakpoints&) = delete;
 
     struct Entry {
-        BreakpointSpec spec;
-        std::size_t skipped{0};
-        std::uint64_t hits{0};
+        BreakpointSpec spec; ///< 注册时的条件；SetEnabled 会改 enabled
+        std::size_t skipped{0}; ///< 已跳过的命中数；ShouldStop 累加，ResetStats 清零
+        std::uint64_t hits{0};  ///< 已触发次数；ShouldStop 累加，ResetStats 清零
     };
     struct HitRecord {
-        std::string name;
-        std::uint64_t task_id{0};
-        std::uint64_t sequence{0};
+        std::string name;        ///< 命中的位置名
+        std::uint64_t task_id{0}; ///< 触发时的 G id（0 表示未知）
+        std::uint64_t sequence{0}; ///< 全局命中序号（取 m_total_hits 当时值）
     };
 
-    mutable std::mutex m_mutex;
-    std::unordered_map<std::uint64_t, Entry> m_entries;
-    std::unordered_map<std::uint64_t, HitRecord> m_waiting;
-    std::uint64_t m_next_id{0};
-    std::uint64_t m_total_hits{0};
+    mutable std::mutex m_mutex; ///< 保护 entries/waiting/计数器；所有公开方法都持锁
+    std::unordered_map<std::uint64_t, Entry> m_entries; ///< id → 断点；Add/Remove/Clear 修改
+    std::unordered_map<std::uint64_t, HitRecord> m_waiting; ///< 已命中未恢复；ShouldStop 写，Resume 删
+    std::uint64_t m_next_id{0}; ///< 下一个断点 id；Add 递增，永不复用
+    std::uint64_t m_total_hits{0}; ///< 累计命中数；ShouldStop 递增，ResetStats 清零
 };
 
 /**
@@ -302,7 +368,7 @@ public:
     bool hit() const noexcept { return m_id != 0; }
 
 private:
-    std::uint64_t m_id{0};
+    std::uint64_t m_id{0}; ///< 命中的断点 id；0 表示未命中，析构时据此决定是否 Resume
 };
 
 }  // namespace go2cpp::debug
