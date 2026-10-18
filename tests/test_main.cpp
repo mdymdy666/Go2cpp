@@ -41,12 +41,20 @@ void run_debug_lock_selector_tests();
 void run_debug_events_tests();
 void run_debug_breakpoints_tests();
 void run_debug_signal_dump_tests();
+void run_spin_mutex_tests();
+void run_spin_mutex_child(const char* scenario);
 
 /**
  * @brief 统一运行默认测试集并根据过滤器选择测试模块。
  * @return 所有选定测试通过返回 0，否则返回非零值。
  */
 int main() {
+    // SpinMutex 的 debug abort 场景由父进程 fork + exec 本程序运行。
+    // 必须在 filter 之前分派，否则子进程会重复运行父进程的模块。
+    if (const char* child_scenario = std::getenv("GO2CPP_SPIN_MUTEX_CHILD")) {
+        run_spin_mutex_child(child_scenario);
+        return 3;
+    }
     const char* const filter_value = std::getenv("GO2CPP_TEST_FILTER");
     const std::string_view filter = filter_value ? filter_value : "";
     // 记录过滤器是否真的命中过某个模块。未知名字会让下面每个 selected() 都返回
@@ -96,6 +104,7 @@ int main() {
     if (selected("debug_events")) run_debug_events_tests();
     if (selected("debug_breakpoints")) run_debug_breakpoints_tests();
     if (selected("debug_signal_dump")) run_debug_signal_dump_tests();
+    if (selected("spin_mutex")) run_spin_mutex_tests();
 #ifdef GO2CPP_TEST_HOOK
     if (selected("hook")) run_hook_tests();
 #endif

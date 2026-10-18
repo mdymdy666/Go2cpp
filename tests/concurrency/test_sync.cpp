@@ -947,6 +947,56 @@ void TestContextCallbackRacesSchedulerShutdown() {
 }  // namespace
 
 /**
+ * @brief 持锁 park 检测：G1 持着 outer 去等 inner，检测计数必须增长。
+ *
+ * @details 这是"持着锁等另一把锁"的最小可复现场景，对应真实代码里
+ *          "持锁读 fd（hook 后 park）"。检测只计数/告警，不干预语义：
+ *          释放 inner 后 G1 必须正常拿到 inner、释放两把锁并退出。
+ */
+void TestHeldLockParkDetection() {
+    const bool saved = go2cpp::sync::HeldLockParkDetection();
+    go2cpp::sync::SetHeldLockParkDetection(true);
+    const std::uint64_t baseline = go2cpp::sync::HeldLockParkCount();
+
+    go2cpp::Scheduler scheduler(SchedulerConfig(2));
+    scheduler.start();
+    go2cpp::sync::Mutex outer;
+    go2cpp::sync::Mutex inner;
+    std::atomic<bool> inner_held{false};
+    std::atomic<bool> release_inner{false};
+    std::atomic<bool> done{false};
+
+    auto holder = scheduler.spawn([&] {
+        inner.Lock();
+        inner_held.store(true, std::memory_order_release);
+        while (!release_inner.load(std::memory_order_acquire)) {
+            scheduler.yield_current();
+        }
+        inner.Unlock();
+    });
+    // 先确定 holder 已持有 inner，再让 waiter 去抢，避免抢跑。
+    GO2CPP_REQUIRE_EVENTUALLY(inner_held.load(std::memory_order_acquire), 2s);
+    auto waiter = scheduler.spawn([&] {
+        outer.Lock();
+        inner.Lock();  // 持着 outer 等 inner：持锁 park
+        inner.Unlock();
+        outer.Unlock();
+        done.store(true, std::memory_order_release);
+    });
+
+    // 等待 G1 真正以"持锁"状态 park。
+    GO2CPP_REQUIRE_EVENTUALLY(
+        go2cpp::sync::HeldLockParkCount() > baseline, 2s);
+    release_inner.store(true, std::memory_order_release);
+    GO2CPP_REQUIRE_EVENTUALLY(done.load(std::memory_order_acquire), 2s);
+    GO2CPP_CHECK(go2cpp::sync::HeldLockParkDetection());
+    holder->wait();
+    waiter->wait();
+    ShutdownOrReportLostWakeup(scheduler);
+    go2cpp::sync::SetHeldLockParkDetection(saved);
+}
+
+/**
  * @brief 运行混合同步原语和关闭竞态测试。
  * @return 无；测试失败由统一断言统计。
  */
@@ -964,6 +1014,7 @@ void run_sync_tests() {
     TestWaitGroupWaveReleasedBeforeReuse();
     TestUnlockRacesContextCancellation();
     TestContextCallbackRacesSchedulerShutdown();
+    TestHeldLockParkDetection();
 }
 
 #ifdef GO2CPP_SYNC_TEST_MAIN

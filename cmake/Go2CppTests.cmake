@@ -12,6 +12,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_dynamic_scheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_fiber.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_sync.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_spin_mutex.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_future.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_io.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_network.cpp
@@ -670,6 +671,13 @@ if (GO2CPP_BUILD_BENCHMARKS)
 
     add_executable(go2cpp_fiber_stack_probe
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/fiber_stack_probe.cpp)
+
+    # 分层锁：SpinMutex vs Mutex vs std::mutex 的 ns/op（native + fiber 两种口径）。
+    add_executable(go2cpp_spin_mutex_benchmark
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/spin_mutex_benchmark.cpp)
+    target_link_libraries(go2cpp_spin_mutex_benchmark PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_spin_mutex_benchmark PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
     target_link_libraries(go2cpp_fiber_stack_probe PRIVATE go2cpp_runtime)
     target_compile_options(go2cpp_fiber_stack_probe PRIVATE
         -O2 -Wall -Wextra -Wpedantic)

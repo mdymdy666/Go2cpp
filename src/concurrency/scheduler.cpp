@@ -41,7 +41,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <iterator>
@@ -51,11 +54,13 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <execinfo.h>
 #include <pthread.h>
 #include <sched.h>
 #endif
 
 namespace go2cpp::scheduler {
+
 
 #ifdef GO2CPP_COUNT_GLOBAL_LOCK
 namespace profiling {
@@ -66,6 +71,108 @@ std::atomic<std::uint64_t> g_lock_hold_ns{0};
 #endif
 
 namespace {
+
+// ---------------------------------------------------------------------------
+// 持锁 park 契约检查
+// ---------------------------------------------------------------------------
+//
+// 两类标记，语义不同，处理方式也不同：
+//
+// | 条件 | 含义 | debug | release |
+// |---|---|---|---|
+// | no_park_depth > 0 | SpinMutex 临界区，禁止 park | abort | 降级 + 计数 |
+// | held_mutexes > 0  | 普通 Mutex 临界区，允许但危险 | 计数 + 日志 | 计数 |
+//
+// 检测点放在 Task::park_for_scheduler() 的最前面：所有 park 路径
+// （park_wait / park_io / park_with_reason / cleanup）都汇聚到那里，
+// 且必须在状态被改成 kWaiting 之前检查，否则当前 G 已经让出执行流。
+
+std::atomic<std::uint64_t> g_spin_mutex_park_degrade_total{0};
+std::atomic<std::uint64_t> g_mutex_held_park_total{0};
+std::atomic<bool> g_spin_mutex_park_warned{false};
+std::atomic<bool> g_held_park_warned{false};
+
+/// 打印一次诊断，之后的同类事件只计数，避免日志风暴。
+void WarnOnce(std::atomic<bool>& flag, const char* message) noexcept {
+    bool expected = false;
+    if (!flag.compare_exchange_strong(expected, true,
+                                      std::memory_order_relaxed)) {
+        return;
+    }
+    std::fprintf(stderr, "%s\n", message);
+    std::fflush(stderr);
+}
+
+#if defined(__linux__)
+/// 打印当前调用栈；只在 abort 前的诊断路径使用。
+void DumpParkCallStack() noexcept {
+    void* frames[32];
+    const int count = ::backtrace(frames, 32);
+    if (count > 0) {
+        std::fprintf(stderr, "[go2cpp] park call stack:\n");
+        ::backtrace_symbols_fd(frames, count, ::fileno(stderr));
+    }
+}
+#else
+void DumpParkCallStack() noexcept {}
+#endif
+
+/**
+ * @brief 处理「SpinMutex 临界区内发生 park」。
+ *
+ * @details debug 构建（定义 `GO2CPP_DEBUG_LOCKS` 或未定义 `NDEBUG`）：
+ *          打印 G id、嵌套深度、原因提示与调用栈后 `std::abort()`。这是
+ *          契约违反，必须让开发期立刻发现。
+ *
+ *          release 构建（`NDEBUG`）：**绝不 abort**。降级为普通 `Mutex`
+ *          语义（正确但慢），只递增降级计数并在第一次打印警告。
+ */
+void ReportParkInNoParkSection(const Task& task, std::uint32_t depth) noexcept {
+#if defined(GO2CPP_DEBUG_LOCKS) || !defined(NDEBUG)
+    std::fprintf(stderr,
+                 "[FATAL] G%llu parked inside a SpinMutex critical section "
+                 "(no_park_depth=%u)\n",
+                 static_cast<unsigned long long>(task.id()),
+                 static_cast<unsigned>(depth));
+    std::fprintf(stderr,
+                 "[FATAL] 临界区内出现了 park 点（read/write/connect/accept/"
+                 "sleep 或竞争中的 Mutex::Lock）。\n"
+                 "[FATAL] 修复：可能阻塞的临界区改用 sync::Mutex，或把 park "
+                 "移出临界区。\n");
+    std::fflush(stderr);
+    DumpParkCallStack();
+    std::abort();
+#else
+    g_spin_mutex_park_degrade_total.fetch_add(1, std::memory_order_relaxed);
+    WarnOnce(g_spin_mutex_park_warned,
+             "[go2cpp] WARN: parked inside a SpinMutex critical section; "
+             "degrading to Mutex semantics (release build never aborts). "
+             "Counter: scheduler::spin_mutex_park_degrade_total()");
+#endif
+}
+
+/**
+ * @brief 处理「普通 Mutex 临界区内发生 park」。
+ *
+ * @details 普通 `Mutex` 允许 park，因此这里**不 abort**；只计数（debug 下
+ *          额外打印一次）。这类 park 是持锁 IO 的直接信号：如果等待的 fd
+ *          永不就绪，等待同一把锁的 G 会永久死锁。
+ */
+void ReportParkWhileHoldingMutex(const Task& task) noexcept {
+    g_mutex_held_park_total.fetch_add(1, std::memory_order_relaxed);
+    bool expected = false;
+    if (!g_held_park_warned.compare_exchange_strong(
+            expected, true, std::memory_order_relaxed)) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "[go2cpp] held-lock-park: G%llu 在持有 %u 把 sync::Mutex "
+                 "时 park（允许，但持锁 IO 可能永久死锁；不自动解锁）\n",
+                 static_cast<unsigned long long>(task.id()),
+                 static_cast<unsigned>(task.held_mutex_count()));
+    std::fflush(stderr);
+}
+
 #ifdef GO2CPP_COUNT_GLOBAL_LOCK
 // 诊断插桩（默认关闭）：统计调度器全局锁的获取次数与持有时间。
 // 计数器定义在上面的 profiling 命名空间里（可外部链接）。
@@ -415,6 +522,21 @@ WakeAction Task::wake_for_wait() noexcept {
 }
 
 ParkAction Task::park_for_scheduler() noexcept {
+    // 契约检查必须在状态转换之前：这里一旦返回 kParked，当前 G 就离开了
+    // 当前执行流，再也无法可靠地定位「谁在持锁状态下 park」。
+    //
+    // 只在 park 调用者确实是当前 G 时检查：park_for_scheduler() 是公开
+    // 接口，外部线程误调时不应把别的 G 的计数算到这次调用头上。
+    if (Scheduler::current_task_ptr() == this) {
+        const std::uint32_t no_park_depth =
+            m_no_park_depth.load(std::memory_order_relaxed);
+        if (no_park_depth != 0U) {
+            // 内层优先：SpinMutex 的「禁止」契约高于普通 Mutex 的「告警」。
+            ReportParkInNoParkSection(*this, no_park_depth);
+        } else if (m_held_mutexes.load(std::memory_order_relaxed) != 0U) {
+            ReportParkWhileHoldingMutex(*this);
+        }
+    }
     std::lock_guard<std::mutex> lock(m_transition_mutex);
     if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
         return ParkAction::kRejected;
@@ -2211,7 +2333,8 @@ bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
     return true;
 }
 
-bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
+bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
+                                    bool allow_notify) {
     if (!task || current_scheduler() != this ||
         t_processor_id >= m_impl->processors.size()) {
         return enqueue(task);
@@ -2248,9 +2371,10 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task) {
                     std::memory_order_relaxed);
                 const auto active = processor.active_machines.load(
                     std::memory_order_relaxed);
-                notify_worker = running == 0 ||
-                                (processor.queue.size() >= 16U &&
-                                 running < active);
+                notify_worker =
+                    allow_notify &&
+                    (running == 0 ||
+                     (processor.queue.size() >= 16U && running < active));
             } catch (...) {
                 m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
                 task->clear_queued();
@@ -2945,6 +3069,10 @@ std::shared_ptr<Task> Scheduler::current_task() noexcept {
     return t_task;
 }
 
+Task* Scheduler::current_task_ptr() noexcept {
+    return t_task.get();
+}
+
 Scheduler* Scheduler::current_scheduler() noexcept {
     return t_scheduler;
 }
@@ -3361,11 +3489,17 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             // A yield issued by the running G is committed only after its
             // execution claim is released, preventing a second M from
             // entering the same callable concurrently.
+            bool requeued_self = false;
             if (task->state() == GState::kRunnable &&
                 !task->queued()) {
                 (void)task->consume_deferred_enqueue();
-                if (!requeue_from_worker(task) &&
-                    !task->cancel_if_runnable_unqueued()) {
+                // 刚 yield 的 G 放回**本** P 的队列，当前 M 马上就会从
+                // 队首取它。此时再 notify_one 会唤醒一个睡着的 M，让它
+                // 从队尾偷走这个 G —— 结果是一次跨 M 迁移 + 一次
+                // wake-from-sleep（实测 4~5µs），而本地继续执行只要
+                // 几百纳秒。allow_notify=false 关掉这个虚假唤醒。
+                requeued_self = requeue_from_worker(task, false);
+                if (!requeued_self && !task->cancel_if_runnable_unqueued()) {
                     // 入队失败且 cancel_if_runnable_unqueued() 也收敛不了，
                     // 说明这是一个**已启动**的 G（它只处理未启动的）。
                     // draining/stopping 时 enqueue() 的 worker 分支会直接
@@ -3409,11 +3543,21 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             }
             if (draining) {
                 m_impl->condition.notify_all();
-            } else if (m_impl->runnable.load(std::memory_order_relaxed) != 0) {
-                // 没有待运行 G 时无需为每次 Fiber 返回唤醒一个空闲 M。
-                // runnable 发布发生在入队之前，并由 enqueue()/wake() 的
-                // notify_one 覆盖；这里仅在当前 worker 产生了后继工作
-                // 或仍有其他队列任务时通知，减少无效 futex 唤醒。
+            } else if (!requeued_self &&
+                       task->state() != GState::kWaiting &&
+                       m_impl->runnable.load(std::memory_order_relaxed) != 0) {
+                // 只有"本 M 真正结束了一个 G、且仍有可运行任务"时才踢一个
+                // 空闲 M。
+                //
+                // 两种常见返回不满足这个条件，都**不能**在这里 notify：
+                // - yield 回队（requeued_self）：G 刚放回本 P 队首，本 M
+                //   下一轮就会取它；
+                // - park 返回（state == kWaiting）：唤醒方（Unlock）已经把
+                //   下一个 G 放进了本 P 队列，本 M 下一轮就会取它。
+                // 这两种情况下去 notify_one，会唤醒一个睡着的 M，让它从
+                // 队尾把该 G 偷走，把几百纳秒的本地续跑放大成 4~5µs 的
+                // 跨 M 唤醒（64 Fiber 实测整档慢 10 倍以上）。其他队列的
+                // 可运行工作由发布方（enqueue / wake_registered）负责唤醒。
                 m_impl->condition.notify_one();
             }
             for (auto& retained_task : deferred_destruction) {
@@ -3555,6 +3699,18 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     t_machine_id = 0;
     t_processor_id = 0;
     t_blocking_machine_id = 0;
+}
+
+// ---------------------------------------------------------------------------
+// 持锁 park 契约计数器
+// ---------------------------------------------------------------------------
+
+std::uint64_t spin_mutex_park_degrade_total() noexcept {
+    return g_spin_mutex_park_degrade_total.load(std::memory_order_relaxed);
+}
+
+std::uint64_t mutex_held_park_total() noexcept {
+    return g_mutex_held_park_total.load(std::memory_order_relaxed);
 }
 
 }  // namespace go2cpp::scheduler

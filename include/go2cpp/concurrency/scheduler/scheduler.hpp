@@ -323,6 +323,48 @@ public:
         return m_last_processor_id.load(std::memory_order_relaxed);
     }
     TaskClassId task_class() const noexcept;
+    /// @brief 当前 G 持有的 `sync::Mutex` 数量（仅持锁 park 检测开启时维护）。
+    std::uint32_t held_mutex_count() const noexcept {
+        return m_held_mutexes.load(std::memory_order_relaxed);
+    }
+    /// @brief 记录一次成功加锁（持锁 park 检测）。
+    void note_mutex_locked() noexcept {
+        m_held_mutexes.fetch_add(1, std::memory_order_relaxed);
+    }
+    /// @brief 记录一次解锁；计数已为 0 时保持不变，避免下溢。
+    void note_mutex_unlocked() noexcept {
+        std::uint32_t current = m_held_mutexes.load(std::memory_order_relaxed);
+        while (current != 0U) {
+            if (m_held_mutexes.compare_exchange_weak(
+                    current, current - 1U, std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                return;
+            }
+        }
+    }
+    /// @brief 当前 G 处于 `sync::SpinMutex` 临界区的嵌套深度。
+    /// @details 深度 > 0 表示临界区内**禁止** park；park 入口据此 abort
+    ///          （debug）或降级为普通 Mutex 语义并计数（release）。
+    std::uint32_t no_park_depth() const noexcept {
+        return m_no_park_depth.load(std::memory_order_relaxed);
+    }
+    /// @brief 进入一段「禁止 park」的临界区（`SpinMutex::Lock` 成功后调用）。
+    void enter_no_park_section() noexcept {
+        m_no_park_depth.fetch_add(1, std::memory_order_relaxed);
+    }
+    /// @brief 离开一段「禁止 park」的临界区；计数已为 0 时保持不变。
+    /// @note 跨 G 解锁时由 `SpinMutex` 记录的 owner 调用，因此不会把计数
+    ///       减到别的 G 头上。
+    void leave_no_park_section() noexcept {
+        std::uint32_t current = m_no_park_depth.load(std::memory_order_relaxed);
+        while (current != 0U) {
+            if (m_no_park_depth.compare_exchange_weak(
+                    current, current - 1U, std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                return;
+            }
+        }
+    }
     // 普通 C++ 异常导致的失败是可观察终态，不会静默当作正常完成。
     bool failed() const noexcept;
     std::exception_ptr failure() const;
@@ -418,6 +460,11 @@ private:
     Function m_function;
     TaskOptions m_options;
     std::unique_ptr<go2cpp::Fiber> m_fiber;
+    // 当前 G 持有的 sync::Mutex 数量。只在开启"持锁 park 检测"时维护。
+    std::atomic<std::uint32_t> m_held_mutexes{0};
+    // 当前 G 处于 sync::SpinMutex 临界区的嵌套深度。>0 时 park 入口
+    // 按 debug/release 两种策略处理（abort / 降级计数）。
+    std::atomic<std::uint32_t> m_no_park_depth{0};
     std::atomic<GState> m_state;
     std::atomic<bool> m_queued{false};
     std::atomic<bool> m_deferred_enqueue{false};
@@ -668,6 +715,10 @@ public:
 
     // 返回当前线程正在执行的任务（若有）。这些值只用于观测，不参与所有权。
     static std::shared_ptr<Task> current_task() noexcept;
+    /// @brief 当前 worker 正在执行的 G（裸指针，仅限同线程立即使用）。
+    /// @details 相比 `current_task()` 不复制 shared_ptr、不做原子引用计数，
+    ///          适合加锁热路径上的诊断读取；可能返回 nullptr。
+    static Task* current_task_ptr() noexcept;
     static Scheduler* current_scheduler() noexcept;
     static MId current_machine_id() noexcept;
     static PId current_processor_id() noexcept;
@@ -680,7 +731,8 @@ public:
 
 private:
     // 仅供拥有该 G 执行权的 worker 在 resume 返回后调用。
-    bool requeue_from_worker(const std::shared_ptr<Task>& task);
+    bool requeue_from_worker(const std::shared_ptr<Task>& task,
+                             bool allow_notify = true);
     // 外部 M 唤醒 G 时优先投递到 G 最近运行的 P，失败时回退到普通
     // admission 队列，避免混合锁交接每次争用全局 incoming stripe。
     bool requeue_to_processor(const std::shared_ptr<Task>& task,
@@ -699,6 +751,31 @@ private:
     std::shared_ptr<Lifetime> m_lifetime;
     std::unique_ptr<Impl> m_impl;
 };
+
+// ---------------------------------------------------------------------------
+// 持锁 park 契约计数器
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief 统计 release 模式下「`SpinMutex` 临界区内发生 park」的降级次数。
+ *
+ * @details release 构建不 abort：违反契约的 park 会降级为普通 `Mutex`
+ *          语义（正确但慢），并在第一次发生时打印一次警告。debug 构建下
+ *          同一事件会直接 abort，因此该计数恒为 0。
+ * @return 进程内累计降级次数，单调递增。
+ */
+std::uint64_t spin_mutex_park_degrade_total() noexcept;
+
+/**
+ * @brief 统计普通 `Mutex` 临界区内发生 park 的次数（允许，但告警）。
+ *
+ * @details 计数来源是 `Task::held_mutex_count() > 0 && no_park_depth == 0`
+ *          的所有 park 入口（包括 `read`/`write` 等 hook 触发的 IO park）。
+ *          `sync.cpp` 的 `HeldLockParkCount()` 只覆盖 `sync` 原语自身的
+ *          等待路径；本计数覆盖全部 park 入口，两者独立。
+ * @return 进程内累计次数，单调递增。
+ */
+std::uint64_t mutex_held_park_total() noexcept;
 
 }  // namespace go2cpp::scheduler
 

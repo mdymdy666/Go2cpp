@@ -11,6 +11,209 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+# ★ 2026-10-18（X-37）：sync::Mutex Fiber park/wake 重设计（64 Fiber 91.9µs → 0.60µs）
+
+## 1. 基线（改动前，5 次中位数，rounds/fiber=500，`taskset -c 0-7`）
+
+`benchmarks/futex_mutex_fiber_benchmark.cpp` 场景 B（临界区内 `Scheduler::yield`）：
+
+| sync::Mutex | Fiber=2 | Fiber=8 | Fiber=64 |
+|---|---:|---:|---:|
+| M=1 | 846.5 | 658.8 | 619.8 |
+| M=4 | 1035.7 | 1925.3 | **21465.5** |
+| M=8 | 1017.2 | 3783.9 | **79007.8** |
+
+场景 A（纯自增）：M=8 时 159.5 / 255.2 / 50.7。`procs_running` 峰值 2~10
+（WSL2 的 loadavg 被历史污染，全程只看 `/proc/loadavg` 第 4 字段）。
+
+## 2. 根因（探针实测，不是猜）
+
+探针：编译期 `-DGO2CPP_SYNC_PROBE`，每线程独占 slot、每字段独占 cache line，
+`fetch_add(relaxed)`；只在子进程跑完 `shutdown()` 后汇总一次。
+
+M=8/Fiber=64、32,000 次 lock 的旧实现：
+
+- **协作 yield 循环**（`src/concurrency/sync.cpp:865-901`，`kCooperativeAttempts=256`）：
+  进入 29,281 次，累计 `yield_current()` **7,464,941** 次，其中只有 **196** 次在
+  循环里真抢到锁；其余 29,085 次烧完 256 次 yield 后仍然 park。
+  即每次 lock 平均 **233 次上下文切换**，全是无效功。
+- **第二层（删掉 yield 后才暴露）**：`Scheduler` 在 yield 回队后
+  `notify_one()`（`src/concurrency/scheduler.cpp:3364-3382` 与 3412-3418），
+  唤醒一个睡着的 M，让它从**队尾偷走**刚回队的 G → 一次本地续跑变成
+  4~5µs 的跨 M wake-from-sleep。反证：只保留主循环 notify、关掉回队 notify，
+  M=8/F=64 仍是 **9,371 ns/op**。
+- `kNativeSpinAttempts=2048` 与 Fiber 无关：探针 `spin_iter=0` —— 受管 G 从不
+  走 `!target` 的 native 自旋分支。
+
+## 3. 重设计
+
+1. **删除 256 次 yield 重试**：受管 G 竞争时直接 `WaitNode + park`（park 释放 M）。
+2. **精确唤醒**：yield 回队用 `requeue_from_worker(task, false)`（不 notify）；
+   主循环只在「本 G 真正终止且仍有其他可运行任务」时 notify
+   （`!requeued_self && task->state() != kWaiting && runnable != 0`）。
+3. **不做 Fiber 忙自旋**（实测反而更慢）：自旋预算 0 / 8 / 32 在场景 B M=8 的
+   64 Fiber 分别为 740 / 788 / 770 ns，F=2 为 780 / 1076 / 1327 ns。
+   原因：持锁者要么在另一个 M 上跑（park/wake 交接实测只要 **390ns**），
+   要么自己也已挂起（自旋纯空烧）。
+4. WaitNode 仍走 thread-local 缓存（32 个/线程）：修复后 32,000 次等待
+   `node_alloc=68`、`node_reuse=31,931`，稳态零堆分配。
+
+## 4. 修复后（5 次中位数，rounds=500）
+
+场景 B：M=8 时 **1019.7 / 980.5 / 743.6**；M=4 时 989.7 / 795.7 / 716.0；
+M=1 时 774.9 / 669.4 / 609.0。全部 ok，无死锁。
+64 Fiber：**79,007.8 → 743.6 ns/op（106 倍）**，目标 <5,000 有 6.7 倍余量。
+
+rounds=2000（摊薄调度器启动开销，3 次中位数）场景 B 全部落在
+**560.1 ~ 693.5 ns/op**，M=8/Fiber=64 = **595.8**。
+
+场景 A（rounds=2000）：M=8/Fiber=2 = **82.4**、Fiber=8 = 60.0、Fiber=64 = 335.6。
+rounds=500 时 Fiber=2 的 227~395ns 主要是 8 个 worker 的启动开销
+（0.15ms 固定成本），不是锁本身。
+
+## 5. 验证
+
+- 全量 `ctest -j4`：**113/113 通过**（改动前后各一次以上）；
+- 新增 `tests/concurrency/test_sync.cpp::TestHeldLockParkDetection`：
+  持锁等另一把锁 → 检测计数必须增长，释放后必须正常完成（只告警、不干预）；
+- 基准矩阵 M=1/4/8 × Fiber=2/8/64 全部 `ok`，`procs_running` 峰值 2~5。
+
+## 6. 持锁 park 检测（P1，最小版本）
+
+- `Task` 增加 `m_held_mutexes`（relaxed 计数）与 `held_mutex_count()`；
+- `sync::Mutex::Impl::m_owner` 记录最近一次加锁的受管 G（仅检测开启时）；
+- `SchedulerWaitBackend::Park` 入口检查：持锁数 >0 就累加
+  `HeldLockParkCount()`，并打印前 8 条 `[held-lock-park]` 告警；
+- **不 panic、不强制解锁**（与 Go 一致）；默认 Debug 开、Release 关，
+  `GO2CPP_DETECT_HELD_PARK=1/0` 或 `SetHeldLockParkDetection()` 覆盖；
+- `Mutex::LockFor(timeout, parent)` 本来就有，未重复实现。
+
+## 7. 已知问题 / 未做
+
+- 场景 A（纯自增）在 rounds=500、M=8/Fiber=64 从 50.7 → 431.5 ns，
+  rounds=2000 为 335.6 ns：旧的 50.7 是同一个 yield 循环买来的，
+  该循环正是场景 B 灾难的根因，属于**有意的取舍**（绝对值仍 <0.5µs）。
+- 持锁 park 计数尚未接 `metrics::Registry`（`HeldLockParkCount()` 已可直接接）；
+- owner 是近似值：Go 风格跨 G 解锁时递减只认「解锁者 == 记录 owner」，
+  可能偏高，不会下溢；
+- 未做 TSan 复跑（本轮改的是调度唤醒条件，已由 113/113 与状态机矩阵覆盖）。
+
+## 8. 文件
+
+- `src/concurrency/sync.cpp`：删 yield 重试、持锁检测、owner
+- `src/concurrency/scheduler.cpp`：yield 回队不 notify、精确 notify 条件
+- `include/go2cpp/concurrency/scheduler/scheduler.hpp`：`current_task_ptr()`、持锁计数
+- `include/go2cpp/sync.hpp`：检测 API
+- `benchmarks/futex_mutex_fiber_benchmark.cpp`：`procs_running` 列 + 锁/场景过滤参数
+- `tests/concurrency/test_sync.cpp`：持锁 park 检测测试
+
+# ★ 2026-10-18（X-36）：FutexMutex 唤醒链修复、锁开销矩阵、GMP 生存性
+
+## 1. `core::FutexMutex`：唤醒链修复（关键）
+
+### 缺陷（确定性构造，不是“跑很多次没失败”）
+
+用 `/proc/self/task/<tid>/wchan` 确认线程真正睡进 futex 后构造：
+队列 FIFO 为 `[ghost, real]`。`ghost` 是会被 `FUTEX_WAKE` 命中的等待者，
+醒来后**直接退出**（不接手锁、不碰状态）；`real` 是真实 `FutexMutex::lock()` 等待者。
+
+- 旧实现 `exchange(0)` + 一次 `FUTEX_WAKE(1)`：WAKE **返回 1**，`ghost` 退出后
+  `real` 永久睡死（状态已是 0；后续流程看到 `previous==1` 不再 `FUTEX_WAKE`）。
+- 所以 **“只在 FUTEX_WAKE 返回 0 时重试”覆盖不了这个场景**（此处返回 1）。
+  真正的死点是“唤醒链依赖被唤醒者接手锁”这个假设。
+- 附带发现：旧实现 `exchange(0)` 后，新来的 `CAS(0->1)` / `try_lock` 可以插队，
+  同样绕过仍在睡的等待者。
+
+### 修复（`include/go2cpp/concurrency/core/futex_mutex.hpp`）
+
+状态字改为两位编码：`bit0=locked`、`bit1=可能有线程睡在 futex 上`（0/1/2/3）。
+
+- `lock()` 快路径仍是 `CAS(0 -> 1)`；慢路径 `exchange(3)`，旧值不带 locked 位即接管。
+- `unlock()` 快路径仍是**一次** `fetch_and(~locked)`（无竞争时原子操作数与旧实现相同）。
+- 有等待者时走唤醒链：`FUTEX_WAKE(1)` 返回 0 → `CAS(2 -> 0)` 收尾；返回 >0 但
+  locked 位仍为 0 → 被唤醒者已退出，**继续唤醒下一个**；有人接手立即停；
+  最多 64 轮，超限保留等待者位，由下一个 `lock()` 走慢路径继续推进（有界）。
+- 不变量：只要可能有线程睡在 futex 上，状态就不会是 0/1，`CAS(0->1)` 无法插队。
+
+### 测试（`tests/concurrency/test_futex_mutex.cpp`）
+
+新增 `CheckWakeWithEmptyQueue`（WAKE 返回 0 分支）、`CheckGhostScenarios`
+（1/2/3/10 个幽灵等待者）、`CheckTwoRealWaitersBehindGhosts`、
+`CheckContentionStateReturnsToZero`。
+
+- **回归验证**：换回旧实现后新测试失败 13 项（含 `real_woken`、`ghosts_woken`），
+  25.8s 超时失败；换回修复版全绿（0.19s）。
+- TSan（`-fsanitize=thread` + `setarch -R`）：8 线程互斥 + 跨线程解锁 + `try_lock`
+  混合压力，无竞争报告、计数正确。
+
+## 2. 锁开销矩阵（`benchmarks/lock_overhead_matrix_benchmark.cpp`）
+
+条件：`build-quality` Release（`-O3 -DNDEBUG`）、`taskset -c 0-7`、每格 reps=5
+取中位数、loadavg 0.64。只跑 Release。
+
+| 临界区 | 1 线程 std / futex | 2 线程 | 4 线程 | 8 线程 |
+|---|---|---|---|---|
+| 1 次自增 | 5.14 / 3.86（0.75x） | 16.31 / 11.78（0.72x） | 16.75 / 15.04（0.90x） | 21.28 / 23.40（1.10x） |
+| 10 次自增 | 6.86 / 8.00（1.17x） | 18.87 / 14.76（0.78x） | 21.06 / 13.71（0.65x） | 27.29 / 20.89（0.77x） |
+| 100 次自增 | 29.89 / 24.23（0.81x） | 57.71 / 67.20（1.16x） | 67.25 / 69.63（1.04x） | 88.17 / 92.43（1.05x） |
+| 1000 次自增 | 231.38 / 223.26（0.96x） | 455.80 / 432.40（0.95x） | 548.30 / 527.24（0.96x） | 521.32 / 555.74（1.07x） |
+
+单位 ns/op。另 4 轮（reps=5/7/5/5，loadavg 0.64~1.69）的比值范围：
+1 次自增 0.62~1.43x、10 次 0.65~1.17x、100 次 0.66~1.16x、1000 次 0.77~1.68x
+（1.68x 那格是单次调度抖动，下一轮同格 1.01x）。**结论：短临界区没有显著慢于
+`std::mutex`，长临界区两者趋于一致。**
+
+现有 `go2cpp_futex_mutex_contention_benchmark` 对照（loadavg 0.96）：
+4 线程 median 16.83 ns/op、8 线程 21.68 ns/op（修复前记录为 19.3 / 31.3），
+**修复未造成退化**。
+
+## 3. GMP 生存性（`benchmarks/futex_mutex_fiber_benchmark.cpp`）
+
+条件：`taskset -c 0-7`、rounds/fiber=500、每个组合独立子进程 + `alarm(3s)` 兜底
+（死锁表现为超时，而不是更长的等待）、loadavg 0.59。
+
+### 场景 A：纯自增临界区（FutexMutex 契约内用法）
+
+| 锁 | M=1 | M=4 | M=8 |
+|---|---|---|---|
+| FutexMutex（Fiber=2 / 8 / 64） | 146 / 54 / 16 | 293 / 87 / 28 | 151 / 288 / 44 |
+| sync::Mutex（Fiber=2 / 8 / 64） | 146 / 58 / 14 | 278 / 84 / 24 | 144 / 153 / 56 |
+
+单位 ns/op，全部 ok。总耗时只有 0.14~1.8ms，ns/op 有 ±30% 抖动，只看量级：
+**两者同量级，FutexMutex 在契约内（临界区极短、绝不让出）可以工作。**
+
+### 场景 B：临界区内含协作点（`Scheduler::yield`，等价于“替代 sync::Mutex”）
+
+| 锁 | M=1 | M=4 | M=8 |
+|---|---|---|---|
+| FutexMutex Fiber=2 / 8 / 64 | **死锁 / 死锁 / 死锁** | 894 / **死锁 / 死锁** | 1231 / 7516 / **死锁** |
+| sync::Mutex Fiber=2 / 8 / 64 | 1029 / 654 / 600 | 1096 / 2273 / 21943 | 827 / 2608 / 85100 |
+
+单位 ns/op，粗体为 `alarm` 捕获的死锁。**结论：**
+`FUTEX_WAIT` 睡的是 worker 线程（M）；M 被睡住后该 M 上的其他 G 全部停摆，
+若持有锁的 G 也要靠这个 M 推进就是死锁。**FutexMutex 只能当内部门锁，
+不能替代 `sync::Mutex`。** 场景 B 中 `sync::Mutex` 全部完成，但 64 Fiber 下
+仍退化到 19~85 µs/op（M=1 时 600 ns 的 32~142 倍），说明“250 倍退化”
+在 Fiber + 临界区让出的组合下**仍有另一套问题**，本次没有修它。
+
+## 4. 验证
+
+- `cmake --build build-quality -j8`（all）：成功；
+- `GO2CPP_TEST_FILTER=futex_mutex ./go2cpp_tests`：`all checks passed`（0.19s）；
+- 全量 `ctest -j4`：**113/113 通过**，两次（41.47s / 17.80s，Release，loadavg ≤1.13）。
+
+## 5. 新问题 / 未覆盖
+
+- **并发工作区干扰**：本次工作期间 `src/concurrency/scheduler.cpp`、`sync.cpp`
+  被另一条流多次修改。中途 `go2cpp_state_matrix` 曾失败 2 格
+  （`Runnable(!queued) x park_for_scheduler`），用**原版** `futex_mutex.hpp`
+  重编仍同样失败，确认与本次改动无关；14:16 该文件改动收敛后全量 ctest 113/113。
+- **有界退出的边界**：连续超过 64 个“已退出等待者”时，`unlock()` 会保留
+  等待者位退出；下一个 `lock()` 流量会继续推进。若此后永远没有新流量，
+  剩余等待者不会自行醒来。这是“有界优先”的取舍，未加等待者侧超时兜底。
+- GMP 场景 B 的 `sync::Mutex` 64 Fiber 退化（µs 级）未定位、未修复。
+
+
 # ★ include 通读全部完成（用户要求「两轮一起做」）
 
 ## 2026-10-15：新增 `tools/time`（Go `time` 核心子集）+ 补齐第三方库逐库计划产出时间（第 29 轮）

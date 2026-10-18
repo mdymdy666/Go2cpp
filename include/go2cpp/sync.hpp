@@ -20,7 +20,8 @@ class DebugConditionVariable;
  *
  * @note **持有者身份不可知**：`Mutex::Impl::m_state` 只记录「已持有」与
  *       「有等待者」两个位，不记录 owner（Go 风格所有权允许 A 加锁、B 解锁）。
- *       因此本快照**不包含** owner 字段；要支持它必须新增 owner 追踪并声明行为差异。
+ *       因此本快照**不包含** owner 字段。持锁 park 检测在开启时会额外记录
+ *       最近一次加锁的受管 G（诊断用的近似值），但不作为快照的权威 owner。
  */
 struct MutexDebugSnapshot {
     bool held{false};                  ///< 是否已被持有。
@@ -29,6 +30,25 @@ struct MutexDebugSnapshot {
     std::size_t native_waiters{0};     ///< 其中普通线程的数量。
     std::size_t fiber_waiters{0};      ///< 其中受管 Fiber 的数量（= waiters - native_waiters）。
 };
+
+// ---- 持锁 park 检测 ----
+//
+// 用户场景：G1 `Lock(A)` 成功后 `read(fd)` 被 hook、park 在 IO 上；
+// G2 `Lock(A)` 于是永久阻塞。Go 也不会自动解锁，但 Go2Cpp 把
+// read/write/connect 全 hook 了，用户很难意识到"我持着锁"。
+//
+// 检测**只告警 + 计数**：不 panic、不强制解锁，保持与 Go 一致的语义。
+// 默认 Debug 构建开启、Release 构建关闭；环境变量
+// `GO2CPP_DETECT_HELD_PARK=1/0` 或本组接口可运行时覆盖。
+// 开启后每次加锁/解锁各多一次 relaxed 原子操作，默认关闭时
+// 热路径只多一次原子读。
+
+/** @brief 开启/关闭持锁 park 检测。 */
+void SetHeldLockParkDetection(bool enabled) noexcept;
+/** @brief 当前是否开启持锁 park 检测。 */
+bool HeldLockParkDetection() noexcept;
+/** @brief 进程内累计"持锁 park"次数（可接到 metrics/Prometheus）。 */
+std::uint64_t HeldLockParkCount() noexcept;
 
 /**
  * @brief ConditionVariable 的调试只读快照。

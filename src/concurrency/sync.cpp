@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <mutex>
@@ -100,6 +101,29 @@ int WakeFutex(std::atomic<std::uint32_t>* word, int n) {
 namespace go2cpp::sync {
 namespace {
 
+// ---- 持锁 park 检测（最小实现） ----
+// 计数只在检测开启时维护；默认值见 DetectHeldParkEnabled()。
+std::atomic<int> g_detect_held_park{-1};  // -1=未解析，0/1=显式
+
+bool DetectHeldParkEnabled() noexcept {
+    int mode = g_detect_held_park.load(std::memory_order_relaxed);
+    if (mode < 0) {
+        static const bool default_enabled = [] {
+            if (const char* value = std::getenv("GO2CPP_DETECT_HELD_PARK")) {
+                return std::atoi(value) != 0;
+            }
+#if !defined(NDEBUG)
+            return true;
+#else
+            return false;
+#endif
+        }();
+        mode = default_enabled ? 1 : 0;
+        g_detect_held_park.store(mode, std::memory_order_relaxed);
+    }
+    return mode != 0;
+}
+
 /**
  * @brief Go2Cpp Scheduler 的默认同步等待适配器。
  * @details Scheduler 类型只在 .cpp 内出现，公共 sync 头因此保持与调度器
@@ -115,6 +139,10 @@ public:
         if (scheduler == nullptr || !task) {
             return false;
         }
+        // 持锁 park 的计数/告警统一在 `Task::park_for_scheduler()` 入口做：
+        // 那里覆盖 park_wait / park_io / park_with_reason / cleanup 全部路径，
+        // 而本后端只能覆盖"等 sync 原语"这一类（用户场景是持锁 read → park_io）。
+        // 这里只负责维护 `Task::held_mutex_count()` 这个输入。
         for (;;) {
             if (predicate()) {
                 return true;
@@ -791,8 +819,8 @@ struct Mutex::Impl {
     static constexpr std::uint8_t kLocked = 1U;
     static constexpr std::uint8_t kWaiter = 2U;
     std::atomic<std::uint8_t> m_state{0U};
-    // 只统计已经进入等待队列的普通线程。managed Fiber 在没有 native
-    // waiter 时可以采用有界协作重试，避免每次短临界区都 park。
+    // 只统计已经进入等待队列的普通线程。受管 Fiber 不参与该计数：
+    // 它们竞争时直接 park（不再做协作 yield 重试，见 LockImpl 的说明）。
     std::atomic<std::size_t> m_native_waiters{0U};
     // 队列必须持有 shared_ptr。Unlock 会先从队列取出等待者，再在释放
     // 队列锁后调用 Wake；如果队列只保存裸指针，等待方可能在这段窗口
@@ -800,6 +828,8 @@ struct Mutex::Impl {
     // 从而形成悬空访问。队列持有的引用把节点生命周期延长到 Wake
     // 完成，同时不改变锁外唤醒以避免锁反转的约束。
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
+    // 最近一次成功加锁的受管 G（持锁 park 检测用；0 表示未记录）。
+    std::atomic<std::uint64_t> m_owner{0};
 };
 
 Mutex::Mutex() : m_impl(std::make_unique<Impl>()) {}
@@ -838,10 +868,25 @@ bool Mutex::LockImpl(const ContextPtr& context,
         return false;
     }
 
+    // 只在检测开启时才记录 owner/持锁数；默认关闭时只是一次 relaxed 读。
+    const auto note_lock_held = [this] {
+        if (!DetectHeldParkEnabled()) {
+            return;
+        }
+        Task* const self = Scheduler::current_task_ptr();
+        if (self == nullptr) {
+            return;
+        }
+        self->note_mutex_locked();
+        m_impl->m_owner.store(static_cast<std::uint64_t>(self->id()),
+                              std::memory_order_relaxed);
+    };
+
     std::uint8_t expected_state = 0U;
     if (m_impl->m_state.compare_exchange_strong(
             expected_state, Impl::kLocked, std::memory_order_acquire,
             std::memory_order_relaxed)) {
+        note_lock_held();
         return true;
     }
 
@@ -856,49 +901,34 @@ bool Mutex::LockImpl(const ContextPtr& context,
         return false;
     }
 
-    // 混合并发下，短临界区通常只需要等待当前 Fiber 完成一小段工作。
-    // 没有 native waiter 时，managed G 走有界协作重试，避免每次短竞争
-    // 都进入 WaitNode + park。managed waiter 之间允许有限度地越过队列，
-    // 以换取吞吐；一旦有普通线程 waiter，最多再重试 4 次后回到 FIFO
-    // handoff，保证线程不会被 Fiber 长时间压住。预算耗尽后仍会进入
-    // WaitNode + park，不会无界占用 M。
-    if (target && target.scheduler->processor_count() > 1 &&
-        m_impl->m_native_waiters.load(std::memory_order_acquire) == 0U &&
-        context == nullptr) {
-        // 竞争刚出现时，临界区通常仍在另一个 P 上运行。协作让出可以
-        // 避免把短临界区升级为 Fiber 挂起/恢复和跨 M 唤醒；单 P 不走
-        // 这条路径，因此不会把唯一 M 忙等住。预算耗尽后再进入 waiter。
-        // 只给当前 G 一个极小的协作窗口，避免短临界区立即创建等待
-        // 节点；窗口耗尽后一次性进入 FIFO 等待队列。不能使用长自旋，
-        // 否则一个 P 上的持锁 G 可能被同一 P 的等待 G 阻塞。
-        // 受管 Fiber 不在这里反复做完整 yield。等待节点的 park/wake
-        // 本身已经是无丢失唤醒的轻路径；重复 yield 会把同一批 G 重新
-        // 放回 P 队列，制造秒级长尾。
-        constexpr int kCooperativeAttempts = 256;
-        for (int attempt = 0; attempt < kCooperativeAttempts; ++attempt) {
-            // native waiter 出现后，重试预算被限制为 4 次，避免 Fiber
-            // 无限越过普通线程；这次检查放在每轮 CAS 前。
-            if (m_impl->m_native_waiters.load(std::memory_order_acquire) !=
-                    0U &&
-                attempt >= 4) {
-                break;
-            }
-            expected_state = 0U;
-            if (m_impl->m_state.compare_exchange_weak(
-                    expected_state, Impl::kLocked,
-                    std::memory_order_acquire,
-                    std::memory_order_relaxed)) {
-                return true;
-            }
-            if (!ignore_task_cancellation &&
-                target.task->cancellation_requested()) {
-                break;
-            }
-            if (!target.scheduler->yield_current()) {
-                break;
-            }
-        }
-    }
+    // 受管 Fiber 的竞争路径：**直接进入 WaitNode + park**，不忙自旋、不 yield。
+    //
+    // ## 为什么删掉旧的"协作 yield 重试"（2026-10-18 探针实测）
+    //
+    // 旧实现对受管 G 最多做 256 次 `yield_current()`：每次都是一次完整的
+    // Fiber 挂起 + 重新入队。64 Fiber / 8 M、32,000 次 lock 的探针口径：
+    //   进入协作循环 29,281 次，累计 yield 7,464,941 次，其中只有 196 次
+    //   在循环里真正抢到锁；其余 29,085 次烧完 256 次 yield 后仍然 park。
+    // 平均每次 lock 233 次上下文切换，全是无效功 —— 这就是
+    // M=8/Fiber=64 退化到 73,000~92,000 ns/op 的原因。同一负载 M=1 不走
+    // 这条 yield 路径（直接 park），只要 634 ns/op，相差 115 倍。
+    //
+    // ## 为什么最终连"忙自旋"也不做
+    //
+    // 试过三种自旋预算（8 / 32 上限的自适应衰减、以及不限队列的 64/256），
+    // 5 次中位数对比（场景 B，M=8）：
+    //   自旋 0   ：Fiber=2 780ns、Fiber=8 893ns、Fiber=64 740ns
+    //   自旋 8   ：Fiber=2 1076ns、Fiber=8 948ns、Fiber=64 788ns
+    //   自旋 32  ：Fiber=2 1327ns、Fiber=8 950ns、Fiber=64 770ns
+    // 自旋只会变慢。原因：受管 Fiber 上，持锁者要么正跑在**另一个 M** 上
+    // （unlock→TryFinish→wake 的 park/wake 交接实测只要 390ns，比自旋更
+    // 便宜），要么自己已经 park/yield（自旋纯属空烧）。自旋还要么挡住本 M
+    // 上其他 G，要么越过 FIFO 队列插队。
+    //
+    // 因此这里的策略是：竞争时直接把当前 G 挂起（park 会释放 M 让其他 G
+    // 继续跑），由 Unlock 精确唤醒 FIFO 队首。等待者的控制块走 thread-local
+    // 缓存复用（32 个/线程），稳态零堆分配。
+
     // std::mutex 在 Linux 上也会先进行短暂自旋；混合锁的 native
     // 调用者如果立即进入条件变量慢路径，会把很短的临界区放大成一次
     // futex 唤醒。这里保留较小的有界自旋，并且一旦队列发布立即退出，
@@ -967,6 +997,7 @@ bool Mutex::LockImpl(const ContextPtr& context,
                         expected_state, Impl::kLocked,
                         std::memory_order_acquire,
                         std::memory_order_relaxed)) {
+                    note_lock_held();
                     release_waiter();
                     return true;
                 }
@@ -1036,6 +1067,7 @@ bool Mutex::LockImpl(const ContextPtr& context,
     if (owned_waiter) {
         ReleaseWaitNode(std::move(owned_waiter));
     }
+    note_lock_held();
     return true;
 }
 
@@ -1063,6 +1095,17 @@ bool Mutex::TryLock() noexcept {
 }
 
 void Mutex::Unlock() {
+    // 持锁 park 检测：只有"解锁者就是记录里的 owner"时才递减，
+    // 避免 Go 风格跨 G 解锁把计数减错。
+    if (DetectHeldParkEnabled()) {
+        Task* const self = Scheduler::current_task_ptr();
+        if (self != nullptr &&
+            m_impl->m_owner.load(std::memory_order_relaxed) ==
+                static_cast<std::uint64_t>(self->id())) {
+            self->note_mutex_unlocked();
+            m_impl->m_owner.store(0U, std::memory_order_relaxed);
+        }
+    }
     // 无等待者时只需一次 CAS，不进入队列互斥量。若等待者位同时存在，
     // CAS 必定失败并转入下面的 FIFO 交接路径。
     std::uint8_t expected_state = Impl::kLocked;
@@ -1367,6 +1410,18 @@ bool WaitGroup::WaitFor(ContextDuration timeout, const ContextPtr& parent) {
 std::int64_t WaitGroup::Count() const noexcept {
     std::lock_guard<std::mutex> lock(m_impl->m_mutex);
     return m_impl->m_count;
+}
+
+void SetHeldLockParkDetection(bool enabled) noexcept {
+    g_detect_held_park.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+bool HeldLockParkDetection() noexcept { return DetectHeldParkEnabled(); }
+
+std::uint64_t HeldLockParkCount() noexcept {
+    // 单一计数源：`Task::park_for_scheduler()` 覆盖所有 park 路径
+    // （含 park_io），比 sync 自己的等待后端更完整。
+    return scheduler::mutex_held_park_total();
 }
 
 }  // namespace go2cpp::sync

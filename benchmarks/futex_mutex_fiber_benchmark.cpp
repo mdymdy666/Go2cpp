@@ -37,17 +37,21 @@
 #include "go2cpp/sync.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
+#include <poll.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
 
 namespace {
 
@@ -63,6 +67,37 @@ double ReadLoadAverage() {
         return load;
     }
     return -1.0;
+}
+
+// `/proc/loadavg` 第 4 字段形如 `8/704`：分子 = 当前处于 R 状态的
+// 任务数（procs_running），分母 = 总任务数。
+//
+// ## 为什么必须看这个而不是 loadavg
+//
+// WSL2 的 loadavg 会被**历史**不可中断任务长期污染（本机曾出现 13600 的
+// 15 分钟均值，而实际 procs_running 只有个位数），用它判断"环境是否安静"
+// 会把几十分钟前的压测残留当成当前负载。procs_running 是**瞬时**值，
+// 才反映跑基准这一刻 CPU 上真正有多少可运行任务。
+int ReadProcsRunning() {
+    if (std::FILE* file = std::fopen("/proc/loadavg", "r")) {
+        double one = 0.0;
+        double five = 0.0;
+        double fifteen = 0.0;
+        char running[64] = {0};
+        const int matched = std::fscanf(file, "%lf %lf %lf %63s", &one, &five,
+                                        &fifteen, running);
+        std::fclose(file);
+        if (matched != 4) {
+            return -1;
+        }
+        // 只取 `/` 前的分子。
+        int value = 0;
+        if (std::sscanf(running, "%d/", &value) != 1) {
+            return -1;
+        }
+        return value;
+    }
+    return -1;
 }
 
 struct ChildResult {
@@ -163,7 +198,8 @@ const char* LockName(LockKind kind) {
  * @return true 正常完成；false 表示子进程被 alarm 杀死（死锁/超时）或失败。
  */
 bool RunInChild(LockKind kind, int machines, int fibers, int rounds,
-                bool yield_inside, int alarm_seconds, ChildResult* out) {
+                bool yield_inside, int alarm_seconds, ChildResult* out,
+                int* peak_procs_running) {
     Pipe pipe;
     if (!pipe.Open()) {
         return false;
@@ -193,7 +229,27 @@ bool RunInChild(LockKind kind, int machines, int fibers, int rounds,
     ChildResult result{};
     ssize_t received = 0;
     // 子进程最多写 sizeof(result) 字节；循环读直到收满或 EOF。
+    // 用 poll(20ms) 代替阻塞 read，是为了在等子进程跑完的同时周期采样
+    // procs_running（瞬时 R 任务数），拿到这一格的峰值而不是只看首尾。
+    int peak = ReadProcsRunning();
     while (received < static_cast<ssize_t>(sizeof(result))) {
+        struct pollfd descriptor {};
+        descriptor.fd = pipe.read_fd;
+        descriptor.events = POLLIN;
+        const int ready = ::poll(&descriptor, 1, 20);
+        if (ready == 0) {
+            const int sampled = ReadProcsRunning();
+            if (sampled > peak) {
+                peak = sampled;
+            }
+            continue;
+        }
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
         const ssize_t chunk =
             ::read(pipe.read_fd, reinterpret_cast<char*>(&result) + received,
                    sizeof(result) - static_cast<std::size_t>(received));
@@ -201,6 +257,9 @@ bool RunInChild(LockKind kind, int machines, int fibers, int rounds,
             break;
         }
         received += chunk;
+    }
+    if (peak_procs_running != nullptr) {
+        *peak_procs_running = peak;
     }
     pipe.CloseRead();
 
@@ -223,6 +282,37 @@ bool RunInChild(LockKind kind, int machines, int fibers, int rounds,
 
 }  // namespace
 
+/// 过滤参数：`argv[3] = both|futex|sync`、`argv[4] = both|plain|yield`。
+/// 全矩阵一次跑完在 64 Fiber 慢路径下要几十秒，按格过滤才能做到
+/// "每次压测都带 timeout、一次只跑一个组合"的纪律。
+struct Filters {
+    bool futex{true};
+    bool sync{true};
+    bool plain{true};
+    bool yield{true};
+};
+
+Filters ParseFilters(int argc, char** argv) {
+    Filters filters;
+    if (argc > 3) {
+        const std::string lock = argv[3];
+        if (lock == "futex") {
+            filters.sync = false;
+        } else if (lock == "sync") {
+            filters.futex = false;
+        }
+    }
+    if (argc > 4) {
+        const std::string scenario = argv[4];
+        if (scenario == "plain") {
+            filters.yield = false;
+        } else if (scenario == "yield") {
+            filters.plain = false;
+        }
+    }
+    return filters;
+}
+
 int main(int argc, char** argv) {
     int rounds = 500;
     int alarm_seconds = 3;
@@ -238,43 +328,52 @@ int main(int argc, char** argv) {
             alarm_seconds = value;
         }
     }
+    const Filters filters = ParseFilters(argc, argv);
 
     const std::vector<int> machine_list = {1, 4, 8};
     const std::vector<int> fiber_list = {2, 8, 64};
 
     std::printf("=== GMP 环境：FutexMutex（线程级）vs sync::Mutex（协程级）===\n");
-    std::printf("rounds/fiber=%d  alarm=%ds  loadavg=%.2f\n\n", rounds,
-                alarm_seconds, ReadLoadAverage());
+    std::printf("rounds/fiber=%d  alarm=%ds  loadavg=%.2f  procs_running=%d\n\n",
+                rounds, alarm_seconds, ReadLoadAverage(), ReadProcsRunning());
 
     // 两种临界区形态：
     //   plain —— 只做一次自增（FutexMutex 契约内的极短门用法）；
     //   yield —— 临界区内让出一次（把它当 sync::Mutex 用的真实后果）。
     for (const bool yield_inside : {false, true}) {
+        if (yield_inside ? !filters.yield : !filters.plain) {
+            continue;
+        }
         std::printf("## %s\n\n",
                     yield_inside
                         ? "场景 B：临界区内含协作点（yield）——检验能否替代 sync::Mutex"
                         : "场景 A：纯自增临界区（契约内用法）");
-        std::printf("| 锁 | M | Fiber | 总耗时 ms | ns/op | 结果 |\n");
-        std::printf("|---|---|---|---|---|---|\n");
+        std::printf("| 锁 | M | Fiber | 总耗时 ms | ns/op | 结果 | procs_running 峰值 |\n");
+        std::printf("|---|---|---|---|---|---|---|\n");
         std::fflush(stdout);
 
         for (const LockKind kind : {LockKind::kFutex, LockKind::kSync}) {
+            if (kind == LockKind::kFutex ? !filters.futex : !filters.sync) {
+                continue;
+            }
             for (const int machines : machine_list) {
                 for (const int fibers : fiber_list) {
                     ChildResult result{};
+                    int peak = -1;
                     const bool ok =
                         RunInChild(kind, machines, fibers, rounds, yield_inside,
-                                   alarm_seconds, &result);
+                                   alarm_seconds, &result, &peak);
                     const long long ops =
                         static_cast<long long>(fibers) * rounds;
                     if (ok) {
-                        std::printf("| %s | %d | %d | %.2f | %.1f | ok |\n",
+                        std::printf("| %s | %d | %d | %.2f | %.1f | ok | %d |\n",
                                     LockName(kind), machines, fibers, result.ms,
-                                    result.ms * 1e6 / static_cast<double>(ops));
+                                    result.ms * 1e6 / static_cast<double>(ops),
+                                    peak);
                     } else {
                         std::printf(
-                            "| %s | %d | %d | - | - | **DEADLOCK/超时** |\n",
-                            LockName(kind), machines, fibers);
+                            "| %s | %d | %d | - | - | **DEADLOCK/超时** | %d |\n",
+                            LockName(kind), machines, fibers, peak);
                     }
                     std::fflush(stdout);
                 }
@@ -283,7 +382,8 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
-    std::printf("final loadavg=%.2f\n", ReadLoadAverage());
+    std::printf("final loadavg=%.2f  procs_running=%d\n", ReadLoadAverage(),
+                ReadProcsRunning());
     std::printf("log: FutexMutex 竞争时 FUTEX_WAIT 睡的是 worker 线程（M）。"
                 "M 被睡住后该 M 上的其他 G 全部停摆；若持有锁的 G 也在等 M，"
                 "即死锁。sync::Mutex 应全部 ok。\n");
