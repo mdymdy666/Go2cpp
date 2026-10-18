@@ -954,17 +954,69 @@ public:
     // 的新 G，worker 会轮询这些条带并按原有的状态机认领任务。
     static constexpr std::size_t kIncomingStripeCount = 16;
 
+    /**
+     * @brief 逻辑处理器 P：一个本地 runqueue + 活动 M 计数。
+     *
+     * ## 定位
+     *
+     * P 的数量（`processor_count`）决定真正的并行度。M 必须附着到一个 P 才能取任务；
+     * G 在 P 的**本地队列**里排队，队列空时从别的 P 窃取（work stealing）。
+     *
+     * ## 为什么有本地队列
+     *
+     * 这是 GMP 的核心优化：worker 把 G 放回自己的 P 只需要一把 P 队列锁
+     * （`requeue_from_worker`），只有跨 P 才走更重的路径。§1.7 记录过「把窃取
+     * 移出全局锁」的尝试反而 -34%，所以本地队列边界不要动。
+     *
+     * ## 不变量
+     *
+     * - `queue` 由 `mutex` 保护；`state`/`active_machines`/`running_machines` 是原子
+     *   （快照可在锁外读，但**增减在 `Impl::mutex` 内**）；
+     * - `running_machines == 0` ⇒ 该 P 当前没有 M 在执行 G（唤醒判定用它）；
+     * - `active_machines` 含被 blocking/detached 的 M。
+     */
     struct Processor {
         explicit Processor(PId processor_id) : id(processor_id) {}
 
+        /// @brief P 编号（0 起，0 合法；不要用 `!=0` 判断存在）。
         PId id;
+        /// @brief 保护 queue；本地入队/出队/窃取都拿它。
         mutable std::mutex mutex;
+        /// @brief 本地 runqueue（FIFO）；worker 优先从这里取 G。
         std::deque<std::shared_ptr<Task>> queue;
+        /// @brief 快照用状态（idle/running/dead）。
         std::atomic<PState> state{PState::kIdle};
+        /// @brief 附着到本 P 的 M 总数（含 blocking/detached 的 M）。
         std::atomic<std::size_t> active_machines{0};
+        /// @brief 正在执行 G 的 M 数；唤醒判定用它区分「有人干活」与「都在等」。
         std::atomic<std::size_t> running_machines{0};
     };
 
+    /**
+     * @brief OS 线程 M：一个 `std::thread` + 首选 P + 阻塞记账。
+     *
+     * ## 定位
+     *
+     * M 是唯一真正执行代码的实体，由 `worker_loop` 驱动。两类 M 的生命周期不同：
+     *
+     * | 类型 | `replacement` | 创建时机 | 退休条件 |
+     * |---|---|---|---|
+     * | **基础 M** | false | 启动时创建 `min_workers` 个 | **永不因空闲退出**，常驻到 shutdown |
+     * | **补充 M** | true | `blocking_workers > 0` 时 | `blocking_workers` 归零后**立即退休** |
+     *
+     * ## 阻塞记账（sysmon 用）
+     *
+     * `processor_detached` / `blocking_since_ns` / `blocking_task` 由 `BlockingRegion`
+     * 与 sysmon 共同读写：detach 后该 M 不再计入 P 的 attached 计数，sysmon 可据
+     * `long_syscall_threshold` 为它申请一个替代 M。
+     *
+     * ## 不变量
+     *
+     * - `replacement` 在线程启动前写一次、之后只读；
+     * - 所有字段要么由 worker 原子更新、要么在 `Impl::mutex` 下修改 ——
+     *   **没有「worker 不持锁却做非原子写」的例外**（`machines()` 快照会在别的线程读）；
+     * - `machine id` 全局递增、不从 0 开始，不要断言 `machine.0`。
+     */
     struct Machine {
         explicit Machine(MId machine_id, PId processor_id,
                          bool is_replacement)

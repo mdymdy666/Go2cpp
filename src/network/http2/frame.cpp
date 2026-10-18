@@ -1,6 +1,26 @@
 /**
  * @file frame.cpp
  * @brief HTTP/2 帧层实现（RFC 9113 §4 / §6）。
+ *
+ * ## 模块定位
+ * 帧层实现：`Connection` 只通过 `DecodeFrame()` / `ParseXxx` / `MakeXxx` 与它打交道。
+ * 本文件不持有状态、不分配长寿命对象，所有函数都是「输入校验 + 结构体映射」。
+ *
+ * ## 本文件定义什么
+ * - 字节序小工具：`ReadUint24` / `ReadUint32` / `WriteUint24` / `WriteUint32`；
+ * - 帧头：`DecodeFrameHeader()` / `EncodeFrameHeader()`；
+ * - 通用帧：`DecodeFrame()`（增量解析，返回 `kNeedMore`）；
+ * - 各语义帧的 `ParseXxx` 与 `MakeXxx`；
+ * - `StripPadding()`：DATA/HEADERS 共用的 padding 剥离。
+ *
+ * ## 阅读建议
+ * 先看 `DecodeFrame()`（先判长度、再判 stream id、最后判 payload 是否收全），
+ * 再看任一 `ParseXxx` —— 它们的形状完全一致：校验类型/流 id/payload 长度，再取字段。
+ *
+ * ## 边界与陷阱
+ * - 所有 `ParseXxx` 只做「帧内自洽性」校验，不查流状态（那是 `Connection` 的事）；
+ * - `DecodeFrame()` 的 `kNeedMore` 优先于其它错误：帧可能只是还没收全；
+ * - `Make*` 必须同步维护 `header.length`，否则线上字节数与声明不符。
  */
 #include "go2cpp/network/http2/frame.hpp"
 
@@ -55,6 +75,17 @@ bool RequiresNonZeroStream(FrameType type) noexcept {
 }
 
 /// 从 payload 中剥掉 padding（DATA/HEADERS 共用）。
+/**
+ * @brief 从 payload 中剥掉 padding（DATA/HEADERS 共用）。
+ *
+ * ## 步骤
+ * step1. 未置 PADDED 位则原样返回 `[0, size)`；
+ * step2. PADDED 时首字节是 pad length，必须满足 `pad_length + 1 <= payload.size()`；
+ * step3. 返回 `[1, size - pad_length)`，把校验过的区间交给调用方。
+ *
+ * ## 失败语义
+ * payload 为空或 padding 越界都返回 `kProtocolError`（不是 `kNeedMore`：帧已完整）。
+ */
 FrameStatus StripPadding(const std::vector<std::uint8_t>& payload, bool padded,
                          std::size_t* begin, std::size_t* end,
                          std::string* error) {
@@ -63,6 +94,7 @@ FrameStatus StripPadding(const std::vector<std::uint8_t>& payload, bool padded,
     if (!padded) {
         return FrameStatus::kOk;
     }
+    // step1/2: PADDED 帧至少要有一个 pad length 字节。
     if (payload.empty()) {
         if (error != nullptr) {
             *error = "PADDED 帧的 payload 为空，缺少 pad length 字节";
@@ -114,6 +146,13 @@ const char* ToString(FrameType type) noexcept {
 // 帧头
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief 解析 9 字节帧头。
+ *
+ * ## 说明
+ * `in` 不足 9 字节返回 `kNeedMore`（不是错误）；stream id 的最高位按 RFC 9113 §4.1
+ * 被忽略（`MaskStreamId`）。
+ */
 FrameStatus DecodeFrameHeader(const std::uint8_t* in, std::size_t length,
                               FrameHeader* out) noexcept {
     if (out == nullptr) {
@@ -137,6 +176,18 @@ void EncodeFrameHeader(const FrameHeader& header, std::uint8_t out[kFrameHeaderS
     WriteUint32(MaskStreamId(header.stream_id), out + 5);
 }
 
+/**
+ * @brief 从字节流中解析一个完整帧（增量解析）。
+ *
+ * ## 步骤
+ * step1. 先解析帧头；不足 9 字节 -> `kNeedMore`；
+ * step2. 校验声明长度不超过对端 `max_frame_size`（超限立即报错，不等 payload）；
+ * step3. 校验 stream id 规则（SETTINGS/PING/GOAWAY 必须为 0，其余必须非 0）；
+ * step4. payload 未收全 -> `kNeedMore`，收全则拷贝并写 `consumed`。
+ *
+ * ## 边界
+ * 校验顺序很关键：长度与 stream id 都能在拿到帧头后立即判定，不必等 payload。
+ */
 FrameStatus DecodeFrame(const std::uint8_t* in, std::size_t length, Frame* out,
                         std::size_t* consumed,
                         std::uint32_t max_frame_size) noexcept {
@@ -148,6 +199,7 @@ FrameStatus DecodeFrame(const std::uint8_t* in, std::size_t length, Frame* out,
     if (header_status != FrameStatus::kOk) {
         return header_status;
     }
+    // step2: 超限不必等 payload，直接报错。
     if (header.length > max_frame_size) {
         // 先判长度：超限说明对端违约，不必等 payload 收全
         return FrameStatus::kFrameSizeError;
@@ -159,6 +211,7 @@ FrameStatus DecodeFrame(const std::uint8_t* in, std::size_t length, Frame* out,
     if (RequiresNonZeroStream(header.type) && header.stream_id == 0) {
         return FrameStatus::kProtocolError;
     }
+    // step4: payload 未收全，等更多字节。
     if (length < kFrameHeaderSize + header.length) {
         return FrameStatus::kNeedMore;
     }
@@ -172,6 +225,14 @@ FrameStatus DecodeFrame(const std::uint8_t* in, std::size_t length, Frame* out,
 // SETTINGS
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief 解析 SETTINGS payload。
+ *
+ * ## 步骤
+ * step1. 校验帧类型 SETTINGS 且 stream id 为 0；
+ * step2. ACK 帧必须空 payload，非 ACK 帧长度必须是 6 的倍数；
+ * step3. 每 6 字节拆成 (id, value)，按出现顺序保留（重复项由上层决定语义）。
+ */
 FrameStatus ParseSettings(const Frame& frame, SettingsFrame* out, std::string* error) {
     if (out == nullptr) {
         return FrameStatus::kProtocolError;
@@ -186,6 +247,7 @@ FrameStatus ParseSettings(const Frame& frame, SettingsFrame* out, std::string* e
     }
     out->ack = (frame.header.flags & FrameFlags::kAck) != 0;
     out->entries.clear();
+    // step2: ACK 必须空 payload（RFC 9113 §6.5）。
     if (out->ack) {
         if (!frame.payload.empty()) {
             if (error != nullptr) *error = "SETTINGS ACK 的 payload 必须为空";
@@ -197,6 +259,7 @@ FrameStatus ParseSettings(const Frame& frame, SettingsFrame* out, std::string* e
         if (error != nullptr) *error = "SETTINGS payload 长度必须是 6 的倍数";
         return FrameStatus::kProtocolError;
     }
+    // step3: 每个条目是 2 字节 id + 4 字节 value。
     for (std::size_t offset = 0; offset + 6 <= frame.payload.size(); offset += 6) {
         SettingsEntry entry;
         entry.id = static_cast<std::uint16_t>(
@@ -316,6 +379,17 @@ Frame MakeData(std::uint32_t stream_id, bool end_stream,
 // HEADERS / CONTINUATION
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief 解析 HEADERS（含可选的 PADDED 与 PRIORITY 字段）。
+ *
+ * ## 步骤
+ * step1. 校验类型与 stream id，剥 padding；
+ * step2. 若带 PRIORITY 标志，跳过固定 5 字节（1 字节独占+依赖 + 1 字节权重）；
+ * step3. 剩余字节即 HPACK header block 片段（可能只是第一片）。
+ *
+ * ## 边界
+ * `end_headers` 为假表示后面还有 CONTINUATION，由 `AssembleHeaderBlock()` 拼。
+ */
 FrameStatus ParseHeaders(const Frame& frame, HeadersFrame* out, std::string* error) {
     if (out == nullptr) {
         return FrameStatus::kProtocolError;
@@ -332,10 +406,12 @@ FrameStatus ParseHeaders(const Frame& frame, HeadersFrame* out, std::string* err
     const bool has_priority = (frame.header.flags & FrameFlags::kPriority) != 0;
     std::size_t begin = 0;
     std::size_t end = 0;
+    // step1: 先剥 padding，再处理优先级字段。
     auto status = StripPadding(frame.payload, padded, &begin, &end, error);
     if (status != FrameStatus::kOk) {
         return status;
     }
+    // step2: 优先级字段固定 5 字节，解析但不使用。
     if (has_priority) {
         // 优先级字段固定 5 字节（1 字节独占+依赖 + 1 字节权重）
         if (end < begin + 5) {
@@ -466,6 +542,13 @@ Frame MakeGoAway(std::uint32_t last_stream_id, ErrorCode error_code,
     return frame;
 }
 
+/**
+ * @brief 解析 WINDOW_UPDATE（stream id 为 0 表示连接级）。
+ *
+ * ## 说明
+ * increment 是 31 位值，为 0 属于协议错误（RFC 9113 §6.9）；本文件只做形状校验，
+ * 窗口是否溢出由 `Connection` 在扣/补时判断。
+ */
 FrameStatus ParseWindowUpdate(const Frame& frame, WindowUpdateFrame* out,
                               std::string* error) {
     if (out == nullptr) {
