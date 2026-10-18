@@ -967,6 +967,42 @@ public:
         }
     }
 
+    /**
+     * @brief IO 空闲轮询回调（IOManager 注入，见 Scheduler::set_io_idle_poller）。
+     * @details poll 在 worker 线程里直接做 epoll_wait；wake 写 eventfd 把正
+     *          睡在 epoll_wait 上的 worker 踢醒。二者都只在安装了回调后使用。
+     */
+    struct IoIdlePoller final {
+        std::function<int(int)> poll;
+        std::function<void()> wake;
+    };
+
+    /**
+     * @brief 通知一个空闲 worker 可能有新工作。
+     * @details 条件变量通知只对睡在调度器条件变量上的 worker 有效；当有
+     *          worker 正睡在 IO 后端的 epoll_wait 上时，还必须写一次 eventfd，
+     *          否则它会一直等到自己的超时。两者都只是提示：worker 被唤醒后
+     *          必然重新检查队列，因此不会丢工作。
+     */
+    void notify_worker() noexcept {
+        condition.notify_one();
+        const IoIdlePoller* poller = io_poller.load(std::memory_order_acquire);
+        if (poller != nullptr && poller->wake &&
+            io_waiting_workers.load(std::memory_order_acquire) != 0) {
+            poller->wake();
+        }
+    }
+
+    /// @brief notify_worker 的广播版本；语义相同，供 shutdown/draining 使用。
+    void notify_all_workers() noexcept {
+        condition.notify_all();
+        const IoIdlePoller* poller = io_poller.load(std::memory_order_acquire);
+        if (poller != nullptr && poller->wake &&
+            io_waiting_workers.load(std::memory_order_acquire) != 0) {
+            poller->wake();
+        }
+    }
+
     static std::size_t registry_stripe(const Task& task) noexcept {
         // GId 单调递增，低位分片即可；条带数为 2 的幂，编译器会将
         // 模运算优化为按位与。
@@ -1253,7 +1289,7 @@ public:
             }
         }
         lock.unlock();
-        condition.notify_all();
+        notify_all_workers();
     }
 
     // sysmon 只做可逆的资源记账：它不会从别的线程跳转或终止正在
@@ -1313,7 +1349,7 @@ public:
         }
         if (detached_count != 0) {
             maybe_grow(scheduler);
-            condition.notify_all();
+            notify_all_workers();
         }
     }
 
@@ -1615,6 +1651,15 @@ public:
     // 接口（wait / wait_for / wait_until / notify_*）与 cv 完全一致，
     // 因此调度器其余 27 处调用点无需改动。
     core::ParkingCondition condition;
+    // M 自己轮询 IO 后端的回调；空表示沿用「poller 线程 + 条件变量唤醒」
+    // 的传统路径（纯计算调度器、以及未使用 IOManager 的测试）。
+    std::atomic<IoIdlePoller*> io_poller{nullptr};
+    // 回调所有权单独持有：io_poller 只发布裸指针，避免 worker 热路径反复
+    // 复制 std::function。
+    std::unique_ptr<IoIdlePoller> io_poller_owner;
+    // 当前正停在 IO 后端 epoll_wait 里的 worker 数。只有它非零时 notify
+    // 才需要写 eventfd。
+    std::atomic<std::size_t> io_waiting_workers{0};
     std::deque<std::shared_ptr<Task>> global_queue;
     std::shared_ptr<Task> emergency_head;
     std::shared_ptr<Task> emergency_tail;
@@ -1736,7 +1781,7 @@ void Scheduler::start() {
         throw;
     }
     lock.unlock();
-    m_impl->condition.notify_all();
+    m_impl->notify_all_workers();
     m_impl->emit_event(SchedulerEvent{SchedulerEventType::kStarted});
 }
 
@@ -1825,7 +1870,7 @@ bool Scheduler::shutdown_for(
         completion_notifications.clear();
         return true;
     }
-    m_impl->condition.notify_all();
+    m_impl->notify_all_workers();
 
     if (called_from_worker) {
         for (auto& task : deferred_destruction) {
@@ -1868,7 +1913,7 @@ bool Scheduler::shutdown_for(
         m_impl->draining.store(false, std::memory_order_release);
     }
     m_impl->stop_sysmon(true);
-    m_impl->condition.notify_all();
+    m_impl->notify_all_workers();
 
     // 先等待 worker 主动退出；这样有界调用不会在 timeout 后把仍运行的
     // std::thread 留给析构路径。若本轮超时，stopping 保持为 true，后续
@@ -2037,6 +2082,35 @@ SchedulerObserverPtr Scheduler::observer() const noexcept {
     }
 }
 
+bool Scheduler::set_io_idle_poller(std::function<int(int)> poll,
+                                  std::function<void()> wake) {
+    if (!m_impl || !poll) {
+        return false;
+    }
+    if (m_impl->io_poller.load(std::memory_order_acquire) != nullptr ||
+        m_impl->started.load(std::memory_order_acquire)) {
+        // worker 已经在跑；运行期替换回调和 std::function 的并发读写无法
+        // 用一次发布保证，因此只允许 start() 之前安装一次。
+        return false;
+    }
+    std::unique_ptr<Impl::IoIdlePoller> owner;
+    try {
+        owner = std::make_unique<Impl::IoIdlePoller>();
+        owner->poll = std::move(poll);
+        owner->wake = std::move(wake);
+    } catch (...) {
+        return false;
+    }
+    m_impl->io_poller_owner = std::move(owner);
+    m_impl->io_poller.store(m_impl->io_poller_owner.get(),
+                            std::memory_order_release);
+    return true;
+}
+
+bool Scheduler::has_io_idle_poller() const noexcept {
+    return m_impl && m_impl->io_poller.load(std::memory_order_acquire) != nullptr;
+}
+
 std::shared_ptr<Task> Scheduler::spawn(Task::Function function) {
     return spawn(std::move(function), TaskOptions{});
 }
@@ -2196,7 +2270,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
                 std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
                 m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
                 m_impl->emergency_enqueue_locked(task);
-                m_impl->condition.notify_one();
+                m_impl->notify_worker();
                 return true;
             }
             task->clear_queued();
@@ -2292,7 +2366,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         (!processor_workers_missing && (maintenance_ticket & 1023U) == 0U)) {
         m_impl->maybe_grow(this);
     }
-    m_impl->condition.notify_one();
+    m_impl->notify_worker();
     return true;
 }
 
@@ -2344,7 +2418,7 @@ bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
         return false;
     }
     if (notify_worker) {
-        m_impl->condition.notify_one();
+        m_impl->notify_worker();
     }
     return true;
 }
@@ -2404,7 +2478,7 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
         return enqueue(task);
     }
     if (notify_worker) {
-        m_impl->condition.notify_one();
+        m_impl->notify_worker();
     }
     return true;
 }
@@ -2623,7 +2697,7 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
         task->clear_queued();
         return enqueue(task);
     }
-    m_impl->condition.notify_one();
+    m_impl->notify_worker();
     return true;
 }
 
@@ -2762,7 +2836,7 @@ bool Scheduler::wake_io_batch(
             }
         }
         if (notify_worker) {
-            m_impl->condition.notify_one();
+            m_impl->notify_worker();
         }
         index = end;
     }
@@ -2814,7 +2888,7 @@ bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
                 task->notify_terminal();
             }
         }
-        m_impl->condition.notify_all();
+        m_impl->notify_all_workers();
         return false;
     }
     return true;
@@ -2829,7 +2903,7 @@ bool Scheduler::cancel(const std::shared_ptr<Task>& task) {
         if (changed) {
             // Unstarted cancellation changes the shutdown predicate without
             // necessarily enqueueing or waking a worker.
-            m_impl->condition.notify_all();
+            m_impl->notify_all_workers();
         }
         return changed;
     }
@@ -2975,7 +3049,7 @@ void Scheduler::leave_blocking_for(Scheduler* scheduler,
         // 阻塞区结束意味着补位 M 的使命已经完成：唤醒挂起的补充 M，让它
         // 当场退休，而不是再等一个 idle_worker_timeout。通知放在锁外，
         // 避免被唤醒的 worker 立刻阻塞在 mutex 上。
-        scheduler->m_impl->condition.notify_all();
+        scheduler->m_impl->notify_all_workers();
     }
 }
 
@@ -3539,7 +3613,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         m_impl->runnable.fetch_add(1,
                                                    std::memory_order_relaxed);
                         m_impl->emergency_enqueue_locked(task);
-                        m_impl->condition.notify_one();
+                        m_impl->notify_worker();
                     }
                 }
             } else {
@@ -3556,7 +3630,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         m_impl->runnable.fetch_add(1,
                                                    std::memory_order_relaxed);
                         m_impl->emergency_enqueue_locked(task);
-                        m_impl->condition.notify_one();
+                        m_impl->notify_worker();
                     }
                 }
             }
@@ -3570,7 +3644,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 maintenance_budget = 0;
             }
             if (draining) {
-                m_impl->condition.notify_all();
+                m_impl->notify_all_workers();
             } else if (!requeued_self &&
                        task->state() != GState::kWaiting &&
                        m_impl->runnable.load(std::memory_order_relaxed) != 0) {
@@ -3586,7 +3660,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 // 队尾把该 G 偷走，把几百纳秒的本地续跑放大成 4~5µs 的
                 // 跨 M 唤醒（64 Fiber 实测整档慢 10 倍以上）。其他队列的
                 // 可运行工作由发布方（enqueue / wake_registered）负责唤醒。
-                m_impl->condition.notify_one();
+                m_impl->notify_worker();
             }
             for (auto& retained_task : deferred_destruction) {
                 if (retained_task) {
@@ -3618,12 +3692,66 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             // terminal without touching the scheduler condition variable.
             // Wake an owner waiting for the final terminal transition after
             // this stale queue node has been consumed.
-            m_impl->condition.notify_all();
+            m_impl->notify_all_workers();
         }
 
         if (m_impl->stopping.load(std::memory_order_acquire)) {
             machine->state.store(MState::kStopping, std::memory_order_release);
             break;
+        }
+
+        // ------------------------------------------------------------------
+        // Go runtime.netpoll 模型：没有 G 可跑时，M 自己进入 IO 后端等待。
+        //
+        // 就绪事件由本线程就地处理，wake_io() 走 requeue_from_worker 把 G
+        // 投回本 P，于是 park -> epoll_wait -> wake 在同一个 M 上闭环，
+        // 不再有「poller 线程 -> 条件变量 -> worker」的跨线程唤醒。
+        //
+        // 只在常驻 M 上启用：
+        // - allow_idle_shrink 打开时保留条件变量路径，否则空闲退休判定永不
+        //   执行（历史语义不能悄悄改变）；
+        // - 补充 M 的职责是接管被阻塞区占住的 P，只有在确实存在阻塞区时
+        //   才轮询；阻塞区结束后它仍需走条件变量路径退休。
+        // ------------------------------------------------------------------
+        const Impl::IoIdlePoller* idle_poller =
+            m_impl->io_poller.load(std::memory_order_acquire);
+        if (idle_poller != nullptr && !m_impl->draining.load(std::memory_order_acquire) &&
+            !m_impl->config.allow_idle_shrink &&
+            (!machine->replacement ||
+             m_impl->blocking_workers.load(std::memory_order_acquire) != 0)) {
+            machine->state.store(MState::kParked, std::memory_order_release);
+            if (own_processor.running_machines.load(std::memory_order_acquire) ==
+                0) {
+                own_processor.state.store(PState::kIdle,
+                                          std::memory_order_release);
+            }
+            // 先登记「本 M 即将进入后端等待」，再复查可运行计数：
+            // 这样登记之后到达的 notify_worker()/enqueue() 一定会看到非零
+            // 计数并写 eventfd，不会落进「刚检查完队列、还没进 epoll_wait」
+            // 的丢唤醒窗口。
+            m_impl->io_waiting_workers.fetch_add(1, std::memory_order_release);
+            const bool work_pending =
+                m_impl->runnable.load(std::memory_order_acquire) != 0 ||
+                m_impl->stopping.load(std::memory_order_acquire);
+            int polled = 0;
+            if (!work_pending) {
+                auto timeout_ms =
+                    static_cast<int>(m_impl->config.idle_wait.count());
+                if (timeout_ms < 1) {
+                    timeout_ms = 1;
+                }
+                polled = idle_poller->poll(timeout_ms);
+            }
+            m_impl->io_waiting_workers.fetch_sub(1, std::memory_order_release);
+            machine->state.store(MState::kIdle, std::memory_order_release);
+            if (work_pending || polled >= 0) {
+                // 轮到事件（polled > 0）和正常超时（polled == 0）都直接回到
+                // 主循环：队列检查很便宜，且能避免条件变量与 epoll 等待
+                // 重叠时 notify 落到空窗里。
+                continue;
+            }
+            // polled < 0：IO 后端已停用（IOManager shutdown 中），退回下面
+            // 的条件变量等待，避免忙循环。
         }
 
         machine->state.store(MState::kParked, std::memory_order_release);
@@ -3645,7 +3773,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
 #endif
         if (m_impl->finish_draining_locked()) {
             lock.unlock();
-            m_impl->condition.notify_all();
+            m_impl->notify_all_workers();
             machine->state.store(MState::kStopping,
                                  std::memory_order_release);
             break;
@@ -3753,7 +3881,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     }
     m_impl->emit_event(SchedulerEvent{SchedulerEventType::kWorkerStopped,
                                       0, machine->id, machine->processor});
-    m_impl->condition.notify_all();
+    m_impl->notify_all_workers();
     t_task.reset();
     Fiber::BindCurrentExecution(FiberExecutionBinding{});
     thread_policy::detail::LeaveRuntimeWorker();

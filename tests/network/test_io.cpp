@@ -83,7 +83,9 @@ void raw_close(int fd) {
  * @return 无。
  */
 void close_pair(IOManager& manager, int (&fds)[2]) {
-    go2cpp::io::DescriptorGuard guard;
+    // 注册表按 fd 分条：分别锁两个条带即可覆盖 NotifyClose 期间的代际保护。
+    go2cpp::io::DescriptorGuard guard_a(fds[0]);
+    go2cpp::io::DescriptorGuard guard_b(fds[1]);
     (void)manager.NotifyClose(fds[0]);
     (void)manager.NotifyClose(fds[1]);
     raw_close(fds[0]);
@@ -649,7 +651,7 @@ void test_generation_reuse_and_cross_manager_close() {
     }
     GO2CPP_CHECK(entered.load(std::memory_order_acquire) == 2);
     {
-        go2cpp::io::DescriptorGuard guard;
+        go2cpp::io::DescriptorGuard guard(target);
         IOManager::NotifyCloseAll(target);
         raw_close(target);
         fds[0] = -1;
@@ -660,7 +662,7 @@ void test_generation_reuse_and_cross_manager_close() {
     int replacement[2]{-1, -1};
     GO2CPP_CHECK(make_pair(replacement));
     {
-        go2cpp::io::DescriptorGuard guard;
+        go2cpp::io::DescriptorGuard guard(target);
         if (replacement[0] != target) {
             IOManager::NotifyCloseAll(target);
             GO2CPP_CHECK(::syscall(SYS_dup2, replacement[0], target) == target);

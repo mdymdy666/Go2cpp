@@ -2,7 +2,7 @@
 
 > 更新时间：2026-10-18 01:00
 > 当前远端 HEAD：`37a2196`
-> 全量测试：**99 个测试，98 通过**（`go2cpp_fiber_stack_limit_full` 在 ctest 下偶发失败，单独跑 3/3 通过，判断为 ctest 环境差异）
+> 全量测试：**113/113 通过**（`ctest --test-dir build-quality` 串行 66.96s；`-j4` 下 `go2cpp_tests` 偶发 hook FIFO 时序失败，串行全绿）
 
 ---
 

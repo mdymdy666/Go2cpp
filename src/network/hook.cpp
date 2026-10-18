@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -269,8 +270,41 @@ struct Descriptor {
     bool m_closed{false};
 };
 
-std::mutex s_descriptors_mutex;
-std::unordered_map<int, std::shared_ptr<Descriptor>> s_descriptors;
+// 描述符元数据表按 fd 分条带。
+//
+// 为什么分片：每次 recv/send/read/write/fcntl/setsockopt 进入 Hook 都要先在
+// 这里查一次元数据。原先这把全局锁让 12 个 M 在所有连接上互相排队——万连接
+// 场景下 12 个 worker 只有约 2 个核在做有效工作，其余全部阻塞在这把锁上。
+//
+// 为什么安全：分片键是 fd 数值本身（fd & (N-1)），因此同一个 fd 永远落在
+// 同一条带，同一 fd 的 adopt/close/dup2/在途 syscall 之间的互斥关系与分片
+// 前完全一致；不同 fd 落在不同条带，互不串行。这与 DescriptorRegistryState
+// （令牌 + 代际）使用同一套分片键，两层门的相对顺序不变：
+//
+//   DescriptorRegistryState 条带锁（fd 代际门） -> 描述符表条带锁 -> Descriptor::m_mutex
+//
+// 不得出现反向嵌套（例如持描述符表条带锁再调用 DescriptorGuard::Capture），
+// 否则两条同 fd 路径会互相等待。
+constexpr std::size_t kDescriptorStripeCount = 64;
+
+struct DescriptorStripe {
+    std::mutex mutex;
+    std::unordered_map<int, std::shared_ptr<Descriptor>> descriptors;
+};
+
+// 函数内 static：避免与其它翻译单元之间的静态初始化顺序依赖。
+std::array<DescriptorStripe, kDescriptorStripeCount>& descriptor_stripes() {
+    static std::array<DescriptorStripe, kDescriptorStripeCount> stripes;
+    return stripes;
+}
+
+/// 返回 fd 所属的描述符表条带。负数 fd 会落到某个条带但必然查不到，
+/// 调用方在此之前都已经做过 fd < 0 判断。
+DescriptorStripe& descriptor_stripe_for(int fd) noexcept {
+    return descriptor_stripes()[static_cast<std::size_t>(
+                                    static_cast<unsigned int>(fd)) &
+                                (kDescriptorStripeCount - 1)];
+}
 
 std::optional<Duration> timeval_duration(const timeval& value) noexcept {
     if (value.tv_sec < 0 || value.tv_usec < 0 || value.tv_usec >= 1000000) {
@@ -308,9 +342,10 @@ std::optional<Duration> socket_timeout(int fd, int option) noexcept {
 }
 
 std::shared_ptr<Descriptor> descriptor_for(int fd) {
-    std::lock_guard<std::mutex> lock(s_descriptors_mutex);
-    const auto found = s_descriptors.find(fd);
-    return found == s_descriptors.end() ? nullptr : found->second;
+    DescriptorStripe& stripe = descriptor_stripe_for(fd);
+    std::lock_guard<std::mutex> lock(stripe.mutex);
+    const auto found = stripe.descriptors.find(fd);
+    return found == stripe.descriptors.end() ? nullptr : found->second;
 }
 
 bool inspect_socket(int fd) noexcept {
@@ -324,16 +359,18 @@ bool inspect_socket(int fd) noexcept {
 }
 
 std::shared_ptr<Descriptor> adopt_socket(int fd) {
-    DescriptorGuard lifecycle;
+    DescriptorGuard lifecycle(fd);
     if (fd < 0 || !s_originals.m_fcntl || !inspect_socket(fd)) {
         return {};
     }
 
     // 串行化第一次接管。否则一个接管者可能观察到另一个接管者设置的
-    // O_NONBLOCK 位，并错误地将其识别为用户请求。
-    std::lock_guard<std::mutex> lock(s_descriptors_mutex);
-    const auto found = s_descriptors.find(fd);
-    if (found != s_descriptors.end()) {
+    // O_NONBLOCK 位，并错误地将其识别为用户请求。按 fd 分片后串行化只覆盖
+    // 同一个数字 fd（这正是语义要求），不同 fd 的首次接管可以并行。
+    DescriptorStripe& stripe = descriptor_stripe_for(fd);
+    std::lock_guard<std::mutex> lock(stripe.mutex);
+    const auto found = stripe.descriptors.find(fd);
+    if (found != stripe.descriptors.end()) {
         return found->second;
     }
 
@@ -357,7 +394,7 @@ std::shared_ptr<Descriptor> adopt_socket(int fd) {
     try {
         auto descriptor = std::make_shared<Descriptor>(
             std::move(open), DescriptorGuard::Capture(fd));
-        s_descriptors.emplace(fd, descriptor);
+        stripe.descriptors.emplace(fd, descriptor);
         return descriptor;
     } catch (...) {
         if (changed_system_nonblocking) {
@@ -394,16 +431,17 @@ bool inspect_fifo(int fd) noexcept {
 // 同样把 fd 切到 O_NONBLOCK：这是 park 的前提（先试一次 syscall，
 // EAGAIN 才去 epoll 等），并且 fcntl hook 会对用户隐藏这个内部位。
 std::shared_ptr<Descriptor> adopt_fifo(int fd) {
-    DescriptorGuard lifecycle;
+    DescriptorGuard lifecycle(fd);
     if (fd < 0 || !s_originals.m_fcntl || !inspect_fifo(fd)) {
         return {};
     }
 
-    // 与 socket 接管使用同一把串行化锁：并发接管时不能把内部设置的
-    // O_NONBLOCK 误判成用户请求。
-    std::lock_guard<std::mutex> lock(s_descriptors_mutex);
-    const auto found = s_descriptors.find(fd);
-    if (found != s_descriptors.end()) {
+    // 与 socket 接管使用同一套条带锁：并发接管时不能把内部设置的
+    // O_NONBLOCK 误判成用户请求。同一个 fd 落在同一条带，语义与分片前一致。
+    DescriptorStripe& stripe = descriptor_stripe_for(fd);
+    std::lock_guard<std::mutex> lock(stripe.mutex);
+    const auto found = stripe.descriptors.find(fd);
+    if (found != stripe.descriptors.end()) {
         return found->second;
     }
 
@@ -427,7 +465,7 @@ std::shared_ptr<Descriptor> adopt_fifo(int fd) {
     try {
         auto descriptor = std::make_shared<Descriptor>(
             std::move(open), DescriptorGuard::Capture(fd));
-        s_descriptors.emplace(fd, descriptor);
+        stripe.descriptors.emplace(fd, descriptor);
         return descriptor;
     } catch (...) {
         if (changed_system_nonblocking) {
@@ -448,7 +486,7 @@ std::shared_ptr<Descriptor> try_adopt_fifo(int fd) noexcept {
 }
 
 void register_new_socket(int fd, bool user_nonblocking) {
-    DescriptorGuard lifecycle;
+    DescriptorGuard lifecycle(fd);
     if (fd < 0 || !s_originals.m_fcntl) {
         return;
     }
@@ -469,8 +507,9 @@ void register_new_socket(int fd, bool user_nonblocking) {
     try {
         auto descriptor = std::make_shared<Descriptor>(
             std::move(open), DescriptorGuard::Capture(fd));
-        std::lock_guard<std::mutex> lock(s_descriptors_mutex);
-        s_descriptors[fd] = std::move(descriptor);
+        DescriptorStripe& stripe = descriptor_stripe_for(fd);
+        std::lock_guard<std::mutex> lock(stripe.mutex);
+        stripe.descriptors[fd] = std::move(descriptor);
     } catch (...) {
         if (changed_system_nonblocking) {
             (void)invoke_real(s_originals.m_fcntl, fd, F_SETFL, flags);
@@ -517,9 +556,10 @@ struct ClosePlan {
 ClosePlan prepare_close(int fd) {
     ClosePlan plan;
     {
-        std::lock_guard<std::mutex> lock(s_descriptors_mutex);
-        const auto found = s_descriptors.find(fd);
-        if (found != s_descriptors.end()) {
+        DescriptorStripe& stripe = descriptor_stripe_for(fd);
+        std::lock_guard<std::mutex> lock(stripe.mutex);
+        const auto found = stripe.descriptors.find(fd);
+        if (found != stripe.descriptors.end()) {
             plan.m_descriptor = found->second;
         }
     }
@@ -535,10 +575,11 @@ void finish_close(int fd, const std::shared_ptr<Descriptor>& descriptor) {
     if (!descriptor) {
         return;
     }
-    std::lock_guard<std::mutex> lock(s_descriptors_mutex);
-    const auto found = s_descriptors.find(fd);
-    if (found != s_descriptors.end() && found->second == descriptor) {
-        s_descriptors.erase(found);
+    DescriptorStripe& stripe = descriptor_stripe_for(fd);
+    std::lock_guard<std::mutex> lock(stripe.mutex);
+    const auto found = stripe.descriptors.find(fd);
+    if (found != stripe.descriptors.end() && found->second == descriptor) {
+        stripe.descriptors.erase(found);
     }
 }
 
@@ -560,13 +601,21 @@ void clone_descriptor(int old_fd, int new_fd) {
     if (source && snapshot_descriptor(source).m_closed) {
         source.reset();
     }
-    std::lock_guard<std::mutex> lock(s_descriptors_mutex);
+    // Capture 必须在描述符表条带锁之外完成：Capture 内部要拿
+    // DescriptorRegistryState 的 fd 条带锁，而 adopt_socket 等路径是
+    // 「先拿注册表条带锁、再拿描述符表条带锁」。若这里反过来嵌套，
+    // 同一个 fd 上两条路径会互相等待（死锁）。
+    DescriptorTokenPtr new_token;
     if (source) {
-        s_descriptors[new_fd] =
-            std::make_shared<Descriptor>(source->m_open,
-                                         DescriptorGuard::Capture(new_fd));
+        new_token = DescriptorGuard::Capture(new_fd);
+    }
+    DescriptorStripe& stripe = descriptor_stripe_for(new_fd);
+    std::lock_guard<std::mutex> lock(stripe.mutex);
+    if (source) {
+        stripe.descriptors[new_fd] = std::make_shared<Descriptor>(
+            source->m_open, std::move(new_token));
     } else {
-        s_descriptors.erase(new_fd);
+        stripe.descriptors.erase(new_fd);
     }
 }
 
@@ -576,8 +625,9 @@ void try_clone_descriptor(int old_fd, int new_fd) noexcept {
     } catch (...) {
         // 不要让 C++ 分配失败越过 C ABI。移除过期的目标条目；下一次 managed
         // 调用可以重新接管该描述符。
-        std::lock_guard<std::mutex> lock(s_descriptors_mutex);
-        s_descriptors.erase(new_fd);
+        DescriptorStripe& stripe = descriptor_stripe_for(new_fd);
+        std::lock_guard<std::mutex> lock(stripe.mutex);
+        stripe.descriptors.erase(new_fd);
     }
 }
 
@@ -608,10 +658,11 @@ void restore_failed_replacement(
         descriptor->m_token.reset();
         descriptor->m_closed = true;
     }
-    std::lock_guard<std::mutex> lock(s_descriptors_mutex);
-    const auto found = s_descriptors.find(fd);
-    if (found != s_descriptors.end() && found->second == descriptor) {
-        s_descriptors.erase(found);
+    DescriptorStripe& stripe = descriptor_stripe_for(fd);
+    std::lock_guard<std::mutex> lock(stripe.mutex);
+    const auto found = stripe.descriptors.find(fd);
+    if (found != stripe.descriptors.end() && found->second == descriptor) {
+        stripe.descriptors.erase(found);
     }
 }
 
@@ -679,7 +730,7 @@ int native_wait(int fd, IOEvent event,
     // 上永久等待。
     for (;;) {
         {
-            DescriptorGuard lifecycle;
+            DescriptorGuard lifecycle(fd);
             if (descriptor_closed(descriptor)) {
                 return EBADF;
             }
@@ -718,7 +769,7 @@ int native_wait(int fd, IOEvent event,
             // poll 返回就绪后再次通过生命周期门检查。这样 close/dup2
             // Hook 在就绪通知与真正读写之间不能把旧 generation 伪装成
             // 新的同号 fd；真正的 syscall 仍在 cooperative_io 的门内执行。
-            DescriptorGuard lifecycle;
+            DescriptorGuard lifecycle(fd);
             if (descriptor_closed(descriptor)) {
                 return EBADF;
             }
@@ -772,7 +823,7 @@ Result cooperative_io(int fd, Function function, IOEvent event,
     for (;;) {
         Result result;
         {
-            DescriptorGuard lifecycle;
+            DescriptorGuard lifecycle(fd);
             if (snapshot_descriptor(descriptor).m_closed) {
                 errno = EBADF;
                 return static_cast<Result>(-1);
@@ -856,7 +907,7 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
 
     int result;
     do {
-        DescriptorGuard lifecycle;
+        DescriptorGuard lifecycle(fd);
         if (snapshot_descriptor(descriptor).m_closed) {
             errno = EBADF;
             return -1;
@@ -887,7 +938,7 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
         errno = wait_errno;
         return -1;
     }
-    DescriptorGuard lifecycle;
+    DescriptorGuard lifecycle(fd);
     if (snapshot_descriptor(descriptor).m_closed) {
         errno = EBADF;
         return -1;
@@ -1905,7 +1956,7 @@ int close(int fd) {
     initialize_originals();
     ClosePlan plan;
     {
-        DescriptorGuard lifecycle;
+        DescriptorGuard lifecycle(fd);
         plan = prepare_close(fd);
         notify_before_close(fd);
     }
@@ -1915,7 +1966,7 @@ int close(int fd) {
                            ? invoke_native_blocking(s_originals.m_close, fd)
                            : invoke_native_blocking(&raw_close_fallback, fd);
     {
-        DescriptorGuard lifecycle;
+        DescriptorGuard lifecycle(fd);
         finish_close(fd, plan.m_descriptor);
     }
     return result;
@@ -1927,7 +1978,7 @@ int dup(int old_fd) {
         errno = ENOSYS;
         return -1;
     }
-    DescriptorGuard lifecycle;
+    DescriptorGuard lifecycle(old_fd);
     const int new_fd = invoke_real(s_originals.m_dup, old_fd);
     if (new_fd >= 0) {
         try_clone_descriptor(old_fd, new_fd);
@@ -1941,7 +1992,7 @@ int dup2(int old_fd, int new_fd) {
         errno = ENOSYS;
         return -1;
     }
-    DescriptorGuard lifecycle;
+    DescriptorGuard lifecycle(new_fd);
     // dup2(old, old) 按文档是空操作。此时不要使描述符 token 失效，也不要
     // 唤醒无关的 waiter。
     if (old_fd == new_fd || new_fd < 0 || !source_fd_is_valid(old_fd)) {
@@ -1970,7 +2021,7 @@ int dup3(int old_fd, int new_fd, int flags) {
         errno = ENOSYS;
         return -1;
     }
-    DescriptorGuard lifecycle;
+    DescriptorGuard lifecycle(new_fd);
     // dup3 会在不触碰目标的情况下拒绝相同描述符和未知标志。对这些确定性失败
     // 不要发出伪关闭通知；源校验也让 dup3(-1, target, ...) 保持透明。
     if (old_fd == new_fd || new_fd < 0 ||
@@ -2009,7 +2060,7 @@ int fcntl(int fd, int command, ...) {
     if (kind == FcntlArgument::Integer) {
         const int argument = va_arg(arguments, int);
         va_end(arguments);
-        DescriptorGuard lifecycle;
+        DescriptorGuard lifecycle(fd);
         auto descriptor = descriptor_for(fd);
         if (command == F_SETFL && descriptor) {
             const bool user_nonblocking = (argument & O_NONBLOCK) != 0;
@@ -2037,11 +2088,11 @@ int fcntl(int fd, int command, ...) {
     if (kind == FcntlArgument::Pointer) {
         void* argument = va_arg(arguments, void*);
         va_end(arguments);
-        DescriptorGuard lifecycle;
+        DescriptorGuard lifecycle(fd);
         return invoke_real(s_originals.m_fcntl, fd, command, argument);
     }
     va_end(arguments);
-    DescriptorGuard lifecycle;
+    DescriptorGuard lifecycle(fd);
     const int result = invoke_real(s_originals.m_fcntl, fd, command);
     if (command == F_GETFL && result >= 0) {
         if (auto descriptor = descriptor_for(fd)) {
@@ -2061,7 +2112,7 @@ int ioctl(int fd, unsigned long request, ...) {
         return -1;
     }
     if (!ioctl_has_pointer_argument(request)) {
-        DescriptorGuard lifecycle;
+        DescriptorGuard lifecycle(fd);
         if (ioctl_has_no_argument(request)) {
             return invoke_real(s_originals.m_ioctl, fd, request);
         }
@@ -2074,7 +2125,7 @@ int ioctl(int fd, unsigned long request, ...) {
     void* argument = va_arg(arguments, void*);
     va_end(arguments);
     if (request == FIONBIO) {
-        DescriptorGuard lifecycle;
+        DescriptorGuard lifecycle(fd);
         auto descriptor = descriptor_for(fd);
         if (descriptor && argument) {
             // 先让内核校验并读取调用者指针。Wrapper 侧解引用会把正常的 EFAULT
@@ -2119,7 +2170,7 @@ int ioctl(int fd, unsigned long request, ...) {
             return result;
         }
     }
-    DescriptorGuard lifecycle;
+    DescriptorGuard lifecycle(fd);
     return invoke_real(s_originals.m_ioctl, fd, request, argument);
 }
 
@@ -2130,7 +2181,7 @@ int getsockopt(int fd, int level, int option, void* value,
         errno = ENOSYS;
         return -1;
     }
-    DescriptorGuard lifecycle;
+    DescriptorGuard lifecycle(fd);
     return invoke_real(s_originals.m_getsockopt, fd, level, option, value,
                        length);
 }
@@ -2142,7 +2193,7 @@ int setsockopt(int fd, int level, int option, const void* value,
         errno = ENOSYS;
         return -1;
     }
-    DescriptorGuard lifecycle;
+    DescriptorGuard lifecycle(fd);
     const int result = invoke_real(s_originals.m_setsockopt, fd, level, option,
                                    value, length);
     if (result != 0 || level != SOL_SOCKET ||

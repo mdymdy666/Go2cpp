@@ -580,6 +580,32 @@ public:
     void set_observer(SchedulerObserverPtr observer) noexcept;
     /** @brief 返回当前观察者快照；空指针表示未安装观察者。 */
     SchedulerObserverPtr observer() const noexcept;
+
+    /**
+     * @brief 安装「M 自己轮询 IO 后端」的回调（Go runtime.netpoll 模型）。
+     *
+     * @details
+     * 没有安装回调时，worker 无 G 可跑就睡在调度器条件变量上；IO 就绪事件
+     * 由 IOManager 的独立 poller 线程发现，再经 wake_io() 跨线程唤醒
+     * worker。在 WSL2/虚拟化环境下这条路径的一次往返实测 54–56µs，单事件
+     * 场景因此被压到 5–9k/s。
+     *
+     * 安装后，worker 空闲时**直接在本 M 上调用 poll(timeout_ms)**：由同一个
+     * 线程完成 epoll_wait、就绪事件处理与 G 的入队，park→poll→wake 在一个 M
+     * 内闭环，不再产生跨线程唤醒。
+     *
+     * @param poll 后端轮询函数；timeout_ms 为最长等待毫秒数（>=0）。
+     *             返回 >0 表示本轮处理了事件，0 表示正常超时，<0 表示后端
+     *             不可用（worker 退回条件变量等待）。
+     * @param wake 踢醒后端等待者的函数（写 eventfd）；可为空。
+     *
+     * @note 必须在 start() 之前安装（IOManager 在构造期完成）；重复安装返回
+     *       false。回调在 worker 线程里执行，不得阻塞、不得抛出异常。
+     */
+    bool set_io_idle_poller(std::function<int(int)> poll,
+                            std::function<void()> wake);
+    /** @brief 已安装 IO 空闲轮询回调时返回 true。 */
+    bool has_io_idle_poller() const noexcept;
     void SetObserver(SchedulerObserverPtr observer) noexcept {
         set_observer(std::move(observer));
     }

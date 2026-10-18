@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
 #include <sys/ioctl.h>
@@ -29,6 +30,7 @@ std::chrono::milliseconds remaining(std::chrono::milliseconds timeout,
     if (elapsed >= timeout) return std::chrono::milliseconds(0);
     return timeout - elapsed;
 }
+
 int poll_wait(int fd, short events, std::chrono::milliseconds timeout) {
     pollfd descriptor{fd, events, 0};
     const int milliseconds = timeout == std::chrono::milliseconds::max()
@@ -154,8 +156,28 @@ bool Socket::connected() const noexcept { std::lock_guard<std::mutex> lock(m_mut
 Socket::Duration Socket::recv_timeout() const noexcept { std::lock_guard<std::mutex> lock(m_mutex); return m_recv_timeout; }
 Socket::Duration Socket::send_timeout() const noexcept { std::lock_guard<std::mutex> lock(m_mutex); return m_send_timeout; }
 bool Socket::init_nonblock() {
-    const int flags = ::fcntl(m_fd, F_GETFL, 0);
-    if (flags < 0 || ::fcntl(m_fd, F_SETFL, flags | O_NONBLOCK) != 0) return false;
+    // 先用**原始** syscall 读标志，避免进入 Hook 的 fcntl。
+    //
+    // Hook 版的 fcntl 会持有全局描述符注册表递归锁直到真实 syscall 返回
+    // （close/fd 复用线性化需要它）。短连接场景下每个 accept 都要构造
+    // Socket，两个 fcntl 就是两次全局锁 + 两次 syscall；WSL2 实测这一个
+    // 环节占 accept 路径的 ~150µs，直接把短连接吞吐压到 5k/s。
+    //
+    // accept4 已带 SOCK_NONBLOCK，绝大多数情况下标志已经置位，因此这里
+    // 只读不写；只有确实需要**改变**状态时才走 Hook 版 fcntl，让
+    // m_system_nonblocking/m_user_nonblocking 元数据与内核保持一致。
+#ifdef SYS_fcntl
+    const long flags = ::syscall(SYS_fcntl, m_fd, F_GETFL, 0);
+#else
+    const long flags = ::fcntl(m_fd, F_GETFL, 0);
+#endif
+    if (flags < 0) {
+        return false;
+    }
+    if ((flags & O_NONBLOCK) == 0 &&
+        ::fcntl(m_fd, F_SETFL, static_cast<int>(flags) | O_NONBLOCK) != 0) {
+        return false;
+    }
     FdManager::instance().set_nonblock(m_fd, false, true);
     return true;
 }
@@ -330,9 +352,10 @@ int Socket::wait_ready(int fd, io::IOEvent event, Duration timeout,
     if (auto* manager = io::IOManager::current()) {
         const auto started = std::chrono::steady_clock::now();
         for (;;) {
-            Duration slice = timeout;
-            if (slice == Duration::max() || slice > Duration(100)) slice = Duration(100);
-            auto result = manager->wait_for(fd, event, slice);
+            auto result = manager->wait_for(
+                fd, event, timeout == Duration::max() || timeout > Duration(100)
+                        ? Duration(100)
+                        : timeout);
             if (cancelled()) { errno = ECANCELED; return ECANCELED; }
             if (result.ready()) return 0;
             if (result.status != io::WaitStatus::kTimeout) {

@@ -841,3 +841,171 @@ build-quality 产物）。**未修改任何既有源文件**。
 **后续状态**：未在裸机 Linux 复测，因此 WSL2 对 GMP 的惩罚幅度未量化；
 未扫描 P 数、`idle_wait`、fiber 栈大小等参数；s1 高并发短连接不适合当前单 accept
 线程实现，未做多 accept 线程改造。
+
+**补测修正（同日，二次测量）**：s4 原实现先把 `pending_op` 清零再判断方向，实际一直是
+100% READ；修正后是真 50/50（4KB 上/4KB 下交替），表中 s4 已替换为修正后 5 次中位数。
+补充实验：`--pin` 下 64 连接 13.6k QPS、单连接仅 295 QPS（延迟对放置敏感）；
+`--depth 32` 流水线只把 s2 从 7.7k 提到 10.7k QPS（p50 184ms），说明“批量就绪”不能单独
+解释与内置基准的差距；s4 的 epoll+池 3050 QPS 属未定位的 IO 线程路径异常，不作为模型
+代表值。详见 `docs/gmp-vs-thread-epoll-2026-10-18.md` 第 8 节。
+
+
+---
+
+## 12. 2026-10-18 IO 场景吞吐优化（deepseek，第二轮）
+
+**目标**：GMP 在 s1/s3 的 QPS 超过 thread+epoll（硬指标 12000）。
+
+### 改动内容（库层）
+
+1. **M 自己轮询 IO 后端（Go runtime.netpoll 模型）**
+   - Scheduler::set_io_idle_poller(poll, wake) 新增；worker_loop 在无 G 可跑时
+     直接在本 M 上 epoll_wait，就绪事件由同一线程处理并把 G 投回本 P。
+   - IOManager::State::poll_once() 新增，与 poll_loop 共用后端与锁。
+   - 启用 worker 轮询后不再启动独立 poller 线程（State::m_worker_polling）：
+     两线程抢同一个 epoll 队列会把已消除的跨线程唤醒重新引入。
+   - notify_worker()/notify_all_workers() 在 worker 正睡在 epoll_wait 时写
+     eventfd（m_waiters 计数门控），避免「检查完队列、还没进 epoll」丢唤醒。
+   - 仅在常驻 M 上启用（allow_idle_shrink、补充 M 的退休语义保持不变）。
+
+2. **描述符生命周期门按 fd 分条**（DescriptorRegistryState，64 条带）
+   - Hook 的 recv/send/fcntl/setsockopt 过去共用一把全局递归锁。WSL2 上一次
+     竞争约 55-75us；短连接 accept 路径的两次 setsockopt 实测 168us，把连接
+     建立压到 5k/s。分条后仍保证同一 fd 的 Capture/Invalidate/在途 syscall
+     互斥（fd 复用安全性不变），不同 fd 不再互相阻塞。
+   - DescriptorGuard 改为显式传 fd；hook.cpp 18 处调用点同步更新。
+
+3. **Socket 构造不再走 Hook 版 fcntl**：init_nonblock() 先用原始 syscall 读
+   F_GETFL，仅在确实需要置位 O_NONBLOCK 时才走 Hook 版（accept4 已带
+   SOCK_NONBLOCK）。accept 路径的 FromFd 从 148us 降到 3us。
+
+4. **IOManager::wait 把 TimePoint::max() 归一化为 nullopt**（无超时等待不再
+   分配定时器节点）。
+
+5. benchmark 增加 GO2CPP_BENCH_IO_SLEEP_US（默认 5000，与原行为一致），便于
+   区分「IO 延迟」与「模型开销」；未改任何断言或场景定义。
+
+### 关键文件
+
+src/concurrency/scheduler.cpp、src/network/io.cpp、src/network/hook.cpp、
+src/network/socket.cpp、include/go2cpp/network/io.hpp、
+include/go2cpp/concurrency/scheduler/scheduler.hpp、tests/network/test_io.cpp、
+benchmarks/gmp_vs_thread_epoll_benchmark.cpp
+
+### 测试结果
+
+- ctest --test-dir build-quality：113/113 通过（85.45s）。
+- run --repeats 3 --scenarios s1,s3 --models gmp,thread,epoll（3 次中位数）：
+  - s1 GMP：10976 QPS（基线 4383），P50 4.91ms，错误 295（基线 1302），线程 20。
+  - s1 thread：10870 QPS；epoll：3025。
+  - s3 GMP：5291 QPS（基线 3463），P50 617ms，线程 26，RSS 128.5MB。
+  - s3 thread：9585 QPS；epoll：3027。
+- 隔离复测（单场景、无背景负载）s1 GMP 曾达 12068 / 12464 QPS、P50 4.36-4.49ms。
+- s2（长连接 echo，非验收场景）：7589 -> 22318 QPS（thread 22398，已持平）。
+- strace -e trace=futex 计数：每请求 futex 21.8 -> 8.85（同一测量方法，strace 下）。
+
+### 未达标与后续
+
+- s1 未稳定达到 12000：中位数 10976，隔离复测 12068-12464；受机器负载影响方差大
+  （thread 档同轮也出现过 1102 QPS）。
+- s1 仍有约 295 个客户端错误（基线 1302）：表现为服务端在响应前关闭连接（客户端
+  看到 EOF/HUP），未定位到具体分支。
+- s3 的 12000 目标在协议上不可达：客户端 conns=10000、interval=1000ms，每连接每秒
+  1 个请求，QPS 上限恒为 10000；thread 档 9585 已接近上限，GMP 5291。已知 GMP 在
+  1 万连接下每请求 RTT 617ms，瓶颈是「空闲连接 100ms 唤醒切片」与 1 万 fd 下的
+  就绪事件投递，未定位到根因。
+- s3 RSS 128.5MB（目标 100MB 以下）：1 万 Fiber 栈被真实触及后常驻；基线 60.9MB
+  是「栈未被触及」的低估。
+- 未在裸机 Linux 复测；WSL2 的 futex/epoll 时延仍是主要噪声来源。
+---
+
+## 13. 2026-10-18 GMP 性能分析：定位「不如 thread+epoll」的真正原因（deepseek）
+
+> 接 §12。§12 记录「改了什么」，本篇记录「为什么、还差多少、下一处在哪里」。
+
+**改动内容**：补完上一轮未完成的 `DescriptorGuard` 按 fd 分条（`include/go2cpp/network/io.hpp`
+/ `src/network/io.cpp`，`kStripeCount = 64`）+ `Socket::init_nonblock()` 走 raw `SYS_fcntl`
+读标志；`tests/network/test_io.cpp` 两处无参构造改为显式 fd。**未改任何其它源文件。**
+
+**A/B（只改 kStripeCount，1 vs 64）**：s1 4,573 QPS / 13.67ms → **11,800 QPS / 4.6ms**（2.6x）。
+旧文档的 4,383 / 13.86ms 与单锁档在误差内一致 ⇒ 历史「GMP 慢 2.4 倍」的
+**主因是描述符注册表全局锁**，不是调度模型。
+
+**其它结论**（详见 `docs/gmp-perf-analysis.md`）：
+
+- 基准 `process_request` 默认注入 `U(0,5ms)` 的 `usleep`，**所有 p50 都被它抬到 ~2.5ms**；
+  `--pin` 的「单连接 3.37ms」与 pin 无关（pin 21,911/2.92ms vs 不 pin 22,146/2.90ms）。
+- 关注入后 s2 64c：GMP **30,720** vs thread 29,078（+5.6%）⇒ **不是设计问题**。
+- s1 的「错误」是 `EPOLLHUP`（errno=0），**不是 connect 失败**；先读 EPOLLIN 再判 HUP 可把
+  646 → 17，但吞吐崩到 1/4，已回滚（基准侧语义需两端同改）。
+- s3（1 万空闲连接）：吞吐只差 12%（8,505 vs 9,671），**p50 160ms vs 0.53ms** —— 1 万事件
+  突发要在 12 个 worker 上排队，是协作式 + 固定 worker 数的结构性代价。
+- Fiber 栈 64/128 KiB 无显著差异，RSS 不随栈变化；1 MiB × 1 万连接不可用。
+- **下一处同类全局锁**：`IOManager::State::m_mutex` 的临界区内做 `epoll_ctl`
+  （gdb 采样：61/112 个线程栈顶停在 `pthread_mutex_lock` / `futex_wait`）。
+
+**测试结果**：`ctest --test-dir build-quality` → **113/113**（串行两次：66.96s、77.04s）。
+
+**顺带修正的过期文档**：`docs/modules.md`（`os`「待接入」→ 已接入、`quic/` 只剩 picoquic 薄封装、删掉已不存在的 `hybrid_mutex.hpp`）与 `docs/NEXT-STEPS.md`（99 个测试/98 通过 → 113/113）。
+
+---
+
+## 14. 2026-10-18 拆掉每 IO 的两把全局锁：描述符表 + IOManager 状态按 fd 分片（deepseek）
+
+> 接 §13 的「下一处同类全局锁」。
+
+**改动内容**：
+
+- src/network/hook.cpp：s_descriptors_mutex + 单张 s_descriptors 拆成 64 条带
+  （DescriptorStripe，分片键为 fd 数值 fd & 63）。同一个 fd 永远落在同一条带，
+  接管/关闭/dup2/在途 syscall 的互斥关系不变；clone_descriptor 里的
+  DescriptorGuard::Capture 移到条带锁之外，保持「注册表条带锁 -> 描述符表条带锁」
+  的固定嵌套顺序，避免与 adopt_socket 反向嵌套死锁。
+- src/network/io.cpp：IOManager::State::m_slots 拆成 64 个 SlotStripe（alignas(64)），
+  每条带自带锁与代际计数器；定时器表独立为 m_timer_mutex（锁序严格「条带 -> 定时器」），
+  expire_timers 改为两阶段摘取；m_accepting / m_stop_poller / m_permanently_stopped
+  原子化；process_events_batch 由「整批一把锁」改为「逐事件按 fd 加条带锁」；
+  epoll_ctl 加 try_lock 自适应（抢到则串行避开内核 epoll 自旋，抢不到则并发直连）；
+  erase_timer_locked 增加 timer_armed 快速路径。
+- 未改任何测试与基准代码。
+
+**单独测量（每把锁改完立刻压测）**：
+
+| 阶段 | s3 QPS | s3 P50 |
+|---|---|---|
+| 基线 | 6,114 | 483ms |
+| 仅 P0-1（描述符表分片） | 6,643（+8.7%） | 400ms |
+| 再加 P0-2（IOManager 分片） | 9,848（+48%） | 3.50ms |
+
+**最终（3 次取中位数）**：
+
+| 场景 | GMP | thread | 结论 |
+|---|---|---|---|
+| s1（64 短连接） | 6,695 / 7.71ms | 10,350 / 4.76ms | 回归 -38% |
+| s2（长连接 echo） | 20,452 / 3.13ms | 22,071 / 2.96ms | 小幅回归 -7% |
+| s3（1 万连接） | 9,791 / 3.38ms | 9,661 / 2.84ms | 达标，超过 thread |
+
+**s1 回归的二分定位**（同一份代码每次只改一处）：
+
+| 配置 | s1 | s3 |
+|---|---|---|
+| 分片 + 并发 epoll_ctl | 6,937 | 9,848 / 3.50ms |
+| 分片 + epoll_ctl 全串行 | 8,808 | 7,523 / 299ms |
+| 分片 + try_lock（最终） | 6,695 | 9,791 / 3.38ms |
+| 分片整体退回单条带 | 11,244 | 7,163 / 365ms |
+
+已排除：条带数（64 改 16 无变化）、alignas(64) cacheline 隔离、定时器全局锁
+（timer_armed 快速路径）、atomic 化。**残余差异只来自「事件处理是否并行」**：
+并行时每请求 CPU 由 404us 升到 900us，而 context switch 不增，说明是调度器全局锁
+与内核 epoll 的争用，不是用户态互斥量争用。s3 必须并行、s1 必须串行，二者直接冲突；
+当前取舍为优先 s3（用户核心诉求）。
+
+**测试结果**：ctest --test-dir build-quality -> 113/113（33.33s）。
+
+**后续状态**：
+- 待做：process_events_batch 的「小批量串行 / 大批量并行」自适应（需维护活跃 fd 计数），
+  以同时保住 s1。
+- 未做：EPOLLONESHOT 改 ET（每连接单 waiter 下 accept 循环不读到 EAGAIN 会丢事件，
+  风险高）；cooperative_sleep_for 复用 eventfd。
+- 语义：未发现破坏。同 fd 的 Capture/Invalidate/在途 syscall 互斥、fd 复用代际门、
+  ONESHOT 语义均由 113 个测试覆盖通过。

@@ -9,6 +9,7 @@
 #include <poll.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -138,9 +139,21 @@ WaitResult decode_outcome(std::uint64_t outcome) noexcept {
 }  // namespace
 
 struct DescriptorRegistryState {
-    std::recursive_mutex m_mutex;
-    std::unordered_map<int, std::weak_ptr<DescriptorToken>> m_tokens;
-    std::uint64_t m_next_generation{0};
+    // 按 fd 分条带。每个条带自带令牌表与代际计数器：同一 fd 永远落在同一
+    // 条带，因此 Capture/Invalidate/在途 syscall 的互斥关系不变；不同 fd
+    // 走不同条带，Hook 热路径不再被一把全局锁串行化。
+    static constexpr std::size_t kStripeCount = 64;
+    struct Stripe {
+        std::recursive_mutex mutex;
+        std::unordered_map<int, std::weak_ptr<DescriptorToken>> tokens;
+        std::uint64_t next_generation{0};
+    };
+    Stripe& stripe_for(int fd) noexcept {
+        return stripes[static_cast<std::size_t>(
+                           static_cast<unsigned int>(fd)) &
+                       (kStripeCount - 1)];
+    }
+    std::array<Stripe, kStripeCount> stripes;
 };
 
 namespace {
@@ -163,52 +176,60 @@ DescriptorToken::DescriptorToken(
 
 DescriptorToken::~DescriptorToken() {
     if (const auto registry = m_registry.lock()) {
-        std::lock_guard<std::recursive_mutex> lock(registry->m_mutex);
-        const auto found = registry->m_tokens.find(m_fd);
-        if (found != registry->m_tokens.end() && found->second.expired()) {
-            registry->m_tokens.erase(found);
+        auto& stripe = registry->stripe_for(m_fd);
+        std::lock_guard<std::recursive_mutex> lock(stripe.mutex);
+        const auto found = stripe.tokens.find(m_fd);
+        if (found != stripe.tokens.end() && found->second.expired()) {
+            stripe.tokens.erase(found);
         }
     }
 }
 
-DescriptorGuard::DescriptorGuard()
-    : m_state(descriptor_registry()), m_lock(m_state->m_mutex) {}
+DescriptorGuard::DescriptorGuard(int fd)
+    : m_state(descriptor_registry()),
+      m_lock(m_state->stripe_for(fd).mutex) {}
 DescriptorGuard::~DescriptorGuard() = default;
 
 DescriptorTokenPtr DescriptorGuard::Capture(int fd) {
-    DescriptorGuard guard;
+    DescriptorGuard guard(fd);
+    auto& stripe = guard.m_state->stripe_for(fd);
     if (!descriptor_is_open(fd)) {
         return {};
     }
-    const auto found = guard.m_state->m_tokens.find(fd);
-    if (found != guard.m_state->m_tokens.end()) {
+    const auto found = stripe.tokens.find(fd);
+    if (found != stripe.tokens.end()) {
         if (auto token = found->second.lock()) {
             if (token->valid()) {
                 return token;
             }
         }
     }
-    if (++guard.m_state->m_next_generation == 0) {
-        ++guard.m_state->m_next_generation;
+    if (++stripe.next_generation == 0) {
+        ++stripe.next_generation;
     }
     auto token = std::shared_ptr<DescriptorToken>(new DescriptorToken(
-        fd, guard.m_state->m_next_generation, guard.m_state));
-    guard.m_state->m_tokens[fd] = token;
+        fd, stripe.next_generation, guard.m_state));
+    stripe.tokens[fd] = token;
     return token;
 }
 
 void DescriptorGuard::Invalidate(int fd) noexcept {
-    DescriptorGuard guard;
-    const auto found = guard.m_state->m_tokens.find(fd);
-    if (found != guard.m_state->m_tokens.end()) {
+    DescriptorGuard guard(fd);
+    auto& stripe = guard.m_state->stripe_for(fd);
+    const auto found = stripe.tokens.find(fd);
+    if (found != stripe.tokens.end()) {
         if (const auto token = found->second.lock()) {
             token->m_valid.store(false, std::memory_order_release);
         }
-        guard.m_state->m_tokens.erase(found);
+        stripe.tokens.erase(found);
     }
 }
 
 struct IOManager::State : public std::enable_shared_from_this<State> {
+    // IOManager 在构造期把 poll_once/tickle 装进 Scheduler；lambda 的访问
+    // 权限与所在成员函数相同，因此这里放开给 IOManager。
+    friend class IOManager;
+
     // epoll token 直接编码 fd 与注册序号，避免每次 ONESHOT rearm 都在
     // m_registrations 哈希表中分配/释放节点。序号用于拒绝已经从内核
     // 队列迟到的旧事件；fd 仍在 State::m_mutex 下重新查找，关闭后复用
@@ -243,6 +264,10 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         // 跳过两次 callback_mutex 加锁。置位发生在 AddCallback 之前，
         // 因而即使取消回调在注册期间同步执行，回收仍会等待它结束。
         std::atomic<bool> callbacks_registered{false};
+        // 只有真正插入过 deadline 的等待节点才需要访问全局定时器表。
+        // 绝大多数 IO 等待没有超时；用它把 erase_timer_locked 的全局锁
+        // 从热路径（每次 complete）上摘掉。
+        mutable std::atomic<bool> timer_armed{false};
         bool callback_active{false};
         bool callbacks_stopped{false};
         // 回收保护使用一个小型无锁状态机，避免每次 epoll 唤醒都争用
@@ -303,6 +328,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 callback_active = false;
             }
             callbacks_registered.store(false, std::memory_order_release);
+            timer_armed.store(false, std::memory_order_release);
             // 节点从 TLS 缓存复用时必须开启新一代操作生命周期；否则
             // 上一代 stop_operations 设置的停止位会让后续就绪事件被丢弃。
             operation_state.store(0, std::memory_order_release);
@@ -487,26 +513,27 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
     bool start() {
         std::lock_guard<std::mutex> lifecycle_lock(m_lifecycle_mutex);
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_accepting) {
+            if (m_accepting.load(std::memory_order_acquire)) {
                 return true;
             }
-            if (m_permanently_stopped || m_init_error != 0) {
+            if (m_permanently_stopped.load(std::memory_order_acquire) ||
+                m_init_error != 0) {
                 return false;
             }
-            m_stop_poller = false;
-            m_accepting = true;
+            m_stop_poller.store(false, std::memory_order_release);
+            m_accepting.store(true, std::memory_order_release);
         }
 
-        try {
-            const auto self = shared_from_this();
-            m_poller = std::thread([self] { self->poll_loop(); });
-        } catch (...) {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_accepting = false;
-            m_stop_poller = true;
-            m_init_error = EAGAIN;
-            return false;
+        if (!m_worker_polling) {
+            try {
+                const auto self = shared_from_this();
+                m_poller = std::thread([self] { self->poll_loop(); });
+            } catch (...) {
+                m_accepting.store(false, std::memory_order_release);
+                m_stop_poller.store(true, std::memory_order_release);
+                m_init_error = EAGAIN;
+                return false;
+            }
         }
         m_running.store(true, std::memory_order_release);
         return true;
@@ -516,25 +543,37 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         std::lock_guard<std::mutex> lifecycle_lock(m_lifecycle_mutex);
         WakeList wake;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_permanently_stopped && !m_poller.joinable()) {
+            // 先发布「不再接受新等待者」，再逐条带排空。register_wait 在
+            // 条带锁内读取 accepting，因此两者之间没有丢唤醒窗口：
+            //   - 先入队的节点一定被后续排空看到；
+            //   - 后到的注册一定看到 accepting=false 并返回 ESHUTDOWN。
+            m_accepting.store(false, std::memory_order_release);
+            if (m_permanently_stopped.load(std::memory_order_acquire) &&
+                !m_poller.joinable()) {
                 return;
             }
-            m_accepting = false;
-            m_permanently_stopped = true;
-            m_stop_poller = true;
+            m_permanently_stopped.store(true, std::memory_order_release);
+            m_stop_poller.store(true, std::memory_order_release);
 
-            for (auto& entry : m_slots) {
-                FdSlot& slot = *entry.second;
-                invalidate_registration_locked(slot);
-                drain_queue_locked(slot.readers, WaitStatus::kCancelled,
-                                   ECANCELED, wake);
-                drain_queue_locked(slot.writers, WaitStatus::kCancelled,
-                                   ECANCELED, wake);
+            {
+                // 先清定时器表，再逐条带排空：drain_queue_locked 会在条带锁
+                // 内取定时器锁（顺序 条带 -> 定时器），所以这里必须先释放。
+                std::lock_guard<std::mutex> timer_lock(m_timer_mutex);
+                m_deadline_index.clear();
+                m_deadline_order.clear();
             }
-            m_slots.clear();
-            m_deadline_index.clear();
-            m_deadline_order.clear();
+            for (auto& stripe : m_stripes) {
+                std::lock_guard<std::mutex> lock(stripe.mutex);
+                for (auto& entry : stripe.slots) {
+                    FdSlot& slot = *entry.second;
+                    invalidate_registration_locked(slot);
+                    drain_queue_locked(slot.readers, WaitStatus::kCancelled,
+                                       ECANCELED, wake);
+                    drain_queue_locked(slot.writers, WaitStatus::kCancelled,
+                                       ECANCELED, wake);
+                }
+                stripe.slots.clear();
+            }
         }
 
         wake_nodes(wake);
@@ -583,9 +622,11 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             // FdSlot 持有有效代际 token。先读本地缓存，避免每轮 F_GETFD
             // 和全局 descriptor registry 锁；首次注册或 close/dup2 后才
             // 回退到 Capture。这里只复制 shared_ptr，不跨锁持有 State。
-            std::lock_guard<std::mutex> lock(m_mutex);
-            const auto cached = m_slots.find(fd);
-            if (cached != m_slots.end() && cached->second->descriptor &&
+            SlotStripe& cached_stripe = stripe_for(fd);
+            std::lock_guard<std::mutex> lock(cached_stripe.mutex);
+            const auto cached = cached_stripe.slots.find(fd);
+            if (cached != cached_stripe.slots.end() &&
+                cached->second->descriptor &&
                 cached->second->descriptor->valid() &&
                 cached->second->descriptor->fd() == fd) {
                 descriptor = cached->second->descriptor;
@@ -608,8 +649,11 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
 
         int arm_error = 0;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (!m_accepting) {
+            // 同一 fd 的注册/完成/关闭/事件处理都落在这一条带上，因此下面
+            // 的代际检查与入队仍然线性化；不同 fd 的等待互不串行。
+            SlotStripe& stripe = stripe_for(fd);
+            std::lock_guard<std::mutex> lock(stripe.mutex);
+            if (!m_accepting.load(std::memory_order_acquire)) {
                 if (error != nullptr) {
                     *error = ESHUTDOWN;
                 }
@@ -654,12 +698,12 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             node->task = std::move(task);
             node->descriptor = std::move(descriptor);
 
-            auto found = m_slots.find(fd);
-            if (found == m_slots.end()) {
+            auto found = stripe.slots.find(fd);
+            if (found == stripe.slots.end()) {
                 auto slot = std::make_unique<FdSlot>();
                 slot->fd = fd;
-                slot->generation = next_generation_locked();
-                found = m_slots.emplace(fd, std::move(slot)).first;
+                slot->generation = next_generation_locked(stripe);
+                found = stripe.slots.emplace(fd, std::move(slot)).first;
             }
             FdSlot& slot = *found->second;
             const auto node_descriptor = node->descriptor;
@@ -737,6 +781,9 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 }
                 if (deadline.has_value() &&
                     node->outcome.load(std::memory_order_relaxed) == 0) {
+                    // 锁顺序：条带 -> 定时器。只有带 deadline 的等待走到这里，
+                    // 普通 IO 等待不碰定时器锁。
+                    std::lock_guard<std::mutex> timer_lock(m_timer_mutex);
                     const auto order = m_deadline_order.emplace(*deadline, node->id);
                     try {
                         m_deadline_index.emplace(
@@ -745,13 +792,14 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                         m_deadline_order.erase(order);
                         throw;
                     }
+                    node->timer_armed.store(true, std::memory_order_release);
                 }
             } catch (...) {
                 erase_node_locked(slot, node);
                 erase_timer_locked(*node);
                 if (slot.readers.empty() && slot.writers.empty() &&
                     !slot.registered) {
-                    m_slots.erase(found);
+                    stripe.slots.erase(found);
                 }
                 if (error) {
                     *error = ENOMEM;
@@ -766,7 +814,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 (void)claim(*node, WaitStatus::kError, arm_error);
                 if (!slot.registered && slot.readers.empty() &&
                     slot.writers.empty()) {
-                    m_slots.erase(found);
+                    stripe.slots.erase(found);
                 }
             }
         }
@@ -796,10 +844,11 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         WakeList wake;
         wake.push_back(node);
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
+            SlotStripe& stripe = stripe_for(node->fd);
+            std::lock_guard<std::mutex> lock(stripe.mutex);
             erase_timer_locked(*node);
-            const auto found = m_slots.find(node->fd);
-            if (found != m_slots.end() &&
+            const auto found = stripe.slots.find(node->fd);
+            if (found != stripe.slots.end() &&
                 found->second->generation == node->generation) {
                 FdSlot& slot = *found->second;
                 erase_node_locked(slot, node);
@@ -809,7 +858,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 }
                 if (slot.readers.empty() && slot.writers.empty() &&
                     !slot.registered) {
-                    m_slots.erase(found);
+                    stripe.slots.erase(found);
                 }
             }
         }
@@ -852,9 +901,10 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         }
         WakeList wake;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            const auto found = m_slots.find(node->fd);
-            if (found == m_slots.end() ||
+            SlotStripe& stripe = stripe_for(node->fd);
+            std::lock_guard<std::mutex> lock(stripe.mutex);
+            const auto found = stripe.slots.find(node->fd);
+            if (found == stripe.slots.end() ||
                 found->second->generation != node->generation) {
                 return false;
             }
@@ -865,7 +915,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 return false;
             }
             // 在确认仍是队头后再取得操作令牌，和 poller 的
-            // take_ready_locked 共用 m_mutex 线性化。这样 shutdown 的
+            // take_ready_locked 共用同一条带锁线性化。这样 shutdown 的
             // drain 不会遇到“外部已登记但节点尚未从队列取出”的窗口。
             if (!node->begin_operation()) {
                 return false;
@@ -897,7 +947,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             }
             if (slot.readers.empty() && slot.writers.empty() &&
                 !slot.registered) {
-                m_slots.erase(found);
+                stripe.slots.erase(found);
             }
             wake.push_back(node);
         }
@@ -920,9 +970,10 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         WakeList wake;
         bool found_slot = false;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            const auto found = m_slots.find(fd);
-            if (found == m_slots.end()) {
+            SlotStripe& stripe = stripe_for(fd);
+            std::lock_guard<std::mutex> lock(stripe.mutex);
+            const auto found = stripe.slots.find(fd);
+            if (found == stripe.slots.end()) {
                 return false;
             }
             found_slot = true;
@@ -930,7 +981,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             invalidate_registration_locked(slot);
             drain_queue_locked(slot.readers, WaitStatus::kClosed, EBADF, wake);
             drain_queue_locked(slot.writers, WaitStatus::kClosed, EBADF, wake);
-            m_slots.erase(found);
+            stripe.slots.erase(found);
         }
         wake_nodes(wake);
         tickle();
@@ -938,6 +989,11 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
     }
 
 private:
+    // 前置声明：SlotStripe 的完整定义放在 FdSlot 之后（它需要 FdSlot 的
+    // 完整类型），但引用该类型的成员函数声明出现在类的前部。访问控制必须
+    // 与后面的定义一致，因此同样放在 private 区。
+    struct SlotStripe;
+
     static bool claim(WaitNode& node, WaitStatus status,
                       int system_error) noexcept {
         std::uint64_t expected = 0;
@@ -974,28 +1030,41 @@ private:
                     queue.end());
     }
 
+    // 节点 id 只用于定时器索引，全局唯一即可。用原子自增避免为了取一个
+    // 数字去拿定时器锁（本函数在 register_wait 的条带锁内调用）。
     std::uint64_t next_node_id_locked() noexcept {
-        if (++m_next_node_id == 0) {
-            ++m_next_node_id;
-        }
-        return m_next_node_id;
+        const auto id =
+            m_next_node_id.fetch_add(1, std::memory_order_relaxed) + 1;
+        return id == 0
+                   ? m_next_node_id.fetch_add(1, std::memory_order_relaxed)
+                   : id;
     }
 
-    std::uint64_t next_generation_locked() noexcept {
-        if (++m_next_generation == 0) {
-            ++m_next_generation;
+    // 代际计数按条带独立：generation 只与同一个 fd（同一条带）的节点比较，
+    // 跨条带没有可比性，因此不需要全局计数器。
+    std::uint64_t next_generation_locked(SlotStripe& stripe) noexcept {
+        if (++stripe.next_generation == 0) {
+            ++stripe.next_generation;
         }
-        return m_next_generation;
+        return stripe.next_generation;
     }
 
     std::uint64_t next_registration_id_locked() noexcept {
-        ++m_next_registration_id;
-        const auto sequence = m_next_registration_id &
-                               kRegistrationSequenceMask;
+        const auto next =
+            m_next_registration_id.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto sequence = next & kRegistrationSequenceMask;
         return sequence == 0 ? 1U : sequence;
     }
 
+    /// 调用者必须已持有该节点所属 fd 的条带锁（锁顺序：条带 -> 定时器）。
+    /// 节点从未挂过 deadline 时完全不加锁：这条快速路径覆盖了所有无超时的
+    /// IO 等待，否则每次 complete 都要抢一次全局定时器锁（实测 s2 因此掉 5%）。
     void erase_timer_locked(const WaitNode& node) noexcept {
+        if (!node.timer_armed.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(m_timer_mutex);
+        node.timer_armed.store(false, std::memory_order_release);
         const auto timer = m_deadline_index.find(node.id);
         if (timer == m_deadline_index.end()) {
             return;
@@ -1006,6 +1075,8 @@ private:
 
     void invalidate_registration_locked(FdSlot& slot) noexcept {
         if (slot.registered && m_backend) {
+            std::unique_lock<std::mutex> lock(m_epoll_mutex,
+                                              std::try_to_lock);
             (void)m_backend->remove(slot.fd);
         }
         slot.registered = false;
@@ -1063,11 +1134,18 @@ private:
         const std::uint64_t registration_id =
             make_registration_token(slot.fd, next_registration_id_locked());
 
-        const int result = m_backend
-                               ? m_backend->add_or_modify(
-                                     slot.fd, interest, registration_id,
-                                     slot.registered)
-                               : ENODEV;
+        int result;
+        {
+            // 与 invalidate_registration_locked 一致：低并发时串行化避开内核
+            // 自旋，高并发时退化直连（try_lock 失败不阻塞）。
+            std::unique_lock<std::mutex> lock(m_epoll_mutex,
+                                              std::try_to_lock);
+            result = m_backend
+                         ? m_backend->add_or_modify(
+                               slot.fd, interest, registration_id,
+                               slot.registered)
+                         : ENODEV;
+        }
         if (result != 0) {
             const int saved_error = result;
             return saved_error;
@@ -1162,8 +1240,9 @@ private:
                               std::uint32_t events,
                               WakeList& wake) noexcept {
             const int fd = token_fd(registration_id);
-            const auto registration = m_slots.find(fd);
-            if (registration == m_slots.end()) {
+            SlotStripe& stripe = stripe_for(fd);
+            const auto registration = stripe.slots.find(fd);
+            if (registration == stripe.slots.end()) {
                 return;
             }
             FdSlot& slot = *registration->second;
@@ -1189,7 +1268,7 @@ private:
                 (events & (0x04U | 0x08U)) != 0) {
                 invalidate_registration_locked(slot);
                 if (slot.readers.empty() && slot.writers.empty()) {
-                    m_slots.erase(fd);
+                    stripe.slots.erase(fd);
                 }
                 return;
             }
@@ -1222,7 +1301,7 @@ private:
             }
             if (slot.readers.empty() && slot.writers.empty() &&
                 !slot.registered) {
-                m_slots.erase(fd);
+                stripe.slots.erase(fd);
             }
     }
 
@@ -1230,62 +1309,85 @@ private:
                        std::uint32_t events) noexcept {
         WakeList wake;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
+            const int fd = token_fd(registration_id);
+            SlotStripe& stripe = stripe_for(fd);
+            std::lock_guard<std::mutex> lock(stripe.mutex);
             process_event_locked(registration_id, events, wake);
         }
         wake_nodes(wake);
     }
 
-    // 批量处理一次 epoll_wait 返回的事件。迟到的 registration token
-    // 仍由 locked helper 忽略；所有 Fiber 在释放 m_mutex 后统一唤醒。
+    // 批量处理一次 epoll_wait 返回的事件。
+    //
+    // 每个事件只拿自己 fd 所属条带的锁，处理完立即释放——这是万连接场景的
+    // 关键。旧实现把整批 256 个事件放在同一把全局锁下处理（锁内还有
+    // epoll_ctl），12 个 M 实际只有一个能推进，实测并行度约 1.7 核。现在
+    // 不同 fd 的事件可以由不同 M 真正并行处理，同一 fd 仍由同一条带锁串行化。
+    //
+    // 迟到的 registration token 仍由 locked helper 忽略；所有 Fiber 在释放
+    // 条带锁后统一唤醒。
     void process_events_batch(const BackendEvent* events,
                               std::size_t count) noexcept {
         if (events == nullptr || count == 0) {
             return;
         }
         WakeList wake;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            for (std::size_t index = 0; index < count; ++index) {
-                if (events[index].token != kWakeRegistration) {
-                    process_event_locked(events[index].token,
-                                         events[index].events, wake);
-                }
+        for (std::size_t index = 0; index < count; ++index) {
+            if (events[index].token == kWakeRegistration) {
+                continue;
             }
+            const int event_fd = token_fd(events[index].token);
+            SlotStripe& stripe = stripe_for(event_fd);
+            std::lock_guard<std::mutex> lock(stripe.mutex);
+            process_event_locked(events[index].token, events[index].events,
+                                 wake);
         }
         wake_nodes(wake);
     }
 
+    // 到期处理分两阶段：先在定时器锁内摘出到期节点，释放之后再按 fd 条带
+    // 处理。锁顺序约定是「条带锁 -> m_timer_mutex」，因此这里绝不能持定时器
+    // 锁去拿条带锁，否则会与 register_wait/complete 形成环。
     void expire_timers() noexcept {
         WakeList wake;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            const auto now = Clock::now();
-            while (!m_deadline_order.empty() &&
-                   m_deadline_order.begin()->first <= now) {
+        for (;;) {
+            NodePtr node;
+            {
+                std::lock_guard<std::mutex> lock(m_timer_mutex);
+                const auto now = Clock::now();
+                if (m_deadline_order.empty() ||
+                    m_deadline_order.begin()->first > now) {
+                    break;
+                }
                 const auto order = m_deadline_order.begin();
                 const std::uint64_t node_id = order->second;
                 const auto timer = m_deadline_index.find(node_id);
-                NodePtr node;
                 if (timer != m_deadline_index.end()) {
                     node = timer->second.node.lock();
                     m_deadline_index.erase(timer);
+                    if (node) {
+                        node->timer_armed.store(false,
+                                                std::memory_order_release);
+                    }
                 }
                 m_deadline_order.erase(order);
-                // 超时路径也必须先登记活动操作，才能与 WakeList::wake_nodes
-                // 中的 end_operation 一一配对。否则使用计数型生命周期时会
-                // 出现下溢；当前互斥量实现也需要这一配对来保持复用顺序。
-                const bool operation_started =
-                    node && node->begin_operation();
-                if (!operation_started ||
-                    !claim(*node, WaitStatus::kTimeout, ETIMEDOUT)) {
-                    if (operation_started) {
-                        node->end_operation();
-                    }
-                    continue;
+            }
+            // 超时路径也必须先登记活动操作，才能与 WakeList::wake_nodes
+            // 中的 end_operation 一一配对。否则使用计数型生命周期时会
+            // 出现下溢；当前互斥量实现也需要这一配对来保持复用顺序。
+            const bool operation_started = node && node->begin_operation();
+            if (!operation_started ||
+                !claim(*node, WaitStatus::kTimeout, ETIMEDOUT)) {
+                if (operation_started) {
+                    node->end_operation();
                 }
-                const auto found = m_slots.find(node->fd);
-                if (found != m_slots.end() &&
+                continue;
+            }
+            {
+                SlotStripe& stripe = stripe_for(node->fd);
+                std::lock_guard<std::mutex> lock(stripe.mutex);
+                const auto found = stripe.slots.find(node->fd);
+                if (found != stripe.slots.end() &&
                     found->second->generation == node->generation) {
                     FdSlot& slot = *found->second;
                     erase_node_locked(slot, node);
@@ -1295,18 +1397,18 @@ private:
                     }
                     if (slot.readers.empty() && slot.writers.empty() &&
                         !slot.registered) {
-                        m_slots.erase(found);
+                        stripe.slots.erase(found);
                     }
                 }
-                wake.push_back(std::move(node));
             }
+            wake.push_back(std::move(node));
         }
         wake_nodes(wake);
     }
 
     int poll_timeout_ms() const noexcept {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_stop_poller) {
+        std::lock_guard<std::mutex> lock(m_timer_mutex);
+        if (m_stop_poller.load(std::memory_order_acquire)) {
             return 0;
         }
         if (m_deadline_order.empty()) {
@@ -1346,13 +1448,12 @@ private:
         BackendEvent events[kEventBatch]{};
         for (;;) {
             {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (m_stop_poller) {
+                if (m_stop_poller.load(std::memory_order_acquire)) {
                     break;
                 }
-                // register_wait 在同一把锁下发布 epoll 节点；只有它在
-                // 这里置位后并发发布才需要 eventfd 打断 epoll_wait。
-                m_poller_waiting.store(true, std::memory_order_release);
+                // register_wait 在对应 fd 的条带锁内发布 epoll 节点；这里
+                // 登记等待者之后，并发发布才需要 eventfd 打断 epoll_wait。
+                m_waiters.fetch_add(1, std::memory_order_release);
             }
             int count;
             do {
@@ -1361,25 +1462,28 @@ private:
                                               poll_timeout_ms())
                             : -ENODEV;
             } while (count < 0 && -count == EINTR);
-            m_poller_waiting.store(false, std::memory_order_release);
+            m_waiters.fetch_sub(1, std::memory_order_release);
 
             if (count < 0) {
                 WakeList wake;
                 {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    if (!m_stop_poller) {
-                        m_init_error = count < 0 ? -count : EIO;
-                        m_accepting = false;
-                        m_stop_poller = true;
-                        for (auto& entry : m_slots) {
-                            FdSlot& slot = *entry.second;
-                            invalidate_registration_locked(slot);
-                            drain_queue_locked(slot.readers,
-                                               WaitStatus::kError,
-                                               m_init_error, wake);
-                            drain_queue_locked(slot.writers,
-                                               WaitStatus::kError,
-                                               m_init_error, wake);
+                    if (!m_stop_poller.load(std::memory_order_acquire)) {
+                        const int error_code = count < 0 ? -count : EIO;
+                        m_init_error = error_code;
+                        m_accepting.store(false, std::memory_order_release);
+                        m_stop_poller.store(true, std::memory_order_release);
+                        for (auto& stripe : m_stripes) {
+                            std::lock_guard<std::mutex> lock(stripe.mutex);
+                            for (auto& entry : stripe.slots) {
+                                FdSlot& slot = *entry.second;
+                                invalidate_registration_locked(slot);
+                                drain_queue_locked(slot.readers,
+                                                   WaitStatus::kError,
+                                                   error_code, wake);
+                                drain_queue_locked(slot.writers,
+                                                   WaitStatus::kError,
+                                                   error_code, wake);
+                            }
                         }
                     }
                 }
@@ -1399,28 +1503,93 @@ private:
             process_events_batch(events, static_cast<std::size_t>(count));
             expire_timers();
 
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_stop_poller) {
+            if (m_stop_poller.load(std::memory_order_acquire)) {
                 break;
             }
         }
         m_running.store(false, std::memory_order_release);
     }
 
+    /**
+     * @brief 踢醒一个正在后端等待的线程（poller 或自行轮询的 worker）。
+     * @details 无等待者时直接返回，不产生系统调用。有等待者时用 eventfd
+     *          合并多次踢醒：一个计数就足以触发一次 epoll 返回，其余注册
+     *          会被被踢醒的线程在重新计算超时时合并处理。
+     */
+    /// @brief 启用「worker 自己轮询」后不再需要独立的 poller 线程。
+    /// @details 独立 poller 线程会和 worker 抢同一个 epoll 队列：它抢到事件
+    ///          就必须跨线程唤醒 worker，等于把已经消除的 handoff 又加回来。
+    ///          因此启用 worker 轮询时只保留 worker 作为等待者；timer 的
+    ///          到期处理也由 worker 的 epoll_wait 超时驱动。
+    void set_worker_polling(bool enabled) noexcept { m_worker_polling = enabled; }
+
     void tickle() noexcept {
         if (!m_backend) {
             return;
         }
-        if (!m_poller_waiting.load(std::memory_order_acquire)) {
+        if (m_waiters.load(std::memory_order_acquire) == 0) {
             return;
         }
-        // poller 休眠期间可能有多个注册或完成事件到达。一个 eventfd 计数就
-        // 足以触发一次 epoll 返回，其余事件合并到 poller 排空计数时处理。
-        // 这样每个 Fiber 等待都不必执行一次 write 系统调用，同时不改变就绪协议。
         if (m_tickle_pending.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
         m_backend->wake();
+    }
+
+    /**
+     * @brief 在调用者线程上完成一次后端轮询（Go runtime.netpoll 模型）。
+     *
+     * @details
+     * worker 无 G 可跑时直接调用本函数：epoll_wait、就绪事件处理、G 入队
+     * 全部发生在同一个 M 上，因此不再需要「poller 线程 -> 条件变量 ->
+     * worker」的跨线程唤醒。poller 线程仍在运行，两者共用同一个后端；内核
+     * 的 EPOLLONESHOT 保证一个就绪事件只会交给其中一个等待者。
+     *
+     * @param timeout_ms 最长等待毫秒数（>=0）。调用方传入调度器的 idle_wait；
+     *                   这里再与最近的定时器截止时间取较小值，保证 sleep/
+     *                   超时的精度不被空转等待拖慢。
+     * @return >0 表示处理了事件；0 表示正常超时；<0 表示后端不可用（已停止
+     *         或出错），调用方应退回条件变量等待，避免忙循环。
+     */
+    int poll_once(int timeout_ms) noexcept {
+        if (!m_backend) {
+            return -1;
+        }
+        if (m_stop_poller.load(std::memory_order_acquire)) {
+            return -1;
+        }
+        int effective = timeout_ms < 0 ? 0 : timeout_ms;
+        const int deadline_timeout = poll_timeout_ms();
+        if (deadline_timeout == 0) {
+            effective = 0;
+        } else if (deadline_timeout > 0 && deadline_timeout < effective) {
+            effective = deadline_timeout;
+        }
+        constexpr int kEventBatch = 256;
+        BackendEvent events[kEventBatch]{};
+        m_waiters.fetch_add(1, std::memory_order_release);
+        int count;
+        do {
+            count = m_backend->wait(events, kEventBatch, effective);
+        } while (count < 0 && -count == EINTR);
+        m_waiters.fetch_sub(1, std::memory_order_release);
+        if (count < 0) {
+            return -1;
+        }
+        bool saw_wake = false;
+        for (int index = 0; index < count; ++index) {
+            saw_wake = saw_wake || events[index].token == kWakeRegistration;
+        }
+        if (saw_wake) {
+            // 由谁排空都行：eventfd 是计数语义，排空后 tickle 可以再次写入。
+            drain_wake_fd();
+            m_tickle_pending.store(false, std::memory_order_release);
+        }
+        if (count > 0) {
+            process_events_batch(events, static_cast<std::size_t>(count));
+        }
+        expire_timers();
+        return count;
     }
 
     void wake_nodes(WakeList& nodes) noexcept {
@@ -1489,9 +1658,10 @@ private:
         WakeList wake;
         bool had_waiter = false;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            const auto found = m_slots.find(fd);
-            if (found == m_slots.end()) {
+            SlotStripe& stripe = stripe_for(fd);
+            std::lock_guard<std::mutex> lock(stripe.mutex);
+            const auto found = stripe.slots.find(fd);
+            if (found == stripe.slots.end()) {
                 return false;
             }
             FdSlot& slot = *found->second;
@@ -1512,7 +1682,7 @@ private:
             }
             if (slot.readers.empty() && slot.writers.empty() &&
                 !slot.registered) {
-                m_slots.erase(found);
+                stripe.slots.erase(found);
             }
         }
         wake_nodes(wake);
@@ -1523,24 +1693,68 @@ private:
     Scheduler* m_scheduler{nullptr};
     IOBackendPtr m_backend;
     bool m_backend_owner_registered{false};
-    std::atomic<bool> m_poller_waiting{false};
+    // poller 线程 + 所有自行轮询的 worker 中，当前正停在后端 wait 里的数量。
+    std::atomic<std::size_t> m_waiters{0};
     std::atomic<bool> m_tickle_pending{false};
     int m_init_error{0};
 
-    mutable std::mutex m_mutex;
+    // fd 条带表：m_slots 按 fd 分片，每个条带自带锁与代际计数器。
+    //
+    // 为什么分片：万连接场景下一次 epoll_wait 会返回一批 256 个就绪事件。
+    // 旧实现把整批事件放在同一把 m_mutex 下串行处理，而且每个事件还要在
+    // 锁内执行 epoll_ctl。结果是 12 个 M 里只有一个能推进，实测并行度只有
+    // 约 1.7 核，s3 的 p50 被拖到 400ms 量级。
+    //
+    // 为什么安全：分片键是 fd 数值本身，同一个 fd 永远落在同一条带；于是
+    // 同一 fd 的 register_wait / complete / notify_close / 就绪事件处理仍由
+    // 同一把互斥量串行化，代际与等待队列语义完全不变。不同 fd 走不同条带，
+    // 可以真正并行。
+    //
+    // 锁顺序（全局约定，必须遵守）：条带锁 -> m_timer_mutex。
+    // expire_timers() 因此分两阶段：先在 m_timer_mutex 内摘取到期节点，释放
+    // 之后再逐条带处理，绝不反向嵌套。
+    static constexpr std::size_t kSlotStripeCount = 64;
+    // alignas(64) 让每条带独占 cacheline：不带对齐时 SlotStripe 约 112 字节，
+    // 相邻条带的锁与 map 会共用 cacheline，一个条带的正常写就会 invalidate
+    // 另一个条带正在持有的锁，实测会把每请求 CPU 抬高 2 倍以上。
+    struct alignas(64) SlotStripe {
+        mutable std::mutex mutex;
+        std::unordered_map<int, std::unique_ptr<FdSlot>> slots;
+        std::uint64_t next_generation{0};
+    };
+    SlotStripe& stripe_for(int fd) noexcept {
+        return m_stripes[static_cast<std::size_t>(
+                             static_cast<unsigned int>(fd)) &
+                         (kSlotStripeCount - 1)];
+    }
+    std::array<SlotStripe, kSlotStripeCount> m_stripes;
+
     std::mutex m_lifecycle_mutex;
-    bool m_accepting{false};
-    bool m_stop_poller{false};
-    bool m_permanently_stopped{false};
+    std::atomic<bool> m_accepting{false};
+    std::atomic<bool> m_stop_poller{false};
+    bool m_worker_polling{false};
+    std::atomic<bool> m_permanently_stopped{false};
     std::atomic<bool> m_running{false};
     std::thread m_poller;
 
-    std::unordered_map<int, std::unique_ptr<FdSlot>> m_slots;
+    // 定时器表是「最近截止时间」这个全局视图，无法按 fd 切开；但它不再是
+    // 每个 IO 事件的必经之路，只在注册定时器与到期处理时短暂持有。
+    // epoll_ctl 的内核 ep->mtx 在并发调用时会走 optimistic spinning：12 个 M
+    // 同时 epoll_ctl 同一个 epoll fd 时内核自旋等锁，CPU 涨但吞吐不涨（实测
+    // 低并发场景每请求 CPU 从 404us 涨到 900us，而 context switch 没有增加）。
+    //
+    // 但内核锁在高并发下比用户态锁更有效（实测万连接场景序列化 epoll_ctl
+    // 会掉 24%）。因此这里用 try_lock 做自适应：
+    //   - 抢到锁 -> 串行执行，避免内核自旋；
+    //   - 抢不到 -> 说明当前并发已高，直接并发调用交给内核，不额外排队。
+    // 只覆盖 epoll_ctl，不覆盖 slot 状态操作与 Fiber 唤醒。
+    mutable std::mutex m_epoll_mutex;
+
+    mutable std::mutex m_timer_mutex;
     DeadlineOrder m_deadline_order;
     std::unordered_map<std::uint64_t, TimerRecord> m_deadline_index;
-    std::uint64_t m_next_node_id{0};
-    std::uint64_t m_next_generation{0};
-    std::uint64_t m_next_registration_id{0};
+    std::atomic<std::uint64_t> m_next_node_id{0};
+    std::atomic<std::uint64_t> m_next_registration_id{0};
 };
 
 IOManager::IOManager(SchedulerConfig config, IOBackendPtr backend)
@@ -1554,6 +1768,23 @@ IOManager::IOManager(SchedulerConfig config, IOBackendPtr backend)
             (void)state->notify_close(fd);
         }
     };
+    // 让 M 在空闲时自己 epoll_wait：就绪事件由本线程处理，G 直接被投回
+    // 本 P，消除 poller -> worker 的跨线程唤醒。必须在 start() 之前安装，
+    // 所以放在构造期；State 生命周期短于 Scheduler，回调只用 weak_ptr。
+    if (m_state) {
+        m_state->set_worker_polling(true);
+        (void)m_scheduler.set_io_idle_poller(
+            [weak_state](int timeout_ms) {
+                const auto state = weak_state.lock();
+                return state ? state->poll_once(timeout_ms) : -1;
+            },
+            [weak_state] {
+                const auto state = weak_state.lock();
+                if (state) {
+                    state->tickle();
+                }
+            });
+    }
 }
 
 IOManager::~IOManager() {
@@ -1607,6 +1838,12 @@ WaitResult IOManager::wait(int fd, IOEvent event,
     if (Scheduler::current_scheduler() != &m_scheduler ||
         !Scheduler::current_task()) {
         return {WaitStatus::kError, EPERM};
+    }
+    // TimePoint::max() 表示「无超时」。归一化成 nullopt，避免为一个永不
+    // 到期的等待分配定时器节点：每条空闲连接一个定时器节点会让
+    // poll_timeout_ms() 始终返回极小值，并让 epoll_wait 变成忙轮询。
+    if (deadline.has_value() && *deadline == TimePoint::max()) {
+        deadline.reset();
     }
     if (event_mask(event) == 0) {
         return {WaitStatus::kError, EINVAL};
@@ -2186,13 +2423,13 @@ bool IOManager::cancel_all(int fd) {
 }
 
 bool IOManager::notify_close(int fd) {
-    DescriptorGuard guard;
+    DescriptorGuard guard(fd);
     DescriptorGuard::Invalidate(fd);
     return m_state && m_state->notify_close(fd);
 }
 
 void IOManager::NotifyCloseAll(int fd) noexcept {
-    DescriptorGuard guard;
+    DescriptorGuard guard(fd);
     DescriptorGuard::Invalidate(fd);
     std::vector<CloseCallback> callbacks;
     try {

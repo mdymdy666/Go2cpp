@@ -62,6 +62,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -178,9 +179,23 @@ struct Response {
 /// @brief 模拟真实 IO 延迟的上限（微秒）。0 表示关闭。
 /// @details 用 usleep 而不是忙等：在 GMP 模型里 usleep 被 hook 成 park（让出 M），
 ///          在 thread 模型里是真正的线程睡眠 —— 这正是要对比的差异。
-constexpr std::uint32_t kIoSleepMaxUs = 5000;
+constexpr std::uint32_t kIoSleepDefaultUs = 5000;
+
+/// 实际使用的 IO 延迟上限，可用 GO2CPP_BENCH_IO_SLEEP_US 覆盖（诊断用）。
+/// 注意：压测结果必须报告这个值；默认 5000 与文档基线一致。
+std::uint32_t io_sleep_max_us() {
+    static const std::uint32_t value = [] {
+        const char* env = std::getenv("GO2CPP_BENCH_IO_SLEEP_US");
+        if (env == nullptr || *env == 0) {
+            return kIoSleepDefaultUs;
+        }
+        return static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10));
+    }();
+    return value;
+}
 
 Response process_request(std::uint8_t opcode, std::string_view body) {
+    const std::uint32_t kIoSleepMaxUs = io_sleep_max_us();
     if (kIoSleepMaxUs > 0) {
         // xorshift32：每线程独立，避免锁；延迟在 [0, kIoSleepMaxUs] 均匀分布
         static thread_local std::uint32_t seed = 0x9e3779b9u;

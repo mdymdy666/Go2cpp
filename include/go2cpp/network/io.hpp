@@ -55,13 +55,24 @@ using DescriptorTokenPtr = std::shared_ptr<const DescriptorToken>;
 /**
  * fd 注册表的短生命周期保护。
  *
- * 依赖：DescriptorRegistryState 的递归互斥锁；对上层/Hook 提供 Capture
- * 和 Invalidate 的原子窗口。不能跨阻塞系统调用或 Fiber park 持有。
+ * 依赖：DescriptorRegistryState 按 fd 分条的递归互斥锁；对上层/Hook 提供
+ * Capture 和 Invalidate 的原子窗口。不能跨阻塞系统调用或 Fiber park 持有。
+ *
+ * 为什么按 fd 分条：Hook 的每个 recv/send/fcntl/setsockopt 都要持有这个门，
+ * 单一全局锁在 12+ 个 worker 下会把它们串行化。WSL2 实测一次竞争约
+ * 55-75µs（等于一次跨线程 futex 往返），短连接 accept 路径上的两次
+ * setsockopt 就要 168µs，直接把连接建立压到 5k/s。分条后仍然保证
+ * 「同一个 fd」的 Capture/Invalidate/在途 syscall 互斥 —— 这正是 fd 复用
+ * 安全所需要的不变式 —— 不同 fd 之间不再互相阻塞。
  */
-/** @brief 持有描述符注册表锁并管理令牌生命周期的 RAII 守卫。 */
+/** @brief 持有 fd 所在条带的注册表锁并管理令牌生命周期的 RAII 守卫。 */
 class DescriptorGuard final {
 public:
-    DescriptorGuard();
+    /**
+     * @param fd 需要保护的描述符；构造时锁住该 fd 所属的注册表条带。
+     * @note 同一线程对同一 fd 可重复构造（条带锁是递归互斥量）。
+     */
+    explicit DescriptorGuard(int fd);
     ~DescriptorGuard();
     DescriptorGuard(const DescriptorGuard&) = delete;
     DescriptorGuard& operator=(const DescriptorGuard&) = delete;

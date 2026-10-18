@@ -11,7 +11,7 @@
 | `src/tools`、`include/go2cpp/tools` | 错误链、显式控制流（defer/panic/recover）、`SelectLoop`/`EventBatch`、默认调度器入口 | `go2cpp::error`、`go2cpp::control_flow` |
 | `src/concurrency`、`include/go2cpp/concurrency` | Scheduler（G/M/P）、Fiber 与栈、FiberLocal、Context、Channel、同步原语、Future、Timer | `go2cpp::scheduler`、`go2cpp::fiber`、`go2cpp::context`、`go2cpp::channel`、`go2cpp::sync`、`go2cpp::future` |
 | `src/network`、`include/go2cpp/network` | IOManager 与 epoll 后端、FD 管理、Socket、Address、ByteArray、Framer、HTTP、SSE、WebSocket、Hook | `go2cpp::io`、`go2cpp::network`、`go2cpp::hook`（仅 Linux 共享库构建） |
-| `src/os`、`include/go2cpp/os` | 文件句柄（`os::File`：Open/Create/Read/Write/Seek/Stat/Sync/Truncate）、目录遍历（`ReadDir`/`MkdirAll`/`RemoveAll`）、符号链接、环境变量、`Args` | `go2cpp::os`（**待接入**：见下方注记） |
+| `src/os`、`include/go2cpp/os` | 文件句柄（`os::File`：Open/Create/Read/Write/Seek/Stat/Sync/Truncate）、目录遍历（`ReadDir`/`MkdirAll`/`RemoveAll`）、符号链接、环境变量、`Args` | `go2cpp::os` |
 | `src/logging`、`include/go2cpp/logging` | 日志等级、Formatter/Item、Sink、Logger 父级传播 | `go2cpp::log` |
 | `src/config`、`include/go2cpp/config` | `ConfigVar<T>`、INI 快照、变更监听与热加载事务 | `go2cpp::config` |
 | 仅头文件 | 聚合 umbrella，导出全部模块 target 与 `include/` 路径 | `go2cpp::runtime`（INTERFACE） |
@@ -27,9 +27,9 @@
 - `include/go2cpp/{concurrency,tools,network,logging,config,scheduler}/`：模块真实定义。
 - `include/go2cpp/os/`：`file.hpp`（文件句柄与错误码）、`os.hpp`（环境变量 / `Args` / `Exit`）、`dir.hpp`（目录遍历与符号链接）。
 - `include/go2cpp/network/http2/`：HTTP/2 全栈 —— `hpack.hpp`（含 Huffman 码表 `huffman_tables.inc`）、`frame.hpp`（帧层）、`stream_state.hpp`（流状态机）、`connection.hpp`（连接层）、`transport.hpp` / `fiber_transport.hpp` / `tls_transport.hpp`（IO 抽象与三种实现）。
-- `include/go2cpp/network/quic/`：QUIC 地基 —— `varint.hpp`（RFC 9000 §16）、`packet.hpp`（§17 六种包头）、`frame.hpp`（§19 帧层）。**不含握手/加密/丢包恢复**。
+- `include/go2cpp/network/quic/`：picoquic 薄封装 —— `picoquic_connection.hpp` / `src/network/quic/picoquic_connection.cpp`（`GO2CPP_WITH_PICOQUIC`，默认 OFF）。自研 varint/packet/frame 已删除，**不要在任何文档或接口里承诺自研 QUIC**。
 
-- `include/go2cpp/core/`：`hybrid_mutex.hpp`、`parking_condition.hpp`、`status.hpp`、
+- `include/go2cpp/core/`：`parking_condition.hpp`、`status.hpp`、
   `timer.hpp`。供同步与 IO 复用的核心设施，**不属于稳定公共 API**。
 - `include/go2cpp/detail/`：`context_backend.hpp`，Fiber 上下文后端声明
   （Linux x86_64 为 Go2Cpp 自有 ABI，其他平台回退 Boost.Context），属实现细节。
@@ -48,7 +48,7 @@
 | `go2cpp_io` | `go2cpp_context`、`go2cpp_scheduler` |
 | `go2cpp_network` | `go2cpp_io`、`go2cpp_context`、`go2cpp_scheduler`、`go2cpp_sync` |
 | `go2cpp_config` | `go2cpp_scheduler`、`go2cpp_log` |
-| `go2cpp_os`（**待接入**） | `go2cpp_config`（`src/os/config.cpp` 调 `Config::SaveToFile`） |
+| `go2cpp_os` | `go2cpp_config`（`src/os/config.cpp` 调 `Config::SaveToFile`） |
 | `go2cpp_hook` | `go2cpp_io`、`go2cpp_fiber`、`${CMAKE_DL_LIBS}` |
 | `go2cpp_error`、`go2cpp_control_flow`、`go2cpp_log`、`go2cpp_fiber` | 仅 `Threads::Threads`；`go2cpp_fiber` 在非 native 上下文平台额外链接 `Boost::context` |
 
@@ -84,4 +84,4 @@
 **验证方式**（不要只编译）：写一个只 `#include <go2cpp/os/file.hpp>` 而不编译源文件的
 小目标，链接 `-lgo2cpp_os` 能通过，才算真正接入。
 
-在此之前，本文件的 §1 与 §3 两张表里给 `os` 标的都是「待接入」。
+`os` 已完成接入：`go2cpp_os` 已在 `GO2CPP_MODULE_TARGETS` 与 `go2cpp::runtime` 中。
