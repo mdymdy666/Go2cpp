@@ -79,6 +79,24 @@ add_library(go2cpp_path
 add_library(go2cpp_container
     ${CMAKE_CURRENT_SOURCE_DIR}/src/container/container.cpp)
 
+# compress 模块：Go `compress/flate`、`compress/zlib`、`compress/gzip` 的薄封装。
+# **不自研 DEFLATE**：Huffman 编码 + LZ77 滑动窗口全部委托系统 zlib
+# （RFC 1951/1950/1952），本模块只做流式 IO 适配、多成员 gzip 与错误翻译。
+#
+# find_package 而不是硬编码 `-lz` 或 `/usr/lib/libz.so`：库名、版本、是否
+# 拆成 libz.so/libz.a 因发行版而异，导入目标 ZLIB::ZLIB 也自带 include 路径。
+# 缺 zlib 时 configure **直接失败**——有意为之：若退化成「编译通过但不压缩」，
+# 会静默产出坏数据，比构建失败难查得多。
+find_package(ZLIB REQUIRED)
+add_library(go2cpp_compress
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/compress/compress.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/compress/deflater.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/compress/errors.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/compress/inflater.cpp)
+# go2cpp_error 是 PUBLIC 依赖：Reader/Writer 是头文件模板，模板实例化时会调用
+# go2cpp::Is / streams::IoEof，使用方必须能链接到 error 模块。
+target_link_libraries(go2cpp_compress PUBLIC go2cpp_error ZLIB::ZLIB)
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GO2CPP_BUILD_HOOK)
     add_library(go2cpp_hook SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/network/hook.cpp)
 endif()
@@ -104,6 +122,7 @@ set_target_properties(go2cpp_math PROPERTIES EXPORT_NAME math)
 set_target_properties(go2cpp_rand PROPERTIES EXPORT_NAME rand)
 set_target_properties(go2cpp_path PROPERTIES EXPORT_NAME path)
 set_target_properties(go2cpp_container PROPERTIES EXPORT_NAME container)
+set_target_properties(go2cpp_compress PROPERTIES EXPORT_NAME compress)
 if (TARGET go2cpp_hook)
     set_target_properties(go2cpp_hook PROPERTIES EXPORT_NAME hook)
 endif()
@@ -129,6 +148,7 @@ add_library(go2cpp::math ALIAS go2cpp_math)
 add_library(go2cpp::rand ALIAS go2cpp_rand)
 add_library(go2cpp::path ALIAS go2cpp_path)
 add_library(go2cpp::container ALIAS go2cpp_container)
+add_library(go2cpp::compress ALIAS go2cpp_compress)
 if (TARGET go2cpp_hook)
     add_library(go2cpp::hook ALIAS go2cpp_hook)
 endif()
@@ -151,6 +171,7 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_rand
     go2cpp_path
     go2cpp_container
+    go2cpp_compress
 )
 if (TARGET go2cpp_hook)
     list(APPEND GO2CPP_MODULE_TARGETS go2cpp_hook)
@@ -210,7 +231,7 @@ endif()
 target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_error go2cpp_control_flow go2cpp_context go2cpp_channel go2cpp_scheduler
     go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io go2cpp_network go2cpp_log go2cpp_config
-    go2cpp_math go2cpp_rand go2cpp_path go2cpp_container
+    go2cpp_math go2cpp_rand go2cpp_path go2cpp_container go2cpp_compress
     Threads::Threads)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_runtime INTERFACE go2cpp_hook)

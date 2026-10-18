@@ -9229,3 +9229,176 @@ ctest --test-dir build-quality --output-on-failure           # 107/107 passed
 - Windows 分支未真机验证；
 - 未实现 `filepath.SplitList`/`VolumeName`/`ToSlash`/`FromSlash`/`IsLocal`/`Localize`/`WalkDir`；
 - 未更新 `docs/NEXT-STEPS.md` 里 os 缺口表的「路径规范化」一行（留待文档维护统一处理）。
+
+## 2026-10-18 compress 模块（Go `compress/flate`、`compress/zlib`、`compress/gzip`）
+
+### 改动内容
+
+- 新增 `include/go2cpp/compress/`：
+  - `compress.hpp`（umbrella）、`flate.hpp`、`zlib.hpp`、`gzip.hpp`、
+    `errors.hpp`、`level.hpp`、`byte_span.hpp`（复用 `bufio::ByteSpan`，零链接依赖）；
+  - `detail/constants.hpp`（windowBits / 缓冲尺寸 / uInt 上限防护）、
+    `detail/reader_engine.hpp`（`Inflater` + 拉取式解压循环）、
+    `detail/writer_engine.hpp`（`Deflater` + 推入式压缩循环）。
+- 新增 `src/compress/{compress,deflater,errors,inflater}.cpp`；
+  `compress.cpp` 只做 umbrella 自包含检查与级别常量 `static_assert`。
+- 新增 `tests/compress/`：`compress_test_main.cpp`、`compress_test_support.{hpp,cpp}`、
+  `test_{flate,zlib,gzip,random,interop,scenarios,stress}.cpp`。
+- 注册 `go2cpp_compress` 到 `cmake/Go2CppModules.cmake`
+  （`find_package(ZLIB REQUIRED)`、显式源文件列表、`EXPORT_NAME compress`、
+  `go2cpp::compress` alias、`GO2CPP_MODULE_TARGETS`、`go2cpp_runtime` 接口）；
+  `go2cpp_compress_test` 注册进 `cmake/Go2CppTests.cmake` 的
+  `if (GO2CPP_BUILD_TESTS)` 块内（不是文件末尾）。
+- `cmake/go2cpp_runtimeConfig.cmake.in` 增加 `find_dependency(ZLIB)`：
+  导出目标 `go2cpp::compress` 的 `INTERFACE_LINK_LIBRARIES` 含 `ZLIB::ZLIB`，
+  安装包使用者必须先找到 ZLIB。
+
+### 实现方式与边界
+
+- **不自研 DEFLATE**：全部委托系统 zlib（1.3，`-lz`）。`windowBits`
+  `-15` / `15` / `31` 分别对应 raw deflate / zlib / gzip；Huffman、LZ77、
+  adler32、crc32、ISIZE 全由 zlib 负责。
+- 解压：拉取式，自带 32 KiB 输入缓冲；调用方输出缓冲直接交给 `inflate`，无额外拷贝。
+  处理部分输入、数据+EOF 同次返回、源无进展（100 次 → `IoErrNoProgress`）。
+- 压缩：推入式，64 KiB 输出缓冲；`Write`/`Flush`（`Z_SYNC_FLUSH`）/
+  `Close`（`Z_FINISH`）+ 粘性错误 + 短写循环。**析构不自动 `Close`**
+  （与 `bufio::Writer` 不自动 `Flush` 一致），忘记 `Close` 会得到半截流，
+  解压方 `ErrUnexpectedEof`。
+- gzip 默认多成员（对齐 Go `Reader.Multistream(true)`）；`Multistream(false)`
+  只解第一个成员；成员间垃圾数据 → `ErrHeader`（与 Go 一致，GNU gzip 则是告警后忽略）。
+- 错误映射：`Z_DATA_ERROR` 按 zlib `msg` 文本细分为 `ErrChecksum` / `ErrHeader` /
+  `ErrCorrupt`；FDICT → `ErrDictionary`；非法级别 → `ErrInvalidLevel`（不静默降级）。
+- gzip 头固定 `FLG=0`、`MTIME=0`（输出可复现），不写文件名/注释；`XFL`/`OS` 由 zlib 决定。
+- 未实现：预置字典、gzip 自定义头字段（Name/Comment/ModTime）、`Resetter`、
+  `HuffmanOnly(-2)`。
+
+### 测试结果（实测）
+
+命令：
+
+```sh
+cd /UserData/CodexWorkSpace/Go2Cpp
+flock /tmp/go2cpp_build.lock cmake -S . -B build-quality    # Found ZLIB 1.3
+flock /tmp/go2cpp_build.lock cmake --build build-quality -j 12   # 0 warning / 0 error
+ctest --test-dir build-quality -N | grep compress            # Test #33: go2cpp_compress_test
+ctest --test-dir build-quality                               # 110/110 passed, 43.6s
+./build-quality/go2cpp_compress_test                         # all checks passed (checks=1158)
+```
+
+- **互操作（关键）**：GNU gzip 1.12 双向 7 组数据（文本/随机/全零/空/单字节，
+  级别 0/1/9）+ 多成员双向全部通过；Python 3.12 `zlib` 对 raw deflate 与 zlib
+  格式各做双向（3 组数据）全部通过。
+- **压测（1 MiB，-O2，AMD Ryzen 9 8945HX / WSL2，各 5 次取中位数）**：
+  - 低熵日志文本：`ratio=0.1034`（9.67x，节省 89.7%）；gzip 级别 1 压缩
+    ~248–475 MiB/s、级别 9 ~32–43 MiB/s；解压 ~589–1400 MiB/s；
+  - 高熵随机：`ratio=1.0003`（stored 块 5B/64KiB 开销）；压缩 ~43–70 MiB/s、
+    解压 ~1.5–7.4 GiB/s；
+  - 低熵 vs 高熵压缩率差距 9.7x；格式之间差异 < 1%（同一 zlib 引擎，符合预期）。
+- **随机测试**：90 组随机（长度 0~2 MiB × 4 类内容 × 3 格式 × 4 级别 × 随机分块）
+  + 6 个显式边界 × 3 格式 + 12 组随机 Write/Flush 交错，逐字节一致。
+- **真实场景 8 个**：1MiB 日志压缩、日志轮转（文件→.gz→删源→回读）、
+  读系统 gzip 文件、多成员拼接、损坏检测（crc32/magic/截断/adler32）、
+  HTTP gzip body（Content-Length 限读）、Flush 后读流式前缀、zlib 缓存条目。
+- **ASan+UBSan**（`g++ -O1 -fsanitize=address,undefined` 独立构建，
+  `detect_leaks=1`）：0 warning、0 sanitizer 报告、1158 checks 全过。
+- **安装/导出**：`cmake --install build-quality --prefix /tmp/g2c_install` 后，
+  最小消费者工程 `find_package(go2cpp_runtime REQUIRED)` +
+  `target_link_libraries(consumer PRIVATE go2cpp::compress)` 配置/编译/运行成功
+  （34 → 53 bytes），证明 `find_dependency(ZLIB)` 链路正确。
+
+### 后续 / 未做
+
+- Windows/MSVC 未实测（`find_package(ZLIB)` 在 Windows 需自备 zlib 包；
+  代码只用标准 zlib API，预期可移植但未验证）。
+- 未实现预置字典（`FDICT` 流报 `ErrDictionary`）、gzip 自定义头字段、`Resetter`。
+- 未做并发压测：`Reader`/`Writer` 明确非线程安全（一个流一个对象），
+  与 Go 的同类类型一致，未提供内部加锁。
+- 本次未执行任何 git 命令。
+
+
+## 2026-10-18 encoding 模块（base64 / hex / binary / csv）
+
+### 改动内容
+
+- 新增 `include/go2cpp/encoding/{base64,hex,binary,csv,errors,encoding}.hpp`；
+- 新增 `src/encoding/{base64,hex,binary,csv}.cpp`（只依赖 `go2cpp_error`，
+  不依赖运行时/IO/调度器）；
+- 新增 `tests/encoding/`：单可执行文件（8 个 cpp）覆盖单元、随机、6 个真实场景、
+  1 MiB 压测；`scripts/gen_python_vectors.py` 生成
+  `testdata/python_vectors.txt`（64 组输入 × 5 类 = 320 条 Python 期望值）。
+- **CMake 注册**：按父代理的并发协调要求，共享的
+  `cmake/Go2CppModules.cmake` / `cmake/Go2CppTests.cmake` 由父代理统一合并；
+  本次交付时两个共享文件已恢复为不含 encoding 注册的状态（`grep go2cpp_encoding`
+  无结果），所需片段已以纯文本提交给父代理。独立构建目录
+  `/tmp/go2cpp_build_encoding` 使用含 encoding 注册的 CMake 副本完成验证。
+
+### API 与语义
+
+- `encoding::Base64Encoding`（别名 `encoding::Base64`）：`StdEncoding` /
+  `URLEncoding` / `RawStdEncoding` / `RawURLEncoding` 四个 `inline constexpr`
+  实例；`Encode/Decode` 追加语义（失败不改 `dst`），`EncodeToString/DecodeString`，
+  `EncodedLen/DecodedLen`。严格校验字母表、长度（带填充必须 `%4==0`）、
+  填充位置；**不接受** `\r`/`\n`/空格（比 Go 默认更严），
+  **不校验**尾部填充位（与 Go 默认一致、与 `Strict()` 不同）。
+- `encoding::Hex`：编码小写；解码接受大小写；奇数长度优先报
+  `HexOddLength()`，非法字符报 `HexInvalidByte()`（文本含 `U+0067 'g'` 形态）。
+- `encoding::Binary`：`Order{BigEndian,LittleEndian}`；`Uint/Int/Float16..64`
+  定长读写（短输入返回 `ErrShortBuffer()`，不越界；写为追加）；
+  `Uvarint/Varint/PutUvarint/PutVarint` 为 LEB128 + zig-zag，10 字节边界、
+  截断/溢出分别用 `ErrUvarintTruncated()` / `ErrUvarintOverflow()`。
+- `encoding::Csv`（`CsvReader` / `CsvWriter` 门面）：引号字段、字段内逗号/换行、
+  `""` 转义、CRLF 归一化、空行跳过、`FieldsPerRecord` 推断、三类错误；
+  Writer 按 Go `fieldNeedsQuotes` 规则加引号，支持 `SetComma` / `UseCRLF`。
+
+### 关键文件
+
+| 文件 | 说明 |
+|---|---|
+| `include/go2cpp/encoding/*.hpp` | 四个子模块 API + 内部 `TaggedError` 工具 |
+| `src/encoding/*.cpp` | 实现（约 980 行） |
+| `tests/encoding/*.cpp` | 单元 / 随机 / 6 场景 / 压测（约 2250 行） |
+| `tests/encoding/testdata/python_vectors.txt` | Python `base64`/`binascii` 对拍数据（220 KiB） |
+| `tests/encoding/scripts/gen_python_vectors.py` | 对拍数据生成器（固定种子，可复现） |
+
+### 测试结果（实测）
+
+```sh
+cd /UserData/CodexWorkSpace/Go2Cpp
+flock /tmp/go2cpp_build.lock cmake -S . -B /tmp/go2cpp_build_encoding \
+    -DCMAKE_BUILD_TYPE=Release -DGO2CPP_BUILD_TESTS=ON \
+    -DGO2CPP_BUILD_EXAMPLES=ON -DGO2CPP_BUILD_BENCHMARKS=OFF
+flock /tmp/go2cpp_build.lock cmake --build /tmp/go2cpp_build_encoding -j 12
+/tmp/go2cpp_build_encoding/go2cpp_encoding_test      # all checks passed
+ctest --test-dir /tmp/go2cpp_build_encoding --output-on-failure
+# 100% tests passed, 0 tests failed out of 111
+# 其中 go2cpp_encoding_test = Test #34（109 baseline + compress + encoding）
+```
+
+- Python 对拍：320 条（64 组输入 × 标准/URL/RawStd/RawURL/hex），
+  `base64.b64encode` / `base64.urlsafe_b64encode` / `binascii.hexlify`，全部一致。
+- 随机：四种 base64 编码 0 ~ 1 MiB+2 往返；hex 128 组；Binary 2 万组定长
+  + 2 万组 varint；CSV 300 组随机字段往返；2 万组畸形输入健壮性 fuzz。
+- 压测（Release/-O2，单线程，AMD Ryzen 9 8945HX / WSL2，取 15 轮最快）：
+  base64 Std 编码 1035.72 MiB/s、解码 904.98 MiB/s；URL 编码 1020.28 MiB/s、
+  解码 909.45 MiB/s；Raw 编码 1029.68 MiB/s、解码 915.97 MiB/s；
+  hex 编码 693.57 MiB/s、解码 357.61 MiB/s（按 2 MiB 输入计）。
+- 6 个真实场景：JWT（jwt.io 公开 token，签名 hex 独立 oracle）、二进制文件
+  hex dump、自定义大端协议帧（含截断）、CSV 导出/回读、1 MiB 图片 data URL、
+  LEB128 时序流。
+
+### 与 Go 的已知差异
+
+- base64 拒绝 `\r`/`\n`（Go 默认忽略）；不接受尾部填充位非零的
+  `"Zh=="`（Go `Strict()` 拒绝、默认接受）；错误时不返回部分解码结果。
+- hex `Decode` 失败时不返回部分结果（Go 会返回已解出的前缀）。
+- Binary 短输入返回错误而不是 panic（C++ 侧刻意差异）。
+- CSV 未实现 `LazyQuotes` / `TrimLeadingSpace` / `Comment` / `ReuseRecord`；
+  错误只带行号不带列号。与 Go 相同的怪癖：单字段空串写出空行、Reader 跳过空行。
+
+### 后续 / 未做
+
+- 共享 CMake 最终合并由父代理完成；合并后需在共享 build-quality 复跑
+  configure + 全量 ctest 确认总数。
+- 未在 Windows/MSVC 验证。
+- 未跑 ASan/UBSan（随机/fuzz 已覆盖边界，但未做 sanitizer 构建）。
+- 本次未执行任何 git 命令。

@@ -418,6 +418,31 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_config_registry_macro_test
              COMMAND go2cpp_config_registry_macro_test)
     set_tests_properties(go2cpp_config_registry_macro_test PROPERTIES TIMEOUT 120)
+
+    # ---- compress 模块：flate / zlib / gzip（薄封装系统 zlib）----
+    # 一个可执行文件包含全部测试段：单元、随机、系统 gzip 互操作、8 个真实场景
+    # 与低熵/高熵压测。拆成多个 target 只会重复编译模板实例，没有收益。
+    # 依赖：ZLIB 由 go2cpp_compress 的 PUBLIC 依赖传递（ZLIB::ZLIB）。
+    add_executable(go2cpp_compress_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/compress/compress_test_main.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/compress/compress_test_support.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/compress/test_flate.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/compress/test_zlib.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/compress/test_gzip.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/compress/test_random.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/compress/test_interop.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/compress/test_scenarios.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/compress/test_stress.cpp)
+    target_include_directories(go2cpp_compress_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/compress)
+    target_link_libraries(go2cpp_compress_test PRIVATE go2cpp_compress)
+    target_compile_options(go2cpp_compress_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_compress_test COMMAND go2cpp_compress_test)
+    # 300s：压测 + 随机测试在 -O2 下约 10s，留足慢机器/Sanitizer 余量。
+    set_tests_properties(go2cpp_compress_test PROPERTIES TIMEOUT 300)
+
     set_tests_properties(go2cpp_high_load_stress PROPERTIES TIMEOUT 180)
 endif()
 
