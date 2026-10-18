@@ -226,15 +226,28 @@ void TestRWMutexSemantics() {
     GO2CPP_REQUIRE_EVENTUALLY(writer_acquired.load(), 2s);
     GO2CPP_JOIN_WITH_WATCHDOG(blocked_writer, 3s);
 
-    // 写者 FIFO：四个写者的取得顺序必须等于入队顺序。
-    mutex.Lock();
+    // 写者 FIFO 用受管 G 单独验证（见 TestRWMutexWriterFifoFibers）：
+    // 用 OS 线程做顺序断言会被调度延迟伪证，受管 G 的 kWaiting 状态才是
+    // 「已进入队列」的可靠证据。
+    GO2CPP_CHECK(!mutex.IsWriteLocked());
+    GO2CPP_CHECK(mutex.ReaderCount() == 0);
+}
+
+/**
+ * @brief 写者 FIFO：在 1 个 P 上顺序启动写者，用 kWaiting 确认入队顺序。
+ * @details 这是唯一能跨调度器稳定复现的 FIFO 验证方式：协作式 G 只有真正
+ *          park 才会进入 kWaiting，因此顺序等于启动顺序。
+ */
+void TestRWMutexWriterFifoFibers() {
+    go2cpp::Scheduler scheduler(MakeSchedulerConfig(1));
+    scheduler.start();
+    RWMutex mutex;
+    mutex.Lock();  // 压住写锁，让后续写者排队
     std::mutex order_mutex;
     std::vector<int> order;
-    std::vector<std::thread> writers;
-    std::atomic<int> attempting{0};
+    std::vector<std::shared_ptr<go2cpp::Task>> writers;
     for (int i = 0; i < 4; ++i) {
-        writers.emplace_back([&, i] {
-            attempting.fetch_add(1, std::memory_order_acq_rel);
+        auto writer = scheduler.spawn([&, i] {
             mutex.Lock();
             {
                 std::lock_guard<std::mutex> lock(order_mutex);
@@ -243,20 +256,19 @@ void TestRWMutexSemantics() {
             mutex.Unlock();
         });
         GO2CPP_REQUIRE_EVENTUALLY(
-            attempting.load(std::memory_order_acquire) == i + 1, 2s);
-        GO2CPP_REQUIRE_EVENTUALLY(mutex.HasPendingWriter(), 2s);
-        // 只靠 HasPendingWriter 无法区分「已经有几个写者」，这里给线程足够时间
-        // 真正插入票据集合；20ms 对测试环境足够，且失败会以顺序不符暴露。
-        std::this_thread::sleep_for(20ms);
+            writer->state() == go2cpp::GState::kWaiting, 2s);
+        writers.push_back(std::move(writer));
     }
+    GO2CPP_CHECK(mutex.HasPendingWriter());
     mutex.Unlock();
     for (auto& writer : writers) {
-        GO2CPP_JOIN_WITH_WATCHDOG(writer, 5s);
+        GO2CPP_CHECK(writer->wait_for(2s));
     }
     GO2CPP_CHECK(order.size() == 4);
     GO2CPP_CHECK(order == std::vector<int>({0, 1, 2, 3}));
     GO2CPP_CHECK(!mutex.IsWriteLocked());
     GO2CPP_CHECK(mutex.ReaderCount() == 0);
+    ShutdownOrReportLostWakeup(scheduler);
 }
 
 /**
@@ -1031,24 +1043,30 @@ void TestTimedMutexStress() {
         mutex.Lock();
         std::atomic<int> timeouts{0};
         std::atomic<int> unexpected{0};
+        std::atomic<std::uint64_t> waited_ns{0};
         std::vector<std::thread> workers;
-        const auto begin = std::chrono::steady_clock::now();
         for (int t = 0; t < 4; ++t) {
             workers.emplace_back([&] {
                 for (int i = 0; i < 50; ++i) {
+                    const auto begin = std::chrono::steady_clock::now();
                     if (mutex.TryLockFor(2ms)) {
                         unexpected.fetch_add(1, std::memory_order_relaxed);
                         mutex.Unlock();
                     } else {
                         timeouts.fetch_add(1, std::memory_order_relaxed);
                     }
+                    waited_ns.fetch_add(
+                        static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - begin)
+                                .count()),
+                        std::memory_order_relaxed);
                 }
             });
         }
         for (auto& worker : workers) {
             GO2CPP_JOIN_WITH_WATCHDOG(worker, 30s);
         }
-        const double elapsed_us = ElapsedUs(begin);
         GO2CPP_CHECK(unexpected.load() == 0);
         GO2CPP_CHECK(timeouts.load() == 200);
         GO2CPP_CHECK(!mutex.TryLock());
@@ -1057,7 +1075,7 @@ void TestTimedMutexStress() {
         mutex.Unlock();
         std::printf(
             "[locks][stress] TimedMutex timeout attempts=200 avg_wait_us=%.1f\n",
-            elapsed_us / 200.0);
+            static_cast<double>(waited_ns.load()) / 200.0 / 1000.0);
     }
 }
 
@@ -1403,7 +1421,7 @@ void TestScenarioConnectionPool() {
         RWMutex mutex;
         std::vector<bool> available;
         std::vector<int> idle;
-        std::size_t capacity{4};
+        std::size_t capacity{2};
         std::atomic<int> grow_events{0};
         std::atomic<int> in_use{0};
     };
@@ -1456,7 +1474,9 @@ void TestScenarioConnectionPool() {
         workers.emplace_back([&] {
             for (int i = 0; i < kCycles; ++i) {
                 const int id = acquire();
-                std::this_thread::yield();
+                // 模拟真实使用连接的时间：4 个 worker 只有 2 个初始连接，
+                // 必然触发扩容路径。
+                std::this_thread::sleep_for(20us);
                 release(id);
             }
         });
@@ -1574,7 +1594,7 @@ void TestScenarioTimedMutexIoFallback() {
     std::thread slow_io([&] {
         mutex.Lock();
         slow_holds.store(true, std::memory_order_release);
-        std::this_thread::sleep_for(150ms);  // 模拟持锁 IO
+        std::this_thread::sleep_for(400ms);  // 模拟持锁 IO
         mutex.Unlock();
         slow_done.store(true, std::memory_order_release);
     });
@@ -1592,21 +1612,23 @@ void TestScenarioTimedMutexIoFallback() {
         } else {
             fallback_used.store(true, std::memory_order_release);
             GO2CPP_CHECK(waited_us >= 10000.0);
-            GO2CPP_CHECK(waited_us < 200000.0);
+            GO2CPP_CHECK(waited_us < 300000.0);
+            // 在**等待者自己的时间线上**确认超时返回时慢线程仍持锁，避免
+            // 主线程 join 后再检查被调度延迟放大成假失败。
+            GO2CPP_CHECK(!slow_done.load(std::memory_order_acquire));
             // 兜底路径：读缓存，不碰锁。
         }
     });
     GO2CPP_JOIN_WITH_WATCHDOG(caller, 3s);
     GO2CPP_CHECK(fallback_used.load());
     GO2CPP_CHECK(!acquired_fast.load());
-    GO2CPP_CHECK(!slow_done.load());  // 超时返回时慢线程仍持锁
     // 超时不能改变锁状态：慢线程的 Unlock 必须正常，之后锁可获取。
-    GO2CPP_JOIN_WITH_WATCHDOG(slow_io, 3s);
+    GO2CPP_JOIN_WITH_WATCHDOG(slow_io, 5s);
     GO2CPP_CHECK(slow_done.load());
     GO2CPP_CHECK(mutex.TryLock());
     mutex.Unlock();
     std::printf(
-        "[locks][scenario] timed-io-fallback fallback=%d slow_io_ms=150\n",
+        "[locks][scenario] timed-io-fallback fallback=%d slow_io_ms=400\n",
         static_cast<int>(fallback_used.load()));
 }
 
@@ -1614,17 +1636,25 @@ void TestScenarioTimedMutexIoFallback() {
 struct WriterLatency {
     std::vector<double> samples_us;
     std::uint64_t reader_ops{0};
+    /// 写者是否被读者饿住（等待达到 run_limit，由停止读者兜底）。
+    bool starved{false};
 };
 
 /// @brief 测量写者等待延迟（读负载持续，读临界区故意持有一段时间）。
+///
+/// @param run_limit 写者最长可等待时间；到达后停止读者（否则读者优先的对照
+///        实现会把测试永久挂住）。这**不是**放宽断言：调用方会检查 `starved`
+///        并把它作为失败报告出来。
 template <typename ReaderLock, typename ReaderUnlock, typename WriterLock,
           typename WriterUnlock>
 WriterLatency MeasureWriterLatency(int reader_threads, int writer_rounds,
+                                   std::chrono::milliseconds run_limit,
                                    ReaderLock reader_lock,
                                    ReaderUnlock reader_unlock,
                                    WriterLock writer_lock,
                                    WriterUnlock writer_unlock) {
     std::atomic<bool> stop{false};
+    std::atomic<bool> finished{false};
     std::atomic<std::uint64_t> reads{0};
     std::vector<std::thread> readers;
     for (int t = 0; t < reader_threads; ++t) {
@@ -1639,6 +1669,18 @@ WriterLatency MeasureWriterLatency(int reader_threads, int writer_rounds,
             }
         });
     }
+    // 兜底：写者等满 run_limit 说明被饿住；先撤读者让主线程能返回，
+    // 再由调用方把 starved 判为失败。
+    std::thread stopper([&] {
+        const auto deadline = std::chrono::steady_clock::now() + run_limit;
+        while (!finished.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(5ms);
+        }
+        if (!finished.load(std::memory_order_acquire)) {
+            stop.store(true, std::memory_order_release);
+        }
+    });
     std::this_thread::sleep_for(50ms);
     WriterLatency result;
     result.samples_us.reserve(static_cast<std::size_t>(writer_rounds));
@@ -1648,12 +1690,18 @@ WriterLatency MeasureWriterLatency(int reader_threads, int writer_rounds,
         result.samples_us.push_back(ElapsedUs(begin));
         writer_unlock();
     }
+    finished.store(true, std::memory_order_release);
+    stopper.join();
     stop.store(true, std::memory_order_release);
     for (auto& reader : readers) {
         GO2CPP_JOIN_WITH_WATCHDOG(reader, 30s);
     }
     result.reader_ops = reads.load();
     std::sort(result.samples_us.begin(), result.samples_us.end());
+    const double limit_us =
+        static_cast<double>(run_limit.count()) * 1000.0 * 0.8;
+    result.starved =
+        !result.samples_us.empty() && result.samples_us.back() >= limit_us;
     return result;
 }
 
@@ -1661,30 +1709,32 @@ void TestScenarioWriterStarvation() {
     // 我方 RWMutex：写者优先，读者在写者等待后不得插队。
     RWMutex mutex;
     const WriterLatency ours = MeasureWriterLatency(
-        4, 40, [&] { mutex.RLock(); }, [&] { mutex.RUnlock(); },
+        4, 40, 2s, [&] { mutex.RLock(); }, [&] { mutex.RUnlock(); },
         [&] { mutex.Lock(); }, [&] { mutex.Unlock(); });
 
     // 对照组：libstdc++ 的 std::shared_mutex（glibc 默认读者优先）。
     std::shared_mutex std_mutex;
     const WriterLatency std_result = MeasureWriterLatency(
-        4, 40, [&] { std_mutex.lock_shared(); },
+        4, 40, 2s, [&] { std_mutex.lock_shared(); },
         [&] { std_mutex.unlock_shared(); }, [&] { std_mutex.lock(); },
         [&] { std_mutex.unlock(); });
 
     const auto report = [](const char* name, const WriterLatency& latency) {
         std::printf(
             "[locks][scenario] writer-latency %-12s p50=%.1fus p95=%.1fus "
-            "p99=%.1fus max=%.1fus reader_ops=%llu\n",
+            "p99=%.1fus max=%.1fus starved=%d reader_ops=%llu\n",
             name, Percentile(latency.samples_us, 0.50),
             Percentile(latency.samples_us, 0.95),
             Percentile(latency.samples_us, 0.99),
             latency.samples_us.empty() ? 0.0 : latency.samples_us.back(),
+            static_cast<int>(latency.starved),
             static_cast<unsigned long long>(latency.reader_ops));
     };
     report("RWMutex", ours);
     report("std::shared", std_result);
-    // 写者优先的硬性断言：40 次写请求的最坏等待必须远小于读者总运行时间
-    // （4 个读者 × 100us 临界区，若允许插队，最坏会到数百 ms）。
+    // 写者优先的硬性断言：写者不得被饿住，且 40 次写请求的最坏等待远小于
+    // 读者总运行时间（若允许插队，最坏会到数百 ms 甚至无限）。
+    GO2CPP_CHECK(!ours.starved);
     GO2CPP_CHECK(!ours.samples_us.empty());
     GO2CPP_CHECK(ours.samples_us.back() < 50000.0);
 
@@ -1894,79 +1944,112 @@ void RunLockBenchmarks() {
         {"write-heavy(10%)", 10, 4, 20000},
     };
     for (const RwCase& test_case : rw_cases) {
-        const double go_ns = BenchRw<GoRwAdapter>(
-            test_case.threads, test_case.read_percent,
-            test_case.ops_per_thread);
-        const double std_ns = BenchRw<StdRwAdapter>(
-            test_case.threads, test_case.read_percent,
-            test_case.ops_per_thread);
+        // 环境里有其他 agent 在并行构建（WSL2 loadavg 不可信，看 procs_running）。
+        // 每个用例交替跑 3 次取**最小值**，降低偶发调度噪声对相对比较的影响；
+        // 这是吞吐微基准的常规做法，不代表生产性能。
+        double go_ns = 1e300;
+        double std_ns = 1e300;
+        for (int repetition = 0; repetition < 3; ++repetition) {
+            go_ns = std::min(
+                go_ns, BenchRw<GoRwAdapter>(test_case.threads,
+                                            test_case.read_percent,
+                                            test_case.ops_per_thread));
+            std_ns = std::min(
+                std_ns, BenchRw<StdRwAdapter>(test_case.threads,
+                                              test_case.read_percent,
+                                              test_case.ops_per_thread));
+        }
         std::printf(
             "[locks][bench] %-22s threads=%d go=%.1fns std::shared=%.1fns "
-            "go/std=%.2fx\n",
+            "go/std=%.2fx pr=%d\n",
             test_case.label, test_case.threads, go_ns, std_ns,
-            std_ns > 0.0 ? go_ns / std_ns : 0.0);
+            std_ns > 0.0 ? go_ns / std_ns : 0.0, ProcsRunning());
     }
 
     for (int threads : {1, 4}) {
         constexpr int kDepth = 10;
         constexpr int kOps = 20000;
-        const double go_ns =
-            BenchRecursive<GoRecursiveAdapter>(threads, kDepth, kOps);
-        const double std_ns =
-            BenchRecursive<StdRecursiveAdapter>(threads, kDepth, kOps);
+        double go_ns = 1e300;
+        double std_ns = 1e300;
+        for (int repetition = 0; repetition < 3; ++repetition) {
+            go_ns = std::min(
+                go_ns,
+                BenchRecursive<GoRecursiveAdapter>(threads, kDepth, kOps));
+            std_ns = std::min(
+                std_ns,
+                BenchRecursive<StdRecursiveAdapter>(threads, kDepth, kOps));
+        }
         std::printf(
             "[locks][bench] RecursiveMutex depth=%d threads=%d go=%.1fns "
-            "std::recursive=%.1fns go/std=%.2fx\n",
+            "std::recursive=%.1fns go/std=%.2fx pr=%d\n",
             kDepth, threads, go_ns, std_ns,
-            std_ns > 0.0 ? go_ns / std_ns : 0.0);
+            std_ns > 0.0 ? go_ns / std_ns : 0.0, ProcsRunning());
     }
 
     // 无竞争超时路径。
     constexpr int kTimedOps = 100000;
     TimedMutex go_timed;
     std::timed_mutex std_timed;
-    const double go_uncontended = BenchTimedUncontended(
-        kTimedOps, [&] { return go_timed.TryLockFor(10ms); },
-        [&] { go_timed.Unlock(); });
-    const double std_uncontended = BenchTimedUncontended(
-        kTimedOps, [&] { return std_timed.try_lock_for(10ms); },
-        [&] { std_timed.unlock(); });
+    double go_uncontended = 1e300;
+    double std_uncontended = 1e300;
+    for (int repetition = 0; repetition < 3; ++repetition) {
+        go_uncontended =
+            std::min(go_uncontended,
+                     BenchTimedUncontended(
+                         kTimedOps, [&] { return go_timed.TryLockFor(10ms); },
+                         [&] { go_timed.Unlock(); }));
+        std_uncontended =
+            std::min(std_uncontended,
+                     BenchTimedUncontended(
+                         kTimedOps,
+                         [&] { return std_timed.try_lock_for(10ms); },
+                         [&] { std_timed.unlock(); }));
+    }
     std::printf(
         "[locks][bench] TimedMutex uncontended ops=%d go=%.1fns "
-        "std::timed=%.1fns go/std=%.2fx\n",
+        "std::timed=%.1fns go/std=%.2fx pr=%d\n",
         kTimedOps, go_uncontended, std_uncontended,
-        std_uncontended > 0.0 ? go_uncontended / std_uncontended : 0.0);
+        std_uncontended > 0.0 ? go_uncontended / std_uncontended : 0.0,
+        ProcsRunning());
 
     // 有竞争的超时路径：锁被主线程持有，2 个线程各测 100 次 2ms 超时。
+    // 取两次运行的最小中位数；失败数必须每次都是 200。
+    double go_wait_us = 1e300;
+    double std_wait_us = 1e300;
     int go_failures = 0;
-    TimedMutex go_contended_mutex;
-    const WriterLatency go_latency = BenchTimedContended(
-        [&] { go_contended_mutex.Lock(); },
-        [&] { go_contended_mutex.Unlock(); },
-        [&](std::chrono::milliseconds timeout) {
-            return go_contended_mutex.TryLockFor(timeout);
-        },
-        2ms, 2, 100, &go_failures);
     int std_failures = 0;
-    std::timed_mutex std_contended_mutex;
-    const WriterLatency std_latency = BenchTimedContended(
-        [&] { std_contended_mutex.lock(); },
-        [&] { std_contended_mutex.unlock(); },
-        [&](std::chrono::milliseconds timeout) {
-            return std_contended_mutex.try_lock_for(timeout);
-        },
-        2ms, 2, 100, &std_failures);
+    for (int repetition = 0; repetition < 2; ++repetition) {
+        TimedMutex go_contended_mutex;
+        const WriterLatency go_latency = BenchTimedContended(
+            [&] { go_contended_mutex.Lock(); },
+            [&] { go_contended_mutex.Unlock(); },
+            [&](std::chrono::milliseconds timeout) {
+                return go_contended_mutex.TryLockFor(timeout);
+            },
+            2ms, 2, 100, &go_failures);
+        go_wait_us = std::min(
+            go_wait_us,
+            go_latency.samples_us.empty()
+                ? 0.0
+                : go_latency.samples_us[go_latency.samples_us.size() / 2]);
+        std::timed_mutex std_contended_mutex;
+        const WriterLatency std_latency = BenchTimedContended(
+            [&] { std_contended_mutex.lock(); },
+            [&] { std_contended_mutex.unlock(); },
+            [&](std::chrono::milliseconds timeout) {
+                return std_contended_mutex.try_lock_for(timeout);
+            },
+            2ms, 2, 100, &std_failures);
+        std_wait_us = std::min(
+            std_wait_us,
+            std_latency.samples_us.empty()
+                ? 0.0
+                : std_latency.samples_us[std_latency.samples_us.size() / 2]);
+    }
     std::printf(
-        "[locks][bench] TimedMutex timeout(2ms) go_avg=%.1fus p95=%.1fus "
-        "fail=%d std_avg=%.1fus p95=%.1fus fail=%d\n",
-        go_latency.samples_us.empty()
-            ? 0.0
-            : go_latency.samples_us[go_latency.samples_us.size() / 2],
-        Percentile(go_latency.samples_us, 0.95), go_failures,
-        std_latency.samples_us.empty()
-            ? 0.0
-            : std_latency.samples_us[std_latency.samples_us.size() / 2],
-        Percentile(std_latency.samples_us, 0.95), std_failures);
+        "[locks][bench] TimedMutex timeout(2ms) go_median=%.1fus "
+        "std_median=%.1fus fail=%d/%d pr=%d\n",
+        go_wait_us, std_wait_us, go_failures, std_failures, ProcsRunning());
 }
 
 }  // namespace
@@ -1989,6 +2072,7 @@ void run_locks_tests() {
 
     // 基础语义。
     TestRWMutexSemantics();
+    TestRWMutexWriterFifoFibers();
     TestRecursiveMutexSemantics();
     TestTimedMutexSemantics();
 

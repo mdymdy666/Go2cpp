@@ -99,8 +99,17 @@ public:
      * @param timeout 最长等待时间；`<= 0` 等价于一次 `TryLock`。
      * @return 成功返回 true（已持有）；超时返回 false，且**锁状态未被修改**。
      * @note 受管 G 等待时 park，不阻塞 worker 线程；普通线程真阻塞。
+     * @note 先做一次无竞争快速尝试：`sync::Mutex::LockFor` 每次都会创建
+     *       TimeoutContext 并向 TimerService 注册定时器（约 10µs），而无竞争
+     *       时这一步纯属浪费。std::timed_mutex 也是「先试再注册」的语义。
      */
     bool TryLockFor(std::chrono::milliseconds timeout) {
+        if (m_impl.TryLock()) {
+            return true;
+        }
+        if (timeout <= std::chrono::milliseconds::zero()) {
+            return false;
+        }
         return m_impl.LockFor(timeout);
     }
 
@@ -111,9 +120,13 @@ public:
      * @return 成功返回 true（已持有）；超时返回 false，且**锁状态未被修改**。
      */
     bool TryLockUntil(std::chrono::steady_clock::time_point deadline) {
+        // 与 TryLockFor 相同的快速路径：无竞争时不注册定时器。
+        if (m_impl.TryLock()) {
+            return true;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (deadline <= now) {
-            return m_impl.TryLock();
+            return false;
         }
         return m_impl.LockFor(deadline - now);
     }

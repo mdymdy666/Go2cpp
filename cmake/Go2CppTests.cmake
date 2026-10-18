@@ -12,6 +12,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_dynamic_scheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_fiber.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_sync.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_locks.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_spin_mutex.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_future.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_io.cpp

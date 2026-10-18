@@ -18,7 +18,7 @@
  * 2. **可重入锁破坏「锁 = 临界区边界」的推理。** 重入后内层临界区并不会
  *    因为外层持锁而自动满足「无人并发修改」以外的条件（例如不变式可能只在
  *    外层入口成立）。审查者看到 `Lock` 就假设进入了干净状态，这个假设会失效。
- * 3. **可重入锁与「Go 风格所有权」冲突。** `sync.Mutex` 允许 A 加锁、B 解锁
+ * 3. **可重入锁与「Go 风格所有权」冲突。** `sync::Mutex` 允许 A 加锁、B 解锁
  *    （所有权随 channel 等交接），可重入锁必须绑定 owner，二者语义不能共存。
  *
  * 因此本类只应作为**移植既有代码**（例如从 C++/Java 翻译过来、确实存在递归
@@ -31,9 +31,20 @@
  * - **受管 G**：owner = `Scheduler::current_task_ptr()` 返回的 `Task*`。
  *   G 可以在不同 worker 线程之间迁移，所以**不能用线程 id** 判定 owner；
  *   用 G 身份才能保证「同一 G 跨线程重入 / 解锁」成立。
- * - **普通 OS 线程**：没有受管 G 时退化为 `std::thread::id`。
+ * - **普通 OS 线程**：没有受管 G 时退化为每线程唯一的 token。
+ * - **手动 Fiber**：没有 Scheduler continuation / 受管 Task，因此也走 OS 线程
+ *   路径。同一 OS 线程上交替运行的两个**手动** Fiber 会被视为同一 owner；
+ *   这是「无受管 G 时退化为线程」的直接后果，需要严格 G 级所有权时请使用
+ *   `Scheduler::spawn` 创建的受管 G。
  *
- * 两套身份在同一个锁里互不相等：G 与普通线程、不同 G、不同线程都是不同 owner。
+ * 两套身份编码进同一个 `std::uintptr_t` token，互不相交：
+ *
+ * - 受管 G：`reinterpret_cast<uintptr_t>(task) | 1`（奇数）；
+ * - OS 线程：全局自增的偶数 id（从 2 开始）。
+ *
+ * 因此不需要哈希、不需要第二把锁：普通路径只有一次原子读；重入路径只由
+ * owner 自己递增深度。真正的互斥与等待（Fiber park / 线程阻塞）全部交给
+ * `sync::Mutex`。
  *
  * ## 语义
  *
@@ -49,8 +60,8 @@
  * ## 使用边界
  *
  * - 非 owner 解锁**一定**抛异常。这一点与 `sync::Mutex` 的 Go 风格所有权不同。
- * - owner 记录的是 `Task*`；如果 G 没解锁就退出，指针会悬空，之后任何比较都是
- *   未定义行为。必须在 G 退出前解锁（推荐 RAII）。
+ * - owner 记录的是 `Task*`；如果 G 没解锁就退出，指针会悬空 / 被新 Task 复用，
+ *   之后任何比较都不可靠。必须在 G 退出前解锁（推荐 RAII）。
  * - 底层仍是 `sync::Mutex`，因此**临界区内不要 park**（IO / 阻塞等待）；需要
  *   IO 时请把数据拷出临界区再做。
  * - 销毁一把仍被持有的锁是未定义行为。
@@ -60,21 +71,19 @@
 #include "go2cpp/concurrency/scheduler/scheduler.hpp"
 #include "go2cpp/sync.hpp"
 
+#include <atomic>
 #include <cstdint>
-#include <mutex>
 #include <stdexcept>
-#include <thread>
 
 namespace go2cpp::sync {
 
 /**
  * @brief 可重入互斥锁：同一 G（或同一 OS 线程）可重复加锁，需同样次数解锁。
  *
- * @details 内部用 `sync::Mutex` 提供真正的互斥与协程 / 线程双等待路径；
- *          另用一把很短的 `std::mutex` 保护 owner 与递归深度。`std::mutex` 的
- *          临界区只有几次内存写、**不含任何 park / 阻塞**，因此不会挡住同一
- *          worker 上的其他 Fiber。真正的阻塞发生在 `m_impl.Lock()`，调用它时
- *          绝不持有 `m_state`。
+ * @details 互斥与等待由 `sync::Mutex` 提供（Fiber park / 线程阻塞双路径）；
+ *          owner 与递归深度用无锁 token 记录。只有 owner 会写深度，因此深度
+ *          不需要 CAS；owner 的发布/撤销通过 release/acquire 配对，保证
+ *          「看到 owner == 自己」时底层锁一定已被持有。
  */
 class RecursiveMutex final {
 public:
@@ -101,28 +110,21 @@ public:
      *        取消 / 调度器不可用。
      */
     void Lock() {
-        {
-            std::lock_guard<std::mutex> lock(m_state);
-            if (OwnedByCurrentLocked()) {
-                if (m_depth >= kMaxRecursionDepth) {
-                    throw std::logic_error(
-                        "go2cpp::sync::RecursiveMutex recursion depth limit "
-                        "(1000) exceeded");
-                }
-                ++m_depth;
-                return;
-            }
+        const std::uintptr_t self = CurrentToken();
+        if (m_owner.load(std::memory_order_acquire) == self) {
+            AcquireRecursiveDepth();
+            return;
         }
-        // 关键：调用可能 park 的底层锁时不得持有 m_state，否则同一 worker 上
-        // 的其他 Fiber 会卡在 std::mutex 上，把协作式调度变成线程阻塞。
+        // 真实阻塞发生在 m_impl；此时没有持有任何本对象的原子状态。
         if (!m_impl.Lock()) {
             throw std::logic_error(
                 "go2cpp::sync::RecursiveMutex lock was cancelled or scheduler "
                 "unavailable");
         }
-        std::lock_guard<std::mutex> lock(m_state);
-        m_owner = CurrentOwner();
-        m_depth = 1;
+        // 先写深度、再发布 owner：两者都是 release 语义，读者看到 owner ==
+        // self 时深度必然已是 1。
+        m_depth.store(1, std::memory_order_relaxed);
+        m_owner.store(self, std::memory_order_release);
     }
 
     /**
@@ -130,20 +132,18 @@ public:
      * @throw std::logic_error 当前执行流不是 owner（含锁未被持有）。
      */
     void Unlock() {
-        {
-            std::lock_guard<std::mutex> lock(m_state);
-            if (!OwnedByCurrentLocked()) {
-                throw std::logic_error(
-                    "go2cpp::sync::RecursiveMutex unlock by non-owner");
-            }
-            --m_depth;
-            if (m_depth != 0) {
-                return;
-            }
-            m_owner = Owner{};
+        const std::uintptr_t self = CurrentToken();
+        if (m_owner.load(std::memory_order_acquire) != self) {
+            throw std::logic_error(
+                "go2cpp::sync::RecursiveMutex unlock by non-owner");
         }
-        // 先清 owner、再释放底层锁：下一个 owner 在 m_impl.Lock() 返回后写
-        // owner。若顺序反过来，中间窗口里别的执行流可能误判 owner。
+        // 只有 owner 会写 m_depth，因此这里无需 CAS。
+        if (m_depth.fetch_sub(1, std::memory_order_acq_rel) != 1U) {
+            return;
+        }
+        // 先撤 owner、再释放底层锁：下一个 owner 在 m_impl.Lock() 返回后重新
+        // 发布。若顺序反过来，中间窗口里别的执行流可能误判 owner。
+        m_owner.store(0U, std::memory_order_release);
         m_impl.Unlock();
     }
 
@@ -153,39 +153,28 @@ public:
      * @throw std::logic_error 递归深度超限（与 Lock 一致）。
      */
     bool TryLock() {
-        {
-            std::lock_guard<std::mutex> lock(m_state);
-            if (OwnedByCurrentLocked()) {
-                if (m_depth >= kMaxRecursionDepth) {
-                    throw std::logic_error(
-                        "go2cpp::sync::RecursiveMutex recursion depth limit "
-                        "(1000) exceeded");
-                }
-                ++m_depth;
-                return true;
-            }
+        const std::uintptr_t self = CurrentToken();
+        if (m_owner.load(std::memory_order_acquire) == self) {
+            AcquireRecursiveDepth();
+            return true;
         }
         if (!m_impl.TryLock()) {
             return false;
         }
-        std::lock_guard<std::mutex> lock(m_state);
-        m_owner = CurrentOwner();
-        m_depth = 1;
+        m_depth.store(1, std::memory_order_relaxed);
+        m_owner.store(self, std::memory_order_release);
         return true;
     }
 
     /**
      * @brief 当前执行流在该锁上的递归深度。
      * @return 非 owner 返回 0；owner 返回已加锁次数。
-     * @note noexcept：内部状态短暂上锁，失败时返回 0。
      */
     std::uint32_t RecursionCount() const noexcept {
-        try {
-            std::lock_guard<std::mutex> lock(m_state);
-            return OwnedByCurrentLocked() ? m_depth : 0;
-        } catch (...) {
+        if (m_owner.load(std::memory_order_acquire) != CurrentToken()) {
             return 0;
         }
+        return m_depth.load(std::memory_order_acquire);
     }
 
     /**
@@ -195,44 +184,45 @@ public:
     bool IsLockedByCurrent() const noexcept { return RecursionCount() != 0; }
 
 private:
-    /// 所有者身份：受管 G 用 `Task*`，普通线程用 `std::thread::id`。
-    struct Owner {
-        Task* task{nullptr};
-        std::thread::id thread{};
-    };
-
-    /// @brief 取当前执行流的 owner 标识（不 park、不做原子引用计数）。
-    static Owner CurrentOwner() noexcept {
-        Owner owner;
-        owner.task = Scheduler::current_task_ptr();
-        if (owner.task == nullptr) {
-            owner.thread = std::this_thread::get_id();
+    /// @brief 重入路径：只由 owner 执行，因此普通 load + store 即可。
+    void AcquireRecursiveDepth() {
+        if (m_depth.load(std::memory_order_relaxed) >= kMaxRecursionDepth) {
+            throw std::logic_error(
+                "go2cpp::sync::RecursiveMutex recursion depth limit (1000) "
+                "exceeded");
         }
-        return owner;
+        m_depth.fetch_add(1, std::memory_order_relaxed);
     }
 
-    /// @brief owner 相等判定；`task` 非空时忽略线程 id（G 可迁移）。
-    static bool SameOwner(const Owner& lhs, const Owner& rhs) noexcept {
-        if (lhs.task != nullptr || rhs.task != nullptr) {
-            return lhs.task == rhs.task;
+    /// @brief 当前执行流的 owner token：受管 G 用 Task*（奇数），否则偶数 id。
+    static std::uintptr_t CurrentToken() noexcept {
+        Task* const task = Scheduler::current_task_ptr();
+        if (task != nullptr) {
+            return reinterpret_cast<std::uintptr_t>(task) | 1U;
         }
-        return lhs.thread == rhs.thread;
+        return CurrentThreadToken();
     }
 
-    /// @brief 调用方必须持有 `m_state`。
-    bool OwnedByCurrentLocked() const noexcept {
-        return m_depth != 0 && SameOwner(m_owner, CurrentOwner());
+    /// @brief 每线程唯一且非零的偶数 token（进程内自增）。
+    ///
+    /// 不用 `std::hash<std::thread::id>`：哈希碰撞在理论上可能，而 owner 判定
+    /// 一旦碰撞就会把两个线程当成同一 owner，破坏互斥语义。这里直接分配唯一
+    /// 值，代价是每线程一次原子自增。
+    static std::uintptr_t CurrentThreadToken() noexcept {
+        static thread_local std::uintptr_t token = 0;
+        if (token == 0) {
+            static std::atomic<std::uintptr_t> next_token{2};
+            token = next_token.fetch_add(2, std::memory_order_relaxed);
+        }
+        return token;
     }
 
-    /// 保护 owner / 深度的短临界区互斥量（纯内存操作，无阻塞）。
-    mutable std::mutex m_state;
-    /// 真正的互斥与等待路径；协程 park / 线程阻塞由它内部决定。
+    /// 真正提供互斥与 Fiber/线程双等待路径的底层锁。
     Mutex m_impl;
-
-    /// 当前 owner；深度为 0 时为空。
-    Owner m_owner{};
-    /// 当前 owner 的递归深度。
-    std::uint32_t m_depth{0};
+    /// 当前 owner token；0 表示无人持有。
+    std::atomic<std::uintptr_t> m_owner{0};
+    /// 当前 owner 的递归深度；只由 owner 写。
+    std::atomic<std::uint32_t> m_depth{0};
 };
 
 }  // namespace go2cpp::sync

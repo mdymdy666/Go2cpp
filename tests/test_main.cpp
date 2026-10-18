@@ -13,6 +13,7 @@ void run_scheduler_stress_tests();
 void run_dynamic_scheduler_tests();
 void run_fiber_tests();
 void run_sync_tests();
+void run_locks_tests();
 void run_future_tests();
 void run_io_tests();
 void run_timer_tests();
@@ -77,6 +78,7 @@ int main() {
     if (selected("dynamic")) run_dynamic_scheduler_tests();
     if (selected("fiber")) run_fiber_tests();
     if (selected("sync")) run_sync_tests();
+    if (selected("locks")) run_locks_tests();
     if (selected("future")) run_future_tests();
     if (selected("io")) run_io_tests();
     if (selected("timer")) run_timer_tests();
