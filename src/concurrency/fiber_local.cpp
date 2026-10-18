@@ -31,8 +31,28 @@ using ValueMap = std::unordered_map<KeyId, std::shared_ptr<void>>;
 
 thread_local ValueMap s_thread_values;
 
+/**
+ * @brief 进程级「Fiber 局部存储」注册表：`Fiber* → {KeyId → 值}`。
+ *
+ * ## 定位
+ *
+ * `FiberLocal` 与 `ThreadValues()` 的存储后端：每个 Fiber 的局部变量放在
+ * `m_values[Fiber::Current()]` 里；普通线程走 `s_thread_values`（thread_local 快路径）。
+ *
+ * ## 为什么永不析构
+ *
+ * Fiber 可能在**任意静态析构阶段**被销毁，那时普通静态对象（含 mutex）可能
+ * 已经析构。用 `new` 且不注册 atexit，让注册表活到进程结束 —— 代价是泄漏
+ * 一个空 map，换来「任何阶段调用都安全」。
+ *
+ * ## 锁
+ *
+ * `m_mutex` 保护 `m_values`；Fiber 的读写都要拿它（普通线程有 thread_local 快路径）。
+ */
 struct Registry final {
+    /// @brief 保护 m_values；FiberLocal 的读/写/清理都拿它。
     std::mutex m_mutex;
+    /// @brief Fiber* → 该 Fiber 的局部变量表；Fiber 销毁时条目被删除。
     std::unordered_map<Fiber*, ValueMap> m_values;
 };
 

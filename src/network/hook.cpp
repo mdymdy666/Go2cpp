@@ -1586,9 +1586,26 @@ std::uint32_t OpMask() noexcept {
 // 关掉不会让任何东西变快，只会让协程退化成阻塞线程。
 namespace {
 
+/**
+ * @brief 一个 hook 开关的文档条目（`Config::DumpIni` 用它生成 `#` 注释）。
+ *
+ * ## 定位
+ *
+ * `kHookOpDocs` 的数组元素，与 `kHookOpCount` 一一对应。每个条目同时服务两件事：
+ * **运行时开关**（按 `op_name` 查）与**配置文档**（`DumpIni` 把 `description`
+ * 按 `\n` 拆成多条 `#` 注释写进 ini）。
+ *
+ * ## 为什么 description 是多行且带警告
+ *
+ * 配置里必须给出**关闭后果**，而不是一句「是否启用」—— 关掉 `read` 的 hook
+ * 会让 Fiber 退化成阻塞线程、整个 worker 停摆。这些警告是排查 hook 问题的
+ * 第一手材料（`kHookOpDocs` 的每条都是这个格式）。
+ */
 struct HookOpDoc final {
+    /// @brief 操作名（`"read"`/`"write"`/`"recv"`…），也是 ini 里的键名。
     const char* op_name;
-    const char* description;   // 多行：Config::DumpIni 会按 \n 拆成多条 `#` 注释
+    /// @brief 多行说明；`\n` 分隔，`DumpIni` 按行转成 `#` 注释。
+    const char* description;
 };
 
 constexpr HookOpDoc kHookOpDocs[kHookOpCount] = {
