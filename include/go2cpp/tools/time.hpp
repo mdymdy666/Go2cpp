@@ -361,9 +361,9 @@ private:
           m_has_monotonic(monotonic != SteadyClock::time_point{}),
           m_is_zero(false) {}
 
-    SystemClock::time_point m_wall{};
-    SteadyClock::time_point m_monotonic{};
-    bool m_has_monotonic{false};
+    SystemClock::time_point m_wall{};        ///< 墙钟时间点；Unix*/String/Equal 读取，Now/From* 写入
+    SteadyClock::time_point m_monotonic{};   ///< 单调读数；仅 Now/Add 写入，Sub/Before/After 在双方都有时读取
+    bool m_has_monotonic{false};             ///< 单调读数是否有效；默认/From* 构造为 false，Now 构造为 true
     /// Go 的零 Time 是「1 年 1 月 1 日 00:00:00 UTC」，与 Unix 0 不同，故用显式标记。
     bool m_is_zero{true};
 };

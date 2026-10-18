@@ -32,7 +32,7 @@
  *
  * `go2cpp::os` 是**最低层的 POSIX 能力封装**，位于运行时调度器与业务代码之下：
  * - 上游调用方：`go2cpp::config` 的 `[os]` 段（`src/os/config.cpp` 静态注册
- *   `os.default_read_buffer_size` / `os.max_file_size`）、`tests/os/*`、examples；
+ *   `os.default_read_buffer_size` / `os.max_file_size`）、`tests/os/` 下的用例、examples；
  * - 下游：直接使用 Linux syscall/libc，不依赖 `IOManager`/`Scheduler`；
  * - 与 `FdManager` 的边界：本模块**不**接管 socket fd，也不修改 fd 标志位。
  *

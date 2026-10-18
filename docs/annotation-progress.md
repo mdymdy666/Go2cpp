@@ -34,3 +34,7 @@
 |---|---|---|---|
 | 1 | 2026-10-19 07:31 | 提交 32 轮优化成果（e566b4b）；建 `annotation-style.md`（136 行）；派子 agent A（bufio/compress/hash/encoding）与 B（http2/websocket/sse/quic）；摸清规模（168 文件 59,175 行）；确认 `context.cpp`（1,920 行，注释 9%）是 GMP 侧最大缺口 | 进行中 |
 | 2 | 2026-10-19 08:16 | `context.cpp` 的 `Context::State`：类注释（定位/取消树/线程模型）+ 13 个成员变量注释；`go2cpp_context` 编译通过 | 进行中 |
+| 3~5 | 08:30~09:10 | `DoneSignal::State` + `Signal()` 四步；`socket.cpp` 的 begin/end_operation；`hook.cpp` 文件头 + Originals + OpenDescription + Descriptor/DescriptorStripe + can_wait + cooperative_io；`channel.hpp` 文件头 + 8 成员；`Channel.md` | 进行中 |
+| 6~10 | 09:10~10:00 | `fiber.cpp` 的 `Fiber::Impl` 20 成员；`hook.cpp` 的 `inspect` 链与 `cooperative_io`；`io.cpp` 的 `FdSlot`/`claim`/`SlotStripe`；`scheduler.cpp` 的 `shutdown_for`/`spawn`/`Task::run`；`sync.cpp` 的 `Mutex::Impl`/`ConditionVariable::Impl`/`WaitGroup::Impl` | 进行中 |
+| 11~15 | 10:00~10:45 | `scheduler.cpp` 的 `Processor`/`Machine`；`parking_condition.cpp` 的 `WaitNode`；`timer.cpp` 的 `TimerService::Impl`；`io.cpp` 的 `DescriptorRegistryState::Stripe`/`State::WaitNode`/`stop_operations` | 进行中 |
+| 16~20 | 10:45~11:05 | 收子 agent 批次：event.hpp/fmt/strconv/container/bytes/debug/rand；第八、九批提交（`48e7201`、`9th`）；发现并修复 `event.hpp` 丢失 `#pragma once` | 进行中 |

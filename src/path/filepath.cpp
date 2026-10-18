@@ -15,6 +15,34 @@
  *   Windows 分支用 `std::filesystem` 近似实现，**未在真机验证**（见交付报告）。
  */
 
+/**
+ * ## 模块定位（补充）
+ *
+ * 平台路径实现层：Linux 分支把纯词法函数转发给 `go2cpp::path`，并在本文件实现
+ * 需要文件系统的 `Abs`/`Rel`/`EvalSymlinks`/`Walk`/`Glob`；Windows 分支用
+ * `std::filesystem` 近似，仅保证可编译。直接调用方是 `tests/path` 与 examples，
+ * `config`/`os` 为保持边界清晰而**不依赖**本文件。
+ *
+ * ## 本文件定义什么
+ *
+ * - 匿名命名空间内的平台辅助：`WinVolumeLen`/`CleanWindows`、`ReadDirNames`/
+ *   `ReadLinkAll`/`GetCwd`/`EvalSymlinksPosix`/`WalkRecursive`/`GlobDir`/
+ *   `GlobWithLimit`；
+ * - 对外纯词法 API 的平台分派（大半是 `go2cpp::path` 的一行转发）；
+ * - `Abs`/`Rel`/`EvalSymlinks`/`Walk`/`Glob` 的完整实现。
+ *
+ * ## 阅读建议
+ *
+ * 先看 `EvalSymlinksPosix`（最复杂的组件级状态机：绝对/相对链接会重置不同起点），
+ * 再看 `WalkRecursive` 的 `SkipDir` 传播，最后看 `GlobWithLimit` 的 10000 层上限
+ * 与「文件系统错误一律忽略」策略。
+ *
+ * ## 边界与陷阱
+ *
+ * - `WalkRecursive` 先读目录再回调父目录，因此目录读取失败也能带 errno 上报；
+ * - `Glob` 只把「模式非法」当错误，`ENOENT`/`EACCES` 等一律视为无匹配；
+ * - `ReadLinkAll` 以「返回值 == 缓冲区大小」作为可能截断的信号，最多 32 KiB。
+ */
 #include "go2cpp/path/filepath.hpp"
 
 #include <algorithm>
@@ -78,7 +106,21 @@ std::size_t WinVolumeLen(std::string_view p) {
 }
 
 /// Windows 版 Clean：保留盘符/UNC，统一分隔符为 `\`，语义对齐 Go `filepath.Clean`。
+/**
+ * @brief Windows 版 `Clean`：保留盘符/UNC 前缀，把分隔符统一成 `\`。
+ *
+ * ## 步骤
+ * step1. 切出卷名前缀；UNC 根（`\\host\share`）只做斜杠转换；
+ * step2. 记录是否 rooted，初始化输出与回溯下界 `dotdot`；
+ * step3. 跳过连续分隔符与 `.` 元素；
+ * step4. `..` 回退一个元素；回退不了且非根时写回 `..`；
+ * step5. 普通元素按需补 `\` 后整段拷贝；
+ * step6. 空结果补 `.`，拼回卷名并统一斜杠。
+ *
+ * @note 该分支未在 Windows 真机验证，见文件头「已知未支持项」。
+ */
 std::string CleanWindows(std::string_view original) {
+    // step1: 卷名与 UNC 根是 Clean 不能吞掉的前缀
     const std::size_t vol_len = WinVolumeLen(original);
     const std::string volume(original.substr(0, vol_len));
     std::string_view path = original.substr(vol_len);
@@ -101,6 +143,7 @@ std::string CleanWindows(std::string_view original) {
     if (rooted) {
         out.push_back('\\');
     }
+    // step2: dotdot 与 POSIX 版含义相同：前导 `..` 的回溯下界
     std::size_t r = 0;
     std::size_t dotdot = 0;
     if (rooted) {
@@ -108,11 +151,13 @@ std::string CleanWindows(std::string_view original) {
         dotdot = 1;
     }
     const std::size_t n = path.size();
+    // step3: 连续分隔符与 `.` 元素不产生输出
     while (r < n) {
         if (IsWinSep(path[r])) {
             ++r;
         } else if (path[r] == '.' && (r + 1 == n || IsWinSep(path[r + 1]))) {
             ++r;
+        // step4: `..` 回溯；根路径的 `/..` 最后会被归约掉
         } else if (path[r] == '.' && r + 1 < n && path[r + 1] == '.' &&
                    (r + 2 == n || IsWinSep(path[r + 2]))) {
             r += 2;
@@ -138,9 +183,11 @@ std::string CleanWindows(std::string_view original) {
             }
         }
     }
+    // step5: 空结果必须写成 `.`，否则拼上卷名会得到空路径
     if (out.empty()) {
         out = ".";
     }
+    // step6: 拼回卷名，并把剩余 `/` 全部转成 `\`
     std::string result = volume + out;
     for (char& c : result) {
         if (c == '/') {
@@ -251,8 +298,25 @@ bool GetCwd(std::string* out, std::string* error) {
     return false;
 }
 
+/**
+ * @brief 逐组件解析符号链接，移植 Go `walkSymlinks`。
+ *
+ * ## 步骤
+ * step1. 复制输入，确定卷前缀（绝对路径为 `/`）并从 `vol` 开始累积 `dest`；
+ * step2. 逐组件扫描：跳过空组件与 `.`；
+ * step3. `..` 按已解析的 `dest` 回退；无斜杠可退或上一组件就是保留的 `..` 时写回；
+ * step4. 普通组件拼进 `dest` 后 `lstat`；非链接且后面还有组件时要求它是目录；
+ * step5. 命中链接：计数并检查 255 层上限，`readlink` 取目标；
+ * step6. 绝对链接把 `dest` 重置到 `/`，相对链接退回所属目录并重新扫描链接内容；
+ * step7. 对最终 `dest` 做一次 `Clean`。
+ *
+ * ## 失败语义
+ * 路径不存在、中间组件不是目录、链接超过 255 层都返回 false 并写中文错误；
+ * `*out` 在失败时保持为空（调用方已先 clear）。
+ */
 bool EvalSymlinksPosix(const std::string& input, std::string* out,
                        std::string* error) {
+    // step1: 卷前缀决定 `..` 的回退边界，缺失它会把绝对路径当相对路径
     std::string path = input;
     int links_walked = 0;
 
@@ -266,6 +330,7 @@ bool EvalSymlinksPosix(const std::string& input, std::string* out,
     std::string dest = vol;
 
     // start/end 指向当前组件；循环末尾 start = end。
+    // step2: 组件级扫描；start/end 始终指向当前组件边界
     for (std::size_t start = vol_len, end = vol_len; start < path.size();
          start = end) {
         while (start < path.size() && path[start] == '/') {
@@ -282,6 +347,7 @@ bool EvalSymlinksPosix(const std::string& input, std::string* out,
         if (component == ".") {
             continue;
         }
+        // step3: `..` 只按已经解析出的 dest 回退，不碰尚未解析的后续组件
         if (component == "..") {
             // 只在卷前缀之后找最后一个 `/`（与 Go 的 r >= volLen 一致）。
             std::size_t slash = std::string::npos;
@@ -307,6 +373,7 @@ bool EvalSymlinksPosix(const std::string& input, std::string* out,
             continue;
         }
 
+        // step4: 先假设是普通组件，拼进 dest 后再用 lstat 验证
         // 普通组件：先拼进 dest 再看它是不是链接。
         if (!dest.empty() && dest.back() != '/') {
             dest.push_back('/');
@@ -331,6 +398,7 @@ bool EvalSymlinksPosix(const std::string& input, std::string* out,
             continue;
         }
 
+        // step5: 255 层上限与 Go 一致，防止链接环或指数级展开
         ++links_walked;
         if (links_walked > 255) {
             if (error != nullptr) {
@@ -348,6 +416,7 @@ bool EvalSymlinksPosix(const std::string& input, std::string* out,
             return false;
         }
 
+        // step6: 把链接内容接回待处理路径；绝对链接会重置起点
         path = link + path.substr(end);
         if (!link.empty() && link[0] == '/') {
             // 绝对链接：重置到根。
@@ -371,27 +440,45 @@ bool EvalSymlinksPosix(const std::string& input, std::string* out,
         }
     }
 
+    // step7: 组件解析可能留下 `//` 或 `/..`，统一收敛
     *out = Clean(dest);
     return true;
 }
 
+/**
+ * @brief 深度优先遍历的单层递归：父目录先回调，子项按名字升序。
+ *
+ * ## 步骤
+ * step1. 非目录直接回调并返回其动作；
+ * step2. 先读目录内容（名字已排序），失败也保留 errno 供父目录回调上报；
+ * step3. 回调父目录；`SkipDir`/`SkipAll` 在此层直接向上传播；
+ * step4. 逐个子项 `lstat`；失败时以零值 `WalkInfo` 回调并继续；
+ * step5. 递归子目录；`SkipDir` 若来自目录本身则被本层吞掉（跳过该子树），
+ *        其余非零动作继续上抛。
+ *
+ * @note 不跟随符号链接：链接作为普通条目回调，不递归。
+ */
 int WalkRecursive(const std::string& path, const WalkInfo& info,
                   const WalkFn& fn) {
+    // step1: 叶子节点没有子树，动作原样返回
     if (!info.is_dir) {
         return static_cast<int>(fn(path, info, 0));
     }
 
+    // step2: 先读目录，保证读取失败时仍能在回调里带上 errno
     std::vector<std::string> names;
     int read_error = 0;
     const bool read_ok = ReadDirNames(path, &names, &read_error);
 
     // Go 先读目录再回调父目录：这样目录读取失败也能带着 errno 报告。
+    // step3: 父目录回调先于子项；SkipDir/SkipAll 在读取后立即返回
     const int status = static_cast<int>(fn(path, info, read_ok ? 0 : read_error));
     if (!read_ok || status != 0) {
         return status;
     }
 
     for (const std::string& name : names) {
+        // step4: 子项 lstat 失败不终止遍历，交给回调决定
         const std::string filename = Join(path, name);
         struct ::stat st {};
         if (::lstat(filename.c_str(), &st) != 0) {
@@ -405,6 +492,7 @@ int WalkRecursive(const std::string& path, const WalkInfo& info,
             continue;
         }
         const WalkInfo child = FromStat(st);
+        // step5: 目录返回 SkipDir 表示跳过该子树，不能继续上抛
         const int child_status = WalkRecursive(filename, child, fn);
         if (child_status != 0) {
             if (!child.is_dir ||
@@ -455,9 +543,25 @@ bool GlobDir(const std::string& dir, std::string_view pattern,
     return true;
 }
 
+/**
+ * @brief `Glob` 的递归主体：逐层展开目录模式并收集匹配。
+ *
+ * ## 步骤
+ * step1. 深度达到 10000 层立即报「模式非法」（CVE-2022-30632 防护）；
+ * step2. 用空名字做一次匹配，先暴露模式本身的语法错误；
+ * step3. 无元字符：`lstat` 成功即唯一匹配，失败视为无匹配；
+ * step4. 拆成 dir/file；无元字符的 dir 直接枚举该目录；
+ * step5. dir 与 pattern 相同说明目录部分无法收敛，报模式非法；
+ * step6. 递归展开 dir 得到匹配目录集合；
+ * step7. 对每个匹配目录枚举 file 模式。
+ *
+ * ## 边界
+ * 任何文件系统错误（ENOENT/EACCES/EIO）都被忽略并当作无匹配；唯一错误是模式非法。
+ */
 bool GlobWithLimit(std::string_view pattern, int depth,
                    std::vector<std::string>* matches, std::string* error) {
     // 与 Go 相同的 10000 层上限（CVE-2022-30632 防护）。
+    // step1: 递归层数上限，防止恶意模式造成栈溢出/指数展开
     constexpr int kSeparatorLimit = 10000;
     if (depth == kSeparatorLimit) {
         if (error != nullptr) {
@@ -466,6 +570,7 @@ bool GlobWithLimit(std::string_view pattern, int depth,
         return false;
     }
 
+    // step2: 先验证模式语法，避免把 `[` 未闭合误报成无匹配
     const MatchResult sanity = MatchChecked(pattern, std::string_view{});
     if (sanity.bad_pattern) {
         if (error != nullptr) {
@@ -474,6 +579,7 @@ bool GlobWithLimit(std::string_view pattern, int depth,
         return false;
     }
 
+    // step3: 无通配符时只查存在性，不读目录
     if (!HasMeta(pattern)) {
         struct ::stat st {};
         if (::lstat(std::string(pattern).c_str(), &st) != 0) {
@@ -483,8 +589,10 @@ bool GlobWithLimit(std::string_view pattern, int depth,
         return true;
     }
 
+    // step4: 目录部分可枚举时直接 GlobDir，避免递归
     auto [dir, file] = Split(pattern);
     dir = CleanGlobPath(dir);
+    // step5: dir 与 pattern 相同意味着无法继续拆分（如模式以元字符开头）
     if (!HasMeta(dir)) {
         return GlobDir(dir, file, matches, error);
     }
@@ -495,10 +603,12 @@ bool GlobWithLimit(std::string_view pattern, int depth,
         return false;
     }
 
+    // step6: 先展开目录部分，再在每个目录里匹配文件名部分
     std::vector<std::string> dirs;
     if (!GlobWithLimit(dir, depth + 1, &dirs, error)) {
         return false;
     }
+    // step7: 目录内名字已排序，因此最终结果按目录逐层有序
     for (const std::string& matched_dir : dirs) {
         if (!GlobDir(matched_dir, file, matches, error)) {
             return false;
@@ -858,6 +968,20 @@ bool Abs(std::string_view path, std::string* out, std::string* error) {
 #endif
 }
 
+/**
+ * @brief 计算 `target` 相对 `base` 的词法相对路径。
+ *
+ * ## 步骤
+ * step1. 分别取卷名并 `Clean`；两者完全相同直接返回 `"."`；
+ * step2. 去掉卷名前缀，把 `"."` 基准归一为空串；
+ * step3. 一绝对一相对、或卷名不同 → 无法表示，返回失败；
+ * step4. 逐组件对齐，定位到第一处不同的组件边界；
+ * step5. base 剩余首组件是 `..` → 从根无法回退，返回失败；
+ * step6. base 还有剩余组件时逐级补 `..`，再拼 target 剩余部分并 `Clean`。
+ *
+ * ## 不变量
+ * 在 base 为目录的前提下，`Join(base, Rel(base, target)) == Clean(target)`。
+ */
 bool Rel(std::string_view base_path, std::string_view target_path,
          std::string* out, std::string* error) {
     if (out == nullptr) {
@@ -868,11 +992,13 @@ bool Rel(std::string_view base_path, std::string_view target_path,
     }
     out->clear();
 
+    // step1: 卷名参与相等判断，Windows 跨盘符必须失败
     const std::string base_volume = VolumeName(base_path);
     const std::string target_volume = VolumeName(target_path);
     std::string base = Clean(base_path);
     std::string target = Clean(target_path);
 
+    // step2: 同一路径的相对表示就是 `.`
     if (base == target && base_volume == target_volume) {
         *out = ".";
         return true;
@@ -886,6 +1012,7 @@ bool Rel(std::string_view base_path, std::string_view target_path,
     const bool base_slashed = !base.empty() && base.front() == Separator;
     const bool target_slashed =
         !target.empty() && target.front() == Separator;
+    // step3: 绝对/相对混用无法用纯词法表达
     if (base_slashed != target_slashed || base_volume != target_volume) {
         if (error != nullptr) {
             *error = "Rel 失败: \"" + std::string(target_path) +
@@ -894,6 +1021,7 @@ bool Rel(std::string_view base_path, std::string_view target_path,
         return false;
     }
 
+    // step4: bi/ti 是组件末边界，b0/t0 是当前比较起点
     // 把 base/target 定位到第一处不同组件的边界。
     const std::size_t bl = base.size();
     const std::size_t tl = target.size();
@@ -924,6 +1052,7 @@ bool Rel(std::string_view base_path, std::string_view target_path,
         b0 = bi;
         t0 = ti;
     }
+    // step5: base 以无法回退的 `..` 开头时，相对路径会逃出根
     if (base.compare(b0, bi - b0, "..") == 0) {
         if (error != nullptr) {
             *error = "Rel 失败: \"" + std::string(base_path) +
@@ -931,6 +1060,7 @@ bool Rel(std::string_view base_path, std::string_view target_path,
         }
         return false;
     }
+    // step6: 先为 base 的每个剩余组件补一个 `..`，再拼 target 剩余段
     if (b0 != bl) {
         // base 还有剩余组件：先逐级 `..`，再拼 target 的剩余部分。
         std::string buffer = "..";
@@ -979,13 +1109,27 @@ bool EvalSymlinks(std::string_view path, std::string* out,
 #endif
 }
 
+/**
+ * @brief 递归遍历目录树（父目录优先、子项按名字升序、不跟随符号链接）。
+ *
+ * ## 步骤
+ * step1. 拒绝空回调（否则无法上报条目）；
+ * step2. 根路径先 `lstat`；失败也回调一次（零值 info + errno）；
+ * step3. 交给平台递归实现；`SkipDir`/`SkipAll` 在顶层都视为正常结束；
+ * step4. 其余非零返回值说明回调返回了未知动作，转为 false + 中文错误。
+ *
+ * ## 边界
+ * 遍历在调用线程同步递归，深度等于目录深度；极深树可能耗尽栈。
+ */
 bool Walk(std::string_view root, const WalkFn& fn, std::string* error) {
+    // step1: 空回调无法处理任何条目，属于调用方错误
     if (!fn) {
         if (error != nullptr) {
             *error = "Walk 失败: 回调为空";
         }
         return false;
     }
+    // step2: 根节点也要回调；lstat 失败时不构造递归
     const std::string root_path(root);
 #ifdef _WIN32
     namespace fs = std::filesystem;
@@ -1017,6 +1161,7 @@ bool Walk(std::string_view root, const WalkFn& fn, std::string* error) {
             ? static_cast<int>(fn(root_path, WalkInfo{}, lstat_error))
             : WalkRecursive(root_path, FromStat(st), fn);
 #endif
+    // step3: 顶层收到 SkipDir/SkipAll 均表示遍历正常提前结束
     if (status == static_cast<int>(WalkAction::SkipDir) ||
         status == static_cast<int>(WalkAction::SkipAll)) {
         return true;
@@ -1030,8 +1175,20 @@ bool Walk(std::string_view root, const WalkFn& fn, std::string* error) {
     return true;
 }
 
+/**
+ * @brief shell 通配符展开，模式可跨目录。
+ *
+ * ## 步骤
+ * step1. 校验输出指针并清空结果；
+ * step2. Linux 走 `GlobWithLimit`（逐层展开 + 10000 层上限）；
+ * step3. Windows 走「确定无元字符前缀 → Walk 枚举 → Match 过滤」的近似实现。
+ *
+ * ## 错误语义
+ * 只有模式非法返回 false；目录不存在、无权限、I/O 错误一律当作无匹配。
+ */
 bool Glob(std::string_view pattern, std::vector<std::string>* matches,
           std::string* error) {
+    // step1: 输出指针为空属于调用方错误，必须显式失败
     if (matches == nullptr) {
         if (error != nullptr) {
             *error = "Glob 失败: matches 为空指针";
@@ -1081,6 +1238,7 @@ bool Glob(std::string_view pattern, std::vector<std::string>* matches,
     }
     return true;
 #else
+    // step3: Linux 用 Go 的逐层展开算法；深度计数从 0 开始
     return GlobWithLimit(pattern, 0, matches, error);
 #endif
 }
