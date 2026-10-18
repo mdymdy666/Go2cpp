@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace go2cpp::net::http2 {
 
@@ -90,6 +91,7 @@ ConnStatus Connection::TakeFrame(Frame* out, std::string* error) {
 ConnStatus Connection::WriteFrame(const Frame& frame, std::string* error) {
     if (m_transport == nullptr) {
         if (error != nullptr) *error = "Transport 为空";
+        m_state = ConnState::kClosed;
         return ConnStatus::kClosed;
     }
     std::vector<std::uint8_t> bytes(kFrameHeaderSize + frame.payload.size());
@@ -100,6 +102,8 @@ ConnStatus Connection::WriteFrame(const Frame& frame, std::string* error) {
     const std::size_t written = m_transport->Write(bytes.data(), bytes.size());
     if (written != bytes.size()) {
         if (error != nullptr) *error = "写帧失败";
+        // 传输坏了：连接级终态。后续操作一律快速失败，不再假装可写。
+        m_state = ConnState::kClosed;
         return ConnStatus::kClosed;
     }
     return ConnStatus::kOk;
@@ -121,12 +125,17 @@ ConnStatus Connection::Handshake(std::string* error) {
     if (m_handshaked) {
         return ConnStatus::kOk;
     }
+    if (m_state != ConnState::kOpen) {
+        if (error != nullptr) *error = "连接已关闭，无法握手";
+        return ConnStatus::kClosed;
+    }
     if (m_role == Role::kClient) {
         // 1) 发送 preface（直接写字节，不是帧）
         const std::size_t written = m_transport->Write(
             reinterpret_cast<const std::uint8_t*>(kClientPreface), kClientPrefaceLength);
         if (written != kClientPrefaceLength) {
             if (error != nullptr) *error = "写 preface 失败";
+            m_state = ConnState::kClosed;  // 写失败即连接不可用
             return ConnStatus::kClosed;
         }
     } else {
@@ -235,6 +244,14 @@ ConnStatus Connection::StartRequest(const std::vector<HeaderField>& headers, boo
         if (error != nullptr) *error = "只有客户端可以发起请求";
         return ConnStatus::kUnsupported;
     }
+    if (m_state != ConnState::kOpen) {
+        if (error != nullptr) {
+            *error = m_state == ConnState::kDraining
+                         ? "连接已发/已收 GOAWAY，不再接受新流"
+                         : "连接已关闭";
+        }
+        return ConnStatus::kProtocolError;
+    }
     if (!m_handshaked) {
         if (error != nullptr) *error = "握手尚未完成";
         return ConnStatus::kProtocolError;
@@ -267,14 +284,22 @@ ConnStatus Connection::StartRequest(const std::vector<HeaderField>& headers, boo
 }
 
 ConnStatus Connection::WriteData(std::uint32_t stream_id,
-                                 const std::vector<std::uint8_t>& data, bool end_stream,
+                                 const std::vector<std::uint8_t>& data,
+                                 bool end_stream,
                                  std::string* error) {
+    if (m_state == ConnState::kClosed) {
+        if (error != nullptr) *error = "连接已关闭";
+        return ConnStatus::kClosed;
+    }
     auto* machine = StreamFor(stream_id);
     if (machine == nullptr) {
         if (error != nullptr) *error = "未知流";
         return ConnStatus::kProtocolError;
     }
-    if (machine->SendData(end_stream) != StreamEventResult::kOk) {
+    // 第一步只做**只读预检**：状态机、帧尺寸、流控全部通过后，才允许推进
+    // 状态与扣额度。否则被拒绝的写入会吃掉 END_STREAM，内存状态与线上
+    // 状态脱节，且 kFlowControl 的"等 WINDOW_UPDATE 后重试"契约失效。
+    if (!machine->CanSendData()) {
         if (error != nullptr) *error = "流状态机拒绝发送 DATA";
         return ConnStatus::kProtocolError;
     }
@@ -283,16 +308,38 @@ ConnStatus Connection::WriteData(std::uint32_t stream_id,
         return ConnStatus::kUnsupported;
     }
     // 流控：窗口不足时拒绝（不阻塞等待，调用方等 WINDOW_UPDATE 后重试）
-    if (!ConsumeSendWindow(stream_id, data.size())) {
+    if (!HasSendWindow(stream_id, data.size())) {
         if (error != nullptr) *error = "流控窗口不足";
         return ConnStatus::kFlowControl;
     }
-    return WriteFrame(MakeData(stream_id, end_stream, data), error);
+    // 第二步才提交：状态机迁移 + 扣额度 + 写帧。
+    if (machine->SendData(end_stream) != StreamEventResult::kOk) {
+        if (error != nullptr) *error = "流状态机拒绝发送 DATA";
+        return ConnStatus::kProtocolError;
+    }
+    if (!ConsumeSendWindow(stream_id, data.size())) {
+        // 单驱动者下不应发生（预检与提交之间没有其他写者）。一旦发生，
+        // 显式关闭该流，绝不留"状态已变、帧没发"的中间态。
+        machine->ForceClose();
+        if (error != nullptr) *error = "流控额度提交失败";
+        return ConnStatus::kFlowControl;
+    }
+    const auto status = WriteFrame(MakeData(stream_id, end_stream, data), error);
+    if (status != ConnStatus::kOk) {
+        // 帧可能只写了一半：这条流在线上已经不完整，显式关闭，
+        // 不让调用方看到一个"以为还能继续写"的流。
+        machine->ForceClose();
+    }
+    return status;
 }
 
 ConnStatus Connection::SendResponseHeaders(std::uint32_t stream_id,
                                            const std::vector<HeaderField>& headers,
                                            bool end_stream, std::string* error) {
+    if (m_state == ConnState::kClosed) {
+        if (error != nullptr) *error = "连接已关闭";
+        return ConnStatus::kClosed;
+    }
     auto* machine = StreamFor(stream_id);
     if (machine == nullptr) {
         if (error != nullptr) *error = "未知流";
@@ -312,6 +359,10 @@ ConnStatus Connection::SendResponseHeaders(std::uint32_t stream_id,
 
 ConnStatus Connection::ResetStream(std::uint32_t stream_id, ErrorCode code,
                                    std::string* error) {
+    if (m_state == ConnState::kClosed) {
+        if (error != nullptr) *error = "连接已关闭";
+        return ConnStatus::kClosed;
+    }
     auto* machine = StreamFor(stream_id);
     if (machine == nullptr) {
         if (error != nullptr) *error = "未知流";
@@ -325,6 +376,16 @@ ConnStatus Connection::ResetStream(std::uint32_t stream_id, ErrorCode code,
 void Connection::ResetStreamWindows(std::uint32_t stream_id) {
     m_stream_local_window[stream_id] = m_config.initial_window_size;
     m_stream_remote_window[stream_id] = m_config.initial_window_size;
+}
+
+bool Connection::HasSendWindow(std::uint32_t stream_id,
+                               std::size_t bytes) const {
+    const auto amount = static_cast<std::int64_t>(bytes);
+    if (m_remote_window < amount) {
+        return false;
+    }
+    const auto it = m_stream_remote_window.find(stream_id);
+    return it != m_stream_remote_window.end() && it->second >= amount;
 }
 
 bool Connection::ConsumeSendWindow(std::uint32_t stream_id, std::size_t bytes) {
@@ -432,20 +493,35 @@ ConnStatus Connection::AssembleHeaderBlock(std::uint32_t stream_id,
 }
 
 ConnStatus Connection::SendGoAway(ErrorCode code, std::string* error) {
+    if (m_state == ConnState::kClosed) {
+        if (error != nullptr) *error = "连接已关闭";
+        return ConnStatus::kClosed;
+    }
     std::uint32_t last = 0;
-    // 最后一个已处理的流 id
+    // 最后一个已处理的流 id。
+    // 已知限制（R7）：本实现没有服务端推送 API，m_streams 里只有本端
+    // 发起的流，所以 client 角色下这个值与 RFC 语义（对端发起的流）有偏差。
     for (const auto& [id, machine] : m_streams) {
         (void)machine;
         if (id > last) {
             last = id;
         }
     }
-    return WriteFrame(MakeGoAway(last, code), error);
+    const auto status = WriteFrame(MakeGoAway(last, code), error);
+    if (status == ConnStatus::kOk) {
+        // 已发出 GOAWAY：进入 draining，不再接受新流（已有流仍可完成）。
+        m_state = ConnState::kDraining;
+    }
+    return status;
 }
 
 ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
     if (out == nullptr) {
         return ConnStatus::kProtocolError;
+    }
+    if (m_state == ConnState::kClosed) {
+        if (error != nullptr) *error = "连接已关闭";
+        return ConnStatus::kClosed;
     }
     Frame frame;
     auto status = TakeFrame(&frame, error);
@@ -531,6 +607,20 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
                 if (error != nullptr) *error = "DATA 落在未知流上";
                 return ConnStatus::kProtocolError;
             }
+            const std::size_t received = data.data.size();
+            const auto received_amount = static_cast<std::int64_t>(received);
+            auto lit = m_stream_local_window.find(data.stream_id);
+            // 接收侧流控（RFC 9113 §6.9.1）：对端 DATA 不得超过当前可用窗口。
+            // 必须在 ReceiveData/扣窗口之前检查 —— 否则窗口会被推到负值，
+            // 既无法回报 FLOW_CONTROL_ERROR，也让补窗增量失真。
+            if (m_local_window < received_amount ||
+                (lit != m_stream_local_window.end() &&
+                 lit->second < received_amount)) {
+                if (error != nullptr) {
+                    *error = "DATA 超过接收窗口（FLOW_CONTROL_ERROR）";
+                }
+                return ConnStatus::kProtocolError;
+            }
             if (machine->ReceiveData(data.end_stream) != StreamEventResult::kOk) {
                 if (error != nullptr) *error = "流状态机拒绝接收 DATA";
                 return ConnStatus::kProtocolError;
@@ -538,22 +628,24 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
             out->kind = IncomingEvent::Kind::kData;
             out->stream_id = data.stream_id;
             out->end_stream = data.end_stream;
-            const std::size_t received = data.data.size();
             out->data = std::move(data.data);
-            // 流控：扣减本地窗口（连接级 + 流级）。允许变负 —— 对端可能先
-            // 超发再补 WINDOW_UPDATE，RFC 允许窗口在收到更新前暂时为负。
-            m_local_window -= static_cast<std::int64_t>(received);
-            auto lit = m_stream_local_window.find(data.stream_id);
+            // 流控：扣减本地窗口（连接级 + 流级）。上面的检查保证不会为负。
+            m_local_window -= received_amount;
             if (lit != m_stream_local_window.end()) {
-                lit->second -= static_cast<std::int64_t>(received);
+                lit->second -= received_amount;
             }
             // 只有消费掉超过一半才补窗口，避免每帧都发 WINDOW_UPDATE
             // （那会让流控形同虚设，还浪费带宽）。
             const auto threshold = static_cast<std::int64_t>(m_config.initial_window_size / 2);
             if (received > 0 && lit != m_stream_local_window.end() &&
                 lit->second <= threshold) {
+                // 增量按 2^31-1 饱和：WINDOW_UPDATE 的 increment 超过
+                // 2^31-1 本身就是协议错误（RFC 9113 §6.9）。
                 const auto increment = static_cast<std::uint32_t>(
-                    m_config.initial_window_size - lit->second);
+                    std::min<std::int64_t>(
+                        static_cast<std::int64_t>(m_config.initial_window_size) -
+                            lit->second,
+                        std::numeric_limits<std::int32_t>::max()));
                 if (increment > 0) {
                     status = WriteFrame(MakeWindowUpdate(data.stream_id, increment), error);
                     if (status != ConnStatus::kOk) {
@@ -563,8 +655,11 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
                 }
             }
             if (received > 0 && m_local_window <= threshold) {
-                const auto increment =
-                    static_cast<std::uint32_t>(m_config.initial_window_size - m_local_window);
+                const auto increment = static_cast<std::uint32_t>(
+                    std::min<std::int64_t>(
+                        static_cast<std::int64_t>(m_config.initial_window_size) -
+                            m_local_window,
+                        std::numeric_limits<std::int32_t>::max()));
                 if (increment > 0) {
                     status = WriteFrame(MakeWindowUpdate(0, increment), error);
                     if (status != ConnStatus::kOk) {
@@ -621,6 +716,13 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
             GoAwayFrame goaway;
             if (ParseGoAway(frame, &goaway, error) != FrameStatus::kOk) {
                 return ConnStatus::kProtocolError;
+            }
+            // 对端 GOAWAY：进入 draining。id 大于 last_stream_id 的流
+            // 在理论上未被对端处理，调用方应重试；本实现只记录边界，
+            // 不自动重放（见头文件的"已知限制"）。
+            m_peer_last_stream_id = goaway.last_stream_id;
+            if (m_state == ConnState::kOpen) {
+                m_state = ConnState::kDraining;
             }
             out->kind = IncomingEvent::Kind::kGoAway;
             out->error_code = goaway.error_code;

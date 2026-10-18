@@ -7,6 +7,8 @@
 > 环境：WSL2 Ubuntu 24.04、AMD Ryzen 9 8945HX（12 逻辑核）、GCC 13.3.0、
 > Release（build-quality）、RelWithDebInfo + TSan（build-tsan）。
 
+> **2026-10-18 更新**：R1/R2/R13 已经批准修复，R3/R5~R12 已做文档级修正，复现测试已转正为回归测试。修复细节、验证结果与未修项见 **§8 修复记录**。
+
 ## 0. 先说结论
 
 - 状态机的**纯逻辑部分**（HTTP/2 StreamState、Future 终态、Channel 关闭态、
@@ -286,3 +288,116 @@ cd build-quality && ctest -j8
 | `codex.md` | 追加本轮记录 |
 
 **未修改任何 `src/` 或 `include/` 下的核心代码。**
+
+---
+
+## 8. 修复记录（2026-10-18，经总管理批准后执行）
+
+> 约束遵守：修复前先有可复现测试（R1/R2a/R2b/R13 在阶段一已稳定红）；
+> 修复后把复现测试**转正**为回归测试；未执行任何 git 命令；所有编译在
+> `flock /tmp/go2cpp_build.lock` 下完成。
+
+### 8.1 P1：R1 + R13
+
+**R1（WriteData 校验顺序）** — `src/network/http2/connection.cpp:286-334`
+
+- 新流程：`CanSendData()`（只读）→ 帧尺寸 → `HasSendWindow()`（只读）→
+  `SendData()` → `ConsumeSendWindow()` → `WriteFrame()`；
+- `WriteFrame` 失败：`machine->ForceClose()`，把该流本地置 `closed`，不再留
+  "状态已变、线上没变"；
+- `ConsumeSendWindow` 提交失败（单驱动者下不可达）：同样 `ForceClose()` 并
+  返回 `kFlowControl`；
+- `StreamStateMachine` 新增两个小方法（`stream_state.hpp/.cpp`）：
+  `bool CanSendData() const noexcept`（只读预检）和 `void ForceClose() noexcept`
+  （本地强制关闭，不发 RST）。
+- 回归用例：**R1a**（超尺寸 END_STREAM 不再推进状态、随后合法 END_STREAM
+  成功）、**R1b**（`kFlowControl` 不推进状态、不扣额度、补窗后重试成功）。
+
+**R13（接收侧流控）** — `src/network/http2/connection.cpp:600-680`
+
+- 在 `ReceiveData` 与扣窗口**之前**检查连接级 + 流级可用窗口；越界返回
+  `kProtocolError`（错误消息含 `FLOW_CONTROL_ERROR`），窗口不再被推到负值；
+- WINDOW_UPDATE 增量按 `2^31-1` 饱和（避免补窗本身变成协议错误）；
+- **复现方式修正（重要）**：连续发 5 个满帧**不能**证明越界 —— 接收方在
+  窗口降到一半以下时会回 WINDOW_UPDATE 并恢复自己的 credit，后续帧是
+  **合法**的。改用 `initial_window_size = 1` + 一个 16 字节 DATA 帧，第一帧
+  就明确超过可用窗口，与补窗策略无关。旧的 5 帧复现在修复后也会通过，
+  因此已整体替换。
+- 回归用例：**R13**。
+
+### 8.2 P2：R2 连接状态（新增 3 个状态）
+
+- 新增 `enum class ConnState : std::uint8_t { kOpen, kDraining, kClosed };`
+  （`connection.hpp`）；成员 `m_state{kOpen}`、`m_peer_last_stream_id{0}`；
+  公开只读 `state()` 与 `peer_last_stream_id()`。
+- 迁移点共 3 条：
+  1. `SendGoAway` 写帧成功后 → `kDraining`；
+  2. 收到 GOAWAY（`ReadEvent`）→ `kDraining` 并记录 `last_stream_id`；
+  3. 任意 `WriteFrame` 失败（含 client preface 写失败）→ `kClosed`。
+- 拒绝路径：`StartRequest` 在非 `kOpen` 返回 `kProtocolError`；`Handshake`
+  在非 `kOpen` 返回 `kClosed`；`WriteData` / `SendResponseHeaders` /
+  `ResetStream` / `ReadEvent` 在 `kClosed` 快速返回 `kClosed`。
+- 验证：**R2a**（发 GOAWAY → `kDraining` + StartRequest 被拒 + 状态不变）、
+  **R2b**（收 GOAWAY → `kDraining` + `peer_last_stream_id` + 拒绝新流）、
+  **R2c**（写失败 → `kClosed` → StartRequest/ReadEvent 拒绝）。
+- 状态数：**3**（`kOpen` / `kDraining` / `kClosed`），原来只有隐式的
+  "未握手/已握手" 2 个布尔局面。
+
+### 8.3 P3：R3 只改文档
+
+`stream_state.hpp` 类注释改为：
+
+```
+ * @details 无锁、无 IO；**非线程安全**：同一个实例同一时刻只允许一个
+ *          线程/Fiber 驱动（上层 Connection 也按单驱动者使用）。可以在
+ *          任意线程上使用，但不能被多个线程并发调用；需要并发访问时由
+ *          调用方加锁。
+```
+
+成员区另加注释：三个字段是普通值，不要改成"看起来原子"的写法。按要求
+**没有**做 atomic 位打包。
+
+### 8.4 P4：R5~R12（只做文档/注释级）
+
+| 项 | 修正 |
+|---|---|
+| R5 | `WriteFrame` 写失败现在置 `kClosed`（属 R2 的行为修正）；`StartRequest` 先消耗流 id/插流表的顺序**未改**，仅在注释中记录 |
+| R6 | `sse.cpp` 注释说明"无效 socket 不置 `m_failed`，状态仍 Idle"，调用方应丢弃该 Stream |
+| R7 | `SendGoAway` 注释记录 `last_stream_id` 对 client 角色的语义偏差 |
+| R8 | `ResponseWriter::flush` 注释说明无用户态缓冲、只查询可写 |
+| R9 | `timer.cpp` 两处 `kExpired` → `kCompleted` |
+| R10 | `scheduler.cpp` worker 的 `PState::kIdle` 写入处补锁归属说明 |
+| R11 | `http.hpp` Parser 注释写明 `Error` 不是持久终态，收到后应丢弃/reset |
+| R12 | 未改（`go2cpp_fiber_stack_limit_full` 偶发，非本次引入） |
+
+### 8.5 复现测试转正
+
+- `cmake/Go2CppTests.cmake`：去掉 `DISABLED TRUE`，注释改为"回归测试"。
+- `tests/network/test_http2_state_desync_repro.cpp`：改为回归测试，6 个场景
+  （R1a / R1b / R2a / R2b / R13 / R2c）。
+- 修复前（阶段一）同一文件稳定失败：**7 个失败断言**；
+  修复后：**checks=35，failures=0，全部通过**。
+
+### 8.6 修复后验证
+
+| 项目 | 结果 |
+|---|---|
+| 构建（含 `go2cpp_http2_state_matrix`、`go2cpp_http2_state_desync_repro`） | 0 error（仅既有 `-Wreorder` 警告：`Connection` 初始化列表顺序，非本次引入） |
+| `go2cpp_http2_state_desync_repro` | **6/6 场景通过，failures=0** |
+| `go2cpp_http2_state_matrix` | **20567 断言，0 失败** |
+| 全量 ctest | **104/104 通过，0 失败**（复现测试已作为常规测试运行并通过） |
+| TSan（`setarch -R`） | state_matrix / regression / connection / stream_state / http2_stress 全部 exit 0、**0 报告**；http2_state_matrix 仅剩 1 条**故意的**双线程探针报告（R3 按要求只改文档、未改代码） |
+
+### 8.7 仍然没修（明确列出）
+
+| 项 | 状态 | 原因 |
+|---|---|---|
+| **R4（中）** `max_concurrent_streams` 未校验、流表无上限 | 未修 | 不在本次批准的 P1~P4 范围 |
+| **R6（低）** SSE 无效 socket 后状态仍 Idle | 仅注释 | 批准为文档级 |
+| **R7（低）** SendGoAway 的 `last_stream_id` 统计本端流 | 仅注释 | 批准为文档级 |
+| **R5（低）** StartRequest 先消耗流 id/插流表再写帧 | 部分（写失败置 kClosed） | 顺序未改，仅注释 |
+| **R10（低）** M/P 无集中转移函数 | 仅注释 | 批准为文档级 |
+| **R11（低）** Parser 的 Error 非持久终态 | 仅注释 | 批准为文档级 |
+| **R12** `go2cpp_fiber_stack_limit_full` 偶发 | 未排查 | 非本次引入 |
+| **R3 代码级** StreamStateMachine 仍非线程安全 | 未改代码 | 按要求不做 atomic 位打包 |
+| 真实 socket/TLS 的半帧/部分写矩阵 | 未做 | 本轮仍只用 MemoryTransport（含 http2_stress） |

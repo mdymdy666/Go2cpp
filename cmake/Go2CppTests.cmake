@@ -336,9 +336,10 @@ if (GO2CPP_BUILD_TESTS)
         -O2 -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_http2_state_desync_repro
              COMMAND go2cpp_http2_state_desync_repro)
-    # 缺陷修复前保持 DISABLED：它断言的是期望语义，现在应当失败。
+    # R1/R2/R13 修复后已转正：本测试从"缺陷复现"变成"回归测试"，
+    # 任何一条断言回退都会让 ctest 直接失败。
     set_tests_properties(go2cpp_http2_state_desync_repro PROPERTIES
-        TIMEOUT 120 DISABLED TRUE)
+        TIMEOUT 120)
 
     # ---- log 缓冲区与 Formatter（子代理新增）----
     add_executable(go2cpp_log_buffer_test

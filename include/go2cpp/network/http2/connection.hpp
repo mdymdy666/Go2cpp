@@ -94,6 +94,19 @@ enum class ConnStatus : std::uint8_t {
 
 const char* ToString(ConnStatus status) noexcept;
 
+/**
+ * @brief 连接生命周期状态。
+ * @details kOpen 是唯一允许新建流的局面；kDraining 表示已发出或收到
+ *          GOAWAY（已有流可以继续收尾，但不再接受新流）；kClosed 表示
+ *          传输已失败，任何操作都不应再发起。状态只由 Connection 内部
+ *          迁移，外部通过 state() 只读观察。
+ */
+enum class ConnState : std::uint8_t {
+    kOpen,      ///< 握手后可正常收发。
+    kDraining,  ///< 已发/已收 GOAWAY：不再接受新流，已有流可继续。
+    kClosed,    ///< 传输失败：连接已不可用。
+};
+
 /** @brief 从连接读到的一个事件。 */
 struct IncomingEvent final {
     enum class Kind : std::uint8_t {
@@ -138,6 +151,12 @@ public:
     Role role() const noexcept { return m_role; }
     const ConnectionConfig& config() const noexcept { return m_config; }
     bool handshaked() const noexcept { return m_handshaked; }
+    /** @brief 返回连接生命周期状态（kOpen/kDraining/kClosed）。 */
+    ConnState state() const noexcept { return m_state; }
+    /** @brief 返回对端 GOAWAY 声明的最后一个已处理流 id（未收到为 0）。 */
+    std::uint32_t peer_last_stream_id() const noexcept {
+        return m_peer_last_stream_id;
+    }
 
     /**
      * @brief 完成握手（客户端发 preface+SETTINGS 并等对端 SETTINGS；
@@ -151,7 +170,8 @@ public:
      * @param headers 请求头（必须含 `:method`/`:path`/`:scheme`/`:authority`）。
      * @param end_stream 是否在 HEADERS 上就结束发送方向（无 body）。
      * @param out_stream_id 成功时写入分配的流 id。
-     * @return 状态。非客户端调用返回 `kUnsupported`。
+     * @return 状态。非客户端调用返回 `kUnsupported`；连接非 `kOpen`
+     *         （draining/closed）时返回 `kProtocolError`。
      */
     ConnStatus StartRequest(const std::vector<HeaderField>& headers, bool end_stream,
                             std::uint32_t* out_stream_id, std::string* error = nullptr);
@@ -169,7 +189,7 @@ public:
     ConnStatus ResetStream(std::uint32_t stream_id, ErrorCode code,
                            std::string* error = nullptr);
 
-    /** @brief 发送 GOAWAY 并标记连接不再接受新流。 */
+    /** @brief 发送 GOAWAY 并把连接置为 kDraining（不再接受新流）。 */
     ConnStatus SendGoAway(ErrorCode code, std::string* error = nullptr);
 
     /**
@@ -220,6 +240,10 @@ private:
     Role m_role{Role::kClient};
     ConnectionConfig m_config;
     bool m_handshaked{false};
+    /// 连接生命周期状态；由本类内部迁移（见 ConnState）。
+    ConnState m_state{ConnState::kOpen};
+    /// 对端 GOAWAY 的 last_stream_id；0 表示尚未收到。
+    std::uint32_t m_peer_last_stream_id{0};
     /// 下一个可用的客户端流 id（奇数）。
     std::uint32_t m_next_stream_id{1};
     std::uint32_t m_peer_max_frame_size{kDefaultMaxFrameSize};
@@ -245,6 +269,8 @@ private:
 
     /// 初始化/重置某条流的窗口。
     void ResetStreamWindows(std::uint32_t stream_id);
+    /// 只读检查发送窗口是否足够（不扣减）。
+    bool HasSendWindow(std::uint32_t stream_id, std::size_t bytes) const;
     /// 检查并扣减发送窗口；不足返回 false。
     bool ConsumeSendWindow(std::uint32_t stream_id, std::size_t bytes);
 };

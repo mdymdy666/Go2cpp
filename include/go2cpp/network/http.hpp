@@ -102,7 +102,12 @@ struct ParseResult {
     explicit operator bool() const noexcept { return state != ParseState::Error; }
 };
 
-/** @brief 可重复使用的 HTTP 请求/响应增量解析器。 */
+/**
+ * @brief 可重复使用的 HTTP 请求/响应增量解析器。
+ * @note 解析失败返回 `ParseState::Error`，但 Parser **不会**因此进入不可变
+ *       终态：继续 feed() 会重新解析缓冲区。调用方一旦收到 Error 应丢弃
+ *       该 Parser（或调用 reset()），不要复用（R11）。
+ */
 class Parser final {
 public:
     explicit Parser(ParserLimits limits = {});

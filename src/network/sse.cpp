@@ -452,6 +452,9 @@ Result Stream::start() {
         return cancelled;
     }
     if (!m_socket || !m_socket->valid()) {
+        // 已知偏差（R6）：这里**不**置 m_failed —— 还没有写过任何字节，
+        // 流仍处于 Idle。调用方看到 Error::Io 后应丢弃该 Stream；若之后
+        // 换成有效 socket，仍可重新 start。真正写失败才会进入 Failed。
         return invalid_result(Error::Io, "SSE 没有有效 Socket");
     }
     http::Response response;

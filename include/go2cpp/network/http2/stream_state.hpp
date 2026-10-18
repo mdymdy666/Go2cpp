@@ -77,8 +77,11 @@ const char* ToString(StreamEventResult result) noexcept;
 
 /**
  * @brief 单条流的 HTTP/2 状态机。
- * @details 无锁、无 IO，可在任意线程使用；每次转换都返回明确结果，
- *          便于上层决定是发 RST_STREAM 还是断开连接。
+ * @details 无锁、无 IO；**非线程安全**：同一个实例同一时刻只允许一个
+ *          线程/Fiber 驱动（上层 `Connection` 也按单驱动者使用）。可以在
+ *          任意线程上使用，但不能被多个线程并发调用；需要并发访问时由
+ *          调用方加锁。每次转换都返回明确结果，便于上层决定是发
+ *          RST_STREAM 还是断开连接。
  */
 class StreamStateMachine final {
 public:
@@ -93,6 +96,13 @@ public:
 
     /** @brief 发送 HEADERS（可带 END_STREAM）。idle -> open / half-closed(local)。 */
     StreamEventResult SendHeaders(bool end_stream) noexcept;
+
+    /**
+     * @brief 只读预检：当前状态是否允许发送 DATA。
+     * @details 供上层在**推进状态之前**完成帧尺寸/流控校验，避免
+     *          "校验失败但 END_STREAM 已被消耗"的状态脱节。
+     */
+    bool CanSendData() const noexcept;
 
     /** @brief 发送 DATA（可带 END_STREAM）。 */
     StreamEventResult SendData(bool end_stream) noexcept;
@@ -117,7 +127,17 @@ public:
     /** @brief 接收 RST_STREAM：任何状态 -> closed。 */
     StreamEventResult ReceiveRstStream() noexcept;
 
+    /**
+     * @brief 本地原因（如写帧失败）强制关闭该流。
+     * @details 不发送 RST_STREAM，只把本地状态置为 closed；用于传输已
+     *          不可用、无法再与对端同步的场合。
+     */
+    void ForceClose() noexcept;
+
 private:
+    // 注意：以下三个字段都是普通值，没有任何同步；本类按文档约定
+    // 由单一驱动者访问（非线程安全），不要把它们改成"看起来原子"的写法
+    // 而保留读改写序列。
     std::uint32_t m_stream_id;
     StreamState m_state{StreamState::kIdle};
     /// 本地是否已发 END_STREAM（用于区分 half-closed 方向）。

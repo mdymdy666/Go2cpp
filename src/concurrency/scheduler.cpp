@@ -3362,6 +3362,11 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         }
 
         machine->state.store(MState::kParked, std::memory_order_release);
+        // 锁归属说明（R10）：worker 对自己 M 的状态写入不需要 Impl::mutex；
+        // 但 P 的 attached 记账（active_machines）由 worker 创建/退休与
+        // sysmon/leave_blocking 在 Impl::mutex 内共同维护。这里的
+        // PState::kIdle 只是"本 P 当前没有运行中的 M"的快速观测值，
+        // 不参与资源记账决策；不要把它当作授权的依据。
         if (own_processor.running_machines.load(std::memory_order_acquire) ==
             0) {
             own_processor.state.store(PState::kIdle,

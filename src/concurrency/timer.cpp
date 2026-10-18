@@ -135,7 +135,7 @@ void log_long_duration(std::chrono::steady_clock::duration duration,
  * - **执行器**：`m_executor` 非空时，回调被提交给外部执行器（通常是调度器），
  *   而不是在 Timer 线程上直接跑；
  * - **状态机**：`m_status`（`TimerState`：kPending/kRunning/kCancelled/
- *   kExpired/kFailed）与 `m_active` 共同决定是否还能触发。`m_active` 是
+ *   kCompleted/kFailed）与 `m_active` 共同决定是否还能触发。`m_active` 是
  *   取消/失效的快速标记，状态机值对外可见；
  * - **观测**：`m_run_count`、`m_next_deadline`、`m_failure`。
  *
@@ -424,7 +424,8 @@ public:
      * step2: 有异常时把状态机置为 kFailed 并记录 `m_failure`，同时从容器摘除，
      *        不再重排 —— 失败的定时器不会静默重试。
      * step3: 无异常时按 kStop / kAt / kAfter / kContinue 计算下一次截止时间；
-     *        需要继续的重新插回 `m_entries` 并更新 `m_index`，否则置为 kExpired
+     *        需要继续的重新插回 `m_entries` 并更新 `m_index`，否则置为
+     *        kCompleted（枚举里没有 kExpired，旧注释已修正）
      *        并摘除。所有分支都保证 `m_entries` 与 `m_index` 同步。
      */
     void Finish(const std::shared_ptr<Timer::State>& state,

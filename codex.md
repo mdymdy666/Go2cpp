@@ -9162,3 +9162,22 @@ ctest --test-dir build-quality --output-on-failure
 - 与 Go 的 PRNG 数值序列**不互通**（Go 1.23 默认源是 runtime ChaCha8 / 兼容
   lagged-Fibonacci；本模块是 xoshiro256\*\*），同种子不同序列，API/分布语义一致；
 - 本次未执行任何 git 命令。
+
+### 修复记录（同日，经总管理批准）
+
+- **P1 R1**：`WriteData` 改为「只读预检（CanSendData/尺寸/HasSendWindow）→
+  提交（SendData + ConsumeSendWindow + WriteFrame）」，写帧失败 `ForceClose()`
+  该流；新增 `CanSendData()`/`ForceClose()` 两个小方法。
+- **P1 R13**：接收侧 DATA 在扣窗口前校验连接级+流级可用窗口，越界
+  `kProtocolError`（FLOW_CONTROL_ERROR）；补窗增量按 2^31-1 饱和。复现
+  方式修正：5 个满帧不构成越界（WINDOW_UPDATE 会恢复 credit），改用
+  `initial_window_size=1` + 16 字节帧。
+- **P2 R2**：新增 `ConnState{kOpen,kDraining,kClosed}`；SendGoAway/收到
+  GOAWAY → kDraining，写失败 → kClosed；StartRequest 非 kOpen 拒绝。
+- **P3 R3**：只改文档，明确 `StreamStateMachine` 非线程安全（未做 atomic 位打包）。
+- **P4 R5~R12**：仅注释级修正（kExpired→kCompleted、flush 语义、SSE Idle
+  偏差、GOAWAY last_stream_id 偏差、Parser Error 非终态、P 锁归属）。
+- 复现测试已转正（去掉 DISABLED）：**6 个场景 / 35 条断言全部通过，failures=0**；
+  修复前为 7 个失败断言。
+- 全量 ctest：**104/104 通过**；TSan 复跑：regression/connection/stream_state/
+  http2_stress/state_matrix 0 报告，http2_state_matrix 仅剩 1 条故意的双线程探针。

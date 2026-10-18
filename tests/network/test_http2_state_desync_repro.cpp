@@ -1,29 +1,27 @@
 /**
  * @file test_http2_state_desync_repro.cpp
- * @brief **已知缺陷的复现测试**（当前应当失败；修复后转正）。
+ * @brief HTTP/2 连接层"状态与线上状态脱节"回归测试（R1/R2/R13）。
  *
- * ## 为什么单独放一个文件而不是直接塞进 ctest 主套件
+ * ## 由来
  *
- * 本文件断言的是**期望语义**（RFC 9113 + 类注释），而不是当前实现行为。
- * 在缺陷修复之前它会稳定失败，所以 CMake 里用 `DISABLED TRUE` 注册 ——
- * 直接跑 `ctest` 不会把它算成回归；需要验证时显式执行：
+ * 本文件最初是**缺陷复现测试**：在修复前它稳定失败，用来证明三个问题真实
+ * 存在，而不是"看代码觉得可疑"：
  *
- * ```
- * cmake --build build-quality --target go2cpp_http2_state_desync_repro
- * ./build-quality/go2cpp_http2_state_desync_repro
- * ```
+ * 1. `WriteData` 先推进流状态机、再做尺寸/流控校验 —— 被拒绝的写入仍把
+ *    END_STREAM 记在流上（状态与线上脱节，且流控的"重试"契约失效）；
+ * 2. 连接没有 GOAWAY/draining 状态 —— 发/收 GOAWAY 后仍接受新流；
+ * 3. 接收侧流控不校验 —— 对端 DATA 超过接收窗口仍被当成合法事件
+ *    （RFC 9113 §6.9.1 要求 FLOW_CONTROL_ERROR）。
  *
- * 修复对应缺陷后，删掉 CMake 里的 `DISABLED TRUE` 即可转成常规回归测试。
+ * 修复后它转为**常规回归测试**（CMake 里不再 DISABLED）：任何一条断言
+ * 回退都会让 ctest 直接失败。
  *
- * ## 覆盖的三个缺陷
+ * ## 关于接收侧流控的构造
  *
- * 1. `Connection::WriteData` 先推进流状态机、再做尺寸/流控校验：被拒绝的
- *    写入仍把 END_STREAM 记在流上，导致"没有发出 END_STREAM 却已
- *    half-closed"的状态与线上状态脱节，且按文档提示"等 WINDOW_UPDATE 后
- *    重试"会永久失败；
- * 2. `SendGoAway` 不记录任何连接级状态，发完仍然接受新流；
- * 3. 收到对端 GOAWAY 后不进入 draining 状态，仍然接受新流；
- * 4. 接收侧流控窗口越界不报 FLOW_CONTROL_ERROR（RFC 9113 §6.9.1）。
+ * 不能用"连续发很多满帧"来证明窗口越界：接收方在窗口降到一半以下时会回
+ * WINDOW_UPDATE 并恢复自己的窗口，随后到达的帧是**合法**的（credit 已补）。
+ * 所以这里把 `initial_window_size` 配成 1 字节，再发一个 16 字节 DATA 帧 ——
+ * 第一帧就明确超过可用窗口，与补窗策略无关。
  */
 #include "go2cpp/network/http2/connection.hpp"
 #include "go2cpp/network/http2/frame.hpp"
@@ -40,10 +38,12 @@ namespace {
 using namespace go2cpp::net::http2;
 
 int g_failures = 0;
+int g_checks = 0;
 
 void Check(bool condition, const char* what) {
+    ++g_checks;
     if (!condition) {
-        std::fprintf(stderr, "[repro] FAILED: %s\n", what);
+        std::fprintf(stderr, "[regress] FAILED: %s\n", what);
         ++g_failures;
     }
 }
@@ -52,14 +52,26 @@ std::vector<std::uint8_t> EmptySettingsFrame() {
     return std::vector<std::uint8_t>{0, 0, 0, 4, 0, 0, 0, 0, 0};
 }
 
+std::vector<std::uint8_t> DataFrame(std::uint32_t stream_id,
+                                    std::size_t payload_size) {
+    std::vector<std::uint8_t> frame(9 + payload_size, 0);
+    frame[0] = static_cast<std::uint8_t>((payload_size >> 16) & 0xff);
+    frame[1] = static_cast<std::uint8_t>((payload_size >> 8) & 0xff);
+    frame[2] = static_cast<std::uint8_t>(payload_size & 0xff);
+    frame[3] = 0;  // type = DATA
+    frame[4] = 0;  // flags
+    frame[5] = static_cast<std::uint8_t>((stream_id >> 24) & 0x7f);
+    frame[6] = static_cast<std::uint8_t>((stream_id >> 16) & 0xff);
+    frame[7] = static_cast<std::uint8_t>((stream_id >> 8) & 0xff);
+    frame[8] = static_cast<std::uint8_t>(stream_id & 0xff);
+    return frame;
+}
+
 std::vector<std::uint8_t> WindowUpdateFrame(std::uint32_t stream_id,
                                             std::uint32_t increment) {
     std::vector<std::uint8_t> frame(13, 0);
-    frame[0] = 0;
-    frame[1] = 0;
     frame[2] = 4;  // length = 4
     frame[3] = 8;  // type = WINDOW_UPDATE
-    frame[4] = 0;  // flags
     frame[5] = static_cast<std::uint8_t>((stream_id >> 24) & 0x7f);
     frame[6] = static_cast<std::uint8_t>((stream_id >> 16) & 0xff);
     frame[7] = static_cast<std::uint8_t>((stream_id >> 8) & 0xff);
@@ -98,64 +110,65 @@ struct Handshaked {
     std::unique_ptr<Connection> connection;
 };
 
-std::unique_ptr<Handshaked> MakeClient() {
+std::unique_ptr<Handshaked> MakeClient(ConnectionConfig config = {}) {
     auto fixture = std::make_unique<Handshaked>();
     fixture->transport.PushInbound(EmptySettingsFrame());
-    fixture->connection = std::make_unique<Connection>(
-        &fixture->transport, Role::kClient);
+    fixture->connection =
+        std::make_unique<Connection>(&fixture->transport, Role::kClient, config);
     Check(fixture->connection->Handshake() == ConnStatus::kOk,
           "fixture: handshake 失败");
     return fixture;
 }
 
 // ---------------------------------------------------------------------------
-// 缺陷 1：WriteData 的尺寸校验发生在 SendData 之后
+// R1a：WriteData 的尺寸校验必须发生在状态推进之前
 // ---------------------------------------------------------------------------
-void ReproWriteDataOversizeDesync() {
+void RegressionWriteDataOversize() {
     auto fixture = MakeClient();
     auto& connection = *fixture->connection;
     std::uint32_t stream_id = 0;
     Check(connection.StartRequest(RequestHeaders(), false, &stream_id) ==
               ConnStatus::kOk,
-          "repro1: StartRequest 失败");
-    Check(connection.Streams().at(stream_id).state() ==
-              StreamState::kOpen,
-          "repro1: 初始流应 open");
+          "R1a: StartRequest 失败");
+    Check(connection.Streams().at(stream_id).state() == StreamState::kOpen,
+          "R1a: 初始流应 open");
 
     // 超过 SETTINGS_MAX_FRAME_SIZE（默认 16384）的 DATA：必须被拒绝。
     const std::vector<std::uint8_t> oversized(20000, 'x');
     const auto rejected =
         connection.WriteData(stream_id, oversized, true /*end_stream*/);
     Check(rejected == ConnStatus::kUnsupported,
-          "repro1: 超尺寸 DATA 应返回 kUnsupported");
+          "R1a: 超尺寸 DATA 应返回 kUnsupported");
 
     // 关键断言：被拒绝的写入不得推进流状态机。
     Check(connection.Streams().at(stream_id).state() == StreamState::kOpen,
-          "repro1: 被拒绝的写入把流推进到了 half-closed(local)/closed —— "
-          "状态机与线上状态脱节");
+          "R1a: 被拒绝的写入把流推进到了 half-closed(local)/closed");
 
     // 合法的小写入（带 END_STREAM）必须仍能成功。
     const std::vector<std::uint8_t> small{'o', 'k'};
     Check(connection.WriteData(stream_id, small, true) == ConnStatus::kOk,
-          "repro1: 被拒绝的写入之后，合法的 END_STREAM 写入也被拒绝");
+          "R1a: 被拒绝的写入之后，合法的 END_STREAM 写入也被拒绝");
+    Check(connection.Streams().at(stream_id).state() ==
+              StreamState::kHalfClosedLocal,
+          "R1a: 合法 END_STREAM 写入后应为 half-closed(local)");
 }
 
 // ---------------------------------------------------------------------------
-// 缺陷 1b：WriteData 的流控校验发生在 SendData 之后
+// R1b：WriteData 的流控校验必须发生在状态推进/扣额度之前
 // ---------------------------------------------------------------------------
-void ReproWriteDataFlowControlDesync() {
+void RegressionWriteDataFlowControl() {
     auto fixture = MakeClient();
     auto& connection = *fixture->connection;
     std::uint32_t stream_id = 0;
     Check(connection.StartRequest(RequestHeaders(), false, &stream_id) ==
               ConnStatus::kOk,
-          "repro1b: StartRequest 失败");
+          "R1b: StartRequest 失败");
 
     // 把连接级/流级发送窗口消耗到只剩 1535 字节。
     const std::vector<std::uint8_t> chunk(16000, 'a');
     for (int i = 0; i < 4; ++i) {
         if (connection.WriteData(stream_id, chunk, false) != ConnStatus::kOk) {
-            Check(false, "repro1b: 窗口填充写入失败");
+            Check(false, "R1b: 窗口填充写入失败");
             return;
         }
     }
@@ -163,115 +176,141 @@ void ReproWriteDataFlowControlDesync() {
     const std::vector<std::uint8_t> over(2000, 'b');
     Check(connection.WriteData(stream_id, over, true) ==
               ConnStatus::kFlowControl,
-          "repro1b: 窗口不足应返回 kFlowControl");
+          "R1b: 窗口不足应返回 kFlowControl");
     Check(connection.Streams().at(stream_id).state() == StreamState::kOpen,
-          "repro1b: 流控拒绝的写入把流推进到了 half-closed(local)");
+          "R1b: 流控拒绝的写入把流推进到了 half-closed(local)");
 
-    // 文档明确写着"调用方应等待后重试"：补窗口后重试必须成功。
+    // 被拒绝的写入也不能扣额度：剩余 1535 字节内的小写入必须成功。
+    const std::vector<std::uint8_t> fits(1024, 's');
+    Check(connection.WriteData(stream_id, fits, false) == ConnStatus::kOk,
+          "R1b: 被拒绝的写入扣减了发送窗口");
+
+    // 文档承诺"等 WINDOW_UPDATE 后重试"：补窗口后重试必须成功。
     fixture->transport.PushInbound(WindowUpdateFrame(0, 65535));
     fixture->transport.PushInbound(WindowUpdateFrame(stream_id, 65535));
     IncomingEvent event;
     Check(connection.ReadEvent(&event) == ConnStatus::kOk,
-          "repro1b: 读取连接级 WINDOW_UPDATE 失败");
+          "R1b: 读取连接级 WINDOW_UPDATE 失败");
     Check(connection.ReadEvent(&event) == ConnStatus::kOk,
-          "repro1b: 读取流级 WINDOW_UPDATE 失败");
+          "R1b: 读取流级 WINDOW_UPDATE 失败");
     Check(connection.WriteData(stream_id, over, true) == ConnStatus::kOk,
-          "repro1b: 补窗口后重试仍失败（状态机已提前 half-closed）");
+          "R1b: 补窗口后重试仍失败");
+    Check(connection.Streams().at(stream_id).state() ==
+              StreamState::kHalfClosedLocal,
+          "R1b: 重试成功后应为 half-closed(local)");
 }
 
 // ---------------------------------------------------------------------------
-// 缺陷 2：SendGoAway 后仍接受新流
+// R2a：SendGoAway 之后连接进入 kDraining，不再接受新流
 // ---------------------------------------------------------------------------
-void ReproSendGoAwayStillAcceptsNewStreams() {
+void RegressionSendGoAwayDraining() {
     auto fixture = MakeClient();
     auto& connection = *fixture->connection;
+    Check(connection.state() == ConnState::kOpen,
+          "R2a: 握手后应为 kOpen");
     Check(connection.SendGoAway(ErrorCode::kNoError) == ConnStatus::kOk,
-          "repro2: SendGoAway 失败");
+          "R2a: SendGoAway 失败");
+    Check(connection.state() == ConnState::kDraining,
+          "R2a: 发 GOAWAY 后应为 kDraining");
     std::uint32_t stream_id = 0;
     const auto status =
         connection.StartRequest(RequestHeaders(), true, &stream_id);
     Check(status == ConnStatus::kProtocolError,
-          "repro2: 已发 GOAWAY 的连接仍然接受新流（类注释声称"
-          "\"标记连接不再接受新流\"）");
+          "R2a: 已发 GOAWAY 的连接仍然接受新流");
+    Check(connection.state() == ConnState::kDraining,
+          "R2a: 被拒绝的 StartRequest 不得改变连接状态");
 }
 
 // ---------------------------------------------------------------------------
-// 缺陷 3：收到 GOAWAY 后仍接受新流
+// R2b：收到 GOAWAY 之后连接进入 kDraining，不再接受新流
 // ---------------------------------------------------------------------------
-void ReproReceivedGoAwayStillAcceptsNewStreams() {
+void RegressionReceivedGoAwayDraining() {
     auto fixture = MakeClient();
     auto& connection = *fixture->connection;
     fixture->transport.PushInbound(GoAwayFrame(0, 0));
     IncomingEvent event;
     Check(connection.ReadEvent(&event) == ConnStatus::kOk,
-          "repro3: 读取 GOAWAY 失败");
+          "R2b: 读取 GOAWAY 失败");
     Check(event.kind == IncomingEvent::Kind::kGoAway,
-          "repro3: 事件类型应为 kGoAway");
+          "R2b: 事件类型应为 kGoAway");
+    Check(connection.state() == ConnState::kDraining,
+          "R2b: 收到 GOAWAY 后应为 kDraining");
+    Check(connection.peer_last_stream_id() == 0,
+          "R2b: peer_last_stream_id 应记录为 0");
     std::uint32_t stream_id = 0;
     const auto status =
         connection.StartRequest(RequestHeaders(), true, &stream_id);
     Check(status == ConnStatus::kProtocolError,
-          "repro3: 收到 GOAWAY 后仍接受新流（连接缺少 draining/closed 状态）");
+          "R2b: 收到 GOAWAY 后仍接受新流");
 }
 
-
 // ---------------------------------------------------------------------------
-// 缺陷 4：接收侧流控窗口越界不报 FLOW_CONTROL_ERROR
+// R13：接收侧流控窗口越界必须报 FLOW_CONTROL_ERROR
 // ---------------------------------------------------------------------------
-void ReproReceiveWindowOverflowAccepted() {
-    auto fixture = MakeClient();
+void RegressionReceiveWindowOverflow() {
+    ConnectionConfig config;
+    config.initial_window_size = 1;  // 小于单帧，第一帧就会越界
+    auto fixture = MakeClient(config);
     auto& connection = *fixture->connection;
     std::uint32_t stream_id = 0;
     Check(connection.StartRequest(RequestHeaders(), false, &stream_id) ==
               ConnStatus::kOk,
-          "repro4: StartRequest 失败");
+          "R13: StartRequest 失败");
 
-    // 默认连接级接收窗口 65535。对端连续发 5 个满帧 DATA（5 x 16384），
-    // 第 5 帧之后窗口已为负；RFC 9113 §6.9.1 要求接收方回
-    // FLOW_CONTROL_ERROR，当前实现照单全收并继续回 WINDOW_UPDATE。
-    std::vector<std::uint8_t> frame(9 + 16384, 0);
-    frame[1] = 0x40;  // length = 0x004000 = 16384
-    frame[2] = 0x00;
-    frame[3] = 0x00;  // type = DATA
-    frame[4] = 0x00;  // flags
-    frame[5] = 0x00;
-    frame[6] = 0x00;
-    frame[7] = 0x00;
-    frame[8] = static_cast<std::uint8_t>(stream_id);
-    bool saw_error = false;
-    for (int i = 0; i < 5; ++i) {
-        fixture->transport.PushInbound(frame);
-        IncomingEvent event;
-        const auto status = connection.ReadEvent(&event);
-        if (status != ConnStatus::kOk) {
-            saw_error = true;
-            break;
-        }
-    }
-    Check(saw_error,
-          "repro4: 超过接收窗口的对端 DATA 被当成合法事件接收"
-          "（应为 FLOW_CONTROL_ERROR）");
+    fixture->transport.PushInbound(DataFrame(stream_id, 16));
+    IncomingEvent event;
+    const auto status = connection.ReadEvent(&event);
+    Check(status == ConnStatus::kProtocolError,
+          "R13: 超过接收窗口的 DATA 未被拒绝（应为 FLOW_CONTROL_ERROR）");
+}
+
+// ---------------------------------------------------------------------------
+// R2c：传输写失败后连接进入 kClosed，后续操作快速失败
+// ---------------------------------------------------------------------------
+class FailingTransport final : public Transport {
+public:
+    std::size_t Read(std::uint8_t*, std::size_t) override { return 0; }
+    std::size_t Write(const std::uint8_t*, std::size_t) override { return 0; }
+};
+
+void RegressionTransportFailureCloses() {
+    FailingTransport transport;
+    Connection connection(&transport, Role::kClient);
+    std::uint32_t stream_id = 0;
+    // 握手写 preface 就会失败 -> kClosed 且状态置 kClosed。
+    Check(connection.Handshake() == ConnStatus::kClosed,
+          "R2c: 写失败时握手应返回 kClosed");
+    Check(connection.state() == ConnState::kClosed,
+          "R2c: 写失败后连接应为 kClosed");
+    Check(connection.StartRequest(RequestHeaders(), true, &stream_id) ==
+              ConnStatus::kProtocolError,
+          "R2c: 关闭后的 StartRequest 应被拒绝");
+    IncomingEvent event;
+    Check(connection.ReadEvent(&event) == ConnStatus::kClosed,
+          "R2c: 关闭后的 ReadEvent 应返回 kClosed");
 }
 
 }  // namespace
 
 int main() {
-    std::printf("=== HTTP/2 状态脱节缺陷复现（修复前应失败）===\n");
-    std::printf("[repro1]  WriteData 尺寸校验晚于状态推进\n");
-    ReproWriteDataOversizeDesync();
-    std::printf("[repro1b] WriteData 流控校验晚于状态推进\n");
-    ReproWriteDataFlowControlDesync();
-    std::printf("[repro2]  SendGoAway 后仍接受新流\n");
-    ReproSendGoAwayStillAcceptsNewStreams();
-    std::printf("[repro3]  收到 GOAWAY 后仍接受新流\n");
-    ReproReceivedGoAwayStillAcceptsNewStreams();
-    std::printf("[repro4]  接收流控窗口越界未报 FLOW_CONTROL_ERROR\n");
-    ReproReceiveWindowOverflowAccepted();
+    std::printf("=== HTTP/2 状态脱节回归测试（R1/R2/R13）===\n");
+    std::printf("[R1a] WriteData 尺寸校验晚于状态推进\n");
+    RegressionWriteDataOversize();
+    std::printf("[R1b] WriteData 流控校验晚于状态推进\n");
+    RegressionWriteDataFlowControl();
+    std::printf("[R2a] SendGoAway 后进入 draining\n");
+    RegressionSendGoAwayDraining();
+    std::printf("[R2b] 收到 GOAWAY 后进入 draining\n");
+    RegressionReceivedGoAwayDraining();
+    std::printf("[R13] 接收流控窗口越界\n");
+    RegressionReceiveWindowOverflow();
+    std::printf("[R2c] 传输写失败后连接关闭\n");
+    RegressionTransportFailureCloses();
 
     if (g_failures == 0) {
-        std::printf("\n[repro] failures=0（缺陷已修复，可去掉 DISABLED）\n");
+        std::printf("\n[regress] checks=%d failures=0\n", g_checks);
     } else {
-        std::printf("\n[repro] failures=%d（预期非零：缺陷仍在）\n",
+        std::printf("\n[regress] checks=%d failures=%d\n", g_checks,
                     g_failures);
     }
     return g_failures == 0 ? 0 : 1;

@@ -576,6 +576,9 @@ bool ResponseWriter::write(std::string_view chunk) {
     }
     return true;
 }
+// 注意：ResponseWriter 没有用户态发送缓冲，每次 write 都直接落到
+// SocketStream。因此 flush() 只用于查询"当前是否仍可写"，不执行任何
+// 系统调用；叫 flush 是历史命名（R8）。
 bool ResponseWriter::flush() noexcept { return m_socket && m_state == StreamState::HeadersCommitted; }
 bool ResponseWriter::close() {
     if (!m_socket || m_state == StreamState::Closed || m_state == StreamState::Failed ||

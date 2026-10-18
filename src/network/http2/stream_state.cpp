@@ -83,12 +83,23 @@ StreamEventResult StreamStateMachine::SendHeaders(bool end_stream) noexcept {
     return StreamEventResult::kInvalidTransition;
 }
 
+bool StreamStateMachine::CanSendData() const noexcept {
+    return m_state == StreamState::kOpen ||
+           m_state == StreamState::kHalfClosedRemote;
+}
+
+void StreamStateMachine::ForceClose() noexcept {
+    m_local_end = true;
+    m_remote_end = true;
+    m_state = StreamState::kClosed;
+}
+
 StreamEventResult StreamStateMachine::SendData(bool end_stream) noexcept {
     if (m_state == StreamState::kClosed) {
         return StreamEventResult::kStreamClosed;
     }
     // 只有 open 与 half-closed(remote) 允许本地发送数据
-    if (m_state != StreamState::kOpen && m_state != StreamState::kHalfClosedRemote) {
+    if (!CanSendData()) {
         return StreamEventResult::kInvalidTransition;
     }
     if (end_stream && !m_local_end) {
