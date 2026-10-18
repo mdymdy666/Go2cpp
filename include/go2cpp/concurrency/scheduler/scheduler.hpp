@@ -294,11 +294,33 @@ struct TaskSnapshot {
     bool cancellation_requested{false};    ///< 是否已请求取消。
 };
 
+/**
+ * @brief 调度器的累计计数器（`Scheduler::metrics()` 返回的快照）。
+ *
+ * ## 定位
+ *
+ * 供 `debug::SchedulerSnapshot` 与压测时观测调度行为；**不是精确的性能指标**
+ * （只增不减、没有时间窗），适合看趋势与比例，不适合算 QPS。
+ *
+ * ## 字段
+ *
+ * - `task_runs` / `task_completions`：G 的执行次数与完成次数。两者差值反映
+ *   「被挂起后重跑」的量（越多说明 park/wake 越频繁）；
+ * - `fiber_resume_ns`：resume 的累计耗时（含 park/wake 往返）；
+ * - `local_queue_pops` / `steal_pops`：本地队列取 vs 跨 P 窃取的比例。
+ *   **窃取占比高说明负载不均衡** —— 但要记住 §1.9 的教训：把窃取移出全局锁
+ *   反而 -34%，因为本地队列边界不能动。
+ */
 struct SchedulerMetrics {
+    /// @brief G 被执行的累计次数（含挂起后重跑）。
     std::uint64_t task_runs{0};
+    /// @brief G 进入终态的累计次数；与 task_runs 的差值反映 park/wake 频率。
     std::uint64_t task_completions{0};
+    /// @brief resume 的累计耗时（纳秒，含 park/wake 往返）。
     std::uint64_t fiber_resume_ns{0};
+    /// @brief 从本地 P 队列取到 G 的次数。
     std::uint64_t local_queue_pops{0};
+    /// @brief 从别的 P 窃取到 G 的次数；占比高说明负载不均衡。
     std::uint64_t steal_pops{0};
 };
 
