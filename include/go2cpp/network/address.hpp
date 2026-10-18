@@ -36,6 +36,7 @@
 
 namespace go2cpp::net {
 
+/// 前置声明：定义在本文件下方（sockaddr 多态包装）。
 class Address;
 using AddressPtr = std::shared_ptr<Address>;
 

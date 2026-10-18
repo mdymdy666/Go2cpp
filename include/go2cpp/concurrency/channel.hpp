@@ -1258,10 +1258,35 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
   }
 
  private:
+  /**
+   * @brief 一个被登记的发送者（无缓冲、或缓冲已满时挂在 `m_senders`）。
+   *
+   * ## 定位
+   *
+   * `SendUntil` 在无法立即交接时创建它并 park；接收方 `Recv` 从 `m_senders` 队头
+   * 取走它完成 rendezvous（**绕过缓冲**），或 `Close` 遍历它置 `closed`。
+   *
+   * ## 字段的两组职责（不要混）
+   *
+   * | 组 | 字段 | 用途 |
+   * |---|---|---|
+   * | 交接结果 | `accepted`/`closed`/`cancelled`/`status`/`error` | 发送方醒来后据此构造 `ChannelSendResult` |
+   * | select 归属 | `select_state`/`select_index` | 属于哪个 select、第几个 case（普通 Send 为 null / 最大值） |
+   * | 等待载体 | `cv` | 发送者在此 park，等接收者取走值 |
+   *
+   * ## 不变量
+   *
+   * - 三个布尔位（`accepted`/`closed`/`cancelled`）**至多一个为真**：它们由
+   *   `Unlock`/`Close`/取消回调三个源在 `m_mutex` 内竞争写入；
+   * - `accepted == true` 时 `value` 已被移走（接收者持有），不要再读。
+   */
   struct PendingSend {
     explicit PendingSend(T item) : value(std::move(item)) {}
+    /// @brief 待发送的值；被接收者 `std::move` 取走后不要读。
     T value;
+    /// @brief 是否已成功交接给接收者（与 `closed`/`cancelled` 互斥）。
     bool accepted{false};
+    /// @brief 是否因 channel 关闭而失败（对应 `kClosed`/`kAlreadyClosed`）。
     bool closed{false};
     bool cancelled{false};
     ChannelStatus status{ChannelStatus::kWouldBlock};
@@ -1271,8 +1296,28 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     core::ParkingCondition cv;
   };
 
+  /**
+   * @brief 一个被登记的接收者（无缓冲、或缓冲已空时挂在 `m_receivers`）。
+   *
+   * ## 定位
+   *
+   * `RecvUntil` 在无法立即取到值时创建它并 park；发送方 `Send` 直接把值塞进它的
+   * `value` 并置 `ready`（**绕过缓冲**），或 `Close` 遍历它置 `cancelled`。
+   *
+   * ## 与 `PendingSend` 的对称性
+   *
+   * 两者字段一一对应（`accepted` ↔ `ready`、`closed` ↔ `cancelled`），但含义相反：
+   * 发送方关心「值有没有被取走」，接收方关心「有没有拿到值」。
+   *
+   * ## 不变量
+   *
+   * - `ready && ok` 时 `value` 必有值；`!ok` 时 `value` 为空；
+   * - `cancelled == true` 时不会再被任何发送方写入（`m_mutex` 内竞争）。
+   */
   struct PendingRecv {
+    /// @brief 接收到的值；`ready == false` 时为空。
     std::optional<T> value;
+    /// @brief 是否已有值可取（与 `cancelled` 互斥）。
     bool ready{false};
     bool ok{false};
     bool cancelled{false};
@@ -1283,8 +1328,25 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     core::ParkingCondition cv;
   };
 
+  /**
+   * @brief 在离开作用域时注销 Context 取消回调的 RAII 守卫。
+   *
+   * ## 定位
+   *
+   * `SendUntil`/`RecvUntil` 在 park 前把等待节点注册到 `Context::Done()`，
+   * 本守卫保证**任何退出路径**（正常完成、取消、异常）都会 `RemoveCallback`。
+   * 不注销虽然靠 `weak_ptr` + generation 也不会出错，但会让 Context 一直持有
+   * 回调（每次取消多跑一次空回调）。
+   *
+   * ## 为什么析构里有 try/catch
+   *
+   * 析构是 `noexcept`；`RemoveCallback` 内部加锁，理论上可能抛 `std::system_error`。
+   * 清理路径抛异常会直接 `terminate`，所以这里吞掉。
+   */
   struct CallbackGuard {
+    /// @brief 要注销回调的 Context（引用，不延长生命周期）。
     const ContextPtr& context;
+    /// @brief 注册时拿到的回调 Id；0 表示未注册（无需注销）。
     DoneSignal::CallbackId id{0};
     ~CallbackGuard() noexcept {
       if (context && id != 0) {

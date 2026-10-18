@@ -231,7 +231,6 @@ Frame MakeSettingsAck();
  * ## 定位
  * `Connection` 在两处自动回 ACK：握手期 `FinishSettingsHandshake()` 与
  * `ReadEvent()` 的 PING 分支。
- *
  */
 struct PingFrame final {
     bool ack{false};
