@@ -43,11 +43,29 @@ int ToZlibFlush(FlushMode mode) noexcept {
 
 }  // namespace
 
+/**
+ * @brief `Deflater` 的 pimpl 状态：zlib deflate 流 + 固定输出缓冲。
+ *
+ * ## 定位
+ * `detail::Deflater` 的私有实现，被 `WriterEngine` 通过 `unique_ptr` 间接
+ * 持有；`Flate::Writer`/`Zlib::Writer`/`Gzip::Writer` 只传 windowBits，
+ * 三个格式共用这一份实现。
+ *
+ * ## 状态机
+ * 只有两态：`Ready`（`initialized == true`）与 `Failed`（`deflateInit2` 或
+ * `Reset` 失败）。`Run`/`SetInput` 不改变它；「开始/冲刷/结束/关闭」的流状态
+ * 由 `WriterEngine` 管理，见 `docs/state-machines/WriterEngine.md`。
+ *
+ * ## 不变量
+ * - `output.size() == kOutputBufferSize`；
+ * - 任意时刻 `produced <= output.size()`；
+ * - `initialized == false` 后不得再调用任何 zlib 函数。
+ */
 struct Deflater::Impl {
-  z_stream stream{};
-  std::vector<std::uint8_t> output;
-  std::size_t produced{0};
-  bool initialized{false};
+  z_stream stream{};                ///< zlib deflate 状态；构造/Reset/Run 读写，析构 deflateEnd
+  std::vector<std::uint8_t> output; ///< 固定 64 KiB 输出缓冲；构造分配，Run 写 [0, produced)
+  std::size_t produced{0};          ///< 最近一次 Run 的产出字节数；Run 写，output_size() 读
+  bool initialized{false};          ///< deflateInit2/Reset 是否成功；失败后禁止调用 zlib
 };
 
 Deflater::Deflater(int level, int window_bits, int mem_level)

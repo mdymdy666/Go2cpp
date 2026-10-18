@@ -394,10 +394,19 @@ std::vector<double> DefaultHistogramBuckets() {
 // Counter
 // ---------------------------------------------------------------------------
 
+/**
+ * ## 定位
+ * `Counter` 根对象拥有的标签族：元数据 + 子序列缓存 + 保护 children 的互斥量。
+ * 子序列通过裸指针共享它，生命周期由根对象的 `m_owned_family` 保证。
+ *
+ * ## 不变量
+ * - `children` 的键是长度前缀编码后的标签值（无歧义）；
+ * - children 一旦插入就不再删除，返回给调用方的引用稳定。
+ */
 struct Counter::Family {
-    detail::MetricInfo info;
-    mutable std::mutex mutex;
-    std::map<std::string, std::unique_ptr<Counter>> children;
+    detail::MetricInfo info;  ///< 族共享元数据；CreateFamily 写入，Name/Help/Type 读取
+    mutable std::mutex mutex;  ///< 保护 children；With 查找/插入，AppendPrometheus 遍历时持有
+    std::map<std::string, std::unique_ptr<Counter>> children;  ///< 标签值编码到子计数器的缓存；With 插入/查找，SeriesCount/Render 读取
 };
 
 std::unique_ptr<Counter::Family> Counter::CreateFamily(
@@ -462,6 +471,16 @@ Counter& Counter::With(std::initializer_list<std::string_view> labels) {
     return With(values);
 }
 
+/**
+ * @brief 取得/创建标签值对应的子计数器。
+ *
+ * ## 步骤
+ * step1. 校验标签值不含控制字符；
+ * step2. 子序列只接受自己的标签值，传错直接抛 `invalid_argument`；
+ * step3. 根对象校验标签个数；无标签族直接返回根对象；
+ * step4. 编码标签值，持族锁查找；
+ * step5. 命中返回稳定引用；未命中创建子对象并插入（只增不删）。
+ */
 Counter& Counter::With(const std::vector<std::string>& labels) {
     ValidateLabelValues(labels);
     if (!m_is_root) {
@@ -484,6 +503,7 @@ Counter& Counter::With(const std::vector<std::string>& labels) {
         return *this;
     }
 
+    // step4: 键用长度前缀编码，{"a,b"} 与 {"a","b"} 不会串键
     const std::string key = EncodeLabelValues(labels);
     std::lock_guard<std::mutex> lock(m_family->mutex);
     const auto found = m_family->children.find(key);
@@ -532,10 +552,18 @@ void Counter::AppendPrometheus(std::string& out) const {
 // Gauge
 // ---------------------------------------------------------------------------
 
+/**
+ * ## 定位
+ * `Gauge` 的标签族容器，结构与 `Counter::Family` 相同；分离定义是为了让
+ * children 的元素类型是 `Gauge`，避免向下转型。
+ *
+ * ## 不变量
+ * 同 `Counter::Family`：标签键无歧义、children 只增不删、引用稳定。
+ */
 struct Gauge::Family {
-    detail::MetricInfo info;
-    mutable std::mutex mutex;
-    std::map<std::string, std::unique_ptr<Gauge>> children;
+    detail::MetricInfo info;  ///< 族共享元数据；CreateFamily 写入，Name/Help/Type 读取
+    mutable std::mutex mutex;  ///< 保护 children；With 查找/插入，AppendPrometheus 遍历时持有
+    std::map<std::string, std::unique_ptr<Gauge>> children;  ///< 标签值编码到子 Gauge 的缓存；With 插入/查找，SeriesCount/Render 读取
 };
 
 std::unique_ptr<Gauge::Family> Gauge::CreateFamily(detail::MetricInfo info) {
@@ -675,11 +703,20 @@ void Gauge::AppendPrometheus(std::string& out) const {
 // Histogram
 // ---------------------------------------------------------------------------
 
+/**
+ * ## 定位
+ * `Histogram` 的标签族容器：除元数据/子序列外还持有**不可变**桶边界，所有子
+ * 序列共享同一组 `le` 上界。
+ *
+ * ## 不变量
+ * - `boundaries` 严格递增且有限，构造后不再修改；
+ * - 所有子序列的 `m_bucket_count` 都等于 `boundaries.size() + 1`。
+ */
 struct Histogram::Family {
-    detail::MetricInfo info;
-    std::vector<double> boundaries;
-    mutable std::mutex mutex;
-    std::map<std::string, std::unique_ptr<Histogram>> children;
+    detail::MetricInfo info;  ///< 族共享元数据；CreateFamily 写入，Name/Help/Type 读取
+    std::vector<double> boundaries;  ///< 有限桶上界（le）；CreateFamily 校验后固定，Observe/Quantile/Render 只读
+    mutable std::mutex mutex;  ///< 保护 children；With 查找/插入，AppendPrometheus 遍历时持有
+    std::map<std::string, std::unique_ptr<Histogram>> children;  ///< 标签值编码到子直方图的缓存；With 插入/查找，SeriesCount/Render 读取
 };
 
 std::unique_ptr<Histogram::Family> Histogram::CreateFamily(
@@ -778,8 +815,15 @@ const std::vector<double>& Histogram::Buckets() const {
     return m_family->boundaries;
 }
 
+/**
+ * @brief 返回累计桶计数快照，长度 `Buckets().size() + 1`。
+ *
+ * @details 逐桶读取并累加；并发 Observe 时各桶来自不同瞬间，因此是**近似快照**
+ * （数组仍保证单调不减，末项等于本次读到的 Count 附近值）。
+ */
 std::vector<std::uint64_t> Histogram::CumulativeBucketCounts() const {
     EnsureSeries("CumulativeBucketCounts");
+    // 先分配再逐桶累加；running 是当前 le 上界的累计值
     std::vector<std::uint64_t> result(m_bucket_count, 0);
     std::uint64_t running = 0;
     for (std::size_t i = 0; i < m_bucket_count; ++i) {
@@ -908,9 +952,24 @@ std::size_t Histogram::SeriesCount() const {
     return m_family->children.size();
 }
 
+/**
+ * @brief 把一个 Histogram 族展开成 `_bucket`（累计）/`_sum`/`_count` 序列。
+ *
+ * ## 步骤
+ * step1. 输出 HELP/TYPE 头；
+ * step2. 定义 `append_series`：累计桶 + 有限上界各一行、`+Inf` 一行、sum/count 各一行；
+ * step3. 子序列：只输出自己；
+ * step4. 无标签根对象：输出自己；
+ * step5. 带标签根对象：持族锁遍历 children，逐个输出。
+ *
+ * ## 为什么桶是累计的
+ * Prometheus 的 `le` 桶语义就是「小于等于上界」，文本里直接输出累计计数，
+ * 服务端不需要再做前缀和。
+ */
 void Histogram::AppendPrometheus(std::string& out) const {
     AppendHeader(out, m_family->info);
 
+    // step2: 一个序列 = 有限桶 + 隐式 +Inf 桶 + sum + count
     const auto append_series = [&out, this](const Histogram& series) {
         const auto cumulative = series.CumulativeBucketCounts();
         const std::string bucket_name = m_family->info.name + "_bucket";
@@ -930,15 +989,18 @@ void Histogram::AppendPrometheus(std::string& out) const {
                      FormatUint(series.Count()));
     };
 
+    // step3: 子序列只导出自己，不遍历兄弟
     if (!m_is_root) {
         append_series(*this);
         return;
     }
+    // step4: 无标签根对象就是唯一序列
     if (m_family->info.label_names.empty()) {
         append_series(*this);
         return;
     }
     std::lock_guard<std::mutex> lock(m_family->mutex);
+    // step5: 带标签根对象：children 按编码键有序，输出稳定
     for (const auto& entry : m_family->children) {
         append_series(*entry.second);
     }
@@ -956,12 +1018,28 @@ Registry& Registry::Default() {
     return registry;
 }
 
+/**
+ * @brief 注册或取得一个指标族，并校验同名参数一致性。
+ *
+ * ## 步骤
+ * step1. 校验名字/help/标签名；Histogram 额外补默认桶并校验边界；
+ * step2. 取注册表锁（查重与插入必须原子）；
+ * step3. 已存在：逐项比较类型/help/标签名/桶，任一不同抛 `invalid_argument`；
+ * step4. 不存在：按类型构造 Family 与具体指标对象；
+ * step5. 入表并返回稳定引用（对象由 `unique_ptr` 持有，生命周期同注册表）。
+ *
+ * ## 为什么冲突要抛异常
+ * 静默复用会让两个调用方写进同一条序列，指标含义被污染且难以发现；启动期
+ * 抛异常比运行期给出错误数字更安全。
+ */
 Metric& Registry::RegisterImpl(const std::string& name,
                                const std::string& help, MetricType type,
                                std::vector<std::string> label_names,
                                std::vector<double> buckets) {
+    // step1: 先校验元数据；Histogram 的空 buckets 在这里补默认值
     const detail::MetricInfo info =
         MakeInfo(name, help, type, std::move(label_names), true);
+    // step1b: 桶必须严格递增且有限，否则 Observe 的二分没有意义
     if (type == MetricType::kHistogram) {
         if (buckets.empty()) {
             buckets = DefaultHistogramBuckets();
@@ -969,7 +1047,9 @@ Metric& Registry::RegisterImpl(const std::string& name,
         ValidateBuckets(buckets);
     }
 
+    // step2: 注册表锁覆盖查重与插入，避免同名并发注册产生两个对象
     std::lock_guard<std::mutex> lock(m_mutex);
+    // step3: 同名必须完全同构；任何差异都说明调用方对指标语义理解不一致
     const auto found = m_metrics.find(name);
     if (found != m_metrics.end()) {
         Metric& existing = *found->second;
@@ -999,6 +1079,7 @@ Metric& Registry::RegisterImpl(const std::string& name,
         return existing;
     }
 
+    // step4: 按类型构造；Family 由根指标独占，子序列通过裸指针共享
     std::unique_ptr<Metric> metric;
     switch (type) {
         case MetricType::kCounter:
@@ -1018,6 +1099,7 @@ Metric& Registry::RegisterImpl(const std::string& name,
                 "go2cpp::metrics: invalid metric type");
     }
     Metric* raw = metric.get();
+    // step5: 入表后指针稳定；返回引用在注册表生命周期内有效
     m_metrics.emplace(name, std::move(metric));
     return *raw;
 }

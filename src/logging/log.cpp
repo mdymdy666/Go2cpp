@@ -1,4 +1,5 @@
 /**
+ * @file src/logging/log.cpp
  * @brief 轻量日志实现：格式项注册表、内置 Sink、Worker 快照与 Logger 分发。
  *
  * ## 模块定位
@@ -49,7 +50,7 @@ public:
     }
 
 private:
-    std::string m_text;
+    std::string m_text;  ///< 固定文本；TextItem 构造时写入，Format 只读
 };
 
 /** @brief 输出日志记录中一个简单字符串或数字字段的格式项。 */
@@ -86,7 +87,7 @@ public:
     }
 
 private:
-    Field m_field;
+    Field m_field;  ///< 要输出的字段枚举；构造时固定，Format 按它 switch
 };
 
 /** @brief 按 strftime 规则输出日志时间的格式项。 */
@@ -109,7 +110,7 @@ public:
     }
 
 private:
-    std::string m_format;
+    std::string m_format;  ///< strftime 模式；DateItem 构造时固定，Format 读
 };
 
 /** @brief 输出带毫秒部分的默认时间格式项，对应 `{time}`。 */
@@ -135,15 +136,29 @@ std::once_flag& BuiltinFormatFlag() {
     return flag;
 }
 
+/**
+ * @brief 用 `std::call_once` 注册全部内置格式项，保证多线程只初始化一次。
+ *
+ * ## 步骤
+ * step1. `call_once` 保证注册只执行一次，避免重复插入改变已有工厂；
+ * step2. `add` 辅助函数每次注册都取注册表锁；
+ * step3. 注册单字符别名与命名别名（`m`/`level` 等都指向同一字段）；
+ * step4. 注册 `%d`/`%%`/`%T`/`%n`/`{time}` 等需要特殊处理的项。
+ *
+ * @note 工厂对象只捕获不可变的字段枚举，格式化热路径不查表。
+ */
 void EnsureBuiltinFormats() {
+    // step1: 内置项必须只注册一次；重复注册会与用户覆盖冲突
     std::call_once(BuiltinFormatFlag(), [] {
         // 内置项的工厂只保存不可变的字段枚举，构造后格式化无需查表。
+        // step2: 每个 add 都在锁内 emplace，已存在的 key 不会被覆盖
         const auto add = [](const char* key, FieldItem::Field field) {
             std::lock_guard<std::mutex> lock(FormatRegistryMutex());
             FormatRegistry().emplace(key, [field](const std::string&) {
                 return std::make_shared<FieldItem>(field);
             });
         };
+        // step3: 单字符与命名别名映射到同一 Field，保持 Sylar 兼容
         add("m", FieldItem::Field::Message);
         add("p", FieldItem::Field::Level);
         add("N", FieldItem::Field::Logger);
@@ -164,6 +179,7 @@ void EnsureBuiltinFormats() {
         add("file", FieldItem::Field::File);
         add("line", FieldItem::Field::Line);
         add("function", FieldItem::Field::Function);
+        // step4: 需要选项/特殊文本的项单独注册
         {
             std::lock_guard<std::mutex> lock(FormatRegistryMutex());
             FormatRegistry().emplace("d", [](const std::string& option) {
@@ -202,8 +218,25 @@ std::string ResolveBraceKey(std::string_view token) {
     return std::string(token);
 }
 
+/**
+ * @brief 把 `{name}` 或 `%x{opt}` 模式解析成 Item 链。
+ *
+ * ## 步骤
+ * step1. 确保内置格式项已注册；
+ * step2. 准备输出链与「待 flush 的纯文本」缓冲；
+ * step3. `append_item`：查工厂；找不到就把原文字面量留在文本里并置 error；
+ * step4. 扫描 `{...}` 命名占位符；闭合则解析并跳过整段；
+ * step5. 普通字符累积到文本；单独的 `%` 原样保留；
+ * step6. `%x{option}`：解析选项；缺 `}` 时把剩余模式原样保留并置 error；
+ * step7. 收尾 flush 文本，返回 Item 链。
+ *
+ * ## 失败语义
+ * 未知/未闭合占位符不会抛异常，而是原样保留 + `*error = true`；调用方
+ * （`PatternFormatter`）据此让 `HasError()` 为真。
+ */
 std::vector<LogFormatter::Item::ptr> ParsePattern(const std::string& pattern, bool* error) {
     EnsureBuiltinFormats();
+    // step2: items 是最终链；text 暂存相邻纯文本，避免每个字符一个 Item
     std::vector<LogFormatter::Item::ptr> items;
     std::string text;
     const auto flush_text = [&] {
@@ -212,6 +245,7 @@ std::vector<LogFormatter::Item::ptr> ParsePattern(const std::string& pattern, bo
             text.clear();
         }
     };
+    // step3: 工厂查不到时保留字面量，便于用户看到原始模式
     const auto append_item = [&](const std::string& key, const std::string& option,
                                  const std::string& literal) {
         auto item = FindFormatItem(key, option);
@@ -223,6 +257,7 @@ std::vector<LogFormatter::Item::ptr> ParsePattern(const std::string& pattern, bo
         flush_text();
         items.push_back(std::move(item));
     };
+    // step4: 主扫描循环；两种语法共用同一条 Item 链
     for (std::size_t index = 0; index < pattern.size(); ++index) {
         if (pattern[index] == '{') {
             const auto end = pattern.find('}', index + 1);
@@ -234,6 +269,7 @@ std::vector<LogFormatter::Item::ptr> ParsePattern(const std::string& pattern, bo
                 continue;
             }
         }
+        // step5: 非 `%` 字符进入文本缓冲，连续文本最后合并成一个 TextItem
         if (pattern[index] != '%') {
             text.push_back(pattern[index]);
             continue;
@@ -242,6 +278,7 @@ std::vector<LogFormatter::Item::ptr> ParsePattern(const std::string& pattern, bo
             text.push_back('%');
             continue;
         }
+        // step6: `%` 后可能跟 `{option}`；缺右花括号时整段保留
         const auto token_start = index;
         const char code = pattern[++index];
         std::string key(1, code);
@@ -259,6 +296,7 @@ std::vector<LogFormatter::Item::ptr> ParsePattern(const std::string& pattern, bo
         }
         append_item(key, option, pattern.substr(token_start, index - token_start + 1));
     }
+    // step7: 收尾：把最后一段纯文本物化成 TextItem
     flush_text();
     return items;
 }
@@ -438,13 +476,24 @@ void FileSink::Flush() {
     if (auto* stream = dynamic_cast<std::ofstream*>(m_stream.get())) stream->flush();
 }
 
+/**
+ * @brief 创建父目录并重新打开日志文件（追加模式）。
+ *
+ * ## 步骤
+ * step1. 取父目录并 `create_directories`（失败/异常按打开失败处理）；
+ * step2. 以 `app|out` 打开，保证重启后继续追加；
+ * step3. 成功才替换 `m_stream`；失败时重置为空，后续 Write 直接丢弃。
+ */
 bool FileSink::Reopen() {
     std::lock_guard<std::mutex> lock(m_mutex);
     try {
+        // step1: 目录可能不存在；创建失败由 catch 统一处理
         const auto parent = std::filesystem::path(m_path).parent_path();
         if (!parent.empty()) std::filesystem::create_directories(parent);
+        // step2: 追加模式，避免 Reopen 清空已有日志
         auto stream = std::make_unique<std::ofstream>(m_path, std::ios::app | std::ios::out);
         if (!stream->is_open()) return false;
+        // step3: 只有成功打开才替换旧流
         m_stream = std::move(stream);
         return true;
     } catch (...) {
@@ -667,11 +716,29 @@ void Logger::ConfigureDefaults(std::vector<LogItemWorker::ptr> workers) {
     PublishLoggerWorkers(&m_workers, &m_worker_snapshot);
 }
 void Logger::ClearWorkers() { std::lock_guard<std::mutex> lock(m_mutex); m_workers.clear(); m_default_workers.clear(); m_custom_workers.clear(); PublishLoggerWorkers(&m_workers, &m_worker_snapshot); }
+/**
+ * @brief 设置父记录器，拒绝自环与间接环。
+ *
+ * ## 步骤
+ * step1. 取进程级父图锁，串行化所有 SetParent（父链是共享结构）；
+ * step2. 从候选父节点沿 `m_parent` 向上走；
+ * step3. 遇到 `this` 说明成环，直接返回、不修改；
+ * step4. `visited` 去重，已有环的旧图也不会让本函数死循环；
+ * step5. 检查通过后取自身锁写入 `m_parent`。
+ *
+ * ## 为什么需要全局锁
+ * 只锁单个 Logger 无法原子地检查整条父链；两个线程同时把对方设为父会各自
+ * 通过局部检查。父图锁把「检查 + 写入」变成一个临界区。
+ */
 void Logger::SetParent(Logger::ptr parent) {
     // 父链是有向树；禁止自环和间接环，避免 Log() 递归永不返回。
+    // step1: 父图是多个 Logger 共享的结构，必须用进程级锁串行化
     static std::mutex parent_graph_mutex;
+    // step1b: 先拿父图锁，再逐个取节点锁（固定顺序，避免互相等待）
     std::lock_guard<std::mutex> graph_lock(parent_graph_mutex);
+    // step2: 为空表示断开父链，无需环检查
     if (parent) {
+        // step4: visited 兼作「旧图已有环」的保护，避免无限上升
         const auto candidate = parent;
         std::unordered_set<const Logger*> visited;
         auto current = candidate;
@@ -684,6 +751,7 @@ void Logger::SetParent(Logger::ptr parent) {
             current = current->m_parent.lock();
         }
     }
+    // step5: 检查通过才写；此时仍持有父图锁，其他 SetParent 不会插入中间态
     std::lock_guard<std::mutex> lock(m_mutex);
     m_parent = std::move(parent);
 }
@@ -716,29 +784,63 @@ LoggerManager::LoggerManager() : m_root(std::make_shared<Logger>("root")) {
     Configure(m_level, m_stdout_enabled, m_directory, m_file);
 }
 
+/**
+ * @brief 按名字查找 Logger；不存在则按当前默认配置创建。
+ *
+ * ## 步骤
+ * step1. 取注册表锁，保证「查找 + 创建 + 入表」原子；
+ * step2. 线性查找同名 Logger，命中直接返回（注册表通常很小）；
+ * step3. 未命中：创建 Logger 并同步当前级别；
+ * step4. 用当前 pattern 建共享 `PatternFormatter`；
+ * step5. 建默认 worker：FileSink 必选，stdout 可选；
+ * step6. 非 root 的记录器把 root 设为父，形成传播链；
+ * step7. 入表后返回，后续 `Get` 复用同一对象。
+ */
 Logger::ptr LoggerManager::Get(const std::string& name) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    // step2: 名字即身份；已存在的 Logger 不重建，保留其自定义 worker
     for (const auto& logger : m_loggers) if (logger->name() == name) return logger;
+    // step3: 新 Logger 先继承当前默认级别
     auto logger = std::make_shared<Logger>(name);
+    // step4: 同一 Logger 的 File/Stdout worker 共享一个 Formatter，省解析
     logger->SetLevel(m_level);
     const auto formatter = std::make_shared<PatternFormatter>(m_pattern);
     std::vector<LogItemWorker::ptr> defaults;
     defaults.push_back(std::make_shared<LogItemWorker>(std::make_shared<MinimumLevelFilter>(m_level), formatter,
                                                        std::make_shared<FileSink>((std::filesystem::path(m_directory) / m_file).string())));
     if (m_stdout_enabled) defaults.push_back(std::make_shared<LogItemWorker>(std::make_shared<MinimumLevelFilter>(m_level), formatter, std::make_shared<StdoutSink>()));
+    // step5: 默认 worker 与自定义 worker 分离，后续 Configure 只重建默认部分
     logger->ConfigureDefaults(std::move(defaults));
+    // step6: root 自己是根；其余默认向 root 传播
     if (name != "root") logger->SetParent(m_root);
+    // step7: 入表后 Get 才能命中；shared_ptr 保证调用方持有期间不析构
     m_loggers.push_back(logger);
     return logger;
 }
 
 Logger::ptr LoggerManager::Root() { return Get("root"); }
 
+/**
+ * @brief 更新默认级别/输出位置/格式，并重建所有 Logger 的默认 worker。
+ *
+ * ## 步骤
+ * step1. 取注册表锁，冻结 Logger 列表与默认配置；
+ * step2. 空目录/空文件名/空模式回退到内置默认值；
+ * step3. `make_defaults` 每次重建 FileSink（以及可选 StdoutSink）；
+ * step4. 遍历所有 Logger：同步级别并整体替换默认 worker；自定义 worker 保留。
+ *
+ * ## 代价
+ * 每次 Configure 都会新建 FileSink（重新打开文件）。热更新频率应远低于日志
+ * 写入频率，否则打开文件的成本会显现。
+ */
 void LoggerManager::Configure(Level level, bool stdout_enabled, const std::string& directory,
                               const std::string& file, const std::string& pattern) {
+    // step1: 整个重建过程持锁，避免 Get 看到一半新一半旧的默认配置
     std::lock_guard<std::mutex> lock(m_mutex);
+    // step2: 空值回退保证 Configure 永远不会产出不可用的路径/模式
     m_level = level; m_stdout_enabled = stdout_enabled; m_directory = directory.empty() ? "log" : directory;
     m_file = file.empty() ? "go2cpp.log" : file; m_pattern = pattern.empty() ? "{time} [{level}] {logger} ({file}:{line}) {message}\n" : pattern;
+    // step3: 每个 Logger 拿到独立 FileSink，但共享同一个 Formatter
     const auto make_defaults = [this, level]() {
         std::vector<LogItemWorker::ptr> defaults;
         const auto formatter = std::make_shared<PatternFormatter>(m_pattern);
@@ -747,6 +849,7 @@ void LoggerManager::Configure(Level level, bool stdout_enabled, const std::strin
         if (m_stdout_enabled) defaults.push_back(std::make_shared<LogItemWorker>(std::make_shared<MinimumLevelFilter>(level), formatter, std::make_shared<StdoutSink>()));
         return defaults;
     };
+    // step4: 只重建默认 worker；Logger 的自定义 worker 不受影响
     for (const auto& logger : m_loggers) { logger->SetLevel(level); logger->ConfigureDefaults(make_defaults()); }
 }
 
@@ -906,16 +1009,26 @@ void BufferedSink::Write(const LogRecord& record, std::string_view formatted) {
     }
 }
 
+/**
+ * @brief 把当前缓冲区整体刷出；空缓冲时只转发一次底层 `Flush`。
+ *
+ * ## 步骤
+ * step1. 锁内 `swap` 出缓冲区并更新刷新时间，随即释放锁；
+ * step2. 有数据则走 `FlushBatch`（锁外 IO）；
+ * step3. 无数据也要转发 `m_inner->Flush()`，保证时间策略下底层缓冲不滞留。
+ */
 void BufferedSink::Flush() {
     if (!m_inner) {
         return;
     }
+    // step1: 只交换缓冲区，持锁时间与批量大小无关
     std::string batch;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         batch.swap(m_buffer);
         m_last_flush = std::chrono::steady_clock::now();
     }
+    // step2: 批量写走锁外路径；空批次跳过
     if (!batch.empty()) {
         FlushBatch(std::move(batch), MakePlaceholderRecord());
     } else {

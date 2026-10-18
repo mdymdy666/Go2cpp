@@ -55,11 +55,29 @@ ErrorPtr MapDataError(const z_stream& stream) {
 
 }  // namespace
 
+/**
+ * @brief `Inflater` 的 pimpl 状态：zlib inflate 流 + 固定输入缓冲。
+ *
+ * ## 定位
+ * `detail::Inflater` 的私有实现，被 `ReaderEngine` 通过 `unique_ptr` 间接
+ * 持有；`Flate::Reader`/`Zlib::Reader`/`Gzip::Reader` 只传 windowBits，
+ * 三个格式共用这一份实现。
+ *
+ * ## 状态机
+ * 只有两态：`Ready`（`initialized == true`）与 `Failed`（`inflateInit2` 或
+ * `Reset` 失败）。成员边界/EOF/解压中的状态由 `ReaderEngine` 管理，见
+ * `docs/state-machines/ReaderEngine.md`。
+ *
+ * ## 不变量
+ * - `input.size() == kInputBufferSize`；
+ * - `window_bits` 构造后不变，`Reset`/`ResetForNextMember` 复用它；
+ * - `avail_in <= input.size()`；`avail_in != 0` 时不得 `CommitInput`。
+ */
 struct Inflater::Impl {
-  z_stream stream{};
-  std::vector<std::uint8_t> input;
-  int window_bits{0};
-  bool initialized{false};
+  z_stream stream{};              ///< zlib inflate 状态；构造/Reset/Inflate 读写，析构 inflateEnd
+  std::vector<std::uint8_t> input; ///< 固定 32 KiB 输入缓冲；构造分配，CommitInput 挂给 zlib
+  int window_bits{0};             ///< -15 raw / 15 zlib / 31 gzip；构造设置，Reset* 复用
+  bool initialized{false};        ///< inflateInit2/Reset 是否成功；失败后禁止调用 zlib
 };
 
 Inflater::Inflater(int window_bits) : m_impl(new Impl()) {

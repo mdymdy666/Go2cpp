@@ -238,6 +238,36 @@ void DescriptorGuard::Invalidate(int fd) noexcept {
 ///          因为一个线程不可能同时处于两次 poll 内部。
 thread_local bool t_inside_poll = false;
 
+/**
+ * @brief `IOManager` 的完整实现（PIMPL；`IOManager` 本身只是门面）。
+ *
+ * ## 组成
+ *
+ * | 成员 | 角色 |
+ * |---|---|
+ * | `m_stripes`（64 条带） | fd → `FdSlot`（等待队列 + 内核注册状态） |
+ * | `m_deadline`（multimap） | 到期时间 → `TimerRecord`（IO 等待超时） |
+ * | `m_registrations` | 注册令牌表（fd + 序号），用于忽略内核队列里的迟到事件 |
+ * | `m_backend` | epoll 实例（`EPOLLONESHOT`） |
+ * | `m_eventfd` | `tickle()` 唤醒 `epoll_wait` 的管道 |
+ *
+ * ## 与 Scheduler 的关系（没有独立 poller 线程）
+ *
+ * Scheduler 在 worker 空闲时通过 `set_io_idle_poller` 注入的回调调用 `poll_once`，
+ * **事件在 worker 自己身上处理**。这是「事件就绪能被任何空闲 worker 处理」的
+ * 关键 —— 专职 poller 线程只能把事件转交给别人，多一次唤醒。
+ *
+ * ## 锁顺序
+ *
+ * `m_mutex`（deadline/registrations）→ 条带锁。`expire_timers` 特意分两阶段
+ * （定时器锁内摘节点、释放后逐条带处理），就是为了不在持 `m_timer_mutex` 时进条带锁。
+ *
+ * ## 关键不变式
+ *
+ * - 一个 fd 的 slot 存在时，其 `generation` 必须与该 fd 的 `DescriptorToken` 一致；
+ * - `interest == 0 && registered == true` 是**合法状态**（ONESHOT 后停用但保留注册）；
+ * - `armed` 只在「内核仍在监听」时为真（一次性后端事件返回后会自动 disarm）。
+ */
 struct IOManager::State : public std::enable_shared_from_this<State> {
     // IOManager 在构造期把 poll_once/tickle 装进 Scheduler；lambda 的访问
     // 权限与所在成员函数相同，因此这里放开给 IOManager。

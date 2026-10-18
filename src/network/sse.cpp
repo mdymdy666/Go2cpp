@@ -402,9 +402,26 @@ Result Parser::feed(std::string_view bytes, std::vector<Event>& events) {
     }
 }
 
+/**
+ * @brief `sse::Stream` 的跨线程取消状态。
+ *
+ * ## 定位
+ * `Stream` 的私有共享状态：Context 取消回调通过 `weak_ptr` 观察它，写路径
+ * 通过 `cancelled` 判断是否继续；只保存取消标记与用于唤醒写等待的 socket。
+ *
+ * ## 状态机
+ * 只有两态：`Running`（`cancelled == false`）与 `Cancelled`（`cancelled == true`，
+ * 置真后不复位）。`Stream` 自身的 Idle/Open/Closed/Failed 见
+ * `docs/state-machines/Stream.md`。
+ *
+ * ## 不变量
+ * - `cancelled` 只从 false 变 true；
+ * - `socket` 可为空（构造早期），使用前必须判空；
+ * - 回调只做原子置位与 `cancel_write()`，不持有 Stream 锁。
+ */
 struct Stream::State {
-    std::atomic<bool> cancelled{false};
-    net::Socket::Ptr socket;
+    std::atomic<bool> cancelled{false}; ///< 是否已取消；Context 回调置真，写路径/state() 读取
+    net::Socket::Ptr socket;            ///< 用于 cancel_write 的 socket 副本；构造时设置，回调判空后使用
 };
 
 Stream::Stream(net::Socket::Ptr socket, ContextPtr context, StreamOptions options)

@@ -80,23 +80,42 @@ bool ParseLevel(std::string_view text, Level* level) noexcept;
  * @brief 一条日志的结构化数据。
  * @details Formatter 和 Sink 只读取此对象；字符串字段不依赖调用方临时内存。
  */
+/**
+ * ## 定位
+ * `LogLine` 构造并填充，`LogFormatter`/`LogSink` 只读；是四层流水线（Filter →
+ * Formatter → Sink）之间唯一的数据契约。测试里也直接构造它验证 Formatter。
+ *
+ * ## 不变量
+ * - 所有字符串字段都是**自有拷贝**，不引用调用方的临时内存；
+ * - `timestamp_ms` 是 Unix epoch 毫秒；`line == 0` 表示未提供位置；
+ * - `thread_id`/`fiber_id` 由 `LogLine` 在构造时抓取，之后不再变化。
+ */
 struct LogRecord {
-    Level level{Level::Info};
-    std::string logger;
-    std::string message;
-    std::string file;
-    std::string function;
-    std::uint64_t timestamp_ms{0};
-    std::uint64_t thread_id{0};
-    std::uint64_t fiber_id{0};
-    std::uint64_t elapse_ms{0};
-    std::string thread_name;
-    int line{0};
+    Level level{Level::Info};  ///< 日志级别；LogLine 构造时写，MinimumLevelFilter 与 Formatter 读
+    std::string logger;  ///< 记录器名；LogLine 从 Logger::name() 拷贝，Formatter 输出
+    std::string message;  ///< 消息正文；LogLine 析构时从 ostringstream 取出，Formatter/Sink 只读
+    std::string file;  ///< 调用点源文件；由 GO2CPP_LOG_* 宏传入，Formatter 输出
+    std::string function;  ///< 调用点函数名；由宏传入，Formatter 的 {function} 读取
+    std::uint64_t timestamp_ms{0};  ///< Unix epoch 毫秒；LogLine 构造时抓取，{time} 使用
+    std::uint64_t thread_id{0};  ///< 线程 ID 哈希；LogLine 构造时抓取，{thread} 使用
+    std::uint64_t fiber_id{0};  ///< Fiber ID；当前由调用方填充，未填时为 0
+    std::uint64_t elapse_ms{0};  ///< 业务可填的耗时毫秒；Formatter 的 {elapse} 读取
+    std::string thread_name;  ///< 线程名；调用方可选填充，{thread_name} 读取
+    int line{0};  ///< 调用点行号；0 表示未提供，{line} 输出 0
 };
 
 /**
  * @brief 日志过滤器接口。
  * @details 在格式化前判断记录是否进入某个 LogItemWorker。
+ */
+/**
+ * ## 定位
+ * `LogItemWorker::Submit` 的第一阶段：在格式化之前决定记录是否进入输出。
+ * `MinimumLevelFilter` 是内置实现，`LoggerManager` 为默认 worker 创建它。
+ *
+ * ## 不变量
+ * - `Accept` 必须是**只读**且可并发调用（实现方自行保证线程安全）；
+ * - 返回 false 时，Worker 不再格式化，省掉字符串构造。
  */
 class LogFilter {
 public:
@@ -107,6 +126,15 @@ public:
 };
 
 /** @brief 按最小级别过滤日志记录的线程安全实现。 */
+/**
+ * ## 定位
+ * 默认过滤器：被 `LoggerManager::Get/Configure` 装进每个 File/Stdout worker，
+ * `Logger::SetLevel` 也会同步更新它，保证级别热更新立即生效。
+ *
+ * ## 不变量
+ * - `m_level` 是原子量，`Accept` 无锁读；
+ * - `Level::Off` 等于拒绝一切（`record.level >= Off` 不可能成立）。
+ */
 class MinimumLevelFilter final : public LogFilter {
 public:
     /** @brief 创建过滤器。@param level 允许的最低级别。 */
@@ -119,12 +147,21 @@ public:
     Level level() const noexcept { return m_level.load(std::memory_order_acquire); }
 
 private:
-    std::atomic<Level> m_level;
+    std::atomic<Level> m_level;  ///< 最低级别；构造/SetLevel 写，Accept 原子读
 };
 
 /**
  * @brief 日志文本格式化接口。
  * @details 将结构化 LogRecord 转为可写入 Sink 的文本。
+ */
+/**
+ * ## 定位
+ * `LogItemWorker::Submit` 的第二阶段：把 `LogRecord` 渲染成文本。默认实现是
+ * `PatternFormatter`，用户也可实现自定义 Formatter 或注册 `Item` 扩展字段。
+ *
+ * ## 不变量
+ * - `Format` 只读 `record`，不得修改它；
+ * - 同一个 Formatter 可能被多个 worker 共享，`Format` 必须可并发调用。
  */
 class LogFormatter {
 public:
@@ -140,6 +177,15 @@ public:
      * Item 对象在构造 PatternFormatter 时被创建，格式化热路径只调用 Format，
      * 不会再次解析字符串或访问注册表。
      */
+/**
+ * ## 定位
+ * `PatternFormatter` 的组成单元：每个占位符对应一个 `Item`，由工厂在构造时
+ * 创建一次；用户可继承它读取 `LogRecord` 的扩展字段并注册新格式项。
+ *
+ * ## 不变量
+ * - `Item` 构造完成后不再解析模式、不再访问注册表（热路径只调 `Format`）；
+ * - 派生类覆写 `Format` 或 `format` 之一即可；默认 `Format` 转调 `format`。
+ */
     class Item {
     public:
         using ptr = std::shared_ptr<Item>;
@@ -232,6 +278,15 @@ public:
 // 默认格式支持 {time} {level} {logger} {thread} {fiber} {file} {line}
 // {function} {message} 标记；未知标记会原样保留，便于用户逐步迁移格式。
 /** @brief 支持占位符模式的内置格式化器。 */
+/**
+ * ## 定位
+ * 默认格式化器：`LoggerManager::Get/Configure` 用它构造 File/Stdout worker；
+ * 配置项 `log.format` 就是它的占位符模式。
+ *
+ * ## 不变量
+ * - `m_items` 在构造后不可变，`Format` 只顺序调用；
+ * - 未知占位符原样保留并置 `m_error`，配置系统可据此拒绝错误模式。
+ */
 class PatternFormatter final : public LogFormatter {
 public:
     /** @brief 创建模式格式化器。@param pattern 占位符模式。 */
@@ -249,9 +304,9 @@ public:
     bool HasError() const noexcept { return m_error; }
 
 private:
-    std::string m_pattern;
-    std::vector<Item::ptr> m_items;
-    bool m_error{false};
+    std::string m_pattern;  ///< 占位符模式原文；构造时固定，pattern() 只读
+    std::vector<Item::ptr> m_items;  ///< 解析后的 Item 链；构造时生成，Format 顺序调用
+    bool m_error{false};  ///< 是否遇到未知/非法占位符；构造时写，HasError 读
 };
 
 
@@ -260,6 +315,18 @@ private:
 /**
  * @brief 日志输出目标接口。
  * @details Sink 负责线程安全地写入文件、标准流或外部日志系统。
+ */
+/**
+ * ## 定位
+ * 流水线末端：`LogItemWorker::Submit` 调用 `Write`；`BufferedSink` 以装饰器
+ * 形式包住具体 Sink，`FileSink`/`RotatingFileSink`/`StdoutSink`/`MemorySink`/
+ * `CallbackSink` 是内置实现。
+ *
+ * ## 不变量
+ * - 基类**不承诺线程安全**：是否需要内部锁由实现决定；`BufferedSink` 用
+ *   `m_io_mutex` 串行化对同一 Sink 的调用；
+ * - `WriteRaw` 默认返回 false，表示不支持批量，缓冲层会退化为逐条 `Write`；
+ * - `Flush`/`Reopen` 默认无操作/成功，简单 Sink 无需覆写。
  */
 class LogSink {
 public:
@@ -319,6 +386,20 @@ public:
  *   record 的完整信息）。对只使用 `formatted` 的 Sink 无影响；若某个 Sink
  *   依赖 `LogRecord` 的字段区分每一条，请让该 Sink 覆写 `WriteRaw` 或不要包缓冲。
  */
+/**
+ * ## 定位
+ * 可选装饰器：包在 `FileSink` 等真实 Sink 外层，把 N 条记录合并成一次批量写，
+ * 降低高并发日志的系统调用/锁开销。`LoggerManager` 默认不启用，调用方按需包装。
+ *
+ * ## 状态机
+ * 缓冲状态（空 / 累积中 / 达到阈值 / 刷新中 / 绕过）由 `Write`/`Flush`/
+ * `FlushBatch` 驱动，状态转化表见 `docs/state-machines/BufferedSink.md`。
+ *
+ * ## 不变量
+ * - 持 `m_mutex` 期间绝不调用底层 Sink；`m_io_mutex` 只在锁外获取；
+ * - 两把锁不嵌套，因此不存在锁序死锁；
+ * - `kByTime` 是惰性检查：没有新日志时不会自动刷，必须显式 `Flush()`。
+ */
 class BufferedSink final : public LogSink {
 public:
     /** @brief 刷新策略。 */
@@ -333,7 +414,7 @@ public:
     struct Config {
         /** @brief 触发刷新的缓冲字节数（kBySize / kBySizeOrTime 使用）。 */
         std::size_t capacity_bytes{64 * 1024};
-        FlushPolicy policy{FlushPolicy::kBySize};
+        FlushPolicy policy{FlushPolicy::kBySize};  ///< 刷新策略；ShouldFlushLocked 按它决定是否刷
         /** @brief 触发刷新的时间间隔（kByTime / kBySizeOrTime 使用）。 */
         std::chrono::milliseconds flush_interval{1000};
         /**
@@ -368,15 +449,15 @@ private:
     /// 锁外执行一次批量写。
     void FlushBatch(std::string batch, const LogRecord& last_record);
 
-    LogSink::ptr m_inner;
-    Config m_config;
+    LogSink::ptr m_inner;  ///< 底层 Sink；Write/Flush/Reopen 转发到它，不应为空
+    Config m_config;  ///< 缓冲配置拷贝；构造时固定，ShouldFlushLocked/Write 读
     /// 保护 m_buffer / m_last_flush。
-    mutable std::mutex m_mutex;
+    mutable std::mutex m_mutex;  ///< 保护 m_lines；Write/Snapshot/Clear 使用
     /// 串行化对 m_inner 的调用（不嵌套 m_mutex）。
     std::mutex m_io_mutex;
-    std::string m_buffer;
-    std::chrono::steady_clock::time_point m_last_flush;
-    std::atomic<std::size_t> m_flush_count{0};
+    std::string m_buffer;  ///< 待批量写出的文本；Write 追加，刷新时 swap 到局部变量
+    std::chrono::steady_clock::time_point m_last_flush;  ///< 上次刷新时间；ShouldFlushLocked 比较，刷新后更新
+    std::atomic<std::size_t> m_flush_count{0};  ///< 累计刷新批次数；FlushBatch 递增，诊断接口读取
 };
 
 /** @brief 写入普通文件的 Sink，使用互斥锁保护流对象。 */
@@ -409,6 +490,7 @@ public:
 protected:
     /// 日志文件路径；构造时固定，Reopen()/path() 使用。
     std::string m_path;
+    /// 保护 m_stream；Write/Flush/Reopen 在同一把锁内串行化。
     std::mutex m_mutex;
     /// 输出流；Reopen() 创建/替换，Write/Flush 使用，失败时为 nullptr。
     std::unique_ptr<std::ostream> m_stream;
@@ -450,26 +532,54 @@ private:
 };
 
 /** @brief 将日志写入标准输出的 Sink。 */
+/**
+ * ## 定位
+ * `LoggerManager` 在 `stdout_enabled` 为真时为每个 Logger 额外建一个 Stdout
+ * worker；examples 与测试也直接用它做可见输出。
+ *
+ * ## 不变量
+ * - 每个实例持有自己的 `m_mutex`，只保证同一 Sink 的写入不交错；
+ * - `std::cout` 是进程级共享资源，多个 Sink 实例之间仍可能交错。
+ */
 class StdoutSink final : public LogSink {
 public:
     /** @brief 线程安全地写入标准输出。 */
     void Write(const LogRecord& record, std::string_view formatted) override;
 
 private:
+    /// 串行化同一 Sink 实例的 stdout 写入；跨实例不共享此锁。
     std::mutex m_mutex;
 };
 
 /** @brief 将日志写入标准错误的 Sink。 */
+/**
+ * ## 定位
+ * 需要把错误日志与普通输出分流时使用（例如 CLI 的 `--quiet` 只保留 stderr）。
+ * 当前 `LoggerManager` 默认不创建它，由调用方手动装进 worker。
+ *
+ * ## 不变量
+ * 同 `StdoutSink`：实例内由 `m_mutex` 串行化，跨实例不保证顺序。
+ */
 class StderrSink final : public LogSink {
 public:
     /** @brief 线程安全地写入标准错误。 */
     void Write(const LogRecord& record, std::string_view formatted) override;
 
 private:
+    /// 串行化同一 Sink 实例的 stderr 写入；跨实例不共享此锁。
     std::mutex m_mutex;
 };
 
 /** @brief 保存日志文本到内存，主要用于测试和诊断。 */
+/**
+ * ## 定位
+ * 测试与诊断专用：把格式化文本留在内存里，`Snapshot()` 取快照断言；
+ * 不参与生产日志落盘。
+ *
+ * ## 不变量
+ * - `m_lines` 的读写都在 `m_mutex` 内；
+ * - 保存的是**格式化后的文本**，丢失 `LogRecord` 的结构化字段。
+ */
 class MemorySink final : public LogSink {
 public:
     /** @brief 追加一条日志到内存。 */
@@ -480,12 +590,21 @@ public:
     void Clear();
 
 private:
-    mutable std::mutex m_mutex;
-    std::vector<std::string> m_lines;
+    mutable std::mutex m_mutex;  ///< 保护 m_lines；Write/Snapshot/Clear 使用
+    std::vector<std::string> m_lines;  ///< 已保存的格式化文本；Write 追加，Snapshot 拷贝，Clear 清空
 };
 
 // 兼容 spdlog/fmt 等第三方系统的边界：调用方只需在回调里转发格式化文本。
 /** @brief 将日志转发给用户回调或第三方日志库的适配 Sink。 */
+/**
+ * ## 定位
+ * 与 spdlog/fmt 等第三方日志系统的桥：调用方在回调里转发文本即可，无需实现
+ * 完整 Sink。也便于测试注入自定义收集逻辑。
+ *
+ * ## 不变量
+ * - `m_callback` 构造后不可变，`Write` 不加锁；
+ * - 若回调访问共享状态，线程安全由回调自己负责（可能被多个日志线程并发调用）。
+ */
 class CallbackSink final : public LogSink {
 public:
     using Callback = std::function<void(const LogRecord&, std::string_view)>;
@@ -496,7 +615,7 @@ public:
     void Write(const LogRecord& record, std::string_view formatted) override;
 
 private:
-    Callback m_callback;
+    Callback m_callback;  ///< 用户回调；构造后不可变，Write 直接调用，线程安全由回调负责
 };
 
 /**
@@ -538,13 +657,23 @@ public:
 private:
     // 热路径只做一次原子 shared_ptr 读取。配置变更时生成新的快照，
     // 因此格式化器和 Sink 不会在每条日志上争用 Worker 配置锁。
+/**
+ * ## 定位
+ * `LogItemWorker` 的不可变配置快照：热路径只 `atomic_load` 一次，后续过滤/
+ * 格式化/写 Sink 都不再碰 `m_mutex`。
+ *
+ * ## 不变量
+ * - 发布后不再修改；`SetFilter`/`SetFormatter`/`SetSink` 复制-替换整个对象；
+ * - 三个指针都可能为空，`Submit` 会逐项检查。
+ */
     struct Snapshot {
-        LogFilter::ptr filter;
-        LogFormatter::ptr formatter;
-        LogSink::ptr sink;
+        LogFilter::ptr filter;  ///< 过滤阶段快照；Submit 先读它决定是否继续
+        LogFormatter::ptr formatter;  ///< 格式化器快照；过滤通过后调用 Format
+        LogSink::ptr sink;  ///< 输出目标快照；格式化后调用 Write
     };
-    mutable std::mutex m_mutex;
-    std::shared_ptr<const Snapshot> m_snapshot;
+    /// 保护快照替换；Submit 不取它，只有 SetFilter/SetFormatter/SetSink 使用。
+    mutable std::mutex m_mutex;  ///< 保护 m_lines；Write/Snapshot/Clear 使用
+    std::shared_ptr<const Snapshot> m_snapshot;  ///< 当前配置快照；atomic_load/store 读写，Submit 与 Set* 使用
 };
 
 /**
@@ -602,14 +731,15 @@ public:
 private:
     /// 记录器名；构造时固定，name()/LogRecord.logger 使用。
     std::string m_name;
-    mutable std::mutex m_mutex;
-    std::atomic<Level> m_level{Level::Warn};
-    std::vector<LogItemWorker::ptr> m_workers;
-    std::vector<LogItemWorker::ptr> m_default_workers;
-    std::vector<LogItemWorker::ptr> m_custom_workers;
+    /// 保护 m_workers/m_default_workers/m_custom_workers/m_parent 的修改；日志热路径不取它。
+    mutable std::mutex m_mutex;  ///< 保护 m_lines；Write/Snapshot/Clear 使用
+    std::atomic<Level> m_level{Level::Warn};  ///< 最低级别；SetLevel 写，ShouldLog/level 原子读
+    std::vector<LogItemWorker::ptr> m_workers;  ///< 默认 + 自定义 worker 的合并列表；仅在 m_mutex 内重建
+    std::vector<LogItemWorker::ptr> m_default_workers;  ///< 默认 worker；ConfigureDefaults/AddDefaultWorker 维护
+    std::vector<LogItemWorker::ptr> m_custom_workers;  ///< 自定义 worker；AddWorker/RemoveWorker/ClearWorkers 维护
     /// 父记录器（弱引用，避免环）；SetParent 写，Log 传播时读。
     std::weak_ptr<Logger> m_parent;
-    std::atomic<bool> m_propagate{false};
+    std::atomic<bool> m_propagate{false};  ///< 是否向父记录器传播；SetPropagate 写，Log 原子读
     // m_workers 只在配置时修改；日志线程通过原子快照无锁读取。
     /// worker 列表快照；配置变更时整体替换，Log/Flush 原子读取。
     std::shared_ptr<const std::vector<LogItemWorker::ptr>> m_worker_snapshot;
@@ -651,19 +781,20 @@ public:
 
 private:
     LoggerManager();
+    /// 保护 m_loggers/m_root/默认配置；Get/Configure/Remove/List 使用。
     mutable std::mutex m_mutex;
     /// 已注册 Logger；Get/Remove/List 在 m_mutex 内读写。
     std::vector<Logger::ptr> m_loggers;
     /// 根记录器；构造时创建，其它 Logger 默认以它为父。
     Logger::ptr m_root;
-    Level m_level{Level::Warn};
-    bool m_stdout_enabled{false};
+    Level m_level{Level::Warn};  ///< 默认最低级别；Configure 写，Get 建新 Logger 时读
+    bool m_stdout_enabled{false};  ///< 默认是否追加 Stdout worker；Configure 写，Get 读
     /// 默认日志目录；Configure 写，Get 拼文件路径。
     std::string m_directory{"log"};
     /// 默认文件名；Configure 写，Get 拼文件路径。
     std::string m_file{"go2cpp.log"};
     /// 默认格式模式；为空时用 PatternFormatter 的内置默认值。
-    std::string m_pattern;
+    std::string m_pattern;  ///< 占位符模式原文；构造时固定，pattern() 只读
 };
 
 /**
@@ -695,7 +826,7 @@ private:
     Logger::ptr m_logger;
     /// 构造时填好级别/位置/时间，析构前补 message。
     LogRecord m_record;
-    std::ostringstream m_stream;
+    std::ostringstream m_stream;  ///< 消息拼接流；stream() 返回引用，析构时 str() 提交
     /// 级别是否通过；false 时析构不提交（但流仍可写）。
     bool m_enabled{false};
 };

@@ -108,10 +108,10 @@ namespace detail {
  * 引用计数开销，也不会形成环。
  */
 struct MetricInfo {
-    std::string name;
-    std::string help;
-    MetricType type{MetricType::kCounter};
-    std::vector<std::string> label_names;
+    std::string name;  ///< 指标名（不含 _bucket/_sum/_count）；注册时固定，Name() 读取
+    std::string help;  ///< HELP 文本；注册时固定，Render 输出
+    MetricType type{MetricType::kCounter};  ///< 指标类型；注册时固定，决定 Family 的具体类型
+    std::vector<std::string> label_names;  ///< 标签名顺序；With() 按此顺序校验取值，Render 输出标签键
 };
 
 }  // namespace detail
@@ -335,6 +335,12 @@ private:
  * - `m_bucket_count == Buckets().size() + 1`（末尾是隐式 `+Inf` 桶）；
  * - `Count()` 等于所有桶计数之和（NaN 不计入）；
  * - 桶边界构造后不可变，`CumulativeBucketCounts()` 单调不减。
+ */
+/**
+ * ## 状态机
+ * 指标族/序列的生命周期（根对象 → `With()` 建子序列 → `Observe()` 累计 →
+ * `AppendPrometheus()` 导出）见 `docs/state-machines/Histogram.md`。
+ * 关键函数：`With`、`Observe`、`CumulativeBucketCounts`、`Quantile`。
  */
 class Histogram final : public Metric {
 public:

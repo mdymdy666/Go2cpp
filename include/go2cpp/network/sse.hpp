@@ -227,6 +227,7 @@ enum class StreamState { Idle, Open, Closed, Failed };
  * ## 状态机
  * `Idle` -(start)-> `Open` -(close)-> `Closed`；任一次写失败 -> `Failed`。
  * 只有 `Open` 允许 `send()`/`comment()`/`tick()`；`close()` 幂等。
+ * 完整转化表见 `docs/state-machines/Stream.md`。
  *
  * ## 不变量
  * - `state()` 由 `m_failed`、Context 取消标记与 `m_writer.state()` 共同决定；
