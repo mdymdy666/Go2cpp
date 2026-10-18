@@ -446,6 +446,133 @@ void RunDistributionChecks() {
                   static_cast<double>(kPermTrials) / 52.0);
 }
 
+void RunNormalExpChecks() {
+    std::printf("[rand][normal] Int31 / Int31n / NormFloat64 / ExpFloat64\n");
+
+    // Int31 的范围与派生关系。
+    r::Rand generator(0x0BADC0DEULL);
+    bool int31_range_ok = true;
+    for (int i = 0; i < 1000000; ++i) {
+        const std::int32_t value = generator.Int31();
+        if (value < 0) {
+            int31_range_ok = false;
+            break;
+        }
+    }
+    Check(int31_range_ok, "Int31 in [0, 2^31)");
+    r::Rand int_left(42);
+    r::Rand int_right(42);
+    bool int31_relation_ok = true;
+    for (int i = 0; i < 100000; ++i) {
+        if (int_left.Int31() != static_cast<std::int32_t>(int_right.Int63() >> 32)) {
+            int31_relation_ok = false;
+            break;
+        }
+    }
+    Check(int31_relation_ok, "Int31 == int32(Int63 >> 32)");
+
+    // Int31n 的边界与均匀性。
+    Check(generator.Int31n(1) == 0, "Int31n(1) == 0");
+    Check(ThrowsInvalidArgument([] { r::Rand local(1); local.Int31n(0); }),
+          "Int31n(0) throws");
+    Check(ThrowsInvalidArgument([] { r::Rand local(1); local.Int31n(-1); }),
+          "Int31n(-1) throws");
+    std::vector<std::size_t> int31n(1000, 0);
+    constexpr int kDraws = 1000000;
+    for (int i = 0; i < kDraws; ++i) {
+        const std::int32_t value = generator.Int31n(1000);
+        if (value < 0 || value >= 1000) {
+            Check(false, "Int31n(1000) out of range");
+            break;
+        }
+        ++int31n[static_cast<std::size_t>(value)];
+    }
+    ReportBuckets("Int31n(1000), 1M draws", int31n,
+                  static_cast<double>(kDraws) / 1000.0);
+
+    // NormFloat64：均值/方差 + 两端覆盖 + 全部有限。
+    constexpr int kNormalDraws = 200000;
+    double norm_sum = 0.0;
+    double norm_square_sum = 0.0;
+    double norm_min = 1e9;
+    double norm_max = -1e9;
+    bool norm_finite = true;
+    for (int i = 0; i < kNormalDraws; ++i) {
+        const double value = generator.NormFloat64();
+        if (!std::isfinite(value)) {
+            norm_finite = false;
+            continue;
+        }
+        norm_sum += value;
+        norm_square_sum += value * value;
+        norm_min = std::min(norm_min, value);
+        norm_max = std::max(norm_max, value);
+    }
+    const double norm_mean = norm_sum / kNormalDraws;
+    const double norm_variance = norm_square_sum / kNormalDraws - norm_mean * norm_mean;
+    std::printf("[rand][normal] mean=%.6f variance=%.6f min=%.4f max=%.4f\n",
+                norm_mean, norm_variance, norm_min, norm_max);
+    Check(norm_finite, "NormFloat64 always finite");
+    Check(std::fabs(norm_mean) < 0.02, "NormFloat64 mean ~= 0");
+    Check(norm_variance > 0.95 && norm_variance < 1.05, "NormFloat64 variance ~= 1");
+    Check(norm_min < -3.0 && norm_max > 3.0, "NormFloat64 covers both tails");
+
+    // 缓存语义：Seed 必须清掉 Box–Muller 缓存的第二个值。
+    r::Rand cached(5);
+    (void)cached.NormFloat64();
+    cached.Seed(5);
+    r::Rand fresh(5);
+    Check(cached.NormFloat64() == fresh.NormFloat64(),
+          "Seed() clears the normal cache");
+    r::Rand deterministic_left(77);
+    r::Rand deterministic_right(77);
+    bool norm_deterministic = true;
+    for (int i = 0; i < 1000; ++i) {
+        if (deterministic_left.NormFloat64() != deterministic_right.NormFloat64()) {
+            norm_deterministic = false;
+            break;
+        }
+    }
+    Check(norm_deterministic, "NormFloat64 is deterministic for a fixed seed");
+
+    // ExpFloat64：均值/方差 + 非负 + 两端覆盖。
+    double exp_sum = 0.0;
+    double exp_square_sum = 0.0;
+    double exp_max = 0.0;
+    bool exp_ok = true;
+    for (int i = 0; i < kNormalDraws; ++i) {
+        const double value = generator.ExpFloat64();
+        if (!std::isfinite(value) || value < 0.0) {
+            exp_ok = false;
+            continue;
+        }
+        exp_sum += value;
+        exp_square_sum += value * value;
+        exp_max = std::max(exp_max, value);
+    }
+    const double exp_mean = exp_sum / kNormalDraws;
+    const double exp_variance = exp_square_sum / kNormalDraws - exp_mean * exp_mean;
+    std::printf("[rand][exp] mean=%.6f variance=%.6f max=%.4f\n", exp_mean,
+                exp_variance, exp_max);
+    Check(exp_ok, "ExpFloat64 always finite and non-negative");
+    Check(std::fabs(exp_mean - 1.0) < 0.02, "ExpFloat64 mean ~= 1");
+    Check(exp_variance > 0.95 && exp_variance < 1.05, "ExpFloat64 variance ~= 1");
+    Check(exp_max > 5.0, "ExpFloat64 covers the tail");
+
+    // 全局函数：播种后可复现，且范围正确。
+    r::Seed(20261018);
+    const double global_norm_a = r::NormFloat64();
+    const double global_exp_a = r::ExpFloat64();
+    const std::int32_t global_int31_a = r::Int31();
+    r::Seed(20261018);
+    Check(r::NormFloat64() == global_norm_a, "global NormFloat64 reproducible");
+    Check(r::ExpFloat64() == global_exp_a, "global ExpFloat64 reproducible");
+    Check(r::Int31() == global_int31_a, "global Int31 reproducible");
+    const std::int32_t global_int31n = r::Int31n(7);
+    Check(global_int31n >= 0 && global_int31n < 7, "global Int31n in range");
+    Check(ThrowsInvalidArgument([] { r::Int31n(0); }), "global Int31n(0) throws");
+}
+
 void RunReadChecks() {
     std::printf("[rand][read] 字节流语义（与 Go 的 readVal/readPos 对齐）\n");
 
@@ -818,6 +945,7 @@ int main() {
     RunSequenceChecks();
     RunBoundsChecks();
     RunDistributionChecks();
+    RunNormalExpChecks();
     RunReadChecks();
     RunGlobalChecks();
     RunRealScenarios();

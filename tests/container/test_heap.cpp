@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -340,6 +341,71 @@ void TestTemplateMoveOnly() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. 模板式 Heap 的 Fix / Remove（接口式之外的 C++ 习惯路径）
+// ---------------------------------------------------------------------------
+void TestTemplateFixAndRemove() {
+    go2cpp_container_test::Announce("heap: template Heap Fix / Remove");
+
+    container::Heap<int> heap;
+    for (const int value : {5, 3, 8, 1, 9, 2, 7}) {
+        heap.Push(value);
+    }
+    CONTAINER_CHECK(heap.Size() == 7);
+    CONTAINER_CHECK(heap.Top() == 1);
+
+    // 优先级变大：Top 改成 100 后下沉，新的最小值是 2。
+    heap.Top() = 100;
+    heap.Fix(0);
+    CONTAINER_CHECK(heap.Top() == 2);
+
+    // 优先级变小：Top 改成 -100 后上浮，仍是堆顶。
+    // 注意：此时堆顶是 2，把它改成 -100 会**覆盖** 2（这是修改元素值的语义，
+    // 不是插入），因此接下来 Remove 后新的最小值是 3。
+    heap.Top() = -100;
+    heap.Fix(0);
+    CONTAINER_CHECK(heap.Top() == -100);
+
+    // 越界 Fix 必须抛 std::out_of_range。
+    bool fix_threw = false;
+    try {
+        heap.Fix(heap.Size());
+    } catch (const std::out_of_range&) {
+        fix_threw = true;
+    }
+    CONTAINER_CHECK(fix_threw);
+
+    // Remove(0) 返回当前最小值，并减少元素数。
+    const int removed_top = heap.Remove(0);
+    CONTAINER_CHECK(removed_top == -100);
+    CONTAINER_CHECK(heap.Size() == 6);
+    CONTAINER_CHECK(heap.Top() == 3);
+
+    // Remove 一个中间下标：返回值必须真的来自该下标，且剩余仍是合法堆。
+    const std::size_t middle = heap.Size() / 2;
+    const int removed_middle = heap.Remove(middle);
+    CONTAINER_CHECK(heap.Size() == 5);
+    bool ordered = true;
+    int previous = std::numeric_limits<int>::min();
+    while (!heap.Empty()) {
+        const int value = heap.Pop();
+        if (value < previous) {
+            ordered = false;
+        }
+        previous = value;
+    }
+    CONTAINER_CHECK(ordered);
+    CONTAINER_CHECK(removed_middle >= 3);
+
+    bool remove_threw = false;
+    try {
+        (void)heap.Remove(0);
+    } catch (const std::out_of_range&) {
+        remove_threw = true;
+    }
+    CONTAINER_CHECK(remove_threw);
+}
+
+// ---------------------------------------------------------------------------
 // 5. 边界：空堆 Pop/Top、越界 Fix/Remove
 // ---------------------------------------------------------------------------
 void TestBoundaries() {
@@ -412,6 +478,7 @@ void RunHeapTests() {
     TestGoInterfaceSequence();
     TestInterfaceRemove();
     TestInterfaceFix();
+    TestTemplateFixAndRemove();
     TestTemplateHeapBasics();
     TestTemplateCustomComparator();
     TestTemplateMoveOnly();

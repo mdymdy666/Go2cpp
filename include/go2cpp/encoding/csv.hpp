@@ -23,9 +23,18 @@
  * - 固定逗号分隔（可 `SetComma` 改成其它单字节分隔符），不支持多字节 rune；
  * - `Reader` 从**内存中的完整文本**解析（构造时传入 `std::string`）；Go 的
  *   `io.Reader` 流式读取未实现 —— 调用方先读文件再构造即可；
- * - 未实现 `LazyQuotes`、`TrimLeadingSpace`、`Comment`、`ReuseRecord`、
- *   `Writer.Error` 等扩展开关；默认行为是**严格模式**（等价于这些开关全关）；
+ * - 已支持 `TrimLeadingSpace`（`SetTrimLeadingSpace`）与 `Comment`
+ *   （`SetComment`）；默认全关，等价于 Go 的零值 Reader；
  * - 不支持 UTF-8 BOM 自动剥离（Go 也不剥离）；首字段若带 BOM 会原样保留。
+ *
+ * ## 已知未支持项及原因（C 类，有意不做）
+ *
+ * | 未支持项 | 原因 |
+ * |---|---|
+ * | `LazyQuotes` | Go 特有的宽松模式（允许非引号字段里的裸 `"`、引号字段里落单的 `"`）。它会让同一个文件在不同解析器里得到不同结果，本模块刻意只保留严格模式；需要容错时应在数据源侧修数据。 |
+ * | `ReuseRecord` | Go 的性能优化：把上一条记录复用为缓冲区，减少分配。C++ 侧 `Read()` 返回值语义是「调用方拥有」，复用会引入别名陷阱；需要省分配时由调用方复用 `CsvReadResult` 变量即可。 |
+ * | `Writer.Error` | Go 的 `Writer` 包装 `io.Writer` 后需要 `Error()` 报告延迟写入错误；本实现的 `CsvWriter` 只写内存 `std::string`，没有可失败的底层 IO，`Write` 恒返回 `nullptr`（见其注释）。 |
+ * | `Reader` 从 `io.Reader` 流式解析 | 本模块构造时持有完整文本（`std::string`）；流式解析需要 `bufio.Reader` 级别的增量状态机，属于后续扩展。当前调用方先读文件再构造即可。 |
  *
  * ## 关键语义（与 Go 对齐）
  *
@@ -125,6 +134,31 @@ class CsvReader {
     /// 当前期望字段数（`0`/`-1`/正整数）。
     int FieldsPerRecord() const noexcept { return m_fields_per_record; }
 
+    /**
+     * @brief 对应 Go `Reader.TrimLeadingSpace`：忽略每个字段开头的前导空白。
+     * @param enabled true 开启（默认 false）。
+     * @note 只处理 ASCII 空格与 `\t`（不含 Unicode 空白，见文件头 C 类清单中
+     *       对 `ScanWords`/rune 分类的同类说明）。引号字段内部不裁剪。
+     */
+    void SetTrimLeadingSpace(bool enabled) noexcept {
+        m_trim_leading_space = enabled;
+    }
+
+    /// 是否开启前导空白裁剪。
+    bool TrimLeadingSpace() const noexcept { return m_trim_leading_space; }
+
+    /**
+     * @brief 对应 Go `Reader.Comment`：以该字符开头的整行被忽略。
+     * @param comment 注释字符；传 `'\0'` 关闭注释功能。
+     * @return 合法返回 true；`'\r'`/`'\n'` 返回 false 且不修改
+     *         （Go 对非法注释符 panic，这里降级为 bool）。
+     * @note 注释判定发生在记录起始处；引号字段内部的 `#` 仍是普通内容。
+     */
+    bool SetComment(char comment) noexcept;
+
+    /// 当前注释字符；`'\0'` 表示关闭。
+    char Comment() const noexcept { return m_comment; }
+
     /// 下一次解析位置所在的行号（1 起）；仅用于诊断。
     std::size_t Line() const noexcept { return m_line; }
 
@@ -144,6 +178,8 @@ class CsvReader {
     std::size_t m_line = 1;
     int m_fields_per_record = 0;
     char m_comma;
+    bool m_trim_leading_space = false;
+    char m_comment = '\0';
     ErrorPtr m_error;
 };
 

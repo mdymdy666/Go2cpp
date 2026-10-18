@@ -58,10 +58,14 @@ Deflater::Deflater(int level, int window_bits, int mem_level)
   m_impl->stream.opaque = Z_NULL;
   m_impl->stream.next_in = Z_NULL;
   m_impl->stream.avail_in = 0;
-  // Z_DEFAULT_STRATEGY 是 Go flate 与 zlib 的默认策略；本模块不暴露策略参数。
+  // Go 的 HuffmanOnly(-2) 在 zlib 里不是合法 level，而是
+  // 「默认级别 + Z_HUFFMAN_ONLY 策略」；其余级别用默认策略。
+  const bool huffman_only = level == HuffmanOnly;
+  const int zlib_level = huffman_only ? Z_DEFAULT_COMPRESSION : level;
+  const int strategy = huffman_only ? Z_HUFFMAN_ONLY : Z_DEFAULT_STRATEGY;
   m_impl->initialized =
-      deflateInit2(&m_impl->stream, level, Z_DEFLATED, window_bits, mem_level,
-                   Z_DEFAULT_STRATEGY) == Z_OK;
+      deflateInit2(&m_impl->stream, zlib_level, Z_DEFLATED, window_bits,
+                   mem_level, strategy) == Z_OK;
 }
 
 Deflater::~Deflater() {
@@ -72,6 +76,22 @@ Deflater::~Deflater() {
 
 bool Deflater::ok() const noexcept {
   return m_impl && m_impl->initialized;
+}
+
+bool Deflater::Reset() noexcept {
+  if (!ok()) {
+    return false;
+  }
+  if (deflateReset(&m_impl->stream) != Z_OK) {
+    m_impl->initialized = false;
+    return false;
+  }
+  m_impl->stream.next_in = Z_NULL;
+  m_impl->stream.avail_in = 0;
+  m_impl->stream.next_out = Z_NULL;
+  m_impl->stream.avail_out = 0;
+  m_impl->produced = 0;
+  return true;
 }
 
 std::uint8_t* Deflater::output() noexcept {

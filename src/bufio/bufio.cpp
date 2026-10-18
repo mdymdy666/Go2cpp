@@ -62,6 +62,24 @@ ErrorPtr ErrInvalidAdvance() {
     return *kOwned;
 }
 
+ErrorPtr ErrInvalidUnreadByte() {
+    static const auto* const kOwned =
+        new ErrorPtr(NewError("bufio: invalid use of UnreadByte"));
+    return *kOwned;
+}
+
+ErrorPtr ErrInvalidUnreadRune() {
+    static const auto* const kOwned =
+        new ErrorPtr(NewError("bufio: invalid use of UnreadRune"));
+    return *kOwned;
+}
+
+ErrorPtr ErrFinalToken() {
+    static const auto* const kOwned =
+        new ErrorPtr(NewError("bufio: final token"));
+    return *kOwned;
+}
+
 SplitResult ScanLines(ByteSpan data, bool at_eof) {
     if (at_eof && data.empty()) {
         return SplitResult{};

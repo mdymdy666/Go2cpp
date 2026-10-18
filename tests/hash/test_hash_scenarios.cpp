@@ -30,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -44,6 +45,7 @@ class TempFile {
     explicit TempFile(const char* tag)
         : m_path(std::filesystem::temp_directory_path() /
                  (std::string("go2cpp_hash_") + tag + "_" +
+                  std::to_string(::getpid()) + "_" +
                   std::to_string(Clock::now().time_since_epoch().count()) +
                   ".bin")) {}
     ~TempFile() {

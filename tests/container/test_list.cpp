@@ -355,9 +355,73 @@ void TestClearAndLifetime() {
     CONTAINER_CHECK(no_default.Len() == 1);
 }
 
+// ---------------------------------------------------------------------------
+// 8. PushBackList / PushFrontList
+// ---------------------------------------------------------------------------
+void TestPushLists() {
+    go2cpp_container_test::Announce("list: PushBackList / PushFrontList");
+
+    container::List<std::string> base;
+    base.PushBack("a");
+    base.PushBack("b");
+
+    container::List<std::string> other;
+    other.PushBack("x");
+    other.PushBack("y");
+    other.PushBack("z");
+
+    base.PushBackList(other);
+    CheckOrder(base, std::vector<std::string>{"a", "b", "x", "y", "z"},
+               "PushBackList appends in order");
+    CheckOrder(other, std::vector<std::string>{"x", "y", "z"},
+               "PushBackList does not modify the source");
+
+    base.PushFrontList(other);
+    CheckOrder(base,
+               std::vector<std::string>{"x", "y", "z", "a", "b", "x", "y", "z"},
+               "PushFrontList prepends preserving order");
+
+    // 空源链表是 no-op。
+    container::List<std::string> empty;
+    base.PushBackList(empty);
+    base.PushFrontList(empty);
+    CheckOrder(base,
+               std::vector<std::string>{"x", "y", "z", "a", "b", "x", "y", "z"},
+               "empty Push*List is a no-op");
+
+    // 自引用：先取原长度再追加，不能无限增长。
+    container::List<int> self_back;
+    self_back.PushBack(1);
+    self_back.PushBack(2);
+    self_back.PushBack(3);
+    self_back.PushBackList(self_back);
+    CheckOrder(self_back, std::vector<int>{1, 2, 3, 1, 2, 3},
+               "PushBackList(self) duplicates once");
+
+    container::List<int> self_front;
+    self_front.PushBack(1);
+    self_front.PushBack(2);
+    self_front.PushBack(3);
+    self_front.PushFrontList(self_front);
+    CheckOrder(self_front, std::vector<int>{1, 2, 3, 1, 2, 3},
+               "PushFrontList(self) duplicates once");
+
+    // 与 Remove/Insert 组合后指针仍然稳定（顺带回归 Element* 语义）。
+    container::List<int> target;
+    container::List<int> source;
+    source.PushBack(10);
+    source.PushBack(20);
+    container::Element<int>* const anchor = target.PushBack(0);
+    target.PushBackList(source);
+    CheckOrder(target, std::vector<int>{0, 10, 20}, "PushBackList after PushBack");
+    CONTAINER_CHECK(anchor->Value == 0);
+    CONTAINER_CHECK(anchor->Next() != nullptr && anchor->Next()->Value == 10);
+}
+
 }  // namespace
 
 void RunListTests() {
+    TestPushLists();
     TestPushAndTraverse();
     TestInsert();
     TestRemove();

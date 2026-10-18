@@ -34,4 +34,17 @@ ErrorPtr ErrNegativeCount();
  */
 ErrorPtr ErrInvalidAdvance();
 
+/// 对应 `bufio.ErrInvalidUnreadByte`：最近一次操作不是 `ReadByte`，`UnreadByte` 非法。
+ErrorPtr ErrInvalidUnreadByte();
+
+/// 对应 `bufio.ErrInvalidUnreadRune`：最近一次操作不是 `ReadRune`，`UnreadRune` 非法。
+ErrorPtr ErrInvalidUnreadRune();
+
+/**
+ * @brief 对应 `bufio.ErrFinalToken`（Go 1.20+）。
+ * @details `SplitFunc` 在最后一个 token 上返回它：`Scan()` 仍交付该 token，
+ *          下一次调用返回 false 且 `Err()` 为**空**（不是错误）。
+ */
+ErrorPtr ErrFinalToken();
+
 }  // namespace go2cpp::bufio

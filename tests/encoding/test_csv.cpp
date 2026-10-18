@@ -347,4 +347,65 @@ void RunCsvTests() {
         ENCODING_CHECK(released == text);
         ENCODING_CHECK(writer.Str().empty());
     }
+
+    // ------------------------------------------------------------------
+    // TrimLeadingSpace：字段前（含逗号后）的空格/Tab 被裁掉。
+    // ------------------------------------------------------------------
+    go2cpp_encoding_test::Announce("csv: TrimLeadingSpace");
+    {
+        e::CsvReader plain("  a,   b\n\tc , d\n");
+        CheckRecord(plain.Read().record, {"  a", "   b"}, "default keeps spaces");
+
+        e::CsvReader trimmed("  a,   b\n\tc, d\n");
+        trimmed.SetTrimLeadingSpace(true);
+        ENCODING_CHECK(trimmed.TrimLeadingSpace());
+        CheckRecord(trimmed.Read().record, {"a", "b"}, "trim first record");
+        CheckRecord(trimmed.Read().record, {"c", "d"}, "trim second record");
+
+        // 引号字段内部的前导空格必须保留（只裁字段外部）。
+        e::CsvReader quoted("  \"  x  \", y\n");
+        quoted.SetTrimLeadingSpace(true);
+        CheckRecord(quoted.Read().record, {"  x  ", "y"}, "quoted keeps inner spaces");
+
+        // 只有空白的行：裁剪后是一个空字段，而不是空行（与 Go 一致）。
+        e::CsvReader spaces("   \n");
+        spaces.SetTrimLeadingSpace(true);
+        CheckRecord(spaces.Read().record, {""}, "spaces-only line yields one field");
+        ENCODING_CHECK(spaces.Read().eof);
+    }
+
+    // ------------------------------------------------------------------
+    // Comment：以注释字符开头的整行忽略；关闭后恢复为普通字段。
+    // ------------------------------------------------------------------
+    go2cpp_encoding_test::Announce("csv: Comment");
+    {
+        e::CsvReader reader("# comment\na,b\n  # not at start,x\n#tail\nc,d\n");
+        ENCODING_CHECK(reader.SetComment('#'));
+        ENCODING_CHECK(reader.Comment() == '#');
+        // 每条记录字段数不同（2/2/2），先关掉字段数校验以聚焦注释语义。
+        ENCODING_CHECK(reader.SetFieldsPerRecord(-1));
+        CheckRecord(reader.Read().record, {"a", "b"}, "record after comment");
+        CheckRecord(reader.Read().record, {"  # not at start", "x"},
+                    "comment char after spaces is data");
+        CheckRecord(reader.Read().record, {"c", "d"}, "comment between records");
+        ENCODING_CHECK(reader.Read().eof);
+
+        // 关闭注释（'\0'）后 '#' 是普通字段内容。
+        e::CsvReader plain("#x,y\n");
+        ENCODING_CHECK(plain.SetComment('\0'));
+        CheckRecord(plain.Read().record, {"#x", "y"}, "comment disabled");
+
+        // 非法注释符：CR/LF 拒绝，保持原值。
+        e::CsvReader invalid("a,b\n");
+        ENCODING_CHECK(invalid.SetComment('#'));
+        ENCODING_CHECK(!invalid.SetComment('\n'));
+        ENCODING_CHECK(!invalid.SetComment('\r'));
+        ENCODING_CHECK(invalid.Comment() == '#');
+
+        // 注释行与空白行交错时也要跳过。
+        e::CsvReader mixed("# c1\n\n# c2\n\na,b\n");
+        ENCODING_CHECK(mixed.SetComment('#'));
+        CheckRecord(mixed.Read().record, {"a", "b"}, "blank/comment interleaved");
+        ENCODING_CHECK(mixed.Read().eof);
+    }
 }

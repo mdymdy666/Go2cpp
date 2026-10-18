@@ -219,4 +219,54 @@ void RunBase64Tests() {
             ENCODING_CHECK_BYTES(decoded.data, all);
         }
     }
+
+    // ------------------------------------------------------------------
+    // Strict()：尾部填充位非零必须拒绝（Go 默认接受，Strict 才拒绝）。
+    // ------------------------------------------------------------------
+    go2cpp_encoding_test::Announce("base64: Strict() padding-bit checks");
+    const e::Base64Encoding strict = e::StdEncoding.Strict();
+    const e::Base64Encoding strict_raw = e::RawStdEncoding.Strict();
+    ENCODING_CHECK(strict.IsStrict());
+    ENCODING_CHECK(strict_raw.IsStrict());
+    ENCODING_CHECK(!e::StdEncoding.IsStrict());
+    ENCODING_CHECK(!e::RawStdEncoding.IsStrict());
+
+    // 默认仍接受（与 Go 默认一致），Strict 拒绝。
+    {
+        const auto lenient = e::StdEncoding.DecodeString("Zh==");
+        ENCODING_REQUIRE(lenient);
+        ENCODING_CHECK_BYTES(lenient.data, "f");
+        const auto strict_result = strict.DecodeString("Zh==");
+        ENCODING_CHECK(strict_result.error != nullptr);
+        ENCODING_CHECK(Is(strict_result.error, e::Base64CorruptInput()));
+        ExpectCorrupt(strict, "Zm9=", "strict: low 2 bits non-zero");
+        ExpectCorrupt(strict_raw, "Zh", "raw strict: low 4 bits non-zero");
+        ExpectCorrupt(strict_raw, "Zm9", "raw strict: low 2 bits non-zero");
+    }
+    // 合法输入在 Strict 下仍然通过。
+    {
+        struct StrictCase {
+            const char* encoded;
+            const char* plain;
+        };
+        const StrictCase cases[] = {{"", ""},   {"Zg==", "f"},
+                                    {"Zm8=", "fo"}, {"Zm9v", "foo"},
+                                    {"Zm9vYg==", "foob"}};
+        for (const StrictCase& item : cases) {
+            const auto result = strict.DecodeString(item.encoded);
+            ENCODING_REQUIRE(result);
+            ENCODING_CHECK_BYTES(result.data, item.plain);
+        }
+        const auto raw_ok = strict_raw.DecodeString("Zm9vYg");
+        ENCODING_REQUIRE(raw_ok);
+        ENCODING_CHECK_BYTES(raw_ok.data, "foob");
+    }
+    // Strict() 是副本：原实例不受影响，且可以继续链式派生出不同字母表的副本。
+    {
+        const e::Base64Encoding url_strict = e::URLEncoding.Strict();
+        ENCODING_CHECK(url_strict.IsStrict());
+        ENCODING_CHECK(!e::URLEncoding.IsStrict());
+        ENCODING_CHECK(url_strict.Padding() == '=');
+        ENCODING_CHECK(url_strict.Alphabet() == e::URLEncoding.Alphabet());
+    }
 }

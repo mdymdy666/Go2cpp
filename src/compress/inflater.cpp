@@ -83,6 +83,23 @@ bool Inflater::ok() const noexcept {
   return m_impl && m_impl->initialized;
 }
 
+bool Inflater::Reset() noexcept {
+  if (!ok()) {
+    return false;
+  }
+  // 复位后必须清掉旧输入指针/计数：继续指向 input 缓冲的旧位置会让下一次
+  // CommitInput 看到 avail_in != 0 而静默丢弃新数据。
+  if (inflateReset2(&m_impl->stream, m_impl->window_bits) != Z_OK) {
+    m_impl->initialized = false;
+    return false;
+  }
+  m_impl->stream.next_in = Z_NULL;
+  m_impl->stream.avail_in = 0;
+  m_impl->stream.next_out = Z_NULL;
+  m_impl->stream.avail_out = 0;
+  return true;
+}
+
 std::uint8_t* Inflater::input_buffer() noexcept {
   return m_impl ? m_impl->input.data() : nullptr;
 }

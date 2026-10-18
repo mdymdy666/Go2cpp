@@ -32,10 +32,16 @@
  *         跨平台逐位一致，因此把「1 ULP 内」作为验收边界；
  *       - `NaN()` 返回平台 libm 的 quiet NaN（x86_64 上为 `0x7ff8000000000000`），
  *         Go 的 `NaN()` 使用 `0x7FF8000000000001`；NaN 的 payload 不属于 Go 的 API 契约，
- *         本模块只保证 `IsNaN` 与符号位行为；
- *       - **未实现**（后续可补）：`Gamma`/`Lgamma`/`Erf`/`Erfc`/`J0`/`Y0` 等特殊函数、
- *         `MaxFloat32`/`SmallestNonzeroFloat32`、`Float32bits` 系列位操作、`Dim`/`CopySign` 之外的
- *         IEEE 754 分类辅助函数。
+ *         本模块只保证 `IsNaN` 与符号位行为。
+ *
+ *   ## 已知未支持项及原因（C 类，有意不做）
+ *
+ *   | 未支持项 | 不做的原因 |
+ *   |---|---|
+ *   | `Gamma`/`Lgamma`/`Erf`/`Erfc`/`J0`/`Y0`/`J1`/`Y1`（及 `*inc` 变体） | 特殊函数，纯 C++ 实现需数百行多项式/连分式，精度验收还要独立 oracle；`libm` 只有 `tgamma`/`lgamma`/`erf`/`erfc`/`j0` 等 GNU 扩展，边界语义（极点、负整数、NaN）与 Go 不完全一致。当前项目无调用场景，因此**不引入半成品**。需要时可单独引入 musl/SLEEF。 |
+ *   | `Dim`（`max(x-y, 0)` 且 NaN 传播） | 可用现有 `Max(x-y, 0)` 表达，没有兼容性风险，不单列 API。 |
+ *   | `Lgamma` 的符号输出（Go 的 `(lgamma, sign)` 双返回值） | 依赖上一行的特殊函数实现。 |
+ *   | FMA/汇编加速 | 编译器已为 `std::sqrt` 生成 `sqrtsd`；其余超越函数由系统 libm 选最优实现，自己写汇编收益小、可移植性差。 |
  *
  * @warning C++ 不允许同名函数与变量共存。为同时支持 Go 的函数调用 `Inf(sign)` 与
  *          常量式用法 `math.Inf`，本模块把 `Inf` 定义成**可调用常量对象**：
@@ -47,6 +53,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <limits>
 
 namespace go2cpp::math {
@@ -78,6 +85,10 @@ inline constexpr double Log10E = 0.434294481903251827651128918916605082294397005
 inline constexpr double MaxFloat64 = std::numeric_limits<double>::max();
 /// 最小非零 float64（Go `math.SmallestNonzeroFloat64`，bits = 0x0000000000000001）。
 inline constexpr double SmallestNonzeroFloat64 = std::numeric_limits<double>::denorm_min();
+/// 最大有限 float32（Go `math.MaxFloat32`，bits = 0x7f7fffff）。
+inline constexpr float MaxFloat32 = std::numeric_limits<float>::max();
+/// 最小非零 float32（Go `math.SmallestNonzeroFloat32`，bits = 0x00000001）。
+inline constexpr float SmallestNonzeroFloat32 = std::numeric_limits<float>::denorm_min();
 
 // ----------------------------------------------------------------------------
 // 整数边界（对应 Go math 包里的 MaxInt8 / MinInt8 / ... 常量）
@@ -164,6 +175,43 @@ bool Signbit(double x) noexcept;
 
 /// 对应 `math.Copysign`：返回 magnitude 为 `x`、符号为 `y` 的值。
 double Copysign(double x, double y) noexcept;
+
+// ----------------------------------------------------------------------------
+// 位级转换（对应 Go math 包的 Float32bits / Float32frombits / Float64bits /
+// Float64frombits）
+//
+// 用 std::memcpy 而不是 reinterpret_cast / union：严格别名规则下只有 memcpy
+// 是合法且可被优化器识别的“按位重解释”；x86/ARM 上都会编译成一次 mov。
+// 这四个函数**保留 NaN 的 payload 与符号位**，不做任何浮点运算。
+// ----------------------------------------------------------------------------
+
+/// 对应 `math.Float32bits`：返回 float32 的 IEEE-754 位模式。
+inline std::uint32_t Float32bits(float f) noexcept {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &f, sizeof(bits));
+    return bits;
+}
+
+/// 对应 `math.Float32frombits`：按位模式构造 float32（可为 NaN/Inf/次正规数）。
+inline float Float32frombits(std::uint32_t bits) noexcept {
+    float f = 0.0f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+/// 对应 `math.Float64bits`：返回 float64 的 IEEE-754 位模式。
+inline std::uint64_t Float64bits(double f) noexcept {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &f, sizeof(bits));
+    return bits;
+}
+
+/// 对应 `math.Float64frombits`：按位模式构造 float64（可为 NaN/Inf/次正规数）。
+inline double Float64frombits(std::uint64_t bits) noexcept {
+    double f = 0.0;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
 
 // ============================================================================
 // 基本运算

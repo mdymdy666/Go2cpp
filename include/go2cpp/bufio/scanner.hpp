@@ -134,6 +134,31 @@ public:
                 const ByteSpan window(m_buffer.data() + m_start, m_end - m_start);
                 const SplitResult result = m_split(window, m_err != nullptr);
                 if (result.error) {
+                    if (go2cpp::Is(result.error, ErrFinalToken())) {
+                        // Go 1.20+：SplitFunc 用 ErrFinalToken 声明「最后一个
+                        // token」。本次仍交付 token，下一次 Scan 返回 false 且
+                        // Err() 为空（哨兵本身不是错误）。
+                        if (result.token.data() != nullptr) {
+                            const std::uint8_t* const window_begin = window.data();
+                            const std::uint8_t* const window_end =
+                                window_begin + window.size();
+                            if (result.token.data() < window_begin ||
+                                result.token.data() + result.token.size() >
+                                    window_end) {
+                                SetErr(ErrInvalidAdvance());
+                                Shutdown();
+                                return false;
+                            }
+                            m_token = result.token;
+                        }
+                        // Go 的 readErr() 在把 atEOF=true 交给 SplitFunc 时
+                        // 已经把 EOF 消费掉；否则 Err() 会错误地返回 EOF。
+                        if (go2cpp::Is(m_err, streams::IoEof())) {
+                            m_err = {};
+                        }
+                        Shutdown();
+                        return true;
+                    }
                     SetErr(result.error);
                     Shutdown();
                     return false;
@@ -206,6 +231,20 @@ public:
 
     /// 终止原因；正常结束为空。
     const ErrorPtr& Err() const noexcept { return m_err; }
+
+    /**
+     * @brief 对应 Go `Scanner.Buffer` 的上限部分：设置单 token 最大字节数。
+     * @param max_token_size 新上限；小于当前缓冲尺寸时提升到缓冲尺寸。
+     * @note Go 的 `Buffer(buf, max)` 还允许调用方提供缓冲区复用；本实现的缓冲由
+     *       Scanner 独占（`std::vector`），因此只保留 `max` 语义，不复用外部内存
+     *       （见文件头「已知未支持项」）。
+     */
+    void Buffer(std::size_t max_token_size) noexcept {
+        m_max_token_size = std::max(m_buffer.size(), max_token_size);
+    }
+
+    /// 当前单 token 上限。
+    std::size_t MaxTokenSize() const noexcept { return m_max_token_size; }
 
     /// 替换切分函数（默认 `ScanLines`）。
     void SetSplit(SplitFunc split) { m_split = std::move(split); }

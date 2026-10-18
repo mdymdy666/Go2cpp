@@ -278,12 +278,35 @@ void TestWriterSemantics() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 空成员：流的最后一个成员恰好在输入耗尽处结束，第一次 Read 必须直接给 EOF。
+// 这是 ReaderEngine 的回归测试（修复前返回 (0, nil)，调用方会多空转一轮）。
+// ---------------------------------------------------------------------------
+void TestEmptyMemberEof() {
+  Announce("gzip: empty stream returns EOF on first Read");
+  ErrorPtr error;
+  const std::string compressed = CompressBytes(
+      Format::kGzip, std::string(), compress::DefaultCompression, &error);
+  COMPRESS_CHECK_NO_ERROR(error, "compress empty gzip");
+  COMPRESS_CHECK(!compressed.empty());
+
+  StringSource source(compressed);
+  compress::Gzip::Reader<StringSource> reader(source);
+  std::uint8_t buffer[64];
+  COMPRESS_CHECK(reader.Read(ByteSpan(buffer, sizeof(buffer))) == 0);
+  COMPRESS_CHECK(go2cpp::Is(reader.Err(), streams::IoEof()));
+  // 第二次仍是 EOF（粘性），不能变成「无错误」。
+  COMPRESS_CHECK(reader.Read(ByteSpan(buffer, sizeof(buffer))) == 0);
+  COMPRESS_CHECK(go2cpp::Is(reader.Err(), streams::IoEof()));
+}
+
 }  // namespace
 
 /// gzip 测试入口。
 void RunGzipTests() {
   Announce("=== gzip (RFC 1952) ===");
   TestHeaderAndTrailer();
+  TestEmptyMemberEof();
   TestLevels();
   TestChecksumTampering();
   TestTruncated();

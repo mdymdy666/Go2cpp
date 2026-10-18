@@ -76,6 +76,10 @@ class Deflater {
   /// `deflateInit2` 是否成功。
   bool ok() const noexcept;
 
+  /// 对应 Go `Resetter`：把 deflate 状态复位到「新流开始」。
+  /// @return 成功 true；失败时 `ok()` 变为 false。
+  bool Reset() noexcept;
+
   /// 输出缓冲起始地址（容量见 `output_capacity()`）。
   std::uint8_t* output() noexcept;
 
@@ -126,7 +130,9 @@ class WriterEngine {
    * @param window_bits `-15` / `15` / `31`。
    */
   WriterEngine(WriterT& destination, int level, int window_bits)
-      : m_destination(&destination) {
+      : m_destination(&destination),
+        m_level(level),
+        m_window_bits(window_bits) {
     if (!IsValidLevel(level)) {
       m_error = ErrInvalidLevel();
       return;
@@ -269,6 +275,32 @@ class WriterEngine {
   /// 是否已经成功或尝试过 `Close()`。
   bool Closed() const noexcept { return m_closed; }
 
+  /**
+   * @brief 对应 Go `Resetter.Reset`：复用 deflate 状态并改绑到新 sink。
+   * @details 不替旧 sink 补 `Close()`（与 Go 一致，见公开 Writer 的文档）。
+   *          参数非法或 zlib 复位失败时返回错误并把错误记为粘性。
+   */
+  ErrorPtr Reset(WriterT& destination) {
+    m_destination = &destination;
+    m_closed = false;
+    m_error = {};
+    if (!IsValidLevel(m_level)) {
+      m_error = ErrInvalidLevel();
+      return m_error;
+    }
+    if (!m_deflater) {
+      m_deflater.reset(new Deflater(m_level, m_window_bits, kMemoryLevel));
+      if (!m_deflater->ok()) {
+        m_error = ErrInternal();
+      }
+      return m_error;
+    }
+    if (!m_deflater->Reset()) {
+      m_error = ErrInternal();
+    }
+    return m_error;
+  }
+
  private:
   /// 把 deflate 输出缓冲里的字节全部写到 sink（处理短写与空写）。
   ErrorPtr Drain() {
@@ -301,6 +333,8 @@ class WriterEngine {
   }
 
   WriterT* m_destination;
+  int m_level;
+  int m_window_bits;
   std::unique_ptr<Deflater> m_deflater;
   bool m_closed{false};
   ErrorPtr m_error;

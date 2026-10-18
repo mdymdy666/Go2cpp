@@ -211,6 +211,68 @@ public:
         return Result<void>();
     }
 
+    /**
+     * @brief 对应 Go `Writer.ReadFrom`：从 `source` 一直读到 EOF 并写入本对象。
+     * @return 成功时为读取并接受的字节数；出错时为出错前已接受的字节数
+     *         （错误见 `Err()`）。EOF 视为正常结束。
+     * @note 数据先经过本 Writer 的缓冲：调用方仍需 `Flush()` 才能保证落地。
+     *       底层 Reader 连续 100 次返回 `(0, nil)` 时返回
+     *       `streams::IoErrNoProgress()`，避免挂死。
+     */
+    template <typename SourceT>
+    Result<std::size_t> ReadFrom(SourceT& source) {
+        if (m_err) {
+            return Result<std::size_t>(m_err);
+        }
+        std::size_t total = 0;
+        std::uint8_t chunk[4096];
+        std::size_t empty_reads = 0;
+        for (;;) {
+            const streams::ReadResult result =
+                source.Read(reinterpret_cast<char*>(chunk), sizeof(chunk));
+            if (result.count > sizeof(chunk)) {
+                // io.Reader 契约要求 n <= len(p)。谎报更大的 n 会让我们
+                // 越界读栈缓冲，必须拒绝而不是信任。
+                return Result<std::size_t>(total, streams::IoErrShortWrite());
+            }
+            if (result.count > 0) {
+                empty_reads = 0;
+                total += Write(ByteSpan(chunk, result.count));
+                if (m_err) {
+                    return Result<std::size_t>(total, m_err);
+                }
+                if (result.error) {
+                    // 「数据 + 错误」：数据已交付，错误在下一轮返回。
+                    if (go2cpp::Is(result.error, streams::IoEof())) {
+                        return Result<std::size_t>(total);
+                    }
+                    return Result<std::size_t>(total, result.error);
+                }
+                continue;
+            }
+            if (result.error) {
+                if (go2cpp::Is(result.error, streams::IoEof())) {
+                    return Result<std::size_t>(total);
+                }
+                return Result<std::size_t>(total, result.error);
+            }
+            if (++empty_reads >= kMaxConsecutiveEmptyReads) {
+                return Result<std::size_t>(total, streams::IoErrNoProgress());
+            }
+        }
+    }
+
+    /**
+     * @brief 对应 Go `Writer.Reset`：改绑到新目标并**丢弃**未刷出的缓冲数据。
+     * @warning 与 Go 完全一致：缓冲里尚未 `Flush()` 的字节会被丢弃，不会写往
+     *          旧目标。粘性错误也会被清除。
+     */
+    void Reset(WriterT& destination) noexcept {
+        m_destination = &destination;
+        m_n = 0;
+        m_err = {};
+    }
+
     /// 缓冲区中尚未写出的字节数。
     std::size_t Buffered() const noexcept { return m_n; }
 

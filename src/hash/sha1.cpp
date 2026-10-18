@@ -104,8 +104,12 @@ void Sha1::Write(ByteSpan p) {
             std::memcpy(m_buffer + m_buffer_len, data, take);
         }
         m_buffer_len += take;
-        data += take;
-        remaining -= take;
+        // 空 Write 时 p.data() 可以是 nullptr；C++ 对 nullptr 做 `+ 0`
+        // 也是未定义行为，因此只有真的拷贝了字节才推进指针。
+        if (take != 0) {
+            data += take;
+            remaining -= take;
+        }
         if (m_buffer_len == kBlockSize) {
             Transform(m_buffer);
             m_buffer_len = 0;

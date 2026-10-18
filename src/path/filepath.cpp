@@ -662,6 +662,103 @@ bool IsAbs(std::string_view path) {
 #endif
 }
 
+std::vector<std::string> SplitList(std::string_view path) {
+    std::vector<std::string> result;
+    if (path.empty()) {
+        return result;
+    }
+    std::size_t start = 0;
+    for (;;) {
+        const std::size_t separator = path.find(ListSeparator, start);
+        if (separator == std::string_view::npos) {
+            result.emplace_back(path.substr(start));
+            return result;
+        }
+        result.emplace_back(path.substr(start, separator - start));
+        start = separator + 1;
+    }
+}
+
+std::string VolumeName(std::string_view path) {
+#ifdef _WIN32
+    return std::string(path.substr(0, WinVolumeLen(path)));
+#else
+    (void)path;
+    return {};
+#endif
+}
+
+std::string ToSlash(std::string_view path) {
+#ifdef _WIN32
+    std::string out(path);
+    for (char& c : out) {
+        if (c == '\\') {
+            c = '/';
+        }
+    }
+    return out;
+#else
+    return std::string(path);
+#endif
+}
+
+std::string FromSlash(std::string_view path) {
+#ifdef _WIN32
+    std::string out(path);
+    for (char& c : out) {
+        if (c == '/') {
+            c = '\\';
+        }
+    }
+    return out;
+#else
+    return std::string(path);
+#endif
+}
+
+bool IsLocal(std::string_view path) {
+    if (path.empty() || IsAbs(path)) {
+        return false;
+    }
+#ifdef _WIN32
+    const auto is_separator = [](char c) noexcept {
+        return c == '\\' || c == '/';
+    };
+#else
+    const auto is_separator = [](char c) noexcept { return c == '/'; };
+#endif
+    bool has_dot_segment = false;
+    for (std::size_t start = 0;;) {
+        std::size_t separator = start;
+        while (separator < path.size() && !is_separator(path[separator])) {
+            ++separator;
+        }
+        const std::string_view part = path.substr(start, separator - start);
+        if (part == "." || part == "..") {
+            has_dot_segment = true;
+            break;
+        }
+        if (separator == path.size()) {
+            break;
+        }
+        start = separator + 1;
+    }
+    const std::string cleaned = has_dot_segment ? Clean(path) : std::string(path);
+    if (cleaned == "..") {
+        return false;
+    }
+    // Go 的 `!strings.HasPrefix(path, "../")`：注意是 `../` 而不是 `/..`。
+    return cleaned.rfind(std::string("..") + Separator, 0) != 0;
+}
+
+std::string Localize(std::string_view path) {
+#ifdef _WIN32
+    return std::string(path.substr(WinVolumeLen(path)));
+#else
+    return std::string(path);
+#endif
+}
+
 std::string JoinElements(std::initializer_list<std::string_view> elems) {
 #ifdef _WIN32
     auto it = elems.begin();
@@ -760,22 +857,6 @@ bool Abs(std::string_view path, std::string* out, std::string* error) {
     return true;
 #endif
 }
-
-namespace {
-
-#ifdef _WIN32
-
-std::string VolumeName(std::string_view path) {
-    return std::string(path.substr(0, WinVolumeLen(path)));
-}
-
-#else
-
-std::string VolumeName(std::string_view /*path*/) { return {}; }
-
-#endif
-
-}  // namespace
 
 bool Rel(std::string_view base_path, std::string_view target_path,
          std::string* out, std::string* error) {

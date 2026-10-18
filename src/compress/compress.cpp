@@ -25,6 +25,8 @@ static_assert(Flate::BestCompression == BestCompression,
               "Flate::BestCompression 必须与 compress::BestCompression 一致");
 static_assert(Flate::DefaultCompression == DefaultCompression,
               "Flate::DefaultCompression 必须与 compress::DefaultCompression 一致");
+static_assert(Flate::HuffmanOnly == HuffmanOnly,
+              "Flate::HuffmanOnly 必须与 compress::HuffmanOnly 一致");
 
 static_assert(Zlib::NoCompression == NoCompression,
               "Zlib::NoCompression 必须与 compress::NoCompression 一致");
@@ -34,6 +36,8 @@ static_assert(Zlib::BestCompression == BestCompression,
               "Zlib::BestCompression 必须与 compress::BestCompression 一致");
 static_assert(Zlib::DefaultCompression == DefaultCompression,
               "Zlib::DefaultCompression 必须与 compress::DefaultCompression 一致");
+static_assert(Zlib::HuffmanOnly == HuffmanOnly,
+              "Zlib::HuffmanOnly 必须与 compress::HuffmanOnly 一致");
 
 static_assert(Gzip::NoCompression == NoCompression,
               "Gzip::NoCompression 必须与 compress::NoCompression 一致");
@@ -43,12 +47,15 @@ static_assert(Gzip::BestCompression == BestCompression,
               "Gzip::BestCompression 必须与 compress::BestCompression 一致");
 static_assert(Gzip::DefaultCompression == DefaultCompression,
               "Gzip::DefaultCompression 必须与 compress::DefaultCompression 一致");
+static_assert(Gzip::HuffmanOnly == HuffmanOnly,
+              "Gzip::HuffmanOnly 必须与 compress::HuffmanOnly 一致");
 
 static_assert(IsValidLevel(DefaultCompression), "DefaultCompression 必须合法");
 static_assert(IsValidLevel(NoCompression), "NoCompression 必须合法");
 static_assert(IsValidLevel(BestSpeed), "BestSpeed 必须合法");
 static_assert(IsValidLevel(BestCompression), "BestCompression 必须合法");
+static_assert(IsValidLevel(HuffmanOnly), "HuffmanOnly(-2) 必须合法");
 static_assert(!IsValidLevel(BestCompression + 1), "10 必须非法");
-static_assert(!IsValidLevel(DefaultCompression - 1), "-2 未暴露，必须非法");
+static_assert(!IsValidLevel(HuffmanOnly - 1), "-3 必须非法");
 
 }  // namespace go2cpp::compress

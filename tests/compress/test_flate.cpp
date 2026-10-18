@@ -156,7 +156,8 @@ void TestInvalidLevel() {
   COMPRESS_CHECK_ERROR(writer.Close(), compress::ErrInvalidLevel(), "close level");
   COMPRESS_CHECK(sink.data().empty());
 
-  Flate::Writer<StringSink> low(sink, -2);  // Go 的 HuffmanOnly，本模块不支持
+  // -2 是 Go 的 HuffmanOnly（本模块已支持，见 TestHuffmanOnly）；-3 才非法。
+  Flate::Writer<StringSink> low(sink, compress::HuffmanOnly - 1);
   COMPRESS_CHECK_ERROR(low.Err(), compress::ErrInvalidLevel(), "negative level");
 }
 
@@ -280,12 +281,123 @@ void TestStreamsAdapter() {
   COMPRESS_CHECK(output == input);
 }
 
+// ---------------------------------------------------------------------------
+// HuffmanOnly(-2)：合法级别，映射到 zlib 的 Z_HUFFMAN_ONLY 策略。
+// ---------------------------------------------------------------------------
+void TestHuffmanOnly() {
+  Announce("flate: HuffmanOnly (-2) round-trip");
+  const std::string input = MakeLogText(100U * 1024U, 77);
+
+  ErrorPtr error;
+  const std::string compressed =
+      CompressBytes(Format::kFlate, input, compress::HuffmanOnly, &error);
+  COMPRESS_CHECK_NO_ERROR(error, "HuffmanOnly compress");
+  COMPRESS_CHECK(!compressed.empty());
+
+  ErrorPtr decompress_error;
+  const std::string output =
+      DecompressBytes(Format::kFlate, compressed, &decompress_error);
+  COMPRESS_CHECK_NO_ERROR(decompress_error, "HuffmanOnly decompress");
+  COMPRESS_CHECK(output == input);
+
+  // 只做 Huffman、不做 LZ77：对重复日志文本必须比默认级别大。
+  ErrorPtr default_error;
+  const std::string defaulted = CompressBytes(
+      Format::kFlate, input, compress::DefaultCompression, &default_error);
+  COMPRESS_CHECK_NO_ERROR(default_error, "default compress");
+  COMPRESS_CHECK(compressed.size() > defaulted.size());
+  std::printf("[compress] HuffmanOnly size=%zu, default size=%zu\n",
+              compressed.size(), defaulted.size());
+
+  // 三个格式的常量都指向同一个 -2，且都能往返。
+  COMPRESS_CHECK(compress::Flate::HuffmanOnly == -2);
+  COMPRESS_CHECK(compress::Zlib::HuffmanOnly == -2);
+  COMPRESS_CHECK(compress::Gzip::HuffmanOnly == -2);
+
+  ErrorPtr zlib_error;
+  const std::string zlib_compressed =
+      CompressBytes(Format::kZlib, input, compress::Zlib::HuffmanOnly,
+                    &zlib_error);
+  COMPRESS_CHECK_NO_ERROR(zlib_error, "zlib HuffmanOnly compress");
+  ErrorPtr zlib_decompress_error;
+  COMPRESS_CHECK(DecompressBytes(Format::kZlib, zlib_compressed,
+                                 &zlib_decompress_error) == input);
+  COMPRESS_CHECK_NO_ERROR(zlib_decompress_error, "zlib HuffmanOnly decompress");
+
+  ErrorPtr gzip_error;
+  const std::string gzip_compressed =
+      CompressBytes(Format::kGzip, input, compress::Gzip::HuffmanOnly,
+                    &gzip_error);
+  COMPRESS_CHECK_NO_ERROR(gzip_error, "gzip HuffmanOnly compress");
+  ErrorPtr gzip_decompress_error;
+  COMPRESS_CHECK(DecompressBytes(Format::kGzip, gzip_compressed,
+                                 &gzip_decompress_error) == input);
+  COMPRESS_CHECK_NO_ERROR(gzip_decompress_error, "gzip HuffmanOnly decompress");
+}
+
+// ---------------------------------------------------------------------------
+// Resetter：复用 zlib 状态跨流，Reader/Writer 各验证一次。
+// ---------------------------------------------------------------------------
+void TestResetter() {
+  Announce("gzip: Resetter (Writer::Reset / Reader::Reset)");
+  std::string first = "gzip-first-payload";
+  std::string second = "gzip-second-payload";
+
+  StringSink sink_a;
+  StringSink sink_b;
+  {
+    compress::Gzip::Writer<StringSink> writer(sink_a);
+    COMPRESS_CHECK(writer.Write(ByteSpan(
+                       reinterpret_cast<std::uint8_t*>(first.data()),
+                       first.size())) == first.size());
+    COMPRESS_CHECK_NO_ERROR(writer.Close(), "first stream close");
+    COMPRESS_CHECK_NO_ERROR(writer.Reset(sink_b), "writer Reset");
+    COMPRESS_CHECK(!writer.Closed());
+    COMPRESS_CHECK(writer.Write(ByteSpan(
+                       reinterpret_cast<std::uint8_t*>(second.data()),
+                       second.size())) == second.size());
+    COMPRESS_CHECK_NO_ERROR(writer.Close(), "second stream close");
+  }
+
+  ErrorPtr error_a;
+  COMPRESS_CHECK(DecompressBytes(Format::kGzip, sink_a.data(), &error_a) ==
+                 first);
+  COMPRESS_CHECK_NO_ERROR(error_a, "first sink decompress");
+  ErrorPtr error_b;
+  COMPRESS_CHECK(DecompressBytes(Format::kGzip, sink_b.data(), &error_b) ==
+                 second);
+  COMPRESS_CHECK_NO_ERROR(error_b, "second sink decompress");
+
+  // Reader::Reset：同一个 Reader 对象连续解两个独立流。
+  ErrorPtr compress_error;
+  const std::string compressed_a = CompressBytes(
+      Format::kGzip, first, compress::DefaultCompression, &compress_error);
+  COMPRESS_CHECK_NO_ERROR(compress_error, "compress first stream");
+  const std::string compressed_b = CompressBytes(
+      Format::kGzip, second, compress::DefaultCompression, &compress_error);
+  COMPRESS_CHECK_NO_ERROR(compress_error, "compress second stream");
+
+  StringSource source_a(compressed_a);
+  compress::Gzip::Reader<StringSource> reader(source_a);
+  ErrorPtr read_error;
+  COMPRESS_CHECK(DrainReader(reader, 8, &read_error) == first);
+  COMPRESS_CHECK_NO_ERROR(read_error, "reader first stream");
+
+  StringSource source_b(compressed_b);
+  COMPRESS_CHECK_NO_ERROR(reader.Reset(source_b), "reader Reset");
+  read_error = {};
+  COMPRESS_CHECK(DrainReader(reader, 8, &read_error) == second);
+  COMPRESS_CHECK_NO_ERROR(read_error, "reader second stream");
+}
+
 }  // namespace
 
 /// flate 测试入口。
 void RunFlateTests() {
   Announce("=== flate (raw deflate) ===");
   TestLevels();
+  TestHuffmanOnly();
+  TestResetter();
   TestBoundaries();
   TestChunkedIo();
   TestFlush();

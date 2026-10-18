@@ -73,6 +73,10 @@ class Inflater {
   /// `inflateInit2` 是否成功。
   bool ok() const noexcept;
 
+  /// 对应 Go `Resetter`：把 inflate 状态复位到「等待新流头部」。
+  /// @return 成功 true；失败时 `ok()` 变为 false。
+  bool Reset() noexcept;
+
   /// 输入缓冲的起始地址（有效容量见 `input_capacity()`）。
   std::uint8_t* input_buffer() noexcept;
 
@@ -197,7 +201,10 @@ class ReaderEngine {
         // 当前成员结束、缓冲已空：必须再向源要一次数据，才能区分
         // 「这是最后一个成员」和「后面还跟着一个成员」。
         if (!Refill(true)) {
-          break;
+          // 不能直接 break：源恰好在本成员结束处耗尽时，break 会让本次
+          // `Read` 返回 (0, nil)（而不是 io.EOF）。回到循环顶部，由
+          // `m_stream_end` / `m_error` 统一决定返回值。
+          continue;
         }
         m_inflater.ResetForNextMember();
         continue;
@@ -215,6 +222,19 @@ class ReaderEngine {
   /// 粘性错误；正常结束时为 `streams::IoEof()`。
   const ErrorPtr& Err() const noexcept { return m_error; }
 
+  /// 对应 Go `Resetter.Reset`：复位解压状态并把源改绑到 `source`。
+  /// @details 清空 EOF/多成员/粘性错误；zlib 状态复位失败时写 `ErrInternal()`。
+  void Reset(ReaderT& source) {
+    m_source = &source;
+    m_source_eof = false;
+    m_stream_end = false;
+    m_deferred_error = {};
+    m_error = {};
+    if (!m_inflater.Reset()) {
+      m_error = ErrInternal();
+    }
+  }
+
   /// 切换多成员模式（仅 `Gzip::Reader` 公开）。
   void SetMultistream(bool enabled) noexcept { m_multistream = enabled; }
 
@@ -230,6 +250,9 @@ class ReaderEngine {
    *   （`ErrUnexpectedEof`）；成员刚结束就耗尽 → 正常 EOF。
    */
   bool Refill(bool after_member_end) {
+    if (m_error) {
+      return false;
+    }
     if (m_deferred_error) {
       m_error = m_deferred_error;
       return false;

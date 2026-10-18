@@ -13,11 +13,13 @@
  */
 #include "hash_test_support.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <memory>
 #include <vector>
 
 using namespace go2cpp::hash;
@@ -100,6 +102,94 @@ void CheckSha256Vectors() {
     HASH_CHECK_HEX(
         "sha256(1M a)", AsBytes(digest),
         "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+void CheckSha512Vectors() {
+    go2cpp_hash_test::Announce("SHA-512 FIPS 180-4 vectors");
+    const Vector vectors[] = {
+        {"",
+         "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce"
+         "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"},
+        {"abc",
+         "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+         "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"},
+        {"message digest",
+         "107dbf389d9e9f71a3a95f6c055b9251bc5268c2be16d6c13492ea45b0199f33"
+         "09e16455ab1e96118e8a905d5597b72038ddb372a89826046de66687bb420e7c"},
+        {"abcdefghijklmnopqrstuvwxyz",
+         "4dbff86cc2ca1bae1e16468a05cb9881c97f1753bce3619034898faa1aabe429"
+         "955a1bf8ec483d7421fe3c1646613a59ed5441fb0f321389f77f48a879c7b1f1"},
+        {"The quick brown fox jumps over the lazy dog",
+         "07e547d9586f6a73f73fbac0435ed76951218fb7d0c8d788a309d785436bbb64"
+         "2e93a252a954f23912547d1e8a3b5ed6e1bfd7097821233fa0538f3db854fee6"},
+        {"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+         "204a8fc6dda82f0a0ced7beb8e08a41657c16ef468b228a8279be331a703c335"
+         "96fd15c13b1b07f9aa1d3bea57789ca031ad85c7a71dd70354ec631238ca3445"},
+        {"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmno"
+         "ijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+         "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018"
+         "501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"},
+    };
+    for (const Vector& vector : vectors) {
+        const auto digest = Sha512::Digest(AsBytes(std::string_view(vector.input)));
+        HASH_CHECK_HEX("sha512 vector", AsBytes(digest), vector.digest);
+    }
+
+    const std::string million(1000000, 'a');
+    HASH_CHECK_HEX(
+        "sha512(1M a)", AsBytes(Sha512::Digest(AsBytes(million))),
+        "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973eb"
+        "de0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b");
+
+    // 接口语义：Size/BlockSize、Sum 不改变状态、Reset、分块 Write。
+    HASH_CHECK(Sha512().Size() == 64);
+    HASH_CHECK(Sha512().BlockSize() == 128);
+
+    Sha512 pure;
+    pure.Write(AsBytes(std::string_view("abc")));
+    const std::vector<std::uint8_t> first = pure.Sum();
+    const std::vector<std::uint8_t> second = pure.Sum();
+    HASH_CHECK(first == second);
+    HASH_CHECK(go2cpp_hash_test::Hex(AsBytes(first)) ==
+               "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+               "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+    pure.Write(AsBytes(std::string_view("def")));
+    HASH_CHECK(go2cpp_hash_test::Hex(AsBytes(pure.Sum())) ==
+               go2cpp_hash_test::DigestHex<Sha512>(
+                   AsBytes(std::string_view("abcdef"))));
+
+    Sha512 reusable;
+    reusable.Write(AsBytes(std::string_view("garbage")));
+    reusable.Reset();
+    reusable.Write(AsBytes(std::string_view("abc")));
+    HASH_CHECK(go2cpp_hash_test::Hex(AsBytes(reusable.Sum())) ==
+               "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+               "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+
+    // 分块写入：1/7/127/128/129 字节块必须与一次写入一致。
+    const std::vector<std::uint8_t> generated =
+        go2cpp_hash_test::Generate(10000, 0x512ULL);
+    const std::string payload(generated.begin(), generated.end());
+    const std::string expected =
+        go2cpp_hash_test::DigestHex<Sha512>(AsBytes(std::string_view(payload)));
+    for (const std::size_t chunk : {std::size_t{1}, std::size_t{7},
+                                    std::size_t{127}, std::size_t{128},
+                                    std::size_t{129}}) {
+        Sha512 chunked;
+        for (std::size_t offset = 0; offset < payload.size(); offset += chunk) {
+            const std::size_t length =
+                std::min(chunk, payload.size() - offset);
+            chunked.Write(AsBytes(std::string_view(payload).substr(offset, length)));
+        }
+        HASH_CHECK(go2cpp_hash_test::Hex(AsBytes(chunked.Sum())) == expected);
+    }
+
+    // 通过 Hash 基类使用（类型擦除路径）。
+    std::unique_ptr<Hash> base = std::make_unique<Sha512>();
+    base->Write(AsBytes(std::string_view("abc")));
+    HASH_CHECK(go2cpp_hash_test::Hex(AsBytes(base->Sum())) ==
+               "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+               "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
 }
 
 void CheckCrc32Vectors() {
@@ -297,6 +387,19 @@ void CheckFactoryFunctions() {
                0xcbf43926u);
 }
 
+// 空 Write（默认构造的 ByteSpan，data()==nullptr）在已有数据之后必须无副作用，
+// 且不能触发对 nullptr 的指针算术。
+template <typename H>
+void CheckEmptyWriteAfterData(const char* label) {
+    H hash;
+    hash.Write(AsBytes(std::string_view("abc")));
+    hash.Write(ByteSpan{});
+    H reference;
+    reference.Write(AsBytes(std::string_view("abc")));
+    HASH_CHECK(hash.Sum() == reference.Sum());
+    (void)label;
+}
+
 }  // namespace
 
 void RunVectorTests() {
@@ -304,6 +407,11 @@ void RunVectorTests() {
     CheckMd5Vectors();
     CheckSha1Vectors();
     CheckSha256Vectors();
+    CheckSha512Vectors();
+    CheckEmptyWriteAfterData<Md5>("md5 empty write");
+    CheckEmptyWriteAfterData<Sha1>("sha1 empty write");
+    CheckEmptyWriteAfterData<Sha256>("sha256 empty write");
+    CheckEmptyWriteAfterData<Sha512>("sha512 empty write");
     CheckCrc32Vectors();
     CheckAdler32Vectors();
     CheckSizeAndBlockSize();

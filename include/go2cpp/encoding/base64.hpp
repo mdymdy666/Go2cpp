@@ -37,8 +37,9 @@
  *   3. `=` 只能出现在**最后一个** quantum 的第 3、4 位，且形如 `xx==` / `xxx=`；
  *      数据后继续出现 `=` 或填充后还有数据都报错；
  *   4. 无填充编码（Raw）禁止出现 `=`，且长度 `% 4 == 1` 非法。
- * - **未校验尾部填充位**：`"Zh=="` 会解出 `'f'`（Go 默认 `Decode` 同样接受，
- *   `Strict()` 才会拒绝）。这是有意的互操作取舍，见 `Decode()` 注释。
+ * - **默认不校验尾部填充位**：`"Zh=="` 会解出 `'f'`，与 Go 默认 `Decode` 一致；
+ *   需要拒绝这种输入时链式调用 `StdEncoding.Strict()`（对应 Go `Encoding.Strict()`），
+ *   四个预定义实例本身保持非严格，避免破坏与常见编码器的互操作。
  * - 错误用 `ErrorPtr` + 身份锚点 `Base64CorruptInput()` 表达，文本形如
  *   `illegal base64 data at input byte 3`（对齐 Go `CorruptInputError`）。
  *
@@ -95,10 +96,12 @@ class Base64Encoding {
      * @brief 用 64 字符字母表与填充字符构造编码。
      * @param alphabet 必须恰好 64 个互不相同的字符（不做运行期校验）。
      * @param pad 填充字符；传 `'\0'` 表示无填充（Raw 编码）。
+     * @param strict 是否校验尾部填充位（默认 false，对应 Go 的默认行为）。
      * @warning 若 `alphabet` 指向临时字符串，必须保证其生命周期长于本对象。
      */
-    constexpr Base64Encoding(std::string_view alphabet, char pad) noexcept
-        : m_alphabet(alphabet), m_pad(pad) {}
+    constexpr Base64Encoding(std::string_view alphabet, char pad,
+                             bool strict = false) noexcept
+        : m_alphabet(alphabet), m_pad(pad), m_strict(strict) {}
 
     /// 对应 Go `EncodedLen`：`src_len` 字节编码后的长度（含填充）。
     std::size_t EncodedLen(std::size_t src_len) const noexcept;
@@ -120,14 +123,27 @@ class Base64Encoding {
      * @return 成功返回 `nullptr`；失败返回包装了 `Base64CorruptInput()` 的错误，
      *         且 `dst` 保持不变。
      *
-     * @note 不校验尾部填充位是否为零（`"Zh=="` → `"f"`）。需要该检查时调用方
-     *       可在解码后重新编码比对；Go 用 `Strict()` 开关，本模块按需求只保留
-     *       严格形态，但把「尾部比特」排除在严格条件之外以保证与常见编码器互操作。
+     * @note 默认**不**校验尾部填充位是否为零（`"Zh=="` → `"f"`，与 Go 默认一致）。
+     *       需要该检查时用 `Strict()` 得到严格副本（对应 Go 的 `Encoding.Strict()`）。
      */
     ErrorPtr Decode(std::string& dst, std::string_view src) const;
 
     /// 对应 Go `DecodeString`：返回 `(data, error)`。
     Base64DecodeResult DecodeString(std::string_view src) const;
+
+    /**
+     * @brief 对应 Go `Encoding.Strict()`：返回启用尾部填充位校验的副本。
+     * @details 启用后，最后一个 quantum 中未使用的低位必须为 0：
+     *          `"xx=="` 检查第 2 个字符的低 4 位、`"xxx="` 检查第 3 个字符的低 2 位；
+     *          Raw 编码的 2/3 字符尾巴同理。非零时报 `Base64CorruptInput()`。
+     *          预定义实例本身不变（`StdEncoding` 仍是非严格），与 Go 一致。
+     */
+    constexpr Base64Encoding Strict() const noexcept {
+        return Base64Encoding(m_alphabet, m_pad, true);
+    }
+
+    /// 是否启用严格模式。
+    constexpr bool IsStrict() const noexcept { return m_strict; }
 
     /// 是否为无填充（Raw）编码。
     bool IsRaw() const noexcept { return m_pad == '\0'; }
@@ -141,6 +157,7 @@ class Base64Encoding {
  private:
     std::string_view m_alphabet;
     char m_pad;
+    bool m_strict{false};
 };
 
 /// Go 包名 `encoding/base64` 的类型别名；四种预定义实例见下方常量。

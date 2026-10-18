@@ -18,6 +18,7 @@
 #include "go2cpp/math/rand.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <limits>
 #include <mutex>
 #include <random>
@@ -87,6 +88,8 @@ void Rand::Seed(std::uint64_t seed) noexcept {
     }
     m_read_val = 0;
     m_read_pos = 0;
+    m_norm_cache = 0.0;
+    m_has_norm_cache = false;
 }
 
 std::uint64_t Rand::Uint64() noexcept {
@@ -109,6 +112,11 @@ std::uint32_t Rand::Uint32() noexcept {
 
 std::int64_t Rand::Int63() noexcept {
     return static_cast<std::int64_t>(Uint64() >> 1);
+}
+
+std::int32_t Rand::Int31() noexcept {
+    // Go 1.23: func (r *Rand) Int31() int32 { return int32(r.Int63() >> 32) }
+    return static_cast<std::int32_t>(Int63() >> 32);
 }
 
 std::int64_t Rand::Int() noexcept {
@@ -135,25 +143,32 @@ std::int64_t Rand::Int63n(std::int64_t n) {
     return value % n;
 }
 
+std::int32_t Rand::Int31n(std::int32_t n) {
+    if (n <= 0) {
+        throw std::invalid_argument("rand.Int31n: n must be positive");
+    }
+    // 2 的幂直接掩码（Go 的快速路径；n 是正 int32，不存在符号问题）。
+    if ((n & (n - 1)) == 0) {
+        return static_cast<std::int32_t>(Int31() & (n - 1));
+    }
+    // 拒绝采样：只接受 <= (2^31-1) - (2^31 mod n) 的值。
+    const std::uint32_t un = static_cast<std::uint32_t>(n);
+    const std::int32_t max_value = static_cast<std::int32_t>(
+        (std::uint32_t{1} << 31) - 1ULL - ((std::uint32_t{1} << 31) % un));
+    std::int32_t value = Int31();
+    while (value > max_value) {
+        value = Int31();
+    }
+    return static_cast<std::int32_t>(value % n);
+}
+
 std::int64_t Rand::Intn(std::int64_t n) {
     if (n <= 0) {
         throw std::invalid_argument("rand.Intn: n must be positive");
     }
     // Go 1.23: n <= 2^31-1 时走 Int31n（31 位拒绝采样），否则走 Int63n。
     if (n <= static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())) {
-        const std::int32_t bound = static_cast<std::int32_t>(n);
-        const std::int32_t value = static_cast<std::int32_t>(Int63() >> 32);
-        if ((bound & (bound - 1)) == 0) {
-            return static_cast<std::int64_t>(value & (bound - 1));
-        }
-        const std::int32_t max_value = static_cast<std::int32_t>(
-            (std::uint32_t{1} << 31) - 1ULL -
-            ((std::uint32_t{1} << 31) % static_cast<std::uint32_t>(bound)));
-        std::int32_t candidate = value;
-        while (candidate > max_value) {
-            candidate = static_cast<std::int32_t>(Int63() >> 32);
-        }
-        return static_cast<std::int64_t>(candidate % bound);
+        return static_cast<std::int64_t>(Int31n(static_cast<std::int32_t>(n)));
     }
     return Int63n(n);
 }
@@ -176,6 +191,32 @@ float Rand::Float32() noexcept {
             return value;
         }
     }
+}
+
+double Rand::NormFloat64() noexcept {
+    // Box–Muller：两个独立的 U(0,1) 生成一对标准正态值，缓存第二个。
+    // 拒绝 u1 == 0（Float64 可以返回 0，而 log(0) = -Inf）。
+    if (m_has_norm_cache) {
+        m_has_norm_cache = false;
+        return m_norm_cache;
+    }
+    double u1 = 0.0;
+    do {
+        u1 = Float64();
+    } while (u1 <= 0.0);
+    const double u2 = Float64();
+    constexpr double kTwoPi = 6.283185307179586476925286766559;
+    const double radius = std::sqrt(-2.0 * std::log(u1));
+    const double angle = kTwoPi * u2;
+    m_norm_cache = radius * std::sin(angle);
+    m_has_norm_cache = true;
+    return radius * std::cos(angle);
+}
+
+double Rand::ExpFloat64() noexcept {
+    // 逆变换：U ~ U[0,1) => -log(1-U) ~ Exp(1)。Float64() 严格小于 1，
+    // 因此 1-U ∈ (0,1]，不会出现 log(0)。
+    return -std::log(1.0 - Float64());
 }
 
 std::vector<std::int64_t> Rand::Perm(std::int64_t n) {
@@ -234,6 +275,11 @@ std::int64_t Int63() {
     return GlobalRand().Int63();
 }
 
+std::int32_t Int31() {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Int31();
+}
+
 std::int64_t Int() {
     std::lock_guard<std::mutex> lock(GlobalMutex());
     return GlobalRand().Int();
@@ -242,6 +288,11 @@ std::int64_t Int() {
 std::int64_t Int63n(std::int64_t n) {
     std::lock_guard<std::mutex> lock(GlobalMutex());
     return GlobalRand().Int63n(n);
+}
+
+std::int32_t Int31n(std::int32_t n) {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Int31n(n);
 }
 
 std::int64_t Intn(std::int64_t n) {
@@ -257,6 +308,16 @@ double Float64() {
 float Float32() {
     std::lock_guard<std::mutex> lock(GlobalMutex());
     return GlobalRand().Float32();
+}
+
+double NormFloat64() {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().NormFloat64();
+}
+
+double ExpFloat64() {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().ExpFloat64();
 }
 
 std::vector<std::int64_t> Perm(std::int64_t n) {

@@ -34,8 +34,16 @@
  *      便于和项目其他模块（`bufio`、`os`）的 `Err()` 风格一致。
  *   2. Go 的 `flate.Reader` 是 `io.ReadCloser`；本类的 zlib 状态在析构时释放，
  *      没有 `Close()` 方法（解压不需要「结束」动作）。
- *   3. 不支持 `Resetter`（复用 zlib 状态跨流）；本模块一个流一个对象，
- *      实现简单且没有共享状态的坑。
+ *   3. 支持 `Resetter`（`Reader::Reset` / `Writer::Reset`）：复用 zlib 状态，
+ *      但**不**替上一个 writer 调用 `Close()`（与 Go 一致，半截流责任自负）。
+ *
+ *   ## 已知未支持项及原因（C 类，有意不做）
+ *
+ *   | 未支持项 | 原因 |
+ *   |---|---|
+ *   | 预置字典（Go `flate.NewReaderDict` / `NewWriterDict`） | 需要在 `Writer`/`Reader` 构造时额外传字典并在 `Z_NEED_DICT` 时 `inflateSetDictionary`；当前没有调用场景，且会让 API 出现两个构造重载。需要时可基于 zlib 的 `deflateSetDictionary`/`inflateSetDictionary` 增补。 |
+ *   | `Writer.Flush` 的 `Z_FULL_FLUSH` / 字节对齐细节 | Go 的 `Flush` 只保证「当前数据可解」，本模块用 `Z_SYNC_FLUSH` 达到同一目的；没有 `Z_FULL_FLUSH`（重置历史窗口）的公开 API。 |
+ *   | 自定义 `dict` 与硬件加速 | DEFLATE 完全委托 zlib，硬件加速（如 zlib-ng）由系统库决定；本模块不参与。 |
  */
 #pragma once
 
@@ -69,6 +77,8 @@ class Flate {
   /// 默认级别（= `compress::DefaultCompression`）。
   static constexpr int DefaultCompression =
       ::go2cpp::compress::DefaultCompression;
+  /// 只做 Huffman 编码（= `compress::HuffmanOnly`，数值 -2）。
+  static constexpr int HuffmanOnly = ::go2cpp::compress::HuffmanOnly;
 
   /**
    * @brief raw DEFLATE 解压器。
@@ -96,6 +106,18 @@ class Flate {
 
     /// 粘性错误；正常读完时为 `streams::IoEof()`。
     const ErrorPtr& Err() const noexcept { return m_engine.Err(); }
+
+    /**
+     * @brief 对应 Go `Resetter.Reset`：复用当前 zlib 状态，改绑到新数据源。
+     * @param source 新的底层 Reader（生命周期必须覆盖后续读取）。
+     * @return 成功为空错误；只有 zlib 状态复位失败才会返回 `ErrInternal()`。
+     * @note 会清空上一次流的错误、EOF 标志与多成员状态，然后从新流的第一个
+     *       字节开始解析（gzip 仍按当前 `Multistream()` 设置处理）。
+     */
+    ErrorPtr Reset(ReaderT& source) {
+      m_engine.Reset(source);
+      return m_engine.Err();
+    }
 
    private:
     detail::ReaderEngine<ReaderT> m_engine;
@@ -142,6 +164,17 @@ class Flate {
 
     /// 是否已经 `Close()`。
     bool Closed() const noexcept { return m_engine.Closed(); }
+
+    /**
+     * @brief 对应 Go `Resetter.Reset`：复用 zlib 状态，改绑到新输出并开始新流。
+     * @param destination 新底层 Writer；生命周期必须覆盖后续写入。
+     * @return 成功为空错误（非法级别 / zlib 复位失败时返回对应错误）。
+     * @warning 与 Go 相同：**不会**替上一次流调用 `Close()`。上一个 sink 里
+     *          未 `Close()` 的数据仍是半截流；需要完整流请先 `Close()` 再 `Reset`。
+     */
+    ErrorPtr Reset(WriterT& destination) {
+      return m_engine.Reset(destination);
+    }
 
    private:
     detail::WriterEngine<WriterT> m_engine;

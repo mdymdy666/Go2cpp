@@ -25,7 +25,10 @@
  *     行为（要求 `T` 可复制，否则抛 `std::invalid_argument`）。
  *   - `InsertValue(value, index)` 是本模块新增的按下标插入便捷接口（Go 里
  *     `insertValue` 是未导出的内部 helper，签名为 `(value, at)`）；复杂度 O(index)。
- *   - Go 的 `PushBackList`/`PushFrontList` 未实现（当前没有使用场景）。
+ *   - `PushBackList`/`PushFrontList` 按 Go 语义**复制** `other` 的每个值
+ *     （Go 的 `any` 也是值拷贝）；复杂度 O(other.Len())。`other == this` 合法：
+ *     先记住原长度再迭代，不会无限增长。要求 `T` 可复制构造（与 `Remove`
+ *     的跨链表分支同一约束）。
  *   - 不提供迭代器；遍历请用 `Front()` + `Element::Next()`，与 Go 写法一致。
  *   - `List` 不可复制/移动：节点由链表独占持有，复制语义需要额外约定；如需要请显式
  *     逐元素复制。
@@ -149,6 +152,16 @@ class List {
         return m_data.empty() ? nullptr : &m_data.back();
     }
 
+    /** @brief 首元素（只读重载，供 `Push*List` 等 const 接口使用）。 */
+    const element_type* Front() const noexcept {
+        return m_data.empty() ? nullptr : &m_data.front();
+    }
+
+    /** @brief 尾元素（只读重载，供 `Push*List` 等 const 接口使用）。 */
+    const element_type* Back() const noexcept {
+        return m_data.empty() ? nullptr : &m_data.back();
+    }
+
     /**
      * @brief 头插，返回新节点（对应 Go `PushFront`）。
      */
@@ -165,6 +178,38 @@ class List {
         auto it = m_data.end();
         --it;
         return Adopt(it);
+    }
+
+    /**
+     * @brief 对应 Go `PushBackList`：把 `other` 的每个值依次复制到本链表尾部。
+     * @param other 源链表，可为 `*this`（先记住原长度，等价于把前 `Len()` 个值
+     *              再追加一遍）。
+     * @note `T` 必须可复制构造；`Go` 的 `any` 本身就是值拷贝，语义一致。
+     */
+    void PushBackList(const List& other) {
+        const size_type count = other.Len();
+        const element_type* element = other.Front();
+        for (size_type i = 0; i < count && element != nullptr; ++i) {
+            const element_type* const next = element->Next();
+            PushBack(element->Value);  // 复制（Go 的 insertValue(e.Value, ...)）
+            element = next;
+        }
+    }
+
+    /**
+     * @brief 对应 Go `PushFrontList`：把 `other` 的每个值依次复制到本链表头部。
+     * @param other 源链表，可为 `*this`。
+     * @note 从 `other.Back()` 向前遍历并逐个 `PushFront`，因此复制后 `other`
+     *       的顺序保持不变（与 Go 的实现一致，不是逆序）。
+     */
+    void PushFrontList(const List& other) {
+        const size_type count = other.Len();
+        const element_type* element = other.Back();
+        for (size_type i = 0; i < count && element != nullptr; ++i) {
+            const element_type* const previous = element->Prev();
+            PushFront(element->Value);
+            element = previous;
+        }
     }
 
     /**

@@ -37,6 +37,15 @@
  *
  * `Abs`/`Rel`/`Walk`/`Glob`/`EvalSymlinks` 会访问文件系统；其余函数纯词法。
  * 全部函数**不依赖** `go2cpp::os` 模块（保持边界清晰，`os` 未做路径规范化）。
+ *
+ * ## 已知未支持项及原因（C 类，有意不做）
+ *
+ * | 未支持项 | 原因 |
+ * |---|---|
+ * | `WalkDir` | Go 的 `WalkDir` 用 `fs.DirEntry` 免去对每个条目额外 `lstat`；本项目没有 `fs` 抽象，`WalkInfo` 已经在遍历时携带 `lstat` 结果，`Walk` 覆盖同一用途。另起一套 API 只会造成两份相似实现漂移。 |
+ * | Windows 未真机验证 | `#ifdef _WIN32` 分支按 Go 文档编写，但当前 CI/开发环境只有 Linux；Windows 的盘符/UNC/保留名（`NUL`、`CON`）语义无法在本机验证。`IsLocal` 的 Windows 分支**不检查**保留名，已在函数注释标明。 |
+ * | `Localize` 的错误返回 | Go 的 `Localize(path) (string, error)` 在 Windows 上可能因非法卷名失败；本模块统一用「返回值」形态（Unix 恒成功），Windows 失败场景归入未验证项。 |
+ * | `EvalSymlinks` 的 Windows 实现 | 用 `std::filesystem::weakly_canonical` 近似，对陈旧路径（不存在的尾段）与链接循环的行为与 Go 不同；Linux 走完整移植实现。 |
  */
 
 #pragma once
@@ -73,6 +82,53 @@ inline constexpr char ListSeparator =
 // ---------------------------------------------------------------------------
 // 纯词法函数（与 path 同名；Linux 下直接转发）
 // ---------------------------------------------------------------------------
+
+/**
+ * @brief 对应 Go `filepath.SplitList`：按 `ListSeparator` 拆分 `PATH` 类变量。
+ * @param path 例如 `"/bin:/usr/bin"`。
+ * @return 拆分结果；**空串返回空列表**（不是含一个空串的列表），与 Go 一致。
+ *         `":"` 返回两个空串。
+ */
+std::vector<std::string> SplitList(std::string_view path);
+
+/**
+ * @brief 对应 Go `filepath.VolumeName`：返回卷名。
+ * @details Unix 恒为空串；Windows 返回盘符（`C:`）或 UNC 共享（`\\host\share`）。
+ * @note 该函数不 `Clean`、不解析符号链接，纯词法。
+ */
+std::string VolumeName(std::string_view path);
+
+/**
+ * @brief 对应 Go `filepath.ToSlash`：把平台分隔符换成 `/`。
+ * @details Unix 是恒等变换；Windows 把 `\` 换成 `/`。
+ */
+std::string ToSlash(std::string_view path);
+
+/**
+ * @brief 对应 Go `filepath.FromSlash`：把 `/` 换成平台分隔符。
+ * @details Unix 是恒等变换；Windows 把 `/` 换成 `\`。
+ */
+std::string FromSlash(std::string_view path);
+
+/**
+ * @brief 对应 Go `filepath.IsLocal`（Go 1.20+）：词法判断路径是否位于 base 子树内。
+ * @details 判据与 Go 的 `unixIsLocal` 一致：
+ *          - 空串、绝对路径 → false；
+ *          - 含 `.`/`..` 段时先 `Clean`，结果为 `".."` 或以 `"../"` 开头 → false；
+ *          - 其余 → true。
+ *          因此 `IsLocal("a/../b") == true`、`IsLocal("a/../../b") == false`。
+ * @note Windows 分支额外排除「去掉卷名后为空/绝对」的情况，但**不检查**
+ *       `NUL`/`CON` 等保留名（未在 Windows 真机验证，见文件头 C 类清单）。
+ */
+bool IsLocal(std::string_view path);
+
+/**
+ * @brief 对应 Go `filepath.Localize`：把路径转成本地形式。
+ * @details Unix 是恒等变换；Windows 近似为「去掉卷名」。
+ * @note Go 的原型带 `error`（Windows 非法卷名可能失败）；本模块用返回值表达，
+ *       Unix 不会失败，Windows 失败场景归入未验证项。
+ */
+std::string Localize(std::string_view path);
 
 /// @brief 平台版 `Clean`。Windows 会保留盘符/UNC 前缀并统一为 `\`。
 std::string Clean(std::string_view path);

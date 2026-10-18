@@ -50,7 +50,14 @@
  *         `Int63n(<=0)`、`Perm(<0)`、`Shuffle(<0)`。
  *
  * @note **边界**：
- *       - 未实现 `NormFloat64`/`ExpFloat64`/`Int31`/`Int31n`/`NewSource`/`Source` 接口；
+ *       - `NormFloat64`/`ExpFloat64` 只保证**分布**与 Go 一致（标准正态 / 速率 1
+ *         指数），**不逐位一致**：Go 用 ziggurat，本模块分别用 Box–Muller（成对
+ *         产出、缓存第二个值）与逆变换 `-log(1-U)`；同种子本来也无法与 Go 对拍
+ *         （底层 PRNG 不同）。`Seed()` 会清掉缓存的正态值；
+ *       - 未实现 `Source` 接口 / `New(Source)` / `jump()` / `long_jump()`（C 类，
+ *         有意不做）：Go 的 `Source` 要求把 `Rand` 改成可替换源的多态对象，而本
+ *         模块只有 xoshiro256** 一种源，没有替换需求；`jump()` 是 xoshiro 参考
+ *         实现的自有 API，Go 的 `math/rand` 并不提供，也没有并行子序列场景。
  *       - 与 Go 的**数值序列不互通**：Go 1.23 的默认源是运行时 ChaCha8（`runtimeSource`）
  *         或兼容的 lagged-Fibonacci（`rngSource`），本模块是 xoshiro256**；同一种子不会
  *         产生相同序列，但分布与 API 语义一致；
@@ -148,6 +155,9 @@ public:
     /// 对应 `Rand.Int63`：非负 63 位整数。
     std::int64_t Int63() noexcept;
 
+    /// 对应 `Rand.Int31`：非负 31 位整数（`int32(Int63() >> 32)`）。
+    std::int32_t Int31() noexcept;
+
     /// 对应 `Rand.Int`：非负 `int`（在 64 位平台上等价于 `Int63`）。
     std::int64_t Int() noexcept;
 
@@ -156,6 +166,13 @@ public:
      * @throws std::invalid_argument 当 `n <= 0`（Go 对应 panic）。
      */
     std::int64_t Int63n(std::int64_t n);
+
+    /**
+     * @brief 对应 `Rand.Int31n(n)`：返回 `[0, n)` 的 31 位整数。
+     * @throws std::invalid_argument 当 `n <= 0`（Go 对应 panic）。
+     * @details 与 Go 相同：`n` 是 2 的幂时直接掩码，否则 31 位拒绝采样。
+     */
+    std::int32_t Int31n(std::int32_t n);
 
     /**
      * @brief 对应 `Rand.Intn(n)`：返回 `[0, n)` 的整数。
@@ -168,6 +185,21 @@ public:
 
     /// 对应 `Rand.Float32`：返回 `[0.0, 1.0)`。
     float Float32() noexcept;
+
+    /**
+     * @brief 对应 `Rand.NormFloat64`：标准正态分布（均值 0、标准差 1）。
+     * @details Box–Muller：每次用两个均匀随机数，同时算出两个正态值，第二个缓存
+     *          到下一次调用（与经典实现的性能技巧一致）。`Seed()` 会清空缓存。
+     *          分布正确性由测试的均值/方差/卡方与两端覆盖验证。
+     */
+    double NormFloat64() noexcept;
+
+    /**
+     * @brief 对应 `Rand.ExpFloat64`：速率 1 的指数分布（均值 1、标准差 1）。
+     * @details 逆变换 `-log(1-U)`，`U` 来自 `Float64()`（严格小于 1），因此不会
+     *          出现 `log(0)`。只保证分布，不保证与 Go ziggurat 逐位一致。
+     */
+    double ExpFloat64() noexcept;
 
     /**
      * @brief 对应 `Rand.Perm(n)`：返回 `[0, n)` 的一个随机排列。
@@ -203,6 +235,8 @@ private:
     std::uint64_t m_state[4]{};
     std::int64_t m_read_val{0};   ///< `Read` 尚未用完的 63 位随机值
     std::int8_t m_read_pos{0};    ///< `m_read_val` 还剩几个有效字节（0 表示需要重新抽取）
+    double m_norm_cache{0.0};     ///< Box–Muller 成对结果中暂存的第二个值
+    bool m_has_norm_cache{false};  ///< 缓存是否有效（`Seed` 必须清掉）
 };
 
 // ============================================================================
@@ -220,16 +254,24 @@ std::uint64_t Uint64();
 std::uint32_t Uint32();
 /// 对应全局 `rand.Int63()`。
 std::int64_t Int63();
+/// 对应全局 `rand.Int31()`。
+std::int32_t Int31();
 /// 对应全局 `rand.Int()`。
 std::int64_t Int();
 /// 对应全局 `rand.Int63n(n)`；`n <= 0` 抛 `std::invalid_argument`。
 std::int64_t Int63n(std::int64_t n);
+/// 对应全局 `rand.Int31n(n)`；`n <= 0` 抛 `std::invalid_argument`。
+std::int32_t Int31n(std::int32_t n);
 /// 对应全局 `rand.Intn(n)`；`n <= 0` 抛 `std::invalid_argument`。
 std::int64_t Intn(std::int64_t n);
 /// 对应全局 `rand.Float64()`。
 double Float64();
 /// 对应全局 `rand.Float32()`。
 float Float32();
+/// 对应全局 `rand.NormFloat64()`。
+double NormFloat64();
+/// 对应全局 `rand.ExpFloat64()`。
+double ExpFloat64();
 /// 对应全局 `rand.Perm(n)`；`n < 0` 抛 `std::invalid_argument`。
 std::vector<std::int64_t> Perm(std::int64_t n);
 /// 对应全局 `rand.Read(p)`：线程安全，恒填满 `p`。

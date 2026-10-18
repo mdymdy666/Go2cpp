@@ -23,6 +23,7 @@
 #include "go2cpp/hash/md5.hpp"
 #include "go2cpp/hash/sha1.hpp"
 #include "go2cpp/hash/sha256.hpp"
+#include "go2cpp/hash/sha512.hpp"
 
 #include <array>
 #include <atomic>

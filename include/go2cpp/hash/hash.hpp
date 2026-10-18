@@ -9,7 +9,7 @@
  * @details 复用优先的结论：
  *   | 候选 | 许可证 | 结论 |
  *   |---|---|---|
- *   | Go 1.23 `hash`、`hash/crc32`、`hash/adler32`、`crypto/md5`、`crypto/sha1`、`crypto/sha256`（本机 `third_party/go1.23.0.src.tar.gz`） | BSD-3-Clause | **作为语义基准**：`Write` 累积 / `Sum` 不改变状态 / `Reset` 复位 / `Size`、`BlockSize` 的取值逐项对照；CRC32 的多项式、`Update` 的「先取反再累加再取反」流程也照搬 |
+ *   | Go 1.23 `hash`、`hash/crc32`、`hash/adler32`、`crypto/md5`、`crypto/sha1`、`crypto/sha256`、`crypto/sha512`（本机 `third_party/go1.23.0.src.tar.gz`） | BSD-3-Clause | **作为语义基准**：`Write` 累积 / `Sum` 不改变状态 / `Reset` 复位 / `Size`、`BlockSize` 的取值逐项对照；CRC32 的多项式、`Update` 的「先取反再累加再取反」流程也照搬 |
  *   | OpenSSL（`libcrypto` 的 `MD5_*` / `SHA*_*` / `CRC32`） | Apache-2.0 | **不采用**：项目明确要求零外部依赖；且 OpenSSL 3.x 把 MD5/SHA-1 放进 legacy provider，接口与构建复杂度都远超本模块需要 |
  *   | zlib（`crc32` / `adler32`） | Zlib | **不采用**：只为两个校验和引入一个 C 依赖不划算，二者算法都只有几十行；zlib 仅作为**测试 oracle**（Python `zlib.crc32` / `zlib.adler32` 即其绑定） |
  *   | [Botan](https://botan.randombit.net/)、[tinycrypt](https://github.com/intel/tinycrypt) | BSD-2 / BSD-3 | **不采用**：前者体积大且 API 形态不同；后者只覆盖 AES/SHA-256 子集，无法一次满足 CRC32/Adler32/MD5/SHA-1/SHA-256 五个摘要 |
@@ -57,8 +57,19 @@
  * ## 安全提示
  *
  * MD5 与 SHA-1 **已不适合任何安全用途**（两者都有实际构造出的碰撞），只可用于
- * 校验和、协议兼容、历史数据迁移。新设计请用 SHA-256 或更强的算法。
+ * 校验和、协议兼容、历史数据迁移。新设计请用 SHA-256 / SHA-512 或更强的算法。
  * 该警告在 `md5.hpp`、`sha1.hpp` 的文件头各重复一次，避免只引子头时漏看。
+ *
+ * ## 已知未支持项及原因（C 类，有意不做）
+ *
+ * | 未支持项 | 原因 |
+ * |---|---|
+ * | SHA-224 | 与 SHA-256 共用压缩函数，只是不同初始向量 + 截断 28 字节；使用面远小于 SHA-256/512。真要加只需约 30 行，但会增加一个几乎没有调用方的 API 面。 |
+ * | SHA-384 / SHA-512/224 / SHA-512/256 | 与 SHA-512 共用压缩函数，差别是初始向量与截断长度。当前只提供最常用的 SHA-512；需要时按 FIPS 180-4 的 IV 表扩展（每个约 10 行）。 |
+ * | HMAC（`crypto/hmac`） | 需要把任意 `Hash` 包装成 HMAC（内外两层 pad、密钥长度规范化）。属于 `crypto` 而非 `hash` 的职责；本项目没有密钥/认证场景，留待安全模块统一设计，避免在基础模块里放出「看起来安全」的半成品。 |
+ * | CRC32 的 SSE4.2 / PCLMUL 硬件加速 | 纯可移植实现已达 **3~5 GB/s**（slicing-by-8），远超本项目 IO 路径需求；运行时 CPU 分派会引入编译期特性宏与平台分支，收益不匹配。 |
+ * | `encoding.BinaryMarshaler` / `BinaryUnmarshaler` 序列化 | Go 用它做哈希状态缓存（`MarshalBinary`）。C++ 侧可直接拷贝对象（`Sha256`/`Sha512` 都是值类型），不需要额外序列化协议。 |
+ * | 各算法的 `New()` 工厂（返回 `hash.Hash` 接口） | C++ 侧构造函数/默认构造已完成同一职责（`Sha256 h;`），再提供 `New()` 只会多一层无意义的间接；需要接口多态时用 `std::unique_ptr<Hash>` 或 `Hash&`。 |
  */
 #pragma once
 

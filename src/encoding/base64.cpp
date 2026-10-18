@@ -172,6 +172,10 @@ ErrorPtr Base64Encoding::Decode(std::string& dst, std::string_view src) const {
                 if (c3 != m_pad) {
                     return CorruptAt(i + 3);
                 }
+                // Strict：`xx==` 只用 v1 的高 4 位，低 4 位必须为 0。
+                if (m_strict && (v1 & 0x0f) != 0) {
+                    return CorruptAt(i + 1);
+                }
                 out.push_back(static_cast<char>((v0 << 2) | (v1 >> 4)));
                 i += 4;
                 continue;
@@ -179,6 +183,10 @@ ErrorPtr Base64Encoding::Decode(std::string& dst, std::string_view src) const {
             const int v2 = value_of(static_cast<unsigned char>(c2));
             if (v2 < 0) return CorruptAt(i + 2);
             if (c3 == m_pad) {
+                // Strict：`xxx=` 只用 v2 的高 6 位，低 2 位必须为 0。
+                if (m_strict && (v2 & 0x03) != 0) {
+                    return CorruptAt(i + 2);
+                }
                 out.push_back(static_cast<char>((v0 << 2) | (v1 >> 4)));
                 out.push_back(
                     static_cast<char>(((v1 & 0x0f) << 4) | (v2 >> 2)));
@@ -203,10 +211,16 @@ ErrorPtr Base64Encoding::Decode(std::string& dst, std::string_view src) const {
         const int v1 = value_of(ByteAt(src, i + 1));
         if (v0 < 0) return CorruptAt(i);
         if (v1 < 0) return CorruptAt(i + 1);
+        if (m_strict && (v1 & 0x0f) != 0) {
+            return CorruptAt(i + 1);
+        }
         out.push_back(static_cast<char>((v0 << 2) | (v1 >> 4)));
         if (remaining == 3) {
             const int v2 = value_of(ByteAt(src, i + 2));
             if (v2 < 0) return CorruptAt(i + 2);
+            if (m_strict && (v2 & 0x03) != 0) {
+                return CorruptAt(i + 2);
+            }
             out.push_back(static_cast<char>(((v1 & 0x0f) << 4) | (v2 >> 2)));
         }
         i = len;

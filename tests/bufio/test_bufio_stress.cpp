@@ -312,7 +312,8 @@ Options ParseOptions(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     const Options options = ParseOptions(argc, argv);
-    const std::string path = "/tmp/go2cpp_bufio_stress.bin";
+    const std::string path = "/tmp/go2cpp_bufio_stress_" +
+                             std::to_string(::getpid()) + ".bin";
 
     std::printf("[stress] ===== bufio 压测开始 =====\n");
     std::printf("[stress] 数据规模=%zu 字节, 轮数=%d, 模式=%s\n", options.size,

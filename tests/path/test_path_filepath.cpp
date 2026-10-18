@@ -102,6 +102,68 @@ std::string CanonicalRoot() {
 }
 
 // ---------------------------------------------------------------------------
+// SplitList / VolumeName / ToSlash / FromSlash / IsLocal / Localize
+// ---------------------------------------------------------------------------
+void TestSplitListVolumeSlashLocalize() {
+    namespace fp = go2cpp::path::Filepath;
+
+    // SplitList：空串 -> 空列表；连续/首尾分隔符产生空段。
+    {
+        const std::vector<std::string> list = fp::SplitList("/bin:/usr/bin::/opt/x");
+        Check(list.size() == 4, "SplitList 段数");
+        CheckEq(list[0], "/bin", "SplitList[0]");
+        CheckEq(list[1], "/usr/bin", "SplitList[1]");
+        CheckEq(list[2], "", "SplitList[2] 空段");
+        CheckEq(list[3], "/opt/x", "SplitList[3]");
+        Check(fp::SplitList("").empty(), "SplitList 空串应为空列表");
+        const std::vector<std::string> single = fp::SplitList("/only");
+        Check(single.size() == 1 && single[0] == "/only", "SplitList 单段");
+        const std::vector<std::string> two_empty = fp::SplitList(":");
+        Check(two_empty.size() == 2 && two_empty[0].empty() &&
+                  two_empty[1].empty(),
+              "SplitList(':') 应为两个空段");
+    }
+
+    // VolumeName：Unix 恒为空。
+    CheckEq(fp::VolumeName("/a/b"), "", "VolumeName 绝对路径");
+    CheckEq(fp::VolumeName("C:/x"), "", "VolumeName 盘符（Unix 不认）");
+    CheckEq(fp::VolumeName(""), "", "VolumeName 空串");
+
+    // ToSlash / FromSlash：Unix 是恒等变换（反斜杠是普通字符）。
+    CheckEq(fp::ToSlash("a\\b/c"), "a\\b/c", "ToSlash Unix 恒等");
+    CheckEq(fp::FromSlash("a\\b/c"), "a\\b/c", "FromSlash Unix 恒等");
+    CheckEq(fp::Localize("/a/b"), "/a/b", "Localize Unix 恒等");
+    CheckEq(fp::Localize(""), "", "Localize 空串");
+
+    // IsLocal：与 Go unixIsLocal 的判据逐项对齐。
+    Check(!fp::IsLocal(""), "IsLocal 空串为 false");
+    Check(!fp::IsLocal("/a"), "IsLocal 绝对路径为 false");
+    Check(!fp::IsLocal(".."), "IsLocal('..') 为 false");
+    Check(!fp::IsLocal("../a"), "IsLocal('../a') 为 false");
+    Check(!fp::IsLocal("a/../../b"), "IsLocal('a/../../b') 为 false");
+    Check(fp::IsLocal("."), "IsLocal('.') 为 true");
+    Check(fp::IsLocal("a"), "IsLocal('a') 为 true");
+    Check(fp::IsLocal("a/b"), "IsLocal('a/b') 为 true");
+    Check(fp::IsLocal("./a"), "IsLocal('./a') 为 true");
+    Check(fp::IsLocal("a/../b"), "IsLocal('a/../b') 为 true");
+    Check(fp::IsLocal("a/b/.."), "IsLocal('a/b/..') 为 true");
+
+    // 真实场景：遍历 PATH 段并判断每个相对项是否可安全 Join 到安装根。
+    {
+        const std::vector<std::string> entries =
+            fp::SplitList("/usr/local/bin:/usr/bin:relative/bin:../escape");
+        Check(entries.size() == 4, "PATH 解析段数");
+        static const bool kExpected[] = {false, false, true, false};
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            Check(fp::IsLocal(entries[i]) == kExpected[i],
+                  "PATH 段的 IsLocal 判定");
+        }
+        CheckEq(fp::Join("/install", "relative/bin"), "/install/relative/bin",
+                "IsLocal 的 Join 场景");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 词法函数：Linux 上与 path 完全一致
 // ---------------------------------------------------------------------------
 
@@ -525,6 +587,7 @@ int main() {
     MakeDir(Root());
 
     TestLexicalDelegation();
+    TestSplitListVolumeSlashLocalize();
     ScenarioConfigPath();
     ScenarioAbs();
     ScenarioRel();

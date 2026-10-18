@@ -94,6 +94,14 @@ bool CsvReader::SetFieldsPerRecord(int fields) {
     return true;
 }
 
+bool CsvReader::SetComment(char comment) noexcept {
+    if (comment == '\r' || comment == '\n') {
+        return false;
+    }
+    m_comment = comment;
+    return true;
+}
+
 CsvReadResult CsvReader::Read() {
     CsvReadResult result;
     if (m_error) {
@@ -120,6 +128,17 @@ CsvReadResult CsvReader::Read() {
             ++m_line;
             continue;
         }
+        if (m_comment != '\0' && m_data[m_pos] == m_comment) {
+            // 注释行：整行忽略（含行尾 \r）；下一轮继续跳过空行/注释。
+            while (m_pos < size && m_data[m_pos] != '\n') {
+                ++m_pos;
+            }
+            if (m_pos < size) {
+                ++m_pos;
+                ++m_line;
+            }
+            continue;
+        }
         break;
     }
 
@@ -131,6 +150,19 @@ CsvReadResult CsvReader::Read() {
             // 只可能由「结尾逗号」走到这里：补一个空尾字段。
             record.emplace_back();
             break;
+        }
+
+        // TrimLeadingSpace：在解析每个字段前裁掉 ASCII 空格/Tab。放在这里
+        // 而不是记录级，才能同时覆盖 `a, b` 这种逗号后的前导空白。
+        if (m_trim_leading_space) {
+            while (m_pos < size &&
+                   (m_data[m_pos] == ' ' || m_data[m_pos] == '\t')) {
+                ++m_pos;
+            }
+            if (m_pos >= size) {
+                record.emplace_back();
+                break;
+            }
         }
 
         std::string field;

@@ -33,7 +33,11 @@
  *      本模块不写这些字段，也不解析后暴露给调用方。需要「读文件名」这类
  *      元信息的场景可以后续加 `Header()`，但那会让 `Reader` 增加一个
  *      与解压无关的状态对象，目前没有需求。
- *   2. 不支持 `Resetter`。
+ *      （C 类：支持它需要放弃 `windowBits=31` 让 zlib 生成头部，改为自己写
+ *      10 字节头 + raw deflate + 自己算 crc32/ISIZE，约 100 行；收益是
+ *      「可复现的 MTIME/OS/文件名」，当前不需要。）
+ *   2. `Resetter` 已支持：`Reader::Reset(source)` / `Writer::Reset(destination)`。
+ *   3. 只支持单个 gzip 头部的 10 字节基础字段；不解析 FHCRC/FEXTRA。
  */
 #pragma once
 
@@ -63,6 +67,8 @@ class Gzip {
   /// 默认级别（= `compress::DefaultCompression`）。
   static constexpr int DefaultCompression =
       ::go2cpp::compress::DefaultCompression;
+  /// 只做 Huffman 编码（= `compress::HuffmanOnly`，数值 -2）。
+  static constexpr int HuffmanOnly = ::go2cpp::compress::HuffmanOnly;
 
   /**
    * @brief gzip 解压器（默认支持多成员）。
@@ -104,6 +110,17 @@ class Gzip {
 
     /// 粘性错误；正常读完时为 `streams::IoEof()`。
     const ErrorPtr& Err() const noexcept { return m_engine.Err(); }
+
+    /**
+     * @brief 对应 Go `Resetter.Reset`：复用 zlib 状态并改绑到新 gzip 源。
+     * @param source 新数据源；生命周期必须覆盖后续读取。
+     * @return 成功为空错误。
+     * @note 保留当前的 `Multistream()` 设置。
+     */
+    ErrorPtr Reset(ReaderT& source) {
+      m_engine.Reset(source);
+      return m_engine.Err();
+    }
 
    private:
     detail::ReaderEngine<ReaderT> m_engine;
@@ -150,6 +167,17 @@ class Gzip {
 
     /// 是否已经 `Close()`。
     bool Closed() const noexcept { return m_engine.Closed(); }
+
+    /**
+     * @brief 对应 Go `Resetter.Reset`：复用 zlib 状态，改绑到新输出并开始新流。
+     * @param destination 新底层 Writer；生命周期必须覆盖后续写入。
+     * @return 成功为空错误（非法级别 / zlib 复位失败时返回对应错误）。
+     * @warning 与 Go 相同：**不会**替上一次流调用 `Close()`。上一个 sink 里
+     *          未 `Close()` 的数据仍是半截流；需要完整流请先 `Close()` 再 `Reset`。
+     */
+    ErrorPtr Reset(WriterT& destination) {
+      return m_engine.Reset(destination);
+    }
 
    private:
     detail::WriterEngine<WriterT> m_engine;

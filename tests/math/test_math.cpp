@@ -469,6 +469,12 @@ void RunConstantChecks() {
     CheckBits("Log10E", m::Log10E, 0x3fdbcb7b1526e50eULL);
     CheckBits("MaxFloat64", m::MaxFloat64, 0x7fefffffffffffffULL);
     CheckBits("SmallestNonzeroFloat64", m::SmallestNonzeroFloat64, 0x0000000000000001ULL);
+    Check(m::MaxFloat32 == std::numeric_limits<float>::max(), "MaxFloat32");
+    Check(m::SmallestNonzeroFloat32 == std::numeric_limits<float>::denorm_min(),
+          "SmallestNonzeroFloat32");
+    Check(m::Float32bits(m::MaxFloat32) == 0x7f7fffffU, "Float32bits(MaxFloat32)");
+    Check(m::Float32bits(m::SmallestNonzeroFloat32) == 0x00000001U,
+          "Float32bits(SmallestNonzeroFloat32)");
 
     Check(m::MaxInt8 == 127, "MaxInt8");
     Check(m::MinInt8 == -128, "MinInt8");
@@ -508,6 +514,44 @@ void RunSemanticChecks() {
     Check(std::signbit(m::Min(0.0, -0.0)), "Min(+0, -0) == -0");
     Check(std::signbit(m::Min(-0.0, 0.0)), "Min(-0, +0) == -0");
     Check(!std::signbit(m::Min(0.0, 0.0)), "Min(+0, +0) == +0");
+
+    // Float32bits / Float64bits 的位级往返（对应 Go math 的同名函数）。
+    Check(m::Float64bits(1.0) == 0x3ff0000000000000ULL, "Float64bits(1.0)");
+    Check(m::Float64bits(-0.0) == 0x8000000000000000ULL, "Float64bits(-0.0)");
+    Check(m::Float64bits(m::Inf) == 0x7ff0000000000000ULL, "Float64bits(+Inf)");
+    Check(m::Float64bits(-m::Inf) == 0xfff0000000000000ULL, "Float64bits(-Inf)");
+    Check((m::Float64bits(m::NaN()) & 0x7fffffffffffffffULL) ==
+              0x7ff8000000000000ULL,
+          "Float64bits(NaN) is quiet NaN");
+    Check(m::Float64frombits(0x3ff0000000000000ULL) == 1.0,
+          "Float64frombits(1.0)");
+    Check(std::signbit(m::Float64frombits(0x8000000000000000ULL)),
+          "Float64frombits(-0) keeps sign");
+    Check(std::isnan(m::Float64frombits(0x7ff8000000000001ULL)),
+          "Float64frombits(NaN)");
+    Check(m::Float32bits(1.0f) == 0x3f800000U, "Float32bits(1.0f)");
+    Check(m::Float32bits(-0.0f) == 0x80000000U, "Float32bits(-0.0f)");
+    Check(m::Float32bits(m::Inf(1)) == 0x7f800000U, "Float32bits(+Inf)");
+    Check(m::Float32frombits(0x3f800000U) == 1.0f, "Float32frombits(1.0f)");
+    Check(std::signbit(m::Float32frombits(0x80000000U)),
+          "Float32frombits(-0) keeps sign");
+    Check(std::isnan(m::Float32frombits(0x7fc00001U)), "Float32frombits(NaN)");
+
+    // 10000 个有限/次正规位模式逐一往返：位模式必须原样保留。
+    std::uint64_t state = 0x243f6a8885a308d3ULL;
+    for (int i = 0; i < 10000; ++i) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        if ((state & 0x7ff0000000000000ULL) == 0x7ff0000000000000ULL) {
+            continue;  // 跳过 NaN/Inf，避免 sNaN payload 被平台规范化
+        }
+        const double value = m::Float64frombits(state);
+        Check(m::Float64bits(value) == state, "Float64 bits round-trip");
+        const std::uint32_t low = static_cast<std::uint32_t>(state ^ (state >> 32));
+        if ((low & 0x7f800000U) != 0x7f800000U) {
+            const float value32 = m::Float32frombits(low);
+            Check(m::Float32bits(value32) == low, "Float32 bits round-trip");
+        }
+    }
 
     // Round 半值远离零；-0 保留
     Check(m::Round(-0.5) == -1.0, "Round(-0.5) == -1");

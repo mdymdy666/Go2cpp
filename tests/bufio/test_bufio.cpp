@@ -132,6 +132,15 @@ struct MemorySource {
     }
 };
 
+/// 谎报「读到的比请求多」的违约 Reader：ReadFrom 不能越界读栈缓冲。
+struct OverreportingSource {
+    std::uint64_t calls{0};
+    streams::ReadResult Read(char*, std::size_t size) {
+        ++calls;
+        return streams::ReadResult{size + 1, {}};
+    }
+};
+
 /// 永远返回 (0, nil) 的违约 Reader：验证防挂死保护。
 struct ZeroSource {
     std::uint64_t calls{0};
@@ -1510,8 +1519,11 @@ void ScenarioHttpResponse() {
 /// 场景 3：写日志 —— 批量写、Flush、回读校验；并验证「不 Flush 就析构」。
 void ScenarioLogWrite() {
     Announce("场景3：写日志（Writer 批量写 1 万行 -> Flush -> 回读校验）");
-    const std::string path = "/tmp/go2cpp_bufio_log.txt";
-    const std::string unflushed_path = "/tmp/go2cpp_bufio_log_unflushed.txt";
+    // 并发 ctest 会让两个测试进程共享 /tmp；固定名字会互相截断/删除。
+    const std::string process_tag = std::to_string(::getpid());
+    const std::string path = "/tmp/go2cpp_bufio_log_" + process_tag + ".txt";
+    const std::string unflushed_path =
+        "/tmp/go2cpp_bufio_log_unflushed_" + process_tag + ".txt";
     ::unlink(path.c_str());
     ::unlink(unflushed_path.c_str());
 
@@ -1693,6 +1705,259 @@ void ScenarioSlowSink() {
                     static_cast<double>(sink.calls));
 }
 
+// ---------------------------------------------------------------------------
+// 7. ReadSlice / ReadBytes / UnreadByte / 零长度 Read
+// ---------------------------------------------------------------------------
+void TestReaderSliceBytesUnread() {
+    Announce("reader: ReadSlice / ReadBytes / UnreadByte / zero-length Read");
+    {
+        MemorySource source("line1\nline2\r\nline3");
+        Reader<MemorySource> reader(source, 16);
+        auto first = reader.ReadSlice('\n');
+        CHECK(first.ok());
+        CHECK(ToString(first.Value()) == "line1\n");
+        auto second = reader.ReadSlice('\n');
+        CHECK(second.ok());
+        CHECK(ToString(second.Value()) == "line2\r\n");  // ReadSlice 不剥 \r
+        auto third = reader.ReadSlice('\n');
+        CHECK(!third.ok() && IsEof(third.Err()));
+        CHECK(ToString(third.Value()) == "line3");
+        auto fourth = reader.ReadSlice('\n');
+        CHECK(!fourth.ok() && IsEof(fourth.Err()));
+        CHECK(fourth.Value().empty());
+    }
+    {
+        // 缓冲满仍未遇到分隔符：Go 的 ErrBufferFull，且已读字节被消费。
+        MemorySource source(std::string(100, 'a') + "\n");
+        Reader<MemorySource> reader(source, 16);
+        auto chunk = reader.ReadSlice('\n');
+        CHECK(!chunk.ok());
+        CHECK(Is(chunk.Err(), go2cpp::bufio::ErrBufferFull()));
+        CHECK(chunk.Value().size() == 16);
+        std::string assembled = ToString(chunk.Value());
+        for (int i = 0; i < 20; ++i) {
+            auto next = reader.ReadSlice('\n');
+            assembled += ToString(next.Value());
+            if (next.ok() || IsEof(next.Err())) {
+                break;
+            }
+            CHECK(Is(next.Err(), go2cpp::bufio::ErrBufferFull()));
+        }
+        CHECK(assembled == std::string(100, 'a') + "\n");
+    }
+    {
+        MemorySource source("alpha,beta,gamma");
+        Reader<MemorySource> reader(source, 8);
+        auto token = reader.ReadBytes(',');
+        CHECK(token.ok() && token.Value() == "alpha,");
+        auto rest = reader.ReadBytes(',');
+        CHECK(rest.ok() && rest.Value() == "beta,");
+        auto tail = reader.ReadBytes(',');
+        CHECK(!tail.ok() && IsEof(tail.Err()) && tail.Value() == "gamma");
+    }
+    {
+        MemorySource source("xyz");
+        Reader<MemorySource> reader(source, 16);
+        auto b1 = reader.ReadByte();
+        CHECK(b1.ok() && b1.Value() == 'x');
+        auto b2 = reader.ReadByte();
+        CHECK(b2.ok() && b2.Value() == 'y');
+        CHECK(reader.UnreadByte().ok());
+        auto b3 = reader.ReadByte();
+        CHECK(b3.ok() && b3.Value() == 'y');
+        CHECK(reader.UnreadByte().ok());
+        auto line = reader.ReadLine();
+        CHECK(line.ok() && line.Value() == "yz");
+        auto invalid = reader.UnreadByte();
+        CHECK(!invalid.ok() &&
+              Is(invalid.Err(), go2cpp::bufio::ErrInvalidUnreadByte()));
+        // 读 0 字节必须是 (0, nil)，不能报 EOF（Go 的 io.Reader 契约）。
+        char dummy = 0;
+        const streams::ReadResult zero = reader.Read(&dummy, 0);
+        CHECK(zero.count == 0 && !zero.error);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8. ReadRune / UnreadRune
+// ---------------------------------------------------------------------------
+void TestReaderRune() {
+    Announce("reader: ReadRune / UnreadRune (UTF-8)");
+    {
+        MemorySource source(std::string("A") + "\xC3\xA9" + "\xE2\x82\xAC" +
+                            "\xF0\x9F\x98\x80");
+        Reader<MemorySource> reader(source, 16);
+        auto ascii = reader.ReadRune();
+        CHECK(ascii.ok() && ascii.rune == U'A' && ascii.size == 1);
+        auto e_acute = reader.ReadRune();
+        CHECK(e_acute.ok() && e_acute.rune == 0xE9 && e_acute.size == 2);
+        CHECK(reader.UnreadRune().ok());
+        auto e_acute_again = reader.ReadRune();
+        CHECK(e_acute_again.ok() && e_acute_again.rune == 0xE9 &&
+              e_acute_again.size == 2);
+        auto euro = reader.ReadRune();
+        CHECK(euro.ok() && euro.rune == 0x20AC && euro.size == 3);
+        auto emoji = reader.ReadRune();
+        CHECK(emoji.ok() && emoji.rune == 0x1F600 && emoji.size == 4);
+        auto eof = reader.ReadRune();
+        CHECK(!eof.ok() && IsEof(eof.error));
+    }
+    {
+        // 非法字节：Go 返回 RuneError + size 1，且**不是**错误。
+        MemorySource source("\xFF\x41", 1);
+        Reader<MemorySource> reader(source, 16);
+        auto invalid = reader.ReadRune();
+        CHECK(invalid.ok() &&
+              invalid.rune == go2cpp::bufio::RuneError && invalid.size == 1);
+        auto ascii = reader.ReadRune();
+        CHECK(ascii.ok() && ascii.rune == U'A' && ascii.size == 1);
+    }
+    {
+        // 码位跨填充边界：15 个 ASCII 后跟 2 字节 UTF-8，缓冲 16。
+        MemorySource source(std::string(15, 'x') + "\xC3\xA9");
+        Reader<MemorySource> reader(source, 16);
+        CHECK(reader.Discard(15) == 15);
+        auto rune = reader.ReadRune();
+        CHECK(rune.ok() && rune.rune == 0xE9 && rune.size == 2);
+    }
+    {
+        // 截断序列（EOF）：逐字节返回 RuneError + size 1。
+        MemorySource source("\xE2\x82");
+        Reader<MemorySource> reader(source, 16);
+        auto first = reader.ReadRune();
+        CHECK(first.ok() && first.rune == go2cpp::bufio::RuneError &&
+              first.size == 1);
+        auto second = reader.ReadRune();
+        CHECK(second.ok() && second.rune == go2cpp::bufio::RuneError &&
+              second.size == 1);
+    }
+    {
+        MemorySource source("ab");
+        Reader<MemorySource> reader(source, 16);
+        CHECK(!reader.UnreadRune().ok());
+        auto a = reader.ReadRune();
+        CHECK(a.ok());
+        auto b = reader.ReadByte();
+        CHECK(b.ok());
+        auto invalid = reader.UnreadRune();
+        CHECK(!invalid.ok() &&
+              Is(invalid.Err(), go2cpp::bufio::ErrInvalidUnreadRune()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Writer.ReadFrom / Writer.Reset
+// ---------------------------------------------------------------------------
+void TestWriterReadFromReset() {
+    Announce("writer: ReadFrom / Reset");
+    {
+        MemorySink sink;
+        MemorySource source("hello world");
+        Writer<MemorySink> writer(sink, 8);
+        const auto count = writer.ReadFrom(source);
+        CHECK(count.ok() && count.Value() == 11);
+        CHECK(writer.Flush().ok());
+        CHECK(sink.data == "hello world");
+    }
+    {
+        // 源在 3 字节后注入错误：数据先交付，错误作为返回值。
+        MemorySink sink;
+        FailingSource source;
+        source.data = "abc";
+        source.fail_at = 3;
+        Writer<MemorySink> writer(sink);
+        const auto count = writer.ReadFrom(source);
+        CHECK(!count.ok());
+        CHECK(count.Value() == 3);
+        CHECK(writer.Flush().ok());
+        CHECK(sink.data == "abc");
+    }
+    {
+        // 底层 Reader 违约（n > len(p)）：必须报短写，不能越界读 chunk。
+        MemorySink sink;
+        OverreportingSource source;
+        Writer<MemorySink> writer(sink);
+        const auto count = writer.ReadFrom(source);
+        CHECK(!count.ok());
+        CHECK(Is(count.Err(), streams::IoErrShortWrite()));
+        CHECK(sink.data.empty());
+        CHECK(source.calls == 1);
+    }
+    {
+        // Reset 丢弃未刷出的缓冲，并改绑到新目标。
+        MemorySink first;
+        MemorySink second;
+        Writer<MemorySink> writer(first, 8);
+        CHECK(writer.WriteString("discarded").ok());
+        CHECK(writer.Buffered() > 0);
+        writer.Reset(second);
+        CHECK(writer.Buffered() == 0);
+        CHECK(writer.Err() == nullptr);
+        CHECK(first.data.empty());
+        CHECK(writer.WriteString("kept").ok());
+        CHECK(writer.Flush().ok());
+        CHECK(second.data == "kept");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 10. Scanner.Buffer(max) / ErrFinalToken
+// ---------------------------------------------------------------------------
+void TestScannerBufferFinalToken() {
+    Announce("scanner: Buffer(max) / ErrFinalToken");
+    {
+        MemorySource source(std::string(64, 'a') + "\n");
+        Scanner<MemorySource> scanner(source, 16);
+        scanner.Buffer(32);
+        CHECK(scanner.MaxTokenSize() == 32);
+        CHECK(!scanner.Scan());
+        CHECK(Is(scanner.Err(), go2cpp::bufio::ErrTooLong()));
+    }
+    {
+        MemorySource source(std::string(31, 'a') + "\n");
+        Scanner<MemorySource> scanner(source, 16);
+        scanner.Buffer(32);
+        CHECK(scanner.Scan());
+        CHECK(scanner.Text().size() == 31);
+        CHECK(!scanner.Scan());
+        CHECK(scanner.Err() == nullptr);
+    }
+    {
+        // ErrFinalToken：最后一次 Scan 返回 true（交付 token），随后 false + 空错误。
+        MemorySource source("tail");
+        Scanner<MemorySource> scanner(source, 16);
+        scanner.SetSplit([](ByteSpan data, bool at_eof) {
+            SplitResult result;
+            if (at_eof && !data.empty()) {
+                result.advance = data.size();
+                result.token = data;
+                result.error = go2cpp::bufio::ErrFinalToken();
+            }
+            return result;
+        });
+        CHECK(scanner.Scan());
+        CHECK(scanner.Text() == "tail");
+        CHECK(!scanner.Scan());
+        CHECK(scanner.Err() == nullptr);
+        CHECK(scanner.Text() == "tail");  // 最终 token 保留到下一次 Scan
+    }
+    {
+        // 普通错误仍然终止扫描并写 Err()。
+        MemorySource source("data");
+        Scanner<MemorySource> scanner(source, 16);
+        scanner.SetSplit([](ByteSpan, bool at_eof) {
+            SplitResult result;
+            if (at_eof) {
+                result.error = NewError("split: injected");
+            }
+            return result;
+        });
+        CHECK(!scanner.Scan());
+        CHECK(scanner.Err() != nullptr);
+        CHECK(!scanner.Scan());
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1709,6 +1974,10 @@ int main() {
     TestScannerBasics();
     TestScannerSplits();
     TestEdgeCases();
+    TestReaderSliceBytesUnread();
+    TestReaderRune();
+    TestWriterReadFromReset();
+    TestScannerBufferFinalToken();
 
     RandomReadLine();
     RandomRead();

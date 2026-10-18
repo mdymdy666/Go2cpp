@@ -65,6 +65,85 @@
 
 namespace go2cpp::bufio {
 
+/// Unicode 码位（对应 Go 的 `rune` = `int32`）。
+using Rune = std::int32_t;
+
+/// 非法 UTF-8 字节的替换码位（对应 Go `utf8.RuneError` = U+FFFD）。
+inline constexpr Rune RuneError = 0xFFFD;
+
+/// `Reader::ReadRune` 的返回值（对应 Go 的 `(rune, size, error)`）。
+struct ReadRuneResult final {
+    /// 解出的码位；错误时为 0。
+    Rune rune{0};
+    /// 消耗的字节数（非法/截断序列也返回 1，与 Go `utf8.DecodeRune` 一致）。
+    int size{0};
+    /// 出错时的错误（EOF 等）；成功为空。
+    ErrorPtr error;
+
+    /// 成功即 true（与 Go 的 `err == nil` 对应）。
+    bool ok() const noexcept { return error == nullptr; }
+    explicit operator bool() const noexcept { return ok(); }
+};
+
+namespace detail {
+
+/**
+ * @brief 从 `[data, data + available)` 解码一个 UTF-8 rune。
+ * @param out 成功/替换时写入码位。
+ * @return 消耗的字节数（1..4）。非法或截断序列返回 U+FFFD + 1，与 Go
+ *         `utf8.DecodeRune` 的约定一致。
+ */
+inline int DecodeUtf8(const std::uint8_t* data, std::size_t available,
+                      Rune* out) noexcept {
+    if (available == 0) {
+        return 1;
+    }
+    const std::uint8_t first = data[0];
+    if (first < 0x80) {
+        *out = static_cast<Rune>(first);
+        return 1;
+    }
+    std::size_t need = 0;
+    std::uint32_t code = 0;
+    std::uint32_t minimum = 0;
+    if ((first & 0xE0u) == 0xC0u) {
+        need = 2;
+        code = first & 0x1Fu;
+        minimum = 0x80u;
+    } else if ((first & 0xF0u) == 0xE0u) {
+        need = 3;
+        code = first & 0x0Fu;
+        minimum = 0x800u;
+    } else if ((first & 0xF8u) == 0xF0u) {
+        need = 4;
+        code = first & 0x07u;
+        minimum = 0x10000u;
+    } else {
+        *out = RuneError;
+        return 1;
+    }
+    if (available < need) {
+        *out = RuneError;
+        return 1;  // 截断序列：只吃掉首字节，后续字节下一轮再判
+    }
+    for (std::size_t i = 1; i < need; ++i) {
+        if ((data[i] & 0xC0u) != 0x80u) {
+            *out = RuneError;
+            return 1;
+        }
+        code = (code << 6) | (data[i] & 0x3Fu);
+    }
+    if (code < minimum || code > 0x10FFFFu ||
+        (code >= 0xD800u && code <= 0xDFFFu)) {
+        *out = RuneError;
+        return 1;
+    }
+    *out = static_cast<Rune>(code);
+    return static_cast<int>(need);
+}
+
+}  // namespace detail
+
 /**
  * @brief 带缓冲的 Reader 装饰器。
  * @tparam ReaderT 底层 Reader 类型（需满足上面文件注释里的 `Read` 契约）。
@@ -99,6 +178,7 @@ public:
      *         用 `Err()` 区分正常 EOF 与错误。
      */
     std::size_t Read(ByteSpan p) {
+        InvalidateUnread();
         if (p.empty()) {
             return 0;
         }
@@ -137,6 +217,11 @@ public:
      *          有数据时先返回数据（错误留到下一次调用）。
      */
     streams::ReadResult Read(char* buffer, std::size_t size) {
+        // Go 的 bufio.Reader.Read 对 len(p)==0 返回 (0, nil)；这里不能落到
+        // 下面的 count==0 分支（那会把「读 0 字节」误报成 EOF）。
+        if (size == 0) {
+            return streams::ReadResult{0, {}};
+        }
         const std::size_t count = Read(AsBytes(buffer, size));
         if (count > 0) {
             return streams::ReadResult{count, {}};
@@ -149,13 +234,81 @@ public:
      * @return 成功时 `Value()` 为字节值；EOF/错误时 `Err()` 非空。
      */
     Result<std::uint8_t> ReadByte() {
+        InvalidateUnread();
         while (m_r == m_w && !m_err) {
             fill();
         }
         if (m_r == m_w) {
             return Result<std::uint8_t>(m_err ? m_err : streams::IoEof());
         }
-        return Result<std::uint8_t>(m_buffer[m_r++]);
+        const std::uint8_t value = m_buffer[m_r++];
+        m_can_unread_byte = true;
+        return Result<std::uint8_t>(value);
+    }
+
+    /**
+     * @brief 对应 Go `Reader.ReadRune`：解码一个 UTF-8 码位。
+     * @return 码位 + 消耗字节数；非法/截断序列返回 `RuneError`（U+FFFD）且
+     *         `size == 1`，与 Go `utf8.DecodeRune` 一致（**不是**错误）。
+     *         EOF/底层错误时 `error` 非空。
+     * @note 成功后可立即 `UnreadRune()`；任何其它读操作都会让 Unread 失效。
+     */
+    ReadRuneResult ReadRune() {
+        InvalidateUnread();
+        while (m_r == m_w && !m_err) {
+            fill();
+        }
+        if (m_r == m_w) {
+            return ReadRuneResult{0, 0, m_err ? m_err : streams::IoEof()};
+        }
+        const std::uint8_t first = m_buffer[m_r];
+        std::size_t need = 1;
+        if (first >= 0xF0u) {
+            need = 4;
+        } else if (first >= 0xE0u) {
+            need = 3;
+        } else if (first >= 0xC0u) {
+            need = 2;
+        }
+        // 码位可能跨填充边界：先尽量凑够 need 字节（EOF 时以现有字节解码）。
+        while (m_w - m_r < need && !m_err) {
+            fill();
+        }
+        Rune decoded = RuneError;
+        const int size = detail::DecodeUtf8(m_buffer.data() + m_r, m_w - m_r,
+                                            &decoded);
+        m_r += static_cast<std::size_t>(size);
+        m_last_rune_size = size;
+        return ReadRuneResult{decoded, size, nullptr};
+    }
+
+    /**
+     * @brief 对应 Go `Reader.UnreadByte`：撤销最近一次 `ReadByte`。
+     * @return 最近一次操作不是 `ReadByte` 时返回 `ErrInvalidUnreadByte()`。
+     */
+    Result<void> UnreadByte() {
+        if (!m_can_unread_byte || m_r == 0) {
+            return Result<void>(ErrInvalidUnreadByte());
+        }
+        --m_r;
+        m_can_unread_byte = false;
+        m_last_rune_size = -1;
+        return Result<void>();
+    }
+
+    /**
+     * @brief 对应 Go `Reader.UnreadRune`：撤销最近一次 `ReadRune`。
+     * @return 最近一次操作不是 `ReadRune` 时返回 `ErrInvalidUnreadRune()`。
+     */
+    Result<void> UnreadRune() {
+        if (m_last_rune_size <= 0 ||
+            static_cast<std::size_t>(m_last_rune_size) > m_r) {
+            return Result<void>(ErrInvalidUnreadRune());
+        }
+        m_r -= static_cast<std::size_t>(m_last_rune_size);
+        m_last_rune_size = -1;
+        m_can_unread_byte = false;
+        return Result<void>();
     }
 
     /**
@@ -169,6 +322,7 @@ public:
      *       `ScanLines` 则会在 EOF 时也丢掉 `\r`（同样对齐 Go）。
      */
     Result<std::string> ReadLine() {
+        InvalidateUnread();
         std::string line;
         const std::size_t max_length = m_buffer.size();
         while (true) {
@@ -236,6 +390,7 @@ public:
      * @note 长度不受缓冲容量限制（与 Go 一致）：内容会跨多次填充累积。
      */
     Result<std::string> ReadString(char delim) {
+        InvalidateUnread();
         const std::uint8_t target = static_cast<std::uint8_t>(delim);
         std::string text;
         while (true) {
@@ -263,6 +418,61 @@ public:
     }
 
     /**
+     * @brief 对应 Go `Reader.ReadSlice`：读到分隔符为止，**结果包含分隔符**。
+     * @return 指向内部缓冲的视图（下一次读操作后失效）。
+     *         - 找到分隔符：成功；
+     *         - 缓冲（`Size()` 字节）已满仍未找到：返回**已有全部数据** +
+     *           `ErrBufferFull()`（Go 同样消费掉这些字节）；
+     *         - EOF 前无分隔符：返回已有数据 + `streams::IoEof()`；完全没数据时
+     *           只返回 EOF。
+     * @note 与 Go 一致：`ReadSlice` 不剥离 `\r`，也不跨 `ErrBufferFull` 拼接；
+     *       需要「一次拿到整行」请用 `ReadBytes`/`ReadString`。
+     */
+    Result<ByteSpan> ReadSlice(char delim) {
+        InvalidateUnread();
+        const std::uint8_t target = static_cast<std::uint8_t>(delim);
+        for (;;) {
+            if (m_r < m_w) {
+                const std::uint8_t* const start = m_buffer.data() + m_r;
+                const std::size_t available = m_w - m_r;
+                const void* const found = std::memchr(start, target, available);
+                if (found != nullptr) {
+                    const std::size_t take =
+                        static_cast<std::size_t>(
+                            static_cast<const std::uint8_t*>(found) - start) +
+                        1;
+                    const ByteSpan slice(m_buffer.data() + m_r, take);
+                    m_r += take;
+                    return Result<ByteSpan>(slice);
+                }
+                if (available == m_buffer.size()) {
+                    const ByteSpan slice(m_buffer.data() + m_r, available);
+                    m_r = m_w;
+                    return Result<ByteSpan>(slice, ErrBufferFull());
+                }
+            }
+            if (m_err) {
+                const std::size_t available = m_w - m_r;
+                if (available > 0) {
+                    const ByteSpan slice(m_buffer.data() + m_r, available);
+                    m_r = m_w;
+                    return Result<ByteSpan>(slice, m_err);
+                }
+                return Result<ByteSpan>(m_err);
+            }
+            fill();
+        }
+    }
+
+    /**
+     * @brief 对应 Go `Reader.ReadBytes`：与 `ReadString` 相同，结果按字节串返回。
+     * @note C++ 侧用 `std::string` 承载任意字节（不是 C 字符串语义）。
+     */
+    Result<std::string> ReadBytes(char delim) {
+        return ReadString(delim);
+    }
+
+    /**
      * @brief 查看缓冲区接下来的 `n` 字节，**零拷贝、不消费**。
      * @param n 期望看到的字节数。
      * @return 指向内部缓冲的 `ByteSpan`（长度 `n`）；`n > Size()` 时为
@@ -271,6 +481,7 @@ public:
      *          之后失效。不要改写它指向的内容。
      */
     Result<ByteSpan> Peek(std::size_t n) {
+        InvalidateUnread();
         if (n > m_buffer.size()) {
             return Result<ByteSpan>(ErrBufferFull());
         }
@@ -291,6 +502,7 @@ public:
      * @return 实际丢弃的字节数；小于 `n` 说明中途遇到 EOF/错误（见 `Err()`）。
      */
     std::size_t Discard(std::size_t n) {
+        InvalidateUnread();
         std::size_t discarded = 0;
         while (discarded < n) {
             if (m_r < m_w) {
@@ -317,6 +529,13 @@ public:
     const ErrorPtr& Err() const noexcept { return m_err; }
 
 private:
+    /// 任何读操作（除 Unread* 与 ReadByte/ReadRune 自身）都会让 Unread 失效，
+    /// 与 Go 的 `lastByte`/`lastRuneSize` 语义一致。
+    void InvalidateUnread() noexcept {
+        m_can_unread_byte = false;
+        m_last_rune_size = -1;
+    }
+
     /// 记录「无进展」的底层读结果；连续太多次就判定底层违约。
     void NoteIdleRead(const ErrorPtr& error) {
         if (error) {
@@ -369,6 +588,8 @@ private:
     std::size_t m_w{0};          ///< 写游标（已从底层读到的位置）
     std::size_t m_empty_reads{0};  ///< 连续「0 字节无错误」次数
     ErrorPtr m_err;              ///< 粘性错误（含 EOF）
+    bool m_can_unread_byte{false};  ///< 上一次操作是否是可撤销的 ReadByte
+    int m_last_rune_size{-1};       ///< ReadRune 消耗的字节数（-1 表示不可撤销）
 };
 
 }  // namespace go2cpp::bufio
