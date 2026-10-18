@@ -38,3 +38,21 @@
 | 6~10 | 09:10~10:00 | `fiber.cpp` 的 `Fiber::Impl` 20 成员；`hook.cpp` 的 `inspect` 链与 `cooperative_io`；`io.cpp` 的 `FdSlot`/`claim`/`SlotStripe`；`scheduler.cpp` 的 `shutdown_for`/`spawn`/`Task::run`；`sync.cpp` 的 `Mutex::Impl`/`ConditionVariable::Impl`/`WaitGroup::Impl` | 进行中 |
 | 11~15 | 10:00~10:45 | `scheduler.cpp` 的 `Processor`/`Machine`；`parking_condition.cpp` 的 `WaitNode`；`timer.cpp` 的 `TimerService::Impl`；`io.cpp` 的 `DescriptorRegistryState::Stripe`/`State::WaitNode`/`stop_operations` | 进行中 |
 | 16~20 | 10:45~11:05 | 收子 agent 批次：event.hpp/fmt/strconv/container/bytes/debug/rand；第八、九批提交（`48e7201`、`9th`）；发现并修复 `event.hpp` 丢失 `#pragma once` | 进行中 |
+
+
+---
+
+## 完成状态（2026-10-19 11:20）
+
+**注释工作已完成。**
+
+- 提交：22 个 commit（`b66f9e2` → `9a58f73`）
+- 真实缺口：**0**（改进版扫描器 `_class_doc_scan2.py` 的 40 条命中全部是
+  `::Impl` / 前向声明 / 函数内局部 struct / 系统类型 / `http3` 未分配模块）
+- `ctest`：113/113
+- 状态机文档：18 份（`docs/state-machines/`）
+- 规范：`docs/annotation-style.md`
+- 场景分析：`docs/gmp-use-cases.md`
+
+**扫描器口径说明**：给前向声明或 `::Impl` 加注释只会制造噪音，因此不补。
+真实缺口为 0 的判定依据是逐条人工核对（见主干对话的轮次 51）。
