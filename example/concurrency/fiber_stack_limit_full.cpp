@@ -464,7 +464,9 @@ Outcome probe_dump(std::size_t depth) {
     });
 }
 
-/// 解析 depth 层后拷贝一份：上游拷贝同样是递归的，且比 dump 更吃栈。
+/// 解析 depth 层后拷贝一份。**注意**：nlohmann::json 的拷贝是深拷贝（递归），
+/// 但实测其临界深度高于 dump（1631 vs 1162）—— dump() 需要序列化 + 字符串拼接，
+/// 栈帧更大。所以「拷贝更吃栈」是个错误假设，不能作为断言依据。
 Outcome probe_copy(std::size_t depth) {
     const std::string text = nested_json(depth, false);
     return run_in_fiber([&] {
@@ -518,7 +520,7 @@ bool scenario_parse_vs_recursion() {
         find_critical_depth([&](std::size_t d) { return probe_copy(d); });
 
     const bool ok = parse_only == Outcome::kOk && dump_crash == Outcome::kCrash &&
-                    copy_crash == Outcome::kCrash && copy_limit < dump_limit &&
+                    copy_crash == Outcome::kCrash &&
                     dump_limit >= 100 && dump_limit <= 6000;
 
     std::cout << "  解析 " << kDeep << " 层 = " << describe(parse_only)
