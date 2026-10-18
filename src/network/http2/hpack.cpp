@@ -492,7 +492,7 @@ HpackStatus DecodeName(const std::uint8_t* in, std::size_t length,
  * @brief 解码一整块 header block。
  *
  * ## 步骤
- * step1. 首字节 `001xxxxx` -> 动态表大小更新（不得超过 SHETTINGS 上限）；
+ * step1. 首字节 `001xxxxx` -> 动态表大小更新（不得超过 SETTINGS 上限）；
  * step2. 首字节 `1xxxxxxx` -> 索引字段（静态 <=61，动态按相对索引）；
  * step3. 首字节 `01xxxxxx` -> 含增量索引的字面量（名字/值解析后 `Add()`）；
  * step4. 首字节 `0000xxxx` / `0001xxxx` -> 不含索引 / 绝不索引的字面量（不入表）；

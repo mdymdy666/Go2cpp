@@ -1,3 +1,29 @@
+/**
+ * @file error.cpp
+ * @brief `tools/error.hpp` 的实现：错误图遍历、深链安全析构与消息展平。
+ *
+ * ## 模块定位
+ *
+ * 错误基础设施的实现层：`Error` 的默认 `UnwrapAll`、三种内置错误的消息/
+ * 析构、`Is`/`As` 的图遍历与工厂函数。被全项目所有模块间接使用。
+ *
+ * ## 本文件定义什么
+ *
+ * - `WalkErrors`：环安全、异常安全的错误图遍历；
+ * - `WrappedError`/`JoinError` 的析构与 `Message()`；
+ * - `NewError`/`Wrap`/`Join`/`Unwrap`/`UnwrapAll`/`ErrorMessage`；
+ * - `Is` 及其内部 `IsImpl`；线程本地释放工作表。
+ *
+ * ## 阅读建议
+ *
+ * 先读两个析构函数的「工作表迭代释放」——这是深链/深图不爆栈的关键；
+ * 再看 `WrappedError::Message`/`JoinError::Message` 如何用迭代展平。
+ *
+ * ## 边界与陷阱
+ *
+ * 析构期间不能再递归释放 `shared_ptr` 成员，否则深链会耗尽原生栈；所有
+ * `noexcept` 查询（`WalkErrors`/`Is`）必须把自定义错误的异常吞掉并返回失败。
+ */
 #include "go2cpp/error.hpp"
 
 #include <sstream>
@@ -14,15 +40,27 @@ namespace go2cpp
     // 的释放过程再用迭代方式排空工作表。
     thread_local std::vector<ErrorPtr> *t_error_release_work = nullptr;
 
+    /**
+     * @brief 迭代释放一条 `WrappedError` 原因链，避免递归析构爆栈。
+     *
+     * ## 步骤
+     * step1. 把传入的 cause 放进显式工作表；
+     * step2. 把自己的工作表挂到线程本地槽位；
+     * step3. 反复弹栈并 `reset()`；被释放的 `WrappedError` 会把其 cause 追加回工作表；
+     * step4. 恢复线程本地槽位。
+     */
     void ReleaseWrappedCause(ErrorPtr cause) noexcept
     {
+      // step1: 非空 cause 才需要释放
       std::vector<ErrorPtr> pending;
       if (cause)
       {
         pending.push_back(std::move(cause));
       }
+      // step2: 挂上线程本地工作表，析构函数会把子 cause 追加进来
       auto *previous = t_error_release_work;
       t_error_release_work = &pending;
+      // step3: 迭代排空，避免递归
       while (!pending.empty())
       {
         ErrorPtr current = std::move(pending.back());
@@ -51,12 +89,14 @@ namespace go2cpp
   /// @note 自定义 Error 的 UnwrapAll/访问器异常会被隔离，不会让错误处理路径终止进程。
   bool WalkErrors(const ErrorPtr &error, const ErrorVisitor &visitor) noexcept
   {
+    // step1: 空访问器直接失败，避免调用空 std::function
     if (!visitor)
     {
       return false;
     }
     try
     {
+      // step2: 显式工作表 + 地址去重，兼容有环的错误图
       std::vector<ErrorPtr> pending;
       std::unordered_set<const Error *> visited;
       if (error)
@@ -71,6 +111,7 @@ namespace go2cpp
         {
           continue;
         }
+        // step3: 访问器可以叫停；随后把全部原因压栈（逆序保持原顺序）
         if (visitor(current) == ErrorVisitResult::kStop)
         {
           return false;
@@ -88,12 +129,14 @@ namespace go2cpp
     }
     catch (...)
     {
+      // step4: 自定义 UnwrapAll/访问器抛异常时按「遍历失败」返回，不穿过 noexcept
       return false;
     }
   }
 
   WrappedError::~WrappedError()
   {
+    // 已经处于释放流程中：把 cause 交回工作表，由最外层循环迭代释放
     if (t_error_release_work != nullptr)
     {
       if (m_cause)
@@ -102,11 +145,13 @@ namespace go2cpp
       }
       return;
     }
+    // 最外层析构：建立工作表并迭代释放整条链
     ReleaseWrappedCause(std::move(m_cause));
   }
 
   JoinError::~JoinError()
   {
+    // 已经处于释放流程中：把全部原因交回工作表
     if (t_error_release_work != nullptr)
     {
       for (auto &cause : m_causes)
@@ -119,6 +164,7 @@ namespace go2cpp
       return;
     }
 
+    // 最外层析构：先搬进本地工作表，再挂到线程本地槽位迭代排空
     std::vector<ErrorPtr> pending;
     pending.reserve(m_causes.size());
     for (auto &cause : m_causes)
@@ -141,6 +187,7 @@ namespace go2cpp
 
   std::string WrappedError::Message() const
   {
+    // step1: 逐层拼接同类型包装的 m_message
     std::string result;
     const WrappedError *current = this;
     ErrorPtr current_owner;
@@ -159,6 +206,7 @@ namespace go2cpp
 
     for (;;)
     {
+      // step2: 先追加当前层描述
       append(current->m_message);
       ErrorPtr cause = current->m_cause;
       if (!cause)
@@ -168,9 +216,11 @@ namespace go2cpp
       const auto *wrapped = dynamic_cast<const WrappedError *>(cause.get());
       if (wrapped == nullptr)
       {
+        // step3: 遇到非 WrappedError 原因，递归它的 Message() 后结束
         append(cause->Message());
         break;
       }
+      // step4: 同类包装继续迭代，不递归
       current = wrapped;
       // 先推进裸指针，再释放前一个所有者。新的所有者会让 `current` 指向的
       // 对象继续存活到下一轮循环。
@@ -195,6 +245,12 @@ namespace go2cpp
   {
     // 使用显式工作表展开内置的嵌套 Join。对于生成的深层错误图，递归调用
     // `Join({previous, next})` 的 Message() 会耗尽原生栈。
+    //
+    // ## 步骤
+    // step1. 把全部原因逆序压栈，保证输出顺序与原因顺序一致；
+    // step2. 弹栈；遇到嵌套 JoinError 就把它的原因展开压栈，不递归调用；
+    // step3. 遇到叶子错误则取其 Message()，非空时用换行连接；
+    // step4. 工作表排空后返回拼好的文本。
     std::string result;
     std::vector<ErrorPtr> pending;
     for (auto it = m_causes.rbegin(); it != m_causes.rend(); ++it)
@@ -204,6 +260,7 @@ namespace go2cpp
         pending.push_back(*it);
       }
     }
+    // step2: 迭代展开，嵌套 Join 只把子原因压栈
     bool first = true;
     while (!pending.empty())
     {
@@ -225,6 +282,7 @@ namespace go2cpp
         }
         continue;
       }
+      // step3: 叶子错误：取文本并用换行拼接
       const std::string part = current->Message();
       if (part.empty())
       {
@@ -237,6 +295,7 @@ namespace go2cpp
       first = false;
       result += part;
     }
+    // step4: 全部展开完成
     return result;
   }
 

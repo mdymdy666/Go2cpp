@@ -84,8 +84,38 @@ namespace {
 constexpr int kSpinBudget = 128;
 }  // namespace
 
+/**
+ * @brief 单个等待者的节点（一个 `wait*` 调用对应一个）。
+ *
+ * ## 定位
+ *
+ * `ParkingCondition::wait*` 在阻塞前创建它：受管 G 把它绑到
+ * `Fiber::Suspend` 的 continuation 上，普通线程把它挂到 `m_waiters` 队列。
+ * 唤醒方（`notify_one/notify_all`、定时器、Context 取消回调）通过
+ * `Finish(...)` 认领它。上层使用者：`Scheduler` 的 park 路径、`sync::Mutex` 的
+ * 普通线程等待、`channel`/`future`。
+ *
+ * ## 状态机（四态、单向）
+ *
+ * ```text
+ * kWaiting -(Finish(kNotified))->  kNotified
+ * kWaiting -(Finish(kTimedOut))->  kTimedOut
+ * kWaiting -(Finish(kCancelled))-> kCancelled
+ * ```
+ *
+ * `Finish` 用 CAS，**只有第一个调用者成功** —— 与 `io::IOManager` 的 `claim`
+ * 是同一模式：一个等待者只能被一个源完成，重复唤醒会让同一个 G 被两个 worker
+ * 执行。`result()` 在被唤醒后只读。
+ *
+ * ## Disarm 门（为什么 Wake 要加锁）
+ *
+ * `Wake()` 持 `m_wake_mutex` 并检查 `m_active`：`Disarm` 会等待所有在途回调
+ * 离开这道门后才允许等待者的栈被回收。否则会出现「Scheduler 指针已随 G 的栈
+ * 失效、回调仍拿它调 `wake_or_cancel`」的 UAF。
+ */
 class ParkingCondition::WaitNode final {
 public:
+    /// @brief 等待结果四态；`kWaiting` 是唯一可被 Finish 改写的初态。
     enum class Result { kWaiting, kNotified, kTimedOut, kCancelled };
 
     WaitNode(ParkingCondition* owner, Scheduler* scheduler,
