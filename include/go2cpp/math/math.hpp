@@ -137,6 +137,17 @@ inline constexpr std::intptr_t MinInt = std::numeric_limits<std::intptr_t>::min(
  * @brief 对应 `math.Inf(sign)`，同时提供常量式用法 `math.Inf`。
  * @details `sign >= 0` 返回 `+Inf`，否则返回 `-Inf`（与 Go 一致）。
  *          隐式转换到 `double` 得到 `+Inf`，因此 `double x = math::Inf;` 可直接使用。
+ *
+ * ## 定位
+ *
+ * 为同时支持 Go 的 `math.Inf(sign)` 调用形态与 `math.Inf` 常量形态而存在；
+ * `src/math/math.cpp` 的 `Max`/`Min` 用它返回 `±Inf`，用户代码用隐式转换取 `+Inf`。
+ *
+ * ## 不变量
+ *
+ * - `operator()(sign)` 对 `sign >= 0` 恒为 `+Inf`、对 `sign < 0` 恒为 `-Inf`；
+ *   `sign == 0` 走 `>= 0` 分支，所以 `Inf(0) == +Inf`。
+ * - 隐式转换与 `operator()(0)` 恒等（都为 `+Inf`），二者不会产生分歧。
  */
 struct InfConstant final {
     /// 对应 `math.Inf(sign)`。
@@ -315,6 +326,17 @@ struct ModfResult final {
 ModfResult Modf(double f) noexcept;
 
 /// `math.Frexp` 的返回值：`frac * 2^exp == f`，且 `0.5 <= |frac| < 1`（有限非零时）。
+/**
+ * ## 定位
+ *
+ * `Frexp` 的双返回值载体，供 `tests/math/test_math.cpp` 与需要拆解浮点指数的调用方
+ * 使用；Go 侧对应 `func Frexp(f float64) (frac float64, exp int)`。
+ *
+ * ## 不变量
+ *
+ * - 有限非零输入下 `frac * 2^exp == f` 精确成立，且 `0.5 <= |frac| < 1`。
+ * - `±0`、`±Inf`、`NaN` 输入的 `exp` 恒为 0，`frac` 等于输入（保留符号）。
+ */
 struct FrexpResult final {
     /// 归一化后的尾数，区间 `[0.5, 1)`（负数时 `(-1, -0.5]`）。
     double frac;

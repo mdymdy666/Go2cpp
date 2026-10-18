@@ -127,13 +127,24 @@ ModfResult Modf(double f) noexcept {
     return ModfResult{integral, fractional};
 }
 
+/**
+ * @brief 按 Go 的特殊值规则拆出尾数与指数。
+ *
+ * ## 步骤
+ * step1. `±0` 直接返回 `{f, 0}`：必须保留 `-0` 的符号位，不能让 `std::frexp` 处理；
+ * step2. `±Inf` / `NaN` 返回 `{f, 0}`（Go 文档规定指数为 0）；
+ * step3. 有限非零值委托 `std::frexp`，其归一化规则（含次正规数）与 Go 一致。
+ */
 FrexpResult Frexp(double f) noexcept {
+    // step1: ±0 保留符号，指数 0。
     if (f == 0.0) {
-        return FrexpResult{f, 0};  // 保留 -0 的符号，指数为 0
+        return FrexpResult{f, 0};
     }
+    // step2: ±Inf / NaN 的指数固定为 0。
     if (std::isinf(f) || std::isnan(f)) {
         return FrexpResult{f, 0};
     }
+    // step3: 有限非零值走 libm。
     int exp = 0;
     const double frac = std::frexp(f, &exp);
     return FrexpResult{frac, exp};

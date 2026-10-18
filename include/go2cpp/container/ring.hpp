@@ -217,8 +217,8 @@ class Ring {
     T Value;
 
  private:
-    Ring* m_next;
-    Ring* m_prev;
+    Ring* m_next;  ///< 后继；Link/Unlink/析构改写，Next/Move/Do/Len 读取
+    Ring* m_prev;  ///< 前驱；Link/Unlink/析构改写，Prev/Move 读取
 };
 
 }  // namespace go2cpp::container

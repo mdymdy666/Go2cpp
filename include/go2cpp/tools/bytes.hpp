@@ -29,6 +29,28 @@
  *       `ToTitle`/`Title`（前四个需要回调且与 `strings` 的对应物同构，后续可与 `strings` 一起补）；
  *       `Reader` 未实现 `WriteTo`（Go 用它优化 `io.Copy`，本模块留待需要时补）；
  *       `Buffer.ReadFrom` 的「预分配/增长」策略比 Go 简单（不与 Go 的 `MinRead` 优化对齐）。
+ *
+ * ## 模块定位
+ * Go `bytes` 的对应物：`[]byte` 操作（**转发到 `strings` 同名函数**，避免两份实现
+ * 漂移）+ `Buffer`/`Reader` 两个有状态类。被 `streams` 的使用方、HTTP 组帧与测试使用。
+ *
+ * ## 本文件定义什么
+ * - 类型别名：`Bytes`（`std::string`）/ `ByteSlices`；
+ * - 无状态函数族：判定/查找/切分/连接/修剪，全部转发 `go2cpp::strings`；
+ * - `Buffer`：可读可写，实现 `streams` 的 8 个接口（含 `Next`/`ReadBytes`/`UnreadByte`）；
+ * - `Reader`：只读可定位，实现 5 个接口（含 `ReadAt` 不改变游标）。
+ *
+ * ## 阅读建议
+ * 先看 `Buffer` 的双游标（`m_data` + `m_read_offset`）与 `Next`/`ReadBytes` 的截断语义，
+ * 再看 `Reader::ReadAt` 为什么不改变游标，最后看 `WriteTo` 只写未读部分。
+ *
+ * ## 边界与陷阱
+ * - Go 的 `string` 与 `[]byte` 是两个类型，C++ 里同为 `std::string`；参数用
+ *   `string_view` 可同时接受两者，但**返回新切片时必须返回 `Bytes`**（返回 view 会悬垂）；
+ * - `Buffer.Read` 在缓冲为空时返回 `io.EOF`（不是 0 字节无错误）；
+ * - `UnreadByte` 只在**上一次是成功读**时有效，否则报错；
+ * - `Buffer.WriteTo` 只写未读部分，并推进读游标；
+ * - `Reader`/`Buffer` 的 `ReadAt` 是绝对定位读，**不影响**读游标。
  */
 
 #pragma once
@@ -244,6 +266,15 @@ inline Bytes TrimSuffix(std::string_view data, std::string_view suffix) {
 /**
  * @brief 对应 `bytes.Buffer`：可读可写的字节缓冲，同时实现 `streams` 的读写接口。
  * @details 读游标与写位置分离：`Read` 从读游标推进，`Write` 追加到末尾（与 Go 一致）。
+ *
+ * ## 定位
+ * 被需要「先写后读」的场景使用（组装响应、测试替身、`streams::ReaderFrom` 目标）；
+ * 通过实现 `streams` 的接口与 `Copy`/`ReadAll` 等组合函数互操作。
+ *
+ * ## 不变量
+ * - `m_read_offset <= m_data.size()`：读只推进游标，写只追加到末尾；
+ * - `Len() == size - m_read_offset`（未读字节数）；
+ * - `m_last_op_was_read` 只在成功读之后为真，`UnreadByte`/`UnreadRune` 依赖它。
  */
 class Buffer final : public streams::Reader,
                      public streams::Writer,
@@ -287,6 +318,14 @@ public:
 
     // ---- 读 ----
     /// 对应 `Buffer.Read`：缓冲为空时返回 `io.EOF`。
+    /**
+     * @brief 对应 `Buffer.Read`（缓冲为空返回 io.EOF）。
+     *
+     * ## 步骤
+     * step1. 计算未读字节数；
+     * step2. 取 `min(size, available)`，为 0 时返回 `IoEof()`；
+     * step3. `memcpy` 到调用方缓冲，推进 `m_read_offset`，标记上一次是读。
+     */
     streams::ReadResult Read(char* out, std::size_t size) override {
         const std::size_t available = m_data.size() - m_read_offset;
         const std::size_t take = size < available ? size : available;
@@ -318,6 +357,15 @@ public:
      * @brief 对应 `Buffer.Next(n)`。
      * @details `n > Len()` 时返回剩余全部并清空缓冲；缓冲为空时返回空切片且**不带错误**（与 Go 一致）。
      */
+    /**
+     * @brief 对应 `Buffer.Next(n)`：取走接下来 n 字节。
+     *
+     * ## 步骤
+     * step1. 取 `min(n, available)`，拷出子串；
+     * step2. 推进读游标；
+     * step3. 若读到末尾则清空缓冲并复位游标（Go 的回收语义）；
+     * step4. 缓冲为空时返回空串且**不带错误**。
+     */
     Bytes Next(std::size_t n) {
         const std::size_t available = m_data.size() - m_read_offset;
         const std::size_t take = n < available ? n : available;
@@ -332,6 +380,14 @@ public:
     }
     /**
      * @brief 对应 `Buffer.ReadBytes(delim)`：返回**包含分隔符**的片段；未找到时返回剩余全部并带 `io.EOF`。
+     */
+    /**
+     * @brief 对应 `Buffer.ReadBytes`（返回内容包含分隔符）。
+     *
+     * ## 步骤
+     * step1. 从读游标起 `find` 分隔符；
+     * step2. 找到 -> 返回 `[m_read_offset, pos]`（含分隔符），游标移到 pos+1；
+     * step3. 没找到 -> 返回剩余全部并**清空缓冲**，同时带 `IoEof()`。
      */
     std::pair<Bytes, ErrorPtr> ReadBytes(char delimiter) {
         const auto position = m_data.find(delimiter, m_read_offset);
@@ -352,6 +408,13 @@ public:
     std::pair<Bytes, ErrorPtr> ReadString(char delimiter) { return ReadBytes(delimiter); }
 
     /// 对应 `Buffer.UnreadByte`：只在**上一次是成功读**时有效。
+    /**
+     * @brief 对应 `Buffer.UnreadByte`：回退一个字节。
+     *
+     * ## 步骤
+     * step1. 上一次不是成功读、或已在开头 -> 返回错误；
+     * step2. 游标减一，并把「上一次是读」标记清零（不能连续回退）。
+     */
     ErrorPtr UnreadByte() {
         if (!m_last_op_was_read || m_read_offset == 0) {
             return NewError("bytes.Buffer: UnreadByte: previous operation was not a successful read");
@@ -391,6 +454,14 @@ public:
         }
     }
     /// 对应 `Buffer.WriteTo`：把**未读部分**写给 `destination`。
+    /**
+     * @brief 对应 `Buffer.WriteTo`：把未读部分写给目标。
+     *
+     * ## 步骤
+     * step1. 无未读字节 -> 返回 0（不调用目标）；
+     * step2. 一次 `destination.Write()` 写出未读部分；
+     * step3. 按实际写入量推进读游标（短写时保留剩余）。
+     */
     streams::WriteResult WriteTo(streams::Writer& destination) override {
         const std::size_t available = m_data.size() - m_read_offset;
         if (available == 0) return streams::WriteResult{0, {}};
@@ -435,6 +506,13 @@ public:
         m_last_op_was_read = false;
     }
     /// 对应 `Buffer.Truncate(n)`：只保留前 `n` 字节（必须 `n <= Cap`）。
+    /**
+     * @brief 对应 `Buffer.Truncate`：只保留前 n 字节。
+     *
+     * ## 步骤
+     * step1. `n > size` -> 返回错误（Go 也是错误而非静默）；
+     * step2. `resize(n)`；若读游标超过 n 则夹到 n。
+     */
     ErrorPtr Truncate(std::size_t n) {
         if (n > m_data.size()) {
             return NewError("bytes.Buffer: truncation out of range");
@@ -445,8 +523,11 @@ public:
     }
 
 private:
+    /// 全部内容（含已读部分）；Write 追加、读只推进游标。
     std::string m_data;
+    /// 读游标；Read/Next/Seek 推进，Reset 清零。
     std::size_t m_read_offset{0};
+    /// 上一次操作是否为成功读；UnreadByte/UnreadRune 依赖。
     bool m_last_op_was_read{false};
 };
 
@@ -456,6 +537,15 @@ private:
 
 /**
  * @brief 对应 `bytes.Reader`：只读、可定位的字节读取器。
+ *
+ * ## 定位
+ * 只读视图，常用于解析与测试；`m_data` 是 `string_view`，**不拥有**底层字节，
+ * 调用方必须保证其生命周期覆盖 Reader。
+ *
+ * ## 不变量
+ * - `m_offset <= m_data.size()`；
+ * - `ReadAt` 不改变 `m_offset`（只有 `Read`/`ReadByte`/`ReadRune`/`Seek` 会）；
+ * - `Len() == size - m_offset`，`Size()` 是总长度。
  */
 class Reader final : public streams::Reader,
                      public streams::ReaderAt,
@@ -475,6 +565,14 @@ public:
         return streams::ReadResult{take, {}};
     }
     /// 对应 `Reader.ReadAt`（不改变读游标）。
+    /**
+     * @brief 对应 `Reader.ReadAt`：绝对定位读，不改变游标。
+     *
+     * ## 步骤
+     * step1. 负偏移或越界 -> `IoEof()`；
+     * step2. 截到 `[offset, size)` 区间，`memcpy` 到调用方缓冲；
+     * step3. 返回读到的字节数，**不修改** `m_offset`。
+     */
     streams::ReadResult ReadAt(char* out, std::size_t size, std::int64_t offset) override {
         if (offset < 0 || static_cast<std::size_t>(offset) >= m_data.size()) {
             return streams::ReadResult{0, streams::IoEof()};
@@ -525,7 +623,9 @@ public:
     std::size_t Size() const noexcept { return m_data.size(); }
 
 private:
+    /// 底层字节（不拥有）；构造时绑定，Size 即其长度。
     std::string_view m_data;
+    /// 读游标；Read/ReadByte/ReadRune/Seek 推进。
     std::size_t m_offset{0};
 };
 
