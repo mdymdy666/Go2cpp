@@ -2893,6 +2893,23 @@ bool Scheduler::wake_io(const std::shared_ptr<Task>& task) {
     return enqueue(task);
 }
 
+/**
+ * @brief 批量唤醒一批 IO 就绪的 G（`process_events_batch` 的事件出口）。
+ *
+ * ## 步骤
+ *
+ * step1. 对每个 task 调 `wake_for_io()`：返回 `kPending`（挂起前已收到唤醒令牌）或
+ *        `kRejected`（终态/拒绝）都跳过 —— 它们不需要再入队；
+ * step2. 按 `last_processor_id()` 排序，让同一 P 的 G 连续入队（减少 P 队列锁的
+ *        反复获取与跨 P 唤醒）；
+ * step3. 逐 P 分组入队；分组失败时走 `fallback`（全局 incoming 条带）。
+ *
+ * ## 为什么这里不做 `owned_by` 校验
+ *
+ * 调用方是 `IOManager::State` 的 `WaitNode`，它**只有在本 Scheduler 注册成功后**
+ * 才会进入 wake list。公开的 `wake_io()` 仍保留完整校验；批量入口只接受内部已登记
+ * 节点，从而省掉高频 IO 上每事件一次的无效锁竞争（s2/s4 的实测优化）。
+ */
 bool Scheduler::wake_io_batch(
     const std::vector<std::shared_ptr<Task>>& tasks) {
     if (tasks.empty()) {

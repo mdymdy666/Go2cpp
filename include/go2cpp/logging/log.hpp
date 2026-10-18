@@ -5,6 +5,7 @@
 // 组合实现扩展。这样既能独立使用，也能通过 CallbackSink 接入 spdlog/fmt。
 
 /**
+ * @file include/go2cpp/logging/log.hpp
  * @brief 轻量日志接口（Filter / Formatter / Worker / Sink 四层组合）。
  *
  * ## 模块定位

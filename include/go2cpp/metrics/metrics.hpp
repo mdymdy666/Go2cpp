@@ -107,6 +107,16 @@ namespace detail {
  * 短于根指标（由根指标的 Family 容器拥有），因此不需要 shared_ptr 的
  * 引用计数开销，也不会形成环。
  */
+/**
+ * ## 定位
+ * 由 `Registry::RegisterImpl` 经 `MakeInfo` 构造，根指标持有；所有标签子指标
+ * 通过裸指针共享，`Metric::Name/Help/Type/LabelNames` 都读它。
+ *
+ * ## 不变量
+ * - 名字/help/标签名校验通过后才写入，注册后不可变；
+ * - 生命周期与 Family 绑定，子指标不得比根指标活得久；
+ * - `type` 决定 Family 的具体类型，同名不同类型注册会被拒绝。
+ */
 struct MetricInfo {
     std::string name;  ///< 指标名（不含 _bucket/_sum/_count）；注册时固定，Name() 读取
     std::string help;  ///< HELP 文本；注册时固定，Render 输出
