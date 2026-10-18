@@ -55,6 +55,32 @@
  * - 空字段不加引号；字段恰好为 `\.` 时加引号（Go 为 PostgreSQL 保留的特例）。
  * - 默认换行 `\n`；`SetUseCRLF(true)` 改为 `\r\n`（对应 Go `UseCRLF`）。
  * - 分隔符必须是单字节且不能是 `\0`、`"`、`\r`、`\n`（对应 Go `validDelim`）。
+ *
+ * ## 模块定位
+ *
+ * `encoding` 的 CSV 文本层：把「整段 CSV 文本」逐条解析成字段数组，或把字段
+ * 数组序列化成 CSV。上游是导入/导出、配置读取、数据管道；下游只有
+ * `go2cpp::tools::error`。Reader 持有完整文本（不依赖 IO），Writer 只写内存。
+ *
+ * ## 本文件定义什么
+ *
+ * - `CsvErrBareQuote` / `CsvErrQuote` / `CsvErrFieldCount`：三个错误锚点；
+ * - `CsvReadResult`：`CsvReader::Read` 的 `(record, error, eof)`；
+ * - `CsvReader`：逐字符状态机，见 `docs/state-machines/CsvReader.md`；
+ * - `CsvWriter`：加引号规则 + 记录拼接；
+ * - `Csv`：`Reader`/`Writer` 的别名门面。
+ *
+ * ## 阅读建议
+ *
+ * 先读「关键语义」的 Reader 规则（空行、引号、`FieldsPerRecord`），再读
+ * `CsvReader` 的状态机文档，最后看 `src/encoding/csv.cpp` 的 step 标注。
+ *
+ * ## 边界与陷阱
+ *
+ * - Reader 出错后**粘性失败**（与 Go 不同，Go 只返回一次错误）；
+ * - Reader 从内存文本解析，不支持 `io.Reader` 流式输入；
+ * - 不支持 `LazyQuotes` / `ReuseRecord` / 多字节分隔符；
+ * - Writer 的 `Flush()` 是空操作，数据直接写在 `m_buf`。
  */
 
 #pragma once
@@ -88,7 +114,13 @@ inline ErrorPtr CsvErrFieldCount() {
     return *kError;
 }
 
-/// `CsvReader::Read` 的返回值：对应 Go 的 `([]string, error)`。
+/**
+ * @brief `CsvReader::Read` 的返回值：对应 Go 的 `([]string, error)`。
+ *
+ * ## 定位
+ * `CsvReader::Read()` 的返回类型；`record`/`error`/`eof` 三者互斥：
+ * 成功时 `record` 有值，正常结束 `eof == true`，失败时 `error` 非空。
+ */
 struct CsvReadResult {
     /// 成功时的字段列表；EOF 或失败时为空。
     std::vector<std::string> record;
@@ -103,6 +135,25 @@ struct CsvReadResult {
 
 /**
  * @brief 逐条读取 CSV 记录，对应 Go 的 `*csv.Reader`。
+ *
+ * ## 定位
+ * `encoding` 的 CSV 解析器：从构造时传入的完整文本里逐条切出记录，供数据
+ * 导入、配置解析等上层使用。它不依赖 `bufio`/IO，状态全部在实例内部。
+ *
+ * ## 生命周期与线程模型
+ * 构造时**复制**整段文本并初始化游标；不可拷贝语义未显式禁用，但复制后两个
+ * 实例各自独立解析。非线程安全：一个实例只应被一个线程/Fiber 使用（与 Go 一致）。
+ *
+ * ## 状态机
+ * `Created -> RecordStart -> UnquotedField/QuotedField -> ...` 的解析状态，
+ * 以及 `Failed` 粘性终止，见 `docs/state-machines/CsvReader.md`。
+ *
+ * ## 不变量
+ * - `0 <= m_pos <= m_data.size()`；`m_line >= 1`；
+ * - `m_fields_per_record` 只取 `0`（首条推断）、`-1`（不校验）或正整数；
+ * - `m_error` 非空后 `Read()` 不再解析，直接返回同一个错误；
+ * - 成功返回的 `record` 至少包含一个字段（空行已被跳过）；
+ * - 引号字段内部的 `\r\n` 已统一成 `\n`。
  *
  * @note 非线程安全：一个实例只应被一个线程/Fiber 使用（与 Go 一致）。
  */
@@ -173,14 +224,14 @@ class CsvReader {
     ErrorPtr ParseError(const ErrorPtr& kind, std::size_t start_line,
                         const std::string& detail) const;
 
-    std::string m_data;
-    std::size_t m_pos = 0;
-    std::size_t m_line = 1;
-    int m_fields_per_record = 0;
-    char m_comma;
-    bool m_trim_leading_space = false;
-    char m_comment = '\0';
-    ErrorPtr m_error;
+    std::string m_data;              ///< 构造时复制的完整 CSV 文本；Read() 只读，Offset()/Line() 反映其游标
+    std::size_t m_pos = 0;           ///< 下一次解析的字节偏移；Read()/ParseError() 读写，Offset() 暴露
+    std::size_t m_line = 1;          ///< 当前行号（1 起）；Read() 遇换行递增，Line() 暴露
+    int m_fields_per_record = 0;     ///< 期望字段数：0=首条推断、-1=不校验、>0=固定；SetFieldsPerRecord() 写，Read() 读
+    char m_comma;                    ///< 字段分隔符；构造/SetComma 语义固定，Read()/Comma() 读取
+    bool m_trim_leading_space = false; ///< 是否裁剪字段前导 ASCII 空白；SetTrimLeadingSpace() 写，Read() 读
+    char m_comment = '\0';           ///< 注释行首字符，'\0' 表示关闭；SetComment() 写，Read() 读
+    ErrorPtr m_error;                ///< 粘性解析错误；Read() 写入并直接返回，构造后清空
 };
 
 /**
@@ -188,6 +239,18 @@ class CsvReader {
  *
  * @details 输出保存在内部缓冲区，`Str()` 取得、`Release()` 取走；`Flush()` 是
  *          兼容 Go 习惯的空操作（本实现直接写内存，无缓冲层）。
+ *
+ * ## 定位
+ * `encoding` 的 CSV 序列化器：把一条记录按 Go 的加引号规则拼成一行文本，
+ * 供导出/落盘/测试构造数据使用。无 IO 依赖，输出只进 `m_buf`。
+ *
+ * ## 生命周期与线程模型
+ * 纯值类型，构造后可反复 `Write`；非线程安全，同一实例需串行调用。
+ *
+ * ## 不变量
+ * - `m_comma` 始终是合法单字节分隔符（构造/SetComma 校验）；
+ * - `m_buf` 里始终是「已完成的记录 + 换行」，`Write` 不会留下半条记录；
+ * - `FieldNeedsQuotes` 只依赖字段内容与分隔符，不改变对象状态。
  */
 class CsvWriter {
  public:
@@ -235,12 +298,17 @@ class CsvWriter {
     /// 字段是否需要加引号（对齐 Go `fieldNeedsQuotes`）。
     bool FieldNeedsQuotes(const std::string& field) const noexcept;
 
-    std::string m_buf;
-    char m_comma = ',';
-    bool m_use_crlf = false;
+    std::string m_buf;          ///< 已生成的 CSV 文本；Write() 追加，Str()/Release()/Reset() 读写
+    char m_comma = ',';         ///< 字段分隔符；构造/SetComma 设置，Write()/Comma() 读取
+    bool m_use_crlf = false;    ///< 记录尾用 '\r\n' 还是 '\n'；SetUseCRLF() 写，Write()/UseCRLF() 读
 };
 
-/// Go 包名 `encoding/csv` 的门面：`Csv::Reader` / `Csv::Writer`。
+/**
+ * @brief Go 包名 `encoding/csv` 的门面：`Csv::Reader` / `Csv::Writer`。
+ *
+ * ## 定位
+ * 只提供类型别名，让调用点写成 `encoding::Csv::Reader`；不引入额外状态。
+ */
 struct Csv {
     using Reader = CsvReader;
     using Writer = CsvWriter;

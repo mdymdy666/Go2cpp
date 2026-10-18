@@ -49,6 +49,32 @@
  * std::string out = RawURLEncoding.EncodeToString("hello");  // "aGVsbG8"
  * auto decoded = RawURLEncoding.DecodeString("aGVsbG8");     // decoded.data == "hello"
  * @endcode
+ *
+ * ## 模块定位
+ *
+ * `encoding` 的 base64 编解码器：把任意字节编码成可放进 URL / JSON / HTTP 头
+ * 的文本，或反向解码。上游是需要传输二进制载荷的协议与序列化模块，下游只有
+ * `go2cpp::tools::error`。本文件是 header-only 的接口与预定义实例，算法在
+ * `src/encoding/base64.cpp`。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Base64Encoding`：一种「字母表 + 填充字符 + 严格模式」的编码器；
+ * - `Base64DecodeResult`：`DecodeString` 的 `(data, error)` 返回；
+ * - `Base64CorruptInput()`：错误身份锚点；
+ * - `StdEncoding` / `URLEncoding` / `RawStdEncoding` / `RawURLEncoding`：
+ *   四个预定义实例。
+ *
+ * ## 阅读建议
+ *
+ * 先读「关键语义」里严格校验与填充规则，再看 `Base64Encoding` 的不变量；
+ * `Encode`/`Decode` 的逐 quantum 流程在 .cpp 里用 step 标注。
+ *
+ * ## 边界与陷阱
+ *
+ * - 默认**不**校验尾部填充位（`"Zh=="` → `"f"`），需要时用 `Strict()`；
+ * - 默认**不**忽略 `\r`/`\n`/空格（Go 默认会忽略），这是有意的严格模式；
+ * - `Decode` 失败时 `dst` 保持不变（强异常安全），与 Go 的「返回部分结果」不同。
  */
 
 #pragma once
@@ -73,7 +99,13 @@ inline ErrorPtr Base64CorruptInput() {
     return *kError;
 }
 
-/// `DecodeString` 的返回值：对应 Go 的 `([]byte, error)`。
+/**
+ * @brief `DecodeString` 的返回值：对应 Go 的 `([]byte, error)`。
+ *
+ * ## 定位
+ * `Base64Encoding::DecodeString()` 的返回类型；调用方用 `operator bool`
+ * 判成功，失败时 `error` 是带「输入字节位置」的 `Base64CorruptInput()`。
+ */
 struct Base64DecodeResult {
     /// 解码结果；`error` 非空时为空串。
     std::string data;
@@ -89,6 +121,21 @@ struct Base64DecodeResult {
  *
  * @details 实例是不可变的：字母表在构造时固定，之后所有操作都是 `const`。
  *          四个预定义实例由本头文件以 `inline constexpr` 提供。
+ *
+ * ## 定位
+ * `encoding` 的 base64 编解码器，供需要把二进制放进文本的协议/序列化调用。
+ * `Encode`/`Decode` 是纯函数式接口，不持有缓冲、不做 IO。
+ *
+ * ## 生命周期与线程模型
+ * 不可变值类型，可自由拷贝；`m_alphabet` 是**非拥有**视图，必须保证字母表
+ * 字符串比本对象活得久（四个预定义实例指向静态字面量，天然满足）。所有
+ * `const` 方法可并发调用，彼此不共享可变状态。
+ *
+ * ## 不变量
+ * - `m_alphabet.size() == 64` 且 64 个字符互不相同（构造方保证，不做运行期校验）；
+ * - `m_pad == '\0'` 当且仅当是 Raw 编码；否则填充只允许出现在最后一个 quantum；
+ * - `m_strict` 只影响解码时尾部填充位的校验，不影响编码；
+ * - `EncodedLen`/`DecodedLen` 只依赖 `m_pad` 与输入长度，不检查内容。
  */
 class Base64Encoding {
  public:
@@ -155,9 +202,9 @@ class Base64Encoding {
     char Padding() const noexcept { return m_pad; }
 
  private:
-    std::string_view m_alphabet;
-    char m_pad;
-    bool m_strict{false};
+    std::string_view m_alphabet; ///< 64 字符字母表（非拥有）；构造时设置，Encode/Decode/Strict 读取
+    char m_pad;                  ///< 填充字符，'\0' 表示 Raw；构造时设置，Encode/IsRaw/Decode 读取
+    bool m_strict{false};        ///< 是否校验尾部填充位；构造/Strict() 设置，Decode 读取
 };
 
 /// Go 包名 `encoding/base64` 的类型别名；四种预定义实例见下方常量。

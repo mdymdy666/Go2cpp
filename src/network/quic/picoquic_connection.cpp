@@ -24,6 +24,28 @@
  * `sockaddr_storage`。但我们走 `Transport` 抽象，真实地址由 Transport 负责。
  * 所以这里用一个**占位地址**（127.0.0.1:0）满足签名即可 —— 因为一条
  * `PicoquicConnection` 只对应一个 `picoquic_cnx_t`，地址不参与多连接区分。
+ *
+ * ## 模块定位
+ * `picoquic_connection.hpp` 的唯一实现文件，也是唯一 `#include <picoquic.h>` 的
+ * 翻译单元；picoquic 类型通过 pimpl（`struct Impl`）完全隔离在 .cpp 内。
+ *
+ * ## 本文件定义什么
+ * - `Impl`：持有 quic/cnx 句柄、握手/关闭标记、按流接收缓冲；
+ * - `Impl::StreamCallback`：把 picoquic 回调翻译成「收到数据 / 关闭」状态；
+ * - `Connect()` / `Poll()` / `WriteStream()` / `ReadStream()` 的全部实现。
+ *
+ * ## 阅读建议
+ * 先看文件头的三个实现坑，再看 `Connect()` 的建上下文顺序，最后看 `Poll()` 的
+ * 「先把所有待发包写完、再读一个 datagram」循环。
+ *
+ * ## 边界与陷阱
+ * - 本文件只在 `GO2CPP_WITH_PICOQUIC=ON` 时参与构建（默认 OFF）；
+ * - `picoquic_set_null_verifier()` 是自签名测试能通的**前提**：
+ *   `picoquic_create_client_cnx()` 在严格验证下会直接拒绝自签名链；
+ * - `picoquic_create_client_cnx()` 内部已经 start，外面**不要**再调
+ *   `picoquic_start_client_cnx()`（会返回 -1）；
+ * - `Read()` 的 datagram 语义由调用方传入的 `Transport` 保证，本文件只按包喂给
+ *   picoquic；占位 `sockaddr` 仅用于满足 API 签名。
  */
 
 #include "go2cpp/network/quic/picoquic_connection.hpp"
@@ -126,6 +148,19 @@ PicoquicConnection::~PicoquicConnection() {
     }
 }
 
+/**
+ * @brief 建立客户端连接（只发 ClientHello，握手在后续 Poll 中推进）。
+ *
+ * ## 步骤
+ * step1. 校验 transport 与 alpn；
+ * step2. `picoquic_create()` 建上下文（不传根证书，配合 null verifier）；
+ * step3. `verify_peer == false` 时调 `picoquic_set_null_verifier()`；
+ * step4. 设置 idle 超时，用占位地址 `picoquic_create_client_cnx()`（内部已 start）；
+ * step5. 失败时释放已建资源，成功则移交 `unique_ptr`。
+ *
+ * ## 失败语义
+ * 任一步失败返回 nullptr 并填 `error`；不泄漏 quic 上下文。
+ */
 std::unique_ptr<PicoquicConnection> PicoquicConnection::Connect(
     net::http2::Transport* transport, const PicoquicConfig& config, std::string* error) {
     if (transport == nullptr) {
@@ -141,6 +176,7 @@ std::unique_ptr<PicoquicConnection> PicoquicConnection::Connect(
         return nullptr;
     }
 
+    // step2: 建 picoquic 上下文并登记回调上下文。
     auto impl = std::make_unique<Impl>();
     impl->transport = transport;
 
@@ -160,6 +196,7 @@ std::unique_ptr<PicoquicConnection> PicoquicConnection::Connect(
         return nullptr;
     }
 
+    // step3: 自签名测试的关键，见文件头细节 2。
     if (!config.verify_peer) {
         // 见文件头细节 2：不这样做的话自签名证书握手必失败。
         picoquic_set_null_verifier(impl->quic);
@@ -173,6 +210,7 @@ std::unique_ptr<PicoquicConnection> PicoquicConnection::Connect(
     //    所以这里不要再调（见文件头细节 1）。
     struct sockaddr_storage addr;
     FillPlaceholderAddress(&addr);
+    // step4: 注意内部已 start，不要重复调用。
     impl->cnx = picoquic_create_client_cnx(
         impl->quic, reinterpret_cast<struct sockaddr*>(&addr), picoquic_current_time(),
         /*preferred_version=*/0, config.sni.c_str(), config.alpn.c_str(),
@@ -188,6 +226,19 @@ std::unique_ptr<PicoquicConnection> PicoquicConnection::Connect(
     return std::unique_ptr<PicoquicConnection>(new PicoquicConnection(std::move(impl)));
 }
 
+/**
+ * @brief 推进一次协议状态机（发完待发包 + 读一个 datagram）。
+ *
+ * ## 步骤
+ * step1. 已关闭直接返回 false（带缓存的错误）；
+ * step2. 循环 `picoquic_prepare_next_packet()`，把**所有**待发包写到 transport；
+ * step3. `transport->Read()` 读一个 datagram（在 Fiber 里即 park）；读 0 且
+ *         `Closed()` 为真才算关闭，否则返回 true 让上层重试；
+ * step4. `picoquic_incoming_packet()` 喂包，并检查回调是否已置 closed。
+ *
+ * ## 失败语义
+ * 写失败/`incoming_packet` 失败都置 `closed` 并缓存原因，后续调用快速失败。
+ */
 bool PicoquicConnection::Poll(std::string* error) {
     Impl& s = *m_impl;
     if (s.closed) {
@@ -203,6 +254,7 @@ bool PicoquicConnection::Poll(std::string* error) {
     std::uint8_t packet[2048];
 
     // 1) 把 picoquic 所有待发的包写出去。
+    // step2: 把所有待发包写完再读，避免半双工饥饿。
     for (;;) {
         std::size_t send_length = 0;
         struct sockaddr_storage addr_to;
@@ -229,6 +281,7 @@ bool PicoquicConnection::Poll(std::string* error) {
     }
 
     // 2) 读一个 datagram 喂给 picoquic。
+    // step3: 一次读一个完整 datagram（QUIC 的边界语义）。
     const std::size_t got = s.transport->Read(packet, sizeof(packet));
     if (got == 0) {
         if (s.transport->Closed()) {

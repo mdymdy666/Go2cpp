@@ -38,6 +38,29 @@
  *   「溢出」，只有出现第 11 个字节才判溢出；本实现保持该判定顺序。
  * - `Varint` 用 zig-zag：`ux = x<<1`，负数再按位取反；解码
  *   `x = (ux >> 1) ^ -(ux & 1)`，与 Go `PutVarint`/`Varint` 完全一致。
+ *
+ * ## 模块定位
+ *
+ * `encoding` 的二进制整数层：定长整数的字节序读写，以及 LEB128/zig-zag
+ * 变长整数。上游是协议帧解析、序列化与消息编解码，下游只有
+ * `go2cpp::tools::error`。实现全部在 `src/encoding/binary.cpp`。
+ *
+ * ## 本文件定义什么
+ *
+ * - `ErrShortBuffer` / `ErrUvarintOverflow` / `ErrUvarintTruncated`：错误锚点；
+ * - `BinaryValue<T>`：定长读取的 `(value, error)` 返回；
+ * - `Binary`：`Order` 枚举、定长读写、`Uvarint`/`Varint` 及其 Result。
+ *
+ * ## 阅读建议
+ *
+ * 先读「关键语义」中「短输入返回错误而不是 panic」「写入是追加」两条；
+ * 再看 `Binary` 的不变量，最后看 .cpp 里 `Uvarint` 的 10 字节边界。
+ *
+ * ## 边界与陷阱
+ *
+ * - 读取函数永不越界，短输入返回 `ErrShortBuffer()` 且 `value == 0`；
+ * - 写入函数把字节追加到 `dst`，返回本次追加长度，不要求预分配；
+ * - 恰好 10 个续位字节返回「截断」而不是「溢出」，第 11 个字节才判溢出。
  */
 
 #pragma once
@@ -75,6 +98,10 @@ inline ErrorPtr ErrUvarintTruncated() {
 /**
  * @brief 定长读取的返回值：`value` + 错误。
  * @tparam T 读取的类型（`std::uint16_t` 等）。
+ *
+ * ## 定位
+ * `Binary::UintXX`/`IntXX`/`FloatXX` 的统一返回类型；调用方用 `operator bool`
+ * 判成功，失败时 `value` 为 `T{}`、`error` 为 `ErrShortBuffer()` 的包装。
  */
 template <typename T>
 struct BinaryValue {
@@ -92,6 +119,16 @@ struct BinaryValue {
  *
  * @details 与 `Hex` 相同，使用 `struct Binary` 让调用点保持
  *          `encoding::Binary::Uint32(...)` 的形态。
+ *
+ * ## 定位
+ * `encoding` 的二进制整数工具集，无状态、纯静态；被协议帧解析与序列化模块
+ * 调用。字节序由调用方显式传入，避免依赖宿主端序。
+ *
+ * ## 不变量
+ * - 所有读取都先检查长度，绝不越界；不足时返回 `ErrShortBuffer()`；
+ * - 所有写入只追加到 `dst` 末尾，返回本次追加的字节数；
+ * - `Uvarint` 最多消耗 10 字节；`Varint` 是 `Uvarint` 的 zig-zag 映射；
+ * - 有符号数按补码、浮点数按 IEEE-754 位模式原样搬运。
  */
 struct Binary {
     /// 字节序。对应 Go 的 `binary.BigEndian` / `binary.LittleEndian`。
@@ -166,6 +203,7 @@ struct Binary {
                                   Order order = Order::kBigEndian);
 
     /// `Uvarint` 的返回值：对应 Go 的 `(uint64, int)`。
+    /// ## 定位：`Uvarint()` 的返回类型；`bytes_read` 供调用方推进输入偏移。
     struct UvarintResult {
         /// 解出的值；失败时为 0。
         std::uint64_t value = 0;
@@ -179,6 +217,7 @@ struct Binary {
     };
 
     /// `Varint` 的返回值：对应 Go 的 `(int64, int)`。
+    /// ## 定位：`Varint()` 的返回类型；`bytes_read` 供调用方推进输入偏移。
     struct VarintResult {
         /// 解出的值；失败时为 0。
         std::int64_t value = 0;

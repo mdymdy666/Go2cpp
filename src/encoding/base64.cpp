@@ -9,6 +9,30 @@
  * @details 解码状态机刻意逐 quantum 处理，而不是先过滤 `=` 再统一解码：
  *          「填充只能出现在最后一个 quantum」「填充后不能再有数据」必须在
  *          同一次扫描里判断，否则 `"Zg==Zm9v"` 这类输入会被错误接受。
+ *
+ * ## 模块定位
+ *
+ * `base64.hpp` 的实现层：四个预定义实例共用这里的编码/解码算法，差异只由
+ * `m_alphabet`/`m_pad`/`m_strict` 决定。被所有包含 `base64.hpp` 的协议/序列化
+ * 模块间接调用。
+ *
+ * ## 本文件定义什么
+ *
+ * - `CorruptAt()`：按输入字节位置构造 `Base64CorruptInput()` 包装错误；
+ * - `Base64Encoding::EncodedLen`/`DecodedLen`：长度换算；
+ * - `Base64Encoding::Encode`/`Decode`：逐 3/4 字节 quantum 的编解码；
+ * - `ByteAt()`：按无符号字节读取。
+ *
+ * ## 阅读建议
+ *
+ * 先读 `Decode` 的步骤 1~3（反查表、非法字符扫描、长度校验），再看步骤 4~5
+ * 的末尾 quantum 分支——严格模式只影响最后这一步。
+ *
+ * ## 边界与陷阱
+ *
+ * 错误位置必须指向**第一个**非法字节；解码先写临时 `out`，全部成功后才追加到
+ * `dst`，失败时 `dst` 不变。`Encode` 用 `reserve` 一次分配，尾部分支不要漏掉
+ * Raw 的填充差异。
  */
 
 #include "go2cpp/encoding/base64.hpp"
@@ -55,12 +79,23 @@ std::size_t Base64Encoding::DecodedLen(std::size_t src_len) const noexcept {
     return src_len / 4 * 3;
 }
 
+/**
+ * @brief 把 `src` 编码后追加到 `dst`。
+ *
+ * ## 步骤
+ * step1. 记录追加起点，按 `EncodedLen` 预留空间；
+ * step2. 每 3 字节拼成 24-bit chunk，按字母表输出 4 个字符；
+ * step3. 尾部剩 1/2 字节：输出 2/3 个字符，非 Raw 时补 `=`；
+ * step4. 返回本次追加的字节数。
+ */
 std::size_t Base64Encoding::Encode(std::string& dst,
                                    std::string_view src) const {
+    // step1: 记录追加起点并预留空间
     const std::size_t start = dst.size();
     dst.reserve(start + EncodedLen(src.size()));
     const char* table = m_alphabet.data();
 
+    // step2: 完整的 3 字节 -> 4 字符
     std::size_t i = 0;
     for (; i + 3 <= src.size(); i += 3) {
         const std::uint32_t chunk = (static_cast<std::uint32_t>(ByteAt(src, i)) << 16) |
@@ -72,6 +107,7 @@ std::size_t Base64Encoding::Encode(std::string& dst,
         dst.push_back(table[chunk & 0x3f]);
     }
 
+    // step3: 尾部 1/2 字节，按是否 Raw 决定补几个 '='
     const std::size_t rest = src.size() - i;
     if (rest == 1) {
         const std::uint32_t chunk = static_cast<std::uint32_t>(ByteAt(src, i)) << 16;
@@ -92,6 +128,7 @@ std::size_t Base64Encoding::Encode(std::string& dst,
             dst.push_back(m_pad);
         }
     }
+    // step4: 返回追加长度（含填充）
     return dst.size() - start;
 }
 
@@ -101,8 +138,20 @@ std::string Base64Encoding::EncodeToString(std::string_view src) const {
     return out;
 }
 
+/**
+ * @brief 严格解码 `src`，成功后才把结果追加到 `dst`。
+ *
+ * ## 步骤
+ * step1. 按字母表重建 256 项反查表（-1 表示非法字符）；
+ * step2. 先全量扫描非法字符：错误位置必须是第一个非法字节；
+ * step3. 校验长度：带填充必须 `% 4 == 0`，Raw 禁止 `% 4 == 1`；
+ * step4. 逐 quantum 解码：非末尾的完整 quantum 四位都必须是数据字符；
+ * step5. 末尾 quantum 处理 `xx==`/`xxx=`/Raw 的 2~3 字符尾巴，
+ *        strict 时校验未使用的低位必须为 0；
+ * step6. 全部成功后才追加到 `dst`（失败时 `dst` 保持不变）。
+ */
 ErrorPtr Base64Encoding::Decode(std::string& dst, std::string_view src) const {
-    // 反查表：-1 表示非法字符。四个预定义实例共用同一张表布局，按字母表重建。
+    // step1: 反查表：-1 表示非法字符；四个预定义实例共用同一布局，按字母表重建
     std::array<std::int8_t, 256> decode_map{};
     decode_map.fill(-1);
     for (std::size_t i = 0; i < 64; ++i) {
@@ -114,7 +163,7 @@ ErrorPtr Base64Encoding::Decode(std::string& dst, std::string_view src) const {
     };
 
     const std::size_t len = src.size();
-    // 先扫描非法字符：错误位置必须指向第一个非法字节，而不是笼统地报长度。
+    // step2: 先扫描非法字符：错误位置必须指向第一个非法字节，而不是笼统地报长度
     for (std::size_t k = 0; k < len; ++k) {
         const unsigned char c = ByteAt(src, k);
         if (value_of(c) < 0 &&
@@ -122,6 +171,7 @@ ErrorPtr Base64Encoding::Decode(std::string& dst, std::string_view src) const {
             return CorruptAt(k);
         }
     }
+    // step3: 长度校验（带填充要完整 quantum，Raw 的 %4==1 非法）
     if (IsRaw()) {
         if (len % 4 == 1) {
             return CorruptAt(len - 1);
@@ -134,6 +184,7 @@ ErrorPtr Base64Encoding::Decode(std::string& dst, std::string_view src) const {
     std::string out;
     out.reserve(DecodedLen(len));
 
+    // step4: 逐 quantum 解码
     std::size_t i = 0;
     while (i < len) {
         const std::size_t remaining = len - i;
@@ -159,6 +210,7 @@ ErrorPtr Base64Encoding::Decode(std::string& dst, std::string_view src) const {
             continue;
         }
 
+        // step5: 末尾 quantum 的填充/严格模式分支
         if (!IsRaw() && remaining == 4) {
             // 末尾 quantum：允许 `xx==` 与 `xxx=` 两种填充形态。
             const int v0 = value_of(ByteAt(src, i));
@@ -226,7 +278,7 @@ ErrorPtr Base64Encoding::Decode(std::string& dst, std::string_view src) const {
         i = len;
     }
 
-    // 强异常安全：全部成功后才追加，失败时 dst 保持原样。
+    // step6: 强异常安全：全部成功后才追加，失败时 dst 保持原样
     dst += out;
     return nullptr;
 }

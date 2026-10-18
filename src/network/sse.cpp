@@ -1,6 +1,27 @@
 /**
  * @file sse.cpp
  * @brief SSE 事件编码、增量解析和流式发送实现。
+ *
+ * ## 模块定位
+ * `sse.hpp` 的实现：事件编码、增量解析与流式写入。IO 全部经
+ * `http::ResponseWriter` / `Socket`，本文件不感知调度器。
+ *
+ * ## 本文件定义什么
+ * - 匿名命名空间里的纯工具：换行归一化、retry 解析、行/字段校验；
+ * - `Event::valid()` / `Event::encode()`：编码侧的校验与序列化；
+ * - `Parser::feed()` / `consume_line()` / `dispatch()`：解析侧三件套；
+ * - `Stream` 的写路径：`start()` / `send()` / `comment()` / `tick()` / `close()`。
+ *
+ * ## 阅读建议
+ * 先看 `Parser::feed()` 的 BOM/切行逻辑，再看 `consume_line()` 的字段分派，
+ * 最后看 `Stream::write_locked()` 如何把「取消/背压/IO 失败」归一成 Result。
+ *
+ * ## 边界与陷阱
+ * - **CR-only 换行是确定性设计缺口，不是 flaky**：`feed()` 遇到缓冲末尾的 `\r`
+ *   只能等待下一个字节才能判定 CR/CRLF；若流在此结束，该行与事件永不派发
+ *   （缺 EOF 冲刷接口 `finish()`）。编码侧会把 CR/CRLF 归一成 LF，缺口仅在解析侧；
+ * - `Parser` 失败后必须 `reset()`；继续 feed 只会重复返回 Parse 错误；
+ * - `Stream` 的失败是**单向**的：`mark_failed_locked()` 之后不再尝试写。
  */
 
 #include "go2cpp/network/sse.hpp"
@@ -92,6 +113,19 @@ bool Event::valid(std::string* reason) const {
     return true;
 }
 
+/**
+ * @brief 把一个事件编码成 SSE 线格式（以空行结尾）。
+ *
+ * ## 步骤
+ * step1. 校验 id/event 不含 CR/LF/NUL；
+ * step2. data 的换行归一化成 LF（CR、CRLF 都变 LF）；
+ * step3. 依次输出 `id:` / `event:` / `retry:`（缺省字段跳过）；
+ * step4. data 按行拆成多个 `data:` 字段（空 data 也输出 `data:`）；
+ * step5. 末尾补空行；超过 `max_bytes` 返回 `MessageTooLarge`。
+ *
+ * ## 异常安全
+ * 内部捕获 `bad_alloc` 返回 `ResourceExhausted`，不向调用方抛异常。
+ */
 Result Event::encode(std::string& output, std::size_t max_bytes) const {
     try {
     std::string reason;
@@ -100,7 +134,9 @@ Result Event::encode(std::string& output, std::size_t max_bytes) const {
         return invalid_result(Error::InvalidEvent, std::move(reason));
     }
 
+    // step2: 统一成 LF，避免下游把 CR 当内容。
     std::string normalized = normalize_newlines(data);
+    // step1: 先编码，失败直接返回（流状态不变）。
     std::string encoded;
     encoded.reserve(id.size() + event.size() + normalized.size() + 32);
     if (!id.empty()) {
@@ -133,6 +169,7 @@ Result Event::encode(std::string& output, std::size_t max_bytes) const {
             }
         }
     }
+    // step5: 事件以空行结束（SSE 的派发边界）。
     encoded.append("\n");
     if (max_bytes != 0 && encoded.size() > max_bytes) {
         output.clear();
@@ -205,6 +242,15 @@ Result Parser::dispatch(std::vector<Event>& events) {
     return Result::success();
 }
 
+/**
+ * @brief 解析一行 SSE 字段并累积到当前事件。
+ *
+ * ## 步骤
+ * step1. 空行 -> 交给 `dispatch()` 派发事件；
+ * step2. `:` 开头 -> 注释行，直接丢弃；
+ * step3. 按第一个 `:` 拆成 field/value（value 去掉一个前导空格）；
+ * step4. 分派 `event` / `data` / `id` / `retry`，并累计事件字节数。
+ */
 Result Parser::consume_line(std::string line, std::vector<Event>& events) {
     if (line.empty()) {
         return dispatch(events);
@@ -257,9 +303,22 @@ Result Parser::consume_line(std::string line, std::vector<Event>& events) {
     return Result::success();
 }
 
+/**
+ * @brief 喂入一段字节并派发所有完整事件。
+ *
+ * ## 步骤
+ * step1. 检查失败标记与缓冲上限，追加本次字节；
+ * step2. 首次输入时识别/剥离 UTF-8 BOM（可能跨两次 feed）；
+ * step3. 循环找行尾（LF / CRLF / CR），`\r` 在末尾时保留等待下一字节；
+ * step4. 每行交给 `consume_line()`，空行触发 `dispatch()` 追加到 events。
+ *
+ * ## 失败语义
+ * 超限 -> `MessageTooLarge` 并置 `m_failed`；异常统一转成 `Parse`/`ResourceExhausted`。
+ */
 Result Parser::feed(std::string_view bytes, std::vector<Event>& events) {
     std::vector<Event> pending_events;
     try {
+    // step1: 失败后必须 reset，不能继续喂()。
     if (m_failed) {
         return invalid_result(Error::Parse, "SSE 解析器已经失败，必须 reset 后重用");
     }
@@ -269,6 +328,7 @@ Result Parser::feed(std::string_view bytes, std::vector<Event>& events) {
     }
     m_buffer.append(bytes);
 
+    // step2: BOM 可能分两次到达，不足 3 字节时先等待。
     if (!m_seen_bom) {
         static constexpr std::string_view bom("\xEF\xBB\xBF", 3);
         if (m_buffer.size() < bom.size() && bom.substr(0, m_buffer.size()) == m_buffer) {
@@ -282,6 +342,7 @@ Result Parser::feed(std::string_view bytes, std::vector<Event>& events) {
     }
 
     for (;;) {
+        // step3: 找行尾；CR 在末尾时 break，等下一个字节判定 CR/CRLF。
         std::size_t position = std::string::npos;
         std::size_t ending_size = 0;
         for (std::size_t index = 0; index < m_buffer.size(); ++index) {
@@ -358,6 +419,7 @@ Stream::Stream(net::Socket::Ptr socket, ContextPtr context, StreamOptions option
 }
 
 Stream::~Stream() {
+    // step4: 注销回调放在锁外，避免与取消回调互等。
     disarm_context_callback();
     m_state.reset();
 }
@@ -442,8 +504,21 @@ Result Stream::write_locked(std::string_view encoded) {
     return Result::success();
 }
 
+/**
+ * @brief 发送 SSE 响应头，把流从 Idle 迁到 Open。
+ *
+ * ## 步骤
+ * step1. 取写锁并校验状态（未启动、未失败、未取消）；
+ * step2. 构造 200 + text/event-stream 响应；
+ * step3. `ResponseWriter::start()` 写头；失败置 `m_failed` 并返回 Io；
+ * step4. 刷新心跳时间点。
+ *
+ * ## 边界
+ * socket 无效时不置 `m_failed`（还没写任何字节，换 socket 后可重新 start）。
+ */
 Result Stream::start() {
     std::lock_guard<sync::Mutex> lock(m_mutex);
+    // step1: 只有 Idle 能启动。
     if (m_failed || m_writer.state() != http::StreamState::Idle) {
         return invalid_result(Error::Closed, "SSE 流已经启动或关闭");
     }
@@ -457,6 +532,7 @@ Result Stream::start() {
         // 换成有效 socket，仍可重新 start。真正写失败才会进入 Failed。
         return invalid_result(Error::Io, "SSE 没有有效 Socket");
     }
+    // step2: 组装标准 SSE 响应头。
     http::Response response;
     PrepareResponse(response, m_options.add_accel_buffering_header);
     if (!m_writer.start(std::move(response))) {
@@ -467,6 +543,14 @@ Result Stream::start() {
     return Result::success();
 }
 
+/**
+ * @brief 编码并发送一条事件。
+ *
+ * ## 步骤
+ * step1. 在锁外完成编码（避免持锁做内存分配/格式化）；
+ * step2. 取写锁并校验流处于 Open；
+ * step3. `write_locked()` 写字节：成功则刷新心跳时间点，失败则标记 Failed。
+ */
 Result Stream::send(const Event& event) {
     std::string encoded;
     const Result encoded_result = event.encode(encoded, m_options.max_event_bytes);
@@ -528,6 +612,15 @@ Result Stream::tick() {
     return write_locked(": heartbeat\n\n");
 }
 
+/**
+ * @brief 发送 chunked 终止块并注销 Context 回调。
+ *
+ * ## 步骤
+ * step1. 取写锁；已 Closed 直接幂等成功；
+ * step2. 非 Open 状态返回 Closed；
+ * step3. `m_writer.close()` 写终止块，失败置 Failed；
+ * step4. 出锁后注销 Context 回调（注销可能等待回调完成，不能在锁内做）。
+ */
 Result Stream::close() {
     {
         std::lock_guard<sync::Mutex> lock(m_mutex);

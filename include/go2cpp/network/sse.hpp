@@ -7,6 +7,31 @@
  *          或业务事件源。SseStream 复用 ResponseWriter，因而普通线程和
  *          IOManager 管理的 Fiber 都可以使用；SseParser 可用于客户端或网关
  *          对无限长的 SSE 字节流做增量解析。
+ *
+ * ## 模块定位
+ * HTTP/1.1 Server-Sent Events 的协议边界：事件编码、增量解析、流式写入。
+ * 不负责重连调度、事件源与业务背压；写入复用 `http::ResponseWriter`，因此
+ * 普通线程与 `IOManager` 的 Fiber 都能用。
+ *
+ * ## 本文件定义什么
+ * - `Error` / `Result`：不跨线程抛异常的结果类型；
+ * - `Event`：一个 SSE 事件（id/event/data/retry）与它的编码；
+ * - `StreamOptions` / `ParserLimits`：写侧与解析侧的上限；
+ * - `Parser`：可喂任意分片的增量解析器；
+ * - `Stream`：单连接写入器（响应头、事件、心跳注释、关闭）；
+ * - `PrepareResponse()` / `LastEventId()`：两个辅助函数。
+ *
+ * ## 阅读建议
+ * 先看 `Event::encode()` 的字段顺序与多行 data 拆分，再看 `Parser::feed()`
+ * 的行切分/派发规则，最后看 `Stream::start/send/close` 与心跳 `tick()`。
+ *
+ * ## 边界与陷阱
+ * - **CR-only 换行是确定性设计缺口，不是 flaky**：`Parser` 遇到 `\r` 时必须
+ *   看下一个字节才能判定是 CR 还是 CRLF；若 `\r` 恰好是流的最后一个字节，
+ *   该行（连同其事件）永远不会被派发。根因是缺 `finish()`/EOF 冲刷接口。
+ *   编码侧 `Event::encode()` 会把 CR/CRLF 归一化为 LF，所以缺口只在解析方向；
+ * - `Stream` 的锁是 `sync::Mutex`（Fiber/线程混合），因为持锁期间写可能 park；
+ * - `Stream` 只保证字节不交错，不承诺业务事件顺序，也不建无界队列。
  */
 
 #include "go2cpp/concurrency/context.hpp"
@@ -54,11 +79,24 @@ struct Result {
  * @details id 和 event 是单行字段，不能包含 CR、LF 或 NUL；data 可以包含
  *          多行，编码时会按 SSE 规范拆成多个 data 字段。retry 表示毫秒级重连
  *          建议，解析器会把它保留为无符号整数。
+ *
+ * ## 定位
+ * `Stream::send()` 的输入，也是 `Parser` 的输出；`websocket` 与它无关，
+ * 两者只是并列的应用协议。
+ *
+ * ## 不变量
+ * - `id` / `event` 必须是单行（不含 CR/LF/NUL），否则 `valid()` 返回 false；
+ * - `data` 可以多行，编码时按行拆成多个 `data:` 字段；
+ * - `retry_ms` 有值才会输出 `retry:` 字段。
  */
 struct Event {
+    /// 事件 id（单行，不含 CR/LF/NUL）；encode() 写、Parser 解析时填。
     std::string id;
+    /// 事件类型（单行）；encode() 写、Parser 解析时填。
     std::string event;
+    /// 事件数据（可多行）；encode() 按行拆成多个 data 字段。
     std::string data;
+    /// 重连建议（毫秒）；encode() 写 retry 字段，Parser 保留最近值。
     std::optional<std::uint64_t> retry_ms;
 
     /** @brief 校验事件字段；失败时写入可读原因。 */
@@ -69,17 +107,25 @@ struct Event {
 
 /** @brief SSE 注释/心跳的默认限制。 */
 struct StreamOptions {
+    /// 单条事件上限；send()/comment() 用它拒绝过大的写入。
     std::size_t max_event_bytes{1024 * 1024};
+    /// 心跳间隔；tick() 与 refresh_heartbeat_locked() 使用，<=0 表示关闭心跳。
     std::chrono::milliseconds heartbeat_interval{std::chrono::seconds(15)};
+    /// 单次写超时；构造 ResponseWriter 时传入。
     net::Socket::Duration write_timeout{net::Socket::Duration::max()};
+    /// 是否加 X-Accel-Buffering: no；PrepareResponse() 读取，避免 nginx 缓冲。
     bool add_accel_buffering_header{true};
 };
 
 /** @brief 增量解析器的内存上限。 */
 struct ParserLimits {
+    /// 单行上限；feed() 切行前检查（防止无换行的超长行）。
     std::size_t max_line_bytes{64 * 1024};
+    /// 单事件上限；consume_line()/dispatch() 累计检查。
     std::size_t max_event_bytes{1024 * 1024};
+    /// 未完成行的缓冲上限；feed() 追加前检查。
     std::size_t max_buffer_bytes{2 * 1024 * 1024};
+    /// retry 字段上限；parse_retry() 用它做饱和。
     std::uint64_t max_retry_ms{24ULL * 60ULL * 60ULL * 1000ULL};
 };
 
@@ -90,6 +136,15 @@ struct ParserLimits {
  *          这样可以避免把截断数据误报为完整业务消息。
  * @note Parser 是有状态的单消费者对象；多个线程/Fiber 同时 feed 必须由调用方
  *       使用 sync::Mutex 或把输入集中到一个 Fiber，否则会产生数据竞争。
+ *
+ * ## 定位
+ * 客户端/网关用来解析无限长的 SSE 字节流；`test_sse_*` 直接驱动它做边界测试。
+ *
+ * ## 不变量
+ * - 单消费者、有状态：并发 feed 必须由调用方加锁或集中到单 Fiber；
+ *   `m_buffer` 只追加，切走的行立即 erase；
+ * - 只有空行才派发事件；没有 data 的块只更新 `last_event_id`；
+ * - 失败后 `m_failed` 置位，必须 `reset()` 才能复用。
  */
 class Parser final {
 public:
@@ -102,6 +157,15 @@ public:
      * @param bytes 本次收到的任意长度字节，可为空。
      * @param events 输出容器，函数只追加本次新完成的事件。
      * @return 成功返回 None；协议或内存限制错误返回 Parse/MessageTooLarge。
+     *
+     * ## 步骤
+     * step1. 检查 `m_failed` 与缓冲区上限，追加本次字节；
+     * step2. 首次输入时识别并剥离 UTF-8 BOM；
+     * step3. 循环切行（LF / CRLF / CR，CR 在末尾时等待下一字节）；
+     * step4. 逐行 `consume_line()` 累积字段，空行触发 `dispatch()` 派发事件。
+     *
+     * ## 失败语义
+     * 超限返回 `MessageTooLarge` 并置 `m_failed`；协议错误返回 `Parse`，需 reset()。
      */
     Result feed(std::string_view bytes, std::vector<Event>& events);
     /** @brief 返回最近一次 retry 字段建议。 */
@@ -115,17 +179,29 @@ private:
     Result dispatch(std::vector<Event>& events);
     Result fail(Error error, std::string message);
 
+    /// 解析上限快照；构造时固定，feed()/consume_line() 使用。
     ParserLimits m_limits;
+    /// 未消费字节；feed() 追加、切行后 erase。
     std::string m_buffer;
+    /// 当前事件的 event 字段；空行派发后清空。
     std::string m_event_name;
+    /// 当前事件的 id 字段；派发后按需更新 last_event_id。
     std::string m_event_id;
+    /// 当前事件累积的 data（多行用 \n 连接）；派发后清空。
     std::string m_data;
+    /// 当前事件已累计字节数；每次追加时与上限比较。
     std::size_t m_event_bytes{0};
+    /// 当前事件的 retry 值；派发后清空。
     std::optional<std::uint64_t> m_event_retry;
+    /// 本轮是否出现过 id 字段；dispatch() 据此决定是否更新 last_event_id。
     bool m_event_id_seen{false};
+    /// 最近一次 retry 建议；`retry_after()` 只读。
     std::optional<std::uint64_t> m_retry_after;
+    /// 最近一次事件 id；`last_event_id()` 供重连填 Last-Event-ID。
     std::string m_last_event_id;
+    /// 是否已处理过 BOM；feed() 首次输入时置位。
     bool m_seen_bom{false};
+    /// 解析器失败标记；fail() 置位，reset() 清零。
     bool m_failed{false};
 };
 
@@ -139,6 +215,23 @@ enum class StreamState { Idle, Open, Closed, Failed };
  *          多个生产者安全调用 send；互斥只保证字节不交错，不承诺业务事件顺序，
  *          生产者仍应控制顺序和业务背压，模块不会
  *          建立无界队列。Context 取消时会标记流并调用 cancel_write 唤醒阻塞写。
+ *
+ * ## 定位
+ * 被服务端 handler 创建并持有 `Ptr`；依赖 `net::Socket`、`http::ResponseWriter`
+ * 与 `Context`（取消传播）。客户端侧对应 `Parser`。
+ *
+ * ## 生命周期与线程模型
+ * `std::shared_ptr` 持有；所有写入由 `m_mutex` 串行化，多生产者可安全调用
+ * `send()`，但事件顺序由调用方负责。`Context` 取消时标记流并唤醒阻塞写。
+ *
+ * ## 状态机
+ * `Idle` -(start)-> `Open` -(close)-> `Closed`；任一次写失败 -> `Failed`。
+ * 只有 `Open` 允许 `send()`/`comment()`/`tick()`；`close()` 幂等。
+ *
+ * ## 不变量
+ * - `state()` 由 `m_failed`、Context 取消标记与 `m_writer.state()` 共同决定；
+ * - 进入 `Failed` 后不再尝试写，也不复位（只能重建 Stream）；
+ * - 心跳时间点 `m_next_heartbeat` 只在成功写入后刷新。
  */
 class Stream final {
 public:
@@ -176,15 +269,24 @@ private:
     void mark_failed_locked(Result result);
     void refresh_heartbeat_locked();
 
+    /// 底层已连接 socket；构造 ResponseWriter 时传入，写失败时取 last_error。
     net::Socket::Ptr m_socket;
+    /// 取消上下文；arm_context_callback() 注册回调，析构时注销。
     ContextPtr m_context;
+    /// 写侧配置；构造时固定，send()/tick() 读取。
     StreamOptions m_options;
+    /// chunked 写入器；start/send/close 都经它写字节。
     http::ResponseWriter m_writer;
+    /// 共享取消状态（Context 回调与写路径共用）；cancelled 为原子量。
     std::shared_ptr<State> m_state;
     // 写入可能在 Fiber 中 park，必须使用 Fiber/线程混合锁，不能使用裸 std::mutex。
+    /// 写锁（Fiber/线程混合）；所有写路径持有，state() 也加锁读。
     mutable sync::Mutex m_mutex;
+    /// 流失败标记；mark_failed_locked() 置位，state() 据此返回 Failed。
     bool m_failed{false};
+    /// 下一次心跳时间点；refresh_heartbeat_locked() 刷新，tick() 比较。
     std::chrono::steady_clock::time_point m_next_heartbeat{};
+    /// Context 回调 id；arm_context_callback() 写入、disarm 清零。
     DoneSignal::CallbackId m_callback_id{0};
 };
 

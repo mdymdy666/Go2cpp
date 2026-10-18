@@ -23,6 +23,29 @@
  *   `HexInvalidByte()` 锚点错误，文本包含字符与下标（对齐 Go `InvalidByteError`）。
  * - `Decode` 失败时不修改输出串（强异常安全）；成功时**追加**到 `dst`。
  * - 二进制数据用 `std::string` 承载（`char` 按无符号字节解释），与项目其他模块一致。
+ *
+ * ## 模块定位
+ *
+ * `encoding` 的十六进制工具：把字节编码成小写 hex 文本，或把 hex 文本解码回
+ * 字节。上游是需要可读性/调试输出或十六进制协议的模块，下游只有
+ * `go2cpp::tools::error`。实现全部在 `src/encoding/hex.cpp`。
+ *
+ * ## 本文件定义什么
+ *
+ * - `HexOddLength()` / `HexInvalidByte()`：两个错误身份锚点；
+ * - `HexDecodeResult`：`Hex::DecodeString` 的 `(data, error)` 返回；
+ * - `Hex`：纯静态函数集合（长度换算、编码、解码）。
+ *
+ * ## 阅读建议
+ *
+ * 先读「关键语义」的「输出小写、解码大小写不敏感、失败不改 dst」三点，
+ * 其余 API 都是围绕这三点的薄封装。
+ *
+ * ## 边界与陷阱
+ *
+ * - `DecodedLen` 只做 `src_len / 2`，不校验奇数长度；真正校验在 `Decode`；
+ * - `Decode` 失败时 `dst` 不变，错误文本包含字符与下标；
+ * - 输入按 `unsigned char` 解释，高位字节不会被符号扩展。
  */
 
 #pragma once
@@ -52,7 +75,13 @@ inline ErrorPtr HexInvalidByte() {
     return *kError;
 }
 
-/// `Hex::DecodeString` 的返回值：对应 Go 的 `([]byte, error)`。
+/**
+ * @brief `Hex::DecodeString` 的返回值：对应 Go 的 `([]byte, error)`。
+ *
+ * ## 定位
+ * `Hex::DecodeString()` 的返回类型；调用方用 `operator bool` 判成功，
+ * 失败时 `error` 是 `HexOddLength()` 或带下标的 `HexInvalidByte()`。
+ */
 struct HexDecodeResult {
     /// 解码结果；`error` 非空时为空串。
     std::string data;
@@ -68,6 +97,15 @@ struct HexDecodeResult {
  *
  * @details 用 `struct Hex` 而非命名空间，是为了让调用点与需求中的
  *          `encoding::Hex::EncodeToString` 完全对应，同时保持头文件可整体包含。
+ *
+ * ## 定位
+ * `encoding` 的十六进制工具集，无状态、纯静态；被需要 hex 文本的日志、
+ * 调试输出、协议字段解析调用。
+ *
+ * ## 不变量
+ * - `Encode` 输出恒为小写；`Decode` 同时接受大小写；
+ * - `EncodedLen(n) == n * 2`；`DecodedLen(n) == n / 2`（不校验合法性）；
+ * - `Decode` 失败时 `dst` 保持不变，成功时追加而不是覆盖。
  */
 struct Hex {
     /// 编码后长度：`src_len * 2`。

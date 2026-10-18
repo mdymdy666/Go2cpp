@@ -51,6 +51,25 @@
  * - 使用本头文件的项目代码**不需要** picoquic 的头文件路径
  * - picoquic 头里的宏（如 `PICOQUIC_VERSION`）不会污染使用者
  * - picoquic 升级时，只有 `picoquic_connection.cpp` 需要重编
+ *
+ * ## 本文件定义什么
+ * - `PicoquicConfig`：ALPN / SNI / 证书校验 / idle 超时；
+ * - `PicoquicConnection`：客户端连接的创建、`Poll()` 驱动、按流读写与诊断接口。
+ *
+ * ## 阅读建议
+ * 先看文件头的「设计：只借用协议层」与「Transport 必须是 datagram 语义」，
+ * 再看 `Poll()` 的三步，最后看 `picoquic_connection.cpp` 头部列出的三个实现坑。
+ *
+ * ## 边界与陷阱
+ * - `GO2CPP_WITH_PICOQUIC` **默认 OFF**（见 `cmake/Go2CppModules.cmake`）：
+ *   不打开时 `picoquic_connection.cpp` 不参与构建，头文件仍可被包含，但链接期
+ *   会缺符号；打开时还需同时给出 `PICOQUIC_ROOT` 与 `PICOTLS_ROOT`；
+ * - 本地自签名证书必须走 `picoquic_set_null_verifier()`（本封装在
+ *   `verify_peer == false` 时代为调用），否则严格验证必然握手失败；
+ * - `picoquic_create_client_cnx()` 内部已经调用了 `picoquic_start_client_cnx()`，
+ *   再调一次会返回 -1（错误信息 "called twice"）；
+ * - `Transport` 必须是 datagram 语义（一次 `Read` 一个完整包），TCP 风格实现
+ *   会让 QUIC 解析失败。
  */
 #pragma once
 
@@ -94,6 +113,17 @@ struct PicoquicConfig {
  * 为真后可以 `WriteStream` / `ReadStream`。
  *
  * **非线程安全** —— 所有方法必须在同一个线程（或同一个 Fiber 序列）里调用。
+ *
+ * ## 定位
+ * 被 QUIC/HTTP-3 的示例与测试使用（`example/network/quic_*`、`tests/network/quic_*`），
+ * 字节通道由调用方以 `net::http2::Transport*` 注入。与 `http2::Connection` 并列：
+ * 后者自己实现协议，前者把协议全部交给 picoquic，只做 Fiber 粘合。
+ *
+ * ## 不变量
+ * - 所有方法必须在同一线程/Fiber 序列调用（非线程安全）；
+ * - `HandshakeComplete()` 为真之前 `WriteStream()` 不可用；
+ * - `ReadStream()` 返回 0 表示「该流暂时没有数据」，不是 EOF；
+ * - 对象不拥有 `Transport` 的生命周期；析构只释放 picoquic 上下文（`picoquic_free` 会连带释放 cnx）。
  */
 class PicoquicConnection {
 public:

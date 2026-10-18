@@ -13,6 +13,28 @@
  *          与 Go 的一个已知差异：Go 的 `Read()` 在解析错误后仍可继续调用
  *          （错误只返回一次）；本实现把错误设为粘性，避免调用方在错位状态上
  *          继续解析产生误导性结果。
+ *
+ * ## 模块定位
+ *
+ * `csv.hpp` 的实现层：`CsvReader` 的逐字符解析状态机与 `CsvWriter` 的
+ * 加引号/拼接逻辑。被数据导入、配置读取、导出等上层直接使用。
+ *
+ * ## 本文件定义什么
+ *
+ * - `CsvReader::Read`：完整解析流程（空行/注释跳过、两类字段、字段数校验）；
+ * - `CsvReader` 的配置/诊断函数（分隔符、注释、字段数、行号/偏移）；
+ * - `CsvWriter` 的 `Write`/`FieldNeedsQuotes`/`Release` 等；
+ * - 内部工具 `StartsWithSpace`（Writer 的引号判定）。
+ *
+ * ## 阅读建议
+ *
+ * 先读 `CsvReader::Read` 的 5 个步骤，再对照 `docs/state-machines/CsvReader.md`
+ * 看状态转化；Writer 侧先看「何时加引号」再看转义循环。
+ *
+ * ## 边界与陷阱
+ *
+ * Reader 的错误是粘性的；字段内 CRLF 统一成 LF；孤立 `\r` 原样保留；
+ * 结尾逗号会产生一个空尾字段。Writer 的 `Flush()` 是空操作。
  */
 
 #include "go2cpp/encoding/csv.hpp"
@@ -102,8 +124,24 @@ bool CsvReader::SetComment(char comment) noexcept {
     return true;
 }
 
+/**
+ * @brief 解析下一条记录。
+ *
+ * ## 步骤
+ * step1. 已有粘性错误直接返回；否则跳过空行与注释行，定位记录起点；
+ * step2. 逐字段解析：先按需裁掉前导空白，再按首字符分派引号/非引号；
+ * step3. 引号字段：处理 `""` 转义、字段内 CRLF→LF，闭合后只允许
+ *        分隔符/换行/EOF；
+ * step4. 非引号字段：遇分隔符/换行结束，裸 `"` 报错；处理结尾逗号；
+ * step5. 记录级 `FieldsPerRecord` 校验（首条推断/固定/关闭），
+ *        失败置粘性错误。
+ *
+ * ## 失败语义
+ * 任何解析错误都会写入 `m_error` 并立即返回；后续调用返回同一个错误。
+ */
 CsvReadResult CsvReader::Read() {
     CsvReadResult result;
+    // step1: 粘性错误优先
     if (m_error) {
         result.error = m_error;
         return result;
@@ -111,7 +149,7 @@ CsvReadResult CsvReader::Read() {
 
     const std::size_t size = m_data.size();
 
-    // 空行（仅含行结束符）直接跳过，与 Go 一致。
+    // step1: 跳过空行与注释行，与 Go 一致
     for (;;) {
         if (m_pos >= size) {
             result.eof = true;
@@ -145,6 +183,7 @@ CsvReadResult CsvReader::Read() {
     const std::size_t start_line = m_line;
     std::vector<std::string> record;
 
+    // step2: 逐字段解析；每个字段独立处理前导空白
     for (;;) {
         if (m_pos >= size) {
             // 只可能由「结尾逗号」走到这里：补一个空尾字段。
@@ -166,6 +205,7 @@ CsvReadResult CsvReader::Read() {
         }
 
         std::string field;
+        // step3: 引号字段
         if (m_data[m_pos] == '"') {
             // ---- 引号字段 ----
             ++m_pos;
@@ -237,7 +277,7 @@ CsvReadResult CsvReader::Read() {
             break;
         }
 
-        // ---- 非引号字段 ----
+        // step4: 非引号字段
         while (m_pos < size) {
             const char c = m_data[m_pos];
             if (c == ',') break;
@@ -279,6 +319,7 @@ CsvReadResult CsvReader::Read() {
         break;
     }
 
+    // step5: 字段数校验（0=首条推断，-1=不校验，>0=固定）
     if (m_fields_per_record == 0) {
         m_fields_per_record = static_cast<int>(record.size());
     } else if (m_fields_per_record > 0 &&
@@ -329,12 +370,24 @@ bool CsvWriter::FieldNeedsQuotes(const std::string& field) const noexcept {
     return StartsWithSpace(field);
 }
 
+/**
+ * @brief 把一条记录追加到内部缓冲。
+ *
+ * ## 步骤
+ * step1. 逐字段写入；非首字段先写分隔符；
+ * step2. 需要引号的字段用 `"` 包裹，内部 `"` 写成 `""`；
+ * step3. 记录末尾按 `m_use_crlf` 追加 `\n` 或 `\r\n`。
+ *
+ * @return 目前恒为 `nullptr`；保留 `ErrorPtr` 是为了与 Reader 形态一致。
+ */
 ErrorPtr CsvWriter::Write(const std::vector<std::string>& record) {
+    // step1: 逐字段拼接，字段之间写分隔符
     for (std::size_t i = 0; i < record.size(); ++i) {
         if (i > 0) {
             m_buf.push_back(m_comma);
         }
         const std::string& field = record[i];
+        // step2: 不需要引号的原样写入；需要时包裹并转义内部引号
         if (!FieldNeedsQuotes(field)) {
             m_buf += field;
             continue;
@@ -348,6 +401,7 @@ ErrorPtr CsvWriter::Write(const std::vector<std::string>& record) {
         }
         m_buf.push_back('"');
     }
+    // step3: 记录尾换行
     if (m_use_crlf) {
         m_buf += "\r\n";
     } else {

@@ -1,6 +1,25 @@
 /**
  * @file websocket.cpp
  * @brief RFC 6455 WebSocket 握手、帧状态机和消息重组实现。
+ *
+ * ## 模块定位
+ * `websocket.hpp` 的实现：握手报文构造/校验、帧编解码、消息重组与关闭握手。
+ * 所有阻塞都落在 `Socket::recv/send` 上（Fiber 中即 park），本文件不感知调度器。
+ *
+ * ## 本文件定义什么
+ * - 匿名命名空间里的纯工具：trim、大小写不敏感比较、base64 编解码、SHA-1、错误文案；
+ * - 握手：`ValidateUpgradeRequest()` / `BuildUpgradeResponse()` / `Accept*()` / `Connect()`；
+ * - 帧层：`read_frame()` / `write_frame_unlocked()`（长度编码、掩码、控制帧校验）；
+ * - 消息层：`read_message()` 分片重组、`close()`/`protocol_error()` 关闭流程。
+ *
+ * ## 阅读建议
+ * 先看 `read_frame()` 的四个阶段（基础头 -> 扩展长度 -> 掩码键 -> payload），
+ * 再看 `read_message()` 的分片状态机，最后看 `close()`/`abort_transport()`。
+ *
+ * ## 边界与陷阱
+ * - 服务端收到未掩码帧、客户端收到掩码帧都是协议错误（方向校验在 `read_frame()`）；
+ * - 读失败只返回错误、不自动 `close()`：是否关闭由调用方决定；
+ * - `write_frame_unlocked()` 要求调用方已持有 `m_write_mutex`（名字里的 unlocked 指锁外）。
  */
 #include "go2cpp/network/websocket.hpp"
 
@@ -177,6 +196,15 @@ bool WebSocket::header_token(std::string_view value, std::string_view token) noe
     return false;
 }
 
+/**
+ * @brief 校验 Upgrade 请求并提取 Sec-WebSocket-Key。
+ *
+ * ## 步骤
+ * step1. 必须是 `GET` + `HTTP/1.1`，且不能带 body（Content-Length 必须缺失或 0）；
+ * step2. Host 必须存在；Upgrade/Connection 必须含 websocket/upgrade token；
+ * step3. `Sec-WebSocket-Version` 必须是 13；
+ * step4. `Sec-WebSocket-Key` 必须是合法 base64 且解码后恰好 16 字节（无控制字符）。
+ */
 bool WebSocket::ValidateUpgradeRequest(const http::Request& request,
                                        std::string& key, std::string* reason) {
     auto fail = [reason](const char* message) {
@@ -187,6 +215,7 @@ bool WebSocket::ValidateUpgradeRequest(const http::Request& request,
         for (unsigned char c : value) if (c < 0x20U || c == 0x7FU) return true;
         return false;
     };
+    // step1: 方法与版本。
     if (request.method != http::Method::Get || request.version != "HTTP/1.1")
         return fail("websocket requires GET HTTP/1.1");
     const auto content_length = trim_copy(request.header.get("Content-Length"));
@@ -199,6 +228,7 @@ bool WebSocket::ValidateUpgradeRequest(const http::Request& request,
         return fail("missing websocket upgrade headers");
     if (trim_copy(request.header.get("Sec-WebSocket-Version")) != "13")
         return fail("unsupported websocket version");
+    // step3/4: 取 key 并检查控制字符，随后做 base64 长度校验。
     key = trim_copy(request.header.get("Sec-WebSocket-Key"));
     if (has_ctl(key)) return fail("invalid websocket key");
     std::vector<std::uint8_t> decoded;
@@ -261,6 +291,18 @@ WebSocket::Ptr WebSocket::AcceptWithPending(Socket::Ptr socket, const http::Requ
     return websocket;
 }
 
+/**
+ * @brief 客户端发起握手：发 Upgrade 请求并校验 101 响应。
+ *
+ * ## 步骤
+ * step1. 校验 target 以 '/' 开头、host/target 无控制字符；
+ * step2. 生成 16 字节随机 key 并拼 Upgrade 请求写出；
+ * step3. 逐字节读到 `\r\n\r\n`（带绝对 deadline，超过 64KiB 报错）；
+ * step4. 用 `http::Parser` 解析响应，校验 101 + Upgrade/Connection + `Sec-WebSocket-Accept`。
+ *
+ * ## 失败语义
+ * 任何一步失败都返回空 `Ptr` 并填 `result`，**不关闭**传入的 socket。
+ */
 WebSocket::Ptr WebSocket::Connect(Socket::Ptr socket, std::string host, std::string target,
                                   WebSocketConfig config, WebSocketResult* result) {
     auto has_ctl = [](std::string_view value) {
@@ -273,6 +315,7 @@ WebSocket::Ptr WebSocket::Connect(Socket::Ptr socket, std::string host, std::str
                                       result_message(WebSocketError::InvalidHandshake, 0, "invalid websocket target")};
         set_result(result, failure); return {};
     }
+    // step1/2: 生成随机 key 与请求行。
     const std::string key = make_client_key();
     if (key.empty()) {
         const WebSocketResult failure{WebSocketError::InvalidHandshake, EIO,
@@ -331,6 +374,7 @@ WebSocket::Ptr WebSocket::Connect(Socket::Ptr socket, std::string host, std::str
         if (response_wire.size() >= 4 && response_wire.compare(response_wire.size() - 4, 4, "\r\n\r\n") == 0)
             break;
     }
+    // step3/4: 解析响应并校验 Accept 值。
     http::Parser parser;
     http::Response response;
     const auto parsed = parser.feed(response_wire, response);
@@ -421,10 +465,23 @@ WebSocketResult WebSocket::write_all(const void* data, std::size_t size) {
     return WebSocketResult::success();
 }
 
+/**
+ * @brief 读一个完整帧（基础头 -> 扩展长度 -> 掩码键 -> payload）。
+ *
+ * ## 步骤
+ * step1. 读 2 字节基础头，校验 RSV 位与 opcode，按角色校验掩码方向；
+ * step2. 读扩展长度（126 -> 2 字节、127 -> 8 字节）并拒绝非最小编码；
+ * step3. 校验控制帧（FIN 必须置位、长度 <= 125）与帧上限；
+ * step4. 读掩码键（若有）与 payload，按掩码逐字节 XOR。
+ *
+ * ## 失败语义
+ * 协议违规走 `protocol_error()`（发 Close 后返回 `Protocol`）；IO 失败原样返回。
+ */
 WebSocketResult WebSocket::read_frame(Frame& frame) {
     std::array<std::uint8_t, 2> header{};
     auto result = read_exact(header.data(), header.size());
     if (!result.ok()) return result;
+    // step1: 解析 FIN/RSV/opcode/MASK，并做方向校验。
     frame.fin = (header[0] & 0x80U) != 0;
     if ((header[0] & 0x70U) != 0) return protocol_error("reserved bits are not supported");
     const auto opcode_value = static_cast<std::uint8_t>(header[0] & 0x0FU);
@@ -436,6 +493,7 @@ WebSocketResult WebSocket::read_frame(Frame& frame) {
     if ((m_role == WebSocketRole::Server && !frame.masked) ||
         (m_role == WebSocketRole::Client && frame.masked))
         return protocol_error("invalid websocket mask direction");
+    // step2: 扩展长度编码（拒绝非最小表示）。
     std::uint64_t length = header[1] & 0x7FU;
     if (length == 126) {
         std::array<std::uint8_t, 2> extended{};
@@ -454,6 +512,7 @@ WebSocketResult WebSocket::read_frame(Frame& frame) {
     if ((control && (!frame.fin || length > 125)) || length > m_config.max_frame_payload)
         return control ? protocol_error("invalid control frame") :
             protocol_error("frame payload too large", 1009);
+    // step3/4: 读掩码键与 payload。
     std::array<std::uint8_t, 4> mask{};
     if (frame.masked && !(result = read_exact(mask.data(), mask.size())).ok()) return result;
     if (length > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
@@ -466,6 +525,7 @@ WebSocketResult WebSocket::read_frame(Frame& frame) {
         return {WebSocketError::MessageTooLarge, ENOMEM, "frame allocation failed"};
     }
     if (length != 0 && !(result = read_exact(frame.payload.data(), frame.payload.size())).ok()) return result;
+    // step4: 解掩码（服务端收到的帧必须带掩码）。
     if (frame.masked) {
         for (std::size_t i = 0; i < frame.payload.size(); ++i) frame.payload[i] ^= mask[i % 4];
     }
@@ -477,6 +537,18 @@ WebSocketResult WebSocket::write_frame(WebSocketOpcode opcode, std::string_view 
     return write_frame_unlocked(opcode, payload, fin);
 }
 
+/**
+ * @brief 构造并写出一个帧（调用方必须已持有写锁）。
+ *
+ * ## 步骤
+ * step1. 校验连接状态、opcode、控制帧约束与帧上限；
+ * step2. 按角色决定是否掩码，生成 4 字节随机掩码键；
+ * step3. 编码长度（<126 / <=0xFFFF / 64 位三种形态）；
+ * step4. 先写头（含掩码键），再写 payload（客户端需先拷贝并异或掩码）。
+ *
+ * ## 失败语义
+ * 写失败调用 `abort_transport()` 并置 `m_closed`，返回原始错误。
+ */
 WebSocketResult WebSocket::write_frame_unlocked(WebSocketOpcode opcode, std::string_view payload, bool fin) {
     if (!m_socket || m_closed.load(std::memory_order_acquire))
         return {WebSocketError::Closed, EBADF, "websocket is closed"};
@@ -487,11 +559,13 @@ WebSocketResult WebSocket::write_frame_unlocked(WebSocketOpcode opcode, std::str
         return {WebSocketError::Protocol, 0, "invalid websocket frame"};
     if (payload.size() > m_config.max_frame_payload)
         return {WebSocketError::MessageTooLarge, 0, "frame payload too large"};
+    // step2: 客户端必须掩码、服务端必须不掩码。
     const bool mask = m_role == WebSocketRole::Client;
     std::array<std::uint8_t, 14> header{};
     std::size_t header_size = 2;
     header[0] = static_cast<std::uint8_t>((fin ? 0x80U : 0) | value);
     const std::uint8_t mask_bit = mask ? 0x80U : 0;
+    // step3: 三种长度编码，选择最短的合法形态。
     if (payload.size() < 126) {
         header[1] = static_cast<std::uint8_t>(mask_bit | payload.size());
     } else if (payload.size() <= 0xFFFFU) {
@@ -516,6 +590,7 @@ WebSocketResult WebSocket::write_frame_unlocked(WebSocketOpcode opcode, std::str
         std::copy(mask_key.begin(), mask_key.end(), header.begin() + header_size);
         header_size += mask_key.size();
     }
+    // step4: 先写头；失败即认为连接不可用。
     auto result = write_all(header.data(), header_size);
     if (!result.ok()) {
         abort_transport();
@@ -557,6 +632,18 @@ WebSocketResult WebSocket::protocol_error(std::string message, std::uint16_t cod
     return {WebSocketError::Protocol, 0, std::move(message)};
 }
 
+/**
+ * @brief 读一条完整业务消息（控制帧内联处理、数据帧按分片重组）。
+ *
+ * ## 步骤
+ * step1. 取读锁并检查 `m_closed`；
+ * step2. 循环 `read_frame()`：Ping 自动回 Pong、Pong 丢弃；
+ * step3. Close：校验 code/reason，必要时回 Close，置 `m_closed` 后交付 Close 消息；
+ * step4. 数据帧：首片记录 opcode，Continuation 追加，FIN 后交付并校验 UTF-8。
+ *
+ * ## 失败语义
+ * 分片期间收到新的 Text/Binary、非法 close code、UTF-8 非法都走 `protocol_error()`。
+ */
 WebSocketResult WebSocket::read_message(WebSocketMessage& message) {
     std::lock_guard<sync::Mutex> lock(m_read_mutex);
     if (m_closed.load(std::memory_order_acquire)) return {WebSocketError::Closed, 0, "websocket is closed"};

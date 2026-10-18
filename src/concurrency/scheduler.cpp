@@ -732,6 +732,38 @@ bool Task::cancel_if_runnable_unqueued() noexcept {
     return true;
 }
 
+/**
+ * @brief 在 worker 上执行这个 G（首次运行，或从 park 处恢复）。
+ *
+ * ## 前置条件
+ *
+ * 调用方必须已取得 `m_execution_claim`（出队时与 `m_queued` 在同一转换中取得），
+ * 且只应在 worker 线程上调用。
+ *
+ * ## 步骤
+ *
+ * step1. 校验 `m_execution_claim`；没有就返回（执行权已丢，可能是因为 cancel）；
+ * step2. `m_run_claim` CAS —— 防止两个执行者同时进入同一个 Fiber 栈帧。
+ *        **CAS 失败的分支是本函数最容易写错的地方**：前一个执行者已释放
+ *        execution_claim、但它的 `run()` 栈帧还在退栈（run_claim 未释放）。
+ *        此时必须把 G 交回 `kRunnable` + 置 `m_deferred_enqueue` + 清
+ *        `m_execution_claim`，否则它会永久停在 `kRunning` 且无人认领，
+ *        `shutdown()` 永远等不到终态（真实事故：12 并发下 1/36 挂死）；
+ * step3. 在 `m_transition_mutex` 内取 Fiber 指针（避免与析构竞争）；
+ * step4. 首次运行则 `initialize` 栈与上下文，否则直接 resume 挂起点；
+ * step5. 恢复执行；`run()` 返回时按 state 决定入队/终态，并在**同一临界区**释放
+ *        两个 claim。
+ *
+ * ## 两个 claim 的关系（必须一起理解）
+ *
+ * | 位 | 含义 |
+ * |---|---|
+ * | `m_execution_claim` | 我拥有这个 G 的执行权（队列已出队） |
+ * | `m_run_claim` | 我正在它的 `run()` 栈帧内（防两个执行者进同一栈） |
+ *
+ * 两者必须在**同一个临界区**翻转（见函数末尾注释）。晚一步释放 run_claim，
+ * 新执行者就会先拿到 execution_claim、再在入口被 run_claim 拒绝并静默返回。
+ */
 void Task::run() {
     if (!m_execution_claim.load(std::memory_order_acquire)) {
         return;
@@ -1799,6 +1831,25 @@ void Scheduler::start() {
     m_impl->emit_event(SchedulerEvent{SchedulerEventType::kStarted});
 }
 
+/**
+ * @brief 合作式关停：关闭 admission、取消未启动 G、给运行中 G 设取消、等全部终态。
+ *
+ * ## 步骤
+ *
+ * step1. 关闭 admission（新的 `go()` 被拒绝）并置 draining；
+ * step2. 取消所有**尚未启动**的 G（它们不会再被调度，直接进终态）；
+ * step3. 对已启动的 G 设置**合作取消** —— 只置标志，由 G 自己在下一个 park 点检查；
+ * step4. 唤醒所有 parked G，让它们看到取消标志并走到终态；
+ * step5. 等待注册表里全部 G 进入终态；有界等待，超时返回 false。
+ *
+ * ## 为什么不能强制
+ *
+ * 协作式模型下**没有安全点可以切断 C++ 栈**；强行终结会跳过 RAII（锁不释放、
+ * 临时对象不析构）。所以只能「请求取消 + 等自然完成」——永不返回的 body 会让
+ * shutdown 一直等到超时，这是有意的取舍。
+ *
+ * @return true 表示全部进入终态；false 表示超时（仍有 G 未结束，调用方负责 watchdog）。
+ */
 bool Scheduler::shutdown_for(
     std::chrono::steady_clock::duration timeout) {
     if (!m_impl) {
@@ -2129,6 +2180,21 @@ std::shared_ptr<Task> Scheduler::spawn(Task::Function function) {
     return spawn(std::move(function), TaskOptions{});
 }
 
+/**
+ * @brief 提交一个可调用对象，返回 `Task` 句柄（GMP 里的「创建 G」）。
+ *
+ * ## 步骤
+ *
+ * step1. 用配置补全 `stack_size` / `fiber_bin_capacity`（0 表示取 Scheduler 默认值）；
+ * step2. 构造 `Task`（同时持有 callable，不在此启动 Fiber —— 首次被 worker 取到才建栈）；
+ * step3. `enqueue()` 入队；失败（admission 已关闭/admission 竞态）时**立即 `cancel()`**，
+ *        让调用方通过 `task->state()` 看到终态，而不是拿到一个永不运行的句柄。
+ *
+ * ## 线程模型
+ *
+ * 可以从任意线程调用；`enqueue` 走外部 admission 路径（全局锁 + registry 条带），
+ * 与 worker 内部的 `requeue_from_worker` 是两条不同的路径。
+ */
 std::shared_ptr<Task> Scheduler::spawn(Task::Function function,
                                       TaskOptions options) {
     if (options.stack_size == 0) {

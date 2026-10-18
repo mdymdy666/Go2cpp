@@ -811,6 +811,38 @@ std::shared_ptr<WaitBackend> CreateWaitBackend() noexcept {
     return s_default_backend;
 }
 
+/**
+ * @brief `sync::Mutex` 的共享实现（PIMPL 隐藏；`Mutex` 本身只持 `unique_ptr<Impl>`）。
+ *
+ * ## 定位
+ *
+ * 所有 `sync::Mutex` 实例共享这套语义；`SpinMutex` 也**复用它**（只额外维护
+ * `no_park_depth` 契约计数），因此这里的每条不变量同时约束两种锁。上层使用者：
+ * `sync::ConditionVariable`/`WaitGroup`、`channel`、`future`、`IOManager` 的等待节点。
+ *
+ * ## 状态字（`m_state` 两个位，必须一起理解）
+ *
+ * | 位 | 含义 |
+ * |---|---|
+ * | `kLocked` | 锁已被持有 |
+ * | `kWaiter` | 可能有线程睡在 futex 上 / 正在入队 |
+ *
+ * **不变量**：只要可能有线程睡在 futex 上，状态就**永远不会是 0/1** —— 这样新来的
+ * `lock()` 无法用 `CAS(0→1)` 快路径绕过仍在睡眠的等待者。这条不变量是 250 倍退化
+ * 修复的核心（详见 `docs/gmp-optimization-log.md` 的「sync::Mutex 的 250 倍退化」）。
+ *
+ * ## 队列与唤醒
+ *
+ * `m_waiters` 是 FIFO 且**存 `shared_ptr`**：`Unlock` 先从队列取出等待者、再在
+ * 释放队列锁后 `Wake`；若存裸指针，等待方可能在这段窗口内返回并销毁栈上的
+ * `WaitNode`（或被缓存节点复用），形成悬空访问。`shared_ptr` 把节点生命周期延长
+ * 到 `Wake` 完成，同时保持「锁外唤醒」避免锁反转。
+ *
+ * ## 线程模型
+ *
+ * 队列操作都在 `m_mutex` 内；状态位用原子操作在锁外快路径读。受管 G 竞争时
+ * **直接 park**（不做 yield 重试），普通线程走 `WaitNative` + 自旋预算。
+ */
 struct Mutex::Impl {
     std::mutex m_mutex;
     // 同一个原子字节同时发布“已持有”和“已有等待者/等待者正在入队”
@@ -1166,8 +1198,27 @@ void Mutex::lock() {
     }
 }
 
+/**
+ * @brief `sync::ConditionVariable` 的共享实现（CV 本身无状态，等待队列在这里）。
+ *
+ * ## 定位
+ *
+ * 语义与 `std::condition_variable` 对齐：`Wait` 必须持外部 `Mutex`，返回时
+ * 外部锁**重新被持有**；`NotifyOne/NotifyAll` 不要求持锁。
+ * 上层使用者：`channel`、`future`、`parking_condition` 的线程路径、`timer`。
+ *
+ * ## 与 `Mutex::Impl::m_waiters` 的区别（很容易混）
+ *
+ * - `Mutex::Impl::m_waiters` 是**等锁**的队列，由 `Unlock` 做 FIFO 交接；
+ * - 本队列是**等通知**的队列，由 `NotifyOne/NotifyAll` 唤醒，与锁的交接无关。
+ *
+ * 两者都用 `shared_ptr<WaitNode>` 保存，理由相同：唤醒发生在锁外，
+ * 裸指针会让等待方在窗口内销毁节点。
+ */
 struct ConditionVariable::Impl {
+    /// @brief 保护 m_waiters；Wait 入队、NotifyOne/NotifyAll 出队。
     std::mutex m_mutex;
+    /// @brief 通知等待队列（FIFO）；存 shared_ptr 以便锁外 Wake 时节点仍存活。
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
 };
 
@@ -1299,9 +1350,27 @@ void ConditionVariable::NotifyAll() noexcept {
     }
 }
 
+/**
+ * @brief `sync::WaitGroup` 的共享实现（`Add/Done/Wait` 的计数与等待队列）。
+ *
+ * ## 状态机（只有两态）
+ *
+ * `Pending(count > 0)` -(Done() 使 count 归零)-> `Done`：归零时唤醒全部等待者。
+ * `Add()` 在归零后可以重新开始一轮（Go 的 `WaitGroup` 允许复用），但
+ * **`Add` 与 `Wait` 并发是调用方的错误**（Go 里会 panic 或竞态）。
+ *
+ * ## 不变量
+ *
+ * - `m_count >= 0`；`Add` 让计数变负是未定义行为（本实现不 panic，靠调用方守约）；
+ * - `m_count == 0 && !m_waiters.empty()` 只是**瞬态**：`Done` 归零时在同一把锁内
+ *   把队列 swap 出来，再在锁外逐个唤醒。
+ */
 struct WaitGroup::Impl {
+    /// @brief 保护 m_count 与 m_waiters；Add/Done 写、Wait 读。
     mutable std::mutex m_mutex;
+    /// @brief 未完成计数；`Add(n)` 加、`Done()` 减，归零时唤醒全部等待者。
     std::int64_t m_count{0};
+    /// @brief 等待计数归零的队列（FIFO）；`Wait` 入队、`Done` 归零时整体 swap 出。
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
 };
 

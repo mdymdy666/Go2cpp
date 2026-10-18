@@ -9,6 +9,27 @@
  * @details 所有读取路径都先检查长度再访问字节，因此短输入只会得到
  *          `ErrShortBuffer()`，不会越界；这是相对 Go（切片过短会 panic）的
  *          刻意差异，也是 C++ 侧必须自己承担的边界责任。
+ *
+ * ## 模块定位
+ *
+ * `binary.hpp` 的实现层：定长整数的字节序读写与 LEB128/zig-zag 变长整数。
+ * 上游是协议帧解析与序列化模块，下游只有 `go2cpp::tools::error`。
+ *
+ * ## 本文件定义什么
+ *
+ * - 内部工具：`Load16/32/64`、`Store16/32/64`、`ByteAt`、`LowByte`；
+ * - `ShortBuffer()`：带函数名/期望长度/实际长度的 `ErrShortBuffer()` 包装；
+ * - `Binary` 的 8 组定长读写、`Uvarint`/`Varint` 及其写入函数。
+ *
+ * ## 阅读建议
+ *
+ * 定长部分只需确认「先查长度、再按 Order 组装」；重点看 `Uvarint` 的
+ * 10 字节边界与 `Varint` 的 zig-zag 还原。
+ *
+ * ## 边界与陷阱
+ *
+ * 定长读取返回的 `value` 在失败时为 0；`Uvarint` 恰好 10 个续位字节返回
+ * 「截断」而不是「溢出」，只有出现第 11 个字节才判溢出。
  */
 
 #include "go2cpp/encoding/binary.hpp"
@@ -239,10 +260,21 @@ std::size_t Binary::PutFloat64(std::string& dst, double value, Order order) {
     return PutUint64(dst, raw, order);
 }
 
+/**
+ * @brief 解码 LEB128 无符号变长整数。
+ *
+ * ## 步骤
+ * step1. 逐字节扫描；出现第 11 个字节（`i == 10`）必定溢出；
+ * step2. 遇到终止字节（`< 0x80`）：第 10 个字节必须 `<= 1`，否则溢出；
+ *        否则组装低 7 位并返回 `bytes_read`；
+ * step3. 续位字节：取低 7 位累加到 `value`，`shift += 7`；
+ * step4. 输入在终止字节前耗尽（含恰好 10 个续位字节）→ 截断错误。
+ */
 Binary::UvarintResult Binary::Uvarint(std::string_view src) noexcept {
     UvarintResult result;
     std::uint64_t value = 0;
     unsigned shift = 0;
+    // step1: 最多 10 字节；第 11 个字节出现即溢出
     for (std::size_t i = 0; i < src.size(); ++i) {
         if (i == 10) {
             // 第 11 个字节才出现：必然超过 64 位（对齐 Go 的 MaxVarintLen64）。
@@ -252,6 +284,7 @@ Binary::UvarintResult Binary::Uvarint(std::string_view src) noexcept {
             return result;
         }
         const unsigned char byte = static_cast<unsigned char>(src[i]);
+        // step2: 终止字节；第 10 字节只剩 1 位有效空间
         if (byte < 0x80) {
             if (i == 9 && byte > 1) {
                 // 第 10 个字节只剩 1 位有效空间。
@@ -265,24 +298,34 @@ Binary::UvarintResult Binary::Uvarint(std::string_view src) noexcept {
             result.bytes_read = i + 1;
             return result;
         }
+        // step3: 续位字节，累加低 7 位
         value |= static_cast<std::uint64_t>(byte & 0x7f) << shift;
         shift += 7;
     }
-    // 输入在终止字节前耗尽。注意：恰好 10 个续位字节也走这里（Go 返回 0，
-    // 表示「缓冲区太小」而不是溢出，只有出现第 11 个字节才算溢出）。
+    // step4: 输入在终止字节前耗尽。注意：恰好 10 个续位字节也走这里
+    // （Go 返回 0，表示「缓冲区太小」而不是溢出，只有第 11 个字节才算溢出）。
     result.error =
         detail::Tagged("binary.Uvarint: unexpected end of varint",
                        ErrUvarintTruncated());
     return result;
 }
 
+/**
+ * @brief 解码 zig-zag 编码的有符号变长整数。
+ *
+ * ## 步骤
+ * step1. 复用 `Uvarint` 取出无符号位模式；
+ * step2. 按 `x = (ux >> 1) ^ -(ux & 1)` 还原，用位取反避免有符号右移。
+ */
 Binary::VarintResult Binary::Varint(std::string_view src) noexcept {
     VarintResult result;
+    // step1: 先按无符号 LEB128 解码
     const UvarintResult raw = Uvarint(src);
     if (!raw) {
         result.error = raw.error;
         return result;
     }
+    // step2: zig-zag 还原：最低位是符号位
     std::uint64_t bits = raw.value >> 1;
     if ((raw.value & 1) != 0) {
         bits = ~bits;
