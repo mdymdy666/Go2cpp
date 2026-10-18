@@ -373,8 +373,8 @@ class Heap {
         }
     }
 
-    std::vector<T> m_data;
-    Less m_less{};
+    std::vector<T> m_data;  ///< 堆的存储；由 Push/Pop/Remove/Init 改写，始终维持小根堆
+    Less m_less{};          ///< 用户比较器（min-heap 语义）；`Inverted` 反向借用它给标准库算法
 };
 
 }  // namespace go2cpp::container

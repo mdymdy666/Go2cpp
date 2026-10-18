@@ -23,6 +23,31 @@
  *       - `Quote` 覆盖 ASCII 可打印 + 常见转义 + `\xNN`/`\uNNNN`，不做 Go 的完整 Unicode `IsPrint` 表。
  * @note 本模块依赖 `ErrorPtr`（`go2cpp/error.hpp`），错误按 Go 的 `ErrSyntax`/`ErrRange` 两类锚点区分，
  *       判断用身份比较 `Is(err, StrconvErrSyntax())`（与全项目一致，不做文本比较）。
+ *
+ * ## 模块定位
+ * Go `strconv` 的对应物：数字/布尔 <-> 字符串的解析与格式化，外加 `Quote`。
+ * 被 `fmt`（数字格式化与字符串引用）、JSON、配置解析和测试断言广泛使用。
+ *
+ * ## 本文件定义什么
+ * - 错误锚点：`StrconvErrSyntax()` / `StrconvErrRange()`（身份比较，不做文本比较）；
+ * - 结果结构：`StrconvIntResult` / `StrconvUintResult` / `StrconvFloatResult` /
+ *   `StrconvBoolResult`（对应 Go 的多返回值 `(value, err)`）；
+ * - 解析：`ParseUint` / `ParseInt` / `Atoi` / `ParseBool` / `ParseFloat`；
+ * - 格式化：`FormatInt` / `FormatUint` / `Itoa` / `FormatBool` / `FormatFloat` / `Quote`。
+ *
+ * ## 阅读建议
+ * 先看文件头「已对照并落实的非显然行为」（base=0 推断、下划线、越界钳制值），
+ * 再看 `ParseUint` 的手动累加（为什么这里**不能**直接用 `std::from_chars`），
+ * 最后看 `FormatFloat` 的 `to_chars` 分支与 `Quote` 的转义表。
+ *
+ * ## 为什么用 from_chars/to_chars 而不是 std::stoi/std::stod
+ * - `std::stoi`/`std::stod` 用**异常**报错、**不返回钳制值**，且受 **locale** 影响
+ *   （小数点、千分位），既无法对齐 Go 语义，也不保证 round-trip；
+ * - `std::from_chars`/`std::to_chars` **locale 无关、无分配、返回明确 errc**；
+ *   浮点 `to_chars` 默认就是**最短 round-trip**，正好对应 Go 的 `%g` 精度 -1；
+ * - 但 `from_chars` **不认识** Go 的 `base=0` 推断与下划线，也**不会在越界时给出
+ *   钳制值**，所以 `ParseUint`/`ParseInt` 在薄校验后改为**手动累加**（见其步骤），
+ *   只有 `ParseFloat` 直接复用 `from_chars`（先剥符号、hex 前缀与下划线）。
  */
 
 #pragma once
@@ -121,6 +146,16 @@ inline int DigitValue(char c, int base) noexcept {
 // ============================================================================
 
 /** @brief `Atoi`/`ParseInt` 的结果。 */
+/**
+ * @brief `Atoi`/`ParseInt` 的结果。
+ *
+ * ## 定位
+ * 被 `Parse*` 系列返回；调用方应同时检查 `error` 与 `value`（越界时 `value` 是
+ * 钳制值而不是未定义内容）。
+ *
+ * ## 不变量
+ * `ok()` 为真等价于 `error` 为空；`error` 非空时 `value` 仍有定义（Go 语义）。
+ */
 struct StrconvIntResult {
     std::int64_t value{0};
     ErrorPtr error;
@@ -128,6 +163,16 @@ struct StrconvIntResult {
 };
 
 /** @brief `ParseUint` 的结果。 */
+/**
+ * @brief `ParseUint` 的结果。
+ *
+ * ## 定位
+ * 被 `Parse*` 系列返回；调用方应同时检查 `error` 与 `value`（越界时 `value` 是
+ * 钳制值而不是未定义内容）。
+ *
+ * ## 不变量
+ * `ok()` 为真等价于 `error` 为空；`error` 非空时 `value` 仍有定义（Go 语义）。
+ */
 struct StrconvUintResult {
     std::uint64_t value{0};
     ErrorPtr error;
@@ -135,6 +180,16 @@ struct StrconvUintResult {
 };
 
 /** @brief `ParseFloat` 的结果。 */
+/**
+ * @brief `ParseFloat` 的结果。
+ *
+ * ## 定位
+ * 被 `Parse*` 系列返回；调用方应同时检查 `error` 与 `value`（越界时 `value` 是
+ * 钳制值而不是未定义内容）。
+ *
+ * ## 不变量
+ * `ok()` 为真等价于 `error` 为空；`error` 非空时 `value` 仍有定义（Go 语义）。
+ */
 struct StrconvFloatResult {
     double value{0};
     ErrorPtr error;
@@ -142,6 +197,16 @@ struct StrconvFloatResult {
 };
 
 /** @brief `ParseBool` 的结果。 */
+/**
+ * @brief `ParseBool` 的结果。
+ *
+ * ## 定位
+ * 被 `Parse*` 系列返回；调用方应同时检查 `error` 与 `value`（越界时 `value` 是
+ * 钳制值而不是未定义内容）。
+ *
+ * ## 不变量
+ * `ok()` 为真等价于 `error` 为空；`error` 非空时 `value` 仍有定义（Go 语义）。
+ */
 struct StrconvBoolResult {
     bool value{false};
     ErrorPtr error;
@@ -157,6 +222,14 @@ struct StrconvBoolResult {
  * @param text 待解析文本（不允许前后空格）。
  * @param base 2..36，或 0 表示自动推断（`0b`/`0o`/`0x` 前缀，或前导 `0` → 八进制）。
  * @param bit_size 0（视作 64）/8/16/32/64；越界值时返回 `ErrRange` **并给出钳制值**。
+ *
+ * ## 步骤
+ * step1. 空串 -> `ErrSyntax`；
+ * step2. `base == 0` 时推断进制（`0b`/`0o`/`0x` 前缀，或前导 `0` -> 八进制）；
+ * step3. 校验 `base` 范围与 `bit_size`（0 视作 64）；
+ * step4. 只在 `base == 0` 时允许 `_`，并用 `UnderscoreOk()` 校验位置；
+ * step5. 手动逐位累加：先用 `cutoff`/`max_digit` 预判溢出；
+ * step6. 溢出 -> 返回**钳制值** + `ErrRange`（这正是不能直接用 `from_chars` 的原因）。
  */
 inline StrconvUintResult ParseUint(std::string_view text, int base, int bit_size) {
     StrconvUintResult result;
@@ -253,6 +326,15 @@ inline StrconvUintResult ParseUint(std::string_view text, int base, int bit_size
  * @brief 对应 `strconv.ParseInt`。
  * @details 负号只在 `bitSize` 的**有符号**范围内检查（Go 用 `cutoff = 1 << (bitSize-1)`，
  *          允许 `-128` 但 `+127` 已是 `ErrRange`）。
+ *
+ * ## 步骤
+ * step1. 剥前导 `+`/`-`，记录符号；
+ * step2. 用 `ParseUint()` 解析绝对值（复用进制推断/下划线/钳制逻辑）；
+ * step3. 按有符号范围检查：正数上限 `2^(n-1)-1`，负数下限 `-2^(n-1)`；
+ * step4. 越界返回钳制值 + `ErrRange`；正常则应用符号返回。
+ *
+ * ## 边界
+ * `bit_size` 的负边界允许 `-128`，正边界不允许 `+128`（与 Go 的 cutoff 语义一致）。
  */
 inline StrconvIntResult ParseInt(std::string_view text, int base, int bit_size) {
     StrconvIntResult result;
@@ -339,6 +421,14 @@ inline bool EqualIgnoreCase(std::string_view text, std::string_view expected) {
  * @details 接受十进制/十六进制浮点、科学计数法、数字间的下划线，以及
  *          `inf`/`infinity`/`nan`（大小写不敏感，可带符号）；**不接受前后空格**。
  * @param bit_size 32 或 64（32 时按 `float` 精度校验，超出返回 `ErrRange`）。
+ *
+ * ## 步骤
+ * step1. 校验 `bit_size`（只允许 32/64）与空串；
+ * step2. 剥前导符号（`from_chars` 不接受 `+`）；
+ * step3. 识别特殊值 `inf`/`infinity`/`nan`（大小写不敏感）；
+ * step4. 校验并剥离下划线（`from_chars` 不认识 `_`），剥 hex 的 `0x` 前缀；
+ * step5. `std::from_chars()` 解析，要求消费完整个输入（`ptr == end`）；
+ * step6. `bit_size == 32` 时按 float 收窄，溢出返回 `ErrRange`。
  */
 inline StrconvFloatResult ParseFloat(std::string_view text, int bit_size) {
     StrconvFloatResult result;
@@ -429,6 +519,14 @@ inline StrconvFloatResult ParseFloat(std::string_view text, int bit_size) {
 // ============================================================================
 
 /// 对应 `strconv.FormatInt`（`base` 2..36，小写字母；非法 base 抛 `std::logic_error`）。
+/**
+ * @brief 对应 `strconv.FormatInt`（base 2..36，小写字母）。
+ *
+ * ## 步骤
+ * step1. 非法 base 抛 `std::logic_error`（与 Go 的 panic 对齐）；
+ * step2. 取绝对值时用 `~x + 1`，避免 `INT64_MIN` 取负溢出；
+ * step3. 从缓冲区尾部向前填数字，最后补 `-`，再构造字符串。
+ */
 inline std::string FormatInt(std::int64_t value, int base) {
     if (base < 2 || base > 36) throw std::logic_error("strconv.FormatInt: invalid base");
     const bool negative = value < 0;
@@ -471,6 +569,13 @@ inline std::string FormatBool(bool value) { return value ? "true" : "false"; }
  * @param precision `'f'`/`'e'` 为小数位数；`'g'` 为有效数字位；**-1 表示最短可往返表示**。
  * @param bit_size 32 或 64。
  * @note Go 的 `'b'`/`'x'`/`'X'` 未实现 —— 抛 `std::logic_error`（已在文件头列为边界）。
+ *
+ * ## 步骤
+ * step1. 校验 `bit_size` 与 format（只支持 `f`/`e`/`g`）；
+ * step2. 特殊值直接返回 `NaN`/`+Inf`/`-Inf`（Go 的拼写）；
+ * step3. `g` + precision -1 -> `to_chars()` 默认的最短 round-trip；
+ * step4. 其它组合 -> `to_chars` 的 fixed/scientific/general + precision 重载；
+ * step5. `to_chars` 失败抛 `std::runtime_error`（缓冲区足够大，正常不会发生）。
  */
 inline std::string FormatFloat(double value, char format, int precision, int bit_size) {
     if (bit_size != 32 && bit_size != 64) throw std::logic_error("strconv.FormatFloat: bad bitSize");
@@ -510,6 +615,13 @@ inline std::string FormatFloat(double value, char format, int precision, int bit
  * @brief 对应 `strconv.Quote`（子集：双引号 + Go 常用转义）。
  * @note ASCII 可打印字符直出；`\a\b\f\n\r\t\v\\\"` 用短转义；
  *       其余字节用 `\xNN`，非 ASCII 的合法 UTF-8 序列用 `\uNNNN`（见文件头边界说明）。
+ *
+ * ## 步骤
+ * step1. 输出开引号；
+ * step2. 短转义表（`\a\b\f\n\r\t\v\\\"`）直接映射；
+ * step3. ASCII 可打印字符原样输出；
+ * step4. 其余字节输出 `\xNN`（不区分是否合法 UTF-8，见文件头边界）；
+ * step5. 输出闭引号。
  */
 inline std::string Quote(std::string_view text) {
     std::string result;

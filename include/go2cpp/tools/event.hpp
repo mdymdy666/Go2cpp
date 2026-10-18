@@ -1,6 +1,35 @@
+/**
+ * @file event.hpp
+ * @brief `EventBatch`（别名 `SelectLoop`）：把一组 `SelectCase` 与回调封装成
+ *        可复用的事件循环。
+ *
+ * ## 模块定位
+ *
+ * `tools` 层的事件循环包装，建立在 `channel::Select` 与 `sync::Mutex` 之上。
+ * 上游是「同时等多个 channel / 定时器 / 取消信号」的业务循环，下游是
+ * `channel` 与 `sync`。它不拥有任何 Fiber，也不强制阻塞策略：等待经过
+ * `ParkingCondition`，Fiber 不会占住 M。
+ *
+ * ## 本文件定义什么
+ *
+ * - `EventBatch`：事件集合、每轮 `work()`、停止/超时/轮数限制；
+ * - `SelectLoop`：同一类型的更直观别名；
+ * - 内部的 `StopControl`（Context + cancel）与 `Entry`（case + handler）。
+ *
+ * ## 阅读建议
+ *
+ * 先读 `work()` 的 6 个步骤与状态机文档 `docs/state-machines/EventBatch.md`，
+ * 再看 `stop()`/`reset()`/`clear()` 三个生命周期函数，最后看各观测接口。
+ *
+ * ## 边界与陷阱
+ *
+ * **`m_mutex.Lock()` 返回 false 时，`add_event`/`clear`/`make_loop_time` 等
+ * 写方法会静默 `return`，不会报错、也不会入队。** 因此不要用「方法返回
+ * void」推断事件已入队；需要确认时用 `size()` 复查。锁失败通常发生在
+ * 调度器关闭或 Fiber 被强制终止的窗口。
+ */
 #pragma once
 
-#include "go2cpp/channel.hpp"
 #include "go2cpp/sync.hpp"
 
 #include <chrono>
@@ -28,11 +57,33 @@ namespace go2cpp {
  * @details 将多个 SelectCase 与回调绑定为一轮一轮的等待任务，底层依赖
  *          Channel、Select 和 sync::Mutex，支持 Fiber 与普通线程调用。
  *          stop()/reset() 控制生命周期，超时和最大轮数用于限制长时间运行。
+ *
+ * ## 定位
+ * `tools` 的事件循环层：供需要「同时等多个 channel / 定时器 / 取消信号」的
+ * 业务循环使用（例如服务主循环、协议多路复用）。它把 `SelectCase` 集合与
+ * 每轮结果统一管理，避免调用方自己维护 case 数组与停止标志。
+ *
+ * ## 生命周期与线程模型
+ * 构造后可 `bind`/`add_event` 装载事件，`work()` 每轮执行一次 Select，
+ * `stop()`/`reset()` 控制生命周期。所有公开方法用 `sync::Mutex` 保护共享
+ * 状态：Fiber 竞争时挂起而不是占住 M，普通线程也可安全等待。`work()` 由
+ * `m_work_mutex` 串行化，同一批只允许一个执行者。用户 Handler 在锁外运行。
+ *
+ * ## 状态机
+ * `Unbound -> Runnable -> Waiting -> Runnable/Stopped` 等转化见
+ * `docs/state-machines/EventBatch.md`。
+ *
+ * ## 不变量
+ * - `m_entries` 与 `m_last.index` 的一致性只在持 `m_mutex` 时成立；
+ * - `m_rounds` 只在成功执行一轮 `work()` 后递增；
+ * - `m_stopped` 为真后 `work()` 不再调用 `Select`，直接返回停止结果；
+ * - `m_has_result` 为真时 `m_last` 是最近一轮结果的副本；
+ * - `m_work_mutex` 保证同一时刻最多一个 `work()` 在跑。
  */
 class EventBatch final {
     struct StopControl final {
-        ContextPtr context;
-        CancelFunc cancel;
+        ContextPtr context; ///< 批次的停止 Context；stop() 通过 cancel 唤醒 Select
+        CancelFunc cancel;  ///< 取消函数；stop() 调用，触发 DoneSignal
     };
 
     static std::shared_ptr<StopControl> make_stop_control() {
@@ -195,11 +246,21 @@ public:
      * @param context 外部取消 Context，可为空。
      * @param timeout 本轮覆盖默认 loop timeout 的时长。
      * @return 本轮选择结果；停止、取消和错误通过 status/error 返回。
+     *
+     * ## 步骤
+     * step1. 获取 `m_work_mutex`，保证同一批只有一个 `work()`；
+     * step2. 持 `m_mutex` 检查停止/空事件，以及轮数与总时长上限；已停止则
+     *        直接返回 `stopped_result`；
+     * step3. 复制 case 与 handler 快照，计算本轮 timeout（显式 timeout >
+     *        loop timeout > 批次剩余时间）；
+     * step4. 在锁外调用 `Select`（可能挂起 Fiber）；异常转成 kInvalid 结果；
+     * step5. 回到锁内更新 `m_last`/`m_has_result`/`m_rounds`，超时且
+     *        `stop_on_timeout` 时置停止；
+     * step6. 在锁外执行选中 case 的 Handler；回调异常只写回 `m_last`。
      */
     SelectResult work(const ContextPtr& context = {},
                       std::optional<Duration> timeout = std::nullopt) {
-        // 同一批次只允许一个 work 调用；sync::Mutex 会让竞争的 Fiber
-        // 挂起而不是占住 M，普通线程仍可安全等待。
+        // step1: 同一批次只允许一个 work；竞争 Fiber 会挂起而不是占住 M
         if (!m_work_mutex.Lock()) {
             return stopped_result("事件批次无法获取工作锁");
         }
@@ -214,6 +275,7 @@ public:
                 m_work_mutex.Unlock();
                 return stopped_result("事件批次无法获取状态锁");
             }
+            // step2: 检查停止条件与轮数/总时长上限
             if (!m_stopped && !m_entries.empty()) {
                 if (!m_started_at.has_value()) {
                     m_started_at = std::chrono::steady_clock::now();
@@ -226,6 +288,7 @@ public:
                     m_stopped = true;
                 }
             }
+            // step3: 复制快照并计算本轮超时
             if (!m_stopped && !m_entries.empty()) {
                 selected_cases = cases();
                 selected_handlers.reserve(m_entries.size());
@@ -274,6 +337,7 @@ public:
                         [stop_bridge_cancel] { stop_bridge_cancel(); });
                 }
             }
+            // step4: 锁外执行 Select；这里才可能挂起 Fiber
             result = Select(selected_cases, effective_context,
                             effective_timeout);
         } catch (const std::exception& exception) {
@@ -300,6 +364,7 @@ public:
                 m_work_mutex.Unlock();
                 return stopped_result("事件批次无法更新状态");
             }
+            // step5: 回写最近结果与轮数
             m_last = result;
             m_has_result = true;
             ++m_rounds;
@@ -315,8 +380,7 @@ public:
         }
         m_work_mutex.Unlock();
 
-        // 用户回调不在 EventBatch 锁内运行；异常转换成结果错误，不能
-        // 穿过 scheduler worker 或 Fiber 边界。
+        // step6: 用户回调在锁外运行；异常只更新 m_last，不穿过边界
         if (handler) {
             try {
                 handler(result);
@@ -382,8 +446,8 @@ public:
 
 private:
     struct Entry {
-        SelectCase event;
-        Handler handler;
+        SelectCase event; ///< 一个等待中的 case；bind/add_event 写入
+        Handler handler;  ///< 该 case 被选中时的回调，可为空
     };
 
     std::vector<SelectCase> cases() const {
@@ -403,19 +467,19 @@ private:
         return m_last;
     }
 
-    mutable sync::Mutex m_mutex;
-    sync::Mutex m_work_mutex;
-    std::shared_ptr<StopControl> m_stop_control;
-    std::vector<Entry> m_entries;
-    std::optional<Duration> m_loop_timeout;
-    std::optional<Duration> m_max_duration;
-    std::optional<std::chrono::steady_clock::time_point> m_started_at;
-    SelectResult m_last;
-    std::size_t m_rounds{0};
-    std::size_t m_max_rounds{0};
-    bool m_stop_on_timeout{true};
-    bool m_stopped{false};
-    bool m_has_result{false};
+    mutable sync::Mutex m_mutex;          ///< 保护全部状态字段；所有公开方法先 Lock()，失败即静默返回
+    sync::Mutex m_work_mutex;             ///< 串行化 work()；同一批只允许一个执行者
+    std::shared_ptr<StopControl> m_stop_control; ///< 当前停止 Context；stop()/clear()/reset() 替换
+    std::vector<Entry> m_entries;         ///< 已绑定事件；bind/add_event 追加，clear 清空
+    std::optional<Duration> m_loop_timeout; ///< 每轮默认超时；make_loop_time() 设置
+    std::optional<Duration> m_max_duration; ///< 批次总时长上限；make_stop_config() 设置
+    std::optional<std::chrono::steady_clock::time_point> m_started_at; ///< 首轮开始时间；首次 work() 设置
+    SelectResult m_last;                  ///< 最近一轮结果副本；work() 写，handle()/last_result_copy() 读
+    std::size_t m_rounds{0};              ///< 已执行轮数；每轮 work() 递增，reset() 清零
+    std::size_t m_max_rounds{0};          ///< 总轮数上限；0 表示不限
+    bool m_stop_on_timeout{true};         ///< 本轮超时是否停止批次；make_loop_time() 设置
+    bool m_stopped{false};                ///< 停止标志；stop()/超时/轮数上限置真，reset()/clear() 复位
+    bool m_has_result{false};             ///< 是否已有最近结果；handle() 据此判断
 };
 
 // SelectLoop 是更直观的别名，保留 EventBatch 的所有显式生命周期规则。

@@ -22,6 +22,32 @@
  *       - `EqualFold` 支持 ASCII/Latin-1 简单折叠，不做 Unicode 完全折叠（如 Kelvin 符号）；
  *       - `TrimSpace`/`Fields` 覆盖 ASCII 空白 + Latin-1 的 0x85/0xA0 + 常见 Unicode 空白
  *         （U+1680、U+2000–U+200A、U+2028、U+2029、U+202F、U+205F、U+3000）。
+ *
+ * ## 模块定位
+ * Go `strings` 的对应物（header-only 薄封装）：判定 / 查找 / 切分 / 连接 / 替换 /
+ * 修剪 / 大小写。被 `fmt`（rune 工具）、`bytes`（同名函数直接转发，避免两份实现
+ * 漂移）、`streams` 与配置解析使用。
+ *
+ * ## 本文件定义什么
+ * - UTF-8 最小工具：`Utf8SequenceLength` / `DecodeRune` / `AppendRune` / `RuneCount` /
+ *   `IsSpaceRune` / `FoldRune` / `CutsetContains`；
+ * - 判定与查找：`Contains*` / `HasPrefix` / `HasSuffix` / `EqualFold` / `Index*` /
+ *   `LastIndex*` / `Count`；
+ * - 切分与连接：`detail::GenSplit`（Split 家族的唯一实现）/ `Split*` / `Fields` /
+ *   `Join` / `Repeat`；
+ * - 替换与修剪：`Replace` / `ReplaceAll` / `Trim*` / `Cut*`；
+ * - 大小写：`ToUpper` / `ToLower`。
+ *
+ * ## 阅读建议
+ * 先看文件头的「为什么自研」表与「明确边界」，再看 `detail::GenSplit`（Split 家族
+ * 只有一个实现，`n`/`sep` 的边界都集中在这里），最后看 `Replace` 对空 `old` 的特判。
+ *
+ * ## 边界与陷阱
+ * - `sep` 为空时 `Split` **按 rune 切分**（每个 rune 一项，不含首尾空串），不是按空串切；
+ * - `Replace` 的 `old` 为空时在**每个 rune 前后**插入新串（共 rune+1 处）；
+ * - `Count(s, "")` 返回 **rune 数 + 1**（Go 的反直觉边界）；
+ * - 非法 UTF-8 字节按 1 字节 rune 处理（`DecodeRune` 返回 size 0），否则循环会卡住；
+ * - 大小写/空白判定只覆盖 ASCII + Latin-1 + 常见 Unicode（见文件头边界），不做全量表。
  */
 
 #pragma once
@@ -61,6 +87,15 @@ inline int Utf8SequenceLength(unsigned char first) noexcept {
  *          `(U+FFFD, 1)` —— 即"非法字节算一个 rune"，这直接影响 `Count`/`Split("")`。
  * @return {rune, 消耗字节数}；输入为空返回 `{U+FFFD, 0}`。
  */
+/**
+ * @brief 解码一个 UTF-8 rune（非法/截断返回 RuneError + 消耗 1 字节）。
+ *
+ * ## 步骤
+ * step1. 空输入 -> `(RuneError, 0)`；
+ * step2. 按首字节求序列长度；非法/截断 -> `(RuneError, 1)`；
+ * step3. 逐续字节校验 `10xxxxxx`，不足则按 1 字节处理；
+ * step4. 拒绝过长编码（overlong）与代理区，返回 `(rune, 长度)`。
+ */
 inline std::pair<char32_t, std::size_t> DecodeRune(std::string_view text) noexcept {
     constexpr char32_t kReplacement = 0xFFFDU;
     if (text.empty()) return {kReplacement, 0};
@@ -87,6 +122,14 @@ inline std::pair<char32_t, std::size_t> DecodeRune(std::string_view text) noexce
 }
 
 /// 把一个 rune 追加到输出缓冲（UTF-8 编码；与 Go `utf8.AppendRune` 一致）。
+/**
+ * @brief 把 rune 追加为 UTF-8 字节。
+ *
+ * ## 步骤
+ * step1. `< 0x80` -> 1 字节；
+ * step2. `< 0x800` -> 2 字节；`< 0x10000` -> 3 字节；否则 4 字节；
+ * step3. 非法码点（代理区/超范围）按 `RuneError` 写入（不抛异常）。
+ */
 inline void AppendRune(std::string& output, char32_t rune) {
     if (rune < 0x80U) {
         output.push_back(static_cast<char>(rune));
@@ -110,6 +153,12 @@ inline void AppendRune(std::string& output, char32_t rune) {
 }
 
 /// rune 计数；非法字节按 1 个 rune 计（`utf8.RuneCountInString` 语义）。
+/**
+ * @brief 统计 rune 数量。
+ *
+ * ## 说明
+ * 按 `DecodeRune` 的步长前进；非法字节记 1 个 rune 并前进 1 字节，保证终止。
+ */
 inline std::size_t RuneCount(std::string_view text) noexcept {
     std::size_t count = 0;
     for (std::size_t i = 0; i < text.size();) {
@@ -196,6 +245,13 @@ inline bool HasSuffix(std::string_view text, std::string_view suffix) {
  * @brief 对应 `strings.EqualFold`（ASCII/Latin-1 简单折叠）。
  * @note 不做 Unicode 完全折叠：例如 "K"（U+212A KELVIN SIGN）与 "k" 在 Go 下相等，
  *       本实现不认为相等 —— 已在文件头列为边界。
+ */
+/**
+ * @brief 大小写不敏感比较（ASCII + Latin-1 简单折叠）。
+ *
+ * ## 说明
+ * 两边同时解码 rune 并用 `FoldRune()` 比较；长度不同直接 false。不做 Unicode
+ * 完全折叠（如 Kelvin 符号）。
  */
 inline bool EqualFold(std::string_view left, std::string_view right) {
     std::size_t i = 0;
@@ -285,6 +341,16 @@ inline std::int64_t Count(std::string_view text, std::string_view substr) {
 namespace detail {
 
 /// Go `genSplit` 的等价物：`sep_for_after` 为 0 时表示 `Split`，为 `sep.size()` 时表示 `SplitAfter`。
+/**
+ * @brief Go `genSplit` 的等价物（Split 家族的唯一实现）。
+ *
+ * ## 步骤
+ * step1. `limit == 0` -> 空结果（Go 语义）；
+ * step2. `sep` 为空 -> 按 rune 切分，每个 rune 一项；`n > 0` 时最后一项吞掉剩余；
+ * step3. `sep` 非空 -> 循环 `find`，每项取 `[position, found + sep_for_after)`：
+ *         `sep_for_after == 0` 是 Split，`== sep.size()` 是 SplitAfter；
+ * step4. `n > 0` 且已产出 `n-1` 项时，把剩余全部作为最后一项。
+ */
 inline StringSlice GenSplit(std::string_view text, std::string_view sep,
                             std::size_t sep_for_after, std::int64_t limit) {
     StringSlice result;
@@ -342,6 +408,14 @@ inline StringSlice SplitAfterN(std::string_view text, std::string_view sep, std:
 }
 
 /// 对应 `strings.Fields`：按 `unicode.IsSpace` 切分并丢弃空项（可用子集见文件头）。
+/**
+ * @brief 对应 `strings.Fields`：按空白 rune 切分并丢弃空项。
+ *
+ * ## 步骤
+ * step1. 跳过前导空白；
+ * step2. 取一段非空白作为一项；
+ * step3. 再跳过空白，回到 step2，直到输入耗尽。
+ */
 inline StringSlice Fields(std::string_view text) {
     StringSlice result;
     std::size_t i = 0;
@@ -399,6 +473,15 @@ inline std::string Repeat(std::string_view text, std::int64_t count) {
 }
 
 /// 对应 `strings.Replace`：`n < 0` 表示全部替换。
+/**
+ * @brief 对应 `strings.Replace`（n < 0 表示全部替换）。
+ *
+ * ## 步骤
+ * step1. `n == 0` -> 原样返回；
+ * step2. `old` 为空 -> 在**每个 rune 前后**插入新串（先插一次再逐 rune 追加），
+ *         共 rune+1 处（Go 的反直觉语义）；
+ * step3. 否则循环 `find`，替换至多 `n` 次（`n < 0` 不限），最后追加尾部。
+ */
 inline std::string Replace(std::string_view text, std::string_view old_text,
                            std::string_view new_text, std::int64_t n) {
     if (n == 0 || old_text.empty()) {
@@ -443,6 +526,14 @@ inline std::string ReplaceAll(std::string_view text, std::string_view old_text,
 // ============================================================================
 
 /// 对应 `strings.TrimSpace`（空白集合见文件头边界说明）。
+/**
+ * @brief 对应 `strings.TrimSpace`：去掉首尾空白 rune。
+ *
+ * ## 步骤
+ * step1. 从头部按 `DecodeRune` 前进，跳过 `IsSpaceRune` 的 rune；
+ * step2. 从尾部反向跳过空白（需按 UTF-8 续字节边界回退）；
+ * step3. 返回 `[start, end)` 切片。
+ */
 inline std::string TrimSpace(std::string_view text) {
     std::size_t start = 0;
     while (start < text.size()) {

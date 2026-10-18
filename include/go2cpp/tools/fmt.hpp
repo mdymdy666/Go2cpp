@@ -26,6 +26,31 @@
  *         `std::vector<T>`/`std::pair`/`std::tuple` 的递归 `%v`；
  *       - 不实现 `%U`（Unicode 码点表）、复数与 `%p` 的 `#` 抑制细节；
  *       - width/precision 的 `*` 形式本轮未实现（抛 `std::logic_error` 明确拒绝）。
+ *
+ * ## 模块定位
+ * Go `fmt` 的对应物：`Sprintf`/`Sprint`/`Sprintln`/`Errorf`/`Print*` 系列，以及
+ * `%v` 指令集的类型分派。它依赖 `strconv`（数字格式化与 `Quote`）与 `error`
+ * （`ErrorPtr`），被日志、示例和全项目的错误信息拼装使用。
+ *
+ * ## 本文件定义什么
+ * - `detail::FormatSpec`：一次 `%` 指令的解析结果（flags/width/precision/verb）；
+ * - `detail::FormatValue`：按编译期类型分派的核心格式化器；
+ * - `detail::ParseSpec` / `FormatImpl`：格式串扫描与运行期参数索引匹配；
+ * - 公开 API：`Sprintf` / `Sprint` / `Sprintln` / `Errorf` / `Printf` / `Print` / `Println`。
+ *
+ * ## 阅读建议
+ * 先看文件头「复用优先的取舍」表（为什么不做 Go 格式串 → fmtlib 的转换层），
+ * 再看 `FormatValue` 的分支顺序（error -> vector -> pair -> bool -> 整数 -> 浮点 -> 字符串），
+ * 最后看 `Errorf` 如何把 `%w` 收集成错误链。
+ *
+ * ## 边界与陷阱
+ * - **不做 Go 格式串转换层**：fmtlib 的 `{}` 语法与 Go 的 `%v` 语义不同，写转换层
+ *   本身就要实现这里的解析器（双份复杂度）；因此直接实现 Go 指令集，只把 fmtlib
+ *   当作未来浮点/编译期检查的候选底层；
+ * - width/precision **按 rune 计**（不是字节），这是与 C `printf` 最容易踩偏的点；
+ * - `%w` 只在 `Errorf` 中有意义；`Sprintf` 遇到它落到「不支持」分支；
+ * - `*` 宽度/精度未实现，抛 `std::logic_error`（明确拒绝而不是静默输出错格式）；
+ * - 多余参数按 Go 语义在末尾追加 `%!(EXTRA type=value)`。
  */
 
 #pragma once
@@ -52,6 +77,17 @@ namespace go2cpp {
 namespace detail {
 
 /** @brief 一次 `%` 指令的解析结果。 */
+/**
+ * @brief 一次 `%` 指令的解析结果。
+ *
+ * ## 定位
+ * `ParseSpec()` 的产出、`FormatValue()` 的输入：一个 `%` 指令的完整语义。
+ *
+ * ## 不变量
+ * - `width`/`precision` 为 -1 表示「未指定」；
+ * - `verb` 为解析到的最后一个字符（缺省 0 表示格式串在指令中途结束）；
+ * - flags 之间无顺序要求，可重复（重复不影响语义）。
+ */
 struct FormatSpec {
     bool minus{false};      // '-'：左对齐
     bool zero{false};       // '0'：零填充（数字时在符号之后）
@@ -207,6 +243,23 @@ template <typename T>
 void AppendDefault(std::string& out, const T& value);
 
 /** @brief 用一个 `FormatSpec` 格式化单个值（类型分派的核心）。 */
+/**
+ * @brief 用一个 `FormatSpec` 格式化单个值（类型分派的核心）。
+ *
+ * ## 步骤
+ * step1. `ErrorPtr`：按 Go 的 error 接口优先规则，`%v`/`%s` 输出 `Message()`、
+ *         `%q` 加引号、`%T` 输出 `error`；
+ * step2. `std::vector`：递归格式化每个元素（`%q` 逐元素加引号，`%v`/`%s` 不加）；
+ * step3. `std::pair`：输出 `(first, second)`；
+ * step4. `bool`：`true`/`false`（`%t`/`%v`/`%s` 同形，`%q` 加引号）；
+ * step5. 整数：按 verb 选进制（`d`/`x`/`X`/`b`/`o`），`c`/`q`/`T` 单独处理；
+ * step6. 浮点：`f`/`e`/`g`，precision 为 -1 时用最短唯一表示（等价 Go 的 `%v`）；
+ * step7. 字符串类：`%q` 加引号、`%x` 逐字节 hex、precision 按 **rune** 截断；
+ * step8. 其它类型输出 `%!verb(unsupported)` —— 不静默吞掉，便于发现类型用错。
+ *
+ * ## 边界
+ * 所有分支都必须消费掉 `PadToWidth()`（宽度对齐），否则 flags 会在这条类型路径上失效。
+ */
 template <typename T>
 void FormatValue(std::string& out, const T& value, const FormatSpec& spec) {
     using Value = std::decay_t<T>;
@@ -381,6 +434,16 @@ void AppendDefault(std::string& out, const T& value) {
 }
 
 /// 解析一个 `%` 指令（`index` 指向 `%` 之后的第一个字符）。
+/**
+ * @brief 解析一个 `%` 指令（index 指向 `%` 之后的第一个字符）。
+ *
+ * ## 步骤
+ * step1. 循环读 flags（`-`/`0`/`+`/空格/`#`）；
+ * step2. 遇到 `*` 宽度立即抛 `std::logic_error`（本轮明确不支持）；
+ * step3. 读十进制 width（缺省 -1）；
+ * step4. 若有 `.` 再读 precision（`*` 同样拒绝）；
+ * step5. 最后一个字符是 verb，并推进 `index`。
+ */
 inline FormatSpec ParseSpec(std::string_view format, std::size_t& index) {
     FormatSpec spec;
     while (index < format.size()) {
@@ -434,6 +497,18 @@ void DispatchArg(const Tuple& tuple, std::size_t index, const FormatSpec& spec,
     }
 }
 
+/**
+ * @brief 扫描格式串并按参数索引分派（编译期展开 + 运行期匹配）。
+ *
+ * ## 步骤
+ * step1. 逐字符扫描：非 `%` 原样输出，`%%` 输出一个 `%`；
+ * step2. `ParseSpec()` 解析指令；参数不足时输出 `%!verb(MISSING)`；
+ * step3. `DispatchArg()` 用折叠表达式在编译期展开的 tuple 上按运行期索引匹配；
+ * step4. 扫描结束后若还有未消费参数，按 Go 语义追加 `%!(EXTRA type=value)`。
+ *
+ * ## 边界
+ * 参数类型在编译期固定；`%v` 对未知类型输出 `%!v(unsupported)` 而不是编译错误。
+ */
 template <typename... Args>
 std::string FormatImpl(std::string_view format, const Args&... args) {
     std::string out;
@@ -540,6 +615,15 @@ inline std::string Sprintln(const Args&... args) {
  * @brief 对应 `fmt.Errorf`：生成一个 `ErrorPtr`；`%w` 会把对应参数包进错误链。
  * @details 多个 `%w` 时用 `Join` 聚合（对齐 Go 1.20+ 的 `errors.Join` 语义）。
  *          文本部分与 `Sprintf` 一致（`%w` 按 `%v` 渲染）。
+ *
+ * ## 步骤
+ * step1. 先扫描格式串，记录 `%w` 对应的参数序号（按指令出现顺序）；
+ * step2. 把格式串里的 `%w` 替换成 `%v` 后走 `FormatImpl`（保证参数消费一致）；
+ * step3. 按记录的序号收集 `ErrorPtr` 实参（非 ErrorPtr 的 `%w` 被忽略）；
+ * step4. 0 个 -> `NewError`；1 个 -> `Wrap`；多个 -> `Join`（对齐 Go 1.20+ 语义）。
+ *
+ * ## 边界
+ * `%w` 的文本部分按 `%v` 渲染；`Join` 的文本与包装链顺序与 Go 保持一致。
  */
 template <typename... Args>
 inline ErrorPtr Errorf(std::string_view format, const Args&... args) {

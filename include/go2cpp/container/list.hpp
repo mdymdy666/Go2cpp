@@ -329,7 +329,7 @@ class List {
         return &*it;
     }
 
-    std::list<element_type> m_data;
+    std::list<element_type> m_data;  ///< 节点存储（链表独占持有）；Clear/Remove/Insert*/Move* 只在这一层改它
 };
 
 }  // namespace go2cpp::container

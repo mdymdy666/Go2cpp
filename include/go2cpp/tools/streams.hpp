@@ -31,6 +31,39 @@
  *       `core::ParkingCondition` 协作，留给后续）；`SectionReader` 已实现但不含 `Size()` 之外的
  *       `Outer` 语义；内存底座（`StringReader`/`BufferWriter`）是 `bytes.Reader`/`bytes.Buffer`
  *       的最小版本，完整版留给 `bytes` 模块。
+ *
+ * ## 模块定位
+ * Go `io` 包的对应物：流接口族 + 核心组合函数 + 适配器。命名空间用
+ * `go2cpp::streams`，因为 `go2cpp::io` 已被「描述符与多路复用调度层」占用
+ * （见 `network/io.hpp`）—— 这是有意保留的命名偏差。
+ *
+ * ## 本文件定义什么
+ * - 结果类型：`ReadResult` / `WriteResult` / `SeekResult` / `ByteResult` / `RuneResult`；
+ * - 错误锚点：`IoEof()` / `IoErrUnexpectedEof()` / `IoErrShortWrite()` /
+ *   `IoErrShortBuffer()` / `IoErrNoProgress()`；
+ * - 接口族：`Reader` / `Writer` / `Closer` / `Seeker` / `ReaderAt` / `WriterAt` /
+ *   `ByteReader` / `ByteWriter` / `RuneReader` / `StringWriter` / `WriterTo` / `ReaderFrom`；
+ * - 核心函数：`ReadAtLeast` / `ReadFull` / `ReadAll` / `WriteString` / `CopyBuffer` /
+ *   `Copy` / `CopyN`；
+ * - 适配器：`LimitedReader` / `MultiReader` / `MultiWriter` / `TeeReader` /
+ *   `SectionReader` / `Discard`；
+ * - 内存底座：`StringReader` / `BufferWriter`（`bytes` 模块的最小版本）。
+ *
+ * ## 阅读建议
+ * 先看 `ReadResult`/`WriteResult`（Go 的 `(n, err)` 契约），再看 `CopyBuffer` 对
+ * EOF/短写/空转的处理，最后看适配器如何在不复制数据的前提下组合流。
+ *
+ * ## 边界与陷阱
+ * - **为什么不用 iostream**：`std::istream`/`std::ostream` 用状态位
+ *   （`eofbit`/`failbit`/`badbit`）表达失败，而 Go 的契约允许**同一次调用既返回
+ *   `n > 0` 又返回非空 error**（典型：读到数据的同时遇到 EOF/超时）。iostream 的
+ *   `gcount()` 只能补回字节数，错误却被压缩成三个位：既无法区分 EOF/超时/短读，
+ *   也无法携带错误文本与包装链；因此这里用 `ReadResult{count, ErrorPtr}` 显式
+ *   同时承载「字节数」与「错误」；
+ * - 哨兵错误一律用**身份比较** `Is(err, IoEof())`，不做文本比较；
+ * - `Copy` 优先走 `WriterTo`（源）或 `ReaderFrom`（目标），否则回落到 32 KiB 缓冲；
+ * - 连续 100 次空读返回 `ErrNoProgress`：Go 只在 `Copy` 里做，本模块在 `ReadAll`
+ *   也加了，避免 Reader 违约时死循环。
  */
 
 #pragma once
@@ -150,6 +183,17 @@ inline constexpr int kSeekEnd = 2;
 // ============================================================================
 
 /** @brief 对应 `io.Reader`。 */
+/**
+ * @brief 对应 `io.Reader`。
+ *
+ * ## 定位
+ * 被 `ReadAtLeast`/`ReadAll`/`CopyBuffer` 等组合函数与所有适配器消费；
+ * `bytes::Reader`、`bytes::Buffer`、`streams::StringReader` 与网络层的流实现它。
+ *
+ * ## 不变量
+ * 允许 `count > 0` 且 `error != nullptr` 同时出现（Go 契约）；调用方必须先消费
+ * `count` 字节再看错误。
+ */
 class Reader {
 public:
     virtual ~Reader() = default;
@@ -158,6 +202,13 @@ public:
 };
 
 /** @brief 对应 `io.Writer`。 */
+/**
+ * @brief 对应 `io.Writer`。
+ *
+ * ## 定位
+ * 被 `Copy*`/`WriteString`/`MultiWriter`/`TeeReader` 使用；`bytes::Buffer`、
+ * `DiscardWriter` 与网络层写路径实现它（也可额外实现 `StringWriter` 免去拷贝）。
+ */
 class Writer {
 public:
     virtual ~Writer() = default;
@@ -242,6 +293,12 @@ public:
  * @brief 对应 `io.ReadAtLeast`。
  * @details `size < minimum` → `ErrShortBuffer`；读够 `minimum` 后**清除** `EOF`；
  *          `0 < count < minimum` 且遇 `EOF` → `ErrUnexpectedEOF`。
+ *
+ * ## 步骤
+ * step1. `size < minimum` -> `ErrShortBuffer`（调用方给的缓冲本身不合法）；
+ * step2. 循环读直到凑够 `minimum` 或出错，累计 `count`；
+ * step3. 凑够 -> **清除 EOF** 返回成功（Go 语义：EOF 不算错）；
+ * step4. 读到了但不足且遇 EOF -> `ErrUnexpectedEOF`；其它错误原样返回。
  */
 inline ReadResult ReadAtLeast(Reader& reader, char* buffer, std::size_t size,
                               std::size_t minimum) {
@@ -277,6 +334,12 @@ inline ReadResult ReadFull(Reader& reader, char* buffer, std::size_t size) {
  * @return {数据, 错误}；`EOF` 被归一化为**成功**（错误为空）。
  * @note 与 Go 的差别：Go 在「连续空读且无错」时会一直循环（依赖 Reader 契约），
  *       这里加了 `ErrNoProgress` 保护（与 `Copy` 的 Go 语义一致），避免死循环。
+ *
+ * ## 步骤
+ * step1. 512 字节栈缓冲循环读，追加到结果串；
+ * step2. 读到数据就重置空读计数；
+ * step3. 遇 EOF -> 归一化为成功（返回已读数据 + 空错误）；
+ * step4. 连续 100 次空读且无错 -> `ErrNoProgress`（防 Reader 违约死循环）。
  */
 inline std::pair<std::string, ErrorPtr> ReadAll(Reader& reader) {
     std::string data;
@@ -312,6 +375,12 @@ inline WriteResult WriteString(Writer& writer, std::string_view text) {
  * @brief 对应 `io.CopyBuffer`：用给定缓冲把 `source` 复制到 `destination`。
  * @details 短写 → `ErrShortWrite`；连续空读 100 次 → `ErrNoProgress`；`EOF` → 成功。
  * @note Go 在缓冲长度为 0 时会 panic，这里返回 `ErrShortBuffer`（明确拒绝而非崩溃）。
+ *
+ * ## 步骤
+ * step1. 缓冲长度为 0 -> `ErrShortBuffer`（Go 会 panic，这里明确拒绝）；
+ * step2. 循环 `read` -> `write`，累计写入字节；
+ * step3. 写错误 -> 原样返回；写少了 -> `ErrShortWrite`；
+ * step4. 读错误：EOF -> 成功；其它 -> 返回；空读 100 次 -> `ErrNoProgress`。
  */
 inline ReadResult CopyBuffer(Writer& destination, Reader& source, char* buffer,
                              std::size_t size) {
@@ -352,6 +421,11 @@ inline ReadResult CopyBuffer(Writer& destination, Reader& source, char* buffer,
  * @brief 对应 `io.Copy`。
  * @details 优先使用源端的 `WriterTo` 或目标端的 `ReaderFrom`（与 Go 一致），
  *          否则回落到 32 KiB 缓冲循环。
+ *
+ * ## 步骤
+ * step1. 源实现 `WriterTo` -> 直接 `WriteTo(destination)`（可零拷贝）；
+ * step2. 目标实现 `ReaderFrom` -> 直接 `ReadFrom(source)`；
+ * step3. 都没有 -> 分配 32 KiB 缓冲走 `CopyBuffer()`。
  */
 inline ReadResult Copy(Writer& destination, Reader& source) {
     if (auto* const writer_to = dynamic_cast<WriterTo*>(&source)) {
@@ -391,7 +465,9 @@ public:
     std::int64_t Remaining() const noexcept { return m_remaining; }
 
 private:
+    /// 被限制的源；构造时绑定，Read() 转发。
     Reader* m_source;
+    /// 剩余可读字节；Read() 递减，Remaining() 只读。
     std::int64_t m_remaining;
 };
 
@@ -423,7 +499,9 @@ public:
     }
 
 private:
+    /// 源列表（不拥有所有权）；构造时绑定。
     std::vector<Reader*> m_sources;
+    /// 当前源下标；遇 EOF 时前进，Read() 读写。
     std::size_t m_index{0};
 };
 
@@ -445,6 +523,7 @@ public:
     }
 
 private:
+    /// 目标列表（不拥有所有权）；Write() 逐个写。
     std::vector<Writer*> m_destinations;
 };
 
@@ -469,6 +548,7 @@ public:
 
 private:
     Reader* m_source;
+    /// 旁路写出目标；Read() 读到数据后写给它。
     Writer* m_tee;
 };
 
@@ -513,9 +593,13 @@ public:
     std::int64_t Size() const noexcept { return m_limit; }
 
 private:
+    /// 底层随机读源；Read/ReadAt 转发。
     ReaderAt* m_source;
+    /// 区间在底层中的起始偏移；Read/ReadAt 加上它。
     std::int64_t m_base;
+    /// 区间长度（端点）；SeekEnd 与 EOF 判定用它。
     std::int64_t m_limit;
+    /// 区间内的当前游标；Read/Seek 读写。
     std::int64_t m_offset{0};
 };
 
@@ -537,6 +621,14 @@ inline Writer& Discard() {
 }
 
 /// 对应 `io.CopyN` 的实现（依赖上面的 `LimitedReader`，故放在其后）。
+/**
+ * @brief 复制恰好 n 字节；不足且无错时返回 EOF。
+ *
+ * ## 步骤
+ * step1. 用 `LimitedReader` 把源限制在 n 字节内；
+ * step2. 调 `Copy()`；
+ * step3. 写满 n -> 成功；否则若无错误则补一个 `IoEof()`（与 Go 一致）。
+ */
 inline ReadResult CopyN(Writer& destination, Reader& source, std::int64_t n) {
     LimitedReader limited(source, n);
     ReadResult result = Copy(destination, limited);
@@ -605,7 +697,9 @@ public:
     }
 
 private:
+    /// 被读的字符串（不拥有）；构造时绑定，长度即 Size。
     std::string_view m_text;
+    /// 读游标；Read/ReadByte/Seek 推进。
     std::size_t m_offset{0};
 };
 
@@ -651,7 +745,9 @@ public:
     }
 
 private:
+    /// 已写入内容；Write/WriteString 追加，Read 消费。
     std::string m_buffer;
+    /// 读游标；Read 推进，Reset 清零，Len 用它算剩余。
     std::size_t m_read_offset{0};
 };
 

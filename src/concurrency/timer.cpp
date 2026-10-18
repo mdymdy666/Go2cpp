@@ -195,6 +195,38 @@ struct Timer::State final {
  * 因为在定时回调里销毁 `TimerService` 会导致线程 join 自身。这个检查是
  * 有意为之，不是防御性冗余。
  */
+/**
+ * @brief 定时器服务的实现：一个后台线程 + 按到期时间排序的 `multimap` + 反向索引。
+ *
+ * ## 定位
+ *
+ * 文件头已说明三层结构（`Timer` 句柄 / `Timer::State` / 本 `Impl`）。这里是**服务端**：
+ * 唯一拥有 `m_thread` 的地方。`Timer::wait_for`、`Context::WithTimeout`、
+ * `TimerService::Default()` 最终都落到它上面。它是运行时里**唯一不经过 epoll 的
+ * 唤醒路径**（另一条是 IOManager 的 deadline 队列）。
+ *
+ * ## 数据结构
+ *
+ * - `m_entries`：`multimap<time_point, shared_ptr<State>>` —— 按到期时间排序，
+ *   同一时刻允许多个定时器；
+ * - 反向索引：`Cancel` 时 O(1) 定位条目，避免线性扫描；
+ * - `m_generation`：插入/删除/重置时递增，后台线程据此**重新计算等待时长**，
+ *   而不是依赖 `notify_all` 的时序（少一次丢失唤醒的机会）。
+ *
+ * ## 线程模型
+ *
+ * - `Run()` 在锁内取「最近的到期时间」，`wait_until` 到点后把到期的 `State`
+ *   摘出来，**在锁外**执行回调 —— 回调里可以再操作定时器而不会死锁；
+ * - 析构时若发现自己在后台线程上（`get_id() == this_thread`）**直接 terminate**：
+ *   在定时器回调里销毁服务是未定义行为，早死好过悬空；
+ * - 回调异常交给 `m_exception_handler`，不让后台线程被打死。
+ *
+ * ## 与 IOManager 的 deadline 队列的区别
+ *
+ * 本服务适合「业务定时器」（可长时间、回调在定时器线程）；`io::IOManager` 的
+ * deadline 队列适合「IO 等待超时」（与 epoll 同一次 `epoll_wait` 返回，延迟更低）。
+ * 两者不要混用：把每请求的 IO 超时放进本服务会让 timer 线程成为瓶颈。
+ */
 class TimerService::Impl final {
 public:
     using Entries =

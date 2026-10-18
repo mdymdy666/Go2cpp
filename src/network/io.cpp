@@ -143,9 +143,15 @@ struct DescriptorRegistryState {
     // 条带，因此 Capture/Invalidate/在途 syscall 的互斥关系不变；不同 fd
     // 走不同条带，Hook 热路径不再被一把全局锁串行化。
     static constexpr std::size_t kStripeCount = 64;
+    /// @brief 一个条带：一把递归锁 + 该条带内 fd 的令牌表 + 代际计数器。
+    /// @details 用**递归**锁是因为同一线程会对同一 fd 重入：hook 的 close 路径
+    ///          在持门期间还会调 `Capture`/`Invalidate`（例如 `dup2` 清理）。
     struct Stripe {
+        /// @brief 保护 tokens 与 next_generation；Capture/Invalidate/close hook 竞争它。
         std::recursive_mutex mutex;
+        /// @brief fd → 令牌弱引用；`expired()` 的条目在 token 析构时被顺手清理。
         std::unordered_map<int, std::weak_ptr<DescriptorToken>> tokens;
+        /// @brief 本条带的下一个代际号；fd 复用（close 后同号重开）时递增。
         std::uint64_t next_generation{0};
     };
     Stripe& stripe_for(int fd) noexcept {
@@ -153,6 +159,7 @@ struct DescriptorRegistryState {
                            static_cast<unsigned int>(fd)) &
                        (kStripeCount - 1)];
     }
+    /// @brief 64 个条带；`fd & 63` 定位（掩码避免除法），同一 fd 永远落同一条带。
     std::array<Stripe, kStripeCount> stripes;
 };
 

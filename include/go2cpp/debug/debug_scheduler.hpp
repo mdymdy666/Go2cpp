@@ -21,6 +21,28 @@
  *
  * 双时间戳：使用者已定案 —— 记录时刻同时取 `steady_clock` 与 `system_clock`，
  *   并**明确声明不做跨机绝对对齐**（`steady` 跨机不可比）。
+ *
+ * ## 模块定位
+ *
+ * `debug` 的调度器快照/序列化层：通过组合持有 `Scheduler&` 读取公开计数与
+ * 快照，不修改调度器热路径。上游是 `debug_cli` 与信号 dump，下游只依赖
+ * `Scheduler` 的 public 查询接口。
+ *
+ * ## 本文件定义什么
+ *
+ * - `DumpFormat` / `DumpOptions`：输出格式与字段裁剪；
+ * - `SchedulerDebugSnapshot`：一次采集的纯数据快照；
+ * - `DebugScheduler`：采集 + text/ini/json 三种序列化。
+ *
+ * ## 阅读建议
+ *
+ * 先读 `SchedulerDebugSnapshot` 的双时间戳与 `per_call_consistent` 含义，
+ * 再看 `DebugScheduler::Snapshot`/`DumpText` 如何如实标注「非全局原子」。
+ *
+ * ## 边界与陷阱
+ *
+ * 快照由多次独立读取拼成，**不是同一瞬间的全景**；`steady_at` 只能同机
+ * 比较；`include_fibers` 需要遍历 16 个分片，成本明显更高，默认关闭。
  */
 
 #include "go2cpp/scheduler.hpp"
@@ -47,34 +69,49 @@ enum class DumpFormat {
     kJson,  ///< JSON（字段名与 design/02 的 schema 一致）。
 };
 
-/// dump 选项（对应 design/02 的 CLI 选项，本轮支持子集）。
+/**
+ * @brief dump 选项（对应 design/02 的 CLI 选项，本轮支持子集）。
+ *
+ * ## 定位
+ * `DebugScheduler` 与 `debug_cli` 共用的字段裁剪配置；只影响输出，不影响采集。
+ */
 struct DumpOptions {
-    bool include_processors{true};
-    bool include_machines{true};
-    bool include_metrics{true};
-    bool include_fibers{false};  ///< 需“枚举全部 G”接口，本轮尚未提供。
+    bool include_processors{true}; ///< 是否输出 P 列表
+    bool include_machines{true};   ///< 是否输出 M 列表
+    bool include_metrics{true};    ///< 是否输出 metrics 段
+    bool include_fibers{false};  ///< 是否枚举全部 G；需“枚举全部 G”接口，成本较高。
     std::size_t event_limit{0};  ///< dump events 的条数上限；0 表示全部。
 };
 
-/// 调度器调试快照（纯数据，可自由拷贝）。
+/**
+ * @brief 调度器调试快照（纯数据，可自由拷贝）。
+ *
+ * ## 定位
+ * `DebugScheduler::Snapshot()` 的返回类型；供序列化与测试断言使用。
+ *
+ * ## 不变量
+ * - 所有字段都是某一时刻的独立读取，不保证彼此严格一致；
+ * - `tasks` 仅在 `include_fibers` 时填充，否则为空；
+ * - 双时间戳同时存在，但 `steady_at` 不可跨机比较。
+ */
 struct SchedulerDebugSnapshot {
-    std::size_t processor_count{0};
-    std::size_t worker_count{0};
-    std::size_t runnable_total{0};
-    std::size_t runnable_global{0};
-    bool running{false};
-    bool sysmon_running{false};
-    std::uint64_t sysmon_passes{0};
-    SchedulerMetrics metrics{};
-    std::vector<ProcessorSnapshot> processors;
-    std::vector<MachineSnapshot> machines;
+    std::size_t processor_count{0}; ///< P 数量；Snapshot() 读取
+    std::size_t worker_count{0};    ///< 当前 worker 线程数
+    std::size_t runnable_total{0};  ///< 全部可运行 G 数
+    std::size_t runnable_global{0}; ///< 全局队列中的可运行 G 数
+    bool running{false};            ///< 调度器是否运行中
+    bool sysmon_running{false};     ///< sysmon 是否运行
+    std::uint64_t sysmon_passes{0}; ///< sysmon 轮询次数
+    SchedulerMetrics metrics{};     ///< 调度器指标快照
+    std::vector<ProcessorSnapshot> processors; ///< P 快照；include_processors 时输出
+    std::vector<MachineSnapshot> machines;     ///< M 快照；include_machines 时输出
     /// 全部仍在注册表里的 G（需 include_fibers 才填充，否则为空）。
     std::vector<TaskSnapshot> tasks;
 
     /// 双时间戳（使用者定案）。`steady` 仅用于**同机**排序与耗时，
     /// **不可跨机比较**；`wall` 用于跨机粗对齐。输出中必须标注此限制。
-    std::chrono::steady_clock::time_point steady_at{};
-    std::chrono::system_clock::time_point wall_at{};
+    std::chrono::steady_clock::time_point steady_at{}; ///< 单调时钟采集时刻；仅同机比较
+    std::chrono::system_clock::time_point wall_at{};   ///< 墙上时钟采集时刻；用于跨机粗对齐
 
     /// 快照一致性声明：本快照由**多次独立读取**拼成，不是同一瞬间的全景。
     bool per_call_consistent{false};
@@ -85,6 +122,19 @@ struct SchedulerDebugSnapshot {
  *
  * 依赖：调用方持有并保证 `Scheduler` 的生命周期长于本代理。
  * 对上层提供：一致读取的快照、以及 text/ini/json 三种序列化。
+ *
+ * ## 定位
+ * `debug` 的调度器观测入口：组合而不是继承 `Scheduler`（后者无虚析构），
+ * 供 `debug_cli`、信号 dump、测试读取调度器状态。
+ *
+ * ## 生命周期与线程模型
+ * 只保存 `Scheduler*`，不拥有它；代理可在任意线程构造/调用，但快照读取
+ * 的是调度器自身的并发安全接口。代理本身无状态、可拷贝。
+ *
+ * ## 不变量
+ * - `m_scheduler == nullptr` 时所有采集返回默认快照；
+ * - `Snapshot()` 绝不修改调度器，只调用 const/查询接口；
+ * - 输出中始终带 `per_call_consistent=false` 与时钟不可比声明。
  */
 class DebugScheduler final {
 public:
@@ -94,11 +144,22 @@ public:
     /// 采集一份快照。
     /// @note 由多次独立读取拼成；`per_call_consistent` 为 false 正是要**如实标注**
     ///       它不是同一瞬间的全景（避免使用者误读）。
+    /**
+     * @brief 采集一份调度器快照。
+     *
+     * ## 步骤
+     * step1. 空指针返回默认快照；
+     * step2. 同时记录 steady/wall 两个时间戳；
+     * step3. 逐项读取计数、metrics、P/M 列表（多次独立读取）；
+     * step4. 标记 `per_call_consistent=false`，如实声明非全局原子。
+     */
     SchedulerDebugSnapshot Snapshot() const {
+        // step1: 未绑定调度器
         SchedulerDebugSnapshot snapshot;
         if (m_scheduler == nullptr) {
             return snapshot;
         }
+        // step2: 双时间戳
         snapshot.steady_at = std::chrono::steady_clock::now();
         snapshot.wall_at = std::chrono::system_clock::now();
         snapshot.processor_count = m_scheduler->processor_count();
@@ -108,11 +169,13 @@ public:
         snapshot.running = m_scheduler->is_running();
         snapshot.sysmon_running = m_scheduler->sysmon_running();
         snapshot.sysmon_passes = m_scheduler->sysmon_pass_count();
+        // step3: 多次独立读取，拼成非原子快照
         snapshot.metrics = m_scheduler->metrics();
         snapshot.processors = m_scheduler->processors();
         snapshot.machines = m_scheduler->machines();
         // 枚举全部 G 需要遍历 16 个分片，成本比其它快照高，
         // 因此只在调用方明确要求时采集（见 DumpOptions::include_fibers）。
+        // step4: 明确标注一致性边界
         snapshot.per_call_consistent = false;
         return snapshot;
     }
@@ -138,6 +201,15 @@ public:
     std::string Dump(const DumpOptions& options = {}) const { return DumpText(options); }
 
     /// 文本格式（人类可读，缺信息如实标注）。
+    /**
+     * @brief 文本格式（人类可读，缺信息如实标注）。
+     *
+     * ## 步骤
+     * step1. 采集快照（可能含 G 列表）；
+     * step2. 输出调度器摘要、sysmon、双时钟与一致性声明；
+     * step3. 按 options 依次输出 metrics、P、M、G 段；
+     * step4. 对全零 metrics、long_syscalls 等易误读字段加显式 note。
+     */
     std::string DumpText(const DumpOptions& options = {}) const {
         const auto s = SnapshotWith(options);
         std::string out;
@@ -159,6 +231,7 @@ public:
                                   s.wall_at.time_since_epoch())
                                   .count()) +
                "  (steady is NOT cross-machine comparable)\n";
+        // step3: 可选段：metrics
         if (options.include_metrics) {
             out += "  metrics: runs=" + std::to_string(s.metrics.task_runs) +
                    " completions=" + std::to_string(s.metrics.task_completions) +
@@ -170,6 +243,7 @@ public:
             }
             out += "\n";
         }
+        // step3: 可选段：P 列表
         if (options.include_processors) {
             out += "\nprocessor  state      queued\n";
             for (const auto& p : s.processors) {
@@ -178,6 +252,7 @@ public:
                        std::to_string(p.queued) + "\n";
             }
         }
+        // step3: 可选段：M 列表
         if (options.include_machines) {
             out += "\nmachine  state      P  detached  blocking  long_syscalls  affinity(h/m)\n";
             for (const auto& m : s.machines) {
@@ -399,7 +474,7 @@ private:
         return "Unknown";
     }
 
-    Scheduler* m_scheduler{nullptr};
+    Scheduler* m_scheduler{nullptr}; ///< 被观测的调度器（不拥有）；构造时绑定，所有查询只读
 };
 
 }  // namespace go2cpp::debug

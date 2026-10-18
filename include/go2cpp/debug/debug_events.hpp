@@ -15,6 +15,31 @@
  *   未声明阻塞、未产生事件的运行时行为**看不到** —— 即设计文档反复强调的
  *   「没显示阻塞 ≠ 没有阻塞」。
  *   `Drain()` 拿到的是**采集点已入队**的事件，不保证与调度器某一瞬间严格一致。
+ *
+ * ## 模块定位
+ *
+ * `debug` 的采集层：实现 `SchedulerObserver`，把调度器已声明的事件写入有界
+ * 环形缓冲，并提供 text/ini/json 三种序列化。上游是 `Scheduler` 的事件回调，
+ * 下游是 `debug_cli` 的 `dump events` 与调试工具。
+ *
+ * ## 本文件定义什么
+ *
+ * - `EventTypeName`：事件枚举到名字的映射；
+ * - `EventBuffer`：无锁有界环形缓冲（满则丢弃并计数）；
+ * - `DebugEventCollector`：观察者实现 + 线程局部批量提交 + 序列化；
+ * - `EventFollowSink` / `FollowEvents`：持续拉取事件的后台跟随。
+ *
+ * ## 阅读建议
+ *
+ * 先读 `EventBuffer::Push/PushBatch` 的无锁下标协议，再读
+ * `DebugEventCollector::OnEvent` 的线程局部攒批；最后看 `Drain/Peek`
+ * 为什么都要先 `Flush`。
+ *
+ * ## 边界与陷阱
+ *
+ * 线程局部暂存只有**当前线程**能被 `Drain/Peek/Pending` 排空；其它线程
+ * 最后不足一批的事件要等它们自己下次调用。`Drain` 是消耗性的，跟随期间
+ * `Pending()` 会归零是刻意行为。
  */
 
 #include "go2cpp/scheduler.hpp"
@@ -71,6 +96,15 @@ inline constexpr std::size_t kDefaultFlushBatch = 32;
  *
  * @note 环形缓冲固定保留一个空槽用于区分「满」与「空」，
  *       因此**实际可存容量 = 构造参数**（内部数组为 capacity+1）。
+ *
+ * ## 定位
+ * 采集器的存储后端：单生产者（`OnEvent`）多消费者（`Drain`/`Peek`）的
+ * 无锁环形队列；被 `DebugEventCollector` 独占使用。
+ *
+ * ## 不变量
+ * - `m_slots.size() == m_capacity + 1`，始终留一个空槽；
+ * - `head`/`tail` 只用原子读写推进，`Push` 满时返回 false 并累加 dropped；
+ * - `Size()` 是瞬时快照，并发写时只保证「某时刻」的近似值。
  */
 class EventBuffer {
 public:
@@ -129,19 +163,32 @@ public:
      *       **从 count 次降到 1 次** —— 这是线程局部暂存能带来收益的技术前提
      *       （缓冲本身是**无锁**的，所以这里省的是原子操作而不是锁争用）。
      */
+    /**
+     * @brief 批量入队：先一次性计算可写槽位，再拷贝。
+     *
+     * ## 步骤
+     * step1. 空输入直接返回 0；
+     * step2. 读 head/tail，计算已用槽位与剩余空间；
+     * step3. 接受 `min(count, free)` 条并拷贝到环形槽；
+     * step4. 一次 release 提交 head，累加 pushed；被拒部分累加 dropped。
+     */
     std::size_t PushBatch(const SchedulerEvent* data, std::size_t count) noexcept {
+        // step1: 空输入
         if (data == nullptr || count == 0) {
             return 0;
         }
+        // step2: 计算剩余空间
         const std::size_t head = m_head.load(std::memory_order_relaxed);
         const std::size_t tail = m_tail.load(std::memory_order_acquire);
         // 可用空间 = capacity - 已用量（内部数组比容量多 1 个哨兵槽）
         const std::size_t used = head >= tail ? head - tail : m_slots.size() - tail + head;
         const std::size_t free_slots = m_capacity - used;
+        // step3: 只接受放得下的部分
         const std::size_t accepted = count < free_slots ? count : free_slots;
         for (std::size_t index = 0; index < accepted; ++index) {
             m_slots[(head + index) % m_slots.size()] = data[index];
         }
+        // step4: 一次提交下标并更新统计
         m_head.store((head + accepted) % m_slots.size(), std::memory_order_release);
         m_pushed.fetch_add(accepted, std::memory_order_relaxed);
         if (accepted < count) {
@@ -164,12 +211,12 @@ public:
     }
 
 private:
-    std::vector<SchedulerEvent> m_slots;
-    std::size_t m_capacity{0};
-    std::atomic<std::size_t> m_head{0};
-    std::atomic<std::size_t> m_tail{0};
-    std::atomic<std::uint64_t> m_pushed{0};
-    std::atomic<std::uint64_t> m_dropped{0};
+    std::vector<SchedulerEvent> m_slots; ///< 环形槽数组（容量+1）；Push 写 head，Pop 读 tail
+    std::size_t m_capacity{0};           ///< 对外容量（不含哨兵槽）；构造时固定
+    std::atomic<std::size_t> m_head{0};  ///< 生产者下标；Push/PushBatch 以 release 推进
+    std::atomic<std::size_t> m_tail{0};  ///< 消费者下标；Pop 以 release 推进，Clear 重置
+    std::atomic<std::uint64_t> m_pushed{0};  ///< 成功入队总数；Push/PushBatch 累加
+    std::atomic<std::uint64_t> m_dropped{0}; ///< 因满丢弃总数；Push/PushBatch 累加
 };
 
 /**
@@ -187,13 +234,39 @@ private:
  *       进一步降低多 worker 争用的做法是"每 worker 线程局部暂存 + 批量发布"；
  *       那需要 per-instance/per-thread 状态管理，本轮**未实现**，
  *       这里如实标注为后续优化，而不是声称已经做到。
+ *
+ * ## 定位
+ * `debug` 的事件采集器：注册到 `Scheduler` 的观察者列表后，`OnEvent` 在
+ * worker 线程上被同步调用；`Drain`/`Peek`/`Dump*` 供 `debug_cli` 与测试读取。
+ *
+ * ## 生命周期与线程模型
+ * 构造时分配固定容量缓冲；`OnEvent` 可能来自多个 worker 线程，因此采用
+ * 线程局部暂存 + 无锁批量提交。`Drain`/`Peek`/`Pending` 只提交**调用线程**
+ * 的暂存；其它线程的不足一批事件需等其自身调用。对象必须比注册它的
+ * `Scheduler` 活得久。
+ *
+ * ## 不变量
+ * - `m_buffer` 的容量构造后固定；
+ * - `OnEvent` 不分配内存（除线程局部 vector 增长）、不加锁、不做 I/O；
+ * - `Dropped()` 只增不减，`Clear()` 也不清零（历史统计）；
+ * - 线程局部暂存槽的 `owner` 指向当前采集器，切换实例前会先排空旧槽。
  */
 class DebugEventCollector final : public SchedulerObserver {
 public:
     explicit DebugEventCollector(std::size_t capacity = 8192) : m_buffer(capacity) {}
 
+    /**
+     * @brief 观察者回调：把事件写入线程局部暂存，满一批再提交。
+     *
+     * ## 步骤
+     * step1. 取本线程暂存槽；若属于其它采集器，先排空旧槽再重绑；
+     * step2. 把事件追加到暂存；
+     * step3. 暂存达到 batch 阈值时调用 `FlushStaging()` 批量提交。
+     *
+     * @note 运行在 worker 线程，不能阻塞、不能抛异常。
+     */
     void OnEvent(const SchedulerEvent& event) override {
-        // 线程局部暂存：先攒批，满一批再一次性提交（把原子操作摊薄到每批一次）。
+        // step1: 线程局部暂存：先攒批，满一批再一次性提交
         auto& staging = Staging();
         if (staging.owner != this) {
             // 一个线程服务了另一个采集器：先把旧暂存排空，避免串到别的实例里。
@@ -203,7 +276,9 @@ public:
             staging.events.clear();
             staging.owner = this;
         }
+        // step2: 追加到本线程暂存
         staging.events.push_back(event);
+        // step3: 满一批就提交，摊薄原子操作
         if (staging.events.size() >= staging.batch) {
             FlushStaging();
         }
@@ -372,9 +447,9 @@ private:
     /// 线程局部暂存槽：owner 表示它属于哪个采集器。
     struct StagingSlot {
         // 用非 const 指针：排空旧暂存时需要调用 owner 的 m_buffer.PushBatch。
-        DebugEventCollector* owner{nullptr};
-        std::vector<SchedulerEvent> events;
-        std::size_t batch{kDefaultFlushBatch};
+        DebugEventCollector* owner{nullptr}; ///< 该暂存槽属于哪个采集器；OnEvent 切换实例时重绑
+        std::vector<SchedulerEvent> events;  ///< 本线程尚未提交的事件；OnEvent 追加，FlushStaging 清空
+        std::size_t batch{kDefaultFlushBatch}; ///< 每批提交条数；SetFlushBatch 设置
     };
     static StagingSlot& Staging() {
         static thread_local StagingSlot slot;
@@ -393,7 +468,7 @@ private:
         return accepted;
     }
 
-    EventBuffer m_buffer;
+    EventBuffer m_buffer; ///< 共享有界环形缓冲；FlushStaging 写入，Drain/Peek 读取
 };
 
 
@@ -422,9 +497,16 @@ inline std::size_t FollowEvents(DebugEventCollector& collector, const EventFollo
                                 std::chrono::milliseconds interval, std::size_t max_batches = 0,
                                 std::chrono::milliseconds overall_timeout =
                                     std::chrono::milliseconds(0)) {
+    // ## 步骤
+    // step1. 记录起始时间；
+    // step2. Drain 一批；非空则计数并回调 sink，sink 返回 false 即停止；
+    // step3. 达到 max_batches 停止（0 表示不限）；
+    // step4. 超过 overall_timeout 停止（0 表示不限，但真实使用建议非 0）；
+    // step5. 否则 sleep interval 后重试。
     std::size_t batches = 0;
     const auto started = std::chrono::steady_clock::now();
     for (;;) {
+        // step2: 拉取并交给 sink
         const auto events = collector.Drain();
         if (!events.empty()) {
             ++batches;
@@ -432,15 +514,18 @@ inline std::size_t FollowEvents(DebugEventCollector& collector, const EventFollo
                 break;
             }
         }
+        // step3: 批数上限
         if (max_batches != 0 && batches >= max_batches) {
             break;
         }
         // 总超时是**必需的**兜底：若采集器一直为空，batches 永远到不了 max_batches，
         // 旧实现会在此处无限循环（实测导致 debug_events 卡住、进而让整条 ctest 超时）。
+        // step4: 总超时兜底，避免空采集器无限循环
         if (overall_timeout.count() > 0 &&
             std::chrono::steady_clock::now() - started >= overall_timeout) {
             break;
         }
+        // step5: 避免忙等
         std::this_thread::sleep_for(interval);
     }
     return batches;
