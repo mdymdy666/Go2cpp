@@ -394,6 +394,15 @@ public:
     // 仅取消尚未入队的可运行任务。用于内部重新入队失败后的收敛，避免
     // 把已经被并发接受的入队误判为接纳失败。
     bool cancel_if_runnable_unqueued() noexcept;
+    // park/yield 未能真正交回执行流时（Fiber 拒绝挂起，或挂起提交后被
+    // 唤醒但执行权仍在本线程），把状态回滚成 kRunning。否则 G 会以
+    // "无人的等待者/Runnable" 留在 registry，既不会被唤醒，也会让后续
+    // park 被状态机一律拒绝而同陷空转。
+    bool resume_after_failed_park() noexcept;
+    // 执行边界自愈：run() 返回后若 G 仍停在 kRunning 且已无执行者，
+    // worker 用它把 G 重新标记为可运行并交回调度器，避免永久悬挂。
+    // 返回 true 表示确实修复了一个孤儿 Running。
+    bool recover_orphan_running() noexcept;
     bool Cancel() { return cancel(); }
     // 后端执行入口；run() 内部也会串行化直接调用。
     void run();

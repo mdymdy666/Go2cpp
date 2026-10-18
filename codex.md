@@ -9586,3 +9586,85 @@ A/B 交替 ×5 中位数，loadavg 1.37～2.34）：2 线程 25.62→25.46 ns；
   并考虑把 `test_sync_cancel_stress.cpp` 注册进 ctest。
 - 当前并行流正在改 `sync.cpp` / `scheduler.cpp` / `hybrid_mutex`（工作树有未提交
   改动），最终数字需在稳定树上复核。
+
+### 复核（2026-10-18 14:03~14:10，机器空闲、持 flock 排除并发重建）
+
+- 2 并发全量 ctest × 3 轮：**6/6 suite 全绿，113/113**。
+- 4 并发全量 ctest × 3 轮：**11/12 suite 全绿**；round1-suite3 的 `go2cpp_tests`
+  以 120s 超时失败（同轮其余 3 份 17~20s 正常通过）。同一时刻
+  `GO2CPP_TEST_FILTER=hook` 12 并发 × 5 轮 **60/60 通过**，排除 FIFO park
+  唤醒问题；判定为第 2 节所述 Fiber 丢唤醒在其它 sync 用例上的复现
+  （该用例不在 test_sync 的 5s 兜底范围内）。
+- 结论：**4× 并发全绿需要先修掉 core 丢唤醒**；FIFO park 与测试隔离本身在
+  2× 并发 3 轮、4× 并发的 11/12 中均稳定。
+
+## 2026-10-18：channel / future / io 并发审计（A 级 io 丢唤醒修复 + 热路径优化）
+
+范围：`channel.hpp`、`channel.cpp`、`future.hpp`、`future.cpp`、`io.cpp`、
+`io.hpp`。**未改** `scheduler.cpp` / `fiber.cpp` / `parking_condition.cpp` /
+`sync.cpp`（另一条流边界）。未执行任何 git 命令。
+
+### 1. 修复：io 终止性排空被队头阻塞（A 级）
+
+`State::drain_queue_locked` 原实现在队头 `begin_operation()` 失败时 `break`。
+该队头正被 Context 取消回调的 `complete()` 在锁外 claim，随后
+`notify_close()` 无条件删除 FdSlot，队列中其余等待者失去 epoll 注册与定时器，
+**永久 park**。改为遍历整个队列：忙节点保留原位交给自身完成路径，其余节点
+逐个 claim + 移出 + 唤醒。影响 notify_close / cancel / cancel_all /
+fail_slot / shutdown。新增复现器
+`tests/network/test_io_audit.cpp`（8 fd × 2 waiters × 200 轮的取消/close
+并发）：修复前 99/200 轮命中、138/1600 个等待者丢失 kClosed；修复后 0/1600
+（重复 3 次）。
+
+### 2. 性能优化
+
+- `channel.hpp`：`WaitForChange` 观察者计数 + `NotifyChange()`，send/recv 热
+  路径不再为空的 `m_change_cv` 支付互斥量；24 处 notify 改走快速判断。
+- `future.hpp`：`FutureState::Wait` 增加终态热路径与“无 Context + deadline
+  已过”快速返回，省掉 `make_shared<FutureWaitRegistration>`。
+- A/B（Release，taskset -c 0，1 万次，5 样本中位数，procs_running=2）：
+  channel 有缓冲往返 129.2→51.3 ns/op；future 已就绪 Get 38.6→20.6 ns/op；
+  pending TryGet 118.4→75.1 ns/op；future 生命周期 163.9→135.5 ns/op。
+  无缓冲会合 3870.7 ns/op（两次分配 + fiber park，未改）。
+  IOManager WaitRead 23.8µs vs 裸 epoll_wait 7.3µs（3.3x，ONESHOT rearm +
+  全局 State 锁 + park/wake，属设计成本，未改）。
+
+### 3. 验证
+
+- 新增（不注册 ctest，保持计数 113）：
+  `tests/concurrency/test_channel_concurrency.cpp`（1 万值精确计数 ×
+  有缓冲/无缓冲/随机 close、close 唤醒、FIFO、Fiber）、
+  `tests/concurrency/test_future_audit.cpp`、
+  `tests/network/test_io_audit.cpp`、
+  `benchmarks/audit_concurrency_benchmark.cpp`、
+  `scripts/run_concurrency_audit.sh`。
+- channel：10000 值 missing=0 dup=0；随机 close 2439 成功发送 0 丢失；
+  16 recv / 8 send / 16 select 在 close 后 1ms 内全部唤醒；FIFO 0 误差。
+- future：4×1000 轮单次终态 winners=1000；broken promise、40ms 超时、
+  异常传递、多等待者全部通过。
+- io：HUP 返回 ready；shutdown 16/16 唤醒；cancel_all 3/3；notify_close
+  2/2；代际复用正常；close 竞态 0 丢失。
+- 全量 ctest：**112/113**。唯一失败 `go2cpp_state_matrix`
+  （`Runnable(!queued) × park_for_scheduler`）为**另一条流**在
+  `scheduler.cpp` 14:11 新增 `runnable_in_place` 与既有矩阵期望的冲突，
+  确定性失败，与本流改动无关；需对方更新
+  `test_state_machine_matrix.cpp:373-376` 或调整实现后才能达到 113/113。
+- 详细报告：`docs/concurrency_audit_2026-10-18.md`。
+
+### 4. 未解决
+
+- A-2：state_matrix 与 park_for_scheduler 新语义冲突（他人范围）。
+- 无缓冲 channel 的 TLS 节点缓存（触及 parking_condition.cpp）。
+- io 3.3x epoll 成本、超长队列 drain 的 O(n²)。
+- 重复 close/send-after-close 返回错误码而非 Go panic（API 语义，有意保留）；
+  `Future::Status()` 对 pending 返回 kTimedOut。
+
+### 更正（2026-10-18 14:15）
+
+- 上条记录的 112/113 已过时：另一条流 14:13 修复 `park_for_scheduler`
+  与矩阵测试的冲突后，重建并重跑全量 ctest 为 **113/113**（18.31s）。
+- 新增已知问题（非本流）：`benchmarks/lock_overhead_matrix_benchmark.cpp`
+  缺 `#include <mutex>`，`cmake --build build-quality`（all）会失败；
+  未注册 ctest，不影响测试。审计报告已更新
+  `docs/concurrency_audit_2026-10-18.md`（性能表取三轮中位数：
+  channel 往返 58.2、future hot 29.2、WaitRead 23.3µs vs epoll 7.4µs）。

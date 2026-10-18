@@ -643,6 +643,18 @@ if (GO2CPP_BUILD_BENCHMARKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/futex_mutex_contention_benchmark.cpp)
     target_link_libraries(go2cpp_futex_mutex_contention_benchmark PRIVATE go2cpp_runtime)
     target_compile_options(go2cpp_futex_mutex_contention_benchmark PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    # X-36：FutexMutex 与 std::mutex 的临界区长度 × 线程数开销矩阵。
+    add_executable(go2cpp_lock_overhead_matrix_benchmark
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/lock_overhead_matrix_benchmark.cpp)
+    target_link_libraries(go2cpp_lock_overhead_matrix_benchmark PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_lock_overhead_matrix_benchmark PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    # X-36：GMP 环境下 FutexMutex（线程级）vs sync::Mutex（协程级）。
+    add_executable(go2cpp_futex_mutex_fiber_benchmark
+        ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/futex_mutex_fiber_benchmark.cpp)
+    target_link_libraries(go2cpp_futex_mutex_fiber_benchmark PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_futex_mutex_fiber_benchmark PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
     target_compile_options(go2cpp_channel_vs_queue_benchmark PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
     add_executable(go2cpp_timer_task_benchmark

@@ -537,6 +537,42 @@ bool Task::request_cancel(bool notify) noexcept {
     return true;
 }
 
+bool Task::resume_after_failed_park() noexcept {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    const GState state = m_state.load(std::memory_order_relaxed);
+    // 只有"执行权确实还握在当前执行流里"时才能声明回 Running。
+    if (!m_execution_claim.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    // kWaiting：park_for_scheduler() 已经提交了挂起，但 Fiber 拒绝切换；
+    // kRunnable：挂起提交的同时被唤醒方改成了可运行，但执行流并未交回
+    // 调度器（deferred handoff），实际仍在运行。
+    // 两种情况下 G 都还在本线程上继续执行，若不回滚成 kRunning，它要么
+    // 以"等待者"身份永远留在 registry（无人唤醒），要么让后续
+    // park_for_scheduler() 一律被拒绝而陷入空转。
+    if (state != GState::kWaiting && state != GState::kRunnable) {
+        return false;
+    }
+    m_state.store(GState::kRunning, std::memory_order_release);
+    m_deferred_enqueue.store(false, std::memory_order_relaxed);
+    m_wake_pending.store(false, std::memory_order_relaxed);
+    return true;
+}
+
+bool Task::recover_orphan_running() noexcept {
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
+        return false;
+    }
+    if (m_execution_claim.load(std::memory_order_relaxed)) {
+        // 仍有执行者持有执行权：这不是孤儿，不能抢。
+        return false;
+    }
+    m_state.store(GState::kRunnable, std::memory_order_release);
+    m_deferred_enqueue.store(true, std::memory_order_release);
+    return true;
+}
+
 bool Task::cancel_if_runnable_unqueued() noexcept {
     {
         std::lock_guard<std::mutex> lock(m_transition_mutex);
@@ -568,12 +604,18 @@ void Task::run() {
     if (!m_run_claim.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel,
             std::memory_order_acquire)) {
+        // 另一个执行者已经释放 execution_claim，但它的 run() 栈帧仍在退出
+        // 过程中（run_claim 尚未释放）。本次执行权作废，必须把 G 交回可
+        // 运行状态：否则它会永久停在 kRunning 且无人认领，
+        // Scheduler::shutdown() 将永远等不到它的终态。
+        std::lock_guard<std::mutex> lock(m_transition_mutex);
+        if (m_state.load(std::memory_order_relaxed) == GState::kRunning) {
+            m_state.store(GState::kRunnable, std::memory_order_release);
+            m_deferred_enqueue.store(true, std::memory_order_release);
+        }
+        m_execution_claim.store(false, std::memory_order_release);
         return;
     }
-    struct RunClaimGuard final {
-        std::atomic<bool>& claim;
-        ~RunClaimGuard() { claim.store(false, std::memory_order_release); }
-    } run_claim_guard{m_run_claim};
 
     Fiber* fiber = nullptr;
     {
@@ -617,6 +659,7 @@ void Task::run() {
                 std::lock_guard<std::mutex> lock(m_transition_mutex);
                 m_state.store(GState::kFailed, std::memory_order_release);
                 m_execution_claim.store(false, std::memory_order_release);
+                m_run_claim.store(false, std::memory_order_release);
             }
             auto abandoned_function = release_callable();
             notify_terminal();
@@ -714,6 +757,12 @@ void Task::run() {
             }
         }
         m_execution_claim.store(false, std::memory_order_release);
+        // run_claim 必须与 execution_claim 在同一个临界区内释放。若晚一步
+        // （例如交给 RAII 在函数返回时释放），新执行者会先拿到
+        // execution_claim，再在 run() 入口被 run_claim 拒绝并静默返回，
+        // 把 G 永久留在 kRunning。这两个位共同描述"谁在执行这个 G"，
+        // 必须原子地一起翻转。
+        m_run_claim.store(false, std::memory_order_release);
     }
     if (became_terminal) {
         if (fiber_failure) {
@@ -2228,6 +2277,10 @@ bool Scheduler::yield(const std::shared_ptr<Task>& task) {
     }
     task->defer_enqueue();
     if (!Fiber::SuspendForScheduler(SuspendReason::Yield)) {
+        // mark_yielded_fast() 已把状态改成 kRunnable，但这次 yield 并没有
+        // 真正交回调度器。必须把它恢复成 kRunning，否则当前执行流会在
+        // "runnable 但未入队"的状态下继续跑，下一次 park 被拒后空转。
+        (void)task->resume_after_failed_park();
         return false;
     }
     return !task->cancellation_requested();
@@ -2266,6 +2319,7 @@ bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
         return false;
     }
     if (!Fiber::SuspendForScheduler(SuspendReason::Park)) {
+        (void)task->resume_after_failed_park();
         return false;
     }
     return !task->cancellation_requested();
@@ -2287,6 +2341,7 @@ bool Scheduler::park_wait_for_cleanup(const std::shared_ptr<Task>& task) {
         return false;
     }
     if (!Fiber::SuspendForScheduler(SuspendReason::Park)) {
+        (void)task->resume_after_failed_park();
         return false;
     }
     return true;
@@ -2317,6 +2372,7 @@ bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
         return false;
     }
     if (!Fiber::SuspendForScheduler(SuspendReason::Io)) {
+        (void)task->resume_after_failed_park();
         return false;
     }
     return !task->cancellation_requested();
@@ -2344,6 +2400,7 @@ bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
         return false;
     }
     if (!Fiber::SuspendForScheduler(reason)) {
+        (void)task->resume_after_failed_park();
         return false;
     }
     return !task->cancellation_requested();
@@ -2639,6 +2696,14 @@ bool Scheduler::cancel(const std::shared_ptr<Task>& task) {
 
     const auto action = task->wake_for_wait();
     if (action == WakeAction::kEnqueue) {
+        if (!enqueue(task)) {
+            (void)task->cancel_if_runnable_unqueued();
+        }
+    } else if (action == WakeAction::kRejected &&
+               task->state() == GState::kRunnable && !task->queued()) {
+        // wake_for_wait 对 kRunnable 返回 kRejected。但 "runnable" 并不
+        // 蕴含 "已入队"：deferred handoff 的中间态正是 kRunnable +
+        // queued=false。取消必须补一次发布，否则 shutdown 永远等不到它。
         if (!enqueue(task)) {
             (void)task->cancel_if_runnable_unqueued();
         }
@@ -3299,11 +3364,39 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             if (task->state() == GState::kRunnable &&
                 !task->queued()) {
                 (void)task->consume_deferred_enqueue();
-                if (!requeue_from_worker(task)) {
-                    (void)task->cancel_if_runnable_unqueued();
+                if (!requeue_from_worker(task) &&
+                    !task->cancel_if_runnable_unqueued()) {
+                    // 入队失败且 cancel_if_runnable_unqueued() 也收敛不了，
+                    // 说明这是一个**已启动**的 G（它只处理未启动的）。
+                    // draining/stopping 时 enqueue() 的 worker 分支会直接
+                    // 丢弃已启动 G；若不在这里补一条不可失败的发布路径，
+                    // G 就停在 Runnable 且无人调度，shutdown 永远等不到
+                    // 它的终态。紧急队列不分配、不抛异常，是唯一安全出口。
+                    std::lock_guard<std::mutex> orphan_lock(m_impl->mutex);
+                    if (task->try_mark_queued()) {
+                        m_impl->runnable.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                        m_impl->emergency_enqueue_locked(task);
+                        m_impl->condition.notify_one();
+                    }
                 }
             } else {
                 (void)task->consume_deferred_enqueue();
+            }
+            // 不变式：run() 已返回，G 就不可能还处于 kRunning 且无人执行。
+            // 一旦出现（执行权交接窗口的残留），必须立刻自愈重新发布，
+            // 绝不能把"永远不会被调度的 Running"留给 shutdown 无限等待。
+            if (task->recover_orphan_running()) {
+                if (!requeue_from_worker(task)) {
+                    task->clear_queued();
+                    std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
+                    if (task->try_mark_queued()) {
+                        m_impl->runnable.fetch_add(1,
+                                                   std::memory_order_relaxed);
+                        m_impl->emergency_enqueue_locked(task);
+                        m_impl->condition.notify_one();
+                    }
+                }
             }
             std::vector<std::shared_ptr<Task>> deferred_destruction;
             const bool draining =

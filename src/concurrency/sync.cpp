@@ -538,6 +538,11 @@ private:
     CancelFunc m_cancel;
 };
 
+// cleanup 重锁路径没有任何取消源可以中断它，因此必须给出明确的
+// 退出预算：park 连续被状态机拒绝说明执行边界已经异常，继续循环只会
+// 把"永久挂起"换成"永久自旋"。预算取较大值，正常路径永远是 0 次。
+constexpr std::size_t kMaxCleanupParkRetries = 4096;
+
 WaitResult Await(WaitNode* waiter, bool cleanup_relock = false) noexcept {
     if (!waiter) {
         return WaitResult::kCancelled;
@@ -557,6 +562,7 @@ WaitResult Await(WaitNode* waiter, bool cleanup_relock = false) noexcept {
     // 的唤醒路径会重新排入同一个逻辑 G。
     Scheduler* const scheduler = waiter->scheduler();
     const auto& task = waiter->task();
+    std::size_t cleanup_retries = 0;
     for (;;) {
         // Unlock() 可以在 waiter 刚发布、但尚未真正调用 park() 的窗口内
         // 完成交接。此时 Wake 已把结果设为 Notified；若仍然进入
@@ -596,6 +602,29 @@ WaitResult Await(WaitNode* waiter, bool cleanup_relock = false) noexcept {
             (!suspended && !scheduler->is_running()))) {
             (void)waiter->TryFinish(WaitResult::kCancelled);
             return finish(waiter->result());
+        }
+        if (cleanup_relock) {
+            // 到这里 result 仍是 kWaiting、park 也没能挂起当前 G。本路径
+            // 没有任何取消源可以打断它，必须自己给出退出条件，否则就是
+            // 一个不烧 CPU 也永不返回（或纯自旋）的死循环。
+            if (Scheduler::current_scheduler() != scheduler ||
+                Scheduler::current_task().get() != task.get()) {
+                // 执行上下文已经丢失，继续 park 没有意义。
+                (void)waiter->TryFinish(WaitResult::kCancelled);
+                return finish(waiter->result());
+            }
+            if (!suspended) {
+                if (++cleanup_retries > kMaxCleanupParkRetries) {
+                    // 状态机持续拒绝挂起：快速失败，而不是把整个
+                    // Scheduler::shutdown() 拖成无限等待。
+                    (void)waiter->TryFinish(WaitResult::kCancelled);
+                    return finish(waiter->result());
+                }
+                // 被拒绝时让出一次执行权，避免用纯自旋烧满一个 M。
+                (void)scheduler->yield_current();
+            } else {
+                cleanup_retries = 0;
+            }
         }
         // false park 可能消耗无关的 pending permit。该 permit 和无关的 unpark
         // 都属于伪唤醒，不代表取消。
