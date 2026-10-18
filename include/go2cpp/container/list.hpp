@@ -1,25 +1,25 @@
 /**
  * @file list.hpp
- * @brief Go `container/list` 的 C++ 对应实现：双向链表 + **指针稳定**的 `Element*`。
+ * @brief Go `container/list` 的 C++ 对应：`std::list` 薄封装 + **指针稳定**的 `Element*`。
  *
- * @details 复用优先的结论（先检索再动手）：
+ * @details 复用结论（先检索再动手）：
  *   | 候选 | 许可证 | 结论 |
  *   |---|---|---|
- *   | Go 1.23 `container/list`（本机 `third_party/go1.23.0.src.tar.gz`） | BSD-3-Clause | **作为语义基准**：接口、移动/插入的 no-op 规则、`Element.Next/Prev` 在两端返回 nil 的语义逐项对齐；独立实现，不复制源码 |
- *   | `std::list` | C++ 标准库 | **采用为对照基线**（随机测试与压测）；**不直接包装**：Go 的 API 以 `*Element` 作为稳定句柄并提供 O(1) 的 `MoveToFront/Back/Before/After`。`std::list` 的节点地址不对外暴露，要拿到稳定句柄得额外存迭代器并再包一层；而且 `Remove` 需要「按句柄删除并返回值」，自己维护节点反而更直接 |
+ *   | Go 1.23 `container/list`（本机 `third_party/go1.23.0.src.tar.gz`） | BSD-3-Clause | **语义基准**：接口、移动/插入的 no-op 规则、`Element.Next/Prev` 两端返回 nil 的语义逐项对齐；独立实现，不复制源码 |
+ *   | `std::list` | C++ 标准库 | **采用为唯一存储与全部结构操作**：标准保证插入/删除/接合**其他**元素时，已有元素的引用与迭代器不失效——这正是 Go `Element*` 的句柄语义。每个 `Element<T>` 保存指向自身节点的迭代器，`Remove`/`MoveToFront`/`MoveToBack`/`MoveBefore`/`MoveAfter` 直接映射到 `erase`/`splice`，全部 O(1) |
  *   | Boost.Intrusive `list` | Boost 1.0 | **不采用**：侵入式链表要求用户把 hook 嵌进元素类型，无法保持 Go 的 `Element{Value}` 形态；引入 Boost 依赖也与本项目定位不符 |
- *   | `std::unordered_map` + `std::list` 手写 LRU（常见片段） | — | **不采用为模块实现**：本项目要提供的是通用 `container::List`，LRU 只是它的一种用法；真实场景测试里正是用本模块搭 LRU |
+ *   | 手写双向链表（重构前） | — | **已移除**：与 `std::list` 能力完全重合，多出约 300 行维护成本，而压测没有性能优势（1.02x，基本打平） |
  *
  *   **关键语义：`Element*` 指针稳定**
- *   - 每个元素由 `new Element` 单独分配，**绝不在插入/删除其他元素时搬移节点**。
- *     因此 `Element*` 在整个生命周期内保持不变，这正是 Go `container/list` 被用于
- *     LRU 缓存的原因：`unordered_map<Key, Element*>` 里的句柄永远不会因其他元素的
- *     增删而失效。
- *   - `Remove(e)` 会释放 `e` 本身（见下方差异说明）；**其它** `Element*` 仍然有效。
+ *   - `std::list` 的节点在插入/删除/接合其他元素时**不会搬移**；每个
+ *     `Element<T>` 还保存了指向自身节点的迭代器，因此 `Element*` 在链表的整个
+ *     生命周期内保持不变。这正是 Go `container/list` 被用于 LRU 缓存的原因：
+ *     `unordered_map<Key, Element*>` 里的句柄不会因其他元素的增删而失效。
+ *   - `Remove(e)` 会销毁 `e` 本身；**其它** `Element*` 仍然有效。
  *
  *   **与 Go 的差异（必须知道）**：
- *   - Go 由 GC 管理节点，`Remove` 后仍可读 `e.Value`；C++ 侧 `Remove(e)` 在返回
- *     元素值后立即 `delete e`，因此**被删元素自身的指针立即失效**。这避免了 LRU
+ *   - Go 由 GC 管理节点，`Remove` 后仍可读 `e.Value`；C++ 侧 `Remove(e)` 在取出
+ *     元素值后立即销毁节点，因此**被删元素自身的指针立即失效**。这避免了 LRU
  *     长时间运行时被淘汰节点无限堆积。
  *   - Go 的 `Remove` 对「不属于本链表」的元素是 no-op 并返回其值；本实现保持该
  *     行为（要求 `T` 可复制，否则抛 `std::invalid_argument`）。
@@ -36,6 +36,8 @@
 #pragma once
 
 #include <cstddef>
+#include <iterator>
+#include <list>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -49,8 +51,8 @@ class List;
  * @brief 链表节点（对应 Go `list.Element`）。
  * @tparam T 元素类型。
  *
- * @details `Value` 是公开字段（与 Go 的 `e.Value` 对应）；链接指针私有，只有
- *          `List<T>` 能修改。节点一旦创建，地址在链表的整个生命周期内不变。
+ * @details `Value` 是公开字段（与 Go 的 `e.Value` 对应）；节点元数据私有，只有
+ *          `List<T>` 能修改。节点地址由 `std::list` 保证在插入/删除其他元素时不变。
  */
 template <typename T>
 struct Element {
@@ -63,28 +65,44 @@ struct Element {
     /**
      * @brief 下一个元素；本节点是尾节点时返回 `nullptr`（Go 返回 nil）。
      */
-    Element* Next() const noexcept { return m_next; }
+    Element* Next() const noexcept {
+        if (m_list == nullptr) {
+            return nullptr;
+        }
+        auto next = m_it;
+        ++next;
+        return next == m_list->end() ? nullptr : &*next;
+    }
 
     /**
      * @brief 上一个元素；本节点是头节点时返回 `nullptr`（Go 返回 nil）。
      */
-    Element* Prev() const noexcept { return m_prev; }
+    Element* Prev() const noexcept {
+        if (m_list == nullptr || m_it == m_list->begin()) {
+            return nullptr;
+        }
+        auto prev = m_it;
+        --prev;
+        return &*prev;
+    }
 
  private:
     friend class List<T>;
 
-    Element* m_next = nullptr;
-    Element* m_prev = nullptr;
-    List<T>* m_owner = nullptr;
+    /** @brief 节点所属的 `std::list`；`nullptr` 表示未挂入任何链表。 */
+    using list_type = std::list<Element<T>>;
+    using iterator = typename list_type::iterator;
+
+    list_type* m_list = nullptr;
+    iterator m_it{};
 };
 
 /**
- * @brief 双向链表（对应 Go `container/list`）。
+ * @brief 双向链表（对应 Go `container/list`），内部就是 `std::list`。
  * @tparam T 元素类型；只要求可移动构造/可析构，**不要求默认构造**。
  *
- * @details 不设哨兵节点，直接维护 `m_front`/`m_back` 两个指针。这样 `Element`
- *          不需要为哨兵构造一个 `T`，因此 `T` 不必默认构造（Go 的哨兵是
- *          `Element{Value:nil}`，对应到 C++ 会强加一个不合理的约束）。
+ * @details `Element<T>` 包一层以保持 Go 的 API 形状（`Element*` + `Value`），
+ *          节点本身由 `std::list` 分配，`Element*` 的稳定性由标准保证。
  *
  * @code
  * container::List<int> l;
@@ -102,8 +120,7 @@ class List {
     using size_type = std::size_t;
 
     List() = default;
-
-    ~List() { Clear(); }
+    ~List() = default;
 
     List(const List&) = delete;
     List& operator=(const List&) = delete;
@@ -111,45 +128,43 @@ class List {
     List& operator=(List&&) = delete;
 
     /** @brief 元素个数，O(1)（对应 Go `l.Len()`）。 */
-    size_type Len() const noexcept { return m_len; }
+    size_type Len() const noexcept { return m_data.size(); }
 
     /** @brief 对应 Go `l.Init()`：清空链表并恢复到可立即使用的空状态。 */
     void Init() { Clear(); }
 
     /**
-     * @brief 清空链表并释放全部节点。
+     * @brief 清空链表并释放全部节点（`std::list::clear`）。
      * @details 不是 Go 的 API（GC 语言不需要），但 C++ 侧必须有显式释放入口。
      */
-    void Clear() {
-        element_type* node = m_front;
-        while (node != nullptr) {
-            element_type* next = node->m_next;
-            delete node;
-            node = next;
-        }
-        m_front = nullptr;
-        m_back = nullptr;
-        m_len = 0;
-    }
+    void Clear() { m_data.clear(); }
 
     /** @brief 首元素；空链表返回 `nullptr`（对应 Go 返回 nil）。 */
-    element_type* Front() noexcept { return m_front; }
+    element_type* Front() noexcept {
+        return m_data.empty() ? nullptr : &m_data.front();
+    }
 
     /** @brief 尾元素；空链表返回 `nullptr`（对应 Go 返回 nil）。 */
-    element_type* Back() noexcept { return m_back; }
+    element_type* Back() noexcept {
+        return m_data.empty() ? nullptr : &m_data.back();
+    }
 
     /**
      * @brief 头插，返回新节点（对应 Go `PushFront`）。
      */
     element_type* PushFront(T value) {
-        return InsertNodeBefore(std::move(value), m_front);
+        m_data.emplace_front(std::move(value));
+        return Adopt(m_data.begin());
     }
 
     /**
      * @brief 尾插，返回新节点（对应 Go `PushBack`）。
      */
     element_type* PushBack(T value) {
-        return InsertNodeBefore(std::move(value), nullptr);
+        m_data.emplace_back(std::move(value));
+        auto it = m_data.end();
+        --it;
+        return Adopt(it);
     }
 
     /**
@@ -158,10 +173,10 @@ class List {
      *         （与 Go 的「不是本链表元素则不改动」一致）。
      */
     element_type* InsertBefore(T value, element_type* mark) {
-        if (mark == nullptr || mark->m_owner != this) {
+        if (!Belongs(mark)) {
             return nullptr;
         }
-        return InsertNodeBefore(std::move(value), mark);
+        return Adopt(m_data.emplace(mark->m_it, std::move(value)));
     }
 
     /**
@@ -169,10 +184,12 @@ class List {
      * @return `mark` 为 `nullptr` 或不属于本链表时返回 `nullptr` 且不修改链表。
      */
     element_type* InsertAfter(T value, element_type* mark) {
-        if (mark == nullptr || mark->m_owner != this) {
+        if (!Belongs(mark)) {
             return nullptr;
         }
-        return InsertNodeBefore(std::move(value), mark->m_next);
+        auto pos = mark->m_it;
+        ++pos;
+        return Adopt(m_data.emplace(pos, std::move(value)));
     }
 
     /**
@@ -182,14 +199,12 @@ class List {
      * @note 复杂度 O(index)；链表没有随机访问。
      */
     element_type* InsertValue(T value, size_type index) {
-        if (index >= m_len) {
-            return InsertNodeBefore(std::move(value), nullptr);
+        if (index >= m_data.size()) {
+            return PushBack(std::move(value));
         }
-        element_type* pos = m_front;
-        for (size_type i = 0; i < index; ++i) {
-            pos = pos->m_next;
-        }
-        return InsertNodeBefore(std::move(value), pos);
+        auto pos = m_data.begin();
+        std::advance(pos, static_cast<std::ptrdiff_t>(index));
+        return Adopt(m_data.emplace(pos, std::move(value)));
     }
 
     /**
@@ -203,7 +218,7 @@ class List {
         if (e == nullptr) {
             throw std::invalid_argument("go2cpp::container::List::Remove(nullptr)");
         }
-        if (e->m_owner != this) {
+        if (!Belongs(e)) {
             if constexpr (std::is_copy_constructible<T>::value) {
                 return e->Value;
             } else {
@@ -211,26 +226,25 @@ class List {
                     "go2cpp::container::List::Remove: element belongs to another list");
             }
         }
-        Detach(e);
         T value = std::move(e->Value);
-        delete e;
+        m_data.erase(e->m_it);
         return value;
     }
 
     /** @brief 移到头部（对应 Go `MoveToFront`）；不属于本链表时 no-op。 */
     void MoveToFront(element_type* e) {
-        if (e == nullptr || e->m_owner != this || m_front == e) {
+        if (!Belongs(e) || e == Front()) {
             return;
         }
-        MoveNodeBefore(e, m_front);
+        m_data.splice(m_data.begin(), m_data, e->m_it);
     }
 
     /** @brief 移到尾部（对应 Go `MoveToBack`）；不属于本链表时 no-op。 */
     void MoveToBack(element_type* e) {
-        if (e == nullptr || e->m_owner != this || m_back == e) {
+        if (!Belongs(e) || e == Back()) {
             return;
         }
-        MoveNodeBefore(e, nullptr);
+        m_data.splice(m_data.end(), m_data, e->m_it);
     }
 
     /**
@@ -238,11 +252,10 @@ class List {
      * @details `e`/`mark` 不属于本链表、`e == mark` 或 `mark == nullptr` 时 no-op。
      */
     void MoveBefore(element_type* e, element_type* mark) {
-        if (e == nullptr || mark == nullptr || e == mark || e->m_owner != this ||
-            mark->m_owner != this) {
+        if (!Belongs(e) || !Belongs(mark) || e == mark) {
             return;
         }
-        MoveNodeBefore(e, mark);
+        m_data.splice(mark->m_it, m_data, e->m_it);
     }
 
     /**
@@ -250,74 +263,28 @@ class List {
      * @details `e`/`mark` 不属于本链表、`e == mark` 或 `mark == nullptr` 时 no-op。
      */
     void MoveAfter(element_type* e, element_type* mark) {
-        if (e == nullptr || mark == nullptr || e == mark || e->m_owner != this ||
-            mark->m_owner != this) {
+        if (!Belongs(e) || !Belongs(mark) || e == mark) {
             return;
         }
-        element_type* pos = mark->m_next;
-        if (pos == e) {
-            return;  // 已经在 mark 之后
-        }
-        MoveNodeBefore(e, pos);
+        auto pos = mark->m_it;
+        ++pos;
+        m_data.splice(pos, m_data, e->m_it);
     }
 
  private:
-    /** @brief 把新节点接到 `pos` 之前；`pos == nullptr` 表示接到尾部。 */
-    element_type* InsertNodeBefore(T value, element_type* pos) {
-        element_type* node = new element_type(std::move(value));
-        AttachBefore(node, pos);
-        return node;
+    /** @brief `e` 是否由本链表持有。 */
+    bool Belongs(const element_type* e) const noexcept {
+        return e != nullptr && e->m_list == &m_data;
     }
 
-    /** @brief 把已经分配好的节点接到 `pos` 之前，并维护首尾指针与长度。 */
-    void AttachBefore(element_type* node, element_type* pos) noexcept {
-        node->m_prev = (pos != nullptr) ? pos->m_prev : m_back;
-        node->m_next = pos;
-        if (node->m_prev != nullptr) {
-            node->m_prev->m_next = node;
-        } else {
-            m_front = node;
-        }
-        if (pos != nullptr) {
-            pos->m_prev = node;
-        } else {
-            m_back = node;
-        }
-        node->m_owner = this;
-        ++m_len;
+    /** @brief 给刚插入的节点补上「所属链表 + 自身迭代器」元数据，返回稳定句柄。 */
+    element_type* Adopt(typename std::list<element_type>::iterator it) noexcept {
+        it->m_list = &m_data;
+        it->m_it = it;
+        return &*it;
     }
 
-    /** @brief 从链表中摘除节点（不释放内存、不修改节点值）。 */
-    void Detach(element_type* node) noexcept {
-        if (node->m_prev != nullptr) {
-            node->m_prev->m_next = node->m_next;
-        } else {
-            m_front = node->m_next;
-        }
-        if (node->m_next != nullptr) {
-            node->m_next->m_prev = node->m_prev;
-        } else {
-            m_back = node->m_prev;
-        }
-        node->m_next = nullptr;
-        node->m_prev = nullptr;
-        node->m_owner = nullptr;
-        --m_len;
-    }
-
-    /**
-     * @brief 把链内节点移动到 `pos` 之前，净长度不变。
-     * @details 先 Detach 再 Attach；调用方已保证 `node != pos`，因此 `pos` 在
-     *          Detach 之后仍然有效。
-     */
-    void MoveNodeBefore(element_type* node, element_type* pos) noexcept {
-        Detach(node);
-        AttachBefore(node, pos);
-    }
-
-    element_type* m_front = nullptr;
-    element_type* m_back = nullptr;
-    size_type m_len = 0;
+    std::list<element_type> m_data;
 };
 
 }  // namespace go2cpp::container

@@ -1,43 +1,44 @@
 /**
  * @file heap.hpp
- * @brief Go `container/heap` 的 C++ 对应实现：接口式 + 模板式两种形态。
+ * @brief Go `container/heap` 的 C++ 对应：接口式（自由函数 + 鸭子类型）+ 模板式 `Heap<T, Less>`。
  *
- * @details 复用优先的结论（先检索再动手）：
+ * @details 复用结论（先检索再动手）：
  *   | 候选 | 许可证 | 结论 |
  *   |---|---|---|
- *   | Go 1.23 `container/heap`（本机 `third_party/go1.23.0.src.tar.gz`） | BSD-3-Clause | **作为语义基准**：本文件是独立实现，逐行对照其 `Init/Push/Pop/Remove/Fix` 的 sift 流程，不复制源码 |
- *   | `std::priority_queue` / `std::push_heap` / `std::pop_heap` | C++ 标准库 | **采用为底层存储与对照基线**：模板式 `Heap` 用 `std::vector` 存元素；压测里直接与 `std::priority_queue` 对比。未直接调用 `std::push_heap`，因为 Go 的 `Fix`/`Remove` 需要「sift 是否真的移动过」这一返回值，而标准算法不暴露该信息 |
- *   | Boost.Heap（`boost::heap::fibonacci_heap` 等） | Boost 1.0 | **不采用**：引入 Boost 头依赖只为一套本可 200 行写清的二叉堆，且其 API 不是 Go 形态；项目当前只在非 native 上下文平台链接 Boost.Context |
- *   | [skarupke/flat_set](https://github.com/skarupke/flat_set) 等第三方扁平容器 | MIT | **不采用**：不是 heap，语义无法对齐 `container/heap` |
+ *   | Go 1.23 `container/heap`（本机 `third_party/go1.23.0.src.tar.gz`） | BSD-3-Clause | **语义基准**：`Init/Push/Pop/Remove/Fix` 的行为、`Fix` 先 down 后 up 的顺序逐项对齐；独立实现，不复制源码 |
+ *   | `<algorithm>` 的 `std::make_heap` / `std::push_heap` / `std::pop_heap` | C++ 标准库 | **采用为模板式 `Heap` 的建堆 / 插入 / 弹出实现**，底层 `std::vector` |
+ *   | `std::priority_queue` | C++ 标准库 | **不采用**：底层容器 `c` 是 protected，拿不到迭代器就做不了 `Fix`/`Remove`；`pop_heap` + `vector::pop_back` 是等价的公开算法组合 |
+ *   | Boost.Heap（`boost::heap::fibonacci_heap` 等） | Boost 1.0 | **不采用**：为二叉堆引入 Boost 头依赖，且其 API 不是 Go 形态 |
  *
- *   **两种形态为什么都要**：
- *   - **接口式**（自由函数 `Init`/`Push`/`Pop`/`Fix`/`Remove`）逐项对齐 Go：
- *     Go 用 `heap.Interface`（`Len`/`Less`/`Swap`/`Push`/`Pop` 五方法）把「堆算法」与
- *     「用户容器」解耦；C++ 侧用**鸭子类型**（模板 + 不写虚接口）表达同一契约，
- *     零虚调用开销。用户容器只需同名同签名地实现五个方法。
- *   - **模板式**（`Heap<T, Less>`）符合 C++ 习惯：内部 `std::vector`，直接
- *     `Push`/`Pop`/`Top`/`Size`/`Empty`，无需用户再写五个方法。
+ *   **模板式用公开算法而不是自实现**：二叉堆的 `push_heap`/`pop_heap`/`make_heap`
+ *   已是标准库实现，`Fix`/`Remove` 只需要在 `std::vector` 上做 sift（约 30 行），
+ *   没有必要再维护一整份堆逻辑。
+ *
+ *   **接口式为什么保留手写 sift**：Go 用 `heap.Interface`（`Len`/`Less`/`Swap`/
+ *   `Push`/`Pop` 五方法）把堆算法与用户容器解耦；C++ 侧用鸭子类型表达同一契约。
+ *   用户容器只暴露下标语义、没有迭代器，`std::*_heap` 无法作用于它，因此
+ *   `detail::HeapDown`/`HeapUp` 必须保留（约 30 行）。这是对齐 Go API 形状的
+ *   必要适配层，不是重复实现整个堆。
  *
  *   **关键语义**：
  *   - 默认 `std::less<>` 是 **min-heap**，`Pop()` 返回**最小元素**（与 Go 一致）；
  *     传 `std::greater<>` 即 max-heap。
- *   - 接口式的 `Pop(h)` 与 Go 完全相同：先把首元素与末元素交换，再对前 `n-1` 个元素
- *     sift-down，最后调用用户的 `h.Pop()` 取走末元素。因此用户的 `Pop()` 方法
- *     **只能删除并返回最后一个元素**，不能自己再做 sift（Go 文档同样如此）。
- *   - `Fix(h, i)`：Go 先尝试 down，未移动才 up；`Remove(h, i)` 同理。这个「先 down
- *     后 up」的顺序不是随意选的——元素变小时 down 不会移动，必须再 up；元素变大时
- *     down 会移动，此时 up 一定无事可做。本实现保留该顺序。
+ *   - 接口式 `Pop(h)`/`Remove(h, i)` 与 Go 完全相同：先把首元素与末元素交换，再对
+ *     前 `n-1` 个元素 sift-down，最后调用用户的 `h.Pop()` 取走末元素。用户的
+ *     `Pop()` 只能删除并返回最后一个元素，不能自己再做 sift（Go 文档同样如此）。
+ *   - `Fix`/`Remove`：先尝试 down，未移动才 up（Go 的顺序）。元素变小时 down 不会
+ *     移动，必须再 up；元素变大时 down 会移动，此时 up 一定无事可做。
  *
  * @note **边界/差异**：
- *       - Go 在空堆上 `Pop`/越界 `Remove` 会 panic；C++ 侧抛 `std::out_of_range`
- *         （模板式 `Pop`/`Top` 亦同）。
- *       - Go 的 `any` 允许同一堆混装任意类型；C++ 侧要求元素类型在编译期确定。
+ *       - Go 在空堆上 `Pop`/越界 `Remove` 会 panic；C++ 侧抛 `std::out_of_range`。
+ *       - Go 的 `any` 允许同一堆混装任意类型；C++ 侧元素类型在编译期确定。
  *       - 模板式 `Heap` **不**参与接口式自由函数（它的成员 `Push`/`Pop` 已自带 sift，
  *         再套自由函数虽然幂等但语义混乱）；两套 API 请勿交叉使用。
- *       - 未提供 `std::priority_queue` 那样的底层容器模板参数；内部固定 `std::vector`。
+ *       - 内部固定 `std::vector`，不提供 `std::priority_queue` 那样的底层容器模板参数。
  */
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <stdexcept>
@@ -186,7 +187,7 @@ inline void Fix(H& h, std::size_t i) {
 // ============================================================================
 
 /**
- * @brief 基于 `std::vector` 的二叉堆。
+ * @brief 基于 `std::vector` + `<algorithm>` 堆算法的二叉堆。
  * @tparam T 元素类型；要求可移动构造/可移动赋值（`Pop` 用移动赋值搬移末元素）。
  * @tparam Less 严格弱序比较器；默认 `std::less<>` 得到 **min-heap**。
  *
@@ -212,61 +213,40 @@ class Heap {
     Heap() = default;
     explicit Heap(Less less) : m_less(std::move(less)) {}
 
-    /** @brief 插入一个元素（左值拷贝 / 右值移动），O(log n)。 */
+    /**
+     * @brief 用一批乱序元素重建堆，O(n)（对应 Go `heap.Init` 的批量场景）。
+     * @details 直接调用 `std::make_heap`；原有元素被丢弃。
+     */
+    void Init(std::vector<T> values) {
+        m_data = std::move(values);
+        std::make_heap(m_data.begin(), m_data.end(), Inverted(&m_less));
+    }
+
+    /** @brief 插入一个元素（左值拷贝），O(log n)。 */
     void Push(const T& value) {
         m_data.push_back(value);
-        SiftUp(m_data.size() - 1);
+        std::push_heap(m_data.begin(), m_data.end(), Inverted(&m_less));
     }
 
     /** @brief 插入一个元素（移动），O(log n)。 */
     void Push(T&& value) {
         m_data.push_back(std::move(value));
-        SiftUp(m_data.size() - 1);
+        std::push_heap(m_data.begin(), m_data.end(), Inverted(&m_less));
     }
 
     /**
      * @brief 删除并返回堆顶（默认比较下的最小值），O(log n)。
      * @throws std::out_of_range 堆为空时。
-     * @details 用「空洞下沉」而不是逐层 swap：把末元素取出后，沿较小孩子路径
-     *          把空洞一路下移（每层只移动一次），最后再尝试把末元素上移补洞。
-     *          接口式 `Pop(h)` 只能用 `Swap`，做不到这一点；模板式可以，故两者
-     *          内部实现不同但结果语义一致。
+     * @details `std::pop_heap` 把堆顶移到末尾并恢复前 n-1 个元素的堆性质，
+     *          再 `pop_back` 取走它；两步都是标准库公开算法。
      */
     T Pop() {
         if (m_data.empty()) {
             throw std::out_of_range("go2cpp::container::Heap::Pop on empty heap");
         }
-        T result = std::move(m_data.front());
-        if (m_data.size() == 1) {
-            m_data.pop_back();
-            return result;
-        }
-
-        T last = std::move(m_data.back());
+        std::pop_heap(m_data.begin(), m_data.end(), Inverted(&m_less));
+        T result = std::move(m_data.back());
         m_data.pop_back();
-        const size_type n = m_data.size();
-        size_type hole = 0;
-        while (true) {
-            size_type child = 2 * hole + 1;
-            if (child >= n) {
-                break;
-            }
-            if (child + 1 < n && m_less(m_data[child + 1], m_data[child])) {
-                ++child;
-            }
-            m_data[hole] = std::move(m_data[child]);
-            hole = child;
-        }
-        // 末元素可能比补洞位置的父节点还小，需要再上移（与 std::pop_heap 同理）。
-        while (hole > 0) {
-            const size_type parent = (hole - 1) / 2;
-            if (!m_less(last, m_data[parent])) {
-                break;
-            }
-            m_data[hole] = std::move(m_data[parent]);
-            hole = parent;
-        }
-        m_data[hole] = std::move(last);
         return result;
     }
 
@@ -298,7 +278,90 @@ class Heap {
     /** @brief 预分配至少 `capacity` 个元素的空间（压测时消除扩容噪声）。 */
     void Reserve(size_type capacity) { m_data.reserve(capacity); }
 
+    /**
+     * @brief 下标 i 的元素优先级变化后，就地恢复堆性质，O(log n)。
+     * @throws std::out_of_range 当 i 越界。
+     * @details 与接口式 `Fix(h, i)` 同序：先 down，未移动再 up。
+     *          语义等价于 Go `heap.Fix`，对应「任务 deadline 被修改」这类用法。
+     */
+    void Fix(size_type i) {
+        if (i >= m_data.size()) {
+            throw std::out_of_range("go2cpp::container::Heap::Fix index out of range");
+        }
+        if (!SiftDown(i, m_data.size())) {
+            SiftUp(i);
+        }
+    }
+
+    /**
+     * @brief 删除下标 i 的元素并返回它，O(log n)。
+     * @throws std::out_of_range 当 i 越界。
+     * @details 与接口式 `Remove(h, i)` 同序：末尾元素换到 i → 先 down、未移动再 up
+     *          → 弹出末元素；对应 Go `heap.Remove`。
+     */
+    T Remove(size_type i) {
+        if (i >= m_data.size()) {
+            throw std::out_of_range(
+                "go2cpp::container::Heap::Remove index out of range");
+        }
+        const size_type last = m_data.size() - 1;
+        if (i != last) {
+            std::swap(m_data[i], m_data[last]);
+            if (!SiftDown(i, last)) {
+                SiftUp(i);
+            }
+        }
+        T result = std::move(m_data.back());
+        m_data.pop_back();
+        return result;
+    }
+
  private:
+    /**
+     * @brief 把用户的 `Less`（Go 的 min-heap 语义）反向后交给 `std::*_heap`。
+     * @details 标准库的 `make_heap`/`push_heap`/`pop_heap` 以 `comp` 为「小于」
+     *          建 **max-heap**（堆顶是 `comp` 意义下的最大元素）；Go 的
+     *          `container/heap` 用 `Less` 建 **min-heap**。因此把比较器反向
+     *          （`Inverted(a, b) = Less(b, a)`）后，标准算法的堆顶正好是最小元素。
+     *          这是薄封装 `std::*_heap` 时唯一需要留意的语义换算。
+     */
+    struct Inverted {
+        const Less* less;
+
+        explicit Inverted(const Less* cmp) : less(cmp) {}
+
+        bool operator()(const T& lhs, const T& rhs) const {
+            return (*less)(rhs, lhs);
+        }
+    };
+
+    /**
+     * @brief 在下标区间 `[0, n)` 内把 i0 向下 sift。
+     * @return 是否真的移动过元素（`Fix`/`Remove` 据此决定要不要再 up）。
+     * @details 只在 `std::vector` 上操作，是 `std::*_heap` 没有公开的
+     *          「按下标修堆」能力的必要补充；与接口式 `detail::HeapDown` 同构，
+     *          但直接作用于 vector，不经过鸭子类型。
+     */
+    bool SiftDown(size_type i0, size_type n) {
+        size_type i = i0;
+        while (true) {
+            size_type child = 2 * i + 1;
+            if (child >= n) {
+                break;
+            }
+            if (child + 1 < n && m_less(m_data[child + 1], m_data[child])) {
+                ++child;
+            }
+            if (!m_less(m_data[child], m_data[i])) {
+                break;
+            }
+            std::swap(m_data[i], m_data[child]);
+            i = child;
+        }
+        return i > i0;
+    }
+
+    /** @brief 从 j 向上 sift（与 Go `container/heap.up` 一致）。 */
     void SiftUp(size_type j) {
         while (j > 0) {
             const size_type parent = (j - 1) / 2;
