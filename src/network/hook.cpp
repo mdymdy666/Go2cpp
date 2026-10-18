@@ -241,6 +241,20 @@ std::once_flag s_originals_once;
 thread_local unsigned int s_real_call_depth = 0;
 thread_local bool s_resolving = false;
 
+/**
+ * @brief 在调用原始 libc 函数期间递增 `s_real_call_depth` 的 RAII 守卫。
+ *
+ * ## 为什么需要深度计数
+ *
+ * hook 函数要区分「用户调用」与「我们替 libc 干活」：深度 > 0 说明当前调用是
+ * hook 内部转发给原始函数的（`invoke_real`），此时**不能再 park、不能再接管**，
+ * 只能直调 —— 否则会无限递归（hook 调 hook）。
+ *
+ * ## 为什么是 thread_local
+ *
+ * 深度按线程计数：一个线程上同一时刻只有一条调用链，用全局原子会造成
+ * 无关线程之间的误判（别的线程正在转发原始调用，不代表本线程也在）。
+ */
 class RealCallGuard final {
 public:
     RealCallGuard() noexcept { ++s_real_call_depth; }
@@ -708,8 +722,24 @@ void try_register_new_socket(int fd, bool user_nonblocking) noexcept {
     }
 }
 
+/**
+ * @brief 一个 fd 句柄的一致快照（令牌 + 关闭标记）。
+ *
+ * ## 为什么不在调用现场直接读
+ *
+ * hook 热路径需要「判断 fd 是否仍有效」而**不持有条带锁**：`snapshot_descriptor`
+ * 在锁内取一份快照（复制 `shared_ptr`），锁外再判 `m_closed` / `token->valid()`。
+ * 复制令牌保证判断期间它不会被回收。
+ *
+ * ## `m_closed` 的三重含义
+ *
+ * 只要 `m_closed` 为真、**或**令牌为空、**或**令牌 `valid()==false`，都视为已关闭 ——
+ * 后两者对应「close/dup2 已使令牌失效、但描述符还没从条带表里清掉」的窗口。
+ */
 struct DescriptorSnapshot {
+    /// @brief 代际令牌（强引用，保证判断期间不被回收）。
     DescriptorTokenPtr m_token;
+    /// @brief 是否已关闭（含令牌为空/失效两种情形）。
     bool m_closed{true};
 };
 
@@ -730,7 +760,19 @@ bool descriptor_closed(const std::shared_ptr<Descriptor>& descriptor) noexcept {
     return snapshot_descriptor(descriptor).m_closed;
 }
 
+/**
+ * @brief `close` 的两阶段计划：先摘出句柄并标记关闭，再在锁外收尾。
+ *
+ * ## 为什么分两阶段
+ *
+ * `close(fd)` 要做四件事：① 从条带表摘出 `Descriptor`（持条带锁）；② 标记
+ * `m_closed`；③ 调原始 `close`；④ 通知 `IOManager` 清理槽位。它们涉及不同的锁，
+ * 混在一起会违反锁层次（hook 条带锁 → IOManager 条带锁）。
+ *
+ * 因此 `prepare_close` 只做 ①②，`finish_close` 在**锁外**做 ③④。
+ */
 struct ClosePlan {
+    /// @brief 摘出的句柄；为空表示该 fd 未被接管（close 直接透传给 libc）。
     std::shared_ptr<Descriptor> m_descriptor;
 };
 
