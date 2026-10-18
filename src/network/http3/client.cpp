@@ -1,0 +1,707 @@
+/**
+ * @file client.cpp
+ * @brief `Client` 的实现 —— 唯一 include `picohttp`（h3zero/QPACK）头的地方。
+ *
+ * ## 分层
+ *
+ * ```
+ *   Client (本文件)              HTTP/3：HEADERS/DATA 帧、:status、body
+ *      |  picoquic_set_callback（换成 HTTP/3 回调）
+ *   PicoquicConnection           QUIC：握手、ACK、重传、流控
+ *      |  picoquic_prepare_next_packet / picoquic_incoming_packet
+ *   Transport (UDP / 内存)        字节通道，datagram 语义
+ * ```
+ *
+ * ## 三个关键实现点
+ *
+ * ### 1. 回调是"换掉"而不是"再包一层"
+ *
+ * `PicoquicConnection` 在创建连接时挂了自己的回调（把每个流的字节攒起来）。
+ * 本类拿到 `picoquic_cnx_t*` 后用 `picoquic_set_callback` 把回调换成
+ * `Impl::Callback`。因此：
+ *
+ * - `PicoquicConnection::HandshakeComplete()` 不再更新，**本类自己用
+ *   `ready` 标志跟踪**，不读 wrapper 的握手状态；
+ * - `PicoquicConnection::ReadStream()` 不再有数据，也不需要。
+ *
+ * ### 2. `h3zero_protocol_init` 必须发，而且要在发请求之前
+ *
+ * HTTP/3 连接上必须先发 SETTINGS（控制流）、QPACK encoder/decoder 流。
+ * `h3zero_protocol_init(cnx)` 一次做完这三件事（内部会分配 3 个单向流）。
+ * 我们在 `picoquic_callback_ready` 里调用它，而 `Send` 会先驱动握手到
+ * `ready`，所以顺序天然正确。
+ *
+ * ### 3. 帧头长度用 QUIC varint 自己写，QPACK 一律用 picohttp
+ *
+ * HEADERS/DATA 的**帧头**（类型 + 长度）是 QUIC varint（RFC 9000 §16），
+ * 不属于 QPACK，所以这里用 5 行的 `AppendVarint` 写。**字段段本身**
+ * （`:method`/`:scheme`/`:path`/`:authority`/UA/自定义头）全部由
+ * `h3zero_create_request_header_frame_ex` /
+ * `h3zero_create_post_header_frame_ex` / `h3zero_qpack_literal_plus_name_encode`
+ * 编码 —— 没有一行自写 QPACK。
+ *
+ * 注意 picohttp 的请求构造函数会在字段段最前面写两个 0 字节
+ * （Required Insert Count = 0，Delta Base = 0），这是 QPACK 字段段前缀，
+ * 必须原样保留在该字段段的最前面。
+ */
+
+#include "go2cpp/network/http3/client.hpp"
+
+#include "go2cpp/network/http2/transport.hpp"
+#include "go2cpp/network/quic/picoquic_connection.hpp"
+
+#include <h3zero.h>
+#include <h3zero_common.h>
+#include <picoquic.h>
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <map>
+#include <utility>
+
+namespace go2cpp::net::http3 {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+void SetError(std::string* error, const std::string& message) {
+    if (error != nullptr) {
+        *error = message;
+    }
+}
+
+std::string ToUpperAscii(std::string text) {
+    for (char& c : text) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return text;
+}
+
+std::string ToLowerAscii(std::string text) {
+    for (char& c : text) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return text;
+}
+
+std::string HexCode(std::uint64_t code) {
+    char buffer[24];
+    std::snprintf(buffer, sizeof(buffer), "0x%llx", static_cast<unsigned long long>(code));
+    return std::string(buffer);
+}
+
+/**
+ * @brief 追加一个 QUIC varint（RFC 9000 §16）。
+ *
+ * 只用于 HTTP/3 的**帧头**（帧类型与帧长度），不涉及 QPACK。
+ */
+void AppendVarint(std::vector<std::uint8_t>& out, std::uint64_t value) {
+    if (value < 0x40ULL) {
+        out.push_back(static_cast<std::uint8_t>(value));
+    } else if (value < 0x4000ULL) {
+        out.push_back(static_cast<std::uint8_t>(0x40U | (value >> 8)));
+        out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
+    } else if (value < 0x40000000ULL) {
+        out.push_back(static_cast<std::uint8_t>(0x80U | (value >> 24)));
+        out.push_back(static_cast<std::uint8_t>((value >> 16) & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
+    } else {
+        out.push_back(static_cast<std::uint8_t>(0xC0U | (value >> 56)));
+        out.push_back(static_cast<std::uint8_t>((value >> 48) & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>((value >> 40) & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>((value >> 32) & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>((value >> 24) & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>((value >> 16) & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFFU));
+        out.push_back(static_cast<std::uint8_t>(value & 0xFFU));
+    }
+}
+
+/**
+ * @brief `h3zero_content_type_enum` 到 MIME 字符串。
+ *
+ * picohttp 只提供 "path -> enum" 与 "enum -> 静态表 code" 两个方向，
+ * 没有 "enum -> MIME 字符串"。响应头里要还原 `content-type` 文本，
+ * 只能在本地做这一张小表 —— 这不是 QPACK 解码，enum 已经在
+ * `h3zero_header_parts_t` 里解好了。
+ */
+const char* ContentTypeName(h3zero_content_type_enum type) {
+    switch (type) {
+        case h3zero_content_type_text_html:
+            return "text/html";
+        case h3zero_content_type_text_plain:
+            return "text/plain";
+        case h3zero_content_type_image_gif:
+            return "image/gif";
+        case h3zero_content_type_image_jpeg:
+            return "image/jpeg";
+        case h3zero_content_type_image_png:
+            return "image/png";
+        case h3zero_content_type_dns_message:
+            return "application/dns-message";
+        case h3zero_content_type_javascript:
+            return "application/javascript";
+        case h3zero_content_type_json:
+            return "application/json";
+        case h3zero_content_type_www_form_urlencoded:
+            return "application/x-www-form-urlencoded";
+        case h3zero_content_type_text_css:
+            return "text/css";
+        case h3zero_content_type_not_supported:
+            return "application/octet-stream";
+        case h3zero_content_type_none:
+        default:
+            return "";
+    }
+}
+
+/// HTTP header 名字的合法字符集（RFC 7230 `token`，已排除大写，因为我们先转小写）。
+bool IsValidHeaderName(const std::string& name) {
+    if (name.empty()) {
+        return false;
+    }
+    for (char c : name) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc) != 0) {
+            continue;
+        }
+        switch (c) {
+            case '!':
+            case '#':
+            case '$':
+            case '%':
+            case '&':
+            case '\'':
+            case '*':
+            case '+':
+            case '-':
+            case '.':
+            case '^':
+            case '_':
+            case '`':
+            case '|':
+            case '~':
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief 把请求编码成一条流上的完整字节序列：HEADERS [ + DATA ]。
+ *
+ * QPACK 字段段全部交给 picohttp；这里只负责：
+ * 1. 选 GET/POST 的字段段构造函数；
+ * 2. 把自定义头以 literal-with-name 追加到字段段（仍然是 picohttp 的编码器）；
+ * 3. 用 QUIC varint 包 HEADERS/DATA 帧头。
+ */
+bool BuildRequestBytes(const Request& request, const std::string& authority,
+                       std::vector<std::uint8_t>* bytes, std::string* error) {
+    const std::string method = ToUpperAscii(request.method);
+    if (method != "GET" && method != "POST") {
+        SetError(error, "HTTP/3 client only supports GET and POST, got '" + request.method + "'");
+        return false;
+    }
+    if (request.path.empty() || request.path[0] != '/') {
+        SetError(error, "HTTP/3 request path must start with '/', got '" + request.path + "'");
+        return false;
+    }
+
+    // 自定义头先规整：小写、拒绝伪头、抽出 user-agent。
+    std::vector<std::pair<std::string, std::string>> extra_headers;
+    std::string user_agent = H3ZERO_USER_AGENT_STRING;
+    for (const auto& header : request.headers) {
+        std::string name = ToLowerAscii(header.first);
+        if (name.empty()) {
+            SetError(error, "HTTP/3 request contains an empty header name");
+            return false;
+        }
+        if (name[0] == ':') {
+            SetError(error, "HTTP/3 pseudo header '" + name + "' must not be set by the caller");
+            return false;
+        }
+        if (!IsValidHeaderName(name)) {
+            SetError(error, "HTTP/3 request contains an invalid header name '" + header.first + "'");
+            return false;
+        }
+        if (name == "user-agent") {
+            user_agent = header.second;
+        } else {
+            extra_headers.emplace_back(std::move(name), header.second);
+        }
+    }
+
+    // picohttp 的构造器按 "原始字节 + 少量固定字段" 估算大小；这里给足冗余。
+    std::size_t capacity = 64 + (request.path.size() + authority.size() + user_agent.size()) * 2;
+    for (const auto& header : extra_headers) {
+        capacity += 8 + (header.first.size() + header.second.size()) * 2;
+    }
+    std::vector<std::uint8_t> fields(capacity);
+    std::uint8_t* fields_max = fields.data() + fields.size();
+
+    std::uint8_t* last = nullptr;
+    if (method == "POST") {
+        last = h3zero_create_post_header_frame_ex(
+            fields.data(), fields_max, reinterpret_cast<const std::uint8_t*>(request.path.data()),
+            request.path.size(), nullptr, 0, authority.c_str(), h3zero_content_type_text_plain,
+            user_agent.empty() ? nullptr : user_agent.c_str());
+    } else {
+        last = h3zero_create_request_header_frame_ex(
+            fields.data(), fields_max, reinterpret_cast<const std::uint8_t*>(request.path.data()),
+            request.path.size(), nullptr, 0, authority.c_str(),
+            user_agent.empty() ? nullptr : user_agent.c_str());
+    }
+    if (last == nullptr) {
+        SetError(error, "picohttp failed to encode the HTTP/3 request header section");
+        return false;
+    }
+
+    for (const auto& header : extra_headers) {
+        last = h3zero_qpack_literal_plus_name_encode(
+            last, fields_max, reinterpret_cast<const std::uint8_t*>(header.first.data()),
+            header.first.size(), reinterpret_cast<const std::uint8_t*>(header.second.data()),
+            header.second.size());
+        if (last == nullptr) {
+            SetError(error, "picohttp failed to encode HTTP/3 header '" + header.first + "'");
+            return false;
+        }
+    }
+
+    const std::size_t field_section_length = static_cast<std::size_t>(last - fields.data());
+    bytes->clear();
+    bytes->reserve(field_section_length + request.body.size() + 24);
+    AppendVarint(*bytes, static_cast<std::uint64_t>(h3zero_frame_header));
+    AppendVarint(*bytes, field_section_length);
+    bytes->insert(bytes->end(), fields.begin(), fields.begin() + static_cast<std::ptrdiff_t>(field_section_length));
+
+    // POST 的 body 用 DATA 帧；body 为空时不发 DATA 帧（H3 允许只有 HEADERS）。
+    if (!request.body.empty()) {
+        AppendVarint(*bytes, static_cast<std::uint64_t>(h3zero_frame_data));
+        AppendVarint(*bytes, request.body.size());
+        bytes->insert(bytes->end(), request.body.begin(), request.body.end());
+    }
+
+    return true;
+}
+
+/// 连接关闭事件里的 `bytes` 是一个 8 字节大端错误码（与 QUIC transport error 一致）。
+std::uint64_t DecodeCloseCode(const std::uint8_t* bytes, std::size_t length) {
+    std::uint64_t code = 0;
+    if (bytes == nullptr) {
+        return code;
+    }
+    const std::size_t count = std::min<std::size_t>(length, 8);
+    for (std::size_t i = 0; i < count; ++i) {
+        code = (code << 8) | bytes[i];
+    }
+    return code;
+}
+
+}  // namespace
+
+struct Client::Impl {
+    /// 每个客户端双向流一个解析状态。析构自动释放 picohttp 内部缓冲。
+    struct StreamState {
+        h3zero_data_stream_state_t parser{};
+        Response response;
+        bool header_captured{false};
+        bool fin{false};
+        bool failed{false};
+        bool flow_opened{false};
+        std::string fail_reason;
+
+        StreamState() = default;
+        StreamState(const StreamState&) = delete;
+        StreamState& operator=(const StreamState&) = delete;
+        ~StreamState() { h3zero_delete_data_stream_state(&parser); }
+    };
+
+    net::http2::Transport* transport{nullptr};
+    std::unique_ptr<quic::PicoquicConnection> connection;
+    std::string sni;
+    std::string alpn;
+    bool ready{false};
+    bool closed{false};
+    std::uint64_t last_error{0};
+    std::string close_reason;
+    std::uint32_t timeout_ms{kDefaultTimeoutMs};
+    std::uint64_t last_stream_id{0};
+
+    std::map<std::uint64_t, StreamState> streams;
+    std::deque<std::uint64_t> pending;
+
+    ~Impl() {
+        // picoquic_free 会回调一次 picoquic_callback_close；此时本对象仍存活，
+        // 回调只碰 closed/last_error/close_reason，是安全的。
+        connection.reset();
+    }
+
+    static int Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
+                        std::size_t length, picoquic_call_back_event_t event,
+                        void* callback_ctx, void* stream_ctx);
+
+    void HandleStreamData(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
+                          std::size_t length, bool fin);
+    void FailStream(std::uint64_t stream_id, const std::string& reason);
+    void CaptureHeader(StreamState* stream);
+};
+
+int Client::Impl::Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
+                           std::size_t length, picoquic_call_back_event_t event,
+                           void* callback_ctx, void* /*stream_ctx*/) {
+    auto* self = static_cast<Impl*>(callback_ctx);
+    if (self == nullptr) {
+        return 0;
+    }
+
+    switch (event) {
+        case picoquic_callback_ready: {
+            if (self->ready) {
+                break;
+            }
+            self->ready = true;
+            // 先发 SETTINGS / QPACK streams，再允许上层发请求（见文件头第 2 点）。
+            const int rc = h3zero_protocol_init(cnx);
+            if (rc != 0) {
+                self->closed = true;
+                self->last_error = H3ZERO_INTERNAL_ERROR;
+                self->close_reason = "h3zero_protocol_init failed";
+            }
+            break;
+        }
+        case picoquic_callback_set_alpn:
+            if (bytes != nullptr && length > 0) {
+                self->alpn.assign(reinterpret_cast<const char*>(bytes), length);
+            }
+            break;
+        case picoquic_callback_stream_data:
+            self->HandleStreamData(cnx, stream_id, bytes, length, false);
+            break;
+        case picoquic_callback_stream_fin:
+            self->HandleStreamData(cnx, stream_id, bytes, length, true);
+            break;
+        case picoquic_callback_stream_reset:
+            self->FailStream(stream_id, "stream reset by peer");
+            break;
+        case picoquic_callback_stop_sending:
+            self->FailStream(stream_id, "peer requested stop sending");
+            break;
+        case picoquic_callback_close:
+        case picoquic_callback_application_close:
+        case picoquic_callback_stateless_reset:
+            self->closed = true;
+            self->last_error = DecodeCloseCode(bytes, length);
+            if (self->close_reason.empty()) {
+                self->close_reason = (event == picoquic_callback_application_close)
+                                         ? "connection closed by application"
+                                         : "connection closed";
+            }
+            break;
+        default:
+            break;
+    }
+    return 0;
+}
+
+void Client::Impl::FailStream(std::uint64_t stream_id, const std::string& reason) {
+    // 只关心客户端主动发起的双向流（低 2 位为 00）。
+    if ((stream_id & 0x3U) != 0) {
+        return;
+    }
+    auto it = streams.find(stream_id);
+    if (it == streams.end()) {
+        return;
+    }
+    it->second.failed = true;
+    if (it->second.fail_reason.empty()) {
+        it->second.fail_reason = reason;
+    }
+}
+
+void Client::Impl::CaptureHeader(StreamState* stream) {
+    stream->header_captured = true;
+    stream->response.status = stream->parser.header.status;
+    const char* content_type = ContentTypeName(stream->parser.header.content_type);
+    if (content_type[0] != '\0') {
+        stream->response.headers.emplace_back("content-type", content_type);
+    }
+}
+
+void Client::Impl::HandleStreamData(picoquic_cnx_t* cnx, std::uint64_t stream_id,
+                                    std::uint8_t* bytes, std::size_t length, bool fin) {
+    // 服务端控制流（3）、QPACK encoder/decoder（7/11）都是单向流，本实现不使用
+    // 动态表，直接忽略。只解析客户端发起的双向流（0, 4, 8, ...）。
+    if ((stream_id & 0x3U) != 0) {
+        return;
+    }
+
+    auto it = streams.find(stream_id);
+    if (it == streams.end()) {
+        if (!fin) {
+            return;
+        }
+        it = streams.try_emplace(stream_id).first;
+        it->second.response.stream_id = stream_id;
+    }
+    StreamState& stream = it->second;
+    if (stream.failed) {
+        return;
+    }
+
+    if (bytes != nullptr && length > 0) {
+        std::uint8_t* cursor = bytes;
+        std::uint8_t* const end = bytes + length;
+        while (cursor != nullptr && cursor < end) {
+            std::size_t available_data = 0;
+            std::uint64_t error_found = 0;
+            cursor = h3zero_parse_data_stream(cursor, end, &stream.parser, &available_data,
+                                              &error_found);
+            if (cursor == nullptr) {
+                stream.failed = true;
+                stream.fail_reason = "HTTP/3 parse failed on stream " + std::to_string(stream_id) +
+                                     ", error " + HexCode(error_found);
+                last_error = error_found;
+                // 与 picoquic demo 客户端一致：解析失败直接关连接，避免状态机继续跑。
+                (void)picoquic_close(cnx, error_found);
+                return;
+            }
+            if (available_data > 0) {
+                if (!stream.flow_opened) {
+                    stream.flow_opened = true;
+                    // DATA 帧声明长度很大时，主动放开接收窗口（demo 客户端同款处理）。
+                    if (stream.parser.current_frame_length > 0x100000ULL) {
+                        (void)picoquic_open_flow_control(cnx, stream_id,
+                                                         stream.parser.current_frame_length);
+                    }
+                }
+                stream.response.body.append(reinterpret_cast<const char*>(cursor), available_data);
+                cursor += available_data;
+            }
+        }
+    }
+
+    if (!stream.header_captured && stream.parser.header_found != 0) {
+        CaptureHeader(&stream);
+    }
+    if (fin) {
+        stream.fin = true;
+    }
+}
+
+std::unique_ptr<Client> Client::Connect(net::http2::Transport* transport, const std::string& sni,
+                                        std::string* error) {
+    if (transport == nullptr) {
+        SetError(error, "transport is null");
+        return nullptr;
+    }
+    if (sni.empty()) {
+        SetError(error, "SNI must not be empty");
+        return nullptr;
+    }
+
+    auto impl = std::make_unique<Impl>();
+    impl->transport = transport;
+    impl->sni = sni;
+
+    quic::PicoquicConfig config;
+    config.alpn = "h3";
+    config.sni = sni;
+    // 与项目现有 QUIC 封装一致：默认不校验证书（本地自签场景），生产必须打开。
+    config.verify_peer = false;
+
+    impl->connection = quic::PicoquicConnection::Connect(transport, config, error);
+    if (impl->connection == nullptr) {
+        return nullptr;
+    }
+
+    auto* cnx = static_cast<picoquic_cnx_t*>(impl->connection->NativeHandle());
+    if (cnx == nullptr) {
+        SetError(error, "picoquic connection handle is null");
+        return nullptr;
+    }
+    // 换掉 QUIC 封装的"攒字节"回调，改由本类解析 HTTP/3 帧。
+    picoquic_set_callback(cnx, &Impl::Callback, impl.get());
+
+    return std::unique_ptr<Client>(new Client(std::move(impl)));
+}
+
+Client::Client(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
+
+Client::~Client() = default;
+
+bool Client::Poll(std::string* error) {
+    Impl& state = *m_impl;
+    if (state.closed) {
+        SetError(error, state.close_reason.empty() ? "connection closed" : state.close_reason);
+        return false;
+    }
+    std::string poll_error;
+    if (!state.connection->Poll(&poll_error)) {
+        state.closed = true;
+        if (state.close_reason.empty()) {
+            state.close_reason = poll_error;
+        }
+        SetError(error, state.close_reason);
+        return false;
+    }
+    if (state.closed) {
+        SetError(error, state.close_reason.empty() ? "connection closed" : state.close_reason);
+        return false;
+    }
+    return true;
+}
+
+bool Client::Send(const Request& req, std::string* error) {
+    Impl& state = *m_impl;
+    if (state.closed) {
+        SetError(error, state.close_reason.empty() ? "connection closed" : state.close_reason);
+        return false;
+    }
+
+    // 握手未完成时先推进握手（HTTP/3 的 SETTINGS 在 ready 回调里发）。
+    const Clock::time_point deadline =
+        Clock::now() + std::chrono::milliseconds(state.timeout_ms);
+    while (!state.ready) {
+        if (state.closed) {
+            SetError(error, state.close_reason.empty() ? "connection closed" : state.close_reason);
+            return false;
+        }
+        if (Clock::now() > deadline) {
+            SetError(error, "HTTP/3 handshake timeout after " + std::to_string(state.timeout_ms) +
+                                " ms");
+            return false;
+        }
+        if (!Poll(error)) {
+            return false;
+        }
+    }
+
+    std::vector<std::uint8_t> bytes;
+    if (!BuildRequestBytes(req, state.sni, &bytes, error)) {
+        return false;
+    }
+
+    auto* cnx = static_cast<picoquic_cnx_t*>(state.connection->NativeHandle());
+    if (cnx == nullptr) {
+        SetError(error, "picoquic connection handle is null");
+        return false;
+    }
+
+    const std::uint64_t stream_id = picoquic_get_next_local_stream_id(cnx, 0);
+    auto inserted = state.streams.try_emplace(stream_id);
+    if (!inserted.second) {
+        SetError(error, "QUIC stream " + std::to_string(stream_id) + " already exists");
+        return false;
+    }
+    inserted.first->second.response.stream_id = stream_id;
+
+    // GET 与 POST 都在这一批字节里带上 FIN：请求体已经完整，不需要等对端要数据。
+    if (picoquic_add_to_stream(cnx, stream_id, bytes.data(), bytes.size(), 1) != 0) {
+        state.streams.erase(stream_id);
+        SetError(error, "picoquic_add_to_stream failed on stream " + std::to_string(stream_id));
+        return false;
+    }
+
+    state.pending.push_back(stream_id);
+    state.last_stream_id = stream_id;
+    return true;
+}
+
+bool Client::Receive(Response* resp, std::string* error) {
+    if (resp == nullptr) {
+        SetError(error, "response is null");
+        return false;
+    }
+    Impl& state = *m_impl;
+    if (state.pending.empty()) {
+        SetError(error, "no pending HTTP/3 request, call Send first");
+        return false;
+    }
+
+    const Clock::time_point deadline =
+        Clock::now() + std::chrono::milliseconds(state.timeout_ms);
+    for (;;) {
+        const std::uint64_t stream_id = state.pending.front();
+        auto it = state.streams.find(stream_id);
+        if (it == state.streams.end()) {
+            state.pending.pop_front();
+            SetError(error, "internal error: stream " + std::to_string(stream_id) +
+                                " has no parser state");
+            return false;
+        }
+        Impl::StreamState& stream = it->second;
+
+        if (stream.failed) {
+            const std::string reason = stream.fail_reason;
+            state.streams.erase(it);
+            state.pending.pop_front();
+            SetError(error, reason);
+            return false;
+        }
+        if (stream.fin) {
+            if (!stream.header_captured) {
+                state.streams.erase(it);
+                state.pending.pop_front();
+                SetError(error, "HTTP/3 stream " + std::to_string(stream_id) +
+                                    " ended without a HEADERS frame");
+                return false;
+            }
+            *resp = stream.response;
+            state.streams.erase(it);
+            state.pending.pop_front();
+            return true;
+        }
+        if (state.closed) {
+            SetError(error, state.close_reason.empty() ? "connection closed" : state.close_reason);
+            return false;
+        }
+        if (Clock::now() > deadline) {
+            SetError(error, "HTTP/3 response timeout after " + std::to_string(state.timeout_ms) +
+                                " ms on stream " + std::to_string(stream_id));
+            return false;
+        }
+        if (!Poll(error)) {
+            return false;
+        }
+    }
+}
+
+bool Client::HandshakeComplete() const noexcept {
+    return m_impl != nullptr && m_impl->ready;
+}
+
+bool Client::Closed() const noexcept {
+    return m_impl == nullptr || m_impl->closed;
+}
+
+std::string Client::Alpn() const {
+    if (m_impl == nullptr) {
+        return {};
+    }
+    if (!m_impl->alpn.empty()) {
+        return m_impl->alpn;
+    }
+    auto* cnx = static_cast<picoquic_cnx_t*>(m_impl->connection->NativeHandle());
+    if (cnx == nullptr) {
+        return {};
+    }
+    const char* negotiated = picoquic_tls_get_negotiated_alpn(cnx);
+    return negotiated == nullptr ? std::string() : std::string(negotiated);
+}
+
+std::uint64_t Client::LastStreamId() const noexcept {
+    return m_impl == nullptr ? 0 : m_impl->last_stream_id;
+}
+
+std::uint64_t Client::ConnectionError() const noexcept {
+    return m_impl == nullptr ? 0 : m_impl->last_error;
+}
+
+}  // namespace go2cpp::net::http3

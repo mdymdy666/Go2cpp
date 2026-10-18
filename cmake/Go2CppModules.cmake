@@ -300,7 +300,7 @@ if (GO2CPP_WITH_PICOQUIC)
             "GO2CPP_WITH_PICOQUIC=ON 需要同时设置 PICOQUIC_ROOT 与 PICOTLS_ROOT")
     endif()
 
-    add_library(go2cpp_quic_picoquic
+    add_library(go2cpp_quic_picoquic STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/network/quic/picoquic_connection.cpp)
     target_include_directories(go2cpp_quic_picoquic
         PRIVATE
@@ -320,6 +320,29 @@ if (GO2CPP_WITH_PICOQUIC)
     add_executable(go2cpp_picoquic_hq_client
         ${CMAKE_CURRENT_SOURCE_DIR}/example/network/picoquic_hq_client.cpp)
     target_link_libraries(go2cpp_picoquic_hq_client PRIVATE go2cpp_quic_picoquic)
+
+    # HTTP/3 客户端：QPACK 与 h3 帧全部走 picohttp（h3zero），不自研。
+    # libpicohttp-core.a 必须排在 libpicoquic-core.a 之前（静态库符号解析顺序）。
+    add_library(go2cpp_http3_picoquic STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http3/client.cpp)
+    target_include_directories(go2cpp_http3_picoquic
+        PRIVATE
+        ${PICOQUIC_ROOT}/picoquic
+        ${PICOQUIC_ROOT}/picohttp
+        ${PICOTLS_ROOT}/include)
+    target_compile_options(go2cpp_http3_picoquic PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(go2cpp_http3_picoquic
+        PUBLIC go2cpp_quic_picoquic
+        PRIVATE
+        ${PICOQUIC_ROOT}/build/libpicohttp-core.a
+        ${PICOQUIC_ROOT}/build/libpicoquic-core.a
+        ${PICOQUIC_ROOT}/build/libpicoquic-log.a
+        ${PICOTLS_ROOT}/libpicotls-core.a
+        ${PICOTLS_ROOT}/libpicotls-openssl.a
+        ${PICOTLS_ROOT}/libpicotls-minicrypto.a
+        ${PICOTLS_ROOT}/libpicotls-fusion.a
+        ssl crypto pthread)
+
 
     message(STATUS "picoquic QUIC transport: ON (picoquic=${PICOQUIC_ROOT})")
 else()
