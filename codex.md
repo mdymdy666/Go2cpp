@@ -78,14 +78,21 @@ rounds=500 时 Fiber=2 的 227~395ns 主要是 8 个 worker 的启动开销
   持锁等另一把锁 → 检测计数必须增长，释放后必须正常完成（只告警、不干预）；
 - 基准矩阵 M=1/4/8 × Fiber=2/8/64 全部 `ok`，`procs_running` 峰值 2~5。
 
-## 6. 持锁 park 检测（P1，最小版本）
+## 6. 持锁 park 检测（P1，与分层锁流协作后的最终形态）
 
-- `Task` 增加 `m_held_mutexes`（relaxed 计数）与 `held_mutex_count()`；
-- `sync::Mutex::Impl::m_owner` 记录最近一次加锁的受管 G（仅检测开启时）；
-- `SchedulerWaitBackend::Park` 入口检查：持锁数 >0 就累加
-  `HeldLockParkCount()`，并打印前 8 条 `[held-lock-park]` 告警；
-- **不 panic、不强制解锁**（与 Go 一致）；默认 Debug 开、Release 关，
-  `GO2CPP_DETECT_HELD_PARK=1/0` 或 `SetHeldLockParkDetection()` 覆盖；
+分工：检测**桩**在 `Task::park_for_scheduler()` 入口（`scheduler.cpp`，分层锁流
+实现）—— 那里覆盖 `park_wait/park_io/park_with_reason/cleanup` 全部路径；
+用户场景"持锁 read → hook → park_io"只有在那里能看到。本流提供**输入侧**：
+
+- `Task::m_held_mutexes` + `held_mutex_count()` / `note_mutex_locked/unlocked()`；
+- `sync::Mutex::Impl::m_owner` 记录最近一次加锁的受管 G（仅检测开启时），
+  Unlock 只在"解锁者 == owner"时递减，避免 Go 风格跨 G 解锁减错；
+- `SetHeldLockParkDetection()` / `HeldLockParkDetection()` 开关
+  （默认 Debug 开、Release 关，`GO2CPP_DETECT_HELD_PARK=1/0` 覆盖）；
+- `HeldLockParkCount()` 直接转发 `scheduler::mutex_held_park_total()`，
+  保持**单计数源、单日志**；
+- **不 panic、不强制解锁**（与 Go 一致；SpinMutex 的"禁止 park"另有一套
+  debug abort / release 降级语义，见 `spin_mutex.hpp`）；
 - `Mutex::LockFor(timeout, parent)` 本来就有，未重复实现。
 
 ## 7. 已知问题 / 未做
