@@ -586,8 +586,30 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
     };
 
     using DeadlineOrder = std::multimap<TimePoint, std::uint64_t>;
+    /**
+     * @brief 一条 deadline 记录：把「到期时间」与「等待节点」绑在一起。
+     *
+     * ## 定位
+     *
+     * `DeadlineOrder`（`multimap<time_point, TimerRecord>`）的元素。`register_wait`
+     * 在调用方给了 deadline 时插入；`expire_timers` 从队头扫到 `now`，把到期的
+     * 节点逐个 `claim(kTimedOut)`。
+     *
+     * ## 为什么 node 是 weak_ptr
+     *
+     * 等待节点可能在到期前就被 IO 完成或取消（**正常路径**），此时它已被回收；
+     * 强引用会让 deadline 队列把它的生命周期延长到超时为止（内存泄漏式浪费）。
+     * weak_ptr 让 `expire_timers` 能跳过已失效的条目。
+     *
+     * ## 清理
+     *
+     * `Remove` 用 `order` 迭代器 **O(1)** 从 multimap 删除（multimap 迭代器不失效）；
+     * 节点回收时也会顺手清理，避免队列里堆积大量 already-expired 的弱引用。
+     */
     struct TimerRecord {
+        /// @brief 在 `DeadlineOrder` 里的迭代器；用于 O(1) 删除。
         DeadlineOrder::iterator order;
+        /// @brief 目标等待节点；弱引用 —— 已完成/已取消的节点会被跳过。
         std::weak_ptr<WaitNode> node;
     };
 

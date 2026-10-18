@@ -270,6 +270,10 @@ struct JsonParseResult {
  * ## 为什么顺序不可交换
  * 先解析再检查深度没有意义：深文档一旦解析成功就已经在堆上，随后任意一次 `dump()`
  * 或拷贝都可能踩爆 Fiber 栈；而栈溢出不可捕获，进程会直接被杀。栅栏必须挡在入口。
+ *
+ * ## 状态机
+ * 第一步所用扫描器的 Normal / InString / Escaped 转化表见
+ * `docs/state-machines/JsonDepthScanner.md`。
  */
 inline JsonParseResult ParseJson(std::string_view text,
                                  std::size_t max_depth = kDefaultJsonMaxDepth) {
