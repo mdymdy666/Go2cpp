@@ -920,11 +920,17 @@ public:
     };
 
     struct Machine {
-        explicit Machine(MId machine_id, PId processor_id)
-            : id(machine_id), processor(processor_id) {}
+        explicit Machine(MId machine_id, PId processor_id,
+                         bool is_replacement)
+            : id(machine_id),
+              processor(processor_id),
+              replacement(is_replacement) {}
 
         MId id;
         PId processor;
+        // 补充 M 标记：spawn 时在线程启动前写入一次，之后只读。基础 M 为
+        // false，常驻到 shutdown；补充 M 在阻塞区结束后立即退休。
+        bool replacement{false};
         std::thread thread;
         std::atomic<MState> state{MState::kIdle};
         // 这些字段由对应 worker 更新，同时允许 machines() 在另一个线程
@@ -1030,7 +1036,10 @@ public:
                 std::min(requested.max_workers, requested.processor_count);
         }
         if (requested.min_workers == 0) {
-            requested.min_workers = 1;
+            // Go 风格：常驻 M 数默认等于 P。基础 M 只在 shutdown 时退出；
+            // 普通 runnable 需求仍以 P 为上限（max_workers 更大时也不会
+            // 因为 min_workers=P 而超额创建）。
+            requested.min_workers = requested.processor_count;
         }
         requested.min_workers = std::max<std::size_t>(1, requested.min_workers);
         requested.min_workers = std::min(requested.min_workers,
@@ -1058,7 +1067,8 @@ public:
     // Create one worker while mutex is held. The thread starts only after its
     // shared Machine object has been published, so snapshots and shutdown can
     // safely retain the same object even when later workers are appended.
-    bool spawn_worker_locked(Scheduler* scheduler) {
+    // is_replacement=true 表示这是为阻塞区补位的动态 M：阻塞结束后可退休。
+    bool spawn_worker_locked(Scheduler* scheduler, bool is_replacement) {
         if (!scheduler || stopping.load(std::memory_order_acquire) ||
             machines.size() >= std::numeric_limits<std::size_t>::max() ||
             active_workers.load(std::memory_order_relaxed) >=
@@ -1078,7 +1088,8 @@ public:
         }
 
         auto machine = std::make_shared<Machine>(
-            s_next_m_id.fetch_add(1, std::memory_order_relaxed), processor_id);
+            s_next_m_id.fetch_add(1, std::memory_order_relaxed), processor_id,
+            is_replacement);
         machines.emplace_back(machine);
         active_workers.fetch_add(1, std::memory_order_relaxed);
         processors[processor_id].active_machines.fetch_add(
@@ -1226,8 +1237,13 @@ public:
         }
         const auto to_add = desired - active;
         for (std::size_t i = 0; i < to_add; ++i) {
+            // 基础槽位（active < min_workers）创建的是基础 M，常驻；超过
+            // 常驻目标的都是为阻塞区补位的补充 M，随阻塞结束退休。
+            const bool replacement =
+                active_workers.load(std::memory_order_relaxed) >=
+                config.min_workers;
             try {
-                if (!spawn_worker_locked(scheduler)) {
+                if (!spawn_worker_locked(scheduler, replacement)) {
                     break;
                 }
             } catch (...) {
@@ -1701,7 +1717,7 @@ void Scheduler::start() {
     m_impl->sysmon_stop.store(false, std::memory_order_release);
     try {
         for (std::size_t i = 0; i < m_impl->config.min_workers; ++i) {
-            (void)m_impl->spawn_worker_locked(this);
+            (void)m_impl->spawn_worker_locked(this, false);
         }
         if (m_impl->config.enable_sysmon) {
             m_impl->sysmon_active.store(true, std::memory_order_release);
@@ -2924,31 +2940,42 @@ void Scheduler::leave_blocking_for(Scheduler* scheduler,
     if (scheduler == nullptr || !scheduler->m_impl || machine_id == 0) {
         return;
     }
-    std::lock_guard<std::mutex> lock(scheduler->m_impl->mutex);
-    for (const auto& machine : scheduler->m_impl->machines) {
-        if (!machine || machine->id != machine_id) {
-            continue;
-        }
-        if (machine->state.load(std::memory_order_relaxed) ==
-            MState::kBlocking) {
-            const bool detached = machine->processor_detached.exchange(
-                false, std::memory_order_acq_rel);
-            machine->blocking_since_ns.store(0, std::memory_order_release);
-            machine->blocking_task.store(0, std::memory_order_release);
-            machine->state.store(MState::kRunning,
-                                 std::memory_order_release);
-            scheduler->m_impl->blocking_workers.fetch_sub(
-                1, std::memory_order_relaxed);
-            if (detached) {
-                auto& processor = scheduler->m_impl->processors[
-                    machine->processor % scheduler->m_impl->processors.size()];
-                processor.active_machines.fetch_add(1,
-                                                    std::memory_order_acq_rel);
-                processor.state.store(PState::kRunning,
-                                      std::memory_order_release);
+    bool left_blocking = false;
+    {
+        std::lock_guard<std::mutex> lock(scheduler->m_impl->mutex);
+        for (const auto& machine : scheduler->m_impl->machines) {
+            if (!machine || machine->id != machine_id) {
+                continue;
             }
+            if (machine->state.load(std::memory_order_relaxed) ==
+                MState::kBlocking) {
+                const bool detached = machine->processor_detached.exchange(
+                    false, std::memory_order_acq_rel);
+                machine->blocking_since_ns.store(0, std::memory_order_release);
+                machine->blocking_task.store(0, std::memory_order_release);
+                machine->state.store(MState::kRunning,
+                                     std::memory_order_release);
+                scheduler->m_impl->blocking_workers.fetch_sub(
+                    1, std::memory_order_relaxed);
+                if (detached) {
+                    auto& processor = scheduler->m_impl->processors[
+                        machine->processor %
+                        scheduler->m_impl->processors.size()];
+                    processor.active_machines.fetch_add(
+                        1, std::memory_order_acq_rel);
+                    processor.state.store(PState::kRunning,
+                                          std::memory_order_release);
+                }
+                left_blocking = true;
+            }
+            break;
         }
-        break;
+    }
+    if (left_blocking) {
+        // 阻塞区结束意味着补位 M 的使命已经完成：唤醒挂起的补充 M，让它
+        // 当场退休，而不是再等一个 idle_worker_timeout。通知放在锁外，
+        // 避免被唤醒的 worker 立刻阻塞在 mutex 上。
+        scheduler->m_impl->condition.notify_all();
     }
 }
 
@@ -3039,7 +3066,8 @@ std::vector<MachineSnapshot> Scheduler::machines() const {
             machine->affinity_misses.load(std::memory_order_relaxed),
             machine->processor_detached.load(std::memory_order_acquire),
             machine->blocking_task.load(std::memory_order_acquire),
-            machine->long_syscall_count.load(std::memory_order_acquire)});
+            machine->long_syscall_count.load(std::memory_order_acquire),
+            machine->replacement});
     }
     return result;
 }
@@ -3639,27 +3667,61 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 m_impl->config.min_workers,
                 std::min(m_impl->config.max_workers, handoff_floor));
         };
+        // 基础 M 与补充 M 的回收策略不同：
+        // - 补充 M 的使命是接替被原生调用占住的 P。blocking_workers 归零
+        //   （阻塞区结束）后它已经无事可做，立即退休 —— 这是 Go 的 M 回收
+        //   语义。退休前提是「阻塞已结束」，不会因为新 G 入队而失效。
+        // - 基础 M 常驻到 shutdown。只有显式打开 allow_idle_shrink 时才
+        //   保留历史的空闲缩容行为（下限 min_workers）。
+        const bool replacement = machine->replacement;
+        const bool idle_shrink = m_impl->config.allow_idle_shrink;
         const auto worker_floor = required_workers();
         const bool can_shrink =
+            idle_shrink &&
             m_impl->active_workers.load(std::memory_order_relaxed) >
-            worker_floor;
-        const auto idle_timeout = can_shrink
-                                    ? m_impl->config.idle_worker_timeout
-                                    : m_impl->config.idle_wait;
-        const bool woke = m_impl->condition.wait_for(lock, idle_timeout, [this] {
-            return m_impl->stopping.load(std::memory_order_acquire) ||
-                   m_impl->runnable.load(std::memory_order_acquire) != 0;
-        });
+                worker_floor;
+        // 补充 M 用 idle_worker_timeout 复查「阻塞是否结束」；基础 M 不
+        // 用它触发退出，只沿用 idle_wait 的空闲等待节奏。
+        const auto idle_timeout = (replacement || can_shrink)
+                                      ? m_impl->config.idle_worker_timeout
+                                      : m_impl->config.idle_wait;
+        const bool woke = m_impl->condition.wait_for(
+            lock, idle_timeout, [this, replacement, idle_shrink] {
+                if (m_impl->stopping.load(std::memory_order_acquire) ||
+                    m_impl->runnable.load(std::memory_order_acquire) != 0) {
+                    return true;
+                }
+                // 阻塞区结束时立刻唤醒补充 M 做退休判定，避免等满一个
+                // idle_worker_timeout 才回收。
+                return replacement && !idle_shrink &&
+                       m_impl->blocking_workers.load(
+                           std::memory_order_acquire) == 0;
+            });
+        // 退休判定与计数修改仍在同一个持锁临界区内：wait_for 返回后锁没有
+        // 释放，因此这里的 runnable/blocking 观测即最终状态，不会出现
+        // 「判定空闲后、置 kStopping 前」被新 G 插队的窗口。
         const auto current_floor = required_workers();
-        if (!woke && can_shrink &&
-            m_impl->runnable.load(std::memory_order_acquire) == 0 &&
-            !m_impl->stopping.load(std::memory_order_acquire) &&
-            m_impl->active_workers.load(std::memory_order_relaxed) >
-                current_floor) {
+        const auto runnable_now =
+            m_impl->runnable.load(std::memory_order_acquire);
+        const auto blocking_now =
+            m_impl->blocking_workers.load(std::memory_order_acquire);
+        const bool stopping_now =
+            m_impl->stopping.load(std::memory_order_acquire);
+        bool retire = false;
+        if (!stopping_now && runnable_now == 0) {
+            if (replacement && !idle_shrink) {
+                // 补充 M：阻塞声明归零且 sysmon 解绑计数归零，才说明它不再
+                // 有「替代被占住的 P」的职责。
+                retire = blocking_now == 0 &&
+                         m_impl->detached_machine_count_locked() == 0;
+            } else if (can_shrink && !woke) {
+                retire = m_impl->active_workers.load(
+                             std::memory_order_relaxed) > current_floor;
+            }
+        }
+        if (retire) {
             machine->state.store(MState::kStopping, std::memory_order_release);
-            // Reserve the retirement while still holding mutex. Otherwise
-            // several idle M's can all observe active > min and shrink below
-            // the configured floor before their epilogues run.
+            // 持锁减计数：多个补充 M 同时退休时不会一起跌破常驻底线。
             m_impl->active_workers.fetch_sub(1, std::memory_order_relaxed);
             own_processor.active_machines.fetch_sub(1,
                                                     std::memory_order_relaxed);

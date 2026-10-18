@@ -55,12 +55,18 @@ fcontext 恢复仍要求固定父 Fiber 对象存活。Ready 子 Fiber 尚未进
 
 ## 动态 M 策略
 
-`min_workers` 是保留底线。普通队列压力只把 M 增长到 P 有界上限；启用
-`allow_worker_oversubscription` 时，每个活动 `BlockingRegion` 可申请一个替代 M，
-但不超过 `max_workers`。关闭该选项即严格 P 上限。空闲 M 等待
-`idle_worker_timeout` 后在 admission mutex 下预留退休名额，并各减少一次全局和
-P-local 计数；死亡记录在锁外 join 后从快照删除。Task class 只影响有限扫描顺序，
-窃取始终可用，不会因亲和性导致饥饿。
+`min_workers` 是常驻「基础 M」数量（默认等于 P）。普通队列压力只把 M 增长到 P
+有界上限；启用 `allow_worker_oversubscription` 时，每个活动 `BlockingRegion`
+可申请一个「补充 M」，但不超过 `max_workers`。关闭该选项即严格 P 上限。
+
+回收策略：基础 M 常驻到 shutdown，不会因为空闲而退出；补充 M 的退休前提是
+`blocking_workers == 0`（阻塞区结束）且没有可运行 G，`leave_blocking()` 会
+唤醒等待中的补充 M 立即复查。退休判定与 `active_workers` / P-local 计数修改
+在同一个 admission mutex 临界区内完成，因此不存在「判定空闲后、置
+kStopping 前」被新 G 插队的窗口。显式设置 `allow_idle_shrink = true` 可恢复
+历史的「空闲 `idle_worker_timeout` 后缩到 `min_workers`」行为。死亡记录在锁外
+join 后从快照删除。Task class 只影响有限扫描顺序，窃取始终可用，不会因亲和性
+导致饥饿。
 
 ### sysmon 长系统调用交接
 
@@ -71,8 +77,8 @@ P-local 计数；死亡记录在锁外 join 后从快照删除。Task class 只�
 从所属 P 的 attached M 计数中扣除一次，并为该长调用申请一个替代 M。替代槽按
 `min_workers + detached_count` 计算，仍受 `max_workers` 和严格模式限制，不会因为
 整机 P 数量很大而无条件创建 P 个线程。原 M 仍在自己的 C++ 调用栈中运行，返回时
-`BlockingRegion` 原子地清除标记并把 M 重新计入 P；在此之前替代 M 不会被 idle timeout
-回收。
+`BlockingRegion` 原子地清除标记并把 M 重新计入 P；在此之前补充 M 不会被回收
+（退休只由阻塞区结束触发）。
 
 这是安全的“逻辑解绑”，不是 Go runtime 的精确 `_Psyscall` 交接，也不会从另一个
 线程强行切断/迁移任意 C++ 栈。未 Hook、未包在 `BlockingRegion` 中的阻塞调用不可被

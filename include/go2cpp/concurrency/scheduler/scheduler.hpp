@@ -195,13 +195,24 @@ struct SchedulerConfig {
     // 为 0 时启动一个初始 worker。max_workers 为 0 时，在允许超额调度的
     // 情况下上限归一化为 2*P；普通可运行任务仍以 P 为上限，阻塞区可以
     // 使用额外 worker。
+    // 常驻「基础 M」数量。为 0 时默认等于 processor_count（Go 风格：
+    // P 数量的常驻 M；仍受 max_workers 封顶）。补充 M 只用于 BlockingRegion
+    // 期间接管被原生调用占住的 P，不参与常驻计数。
     std::size_t min_workers = 0;
+    // 补充 M 的阻塞结束检查周期。基础 M 不再因为空闲而退出，因此这个值
+    // 只决定补充 M 在等待唤醒时多久复查一次 blocking_workers 是否归零；
+    // leave_blocking() 会主动 notify，正常情况下无需等满一个周期。
     std::chrono::milliseconds idle_worker_timeout{250};
     std::size_t fiber_stack_size = 0;
     std::size_t task_affinity_budget = 4;
     // 调用方声明原生阻塞区时，允许 M 的数量超过 P。默认值保持 worker
     // 池弹性；若部署要求严格的一 M 对一 P 上限，可以关闭此开关。
     bool allow_worker_oversubscription = true;
+    // 是否允许「基础 M」在空闲超过 idle_worker_timeout 后退出（历史行为）。
+    // 默认 false：基础 M 常驻到 shutdown，只有补充 M 会在 blocking_workers
+    // 归零后立即退休，从而消除「空闲判定与状态切换之间新 G 入队」的窗口。
+    // 代价是空载时保留 min_workers（默认 P）个 OS 线程。
+    bool allow_idle_shrink = false;
     // Go sysmon 风格的阻塞监控。它只观察已声明的 BlockingRegion/Hook
     // 边界，不会从另一个线程强行切断任意 C++ 调用栈。
     bool enable_sysmon = true;
@@ -257,6 +268,9 @@ struct MachineSnapshot {
     bool processor_detached{false};
     GId blocking_task{0};
     std::uint64_t long_syscall_count{0};
+    // 该 M 是否为「补充 M」：为阻塞区补位的动态 worker。补充 M 在
+    // blocking_workers 归零后立即退休；基础 M 恒为 false 且常驻到 shutdown。
+    bool replacement{false};
 };
 
 // 调度器热点计数器。所有时间均为 steady_clock 纳秒，采用累计值，便于

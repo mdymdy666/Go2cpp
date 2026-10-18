@@ -576,7 +576,8 @@ close、WaitAny/WaitMany 和 hook 等场景；Debug/Werror 和 ASan 只作为正
   累计纳秒、本地队列命中和窃取次数；高负载示例会打印这些指标。
 - 硬件：新增 SchedulerConfig::pin_workers_to_cpu，Linux 上可将 M 绑定到
   对应 P 的 CPU。默认关闭，避免覆盖宿主进程或容器的既有 cpuset 策略；
-  min_workers 仍保证至少一个初始 M 不因空闲回收而消失。
+  基础 M（min_workers，默认 P）常驻到 shutdown，不因空闲回收；只有补充 M
+  在阻塞区结束后退休。
 
 Release 高负载结果（50,000 个任务各 4 次 yield、8,000 个计算任务、
 2,000 Fiber 与 32 线程混合锁、32,000 条 Channel 消息、4,096 FD×25 轮

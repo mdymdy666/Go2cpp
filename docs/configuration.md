@@ -17,14 +17,14 @@
 | 参数 | 默认值 | 允许范围 | 说明 |
 | --- | ---: | --- | --- |
 | `processor_count` | `0` | `0` 或 `1..32` | P 数量；0 使用硬件并发数。 |
-| `min_workers` | `0` | `0` 或 `1..32` | 最小 M 数量；0 使用运行时默认值 1。 |
+| `min_workers` | `0` | `0` 或 `1..32` | 常驻基础 M 数量；0 使用 `processor_count`（受 `max_workers` 封顶）。 |
 | `max_workers` | `0` | `0` 或 `1..32` | 最大 M 数量；0 按 P 和阻塞区策略计算。 |
 | `local_queue_limit` | `256` | `1..1048576` | 每个 P 的本地队列容量。 |
 | `fiber_stack_size` | `0` | `0` 或 `16384..67108864` 字节 | Fiber 初始栈；0 使用后端默认值。 |
 | `task_affinity_budget` | `4` | `0..1048576` | 同类任务优先留在最近 P 的次数预算。 |
 | `fiber_bin_capacity` | `32` | `0..4096` | 每个 M 缓存的已完成 Fiber 数量。 |
 | `idle_wait_ms` | `10` | `1..86400000` | 空闲 M 等待新任务的周期。 |
-| `idle_worker_timeout_ms` | `250` | `1..86400000` | 空闲 M 回收等待时间。 |
+| `idle_worker_timeout_ms` | `250` | `1..86400000` | 补充 M 的阻塞结束复查周期；阻塞区结束会主动唤醒补充 M。 |
 | `sysmon_interval_ms` | `10` | `1..86400000` | sysmon 检查周期。 |
 | `long_syscall_threshold_ms` | `50` | `1..86400000` | 已声明阻塞区的长调用阈值。 |
 

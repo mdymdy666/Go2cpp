@@ -11,6 +11,131 @@
 > `example/{concurrency,network,logging,tools}/`。引用旧路径时请按当前结构
 > 换算；这些条目不改写，以保留演进过程。
 
+# 2026-10-18：分层锁 `sync::SpinMutex` + 持锁 park 契约检测
+
+## 1. 背景
+
+Go2Cpp 是协作式调度，`read` / `write` / `connect` / `accept` / `sleep` 全部被
+Hook 成 park 点。持锁 park 是 Go 里不存在的死锁形态：
+
+```
+G1: Lock(A) -> read(fd) -> park     // 持着 A 走了
+G2: Lock(B) -> read(fd) -> park     // 持着 B 走了
+G3: Lock(A) -> 等 G1 释放 A -> 永久死锁（fd 可能永不可读）
+```
+
+因此把锁分成两类：`sync::Mutex`（临界区可以 park）与 `sync::SpinMutex`
+（临界区禁止 park，只做纯计算）。`SpinMutex` **不是自旋锁**：协作式下自旋
+比 park 更糟；它内部完全复用 `sync::Mutex`，只增加契约检查。
+
+## 2. 改动
+
+### 新增
+
+- `include/go2cpp/concurrency/spin_mutex.hpp`：纯头文件 `sync::SpinMutex`
+  - `Lock` / `TryLock` / `LockFor` / `TryLockFor` / `Unlock` / `IsLocked` / `Guard`；
+  - `Lock` 成功后 `CurrentG()->no_park_depth++`，`Unlock` 先递减再释放底层锁；
+  - 记录加锁时的 G（`shared_ptr<Task>`），跨 G 解锁也能精确递减；
+  - 普通线程上无 G 可记，退化为普通 `Mutex`（只多一次 TLS 读）。
+- `tests/concurrency/test_spin_mutex.cpp`：9 类场景（普通线程、随机嵌套、
+  纯计算、read park 的 debug abort / release 降级、普通 Mutex 计数、
+  嵌套内层优先、跨 G 解锁、嵌套深度、LockFor 超时、临界区外 park 不误报）。
+- `benchmarks/spin_mutex_benchmark.cpp`：native × 1/2/4/8 线程与
+  GMP（workers × 2 G）两种口径，SpinMutex vs Mutex vs std::mutex。
+- `docs/concurrency-park-points.md`：park 点清单（会 park / 不 park 但阻塞 M /
+  纯计算）+ 检测机制 + 代码审查清单。
+
+### 修改
+
+- `include/go2cpp/concurrency/scheduler/scheduler.hpp`
+  - `Task::no_park_depth()` / `enter_no_park_section()` / `leave_no_park_section()`；
+  - 字段 `std::atomic<std::uint32_t> m_no_park_depth{0}`；
+  - namespace 级 `spin_mutex_park_degrade_total()` / `mutex_held_park_total()`。
+- `src/concurrency/scheduler.cpp`
+  - 检测桩在 `Task::park_for_scheduler()` **入口**（状态转换之前）：
+    - `no_park_depth > 0`：debug（`GO2CPP_DEBUG_LOCKS` 或未定义 `NDEBUG`）
+      打印 G id / 深度 / 栈并 `std::abort()`；release 降级为 Mutex 语义 +
+      计数 + 一次性警告；
+    - `held_mutexes > 0 && no_park_depth == 0`：普通 Mutex 持锁 park，
+      只计数（debug 下一次性日志），**不 abort**；
+    - 内层优先：`SpinMutex` 的「禁止」覆盖普通 Mutex 的「告警」。
+- `tests/test_main.cpp`：注册 `spin_mutex` 模块 + `GO2CPP_SPIN_MUTEX_CHILD`
+  子进程分派（fork + exec 验证 SIGABRT）。
+- `cmake/Go2CppTests.cmake`：加入测试源文件与 benchmark target（**不注册进
+  ctest**，保持 113 计数）。该文件与另一条工作流并发修改，合并以父任务为准。
+
+**未改** `src/concurrency/sync.cpp`（另一条工作流占用）。普通 `Mutex` 的
+`held_mutex_count` / `note_mutex_locked` / `note_mutex_unlocked` 复用其已有
+实现（X-37 加入），本任务只在 park 入口读取该计数。
+
+## 3. 检测桩位置
+
+`src/concurrency/scheduler.cpp` 的 `Task::park_for_scheduler()` 第一段
+（状态转换与 `m_transition_mutex` 之前）。所有 park 路径
+（`park_wait` / `park_io` / `park_with_reason` / `park_wait_for_cleanup`）
+都汇聚到这里，因此一处检查覆盖全部协作点。
+
+## 4. 验证
+
+- Release 全量：`ctest --test-dir build-quality` → **113/113**（50.03s，14:52）。
+- Debug（`build-debug-locks`）：
+  - 单独跑 `GO2CPP_TEST_FILTER=spin_mutex`：子进程输出
+    `[FATAL] G1 parked inside a SpinMutex critical section (no_park_depth=1)`
+    + 调用栈（`Task::park_for_scheduler` ← `Scheduler::park_io` ←
+    `IOManager::wait` ← Hook `read`）+ SIGABRT；
+  - `Mutex` 套 `SpinMutex` 的 nested 场景同样 abort（内层优先）。
+- Release 降级：read 场景不崩，`scheduler::spin_mutex_park_degrade_total()`
+  增长；普通 Mutex 场景只增长 `mutex_held_park_total()`。
+- 复现命令：
+  ```
+  GO2CPP_TEST_FILTER=spin_mutex ./build-quality/go2cpp_tests
+  GO2CPP_TEST_FILTER=spin_mutex ./build-debug-locks/go2cpp_tests
+  timeout 120 ./build-quality/go2cpp_spin_mutex_benchmark 1,2,4,8
+  ```
+
+## 5. 压测（Release，taskset 0-7，WSL2）
+
+fiber 口径（workers × 2 G，5000 rounds/fiber，5 次中位数）：
+
+| workers | SpinMutex ns/op | Mutex ns/op | 差异 |
+|---:|---:|---:|---:|
+| 1 | 108.9 | 108.9 | 0% |
+| 2 | 441.6 | 384.5 | +15% |
+| 4 | 433.8 | 408.2 | +6% |
+| 8 | 548.7 | 505.4 | +9% |
+
+native 口径（1/2/4/8 线程）SpinMutex 比 Mutex 多约 5~15ns/op 固定开销
+（`current_task_ptr()` TLS 读 + owner 判空），高争用下两者都出现长尾
+（Mutex 实测最高 29.7µs/op，SpinMutex 23.6µs/op），说明尾延迟来自共用的
+FIFO handoff，而不是契约计数。WSL2 的 loadavg 不可信，测量时记录
+`procs_running`；数据仍有噪声，未做 CPU 隔离，不能当作硬基线。
+
+## 6. 已知边界 / 漏洞
+
+1. **跨线程无同步解锁**：`SpinMutex` 用 `shared_ptr<Task>` 记录 owner，
+   跨 G 解锁依赖所有权移交本身携带的 happens-before；若完全无同步地跨线程
+   解锁，锁本身也不安全（C++ 数据竞争）。
+2. **普通线程不受检查**：没有受管 G 时 `no_park_depth` 无处记录，
+   `SpinMutex` 退化为 `Mutex`。
+3. **release 降级后不再诊断**：同一进程内只打印一次警告，后续只计数；
+   长跑服务里可能掩盖重复违规，需要监控计数器。
+4. **普通 Mutex 计数依赖开关**：`sync::SetHeldLockParkDetection`（默认
+   Debug 开、Release 关）。关闭时 `held_mutex_count` 恒为 0，park 入口
+   不会计数。
+5. **计数器是进程级且不重置**：测试断言用前后差值；长期运行时需做速率
+   而不是总量监控。
+6. **`*_f` 不触发检查**：直调 libc 会阻塞整个 M，契约检查看不到。
+7. **G 生命周期**：`no_park_depth` 存在 Task 上，G 结束后计数无意义；
+   锁对象若比 G 活得更久，owner `shared_ptr` 会延长 Task 生命周期到解锁。
+
+## 7. 后续状态
+
+- 待父任务合并 `cmake/Go2CppTests.cmake`（本任务与 `08372355` 并发修改）。
+- 若后续要把普通 `Mutex` 的自动计数下沉/迁移，保持
+  `Task::held_mutex_count()` 接口不变，park 入口无需改动。
+- 全量 ctest 仍为 113 项；本任务未新增 ctest 条目（测试挂在 `go2cpp_tests`
+  的 `spin_mutex` 模块下）。
+
 # ★ 2026-10-18（X-37）：sync::Mutex Fiber park/wake 重设计（64 Fiber 91.9µs → 0.60µs）
 
 ## 1. 基线（改动前，5 次中位数，rounds/fiber=500，`taskset -c 0-7`）
@@ -9878,3 +10003,66 @@ fail_slot / shutdown。新增复现器
   未注册 ctest，不影响测试。审计报告已更新
   `docs/concurrency_audit_2026-10-18.md`（性能表取三轮中位数：
   channel 往返 58.2、future hot 29.2、WaitRead 23.3µs vs epoll 7.4µs）。
+
+# 2026-10-18：动态 worker 回收改为「阻塞结束后立即回收」
+
+## 1. 背景
+
+回收策略此前是：任意 M 空闲超过 `idle_worker_timeout`（默认 250ms）后退出，
+下限是 `min_workers`（默认 1）。问题有二：
+
+- 收益极小（省一个 OS 线程），风险极大：判定 `runnable == 0` 与置
+  `MState::kStopping` 之间若新 G 入队，退出路径就把一个「本来要跑活」的 M
+  拆掉了；这与刚修过的 `m_execution_claim` / `m_run_claim` 属同一类窗口。
+- 与 Go 的语义相反：Go 回收 M 的前提是「M 的阻塞调用已经返回」，而不是
+  「M 闲了一会儿」。空闲 M 随时可能被分配新 G，不构成可回收的稳定状态。
+
+## 2. 改动
+
+- `SchedulerConfig` 新增 `allow_idle_shrink`（默认 `false`）。`false` 时基础 M
+  常驻到 shutdown；`true` 恢复历史空闲缩容（下限 `min_workers`）。
+- `normalize()`：`min_workers == 0` 时默认取 `processor_count`（仍受
+  `max_workers` 封顶）。即默认常驻 M 数 = P，与 Go 的 P 数量常驻一致。
+- `Impl::Machine` 新增 `replacement` 标记；`spawn_worker_locked(scheduler,
+  is_replacement)` 在创建时决定：`active_workers >= min_workers` 的槽位是
+  「补充 M」。
+- `worker_loop` park 分支改为双策略：
+  - 补充 M：`blocking_workers == 0 && detached == 0 && runnable == 0` 时退休；
+    等待谓词包含 `blocking_workers == 0`，`leave_blocking()` 主动
+    `notify_all`，阻塞区结束当场回收。
+  - 基础 M：只有 `allow_idle_shrink=true` 才参与空闲缩容。
+  - 退休判定与 `active_workers` / `active_machines` 递减在同一个持锁临界区
+    内完成（比「退出前再确认一次」更强：观测即最终状态）。
+- `MachineSnapshot` 暴露 `replacement`，便于验证基础/补充 M 的分布。
+- 文档：`docs/scheduler.md`、`docs/configuration.md`、`docs/compatibility.md`、
+  `docs/testing.md`、`go2cpp.ini` 注释同步。
+
+## 3. 验证
+
+新增 `tests/concurrency/test_worker_lifecycle.cpp` +
+`scripts/run_worker_lifecycle_test.sh`（不注册 ctest，保持 113 计数）：
+
+- 场景 1：无 BlockingRegion，1000 万次计算 + 500ms 空闲，采样 239 次
+  worker min=max=4（P=4），machines 全部 `replacement=false`。
+- 场景 2：单个 read_f 1 秒：4 → 5 → 4（阻塞期间保持 5，结束后立即回落）。
+- 场景 3：10 个并发 read_f：4 → 14 → 4。
+- 场景 4：read_f 期间 2000 个短任务，并发峰值 4（3 个基础 + 1 个补充），无饿死。
+- 场景 5：仍有补充 M 时 `shutdown_for(10s)` 返回 true，worker 归零。
+- 场景 7：100 轮 × 10 个并发 read_f（共 1000 次），峰值 14，每轮收尾回 4。
+- 场景 8：`allow_idle_shrink=true` + `min_workers=1`：1 → 4 → 1，历史行为可用。
+- 场景 6：随机交错 spawn/BlockingRegion 120 轮 556 个任务，worker 始终
+  ≤ max_workers，最终回到 P，`runnable == 0`。
+- 连续 5 次运行：每次 2004 checks、0 failures。
+- 全量 ctest：**113/113**（17.64s，Release，build-quality）。
+
+## 4. 已知风险 / 未覆盖
+
+- `allow_idle_shrink` 尚未接入 ini/config 模块（只有 C++ API 可配）。
+- 默认 `min_workers = P` 意味着空载常驻 P 个 OS 线程（Go 也常驻 P 个 M）；
+  线程数极多或内存受限的嵌入场景可显式调小 `min_workers`（此时基础 M 数
+  就是该值，不再是 P）。
+- `max_workers` 默认 2P，并发阻塞数超过 P 时补充 M 会被 `max_workers` 截断；
+  需要更多并发阻塞要显式放大 `max_workers`。
+- 未跑 TSAN 全量；新增字段 `Machine::replacement` 为普通 bool（spawn 时在线程
+  启动前写入、之后只读），`active_workers`/`active_machines` 仍在同一把锁内成对
+  修改。
