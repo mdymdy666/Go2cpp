@@ -253,9 +253,21 @@ inline std::int64_t SearchFloat64s(const std::vector<double>& values, double tar
  * @note Go 的 `sort.Reverse(data)` 返回包装后的 `Interface`；C++ 里没有接口值，
  *       因此改为「比较器装饰器」，用法：`Sort(v, ReverseLess<std::less<int>>{})`。
  */
+/**
+ * ## 定位
+ *
+ * `sort.Reverse` 的 C++ 替身：把任意比较器取反后交给 `Sort` / `Stable` /
+ * `Search` 等模板。当前仓库内没有调用方，供 Go 代码转译使用。
+ *
+ * ## 不变量
+ *
+ * - 若 `less` 是严格弱序，则 `ReverseLess` 也是严格弱序（等价类不变、方向反转），
+ *   因此可以安全地传给 `std::sort` / `std::stable_sort` / `std::is_sorted`。
+ * - `less` 按值持有；有状态的比较器会被复制，修改原对象不会影响已构造的装饰器。
+ */
 template <typename Less>
 struct ReverseLess {
-    Less less{};
+    Less less{};  ///< 被装饰的比较器；只读，由 operator() 以 (right,left) 顺序调用
     template <typename T>
     bool operator()(const T& left, const T& right) const {
         return less(right, left);

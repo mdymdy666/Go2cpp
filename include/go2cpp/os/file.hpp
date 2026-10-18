@@ -93,6 +93,38 @@
  * - **符号链接 / 权限 / 属主**：`Stat` 透传 `struct stat`，但没有 Lua 式的便捷封装。
  * - **Windows**：本模块假设 POSIX（`syscall`/`fstat`/`pread`），未做平台抽象。
  */
+/**
+ * ## 模块定位（补充）
+ *
+ * `go2cpp::os::File` 是**普通文件**的 RAII 句柄，位于调度器可见范围之外：
+ * `Read`/`Write`/`Sync` 走裸 `syscall`，不注册 epoll、不 park Fiber、也不经过
+ * `FdManager`。上游调用方是 `tests/os/test_os_file.cpp`、examples 与
+ * `os::ReadFile`/`WriteFile` 便利函数；`config` 的 `SaveToFile` 走的是
+ * `std::ofstream + rename`，不经过本类。
+ *
+ * ## 本文件定义什么
+ *
+ * - `OsError`：稳定的错误码集合（尤其 `kIsSocket`/`kNotRegularFile`）；
+ * - `FileStatus` + `ToString`：错误码 + errno 的轻量结果；
+ * - `OpenFlag` 与 `operator|`：`open(2)` 标志的语义化别名；
+ * - `File`：可移动不可复制的句柄，**只接受普通文件**；
+ * - `ReadFile`/`WriteFile`、环境变量、命令行参数等便利函数。
+ *
+ * ## 阅读建议
+ *
+ * 必须先读文件头「一、与 Hook / FdManager 的边界结论」：它解释了为什么文件
+ * IO 要绕过 Hook、为什么 `Adopt` 必须拒绝 socket/FIFO。然后看 `OsError::
+ * kNotRegularFile` 的 fd 类型表，最后看 `File` 的状态机（`docs/state-machines/
+ * File.md`）。
+ *
+ * ## 边界与陷阱
+ *
+ * - **只接受 `S_ISREG`**：FIFO/pipe/字符设备/eventfd/timerfd/signalfd 的 read
+ *   会真阻塞，而本类绕过 Hook，会把整个 worker 线程卡死（本地 DoS）；
+ * - `Open` 内部先加 `O_NONBLOCK` 再 `fstat`：否则打开 FIFO 会卡在 `open` 里，
+ *   根本到不了类型校验；普通文件上该位是 no-op；
+ * - `fsync`/`Truncate` 会真实等待磁盘/改变文件长度，热路径上需自行评估。
+ */
 #pragma once
 
 #include <cstddef>
@@ -149,8 +181,17 @@ enum class OsError : std::uint8_t {
 const char* ToString(OsError error) noexcept;
 
 /** @brief 带错误码的结果。 */
+/**
+ * ## 定位
+ * 被 `File::Open`/`Create`/`Adopt`/`Truncate` 与 `ReadFile`/`WriteFile` 返回；
+ * `system_error` 保留 errno，便于上层区分 ENOENT/EACCES/EFBIG 等具体原因。
+ *
+ * ## 不变量
+ * - `code == kOk` 时 `system_error` 无意义（通常为 0）；
+ * - `ok()` 与 `operator bool` 只看 `code`，不检查 `system_error`。
+ */
 struct FileStatus final {
-    OsError code{OsError::kOk};
+    OsError code{OsError::kOk};  ///< 主错误码；所有返回 FileStatus 的函数写入，ok()/operator bool 只读取它
     /// 失败时的 `errno`（0 表示不适用）。
     int system_error{0};
 
@@ -183,6 +224,27 @@ inline OpenFlag operator|(OpenFlag a, OpenFlag b) noexcept {
  *
  * @warning 本类**只接受普通文件**。`Adopt` 一个 socket fd 会返回 `kIsSocket`，
  *          因为绕过 Hook 的读写会让 socket 阻塞整个 M 线程（见 1.4）。
+ */
+/**
+ * ## 定位
+ * 面向业务代码的**普通文件**句柄：`config` 之外的配置/日志/资源文件读写可直接
+ * 使用；测试见 `tests/os/test_os_file.cpp`。它不参与协程调度，也不与
+ * `FdManager` 的 socket 生命周期机制交互。
+ *
+ * ## 生命周期与线程模型
+ * - 创建：`Open`/`Create`/`Adopt` 成功后才持有 fd；默认构造是关闭态；
+ * - 销毁：析构调用 `Close()`；`m_owned == false` 时只放弃引用、不关闭 fd；
+ * - 线程模型：**非线程安全**，同一个 `File` 不应被多线程并发读写；`ReadAt`/
+ *   `WriteAt` 不改变文件偏移，可配合多个句柄做并发读，但需调用方自行同步。
+ *
+ * ## 状态机
+ * 有 Closed / OpenOwned / OpenBorrowed 三个状态，状态转化表见
+ * `docs/state-machines/File.md`（触发函数：`Open`/`Adopt`/移动构造/`Close`）。
+ *
+ * ## 不变量
+ * - `m_fd >= 0` 时句柄可用；`m_fd == -1` 时 `m_owned` 必为 false；
+ * - `m_owned == true` 时，析构或 `Close` 恰好关闭一次 fd；
+ * - 持有有效 fd 的对象只可能是普通文件（`S_ISREG`）。
  */
 class File final {
 public:
@@ -311,9 +373,9 @@ public:
     int last_error() const noexcept { return m_last_error; }
 
 private:
-    int m_fd{-1};
-    bool m_owned{false};
-    int m_last_error{0};
+    int m_fd{-1};  ///< 持有的 fd，-1 表示关闭；Open/Adopt/移动赋值写入，Close 置 -1，fd()/valid() 读取
+    bool m_owned{false};  ///< 是否拥有 fd（析构/Close 负责关闭）；Adopt 的 take_ownership 决定，移动时随 fd 转移
+    int m_last_error{0};  ///< 最近一次失败的 errno，0 表示成功；各 IO 函数写入，last_error() 读取
 };
 
 // ---------------------------------------------------------------------------

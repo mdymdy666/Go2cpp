@@ -6,6 +6,30 @@
  * `dir.hpp` 顶部 —— 一句话：`HookOp` 里没有 `opendir`/`readdir`/`getdents`，
  * 它们不会被 Hook 拦到等待路径上，所以直接用 libc 更简单也更快（能用 `d_type`）。
  */
+/**
+ * ## 模块定位（补充）
+ *
+ * `os` 目录能力的实现层：被 `tests/os/test_os_dir.cpp`、examples 与后续的
+ * 配置目录巡检调用；向下直接用 libc `opendir/readdir/mkdir/unlink/readlink/
+ * symlink/stat/lstat`，只有 `SetTimes` 走 `SYS_utimensat`。
+ *
+ * ## 本文件定义什么
+ *
+ * - `ReadDir`：一次目录枚举，按 `d_type` 填 `DirEntry`，跳过 `.`/`..`；
+ * - `MkdirAll`/`RemoveAll`：递归建/删，语义对齐 `mkdir -p`/`rm -rf`；
+ * - `Readlink`（动态扩容）/`Symlink`/`SetTimes`/`StatPath`。
+ *
+ * ## 阅读建议
+ *
+ * 先看 `ReadDir` 的 errno 归零时机（`readdir` 用 nullptr 同时表示 EOF 和错误），
+ * 再看 `RemoveAll` 的「先收集子项再递归删除」，最后看 `Readlink` 的翻倍重试。
+ *
+ * ## 边界与陷阱
+ *
+ * - `d_name` 指向 dirent 内部缓冲，必须立即拷贝；
+ * - `RemoveAll` 用 `lstat`：符号链接只删链接本身，不递归进目标；
+ * - `MkdirAll` 不清理中途已创建的目录（与 `mkdir -p` 一致）。
+ */
 #include "go2cpp/os/dir.hpp"
 
 #include <dirent.h>
@@ -54,6 +78,16 @@ FileStatus Fail(OsError code, int err, std::string* error, const std::string& wh
 // ReadDir
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief 列出一个目录下的条目（不递归、不排序、跳过 `.`/`..`）。
+ *
+ * ## 步骤
+ * step1. 校验输出指针与路径，清空结果；
+ * step2. `opendir`；失败返回 `kOpenFailed` 并保留 errno；
+ * step3. 循环 `readdir`：名字立即拷贝，按 `d_type` 填类型标记；
+ * step4. `DT_UNKNOWN` 只置 `type_unknown`，不自动补 `lstat`（避免每项多一次 syscall）；
+ * step5. 结束后用 errno 区分 EOF 与读取错误；出错时清空结果再返回。
+ */
 FileStatus ReadDir(const std::string& path, std::vector<DirEntry>* out,
                    std::string* error) {
     if (out == nullptr) {
@@ -69,6 +103,7 @@ FileStatus ReadDir(const std::string& path, std::vector<DirEntry>* out,
         return Fail(OsError::kOpenFailed, errno, error, "ReadDir 打开目录失败: " + path);
     }
 
+    // step3: 必须在循环前清零 errno，否则会继承上一次调用的残留值
     // `readdir` 出错与"读完了"都返回 nullptr，靠 errno 区分。
     // 必须在循环前清零，否则会把上一次调用的残留 errno 当成错误。
     errno = 0;
@@ -110,6 +145,7 @@ FileStatus ReadDir(const std::string& path, std::vector<DirEntry>* out,
     }
     const int readdir_errno = errno;
     ::closedir(dir);
+    // step5: 读取中途失败时不能把已收集的半份列表交给调用方
     if (readdir_errno != 0) {
         out->clear();
         return Fail(OsError::kIoFailed, readdir_errno, error,
@@ -122,11 +158,21 @@ FileStatus ReadDir(const std::string& path, std::vector<DirEntry>* out,
 // MkdirAll
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief 逐段递归创建目录（等价 `mkdir -p`）。
+ *
+ * ## 步骤
+ * step1. 空路径直接拒绝；
+ * step2. 从第一个 `/` 起逐段取前缀，构造当前要创建的路径；
+ * step3. `mkdir`：`EEXIST` 时用 `stat` 确认已是目录，否则报错；
+ * step4. 已存在且是目录则继续下一段；中途失败立即返回，不回收已建目录。
+ */
 FileStatus MkdirAll(const std::string& path, mode_t mode, std::string* error) {
     if (path.empty()) {
         return Fail(OsError::kInvalidArgument, EINVAL, error, "MkdirAll: 路径为空");
     }
 
+    // step2: current 是累积前缀，position 指向下一段的起点
     // 逐段创建：从第一个 '/' 开始，每往后一段就 mkdir 一次。
     // 这样 "/a/b/c" 会依次尝试 "/a"、"/a/b"、"/a/b/c"。
     std::string current;
@@ -146,6 +192,7 @@ FileStatus MkdirAll(const std::string& path, mode_t mode, std::string* error) {
             continue;
         }
 
+        // step3: EEXIST 不算成功，必须再确认它是目录
         if (::mkdir(current.c_str(), mode) != 0) {
             const int mkdir_errno = errno;
             if (mkdir_errno == EEXIST) {
@@ -176,6 +223,16 @@ FileStatus MkdirAll(const std::string& path, mode_t mode, std::string* error) {
 // RemoveAll
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief 递归删除文件或目录（等价 `rm -rf`，不跟随符号链接）。
+ *
+ * ## 步骤
+ * step1. `lstat` 判断类型；`ENOENT` 视为成功（幂等）；
+ * step2. 非目录（含符号链接）直接 `unlink`，绝不递归进链接目标；
+ * step3. 目录先收集全部子项名字，避免 readdir 期间删除导致条目被跳过；
+ * step4. 逐个递归删除子项，任一失败立即返回；
+ * step5. 最后 `rmdir` 空目录。
+ */
 FileStatus RemoveAll(const std::string& path, std::string* error) {
     if (path.empty()) {
         return Fail(OsError::kInvalidArgument, EINVAL, error, "RemoveAll: 路径为空");
@@ -193,6 +250,7 @@ FileStatus RemoveAll(const std::string& path, std::string* error) {
                     "RemoveAll 检查路径失败: " + path);
     }
 
+    // step2: lstat 已保证符号链接走到这里，删的是链接本身
     // 不是目录（含符号链接）：直接 unlink
     if (!S_ISDIR(info.st_mode)) {
         if (::unlink(path.c_str()) != 0) {
@@ -201,6 +259,7 @@ FileStatus RemoveAll(const std::string& path, std::string* error) {
         return FileStatus{};
     }
 
+    // step3: readdir 迭代期间删除条目的行为在部分文件系统上未定义
     // 是目录：两阶段 —— 先把子项名字全部收集出来，再逐个递归删除。
     // 理由：在 readdir 迭代过程中删除条目，某些文件系统上行为未定义
     // （可能跳过条目），所以不能边读边删。
@@ -235,6 +294,7 @@ FileStatus RemoveAll(const std::string& path, std::string* error) {
                     "RemoveAll 遍历失败: " + path);
     }
 
+    // step4: 子项删除失败时保留现场并返回，便于调用方定位
     for (const auto& child : children) {
         const auto status = RemoveAll(child, error);
         if (!status.ok()) {
@@ -242,6 +302,7 @@ FileStatus RemoveAll(const std::string& path, std::string* error) {
         }
     }
 
+    // step5: 子项全部删除后目录应为空，rmdir 失败说明有并发写入或权限问题
     if (::rmdir(path.c_str()) != 0) {
         return Fail(OsError::kIoFailed, errno, error, "RemoveAll 删除目录失败: " + path);
     }
@@ -252,6 +313,18 @@ FileStatus RemoveAll(const std::string& path, std::string* error) {
 // Readlink / Symlink
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief 读取符号链接目标（不跟随），缓冲区不足时翻倍重试。
+ *
+ * ## 步骤
+ * step1. 校验输出与路径；
+ * step2. 从 256 字节开始 `readlink`；
+ * step3. 返回值 < 缓冲区大小说明未截断，收缩到实际长度返回；
+ * step4. 否则容量翻倍重试，最多 8 次（32 KiB），仍不足报 `ENAMETOOLONG`。
+ *
+ * @note `readlink` 在缓冲区不足时**静默截断**并返回缓冲区大小，所以不能用
+ *       「返回值 < 0 才算失败」来判断。
+ */
 FileStatus Readlink(const std::string& path, std::string* out, std::string* error) {
     if (out == nullptr) {
         return Fail(OsError::kInvalidArgument, 0, error, "Readlink: out 为空指针");
@@ -263,11 +336,13 @@ FileStatus Readlink(const std::string& path, std::string* out, std::string* erro
 
     // 动态扩容：readlink 在缓冲区不够时会**静默截断**并返回缓冲区大小，
     // 所以"返回值 == 缓冲区大小"是"可能被截断"的信号，要翻倍重试。
+    // step2: 256 字节覆盖绝大多数链接；不足时按 2 倍增长
     std::size_t capacity = 256;
     for (int attempt = 0; attempt < 8; ++attempt) {
         std::string buffer(capacity, '\0');
         const ssize_t written =
             ::readlink(path.c_str(), buffer.data(), buffer.size());
+        // step3: 负值才是真错误；非负值可能仍被截断
         if (written < 0) {
             return Fail(OsError::kIoFailed, errno, error, "Readlink 失败: " + path);
         }
@@ -277,6 +352,7 @@ FileStatus Readlink(const std::string& path, std::string* out, std::string* erro
             *out = std::move(buffer);
             return FileStatus{};
         }
+        // step4: 返回值等于缓冲区大小 = 可能截断，翻倍重试
         capacity *= 2;
     }
     return Fail(OsError::kIoFailed, ENAMETOOLONG, error,

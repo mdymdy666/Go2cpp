@@ -44,6 +44,36 @@
  *   这是 `Join` 唯一不返回 `"."` 的情况）。
  */
 
+/**
+ * ## 模块定位（补充）
+ *
+ * 本文件属于**基础设施最底层**的纯词法层：不分配 fd、不访问文件系统、不依赖
+ * `go2cpp::os` / `config` / 调度器。`go2cpp::path::Filepath`（平台相关路径）在
+ * Linux 上把 `Clean`/`Split`/`Ext`/`Base`/`Dir`/`IsAbs`/`Join`/`Match` 直接转发
+ * 到本文件；而 `config` 的 INI 导出与 `os` 的目录操作**刻意不依赖**它，各自
+ * 使用 `std::filesystem` 或裸 POSIX，避免底层模块之间形成环。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Clean`/`Split`/`Ext`/`Base`/`Dir`/`IsAbs`/`JoinElements`/`Join`：Go `path`
+ *   包的纯字符串路径操作，全部按字节处理、永远只认 `/`；
+ * - `MatchResult`/`MatchChecked`/`Match`：shell 通配符匹配，并把「不匹配」与
+ *   「模式非法」区分为两个字段；
+ * - 模板 `Join`：只做参数转发，不引入额外语义。
+ *
+ * ## 阅读建议
+ *
+ * 先记住文件顶部「关键语义」里三个反直觉点：`Clean("") == "."`、相对路径的
+ * 前导 `..` 至少保留一个、`Join` 全空参数返回空串而非 `"."`；再读 `Clean` 的
+ * 四条规则，最后看 `MatchChecked` 的 UTF-8 rune 匹配。实现见
+ * `src/path/path.cpp` 与 `src/path/match_impl.hpp`。
+ *
+ * ## 边界与陷阱
+ *
+ * - 只认 `/`：`\` 在此是普通字符，Windows 盘符/UNC 属于 `Filepath`；
+ * - 不做 `stat`/`readlink`，`Clean("a/../b")` 不关心 `a` 是否存在；
+ * - `Join()` 全空参数返回**空串**，与 `Clean("")` 的 `"."` 不是同一语义。
+ */
 #pragma once
 
 #include <initializer_list>
@@ -142,6 +172,15 @@ std::string Join(const std::vector<std::string>& elems);
  * @brief `Match` 的结果：区分「不匹配」与「模式本身非法」。
  * @details Go 的 `Match` 返回 `(matched bool, err error)`，唯一可能的错误是
  *          `ErrBadPattern`。C++ 里用两个 bool 表达，避免为一条错误信息引入异常。
+ */
+/**
+ * ## 定位
+ * 被 `MatchChecked`/`Match` 返回，也被 `Filepath::Glob` 用于区分「模式非法」与
+ * 「没有匹配」：否则用户写错 `[` 只会得到空列表，排查成本很高。
+ *
+ * ## 不变量
+ * - `bad_pattern == true` 时 `matched` 恒为 false；
+ * - `operator bool` 只表示 `matched`，**不**表示模式合法。
  */
 struct MatchResult final {
     /// 是否整体匹配（模式必须匹配 name 的全部内容，不是子串）。

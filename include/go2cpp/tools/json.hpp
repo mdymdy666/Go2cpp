@@ -200,6 +200,7 @@ struct JsonParseResult {
 inline JsonParseResult ParseJson(std::string_view text,
                                  std::size_t max_depth = kDefaultJsonMaxDepth) {
     JsonParseResult result;
+    // step1: 先用迭代扫描器量深度；超限直接返回可处理的错误。
     const std::size_t observed = JsonScanDepth(text, max_depth);
     if (observed > max_depth) {
         result.error =
@@ -209,6 +210,7 @@ inline JsonParseResult ParseJson(std::string_view text,
                      " 层即早退，完整深度未统计）");
         return result;
     }
+    // step2: 确认不超限后才交给上游；异常一律转成 ErrorPtr。
     try {
         result.value = Json::parse(text.begin(), text.end());
     } catch (const std::exception& failure) {

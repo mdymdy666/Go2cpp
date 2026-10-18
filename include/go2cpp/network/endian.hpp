@@ -5,6 +5,23 @@
  * @brief 网络字节序和主机字节序转换工具。
  * @details 该文件只包含无状态的整数转换函数，不依赖 Socket 或调度器，
  *          协议层可以替换为自己的编码策略。
+ *
+ * ## 模块定位
+ * 无状态字节序转换：host <-> big-endian（网络字节序）。被 `address`、协议编码与
+ * socket 层使用；不依赖 Socket 或调度器。
+ *
+ * ## 本文件定义什么
+ * - `byteswap16/32/64`：纯位运算的字节交换；
+ * - `host_to_be*` / `be_to_host*`：按 `__BYTE_ORDER__` 条件编译的转换。
+ *
+ * ## 阅读建议
+ * 先看 `byteswap*`（纯位运算、可 constexpr），再看 `host_to_be*` 的条件编译分支。
+ *
+ * ## 边界与陷阱
+ * - 依赖编译器预定义的 `__BYTE_ORDER__` / `__ORDER_LITTLE_ENDIAN__`（GCC/Clang 提供）；
+ *   平台不定义时会走「保持不变」分支 —— 在大端机上正确，在其它情况下可能静默出错；
+ * - `be_to_host*` 与 `host_to_be*` 是同一个交换（字节交换自反），保留两个名字只为可读性；
+ * - 小端主机上 `host_to_be32(x) == byteswap32(x)`，转换路径上**不要重复交换**。
  */
 
 #include <cstdint>
@@ -44,6 +61,13 @@ constexpr std::uint16_t host_to_be16(std::uint16_t value) noexcept {
     return value;
 #endif
 }
+/**
+ * @brief host -> big-endian 的 32 位转换。
+ *
+ * ## 说明
+ * 小端主机上等于 `byteswap32`，大端主机上原样返回；三档位宽各自条件编译，
+ * 避免运行期分支（`constexpr` 可用于常量初始化）。
+ */
 constexpr std::uint32_t host_to_be32(std::uint32_t value) noexcept {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     return byteswap32(value);

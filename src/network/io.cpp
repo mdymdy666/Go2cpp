@@ -434,6 +434,32 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             }
         }
 
+        /**
+         * @brief 停止接受新的活动操作，并等待所有在途操作结束。
+         *
+         * ## 四态机（`operation_state`）
+         *
+         * | 值 | 含义 |
+         * |---|---|
+         * | 0 | 空闲，没有活动操作 |
+         * | 1 | 有活动操作（`begin_operation` 已进入） |
+         * | 2 | 正在停止，等最后一个活动操作退出 |
+         * | 3 | 已停止，永不再接受操作 |
+         *
+         * 本函数把 `0 → 3`（无竞争者，立即完成）或 `1 → 2`（有在途操作，等它退出），
+         * 已有 `2/3` 则直接返回（幂等）。
+         *
+         * ## 为什么用 yield 而不是 condition_variable
+         *
+         * 活动操作的区间只有一次 `Scheduler::wake_io`（通常几十纳秒）。为每个节点
+         * 创建一个 cv 比直接 `yield` 自旋更贵，且节点会被缓存复用 —— 不能留下
+         * 每节点一个内核对象。
+         *
+         * ## 为什么必须调用
+         *
+         * 它是**把节点放回 `s_node_cache` 之前的门**：保证不会有 in-flight 回调
+         * 在节点被回收后仍访问它（UAF）。`recycle_node` 依赖这个保证。
+         */
         void stop_operations() noexcept {
             for (;;) {
                 std::uint8_t expected = 0;

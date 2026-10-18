@@ -3,6 +3,25 @@
  * @brief 实现地址族构造、DNS 查询和 IPv4/IPv6 掩码运算。
  * @details 本实现只复制 sockaddr，不持有 Socket；所有长度和前缀都会先校验，
  *          避免 Unix 路径、IPv6 scope 或掩码计算越界。
+ *
+ * ## 模块定位
+ * `address.hpp` 的实现：地址族工厂、DNS 查询与 IPv4/IPv6 子网运算。
+ * 只复制 sockaddr，不持有 Socket；所有长度与前缀都先校验再运算。
+ *
+ * ## 本文件定义什么
+ * - 匿名命名空间里的 `host:port` 拆分（`service_host` / `service_port`）；
+ * - `Address::Create()` / `Lookup()` / `LookupAny()` / `LookupAnyIPAddress()`；
+ * - 四个地址子类的构造、`to_string()`、端口与子网运算。
+ *
+ * ## 阅读建议
+ * 先看 `Create()` 的 family 分派与长度校验，再看 `Lookup()` 对 getaddrinfo 结果的
+ * 保留顺序，最后看 IPv4/IPv6 的掩码位运算。
+ *
+ * ## 边界与陷阱
+ * - `Lookup()` 的 `AI_ADDRCONFIG` 会按本机配置过滤地址族（例如无 IPv6 网卡时
+ *   不返回 AAAA），这是与「纯 DNS 查询」的区别；
+ * - `UnixAddress` 的构造会校验 NUL 与填充字节，非法输入抛异常而非截断；
+ * - IPv6 的 `%scope` 只接受十进制（`from_chars`），不解析接口名（如 `eth0`）。
  */
 #include "go2cpp/network/address.hpp"
 #include "go2cpp/network/endian.hpp"
@@ -41,8 +60,21 @@ std::string service_port(const std::string& host) {
 }
 }
 
+/**
+ * @brief 从系统 sockaddr 复制出正确的地址子类。
+ *
+ * ## 步骤
+ * step1. 空指针或长度不足 `sa_family_t` -> 返回空；
+ * step2. 按 `sa_family` 分派：AF_INET/AF_INET6 要求长度足够容纳完整结构；
+ * step3. AF_UNIX 先校验长度区间，再**整块 memcpy 到临时 sockaddr_un**（不能直接解引用短缓冲）；
+ * step4. 其它 family -> `UnknownAddress`（保留原始字节）。
+ *
+ * ## 安全要点
+ * 所有分支都先校验 `length` 再访问字段：调用方可能给的是截断的缓冲区。
+ */
 Address::Ptr Address::Create(const sockaddr* address, socklen_t length) {
     if (!address || length < sizeof(sa_family_t)) return {};
+    // step2: 按地址族分派，长度不足则落到 Unknown/空。
     switch (address->sa_family) {
         case AF_INET:
             if (length >= sizeof(sockaddr_in)) {
@@ -64,6 +96,7 @@ Address::Ptr Address::Create(const sockaddr* address, socklen_t length) {
             if (length < offsetof(sockaddr_un, sun_path) || length > sizeof(sockaddr_un))
                 return {};
             {
+                // step3: 短缓冲不能整结构解引用，先复制到临时对象。
                 sockaddr_un copied{};
                 std::memcpy(&copied, address, length);
                 return std::make_shared<UnixAddress>(copied, length);
@@ -74,6 +107,16 @@ Address::Ptr Address::Create(const sockaddr* address, socklen_t length) {
     return std::make_shared<UnknownAddress>(address, length);
 }
 
+/**
+ * @brief 解析 host:service，保留 getaddrinfo 返回的全部候选。
+ *
+ * ## 步骤
+ * step1. 清空结果，按 family/type/protocol 填 hints（`AI_ADDRCONFIG`）；
+ * step2. 用 `service_host()`/`service_port()` 拆 `host:port`（支持 `[v6]:port`）；
+ * step3. `getaddrinfo()`，失败返回 false；
+ * step4. 逐项 `Create()` 并 push（保持系统返回顺序）；
+ * step5. `freeaddrinfo()`，返回结果是否非空。
+ */
 bool Address::Lookup(std::vector<Ptr>& result, const std::string& host,
                      int family, int type, int protocol) {
     result.clear();
@@ -85,6 +128,7 @@ bool Address::Lookup(std::vector<Ptr>& result, const std::string& host,
     const std::string node = service_host(host);
     const std::string service = service_port(host);
     addrinfo* list = nullptr;
+    // step3: node/service 为空时传 nullptr（表示任意地址/端口）。
     const int error = ::getaddrinfo(node.empty() ? nullptr : node.c_str(),
                                     service.empty() ? nullptr : service.c_str(),
                                     &hints, &list);
@@ -169,6 +213,15 @@ IPv6Address::IPv6Address(const in6_addr& address, std::uint16_t port, std::uint3
     m_addr.sin6_port = htons(port);
     m_addr.sin6_scope_id = scope;
 }
+/**
+ * @brief 解析 IPv6 字面量（支持 `%scope` 后缀）。
+ *
+ * ## 步骤
+ * step1. 空指针 -> 空结果；
+ * step2. 找 `%`，把 scope 文本校验为纯十进制并用 `from_chars` 解析；
+ * step3. 去掉 scope 后缀后用 `inet_pton(AF_INET6)` 解析地址；
+ * step4. 任一失败返回空（不构造半个地址）。
+ */
 std::shared_ptr<IPv6Address> IPv6Address::Create(const char* address, std::uint16_t port) {
     if (!address) return {};
     std::string value(address);
@@ -225,6 +278,17 @@ IPAddress::Ptr IPv6Address::subnet_mask(std::uint32_t prefix_len) const {
     return std::make_shared<IPv6Address>(mask, port(), m_addr.sin6_scope_id);
 }
 
+/**
+ * @brief 从路径构造 Unix 地址（文件系统或抽象命名空间）。
+ *
+ * ## 步骤
+ * step1. 判断是否抽象命名空间（首字节 NUL）；
+ * step2. 按类型校验长度与 NUL：抽象 <= capacity，文件系统 < capacity 且内部无 NUL；
+ * step3. `memcpy` 路径并计算 `m_length`（文件系统路径 +1 给结尾 NUL）。
+ *
+ * ## 失败语义
+ * 路径过长/含内部 NUL 抛 `std::length_error`/`std::invalid_argument`（不静默截断）。
+ */
 UnixAddress::UnixAddress(const std::string& path) : m_path(path) {
     m_addr.sun_family = AF_UNIX;
     const bool abstract = !path.empty() && path.front() == '\0';

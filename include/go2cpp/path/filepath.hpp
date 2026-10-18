@@ -48,6 +48,35 @@
  * | `EvalSymlinks` 的 Windows 实现 | 用 `std::filesystem::weakly_canonical` 近似，对陈旧路径（不存在的尾段）与链接循环的行为与 Go 不同；Linux 走完整移植实现。 |
  */
 
+/**
+ * ## 模块定位（补充）
+ *
+ * 位于 `go2cpp::path` 的**平台适配层**：Linux 上直接转发 `go2cpp::path` 的纯词法
+ * 实现，另外提供需要文件系统的 `Abs`/`Rel`/`EvalSymlinks`/`Walk`/`Glob`。
+ * 直接调用方目前是 `tests/path/test_path_filepath.cpp` 与 examples；`config` 与
+ * `os` 模块**有意不依赖**本文件（它们各自用 `std::filesystem`/POSIX），因此本层
+ * 不会把路径语义泄漏进运行时核心。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Separator`/`ListSeparator`：平台分隔符常量；
+ * - 纯词法 API（`Clean`/`Split`/`Ext`/`Base`/`Dir`/`IsAbs`/`Join`/`Match` 等）：
+ *   Linux 转发 `path`，Windows 另有一套 `#ifdef` 实现；
+ * - `WalkInfo`/`WalkAction`/`WalkFn`/`Walk`：不跟随符号链接、按词典序的深度优先遍历；
+ * - `Abs`/`Rel`/`EvalSymlinks`/`Glob`：少量需要 `lstat`/`readlink`/`getcwd` 的函数。
+ *
+ * ## 阅读建议
+ *
+ * 先读文件头「平台语义」与「已知未支持项」，确认当前只保证 Linux 正确；再看
+ * `WalkAction` 的传播规则（`SkipDir` 用在文件上会跳过父目录剩余兄弟）；最后看
+ * `Glob` 的递归上限与错误忽略策略。实现见 `src/path/filepath.cpp`。
+ *
+ * ## 边界与陷阱
+ *
+ * - Windows 分支按 Go 文档编写但**未真机验证**，保留名 `NUL`/`CON` 不做检查；
+ * - `Abs` 只做 `getcwd + Clean`，**不解析符号链接**，同一文件可有多种绝对写法；
+ * - `Walk` 是同步递归，深度等于目录深度，极深的树可能耗尽调用线程栈。
+ */
 #pragma once
 
 #include "go2cpp/path/path.hpp"
@@ -230,6 +259,16 @@ bool EvalSymlinks(std::string_view path, std::string* out,
 /**
  * @brief Walk 传给回调的条目信息（Go `fs.FileInfo` 的收敛版）。
  * @details 只保留路径处理常用字段；需要完整 `struct stat` 时调用方自行查询。
+ */
+/**
+ * ## 定位
+ * 由 `Filepath::Walk` 在遍历线程同步传给回调，供上层（例如后续的静态资源扫描、
+ * 配置目录巡检）判断条目类型而**不必**再 `lstat` 一次。
+ *
+ * ## 不变量
+ * - 三个类型标记互斥：`is_symlink` 为真时 `is_dir`/`is_regular` 均为 false，
+ *   即使链接指向目录（遍历不跟随链接）；
+ * - `type_unknown` 场景下三个标记可能全为 false，调用方需自行 `StatPath`。
  */
 struct WalkInfo final {
     /// 是否是目录（`lstat` 结果，**不跟随**符号链接）。

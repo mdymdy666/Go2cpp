@@ -6,6 +6,31 @@
  * 的边界结论 1.2/1.3：绕过 Hook 的符号拦截，避免为普通文件 IO 白构造
  * `BlockingRegion`。代价是**自己处理 `EINTR` 与部分写**（hook 原本替我们做了）。
  */
+/**
+ * ## 模块定位（补充）
+ *
+ * `os::File` 的实现层：向上支撑 `tests/os/test_os_file.cpp`、examples 与
+ * `ReadFile`/`WriteFile`；向下直接发 `SYS_openat/read/write/pread/pwrite/fsync/
+ * ftruncate/fstat/lseek`。它**不经过** Hook、不注册 epoll，也不参与 Fiber 调度。
+ *
+ * ## 本文件定义什么
+ *
+ * - `RawOpen`/`RawClose`/`IsSyscallError`：裸 syscall 辅助；
+ * - `File` 的生命周期、打开/接管、读写、定位、元信息与同步；
+ * - `ReadFile`/`WriteFile`、环境变量、`SetArgs`/`Args`/`ProgramName`。
+ *
+ * ## 阅读建议
+ *
+ * 先看 `RawOpen` 为什么强制 `O_NONBLOCK`（否则打开 FIFO 会卡在 open），再看
+ * `Open`/`Adopt` 的 `S_ISSOCK` → `S_ISREG` 白名单，最后看 `Read`/`Write` 的
+ * `EINTR` 重试与 `WriteAll` 的部分写循环。
+ *
+ * ## 边界与陷阱
+ *
+ * - 所有 IO 自己处理 `EINTR`；Hook 原本替我们做的事现在必须显式做；
+ * - `syscall` 成功值可能是 `-1`，所以 `IsSyscallError` 只认 `[-4095, -1]`；
+ * - `ReadFile` 的 `st_size` 只是容量提示，文件被并发追加时仍按实际读到为准。
+ */
 #include "go2cpp/os/file.hpp"
 #include "go2cpp/os/os.hpp"
 
@@ -25,6 +50,8 @@ namespace go2cpp::os {
 namespace {
 
 /// 绕过 Hook 的 `openat`。失败返回 -1 且 errno 有效。
+// 强制 O_NONBLOCK 只影响 open 本身：普通文件上 POSIX 保证它是 no-op；
+// 对 FIFO/socket 则保证 open 不会在类型校验之前无限等待。
 int RawOpen(const char* path, int flags, mode_t mode) noexcept {
     // O_NONBLOCK 的作用：**避免 open(2) 自己阻塞**。
     // 关键场景：`Open("/tmp/some_fifo")` 若不加 O_NONBLOCK，`open` 会一直等到
@@ -144,6 +171,19 @@ void File::Close() noexcept {
 // 打开 / 接管
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief 打开一个普通文件；成功时把 fd 所有权移入 `*out`。
+ *
+ * ## 步骤
+ * step1. 校验输出指针与路径（空路径直接 `EINVAL`）；
+ * step2. `RawOpen`：追加 `O_CLOEXEC|O_NONBLOCK`，避免打开 FIFO 时卡在 open；
+ * step3. `fstat` 做白名单校验：先判 socket 给出精确错误码，再要求 `S_ISREG`；
+ * step4. 只有校验通过才把 fd/owned 写入 `*out`；失败路径先 `RawClose`，不漏 fd。
+ *
+ * ## 失败语义
+ * `kOpenFailed`（open 失败，errno 有效）、`kIsSocket`、`kNotRegularFile`、
+ * `kInvalidArgument`。失败时 `*out` 不会被写入新 fd。
+ */
 FileStatus File::Open(const std::string& path, OpenFlag flags, mode_t mode, File* out) {
     FileStatus status;
     if (out == nullptr) {
@@ -155,6 +195,7 @@ FileStatus File::Open(const std::string& path, OpenFlag flags, mode_t mode, File
         status.system_error = EINVAL;
         return status;
     }
+    // step2: O_NONBLOCK 防止 open(FIFO) 在 fstat 之前阻塞整个 worker
     const int fd = RawOpen(path.c_str(), static_cast<int>(flags), mode);
     if (fd < 0) {
         status.code = OsError::kOpenFailed;
@@ -165,6 +206,7 @@ FileStatus File::Open(const std::string& path, OpenFlag flags, mode_t mode, File
     // 非普通文件（FIFO/pipe/字符设备/eventfd/timerfd/signalfd）的 read 会真阻塞，
     // 而本类走裸 syscall 绕过 Hook，会卡死整个 worker。
     // 先判 socket 是为了给出更精确的错误码。
+    // step3: 白名单校验：anon_inodefs 的类型位为 0，黑名单必然漏掉
     struct ::stat info {};
     if (static_cast<int>(::syscall(SYS_fstat, fd, &info)) == 0) {
         if (S_ISSOCK(info.st_mode)) {
@@ -178,6 +220,7 @@ FileStatus File::Open(const std::string& path, OpenFlag flags, mode_t mode, File
             return status;
         }
     }
+    // step4: 校验全部通过后才转移所有权，失败路径不会泄漏 fd
     *out = File{};
     out->m_fd = fd;
     out->m_owned = true;
@@ -194,6 +237,21 @@ FileStatus File::Create(const std::string& path, mode_t mode, File* out) {
     return Open(path, flags, mode, out);
 }
 
+/**
+ * @brief 接管一个已经打开的 fd，并拒绝 socket / 非普通文件。
+ *
+ * ## 步骤
+ * step1. 校验输出指针与 fd 合法性；
+ * step2. `fstat` 读取类型；失败按无效句柄处理（不关闭调用方的 fd）；
+ * step3. `S_ISSOCK` → `kIsSocket`（比统一错误码更精确）；
+ * step4. 非 `S_ISREG` → `kNotRegularFile`：FIFO/pipe/字符设备/eventfd/timerfd/
+ *        signalfd 的 read 会真阻塞，而 `File::Read` 绕过 Hook；
+ * step5. 校验通过后按 `take_ownership` 记录是否负责关闭。
+ *
+ * ## 不变量
+ * `Adopt` **不修改** fd 的任何标志位（尤其不碰 `O_NONBLOCK`），避免与
+ * `FdManager` 的 `m_user_nonblock`/`m_system_nonblock` 还原逻辑打架。
+ */
 FileStatus File::Adopt(int fd, bool take_ownership, File* out) {
     FileStatus status;
     if (out == nullptr) {
@@ -205,6 +263,7 @@ FileStatus File::Adopt(int fd, bool take_ownership, File* out) {
         status.system_error = EBADF;
         return status;
     }
+    // step2: fstat 失败只报无效句柄，绝不能 close 调用方仍持有的 fd
     struct ::stat info {};
     const long fstat_result = ::syscall(SYS_fstat, fd, &info);
     if (IsSyscallError(fstat_result)) {
@@ -212,6 +271,7 @@ FileStatus File::Adopt(int fd, bool take_ownership, File* out) {
         status.system_error = errno;
         return status;
     }
+    // step3: socket 先单独判，错误码比统一的 kNotRegularFile 更精确
     // ★ 高危误用拦截：`File::Read/Write` 走裸 syscall 绕过 Hook，前提是
     //   "普通文件的 IO 在内核里同步完成、不会 EAGAIN"。凡是**可能阻塞**的 fd
     //   都不满足这个前提，塞进来就会把整个 M 线程卡死。见 file.hpp 1.4。
@@ -222,10 +282,12 @@ FileStatus File::Adopt(int fd, bool take_ownership, File* out) {
         status.code = OsError::kIsSocket;
         return status;
     }
+    // step4: 白名单只留 S_ISREG；FIFO/eventfd 的 read 会真阻塞
     if (!S_ISREG(info.st_mode)) {
         status.code = OsError::kNotRegularFile;
         return status;
     }
+    // step5: 所有权按调用方声明记录，不在此处 close 借用 fd
     *out = File{};
     out->m_fd = fd;
     out->m_owned = take_ownership;
@@ -410,6 +472,18 @@ bool File::IsRegular() const noexcept {
 // 便利函数
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief 把整个文件读进 `std::string`，带大小上限与可配置缓冲区。
+ *
+ * ## 步骤
+ * step1. 校验输出并清空，打开只读句柄；
+ * step2. 用 `st_size` 做容量提示，并按 `os.max_file_size` 提前拒绝超大文件；
+ * step3. 以 `os.default_read_buffer_size` 为块循环 `read`，直到返回 0（EOF）；
+ * step4. 任一次读失败：清空输出、写 errno，避免调用方拿到半份内容。
+ *
+ * ## 并发语义
+ * 文件可能在读取期间增长：`st_size` 只用于 `reserve`，不会截断实际读取。
+ */
 FileStatus ReadFile(const std::string& path, std::string* out, std::string* error) {
     FileStatus status;
     if (out == nullptr) {
@@ -417,6 +491,7 @@ FileStatus ReadFile(const std::string& path, std::string* out, std::string* erro
         return status;
     }
     out->clear();
+    // step1: 打开失败直接返回；ReadFile 不创建文件，也不重试
     File file;
     status = File::Open(path, OpenFlag::kReadOnly, 0, &file);
     if (!status.ok()) {
@@ -425,6 +500,7 @@ FileStatus ReadFile(const std::string& path, std::string* out, std::string* erro
         }
         return status;
     }
+    // step2: 上限检查发生在分配/读取之前，防止单个大文件耗尽内存
     // 用 st_size 做容量提示（不当作精确长度：文件可能在被读期间变化）。
     const off_t size_hint = file.Size();
     // 大小上限（来自配置 os.max_file_size，0 表示不限制）。
@@ -442,6 +518,7 @@ FileStatus ReadFile(const std::string& path, std::string* out, std::string* erro
         out->reserve(static_cast<std::size_t>(size_hint));
     }
     // 缓冲区大小来自配置（os.default_read_buffer_size，带钳制）。
+    // step3: 块大小来自配置并已钳制；循环到 read 返回 0
     std::vector<char> buffer(ReadBufferSize());
     for (;;) {
         const ssize_t got = file.Read(buffer.data(), buffer.size());
@@ -459,9 +536,17 @@ FileStatus ReadFile(const std::string& path, std::string* out, std::string* erro
         }
         out->append(buffer.data(), static_cast<std::size_t>(got));
     }
+    // step4: 读到 EOF 才算成功；失败路径已清空 out 并写 errno
     return status;
 }
 
+/**
+ * @brief 把 `data` 整体写入文件（创建或截断）。
+ *
+ * ## 步骤
+ * step1. `Create` 打开（O_RDWR|O_CREAT|O_TRUNC），失败即返回；
+ * step2. `WriteAll` 负责 EINTR 与部分写；写不满一律按 `kIoFailed` 上报。
+ */
 FileStatus WriteFile(const std::string& path, std::string_view data, std::string* error) {
     FileStatus status;
     File file;
@@ -472,6 +557,7 @@ FileStatus WriteFile(const std::string& path, std::string_view data, std::string
         }
         return status;
     }
+    // step2: WriteAll 已经循环处理部分写，这里的短写只可能是真失败
     const std::size_t written = file.WriteAll(data.data(), data.size());
     if (written != data.size()) {
         status.code = OsError::kIoFailed;

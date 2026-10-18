@@ -27,6 +27,33 @@
  * 它**不**接管 fd 的生命周期管理（那是 `FdManager` 对 socket 做的事），
  * **不**修改任何 fd 的标志位，**不**做平台抽象（POSIX only）。
  */
+/**
+ * ## 模块定位（补充）
+ *
+ * `go2cpp::os` 是**最低层的 POSIX 能力封装**，位于运行时调度器与业务代码之下：
+ * - 上游调用方：`go2cpp::config` 的 `[os]` 段（`src/os/config.cpp` 静态注册
+ *   `os.default_read_buffer_size` / `os.max_file_size`）、`tests/os/*`、examples；
+ * - 下游：直接使用 Linux syscall/libc，不依赖 `IOManager`/`Scheduler`；
+ * - 与 `FdManager` 的边界：本模块**不**接管 socket fd，也不修改 fd 标志位。
+ *
+ * ## 本文件定义什么
+ *
+ * - `Exit`：唯一的进程级操作，声明在此、实现见 `src/os/os.cpp`；
+ * - `SaveDefaultConfig`：把当前全部注册项导出为带注释的 INI；
+ * - `ReadBufferSize`/`MaxFileSize`：从配置读取并钳制后的 `ReadFile` 参数。
+ * `File`/`ReadFile`/环境变量等实体在 `file.hpp`，目录能力在 `dir.hpp`。
+ *
+ * ## 阅读建议
+ *
+ * 先读 `Exit` 的警告（它不清理 Fiber/Task），再读 `file.hpp` 顶部「为什么文件
+ * IO 不参与协程调度」的长文；`os.hpp` 本身只是入口与配置读取。
+ *
+ * ## 边界与陷阱
+ *
+ * - `ReadBufferSize` 有 4 KiB..16 MiB 的硬钳制，配置错得再离谱也不会让缓冲区爆炸；
+ * - `MaxFileSize` 返回 0 表示**不限制**，不是「禁止读取」；
+ * - 本模块 POSIX only，Windows 分支不存在。
+ */
 #pragma once
 
 #include "go2cpp/os/dir.hpp"

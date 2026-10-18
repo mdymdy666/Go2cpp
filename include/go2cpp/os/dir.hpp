@@ -39,6 +39,32 @@
  * - 不跟随符号链接做递归（`RemoveAll` 用 `lstat`，删链接本身而不删目标 —— 与 `rm -rf` 一致）；
  * - POSIX only。
  */
+/**
+ * ## 模块定位（补充）
+ *
+ * `go2cpp::os` 的**按路径操作**子层：目录遍历、递归创建/删除、符号链接、时间戳、
+ * `stat`。上游是 `tests/os/test_os_dir.cpp`、examples 以及未来的配置目录巡检；
+ * 下游是 glibc `opendir`/`readdir`/`mkdir`/`unlink`/`readlink`（理由见文件头：
+ * `HookOp` 没有 `getdents`，这些调用不会被 Hook 拦到等待路径）。
+ *
+ * ## 本文件定义什么
+ *
+ * - `DirEntry`：目录条目的名字 + 类型标记（`d_type` 直读，不额外 `lstat`）；
+ * - `ReadDir`/`MkdirAll`/`RemoveAll`：目录级操作；
+ * - `Readlink`/`Symlink`/`SetTimes`/`StatPath`：链接与元数据操作。
+ *
+ * ## 阅读建议
+ *
+ * 先读 `DirEntry::type_unknown` 的含义（网络文件系统可能不给 `d_type`），再看
+ * `RemoveAll` 的「两阶段收集再删除」；`SetTimes` 是唯一走 `syscall` 的函数，
+ * 原因与 Hook 无关，见函数注释。
+ *
+ * ## 边界与陷阱
+ *
+ * - 不做路径规范化，调用方自行 `Clean`/`Join`；
+ * - `RemoveAll` 用 `lstat`：符号链接只删链接本身，绝不递归进目标；
+ * - `MkdirAll` 中途失败不回滚，已创建目录保留（与 `mkdir -p` 一致）。
+ */
 #pragma once
 
 #include "go2cpp/os/file.hpp"
@@ -58,16 +84,26 @@ namespace go2cpp::os {
  *          而调用方多数只想区分文件/目录/符号链接。需要完整信息时用
  *          `StatPath` 单独查。
  */
+/**
+ * ## 定位
+ * 由 `os::ReadDir` 填充并返回给需要目录列表的上层（测试、示例、后续的静态
+ * 资源/配置巡检）；`type_unknown` 让调用方自行决定是否再 `StatPath`。
+ *
+ * ## 不变量
+ * - `name` 是纯文件名，不含父目录（与 `readdir` 的 `d_name` 一致）；
+ * - 三个类型标记至多一个为 true；`DT_UNKNOWN` 时全部为 false 且
+ *   `type_unknown == true`。
+ */
 struct DirEntry final {
     /// 条目的名字（**不含**父目录路径，与 `readdir` 的 `d_name` 一致）。
     std::string name;
-    bool is_dir{false};
-    bool is_regular{false};
-    bool is_symlink{false};
+    bool is_dir{false};  ///< 是否目录；ReadDir 按 d_type=DT_DIR 置位，块/字符设备等保持 false
+    bool is_regular{false};  ///< 是否普通文件；ReadDir 按 DT_REG 置位，供调用方过滤目录
+    bool is_symlink{false};  ///< 是否符号链接；ReadDir 按 DT_LNK 置位（不跟随链接）
     /// 文件系统返回 `DT_UNKNOWN` 时，类型标记全部为 false —— 调用方若需要
     /// 精确类型，应再用 `StatPath` 查。ext4/xfs/tmpfs 不会出现这种情况，
     /// 但某些网络文件系统会。
-    bool type_unknown{false};
+    bool type_unknown{false};  ///< d_type==DT_UNKNOWN；ReadDir 置位，调用方据此决定是否再 StatPath
 };
 
 /**
