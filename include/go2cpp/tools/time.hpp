@@ -357,10 +357,14 @@ public:
 
     /// 对应 `Time.Sub(u)`：优先用单调读数（两者都有时），否则回落到墙钟。
     Duration Sub(const Time& other) const {
+        // 为什么优先单调读数：Sub 回答「流逝了多久」。墙钟会被 NTP/adjtime/手动改时间
+        // 回拨，可能算出负数或跳变；steady_clock 只增不减。两个 Time 都由 Now() 产生
+        // （都带单调读数）时才可用，否则退回墙钟 —— 与 Go 在 ext 缺失时退回 wall 一致。
         if (m_has_monotonic && other.m_has_monotonic) {
             const auto delta = m_monotonic - other.m_monotonic;
             return Duration(std::chrono::duration_cast<std::chrono::nanoseconds>(delta).count());
         }
+        // 退化路径：至少一方来自 FromUnix/FromSystemClock，只能比墙钟。
         const auto delta = m_wall - other.m_wall;
         return Duration(std::chrono::duration_cast<std::chrono::nanoseconds>(delta).count());
     }
@@ -375,6 +379,11 @@ public:
         if (m_has_monotonic && other.m_has_monotonic) return m_monotonic > other.m_monotonic;
         return m_wall > other.m_wall;
     }
+    // 为什么 Equal 只比较墙钟：Go 的 Time.Equal 语义是「是否表示同一时刻」，
+    // 只比较 wall + location，明确忽略单调读数；而 Sub 恰好相反，优先单调读数。
+    // 因此「Equal 为真但 Sub 非零」是合法组合：两个 Time 表示同一时刻，但单调读数
+    // 来自不同起点（或一方根本没有）。若把单调读数塞进 Equal，两个表示同一时刻的
+    // 对象会不相等，破坏以 Time 为键的 map 与去重逻辑。
     /// 对应 `Time.Equal(u)`（只用墙钟，与 Go 一致：单调读数不参与 Equal）。
     bool Equal(const Time& other) const { return m_wall == other.m_wall; }
     /// 对应 `Time.IsZero()`（Go 的零 Time 是 0001-01-01T00:00:00Z）。

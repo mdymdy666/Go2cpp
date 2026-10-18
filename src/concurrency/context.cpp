@@ -293,6 +293,21 @@ namespace go2cpp
     namespace detail
     {
 
+        /**
+         * @brief 只给 `context.cpp` 内部用的 `DoneSignal` 访问桥。
+         *
+         * ## 为什么需要它
+         *
+         * `DoneSignal::Signal()` 与 `AddCallbackImpl(..., internal=true)` 都不是公开
+         * 接口：内部回调组必须先于用户回调执行，不能让业务代码插到前面。但 `Context`
+         * 的取消路径需要它们。用这个只暴露两个静态方法的桥，代替「把 `Context` 设为
+         * `DoneSignal` 的 friend」—— 把「谁能触发信号」限制在最小范围。
+         *
+         * ## 语义提醒
+         *
+         * `AddInternalCallback` 注册的回调会在**所有用户回调之前**执行；如果信号
+         * 已完成，它会**立即被调用一次**（不是登记后再等）。
+         */
         struct DoneSignalAccess
         {
             static void Signal(DoneSignal &signal) noexcept { signal.Signal(); }
@@ -339,6 +354,28 @@ namespace go2cpp
             return now + timeout;
         }
 
+        /**
+         * @brief Context 专用的小型定时器服务（与 `concurrency::TimerService` 不是同一个）。
+         *
+         * ## 定位
+         *
+         * `Context::WithDeadline/WithTimeout` 向它注册：到期时把对应 `State` 标记为
+         * `DeadlineExceeded` 并走取消路径（级联到子节点）。它比
+         * `concurrency::TimerService` 简单：只有一个固定线程、一个 `multimap`，
+         * 没有 executor / 异常处理器 / 时长告警。
+         *
+         * ## 为什么是进程级单例且**永不析构**
+         *
+         * Context 状态可能在任意静态析构阶段被销毁。若本服务先析构，
+         * `State::~State()` 移除挂起定时器时就会访问已析构的单例。
+         * 所以用 `new` + `atexit(ShutdownAtExit)`：退出时先停 worker（避免
+         * Memcheck 报存活线程），但**对象本身不 delete**。
+         *
+         * ## 与状态机文档的关系
+         *
+         * 它是 `docs/state-machines/Context.md` 里
+         * `Active -(TimerService 到期)-> Canceled(DeadlineExceeded)` 这条转化的实现者。
+         */
         class TimerService
         {
         public:
@@ -366,10 +403,14 @@ namespace go2cpp
             void Remove(Id id);
 
         private:
+            /// @brief 一条待触发的定时器；`state` 用 weak_ptr 避免延长 Context 生命周期。
             struct Entry
             {
+                /// @brief 绝对到期时间；`Run` 取最早的一条决定 `wait_until` 的时长。
                 ContextTimePoint deadline;
+                /// @brief 定时器 Id；`Remove` 用它定位。
                 Id id;
+                /// @brief 目标 Context 状态；弱引用 —— Context 先释放则到期时直接跳过。
                 std::weak_ptr<Context::State> state;
             };
 
