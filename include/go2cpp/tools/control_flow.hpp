@@ -135,11 +135,31 @@ public:
     bool active() const noexcept { return m_active; }
 
 private:
+    /**
+     * @brief 类型擦除后的回调基类（defer 的内部多态载体）。
+     *
+     * ## 定位
+     * `defer` 用 `unique_ptr<Callable>` 保存任意可调用对象；具体逻辑在
+     * `CallableModel<F>`。不对外暴露。
+     *
+     * ## 不变量
+     * `run()` 必须 noexcept 且自行吞掉异常（记录到 `LastDeferException`）。
+     */
     struct Callable {
         virtual ~Callable() = default;
         virtual void run() noexcept = 0;
     };
 
+    /**
+     * @brief `Callable` 的模板实现，持有用户回调。
+     *
+     * ## 定位
+     * `defer` 构造时把 lambda/函数对象包成它；析构/`run_now()` 通过基类调用。
+     *
+     * ## 不变量
+     * - `m_function` 在构造后不再改变（回调可能被移动进来）；
+     * - `run()` 最多执行一次（由 `defer::m_active` 保证），异常被捕获并记录。
+     */
     template <typename F>
     struct CallableModel final : Callable {
         explicit CallableModel(F function) : m_function(std::move(function)) {}

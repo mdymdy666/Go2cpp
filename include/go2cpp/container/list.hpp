@@ -74,6 +74,7 @@
 
 namespace go2cpp::container {
 
+/// @brief 前置声明：`Element<T>` 的 `m_list` 需要 `List<T>*`，而 `List` 定义在其后。
 template <typename T>
 class List;
 

@@ -175,6 +175,16 @@ public:
     Socket::Ptr socket() const noexcept { return m_socket; }
 
 private:
+    /**
+     * @brief 读出的原始帧（未重组）。
+     *
+     * ## 定位
+     * `read_frame()` 的产出、`read_message()` 的输入；`write_frame_unlocked()` 不构造它
+     * （直接按字段编码）。
+     *
+     * ## 不变量
+     * `masked` 与角色一致（服务端读到的帧必带掩码），`payload` 已解掩码。
+     */
     struct Frame {
         /// 是否 FIN（消息/分片结束）；read_frame() 写入、read_message() 读取。
         bool fin{false};

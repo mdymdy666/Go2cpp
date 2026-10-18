@@ -30,6 +30,22 @@
 namespace go2cpp {
 namespace detail {
 
+/**
+ * @brief `panic` 的共享状态（pimpl）。
+ *
+ * ## 定位
+ * `panic` 通过 `shared_ptr` 持有、`recover` 通过 `weak_ptr` 观察；所有读写
+ * 都由本类的 `mutex` 保护。
+ *
+ * ## 状态机
+ * `active`/`recovered` 组合出 Idle/Active/Recovered 三态，见
+ * `docs/state-machines/Panic.md`。
+ *
+ * ## 不变量
+ * - `active == info.raised`；
+ * - `recovered` 为真时 `active` 必为假；
+ * - `info`/`active`/`recovered` 的所有访问都持 `mutex`。
+ */
 struct PanicState {
     mutable std::mutex mutex; ///< 保护 info/active/recovered；panic 与 recover 的所有读写都持锁
     PanicInfo info;           ///< 当前 panic 快照；call_info() 写，take()/peek() 读
@@ -40,6 +56,16 @@ struct PanicState {
 thread_local unsigned int s_defer_depth = 0; ///< 当前线程 defer 回调嵌套深度；DeferCallbackScope 增减
 thread_local std::exception_ptr s_defer_exception; ///< 最近一次 defer 回调异常；RecordDeferException 写，LastDeferException 读
 
+/**
+ * @brief 标记「当前线程正处于 defer 回调」的 RAII 作用域。
+ *
+ * ## 定位
+ * `defer::run_now()` 进入时构造、退出时析构；`recover::take()` 靠它判断
+ * 是否允许恢复。
+ *
+ * ## 不变量
+ * 构造时 `s_defer_depth` 加 1、析构时恢复旧值；支持嵌套 defer。
+ */
 class DeferCallbackScope final {
 public:
     DeferCallbackScope() noexcept : m_previous(s_defer_depth) {

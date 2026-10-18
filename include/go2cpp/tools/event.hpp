@@ -82,6 +82,16 @@ namespace go2cpp {
  * - `m_work_mutex` 保证同一时刻最多一个 `work()` 在跑。
  */
 class EventBatch final {
+    /**
+     * @brief 批次的停止控制块（Context + cancel）。
+     *
+     * ## 定位
+     * `EventBatch` 私有持有；`stop()` 调 `cancel` 唤醒正在 Select 的等待者，
+     * `clear()`/`reset()` 换新的控制块。
+     *
+     * ## 不变量
+     * `context` 与 `cancel` 由 `Context::WithCancel` 成对创建，同生共死。
+     */
     struct StopControl final {
         ContextPtr context; ///< 批次的停止 Context；stop() 通过 cancel 唤醒 Select
         CancelFunc cancel;  ///< 取消函数；stop() 调用，触发 DoneSignal
@@ -446,6 +456,15 @@ public:
     }
 
 private:
+    /**
+     * @brief 一个「case + 回调」绑定。
+     *
+     * ## 定位
+     * `m_entries` 的元素；`work()` 把它们拆成 case 数组与 handler 快照。
+     *
+     * ## 不变量
+     * `handler` 可为空；`event` 在批次生命周期内保持不变。
+     */
     struct Entry {
         SelectCase event; ///< 一个等待中的 case；bind/add_event 写入
         Handler handler;  ///< 该 case 被选中时的回调，可为空

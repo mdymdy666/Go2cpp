@@ -316,11 +316,29 @@ private:
     DebugBreakpoints(const DebugBreakpoints&) = delete;
     DebugBreakpoints& operator=(const DebugBreakpoints&) = delete;
 
+    /**
+     * @brief 注册表里一个断点的内部记录。
+     *
+     * ## 定位
+     * `m_entries` 的值类型；`ShouldStop` 读取条件并累加 skipped/hits。
+     *
+     * ## 不变量
+     * `skipped <= spec.skip`；`hits` 只增不减（`ResetStats` 除外）。
+     */
     struct Entry {
         BreakpointSpec spec; ///< 注册时的条件；SetEnabled 会改 enabled
         std::size_t skipped{0}; ///< 已跳过的命中数；ShouldStop 累加，ResetStats 清零
         std::uint64_t hits{0};  ///< 已触发次数；ShouldStop 累加，ResetStats 清零
     };
+    /**
+     * @brief 「已命中、等待 Resume」的断点快照。
+     *
+     * ## 定位
+     * `m_waiting` 的值类型；`Waiting()` 把它转成 `BreakpointHit` 返回。
+     *
+     * ## 不变量
+     * `sequence` 等于命中时的 `m_total_hits`，全局唯一。
+     */
     struct HitRecord {
         std::string name;        ///< 命中的位置名
         std::uint64_t task_id{0}; ///< 触发时的 G id（0 表示未知）

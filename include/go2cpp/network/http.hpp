@@ -164,6 +164,17 @@ struct ParserLimits {
 };
 
 enum class ParseState { NeedMore, Complete, Error };
+/**
+ * @brief 一次 `feed()` 的结果。
+ *
+ * ## 定位
+ * 被 `Parser::feed()` / `Parser::finish()` 返回；`Client`、`Server` 与 WebSocket 握手
+ * 都靠它判断「还要更多字节 / 完成 / 失败」。
+ *
+ * ## 不变量
+ * `state == Complete` 时 `consumed > 0`；`state == Error` 时 `error` 非空。
+ * `operator bool()` 只排除 Error（NeedMore 仍为 true）。
+ */
 struct ParseResult {
     ParseState state{ParseState::NeedMore};
     std::size_t consumed{0};

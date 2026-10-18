@@ -79,6 +79,7 @@
 #include <string>
 
 namespace go2cpp::net::http2 {
+/// 前置声明：字节通道接口（定义在 http2/transport.hpp）。
 class Transport;
 }
 
@@ -200,6 +201,7 @@ public:
     void* NativeHandle() const noexcept;
 
 private:
+    /// pimpl：picoquic 类型完全藏在 .cpp 内，头文件零依赖。
     struct Impl;
     explicit PicoquicConnection(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> m_impl;

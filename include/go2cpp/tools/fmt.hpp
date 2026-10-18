@@ -214,25 +214,70 @@ const char* TypeName() {
     else return "interface {}";
 }
 
+/**
+ * @brief 判断 `T` 是否为 `ErrorPtr` 的特征。
+ *
+ * ## 定位
+ * `fmt` 内部的分派特征：让 `%v` 对 `ErrorPtr` 走错误文本分支。
+ *
+ * ## 不变量
+ * 主模板恒为 `false_type`，只由 `ErrorPtr` 特化翻转为 `true_type`。
+ */
 template <typename T>
+/// 判定 T 是否为 ErrorPtr；FormatValue 用它走 error 接口优先规则。
 struct IsErrorPtr : std::false_type {};
+/// @brief `IsErrorPtr` 的 `ErrorPtr` 特化：恒为 true。
 template <>
+/// ErrorPtr 特化：让 if constexpr 能在编译期选中 error 分支。
 struct IsErrorPtr<ErrorPtr> : std::true_type {};
 
+/**
+ * @brief 判断 `T` 是否为 `std::vector` 的特征。
+ *
+ * ## 定位
+ * `fmt` 内部的分派特征：容器格式化递归时用它取出元素类型。
+ *
+ * ## 不变量
+ * 只有 `std::vector<U, Alloc>` 特化为 true，并提供 `element = U`。
+ */
 template <typename T>
+/// 判定 T 是否为 std::vector；命中后递归格式化元素。
 struct IsVector : std::false_type {};
+/// @brief `std::vector` 特化：暴露 `element` 供递归格式化。
 template <typename U, typename Alloc>
+/// vector 特化：额外暴露 element 类型供递归分派。
 struct IsVector<std::vector<U, Alloc>> : std::true_type {
-    using element = U;
+    using element = U; ///< 元素类型；容器格式化递归时读取
 };
 
+/**
+ * @brief 判断 `T` 是否为 `std::pair` 的特征。
+ *
+ * ## 定位
+ * `fmt` 内部的分派特征：`%v` 对 pair 输出 `(first, second)`。
+ *
+ * ## 不变量
+ * 只有 `std::pair<A, B>` 特化为 true。
+ */
 template <typename T>
+/// 判定 T 是否为 std::pair；命中后输出 (first, second)。
 struct IsPair : std::false_type {};
+/// @brief `std::pair` 特化：恒为 true。
 template <typename A, typename B>
+/// pair 特化；与 vector 特化互斥（分支顺序保证）。
 struct IsPair<std::pair<A, B>> : std::true_type {};
 
-/// 字符串类判定（`std::string` / `std::string_view` / `const char*` / 字面量）。
+/**
+ * @brief 字符串类判定（`std::string` / `std::string_view` / `const char*` / 字面量）。
+ *
+ * ## 定位
+ * `fmt` 内部的分派特征：字符串走文本分支，而不是容器/指针分支。
+ *
+ * ## 不变量
+ * 排除 `bool`（可隐式转 `string_view` 的陷阱）与 `ErrorPtr`。
+ */
 template <typename T>
+/// 字符串类判定：可转 string_view 且不是 bool/ErrorPtr（避免误判）。
 struct IsStringLike
     : std::bool_constant<std::is_convertible_v<const T&, std::string_view> &&
                          !std::is_same_v<std::decay_t<T>, bool> &&

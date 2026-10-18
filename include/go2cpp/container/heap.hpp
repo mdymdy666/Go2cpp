@@ -373,6 +373,16 @@ class Heap {
      *          `container/heap` 用 `Less` 建 **min-heap**。因此把比较器反向
      *          （`Inverted(a, b) = Less(b, a)`）后，标准算法的堆顶正好是最小元素。
      *          这是薄封装 `std::*_heap` 时唯一需要留意的语义换算。
+     *
+     * ## 定位
+     * 私有辅助，只被 `Heap::Init/Push/Pop` 用来把用户比较器适配给 `std::*_heap`；
+     * 不对外暴露，也不参与接口式自由函数。
+     *
+     * ## 不变量
+     * - 恒有 `Inverted(a,b) == m_less(b,a)`，即严格反转用户比较器；
+     * - 只保存**指针** `less`、不拥有比较器：`m_less` 必须比所有 `Inverted` 临时
+     *   对象活得久（它们只在单次标准库调用期间存在）；
+     * - 若 `m_less` 是严格弱序，反转后仍是严格弱序（等价类不变、方向相反）。
      */
     struct Inverted {
         const Less* less;

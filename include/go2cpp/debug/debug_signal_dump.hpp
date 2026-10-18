@@ -238,6 +238,18 @@ private:
     static constexpr int kSignal = SIGUSR1;
 #endif
 
+    /**
+     * @brief `DebugSignalDumper` 的进程级单例状态。
+     *
+     * ## 定位
+     * `Get()` 返回的静态对象；信号处理器只写 `requested`，`PollOnce` 消费它
+     * 并读取绑定对象与输出目录。
+     *
+     * ## 不变量
+     * - 信号处理器只做 `requested.store`，不碰其它字段；
+     * - `installed == false` 时 `PollOnce` 直接返回 0；
+     * - `scheduler`/`collector` 的生命周期由 `Install` 调用方保证。
+     */
     struct State {
         std::atomic<bool> installed{false}; ///< 是否已安装处理器；Install/Uninstall 写，PollOnce 读
         std::atomic<bool> requested{false}; ///< 是否收到信号；OnSignal 置真，PollOnce exchange 消费

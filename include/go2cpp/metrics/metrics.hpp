@@ -126,6 +126,7 @@ struct MetricInfo {
 
 }  // namespace detail
 
+/// 前置声明；Registry 定义在本文件后部（Metric 的 friend）。
 class Registry;
 
 /**
@@ -236,6 +237,7 @@ public:
 private:
     friend class Registry;
 
+    /// 前置声明：标签族容器（元数据 + 子指标 map），定义在 metrics.cpp。
     struct Family;
 
     explicit Counter(std::unique_ptr<Family> family);
@@ -301,6 +303,7 @@ public:
 private:
     friend class Registry;
 
+    /// 前置声明：标签族容器（元数据 + 子指标 map），定义在 metrics.cpp。
     struct Family;
 
     explicit Gauge(std::unique_ptr<Family> family);
@@ -415,6 +418,7 @@ public:
 private:
     friend class Registry;
 
+    /// 前置声明：标签族容器（元数据 + 子指标 map），定义在 metrics.cpp。
     struct Family;
 
     explicit Histogram(std::unique_ptr<Family> family);

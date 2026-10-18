@@ -232,26 +232,6 @@ Frame MakeSettingsAck();
  * `Connection` 在两处自动回 ACK：握手期 `FinishSettingsHandshake()` 与
  * `ReadEvent()` 的 PING 分支。
  *
- * ## 定位
- * `Connection::WriteData()` 构造；`ReadEvent()` 的 DATA 分支解析并做接收流控。
- *
- * ## 定位
- * 同时承载 HEADERS 与 CONTINUATION 的语义（`ParseHeaders`/`ParseContinuation`）；
- * `Connection::AssembleHeaderBlock()` 把多片 `header_block` 拼成一整块。
- *
- * ## 定位
- * `Connection::ResetStream()` 发送；`ReadEvent()` 用它把对应流置 closed。
- *
- * ## 定位
- * `Connection::SendGoAway()` 构造；`ReadEvent()` 收到后记录 `last_stream_id`
- * 并把连接迁到 `kDraining`。
- *
- * ## 定位
- * `ReadEvent()` 用它补回发送窗口（`stream_id == 0` 时是连接级窗口）。
- *
- * ## 定位
- * 能解析但**不参与调度**（RFC 9113 已弃用优先级树）；保留是为了不把
- * PRIORITY 帧当未知帧丢弃。
  */
 struct PingFrame final {
     bool ack{false};
@@ -266,6 +246,15 @@ Frame MakePing(std::uint64_t opaque_data, bool ack);
 // DATA（§6.1）
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief DATA 帧的语义视图。
+ *
+ * ## 定位
+ * `Connection::WriteData()` 构造；`ReadEvent()` 的 DATA 分支解析并做接收流控。
+ *
+ * ## 不变量
+ * `data` 已剥掉 padding（`ParseData()` 负责），长度即实际业务字节数。
+ */
 struct DataFrame final {
     std::uint32_t stream_id{0};
     bool end_stream{false};
@@ -280,6 +269,16 @@ Frame MakeData(std::uint32_t stream_id, bool end_stream,
 // HEADERS / CONTINUATION（§6.2 / §6.10）
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief HEADERS / CONTINUATION 的语义视图。
+ *
+ * ## 定位
+ * 由 `ParseHeaders()` / `ParseContinuation()` 产出；`Connection::AssembleHeaderBlock()`
+ * 把多片 `header_block` 拼成一整块，再交给 HPACK 解码。
+ *
+ * ## 不变量
+ * `end_headers == false` 表示后面还有 CONTINUATION；`end_stream` 只可能来自 HEADERS。
+ */
 struct HeadersFrame final {
     std::uint32_t stream_id{0};
     bool end_stream{false};
@@ -300,6 +299,15 @@ Frame MakeContinuation(std::uint32_t stream_id, bool end_headers,
 // RST_STREAM / GOAWAY / WINDOW_UPDATE / PRIORITY
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief RST_STREAM 帧的语义视图。
+ *
+ * ## 定位
+ * `Connection::ResetStream()` 发送；`ReadEvent()` 收到后把对应流置 closed。
+ *
+ * ## 不变量
+ * `stream_id` 非 0（协议要求），`error_code` 是 RFC 9113 §7 的错误码。
+ */
 struct RstStreamFrame final {
     std::uint32_t stream_id{0};
     ErrorCode error_code{ErrorCode::kNoError};
@@ -308,6 +316,16 @@ struct RstStreamFrame final {
 FrameStatus ParseRstStream(const Frame& frame, RstStreamFrame* out, std::string* error);
 Frame MakeRstStream(std::uint32_t stream_id, ErrorCode error_code);
 
+/**
+ * @brief GOAWAY 帧的语义视图。
+ *
+ * ## 定位
+ * `Connection::SendGoAway()` 构造；`ReadEvent()` 收到后记录 `last_stream_id`
+ * 并把连接迁到 `kDraining`。
+ *
+ * ## 不变量
+ * `last_stream_id` 是「对端已处理的最大流 id」，`debug_data` 可为空。
+ */
 struct GoAwayFrame final {
     std::uint32_t last_stream_id{0};
     ErrorCode error_code{ErrorCode::kNoError};
@@ -318,6 +336,15 @@ FrameStatus ParseGoAway(const Frame& frame, GoAwayFrame* out, std::string* error
 Frame MakeGoAway(std::uint32_t last_stream_id, ErrorCode error_code,
                  const std::vector<std::uint8_t>& debug_data = {});
 
+/**
+ * @brief WINDOW_UPDATE 帧的语义视图。
+ *
+ * ## 定位
+ * `ReadEvent()` 用它补回发送窗口；`stream_id == 0` 表示连接级窗口。
+ *
+ * ## 不变量
+ * `increment` 是 31 位非零值（为 0 属于协议错误，`ParseWindowUpdate()` 已拒绝）。
+ */
 struct WindowUpdateFrame final {
     std::uint32_t stream_id{0};
     /// 31 位增量；为 0 是协议错误。
@@ -327,6 +354,13 @@ struct WindowUpdateFrame final {
 FrameStatus ParseWindowUpdate(const Frame& frame, WindowUpdateFrame* out, std::string* error);
 Frame MakeWindowUpdate(std::uint32_t stream_id, std::uint32_t increment);
 
+/**
+ * @brief PRIORITY 帧的语义视图（解析保留但不用）。
+ *
+ * ## 定位
+ * 能解析但**不参与调度**（RFC 9113 已弃用优先级树）；保留是为了不把 PRIORITY
+ * 帧当未知帧丢弃。
+ */
 struct PriorityFrame final {
     std::uint32_t stream_id{0};
     /// 依赖的流 id（最高位是独占标志）。

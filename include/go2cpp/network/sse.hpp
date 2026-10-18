@@ -262,6 +262,7 @@ public:
     const StreamOptions& options() const noexcept { return m_options; }
 
 private:
+    /// pimpl：共享取消状态（原子 cancelled 标记），定义在 sse.cpp。
     struct State;
     Result cancellation_result() const;
     Result write_locked(std::string_view encoded);

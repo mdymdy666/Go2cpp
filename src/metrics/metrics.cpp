@@ -527,6 +527,15 @@ std::size_t Counter::SeriesCount() const {
     return m_family->children.size();
 }
 
+/**
+ * @brief 把一个 Counter 族导出为 `name value` 序列。
+ *
+ * ## 步骤
+ * step1. 输出 HELP/TYPE 头；
+ * step2. 子序列只输出自己；
+ * step3. 无标签根对象输出根值；
+ * step4. 带标签根对象持族锁遍历 children，逐个输出。
+ */
 void Counter::AppendPrometheus(std::string& out) const {
     AppendHeader(out, m_family->info);
     if (!m_is_root) {
@@ -633,6 +642,16 @@ Gauge& Gauge::With(std::initializer_list<std::string_view> labels) {
     return With(values);
 }
 
+/**
+ * @brief 取得/创建标签值对应的子 Gauge。
+ *
+ * ## 步骤
+ * step1. 校验标签值不含控制字符；
+ * step2. 子序列只接受自己的标签值，传错抛 `invalid_argument`；
+ * step3. 根对象校验标签个数；无标签族直接返回根对象；
+ * step4. 编码标签值并持族锁查找；
+ * step5. 命中返回稳定引用；未命中创建子对象并插入。
+ */
 Gauge& Gauge::With(const std::vector<std::string>& labels) {
     ValidateLabelValues(labels);
     if (!m_is_root) {
@@ -678,6 +697,15 @@ std::size_t Gauge::SeriesCount() const {
     return m_family->children.size();
 }
 
+/**
+ * @brief 把一个 Gauge 族导出为 `name value` 序列。
+ *
+ * ## 步骤
+ * step1. 输出 HELP/TYPE 头；
+ * step2. 子序列只输出自己；
+ * step3. 无标签根对象输出根值；
+ * step4. 带标签根对象持族锁遍历 children，逐个输出。
+ */
 void Gauge::AppendPrometheus(std::string& out) const {
     AppendHeader(out, m_family->info);
     if (!m_is_root) {
@@ -907,6 +935,16 @@ Histogram& Histogram::With(
     return With(values);
 }
 
+/**
+ * @brief 取得/创建标签值对应的子 Histogram。
+ *
+ * ## 步骤
+ * step1. 校验标签值不含控制字符；
+ * step2. 子序列只接受自己的标签值，传错抛 `invalid_argument`；
+ * step3. 根对象校验标签个数；无标签族直接返回根对象；
+ * step4. 编码标签值并持族锁查找；
+ * step5. 命中返回稳定引用；未命中创建子对象并插入（沿用同一组桶边界）。
+ */
 Histogram& Histogram::With(const std::vector<std::string>& labels) {
     ValidateLabelValues(labels);
     if (!m_is_root) {
