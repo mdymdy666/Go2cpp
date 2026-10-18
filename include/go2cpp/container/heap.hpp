@@ -227,20 +227,46 @@ class Heap {
     /**
      * @brief 删除并返回堆顶（默认比较下的最小值），O(log n)。
      * @throws std::out_of_range 堆为空时。
+     * @details 用「空洞下沉」而不是逐层 swap：把末元素取出后，沿较小孩子路径
+     *          把空洞一路下移（每层只移动一次），最后再尝试把末元素上移补洞。
+     *          接口式 `Pop(h)` 只能用 `Swap`，做不到这一点；模板式可以，故两者
+     *          内部实现不同但结果语义一致。
      */
     T Pop() {
         if (m_data.empty()) {
             throw std::out_of_range("go2cpp::container::Heap::Pop on empty heap");
         }
         T result = std::move(m_data.front());
-        if (m_data.size() > 1) {
-            // 把末元素搬到根再下沉，避免 O(n) 的整体前移。
-            m_data.front() = std::move(m_data.back());
+        if (m_data.size() == 1) {
             m_data.pop_back();
-            SiftDown(0);
-        } else {
-            m_data.pop_back();
+            return result;
         }
+
+        T last = std::move(m_data.back());
+        m_data.pop_back();
+        const size_type n = m_data.size();
+        size_type hole = 0;
+        while (true) {
+            size_type child = 2 * hole + 1;
+            if (child >= n) {
+                break;
+            }
+            if (child + 1 < n && m_less(m_data[child + 1], m_data[child])) {
+                ++child;
+            }
+            m_data[hole] = std::move(m_data[child]);
+            hole = child;
+        }
+        // 末元素可能比补洞位置的父节点还小，需要再上移（与 std::pop_heap 同理）。
+        while (hole > 0) {
+            const size_type parent = (hole - 1) / 2;
+            if (!m_less(last, m_data[parent])) {
+                break;
+            }
+            m_data[hole] = std::move(m_data[parent]);
+            hole = parent;
+        }
+        m_data[hole] = std::move(last);
         return result;
     }
 
@@ -282,28 +308,6 @@ class Heap {
             std::swap(m_data[parent], m_data[j]);
             j = parent;
         }
-    }
-
-    bool SiftDown(size_type i0) {
-        const size_type n = m_data.size();
-        size_type i = i0;
-        while (true) {
-            const size_type left = 2 * i + 1;
-            if (left >= n) {
-                break;
-            }
-            size_type child = left;
-            const size_type right = left + 1;
-            if (right < n && m_less(m_data[right], m_data[left])) {
-                child = right;
-            }
-            if (!m_less(m_data[child], m_data[i])) {
-                break;
-            }
-            std::swap(m_data[i], m_data[child]);
-            i = child;
-        }
-        return i > i0;
     }
 
     std::vector<T> m_data;
