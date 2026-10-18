@@ -9031,3 +9031,134 @@ close_f / shutdown_f / fcntl_f / dup_f / dup2_f
 ## 2026-10-18
 
 本轮（QUIC 薄封装 + hook 完善 + os 收尾 + 架构图渲染验证）的完整记录、未完成项、已知陷阱见 \docs/NEXT-STEPS.md\。
+
+---
+
+## 2026-10-18 状态机正确性 + 并发风险审查（穷举矩阵 / TSan）
+
+> 完整报告：`docs/state_machine_audit_2026-10-18.md`
+
+### 做了什么
+
+- 盘点 16 组状态机/开关（GState、MState、PState、FiberState、TimerState、
+  Channel 关闭态、FutureStateKind、HTTP/2 StreamState、HTTP/2 Connection、
+  http::StreamState、SSE StreamState、ContextRollback::Status、Hook 位图、
+  WaitStatus/FrameStatus/HpackStatus 等结果码、HTTP ParseState、WebSocket 关闭态）。
+- 新增三个测试目标（**未改任何核心代码**）：
+  - `go2cpp_state_matrix`：GState 8×17=136 格、Fiber 5×5、Timer 6×5、
+    Channel 2×7、Future 5×4，共 1844 条断言；
+  - `go2cpp_http2_state_matrix`：StreamState 7×12=84 格逐格断言返回值+下一状态、
+    连接握手 2×6、ResponseWriter 4×5、SSE 4×6，共 20567 条断言；
+  - `go2cpp_http2_state_desync_repro`：5 个已知缺陷复现（7 个失败断言）（CMake `DISABLED`，
+    修复后去掉 DISABLED 即转正）。
+- TSan（`build-tsan`，必须 `setarch -R`，本机 `vm.mmap_rnd_bits=32`）：
+  5 个既有并发/网络二进制 + 2 个新矩阵，共 1 条数据竞争报告。
+
+### 结论（详见报告风险表）
+
+- **高**：`Connection::WriteData` 先 `SendData()` 推进流状态机、后做尺寸/流控校验；
+  被拒绝的写入仍消耗 END_STREAM，状态与线上脱节，流控"等 WINDOW_UPDATE 重试"
+  的契约失效（repro1/repro1b 稳定复现）。
+- **中**：接收侧流控窗口越界不报 FLOW_CONTROL_ERROR（repro4）；
+  连接缺少 GOAWAY/draining/closed 状态（发/收 GOAWAY 后仍接受新流）；
+  `StreamStateMachine` 无并发保护但文档写"可在任意线程使用"（TSan 已抓到
+  `RefreshFromEndFlags` 与 `SendData` 的数据竞争）；`max_concurrent_streams`
+  只写进 SETTINGS、从未校验。
+- 纯状态机逻辑（StreamState 84 格、GState 136 格、Fiber/Timer/Channel/Future）
+  未发现"非法转移被接受/终态被复活"。
+
+### 测试结果
+
+- 改动后第 1 轮全量 ctest：**101/101 通过**（102 注册，1 个 DISABLED）。
+- 最终一轮 104 注册（103 运行 + 1 DISABLED）：**103/103 通过，0 失败**。
+  中间一轮 `go2cpp_math_test` / `go2cpp_rand_test` 曾失败，那是并行任务 12:08
+  新增的模块测试，随后已被其作者修好，与本审查无关。
+- 基线首轮 98/99（`go2cpp_fiber_stack_limit_full` 偶发失败），该测试单独复跑
+  5/5 通过，判定为偶发。
+
+### 后续
+
+- R1/R2 修复后：删掉 repro 的 `DISABLED`，并把 `StreamStateMachine` 的并发
+  契约写清楚（或改成原子位打包）。
+- M/P 状态机建议收敛为可单测的集中转移函数，当前只能做采样断言。
+
+## 2026-10-18：新增 `math` + `math/rand` 模块（第 30 轮）
+
+### 改动内容
+
+新增两个基础模块，并接入构建与测试：
+
+- **`go2cpp::math`**：Go `math` 最小可用子集。
+  - 常量：`Pi`/`E`/`Sqrt2`/`SqrtE`/`SqrtPi`/`Ln2`/`Log2E`/`Ln10`/`Log10E`/
+    `MaxFloat64`/`SmallestNonzeroFloat64`；
+  - 基本/超越函数：`Abs`/`Max`/`Min`/`Floor`/`Ceil`/`Round`/`Trunc`/`Mod`/
+    `Pow`/`Sqrt`/`Cbrt`/`Hypot`/`Exp`/`Exp2`/`Log`/`Log2`/`Log10`/`Sin`/`Cos`/
+    `Tan`/`Asin`/`Acos`/`Atan`/`Atan2`/`Sinh`/`Cosh`/`Tanh`；
+  - 特殊值/分解：`NaN()`、可调用常量 `Inf`（同时支持 `Inf(sign)` 与
+    `double x = Inf`）、`IsNaN`/`IsInf`/`Signbit`/`Copysign`、`Modf`/`Frexp`/`Ldexp`；
+  - 整数边界：`MaxInt8/16/32/64`、`MinInt8/16/32/64`、`MaxUint8/16/32/64`、`MaxInt`/`MinInt`。
+- **`go2cpp::rand`**：Go `math/rand` 最小可用子集。
+  - 算法：**xoshiro256\*\***（Blackman & Vigna，public domain/CC0），
+    splitmix64 播种；未使用 `std::mt19937`；
+  - `Rand` 实例：`Int`/`Intn`/`Int63`/`Int63n`/`Uint32`/`Uint64`/`Float64`/
+    `Float32`/`Perm`/`Shuffle`/`Read`/`Seed`；
+  - 全局函数：`go2cpp::rand::Intn()` 等 12 个无状态函数；
+  - **并发策略选 A**：全局函数用进程级 `std::mutex` 保护，实例不加锁，
+    与 Go 的「顶层函数并发安全 / `*rand.Rand` 非并发安全」划分一致。
+    `Read` 与 Go 的 `readVal/readPos` 对齐：每个 `Int63()` 产出 **7 个字节**
+    （已用 Go 1.27 实测确认，不是 8 个）。
+- 构建：`cmake/Go2CppModules.cmake` 新增 `go2cpp_math`/`go2cpp_rand` 两个库、
+  `go2cpp::math`/`go2cpp::rand` ALIAS、`GO2CPP_MODULE_TARGETS`、runtime 链接；
+  `go2cpp_math` 显式链接 `m`。`cmake/Go2CppTests.cmake` 新增
+  `go2cpp_math_test`/`go2cpp_rand_test` 两个 ctest 目标。
+
+### 关键文件
+
+| 文件 | 说明 |
+|---|---|
+| `include/go2cpp/math/math.hpp` | math API、常量、Inf 可调用常量设计 |
+| `src/math/math.cpp` | libm 委托 + Go 语义的 Max/Min/Modf/Frexp |
+| `include/go2cpp/math/rand.hpp` | rand API、xoshiro256**/并发策略文档、最小 span |
+| `src/math/rand.cpp` | xoshiro256** + splitmix64 + 全局 mutex |
+| `tests/math/test_math.cpp` | 8 个真实场景 + 逐函数 10 万随机 libm 对拍 + 压测 |
+| `tests/math/test_rand.cpp` | 已知向量 + 卡方/桶统计 + 8 线程并发 + 7 个真实场景 + 压测 |
+| `tests/math/test_math_env.hpp` | 两个测试共享的 CPU/编译器环境输出 |
+| `cmake/Go2CppModules.cmake`、`cmake/Go2CppTests.cmake` | 构建与 ctest 注册 |
+
+### 测试结果（实测）
+
+```sh
+cd /UserData/CodexWorkSpace/Go2Cpp
+flock /tmp/go2cpp_build.lock cmake -S . -B build-quality        # CMake Error 0
+flock /tmp/go2cpp_build.lock cmake --build build-quality -j 12  # 全量成功，无警告
+./build-quality/go2cpp_math_test                                 # failures=0
+./build-quality/go2cpp_rand_test                                 # failures=0
+ctest --test-dir build-quality --output-on-failure
+# 100% tests passed, 0 tests failed out of 103
+# Total Tests: 104（1 个 Disabled：go2cpp_http2_state_desync_repro）
+# go2cpp_fiber_stack_limit_full 本轮实际通过
+```
+
+- math 随机对拍：21 个一元函数各 10 万 + 32 个特殊值，7 个二元函数各 10 万 +
+  1024 个特殊值对；`Modf`/`Frexp`/`Ldexp` 各约 10 万；**全部 max_ulp=0、
+  mismatches=0**（容差 1 ULP）。
+- math 压测（AMD Ryzen 9 8945HX，WSL2，g++ 13.3.0，Release/-O2，12 逻辑核）：
+  `sqrt` 429.69 Mops/s、`exp` 255.30 Mops/s、`log` 275.72 Mops/s（各 1000 万次）。
+- rand 分布：`Intn(1000)` 100 万次 chi2=1036.46（阈值 1267.19）；
+  `Uint32` 低字节 256 桶 chi2=231.34（阈值 390.50）；`Float64` 10 桶 chi2=6.88；
+  8 线程 × 10 万次全局 `Intn(100)` chi2=108.56（阈值 183.43）。
+- rand 压测：全局 `Intn(1000)` 113.18 Mops/s（8.84 ns/op）、实例 `Intn(1000)`
+  219.09 Mops/s（4.56 ns/op）、全局 `Uint64` 158.43 Mops/s。
+- rand 已知向量：seed=1 / seed=42 的前 10 个 `Uint64` 与官方参考算法
+  （Python 独立实现）逐位一致。
+
+### 后续 / 未做
+
+- 未实现 `math` 的特殊函数（`Gamma`/`Erf`/`J0` 等）、`MaxFloat32`/
+  `SmallestNonzeroFloat32`、`Float32bits` 系列位操作；
+- 未实现 `rand` 的 `NormFloat64`/`ExpFloat64`/`Int31`/`Int31n`/`Source` 接口、
+  `jump()`/`long_jump()`；
+- 未跑完整 TestU01 BigCrush（只做卡方/桶统计/置换/并发与已知向量对拍）；
+- 与 Go 的 PRNG 数值序列**不互通**（Go 1.23 默认源是 runtime ChaCha8 / 兼容
+  lagged-Fibonacci；本模块是 xoshiro256\*\*），同种子不同序列，API/分布语义一致；
+- 本次未执行任何 git 命令。

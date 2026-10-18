@@ -296,6 +296,50 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_http2_boundary COMMAND go2cpp_http2_boundary)
     set_tests_properties(go2cpp_http2_boundary PROPERTIES TIMEOUT 180)
 
+    # ---- 状态机穷举矩阵（状态机正确性 + 并发风险审查新增）----
+    # 说明：矩阵测试按「N 状态 x M 事件」逐格断言合法/非法转移；复现测试
+    # 断言期望语义，缺陷修复前用 DISABLED 注册，避免把已知缺陷算成回归。
+    add_executable(go2cpp_state_matrix
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_state_machine_matrix.cpp)
+    target_link_libraries(go2cpp_state_matrix PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_state_matrix PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_state_matrix COMMAND go2cpp_state_matrix)
+    set_tests_properties(go2cpp_state_matrix PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_http2_state_matrix
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_http2_state_matrix.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/connection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/frame.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/hpack.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/huffman.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/stream_state.cpp)
+    target_include_directories(go2cpp_http2_state_matrix PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(go2cpp_http2_state_matrix PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_http2_state_matrix PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_http2_state_matrix COMMAND go2cpp_http2_state_matrix)
+    set_tests_properties(go2cpp_http2_state_matrix PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_http2_state_desync_repro
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_http2_state_desync_repro.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/connection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/frame.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/hpack.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/huffman.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/stream_state.cpp)
+    target_include_directories(go2cpp_http2_state_desync_repro PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(go2cpp_http2_state_desync_repro PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_http2_state_desync_repro PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_http2_state_desync_repro
+             COMMAND go2cpp_http2_state_desync_repro)
+    # 缺陷修复前保持 DISABLED：它断言的是期望语义，现在应当失败。
+    set_tests_properties(go2cpp_http2_state_desync_repro PROPERTIES
+        TIMEOUT 120 DISABLED TRUE)
+
     # ---- log 缓冲区与 Formatter（子代理新增）----
     add_executable(go2cpp_log_buffer_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/logging/test_log_buffer.cpp
@@ -307,6 +351,23 @@ if (GO2CPP_BUILD_TESTS)
     set_tests_properties(go2cpp_log_buffer_test PROPERTIES TIMEOUT 120)
 
 
+
+    # ---- math / math/rand 模块（math 委托 libm；rand 为 xoshiro256**）----
+    # 两个目标只链接各自的模块库，不拖入整个 runtime：math/rand 是基础库，
+    # 测试也应当能在最小依赖下独立编译运行。
+    add_executable(go2cpp_math_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/math/test_math.cpp)
+    target_link_libraries(go2cpp_math_test PRIVATE go2cpp_math)
+    target_compile_options(go2cpp_math_test PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_math_test COMMAND go2cpp_math_test)
+    set_tests_properties(go2cpp_math_test PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_rand_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/math/test_rand.cpp)
+    target_link_libraries(go2cpp_rand_test PRIVATE go2cpp_rand)
+    target_compile_options(go2cpp_rand_test PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_rand_test COMMAND go2cpp_rand_test)
+    set_tests_properties(go2cpp_rand_test PROPERTIES TIMEOUT 300)
 
     add_executable(go2cpp_config_registry_macro_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/test_config_registry_macro.cpp)

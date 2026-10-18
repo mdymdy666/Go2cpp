@@ -50,6 +50,13 @@ add_library(go2cpp_network
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/sse.cpp)
 add_library(go2cpp_config ${CMAKE_CURRENT_SOURCE_DIR}/src/config/config.cpp)
 
+# math 模块：Go math 最小子集。绝大多数函数委托 libm；Max/Min 与 Modf 的
+# 特殊值语义按 Go 文档自实现（详见 include/go2cpp/math/math.hpp）。
+add_library(go2cpp_math ${CMAKE_CURRENT_SOURCE_DIR}/src/math/math.cpp)
+# math/rand 模块：xoshiro256** + splitmix64 播种；全局函数用 std::mutex 保护，
+# 本地 Rand 实例不加锁（对齐 Go 的顶层函数 / *rand.Rand 划分）。
+add_library(go2cpp_rand ${CMAKE_CURRENT_SOURCE_DIR}/src/math/rand.cpp)
+
 # os 模块：文件/目录/环境变量/参数。走 syscall 绕过 Hook（见 os/file.hpp 的边界论证），
 # 依赖 config（src/os/config.cpp 用 Config::SaveToFile 导出 app.ini）。
 add_library(go2cpp_os
@@ -80,6 +87,8 @@ set_target_properties(go2cpp_io PROPERTIES EXPORT_NAME io)
 set_target_properties(go2cpp_network PROPERTIES EXPORT_NAME network)
 set_target_properties(go2cpp_log PROPERTIES EXPORT_NAME log)
 set_target_properties(go2cpp_config PROPERTIES EXPORT_NAME config)
+set_target_properties(go2cpp_math PROPERTIES EXPORT_NAME math)
+set_target_properties(go2cpp_rand PROPERTIES EXPORT_NAME rand)
 if (TARGET go2cpp_hook)
     set_target_properties(go2cpp_hook PROPERTIES EXPORT_NAME hook)
 endif()
@@ -101,6 +110,8 @@ add_library(go2cpp::network ALIAS go2cpp_network)
 add_library(go2cpp::log ALIAS go2cpp_log)
 add_library(go2cpp::config ALIAS go2cpp_config)
 add_library(go2cpp::os ALIAS go2cpp_os)
+add_library(go2cpp::math ALIAS go2cpp_math)
+add_library(go2cpp::rand ALIAS go2cpp_rand)
 if (TARGET go2cpp_hook)
     add_library(go2cpp::hook ALIAS go2cpp_hook)
 endif()
@@ -119,6 +130,8 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_log
     go2cpp_config
     go2cpp_os
+    go2cpp_math
+    go2cpp_rand
 )
 if (TARGET go2cpp_hook)
     list(APPEND GO2CPP_MODULE_TARGETS go2cpp_hook)
@@ -141,6 +154,12 @@ foreach(module_target IN LISTS GO2CPP_MODULE_TARGETS)
     target_compile_options(${module_target} PRIVATE -Wall -Wextra -Wpedantic)
     target_link_libraries(${module_target} PUBLIC Threads::Threads)
 endforeach()
+
+# 显式链接 libm：std::sqrt/exp/log 等符号在部分工具链/链接方式下不会由
+# libstdc++ 传递；Go math 模块依赖它们，不能靠隐式依赖碰运气。
+if (UNIX)
+    target_link_libraries(go2cpp_math PUBLIC m)
+endif()
 
 target_include_directories(go2cpp_runtime INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -172,6 +191,7 @@ endif()
 target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_error go2cpp_control_flow go2cpp_context go2cpp_channel go2cpp_scheduler
     go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io go2cpp_network go2cpp_log go2cpp_config
+    go2cpp_math go2cpp_rand
     Threads::Threads)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_runtime INTERFACE go2cpp_hook)

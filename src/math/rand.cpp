@@ -1,0 +1,272 @@
+/**
+ * @file rand.cpp
+ * @brief `go2cpp/math/rand.hpp` 的实现：xoshiro256** + splitmix64 播种。
+ *
+ * @details 算法来源（public domain / CC0）：
+ *   - xoshiro256** 1.0：David Blackman & Sebastiano Vigna (2018)
+ *     https://prng.di.unimi.it/xoshiro256starstar.c
+ *   - splitmix64 播种：Sebastiano Vigna (2015)
+ *     https://prng.di.unimi.it/splitmix64.c
+ *   本文件按上述公开算法独立实现；`next()` 的状态推进顺序与参考实现逐行一致。
+ *
+ *   并发：实例不加锁；全局函数用进程级 `std::mutex` 保护（策略 A，详见头文件）。
+ *
+ * @author Go2Cpp project
+ * @date 2026-10-18
+ */
+
+#include "go2cpp/math/rand.hpp"
+
+#include <chrono>
+#include <limits>
+#include <mutex>
+#include <random>
+
+namespace go2cpp::rand {
+
+namespace {
+
+/// xoshiro256** 的 64 位循环左移。
+constexpr std::uint64_t Rotl(std::uint64_t x, int k) noexcept {
+    return (x << k) | (x >> (64 - k));
+}
+
+/// splitmix64：把 64 位种子扩散成高质量状态字（官方参考实现）。
+std::uint64_t SplitMix64(std::uint64_t& state) noexcept {
+    state += 0x9e3779b97f4a7c15ULL;
+    std::uint64_t z = state;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+/**
+ * @brief 为全局生成器取一个不可预测的初始种子。
+ * @details 优先用 `std::random_device`；某些平台（旧版 MinGW、部分容器）的
+ *          `random_device` 可能抛异常或退化为确定性序列，因此再混入高精度时钟与
+ *          栈地址，至少保证同一进程的多次运行不会从同一状态开始。
+ */
+std::uint64_t EntropySeed() noexcept {
+    std::uint64_t seed = 0;
+    try {
+        std::random_device device;
+        seed = (static_cast<std::uint64_t>(device()) << 32) ^
+               static_cast<std::uint64_t>(device());
+    } catch (...) {
+        seed = 0;
+    }
+    seed ^= static_cast<std::uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    seed ^= static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&seed));
+    return seed;
+}
+
+std::mutex& GlobalMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+Rand& GlobalRand() {
+    static Rand generator(EntropySeed());
+    return generator;
+}
+
+}  // namespace
+
+Rand::Rand(std::uint64_t seed) noexcept { Seed(seed); }
+
+void Rand::Seed(std::uint64_t seed) noexcept {
+    std::uint64_t x = seed;
+    for (auto& word : m_state) {
+        word = SplitMix64(x);
+    }
+    // xoshiro 要求状态不能全零（概率极低，但 splitmix64 的输出序列在理论上可能
+    // 连续四个 0；显式兜底，避免生成器退化为恒零）。
+    if ((m_state[0] | m_state[1] | m_state[2] | m_state[3]) == 0) {
+        m_state[0] = 0x9e3779b97f4a7c15ULL;
+    }
+    m_read_val = 0;
+    m_read_pos = 0;
+}
+
+std::uint64_t Rand::Uint64() noexcept {
+    // xoshiro256** 1.0 的 next()（逐行对照官方参考实现）。
+    const std::uint64_t result = Rotl(m_state[1] * 5, 7) * 9;
+    const std::uint64_t t = m_state[1] << 17;
+    m_state[2] ^= m_state[0];
+    m_state[3] ^= m_state[1];
+    m_state[1] ^= m_state[2];
+    m_state[0] ^= m_state[3];
+    m_state[2] ^= t;
+    m_state[3] = Rotl(m_state[3], 45);
+    return result;
+}
+
+std::uint32_t Rand::Uint32() noexcept {
+    // Go 1.23: func (r *Rand) Uint32() uint32 { return uint32(r.Int63() >> 31) }
+    return static_cast<std::uint32_t>(Int63() >> 31);
+}
+
+std::int64_t Rand::Int63() noexcept {
+    return static_cast<std::int64_t>(Uint64() >> 1);
+}
+
+std::int64_t Rand::Int() noexcept {
+    // Go 的 Int() 在 64 位平台上就是 Int63()（int 宽度 == 64）。
+    return Int63();
+}
+
+std::int64_t Rand::Int63n(std::int64_t n) {
+    if (n <= 0) {
+        throw std::invalid_argument("rand.Int63n: n must be positive");
+    }
+    // 2 的幂直接掩码；Go 的实现也是这条快速路径。
+    if ((n & (n - 1)) == 0) {
+        return Int63() & (n - 1);
+    }
+    const std::uint64_t un = static_cast<std::uint64_t>(n);
+    // 拒绝采样：只接受 <= (2^63-1) - (2^63 mod n) 的值，保证取模后均匀。
+    const std::int64_t max_value = static_cast<std::int64_t>(
+        (std::uint64_t{1} << 63) - 1ULL - ((std::uint64_t{1} << 63) % un));
+    std::int64_t value = Int63();
+    while (value > max_value) {
+        value = Int63();
+    }
+    return value % n;
+}
+
+std::int64_t Rand::Intn(std::int64_t n) {
+    if (n <= 0) {
+        throw std::invalid_argument("rand.Intn: n must be positive");
+    }
+    // Go 1.23: n <= 2^31-1 时走 Int31n（31 位拒绝采样），否则走 Int63n。
+    if (n <= static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max())) {
+        const std::int32_t bound = static_cast<std::int32_t>(n);
+        const std::int32_t value = static_cast<std::int32_t>(Int63() >> 32);
+        if ((bound & (bound - 1)) == 0) {
+            return static_cast<std::int64_t>(value & (bound - 1));
+        }
+        const std::int32_t max_value = static_cast<std::int32_t>(
+            (std::uint32_t{1} << 31) - 1ULL -
+            ((std::uint32_t{1} << 31) % static_cast<std::uint32_t>(bound)));
+        std::int32_t candidate = value;
+        while (candidate > max_value) {
+            candidate = static_cast<std::int32_t>(Int63() >> 32);
+        }
+        return static_cast<std::int64_t>(candidate % bound);
+    }
+    return Int63n(n);
+}
+
+double Rand::Float64() noexcept {
+    // Go 的实现：f = Int63() / 2^63；理论上可能四舍五入到 1.0（1/2^53 概率），
+    // 此时重采样，保证严格小于 1.0。
+    for (;;) {
+        const double value = static_cast<double>(Int63()) / 9223372036854775808.0;
+        if (value != 1.0) {
+            return value;
+        }
+    }
+}
+
+float Rand::Float32() noexcept {
+    for (;;) {
+        const float value = static_cast<float>(Float64());
+        if (value != 1.0f) {
+            return value;
+        }
+    }
+}
+
+std::vector<std::int64_t> Rand::Perm(std::int64_t n) {
+    if (n < 0) {
+        throw std::invalid_argument("rand.Perm: negative n");
+    }
+    std::vector<std::int64_t> result(static_cast<std::size_t>(n));
+    // Go 的原地算法：i=0 时也执行一次 m[0] = m[0]，这会消耗一次随机数；
+    // 为了保持与 Go 相同的随机流消耗，不跳过 i=0。
+    for (std::int64_t i = 0; i < n; ++i) {
+        const std::int64_t j = Intn(i + 1);
+        result[static_cast<std::size_t>(i)] = result[static_cast<std::size_t>(j)];
+        result[static_cast<std::size_t>(j)] = i;
+    }
+    return result;
+}
+
+std::size_t Rand::Read(ByteSpan p) noexcept {
+    // 与 Go 的 read() 一致：每次从 Int63() 取 7 个字节（63 位中只用低 56 位），
+    // 未用完的字节保存在 m_read_val / m_read_pos 里，跨调用继续使用。
+    // 不要把 m_read_pos 改成 8：Go 的 readPos 从 7 递减到 0，每次只产出 7 字节；
+    // 实测 Go 1.27 的 Rand.Read 也是这个行为。
+    for (std::size_t i = 0; i < p.size(); ++i) {
+        if (m_read_pos == 0) {
+            m_read_val = Int63();
+            m_read_pos = 7;
+        }
+        p[i] = static_cast<byte>(m_read_val);
+        m_read_val >>= 8;
+        --m_read_pos;
+    }
+    return p.size();
+}
+
+// ============================================================================
+// 全局函数：一个进程级 Rand + mutex（策略 A）
+// ============================================================================
+
+void Seed(std::int64_t seed) {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    GlobalRand().Seed(static_cast<std::uint64_t>(seed));
+}
+
+std::uint64_t Uint64() {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Uint64();
+}
+
+std::uint32_t Uint32() {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Uint32();
+}
+
+std::int64_t Int63() {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Int63();
+}
+
+std::int64_t Int() {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Int();
+}
+
+std::int64_t Int63n(std::int64_t n) {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Int63n(n);
+}
+
+std::int64_t Intn(std::int64_t n) {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Intn(n);
+}
+
+double Float64() {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Float64();
+}
+
+float Float32() {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Float32();
+}
+
+std::vector<std::int64_t> Perm(std::int64_t n) {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Perm(n);
+}
+
+std::size_t Read(ByteSpan p) {
+    std::lock_guard<std::mutex> lock(GlobalMutex());
+    return GlobalRand().Read(p);
+}
+
+}  // namespace go2cpp::rand
