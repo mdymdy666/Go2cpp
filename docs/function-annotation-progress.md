@@ -34,7 +34,7 @@
 
 | 模块 | 候选函数 | 状态 |
 |---|---|---|
-| io | `poll_once` / `process_events_batch` / `register_wait` | ⬜ |
+| io | `poll_once` ✅ / `process_events_batch` ✅ / `register_wait` | 2/3 完成 |
 | hook | `cooperative_io` / `cooperative_connect` | ⬜ |
 | fiber | `Fiber::resume_locked` | ⬜ |
 | sync | `Mutex::LockImpl` / `Unlock` | ⬜ |

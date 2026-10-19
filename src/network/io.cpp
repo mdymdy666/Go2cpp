@@ -1517,6 +1517,37 @@ private:
     //
     // 迟到的 registration token 仍由 locked helper 忽略；所有 Fiber 在释放
     // 条带锁后统一唤醒。
+    /**
+     * @brief 批量处理一次 `epoll_wait` 返回的事件（IO 事件的主出口）。
+     * @param events 后端返回的事件数组；为空或 `count == 0` 时直接返回。
+     * @param count 事件个数。
+     *
+     * ## 定位
+     *
+     * 由 `poll_once()` 在 `m_backend->wait()` 之后调用，是**所有 IO 就绪**进入
+     * 调度器的唯一入口。它把「事件 → fd 槽位 → 等待者」的解析、唤醒收集、
+     * 批量投递三件事串起来。
+     *
+     * ## 步骤
+     *
+     * step1. 空检查后准备 `WakeList`（本批次所有要唤醒的等待者）；
+     * step2. 逐事件：跳过 `kWakeRegistration`（tickle 用的 eventfd，由
+     *        `poll_once` 单独排空），按 fd 取所属条带锁，在锁内调
+     *        `process_event_locked` —— 它把 fd 事件翻译成等待者的完成状态，
+     *        并把等待者追加到 `wake`（**不在锁内唤醒**）；
+     * step3. 全部事件处理完、锁释放后一次性 `wake_nodes(wake)`。
+     *
+     * ## 并发/失败语义
+     *
+     * - **每事件只持自己 fd 所属条带的锁**（`SlotStripe`，64 分条），处理完
+     *   立即释放。旧实现把整批 256 个事件放在同一把全局锁下（锁内还有
+     *   `epoll_ctl`），12 个 M 实际只有一个能推进，实测并行度约 1.7 核；
+     * - **同一 fd 仍由同一条带锁串行化**，不会有两个 M 同时处理同一 fd；
+     * - 迟到的 `registration_token`（fd 已关闭并复用）由 `process_event_locked`
+     *   内部忽略，不会误唤醒新连接的等待者；
+     * - **唤醒必须在锁外**：`wake_nodes` 会重新入队并可能触发跨 M 通知，
+     *   持条带锁做这件事会与 `register_wait` 形成锁序环。
+     */
     void process_events_batch(const BackendEvent* events,
                               std::size_t count) noexcept {
         if (events == nullptr || count == 0) {
@@ -1748,6 +1779,42 @@ private:
      *                   超时的精度不被空转等待拖慢。
      * @return >0 表示处理了事件；0 表示正常超时；<0 表示后端不可用（已停止
      *         或出错），调用方应退回条件变量等待，避免忙循环。
+     */
+    /**
+     * @brief 做一次「等待 IO 事件 + 处理 + 处理到期定时器」的完整循环。
+     * @param timeout_ms 最长等待毫秒数（>=0）。调用方传入调度器的 `idle_wait`；
+     *                   这里再与最近的定时器截止时间取较小值，保证 sleep/超时
+     *                   的精度不被空转等待拖慢。
+     * @return >0 表示处理了事件；0 表示正常超时；<0 表示后端不可用（已停止或
+     *         出错），调用方应退回条件变量等待，避免忙循环。
+     *
+     * ## 定位
+     *
+     * `Scheduler` 在 worker 空闲时通过 `set_io_idle_poller` 注入的回调调用本函数。
+     * 它是 **IO 与调度器之间的唯一驱动点**：一次调用把「等事件 → 分发事件 →
+     * 处理超时」串完，中间不返回调度器。
+     *
+     * ## 步骤
+     *
+     * step1. 后端可用性检查：无后端或已请求停止时返回 -1（让调用方退回阻塞
+     *        等待，而不是空转）；
+     * step2. 计算**有效超时**：取 `timeout_ms` 与 `poll_timeout_ms()`（最近
+     *        定时器）的较小值；有定时器已到期时直接取 0（不等待，立刻处理）；
+     * step3. 标记「正在 poll」（`m_waiters` / `t_inside_poll`），然后
+     *        `m_backend->wait()`；被信号打断（`EINTR`）时重试；
+     * step4. 若本批次含 `kWakeRegistration`，排空 eventfd 并清
+     *        `m_tickle_pending`——eventfd 是计数语义，谁排空都行；
+     * step5. 有事件则 `process_events_batch()`；**无论有无事件**都调
+     *        `expire_timers()`（超时处理不能依赖 IO 事件到达）。
+     *
+     * ## 并发/失败语义
+     *
+     * - `t_inside_poll` 是本线程的「正在 poll」标记，供 `tickle()` 判断是否
+     *   需要写 eventfd 打断（见 `inside_poll()`）；返回前必须复位；
+     * - `m_waiters` 是**跨线程**计数：`stop()` 用它判断是否还有 poller 在跑；
+     * - `EINTR` 只重试 `wait`，不重试整个函数——否则事件可能被重复处理；
+     * - `noexcept`：本函数在 worker 空闲路径上，不能因异常把线程带崩；
+     * - 有效超时为 0 时不阻塞，但**仍会**处理已经就绪的事件与到期定时器。
      */
     int poll_once(int timeout_ms) noexcept {
         if (!m_backend) {
