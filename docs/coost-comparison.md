@@ -325,3 +325,62 @@ thread_local int t_sleep_eventfd = -1;
 **可选优化**（未验证，下轮尝试）：
 - 给 `SchedulerConfig` 加「唤醒时优先本 P 的队列尾部」的快速路径（减少跨 P 选择）；
 - 或者让 P 有固定亲和连接（`pin_workers_to_cpu` 已有，但只对 M 生效）。
+
+---
+
+# 第五轮：coost 的窃取机制对照（解释 P99.9 差距的来源）
+
+## coost 的调度循环（`src/co/sched.cc:117`）
+
+```cpp
+while (!_stopped) {
+    _epoll->wait(_wait_ms);
+    _epoll->handle_events();
+    do {
+        _task_mgr.get_all_tasks(_new_tasks, _ready_tasks);
+        if (!_new_tasks.empty())   { for (...) resume(new_coroutine(...)); }
+        if (!_ready_tasks.empty()) { for (...) resume(...); }
+        else {
+            const size_t n = this->steal_tasks();   // ← 本地空了才偷
+            ...
+        }
+    } while (0);
+    _wait_ms = _timer_mgr.check_timeout(_ready_tasks);
+    ...
+}
+```
+
+**coost 的窃取时机：本地 `_new_tasks` 与 `_ready_tasks` 都为空时，才 `steal_tasks()`。**
+
+## GMP 的窃取（`src/concurrency/scheduler.cpp`）
+
+同样的结构：`worker_loop` 先取本 P 队列（`pop_local`），取不到才走 `take_victim`（偷一半，带 `scan_limit` 与 `prefer_class`）。
+
+**两者在「何时偷」上没有差别。**
+
+## 那 P99.9 的差距从哪来
+
+| 环节 | coost | GMP | epoll 池 |
+|---|---|---|---|
+| 任务队列 | 每 Sched 独立 + steal | P 共享 runqueue + steal | **每 worker 独立（无共享）** |
+| 唤醒一个任务 | 写本线程队列 | **要在 N 个 P 里选一个** | 直接唤醒一个 worker |
+| P99.9（实测 GMP） | 未测（benchmark 跑不出数据） | 35ms（P=24） | **29ms** |
+
+**结论**：
+1. **窃取时机相同**，所以 P99.9 的差距**不是窃取导致的**；
+2. 差距来自 **「唤醒时要跨 P 选择目标」** ——epoll 池的 worker 是**自己从 epoll 拿到事件**，不需要别人替它选；
+3. **coost 也有这个问题**（它同样要在多个 `Sched` 间唤醒），所以**参考 coost 解决不了 P99.9**。
+
+## 这一轮否定的假设
+
+- ❌「P99.9 差是因为 GMP 有跨 P 窃取而 coost 没有」——**coost 也有**；
+- ❌「P99.9 差是因为窃取太频繁」——`nonvol=0.000/请求`，实测没有触发；
+- ✅ **P99.9 差是因为「共享 runqueue + 跨 P 唤醒选择」**，这是 GMP/coost 这类 **M:N 调度器**相对「每 worker 独占连接」的固有劣势。
+
+## 可尝试但风险高的方向
+
+1. **连接亲和到 P**：让同一连接的后续请求回到同一个 P（缓存友好，减少跨 P 唤醒）；
+2. **唤醒时优先本 P**：如果当前 P 的 `running_machines > 0`，直接把 G 塞进本 P 队列尾部而不是唤醒别的 P——但这可能加剧负载不均；
+3. **接受这个差距**：P99.9 差 20%（35 vs 29ms），而 QPS 与 CPU 效率都更好（P=24 时 QPS +7.6%）。
+
+**本轮未改代码**：读源码对照后确认「参考 coost」无法解决 P99.9，避免了又一个错误方向的改动。
