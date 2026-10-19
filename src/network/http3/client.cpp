@@ -353,6 +353,48 @@ struct Client::Impl {
     void CaptureHeader(StreamState* stream);
 };
 
+/**
+ * @brief picoquic 的全局事件回调：把 C 库的连接/流事件翻译成本对象的状态。
+ * @param cnx 连接句柄（只在 `ready` 分支用于 `h3zero_protocol_init`）。
+ * @param stream_id 事件所属的 QUIC 流 id（流类事件有效）。
+ * @param bytes/length 事件携带的数据（`stream_data`/`stream_fin` 为流字节，
+ *        `close` 类事件为关闭码）。
+ * @param event 事件类型。
+ * @param callback_ctx 就是 `Impl*` 自身（picoquic 透传）。
+ * @return 0——picoquic 要求回调返回 0；非 0 会被当成致命错误。
+ *
+ * ## 定位
+ *
+ * 这是**本项目与 picoquic 的唯一交互面**：所有 QUIC/HTTP3 协议事件都从这里
+ * 进入 C++ 侧。文件头也强调「唯一 include `picohttp`（h3zero/QPACK）头的地方」。
+ *
+ * ## 步骤
+ *
+ * step1. **`ready`**：先 `h3zero_protocol_init` 发出 SETTINGS 与 QPACK
+ *        encoder/decoder 流，**之后**才允许上层发请求（顺序不能反，否则对端
+ *        会在控制流建立前收到 HEADERS）；初始化失败时置 `closed` 并记录原因；
+ * step2. **`set_alpn`**：记录协商出的 ALPN（诊断用）；
+ * step3. **流事件**：`stream_data`/`stream_fin` 交给 `HandleStreamData`
+ *        （按 `fin` 区分是否收尾）；`stream_reset`/`stop_sending` 交给
+ *        `FailStream` 标记失败；
+ * step4. **关闭类事件**（`close`/`application_close`/`stateless_reset`）：
+ *        置 `closed`，用 `DecodeCloseCode` 解析应用层关闭码，并记录首个原因。
+ *
+ * ## 并发/失败语义
+ *
+ * - **必须返回 0**：picoquic 把非 0 返回值当作致命错误，会直接拆连接；
+ * - **回调在 picoquic 自己的线程上执行**，不能阻塞、不能 park；本函数只做
+ *   状态更新与数据搬运，没有等待；
+ * - **`self == nullptr` 时返回 0**：`~Impl` 里 `connection.reset()` 会触发
+ *   一次 `close` 回调，此时 `callback_ctx` 仍有效，但防御性地判空；
+ * - **`ready` 只处理一次**（`if (self->ready) break;`）：picoquic 可能重复
+ *   触发，重复 init 会破坏控制流；
+ * - **关闭原因只记第一次**（`if (close_reason.empty())`）：后续关闭事件
+ *   （如先 `application_close` 再 `close`）不覆盖更具体的信息；
+ * - **`stream_id` 的流类型过滤在 `HandleStreamData`/`FailStream` 里做**，
+ *   本函数不做——因为它们各自需要不同的过滤理由（只关心双向流 vs 只标记已知流）；
+ * - **不抛异常**：C 回调栈不能传播 C++ 异常，所有分支都只做不会抛的操作。
+ */
 int Client::Impl::Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
                            std::size_t length, picoquic_call_back_event_t event,
                            void* callback_ctx, void* /*stream_ctx*/) {
@@ -362,6 +404,7 @@ int Client::Impl::Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::ui
     }
 
     switch (event) {
+        // step1: 连接就绪——先建控制流（SETTINGS/QPACK），之后才允许发请求。
         case picoquic_callback_ready: {
             if (self->ready) {
                 break;
@@ -381,6 +424,7 @@ int Client::Impl::Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::ui
                 self->alpn.assign(reinterpret_cast<const char*>(bytes), length);
             }
             break;
+        // step3: 流事件——数据/收尾交给 HandleStreamData，reset 标记失败。
         case picoquic_callback_stream_data:
             self->HandleStreamData(cnx, stream_id, bytes, length, false);
             break;
@@ -393,6 +437,7 @@ int Client::Impl::Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::ui
         case picoquic_callback_stop_sending:
             self->FailStream(stream_id, "peer requested stop sending");
             break;
+        // step4: 关闭类事件——置 closed、解析关闭码、只记首个原因。
         case picoquic_callback_close:
         case picoquic_callback_application_close:
         case picoquic_callback_stateless_reset:
