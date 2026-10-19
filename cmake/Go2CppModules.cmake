@@ -48,7 +48,10 @@ add_library(go2cpp_network
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/websocket.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/sse.cpp)
-add_library(go2cpp_config ${CMAKE_CURRENT_SOURCE_DIR}/src/config/config.cpp)
+add_library(go2cpp_config
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/config/config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/config/so_manifest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/config/so_reloader.cpp)
 
 # math 模块：Go math 最小子集。绝大多数函数委托 libm；Max/Min 与 Modf 的
 # 特殊值语义按 Go 文档自实现（详见 include/go2cpp/math/math.hpp）。
@@ -245,7 +248,7 @@ target_include_directories(go2cpp_runtime INTERFACE
 target_link_libraries(go2cpp_context PUBLIC go2cpp_error go2cpp_scheduler)
 target_link_libraries(go2cpp_channel PUBLIC go2cpp_context go2cpp_error)
 target_link_libraries(go2cpp_scheduler PUBLIC go2cpp_fiber go2cpp_log)
-target_link_libraries(go2cpp_config PUBLIC go2cpp_scheduler go2cpp_log)
+target_link_libraries(go2cpp_config PUBLIC go2cpp_scheduler go2cpp_log go2cpp_hash)
 if (GO2CPP_NATIVE_CONTEXT)
     # Linux x86_64 uses the internal context ABI; it no longer needs the
     # Boost.Context protected-stack implementation at link time.

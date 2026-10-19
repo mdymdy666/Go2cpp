@@ -1009,3 +1009,43 @@ benchmarks/gmp_vs_thread_epoll_benchmark.cpp
   风险高）；cooperative_sleep_for 复用 eventfd。
 - 语义：未发现破坏。同 fd 的 Capture/Invalidate/在途 syscall 互斥、fd 复用代际门、
   ONESHOT 语义均由 113 个测试覆盖通过。
+
+## 15. 2026-10-19 新增 SO 热重载配置层：manifest 静态校验 + 两阶段事务（deepseek）
+
+**改动内容**：
+
+- 新增 `docs/so-reload-design.md`：分层结构、17 个场景逐条对应键/校验、文字版
+  事务时序、ABI 接口约定、明确的不做项与已知限制。
+- 新增 `include/go2cpp/config/so_manifest.hpp` + `src/config/so_manifest.cpp`：
+  `[so]` / `[so.group.*]` / `[so.<name>]` 解析；文件存在、SHA-256（复用
+  `go2cpp_hash`）、声明 ABI、依赖环、符号前缀冲突、版本化路径静态校验；
+  不引入 `<dlfcn.h>`。
+- 新增 `include/go2cpp/config/so_reloader.hpp` + `src/config/so_reloader.cpp`：
+  `SoLoader`/`SoUnloader`/`SoActivator` 回调注入；revision 幂等与栅栏；
+  变更集/A1 依赖一致性；`ApplyString` → `NotifyPending` →
+  `RollbackPending` 两阶段；失败只卸载本次新加载的 SO；`keep_versions`
+  保留清单与 `so.<name>.runtime.*` 观测键。
+- 新增 `tests/config/test_so_manifest.cpp`（假 loader，不编译真实 `.so`），覆盖
+  A1/A2/A3/B2/B3/D1/D2/D3/E1/F2，另加 C2 的 Notify→Activator 顺序断言。
+- 新增 `docs/state-machines/SoReloader.md`（注释规范要求的状态转化表）。
+- 改 `cmake/Go2CppModules.cmake`（`go2cpp_config` 增加两个源文件并链接
+  `go2cpp_hash`）与 `cmake/Go2CppTests.cmake`（新增 `go2cpp_so_manifest_test`）。
+- **未改** `include/go2cpp/config/config.hpp` 与 `src/config/config.cpp`。
+
+**测试结果**：
+
+- `cmake --build build-work -j8`：全量构建通过；新代码 `-Wall -Wextra -Wpedantic`
+  无告警。
+- `ctest --test-dir build-work -R so_manifest --output-on-failure`：1/1 通过
+  （0.01s）。
+- `ctest --test-dir build-work -R 'so_manifest|config_registry'`：2/2 通过。
+- `ctest --test-dir build-work -R '^go2cpp_tests$'`：首次运行出现 2 个 hook
+  时序失败（既有用例），立即重跑 1/1 通过；失败与本轮 config 改动无直接关联，
+  但如实记录为波动项。
+
+**后续状态**：
+
+- 未实现：E3 的 `IN_Q_OVERFLOW` 全量重扫、F1 的灰度/进程隔离、F2 的成功/失败
+  计数与耗时、F3 的跨进程测试；真实 `dlopen` loader 与 vtable 切换不在本层。
+- 已知限制：已加载组/SO 从 manifest 消失会被拒绝（不在本层退役）；一次
+  `Reload` 跨组全或全无；路径若含 `#`/`;` 会被 `IniFile` 截断。

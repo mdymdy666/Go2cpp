@@ -421,6 +421,16 @@ if (GO2CPP_BUILD_TESTS)
              COMMAND go2cpp_config_registry_macro_test)
     set_tests_properties(go2cpp_config_registry_macro_test PROPERTIES TIMEOUT 120)
 
+    # ---- config/SO 热重载 manifest：解析、静态校验与两阶段事务 ----
+    # 假 loader 注入，不编译/不加载真实 .so；ctest -R so_manifest 命中。
+    add_executable(go2cpp_so_manifest_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/test_so_manifest.cpp)
+    target_link_libraries(go2cpp_so_manifest_test PRIVATE go2cpp_config)
+    target_compile_options(go2cpp_so_manifest_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_so_manifest_test COMMAND go2cpp_so_manifest_test)
+    set_tests_properties(go2cpp_so_manifest_test PROPERTIES TIMEOUT 180)
+
     # ---- compress 模块：flate / zlib / gzip（薄封装系统 zlib）----
     # 一个可执行文件包含全部测试段：单元、随机、系统 gzip 互操作、8 个真实场景
     # 与低熵/高熵压测。拆成多个 target 只会重复编译模板实例，没有收益。
