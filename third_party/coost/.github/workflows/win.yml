@@ -1,0 +1,34 @@
+name: Windows
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest]
+        arch: [x64, x86]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v1
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+          build-cache: true
+          build-cache-key: ${{ matrix.arch }}
+
+      - name: Tests
+        run: |
+          xmake -a
+          xmake r unitest
+          xmake r co
+          xmake r os
+          xmake r tcp

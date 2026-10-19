@@ -194,6 +194,36 @@ std::uint32_t io_sleep_max_us() {
     return value;
 }
 
+/// @brief 把 body 当作 int32 数组排序（真实 CPU 计算；规模由 body 长度决定）。
+/// @details 这不是「注入延迟」，而是真正消耗 CPU 的排序：规模小时是 L1 内快排，
+///          规模大时会溢出 cache。用它来测「每请求计算量」对两种模型的影响。
+std::string SortPayload(std::string_view body) {
+    if (body.size() < 8 || body.size() % 4 != 0) {
+        return std::string(body);
+    }
+    std::vector<std::int32_t> values(body.size() / sizeof(std::int32_t));
+    std::memcpy(values.data(), body.data(), body.size());
+    std::sort(values.begin(), values.end());
+    std::string out(body.size(), '\0');
+    std::memcpy(out.data(), values.data(), out.size());
+    return out;
+}
+
+/// @brief 请求体大小（字节），可用 GO2CPP_BENCH_BODY 覆盖。
+/// @details body 会被服务端当作 int32 数组排序，所以这个值直接决定「每请求计算量」：
+///          64B = 16 个 int（几乎无计算），4KB = 1024 个 int（真实排序），
+///          64KB = 16384 个 int（溢出 L2）。默认 64 与文档基线一致。
+std::size_t bench_body_size() {
+    static const std::size_t value = [] {
+        const char* env = std::getenv("GO2CPP_BENCH_BODY");
+        if (env == nullptr || *env == 0) {
+            return std::size_t{64};
+        }
+        return static_cast<std::size_t>(std::strtoul(env, nullptr, 10));
+    }();
+    return value;
+}
+
 Response process_request(std::uint8_t opcode, std::string_view body) {
     const std::uint32_t kIoSleepMaxUs = io_sleep_max_us();
     if (kIoSleepMaxUs > 0) {
@@ -209,7 +239,8 @@ Response process_request(std::uint8_t opcode, std::string_view body) {
     }
     switch (opcode) {
         case kOpEcho:
-            return {kOpEcho, std::string(body), 0};
+            // 真实业务形态：echo 带一段数据，服务端排序后返回（不是纯搬运）。
+            return {kOpEcho, SortPayload(body), 0};
         case kOpRead:
             return {kOpRead, std::string(1, 'A'), 0};
         case kOpWrite:
@@ -1317,12 +1348,12 @@ private:
         switch (m_options.scenario) {
             case Scenario::kShort: {
                 conn.t_send = now_ns();
-                queue_request(index, kOpEcho, std::string(64, 'e'));
+                queue_request(index, kOpEcho, std::string(bench_body_size(), 'e'));
                 break;
             }
             case Scenario::kEcho: {
                 for (std::size_t i = 0; i < std::max<std::size_t>(m_options.depth, 1); ++i) {
-                    queue_request(index, kOpEcho, std::string(64, 'e'));
+                    queue_request(index, kOpEcho, std::string(bench_body_size(), 'e'));
                 }
                 break;
             }
@@ -1343,7 +1374,7 @@ private:
                 if (conn.slow) {
                     queue_request(index, kOpBig, std::string(1, 'b'));
                 } else {
-                    queue_request(index, kOpEcho, std::string(64, 'e'));
+                    queue_request(index, kOpEcho, std::string(bench_body_size(), 'e'));
                 }
                 break;
             }
@@ -1536,7 +1567,7 @@ private:
                 break;
             }
             case Scenario::kEcho: {
-                queue_request(index, kOpEcho, std::string(64, 'e'));
+                queue_request(index, kOpEcho, std::string(bench_body_size(), 'e'));
                 break;
             }
             case Scenario::kIdle: {
@@ -1557,7 +1588,7 @@ private:
                 if (conn.slow) {
                     queue_request(index, kOpBig, std::string(1, 'b'));
                 } else {
-                    queue_request(index, kOpEcho, std::string(64, 'e'));
+                    queue_request(index, kOpEcho, std::string(bench_body_size(), 'e'));
                 }
                 break;
             }

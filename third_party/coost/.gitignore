@@ -1,0 +1,5 @@
+.cache
+.xmake
+build
+lib
+config.h
