@@ -607,12 +607,55 @@ namespace go2cpp
             }
         }
 
+        /**
+         * @brief 把取消传播到整棵子树，并触发所有 `Done` 等待者。
+         * @param work 初始待处理项（`Cancel` 传根节点，`CancelFromParent` 传子节点
+         *        并附带继承的 error/cause）。
+         *
+         * ## 定位
+         *
+         * `Context::Cancel` 与 `CancelFromParent` 的唯一实现，也是**取消语义的
+         * 心脏**：从触发点向下遍历所有后代，标记 `error`，然后统一唤醒。
+         *
+         * ## 步骤
+         *
+         * step1. 用**显式栈**（`work`）而不是递归遍历：深层 Context 树递归会爆栈，
+         *        这里每轮取一个节点、把它的后代压回栈，直到栈空；
+         * step2. 每轮在 `state->mutex` 内完成「标记 + 摘除」：写入 `error`/`cause`，
+         *        取出 `timer_id`、清空 `before_done_callbacks`、收集 `children`，
+         *        然后 `children.clear()`——**已经取消过的子树（`error` 非空）直接跳过**，
+         *        保证每个节点只处理一次；
+         * step3. 锁外做三件事：移除该节点的超时 timer、从父节点解绑、
+         *        把它的 `before_done_callbacks` 收集到全局列表；
+         * step4. 把 `descendants` 压回 `work`，继续下一轮（迭代传播）；
+         * step5. 全部节点标记完成后，**按逆序**执行 `before_done_callbacks`，
+         *        再**按逆序** `done.Signal()` 唤醒所有等待者。
+         *
+         * ## 并发/失败语义
+         *
+         * - **先标记、后唤醒（两阶段）**：调用用户回调前必须先标记完整子树。
+         *          因为 `Done` 回调可能观察或等待后代，若先通知父回调，
+         *          取消传播期间同步的 parent→child 等待会死锁；
+         * - **锁外执行回调与 Signal**：`Signal()` 会唤醒 Fiber（可能跨 M），
+         *          持 `state->mutex` 调用会锁序反转；
+         * - **逆序**：`before_done_callbacks` 与 `done.Signal()` 都按逆序执行，
+         *          与注册顺序相反——这是 rollback scope 的语义要求（后注册的
+         *          undo 先回滚）；
+         * - **回调异常被吞掉**（`catch (...)`）：取消是「尽力而为」的清理路径，
+         *          一个观察者抛异常不能阻止其它观察者被唤醒；
+         * - **timer 必须在锁外移除**：`TimerService::Remove` 会拿定时器锁，
+         *          而锁顺序约定是「状态锁 → 定时器锁」不存在环，所以先释放状态锁；
+         * - **幂等**：`error` 非空或 `root` 为真的节点直接跳过，重复取消不产生副作用。
+         */
         static void DrainCancellation(std::vector<CancellationWork> work)
         {
+            // step1/step2 的全局约定：先标记完整子树，再执行回调与 Signal。
             // 调用用户回调前先标记完整子树。Done 回调可以观察或等待后代；如果
             // 先通知父回调，取消传播期间同步的 parent->child 等待可能死锁。
             std::vector<std::shared_ptr<State>> to_signal;
             std::vector<std::function<void()>> before_done_callbacks;
+            // step1/step2: 用显式栈迭代（不递归，避免深层 Context 树爆栈）；
+            // 每轮在 state->mutex 内标记并摘除该节点。
             while (!work.empty())
             {
                 CancellationWork item = std::move(work.back());
@@ -622,6 +665,7 @@ namespace go2cpp
                     continue;
                 }
 
+                // step2: 本轮的局部收集区——标记、摘 timer、摘回调、收集后代。
                 std::vector<std::shared_ptr<State>> descendants;
                 ErrorPtr local_error = item.error;
                 ErrorPtr local_cause = item.cause;
@@ -688,6 +732,7 @@ namespace go2cpp
                         {std::move(child), local_error, local_cause, false});
                 }
             }
+            // step5: 两阶段完成——先逆序执行 before_done 回调，再逆序 Signal。
             // 所有 Context 状态都已先标记取消，再让 rollback scope 冻结其
             // undo。这样 Done 的观察者、RecordUndo 和 Commit 不会在取消窗口
             // 中错误地把新动作当成可提交状态。真正的补偿由 DoneSignal 的

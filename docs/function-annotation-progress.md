@@ -39,7 +39,7 @@
 | fiber | `Fiber::resume_locked` ✅（1 函数头 6 步 + 4 处 step） | 1/1 完成 |
 | sync | `Mutex::LockImpl` ✅（6 步 + 5 处 step）/ `Unlock` ✅（4 步 + 4 处 step） | **2/2 完成** |
 | channel | `SendUntil` ✅（多条件等待，6 步 + 7 条并发语义）/ `RecvUntil` | 1/2 完成 |
-| context | `Cancel` | ⬜ |
+| context | `DrainCancellation` ✅（取消传播 5 步 + 6 条并发语义；`Cancel` 本身是 3 行薄封装） | 1/1 完成 |
 | timer | `TimerWheel::Run` | ⬜ |
 | socket | `wait_ready` | ⬜ |
 | http2 | `Connection::ReadEvent` | ⬜ |
