@@ -138,16 +138,54 @@ std::size_t Deflater::InputRemaining() const noexcept {
   return ok() ? m_impl->stream.avail_in : 0;
 }
 
+/**
+ * @brief 驱动一次 zlib 的 `deflate()`，把输入压缩到内部输出缓冲。
+ * @param mode 刷新模式（`None` / `Sync` / `Full` / `Finish`），决定 zlib 是否
+ *        强制输出当前累积的数据。
+ * @return `kOk`（还有更多输出可产）/ `kStreamEnd`（流已结束）/ `kError`。
+ *        每次调用后通过 `output()` / `output_size()` 取本次产出的字节。
+ *
+ * ## 定位
+ *
+ * 压缩侧的**唯一引擎调用点**：上层 `Compressor` 的循环反复调它，直到
+ * `kStreamEnd`（或输入耗尽）。解压侧有对称的 `Inflater::Run`。
+ *
+ * ## 步骤
+ *
+ * step1. `ok()` 检查：zlib 流未初始化成功时直接返回 `kError`；
+ * step2. 重置输出游标：`next_out` 指向内部缓冲起点、`avail_out` 设为缓冲容量；
+ *        **每次 Run 都从缓冲开头写**——上层必须先消费上一批输出再调用；
+ * step3. 调用 `deflate()`（`ToZlibFlush` 把 FlushMode 映射成 `Z_*` 常量）；
+ * step4. 用 `缓冲容量 - avail_out` 算出本次产出字节数（存到 `produced`）；
+ * step5. 把 zlib 返回码映射成本项目的 `DeflateStatus`。
+ *
+ * ## 并发/失败语义
+ *
+ * - **`Z_BUF_ERROR` 映射成 `kOk` 而不是错误**：它表示「输出缓冲满了，没进展」，
+ *   是正常的背压信号——调用方应消费输出后**再次调用**，而不是当成失败；
+ * - **`noexcept`**：本函数在压缩热路径上，不能因异常中断流状态；
+ * - **`m_impl->produced` 每次先清零**，保证 `output_size()` 反映的是本次产出，
+ *   不会把上一次的字节数带出来；
+ * - **输入由 `SetInput` 单独设置**（并被 `kMaxChunkSize` 截断），本函数不碰
+ *   `next_in`/`avail_in`；因此调用方必须自己跟踪 `InputRemaining()`；
+ * - **内部输出缓冲是固定的**：单次 Run 最多产出 `output_capacity()` 字节，
+ *   压缩比很高时（大量重复数据）需要多轮 Run 才能把输入吃完。
+ */
 DeflateStatus Deflater::Run(FlushMode mode) noexcept {
+  // step1: zlib 流不可用时直接报错。
   if (!ok()) {
     return DeflateStatus::kError;
   }
+  // step2: 每次 Run 都从输出缓冲开头写，先重置游标与剩余容量。
   m_impl->produced = 0;
   m_impl->stream.next_out =
       reinterpret_cast<Bytef*>(m_impl->output.data());
   m_impl->stream.avail_out = static_cast<uInt>(m_impl->output.size());
+  // step3: 唯一一次 deflate() 调用。
   const int result = deflate(&m_impl->stream, ToZlibFlush(mode));
+  // step4: 产出字节数 = 容量 - 剩余。
   m_impl->produced = m_impl->output.size() - m_impl->stream.avail_out;
+  // step5: 返回码映射（Z_BUF_ERROR 是背压信号，不是错误）。
   switch (result) {
     case Z_OK:
     case Z_BUF_ERROR:

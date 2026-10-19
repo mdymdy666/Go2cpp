@@ -45,7 +45,7 @@
 | http2 | `Connection::ReadEvent` | ⬜ |
 | websocket | `read_frame` | ⬜ |
 | bufio | `Reader::Read` | ⬜ |
-| compress | 引擎循环 | ⬜ |
+| compress | `Deflater::Run` ✅（zlib 引擎调用，5 步 + 5 条并发语义） | 1/1 完成 |
 | os | `File::ReadFile` | ⬜ |
 | path | `WalkRecursive` | ⬜ |
 | config | `LoadFromIni` | ⬜ |
