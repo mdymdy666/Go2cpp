@@ -150,3 +150,33 @@ ctest --test-dir build-work
 - 三个指标键是进程级固定名；多个 `SoReloader` 实例会互相覆盖镜像值，生产只应
   创建一个实例。
 - 本轮**未提交 git**，留给主 agent 审查后提交。
+
+## 失误记录：提交 `58b31d4` 混入了子 agent 的在途改动
+
+### 发生了什么
+
+子 agent `2cf46805` 仍在写 `DoneCase` / `AfterCase` + 测试时，主 agent 执行了
+`git add -A` 并提交 `58b31d4`，把它的**未完成改动**一并提交：
+
+| 文件 | 行数 |
+|---|---:|
+| `include/go2cpp/concurrency/channel.hpp` | +222（`DoneCase` / `AfterCase`） |
+| `tests/concurrency/test_channel.cpp` | +540（测试用例） |
+
+**`58b31d4` 的提交信息没有提到这两批改动**，提交信息与实际内容不符。
+
+### 影响评估
+
+```
+cmake --build build-work -j8   → 通过（无 error）
+ctest -R channel               → 2/2 通过（channel_demo、channel_full）
+grep -c 'DoneCase|AfterCase' tests/concurrency/test_channel.cpp → 49 处
+```
+
+代码可编译、既有 channel 测试全过，**没有破坏性后果**，但提交历史不干净。
+
+### 处理
+
+1. 等 `2cf46805` 自然完成（不打断）；
+2. 其产出验证通过后，提一个 fixup commit 说明 `58b31d4` 实际包含两批改动；
+3. **规则**：子 agent 运行期间**禁止 `git add -A`**，只做只读检查，等它 stopped 再提交。
