@@ -722,15 +722,20 @@ void test_wait_any_and_wait_many() {
 
     const char first_byte = 'a';
     const char second_byte = 'b';
+    // 先把两个 fd 都写满，再启动 WaitMany。
+    // 为什么：WaitManyFor 的语义是「任一节点完成就返回当前已就绪的集合」
+    // （实现里是 `while (!has_terminal())`），不是「等全部就绪」。如果先启动
+    // 等待、再依次写两个 fd，Fiber 可能在第二个 write 之前就被第一个唤醒，
+    // 导致 ready_indices 只有 1 个 —— 这是测试自身的竞态，不是实现缺陷。
+    // 先写满再等，注册后的零超时 poll 能确定性地看到两个都就绪。
+    GO2CPP_CHECK(::syscall(SYS_write, first[1], &first_byte, 1) == 1);
+    GO2CPP_CHECK(::syscall(SYS_write, second[1], &second_byte, 1) == 1);
     std::atomic<bool> many_done{false};
     go2cpp::IOWaitManyResult many_result;
     auto many_task = manager.Go([&] {
         many_result = manager.WaitManyFor(requests, 1s);
         many_done.store(true, std::memory_order_release);
     });
-    GO2CPP_CHECK(wait_for_task_state(many_task, go2cpp::GState::Waiting));
-    GO2CPP_CHECK(::syscall(SYS_write, first[1], &first_byte, 1) == 1);
-    GO2CPP_CHECK(::syscall(SYS_write, second[1], &second_byte, 1) == 1);
     GO2CPP_CHECK(wait_until(many_done));
     GO2CPP_CHECK(many_result.ready());
     GO2CPP_CHECK(many_result.ready_indices.size() == 2);
