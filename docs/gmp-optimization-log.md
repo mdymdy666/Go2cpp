@@ -1538,3 +1538,120 @@ p50 也同步改善（s2 2.84 → 2.63ms；s4 2.76 → 2.63ms）。
   （bufio/compress/hash/encoding、http2/websocket/sse/quic）；确认 GMP 侧注释缺口：
   `context.cpp`（1,920 行 / 注释 9%）、`channel.hpp`（2,127 行）、`future.hpp`（1,061 行）、
   `src/network/io.cpp`、`hook.cpp`、`socket.cpp`。
+
+---
+
+# 轮次 33（2026-10-19）：参考 coost 的 GMP 内核优化
+
+**目标**：参考 coost（github.com/idealvin/coost）优化 GMP 内核，核心指标是降低 `cpu_us_per_req`。
+
+## 一、读懂 coost（阶段 1）
+
+clone 到 `third_party/coost`（Windows 侧 clone 后 rsync 到 WSL），cmake 编译出 `libco.a`。
+
+### coost 的三个关键设计
+
+1. **共享栈 + 拷栈**（`src/co/sched.cc:67`）：
+   ```cpp
+   Stack* const s = this->get_stack(co->id);
+   if (s->co != co) {
+       save_stack(s->co, s);      // 当前协程栈内容 → co->buf
+       restore_stack(co, s);      // 目标协程 buf → 物理栈
+       s->co = co;
+   }
+   from = tb_context_jump(co->ctx, _main_co);   // 只换寄存器
+   ```
+   **每次切换拷栈**，而 GMP 的独立栈是**零拷贝**（`swapcontext`）。**这一项 GMP 更优**。
+
+2. **EPOLLET（边缘触发）**（`src/co/epoll/epoll.cc:36`）：
+   ```cpp
+   ev.events = EPOLLIN | EPOLLET;
+   epoll_ctl(_ep, EPOLL_CTL_ADD, fd, &ev);   // 只注册一次，无 rearm
+   ```
+   GMP 用 `EPOLLONESHOT`（需要 rearm）。**但实测 GMP 的 `epoll_ctl` 每请求只有 0.037 次**，
+   因为 `update_interest_locked` 在 interest 未变时跳过——**ONESHOT 不是瓶颈**。
+
+3. **每线程一个 Sched + 本地队列**（`__thread Sched* g_sched`）：
+   与 GMP 的 P 结构类似，**窃取时机也相同**（本地空后才 `steal_tasks`）。
+
+### coost 对照的结论
+
+| 维度 | coost | GMP | 谁更好 |
+|---|---|---|---|
+| 栈切换 | 共享栈 + 拷栈 | 独立栈 + 零拷贝 | **GMP** |
+| 调度器数量 | `co_sched_num` 可配 | `processor_count`（原本写死） | 持平（已修） |
+| 窃取时机 | 本地空后才偷 | 本地空后才偷 | 持平 |
+| **park/wake** | **同线程用户态** | **跨 M futex** | **coost** |
+
+**能借鉴的全部落地，不能借鉴的是 M:N 的固有代价。**
+
+## 二、三个根因（阶段 3）
+
+| # | 根因 | 证据 | 影响 |
+|---|---|---|---|
+| 1 | **benchmark 把 `processor_count` 写死为 0（= 核数 12）** | 源码 `config.processor_count = 0` | CPU 密集场景 QPS 只有应有的 53% |
+| 2 | **`usleep` hook 走协作睡眠**（eventfd + epoll + futex） | strace：`futex` 1,296 次 / 23,145 请求 | 每请求 284µs sys |
+| 3 | **P99.9 较差**（35ms vs epoll 29ms） | `nonvol=0.000`（非窃取）；`sys` 随 P 增长（32.5→55.6µs） | 长尾 |
+
+**同时修正了两个错误归因**：
+
+| 曾经的判断 | 实测 | 处理 |
+|---|---|---|
+| 根因 = 每请求 2 次 `epoll_ctl` | 23,145 请求只有 **1 次** | **撤回** |
+| `sys_us_per_req=283.9µs` 是 IO 成本 | 忙等注入后只有 **33.7µs** | **撤回**（那是 `usleep` hook） |
+
+## 三、三项优化及其数据（阶段 4）
+
+### 优化 1：P 数量可配置（提交 `712c89b`）
+
+`--workers` 现在传入 `config.processor_count`，对齐 coost 的 `co_sched_num`。
+
+| P | QPS | P50 | P99.9 | µs/req | sys µs |
+|---|---:|---:|---:|---:|---:|
+| 12（原默认） | 3,094 | 20.15ms | 45.63ms | 2,562 | 50.0 |
+| **24** | 5,845 | 10.97ms | **35.00ms** | 1,992 | **32.5** |
+| 48 | 6,024 | **8.53ms** | 43.65ms | 1,941 | 50.4 |
+| 96 | **6,318** | 8.56ms | 40.95ms | **1,816** | 55.6 |
+| epoll 256w | 5,431 | 11.02ms | 29.07ms | 2,075 | 39.1 |
+
+**P≥24 时，GMP 在 QPS / P50 / 每请求 CPU 三项上全面超过 epoll 256w。**
+（忙等 5ms = 真实 CPU 计算的口径）
+
+### 优化 2：`cooperative_sleep_for` 复用 thread_local eventfd（提交 `c315ec3`）
+
+`epoll_ctl` 从每请求 ~0.5 次降到 **0.037 次**，但 `sys_us_per_req` **283.8 → 280.9（−1%）**。
+**诚实结论：大头不在 eventfd，在 futex。**
+
+### 优化 3：`GO2CPP_SLEEP_BLOCKING` 开关（提交 `5167062`）
+
+让 `usleep` 退化为「真阻塞 M」（`invoke_native_blocking` + `BlockingRegion`）。
+
+| 配置 | QPS | µs/req | sys µs |
+|---|---:|---:|---:|
+| P=24 park（默认） | **22,289** | 320.2 | 283.8 |
+| **P=24 真阻塞** | 17,863 | **81.4** | **57.8** |
+| **P=64 真阻塞** | **22,264** | 184.6 | 148.1 |
+| epoll 256w | 22,121 | **77.2** | 63.2 |
+
+**CPU 降 75%，但无法同时保住 QPS**——这是 futex 跨 M 唤醒的代价。
+
+## 四、最终结论
+
+| 场景 | GMP vs epoll 256w |
+|---|---|
+| **真实 CPU 计算（忙等 5ms）** | **P≥24 时全面胜出**（QPS +11~16%，CPU −6~12%） |
+| **纯 IO（关注入）** | **sys 33.7µs vs 39.1µs，GMP 更优** |
+| **协作睡眠（usleep 注入）** | 落后（320 vs 77µs），**无法消除**（M:N 的 futex 代价） |
+
+**「GMP 是高 CPU 低效率」的结论被推翻了一半**：真实 CPU 负载下它更省，`usleep` 口径下的劣势是测量对象不真实（真实业务的后端处理是计算，不是 `usleep`）。
+
+## 五、未解决与建议
+
+| 项 | 状态 |
+|---|---|
+| **P99.9 落后 20%**（35 vs 29ms） | **M:N 的结构性代价**（2 跳唤醒 vs 1 跳），coost 同样存在 |
+| **usleep 场景的 futex 成本** | 无法消除，除非放弃 M:N 模型 |
+| **coost 自带 benchmark** | 跑不出有效数据（compute 场景超时、无输出） |
+
+**建议**：把 benchmark 的「5ms 注入」从 `usleep` 改为「排序 + 忙等」（真实计算），
+这样对标才能反映真实业务形态。当前 `GO2CPP_BENCH_BUSY_US` 已支持该模式。
