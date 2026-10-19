@@ -41,7 +41,7 @@
 | channel | `SendUntil` ✅（多条件等待，6 步 + 7 条并发语义）/ `RecvUntil` | 1/2 完成 |
 | context | `DrainCancellation` ✅（取消传播 5 步 + 6 条并发语义；`Cancel` 本身是 3 行薄封装） | 1/1 完成 |
 | timer | `TimerWheel::Run` | ⬜ |
-| socket | `wait_ready` | ⬜ |
+| socket | `wait_ready` ✅（三种等待策略分派，5 步 + 6 条并发语义） | 1/1 完成 |
 | http2 | `Connection::ReadEvent` | ⬜ |
 | websocket | `read_frame` | ⬜ |
 | bufio | `Reader::Read` | ⬜ |

@@ -359,8 +359,53 @@ bool Socket::shutdown(int how) noexcept {
     end_operation(); return result;
 }
 
+/**
+ * @brief 等 socket 在指定方向上可读/可写，同时响应取消与关闭。
+ * @param fd 已通过 `begin_operation` 固定住的文件描述符。
+ * @param event 等待方向（`kRead` / `kWrite`）。
+ * @param timeout 最长等待时长；`Duration::max()` 表示无限。
+ * @param cancel_generation 发起等待时记下的取消代号；当前代号变了就说明
+ *        本方向被取消过。
+ * @return 0 表示就绪；否则返回 errno（`ECANCELED` / `ETIMEDOUT` / 系统错误）。
+ *
+ * ## 定位
+ *
+ * `Socket` 的 `send_impl` / `recv_impl` / `connect` 在真正的 syscall 返回
+ * `EAGAIN` 之后都调用它来等待下一次就绪。它是 **socket 层与 IO 层之间的
+ * 唯一等待入口**：三种等待策略（专用 waiter / IOManager / 原生 poll）在这里分派。
+ *
+ * ## 步骤
+ *
+ * step1. 构造 `cancelled()` 谓词：比较当前方向代号与 `cancel_generation`，
+ *        不一致即视为已取消；
+ * step2. 取 `m_waiter` 并做三项前置检查：fd 无效 → `EBADF`；已取消 →
+ *        `ECANCELED`；正在关闭 → `ECANCELED`（关闭优先于等待）；
+ * step3. **有专用 waiter**（例如 TLS/自定义传输）：交给它等待，返回前再查一次
+ *        取消；
+ * step4. **有 IOManager**（受管 Fiber）：以 **100ms 为片上界**循环调用
+ *        `manager->wait_for()`；每片结束后重查取消/关闭/总超时。分片是为了
+ *        让 `close()` 能在有限时间内打断一个无限期等待；
+ * step5. **普通线程**（无 IOManager，拿不到取消通知）：同样以 100ms 为片上界
+ *        调 `poll_wait()`，每片之间检查取消与关闭。
+ *
+ * ## 并发/失败语义
+ *
+ * - **取消优先级最高**：任何路径返回前都重查 `cancelled()`，因此「等待期间
+ *   被取消」不会被误报成「已就绪」；
+ * - **关闭优先于超时**：`is_closing()` 的检查在超时判定之前，避免把
+ *   「对端已关闭」误报成 `ETIMEDOUT`；
+ * - **分片不是忙等**：每片仍由内核阻塞（`wait_for` / `poll`），只是把
+ *   「无限期等待」切成可被取消打断的片段；
+ * - **`timeout` 的剩余时间必须按 `started` 计算**，不能每片重新用原始
+ *   `timeout`，否则总等待时间会随片数放大；
+ * - `Duration::max()` 表示无限，分片逻辑里要单独判断（`max > 100ms` 成立，
+ *   但剩余时间计算不能用 `max - elapsed`）；
+ * - 本函数**不改 `m_fd`**，fd 的生命周期由调用方的 `begin_operation` /
+ *   `end_operation` 保证。
+ */
 int Socket::wait_ready(int fd, io::IOEvent event, Duration timeout,
                        std::uint64_t cancel_generation) {
+    // step1: 构造取消谓词——比较「当前代号」与「发起等待时的代号」。
     const auto cancelled = [this, event, cancel_generation] {
         const auto current = event == io::IOEvent::kRead
                                  ? m_read_cancel_generation.load(std::memory_order_acquire)
@@ -372,14 +417,17 @@ int Socket::wait_ready(int fd, io::IOEvent event, Duration timeout,
         std::lock_guard<std::mutex> lock(m_mutex);
         waiter = m_waiter;
     }
+    // step2: 三项前置检查——fd 无效 / 已取消 / 正在关闭（关闭优先于等待）。
     if (fd < 0) { errno = EBADF; return EBADF; }
     if (cancelled()) { errno = ECANCELED; return ECANCELED; }
     if (is_closing()) { errno = ECANCELED; return ECANCELED; }
+    // step3: 有专用 waiter 就交给它（返回前再查一次取消）。
     if (waiter) {
         const int result = waiter->wait(fd, event, timeout);
         if (cancelled()) { errno = ECANCELED; return ECANCELED; }
         return result;
     }
+    // step4: 受管 Fiber——按 100ms 分片循环 wait_for，让 close() 能打断无限等待。
     if (auto* manager = io::IOManager::current()) {
         const auto started = std::chrono::steady_clock::now();
         for (;;) {
@@ -399,6 +447,8 @@ int Socket::wait_ready(int fd, io::IOEvent event, Duration timeout,
             }
         }
     }
+    // step5: 普通线程——同样按 100ms 分片 poll，但拿不到取消通知，
+    // 只能靠 is_closing() 退出。每片仍由内核阻塞，不会忙等待。
     // 普通线程没有 IOManager 的取消通知，按小片轮询检查关闭状态，避免
     // close() 永久等待一个无限期 poll。每片仍然由内核阻塞，不会忙等待。
     const auto started = std::chrono::steady_clock::now();
