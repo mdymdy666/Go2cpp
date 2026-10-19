@@ -155,3 +155,17 @@ const auto workers = static_cast<std::size_t>(arg_int(argc, argv, "--workers", 8
 `s1` 的错误率从 0.48% 涨到 3.1% 是 P 超配的副作用，需要确认：
 1. 这是否与 `accept` 的竞争有关（多个 P 同时 `accept`）；
 2. 如果确认，是否需要在 `processor_count > 核数` 时**限制 accept 到单一 P**（或加 `EPOLLEXCLUSIVE`）。
+
+## 轮次 4：`local_queue_limit` 扫描（256 vs 64）
+
+| `local_queue_limit` | QPS | P50 | P99.9 | µs/req | sys |
+|---|---:|---:|---:|---:|---:|
+| **256（当前默认）** | **31,180** | **1.94ms** | **5.36ms** | **244.5** | **166.9** |
+| 64 | 29,349 | 2.08ms | 5.66ms | 252.6 | 169.2 |
+
+**结论：256 更优**（64 的 QPS −6%、CPU +3%）。
+
+**原因**：`local_queue_limit` 是本地队列上限，超出后溢出到全局队列。把它调小会让更多任务
+走全局队列（需要抢全局锁），反而增加争用。**当前默认 256 已是合理值，不改。**
+
+**已恢复 256，`git status` 干净。**
