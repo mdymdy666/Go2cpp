@@ -30,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -179,6 +180,29 @@ go2cpp::config::SoSpec MakeSpec(
 
 bool Contains(const std::vector<std::string>& values, const std::string& value) {
     return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+// 指标键是十进制文本；解析失败返回 0，测试会因此失败。
+std::uint64_t ReadU64(const char* key) {
+    auto variable = go2cpp::config::Config::Instance().Lookup<std::string>(
+        key, "0", "测试读取运行指标");
+    if (!variable) return 0;
+    try {
+        return std::stoull(variable->GetValue());
+    } catch (...) {
+        return 0;
+    }
+}
+
+std::int64_t ReadI64(const char* key) {
+    auto variable = go2cpp::config::Config::Instance().Lookup<std::string>(
+        key, "0", "测试读取运行指标");
+    if (!variable) return 0;
+    try {
+        return std::stoll(variable->GetValue());
+    } catch (...) {
+        return 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +538,13 @@ void ScenarioE1() {
     CHECK(reloader.CommittedRevision() == 2);
     CHECK(reloader.CurrentVersion("e1so") == "2");
     CHECK(unloads.load() >= 1);
-    std::printf("[E1] 旧 revision 回滚，最终提交 revision=2/version=2\n");
+    // F2：被抢占的旧事务计入失败，新事务计入成功。
+    CHECK(reloader.ReloadSuccessTotal() == 1);
+    CHECK(reloader.ReloadFailureTotal() == 1);
+    std::printf("[E1] 旧 revision 回滚，最终提交 revision=2/version=2；"
+                "success=%llu failure=%llu\n",
+                static_cast<unsigned long long>(reloader.ReloadSuccessTotal()),
+                static_cast<unsigned long long>(reloader.ReloadFailureTotal()));
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +583,126 @@ void ScenarioF2() {
     std::printf("[F2] runtime.current_version=%s, revision=%s\n",
                 version ? version->GetValue().c_str() : "(null)",
                 revision ? revision->GetValue().c_str() : "(null)");
+}
+
+// ---------------------------------------------------------------------------
+// F2（指标）：两次成功 + 一次 loader 失败 → success=2 / failure=1 / duration>=0，
+// 并且同名 ConfigVar 与实例访问器一致；幂等命中既不计成功也不计失败。
+// ---------------------------------------------------------------------------
+void ScenarioF2Metrics() {
+    TempDir directory;
+    const auto spec1 = MakeSpec(directory, "f2mso", "f2mg", "1");
+    const auto spec2 = MakeSpec(directory, "f2mso", "f2mg", "2");
+    const auto spec3 = MakeSpec(directory, "f2mso", "f2mg", "3");
+    go2cpp::config::SoManifest manifest1;
+    go2cpp::config::SoManifest manifest2;
+    go2cpp::config::SoManifest manifest3;
+    std::string error;
+    CHECK(ParseManifest(BuildIni(1, 3, {{"f2mg", {"f2mso"}}}, {spec1}),
+                        &manifest1, &error));
+    CHECK(ParseManifest(BuildIni(2, 3, {{"f2mg", {"f2mso"}}}, {spec2}),
+                        &manifest2, &error));
+    CHECK(ParseManifest(BuildIni(3, 3, {{"f2mg", {"f2mso"}}}, {spec3}),
+                        &manifest3, &error));
+
+    go2cpp::config::SoReloader reloader(
+        go2cpp::config::Config::Instance(),
+        [](const go2cpp::config::SoSpec& spec, std::string* why) {
+            if (spec.version == "3") {
+                if (why) *why = "假 loader 对 v3 故意失败";
+                return false;
+            }
+            return true;
+        });
+    CHECK(reloader.Reload(manifest1).ok);
+    CHECK(reloader.Reload(manifest2).ok);
+    const auto failed = reloader.Reload(manifest3);
+    CHECK(!failed.ok);
+    CHECK(reloader.CurrentVersion("f2mso") == "2");
+
+    CHECK(reloader.ReloadSuccessTotal() == 2);
+    CHECK(reloader.ReloadFailureTotal() == 1);
+    CHECK(reloader.LastReloadDurationMs() >= 0);
+    CHECK(ReadU64(go2cpp::config::SoReloader::kReloadSuccessTotalKey) == 2);
+    CHECK(ReadU64(go2cpp::config::SoReloader::kReloadFailureTotalKey) == 1);
+    CHECK(ReadI64(go2cpp::config::SoReloader::kReloadDurationMsKey) >= 0);
+
+    // 同 revision 幂等命中不重复 dlopen，也不应污染成功/失败计数。
+    const auto idempotent = reloader.Reload(manifest2);
+    CHECK(idempotent.ok);
+    CHECK(!idempotent.applied);
+    CHECK(reloader.ReloadSuccessTotal() == 2);
+    CHECK(reloader.ReloadFailureTotal() == 1);
+
+    std::printf("[F2 指标] success=%llu failure=%llu duration_ms=%lld\n",
+                static_cast<unsigned long long>(reloader.ReloadSuccessTotal()),
+                static_cast<unsigned long long>(reloader.ReloadFailureTotal()),
+                static_cast<long long>(reloader.LastReloadDurationMs()));
+}
+
+// ---------------------------------------------------------------------------
+// E3：revision 相同时普通 Reload 幂等跳过，ForceRescan 必须无视幂等、
+// 重新校验整份 manifest 并重载全部 SO（用 loader 调用计数验证）。
+// ---------------------------------------------------------------------------
+void ScenarioE3OverflowRescan() {
+    TempDir directory;
+    const auto a1 = MakeSpec(directory, "e3a", "e3g", "1");
+    const auto b1 = MakeSpec(directory, "e3b", "e3g", "1", {"e3a"});
+    const auto a2 = MakeSpec(directory, "e3a", "e3g", "2");
+    const auto b2 = MakeSpec(directory, "e3b", "e3g", "2", {"e3a"});
+    go2cpp::config::SoManifest manifest1;
+    go2cpp::config::SoManifest manifest2;  // 与 manifest1 同 revision，但 artifact 是 v2
+    std::string error;
+    CHECK(ParseManifest(
+        BuildIni(1, 3, {{"e3g", {"e3a", "e3b"}}}, {a1, b1}), &manifest1,
+        &error));
+    CHECK(ParseManifest(
+        BuildIni(1, 3, {{"e3g", {"e3a", "e3b"}}}, {a2, b2}), &manifest2,
+        &error));
+
+    std::atomic<int> loader_calls{0};
+    go2cpp::config::SoReloader reloader(
+        go2cpp::config::Config::Instance(),
+        [&loader_calls](const go2cpp::config::SoSpec&, std::string*) {
+            loader_calls.fetch_add(1);
+            return true;
+        });
+
+    const auto first = reloader.Reload(manifest1);
+    CHECK(first.ok);
+    CHECK(loader_calls.load() == 2);
+
+    // 同一份 manifest：普通入口走幂等，loader 不应被再次调用。
+    const auto idempotent = reloader.Reload(manifest1);
+    CHECK(idempotent.ok);
+    CHECK(!idempotent.applied);
+    CHECK(loader_calls.load() == 2);
+
+    // 同 revision 但 artifact 已变：普通入口仍然幂等，这正是 E3 的风险。
+    const auto stale = reloader.Reload(manifest2);
+    CHECK(stale.ok);
+    CHECK(!stale.applied);
+    CHECK(loader_calls.load() == 2);
+    CHECK(reloader.CurrentVersion("e3a") == "1");
+
+    // IN_Q_OVERFLOW 后的强制全量重扫：无视幂等，两个 SO 全部重新加载。
+    const auto forced = reloader.ForceRescan(manifest2);
+    CHECK(forced.ok);
+    CHECK(forced.applied);
+    CHECK(forced.revision == 1);
+    CHECK(forced.loaded.size() == 2);
+    CHECK(loader_calls.load() == 4);
+    CHECK(reloader.CurrentVersion("e3a") == "2");
+    CHECK(reloader.CurrentVersion("e3b") == "2");
+
+    // 无参重载：对 CurrentManifest() 再全量重扫一次。
+    const auto forced_current = reloader.ForceRescan();
+    CHECK(forced_current.ok);
+    CHECK(forced_current.applied);
+    CHECK(loader_calls.load() == 6);
+    CHECK(reloader.CommittedRevision() == 1);
+
+    std::printf("[E3] revision 未变仍全量重扫：loader 调用 2→4→6，版本 1→2\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +767,10 @@ int main() {
     ScenarioE1();
     std::printf("[场景 F2] runtime.current_version\n");
     ScenarioF2();
+    std::printf("[场景 F2 指标] success/failure/duration\n");
+    ScenarioF2Metrics();
+    std::printf("[场景 E3] IN_Q_OVERFLOW 强制全量重扫\n");
+    ScenarioE3OverflowRescan();
     std::printf("[额外 C2] NotifyPending → SoActivator 顺序\n");
     ScenarioC2Ordering();
 

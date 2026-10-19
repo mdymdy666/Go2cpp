@@ -1049,3 +1049,46 @@ benchmarks/gmp_vs_thread_epoll_benchmark.cpp
   计数与耗时、F3 的跨进程测试；真实 `dlopen` loader 与 vtable 切换不在本层。
 - 已知限制：已加载组/SO 从 manifest 消失会被拒绝（不在本层退役）；一次
   `Reload` 跨组全或全无；路径若含 `#`/`;` 会被 `IniFile` 截断。
+
+## 16. 2026-10-19 SO 热重载收尾：F2 三指标 + E3 ForceRescan + 使用文档（deepseek）
+
+**改动内容**：
+
+- `include/go2cpp/config/so_reloader.hpp`：新增 `ForceRescan(const SoManifest&)`
+  与 `ForceRescan()`；新增 `ReloadSuccessTotal()`/`ReloadFailureTotal()`/
+  `LastReloadDurationMs()` 与三个 `so.runtime.*` 键常量；新增私有
+  `ReloadAttempt` 计时/结果作用域、`ReloadImpl`、`FinishReload`、`PublishMetrics`、
+  `EnsureMetricVars`。**未改** `Reload`、`CurrentManifest` 等既有公开签名。
+- `src/config/so_reloader.cpp`：`Reload` 委托给 `ReloadImpl(manifest, false)`；
+  `ForceRescan` 走同一实现并置 `force_rescan=true`，跳过 revision 幂等、仍拒绝
+  回退/受 `highest_seen` 栅栏约束，把 manifest 全部 SO 加入变更集重新加载；
+  所有返回路径经 `fail`/`MarkSuccess`/`MarkSkipped` 更新原子计数；用
+  `std::chrono::steady_clock` 计时并在返回前把三个指标镜像到 `so.runtime.*`。
+  三个指标都是 `ConfigVar<std::string>`（十进制文本，与既有 `so.runtime.*`
+  一致），在构造时注册；数值访问器仍返回 `uint64_t`/`int64_t`。
+- `tests/config/test_so_manifest.cpp`：新增 F2 指标场景（两次成功 + 一次 loader
+  失败，断言 `success_total=2`、`failure_total=1`、`duration_ms>=0`，并验证幂等
+  命中不改变计数）；新增 E3 场景（同 revision 普通 `Reload` 幂等，`ForceRescan`
+  让两个 SO 重新加载，loader 调用 2→4→6）；E1 增加抢占计数断言。
+- 新增 `docs/so-reload-usage.md`（528 行）：最小 manifest、`dlopen` 三回调、
+  5 步发布流程、`so.runtime.*` 排障、限制与不适用场景。
+- 更新 `docs/so-reload-design.md`、`docs/state-machines/SoReloader.md`、
+  `docs/so-reload-progress.md`。
+- **未改** `include/go2cpp/config/config.hpp` 与 `src/config/config.cpp`。
+
+**测试结果**：
+
+- `cmake --build build-work -j8`：全量构建通过，新代码无新增告警。
+- `ctest --test-dir build-work -R so_manifest --output-on-failure`：1/1 通过。
+- 测试二进制直接运行：`[F2 指标] success=2 failure=1 duration_ms=0`；
+  `[E3] revision 未变仍全量重扫：loader 调用 2→4→6，版本 1→2`；
+  `failures=0`。
+- `ctest --test-dir build-work`：114/114 通过（61.75s）。
+
+**后续状态**：
+
+- 未做：真实 inotify 事件源、真实 `dlopen` loader/vtable 切换、F1 灰度/进程隔离、
+  F3 跨进程测试、随机 fuzz/压测。
+- 语义：`ForceRescan` 成功时 `applied=true` 即使 revision 未变；三个指标键为
+  进程级固定名，多实例会互相覆盖，生产应只创建一个 `SoReloader`。
+- 本轮未提交 git，留给主 agent 审查。

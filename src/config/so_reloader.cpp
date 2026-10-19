@@ -64,7 +64,78 @@ SoReloader::SoReloader(Config& config, SoLoader loader, SoUnloader unloader,
       m_loader(std::move(loader)),
       m_unloader(std::move(unloader)),
       m_activator(std::move(activator)),
-      m_validation(std::move(validation)) {}
+      m_validation(std::move(validation)) {
+    // 指标键在构造时注册，首个 Reload 之前 DumpIni 也能看到它们。
+    EnsureMetricVars();
+}
+
+SoReloader::ReloadAttempt::~ReloadAttempt() noexcept {
+    m_owner.FinishReload(m_started, m_outcome == Outcome::Success,
+                         m_outcome == Outcome::Skipped);
+}
+
+void SoReloader::EnsureMetricVars() noexcept {
+    try {
+        // 与既有 so.runtime.* 保持同一类型：十进制文本。
+        m_config.Lookup<std::string>(kReloadSuccessTotalKey, "0",
+                                     "SO 热更累计成功次数");
+        m_config.Lookup<std::string>(kReloadFailureTotalKey, "0",
+                                     "SO 热更累计失败次数");
+        m_config.Lookup<std::string>(kReloadDurationMsKey, "0",
+                                     "最近一次 SO 热更耗时（毫秒）");
+    } catch (...) {
+        // 指标注册失败不应阻止构造：首次 Reload 时 PublishMetrics 还会重试。
+    }
+}
+
+void SoReloader::FinishReload(std::chrono::steady_clock::time_point started,
+                              bool success, bool skipped) noexcept {
+    // steady_clock 不受系统时间回拨影响；<0 只是防御性处理，正常不会发生。
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    const auto duration =
+        elapsed < 0 ? std::int64_t{0} : static_cast<std::int64_t>(elapsed);
+    m_last_reload_duration_ms.store(duration, std::memory_order_relaxed);
+    if (success) {
+        m_reload_success_total.fetch_add(1, std::memory_order_relaxed);
+    } else if (!skipped) {
+        // 被更高 revision 抢占也计入失败：调用方确实没有提交这一代。
+        m_reload_failure_total.fetch_add(1, std::memory_order_relaxed);
+    }
+    PublishMetrics();
+}
+
+void SoReloader::PublishMetrics() noexcept {
+    try {
+        // 指标是进程级观测值，不参与两阶段事务：直接 SetValue 发布，
+        // 失败（例如外部 LoadFromIni 正持有 pending）只跳过本次镜像，
+        // 原子成员仍然是可靠来源。
+        const auto publish = [this](const char* key,
+                                    const std::string& value,
+                                    const char* description) {
+            auto variable =
+                m_config.Lookup<std::string>(key, std::string(), description);
+            if (!variable) return;
+            std::string error;
+            variable->SetValue(value, &error);
+        };
+        publish(kReloadSuccessTotalKey,
+                std::to_string(
+                    m_reload_success_total.load(std::memory_order_relaxed)),
+                "SO 热更累计成功次数");
+        publish(kReloadFailureTotalKey,
+                std::to_string(
+                    m_reload_failure_total.load(std::memory_order_relaxed)),
+                "SO 热更累计失败次数");
+        publish(kReloadDurationMsKey,
+                std::to_string(
+                    m_last_reload_duration_ms.load(std::memory_order_relaxed)),
+                "最近一次 SO 热更耗时（毫秒）");
+    } catch (...) {
+        // 观测值回写属于扩展点，不能把构造/事务线程带崩。
+    }
+}
 
 void SoReloader::RollbackStaged(
     const std::vector<ConfigVarBase::ptr>& staged) noexcept {
@@ -122,10 +193,38 @@ void SoReloader::AppendRetentionLocked(const std::string& name,
 }
 
 SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
+    return ReloadImpl(manifest, false);
+}
+
+SoReloadResult SoReloader::ForceRescan(const SoManifest& manifest) {
+    return ReloadImpl(manifest, true);
+}
+
+SoReloadResult SoReloader::ForceRescan() {
+    const auto current = CurrentManifest();
+    if (current.revision == 0) {
+        // 没有已提交快照时没有「整份 manifest」可重扫；这属于调用方顺序错误。
+        ReloadAttempt attempt(*this);
+        attempt.MarkFailure();
+        return Failure(0, "没有可重扫的已提交 manifest；请先成功执行一次 Reload");
+    }
+    // 复制快照后再进入事务：校验的仍是同一份 SoManifest，revision 栅栏照常生效。
+    return ReloadImpl(current, true);
+}
+
+SoReloadResult SoReloader::ReloadImpl(const SoManifest& manifest,
+                                      bool force_rescan) {
+    // 计时与计数覆盖所有返回路径；析构发生在 m_reload_mutex 释放之后，
+    // 避免指标回写（Config 锁）与事务串行锁形成嵌套。
+    ReloadAttempt attempt(*this);
+    const auto fail = [&attempt, &manifest](std::string error) {
+        attempt.MarkFailure();
+        return Failure(manifest.revision, std::move(error));
+    };
     // revision 0 不是合法 manifest；必须先拒绝，否则 committed 初值 0 会让
     // 下面的「相等即幂等」分支把它误判成成功。
     if (manifest.revision == 0) {
-        return Failure(0, "manifest revision 必须大于 0");
+        return fail("manifest revision 必须大于 0");
     }
 
     // step1: 在进入串行区之前抬高 highest_seen。这样正在加载的旧 revision
@@ -142,12 +241,12 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
     {
         std::lock_guard<std::mutex> state_lock(m_state_mutex);
         if (manifest.revision < m_committed_revision) {
-            return Failure(manifest.revision,
-                           "revision 回退被拒绝: 当前已提交 " +
-                               std::to_string(m_committed_revision) +
-                               "，收到 " + std::to_string(manifest.revision));
+            return fail("revision 回退被拒绝: 当前已提交 " +
+                        std::to_string(m_committed_revision) + "，收到 " +
+                        std::to_string(manifest.revision));
         }
-        if (manifest.revision == m_committed_revision) {
+        if (!force_rescan && manifest.revision == m_committed_revision) {
+            attempt.MarkSkipped();
             SoReloadResult result;
             result.ok = true;
             result.applied = false;
@@ -156,9 +255,8 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
         }
     }
     if (manifest.revision < m_highest_seen.load(std::memory_order_acquire)) {
-        return Failure(manifest.revision,
-                       "已有更高 revision 进入，丢弃旧事务: " +
-                           std::to_string(manifest.revision));
+        return fail("已有更高 revision 进入，丢弃旧事务: " +
+                    std::to_string(manifest.revision));
     }
 
     // step3: 纯静态校验；失败时 loader 一次都不会被调用。
@@ -169,7 +267,7 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
         if (!diagnostics.empty() && !diagnostics.front().scope.empty()) {
             validation_error = diagnostics.front().scope + ": " + validation_error;
         }
-        return Failure(manifest.revision, validation_error);
+        return fail(validation_error);
     }
 
     SoManifest current;
@@ -183,32 +281,39 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
     for (const auto& [group, members] : current.groups) {
         (void)members;
         if (!manifest.groups.count(group)) {
-            return Failure(manifest.revision,
-                           "本层不支持移除已加载的组: " + group);
+            return fail("本层不支持移除已加载的组: " + group);
         }
     }
     for (const auto& [name, spec] : current.specs) {
         (void)spec;
         if (!manifest.specs.count(name)) {
-            return Failure(manifest.revision,
-                           "本层不支持移除已加载的 SO: " + name);
+            return fail("本层不支持移除已加载的 SO: " + name);
         }
     }
 
     // step4: 计算变更集。组成员变化 → 整组重载；artifact 身份变化 → 单 SO 重载。
     std::set<std::string> changed;
-    for (const auto& [group, members] : manifest.groups) {
-        const auto old_group = current.groups.find(group);
-        const bool membership_changed =
-            old_group == current.groups.end() ||
-            !SameMembers(old_group->second, members);
-        for (const auto& member : members) {
-            const auto next = manifest.specs.find(member);
-            if (next == manifest.specs.end()) continue;
-            const auto old = current.specs.find(member);
-            if (membership_changed || old == current.specs.end() ||
-                !SameSoArtifact(next->second, old->second)) {
-                changed.insert(member);
+    if (force_rescan) {
+        // E3：事件溢出后无法确定漏掉了哪几代变更，差异计算不再可信；
+        // 把整份 manifest 都当作变更集，全部重新 dlopen 并重新提交观测值。
+        for (const auto& [name, spec] : manifest.specs) {
+            (void)spec;
+            changed.insert(name);
+        }
+    } else {
+        for (const auto& [group, members] : manifest.groups) {
+            const auto old_group = current.groups.find(group);
+            const bool membership_changed =
+                old_group == current.groups.end() ||
+                !SameMembers(old_group->second, members);
+            for (const auto& member : members) {
+                const auto next = manifest.specs.find(member);
+                if (next == manifest.specs.end()) continue;
+                const auto old = current.specs.find(member);
+                if (membership_changed || old == current.specs.end() ||
+                    !SameSoArtifact(next->second, old->second)) {
+                    changed.insert(member);
+                }
             }
         }
     }
@@ -220,10 +325,9 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
             if (changed.count(name)) continue;
             if (std::find(spec.dependencies.begin(), spec.dependencies.end(),
                           changed_name) != spec.dependencies.end()) {
-                return Failure(manifest.revision,
-                               "依赖组不自洽: " + name + " 依赖已变更的 " +
-                                   changed_name + "，但 " + name +
-                                   " 未在本次更新中升级");
+                return fail("依赖组不自洽: " + name + " 依赖已变更的 " +
+                            changed_name + "，但 " + name +
+                            " 未在本次更新中升级");
             }
         }
     }
@@ -231,7 +335,7 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
     std::vector<std::string> changed_names(changed.begin(), changed.end());
     std::vector<std::string> order;
     if (!manifest.BuildLoadOrder(changed_names, &order, &validation_error)) {
-        return Failure(manifest.revision, validation_error);
+        return fail(validation_error);
     }
 
     // step5: 按拓扑顺序加载；任一个失败就逆序卸载本次已成功的句柄。
@@ -239,13 +343,12 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
     for (const auto& name : order) {
         if (!m_loader) {
             UnloadLoaded(manifest, loaded);
-            return Failure(manifest.revision,
-                           "未注入 SoLoader，无法加载 SO: " + name);
+            return fail("未注入 SoLoader，无法加载 SO: " + name);
         }
         const auto* spec = manifest.Find(name);
         if (!spec) {
             UnloadLoaded(manifest, loaded);
-            return Failure(manifest.revision, "manifest 中找不到 SO: " + name);
+            return fail("manifest 中找不到 SO: " + name);
         }
         std::string load_error;
         bool ok = false;
@@ -259,8 +362,7 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
         if (!ok) {
             UnloadLoaded(manifest, loaded);
             if (load_error.empty()) load_error = "loader 返回 false";
-            return Failure(manifest.revision,
-                           "加载 SO " + name + " 失败: " + load_error);
+            return fail("加载 SO " + name + " 失败: " + load_error);
         }
         loaded.push_back(name);
     }
@@ -277,7 +379,7 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
         const auto* spec = manifest.Find(name);
         if (!spec) {
             rollback();
-            return Failure(manifest.revision, "manifest 中找不到 SO: " + name);
+            return fail("manifest 中找不到 SO: " + name);
         }
         std::string stage_error;
         if (!StageString(RuntimeVersionKey(name), spec->version,
@@ -292,7 +394,7 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
                          "SO " + name + " 加载时间（Unix 秒）", &staged,
                          &stage_error)) {
             rollback();
-            return Failure(manifest.revision, stage_error);
+            return fail(stage_error);
         }
     }
     std::string stage_error;
@@ -301,15 +403,14 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
         !StageString("so.runtime.last_reload_at", epoch,
                      "最近一次 SO 热更时间（Unix 秒）", &staged, &stage_error)) {
         rollback();
-        return Failure(manifest.revision, stage_error);
+        return fail(stage_error);
     }
 
     // step7: 被更高 revision 抢占时，在通知监听器之前回滚。
     if (manifest.revision < m_highest_seen.load(std::memory_order_acquire)) {
         rollback();
-        return Failure(manifest.revision,
-                       "提交前发现更高 revision，回滚本次事务: " +
-                           std::to_string(manifest.revision));
+        return fail("提交前发现更高 revision，回滚本次事务: " +
+                    std::to_string(manifest.revision));
     }
 
     // step8: 全部成功后统一发布。监听器只会看到完整的一代。
@@ -341,6 +442,7 @@ SoReloadResult SoReloader::Reload(const SoManifest& manifest) {
         m_committed_revision = manifest.revision;
     }
 
+    attempt.MarkSuccess();
     SoReloadResult result;
     result.ok = true;
     result.applied = true;
@@ -380,6 +482,18 @@ std::uint64_t SoReloader::CommittedRevision() const {
 
 std::uint64_t SoReloader::HighestSeenRevision() const {
     return m_highest_seen.load(std::memory_order_acquire);
+}
+
+std::uint64_t SoReloader::ReloadSuccessTotal() const noexcept {
+    return m_reload_success_total.load(std::memory_order_relaxed);
+}
+
+std::uint64_t SoReloader::ReloadFailureTotal() const noexcept {
+    return m_reload_failure_total.load(std::memory_order_relaxed);
+}
+
+std::int64_t SoReloader::LastReloadDurationMs() const noexcept {
+    return m_last_reload_duration_ms.load(std::memory_order_relaxed);
 }
 
 std::string SoReloader::RuntimeVersionKey(const std::string& name) {

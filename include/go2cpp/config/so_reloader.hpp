@@ -33,6 +33,7 @@
 #include "go2cpp/config/so_manifest.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -76,12 +77,13 @@ using SoActivator = std::function<void(const SoSpec& spec)>;
  *
  * ## 不变量
  * - `ok == false` 时 `loaded` 为空、`current_`/retention 未改变；
- * - `applied == false` 只出现在同 revision 幂等命中；
+ * - `applied == false` 只出现在同 revision 的 `Reload` 幂等命中；
+ * - `ForceRescan` 成功时 `applied == true`，revision 可以与上次相同；
  * - `revision` 始终等于传入 manifest 的 revision。
  */
 struct SoReloadResult final {
     bool ok{false};                 ///< 事务是否成功；失败时旧版本仍在服务
-    bool applied{false};            ///< 是否真的提交了新 revision（幂等命中为 false）
+    bool applied{false};            ///< 是否真的提交了一代（同 revision 幂等命中为 false；ForceRescan 为 true）
     std::uint64_t revision{0};      ///< 本次尝试的 manifest revision
     std::vector<std::string> loaded;  ///< 本次新加载并提交的 SO 名（失败时为空）
     std::string error;              ///< 首条中文诊断；成功时为空
@@ -154,6 +156,36 @@ public:
      */
     SoReloadResult Reload(const SoManifest& manifest);
 
+    /**
+     * @brief 忽略 revision 幂等检查，强制重新校验并重载整份 manifest。
+     *
+     * ## 定位
+     * 供 E3 的 `IN_Q_OVERFLOW` 路径使用：inotify 事件队列溢出意味着至少有一个
+     * 变更事件已经丢失，不能再用 revision 相等判断「无需动作」。调用方（持有
+     * watcher 的上层）应在收到 `IN_Q_OVERFLOW` 后重新读取 manifest 文件并调用
+     * 本函数；正常的 watcher 事件仍然走 `Reload`。
+     *
+     * ## 步骤
+     * step1. 仍然拒绝 revision 回退（小于已提交 revision），只跳过相等幂等；
+     * step2. 重新执行 `SoManifest::Validate`，文件/哈希/ABI/环/前缀全部重查；
+     * step3. 把 manifest 中**所有** SO 加入变更集，不依赖 artifact 差异；
+     * step4. 依赖拓扑排序后逐个调用 `SoLoader`，其余事务步骤与 `Reload` 相同。
+     *
+     * ## 并发/失败语义
+     * 与 `Reload` 共用 `m_reload_mutex` 与 revision 栅栏，可安全并发调用；
+     * 失败时只回滚本次新加载的句柄，旧版本继续服务。成功时 `applied=true`，
+     * 即使 manifest 的 revision 没有变化。
+     */
+    SoReloadResult ForceRescan(const SoManifest& manifest);
+
+    /**
+     * @brief 对 `CurrentManifest()` 做一次强制全量重扫。
+     *
+     * 没有已提交 manifest（revision == 0）时返回失败；若读取快照后到提交前
+     * 已有更高 revision 提交，本次调用会按 revision 回退被拒绝，调用方重试即可。
+     */
+    SoReloadResult ForceRescan();
+
     /** @brief 返回当前已提交 manifest 的副本。 */
     SoManifest CurrentManifest() const;
 
@@ -177,6 +209,27 @@ public:
     /** @brief 已经见过的最大 revision（含失败/被抢占的事务）。 */
     std::uint64_t HighestSeenRevision() const;
 
+    /** @brief 运行指标键：累计成功提交次数（十进制文本，`ConfigVar<std::string>`）。 */
+    static constexpr const char* kReloadSuccessTotalKey =
+        "so.runtime.reload_success_total";
+
+    /** @brief 运行指标键：累计失败次数（十进制文本，含被 revision 抢占）。 */
+    static constexpr const char* kReloadFailureTotalKey =
+        "so.runtime.reload_failure_total";
+
+    /** @brief 运行指标键：最近一次耗时毫秒数（十进制文本）。 */
+    static constexpr const char* kReloadDurationMsKey =
+        "so.runtime.reload_duration_ms";
+
+    /** @brief 本实例累计成功提交次数（只统计 applied=true 的事务）。 */
+    std::uint64_t ReloadSuccessTotal() const noexcept;
+
+    /** @brief 本实例累计失败次数（含校验失败、loader 失败与被抢占）。 */
+    std::uint64_t ReloadFailureTotal() const noexcept;
+
+    /** @brief 最近一次 `Reload` 的耗时（毫秒；从入口到返回，含等锁时间）。 */
+    std::int64_t LastReloadDurationMs() const noexcept;
+
     /** @brief 运行时版本键名：`so.<name>.runtime.current_version`。 */
     static std::string RuntimeVersionKey(const std::string& name);
 
@@ -184,6 +237,42 @@ public:
     static std::string RuntimePathKey(const std::string& name);
 
 private:
+    // 单次 Reload 的计时与结果标记；析构时统一更新指标并回写 ConfigVar。
+    // 声明在 m_reload_mutex 之前，保证析构发生在释放串行锁之后。
+    class ReloadAttempt final {
+    public:
+        explicit ReloadAttempt(SoReloader& owner)
+            : m_owner(owner), m_started(std::chrono::steady_clock::now()) {}
+        ~ReloadAttempt() noexcept;
+
+        ReloadAttempt(const ReloadAttempt&) = delete;
+        ReloadAttempt& operator=(const ReloadAttempt&) = delete;
+
+        void MarkSuccess() noexcept { m_outcome = Outcome::Success; }
+        void MarkFailure() noexcept { m_outcome = Outcome::Failure; }
+        void MarkSkipped() noexcept { m_outcome = Outcome::Skipped; }
+
+    private:
+        enum class Outcome { Running, Success, Failure, Skipped };
+
+        SoReloader& m_owner;  ///< 指标所属实例；必须比本对象活得久
+        std::chrono::steady_clock::time_point m_started;  ///< 进入 ReloadImpl 的时刻
+        Outcome m_outcome{Outcome::Running};  ///< 返回路径标记；Running 表示异常逸出
+    };
+
+    // 两个公共入口的共同实现；force_rescan 跳过 revision 幂等并全量重载。
+    SoReloadResult ReloadImpl(const SoManifest& manifest, bool force_rescan);
+
+    // 更新原子指标并尽力回写三个 ConfigVar；noexcept，异常被隔离。
+    void FinishReload(std::chrono::steady_clock::time_point started, bool success,
+                      bool skipped) noexcept;
+
+    // 把原子指标镜像到 so.runtime.*；ConfigVar 写入失败不影响事务结果。
+    void PublishMetrics() noexcept;
+
+    // 构造函数里注册指标键；不重置已有值，多实例共享进程级键。
+    void EnsureMetricVars() noexcept;
+
     // 暂存变量的回滚栈：只记录 ApplyString 真正产生 pending 的变量。
     void RollbackStaged(const std::vector<ConfigVarBase::ptr>& staged) noexcept;
 
@@ -214,6 +303,9 @@ private:
     std::map<std::string, std::vector<std::string>> m_retained;  ///< SO 名 → 版本路径保留清单（末尾最新）
     std::uint64_t m_committed_revision{0};  ///< 最近成功提交的 revision；只增不减
     std::atomic<std::uint64_t> m_highest_seen{0};  ///< 已见最大 revision；Reload 入口 fetch_max，提交前比较
+    std::atomic<std::uint64_t> m_reload_success_total{0};  ///< 成功提交计数；FinishReload 递增
+    std::atomic<std::uint64_t> m_reload_failure_total{0};  ///< 失败计数（含抢占）；FinishReload 递增
+    std::atomic<std::int64_t> m_last_reload_duration_ms{0};  ///< 最近一次耗时（ms）；FinishReload 覆盖
 };
 
 }  // namespace go2cpp::config

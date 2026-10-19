@@ -46,7 +46,9 @@
 - **不做流量灰度**：`candidate` 只被解析和透传，1% 分流属于业务/网关层；
 - **不做进程隔离**：F1 的进程内崩溃本层无法兜底，独立进程插件模型不在范围内；
 - **不实现 inotify**：B1/B3/E2/E3 复用 `Config::StartWatcher` 的轮询 + 稳定快照；
-  `IN_Q_OVERFLOW` 的强制全量重扫不在本层；
+  inotify 事件源由上层提供，但**溢出后的强制全量重扫入口**在本层：watcher
+  收到 `IN_Q_OVERFLOW` 时应重新读取 manifest 并调用
+  `SoReloader::ForceRescan()`（见 §4 E3 与 `docs/so-reload-usage.md`）；
 - **不删除旧 SO**：C1 的 `retire_policy` 只解析、不执行；本层只维护
   「旧版本路径保留清单」，真正的 `dlclose` 由加载器在引用计数归零后决定；
 - **不接管 `Config` 的私有事务锁**：`Config::m_transaction_mutex` 不可见，本层
@@ -82,7 +84,7 @@
 | `src/config/so_manifest.cpp` | 解析 `[so]` / `[so.group.*]` / `[so.<name>]`；文件存在性、SHA-256、声明 ABI、依赖环、符号前缀冲突 | 同上 |
 | `include/go2cpp/config/so_reloader.hpp` | `SoLoader`/`SoUnloader`/`SoActivator` 回调类型；`SoReloader` 与 `SoReloadResult` | 加载器实现 |
 | `src/config/so_reloader.cpp` | revision 幂等/栅栏、变更集与依赖一致性、两阶段 `ConfigVar` 事务、失败卸载、保留清单 | `dlopen` |
-| `tests/config/test_so_manifest.cpp` | 用假 loader 覆盖 A1/A2/A3/B2/B3/D1/D2/D3/E1/F2（另含 C2 顺序验证） | 真实 `.so` |
+| `tests/config/test_so_manifest.cpp` | 用假 loader 覆盖 A1/A2/A3/B2/B3/D1/D2/D3/E1/F2/F2 指标/E3 ForceRescan（另含 C2 顺序验证） | 真实 `.so` |
 | `docs/state-machines/SoReloader.md` | 事务状态转化表 | — |
 
 ### 2.2 修改的构建文件
@@ -177,15 +179,22 @@ dependencies=
 |---|---|---|
 | `so.runtime.revision` | 每次成功提交 | 当前 manifest revision |
 | `so.runtime.last_reload_at` | 每次成功提交 | Unix 秒 |
+| `so.runtime.reload_success_total` | 每次 `Reload`/`ForceRescan` 成功提交 | F2：累计成功次数（十进制文本） |
+| `so.runtime.reload_failure_total` | 每次 `Reload`/`ForceRescan` 失败（含被 revision 抢占） | F2：累计失败次数（十进制文本） |
+| `so.runtime.reload_duration_ms` | 每次 `Reload`/`ForceRescan` 返回前 | F2：最近一次入口到返回的耗时（毫秒，十进制文本） |
 | `so.<name>.runtime.current_version` | 该 SO 成功提交 | F2：当前版本 |
 | `so.<name>.runtime.loaded_path` | 该 SO 成功提交 | F3：本进程实际加载路径（含版本） |
 | `so.<name>.runtime.loaded_sha256` | 该 SO 成功提交 | F3：跨进程比对内容 |
 | `so.<name>.runtime.abi_version` | 该 SO 成功提交 | 排障 |
 | `so.<name>.runtime.loaded_at` | 该 SO 成功提交 | 排障 |
 
-这些键都是普通 `ConfigVar<std::string>`，因此 `DumpIni()`、`StartWatcher()`、
-`AddListener()` 全部可直接复用。它们**只在事务提交阶段发布**；失败事务不会
-留下新值。
+`so.<name>.runtime.*`、`so.runtime.revision`/`last_reload_at` 与三个新增
+指标都是普通 `ConfigVar<std::string>`；指标值是十进制文本，读取方自行
+转换为整数。它们都能被 `DumpIni()`/`AddListener()` 直接使用。
+per-SO 观测值**只在事务提交阶段发布**，失败事务不会留下新值；三个累计指标
+不参与两阶段事务，而是在每次 `Reload` 返回前单独发布（失败也计数），因此它们
+描述的是「尝试」而不是「已提交的一代」：`success_total` 只统计
+`applied=true` 的提交，同 revision 幂等命中不增加任何计数。
 
 ---
 
@@ -206,9 +215,9 @@ dependencies=
 | **D3** 回滚到旧 SO | `keep_versions`、`path` | 每次成功提交把 `path` 追加到保留清单，按 `keep_versions` 裁剪；清单只记录，不卸载旧文件 | ✅ 实现，测试覆盖 |
 | **E1** 多线程同时热更 | `revision` | `HighestSeenRevision` 在进入串行区**之前**原子抬高；提交前再次比较；旧 revision 即使已加载完成也会被回滚，只有最大 revision 能提交 | ✅ 实现，测试覆盖 |
 | **E2** 文件写入中被 dlopen | `path` | 依赖既有 `Config::StartWatcher` 的稳定快照 + `.lock`；本层要求版本化文件名，进一步避免覆盖写 | ⚠️ 复用既有能力，未新增测试 |
-| **E3** inotify 重复/丢失/溢出 | `revision` | 事件只当去抖信号，真实状态靠 revision/hash 对比；`IN_Q_OVERFLOW` 强制全量重扫在 watcher 层 | ❌ 溢出重扫未实现 |
+| **E3** inotify 重复/丢失/溢出 | `revision` | 事件只当去抖信号，真实状态靠 revision/hash 对比；本层新增 `ForceRescan(manifest)` / `ForceRescan()`：跳过 revision 幂等、重新 `Validate`、把全部 SO 重新加载。上层在收到 `IN_Q_OVERFLOW` 时调用 | ✅ 入口与测试；inotify 事件源仍由上层提供 |
 | **F1** 新 SO 首调崩溃 | `candidate` | 只解析/透传；进程内隔离与灰度不在本层 | ❌ 仅保留配置位 |
-| **F2** 可观测指标 | `so.<name>.runtime.*`、`so.runtime.*` | 事务提交时回写 `current_version` / `loaded_path` / `loaded_sha256` / `abi_version` / `loaded_at` / `revision` / `last_reload_at` | ⚠️ 部分实现；成功/失败计数与耗时未实现 |
+| **F2** 可观测指标 | `so.<name>.runtime.*`、`so.runtime.*` | 事务提交时回写 `current_version` / `loaded_path` / `loaded_sha256` / `abi_version` / `loaded_at` / `revision` / `last_reload_at`；每次 `Reload` 返回前更新 `reload_success_total` / `reload_failure_total` / `reload_duration_ms` | ✅ 实现，E1/F2 指标测试覆盖 |
 | **F3** 多进程共享同一 SO | `so.<name>.runtime.loaded_path`、`loaded_sha256` | 每进程独立 `SoReloader`，各自回写自己的路径与哈希；不假设跨进程一致 | ⚠️ 观测键已实现；跨进程测试未做 |
 
 ### 4.1 变更集规则（A1/D2/E1 的共同基础）
@@ -272,6 +281,10 @@ loader false / ApplyString false / 更高 revision 抢占
         └─> 返回 ok=false，旧版本继续服务
 ```
 
+E3 的溢出重扫复用同一时序，只改两处：跳过 `revision == committed_revision`
+的幂等短路，并把「变更集」替换成「manifest 里的全部 SO」。因此成功时即使
+revision 未变，`applied` 也是 true；失败时仍只卸载本次新加载的句柄。
+
 ### 5.1 并发与失败语义
 
 - **串行化**：同一 `SoReloader` 的 `Reload` 由 `m_reload_mutex` 串行；
@@ -280,7 +293,7 @@ loader false / ApplyString false / 更高 revision 抢占
   提交前看到更大的值并主动回滚；后到的旧 revision 会在进入串行区后立即被
   丢弃；
 - **幂等**：`R == committed_revision` 直接返回 `ok=true, applied=false`，
-  不重复 `dlopen`；
+  不重复 `dlopen`；`ForceRescan` 是有意的例外，它跳过这条短路（E3 溢出重扫）；
 - **旧版本安全**：无论哪条失败路径，都**不会**对 `current_` 里的旧句柄调用
   `SoUnloader`；`SoUnloader` 只接受本次 `loaded` 列表里的句柄；
 - **激活不可失败**：`SoActivator` 在 `NotifyPending` 之后执行，此时配置值
@@ -399,6 +412,8 @@ manifest）。推荐流程：
 | D3 | `keep_versions=3`，依次 v1..v4 → v1 在 v2 时仍在清单；v4 后清单为 `[v2,v3,v4]` |
 | E1 | 旧 revision 正在 loader 中阻塞，新 revision 到达 → 旧事务回滚并卸载自己加载的 SO，只有新 revision 提交 |
 | F2 | 热更后 `so.f2so.runtime.current_version` 可读且等于 manifest 的 `version`；`so.runtime.revision` 等于 manifest revision |
+| F2 指标 | 两次成功 + 一次 loader 失败 → `success_total=2`、`failure_total=1`、`duration_ms>=0`；同 revision 幂等命中不改变计数；E1 中被抢占的旧事务计 1 次失败 |
+| E3 | revision=1 正常提交后，同 revision 的普通 `Reload` 幂等（loader 不增加）；`ForceRescan` 让两个 SO 重新加载，loader 调用 2→4→6，版本 1→2 |
 
 所有加载器都是假回调，不编译/不加载真实 `.so`。
 
@@ -406,11 +421,13 @@ manifest）。推荐流程：
 
 ## 9. 已知限制（诚实清单）
 
-1. **E3**：`IN_Q_OVERFLOW` 强制全量重扫未实现，仍依赖 `Config::StartWatcher`
-   的轮询与时间戳/大小比较；
+1. **E3**：本层只提供 `ForceRescan` 入口；inotify 事件源与「何时判定
+   `IN_Q_OVERFLOW`」仍由上层 watcher 负责，`Config::StartWatcher` 自身的
+   轮询模型不感知 inotify 溢出；
 2. **F1**：`candidate` 只是配置位，没有灰度、没有崩溃捕获；
-3. **F2**：`reload_success_total`/`reload_failure_total`/`reload_duration_ms`
-   未实现；当前只有 `revision`、`last_reload_at`、每 SO 版本/路径/哈希/时间；
+3. **F2**：三个累计指标已实现，但它们是**进程内单实例**语义；多个
+   `SoReloader` 共享同名的 `so.runtime.*` 键，生产环境应只创建一个实例。
+   幂等命中（同 revision）不增加成功计数；
 4. **F3**：跨进程版本比对没有测试；`loaded_path`/`loaded_sha256` 已可供外部
    比对，但本层不假设多进程一致；
 5. **C1**：`retire_policy` 不执行；旧 `.so` 文件与旧句柄都由加载器层管理；

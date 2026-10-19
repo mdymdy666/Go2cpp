@@ -57,6 +57,7 @@
 
 #include "go2cpp/context.hpp"
 #include "go2cpp/core/parking_condition.hpp"
+#include "go2cpp/core/timer.hpp"
 #include "go2cpp/error.hpp"
 
 #include <algorithm>
@@ -76,6 +77,7 @@
 #include <random>
 #include <type_traits>
 #include <typeinfo>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -2288,6 +2290,226 @@ inline SelectCase DefaultCase() {
                     {},
                     {},
                     {}};
+}
+
+namespace detail {
+
+/**
+ * @brief 一次 `Select` 调用期间，非通道 case 的「可撤销注册」登记表。
+ *
+ * ## 定位
+ * `DoneCase` / `AfterCase` 不是 channel：它们靠 `SelectCase::arm` 注册一个外部
+ * 事件源、靠 `SelectCase::disarm` 撤销。arm 与 disarm 之间**只有**
+ * `SelectWaitState` 这一个共同参数，因此需要一张以它为键的登记表，把「注册时
+ * 拿到的句柄」交给「撤销时使用」。本表就是那张表，回调 id 与 Timer 句柄共用。
+ *
+ * ## 为什么不能用 case 内的单个槽位
+ * `Select` 在没有任何分支获胜时会**重新 arm**（`src/concurrency/channel.cpp`
+ * 的主循环），同一个 `wait_state` 会被反复使用；同一个 `SelectCase` 对象也可能
+ * 被多个线程共享（case 表按值传入，且内部全是 const 可调用的 `std::function`）。
+ * 单槽位在并发使用时会互相覆盖，导致 disarm 删错 id —— 前一个回调永远留在
+ * `Done` 上，每调用一次 select 就泄漏一个回调。
+ *
+ * ## 并发/失败语义
+ * 所有方法内部加锁；同一个键的 arm/disarm 由同一次 Select 调用发起（同一线程），
+ * 不同 Select 的键不同。`Take*` 对不存在的键返回空值 —— `Select` 的回滚路径会对
+ * **所有** case 调 disarm（包括从未 arm 成功的），这必须是无害的。
+ */
+class SelectCaseRegistry final {
+ public:
+  /** @brief 登记 Done 回调 id；同一键上的旧值由调用方先 Take 清理。 */
+  void StoreCallback(const void* key, DoneSignal::CallbackId id) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_callbacks[key] = id;
+  }
+
+  /** @brief 取走并删除回调 id；键不存在返回 0（0 是 DoneSignal 的无效哨兵）。 */
+  DoneSignal::CallbackId TakeCallback(const void* key) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto found = m_callbacks.find(key);
+    if (found == m_callbacks.end()) {
+      return 0;
+    }
+    const DoneSignal::CallbackId id = found->second;
+    m_callbacks.erase(found);
+    return id;
+  }
+
+  /** @brief 登记定时器句柄；同一键上的旧句柄由调用方先 Take 取消。 */
+  void StoreTimer(const void* key, std::shared_ptr<core::Timer> timer) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_timers[key] = std::move(timer);
+  }
+
+  /** @brief 取走并删除定时器句柄；键不存在返回空指针。 */
+  std::shared_ptr<core::Timer> TakeTimer(const void* key) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto found = m_timers.find(key);
+    if (found == m_timers.end()) {
+      return {};
+    }
+    auto timer = std::move(found->second);
+    m_timers.erase(found);
+    return timer;
+  }
+
+ private:
+  std::mutex m_mutex;  ///< 保护两张表；arm/disarm 可能来自不同线程
+  /// wait_state → Done 回调 id；arm 写入、disarm 取走
+  std::unordered_map<const void*, DoneSignal::CallbackId> m_callbacks;
+  /// wait_state → 已排程的 Timer；持有句柄避免 arm 返回后析构即取消
+  std::unordered_map<const void*, std::shared_ptr<core::Timer>> m_timers;
+};
+
+/** @brief 构造「ctx 已取消」的探测结果；probe 与 Done 回调共用同一份语义。 */
+inline SelectProbe CancelledProbe(const ContextPtr& ctx) {
+  SelectProbe probe;
+  probe.ready = true;
+  probe.ok = false;
+  probe.status = ChannelStatus::kCancelled;
+  const auto err = ctx ? ctx->Err() : ErrorPtr{};
+  probe.error = err ? err : CanceledError();
+  return probe;
+}
+
+/** @brief 构造「计时器到期」的探测结果；probe 与 Timer 回调共用。 */
+inline SelectProbe TimerFiredProbe() {
+  SelectProbe probe;
+  probe.ready = true;
+  probe.ok = true;
+  probe.status = ChannelStatus::kReady;
+  return probe;
+}
+
+}  // namespace detail
+
+/**
+ * @brief 构造 `case <-ctx.Done()` 的 select 分支。
+ *
+ * ## 步骤
+ * step1. `probe`：`ctx->IsDone()` 为真时返回就绪，状态 `kCancelled`，错误取
+ *        `ctx->Err()`（取消原因为空时退化为 `CanceledError()`）；
+ * step2. `arm`：`ctx->Done().AddCallback(...)` 注册回调，回调里只做
+ *        `wait_state->TrySelect(index, CancelledProbe(ctx))`；返回的回调 id
+ *        存进共享登记表（见 `detail::SelectCaseRegistry`），键是本次 Select 的
+ *        `wait_state`；
+ * step3. `disarm`：从登记表取回 id 并 `RemoveCallback`，然后删除表项。
+ *
+ * ## 并发/失败语义
+ * - `ctx` 为空时永远不就绪（对齐 Go 的 nil channel）；只有这一个分支的 `Select`
+ *   会永久等待，调用方需自行保证非空；
+ * - 取消与就绪 channel 同时可选中时，由 `Select` 的轮转探测决定赢家，与 Go 的
+ *   随机选择一致，**不保证** context 优先；
+ * - arm 时若 `ctx` 已取消，`AddCallback` 会同步执行回调并返回 0，此时 disarm 不再
+ *   调用 `RemoveCallback`（0 是无效 id）；
+ * - 漏掉 disarm 会让每次 select 在 `Done` 上留下一个永不触发的回调，长期运行等于
+ *   按调用次数泄漏内存，因此 disarm 必须与 arm 成对。
+ */
+inline SelectCase DoneCase(const ContextPtr& ctx) {
+  auto registry = std::make_shared<detail::SelectCaseRegistry>();
+  return SelectCase{
+      [ctx] {
+        if (ctx && ctx->IsDone()) {
+          return detail::CancelledProbe(ctx);
+        }
+        return SelectProbe{};
+      },
+      false,
+      [ctx, registry](const std::shared_ptr<detail::SelectWaitState>& state,
+                      std::size_t index) {
+        // step2.1: Select 重试会复用同一个 wait_state，先清掉上一轮残留的 id，
+        //          否则旧回调既不会被触发也不会被移除。
+        const auto previous = registry->TakeCallback(state.get());
+        if (ctx && previous != 0) {
+          ctx->Done().RemoveCallback(previous);
+        }
+        if (!ctx) {
+          return;
+        }
+        // step2.2: 回调在 Done 完成时由 Signal 在锁外调用，且 Done 状态先发布，
+        //          所以这里读 ctx->Err() 拿到的一定是最终原因。
+        const auto id = ctx->Done().AddCallback([ctx, state, index] {
+          try {
+            (void)state->TrySelect(index, detail::CancelledProbe(ctx));
+          } catch (...) {
+            // 回调只负责唤醒；构造失败时 Select 侧另有错误返回路径。
+          }
+        });
+        if (id != 0) {
+          registry->StoreCallback(state.get(), id);
+        }
+      },
+      [ctx, registry](const std::shared_ptr<detail::SelectWaitState>& state) {
+        const auto id = registry->TakeCallback(state.get());
+        if (ctx && id != 0) {
+          ctx->Done().RemoveCallback(id);
+        }
+      },
+      {},
+      {}};
+}
+
+/**
+ * @brief 构造 `case <-time.After(d)` 的 select 分支。
+ *
+ * ## 步骤
+ * step1. `probe`：`steady_clock::now() >= deadline` 即就绪（等价于 Go 的
+ *        `time.After` 已经触发），命中结果 `ok=true`、`status=kReady`；
+ * step2. `arm`：`core::TimerService::Default().Schedule(deadline, cb)` 排程一次性
+ *        定时器，回调里 `wait_state->TrySelect(index, TimerFiredProbe())`；
+ *        **Timer 句柄存进 `std::shared_ptr` 登记表**——局部 `Timer` 在 arm 返回时
+ *        析构，而析构等价于 Cancel，回调将永远不会触发，这是最容易踩的坑；
+ * step3. `disarm`：取回 `Timer` 并 `Cancel()`，然后删除表项。
+ *
+ * ## 并发/失败语义
+ * - 传入过去的 deadline 时 probe 立即就绪，不会排程任何定时器（无泄漏）；
+ * - 定时器回调可能已经进入执行队列，`Cancel()` 只能撤销尚未执行的触达；此时
+ *   回调里的 `TrySelect` 会因状态已被其他分支选中或已取消而返回 false；
+ * - `TimerService::Default()` 已停止时 `Schedule` 抛异常，`Select` 会按注册失败
+ *   走统一回滚路径并返回 `kInvalid`；
+ * - 未 disarm 的 `Timer` 会一直挂在服务队列里直到到期（`PendingCount()` 可见），
+ *   大批量使用必须依靠 disarm 取消。
+ */
+inline SelectCase AfterCase(std::chrono::steady_clock::time_point deadline) {
+  auto registry = std::make_shared<detail::SelectCaseRegistry>();
+  return SelectCase{
+      [deadline] {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          return detail::TimerFiredProbe();
+        }
+        return SelectProbe{};
+      },
+      false,
+      [deadline, registry](
+          const std::shared_ptr<detail::SelectWaitState>& state,
+          std::size_t index) {
+        // step2.1: Select 重试复用 wait_state，先把上一轮没撤掉的定时器取消。
+        if (auto previous = registry->TakeTimer(state.get())) {
+          previous->Cancel();
+        }
+        // step2.2: Timer 必须由 shared_ptr 持有到 disarm；局部变量析构即取消。
+        auto timer = std::make_shared<core::Timer>(
+            core::TimerService::Default().Schedule(deadline, [state, index] {
+              try {
+                (void)state->TrySelect(index, detail::TimerFiredProbe());
+              } catch (...) {
+                // 唤醒失败说明本次 select 已由其他分支获胜，无需额外处理。
+              }
+            }));
+        registry->StoreTimer(state.get(), std::move(timer));
+      },
+      [registry](const std::shared_ptr<detail::SelectWaitState>& state) {
+        if (auto timer = registry->TakeTimer(state.get())) {
+          timer->Cancel();
+        }
+      },
+      {},
+      {}};
+}
+
+/** @brief `AfterCase` 的相对时长版本，等价 Go 的 `time.After(d)`。 */
+inline SelectCase AfterCase(ContextDuration timeout) {
+  return AfterCase(detail::SaturatingDeadline(timeout));
 }
 
 // 执行多路 select。cases 是候选分支，context 可取消，timeout 是可选相对

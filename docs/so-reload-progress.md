@@ -10,7 +10,7 @@
 | **step1** | 17 个工业级场景/边界 → `docs/so-reload-scenarios.md` | ✅ **完成**（`ddb8344`） |
 | **step2** | config 分层扩展设计 + 实现 → `docs/so-reload-design.md`、`so_manifest.*`、`so_reloader.*` | ✅ **完成**（`acca90d`） |
 | **step3** | 11 个场景测试全部通过；原 113 个测试无回归 | ✅ **完成**（**ctest 114/114**） |
-| step4 | 使用文档与剩余限制的收口 | 🔄 进行中 |
+| **step4** | F2 三项指标 + E3 `ForceRescan` + 使用文档 | ✅ **完成**（本轮；ctest 114/114） |
 
 ## config 模块的既有能力（审查基准）
 
@@ -43,6 +43,7 @@
 | 1 | 15:05 | 建 goal + 定时任务 + 派子 agent | `fd48cb1f` running |
 | 2-6 | 15:10~15:22 | 摸清 config 接口；给子 agent 补充「已有两阶段事务」的输入 | 已送达 |
 | 7 | 15:24 | 检查产出 | **无文件**，`git status` 空 |
+| 8 | 15:16 | 补 F2 三指标、E3 `ForceRescan`、`docs/so-reload-usage.md` | ✅ 构建通过；SO 测试 1/1；全量 114/114 |
 
 ## step2 / step3 完成记录（`acca90d`）
 
@@ -87,3 +88,65 @@ ctest --test-dir build-work      → 114/114 通过（原 113 + 新增 1）
 | F3 跨进程测试 | 未做 |
 | 已加载组从 manifest 消失时的退役 | 拒绝（不做退役） |
 | 随机 fuzz / 吞吐压测 | 未做（本轮按 10 场景 + C2 验收） |
+
+> 上表是 step2 时点的记录；其中 **E3 全量重扫**与 **F2 三指标**已在本轮补齐，
+> 见下方 step4 记录。
+
+## step4 完成记录（2026-10-19 15:16）
+
+### 交付
+
+| 文件 | 改动 |
+|---|---|
+| `include/go2cpp/config/so_reloader.hpp` | 新增 `ForceRescan(manifest)` / `ForceRescan()`、三个指标访问器与键常量、`ReloadAttempt` 计时作用域；**未改** `Reload` 等既有公开签名 |
+| `src/config/so_reloader.cpp` | `Reload` 拆成 `ReloadImpl(manifest, force_rescan)`；所有返回路径经 `fail`/`MarkSuccess`/`MarkSkipped` 计数；`steady_clock` 计时；指标镜像到 `so.runtime.*`；`ForceRescan` 跳过幂等并全量重载 |
+| `tests/config/test_so_manifest.cpp` | 新增 F2 指标（2 成功 + 1 失败 + 幂等不计）、E3 `ForceRescan`（loader 2→4→6）；E1 增加抢占计数断言 |
+| `docs/so-reload-design.md` | E3/F2 状态更新、三个指标键、`ForceRescan` 时序与测试映射、已知限制修订 |
+| `docs/state-machines/SoReloader.md` | 增加 `ForceRescan` 状态行与不变量 |
+| `docs/so-reload-usage.md` | **新增** 528 行使用文档（最小 manifest、dlopen 三回调、5 步发布、排障、限制） |
+| `docs/so-reload-progress.md` | 本记录 |
+| `codex.md` | AI 协作记录 §16 |
+
+### 三项任务
+
+1. **F2 三指标：完成。** `so.runtime.reload_success_total` /
+   `reload_failure_total` / `reload_duration_ms` 都是
+   `ConfigVar<std::string>`（十进制文本，与既有 `so.runtime.*` 一致）；
+   构造时注册，每次 `Reload`/`ForceRescan` 返回前（析构作用域）更新。
+   成功只统计 `applied=true`；校验失败、loader 失败、revision 回退/被抢占都计入
+   失败；同 revision 幂等命中两者都不计。`std::chrono::steady_clock` 从入口开始
+   计时（含等 `m_reload_mutex`），因此能暴露锁竞争。
+2. **E3 `ForceRescan`：完成。** 两个入口：`ForceRescan(manifest)` 与
+   `ForceRescan()`（重扫 `CurrentManifest()`）。跳过 `revision == committed` 的
+   幂等短路，仍拒绝 revision 回退、仍受 `highest_seen` 栅栏约束；重新 `Validate`
+   后把 manifest 全部 SO 当变更集，逐个 `SoLoader`。文档写明 inotify 收到
+   `IN_Q_OVERFLOW` 时应调用它。
+3. **使用文档：完成。** `docs/so-reload-usage.md` 覆盖任务要求的 5 节，并额外给出
+   SO 侧导出符号、加载器注册表与回滚发布注意事项。
+
+### 实际验证
+
+```
+cmake --build build-work -j8
+  → 全量构建通过（新代码 -Wall -Wextra -Wpedantic 无告警）
+
+ctest --test-dir build-work -R so_manifest --output-on-failure
+  → 1/1 Passed（0.01s）
+go2cpp_so_manifest_test 直接运行：
+  [F2 指标] success=2 failure=1 duration_ms=0
+  [E3] revision 未变仍全量重扫：loader 调用 2→4→6，版本 1→2
+  [so_manifest] failures=0
+
+ctest --test-dir build-work
+  → 114/114 Passed（61.75s）
+```
+
+### 边界与后续
+
+- **未做**：真实 inotify 事件源（属于上层 watcher）；真实 `dlopen` loader 与
+  vtable 切换（属于加载器层）；F1 灰度/进程隔离；F3 跨进程测试；随机 fuzz/压测。
+- `ForceRescan` 仍拒绝 revision 回退；若溢出期间 manifest 已被更高 revision
+  提交，本次重扫可能按回退被拒绝，调用方应重新读取后重试。
+- 三个指标键是进程级固定名；多个 `SoReloader` 实例会互相覆盖镜像值，生产只应
+  创建一个实例。
+- 本轮**未提交 git**，留给主 agent 审查后提交。
