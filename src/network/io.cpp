@@ -996,8 +996,15 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             return node;
         }
 
-        // 新增定时器可能早于 epoll_wait 上一次计算出的超时时间。
-        tickle();
+        // 只有**新增定时器**才需要打断正在 epoll_wait 的 worker：它可能按
+        // 旧的最近截止时间睡着，而新 deadline 更早。无 deadline 的注册
+        // （s3 的空闲长连接 recv 就是这一类）只需把 fd 交给内核，就绪事件
+        // 会正常唤醒 poller；无条件 tickle 只会把全部空闲 worker 踢醒再睡
+        // 回去 —— 实测每请求 0.93 次 eventfd 写被放大成 10.9 次 epoll_wait
+        // 返回和 10.9 次 eventfd read。
+        if (deadline.has_value()) {
+            tickle();
+        }
         return node;
     }
 

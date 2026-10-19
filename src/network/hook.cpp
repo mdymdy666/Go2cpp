@@ -1462,6 +1462,39 @@ bool ioctl_has_no_argument(unsigned long request) noexcept {
 
 namespace go2cpp::hook {
 
+/**
+ * @brief 把已接管 fd 的非阻塞位归因为「运行时设置」。
+ * @details `Socket::accept()` 在把新连接交给上层之前调用：`accept4` 的
+ *          `SOCK_NONBLOCK` 只是让「先试一次」不阻塞 M，不是用户要的 EAGAIN
+ *          语义。纠正后 `can_wait()` 才会为真，读写回到 park 路径，而不是
+ *          退化成 Socket 层的 100ms 分片轮询（每片一次 DEL+ADD）。
+ * @param fd 目标描述符；负值或无法接管时静默返回。
+ */
+void mark_system_nonblocking(int fd) noexcept {
+    if (fd < 0) {
+        return;
+    }
+    try {
+        // 允许懒接管：Socket::accept() 在 Linux 上可能在普通线程里调用
+        // （benchmark/服务器主循环就是这样），此时 Hook 的 accept4 分支因为
+        // cooperative_manager() 为空而没有登记描述符。这里的调用点只限
+        // 「框架刚创建的连接」，所以替它接管是安全的；Socket 构造函数不再
+        // 调用本函数，避免改变用户自定义 SocketWaiter 的既有语义。
+        auto descriptor = descriptor_for(fd);
+        if (!descriptor) {
+            descriptor = try_adopt_socket(fd);
+        }
+        if (!descriptor) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(descriptor->m_open->m_mutex);
+        descriptor->m_open->m_system_nonblocking = true;
+        descriptor->m_open->m_user_nonblocking = false;
+    } catch (...) {
+        // 元数据纠正只是 park 判定的优化；失败时保留原有的懒接管语义。
+    }
+}
+
 void set_enabled(bool enabled_value) noexcept {
     s_enabled.store(enabled_value, std::memory_order_release);
 }

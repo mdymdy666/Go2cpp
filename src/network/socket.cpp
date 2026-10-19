@@ -6,6 +6,7 @@
  */
 #include "go2cpp/network/socket.hpp"
 #include "go2cpp/network/fd_manager.hpp"
+#include "go2cpp/network/hook.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -210,6 +211,10 @@ bool Socket::init_nonblock() {
         return false;
     }
     FdManager::instance().set_nonblock(m_fd, false, true);
+    // 这里不调用 hook::mark_system_nonblocking：Socket 可以包装任意来源的 fd
+    // （socketpair、用户自己的 socket），强制把它纳入 Hook 的 park 路径会
+    // 绕过 set_waiter() 注册的自定义等待器。只有 accept() 出来的连接明确
+    // 属于运行时自己，那个调用点在 Socket::accept 里。
     return true;
 }
 int Socket::last_error() const noexcept {
@@ -275,6 +280,12 @@ Socket::Ptr Socket::accept(Duration timeout) {
         const int accepted = ::accept4(fd, reinterpret_cast<sockaddr*>(&storage), &length,
                                        SOCK_CLOEXEC | SOCK_NONBLOCK);
         if (accepted >= 0) {
+            // accept4(SOCK_NONBLOCK) 的 O_NONBLOCK 是运行时为了让「先试一次」
+            // 不阻塞 M 而设置的，不是用户要的 EAGAIN 语义。Hook 会把内核标志
+            // 误归因为用户意图并拒绝 park，让 Socket 层退化成 100ms 分片轮询
+            // （每片一次 DEL+ADD；s3 实测每请求 10.3 次 epoll_ctl、9.3 次
+            // futex）。必须在 FromFd 之前纠正，保证首次 recv 就走 park 路径。
+            go2cpp::hook::mark_system_nonblocking(accepted);
             auto result = FromFd(accepted, storage.ss_family, m_type, m_protocol);
             if (result) result->m_connected = true;
             end_operation(); return result;

@@ -57,6 +57,29 @@ inline void BindIOManager(IOManager* manager) noexcept {
 }
 inline IOManager* BoundIOManager() noexcept { return bound_io_manager(); }
 
+/**
+ * @brief 把已接管 fd 的 `O_NONBLOCK` 归因为「运行时设置」而不是「用户意图」。
+ *
+ * ## 为什么需要它
+ *
+ * `socket()`/`accept4()` 带 `SOCK_NONBLOCK`（或调用方自己先 `fcntl`）时，
+ * 内核里 fd 一开始就是 `O_NONBLOCK`；`adopt_socket`/`register_new_socket`
+ * 只能看到这个位，于是记成 `m_user_nonblocking = true`，`can_wait()` 随之为
+ * 假 —— **所有读写都不再 park**，退化成调用方的分片轮询。`Socket` 抽象自己
+ * 负责超时、取消与关闭唤醒，它传的 `SOCK_NONBLOCK` 只是为了让「先试一次」
+ * 不阻塞 M，不是「用户要 EAGAIN 语义」。
+ *
+ * 因此 `Socket::accept()` 在把新连接交给上层之前调用本函数，把 Hook 的
+ * 元数据纠正为 system-nonblocking。没有接管记录时先做一次懒接管；
+ * 接管失败（非 socket/FIFO、Hook 关闭）时静默返回。**不要**在 `Socket`
+ * 构造函数里调用：任意来源的 fd（socketpair、用户自己的 socket）可能依赖
+ * `set_waiter()` 注册的自定义等待器，强制 park 会改变该语义。
+ *
+ * @param fd 目标文件描述符；负值或未接管时无操作。
+ * @note 只影响 Hook 的 park 判定，不改变内核 fd 标志。
+ */
+void mark_system_nonblocking(int fd) noexcept;
+
 /** @brief 设置 Hook connect 调用使用的默认超时。 */
 void set_connect_timeout(std::chrono::milliseconds timeout) noexcept;
 /** @brief 读取当前 Hook connect 默认超时。 */
