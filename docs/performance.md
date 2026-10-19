@@ -179,3 +179,94 @@ P 越多，无效唤醒、调度与 P 队列/条带锁竞争越多。s3 是 IO-b
    空闲 M 无法退休。需要把 `min_workers` 与 P 解耦，按 IO 等待比例收缩。
 2. **s1 的 accept/close hook 成本**：每连接多出 `getsockopt`/`fcntl`/`DEL`/`tickle`，
    约 90µs sys，是缩短短连接差距的主要空间。
+
+---
+
+## ⚠️ 2026-10-19 18:30：旧 benchmark 不公平，此前「GMP 快 3 倍」的结论作废
+
+### 审计发现的 5 个不公平点
+
+旧 `benchmarks/gmp_vs_thread_epoll_benchmark.cpp` 的 epoll 模型存在系统性劣势：
+
+| # | 问题 | 影响 |
+|---|---|---|
+| 1 | epoll 池用 **256 个工作线程**（12 核），全部抢**同一把 `m_mutex`** 投递 job、**同一把锁**收完成、**每个完成再写一次 eventfd** | 每请求 **2 次跨线程交接**；这是「GMP 快 3 倍」的主因 |
+| 2 | s3 的 QPS 被**客户端限速**（8000 连接 × 1 req/s ≈ 7950） | 两边 QPS 相同是客户端决定的，**不能说明 server 能力** |
+| 3 | CPU 采样窗口**包含 warmup**（连接建立） | `cpu_us_per_req` 被摊入建立成本 |
+| 4 | s1 的 GMP 有约 **2.5% 连接错误**（epoll 0） | 对比不对等 |
+| 5 | 两边 `send`/`recv` 写法不同（GMP 2 次 send、epoll 1 次），业务函数有细微差异 | 不是同一工作量 |
+
+### 重写后的公平 benchmark
+
+`benchmarks/gmp_vs_epoll_fair_benchmark.cpp`：
+
+- epoll 模型改为**与 GMP 同构**：K 个独立 IO 线程，各自 `epoll` 实例，
+  **就绪事件在本线程内联读/解析/业务/写**，无跨线程投递、无全局锁；
+- 两边**同一协议、同一份业务函数**、同样 1 次 send + 1 次批量 recv；
+- 客户端：**指数分布到达**、body 随机 64~4096 B、pipeline depth 可配；
+- 采样：客户端打印 `MEASURE_START`，驱动脚本**只采样稳态窗口**的 `/proc` utime/stime，**排除 warmup**。
+
+### 公平对比结果（12 workers，2 clients，10s）
+
+| 场景 | 模型 | QPS | cpu µs/req | user | sys | P50 |
+|---|---|---:|---:|---:|---:|---:|
+| **A 高吞吐 depth1** | gmp | 139,190 | 71.1 | 58.1 | 13.1 | 2.24ms |
+| | **epoll** | **157,348** | **64.0** | 54.3 | **9.7** | **1.38ms** |
+| **B pipeline depth8** | gmp | 164,677 | 63.5 | 54.6 | 8.9 | **0.60ms** |
+| | **epoll** | **179,785** | **60.3** | 55.4 | **5.0** | 15.7ms |
+| **C 4000 连接 rate1** | gmp | 4,005 | 161.7 | 92.4 | 69.3 | 0.122ms |
+| | **epoll** | 4,004 | **143.3** | 84.3 | **59.0** | 0.121ms |
+| **D 1000 连接 rate100** | gmp | 96,934 | 85.9 | 64.0 | 21.9 | **0.279ms** |
+| | **epoll** | 97,338 | **77.0** | 60.2 | **16.9** | 0.248ms |
+
+**主 agent 独立复验 A 场景**（loadavg 3.77，同窗口）：
+
+```
+gmp 12w:   qps=140,213  cpu=71.0  user=57.7  sys=13.3  p50=2.167ms
+epoll 12w: qps=156,103  cpu=64.0  user=53.9  sys=10.1  p50=1.473ms
+```
+
+### 修正后的结论
+
+| 结论 | 状态 |
+|---|---|
+| 「GMP 吞吐是 epoll 的 3 倍」 | ❌ **作废**，是旧 benchmark 的假象 |
+| **高吞吐场景 epoll 快 9~13%** | ✅ 成立 |
+| **限速场景 QPS 相同，但 epoll CPU 低 10~11%** | ✅ 成立 |
+| **GMP 在 B/C 的 P50 更好** | ✅ 成立（B: 0.60 vs 15.7ms；C: 0.122 vs 0.121ms） |
+| s3 的 sys 从 713.8 降到 79.9 | ✅ 仍成立（那是**真实的实现缺陷修复**，与 benchmark 无关） |
+
+### 本轮优化（A 场景 gmp，全部实测）
+
+| 阶段 | QPS | cpu | sys | user |
+|---|---:|---:|---:|---:|
+| 公平基线 | 131,780 | 74.2 | 15.0 | 59.3 |
+| + **`EPOLLET` 替代 `EPOLLONESHOT`**（消除每请求 MOD） | 135,833 | 72.5 | 13.7 | 58.8 |
+| + hook 锁合并、定时器/事件数组快速路径、`current()` 无锁 | **139,190** | **71.1** | **13.1** | 58.1 |
+| **累计** | **+5.6%** | **−4.2%** | **−12.7%** | −2.0% |
+
+**改动文件**：
+- `io_backend.cpp`：ET 注册；`supports_one_shot()` 改 `false`；
+- `io.cpp`：无等待者时保留 interest（事件记 pending，下次零超时 poll 消费）；
+  同 fd 仍有等待者时 `force_rearm` 强制 MOD **防饿死**；
+  `expire_timers`/`poll_timeout_ms` 无定时器锁快速路径；
+  `BackendEvent events[256]` 不再值初始化；
+  `IOManager::current()` 改为读 Scheduler 原子指针（去掉每次 IO 的全局锁+哈希）；
+- `scheduler.hpp`：新增 `io_manager` 原子字段（**不改公开签名**）；
+- `hook.cpp`：`wait_decision()` 合并 `can_wait` + `timeout` 两次加锁。
+
+### 旧场景回归（无退化）
+
+| 场景 | 优化前 | 优化后 |
+|---|---:|---:|
+| s3 24w | 173.5 | 170.9 |
+| s3 4w | 144.1 | 145.0 |
+| s1 12w | 230.5 | 225.4 |
+
+### 未解决项
+
+1. **仍差约 11%**：GMP **每事件唤醒一个 worker 的 `epoll_wait`** + **两次 Fiber 切换**是模型固有；
+   要再降需要共享 poller / 批量取事件，**改动大**。
+2. **ET 的正确性边界**：依赖「无等待者保留 interest + pending 消费 + 多等待者 `force_rearm`」。
+   `ctest 115/115` 通过，但**建议补** `wait_many` 多 fd、同 fd 多 Fiber、close 竞争**专项压力测试**后再合入。
+3. 旧 benchmark 的 256 线程 epoll 数据**不应再作为对比基准**。

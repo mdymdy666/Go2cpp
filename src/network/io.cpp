@@ -609,6 +609,8 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         std::uint32_t interest{0};
         /// @brief 当前注册的 token（编码 fd + 序号）；用于忽略旧注册的迟到事件。
         std::uint64_t registration_id{0};
+        /// @brief EPOLLET 下同一 fd 还有等待者时必须强制 MOD 重新产生边沿。
+        bool force_rearm{false};
         /// @brief 最近事件报告了可读但当时没有等待者；下一次 wait 直接消费它。
         bool pending_read{false};
         /// @brief 同上，写方向。
@@ -955,11 +957,13 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                     // 普通 IO 等待不碰定时器锁。
                     std::lock_guard<std::mutex> timer_lock(m_timer_mutex);
                     const auto order = m_deadline_order.emplace(*deadline, node->id);
+                    m_timer_count.fetch_add(1, std::memory_order_release);
                     try {
                         m_deadline_index.emplace(
                             node->id, TimerRecord{order, std::weak_ptr<WaitNode>(node)});
                     } catch (...) {
                         m_deadline_order.erase(order);
+                        m_timer_count.fetch_sub(1, std::memory_order_release);
                         throw;
                     }
                     node->timer_armed.store(true, std::memory_order_release);
@@ -1269,6 +1273,7 @@ private:
         }
         m_deadline_order.erase(timer->second.order);
         m_deadline_index.erase(timer);
+        m_timer_count.fetch_sub(1, std::memory_order_release);
     }
 
     void invalidate_registration_locked(FdSlot& slot) noexcept {
@@ -1281,6 +1286,7 @@ private:
         slot.armed = false;
         slot.interest = 0;
         slot.registration_id = 0;
+        slot.force_rearm = false;
     }
 
     int update_interest_locked(FdSlot& slot) noexcept {
@@ -1298,6 +1304,12 @@ private:
         const bool one_shot =
             m_backend && m_backend->supports_one_shot();
         if (interest == 0) {
+            // 边沿触发后端：等待队列为空也保留注册与上次的兴趣位。事件在
+            // 无等待者时由 process_event_locked 记为 pending，下一次
+            // register_wait 会消费它；这样稳态下不再需要 epoll_ctl。
+            if (!one_shot && m_backend && slot.registered) {
+                return 0;
+            }
             if (one_shot) {
                 // ONESHOT 事件返回后已自动停用；保留内核注册和代际，
                 // 下一次 waiter 通过 MOD 重新 arm。取消路径若仍 armed
@@ -1325,7 +1337,7 @@ private:
         // 旧集合子集”时直接返回，导致 READ|WRITE 收缩为 WRITE 后仍保留
         // READ 注册；水平触发下会持续收到无消费者的 READ 事件并忙循环。
         if (slot.registered && slot.interest == interest &&
-            (!one_shot || slot.armed)) {
+            (!one_shot || slot.armed) && !slot.force_rearm) {
             return 0;
         }
 
@@ -1353,6 +1365,7 @@ private:
         slot.armed = !one_shot || interest != 0;
         slot.interest = interest;
         slot.registration_id = registration_id;
+        slot.force_rearm = false;
         return 0;
     }
 
@@ -1493,6 +1506,12 @@ private:
                 }
             }
 
+            // EPOLLET：本轮边沿已被消费。同一 fd 还有等待者时，必须让内核
+            // 重新检查就绪状态并再产生一次边沿，否则后续等待者永远等不到。
+            if (!one_shot && (!slot.readers.empty() || !slot.writers.empty())) {
+                slot.force_rearm = true;
+            }
+
             const int arm_error = update_interest_locked(slot);
             if (arm_error != 0) {
                 fail_slot_locked(slot, arm_error, wake);
@@ -1578,6 +1597,11 @@ private:
     // 处理。锁顺序约定是「条带锁 -> m_timer_mutex」，因此这里绝不能持定时器
     // 锁去拿条带锁，否则会与 register_wait/complete 形成环。
     void expire_timers() noexcept {
+        // 绝大多数 IO 等待没有 deadline（s2/s3 的空闲 recv 就是这一类）。
+        // 没有定时器时不必取全局锁、也不必读时钟。
+        if (m_timer_count.load(std::memory_order_acquire) == 0) {
+            return;
+        }
         WakeList wake;
         for (;;) {
             NodePtr node;
@@ -1600,6 +1624,7 @@ private:
                     }
                 }
                 m_deadline_order.erase(order);
+                m_timer_count.fetch_sub(1, std::memory_order_release);
             }
             // 超时路径也必须先登记活动操作，才能与 WakeList::wake_nodes
             // 中的 end_operation 一一配对。否则使用计数型生命周期时会
@@ -1636,6 +1661,9 @@ private:
     }
 
     int poll_timeout_ms() const noexcept {
+        if (m_timer_count.load(std::memory_order_acquire) == 0) {
+            return m_stop_poller.load(std::memory_order_acquire) ? 0 : -1;
+        }
         std::lock_guard<std::mutex> lock(m_timer_mutex);
         if (m_stop_poller.load(std::memory_order_acquire)) {
             return 0;
@@ -1674,7 +1702,7 @@ private:
 
     void poll_loop() noexcept {
         constexpr int kEventBatch = 256;
-        BackendEvent events[kEventBatch]{};
+        BackendEvent events[kEventBatch];
         for (;;) {
             {
                 if (m_stop_poller.load(std::memory_order_acquire)) {
@@ -1838,7 +1866,9 @@ private:
             effective = deadline_timeout;
         }
         constexpr int kEventBatch = 256;
-        BackendEvent events[kEventBatch]{};
+        // 不写 `{}`：epoll_wait 只填充 count 个元素，值初始化会无条件
+        // 清零 4KB（每次 poll_once 一次，空转时占主导）。
+        BackendEvent events[kEventBatch];
         m_waiters.fetch_add(1, std::memory_order_release);
         t_inside_poll = true;
         int count;
@@ -2046,6 +2076,8 @@ private:
     mutable std::mutex m_epoll_mutex;
 
     mutable std::mutex m_timer_mutex;
+    // deadline 表里已登记条目数；0 时 expire_timers/poll_timeout_ms 走无锁快速路径。
+    std::atomic<std::size_t> m_timer_count{0};
     DeadlineOrder m_deadline_order;
     std::unordered_map<std::uint64_t, TimerRecord> m_deadline_index;
     std::atomic<std::uint64_t> m_next_node_id{0};
@@ -2055,6 +2087,7 @@ private:
 IOManager::IOManager(SchedulerConfig config, IOBackendPtr backend)
     : m_scheduler(std::move(config)),
       m_state(std::make_shared<State>(&m_scheduler, std::move(backend))) {
+    m_scheduler.set_io_manager(this);
     std::lock_guard<std::mutex> lock(manager_registry_mutex());
     manager_registry()[&m_scheduler] = this;
     const std::weak_ptr<State> weak_state(m_state);
@@ -2084,6 +2117,7 @@ IOManager::IOManager(SchedulerConfig config, IOBackendPtr backend)
 
 IOManager::~IOManager() {
     shutdown();
+    m_scheduler.set_io_manager(nullptr);
     std::lock_guard<std::mutex> lock(manager_registry_mutex());
     const auto found = manager_registry().find(&m_scheduler);
     if (found != manager_registry().end() && found->second == this) {
@@ -2758,9 +2792,9 @@ IOManager* IOManager::current() noexcept {
     if (!scheduler) {
         return nullptr;
     }
-    std::lock_guard<std::mutex> lock(manager_registry_mutex());
-    const auto found = manager_registry().find(scheduler);
-    return found == manager_registry().end() ? nullptr : found->second;
+    // 直接读 Scheduler 上的绑定指针：hook 的每次 IO 调用都会经过这里，
+    // 原实现的全局注册表锁在高并发下是共享热点。
+    return static_cast<IOManager*>(scheduler->io_manager());
 }
 
 }  // namespace go2cpp::io

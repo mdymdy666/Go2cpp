@@ -69,7 +69,7 @@ public:
      */
     // Linux epoll 使用 ONESHOT，IOManager 在每次消费后显式重新布防。
     // 这样无等待者时不会反复收到同一就绪边沿，下一次等待只需一次 MOD。
-    bool supports_one_shot() const noexcept override { return true; }
+    bool supports_one_shot() const noexcept override { return false; }
 
     /// 将统一读写兴趣转换为 epoll 事件并注册代际 token。
     int add_or_modify(int fd, std::uint32_t interest, std::uint64_t token,
@@ -84,10 +84,7 @@ public:
         // 发布读写兴趣时仍能复用原来的内核注册。关闭或代际变化仍由
         // remove() 真正删除注册，因而不会影响 fd 生命周期和复用隔离。
         if (interest != 0) {
-            event.events = EPOLLERR | EPOLLHUP;
-            if (supports_one_shot()) {
-                event.events |= EPOLLONESHOT;
-            }
+            event.events = EPOLLERR | EPOLLHUP | EPOLLET;
             if (interest & kRead) event.events |= EPOLLIN | EPOLLRDHUP;
             if (interest & kWrite) event.events |= EPOLLOUT;
         }

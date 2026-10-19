@@ -927,6 +927,25 @@ std::optional<Duration> operation_timeout(
  * | `m_system_nonblocking` | hook 必须已经把 fd 切成 `O_NONBLOCK`，否则「先试一次」会直接阻塞 M |
  * | `!m_user_nonblocking` | 用户显式要非阻塞时保持 `EAGAIN` 语义，**替他 park 会违反他的契约** |
  */
+/// @brief 一次加锁读出 park 判定与超时（热路径把两次互斥合并成一次）。
+struct WaitDecision {
+    bool can_wait{false};
+    std::optional<Duration> timeout;
+};
+
+WaitDecision wait_decision(const std::shared_ptr<Descriptor>& descriptor,
+                           IOEvent event) {
+    WaitDecision decision;
+    std::lock_guard<std::mutex> lock(descriptor->m_open->m_mutex);
+    decision.can_wait = descriptor->m_open->m_pollable &&
+                        descriptor->m_open->m_system_nonblocking &&
+                        !descriptor->m_open->m_user_nonblocking;
+    decision.timeout = event == IOEvent::kRead
+                           ? descriptor->m_open->m_receive_timeout
+                           : descriptor->m_open->m_send_timeout;
+    return decision;
+}
+
 bool can_wait(const std::shared_ptr<Descriptor>& descriptor) noexcept {
     std::lock_guard<std::mutex> lock(descriptor->m_open->m_mutex);
     return descriptor->m_open->m_pollable &&
@@ -1102,9 +1121,9 @@ Result cooperative_io(int fd, Function function, IOEvent event,
     }
 
     // step3: 只有 can_wait 且本次没有单次非阻塞标志，才允许 park。
-    const bool blocking = !per_call_nonblocking && can_wait(descriptor);
-    const auto deadline =
-        deadline_from_timeout(operation_timeout(descriptor, event));
+    const WaitDecision decision = wait_decision(descriptor, event);
+    const bool blocking = !per_call_nonblocking && decision.can_wait;
+    const auto deadline = deadline_from_timeout(decision.timeout);
     for (;;) {
         Result result;
         {

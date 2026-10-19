@@ -782,6 +782,18 @@ public:
     ///          适合加锁热路径上的诊断读取；可能返回 nullptr。
     static Task* current_task_ptr() noexcept;
     static Scheduler* current_scheduler() noexcept;
+    /**
+     * @brief 绑定/读取当前调度器上的 IOManager 不透明指针。
+     * @details 由 io::IOManager 在构造/析构时维护；current() 用它避免在
+     *          每次 recv/send hook 上取全局注册表锁。指针的存活期由
+     *          IOManager 保证（析构时置空）。
+     */
+    void set_io_manager(void* manager) noexcept {
+        m_io_manager.store(manager, std::memory_order_release);
+    }
+    void* io_manager() const noexcept {
+        return m_io_manager.load(std::memory_order_acquire);
+    }
     static MId current_machine_id() noexcept;
     static PId current_processor_id() noexcept;
     // 供拦截器和嵌入方在受管 G 中调用原生阻塞 API 时显式标记。一般代码
@@ -812,6 +824,7 @@ private:
     class TimerExecutorAdapter;
     std::shared_ptr<Lifetime> m_lifetime;
     std::unique_ptr<Impl> m_impl;
+    std::atomic<void*> m_io_manager{nullptr};
 };
 
 // ---------------------------------------------------------------------------
