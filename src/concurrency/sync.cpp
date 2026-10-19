@@ -968,8 +968,47 @@ bool Mutex::LockForConditionWait() {
     return LockImpl({}, true);
 }
 
+/**
+ * @brief Mutex 的加锁实现（`Lock` 与 `LockForConditionWait` 的共同落点）。
+ * @param context 可选的取消上下文；已失效时直接返回 false。
+ * @param ignore_task_cancellation 条件变量内部加锁时传 true，避免把
+ *        「等待条件」误判成「任务已取消」。
+ * @return true 表示已持有锁；false 表示失败/被取消（都不会持锁返回）。
+ *
+ * ## 定位
+ *
+ * `Mutex::lock` / `try_lock` / `ConditionVariable::Wait` 都收敛到这里。
+ * 它是**混合锁**：无竞争走一次 CAS；受管 G 竞争时直接 park（把 M 让给
+ * 别的 G）；普通线程竞争时先用有界自旋吸收短临界区，再落到 futex。
+ *
+ * ## 步骤
+ *
+ * step1. 上下文已失效 → 返回 false（先判，避免拿到锁却无法返回）；
+ * step2. **无竞争快速路径**：`CAS 0 → kLocked` 成功即返回（绝大多数调用）；
+ * step3. 判定等待者类型：受管 G / 普通线程 / 手动 Fiber；手动 Fiber 无法
+ *        park，直接返回 false；
+ * step4. **普通线程**：先做有界自旋（2048 次；已有等待者时只给 4 次以保持
+ *        FIFO 公平），越界后进 futex 等待；
+ * step5. 走等待路径：从 thread-local 缓存取 `WaitNode`，在 `m_mutex` 下
+ *        发布 `kWaiter` 位并做 FIFO 交接；
+ * step6. 等待结束（被唤醒/超时/取消）后由 `Unlock` 直接交接或重试。
+ *
+ * ## 并发/失败语义
+ *
+ * - **快速路径只有一次 CAS**，不加锁、不碰队列；
+ * - **受管 G 竞争时直接 park，不自旋也不 yield**——实测自旋只会更慢
+ *   （见下方「为什么最终连忙自旋也不做」的 5 组数据）；
+ * - **公平性**：等待者按 FIFO 交接；已有等待者时自旋预算降到 4 次，
+ *   不允许新来者插队；
+ * - `kWaiter` 位只在持有 `m_mutex` 时发布，不会出现「标志已设但未入队，
+ *   Unlock 却覆盖标志」的窗口；
+ * - **不持锁返回 false**：任何失败路径都在拿到锁之前返回；
+ * - 等待者在队列里用 `shared_ptr` 持有——`Unlock` 是「先出队、锁外 Wake」，
+ *   裸指针会让节点在 Wake 前被销毁。
+ */
 bool Mutex::LockImpl(const ContextPtr& context,
                      bool ignore_task_cancellation) {
+    // step1: 上下文已失效时直接失败（调用方按取消处理）。
     if (context && context->IsDone()) {
         return false;
     }
@@ -988,6 +1027,7 @@ bool Mutex::LockImpl(const ContextPtr& context,
                               std::memory_order_relaxed);
     };
 
+    // step2: 无竞争快速路径——CAS 0 → kLocked，成功即返回（绝大多数情况）。
     std::uint8_t expected_state = 0U;
     if (m_impl->m_state.compare_exchange_strong(
             expected_state, Impl::kLocked, std::memory_order_acquire,
@@ -996,6 +1036,8 @@ bool Mutex::LockImpl(const ContextPtr& context,
         return true;
     }
 
+    // step3: 判定等待者类型：受管 G（可 park）、普通线程（走 futex）、
+    // 或手动 Fiber（无法 park，只能失败）。
     const WaitTarget target = CurrentTarget();
     if (target.unsupported_manual_fiber) {
         // 手动恢复的 Fiber 没有可用于 park 的 Scheduler continuation。返回 false
@@ -1039,6 +1081,7 @@ bool Mutex::LockImpl(const ContextPtr& context,
     // 调用者如果立即进入条件变量慢路径，会把很短的临界区放大成一次
     // futex 唤醒。这里保留较小的有界自旋，并且一旦队列发布立即退出，
     // 因而不会越过 FIFO waiter。
+    // step4: 普通线程的竞争路径——先做有界自旋，越界后才进 futex 等待。
     if (!target) {
         // 自旋预算分两段（2026-10-18 实测重新标定）：
         //   1. 没有等待者时给足 2048 次（≈18µs，PAUSE 实测 8.7ns）。这一档
@@ -1072,6 +1115,8 @@ bool Mutex::LockImpl(const ContextPtr& context,
 
     // Mutex::Unlock 会在释放 m_mutex 后异步执行 Wake，因此即使没有
     // Context，也必须让队列持有一个 shared_ptr，不能使用栈上节点。
+    // step5: 走等待路径：从 thread-local 缓存取 WaitNode（稳态零堆分配），
+    // 在 m_mutex 下发布 kWaiter 并做 FIFO 交接。
     std::shared_ptr<WaitNode> owned_waiter =
         AcquireWaitNode(target.scheduler, target.task);
     WaitNode* waiter = owned_waiter.get();

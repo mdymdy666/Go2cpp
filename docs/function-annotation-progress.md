@@ -37,7 +37,7 @@
 | io | `poll_once` ✅ / `process_events_batch` ✅ / `register_wait` | 2/3 完成 |
 | hook | `cooperative_io` ✅（已有函数头，本轮补体内 4 处 step）/ `cooperative_connect` | 1/2 完成 |
 | fiber | `Fiber::resume_locked` ✅（1 函数头 6 步 + 4 处 step） | 1/1 完成 |
-| sync | `Mutex::LockImpl` / `Unlock` | ⬜ |
+| sync | `Mutex::LockImpl` ✅（1 函数头 6 步 + 5 处 step）/ `Unlock` | 1/2 完成 |
 | channel | `SendUntil` / `RecvUntil` | ⬜ |
 | context | `Cancel` | ⬜ |
 | timer | `TimerWheel::Run` | ⬜ |
