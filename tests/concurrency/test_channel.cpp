@@ -685,9 +685,9 @@ void SelectHelperT6RecvWinsTimerDisarmed() {
         result = Select({after, recv}, {}, 2s);
     });
     GO2CPP_REQUIRE_EVENTUALLY(started.load(std::memory_order_acquire), 3s);
-    std::this_thread::sleep_for(5ms);
-    // 已 arm：10s 定时器必须真的排进了默认 TimerService。
-    GO2CPP_CHECK(timers.PendingCount() >= baseline + 1);
+    // 已 arm：10s 定时器必须真的排进了默认 TimerService。用轮询而不是固定
+    // sleep，避免慢机器/插桩环境下"还没 arm 就断言"的假失败。
+    GO2CPP_REQUIRE_EVENTUALLY(timers.PendingCount() >= baseline + 1, 2s);
     GO2CPP_CHECK(channel->SendFor(31, 2s).Ok());
     GO2CPP_JOIN_WITH_WATCHDOG(worker, 3s);
     GO2CPP_CHECK(result.selected);

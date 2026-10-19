@@ -1092,3 +1092,85 @@ benchmarks/gmp_vs_thread_epoll_benchmark.cpp
 - 语义：`ForceRescan` 成功时 `applied=true` 即使 revision 未变；三个指标键为
   进程级固定名，多实例会互相覆盖，生产应只创建一个 `SoReloader`。
 - 本轮未提交 git，留给主 agent 审查。
+
+## 17. 2026-10-19 Channel::Select 增加 DoneCase / AfterCase（deepseek）
+
+**改动内容**：
+
+- `include/go2cpp/concurrency/channel.hpp`（+222 行，只新增）：
+  - 新增公共 API `DoneCase(const ContextPtr&)`（等价 Go `case <-ctx.Done()`）与
+    `AfterCase(time_point)` / `AfterCase(ContextDuration)`（等价
+    `case <-time.After(d)`），插在 `DefaultCase()` 之后；**未改** `Select` /
+    `RecvCase` / `SendCase` / `DefaultCase` 的既有签名。
+  - 新增 `detail::SelectCaseRegistry`：以 `SelectWaitState*` 为键保存 Done 回调 id
+    与 `std::shared_ptr<core::Timer>`。不用 case 内单槽位，是因为 `Select` 在没有
+    分支获胜时会重建等待状态并**重新 arm**（同一个 `wait_state` 指针被复用），
+    且同一个 `SelectCase` 对象可能被多线程共享；单槽会互相覆盖，导致 disarm 删错
+    id、回调永久留在 `Done` 上（每次 select 泄漏一个回调）。
+  - `DoneCase`：probe 看 `ctx->IsDone()`（`status=kCancelled`，
+    `error = ctx->Err() ?: CanceledError()`）；arm 用 `ctx->Done().AddCallback(...)`，
+    回调里 `wait_state->TrySelect(index, probe)`；disarm 取回 id 后
+    `RemoveCallback`。
+  - `AfterCase`：probe 比较 `steady_clock::now() >= deadline`（命中 `ok=true`、
+    `status=kReady`）；arm 用 `core::TimerService::Default().Schedule(deadline, cb)`，
+    `Timer` 必须由 `std::shared_ptr` 持有（局部 `Timer` 在 arm 返回时析构，析构等价
+    于 `Cancel`，回调将永不触发）；disarm `timer->Cancel()`。
+  - 新增 include：`go2cpp/core/timer.hpp`、`<unordered_map>`。
+- `tests/concurrency/test_channel.cpp`（在原文件内追加，未新建文件，+540 行）：
+  - T1~T11 场景测试 + B1~B4 大数据量测试 + R1 随机事件源回归；
+  - 泄漏断言用两种可核验手段：`core::TimerService::Default().PendingCount()`
+    （定时器是否真的撤销）与"取消后保留的 `wait_state` 不得被回调改写"
+    （T9(b)：漏 `RemoveCallback` 时回调会触发，直接把状态标成已选中）；
+  - 所有大数据量用例打印 `[perf]` 实际耗时。
+
+**测试结果**（build-work，Release，实际运行输出）：
+
+- `cmake --build build-work -j8`：通过（增量 12.2s）。
+- `GO2CPP_TEST_FILTER=channel ./build-work/go2cpp_tests`：全部通过，`[perf]` 输出见下表。
+- `ctest --test-dir build-work -R '^go2cpp_tests$' --output-on-failure`：1/1 通过
+  （27.3s；改动前的同项运行 30.9s）。
+- 收尾时把 T6 的"等待 arm 完成"从固定 `sleep_for(5ms)` 改成轮询
+  `PendingCount()`（`GO2CPP_REQUIRE_EVENTUALLY`），避免慢机器/插桩环境下的假失败；
+  下表是这次改动后的最终一次运行。
+- `ctest --test-dir build-work`：**首次** 1/114 失败——`go2cpp_tests` 在
+  `tests/network/test_io.cpp:736/738`（`many_result.ready_indices.size()==2`、
+  `ready_indices[1]==1`）失败；单独重跑 `-R '^go2cpp_tests$'` 通过，再跑全量
+  **114/114 通过**（60.1s）。
+  该断言在 `GO2CPP_TEST_FILTER=io` 单独跑 10 次里也失败 2 次（完全不经过 channel
+  模块），判定为既有偶发（IO 多路等待"就绪批"的时序），与本轮改动无关。
+- 变异验证（确认测试真的能抓到泄漏，验证后已还原）：
+  - 去掉 `DoneCase` disarm 的 `RemoveCallback` → T9(b) `fired == 0` 失败；
+  - 去掉 `AfterCase` disarm 的 `Timer::Cancel`（且不释放句柄）→ T6
+    (`PendingCount() <= baseline`) 与 T10 (`disarmed_visible`) 失败。
+  说明两条泄漏断言都不是"恒真断言"。
+
+大数据量/计时实测（同一次运行，单位为 ms）：
+
+| 用例 | 规模 | 实测 |
+|---|---|---|
+| T1 DoneCase(已取消 ctx) | 1 次 | 0.003 |
+| T4 AfterCase(30ms) | 1 次 | 30.18（≈ deadline） |
+| T5 AfterCase(40ms) vs Recv | 1 次 | 40.18 |
+| T7(c) 三合一 timer 先到 | 1 次 | 25.17（deadline 25ms） |
+| T8 Done+Recv+Default 全走 default | 1000 次 | 0.28 |
+| T9(a) Select(已取消 DoneCase) | 10000 次 | 1.22 |
+| T9(b) DoneCase arm/disarm | 10000 次 | 1.14 |
+| T10 AfterCase arm+立即 disarm | 10000 次 | 5.47 |
+| B1 Send+Select(Recv+Default) | 100 万次 | 265.63 |
+| B2 1000 个 RecvCase（第 1000 个有数据） | 1000 cases | 0.19 |
+| B3 AfterCase 创建+立即 disarm | 10 万次 | 58.73 |
+| B4 8 线程 × Select(Recv+Done) + 阻塞取消 | 8×10000 + 8×100 | 50.78 |
+| R1 随机事件源 | 3000 轮 | 4.11 |
+
+**后续状态**：
+
+- 语义：`DoneCase` 与"已就绪 channel"同时可选中时不做 context 优先（由 `Select`
+  的轮转探测决定赢家，与 Go 的随机选择一致）；T3 覆盖的是"先挂起、数据先到、
+  之后才 cancel"的路径。
+- 已知限制：`DoneCase(nullptr)` 永不就绪（对齐 Go 的 nil channel），只有它一个
+  分支的 `Select` 会永久等待，调用方需自己保证非空。
+- 未做：Fiber（受管 G）里 `DoneCase`/`AfterCase` 的专项用例；本轮覆盖的是普通
+  线程 + `Select` 的既有等待路径（`Select` 本身对受管 G 的支持未改动）。
+- 仓库状态：本轮**没有执行任何 git 提交**；但另一个进程在 15:20 用
+  `feat(config): SO 热重载收尾...`（58b31d4）把工作区里的 `channel.hpp` 与
+  `test_channel.cpp` 一并提交了，主 agent 审查/提交时注意这一点。
