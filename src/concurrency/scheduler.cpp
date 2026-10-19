@@ -1172,7 +1172,14 @@ public:
 
     static SchedulerConfig normalize(SchedulerConfig requested) {
         if (requested.processor_count == 0) {
-            requested.processor_count = default_processor_count();
+            // 默认 2 × 核数（不是 1 × 核数）。实测见 docs/parameter-tuning.md：
+            //   s1 短连接 QPS +105%（19,121 → 39,141）、P50 −62%
+            //   s3 8,000 长连接 P50 −91%（3.56ms → 0.31ms）、P99.9 −74%
+            //   s4 计算+IO QPS +16%、sys −6%
+            // 原理：P 越多，每个 P 上排队的 G 越少，跨 M 协调（唤醒/迁移）就越少——
+            // 这正是之前诊断出的 sys 开销主要来源（P=96 时 sys 从 168µs 降到 80µs）。
+            // 代价：虚拟内存约 2 倍（每个 P 有自己的栈缓存，P=24 时约 1.75GB vsz）。
+            requested.processor_count = default_processor_count() * 2;
         }
         requested.processor_count = std::max<std::size_t>(1,
                                                            requested.processor_count);

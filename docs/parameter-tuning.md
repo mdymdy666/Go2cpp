@@ -96,3 +96,62 @@
 
 **下一轮必须验证**：`2×核数` 在 s1（短连接）与 s3（8,000 长连接）下是否同样更好——
 否则改默认会顾此失彼。
+
+## 轮次 3：`processor_count` 默认值已改（核数 → 2×核数）
+
+### 改动
+
+`src/concurrency/scheduler.cpp` 的 `normalize()`：
+
+```cpp
+if (requested.processor_count == 0) {
+    // 默认 2 × 核数（不是 1 × 核数）
+    requested.processor_count = default_processor_count() * 2;
+}
+```
+
+### 验证：三个场景 P=12 vs P=24
+
+| 场景 | P=12 | **P=24** | 变化 |
+|---|---|---|---|
+| **s1 短连接** | 19,121 QPS / 3.13ms / err 0.48% | **39,141 / 1.20ms / err 3.1%** | **QPS +105%、P50 −62%**，但错误率 6.5× |
+| **s3 8,000 长连接** | 7,919 / 3.56ms / P99.9 14.98ms | 7,941 / **0.31ms / 3.95ms** | **P50 −91%、P99.9 −74%**，CPU +23% |
+| **s4 计算+IO** | 27,959 | 32,328 | **QPS +16%、sys −6%** |
+
+**三个场景全部改善**（s1 的 QPS、s3 的延迟、s4 的吞吐与 sys）。
+
+### 代价
+
+| 项 | P=12 | P=24 |
+|---|---|---|
+| 虚拟内存 | 888MB | **1,752MB**（2×） |
+| s1 错误率 | 0.48% | **3.1%**（P 越多 accept 竞争越激烈） |
+
+**s1 错误率上升是唯一需要关注的副作用**——非阻塞 accept 在多 P 同时 accept 时 RST 概率增加。
+
+### ⚠️ 踩到的坑：benchmark 的 `--workers` 会覆盖源码默认
+
+`benchmarks/gmp_vs_thread_epoll_benchmark.cpp:1731`：
+
+```cpp
+const auto workers = static_cast<std::size_t>(arg_int(argc, argv, "--workers", 8));
+```
+
+**默认 8**，会覆盖 `config.processor_count`。所以：
+
+- 要测**源码默认** → 必须传 `--workers 0`（`0` 会让 `normalize()` 走默认）；
+- 要测**指定 P** → 传 `--workers N`。
+
+**验证方式**：看 `peak_threads`。`--workers 0` 时是 **26**（P=24 + sysmon + timer），
+`--workers 8` 时是 10。
+
+### 验证
+
+- `ctest` **113/113**（60.24s）
+- 默认生效确认：`--workers 0` → `peak_threads=26`（P=24）
+
+### 下一轮
+
+`s1` 的错误率从 0.48% 涨到 3.1% 是 P 超配的副作用，需要确认：
+1. 这是否与 `accept` 的竞争有关（多个 P 同时 `accept`）；
+2. 如果确认，是否需要在 `processor_count > 核数` 时**限制 accept 到单一 P**（或加 `EPOLLEXCLUSIVE`）。
