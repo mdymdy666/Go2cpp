@@ -20,12 +20,15 @@
 
 ### ParkingCondition（要求 ≥3 个）
 
-| # | 函数 | 状态 |
-|---|---|---|
-| 1 | `ParkingCondition::wait`（谓词等待） | ⬜ |
-| 2 | `ParkingCondition::wait_for` / `wait_until` | ⬜ |
-| 3 | `ParkingCondition::notify_one` / `notify_all` | ⬜ |
-| 4 | `WaitNode::Wake`（或等价唤醒路径） | ⬜ |
+| # | 函数 | 状态 | 说明 |
+|---|---|---|---|
+| 1 | `ParkingCondition::notify_one` | ✅ **已完成** | 抢占式唤醒 + 跳过僵尸节点 + 锁外 Wake |
+| 2 | `ParkingCondition::notify_all` | ✅ **已完成** | swap 出队 + 只唤醒真正抢占成功的节点 |
+| 3 | `ParkingCondition::WaitOnce` | ✅ **已完成** | 7 步（判定→提前返回→入队重检→cleanup→超时→等待→映射）+ 5 条并发语义 |
+| 4 | `WaitNode::Wake`（或等价唤醒路径） | ⬜ 可选 | 内部实现，已被 `WaitOnce` 的注释覆盖调用关系 |
+| 5 | `ParkingCondition::wait` / `wait_for` / `wait_until` | ⬜ 可选 | 都是 `WaitOnce` 的薄封装 |
+
+**ParkingCondition 的 3 个必做函数已全部完成。**
 
 ### 其余模块（各 1~3 个）
 

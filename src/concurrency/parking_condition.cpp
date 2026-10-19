@@ -315,6 +315,29 @@ bool ParkingCondition::FiberWaitUnsupported() noexcept {
     return Fiber::Current() != nullptr && !Scheduler::current_task();
 }
 
+/**
+ * @brief 唤醒**一个**等待者；没有等待者时什么也不做。
+ *
+ * ## 定位
+ *
+ * 这是 `cooperative sleep`、`channel` 发送、`Mutex` 解锁等所有「唤醒一方」场景
+ * 的出口。它只负责**把某个 WaitNode 从等待链上摘下来并标记结果**，真正让 Fiber
+ * 恢复执行的是 `WaitNode::Wake()`。
+ *
+ * ## 步骤
+ *
+ * step1. 在 `m_mutex` 下从队首逐个取节点，用 `Finish(kNotified)` 抢占结果——
+ *        只有**第一个抢占成功**的节点才是本次被唤醒者（其余可能已被超时/取消）；
+ * step2. 释放 `m_mutex` 后调用 `selected->Wake()`：唤醒动作不能持内部锁，
+ *        否则会与等待者重新获取外部锁形成锁序反转。
+ *
+ * ## 并发/失败语义
+ *
+ * - **抢占式**：`Finish()` 用 CAS 决定唯一结果，超时线程与唤醒线程只有一个能赢；
+ * - `Finish()` 失败的节点（已被超时/取消）会被跳过并继续找下一个，
+ *   因此 `notify_one` 不会因为队首是「僵尸节点」而丢失唤醒；
+ * - `noexcept`：唤醒路径不允许抛异常（它在解锁路径上，抛异常会破坏状态）。
+ */
 void ParkingCondition::notify_one() noexcept {
     std::shared_ptr<WaitNode> selected;
     {
@@ -333,6 +356,23 @@ void ParkingCondition::notify_one() noexcept {
     }
 }
 
+/**
+ * @brief 唤醒**所有**当前等待者。
+ *
+ * ## 步骤
+ *
+ * step1. 在 `m_mutex` 下把整个等待队列 `swap` 到局部 deque，并逐个
+ *        `Finish(kNotified)`；用 `swap` 而不是逐个 `pop` 是为了把临界区压到
+ *        「换指针 + 打标记」，唤醒动作全部移到锁外；
+ * step2. 释放锁后，只对**真正抢占成功**（`result() == kNotified`）的节点调
+ *        `Wake()`——已被超时/取消的节点不能重复唤醒。
+ *
+ * ## 并发/失败语义
+ *
+ * - `swap` 保证新来的等待者在 swap 之后入队，不会被本次 `notify_all` 漏掉；
+ * - 与 `notify_one` 一致：唤醒在锁外，避免锁序反转；
+ * - `noexcept`。
+ */
 void ParkingCondition::notify_all() noexcept {
     std::deque<std::shared_ptr<WaitNode>> waiters;
     {
@@ -349,6 +389,48 @@ void ParkingCondition::notify_all() noexcept {
     }
 }
 
+/**
+ * @brief 在条件上等待一次（可带超时与谓词），返回本次等待的结局。
+ * @param lock 调用方持有的外部互斥量；等待期间会被解锁，返回时保证重新持有。
+ * @param deadline 绝对超时点；`nullopt` 表示无限等待。
+ * @param predicate 谓词；在**入队前**会被重检一次，为真则直接返回 `kNotified`。
+ * @return `kNotified` / `kTimedOut` / `kCancelled`。
+ *
+ * ## 定位
+ *
+ * 这是 `ParkingCondition::wait` / `wait_for` / `wait_until` 的**唯一实现**，
+ * 也是本项目 park/wake 链路的「等待侧」：`Task::park_for_scheduler` 负责
+ * 提交挂起，本函数负责**把等待者登记到链上、注册超时、并在返回时清理干净**。
+ *
+ * ## 步骤
+ *
+ * step1. 判定是否为「受管等待」（有 Scheduler 且有当前 Task）。手动 Fiber
+ *        没有调度器归属时无法安全 park，直接返回 `kCancelled`，绝不阻塞
+ *        carrier 线程；
+ * step2. 提前返回两类情况：已请求取消 → `kCancelled`；已过 deadline → `kTimedOut`；
+ * step3. 创建 `WaitNode`，在 `m_mutex` 下**重检谓词**（为真则不入队，直接
+ *        `kNotified`），否则入队——重检是必须的，因为取消不持有外部锁，
+ *        存在「通知先于入队」的窗口；
+ * step4. 定义 `cleanup`：抢结果 `kCancelled`、撤 timer、从队列摘除。它在
+ *        正常返回、超时、异常三条路径上都必须执行；
+ * step5. 若受管且有 deadline，注册超时 timer（到期时 `Finish(kTimedOut)` 并唤醒）；
+ * step6. **解锁外部 mutex** 后进入等待：受管走 `WaitManaged()`（Fiber park），
+ *        否则走 `WaitNative()`（阻塞线程）；
+ * step7. 等待返回后 `cleanup()` 并**重新加锁**，最后把 `WaitNode::Result`
+ *        映射为 `WaitStatus`。
+ *
+ * ## 并发/失败语义
+ *
+ * - **锁序**：`m_mutex`（内部）只在入队/出队时短暂持有，绝不在持有它时
+ *   解锁外部 mutex 或调用 `Wake()`；
+ * - **谓词重检**闭合了「通知先于入队」的窗口：即使 `notify_*` 在 step3 之前
+ *   跑完，谓词也会为真而直接返回；
+ * - **返回时 `lock` 一定被持有**：正常路径在 step7 重新加锁；异常路径在
+ *   `catch` 里补加锁后再 `throw`；
+ * - 超时 timer 用 `weak_ptr` 捕获节点，等待者提前返回时不会因 timer 持有
+ *   节点而延长生命周期；
+ * - 被取消与被超时都映射为 `kCancelled`（调用方只需要知道「没等到」）。
+ */
 ParkingCondition::WaitStatus ParkingCondition::WaitOnce(
     std::unique_lock<std::mutex>& lock,
     std::optional<Clock::time_point> deadline,
