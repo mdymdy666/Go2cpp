@@ -1403,19 +1403,66 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     NotifyChange();
   }
 
+  /**
+   * @brief 向 channel 发送一个值，直到成功、超时、取消或 channel 关闭。
+   * @param value 要发送的值（移动语义；失败时可能已被移动）。
+   * @param deadline 绝对超时点；`nullopt` 表示无限等待。
+   * @param context 可选的取消上下文；`Done()` 被触发时唤醒并返回 `kCancelled`。
+   * @param nonblocking 非阻塞模式：无法立即完成时返回 `kWouldBlock` 而不是 park。
+   * @return `ChannelSendResult`，`status` 说明结局，`error` 在失败时非空。
+   *
+   * ## 定位
+   *
+   * `channel::Send` / `SendFor` / `TrySend` 的共同落点，也是 GMP 里
+   * **最典型的「多条件等待」**：一次调用要同时等「接收者出现」「缓冲区有空位」
+   * 「context 取消」「deadline 到期」四件事中的任意一件。
+   *
+   * ## 步骤
+   *
+   * step1. 上下文检查：已取消/已超时就直接返回，不进入锁；
+   * step2. 加锁后检查 `m_closed`——关闭的 channel 上发送立即返回 `kClosed`；
+   * step3. **优先交接给等待中的接收者**：从 `m_receivers` 队首取，跳过已取消的
+   *        节点；`select_state` 节点走 `TrySelect`（select 语义：可能同时有多个
+   *        分支就绪，由 select 决定谁赢）；普通节点直接 `value.emplace` +
+   *        `cv.notify_one()`。成功后**锁外** `NotifyChange()`；
+   * step4. 没有接收者但**缓冲区有空位**：入缓冲，同样锁外通知；
+   * step5. 既无接收者又无空位：检查 deadline / Fiber 支持，然后创建
+   *        `PendingSend` 入 `m_senders`，并把 `context->Done()` 的回调注册为
+   *        「唤醒这个 pending」——这样取消能立刻打断 park；
+   * step6. 进入 `for (;;)` 等待循环：每次被唤醒后重检
+   *        `accepted`/`closed`/`cancelled`/context/deadline，任一成立就清理
+   *        并返回；否则继续 `wait_for`（有 deadline）或 `wait`（无 deadline）。
+   *
+   * ## 并发/失败语义
+   *
+   * - **`NotifyChange()` 必须在锁外**：它可能跨线程唤醒 `WaitForChange` 的
+   *   观察者，持 `m_mutex` 调用会形成锁序反转；
+   * - **值只在交接成功后移动**：`emplace` 抛异常时保留接收/发送节点，
+   *   后续仍可重试（`optional::emplace` 的强保证）；
+   * - **pending 用 `shared_ptr` 持有**：`context` 回调可能在 park 线程之外
+   *   触发，裸指针会在唤醒前被销毁；
+   * - **所有提前返回路径都要 `ErasePending` + `++m_generation`**，
+   *   否则等待者会永远留在队列里，且 generation 不前进会让 select 看不到变化；
+   * - **`nonblocking` 与 `deadline` 的交互**：无空位且已到 deadline 时，
+   *   非阻塞返回 `kWouldBlock`，阻塞返回 `kTimedOut`——两者的 `errno` 语义不同；
+   * - **Fiber 不支持时返回 `kInvalid`**（手动 Fiber 无法 park），
+   *   绝不阻塞 carrier 线程。
+   */
   ChannelSendResult SendUntil(T value, std::optional<TimePoint> deadline,
                               const ContextPtr& context, bool nonblocking) {
+    // step1: 上下文已取消/已超时，直接返回，不进入锁。
     if (const auto context_status = ContextSendStatus(context);
         context_status.status != ChannelStatus::kReady) {
       return context_status;
     }
 
+    // step2: 关闭的 channel 上发送立即失败。
     std::unique_lock<std::mutex> lock(m_mutex);
     if (m_closed) {
       return {ChannelStatus::kClosed, ChannelClosedError()};
     }
 
-    // 优先把值交接给最早等待的接收者，再使用缓冲区。
+    // step3: 优先交接给等待中的接收者（select 节点走 TrySelect，普通节点直接塞值）。
     while (!m_receivers.empty()) {
       auto receiver = m_receivers.front();
       if (receiver->cancelled) {
@@ -1477,6 +1524,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       return {ChannelStatus::kReady, {}};
     }
 
+    // step4: 没有接收者但有缓冲空位——入缓冲。
     if (m_buffer.size() < m_capacity) {
       try {
         m_buffer.emplace_back(std::move(value));
@@ -1498,6 +1546,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     if (core::ParkingCondition::FiberWaitUnsupported()) {
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
+    // step5: 既无接收者又无空位——登记 PendingSend，并挂 context 回调
+    // （取消时立刻唤醒，不必等下一个 send/recv）。
     std::shared_ptr<PendingSend> pending;
     try {
       pending = std::make_shared<PendingSend>(std::move(value));
@@ -1517,6 +1567,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       }
     }
 
+    // step6: park 等待循环——每次唤醒后重检 accepted/closed/cancelled/
+    // context/deadline，任一成立就清理并返回。
     for (;;) {
       if (pending->accepted) {
         return {ChannelStatus::kReady, {}};

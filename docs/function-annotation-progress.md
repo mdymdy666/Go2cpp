@@ -38,7 +38,7 @@
 | hook | `cooperative_io` ✅（已有函数头，本轮补体内 4 处 step）/ `cooperative_connect` | 1/2 完成 |
 | fiber | `Fiber::resume_locked` ✅（1 函数头 6 步 + 4 处 step） | 1/1 完成 |
 | sync | `Mutex::LockImpl` ✅（6 步 + 5 处 step）/ `Unlock` ✅（4 步 + 4 处 step） | **2/2 完成** |
-| channel | `SendUntil` / `RecvUntil` | ⬜ |
+| channel | `SendUntil` ✅（多条件等待，6 步 + 7 条并发语义）/ `RecvUntil` | 1/2 完成 |
 | context | `Cancel` | ⬜ |
 | timer | `TimerWheel::Run` | ⬜ |
 | socket | `wait_ready` | ⬜ |
