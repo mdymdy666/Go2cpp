@@ -234,7 +234,21 @@ Response process_request(std::uint8_t opcode, std::string_view body) {
         seed ^= seed << 5;
         const std::uint32_t delay_us = seed % (kIoSleepMaxUs + 1u);
         if (delay_us > 0) {
-            ::usleep(delay_us);
+            // 忙等而不是 usleep：两边都真正消耗 CPU，避免「GMP 协作睡眠 vs
+            // epoll 内核睡眠」这种不对等的比较。用 GO2CPP_BENCH_BUSY_US=0
+            // 可退回原来的 usleep 行为。
+            const char* busy = std::getenv("GO2CPP_BENCH_BUSY_US");
+            const bool use_busy = (busy == nullptr) || (std::strtoul(busy, nullptr, 10) != 0);
+            if (use_busy) {
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::microseconds(delay_us);
+                while (std::chrono::steady_clock::now() < deadline) {
+                    // 自旋消耗 CPU；不带内存访问，避免被编译器优化掉。
+                    __asm__ __volatile__("" ::: "memory");
+                }
+            } else {
+                ::usleep(delay_us);
+            }
         }
     }
     switch (opcode) {
@@ -479,9 +493,13 @@ void serve_gmp_connection(Socket::Ptr socket) {
     socket->close();
 }
 
-int run_gmp_server(std::uint16_t port, int sndbuf, bool raw_io, bool pin) {
+int run_gmp_server(std::uint16_t port, std::size_t workers, int sndbuf,
+                   bool raw_io, bool pin) {
     go2cpp::SchedulerConfig config;
-    config.processor_count = 0;      // 0 = 按硬件线程数（本机 12）
+    // workers == 0 时按硬件线程数；显式传入则按传入值（用于测「P 超配」的影响，
+    // 对齐 coost 的 co_sched_num）。P 超过核数时收益来自 IO 等待与计算的重叠，
+    // 代价是调度开销。
+    config.processor_count = static_cast<std::uint32_t>(workers);
     config.collect_metrics = false;  // 关闭诊断计时，压测时不付额外成本
     config.pin_workers_to_cpu = pin;
     go2cpp::IOManager manager(config);
@@ -1762,7 +1780,7 @@ int server_main(int argc, char** argv) {
     const bool raw_io = has_bool_flag(argc, argv, "--raw-io");
     const bool pin = has_bool_flag(argc, argv, "--pin");
     if (model == "gmp") {
-        return run_gmp_server(port, sndbuf, raw_io, pin);
+        return run_gmp_server(port, workers, sndbuf, raw_io, pin);
     }
     if (model == "thread") {
         return run_thread_server(port, sndbuf, stack_kb);
