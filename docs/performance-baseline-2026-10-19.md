@@ -48,14 +48,14 @@
 - 客户端：**指数分布到达**（`--rate`）、body 随机 `[64,4096]`、pipeline depth、
   短/长连接可配、多客户端；
 - 采样：客户端在 warmup 结束时打印 `MEASURE_START`，驱动脚本
-  `.dsh_tmp/_fair_bench.py` 只统计该标记之后的 `/proc/<pid>/stat`
+  `benchmarks/fair_bench.py` 只统计该标记之后的 `/proc/<pid>/stat`
   utime/stime 与完成数，**排除 warmup**。
 
 ### 1.3 coost 对照
 
 - 源码 `https://github.com/idealvin/coost`（v3.0.0），拷贝到
   `/UserData/CodexWorkSpace/coost`，`cmake -DCMAKE_BUILD_TYPE=Release` 构建 `libco.a`；
-- `coost-bench/coost_echo_server.cpp`：同一协议、同一业务函数、`co_sched_num=12`；
+- `benchmarks/coost_echo_server.cpp`：同一协议、同一业务函数、`co_sched_num=12`；
 - 客户端与驱动与 GMP/epoll 完全一致。
 
 ---
@@ -224,16 +224,20 @@ g++ -std=c++17 -O3 -DNDEBUG -Iinclude -Ithird_party \
   -lgo2cpp_log -lgo2cpp_error -lz -ldl -lpthread -lm
 
 # 3) GMP / epoll
-python3 .dsh_tmp/_fair_bench.py --model gmp   --workers 12 --conns 200 --clients 2 \
+python3 benchmarks/fair_bench.py --model gmp   --workers 12 --conns 200 --clients 2 \
   --depth 1 --rate 0 --mixed --body-min 64 --body-max 4096 \
   --warmup-ms 2000 --duration-ms 10000
-python3 .dsh_tmp/_fair_bench.py --model epoll --workers 12 --conns 200 --clients 2 \
+python3 benchmarks/fair_bench.py --model epoll --workers 12 --conns 200 --clients 2 \
   --depth 1 --rate 0 --mixed --body-min 64 --body-max 4096 \
   --warmup-ms 2000 --duration-ms 10000
 
 # 4) coost
 cd /UserData/CodexWorkSpace/coost/build-wsl && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j8
-python3 /UserData/CodexWorkSpace/Go2Cpp-work/.dsh_tmp/_fair_bench.py --model coost \
+# server 源码在 benchmarks/coost_echo_server.cpp：
+g++ -std=c++17 -O3 -I/UserData/CodexWorkSpace/coost/include \
+  benchmarks/coost_echo_server.cpp -o coost_echo_server \
+  -L/UserData/CodexWorkSpace/coost/build-wsl/src -lco -lpthread -ldl
+python3 benchmarks/fair_bench.py --model coost \
   --server-cmd "/UserData/CodexWorkSpace/coost-bench/coost_echo_server --port 0 --workers 12" \
   --conns 200 --clients 2 --depth 1 --rate 0 --mixed \
   --body-min 64 --body-max 4096 --warmup-ms 2000 --duration-ms 10000
