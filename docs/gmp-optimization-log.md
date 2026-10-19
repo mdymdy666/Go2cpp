@@ -1,5 +1,11 @@
 # GMP 优化轮次日志
 
+> ⚠️ **2026-10-19 更新**：本文的对比数据基于旧 benchmark，其 epoll 池模型
+> 不公平（256 线程抢同一把 `m_mutex`、每请求两次跨线程交接），
+> 「GMP 比 epoll 快 3 倍」「s3 6,270 QPS / P50 445ms」等结论已作废。
+> 最新有效数据与优化点见 **`docs/performance-baseline-2026-10-19.md`**。
+
+
 > 目标：s1~s5 五场景的 QPS / P50 / P95 / P99 / 错误数全面优于 thread 与 epoll+线程池。
 > 口径：`benchmarks/gmp_vs_thread_epoll_benchmark.cpp`，`build-quality`（Release -O2），
 > 12 核 WSL2。**基准默认注入 `U(0,5ms)` usleep**，跨「开/关注入」不可直接比较。

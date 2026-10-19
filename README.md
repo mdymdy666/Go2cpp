@@ -22,6 +22,10 @@
   为保证等待节点可回滚，要求 T 可复制；move-only 值请使用普通 Send/Recv 或
   直接使用 SelectValue。
 
+性能基线与优化记录见 [docs/performance-baseline-2026-10-19.md](docs/performance-baseline-2026-10-19.md)：
+包含公平对比方法（排除 warmup、随机负载、同构 epoll 模型）、三轮优化的
+根因/改动/前后数据，以及与 coost 的三框架对比。
+
 构建并运行默认测试套件：
 
 ```sh

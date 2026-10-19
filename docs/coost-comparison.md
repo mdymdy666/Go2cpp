@@ -1,5 +1,12 @@
 # coost 对比与 GMP 优化线索
 
+> ⚠️ **2026-10-19 更新**：本文完成于 s3 修复之前。后续实测确认：
+> Hook 把 `accept4(SOCK_NONBLOCK)` 误归因为用户意图，是 s3 sys 713µs 的主因；
+> coost 的 EPOLLET 做法已被 GMP 采纳（`supports_one_shot()` 改 false +
+> EPOLLET 持久注册 + 无等待者保留 interest），每请求 `epoll_ctl` 从 1 次降到 ~0。
+> 三框架（epoll/GMP/coost）最新对比见 `docs/performance-baseline-2026-10-19.md`。
+
+
 > 源码：`third_party/coost`（github.com/idealvin/coost，clone 于 2026-10-19）
 > 本轮目标：读懂 coost，定位 GMP 高 CPU 的根因。
 
@@ -529,6 +536,7 @@ epoll 池没有这个问题：worker 自己阻塞在 epoll 上，事件来了自
 
 其余 9 个参数全部保持默认——要么改动后更差（local_queue_limit/kMaxEvents/
 iber_bin_capacity/sysmon_interval），要么受语义约束（min_workers 改 2×P
-会让 ead_f 的阻塞语义失效），要么无效（processor_count 超配）。
+会让 
+ead_f 的阻塞语义失效），要么无效（processor_count 超配）。
 
 **结论：本项目的参数调优不是瓶颈，性能差距只能从结构性改动（park 模型、跨 M 协调）入手。**
