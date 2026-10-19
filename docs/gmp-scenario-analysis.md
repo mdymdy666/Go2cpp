@@ -409,3 +409,56 @@ for (std::size_t i = 0; i < m_workers; ++i) {
 1. **s5 同配置重测**（GMP 11,368 是旧数据）；
 2. **FDS 扫描用 epoll 池重跑**（这是 GMP 最后可能成立的优势场景）；
 3. `docs/gmp-use-cases.md` 整体重写。
+
+## 关键发现：GMP 唯一成立的优势场景（FDS 批量就绪）
+
+### 基准的公平性（必须先说明）
+
+`benchmarks/io_epoll_fair_benchmark.cpp` 文件头：
+
+> 两种模型复用相同的 4096 个非阻塞 pipe、相同的 25 轮逐 fd 可读事件、
+> **相同的固定 worker 数和一个 epoll 轮询线程**。每轮都要求所有 fd 消费
+> 完成后才发送下一轮，避免把积压事件误算成处理吞吐。
+
+所以它**不是** per-conn thread，而是**真正的线程池 + epoll**，且 worker 数相同。
+
+### 重跑结果（FDS=64，25 波，workers=8，poller=1）
+
+```
+thread-pool+epoll    steady_ms=31   events_per_sec≈51,000
+IOManager+Fiber      steady_ms=5    events_per_sec≈331,812
+median ratio_fiber_over_thread = 0.154
+```
+
+| 模型 | events/s | 稳态耗时 |
+|---|---:|---:|
+| thread-pool + epoll | 51,000 | 31ms |
+| **GMP（IOManager + Fiber）** | **331,812** | **5ms** |
+| **GMP 加速** | **6.5×** | |
+
+### 为什么 GMP 在这个场景能快 6.5 倍
+
+| 环节 | thread-pool + epoll | GMP |
+|---|---|---|
+| 谁在 `epoll_wait` | **专职 poller 线程** | **worker 空闲时自己 poll**（`set_io_idle_poller`） |
+| 事件怎么到 worker | poller 读出来 → **入队/唤醒 worker**（跨线程） | 拿到事件的 worker **自己处理**，无分发 |
+| 每批 64 个事件的成本 | 64 次跨线程投递 | 0 次分发 |
+
+**「分发环节」就是那 6.5 倍的来源**：WSL2 上一次跨线程唤醒约 55µs（`docs/gmp-perf-analysis.md` 的实测），
+64 事件 × 多轮下来差距被放大。
+
+### 边界（这个优势什么时候消失）
+
+- **每个批次只有 1 个事件时**：没有分发可省，GMP 反而更慢（FDS=1 时 ratio 0.90，即 GMP 只快 10%）；
+- **多连接各自独立的事件流**：s1/s2/s3/s4 都属于这种，**GMP 不占优**（见前几节）。
+
+### 结论
+
+**GMP 的真实优势场景只有一个：单 epoll 实例的事件扇出（批量就绪）。在这个场景下快 6.5 倍。**
+
+**这不是「高并发」场景**，而是「**少量连接、每次大量 fd 同时就绪**」的场景，例如：
+- 代理/网关的上游批量回包；
+- 消息中间件的广播/扇出；
+- 多个 pipe/socket 由一个 loop 统一驱动（如 `libuv` 风格的 watcher）。
+
+**「海量连接」「高 QPS 短连接」「多核小包」都不是它的优势场景。**
