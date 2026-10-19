@@ -46,8 +46,9 @@
 | websocket | `read_frame` | ⬜ |
 | bufio | `Reader::Read` | ⬜ |
 | compress | `Deflater::Run` ✅（zlib 引擎调用，5 步 + 5 条并发语义） | 1/1 完成 |
+| http | `Client::do_request` ✅（请求生命周期 6 步 + 6 条并发语义） / `Server::serve_connection` | 1/2 完成 |
 | os | `File::ReadFile` | ⬜ |
-| path | `WalkRecursive` | ⬜ |
+| path | `WalkRecursive` ✅（已有：step1-5 + @note + 体内标注） | 1/1 完成 |
 | config | `LoadFromIni` | ⬜ |
 | log | `BufferedSink::Flush` | ⬜ |
 | metrics | `Histogram::Quantile` | ⬜ |

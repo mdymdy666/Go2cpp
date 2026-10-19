@@ -450,18 +450,67 @@ std::string encode_query(const QueryValues& values) { std::string result; for (c
 bool decode_query(std::string_view value, QueryValues& output) { output.clear(); while (!value.empty()) { const auto amp = value.find('&'); const auto item = value.substr(0, amp); const auto equal = item.find('='); const auto key_part = item.substr(0, equal); const auto value_part = equal == std::string_view::npos ? std::string_view{} : item.substr(equal + 1); std::string key, decoded; if (!query_unescape(key_part, key) || !query_unescape(value_part, decoded)) return false; output[key].push_back(std::move(decoded)); if (amp == std::string_view::npos) break; value.remove_prefix(amp + 1); } return true; }
 
 Client::Client(std::chrono::milliseconds timeout) : m_timeout(timeout) {}
+/**
+ * @brief 执行一次完整的 HTTP/1.x 请求：解析地址 → 连接 → 发送 → 读响应。
+ * @param request 请求（方法、目标、头、体）；未设置 `Host`/`Connection` 时自动补。
+ * @param host 主机名（用于 DNS 与 `Host` 头）。
+ * @param port 端口。
+ * @return `Result`：成功时 `response` 非空；失败时 `error` 说明阶段，
+ *         `message` 来自 `strerror` 或解析器的诊断。
+ *
+ * ## 定位
+ *
+ * `Client::get/head/post` 的共同实现，也是 HTTP 客户端**唯一的请求生命周期**：
+ * 一次调用内完成建连、发送、接收、协议解析，**不复用连接**（固定发
+ * `Connection: close`）。
+ *
+ * ## 步骤
+ *
+ * step1. 定义 `classify_io`：把 errno 的 `ETIMEDOUT`/`ECANCELED` 提升为
+ *        对应的 `Result::Error`，其余归到调用方指定的阶段错误（Connect/Send/Receive）；
+ * step2. 计算绝对 deadline（`make_deadline`），做 DNS 解析；
+ *        **每次 IO 前都用 `remaining_time(deadline)` 重算剩余时间**，
+ *        而不是每步用一个固定超时——否则总耗时会被阶段数放大；
+ * step3. 创建 TCP socket 并 connect；失败时按 `classify_io` 归类；
+ * step4. 补全 `Host` 与 `Connection: close` 头，序列化成 wire 字节；
+ *        然后**循环发送**直到 `sent == wire.size()`（部分写是合法的）；
+ * step5. 创建 `Parser`（HEAD 请求要求「无响应体」），准备 8KiB 栈上缓冲与
+ *        `pending`（跨 recv 的流水线剩余）；
+ * step6. **接收 + 解析循环**：有待处理数据就先 `feed`，否则 `recv`；
+ *        `transferred == 0` 说明对端关闭，用 `finish` 尝试收尾；
+ *        `Complete` → 若状态码是 100~199（且非 101）则**跳过 informational
+ *        响应**（保留剩余字节、重建 Response）继续等最终响应；否则返回；
+ *        `Error` → 返回解析错误。
+ *
+ * ## 并发/失败语义
+ *
+ * - **超时是全局 deadline**，不是每阶段超时：DNS/connect/send/recv 共享它，
+ *   因此慢 DNS 会压缩后续阶段的时间预算；
+ * - **部分写必须循环**：`send` 返回的 `transferred` 可能小于请求长度；
+ * - **`recv` 返回 0 不是错误**，是「对端优雅关闭」——要先用 `finish()` 判断
+ *   是否恰好解析完（否则报 `Closed`）；
+ * - **informational 响应（1xx）不是最终结果**：`pending` 保存同一 recv 里
+ *   的后续字节，避免丢流水线数据；
+ * - **HEAD 请求不允许响应体**：`set_response_to_head` 让解析器在头结束处
+ *   直接判 `Complete`；
+ * - `response` 用 `shared_ptr` 传出，因为 `Result` 会被复制而 `Response` 较大；
+ * - 本函数**不做重定向跟随**，3xx 原样返回给调用方。
+ */
 Result Client::do_request(const Request& request, const std::string& host, std::uint16_t port) {
+    // step1: 错误分类器——把超时/取消从普通阶段错误里分出来。
     const auto classify_io = [](Result::Error normal, int error) {
         if (error == ETIMEDOUT) return Result::Error::Timeout;
         if (error == ECANCELED) return Result::Error::Cancelled;
         return normal;
     };
     const auto deadline = make_deadline(m_timeout);
+    // step2: 计算全局 deadline 后做 DNS 解析。
     auto address = net::Address::LookupAny(host + ":" + std::to_string(port), AF_UNSPEC, SOCK_STREAM);
     if (!address) return {Result::Error::Resolve, "resolve failed", {}};
     auto remaining = remaining_time(deadline);
     if (remaining == std::chrono::milliseconds::zero())
         return {Result::Error::Timeout, "request deadline exceeded", {}};
+    // step3: 建 TCP 连接（超时用 deadline 的剩余时间）。
     auto socket = net::Socket::CreateTCP(address->family());
     if (!socket || !socket->connect(*address, remaining)) {
         const int error = errno == 0 ? EIO : errno;
@@ -471,6 +520,7 @@ Result Client::do_request(const Request& request, const std::string& host, std::
     Request outgoing = request; if (!outgoing.header.has("Host")) outgoing.header.set("Host", host); if (!outgoing.header.has("Connection")) outgoing.header.set("Connection", "close");
     const auto wire = outgoing.to_string();
     if (wire.empty()) return {Result::Error::Parse, "invalid request line", {}};
+    // step4: 循环发送——send 可能部分写，必须发完整个 wire。
     std::size_t sent = 0;
     while (sent < wire.size()) {
         remaining = remaining_time(deadline);
@@ -483,9 +533,11 @@ Result Client::do_request(const Request& request, const std::string& host, std::
         }
         sent += static_cast<std::size_t>(written.transferred);
     }
+    // step5: 准备响应解析器与栈上接收缓冲。
     Parser parser; parser.set_response_to_head(request.method == Method::Head);
     auto response = std::make_shared<Response>(); std::array<char, 8192> buffer{};
     std::string pending;
+    // step6: 接收 + 解析循环（含 1xx informational 响应的处理）。
     for (;;) {
         ParseResult parsed;
         if (!pending.empty()) {
