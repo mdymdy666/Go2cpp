@@ -1062,6 +1062,7 @@ int native_wait(int fd, IOEvent event,
 template <typename Result, typename Function, typename... Args>
 Result cooperative_io(int fd, Function function, IOEvent event,
                       bool per_call_nonblocking, Args... args) {
+    // step1: 符号没解析出来就只能退化为失败（ENOSYS），不能假装成功。
     if (!function) {
         errno = ENOSYS;
         return static_cast<Result>(-1);
@@ -1078,6 +1079,8 @@ Result cooperative_io(int fd, Function function, IOEvent event,
     if (manager == nullptr && go2cpp::Scheduler::current_task() != nullptr) {
         blocking_region.emplace();
     }
+    // step2: 查 fd 元数据；未接管则依次尝试 adopt socket / adopt fifo，
+    // 都失败就原生调用（并显式发布 M::Blocking 让 sysmon 看得见）。
     auto descriptor = descriptor_for(fd);
     if (!descriptor && managed_hook_admission) {
         descriptor = try_adopt_socket(fd);
@@ -1119,11 +1122,14 @@ Result cooperative_io(int fd, Function function, IOEvent event,
         if (!blocking) {
             return result;
         }
+        // step5: 成功、或错误不是 EAGAIN/EWOULDBLOCK ⇒ 直接返回。
         if (result != static_cast<Result>(-1) ||
             (errno != EAGAIN && errno != EWOULDBLOCK)) {
             return result;
         }
 
+        // step6: EAGAIN ⇒ 注册 epoll 等待并 park；被唤醒后回到 step4 重试
+        // （数据可能已被别的读者取走，不能假设「唤醒 = 有数据」）。
         const auto token = snapshot_descriptor(descriptor).m_token;
         const int error = manager
                               ? wait_error(wait_for_io(*manager, fd, event,

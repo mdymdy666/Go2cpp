@@ -35,7 +35,7 @@
 | 模块 | 候选函数 | 状态 |
 |---|---|---|
 | io | `poll_once` ✅ / `process_events_batch` ✅ / `register_wait` | 2/3 完成 |
-| hook | `cooperative_io` / `cooperative_connect` | ⬜ |
+| hook | `cooperative_io` ✅（已有函数头，本轮补体内 4 处 step）/ `cooperative_connect` | 1/2 完成 |
 | fiber | `Fiber::resume_locked` | ⬜ |
 | sync | `Mutex::LockImpl` / `Unlock` | ⬜ |
 | channel | `SendUntil` / `RecvUntil` | ⬜ |
