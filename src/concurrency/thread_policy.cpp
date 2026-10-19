@@ -47,6 +47,34 @@ bool ThreadParticipatesInGMP() noexcept {
            s_policy_participation == ThreadParticipationMode::kGmpEligible;
 }
 
+/**
+ * @brief 临时把当前线程标记为「参与 GMP」，析构时还原。
+ * @param scheduler 关联的调度器（`kGmpEligible` 时必须非空）。
+ * @param mode 期望的参与模式。
+ *
+ * ## 定位
+ *
+ * 让**非调度器创建的线程**（例如用户自己起的线程）能临时声明「我愿意被
+ * GMP 接管」：在这个 scope 内调用 `read()`/`sleep()` 会被 hook 成 park，
+ * 而不是原生阻塞。
+ *
+ * ## 步骤
+ *
+ * step1. 先保存当前策略快照（`m_previous`），保证析构能精确还原；
+ * step2. **若当前线程已经是 runtime worker，则不改策略**：worker 的 M/P
+ *        绑定是权威的，外部 scope 不能覆盖它（否则一个用户 scope 就能让
+ *        worker 从 GMP 里「掉出来」）；
+ * step3. 否则按 mode 设置：`kGmpEligible` 且 scheduler 非空 → 绑定 scheduler；
+ *        其余情况一律降级为 `kUnmanaged`；
+ * step4. `s_runtime_worker` 恢复成快照值（scope 不改变 worker 身份）。
+ *
+ * ## 并发/失败语义
+ *
+ * - 全部是 `thread_local` 写，**无线程安全负担**（只影响本线程）；
+ * - **析构一定还原**（`if (m_active)` 保护，防止移动后重复还原）；
+ * - **`noexcept`**：策略切换在 hot path 上，且失败也没有可用的错误通道；
+ * - **worker 身份不被 scope 覆盖**是这里最重要的不变量。
+ */
 ScopedThreadParticipation::ScopedThreadParticipation(
     scheduler::Scheduler* scheduler, ThreadParticipationMode mode) noexcept
     : m_previous(CurrentThreadPolicy()), m_active(true) {
@@ -107,6 +135,23 @@ void LeaveRuntimeWorker() noexcept {
     s_runtime_worker = false;
 }
 
+/**
+ * @brief 判定当前线程是否允许把阻塞调用 hook 成 park。
+ * @param process_enabled 进程级的总开关（`hook.enable_*` 配置）。
+ * @return true 表示允许 hook。
+ *
+ * ## 步骤
+ *
+ * step1. `kDisabled` → 直接 false（线程级强制关闭）；
+ * step2. `kEnabled` → 直接 true（线程级强制开启，**忽略进程开关**）；
+ * step3. `kInherit` → 返回 `process_enabled`（默认行为，跟随进程配置）。
+ *
+ * ## 并发/失败语义
+ *
+ * - `kEnabled` **能覆盖进程级关闭**是刻意的：它用于「这个线程必须协作」
+ *   的场景（例如调度器内部线程），即使全局诊断时关掉了 hook 也要保持工作；
+ * - 无锁、`noexcept`，每次 hook 调用都会走一次（所以用 switch 而不是查表）。
+ */
 bool HookAllowed(bool process_enabled) noexcept {
     switch (s_policy_hook) {
         case ThreadHookMode::kDisabled:
