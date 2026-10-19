@@ -1265,12 +1265,32 @@ enum class SleepOutcome { Unavailable, Completed, Interrupted };
 /// `WaitFor` 会立即返回（假唤醒）。所以复用前必须先 `read` 清空。
 thread_local int t_sleep_eventfd = -1;
 
+/// 是否把 sleep 族退化为「真阻塞 M」而不是 park。
+///
+/// ## 为什么需要这个开关
+///
+/// 协作睡眠（park）在当前实现里每个请求要付 **~280µs 内核 CPU**（futex park/wake）。
+/// 而如果 P 数量足够多（>= 2 × 核数），阻塞一个 M 的时间片损失可能小于 280µs——
+/// 这是一个需要用数据验证的权衡，所以做成开关而不是直接改默认行为。
+///
+/// - `GO2CPP_SLEEP_BLOCKING=1`：始终真阻塞（`usleep` 走 `invoke_native_blocking`，
+///   会发布 `M::Blocking`，sysmon 可申请替代 M）；
+/// - 未设置或 `0`：保持协作睡眠（默认，park 让出 M）。
+bool sleep_should_block() noexcept {
+    static const bool value = [] {
+        const char* env = std::getenv("GO2CPP_SLEEP_BLOCKING");
+        return env != nullptr && *env != '0' && *env != '\0';
+    }();
+    return value;
+}
+
 SleepOutcome cooperative_sleep_for(Duration duration) {
     IOManager* manager = cooperative_manager();
     if (duration <= Duration::zero()) {
         return SleepOutcome::Completed;
     }
-    if (!manager) {
+    if (!manager || sleep_should_block()) {
+        // 没有 IOManager，或显式要求阻塞：交给调用方的 invoke_native_blocking。
         return SleepOutcome::Unavailable;
     }
 
