@@ -1245,8 +1245,41 @@ bool Mutex::TryLock() noexcept {
     return acquired;
 }
 
+/**
+ * @brief 释放 Mutex；若有等待者，把**所有权直接交给 FIFO 队首**。
+ *
+ * ## 定位
+ *
+ * `LockImpl` 的另一半。关键设计是「先出队、锁外 Wake」：队列操作在
+ * `m_mutex` 内完成（与等待者的入队线性化），但 `Wake()` 必须在释放
+ * `m_mutex` 之后调用——否则唤醒一个 Fiber 后它立刻回来抢锁，会形成
+ * 「持队列锁 → 唤醒 → 等待者抢锁」的锁序反转。
+ *
+ * ## 步骤
+ *
+ * step1. 持锁 park 检测：只有「解锁者就是记录里的 owner」时才递减计数，
+ *        避免 Go 风格跨 G 解锁把计数减错；
+ * step2. **无等待者快速路径**：`CAS kLocked → 0` 成功即返回，不进入队列锁。
+ *        若等待者位同时存在，CAS 必定失败并转入 step3；
+ * step3. **FIFO 交接**（持 `m_mutex`）：先确认锁确实被持有（否则抛
+ *        `logic_error`），`ReorderWaitersForSelector` 让选择器重排队列，
+ *        然后逐个出队用 `TryFinish(kNotified)` 找第一个能成功认领的等待者；
+ *        - 找到：`selected` 非空，`m_state` 保持 `kLocked`（所有权直接交给
+ *          队首，`TryLock` 调用者不能插队）；
+ *        - 没找到：`m_state` 置 0（真正释放）。
+ * step4. 锁外 `Wake()`：让被选中的等待者恢复执行。
+ *
+ * ## 并发/失败语义
+ *
+ * - **解锁未持有的 mutex 抛 `logic_error`**（继续下去会让状态永久错乱）；
+ * - `kWaiter` 位与 `m_waiters` 非空必须一致：两者都在 `m_mutex` 内更新；
+ * - **唤醒在锁外**：这是与 `LockImpl` 的 park 路径配对的约定，违反它会死锁；
+ * - `TryFinish` 失败的节点（已被超时/取消）会被跳过并继续找下一个，
+ *   因此不会因队首是僵尸节点而丢唤醒；
+ * - 正常路径不抛异常，唯一的异常是 `logic_error`（误解锁）。
+ */
 void Mutex::Unlock() {
-    // 持锁 park 检测：只有"解锁者就是记录里的 owner"时才递减，
+    // step1: 持锁 park 检测：只有「解锁者就是记录里的 owner」时才递减，
     // 避免 Go 风格跨 G 解锁把计数减错。
     if (DetectHeldParkEnabled()) {
         Task* const self = Scheduler::current_task_ptr();
@@ -1259,6 +1292,7 @@ void Mutex::Unlock() {
     }
     // 无等待者时只需一次 CAS，不进入队列互斥量。若等待者位同时存在，
     // CAS 必定失败并转入下面的 FIFO 交接路径。
+    // step2: 无等待者快速路径——一次 CAS，不进队列锁。
     std::uint8_t expected_state = Impl::kLocked;
     if (m_impl->m_state.compare_exchange_strong(
             expected_state, 0U, std::memory_order_release,
@@ -1266,6 +1300,7 @@ void Mutex::Unlock() {
         return;
     }
 
+    // step3: FIFO 交接——队列操作在 m_mutex 内与等待者入队线性化。
     std::shared_ptr<WaitNode> selected;
     {
         // Unlock 与 waiter 发布必须共享同一把队列锁。原子快路径无法
@@ -1305,6 +1340,7 @@ void Mutex::Unlock() {
         // 选定 waiter 后锁在逻辑上仍保持持有：所有权直接交给 FIFO 队首，
         // 因而 TryLock 调用者不能插队。
     }
+    // step4: 锁外唤醒（与 LockImpl 的 park 路径配对；持队列锁唤醒会死锁）。
     if (selected) {
         selected->Wake();
     }
