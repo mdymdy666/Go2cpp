@@ -511,13 +511,17 @@ void serve_gmp_connection(Socket::Ptr socket) {
     socket->close();
 }
 
-int run_gmp_server(std::uint16_t port, std::size_t workers, int sndbuf,
-                   bool raw_io, bool pin) {
+int run_gmp_server(std::uint16_t port, std::size_t workers,
+                   std::size_t min_workers, int sndbuf, bool raw_io, bool pin) {
     go2cpp::SchedulerConfig config;
     // workers == 0 时按硬件线程数；显式传入则按传入值（用于测「P 超配」的影响，
     // 对齐 coost 的 co_sched_num）。P 超过核数时收益来自 IO 等待与计算的重叠，
     // 代价是调度开销。
     config.processor_count = static_cast<std::uint32_t>(workers);
+    // min_workers 与 processor_count 解耦，用于区分「P 变多」与「常驻 M 变多」
+    // 各自的贡献：P 是逻辑队列（Go 语义下超配无益），M 是 OS 线程（多了能吸收
+    // IO 等待）。0 表示沿用运行时默认（= processor_count）。
+    config.min_workers = min_workers;
     config.collect_metrics = false;  // 关闭诊断计时，压测时不付额外成本
     config.pin_workers_to_cpu = pin;
     go2cpp::IOManager manager(config);
@@ -1774,7 +1778,7 @@ long long arg_int(int argc, char** argv, const char* name, long long fallback) {
 void usage() {
     std::fputs(
         "用法:\n"
-        "  server --model gmp|thread|epoll [--port 0] [--workers 8]\n"
+        "  server --model gmp|thread|epoll [--port 0] [--workers 8] [--min-workers 0]\n"
         "         [--sndbuf 0] [--stack-kb 8192]\n"
         "  client --scenario s1|s2|s3|s4|s5 --port N [--host 127.0.0.1]\n"
         "         [--conns 64] [--duration-ms 5000] [--warmup-ms 1000]\n"
@@ -1798,7 +1802,9 @@ int server_main(int argc, char** argv) {
     const bool raw_io = has_bool_flag(argc, argv, "--raw-io");
     const bool pin = has_bool_flag(argc, argv, "--pin");
     if (model == "gmp") {
-        return run_gmp_server(port, workers, sndbuf, raw_io, pin);
+        const auto min_workers = static_cast<std::size_t>(
+            arg_int(argc, argv, "--min-workers", 0));
+        return run_gmp_server(port, workers, min_workers, sndbuf, raw_io, pin);
     }
     if (model == "thread") {
         return run_thread_server(port, sndbuf, stack_kb);

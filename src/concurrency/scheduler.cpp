@@ -1172,14 +1172,13 @@ public:
 
     static SchedulerConfig normalize(SchedulerConfig requested) {
         if (requested.processor_count == 0) {
-            // 默认 2 × 核数（不是 1 × 核数）。实测见 docs/parameter-tuning.md：
-            //   s1 短连接 QPS +105%（19,121 → 39,141）、P50 −62%
-            //   s3 8,000 长连接 P50 −91%（3.56ms → 0.31ms）、P99.9 −74%
-            //   s4 计算+IO QPS +16%、sys −6%
-            // 原理：P 越多，每个 P 上排队的 G 越少，跨 M 协调（唤醒/迁移）就越少——
-            // 这正是之前诊断出的 sys 开销主要来源（P=96 时 sys 从 168µs 降到 80µs）。
-            // 代价：虚拟内存约 2 倍（每个 P 有自己的栈缓存，P=24 时约 1.75GB vsz）。
-            requested.processor_count = default_processor_count() * 2;
+            // 默认 = 硬件并发度（与 Go 的 GOMAXPROCS 语义对齐）。
+            //
+            // 区分实验（docs/parameter-tuning.md 轮次 6）证明 **P 数量本身超配无效**：
+            //   D(P=48, M=12) 27,809 qps ≈ A(P=12, M=12) 27,786 qps
+            // 即把 P 从 12 加到 48、但 M 保持 12，QPS 完全不变。P 只是逻辑队列，
+            // 超配不增加并行度。真正的收益来自常驻 M 数量（见 min_workers）。
+            requested.processor_count = default_processor_count();
         }
         requested.processor_count = std::max<std::size_t>(1,
                                                            requested.processor_count);
@@ -1207,9 +1206,16 @@ public:
                 std::min(requested.max_workers, requested.processor_count);
         }
         if (requested.min_workers == 0) {
-            // Go 风格：常驻 M 数默认等于 P。基础 M 只在 shutdown 时退出；
-            // 普通 runnable 需求仍以 P 为上限（max_workers 更大时也不会
-            // 因为 min_workers=P 而超额创建）。
+            // 默认 = P（Go 风格：常驻 M 数等于 P，保证每个 P 都有承载者）。
+            //
+            // 曾试过改成 2 × P：性能确有 +11.7%（s4 计算注入 27,786 → 31,032），
+            // 但 **破坏语义** —— tests/network/test_hook.cpp 的 
+            // read_f 用例要求
+            // 「阻塞一个 M 后整个 P 停摆、心跳近乎平直」，常驻 M 翻倍后备用 M 继续
+            // 跑心跳，测试失败。性能收益不能以改变阻塞语义为代价，故回退。
+            //
+            // 需要更多常驻 M 的部署可以显式设 min_workers（配置项），
+            // 但要自行承担上述语义变化。
             requested.min_workers = requested.processor_count;
         }
         requested.min_workers = std::max<std::size_t>(1, requested.min_workers);
