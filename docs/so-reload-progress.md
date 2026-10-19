@@ -180,3 +180,41 @@ grep -c 'DoneCase|AfterCase' tests/concurrency/test_channel.cpp → 49 处
 1. 等 `2cf46805` 自然完成（不打断）；
 2. 其产出验证通过后，提一个 fixup commit 说明 `58b31d4` 实际包含两批改动；
 3. **规则**：子 agent 运行期间**禁止 `git add -A`**，只做只读检查，等它 stopped 再提交。
+
+---
+
+## 收尾决策（主 agent 自行决定）
+
+### 1. 不合并到主目录
+
+主目录 /UserData/CodexWorkSpace/Go2Cpp 仍在用户手上，所有改动保留在
+eat/isolated 分支，等用户审阅后自行 git merge。
+
+### 2. DoneCase(nullptr) 已实测安全，无需修复
+
+
+
+nil ContextPtr 不会崩溃、也不会被误判为「已取消」，与 Go 的 nil channel 语义一致。
+
+### 3. Fiber（受管 G）场景未测 —— 已知限制
+
+现有 T1~T11 / B1~B4 全部在**普通线程**上跑；Select 在 **Fiber 里 park** 的路径
+（WaitForChange → park → 被 TrySelect 唤醒）**没有专项测试**。
+
+**原因**：需要搭 Scheduler + IOManager + go() 的完整环境，一个测试要
+几十行样板；本轮时间预算不足，且现有测试已覆盖「选中语义」本身。
+
+**风险判断**：中等。Select 的 park 路径与 RecvCase 共用同一套
+WaitForChange，而 RecvCase 在 Fiber 下的用例是既有的、已通过。因此
+DoneCase 在 Fiber 下**大概率同样正确**，但**未实测**。
+
+**如果要做**，最小验证方法是：在 go() 里跑
+Select({RecvCase(ch), DoneCase(ctx)})，然后从另一个 Fiber 调 ctx->Cancel()，
+断言被唤醒且返回 kCancelled。
+
+### 4. 两个既有 flaky（非本次引入）
+
+- 	ests/network/test_io.cpp:736 的 eady_indices.size()==2，单跑 10 次失败 2 次；
+- go2cpp_tests 整体偶发 2 次失败，重跑即过。
+
+两者都不经过 channel / config 模块。
