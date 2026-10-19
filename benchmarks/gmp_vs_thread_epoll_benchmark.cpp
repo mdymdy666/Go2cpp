@@ -74,6 +74,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -181,13 +182,27 @@ struct Response {
 ///          在 thread 模型里是真正的线程睡眠 —— 这正是要对比的差异。
 constexpr std::uint32_t kIoSleepDefaultUs = 5000;
 
-/// 实际使用的 IO 延迟上限，可用 GO2CPP_BENCH_IO_SLEEP_US 覆盖（诊断用）。
-/// 注意：压测结果必须报告这个值；默认 5000 与文档基线一致。
-std::uint32_t io_sleep_max_us() {
+/// 每请求「计算任务」的最大元素数（随机规模），可用 GO2CPP_BENCH_COMPUTE_ITEMS 覆盖。
+///
+/// ## 为什么用随机规模的排序而不是 usleep
+///
+/// `usleep` 模拟的是「后端处理耗时」，但真实业务的后端处理是**CPU 计算**
+/// （排序、序列化、查表、校验）。用 `usleep` 会让 GMP 的协作睡眠（park + futex）
+/// 成为被测对象，而 epoll 池的 worker 真睡几乎零成本——这是**不对等的比较**。
+///
+/// 改成生成 [0, kMaxItems] 个随机 int 并排序：
+/// - 两个模型都在做**真实的 CPU 计算**；
+/// - 规模随机，模拟「数据量不一的算法任务」；
+/// - 规模上限可调，用来扫「每请求计算量」对两种模型的影响。
+///
+/// 默认 4096 个 int（排序约 100~200µs），量级接近真实的后端处理。
+constexpr std::uint32_t kComputeItemsDefault = 4096;
+
+std::uint32_t io_compute_max_items() {
     static const std::uint32_t value = [] {
-        const char* env = std::getenv("GO2CPP_BENCH_IO_SLEEP_US");
+        const char* env = std::getenv("GO2CPP_BENCH_COMPUTE_ITEMS");
         if (env == nullptr || *env == 0) {
-            return kIoSleepDefaultUs;
+            return kComputeItemsDefault;
         }
         return static_cast<std::uint32_t>(std::strtoul(env, nullptr, 10));
     }();
@@ -225,29 +240,32 @@ std::size_t bench_body_size() {
 }
 
 Response process_request(std::uint8_t opcode, std::string_view body) {
-    const std::uint32_t kIoSleepMaxUs = io_sleep_max_us();
-    if (kIoSleepMaxUs > 0) {
-        // xorshift32：每线程独立，避免锁；延迟在 [0, kIoSleepMaxUs] 均匀分布
+    // 真实计算任务：生成 [0, kMaxItems] 个随机 int 并排序。
+    // 两边（GMP 与 epoll 池）执行完全相同的计算，区别只在调度模型。
+    const std::uint32_t kMaxItems = io_compute_max_items();
+    if (kMaxItems > 0) {
         static thread_local std::uint32_t seed = 0x9e3779b9u;
         seed ^= seed << 13;
         seed ^= seed >> 17;
         seed ^= seed << 5;
-        const std::uint32_t delay_us = seed % (kIoSleepMaxUs + 1u);
-        if (delay_us > 0) {
-            // 忙等而不是 usleep：两边都真正消耗 CPU，避免「GMP 协作睡眠 vs
-            // epoll 内核睡眠」这种不对等的比较。用 GO2CPP_BENCH_BUSY_US=0
-            // 可退回原来的 usleep 行为。
-            const char* busy = std::getenv("GO2CPP_BENCH_BUSY_US");
-            const bool use_busy = (busy == nullptr) || (std::strtoul(busy, nullptr, 10) != 0);
-            if (use_busy) {
-                const auto deadline = std::chrono::steady_clock::now() +
-                                      std::chrono::microseconds(delay_us);
-                while (std::chrono::steady_clock::now() < deadline) {
-                    // 自旋消耗 CPU；不带内存访问，避免被编译器优化掉。
-                    __asm__ __volatile__("" ::: "memory");
-                }
-            } else {
-                ::usleep(delay_us);
+        const std::uint32_t count = seed % (kMaxItems + 1u);
+        if (count > 1) {
+            // 用 thread_local 复用缓冲，避免每请求分配（那会变成测 malloc）。
+            static thread_local std::vector<std::int32_t> scratch;
+            if (scratch.size() < count) {
+                scratch.resize(count);
+            }
+            std::uint32_t x = seed | 1u;
+            for (std::uint32_t i = 0; i < count; ++i) {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                scratch[i] = static_cast<std::int32_t>(x);
+            }
+            std::sort(scratch.begin(), scratch.begin() + count);
+            // 用排序结果影响响应，防止编译器把计算优化掉。
+            if (scratch[0] == std::numeric_limits<std::int32_t>::min()) {
+                body = std::string_view{};
             }
         }
     }
