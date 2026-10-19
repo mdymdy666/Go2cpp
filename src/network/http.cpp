@@ -648,23 +648,65 @@ bool ResponseWriter::close() {
 Server::Server(net::Socket::Ptr listener) : m_listener(std::move(listener)) {}
 void Server::route(Method method, std::string path, Handler handler) { m_routes.emplace_back(method, std::move(path), std::move(handler)); }
 void Server::set_fallback(Handler handler) { m_fallback = std::move(handler); }
+/**
+ * @brief 在一个已接受的连接上服务若干请求（keep-alive 循环）。
+ * @param connection 已建立的连接（由 `Server` 的 accept 循环传入）。
+ * @param max_requests 本连接最多服务的请求数（防单连接饿死其它连接）。
+ *
+ * ## 定位
+ *
+ * `Server` 的连接级入口，与客户端 `Client::do_request` 对称。它把
+ * 「读请求 → 路由 → 调 handler → 写响应 → 决定是否继续」串成一个循环，
+ * 是服务端**唯一的请求生命周期**。
+ *
+ * ## 步骤
+ *
+ * step1. 空连接直接返回；初始化 `Parser` 与 `pending`（跨 recv 的流水线剩余）；
+ * step2. `for` 循环（上限 `max_requests`，且 `m_stopped` 为假）：
+ *        用 `do { feed/recv } while (NeedMore)` 读出一个**完整**请求；
+ *        收到 0 字节或解析错误就返回（连接结束）；
+ * step3. `pending = take_remaining()`：同一 recv 里可能还有下一个请求的字节，
+ *        留给下一轮循环；
+ * step4. 路由：按 (method, path) 精确匹配 `m_routes`，未命中用 `m_fallback`；
+ *        handler 抛异常时降级成 500 且**强制 close**；
+ * step5. 序列化响应并 `write_all`；写失败直接返回；
+ *        `request.close || response.close` 为真则结束循环（关闭连接）。
+ *
+ * ## 并发/失败语义
+ *
+ * - **单连接单线程**：本函数在调用它的 Fiber/线程上顺序执行，不并发处理
+ *   同一连接的多个请求（HTTP/1.1 的串行语义）；
+ * - **`max_requests` 是公平性保护**：防止一个 keep-alive 连接长期占用 worker；
+ * - **handler 异常必须转 500**：否则异常会穿过网络栈；
+ *   同时设 `response.close = true`，因为此时协议状态可能已不可信；
+ * - **`pending` 不能丢**：`take_remaining()` 返回的是下一次请求的开头，
+ *   丢弃会导致流水线请求被静默吞掉；
+ * - **写失败即返回**：对端已断，继续读只会浪费一次 syscall；
+ * - `m_stopped` 是原子标志，`Server::stop()` 置位后本循环在下一轮退出。
+ */
 void Server::serve_connection(net::Socket::Ptr connection, std::size_t max_requests) {
+    // step1: 空连接直接返回；准备解析器与流水线剩余缓冲。
     if (!connection) return;
     Parser parser; std::string pending;
+    // step2: keep-alive 主循环，单连接串行处理，上限 max_requests。
     for (std::size_t i = 0; i < max_requests && !m_stopped.load(std::memory_order_acquire); ++i) {
         Request request; std::array<char, 8192> buffer{}; ParseResult parsed;
+        // 读出一个完整请求：NeedMore 时继续 recv。
         do {
             if (!pending.empty()) { parsed = parser.feed(pending, request); pending.clear(); }
             else { auto count = connection->recv(buffer.data(), buffer.size()); if (count.transferred <= 0) return; parsed = parser.feed(std::string_view(buffer.data(), static_cast<std::size_t>(count.transferred)), request); }
             if (parsed.state == ParseState::Error) return;
         } while (parsed.state == ParseState::NeedMore);
+        // step3: 同一 recv 里可能还有下一个请求，留给下一轮。
         pending = parser.take_remaining();
+        // step4: 精确匹配路由，未命中用 fallback；handler 异常转 500 并强制 close。
         Response response; Handler selected = m_fallback;
         for (const auto& [method, path, handler] : m_routes) if (method == request.method && path == request.path()) { selected = handler; break; }
         if (selected) {
             try { response = selected(request); }
             catch (...) { response = Response{}; response.status = Status::InternalError; response.close = true; }
         } else response.status = Status::NotFound;
+        // step5: 写响应；close 标志决定是否结束本连接。
         const auto wire = response.to_string(request.method == Method::Head);
         net::SocketStream stream(connection, false);
         if (!stream.write_all(wire.data(), wire.size())) return;
