@@ -384,3 +384,69 @@ while (!_stopped) {
 3. **接受这个差距**：P99.9 差 20%（35 vs 29ms），而 QPS 与 CPU 效率都更好（P=24 时 QPS +7.6%）。
 
 **本轮未改代码**：读源码对照后确认「参考 coost」无法解决 P99.9，避免了又一个错误方向的改动。
+
+---
+
+# 第六轮：「唤醒优先本 P」已实现，P99.9 无进一步优化空间
+
+## 检查结果
+
+`Scheduler::wake_io_batch`（`scheduler.cpp:2903`）已经做了「优先本 P」：
+
+```cpp
+std::sort(pending.begin(), pending.end(),
+          [](const Pending& left, const Pending& right) {
+              return left.processor < right.processor;   // 按 last_processor_id 排序
+          });
+// 然后按 processor_id 分组，每组入对应 P 的本地队列（processor.mutex 保护）
+```
+
+**三个优化方向的状态**：
+
+| 方向 | 状态 | 说明 |
+|---|---|---|
+| 唤醒时优先本 P | ✅ **已实现** | `wake_io_batch` 按 `last_processor_id` 排序 + 分组入队 |
+| 连接亲和到 P | ✅ **部分** | `last_processor_id` 记录了连接上次所在 P，wake 时优先回该 P |
+| 减少跨 P 选择 | ❌ 不可行 | 唤醒方必须决定「叫醒哪个 P」，这个选择本身无法消除 |
+
+## P99.9 的最终归因
+
+**这是 M:N 调度模型相对「每 worker 独占连接」的结构性代价，无法通过优化消除**：
+
+| | GMP / coost（M:N） | epoll 线程池 |
+|---|---|---|
+| 谁决定「哪个 worker 处理这个事件」 | **调度器（要跨 P 选择）** | **worker 自己从 epoll 拿到** |
+| 唤醒路径长度 | 2 跳（唤醒方 → P → M） | 1 跳（内核 → 线程） |
+| P99.9 | 35ms | **29ms** |
+| QPS | **5,845** | 5,431 |
+| 每请求 CPU | **1,992µs** | 2,075µs |
+
+**GMP 用「2 跳唤醒」换来了更好的负载均衡和更高的 QPS；epoll 用「1 跳」换来了更短的长尾。这是两种模型的取舍，不是缺陷。**
+
+## coost 对照的最终结论
+
+| 维度 | coost | GMP | 谁更好 |
+|---|---|---|---|
+| 栈切换 | 共享栈 + **拷栈** | 独立栈 + **零拷贝** | **GMP** |
+| 调度器数量 | `co_sched_num` 可配 | `processor_count`（**已修复为可配**） | 持平 |
+| 窃取时机 | 本地空后才偷 | 本地空后才偷 | 持平 |
+| park/wake | 同线程用户态切换 | **跨 M futex** | **coost** |
+| 长尾 | 未实测（benchmark 跑不出数据） | 35ms | 未知 |
+
+**「参考 coost」能借鉴的部分已经全部落地**：
+1. `co_sched_num` → `processor_count` 可配（**+95% QPS**）；
+2. 共享栈 vs 独立栈：**GMP 的选择更优**（零拷贝），不需要改；
+3. `co::Event` 的 eventfd 复用 → **已落地**（−1%，非主因）。
+
+**不能借鉴的部分**：coost 的 park 是**同线程用户态切换**，而 GMP 的 park 必须**跨 M**（这是 M:N 的代价）。
+
+## 本目标的收敛状态
+
+| 项 | 状态 |
+|---|---|
+| 读懂 coost 的调度/栈/同步原语 | ✅ |
+| 编译 coost + 跑基准 | ⚠️ 编译成功，但其自带 benchmark 跑不出有效数据（compute 场景超时、无输出） |
+| 对照定位高 CPU 根因 | ✅ 三个根因（P 写死、usleep hook、futex park） |
+| 逐项实施优化并验证 | ✅ P 可配（+95%）、eventfd 复用（−1%）、sleep 阻塞开关（CPU −75%） |
+| ctest 113/113 | ✅ 每次改动后都验证 |
+| 结论写入文档 | ✅ `docs/coost-comparison.md`（6 轮记录） |
