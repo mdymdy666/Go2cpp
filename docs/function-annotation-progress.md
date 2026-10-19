@@ -8,13 +8,15 @@
 
 ### scheduler（要求 ≥3 个）
 
-| # | 函数 | 行数 | 状态 | 提交 |
+| # | 函数 | 行数 | 状态 | 说明 |
 |---|---|---:|---|---|
-| 1 | `Scheduler::worker_loop` | ~420 | ✅ **已完成**（1 函数头 + 5 处 step） | 本轮 |
-| 2 | `Scheduler::park_for_scheduler` | 待查 | ⬜ | — |
-| 3 | `Scheduler::wake_io_batch` | 待查 | ⬜ | — |
-| 4 | `Scheduler::requeue_from_worker` | 待查 | ⬜ | — |
-| 5 | `Scheduler::shutdown_for` | 待查 | ⬜ | — |
+| 1 | `Scheduler::worker_loop` | ~420 | ✅ **已完成** | 1 函数头 + 5 处 step（快/中/慢三路径 + 执行 + 维护） |
+| 2 | `Task::park_for_scheduler` | 26 | ✅ **已完成** | 1 函数头（5 步 + 4 条并发语义）+ 4 处 step |
+| 3 | `Scheduler::wake_io_batch` | ~150 | ✅ **已完成** | 原已有函数头（3 步），本轮补齐体内 3 处 step 标注 |
+| 4 | `Scheduler::requeue_from_worker` | 待查 | ⬜ 可选 | — |
+| 5 | `Scheduler::shutdown_for` | 待查 | ⬜ 可选 | — |
+
+**scheduler 的 3 个必做函数已全部完成。**
 
 ### ParkingCondition（要求 ≥3 个）
 

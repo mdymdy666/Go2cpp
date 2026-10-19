@@ -535,9 +535,43 @@ WakeAction Task::wake_for_wait() noexcept {
     return WakeAction::kRejected;
 }
 
+/**
+ * @brief 把当前 G 从 `kRunning` 提交为 `kWaiting`，并告诉调用方是否真的让出。
+ * @return
+ * - `kParked`：挂起已提交，调用方**必须**切走 Fiber（当前 G 已不是 running）；
+ * - `kRequeued`：Fiber 提交挂起前已收到唤醒，**不要切走**，继续在当前执行流跑；
+ * - `kRejected`：当前 G 不是 `kRunning`（例如已被取消），调用方按普通返回处理。
+ *
+ * ## 定位
+ *
+ * 这是**所有 park 路径的唯一提交点**：`sync.cpp` 的等待、`channel` 的阻塞收发、
+ * `ParkingCondition::wait` 最终都收敛到这里。它的返回值直接决定上层是否调用
+ * `Fiber::Yield`，所以「返回值 → 切不切」这个契约一旦错就是死锁或丢唤醒。
+ *
+ * ## 步骤
+ *
+ * step1. **契约检查**（必须在状态转换之前）：若调用者确实是当前 G，检查
+ *        它是否在 `SpinMutex` 临界区（`no_park_depth`，禁止）或持有普通
+ *        `Mutex`（`held_mutexes`，允许但记日志）；
+ * step2. 取 `m_transition_mutex`——状态转换与 `wake_pending` 的消费必须在
+ *        同一临界区内，否则「先通知后挂起」会丢唤醒；
+ * step3. 校验状态：不是 `kRunning` 就返回 `kRejected`（已被取消/已死）；
+ * step4. **消费唤醒令牌**：`m_wake_pending.exchange(false)` 为真说明挂起前
+ *        已经有人唤醒过，此时返回 `kRequeued`，让调用方留在当前执行流；
+ * step5. 提交 `kWaiting` 并返回 `kParked`。
+ *
+ * ## 并发/失败语义
+ *
+ * - **契约检查必须在 step2 之前**：一旦返回 `kParked`，当前 G 就离开了执行流，
+ *   再也无法可靠地定位「谁在持锁状态下 park」；
+ * - 契约检查只在该 G 确实是当前 G 时执行——`park_for_scheduler` 是公开接口，
+ *   外部线程误调时不应把别的 G 的计数算到这次调用头上；
+ * - `noexcept`：本函数不分配、不加可能抛出的锁，失败只能通过返回值表达；
+ * - **不变量**：返回 `kParked` 后 `m_state == kWaiting` 且 `m_wake_pending == false`；
+ *   返回 `kRequeued` 后 `m_state` 仍为 `kRunning` 且令牌已被消费。
+ */
 ParkAction Task::park_for_scheduler() noexcept {
-    // 契约检查必须在状态转换之前：这里一旦返回 kParked，当前 G 就离开了
-    // 当前执行流，再也无法可靠地定位「谁在持锁状态下 park」。
+    // step1: 契约检查——必须在状态转换之前（返回 kParked 后就离开执行流了）。
     //
     // 只在 park 调用者确实是当前 G 时检查：park_for_scheduler() 是公开
     // 接口，外部线程误调时不应把别的 G 的计数算到这次调用头上。
@@ -551,15 +585,19 @@ ParkAction Task::park_for_scheduler() noexcept {
             ReportParkWhileHoldingMutex(*this);
         }
     }
+    // step2: 状态转换与令牌消费必须在同一临界区内，否则会丢唤醒。
     std::lock_guard<std::mutex> lock(m_transition_mutex);
+    // step3: 只有 kRunning 才能 park；否则说明已被取消或已终态。
     if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
         return ParkAction::kRejected;
     }
+    // step4: 挂起前已收到唤醒 → 消费令牌并留在当前执行流（kRequeued）。
     if (m_wake_pending.exchange(false, std::memory_order_acq_rel)) {
         // Fiber 提交挂起前已经收到唤醒。消费该令牌并留在当前执行流，
         // 避免先通知后挂起造成丢失唤醒。
         return ParkAction::kRequeued;
     }
+    // step5: 提交挂起。
     m_state.store(GState::kWaiting, std::memory_order_release);
     return ParkAction::kParked;
 }
@@ -2937,6 +2975,7 @@ bool Scheduler::wake_io_batch(
     try {
         pending.reserve(tasks.size());
         fallback.reserve(tasks.size());
+        // step1: 先对每个 task 尝试 wake_for_io；kPending/kRejected 都跳过。
         for (const auto& task : tasks) {
             // 调用方是 IOManager::State 的 WaitNode；该节点只有在本
             // Scheduler 注册成功后才会进入 wake list，因此这里不再为
@@ -2953,6 +2992,7 @@ bool Scheduler::wake_io_batch(
             }
             pending.push_back(Pending{task, task->last_processor_id()});
         }
+        // step2: 按 last_processor_id 排序，让同一 P 的 G 连续入队。
         std::sort(pending.begin(), pending.end(),
                   [](const Pending& left, const Pending& right) {
                       return left.processor < right.processor;
@@ -2970,6 +3010,7 @@ bool Scheduler::wake_io_batch(
         return false;
     }
 
+    // step3: 逐 P 分组入队；分组不可用（P 越界/正在 drain/stopping）时走 fallback。
     std::size_t index = 0;
     while (index < pending.size()) {
         const PId processor_id = pending[index].processor;
