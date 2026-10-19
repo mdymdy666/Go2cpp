@@ -3379,6 +3379,43 @@ PId Scheduler::current_processor_id() noexcept {
     return t_processor_id;
 }
 
+/**
+ * @brief M（OS 线程）的主循环：取 G、执行、回收，空转时做维护。
+ * @param opaque_machine 该 M 的 `Impl::Machine`；为空时直接返回（防御性检查）。
+ *
+ * ## 定位
+ *
+ * 这是整个调度器的**唯一执行驱动**：所有 G 都在这一个 `for (;;)` 里被
+ * 「取出 → 标记 running → 执行 → 回收」。P 只是队列容器，真正的并行度来自
+ * 同时跑在多少个 M 上。
+ *
+ * ## 步骤
+ *
+ * step1. 绑定线程本地身份（`t_scheduler` / `t_machine_id` / `t_processor_id`），
+ *        可选地把当前线程 pin 到与本 P 对应的 CPU；
+ * step2. **快路径**：直接取本 P 的本地队列（`own_processor.queue`）队首。
+ *        本 P 的队列由本 P 的 worker 独占消费，因此不需要调度器总锁；
+ * step3. **中路径**：扫描 `incoming` 分条队列（跨线程投递的入口）。
+ *        若本 M 有任务类亲和且预算未耗尽，先按 class 匹配，再退化为 FIFO；
+ * step4. **慢路径**：本地与 incoming 都空时，才在 `m_impl->mutex` 这把
+ *        admission 锁下依次尝试 `emergency_pop` → 本地 FIFO → 全局 FIFO →
+ *        从其它 P 的**队尾**窃取（窃取用队尾，减少与本地消费者的争用）；
+ * step5. 执行前做 M/P 计数与亲和记账，然后 `task->run()`；返回后按
+ *        终态发事件、记指标，并把「yield 回来且已 unqueue」的 G 重新入队；
+ * step6. 空转或到达摊销周期时调用 `maybe_grow()`（补充 M 属于维护路径，
+ *        不放在 Fiber 切换热路径上）。
+ *
+ * ## 并发/失败语义
+ *
+ * - **取任务的三条路径互斥**：只有一条会成功给 `task` 赋值，且每条路径都
+ *   必须完成 `runnable` 递减与 `try_mark_running()` 认领；
+ * - `try_mark_running()` 失败（任务已被取消或已死）时必须 `clear_queued()`，
+ *   否则队列节点的 reservation 会泄漏；
+ * - `task->run()` 返回后**必须**把 `running_workers` / `running_machines` /
+ *   `MState` / `PState` 全部还原，否则后续唤醒判定会把空闲 P 误判为忙；
+ * - 若 `t_blocking_machine_id != 0`（BlockingRegion 跨越了 G 边界），
+ *   这里 `std::terminate()`：这是不可恢复的状态损坏，静默清理会传播不一致。
+ */
 void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     auto machine = std::static_pointer_cast<Impl::Machine>(opaque_machine);
     if (!machine) {
@@ -3410,9 +3447,10 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         std::shared_ptr<Task> task;
         bool claimed = false;
         bool local_queue_pop = false;
+        // step2: 快路径——只碰本 P 的本地队列，不加调度器总锁。
         // 绝大多数 yield 回来的 G 都会回到原 P。本地队列由同一 P 的
-        // worker 独占消费，先走无调度器总锁路径；只有本地为空时才进入
-        // 需要全局 admission 锁的全局队列/窃取路径。
+        // worker 独占消费；只有本地为空时才进入需要全局 admission 锁的
+        // 全局队列/窃取路径。
         if (!m_impl->stopping.load(std::memory_order_acquire) &&
             m_impl->running_workers.load(std::memory_order_acquire) != 0 &&
             m_impl->runnable.load(std::memory_order_acquire) >
@@ -3437,6 +3475,9 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             task->request_cancel(false);
         }
         if (!task && !m_impl->stopping.load(std::memory_order_acquire)) {
+            // step3: 中路径——扫描 incoming 分条队列（跨线程投递入口）。
+            // 每个 stripe 有自己的锁；先按任务类亲和匹配，再从 start 开始
+            // 轮转扫全部 stripe，避免固定顺序造成饥饿。
             if (m_impl->incoming_count.load(std::memory_order_acquire) != 0) {
                 const auto start = m_impl->incoming_probe.fetch_add(
                     1, std::memory_order_relaxed);
@@ -3534,6 +3575,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             task->request_cancel(false);
         }
         if (!task) {
+            // step4: 慢路径——本地与 incoming 都空，进入全局 admission 锁。
+            // 顺序固定为：emergency → 本地 FIFO → 全局 FIFO → 窃取队尾。
             // Queue removal, the shutdown check, and the runnable->running
             // claim form one admission transaction.  A task already claimed
             // from this worker's local queue skips this global mutex entirely:
@@ -3700,6 +3743,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         }
 
         if (task && claimed) {
+            // step6: 维护路径——按「有积压就勤查、否则摊销」的策略决定
+            // 是否补充 M。它不在 Fiber 切换热路径上。
             // Growth is maintenance, not part of the Fiber switch hot path.
             // A previous implementation scanned/reaped under scheduler locks
             // for every resume, which dominated short yield workloads. Check
@@ -3731,6 +3776,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 t_processor_id, GState::kRunning});
             const bool collect_metrics = m_impl->config.collect_metrics;
             const auto run_started = collect_metrics ? steady_now_ns() : 0;
+            // step5: 执行 G。返回值通过 task 的终态体现（Dead/Failed/
+            // Cancelled/Yielded/Parked），这里只负责记账与后续回收。
             task->run();
             const auto task_state_after_run = task->state();
             const auto task_event_type =
