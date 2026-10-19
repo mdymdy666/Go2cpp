@@ -214,7 +214,8 @@ Select({RecvCase(ch), DoneCase(ctx)})，然后从另一个 Fiber 调 ctx->Cancel
 
 ### 4. 两个既有 flaky（非本次引入）
 
-- 	ests/network/test_io.cpp:736 的 eady_indices.size()==2，单跑 10 次失败 2 次；
+- tests/network/test_io.cpp:736 的 
+ready_indices.size()==2，单跑 10 次失败 2 次；
 - go2cpp_tests 整体偶发 2 次失败，重跑即过。
 
 两者都不经过 channel / config 模块。
