@@ -830,7 +830,48 @@ struct Fiber::Impl {
         return true;
     }
 
+    /**
+     * @brief 切换到本 Fiber 执行，直到它挂起/结束再返回调用者。
+     * @param validate_caller 是否校验「调用者确实是本 Fiber 的父级」（调度器
+     *        内部恢复已建立父子关系时可传 false 省掉校验）；
+     * @param scheduler_fast 调度器热路径模式：跳过跨线程记录（`last_thread`
+     *        的哈希比较与写回），只保留必要的上下文切换；
+     * @return true 表示成功切换过；false 表示状态不允许或 context 初始化失败。
+     *
+     * ## 定位
+     *
+     * 这是**整个 Fiber 机制的唯一切换点**：`Fiber::Resume`、`Task::run` 的
+     * trampoline、`Scheduler` 的 G 执行都收敛到这里。它下面是
+     * `jump_fcontext`（或原生 asm 版本），上面是所有并发原语。
+     *
+     * ## 步骤
+     *
+     * step1. 可选地校验调用者：`bind_caller()` 会在父子关系不符时返回 false，
+     *        防止「A 的父级被写成 B」这类栈链损坏；
+     * step2. 保存最初的调用者并登记 `FiberTlsRestore` —— 本函数内部可能沿
+     *        父链**循环多轮**，每轮都临时改 TLS，退出时必须恢复到最初的调用者；
+     * step3. 进入 `for (;;)`：校验状态必须是 `Ready`（首次）或 `Suspended`
+     *        （再次），`Ready` 且无 context 时先 `initialize_context()`；
+     * step4. 把状态置为 `Running`、清 `reason` 与 `m_scheduler_propagate`；
+     * step5. 保存当前 `errno`、把 TLS 当前 Fiber 切成本 Fiber、非 fast 模式
+     *        下记录 `last_thread`，然后 `store_errno(m_saved_errno)`；
+     * step6. 执行真正的上下文切换（含 ASAN/TSAN 的 fiber 切换钩子）；
+     *        返回时说明本 Fiber 已挂起或结束，恢复 TLS 与 errno 后回到循环
+     *        （若是 Scheduler 级挂起，会继续沿父链处理）。
+     *
+     * ## 并发/失败语义
+     *
+     * - `noexcept`：切换路径不允许抛异常（栈已经换过，异常无法安全穿越）；
+     * - 状态不是 `Ready`/`Suspended` 时返回 false，**不改变任何状态**；
+     * - `m_context == nullptr` 且初始化失败时返回 false（例如栈分配失败）；
+     * - **errno 必须按 Fiber 隔离**：进入前保存调用者的 errno，切到目标 Fiber
+     *   时恢复它自己保存的 errno，返回时再恢复调用者的——否则一个 Fiber 的
+     *   系统调用会污染另一个 Fiber 的 errno；
+     * - ASAN/TSAN 钩子成对出现（`start_switch` / `finish_switch`），遗漏任一侧
+     *   会让 sanitizer 把跨 Fiber 的栈访问误报为 use-after-return。
+     */
     bool resume_locked(bool validate_caller, bool scheduler_fast = false) noexcept {
+        // step1: 可选地校验调用者确实是本 Fiber 的父级。
         if (validate_caller && !bind_caller(s_current_fiber)) {
             return false;
         }
@@ -838,8 +879,10 @@ struct Fiber::Impl {
         // 都暂时把 TLS 当前 Fiber 设为本对象，但完成后必须恢复最初的
         // 调用者；否则父函数在同一栈帧里创建下一个子 Fiber 时，会把
         // 已完成的前一个子 Fiber 错当成新子 Fiber 的父级。
+        // step2: 记住最初的调用者；本函数可能沿父链循环多轮，退出时必须恢复。
         Fiber* const original_caller = s_current_fiber;
         const FiberTlsRestore tls_restore(original_caller);
+        // step3: 每轮都重新校验状态（上一轮切换后状态可能已变）。
         for (;;) {
             const FiberState current = m_record->state.load(std::memory_order_acquire);
             if (current != FiberState::Ready && current != FiberState::Suspended) {
@@ -853,10 +896,13 @@ struct Fiber::Impl {
             if (m_context == nullptr) {
                 return false;
             }
+            // step4: 进入运行态，清掉上一次挂起的原因与调度器传播标记。
             m_record->state.store(FiberState::Running, std::memory_order_release);
             m_record->reason.store(SuspendReason::None, std::memory_order_release);
             m_scheduler_propagate.store(false, std::memory_order_release);
 
+            // step5: errno 按 Fiber 隔离——保存调用者的，切到目标 Fiber 前恢复
+            // 它自己保存的值。
             const int caller_errno = load_errno();
             Fiber* const previous_fiber = s_current_fiber;
             s_current_fiber = m_owner;
