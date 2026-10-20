@@ -156,6 +156,8 @@ ErrorPtr ChannelTimeoutError() noexcept {
 SelectResult Select(const std::vector<SelectCase>& cases,
                     const ContextPtr& context,
                     std::optional<ContextDuration> timeout) {
+  GO2CPP_DEBUG_EVENT(kChannelSelectEnter, GO2CPP_DEBUG_BOUND_TASK(),
+                     static_cast<std::uint64_t>(cases.size()));
   if (cases.empty()) {
     return {SelectResult::kNoSelection, false, false, {},
             ChannelStatus::kInvalid, NewError("select has no cases")};
@@ -254,6 +256,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
                 ChannelStatus::kInvalid, detail::ValueOperationError()};
       }
       if (probe.ready) {
+        GO2CPP_DEBUG_EVENT(kChannelSelect, GO2CPP_DEBUG_BOUND_TASK(),
+                           static_cast<std::uint64_t>(index));
         return {index, true, probe.ok, std::move(probe.value), probe.status,
                 std::move(probe.error), std::move(probe.typed_value)};
       }
@@ -276,6 +280,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
     if (has_default) {
       for (std::size_t index = 0; index < cases.size(); ++index) {
         if (cases[index].is_default) {
+          GO2CPP_DEBUG_EVENT(kChannelSelect, GO2CPP_DEBUG_BOUND_TASK(),
+                             static_cast<std::uint64_t>(index));
           return {index, true, true, {}, ChannelStatus::kReady, {}};
         }
       }
@@ -500,6 +506,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
               ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
     if (channel_selected) {
+      GO2CPP_DEBUG_EVENT(kChannelSelect, GO2CPP_DEBUG_BOUND_TASK(),
+                         static_cast<std::uint64_t>(selected_index));
       return {selected_index,
               selected_probe.ready,
               selected_probe.ok,
@@ -525,6 +533,8 @@ SelectResult Select(const std::vector<SelectCase>& cases,
     }
     if (deadline.has_value() &&
         std::chrono::steady_clock::now() >= *deadline) {
+      GO2CPP_DEBUG_EVENT(kChannelSelect, GO2CPP_DEBUG_BOUND_TASK(),
+                         ::go2cpp::debug::kNoSelectCase);
       return {SelectResult::kNoSelection, false, false, {},
               ChannelStatus::kTimedOut, ChannelTimeoutError()};
     }

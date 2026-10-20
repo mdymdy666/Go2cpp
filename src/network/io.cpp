@@ -2169,6 +2169,7 @@ WaitResult IOManager::wait(int fd, IOEvent event,
                            DescriptorTokenPtr expected_descriptor) {
     GO2CPP_DEBUG_EVENT(kIoWait, 0,
                        static_cast<std::uint64_t>(fd < 0 ? 0 : fd));
+    GO2CPP_DEBUG_PARK_HINT(kIo);
     if (Scheduler::current_scheduler() != &m_scheduler ||
         !Scheduler::current_task()) {
         return {WaitStatus::kError, EPERM};

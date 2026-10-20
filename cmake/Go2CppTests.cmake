@@ -97,6 +97,28 @@ if (GO2CPP_BUILD_TESTS)
         target_compile_options(go2cpp_debug_subscribe_demo PRIVATE
             -Wall -Wextra -Wpedantic)
     endif()
+    # ---- 全链路追踪场景（仅 GO2CPP_DEBUG_DUMP=ON）----
+    # ≥4 Fiber × channel/mutex/timer/select/PC，跑 10s 后抓取 6 个 JSON 视图。
+    # **不注册 ctest**：ctest 用例总数保持 116；验收由
+    # tests/scenarios/full_trace/run_full_trace.sh 从外部驱动。
+    if (GO2CPP_DEBUG_DUMP)
+        add_executable(go2cpp_full_trace_scenario
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/full_trace/full_trace_scenario.cpp)
+        target_link_libraries(go2cpp_full_trace_scenario PRIVATE go2cpp_runtime)
+        target_compile_options(go2cpp_full_trace_scenario PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
+    # ---- 真实场景：100+ HTTP client 并发 → 锁顺序死锁 → Doctor 受控解锁 ----
+    # 需要 DebugServer（dump/事件环）与 Doctor（等待图/force-unlock）同时在线。
+    # **不注册 ctest**：ctest 用例总数保持 116 不变；端到端验收由
+    # tests/scenarios/deadlock_routes/run_deadlock_scenario.sh 从外部驱动。
+    if (GO2CPP_DEBUG_DUMP AND GO2CPP_DIAGNOSTIC)
+        add_executable(go2cpp_deadlock_routes
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/deadlock_routes/deadlock_routes_server.cpp)
+        target_link_libraries(go2cpp_deadlock_routes PRIVATE go2cpp_runtime)
+        target_compile_options(go2cpp_deadlock_routes PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
     add_test(NAME go2cpp_tests COMMAND go2cpp_tests)
     # 超时从 30 -> 60 -> 120：go2cpp_tests 是全部单元测试的集合。
     # 随调试模块陆续新增测试（debug_* 七个）后整体耗时约 18~30s，且**偶发**更高：

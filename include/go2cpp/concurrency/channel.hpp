@@ -924,7 +924,12 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   // 发送 value；阻塞直到接收者/缓冲可用、关闭或 context 取消。
   ChannelSendResult Send(T value, const ContextPtr& context = {}) {
     try {
-      return SendUntil(std::move(value), std::nullopt, context, false);
+      auto result = SendUntil(std::move(value), std::nullopt, context, false);
+      if (result.status == ChannelStatus::kReady) {
+        GO2CPP_DEBUG_EVENT_SAMPLED(
+            kChannelSendOk, GO2CPP_DEBUG_BOUND_TASK(), m_capacity, 32);
+      }
+      return result;
     } catch (...) {
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
@@ -947,7 +952,13 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   // 非阻塞发送；当前不能完成时返回 kWouldBlock。
   ChannelSendResult TrySend(T value) {
     try {
-      return SendUntil(std::move(value), std::chrono::steady_clock::now(), {}, true);
+      auto result =
+          SendUntil(std::move(value), std::chrono::steady_clock::now(), {}, true);
+      if (result.status == ChannelStatus::kReady) {
+        GO2CPP_DEBUG_EVENT_SAMPLED(
+            kChannelSendOk, GO2CPP_DEBUG_BOUND_TASK(), m_capacity, 32);
+      }
+      return result;
     } catch (...) {
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
@@ -956,7 +967,12 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   // 接收一个值；关闭后返回 kClosed 与零值/空 optional。
   ChannelRecvResult<T> Recv(const ContextPtr& context = {}) {
     try {
-      return RecvUntil(std::nullopt, context, false);
+      auto result = RecvUntil(std::nullopt, context, false);
+      if (result.status == ChannelStatus::kReady) {
+        GO2CPP_DEBUG_EVENT_SAMPLED(
+            kChannelRecvOk, GO2CPP_DEBUG_BOUND_TASK(), m_capacity, 32);
+      }
+      return result;
     } catch (...) {
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
               detail::ValueOperationError()};
@@ -979,7 +995,12 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   // 非阻塞接收；当前没有值且未关闭时返回 kWouldBlock。
   ChannelRecvResult<T> TryRecv() {
     try {
-      return RecvUntil(std::chrono::steady_clock::now(), {}, true);
+      auto result = RecvUntil(std::chrono::steady_clock::now(), {}, true);
+      if (result.status == ChannelStatus::kReady) {
+        GO2CPP_DEBUG_EVENT_SAMPLED(
+            kChannelRecvOk, GO2CPP_DEBUG_BOUND_TASK(), m_capacity, 32);
+      }
+      return result;
     } catch (...) {
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
               detail::ValueOperationError()};
@@ -1509,6 +1530,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     void NotifyIfParked() noexcept {
       if (!spin_wait || parked.load(std::memory_order_relaxed)) {
         GO2CPP_DEBUG_EVENT(kChannelWake, 0, 1);
+        // 外层优先：ParkingCondition::notify_one 内部的 kPCNotify 不会把
+        // 这次唤醒的语义改写成 kParkingCondition。
+        GO2CPP_DEBUG_WAKE_HINT(kChannelSend);
         cv.notify_one();
       }
     }
@@ -1569,6 +1593,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     void NotifyIfParked() noexcept {
       if (!spin_wait || parked.load(std::memory_order_relaxed)) {
         GO2CPP_DEBUG_EVENT(kChannelWake, 0, 2);
+        GO2CPP_DEBUG_WAKE_HINT(kChannelRecv);
         cv.notify_one();
       }
     }
@@ -2038,6 +2063,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
     // 发送方即将 park：只在阻塞路径记录（缓冲命中/立即交接无开销）。
+    GO2CPP_DEBUG_PARK_HINT(kChannelSend);
     GO2CPP_DEBUG_EVENT(kChannelSend, 0, m_capacity);
     CallbackGuard callback_guard{context};
     if (context) {
@@ -2264,6 +2290,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
               detail::ValueOperationError()};
     }
     // 接收方即将 park：只在阻塞路径记录（缓冲命中/立即交接无开销）。
+    GO2CPP_DEBUG_PARK_HINT(kChannelRecv);
     GO2CPP_DEBUG_EVENT(kChannelRecv, 0, m_capacity);
     CallbackGuard callback_guard{context};
     if (context) {

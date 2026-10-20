@@ -650,6 +650,54 @@ void TestMutexUnlock() {
                            std::chrono::milliseconds(3000)));
     GO2CPP_CHECK(!abandoned.DebugSnapshotInternal().held);
 
+    // 场景 C：owner 属于一个没有注册给 Doctor 的 Scheduler -> owner-unknown。
+    // 「查不到」不是「已死」：此时必须拒绝，不能把仍可能存活的临界区解锁。
+    go2cpp::sync::Mutex orphan;
+    auto orphan_owner = scheduler.spawn([&] {
+        GO2CPP_CHECK(orphan.Lock());
+        // 故意不 Unlock：owner G 结束后锁仍被它持有。
+    });
+    GO2CPP_CHECK(orphan_owner->wait_for(std::chrono::seconds(2)));
+    const auto orphan_snapshot = orphan.DebugSnapshotInternal();
+    GO2CPP_CHECK(orphan_snapshot.held);
+    GO2CPP_CHECK(orphan_snapshot.owner_gid != 0U);
+    SchedulerConfig other_config;
+    other_config.processor_count = 2;
+    other_config.min_workers = 2;
+    other_config.max_workers = 2;
+    Scheduler other(other_config);
+    other.start();
+    // 只注册一个**没有**该 owner G 的 Scheduler：单点查询查不到 owner。
+    agent.ResetRegistrations();
+    GO2CPP_CHECK(agent.RegisterScheduler("other", other));
+    GO2CPP_CHECK(agent.RegisterMutex("orphan", orphan));
+    std::atomic<bool> orphan_acquired{false};
+    other.spawn([&] {
+        if (orphan.Lock()) {
+            orphan_acquired.store(true);
+            orphan.Unlock();
+        }
+    });
+    GO2CPP_CHECK(WaitUntil(
+        [&] { return orphan.DebugSnapshotInternal().waiters > 0U; },
+        std::chrono::milliseconds(2000)));
+    GO2CPP_CHECK(harness.RoundTrip("mutex-unlock name=orphan", 4, &payload,
+                                   &kind));
+    GO2CPP_CHECK(kind == DiagnosticFrameKind::kError);
+    GO2CPP_CHECK(payload.find("owner-unknown") != std::string::npos);
+    GO2CPP_CHECK(orphan.DebugSnapshotInternal().held);
+    // 把 owner 所属的 Scheduler 重新注册回来：恢复 owner-gone 判定并解锁，
+    // 同时验证多 Scheduler 下「存活优先、终态次之」的聚合顺序。
+    GO2CPP_CHECK(agent.RegisterScheduler("scheduler", scheduler));
+    GO2CPP_CHECK(harness.RoundTrip("mutex-unlock name=orphan", 5, &payload,
+                                   &kind));
+    GO2CPP_CHECK(kind == DiagnosticFrameKind::kResponse);
+    GO2CPP_CHECK(payload.find("reason=owner-gone") != std::string::npos);
+    GO2CPP_CHECK(WaitUntil([&] { return orphan_acquired.load(); },
+                           std::chrono::milliseconds(3000)));
+    GO2CPP_CHECK(!orphan.DebugSnapshotInternal().held);
+    other.shutdown();
+
     // 未注册对象：拒绝。
     GO2CPP_CHECK(harness.RoundTrip("mutex-unlock name=missing", 3, &payload,
                                    &kind));

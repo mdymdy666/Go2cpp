@@ -2502,13 +2502,24 @@ DiagnosticCommandResult DiagnosticAgent::CmdDeadlockReport(
 DiagnosticCommandResult DiagnosticAgent::CmdMutexUnlock(
     const std::string& argument) {
     const Arguments arguments = ParseArguments(argument);
+    // `--force` 是裸参数；`force=1` 是等价长写法。两者都必须由调用方显式给出。
+    bool force = arguments.Get("force") == "1" ||
+                 arguments.Get("force") == "true" ||
+                 arguments.Get("force") == "yes";
     std::string name = arguments.Get("name");
-    if (name.empty()) {
-        name = arguments.Positional(0);
+    for (const std::string& positional : arguments.positional) {
+        if (positional == "--force") {
+            force = true;
+            continue;
+        }
+        if (name.empty() && positional.rfind("--", 0) != 0) {
+            name = positional;
+        }
     }
     if (name.empty()) {
         return Fail("bad-argument", "mutex-unlock requires name=<registered-mutex>");
     }
+    const std::string force_reason = arguments.Get("reason");
     sync::Mutex* mutex = nullptr;
     {
         std::lock_guard<std::mutex> lock(m_registry_mutex);
@@ -2524,6 +2535,107 @@ DiagnosticCommandResult DiagnosticAgent::CmdMutexUnlock(
     }
 
     const auto snapshot = mutex->DebugSnapshotInternal();
+
+    // ---- 受控强制路径（demo 级，默认拒绝）----
+    // 正常路径只在「owner 已明确终止」时解锁；--force 跳过 owner 存活证明，
+    // 直接把锁交给等待队列里的下一个 G。**这会破坏互斥语义**：被夺锁的
+    // owner 并不知道自己已经失去锁，之后仍可能访问临界区。因此强制要求：
+    //   1) 显式 --force；
+    //   2) 显式 reason（审计可追溯）；
+    //   3) 响应体与 stderr 都打印审计字段，并计入 stats().forced_unlocks。
+    if (force) {
+        if (force_reason.empty()) {
+            return Fail("bad-argument",
+                        "mutex-unlock --force requires reason=<text>");
+        }
+        if (!snapshot.held) {
+            return Fail("refused",
+                        "not-locked: mutex is not currently held");
+        }
+        // **先自增审计计数、再 Unlock**：被唤醒的等待者可能在 Unlock 返回前
+        // 就跑完临界区并检查「是否被强制夺锁」；若计数在 Unlock 之后才加，
+        // 协作方会观测不到这次强制解锁，从而错误地再次 Unlock()。
+        m_forced_unlocks.fetch_add(1, std::memory_order_relaxed);
+        bool unlocked = false;
+        std::string unlock_error;
+        try {
+            mutex->Unlock();
+            unlocked = true;
+        } catch (const std::exception& exception) {
+            unlock_error = exception.what();
+        } catch (...) {
+            unlock_error = "unknown-exception";
+        }
+        if (!unlocked) {
+            m_forced_unlocks.fetch_sub(1, std::memory_order_relaxed);
+            return Fail("refused", "unlock-failed: " + unlock_error);
+        }
+        const auto after = mutex->DebugSnapshotInternal();
+        const std::uint64_t forced_total =
+            m_forced_unlocks.load(std::memory_order_relaxed);
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_EVENT(kDiagnosticMutexUnlock, snapshot.owner_gid,
+                           static_cast<std::uint64_t>(snapshot.waiters));
+#endif
+        // 审计走 stderr：被测进程的 stdout 是场景的阶段输出，不能被污染。
+        std::fprintf(stderr,
+                     "[go2cpp][doctor][audit] mutex-unlock --force name=%s "
+                     "reason=%s owner_gid=%llu owner_known=%s "
+                     "waiters_before=%zu waiters_after=%zu held_after=%s "
+                     "forced_total=%llu\n",
+                     name.c_str(), force_reason.c_str(),
+                     static_cast<unsigned long long>(snapshot.owner_gid),
+                     snapshot.owner_known ? "true" : "false", snapshot.waiters,
+                     after.waiters, after.held ? "true" : "false",
+                     static_cast<unsigned long long>(forced_total));
+
+        DiagnosticCommandResult result;
+        result.ok = true;
+        const bool want_json = arguments.Get("format") == "json" ||
+                               arguments.Get("json") == "1";
+        result.json = want_json;
+        if (want_json) {
+            Json root = Json::object();
+            root["schema"] = "go2cpp.diagnostic.mutex-unlock/1";
+            root["version"] = 1;
+            root["name"] = name;
+            root["verdict"] = "forced";
+            root["audit"] = true;
+            root["force"] = true;
+            root["reason"] = force_reason;
+            root["owner_gid"] =
+                static_cast<std::int64_t>(snapshot.owner_gid);
+            root["owner_known"] = snapshot.owner_known;
+            root["waiters_before"] =
+                static_cast<std::int64_t>(snapshot.waiters);
+            root["waiters_after"] = static_cast<std::int64_t>(after.waiters);
+            root["held_after"] = after.held;
+            root["forced_total"] = static_cast<std::int64_t>(forced_total);
+            result.payload = JsonText(root);
+        } else {
+            result.payload = "schema=go2cpp.diagnostic.mutex-unlock/1\n";
+            result.payload += "name=" + name + "\n";
+            result.payload += "verdict=forced\n";
+            result.payload += "audit=true\n";
+            result.payload += "force=true\n";
+            result.payload += "reason=" + force_reason + "\n";
+            result.payload +=
+                "owner_gid=" + std::to_string(snapshot.owner_gid) + "\n";
+            result.payload +=
+                "owner_known=" + std::string(BoolText(snapshot.owner_known)) +
+                "\n";
+            result.payload +=
+                "waiters_before=" + std::to_string(snapshot.waiters) + "\n";
+            result.payload +=
+                "waiters_after=" + std::to_string(after.waiters) + "\n";
+            result.payload +=
+                "held_after=" + std::string(BoolText(after.held)) + "\n";
+            result.payload +=
+                "forced_total=" + std::to_string(forced_total) + "\n";
+        }
+        return result;
+    }
+
     if (!snapshot.held) {
         return Fail("refused", "not-locked: mutex is not currently held");
     }
@@ -2536,49 +2648,49 @@ DiagnosticCommandResult DiagnosticAgent::CmdMutexUnlock(
                     "cannot prove the critical section is abandoned");
     }
 
-    // 在所有已注册 Scheduler 的活动 G 里查 owner。
+    // 按 gid **单点查询** owner 状态：每个已注册 Scheduler 只查自己
+    // 对应分片里的一条记录，不枚举全量任务表。
     //
-    // 判定必须区分三态，而不是二态（找到存活 / 没找到）：
-    //   - 找到且状态存活        -> refused owner-alive；
-    //   - 找到且状态明确终止    -> owner-gone，允许解锁；
-    //   - 一个都没找到          -> owner **不可知**（owner 可能属于一个没有
-    //     注册到 Doctor 的 Scheduler），**不能**当作 owner-gone。
+    // 为什么不再用 DebugSnapshotTasks()：对外快照只返回非终态 G（终态 G
+    // 会滞留注册表直到回收，全量枚举会让长跑进程的 tasks 线性膨胀到数十
+    // 万条）。拿它反查 owner 会让「已终止、尚未回收」的 owner 从快照里
+    // 凭空消失，把 owner-gone 误判成 owner-unknown。
     //
-    // 最后一态正是 P1-1 的缺陷来源：部分注册 Scheduler 是常见用法，
-    // 「注册表里没有」不等于「进程里没有」。误判会把仍然存活的 owner
-    // 正在执行的临界区强行解锁，造成两个执行流同时进入临界区。
-    bool owner_found = false;
-    bool owner_alive = false;
-    GState owner_state = GState::kDead;
+    // 判定仍必须是三态，而不是二态（找到存活 / 没找到）：
+    //   - 任一已注册 Scheduler 报告存活 -> refused owner-alive；
+    //   - 任一已注册 Scheduler 报告终态 -> owner-gone，允许解锁；
+    //   - 所有已注册 Scheduler 都查不到 -> owner **不可知**（owner 可能
+    //     属于一个没有注册到 Doctor 的 Scheduler），**不能**当作
+    //     owner-gone。误判会把仍然存活的 owner 正在执行的临界区强行
+    //     解锁，造成两个执行流同时进入临界区。
     std::vector<std::pair<std::string, Scheduler*>> schedulers;
     {
         std::lock_guard<std::mutex> lock(m_registry_mutex);
         schedulers = m_schedulers;
     }
+    bool owner_alive = false;
     for (const auto& entry : schedulers) {
         if (entry.second == nullptr) {
             continue;
         }
-        for (const auto& task : entry.second->DebugSnapshotTasks()) {
-            if (task.id != snapshot.owner_gid) {
+        // gid 只在单个 Scheduler 内唯一：只要任一注册的 Scheduler 说它
+        // 还活着，就绝不允许解锁（存活优先于任何终态报告）。
+        if (entry.second->IsTaskAlive(snapshot.owner_gid)) {
+            owner_alive = true;
+            break;
+        }
+    }
+    TaskTerminalState owner_terminal = TaskTerminalState::kUnknown;
+    if (!owner_alive) {
+        for (const auto& entry : schedulers) {
+            if (entry.second == nullptr) {
                 continue;
             }
-            owner_found = true;
-            switch (task.state) {
-                case GState::kNew:
-                case GState::kRunnable:
-                case GState::kRunning:
-                case GState::kWaiting:
-                    owner_alive = true;
-                    owner_state = task.state;
-                    break;
-                default:
-                    // 只在没有观察到存活状态时记录终止状态，避免
-                    // 「先看到 kDead 再看到 kWaiting」时把存活误报成已死。
-                    if (!owner_alive) {
-                        owner_state = task.state;
-                    }
-                    break;
+            const TaskTerminalState state =
+                entry.second->TaskTerminal(snapshot.owner_gid);
+            if (state != TaskTerminalState::kUnknown) {
+                owner_terminal = state;
+                break;
             }
         }
     }
@@ -2586,11 +2698,10 @@ DiagnosticCommandResult DiagnosticAgent::CmdMutexUnlock(
         return Fail("refused",
                     "owner-alive: owner gid " +
                         std::to_string(snapshot.owner_gid) +
-                        " is still a live G (state=" +
-                        GStateNameStable(owner_state) +
-                        "); force-unlock would corrupt the mutex");
+                        " is still a live G; force-unlock would corrupt "
+                        "the mutex");
     }
-    if (!owner_found) {
+    if (owner_terminal == TaskTerminalState::kUnknown) {
         // 「不可知」不是「已死」。只有 owner 在某个已注册 Scheduler 的
         // 任务表里出现并处于终止状态，才有资格说临界区不可能再被访问。
         return Fail("refused",
@@ -2599,6 +2710,14 @@ DiagnosticCommandResult DiagnosticAgent::CmdMutexUnlock(
                         " is not present in any registered Scheduler; an "
                         "unregistered Scheduler may still own this mutex, so "
                         "the critical section cannot be proven abandoned");
+    }
+
+    // owner_state 只用于响应字段，沿用既有 GState 名称（dead/failed/cancelled）。
+    GState owner_state = GState::kDead;
+    if (owner_terminal == TaskTerminalState::kFailed) {
+        owner_state = GState::kFailed;
+    } else if (owner_terminal == TaskTerminalState::kCancelled) {
+        owner_state = GState::kCancelled;
     }
 
     // owner 在已注册 Scheduler 中被明确观察到已终止：临界区不可能再被访问，
@@ -2758,6 +2877,8 @@ DiagnosticCommandResult DiagnosticAgent::CmdStats(const std::string& argument) {
             static_cast<std::int64_t>(snapshot.deadlock_events);
         root["auto_force_wakes"] =
             static_cast<std::int64_t>(snapshot.auto_force_wakes);
+        root["forced_unlocks"] =
+            static_cast<std::int64_t>(snapshot.forced_unlocks);
         root["fiber_jobs"] = static_cast<std::int64_t>(snapshot.fiber_jobs);
         root["fiber_failures"] =
             static_cast<std::int64_t>(snapshot.fiber_failures);
@@ -2782,6 +2903,8 @@ DiagnosticCommandResult DiagnosticAgent::CmdStats(const std::string& argument) {
                           std::to_string(snapshot.deadlock_events) + "\n";
         result.payload += "auto_force_wakes=" +
                           std::to_string(snapshot.auto_force_wakes) + "\n";
+        result.payload += "forced_unlocks=" +
+                          std::to_string(snapshot.forced_unlocks) + "\n";
         result.payload += "fiber_jobs=" +
                           std::to_string(snapshot.fiber_jobs) + "\n";
         result.payload += "fiber_failures=" +
@@ -3036,6 +3159,8 @@ DiagnosticAgentStats DiagnosticAgent::stats() const {
         m_deadlock_events.load(std::memory_order_relaxed);
     snapshot.auto_force_wakes =
         m_auto_force_wakes.load(std::memory_order_relaxed);
+    snapshot.forced_unlocks =
+        m_forced_unlocks.load(std::memory_order_relaxed);
     snapshot.fiber_jobs = m_fiber_jobs.load(std::memory_order_relaxed);
     snapshot.fiber_failures =
         m_fiber_failures.load(std::memory_order_relaxed);
@@ -3059,6 +3184,10 @@ std::string DiagnosticAgent::HelpText() {
         "  force-wake scope=scheduler-idle|parking-condition|channel|all\n"
         "  deadlock-report [json]             wait-for graph + verdict\n"
         "  mutex-unlock name=<registered>     controlled unlock (owner-gone only)\n"
+        "  mutex-unlock name=<registered> --force reason=<text>\n"
+        "                                    DANGEROUS: skip the owner-gone\n"
+        "                                    proof and Unlock() anyway; audited\n"
+        "                                    on stderr + response fields\n"
         "  inject-fiber fn=<registered> [timeout_ms=N]\n"
         "  ping | stats [json] | help\n"
         "frame: magic=G2CD version=1 header=24 bytes, checksum=FNV-1a/32\n"

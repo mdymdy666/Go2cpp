@@ -577,6 +577,8 @@ public:
             if (repeat_callback) {
                 decision = repeat_callback(context);
             } else if (executor) {
+                GO2CPP_DEBUG_EVENT(kTimerCallback, state->m_source_gid,
+                                   state->m_timer_id);
                 if (!executor->Submit(std::move(callback))) {
                     throw std::runtime_error("timer executor rejected callback");
                 }
@@ -1210,6 +1212,7 @@ Timer TimerService::ScheduleEveryOn(
     const auto repeat_callback =
         [callback = std::move(callback), executor = std::move(executor)](
             const TimerContext&) {
+            GO2CPP_DEBUG_EVENT(kTimerCallback, 0, 0);
             if (!executor->Submit(callback)) {
                 throw std::runtime_error("timer executor rejected callback");
             }

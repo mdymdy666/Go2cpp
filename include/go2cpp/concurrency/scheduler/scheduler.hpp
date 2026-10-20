@@ -93,6 +93,22 @@ enum class GState : std::uint8_t {
     Failed = kFailed,
 };
 
+/**
+ * @brief 按 gid 查询到的 G 终态分类（Scheduler::TaskTerminal() 的返回值）。
+ * @details 只为「单点查一个 G 是否仍是活的 / 以什么终态结束」提供稳定答案：
+ *          - kUnknown：该 gid 不在当前调度器注册表里。**不能**当作「已终止」
+ *            ——既可能是从未存在，也可能是终态条目已被回收；
+ *          - kCompleted / kFailed / kCancelled：分别对应正常的 kDead、
+ *            异常失败、取消三种终态。
+ *          与 GState 分开，是为了避免调用方把「查不到」误读成某个状态。
+ */
+enum class TaskTerminalState : std::uint8_t {
+    kUnknown,
+    kCompleted,
+    kFailed,
+    kCancelled,
+};
+
 /** @brief GMP 模型中 M（工作线程）状态。 */
 enum class MState : std::uint8_t {
     kIdle,
@@ -784,6 +800,28 @@ public:
      */
     std::vector<TaskSnapshot> DebugSnapshotTasks() const;
 
+    /**
+     * @brief 按 gid 查该 G 是否仍在注册表中且**非终态**。
+     * @details 只锁 id 按位与「分片数 - 1」对应的单个分片扫描，不枚举全量
+     *          注册表；开销与进程历史任务数无关。DebugSnapshotTasks()
+     *          返回的是全量存活快照，长跑进程下会有明显开销。
+     * @return true 表示注册表里存在该 gid 且尚未进入终态；false 表示
+     *         「已终态」或「不在注册表」，需要区分时用 TaskTerminal()。
+     * @note 只读观测接口，不改变任何调度状态。
+     */
+    bool IsTaskAlive(GId id) const;
+
+    /**
+     * @brief 按 gid 查该 G 的终态分类（同样只查单个分片）。
+     * @details 终态条目可能滞留注册表直到被回收，因此「已终止但未回收」的 G
+     *          仍能查到具体终态；一旦被回收就变成 kUnknown。
+     * @return kCompleted / kFailed / kCancelled；该 gid 不在注册表、
+     *         或仍处于活动状态时返回 kUnknown（活动状态请配合
+     *         IsTaskAlive() 判定）。
+     * @note 只读观测接口；kUnknown **不等于**「已终止」。
+     */
+    TaskTerminalState TaskTerminal(GId id) const;
+
     // ---------------------------------------------------------------------
     // Doctor 的最小受控唤醒接口（不改变默认调度行为）
     // ---------------------------------------------------------------------
@@ -906,6 +944,7 @@ using Scheduler = scheduler::Scheduler;
 using SchedulerConfig = scheduler::SchedulerConfig;
 using Task = scheduler::Task;
 using GState = scheduler::GState;
+using TaskTerminalState = scheduler::TaskTerminalState;
 using MState = scheduler::MState;
 using PState = scheduler::PState;
 using GId = scheduler::GId;

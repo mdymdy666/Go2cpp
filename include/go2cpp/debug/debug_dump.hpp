@@ -220,6 +220,36 @@ DumpPayload DumpEvents(std::size_t max = 0);
 /// 运行时信息：pid、构建开关、线程数、事件环线程数。
 DumpPayload DumpRuntimeInfo();
 
+// ---------------------------------------------------------------------------
+// Agent 可读视图（JSON 优先；字段稳定）
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief 视图名是否合法：`gmp` / `timeline` / `sched` / `park` / `timer` /
+ *        `primitives`（稳定；新增只能追加）。
+ */
+bool IsKnownViewName(std::string_view name) noexcept;
+
+/**
+ * @brief 构建一个 JSON 视图。
+ *
+ * @param name 视图名（大小写敏感；见 IsKnownViewName）。
+ * @param gid `timeline` 必填的目标 G；其它视图忽略。
+ * @param scheduler_json 已采集的 `JSON scheduler` payload（空表示未注册）。
+ * @param timer_json 已采集的 `JSON timer` payload（空表示未注册）。
+ * @param io_json 已采集的 `JSON io` payload（空表示未注册）。
+ * @return 一行 JSON（以换行结尾）。未知视图/缺少 gid 时返回
+ *         `{"schema":"go2cpp.dump.view.error/1","ok":false,...}`。
+ *
+ * @note 只读取 `EventRing::Snapshot()` 与传入的 JSON；不调用会改变运行时
+ *       状态的接口。窗口截断由 `window.truncated` / `window.gaps` 标注，
+ *       进程级累计次数见 `totals`。
+ */
+std::string BuildViewJson(std::string_view name, std::uint64_t gid,
+                          const std::string& scheduler_json = {},
+                          const std::string& timer_json = {},
+                          const std::string& io_json = {});
+
 /// 把 payload 写成文件（原子替换：先写 `.tmp` 再 rename）。
 bool WriteDumpFile(const std::string& path, const DumpPayload& payload,
                    bool json, std::string* error);

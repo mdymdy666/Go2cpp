@@ -654,6 +654,8 @@ int RunDumpImpl(const std::vector<std::string>& args) {
             {"--pid", "PID", "目标进程 pid", true},
             {"--out", "FILE", "输出文件，默认 -（stdout）"},
             {"--sections", "LIST", "all|goroutines|scheduler|locks|组件名"},
+            {"--view", "NAME", "gmp|timeline|sched|park|timer|primitives"},
+            {"--gid", "GID", "timeline 视图的目标 G"},
             {"--format", "FMT", "json 或 text，默认 json"},
             {"--timeout-ms", "N", "总超时毫秒，默认 5000"},
         },
@@ -676,6 +678,59 @@ int RunDumpImpl(const std::vector<std::string>& args) {
 
     DebugClient client(ResolveDebugTarget(pid, timeout_ms));
     std::string content;
+
+    // 视图模式：一条 `VIEW <name> [gid]` 请求，服务端返回结构化 JSON。
+    const std::string view = parsed.Get("--view");
+    if (!view.empty()) {
+        static const std::vector<std::string> kKnownViews = {
+            "gmp", "timeline", "sched", "park", "timer", "primitives"};
+        if (parsed.Has("--sections")) {
+            throw CliError(ExitCode::kUsage,
+                           "选项 '--view' 与 '--sections' 不能同时使用");
+        }
+        if (!as_json) {
+            throw CliError(ExitCode::kUsage,
+                           "选项 '--view' 只输出 JSON；不要与 '--format text' 同时使用");
+        }
+        if (std::find(kKnownViews.begin(), kKnownViews.end(), view) ==
+            kKnownViews.end()) {
+            throw CliError(ExitCode::kUsage,
+                           "未知视图 '" + view +
+                               "'；可选 gmp/timeline/sched/park/timer/primitives");
+        }
+        std::uint64_t gid = 0;
+        if (parsed.Has("--gid")) {
+            gid = static_cast<std::uint64_t>(
+                ParseIntOption(parsed.Get("--gid"), "--gid", 0, 2147483647));
+        }
+        if (view == "timeline" && gid == 0) {
+            throw CliError(ExitCode::kUsage,
+                           "timeline 视图需要 --gid <GID>");
+        }
+        std::string command = "VIEW " + view;
+        if (gid != 0) {
+            command += " " + std::to_string(gid);
+        }
+        try {
+            const DebugReply reply = client.Call(command);
+            content = RenderJson(ParseJsonPayload(reply.payload, "VIEW JSON"));
+        } catch (const DebugError& error) {
+            if (error.remote_code() == "unknown-view") {
+                throw CliError(
+                    ExitCode::kUnavailable,
+                    "目标进程不支持视图 '" + view +
+                        "'；请确认它以 GO2CPP_DEBUG_DUMP=ON 构建并运行当前版本。");
+            }
+            if (error.remote_code() == "bad-command") {
+                throw CliError(ExitCode::kUsage,
+                               "视图请求被拒绝：" + std::string(error.what()) +
+                                   "\n  提示：timeline 需要 --gid <GID>。");
+            }
+            throw;
+        }
+        WriteOutput(parsed.GetOr("--out", "-"), content);
+        return 0;
+    }
 
     if (selection.all) {
         const DebugReply reply = client.Call(as_json ? "JSON ALL" : "DUMP ALL");

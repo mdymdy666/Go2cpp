@@ -24,6 +24,7 @@
  * 重新获取，但**谓词判断永远在持锁状态下进行**，否则会出现丢失唤醒。
  */
 #include "go2cpp/core/parking_condition.hpp"
+#include "go2cpp/debug/debug_event_ring.hpp"
 
 #include "go2cpp/concurrency/core/futex_mutex.hpp"
 
@@ -389,6 +390,10 @@ public:
     Result WaitManaged() {
         Scheduler* const scheduler = m_scheduler;
         const auto task = m_task;
+        // 原语提示：外层（channel/mutex）已设置时不会被覆盖。
+        GO2CPP_DEBUG_PARK_HINT(kParkingCondition);
+        GO2CPP_DEBUG_EVENT_SAMPLED(
+            kPCWait, task ? task->id() : 0, 0, 16);
         for (;;) {
             // Notify 可能在当前 G 进入 park 前完成。终态已经通过
             // WaitNode::Finish 发布时，直接返回可跳过 Scheduler admission
@@ -528,6 +533,8 @@ void ParkingCondition::notify_one() noexcept {
         }
     }
     if (selected) {
+        GO2CPP_DEBUG_EVENT(kPCNotify, selected->gid(), 0);
+        GO2CPP_DEBUG_WAKE_HINT(kParkingCondition);
         selected->Wake();
     }
 }
@@ -569,6 +576,9 @@ void ParkingCondition::notify_all() noexcept {
 #if defined(__linux__)
     broadcast = native_notified != 0 && FutexWaitvEnabled();
 #endif
+    GO2CPP_DEBUG_EVENT(kPCNotifyAll, 0,
+                       static_cast<std::uint64_t>(waiters.size()));
+    GO2CPP_DEBUG_WAKE_HINT(kParkingCondition);
     for (const auto& node : waiters) {
         if (node->result() != WaitNode::Result::kNotified) {
             continue;

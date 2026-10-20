@@ -70,6 +70,33 @@ Table& GetTable() {
 thread_local ThreadRing t_ring;
 /// 当前线程已发布的 P；未绑定为 kInvalidProcessorId。
 thread_local std::uint32_t t_processor_id = kInvalidProcessorId;
+/// 当前线程正在执行的 G（0=未绑定）。
+thread_local std::uint64_t t_bound_task = 0;
+
+/// 原语提示槽（park / wake 各一）：0 表示未设置。
+struct HintSlot {
+    std::uint16_t reason{0};
+    std::uint64_t context{0};
+};
+thread_local HintSlot t_park_hint;
+thread_local HintSlot t_wake_hint;
+/// 采样计数器（按事件码低 8 位索引；只在本线程读写）。
+thread_local std::uint32_t t_sample_counters[256] = {};
+
+/// 进程级累计事件计数（按事件码）。堆上常驻，避免静态析构顺序问题。
+struct EventTotals {
+    std::atomic<std::uint64_t> codes[256];
+    EventTotals() {
+        for (auto& counter : codes) {
+            counter.store(0, std::memory_order_relaxed);
+        }
+    }
+};
+
+EventTotals& GetTotals() {
+    static EventTotals* totals = new EventTotals();
+    return *totals;
+}
 
 /**
  * 全局单调 seq：本轮起跨线程唯一。
@@ -168,6 +195,16 @@ void CollectSegment(const SegmentT& segment, std::size_t capacity,
 
 #endif  // GO2CPP_DEBUG_DUMP
 
+/// wake 事件码判定：ON/OFF 构建都需要（JSON 导出在 OFF 构建也编译）。
+/// 只读枚举值、无副作用，放在 #if 外避免 OFF 构建未定义。
+bool IsWakeCodeValue(std::uint32_t value) noexcept {
+    return value == static_cast<std::uint32_t>(SchedEventCode::kWakeEnqueued) ||
+           value == static_cast<std::uint32_t>(SchedEventCode::kWakePending) ||
+           value == static_cast<std::uint32_t>(SchedEventCode::kWakeRejected) ||
+           value == static_cast<std::uint32_t>(SchedEventCode::kWakeBatch);
+}
+
+
 std::string JsonString(const std::string& value) {
     std::string out;
     out.reserve(value.size() + 2);
@@ -186,6 +223,106 @@ std::string JsonString(const std::string& value) {
     return out;
 }
 
+/// 追加进程级累计计数（DumpText 用；键名稳定）。
+void AppendTotalCountersText(std::string& out) {
+    struct Entry {
+        const char* key;
+        SchedEventCode code;
+    };
+    static const Entry kEntries[] = {
+        {"total_events", SchedEventCode::kUnknown},
+        {"park_total", SchedEventCode::kParkEnter},
+        {"park_return_total", SchedEventCode::kParkReturn},
+        {"park_rejected_total", SchedEventCode::kParkRejected},
+        {"wake_total", SchedEventCode::kWakeEnqueued},
+        {"wake_pending_total", SchedEventCode::kWakePending},
+        {"wake_rejected_total", SchedEventCode::kWakeRejected},
+        {"enqueue_total", SchedEventCode::kEnqueue},
+        {"enqueue_rejected_total", SchedEventCode::kEnqueueRejected},
+        {"claim_ok_total", SchedEventCode::kRunQueueClaimOk},
+        {"claim_fail_total", SchedEventCode::kRunQueueClaimFail},
+        {"steal_ok_total", SchedEventCode::kStealOk},
+        {"mutex_lock_total", SchedEventCode::kMutexLock},
+        {"mutex_unlock_total", SchedEventCode::kMutexUnlock},
+        {"mutex_fast_total", SchedEventCode::kMutexFastLock},
+        {"channel_send_block_total", SchedEventCode::kChannelSend},
+        {"channel_recv_block_total", SchedEventCode::kChannelRecv},
+        {"channel_send_ok_total", SchedEventCode::kChannelSendOk},
+        {"channel_recv_ok_total", SchedEventCode::kChannelRecvOk},
+        {"channel_select_total", SchedEventCode::kChannelSelect},
+        {"pc_wait_total", SchedEventCode::kPCWait},
+        {"pc_notify_total", SchedEventCode::kPCNotify},
+        {"timer_callback_total", SchedEventCode::kTimerCallback},
+        {"timer_enqueue_total", SchedEventCode::kTimerEnqueue},
+        {"g_created_total", SchedEventCode::kGCreated},
+        {"g_started_total", SchedEventCode::kGStarted},
+        {"g_completed_total", SchedEventCode::kGCompleted},
+        {"g_failed_total", SchedEventCode::kGFailed},
+        {"g_cancelled_total", SchedEventCode::kGCancelled},
+    };
+    for (const auto& entry : kEntries) {
+        const std::uint64_t value =
+            entry.code == SchedEventCode::kUnknown
+                ? EventRing::TotalCountAll()
+                : EventRing::TotalCount(entry.code);
+        out += std::string(entry.key) + "=" + std::to_string(value) + "\n";
+    }
+}
+
+/// 进程级累计计数（JSON 对象；键名与文本版一致）。
+std::string TotalCountersJson() {
+    struct Entry {
+        const char* key;
+        SchedEventCode code;
+    };
+    static const Entry kEntries[] = {
+        {"total_events", SchedEventCode::kUnknown},
+        {"park_total", SchedEventCode::kParkEnter},
+        {"park_return_total", SchedEventCode::kParkReturn},
+        {"park_rejected_total", SchedEventCode::kParkRejected},
+        {"wake_total", SchedEventCode::kWakeEnqueued},
+        {"wake_pending_total", SchedEventCode::kWakePending},
+        {"wake_rejected_total", SchedEventCode::kWakeRejected},
+        {"enqueue_total", SchedEventCode::kEnqueue},
+        {"enqueue_rejected_total", SchedEventCode::kEnqueueRejected},
+        {"claim_ok_total", SchedEventCode::kRunQueueClaimOk},
+        {"claim_fail_total", SchedEventCode::kRunQueueClaimFail},
+        {"steal_ok_total", SchedEventCode::kStealOk},
+        {"mutex_lock_total", SchedEventCode::kMutexLock},
+        {"mutex_unlock_total", SchedEventCode::kMutexUnlock},
+        {"mutex_fast_total", SchedEventCode::kMutexFastLock},
+        {"channel_send_block_total", SchedEventCode::kChannelSend},
+        {"channel_recv_block_total", SchedEventCode::kChannelRecv},
+        {"channel_send_ok_total", SchedEventCode::kChannelSendOk},
+        {"channel_recv_ok_total", SchedEventCode::kChannelRecvOk},
+        {"channel_select_total", SchedEventCode::kChannelSelect},
+        {"pc_wait_total", SchedEventCode::kPCWait},
+        {"pc_notify_total", SchedEventCode::kPCNotify},
+        {"timer_callback_total", SchedEventCode::kTimerCallback},
+        {"timer_enqueue_total", SchedEventCode::kTimerEnqueue},
+        {"g_created_total", SchedEventCode::kGCreated},
+        {"g_started_total", SchedEventCode::kGStarted},
+        {"g_completed_total", SchedEventCode::kGCompleted},
+        {"g_failed_total", SchedEventCode::kGFailed},
+        {"g_cancelled_total", SchedEventCode::kGCancelled},
+    };
+    std::string out = "{";
+    bool first = true;
+    for (const auto& entry : kEntries) {
+        if (!first) {
+            out += ',';
+        }
+        first = false;
+        const std::uint64_t value =
+            entry.code == SchedEventCode::kUnknown
+                ? EventRing::TotalCountAll()
+                : EventRing::TotalCount(entry.code);
+        out += std::string("\"") + entry.key + "\":" + std::to_string(value);
+    }
+    out += '}';
+    return out;
+}
+
 /// 统计事件中的关键/普通条数（Dump 用）。
 void CountBySegment(const std::vector<EventRecord>& events,
                     std::size_t* critical, std::size_t* normal) {
@@ -200,6 +337,25 @@ void CountBySegment(const std::vector<EventRecord>& events,
 }
 
 }  // namespace
+
+const char* PrimitiveReasonName(PrimitiveReasonCode reason) noexcept {
+    switch (reason) {
+        case PrimitiveReasonCode::kUnknown: return "kUnknown";
+        case PrimitiveReasonCode::kYield: return "kYield";
+        case PrimitiveReasonCode::kChannelSend: return "kChannelSend";
+        case PrimitiveReasonCode::kChannelRecv: return "kChannelRecv";
+        case PrimitiveReasonCode::kSelect: return "kSelect";
+        case PrimitiveReasonCode::kMutex: return "kMutex";
+        case PrimitiveReasonCode::kParkingCondition: return "kParkingCondition";
+        case PrimitiveReasonCode::kIo: return "kIo";
+        case PrimitiveReasonCode::kTimer: return "kTimer";
+        case PrimitiveReasonCode::kFuture: return "kFuture";
+        case PrimitiveReasonCode::kScheduler: return "kScheduler";
+        case PrimitiveReasonCode::kWait: return "kWait";
+        case PrimitiveReasonCode::kShutdown: return "kShutdown";
+    }
+    return "kUnknown";
+}
 
 const char* SchedEventCodeName(SchedEventCode code) noexcept {
     switch (code) {
@@ -242,6 +398,28 @@ const char* SchedEventCodeName(SchedEventCode code) noexcept {
         case SchedEventCode::kTimerFire: return "kTimerFire";
         case SchedEventCode::kTimerCancel: return "kTimerCancel";
         case SchedEventCode::kTimerReschedule: return "kTimerReschedule";
+        case SchedEventCode::kGCreated: return "kGCreated";
+        case SchedEventCode::kGStarted: return "kGStarted";
+        case SchedEventCode::kGResumed: return "kGResumed";
+        case SchedEventCode::kGCompleted: return "kGCompleted";
+        case SchedEventCode::kGFailed: return "kGFailed";
+        case SchedEventCode::kGCancelled: return "kGCancelled";
+        case SchedEventCode::kStealOk: return "kStealOk";
+        case SchedEventCode::kStealFail: return "kStealFail";
+        case SchedEventCode::kWorkerPark: return "kWorkerPark";
+        case SchedEventCode::kWorkerUnpark: return "kWorkerUnpark";
+        case SchedEventCode::kSysmonPass: return "kSysmonPass";
+        case SchedEventCode::kTimerEnqueue: return "kTimerEnqueue";
+        case SchedEventCode::kMutexFastLock: return "kMutexFastLock";
+        case SchedEventCode::kChannelSendOk: return "kChannelSendOk";
+        case SchedEventCode::kChannelRecvOk: return "kChannelRecvOk";
+        case SchedEventCode::kChannelSelectEnter:
+            return "kChannelSelectEnter";
+        case SchedEventCode::kChannelSelect: return "kChannelSelect";
+        case SchedEventCode::kPCWait: return "kPCWait";
+        case SchedEventCode::kPCNotify: return "kPCNotify";
+        case SchedEventCode::kPCNotifyAll: return "kPCNotifyAll";
+        case SchedEventCode::kTimerCallback: return "kTimerCallback";
     }
     return "kUnknown";
 }
@@ -258,6 +436,11 @@ bool SchedEventCodeIsCritical(SchedEventCode code) noexcept {
         case SchedEventCode::kEnqueueRejected:
         case SchedEventCode::kRunQueueClaimFail:
         case SchedEventCode::kParkRejected:
+        // Doctor 的受控干预是低频且必须可追溯的事件。
+        // G 终态：每个 G 只发生一次，是生命周期回溯的锚点。
+        case SchedEventCode::kGCompleted:
+        case SchedEventCode::kGFailed:
+        case SchedEventCode::kGCancelled:
         // Doctor 的受控干预是低频且必须可追溯的事件。
         case SchedEventCode::kDiagnosticSuspected:
         case SchedEventCode::kDiagnosticForceWake:
@@ -292,6 +475,17 @@ void EventRing::Record(SchedEventCode code, std::uint64_t gid,
     record.code = static_cast<std::uint32_t>(code);
     record.tid = t_ring.tid.load(std::memory_order_relaxed);
     record.pid = t_processor_id;
+    // 累计计数：环形窗口会被覆盖，覆盖率报告用进程级总量。
+    const std::uint32_t code_value = static_cast<std::uint32_t>(code);
+    GetTotals().codes[code_value & 0xFFU].fetch_add(
+        1, std::memory_order_relaxed);
+    // park/wake 事件带上当前线程的原语原因（RAII 作用域写入）。
+    if (code == SchedEventCode::kParkEnter) {
+        record.arg3 = t_park_hint.reason;
+        record.arg4 = t_park_hint.context;
+    } else if (IsWakeCodeValue(code_value)) {
+        record.arg3 = t_wake_hint.reason;
+    }
     if (SchedEventCodeIsCritical(code)) {
         WriteSlot(t_ring.critical, record, kCriticalSlots);
     } else {
@@ -321,6 +515,8 @@ void EventRing::RecordTimer(SchedEventCode code, std::uint64_t timer_id,
     record.pid = t_processor_id;
     record.arg3 = kind;
     record.arg4 = source_gid;
+    GetTotals().codes[static_cast<std::uint32_t>(code) & 0xFFU].fetch_add(
+        1, std::memory_order_relaxed);
     // timer 事件走普通区：10k 级 arm 压测不应挤掉关键区里的 wake 线索。
     WriteSlot(t_ring.normal, record, kNormalSlots);
 #else
@@ -329,6 +525,93 @@ void EventRing::RecordTimer(SchedEventCode code, std::uint64_t timer_id,
     (void)deadline_ns;
     (void)kind;
     (void)source_gid;
+#endif
+}
+
+PrimitiveHintScope::PrimitiveHintScope(bool wake_hint,
+                                       PrimitiveReasonCode reason,
+                                       std::uint64_t context) noexcept
+    : m_wake_hint(wake_hint) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    HintSlot& slot = m_wake_hint ? t_wake_hint : t_park_hint;
+    // 外层优先：已有一个未退出的原因作用域时不覆盖。
+    if (slot.reason == 0) {
+        m_active = true;
+        m_prior_reason = static_cast<PrimitiveReasonCode>(slot.reason);
+        m_prior_context = slot.context;
+        slot.reason = static_cast<std::uint16_t>(reason);
+        slot.context = context;
+    }
+#else
+    (void)reason;
+    (void)context;
+#endif
+}
+
+PrimitiveHintScope::~PrimitiveHintScope() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    if (!m_active) {
+        return;
+    }
+    HintSlot& slot = m_wake_hint ? t_wake_hint : t_park_hint;
+    slot.reason = static_cast<std::uint16_t>(m_prior_reason);
+    slot.context = m_prior_context;
+#endif
+}
+
+void EventRing::RecordSampled(SchedEventCode code, std::uint64_t gid,
+                              std::uint64_t arg2,
+                              std::uint32_t every) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    if (every <= 1U) {
+        Record(code, gid, arg2);
+        return;
+    }
+    std::uint32_t& counter =
+        t_sample_counters[static_cast<std::uint32_t>(code) & 0xFFU];
+    ++counter;
+    if (counter % every != 0U) {
+        return;
+    }
+    Record(code, gid, arg2);
+#else
+    (void)code;
+    (void)gid;
+    (void)arg2;
+    (void)every;
+#endif
+}
+
+std::uint64_t EventRing::TotalCount(SchedEventCode code) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    return GetTotals()
+        .codes[static_cast<std::uint32_t>(code) & 0xFFU]
+        .load(std::memory_order_relaxed);
+#else
+    (void)code;
+    return 0;
+#endif
+}
+
+std::uint64_t EventRing::TotalCountAll() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    std::uint64_t total = 0;
+    EventTotals& totals = GetTotals();
+    for (auto& counter : totals.codes) {
+        total += counter.load(std::memory_order_relaxed);
+    }
+    return total;
+#else
+    return 0;
+#endif
+}
+
+void EventRing::ResetTotals() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    EventTotals& totals = GetTotals();
+    for (auto& counter : totals.codes) {
+        counter.store(0, std::memory_order_relaxed);
+    }
 #endif
 }
 
@@ -351,6 +634,28 @@ std::uint32_t EventRing::BoundProcessor() noexcept {
     return t_processor_id;
 #else
     return kInvalidProcessorId;
+#endif
+}
+
+void EventRing::BindTask(std::uint64_t gid) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    t_bound_task = gid;
+#else
+    (void)gid;
+#endif
+}
+
+void EventRing::UnbindTask() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    t_bound_task = 0;
+#endif
+}
+
+std::uint64_t EventRing::BoundTask() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    return t_bound_task;
+#else
+    return 0;
 #endif
 }
 
@@ -473,6 +778,7 @@ std::string EventRing::DumpText(std::size_t max) {
     out += "critical_event_count=" + std::to_string(critical_count) + "\n";
     out += "normal_event_count=" + std::to_string(normal_count) + "\n";
     out += "timer_event_count=" + std::to_string(timer_event_count) + "\n";
+    AppendTotalCountersText(out);
     out += "# seq ts_ns tid code gid arg2 pid\n";
     for (const auto& event : events) {
         out += std::to_string(event.seq);
@@ -530,6 +836,8 @@ std::string EventRing::DumpJson(std::size_t max) {
     out += ",\"critical_event_count\":" + std::to_string(critical_count);
     out += ",\"normal_event_count\":" + std::to_string(normal_count);
     out += ",\"timer_event_count\":" + std::to_string(timer_event_count);
+    out += ",\"totals\":";
+    out += TotalCountersJson();
     out += ",\"events\":[";
     bool first = true;
     for (const auto& event : events) {
@@ -562,6 +870,24 @@ std::string EventRing::DumpJson(std::size_t max) {
         out += ",\"source_gid\":" +
                std::to_string(is_timer_event ? event.arg4 : 0);
         out += ",\"pid\":" + std::to_string(event.pid);
+        out += ",\"arg3\":" + std::to_string(event.arg3);
+        out += ",\"arg4\":" + std::to_string(event.arg4);
+        // park/wake 的语义原因（非 park/wake 事件为空串，字段集合稳定）。
+        const bool is_park_enter = event_code == SchedEventCode::kParkEnter;
+        const bool is_wake_event =
+            IsWakeCodeValue(static_cast<std::uint32_t>(event.code));
+        std::string primitive_name;
+        std::uint64_t primitive_code = 0;
+        if (is_park_enter || is_wake_event) {
+            primitive_code = event.arg3;
+            primitive_name = PrimitiveReasonName(
+                static_cast<PrimitiveReasonCode>(event.arg3));
+        }
+        out += ",\"primitive_reason\":\"" + primitive_name + "\"";
+        out += ",\"primitive_reason_code\":" +
+               std::to_string(primitive_code);
+        out += ",\"park_context\":" +
+               std::to_string(is_park_enter ? event.arg4 : 0);
         out += ",\"critical\":";
         out += SchedEventCodeIsCritical(
                    static_cast<SchedEventCode>(event.code))

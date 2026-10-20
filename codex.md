@@ -1514,3 +1514,51 @@ benchmarks/gmp_vs_thread_epoll_benchmark.cpp
 - 10k 压测：core TimerService schedule p99≈12.8µs、cancel p99≈3.0µs；
   replay live 驱动 schedule p99≈30.9µs、20k trace 回放≈74ms。
 - 报告：`/tmp/timer_debug_replay.md`；demo：`/tmp/timer_dump_demo.txt`、`/tmp/timer_replay_demo.txt`。
+
+## 24. 2026-10-20 真实场景死锁闭环：100+ HTTP client → 锁顺序死锁 → Doctor 解锁（deepseek）
+
+**新增能力**
+- `tests/scenarios/deadlock_routes/`：真实 HTTP 服务（`http::Server` + 每连接一个 Fiber）+
+  122 个并发 client + 两把 `sync::Mutex` 的 A→B / B→A 锁顺序反转。两个触发 client
+  在 `ParkingCondition` 上会合后各持一把锁再抢第二把 → 确定性死锁；追加 8 个单锁
+  请求排队 → 卡住 10 个请求。
+- 观测：`go2cpp-cli dump --sections scheduler,fiber,mutex,events` 抓到
+  gid/state/waiting_on/owner/waiters 与 park/mutex 事件；场景注册了带注解的
+  `fiber`/`mutex` 组件（schema `go2cpp.scenario.*`），不伪造库内 schema。
+- Doctor `mutex-unlock --force reason=<text>`：默认拒绝、缺 reason 拒绝；执行
+  `Mutex::Unlock()`，`stats().forced_unlocks` 在 Unlock **之前**自增，响应带
+  audit 字段并在 stderr 打审计行。文档：`docs/diagnostic-channel.md` §4.5.1。
+
+**实测数据（build-doctor-full, Release -O3, 12 vCPU WSL2）**
+- 122 client / 1500ms：4968 请求，3008 QPS，成功率 95.45%，
+  p50 0.37ms / p95 0.64ms / p99 8.63ms；失败为短连接 connect(179)/receive(48)，
+  与死锁无关，`FINAL_ERRORS` 如实输出。
+- 死锁：gid 4794(res-a) ↔ 4795(res-b)，A/B 各 5 waiters，卡住 10；
+  `deadlock-report` verdict=deadlock @663ms，两条 mutex 边 owner_alive=true；
+  `force-wake all` → woken_total=4（只唤醒 idle worker），waiters/verdict 不变；
+  `mutex-unlock name=res-a` → refused owner-alive；
+  `--force reason=...` → verdict=forced，waiters 5→4、held_after=false；
+  恢复后 stuck 10→0，10 个请求全部 200，`stale-unlock-skip` 1 次。
+- 触发率 `--repro 10` → 10/10；恢复 10/10。
+
+**约束 / 陷阱**
+- force 解锁后 owner 不知道锁已丢：业务代码必须自己识别（本场景比较
+  `forced_unlocks` 计数 + Mutex owner，只释放仍属于自己的锁，记
+  `stale-unlock-skip`），否则会出现 `unlock of unlocked mutex` 或抢锁；
+  `--force` 仅限故障处置/demo，不能作为常规运维手段。
+- 加载期不能让 client 走交叉锁路由：否则压测中随时可能出现计划外自然死锁，
+  触发率退化成随机事件。交叉锁路由只由 2 个触发 client 在固定时序下并发访问。
+- `deadlock-report` 需要全局无进展超过阈值（本场景 600ms）才从 `stalled` 变
+  `deadlock`；刚卡住就查会得到 `verdict=stalled`。
+- Release 构建默认关闭持锁 park 检测，场景必须显式
+  `SetHeldLockParkDetection(true)`，否则 owner_gid 不可知，`mutex-unlock` 一律 refused。
+
+**验证**
+- `bash tests/scenarios/deadlock_routes/run_deadlock_scenario.sh build-doctor-full`
+  → 17 PASS / 0 FAIL；`--repro 10` → 触发率 10/10、恢复 10/10；
+- `ctest --test-dir build-doctor-full` → **115/116**：唯一失败是
+  `test_diagnostic` 的 owner-gone 用例，把本任务改动还原到 HEAD 后同样失败，
+  属既有回归（`DebugSnapshotTasks()` 过滤终态 G → `mutex-unlock` 看不到已终止
+  owner），不是本场景引入；详见 `/tmp/deadlock_scenario.md` §11.3；
+- `cmake --build build-work` 全量通过（默认开关零影响）。
+- 报告：`/tmp/deadlock_scenario.md`；dump：`/tmp/scenario-deadlock-dump.txt`。

@@ -8,11 +8,18 @@
 #include "go2cpp/debug/debug_dump.hpp"
 #include "go2cpp/debug/debug_server.hpp"
 
+#include "go2cpp/json.hpp"
+
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
+#include <string_view>
+#include <vector>
+
 #include <unistd.h>
 
 namespace go2cpp::debug {
@@ -834,6 +841,1404 @@ bool WriteDumpFile(const std::string& path, const DumpPayload& payload,
         }
     }
     return true;
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Agent 可读视图（JSON 优先；字段稳定）
+//
+// 所有视图只消费 `EventRing::Snapshot()` 与调用方已经采集好的组件 JSON，
+// 不调用会改变运行时状态的接口。窗口内的事件受环形容量限制，`window.gaps`
+// 与 `window.total_published` 如实标注截断；进程级累计次数见 `totals`。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using ViewJson = go2cpp::Json;
+
+ViewJson ParseViewJson(const std::string& text) {
+    if (text.empty()) {
+        return ViewJson::object();
+    }
+    const auto parsed = go2cpp::ParseJson(text);
+    if (!parsed.ok()) {
+        return ViewJson::object();
+    }
+    return parsed.value;
+}
+
+bool IsTimerEventCode(SchedEventCode code) noexcept {
+    switch (code) {
+        case SchedEventCode::kTimerArm:
+        case SchedEventCode::kTimerFire:
+        case SchedEventCode::kTimerCancel:
+        case SchedEventCode::kTimerReschedule:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsWakeEventCode(SchedEventCode code) noexcept {
+    switch (code) {
+        case SchedEventCode::kWakeEnqueued:
+        case SchedEventCode::kWakePending:
+        case SchedEventCode::kWakeRejected:
+        case SchedEventCode::kWakeBatch:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsParkEventCode(SchedEventCode code) noexcept {
+    switch (code) {
+        case SchedEventCode::kParkEnter:
+        case SchedEventCode::kParkReturn:
+        case SchedEventCode::kParkRejected:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsGEventCode(SchedEventCode code) noexcept {
+    switch (code) {
+        case SchedEventCode::kGCreated:
+        case SchedEventCode::kGStarted:
+        case SchedEventCode::kGResumed:
+        case SchedEventCode::kGCompleted:
+        case SchedEventCode::kGFailed:
+        case SchedEventCode::kGCancelled:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsSchedulerFlowCode(SchedEventCode code) noexcept {
+    if (IsParkEventCode(code) || IsWakeEventCode(code) || IsGEventCode(code)) {
+        return true;
+    }
+    switch (code) {
+        case SchedEventCode::kEnqueue:
+        case SchedEventCode::kEnqueueRejected:
+        case SchedEventCode::kRequeueWorker:
+        case SchedEventCode::kRequeueProcessor:
+        case SchedEventCode::kRunQueuePush:
+        case SchedEventCode::kRunQueuePop:
+        case SchedEventCode::kRunQueueClaimOk:
+        case SchedEventCode::kRunQueueClaimFail:
+        case SchedEventCode::kStealOk:
+        case SchedEventCode::kStealFail:
+        case SchedEventCode::kWorkerPark:
+        case SchedEventCode::kWorkerUnpark:
+        case SchedEventCode::kSysmonPass:
+        case SchedEventCode::kTimerEnqueue:
+        case SchedEventCode::kThreadStart:
+        case SchedEventCode::kThreadStop:
+        case SchedEventCode::kSchedulerStart:
+        case SchedEventCode::kSchedulerStop:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsPrimitiveCode(SchedEventCode code) noexcept {
+    switch (code) {
+        case SchedEventCode::kMutexLock:
+        case SchedEventCode::kMutexUnlock:
+        case SchedEventCode::kMutexFastLock:
+        case SchedEventCode::kChannelSend:
+        case SchedEventCode::kChannelRecv:
+        case SchedEventCode::kChannelWake:
+        case SchedEventCode::kChannelSendOk:
+        case SchedEventCode::kChannelRecvOk:
+        case SchedEventCode::kChannelSelectEnter:
+        case SchedEventCode::kChannelSelect:
+        case SchedEventCode::kPCWait:
+        case SchedEventCode::kPCNotify:
+        case SchedEventCode::kPCNotifyAll:
+        case SchedEventCode::kTimerCallback:
+        case SchedEventCode::kIoWait:
+        case SchedEventCode::kIoWake:
+        case SchedEventCode::kIoWakeBatch:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// 事件的可读详情（给 agent 直接读，不需要再查事件码语义）。
+std::string EventDetail(SchedEventCode code, const EventRecord& event) {
+    const auto primitive = PrimitiveReasonName(
+        static_cast<PrimitiveReasonCode>(event.arg3));
+    switch (code) {
+        case SchedEventCode::kParkEnter:
+            return std::string("suspend=") +
+                   SuspendReasonNameStable(
+                       static_cast<SuspendReason>(event.arg2)) +
+                   " primitive=" + primitive;
+        case SchedEventCode::kParkReturn:
+            return event.arg2 == 0 ? "returned-cancelled" : "returned";
+        case SchedEventCode::kParkRejected:
+            return "rejected reason=" + std::to_string(event.arg2);
+        case SchedEventCode::kWakeEnqueued:
+            return std::string("wake-enqueued reason=") + primitive;
+        case SchedEventCode::kWakePending:
+            return std::string("wake-pending reason=") + primitive;
+        case SchedEventCode::kWakeRejected:
+            return std::string("wake-rejected reason=") + primitive;
+        case SchedEventCode::kEnqueue:
+            return "enqueue-request";
+        case SchedEventCode::kEnqueueRejected:
+            return "enqueue-rejected reason=" + std::to_string(event.arg2);
+        case SchedEventCode::kRunQueuePush:
+            return event.arg2 == kGlobalQueueTag
+                       ? "push global"
+                       : "push P=" + std::to_string(event.arg2);
+        case SchedEventCode::kRunQueuePop:
+            return event.arg2 == kGlobalQueueTag
+                       ? "pop global"
+                       : "pop P=" + std::to_string(event.arg2);
+        case SchedEventCode::kRunQueueClaimOk:
+            return "claim-ok";
+        case SchedEventCode::kRunQueueClaimFail:
+            return "claim-fail";
+        case SchedEventCode::kStealOk:
+            return "steal-ok victim-P=" + std::to_string(event.arg2);
+        case SchedEventCode::kStealFail:
+            return "steal-fail scanned=" + std::to_string(event.arg2);
+        case SchedEventCode::kWorkerPark:
+            return "M-park P=" + std::to_string(event.arg2);
+        case SchedEventCode::kWorkerUnpark:
+            return event.arg2 == 1 ? "M-unpark work"
+                 : event.arg2 == 2 ? "M-unpark stopping"
+                                   : "M-unpark timeout";
+        case SchedEventCode::kSysmonPass:
+            return "sysmon-pass #" + std::to_string(event.arg2);
+        case SchedEventCode::kGCreated:
+            return "created";
+        case SchedEventCode::kGStarted:
+            return "started M=" + std::to_string(event.arg2);
+        case SchedEventCode::kGResumed:
+            return "resumed M=" + std::to_string(event.arg2);
+        case SchedEventCode::kGCompleted:
+            return "completed";
+        case SchedEventCode::kGFailed:
+            return "failed";
+        case SchedEventCode::kGCancelled:
+            return "cancelled";
+        case SchedEventCode::kMutexLock:
+            return "mutex-contended";
+        case SchedEventCode::kMutexUnlock:
+            return "mutex-unlock+wake";
+        case SchedEventCode::kMutexFastLock:
+            return "mutex-fast-lock";
+        case SchedEventCode::kChannelSend:
+            return "channel-send-block cap=" + std::to_string(event.arg2);
+        case SchedEventCode::kChannelRecv:
+            return "channel-recv-block cap=" + std::to_string(event.arg2);
+        case SchedEventCode::kChannelWake:
+            return event.arg2 == 1 ? "channel-wake sender" : "channel-wake receiver";
+        case SchedEventCode::kChannelSendOk:
+            return "channel-send-immediate cap=" + std::to_string(event.arg2);
+        case SchedEventCode::kChannelRecvOk:
+            return "channel-recv-immediate cap=" + std::to_string(event.arg2);
+        case SchedEventCode::kChannelSelectEnter:
+            return "select-enter cases=" + std::to_string(event.arg2);
+        case SchedEventCode::kChannelSelect:
+            return event.arg2 == kNoSelectCase
+                       ? "select-none"
+                       : "select-case=" + std::to_string(event.arg2);
+        case SchedEventCode::kPCWait:
+            return "pc-wait";
+        case SchedEventCode::kPCNotify:
+            return "pc-notify";
+        case SchedEventCode::kPCNotifyAll:
+            return "pc-notify-all n=" + std::to_string(event.arg2);
+        case SchedEventCode::kTimerArm:
+            return "timer-arm deadline_ns=" + std::to_string(event.arg2);
+        case SchedEventCode::kTimerFire:
+            return "timer-fire deadline_ns=" + std::to_string(event.arg2);
+        case SchedEventCode::kTimerCancel:
+            return "timer-cancel";
+        case SchedEventCode::kTimerReschedule:
+            return "timer-reschedule deadline_ns=" + std::to_string(event.arg2);
+        case SchedEventCode::kTimerCallback:
+            return "timer-callback timer_id=" + std::to_string(event.arg2);
+        case SchedEventCode::kTimerEnqueue:
+            return "timer-G-enqueued";
+        case SchedEventCode::kIoWait:
+            return "io-wait fd=" + std::to_string(event.arg2);
+        case SchedEventCode::kIoWake:
+            return "io-wake fd=" + std::to_string(event.arg2);
+        default:
+            return SchedEventCodeName(code);
+    }
+}
+
+ViewJson EventToJson(const EventRecord& event) {
+    const auto code = static_cast<SchedEventCode>(event.code);
+    ViewJson item;
+    item["seq"] = event.seq;
+    item["ts_ns"] = event.ts_ns;
+    item["tid"] = event.tid;
+    if (event.pid == kInvalidProcessorId) {
+        item["pid"] = nullptr;
+    } else {
+        item["pid"] = event.pid;
+    }
+    item["code"] = SchedEventCodeName(code);
+    item["code_value"] = event.code;
+    item["gid"] = event.gid;
+    item["arg2"] = event.arg2;
+    item["arg3"] = event.arg3;
+    item["arg4"] = event.arg4;
+    const bool has_primitive =
+        code == SchedEventCode::kParkEnter || IsWakeEventCode(code);
+    item["primitive_reason"] =
+        has_primitive
+            ? PrimitiveReasonName(
+                  static_cast<PrimitiveReasonCode>(event.arg3))
+            : "";
+    item["park_context"] =
+        code == SchedEventCode::kParkEnter ? event.arg4 : 0;
+    item["critical"] = SchedEventCodeIsCritical(code);
+    item["detail"] = EventDetail(code, event);
+    return item;
+}
+
+ViewJson WindowJson(const std::vector<EventRecord>& events,
+                    std::uint64_t seq_start, std::uint64_t seq_end) {
+    ViewJson window;
+    window["event_count"] = events.size();
+    window["first_seq"] = events.empty() ? 0 : events.front().seq;
+    window["last_seq"] = events.empty() ? 0 : events.back().seq;
+    std::uint64_t gaps = 0;
+    for (std::size_t index = 1; index < events.size(); ++index) {
+        if (events[index].seq != events[index - 1].seq + 1) {
+            ++gaps;
+        }
+    }
+    const std::uint64_t total_published = EventRing::TotalCountAll();
+    window["gaps"] = gaps;
+    window["truncated"] =
+        gaps != 0 || total_published > static_cast<std::uint64_t>(events.size());
+    window["total_published"] = total_published;
+    window["capacity_per_thread"] = EventRing::kCapacity;
+    window["critical_capacity_per_thread"] = EventRing::kCriticalCapacity;
+    window["threads"] = EventRing::ThreadCount();
+    window["dropped_threads"] = EventRing::DroppedThreads();
+    window["seq_at_start"] = seq_start;
+    window["seq_at_end"] = seq_end;
+    window["changed_during_snapshot"] = seq_start != seq_end;
+    return window;
+}
+
+ViewJson TotalsJson() {
+    struct Entry {
+        const char* key;
+        SchedEventCode code;
+    };
+    static const Entry kEntries[] = {
+        {"park", SchedEventCode::kParkEnter},
+        {"park_return", SchedEventCode::kParkReturn},
+        {"park_rejected", SchedEventCode::kParkRejected},
+        {"wake", SchedEventCode::kWakeEnqueued},
+        {"wake_pending", SchedEventCode::kWakePending},
+        {"wake_rejected", SchedEventCode::kWakeRejected},
+        {"enqueue", SchedEventCode::kEnqueue},
+        {"enqueue_rejected", SchedEventCode::kEnqueueRejected},
+        {"claim_ok", SchedEventCode::kRunQueueClaimOk},
+        {"claim_fail", SchedEventCode::kRunQueueClaimFail},
+        {"runqueue_push", SchedEventCode::kRunQueuePush},
+        {"runqueue_pop", SchedEventCode::kRunQueuePop},
+        {"steal_ok", SchedEventCode::kStealOk},
+        {"mutex_lock", SchedEventCode::kMutexLock},
+        {"mutex_unlock", SchedEventCode::kMutexUnlock},
+        {"mutex_fast_lock", SchedEventCode::kMutexFastLock},
+        {"channel_send_block", SchedEventCode::kChannelSend},
+        {"channel_recv_block", SchedEventCode::kChannelRecv},
+        {"channel_send_ok", SchedEventCode::kChannelSendOk},
+        {"channel_recv_ok", SchedEventCode::kChannelRecvOk},
+        {"channel_select", SchedEventCode::kChannelSelect},
+        {"pc_wait", SchedEventCode::kPCWait},
+        {"pc_notify", SchedEventCode::kPCNotify},
+        {"timer_arm", SchedEventCode::kTimerArm},
+        {"timer_fire", SchedEventCode::kTimerFire},
+        {"timer_cancel", SchedEventCode::kTimerCancel},
+        {"timer_reschedule", SchedEventCode::kTimerReschedule},
+        {"timer_callback", SchedEventCode::kTimerCallback},
+        {"timer_enqueue", SchedEventCode::kTimerEnqueue},
+        {"g_created", SchedEventCode::kGCreated},
+        {"g_started", SchedEventCode::kGStarted},
+        {"g_resumed", SchedEventCode::kGResumed},
+        {"g_completed", SchedEventCode::kGCompleted},
+        {"g_failed", SchedEventCode::kGFailed},
+        {"g_cancelled", SchedEventCode::kGCancelled},
+        {"worker_park", SchedEventCode::kWorkerPark},
+        {"worker_unpark", SchedEventCode::kWorkerUnpark},
+        {"sysmon_pass", SchedEventCode::kSysmonPass},
+    };
+    ViewJson totals = ViewJson::object();
+    for (const auto& entry : kEntries) {
+        totals[entry.key] = EventRing::TotalCount(entry.code);
+    }
+    return totals;
+}
+
+/// parking / wake 配对结果。
+struct ParkPair {
+    std::uint64_t gid{0};
+    std::uint64_t park_seq{0};
+    std::uint64_t park_ts{0};
+    std::uint64_t suspend_reason{0};
+    std::uint64_t primitive_reason{0};
+    std::uint64_t wake_seq{0};
+    std::uint64_t wake_ts{0};
+    std::uint64_t wake_code{0};
+    std::uint64_t wake_reason{0};
+    std::uint64_t return_seq{0};
+    std::uint64_t return_ts{0};
+    bool returned{false};
+};
+
+std::vector<ParkPair> PairParks(const std::vector<EventRecord>& events) {
+    std::vector<ParkPair> pairs;
+    std::map<std::uint64_t, std::vector<std::size_t>> open_by_gid;
+    for (const auto& event : events) {
+        const auto code = static_cast<SchedEventCode>(event.code);
+        if (code == SchedEventCode::kParkEnter && event.gid != 0) {
+            ParkPair pair;
+            pair.gid = event.gid;
+            pair.park_seq = event.seq;
+            pair.park_ts = event.ts_ns;
+            pair.suspend_reason = event.arg2;
+            pair.primitive_reason = event.arg3;
+            pairs.push_back(pair);
+            open_by_gid[event.gid].push_back(pairs.size() - 1);
+        } else if (IsWakeEventCode(code) && event.gid != 0) {
+            const auto found = open_by_gid.find(event.gid);
+            if (found == open_by_gid.end()) {
+                continue;
+            }
+            for (const auto index : found->second) {
+                if (pairs[index].wake_seq == 0) {
+                    pairs[index].wake_seq = event.seq;
+                    pairs[index].wake_ts = event.ts_ns;
+                    pairs[index].wake_code = event.code;
+                    pairs[index].wake_reason = event.arg3;
+                    break;
+                }
+            }
+        } else if (code == SchedEventCode::kParkReturn && event.gid != 0) {
+            const auto found = open_by_gid.find(event.gid);
+            if (found == open_by_gid.end()) {
+                continue;
+            }
+            for (auto it = found->second.rbegin(); it != found->second.rend();
+                 ++it) {
+                if (!pairs[*it].returned) {
+                    pairs[*it].returned = true;
+                    pairs[*it].return_seq = event.seq;
+                    pairs[*it].return_ts = event.ts_ns;
+                    break;
+                }
+            }
+        }
+    }
+    return pairs;
+}
+
+std::string PairStatus(const ParkPair& pair) {
+    const bool woke = pair.wake_seq != 0;
+    if (woke && pair.returned) {
+        return "paired";
+    }
+    if (woke && !pair.returned) {
+        return "woken_pending_resume";
+    }
+    if (!woke && pair.returned) {
+        return "returned_without_wake";
+    }
+    return "open";
+}
+
+ViewJson PairToJson(const ParkPair& pair) {
+    ViewJson item;
+    item["gid"] = pair.gid;
+    item["park_seq"] = pair.park_seq;
+    item["park_ts_ns"] = pair.park_ts;
+    item["suspend_reason"] =
+        SuspendReasonNameStable(static_cast<SuspendReason>(pair.suspend_reason));
+    item["reason"] = PrimitiveReasonName(
+        static_cast<PrimitiveReasonCode>(pair.primitive_reason));
+    item["status"] = PairStatus(pair);
+    if (pair.wake_seq != 0) {
+        item["wake_seq"] = pair.wake_seq;
+        item["wake_ts_ns"] = pair.wake_ts;
+        item["wake_code"] = SchedEventCodeName(
+            static_cast<SchedEventCode>(pair.wake_code));
+        item["wake_reason"] = PrimitiveReasonName(
+            static_cast<PrimitiveReasonCode>(pair.wake_reason));
+        item["wake_latency_ns"] =
+            pair.wake_ts > pair.park_ts ? pair.wake_ts - pair.park_ts : 0;
+    } else {
+        item["wake_seq"] = 0;
+        item["wake_ts_ns"] = 0;
+        item["wake_code"] = "";
+        item["wake_reason"] = "";
+        item["wake_latency_ns"] = 0;
+    }
+    if (pair.returned) {
+        item["return_seq"] = pair.return_seq;
+        item["resume_delay_ns"] =
+            pair.return_ts > pair.park_ts ? pair.return_ts - pair.park_ts : 0;
+    } else {
+        item["return_seq"] = 0;
+        item["resume_delay_ns"] = 0;
+    }
+    return item;
+}
+
+std::string TaskStateFromScheduler(const ViewJson& scheduler,
+                                   std::uint64_t gid) {
+    if (!scheduler.is_object() || !scheduler.contains("tasks") ||
+        !scheduler["tasks"].is_array()) {
+        return "";
+    }
+    for (const auto& task : scheduler["tasks"]) {
+        if (task.value("id", std::uint64_t{0}) == gid) {
+            return task.value("state", std::string{});
+        }
+    }
+    return "";
+}
+
+bool SchedulerTaskStarted(const ViewJson& scheduler, std::uint64_t gid) {
+    if (!scheduler.is_object() || !scheduler.contains("tasks") ||
+        !scheduler["tasks"].is_array()) {
+        return false;
+    }
+    for (const auto& task : scheduler["tasks"]) {
+        if (task.value("id", std::uint64_t{0}) == gid) {
+            return task.value("started", false);
+        }
+    }
+    return false;
+}
+
+ViewJson SchedulerSummary(const ViewJson& scheduler) {
+    ViewJson summary = ViewJson::object();
+    if (!scheduler.is_object() || scheduler.empty()) {
+        summary["available"] = false;
+        return summary;
+    }
+    summary["available"] = true;
+    summary["running"] = scheduler.value("running", false);
+    summary["processor_count"] =
+        scheduler.value("processor_count", std::uint64_t{0});
+    summary["worker_count"] = scheduler.value("worker_count", std::uint64_t{0});
+    summary["runnable_total"] =
+        scheduler.value("runnable_total", std::uint64_t{0});
+    summary["runnable_global"] =
+        scheduler.value("runnable_global", std::uint64_t{0});
+    summary["runqueue"] = scheduler.contains("runqueue")
+                              ? scheduler["runqueue"]
+                              : ViewJson::object();
+    summary["sysmon_passes"] =
+        scheduler.value("sysmon_passes", std::uint64_t{0});
+    if (scheduler.contains("metrics")) {
+        summary["metrics"] = scheduler["metrics"];
+    }
+    return summary;
+}
+
+ViewJson GmpView(const ViewJson& scheduler,
+                 const std::vector<ParkPair>& pairs) {
+    ViewJson gmp = ViewJson::object();
+    gmp["summary"] = SchedulerSummary(scheduler);
+
+    ViewJson processors = ViewJson::array();
+    if (scheduler.contains("processors") && scheduler["processors"].is_array()) {
+        for (const auto& processor : scheduler["processors"]) {
+            ViewJson item;
+            item["id"] = processor.value("id", std::uint64_t{0});
+            item["state"] = processor.value("state", std::string{});
+            item["queued"] = processor.value("queued", std::uint64_t{0});
+            processors.push_back(item);
+        }
+    }
+    gmp["processors"] = processors;
+
+    ViewJson machines = ViewJson::array();
+    if (scheduler.contains("machines") && scheduler["machines"].is_array()) {
+        for (const auto& machine : scheduler["machines"]) {
+            ViewJson item;
+            item["id"] = machine.value("id", std::uint64_t{0});
+            item["state"] = machine.value("state", std::string{});
+            item["processor"] = machine.value("processor", std::uint64_t{0});
+            item["blocking_task"] =
+                machine.value("blocking_task", std::uint64_t{0});
+            item["long_syscall_count"] =
+                machine.value("long_syscall_count", std::uint64_t{0});
+            item["replacement"] = machine.value("replacement", false);
+            machines.push_back(item);
+        }
+    }
+    gmp["machines"] = machines;
+
+    ViewJson globals = ViewJson::array();
+    ViewJson by_state = ViewJson::object();
+    if (scheduler.contains("tasks") && scheduler["tasks"].is_array()) {
+        for (const auto& task : scheduler["tasks"]) {
+            ViewJson item;
+            item["gid"] = task.value("id", std::uint64_t{0});
+            item["state"] = task.value("state", std::string{});
+            item["started"] = task.value("started", false);
+            item["last_processor_id"] =
+                task.value("last_processor_id", std::uint64_t{0});
+            item["failed"] = task.value("failed", false);
+            item["cancellation_requested"] =
+                task.value("cancellation_requested", false);
+            globals.push_back(item);
+            const std::string state = item["state"];
+            by_state[state] = by_state.value(state, std::uint64_t{0}) + 1;
+        }
+    }
+    gmp["g"] = globals;
+    gmp["g_by_state"] = by_state;
+
+    // 阻塞图：窗口内未配对的 park + 当前仍处于 kWaiting 的 G。
+    std::map<std::uint64_t, ViewJson> blocked;
+    for (const auto& pair : pairs) {
+        const std::string status = PairStatus(pair);
+        if (status == "open" || status == "woken_pending_resume") {
+            blocked[pair.gid] = PairToJson(pair);
+        }
+    }
+    if (scheduler.contains("tasks") && scheduler["tasks"].is_array()) {
+        for (const auto& task : scheduler["tasks"]) {
+            const std::string state = task.value("state", std::string{});
+            const std::uint64_t gid = task.value("id", std::uint64_t{0});
+            if (state == "kWaiting" && blocked.find(gid) == blocked.end()) {
+                ViewJson item;
+                item["gid"] = gid;
+                item["park_seq"] = 0;
+                item["park_ts_ns"] = 0;
+                item["suspend_reason"] = "kUnknown";
+                item["reason"] = "kWindowMissing";
+                item["status"] = "waiting_no_park_in_window";
+                item["wake_seq"] = 0;
+                item["wake_ts_ns"] = 0;
+                item["wake_code"] = "";
+                item["wake_reason"] = "";
+                item["wake_latency_ns"] = 0;
+                item["return_seq"] = 0;
+                item["resume_delay_ns"] = 0;
+                blocked[gid] = item;
+            }
+        }
+    }
+    ViewJson blocked_items = ViewJson::array();
+    ViewJson blocked_by_reason = ViewJson::object();
+    for (auto& entry : blocked) {
+        blocked_items.push_back(entry.second);
+        const std::string reason = entry.second.value("reason", std::string{});
+        blocked_by_reason[reason] =
+            blocked_by_reason.value(reason, std::uint64_t{0}) + 1;
+    }
+    ViewJson blocked_view;
+    blocked_view["count"] = blocked_items.size();
+    blocked_view["by_reason"] = blocked_by_reason;
+    blocked_view["items"] = blocked_items;
+    gmp["blocked"] = blocked_view;
+    return gmp;
+}
+
+ViewJson TimerView(const ViewJson& timer_service,
+                   const std::vector<EventRecord>& events) {
+    ViewJson view = ViewJson::object();
+    ViewJson summary = ViewJson::object();
+    if (timer_service.is_object() && !timer_service.empty()) {
+        summary["available"] = true;
+        summary["active"] = timer_service.value("active", std::uint64_t{0});
+        summary["next_deadline_in_ns"] =
+            timer_service.value("next_deadline_in_ns", std::uint64_t{0});
+        summary["armed_total"] =
+            timer_service.value("armed_total", std::uint64_t{0});
+        summary["fired"] =
+            timer_service.value("stats", ViewJson::object())
+                .value("fired", std::uint64_t{0});
+        summary["cancelled"] =
+            timer_service.value("stats", ViewJson::object())
+                .value("cancelled", std::uint64_t{0});
+        summary["rescheduled"] =
+            timer_service.value("stats", ViewJson::object())
+                .value("rescheduled", std::uint64_t{0});
+        summary["running"] = timer_service.value("running", false);
+        if (timer_service.contains("sources")) {
+            summary["sources"] = timer_service["sources"];
+        }
+    } else {
+        summary["available"] = false;
+    }
+    view["service"] = summary;
+
+    struct TimerState {
+        std::uint64_t timer_id{0};
+        std::uint64_t arm_seq{0};
+        std::uint64_t fire_count{0};
+        std::uint64_t cancel_seq{0};
+        std::uint64_t reschedule_count{0};
+        std::uint64_t callback_count{0};
+        std::uint64_t g_enqueue_count{0};
+        std::uint64_t last_fire_ts{0};
+        std::uint64_t last_callback_ts{0};
+        std::uint64_t source_gid{0};
+        std::uint64_t kind{0};
+        std::uint64_t last_deadline_ns{0};
+        bool saw_fire{false};
+        bool saw_callback{false};
+        bool saw_enqueue{false};
+        std::vector<std::uint64_t> gids;
+    };
+    std::map<std::uint64_t, TimerState> timers;
+    ViewJson timeline = ViewJson::array();
+    std::uint64_t fire_with_callback = 0;
+    std::uint64_t fire_total = 0;
+    std::uint64_t fire_with_enqueue = 0;
+    // 回调投递与 G 入队按时间邻近关联：执行器提交回调后立刻 spawn，
+    // 两条事件的 seq 只隔少量记录，这里按「同一 timer 的 fire 之后
+    // 最近一次 callback/enqueue」统计。
+    std::uint64_t last_callback_gid = 0;
+    std::uint64_t callbacks_without_timer_id = 0;
+    // fire → callback → G 入队的近邻关联（同一 timer 线程相邻记录）。
+    std::uint64_t last_fire_seq = 0;
+    std::uint64_t last_callback_seq = 0;
+    std::uint64_t fire_events = 0;
+    std::uint64_t fire_events_with_callback = 0;
+    std::uint64_t fire_events_with_enqueue = 0;
+    std::uint64_t g_enqueue_without_timer_id = 0;
+    for (const auto& event : events) {
+        const auto code = static_cast<SchedEventCode>(event.code);
+        if (!IsTimerEventCode(code) &&
+            code != SchedEventCode::kTimerCallback &&
+            code != SchedEventCode::kTimerEnqueue) {
+            continue;
+        }
+        ViewJson item = EventToJson(event);
+        item["timer_id"] = IsTimerEventCode(code) ? event.gid : event.arg2;
+        item["kind"] = IsTimerEventCode(code) ? event.arg3 : 0;
+        item["deadline_ns"] = IsTimerEventCode(code) ? event.arg2 : 0;
+        item["source_gid"] = IsTimerEventCode(code) ? event.arg4 : event.gid;
+        if (code == SchedEventCode::kTimerArm ||
+            code == SchedEventCode::kTimerFire ||
+            code == SchedEventCode::kTimerCancel ||
+            code == SchedEventCode::kTimerReschedule) {
+            TimerState& state = timers[event.gid];
+            state.timer_id = event.gid;
+            state.source_gid = event.arg4;
+            state.kind = event.arg3;
+            state.last_deadline_ns = event.arg2;
+            if (code == SchedEventCode::kTimerArm) {
+                state.arm_seq = event.seq;
+            } else if (code == SchedEventCode::kTimerFire) {
+                ++state.fire_count;
+                state.last_fire_ts = event.ts_ns;
+                state.saw_fire = true;
+                ++fire_events;
+                last_fire_seq = event.seq;
+            } else if (code == SchedEventCode::kTimerCancel) {
+                state.cancel_seq = event.seq;
+            } else {
+                ++state.reschedule_count;
+            }
+        } else if (code == SchedEventCode::kTimerCallback) {
+            if (event.arg2 == 0) {
+                // 执行器路径的周期回调没有可用的 timer_id（ScheduleEveryOn
+                // 的 repeat_callback 只能拿到回调本身）；单独计数，不能
+                // 伪造成 timer_id=0 的定时器。
+                ++callbacks_without_timer_id;
+                item["timer_id_known"] = false;
+            } else {
+                TimerState& state = timers[event.arg2];
+                state.timer_id = event.arg2;
+                ++state.callback_count;
+                state.last_callback_ts = event.ts_ns;
+                state.saw_callback = true;
+                item["timer_id_known"] = true;
+            }
+            if (last_fire_seq != 0 && event.seq > last_fire_seq &&
+                event.seq - last_fire_seq <= 128) {
+                ++fire_events_with_callback;
+            }
+            last_callback_seq = event.seq;
+            last_callback_gid = event.gid;
+            item["source_gid"] = event.gid;
+        } else {
+            if (event.arg2 == 0) {
+                // 执行器把回调交给 Scheduler 时只能拿到新 G，拿不到 timer_id；
+                // 单独计数，不能伪造一个 timer_id=0 的定时器。
+                ++g_enqueue_without_timer_id;
+                item["timer_id_known"] = false;
+            } else {
+                TimerState& state = timers[event.arg2];
+                state.timer_id = event.arg2;
+                ++state.g_enqueue_count;
+                state.gids.push_back(event.gid);
+                state.saw_enqueue = true;
+                item["timer_id_known"] = true;
+            }
+            item["source_gid"] = last_callback_gid;
+            if (last_callback_seq != 0 && event.seq > last_callback_seq &&
+                event.seq - last_callback_seq <= 128) {
+                ++fire_events_with_enqueue;
+            }
+        }
+        timeline.push_back(item);
+    }
+
+    fire_total = 0;
+    fire_with_callback = 0;
+    fire_with_enqueue = 0;
+    for (const auto& entry : timers) {
+        const auto& state = entry.second;
+        if (state.saw_fire) {
+            ++fire_total;
+            if (state.saw_callback) {
+                ++fire_with_callback;
+            }
+            if (state.saw_enqueue) {
+                ++fire_with_enqueue;
+            }
+        }
+    }
+    ViewJson timer_map = ViewJson::object();
+    for (const auto& entry : timers) {
+        const auto& state = entry.second;
+        ViewJson item;
+        item["timer_id"] = state.timer_id;
+        item["arm_seq"] = state.arm_seq;
+        item["fire_count"] = state.fire_count;
+        item["cancel_seq"] = state.cancel_seq;
+        item["reschedule_count"] = state.reschedule_count;
+        item["callback_count"] = state.callback_count;
+        item["g_enqueue_count"] = state.g_enqueue_count;
+        item["source_gid"] = state.source_gid;
+        item["kind"] = state.kind;
+        item["last_deadline_ns"] = state.last_deadline_ns;
+        ViewJson gids = ViewJson::array();
+        for (const auto gid : state.gids) {
+            gids.push_back(gid);
+        }
+        item["g_enqueued"] = gids;
+        timer_map[std::to_string(entry.first)] = item;
+    }
+    view["timers"] = timer_map;
+    view["timeline"] = timeline;
+    ViewJson pairing;
+    pairing["fire_total"] = fire_total;
+    pairing["fire_with_callback"] = fire_with_callback;
+    pairing["fire_with_g_enqueue"] = fire_with_enqueue;
+    const std::uint64_t fire_total_all =
+        EventRing::TotalCount(SchedEventCode::kTimerFire);
+    const std::uint64_t callback_total_all =
+        EventRing::TotalCount(SchedEventCode::kTimerCallback);
+    pairing["fire_total_all"] = fire_total_all;
+    pairing["callback_total_all"] = callback_total_all;
+    pairing["callback_without_fire_total"] =
+        callback_total_all > fire_total_all
+            ? callback_total_all - fire_total_all
+            : 0;
+    pairing["g_enqueue_total_all"] =
+        EventRing::TotalCount(SchedEventCode::kTimerEnqueue);
+    pairing["callbacks_without_timer_id"] = callbacks_without_timer_id;
+    pairing["fire_events"] = fire_events;
+    pairing["fire_events_with_callback"] = fire_events_with_callback;
+    pairing["fire_events_with_enqueue"] = fire_events_with_enqueue;
+    pairing["g_enqueues_without_timer_id"] = g_enqueue_without_timer_id;
+    view["pairing"] = pairing;
+    return view;
+}
+
+ViewJson ParkView(const std::vector<ParkPair>& pairs,
+                  const ViewJson& scheduler) {
+    ViewJson view = ViewJson::object();
+    ViewJson by_reason = ViewJson::object();
+    ViewJson items = ViewJson::array();
+    std::uint64_t paired = 0;
+    std::uint64_t woken_not_resumed = 0;
+    std::uint64_t returned_without_wake = 0;
+    std::uint64_t open = 0;
+    for (const auto& pair : pairs) {
+        items.push_back(PairToJson(pair));
+        const std::string reason = PrimitiveReasonName(
+            static_cast<PrimitiveReasonCode>(pair.primitive_reason));
+        by_reason[reason] = by_reason.value(reason, std::uint64_t{0}) + 1;
+        const std::string status = PairStatus(pair);
+        if (status == "paired") {
+            ++paired;
+        } else if (status == "woken_pending_resume") {
+            ++woken_not_resumed;
+        } else if (status == "returned_without_wake") {
+            ++returned_without_wake;
+        } else {
+            ++open;
+        }
+    }
+    ViewJson pairing;
+    pairing["checked"] = pairs.size();
+    pairing["paired"] = paired;
+    pairing["woken_pending_resume"] = woken_not_resumed;
+    pairing["returned_without_wake"] = returned_without_wake;
+    pairing["open"] = open;
+    pairing["park_total"] = EventRing::TotalCount(SchedEventCode::kParkEnter);
+    pairing["wake_total"] =
+        EventRing::TotalCount(SchedEventCode::kWakeEnqueued);
+    pairing["park_minus_wake_total"] =
+        pairing["park_total"].get<std::uint64_t>() >=
+                pairing["wake_total"].get<std::uint64_t>()
+            ? pairing["park_total"].get<std::uint64_t>() -
+                  pairing["wake_total"].get<std::uint64_t>()
+            : 0;
+    view["pairing"] = pairing;
+    view["by_reason"] = by_reason;
+    view["items"] = items;
+
+    // 明确 stuck：窗口内 open 的 park 且当前 G 仍处于 kWaiting。
+    ViewJson stuck = ViewJson::array();
+    for (const auto& pair : pairs) {
+        if (PairStatus(pair) != "open") {
+            continue;
+        }
+        if (TaskStateFromScheduler(scheduler, pair.gid) == "kWaiting") {
+            stuck.push_back(PairToJson(pair));
+        }
+    }
+    view["stuck"] = stuck;
+    return view;
+}
+
+ViewJson TimelineView(std::uint64_t gid, const std::vector<EventRecord>& events,
+                      const ViewJson& scheduler) {
+    ViewJson view = ViewJson::object();
+    ViewJson timeline = ViewJson::array();
+    ViewJson lifecycle = ViewJson::object();
+    std::uint64_t park = 0;
+    std::uint64_t wake = 0;
+    std::uint64_t resume = 0;
+    std::uint64_t push = 0;
+    std::uint64_t pop = 0;
+    std::uint64_t claim_ok = 0;
+    std::uint64_t claim_fail = 0;
+    for (const auto& event : events) {
+        if (event.gid != gid) {
+            continue;
+        }
+        const auto code = static_cast<SchedEventCode>(event.code);
+        timeline.push_back(EventToJson(event));
+        if (code == SchedEventCode::kParkEnter) {
+            ++park;
+        } else if (code == SchedEventCode::kWakeEnqueued) {
+            ++wake;
+        } else if (code == SchedEventCode::kGResumed) {
+            ++resume;
+        } else if (code == SchedEventCode::kRunQueuePush) {
+            ++push;
+        } else if (code == SchedEventCode::kRunQueuePop) {
+            ++pop;
+        } else if (code == SchedEventCode::kRunQueueClaimOk) {
+            ++claim_ok;
+        } else if (code == SchedEventCode::kRunQueueClaimFail) {
+            ++claim_fail;
+        } else if (code == SchedEventCode::kGCreated ||
+                   code == SchedEventCode::kGStarted ||
+                   code == SchedEventCode::kGCompleted ||
+                   code == SchedEventCode::kGFailed ||
+                   code == SchedEventCode::kGCancelled) {
+            ViewJson marker;
+            marker["seq"] = event.seq;
+            marker["ts_ns"] = event.ts_ns;
+            marker["code"] = SchedEventCodeName(code);
+            switch (code) {
+                case SchedEventCode::kGCreated: lifecycle["created"] = marker; break;
+                case SchedEventCode::kGStarted: lifecycle["started"] = marker; break;
+                case SchedEventCode::kGCompleted: lifecycle["completed"] = marker; break;
+                case SchedEventCode::kGFailed: lifecycle["failed"] = marker; break;
+                default: lifecycle["cancelled"] = marker; break;
+            }
+        }
+    }
+    ViewJson counts;
+    counts["events"] = timeline.size();
+    counts["park"] = park;
+    counts["wake"] = wake;
+    counts["resume"] = resume;
+    counts["runqueue_push"] = push;
+    counts["runqueue_pop"] = pop;
+    counts["claim_ok"] = claim_ok;
+    counts["claim_fail"] = claim_fail;
+    view["gid"] = gid;
+    view["found_in_window"] = !timeline.empty();
+    std::string current_state = TaskStateFromScheduler(scheduler, gid);
+    if (current_state.empty() && lifecycle.contains("completed")) {
+        current_state = "kDead";
+    } else if (current_state.empty() && lifecycle.contains("failed")) {
+        current_state = "kFailed";
+    } else if (current_state.empty() && lifecycle.contains("cancelled")) {
+        current_state = "kCancelled";
+    }
+    view["current_state"] = current_state;
+    view["started"] = SchedulerTaskStarted(scheduler, gid);
+    view["lifecycle"] = lifecycle;
+    view["counts"] = counts;
+    view["events"] = timeline;
+    return view;
+}
+
+ViewJson SchedView(const std::vector<EventRecord>& events,
+                   const std::vector<ParkPair>& pairs,
+                   const ViewJson& scheduler) {
+    ViewJson view = ViewJson::object();
+    ViewJson flow = ViewJson::array();
+    ViewJson chains = ViewJson::array();
+    ViewJson counts = ViewJson::object();
+    std::uint64_t enqueue = 0;
+    std::uint64_t enqueue_rejected = 0;
+    std::uint64_t push = 0;
+    std::uint64_t pop = 0;
+    std::uint64_t claim_ok = 0;
+    std::uint64_t claim_fail = 0;
+    std::uint64_t steal_ok = 0;
+    std::uint64_t worker_park = 0;
+    std::uint64_t worker_unpark = 0;
+    std::uint64_t sysmon = 0;
+
+    struct Chain {
+        std::uint64_t gid{0};
+        std::uint64_t last_seq{0};
+        std::uint64_t enqueue_seq{0};
+        std::uint64_t push_seq{0};
+        std::uint64_t pop_seq{0};
+        std::uint64_t claim_seq{0};
+        std::uint64_t resume_seq{0};
+        std::uint64_t park_seq{0};
+        std::uint64_t wake_seq{0};
+        std::uint64_t enqueue_count{0};
+        std::uint64_t claim_count{0};
+        std::uint64_t park_count{0};
+        std::uint64_t wake_count{0};
+    };
+    std::map<std::uint64_t, Chain> chain_map;
+    std::uint64_t max_seq_in_window = 0;
+    for (const auto& event : events) {
+        const auto code = static_cast<SchedEventCode>(event.code);
+        if (!IsSchedulerFlowCode(code)) {
+            continue;
+        }
+        if (event.seq > max_seq_in_window) {
+            max_seq_in_window = event.seq;
+        }
+        flow.push_back(EventToJson(event));
+        switch (code) {
+            case SchedEventCode::kEnqueue: ++enqueue; break;
+            case SchedEventCode::kEnqueueRejected: ++enqueue_rejected; break;
+            case SchedEventCode::kRunQueuePush: ++push; break;
+            case SchedEventCode::kRunQueuePop: ++pop; break;
+            case SchedEventCode::kRunQueueClaimOk: ++claim_ok; break;
+            case SchedEventCode::kRunQueueClaimFail: ++claim_fail; break;
+            case SchedEventCode::kStealOk: ++steal_ok; break;
+            case SchedEventCode::kWorkerPark: ++worker_park; break;
+            case SchedEventCode::kWorkerUnpark: ++worker_unpark; break;
+            case SchedEventCode::kSysmonPass: ++sysmon; break;
+            default: break;
+        }
+        if (event.gid == 0) {
+            continue;
+        }
+        Chain& chain = chain_map[event.gid];
+        chain.gid = event.gid;
+        if (event.seq > chain.last_seq) {
+            chain.last_seq = event.seq;
+        }
+        switch (code) {
+            case SchedEventCode::kEnqueue:
+                if (chain.enqueue_seq == 0) {
+                    chain.enqueue_seq = event.seq;
+                }
+                ++chain.enqueue_count;
+                break;
+            case SchedEventCode::kRunQueuePush:
+                if (chain.push_seq == 0) {
+                    chain.push_seq = event.seq;
+                }
+                break;
+            case SchedEventCode::kRunQueuePop:
+                chain.pop_seq = event.seq;
+                break;
+            case SchedEventCode::kRunQueueClaimOk:
+            case SchedEventCode::kRunQueueClaimFail:
+                chain.claim_seq = event.seq;
+                ++chain.claim_count;
+                break;
+            case SchedEventCode::kGResumed:
+            case SchedEventCode::kGStarted:
+                chain.resume_seq = event.seq;
+                break;
+            case SchedEventCode::kParkEnter:
+                chain.park_seq = event.seq;
+                ++chain.park_count;
+                break;
+            case SchedEventCode::kWakeEnqueued:
+                chain.wake_seq = event.seq;
+                ++chain.wake_count;
+                break;
+            default: break;
+        }
+    }
+
+    // 只输出窗口内仍有活动、且链路不完整的 G（最多 64 条）。
+    std::vector<const Chain*> candidates;
+    for (const auto& entry : chain_map) {
+        const Chain& chain = entry.second;
+        const bool has_tail =
+            chain.park_seq != 0 || chain.wake_seq != 0 ||
+            chain.resume_seq != 0 || chain.claim_seq != 0;
+        if (has_tail) {
+            candidates.push_back(&chain);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Chain* lhs, const Chain* rhs) {
+                  return lhs->last_seq > rhs->last_seq;
+              });
+    if (candidates.size() > 64) {
+        candidates.resize(64);
+    }
+    for (const Chain* chain : candidates) {
+        ViewJson item;
+        item["gid"] = chain->gid;
+        item["enqueue_count"] = chain->enqueue_count;
+        item["claim_count"] = chain->claim_count;
+        item["park_count"] = chain->park_count;
+        item["wake_count"] = chain->wake_count;
+        item["enqueue_seq"] = chain->enqueue_seq;
+        item["push_seq"] = chain->push_seq;
+        item["pop_seq"] = chain->pop_seq;
+        item["claim_seq"] = chain->claim_seq;
+        item["resume_seq"] = chain->resume_seq;
+        item["park_seq"] = chain->park_seq;
+        item["wake_seq"] = chain->wake_seq;
+        item["state"] = TaskStateFromScheduler(scheduler, chain->gid);
+        ViewJson missing = ViewJson::array();
+        if (chain->enqueue_count > chain->claim_count) {
+            missing.push_back("claim");
+        }
+        if (chain->claim_count != 0 && chain->pop_seq == 0) {
+            missing.push_back("pop");
+        }
+        if (chain->park_count > chain->wake_count) {
+            missing.push_back("wake");
+        }
+        item["missing"] = missing;
+        item["status"] = missing.empty() ? "complete" : "incomplete";
+        chains.push_back(item);
+    }
+
+    ViewJson pairing;
+    pairing["enqueue_total"] =
+        EventRing::TotalCount(SchedEventCode::kEnqueue);
+    pairing["enqueue_rejected_total"] =
+        EventRing::TotalCount(SchedEventCode::kEnqueueRejected);
+    pairing["claim_ok_total"] =
+        EventRing::TotalCount(SchedEventCode::kRunQueueClaimOk);
+    pairing["claim_fail_total"] =
+        EventRing::TotalCount(SchedEventCode::kRunQueueClaimFail);
+    pairing["window_enqueue"] = enqueue;
+    pairing["window_claim_ok"] = claim_ok;
+    pairing["window_enqueue_pending"] =
+        enqueue > enqueue_rejected + claim_ok + claim_fail
+            ? enqueue - enqueue_rejected - claim_ok - claim_fail
+            : 0;
+    pairing["park_pairs"] = pairs.size();
+    counts["enqueue"] = enqueue;
+    counts["enqueue_rejected"] = enqueue_rejected;
+    counts["runqueue_push"] = push;
+    counts["runqueue_pop"] = pop;
+    counts["claim_ok"] = claim_ok;
+    counts["claim_fail"] = claim_fail;
+    counts["steal_ok"] = steal_ok;
+    counts["worker_park"] = worker_park;
+    counts["worker_unpark"] = worker_unpark;
+    counts["sysmon_pass"] = sysmon;
+    counts["max_seq_in_window"] = max_seq_in_window;
+    view["counts"] = counts;
+    view["pairing"] = pairing;
+    view["chains"] = chains;
+    view["flow"] = flow;
+    return view;
+}
+
+ViewJson PrimitivesView(const std::vector<EventRecord>& events,
+                        const std::vector<ParkPair>& pairs) {
+    ViewJson view = ViewJson::object();
+    ViewJson flow = ViewJson::array();
+    ViewJson counts = ViewJson::object();
+    ViewJson selects = ViewJson::array();
+    ViewJson mutex_items = ViewJson::array();
+    ViewJson channel_items = ViewJson::array();
+    ViewJson pc_items = ViewJson::array();
+    std::uint64_t mutex_lock = 0;
+    std::uint64_t mutex_unlock = 0;
+    std::uint64_t mutex_fast = 0;
+    std::uint64_t channel_send = 0;
+    std::uint64_t channel_recv = 0;
+    std::uint64_t channel_send_ok = 0;
+    std::uint64_t channel_recv_ok = 0;
+    std::uint64_t select_count = 0;
+    std::uint64_t pc_wait = 0;
+    std::uint64_t pc_notify = 0;
+    for (const auto& event : events) {
+        const auto code = static_cast<SchedEventCode>(event.code);
+        if (!IsPrimitiveCode(code)) {
+            continue;
+        }
+        ViewJson item = EventToJson(event);
+        flow.push_back(item);
+        switch (code) {
+            case SchedEventCode::kMutexLock: {
+                ++mutex_lock;
+                mutex_items.push_back(item);
+                break;
+            }
+            case SchedEventCode::kMutexUnlock: {
+                ++mutex_unlock;
+                mutex_items.push_back(item);
+                break;
+            }
+            case SchedEventCode::kMutexFastLock:
+                ++mutex_fast;
+                mutex_items.push_back(item);
+                break;
+            case SchedEventCode::kChannelSend:
+                ++channel_send;
+                channel_items.push_back(item);
+                break;
+            case SchedEventCode::kChannelRecv:
+                ++channel_recv;
+                channel_items.push_back(item);
+                break;
+            case SchedEventCode::kChannelSendOk:
+                ++channel_send_ok;
+                channel_items.push_back(item);
+                break;
+            case SchedEventCode::kChannelRecvOk:
+                ++channel_recv_ok;
+                channel_items.push_back(item);
+                break;
+            case SchedEventCode::kChannelSelect: {
+                ++select_count;
+                ViewJson select_item;
+                select_item["seq"] = event.seq;
+                select_item["gid"] = event.gid;
+                select_item["chosen"] =
+                    event.arg2 == kNoSelectCase
+                        ? ViewJson(nullptr)
+                        : ViewJson(event.arg2);
+                select_item["none"] = event.arg2 == kNoSelectCase;
+                selects.push_back(select_item);
+                break;
+            }
+            case SchedEventCode::kPCWait:
+                ++pc_wait;
+                pc_items.push_back(item);
+                break;
+            case SchedEventCode::kPCNotify:
+            case SchedEventCode::kPCNotifyAll:
+                ++pc_notify;
+                pc_items.push_back(item);
+                break;
+            default:
+                break;
+        }
+    }
+    counts["mutex_lock"] = mutex_lock;
+    counts["mutex_unlock"] = mutex_unlock;
+    counts["mutex_fast_lock"] = mutex_fast;
+    counts["channel_send_block"] = channel_send;
+    counts["channel_recv_block"] = channel_recv;
+    counts["channel_send_ok"] = channel_send_ok;
+    counts["channel_recv_ok"] = channel_recv_ok;
+    counts["channel_select"] = select_count;
+    counts["pc_wait"] = pc_wait;
+    counts["pc_notify"] = pc_notify;
+    view["counts"] = counts;
+    ViewJson park_by_reason = ViewJson::object();
+    for (const auto& pair : pairs) {
+        const std::string reason = PrimitiveReasonName(
+            static_cast<PrimitiveReasonCode>(pair.primitive_reason));
+        park_by_reason[reason] =
+            park_by_reason.value(reason, std::uint64_t{0}) + 1;
+    }
+    view["park_reason_mix"] = park_by_reason;
+    view["selects"] = selects;
+    view["mutex"] = mutex_items;
+    view["channel"] = channel_items;
+    view["parking_condition"] = pc_items;
+    view["flow"] = flow;
+    return view;
+}
+
+void AppendCoverage(ViewJson& root, const std::vector<ParkPair>& pairs) {
+    ViewJson coverage = ViewJson::object();
+    const std::uint64_t park_total =
+        EventRing::TotalCount(SchedEventCode::kParkEnter);
+    const std::uint64_t wake_total =
+        EventRing::TotalCount(SchedEventCode::kWakeEnqueued);
+    coverage["park_total"] = park_total;
+    coverage["wake_total"] = wake_total;
+    coverage["park_minus_wake"] =
+        park_total >= wake_total ? park_total - wake_total : 0;
+    coverage["wake_pending_total"] =
+        EventRing::TotalCount(SchedEventCode::kWakePending);
+    coverage["wake_rejected_total"] =
+        EventRing::TotalCount(SchedEventCode::kWakeRejected);
+    coverage["park_return_total"] =
+        EventRing::TotalCount(SchedEventCode::kParkReturn);
+    coverage["park_rejected_total"] =
+        EventRing::TotalCount(SchedEventCode::kParkRejected);
+    coverage["enqueue_total"] =
+        EventRing::TotalCount(SchedEventCode::kEnqueue);
+    coverage["enqueue_rejected_total"] =
+        EventRing::TotalCount(SchedEventCode::kEnqueueRejected);
+    coverage["claim_ok_total"] =
+        EventRing::TotalCount(SchedEventCode::kRunQueueClaimOk);
+    coverage["claim_fail_total"] =
+        EventRing::TotalCount(SchedEventCode::kRunQueueClaimFail);
+    const std::uint64_t admitted = coverage["enqueue_total"].get<std::uint64_t>();
+    const std::uint64_t rejected =
+        coverage["enqueue_rejected_total"].get<std::uint64_t>();
+    const std::uint64_t claimed =
+        coverage["claim_ok_total"].get<std::uint64_t>();
+    coverage["enqueue_pending_total"] =
+        admitted > rejected + claimed ? admitted - rejected - claimed : 0;
+    coverage["steal_ok_total"] =
+        EventRing::TotalCount(SchedEventCode::kStealOk);
+    coverage["g_created_total"] =
+        EventRing::TotalCount(SchedEventCode::kGCreated);
+    coverage["g_completed_total"] =
+        EventRing::TotalCount(SchedEventCode::kGCompleted);
+    coverage["g_failed_total"] =
+        EventRing::TotalCount(SchedEventCode::kGFailed);
+    coverage["g_cancelled_total"] =
+        EventRing::TotalCount(SchedEventCode::kGCancelled);
+    coverage["timer_fire_total"] =
+        EventRing::TotalCount(SchedEventCode::kTimerFire);
+    coverage["timer_callback_total"] =
+        EventRing::TotalCount(SchedEventCode::kTimerCallback);
+    coverage["timer_enqueue_total"] =
+        EventRing::TotalCount(SchedEventCode::kTimerEnqueue);
+    coverage["pc_wait_total"] =
+        EventRing::TotalCount(SchedEventCode::kPCWait);
+    coverage["pc_notify_total"] =
+        EventRing::TotalCount(SchedEventCode::kPCNotify);
+    coverage["window_pairs_checked"] = pairs.size();
+    std::uint64_t paired = 0;
+    std::uint64_t open = 0;
+    for (const auto& pair : pairs) {
+        if (PairStatus(pair) == "paired") {
+            ++paired;
+        } else if (PairStatus(pair) == "open") {
+            ++open;
+        }
+    }
+    coverage["window_pairs_paired"] = paired;
+    coverage["window_pairs_open"] = open;
+    root["coverage"] = coverage;
+}
+
+}  // namespace
+
+bool IsKnownViewName(std::string_view name) noexcept {
+    return name == "gmp" || name == "timeline" || name == "sched" ||
+           name == "park" || name == "timer" || name == "primitives";
+}
+
+std::string BuildViewJson(std::string_view name, std::uint64_t gid,
+                          const std::string& scheduler_json,
+                          const std::string& timer_json,
+                          const std::string& io_json) {
+    ViewJson root = ViewJson::object();
+    if (!IsKnownViewName(name)) {
+        root["schema"] = "go2cpp.dump.view.error/1";
+        root["version"] = 1;
+        root["ok"] = false;
+        root["error"] = "unknown-view";
+        root["view"] = std::string(name);
+        return root.dump() + "\n";
+    }
+    if (name == "timeline" && gid == 0) {
+        root["schema"] = "go2cpp.dump.view.error/1";
+        root["version"] = 1;
+        root["ok"] = false;
+        root["error"] = "missing-gid";
+        root["view"] = std::string(name);
+        return root.dump() + "\n";
+    }
+
+    const std::uint64_t seq_start = EventRing::PublishSeq();
+    const std::vector<EventRecord> events = EventRing::Snapshot(0);
+    const std::uint64_t seq_end = EventRing::PublishSeq();
+    const ViewJson scheduler = ParseViewJson(scheduler_json);
+    const ViewJson timer_service = ParseViewJson(timer_json);
+    const ViewJson io_manager = ParseViewJson(io_json);
+    const std::vector<ParkPair> pairs = PairParks(events);
+
+    root["schema"] = "go2cpp.dump.view." + std::string(name) + "/1";
+    root["version"] = 1;
+    root["ok"] = true;
+    root["view"] = std::string(name);
+    root["gid"] = gid;
+    root["generated_seq"] = seq_end;
+    root["event_ring_enabled"] = EventRing::Enabled();
+    root["window"] = WindowJson(events, seq_start, seq_end);
+    root["totals"] = TotalsJson();
+    AppendCoverage(root, pairs);
+
+    if (name == "gmp") {
+        root["gmp"] = GmpView(scheduler, pairs);
+        ViewJson resources = ViewJson::object();
+        resources["timer"] =
+            TimerView(timer_service, events).value("service", ViewJson::object());
+        resources["io"] = io_manager.is_object() && !io_manager.empty()
+                              ? io_manager
+                              : ViewJson(nullptr);
+        root["resources"] = resources;
+    } else if (name == "timeline") {
+        root["timeline"] = TimelineView(gid, events, scheduler);
+        ViewJson park_pairs = ViewJson::array();
+        for (const auto& pair : pairs) {
+            if (pair.gid == gid) {
+                park_pairs.push_back(PairToJson(pair));
+            }
+        }
+        root["parks"] = park_pairs;
+    } else if (name == "sched") {
+        ViewJson sched = SchedView(events, pairs, scheduler);
+        root["sched"] = sched;
+    } else if (name == "park") {
+        root["park"] = ParkView(pairs, scheduler);
+    } else if (name == "timer") {
+        ViewJson timer_view = TimerView(timer_service, events);
+        root["timer"] = timer_view;
+    } else if (name == "primitives") {
+        root["primitives"] = PrimitivesView(events, pairs);
+    }
+    return root.dump() + "\n";
 }
 
 

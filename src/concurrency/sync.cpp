@@ -1218,6 +1218,8 @@ bool Mutex::LockImpl(const ContextPtr& context,
                 static_cast<std::uint8_t>(expected_state | Impl::kLocked),
                 std::memory_order_acquire, std::memory_order_relaxed)) {
             note_lock_held();
+            GO2CPP_DEBUG_EVENT_SAMPLED(
+                kMutexFastLock, GO2CPP_DEBUG_BOUND_TASK(), 0, 32);
             return true;
         }
     }
@@ -1254,6 +1256,7 @@ bool Mutex::LockImpl(const ContextPtr& context,
 
     // 争用事件：能走到这里说明快速 CAS 已失败，本次 Lock 必须排队/自旋/park。
     // 只在慢路径记录（无竞争加锁零开销）；pid 由事件环从调度器绑定读取。
+    GO2CPP_DEBUG_PARK_HINT(kMutex);
     GO2CPP_DEBUG_EVENT(
         kMutexLock,
         target.task ? static_cast<std::uint64_t>(target.task->id()) : 0ULL, 0);
@@ -1677,6 +1680,7 @@ void Mutex::Unlock() {
         GO2CPP_DEBUG_EVENT(kMutexUnlock,
                            unlocker != nullptr ? unlocker->id() : 0, 1);
 #endif
+        GO2CPP_DEBUG_WAKE_HINT(kMutex);
         selected->Wake();
     }
 }

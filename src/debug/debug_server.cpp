@@ -947,7 +947,9 @@ std::string DebugServer::HandleCommand(const std::string& line) {
         return OkResponse(
             "commands: PING | LIST | STATUS | DUMP <component>|ALL | "
             "TEXT <component>|ALL | JSON <component>|ALL | EVENTS [limit] | "
+            "VIEW <name> [gid] | VIEWS | "
             "SUBSCRIBE <topic> [interval_ms] [max_events] | HELP\n"
+            "views: gmp | timeline <gid> | sched | park | timer | primitives\n"
             "protocol: GO2CPP-DEBUG/1\npush: GO2CPP-DEBUG-PUSH/1\n");
     }
     if (command == "STATUS") {
@@ -993,6 +995,47 @@ std::string DebugServer::HandleCommand(const std::string& line) {
         // HandleClient 会在 socket 路径上拦截 SUBSCRIBE 并转成长连接；
         // 进程内调用没有连接可推送，明确报错而不是假装成功。
         return ErrorResponse("bad-command", "subscribe-requires-socket");
+    }
+    if (command == "VIEWS") {
+        return OkResponse(
+            "gmp\ntimeline\t--gid <gid>\nsched\npark\ntimer\n"
+            "primitives\nschema: go2cpp.dump.view.<name>/1\n");
+    }
+    if (command == "VIEW") {
+        const std::vector<std::string> tokens = SplitTokens(argument);
+        if (tokens.empty()) {
+            return ErrorResponse("bad-command", "missing-view");
+        }
+        const std::string& view = tokens[0];
+        if (!IsKnownViewName(view)) {
+            return ErrorResponse("unknown-view", view + "-not-supported");
+        }
+        std::uint64_t gid = 0;
+        if (tokens.size() > 1) {
+            try {
+                std::size_t consumed = 0;
+                gid = static_cast<std::uint64_t>(
+                    std::stoull(tokens[1], &consumed));
+                if (consumed != tokens[1].size()) {
+                    return ErrorResponse("bad-command", "invalid-gid");
+                }
+            } catch (...) {
+                return ErrorResponse("bad-command", "invalid-gid");
+            }
+        }
+        if (view == "timeline" && gid == 0) {
+            return ErrorResponse("bad-command", "missing-gid");
+        }
+        // 逐组件采集：不同 provider 各自独立加锁，避免在 server 锁内
+        // 递归调用 Dump()。未注册的组件按空 JSON 处理。
+        const DumpPayload scheduler_payload = Dump("scheduler");
+        const DumpPayload timer_payload = Dump("timer");
+        const DumpPayload io_payload = Dump("io");
+        return OkResponse(BuildViewJson(
+            view, gid,
+            scheduler_payload.available ? scheduler_payload.json : std::string(),
+            timer_payload.available ? timer_payload.json : std::string(),
+            io_payload.available ? io_payload.json : std::string()));
     }
     if (command == "EVENTS") {
         std::size_t limit = 0;

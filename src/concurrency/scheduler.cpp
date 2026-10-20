@@ -828,6 +828,8 @@ void Task::run() {
     }
 
     Fiber* fiber = nullptr;
+    // 本次 run() 是否刚刚创建了执行栈：用于区分「首次启动」与「再次恢复」。
+    bool created_fiber_now = false;
     {
         std::lock_guard<std::mutex> lock(m_transition_mutex);
         fiber = m_fiber.get();
@@ -858,6 +860,7 @@ void Task::run() {
                 if (!m_fiber) {
                     m_fiber = std::move(created_fiber);
                     m_started.store(true, std::memory_order_release);
+                    created_fiber_now = true;
                 }
                 fiber = m_fiber.get();
             }
@@ -907,6 +910,17 @@ void Task::run() {
     // Only this run claim can move/destroy m_fiber, and it does so after
     // resume() returns while holding m_transition_mutex. A concurrent cancel
     // can therefore safely request cancellation on this stable pointer.
+    // G 生命周期：首次 resume 是 start，之后是 resumed（arg2=M）。
+    if (Scheduler::current_scheduler() != nullptr) {
+        if (created_fiber_now) {
+            GO2CPP_DEBUG_EVENT(kGStarted, id(),
+                               static_cast<std::uint64_t>(t_machine_id));
+        } else {
+            GO2CPP_DEBUG_EVENT(kGResumed, id(),
+                               static_cast<std::uint64_t>(t_machine_id));
+        }
+    }
+    (void)created_fiber_now;
     const bool resumed = Scheduler::current_scheduler() != nullptr
                              ? fiber->resume_from_scheduler()
                              : fiber->resume();
@@ -977,6 +991,20 @@ void Task::run() {
         m_run_claim.store(false, std::memory_order_release);
     }
     if (became_terminal) {
+        const GState final_state = m_state.load(std::memory_order_relaxed);
+        if (final_state == GState::kFailed) {
+            GO2CPP_DEBUG_EVENT(
+                kGFailed, id(),
+                static_cast<std::uint64_t>(final_state));
+        } else if (final_state == GState::kCancelled) {
+            GO2CPP_DEBUG_EVENT(
+                kGCancelled, id(),
+                static_cast<std::uint64_t>(final_state));
+        } else {
+            GO2CPP_DEBUG_EVENT(
+                kGCompleted, id(),
+                static_cast<std::uint64_t>(final_state));
+        }
         if (fiber_failure) {
             auto logger = GO2CPP_LOG_NAME("Scheduler");
             GO2CPP_LOG_ERROR(logger) << "Fiber task " << m_id
@@ -1487,7 +1515,9 @@ public:
         // 心跳先于调度器锁更新。高负载时即使本轮无法取得锁，
         // monitor 线程也不会永久卡在业务队列上，调用者仍能观察到它在线。
         const auto now = steady_now_ns();
-        sysmon_pass_count.fetch_add(1, std::memory_order_relaxed);
+        const auto pass_number =
+            sysmon_pass_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        GO2CPP_DEBUG_EVENT_SAMPLED(kSysmonPass, 0, pass_number, 32);
         const auto threshold = milliseconds_to_ns(config.long_syscall_threshold);
         std::size_t detached_count = 0;
         {
@@ -1896,7 +1926,11 @@ public:
         if (!lifetime->owner || !lifetime->owner->is_running()) {
             return false;
         }
-        return static_cast<bool>(lifetime->owner->spawn(std::move(callback)));
+        auto task = lifetime->owner->spawn(std::move(callback));
+        if (task) {
+            GO2CPP_DEBUG_EVENT(kTimerEnqueue, task->id(), 0);
+        }
+        return static_cast<bool>(task);
     }
 
 private:
@@ -2350,6 +2384,7 @@ std::shared_ptr<Task> Scheduler::spawn(Task::Function function,
         options.fiber_bin_capacity = m_impl->config.fiber_bin_capacity;
     }
     auto task = std::make_shared<Task>(std::move(function), options);
+    GO2CPP_DEBUG_EVENT(kGCreated, task ? task->id() : 0, 0);
     if (!enqueue(task)) {
         task->cancel();
     }
@@ -2739,13 +2774,18 @@ bool Scheduler::yield(const std::shared_ptr<Task>& task) {
         return false;
     }
     task->defer_enqueue();
+    GO2CPP_DEBUG_PARK_HINT(kYield);
+    GO2CPP_DEBUG_EVENT(kParkEnter, task->id(),
+                       static_cast<std::uint64_t>(SuspendReason::Yield));
     if (!Fiber::SuspendForScheduler(SuspendReason::Yield)) {
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 4);
         // mark_yielded_fast() 已把状态改成 kRunnable，但这次 yield 并没有
         // 真正交回调度器。必须把它恢复成 kRunning，否则当前执行流会在
         // "runnable 但未入队"的状态下继续跑，下一次 park 被拒后空转。
         (void)task->resume_after_failed_park();
         return false;
     }
+    GO2CPP_DEBUG_EVENT(kParkReturn, task->id(), 1);
     return !task->cancellation_requested();
 }
 
@@ -2762,11 +2802,13 @@ bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
                        static_cast<std::uint64_t>(SuspendReason::Park));
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get()) {
+        GO2CPP_DEBUG_EVENT(kParkRejected, task ? task->id() : 0, 1);
         return false;
     }
     if (m_impl->draining.load(std::memory_order_acquire) ||
         m_impl->stopping.load(std::memory_order_acquire) ||
         task->cancellation_requested()) {
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 2);
         return false;
     }
 
@@ -2775,18 +2817,23 @@ bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
     // 已开始，回滚 Waiting 状态并让调用方走取消路径，不能遗留悬挂 G。
     const ParkAction action = task->park_for_scheduler();
     if (action != ParkAction::kParked) {
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 3);
         return false;
     }
     if (m_impl->draining.load(std::memory_order_acquire) ||
         m_impl->stopping.load(std::memory_order_acquire) ||
         task->cancellation_requested()) {
         (void)task->wake_for_wait();
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 2);
         return false;
     }
     if (!Fiber::SuspendForScheduler(SuspendReason::Park)) {
         (void)task->resume_after_failed_park();
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 5);
         return false;
     }
+    GO2CPP_DEBUG_EVENT(kParkReturn, task->id(),
+                       task->cancellation_requested() ? 0 : 1);
     return !task->cancellation_requested();
 }
 
@@ -2799,16 +2846,22 @@ bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
 bool Scheduler::park_wait_for_cleanup(const std::shared_ptr<Task>& task) {
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get()) {
+        GO2CPP_DEBUG_EVENT(kParkRejected, task ? task->id() : 0, 1);
         return false;
     }
+    GO2CPP_DEBUG_EVENT(kParkEnter, task->id(),
+                       static_cast<std::uint64_t>(SuspendReason::Park));
     const ParkAction action = task->park_for_scheduler();
     if (action != ParkAction::kParked) {
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 3);
         return false;
     }
     if (!Fiber::SuspendForScheduler(SuspendReason::Park)) {
         (void)task->resume_after_failed_park();
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 5);
         return false;
     }
+    GO2CPP_DEBUG_EVENT(kParkReturn, task->id(), 1);
     return true;
 }
 
@@ -2817,11 +2870,13 @@ bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
                        static_cast<std::uint64_t>(SuspendReason::Io));
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get()) {
+        GO2CPP_DEBUG_EVENT(kParkRejected, task ? task->id() : 0, 1);
         return false;
     }
     if (m_impl->draining.load(std::memory_order_acquire) ||
         m_impl->stopping.load(std::memory_order_acquire) ||
         task->cancellation_requested()) {
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 2);
         return false;
     }
     // The IO poller changes Waiting -> Runnable with wake_io(). Publish the
@@ -2830,18 +2885,23 @@ bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
     // admission mutex on every socket wait.
     const auto action = task->park_for_scheduler();
     if (action != ParkAction::kParked) {
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 3);
         return false;
     }
     if (m_impl->draining.load(std::memory_order_acquire) ||
         m_impl->stopping.load(std::memory_order_acquire) ||
         task->cancellation_requested()) {
         (void)task->wake_for_io();
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 2);
         return false;
     }
     if (!Fiber::SuspendForScheduler(SuspendReason::Io)) {
         (void)task->resume_after_failed_park();
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 5);
         return false;
     }
+    GO2CPP_DEBUG_EVENT(kParkReturn, task->id(),
+                       task->cancellation_requested() ? 0 : 1);
     return !task->cancellation_requested();
 }
 
@@ -2851,6 +2911,7 @@ bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
                        static_cast<std::uint64_t>(reason));
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get()) {
+        GO2CPP_DEBUG_EVENT(kParkRejected, task ? task->id() : 0, 1);
         return false;
     }
     // Shutdown scans waiting Gs under this same mutex. Do not enter waiting
@@ -2861,17 +2922,22 @@ bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
         if (m_impl->draining.load(std::memory_order_acquire) ||
             m_impl->stopping.load(std::memory_order_acquire) ||
             task->cancellation_requested()) {
+            GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 2);
             return false;
         }
         action = task->park_for_scheduler();
     }
     if (action != ParkAction::kParked) {
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 3);
         return false;
     }
     if (!Fiber::SuspendForScheduler(reason)) {
         (void)task->resume_after_failed_park();
+        GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 5);
         return false;
     }
+    GO2CPP_DEBUG_EVENT(kParkReturn, task->id(),
+                       task->cancellation_requested() ? 0 : 1);
     return !task->cancellation_requested();
 }
 
@@ -2989,6 +3055,7 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
 
 bool Scheduler::wake_io(const std::shared_ptr<Task>& task) {
     GO2CPP_DEBUG_EVENT(kIoWake, task ? task->id() : 0, 0);
+    GO2CPP_DEBUG_WAKE_HINT(kIo);
     if (!task || !task->owned_by(m_impl->owner_token)) {
         return false;
     }
@@ -3489,6 +3556,56 @@ std::vector<TaskSnapshot> Scheduler::DebugSnapshotTasks() const {
     return result;
 }
 
+bool Scheduler::IsTaskAlive(GId id) const {
+    if (!m_impl) {
+        return false;
+    }
+    // 单个 gid 只可能落在它 id 对应的那一个条带里（注册时用同一个
+    // id 按位与「分片数 - 1」选片），所以这里只锁一个分片、只扫这一片，
+    // 不枚举全量注册表；开销与历史任务数无关。
+    const std::size_t stripe =
+        static_cast<std::size_t>(id) & (Impl::kRegistryStripeCount - 1);
+    std::lock_guard<std::mutex> registry_lock(
+        m_impl->registry_mutexes[stripe]);
+    for (const auto& task : m_impl->task_registries[stripe]) {
+        if (task && task->id() == id) {
+            // 注册表可能仍滞留已进入终态、尚未被 collect_terminal_locked
+            // 回收的 G，因此必须看 terminal()，不能「查到了就算活」。
+            return !task->terminal();
+        }
+    }
+    return false;
+}
+
+TaskTerminalState Scheduler::TaskTerminal(GId id) const {
+    if (!m_impl) {
+        return TaskTerminalState::kUnknown;
+    }
+    const std::size_t stripe =
+        static_cast<std::size_t>(id) & (Impl::kRegistryStripeCount - 1);
+    std::lock_guard<std::mutex> registry_lock(
+        m_impl->registry_mutexes[stripe]);
+    for (const auto& task : m_impl->task_registries[stripe]) {
+        if (!task || task->id() != id) {
+            continue;
+        }
+        switch (task->state()) {
+            case GState::kDead:
+                // kDead 是 Fiber 正常执行完毕的终态。
+                return TaskTerminalState::kCompleted;
+            case GState::kFailed:
+                return TaskTerminalState::kFailed;
+            case GState::kCancelled:
+                return TaskTerminalState::kCancelled;
+            default:
+                // 仍是活动状态：不是终态，返回 kUnknown；需要区分存活时
+                // 先调 IsTaskAlive()。
+                return TaskTerminalState::kUnknown;
+        }
+    }
+    return TaskTerminalState::kUnknown;
+}
+
 std::vector<MachineSnapshot> Scheduler::machines() const {
     std::vector<MachineSnapshot> result;
     if (!m_impl) {
@@ -3918,6 +4035,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 if (!task && m_impl->processors.size() > 1) {
                     const auto start = m_impl->next_processor.fetch_add(
                         1, std::memory_order_relaxed);
+                    std::uint64_t victim_id = 0;
                     for (std::size_t offset = 0;
                          offset < m_impl->processors.size(); ++offset) {
                         auto& victim = m_impl->processors[
@@ -3931,9 +4049,20 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                             if (task) {
                                 m_impl->metric_steal_pops.fetch_add(
                                     1, std::memory_order_relaxed);
+                                victim_id =
+                                    static_cast<std::uint64_t>(victim.id);
                             }
                             break;
                         }
+                    }
+                    if (task) {
+                        GO2CPP_DEBUG_EVENT(kStealOk, task->id(), victim_id);
+                    } else {
+                        GO2CPP_DEBUG_EVENT_SAMPLED(
+                            kStealFail, 0,
+                            static_cast<std::uint64_t>(
+                                m_impl->processors.size() - 1),
+                            16);
                     }
                 }
 
@@ -4004,6 +4133,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             own_processor.state.store(PState::kRunning,
                                       std::memory_order_release);
             t_task = task;
+            GO2CPP_DEBUG_BIND_TASK(task->id());
             Fiber::BindCurrentExecution(FiberExecutionBinding{
                 reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,
                 t_processor_id, true});
@@ -4045,6 +4175,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 }
             }
             t_task.reset();
+            GO2CPP_DEBUG_UNBIND_TASK();
             Fiber::BindCurrentExecution(FiberExecutionBinding{
                 reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,
                 t_processor_id, true});
@@ -4231,6 +4362,9 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         }
 
         machine->state.store(MState::kParked, std::memory_order_release);
+        GO2CPP_DEBUG_EVENT_SAMPLED(
+            kWorkerPark, machine->id,
+            static_cast<std::uint64_t>(own_processor.id), 8);
         // 锁归属说明（R10）：worker 对自己 M 的状态写入不需要 Impl::mutex；
         // 但 P 的 attached 记账（active_machines）由 worker 创建/退休与
         // sysmon/leave_blocking 在 Impl::mutex 内共同维护。这里的
@@ -4332,6 +4466,9 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             retired = true;
             break;
         }
+        GO2CPP_DEBUG_EVENT_SAMPLED(
+            kWorkerUnpark, machine->id,
+            static_cast<std::uint64_t>(woke ? 1 : 3), 8);
         machine->state.store(MState::kIdle, std::memory_order_release);
     }
 
@@ -4360,6 +4497,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     GO2CPP_DEBUG_EVENT(kThreadStop, machine->id, machine->processor);
     m_impl->notify_all_workers();
     t_task.reset();
+    GO2CPP_DEBUG_UNBIND_TASK();
     Fiber::BindCurrentExecution(FiberExecutionBinding{});
     thread_policy::detail::LeaveRuntimeWorker();
     t_scheduler = nullptr;

@@ -295,6 +295,8 @@ struct DiagnosticAgentStats {
     std::uint64_t concurrent_peak{0}; ///< 同时执行命令数的峰值（期望恒为 1）。
     std::uint64_t deadlock_events{0};
     std::uint64_t auto_force_wakes{0};
+    /// 已执行的 `mutex-unlock --force` 次数（危险操作审计；默认拒绝时不计）。
+    std::uint64_t forced_unlocks{0};
     std::uint64_t fiber_jobs{0};
     std::uint64_t fiber_failures{0};
 };
@@ -575,6 +577,7 @@ private:
     std::atomic<std::uint64_t> m_concurrent_peak{0};
     std::atomic<std::uint64_t> m_deadlock_events{0};
     std::atomic<std::uint64_t> m_auto_force_wakes{0};
+    std::atomic<std::uint64_t> m_forced_unlocks{0};
     std::atomic<std::uint64_t> m_fiber_jobs{0};
     std::atomic<std::uint64_t> m_fiber_failures{0};
 

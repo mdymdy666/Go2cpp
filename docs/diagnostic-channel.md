@@ -97,7 +97,7 @@ status [json]
 dump [sections=a,b] [format=json]
 force-wake scope=scheduler-idle|parking-condition|channel|all|mutex
 deadlock-report [json]
-mutex-unlock name=<registered-mutex>
+mutex-unlock name=<registered-mutex> [--force reason=<text>]
 inject-fiber fn=<registered-function> [timeout_ms=2000] [json]
 ping | stats [json] | help
 ```
@@ -271,6 +271,58 @@ held_after=false
 已知限制：owner 记录依赖「持锁 park 检测」（`SetHeldLockParkDetection(true)`，
 Debug 构建默认开启，Release 默认关闭）。未开启时 `owner_known=false`，
 `mutex-unlock` 一律拒绝 —— 这是有意的保守行为。
+
+#### 4.5.1 `--force`：受控强制解锁（危险，默认拒绝）
+
+```text
+mutex-unlock name=<registered-mutex> --force reason=<text>
+```
+
+锁顺序反转（A→B 与 B→A）造成的死锁里，两个 owner 都是**存活**的 G，
+上面的安全检查必然返回 `owner-alive`。为了让「演示环境里解开死锁」这件事
+可操作，Doctor 提供一条显式、带审计的强制路径：
+
+1. 必须同时出现 `--force`（或 `force=1`）与 `reason=<非空文本>`；
+   缺 reason 直接 `bad-argument: mutex-unlock --force requires reason=<text>`；
+2. 跳过 owner-gone 证明，直接在**调用线程**上执行既有 `Mutex::Unlock()`；
+3. 自增 `stats().forced_unlocks`（**在 Unlock 之前**自增：被唤醒的等待者
+   可能在 Unlock 返回前就跑完临界区，晚自增会让协作方观测不到这次强制解锁）；
+4. 响应体给出 `verdict=forced`、`audit=true`、`force=true`、`reason=`、
+   `owner_gid/owner_known/waiters_before/waiters_after/held_after/forced_total`；
+5. 同时在 stderr 打一行 `[go2cpp][doctor][audit] mutex-unlock --force ...`。
+
+> **风险（必须写进使用文档，不能只在代码注释里）**
+>
+> - 被夺锁的 owner **不知道**自己已经失去锁，之后仍可能访问临界区，
+>   造成两个执行流同时进入临界区；
+> - 若 owner 之后仍然 `Unlock()`，轻则抛
+>   `go2cpp::sync::Mutex unlock of unlocked mutex`，重则把锁从新的合法
+>   持有者手里抢走；
+> - 因此 `--force` **只适用于「进程已经卡死、数据一致性已不可保」的
+>   故障处置/demo**，不能作为常规运维手段；生产环境应优先修锁顺序、
+>   使用 try-lock/退避，或直接重启进程；
+> - 协作方（业务代码）若要在 force 之后继续运行，必须自己识别「锁已被
+>   夺走」并跳过对旧锁的释放。`tests/scenarios/deadlock_routes/` 给出了
+>   一个例子：handler 释放前比较 `forced_unlocks` 计数 + Mutex owner，
+>   只释放仍属于自己的锁（日志里记为 `stale-unlock-skip`）。
+
+强制解锁示例：
+
+```text
+schema=go2cpp.diagnostic.mutex-unlock/1
+name=res-a
+verdict=forced
+audit=true
+force=true
+reason=deadlock-scenario-demo
+owner_gid=2100
+owner_known=true
+waiters_before=5
+waiters_after=4
+held_after=false
+forced_total=1
+```
+
 
 ### 4.6 `inject-fiber`（诊断 Fiber）
 
@@ -471,7 +523,11 @@ GO2CPP_TEST_FILTER=diagnostic ./build-diag/go2cpp_tests
 # 2) 端到端：真实进程 + 真实 Unix socket + 丢唤醒恢复
 bash tests/debug/run_diagnostic_e2e.sh build-diag
 
-# 3) 手动体验
+# 3) 真实场景：100+ HTTP client → 锁顺序死锁 → dump → force-wake → --force 解锁
+bash tests/scenarios/deadlock_routes/run_deadlock_scenario.sh build-doctor-full
+#    重复触发率：追加 --repro 10
+
+# 4) 手动体验
 ./build-diag/go2cpp_diagnostic_demo /tmp/demo.sock
 python3 tests/debug/doctor_client.py /tmp/demo.sock status
 python3 tests/debug/doctor_client.py /tmp/demo.sock deadlock-report
