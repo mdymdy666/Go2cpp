@@ -95,6 +95,37 @@ struct FiberContextFrame {
 
 using FiberContextSnapshot = std::vector<FiberContextFrame>;
 
+// ---------------------------------------------------------------------------
+// 调试快照（只读）：栈范围 / committed / 父 Fiber
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Fiber 栈的只读快照（诊断与重放用）。
+ *
+ * ## 边界
+ * 全部地址都是进程虚拟地址；`has_stack=false` 表示该 Fiber 已终态、
+ * 上下文已释放（`m_stack == nullptr`），此时地址字段全为 0。
+ * `current_sp` 只在**当前线程正在执行该 Fiber** 时可读，其它情况为 0 ——
+ * 不伪造一个「看起来有意义」的栈指针。
+ */
+struct FiberStackDebugSnapshot {
+    std::uint64_t id{0};                      ///< Fiber 编号
+    FiberState state{FiberState::Ready};      ///< 生命周期状态
+    SuspendReason suspend_reason{SuspendReason::None}; ///< 最近挂起原因
+    bool has_stack{false};                    ///< 是否仍有活跃栈（运行/挂起中）
+    bool growable{false};                     ///< 是否启用按需增长
+    std::size_t requested_bytes{0};           ///< 归一化后的初始提交请求
+    std::size_t reserve_bytes{0};             ///< 预留虚拟地址空间
+    std::size_t usable_bytes{0};              ///< 当前已提交区的可用量
+    std::uintptr_t mapping_base{0};           ///< 映射底（预留区最低地址，含 guard）
+    std::uintptr_t mapping_top{0};            ///< 映射顶（栈高地址）
+    std::uintptr_t committed_begin{0};        ///< 当前已提交区底部
+    std::uintptr_t current_sp{0};             ///< 仅当前线程正在执行时非 0
+    std::uint64_t parent_id{0};               ///< 逻辑父 Fiber 编号
+    std::uint64_t active_parent_id{0};        ///< 最近一次 resume 的实际调用者
+    std::size_t nesting_depth{0};             ///< 嵌套深度（main_fiber 为 0）
+};
+
 // 一次 resume 的非异常结果。Fiber 不把 C++ 异常抛出到调度器；调用者
 // 可以通过 failure 和 context_snapshot 显式取得失败原因及完整父链。
 /** @brief resume 操作的可检查结果。 */
@@ -246,6 +277,12 @@ public:
     /** @brief 返回当前 Fiber 调试帧。 */
     FiberContextFrame debug_info() const;
     FiberContextFrame DebugInfo() const { return debug_info(); }
+    /**
+     * @brief 返回栈范围、committed 与父 Fiber 的只读快照。
+     * @note best-effort：与 Fiber 自身的 reset/析构并发时可能读到过渡值；
+     *       本函数不加锁、不改状态，只用于诊断与重放记录。
+     */
+    FiberStackDebugSnapshot debug_stack() const;
     // 返回从本 Fiber 向上追溯的逻辑调用链。Fiber 被迁移或挂起后仍
     // 保留首次进入时的父级关系；父对象结束后由共享记录保留
     // alive=false 的墓碑帧。墓碑只用于观测、取消和诊断，不能恢复已销毁的父栈。

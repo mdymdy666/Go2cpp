@@ -552,6 +552,12 @@ struct FiberStack {
 
     bool growable() const noexcept { return m_reserve != 0; }
 
+    // 诊断用：实际生效的预留大小与映射大小。构造参数 reserve 为 0 时
+    // 也会解析出默认预留（8MiB）或固定栈映射，因此快照必须报告这里的
+    // 实际值，而不是构造参数。
+    std::size_t reserve_size() const noexcept { return m_reserve; }
+    std::size_t mapping_size() const noexcept { return m_mapping_size; }
+
     // 当前已提交区的大小。growable 栈增长后 bottom() 会下移，MakeContext
     // 在首次 resume 前调用，因此这里返回的就是初始提交量；复用前池化路径
     // 已把 committed 重置回初始位置。
@@ -1775,6 +1781,43 @@ void Fiber::bind_execution(FiberExecutionBinding binding) noexcept {
     std::lock_guard<std::mutex> lock(m_impl->m_record->mutex);
     m_impl->m_record->execution = binding;
     m_impl->m_record->last_thread = std::this_thread::get_id();
+}
+
+FiberStackDebugSnapshot Fiber::debug_stack() const {
+    FiberStackDebugSnapshot snapshot;
+    const auto record = m_impl->m_record;
+    snapshot.id = record->id;
+    {
+        std::lock_guard<std::mutex> lock(record->mutex);
+        snapshot.state = record->state.load(std::memory_order_acquire);
+        snapshot.suspend_reason = record->reason.load(std::memory_order_acquire);
+        snapshot.parent_id = record->parent == nullptr ? 0 : record->parent->id;
+        snapshot.active_parent_id = record->active_parent_id;
+        snapshot.nesting_depth = record->depth;
+    }
+    snapshot.requested_bytes = m_impl->m_stack_size;
+    snapshot.reserve_bytes = m_impl->m_stack_reserve_size;
+    // m_stack 在终态 reset 后为空；并发 reset 与读取之间可能出现过渡值，
+    // 因此本函数刻意不把「读到空」当成错误，只是如实标注 has_stack。
+    FiberStack* stack = m_impl->m_stack.get();
+    if (stack != nullptr) {
+        snapshot.has_stack = true;
+        snapshot.growable = stack->growable();
+        snapshot.reserve_bytes = stack->reserve_size();
+        snapshot.usable_bytes = stack->usable_size();
+        snapshot.mapping_base =
+            reinterpret_cast<std::uintptr_t>(stack->growth_base());
+        snapshot.mapping_top =
+            reinterpret_cast<std::uintptr_t>(stack->growth_top());
+        snapshot.committed_begin = stack->growth_committed();
+        if (s_current_fiber == this) {
+            // 当前线程正在执行的 Fiber 才能读到有意义的栈帧地址；
+            // 其它 Fiber 返回 0，不伪造 sp。
+            snapshot.current_sp =
+                reinterpret_cast<std::uintptr_t>(&snapshot);
+        }
+    }
+    return snapshot;
 }
 
 std::size_t Fiber::nesting_depth() const noexcept {

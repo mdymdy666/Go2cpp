@@ -179,6 +179,34 @@ struct WaitManyResult {
  * @details 将 fd 事件注册到 epoll，Fiber 阻塞时释放工作线程，事件触发后
  *          重新入队；普通线程也可通过 wait 接口安全使用。
  */
+/**
+ * @brief IOManager 的只读调试快照。
+ *
+ * ## 字段口径
+ * - `fd_slots`：仍被保留的 FdSlot 数（含为空闲复用而保留的槽位）；
+ * - `slots_with_waiters`：至少有一个读/写等待者的槽位数；
+ * - `epoll_registered`：当前在 epoll 中仍注册着的 fd 数；
+ * - `pending_read/pending_write`：EAGAIN 轮询缓存的一次性边沿数；
+ * - `timers`：deadline 索引中的条目数。
+ *
+ * 快照逐条带加锁采集，不是同一瞬间的全局原子视图。
+ */
+struct IOManagerDebugSnapshot {
+    bool running{false};
+    bool accepting{false};
+    bool worker_polling{false};
+    std::size_t fd_slots{0};
+    std::size_t slots_with_waiters{0};
+    std::size_t epoll_registered{0};
+    std::size_t reader_waiters{0};
+    std::size_t writer_waiters{0};
+    std::size_t pending_read{0};
+    std::size_t pending_write{0};
+    std::size_t timers{0};
+    std::size_t scheduler_runnable{0};
+    std::size_t scheduler_workers{0};
+};
+
 class IOManager final {
 public:
     using Clock = std::chrono::steady_clock;
@@ -304,6 +332,13 @@ public:
     /** @brief 返回当前线程绑定的 IOManager。 */
     static IOManager* current() noexcept;
     static IOManager* Current() noexcept { return current(); }
+
+    /**
+     * @brief 采集 FdSlot / 等待者 / epoll 注册的只读快照。
+     * @note 遍历 64 条文带并逐条加锁，成本高于普通计数；仅在调试/CLI
+     *       路径调用。不改变任何等待节点的状态。
+     */
+    IOManagerDebugSnapshot DebugSnapshot() const;
 
 private:
     struct State;

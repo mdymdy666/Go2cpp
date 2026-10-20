@@ -43,6 +43,10 @@ void run_debug_lock_selector_tests();
 void run_debug_events_tests();
 void run_debug_breakpoints_tests();
 void run_debug_signal_dump_tests();
+void run_debug_dump_tests();
+#if defined(GO2CPP_DIAGNOSTIC) && GO2CPP_DIAGNOSTIC
+void run_diagnostic_tests();
+#endif
 void run_spin_mutex_tests();
 void run_spin_mutex_child(const char* scenario);
 
@@ -108,6 +112,10 @@ int main() {
     if (selected("debug_events")) run_debug_events_tests();
     if (selected("debug_breakpoints")) run_debug_breakpoints_tests();
     if (selected("debug_signal_dump")) run_debug_signal_dump_tests();
+    if (selected("debug_dump")) run_debug_dump_tests();
+#if defined(GO2CPP_DIAGNOSTIC) && GO2CPP_DIAGNOSTIC
+    if (selected("diagnostic")) run_diagnostic_tests();
+#endif
     if (selected("spin_mutex")) run_spin_mutex_tests();
 #ifdef GO2CPP_TEST_HOOK
     if (selected("hook")) run_hook_tests();

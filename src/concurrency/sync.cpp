@@ -31,6 +31,7 @@
 
 #include "go2cpp/concurrency/core/futex_mutex.hpp"
 
+#include "go2cpp/debug/debug_event_ring.hpp"
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/scheduler.hpp"
 
@@ -1109,6 +1110,13 @@ MutexDebugSnapshot Mutex::DebugSnapshotInternal() const {
     const std::uint8_t state = m_impl->m_state.load(std::memory_order_acquire);
     snapshot.held = (state & Impl::kLocked) != 0U;
     snapshot.has_waiters = (state & Impl::kWaiter) != 0U;
+    snapshot.state_bits = state;
+    snapshot.locked = (state & Impl::kLocked) != 0U;
+    snapshot.waiter_flag = (state & Impl::kWaiter) != 0U;
+    snapshot.starving = (state & Impl::kStarving) != 0U;
+    snapshot.woken = (state & Impl::kWoken) != 0U;
+    snapshot.owner_gid = m_impl->m_owner.load(std::memory_order_relaxed);
+    snapshot.owner_known = snapshot.owner_gid != 0U;
     snapshot.native_waiters = m_impl->m_native_waiters.load(std::memory_order_acquire);
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
@@ -1243,6 +1251,12 @@ bool Mutex::LockImpl(const ContextPtr& context,
         was_woken = false;
         m_impl->DropWakeToken();
     };
+
+    // 争用事件：能走到这里说明快速 CAS 已失败，本次 Lock 必须排队/自旋/park。
+    // 只在慢路径记录（无竞争加锁零开销）；pid 由事件环从调度器绑定读取。
+    GO2CPP_DEBUG_EVENT(
+        kMutexLock,
+        target.task ? static_cast<std::uint64_t>(target.task->id()) : 0ULL, 0);
 
     for (;;) {
         // step2: 无竞争/正常模式快速路径——一次 CAS。kStarving 时禁止插队。
@@ -1658,6 +1672,11 @@ void Mutex::Unlock() {
     }
     // step4: 锁外唤醒（与 LockImpl 的 park 路径配对；持队列锁唤醒会死锁）。
     if (selected) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        const Task* const unlocker = Scheduler::current_task_ptr();
+        GO2CPP_DEBUG_EVENT(kMutexUnlock,
+                           unlocker != nullptr ? unlocker->id() : 0, 1);
+#endif
         selected->Wake();
     }
 }

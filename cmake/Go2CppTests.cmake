@@ -42,6 +42,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_events.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_breakpoints.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_signal_dump.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_dump.cpp
     )
     target_link_libraries(go2cpp_tests PRIVATE go2cpp_runtime)
     target_include_directories(go2cpp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -51,6 +52,32 @@ if (GO2CPP_BUILD_TESTS)
         target_compile_definitions(go2cpp_tests PRIVATE GO2CPP_TEST_HOOK=1)
     endif()
     target_compile_options(go2cpp_tests PRIVATE -Wall -Wextra -Wpedantic)
+    # Doctor 测试只在 GO2CPP_DIAGNOSTIC=ON 时编译。默认 OFF 构建既没有
+    # DiagnosticAgent 符号，也没有这些测试（保证 ctest 用例数与默认构建
+    # 零开销）。ON 时测试并入同一个 go2cpp_tests，**不新增 add_test**，
+    # 因此 ctest 用例总数保持不变。
+    if (GO2CPP_DIAGNOSTIC)
+        target_sources(go2cpp_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_diagnostic.cpp)
+
+        # 独立 demo 进程：供 tests/debug/run_diagnostic_e2e.sh 从外部诊断。
+        # **不注册 ctest**：ctest 用例总数保持不变；端到端验收由脚本执行。
+        add_executable(go2cpp_diagnostic_demo
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/diagnostic_deadlock_demo.cpp)
+        target_link_libraries(go2cpp_diagnostic_demo PRIVATE go2cpp_runtime)
+        target_compile_options(go2cpp_diagnostic_demo PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
+    # ---- SUBSCRIBE 实时推送 demo（仅 GO2CPP_DEBUG_DUMP=ON）----
+    # 不注册 ctest（保持用例总数不变）：由 tests/debug/run_subscribe_demo.sh
+    # 在测试脚本里做端到端演示与验收。
+    if (GO2CPP_DEBUG_DUMP)
+        add_executable(go2cpp_debug_subscribe_demo
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/debug_subscribe_demo.cpp)
+        target_link_libraries(go2cpp_debug_subscribe_demo PRIVATE go2cpp_runtime)
+        target_compile_options(go2cpp_debug_subscribe_demo PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
     add_test(NAME go2cpp_tests COMMAND go2cpp_tests)
     # 超时从 30 -> 60 -> 120：go2cpp_tests 是全部单元测试的集合。
     # 随调试模块陆续新增测试（debug_* 七个）后整体耗时约 18~30s，且**偶发**更高：

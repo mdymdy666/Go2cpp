@@ -29,6 +29,23 @@ struct MutexDebugSnapshot {
     std::size_t waiters{0};            ///< 等待队列长度（含 Fiber 与普通线程）。
     std::size_t native_waiters{0};     ///< 其中普通线程的数量。
     std::size_t fiber_waiters{0};      ///< 其中受管 Fiber 的数量（= waiters - native_waiters）。
+
+    // ---- 状态字（第 26 轮补全：owner / kLocked / kWaiter / kStarving / kWoken）----
+    // `state_bits` 是 `Mutex::Impl::m_state` 的原始值；四个 bit 与
+    // Go sync.Mutex 对应：kLocked=1, kWaiter=2, kStarving=4, kWoken=8。
+    // 单独给出布尔字段是为了让 CLI 不必硬编码位值；新增字段放在末尾，
+    // 保持既有聚合初始化兼容。
+    std::uint8_t state_bits{0};        ///< 原始状态字。
+    bool locked{false};                ///< = held；kLocked 位。
+    bool waiter_flag{false};           ///< kWaiter 位（队列非空的提示）。
+    bool starving{false};              ///< kStarving 位（饥饿模式）。
+    bool woken{false};                 ///< kWoken 位（唤醒令牌已发出）。
+    ///
+    /// **近似 owner**：`m_owner` 只在「持锁 park 检测」开启时由加锁路径写入，
+    /// 且 Go 风格所有权允许 A 加锁、B 解锁；因此它只是最近一次记录的受管 G，
+    /// 不是权威所有者。`owner_known=false` 表示没有记录（不是「无主」）。
+    std::uint64_t owner_gid{0};
+    bool owner_known{false};
 };
 
 // ---- 持锁 park 检测 ----

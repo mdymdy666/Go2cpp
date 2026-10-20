@@ -1301,3 +1301,143 @@ benchmarks/gmp_vs_thread_epoll_benchmark.cpp
   应用层；库侧 `Socket` 的写合并需要发送缓冲与 flush 策略，风险更高，未做；
 - `ctest` **116/116** 通过；
 - 未 commit / push；主目录未改动。
+
+## 20. 2026-10-20 四线集成联调（deepseek）
+
+### 20.1 改动
+
+1. **修复 `GO2CPP_DEBUG_DUMP=ON` 全量构建失败**：`EventRing::Record` 的实现原本
+   只在 `go2cpp_debug` 中，而 scheduler/io 在 ON 构建直接调用它；反向链接会与
+   `go2cpp_debug -> scheduler` 构成目标依赖环。新增零依赖库
+   `go2cpp_debug_event` 承载 `src/debug/debug_event_ring.cpp`，`go2cpp_debug`
+   与（仅 ON 构建的）scheduler/io 链接它。未改 `src/**`。
+2. **CLI 迁移协议对齐 v2**：`G2CMIG01` → `G2CMIG02`，新增 `version=2` 校验
+   （v1 与 version≠2 均退出 4）；帮助、文档、fixture、断言同步更新。
+3. **新增可复现集成测试**：
+   `tools/cli/tests/integration_e2e.sh`（44 断言）、
+   `tools/cli/tests/debug_longrun_demo.cpp`、
+   `tools/cli/tests/debug_socket_probe.py`；
+   详细报告 `docs/integration-test.md`。
+
+### 20.2 关键文件
+
+- `cmake/Go2CppModules.cmake`
+- `tools/cli/formats.hpp`、`tools/cli/formats.cpp`、`tools/cli/commands.cpp`、
+  `tools/cli/help.cpp`
+- `tools/cli/tests/make_binaries.py`、`tools/cli/tests/run_all.sh`
+- `tools/cli/tests/integration_e2e.sh`（新增）、
+  `tools/cli/tests/debug_longrun_demo.cpp`（新增）、
+  `tools/cli/tests/debug_socket_probe.py`（新增）
+- `docs/cli.md`、`docs/integration-test.md`（新增）
+
+### 20.3 测试结果（实际运行）
+
+- `bash tools/cli/tests/integration_e2e.sh`：**44 PASS / 0 FAIL**
+  （Debug 真实 socket、迁移 dump/verify/restore、CLI migrate、重放 record/replay、
+  CLI replay、丢唤醒复现）。
+- `ctest --test-dir build-integration --output-on-failure -j6`：
+  **116/116 通过，26.84s**（ON 构建）。
+- `GO2CPP_DEBUG_DUMP=OFF` 独立构建 `go2cpp_tests`：成功。
+- `BIN=build-integration/tools/cli/go2cpp-cli bash tools/cli/tests/run_all.sh`：
+  **PASS=202 FAIL=0**。
+- `bash tools/migration/tests/run_tests.sh build-migration`：**23/23 通过**。
+- `bash tools/replay/scripts/stress_record_replay.sh build-replay 10`：
+  **10/10 轮 MATCH**；`fault_injection.sh build-replay`：两种注入均 stuck。
+
+### 20.4 后续状态 / 已知限制
+
+- 本轮所有改动**未 commit**。
+- `migrate dump --pid/--gid` 仍是 demo 能力（后端只写自身进程 A 的快照），
+  CLI 已明确提示，未伪造按 pid/gid 抓取。
+- CLI `replay play` 调用离线 `tools/replay/replay`，报告
+  `replay_executed=false`；完整 Fiber 重放由 `go2cpp_replay_replay` 覆盖。
+- OFF 构建只验证了编译，未重跑完整 ctest；ON 构建 116/116 已完整通过。
+
+## 21. 2026-10-20 在线诊断 Doctor + 受控解锁（deepseek）
+
+### 21.1 改动
+
+1. **新增 Doctor（单线程命令平面）**：
+   - `include/go2cpp/debug/diagnostic_protocol.hpp`：G2CD/1 帧协议
+     （24 字节头：magic/version/kind/flags/stream_id/seq/len/FNV-1a 校验），
+     header-only，CLI 与 topic 项目不需要链接运行时；
+   - `include/go2cpp/debug/diagnostic_agent.hpp` +
+     `src/debug/diagnostic_agent.cpp`：接收线程（只做 I/O）+ FIFO 队列 +
+     唯一执行线程；所有命令串行执行，`stats.concurrent_peak` 恒为 1；
+   - 可插拔 `DiagnosticTransport`：Unix socket / 内存实现；接口按
+     `Recv(envelope, timeout)` / `Send(envelope)` 定义，`peer` 与
+     `stream_id` 解耦，供 QUIC / 用户 topic 字节流接入。
+2. **命令集**：`status`（协程/M-P/runqueue/锁等待/模块基址+build-id）、
+   `dump`（复用 DebugServer 组件）、`force-wake`（四个白名单 scope）、
+   `deadlock-report`（资源级等待图）、`mutex-unlock`（仅 owner 已终止）、
+   `inject-fiber`（诊断 Fiber 内执行）、`stats`/`ping`/`help`。
+3. **安全白名单**：force-wake 只作用于 scheduler-idle / ParkingCondition /
+   Channel；`scope=mutex` 明确 refused（FIFO 所有权交接不允许 spurious wake）。
+4. **诊断 Fiber**：`InstallDiagnosticFiber` 注入常驻受管 G，park 在私有
+   ParkingCondition；命令期间 `notify` + `Scheduler::ForceWakeIdle()` 唤醒，
+   在 GMP 上下文执行 `traverse`（gid/processor/machine/tasks）。
+5. **死锁检测**：执行线程每 500ms 采样进展指纹（runnable/metrics/前 512 G/
+   M 状态/等待者），超阈值记录 `kDiagnosticSuspected` 事件；默认只报告，
+   `auto_force_wake` 默认关闭。
+6. **最小受控唤醒接口（不改默认行为）**：
+   - `Scheduler::ForceWakeIdle()`：仅转发既有 `notify_all_workers()`；
+   - `ParkingCondition` 等待者快照增加 `gid`（只读暴露）；
+   - `Channel<T>::ForceWakeWaiters()`：只发 spurious wake，不写结果位、
+     不关闭、不递增 generation；
+   - 事件码追加 `kDiagnosticSuspected=60` / `kDiagnosticForceWake=61` /
+     `kDiagnosticMutexUnlock=62`。
+7. **CLI**：`go2cpp-cli doctor`（Unix socket；`--concurrency` 并发探针；
+   `--transport quic` 明确返回「尚未实现」而不是静默退回）。
+8. **编译开关**：`GO2CPP_DIAGNOSTIC`（默认 OFF）
+   + `GO2CPP_DIAGNOSTIC_QUIC`（默认 OFF，依赖 picoquic）。
+9. **文档**：`docs/diagnostic-channel.md`（协议/白名单/等待图/QUIC stream
+   映射/用户 topic 接入/限制）；`docs/cli.md` 增 4.8 节。
+
+### 21.2 关键文件
+
+新增：
+`include/go2cpp/debug/diagnostic_protocol.hpp`、
+`include/go2cpp/debug/diagnostic_agent.hpp`、
+`src/debug/diagnostic_agent.cpp`、
+`docs/diagnostic-channel.md`、
+`tests/debug/test_diagnostic.cpp`、
+`tests/debug/diagnostic_deadlock_demo.cpp`、
+`tests/debug/doctor_client.py`、
+`tests/debug/run_diagnostic_e2e.sh`、
+`tools/cli/doctor.hpp`、`tools/cli/doctor.cpp`。
+
+修改：`include/go2cpp/concurrency/scheduler/scheduler.hpp`、
+`src/concurrency/scheduler.cpp`、`include/go2cpp/concurrency/core/parking_condition.hpp`、
+`src/concurrency/parking_condition.cpp`、`include/go2cpp/concurrency/channel.hpp`、
+`include/go2cpp/debug/debug_event_ring.hpp`、`cmake/Go2CppOptions.cmake`、
+`cmake/Go2CppModules.cmake`、`cmake/Go2CppTests.cmake`、`tests/test_main.cpp`、
+`tools/cli/{main,help,CMakeLists}`、`docs/cli.md`。
+
+### 21.3 测试结果（实际运行）
+
+- `GO2CPP_TEST_FILTER=diagnostic ./build-diag/go2cpp_tests`：
+  **11 个场景 + 200 次往返压测 + 1000 次随机帧解析，all checks passed**；
+- `bash tests/debug/run_diagnostic_e2e.sh build-diag`：**14/14 PASS**
+  （卡死期间 status/dump、build-id、deadlock 判定、等待图、mutex scope
+  refused、force-wake 恢复 `RECOVERED ready=1`、并发 10、concurrent_peak=1、
+  死锁事件计数）；
+- `ctest --test-dir build-integration -j4`（Doctor OFF 回归）：
+  **116/116 通过，26.21s**；
+- `build-diag`（Doctor ON，examples OFF）：**41/41 通过，26.75s**
+  （#1 `go2cpp_tests` 内含诊断模块，未新增 ctest 用例）；
+- `build-doctor-full`（Doctor ON，完整配置：examples/CLI 全开）：
+  **116/116 通过，26.67s**；
+- OFF 构建（`GO2CPP_DEBUG_DUMP=OFF`、`GO2CPP_DIAGNOSTIC=OFF`）：
+  `nm -C libgo2cpp_debug.so | grep -c DiagnosticAgent` = **0**，
+  且 `go2cpp_debug` 只编译 `debug_dump.cpp` / `debug_server.cpp`。
+
+### 21.4 后续状态 / 已知限制
+
+- 所有改动**未 commit**；
+- QUIC：协议/接口/开关已落地，picoquic 服务端/客户端未实现（路线见
+  `docs/diagnostic-channel.md` §9）；
+- 执行线程可能卡在运行时内部锁（原生死锁）上，此时 Doctor 也会挂起；
+- 等待图为资源级；Mutex 的等待者没有 gid，owner 是近似值；
+- `mutex-unlock` 依赖持锁 park 检测（Debug 默认开，Release 默认关）；
+- 诊断 Fiber 与业务共享 P 的 runqueue（命令期间短暂占用）；
+- 帧协议无身份认证，跨机必须由 topic/QUIC 层提供 mTLS。

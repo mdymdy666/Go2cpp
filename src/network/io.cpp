@@ -1,6 +1,7 @@
 #include "go2cpp/io.hpp"
 
 #include "go2cpp/concurrency/core/futex_mutex.hpp"
+#include "go2cpp/debug/debug_event_ring.hpp"
 
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -2166,6 +2167,8 @@ WaitResult IOManager::wait(int fd, IOEvent event,
                            std::optional<TimePoint> deadline,
                            ContextPtr context,
                            DescriptorTokenPtr expected_descriptor) {
+    GO2CPP_DEBUG_EVENT(kIoWait, 0,
+                       static_cast<std::uint64_t>(fd < 0 ? 0 : fd));
     if (Scheduler::current_scheduler() != &m_scheduler ||
         !Scheduler::current_task()) {
         return {WaitStatus::kError, EPERM};
@@ -2787,6 +2790,44 @@ void IOManager::NotifyCloseAll(int fd) noexcept {
         } catch (...) {
         }
     }
+}
+
+IOManagerDebugSnapshot IOManager::DebugSnapshot() const {
+    IOManagerDebugSnapshot snapshot;
+    if (!m_state) {
+        return snapshot;
+    }
+    const State& state = *m_state;
+    snapshot.running = state.m_running.load(std::memory_order_relaxed);
+    snapshot.accepting = state.m_accepting.load(std::memory_order_relaxed);
+    // m_worker_polling 只在构造期设置一次，之后只读。
+    snapshot.worker_polling = state.m_worker_polling;
+    for (const auto& stripe : state.m_stripes) {
+        std::lock_guard<std::mutex> lock(stripe.mutex);
+        for (const auto& entry : stripe.slots) {
+            const auto& slot = *entry.second;
+            ++snapshot.fd_slots;
+            snapshot.reader_waiters += slot.readers.size();
+            snapshot.writer_waiters += slot.writers.size();
+            if (slot.readers.empty() && slot.writers.empty()) {
+                continue;
+            }
+            ++snapshot.slots_with_waiters;
+            if (slot.registered) {
+                ++snapshot.epoll_registered;
+            }
+            if (slot.pending_read) {
+                ++snapshot.pending_read;
+            }
+            if (slot.pending_write) {
+                ++snapshot.pending_write;
+            }
+        }
+    }
+    snapshot.timers = state.m_timer_count.load(std::memory_order_relaxed);
+    snapshot.scheduler_runnable = m_scheduler.runnable_count();
+    snapshot.scheduler_workers = m_scheduler.worker_count();
+    return snapshot;
 }
 
 IOManager* IOManager::current() noexcept {

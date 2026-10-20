@@ -192,6 +192,36 @@ add_library(go2cpp_metrics src/metrics/metrics.cpp)
 set_target_properties(go2cpp_metrics PROPERTIES EXPORT_NAME metrics)
 add_library(go2cpp::metrics ALIAS go2cpp_metrics)
 
+# 事件环（EventRing）：scheduler/io 在 GO2CPP_DEBUG_DUMP=ON 时**直接调用**
+# EventRing::Record，所以它的实现不能放在 go2cpp_debug 里 —— 否则
+# scheduler/io 必须反向链接 go2cpp_debug，与 go2cpp_debug -> scheduler 构成
+# 目标依赖环，只链接 scheduler 的测试目标会得到 undefined reference。
+# 拆成零依赖小库后：scheduler/io -> debug_event -> libc，debug -> debug_event。
+add_library(go2cpp_debug_event
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/debug/debug_event_ring.cpp)
+set_target_properties(go2cpp_debug_event PROPERTIES EXPORT_NAME debug_event)
+add_library(go2cpp::debug_event ALIAS go2cpp_debug_event)
+
+# debug 模块：统一只读内省接口（scheduler/fiber/channel/parking_condition/
+# sync/io）+ Unix socket DebugServer。
+#
+# 依赖方向：debug -> {scheduler,fiber,sync,io,debug_event}；被观测模块只依赖
+# 零依赖的 debug_event（且仅在 GO2CPP_DEBUG_DUMP=ON 时建立链接）。
+add_library(go2cpp_debug
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/debug/debug_dump.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/debug/debug_server.cpp)
+# Doctor（在线诊断）：默认 OFF 时不编译该源文件，go2cpp_debug 中不存在
+# DiagnosticAgent 符号；打开后由同一个 target 承载（不新增对外 target，
+# 避免 install(EXPORT) 的 ABI 面扩大）。
+if (GO2CPP_DIAGNOSTIC)
+    target_sources(go2cpp_debug PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/debug/diagnostic_agent.cpp)
+endif()
+target_link_libraries(go2cpp_debug PUBLIC
+    go2cpp_scheduler go2cpp_fiber go2cpp_sync go2cpp_io go2cpp_debug_event)
+set_target_properties(go2cpp_debug PROPERTIES EXPORT_NAME debug)
+add_library(go2cpp::debug ALIAS go2cpp_debug)
+
 set(GO2CPP_MODULE_TARGETS
     go2cpp_error
     go2cpp_control_flow
@@ -214,6 +244,8 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_encoding
     go2cpp_hash
     go2cpp_metrics
+    go2cpp_debug_event
+    go2cpp_debug
 )
 if (TARGET go2cpp_hook)
     list(APPEND GO2CPP_MODULE_TARGETS go2cpp_hook)
@@ -265,6 +297,16 @@ endif()
 target_link_libraries(go2cpp_sync PUBLIC go2cpp_context go2cpp_scheduler)
 target_link_libraries(go2cpp_future PUBLIC go2cpp_context go2cpp_scheduler)
 target_link_libraries(go2cpp_io PUBLIC go2cpp_context go2cpp_scheduler)
+# GO2CPP_DEBUG_DUMP=ON 时 io.cpp 直接记录 EventRing 事件，必须能解析符号。
+# OFF 时宏展开为 ((void)0)，不建立这条额外链接，保持原依赖图。
+if (GO2CPP_DEBUG_DUMP)
+    target_link_libraries(go2cpp_scheduler PUBLIC go2cpp_debug_event)
+    target_link_libraries(go2cpp_io PUBLIC go2cpp_debug_event)
+    # sync.cpp 的 Mutex 慢路径与 channel.hpp（模板）的阻塞路径直接记录事件；
+    # OFF 构建宏为空展开，不建立这两条链接。
+    target_link_libraries(go2cpp_sync PUBLIC go2cpp_debug_event)
+    target_link_libraries(go2cpp_channel PUBLIC go2cpp_debug_event)
+endif()
 target_link_libraries(go2cpp_network PUBLIC go2cpp_io go2cpp_context go2cpp_scheduler go2cpp_sync)
 # TlsTransport 的实现细节：OpenSSL 只出现在 .cpp 里。
 target_link_libraries(go2cpp_network PRIVATE OpenSSL::SSL OpenSSL::Crypto)
@@ -277,7 +319,7 @@ target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io go2cpp_network go2cpp_log go2cpp_config
     go2cpp_math go2cpp_rand go2cpp_path go2cpp_container go2cpp_compress go2cpp_encoding go2cpp_hash
     Threads::Threads
-    go2cpp_metrics
+    go2cpp_metrics go2cpp_debug
 )
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_runtime INTERFACE go2cpp_hook)

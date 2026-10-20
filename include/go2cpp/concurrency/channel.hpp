@@ -58,6 +58,7 @@
 #include "go2cpp/context.hpp"
 #include "go2cpp/core/parking_condition.hpp"
 #include "go2cpp/core/timer.hpp"
+#include "go2cpp/debug/debug_event_ring.hpp"
 #include "go2cpp/error.hpp"
 
 #include <algorithm>
@@ -812,6 +813,28 @@ class RingBuffer final {
 
 }  // namespace detail
 
+/**
+ * @brief Channel 的只读调试快照（与元素类型 T 无关，便于 debug 层统一序列化）。
+ *
+ * ## 语义
+ * - `length` 是缓冲区当前元素数（不含正在交接的等待者）；
+ * - `send_waiters/recv_waiters` 是已登记等待队列长度；
+ * - `select_senders/select_receivers` 是上述队列中由 select 注册的节点数；
+ * - `change_waiters` 是当前 park 在状态变化条件变量上的线程/G 数。
+ * 全部字段在同一次持锁读取中采集；不改变 Channel 状态。
+ */
+struct ChannelDebugSnapshot {
+    std::size_t capacity{0};
+    std::size_t length{0};
+    bool closed{false};
+    std::size_t send_waiters{0};
+    std::size_t recv_waiters{0};
+    std::size_t select_senders{0};
+    std::size_t select_receivers{0};
+    std::size_t change_waiters{0};
+    std::uint64_t generation{0};
+};
+
 /** * @brief 支持 Fiber 与线程并发的 FIFO Channel。
  * @details capacity=0 时为无缓冲 rendezvous，正值时使用有界 FIFO 缓冲；
  *          关闭会唤醒所有发送者和接收者，Select 通过内部等待节点接入。
@@ -857,6 +880,34 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     return m_closed;
   }
   bool closed() const { return IsClosed(); }
+
+  /**
+   * @brief 采集通道的只读调试快照（缓冲长度/等待者/select 注册数）。
+   * @note 一次持锁读取；与 Send/Recv/Close 并发时结果只代表某一瞬间。
+   */
+  ChannelDebugSnapshot DebugSnapshot() const {
+    ChannelDebugSnapshot snapshot;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    snapshot.capacity = m_capacity;
+    snapshot.length = m_buffer.size();
+    snapshot.closed = m_closed;
+    snapshot.send_waiters = m_senders.size();
+    snapshot.recv_waiters = m_receivers.size();
+    for (const auto& node : m_senders) {
+      if (node != nullptr && node->select_state) {
+        ++snapshot.select_senders;
+      }
+    }
+    for (const auto& node : m_receivers) {
+      if (node != nullptr && node->select_state) {
+        ++snapshot.select_receivers;
+      }
+    }
+    snapshot.change_waiters =
+        m_change_waiters.load(std::memory_order_relaxed);
+    snapshot.generation = m_generation.load(std::memory_order_relaxed);
+    return snapshot;
+  }
 
   // 发送 value；阻塞直到接收者/缓冲可用、关闭或 context 取消。
   ChannelSendResult Send(T value, const ContextPtr& context = {}) {
@@ -989,6 +1040,63 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
     NotifyChange();
     return {ChannelStatus::kReady, {}};
+  }
+
+  /**
+   * @brief Doctor 专用：对阻塞在 Channel 上的等待者发一次 **spurious wake**。
+   *
+   * ## 语义（为什么安全）
+   *
+   * 本方法**不写任何结果标志、不入队/出队、不递增 generation、不关闭
+   * channel**，只调用等待节点自己的 `ParkingCondition::notify_one()`：
+   *
+   * - `SendUntil`/`RecvUntil` 的等待循环被唤醒后会重检
+   *   `accepted/closed/cancelled/context/deadline`，仍不满足就继续等；
+   * - select 节点由 `SelectWaitState` 管理，不在此处唤醒（它们不是
+   *   ParkingCondition 等待者），避免伪造 select 就绪；
+   * - `WaitForChange` 观察者只重检 generation，不递增就不会被误判为变化。
+   *
+   * 因此它是「唤醒后重新检查条件」的可安全重试操作，不会改变 Channel
+   * 的可见行为；用于诊断线程在全局卡死时踢一下等待者（例如确认它们确实
+   * 只是等待，而不是唤醒令牌丢失）。
+   *
+   * @return 本次尝试唤醒的普通等待节点数（不含 select 节点与 change 观察者）。
+   */
+  std::size_t ForceWakeWaiters() {
+    std::vector<std::shared_ptr<PendingSend>> senders;
+    std::vector<std::shared_ptr<PendingRecv>> receivers;
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      senders.assign(m_senders.begin(), m_senders.end());
+      receivers.assign(m_receivers.begin(), m_receivers.end());
+    }
+    std::size_t woken = 0;
+    for (auto& sender : senders) {
+      if (!sender || sender->select_state) {
+        continue;
+      }
+      // spin_wait 节点在「已发布但还没真正 park」的窗口里只认 signaled；
+      // 置位让它提前结束自旋并重新加锁重检（重检后仍不满足会继续等）。
+      if (sender->spin_wait) {
+        sender->signaled.store(true, std::memory_order_release);
+      }
+      sender->NotifyIfParked();
+      ++woken;
+    }
+    for (auto& receiver : receivers) {
+      if (!receiver || receiver->select_state) {
+        continue;
+      }
+      if (receiver->spin_wait) {
+        receiver->signaled.store(true, std::memory_order_release);
+      }
+      receiver->NotifyIfParked();
+      ++woken;
+    }
+    if (m_change_waiters.load(std::memory_order_acquire) != 0) {
+      m_change_cv.notify_all();
+    }
+    return woken;
   }
 
   // 返回单调递增代际；每次发送、接收或关闭改变可用性时递增，供外部
@@ -1388,6 +1496,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     ///        ParkingCondition 内部互斥量，也避免 Close 对已醒节点做无效唤醒。
     void NotifyIfParked() noexcept {
       if (!spin_wait || parked.load(std::memory_order_relaxed)) {
+        GO2CPP_DEBUG_EVENT(kChannelWake, 0, 1);
         cv.notify_one();
       }
     }
@@ -1447,6 +1556,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     ///        ParkingCondition 内部互斥量，也避免 Close 对已醒节点做无效唤醒。
     void NotifyIfParked() noexcept {
       if (!spin_wait || parked.load(std::memory_order_relaxed)) {
+        GO2CPP_DEBUG_EVENT(kChannelWake, 0, 2);
         cv.notify_one();
       }
     }
@@ -1690,6 +1800,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     } catch (...) {
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
+    // 发送方即将 park：只在阻塞路径记录（缓冲命中/立即交接无开销）。
+    GO2CPP_DEBUG_EVENT(kChannelSend, 0, m_capacity);
     CallbackGuard callback_guard{context};
     if (context) {
       try {
@@ -1905,6 +2017,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
               detail::ValueOperationError()};
     }
+    // 接收方即将 park：只在阻塞路径记录（缓冲命中/立即交接无开销）。
+    GO2CPP_DEBUG_EVENT(kChannelRecv, 0, m_capacity);
     CallbackGuard callback_guard{context};
     if (context) {
       try {

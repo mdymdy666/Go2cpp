@@ -223,6 +223,12 @@ public:
 
     bool IsNative() const noexcept { return !m_managed; }
 
+    /// Doctor 等待图用：该节点对应的受管 G 编号；native 节点没有 Task。
+    /// 只读一个构造后不再改变的 shared_ptr 指向对象的 id，不做所有权转移。
+    std::uint64_t gid() const noexcept {
+        return m_task ? m_task->id() : 0U;
+    }
+
     void Wake() noexcept {
         if (!m_managed) {
 #if defined(__linux__)
@@ -439,6 +445,39 @@ private:
     std::condition_variable_any m_native_cv;
     bool m_active{true};
 };
+
+ParkingConditionDebugSnapshot ParkingCondition::DebugSnapshot() const {
+    ParkingConditionDebugSnapshot snapshot;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    snapshot.waiters = m_waiters.size();
+    snapshot.nodes.reserve(m_waiters.size());
+    for (std::size_t index = 0; index < m_waiters.size(); ++index) {
+        const auto& node = m_waiters[index];
+        if (!node) {
+            continue;
+        }
+        ParkingWaiterDebugSnapshot item;
+        item.index = index;
+        item.native = node->IsNative();
+        item.state = static_cast<int>(node->result());
+        item.gid = node->gid();
+        if (item.native) {
+            ++snapshot.native_waiters;
+        } else {
+            ++snapshot.fiber_waiters;
+        }
+        if (item.state == 0) {
+            ++snapshot.waiting_nodes;
+        } else if (item.state == 1) {
+            ++snapshot.notified_nodes;
+        }
+        snapshot.nodes.push_back(item);
+    }
+    snapshot.broadcast_seq = m_broadcast.seq.load(std::memory_order_relaxed);
+    snapshot.broadcast_waiters =
+        m_broadcast.waiters.load(std::memory_order_relaxed);
+    return snapshot;
+}
 
 ParkingCondition::ParkingCondition() = default;
 ParkingCondition::~ParkingCondition() = default;

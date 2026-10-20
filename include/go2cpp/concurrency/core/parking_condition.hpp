@@ -51,6 +51,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 namespace go2cpp::core {
 
@@ -64,6 +65,37 @@ namespace go2cpp::core {
  * 方持有传入的外部互斥锁；它本身不拥有业务状态，也不负责通知条件的
  * 产生。
  */
+/**
+ * @brief 等待队列中单个节点的只读快照。
+ * @note `state`：0=kWaiting 1=kNotified 2=kTimedOut 3=kCancelled。
+ */
+struct ParkingWaiterDebugSnapshot {
+    std::size_t index{0};  ///< 在等待队列中的位置（0=FIFO 队首）
+    bool native{false};    ///< true=普通线程等待；false=受管 Fiber
+    int state{0};          ///< 节点结果状态（见上）
+    // Doctor 等待图需要「哪个 G 在等」。受管节点在构造时绑定 Task，记录其
+    // gid 是**已存在事实**的只读暴露；native 节点没有 Task，恒为 0。
+    // 不要把它当所有权凭据：G 可能在本快照返回前就被回收。
+    std::uint64_t gid{0};  ///< 受管等待者的 G 编号；native/未知为 0。
+};
+
+/**
+ * @brief ParkingCondition 的只读调试快照。
+ *
+ * `waiters` 是队列长度；`waiting_nodes/notified_nodes` 按节点结果统计
+ * （`kTimedOut/kCancelled` 的节点通常已被等待者自己摘除，队列里少见）。
+ */
+struct ParkingConditionDebugSnapshot {
+    std::size_t waiters{0};
+    std::size_t native_waiters{0};
+    std::size_t fiber_waiters{0};
+    std::size_t waiting_nodes{0};
+    std::size_t notified_nodes{0};
+    std::uint32_t broadcast_seq{0};      ///< notify_all 的广播代际
+    std::uint32_t broadcast_waiters{0};  ///< futex_waitv 路径上的原生等待者数
+    std::vector<ParkingWaiterDebugSnapshot> nodes;
+};
+
 class ParkingCondition final {
 public:
     using Clock = std::chrono::steady_clock;
@@ -128,6 +160,12 @@ public:
     /** @brief 返回当前 Fiber 是否缺少可用 Scheduler 等待后端。 */
     static bool FiberWaitUnsupported() noexcept;
 
+    /**
+     * @brief 采集等待队列的只读快照（等待者数量与各节点状态）。
+     * @note 持 `m_mutex` 遍历队列；不唤醒、不修改任何节点。
+     */
+    ParkingConditionDebugSnapshot DebugSnapshot() const;
+
 private:
     enum class WaitStatus { kNotified, kTimedOut, kCancelled };
     class WaitNode;
@@ -136,7 +174,9 @@ private:
                         std::optional<Clock::time_point> deadline,
                         const std::function<bool()>& predicate);
 
-    std::mutex m_mutex;
+    // mutable：DebugSnapshot() 需要作为 const 观测接口持锁遍历等待队列；
+    // 只影响 const 限定，不改变任何同步语义。
+    mutable std::mutex m_mutex;
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
 
     // ---- 广播代际字（futex_waitv 混合方案）----

@@ -34,6 +34,7 @@
  */
 #include "go2cpp/scheduler/scheduler.hpp"
 
+#include "go2cpp/debug/debug_event_ring.hpp"
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/log.hpp"
 #include "go2cpp/thread_policy.hpp"
@@ -2356,12 +2357,15 @@ std::shared_ptr<Task> Scheduler::spawn(Task::Function function,
 }
 
 bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
+    GO2CPP_DEBUG_EVENT(kEnqueue, task ? task->id() : 0, 0);
     if (!task || !m_impl) {
+        GO2CPP_DEBUG_EVENT(kEnqueueRejected, task ? task->id() : 0, 1);
         return false;
     }
     const auto initial_state = task->state();
     if (initial_state == GState::kDead || initial_state == GState::kCancelled ||
         initial_state == GState::kFailed) {
+        GO2CPP_DEBUG_EVENT(kEnqueueRejected, task->id(), 2);
         return false;
     }
 
@@ -2380,16 +2384,19 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         if (notify) {
             task->notify_terminal();
         }
+        GO2CPP_DEBUG_EVENT(kEnqueueRejected, task->id(), 3);
         return false;
     }
 
     const auto admission_state = task->state();
     if (!drain_resume && admission_state != GState::kNew &&
         admission_state != GState::kRunnable) {
+        GO2CPP_DEBUG_EVENT(kEnqueueRejected, task->id(), 4);
         return false;
     }
     if (!task->prepare_enqueue(m_impl->owner_token,
                                m_impl->cancellation_gate)) {
+        GO2CPP_DEBUG_EVENT(kEnqueueRejected, task->id(), 5);
         return false;
     }
 
@@ -2423,6 +2430,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         task->clear_queued();
         task->request_cancel(false);
         task->notify_terminal();
+        GO2CPP_DEBUG_EVENT(kEnqueueRejected, task->id(), 6);
         return false;
     }
 
@@ -2483,6 +2491,8 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
                 m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
                 try {
                     m_impl->incoming_queues[incoming_stripe].emplace_back(task);
+                    GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(),
+                                       ::go2cpp::debug::kGlobalQueueTag);
                     m_impl->incoming_count.fetch_add(1,
                                                      std::memory_order_release);
                     m_impl->incoming_nonempty_mask.fetch_or(
@@ -2546,8 +2556,11 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         try {
             if (!use_global) {
                 processor.queue.push_back(task);
+                GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(), processor.id);
             } else {
                 m_impl->global_queue.push_back(task);
+                GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(),
+                                   ::go2cpp::debug::kGlobalQueueTag);
             }
         } catch (...) {
             if (task->started()) {
@@ -2603,6 +2616,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
 
 bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
                                      PId processor_id) {
+    GO2CPP_DEBUG_EVENT(kRequeueProcessor, task ? task->id() : 0, processor_id);
     if (!task || processor_id >= m_impl->processors.size()) {
         return false;
     }
@@ -2628,6 +2642,7 @@ bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
             m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
             try {
                 processor.queue.push_back(task);
+                GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(), processor_id);
                 // 该 P 已有运行中的 M 时，它会在当前 G 返回后消费本地
                 // 队列；此时唤醒额外 M 只会制造 futex 抖动。
                 const auto running = processor.running_machines.load(
@@ -2656,6 +2671,7 @@ bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
 
 bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
                                     bool allow_notify) {
+    GO2CPP_DEBUG_EVENT(kRequeueWorker, task ? task->id() : 0, 1);
     if (!task || current_scheduler() != this ||
         t_processor_id >= m_impl->processors.size()) {
         return enqueue(task);
@@ -2686,6 +2702,8 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
             m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
             try {
                 processor.queue.push_back(task);
+                GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(),
+                                   t_processor_id);
                 // 当前 M 正在执行这个 G；本地回队无需再次唤醒另一个
                 // M，减少每次 Fiber handoff 的条件变量切换。
                 const auto running = processor.running_machines.load(
@@ -2740,6 +2758,8 @@ bool Scheduler::park(const std::shared_ptr<Task>& task) {
 }
 
 bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
+    GO2CPP_DEBUG_EVENT(kParkEnter, task ? task->id() : 0,
+                       static_cast<std::uint64_t>(SuspendReason::Park));
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get()) {
         return false;
@@ -2793,6 +2813,8 @@ bool Scheduler::park_wait_for_cleanup(const std::shared_ptr<Task>& task) {
 }
 
 bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
+    GO2CPP_DEBUG_EVENT(kParkEnter, task ? task->id() : 0,
+                       static_cast<std::uint64_t>(SuspendReason::Io));
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get()) {
         return false;
@@ -2825,6 +2847,8 @@ bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
 
 bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
                                   SuspendReason reason) {
+    GO2CPP_DEBUG_EVENT(kParkEnter, task ? task->id() : 0,
+                       static_cast<std::uint64_t>(reason));
     if (!task || current_scheduler() != this ||
         current_task().get() != task.get()) {
         return false;
@@ -2860,25 +2884,36 @@ bool Scheduler::wake(const std::shared_ptr<Task>& task) {
 }
 
 bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
+    GO2CPP_DEBUG_EVENT(kWakeRequest, task ? task->id() : 0, 0);
     if (!task || !m_impl || !task->owned_by(m_impl->owner_token)) {
         return false;
     }
     const auto action = task->wake_for_wait();
     if (action == WakeAction::kPending) {
+        GO2CPP_DEBUG_EVENT(kWakePending, task->id(), 0);
         return false;
     }
     if (action != WakeAction::kEnqueue) {
+        GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 2);
         return false;
     }
     if (!task->registered()) {
         // A task can leave the registry while its final wake callback is
         // racing with shutdown.  Fall back to the fully checked path rather
         // than publishing a node without a lifetime anchor.
-        return enqueue(task);
+        if (enqueue(task)) {
+            GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                               m_impl->runnable.load(std::memory_order_relaxed));
+            return true;
+        }
+        GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 3);
+        return false;
     }
     if (current_scheduler() == this &&
         t_processor_id < m_impl->processors.size() &&
         requeue_from_worker(task)) {
+        GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                           m_impl->runnable.load(std::memory_order_relaxed));
         return true;
     }
     // 混合 Mutex 的 Unlock 通常来自普通线程。G 最近运行的 P 是稳定的
@@ -2887,6 +2922,8 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
     const PId preferred_processor = task->last_processor_id();
     if (preferred_processor < m_impl->processors.size() &&
         requeue_to_processor(task, preferred_processor)) {
+        GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                           m_impl->runnable.load(std::memory_order_relaxed));
         return true;
     }
     if (!task->try_mark_queued()) {
@@ -2894,9 +2931,17 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
         // report success when the task is already queued; otherwise let the
         // regular admission path repair the state.
         if (task->queued()) {
+            GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                               m_impl->runnable.load(std::memory_order_relaxed));
             return true;
         }
-        return enqueue(task);
+        if (enqueue(task)) {
+            GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                               m_impl->runnable.load(std::memory_order_relaxed));
+            return true;
+        }
+        GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 3);
+        return false;
     }
 
     static thread_local std::size_t t_incoming_stripe =
@@ -2915,6 +2960,8 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
             m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
             try {
                 m_impl->incoming_queues[stripe].emplace_back(task);
+                GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(),
+                                   ::go2cpp::debug::kGlobalQueueTag);
                 m_impl->incoming_count.fetch_add(1, std::memory_order_release);
                 m_impl->incoming_nonempty_mask.fetch_or(
                     std::uint32_t{1} << stripe, std::memory_order_release);
@@ -2926,21 +2973,32 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
     }
     if (!published) {
         task->clear_queued();
-        return enqueue(task);
+        if (enqueue(task)) {
+            GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                               m_impl->runnable.load(std::memory_order_relaxed));
+            return true;
+        }
+        GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 3);
+        return false;
     }
     m_impl->notify_worker();
+    GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                       m_impl->runnable.load(std::memory_order_relaxed));
     return true;
 }
 
 bool Scheduler::wake_io(const std::shared_ptr<Task>& task) {
+    GO2CPP_DEBUG_EVENT(kIoWake, task ? task->id() : 0, 0);
     if (!task || !task->owned_by(m_impl->owner_token)) {
         return false;
     }
     const auto action = task->wake_for_io();
     if (action == WakeAction::kPending) {
+        GO2CPP_DEBUG_EVENT(kWakePending, task->id(), 0);
         return true;
     }
     if (action != WakeAction::kEnqueue) {
+        GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 2);
         return false;
     }
     // A worker waking another G can publish directly to its current P.  The
@@ -2950,6 +3008,8 @@ bool Scheduler::wake_io(const std::shared_ptr<Task>& task) {
     if (current_scheduler() == this &&
         t_processor_id < m_impl->processors.size()) {
         if (requeue_from_worker(task)) {
+            GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                               m_impl->runnable.load(std::memory_order_relaxed));
             return true;
         }
     }
@@ -2957,9 +3017,17 @@ bool Scheduler::wake_io(const std::shared_ptr<Task>& task) {
     const PId preferred_processor = task->last_processor_id();
     if (preferred_processor < m_impl->processors.size() &&
         requeue_to_processor(task, preferred_processor)) {
+        GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                           m_impl->runnable.load(std::memory_order_relaxed));
         return true;
     }
-    return enqueue(task);
+    if (enqueue(task)) {
+        GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                           m_impl->runnable.load(std::memory_order_relaxed));
+        return true;
+    }
+    GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 3);
+    return false;
 }
 
 /**
@@ -2981,6 +3049,7 @@ bool Scheduler::wake_io(const std::shared_ptr<Task>& task) {
  */
 bool Scheduler::wake_io_batch(
     const std::vector<std::shared_ptr<Task>>& tasks) {
+    GO2CPP_DEBUG_EVENT(kWakeBatch, 0, tasks.size());
     if (tasks.empty()) {
         return true;
     }
@@ -3004,8 +3073,12 @@ bool Scheduler::wake_io_batch(
                 continue;
             }
             const auto action = task->wake_for_io();
-            if (action == WakeAction::kPending ||
-                action == WakeAction::kRejected) {
+            if (action == WakeAction::kPending) {
+                GO2CPP_DEBUG_EVENT(kWakePending, task->id(), 0);
+                continue;
+            }
+            if (action == WakeAction::kRejected) {
+                GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 2);
                 continue;
             }
             pending.push_back(Pending{task, task->last_processor_id()});
@@ -3070,6 +3143,11 @@ bool Scheduler::wake_io_batch(
                     }
                     try {
                         processor.queue.push_back(task);
+                        GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(),
+                                           processor_id);
+                        GO2CPP_DEBUG_EVENT(
+                            kWakeEnqueued, task->id(),
+                            m_impl->runnable.load(std::memory_order_relaxed));
                         ++published;
                         m_impl->runnable.fetch_add(1,
                                                    std::memory_order_relaxed);
@@ -3101,6 +3179,7 @@ bool Scheduler::wake_io_batch(
 }
 
 bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
+    GO2CPP_DEBUG_EVENT(kWakeRequest, task ? task->id() : 0, 0);
     if (!task || !task->owned_by(m_impl->owner_token)) {
         return false;
     }
@@ -3108,14 +3187,18 @@ bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
     if (action == WakeAction::kPending) {
         // The running G will consume the permit if it parks. It is not
         // immediately runnable because its C++ callable still owns the M.
+        GO2CPP_DEBUG_EVENT(kWakePending, task->id(), 0);
         return false;
     }
     if (action == WakeAction::kRejected) {
+        GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 2);
         return false;
     }
     if (current_scheduler() == this &&
         t_processor_id < m_impl->processors.size()) {
         if (requeue_from_worker(task)) {
+            GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                               m_impl->runnable.load(std::memory_order_relaxed));
             return true;
         }
     }
@@ -3139,9 +3222,12 @@ bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
                 task->notify_terminal();
             }
         }
+        GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 3);
         m_impl->notify_all_workers();
         return false;
     }
+    GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                       m_impl->runnable.load(std::memory_order_relaxed));
     return true;
 }
 
@@ -3310,6 +3396,34 @@ std::size_t Scheduler::processor_count() const noexcept {
 
 std::size_t Scheduler::worker_count() const noexcept {
     return m_impl ? m_impl->active_workers.load(std::memory_order_acquire) : 0;
+}
+
+/**
+ * @brief Doctor 的最小受控唤醒：转发既有 `notify_all_workers()`。
+ *
+ * 为什么不直接调 `m_impl->condition.notify_all()`：
+ * `notify_all_workers()` 同时覆盖两类空闲等待——睡在调度器
+ * `ParkingCondition` 上的 worker，以及睡在 IO 后端 `epoll_wait` 上的 worker
+ * （后者要写 eventfd）。只 notify 条件变量会漏掉后者。
+ *
+ * 为什么不需要持 `Impl::mutex`：`notify_all_workers()` 的设计就是锁外通知
+ * （见其定义处的注释），worker 醒来后会自己取锁并重检状态；在诊断线程持锁
+ * 反而会增加与 park 路径的锁序耦合。
+ *
+ * 失败隔离：`IoIdlePoller::wake` 是外部注入的 `std::function`，理论上可能
+ * 抛异常；本接口声明 noexcept，因此这里吞掉异常（唤醒失败等价于「没有
+ * 唤醒」，不会把诊断线程打崩）。
+ */
+std::size_t Scheduler::ForceWakeIdle() noexcept {
+    if (!m_impl) {
+        return 0;
+    }
+    try {
+        m_impl->notify_all_workers();
+    } catch (...) {
+        // 外部 poller 的 wake 抛出：保持诊断接口 noexcept。
+    }
+    return worker_count();
 }
 
 std::size_t Scheduler::runnable_count() const noexcept {
@@ -3484,8 +3598,11 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     thread_policy::detail::EnterRuntimeWorker(this);
     t_machine_id = machine->id;
     t_processor_id = machine->processor;
+    // 把当前线程的 P 发布给事件环：之后所有事件都带 pid。
+    GO2CPP_DEBUG_BIND_PROCESSOR(t_processor_id);
     m_impl->emit_event(SchedulerEvent{SchedulerEventType::kWorkerStarted,
                                       0, machine->id, machine->processor});
+    GO2CPP_DEBUG_EVENT(kThreadStart, machine->id, machine->processor);
 #if defined(__linux__)
     if (m_impl->config.pin_workers_to_cpu &&
         machine->processor < static_cast<PId>(CPU_SETSIZE)) {
@@ -3548,12 +3665,17 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     task = std::move(own_processor.queue.front());
                     own_processor.queue.pop_front();
                     local_queue_pop = true;
+                    GO2CPP_DEBUG_EVENT(kRunQueuePop, task->id(),
+                                       own_processor.id);
                 }
             }
             if (task) {
                 m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
                 claimed = task->try_mark_running();
-                if (!claimed) {
+                if (claimed) {
+                    GO2CPP_DEBUG_EVENT(kRunQueueClaimOk, task->id(), 0);
+                } else {
+                    GO2CPP_DEBUG_EVENT(kRunQueueClaimFail, task->id(), 0);
                     recover_unclaimed(task);
                 }
             }
@@ -3602,6 +3724,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     }
                     task = std::move(*selected);
                     incoming_queue.erase(selected);
+                    GO2CPP_DEBUG_EVENT(kRunQueuePop, task->id(),
+                                       ::go2cpp::debug::kGlobalQueueTag);
                     if (incoming_queue.empty()) {
                         m_impl->incoming_nonempty_mask.fetch_and(
                             ~(std::uint32_t{1} << stripe),
@@ -3611,7 +3735,10 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         1, std::memory_order_release);
                     m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
                     claimed = task->try_mark_running();
-                    if (!claimed) {
+                    if (claimed) {
+                        GO2CPP_DEBUG_EVENT(kRunQueueClaimOk, task->id(), 0);
+                    } else {
+                        GO2CPP_DEBUG_EVENT(kRunQueueClaimFail, task->id(), 0);
                         recover_unclaimed(task);
                     }
                     return true;
@@ -3695,6 +3822,9 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                             if (*it && (*it)->task_class() == preferred_class) {
                                 auto selected = std::move(*it);
                                 queue.erase(it);
+                                GO2CPP_DEBUG_EVENT(kRunQueuePop,
+                                                   selected->id(),
+                                                   own_processor.id);
                                 return selected;
                             }
                         }
@@ -3704,6 +3834,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     }
                     auto selected = std::move(queue.front());
                     queue.pop_front();
+                    GO2CPP_DEBUG_EVENT(kRunQueuePop, selected->id(),
+                                       own_processor.id);
                     return selected;
                 };
                 const auto take_global = [&](auto& queue) {
@@ -3715,6 +3847,9 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                             if (*it && (*it)->task_class() == preferred_class) {
                                 auto selected = std::move(*it);
                                 queue.erase(it);
+                                GO2CPP_DEBUG_EVENT(kRunQueuePop,
+                                                   selected->id(),
+                                                   ::go2cpp::debug::kGlobalQueueTag);
                                 return selected;
                             }
                         }
@@ -3724,9 +3859,11 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     }
                     auto selected = std::move(queue.front());
                     queue.pop_front();
+                    GO2CPP_DEBUG_EVENT(kRunQueuePop, selected->id(),
+                                       ::go2cpp::debug::kGlobalQueueTag);
                     return selected;
                 };
-                const auto take_victim = [&](auto& queue) {
+                const auto take_victim = [&](auto& queue, PId victim_id) {
                     if (prefer_class) {
                         auto it = queue.rbegin();
                         std::size_t scanned = 0;
@@ -3736,6 +3873,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                                 auto base = std::next(it).base();
                                 auto selected = std::move(*base);
                                 queue.erase(base);
+                                GO2CPP_DEBUG_EVENT(kRunQueuePop,
+                                                   selected->id(), victim_id);
                                 return selected;
                             }
                         }
@@ -3745,6 +3884,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     }
                     auto selected = std::move(queue.back());
                     queue.pop_back();
+                    GO2CPP_DEBUG_EVENT(kRunQueuePop, selected->id(),
+                                       victim_id);
                     return selected;
                 };
 
@@ -3780,7 +3921,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         }
                         std::lock_guard<std::mutex> queue_lock(victim.mutex);
                         if (!victim.queue.empty()) {
-                            task = take_victim(victim.queue);
+                            task = take_victim(victim.queue, victim.id);
                             if (task) {
                                 m_impl->metric_steal_pops.fetch_add(
                                     1, std::memory_order_relaxed);
@@ -3793,7 +3934,10 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 if (task) {
                     m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
                     claimed = task->try_mark_running();
-                    if (!claimed) {
+                    if (claimed) {
+                        GO2CPP_DEBUG_EVENT(kRunQueueClaimOk, task->id(), 0);
+                    } else {
+                        GO2CPP_DEBUG_EVENT(kRunQueueClaimFail, task->id(), 0);
                         // 节点已经从队列取出：按任务当前状态条件清理
                         // reservation，必要时补发布自愈（B1）。
                         recover_unclaimed(task);
@@ -4207,12 +4351,14 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     }
     m_impl->emit_event(SchedulerEvent{SchedulerEventType::kWorkerStopped,
                                       0, machine->id, machine->processor});
+    GO2CPP_DEBUG_EVENT(kThreadStop, machine->id, machine->processor);
     m_impl->notify_all_workers();
     t_task.reset();
     Fiber::BindCurrentExecution(FiberExecutionBinding{});
     thread_policy::detail::LeaveRuntimeWorker();
     t_scheduler = nullptr;
     t_machine_id = 0;
+    GO2CPP_DEBUG_UNBIND_PROCESSOR();
     t_processor_id = 0;
     t_blocking_machine_id = 0;
 }
