@@ -21,6 +21,12 @@
  *    `refused owner-unknown`（不可知 != 已死，owner 可能属于未注册的
  *    Scheduler）；只有观察到终止状态才算 `owner-gone`。
  *
+ * 4. **取消走 Context，而不是替业务解锁**。`ctx.cancel` 只对**已注册**的
+ *    `Context` 调用既有 `Cancel()`：被取消方从 `Lock(ctx)` / `Wait(ctx)`
+ *    返回 false，再由 `ContextRollback` 的 undo 回调释放自己持有的锁。
+ *    Doctor 不调用 `Unlock()`，因此不存在「强制解锁路径」的 stale-unlock。
+ *    `ctx.cancel --address` 也只在注册表里按指针身份匹配，不解引用任意地址。
+ *
  * ## 平台
  *
  * Unix domain socket / `/proc` / ELF 解析都是 POSIX/Linux 实现；非 Linux
@@ -75,6 +81,14 @@ std::uint64_t NowNs() noexcept {
 std::uint64_t ElapsedNs(std::uint64_t start) noexcept {
     const std::uint64_t now = NowNs();
     return now >= start ? now - start : 0U;
+}
+
+/// 墙钟毫秒（仅用于审计字段；排序/时长一律用 steady_clock）。
+std::uint64_t WallMs() noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
 }
 
 std::uint64_t ToMs(std::uint64_t ns) noexcept { return ns / 1000000U; }
@@ -1255,6 +1269,37 @@ bool DiagnosticAgent::RegisterMutex(const std::string& name,
     return true;
 }
 
+bool DiagnosticAgent::RegisterContext(const std::string& name,
+                                        ContextPtr context,
+                                        std::uint64_t gid) {
+    if (name.empty() || !context) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_registry_mutex);
+    for (auto& existing : m_contexts) {
+        if (existing.name == name) {
+            existing.context = std::move(context);
+            existing.gid = gid;
+            return true;
+        }
+    }
+    m_contexts.push_back(
+        ContextRegistration{name, std::move(context), gid});
+    return true;
+}
+
+bool DiagnosticAgent::UnregisterContext(const std::string& name) {
+    std::lock_guard<std::mutex> lock(m_registry_mutex);
+    const auto before = m_contexts.size();
+    m_contexts.erase(
+        std::remove_if(m_contexts.begin(), m_contexts.end(),
+                       [&name](const ContextRegistration& registration) {
+                           return registration.name == name;
+                       }),
+        m_contexts.end());
+    return m_contexts.size() != before;
+}
+
 bool DiagnosticAgent::RegisterFiberFunction(
     const std::string& name, std::function<std::string()> function) {
     if (name.empty() || !function) {
@@ -1340,6 +1385,7 @@ void DiagnosticAgent::ResetRegistrations() {
         m_schedulers.clear();
         m_targets.clear();
         m_mutexes.clear();
+        m_contexts.clear();
         m_fiber_functions.clear();
     }
     // 注册时桥接过 DebugServer（组件的 dump provider 捕获对象地址）。对象
@@ -1604,6 +1650,8 @@ DiagnosticCommandResult DiagnosticAgent::RunCommand(
                 result = CmdDeadlockReport(line.argument);
             } else if (line.name == kDoctorCmdMutexUnlock) {
                 result = CmdMutexUnlock(line.argument);
+            } else if (line.name == kDoctorCmdContextCancel) {
+                result = CmdContextCancel(line.argument);
             } else if (line.name == kDoctorCmdInjectFiber) {
                 result = CmdInjectFiber(line.argument);
             } else if (line.name == kDoctorCmdStats) {
@@ -1760,6 +1808,8 @@ DiagnosticCommandResult DiagnosticAgent::CmdStatus(const std::string& argument) 
         static_cast<std::int64_t>(agent_stats.concurrent_peak);
     root["doctor"]["deadlock_events"] =
         static_cast<std::int64_t>(agent_stats.deadlock_events);
+    root["doctor"]["context_cancels"] =
+        static_cast<std::int64_t>(agent_stats.context_cancels);
     root["doctor"]["deadlock_verdict"] = VerdictName(deadlock_verdict());
     root["doctor"]["no_progress_ms"] =
         static_cast<std::int64_t>(no_progress_ms());
@@ -1958,6 +2008,7 @@ DiagnosticCommandResult DiagnosticAgent::CmdStatus(const std::string& argument) 
     text.Key("doctor.dropped", agent_stats.dropped);
     text.Key("doctor.max_queue_depth", agent_stats.max_queue_depth);
     text.Key("doctor.concurrent_peak", agent_stats.concurrent_peak);
+    text.Key("doctor.context_cancels", agent_stats.context_cancels);
     text.Key("doctor.deadlock_verdict", VerdictName(deadlock_verdict()));
     text.Key("doctor.no_progress_ms", no_progress_ms());
     text.Key("doctor.diagnostic_fiber", diagnostic_fiber_installed());
@@ -2778,6 +2829,259 @@ DiagnosticCommandResult DiagnosticAgent::CmdMutexUnlock(
 }
 
 // ---------------------------------------------------------------------------
+// ctx.cancel：只取消已注册的 Context（不做任何解锁）
+// ---------------------------------------------------------------------------
+
+DiagnosticCommandResult DiagnosticAgent::CmdContextCancel(
+    const std::string& argument) {
+    const Arguments arguments = ParseArguments(argument);
+    const bool want_json = arguments.Get("format") == "json" ||
+                           arguments.Get("json") == "1";
+
+    // 定位条件可来自 key=value，也可来自位置参数：
+    //   ctx.cancel 42            （十进制 gid）
+    //   ctx.cancel --address 0x...（指针）
+    //   ctx.cancel 0x...          （指针的短写法）
+    std::string gid_text = arguments.Get("gid");
+    std::string name_text = arguments.Get("name");
+    std::string address_text = arguments.Get("address");
+    const auto looks_like_pointer = [](const std::string& token) {
+        return token.size() > 2U && token[0] == '0' &&
+               (token[1] == 'x' || token[1] == 'X');
+    };
+    for (std::size_t index = 0; index < arguments.positional.size(); ++index) {
+        const std::string& token = arguments.positional[index];
+        if (token == "--address") {
+            if (index + 1U >= arguments.positional.size()) {
+                return Fail("bad-argument",
+                            "ctx.cancel --address requires <ptr>");
+            }
+            address_text = arguments.positional[++index];
+            continue;
+        }
+        if (token.rfind("--", 0) == 0) {
+            return Fail("bad-argument", "unknown option: " + token);
+        }
+        if (looks_like_pointer(token)) {
+            if (!address_text.empty()) {
+                return Fail("bad-argument", "address specified twice");
+            }
+            address_text = token;
+            continue;
+        }
+        if (!gid_text.empty()) {
+            return Fail("bad-argument", "unexpected argument: " + token);
+        }
+        gid_text = token;
+    }
+    if (gid_text.empty() && name_text.empty() && address_text.empty()) {
+        return Fail("bad-argument",
+                    "ctx.cancel requires <gid>, gid=<n>, name=<name> or "
+                    "--address <ptr>");
+    }
+
+    std::uint64_t gid = 0;
+    bool have_gid = false;
+    if (!gid_text.empty()) {
+        std::size_t used = 0;
+        bool parsed = true;
+        try {
+            gid = std::stoull(gid_text, &used, 10);
+        } catch (...) {
+            parsed = false;
+        }
+        if (!parsed || used != gid_text.size()) {
+            return Fail("bad-argument",
+                        "gid must be a decimal integer: " + gid_text);
+        }
+        if (gid == 0U) {
+            return Fail("bad-argument",
+                        "gid=0 is not a valid task id");
+        }
+        have_gid = true;
+    }
+
+    std::uintptr_t address = 0;
+    bool have_address = false;
+    if (!address_text.empty()) {
+        std::size_t used = 0;
+        unsigned long long value = 0;
+        bool parsed = true;
+        try {
+            if (looks_like_pointer(address_text)) {
+                value = std::stoull(address_text.substr(2), &used, 16);
+                parsed = used == address_text.size() - 2U;
+            } else {
+                value = std::stoull(address_text, &used, 10);
+                parsed = used == address_text.size();
+            }
+        } catch (...) {
+            parsed = false;
+        }
+        if (!parsed) {
+            return Fail("bad-argument",
+                        "address must be 0x<hex> or decimal: " +
+                            address_text);
+        }
+        address = static_cast<std::uintptr_t>(value);
+        have_address = true;
+    }
+
+    std::vector<ContextRegistration> contexts;
+    {
+        std::lock_guard<std::mutex> lock(m_registry_mutex);
+        contexts = m_contexts;
+    }
+
+    // 只有**已注册**的 Context 才会被取消：address 也是注册表内的身份匹配，
+    // 不是 `reinterpret_cast` 后直接解引用。优先级 address > gid > name。
+    ContextPtr matched;
+    std::string matched_name;
+    std::string matched_by;
+    std::uint64_t matched_gid = 0;
+    for (const auto& registration : contexts) {
+        if (!registration.context) {
+            continue;
+        }
+        if (have_address &&
+            reinterpret_cast<std::uintptr_t>(registration.context.get()) ==
+                address) {
+            matched = registration.context;
+            matched_name = registration.name;
+            matched_gid = registration.gid;
+            matched_by = "address";
+            break;
+        }
+        if (have_gid && registration.gid == gid) {
+            matched = registration.context;
+            matched_name = registration.name;
+            matched_gid = registration.gid;
+            matched_by = "gid";
+            break;
+        }
+        if (!name_text.empty() && registration.name == name_text) {
+            matched = registration.context;
+            matched_name = registration.name;
+            matched_gid = registration.gid;
+            matched_by = "name";
+            break;
+        }
+    }
+    if (!matched) {
+        std::string what;
+        if (have_address) {
+            what = "address=" + HexAddress(static_cast<std::uint64_t>(address));
+        } else if (have_gid) {
+            what = "gid=" + std::to_string(gid);
+        } else {
+            what = "name=" + name_text;
+        }
+        return Fail("not-registered",
+                    "no registered context for " + what +
+                        " (register via DiagnosticAgent::RegisterContext)");
+    }
+
+    const bool was_done = matched->IsDone();
+    const std::uint64_t ts_ns = NowNs();
+    const std::uint64_t wall_ms = WallMs();
+    // 先计数、再 Cancel：与 mutex-unlock --force 同理，被唤醒的等待方可能在
+    // Cancel 返回前就完成回滚并观察审计计数。
+    m_context_cancels.fetch_add(1, std::memory_order_relaxed);
+    bool cancelled = true;
+    std::string cancel_error;
+    try {
+        // **只取消**：不调用 Unlock/FUnlock，不写任何锁状态字。锁的释放由被
+        // 取消方 ContextRollback 的 undo 完成（同步运行在 DoneSignal 的内部
+        // 回调里，因此本命令返回时 undo 已经执行过）。
+        matched->Cancel();
+    } catch (const std::exception& exception) {
+        cancelled = false;
+        cancel_error = exception.what();
+    } catch (...) {
+        cancelled = false;
+        cancel_error = "unknown-exception";
+    }
+    if (!cancelled) {
+        m_context_cancels.fetch_sub(1, std::memory_order_relaxed);
+        return Fail("internal", "ctx-cancel-failed: " + cancel_error);
+    }
+    const bool now_done = matched->IsDone();
+    const std::uint64_t cancels_total =
+        m_context_cancels.load(std::memory_order_relaxed);
+    const std::uint64_t matched_address =
+        static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(matched.get()));
+
+    // 审计走 stderr：被测进程的 stdout 是场景阶段输出，不能被污染。
+    std::fprintf(stderr,
+                 "[go2cpp][doctor][audit] ctx.cancel name=%s gid=%llu "
+                 "address=%s matched_by=%s actor=doctor pid=%d ts_ns=%llu "
+                 "wall_ms=%llu was_done=%s now_done=%s cancels_total=%llu\n",
+                 matched_name.c_str(),
+                 static_cast<unsigned long long>(matched_gid),
+                 HexAddress(matched_address).c_str(), matched_by.c_str(),
+                 static_cast<int>(::getpid()),
+                 static_cast<unsigned long long>(ts_ns),
+                 static_cast<unsigned long long>(wall_ms),
+                 was_done ? "true" : "false", now_done ? "true" : "false",
+                 static_cast<unsigned long long>(cancels_total));
+
+    DiagnosticCommandResult result;
+    result.ok = true;
+    result.json = want_json;
+    if (want_json) {
+        Json root = Json::object();
+        root["schema"] = "go2cpp.diagnostic.ctx-cancel/1";
+        root["version"] = 1;
+        root["verdict"] = "cancelled";
+        root["audit"] = true;
+        root["context"] = Json::object();
+        root["context"]["name"] = matched_name;
+        root["context"]["gid"] = static_cast<std::int64_t>(matched_gid);
+        root["context"]["gid_known"] = matched_gid != 0U;
+        root["context"]["address"] = HexAddress(matched_address);
+        root["context"]["matched_by"] = matched_by;
+        root["context"]["was_done"] = was_done;
+        root["context"]["now_done"] = now_done;
+        root["audit_detail"] = Json::object();
+        root["audit_detail"]["actor"] = "doctor";
+        root["audit_detail"]["pid"] =
+            static_cast<std::int64_t>(::getpid());
+        root["audit_detail"]["ts_ns"] =
+            static_cast<std::int64_t>(ts_ns);
+        root["audit_detail"]["wall_ms"] =
+            static_cast<std::int64_t>(wall_ms);
+        root["audit_detail"]["command"] = "ctx.cancel";
+        root["audit_detail"]["cancel_thread"] = "doctor-executor";
+        root["contexts_registered"] =
+            static_cast<std::int64_t>(contexts.size());
+        root["cancels_total"] = static_cast<std::int64_t>(cancels_total);
+        result.payload = JsonText(root);
+    } else {
+        TextDump text;
+        text.Head("go2cpp.diagnostic.ctx-cancel/1");
+        text.Key("verdict", "cancelled");
+        text.Key("context.name", matched_name);
+        text.Key("context.gid", matched_gid);
+        text.Key("context.gid_known", matched_gid != 0U);
+        text.Key("context.address", HexAddress(matched_address));
+        text.Key("context.matched_by", matched_by);
+        text.Key("context.was_done", was_done);
+        text.Key("context.now_done", now_done);
+        text.Key("audit.actor", "doctor");
+        text.Key("audit.pid", static_cast<std::uint64_t>(::getpid()));
+        text.Key("audit.ts_ns", ts_ns);
+        text.Key("audit.wall_ms", wall_ms);
+        text.Key("audit.cancel_thread", "doctor-executor");
+        text.Key("contexts_registered",
+                 static_cast<std::uint64_t>(contexts.size()));
+        text.Key("cancels_total", cancels_total);
+        result.payload = text.Take();
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // inject-fiber：在受管 G 的 GMP 上下文里执行
 // ---------------------------------------------------------------------------
 
@@ -2879,6 +3183,8 @@ DiagnosticCommandResult DiagnosticAgent::CmdStats(const std::string& argument) {
             static_cast<std::int64_t>(snapshot.auto_force_wakes);
         root["forced_unlocks"] =
             static_cast<std::int64_t>(snapshot.forced_unlocks);
+        root["context_cancels"] =
+            static_cast<std::int64_t>(snapshot.context_cancels);
         root["fiber_jobs"] = static_cast<std::int64_t>(snapshot.fiber_jobs);
         root["fiber_failures"] =
             static_cast<std::int64_t>(snapshot.fiber_failures);
@@ -2905,6 +3211,8 @@ DiagnosticCommandResult DiagnosticAgent::CmdStats(const std::string& argument) {
                           std::to_string(snapshot.auto_force_wakes) + "\n";
         result.payload += "forced_unlocks=" +
                           std::to_string(snapshot.forced_unlocks) + "\n";
+        result.payload += "context_cancels=" +
+                          std::to_string(snapshot.context_cancels) + "\n";
         result.payload += "fiber_jobs=" +
                           std::to_string(snapshot.fiber_jobs) + "\n";
         result.payload += "fiber_failures=" +
@@ -3161,6 +3469,8 @@ DiagnosticAgentStats DiagnosticAgent::stats() const {
         m_auto_force_wakes.load(std::memory_order_relaxed);
     snapshot.forced_unlocks =
         m_forced_unlocks.load(std::memory_order_relaxed);
+    snapshot.context_cancels =
+        m_context_cancels.load(std::memory_order_relaxed);
     snapshot.fiber_jobs = m_fiber_jobs.load(std::memory_order_relaxed);
     snapshot.fiber_failures =
         m_fiber_failures.load(std::memory_order_relaxed);
@@ -3188,6 +3498,9 @@ std::string DiagnosticAgent::HelpText() {
         "                                    DANGEROUS: skip the owner-gone\n"
         "                                    proof and Unlock() anyway; audited\n"
         "                                    on stderr + response fields\n"
+        "  ctx.cancel <gid>                  cancel a registered Context only\n"
+        "  ctx.cancel name=<registered>      (no forced unlock; ContextRollback\n"
+        "  ctx.cancel --address <ptr>        undo runs on the cancelling thread)\n"
         "  inject-fiber fn=<registered> [timeout_ms=N]\n"
         "  ping | stats [json] | help\n"
         "frame: magic=G2CD version=1 header=24 bytes, checksum=FNV-1a/32\n"

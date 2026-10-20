@@ -95,6 +95,7 @@
 
 #include "go2cpp/concurrency/channel.hpp"
 #include "go2cpp/concurrency/core/parking_condition.hpp"
+#include "go2cpp/concurrency/context.hpp"
 #include "go2cpp/concurrency/scheduler/scheduler.hpp"
 #include "go2cpp/debug/debug_dump.hpp"
 #include "go2cpp/debug/debug_server.hpp"
@@ -297,6 +298,8 @@ struct DiagnosticAgentStats {
     std::uint64_t auto_force_wakes{0};
     /// 已执行的 `mutex-unlock --force` 次数（危险操作审计；默认拒绝时不计）。
     std::uint64_t forced_unlocks{0};
+    /// 已执行成功的 `ctx.cancel` 次数（只取消、不强制解锁；未命中不计数）。
+    std::uint64_t context_cancels{0};
     std::uint64_t fiber_jobs{0};
     std::uint64_t fiber_failures{0};
 };
@@ -413,6 +416,25 @@ public:
     /// 注册 Mutex（只用于 dump / 等待图 / `mutex-unlock`；**不可 force-wake**）。
     bool RegisterMutex(const std::string& name, sync::Mutex& mutex);
 
+    /**
+     * @brief 注册一个可被 `ctx.cancel` 定位的 Context（白名单）。
+     *
+     * Doctor **不解引用任意地址**：`ctx.cancel --address <ptr>` 只在已注册
+     * 表里按指针身份匹配，未注册的地址一律 `not-registered`。这与
+     * `mutex-unlock` 只接受注册名是同一套安全约定。
+     *
+     * @param name 人类可读名（必须非空；同名重复注册视为替换）。
+     * @param context 要登记的可取消 Context；为空返回 false。
+     * @param gid 关联的 G/线程 id（0 = 只能按 name/address 定位）。
+     * @return 登记成功返回 true。
+     * @note 只保存 `shared_ptr`（不延长被取消对象的业务生命周期），调用方
+     *       在对象失效后应 `UnregisterContext`。
+     */
+    bool RegisterContext(const std::string& name, ContextPtr context,
+                         std::uint64_t gid = 0);
+    /// 按名字注销 Context 登记；返回是否移除了一项。
+    bool UnregisterContext(const std::string& name);
+
     /// 注册可在诊断 Fiber 里执行的函数（`inject-fiber fn=<name>`）。
     bool RegisterFiberFunction(const std::string& name,
                                std::function<std::string()> function);
@@ -495,6 +517,12 @@ private:
         sync::Mutex* mutex{nullptr};
     };
 
+    struct ContextRegistration {
+        std::string name;
+        ContextPtr context;
+        std::uint64_t gid{0};
+    };
+
     struct FiberJob {
         bool stop{false};
         bool has_job{false};
@@ -525,6 +553,7 @@ private:
     DiagnosticCommandResult CmdForceWake(const std::string& argument);
     DiagnosticCommandResult CmdDeadlockReport(const std::string& argument);
     DiagnosticCommandResult CmdMutexUnlock(const std::string& argument);
+    DiagnosticCommandResult CmdContextCancel(const std::string& argument);
     DiagnosticCommandResult CmdInjectFiber(const std::string& argument);
     DiagnosticCommandResult CmdStats(const std::string& argument);
     DiagnosticCommandResult Fail(std::string code, std::string message) const;
@@ -565,6 +594,7 @@ private:
     std::vector<std::pair<std::string, Scheduler*>> m_schedulers;
     std::vector<std::shared_ptr<WakeTarget>> m_targets;
     std::vector<MutexRegistration> m_mutexes;
+    std::vector<ContextRegistration> m_contexts;
     std::vector<std::pair<std::string, std::function<std::string()>>>
         m_fiber_functions;
 
@@ -578,6 +608,7 @@ private:
     std::atomic<std::uint64_t> m_deadlock_events{0};
     std::atomic<std::uint64_t> m_auto_force_wakes{0};
     std::atomic<std::uint64_t> m_forced_unlocks{0};
+    std::atomic<std::uint64_t> m_context_cancels{0};
     std::atomic<std::uint64_t> m_fiber_jobs{0};
     std::atomic<std::uint64_t> m_fiber_failures{0};
 

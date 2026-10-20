@@ -391,6 +391,9 @@ inline constexpr const char* kDoctorCmdForceWake = "force-wake";
 inline constexpr const char* kDoctorCmdDeadlockReport = "deadlock-report";
 /// `mutex-unlock name=<registered-name>`：受控解锁（白名单判定）。
 inline constexpr const char* kDoctorCmdMutexUnlock = "mutex-unlock";
+/// `ctx.cancel <gid> | name=<n> | --address <ptr>`：只取消已注册的 Context，
+/// 不强制解锁、不碰未注册对象（回滚由 ContextRollback 的 undo 负责）。
+inline constexpr const char* kDoctorCmdContextCancel = "ctx.cancel";
 /// `inject-fiber fn=<registered-function>`：在诊断 Fiber 内执行。
 inline constexpr const char* kDoctorCmdInjectFiber = "inject-fiber";
 /// `ping`：存活探测（不触碰运行时状态）。

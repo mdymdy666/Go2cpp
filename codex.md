@@ -1562,3 +1562,36 @@ benchmarks/gmp_vs_thread_epoll_benchmark.cpp
   owner），不是本场景引入；详见 `/tmp/deadlock_scenario.md` §11.3；
 - `cmake --build build-work` 全量通过（默认开关零影响）。
 - 报告：`/tmp/deadlock_scenario.md`；dump：`/tmp/scenario-deadlock-dump.txt`。
+
+## 25. 2026-10-20 Context 取消 + 回滚解死锁：Doctor `ctx.cancel` + 场景（deepseek）
+
+- 需求：A 等锁被取消 → A 回滚释放已持锁 → B 继续。一次做完，不 commit。
+- Doctor：新增 `ctx.cancel <gid> | gid=<n> | name=<n> | --address <ptr>`。
+  只对 `RegisterContext()` 登记的 Context 调用 `Cancel()`，**不 Unlock**；
+  `--address` 只在注册表内按指针身份匹配（不解引用任意地址）。响应
+  `schema=go2cpp.diagnostic.ctx-cancel/1`，`verdict=cancelled` + `context.*`
+  + `audit.actor/pid/ts_ns/wall_ms/cancel_thread`；stderr 有审计行；
+  `stats().context_cancels` 计数。拒绝：`not-registered`（未注册 gid/address）、
+  `bad-argument`（非法 gid、缺参数）。
+- 新场景 `tests/scenarios/ctx_cancel_rollback/`：A/B 交叉持锁死锁，两把锁的
+  持有都绑定 `ContextRollback::RecordUndo`；`deadlock-report` 判 deadlock 后
+  `ctx.cancel gid=A` → undo 在取消线程释放 L1，A 的 `Lock(L2)` 返回 false、
+  `ctx.Err()` 非空；B 拿到 L1 完成。三模式：cancel / external（真实 socket +
+  doctor_client.py）/ force（对照 stale-unlock）。
+- 实测（build-doctor-full, Release）：
+  - cancel：pass=1，undo_executed=1，rolled_back，locks 3=3，L1/L2
+    held=0 waiters=0，shared_work=1；单独连续 10/10 轮通过；
+  - external：65 项断言全 PASS（含 4 条拒绝路径），连续 5 轮 PASS=65 FAIL=0；
+  - force：stale=1、undo_executed=0、committed、4/3 + force1 = balanced
+    （对照组证明强制解锁的 stale 风险）。
+- 关键竞态：取消的 undo 先释放 L1 → B 完成释放 L2 → A 被正常唤醒抢到 L2 →
+  取消回调尚未执行。A 在 `Lock` 返回后必须**无条件检查 `ctx.Err()`**，
+  拿到锁但已取消就立刻归还（`cancel_race=1`），否则会带着「已失去 L1」的
+  假设继续跑。
+- 既有缺陷（未改）：`Mutex::DebugSnapshotInternal().native_waiters` 在取消与
+  Unlock 竞争时偶发下溢（SIZE_MAX）；权威队列长度是 `waiters`。另有
+  build-doctor-full 陈旧构建导致 go2cpp_tests 假 SEGFAULT（重建 go2cpp_tests
+  后 ctest 116/116）。
+- 验证：`bash tests/scenarios/ctx_cancel_rollback/run_ctx_cancel_rollback.sh
+  build-doctor-full` → PASS=65 FAIL=0；`ctest` → 116/116；`git` 未 commit。
+- 报告：`/tmp/ctx_cancel_rollback.md`。

@@ -125,6 +125,17 @@ if (GO2CPP_BUILD_TESTS)
         target_compile_options(go2cpp_deadlock_routes PRIVATE
             -Wall -Wextra -Wpedantic)
     endif()
+    # ---- 场景：锁顺序死锁 → Doctor ctx.cancel → ContextRollback undo 解死锁 ----
+    # 演示「取消等待 + 回滚释放已持锁」，与 mutex-unlock --force 的 stale 路径
+    # 对照。**不注册 ctest**：ctest 用例总数保持 116；验收由
+    # tests/scenarios/ctx_cancel_rollback/run_ctx_cancel_rollback.sh 外部驱动。
+    if (GO2CPP_DEBUG_DUMP AND GO2CPP_DIAGNOSTIC)
+        add_executable(go2cpp_ctx_cancel_rollback
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/ctx_cancel_rollback/ctx_cancel_rollback_demo.cpp)
+        target_link_libraries(go2cpp_ctx_cancel_rollback PRIVATE go2cpp_runtime)
+        target_compile_options(go2cpp_ctx_cancel_rollback PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
     add_test(NAME go2cpp_tests COMMAND go2cpp_tests)
     # 超时从 30 -> 60 -> 120：go2cpp_tests 是全部单元测试的集合。
     # 随调试模块陆续新增测试（debug_* 七个）后整体耗时约 18~30s，且**偶发**更高：
