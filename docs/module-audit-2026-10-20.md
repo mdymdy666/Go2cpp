@@ -249,3 +249,48 @@ D09 复核 + 端到端（application_close(7)、stream_reset(0x1234)）；D15 ho
 | `AbortAfterLockLoss` 兜底分支 | 并发 | 实际不可达，保留 |
 | fiber SIGSEGV handler 覆盖/async-signal-safe | Fiber | 未排期（P2） |
 | `worker_loop` 门槛 `runnable>P` 注释不符 | scheduler | 性能项，未改 |
+
+## 8. 发布注意事项（Breaking Changes 与行为变化）
+
+> 本节面向升级者，列出第二轮修复中**默认行为发生变化**的项。
+
+### 8.1 默认值/行为变更（升级需检查）
+
+| 变更 | 影响 | 建议 |
+|---|---|---|
+| **TLS `verify_peer` 默认 false → true** | 依赖旧默认可连自签名/无证书服务端的代码会 fail-closed | 发布说明写明 breaking change；需要旧行为的调用显式传 `verify_peer=false` |
+| **HTTP2 `MAX_CONCURRENT_STREAMS` 默认执行** | 超过对端通告值的流返回 `REFUSED_STREAM`（此前全部接受） | 依赖「只发不收」压测的代码需处理拒绝 |
+| **HTTP2 `:scheme` 强制** | 带 `:authority` 的请求缺少/非法 `:scheme` 会被拒 | 客户端已自动补 `http`；自定义客户端需带 `:scheme` |
+| **HTTP2 帧长超限先发 GOAWAY** | 超限帧不再直接断连 | 无需改代码，行为更符合 RFC |
+| **配置值中的字面 `\xHH`** | 会被解析为对应字节（此前按字面保留） | 需要字面 `\x` 的值请用 `\\x` 转义 |
+| **OS 路径/环境变量含 NUL** | 返回 `EINVAL`（此前静默截断） | 检查是否有依赖截断的调用 |
+| **`RemoveAll(".")`/`("..")`** | 返回 `EINVAL`（此前清空 cwd/父目录） | 修正误用 |
+| **`WriteAt` 在 O_APPEND 句柄** | 返回 `EINVAL`（此前忽略 offset 追加） | 改用 `Write` 或非 O_APPEND 句柄 |
+| **`ReadFile` 超过 `max_file_size`** | 返回 `EFBIG`（此前 procfs 等可绕过） | 调大配置或分块读 |
+
+### 8.2 待决策项（默认未启用/未改）
+
+| 项 | 现状 | 启用条件 |
+|---|---|---|
+| HTTP2 `:scheme` 完全严格（`strict_scheme`） | 默认仅对带 `:authority` 的请求强制 | 修改 `tests/network/test_connection` 场景 8/case3 后可开 |
+| HTTP2 请求方向 header 上限 | 默认关闭（服务端响应方向始终检查） | 修改 `test_http2_stress` case2（两端同 config=100）后可默认 true |
+| HTTP2 431 自动发送 | 未自动发，由上层处理 | 上层 HTTP 服务器实现 |
+| OS `CloseChecked()` | 未提供，`Close()` 仍丢弃 close(2) 错误 | 新增 API（不破坏现有签名） |
+| OS `Rename/Chmod/Chdir/Getwd/MkdirTemp` | 未实现 | 产品决策 |
+| http3/quic ctest | 仓库内无（验收测试在 `/tmp/fix_http3`） | 放宽 `cmake/`、`tests/` 边界后迁入 |
+
+### 8.3 已知未修（不阻塞发布）
+
+- `fiber.cpp` growable 栈覆盖进程 SIGSEGV handler、不保存旧 handler、handler 内 `mprotect` 非严格 async-signal-safe（P2）；
+- `worker_loop` 本地快路径门槛 `runnable > P` 与注释不符（性能项）；
+- `wake_io_batch` 入队失败静默、stale wake token（P3，`Await` 已容忍）；
+- `AbortAfterLockLoss` 的 `recovered=false` 兜底分支保留写者票据（实际不可达）。
+
+### 8.4 验证基线
+
+- `ctest` **116/116**；
+- scheduler 唤醒丢失：卡死 7/12 → **0/24**（720 轮）；
+- HTTP2：20/20 探针、checks=50244；
+- HTTP3：29/29 acceptance、300×3 建连；
+- OS：103 断言、fuzz 10 万、30 轮；
+- 并发性能：Mutex 两态 latch 8t 24~55µs→18.3~19ns、PC pc-rtt 32.1→3.4µs、Channel cap0 30.3→1.19µs、RWMutex alloc 3.00→0.02。
