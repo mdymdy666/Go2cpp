@@ -43,6 +43,8 @@
 
 #include "go2cpp/sync.hpp"
 
+#include "go2cpp/debug/debug_resources.hpp"
+
 #include <chrono>
 #include <stdexcept>
 
@@ -57,13 +59,22 @@ namespace go2cpp::sync {
 class TimedMutex final {
 public:
     /// @brief 创建未加锁的互斥锁。
-    TimedMutex() = default;
+    TimedMutex() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        m_debug_resource =
+            GO2CPP_DEBUG_RESOURCE_REGISTER(kTimedMutex, this, nullptr);
+#endif
+    }
 
     /**
      * @brief 销毁互斥锁。
      * @warning 调用方必须保证锁已释放且没有等待者。
      */
-    ~TimedMutex() = default;
+    ~TimedMutex() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_UNREGISTER(m_debug_resource);
+#endif
+    }
 
     TimedMutex(const TimedMutex&) = delete;
     TimedMutex& operator=(const TimedMutex&) = delete;
@@ -75,24 +86,52 @@ public:
      * @throw std::logic_error 调度器不可用或 G 被取消，导致无法继续等待。
      */
     void Lock() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kMutexLock, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ::go2cpp::debug::ResourceResult::kBlocked, 0, true);
+#endif
         if (!m_impl.Lock()) {
             throw std::logic_error(
                 "go2cpp::sync::TimedMutex lock was cancelled or scheduler "
                 "unavailable");
         }
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kMutexLock, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ::go2cpp::debug::ResourceResult::kOk, 0, false);
+#endif
     }
 
     /**
      * @brief 释放锁。
      * @throw std::logic_error 当前未持有锁。
      */
-    void Unlock() { m_impl.Unlock(); }
+    void Unlock() {
+        m_impl.Unlock();
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kMutexUnlock, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ::go2cpp::debug::ResourceResult::kOk, 0, false);
+#endif
+    }
 
     /**
      * @brief 非阻塞尝试加锁。
      * @return 成功返回 true（已持有）；已被持有返回 false。
      */
-    bool TryLock() noexcept { return m_impl.TryLock(); }
+    bool TryLock() noexcept {
+        const bool acquired = m_impl.TryLock();
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT_EX(
+            kMutexLock, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            acquired ? ::go2cpp::debug::ResourceResult::kOk
+                     : ::go2cpp::debug::ResourceResult::kWouldBlock,
+            0, false,
+            static_cast<std::uint32_t>(::go2cpp::debug::kResourceFlagTry));
+#endif
+        return acquired;
+    }
 
     /**
      * @brief 在相对超时内尝试加锁。
@@ -132,6 +171,10 @@ public:
     }
 
 private:
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    /// @brief 资源级历史编号（构造时注册；OFF 构建不存在该成员）。
+    ::go2cpp::debug::ResourceId m_debug_resource{0};
+#endif
     /// 底层混合互斥锁；超时、park、FIFO 全部由它提供。
     Mutex m_impl;
 };

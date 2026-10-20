@@ -25,6 +25,7 @@
  */
 #include "go2cpp/core/parking_condition.hpp"
 #include "go2cpp/debug/debug_event_ring.hpp"
+#include "go2cpp/debug/debug_resources.hpp"
 
 #include "go2cpp/concurrency/core/futex_mutex.hpp"
 
@@ -392,8 +393,6 @@ public:
         const auto task = m_task;
         // 原语提示：外层（channel/mutex）已设置时不会被覆盖。
         GO2CPP_DEBUG_PARK_HINT(kParkingCondition);
-        GO2CPP_DEBUG_EVENT_SAMPLED(
-            kPCWait, task ? task->id() : 0, 0, 16);
         for (;;) {
             // Notify 可能在当前 G 进入 park 前完成。终态已经通过
             // WaitNode::Finish 发布时，直接返回可跳过 Scheduler admission
@@ -484,8 +483,16 @@ ParkingConditionDebugSnapshot ParkingCondition::DebugSnapshot() const {
     return snapshot;
 }
 
-ParkingCondition::ParkingCondition() = default;
-ParkingCondition::~ParkingCondition() = default;
+ParkingCondition::ParkingCondition() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_REGISTER(kParkingCondition, this, nullptr);
+#endif
+}
+ParkingCondition::~ParkingCondition() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_UNREGISTER_ADDR(this);
+#endif
+}
 
 bool ParkingCondition::CancellationRequested() noexcept {
     const auto task = Scheduler::current_task();
@@ -521,6 +528,7 @@ bool ParkingCondition::FiberWaitUnsupported() noexcept {
  */
 void ParkingCondition::notify_one() noexcept {
     std::shared_ptr<WaitNode> selected;
+    std::uint32_t waiters_after = 0;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         while (!m_waiters.empty()) {
@@ -531,9 +539,15 @@ void ParkingCondition::notify_one() noexcept {
                 break;
             }
         }
+        waiters_after = static_cast<std::uint32_t>(m_waiters.size());
     }
     if (selected) {
-        GO2CPP_DEBUG_EVENT(kPCNotify, selected->gid(), 0);
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kPCNotify, GO2CPP_DEBUG_RESOURCE_ID(this),
+            GO2CPP_DEBUG_BOUND_TASK(), selected->gid(), 0,
+            ::go2cpp::debug::ResourceResult::kWake, waiters_after, true);
+#endif
         GO2CPP_DEBUG_WAKE_HINT(kParkingCondition);
         selected->Wake();
     }
@@ -578,6 +592,12 @@ void ParkingCondition::notify_all() noexcept {
 #endif
     GO2CPP_DEBUG_EVENT(kPCNotifyAll, 0,
                        static_cast<std::uint64_t>(waiters.size()));
+    GO2CPP_DEBUG_RESOURCE_EVENT(
+        kPCNotifyAll, GO2CPP_DEBUG_RESOURCE_ID(this),
+        GO2CPP_DEBUG_BOUND_TASK(), 0,
+        static_cast<std::uint64_t>(waiters.size()),
+        ::go2cpp::debug::ResourceResult::kWake,
+        static_cast<std::uint32_t>(waiters.size()), true);
     GO2CPP_DEBUG_WAKE_HINT(kParkingCondition);
     for (const auto& node : waiters) {
         if (node->result() != WaitNode::Result::kNotified) {
@@ -661,6 +681,7 @@ ParkingCondition::WaitStatus ParkingCondition::WaitOnce(
 
     const auto node = std::make_shared<WaitNode>(this, 
         managed ? scheduler : nullptr, managed ? task : nullptr);
+    std::uint32_t waiters_after = 0;
     {
         std::lock_guard<std::mutex> queue_lock(m_mutex);
         // Recheck after acquiring the notification lock. Context cancellation
@@ -670,7 +691,37 @@ ParkingCondition::WaitStatus ParkingCondition::WaitOnce(
             return WaitStatus::kNotified;
         }
         m_waiters.push_back(node);
+        waiters_after = static_cast<std::uint32_t>(m_waiters.size());
     }
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    const go2cpp::debug::ResourceId debug_resource =
+        GO2CPP_DEBUG_RESOURCE_ID(this);
+    const std::uint64_t debug_gid =
+        task ? static_cast<std::uint64_t>(task->id()) : 0ULL;
+    GO2CPP_DEBUG_RESOURCE_EVENT(
+        kPCWait, debug_resource, debug_gid, 0, 0,
+        ::go2cpp::debug::ResourceResult::kBlocked, waiters_after, true);
+    const auto finish_wait = [&](WaitStatus status) {
+        go2cpp::debug::ResourceResult result =
+            go2cpp::debug::ResourceResult::kCancelled;
+        switch (status) {
+            case WaitStatus::kNotified:
+                result = go2cpp::debug::ResourceResult::kOk;
+                break;
+            case WaitStatus::kTimedOut:
+                result = go2cpp::debug::ResourceResult::kTimeout;
+                break;
+            case WaitStatus::kCancelled:
+                result = go2cpp::debug::ResourceResult::kCancelled;
+                break;
+        }
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kPCWait, debug_resource, debug_gid, 0, 0, result, 0, true);
+        return status;
+    };
+#else
+    const auto finish_wait = [](WaitStatus status) { return status; };
+#endif
 
     Timer timer;
     const auto cleanup = [&] {
@@ -714,14 +765,14 @@ ParkingCondition::WaitStatus ParkingCondition::WaitOnce(
     }
     switch (result) {
     case WaitNode::Result::kNotified:
-        return WaitStatus::kNotified;
+        return finish_wait(WaitStatus::kNotified);
     case WaitNode::Result::kTimedOut:
-        return WaitStatus::kTimedOut;
+        return finish_wait(WaitStatus::kTimedOut);
     case WaitNode::Result::kWaiting:
     case WaitNode::Result::kCancelled:
-        return WaitStatus::kCancelled;
+        return finish_wait(WaitStatus::kCancelled);
     }
-    return WaitStatus::kCancelled;
+    return finish_wait(WaitStatus::kCancelled);
 }
 
 }  // namespace go2cpp::core

@@ -71,6 +71,8 @@
 #include "go2cpp/concurrency/scheduler/scheduler.hpp"
 #include "go2cpp/sync.hpp"
 
+#include "go2cpp/debug/debug_resources.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <stdexcept>
@@ -91,13 +93,22 @@ public:
     static constexpr std::uint32_t kMaxRecursionDepth = 1000;
 
     /// @brief 创建未加锁的可重入锁。
-    RecursiveMutex() = default;
+    RecursiveMutex() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        m_debug_resource =
+            GO2CPP_DEBUG_RESOURCE_REGISTER(kRecursiveMutex, this, nullptr);
+#endif
+    }
 
     /**
      * @brief 销毁可重入锁。
      * @warning 调用方必须保证锁已完全释放（深度归零）；否则未定义行为。
      */
-    ~RecursiveMutex() = default;
+    ~RecursiveMutex() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_UNREGISTER(m_debug_resource);
+#endif
+    }
 
     RecursiveMutex(const RecursiveMutex&) = delete;
     RecursiveMutex& operator=(const RecursiveMutex&) = delete;
@@ -113,9 +124,20 @@ public:
         const std::uintptr_t self = CurrentToken();
         if (m_owner.load(std::memory_order_acquire) == self) {
             AcquireRecursiveDepth();
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+            GO2CPP_DEBUG_RESOURCE_EVENT(
+                kRecursiveLock, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
+                m_depth.load(std::memory_order_relaxed),
+                ::go2cpp::debug::ResourceResult::kOk, 0, false);
+#endif
             return;
         }
         // 真实阻塞发生在 m_impl；此时没有持有任何本对象的原子状态。
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kRecursiveLock, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ::go2cpp::debug::ResourceResult::kBlocked, 0, true);
+#endif
         if (!m_impl.Lock()) {
             throw std::logic_error(
                 "go2cpp::sync::RecursiveMutex lock was cancelled or scheduler "
@@ -125,6 +147,11 @@ public:
         // self 时深度必然已是 1。
         m_depth.store(1, std::memory_order_relaxed);
         m_owner.store(self, std::memory_order_release);
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kRecursiveLock, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 1,
+            ::go2cpp::debug::ResourceResult::kOk, 0, false);
+#endif
     }
 
     /**
@@ -139,12 +166,23 @@ public:
         }
         // 只有 owner 会写 m_depth，因此这里无需 CAS。
         if (m_depth.fetch_sub(1, std::memory_order_acq_rel) != 1U) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+            GO2CPP_DEBUG_RESOURCE_EVENT(
+                kRecursiveUnlock, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(),
+                0, m_depth.load(std::memory_order_relaxed),
+                ::go2cpp::debug::ResourceResult::kOk, 0, false);
+#endif
             return;
         }
         // 先撤 owner、再释放底层锁：下一个 owner 在 m_impl.Lock() 返回后重新
         // 发布。若顺序反过来，中间窗口里别的执行流可能误判 owner。
         m_owner.store(0U, std::memory_order_release);
         m_impl.Unlock();
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kRecursiveUnlock, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ::go2cpp::debug::ResourceResult::kWake, 0, true);
+#endif
     }
 
     /**
@@ -229,6 +267,10 @@ private:
         return token;
     }
 
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    /// @brief 资源级历史编号（构造时注册；OFF 构建不存在该成员）。
+    ::go2cpp::debug::ResourceId m_debug_resource{0};
+#endif
     /// 真正提供互斥与 Fiber/线程双等待路径的底层锁。
     Mutex m_impl;
     /// 当前 owner token；0 表示无人持有。

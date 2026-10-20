@@ -23,6 +23,8 @@
  */
 #include "go2cpp/fiber.hpp"
 
+#include "go2cpp/debug/debug_resources.hpp"
+
 #include "go2cpp/detail/context_backend.hpp"
 #include "go2cpp/fiber_local.hpp"
 
@@ -48,7 +50,12 @@
 #endif
 #endif
 
+#if defined(__GNUG__)
+#include <cxxabi.h>
+#endif
+
 #include <algorithm>
+#include <unordered_map>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -950,7 +957,81 @@ struct FiberRecord {
     std::size_t depth{0};
     std::thread::id last_thread{};
     FiberExecutionBinding execution{};
+    /// 以下仅为调试元数据（GO2CPP_DEBUG_DUMP=ON 时填充）：
+    /// 任务实际函数名（typeid demangle / GO2CPP_FIBER_NAME）与栈地址范围。
+    std::string function_name;
+    std::uintptr_t stack_low{0};
+    std::uintptr_t stack_high{0};
+    bool stack_known{false};
 };
+
+/// 任务函数名：优先 GO2CPP_FIBER_NAME 的显式名字，其次 typeid 的
+/// target_type 名（std::function 的 target_type 才能拿到真实 lambda/函数
+/// 指针类型；直接 typeid(Function) 只会得到 std::function<void()>）。
+std::string DescribeFiberFunction(const Fiber::Function& function) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    const char* explicit_name = go2cpp::debug::TakeNextFiberName();
+    if (explicit_name != nullptr && *explicit_name != '\0') {
+        return explicit_name;
+    }
+    const std::type_info& type = function.target_type();
+    const char* raw = type.name();
+    if (raw == nullptr) {
+        return "<unknown>";
+    }
+#if defined(__GNUG__)
+    int status = 0;
+    char* demangled = abi::__cxa_demangle(raw, nullptr, nullptr, &status);
+    if (status == 0 && demangled != nullptr) {
+        std::string name(demangled);
+        std::free(demangled);
+        return name;
+    }
+    std::free(demangled);
+#endif
+    return raw;
+#else
+    (void)function;
+    return {};
+#endif
+}
+
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+/// Fiber 调试元数据发布表：父链样本需要父 Fiber 的函数名与栈范围，
+/// 而 free function 无法访问 Fiber 的私有 Impl；`context_snapshot()`
+/// 遍历父链时顺带发布，供 CaptureFiberChain 查询。
+struct FiberDebugMeta {
+    std::string function;
+    std::uintptr_t stack_low{0};
+    std::uintptr_t stack_high{0};
+    bool stack_known{false};
+};
+
+std::mutex& FiberMetaMutex() {
+    static std::mutex* mutex = new std::mutex();
+    return *mutex;
+}
+
+std::unordered_map<std::uint64_t, FiberDebugMeta>& FiberMetaMap() {
+    static auto* map =
+        new std::unordered_map<std::uint64_t, FiberDebugMeta>();
+    return *map;
+}
+
+/// 读取 record 元数据并发布（record 由父链共享，墓碑也可读）。
+void PublishFiberDebugMeta(FiberRecord& record) {
+    FiberDebugMeta meta;
+    {
+        std::lock_guard<std::mutex> lock(record.mutex);
+        meta.function = record.function_name;
+        meta.stack_low = record.stack_low;
+        meta.stack_high = record.stack_high;
+        meta.stack_known = record.stack_known;
+    }
+    std::lock_guard<std::mutex> lock(FiberMetaMutex());
+    FiberMetaMap()[record.id] = std::move(meta);
+}
+#endif  // GO2CPP_DEBUG_DUMP
 
 }  // namespace
 
@@ -966,6 +1047,9 @@ struct Fiber::Impl {
           m_stack_growable(stack_growable) {
 #if defined(GO2CPP_FIBER_TSAN)
         m_tsan_fiber = __tsan_create_fiber(0);
+#endif
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        m_record->function_name = DescribeFiberFunction(m_function);
 #endif
     }
 
@@ -989,6 +1073,9 @@ struct Fiber::Impl {
         m_function = std::move(function);
         m_id = next_record->id;
         m_record = std::move(next_record);
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        m_record->function_name = DescribeFiberFunction(m_function);
+#endif
         m_stack_size = normalized_stack_size;
         m_stack_reserve_size = stack_reserve_size;
         m_stack_growable = stack_growable;
@@ -1467,6 +1554,24 @@ struct Fiber::Impl {
         m_scheduler_propagate.store(propagate, std::memory_order_release);
         m_record->state.store(FiberState::Suspended, std::memory_order_release);
 
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        // park 是死锁分析的关键锚点：全量捕获线程栈与 Fiber 父链。
+        // 事件只写入事件环，不改变挂起/恢复语义；任何异常都被吞掉，
+        // 不能让诊断代码破坏 noexcept 的上下文切换。
+        try {
+            const std::uint64_t actor =
+                m_debug_gid.load(std::memory_order_relaxed);
+            go2cpp::debug::ResourceEventRecord event;
+            event.code = go2cpp::debug::SchedEventCode::kParkCaptured;
+            event.actor_gid = actor;
+            event.arg2 = static_cast<std::uint64_t>(reason);
+            event.result = go2cpp::debug::ResourceResult::kBlocked;
+            event.chain_id = go2cpp::debug::CaptureFiberChain(actor, true);
+            go2cpp::debug::RecordResourceEvent(event);
+        } catch (...) {
+        }
+#endif
+
 #if defined(GO2CPP_FIBER_ASAN)
         __sanitizer_start_switch_fiber(&m_asan_fake_stack, m_asan_caller_bottom,
                                       m_asan_caller_size);
@@ -1524,6 +1629,16 @@ struct Fiber::Impl {
             m_context = boost::context::detail::make_fcontext(
                 m_stack->stack_pointer(), m_stack->usable_size(), &Impl::entry);
             #endif
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+            {
+                std::lock_guard<std::mutex> lock(m_record->mutex);
+                m_record->stack_low = reinterpret_cast<std::uintptr_t>(
+                    m_stack->growth_base());
+                m_record->stack_high = reinterpret_cast<std::uintptr_t>(
+                    m_stack->growth_top());
+                m_record->stack_known = true;
+            }
+#endif
             return true;
         } catch (...) {
             std::lock_guard<std::mutex> lock(m_failure_mutex);
@@ -1539,6 +1654,8 @@ struct Fiber::Impl {
     std::uint64_t m_id;
     /// @brief 与外部观察者共享的元数据（状态/父链/时间戳）；快照跨线程读它。
     std::shared_ptr<FiberRecord> m_record;
+    /// @brief 最近一次执行绑定的 G 编号（仅调试事件用；无锁快照）。
+    std::atomic<std::uint64_t> m_debug_gid{0};
     /// @brief Fiber 主体；`reset_for_scheduler` 会替换成新提交的可调用对象。
     Function m_function;
     /// @brief 规范化后的初始提交量（页对齐，见 normalize_stack_size）。
@@ -1802,6 +1919,9 @@ FiberContextSnapshot Fiber::context_snapshot() const {
             parent = cursor->parent;
         }
         result.push_back(std::move(frame));
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        PublishFiberDebugMeta(*cursor);
+#endif
         cursor = std::move(parent);
     }
     std::reverse(result.begin(), result.end());
@@ -1823,6 +1943,7 @@ void Fiber::bind_execution(FiberExecutionBinding binding) noexcept {
     std::lock_guard<std::mutex> lock(m_impl->m_record->mutex);
     m_impl->m_record->execution = binding;
     m_impl->m_record->last_thread = std::this_thread::get_id();
+    m_impl->m_debug_gid.store(binding.task_id, std::memory_order_relaxed);
 }
 
 FiberStackDebugSnapshot Fiber::debug_stack() const {
@@ -2745,5 +2866,259 @@ std::unique_ptr<Fiber> Fiber::ImportMigrationImage(
 }
 
 #endif  // GO2CPP_MIGRATION_API
+
+// ===========================================================================
+// Fiber 链样本（debug）：父链节点 = gid / 状态 / 任务函数 / 栈范围
+//
+// 放在 fiber.cpp 的原因：只有这里能读到 FiberRecord 的内部元数据；样本表
+// 也随 go2cpp_fiber 一起导出，debug_dump 视图通过 LookupFiberChain 读取。
+// ===========================================================================
+namespace debug {
+namespace {
+
+constexpr std::uint32_t kDefaultChainEvery = 8;
+
+struct ChainTable {
+    std::mutex mutex;
+    std::vector<FiberChainSample> samples; ///< index = id - 1
+    std::unordered_map<std::uint64_t, FiberChainId> by_hash;
+    std::atomic<std::uint64_t> dropped{0};
+};
+
+ChainTable& ChainSamples() {
+    static ChainTable* table = new ChainTable();
+    return *table;
+}
+
+std::uint64_t HashChain(const FiberChainSample& sample) noexcept {
+    std::uint64_t hash = 1469598103934665603ULL;
+    const auto mix = [&hash](std::uint64_t value) {
+        for (int byte = 0; byte < 8; ++byte) {
+            hash ^= (value >> (byte * 8)) & 0xFFU;
+            hash *= 1099511628211ULL;
+        }
+    };
+    for (const auto& node : sample.nodes) {
+        mix(node.fiber_id);
+        mix(node.gid);
+        mix(node.state);
+        mix(node.depth);
+        mix(node.stack_low);
+        mix(node.stack_high);
+        for (const char ch : node.function) {
+            hash ^= static_cast<unsigned char>(ch);
+            hash *= 1099511628211ULL;
+        }
+    }
+    return hash;
+}
+
+std::uint64_t SteadyNs() noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+std::uint32_t ThreadHash() noexcept {
+    return static_cast<std::uint32_t>(
+        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+}  // namespace
+
+const char* FiberStateNameForDebug(std::uint8_t state) noexcept {
+    switch (static_cast<FiberState>(state)) {
+        case FiberState::Ready: return "Ready";
+        case FiberState::Running: return "Running";
+        case FiberState::Suspended: return "Suspended";
+        case FiberState::Completed: return "Completed";
+        case FiberState::Failed: return "Failed";
+    }
+    return "kUnknown";
+}
+
+FiberChainId CaptureFiberChain(std::uint64_t gid, bool critical) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    static thread_local std::uint32_t counter = 0;
+    ++counter;
+    const std::uint32_t every = FiberChainSampleEvery();
+    if (!critical && every > 1U && (counter % every) != 0U) {
+        return 0;
+    }
+    try {
+        Fiber* const current = Fiber::Current();
+        FiberContextSnapshot frames = current != nullptr
+                                          ? current->context_snapshot()
+                                          : Fiber::CurrentContextSnapshot();
+        if (frames.size() > kMaxFiberChainNodes) {
+            frames.erase(frames.begin(),
+                         frames.end() - static_cast<std::ptrdiff_t>(
+                                            kMaxFiberChainNodes));
+        }
+        FiberChainSample sample;
+        sample.gid = gid;
+        sample.thread_id = ThreadHash();
+        sample.ts_ns = SteadyNs();
+        sample.nodes.reserve(frames.size());
+        for (const auto& frame : frames) {
+            FiberChainNode node;
+            node.fiber_id = frame.id;
+            node.gid = frame.execution.task_id != 0
+                           ? frame.execution.task_id
+                           : (frame.main_fiber ? 0U : gid);
+            node.state = static_cast<std::uint8_t>(frame.state);
+            node.suspend_reason =
+                static_cast<std::uint8_t>(frame.suspend_reason);
+            node.depth = static_cast<std::uint32_t>(frame.depth);
+            node.alive = frame.alive;
+            node.main_fiber = frame.main_fiber;
+            if (frame.main_fiber) {
+                node.function = "<main>";
+            } else {
+                std::lock_guard<std::mutex> lock(FiberMetaMutex());
+                const auto it = FiberMetaMap().find(frame.id);
+                if (it != FiberMetaMap().end()) {
+                    node.function = it->second.function;
+                    node.stack_low = it->second.stack_low;
+                    node.stack_high = it->second.stack_high;
+                    node.stack_known = it->second.stack_known;
+                }
+            }
+            sample.nodes.push_back(std::move(node));
+        }
+        const std::uint64_t hash = HashChain(sample);
+        ChainTable& table = ChainSamples();
+        std::lock_guard<std::mutex> lock(table.mutex);
+        const auto found = table.by_hash.find(hash);
+        if (found != table.by_hash.end()) {
+            FiberChainSample& existing = table.samples[found->second - 1U];
+            if (existing.nodes.size() == sample.nodes.size()) {
+                bool same = true;
+                for (std::size_t i = 0; i < sample.nodes.size(); ++i) {
+                    if (existing.nodes[i].fiber_id != sample.nodes[i].fiber_id ||
+                        existing.nodes[i].function != sample.nodes[i].function) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) {
+                    ++existing.refs;
+                    return existing.id;
+                }
+            }
+        }
+        if (table.samples.size() >= kMaxFiberChains) {
+            table.dropped.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        sample.id = static_cast<FiberChainId>(table.samples.size() + 1U);
+        sample.refs = 1;
+        table.samples.push_back(std::move(sample));
+        table.by_hash[hash] = table.samples.back().id;
+        return table.samples.back().id;
+    } catch (...) {
+        return 0;
+    }
+#else
+    (void)gid;
+    (void)critical;
+    return 0;
+#endif
+}
+
+bool LookupFiberChain(FiberChainId id, FiberChainSample* out) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    if (out == nullptr || id == 0) {
+        return false;
+    }
+    ChainTable& table = ChainSamples();
+    std::lock_guard<std::mutex> lock(table.mutex);
+    if (id > table.samples.size()) {
+        return false;
+    }
+    *out = table.samples[id - 1U];
+    return true;
+#else
+    (void)id;
+    (void)out;
+    return false;
+#endif
+}
+
+std::size_t FiberChainCount() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    ChainTable& table = ChainSamples();
+    std::lock_guard<std::mutex> lock(table.mutex);
+    return table.samples.size();
+#else
+    return 0;
+#endif
+}
+
+std::uint64_t FiberChainDropped() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    return ChainSamples().dropped.load(std::memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
+
+void ResetFiberChains() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    ChainTable& table = ChainSamples();
+    std::lock_guard<std::mutex> lock(table.mutex);
+    table.samples.clear();
+    table.by_hash.clear();
+    table.dropped.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> meta_lock(FiberMetaMutex());
+        FiberMetaMap().clear();
+    }
+#endif
+}
+
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+namespace {
+thread_local std::string t_next_fiber_name;
+}  // namespace
+#endif
+
+void SetNextFiberName(const char* name) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    try {
+        if (name != nullptr) {
+            t_next_fiber_name.assign(name);
+        } else {
+            t_next_fiber_name.clear();
+        }
+    } catch (...) {
+        t_next_fiber_name.clear();
+    }
+#else
+    (void)name;
+#endif
+}
+
+const char* TakeNextFiberName() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    if (t_next_fiber_name.empty()) {
+        return nullptr;
+    }
+    static thread_local std::string taken;
+    try {
+        taken = t_next_fiber_name;
+    } catch (...) {
+        return nullptr;
+    }
+    t_next_fiber_name.clear();
+    return taken.c_str();
+#else
+    return nullptr;
+#endif
+}
+
+}  // namespace debug
+
 
 }  // namespace go2cpp

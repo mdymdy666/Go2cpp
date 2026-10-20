@@ -654,8 +654,10 @@ int RunDumpImpl(const std::vector<std::string>& args) {
             {"--pid", "PID", "目标进程 pid", true},
             {"--out", "FILE", "输出文件，默认 -（stdout）"},
             {"--sections", "LIST", "all|goroutines|scheduler|locks|组件名"},
-            {"--view", "NAME", "gmp|timeline|sched|park|timer|primitives"},
+            {"--view", "NAME",
+             "gmp|timeline|sched|park|timer|primitives|history|locks|channels|resources"},
             {"--gid", "GID", "timeline 视图的目标 G"},
+            {"--resource", "ID", "history 视图的目标资源 id"},
             {"--format", "FMT", "json 或 text，默认 json"},
             {"--timeout-ms", "N", "总超时毫秒，默认 5000"},
         },
@@ -683,7 +685,8 @@ int RunDumpImpl(const std::vector<std::string>& args) {
     const std::string view = parsed.Get("--view");
     if (!view.empty()) {
         static const std::vector<std::string> kKnownViews = {
-            "gmp", "timeline", "sched", "park", "timer", "primitives"};
+            "gmp", "timeline", "sched", "park", "timer", "primitives",
+            "history", "locks", "channels", "resources"};
         if (parsed.Has("--sections")) {
             throw CliError(ExitCode::kUsage,
                            "选项 '--view' 与 '--sections' 不能同时使用");
@@ -696,19 +699,41 @@ int RunDumpImpl(const std::vector<std::string>& args) {
             kKnownViews.end()) {
             throw CliError(ExitCode::kUsage,
                            "未知视图 '" + view +
-                               "'；可选 gmp/timeline/sched/park/timer/primitives");
+                               "'；可选 gmp/timeline/sched/park/timer/"
+                               "primitives/history/locks/channels/resources");
         }
         std::uint64_t gid = 0;
         if (parsed.Has("--gid")) {
             gid = static_cast<std::uint64_t>(
                 ParseIntOption(parsed.Get("--gid"), "--gid", 0, 2147483647));
         }
+        std::uint64_t resource = 0;
+        if (parsed.Has("--resource")) {
+            resource = static_cast<std::uint64_t>(
+                ParseIntOption(parsed.Get("--resource"), "--resource", 0,
+                               2147483647));
+        }
         if (view == "timeline" && gid == 0) {
             throw CliError(ExitCode::kUsage,
                            "timeline 视图需要 --gid <GID>");
         }
+        const bool has_resource = parsed.Has("--resource");
+        if (view == "history" && !has_resource && gid == 0) {
+            throw CliError(ExitCode::kUsage,
+                           "history 视图需要 --resource <ID>"
+                           "（--resource 0 表示 park 时间线）");
+        }
+        // VIEW 协议只有 `VIEW <name> [number]` 一个数值参数：对 history
+        // 它是资源 id，对 timeline 是 gid，其余视图忽略。history 的 0 是
+        // 合法值（park 时间线），因此必须按“参数是否提供”而不是值判断。
         std::string command = "VIEW " + view;
-        if (gid != 0) {
+        if (view == "history") {
+            if (has_resource) {
+                command += " " + std::to_string(resource);
+            } else if (gid != 0) {
+                command += " " + std::to_string(gid);
+            }
+        } else if (gid != 0) {
             command += " " + std::to_string(gid);
         }
         try {

@@ -59,6 +59,7 @@
 #include "go2cpp/core/parking_condition.hpp"
 #include "go2cpp/core/timer.hpp"
 #include "go2cpp/debug/debug_event_ring.hpp"
+#include "go2cpp/debug/debug_resources.hpp"
 #include "go2cpp/error.hpp"
 #if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
 // 迁移 API：等待状态类型与 ChannelMigrationBase 都定义在 fiber.hpp。
@@ -342,6 +343,44 @@ std::shared_ptr<const SelectCaster> MakeCaster(Function&& function) {
 }
 
 namespace detail {
+
+/// ChannelStatus → 资源事件结果（稳定映射；只用于诊断字段）。
+inline go2cpp::debug::ResourceResult ChannelDebugResult(
+    ChannelStatus status) noexcept {
+  switch (status) {
+    case ChannelStatus::kReady:
+      return go2cpp::debug::ResourceResult::kOk;
+    case ChannelStatus::kWouldBlock:
+      return go2cpp::debug::ResourceResult::kWouldBlock;
+    case ChannelStatus::kClosed:
+    case ChannelStatus::kAlreadyClosed:
+      return go2cpp::debug::ResourceResult::kClosed;
+    case ChannelStatus::kCancelled:
+      return go2cpp::debug::ResourceResult::kCancelled;
+    case ChannelStatus::kDeadlineExceeded:
+    case ChannelStatus::kTimedOut:
+      return go2cpp::debug::ResourceResult::kTimeout;
+    case ChannelStatus::kNil:
+    case ChannelStatus::kInvalid:
+      return go2cpp::debug::ResourceResult::kFailed;
+  }
+  return go2cpp::debug::ResourceResult::kFailed;
+}
+
+/// channel 值的调试摘要：整型/枚举/指针可直接比较，其它类型为 0。
+template <typename T>
+inline std::uint64_t ChannelDebugValue(const T& value) noexcept {
+  return go2cpp::debug::ResourceValueDigest(value);
+}
+
+/// 值摘要是否有效（写入事件的 kResourceFlagValueKnown）。
+template <typename T>
+inline constexpr std::uint32_t ChannelDebugValueFlags() noexcept {
+  return go2cpp::debug::ResourceValueDigestible<T>
+             ? static_cast<std::uint32_t>(
+                   go2cpp::debug::kResourceFlagValueKnown)
+             : 0U;
+}
 
 template <typename T>
 struct IsOptional : std::false_type {};
@@ -870,8 +909,17 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   }
 
   explicit Channel(std::size_t capacity = 0)
-      : m_capacity(capacity), m_buffer(capacity) {}
-  ~Channel() noexcept { (void)Close(); }
+      : m_capacity(capacity), m_buffer(capacity) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    m_debug_resource = GO2CPP_DEBUG_RESOURCE_REGISTER(kChannel, this, nullptr);
+#endif
+  }
+  ~Channel() noexcept {
+    (void)Close();
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_UNREGISTER(m_debug_resource);
+#endif
+  }
 
   Channel(const Channel&) = delete;
   Channel& operator=(const Channel&) = delete;
@@ -923,14 +971,29 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
 
   // 发送 value；阻塞直到接收者/缓冲可用、关闭或 context 取消。
   ChannelSendResult Send(T value, const ContextPtr& context = {}) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    const std::uint64_t debug_value = detail::ChannelDebugValue(value);
+#endif
     try {
       auto result = SendUntil(std::move(value), std::nullopt, context, false);
       if (result.status == ChannelStatus::kReady) {
         GO2CPP_DEBUG_EVENT_SAMPLED(
             kChannelSendOk, GO2CPP_DEBUG_BOUND_TASK(), m_capacity, 32);
       }
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+      GO2CPP_DEBUG_RESOURCE_EVENT_EX(
+          kChannelSend, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
+          debug_value, detail::ChannelDebugResult(result.status), 0, false,
+          detail::ChannelDebugValueFlags<T>());
+#endif
       return result;
     } catch (...) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+      GO2CPP_DEBUG_RESOURCE_EVENT_EX(
+          kChannelSend, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
+          debug_value, go2cpp::debug::ResourceResult::kFailed, 0, false,
+          detail::ChannelDebugValueFlags<T>());
+#endif
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
   }
@@ -951,6 +1014,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
 
   // 非阻塞发送；当前不能完成时返回 kWouldBlock。
   ChannelSendResult TrySend(T value) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    const std::uint64_t debug_value = detail::ChannelDebugValue(value);
+#endif
     try {
       auto result =
           SendUntil(std::move(value), std::chrono::steady_clock::now(), {}, true);
@@ -958,6 +1024,14 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
         GO2CPP_DEBUG_EVENT_SAMPLED(
             kChannelSendOk, GO2CPP_DEBUG_BOUND_TASK(), m_capacity, 32);
       }
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+      GO2CPP_DEBUG_RESOURCE_EVENT_EX(
+          kChannelSend, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
+          debug_value, detail::ChannelDebugResult(result.status), 0, false,
+          detail::ChannelDebugValueFlags<T>() |
+              static_cast<std::uint32_t>(
+                  go2cpp::debug::kResourceFlagTry));
+#endif
       return result;
     } catch (...) {
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
@@ -972,6 +1046,16 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
         GO2CPP_DEBUG_EVENT_SAMPLED(
             kChannelRecvOk, GO2CPP_DEBUG_BOUND_TASK(), m_capacity, 32);
       }
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+      std::uint64_t debug_value = 0;
+      if (result.value.has_value()) {
+        debug_value = detail::ChannelDebugValue(*result.value);
+      }
+      GO2CPP_DEBUG_RESOURCE_EVENT_EX(
+          kChannelRecv, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
+          debug_value, detail::ChannelDebugResult(result.status), 0, false,
+          detail::ChannelDebugValueFlags<T>());
+#endif
       return result;
     } catch (...) {
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
@@ -1000,6 +1084,18 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
         GO2CPP_DEBUG_EVENT_SAMPLED(
             kChannelRecvOk, GO2CPP_DEBUG_BOUND_TASK(), m_capacity, 32);
       }
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+      std::uint64_t debug_value = 0;
+      if (result.value.has_value()) {
+        debug_value = detail::ChannelDebugValue(*result.value);
+      }
+      GO2CPP_DEBUG_RESOURCE_EVENT_EX(
+          kChannelRecv, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
+          debug_value, detail::ChannelDebugResult(result.status), 0, false,
+          detail::ChannelDebugValueFlags<T>() |
+              static_cast<std::uint32_t>(
+                  go2cpp::debug::kResourceFlagTry));
+#endif
       return result;
     } catch (...) {
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
@@ -1516,6 +1612,11 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     ///        `signaled`，跳过 notify 可省掉一次 ParkingCondition 内部锁；
     ///        Close 一次唤醒大量等待者时也能跳过已经醒了的节点。
     std::atomic<bool> parked{false};
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    /// @brief 所属 channel 的调试资源编号与等待者 gid（仅资源事件用）。
+    std::uint64_t debug_channel{0};
+    std::uint64_t debug_waiter_gid{0};
+#endif
 
     /// @brief 在持 m_mutex 并写完结果标志后调用（只对自旋通道需要）。
     void Signal() noexcept {
@@ -1529,7 +1630,14 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     ///        ParkingCondition 内部互斥量，也避免 Close 对已醒节点做无效唤醒。
     void NotifyIfParked() noexcept {
       if (!spin_wait || parked.load(std::memory_order_relaxed)) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kChannelWake, debug_channel, GO2CPP_DEBUG_BOUND_TASK(),
+            debug_waiter_gid, 0, go2cpp::debug::ResourceResult::kWake, 0,
+            true);
+#else
         GO2CPP_DEBUG_EVENT(kChannelWake, 0, 1);
+#endif
         // 外层优先：ParkingCondition::notify_one 内部的 kPCNotify 不会把
         // 这次唤醒的语义改写成 kParkingCondition。
         GO2CPP_DEBUG_WAKE_HINT(kChannelSend);
@@ -1579,6 +1687,11 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     ///        `signaled`，跳过 notify 可省掉一次 ParkingCondition 内部锁；
     ///        Close 一次唤醒大量等待者时也能跳过已经醒了的节点。
     std::atomic<bool> parked{false};
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    /// @brief 所属 channel 的调试资源编号与等待者 gid（仅资源事件用）。
+    std::uint64_t debug_channel{0};
+    std::uint64_t debug_waiter_gid{0};
+#endif
 
     /// @brief 在持 m_mutex 并写完结果标志后调用（只对自旋通道需要）。
     void Signal() noexcept {
@@ -1592,7 +1705,14 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     ///        ParkingCondition 内部互斥量，也避免 Close 对已醒节点做无效唤醒。
     void NotifyIfParked() noexcept {
       if (!spin_wait || parked.load(std::memory_order_relaxed)) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kChannelWake, debug_channel, GO2CPP_DEBUG_BOUND_TASK(),
+            debug_waiter_gid, 0, go2cpp::debug::ResourceResult::kWake, 0,
+            true);
+#else
         GO2CPP_DEBUG_EVENT(kChannelWake, 0, 2);
+#endif
         GO2CPP_DEBUG_WAKE_HINT(kChannelRecv);
         cv.notify_one();
       }
@@ -2058,13 +2178,26 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       // 必须在入队前写好：完成方会在 m_mutex 内根据它决定是否维护
       // signaled/parked 原子协议（cap>1 的等待者直接 park，不需要）。
       pending->spin_wait = spin_before_park;
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+      pending->debug_channel = m_debug_resource;
+      pending->debug_waiter_gid = GO2CPP_DEBUG_BOUND_TASK();
+#endif
       m_senders.emplace_back(pending);
     } catch (...) {
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
     // 发送方即将 park：只在阻塞路径记录（缓冲命中/立即交接无开销）。
     GO2CPP_DEBUG_PARK_HINT(kChannelSend);
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_EVENT_EX(
+        kChannelSend, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
+        detail::ChannelDebugValue(pending->value),
+        go2cpp::debug::ResourceResult::kBlocked,
+        static_cast<std::uint32_t>(m_senders.size()), true,
+        detail::ChannelDebugValueFlags<T>());
+#else
     GO2CPP_DEBUG_EVENT(kChannelSend, 0, m_capacity);
+#endif
     CallbackGuard callback_guard{context};
     if (context) {
       try {
@@ -2284,6 +2417,10 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       pending = std::make_shared<PendingRecv>();
       // 必须在入队前写好：完成方据此决定是否维护 signaled/parked 协议。
       pending->spin_wait = spin_before_park;
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+      pending->debug_channel = m_debug_resource;
+      pending->debug_waiter_gid = GO2CPP_DEBUG_BOUND_TASK();
+#endif
       m_receivers.emplace_back(pending);
     } catch (...) {
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
@@ -2291,7 +2428,14 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     }
     // 接收方即将 park：只在阻塞路径记录（缓冲命中/立即交接无开销）。
     GO2CPP_DEBUG_PARK_HINT(kChannelRecv);
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_EVENT_EX(
+        kChannelRecv, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+        go2cpp::debug::ResourceResult::kBlocked,
+        static_cast<std::uint32_t>(m_receivers.size()), true, 0U);
+#else
     GO2CPP_DEBUG_EVENT(kChannelRecv, 0, m_capacity);
+#endif
     CallbackGuard callback_guard{context};
     if (context) {
       try {
@@ -2456,6 +2600,10 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
 
   /// @brief 固定容量（创建后不变）；0 表示无缓冲 rendezvous。
   std::size_t m_capacity{0};
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+  /// @brief 资源级历史编号（构造时注册；OFF 构建不存在该成员）。
+  go2cpp::debug::ResourceId m_debug_resource{0};
+#endif
   /// @brief 保护 buffer/senders/receivers/closed；Send/Recv/Close/Select 全部竞争它。
   mutable std::mutex m_mutex;
   /// @brief 状态变化通知（有值可收 / 有空间可发 / 已关闭）；等待者在锁外 park 在它上面。

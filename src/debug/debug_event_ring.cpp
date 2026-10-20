@@ -18,6 +18,19 @@
  */
 
 #include "go2cpp/debug/debug_event_ring.hpp"
+#include "go2cpp/debug/debug_resources.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -165,6 +178,14 @@ void WriteSlot(SegmentT& segment, const EventRecord& record,
     slot.reserved = 0;
     slot.arg3 = record.arg3;
     slot.arg4 = record.arg4;
+    slot.resource_id = record.resource_id;
+    slot.target_gid = record.target_gid;
+    slot.stack_id = record.stack_id;
+    slot.chain_id = record.chain_id;
+    slot.result = record.result;
+    slot.flags = record.flags;
+    slot.value = record.value;
+    slot.waiters = record.waiters;
     // seq 最后写：读者以 seq 作为「本条已完整发布」的判据。
     slot.seq = record.seq;
     segment.head.store(write_index + 1U, std::memory_order_release);
@@ -391,6 +412,14 @@ const char* SchedEventCodeName(SchedEventCode code) noexcept {
             return "kDiagnosticMutexUnlock";
         case SchedEventCode::kMutexLock: return "kMutexLock";
         case SchedEventCode::kMutexUnlock: return "kMutexUnlock";
+        case SchedEventCode::kRwLockRead: return "kRwLockRead";
+        case SchedEventCode::kRwUnlockRead: return "kRwUnlockRead";
+        case SchedEventCode::kRwLockWrite: return "kRwLockWrite";
+        case SchedEventCode::kRwUnlockWrite: return "kRwUnlockWrite";
+        case SchedEventCode::kRecursiveLock: return "kRecursiveLock";
+        case SchedEventCode::kRecursiveUnlock: return "kRecursiveUnlock";
+        case SchedEventCode::kCvWait: return "kCvWait";
+        case SchedEventCode::kCvNotify: return "kCvNotify";
         case SchedEventCode::kChannelSend: return "kChannelSend";
         case SchedEventCode::kChannelRecv: return "kChannelRecv";
         case SchedEventCode::kChannelWake: return "kChannelWake";
@@ -420,6 +449,9 @@ const char* SchedEventCodeName(SchedEventCode code) noexcept {
         case SchedEventCode::kPCNotify: return "kPCNotify";
         case SchedEventCode::kPCNotifyAll: return "kPCNotifyAll";
         case SchedEventCode::kTimerCallback: return "kTimerCallback";
+        case SchedEventCode::kParkCaptured: return "kParkCaptured";
+        case SchedEventCode::kWaitGroupWait: return "kWaitGroupWait";
+        case SchedEventCode::kWaitGroupDone: return "kWaitGroupDone";
     }
     return "kUnknown";
 }
@@ -872,6 +904,14 @@ std::string EventRing::DumpJson(std::size_t max) {
         out += ",\"pid\":" + std::to_string(event.pid);
         out += ",\"arg3\":" + std::to_string(event.arg3);
         out += ",\"arg4\":" + std::to_string(event.arg4);
+        out += ",\"resource_id\":" + std::to_string(event.resource_id);
+        out += ",\"target_gid\":" + std::to_string(event.target_gid);
+        out += ",\"stack_id\":" + std::to_string(event.stack_id);
+        out += ",\"chain_id\":" + std::to_string(event.chain_id);
+        out += ",\"result\":" + std::to_string(event.result);
+        out += ",\"flags\":" + std::to_string(event.flags);
+        out += ",\"value\":" + std::to_string(event.value);
+        out += ",\"waiters\":" + std::to_string(event.waiters);
         // park/wake 的语义原因（非 park/wake 事件为空串，字段集合稳定）。
         const bool is_park_enter = event_code == SchedEventCode::kParkEnter;
         const bool is_wake_event =
@@ -920,5 +960,561 @@ bool EventRing::WriteToFile(const std::string& path, bool json,
     }
     return true;
 }
+
+// ===========================================================================
+// 资源级历史：注册表 / 线程栈样本 / 资源事件（v3）
+//
+// 这些实现放在本文件而不是新 .cpp：`go2cpp_debug_event` 是 sync/channel/
+// parking_condition/fiber 在 DEBUG ON 时直接链接的零依赖小库，新增源文件
+// 需要改 CMake 目标列表；追加在本文件可保持构建图不变。
+// ===========================================================================
+
+namespace {
+
+constexpr std::uint32_t kDefaultStackSampleEvery = 16;
+constexpr std::uint32_t kDefaultChainSampleEvery = 8;
+/// 资源注册表容量上限：含墓碑。满时批量回收最旧的已注销条目；全是存活
+/// 条目时拒绝新注册（返回 0），避免诊断设施无限吃内存。
+constexpr std::size_t kMaxResourceEntries = 4096;
+
+std::uint32_t ReadSampleEnv(const char* name, std::uint32_t fallback) noexcept {
+    const char* text = std::getenv(name);
+    if (text == nullptr || *text == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    if (end == text || value == 0UL || value > 1000000UL) {
+        return fallback;
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
+std::atomic<std::uint32_t>& StackEverySlot() {
+    static std::atomic<std::uint32_t> slot{0};
+    return slot;
+}
+
+std::atomic<std::uint32_t>& ChainEverySlot() {
+    static std::atomic<std::uint32_t> slot{0};
+    return slot;
+}
+
+/// 资源注册表：shared_mutex 保护，读多写少（每次资源事件按地址查一次）。
+struct ResourceRegistry {
+    mutable std::shared_mutex mutex;
+    std::vector<ResourceInfo> entries; ///< 按 id 升序，含墓碑
+    std::unordered_map<const void*, ResourceId> by_address; ///< 仅存活条目
+    std::atomic<std::uint64_t> next_id{1};
+    std::size_t dead_count{0}; ///< entries 中已注销条目数（受 mutex 保护）
+};
+
+ResourceRegistry& Registry() {
+    static ResourceRegistry* registry = new ResourceRegistry();
+    return *registry;
+}
+
+/// 栈样本表：相同帧序列按哈希去重，引用计数递增。
+struct StackTable {
+    mutable std::mutex mutex;
+    std::vector<StackSample> samples; ///< index = id - 1
+    std::unordered_map<std::uint64_t, StackSampleId> by_hash;
+    std::atomic<std::uint64_t> dropped{0};
+};
+
+StackTable& StackSamples() {
+    static StackTable* table = new StackTable();
+    return *table;
+}
+
+std::uint64_t HashFrames(const std::uintptr_t* frames,
+                         std::size_t count) noexcept {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::uint64_t value = static_cast<std::uint64_t>(frames[i]);
+        for (int byte = 0; byte < 8; ++byte) {
+            hash ^= (value >> (byte * 8)) & 0xFFU;
+            hash *= 1099511628211ULL;
+        }
+    }
+    return hash;
+}
+
+std::uint32_t ThreadHash() noexcept {
+    return static_cast<std::uint32_t>(
+        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+}
+
+bool IsCriticalResult(ResourceResult result) noexcept {
+    switch (result) {
+        case ResourceResult::kBlocked:
+        case ResourceResult::kWake:
+        case ResourceResult::kTimeout:
+        case ResourceResult::kCancelled:
+        case ResourceResult::kClosed:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
+const char* ResourceKindName(ResourceKind kind) noexcept {
+    switch (kind) {
+        case ResourceKind::kUnknown: return "kUnknown";
+        case ResourceKind::kMutex: return "kMutex";
+        case ResourceKind::kRwMutex: return "kRwMutex";
+        case ResourceKind::kRecursiveMutex: return "kRecursiveMutex";
+        case ResourceKind::kParkingCondition: return "kParkingCondition";
+        case ResourceKind::kChannel: return "kChannel";
+        case ResourceKind::kWaitGroup: return "kWaitGroup";
+        case ResourceKind::kConditionVariable: return "kConditionVariable";
+        case ResourceKind::kTimedMutex: return "kTimedMutex";
+        case ResourceKind::kSpinMutex: return "kSpinMutex";
+        case ResourceKind::kFutexMutex: return "kFutexMutex";
+    }
+    return "kUnknown";
+}
+
+ResourceKind ParseResourceKind(const std::string& text) noexcept {
+    if (text == "mutex" || text == "kMutex") return ResourceKind::kMutex;
+    if (text == "rwmutex" || text == "kRwMutex") return ResourceKind::kRwMutex;
+    if (text == "recursive_mutex" || text == "recursive" ||
+        text == "kRecursiveMutex") {
+        return ResourceKind::kRecursiveMutex;
+    }
+    if (text == "parking_condition" || text == "kParkingCondition") {
+        return ResourceKind::kParkingCondition;
+    }
+    if (text == "channel" || text == "kChannel") return ResourceKind::kChannel;
+    if (text == "waitgroup" || text == "kWaitGroup") {
+        return ResourceKind::kWaitGroup;
+    }
+    if (text == "condition_variable" || text == "kConditionVariable") {
+        return ResourceKind::kConditionVariable;
+    }
+    if (text == "timed_mutex" || text == "kTimedMutex") {
+        return ResourceKind::kTimedMutex;
+    }
+    if (text == "spin_mutex" || text == "kSpinMutex") {
+        return ResourceKind::kSpinMutex;
+    }
+    if (text == "futex_mutex" || text == "kFutexMutex") {
+        return ResourceKind::kFutexMutex;
+    }
+    return ResourceKind::kUnknown;
+}
+
+const char* ResourceResultName(ResourceResult result) noexcept {
+    switch (result) {
+        case ResourceResult::kOk: return "ok";
+        case ResourceResult::kBlocked: return "blocked";
+        case ResourceResult::kWake: return "wake";
+        case ResourceResult::kTimeout: return "timeout";
+        case ResourceResult::kCancelled: return "cancelled";
+        case ResourceResult::kWouldBlock: return "would_block";
+        case ResourceResult::kClosed: return "closed";
+        case ResourceResult::kFailed: return "failed";
+    }
+    return "kUnknown";
+}
+
+ResourceId RegisterResource(ResourceKind kind, const void* address,
+                            const char* name) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    if (address == nullptr || kind == ResourceKind::kUnknown) {
+        return kInvalidResourceId;
+    }
+    ResourceRegistry& registry = Registry();
+    std::unique_lock<std::shared_mutex> lock(registry.mutex);
+    const auto existing = registry.by_address.find(address);
+    if (existing != registry.by_address.end()) {
+        return existing->second;
+    }
+    if (registry.entries.size() >= kMaxResourceEntries) {
+        // 满表：先批量回收已注销条目（一次 O(n)）；若全是存活条目则
+        // O(1) 拒绝，避免高频临时对象（如 Channel 内部 PC）把注册路径
+        // 退化成每次 O(n) 扫描。
+        if (registry.dead_count == 0) {
+            return kInvalidResourceId;
+        }
+        registry.entries.erase(
+            std::remove_if(registry.entries.begin(), registry.entries.end(),
+                           [](const ResourceInfo& entry) {
+                               return !entry.alive;
+                           }),
+            registry.entries.end());
+        registry.dead_count = 0;
+        if (registry.entries.size() >= kMaxResourceEntries) {
+            return kInvalidResourceId;
+        }
+    }
+    const ResourceId id =
+        registry.next_id.fetch_add(1, std::memory_order_relaxed);
+    ResourceInfo info;
+    info.id = id;
+    info.kind = kind;
+    info.address = address;
+    info.alive = true;
+    info.created_seq = EventRing::PublishSeq();
+    info.created_ts_ns = NowNs();
+    if (name != nullptr && *name != '\0') {
+        info.name = name;
+    } else {
+        info.name = std::string(ResourceKindName(kind)) + "#" + std::to_string(id);
+    }
+    registry.entries.push_back(info);
+    registry.by_address[address] = id;
+    return id;
+#else
+    (void)kind;
+    (void)address;
+    (void)name;
+    return kInvalidResourceId;
+#endif
+}
+
+void UnregisterResource(ResourceId id) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    if (id == kInvalidResourceId) {
+        return;
+    }
+    ResourceRegistry& registry = Registry();
+    std::unique_lock<std::shared_mutex> lock(registry.mutex);
+    for (auto& entry : registry.entries) {
+        if (entry.id != id) {
+            continue;
+        }
+        if (!entry.alive) {
+            return;
+        }
+        entry.alive = false;
+        entry.destroyed_seq = EventRing::PublishSeq();
+        entry.destroyed_ts_ns = NowNs();
+        registry.by_address.erase(entry.address);
+        ++registry.dead_count;
+        return;
+    }
+#else
+    (void)id;
+#endif
+}
+
+void UnregisterResourceByAddress(const void* address) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    if (address == nullptr) {
+        return;
+    }
+    ResourceRegistry& registry = Registry();
+    std::unique_lock<std::shared_mutex> lock(registry.mutex);
+    const auto it = registry.by_address.find(address);
+    if (it == registry.by_address.end()) {
+        return;
+    }
+    const ResourceId id = it->second;
+    registry.by_address.erase(it);
+    for (auto& entry : registry.entries) {
+        if (entry.id == id) {
+            entry.alive = false;
+            entry.destroyed_seq = EventRing::PublishSeq();
+            entry.destroyed_ts_ns = NowNs();
+            ++registry.dead_count;
+            break;
+        }
+    }
+#else
+    (void)address;
+#endif
+}
+
+bool LookupResource(ResourceId id, ResourceInfo* out) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    if (out == nullptr || id == kInvalidResourceId) {
+        return false;
+    }
+    ResourceRegistry& registry = Registry();
+    std::shared_lock<std::shared_mutex> lock(registry.mutex);
+    for (const auto& entry : registry.entries) {
+        if (entry.id == id) {
+            *out = entry;
+            return true;
+        }
+    }
+    return false;
+#else
+    (void)id;
+    (void)out;
+    return false;
+#endif
+}
+
+ResourceId FindResourceByAddress(const void* address) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    if (address == nullptr) {
+        return kInvalidResourceId;
+    }
+    ResourceRegistry& registry = Registry();
+    std::shared_lock<std::shared_mutex> lock(registry.mutex);
+    const auto it = registry.by_address.find(address);
+    return it == registry.by_address.end() ? kInvalidResourceId : it->second;
+#else
+    (void)address;
+    return kInvalidResourceId;
+#endif
+}
+
+std::vector<ResourceInfo> SnapshotResources() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    ResourceRegistry& registry = Registry();
+    std::shared_lock<std::shared_mutex> lock(registry.mutex);
+    return registry.entries;
+#else
+    return {};
+#endif
+}
+
+std::size_t ResourceAliveCount() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    ResourceRegistry& registry = Registry();
+    std::shared_lock<std::shared_mutex> lock(registry.mutex);
+    std::size_t alive = 0;
+    for (const auto& entry : registry.entries) {
+        if (entry.alive) {
+            ++alive;
+        }
+    }
+    return alive;
+#else
+    return 0;
+#endif
+}
+
+void ResetResourceRegistry() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    ResourceRegistry& registry = Registry();
+    std::unique_lock<std::shared_mutex> lock(registry.mutex);
+    registry.entries.clear();
+    registry.by_address.clear();
+    registry.next_id.store(1, std::memory_order_relaxed);
+#endif
+}
+
+std::uint32_t StackSampleEvery() noexcept {
+    std::atomic<std::uint32_t>& slot = StackEverySlot();
+    std::uint32_t value = slot.load(std::memory_order_relaxed);
+    if (value == 0) {
+        value = ReadSampleEnv("GO2CPP_DEBUG_STACK_SAMPLE",
+                              kDefaultStackSampleEvery);
+        slot.store(value, std::memory_order_relaxed);
+    }
+    return value;
+}
+
+std::uint32_t FiberChainSampleEvery() noexcept {
+    std::atomic<std::uint32_t>& slot = ChainEverySlot();
+    std::uint32_t value = slot.load(std::memory_order_relaxed);
+    if (value == 0) {
+        value = ReadSampleEnv("GO2CPP_DEBUG_FIBER_CHAIN_SAMPLE",
+                              kDefaultChainSampleEvery);
+        slot.store(value, std::memory_order_relaxed);
+    }
+    return value;
+}
+
+void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
+                                std::uint32_t chain_every) noexcept {
+    StackEverySlot().store(stack_every == 0 ? kDefaultStackSampleEvery
+                                            : stack_every,
+                           std::memory_order_relaxed);
+    ChainEverySlot().store(chain_every == 0 ? kDefaultChainSampleEvery
+                                            : chain_every,
+                           std::memory_order_relaxed);
+}
+
+StackSampleId CaptureStackSample(std::uint64_t gid, bool critical) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP && defined(__linux__)
+    // 采样：非关键事件每 N 次捕获一条；关键事件（阻塞/唤醒/park）全量。
+    static thread_local std::uint32_t sample_counter = 0;
+    ++sample_counter;
+    const std::uint32_t every = StackSampleEvery();
+    const bool skipped =
+        !critical && every > 1U && (sample_counter % every) != 0U;
+    if (skipped) {
+        return 0;
+    }
+    void* buffer[kMaxStackFrames] = {};
+    const int frames = ::backtrace(buffer, static_cast<int>(kMaxStackFrames));
+    if (frames <= 0) {
+        return 0;
+    }
+    int skip = 2; // backtrace 自身 + CaptureStackSample
+    if (skip >= frames) {
+        skip = frames - 1;
+    }
+    const int count = frames - skip;
+    if (count <= 0) {
+        return 0;
+    }
+    std::uintptr_t addresses[kMaxStackFrames] = {};
+    for (int i = 0; i < count; ++i) {
+        addresses[i] = reinterpret_cast<std::uintptr_t>(buffer[skip + i]);
+    }
+    const std::uint64_t hash =
+        HashFrames(addresses, static_cast<std::size_t>(count));
+    StackTable& table = StackSamples();
+    std::lock_guard<std::mutex> lock(table.mutex);
+    const auto found = table.by_hash.find(hash);
+    if (found != table.by_hash.end()) {
+        StackSample& sample = table.samples[found->second - 1U];
+        if (sample.frame_count == static_cast<std::uint32_t>(count) &&
+            std::memcmp(sample.frames.data(), addresses,
+                        sizeof(std::uintptr_t) *
+                            static_cast<std::size_t>(count)) == 0) {
+            ++sample.refs;
+            return sample.id;
+        }
+    }
+    if (table.samples.size() >= kMaxStackSamples) {
+        table.dropped.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    StackSample sample;
+    sample.id = static_cast<StackSampleId>(table.samples.size() + 1U);
+    sample.thread_id = ThreadHash();
+    sample.gid = gid;
+    sample.ts_ns = NowNs();
+    sample.frame_count = static_cast<std::uint32_t>(count);
+    sample.refs = 1;
+    for (int i = 0; i < count; ++i) {
+        sample.frames[static_cast<std::size_t>(i)] = addresses[i];
+    }
+    table.samples.push_back(sample);
+    table.by_hash[hash] = sample.id;
+    return sample.id;
+#else
+    (void)gid;
+    (void)critical;
+    return 0;
+#endif
+}
+
+bool LookupStackSample(StackSampleId id, StackSample* out) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    if (out == nullptr || id == 0) {
+        return false;
+    }
+    StackTable& table = StackSamples();
+    std::lock_guard<std::mutex> lock(table.mutex);
+    if (id > table.samples.size()) {
+        return false;
+    }
+    *out = table.samples[id - 1U];
+    return true;
+#else
+    (void)id;
+    (void)out;
+    return false;
+#endif
+}
+
+std::vector<StackFrameInfo> ResolveStackSample(StackSampleId id) {
+    std::vector<StackFrameInfo> frames;
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP && defined(__linux__)
+    StackSample sample;
+    if (!LookupStackSample(id, &sample)) {
+        return frames;
+    }
+    frames.reserve(sample.frame_count);
+    for (std::uint32_t i = 0; i < sample.frame_count; ++i) {
+        StackFrameInfo info;
+        info.address = sample.frames[i];
+        Dl_info dl{};
+        if (::dladdr(reinterpret_cast<void*>(info.address), &dl) != 0) {
+            if (dl.dli_sname != nullptr) {
+                info.symbol = dl.dli_sname;
+            }
+            if (dl.dli_fname != nullptr) {
+                info.module = dl.dli_fname;
+            }
+            info.offset = info.address -
+                          reinterpret_cast<std::uintptr_t>(dl.dli_fbase);
+            info.resolved = !info.symbol.empty();
+        }
+        frames.push_back(std::move(info));
+    }
+#else
+    (void)id;
+#endif
+    return frames;
+}
+
+std::size_t StackSampleCount() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    StackTable& table = StackSamples();
+    std::lock_guard<std::mutex> lock(table.mutex);
+    return table.samples.size();
+#else
+    return 0;
+#endif
+}
+
+std::uint64_t StackSampleDropped() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    return StackSamples().dropped.load(std::memory_order_relaxed);
+#else
+    return 0;
+#endif
+}
+
+void ResetStackSamples() noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    StackTable& table = StackSamples();
+    std::lock_guard<std::mutex> lock(table.mutex);
+    table.samples.clear();
+    table.by_hash.clear();
+    table.dropped.store(0, std::memory_order_relaxed);
+#endif
+}
+
+void RecordResourceEvent(const ResourceEventRecord& event) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    (void)t_registration;
+    const bool critical =
+        IsCriticalResult(event.result) ||
+        event.code == SchedEventCode::kParkCaptured;
+    EventRecord record;
+    record.seq = g_publish_seq.fetch_add(1, std::memory_order_relaxed) + 1U;
+    record.ts_ns = NowNs();
+    record.gid = event.actor_gid;
+    record.arg2 = event.arg2;
+    record.code = static_cast<std::uint32_t>(event.code);
+    record.tid = t_ring.tid.load(std::memory_order_relaxed);
+    record.pid = t_processor_id;
+    record.resource_id = event.resource_id;
+    record.target_gid = event.target_gid;
+    record.result = static_cast<std::uint32_t>(event.result);
+    record.flags = event.flags;
+    record.chain_id = event.chain_id;
+    record.value = event.value;
+    record.waiters = event.waiters;
+    if (event.code == SchedEventCode::kParkCaptured) {
+        record.arg3 = t_park_hint.reason;
+        record.arg4 = t_park_hint.context;
+    }
+    record.stack_id = CaptureStackSample(event.actor_gid, critical);
+    if (!critical && record.stack_id != 0) {
+        record.flags |= kResourceFlagStackSampled;
+    }
+    GetTotals().codes[static_cast<std::uint32_t>(event.code) & 0xFFU].fetch_add(
+        1, std::memory_order_relaxed);
+    // 资源事件全部走普通区：阻塞/唤醒在长跑里也是高频的，放进关键区会
+    // 把调度器的 wake 线索挤掉。时间线视图用 seq 窗口 + coverage 标注截断。
+    WriteSlot(t_ring.normal, record, kNormalSlots);
+#else
+    (void)event;
+#endif
+}
+
 
 }  // namespace go2cpp::debug

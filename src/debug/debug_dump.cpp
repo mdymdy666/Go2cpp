@@ -6,6 +6,7 @@
  */
 
 #include "go2cpp/debug/debug_dump.hpp"
+#include "go2cpp/debug/debug_resources.hpp"
 #include "go2cpp/debug/debug_server.hpp"
 
 #include "go2cpp/json.hpp"
@@ -1107,6 +1108,17 @@ ViewJson EventToJson(const EventRecord& event) {
     item["park_context"] =
         code == SchedEventCode::kParkEnter ? event.arg4 : 0;
     item["critical"] = SchedEventCodeIsCritical(code);
+    item["resource_id"] = event.resource_id;
+    item["target_gid"] = event.target_gid;
+    item["result"] = event.result;
+    item["result_name"] =
+        ResourceResultName(static_cast<ResourceResult>(event.result));
+    item["waiter_depth"] = event.waiters;
+    item["value"] = event.value;
+    item["value_known"] = (event.flags & kResourceFlagValueKnown) != 0U;
+    item["stack_id"] = event.stack_id;
+    item["chain_id"] = event.chain_id;
+    item["flags"] = event.flags;
     item["detail"] = EventDetail(code, event);
     return item;
 }
@@ -2161,11 +2173,522 @@ void AppendCoverage(ViewJson& root, const std::vector<ParkPair>& pairs) {
     root["coverage"] = coverage;
 }
 
+// ---------------------------------------------------------------------------
+// 资源级历史视图（v3）：history / locks / channels / resources
+//
+// 数据来源：
+//   - EventRing::Snapshot()：带 resource_id / target_gid / result / stack_id /
+//     chain_id 的资源事件；
+//   - 资源注册表（debug_resources.hpp）：全部 10 类并发结构的注册/注销记录；
+//   - 线程栈样本表与 Fiber 链样本表：按 id 解析，视图输出时才做符号解析。
+// ---------------------------------------------------------------------------
+
+bool IsResourceEventCode(SchedEventCode code) noexcept {
+    switch (code) {
+        case SchedEventCode::kMutexLock:
+        case SchedEventCode::kMutexUnlock:
+        case SchedEventCode::kRwLockRead:
+        case SchedEventCode::kRwUnlockRead:
+        case SchedEventCode::kRwLockWrite:
+        case SchedEventCode::kRwUnlockWrite:
+        case SchedEventCode::kRecursiveLock:
+        case SchedEventCode::kRecursiveUnlock:
+        case SchedEventCode::kPCWait:
+        case SchedEventCode::kPCNotify:
+        case SchedEventCode::kPCNotifyAll:
+        case SchedEventCode::kChannelSend:
+        case SchedEventCode::kChannelRecv:
+        case SchedEventCode::kChannelWake:
+        case SchedEventCode::kChannelSendOk:
+        case SchedEventCode::kChannelRecvOk:
+        case SchedEventCode::kParkCaptured:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsChannelResourceCode(SchedEventCode code) noexcept {
+    switch (code) {
+        case SchedEventCode::kChannelSend:
+        case SchedEventCode::kChannelRecv:
+        case SchedEventCode::kChannelWake:
+        case SchedEventCode::kChannelSendOk:
+        case SchedEventCode::kChannelRecvOk:
+        case SchedEventCode::kChannelSelect:
+        case SchedEventCode::kChannelSelectEnter:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsLockEventCode(SchedEventCode code) noexcept {
+    switch (code) {
+        case SchedEventCode::kMutexLock:
+        case SchedEventCode::kMutexUnlock:
+        case SchedEventCode::kRwLockRead:
+        case SchedEventCode::kRwUnlockRead:
+        case SchedEventCode::kRwLockWrite:
+        case SchedEventCode::kRwUnlockWrite:
+        case SchedEventCode::kRecursiveLock:
+        case SchedEventCode::kRecursiveUnlock:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsLockAcquireCode(SchedEventCode code) noexcept {
+    return code == SchedEventCode::kMutexLock ||
+           code == SchedEventCode::kRwLockRead ||
+           code == SchedEventCode::kRwLockWrite ||
+           code == SchedEventCode::kRecursiveLock;
+}
+
+bool IsLockReleaseCode(SchedEventCode code) noexcept {
+    return code == SchedEventCode::kMutexUnlock ||
+           code == SchedEventCode::kRwUnlockRead ||
+           code == SchedEventCode::kRwUnlockWrite ||
+           code == SchedEventCode::kRecursiveUnlock;
+}
+
+ViewJson StackSampleJson(StackSampleId id) {
+    ViewJson out = ViewJson::object();
+    StackSample sample;
+    if (!LookupStackSample(id, &sample)) {
+        out["id"] = id;
+        out["available"] = false;
+        return out;
+    }
+    out["id"] = id;
+    out["available"] = true;
+    out["thread_id"] = sample.thread_id;
+    out["gid"] = sample.gid;
+    out["ts_ns"] = sample.ts_ns;
+    out["refs"] = sample.refs;
+    ViewJson frames = ViewJson::array();
+    for (auto& frame : ResolveStackSample(id)) {
+        ViewJson item;
+        item["address"] = static_cast<std::uint64_t>(frame.address);
+        item["symbol"] = frame.symbol;
+        item["module"] = frame.module;
+        item["offset"] = static_cast<std::uint64_t>(frame.offset);
+        item["resolved"] = frame.resolved;
+        frames.push_back(item);
+    }
+    out["frames"] = frames;
+    return out;
+}
+
+ViewJson FiberChainJson(FiberChainId id) {
+    ViewJson out = ViewJson::object();
+    FiberChainSample sample;
+    if (!LookupFiberChain(id, &sample)) {
+        out["id"] = id;
+        out["available"] = false;
+        return out;
+    }
+    out["id"] = id;
+    out["available"] = true;
+    out["thread_id"] = sample.thread_id;
+    out["gid"] = sample.gid;
+    out["ts_ns"] = sample.ts_ns;
+    out["refs"] = sample.refs;
+    ViewJson nodes = ViewJson::array();
+    for (const auto& node : sample.nodes) {
+        ViewJson item;
+        item["fiber_id"] = node.fiber_id;
+        item["gid"] = node.gid;
+        item["state"] = node.state;
+        item["state_name"] = FiberStateNameForDebug(node.state);
+        item["suspend_reason"] = node.suspend_reason;
+        item["depth"] = node.depth;
+        item["alive"] = node.alive;
+        item["main_fiber"] = node.main_fiber;
+        item["function"] = node.function;
+        item["stack_low"] = static_cast<std::uint64_t>(node.stack_low);
+        item["stack_high"] = static_cast<std::uint64_t>(node.stack_high);
+        item["stack_known"] = node.stack_known;
+        nodes.push_back(item);
+    }
+    out["nodes"] = nodes;
+    return out;
+}
+
+/// 单资源累计统计（视图中按资源 id 聚合）。
+struct ResourceStats {
+    std::uint64_t events{0};
+    std::uint64_t holds{0};
+    std::uint64_t waits{0};       ///< result=blocked 的次数
+    std::uint64_t wakes{0};       ///< result=wake 的次数
+    std::uint64_t timeouts{0};
+    std::uint64_t cancels{0};
+    std::uint64_t max_waiters{0};
+    std::uint64_t hold_ns_total{0};
+    std::uint64_t hold_ns_max{0};
+    std::uint64_t wait_ns_total{0};
+    std::uint64_t wait_ns_max{0};
+    std::uint64_t sends{0};
+    std::uint64_t recvs{0};
+    std::uint64_t send_blocked{0};
+    std::uint64_t recv_blocked{0};
+    std::uint64_t value_known{0};
+    std::uint64_t last_value{0};
+    std::map<std::uint64_t, std::uint64_t> hold_start; ///< actor -> ts
+    std::map<std::uint64_t, std::uint64_t> wait_start; ///< actor -> ts
+};
+
+void AccumulateResourceEvent(ResourceStats& stats, const EventRecord& event) {
+    const auto code = static_cast<SchedEventCode>(event.code);
+    const auto result = static_cast<ResourceResult>(event.result);
+    ++stats.events;
+    stats.max_waiters =
+        std::max<std::uint64_t>(stats.max_waiters, event.waiters);
+    if (result == ResourceResult::kBlocked) {
+        ++stats.waits;
+        stats.wait_start[event.gid] = event.ts_ns;
+        if (code == SchedEventCode::kChannelSend) {
+            ++stats.send_blocked;
+        } else if (code == SchedEventCode::kChannelRecv) {
+            ++stats.recv_blocked;
+        }
+    } else if (result == ResourceResult::kWake) {
+        ++stats.wakes;
+    } else if (result == ResourceResult::kTimeout) {
+        ++stats.timeouts;
+    } else if (result == ResourceResult::kCancelled) {
+        ++stats.cancels;
+    }
+    if (code == SchedEventCode::kChannelSend ||
+        code == SchedEventCode::kChannelSendOk) {
+        ++stats.sends;
+        if ((event.flags & kResourceFlagValueKnown) != 0U) {
+            ++stats.value_known;
+            stats.last_value = event.value;
+        }
+    } else if (code == SchedEventCode::kChannelRecv ||
+               code == SchedEventCode::kChannelRecvOk) {
+        ++stats.recvs;
+        if ((event.flags & kResourceFlagValueKnown) != 0U) {
+            ++stats.value_known;
+            stats.last_value = event.value;
+        }
+    }
+    if (IsLockAcquireCode(code)) {
+        if (result == ResourceResult::kOk) {
+            ++stats.holds;
+            auto it = stats.hold_start.find(event.gid);
+            if (it != stats.hold_start.end()) {
+                // 同一 actor 重复 acquire（递归锁）：先按上一段结算。
+                const std::uint64_t elapsed =
+                    event.ts_ns >= it->second ? event.ts_ns - it->second : 0;
+                stats.hold_ns_total += elapsed;
+                stats.hold_ns_max = std::max(stats.hold_ns_max, elapsed);
+            }
+            stats.hold_start[event.gid] = event.ts_ns;
+        }
+        // 等待结束：同 actor 的 blocked -> ok / timeout / cancel。
+        // 注意 blocked 事件本身就是 acquire code（kMutexLock 等），必须
+        // 排除它自己，否则刚写入的起点会被同一事件立刻配对成 0。
+        if (result != ResourceResult::kBlocked) {
+            auto wait_it = stats.wait_start.find(event.gid);
+            if (wait_it != stats.wait_start.end()) {
+                if (event.ts_ns >= wait_it->second) {
+                    const std::uint64_t elapsed = event.ts_ns - wait_it->second;
+                    stats.wait_ns_total += elapsed;
+                    stats.wait_ns_max = std::max(stats.wait_ns_max, elapsed);
+                }
+                stats.wait_start.erase(wait_it);
+            }
+        }
+    }
+    if (IsLockReleaseCode(code)) {
+        auto it = stats.hold_start.find(event.gid);
+        if (it != stats.hold_start.end()) {
+            const std::uint64_t elapsed =
+                event.ts_ns >= it->second ? event.ts_ns - it->second : 0;
+            stats.hold_ns_total += elapsed;
+            stats.hold_ns_max = std::max(stats.hold_ns_max, elapsed);
+            stats.hold_start.erase(it);
+        }
+    }
+}
+
+ViewJson ResourceStatsJson(const ResourceStats& stats) {
+    ViewJson out = ViewJson::object();
+    out["events"] = stats.events;
+    out["holds"] = stats.holds;
+    out["hold_ns_total"] = stats.hold_ns_total;
+    out["hold_ns_max"] = stats.hold_ns_max;
+    out["waits"] = stats.waits;
+    out["wait_ns_total"] = stats.wait_ns_total;
+    out["wait_ns_max"] = stats.wait_ns_max;
+    out["wakes"] = stats.wakes;
+    out["timeouts"] = stats.timeouts;
+    out["cancels"] = stats.cancels;
+    out["max_waiters"] = stats.max_waiters;
+    out["sends"] = stats.sends;
+    out["recvs"] = stats.recvs;
+    out["send_blocked"] = stats.send_blocked;
+    out["recv_blocked"] = stats.recv_blocked;
+    out["value_known"] = stats.value_known;
+    out["last_value"] = stats.last_value;
+    return out;
+}
+
+ViewJson ResourceInfoJson(const ResourceInfo& info) {
+    ViewJson out = ViewJson::object();
+    out["id"] = info.id;
+    out["kind"] = ResourceKindName(info.kind);
+    out["kind_code"] = static_cast<std::uint32_t>(info.kind);
+    out["name"] = info.name;
+    out["address"] = static_cast<std::uint64_t>(
+        reinterpret_cast<std::uintptr_t>(info.address));
+    out["alive"] = info.alive;
+    out["created_seq"] = info.created_seq;
+    out["created_ts_ns"] = info.created_ts_ns;
+    out["destroyed_seq"] = info.destroyed_seq;
+    out["destroyed_ts_ns"] = info.destroyed_ts_ns;
+    return out;
+}
+
+/// 全部资源的累计统计（按 resource_id 聚合事件）。
+std::map<ResourceId, ResourceStats> AggregateResourceStats(
+    const std::vector<EventRecord>& events) {
+    std::map<ResourceId, ResourceStats> stats;
+    for (const auto& event : events) {
+        const auto code = static_cast<SchedEventCode>(event.code);
+        if (!IsResourceEventCode(code) || event.resource_id == 0) {
+            continue;
+        }
+        AccumulateResourceEvent(stats[event.resource_id], event);
+    }
+    return stats;
+}
+
+ViewJson ResourceHistoryView(std::uint64_t resource_id,
+                             const std::vector<EventRecord>& events) {
+    ViewJson view = ViewJson::object();
+    ViewJson timeline = ViewJson::array();
+    ResourceStats stats;
+    for (const auto& event : events) {
+        const auto code = static_cast<SchedEventCode>(event.code);
+        if (!IsResourceEventCode(code)) {
+            continue;
+        }
+        if (resource_id == 0) {
+            if (code != SchedEventCode::kParkCaptured) {
+                continue;
+            }
+        } else if (event.resource_id != resource_id) {
+            continue;
+        }
+        ViewJson item = EventToJson(event);
+        item["actor_gid"] = event.gid;
+        item["target_gid"] = event.target_gid;
+        item["resource_id"] = event.resource_id;
+        item["result"] = event.result;
+        item["result_name"] =
+            ResourceResultName(static_cast<ResourceResult>(event.result));
+        item["waiters"] = event.waiters;
+        item["value"] = event.value;
+        item["value_known"] =
+            (event.flags & kResourceFlagValueKnown) != 0U;
+        if (event.stack_id != 0) {
+            item["stack"] = StackSampleJson(event.stack_id);
+        }
+        if (event.chain_id != 0) {
+            item["fiber_chain"] = FiberChainJson(event.chain_id);
+        }
+        timeline.push_back(item);
+        AccumulateResourceEvent(stats, event);
+    }
+
+    ResourceInfo info;
+    if (resource_id != 0 && LookupResource(resource_id, &info)) {
+        view["resource"] = ResourceInfoJson(info);
+    } else if (resource_id != 0) {
+        ViewJson missing;
+        missing["id"] = resource_id;
+        missing["known"] = false;
+        view["resource"] = missing;
+    }
+    view["resource_id"] = resource_id;
+    view["events"] = timeline;
+    view["count"] = timeline.size();
+    view["summary"] = ResourceStatsJson(stats);
+    view["stack_samples"] = StackSampleCount();
+    view["fiber_chain_samples"] = FiberChainCount();
+    return view;
+}
+
+ViewJson LocksView(const std::vector<EventRecord>& events) {
+    const auto stats = AggregateResourceStats(events);
+    ViewJson view = ViewJson::object();
+    ViewJson items = ViewJson::array();
+    std::uint64_t lock_resources = 0;
+    std::uint64_t holds = 0;
+    std::uint64_t waits = 0;
+    std::uint64_t wakes = 0;
+    for (const auto& info : SnapshotResources()) {
+        switch (info.kind) {
+            case ResourceKind::kMutex:
+            case ResourceKind::kRwMutex:
+            case ResourceKind::kRecursiveMutex:
+            case ResourceKind::kTimedMutex:
+                break;
+            default:
+                continue;
+        }
+        ++lock_resources;
+        ViewJson item = ResourceInfoJson(info);
+        const auto it = stats.find(info.id);
+        if (it != stats.end()) {
+            const ViewJson numbers = ResourceStatsJson(it->second);
+            for (const auto& key : {"events", "holds", "hold_ns_total",
+                                    "hold_ns_max", "waits", "wait_ns_total",
+                                    "wait_ns_max", "wakes", "timeouts",
+                                    "cancels", "max_waiters"}) {
+                item[key] = numbers[key];
+            }
+            holds += it->second.holds;
+            waits += it->second.waits;
+            wakes += it->second.wakes;
+        } else {
+            item["events"] = 0;
+            item["holds"] = 0;
+            item["waits"] = 0;
+            item["wakes"] = 0;
+            item["max_waiters"] = 0;
+        }
+        items.push_back(item);
+    }
+    view["locks"] = items;
+    ViewJson counts;
+    counts["resources"] = lock_resources;
+    counts["holds"] = holds;
+    counts["waits"] = waits;
+    counts["wakes"] = wakes;
+    view["counts"] = counts;
+    return view;
+}
+
+ViewJson ChannelsView(const std::vector<EventRecord>& events) {
+    const auto stats = AggregateResourceStats(events);
+    ViewJson view = ViewJson::object();
+    ViewJson items = ViewJson::array();
+    std::uint64_t channel_resources = 0;
+    std::uint64_t sends = 0;
+    std::uint64_t recvs = 0;
+    std::uint64_t blocked = 0;
+    std::uint64_t wakes = 0;
+    for (const auto& info : SnapshotResources()) {
+        if (info.kind != ResourceKind::kChannel) {
+            continue;
+        }
+        ++channel_resources;
+        ViewJson item = ResourceInfoJson(info);
+        const auto it = stats.find(info.id);
+        if (it != stats.end()) {
+            const ViewJson numbers = ResourceStatsJson(it->second);
+            for (const auto& key : {"events", "sends", "recvs",
+                                    "send_blocked", "recv_blocked", "wakes",
+                                    "max_waiters", "value_known",
+                                    "last_value"}) {
+                item[key] = numbers[key];
+            }
+            sends += it->second.sends;
+            recvs += it->second.recvs;
+            blocked += it->second.send_blocked + it->second.recv_blocked;
+            wakes += it->second.wakes;
+        } else {
+            item["events"] = 0;
+            item["sends"] = 0;
+            item["recvs"] = 0;
+            item["wakes"] = 0;
+            item["max_waiters"] = 0;
+        }
+        items.push_back(item);
+    }
+    view["channels"] = items;
+    ViewJson counts;
+    counts["resources"] = channel_resources;
+    counts["sends"] = sends;
+    counts["recvs"] = recvs;
+    counts["blocked"] = blocked;
+    counts["wakes"] = wakes;
+    view["counts"] = counts;
+    return view;
+}
+
+ViewJson ResourcesView(const std::vector<EventRecord>& events) {
+    const auto stats = AggregateResourceStats(events);
+    ViewJson view = ViewJson::object();
+    ViewJson items = ViewJson::array();
+    ViewJson by_kind = ViewJson::object();
+    std::uint64_t alive = 0;
+    for (const auto& info : SnapshotResources()) {
+        ViewJson item = ResourceInfoJson(info);
+        const auto it = stats.find(info.id);
+        item["event_count"] = it == stats.end() ? 0 : it->second.events;
+        if (it != stats.end()) {
+            item["holds"] = it->second.holds;
+            item["waits"] = it->second.waits;
+            item["wakes"] = it->second.wakes;
+            item["max_waiters"] = it->second.max_waiters;
+        }
+        items.push_back(item);
+        const std::string kind = ResourceKindName(info.kind);
+        by_kind[kind] = by_kind.value(kind, std::uint64_t{0}) + 1;
+        if (info.alive) {
+            ++alive;
+        }
+    }
+    view["resources"] = items;
+    view["count"] = items.size();
+    view["alive"] = alive;
+    view["by_kind"] = by_kind;
+    view["stack_samples"] = StackSampleCount();
+    view["stack_dropped"] = StackSampleDropped();
+    view["fiber_chain_samples"] = FiberChainCount();
+    view["fiber_chain_dropped"] = FiberChainDropped();
+
+    // 项目内共有 10 类并发结构；明确列出覆盖状态，不静默跳过。
+    ViewJson coverage = ViewJson::array();
+    const auto add_kind = [&coverage](const char* kind, bool instrumented,
+                                      const char* reason) {
+        ViewJson item;
+        item["kind"] = kind;
+        item["instrumented"] = instrumented;
+        item["reason"] = reason;
+        coverage.push_back(item);
+    };
+    add_kind("sync::Mutex", true, "");
+    add_kind("sync::RWMutex", true, "");
+    add_kind("sync::RecursiveMutex", true, "");
+    add_kind("core::ParkingCondition", true, "");
+    add_kind("Channel<T>", true, "");
+    add_kind("sync::ConditionVariable", true, "");
+    add_kind("sync::WaitGroup", true, "");
+    add_kind("sync::TimedMutex", true, "");
+    add_kind("sync::SpinMutex", false,
+             "纯自旋锁：无等待队列、无 park/唤醒事件；插桩会给无竞争路径"
+             "增加原子操作，且无法提供等待者/唤醒字段");
+    add_kind("core::FutexMutex", false,
+             "最底层门闩：所有原语内部都经过它；逐次插桩会产生事件风暴并"
+             "污染上层原语的资源归因，故只通过上层原语观测");
+    view["coverage"] = coverage;
+    return view;
+}
+
 }  // namespace
 
 bool IsKnownViewName(std::string_view name) noexcept {
     return name == "gmp" || name == "timeline" || name == "sched" ||
-           name == "park" || name == "timer" || name == "primitives";
+           name == "park" || name == "timer" || name == "primitives" ||
+           name == "history" || name == "locks" || name == "channels" ||
+           name == "resources";
 }
 
 std::string BuildViewJson(std::string_view name, std::uint64_t gid,
@@ -2237,6 +2760,16 @@ std::string BuildViewJson(std::string_view name, std::uint64_t gid,
         root["timer"] = timer_view;
     } else if (name == "primitives") {
         root["primitives"] = PrimitivesView(events, pairs);
+    } else if (name == "history") {
+        // history 复用 `VIEW <name> [n]` 的数值参数：对 history 它是
+        // ResourceId，而不是 gid（服务端无需新增协议字段）。
+        root["history"] = ResourceHistoryView(gid, events);
+    } else if (name == "locks") {
+        root["locks"] = LocksView(events);
+    } else if (name == "channels") {
+        root["channels"] = ChannelsView(events);
+    } else if (name == "resources") {
+        root["resources"] = ResourcesView(events);
     }
     return root.dump() + "\n";
 }

@@ -32,6 +32,7 @@
 #include "go2cpp/concurrency/core/futex_mutex.hpp"
 
 #include "go2cpp/debug/debug_event_ring.hpp"
+#include "go2cpp/debug/debug_resources.hpp"
 #include "go2cpp/fiber.hpp"
 #include "go2cpp/scheduler.hpp"
 
@@ -430,6 +431,11 @@ public:
 
     bool managed() const noexcept {
         return m_scheduler != nullptr && static_cast<bool>(m_task);
+    }
+
+    /// @brief 受管等待者的 G 编号；native/未知为 0（调试事件用）。
+    std::uint64_t gid() const noexcept {
+        return m_task ? static_cast<std::uint64_t>(m_task->id()) : 0U;
     }
 
     WaitResult WaitNative() noexcept {
@@ -1008,6 +1014,10 @@ std::shared_ptr<WaitBackend> CreateWaitBackend() noexcept {
  */
 struct Mutex::Impl {
     std::mutex m_mutex;
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    /// @brief 资源级历史编号（构造时注册；OFF 构建不存在该成员）。
+    ::go2cpp::debug::ResourceId m_debug_resource{0};
+#endif
     // 同一个原子字节同时发布锁状态、等待者提示、饥饿模式与唤醒令牌。
     // 关键点：正常模式下 Unlock 清 kLocked 后新来者仍能 CAS 拿锁；只有
     // kStarving 会关闭快路径（饥饿模式禁止插队）。
@@ -1103,7 +1113,12 @@ struct Mutex::Impl {
     }
 };
 
-Mutex::Mutex() : m_impl(std::make_unique<Impl>()) {}
+Mutex::Mutex() : m_impl(std::make_unique<Impl>()) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    m_impl->m_debug_resource = GO2CPP_DEBUG_RESOURCE_REGISTER(
+        kMutex, this, nullptr);
+#endif
+}
 
 MutexDebugSnapshot Mutex::DebugSnapshotInternal() const {
     MutexDebugSnapshot snapshot;
@@ -1130,7 +1145,11 @@ MutexDebugSnapshot Mutex::DebugSnapshotInternal() const {
     return snapshot;
 }
 
-Mutex::~Mutex() = default;
+Mutex::~Mutex() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_UNREGISTER(m_impl->m_debug_resource);
+#endif
+}
 
 bool Mutex::Lock(const ContextPtr& context) {
     return LockImpl(context, false);
@@ -1220,6 +1239,10 @@ bool Mutex::LockImpl(const ContextPtr& context,
             note_lock_held();
             GO2CPP_DEBUG_EVENT_SAMPLED(
                 kMutexFastLock, GO2CPP_DEBUG_BOUND_TASK(), 0, 32);
+            GO2CPP_DEBUG_RESOURCE_EVENT(
+                kMutexLock, m_impl->m_debug_resource,
+                GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+                ::go2cpp::debug::ResourceResult::kOk, 0, false);
             return true;
         }
     }
@@ -1257,9 +1280,11 @@ bool Mutex::LockImpl(const ContextPtr& context,
     // 争用事件：能走到这里说明快速 CAS 已失败，本次 Lock 必须排队/自旋/park。
     // 只在慢路径记录（无竞争加锁零开销）；pid 由事件环从调度器绑定读取。
     GO2CPP_DEBUG_PARK_HINT(kMutex);
-    GO2CPP_DEBUG_EVENT(
-        kMutexLock,
-        target.task ? static_cast<std::uint64_t>(target.task->id()) : 0ULL, 0);
+    GO2CPP_DEBUG_RESOURCE_EVENT(
+        kMutexLock, m_impl->m_debug_resource,
+        target.task ? static_cast<std::uint64_t>(target.task->id()) : 0ULL, 0,
+        0, ::go2cpp::debug::ResourceResult::kBlocked,
+        m_impl->m_native_waiters.load(std::memory_order_relaxed) + 1U, true);
 
     for (;;) {
         // step2: 无竞争/正常模式快速路径——一次 CAS。kStarving 时禁止插队。
@@ -1274,6 +1299,11 @@ bool Mutex::LockImpl(const ContextPtr& context,
                     expected_state, desired, std::memory_order_acquire,
                     std::memory_order_relaxed)) {
                 note_lock_held();
+                GO2CPP_DEBUG_RESOURCE_EVENT(
+                    kMutexLock, m_impl->m_debug_resource,
+                    target.task ? static_cast<std::uint64_t>(target.task->id())
+                                : 0ULL,
+                    0, 0, ::go2cpp::debug::ResourceResult::kOk, 0, false);
                 return true;
             }
         }
@@ -1313,6 +1343,13 @@ bool Mutex::LockImpl(const ContextPtr& context,
                             std::memory_order_acquire,
                             std::memory_order_relaxed)) {
                         note_lock_held();
+                        GO2CPP_DEBUG_RESOURCE_EVENT(
+                            kMutexLock, m_impl->m_debug_resource,
+                            target.task
+                                ? static_cast<std::uint64_t>(target.task->id())
+                                : 0ULL,
+                            0, 0, ::go2cpp::debug::ResourceResult::kOk, 0,
+                            false);
                         return true;
                     }
                 }
@@ -1417,6 +1454,11 @@ bool Mutex::LockImpl(const ContextPtr& context,
             subscription.Reset();
             ReleaseWaitNode(std::move(owned_waiter));
             note_lock_held();
+            GO2CPP_DEBUG_RESOURCE_EVENT(
+                kMutexLock, m_impl->m_debug_resource,
+                target.task ? static_cast<std::uint64_t>(target.task->id())
+                            : 0ULL,
+                0, 0, ::go2cpp::debug::ResourceResult::kOk, 0, false);
             return true;
         }
         if (abort_before_enqueue) {
@@ -1458,6 +1500,11 @@ bool Mutex::LockImpl(const ContextPtr& context,
                     }
                 }
                 note_lock_held();
+                GO2CPP_DEBUG_RESOURCE_EVENT(
+                    kMutexLock, m_impl->m_debug_resource,
+                    target.task ? static_cast<std::uint64_t>(target.task->id())
+                                : 0ULL,
+                    0, 0, ::go2cpp::debug::ResourceResult::kOk, 0, false);
                 return true;
             }
             // 正常模式：只是被叫醒，必须回到循环重新竞争。
@@ -1592,11 +1639,15 @@ void Mutex::Unlock() {
     if (m_impl->m_state.compare_exchange_strong(
             expected_state, 0U, std::memory_order_release,
             std::memory_order_acquire)) {
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kMutexUnlock, m_impl->m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(),
+            0, 0, ::go2cpp::debug::ResourceResult::kOk, 0, false);
         return;
     }
 
     // step3: 慢路径——队列操作在 m_mutex 内与等待者入队线性化。
     std::shared_ptr<WaitNode> selected;
+    std::uint32_t waiters_after = 0;
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
         std::uint8_t state = m_impl->m_state.load(std::memory_order_acquire);
@@ -1672,6 +1723,7 @@ void Mutex::Unlock() {
                 m_impl->m_state.store(0U, std::memory_order_release);
             }
         }
+        waiters_after = static_cast<std::uint32_t>(m_impl->m_waiters.size());
     }
     // step4: 锁外唤醒（与 LockImpl 的 park 路径配对；持队列锁唤醒会死锁）。
     if (selected) {
@@ -1679,9 +1731,19 @@ void Mutex::Unlock() {
         const Task* const unlocker = Scheduler::current_task_ptr();
         GO2CPP_DEBUG_EVENT(kMutexUnlock,
                            unlocker != nullptr ? unlocker->id() : 0, 1);
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kMutexUnlock, m_impl->m_debug_resource,
+            unlocker != nullptr ? static_cast<std::uint64_t>(unlocker->id())
+                                : 0ULL,
+            selected->gid(), 0, ::go2cpp::debug::ResourceResult::kWake,
+            waiters_after, true);
 #endif
         GO2CPP_DEBUG_WAKE_HINT(kMutex);
         selected->Wake();
+    } else {
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kMutexUnlock, m_impl->m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(),
+            0, 0, ::go2cpp::debug::ResourceResult::kOk, waiters_after, false);
     }
 }
 
@@ -1768,11 +1830,19 @@ bool TryRelockWithoutParking(Mutex& mutex) noexcept {
 struct ConditionVariable::Impl {
     /// @brief 保护 m_waiters；Wait 入队、NotifyOne/NotifyAll 出队。
     std::mutex m_mutex;
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    ::go2cpp::debug::ResourceId m_debug_resource{0};
+#endif
     /// @brief 通知等待队列（FIFO）；存 shared_ptr 以便锁外 Wake 时节点仍存活。
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
 };
 
-ConditionVariable::ConditionVariable() : m_impl(std::make_unique<Impl>()) {}
+ConditionVariable::ConditionVariable() : m_impl(std::make_unique<Impl>()) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    m_impl->m_debug_resource =
+        GO2CPP_DEBUG_RESOURCE_REGISTER(kConditionVariable, this, nullptr);
+#endif
+}
 
 ConditionVariableDebugSnapshot ConditionVariable::DebugSnapshotInternal() const {
     ConditionVariableDebugSnapshot snapshot;
@@ -1781,13 +1851,22 @@ ConditionVariableDebugSnapshot ConditionVariable::DebugSnapshotInternal() const 
     return snapshot;
 }
 
-ConditionVariable::~ConditionVariable() = default;
+ConditionVariable::~ConditionVariable() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_UNREGISTER(m_impl->m_debug_resource);
+#endif
+}
 
 bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
     // 必须先识别手动 Fiber。即使 Context 已取消，也不能走普通线程的
     // unlock/relock 路径，否则竞争中的重锁会阻塞 carrier 线程。
     const WaitTarget target = CurrentTarget();
-    const auto abort_wait = [&mutex](bool preserve_lock) {
+    const auto abort_wait = [this, &mutex](bool preserve_lock) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kCvWait, m_impl->m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ::go2cpp::debug::ResourceResult::kCancelled, 0, true);
+#endif
         // 所有可调度调用者统一走 cleanup 重锁。它忽略 G 的取消标记，
         // 但仍可让出当前 G 等待 owner 释放 mutex；只有手动 Fiber 没有
         // Scheduler continuation，因此必须保留进入 Wait 前的锁状态。
@@ -1836,6 +1915,12 @@ bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
         // 它必须能够检查注册表，避免锁顺序反转。
         return abort_wait(false);
     }
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_EVENT(
+        kCvWait, m_impl->m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+        ::go2cpp::debug::ResourceResult::kBlocked,
+        static_cast<std::uint32_t>(m_impl->m_waiters.size()), true);
+#endif
 
     try {
         // 先发布再解锁。并发 Notify 可能在此时运行，但 Scheduler 的 pending-wake
@@ -1870,6 +1955,14 @@ bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
     if (!mutex.LockForConditionWait() && !TryRelockWithoutParking(mutex)) {
         ThrowConditionRelockFailure();
     }
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_EVENT(
+        kCvWait, m_impl->m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+        result == WaitResult::kNotified
+            ? ::go2cpp::debug::ResourceResult::kOk
+            : ::go2cpp::debug::ResourceResult::kCancelled,
+        0, true);
+#endif
     return result == WaitResult::kNotified;
 }
 
@@ -1896,6 +1989,12 @@ void ConditionVariable::NotifyOne() noexcept {
         }
     }
     if (selected) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kCvNotify, m_impl->m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(),
+            selected->gid(), 0, ::go2cpp::debug::ResourceResult::kWake, 0,
+            true);
+#endif
         selected->Wake();
     }
 }
@@ -1908,6 +2007,12 @@ void ConditionVariable::NotifyAll() noexcept {
     }
     for (const auto& waiter : waiters) {
         if (waiter && waiter->TryFinish(WaitResult::kNotified)) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+            GO2CPP_DEBUG_RESOURCE_EVENT(
+                kCvNotify, m_impl->m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(),
+                waiter->gid(), 0, ::go2cpp::debug::ResourceResult::kWake,
+                static_cast<std::uint32_t>(waiters.size()), true);
+#endif
             waiter->Wake();
         }
     }
@@ -1931,13 +2036,21 @@ void ConditionVariable::NotifyAll() noexcept {
 struct WaitGroup::Impl {
     /// @brief 保护 m_count 与 m_waiters；Add/Done 写、Wait 读。
     mutable std::mutex m_mutex;
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    ::go2cpp::debug::ResourceId m_debug_resource{0};
+#endif
     /// @brief 未完成计数；`Add(n)` 加、`Done()` 减，归零时唤醒全部等待者。
     std::int64_t m_count{0};
     /// @brief 等待计数归零的队列（FIFO）；`Wait` 入队、`Done` 归零时整体 swap 出。
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
 };
 
-WaitGroup::WaitGroup() : m_impl(std::make_unique<Impl>()) {}
+WaitGroup::WaitGroup() : m_impl(std::make_unique<Impl>()) {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    m_impl->m_debug_resource =
+        GO2CPP_DEBUG_RESOURCE_REGISTER(kWaitGroup, this, nullptr);
+#endif
+}
 
 WaitGroupDebugSnapshot WaitGroup::DebugSnapshotInternal() const {
     WaitGroupDebugSnapshot snapshot;
@@ -1947,10 +2060,15 @@ WaitGroupDebugSnapshot WaitGroup::DebugSnapshotInternal() const {
     return snapshot;
 }
 
-WaitGroup::~WaitGroup() = default;
+WaitGroup::~WaitGroup() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_UNREGISTER(m_impl->m_debug_resource);
+#endif
+}
 
 void WaitGroup::Add(std::int64_t delta) {
     std::deque<std::shared_ptr<WaitNode>> released;
+    std::int64_t debug_count = 0;
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
         if (delta < 0 &&
@@ -1964,6 +2082,7 @@ void WaitGroup::Add(std::int64_t delta) {
             throw std::logic_error("go2cpp::sync::WaitGroup counter overflow");
         }
         m_impl->m_count += delta;
+        debug_count = m_impl->m_count;
         if (m_impl->m_count == 0) {
             for (const auto& waiter : m_impl->m_waiters) {
                 if (waiter) {
@@ -1974,6 +2093,16 @@ void WaitGroup::Add(std::int64_t delta) {
         }
     }
 
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_EVENT(
+        kWaitGroupDone, m_impl->m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(),
+        released.empty() ? 0U
+                         : static_cast<std::uint64_t>(released.front()->gid()),
+        static_cast<std::uint64_t>(debug_count),
+        released.empty() ? ::go2cpp::debug::ResourceResult::kOk
+                         : ::go2cpp::debug::ResourceResult::kWake,
+        static_cast<std::uint32_t>(released.size()), !released.empty());
+#endif
     // 在零值转换被锁保护时标记旧一轮结果。后续 Add 不能改变这些结果；
     // 任意 Scheduler 工作都放在锁外执行。
     for (const auto& waiter : released) {
@@ -2021,14 +2150,30 @@ bool WaitGroup::Wait(const ContextPtr& context) {
             return false;
         }
     }
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_EVENT(
+        kWaitGroupWait, m_impl->m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
+        0, ::go2cpp::debug::ResourceResult::kBlocked,
+        static_cast<std::uint32_t>(m_impl->m_waiters.size()), true);
+#endif
 
     const WaitResult result = Await(waiter.get());
     subscription.Reset();
     if (result != WaitResult::kNotified) {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
         RemoveWaiter(m_impl->m_waiters, waiter);
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kWaitGroupWait, m_impl->m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(),
+            0, 0, ::go2cpp::debug::ResourceResult::kCancelled, 0, true);
+#endif
         return false;
     }
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    GO2CPP_DEBUG_RESOURCE_EVENT(
+        kWaitGroupWait, m_impl->m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
+        0, ::go2cpp::debug::ResourceResult::kOk, 0, true);
+#endif
     return true;
 }
 

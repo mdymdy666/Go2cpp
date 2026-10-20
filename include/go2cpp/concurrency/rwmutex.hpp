@@ -55,6 +55,8 @@
 
 #include "go2cpp/sync.hpp"
 
+#include "go2cpp/debug/debug_resources.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -107,13 +109,22 @@ namespace go2cpp::sync {
 class RWMutex final {
 public:
     /// @brief 创建未加锁的读写锁。
-    RWMutex() = default;
+    RWMutex() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        m_debug_resource =
+            GO2CPP_DEBUG_RESOURCE_REGISTER(kRwMutex, this, nullptr);
+#endif
+    }
 
     /**
      * @brief 销毁读写锁。
      * @warning 调用方必须保证没有读者 / 写者持有，也没有等待者；否则未定义。
      */
-    ~RWMutex() = default;
+    ~RWMutex() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_UNREGISTER(m_debug_resource);
+#endif
+    }
 
     RWMutex(const RWMutex&) = delete;
     RWMutex& operator=(const RWMutex&) = delete;
@@ -132,6 +143,14 @@ public:
         }
         while (m_writing || !m_waiting_writers.empty()) {
             m_waiting_readers.fetch_add(1, std::memory_order_relaxed);
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+            GO2CPP_DEBUG_RESOURCE_EVENT(
+                kRwLockRead, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+                ::go2cpp::debug::ResourceResult::kBlocked,
+                static_cast<std::uint32_t>(
+                    m_waiting_readers.load(std::memory_order_relaxed)),
+                true);
+#endif
             bool notified = false;
             try {
                 notified = m_ready.Wait(m_state);
@@ -153,6 +172,11 @@ public:
         }
         ++m_readers;
         m_state.Unlock();
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kRwLockRead, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ::go2cpp::debug::ResourceResult::kOk, 0, false);
+#endif
     }
 
     /**
@@ -177,6 +201,11 @@ public:
             WakeWriterLocked();
         }
         m_state.Unlock();
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kRwUnlockRead, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ::go2cpp::debug::ResourceResult::kOk, 0, false);
+#endif
     }
 
     /**
@@ -191,6 +220,12 @@ public:
         }
         const std::uint64_t ticket = m_next_writer_ticket++;
         m_waiting_writers.push_back(ticket);
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kRwLockWrite, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ::go2cpp::debug::ResourceResult::kBlocked,
+            static_cast<std::uint32_t>(m_waiting_writers.size()), true);
+#endif
         while (!WriterCanAcquireLocked(ticket)) {
             bool notified = false;
             try {
@@ -214,6 +249,11 @@ public:
         m_waiting_writers.pop_front();
         m_writing = true;
         m_state.Unlock();
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kRwLockWrite, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ::go2cpp::debug::ResourceResult::kOk, 0, false);
+#endif
     }
 
     /**
@@ -234,12 +274,21 @@ public:
         // 按角色唤醒：有写者排队时只唤醒写者（写者优先，读者继续睡）；
         // 没有写者时才放行读者；两者都没有时完全短路 —— 不构造 NotifyAll 的
         // 临时批次，也不进条件变量内部互斥量。
+        const bool woke = !m_waiting_writers.empty() ||
+                          m_waiting_readers.load(std::memory_order_relaxed) != 0U;
         if (!m_waiting_writers.empty()) {
             WakeWriterLocked();
         } else {
             WakeReadersLocked();
         }
         m_state.Unlock();
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        GO2CPP_DEBUG_RESOURCE_EVENT(
+            kRwUnlockWrite, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            woke ? ::go2cpp::debug::ResourceResult::kWake
+                 : ::go2cpp::debug::ResourceResult::kOk,
+            0, woke);
+#endif
     }
 
     /**
@@ -555,6 +604,10 @@ private:
                m_waiting_writers.front() == ticket;
     }
 
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    /// @brief 资源级历史编号（构造时注册；OFF 构建不存在该成员）。
+    ::go2cpp::debug::ResourceId m_debug_resource{0};
+#endif
     /// 保护下面全部可变状态的内部互斥量（协程 / 线程混合）。
     mutable Mutex m_state;
     /// 读者广播：读者等待「无写者且无等待写者」。

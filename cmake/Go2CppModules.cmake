@@ -306,6 +306,9 @@ if (GO2CPP_DEBUG_DUMP)
     # OFF 构建宏为空展开，不建立这两条链接。
     target_link_libraries(go2cpp_sync PUBLIC go2cpp_debug_event)
     target_link_libraries(go2cpp_channel PUBLIC go2cpp_debug_event)
+    # fiber.cpp 在 park（Fiber::Suspend）时记录资源事件并维护 Fiber 链样本；
+    # OFF 构建宏空展开，不建立这条链接。
+    target_link_libraries(go2cpp_fiber PUBLIC go2cpp_debug_event)
 endif()
 target_link_libraries(go2cpp_network PUBLIC go2cpp_io go2cpp_context go2cpp_scheduler go2cpp_sync)
 # TlsTransport 的实现细节：OpenSSL 只出现在 .cpp 里。

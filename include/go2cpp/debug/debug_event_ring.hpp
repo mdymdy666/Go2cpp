@@ -187,8 +187,22 @@ enum class SchedEventCode : std::uint16_t {
 
     // 70~79：sync 原语。只在**慢路径**记录（无竞争的 Lock/Unlock 不产生事件），
     // 因此对快路径零开销。
-    kMutexLock = 70,   ///< Mutex 争用：gid=等待的 G，arg2=当前等待者数（近似）
-    kMutexUnlock = 71, ///< Mutex 解锁并唤醒等待者：gid=解锁的 G，arg2=1 唤醒了一个
+    kMutexLock = 70,   ///< Mutex 加锁：resource_id 标识锁，gid=actor，
+                       ///< target_gid=0，arg2=当前等待者数，result=ok/blocked
+    kMutexUnlock = 71, ///< Mutex 解锁：gid=解锁的 G，target_gid=被唤醒的 G，
+                       ///< result=ok/wake
+    kRwLockRead = 72,  ///< RWMutex 读锁：resource_id，gid=actor，result=ok/blocked
+    kRwUnlockRead = 73,   ///< RWMutex 释放读锁：resource_id，gid=actor
+    kRwLockWrite = 74,    ///< RWMutex 写锁：resource_id，gid=actor，result=ok/blocked
+    kRwUnlockWrite = 75,  ///< RWMutex 释放写锁：resource_id，gid=actor，result=wake
+    kRecursiveLock = 76,  ///< RecursiveMutex 加锁：resource_id，gid=actor，
+                          ///< arg2=递归深度，result=ok/blocked
+    kRecursiveUnlock = 77,///< RecursiveMutex 解锁：resource_id，gid=actor，
+                          ///< arg2=剩余深度，result=wake=1 真正释放
+    kCvWait = 78,         ///< ConditionVariable 等待：resource_id，gid=actor，
+                          ///< result=blocked/ok/timeout/cancel
+    kCvNotify = 79,       ///< ConditionVariable 通知：gid=actor，
+                          ///< target_gid=被唤醒者，result=wake
 
     // 80~89：channel。只在**阻塞**路径记录（立即完成/缓冲命中不产生事件）。
     kChannelSend = 80, ///< 发送方即将 park：gid=0，arg2=capacity
@@ -234,6 +248,14 @@ enum class SchedEventCode : std::uint16_t {
     // 130~139：timer 回调投递。kTimerFire 是服务端触发；本组记录「回调被交给
     // 执行器、进而变成可执行 G」的那一步。
     kTimerCallback = 130, ///< 回调交给执行器：gid=source_gid，arg2=timer_id
+
+    // 136：park 的资源级捕获（Fiber::Suspend 内记录）。
+    // 与 kParkEnter（scheduler.cpp 的调度事件）互补：本事件带 stack_id /
+    // chain_id / 原语原因，用于 --view history 展开调用栈与 Fiber 链。
+    kParkCaptured = 136, ///< park 捕获：gid=actor，arg2=SuspendReason，
+                         ///< arg3=PrimitiveReasonCode，stack_id/chain_id 见字段
+    kWaitGroupWait = 137, ///< WaitGroup::Wait 阻塞：resource_id，gid=actor
+    kWaitGroupDone = 138, ///< WaitGroup::Done 计数变化：resource_id，arg2=新计数
 };
 
 /// 事件码的稳定名字；未知值返回 "kUnknown"。
@@ -260,6 +282,17 @@ struct EventRecord {
     std::uint32_t reserved{0}; ///< 保留（显式零，保持 8 字节对齐与未来扩展）
     std::uint64_t arg3{0};  ///< timer kind / park-wake 原语原因码
     std::uint64_t arg4{0};  ///< timer 来源 gid / park 上下文
+
+    // ---- 资源级历史（v3 追加；旧字段位置与文本导出格式不变）----
+    std::uint64_t resource_id{0}; ///< 资源注册表编号；0=无资源
+    std::uint64_t target_gid{0};  ///< 被唤醒/交接的 G；0=无
+    std::uint32_t stack_id{0};    ///< 线程栈样本编号；0=未捕获
+    std::uint32_t chain_id{0};    ///< Fiber 链样本编号；0=未捕获
+    std::uint32_t result{0};      ///< ResourceResult 数值（0=ok）
+    std::uint32_t flags{0};       ///< ResourceEventFlags 位
+    std::uint64_t value{0};       ///< channel 值摘要（其它原语为 0）
+    std::uint32_t waiters{0};     ///< 操作后的队列深度（近似）
+    std::uint32_t reserved2{0};   ///< 保留（显式零）
 };
 
 /**
