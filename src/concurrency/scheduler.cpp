@@ -3459,13 +3459,19 @@ std::vector<TaskSnapshot> Scheduler::DebugSnapshotTasks() const {
     if (!m_impl) {
         return result;
     }
+    // 只返回**非终态** G。终态（kDead/kCancelled/kFailed）已不再参与调度，
+    // 但可能仍滞留在 registry 中等待 collect_terminal_locked() 回收；若全量
+    // dump 枚举它们，长跑进程的 tasks 会随「历史完成任务数」线性膨胀
+    // （实测 48s 达 23 万条 / 61MB），并可能撑爆 CLI 的 64MiB 传输上限。
+    // 未回收的终态 G 属于调度器内部回收滞后，不应出现在对外观测快照里。
     // 分片遍历：每片单独持锁，不长时间阻塞其它分片的新增/回收。
     // 用 task_registries.size() 而不是硬编码 16，避免与常量漂移。
     for (std::size_t stripe = 0; stripe < m_impl->task_registries.size(); ++stripe) {
         std::lock_guard<std::mutex> lock(m_impl->registry_mutexes[stripe]);
-        result.reserve(result.size() + m_impl->task_registries[stripe].size());
+        // 不按 registry 大小 reserve：过滤后存活 G 通常只有个位数，
+        // 按全量预留会在历史任务很多时白白分配大块内存。
         for (const auto& task : m_impl->task_registries[stripe]) {
-            if (!task) {
+            if (!task || task->terminal()) {
                 continue;
             }
             TaskSnapshot snapshot;

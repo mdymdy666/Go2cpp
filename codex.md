@@ -1441,3 +1441,76 @@ benchmarks/gmp_vs_thread_epoll_benchmark.cpp
 - `mutex-unlock` 依赖持锁 park 检测（Debug 默认开，Release 默认关）；
 - 诊断 Fiber 与业务共享 P 的 runqueue（命令期间短暂占用）；
 - 帧协议无身份认证，跨机必须由 topic/QUIC 层提供 mTLS。
+
+## 22. 可迁移协程：生产版 Fiber / Channel adopt API（2026-10-20）
+
+### 22.1 改动
+
+- 新增编译开关 `GO2CPP_MIGRATION_API`（默认 OFF，`cmake/Go2CppOptions.cmake`）；
+  OFF 时迁移实现不参与编译、`Channel<T>` 无额外基类/虚表，默认构建 116 项与
+  热路径不变；
+- `include/go2cpp/concurrency/fiber.hpp`：`ChannelWaitState`、
+  `ChannelMigrationBase`、`FiberMigrationOptions`、`Fiber::EnableMigration` /
+  `migration_enabled`、`ExportMigrationImage` / `ImportMigrationImage`、
+  内部 `BeginMigrationWait` / `EndMigrationWait`；
+- `include/go2cpp/concurrency/channel.hpp`：迁移等待路径（不入
+  `ParkingCondition`，登记节点后直接 `Fiber::Suspend`）、`ExportWaitState` /
+  `AdoptWaitState`、`MigrationObjectAddress/Size/NodeSize`、
+  `ReleaseMigrationHold`、noinline 等待节点辅助函数；
+- `src/concurrency/fiber.cpp`：导出/导入实现（G2CMIG03 快照、栈槽扫描、
+  栈/句柄/模块重定位、build-id、HMAC 签名、指针审计、`ClearedHeapSlot` 兜底）；
+- `cmake/Go2CppModules.cmake` + 新增 `cmake/Go2CppMigration.cmake`：
+  私有链接 `go2cpp_migration_format`（复用 `tools/migration` 格式层）、
+  ON 构建全模块关闭 stack protector、新增 demo 与反例可执行文件；
+- `tools/migration/adopt_demo.cpp`：跨进程 dump/restore/selftest；
+- `docs/fiber-migration.md`：§11 标题与落地说明更新，新增 §11.6–§11.8；
+- 报告：`/tmp/adopt_api.md`。
+
+### 22.2 验证（实际运行）
+
+- `./go2cpp_fiber_adopt_demo dump /tmp/fiber-adopt.mig` →
+  `restore`：输出「fiber 继续执行，收到消息 = 42」「state=Completed」；
+- `selftest` 8 场景全过：正常闭环、100 次随机值重复恢复
+  （28.3ms / 283us 每次）、篡改快照拒绝、无密钥导出拒绝、多等待者拒绝、
+  未登记堆指针拒绝、已关闭通道拒绝、其他 build-id 拒绝；
+- `ctest --test-dir build-work -j2`：**116/116 通过**（30.23s）；
+- `tools/migration/tests/run_tests.sh build-migration`：**53/53 通过**；
+- OFF 构建符号检查：`libgo2cpp_fiber.so` / `libgo2cpp_channel.so` 中
+  `ExportMigrationImage` / `ChannelMigrationBase` 符号计数均为 0。
+
+### 22.3 后续状态 / 已知限制
+
+- 所有改动**未 commit**；
+- 只支持无缓冲、单生产者单消费者、无 select 的接收等待（`<-ch`）；
+- 迁移等待路径不进入 Scheduler park 协议，唤醒由宿主显式 `resume()`；
+- 迁移构建关闭 stack protector（canary 不可跨进程）；
+- 真实等待路径会留下容器内部死值，默认拒绝导出；受控 demo 用
+  `allow_dead_heap_slots` 清零，不是安全边界；
+- 未验证：跨机器/跨架构、调度器自动接入、异常展开中的栈、持锁挂起点、
+  select/发送等待。
+
+## 23. Timer 调试内省与回放（2026-10-20）
+
+**能力**
+- `TimerService::DebugSnapshot()`：活动数 / 堆顶 deadline / 按来源分类 / fired-cancelled-rescheduled 统计 / 后台线程状态；
+  `DumpTimer` 输出 text+JSON 并带 `seq_at_start/seq_at_end`；`RegisterTimer` 接入 DebugServer。
+- 事件环新增 `kTimerArm/Fire/Cancel/Reschedule`（90~93）：`gid`=timer_id、`arg2`=deadline_ns、
+  `arg3`=kind、`arg4`=source_gid。文本事件行保持 7 列不变，JSON 与 `DUMP timer` 给出语义字段视图。
+- `tools/replay` 格式 v3：`kTimer` 尾部追加 `timer_id/timer_source/deadline_ns/fired_at_ns/callback_result`；
+  `ReplayTimerService` 支持 live 录制与 replay 虚拟时间驱动；引擎按 `kTimerFire` 派发回调并校验 fire checksum。
+
+**约束 / 陷阱**
+- 来源分类依赖线程本地 `TimerSourceScope`；本次边界不允许改 context/parking_condition/channel/timed_mutex，
+  运行时这些使用方未标注 → `kUnknown`（`ScheduleOn/EveryOn` 已自动归 `kScheduler`）。
+- replay 的 timer 回调在引擎线程执行，不能 park；live 周期是固定延迟；
+  “正在执行的回调不可取消”（Cancel 返回 false）是有意取舍，避免记录出现 cancel 在 fire 前的假顺序。
+- timer 事件走事件环普通区：10k 级 arm 不会挤掉关键区 wake 线索，但会被后续事件覆盖，
+  `timer_events.count` 只表示“最近可见条数”。
+
+**验证**
+- `ctest --test-dir build-work` → 116/116；`ctest --test-dir build-debug-full` → 116/116。
+- 回放 MATCH：same-deadline / periodic(≥10 次) / cancel / random-1000 / stress10k；
+  独立 `tools/replay` 工程构建与单测通过。
+- 10k 压测：core TimerService schedule p99≈12.8µs、cancel p99≈3.0µs；
+  replay live 驱动 schedule p99≈30.9µs、20k trace 回放≈74ms。
+- 报告：`/tmp/timer_debug_replay.md`；demo：`/tmp/timer_dump_demo.txt`、`/tmp/timer_replay_demo.txt`。

@@ -60,6 +60,11 @@
 #include "go2cpp/core/timer.hpp"
 #include "go2cpp/debug/debug_event_ring.hpp"
 #include "go2cpp/error.hpp"
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+// 迁移 API：等待状态类型与 ChannelMigrationBase 都定义在 fiber.hpp。
+// 默认构建不包含该头，保持原有编译依赖与类型布局。
+#include "go2cpp/concurrency/fiber.hpp"
+#endif
 
 #include <algorithm>
 #include <any>
@@ -68,12 +73,14 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <random>
 #include <thread>
@@ -840,7 +847,12 @@ struct ChannelDebugSnapshot {
  *          关闭会唤醒所有发送者和接收者，Select 通过内部等待节点接入。
  */
 template <typename T>
-class Channel final : public std::enable_shared_from_this<Channel<T>> {
+class Channel final : public std::enable_shared_from_this<Channel<T>>
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+    ,
+    public ChannelMigrationBase
+#endif
+{
   static_assert(std::is_nothrow_move_constructible<T>::value,
                 "Channel<T> requires a nothrow move constructor");
   static_assert(std::is_nothrow_destructible<T>::value,
@@ -1562,6 +1574,231 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
   };
 
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+ public:
+  // -------------------------------------------------------------------------
+  // 跨进程迁移：等待状态导出 / 接纳（最小子集）
+  //
+  // 支持范围：无缓冲通道、单生产者单消费者、无 select、无 deadline/context。
+  // 迁移等待路径**不**进入 ParkingCondition：它把等待节点挂在队列上之后直接
+  // park 当前 Fiber。这样挂起栈帧里没有 WaitNode/Scheduler/堆控制块等跨进程
+  // 无效引用；恢复由宿主 resume，唤醒方不需要 Scheduler。
+  // -------------------------------------------------------------------------
+
+  /**
+   * @brief 导出当前唯一的等待者（仅接收方向）。
+   * @details 复杂场景（有缓冲、多个等待者、select、已关闭）明确拒绝，
+   *          不做语义等价的近似导出。
+   */
+  bool ExportWaitState(ChannelWaitState* out, std::string* error) override {
+    if (out == nullptr) {
+      if (error != nullptr) *error = "ChannelWaitState 输出为空";
+      return false;
+    }
+    *out = ChannelWaitState{};
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_capacity != 0 || !m_buffer.empty()) {
+      if (error != nullptr) {
+        *error = "迁移只支持无缓冲通道（capacity=" +
+                 std::to_string(m_capacity) + "）";
+      }
+      return false;
+    }
+    if (!m_senders.empty()) {
+      if (error != nullptr) *error = "通道上存在等待发送者，超出单生产者单消费者子集";
+      return false;
+    }
+    if (m_receivers.size() != 1) {
+      if (error != nullptr) {
+        *error = "通道上必须恰好有一个接收等待者（实际 " +
+                 std::to_string(m_receivers.size()) + "）";
+      }
+      return false;
+    }
+    if (m_closed) {
+      if (error != nullptr) *error = "已关闭的通道不能导出等待状态";
+      return false;
+    }
+    const auto& node = m_receivers.front();
+    if (!node || node->select_state) {
+      if (error != nullptr) *error = "select 等待者不在迁移子集内";
+      return false;
+    }
+    if (node->ready || node->cancelled) {
+      if (error != nullptr) *error = "等待节点已经就绪，导出没有意义";
+      return false;
+    }
+    // std::shared_ptr 是「对象指针 + 控制块指针」两个机器字；迁移必须同时
+    // 重建两者，否则恢复侧析构会访问旧进程的引用计数。
+    static_assert(sizeof(node) == 2U * sizeof(std::uint64_t),
+                  "std::shared_ptr 必须是两机器字布局");
+    std::uint64_t words[2] = {0, 0};
+    std::memcpy(words, &node, sizeof(words));
+    out->kind = 1;
+    out->channel_address = reinterpret_cast<std::uint64_t>(this);
+    out->node_address = words[0];
+    out->control_block = words[1];
+    out->value_bytes = sizeof(T);
+    out->has_value = node->ready ? 1U : 0U;
+    return true;
+  }
+
+  /**
+   * @brief 把导入的接收等待者挂回队列。
+   * @details `state.pending_slot` 必须是**新栈**上的 shared_ptr 槽：就地
+   *          构造会接管一份真实引用，避免发送方取走队列引用后节点被提前
+   *          销毁。旧栈槽里的字节来自生成进程，不能调用其析构（控制块在
+   *          旧进程），只能直接覆盖。
+   */
+  bool AdoptWaitState(const ChannelWaitState& state,
+                      ChannelWaitState* adopted,
+                      std::string* error) override {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (state.kind != 1) {
+      if (error != nullptr) *error = "迁移只支持接收等待（kind=1）";
+      return false;
+    }
+    if (state.value_bytes != sizeof(T)) {
+      if (error != nullptr) {
+        *error = "等待值类型大小不匹配（快照 " +
+                 std::to_string(state.value_bytes) + "，当前 " +
+                 std::to_string(sizeof(T)) + "）";
+      }
+      return false;
+    }
+    if (m_capacity != 0 || !m_buffer.empty() || !m_senders.empty() ||
+        !m_receivers.empty() || m_closed) {
+      if (error != nullptr) *error = "目标通道必须为空的无缓冲通道";
+      return false;
+    }
+    auto node = std::make_shared<PendingRecv>();
+    node->spin_wait = false;
+    m_receivers.emplace_back(node);
+    ++m_generation;
+    if (state.pending_slot != 0) {
+      auto* slot = reinterpret_cast<std::shared_ptr<PendingRecv>*>(
+          static_cast<std::uintptr_t>(state.pending_slot));
+      new (slot) std::shared_ptr<PendingRecv>(node);
+    }
+    // 额外保持一份引用，直到导入器完成栈槽构造（ReleaseMigrationHold）。
+    m_migration_hold = node;
+    if (adopted != nullptr) {
+      *adopted = ChannelWaitState{};
+      adopted->kind = 1;
+      adopted->channel_address = reinterpret_cast<std::uint64_t>(this);
+      std::uint64_t words[2] = {0, 0};
+      std::memcpy(words, &node, sizeof(words));
+      adopted->node_address = words[0];
+      adopted->control_block = words[1];
+      adopted->pending_slot = state.pending_slot;
+      adopted->value_bytes = sizeof(T);
+    }
+    return true;
+  }
+
+  /** @brief 通道对象（`Channel<T>` 本体）的起始地址。 */
+  std::uint64_t MigrationObjectAddress() const noexcept override {
+    return reinterpret_cast<std::uint64_t>(this);
+  }
+
+  /** @brief 通道对象大小（句柄重定位的内部偏移上界）。 */
+  std::uint64_t MigrationObjectSize() const noexcept override {
+    return sizeof(Channel<T>);
+  }
+
+  /** @brief 等待节点大小（句柄重定位的内部偏移上界）。 */
+  std::uint64_t MigrationNodeSize() const noexcept override {
+    return sizeof(PendingRecv);
+  }
+
+  /** @brief 释放 Adopt 期间额外持有的节点引用。 */
+  void ReleaseMigrationHold() noexcept override { m_migration_hold.reset(); }
+
+  /**
+   * @brief 判断当前等待是否落在迁移子集（调用方必须已持有 m_mutex）。
+   * @note 只做状态检查，不修改通道。
+   */
+  bool CanAdoptMigrationWait(std::optional<TimePoint> deadline,
+                             const ContextPtr& context) const noexcept {
+    if (deadline.has_value() || context) return false;
+    if (m_capacity != 0 || m_closed) return false;
+    if (!m_buffer.empty() || !m_senders.empty() || !m_receivers.empty()) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * @brief 创建迁移等待节点（noinline：把分配器临时留在独立栈帧里）。
+   *
+   * @details make_shared 与 deque 入队会在调用者栈上留下容器内部指针
+   * （`_M_node` 等）。这些是死值，但导出侧的指针审计无法证明它们已失效，
+   * 会把它们判成未登记堆指针。把这两步放进 noinline 辅助函数后，它们
+   * 的栈帧在返回后会被随后的 `Fiber::Suspend` 调用帧覆盖，审计面对的就
+   * 只剩真正活跃的指针。
+   */
+  [[gnu::noinline]] static std::shared_ptr<PendingRecv>
+  MakeMigrationWaitNode() {
+    auto node = std::make_shared<PendingRecv>();
+    node->spin_wait = false;
+    return node;
+  }
+
+  /// @brief 把迁移等待节点挂进接收队列（noinline，原因见上）。
+  [[gnu::noinline]] void EnqueueMigrationWaitNode(
+      const std::shared_ptr<PendingRecv>& node) {
+    // push_back 返回 void；emplace_back 在 C++17 返回元素引用，内联后会在
+    // 调用者栈上留下 deque block 内的元素地址（堆指针），导出审计会把它
+    // 误判成未登记堆指针。
+    m_receivers.push_back(node);
+    ++m_generation;
+  }
+
+  /**
+   * @brief 迁移子集的阻塞接收：登记节点后直接 park 当前 Fiber。
+   *
+   * @details 调用方必须持有 `lock`（指向 m_mutex）。等待期间释放锁；
+   * 返回时重新持有。恢复后 `self`/`pending` 可能已被导入路径重定位到
+   * 新对象，代码只通过这两个栈上指针访问，不缓存其它堆地址。
+   */
+  ChannelRecvResult<T> RecvMigratable(std::unique_lock<std::mutex>& lock,
+                                      Fiber* self) {
+    std::shared_ptr<PendingRecv> pending;
+    try {
+      pending = MakeMigrationWaitNode();
+    } catch (...) {
+      return {std::nullopt, false, true, ChannelStatus::kInvalid,
+              detail::ValueOperationError()};
+    }
+    EnqueueMigrationWaitNode(pending);
+    for (;;) {
+      if (pending->ready) {
+        return {std::move(pending->value), pending->ok, true, pending->status,
+                pending->error};
+      }
+      if (pending->cancelled) {
+        return {std::nullopt, false, true, pending->status, pending->error};
+      }
+      self->BeginMigrationWait(this, pending.get(), &pending, 1);
+      lock.unlock();
+      const bool suspended = Fiber::Suspend(SuspendReason::Park);
+      if (!lock.owns_lock()) {
+        lock.lock();
+      }
+      self->EndMigrationWait();
+      if (!suspended) {
+        ErasePending(m_receivers, pending);
+        ++m_generation;
+        return {std::nullopt, false, true, ChannelStatus::kInvalid,
+                detail::ValueOperationError()};
+      }
+      // 恢复后重新检查（发送方可能已交接；也可能只是被宿主提前 resume）。
+    }
+  }
+
+ private:
+#endif  // GO2CPP_MIGRATION_API
+
   /**
    * @brief 在离开作用域时注销 Context 取消回调的 RAII 守卫。
    *
@@ -1999,6 +2236,15 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
               nonblocking ? ChannelWouldBlockError() : ChannelTimeoutError()};
     }
 
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+    // 迁移等待子集：显式开启迁移的 Fiber + 无缓冲空通道 + 无 context/deadline。
+    // 走独立路径，避免在挂起栈上留下 ParkingCondition 的堆等待节点。
+    if (Fiber* const migration_fiber = Fiber::Current();
+        migration_fiber != nullptr && migration_fiber->migration_enabled() &&
+        CanAdoptMigrationWait(deadline, context)) {
+      return RecvMigratable(lock, migration_fiber);
+    }
+#endif
     if (core::ParkingCondition::FiberWaitUnsupported()) {
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
               detail::ValueOperationError()};
@@ -2199,6 +2445,10 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
   bool m_closed{false};
   /// @brief 关闭代际（每次 Close +1）；Select 用它判断等待节点是否跨代失效。
   std::atomic<std::uint64_t> m_generation{0};
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+  /// @brief AdoptWaitState 创建的新节点保活引用；ReleaseMigrationHold 释放。
+  std::shared_ptr<PendingRecv> m_migration_hold;
+#endif
 };
 
 template <typename T>

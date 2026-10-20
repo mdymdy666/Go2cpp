@@ -1,6 +1,22 @@
 if (GO2CPP_BUILD_TESTS)
     enable_testing()
 
+    # ---- tools/replay 核心（录制/回放）作为测试用静态库 ----
+    # 只在测试目标内部复用 tools/replay 的格式层与回放引擎，不新增
+    # ctest 用例（保持 ctest 计数不变），也不改变顶层库的依赖图。
+    add_library(go2cpp_replay_core STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/replay/src/format.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/replay/src/recorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/replay/src/replay_engine.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/replay/src/auto_entry.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/replay/src/split.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/replay/src/timer.cpp)
+    target_include_directories(go2cpp_replay_core PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools/replay/include)
+    target_link_libraries(go2cpp_replay_core PUBLIC go2cpp_runtime)
+    target_compile_options(go2cpp_replay_core PRIVATE
+        -Wall -Wextra -Wpedantic)
+
     add_executable(go2cpp_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_main.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_error.cpp
@@ -43,8 +59,11 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_breakpoints.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_signal_dump.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_dump.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_timer_debug.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/test_timer_replay.cpp
     )
-    target_link_libraries(go2cpp_tests PRIVATE go2cpp_runtime)
+    target_link_libraries(go2cpp_tests PRIVATE go2cpp_runtime
+        go2cpp_replay_core)
     target_include_directories(go2cpp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     if (TARGET go2cpp_hook)
         target_sources(go2cpp_tests PRIVATE

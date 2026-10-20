@@ -24,6 +24,12 @@
  * 本项目用**每 Fiber 独立栈 + 池化复用**（`FiberBin`）。这与 coost 的
  * "共享栈"是相反的取舍：独立栈换来更低的切换成本，代价是更大的内存占用；
  * 池化则把重复建栈的开销摊掉。
+ *
+ * ## 跨进程迁移
+ *
+ * `GO2CPP_MIGRATION_API=ON` 时额外提供 `ExportMigrationImage` /
+ * `ImportMigrationImage` 与 `Channel<T>` 的等待状态导出/接纳接口；
+ * 默认关闭，关闭时类型布局、热路径与行为均不变。
  */
 #pragma once
 
@@ -32,10 +38,127 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
 namespace go2cpp {
+
+// ---------------------------------------------------------------------------
+// 跨进程迁移 API（GO2CPP_MIGRATION_API=ON 时启用）
+// ---------------------------------------------------------------------------
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+
+/**
+ * @brief 通道等待者的可迁移视图（最小子集）。
+ *
+ * ## 适用范围
+ *
+ * 只表达「无缓冲、单生产者单消费者、无 select、无 deadline/context」的
+ * 阻塞等待：通道队列里恰好有一个 `PendingRecv`/`PendingSend` 节点。
+ * 复杂场景（有缓冲、select、多个等待者）在 `Channel<T>::ExportWaitState`
+ * 里明确拒绝，而不是退化成一个语义不同的快照。
+ *
+ * ## 地址字段的含义
+ *
+ * `node_address`/`control_block` 是 **std::shared_ptr 的两个机器字**：
+ * 前者指向等待节点对象，后者指向引用计数控制块。跨进程恢复时两者都
+ * 必须被重建（节点由 `Channel<T>::AdoptWaitState` 新建），因此这里
+ * 同时导出，导入侧据旧值生成重定位映射。
+ *
+ * `pending_slot` 是**等待方栈上 `std::shared_ptr` 变量的地址**：恢复后
+ * 它会被重定位到新栈的同一相对位置，并在该位置就地构造新的
+ * `shared_ptr`，让引用计数正确接管节点生命周期。
+ */
+struct ChannelWaitState {
+    /// 等待方向：0=无，1=接收（PendingRecv），2=发送（PendingSend）。
+    std::uint32_t kind{0};
+    std::uint32_t reserved{0};
+    /// 通道对象地址（旧侧导出 / 新侧导入，仅诊断）。
+    std::uint64_t channel_address{0};
+    /// 等待节点地址（std::shared_ptr 的第一个机器字）。
+    std::uint64_t node_address{0};
+    /// 引用计数控制块地址（std::shared_ptr 的第二个机器字）。
+    std::uint64_t control_block{0};
+    /// 等待方栈上 shared_ptr 变量的地址；0 表示未记录。
+    std::uint64_t pending_slot{0};
+    /// 值类型大小（诊断/校验，防止恢复侧 T 不一致）。
+    std::uint64_t value_bytes{0};
+    /// 导出时节点是否已经就绪（诊断）。
+    std::uint32_t has_value{0};
+};
+
+/**
+ * @brief 与模板无关的通道迁移接口，由 `Channel<T>` 实现。
+ *
+ * Fiber 的导出/导入代码不认识 `T`，只通过本接口读写等待状态。默认构建
+ * 不定义该类型，`Channel<T>` 也不会多出虚表。
+ */
+class ChannelMigrationBase {
+public:
+    virtual ~ChannelMigrationBase() = default;
+
+    /**
+     * @brief 导出当前唯一的等待者。
+     * @param out 输出等待状态。
+     * @param error 失败原因（复杂场景会明确说明拒绝理由）。
+     * @return 成功返回 true。
+     */
+    virtual bool ExportWaitState(ChannelWaitState* out, std::string* error) = 0;
+
+    /**
+     * @brief 把导入的等待者重新挂回通道队列。
+     * @param state 导出侧的状态；`pending_slot` 必须是**新栈**上的槽地址。
+     * @param adopted 输出新节点/新控制块地址。
+     * @param error 失败原因。
+     * @return 成功返回 true。
+     */
+    virtual bool AdoptWaitState(const ChannelWaitState& state,
+                                ChannelWaitState* adopted,
+                                std::string* error) = 0;
+
+    /// @brief 通道对象（`Channel<T>` 本体）的起始地址。
+    /// @details `Channel<T>` 可能以非 0 偏移继承本接口；栈上保存的是
+    ///          `Channel<T>*`，句柄重定位必须用它而不是基类子对象地址。
+    virtual std::uint64_t MigrationObjectAddress() const noexcept = 0;
+
+    /// @brief 通道对象的字节数（作为句柄重定位的内部偏移上界）。
+    virtual std::uint64_t MigrationObjectSize() const noexcept = 0;
+
+    /// @brief 等待节点对象的字节数（作为句柄重定位的内部偏移上界）。
+    virtual std::uint64_t MigrationNodeSize() const noexcept = 0;
+
+    /// @brief 释放 Adopt 期间额外持有的节点引用。
+    virtual void ReleaseMigrationHold() noexcept = 0;
+};
+
+/**
+ * @brief 迁移导入选项。
+ *
+ * @details `channel` 是快照中等待者要挂回的**当前进程**通道。快照带等待
+ * 状态时必填；无等待状态（纯 park）可以留空。
+ */
+struct FiberMigrationOptions {
+    /// 导入侧：等待者要挂回的通道；导出侧忽略。
+    ChannelMigrationBase* channel{nullptr};
+    /// 导入侧：是否校验可执行文件 build-id（默认校验，同版本才可恢复）。
+    bool verify_build_id{true};
+    /// 导入侧：是否强制校验 HMAC 签名（默认强制；仅负例测试可关闭）。
+    bool verify_signature{true};
+    /**
+     * @brief 导出侧：是否允许把「未登记堆指针」清零后继续导出。
+     *
+     * @details 默认 false：指针审计遇到未登记堆/匿名映射指针就拒绝。
+     * 真实 Fiber 的等待路径会在栈上留下容器内部的死值（deque block、
+     * 临时 shared_ptr 等），它们不可证明一定活跃，也不可迁移。受控 demo
+     * 可以显式打开本开关：这些槽在快照里被登记为 `ClearedHeapSlot`，
+     * 恢复时写 0（不用则无害，用了会立即崩溃而不是悬空执行）。生产环境
+     * 应消除残留指针并保持默认拒绝。
+     */
+    bool allow_dead_heap_slots{false};
+};
+
+#endif  // GO2CPP_MIGRATION_API
 
 /** @brief Fiber 生命周期状态。 */
 enum class FiberState : std::uint8_t {
@@ -299,6 +422,68 @@ public:
     // 深度为 1。
     /** @brief 返回 Fiber 在嵌套链中的深度。 */
     std::size_t nesting_depth() const noexcept;
+
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+    /**
+     * @brief 开启本 Fiber 的迁移等待路径。
+     *
+     * @details 只有显式开启后，`Channel<T>` 的阻塞收发才会走「等待节点
+     * 状态外置 + 直接 park」的迁移友好路径。默认关闭，普通 Fiber 的行为
+     * 与不编译迁移 API 时完全一致。必须在 Fiber 首次进入通道等待前调用。
+     * @return 当前 Fiber 有效返回 true。
+     */
+    bool EnableMigration() noexcept;
+    /** @brief 返回本 Fiber 是否开启了迁移等待路径。 */
+    bool migration_enabled() const noexcept;
+    /** @brief 返回当前构建是否包含迁移 API。 */
+    static bool MigrationApiEnabled() noexcept { return true; }
+
+    /**
+     * @brief 导出挂起 Fiber 的跨进程镜像。
+     *
+     * @details 只允许在 Fiber 处于 park（等待通道）时调用。导出内容：
+     * 栈快照 + 上下文保存区 + 等待状态；同时做指针审计，任何未登记的
+     * 堆指针都会被拒绝（避免恢复侧执行悬空指针）。快照使用
+     * `tools/migration` 的 v3 格式并强制 HMAC-SHA256 签名。
+     * @param path 输出文件路径。
+     * @param options 迁移选项（导出侧目前只用于扩展/诊断）。
+     * @param error 失败原因。
+     * @return 成功返回 true；不改变 Fiber 状态。
+     */
+    bool ExportMigrationImage(const std::string& path,
+                              const FiberMigrationOptions& options = {},
+                              std::string* error = nullptr) const;
+
+    /**
+     * @brief 在目标进程重建 Fiber。
+     *
+     * @details 按快照重建栈、重定位指针、把等待者挂回 `options.channel`，
+     * 返回一个 Suspended 状态、可 `resume()` 的 Fiber。导入过程不会
+     * 自动恢复执行；调用方应先完成必要的交接（例如发送消息），再
+     * `resume()`。
+     * @param path 快照文件路径。
+     * @param options 迁移选项；快照带等待状态时 `channel` 必填。
+     * @param error 失败原因。
+     * @return 成功返回新 Fiber；失败返回空指针并填写 error。
+     */
+    static std::unique_ptr<Fiber> ImportMigrationImage(
+        const std::string& path,
+        const FiberMigrationOptions& options = {},
+        std::string* error = nullptr);
+
+    /**
+     * @brief 内部接口：通道迁移等待路径登记等待节点。
+     * @note 仅供 `Channel<T>` 的迁移等待子集调用，不是稳定用户 API。
+     */
+    bool BeginMigrationWait(ChannelMigrationBase* channel, void* node,
+                            const void* pending_slot,
+                            std::uint32_t kind) noexcept;
+    /** @brief 内部接口：注销迁移等待登记。 */
+    void EndMigrationWait() noexcept;
+#else
+    /** @brief 返回当前构建是否包含迁移 API。 */
+    static bool MigrationApiEnabled() noexcept { return false; }
+#endif
 
 private:
     struct Impl;

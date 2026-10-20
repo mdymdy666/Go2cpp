@@ -43,6 +43,7 @@
 
 #include "go2cpp/concurrency/channel.hpp"
 #include "go2cpp/concurrency/core/parking_condition.hpp"
+#include "go2cpp/concurrency/core/timer.hpp"
 #include "go2cpp/concurrency/fiber.hpp"
 #include "go2cpp/io.hpp"
 #include "go2cpp/scheduler.hpp"
@@ -64,6 +65,7 @@ inline constexpr const char* kComponentMutex = "mutex";
 inline constexpr const char* kComponentIO = "io";
 inline constexpr const char* kComponentEvents = "events";
 inline constexpr const char* kComponentRuntime = "runtime";
+inline constexpr const char* kComponentTimer = "timer";
 
 /// 把文本转义为单行值：反斜杠、换行、回车、`=` 与首尾空白可见。
 std::string DumpEscape(std::string_view value);
@@ -207,6 +209,10 @@ DumpPayload DumpConditionVariable(const sync::ConditionVariable& condition);
 
 /// io::IOManager：FdSlot 数量、等待者、epoll 注册数、事件环 wake 统计。
 DumpPayload DumpIOManager(io::IOManager& manager);
+
+/// timer：活动数、堆顶 deadline、按来源分类、fire/cancel/reschedule 统计、
+/// 后台线程状态；带 seq_at_start/seq_at_end 一致性标记。
+DumpPayload DumpTimer(const core::TimerService& service);
 
 /// 事件环（scheduler park/wake/runqueue 序列）。
 DumpPayload DumpEvents(std::size_t max = 0);

@@ -64,6 +64,19 @@
 #include <utility>
 #include <vector>
 
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+// 跨进程迁移实现复用 tools/migration 的 v3 快照格式与符号哈希。
+#include "migration/format.hpp"
+#include "migration/symbol_table.hpp"
+#include <elf.h>
+#include <link.h>
+#include <climits>
+#include <cstdio>
+#include <fstream>
+#include <map>
+#include <sstream>
+#endif
+
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define GO2CPP_FIBER_ASAN 1
@@ -991,6 +1004,14 @@ struct Fiber::Impl {
             std::lock_guard<std::mutex> lock(m_failure_mutex);
             m_failure = {};
         }
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+        m_migration_enabled.store(false, std::memory_order_relaxed);
+        m_migration_wait_active.store(false, std::memory_order_relaxed);
+        m_migration_channel = nullptr;
+        m_migration_node = nullptr;
+        m_migration_pending_slot = nullptr;
+        m_migration_kind = 0;
+#endif
 #if defined(GO2CPP_FIBER_TSAN)
         if (m_tsan_fiber != nullptr) {
             __tsan_destroy_fiber(m_tsan_fiber);
@@ -1022,6 +1043,13 @@ struct Fiber::Impl {
         m_function = {};
         m_caller = nullptr;
         m_context = nullptr;
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+        m_migration_wait_active.store(false, std::memory_order_release);
+        m_migration_channel = nullptr;
+        m_migration_node = nullptr;
+        m_migration_pending_slot = nullptr;
+        m_migration_kind = 0;
+#endif
         m_record->reason.store(SuspendReason::None, std::memory_order_release);
         m_scheduler_propagate.store(false, std::memory_order_release);
         m_record->state.store(FiberState::Failed, std::memory_order_release);
@@ -1562,6 +1590,20 @@ struct Fiber::Impl {
     void* m_tsan_fiber{nullptr};
     void* m_tsan_caller{nullptr};
 #endif
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+    /// @brief 是否显式开启迁移等待路径（Channel 阻塞收发据此分流）。
+    std::atomic<bool> m_migration_enabled{false};
+    /// @brief 当前是否登记了一次可迁移的通道等待。
+    std::atomic<bool> m_migration_wait_active{false};
+    /// @brief 等待中的通道（非拥有指针，仅在挂起期间有效）。
+    ChannelMigrationBase* m_migration_channel{nullptr};
+    /// @brief 等待节点地址（PendingRecv*，仅用于导出校验）。
+    void* m_migration_node{nullptr};
+    /// @brief 等待方栈上的 shared_ptr 槽地址（导出为栈内偏移）。
+    const void* m_migration_pending_slot{nullptr};
+    /// @brief 等待方向：1=recv 2=send。
+    std::uint32_t m_migration_kind{0};
+#endif
 };
 
 Fiber::Fiber(Function function, std::size_t stack_size,
@@ -1824,5 +1866,884 @@ std::size_t Fiber::nesting_depth() const noexcept {
     std::lock_guard<std::mutex> lock(m_impl->m_record->mutex);
     return m_impl->m_record->depth;
 }
+
+#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
+// ===========================================================================
+// 跨进程迁移：Fiber 导出 / 导入
+//
+// 设计要点（与 docs/fiber-migration.md §11 对应）：
+//   1. 复用 tools/migration 的 G2CMIG03（v3）快照格式、CRC 与 HMAC-SHA256；
+//   2. 栈内指针分三类重定位：栈内偏移 / 代码地址（模块 + 模块内偏移）/
+//      已登记堆对象（Fiber、Impl、FiberRecord、Channel、等待节点与控制块）；
+//   3. 任何未登记的堆/映射指针都在导出时拒绝（安全边界，不猜测）；
+//   4. 代码地址不用裸地址也不用符号表名，而是「模块真实路径 + 模块内偏移
+//      + 模块 build-id」。同 build-id 是恢复的前置条件，跨版本明确拒绝。
+//
+// 恢复点位于 `Impl::suspend()` 内 `JumpContext` 返回处：导入时把保存区
+// 放到新栈的同一相对位置，7 个 callee-saved 寄存器与返回地址都按上述
+// 规则重写；随后 `resume()` 直接跳回该点，`suspend()` 的收尾代码会把
+// `m_caller` 刷新成本进程的调用者上下文。
+// ===========================================================================
+namespace {
+
+/// 导出时登记的可重定位对象类别。
+enum class MigrationObjectKind : std::uint32_t {
+    kFiber = 1,
+    kImpl = 2,
+    kRecord = 3,
+    kChannel = 4,
+    kWaitNode = 5,
+    kWaitControl = 6,
+    kStaleCaller = 7,
+    kWaitSlot = 8,
+};
+
+constexpr char kMigrationHandleFiber[] = "go2cpp::Fiber";
+constexpr char kMigrationHandleImpl[] = "go2cpp::Fiber::Impl";
+constexpr char kMigrationHandleRecord[] = "go2cpp::FiberRecord";
+constexpr char kMigrationHandleChannel[] = "go2cpp::Channel";
+constexpr char kMigrationHandleWaitNode[] = "go2cpp::ChannelWaitNode";
+constexpr char kMigrationHandleWaitControl[] = "go2cpp::ChannelWaitControl";
+constexpr char kMigrationHandleStaleCaller[] = "go2cpp::StaleCaller";
+constexpr char kMigrationHandleWaitSlot[] = "go2cpp::ChannelWaitSlot";
+constexpr char kMigrationHandleCleared[] = "go2cpp::ClearedHeapSlot";
+constexpr char kMigrationModulePrefix[] = "module:";
+
+/// 一个已加载模块的可执行段与 build-id。
+struct MigrationModuleSpan {
+    std::string key;          ///< `module:<realpath>`，跨进程稳定键
+    std::string path;         ///< 模块文件路径（读取 build-id 用）
+    std::uintptr_t base{0};   ///< 模块加载基址（ASLR 后的 dlpi_addr）
+    /// 所有 PT_LOAD 段的 [begin, end)。代码与数据都按「模块 + 偏移」重定位：
+    /// 栈上出现 libc 的 `stdout`/locale 等数据段指针时，同 build-id 的新进程
+    /// 里同一偏移仍然指向同一个对象，不需要拒绝导出。
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> load_ranges;
+};
+
+/// 导出时登记的一个堆对象（用于栈槽匹配与句柄生成）。
+struct MigrationObjectSpan {
+    std::uint32_t handle_id{0};
+    MigrationObjectKind kind{MigrationObjectKind::kFiber};
+    std::uint64_t start{0};
+    std::uint64_t size{0};
+};
+
+std::string MigrationReadSelfExecutablePath() {
+    char buffer[4096];
+    const ssize_t length = ::readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (length <= 0) {
+        return {};
+    }
+    buffer[length] = '\0';
+    return std::string(buffer, static_cast<std::size_t>(length));
+}
+
+std::string MigrationNormalizeModulePath(const std::string& path) {
+    if (path.empty()) {
+        return {};
+    }
+    char resolved[PATH_MAX];
+    if (::realpath(path.c_str(), resolved) != nullptr) {
+        return std::string(resolved);
+    }
+    return path;
+}
+
+int MigrationCollectModule(struct dl_phdr_info* info, std::size_t, void* data) {
+    auto* spans = static_cast<std::vector<MigrationModuleSpan>*>(data);
+    if (info == nullptr || spans == nullptr) {
+        return 0;
+    }
+    std::string path =
+        info->dlpi_name != nullptr ? std::string(info->dlpi_name) : std::string();
+    if (path.empty()) {
+        path = MigrationReadSelfExecutablePath();
+    }
+    path = MigrationNormalizeModulePath(path);
+    if (path.empty()) {
+        return 0;
+    }
+    MigrationModuleSpan span;
+    span.key = std::string(kMigrationModulePrefix) + path;
+    span.path = path;
+    span.base = static_cast<std::uintptr_t>(info->dlpi_addr);
+    bool has_load = false;
+    for (int index = 0; index < info->dlpi_phnum; ++index) {
+        const Elf64_Phdr& header = info->dlpi_phdr[index];
+        if (header.p_type != PT_LOAD || header.p_memsz == 0) {
+            continue;
+        }
+        const auto begin = span.base + static_cast<std::uintptr_t>(header.p_vaddr);
+        const auto end = begin + static_cast<std::uintptr_t>(header.p_memsz);
+        span.load_ranges.emplace_back(begin, end);
+        has_load = true;
+    }
+    if (has_load) {
+        spans->push_back(std::move(span));
+    }
+    return 0;
+}
+
+std::vector<MigrationModuleSpan> MigrationEnumerateModules() {
+    std::vector<MigrationModuleSpan> spans;
+    ::dl_iterate_phdr(&MigrationCollectModule, &spans);
+    return spans;
+}
+
+const MigrationModuleSpan* MigrationFindModuleForAddress(
+    const std::vector<MigrationModuleSpan>& modules, std::uint64_t address) {
+    for (const auto& module : modules) {
+        for (const auto& range : module.load_ranges) {
+            if (address >= range.first && address < range.second) {
+                return &module;
+            }
+        }
+    }
+    return nullptr;
+}
+
+std::uint64_t MigrationFnv1a(const std::uint8_t* data, std::size_t size) {
+    std::uint64_t hash = 0xcbf29ce484222325ULL;
+    for (std::size_t index = 0; index < size; ++index) {
+        hash ^= data[index];
+        hash *= 0x100000001b3ULL;
+    }
+    return hash;
+}
+
+/// 读取 ELF 文件的 GNU build-id 并哈希成 u64；失败返回 false。
+bool MigrationReadBuildIdHash(const std::string& path, std::uint64_t* hash) {
+    if (hash == nullptr) {
+        return false;
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    Elf64_Ehdr header{};
+    file.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!file || std::memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 ||
+        header.e_ident[EI_CLASS] != ELFCLASS64 ||
+        header.e_phentsize != sizeof(Elf64_Phdr) || header.e_phoff == 0) {
+        return false;
+    }
+    for (std::uint16_t index = 0; index < header.e_phnum; ++index) {
+        Elf64_Phdr program{};
+        file.seekg(static_cast<std::streamoff>(
+            header.e_phoff + static_cast<std::uint64_t>(index) * sizeof(Elf64_Phdr)));
+        file.read(reinterpret_cast<char*>(&program), sizeof(program));
+        if (!file || program.p_type != PT_NOTE || program.p_filesz == 0) {
+            continue;
+        }
+        std::vector<char> notes(static_cast<std::size_t>(program.p_filesz));
+        file.seekg(static_cast<std::streamoff>(program.p_offset));
+        file.read(notes.data(), static_cast<std::streamsize>(notes.size()));
+        if (!file) {
+            continue;
+        }
+        std::size_t offset = 0;
+        while (offset + sizeof(Elf64_Nhdr) <= notes.size()) {
+            Elf64_Nhdr note{};
+            std::memcpy(&note, notes.data() + offset, sizeof(note));
+            offset += sizeof(note);
+            const std::size_t name_size = (note.n_namesz + 3U) & ~static_cast<std::size_t>(3U);
+            const std::size_t desc_size = (note.n_descsz + 3U) & ~static_cast<std::size_t>(3U);
+            if (offset + name_size + desc_size > notes.size()) {
+                break;
+            }
+            const char* name = notes.data() + offset;
+            const auto* desc = reinterpret_cast<const std::uint8_t*>(
+                notes.data() + offset + name_size);
+            if (note.n_type == NT_GNU_BUILD_ID && note.n_namesz == 4 &&
+                std::memcmp(name, "GNU", 4) == 0) {
+                *hash = MigrationFnv1a(desc, note.n_descsz);
+                return true;
+            }
+            offset += name_size + desc_size;
+        }
+    }
+    return false;
+}
+
+bool MigrationReadMappedRanges(
+    std::vector<std::pair<std::uint64_t, std::uint64_t>>* ranges) {
+    std::ifstream maps("/proc/self/maps");
+    if (!maps || ranges == nullptr) {
+        return false;
+    }
+    std::string line;
+    while (std::getline(maps, line)) {
+        unsigned long long begin = 0;
+        unsigned long long end = 0;
+        if (std::sscanf(line.c_str(), "%llx-%llx", &begin, &end) == 2 && end > begin) {
+            ranges->emplace_back(begin, end);
+        }
+    }
+    return true;
+}
+
+bool MigrationInMappedRanges(
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges,
+    std::uint64_t value) {
+    for (const auto& range : ranges) {
+        if (value >= range.first && value < range.second) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string MigrationHexU64(std::uint64_t value) {
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%016llx",
+                  static_cast<unsigned long long>(value));
+    return std::string(buffer);
+}
+
+bool MigrationParseHexU64(const std::string& text, std::uint64_t* value) {
+    if (text.empty() || value == nullptr) {
+        return false;
+    }
+    std::uint64_t result = 0;
+    for (char character : text) {
+        std::uint32_t digit = 0;
+        if (character >= '0' && character <= '9') {
+            digit = static_cast<std::uint32_t>(character - '0');
+        } else if (character >= 'a' && character <= 'f') {
+            digit = static_cast<std::uint32_t>(character - 'a') + 10U;
+        } else if (character >= 'A' && character <= 'F') {
+            digit = static_cast<std::uint32_t>(character - 'A') + 10U;
+        } else {
+            return false;
+        }
+        result = (result << 4U) | digit;
+    }
+    *value = result;
+    return true;
+}
+
+std::vector<std::uint8_t> MigrationEncodeU64(std::uint64_t value) {
+    std::vector<std::uint8_t> payload(sizeof(value));
+    std::memcpy(payload.data(), &value, sizeof(value));
+    return payload;
+}
+
+std::uint64_t MigrationDecodeU64(const std::uint8_t* data, std::size_t size,
+                                 std::size_t offset) {
+    if (data == nullptr || offset + sizeof(std::uint64_t) > size) {
+        return 0;
+    }
+    std::uint64_t value = 0;
+    std::memcpy(&value, data + offset, sizeof(value));
+    return value;
+}
+
+const char* MigrationHandleType(MigrationObjectKind kind) {
+    switch (kind) {
+    case MigrationObjectKind::kFiber:
+        return kMigrationHandleFiber;
+    case MigrationObjectKind::kImpl:
+        return kMigrationHandleImpl;
+    case MigrationObjectKind::kRecord:
+        return kMigrationHandleRecord;
+    case MigrationObjectKind::kChannel:
+        return kMigrationHandleChannel;
+    case MigrationObjectKind::kWaitNode:
+        return kMigrationHandleWaitNode;
+    case MigrationObjectKind::kWaitControl:
+        return kMigrationHandleWaitControl;
+    case MigrationObjectKind::kStaleCaller:
+        return kMigrationHandleStaleCaller;
+    case MigrationObjectKind::kWaitSlot:
+        return kMigrationHandleWaitSlot;
+    }
+    return "go2cpp::Unknown";
+}
+
+std::size_t MigrationRoundUpStackSize(std::size_t size) {
+    const long page = ::sysconf(_SC_PAGESIZE);
+    const auto page_size = page > 0 ? static_cast<std::size_t>(page) : 4096U;
+    const std::size_t aligned = (size + page_size - 1U) & ~(page_size - 1U);
+    return aligned == 0 ? page_size : aligned;
+}
+
+}  // namespace
+
+bool Fiber::EnableMigration() noexcept {
+    if (!m_impl) {
+        return false;
+    }
+    m_impl->m_migration_enabled.store(true, std::memory_order_release);
+    return true;
+}
+
+bool Fiber::migration_enabled() const noexcept {
+    return m_impl && m_impl->m_migration_enabled.load(std::memory_order_acquire);
+}
+
+bool Fiber::BeginMigrationWait(ChannelMigrationBase* channel, void* node,
+                               const void* pending_slot,
+                               std::uint32_t kind) noexcept {
+    if (!m_impl || channel == nullptr || node == nullptr) {
+        return false;
+    }
+    m_impl->m_migration_channel = channel;
+    m_impl->m_migration_node = node;
+    m_impl->m_migration_pending_slot = pending_slot;
+    m_impl->m_migration_kind = kind;
+    m_impl->m_migration_wait_active.store(true, std::memory_order_release);
+    return true;
+}
+
+void Fiber::EndMigrationWait() noexcept {
+    if (!m_impl) {
+        return;
+    }
+    m_impl->m_migration_wait_active.store(false, std::memory_order_release);
+    m_impl->m_migration_channel = nullptr;
+    m_impl->m_migration_node = nullptr;
+    m_impl->m_migration_pending_slot = nullptr;
+    m_impl->m_migration_kind = 0;
+}
+
+bool Fiber::ExportMigrationImage(const std::string& path,
+                                 const FiberMigrationOptions& options,
+                                 std::string* error) const {
+    const auto fail = [error](const std::string& message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return false;
+    };
+    if (!m_impl) {
+        return fail("Fiber 对象无效");
+    }
+    if (!m_impl->m_migration_enabled.load(std::memory_order_acquire)) {
+        return fail("Fiber 未开启迁移路径：请先在 Fiber 内调用 EnableMigration()");
+    }
+    if (!m_impl->m_migration_wait_active.load(std::memory_order_acquire)) {
+        return fail("Fiber 当前不在可迁移的通道等待中（只支持等待 channel 的挂起状态）");
+    }
+    if (m_impl->m_migration_kind != 1U) {
+        return fail("当前只支持接收等待（<-ch）的迁移，发送等待明确拒绝");
+    }
+    if (m_impl->m_record->state.load(std::memory_order_acquire) !=
+        FiberState::Suspended) {
+        return fail("Fiber 不是挂起状态，不能导出迁移镜像");
+    }
+    ChannelMigrationBase* const channel = m_impl->m_migration_channel;
+    FiberStack* const stack = m_impl->m_stack.get();
+    const auto context_address =
+        reinterpret_cast<std::uint64_t>(m_impl->m_context);
+    if (channel == nullptr || stack == nullptr || context_address == 0) {
+        return fail("Fiber 缺少迁移所需的通道、栈或上下文");
+    }
+    const auto bottom = reinterpret_cast<std::uint64_t>(stack->bottom());
+    const auto top = reinterpret_cast<std::uint64_t>(stack->stack_pointer());
+    const auto usable = top - bottom;
+    if (context_address < bottom || context_address + 8U * 7U > top) {
+        return fail("上下文保存区不在 Fiber 栈内（Fiber 可能已经结束）");
+    }
+
+    ChannelWaitState wait;
+    std::string wait_error;
+    if (!channel->ExportWaitState(&wait, &wait_error)) {
+        return fail("通道等待状态导出失败：" + wait_error);
+    }
+    wait.pending_slot =
+        reinterpret_cast<std::uint64_t>(m_impl->m_migration_pending_slot);
+    if (wait.node_address == 0 ||
+        wait.node_address !=
+            reinterpret_cast<std::uint64_t>(m_impl->m_migration_node)) {
+        return fail("通道等待节点与 Fiber 迁移登记不一致");
+    }
+    if (wait.pending_slot == 0 ||
+        wait.pending_slot < bottom ||
+        wait.pending_slot + 2U * sizeof(std::uint64_t) > top) {
+        return fail("等待方栈上的 shared_ptr 槽不在 Fiber 栈内");
+    }
+
+    std::vector<migration::HandleRecord> handles;
+    const auto add_handle = [&handles](const char* type, std::uint64_t old_address,
+                                       std::uint64_t object_size,
+                                       std::vector<std::uint8_t> payload) {
+        migration::HandleRecord record{};
+        record.id = static_cast<std::uint32_t>(handles.size()) + 1U;
+        record.old_address = old_address;
+        record.object_size = object_size;
+        record.type = type;
+        record.payload = std::move(payload);
+        handles.push_back(std::move(record));
+        return handles.back().id;
+    };
+
+    std::vector<MigrationObjectSpan> objects;
+    const auto add_object = [&handles, &objects, &add_handle](
+                                MigrationObjectKind kind, std::uint64_t start,
+                                std::uint64_t size,
+                                std::vector<std::uint8_t> payload) {
+        MigrationObjectSpan span;
+        span.kind = kind;
+        span.start = start;
+        span.size = size;
+        span.handle_id =
+            add_handle(MigrationHandleType(kind), start, size, std::move(payload));
+        objects.push_back(span);
+    };
+
+    add_object(MigrationObjectKind::kFiber, reinterpret_cast<std::uint64_t>(this),
+               sizeof(Fiber), {});
+    add_object(MigrationObjectKind::kImpl,
+               reinterpret_cast<std::uint64_t>(m_impl.get()), sizeof(Impl), {});
+    add_object(MigrationObjectKind::kRecord,
+               reinterpret_cast<std::uint64_t>(m_impl->m_record.get()),
+               sizeof(FiberRecord), {});
+    {
+        std::vector<std::uint8_t> payload(3U * sizeof(std::uint64_t));
+        const std::uint64_t object_size = channel->MigrationObjectSize();
+        const std::uint64_t node_size = channel->MigrationNodeSize();
+        const std::uint64_t value_bytes = wait.value_bytes;
+        std::memcpy(payload.data(), &object_size, sizeof(object_size));
+        std::memcpy(payload.data() + sizeof(std::uint64_t), &node_size,
+                    sizeof(node_size));
+        std::memcpy(payload.data() + 2U * sizeof(std::uint64_t), &value_bytes,
+                    sizeof(value_bytes));
+        // 用 Channel<T> 本体的地址（快照里的栈槽保存的是 Channel<T>*），
+        // 不能用 ChannelMigrationBase* 子对象地址。
+        add_object(MigrationObjectKind::kChannel, wait.channel_address,
+                   object_size, std::move(payload));
+    }
+    add_object(MigrationObjectKind::kWaitNode, wait.node_address,
+               channel->MigrationNodeSize(), {});
+    add_object(MigrationObjectKind::kWaitControl, wait.control_block, 64U, {});
+    if (m_impl->m_caller != nullptr) {
+        add_object(MigrationObjectKind::kStaleCaller,
+                   reinterpret_cast<std::uint64_t>(m_impl->m_caller), 8U, {});
+    }
+    add_object(MigrationObjectKind::kWaitSlot, wait.pending_slot,
+               sizeof(void*), MigrationEncodeU64(wait.pending_slot - context_address));
+
+    const auto modules = MigrationEnumerateModules();
+    std::vector<migration::SymbolRecord> symbols;
+    std::map<std::string, std::uint32_t> module_ids;
+    const auto intern_module = [&modules, &symbols, &module_ids](
+                                   const MigrationModuleSpan& module) {
+        const auto found = module_ids.find(module.key);
+        if (found != module_ids.end()) {
+            return found->second;
+        }
+        std::uint64_t build_id = 0;
+        if (!MigrationReadBuildIdHash(module.path, &build_id)) {
+            build_id = 0;
+        }
+        migration::SymbolRecord record{};
+        record.id = static_cast<std::uint32_t>(symbols.size()) + 1U;
+        record.kind = migration::kSymbolData;
+        record.size = 0;
+        record.name = module.key;
+        record.display = MigrationHexU64(build_id);
+        symbols.push_back(record);
+        module_ids[module.key] = record.id;
+        return record.id;
+    };
+
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> mapped_ranges;
+    if (!MigrationReadMappedRanges(&mapped_ranges)) {
+        return fail("无法读取 /proc/self/maps，指针审计不可用");
+    }
+
+    std::vector<migration::Relocation> relocations;
+    migration::PointerAudit audit{};
+    for (std::uint64_t slot = context_address; slot + 8U <= top; slot += 8U) {
+        std::uint64_t value = 0;
+        std::memcpy(&value, reinterpret_cast<const void*>(slot), sizeof(value));
+        ++audit.slots;
+        if (value == 0) {
+            continue;
+        }
+        migration::Relocation relocation{};
+        relocation.slot_offset = slot - context_address;
+        if (value >= bottom && value < top) {
+            relocation.kind = migration::kRelocStack;
+            relocation.addend = static_cast<std::int64_t>(value - context_address);
+            ++audit.stack_ptrs;
+            relocations.push_back(relocation);
+            continue;
+        }
+        const MigrationObjectSpan* matched = nullptr;
+        for (const auto& object : objects) {
+            if (value >= object.start && value < object.start + object.size) {
+                matched = &object;
+                break;
+            }
+        }
+        if (matched != nullptr) {
+            relocation.kind = migration::kRelocHandle;
+            relocation.target_id = matched->handle_id;
+            relocation.addend =
+                static_cast<std::int64_t>(value - matched->start);
+            ++audit.handle_ptrs;
+            relocations.push_back(relocation);
+            continue;
+        }
+        const MigrationModuleSpan* const module =
+            MigrationFindModuleForAddress(modules, value);
+        if (module != nullptr) {
+            relocation.kind = migration::kRelocSymbol;
+            relocation.target_id = intern_module(*module);
+            relocation.addend =
+                static_cast<std::int64_t>(value - module->base);
+            ++audit.symbol_ptrs;
+            ++audit.code_ptrs;
+            relocations.push_back(relocation);
+            continue;
+        }
+        if (MigrationInMappedRanges(mapped_ranges, value)) {
+            ++audit.heap_ptrs;
+            if (options.allow_dead_heap_slots) {
+                // 受控模式：登记为「清零槽」。恢复后该槽为 0；代码若真的
+                // 使用它会在解引用处立即崩溃，而不是访问旧进程的地址。
+                const std::uint32_t handle_id = add_handle(
+                    kMigrationHandleCleared, value, sizeof(std::uint64_t),
+                    MigrationEncodeU64(value));
+                relocation.kind = migration::kRelocHandle;
+                relocation.target_id = handle_id;
+                relocation.addend = 0;
+                relocations.push_back(relocation);
+                continue;
+            }
+            std::ostringstream message;
+            message << "栈上存在未登记的堆/映射指针 0x" << std::hex << value
+                    << std::dec << "（槽位相对上下文 +0x" << std::hex
+                    << (slot - context_address) << std::dec
+                    << "）：拒绝导出，避免恢复侧执行悬空指针。"
+                       "若该槽确认是容器内部的死值，可在导出选项里显式打开 "
+                       "allow_dead_heap_slots（恢复后该槽为 0）。";
+            return fail(message.str());
+        }
+        ++audit.other_ptrs;
+    }
+
+    migration::Snapshot snapshot;
+    snapshot.fiber_id = m_impl->m_id;
+    snapshot.stack_base_va = bottom;
+    snapshot.stack_va = top;
+    snapshot.context_va = context_address;
+    snapshot.stack_size = usable;
+    snapshot.stack_bytes = top - context_address;
+    snapshot.stack.resize(static_cast<std::size_t>(snapshot.stack_bytes));
+    std::memcpy(snapshot.stack.data(),
+                reinterpret_cast<const void*>(context_address),
+                snapshot.stack.size());
+    std::uint64_t registers[7] = {0, 0, 0, 0, 0, 0, 0};
+    std::memcpy(registers, reinterpret_cast<const void*>(context_address),
+                sizeof(registers));
+    snapshot.registers.r12 = registers[0];
+    snapshot.registers.r13 = registers[1];
+    snapshot.registers.r14 = registers[2];
+    snapshot.registers.r15 = registers[3];
+    snapshot.registers.rbx = registers[4];
+    snapshot.registers.rbp = registers[5];
+    snapshot.registers.rip = registers[6];
+
+    snapshot.channel.va = wait.channel_address;
+    snapshot.channel.capacity = 0;
+    snapshot.channel.count = 0;
+    snapshot.channel.closed = 0;
+    snapshot.channel.head_offset = 0;
+    snapshot.channel.tail_offset = 0;
+    snapshot.channel_va = wait.channel_address;
+    snapshot.waiter_va = wait.node_address;
+    snapshot.wait_kind = migration::kWaitChannelRecv;
+
+    snapshot.fiber.ctx = context_address;
+    snapshot.fiber.caller = reinterpret_cast<std::uint64_t>(m_impl->m_caller);
+    snapshot.fiber.stack_base = bottom;
+    snapshot.fiber.stack_size = usable;
+    snapshot.fiber.top = top;
+    snapshot.fiber.fiber_id = m_impl->m_id;
+    snapshot.fiber.state = 2;  // Parked：ReadSnapshotFile 强制要求
+    snapshot.fiber.fn = 0;
+    snapshot.fiber.channel = wait.channel_address;
+    snapshot.fiber.waiter = wait.node_address;
+    snapshot.fiber.ctx_offset = context_address - bottom;
+    snapshot.fiber.waiter_offset = 0;
+    snapshot.fiber.safepoint_id = 0;
+    snapshot.fiber.fn_symbol_id = 0;
+    snapshot.fiber.channel_symbol_id = 0;
+
+    snapshot.audit = audit;
+    snapshot.relocations = std::move(relocations);
+    snapshot.handles = std::move(handles);
+    snapshot.symbols = std::move(symbols);
+    snapshot.symbol_epoch = migration::kSymbolEpoch;
+    snapshot.build_id_hash = migration::SelfBuildIdHash();
+    snapshot.safepoint_slots.clear();
+    snapshot.frames.clear();
+    {
+        std::vector<std::string> names;
+        names.reserve(snapshot.symbols.size());
+        for (const auto& symbol : snapshot.symbols) {
+            names.push_back(symbol.name);
+        }
+        snapshot.symbol_hash = migration::SymbolTable::HashNames(names);
+    }
+    {
+        std::vector<std::string> manifest;
+        manifest.reserve(modules.size());
+        for (const auto& module : modules) {
+            manifest.push_back(module.key);
+        }
+        snapshot.symbol_manifest = manifest;
+        snapshot.symbol_table_hash =
+            migration::SymbolTable::HashNames(manifest);
+    }
+    snapshot.flags = migration::kFlagCrossProcessReady |
+                     migration::kFlagSymbolized;
+    if (audit.code_ptrs != 0) {
+        snapshot.flags |= migration::kFlagHasCodePointers;
+    }
+    if (audit.stack_ptrs != 0) {
+        snapshot.flags |= migration::kFlagHasStackPointers;
+    }
+    if (!snapshot.handles.empty()) {
+        snapshot.flags |= migration::kFlagHasHandles;
+    }
+    {
+        std::ostringstream summary;
+        summary << "go2cpp Fiber 迁移镜像 v3：fiber#" << m_impl->m_id
+                << "，栈 " << snapshot.stack_bytes << " 字节，"
+                << snapshot.symbols.size() << " 个模块、"
+                << snapshot.relocations.size() << " 条重定位、"
+                << snapshot.handles.size() << " 个句柄；指针审计 stack="
+                << audit.stack_ptrs << " symbol=" << audit.symbol_ptrs
+                << " code=" << audit.code_ptrs << " heap=" << audit.heap_ptrs
+                << " handle=" << audit.handle_ptrs
+                << " other=" << audit.other_ptrs;
+        snapshot.summary = summary.str();
+    }
+
+    std::string write_error;
+    if (!migration::WriteSnapshotFile(path, snapshot, &write_error)) {
+        return fail("写入迁移镜像失败：" + write_error);
+    }
+    return true;
+}
+
+std::unique_ptr<Fiber> Fiber::ImportMigrationImage(
+    const std::string& path, const FiberMigrationOptions& options,
+    std::string* error) {
+    const auto fail = [error](const std::string& message) {
+        if (error != nullptr) {
+            *error = message;
+        }
+        return std::unique_ptr<Fiber>();
+    };
+
+    migration::Snapshot snapshot;
+    std::string read_error;
+    if (!migration::ReadSnapshotFile(path, &snapshot, &read_error)) {
+        return fail("读取迁移镜像失败：" + read_error);
+    }
+    (void)options.verify_signature;
+    if (options.verify_build_id) {
+        // 读取层已经做过一次；这里再显式检查一次，保证错误信息明确指向
+        // 「可执行文件不同」而不是后续的模块表缺失。
+        const std::uint64_t self_build = migration::SelfBuildIdHash();
+        if (snapshot.build_id_hash != 0 && self_build != 0 &&
+            snapshot.build_id_hash != self_build) {
+            return fail("快照的可执行文件 build-id 与当前进程不匹配"
+                        "（代码布局不同，拒绝恢复）");
+        }
+    }
+    if (snapshot.wait_kind != migration::kWaitNone &&
+        snapshot.wait_kind != migration::kWaitChannelRecv) {
+        return fail("当前只支持接收等待（<-ch）的迁移镜像");
+    }
+    if (snapshot.stack_bytes == 0 || snapshot.stack.empty()) {
+        return fail("迁移镜像没有 Fiber 栈内容");
+    }
+    if (snapshot.stack_bytes > snapshot.stack_size) {
+        return fail("迁移镜像的栈使用量超过栈大小");
+    }
+    if (snapshot.wait_kind != migration::kWaitNone && options.channel == nullptr) {
+        return fail("迁移镜像包含通道等待状态，导入选项必须提供 channel");
+    }
+
+    const auto modules = MigrationEnumerateModules();
+    std::map<std::string, const MigrationModuleSpan*> module_by_key;
+    for (const auto& module : modules) {
+        module_by_key[module.key] = &module;
+    }
+    std::map<std::uint32_t, std::uint64_t> module_bases;
+    for (const auto& symbol : snapshot.symbols) {
+        if (symbol.name.rfind(kMigrationModulePrefix, 0) != 0) {
+            continue;
+        }
+        const auto found = module_by_key.find(symbol.name);
+        if (found == module_by_key.end()) {
+            return fail("迁移镜像引用的模块未加载：" + symbol.name);
+        }
+        if (!symbol.display.empty()) {
+            std::uint64_t expected = 0;
+            std::uint64_t actual = 0;
+            if (!MigrationParseHexU64(symbol.display, &expected)) {
+                return fail("迁移镜像的模块 build-id 字段损坏：" + symbol.name);
+            }
+            if (expected != 0) {
+                if (!MigrationReadBuildIdHash(found->second->path, &actual) ||
+                    actual != expected) {
+                    return fail("模块 build-id 不匹配（版本漂移，拒绝恢复）：" +
+                                symbol.name);
+                }
+            }
+        }
+        module_bases[symbol.id] = found->second->base;
+    }
+
+    const std::size_t usable = MigrationRoundUpStackSize(
+        std::max<std::size_t>(Fiber::DefaultStackSize(),
+                              static_cast<std::size_t>(snapshot.stack_bytes)));
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+    auto stack = std::make_unique<FiberStack>(usable, 0U, false);
+#else
+    auto stack = std::make_unique<FiberStack>(usable);
+#endif
+    const auto new_top = reinterpret_cast<std::uint64_t>(stack->stack_pointer());
+    const auto new_bottom = reinterpret_cast<std::uint64_t>(stack->bottom());
+    if (new_top - new_bottom < snapshot.stack_bytes) {
+        return fail("新栈容量不足");
+    }
+    const std::uint64_t new_context = new_top - snapshot.stack_bytes;
+    std::memcpy(reinterpret_cast<void*>(new_context), snapshot.stack.data(),
+                snapshot.stack.size());
+
+    auto fiber = std::unique_ptr<Fiber>(new Fiber(Function{}));
+    Impl* const impl = fiber->m_impl.get();
+
+    std::map<std::uint32_t, std::uint64_t> handle_addresses;
+    std::uint64_t pending_slot = 0;
+    const migration::HandleRecord* node_handle = nullptr;
+    const migration::HandleRecord* control_handle = nullptr;
+    std::uint64_t channel_value_bytes = 0;
+    for (const auto& handle : snapshot.handles) {
+        if (handle.type == kMigrationHandleFiber) {
+            handle_addresses[handle.id] =
+                reinterpret_cast<std::uint64_t>(fiber.get());
+        } else if (handle.type == kMigrationHandleImpl) {
+            handle_addresses[handle.id] = reinterpret_cast<std::uint64_t>(impl);
+        } else if (handle.type == kMigrationHandleRecord) {
+            handle_addresses[handle.id] =
+                reinterpret_cast<std::uint64_t>(impl->m_record.get());
+        } else if (handle.type == kMigrationHandleChannel) {
+            if (options.channel == nullptr) {
+                return fail("迁移镜像包含通道等待状态，导入选项必须提供 channel");
+            }
+            if (handle.payload.size() < 3U * sizeof(std::uint64_t)) {
+                return fail("通道句柄内容损坏");
+            }
+            const std::uint64_t expected_size =
+                MigrationDecodeU64(handle.payload.data(), handle.payload.size(), 0);
+            if (expected_size != options.channel->MigrationObjectSize()) {
+                return fail("通道对象大小不匹配（等待值类型或通道实现不同）");
+            }
+            channel_value_bytes = MigrationDecodeU64(
+                handle.payload.data(), handle.payload.size(), 2U * sizeof(std::uint64_t));
+            handle_addresses[handle.id] =
+                options.channel->MigrationObjectAddress();
+        } else if (handle.type == kMigrationHandleStaleCaller ||
+                   handle.type == kMigrationHandleCleared) {
+            handle_addresses[handle.id] = 0;
+        } else if (handle.type == kMigrationHandleWaitSlot) {
+            if (handle.payload.size() < sizeof(std::uint64_t)) {
+                return fail("等待槽句柄内容损坏");
+            }
+            const std::uint64_t offset =
+                MigrationDecodeU64(handle.payload.data(), handle.payload.size(), 0);
+            if (offset + 2U * sizeof(std::uint64_t) > snapshot.stack_bytes) {
+                return fail("等待槽偏移超出栈范围");
+            }
+            pending_slot = new_context + offset;
+        } else if (handle.type == kMigrationHandleWaitNode) {
+            node_handle = &handle;
+        } else if (handle.type == kMigrationHandleWaitControl) {
+            control_handle = &handle;
+        } else {
+            return fail("未知的迁移句柄类型：" + handle.type);
+        }
+    }
+
+    if (snapshot.wait_kind != migration::kWaitNone) {
+        if (node_handle == nullptr || control_handle == nullptr) {
+            return fail("迁移镜像缺少等待节点/控制块句柄");
+        }
+        if (options.channel == nullptr) {
+            return fail("迁移镜像包含通道等待状态，导入选项必须提供 channel");
+        }
+        ChannelWaitState state;
+        state.kind = 1;
+        state.channel_address = snapshot.channel_va;
+        state.node_address = node_handle->old_address;
+        state.control_block = control_handle->old_address;
+        state.pending_slot = pending_slot;
+        state.value_bytes = channel_value_bytes;
+        ChannelWaitState adopted;
+        std::string adopt_error;
+        if (!options.channel->AdoptWaitState(state, &adopted, &adopt_error)) {
+            return fail("把等待者挂回通道失败：" + adopt_error);
+        }
+        handle_addresses[node_handle->id] = adopted.node_address;
+        handle_addresses[control_handle->id] = adopted.control_block;
+        options.channel->ReleaseMigrationHold();
+    }
+
+    for (const auto& relocation : snapshot.relocations) {
+        if (relocation.slot_offset + sizeof(std::uint64_t) > snapshot.stack_bytes) {
+            return fail("重定位槽偏移超出栈范围");
+        }
+        std::uint64_t value = 0;
+        if (relocation.kind == migration::kRelocStack) {
+            value = new_context + static_cast<std::uint64_t>(relocation.addend);
+        } else if (relocation.kind == migration::kRelocSymbol) {
+            const auto found = module_bases.find(relocation.target_id);
+            if (found == module_bases.end()) {
+                return fail("重定位引用了未解析的模块 id " +
+                            std::to_string(relocation.target_id));
+            }
+            value = found->second + static_cast<std::uint64_t>(relocation.addend);
+        } else if (relocation.kind == migration::kRelocHandle) {
+            const auto found = handle_addresses.find(relocation.target_id);
+            if (found == handle_addresses.end()) {
+                return fail("重定位引用了未重建的句柄 id " +
+                            std::to_string(relocation.target_id));
+            }
+            if (relocation.addend < 0) {
+                return fail("句柄重定位的偏移为负");
+            }
+            value = found->second + static_cast<std::uint64_t>(relocation.addend);
+        } else {
+            return fail("未知的重定位类型 " + std::to_string(relocation.kind));
+        }
+        std::memcpy(reinterpret_cast<void*>(new_context + relocation.slot_offset),
+                    &value, sizeof(value));
+    }
+
+    impl->m_stack = std::move(stack);
+    impl->m_stack_size = usable;
+    impl->m_context = reinterpret_cast<void*>(static_cast<std::uintptr_t>(new_context));
+    impl->m_caller = nullptr;
+    impl->m_migration_enabled.store(true, std::memory_order_release);
+    impl->m_migration_wait_active.store(false, std::memory_order_release);
+    impl->m_migration_channel = nullptr;
+    impl->m_migration_node = nullptr;
+    impl->m_migration_pending_slot = nullptr;
+    impl->m_migration_kind = 0;
+    impl->m_record->state.store(FiberState::Suspended, std::memory_order_release);
+    impl->m_record->reason.store(SuspendReason::Park, std::memory_order_release);
+    impl->m_record->alive.store(true, std::memory_order_release);
+    return fiber;
+}
+
+#endif  // GO2CPP_MIGRATION_API
 
 }  // namespace go2cpp

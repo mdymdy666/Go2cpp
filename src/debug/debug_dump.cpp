@@ -6,6 +6,7 @@
  */
 
 #include "go2cpp/debug/debug_dump.hpp"
+#include "go2cpp/debug/debug_server.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -39,6 +40,15 @@ std::string HexValue(std::uint64_t value) {
 }
 
 std::string BoolText(bool value) { return value ? "true" : "false"; }
+
+/// steady_clock 时间点转纳秒（timer dump 的 deadline 字段）。
+std::uint64_t ToSteadyNs(
+    std::chrono::steady_clock::time_point point) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            point.time_since_epoch())
+            .count());
+}
 
 }  // namespace
 
@@ -576,6 +586,167 @@ DumpPayload DumpIOManager(io::IOManager& manager) {
     return payload;
 }
 
+
+DumpPayload DumpTimer(const core::TimerService& service) {
+    ConsistencyStamp stamp = BeginConsistency();
+    const core::TimerDebugSnapshot snapshot = service.DebugSnapshot();
+    EndConsistency(stamp);
+
+    // 事件环里的 timer 事件（最近 8 条）：SUBSCRIBE 的文本行只有 7 列，
+    // 这里给出 timer_id/kind/deadline_ns/source_gid 的语义视图，
+    // 让 DUMP timer 一处就能核对事件字段。
+    std::vector<EventRecord> recent_timer_events;
+    if (EventRing::Enabled()) {
+        for (const auto& event : EventRing::Snapshot(0)) {
+            const auto code = static_cast<SchedEventCode>(event.code);
+            if (code == SchedEventCode::kTimerArm ||
+                code == SchedEventCode::kTimerFire ||
+                code == SchedEventCode::kTimerCancel ||
+                code == SchedEventCode::kTimerReschedule) {
+                recent_timer_events.push_back(event);
+            }
+        }
+        if (recent_timer_events.size() > 8U) {
+            recent_timer_events.erase(recent_timer_events.begin(),
+                                      recent_timer_events.end() - 8);
+        }
+    }
+
+    const std::uint64_t captured_ns = ToSteadyNs(snapshot.captured_at);
+    const std::uint64_t next_ns =
+        snapshot.next_deadline ? ToSteadyNs(*snapshot.next_deadline) : 0;
+    const std::uint64_t relative_ns =
+        snapshot.next_deadline && next_ns > captured_ns
+            ? next_ns - captured_ns
+            : 0;
+
+    TextDump text;
+    text.Head("go2cpp.dump.timer/1");
+    text.Key("consistent", "per_call");
+    AppendConsistency(text, stamp);
+    text.Key("steady_ns", SteadyNs());
+    text.Key("captured_at_ns", captured_ns);
+    text.Key("dump_seq", snapshot.seq);
+    text.Key("active", static_cast<std::uint64_t>(snapshot.active));
+    text.Key("next_deadline_ns", next_ns);
+    text.Key("next_deadline_in_ns", relative_ns);
+    text.Key("armed_total", snapshot.armed_total);
+    text.Key("stats.fired", snapshot.fired);
+    text.Key("stats.cancelled", snapshot.cancelled);
+    text.Key("stats.rescheduled", snapshot.rescheduled);
+    text.Key("stats.completed", snapshot.completed);
+    text.Key("stats.failed", snapshot.failed);
+    text.Key("source.count",
+             static_cast<std::uint64_t>(core::kTimerSourceCount));
+    for (std::size_t index = 0; index < snapshot.sources.size(); ++index) {
+        const auto source = static_cast<core::TimerSource>(index);
+        const std::string prefix =
+            std::string("source.") + core::TimerSourceName(source) + ".";
+        const auto& stats = snapshot.sources[index];
+        text.Key(prefix + "active", stats.active);
+        text.Key(prefix + "armed", stats.armed);
+        text.Key(prefix + "fired", stats.fired);
+        text.Key(prefix + "cancelled", stats.cancelled);
+        text.Key(prefix + "rescheduled", stats.rescheduled);
+        text.Key(prefix + "completed", stats.completed);
+        text.Key(prefix + "failed", stats.failed);
+    }
+    text.Key("running", snapshot.running);
+    text.Key("stopping", snapshot.stopping);
+    text.Key("thread.joinable", snapshot.thread_joinable);
+    text.KeyHex("thread.id", snapshot.thread_id);
+    text.Key("thread.state",
+             core::TimerThreadStateName(snapshot.thread_state));
+    text.Key("thread.wait_wakeups", snapshot.background_wait_wakeups);
+    text.Key("event_ring_supported", snapshot.event_ring_supported);
+    text.Key("timer_events.count",
+             static_cast<std::uint64_t>(recent_timer_events.size()));
+    for (std::size_t index = 0; index < recent_timer_events.size(); ++index) {
+        const auto& event = recent_timer_events[index];
+        const std::string prefix =
+            "timer_event." + std::to_string(index) + ".";
+        text.Key(prefix + "code",
+                 SchedEventCodeName(
+                     static_cast<SchedEventCode>(event.code)));
+        text.Key(prefix + "seq", event.seq);
+        text.Key(prefix + "timer_id", event.gid);
+        text.Key(prefix + "kind", event.arg3);
+        text.Key(prefix + "deadline_ns", event.arg2);
+        text.Key(prefix + "source_gid", event.arg4);
+    }
+
+    std::string json = "{\"schema\":\"go2cpp.dump.timer/1\",\"version\":1";
+    json += ",\"consistent\":\"per_call\"";
+    json += JsonConsistency(stamp);
+    json += ",\"steady_ns\":" + std::to_string(SteadyNs());
+    json += ",\"captured_at_ns\":" + std::to_string(captured_ns);
+    json += ",\"dump_seq\":" + std::to_string(snapshot.seq);
+    json += ",\"active\":" + std::to_string(snapshot.active);
+    json += ",\"next_deadline_ns\":" + std::to_string(next_ns);
+    json += ",\"next_deadline_in_ns\":" + std::to_string(relative_ns);
+    json += ",\"armed_total\":" + std::to_string(snapshot.armed_total);
+    json += ",\"stats\":{\"fired\":" + std::to_string(snapshot.fired) +
+            ",\"cancelled\":" + std::to_string(snapshot.cancelled) +
+            ",\"rescheduled\":" + std::to_string(snapshot.rescheduled) +
+            ",\"completed\":" + std::to_string(snapshot.completed) +
+            ",\"failed\":" + std::to_string(snapshot.failed) + "}";
+    json += ",\"source_count\":" +
+            std::to_string(static_cast<std::uint64_t>(
+                core::kTimerSourceCount));
+    json += ",\"sources\":{";
+    for (std::size_t index = 0; index < snapshot.sources.size(); ++index) {
+        if (index != 0) {
+            json += ',';
+        }
+        const auto source = static_cast<core::TimerSource>(index);
+        const auto& stats = snapshot.sources[index];
+        json += "\"";
+        json += core::TimerSourceName(source);
+        json += "\":{\"active\":" + std::to_string(stats.active);
+        json += ",\"armed\":" + std::to_string(stats.armed);
+        json += ",\"fired\":" + std::to_string(stats.fired);
+        json += ",\"cancelled\":" + std::to_string(stats.cancelled);
+        json += ",\"rescheduled\":" + std::to_string(stats.rescheduled);
+        json += ",\"completed\":" + std::to_string(stats.completed);
+        json += ",\"failed\":" + std::to_string(stats.failed) + "}";
+    }
+    json += "}";
+    json += ",\"running\":" + BoolText(snapshot.running);
+    json += ",\"stopping\":" + BoolText(snapshot.stopping);
+    json += ",\"thread\":{\"joinable\":" +
+            BoolText(snapshot.thread_joinable);
+    json += ",\"id\":\"" + HexValue(snapshot.thread_id) + "\"";
+    json += ",\"state\":\"";
+    json += core::TimerThreadStateName(snapshot.thread_state);
+    json += "\",\"wait_wakeups\":" +
+            std::to_string(snapshot.background_wait_wakeups) + "}";
+    json += ",\"event_ring_supported\":" +
+            BoolText(snapshot.event_ring_supported);
+    json += ",\"timer_events\":{\"count\":" +
+            std::to_string(recent_timer_events.size()) + ",\"recent\":[";
+    for (std::size_t index = 0; index < recent_timer_events.size(); ++index) {
+        if (index != 0) {
+            json += ',';
+        }
+        const auto& event = recent_timer_events[index];
+        json += "{\"code\":\"";
+        json += SchedEventCodeName(
+            static_cast<SchedEventCode>(event.code));
+        json += "\",\"seq\":" + std::to_string(event.seq);
+        json += ",\"timer_id\":" + std::to_string(event.gid);
+        json += ",\"kind\":" + std::to_string(event.arg3);
+        json += ",\"deadline_ns\":" + std::to_string(event.arg2);
+        json += ",\"source_gid\":" + std::to_string(event.arg4);
+        json += "}";
+    }
+    json += "]}}";
+
+    DumpPayload payload;
+    payload.text = text.Take();
+    payload.json = std::move(json);
+    return payload;
+}
+
 DumpPayload DumpEvents(std::size_t max) {
     DumpPayload payload;
     payload.text = EventRing::DumpText(max);
@@ -663,6 +834,16 @@ bool WriteDumpFile(const std::string& path, const DumpPayload& payload,
         }
     }
     return true;
+}
+
+
+bool RegisterTimer(const std::string& name, core::TimerService& service) {
+    if (name.empty()) {
+        return false;
+    }
+    return DebugServer::Instance().Register(
+        name, "TimerService active/next-deadline/source stats/thread state",
+        [&service]() { return DumpTimer(service); });
 }
 
 }  // namespace go2cpp::debug

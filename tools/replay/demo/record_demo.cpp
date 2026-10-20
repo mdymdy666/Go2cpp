@@ -161,5 +161,13 @@ int main(int argc, char** argv) {
         std::printf("[record] fault-injection: drop wake #%u was requested\n",
                     drop_wake_at);
     }
+    // 落盘失败（磁盘满 / 坏盘 / /dev/full）不能被当成成功：Finalize() 之后的
+    // error() 包含 short write 与 flush 失败，必须转成非零退出码并打印原因。
+    const std::string write_error = recorder.error();
+    if (!write_error.empty()) {
+        std::fprintf(stderr, "[record] 写入记录文件失败（%s）：%s\n", path,
+                     write_error.c_str());
+        return 2;
+    }
     return received.size() == demo::kTotalMessages ? 0 : 1;
 }

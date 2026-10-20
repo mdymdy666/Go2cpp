@@ -1,10 +1,10 @@
 # go2cpp-cli：统一命令行入口
 
-> 状态：v0.1.0，已与同期交付的三个模块**完成协议对齐**（2026-10-20 联调版，迁移对齐 v2 `G2CMIG02`）：
+> 状态：v0.1.0，已与同期交付的三个模块**完成协议对齐**（2026-10-20 联调版，迁移对齐 v3 `G2CMIG03`，兼容读 v2）：
 >
 > - DebugServer：`GO2CPP-DEBUG/1` 文本协议（`include/go2cpp/debug/debug_server.hpp`）；
 > - 重放：二进制 `G2CRPLY` 记录 + `replay` 工具（`tools/replay`）；
-> - 迁移：二进制 `G2CMIG02`（v2 符号化）快照 + `migrate` 工具（`tools/migration`）。
+> - 迁移：二进制 `G2CMIG03`（v3：safepoint id + 句柄 + 签名）快照 + `migrate` 工具（`tools/migration`）。
 >
 > 仍存在两处**后端能力缺口**（不是 CLI 缺陷），见第 5 节「待对齐」：
 > 通用 `GO2CPP_REPLAY` 记录注入、`migrate` 按 pid/gid 抓取运行中协程。
@@ -98,6 +98,7 @@ CLI 按以下顺序查找后端：`GO2CPP_*_TOOL` > 与 `go2cpp-cli` 同目录 >
 | `GO2CPP_DOCTOR_SOCKET` | 覆盖 Doctor socket 路径；默认 `/tmp/go2cpp-<pid>-doctor.sock`。仅 `doctor` 子命令使用。 |
 | `GO2CPP_CLI_TRACE=1` | 把协议请求/响应打到 stderr，用于排查协议问题。 |
 | `GO2CPP_REPLAY_TOOL` | 指定 `replay play` 的后端（`tools/replay` 的 `replay`）。 |
+| `GO2CPP_REPLAY_DROP_WAKE=N` | 丢弃第 N 次唤醒（故障注入）。CLI 不解析、原样继承给 `replay` 后端，用于复现 stuck。 |
 | `GO2CPP_MIGRATE_TOOL` | 指定 `migrate` 子命令的后端（`tools/migration` 的 `migrate`）。 |
 
 ---
@@ -190,7 +191,8 @@ go2cpp-cli replay record --out <file> -- <exe> [args...]
 ```
 
 - `--out <FILE>`：必需，记录文件路径（不能是 `-`）。可写在任意位置；
-  启动前删除同名旧文件，避免旧记录掩盖「本次没有记录」。
+  目标文件已存在或为目录时**直接拒绝**（exit 2），不删除任何现有文件——
+  避免误删目标程序或旧记录。
 - `<exe>` 之后的参数原样透传，包括以 `-` 开头的参数；要把 `--out` 传给目标程序，
   写在 `--` 之后。
 - 子进程环境：`GO2CPP_REPLAY=ON`、`GO2CPP_REPLAY_RECORD=<绝对路径>`。
@@ -221,12 +223,18 @@ go2cpp-cli replay play <file>
 
 1. 探测并校验记录文件：魔数 `G2CRPLY`（`tools/replay/include/replay/format.hpp`）；
 2. 查找后端 `replay`（`GO2CPP_REPLAY_TOOL` > 同目录 > PATH）；
-3. 找到则执行 `replay <绝对路径>`，stdio 继承终端，退出码透传
+3. 找到则执行 `replay play <绝对路径>`，**捕获 stdout 解析 JSON 报告**的
+   `replay_executed`；未真正重放时以 exit 3 拒绝；退出码透传
    （0=记录自洽，1=stuck/不一致，2=用法错误）；
 4. 找不到退出 3，并给出 `tools/replay` 的构建命令。
 
+故障注入：`GO2CPP_REPLAY_DROP_WAKE=N` 由 CLI 原样继承给后端（`fork`/`exec`
+不清理环境），`replay` 端在 `RunPlay` 中解析并丢弃第 N 次唤醒，从而复现
+`status=stuck`（退出码 1）。其它 `GO2CPP_REPLAY_*` 同样透传。
+
 ```bash
 go2cpp-cli replay play /tmp/run.g2cr
+GO2CPP_REPLAY_DROP_WAKE=20 go2cpp-cli replay play /tmp/run.g2cr   # 期望 stuck/exit 1
 ```
 
 ### 4.5 `migrate dump`
@@ -244,7 +252,7 @@ go2cpp-cli migrate dump --pid <pid> --gid <gid> --out <file>
 | `--out <FILE>` | 是 | 快照文件（二进制，不能是 `-`）。 |
 
 行为：调用 `migrate dump <file>`（`tools/migration`），并把 `MIGRATION_PID` /
-`MIGRATION_GID` 传给后端；成功后校验输出文件魔数 `G2CMIG02` 与 `version=2` 并打印摘要。
+`MIGRATION_GID` 传给后端；成功后校验输出文件魔数 `G2CMIG03` 与 `version=3`（兼容 `G2CMIG02`/v2）并打印摘要。
 
 > **能力缺口**：`tools/migration` 当前是 demo —— `dump` 只写它自己进程 A 的快照，
 > **不支持按 pid/gid 抓取运行中的协程**。CLI 会在 stderr 明确提示这一点，
@@ -260,12 +268,12 @@ go2cpp-cli migrate restore <file>
 
 流程：
 
-1. 校验快照魔数 `G2CMIG02` 且 `version=2`（`tools/migration/include/migration/format.hpp`）；
+1. 校验快照魔数 `G2CMIG03` 且 `version=3`；v2（`G2CMIG02`/`version=2`）仍可读（`tools/migration/include/migration/format.hpp`）；
 2. 查找后端 `migrate`（`GO2CPP_MIGRATE_TOOL` > 同目录 > PATH）；
 3. 找到则执行 `migrate restore <绝对路径>`，退出码透传；
 4. 找不到退出 3，并给出构建命令。
 
-注意：v2 快照允许 PIE/ASLR 导致的运行间地址变化，但仍要求生成方与恢复方是
+注意：v3/v2 快照允许 PIE/ASLR 导致的运行间地址变化，但仍要求生成方与恢复方是
 **同一可执行文件**（ELF build-id 校验）；Fiber 主体所在 SO 可以换版本。
 
 ```bash
@@ -282,7 +290,7 @@ go2cpp-cli debug <file> [--top <n>] [--json]
 
 | 参数 | 说明 |
 |---|---|
-| `<file>` | JSON dump、`# go2cpp-trace` 文本、ini dump、`G2CRPLY` 记录、`G2CMIG02` 快照。 |
+| `<file>` | JSON dump、`# go2cpp-trace` 文本、ini dump、`G2CRPLY` 记录、`G2CMIG03`/`G2CMIG02` 快照。 |
 | `--top <N>` | 时间线显示前 N 条，默认 20；0 表示全部。 |
 | `--json` | 以 JSON 输出统计。 |
 
@@ -291,7 +299,7 @@ go2cpp-cli debug <file> [--top <n>] [--json]
 - trace 文本：记录数、INPUT/OUTPUT 计数、事件类型分布、时间线；
 - ini：节数、键值行数、节名列表；
 - `G2CRPLY`：格式版本、header_size、producer_id；事件级报告交给 `replay` 工具；
-- `G2CMIG02`：版本、段数、fiber_id、栈大小；恢复/只读校验交给 `migrate`。
+- `G2CMIG03` / `G2CMIG02`：版本、段数、fiber_id、栈大小；恢复/只读校验交给 `migrate`。
 
 ```bash
 go2cpp-cli debug /tmp/dump.json
@@ -414,8 +422,8 @@ fiber_resume_ns,local_queue_pops,steal_pops}`。
 
 ### 5.2 可迁移协程（`b0888d42`）— 已对齐文件格式，能力待补齐
 
-- 快照格式：`G2CMIG02` + 192 字节头（version/header_size/section 表/build-id/CRC，
-  v2 地址已符号化），
+- 快照格式：`G2CMIG03` + 224 字节头（version/header_size/段表/build-id/CRC/签名，
+  v3 用 safepoint id + 句柄；`G2CMIG02` + 192 字节头的 v2 快照仍可读），
   见 `tools/migration/include/migration/format.hpp`；
 - CLI 的 `migrate dump` 调用 `migrate dump <file>`，`migrate restore` 调用
   `migrate restore <file>`；
@@ -426,7 +434,7 @@ fiber_resume_ns,local_queue_pops,steal_pops}`。
 1. `migrate dump` 目前不按 pid/gid 抓取运行中的协程（demo 只写自己的进程 A），
    需要后端提供「从目标进程导出指定 Fiber」的接口；届时 CLI 只需改
    `RunMigrateDumpImpl` 的参数传递；
-2. 快照要求恢复方与生成方同一二进制（`-no-pie` + build-id），CLI 只做格式校验，
+2. 快照要求恢复方与生成方同一二进制（build-id + 签名），CLI 只做格式校验，
    跨二进制恢复由后端拒绝；
 3. 若快照格式版本升级，`formats.cpp` 的魔数/版本读取与文档需同步。
 
@@ -434,7 +442,7 @@ fiber_resume_ns,local_queue_pops,steal_pops}`。
 
 - 记录格式：`G2CRPLY` + 32 字节头，记录 40 字节头 + 变长 payload + CRC32，
   `kEnd` 收尾，见 `tools/replay/include/replay/format.hpp`；
-- CLI 的 `replay play` 调用 `replay <file>`（该工具无子命令，stdout 输出 JSON 报告，
+- CLI 的 `replay play` 调用 `replay play <file>`（stdout 输出 JSON 报告，
   exit 0/1/2）；
 - `replay record` 已实现环境变量约定（`GO2CPP_REPLAY=ON` /
   `GO2CPP_REPLAY_RECORD`）与子进程生命周期。
@@ -459,7 +467,7 @@ fiber_resume_ns,local_queue_pops,steal_pops}`。
 BIN=./build-cli/tools/cli/go2cpp-cli bash tools/cli/tests/run_all.sh
 ```
 
-覆盖内容（198 项断言）：
+覆盖内容（断言数以 `run_all.sh` 的 PASS 汇总为准）：
 
 - 全部子命令 `--help`、主帮助、`help <cmd>`、版本、未知命令；
 - 参数错误（缺失/未知/重复/越界/多余位置参数/`--out -`）；
@@ -471,8 +479,8 @@ BIN=./build-cli/tools/cli/go2cpp-cli bash tools/cli/tests/run_all.sh
   二进制记录、未生成记录；
 - `replay play`：无后端、后端参数与退出码、文件不存在、空文件、非 `G2CRPLY` 格式；
 - `migrate dump/restore`：后端成功与退出码、pid 不存在、`--out -`、无后端、
-  非 `G2CMIG02` 格式、v1 旧魔数、空文件；
-- `debug`：JSON / trace / ini / `G2CRPLY` / `G2CMIG02` / 未知格式 / `--json`；
+  非迁移格式、v1 旧魔数、不支持的版本、空文件；
+- `debug`：JSON / trace / ini / `G2CRPLY` / `G2CMIG03` / `G2CMIG02` / 未知格式 / `--json`；
 - 随机参数 500 组（退出码必须在 0..5，无超时）；
 - 压测 200 次启动与 200 次 `status` 请求的 P50/P95/P99。
 

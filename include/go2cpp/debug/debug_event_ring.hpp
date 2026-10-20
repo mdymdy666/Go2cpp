@@ -146,6 +146,14 @@ enum class SchedEventCode : std::uint16_t {
     kChannelSend = 80, ///< 发送方即将 park：gid=0，arg2=capacity
     kChannelRecv = 81, ///< 接收方即将 park：gid=0，arg2=capacity
     kChannelWake = 82, ///< 唤醒一个已 park 的等待者：gid=0，arg2=1 sender/2 receiver
+
+    // 90~99：timer（TimerService 调试事件）。只在 GO2CPP_DEBUG_DUMP=ON
+    // 构建记录；固定字段映射见 EventRecord 的 arg3/arg4 注释。
+    // 追加新值，不复用旧值。
+    kTimerArm = 90,        ///< 注册：gid=timer_id，arg2=deadline_ns，arg3=kind，arg4=source_gid
+    kTimerFire = 91,       ///< 触发：字段同上（deadline_ns 为计划时间）
+    kTimerCancel = 92,     ///< 取消：字段同上
+    kTimerReschedule = 93, ///< 重排：字段同上（deadline_ns 为新的截止时间）
 };
 
 /// 事件码的稳定名字；未知值返回 "kUnknown"。
@@ -168,6 +176,8 @@ struct EventRecord {
     std::uint32_t tid{0};   ///< 线程 id 的 32 位哈希
     std::uint32_t pid{0};   ///< 当前线程绑定的 P；未绑定为 kInvalidProcessorId
     std::uint32_t reserved{0}; ///< 保留（显式零，保持 8 字节对齐与未来扩展）
+    std::uint64_t arg3{0};  ///< timer kind（0=kOnce/1=kFixedDelay/2=kFixedRate/3=executor）
+    std::uint64_t arg4{0};  ///< timer 来源 gid（source_gid；0=未知）
 };
 
 /**
@@ -199,6 +209,19 @@ public:
      */
     static void Record(SchedEventCode code, std::uint64_t gid,
                        std::uint64_t arg2) noexcept;
+
+    /**
+     * @brief 记录一条 timer 事件（字段语义见 EventRecord 注释）。
+     * @param code 必须是 kTimerArm/kTimerFire/kTimerCancel/kTimerReschedule。
+     * @param timer_id 定时器的调试标识（1 起；与句柄生命周期无关）。
+     * @param deadline_ns 计划截止时间（steady_clock 纳秒，同机可比）。
+     * @param kind 0=kOnce 1=kFixedDelay 2=kFixedRate 3=executor。
+     * @param source_gid 来源逻辑 fiber id（0=未知）。
+     * @note OFF 构建为空操作；不分配内存、不加锁。
+     */
+    static void RecordTimer(SchedEventCode code, std::uint64_t timer_id,
+                            std::uint64_t deadline_ns, std::uint8_t kind,
+                            std::uint32_t source_gid) noexcept;
 
     /**
      * @brief 发布当前线程绑定的 P（调度器在 worker 绑定 P 后调用）。
@@ -252,8 +275,22 @@ public:
     ::go2cpp::debug::EventRing::BindProcessor(static_cast<std::uint32_t>(pid))
 #define GO2CPP_DEBUG_UNBIND_PROCESSOR() \
     ::go2cpp::debug::EventRing::UnbindProcessor()
+#define GO2CPP_DEBUG_TIMER_EVENT(code, timer_id, deadline_ns, kind, source_gid) \
+    ::go2cpp::debug::EventRing::RecordTimer(                                 \
+        (code), static_cast<std::uint64_t>(timer_id),                        \
+        static_cast<std::uint64_t>(deadline_ns),                             \
+        static_cast<std::uint8_t>(kind),                                     \
+        static_cast<std::uint32_t>(source_gid))
 #else
 #define GO2CPP_DEBUG_EVENT(code, gid, arg2) ((void)0)
+#define GO2CPP_DEBUG_TIMER_EVENT(code, timer_id, deadline_ns, kind, source_gid) \
+    do {                                                                     \
+        (void)(code);                                                        \
+        (void)(timer_id);                                                    \
+        (void)(deadline_ns);                                                 \
+        (void)(kind);                                                        \
+        (void)(source_gid);                                                  \
+    } while (0)
 #define GO2CPP_DEBUG_BIND_PROCESSOR(pid) ((void)0)
 #define GO2CPP_DEBUG_UNBIND_PROCESSOR() ((void)0)
 #endif

@@ -577,11 +577,12 @@ migrate selftest            # SHA-256/HMAC 向量
 `VerifySnapshotFile`；格式层用 `ReadSnapshotFile` + `DescribeSnapshot`，
 符号层用 `SymbolTable::Instance()`，挂起点用 `SafepointTable::Instance()`。
 
-## 11. 生产版 `Fiber`/`Channel` 的 adopt API 设计（不实现）
+## 11. 生产版 `Fiber`/`Channel` 的 adopt API（已实现最小子集）
 
-> 本节只给设计：如何给真实 `go2cpp::Fiber` / `go2cpp::Channel` 加
-> `DumpTo` / `AdoptFrom`，需要哪些访问器、在哪些状态迁移点插入、有哪些风险。
-> **不修改 `src/**`**；demo 复用的是同一套底层上下文 ABI，不是同一批对象。
+> 本节原为设计稿，2026-10-20 已按此落地最小可用实现（见 §11.6–§11.8）。
+> 实现只在 `-DGO2CPP_MIGRATION_API=ON` 时参与编译与链接；默认构建不包含
+> 任何迁移代码、`Channel<T>` 没有额外基类、Fiber 布局与热路径不变。
+> §11.1–§11.5 保留原始设计，供后续扩展（发送等待、select、调度器接入）参考。
 
 ### 11.1 目标 API
 
@@ -706,6 +707,96 @@ public:
 5. **调度器集成**：run queue、M 绑定、取消/timer 拒绝策略；
 6. **安全加固**：密钥管理、权限、审计（key_id/build-id/epoch）。
 
+### 11.6 落地实现（`GO2CPP_MIGRATION_API=ON`）
+
+#### 构建面
+
+- `cmake -DGO2CPP_MIGRATION_API=ON` 打开；默认 OFF。
+- OFF：不编译迁移实现、不链接格式层，`Channel<T>` 无额外基类/虚表，Fiber 布局不变；
+  默认构建的 ctest 116 项与热路径零变化。
+- ON：`go2cpp_fiber` 私有链接 `go2cpp_migration_format`（复用 `tools/migration` 的
+  format/sha256/signature/symbol_table，不编译它的 runtime/CLI）；所有 go2cpp 模块
+  关闭 stack protector（挂起帧的 canary 无法跨进程）；新增
+  `go2cpp_fiber_adopt_demo` 与反例 `go2cpp_fiber_adopt_demo_alt`，两者都不注册 ctest。
+
+#### 迁移等待路径（关键设计）
+
+`Channel<T>::RecvUntil` 在以下条件同时满足时走迁移路径，否则保持原行为：
+
+- 当前 Fiber 显式调用 `EnableMigration()`；
+- 无缓冲（capacity==0）、接收队列为空、未关闭、无 context/deadline、非 nonblocking。
+
+迁移路径**不进入 `ParkingCondition`**：它创建 `PendingRecv`、挂到 `m_receivers`，把
+`{channel, node, &pending, kind}` 登记到 Fiber 的迁移槽，然后直接
+`Fiber::Suspend(Park)`。这样挂起栈帧里没有 `WaitNode`/Scheduler/Task 等跨进程无效
+引用；唤醒由宿主在 `Send` 后调用 `Fiber::resume()` 完成（demo 顺序：导入 → Send →
+resume）。`make_shared` 与 deque 入队放在 noinline 辅助函数里，把分配器临时留在
+独立栈帧，避免污染导出时的指针审计。
+
+#### 导出 `Fiber::ExportMigrationImage(path, options, error)`
+
+1. 校验：`EnableMigration` + 迁移槽活跃 + 状态 Suspended + `kind==recv` +
+   `Channel::ExportWaitState` 成功（无缓冲、恰好一个等待者、无 select、未关闭）；
+2. 记录上下文保存区 `m_context`、栈 `[bottom, top)`、栈使用量、等待通道/节点/
+   shared_ptr 槽；
+3. 以 `{Fiber, Impl, FiberRecord, Channel, WaitNode, WaitControl, StaleCaller,
+   WaitSlot}` 为「可重定位对象」，扫描 `[ctx, top)` 每个 8 字节槽：
+   - 栈内 → `kRelocStack`（相对 ctx 的偏移）；
+   - 已登记对象区间 → `kRelocHandle`（type + 区间内 addend）；
+   - 模块内地址（任意 PT_LOAD 段，代码或数据）→ `kRelocSymbol`
+     （`module:<realpath>` + 模块内偏移；build-id 哈希写在 `display`）；
+   - 其他可写映射/堆 → 默认拒绝（指针审计）；`allow_dead_heap_slots=true` 时
+     登记为 `ClearedHeapSlot`，恢复后该槽写 0；
+4. 写 G2CMIG03 快照（CRC32 + HMAC-SHA256 + build-id）；`safepoint_id=0`，恢复点由
+   上下文保存区的 rip 决定，不需要 safepoint 槽。
+
+#### 导入 `Fiber::ImportMigrationImage(path, options, error)`
+
+1. `ReadSnapshotFile` 校验 magic/version/CRC/HMAC/可执行文件 build-id；
+2. 按模块真实路径 + build-id 重新解析代码/数据地址，按句柄重建对象；
+3. 新建独立 Fiber（固定栈，容量至少覆盖快照栈字节），把栈拷贝到
+   `new_ctx = new_top - stack_bytes`，逐槽重定位：
+   `kRelocStack` 相对 ctx、`kRelocSymbol` 模块基址+偏移、`kRelocHandle` 新地址+addend；
+4. `Channel::AdoptWaitState` 新建 `PendingRecv` 挂回 `m_receivers`，并在新栈的
+   shared_ptr 槽上 placement-new 接管一份真实引用（旧槽字节直接覆盖，不调用旧进程
+   控制块的析构）；随后 `ReleaseMigrationHold()`；
+5. 设置 `m_context=new_ctx`、`m_stack`、状态 Suspended、`m_migration_enabled=true`；
+   不自动 resume。
+
+#### 恢复语义
+
+`resume()` → `resume_locked` 看到 Suspended + 非空 `m_context` → `JumpContext(new_ctx,
+this)` 跳回 `Impl::suspend` 的 `JumpContext` 返回点；`suspend()` 收尾把 `m_caller`
+刷新为本进程调用者上下文；channel 等待路径重新加锁、读取已就绪节点并返回，用户
+Fiber 继续执行到结束，`Impl::entry` 跳回本进程 `resume_locked`。
+
+### 11.7 限制与安全边界
+
+- **只支持接收等待**（`<-ch`）：无缓冲、单生产者单消费者、无 select；发送等待/
+  有缓冲/多等待者/已关闭/带 deadline 或 context 一律明确拒绝；
+- **必须显式 `EnableMigration()`**；未开启的 Fiber 仍走原 `ParkingCondition` 路径；
+- **唤醒由宿主负责**：迁移等待路径不用 Scheduler park 协议，`Send` 只完成节点交接，
+  不 resume Fiber；导入方必须显式 `resume()`；
+- **旧进程**：导出不改变原 Fiber；旧进程应把该 Fiber 视为已放弃（demo 直接
+  `_Exit`），不能继续 resume；
+- **canary**：迁移构建必须关闭 stack protector；默认构建不受影响；
+- **`allow_dead_heap_slots`**：真实等待路径会留下容器内部死值（deque block、临时
+  shared_ptr），默认拒绝导出；受控 demo 显式打开后清零。生产应消除残留或扩展句柄化；
+- **模块 build-id**：可执行文件与引用模块必须同 build-id，跨版本明确拒绝；
+- **签名**：默认强制 HMAC-SHA256，密钥走 `MIGRATION_SIGNING_KEY[_FILE]`；未签名
+  快照拒绝生成/拒绝恢复；
+- **未验证**：跨机器、跨架构、调度器自动接入、异常展开中的栈、持有锁的挂起点、
+  select/发送等待。
+
+### 11.8 验证
+
+- 跨进程 demo：`./go2cpp_fiber_adopt_demo dump /tmp/x.mig` →
+  `restore /tmp/x.mig`；输出「fiber 继续执行，收到消息 = 42」、状态 Completed；
+- `selftest` 8 个场景：正常闭环、100 次随机值重复恢复（打印平均耗时）、篡改快照
+  拒绝、无密钥导出拒绝、多等待者拒绝、未登记堆指针拒绝、已关闭通道拒绝、其他
+  build-id 快照拒绝；
+- 默认构建 `ctest` 116/116；`tools/migration` 独立构建场景保持 53/53。
+
 ## 12. 签名密钥管理
 
 ### 12.1 密钥来源与格式
@@ -758,5 +849,9 @@ export MIGRATION_SIGNING_KEY_FILE=/etc/go2cpp/migration.key
 - **句柄表可用**：`std::string` + 自定义 POD 跨进程重建并逐字段校验；
   未登记堆指针仍明确拒绝；
 - **签名可用**：HMAC-SHA256 强制校验，错误/缺失/未签名/篡改全部拒绝；
-- **剩余边界**：栈帧布局必须稳定、IPA 克隆必须关闭、真实 `Fiber`/`Channel`
-  需要 §11 的 adopt API 与调度器配合。
+- **真实对象已可迁移（最小子集）**：`GO2CPP_MIGRATION_API=ON` 下
+  `Fiber::ExportMigrationImage/ImportMigrationImage` 与 `Channel<T>` 的
+  等待状态导出/接纳已落地，跨进程 demo 与 8 场景 selftest 通过；
+- **剩余边界**：只支持无缓冲单生产者单消费者的接收等待；唤醒由宿主 resume，
+  尚未接入调度器自动唤醒；栈帧布局必须稳定、IPA 克隆必须关闭；
+  `allow_dead_heap_slots` 是受控降级，不是安全边界。

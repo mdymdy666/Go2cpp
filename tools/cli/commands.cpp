@@ -11,7 +11,8 @@
  * - `migrate dump` / `migrate restore`：外部可执行 `migrate`
  *   （`tools/migration`，产物名 `migrate`），子命令 `dump|restore <file>`。
  * - `replay play`：外部可执行 `replay`（`tools/replay`，产物名 `replay`），
- *   唯一参数是记录文件，stdout 输出 JSON 报告。
+ *   传 `play <文件>` 子命令，stdout 输出 JSON 报告；CLI 解析
+ *   `replay_executed`，未真正重放时以退出码 3 拒绝。
  * - `replay record`：设置 `GO2CPP_REPLAY=ON` 与 `GO2CPP_REPLAY_RECORD` 后
  *   fork/exec；当前重放后端只提供 demo 记录器，通用注入待对齐。
  *
@@ -19,11 +20,11 @@
  *
  * - DebugServer 一个连接只处理一条命令，`DebugClient::Call` 每次新建连接；
  *   status 需要两次调用（STATUS + JSON scheduler）。
- * - `replay record` 启动前删除同名旧记录文件：否则「程序没写记录」会被旧文件
- *   掩盖成假成功。只删普通文件，不删目录。
+ * - `replay record` 拒绝覆盖已存在的 `--out`（不再启动前删除）：否则用户误指
+ *   一个已有文件（甚至是被记录程序本身）会被不可恢复地删除。
  * - 子进程退出码原样返回；被信号杀死返回 128+signo。
- * - 后端 stdout/stderr 直接继承终端，CLI 不捕获 —— 重放/迁移工具的输出本身
- *   就是结果的一部分。
+ * - 后端 stdout 在 `replay play` 中被捕获用于解析 JSON 报告；stderr 仍继承
+ *   终端 —— 错误信息不该藏进缓冲区。
  */
 
 #include "commands.hpp"
@@ -62,6 +63,8 @@ namespace {
 constexpr int kDefaultTimeoutMs = 5000;
 constexpr int kMaxTimeoutMs = 600000;
 constexpr std::uint64_t kMaxFileBytes = 64ULL * 1024ULL * 1024ULL;
+/// 后端 stdout 捕获上限：重放报告 JSON 默认不含 timeline，16MiB 足够。
+constexpr std::uint64_t kMaxCaptureBytes = 16ULL * 1024ULL * 1024ULL;
 
 std::string EnvNonEmpty(const char* name) {
     const char* value = std::getenv(name);
@@ -513,6 +516,133 @@ int RunBackend(const std::string& program, const std::vector<std::string>& argum
     return WEXITSTATUS(status);
 }
 
+/// 后端捕获结果：退出码 + 完整 stdout（stderr 仍继承终端）。
+struct CapturedBackend {
+    int exit_code{0};
+    std::string output;
+};
+
+/**
+ * @brief 启动外部后端并捕获其 stdout。
+ *
+ * `replay play` 必须把引擎的 JSON 报告解析回来（`replay_executed`），
+ * 不能像其它后端那样让 stdout 直接继承终端。stderr 仍继承终端：
+ * 错误信息不应藏进缓冲区。最多保留 `kMaxCaptureBytes`，超出部分丢弃，
+ * 防止畸形后端用无限输出打爆 CLI。
+ *
+ * @return 子进程退出码 + stdout；被信号杀死时退出码为 128+signo。
+ * @throws CliError 后端无法执行（`kUnavailable`）或管道/fork 失败（`kFailure`）。
+ */
+CapturedBackend RunBackendCapture(const std::string& program,
+                                  const std::vector<std::string>& arguments) {
+    int output_pipe[2] = {-1, -1};
+    if (::pipe(output_pipe) != 0) {
+        throw CliError(ExitCode::kFailure,
+                       "创建子进程输出管道失败：" + std::string(std::strerror(errno)));
+    }
+    int error_pipe[2] = {-1, -1};
+    if (::pipe(error_pipe) != 0) {
+        const int saved = errno;
+        ::close(output_pipe[0]);
+        ::close(output_pipe[1]);
+        throw CliError(ExitCode::kFailure,
+                       "创建子进程错误管道失败：" + std::string(std::strerror(saved)));
+    }
+    ::fcntl(output_pipe[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(error_pipe[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(error_pipe[1], F_SETFD, FD_CLOEXEC);
+
+    std::fflush(nullptr);
+    const pid_t child = ::fork();
+    if (child < 0) {
+        const int saved = errno;
+        ::close(output_pipe[0]);
+        ::close(output_pipe[1]);
+        ::close(error_pipe[0]);
+        ::close(error_pipe[1]);
+        throw CliError(ExitCode::kFailure, "fork 失败：" + std::string(std::strerror(saved)));
+    }
+    if (child == 0) {
+        ::close(output_pipe[0]);
+        ::close(error_pipe[0]);
+        if (::dup2(output_pipe[1], STDOUT_FILENO) < 0) {
+            const int saved = errno;
+            const ssize_t ignored = ::write(error_pipe[1], &saved, sizeof(saved));
+            (void)ignored;
+            ::_exit(127);
+        }
+        ::close(output_pipe[1]);
+        std::vector<char*> argv;
+        argv.reserve(arguments.size() + 2);
+        argv.push_back(const_cast<char*>(program.c_str()));
+        for (const std::string& argument : arguments) {
+            argv.push_back(const_cast<char*>(argument.c_str()));
+        }
+        argv.push_back(nullptr);
+        ::execv(program.c_str(), argv.data());
+        const int saved = errno;
+        const ssize_t ignored = ::write(error_pipe[1], &saved, sizeof(saved));
+        (void)ignored;
+        ::_exit(127);
+    }
+
+    ::close(output_pipe[1]);
+    ::close(error_pipe[1]);
+
+    int child_errno = 0;
+    ssize_t error_read = 0;
+    do {
+        error_read = ::read(error_pipe[0], &child_errno, sizeof(child_errno));
+    } while (error_read < 0 && errno == EINTR);
+    ::close(error_pipe[0]);
+
+    CapturedBackend result;
+    char buffer[64 * 1024];
+    for (;;) {
+        const ssize_t count = ::read(output_pipe[0], buffer, sizeof(buffer));
+        if (count > 0) {
+            const std::size_t received = static_cast<std::size_t>(count);
+            if (result.output.size() < kMaxCaptureBytes) {
+                const std::size_t room = kMaxCaptureBytes - result.output.size();
+                result.output.append(buffer, std::min(received, room));
+            }
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+    ::close(output_pipe[0]);
+
+    int status = 0;
+    for (;;) {
+        const pid_t waited = ::waitpid(child, &status, 0);
+        if (waited >= 0) {
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        throw CliError(ExitCode::kFailure,
+                       "waitpid 失败：" + std::string(std::strerror(errno)));
+    }
+    if (error_read == static_cast<ssize_t>(sizeof(child_errno))) {
+        throw CliError(ExitCode::kUnavailable,
+                       "无法启动后端 '" + program + "'：" +
+                           std::string(std::strerror(child_errno)));
+    }
+    if (WIFSIGNALED(status)) {
+        const int signal_number = WTERMSIG(status);
+        std::fprintf(stderr, "go2cpp-cli: 后端被信号 %d（%s）终止\n", signal_number,
+                     strsignal(signal_number));
+        result.exit_code = 128 + signal_number;
+        return result;
+    }
+    result.exit_code = WEXITSTATUS(status);
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // dump / status
 // ---------------------------------------------------------------------------
@@ -895,12 +1025,20 @@ int RunReplayRecord(const std::vector<std::string>& args) {
         throw CliError(ExitCode::kFailure,
                        "输出目录不存在：'" + parent.string() + "'");
     }
-    if (std::filesystem::is_regular_file(out_absolute, filesystem_error) && !filesystem_error) {
-        if (!std::filesystem::remove(out_absolute, filesystem_error) || filesystem_error) {
-            throw CliError(ExitCode::kFailure,
-                           "无法删除旧的记录文件 '" + out_absolute + "'：" +
-                               filesystem_error.message());
-        }
+    // 绝不在启动被记录程序之前删除 --out（P2-5）：
+    // 1) 用户可能误指一个已有文件（甚至是被记录程序本身），删除不可恢复；
+    // 2) 「旧记录掩盖本次没有记录」应当用「已存在即拒绝」解决，而不是删除。
+    if (std::filesystem::is_directory(out_absolute, filesystem_error) && !filesystem_error) {
+        throw CliError(ExitCode::kUsage,
+                       "'--out' 指向目录：'" + out_absolute + "'（需要文件路径）");
+    }
+    filesystem_error.clear();
+    if (std::filesystem::exists(out_absolute, filesystem_error) && !filesystem_error) {
+        throw CliError(
+            ExitCode::kUsage,
+            "记录文件已存在，拒绝覆盖：'" + out_absolute + "'\n"
+            "  replay record 会在被记录程序退出后写入该路径，启动前删除会不可恢复地\n"
+            "  销毁原文件。请先删除/改名该文件，或改用新的 --out 路径。");
     }
 
     int error_pipe[2] = {-1, -1};
@@ -1037,8 +1175,45 @@ int RunReplayPlay(const std::vector<std::string>& args) {
             "    cmake -S tools/replay -B build-replay && cmake --build build-replay -j\n"
             "  也可设置 GO2CPP_REPLAY_TOOL=<path> 指向它。");
     }
-    // tools/replay 的 `replay` 只接受一个位置参数（记录文件），stdout 输出 JSON 报告。
-    return RunBackend(backend, {AbsolutePath(probe.path)});
+    // 必须把 `play` 子命令传给引擎：只传记录文件路径时，引擎会退化执行
+    // `info`（静态分析），CLI 却返回成功——重放语义完全丢失（P1-2）。
+    // 环境变量（GO2CPP_REPLAY_DROP_WAKE 等故障注入参数）由 fork/exec 原样
+    // 继承给后端；CLI 不过滤/清空环境，replay 端 RunPlay 负责解析（D4）。
+    const CapturedBackend backend_result =
+        RunBackendCapture(backend, {"play", AbsolutePath(probe.path)});
+    if (!backend_result.output.empty()) {
+        const std::size_t written =
+            std::fwrite(backend_result.output.data(), 1, backend_result.output.size(), stdout);
+        (void)written;
+        std::fflush(stdout);
+    }
+    if (backend_result.exit_code != 0) {
+        // 退出码 3 = 引擎没有可用的 RECORD_FIBER_ENTRY；2 = 格式/用法错误；
+        // 1 = stuck/不一致。原样透传给 CI。
+        return backend_result.exit_code;
+    }
+    // 退出码 0 还不够：必须确认引擎真的执行了重放，而不是只做了静态分析。
+    bool replay_executed = false;
+    try {
+        const nlohmann::json report = nlohmann::json::parse(backend_result.output);
+        replay_executed = report.value("replay_executed", false);
+    } catch (const std::exception&) {
+        throw CliError(
+            ExitCode::kUnavailable,
+            "重放引擎的输出不是可解析的 JSON 报告：'" + probe.path + "'\n"
+            "  需要 tools/replay 的 `replay play <file>`（输出 replay_executed 字段）。\n"
+            "  确认 GO2CPP_REPLAY_TOOL 指向当前 tools/replay 的构建。");
+    }
+    if (!replay_executed) {
+        // 后端退化为静态分析（例如把 `play` 当成记录文件路径）时，绝不能
+        // 把「未重放」当成功上报告给 CI。
+        throw CliError(
+            ExitCode::kUnavailable,
+            "重放引擎没有执行重放（replay_executed=false）：'" + probe.path + "'\n"
+            "  后端可能把 `play` 当成记录文件路径而退化为静态分析；\n"
+            "  确认 GO2CPP_REPLAY_TOOL 指向支持 `replay play <file>` 的构建。");
+    }
+    return 0;
 }
 
 int RunReplayImpl(const std::vector<std::string>& args) {
@@ -1062,18 +1237,19 @@ int RunReplayImpl(const std::vector<std::string>& args) {
 // migrate
 // ---------------------------------------------------------------------------
 
-/// 校验迁移快照版本必须是 v2；v1（G2CMIG01）已由 tools/migration 移除。
-/// 只做头部版本检查，完整 CRC/段表校验交给后端的 `migrate verify`。
-void RequireMigrationV2(const FileProbe& probe) {
+/// 校验迁移快照版本：v3（G2CMIG03）是当前写版本，v2（G2CMIG02）保留兼容读；
+/// v1（G2CMIG01）已由 tools/migration 移除。只做头部版本检查，完整 CRC/段表/
+/// 签名校验交给后端的 `migrate verify`。
+void RequireMigrationSupported(const FileProbe& probe) {
     if (probe.format != FileFormat::kMigrationBinary) {
         return;
     }
     const std::uint32_t version = MigrationFormatVersion(probe.head);
-    if (version != 2) {
+    if (version != 3 && version != 2) {
         throw CliError(ExitCode::kFormat,
                        "迁移快照版本不支持：'" + probe.path + "' 的 version=" +
                            std::to_string(version) +
-                           "；tools/migration v2 只接受 version=2（魔数 G2CMIG02）。");
+                           "；CLI 接受 v3（魔数 G2CMIG03，当前写版本）与 v2（G2CMIG02，兼容读）。");
     }
 }
 
@@ -1145,7 +1321,7 @@ int RunMigrateDumpImpl(const std::vector<std::string>& args) {
                        "迁移后端返回成功，但输出文件不是有效快照：'" + out_absolute +
                            "'（" + probe.detail + "）");
     }
-    RequireMigrationV2(probe);
+    RequireMigrationSupported(probe);
     std::printf("迁移快照: %s（%s，%s）\n", out_absolute.c_str(),
                 FormatBytes(probe.size).c_str(), probe.detail.c_str());
     std::fflush(stdout);
@@ -1163,10 +1339,10 @@ int RunMigrateRestoreImpl(const std::vector<std::string>& args) {
     if (probe.format != FileFormat::kMigrationBinary) {
         throw CliError(ExitCode::kFormat,
                        "迁移文件格式不匹配：'" + probe.path + "'\n"
-                       "  期望迁移快照（魔数 G2CMIG02，由 tools/migration v2 生成）；实际：" +
+                       "  期望迁移快照（魔数 G2CMIG03，兼容 v2 G2CMIG02，由 tools/migration 生成）；实际：" +
                            probe.detail);
     }
-    RequireMigrationV2(probe);
+    RequireMigrationSupported(probe);
 
     const std::string backend =
         FindBackend({"go2cpp-migrate", "go2cpp_migrate", "migrate"}, "GO2CPP_MIGRATE_TOOL");
@@ -1179,7 +1355,7 @@ int RunMigrateRestoreImpl(const std::vector<std::string>& args) {
             "  但恢复需要 tools/migration 构建出的 migrate 可执行文件：\n"
             "    cmake -S tools/migration -B build-migration && cmake --build build-migration -j\n"
             "  也可设置 GO2CPP_MIGRATE_TOOL=<path> 指向它。\n"
-            "  注意：v2 允许多次运行间 PIE/ASLR 地址变化，但仍要求生成方与恢复方\n"
+            "  注意：v3/v2 都允许运行间 PIE/ASLR 地址变化，但仍要求生成方与恢复方\n"
             "  是同一可执行文件（ELF build-id 校验）；SO 版本可以不同。");
     }
     return RunBackend(backend, {"restore", AbsolutePath(probe.path)});
@@ -1622,7 +1798,7 @@ int RunDebugImpl(const std::vector<std::string>& args) {
     throw CliError(ExitCode::kFormat,
                    "无法识别的文件格式：'" + probe.path + "'\n  实际：" + probe.detail +
                        "\n  支持 JSON dump、'# go2cpp-trace' 文本、ini dump、"
-                       "G2CRPLY 重放记录与 G2CMIG02 迁移快照");
+                       "G2CRPLY 重放记录与 G2CMIG03/G2CMIG02 迁移快照");
 }
 
 }  // namespace

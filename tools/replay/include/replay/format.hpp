@@ -60,8 +60,8 @@ namespace go2cpp::replay {
 
 /// 文件魔数（8 字节，含结尾 NUL）。
 inline constexpr char kMagic[8] = {'G', '2', 'C', 'R', 'P', 'L', 'Y', '\0'};
-/// 写端版本：v2 在 v1 基础上**只追加** vtime/data/case/timer/ctx 字段。
-inline constexpr std::uint16_t kFormatVersion = 2;
+/// 写端版本：v3 在 v2 基础上只追加 TimerService 的 timer 字段。
+inline constexpr std::uint16_t kFormatVersion = 3;
 /// 读端接受的最小版本。v1 文件没有 v2 的追加字段，解码器按剩余字节判断。
 inline constexpr std::uint16_t kMinFormatVersion = 1;
 inline constexpr std::uint32_t kFileHeaderSize = 32;
@@ -113,12 +113,17 @@ enum class SelectCaseKind : std::uint8_t {
     kContext = 4, ///< <-ctx.Done()
 };
 
-/// `kTimer` 的 kind。
+/// `kTimer` 的 kind（稳定编号，只追加）。
 enum class TimerKind : std::uint8_t {
     kSleep = 0,            ///< 一次 sleep（重放时按记录瞬间推进虚拟时钟）
     kDeadlineSet = 1,      ///< 设置 deadline
     kDeadlineExceeded = 2, ///< deadline 到期
     kTimeoutSelected = 3,  ///< select 的 timeout case 被选中
+    // v3：TimerService 回放（一次定时器的完整生命周期）
+    kServiceArm = 4,        ///< 注册（Schedule/ScheduleEvery）
+    kServiceFire = 5,       ///< 回调执行（fired_at_ns / callback_result）
+    kServiceCancel = 6,     ///< 取消（取消后不再触发）
+    kServiceReschedule = 7, ///< 周期重排（下一次 deadline）
 };
 
 /// `kCtx` 的 kind。
@@ -218,6 +223,12 @@ struct Event {
     std::uint32_t clock_mode{0};///< kMeta 的时钟模式
     std::vector<SelectCaseRecord> cases;  ///< kSelect 的 case 表
     std::string note;
+    // ---- v3：kTimer（TimerService）的追加字段 ----
+    std::uint32_t timer_id{0};       ///< 定时器标识（录制端分配，1 起）
+    std::uint32_t timer_source{0};   ///< TimerSource（0=unknown/1=context/2=pc/3=channel/4=timed_mutex/5=scheduler/6=sleep/7=user）
+    std::uint64_t deadline_ns{0};    ///< 绝对的虚拟截止时间（相对录制起点）
+    std::uint64_t fired_at_ns{0};    ///< 回调开始执行时的虚拟时间
+    std::int64_t callback_result{0}; ///< 回调返回值（重放时校验一致）
 };
 
 /**

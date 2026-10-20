@@ -2,7 +2,7 @@
  * @file formats.cpp
  * @brief `formats.hpp` 的实现。
  *
- * @details 探测顺序刻意把**二进制魔数**放在最前：`G2CRPLY\0` 与 `G2CMIG02`
+ * @details 探测顺序刻意把**二进制魔数**放在最前：`G2CRPLY\0`、`G2CMIG03` 与 `G2CMIG02`
  *          都包含 NUL，先做文本判断会把它们当成「无法识别的乱码」。之后的
  *          顺序是 trace 头 → JSON → ini，其中 `[scheduler]` 与 JSON 数组的
  *          歧义由 `IsIniSectionLine` 解决（详见该函数注释）。
@@ -32,6 +32,7 @@ constexpr std::size_t kIniScanLines = 32;
 constexpr std::size_t kProbeHeadBytes = kHeadBytes;
 
 const std::string_view kMigrationMagicView(kMigrationMagic, sizeof(kMigrationMagic));
+const std::string_view kMigrationMagicV2View(kMigrationMagicV2, sizeof(kMigrationMagicV2));
 const std::string_view kReplayMagicView(kReplayMagic, sizeof(kReplayMagic));
 
 /// 去掉 UTF-8 BOM；`head` 原地修改，避免复制。
@@ -149,7 +150,8 @@ std::uint16_t ReplayFormatVersion(const std::string& head) {
 
 std::uint32_t MigrationFormatVersion(const std::string& head) {
     // Header: magic[0,8) + version u32@8 + header_size u32@12 + ...
-    if (!StartsWith(head, kMigrationMagicView)) {
+    // v3（G2CMIG03）与 v2（G2CMIG02）的版本字段偏移一致，可共用解析。
+    if (!StartsWith(head, kMigrationMagicView) && !StartsWith(head, kMigrationMagicV2View)) {
         return 0;
     }
     return ReadLeU32(head, 8);
@@ -186,10 +188,14 @@ FileProbe ProbeFile(const std::string& path, std::uint64_t max_bytes) {
     }
     StripUtf8Bom(&probe.head);
 
-    // 二进制魔数优先：两个格式的魔数都含 NUL 或非文本字节。
-    if (StartsWith(probe.head, kMigrationMagicView)) {
+    // 二进制魔数优先：三个格式的魔数都含 NUL 或非文本字节。
+    // v3 是当前写版本；v2 仍可读，因此两种魔数都归入 kMigrationBinary。
+    if (StartsWith(probe.head, kMigrationMagicView) ||
+        StartsWith(probe.head, kMigrationMagicV2View)) {
         probe.format = FileFormat::kMigrationBinary;
-        probe.detail = "迁移快照（G2CMIG02，版本 " +
+        const char* magic =
+            StartsWith(probe.head, kMigrationMagicView) ? "G2CMIG03" : "G2CMIG02";
+        probe.detail = "迁移快照（" + std::string(magic) + "，版本 " +
                        std::to_string(MigrationFormatVersion(probe.head)) + "）";
         return probe;
     }

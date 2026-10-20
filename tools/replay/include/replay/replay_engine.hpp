@@ -117,6 +117,15 @@ struct ReplayStats {
     std::uint64_t closes{0};
     std::uint64_t selects{0};
     std::uint64_t timers{0};
+    // v3：TimerService 生命周期细分与 fire 序列校验和。
+    std::uint64_t timer_arms{0};
+    std::uint64_t timer_fires{0};
+    std::uint64_t timer_cancels{0};
+    std::uint64_t timer_reschedules{0};
+    std::uint64_t timer_checksum{0};
+    std::uint64_t replayed_timer_checksum{0};
+    std::vector<std::uint32_t> timer_fire_ids;
+    std::vector<std::uint32_t> replayed_timer_fire_ids;
     std::uint64_t ctx_events{0};
     std::uint64_t blocked_ops{0};    ///< blocked=1 的操作数
     std::uint64_t messages{0};       ///< 成功接收的消息数（含 select 的 recv）

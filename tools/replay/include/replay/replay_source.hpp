@@ -17,8 +17,11 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace go2cpp::replay {
+
+class ReplayTimerService;
 
 namespace detail {
 inline thread_local std::uint32_t t_current_gid = 0;
@@ -93,6 +96,32 @@ public:
 
     /// 最近一次错误的可读描述；空表示无错误。
     virtual const char* LastError() const = 0;
+
+    /**
+     * @brief 安装 timer 回放服务（`ReplayTimerService` 构造时自动调用）。
+     * @details 引擎在遍历事件流时把 `kTimer` 事件派发给它，从而让
+     *          timer 回调与 channel/select 的交错顺序完全由记录决定。
+     */
+    virtual void InstallTimerService(ReplayTimerService* service) {
+        (void)service;
+    }
+
+    /// 当前安装的 timer 回放服务；默认 nullptr。
+    virtual ReplayTimerService* TimerService() { return nullptr; }
+
+    /**
+     * @brief replay：强制 `CurrentFiberGid()` 的返回值（timer 回调用）。
+     * @details timer 回调在引擎线程执行，不在任何 fiber 栈上；如果没有
+     *          这个覆盖，回调里的 channel 操作会拿到 `kNoChannel`，
+     *          无法消费记录。传 `kNoChannel` 表示清除覆盖。
+     */
+    virtual void SetCurrentGidOverride(std::uint32_t gid) { (void)gid; }
+
+    /// 记录中的全部事件（replay 引擎提供；默认空）。
+    virtual const std::vector<Event>& Events() const {
+        static const std::vector<Event> kEmpty;
+        return kEmpty;
+    }
 };
 
 /// 线程本地当前 gid（live 模式由 demo 的 fiber 入口设置）。

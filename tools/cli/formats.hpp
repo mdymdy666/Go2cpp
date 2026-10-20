@@ -12,7 +12,7 @@
  *
  * | 格式 | 判定依据 | 归属 |
  * |---|---|---|
- * | 迁移快照（二进制） | 前 8 字节 `G2CMIG02`（v2，符号化） | `tools/migration/include/migration/format.hpp` |
+ * | 迁移快照（二进制） | 前 8 字节 `G2CMIG03`（v3，当前写版本）或 `G2CMIG02`（v2，兼容读） | `tools/migration/include/migration/format.hpp` |
  * | 重放记录（二进制） | 前 8 字节 `G2CRPLY\0` | `tools/replay/include/replay/format.hpp` |
  * | JSON | 去 BOM 后首字符 `{` / `[`（且不是 ini 节名） | DebugServer `JSON` payload、通用 dump |
  * | go2cpp-trace 文本 | 首行 `# go2cpp-trace` / `# go2cpp-replay` | `docs/trace_format.md` |
@@ -34,8 +34,10 @@
 
 namespace go2cpp::cli {
 
-/// 迁移快照魔数（8 字节，`migration::kMagic`；v1 的 `G2CMIG01` 已废弃）。
-inline constexpr char kMigrationMagic[8] = {'G', '2', 'C', 'M', 'I', 'G', '0', '2'};
+/// 当前迁移快照魔数（8 字节，`migration::kMagic`；v3 为当前写版本）。
+inline constexpr char kMigrationMagic[8] = {'G', '2', 'C', 'M', 'I', 'G', '0', '3'};
+/// v2 迁移快照魔数：只用于**兼容读**（v1 的 `G2CMIG01` 已废弃，明确拒绝）。
+inline constexpr char kMigrationMagicV2[8] = {'G', '2', 'C', 'M', 'I', 'G', '0', '2'};
 /// 重放记录魔数（8 字节，含结尾 NUL，`replay::kMagic`）。
 inline constexpr char kReplayMagic[8] = {'G', '2', 'C', 'R', 'P', 'L', 'Y', '\0'};
 
@@ -44,7 +46,7 @@ enum class FileFormat {
     kUnknown,         ///< 无法识别。
     kJson,            ///< JSON 文本（对象或数组）。
     kTraceText,       ///< `# go2cpp-trace` / `# go2cpp-replay` 文本记录。
-    kMigrationBinary, ///< `tools/migration` v2 的 `G2CMIG02` 快照。
+    kMigrationBinary, ///< `tools/migration` 的 `G2CMIG03`（v3）或 `G2CMIG02`（v2）快照。
     kReplayBinary,    ///< `tools/replay` 的 `G2CRPLY` 记录。
     kIniText,         ///< ini 格式（`[section]` + `key = value`）。
 };
@@ -100,7 +102,7 @@ const char* FileFormatName(FileFormat format);
 /// 从二进制头解析重放记录版本（`kReplayBinary` 专用；失败返回 0）。
 std::uint16_t ReplayFormatVersion(const std::string& head);
 
-/// 从二进制头解析迁移快照版本（`kMigrationBinary` 专用；非 v2 魔数返回 0）。
+/// 从二进制头解析迁移快照版本（`kMigrationBinary` 专用；接受 v3/v2 魔数，其余返回 0）。
 std::uint32_t MigrationFormatVersion(const std::string& head);
 
 }  // namespace go2cpp::cli

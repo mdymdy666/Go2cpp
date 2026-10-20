@@ -80,6 +80,23 @@ Event MakeParkEvent(EventType type, std::uint32_t gid, std::uint32_t channel,
 Event MakeTimerEvent(std::uint32_t gid, TimerKind kind, std::uint64_t timer_ns,
                      std::uint32_t op_index, std::string name = {});
 
+/**
+ * @brief 构造一条 TimerService 生命周期事件（v3）。
+ * @param timer_id 录制端分配的定时器标识（1 起）。
+ * @param kind kServiceArm/kServiceFire/kServiceCancel/kServiceReschedule。
+ * @param deadline_ns 绝对的虚拟截止时间（相对录制起点）。
+ * @param fired_at_ns 回调开始执行时的虚拟时间（仅 fire 有意义）。
+ * @param callback_result 回调返回值（仅 fire 有意义）。
+ * @param timer_source `TimerSource` 数值（0=unknown ... 7=user）。
+ * @param source_gid 发起注册/取消的逻辑 fiber id（0=未知）。
+ */
+Event MakeTimerServiceEvent(std::uint32_t timer_id, TimerKind kind,
+                            std::uint64_t deadline_ns,
+                            std::uint64_t fired_at_ns,
+                            std::int64_t callback_result,
+                            std::uint32_t timer_source,
+                            std::uint32_t source_gid);
+
 /// 构造一条 Context 事件（cancel / deadline set / deadline fired）。
 Event MakeCtxEvent(std::uint32_t ctx_id, ContextEventKind kind,
                    std::uint32_t op_index);
@@ -113,6 +130,10 @@ public:
 
     /// 分配下一个全局序号（原子）。调用方应持有决定点锁。
     std::uint64_t NextSeq() noexcept { return m_seq.fetch_add(1, std::memory_order_relaxed); }
+    /// 分配下一个 timer 标识（原子；从 1 起）。
+    std::uint32_t NextTimerId() noexcept {
+        return m_timer_id.fetch_add(1, std::memory_order_relaxed) + 1U;
+    }
     /// 分配下一个交接 id（原子）；send/recv 两侧共享同一个值。
     std::uint32_t NextXferId() noexcept {
         return m_xfer.fetch_add(1, std::memory_order_relaxed);
@@ -176,6 +197,7 @@ private:
     mutable std::mutex m_mutex;
     std::atomic<std::uint64_t> m_seq{0};
     std::atomic<std::uint32_t> m_xfer{0};
+    std::atomic<std::uint32_t> m_timer_id{0};
     std::atomic<std::uint64_t> m_records{0};
     std::atomic<bool> m_finalized{false};
     std::atomic<std::uint32_t> m_wake_seen{0};

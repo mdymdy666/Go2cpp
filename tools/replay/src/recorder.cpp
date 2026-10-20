@@ -5,7 +5,9 @@
 
 #include "replay/recorder.hpp"
 
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <utility>
 
 namespace go2cpp::replay {
@@ -86,6 +88,26 @@ Event MakeTimerEvent(std::uint32_t gid, TimerKind kind, std::uint64_t timer_ns,
     event.timer_ns = timer_ns;
     event.op_index = op_index;
     event.note = std::move(name);
+    return event;
+}
+
+Event MakeTimerServiceEvent(std::uint32_t timer_id, TimerKind kind,
+                            std::uint64_t deadline_ns,
+                            std::uint64_t fired_at_ns,
+                            std::int64_t callback_result,
+                            std::uint32_t timer_source,
+                            std::uint32_t source_gid) {
+    Event event;
+    event.type = EventType::kTimer;
+    event.gid = source_gid;
+    event.channel = kNoChannel;
+    event.timer_kind = static_cast<std::uint8_t>(kind);
+    event.timer_ns = deadline_ns;
+    event.timer_id = timer_id;
+    event.timer_source = timer_source;
+    event.deadline_ns = deadline_ns;
+    event.fired_at_ns = fired_at_ns;
+    event.callback_result = callback_result;
     return event;
 }
 
@@ -277,7 +299,9 @@ void Recorder::WriteEndLocked(const std::string& reason) {
         EncodeEvent(note, m_scratch);
         if (!m_scratch.empty()) {
             m_file_crc = Crc32(m_scratch.data(), m_scratch.size(), m_file_crc);
-            (void)WriteRaw(m_scratch.data(), m_scratch.size());
+            if (!WriteRaw(m_scratch.data(), m_scratch.size())) {
+                m_error = "无法写入收尾 note：" + m_error;
+            }
             m_records.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -295,10 +319,14 @@ void Recorder::WriteEndLocked(const std::string& reason) {
     end.sched_type = m_file_crc;  // 整文件滚动 CRC（不含本条 kEnd）
     m_scratch.clear();
     EncodeEvent(end, m_scratch);
-    if (!m_scratch.empty()) {
-        (void)WriteRaw(m_scratch.data(), m_scratch.size());
+    if (!m_scratch.empty() && !WriteRaw(m_scratch.data(), m_scratch.size())) {
+        m_error = "无法写入 kEnd：" + m_error;
     }
-    std::fflush(m_file);
+    // fwrite 是缓冲写：/dev/full、磁盘满这类错误通常直到 flush 才暴露。
+    // 必须检查 fflush 返回值，否则调用方会把「0 字节文件」当成成功（D3）。
+    if (std::fflush(m_file) != 0 && m_error.empty()) {
+        m_error = "刷新记录文件失败：" + std::string(std::strerror(errno));
+    }
     m_finalized.store(true, std::memory_order_relaxed);
 }
 

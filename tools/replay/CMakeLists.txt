@@ -24,7 +24,8 @@ add_library(go2cpp_replay STATIC
     src/recorder.cpp
     src/replay_engine.cpp
     src/auto_entry.cpp
-    src/split.cpp)
+    src/split.cpp
+    src/timer.cpp)
 target_include_directories(go2cpp_replay
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
     PRIVATE "${GO2CPP_REPLAY_ROOT}/include")

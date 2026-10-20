@@ -190,6 +190,8 @@ bool RegisterParkingCondition(const std::string& name,
                               core::ParkingCondition& condition);
 bool RegisterFiber(const std::string& name, Fiber& fiber);
 bool RegisterEventRing(const std::string& name = kComponentEvents);
+/// 注册 TimerService 的只读 dump；被观测服务必须活到 Unregister。
+bool RegisterTimer(const std::string& name, core::TimerService& service);
 
 /**
  * @brief 注册一个 Channel<T> 的 dump provider。

@@ -141,17 +141,31 @@ APP
 
 cat > "$WORK/fake_replay.sh" <<'APP'
 #!/usr/bin/env bash
-printf 'FAKE-REPLAY:%s\n' "${1:-}"
-printf 'FAKE-REPLAY-COUNT:%s\n' "$#"
+# 引擎契约：`play <file>`；stdout 只输出 JSON 报告（CLI 会解析 replay_executed），
+# 人类可读信息一律走 stderr。
+if [ "${1:-}" = "play" ]; then
+    shift
+fi
+printf '{"schema":"go2cpp.replay.report/1","status":"ok","replay_executed":true}\n'
+printf 'FAKE-REPLAY:%s\n' "${1:-}" >&2
+printf 'FAKE-REPLAY-COUNT:%s\n' "$#" >&2
 exit "${FAKE_BACKEND_EXIT:-0}"
 APP
+
+cat > "$WORK/fake_no_replay.sh" <<'APP'
+#!/usr/bin/env bash
+# 退化引擎：退出码 0 但声称没有执行重放（P1-2 的缺陷形态）。
+printf '{"schema":"go2cpp.replay.report/1","status":"ok","replay_executed":false}\n'
+exit 0
+APP
+chmod +x "$WORK/fake_no_replay.sh"
 
 cat > "$WORK/fake_migrate.sh" <<'APP'
 #!/usr/bin/env bash
 mode="${1:-}"
 path="${2:-}"
 if [ "$mode" = "dump" ]; then
-    cp "${FIXTURE_DIR}/good.mig" "$path" || exit 1
+    cp "${FIXTURE_DIR}/good-v3.mig" "$path" || exit 1
     printf 'FAKE-MIGRATE dump %s\n' "$path"
     printf 'FAKE-MIGRATE pid=%s gid=%s\n' "${MIGRATION_PID:-}" "${MIGRATION_GID:-}"
     exit 0
@@ -362,11 +376,12 @@ run_expect "record -- 分隔" 0 replay record --out "$WORK/rec_dd.g2cr" -- "$WOR
 expect_contains "record -- 后参数" "ARGS=-x" "$LAST_OUTPUT"
 
 printf 'OLD-CONTENT\n' > "$WORK/replace.g2cr"
-run_expect "record 覆盖旧文件" 0 replay record "$WORK/fake_app.sh" --out "$WORK/replace.g2cr"
-if grep -q '# fake record' "$WORK/replace.g2cr"; then
-    pass "record 旧文件被替换"
+run_expect "record 拒绝覆盖已存在文件" 2 replay record "$WORK/fake_app.sh" --out "$WORK/replace.g2cr"
+expect_contains "拒绝覆盖提示" "记录文件已存在，拒绝覆盖" "$LAST_OUTPUT"
+if grep -q 'OLD-CONTENT' "$WORK/replace.g2cr"; then
+    pass "record 旧文件未被删除"
 else
-    fail "record 旧文件被替换"
+    fail "record 旧文件未被删除"
 fi
 
 export FAKE_APP_EXIT=7
@@ -405,6 +420,12 @@ export FAKE_BACKEND_EXIT=9
 run_expect "play 后端退出码透传" 9 replay play "$WORK/good.g2cr"
 unset FAKE_BACKEND_EXIT GO2CPP_REPLAY_TOOL
 
+GO2CPP_REPLAY_TOOL="$WORK/fake_no_replay.sh"
+export GO2CPP_REPLAY_TOOL
+run_expect "play 引擎未执行重放 → 3" 3 replay play "$WORK/good.g2cr"
+expect_contains "play 未执行提示" "没有执行重放" "$LAST_OUTPUT"
+unset GO2CPP_REPLAY_TOOL
+
 run_expect "play 文件不存在" 1 replay play "$WORK/nope.g2cr"
 printf '' > "$WORK/empty.g2cr"
 run_expect "play 空文件" 4 replay play "$WORK/empty.g2cr"
@@ -425,10 +446,10 @@ expect_contains "migrate dump 快照摘要" "迁移快照:" "$LAST_OUTPUT"
 expect_contains "migrate dump 后端输出" "FAKE-MIGRATE dump" "$LAST_OUTPUT"
 expect_contains "migrate dump pid 透传" "FAKE-MIGRATE pid=$$ gid=42" "$LAST_OUTPUT"
 expect_contains "migrate dump demo 提示" "不支持按 pid/gid" "$LAST_OUTPUT"
-if head -c 8 "$WORK/out.mig" | grep -q 'G2CMIG02'; then
-    pass "migrate dump 生成 G2CMIG02"
+if head -c 8 "$WORK/out.mig" | grep -q 'G2CMIG03'; then
+    pass "migrate dump 生成 G2CMIG03"
 else
-    fail "migrate dump 生成 G2CMIG02"
+    fail "migrate dump 生成 G2CMIG03"
 fi
 
 run_expect "migrate dump 进程不存在" 3 migrate dump --pid 999999 --gid 1 --out "$WORK/x.mig"
@@ -448,8 +469,10 @@ expect_contains "restore 无后端提示" "迁移工具未就绪" "$LAST_OUTPUT"
 
 GO2CPP_MIGRATE_TOOL="$WORK/fake_migrate.sh"
 export GO2CPP_MIGRATE_TOOL
-run_expect "restore 后端成功" 0 migrate restore "$WORK/good.mig"
+run_expect "restore 后端成功（v2 兼容读）" 0 migrate restore "$WORK/good.mig"
 expect_contains "restore 后端参数" "FAKE-MIGRATE restore $WORK/good.mig" "$LAST_OUTPUT"
+run_expect "restore 后端成功（v3）" 0 migrate restore "$WORK/good-v3.mig"
+expect_contains "restore v3 后端参数" "FAKE-MIGRATE restore $WORK/good-v3.mig" "$LAST_OUTPUT"
 export FAKE_BACKEND_EXIT=9
 run_expect "restore 后端退出码透传" 9 migrate restore "$WORK/good.mig"
 unset FAKE_BACKEND_EXIT GO2CPP_MIGRATE_TOOL
@@ -461,6 +484,8 @@ run_expect "restore 拒绝 v1" 4 migrate restore "$WORK/legacy_v1.mig"
 expect_contains "restore v1 提示" "迁移文件格式不匹配" "$LAST_OUTPUT"
 printf '' > "$WORK/empty.mig"
 run_expect "restore 空文件" 4 migrate restore "$WORK/empty.mig"
+run_expect "restore 拒绝不支持的版本" 4 migrate restore "$WORK/unsupported.mig"
+expect_contains "不支持版本提示" "版本不支持" "$LAST_OUTPUT"
 
 # ---------------- 8. debug ----------------
 say "debug 离线分析"
@@ -505,8 +530,12 @@ expect_contains "ini 统计" "节: 2 个；键值行: 3 行" "$LAST_OUTPUT"
 run_expect "debug G2CRPLY" 0 debug "$WORK/good.g2cr"
 expect_contains "replay 记录头" "记录头: version=1 header_size=32" "$LAST_OUTPUT"
 
-run_expect "debug G2CMIG02" 0 debug "$WORK/good.mig"
+run_expect "debug G2CMIG02（v2 兼容读）" 0 debug "$WORK/good.mig"
 expect_contains "migration 快照头" "快照头: version=2 sections=2 fiber_id=42 stack_size=64.0 KiB" "$LAST_OUTPUT"
+expect_contains "migration v2 格式" "G2CMIG02，版本 2" "$LAST_OUTPUT"
+run_expect "debug G2CMIG03" 0 debug "$WORK/good-v3.mig"
+expect_contains "migration v3 快照头" "快照头: version=3 sections=2 fiber_id=42 stack_size=64.0 KiB" "$LAST_OUTPUT"
+expect_contains "migration v3 格式" "G2CMIG03，版本 3" "$LAST_OUTPUT"
 run_expect "debug 拒绝 v1" 4 debug "$WORK/legacy_v1.mig"
 expect_contains "debug v1 提示" "无法识别的文件格式" "$LAST_OUTPUT"
 

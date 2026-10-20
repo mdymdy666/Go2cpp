@@ -80,6 +80,21 @@ bool ParseU64(const std::string& text, std::uint64_t* out) {
     return true;
 }
 
+std::uint32_t EnvU32(const char* name, std::uint32_t fallback) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') {
+        return fallback;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(raw, &end, 10);
+    if (errno != 0 || end == raw || *end != '\0' || value > 0xFFFFFFFFUL) {
+        std::fprintf(stderr, "[replay] bad %s value: %s\n", name, raw);
+        return fallback;
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
 bool ParseOptions(int argc, char** argv, int start, Args* args) {
     for (int index = start; index < argc; ++index) {
         const std::string option = argv[index];
@@ -145,6 +160,11 @@ int RunPlay(const Args& args) {
     options.stop_at_seq = args.until;
     options.checkpoint_every_events = args.every_events;
     options.checkpoint_every_ns = args.every_ms * 1000000ULL;
+    // 故障注入：与 demo 入口保持一致，读取 GO2CPP_REPLAY_DROP_WAKE。
+    // CLI（go2cpp-cli replay play）通过 fork/exec 启动本工具，环境变量天然
+    // 透传（包括其它 GO2CPP_REPLAY_*），因此只需在这里解析即可让 CLI 复现
+    // stuck；此前不读取导致 CLI 路径的丢唤醒注入被静默忽略（D4）。
+    options.drop_wake_at = EnvU32("GO2CPP_REPLAY_DROP_WAKE", 0);
     const auto report = go2cpp::replay::ReplayFileAuto(args.path, options);
     WriteJson(report);
     std::fprintf(stderr, "%s", report.Summary().c_str());

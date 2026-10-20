@@ -417,3 +417,9 @@ target_link_libraries(go2cpp_bufio PUBLIC go2cpp_error)
 set_target_properties(go2cpp_bufio PROPERTIES EXPORT_NAME bufio)
 add_library(go2cpp::bufio ALIAS go2cpp_bufio)
 list(APPEND GO2CPP_MODULE_TARGETS go2cpp_bufio)
+
+# 迁移格式层与 demo 只在实验开关打开时进入构建；它们不进入
+# GO2CPP_MODULE_TARGETS，因此默认安装/导出与 ON 构建的安装面都不变。
+if (GO2CPP_MIGRATION_API)
+    include(${PROJECT_SOURCE_DIR}/cmake/Go2CppMigration.cmake)
+endif()

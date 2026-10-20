@@ -8,6 +8,7 @@
 #include "go2cpp/json.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -22,6 +23,20 @@
 
 namespace go2cpp::debug {
 namespace {
+
+// 半包/慢连接防护（P2-1）：首个字节 100ms，整条命令 1s。
+constexpr std::size_t kMaxRequestBytes = 4096;
+constexpr int kRequestFirstByteTimeoutMs = 100;
+constexpr int kRequestTotalTimeoutMs = 1000;
+// 错误帧的优雅关闭：最多 drain 64KiB / 1s 后 close，避免 RST 冲掉响应（P2-2）。
+constexpr std::size_t kMaxDrainBytes = 64U * 1024U;
+constexpr int kDrainTimeoutMs = 1000;
+// 单条响应上限：超大 dump 在服务端就拒绝，避免构造/传输无界 payload（P2-4）。
+constexpr std::size_t kMaxResponseBytes = 64ULL * 1024ULL * 1024ULL;
+// 并发订阅上限（P2-3）：每个订阅一个 OS 线程，必须有上限。
+constexpr std::size_t kMaxSubscriptions = 16;
+/// 已预留的订阅线程数（fetch_add 先占名额，线程结束时释放）。
+std::atomic<std::size_t> g_subscription_threads{0};
 
 const char* const kKnownComponents[] = {
     "scheduler", "fiber", "channel", "parking_condition", "mutex",
@@ -283,6 +298,30 @@ std::uint64_t NowNs() {
             .count());
 }
 
+/// 尽力读完并丢弃对端剩余字节（最多 max_bytes / timeout_ms）。
+/// 错误帧必须先 shutdown(SHUT_WR) 再 drain：socket 上残留未读数据时
+/// close 会发 RST，内核会丢弃已写出的响应，客户端只能看到 ConnectionReset。
+void DrainClient(int fd, std::size_t max_bytes, int timeout_ms) {
+    std::size_t drained = 0;
+    const std::uint64_t deadline =
+        NowNs() + static_cast<std::uint64_t>(timeout_ms) * 1000000ULL;
+    char buffer[4096];
+    while (drained < max_bytes && NowNs() < deadline) {
+        const ssize_t received = ::recv(fd, buffer, sizeof(buffer), 0);
+        if (received > 0) {
+            drained += static_cast<std::size_t>(received);
+            continue;
+        }
+        if (received == 0) {
+            break;  // 对端已关闭写端。
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        break;  // EAGAIN（读超时）或连接错误。
+    }
+}
+
 bool IsKnownComponent(const std::string& name) {
     for (const char* known : kKnownComponents) {
         if (name == known) {
@@ -469,74 +508,169 @@ void DebugServer::Run() noexcept {
 }
 
 void DebugServer::HandleClient(int client_fd) noexcept {
+    // 读取阶段：首个字节最多等 kRequestFirstByteTimeoutMs；已经有部分数据后
+    // 允许继续读，但整条命令不超过 kRequestTotalTimeoutMs。这样「连接后不发」
+    // 或「每 99ms 续一个字节」都不能把单线程 accept 循环拖住（P2-1）。
+    // 发送阶段仍给 5s：大 dump 需要时间。
     timeval timeout{};
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = kRequestFirstByteTimeoutMs * 1000;
     (void)::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                        sizeof(timeout));
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
     (void)::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
                        sizeof(timeout));
+
     std::string request;
     request.reserve(128);
     char buffer[512];
-    while (request.size() < 4096U) {
+    bool frame_too_long = false;
+    bool request_timeout = false;
+    bool peer_closed = false;
+    const std::uint64_t read_start_ns = NowNs();
+    std::uint64_t last_data_ns = read_start_ns;
+    while (request.size() <= kMaxRequestBytes) {
         const ssize_t received = ::recv(client_fd, buffer, sizeof(buffer), 0);
-        if (received <= 0) {
+        if (received > 0) {
+            request.append(buffer, static_cast<std::size_t>(received));
+            last_data_ns = NowNs();
+            if (request.size() > kMaxRequestBytes) {
+                // 超长帧：停止读取，回 ERR 后优雅关闭（P2-2）。
+                frame_too_long = true;
+                break;
+            }
+            if (request.find('\n') != std::string::npos) {
+                break;
+            }
+            continue;
+        }
+        if (received == 0) {
+            peer_closed = true;
             break;
         }
-        request.append(buffer, static_cast<std::size_t>(received));
-        if (request.find('\n') != std::string::npos) {
-            break;
+        if (errno == EINTR) {
+            continue;
         }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            const std::uint64_t now = NowNs();
+            // 半包：SO_RCVTIMEO 已经等了 100ms 没有新字节 → 直接断连。
+            // 这样一条只发了部分命令的连接最多占用 accept 循环 100ms（P2-1）。
+            if (now - last_data_ns >=
+                static_cast<std::uint64_t>(kRequestFirstByteTimeoutMs) * 1000000ULL) {
+                request_timeout = true;
+                break;
+            }
+            // 持续滴灌（间隔 <100ms）但始终没有换行：整条命令最多 1s。
+            if (now - read_start_ns >=
+                static_cast<std::uint64_t>(kRequestTotalTimeoutMs) * 1000000ULL) {
+                request_timeout = true;
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    if (peer_closed && request.empty()) {
+        // 只 connect 不发命令（活性探测/健康检查）：静默关闭。
+        return;
     }
     const std::size_t newline = request.find('\n');
     if (newline != std::string::npos) {
         request.resize(newline);
     }
+
     std::string response;
     bool detached = false;
-    try {
-        const std::string trimmed = Trim(request);
-        if (!trimmed.empty() && trimmed.front() == '{') {
-            response = HandleJsonCommand(trimmed);
-        } else {
-            const std::size_t space = trimmed.find_first_of(" \t");
-            const std::string command = Upper(trimmed.substr(
-                0, space == std::string::npos ? trimmed.size() : space));
-            if (command == "SUBSCRIBE") {
-                // 长连接：把这条连接交给独立线程，accept 循环继续服务
-                // 其它客户端（DUMP/STATUS 不被订阅阻塞）。
-                ++m_requests;
-                const std::string argument =
-                    space == std::string::npos
-                        ? std::string()
-                        : Trim(trimmed.substr(space));
-                const int subscription_fd = ::dup(client_fd);
-                if (subscription_fd < 0) {
-                    response = ErrorResponse("internal", "dup-failed");
-                } else {
-                    try {
-                        std::thread([this, subscription_fd, argument] {
-                            ServeSubscription(subscription_fd, argument);
-                        }).detach();
-                        detached = true;
-                    } catch (...) {
-                        ::close(subscription_fd);
-                        response = ErrorResponse("internal",
-                                                 "thread-start-failed");
-                    }
-                }
+    bool graceful_close = false;
+    if (frame_too_long) {
+        response = ErrorResponse("bad-command", "frame-too-long");
+        graceful_close = true;
+    } else if (request_timeout) {
+        response = ErrorResponse("bad-command", "request-timeout");
+        graceful_close = true;
+    } else {
+        try {
+            const std::string trimmed = Trim(request);
+            if (!trimmed.empty() && trimmed.front() == '{') {
+                response = HandleJsonCommand(trimmed);
             } else {
-                response = HandleCommand(request);
+                const std::size_t space = trimmed.find_first_of(" \t");
+                const std::string command = Upper(trimmed.substr(
+                    0, space == std::string::npos ? trimmed.size() : space));
+                if (command == "SUBSCRIBE") {
+                    // 长连接：把这条连接交给独立线程，accept 循环继续服务
+                    // 其它客户端（DUMP/STATUS 不被订阅阻塞）。每个订阅一个
+                    // OS 线程，因此必须先预留名额，超过上限直接拒绝（P2-3）。
+                    ++m_requests;
+                    const std::string argument =
+                        space == std::string::npos
+                            ? std::string()
+                            : Trim(trimmed.substr(space));
+                    const std::size_t active =
+                        g_subscription_threads.fetch_add(
+                            1, std::memory_order_acq_rel) +
+                        1;
+                    if (active > kMaxSubscriptions) {
+                        (void)g_subscription_threads.fetch_sub(
+                            1, std::memory_order_acq_rel);
+                        response = ErrorResponse(
+                            "too-many-subscribers",
+                            "subscription limit " +
+                                std::to_string(kMaxSubscriptions) +
+                                " reached; retry after a subscriber disconnects");
+                    } else {
+                        const int subscription_fd = ::dup(client_fd);
+                        if (subscription_fd < 0) {
+                            (void)g_subscription_threads.fetch_sub(
+                                1, std::memory_order_acq_rel);
+                            response =
+                                ErrorResponse("internal", "dup-failed");
+                        } else {
+                            try {
+                                std::thread([this, subscription_fd, argument] {
+                                    struct Release {
+                                        ~Release() {
+                                            g_subscription_threads.fetch_sub(
+                                                1,
+                                                std::memory_order_acq_rel);
+                                        }
+                                    } release;
+                                    ServeSubscription(subscription_fd,
+                                                      argument);
+                                }).detach();
+                                detached = true;
+                            } catch (...) {
+                                ::close(subscription_fd);
+                                (void)g_subscription_threads.fetch_sub(
+                                    1, std::memory_order_acq_rel);
+                                response = ErrorResponse(
+                                    "internal", "thread-start-failed");
+                            }
+                        }
+                    }
+                } else {
+                    response = HandleCommand(request);
+                }
             }
+        } catch (...) {
+            response = ErrorResponse("internal", "handler-exception");
         }
-    } catch (...) {
-        response = ErrorResponse("internal", "handler-exception");
     }
     if (detached) {
         // 连接所有权已移交给订阅线程；这里不能再关闭 client_fd 之外的
         // 东西，也不能再发送普通响应。
         return;
+    }
+    if (response.size() > kMaxResponseBytes) {
+        // 超大响应在服务端拒绝：避免把 46.5MiB 级 payload 塞给 CLI 的
+        // 16MiB 上限（P2-4），同时把错误明确交给调用方。
+        response = ErrorResponse(
+            "payload-too-large",
+            "response exceeds " + std::to_string(kMaxResponseBytes) +
+                " bytes; request a single component (JSON <component>) or "
+                "use EVENTS <limit>");
+        graceful_close = true;
     }
     std::size_t offset = 0;
     while (offset < response.size()) {
@@ -547,8 +681,13 @@ void DebugServer::HandleClient(int client_fd) noexcept {
         }
         offset += static_cast<std::size_t>(sent);
     }
+    if (graceful_close) {
+        // 先关写端（客户端读到 ERR 后看到 EOF），再把对端剩余字节 drain
+        // 掉：close 前没有未读数据，内核就不会发 RST 把响应冲掉（P2-2）。
+        (void)::shutdown(client_fd, SHUT_WR);
+        DrainClient(client_fd, kMaxDrainBytes, kDrainTimeoutMs);
+    }
 }
-
 void DebugServer::ServeSubscription(int fd,
                                     const std::string& argument) noexcept {
     m_subscribers.fetch_add(1, std::memory_order_relaxed);

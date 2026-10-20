@@ -136,6 +136,8 @@ void WriteSlot(SegmentT& segment, const EventRecord& record,
     slot.tid = record.tid;
     slot.pid = record.pid;
     slot.reserved = 0;
+    slot.arg3 = record.arg3;
+    slot.arg4 = record.arg4;
     // seq 最后写：读者以 seq 作为「本条已完整发布」的判据。
     slot.seq = record.seq;
     segment.head.store(write_index + 1U, std::memory_order_release);
@@ -236,6 +238,10 @@ const char* SchedEventCodeName(SchedEventCode code) noexcept {
         case SchedEventCode::kChannelSend: return "kChannelSend";
         case SchedEventCode::kChannelRecv: return "kChannelRecv";
         case SchedEventCode::kChannelWake: return "kChannelWake";
+        case SchedEventCode::kTimerArm: return "kTimerArm";
+        case SchedEventCode::kTimerFire: return "kTimerFire";
+        case SchedEventCode::kTimerCancel: return "kTimerCancel";
+        case SchedEventCode::kTimerReschedule: return "kTimerReschedule";
     }
     return "kUnknown";
 }
@@ -295,6 +301,34 @@ void EventRing::Record(SchedEventCode code, std::uint64_t gid,
     (void)code;
     (void)gid;
     (void)arg2;
+#endif
+}
+
+void EventRing::RecordTimer(SchedEventCode code, std::uint64_t timer_id,
+                            std::uint64_t deadline_ns, std::uint8_t kind,
+                            std::uint32_t source_gid) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    // 与 Record 相同：先 odr-use 注册对象，保证线程 ring 已登记。
+    (void)t_registration;
+    EventRecord record;
+    record.seq =
+        g_publish_seq.fetch_add(1, std::memory_order_relaxed) + 1U;
+    record.ts_ns = NowNs();
+    record.gid = timer_id;
+    record.arg2 = deadline_ns;
+    record.code = static_cast<std::uint32_t>(code);
+    record.tid = t_ring.tid.load(std::memory_order_relaxed);
+    record.pid = t_processor_id;
+    record.arg3 = kind;
+    record.arg4 = source_gid;
+    // timer 事件走普通区：10k 级 arm 压测不应挤掉关键区里的 wake 线索。
+    WriteSlot(t_ring.normal, record, kNormalSlots);
+#else
+    (void)code;
+    (void)timer_id;
+    (void)deadline_ns;
+    (void)kind;
+    (void)source_gid;
 #endif
 }
 
@@ -408,6 +442,16 @@ std::string EventRing::DumpText(std::size_t max) {
     std::size_t critical_count = 0;
     std::size_t normal_count = 0;
     CountBySegment(events, &critical_count, &normal_count);
+    std::size_t timer_event_count = 0;
+    for (const auto& event : events) {
+        const auto code = static_cast<SchedEventCode>(event.code);
+        if (code == SchedEventCode::kTimerArm ||
+            code == SchedEventCode::kTimerFire ||
+            code == SchedEventCode::kTimerCancel ||
+            code == SchedEventCode::kTimerReschedule) {
+            ++timer_event_count;
+        }
+    }
 
     std::string out;
     out += "schema=go2cpp.dump.events/1\n";
@@ -428,6 +472,7 @@ std::string EventRing::DumpText(std::size_t max) {
     out += "event_count=" + std::to_string(events.size()) + "\n";
     out += "critical_event_count=" + std::to_string(critical_count) + "\n";
     out += "normal_event_count=" + std::to_string(normal_count) + "\n";
+    out += "timer_event_count=" + std::to_string(timer_event_count) + "\n";
     out += "# seq ts_ns tid code gid arg2 pid\n";
     for (const auto& event : events) {
         out += std::to_string(event.seq);
@@ -455,6 +500,16 @@ std::string EventRing::DumpJson(std::size_t max) {
     std::size_t critical_count = 0;
     std::size_t normal_count = 0;
     CountBySegment(events, &critical_count, &normal_count);
+    std::size_t timer_event_count = 0;
+    for (const auto& event : events) {
+        const auto code = static_cast<SchedEventCode>(event.code);
+        if (code == SchedEventCode::kTimerArm ||
+            code == SchedEventCode::kTimerFire ||
+            code == SchedEventCode::kTimerCancel ||
+            code == SchedEventCode::kTimerReschedule) {
+            ++timer_event_count;
+        }
+    }
 
     std::string out = "{\"schema\":\"go2cpp.dump.events/1\",\"version\":1";
     out += ",\"enabled\":";
@@ -474,6 +529,7 @@ std::string EventRing::DumpJson(std::size_t max) {
     out += ",\"event_count\":" + std::to_string(events.size());
     out += ",\"critical_event_count\":" + std::to_string(critical_count);
     out += ",\"normal_event_count\":" + std::to_string(normal_count);
+    out += ",\"timer_event_count\":" + std::to_string(timer_event_count);
     out += ",\"events\":[";
     bool first = true;
     for (const auto& event : events) {
@@ -490,6 +546,21 @@ std::string EventRing::DumpJson(std::size_t max) {
         out += ",\"code_value\":" + std::to_string(event.code);
         out += ",\"gid\":" + std::to_string(event.gid);
         out += ",\"arg2\":" + std::to_string(event.arg2);
+        // timer 事件用语义字段名暴露（非 timer 事件恒为 0，字段集合稳定）。
+        const auto event_code = static_cast<SchedEventCode>(event.code);
+        const bool is_timer_event =
+            event_code == SchedEventCode::kTimerArm ||
+            event_code == SchedEventCode::kTimerFire ||
+            event_code == SchedEventCode::kTimerCancel ||
+            event_code == SchedEventCode::kTimerReschedule;
+        out += ",\"timer_id\":" +
+               std::to_string(is_timer_event ? event.gid : 0);
+        out += ",\"timer_kind\":" +
+               std::to_string(is_timer_event ? event.arg3 : 0);
+        out += ",\"deadline_ns\":" +
+               std::to_string(is_timer_event ? event.arg2 : 0);
+        out += ",\"source_gid\":" +
+               std::to_string(is_timer_event ? event.arg4 : 0);
         out += ",\"pid\":" + std::to_string(event.pid);
         out += ",\"critical\":";
         out += SchedEventCodeIsCritical(

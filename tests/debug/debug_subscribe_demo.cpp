@@ -13,10 +13,13 @@
  * 事件来源（覆盖三类插桩）：
  * 1. runqueue/wake：2 个消费者 G 在无缓冲 channel 上 park/被唤醒；
  * 2. sync：2 个原生线程争用同一把 `sync::Mutex`；
- * 3. channel：生产者在 rendezvous channel 上 Send（接收者未就绪时 park）。
+ * 3. channel：生产者在 rendezvous channel 上 Send（接收者未就绪时 park）；
+ * 4. timer：一个 20ms 周期 TimerService 产生 kTimerArm/kTimerFire/
+ *    kTimerReschedule（验证 SUBSCRIBE 里能看到 timer 事件）。
  */
 
 #include "go2cpp/channel.hpp"
+#include "go2cpp/concurrency/core/timer.hpp"
 #include "go2cpp/debug.hpp"
 #include "go2cpp/scheduler.hpp"
 #include "go2cpp/sync.hpp"
@@ -66,6 +69,14 @@ int main(int argc, char** argv) {
     }
     std::printf("socket=%s\npid=%d\n", server.path().c_str(), ::getpid());
     std::fflush(stdout);
+
+    // timer 事件源：20ms 周期定时器（kTimerArm / kTimerFire / kTimerReschedule）。
+    go2cpp::core::TimerService timer_service;
+    go2cpp::debug::RegisterTimer("timer", timer_service);
+    go2cpp::core::TimerSourceScope timer_scope(
+        go2cpp::core::TimerSource::kUser, 0);
+    go2cpp::core::Timer periodic_timer =
+        timer_service.ScheduleEvery(std::chrono::milliseconds(20), [] {});
 
     // 无缓冲 channel：Send/Recv 在对方未就绪时 park —— 产生 kChannelSend /
     // kChannelRecv / kChannelWake 与调度器的 wake 事件。
@@ -132,6 +143,8 @@ int main(int argc, char** argv) {
     std::printf("stopped sent=%lld mutex_rounds=%lld\n", sent,
                 static_cast<long long>(mutex_rounds.load()));
     std::fflush(stdout);
+    periodic_timer.Cancel();
+    (void)server.Unregister("timer");
     server.Stop();
     scheduler.shutdown();
     return 0;

@@ -103,6 +103,10 @@ const char* TimerKindName(TimerKind kind) noexcept {
         case TimerKind::kDeadlineSet: return "deadline-set";
         case TimerKind::kDeadlineExceeded: return "deadline-exceeded";
         case TimerKind::kTimeoutSelected: return "timeout-selected";
+        case TimerKind::kServiceArm: return "service-arm";
+        case TimerKind::kServiceFire: return "service-fire";
+        case TimerKind::kServiceCancel: return "service-cancel";
+        case TimerKind::kServiceReschedule: return "service-reschedule";
     }
     return "unknown";
 }
@@ -180,6 +184,13 @@ void EncodePayload(const Event& event, std::vector<std::uint8_t>& payload) {
             writer.U64(event.timer_ns);
             writer.U64(event.vtime_ns);
             writer.Str(event.note);
+            // v3 追加：TimerService 的 timer 生命周期字段（旧解码器按尾部
+            // 剩余字节判断，v1/v2 文件不受影响）。
+            writer.U32(event.timer_id);
+            writer.U32(event.timer_source);
+            writer.U64(event.deadline_ns);
+            writer.U64(event.fired_at_ns);
+            writer.I64(event.callback_result);
             break;
         case EventType::kCtx:
             writer.U32(event.ctx_id);
@@ -385,6 +396,13 @@ bool DecodeEvent(const std::uint8_t* data, std::size_t size, Event* event,
             out.timer_ns = reader.U64();
             out.vtime_ns = reader.U64();
             out.note = reader.Str();
+            if (reader.ok() && reader.remaining() >= 32U) {
+                out.timer_id = reader.U32();
+                out.timer_source = reader.U32();
+                out.deadline_ns = reader.U64();
+                out.fired_at_ns = reader.U64();
+                out.callback_result = reader.I64();
+            }
             break;
         case EventType::kCtx:
             out.ctx_id = reader.U32();

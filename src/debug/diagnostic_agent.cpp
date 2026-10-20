@@ -15,8 +15,11 @@
  *    **不写任何状态字**，因此不存在「诊断工具把状态机改坏」的路径。
  *
  * 3. **解锁前先证明 owner 已不可能再访问临界区**。`mutex-unlock` 只在
- *    `owner_known && owner 不在任何已注册 Scheduler 的活动 G 表里` 时调用
- *    既有 `Mutex::Unlock()`；其余情况一律 `refused` 并给出稳定原因。
+ *    `owner_known` 且 owner 在某个已注册 Scheduler 的任务表里被明确观察到
+ *    **已终止**时调用既有 `Mutex::Unlock()`。三态判定：owner 存活 ->
+ *    `refused owner-alive`；owner 不在任何已注册 Scheduler 的任务表里 ->
+ *    `refused owner-unknown`（不可知 != 已死，owner 可能属于未注册的
+ *    Scheduler）；只有观察到终止状态才算 `owner-gone`。
  *
  * ## 平台
  *
@@ -2534,6 +2537,17 @@ DiagnosticCommandResult DiagnosticAgent::CmdMutexUnlock(
     }
 
     // 在所有已注册 Scheduler 的活动 G 里查 owner。
+    //
+    // 判定必须区分三态，而不是二态（找到存活 / 没找到）：
+    //   - 找到且状态存活        -> refused owner-alive；
+    //   - 找到且状态明确终止    -> owner-gone，允许解锁；
+    //   - 一个都没找到          -> owner **不可知**（owner 可能属于一个没有
+    //     注册到 Doctor 的 Scheduler），**不能**当作 owner-gone。
+    //
+    // 最后一态正是 P1-1 的缺陷来源：部分注册 Scheduler 是常见用法，
+    // 「注册表里没有」不等于「进程里没有」。误判会把仍然存活的 owner
+    // 正在执行的临界区强行解锁，造成两个执行流同时进入临界区。
+    bool owner_found = false;
     bool owner_alive = false;
     GState owner_state = GState::kDead;
     std::vector<std::pair<std::string, Scheduler*>> schedulers;
@@ -2549,15 +2563,21 @@ DiagnosticCommandResult DiagnosticAgent::CmdMutexUnlock(
             if (task.id != snapshot.owner_gid) {
                 continue;
             }
-            owner_state = task.state;
+            owner_found = true;
             switch (task.state) {
                 case GState::kNew:
                 case GState::kRunnable:
                 case GState::kRunning:
                 case GState::kWaiting:
                     owner_alive = true;
+                    owner_state = task.state;
                     break;
                 default:
+                    // 只在没有观察到存活状态时记录终止状态，避免
+                    // 「先看到 kDead 再看到 kWaiting」时把存活误报成已死。
+                    if (!owner_alive) {
+                        owner_state = task.state;
+                    }
                     break;
             }
         }
@@ -2570,8 +2590,19 @@ DiagnosticCommandResult DiagnosticAgent::CmdMutexUnlock(
                         GStateNameStable(owner_state) +
                         "); force-unlock would corrupt the mutex");
     }
+    if (!owner_found) {
+        // 「不可知」不是「已死」。只有 owner 在某个已注册 Scheduler 的
+        // 任务表里出现并处于终止状态，才有资格说临界区不可能再被访问。
+        return Fail("refused",
+                    "owner-unknown: owner gid " +
+                        std::to_string(snapshot.owner_gid) +
+                        " is not present in any registered Scheduler; an "
+                        "unregistered Scheduler may still own this mutex, so "
+                        "the critical section cannot be proven abandoned");
+    }
 
-    // owner 已不在任何活动 G 表中：临界区不可能再被访问，走既有 Unlock()。
+    // owner 在已注册 Scheduler 中被明确观察到已终止：临界区不可能再被访问，
+    // 走既有 Unlock()。
     bool unlocked = false;
     std::string unlock_error;
     try {

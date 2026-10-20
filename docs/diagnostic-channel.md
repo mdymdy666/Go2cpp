@@ -250,7 +250,7 @@ detail=woken.parking-condition=1 targets=1 woken.channel=1 targets=1 woken.sched
 2. `locked` 必须为真，否则 `not-locked`；
 3. `waiters > 0`，否则 `no-waiters`（解了也没人受益）；
 4. `owner_known && owner_gid != 0`，否则 `owner-unknown`（无法证明临界区
-   被遗弃）；
+   被遗弃；**owner-unknown 不等于 owner-gone，绝不据此解锁**）；
 5. owner 不在任何已注册 Scheduler 的活动 G 表里（或已处于终态），否则
    `owner-alive`；
 6. 调用**既有** `Mutex::Unlock()`；异常映射为 `unlock-failed`。

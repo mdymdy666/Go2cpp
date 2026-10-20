@@ -34,8 +34,10 @@
  */
 #include "go2cpp/core/timer.hpp"
 #include "go2cpp/logging/log.hpp"
+#include "go2cpp/debug/debug_event_ring.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <map>
@@ -118,6 +120,55 @@ void log_long_duration(std::chrono::steady_clock::duration duration,
     }
 }
 
+
+/**
+ * @brief 当前线程的定时器来源标签。
+ * @details 只服务调试分类：`SetThreadTimerSource` / `TimerSourceScope` 写入，
+ *          `Schedule*` 读取。thread_local 避免为每次注册加锁，也不改变调度。
+ */
+struct ThreadTimerTag {
+    TimerSource source{TimerSource::kUnknown};
+    std::uint32_t source_gid{0};
+};
+
+ThreadTimerTag& MutableThreadTag() noexcept {
+    static thread_local ThreadTimerTag tag;
+    return tag;
+}
+
+const ThreadTimerTag& ThreadTag() noexcept { return MutableThreadTag(); }
+
+/// 定时器注册时解析来源：只信线程标签，未标注记为 kUnknown。
+TimerSource ResolveSource() noexcept { return ThreadTag().source; }
+std::uint32_t ResolveSourceGid() noexcept { return ThreadTag().source_gid; }
+
+/**
+ * @brief 事件环里 timer 事件的 kind 编码（稳定）。
+ * @details 0=kOnce、1=kFixedDelay、2=kFixedRate、3=交由执行器提交。
+ */
+std::uint8_t TimerEventKind(const TimerOptions& options,
+                            bool has_executor) noexcept {
+    if (has_executor) {
+        return 3;
+    }
+    return static_cast<std::uint8_t>(options.repeat);
+}
+
+/// steady_clock 时间点转纳秒（同机可比；事件环字段）。
+std::uint64_t SteadyNs(std::chrono::steady_clock::time_point point) noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            point.time_since_epoch())
+            .count());
+}
+
+/// 记录一条 timer 事件（OFF 构建由宏展开为空，不产生符号引用）。
+void EmitTimerEvent(debug::SchedEventCode code, std::uint64_t timer_id,
+                    std::uint64_t deadline_ns, std::uint8_t kind,
+                    std::uint32_t source_gid) noexcept {
+    GO2CPP_DEBUG_TIMER_EVENT(code, timer_id, deadline_ns, kind, source_gid);
+}
+
 }  // 匿名命名空间
 
 /**
@@ -146,6 +197,11 @@ void log_long_duration(std::chrono::steady_clock::duration duration,
  */
 struct Timer::State final {
     std::weak_ptr<TimerService::Impl> m_owner;
+    /// 调试来源分类与来源 gid：创建时写入，之后只读（dump 无需加锁）。
+    TimerSource m_source{TimerSource::kUnknown};
+    std::uint32_t m_source_gid{0};
+    /// 调试用 timer 标识（1 起）；由 Impl::Add 统一分配。
+    std::uint64_t m_timer_id{0};
     mutable std::mutex m_mutex;
     std::function<void()> m_callback;
     TimerRepeatCallback m_repeat_callback;
@@ -236,7 +292,38 @@ public:
                   TimerDurationLimits duration_limits)
         : m_exception_handler(std::move(handler)),
           m_duration_limits(duration_limits),
-          m_thread([this] { Run(); }) {}
+          m_thread([this] { Run(); }) {
+        // 原子量默认构造不保证是 0：显式初始化所有只读观测计数。
+        for (auto& counter : m_source_armed) {
+            counter.store(0, std::memory_order_relaxed);
+        }
+        for (auto& counter : m_source_fired) {
+            counter.store(0, std::memory_order_relaxed);
+        }
+        for (auto& counter : m_source_cancelled) {
+            counter.store(0, std::memory_order_relaxed);
+        }
+        for (auto& counter : m_source_rescheduled) {
+            counter.store(0, std::memory_order_relaxed);
+        }
+        for (auto& counter : m_source_completed) {
+            counter.store(0, std::memory_order_relaxed);
+        }
+        for (auto& counter : m_source_failed) {
+            counter.store(0, std::memory_order_relaxed);
+        }
+        m_thread_id_hash.store(
+            static_cast<std::uint64_t>(
+                std::hash<std::thread::id>{}(m_thread.get_id())),
+            std::memory_order_relaxed);
+        m_thread_state.store(TimerThreadState::kStarting,
+                             std::memory_order_relaxed);
+    }
+
+    /// @brief 分配调试用的 timer 标识（1 起；不参与调度语义）。
+    std::uint64_t NextTimerId() noexcept {
+        return m_next_timer_id.fetch_add(1, std::memory_order_relaxed) + 1U;
+    }
 
     bool SetDurationLimits(TimerDurationLimits limits) noexcept {
         if (limits.warn_after < Clock::duration::zero() ||
@@ -268,6 +355,8 @@ public:
                 std::terminate();
             }
             m_stopping = true;
+            m_thread_state.store(TimerThreadState::kStopping,
+                                 std::memory_order_relaxed);
             ++m_generation;
             abandoned.swap(m_entries);
             m_index.clear();
@@ -276,8 +365,23 @@ public:
         if (m_thread.joinable()) {
             m_thread.join();
         }
+        m_thread_state.store(TimerThreadState::kStopped,
+                             std::memory_order_relaxed);
         for (const auto& entry : abandoned) {
             CancelState(entry.second);
+            // 服务销毁时遗留的 timer 实际被取消：计入观测统计。
+            m_cancelled_total.fetch_add(1, std::memory_order_relaxed);
+            const auto source =
+                static_cast<std::size_t>(entry.second->m_source);
+            if (source < kTimerSourceCount) {
+                m_source_cancelled[source].fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            EmitTimerEvent(debug::SchedEventCode::kTimerCancel,
+                           entry.second->m_timer_id,
+                           SteadyNs(entry.second->m_next_deadline),
+                           TimerEventKind(entry.second->m_options, false),
+                           entry.second->m_source_gid);
         }
     }
 
@@ -294,9 +398,23 @@ public:
             if (m_stopping) {
                 throw std::runtime_error("timer service is stopped");
             }
+            if (state->m_timer_id == 0) {
+                state->m_timer_id = NextTimerId();
+            }
             const auto it = m_entries.emplace(deadline, state);
             m_index[state.get()] = it;
             ++m_generation;
+            m_armed_total.fetch_add(1, std::memory_order_relaxed);
+            const auto source = static_cast<std::size_t>(state->m_source);
+            if (source < kTimerSourceCount) {
+                m_source_armed[source].fetch_add(1,
+                                                 std::memory_order_relaxed);
+            }
+            EmitTimerEvent(debug::SchedEventCode::kTimerArm,
+                           state->m_timer_id, SteadyNs(deadline),
+                           TimerEventKind(state->m_options,
+                                          static_cast<bool>(state->m_executor)),
+                           state->m_source_gid);
         }
         m_cv.notify_all();
     }
@@ -351,6 +469,18 @@ public:
             state->m_callback = {};
             state->m_repeat_callback = {};
             state->m_executor.reset();
+            m_cancelled_total.fetch_add(1, std::memory_order_relaxed);
+            const auto source =
+                static_cast<std::size_t>(state->m_source);
+            if (source < kTimerSourceCount) {
+                m_source_cancelled[source].fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            EmitTimerEvent(debug::SchedEventCode::kTimerCancel,
+                           state->m_timer_id,
+                           SteadyNs(state->m_next_deadline),
+                           TimerEventKind(state->m_options, false),
+                           state->m_source_gid);
         }
         m_cv.notify_all();
         return true;
@@ -379,6 +509,16 @@ public:
         found->second = it;
         state->m_next_deadline = deadline;
         ++m_generation;
+        m_rescheduled_total.fetch_add(1, std::memory_order_relaxed);
+        const auto source = static_cast<std::size_t>(state->m_source);
+        if (source < kTimerSourceCount) {
+            m_source_rescheduled[source].fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        EmitTimerEvent(debug::SchedEventCode::kTimerReschedule,
+                       state->m_timer_id, SteadyNs(deadline),
+                       TimerEventKind(state->m_options, false),
+                       state->m_source_gid);
         m_cv.notify_all();
         return true;
     }
@@ -410,6 +550,18 @@ public:
             }
             state->m_status = TimerState::kRunning;
             ++state->m_run_count;
+            m_fired_total.fetch_add(1, std::memory_order_relaxed);
+            const auto fired_source =
+                static_cast<std::size_t>(state->m_source);
+            if (fired_source < kTimerSourceCount) {
+                m_source_fired[fired_source].fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            EmitTimerEvent(debug::SchedEventCode::kTimerFire,
+                           state->m_timer_id, SteadyNs(scheduled_deadline),
+                           TimerEventKind(state->m_options,
+                                          static_cast<bool>(state->m_executor)),
+                           state->m_source_gid);
             context.run_count = state->m_run_count;
             context.scheduled_deadline = scheduled_deadline;
             context.started_at = Clock::now();
@@ -510,6 +662,13 @@ public:
                 state->m_callback = {};
                 state->m_repeat_callback = {};
                 state->m_executor.reset();
+                m_failed_total.fetch_add(1, std::memory_order_relaxed);
+                const auto failed_source =
+                    static_cast<std::size_t>(state->m_source);
+                if (failed_source < kTimerSourceCount) {
+                    m_source_failed[failed_source].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
                 return;
             }
             const TimerOptions options = state->m_options;
@@ -522,6 +681,13 @@ public:
                 state->m_callback = {};
                 state->m_repeat_callback = {};
                 state->m_executor.reset();
+                m_completed_total.fetch_add(1, std::memory_order_relaxed);
+                const auto completed_source =
+                    static_cast<std::size_t>(state->m_source);
+                if (completed_source < kTimerSourceCount) {
+                    m_source_completed[completed_source].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
                 return;
             }
 
@@ -551,6 +717,14 @@ public:
                     state->m_callback = {};
                     state->m_repeat_callback = {};
                     state->m_executor.reset();
+                    m_completed_total.fetch_add(
+                        1, std::memory_order_relaxed);
+                    const auto stop_source =
+                        static_cast<std::size_t>(state->m_source);
+                    if (stop_source < kTimerSourceCount) {
+                        m_source_completed[stop_source].fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
                     return;
             }
             if (next < now) {
@@ -565,6 +739,13 @@ public:
                 state->m_callback = {};
                 state->m_repeat_callback = {};
                 state->m_executor.reset();
+                m_failed_total.fetch_add(1, std::memory_order_relaxed);
+                const auto period_source =
+                    static_cast<std::size_t>(state->m_source);
+                if (period_source < kTimerSourceCount) {
+                    m_source_failed[period_source].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
                 return;
             }
             state->m_next_deadline = next;
@@ -572,6 +753,17 @@ public:
             const auto it = m_entries.emplace(next, state);
             m_index[state.get()] = it;
             ++m_generation;
+            m_rescheduled_total.fetch_add(1, std::memory_order_relaxed);
+            const auto rescheduled_source =
+                static_cast<std::size_t>(state->m_source);
+            if (rescheduled_source < kTimerSourceCount) {
+                m_source_rescheduled[rescheduled_source].fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            EmitTimerEvent(debug::SchedEventCode::kTimerReschedule,
+                           state->m_timer_id, SteadyNs(next),
+                           TimerEventKind(state->m_options, false),
+                           state->m_source_gid);
             notify = true;
         }
         if (notify) {
@@ -617,6 +809,70 @@ public:
         return m_entries.begin()->first;
     }
 
+
+    /**
+     * @brief 采集只读快照（语义见头文件）。
+     * @details 容器在 `m_mutex` 内读取；来源 active 直接累加每个 State 的
+     *          只读字段。统计计数为原子读，可能与容器状态差一拍。
+     */
+    TimerDebugSnapshot DebugSnapshot() const noexcept {
+        TimerDebugSnapshot snapshot;
+        snapshot.captured_at = Clock::now();
+        snapshot.seq =
+            m_dump_seq.fetch_add(1, std::memory_order_relaxed) + 1U;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            snapshot.active = m_entries.size();
+            if (!m_entries.empty()) {
+                snapshot.next_deadline = m_entries.begin()->first;
+            }
+            snapshot.running = !m_stopping;
+            snapshot.stopping = m_stopping;
+            snapshot.thread_joinable = m_thread.joinable();
+            for (const auto& entry : m_entries) {
+                const auto source =
+                    static_cast<std::size_t>(entry.second->m_source);
+                if (source < snapshot.sources.size()) {
+                    ++snapshot.sources[source].active;
+                }
+            }
+        }
+        snapshot.armed_total = m_armed_total.load(std::memory_order_relaxed);
+        snapshot.fired = m_fired_total.load(std::memory_order_relaxed);
+        snapshot.cancelled =
+            m_cancelled_total.load(std::memory_order_relaxed);
+        snapshot.rescheduled =
+            m_rescheduled_total.load(std::memory_order_relaxed);
+        snapshot.completed =
+            m_completed_total.load(std::memory_order_relaxed);
+        snapshot.failed = m_failed_total.load(std::memory_order_relaxed);
+        for (std::size_t index = 0; index < snapshot.sources.size(); ++index) {
+            auto& stats = snapshot.sources[index];
+            stats.armed =
+                m_source_armed[index].load(std::memory_order_relaxed);
+            stats.fired =
+                m_source_fired[index].load(std::memory_order_relaxed);
+            stats.cancelled =
+                m_source_cancelled[index].load(std::memory_order_relaxed);
+            stats.rescheduled =
+                m_source_rescheduled[index].load(std::memory_order_relaxed);
+            stats.completed =
+                m_source_completed[index].load(std::memory_order_relaxed);
+            stats.failed =
+                m_source_failed[index].load(std::memory_order_relaxed);
+        }
+        snapshot.thread_id =
+            m_thread_id_hash.load(std::memory_order_relaxed);
+        snapshot.thread_state =
+            m_thread_state.load(std::memory_order_relaxed);
+        snapshot.background_wait_wakeups =
+            m_background_wakeups.load(std::memory_order_relaxed);
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        snapshot.event_ring_supported = true;
+#endif
+        return snapshot;
+    }
+
 private:
     static void CancelState(const std::shared_ptr<Timer::State>& state) noexcept {
         std::lock_guard<std::mutex> lock(state->m_mutex);
@@ -648,18 +904,24 @@ private:
     void Run() noexcept {
         for (;;) {
             std::shared_ptr<Timer::State> expired;
+            m_thread_state.store(TimerThreadState::kWaiting,
+                                 std::memory_order_relaxed);
             std::chrono::steady_clock::time_point deadline{};
             TimerWaitMode wait_mode = TimerWaitMode::kConditionVariable;
             std::chrono::steady_clock::duration spin_window{};
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 if (m_stopping) {
+                    m_thread_state.store(TimerThreadState::kStopped,
+                                         std::memory_order_relaxed);
                     return;
                 }
                 if (m_entries.empty()) {
                     m_cv.wait(lock, [this] {
                         return m_stopping || !m_entries.empty();
                     });
+                    m_background_wakeups.fetch_add(
+                        1, std::memory_order_relaxed);
                     continue;
                 }
                 const auto it = m_entries.begin();
@@ -683,17 +945,23 @@ private:
                             }
                             std::this_thread::yield();
                         }
+                        m_background_wakeups.fetch_add(
+                            1, std::memory_order_relaxed);
                         continue;
                     }
                     m_cv.wait_until(lock, deadline, [this, generation] {
                         return m_stopping || m_generation.load() != generation;
                     });
+                    m_background_wakeups.fetch_add(
+                        1, std::memory_order_relaxed);
                     continue;
                 }
                 expired = it->second;
                 m_index.erase(expired.get());
                 m_entries.erase(it);
             }
+            m_thread_state.store(TimerThreadState::kExecuting,
+                                 std::memory_order_relaxed);
             Execute(expired, deadline);
         }
     }
@@ -703,6 +971,24 @@ private:
     Entries m_entries;
     std::unordered_map<Timer::State*, Entries::iterator> m_index;
     std::atomic<std::uint64_t> m_generation{0};
+    // ---- 只读调试观测（不参与调度决策）----
+    mutable std::atomic<std::uint64_t> m_dump_seq{0}; ///< dump 序号
+    std::atomic<std::uint64_t> m_next_timer_id{0};    ///< timer id 分配
+    std::atomic<std::uint64_t> m_armed_total{0};      ///< 累计注册
+    std::atomic<std::uint64_t> m_fired_total{0};      ///< 累计执行
+    std::atomic<std::uint64_t> m_cancelled_total{0};  ///< 累计取消
+    std::atomic<std::uint64_t> m_rescheduled_total{0};///< 累计重排
+    std::atomic<std::uint64_t> m_completed_total{0};  ///< 累计正常结束
+    std::atomic<std::uint64_t> m_failed_total{0};     ///< 累计异常结束
+    std::array<std::atomic<std::uint64_t>, kTimerSourceCount> m_source_armed{};
+    std::array<std::atomic<std::uint64_t>, kTimerSourceCount> m_source_fired{};
+    std::array<std::atomic<std::uint64_t>, kTimerSourceCount> m_source_cancelled{};
+    std::array<std::atomic<std::uint64_t>, kTimerSourceCount> m_source_rescheduled{};
+    std::array<std::atomic<std::uint64_t>, kTimerSourceCount> m_source_completed{};
+    std::array<std::atomic<std::uint64_t>, kTimerSourceCount> m_source_failed{};
+    std::atomic<std::uint64_t> m_thread_id_hash{0};   ///< 后台线程 id 哈希
+    std::atomic<TimerThreadState> m_thread_state{TimerThreadState::kUnknown};
+    std::atomic<std::uint64_t> m_background_wakeups{0}; ///< 唤醒次数
     bool m_stopping{false};
     mutable std::mutex m_handler_mutex;
     TimerExceptionHandler m_exception_handler;
@@ -825,6 +1111,8 @@ Timer TimerService::Schedule(Clock::time_point deadline,
     const auto state = std::make_shared<Timer::State>();
     state->m_owner = m_impl;
     state->m_callback = std::move(callback);
+    state->m_source = ResolveSource();
+    state->m_source_gid = ResolveSourceGid();
     state->m_options.repeat = TimerRepeatMode::kOnce;
     state->m_next_deadline = deadline;
     m_impl->Add(state, deadline);
@@ -875,6 +1163,8 @@ Timer TimerService::ScheduleRepeat(std::chrono::steady_clock::duration initial_d
     const auto state = std::make_shared<Timer::State>();
     state->m_owner = m_impl;
     state->m_repeat_callback = std::move(callback);
+    state->m_source = ResolveSource();
+    state->m_source_gid = ResolveSourceGid();
     state->m_options = options;
     state->m_next_deadline = saturating_add(Clock::now(),
                                             nonnegative(initial_delay));
@@ -896,6 +1186,9 @@ Timer TimerService::ScheduleOn(Clock::time_point deadline,
     state->m_owner = m_impl;
     state->m_callback = std::move(callback);
     state->m_executor = std::move(executor);
+    // 该入口的唯一调用方是调度器：自动分类，不依赖线程标签。
+    state->m_source = TimerSource::kScheduler;
+    state->m_source_gid = 0;
     state->m_options.repeat = TimerRepeatMode::kOnce;
     state->m_next_deadline = deadline;
     m_impl->Add(state, deadline);
@@ -922,6 +1215,8 @@ Timer TimerService::ScheduleEveryOn(
             }
             return TimerDecision::Continue();
         };
+    // ScheduleRepeat 内部创建 State：用作用域标签把它归到调度器来源。
+    TimerSourceScope scope(TimerSource::kScheduler);
     return ScheduleRepeat(period, repeat_callback, options);
 }
 
@@ -985,6 +1280,61 @@ std::size_t TimerService::PendingCount() const noexcept {
 std::optional<TimerService::Clock::time_point>
 TimerService::NextDeadline() const noexcept {
     return m_impl ? m_impl->NextDeadline() : std::nullopt;
+}
+
+TimerDebugSnapshot TimerService::DebugSnapshot() const noexcept {
+    return m_impl ? m_impl->DebugSnapshot() : TimerDebugSnapshot{};
+}
+
+
+const char* TimerSourceName(TimerSource source) noexcept {
+    switch (source) {
+        case TimerSource::kUnknown: return "kUnknown";
+        case TimerSource::kContext: return "kContext";
+        case TimerSource::kParkingCondition: return "kParkingCondition";
+        case TimerSource::kChannel: return "kChannel";
+        case TimerSource::kTimedMutex: return "kTimedMutex";
+        case TimerSource::kScheduler: return "kScheduler";
+        case TimerSource::kSleep: return "kSleep";
+        case TimerSource::kUser: return "kUser";
+    }
+    return "kUnknown";
+}
+
+const char* TimerThreadStateName(TimerThreadState state) noexcept {
+    switch (state) {
+        case TimerThreadState::kUnknown: return "kUnknown";
+        case TimerThreadState::kStarting: return "kStarting";
+        case TimerThreadState::kWaiting: return "kWaiting";
+        case TimerThreadState::kExecuting: return "kExecuting";
+        case TimerThreadState::kStopping: return "kStopping";
+        case TimerThreadState::kStopped: return "kStopped";
+    }
+    return "kUnknown";
+}
+
+void SetThreadTimerSource(TimerSource source,
+                          std::uint32_t source_gid) noexcept {
+    auto& tag = MutableThreadTag();
+    tag.source = source;
+    tag.source_gid = source_gid;
+}
+
+TimerSource ThreadTimerSource() noexcept { return ThreadTag().source; }
+
+std::uint32_t ThreadTimerSourceGid() noexcept {
+    return ThreadTag().source_gid;
+}
+
+TimerSourceScope::TimerSourceScope(TimerSource source,
+                                   std::uint32_t source_gid) noexcept
+    : m_previous(ThreadTimerSource()),
+      m_previous_gid(ThreadTimerSourceGid()) {
+    SetThreadTimerSource(source, source_gid);
+}
+
+TimerSourceScope::~TimerSourceScope() {
+    SetThreadTimerSource(m_previous, m_previous_gid);
 }
 
 }  // go2cpp::core 命名空间

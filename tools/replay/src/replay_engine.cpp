@@ -5,6 +5,7 @@
 
 #include "replay/replay_engine.hpp"
 
+#include "replay/timer.hpp"
 #include "replay/ucx.hpp"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <new>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -22,6 +24,10 @@ namespace go2cpp::replay {
 namespace {
 
 constexpr std::uint64_t kMaxFileSize = 256ULL * 1024ULL * 1024ULL;
+/// 合法 gid 上限（含）。引擎按 gid 建稠密索引（11 个 vector + 每槽位固定
+/// 开销），不设上限时一条 `gid=0x7FFFFFFF` 的 kSpawn 就会触发
+/// std::bad_alloc 并 abort（P1-3）。65536 覆盖真实记录，索引内存 < 20MiB。
+constexpr std::uint32_t kMaxGid = 1U << 16U;
 
 /// 一个消息值（i64 或 bytes）；比较时两者都比，避免摘要碰撞。
 struct RecordedValue {
@@ -42,6 +48,8 @@ struct LoadedFile {
     std::uint64_t file_size{0};
     std::uint32_t computed_crc{0};
     bool complete{false};
+    /// 加载失败是否属于「文件内容/格式」问题（而不是 IO/权限）。
+    bool format_error{false};
     std::string error;
 };
 
@@ -142,6 +150,16 @@ bool LoadFile(const std::string& path, LoadedFile* out) {
         if (!DecodeEvent(data.data() + offset, data.size() - offset, &event,
                          &consumed, &error)) {
             out->error = "record at offset " + std::to_string(offset) + ": " + error;
+            return false;
+        }
+        if (event.gid > kMaxGid) {
+            // 超限 gid 必须在分配任何索引数组之前拒绝：per-gid 稠密数组
+            // 会按 max_gid+1 分配，gid=0x7FFFFFFF 会直接 bad_alloc → abort。
+            out->format_error = true;
+            out->error = "record at offset " + std::to_string(offset) + ": gid " +
+                         std::to_string(event.gid) +
+                         " exceeds supported maximum " +
+                         std::to_string(kMaxGid) + " (dense per-gid index)";
             return false;
         }
         if (event.type == EventType::kEnd) {
@@ -253,6 +271,14 @@ ReplayReport AnalyzeLoaded(const LoadedFile& loaded, const ReplayOptions& option
     for (const auto& event : loaded.events) {
         max_gid = std::max(max_gid, event.gid);
     }
+    if (max_gid > kMaxGid) {
+        // LoadFile 已拒绝；这里再守一道，保证任何调用路径都不会按未校验
+        // 的 gid 分配数组。
+        report.status = ReplayStatus::kFormatError;
+        report.error = "gid " + std::to_string(max_gid) +
+                       " exceeds supported maximum " + std::to_string(kMaxGid);
+        return report;
+    }
     report.stats.per_gid.resize(static_cast<std::size_t>(max_gid) + 1U);
     report.stats.recv_by_gid.resize(static_cast<std::size_t>(max_gid) + 1U);
     for (std::uint32_t gid = 0; gid <= max_gid; ++gid) {
@@ -273,6 +299,10 @@ ReplayReport AnalyzeLoaded(const LoadedFile& loaded, const ReplayOptions& option
             const auto kind = static_cast<TimerKind>(event.timer_kind);
             if (kind == TimerKind::kSleep) {
                 virtual_ns = std::max(virtual_ns, event.vtime_ns + event.timer_ns);
+            } else if (kind == TimerKind::kServiceFire) {
+                virtual_ns = std::max(virtual_ns, event.fired_at_ns);
+            } else if (kind == TimerKind::kServiceReschedule) {
+                virtual_ns = std::max(virtual_ns, event.deadline_ns);
             }
         }
         checkpoints.Maybe(event, index, virtual_ns);
@@ -357,9 +387,43 @@ ReplayReport AnalyzeLoaded(const LoadedFile& loaded, const ReplayOptions& option
             case EventType::kClose:
                 ++report.stats.closes;
                 break;
-            case EventType::kTimer:
+            case EventType::kTimer: {
                 ++report.stats.timers;
+                const auto timer_kind =
+                    static_cast<TimerKind>(event.timer_kind);
+                switch (timer_kind) {
+                    case TimerKind::kServiceArm:
+                        ++report.stats.timer_arms;
+                        break;
+                    case TimerKind::kServiceFire:
+                        ++report.stats.timer_fires;
+                        report.stats.timer_fire_ids.push_back(
+                            event.timer_id);
+                        report.stats.timer_checksum = FnvStep(
+                            report.stats.timer_checksum,
+                            (static_cast<std::uint64_t>(
+                                 event.timer_id)
+                             << 32U) ^
+                                static_cast<std::uint32_t>(
+                                    event.callback_result));
+                        if (event.fired_at_ns > virtual_ns) {
+                            virtual_ns = event.fired_at_ns;
+                        }
+                        break;
+                    case TimerKind::kServiceCancel:
+                        ++report.stats.timer_cancels;
+                        break;
+                    case TimerKind::kServiceReschedule:
+                        ++report.stats.timer_reschedules;
+                        if (event.deadline_ns > virtual_ns) {
+                            virtual_ns = event.deadline_ns;
+                        }
+                        break;
+                    default:
+                        break;
+                }
                 break;
+            }
             case EventType::kCtx:
                 ++report.stats.ctx_events;
                 break;
@@ -506,6 +570,20 @@ public:
 
     ReplayReport Run(const ReplayReport& base);
 
+    void InstallTimerService(ReplayTimerService* service) override {
+        m_timers = service;
+    }
+
+    ReplayTimerService* TimerService() override { return m_timers; }
+
+    void SetCurrentGidOverride(std::uint32_t gid) override {
+        m_gid_override = gid;
+    }
+
+    const std::vector<Event>& Events() const override {
+        return m_events;
+    }
+
     const Event* NextOperation(std::uint32_t gid) override {
         if (gid >= m_ops.size()) {
             SetError("operation for gid " + std::to_string(gid) + " out of range");
@@ -650,6 +728,9 @@ public:
     const char* LastError() const override { return m_error.c_str(); }
 
     std::uint32_t CurrentFiberGid() const noexcept override {
+        if (m_gid_override != kNoChannel) {
+            return m_gid_override;
+        }
         const std::uint32_t ucx_id = m_ucx.current();
         return ucx_id < m_gid_by_ucx.size() ? m_gid_by_ucx[ucx_id] : kNoChannel;
     }
@@ -678,6 +759,14 @@ private:
         std::uint32_t max_gid = 0;
         for (const auto& event : m_events) {
             max_gid = std::max(max_gid, event.gid);
+        }
+        if (max_gid > kMaxGid) {
+            // 构造函数没有返回值：记下错误并让 Run() 直接返回
+            // format-error，绝不按未校验的 gid 分配索引（P1-3）。
+            SetError("gid " + std::to_string(max_gid) +
+                     " exceeds supported maximum " +
+                     std::to_string(kMaxGid));
+            return;
         }
         const std::size_t slots = static_cast<std::size_t>(max_gid) + 1U;
         m_ops.resize(slots);
@@ -795,6 +884,23 @@ private:
         }
     }
 
+    void OnTimer(const Event& event) {
+        const auto kind = static_cast<TimerKind>(event.timer_kind);
+        if (kind == TimerKind::kServiceFire) {
+            m_virtual_now = std::max(m_virtual_now, event.fired_at_ns);
+        } else if (kind == TimerKind::kServiceReschedule) {
+            m_virtual_now = std::max(m_virtual_now, event.deadline_ns);
+        }
+        if (m_timers == nullptr) {
+            return;
+        }
+        // timer 回调在引擎线程执行；回调内 park 型操作不在支持范围
+        // （见 replay/timer.hpp 的限制说明）。
+        if (!m_timers->Dispatch(event) && !m_timers->error().empty()) {
+            SetError(m_timers->error());
+        }
+    }
+
     void OnWake(const Event& wake) {
         ++m_stats.wakes;
         ++m_wake_seen;
@@ -853,6 +959,8 @@ private:
     std::unordered_map<std::uint32_t, std::vector<const Event*>> m_ctx_events;
     std::unordered_map<std::uint32_t, std::size_t> m_ctx_cursor;
     ReplayStats m_stats;
+    ReplayTimerService* m_timers{nullptr}; ///< 由用户 fiber 构造并安装
+    std::uint32_t m_gid_override{kNoChannel}; ///< timer 回调期间强制 gid
     std::string m_error;
     bool m_abort{false};
     bool m_stuck{false};
@@ -870,7 +978,25 @@ private:
 };
 
 ReplayReport Engine::Run(const ReplayReport& base) {
+    // timer 服务可能比引擎活得久（demo 里是全局对象）：Run 结束时解除绑定，
+    // 避免它在 source 销毁后回头访问 this。
+    struct TimerDetachGuard {
+        ReplayTimerService* service;
+        ~TimerDetachGuard() {
+            if (service != nullptr) {
+                service->Detach();
+            }
+        }
+    } timer_guard{m_timers};
     ReplayReport report = base;
+    if (m_abort) {
+        // 索引构建阶段就拒绝了输入（gid 超限等）：这是文件格式问题，
+        // 返回结构化错误而不是崩溃（P1-3）。
+        report.status = ReplayStatus::kFormatError;
+        report.replay_executed = false;
+        report.error = m_error.empty() ? "index-build-failed" : m_error;
+        return report;
+    }
     report.replay_executed = true;
     report.timeline.clear();
     report.stuck = false;
@@ -910,6 +1036,9 @@ ReplayReport Engine::Run(const ReplayReport& base) {
             case EventType::kExit:
                 OnExit(event);
                 break;
+            case EventType::kTimer:
+                OnTimer(event);
+                break;
             default:
                 break;
         }
@@ -930,6 +1059,23 @@ ReplayReport Engine::Run(const ReplayReport& base) {
     report.stats.recvs = m_stats.recvs;
     report.stats.replayed_select_choices = m_stats.replayed_select_choices;
     report.stats.replayed_select_checksum = m_stats.replayed_select_checksum;
+    if (m_timers != nullptr) {
+        // 与静态分析的初值保持一致（ReplayStats 默认 0 起）——
+        // 两边同一条 fire 序列必须得到同一个 checksum。
+        report.stats.replayed_timer_checksum = 0;
+        for (const auto& entry : m_timers->trace()) {
+            if (entry.kind != TimerKind::kServiceFire) {
+                continue;
+            }
+            report.stats.replayed_timer_fire_ids.push_back(
+                entry.timer_id);
+            report.stats.replayed_timer_checksum = FnvStep(
+                report.stats.replayed_timer_checksum,
+                (static_cast<std::uint64_t>(entry.timer_id) << 32U) ^
+                    static_cast<std::uint32_t>(
+                        entry.callback_result));
+        }
+    }
     report.checkpoints = m_checkpoints;
     report.virtual_ns = m_virtual_now;
     report.stopped_early = m_stopped_early;
@@ -1022,6 +1168,25 @@ ReplayReport Engine::Run(const ReplayReport& base) {
         }
     }
 
+    if (m_timers != nullptr &&
+        report.stats.timer_fires !=
+            report.stats.replayed_timer_fire_ids.size()) {
+        report.status = ReplayStatus::kMismatch;
+        report.error = "timer fire count differs from recording (recorded=" +
+                       std::to_string(report.stats.timer_fires) +
+                       ", replayed=" +
+                       std::to_string(
+                           report.stats.replayed_timer_fire_ids.size()) +
+                       ")";
+        return report;
+    }
+    if (m_timers != nullptr &&
+        report.stats.timer_checksum !=
+            report.stats.replayed_timer_checksum) {
+        report.status = ReplayStatus::kMismatch;
+        report.error = "timer fire sequence differs from recording";
+        return report;
+    }
     report.status = ReplayStatus::kOk;
     return report;
 }
@@ -1067,58 +1232,85 @@ const char* ParkReasonName(ParkReason reason) noexcept {
     return "unknown";
 }
 
+ReplayReport MakeFormatErrorReport(const std::string& path,
+                                   const std::string& error) {
+    ReplayReport report;
+    report.path = path;
+    report.status = ReplayStatus::kFormatError;
+    report.error = error;
+    return report;
+}
+
 ReplayReport ReplayFile(const std::string& path, const ReplayOptions& options) {
-    LoadedFile loaded;
-    if (!LoadFile(path, &loaded)) {
-        ReplayReport report;
-        report.path = path;
-        report.status = loaded.error.find("checksum") != std::string::npos ||
-                                loaded.error.find("record") != std::string::npos ||
-                                loaded.error.find("magic") != std::string::npos ||
-                                loaded.error.find("version") != std::string::npos ||
-                                loaded.error.find("header") != std::string::npos
-                            ? ReplayStatus::kFormatError
-                            : ReplayStatus::kIoError;
-        report.error = loaded.error;
-        return report;
+    try {
+        LoadedFile loaded;
+        if (!LoadFile(path, &loaded)) {
+            ReplayReport report;
+            report.path = path;
+            report.status =
+                loaded.format_error ||
+                        loaded.error.find("checksum") != std::string::npos ||
+                        loaded.error.find("record") != std::string::npos ||
+                        loaded.error.find("magic") != std::string::npos ||
+                        loaded.error.find("version") != std::string::npos ||
+                        loaded.error.find("header") != std::string::npos
+                    ? ReplayStatus::kFormatError
+                    : ReplayStatus::kIoError;
+            report.error = loaded.error;
+            return report;
+        }
+        return AnalyzeLoaded(loaded, options, path);
+    } catch (const std::bad_alloc&) {
+        // 顶层兜底：畸形记录绝不能让进程 abort（P1-3）。
+        return MakeFormatErrorReport(
+            path,
+            "out of memory while loading recording: the file's gid/event "
+            "counts exceed what this build can index");
     }
-    return AnalyzeLoaded(loaded, options, path);
 }
 
 ReplayReport ReplayFileWith(const std::string& path, const FiberEntryFactory& factory,
                             const ReplayOptions& options) {
-    LoadedFile loaded;
-    if (!LoadFile(path, &loaded)) {
-        ReplayReport report;
+    try {
+        LoadedFile loaded;
+        if (!LoadFile(path, &loaded)) {
+            ReplayReport report;
+            report.path = path;
+            report.status = loaded.format_error ? ReplayStatus::kFormatError
+                                                : ReplayStatus::kIoError;
+            report.error = loaded.error;
+            return report;
+        }
+        // 分片文件末尾带 checkpoint note：自动把 stop 设在分片最后一条事件上，
+        // 这样 `play part` 得到 partial 而不是「记录不完整」的 stuck。
+        ReplayOptions effective = options;
+        if (effective.stop_at_seq == 0 && !loaded.events.empty() &&
+            IsCheckpointNote(loaded.events.back())) {
+            effective.stop_at_seq = loaded.events.back().seq > 0
+                                        ? loaded.events.back().seq - 1
+                                        : 0;
+        }
+        // 先用静态分析拿到元信息与文件完整性；记录自洽性由完整重放重新判定。
+        ReplayOptions meta_options;
+        meta_options.keep_timeline = false;
+        meta_options.stop_at_seq = effective.stop_at_seq;
+        ReplayReport base = AnalyzeLoaded(loaded, meta_options, path);
+        if (base.status == ReplayStatus::kFormatError ||
+            base.status == ReplayStatus::kMismatch) {
+            return base;
+        }
+        Engine engine(std::move(loaded.events), factory, effective);
+        ReplayReport report = engine.Run(base);
         report.path = path;
-        report.status = ReplayStatus::kIoError;
-        report.error = loaded.error;
+        report.file_size = loaded.file_size;
+        report.file_crc = loaded.computed_crc;
         return report;
+    } catch (const std::bad_alloc&) {
+        return MakeFormatErrorReport(
+            path,
+            "out of memory while replaying recording: the file's gid/event "
+            "counts exceed what this build can index");
     }
-    // 分片文件末尾带 checkpoint note：自动把 stop 设在分片最后一条事件上，
-    // 这样 `play part` 得到 partial 而不是「记录不完整」的 stuck。
-    ReplayOptions effective = options;
-    if (effective.stop_at_seq == 0 && !loaded.events.empty() &&
-        IsCheckpointNote(loaded.events.back())) {
-        effective.stop_at_seq = loaded.events.back().seq > 0
-                                    ? loaded.events.back().seq - 1
-                                    : 0;
-    }
-    // 先用静态分析拿到元信息与文件完整性；记录自洽性由完整重放重新判定。
-    ReplayOptions meta_options;
-    meta_options.keep_timeline = false;
-    meta_options.stop_at_seq = effective.stop_at_seq;
-    ReplayReport base = AnalyzeLoaded(loaded, meta_options, path);
-    if (base.status == ReplayStatus::kFormatError ||
-        base.status == ReplayStatus::kMismatch) {
-        return base;
-    }
-    Engine engine(std::move(loaded.events), factory, effective);
-    ReplayReport report = engine.Run(base);
-    report.path = path;
-    report.file_size = loaded.file_size;
-    report.file_crc = loaded.computed_crc;
-    return report;
 }
 
 namespace {
@@ -1185,6 +1377,10 @@ std::string ReplayReport::Summary() const {
            " closes=" + std::to_string(stats.closes) +
            " selects=" + std::to_string(stats.selects) +
            " timers=" + std::to_string(stats.timers) +
+           " timer_arms=" + std::to_string(stats.timer_arms) +
+           " timer_fires=" + std::to_string(stats.timer_fires) +
+           " timer_cancels=" + std::to_string(stats.timer_cancels) +
+           " timer_reschedules=" + std::to_string(stats.timer_reschedules) +
            " ctx=" + std::to_string(stats.ctx_events) + "\n";
     out += "  messages=" + std::to_string(stats.messages) +
            " checksum=" + std::to_string(stats.message_checksum);
@@ -1196,6 +1392,18 @@ std::string ReplayReport::Summary() const {
         out += " dropped_wakes=" + std::to_string(stats.dropped_wakes);
     }
     out += "\n";
+    if (stats.timer_fires > 0 || stats.timer_arms > 0) {
+        out += "  timer: arms=" + std::to_string(stats.timer_arms) +
+               " fires=" + std::to_string(stats.timer_fires) +
+               " cancels=" + std::to_string(stats.timer_cancels) +
+               " reschedules=" + std::to_string(stats.timer_reschedules) +
+               " checksum=" + std::to_string(stats.timer_checksum);
+        if (stats.replayed_timer_checksum != 0) {
+            out += " replayed_checksum=" +
+                   std::to_string(stats.replayed_timer_checksum);
+        }
+        out += "\n";
+    }
     if (stats.selects > 0) {
         out += "  selects: choices=";
         for (std::size_t i = 0; i < stats.select_choices.size() && i < 32; ++i) {
@@ -1285,6 +1493,16 @@ std::string ReplayReportJson(const ReplayReport& report) {
     out += ",\"closes\":" + std::to_string(report.stats.closes);
     out += ",\"selects\":" + std::to_string(report.stats.selects);
     out += ",\"timers\":" + std::to_string(report.stats.timers);
+    out += ",\"timer_arms\":" + std::to_string(report.stats.timer_arms);
+    out += ",\"timer_fires\":" + std::to_string(report.stats.timer_fires);
+    out += ",\"timer_cancels\":" +
+           std::to_string(report.stats.timer_cancels);
+    out += ",\"timer_reschedules\":" +
+           std::to_string(report.stats.timer_reschedules);
+    out += ",\"timer_checksum\":" +
+           std::to_string(report.stats.timer_checksum);
+    out += ",\"replayed_timer_checksum\":" +
+           std::to_string(report.stats.replayed_timer_checksum);
     out += ",\"ctx_events\":" + std::to_string(report.stats.ctx_events);
     out += ",\"blocked_ops\":" + std::to_string(report.stats.blocked_ops);
     out += ",\"messages\":" + std::to_string(report.stats.messages);
@@ -1315,6 +1533,20 @@ std::string ReplayReportJson(const ReplayReport& report) {
     for (std::size_t index = 0; index < report.stats.select_choices.size(); ++index) {
         if (index != 0) out += ",";
         out += std::to_string(report.stats.select_choices[index]);
+    }
+    out += "]";
+    out += ",\"timer_fire_ids\":[";
+    for (std::size_t index = 0; index < report.stats.timer_fire_ids.size();
+         ++index) {
+        if (index != 0) out += ",";
+        out += std::to_string(report.stats.timer_fire_ids[index]);
+    }
+    out += "]";
+    out += ",\"replayed_timer_fire_ids\":[";
+    for (std::size_t index = 0;
+         index < report.stats.replayed_timer_fire_ids.size(); ++index) {
+        if (index != 0) out += ",";
+        out += std::to_string(report.stats.replayed_timer_fire_ids[index]);
     }
     out += "]";
     out += ",\"replayed_select_choices\":[";

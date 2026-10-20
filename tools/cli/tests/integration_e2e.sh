@@ -156,25 +156,27 @@ rm -f "/tmp/go2cpp-$DEMO_PID.sock"
 DEMO_PID=""
 
 # ---------------------------------------------------------------------------
-# 2. 迁移 v2 端到端
+# 2. 迁移 v3 端到端（v2 兼容读）
 # ---------------------------------------------------------------------------
-say "2. 迁移 v2：dump -> verify -> restore"
+# v3 默认强制 HMAC 签名；联调用固定测试密钥（不要用于生产）。
+export MIGRATION_SIGNING_KEY="${MIGRATION_SIGNING_KEY:-hex:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff}"
+say "2. 迁移 v3：dump -> verify -> restore"
 SNAP="$EVID/fiber.mig"
 "$MIGRATE" dump "$SNAP" > "$EVID/migrate-dump.txt" 2>&1
 MIG_DUMP_RC=$?
 cat "$EVID/migrate-dump.txt"
 [ "$MIG_DUMP_RC" -eq 0 ] && ok "migrate dump 退出码 0" || bad "migrate dump 退出码 $MIG_DUMP_RC"
 MAGIC=$(head -c 8 "$SNAP" 2>/dev/null)
-[ "$MAGIC" = "G2CMIG02" ] && ok "快照魔数 G2CMIG02" || bad "快照魔数=$MAGIC"
+[ "$MAGIC" = "G2CMIG03" ] && ok "快照魔数 G2CMIG03" || bad "快照魔数=$MAGIC"
 python3 - "$SNAP" <<'PY'
 import struct, sys
-h = open(sys.argv[1], "rb").read(192)
+h = open(sys.argv[1], "rb").read(224)
 version, header_size = struct.unpack_from("<II", h, 8)
 print(f"header: magic={h[:8].decode()} version={version} header_size={header_size} "
       f"size={__import__('os').path.getsize(sys.argv[1])}")
-assert h[:8] == b"G2CMIG02" and version == 2 and header_size == 192
+assert h[:8] == b"G2CMIG03" and version == 3 and header_size == 224
 PY
-[ $? -eq 0 ] && ok "快照头 version=2/header_size=192" || bad "快照头字段不符"
+[ $? -eq 0 ] && ok "快照头 version=3/header_size=224" || bad "快照头字段不符"
 
 "$MIGRATE" verify "$SNAP" > "$EVID/migrate-verify.txt" 2>&1
 MIG_VERIFY_RC=$?
@@ -188,7 +190,7 @@ cat "$EVID/migrate-restore.txt"
 [ "$MIG_RESTORE_RC" -eq 0 ] && ok "migrate restore 退出码 0" || bad "migrate restore 退出码 $MIG_RESTORE_RC"
 grep -q 'restore 完成' "$EVID/migrate-restore.txt" && ok "restore 完成（跨进程 Fiber 继续执行）" || bad "restore 未报告完成"
 
-say "2.1 CLI migrate restore（真实 v2 快照）"
+say "2.1 CLI migrate restore（真实 v3 快照）"
 GO2CPP_MIGRATE_TOOL="$MIGRATE" "$CLI" migrate restore "$SNAP" > "$EVID/cli-migrate-restore.txt" 2>&1
 CLI_RESTORE_RC=$?
 cat "$EVID/cli-migrate-restore.txt"
@@ -203,17 +205,28 @@ CLI_DUMP_RC=$?
 cat "$EVID/cli-migrate-dump.txt"
 [ "$CLI_DUMP_RC" -eq 0 ] && ok "CLI migrate dump 退出码 0" || bad "CLI migrate dump 退出码 $CLI_DUMP_RC"
 grep -q '迁移快照:' "$EVID/cli-migrate-dump.txt" && ok "CLI 打印快照摘要" || bad "CLI 缺少快照摘要"
-grep -q 'G2CMIG02，版本 2' "$EVID/cli-migrate-dump.txt" && ok "CLI 识别 G2CMIG02/v2" || bad "CLI 未识别 G2CMIG02/v2"
+grep -q 'G2CMIG03，版本 3' "$EVID/cli-migrate-dump.txt" && ok "CLI 识别 G2CMIG03/v3" || bad "CLI 未识别 G2CMIG03/v3"
 
-say "2.3 版本/魔数负路径（v1 与 version=3）"
+say "2.3 版本/魔数路径（v1 拒绝、v2 兼容读、version=9 拒绝）"
 printf 'G2CMIG01' > "$EVID/legacy-v1.mig"
 head -c 120 /dev/zero >> "$EVID/legacy-v1.mig"
-python3 - "$EVID/version3.mig" <<'PY'
+python3 - "$EVID/legacy-v2.mig" <<'PY'
 import struct, sys
 h = bytearray(192)
 h[0:8] = b"G2CMIG02"
-struct.pack_into("<I", h, 8, 3)     # version=3
-struct.pack_into("<I", h, 12, 192)  # header_size
+struct.pack_into("<I", h, 8, 2)      # version
+struct.pack_into("<I", h, 12, 192)   # header_size
+struct.pack_into("<I", h, 20, 2)     # section_count
+struct.pack_into("<Q", h, 44, 42)    # fiber_id
+struct.pack_into("<Q", h, 60, 65536)  # stack_size
+open(sys.argv[1], "wb").write(h)
+PY
+python3 - "$EVID/version9.mig" <<'PY'
+import struct, sys
+h = bytearray(224)
+h[0:8] = b"G2CMIG03"
+struct.pack_into("<I", h, 8, 9)      # version=9（不支持）
+struct.pack_into("<I", h, 12, 224)   # header_size
 open(sys.argv[1], "wb").write(h)
 PY
 GO2CPP_MIGRATE_TOOL="$MIGRATE" "$CLI" migrate restore "$EVID/legacy-v1.mig" \
@@ -223,12 +236,18 @@ cat "$EVID/cli-reject-v1.txt"
 [ "$V1_RC" -eq 4 ] && ok "CLI 拒绝 v1 魔数（退出码 4）" || bad "CLI v1 退出码 $V1_RC"
 grep -q '迁移文件格式不匹配' "$EVID/cli-reject-v1.txt" && ok "v1 错误信息明确" || bad "v1 错误信息不符"
 
-GO2CPP_MIGRATE_TOOL="$MIGRATE" "$CLI" migrate restore "$EVID/version3.mig" \
-    > "$EVID/cli-reject-v3.txt" 2>&1
-V3_RC=$?
-cat "$EVID/cli-reject-v3.txt"
-[ "$V3_RC" -eq 4 ] && ok "CLI 拒绝 version=3（退出码 4）" || bad "CLI v3 退出码 $V3_RC"
-grep -q 'version=3' "$EVID/cli-reject-v3.txt" && ok "版本校验错误信息含 version=3" || bad "版本校验错误信息不符"
+"$CLI" debug "$EVID/legacy-v2.mig" > "$EVID/cli-debug-v2.txt" 2>&1
+V2_DEBUG_RC=$?
+cat "$EVID/cli-debug-v2.txt"
+[ "$V2_DEBUG_RC" -eq 0 ] && ok "CLI 兼容读 G2CMIG02/v2" || bad "CLI v2 兼容读失败（$V2_DEBUG_RC）"
+grep -q 'G2CMIG02，版本 2' "$EVID/cli-debug-v2.txt" && ok "v2 摘要正确" || bad "v2 摘要不符"
+
+GO2CPP_MIGRATE_TOOL="$MIGRATE" "$CLI" migrate restore "$EVID/version9.mig" \
+    > "$EVID/cli-reject-v9.txt" 2>&1
+V9_RC=$?
+cat "$EVID/cli-reject-v9.txt"
+[ "$V9_RC" -eq 4 ] && ok "CLI 拒绝 version=9（退出码 4）" || bad "CLI v9 退出码 $V9_RC"
+grep -q 'version=9' "$EVID/cli-reject-v9.txt" && ok "版本校验错误信息含 version=9" || bad "版本校验错误信息不符"
 
 # ---------------------------------------------------------------------------
 # 3. 重放端到端
@@ -256,7 +275,7 @@ grep -q 'consistency=MATCH' "$EVID/replay-replay.txt" && ok "replay: consistency
 grep -q 'replayed: checksum=' "$EVID/replay-replay.txt" && ok "replay 打印重放校验和" || bad "replay 缺少校验和"
 
 say "3.1 CLI replay play（真实离线 replay 后端）"
-GO2CPP_REPLAY_TOOL="$OFFLINE_REPLAY" "$CLI" replay play "$RECORDING" > "$EVID/cli-replay-play.txt" 2>&1
+GO2CPP_REPLAY_TOOL="$OFFLINE_REPLAY" "$CLI" replay play "$RECORDING" > "$EVID/cli-replay-play.txt" 2> "$EVID/cli-replay-play.err"
 CLI_PLAY_RC=$?
 cat "$EVID/cli-replay-play.txt"
 [ "$CLI_PLAY_RC" -eq 0 ] && ok "CLI replay play 退出码 0" || bad "CLI replay play 退出码 $CLI_PLAY_RC"
@@ -284,6 +303,14 @@ STUCK_REPLAY_RC=$?
 cat "$EVID/replay-replay-stuck.txt"
 [ "$STUCK_REPLAY_RC" -ne 0 ] && ok "重放复现卡死（非零退出码 $STUCK_REPLAY_RC）" || bad "重放未复现卡死"
 grep -qi 'stuck\|MISMATCH' "$EVID/replay-replay-stuck.txt" && ok "重放报告 stuck/MISMATCH" || bad "重放报告缺少 stuck/MISMATCH"
+
+say "3.3 CLI replay play 透传 GO2CPP_REPLAY_DROP_WAKE"
+GO2CPP_REPLAY_TOOL="$OFFLINE_REPLAY" GO2CPP_REPLAY_DROP_WAKE=17 "$CLI" replay play "$STUCK" \
+    > "$EVID/cli-replay-drop.txt" 2>&1
+CLI_DROP_RC=$?
+cat "$EVID/cli-replay-drop.txt"
+[ "$CLI_DROP_RC" -ne 0 ] && ok "CLI 丢唤醒复现 stuck（非零退出码 $CLI_DROP_RC）" || bad "CLI 丢唤醒仍返回 0（D4 未修复）"
+grep -qi 'stuck' "$EVID/cli-replay-drop.txt" && ok "CLI 报告含 stuck" || bad "CLI 报告缺少 stuck"
 
 # ---------------------------------------------------------------------------
 say "结果"

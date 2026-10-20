@@ -48,7 +48,11 @@
 namespace go2cpp::cli {
 namespace {
 
-constexpr std::size_t kMaxPayloadBytes = 16ULL * 1024ULL * 1024ULL;
+// 上限与 DebugServer 的 kMaxResponseBytes（64 MiB）一致：
+// 大型进程的 `JSON scheduler` 实测可达 46.5 MiB，16 MiB 会让 status/dump
+// 直接不可用（P2-4）。超过 64 MiB 的响应在 DebugServer 端就会被拒绝为
+// `payload-too-large`，不会回流到这里。
+constexpr std::size_t kMaxPayloadBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kMaxHeadLineBytes = 4096;
 
 using Clock = std::chrono::steady_clock;

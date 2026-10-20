@@ -25,6 +25,17 @@ if (GO2CPP_DEBUG_DUMP)
         GO2CPP_DEBUG_EVENT_CRITICAL_CAPACITY=${GO2CPP_DEBUG_EVENT_CRITICAL_CAPACITY})
 endif()
 
+# 跨进程 Fiber/Channel 迁移 API（实验性）。默认 OFF：
+#   - 不编译迁移实现、不链接 tools/migration 的格式层；
+#   - Fiber 的迁移等待路径不存在，Channel<T> 没有额外虚表，
+#     类型布局与热路径与不定义该宏时完全一致。
+# 打开方式：cmake -DGO2CPP_MIGRATION_API=ON
+option(GO2CPP_MIGRATION_API
+       "Build the experimental cross-process Fiber/Channel migration API" OFF)
+if (GO2CPP_MIGRATION_API)
+    add_compile_definitions(GO2CPP_MIGRATION_API=1)
+endif()
+
 # 在线诊断代理（Doctor）。默认 OFF（零开销）：
 #   - 不编译 src/debug/diagnostic_agent.cpp，go2cpp_debug 里没有 Doctor 符号；
 #   - 不创建线程、不创建 socket、不注册任何回调；

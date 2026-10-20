@@ -29,6 +29,7 @@
  */
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -180,6 +181,130 @@ public:
     virtual bool Submit(std::function<void()> callback) = 0;
 };
 using TimerExecutorPtr = std::shared_ptr<TimerExecutor>;
+
+/**
+ * @brief 定时器来源分类（**只用于调试内省**，不参与调度语义）。
+ * @details 使用方可以在调用 `Schedule*` 前用 `TimerSourceScope` 标注来源；
+ *          未标注的定时器记为 kUnknown。`ScheduleOn` / `ScheduleEveryOn`
+ *          由实现自动标记为 kScheduler（这两个入口的唯一调用方是调度器）。
+ *          该枚举**不改变**定时器的排队、触发或取消行为。
+ */
+enum class TimerSource : std::uint8_t {
+    kUnknown = 0,          ///< 未标注（默认）。
+    kContext = 1,          ///< Context deadline / cancel。
+    kParkingCondition = 2, ///< ParkingCondition::WaitUntil 超时。
+    kChannel = 3,          ///< select / channel 的 timeout。
+    kTimedMutex = 4,       ///< timed_mutex 的 LockTimeout。
+    kScheduler = 5,        ///< Scheduler::ScheduleOn / ScheduleEveryOn。
+    kSleep = 6,            ///< time.hpp 的 Sleep / After。
+    kUser = 7,             ///< 用户显式标注的普通业务定时器。
+};
+
+/// 来源枚举的取值个数（数组 / JSON 输出用）。
+inline constexpr std::size_t kTimerSourceCount = 8;
+
+/// 来源枚举的稳定名字；未知值返回 "kUnknown"。
+const char* TimerSourceName(TimerSource source) noexcept;
+
+/**
+ * @brief TimerService 后台线程的观测状态。
+ * @details 只是**观测快照**：dump 读取时线程可能已经离开该状态。
+ */
+enum class TimerThreadState : std::uint8_t {
+    kUnknown = 0,   ///< 尚未启动或已退出。
+    kStarting = 1,  ///< 线程已创建、尚未进入等待循环。
+    kWaiting = 2,   ///< 在条件变量上等待最近的截止时间。
+    kExecuting = 3, ///< 正在执行回调（锁外）。
+    kStopping = 4,  ///< 已收到停止信号，正在收尾。
+    kStopped = 5,   ///< 线程已结束。
+};
+
+/// 线程状态的稳定名字。
+const char* TimerThreadStateName(TimerThreadState state) noexcept;
+
+/// 单个来源的分类统计（只读快照）。
+struct TimerSourceStats {
+    std::uint64_t active{0};      ///< 当前仍在队列里的定时器数。
+    std::uint64_t armed{0};       ///< 累计注册数。
+    std::uint64_t fired{0};       ///< 累计实际执行回调的次数。
+    std::uint64_t cancelled{0};   ///< 累计取消数。
+    std::uint64_t rescheduled{0}; ///< 累计周期重排次数。
+    std::uint64_t completed{0};   ///< 累计正常结束（一次性触发 / 周期 Stop）。
+    std::uint64_t failed{0};      ///< 累计异常结束。
+};
+
+/**
+ * @brief `TimerService::DebugSnapshot()` 的返回值（纯数据，只读）。
+ *
+ * ## 一致性
+ *
+ * `active` / `next_deadline` / `sources[*].active` 在服务锁内采集；
+ * 统计计数是原子量，可能与容器状态差一拍。`seq` 是每次 dump 自增的
+ * 观测序号，便于判断两次 dump 之间是否有变化。
+ *
+ * ## 边界
+ *
+ * - 不包含每个定时器的回调 / 句柄：只给聚合视图，避免把用户闭包暴露给
+ *   dump 通道；
+ * - `thread_id` 是 `std::thread::id` 的哈希，仅用于同进程内区分；
+ * - OFF 构建（无 GO2CPP_DEBUG_DUMP）也能用：事件环字段如实报告 false。
+ */
+struct TimerDebugSnapshot {
+    std::chrono::steady_clock::time_point captured_at{}; ///< 采集时刻。
+    std::uint64_t seq{0};          ///< 本进程内 dump 序号（1 起）。
+    std::size_t active{0};         ///< 队列中尚未领取的定时器数。
+    std::optional<std::chrono::steady_clock::time_point> next_deadline{}; ///< 堆顶。
+    std::uint64_t armed_total{0};  ///< 累计注册数（所有来源）。
+    std::uint64_t fired{0};        ///< 累计执行次数。
+    std::uint64_t cancelled{0};    ///< 累计取消次数。
+    std::uint64_t rescheduled{0};  ///< 累计重排次数。
+    std::uint64_t completed{0};    ///< 累计正常结束次数。
+    std::uint64_t failed{0};       ///< 累计异常结束次数。
+    std::array<TimerSourceStats, kTimerSourceCount> sources{}; ///< 按来源分类。
+    bool running{false};           ///< 服务是否仍接受新任务。
+    bool stopping{false};          ///< 是否已进入停止流程。
+    std::uint64_t thread_id{0};    ///< 后台线程 id 的哈希（0=无线程）。
+    bool thread_joinable{false};   ///< 后台线程是否仍 joinable。
+    TimerThreadState thread_state{TimerThreadState::kUnknown}; ///< 线程状态。
+    std::uint64_t background_wait_wakeups{0}; ///< 后台线程被唤醒次数。
+    bool event_ring_supported{false}; ///< 本构建是否记录 timer 事件。
+};
+
+/**
+ * @brief 设置**当前线程**的默认定时器来源标签。
+ * @param source 来源分类；kUnknown 表示清除标签。
+ * @param source_gid 该来源的逻辑 fiber id（0 表示未知）。
+ * @details 使用方在调用 `Schedule*` 前设置，或使用 `TimerSourceScope` 的
+ *          RAII 形式。标签只影响调试快照的分类，不影响调度。
+ */
+void SetThreadTimerSource(TimerSource source,
+                          std::uint32_t source_gid = 0) noexcept;
+/// 读取当前线程的默认来源标签（未设置返回 kUnknown）。
+TimerSource ThreadTimerSource() noexcept;
+/// 读取当前线程的来源 gid（未设置返回 0）。
+std::uint32_t ThreadTimerSourceGid() noexcept;
+
+/**
+ * @brief 作用域内的来源标签（RAII；析构恢复进入前的值）。
+ * @code
+ *   {
+ *       core::TimerSourceScope scope(core::TimerSource::kChannel);
+ *       service.ScheduleAfter(timeout, cb);   // 分类记为 kChannel
+ *   }
+ * @endcode
+ */
+class TimerSourceScope final {
+public:
+    explicit TimerSourceScope(TimerSource source,
+                              std::uint32_t source_gid = 0) noexcept;
+    ~TimerSourceScope();
+    TimerSourceScope(const TimerSourceScope&) = delete;
+    TimerSourceScope& operator=(const TimerSourceScope&) = delete;
+
+private:
+    TimerSource m_previous;
+    std::uint32_t m_previous_gid;
+};
 
 class TimerService;
 
@@ -364,6 +489,13 @@ public:
     std::size_t PendingCount() const noexcept;
     /** @brief 返回最早待处理截止时间；无待处理任务时返回空值。 */
     std::optional<Clock::time_point> NextDeadline() const noexcept;
+
+    /**
+     * @brief 只读调试快照：活动数、堆顶 deadline、按来源分类、到期统计、
+     *        后台线程状态。
+     * @details 不修改任何调度状态，可在任意线程调用；不分配内存。
+     */
+    TimerDebugSnapshot DebugSnapshot() const noexcept;
 
 private:
     std::shared_ptr<Impl> m_impl;
