@@ -60,8 +60,9 @@ namespace go2cpp::replay {
 
 /// 文件魔数（8 字节，含结尾 NUL）。
 inline constexpr char kMagic[8] = {'G', '2', 'C', 'R', 'P', 'L', 'Y', '\0'};
-/// 写端版本：v3 在 v2 基础上只追加 TimerService 的 timer 字段。
-inline constexpr std::uint16_t kFormatVersion = 3;
+/// 写端版本：v4 在 v3 基础上新增资源事件（lock/unlock/pc/channel）。
+/// 读端仍接受 v1~v4：旧文件缺少的字段按默认值处理。
+inline constexpr std::uint16_t kFormatVersion = 4;
 /// 读端接受的最小版本。v1 文件没有 v2 的追加字段，解码器按剩余字节判断。
 inline constexpr std::uint16_t kMinFormatVersion = 1;
 inline constexpr std::uint32_t kFileHeaderSize = 32;
@@ -89,6 +90,15 @@ enum class EventType : std::uint16_t {
     kWake = 21,   ///< 一次唤醒（离开等待）；重放的驱动点
     kSched = 30,  ///< 调度器旁证事件（observer：started/suspended/completed）
     kNote = 40,   ///< 自由文本标注（注入、watchdog、诊断）
+    // v4：资源事件（与 channel/select/timer 同一条 seq 流）。
+    // 录制端在锁/条件变量/channel 的慢路径写；回放端只读重演，
+    // 不重新竞争，因此序列与 owner 完全由记录决定。
+    kResMutexLock = 50,    ///< 互斥锁加锁（含无竞争快路径）
+    kResMutexUnlock = 51,  ///< 互斥锁解锁（target=被唤醒者）
+    kResPCWait = 52,       ///< ParkingCondition 等待
+    kResPCNotify = 53,     ///< ParkingCondition 唤醒
+    kResChannelSend = 54,  ///< channel 发送（含立即完成/阻塞）
+    kResChannelRecv = 55,  ///< channel 接收（含立即完成/阻塞）
     kEnd = 99,    ///< 文件结束；payload 带总条数与整文件 CRC
 };
 
@@ -229,6 +239,13 @@ struct Event {
     std::uint64_t deadline_ns{0};    ///< 绝对的虚拟截止时间（相对录制起点）
     std::uint64_t fired_at_ns{0};    ///< 回调开始执行时的虚拟时间
     std::int64_t callback_result{0}; ///< 回调返回值（重放时校验一致）
+    // ---- v4：资源事件字段（其它类型保持 0）----
+    std::uint64_t resource_id{0};    ///< 资源标识（录制端分配，0=未知）
+    std::uint64_t actor_gid{0};      ///< 执行操作的逻辑 fiber（与 gid 一致）
+    std::uint64_t target_gid{0};     ///< 被唤醒/交接的 gid（0=无）
+    std::uint32_t resource_result{0};///< ResourceResult 数值（0=ok）
+    std::uint64_t address{0};        ///< 资源对象地址（诊断定位用）
+    std::uint32_t waiters{0};        ///< 操作后的等待者数（近似）
 };
 
 /**

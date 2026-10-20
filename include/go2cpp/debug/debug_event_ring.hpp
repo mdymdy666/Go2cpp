@@ -82,6 +82,8 @@
  * 新事件发布；不同则说明存在并发写入（见 debug_dump.hpp 的一致性标记约定）。
  */
 
+#include "go2cpp/debug/debug_config.hpp"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -262,6 +264,107 @@ enum class SchedEventCode : std::uint16_t {
 const char* SchedEventCodeName(SchedEventCode code) noexcept;
 
 /**
+ * @brief 事件码 → 类别（类别定义与语义见 `debug_config.hpp`）。
+ *
+ * 分组规则（与枚举的数值区间对齐，新增码必须同时登记到这里）：
+ * - 1~3、10~14、136 → kPark；
+ * - 20~23、30~33、110~114 → kSched；
+ * - 40~42 → kIo；
+ * - 50~53、100~105 → kLifecycle；
+ * - 60~62（Doctor）→ kNone（不受开关控制，保证受控干预永远留痕）；
+ * - 70~79、80~82、120~129、137~138 → kPrimitives；
+ * - 90~93、115、130 → kTimer；
+ * - 其它 → kNone。
+ */
+inline DebugCategory DebugCategoryOf(SchedEventCode code) noexcept {
+    switch (code) {
+        // ---- park / wake ----
+        case SchedEventCode::kParkEnter:
+        case SchedEventCode::kParkReturn:
+        case SchedEventCode::kParkRejected:
+        case SchedEventCode::kWakeRequest:
+        case SchedEventCode::kWakeEnqueued:
+        case SchedEventCode::kWakePending:
+        case SchedEventCode::kWakeRejected:
+        case SchedEventCode::kWakeBatch:
+        case SchedEventCode::kParkCaptured:
+            return DebugCategory::kPark;
+        // ---- 调度（入队/出队/窃取/worker/sysmon）----
+        case SchedEventCode::kEnqueue:
+        case SchedEventCode::kEnqueueRejected:
+        case SchedEventCode::kRequeueWorker:
+        case SchedEventCode::kRequeueProcessor:
+        case SchedEventCode::kRunQueuePush:
+        case SchedEventCode::kRunQueuePop:
+        case SchedEventCode::kRunQueueClaimOk:
+        case SchedEventCode::kRunQueueClaimFail:
+        case SchedEventCode::kStealOk:
+        case SchedEventCode::kStealFail:
+        case SchedEventCode::kWorkerPark:
+        case SchedEventCode::kWorkerUnpark:
+        case SchedEventCode::kSysmonPass:
+            return DebugCategory::kSched;
+        // ---- IO ----
+        case SchedEventCode::kIoWait:
+        case SchedEventCode::kIoWake:
+        case SchedEventCode::kIoWakeBatch:
+            return DebugCategory::kIo;
+        // ---- 生命周期 ----
+        case SchedEventCode::kSchedulerStart:
+        case SchedEventCode::kSchedulerStop:
+        case SchedEventCode::kThreadStart:
+        case SchedEventCode::kThreadStop:
+        case SchedEventCode::kGCreated:
+        case SchedEventCode::kGStarted:
+        case SchedEventCode::kGResumed:
+        case SchedEventCode::kGCompleted:
+        case SchedEventCode::kGFailed:
+        case SchedEventCode::kGCancelled:
+            return DebugCategory::kLifecycle;
+        // ---- 并发原语 ----
+        case SchedEventCode::kMutexLock:
+        case SchedEventCode::kMutexUnlock:
+        case SchedEventCode::kRwLockRead:
+        case SchedEventCode::kRwUnlockRead:
+        case SchedEventCode::kRwLockWrite:
+        case SchedEventCode::kRwUnlockWrite:
+        case SchedEventCode::kRecursiveLock:
+        case SchedEventCode::kRecursiveUnlock:
+        case SchedEventCode::kCvWait:
+        case SchedEventCode::kCvNotify:
+        case SchedEventCode::kChannelSend:
+        case SchedEventCode::kChannelRecv:
+        case SchedEventCode::kChannelWake:
+        case SchedEventCode::kMutexFastLock:
+        case SchedEventCode::kChannelSendOk:
+        case SchedEventCode::kChannelRecvOk:
+        case SchedEventCode::kChannelSelectEnter:
+        case SchedEventCode::kChannelSelect:
+        case SchedEventCode::kPCWait:
+        case SchedEventCode::kPCNotify:
+        case SchedEventCode::kPCNotifyAll:
+        case SchedEventCode::kWaitGroupWait:
+        case SchedEventCode::kWaitGroupDone:
+            return DebugCategory::kPrimitives;
+        // ---- timer ----
+        case SchedEventCode::kTimerArm:
+        case SchedEventCode::kTimerFire:
+        case SchedEventCode::kTimerCancel:
+        case SchedEventCode::kTimerReschedule:
+        case SchedEventCode::kTimerEnqueue:
+        case SchedEventCode::kTimerCallback:
+            return DebugCategory::kTimer;
+        // Doctor 事件与未知码不受类别开关控制（永远记录）。
+        case SchedEventCode::kUnknown:
+        case SchedEventCode::kDiagnosticSuspected:
+        case SchedEventCode::kDiagnosticForceWake:
+        case SchedEventCode::kDiagnosticMutexUnlock:
+            return DebugCategory::kNone;
+    }
+    return DebugCategory::kNone;
+}
+
+/**
  * @brief 该事件是否写入**关键区**（不会被普通事件覆盖）。
  * @details 关键集合 = wake 系列 + enqueue 拒绝 + claim 失败 + park 拒绝 +
  *          G 终态（完成/失败/取消）+ 诊断事件。
@@ -433,14 +536,28 @@ public:
 
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
 
+// 粒度过滤：每个记录点在参数求值**之前**检查类别，关闭时没有任何副作用
+// （不读时钟、不取 gid、不写槽位）。三元表达式保持与旧宏一致的「表达式」
+// 语义（两个分支都是 void）。
 #define GO2CPP_DEBUG_EVENT(code, gid, arg2)                              \
-    ::go2cpp::debug::EventRing::Record(                                  \
-        ::go2cpp::debug::SchedEventCode::code, static_cast<std::uint64_t>(gid), \
-        static_cast<std::uint64_t>(arg2))
+    (::go2cpp::debug::DebugConfig::Enabled(                              \
+         ::go2cpp::debug::DebugCategoryOf(                               \
+             ::go2cpp::debug::SchedEventCode::code))                     \
+         ? ::go2cpp::debug::EventRing::Record(                           \
+               ::go2cpp::debug::SchedEventCode::code,                    \
+               static_cast<std::uint64_t>(gid),                          \
+               static_cast<std::uint64_t>(arg2))                         \
+         : (void)0)
 #define GO2CPP_DEBUG_EVENT_SAMPLED(code, gid, arg2, every)               \
-    ::go2cpp::debug::EventRing::RecordSampled(                           \
-        ::go2cpp::debug::SchedEventCode::code, static_cast<std::uint64_t>(gid), \
-        static_cast<std::uint64_t>(arg2), static_cast<std::uint32_t>(every))
+    (::go2cpp::debug::DebugConfig::Enabled(                              \
+         ::go2cpp::debug::DebugCategoryOf(                               \
+             ::go2cpp::debug::SchedEventCode::code))                     \
+         ? ::go2cpp::debug::EventRing::RecordSampled(                    \
+               ::go2cpp::debug::SchedEventCode::code,                    \
+               static_cast<std::uint64_t>(gid),                          \
+               static_cast<std::uint64_t>(arg2),                         \
+               static_cast<std::uint32_t>(every))                        \
+         : (void)0)
 #define GO2CPP_DEBUG_BIND_PROCESSOR(pid) \
     ::go2cpp::debug::EventRing::BindProcessor(static_cast<std::uint32_t>(pid))
 #define GO2CPP_DEBUG_UNBIND_PROCESSOR() \
@@ -452,11 +569,14 @@ public:
 #define GO2CPP_DEBUG_BOUND_TASK() \
     ::go2cpp::debug::EventRing::BoundTask()
 #define GO2CPP_DEBUG_TIMER_EVENT(code, timer_id, deadline_ns, kind, source_gid) \
-    ::go2cpp::debug::EventRing::RecordTimer(                                 \
-        (code), static_cast<std::uint64_t>(timer_id),                        \
-        static_cast<std::uint64_t>(deadline_ns),                             \
-        static_cast<std::uint8_t>(kind),                                     \
-        static_cast<std::uint32_t>(source_gid))
+    (::go2cpp::debug::DebugConfig::Enabled(                                 \
+         ::go2cpp::debug::DebugCategory::kTimer)                            \
+         ? ::go2cpp::debug::EventRing::RecordTimer(                          \
+               (code), static_cast<std::uint64_t>(timer_id),                 \
+               static_cast<std::uint64_t>(deadline_ns),                      \
+               static_cast<std::uint8_t>(kind),                              \
+               static_cast<std::uint32_t>(source_gid))                       \
+         : (void)0)
 
 #define GO2CPP_DEBUG_CONCAT_INNER(a, b) a##b
 #define GO2CPP_DEBUG_CONCAT(a, b) GO2CPP_DEBUG_CONCAT_INNER(a, b)

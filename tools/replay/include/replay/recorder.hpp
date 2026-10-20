@@ -102,6 +102,22 @@ Event MakeCtxEvent(std::uint32_t ctx_id, ContextEventKind kind,
                    std::uint32_t op_index);
 
 /**
+ * @brief 构造一条资源事件（v4：锁/条件变量/channel）。
+ * @param type kResMutexLock...kResChannelRecv 之一。
+ * @param resource_id 录制端的资源标识（`ResourceId`，0=未知）。
+ * @param actor_gid 执行操作的逻辑 fiber。
+ * @param target_gid 被唤醒/交接的 fiber（0=无）。
+ * @param resource_result `ResourceResult` 数值（0=ok）。
+ * @param address 资源对象地址（0=未知；仅诊断用）。
+ * @param waiters 操作后的等待者数（近似）。
+ */
+Event MakeResourceEvent(EventType type, std::uint64_t resource_id,
+                        std::uint64_t actor_gid,
+                        std::uint64_t target_gid,
+                        std::uint32_t resource_result,
+                        std::uint64_t address, std::uint32_t waiters);
+
+/**
  * @brief 线程安全的录制器。
  *
  * 生命周期：构造成功后即可 `Write`；析构会调用 `Finalize()`。对象必须比

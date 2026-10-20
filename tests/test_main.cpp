@@ -44,6 +44,8 @@ void run_debug_events_tests();
 void run_debug_breakpoints_tests();
 void run_debug_signal_dump_tests();
 void run_debug_dump_tests();
+void run_debug_config_tests();
+void run_resource_replay_tests();
 void run_timer_debug_tests();
 void run_timer_replay_tests();
 #if defined(GO2CPP_DIAGNOSTIC) && GO2CPP_DIAGNOSTIC
@@ -115,6 +117,8 @@ int main() {
     if (selected("debug_breakpoints")) run_debug_breakpoints_tests();
     if (selected("debug_signal_dump")) run_debug_signal_dump_tests();
     if (selected("debug_dump")) run_debug_dump_tests();
+    if (selected("debug_config")) run_debug_config_tests();
+    if (selected("resource_replay")) run_resource_replay_tests();
     if (selected("timer_debug")) run_timer_debug_tests();
     if (selected("timer_replay")) run_timer_replay_tests();
 #if defined(GO2CPP_DIAGNOSTIC) && GO2CPP_DIAGNOSTIC

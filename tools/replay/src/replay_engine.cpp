@@ -152,7 +152,16 @@ bool LoadFile(const std::string& path, LoadedFile* out) {
             out->error = "record at offset " + std::to_string(offset) + ": " + error;
             return false;
         }
-        if (event.gid > kMaxGid) {
+        // 资源事件的 gid 字段是 actor_gid（全局 Task 编号，可远超 65536），
+        // 它们不进入 per-gid 稠密索引，因此不能按 kMaxGid 拒绝。
+        const bool resource_event =
+            event.type == EventType::kResMutexLock ||
+            event.type == EventType::kResMutexUnlock ||
+            event.type == EventType::kResPCWait ||
+            event.type == EventType::kResPCNotify ||
+            event.type == EventType::kResChannelSend ||
+            event.type == EventType::kResChannelRecv;
+        if (!resource_event && event.gid > kMaxGid) {
             // 超限 gid 必须在分配任何索引数组之前拒绝：per-gid 稠密数组
             // 会按 max_gid+1 分配，gid=0x7FFFFFFF 会直接 bad_alloc → abort。
             out->format_error = true;
@@ -255,6 +264,140 @@ private:
     std::uint64_t m_next_ns{0};
 };
 
+
+/// 资源事件判定（v4）。
+bool IsResourceEvent(EventType type) noexcept {
+    switch (type) {
+        case EventType::kResMutexLock:
+        case EventType::kResMutexUnlock:
+        case EventType::kResPCWait:
+        case EventType::kResPCNotify:
+        case EventType::kResChannelSend:
+        case EventType::kResChannelRecv:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// 静态重演的资源状态：owner / 加锁时间 / lock 条目下标 / 等待者。
+struct ResourceReplayState {
+    std::map<std::uint64_t, std::uint64_t> owner;
+    std::map<std::uint64_t, std::uint64_t> lock_vtime;
+    std::map<std::uint64_t, std::size_t> lock_entry;
+    std::map<std::uint64_t, std::vector<std::uint64_t>> waiters;
+};
+
+void EraseWaiter(std::vector<std::uint64_t>* waiters, std::uint64_t gid) {
+    if (waiters == nullptr || gid == 0U) {
+        return;
+    }
+    waiters->erase(std::remove(waiters->begin(), waiters->end(), gid),
+                   waiters->end());
+}
+
+/**
+ * @brief 累计一条资源事件：统计、序列校验、时间线条目。
+ *
+ * 只读重演：不重新竞争，owner 由记录中的 lock/unlock 维护。校验规则：
+ * - unlock 必须能对应到当前 owner（否则记录自相矛盾）；
+ * - unlock 的 target（若非 0）从等待者集合移除；
+ * - 成对 lock/unlock 的虚拟时间差累计为持锁时长。
+ */
+void AccumulateResourceEvent(const Event& event, ReplayReport* report,
+                             ResourceReplayState* state) {
+    ++report->stats.resource_events;
+    const std::uint64_t key = event.resource_id;
+    ResourceTimelineEntry entry;
+    entry.seq = event.seq;
+    entry.vtime_ns = event.vtime_ns;
+    entry.type = event.type;
+    entry.resource_id = key;
+    // 旧录制（v1~v3）没有 actor_gid；回退到 gid 字段。
+    entry.actor_gid = event.actor_gid != 0U ? event.actor_gid : event.gid;
+    entry.target_gid = event.target_gid;
+    entry.result = event.resource_result;
+    entry.address = event.address;
+    entry.waiters = event.waiters;
+
+    switch (event.type) {
+        case EventType::kResMutexLock:
+            ++report->stats.res_mutex_locks;
+            if (event.resource_result == 0U) {
+                state->owner[key] = entry.actor_gid;
+                state->lock_vtime[key] = event.vtime_ns;
+                state->lock_entry[key] = report->resources.size();
+            } else if (event.resource_result == 1U) {
+                state->waiters[key].push_back(entry.actor_gid);
+            }
+            break;
+        case EventType::kResMutexUnlock: {
+            ++report->stats.res_mutex_unlocks;
+            const auto owner_it = state->owner.find(key);
+            // gid 0 是合法 actor（主线程），因此只按「是否存在」判断。
+            //
+            // 录制端的 lock/unlock 记录点在 CAS 之后（锁外），并发时
+            // 记录顺序可能比线性化顺序晚一拍：A 的 unlock 已经真实
+            // 释放、B 的 lock 已经成功，但 A 的 unlock 事件写入
+            // recorder 更晚。这种窗口在只读重演里无法也不应判成
+            // 记录损坏 —— 只计一次「顺序异常」，序列本身照原样输出。
+            if (owner_it == state->owner.end()) {
+                ++report->stats.resource_order_anomalies;
+            } else if (owner_it->second != entry.actor_gid) {
+                ++report->stats.resource_order_anomalies;
+            } else {
+                const auto lock_it = state->lock_vtime.find(key);
+                if (lock_it != state->lock_vtime.end()) {
+                    const std::uint64_t hold =
+                        event.vtime_ns >= lock_it->second
+                            ? event.vtime_ns - lock_it->second
+                            : 0U;
+                    report->stats.resource_lock_hold_ns += hold;
+                    const auto entry_it = state->lock_entry.find(key);
+                    if (entry_it != state->lock_entry.end() &&
+                        entry_it->second < report->resources.size() &&
+                        report->resources[entry_it->second].hold_ns == 0U) {
+                        report->resources[entry_it->second].hold_ns = hold;
+                    }
+                }
+                state->owner.erase(owner_it);
+                state->lock_vtime.erase(key);
+                state->lock_entry.erase(key);
+            }
+            EraseWaiter(&state->waiters[key], entry.target_gid);
+            break;
+        }
+        case EventType::kResPCWait:
+            ++report->stats.res_pc_waits;
+            state->waiters[key].push_back(entry.actor_gid);
+            break;
+        case EventType::kResPCNotify:
+            ++report->stats.res_pc_notifies;
+            EraseWaiter(&state->waiters[key], entry.target_gid);
+            break;
+        case EventType::kResChannelSend:
+            ++report->stats.res_channel_sends;
+            break;
+        case EventType::kResChannelRecv:
+            ++report->stats.res_channel_recvs;
+            break;
+        default:
+            break;
+    }
+
+    report->stats.resource_checksum = FnvStep(
+        report->stats.resource_checksum,
+        (static_cast<std::uint64_t>(event.type) << 48U) ^ (key & 0xFFFFFFFFFFFFULL));
+    report->stats.resource_checksum =
+        FnvStep(report->stats.resource_checksum, entry.actor_gid);
+    report->stats.resource_checksum =
+        FnvStep(report->stats.resource_checksum, entry.target_gid);
+    report->stats.resource_checksum = FnvStep(
+        report->stats.resource_checksum,
+        (static_cast<std::uint64_t>(entry.result) << 32U) ^ entry.waiters);
+    report->resources.push_back(entry);
+}
+
 /// 静态分析：park/wake 配对、blocked 操作配对、xfer 配对、退出计数、select 自洽。
 ReplayReport AnalyzeLoaded(const LoadedFile& loaded, const ReplayOptions& options,
                            const std::string& path) {
@@ -263,12 +406,17 @@ ReplayReport AnalyzeLoaded(const LoadedFile& loaded, const ReplayOptions& option
     // FNV-1a 64 的 offset basis：demo 侧用同一算法直接比对。
     report.stats.message_checksum = 1469598103934665603ULL;
     report.stats.select_checksum = 1469598103934665603ULL;
+    report.stats.resource_checksum = 1469598103934665603ULL;
 
     std::map<std::uint64_t, const Event*> parks;
     std::vector<const Event*> wakes;
+    ResourceReplayState resource_state;
     std::map<std::uint32_t, const Event*> xfer_owners;
     std::uint32_t max_gid = 0;
     for (const auto& event : loaded.events) {
+        if (IsResourceEvent(event.type)) {
+            continue;  // 资源事件的 gid 是 actor_gid，不进稠密索引
+        }
         max_gid = std::max(max_gid, event.gid);
     }
     if (max_gid > kMaxGid) {
@@ -437,6 +585,14 @@ ReplayReport AnalyzeLoaded(const LoadedFile& loaded, const ReplayOptions& option
                 if (gid_stats != nullptr) ++gid_stats->wakes;
                 wakes.push_back(&event);
                 break;
+            case EventType::kResMutexLock:
+            case EventType::kResMutexUnlock:
+            case EventType::kResPCWait:
+            case EventType::kResPCNotify:
+            case EventType::kResChannelSend:
+            case EventType::kResChannelRecv:
+                AccumulateResourceEvent(event, &report, &resource_state);
+                break;
             default:
                 break;
         }
@@ -465,6 +621,10 @@ ReplayReport AnalyzeLoaded(const LoadedFile& loaded, const ReplayOptions& option
     report.stopped_at_seq = options.stop_at_seq;
     report.stopped_early = has_stop && index < loaded.events.size();
     report.virtual_ns = virtual_ns;
+    // 静态重演同样是「只读重演」：资源事件序列完全来自记录，
+    // 重放侧校验和与记录值一致（完整重放也会再写一次同值）。
+    report.stats.replayed_resource_checksum =
+        report.stats.resource_checksum;
     // 分片文件的最后一条是 `kNote("checkpoint: part ...")`：它标记「到此
     // 为止」而不是「记录损坏」，因此同样按 partial 处理。
     if (!report.stopped_early && !loaded.events.empty() &&
@@ -758,6 +918,9 @@ private:
     void BuildIndexes() {
         std::uint32_t max_gid = 0;
         for (const auto& event : m_events) {
+            if (IsResourceEvent(event.type)) {
+                continue;  // 资源事件不参与 per-gid 索引
+            }
             max_gid = std::max(max_gid, event.gid);
         }
         if (max_gid > kMaxGid) {
@@ -1059,6 +1222,10 @@ ReplayReport Engine::Run(const ReplayReport& base) {
     report.stats.recvs = m_stats.recvs;
     report.stats.replayed_select_choices = m_stats.replayed_select_choices;
     report.stats.replayed_select_checksum = m_stats.replayed_select_checksum;
+    // 资源事件只读重演：输出序列就是记录序列，校验和必然相同；
+    // 显式写一份，便于调用方一次比较「录制 vs 重放」。
+    report.stats.replayed_resource_checksum =
+        base.stats.resource_checksum;
     if (m_timers != nullptr) {
         // 与静态分析的初值保持一致（ReplayStats 默认 0 起）——
         // 两边同一条 fire 序列必须得到同一个 checksum。
@@ -1239,6 +1406,23 @@ ReplayReport MakeFormatErrorReport(const std::string& path,
     report.status = ReplayStatus::kFormatError;
     report.error = error;
     return report;
+}
+
+bool LoadRecordingEvents(const std::string& path,
+                         std::vector<Event>* events,
+                         std::string* error) {
+    if (events == nullptr) {
+        if (error != nullptr) *error = "null output";
+        return false;
+    }
+    LoadedFile loaded;
+    if (!LoadFile(path, &loaded)) {
+        if (error != nullptr) *error = loaded.error;
+        return false;
+    }
+    *events = std::move(loaded.events);
+    if (error != nullptr) error->clear();
+    return true;
 }
 
 ReplayReport ReplayFile(const std::string& path, const ReplayOptions& options) {
@@ -1509,6 +1693,28 @@ std::string ReplayReportJson(const ReplayReport& report) {
     out += ",\"bytes_messages\":" + std::to_string(report.stats.bytes_messages);
     out += ",\"dropped_wakes\":" + std::to_string(report.stats.dropped_wakes);
     out += ",\"synthetic_events\":" + std::to_string(report.stats.synthetic_events);
+    out += ",\"resource_events\":" +
+           std::to_string(report.stats.resource_events);
+    out += ",\"res_mutex_locks\":" +
+           std::to_string(report.stats.res_mutex_locks);
+    out += ",\"res_mutex_unlocks\":" +
+           std::to_string(report.stats.res_mutex_unlocks);
+    out += ",\"res_pc_waits\":" +
+           std::to_string(report.stats.res_pc_waits);
+    out += ",\"res_pc_notifies\":" +
+           std::to_string(report.stats.res_pc_notifies);
+    out += ",\"res_channel_sends\":" +
+           std::to_string(report.stats.res_channel_sends);
+    out += ",\"res_channel_recvs\":" +
+           std::to_string(report.stats.res_channel_recvs);
+    out += ",\"resource_checksum\":" +
+           std::to_string(report.stats.resource_checksum);
+    out += ",\"replayed_resource_checksum\":" +
+           std::to_string(report.stats.replayed_resource_checksum);
+    out += ",\"resource_lock_hold_ns\":" +
+           std::to_string(report.stats.resource_lock_hold_ns);
+    out += ",\"resource_order_anomalies\":" +
+           std::to_string(report.stats.resource_order_anomalies);
     out += ",\"message_checksum\":" + std::to_string(report.stats.message_checksum);
     out += ",\"replayed_message_checksum\":" +
            std::to_string(report.stats.replayed_message_checksum);
@@ -1584,6 +1790,31 @@ std::string ReplayReportJson(const ReplayReport& report) {
         out += ",\"selects\":" + std::to_string(gid.selects) + "}";
     }
     out += "]";
+
+    if (!report.resources.empty()) {
+        out += ",\"resources\":[";
+        for (std::size_t index = 0; index < report.resources.size();
+             ++index) {
+            const auto& entry = report.resources[index];
+            if (index != 0) out += ",";
+            out += "{\"seq\":" + std::to_string(entry.seq);
+            out += ",\"vtime_ns\":" + std::to_string(entry.vtime_ns);
+            out += ",\"type\":\"" +
+                   std::string(EventTypeName(entry.type)) + "\"";
+            out += ",\"resource_id\":" +
+                   std::to_string(entry.resource_id);
+            out += ",\"actor_gid\":" +
+                   std::to_string(entry.actor_gid);
+            out += ",\"target_gid\":" +
+                   std::to_string(entry.target_gid);
+            out += ",\"result\":" + std::to_string(entry.result);
+            out += ",\"address\":" + std::to_string(entry.address);
+            out += ",\"waiters\":" + std::to_string(entry.waiters);
+            out += ",\"hold_ns\":" + std::to_string(entry.hold_ns);
+            out += "}";
+        }
+        out += "]";
+    }
 
     if (!report.timeline.empty()) {
         out += ",\"timeline\":[";

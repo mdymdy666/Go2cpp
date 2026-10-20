@@ -60,6 +60,26 @@
 #define GO2CPP_DEBUG_DUMP 0
 #endif
 
+/**
+ * @brief 资源级历史/资源事件是否参与编译。
+ *
+ * 两个独立开关任一打开即可：
+ * - `GO2CPP_DEBUG_DUMP=ON`：事件环 + 资源历史（在线诊断）；
+ * - `GO2CPP_REPLAY=ON`：回放录制只需要资源注册表与事件转发，不需要环形缓冲
+ *   （见 `SetResourceReplaySink`）。
+ *
+ * DBG=OFF && REPLAY=OFF 时所有资源宏仍展开为 `((void)0)`，注册表实现返回
+ * 无效 id，热路径零开销。
+ */
+#ifndef GO2CPP_DEBUG_RESOURCES
+#if (defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP) || \
+    (defined(GO2CPP_REPLAY) && GO2CPP_REPLAY)
+#define GO2CPP_DEBUG_RESOURCES 1
+#else
+#define GO2CPP_DEBUG_RESOURCES 0
+#endif
+#endif
+
 namespace go2cpp::debug {
 
 /// 资源类别（稳定；新增只能追加）。
@@ -120,6 +140,12 @@ void UnregisterResourceByAddress(const void* address) noexcept;
 bool LookupResource(ResourceId id, ResourceInfo* out);
 /// 按地址查询**存活**条目；未找到返回 0。
 ResourceId FindResourceByAddress(const void* address) noexcept;
+/**
+ * @brief 按编号查询**存活**资源的地址；未找到/已注销返回 nullptr。
+ * @note 与 `LookupResource` 的区别：不拷贝 `ResourceInfo`（不分配
+ *       字符串），供录制热路径与外部工具按 id 取地址。
+ */
+const void* LookupResourceAddress(ResourceId id) noexcept;
 /// 全部条目快照（按 id 升序）。
 std::vector<ResourceInfo> SnapshotResources();
 /// 当前存活条目数。
@@ -307,8 +333,36 @@ struct ResourceEventRecord {
 /**
  * @brief 记录一条资源事件（线程栈样本在此内部捕获）。
  * @note OFF 构建为空操作；调用方优先使用 `GO2CPP_DEBUG_RESOURCE_EVENT`。
+ *       若安装了回放录制汇（见下），事件在写环之前先转发给它。
  */
 void RecordResourceEvent(const ResourceEventRecord& event) noexcept;
+
+// ---------------------------------------------------------------------------
+// 回放录制汇（GO2CPP_REPLAY=ON）
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief 资源事件回放录制回调。
+ *
+ * 参数是**已完成字段填充**的资源事件；回调由产生事件的线程同步调用，
+ * 因此实现必须thread-safe且尽量短（`replay::Recorder::Write` 只做一次加锁
+ * 与顺序写）。回调内不得递归触发资源事件。
+ */
+using ResourceReplaySink = void (*)(void* user,
+                                    const ResourceEventRecord& event) noexcept;
+
+/**
+ * @brief 安装/卸载资源事件录制汇。
+ * @param sink nullptr 表示卸载。
+ * @param user 回调透传的用户指针（通常是 `replay::Recorder*`）。
+ * @note 线程安全。未安装时 `RecordResourceEvent` 只有一次 acquire 读。
+ *       `tools/replay` 的 `Recorder` 在构造时安装、析构时卸载；同一进程
+ *       同一时刻只支持一个录制器（重复安装以后者为准）。
+ */
+void SetResourceReplaySink(ResourceReplaySink sink, void* user) noexcept;
+
+/// 当前安装的汇；未安装返回 nullptr，`*user` 写 0（`user` 可为 nullptr）。
+ResourceReplaySink GetResourceReplaySink(void** user) noexcept;
 
 /// 计算 channel 值的摘要（整型/枚举/指针可直接比较；其它类型返回 0）。
 template <typename T>
@@ -346,7 +400,7 @@ void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
 
 }  // namespace go2cpp::debug
 
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
 
 /// 注册资源；`name` 可为 nullptr。
 #define GO2CPP_DEBUG_RESOURCE_REGISTER(kind, address, name)                \
@@ -389,6 +443,11 @@ void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
     ev_code, ev_resource, ev_actor, ev_target, ev_value, ev_result,          \
     ev_waiters, ev_critical, ev_flags)                                       \
     do {                                                                     \
+        if (!::go2cpp::debug::DebugConfig::Enabled(                          \
+                ::go2cpp::debug::DebugCategoryOf(                            \
+                    ::go2cpp::debug::SchedEventCode::ev_code))) {            \
+            break;                                                           \
+        }                                                                    \
         ::go2cpp::debug::ResourceEventRecord _go2cpp_res_ev;                 \
         _go2cpp_res_ev.code = ::go2cpp::debug::SchedEventCode::ev_code;      \
         _go2cpp_res_ev.resource_id =                                         \
@@ -399,13 +458,17 @@ void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
         _go2cpp_res_ev.result = (ev_result);                                 \
         _go2cpp_res_ev.waiters = static_cast<std::uint32_t>(ev_waiters);     \
         _go2cpp_res_ev.flags = static_cast<std::uint32_t>(ev_flags);         \
-        _go2cpp_res_ev.chain_id = ::go2cpp::debug::CaptureFiberChain(        \
-            static_cast<std::uint64_t>(ev_actor),                            \
-            static_cast<bool>(ev_critical));                                 \
+        _go2cpp_res_ev.chain_id =                                            \
+            ::go2cpp::debug::DebugConfig::Enabled(                           \
+                ::go2cpp::debug::DebugCategory::kChains)                     \
+                ? ::go2cpp::debug::CaptureFiberChain(                        \
+                      static_cast<std::uint64_t>(ev_actor),                   \
+                      static_cast<bool>(ev_critical))                        \
+                : 0U;                                                       \
         ::go2cpp::debug::RecordResourceEvent(_go2cpp_res_ev);                \
     } while (0)
 
-#else  // GO2CPP_DEBUG_DUMP
+#else  // GO2CPP_DEBUG_RESOURCES
 
 #define GO2CPP_DEBUG_RESOURCE_REGISTER(kind, address, name) ((void)0)
 #define GO2CPP_DEBUG_RESOURCE_UNREGISTER(id) ((void)0)

@@ -72,6 +72,12 @@ const char* EventTypeName(EventType type) noexcept {
         case EventType::kWake: return "wake";
         case EventType::kSched: return "sched";
         case EventType::kNote: return "note";
+        case EventType::kResMutexLock: return "res-mutex-lock";
+        case EventType::kResMutexUnlock: return "res-mutex-unlock";
+        case EventType::kResPCWait: return "res-pc-wait";
+        case EventType::kResPCNotify: return "res-pc-notify";
+        case EventType::kResChannelSend: return "res-channel-send";
+        case EventType::kResChannelRecv: return "res-channel-recv";
         case EventType::kEnd: return "end";
     }
     return "unknown";
@@ -215,6 +221,24 @@ void EncodePayload(const Event& event, std::vector<std::uint8_t>& payload) {
             break;
         case EventType::kNote:
             writer.Str(event.note);
+            break;
+        // v4：资源事件固定 48 字节 payload。字段顺序即磁盘顺序，
+        // 后续版本只能在其后追加（v4 读端按 remaining 判断）。
+        case EventType::kResMutexLock:
+        case EventType::kResMutexUnlock:
+        case EventType::kResPCWait:
+        case EventType::kResPCNotify:
+        case EventType::kResChannelSend:
+        case EventType::kResChannelRecv:
+            writer.U64(event.resource_id);
+            writer.U64(event.actor_gid);
+            writer.U64(event.target_gid);
+            writer.U32(event.resource_result);
+            writer.U64(event.address);
+            writer.U32(event.waiters);
+            // vtime_ns 必须在 payload 里：资源事件没有 v2 的
+            // 「通用 vtime 尾字段」，漏掉它会让锁持有时间恒为 0。
+            writer.U64(event.vtime_ns);
             break;
         case EventType::kEnd:
             writer.U64(static_cast<std::uint64_t>(event.value));  // records
@@ -429,6 +453,24 @@ bool DecodeEvent(const std::uint8_t* data, std::size_t size, Event* event,
             break;
         case EventType::kNote:
             out.note = reader.Str();
+            break;
+        case EventType::kResMutexLock:
+        case EventType::kResMutexUnlock:
+        case EventType::kResPCWait:
+        case EventType::kResPCNotify:
+        case EventType::kResChannelSend:
+        case EventType::kResChannelRecv:
+            if (reader.ok() && reader.remaining() >= 40U) {
+                out.resource_id = reader.U64();
+                out.actor_gid = reader.U64();
+                out.target_gid = reader.U64();
+                out.resource_result = reader.U32();
+                out.address = reader.U64();
+                out.waiters = reader.U32();
+                if (reader.remaining() >= 8U) {
+                    out.vtime_ns = reader.U64();
+                }
+            }
             break;
         case EventType::kEnd:
             out.value = static_cast<std::int64_t>(reader.U64());

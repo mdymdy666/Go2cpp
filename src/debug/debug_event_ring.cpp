@@ -34,11 +34,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <string>
 #include <thread>
+#include <vector>
 
 namespace go2cpp::debug {
 namespace {
@@ -359,6 +362,273 @@ void CountBySegment(const std::vector<EventRecord>& events,
 
 }  // namespace
 
+
+// ===========================================================================
+// 粒度配置（DebugConfig）：类别掩码 + 采样位移 + 环境变量
+//
+// 状态全部放在本文件：`go2cpp_debug_event` 是 scheduler/sync/channel 直接
+// 链接的零依赖小库，配置实现放这里可以避免新增 CMake 源文件与目标依赖。
+// ===========================================================================
+
+namespace detail {
+
+std::atomic<std::uint32_t> g_debug_category_mask{
+    static_cast<std::uint32_t>(DebugCategory::kAll)};
+std::atomic<std::uint32_t> g_debug_sample_shift{0};
+std::atomic<bool> g_debug_env_ready{false};
+
+}  // namespace detail
+
+namespace {
+
+constexpr std::uint32_t kAllCategoryBits =
+    static_cast<std::uint32_t>(DebugCategory::kAll);
+/// 采样位移上限：2^16 已经把任何事件降到可忽略的频率。
+constexpr std::uint32_t kMaxSampleShift = 16U;
+
+std::mutex g_debug_config_mutex;
+std::atomic<bool> g_debug_env_ok{true};
+std::atomic<bool> g_debug_env_warned{false};
+
+std::uint32_t MaskOf(const DebugConfig& config) noexcept {
+    std::uint32_t mask = 0;
+    if (config.lifecycle) {
+        mask |= static_cast<std::uint32_t>(DebugCategory::kLifecycle);
+    }
+    if (config.sched) {
+        mask |= static_cast<std::uint32_t>(DebugCategory::kSched);
+    }
+    if (config.park) {
+        mask |= static_cast<std::uint32_t>(DebugCategory::kPark);
+    }
+    if (config.primitives) {
+        mask |= static_cast<std::uint32_t>(DebugCategory::kPrimitives);
+    }
+    if (config.timer) {
+        mask |= static_cast<std::uint32_t>(DebugCategory::kTimer);
+    }
+    if (config.io) {
+        mask |= static_cast<std::uint32_t>(DebugCategory::kIo);
+    }
+    if (config.stacks) {
+        mask |= static_cast<std::uint32_t>(DebugCategory::kStacks);
+    }
+    if (config.chains) {
+        mask |= static_cast<std::uint32_t>(DebugCategory::kChains);
+    }
+    return mask;
+}
+
+DebugConfig ConfigOf(std::uint32_t mask,
+                     std::uint32_t sample_shift) noexcept {
+    DebugConfig config;
+    config.lifecycle =
+        (mask & static_cast<std::uint32_t>(DebugCategory::kLifecycle)) != 0U;
+    config.sched =
+        (mask & static_cast<std::uint32_t>(DebugCategory::kSched)) != 0U;
+    config.park =
+        (mask & static_cast<std::uint32_t>(DebugCategory::kPark)) != 0U;
+    config.primitives =
+        (mask & static_cast<std::uint32_t>(DebugCategory::kPrimitives)) != 0U;
+    config.timer =
+        (mask & static_cast<std::uint32_t>(DebugCategory::kTimer)) != 0U;
+    config.io = (mask & static_cast<std::uint32_t>(DebugCategory::kIo)) != 0U;
+    config.stacks =
+        (mask & static_cast<std::uint32_t>(DebugCategory::kStacks)) != 0U;
+    config.chains =
+        (mask & static_cast<std::uint32_t>(DebugCategory::kChains)) != 0U;
+    config.sample_shift = sample_shift;
+    return config;
+}
+
+/// 取下一个逗号分隔 token，去首尾空白并转小写。返回 false 表示已到末尾。
+bool NextToken(const char** cursor, std::string* token) {
+    const char* begin = *cursor;
+    if (begin == nullptr || *begin == '\0') {
+        return false;
+    }
+    const char* end = begin;
+    while (*end != '\0' && *end != ',') {
+        ++end;
+    }
+    const char* trimmed_begin = begin;
+    while (trimmed_begin < end &&
+           std::isspace(static_cast<unsigned char>(*trimmed_begin)) != 0) {
+        ++trimmed_begin;
+    }
+    const char* trimmed_end = end;
+    while (trimmed_end > trimmed_begin &&
+           std::isspace(static_cast<unsigned char>(trimmed_end[-1])) != 0) {
+        --trimmed_end;
+    }
+    token->assign(trimmed_begin, trimmed_end);
+    for (char& ch : *token) {
+        ch = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(ch)));
+    }
+    *cursor = (*end == ',') ? end + 1 : end;
+    return true;
+}
+
+/// 单个 token → 掩码位；未知 token 返回 false 且不改 mask。
+bool ApplyCategoryToken(const std::string& token, std::uint32_t* mask) {
+    if (token.empty()) {
+        return true;  // 空 token（连续逗号/尾逗号）视为无操作
+    }
+    if (token == "all") {
+        *mask = kAllCategoryBits;
+        return true;
+    }
+    if (token == "none") {
+        *mask = 0U;
+        return true;
+    }
+    if (token == "lifecycle" || token == "g" || token == "g-lifecycle") {
+        *mask |= static_cast<std::uint32_t>(DebugCategory::kLifecycle);
+        return true;
+    }
+    if (token == "sched" || token == "scheduler" || token == "schedule") {
+        *mask |= static_cast<std::uint32_t>(DebugCategory::kSched);
+        return true;
+    }
+    if (token == "park" || token == "wake" || token == "parking") {
+        *mask |= static_cast<std::uint32_t>(DebugCategory::kPark);
+        return true;
+    }
+    if (token == "primitives" || token == "primitive" || token == "sync" ||
+        token == "mutex" || token == "rwmutex" || token == "rwlock" ||
+        token == "recursive" || token == "channel" || token == "pc" ||
+        token == "parking_condition" || token == "cv" ||
+        token == "condition_variable" || token == "waitgroup" ||
+        token == "select") {
+        *mask |= static_cast<std::uint32_t>(DebugCategory::kPrimitives);
+        return true;
+    }
+    if (token == "timer" || token == "timers") {
+        *mask |= static_cast<std::uint32_t>(DebugCategory::kTimer);
+        return true;
+    }
+    if (token == "io" || token == "i/o") {
+        *mask |= static_cast<std::uint32_t>(DebugCategory::kIo);
+        return true;
+    }
+    if (token == "stacks" || token == "stack") {
+        *mask |= static_cast<std::uint32_t>(DebugCategory::kStacks);
+        return true;
+    }
+    if (token == "chains" || token == "chain" || token == "fiber-chain") {
+        *mask |= static_cast<std::uint32_t>(DebugCategory::kChains);
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+const char* DebugCategoryName(DebugCategory category) noexcept {
+    switch (category) {
+        case DebugCategory::kNone: return "none";
+        case DebugCategory::kLifecycle: return "lifecycle";
+        case DebugCategory::kSched: return "sched";
+        case DebugCategory::kPark: return "park";
+        case DebugCategory::kPrimitives: return "primitives";
+        case DebugCategory::kTimer: return "timer";
+        case DebugCategory::kIo: return "io";
+        case DebugCategory::kStacks: return "stacks";
+        case DebugCategory::kChains: return "chains";
+        case DebugCategory::kAll: return "all";
+    }
+    return "none";
+}
+
+bool DebugConfig::ParseCategories(const char* text, DebugConfig* out) noexcept {
+    if (out == nullptr) {
+        return false;
+    }
+    if (text == nullptr || *text == '\0') {
+        *out = DebugConfig{};
+        return true;
+    }
+    std::uint32_t mask = 0U;
+    bool ok = true;
+    const char* cursor = text;
+    std::string token;
+    while (NextToken(&cursor, &token)) {
+        if (!ApplyCategoryToken(token, &mask)) {
+            ok = false;
+        }
+    }
+    *out = ConfigOf(mask, out->sample_shift);
+    return ok;
+}
+
+void detail::EnsureDebugConfigEnv() noexcept {
+    std::lock_guard<std::mutex> lock(g_debug_config_mutex);
+    if (detail::g_debug_env_ready.load(std::memory_order_relaxed)) {
+        return;
+    }
+    DebugConfig config;
+    bool ok = true;
+    const char* categories = std::getenv("GO2CPP_DEBUG_CATEGORIES");
+    if (categories != nullptr && *categories != '\0') {
+        ok = DebugConfig::ParseCategories(categories, &config);
+    }
+    const char* shift_text = std::getenv("GO2CPP_DEBUG_SAMPLE_SHIFT");
+    if (shift_text != nullptr && *shift_text != '\0') {
+        char* end = nullptr;
+        const unsigned long value = std::strtoul(shift_text, &end, 10);
+        if (end == shift_text || *end != '\0' || value > kMaxSampleShift) {
+            ok = false;
+        } else {
+            config.sample_shift = static_cast<std::uint32_t>(value);
+        }
+    }
+    if (!ok && !g_debug_env_warned.exchange(true)) {
+        std::fprintf(stderr,
+                     "[go2cpp] invalid GO2CPP_DEBUG_CATEGORIES/"
+                     "GO2CPP_DEBUG_SAMPLE_SHIFT value; using parsed subset\n");
+    }
+    detail::g_debug_sample_shift.store(config.sample_shift,
+                                       std::memory_order_relaxed);
+    detail::g_debug_category_mask.store(MaskOf(config),
+                                        std::memory_order_release);
+    g_debug_env_ok.store(ok, std::memory_order_relaxed);
+    detail::g_debug_env_ready.store(true, std::memory_order_release);
+}
+
+bool DebugConfig::LoadFromEnv() noexcept {
+    detail::EnsureDebugConfigEnv();
+    return g_debug_env_ok.load(std::memory_order_relaxed);
+}
+
+DebugConfig DebugConfig::Get() noexcept {
+    if (!detail::g_debug_env_ready.load(std::memory_order_acquire)) {
+        detail::EnsureDebugConfigEnv();
+    }
+    return ConfigOf(
+        detail::g_debug_category_mask.load(std::memory_order_relaxed),
+        detail::g_debug_sample_shift.load(std::memory_order_relaxed));
+}
+
+void DebugConfig::Set(const DebugConfig& config) noexcept {
+    std::lock_guard<std::mutex> lock(g_debug_config_mutex);
+    std::uint32_t shift = config.sample_shift;
+    if (shift > kMaxSampleShift) {
+        shift = kMaxSampleShift;
+    }
+    detail::g_debug_sample_shift.store(shift, std::memory_order_relaxed);
+    detail::g_debug_category_mask.store(MaskOf(config),
+                                        std::memory_order_release);
+    g_debug_env_ok.store(true, std::memory_order_relaxed);
+    // 显式 Set 之后不再让环境变量覆盖配置。
+    detail::g_debug_env_ready.store(true, std::memory_order_release);
+}
+
+void DebugConfig::Reset() noexcept {
+    Set(DebugConfig{});
+}
+
+
 const char* PrimitiveReasonName(PrimitiveReasonCode reason) noexcept {
     switch (reason) {
         case PrimitiveReasonCode::kUnknown: return "kUnknown";
@@ -595,14 +865,21 @@ void EventRing::RecordSampled(SchedEventCode code, std::uint64_t gid,
                               std::uint64_t arg2,
                               std::uint32_t every) noexcept {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-    if (every <= 1U) {
+    // 全局采样位移：0 时保持调用点的采样周期不变；n>0 时周期再乘 2^n。
+    std::uint32_t effective = every <= 1U ? 1U : every;
+    const std::uint32_t shift = DebugConfig::SampleShift();
+    if (shift > 0U) {
+        const std::uint32_t cap = 0xFFFFFFFFU >> shift;
+        effective = effective > cap ? 0xFFFFFFFFU : (effective << shift);
+    }
+    if (effective <= 1U) {
         Record(code, gid, arg2);
         return;
     }
     std::uint32_t& counter =
         t_sample_counters[static_cast<std::uint32_t>(code) & 0xFFU];
     ++counter;
-    if (counter % every != 0U) {
+    if (counter % effective != 0U) {
         return;
     }
     Record(code, gid, arg2);
@@ -1122,7 +1399,7 @@ const char* ResourceResultName(ResourceResult result) noexcept {
 
 ResourceId RegisterResource(ResourceKind kind, const void* address,
                             const char* name) noexcept {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
     if (address == nullptr || kind == ResourceKind::kUnknown) {
         return kInvalidResourceId;
     }
@@ -1176,7 +1453,7 @@ ResourceId RegisterResource(ResourceKind kind, const void* address,
 }
 
 void UnregisterResource(ResourceId id) noexcept {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
     if (id == kInvalidResourceId) {
         return;
     }
@@ -1202,7 +1479,7 @@ void UnregisterResource(ResourceId id) noexcept {
 }
 
 void UnregisterResourceByAddress(const void* address) noexcept {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
     if (address == nullptr) {
         return;
     }
@@ -1229,7 +1506,7 @@ void UnregisterResourceByAddress(const void* address) noexcept {
 }
 
 bool LookupResource(ResourceId id, ResourceInfo* out) {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
     if (out == nullptr || id == kInvalidResourceId) {
         return false;
     }
@@ -1249,8 +1526,33 @@ bool LookupResource(ResourceId id, ResourceInfo* out) {
 #endif
 }
 
+const void* LookupResourceAddress(ResourceId id) noexcept {
+#if GO2CPP_DEBUG_RESOURCES
+    if (id == kInvalidResourceId) {
+        return nullptr;
+    }
+    ResourceRegistry& registry = Registry();
+    std::shared_lock<std::shared_mutex> lock(registry.mutex);
+    // 快速路径：id 从 1 起递增且墓碑保留，通常 entries[id-1].id == id。
+    if (id <= registry.entries.size() &&
+        registry.entries[id - 1U].id == id) {
+        const ResourceInfo& entry = registry.entries[id - 1U];
+        return entry.alive ? entry.address : nullptr;
+    }
+    for (const auto& entry : registry.entries) {
+        if (entry.id == id) {
+            return entry.alive ? entry.address : nullptr;
+        }
+    }
+    return nullptr;
+#else
+    (void)id;
+    return nullptr;
+#endif
+}
+
 ResourceId FindResourceByAddress(const void* address) noexcept {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
     if (address == nullptr) {
         return kInvalidResourceId;
     }
@@ -1265,7 +1567,7 @@ ResourceId FindResourceByAddress(const void* address) noexcept {
 }
 
 std::vector<ResourceInfo> SnapshotResources() {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
     ResourceRegistry& registry = Registry();
     std::shared_lock<std::shared_mutex> lock(registry.mutex);
     return registry.entries;
@@ -1275,7 +1577,7 @@ std::vector<ResourceInfo> SnapshotResources() {
 }
 
 std::size_t ResourceAliveCount() noexcept {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
     ResourceRegistry& registry = Registry();
     std::shared_lock<std::shared_mutex> lock(registry.mutex);
     std::size_t alive = 0;
@@ -1291,7 +1593,7 @@ std::size_t ResourceAliveCount() noexcept {
 }
 
 void ResetResourceRegistry() noexcept {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
     ResourceRegistry& registry = Registry();
     std::unique_lock<std::shared_mutex> lock(registry.mutex);
     registry.entries.clear();
@@ -1334,10 +1636,20 @@ void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
 
 StackSampleId CaptureStackSample(std::uint64_t gid, bool critical) noexcept {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP && defined(__linux__)
+    // 粒度开关：stacks 关闭时不做 backtrace、不加锁、不建样本。
+    if (!DebugConfig::Enabled(DebugCategory::kStacks)) {
+        return 0;
+    }
     // 采样：非关键事件每 N 次捕获一条；关键事件（阻塞/唤醒/park）全量。
+    // 全局 sample_shift 再把周期乘 2^n（0 保持不变）。
     static thread_local std::uint32_t sample_counter = 0;
     ++sample_counter;
-    const std::uint32_t every = StackSampleEvery();
+    std::uint32_t every = StackSampleEvery();
+    const std::uint32_t shift = DebugConfig::SampleShift();
+    if (shift > 0U) {
+        const std::uint32_t cap = 0xFFFFFFFFU >> shift;
+        every = every > cap ? 0xFFFFFFFFU : (every << shift);
+    }
     const bool skipped =
         !critical && every > 1U && (sample_counter % every) != 0U;
     if (skipped) {
@@ -1477,43 +1789,96 @@ void ResetStackSamples() noexcept {
 #endif
 }
 
+namespace {
+
+/// 回放录制汇（未安装时热路径只有一次 acquire 读）。
+std::atomic<ResourceReplaySink> g_resource_replay_sink{nullptr};
+std::atomic<void*> g_resource_replay_user{nullptr};
+std::mutex g_resource_replay_mutex;
+/// 录制构建中把「录制文件写入」与「事件环写入」串行化：两路必须同序，
+/// 否则 `--view history`（事件环）无法与回放序列逐条对照。
+std::mutex g_resource_record_mutex;
+
+}  // namespace
+
+void SetResourceReplaySink(ResourceReplaySink sink, void* user) noexcept {
+    std::lock_guard<std::mutex> lock(g_resource_replay_mutex);
+    if (sink == nullptr) {
+        // 先撤 sink 再清 user：并发读端只要拿到非空 sink，user 一定有效。
+        g_resource_replay_sink.store(nullptr, std::memory_order_release);
+        g_resource_replay_user.store(nullptr, std::memory_order_relaxed);
+        return;
+    }
+    g_resource_replay_user.store(user, std::memory_order_relaxed);
+    g_resource_replay_sink.store(sink, std::memory_order_release);
+}
+
+ResourceReplaySink GetResourceReplaySink(void** user) noexcept {
+    if (user != nullptr) {
+        *user = g_resource_replay_user.load(std::memory_order_relaxed);
+    }
+    return g_resource_replay_sink.load(std::memory_order_acquire);
+}
+
 void RecordResourceEvent(const ResourceEventRecord& event) noexcept {
+#if GO2CPP_DEBUG_RESOURCES
+    // 类别过滤：直接调用本 API 的路径（宏不经过）也要生效。
+    if (!DebugConfig::Enabled(DebugCategoryOf(event.code))) {
+        return;
+    }
+    const auto write_ring = [&event]() {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-    (void)t_registration;
-    const bool critical =
-        IsCriticalResult(event.result) ||
-        event.code == SchedEventCode::kParkCaptured;
-    EventRecord record;
-    record.seq = g_publish_seq.fetch_add(1, std::memory_order_relaxed) + 1U;
-    record.ts_ns = NowNs();
-    record.gid = event.actor_gid;
-    record.arg2 = event.arg2;
-    record.code = static_cast<std::uint32_t>(event.code);
-    record.tid = t_ring.tid.load(std::memory_order_relaxed);
-    record.pid = t_processor_id;
-    record.resource_id = event.resource_id;
-    record.target_gid = event.target_gid;
-    record.result = static_cast<std::uint32_t>(event.result);
-    record.flags = event.flags;
-    record.chain_id = event.chain_id;
-    record.value = event.value;
-    record.waiters = event.waiters;
-    if (event.code == SchedEventCode::kParkCaptured) {
-        record.arg3 = t_park_hint.reason;
-        record.arg4 = t_park_hint.context;
+        (void)t_registration;
+        const bool critical =
+            IsCriticalResult(event.result) ||
+            event.code == SchedEventCode::kParkCaptured;
+        EventRecord record;
+        record.seq =
+            g_publish_seq.fetch_add(1, std::memory_order_relaxed) + 1U;
+        record.ts_ns = NowNs();
+        record.gid = event.actor_gid;
+        record.arg2 = event.arg2;
+        record.code = static_cast<std::uint32_t>(event.code);
+        record.tid = t_ring.tid.load(std::memory_order_relaxed);
+        record.pid = t_processor_id;
+        record.resource_id = event.resource_id;
+        record.target_gid = event.target_gid;
+        record.result = static_cast<std::uint32_t>(event.result);
+        record.flags = event.flags;
+        record.chain_id = event.chain_id;
+        record.value = event.value;
+        record.waiters = event.waiters;
+        if (event.code == SchedEventCode::kParkCaptured) {
+            record.arg3 = t_park_hint.reason;
+            record.arg4 = t_park_hint.context;
+        }
+        record.stack_id = CaptureStackSample(event.actor_gid, critical);
+        if (!critical && record.stack_id != 0) {
+            record.flags |= kResourceFlagStackSampled;
+        }
+        GetTotals()
+            .codes[static_cast<std::uint32_t>(event.code) & 0xFFU]
+            .fetch_add(1, std::memory_order_relaxed);
+        // 资源事件全部走普通区：阻塞/唤醒在长跑里也是高频的，放进关键区会
+        // 把调度器的 wake 线索挤掉。时间线视图用 seq 窗口 + coverage 标注截断。
+        WriteSlot(t_ring.normal, record, kNormalSlots);
+#endif
+    };
+    // 回放录制：先转发再写环（录制顺序更接近决定点；栈捕获较慢，放在后面）。
+    ResourceReplaySink sink =
+        g_resource_replay_sink.load(std::memory_order_acquire);
+    if (sink != nullptr) {
+        // 文件与事件环在同一临界区写入：两个并发原语事件在两路里的相对
+        // 顺序一致，`--view history` 与回放序列才能逐条比较。
+        std::lock_guard<std::mutex> lock(g_resource_record_mutex);
+        sink(g_resource_replay_user.load(std::memory_order_relaxed), event);
+        write_ring();
+        return;
     }
-    record.stack_id = CaptureStackSample(event.actor_gid, critical);
-    if (!critical && record.stack_id != 0) {
-        record.flags |= kResourceFlagStackSampled;
-    }
-    GetTotals().codes[static_cast<std::uint32_t>(event.code) & 0xFFU].fetch_add(
-        1, std::memory_order_relaxed);
-    // 资源事件全部走普通区：阻塞/唤醒在长跑里也是高频的，放进关键区会
-    // 把调度器的 wake 线索挤掉。时间线视图用 seq 窗口 + coverage 标注截断。
-    WriteSlot(t_ring.normal, record, kNormalSlots);
+    write_ring();
 #else
     (void)event;
-#endif
+#endif  // GO2CPP_DEBUG_RESOURCES
 }
 
 

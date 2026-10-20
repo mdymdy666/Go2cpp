@@ -16,6 +16,10 @@ if (GO2CPP_BUILD_TESTS)
     target_link_libraries(go2cpp_replay_core PUBLIC go2cpp_runtime)
     target_compile_options(go2cpp_replay_core PRIVATE
         -Wall -Wextra -Wpedantic)
+    # 测试构建总是链接 go2cpp_runtime：打开资源事件桥，让 Recorder
+    # 能录制 sync/channel 的资源事件（v4）。
+    target_compile_definitions(go2cpp_replay_core PRIVATE
+        GO2CPP_REPLAY_LINK_RUNTIME=1)
 
     add_executable(go2cpp_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_main.cpp
@@ -61,6 +65,8 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_dump.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_timer_debug.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/test_timer_replay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_config.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/test_resource_replay.cpp
     )
     target_link_libraries(go2cpp_tests PRIVATE go2cpp_runtime
         go2cpp_replay_core)

@@ -5,6 +5,10 @@
 
 #include "replay/recorder.hpp"
 
+#if defined(GO2CPP_REPLAY_LINK_RUNTIME) && GO2CPP_REPLAY_LINK_RUNTIME
+#include "go2cpp/debug/debug_resources.hpp"
+#endif
+
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -12,6 +16,63 @@
 
 namespace go2cpp::replay {
 namespace {
+
+#if defined(GO2CPP_REPLAY_LINK_RUNTIME) && GO2CPP_REPLAY_LINK_RUNTIME
+/// 资源事件 → v4 事件类型；不支持的事件码返回 false（不录制）。
+bool MapResourceEvent(go2cpp::debug::SchedEventCode code,
+                      EventType* type) {
+    using go2cpp::debug::SchedEventCode;
+    switch (code) {
+        case SchedEventCode::kMutexLock:
+        case SchedEventCode::kMutexFastLock:
+            *type = EventType::kResMutexLock;
+            return true;
+        case SchedEventCode::kMutexUnlock:
+            *type = EventType::kResMutexUnlock;
+            return true;
+        case SchedEventCode::kPCWait:
+            *type = EventType::kResPCWait;
+            return true;
+        case SchedEventCode::kPCNotify:
+        case SchedEventCode::kPCNotifyAll:
+            *type = EventType::kResPCNotify;
+            return true;
+        case SchedEventCode::kChannelSend:
+        case SchedEventCode::kChannelSendOk:
+            *type = EventType::kResChannelSend;
+            return true;
+        case SchedEventCode::kChannelRecv:
+        case SchedEventCode::kChannelRecvOk:
+            *type = EventType::kResChannelRecv;
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// 安装在 go2cpp 资源事件记录点上的回调（同步、可重入到 Recorder::Write）。
+void ResourceSinkThunk(void* user,
+                       const go2cpp::debug::ResourceEventRecord& event) noexcept {
+    auto* recorder = static_cast<Recorder*>(user);
+    if (recorder == nullptr || !recorder->ok()) {
+        return;
+    }
+    EventType type = EventType::kNote;
+    if (!MapResourceEvent(event.code, &type)) {
+        return;
+    }
+    std::uint64_t address = 0;
+    if (const void* pointer =
+            go2cpp::debug::LookupResourceAddress(event.resource_id)) {
+        address = static_cast<std::uint64_t>(
+            reinterpret_cast<std::uintptr_t>(pointer));
+    }
+    recorder->Write(MakeResourceEvent(
+        type, event.resource_id, event.actor_gid, event.target_gid,
+        static_cast<std::uint32_t>(event.result), address,
+        event.waiters));
+}
+#endif  // GO2CPP_REPLAY_LINK_RUNTIME
 
 std::uint64_t UnixNowNs() noexcept {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
@@ -123,6 +184,26 @@ Event MakeCtxEvent(std::uint32_t ctx_id, ContextEventKind kind,
     return event;
 }
 
+Event MakeResourceEvent(EventType type, std::uint64_t resource_id,
+                        std::uint64_t actor_gid,
+                        std::uint64_t target_gid,
+                        std::uint32_t resource_result,
+                        std::uint64_t address,
+                        std::uint32_t waiters) {
+    Event event;
+    event.type = type;
+    // gid 字段与 actor_gid 保持一致：旧工具只认识 gid，也能正确分组。
+    event.gid = static_cast<std::uint32_t>(actor_gid);
+    event.channel = kNoChannel;
+    event.resource_id = resource_id;
+    event.actor_gid = actor_gid;
+    event.target_gid = target_gid;
+    event.resource_result = resource_result;
+    event.address = address;
+    event.waiters = waiters;
+    return event;
+}
+
 Recorder::Recorder(RecordOptions options) : m_options(std::move(options)) {
     const std::size_t slots = m_options.gid_count == 0 ? 64U : m_options.gid_count;
     m_op_index = std::vector<std::atomic<std::uint32_t>>(slots);
@@ -173,9 +254,22 @@ Recorder::Recorder(RecordOptions options) : m_options(std::move(options)) {
              "fault-injection: drop wake #" + std::to_string(m_options.drop_wake_at),
              kFlagInjected);
     }
+#if defined(GO2CPP_REPLAY_LINK_RUNTIME) && GO2CPP_REPLAY_LINK_RUNTIME
+    // 文件成功打开后才接管资源事件：资源事件与 channel/select/timer
+    // 共用同一 seq 流（seq 由 Write 在文件锁内分配）。
+    go2cpp::debug::SetResourceReplaySink(&ResourceSinkThunk, this);
+#endif
 }
 
 Recorder::~Recorder() {
+#if defined(GO2CPP_REPLAY_LINK_RUNTIME) && GO2CPP_REPLAY_LINK_RUNTIME
+    // 只卸载本对象安装的汇，避免误清另一个录制器的注册。
+    void* current_user = nullptr;
+    if (go2cpp::debug::GetResourceReplaySink(&current_user) != nullptr &&
+        current_user == this) {
+        go2cpp::debug::SetResourceReplaySink(nullptr, nullptr);
+    }
+#endif
     Finalize("destructor");
     if (m_file != nullptr) {
         std::fclose(m_file);

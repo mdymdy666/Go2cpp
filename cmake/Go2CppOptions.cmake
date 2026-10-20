@@ -9,6 +9,20 @@ option(GO2CPP_BUILD_BENCHMARKS "Build standalone performance benchmarks" OFF)
 # ON 时记录 park/wake/runqueue 事件并启用 Unix socket 服务，用于重放与迁移。
 option(GO2CPP_DEBUG_DUMP "Build debug dump event ring and Unix socket server" OFF)
 
+# 回放资源事件录制（GO2CPP_REPLAY=ON）。
+#
+# 只启用「资源注册表 + 资源事件转发」，不启用事件环/在线诊断：
+#   - sync/channel/parking_condition 的 GO2CPP_DEBUG_RESOURCE_EVENT 宏展开；
+#   - 事件转发给 tools/replay 的 Recorder 安装的 sink（与 channel/
+#     select/timer 共用同一条 G2CRPLY v4 seq 流）；
+#   - 不写环形缓冲、不启动 DebugServer。
+# 与 GO2CPP_DEBUG_DUMP 可同时打开（两个数据源都工作，便于对照
+# --view history 与回放结果）。默认 OFF：热路径零开销。
+option(GO2CPP_REPLAY "Build replay recording hooks for resource events" OFF)
+if (GO2CPP_REPLAY)
+    add_compile_definitions(GO2CPP_REPLAY=1)
+endif()
+
 # 事件环两段容量（编译期常量，仅 GO2CPP_DEBUG_DUMP=ON 时生效）：
 #   - 普通区：park / runqueue push-pop 等高频事件，写满后覆盖最旧；
 #   - 关键区：wake / enqueue 拒绝 / claim 失败等关键事件，不被普通事件覆盖。

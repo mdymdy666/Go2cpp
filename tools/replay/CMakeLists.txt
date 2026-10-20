@@ -30,6 +30,12 @@ target_include_directories(go2cpp_replay
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
     PRIVATE "${GO2CPP_REPLAY_ROOT}/include")
 target_compile_options(go2cpp_replay PRIVATE -Wall -Wextra -Wpedantic)
+# GO2CPP_REPLAY=ON 时本工程链接 go2cpp 运行时，Recorder 可以安装资源
+# 事件汇（G2CRPLY v4）。OFF 时是纯格式库，不引用任何运行时符号。
+if(GO2CPP_REPLAY)
+    target_compile_definitions(go2cpp_replay PRIVATE
+        GO2CPP_REPLAY_LINK_RUNTIME=1)
+endif()
 
 # 极简工具：静态重演 / 自动完整重放 / 分片。
 # GO2CPP_REPLAY=ON 时内置 fanin demo 入口，让 `replay play` 可以直接自测；
@@ -57,10 +63,15 @@ if(GO2CPP_REPLAY)
         PATHS "${GO2CPP_REPLAY_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
     find_library(G2C_SYNC NAMES go2cpp_sync
         PATHS "${GO2CPP_REPLAY_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+    # 资源事件 sink 的实现位于零依赖的 go2cpp_debug_event
+    # （SetResourceReplaySink / LookupResourceAddress）。
+    find_library(G2C_DEBUG_EVENT NAMES go2cpp_debug_event
+        PATHS "${GO2CPP_REPLAY_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
 
     set(G2C_RUNTIME_LIBS
         ${G2C_SCHEDULER} ${G2C_FIBER} ${G2C_CONTEXT}
-        ${G2C_ERROR} ${G2C_LOG} ${G2C_SYNC} Threads::Threads)
+        ${G2C_ERROR} ${G2C_LOG} ${G2C_SYNC} ${G2C_DEBUG_EVENT}
+        Threads::Threads)
 
     # `replay play` 自带 fanin 入口（仅用于自测/演示）。
     target_sources(replay PRIVATE demo/scenario_entry.cpp)
@@ -122,4 +133,11 @@ if(GO2CPP_REPLAY)
     set_target_properties(${G2C_DEMO_TARGETS} replay PROPERTIES
         BUILD_RPATH "${GO2CPP_REPLAY_LIB_DIR}"
         INSTALL_RPATH "${GO2CPP_REPLAY_LIB_DIR}")
+endif()
+
+# GO2CPP_REPLAY=ON 时 go2cpp_replay 引用 go2cpp_debug_event 的 sink 符号
+# （资源事件桥），独立单测也必须链接运行时库；放在文件末尾是因为
+# G2C_RUNTIME_LIBS 在上面的 if(GO2CPP_REPLAY) 块里才定义。
+if(GO2CPP_REPLAY AND TARGET go2cpp_replay_tests)
+    target_link_libraries(go2cpp_replay_tests PRIVATE ${G2C_RUNTIME_LIBS})
 endif()

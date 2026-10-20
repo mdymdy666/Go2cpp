@@ -99,6 +99,26 @@ struct TimelineEntry {
     std::uint16_t chosen{0};
 };
 
+/**
+ * @brief 一条资源事件（v4：锁/条件变量/channel）。
+ *
+ * 回放端**只读重演**：不重新竞争，字段全部来自记录，因此序列与
+ * owner 完全可复现。`hold_ns` 只在 lock 条目上由配对的 unlock 回填
+ * （虚拟时钟差）。
+ */
+struct ResourceTimelineEntry {
+    std::uint64_t seq{0};
+    std::uint64_t vtime_ns{0};
+    EventType type{EventType::kNote};
+    std::uint64_t resource_id{0};
+    std::uint64_t actor_gid{0};
+    std::uint64_t target_gid{0};
+    std::uint32_t result{0};   ///< ResourceResult 数值（0=ok）
+    std::uint64_t address{0};
+    std::uint32_t waiters{0};
+    std::uint64_t hold_ns{0};  ///< 持锁时长（仅 unlock 前的 lock 条目）
+};
+
 /// 检查点（分片/二分定位「出事点」用）。
 struct CheckpointInfo {
     std::uint64_t seq{0};         ///< 该检查点覆盖的最后一条事件 seq
@@ -132,6 +152,27 @@ struct ReplayStats {
     std::uint64_t bytes_messages{0}; ///< 走 bytes 编码的接收消息数
     std::uint64_t dropped_wakes{0};  ///< 注入丢弃的唤醒数
     std::uint64_t synthetic_events{0};
+    // v4：资源事件统计（锁/条件变量/channel）。
+    std::uint64_t resource_events{0};
+    std::uint64_t res_mutex_locks{0};
+    std::uint64_t res_mutex_unlocks{0};
+    std::uint64_t res_pc_waits{0};
+    std::uint64_t res_pc_notifies{0};
+    std::uint64_t res_channel_sends{0};
+    std::uint64_t res_channel_recvs{0};
+    /// 记录中的资源事件序列校验和（FNV-1a 64，按 seq 顺序）。
+    std::uint64_t resource_checksum{0};
+    /// 重放输出（只读重放）的资源序列校验和；应与记录值一致。
+    std::uint64_t replayed_resource_checksum{0};
+    /// 所有成功加锁的持锁时长之和（虚拟纳秒；只统计成对的 lock/unlock）。
+    std::uint64_t resource_lock_hold_ns{0};
+    /// 录制端的**记录顺序**与锁的线性化顺序不一致的次数。
+    ///
+    /// 原因：Mutex 的加锁/解锁事件记录点在 CAS 之后（锁外），
+    /// 两个线程并发时可能出现「A 的 lock 事件排在 B 的 unlock
+    /// 事件之前」。回放只读重演，不因此判记录损坏；这里计数供
+    /// 诊断参考。
+    std::uint64_t resource_order_anomalies{0};
     /// 记录中的全局接收序列校验和（FNV-1a 64，按事件 seq 顺序）。
     std::uint64_t message_checksum{0};
     /// 重放实际产生的接收序列校验和（按 fiber 执行顺序）。
@@ -177,6 +218,8 @@ struct ReplayReport {
     std::vector<CheckpointInfo> checkpoints;
     ReplayStats stats;
     std::vector<TimelineEntry> timeline;
+    /// 资源事件时间线（v4；按 seq 升序，回放端只读重演）。
+    std::vector<ResourceTimelineEntry> resources;
 
     bool ok() const noexcept { return status == ReplayStatus::kOk; }
     /// 一行摘要（人类可读；JSON 见 `ReplayReportJson`）。
@@ -191,6 +234,17 @@ struct ReplayReport {
  */
 using FiberEntryFactory =
     std::function<std::function<void()>(std::uint32_t gid, ReplaySource& source)>;
+
+/**
+ * @brief 只加载记录中的事件（不做校验、不重放），供 `replay step` 使用。
+ * @param path 记录文件路径。
+ * @param events 输出事件列表（按文件顺序，含 kMeta/kEnd）。
+ * @param error 失败原因（成功时清空）。
+ * @return 成功解析文件头与全部记录返回 true。
+ */
+bool LoadRecordingEvents(const std::string& path,
+                         std::vector<Event>* events,
+                         std::string* error);
 
 /**
  * @brief 静态重演：不需要原程序。
