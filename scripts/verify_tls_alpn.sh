@@ -24,7 +24,18 @@ for _ in $(seq 1 60); do
   sleep 0.2
 done
 
-timeout 40 ./build-quality/go2cpp_tls_alpn_test "$PORT" 2>&1 | tr -d '\r'
+# 二进制随 CMake 构建在构建目录里（默认 build-work），不再引用历史上
+# 从未生成的 build-quality/ 目录。
+BUILD_DIR=${BUILD_DIR:-build-work}
+BIN="$BUILD_DIR/go2cpp_tls_alpn_test"
+if [ ! -x "$BIN" ]; then
+  echo "ERROR: 未找到 $BIN" >&2
+  echo "先构建：cmake -S . -B $BUILD_DIR -DGO2CPP_BUILD_TESTS=ON && cmake --build $BUILD_DIR --target go2cpp_tls_alpn_test" >&2
+  kill $SRV 2>/dev/null
+  wait $SRV 2>/dev/null
+  exit 1
+fi
+timeout 40 "$BIN" "$PORT" 2>&1 | tr -d '\r'
 RC=${PIPESTATUS[0]}
 kill $SRV 2>/dev/null
 wait $SRV 2>/dev/null

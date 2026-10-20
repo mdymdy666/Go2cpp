@@ -171,7 +171,15 @@ public:
      * @return 非 owner 返回 0；owner 返回已加锁次数。
      */
     std::uint32_t RecursionCount() const noexcept {
-        if (m_owner.load(std::memory_order_acquire) != CurrentToken()) {
+        // 快速否定：无人持有（owner == 0）时直接返回 0，不必计算当前 token。
+        // CurrentToken() 要跨库调用 Scheduler::current_task_ptr()（实测约
+        // 4.6 ns/次），而 m_owner == 0 是「锁空闲」的权威快照——此时任何执行
+        // 流都不可能是 owner。owner 非空时才需要比较身份。
+        const std::uintptr_t owner = m_owner.load(std::memory_order_acquire);
+        if (owner == 0U) {
+            return 0;
+        }
+        if (owner != CurrentToken()) {
             return 0;
         }
         return m_depth.load(std::memory_order_acquire);
@@ -194,11 +202,15 @@ private:
         m_depth.fetch_add(1, std::memory_order_relaxed);
     }
 
-    /// @brief 当前执行流的 owner token：受管 G 用 Task*（奇数），否则偶数 id。
+    /// @brief 当前执行流的 owner token：受管 G 用全局唯一 G id（奇数），
+    /// 否则用每线程唯一 id（偶数）。
+    /// @details 不用 `Task*` 地址：地址会被复用，旧 G 未解锁退出后新 G 可能
+    /// 拿到同一地址，导致 owner 判定失真（审计 D4）。G id 全局单调、不复用，
+    /// 左移一位后仍保持奇数，与线程 token（偶数）不冲突。
     static std::uintptr_t CurrentToken() noexcept {
         Task* const task = Scheduler::current_task_ptr();
         if (task != nullptr) {
-            return reinterpret_cast<std::uintptr_t>(task) | 1U;
+            return (static_cast<std::uintptr_t>(task->id()) << 1) | 1U;
         }
         return CurrentThreadToken();
     }

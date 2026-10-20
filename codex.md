@@ -1174,3 +1174,130 @@ benchmarks/gmp_vs_thread_epoll_benchmark.cpp
 - 仓库状态：本轮**没有执行任何 git 提交**；但另一个进程在 15:20 用
   `feat(config): SO 热重载收尾...`（58b31d4）把工作区里的 `channel.hpp` 与
   `test_channel.cpp` 一并提交了，主 agent 审查/提交时注意这一点。
+
+## 18. 2026-10-19 Fiber 可变长栈：8MiB 预留 + 2KiB 初始提交 + SIGSEGV 按需增长（deepseek）
+
+**修改时间**：2026-10-19 21:30（Asia/Shanghai）
+
+**改动内容**：
+
+- 配置层：
+  - `SchedulerConfig::fiber_stack_size` 默认 `0` → `2048`；
+  - 新增 `fiber_stack_reserve_size = 8MiB`、`fiber_stack_growable = true`；
+  - `TaskOptions` 末尾新增 `stack_reserve_size` / `stack_growable`（保持既有
+    `TaskOptions{a, b}` 聚合初始化语义）；
+  - `Scheduler::spawn` 用配置补全 reserve/growable，`Task::run` 传给
+    `Fiber::AcquireForScheduler`。
+- `Fiber` 栈布局（`src/concurrency/fiber.cpp`）：
+  - growable：`mmap(reserve, PROT_NONE, MAP_NORESERVE)`，`top = base + reserve`，
+    `committed = top - initial_usable`，只把顶部 `initial_usable` 改 RW；
+  - 归一化 `initial_usable = max(page_align_up(requested), 1 页)`；
+    默认请求 2048 → 实际 4096（1 页）；
+  - reserve == initial（或只多出不足 64KiB）、`GO2CPP_GROWABLE_STACK=0`、
+    非 Linux/x86_64、非原生上下文、ASAN/TSAN 时退化为固定栈；固定栈保留旧布局
+    （usable + 1 页 PROT_NONE guard），且不安装 handler；
+  - 池化键 `(normalized usable, reserve)`；释放增长过的栈前用 `mprotect(PROT_NONE)`
+    把 `[top-initial, committed)` 重置，并把 committed 重置回 `top-initial`，
+    防止复用后溢出静默写坏已提交页。
+- SIGSEGV 增长：
+  - 每线程 `sigaltstack`（256KiB，mmap），进程级 `sigaction`：
+    `SA_SIGINFO | SA_ONSTACK`，不设 `SA_NODEFER`；
+  - `thread_local FiberStack* t_current_growable_stack` 在
+    `resume_locked` / `entry` / `finish_switch_to_fiber` / `suspend` 中维护；
+    迁移到新 M 时在 resume 前补装 altstack；
+  - handler 判定：重入保护、`REG_ERR & 0x10` 取指故障、`si_addr ∈ [base, committed)`、
+    `rsp ∈ [base, top]`、`|rsp - si_addr| ≤ 256KiB`、`committed - base ≥ 64KiB`，
+    然后 `new_low = align_down(min(si_addr, rsp)) - 64KiB`（clamp 到 base），
+    `mprotect(new_low, committed-new_low, RW)`，成功后更新原子 committed 并
+    **直接 return**；
+  - 有意偏离设计稿的一点：设计稿要求 `rsp ∈ [committed, top]`，实测函数序言
+    `sub rsp` 会先越过 committed（probe: fault=committed-8, rsp=committed-0x50），
+    因此放宽为 `rsp ∈ [base, top]` 且用 256KiB 窗口约束；提交范围也改为从
+    `min(si_addr, rsp)` 向下，以覆盖大帧；
+  - fatal 路径：恢复 SIG_DFL、解除屏蔽、`raise(sig)`、`_exit(128+sig)`；
+    只使用 async-signal-safe 调用；增长次数用原子计数，不打印日志。
+- 配置兼容：`src/config/config.cpp` 的 `kMinFiberStack` 16384 → 2048，
+  `go2cpp.ini` 的 `fiber_stack_size` 0 → 2048。
+- 测试：
+  - 新增 `tests/concurrency/test_fiber_growable_stack.cpp`（273 行）并注册到
+    `go2cpp_tests` 与独立 ctest `go2cpp_fiber_growable_stack`；
+  - `test_fiber.cpp` 的初始栈下限断言从 2 页改为 1 页（新归一化语义）；
+  - `example/concurrency/fiber_stack_limit_full.cpp` 在 main 开头显式设置
+    `GO2CPP_GROWABLE_STACK=0`，保留其固定栈临界深度/爆栈实验的可复现性。
+
+**关键文件**：
+
+- `src/concurrency/fiber.cpp`（+614/−82）
+- `include/go2cpp/concurrency/fiber.hpp`、`include/go2cpp/concurrency/scheduler/scheduler.hpp`
+- `src/concurrency/scheduler.cpp`、`src/config/config.cpp`、`go2cpp.ini`
+- `tests/concurrency/test_fiber_growable_stack.cpp`、`tests/concurrency/test_fiber.cpp`、
+  `tests/test_main.cpp`、`cmake/Go2CppTests.cmake`
+- `example/concurrency/fiber_stack_limit_full.cpp`
+
+**测试结果**（build-work，Release，实际运行）：
+
+- `ctest --test-dir build-work --output-on-failure`：**116/116 通过，63.81s**
+  （115 个既有测试 + 新增 `go2cpp_fiber_growable_stack`；既有测试全绿）。
+- 新增专项（`GO2CPP_TEST_FILTER=fiber_growable`）：
+  - 256KiB-class：frames=1024，checksum=68616（expected 68616）
+  - 1MiB-class：frames=4096，checksum=323616（expected 323616）
+  - 深递归返回后外层局部：outer=0x123456789ABCDEF0，地址不变
+  - 迁移后增长：checksum=68616
+  - 4 workers × 32 tasks 并发增长：completed=32
+  - `GO2CPP_GROWABLE_STACK=0` / reserve==initial：4KiB 固定栈 Fiber 正常完成，
+    恢复 env 后增长路径不复用固定栈缓存
+- 增长证据：
+  - 1000 个挂起 Fiber：VmSize 6428 kB → 8199212 kB（+8192784 kB ≈ 8GiB，
+    即每个 8MiB 预留）；VmRSS 仅 +4864 kB（每 Fiber 初始 1 页 4KiB）；
+  - 单个深递归 Fiber：VmRSS +1152 kB，stack_size=4096；
+  - `strace -e mprotect` 单 Fiber：初始 `mprotect(...,4096,RW)`，每次 SIGSEGV
+    `mprotect(...,69632,RW)`（64KiB+故障页），完成后
+    `mprotect(...,1183744,PROT_NONE)` 重置。
+- 性能（fair_bench，同机）：
+  - A（200×2 depth1，12 workers，10s）：改动前 qps=132804/cpu=71.3µs/RSS=16484kB；
+    改动后 qps=146622/cpu=70.4µs/RSS=16752kB；同代码 fixed 回退
+    qps=143913/cpu=71.1µs/RSS=16736kB。
+  - s3（8000 rate1，GMP P=4，12s）：改动前 qps=11239/cpu=182.5µs/RSS=221768kB
+    （3 errors）；改动后两次 qps=10807/10869，cpu=178.7/174.9µs，
+    RSS=221332/224180kB，completed=138126/140054（均高于改动前 136020）；
+    同代码 fixed 回退 qps=11532/cpu=175.5µs/RSS=218856kB。s3 的 qps 受客户端
+    rate/采样 span 影响大，以 completed 与 cpu µs/req 看无回退。
+
+**后续状态 / 已知限制**：
+
+- 直接 `Fiber(fn)` 的 `Fiber::DefaultStackSize()` 仍为 128KiB（为兼容既有示例与
+  测试）；调度器默认走 `SchedulerConfig` 的 2048，对应 1 页初始提交。
+- handler 是进程级覆盖 SIGSEGV；宿主若已有自定义 SIGSEGV handler 会被替换。
+  fatal 路径按设计恢复 SIG_DFL。
+- 大帧 >256KiB（或 `alloca`/VLA 远超窗口）按设计 fatal；初始只有 1 页，
+  函数序言的大帧依赖 64KiB 增长块与 256KiB 窗口。
+- `codex.md` 仅追加本记录；本轮**没有 git commit / push**。
+- 未改 `docs/design.md`、`docs/boundary_audit.md` 中“没有自动扩容”的旧描述，
+  后续如需要可单独更新文档。
+
+## 19. 2026-10-19 性能优化轮次：fiber cache 扩容 + 批量发送（deepseek）
+
+### 19.1 改动
+
+1. **fiber/栈池扩容**（`src/concurrency/fiber.cpp`、`scheduler.hpp:240`）：
+   thread-local 栈池 8 → 32、全局栈池 128 → 512、`fiber_bin_capacity` 32 → 128。
+2. **GMP benchmark 批量发送**（`benchmarks/gmp_vs_epoll_fair_benchmark.cpp`）：
+   `serve_gmp_connection` 一次 recv 解析出的所有帧合并为一次 `send_all`，
+   `out.reserve(16KB)`；此前每帧一次 `sendmsg`。
+
+### 19.2 数据（同机、同窗口）
+
+- **s1 短连接**（旧 benchmark，2 clients）：22,606 → **33,058 QPS（+46%）**、
+  cpu 248.7 → 216.9 µs/req、p99 40.8 → **5.6ms**、VmSize 84GB → **8.2GB**。
+- **B pipeline depth8**：168,548 → **189,159 QPS（+12.2%）**、cpu 62.6 → 58.2、
+  sys 8.5 → **4.7**、`sendmsg` 1.2 → **0.33 次/请求**。
+- **A depth1**：142,491 → 141,968（噪声内）、cpu 70.3 → 70.7。
+- **s3 8000 rate1**：7,983 → 7,983、cpu 121.9 → 123.6、RSS 162 → 190MB（out 缓冲触碰页）。
+
+### 19.3 结论与回退
+
+- 池容量继续加倍（64/1024/256）无收益（s1 32.1k），**已回退到 32/512/128**；
+- 批量发送是本轮最大单点收益（pipeline +12~14%、sys −47%），但只改了 benchmark
+  应用层；库侧 `Socket` 的写合并需要发送缓冲与 flush 策略，风险更高，未做；
+- `ctest` **116/116** 通过；
+- 未 commit / push；主目录未改动。

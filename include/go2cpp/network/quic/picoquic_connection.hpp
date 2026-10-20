@@ -103,6 +103,13 @@ struct PicoquicConfig {
     /// 并配置根证书。这个默认值是**测试便利**，不是安全默认。
     bool verify_peer{false};
 
+    /// 根证书（CA bundle）PEM 文件路径。
+    ///
+    /// - `verify_peer == true` 时使用；留空则自动探测系统信任库
+    ///   （`/etc/ssl/certs/ca-certificates.crt`、`/etc/pki/tls/certs/ca-bundle.crt` 等）；
+    /// - `verify_peer == false` 时忽略（改为安装 null verifier，保持本地自签场景可用）。
+    std::string cert_root_file_name;
+
     /// 空闲超时（毫秒）。0 表示用 picoquic 默认值。
     std::uint32_t idle_timeout_ms{30000};
 };
@@ -124,7 +131,9 @@ struct PicoquicConfig {
  * - 所有方法必须在同一线程/Fiber 序列调用（非线程安全）；
  * - `HandshakeComplete()` 为真之前 `WriteStream()` 不可用；
  * - `ReadStream()` 返回 0 表示「该流暂时没有数据」，不是 EOF；
- * - 对象不拥有 `Transport` 的生命周期；析构只释放 picoquic 上下文（`picoquic_free` 会连带释放 cnx）。
+ * - 对象不拥有 `Transport` 的生命周期：`Transport` 必须比本对象**活得久**，
+ *   因为析构会尽力发送 CONNECTION_CLOSE（见 `Close()`）后才释放 picoquic 上下文；
+ * - 析构是 best-effort 关闭：显式 `Close()` 才能拿到失败原因。
  */
 class PicoquicConnection {
 public:
@@ -145,20 +154,52 @@ public:
     PicoquicConnection& operator=(const PicoquicConnection&) = delete;
 
     /**
-     * @brief 推进一次协议状态机。
+     * @brief 推进一次协议状态机（单次最多等待 `kDefaultPollWaitMs` = 1000 ms）。
      *
      * 做三件事：
      * 1. 调 `picoquic_prepare_next_packet` 循环，把**所有待发**的包写到 `transport`；
-     * 2. 从 `transport` 读**一个** datagram，喂给 `picoquic_incoming_packet`；
-     * 3. 处理定时器（重传、idle 超时）。
+     * 2. 按 `picoquic_get_next_wake_time()` 截短等待，用
+     *    `Transport::ReadWithTimeout()` 读**一个** datagram 喂给
+     *    `picoquic_incoming_packet`（定时器到点会先重传再继续等）；
+     * 3. 回调置 closed 或出错时返回 false。
      *
-     * @return 连接仍存活返回 true；已关闭/出错返回 false 并填 `error`。
+     * @return 连接仍存活返回 true（**包括等待超时**）；已关闭/出错返回 false 并填 `error`。
      *
-     * @note 第 2 步的 `transport->Read` 会**阻塞**（在 Fiber 里就是 park 当前
-     *       Fiber，不阻塞 worker），所以 `Poll` 是"驱动一次收发"的语义，
-     *       不是忙轮询。
+     * @note 单次调用有 1s 上限，调用方不会被无界阻塞；需要精确控制等待用
+     *       `PollFor()`，需要从别的 Fiber/线程取消用 `Close()`。
      */
     bool Poll(std::string* error);
+
+    /**
+     * @brief 带等待预算的 `Poll`。
+     *
+     * @param timeout_ms 等待上限（毫秒）：`0` = 只发待发包并做一次非阻塞读；
+     *                   `>0` = 最多等这么久；`<0` = 等到有数据或连接关闭
+     *                   （可由 `Close()` 从外部置状态取消）。
+     * @return 连接仍存活（含等待超时）返回 true；已关闭/出错返回 false。
+     *
+     * 每次内部等待还会被 picoquic 的下一个定时器（PTO / idle / ACK delay）
+     * 截短，保证重传与 idle 超时能被及时驱动；Transport 若立即返回 0，
+     * 本方法会做 1ms→20ms 退避，避免忙转占满 CPU。
+     */
+    bool PollFor(std::string* error, int timeout_ms);
+
+    /**
+     * @brief 主动关闭连接，并把 picoquic 生成的 CONNECTION_CLOSE 立即写出去。
+     *
+     * 只调 `picoquic_close()` 只是把连接置为 disconnecting，关闭帧要等下一次
+     * `prepare_next_packet` 才发送；本方法在内部完成这一步（不需要再 `Poll`）。
+     * 析构函数复用同一路径，因此对象销毁时对端能收到关闭帧并释放连接槽
+     * （审计 D01：不关闭时服务端 256 个连接槽耗尽后拒绝新连接）。
+     *
+     * @param application_error_code 应用层关闭码（0 表示正常关闭）。
+     * @param error 写失败时填原因；可为 nullptr。
+     * @return 关闭帧是否成功写出（连接已关闭/已释放时返回 true）。
+     *
+     * @note 幂等；调用后 `Closed()` 为 true，`LastErrorCode()` 返回关闭码。
+     *       `transport` 必须仍然可用。
+     */
+    bool Close(std::uint64_t application_error_code = 0, std::string* error = nullptr);
 
     /// 握手（TLS 1.3）是否已完成。完成后才能收发应用数据。
     bool HandshakeComplete() const noexcept;
@@ -189,6 +230,12 @@ public:
      */
     std::size_t ReadStream(std::uint64_t stream_id, std::uint8_t* buffer,
                            std::size_t capacity);
+
+    /// 流是否已收到对端 FIN（`true` 表示不会再有新数据）。
+    bool StreamFinished(std::uint64_t stream_id) const noexcept;
+
+    /// 流最近一次 reset 的对端错误码；未 reset 返回 0。
+    std::uint64_t StreamErrorCode(std::uint64_t stream_id) const noexcept;
 
     /// 已收到数据的流号列表（便于调用方知道哪些流有数据）。
     void ReceivedStreamIds(std::uint64_t* out, std::size_t capacity,

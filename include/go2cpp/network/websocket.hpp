@@ -89,6 +89,12 @@ struct WebSocketConfig {
     Socket::Duration io_timeout{Socket::Duration::max()};
     bool auto_pong{true};
     bool validate_utf8{true};
+    /// 发送超过 max_frame_payload 的消息时是否自动拆成 continuation 帧。
+    /// 默认 true：max_message_payload（默认 64MiB）在发送方向也生效；
+    /// 超过 max_frame_payload（默认 16MiB）的消息按该上限拆帧，整条消息
+    /// 持写锁、帧不交错。置 false 可恢复“单帧超限即 MessageTooLarge”的
+    /// 严格单帧语义（此时 >16MiB 的消息发不出去）。
+    bool fragment_outgoing{true};
 };
 
 /**
@@ -205,6 +211,8 @@ private:
                                 bool fin = true);
     WebSocketResult write_frame_unlocked(WebSocketOpcode opcode,
                                          std::string_view payload, bool fin);
+    /// 持写锁把一条消息拆成 <= max_frame_payload 的 continuation 帧序列。
+    WebSocketResult send_message(WebSocketOpcode opcode, std::string_view payload);
     WebSocketResult send_control(WebSocketOpcode opcode, std::string_view payload);
     /** @brief 发送指定 RFC close code 并将连接置为不可复用。 */
     WebSocketResult protocol_error(std::string message, std::uint16_t code = 1002);

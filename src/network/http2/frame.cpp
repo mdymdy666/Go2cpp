@@ -266,6 +266,36 @@ FrameStatus ParseSettings(const Frame& frame, SettingsFrame* out, std::string* e
             (static_cast<std::uint16_t>(frame.payload[offset]) << 8) |
             static_cast<std::uint16_t>(frame.payload[offset + 1]));
         entry.value = ReadUint32(frame.payload.data() + offset + 2);
+        // RFC 9113 §6.5.2：以下参数的非法值都是**连接错误**，必须在帧层拒绝，
+        // 不能静默忽略（否则对端会按一个本端永远不会采用的参数继续通信）。
+        switch (static_cast<SettingsId>(entry.id)) {
+            case SettingsId::kEnablePush:
+                if (entry.value > 1) {
+                    if (error != nullptr) {
+                        *error = "SETTINGS_ENABLE_PUSH 必须是 0 或 1";
+                    }
+                    return FrameStatus::kProtocolError;
+                }
+                break;
+            case SettingsId::kInitialWindowSize:
+                if (entry.value > 0x7FFFFFFFU) {
+                    if (error != nullptr) {
+                        *error = "SETTINGS_INITIAL_WINDOW_SIZE 超过 2^31-1";
+                    }
+                    return FrameStatus::kProtocolError;
+                }
+                break;
+            case SettingsId::kMaxFrameSize:
+                if (entry.value < kMinMaxFrameSize || entry.value > kMaxMaxFrameSize) {
+                    if (error != nullptr) {
+                        *error = "SETTINGS_MAX_FRAME_SIZE 超出 [16384, 16777215]";
+                    }
+                    return FrameStatus::kProtocolError;
+                }
+                break;
+            default:
+                break;
+        }
         out->entries.push_back(entry);
     }
     return FrameStatus::kOk;

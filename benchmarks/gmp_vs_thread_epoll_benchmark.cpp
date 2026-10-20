@@ -1364,6 +1364,18 @@ private:
         }
         if ((mask & (EPOLLERR | EPOLLHUP)) != 0) {
             ++m_errors;
+            int so_error = 0;
+            socklen_t so_len = sizeof(so_error);
+            ::getsockopt(conn.fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len);
+            if (so_error == 0) {
+                ++m_err_normal_fin;
+            } else if (so_error == ECONNRESET) {
+                ++m_err_reset;
+            } else if (so_error == EPIPE) {
+                ++m_err_pipe;
+            } else {
+                ++m_err_other;
+            }
             if (m_options.scenario == Scenario::kShort) {
                 close_conn(index);
                 schedule_reconnect(index);
@@ -1691,6 +1703,7 @@ private:
         }();
         std::printf(
             "RESULT {\"scenario\":\"%s\",\"completed\":%llu,\"errors\":%llu,"
+            "\"err_fin\":%llu,\"err_reset\":%llu,\"err_pipe\":%llu,\"err_other\":%llu,"
             "\"elapsed_ms\":%.3f,\"qps\":%.3f,\"resp_mbps\":%.3f,"
             "\"p50_ns\":%llu,\"p95_ns\":%llu,\"p99_ns\":%llu,\"p999_ns\":%llu,"
             "\"avg_ns\":%llu,\"samples\":%llu,\"established\":%llu,"
@@ -1698,6 +1711,10 @@ private:
             scenario_name(m_options.scenario),
             static_cast<unsigned long long>(count),
             static_cast<unsigned long long>(m_errors),
+            static_cast<unsigned long long>(m_err_normal_fin),
+            static_cast<unsigned long long>(m_err_reset),
+            static_cast<unsigned long long>(m_err_pipe),
+            static_cast<unsigned long long>(m_err_other),
             static_cast<double>(elapsed) / 1e6,
             qps,
             mbps,
@@ -1726,6 +1743,10 @@ private:
 
     std::uint64_t m_completed{0};
     std::uint64_t m_errors{0};
+    std::uint64_t m_err_normal_fin{0};
+    std::uint64_t m_err_reset{0};
+    std::uint64_t m_err_pipe{0};
+    std::uint64_t m_err_other{0};
     std::uint64_t m_bytes_rx{0};
     std::uint64_t m_resp_bytes{0};
     std::uint64_t m_established{0};

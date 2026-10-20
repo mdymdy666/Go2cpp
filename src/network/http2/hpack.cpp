@@ -28,6 +28,7 @@
 
 #include <array>
 #include <cstring>
+#include <limits>
 
 namespace go2cpp::net::http2 {
 
@@ -78,23 +79,35 @@ HpackStatus DecodeInteger(const std::uint8_t* in, std::size_t length,
     // 前缀位全 1：后续 7 位一组，直到最高位为 0
     std::size_t index = 1;
     std::uint64_t shift = 0;
+    // RFC 7541 §5.1 的值域是 64 位无符号整数；7 位一组最多需要 10 个续字节
+    // （10 * 7 = 70 >= 64）。继续字节数超过 10 或位移 >= 64 一律判非法：
+    // 既防止恶意超长整数，也避免 `<< shift` 在 shift >= 64 时的未定义行为。
+    constexpr std::size_t kMaxContinuationBytes = 10;
+    std::size_t continuation = 0;
     // step2: 7 位一组的续字节，最高位是继续标志。
     for (;;) {
         if (index >= length) {
             return HpackStatus::kNeedMore;
         }
-        const std::uint8_t byte = in[index++];
-        // 防止 shift 溢出（最多 64 位）
-        if (shift >= 63 && (byte & 0x7F) != 0) {
+        if (continuation >= kMaxContinuationBytes) {
             return HpackStatus::kInvalidInteger;
         }
-        value += static_cast<std::uint64_t>(byte & 0x7F) << shift;
+        const std::uint8_t byte = in[index++];
+        ++continuation;
+        // 关键：先判 shift 再移位。旧实现只看低 7 位是否为 0，
+        // `0xFF` + 11 个 `0x80` 会把 shift 累加到 70，`x << 70` 是 UB。
+        if (shift >= 64) {
+            return HpackStatus::kInvalidInteger;
+        }
+        const std::uint64_t chunk = static_cast<std::uint64_t>(byte & 0x7F);
+        const std::uint64_t add = chunk << shift;
+        if (value > std::numeric_limits<std::uint64_t>::max() - add) {
+            return HpackStatus::kInvalidInteger;
+        }
+        value += add;
         shift += 7;
         if ((byte & 0x80) == 0) {
             break;
-        }
-        if (index > length + 10) {
-            return HpackStatus::kInvalidInteger;
         }
     }
     *out = value;
@@ -508,11 +521,23 @@ HpackStatus Decoder::DecodeBlock(const std::uint8_t* in, std::size_t length,
         return HpackStatus::kInvalidInteger;
     }
     std::size_t offset = 0;
+    // RFC 7541 §4.2：动态表大小更新只能出现在 header block 开头，
+    // 且一次最多两条（先最小值、再最终值）。块中部出现或第 3 条都是解码错误，
+    // 否则编码端可以在任意位置改变表的解释方式，两端索引必然错位。
+    bool emitted_field = false;
+    unsigned table_size_updates = 0;
     while (offset < length) {
         const std::uint8_t byte = in[offset];
         // §6.3 动态表大小更新：001xxxxx
         // step1: 表大小更新（必须 <= 本端 SETTINGS 上限）。
         if ((byte & 0xE0U) == 0x20U) {
+            if (emitted_field || table_size_updates >= 2) {
+                if (error != nullptr) {
+                    *error = "HPACK 表大小更新只能位于块首且最多两次";
+                }
+                return HpackStatus::kInvalidTableSize;
+            }
+            ++table_size_updates;
             std::uint64_t new_size = 0;
             std::size_t consumed = 0;
             const auto status = DecodeInteger(in + offset, length - offset, 5, &new_size,
@@ -546,6 +571,7 @@ HpackStatus Decoder::DecodeBlock(const std::uint8_t* in, std::size_t length,
             }
             if (index <= StaticTableSize()) {
                 out->push_back(*StaticTableEntry(static_cast<std::size_t>(index)));
+                emitted_field = true;
             } else {
                 const auto* entry = m_table.Get(static_cast<std::size_t>(index) - StaticTableSize());
                 if (entry == nullptr) {
@@ -555,6 +581,7 @@ HpackStatus Decoder::DecodeBlock(const std::uint8_t* in, std::size_t length,
                     return HpackStatus::kIndexOutOfRange;
                 }
                 out->push_back(*entry);
+                emitted_field = true;
             }
             offset += consumed;
             continue;
@@ -620,6 +647,7 @@ HpackStatus Decoder::DecodeBlock(const std::uint8_t* in, std::size_t length,
             m_table.Add(name, value);
         }
         out->push_back(HeaderField{std::move(name), std::move(value)});
+        emitted_field = true;
         offset = value_consumed;
     }
     return HpackStatus::kOk;

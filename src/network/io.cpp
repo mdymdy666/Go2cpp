@@ -1755,7 +1755,7 @@ private:
             }
             if (saw_wake) {
                 drain_wake_fd();
-                m_tickle_pending.store(false, std::memory_order_release);
+                m_tickle_pending.exchange(0, std::memory_order_acq_rel);
             }
             process_events_batch(events, static_cast<std::size_t>(count));
             expire_timers();
@@ -1794,10 +1794,12 @@ private:
         if (m_waiters.load(std::memory_order_acquire) == 0) {
             return;
         }
-        if (m_tickle_pending.exchange(true, std::memory_order_acq_rel)) {
-            return;
+        // 计数语义：只让 0→1 的那次写 eventfd；drain 侧用 exchange(0)
+        // 清零。这样 drain 之后到达的 tickle 必然看到 0 并重新写，
+        // 不会出现「布尔合并 + drain 竞态」吞掉最后一次唤醒。
+        if (m_tickle_pending.fetch_add(1, std::memory_order_acq_rel) == 0) {
+            m_backend->wake();
         }
-        m_backend->wake();
     }
 
     /**
@@ -1887,7 +1889,7 @@ private:
         if (saw_wake) {
             // 由谁排空都行：eventfd 是计数语义，排空后 tickle 可以再次写入。
             drain_wake_fd();
-            m_tickle_pending.store(false, std::memory_order_release);
+            m_tickle_pending.exchange(0, std::memory_order_acq_rel);
         }
         if (count > 0) {
             process_events_batch(events, static_cast<std::size_t>(count));
@@ -2000,7 +2002,7 @@ private:
     bool m_backend_owner_registered{false};
     // poller 线程 + 所有自行轮询的 worker 中，当前正停在后端 wait 里的数量。
     std::atomic<std::size_t> m_waiters{0};
-    std::atomic<bool> m_tickle_pending{false};
+    std::atomic<std::uint32_t> m_tickle_pending{0};
     int m_init_error{0};
 
     // fd 条带表：m_slots 按 fd 分片，每个条带自带锁与代际计数器。

@@ -288,12 +288,22 @@ public:
                                       std::vector<std::uint8_t>* out);
 
     /**
-     * @brief 只修改本地动态表上限，不发送表大小更新帧。
-     * @details 用于应用对端 SETTINGS 里的 `SETTINGS_HEADER_TABLE_SIZE` ——
-     *          对端声明的是"它愿意接收多大"，编码器据此收缩自己的表。
-     *          需要主动通知对端时用 `AppendTableSizeUpdate`。
+     * @brief 应用对端 `SETTINGS_HEADER_TABLE_SIZE`：只更新允许上限。
+     * @details 对端声明的是"它愿意接收多大"，因此：
+     *          - **收缩**：立即把动态表裁到新上限（绝不能让表超过对端上限）；
+     *          - **扩容**：本函数**不**自动成长。扩容属于「改变编码器动态表大小」，
+     *            按 RFC 7541 §4.2 必须先在下一个 header block 首部发送
+     *            `001xxxxx` 表大小更新，否则对端解码器仍按旧上限解释索引，
+     *            会因索引越界以 COMPRESSION_ERROR 断连（真实互通故障）。
+     *            需要扩容时调用方应调用 `AppendTableSizeUpdate()`，由它同时
+     *            写更新字节并推进本地表上限。
      */
-    void SetTableSize(std::size_t max_size) noexcept { m_table.SetMaxSize(max_size); }
+    void SetTableSize(std::size_t max_size) noexcept {
+        m_settings_max = max_size;
+        if (m_table.MaxSize() > max_size) {
+            m_table.SetMaxSize(max_size);
+        }
+    }
 
     /** @brief 当前动态表（只读，便于测试断言）。 */
     const DynamicTable& Table() const noexcept { return m_table; }

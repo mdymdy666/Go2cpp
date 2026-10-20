@@ -22,6 +22,10 @@
  * - **证书校验默认关闭**（`verify_peer = false`）。生产必须打开并配置 CA
  *   路径，否则等于不做身份验证 —— 这里为了让自签名证书的本地测试能跑通
  *   才默认关闭，属于**测试便利**而非安全默认；
+ * - `verify_peer = true` 时：优先加载显式 `ca_file`/`ca_path`，否则加载系统
+ *   默认信任库（`SSL_CTX_set_default_verify_paths`，尊重 `SSL_CERT_FILE` /
+ *   `SSL_CERT_DIR`）；`server_name` 非空时校验证书 SAN/CN（IP 字面量走
+ *   `X509_VERIFY_PARAM_set1_ip_asc`）；
  * - **服务端 TLS**（只有客户端）；
  * - **会话复用 / 0-RTT**。
  *
@@ -46,6 +50,7 @@
 #include "go2cpp/network/http2/transport.hpp"
 #include "go2cpp/network/socket.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -80,20 +85,27 @@ public:
      * @brief 创建一个客户端 TLS 传输。
      * @param socket 已连接（TCP 握手完成）的 socket，所有权转入。
      * @param server_name SNI 主机名；可为空字符串。
-     * @param verify_peer 是否校验证书链；测试自签名证书时传 false。
-     * @param timeout 单次读写的等待超时。
-     * @return 成功返回对象；OpenSSL 初始化失败返回 nullptr。
+     * @param verify_peer 是否校验证书链与主机名；测试自签名证书时传 false。
+     * @param timeout 握手或**单次** Read/Write 的总 deadline（不是每轮
+     *        WANT_READ/WANT_WRITE 重新计时）；必须是有限值。`Duration::max()`
+     *        会被拒绝并返回 nullptr，避免 `poll(-1)` 永久挂起。
+     * @param ca_file verify_peer=true 时显式 CA 文件（PEM）；为空则用 ca_path
+     *        或系统默认信任库。
+     * @param ca_path verify_peer=true 时显式 CA 目录（openssl rehash 过的目录）。
+     * @return 成功返回对象；参数非法、OpenSSL 初始化或信任库加载失败返回 nullptr。
      *
      * ## 步骤
      * step1. `OPENSSL_init_ssl()`（3.x 幂等）；
      * step2. 建 `SSL_CTX`，设最低 TLS1.2 与校验模式（verify_peer 决定）；
+     *        verify_peer=true 时加载 ca_file/ca_path 或默认信任库；
      * step3. `SSL_new`，把 fd 设为非阻塞（关键，见文件头）；
-     * step4. 设置 SNI 与 ALPN 列表（`h2` 优先、`http/1.1` 兜底）。
+     * step4. 设置 SNI、主机名校验（`SSL_set1_host` / IP 参数）与 ALPN 列表
+     *        （`h2` 优先、`http/1.1` 兜底）。
      */
-    static std::unique_ptr<TlsTransport> CreateClient(Socket::Ptr socket,
-                                                      const std::string& server_name,
-                                                      bool verify_peer = false,
-                                                      Duration timeout = Duration{10000});
+    static std::unique_ptr<TlsTransport> CreateClient(
+        Socket::Ptr socket, const std::string& server_name, bool verify_peer = false,
+        Duration timeout = Duration{10000}, const std::string& ca_file = {},
+        const std::string& ca_path = {});
 
     ~TlsTransport() override;
     TlsTransport(const TlsTransport&) = delete;
@@ -107,9 +119,17 @@ public:
      * ## 步骤
      * step1. 循环 `SSL_connect()`；
      * step2. `WANT_READ`/`WANT_WRITE` 时 `WaitFor()`（项目 hook 拦截 poll，Fiber 挂起）；
+     *        每片最多 100ms 并共享同一个总 deadline，可被 `Cancel()` 打断；
      * step3. 成功后 `SSL_get0_alpn_selected()` 记录协商出的协议名。
      */
     bool Handshake(std::string* error = nullptr);
+
+    /**
+     * @brief 取消正在进行的握手/读写等待（线程安全）。
+     * @details 置位取消标记；等待中的 `poll` 最多 100ms 后返回，后续
+     *          `Read`/`Write` 返回 0、`Closed()` 变为 true。取消不可复位。
+     */
+    void Cancel() noexcept { m_cancelled.store(true, std::memory_order_release); }
 
     /** @brief ALPN 协商出的协议名（如 `"h2"`）；未协商或失败时为空。 */
     const std::string& NegotiatedProtocol() const noexcept { return m_alpn; }
@@ -122,7 +142,8 @@ public:
      *
      * ## 步骤
      * step1. `SSL_read()`；正数直接返回；
-     * step2. WANT_READ/WANT_WRITE -> `WaitFor()` 后重试；
+     * step2. WANT_READ/WANT_WRITE -> `WaitFor()` 后重试（共享本次调用的总 deadline，
+     *        分片 100ms，可被 Cancel() 打断）；
      * step3. ZERO_RETURN / 无 close_notify 的 EOF -> 置 `m_eof` 并返回 0。
      */
     std::size_t Read(std::uint8_t* buffer, std::size_t capacity) override;
@@ -131,17 +152,23 @@ public:
      *
      * ## 步骤
      * step1. 循环 `SSL_write()` 累计已写字节；
-     * step2. WANT_WRITE/WANT_READ -> `WaitFor()` 后重试；
+     * step2. WANT_WRITE/WANT_READ -> `WaitFor()` 后重试（共享本次调用的总 deadline，
+     *        分片 100ms，可被 Cancel() 打断）；
      * step3. 其它错误置 `m_eof` 并返回已写字节数（小于 length 即失败）。
      */
     std::size_t Write(const std::uint8_t* data, std::size_t length) override;
-    bool Closed() const noexcept override { return m_ssl == nullptr || m_eof; }
+    bool Closed() const noexcept override {
+        return m_ssl == nullptr || m_eof ||
+               m_cancelled.load(std::memory_order_acquire);
+    }
 
 private:
     TlsTransport(Socket::Ptr socket, Duration timeout);
 
-    /// 等待 fd 就绪；返回 true 表示可以重试。
-    bool WaitFor(bool want_read);
+    /// 本次操作的总 deadline；`Duration::max()` 在 CreateClient 已被拒绝。
+    std::chrono::steady_clock::time_point Deadline() const;
+    /// 等待 fd 就绪；按 100ms 分片检查取消/关闭/总 deadline。true 表示可以重试。
+    bool WaitFor(bool want_read, std::chrono::steady_clock::time_point deadline);
     /// 把 OpenSSL 错误转成可读文本。
     std::string LastErrorString() const;
 
@@ -151,12 +178,14 @@ private:
     SSL_CTX* m_ctx{nullptr};
     /// SSL 会话；CreateClient() 创建，Handshake/Read/Write 使用，析构释放。
     SSL* m_ssl{nullptr};
-    /// 单次等待超时；WaitFor() 的 poll 超时用它。
+    /// 握手或单次 Read/Write 的总 deadline 时长；WaitFor() 分片消费它。
     Duration m_timeout;
     /// ALPN 协商结果；Handshake() 写入，NegotiatedProtocol() 只读。
     std::string m_alpn;
     /// 读侧 EOF/不可用标记；Read/Write 置位，Closed() 读取。
     bool m_eof{false};
+    /// 取消标记；Cancel() 置位，WaitFor()/Closed() 读取（只从 false 变 true）。
+    std::atomic<bool> m_cancelled{false};
     /// socket fd 副本；构造时取，WaitFor() 与 SSL_set_fd() 使用。
     int m_fd{-1};
 };

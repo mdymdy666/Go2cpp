@@ -8,10 +8,13 @@
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <climits>
 #include <cstring>
 
 namespace go2cpp::net::http2 {
@@ -44,11 +47,12 @@ TlsTransport::TlsTransport(Socket::Ptr socket, Duration timeout)
     }
 }
 
-std::unique_ptr<TlsTransport> TlsTransport::CreateClient(Socket::Ptr socket,
-                                                         const std::string& server_name,
-                                                         bool verify_peer,
-                                                         Duration timeout) {
-    if (!socket) {
+std::unique_ptr<TlsTransport> TlsTransport::CreateClient(
+    Socket::Ptr socket, const std::string& server_name, bool verify_peer,
+    Duration timeout, const std::string& ca_file, const std::string& ca_path) {
+    if (!socket || timeout.count() < 0 || timeout == Duration::max()) {
+        // Duration::max() 以前会被 static_cast<int> 溢出成 -1，令 poll(-1)
+        // 永久挂起；这里直接拒绝，调用方必须给有限的握手/读写 deadline。
         return nullptr;
     }
     auto transport = std::unique_ptr<TlsTransport>(new TlsTransport(std::move(socket), timeout));
@@ -65,6 +69,19 @@ std::unique_ptr<TlsTransport> TlsTransport::CreateClient(Socket::Ptr socket,
     SSL_CTX_set_min_proto_version(transport->m_ctx, TLS1_2_VERSION);
     if (verify_peer) {
         SSL_CTX_set_verify(transport->m_ctx, SSL_VERIFY_PEER, nullptr);
+        // 信任锚优先级：显式 ca_file/ca_path > 系统默认信任库。
+        // 默认库会读取 SSL_CERT_FILE / SSL_CERT_DIR，便于容器与测试注入 CA。
+        int loaded = 0;
+        if (!ca_file.empty() || !ca_path.empty()) {
+            loaded = SSL_CTX_load_verify_locations(
+                transport->m_ctx, ca_file.empty() ? nullptr : ca_file.c_str(),
+                ca_path.empty() ? nullptr : ca_path.c_str());
+        } else {
+            loaded = SSL_CTX_set_default_verify_paths(transport->m_ctx);
+        }
+        if (loaded != 1) {
+            return nullptr;
+        }
     } else {
         // 测试便利：不校验证书链。生产必须打开。
         SSL_CTX_set_verify(transport->m_ctx, SSL_VERIFY_NONE, nullptr);
@@ -81,7 +98,24 @@ std::unique_ptr<TlsTransport> TlsTransport::CreateClient(Socket::Ptr socket,
         return nullptr;
     }
     if (!server_name.empty()) {
-        SSL_set_tlsext_host_name(transport->m_ssl, server_name.c_str());
+        if (SSL_set_tlsext_host_name(transport->m_ssl, server_name.c_str()) != 1) {
+            return nullptr;
+        }
+    }
+    // 主机名校验：verify_peer=true 且给了名字时，证书必须匹配 SAN/CN。
+    // IP 字面量（例如 "127.0.0.1"）走 set1_ip_asc，DNS 走 SSL_set1_host。
+    if (verify_peer && !server_name.empty()) {
+        X509_VERIFY_PARAM* param = SSL_get0_param(transport->m_ssl);
+        X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        unsigned char address[sizeof(struct in6_addr)] = {};
+        const bool is_ip = ::inet_pton(AF_INET, server_name.c_str(), address) == 1 ||
+                           ::inet_pton(AF_INET6, server_name.c_str(), address) == 1;
+        const int verified = is_ip
+                                 ? X509_VERIFY_PARAM_set1_ip_asc(param, server_name.c_str())
+                                 : SSL_set1_host(transport->m_ssl, server_name.c_str());
+        if (verified != 1) {
+            return nullptr;
+        }
     }
     if (SSL_set_alpn_protos(transport->m_ssl, kAlpnProtos, sizeof(kAlpnProtos)) != 0) {
         return nullptr;
@@ -100,16 +134,67 @@ TlsTransport::~TlsTransport() {
     }
 }
 
-bool TlsTransport::WaitFor(bool want_read) {
-    struct pollfd pfd;
-    pfd.fd = m_fd;
-    pfd.events = want_read ? POLLIN : POLLOUT;
-    pfd.revents = 0;
-    const int result = ::poll(&pfd, 1, static_cast<int>(m_timeout.count()));
-    if (result <= 0) {
+std::chrono::steady_clock::time_point TlsTransport::Deadline() const {
+    if (m_timeout == Duration::max()) {
+        return std::chrono::steady_clock::time_point::max();
+    }
+    return std::chrono::steady_clock::now() + m_timeout;
+}
+
+bool TlsTransport::WaitFor(bool want_read,
+                           std::chrono::steady_clock::time_point deadline) {
+    // 100ms 分片：既让 Duration::max() 不再溢出成 poll(-1)，也让 Cancel()
+    // 与 socket 关闭能在有限时间内打断等待；剩余时间按总 deadline 计算，
+    // 不会像旧实现那样每次 WANT_READ/WANT_WRITE 都重新获得完整超时。
+    constexpr Duration kSlice{100};
+    for (;;) {
+        if (m_cancelled.load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (!m_socket || !m_socket->valid()) {
+            return false;
+        }
+        Duration slice = kSlice;
+        if (deadline != std::chrono::steady_clock::time_point::max()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                return false;
+            }
+            const auto remaining =
+                std::chrono::duration_cast<Duration>(deadline - now);
+            if (remaining.count() <= 0) {
+                return false;
+            }
+            if (remaining < slice) {
+                slice = remaining;
+            }
+        }
+        if (slice.count() <= 0) {
+            slice = Duration{1};
+        }
+        struct pollfd pfd;
+        pfd.fd = m_fd;
+        pfd.events = want_read ? POLLIN : POLLOUT;
+        pfd.revents = 0;
+        const int result = ::poll(&pfd, 1, static_cast<int>(slice.count()));
+        if (result < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (result == 0) {
+            continue;  // 本片超时：回到循环顶部重查取消/关闭/总 deadline
+        }
+        if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            // 交给 SSL_* 读取真实错误（EOF/EPIPE/ECONNRESET 等）。
+            return true;
+        }
+        if ((pfd.revents & (want_read ? POLLIN : POLLOUT)) != 0) {
+            return true;
+        }
         return false;
     }
-    return (pfd.revents & (want_read ? POLLIN : POLLOUT)) != 0;
 }
 
 std::string TlsTransport::LastErrorString() const {
@@ -125,7 +210,12 @@ bool TlsTransport::Handshake(std::string* error) {
         if (error != nullptr) *error = "TLS 尚未初始化";
         return false;
     }
+    const auto deadline = Deadline();
     for (;;) {
+        if (m_cancelled.load(std::memory_order_acquire)) {
+            if (error != nullptr) *error = "TLS 握手已取消";
+            return false;
+        }
         ERR_clear_error();
         const int result = SSL_connect(m_ssl);
         if (result == 1) {
@@ -133,21 +223,38 @@ bool TlsTransport::Handshake(std::string* error) {
         }
         const int ssl_error = SSL_get_error(m_ssl, result);
         if (ssl_error == SSL_ERROR_WANT_READ) {
-            if (!WaitFor(true)) {
-                if (error != nullptr) *error = "TLS 握手等待可读超时";
+            if (!WaitFor(true, deadline)) {
+                if (error != nullptr) {
+                    *error = m_cancelled.load(std::memory_order_acquire)
+                                 ? "TLS 握手已取消"
+                                 : "TLS 握手等待可读超时";
+                }
                 return false;
             }
             continue;
         }
         if (ssl_error == SSL_ERROR_WANT_WRITE) {
-            if (!WaitFor(false)) {
-                if (error != nullptr) *error = "TLS 握手等待可写超时";
+            if (!WaitFor(false, deadline)) {
+                if (error != nullptr) {
+                    *error = m_cancelled.load(std::memory_order_acquire)
+                                 ? "TLS 握手已取消"
+                                 : "TLS 握手等待可写超时";
+                }
                 return false;
             }
             continue;
         }
         if (error != nullptr) {
-            *error = "TLS 握手失败: " + LastErrorString();
+            std::string detail = LastErrorString();
+            // OpenSSL 3 的 ERR 队列对证书类失败只给笼统的
+            // "certificate verify failed"；把 verify result 一并带上，
+            // 调用方才分得清自签名、过期、主机名不匹配。
+            const long verify_result = SSL_get_verify_result(m_ssl);
+            if (verify_result != X509_V_OK) {
+                detail += "; verify: ";
+                detail += X509_verify_cert_error_string(verify_result);
+            }
+            *error = "TLS 握手失败: " + detail;
         }
         return false;
     }
@@ -171,22 +278,28 @@ std::string TlsTransport::TlsVersion() const {
 }
 
 std::size_t TlsTransport::Read(std::uint8_t* buffer, std::size_t capacity) {
-    if (m_ssl == nullptr || buffer == nullptr || capacity == 0 || m_eof) {
+    if (m_ssl == nullptr || buffer == nullptr || capacity == 0 || m_eof ||
+        m_cancelled.load(std::memory_order_acquire)) {
         return 0;
     }
+    const auto deadline = Deadline();
+    // SSL_read 的 length 是 int：>2GiB 的容量按 INT_MAX 截断，不做隐式溢出。
+    const int request = capacity > static_cast<std::size_t>(INT_MAX)
+                            ? INT_MAX
+                            : static_cast<int>(capacity);
     for (;;) {
         ERR_clear_error();
-        const int result = SSL_read(m_ssl, buffer, static_cast<int>(capacity));
+        const int result = SSL_read(m_ssl, buffer, request);
         if (result > 0) {
             return static_cast<std::size_t>(result);
         }
         const int ssl_error = SSL_get_error(m_ssl, result);
         if (ssl_error == SSL_ERROR_WANT_READ) {
-            if (!WaitFor(true)) return 0;
+            if (!WaitFor(true, deadline)) return 0;
             continue;
         }
         if (ssl_error == SSL_ERROR_WANT_WRITE) {
-            if (!WaitFor(false)) return 0;
+            if (!WaitFor(false, deadline)) return 0;
             continue;
         }
         if (ssl_error == SSL_ERROR_ZERO_RETURN) {
@@ -204,25 +317,30 @@ std::size_t TlsTransport::Read(std::uint8_t* buffer, std::size_t capacity) {
 }
 
 std::size_t TlsTransport::Write(const std::uint8_t* data, std::size_t length) {
-    if (m_ssl == nullptr || data == nullptr || length == 0 || m_eof) {
+    if (m_ssl == nullptr || data == nullptr || length == 0 || m_eof ||
+        m_cancelled.load(std::memory_order_acquire)) {
         return 0;
     }
+    const auto deadline = Deadline();
     std::size_t total = 0;
     while (total < length) {
         ERR_clear_error();
-        const int result =
-            SSL_write(m_ssl, data + total, static_cast<int>(length - total));
+        const std::size_t remaining = length - total;
+        const int chunk = remaining > static_cast<std::size_t>(INT_MAX)
+                              ? INT_MAX
+                              : static_cast<int>(remaining);
+        const int result = SSL_write(m_ssl, data + total, chunk);
         if (result > 0) {
             total += static_cast<std::size_t>(result);
             continue;
         }
         const int ssl_error = SSL_get_error(m_ssl, result);
         if (ssl_error == SSL_ERROR_WANT_WRITE) {
-            if (!WaitFor(false)) break;
+            if (!WaitFor(false, deadline)) break;
             continue;
         }
         if (ssl_error == SSL_ERROR_WANT_READ) {
-            if (!WaitFor(true)) break;
+            if (!WaitFor(true, deadline)) break;
             continue;
         }
         m_eof = true;

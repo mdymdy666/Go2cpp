@@ -64,6 +64,15 @@ namespace {
 constexpr std::uint32_t kMaxFrame = 8U << 20;
 std::atomic<bool> g_stop{false};
 
+std::size_t bench_stack_kb() {
+    const char* env = std::getenv("GO2CPP_BENCH_STACK_KB");
+    if (env == nullptr || *env == 0) {
+        return 128;
+    }
+    return static_cast<std::size_t>(std::strtoul(env, nullptr, 10));
+}
+int g_downstream_us = 0;  // 模拟下游阻塞等待（微秒），0 = 关闭
+
 std::uint64_t now_ns() {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -142,11 +151,14 @@ void serve_gmp_connection(go2cpp::net::Socket::Ptr socket) {
     // 与 epoll 模型同构的读取方式：一次 recv 读满 64KB 缓冲，再按帧解析。
     // 旧写法“精确读 4 字节 header、再读 body”每请求要 2 次 recvmsg，而
     // epoll 模型 1 次 recvfrom 就能读完——这是测试写法差异，不是模型差异。
-    char buffer[64 * 1024];
+    char buffer[8 * 1024];
     std::string in;
+    in.reserve(16 * 1024);
     std::size_t in_off = 0;
     std::string out;
+    out.reserve(16 * 1024);
     for (;;) {
+        out.clear();
         for (;;) {
             const std::size_t available = in.size() - in_off;
             if (available < 4) {
@@ -161,20 +173,23 @@ void serve_gmp_connection(go2cpp::net::Socket::Ptr socket) {
                 break;
             }
             const char* body = in.data() + in_off + 4;
+            if (g_downstream_us > 0) {
+                ::usleep(static_cast<unsigned>(g_downstream_us));
+            }
             const std::string response = process_body(
                 static_cast<std::uint8_t>(body[0]),
                 std::string_view(body + 1, length - 1));
-            out.clear();
-            out.reserve(4 + response.size());
             char header[4];
             put_u32(header, static_cast<std::uint32_t>(response.size()));
             out.append(header, sizeof(header));
             out.append(response);
-            if (!send_all(*socket, out.data(), out.size())) {
-                socket->close();
-                return;
-            }
             in_off += static_cast<std::size_t>(length) + 4;
+        }
+        // 批量发送：一次 recv 解析出的所有帧合并成一次 send_all，
+        // 减少 pipeline 场景下每帧一次 sendmsg 的系统调用。
+        if (!out.empty() && !send_all(*socket, out.data(), out.size())) {
+            socket->close();
+            return;
         }
         if (in_off == in.size()) {
             in.clear();
@@ -205,6 +220,7 @@ int run_gmp_server(std::uint16_t port, std::size_t workers) {
     config.processor_count = static_cast<std::uint32_t>(workers);
     config.min_workers = workers;
     config.collect_metrics = false;
+    config.fiber_stack_size = bench_stack_kb() * 1024;
     go2cpp::IOManager manager(config);
     if (!manager.start()) {
         std::fputs("[server] IOManager 启动失败\n", stderr);
@@ -309,7 +325,7 @@ void e_handle(EWorker& worker, int fd, std::uint32_t mask) {
         e_close(conn);
     }
     if ((mask & EPOLLIN) != 0 || closed) {
-        char buffer[64 * 1024];
+        char buffer[8 * 1024];
         for (;;) {
             const ssize_t n = ::recv(fd, buffer, sizeof(buffer), 0);
             if (n > 0) {
@@ -350,6 +366,9 @@ void e_handle(EWorker& worker, int fd, std::uint32_t mask) {
             break;
         }
         const char* body = conn.in.data() + conn.in_off + 4;
+        if (g_downstream_us > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(g_downstream_us));
+        }
         const std::string response = process_body(
             static_cast<std::uint8_t>(body[0]), std::string_view(body + 1, length - 1));
         char header[4];
@@ -847,6 +866,7 @@ int main(int argc, char** argv) {
     }
     const std::string mode = argv[1];
     if (mode == "server") {
+        g_downstream_us = std::stoi(arg_value(argc, argv, "--downstream-us", "0"));
         const std::string model = arg_value(argc, argv, "--model", "gmp");
         const std::size_t workers = static_cast<std::size_t>(
             std::stoul(arg_value(argc, argv, "--workers", "12")));

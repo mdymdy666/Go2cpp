@@ -53,6 +53,8 @@
 #include <alloca.h>
 #include <pthread.h>
 
+#include <cstdlib>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -627,6 +629,11 @@ bool scenario_json_nesting() {
  * @return 全部场景通过返回 0，否则返回 1。
  */
 int main() {
+    // 本示例测量的是「固定栈」的临界深度与爆栈语义。默认的可变长栈会把
+    // 深递归 mprotect 成更大的栈，从而改变场景 1/5 的预期（临界深度从
+    // 128KiB 级提升到 8MiB 级）。显式关闭增长，让本示例继续作为固定栈
+    // 基线的可复现实验；子进程继承该环境变量。
+    ::setenv("GO2CPP_GROWABLE_STACK", "0", 1);
     disable_core_dumps();  // 探深会故意让子进程爆栈
 
     bool ok = true;

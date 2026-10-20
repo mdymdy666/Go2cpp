@@ -26,10 +26,11 @@
  * 的行切分/派发规则，最后看 `Stream::start/send/close` 与心跳 `tick()`。
  *
  * ## 边界与陷阱
- * - **CR-only 换行是确定性设计缺口，不是 flaky**：`Parser` 遇到 `\r` 时必须
- *   看下一个字节才能判定是 CR 还是 CRLF；若 `\r` 恰好是流的最后一个字节，
- *   该行（连同其事件）永远不会被派发。根因是缺 `finish()`/EOF 冲刷接口。
- *   编码侧 `Event::encode()` 会把 CR/CRLF 归一化为 LF，所以缺口只在解析方向；
+ * - **CR-only 行尾需要显式 EOF**：`Parser` 遇到 `\r` 时必须看下一个字节才能
+ *   判定是 CR 还是 CRLF；若 `\r` 恰好是流的最后一个字节，`feed()` 只能保守
+ *   等待。调用方确认流结束时必须调用 `finish()`：它把末尾 CR 当作 CR-only
+ *   行尾，并派发最后一个未以空行闭合的事件。编码侧 `Event::encode()` 会把
+ *   CR/CRLF 归一化为 LF，所以该边界只在解析方向；
  * - `Stream` 的锁是 `sync::Mutex`（Fiber/线程混合），因为持锁期间写可能 park；
  * - `Stream` 只保证字节不交错，不承诺业务事件顺序，也不建无界队列。
  */
@@ -107,7 +108,9 @@ struct Event {
 
 /** @brief SSE 注释/心跳的默认限制。 */
 struct StreamOptions {
-    /// 单条事件上限；send()/comment() 用它拒绝过大的写入。
+    /// 单条事件上限（**编码后**字节数）；send()/comment() 用它拒绝过大的写入。
+    /// 与 ParserLimits::max_line_bytes 的默认值自洽：编码后不超过 1MiB 的事件
+    /// 不会产生超过 1MiB 的单行，默认 Parser 一定能解析默认 Stream 能发送的事件。
     std::size_t max_event_bytes{1024 * 1024};
     /// 心跳间隔；tick() 与 refresh_heartbeat_locked() 使用，<=0 表示关闭心跳。
     std::chrono::milliseconds heartbeat_interval{std::chrono::seconds(15)};
@@ -119,8 +122,10 @@ struct StreamOptions {
 
 /** @brief 增量解析器的内存上限。 */
 struct ParserLimits {
-    /// 单行上限；feed() 切行前检查（防止无换行的超长行）。
-    std::size_t max_line_bytes{64 * 1024};
+    /// 单行上限（含 `data: ` 等字段前缀）；feed()/finish() 切行前检查，
+    /// 防止无换行的超长行。默认 1MiB 与 StreamOptions::max_event_bytes 对齐，
+    /// 避免“默认发送端能编码、默认解析端却拒收”。
+    std::size_t max_line_bytes{1024 * 1024};
     /// 单事件上限；consume_line()/dispatch() 累计检查。
     std::size_t max_event_bytes{1024 * 1024};
     /// 未完成行的缓冲上限；feed() 追加前检查。
@@ -132,8 +137,9 @@ struct ParserLimits {
 /**
  * @brief SSE 增量解析器。
  * @details 支持任意字节分片、LF/CRLF/CR 换行、UTF-8 BOM、注释、重复 data
- *          字段和 Last-Event-ID。EOF 不会把没有空行结束的半个事件强行派发，
- *          这样可以避免把截断数据误报为完整业务消息。
+ *          字段和 Last-Event-ID。隐式 EOF（不再 feed）不会把没有空行结束的
+ *          半个事件强行派发，避免把截断数据误报为完整业务消息；调用方明确
+ *          知道流已结束时，应调用 `finish()` 冲刷末尾 CR 行与最后一个事件。
  * @note Parser 是有状态的单消费者对象；多个线程/Fiber 同时 feed 必须由调用方
  *       使用 sync::Mutex 或把输入集中到一个 Fiber，否则会产生数据竞争。
  *
@@ -142,7 +148,8 @@ struct ParserLimits {
  *
  * ## 不变量
  * - 单消费者、有状态：并发 feed 必须由调用方加锁或集中到单 Fiber；
- *   `m_buffer` 只追加，切走的行立即 erase；
+ *   `m_buffer` 只追加，消费用 `m_in_off` 游标推进，每次 feed/finish 结束后
+ *   一次性压缩已消费前缀（避免逐行 `erase(0, ...)` 的 O(n²) 搬移）；
  * - 只有空行才派发事件；没有 data 的块只更新 `last_event_id`；
  * - 失败后 `m_failed` 置位，必须 `reset()` 才能复用。
  */
@@ -168,6 +175,24 @@ public:
      * 超限返回 `MessageTooLarge` 并置 `m_failed`；协议错误返回 `Parse`，需 reset()。
      */
     Result feed(std::string_view bytes, std::vector<Event>& events);
+    /**
+     * @brief 声明输入已到 EOF：冲刷末尾 CR 行与最后一个未闭合事件。
+     * @param events 输出容器，函数只追加本次新完成的事件。
+     * @return 成功返回 None；失败语义与 feed() 相同（失败后必须 reset()）。
+     *
+     * ## 语义
+     * - 缓冲末尾的 `\r` 视为 CR-only 行尾，不再等待下一个字节；
+     * - **没有空行结尾的最后一行也按 EOF 行尾处理**，并派发累积了 data 的
+     *   最后一个事件；这是调用方显式声明 EOF 才有的行为，`feed()` 本身仍
+     *   保持“不猜截断数据”的保守策略；
+     * - 可重复调用：第二次调用时缓冲与当前事件已清空，直接成功。
+     *
+     * ## 步骤
+     * step1. 压缩已消费前缀；
+     * step2. 若仍有未完成行，按 EOF 行尾切出并 `consume_line()`；
+     * step3. `dispatch()` 派发最后一个事件（无 data 时只更新 last_event_id）。
+     */
+    Result finish(std::vector<Event>& events);
     /** @brief 返回最近一次 retry 字段建议。 */
     std::optional<std::uint64_t> retry_after() const noexcept { return m_retry_after; }
     /** @brief 返回服务器最近发送的事件 ID，供重连时填入 Last-Event-ID。 */
@@ -181,8 +206,10 @@ private:
 
     /// 解析上限快照；构造时固定，feed()/consume_line() 使用。
     ParserLimits m_limits;
-    /// 未消费字节；feed() 追加、切行后 erase。
+    /// 未消费字节；feed() 追加，消费用 m_in_off 游标，压缩时一次性 erase。
     std::string m_buffer;
+    /// m_buffer 中已消费前缀的长度；feed()/finish() 推进，reset() 清零。
+    std::size_t m_in_off{0};
     /// 当前事件的 event 字段；空行派发后清空。
     std::string m_event_name;
     /// 当前事件的 id 字段；派发后按需更新 last_event_id。
@@ -226,7 +253,8 @@ enum class StreamState { Idle, Open, Closed, Failed };
  *
  * ## 状态机
  * `Idle` -(start)-> `Open` -(close)-> `Closed`；任一次写失败 -> `Failed`。
- * 只有 `Open` 允许 `send()`/`comment()`/`tick()`；`close()` 幂等。
+ * 只有 `Open` 允许 `send()`/`comment()`/`tick()`；`close()` 在 `Closed`
+ * 状态幂等成功，`Failed` 状态不写任何字节并返回 `Error::Closed`。
  * 完整转化表见 `docs/state-machines/Stream.md`。
  *
  * ## 不变量
@@ -252,7 +280,11 @@ public:
     Result comment(std::string_view text = "heartbeat");
     /** @brief 到达心跳时间时发送注释，否则不写入任何字节。 */
     Result tick();
-    /** @brief 发送 chunked 终止块；重复 close 幂等成功。 */
+    /**
+     * @brief 发送 chunked 终止块。
+     * @note 仅 `Closed` 状态幂等成功；`Failed` 状态返回 `Error::Closed`
+     *       （连接已不可复用，不再尝试写终止块），与 `StreamState` 一致。
+     */
     Result close();
 
     StreamState state() const noexcept;

@@ -291,17 +291,43 @@ bool BuildRequestBytes(const Request& request, const std::string& authority,
     return true;
 }
 
-/// 连接关闭事件里的 `bytes` 是一个 8 字节大端错误码（与 QUIC transport error 一致）。
-std::uint64_t DecodeCloseCode(const std::uint8_t* bytes, std::size_t length) {
-    std::uint64_t code = 0;
-    if (bytes == nullptr) {
-        return code;
+/// `Poll` 的单次默认等待上限（毫秒）。
+constexpr int kClientPollWaitMs = 1000;
+
+/// 距 deadline 的剩余毫秒数（已过期返回 0）。
+std::int64_t RemainingMs(Clock::time_point deadline) {
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now());
+    return left.count() < 0 ? 0 : left.count();
+}
+
+/**
+ * @brief 取关闭类事件的关闭码（审计 D05）。
+ *
+ * picoquic 1.1.53 的 `close`/`application_close`/`stateless_reset` 回调都是
+ * `bytes = NULL, len = 0`，关闭码必须从连接上下文读，不能解 `bytes`。
+ */
+std::uint64_t CloseErrorCode(picoquic_cnx_t* cnx) {
+    if (cnx == nullptr) {
+        return 0;
     }
-    const std::size_t count = std::min<std::size_t>(length, 8);
-    for (std::size_t i = 0; i < count; ++i) {
-        code = (code << 8) | bytes[i];
+    // 注意 picoquic_get_application_error() 只返回对端的 application error；
+    // 本地 close(code) 的码必须用 picoquic_get_close_reasons() 取（D05）。
+    std::uint64_t local_transport = 0;
+    std::uint64_t remote_transport = 0;
+    std::uint64_t local_application = 0;
+    std::uint64_t remote_application = 0;
+    picoquic_get_close_reasons(cnx, &local_transport, &remote_transport, &local_application,
+                               &remote_application);
+    if (remote_application != 0) {
+        return remote_application;
     }
-    return code;
+    if (local_application != 0) {
+        return local_application;
+    }
+    if (remote_transport != 0) {
+        return remote_transport;
+    }
+    return local_transport;
 }
 
 }  // namespace
@@ -331,16 +357,21 @@ struct Client::Impl {
     bool closed{false};
     std::uint64_t last_error{0};
     std::string close_reason;
-    std::uint32_t timeout_ms{kDefaultTimeoutMs};
+    Options options;
     std::uint64_t last_stream_id{0};
 
     std::map<std::uint64_t, StreamState> streams;
     std::deque<std::uint64_t> pending;
 
     ~Impl() {
-        // picoquic_free 会回调一次 picoquic_callback_close；此时本对象仍存活，
-        // 回调只碰 closed/last_error/close_reason，是安全的。
+        // D01：PicoquicConnection 析构会先发 CONNECTION_CLOSE 再 picoquic_free；
+        // 该过程会回调本对象的 Callback（close 事件），此时 Impl 仍存活，安全。
         connection.reset();
+    }
+
+    /// `:authority`：显式配置优先，否则退回 SNI（保持旧行为）。
+    const std::string& Authority() const {
+        return options.authority.empty() ? sni : options.authority;
     }
 
     static int Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
@@ -409,14 +440,16 @@ int Client::Impl::Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::ui
             if (self->ready) {
                 break;
             }
-            self->ready = true;
-            // 先发 SETTINGS / QPACK streams，再允许上层发请求（见文件头第 2 点）。
+            // D14：先发 SETTINGS / QPACK streams，成功后才置 ready，避免
+            // HandshakeComplete() 在控制流初始化失败时「撒谎」。
             const int rc = h3zero_protocol_init(cnx);
             if (rc != 0) {
                 self->closed = true;
                 self->last_error = H3ZERO_INTERNAL_ERROR;
                 self->close_reason = "h3zero_protocol_init failed";
+                break;
             }
+            self->ready = true;
             break;
         }
         case picoquic_callback_set_alpn:
@@ -442,7 +475,8 @@ int Client::Impl::Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::ui
         case picoquic_callback_application_close:
         case picoquic_callback_stateless_reset:
             self->closed = true;
-            self->last_error = DecodeCloseCode(bytes, length);
+            // D05：bytes/len 恒为 NULL/0，关闭码从连接上下文取。
+            self->last_error = CloseErrorCode(cnx);
             if (self->close_reason.empty()) {
                 self->close_reason = (event == picoquic_callback_application_close)
                                          ? "connection closed by application"
@@ -518,12 +552,26 @@ void Client::Impl::HandleStreamData(picoquic_cnx_t* cnx, std::uint64_t stream_id
                 return;
             }
             if (available_data > 0) {
+                // D08：响应体上限，避免被对端声明的超长 DATA 帧拖成 OOM。
+                const std::size_t max_body = options.max_response_bytes;
+                if (max_body != 0 && stream.response.body.size() + available_data > max_body) {
+                    stream.failed = true;
+                    stream.fail_reason = "HTTP/3 response body exceeds limit (" +
+                                         std::to_string(max_body) + " bytes)";
+                    last_error = H3ZERO_INTERNAL_ERROR;
+                    (void)picoquic_close(cnx, H3ZERO_INTERNAL_ERROR);
+                    return;
+                }
                 if (!stream.flow_opened) {
                     stream.flow_opened = true;
-                    // DATA 帧声明长度很大时，主动放开接收窗口（demo 客户端同款处理）。
+                    // 只按实际需要放开流控；对端声明超大长度时不照单全收（D08）。
                     if (stream.parser.current_frame_length > 0x100000ULL) {
-                        (void)picoquic_open_flow_control(cnx, stream_id,
-                                                         stream.parser.current_frame_length);
+                        const std::uint64_t window =
+                            (max_body == 0)
+                                ? stream.parser.current_frame_length
+                                : std::min<std::uint64_t>(stream.parser.current_frame_length,
+                                                          max_body);
+                        (void)picoquic_open_flow_control(cnx, stream_id, window);
                     }
                 }
                 stream.response.body.append(reinterpret_cast<const char*>(cursor), available_data);
@@ -542,6 +590,11 @@ void Client::Impl::HandleStreamData(picoquic_cnx_t* cnx, std::uint64_t stream_id
 
 std::unique_ptr<Client> Client::Connect(net::http2::Transport* transport, const std::string& sni,
                                         std::string* error) {
+    return Connect(transport, sni, Options{}, error);
+}
+
+std::unique_ptr<Client> Client::Connect(net::http2::Transport* transport, const std::string& sni,
+                                        const Options& options, std::string* error) {
     if (transport == nullptr) {
         SetError(error, "transport is null");
         return nullptr;
@@ -554,12 +607,15 @@ std::unique_ptr<Client> Client::Connect(net::http2::Transport* transport, const 
     auto impl = std::make_unique<Impl>();
     impl->transport = transport;
     impl->sni = sni;
+    impl->options = options;
 
     quic::PicoquicConfig config;
     config.alpn = "h3";
     config.sni = sni;
-    // 与项目现有 QUIC 封装一致：默认不校验证书（本地自签场景），生产必须打开。
-    config.verify_peer = false;
+    // D04：把证书校验开关与 CA 路径透传到 QUIC 层。默认仍是 false（本地自签），
+    // 但调用方现在可以通过 Options 真正打开校验。
+    config.verify_peer = options.verify_peer;
+    config.cert_root_file_name = options.cert_root_file_name;
 
     impl->connection = quic::PicoquicConnection::Connect(transport, config, error);
     if (impl->connection == nullptr) {
@@ -588,7 +644,7 @@ bool Client::Poll(std::string* error) {
         return false;
     }
     std::string poll_error;
-    if (!state.connection->Poll(&poll_error)) {
+    if (!state.connection->PollFor(&poll_error, kClientPollWaitMs)) {
         state.closed = true;
         if (state.close_reason.empty()) {
             state.close_reason = poll_error;
@@ -610,26 +666,42 @@ bool Client::Send(const Request& req, std::string* error) {
         return false;
     }
 
+    // D10：method/path/header 校验与编码都是纯本地操作，放在握手之前，
+    // 参数错误立即返回，不会被 5s 握手超时掩盖。
+    std::vector<std::uint8_t> bytes;
+    if (!BuildRequestBytes(req, state.Authority(), &bytes, error)) {
+        return false;
+    }
+
     // 握手未完成时先推进握手（HTTP/3 的 SETTINGS 在 ready 回调里发）。
     const Clock::time_point deadline =
-        Clock::now() + std::chrono::milliseconds(state.timeout_ms);
+        Clock::now() + std::chrono::milliseconds(state.options.timeout_ms);
     while (!state.ready) {
         if (state.closed) {
             SetError(error, state.close_reason.empty() ? "connection closed" : state.close_reason);
             return false;
         }
-        if (Clock::now() > deadline) {
-            SetError(error, "HTTP/3 handshake timeout after " + std::to_string(state.timeout_ms) +
-                                " ms");
+        const std::int64_t remaining = RemainingMs(deadline);
+        if (remaining <= 0) {
+            SetError(error, "HTTP/3 handshake timeout after " +
+                                std::to_string(state.options.timeout_ms) + " ms");
             return false;
         }
-        if (!Poll(error)) {
+        // D02：把剩余预算交给 PollFor，单次阻塞读不会超出 deadline。
+        std::string poll_error;
+        if (!state.connection->PollFor(&poll_error, static_cast<int>(remaining))) {
+            state.closed = true;
+            if (state.close_reason.empty()) {
+                state.close_reason = poll_error;
+            }
+            SetError(error, poll_error);
             return false;
         }
     }
 
-    std::vector<std::uint8_t> bytes;
-    if (!BuildRequestBytes(req, state.sni, &bytes, error)) {
+    // D14：成功协商后必须是 h3；ALPN 回调尚未到达（空串）时不拦截。
+    if (!state.alpn.empty() && state.alpn != "h3") {
+        SetError(error, "HTTP/3 requires ALPN 'h3', negotiated '" + state.alpn + "'");
         return false;
     }
 
@@ -671,7 +743,7 @@ bool Client::Receive(Response* resp, std::string* error) {
     }
 
     const Clock::time_point deadline =
-        Clock::now() + std::chrono::milliseconds(state.timeout_ms);
+        Clock::now() + std::chrono::milliseconds(state.options.timeout_ms);
     for (;;) {
         const std::uint64_t stream_id = state.pending.front();
         auto it = state.streams.find(stream_id);
@@ -707,15 +779,41 @@ bool Client::Receive(Response* resp, std::string* error) {
             SetError(error, state.close_reason.empty() ? "connection closed" : state.close_reason);
             return false;
         }
-        if (Clock::now() > deadline) {
-            SetError(error, "HTTP/3 response timeout after " + std::to_string(state.timeout_ms) +
-                                " ms on stream " + std::to_string(stream_id));
+        const std::int64_t remaining = RemainingMs(deadline);
+        if (remaining <= 0) {
+            SetError(error, "HTTP/3 response timeout after " +
+                                std::to_string(state.options.timeout_ms) + " ms on stream " +
+                                std::to_string(stream_id));
             return false;
         }
-        if (!Poll(error)) {
+        // D02：按剩余预算驱动，阻塞读不会击穿 deadline。
+        std::string poll_error;
+        if (!state.connection->PollFor(&poll_error, static_cast<int>(remaining))) {
+            state.closed = true;
+            if (state.close_reason.empty()) {
+                state.close_reason = poll_error;
+            }
+            SetError(error, poll_error);
             return false;
         }
     }
+}
+
+bool Client::Close(std::uint64_t application_error_code, std::string* error) {
+    Impl& state = *m_impl;
+    std::string close_error;
+    bool ok = true;
+    if (state.connection != nullptr) {
+        ok = state.connection->Close(application_error_code, &close_error);
+    }
+    state.closed = true;
+    if (state.close_reason.empty()) {
+        state.close_reason = "connection closed locally";
+    }
+    if (error != nullptr) {
+        *error = ok ? std::string() : close_error;
+    }
+    return ok;
 }
 
 bool Client::HandshakeComplete() const noexcept {

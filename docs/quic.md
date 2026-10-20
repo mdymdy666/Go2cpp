@@ -1,5 +1,31 @@
-# QUIC 地基模块（能力边界如实说明）
+# QUIC / HTTP3 模块（2026-10-20 以代码为准订正）
 
+> ## 当前状态：自实现已删除，现为 picoquic + picohttp 薄封装
+>
+> 下面「参考实现」的定位声明描述的是 **2026-10-18 之前的自实现**
+> （varint/包头/帧层，1702 行），那套代码已全部删除（见文末「自实现已删除」）。
+> **当前代码是成熟库集成，不是参考实现：**
+>
+> | 文件 | 行数 | 内容 |
+> |---|---:|---|
+> | `src/network/quic/picoquic_connection.cpp` | 392 | picoquic 客户端连接、握手驱动、按流读写、回调 |
+> | `src/network/http3/client.cpp` | 752 | picohttp h3zero 的 HTTP/3 客户端（HEADERS/DATA、QPACK） |
+> | `example/network/picoquic_hq_client.cpp` | — | 端到端示例（TLS 1.3 握手 + 46 字节响应，验证通过） |
+>
+> - 构建开关 `GO2CPP_WITH_PICOQUIC`（默认 OFF），需要 `PICOQUIC_ROOT` + `PICOTLS_ROOT`；
+> - **依赖已在本机**：`/home/ubunturoot/build-deps/picoquic`（`PICOQUIC_VERSION`
+>   "1.1.53.0"，含 `build/libpicoquic-core.a`、`libpicohttp-core.a`、`picoquicdemo`）
+>   与 `/home/ubunturoot/build-deps/picotls`（`libpicotls-{core,openssl,minicrypto,fusion}.a`），
+>   均已编译；构建时传 `-DPICOQUIC_ROOT/-DPICOTLS_ROOT` 即可（见 `codex.md:549`）；
+> - **当前缺口**：`tests/` 下没有 HTTP3/QUIC 自动化测试，回归保护缺失；
+> - 构建步骤见 `cmake/Go2CppModules.cmake` 的 `GO2CPP_WITH_PICOQUIC` 段
+>   与 `docs/quic-lib-evaluation.md`。
+>
+> 以下历史内容保留作教训记录。
+
+---
+
+## 历史：自实现时期的能力边界（2026-10-18 之前，已删除）
 
 > ## ⚠️ 定位声明：**参考实现，不可用于生产**
 >

@@ -17,9 +17,10 @@
  * 最后看 `Stream::write_locked()` 如何把「取消/背压/IO 失败」归一成 Result。
  *
  * ## 边界与陷阱
- * - **CR-only 换行是确定性设计缺口，不是 flaky**：`feed()` 遇到缓冲末尾的 `\r`
- *   只能等待下一个字节才能判定 CR/CRLF；若流在此结束，该行与事件永不派发
- *   （缺 EOF 冲刷接口 `finish()`）。编码侧会把 CR/CRLF 归一成 LF，缺口仅在解析侧；
+ * - **CR-only 行尾需要显式 EOF**：`feed()` 遇到缓冲末尾的 `\r` 时只能等待
+ *   下一个字节判定 CR/CRLF；流在此结束时要调用 `finish()`，它把末尾 CR 当作
+ *   CR-only 行尾并派发最后一个未闭合事件。编码侧会把 CR/CRLF 归一成 LF，
+ *   该边界仅存在于解析侧；
  * - `Parser` 失败后必须 `reset()`；继续 feed 只会重复返回 Parse 错误；
  * - `Stream` 的失败是**单向**的：`mark_failed_locked()` 之后不再尝试写。
  */
@@ -192,6 +193,7 @@ Parser::Parser(ParserLimits limits) : m_limits(std::move(limits)) {}
 
 void Parser::reset() {
     m_buffer.clear();
+    m_in_off = 0;
     m_event_name.clear();
     m_event_id.clear();
     m_data.clear();
@@ -322,6 +324,11 @@ Result Parser::feed(std::string_view bytes, std::vector<Event>& events) {
     if (m_failed) {
         return invalid_result(Error::Parse, "SSE 解析器已经失败，必须 reset 后重用");
     }
+    // 上一次 feed 留下的已消费前缀在这里一次性丢弃；limit 只统计未消费字节。
+    if (m_in_off != 0) {
+        m_buffer.erase(0, m_in_off);
+        m_in_off = 0;
+    }
     if (m_buffer.size() > m_limits.max_buffer_bytes ||
         bytes.size() > m_limits.max_buffer_bytes - m_buffer.size()) {
         return fail(Error::MessageTooLarge, "SSE 未完成行超过缓冲区上限");
@@ -341,11 +348,13 @@ Result Parser::feed(std::string_view bytes, std::vector<Event>& events) {
         m_seen_bom = true;
     }
 
+    // step3: 读游标推进；不再每行 erase(0)，否则单次大 feed 是 O(n²)。
+    std::size_t consumed = m_in_off;
     for (;;) {
-        // step3: 找行尾；CR 在末尾时 break，等下一个字节判定 CR/CRLF。
+        // 找行尾；CR 在末尾时 break，等下一个字节判定 CR/CRLF。
         std::size_t position = std::string::npos;
         std::size_t ending_size = 0;
-        for (std::size_t index = 0; index < m_buffer.size(); ++index) {
+        for (std::size_t index = consumed; index < m_buffer.size(); ++index) {
             if (m_buffer[index] == '\n') {
                 position = index;
                 ending_size = 1;
@@ -361,26 +370,32 @@ Result Parser::feed(std::string_view bytes, std::vector<Event>& events) {
             }
         }
         if (position == std::string::npos) {
-            if (m_buffer.size() > m_limits.max_line_bytes) {
+            if (m_buffer.size() - consumed > m_limits.max_line_bytes) {
                 return fail(Error::MessageTooLarge, "SSE 行超过最大长度");
             }
             break;
         }
-        if (position > m_limits.max_line_bytes) {
+        if (position - consumed > m_limits.max_line_bytes) {
             return fail(Error::MessageTooLarge, "SSE 行超过最大长度");
         }
-        std::string line = m_buffer.substr(0, position);
-        m_buffer.erase(0, position + ending_size);
+        std::string line = m_buffer.substr(consumed, position - consumed);
+        consumed = position + ending_size;
         const Result result = consume_line(std::move(line), pending_events);
         if (!result.ok()) {
             return result;
         }
     }
+        m_in_off = consumed;
+        if (m_in_off == m_buffer.size()) {
+            m_buffer.clear();
+            m_in_off = 0;
+        }
         events.insert(events.end(), std::make_move_iterator(pending_events.begin()),
                       std::make_move_iterator(pending_events.end()));
         return Result::success();
     } catch (const std::bad_alloc&) {
         m_failed = true;
+        m_in_off = 0;
         std::string().swap(m_buffer);
         std::string().swap(m_event_name);
         std::string().swap(m_event_id);
@@ -391,6 +406,59 @@ Result Parser::feed(std::string_view bytes, std::vector<Event>& events) {
         return result;
     } catch (...) {
         m_failed = true;
+        m_in_off = 0;
+        std::string().swap(m_buffer);
+        std::string().swap(m_event_name);
+        std::string().swap(m_event_id);
+        std::string().swap(m_data);
+        m_event_bytes = 0;
+        Result result;
+        result.error = Error::Parse;
+        return result;
+    }
+}
+
+Result Parser::finish(std::vector<Event>& events) {
+    if (m_failed) {
+        return invalid_result(Error::Parse, "SSE 解析器已经失败，必须 reset 后重用");
+    }
+    try {
+        if (m_in_off != 0) {
+            m_buffer.erase(0, m_in_off);
+            m_in_off = 0;
+        }
+        // step1/2: 未完成行按 EOF 行尾处理；末尾 CR 就是 CR-only 换行。
+        if (!m_buffer.empty()) {
+            if (m_buffer.size() > m_limits.max_line_bytes) {
+                return fail(Error::MessageTooLarge, "SSE 行超过最大长度");
+            }
+            std::size_t length = m_buffer.size();
+            if (m_buffer.back() == '\r') {
+                --length;
+            }
+            std::string line = m_buffer.substr(0, length);
+            m_buffer.clear();
+            const Result result = consume_line(std::move(line), events);
+            if (!result.ok()) {
+                return result;
+            }
+        }
+        // step3: 显式 EOF 才允许派发缺最后一个空行的事件。
+        return dispatch(events);
+    } catch (const std::bad_alloc&) {
+        m_failed = true;
+        m_in_off = 0;
+        std::string().swap(m_buffer);
+        std::string().swap(m_event_name);
+        std::string().swap(m_event_id);
+        std::string().swap(m_data);
+        m_event_bytes = 0;
+        Result result;
+        result.error = Error::ResourceExhausted;
+        return result;
+    } catch (...) {
+        m_failed = true;
+        m_in_off = 0;
         std::string().swap(m_buffer);
         std::string().swap(m_event_name);
         std::string().swap(m_event_id);
@@ -500,16 +568,30 @@ Result Stream::write_locked(std::string_view encoded) {
     if (!cancelled.ok()) {
         return cancelled;
     }
-    if (!m_writer.write(encoded)) {
+    const auto write_started = std::chrono::steady_clock::now();
+    const bool written = m_writer.write(encoded);
+    const auto write_elapsed = std::chrono::steady_clock::now() - write_started;
+    if (!written) {
         const Result cancelled_after_write = cancellation_result();
         if (!cancelled_after_write.ok()) {
             mark_failed_locked(cancelled_after_write);
             return cancelled_after_write;
         }
-        const int system_error = m_socket ? m_socket->last_error() : EBADF;
-        const bool backpressure = system_error == EAGAIN ||
-                                   system_error == EWOULDBLOCK ||
-                                   system_error == ETIMEDOUT;
+        int system_error = m_socket ? m_socket->last_error() : EBADF;
+        bool backpressure = system_error == EAGAIN ||
+                            system_error == EWOULDBLOCK ||
+                            system_error == ETIMEDOUT;
+        // ResponseWriter::write() 只返回 bool，而本地 poll 超时不会写
+        // SO_ERROR（last_error() 读到 0），所以旧实现里 Backpressure 不可达。
+        // 写调用耗时达到配置的写超时 = 慢消费者背压；真实 IO 错误（EPIPE/
+        // ECONNRESET 等）会在超时前返回，不会被这条规则误判。
+        if (!backpressure &&
+            m_options.write_timeout != net::Socket::Duration::max() &&
+            m_options.write_timeout.count() > 0 &&
+            write_elapsed >= m_options.write_timeout) {
+            backpressure = true;
+            system_error = ETIMEDOUT;
+        }
         Result result = invalid_result(backpressure ? Error::Backpressure : Error::Io,
                                        backpressure ? "SSE 慢消费者导致写入超时"
                                                      : "SSE Socket 写入失败");

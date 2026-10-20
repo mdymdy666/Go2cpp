@@ -43,13 +43,15 @@ void run_fiber_tests() {
     GO2CPP_CHECK(!Fiber::CancellationRequested());
 
 #if defined(__linux__) && defined(__x86_64__)
-    // native context 的栈至少保留两个页面，并且 guard page 的映射加法
-    // 必须在构造阶段拒绝溢出，不能等到首次 resume 才破坏上下文。
+    // 可变长栈的初始提交量下限是 1 页（2048 请求归一化为 4096）；
+    // 固定栈回退仍会在映射末尾额外保留 1 页 guard。映射加法必须在构造
+    // 阶段拒绝溢出，不能等到首次 resume 才破坏上下文。
     const long raw_page_size = ::sysconf(_SC_PAGESIZE);
     if (raw_page_size > 0) {
         const auto page_size = static_cast<std::size_t>(raw_page_size);
         Fiber tiny_stack([] {}, 1U);
-        GO2CPP_CHECK(tiny_stack.stack_size() >= page_size * 2U);
+        // 1 字节请求归一化为恰好 1 页；这是比原来的 >= 2 页更精确的新语义。
+        GO2CPP_CHECK(tiny_stack.stack_size() == page_size);
         GO2CPP_CHECK(tiny_stack.stack_size() % page_size == 0);
 
         bool rejected_overflow = false;

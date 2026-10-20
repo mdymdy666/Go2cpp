@@ -11,6 +11,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_scheduler_stress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_dynamic_scheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_fiber.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_fiber_growable_stack.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_sync.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_locks.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_spin_mutex.cpp
@@ -74,6 +75,15 @@ if (GO2CPP_BUILD_TESTS)
         ENVIRONMENT "GO2CPP_TEST_FILTER=error"
         PASS_REGULAR_EXPRESSION "error values and chains"
         TIMEOUT 30)
+    # 可变长栈专项：go2cpp_tests 内的 fiber_growable 模块已经包含在 test #1
+    # 的全量运行里；这里再单独注册一条 ctest，失败时能直接定位到栈增长，
+    # 而不是看到整个 go2cpp_tests 超时/崩溃。复用同一二进制避免再链接一份
+    # runtime；filter 入口与 go2cpp_known_filter_runs 的机制一致。
+    add_test(NAME go2cpp_fiber_growable_stack COMMAND go2cpp_tests)
+    set_tests_properties(go2cpp_fiber_growable_stack PROPERTIES
+        ENVIRONMENT "GO2CPP_TEST_FILTER=fiber_growable"
+        PASS_REGULAR_EXPRESSION "fiber growable stack"
+        TIMEOUT 120)
 
     add_executable(go2cpp_scheduler_smoke
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/scheduler_smoke.cpp)
@@ -149,6 +159,15 @@ if (GO2CPP_BUILD_TESTS)
         -O2 -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_stream_state_test COMMAND go2cpp_stream_state_test)
     set_tests_properties(go2cpp_stream_state_test PROPERTIES TIMEOUT 180)
+
+    # TLS/ALPN 测试由 `openssl s_server` 提供对端，属非 hermetic 测试，
+    # 因此**不注册为 ctest**（避免无 openssl 的 CI 误报），只构建独立
+    # 二进制，由 scripts/verify_tls_alpn.sh 启动服务端后执行。
+    add_executable(go2cpp_tls_alpn_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_tls_alpn.cpp)
+    target_link_libraries(go2cpp_tls_alpn_test PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_tls_alpn_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
 
     add_executable(go2cpp_connection_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_connection.cpp

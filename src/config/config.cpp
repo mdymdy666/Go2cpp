@@ -80,7 +80,10 @@ bool ParseBool(const std::string& text, bool* value) {
 // 参数后造成过量线程、内存或超长等待。0 只在文档明确说明时表示自动。
 constexpr std::size_t kMaxWorkers = 32U;
 constexpr std::size_t kMaxLocalQueue = 1U << 20U;
-constexpr std::size_t kMinFiberStack = 16U * 1024U;
+// 与 SchedulerConfig::fiber_stack_size 的新默认值 2048 对齐：Linux 页粒度
+// 是 4KiB，归一化后实际初始提交 4096。允许显式配置更小值没有意义，因为
+// normalize_stack_size 会把它抬到 1 页；下限取 2048 而不是 16384。
+constexpr std::size_t kMinFiberStack = 2048U;
 constexpr std::size_t kMaxFiberStack = 64U * 1024U * 1024U;
 constexpr std::size_t kMaxAffinityBudget = 1U << 20U;
 constexpr auto kMaxDuration = std::chrono::hours(24);
@@ -106,7 +109,7 @@ bool ValidateSchedulerSize(const char* key, std::size_t value,
     }
     if (std::string_view(key) == "fiber_stack_size") {
         if (value == 0) return true;
-        if (value < kMinFiberStack) return fail(" 小于 16384 时可能无法建立安全栈");
+        if (value < kMinFiberStack) return fail(" 小于 2048 时可能无法建立安全栈");
         return value <= kMaxFiberStack ? true : fail(" 不能超过 67108864");
     }
     if (std::string_view(key) == "task_affinity_budget") {
@@ -463,7 +466,7 @@ bool RuntimeConfig::Validate(std::string* error) const {
     if (value.local_queue_limit > kMaxLocalQueue) return fail("scheduler.local_queue_limit 不能超过 1048576");
     if (value.fiber_stack_size != 0 &&
         (value.fiber_stack_size < kMinFiberStack || value.fiber_stack_size > kMaxFiberStack)) {
-        return fail("scheduler.fiber_stack_size 必须为 0 或处于 16384..67108864 字节");
+        return fail("scheduler.fiber_stack_size 必须为 0 或处于 2048..67108864 字节");
     }
     if (value.task_affinity_budget > kMaxAffinityBudget) return fail("scheduler.task_affinity_budget 不能超过 1048576");
     if (value.fiber_bin_capacity > 4096) return fail("scheduler.fiber_bin_capacity 不能超过 4096");

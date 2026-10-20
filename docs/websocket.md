@@ -39,4 +39,6 @@ for (;;) {
 
 解析器会拒绝错误掩码方向、RSV 位、未知 opcode、非最小 126/127 长度编码、非法 64 位长度、控制帧分片或超过 125 字节、非法 Close code/reason、非法 UTF-8 和超出 `max_frame_payload/max_message_payload` 的消息；不可恢复的协议、UTF-8、大小错误分别发送 1002、1007、1009 Close。握手要求 Host，拒绝控制字符、HTTP body 和 Transfer-Encoding。默认帧上限 16 MiB、消息上限 64 MiB；真实服务应按业务调低并设置 `io_timeout`，该超时也覆盖握手写入。
 
-当前明确限制：不支持 permessage-deflate、TLS、HTTP/2 CONNECT、扩展协商、发送端主动分片和跨连接会话恢复。SSE、路由鉴权、限流、审计和服务治理不属于 WebSocket 核心对象，应由后续 NetService 层组合。
+发送方向默认开启分片：超过 `max_frame_payload`（默认 16 MiB）的消息会自动拆成 continuation 帧，因此 `max_message_payload`（默认 64 MiB）在收发两个方向都生效。需要严格单帧语义时可设 `WebSocketConfig::fragment_outgoing = false`，此时发送超过 `max_frame_payload` 的消息返回 `MessageTooLarge`。分片以整条消息为单位持写锁，帧不会与其它消息交错；文本消息的 UTF-8 校验仍按整条消息进行。
+
+当前明确限制：不支持 permessage-deflate、TLS、HTTP/2 CONNECT、扩展协商和跨连接会话恢复。SSE、路由鉴权、限流、审计和服务治理不属于 WebSocket 核心对象，应由后续 NetService 层组合。

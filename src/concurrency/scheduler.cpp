@@ -374,18 +374,21 @@ bool Task::try_mark_queued() noexcept {
 }
 
 bool Task::try_mark_queued_from_worker() noexcept {
-    bool expected_queued = false;
-    if (!m_queued.compare_exchange_strong(expected_queued, true,
-                                          std::memory_order_acq_rel,
-                                          std::memory_order_acquire)) {
+    // 与 try_mark_queued() 共用 transition_mutex，让 m_queued 的
+    // 「检查 + 置位」只有一个线性化点。原实现用无锁 CAS，而
+    // try_mark_queued() 是「持锁检查再 store」；两者并发时都能成功，
+    // 于是同一个 G 被发布两个队列节点。残留节点被 worker 取出后
+    // try_mark_running() 失败，其 clear_queued() 又可能误清另一个节点
+    // 的 reservation，最终 G 停在 Runnable 且没有任何队列节点，表现为
+    // 「fiber 唤醒丢失」：worker 全部空闲、队列全空、被唤醒的 G 永不运行。
+    // 该函数只在本地回队/IO 批量唤醒路径调用，未竞争时加锁开销可忽略。
+    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    if (m_state.load(std::memory_order_relaxed) != GState::kRunnable ||
+        m_execution_claim.load(std::memory_order_relaxed) ||
+        m_queued.load(std::memory_order_relaxed)) {
         return false;
     }
-    const auto state = m_state.load(std::memory_order_acquire);
-    if (state != GState::kRunnable ||
-        m_execution_claim.load(std::memory_order_acquire)) {
-        m_queued.store(false, std::memory_order_release);
-        return false;
-    }
+    m_queued.store(true, std::memory_order_release);
     return true;
 }
 
@@ -833,6 +836,7 @@ void Task::run() {
             const auto stack_size = m_options.stack_size == 0
                                         ? Fiber::DefaultStackSize()
                                         : m_options.stack_size;
+            const auto stack_reserve_size = m_options.stack_reserve_size;
             auto created_fiber = Fiber::AcquireForScheduler(
                 [this] {
                     // Move the callable onto the G stack. Its captures are
@@ -846,7 +850,8 @@ void Task::run() {
                         body();
                     }
                 },
-                stack_size, m_options.fiber_bin_capacity);
+                stack_size, m_options.fiber_bin_capacity,
+                stack_reserve_size, m_options.stack_growable);
             {
                 std::lock_guard<std::mutex> lock(m_transition_mutex);
                 if (!m_fiber) {
@@ -2332,6 +2337,13 @@ std::shared_ptr<Task> Scheduler::spawn(Task::Function function,
                                       TaskOptions options) {
     if (options.stack_size == 0) {
         options.stack_size = m_impl->config.fiber_stack_size;
+    }
+    if (options.stack_reserve_size == 0) {
+        options.stack_reserve_size = m_impl->config.fiber_stack_reserve_size;
+    }
+    // 配置是总开关：即使调用方没有显式关闭，配置关闭时也必须退化。
+    if (!m_impl->config.fiber_stack_growable) {
+        options.stack_growable = false;
     }
     if (options.fiber_bin_capacity == 0) {
         options.fiber_bin_capacity = m_impl->config.fiber_bin_capacity;

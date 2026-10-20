@@ -1,20 +1,21 @@
 /**
  * @file parking_condition.cpp
- * @brief ParkingCondition 的 futex 无状态等待实现。
+ * @brief ParkingCondition 的等待/唤醒实现（per-node futex + 广播）。
  *
  * ## 这个文件实现什么
  *
  * 把 `parking_condition.hpp` 声明的"Fiber / 普通线程共用条件等待"落到具体
  * 机制上：
  *
- * - **Fiber 路径**：Linux futex 无状态等待。用 32 位代际字 `m_futex_seq` 作为
- *   等待条件 —— 等待者记下代际后 `FUTEX_WAIT`，唤醒方 +1 后 `FUTEX_WAKE`。
- *   "无状态"指不需要为每个等待者分配内核对象，避免"先建没建"的竞态；
- * - **线程路径**：`m_waiters` 队列 + `std::mutex`；
- * - **park 前自旋**：`kSpinBudget = 128` 次。这不是可有可无的优化 ——
- *   无自旋时 2 个等待者的场景实测比 `std::condition_variable` 慢 3.3 倍，
- *   因为"检查完条件、还没进内核"的窗口里到达的唤醒会丢失，等待者被迫睡到超时；
- * - `FiberWaitUnsupported()`：平台能力探测，让上层在不支持时安全降级。
+ * - **Fiber 路径**：有 Scheduler 归属时 park G，唤醒走 wake_or_cancel；
+ * - **线程路径**：每个 WaitNode 自己的 32 位 futex 代际字。notify_one 只推进
+ *   选中节点（D2：共享字会唤醒错节点而丢唤醒）；notify_all 用 futex_waitv
+ *   让等待者同时监听「节点字 + 共享广播字」，一次 FUTEX_WAKE(INT_MAX) 唤醒
+ *   全部 native waiter，N 次系统调用降为 1 次（内核不支持时逐节点回退）；
+ * - **park 前自旋**：kSpinBudget 次。无自旋时 2 个等待者场景实测比
+ *   std::condition_variable 慢 3.3 倍；预算过大则白烧 CPU，实测数据见
+ *   /tmp/perf_pc.md；
+ * - FiberWaitUnsupported()：平台能力探测，让上层在不支持时安全降级。
  *
  * ## 锁契约（最容易写错的地方）
  *
@@ -35,12 +36,23 @@
 #include <condition_variable>
 #include <utility>
 
-
 #if defined(__linux__)
 #include <cerrno>
+#include <climits>
+#include <cstring>
+#include <ctime>
 #include <linux/futex.h>
+#include <linux/time_types.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+
+// futex_waitv：Linux 5.16+ 系统调用，6.2+ 支持 FUTEX_PRIVATE_FLAG。
+// 头文件或内核任一缺失就退回逐节点 FUTEX_WAKE。
+#if defined(SYS_futex_waitv) && defined(FUTEX_32)
+#define GO2CPP_PC_HAS_WAITV 1
+#else
+#define GO2CPP_PC_HAS_WAITV 0
+#endif
 
 namespace {
 
@@ -73,15 +85,89 @@ int FutexWake(std::atomic<std::uint32_t>* word, int n) {
                                       FUTEX_WAKE_PRIVATE, n, nullptr, nullptr, 0));
 }
 
+#if GO2CPP_PC_HAS_WAITV
+/// 探测 futex_waitv 是否真的可用（不睡眠：val 不匹配会立刻 EAGAIN）。
+/// 结果在进程内缓存一次；等待侧与唤醒侧必然读到同一个值。
+bool FutexWaitvEnabled() noexcept {
+    static const bool enabled = [] {
+        std::uint32_t word = 0;
+        struct futex_waitv entry;
+        std::memset(&entry, 0, sizeof(entry));
+        // 与 word 的 0 不匹配：内核支持且接受 private flag 时返回 EAGAIN。
+        entry.val = 1;
+        entry.uaddr = reinterpret_cast<std::uint64_t>(&word);
+        entry.flags = FUTEX_32 | FUTEX_PRIVATE_FLAG;
+        errno = 0;
+        const long rc = ::syscall(SYS_futex_waitv, &entry, 1U, 0U, nullptr, 0);
+        return rc == -1 && errno == EAGAIN;
+    }();
+    return enabled;
+}
+
+/// 同时等两个 futex 字：节点自己的字 + 条件对象的广播字。
+/// futex_waitv 的 timeout 是「绝对时刻 + clockid」，与 FUTEX_WAIT 的相对超时不同，
+/// 这里用 CLOCK_MONOTONIC 绝对时刻；十年以上按无限等待处理。
+int FutexWaitvTwo(std::atomic<std::uint32_t>* first,
+                  std::uint32_t first_expected,
+                  std::atomic<std::uint32_t>* second,
+                  std::uint32_t second_expected,
+                  const std::optional<std::chrono::steady_clock::time_point>& deadline) {
+    struct futex_waitv entries[2];
+    std::memset(entries, 0, sizeof(entries));
+    entries[0].val = first_expected;
+    entries[0].uaddr = reinterpret_cast<std::uint64_t>(first);
+    entries[0].flags = FUTEX_32 | FUTEX_PRIVATE_FLAG;
+    entries[1].val = second_expected;
+    entries[1].uaddr = reinterpret_cast<std::uint64_t>(second);
+    entries[1].flags = FUTEX_32 | FUTEX_PRIVATE_FLAG;
+
+    __kernel_timespec absolute{};
+    const __kernel_timespec* ts = nullptr;
+    if (deadline) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                *deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        constexpr long long kForeverNs = 10LL * 365 * 24 * 3600 * 1000000000LL;
+        if (remaining.count() < kForeverNs) {
+            timespec mono{};
+            (void)::clock_gettime(CLOCK_MONOTONIC, &mono);
+            long long seconds = static_cast<long long>(mono.tv_sec) +
+                                remaining.count() / 1000000000LL;
+            long long nanos = static_cast<long long>(mono.tv_nsec) +
+                              remaining.count() % 1000000000LL;
+            if (nanos >= 1000000000LL) {
+                ++seconds;
+                nanos -= 1000000000LL;
+            }
+            absolute.tv_sec = seconds;
+            absolute.tv_nsec = nanos;
+            ts = &absolute;
+        }
+    }
+    return static_cast<int>(::syscall(SYS_futex_waitv, entries, 2U, 0U,
+                                      const_cast<__kernel_timespec*>(ts),
+                                      CLOCK_MONOTONIC));
+}
+#else
+/// 编译期没有 futex_waitv：保持旧的逐节点 FUTEX_WAIT/WAKE。
+bool FutexWaitvEnabled() noexcept { return false; }
+#endif
+
 }  // namespace
 #endif  // __linux__
 
 namespace go2cpp::core {
 
 namespace {
-/// FUTEX_WAIT 前的自旋预算。
-/// 取较小值：只覆盖「唤醒已在路上」的窄窗口；过大则真需要睡眠时白烧 CPU。
-constexpr int kSpinBudget = 128;
+/// FUTEX_WAIT 前的自旋预算（约 2048 * 0.32ns ≈ 0.65us）。
+/// 目标是覆盖「唤醒已在路上」的窗口：实测 WSL2 上一次 futex 唤醒往返约
+/// 20-30us，而自旋命中只需 0.65us，命中时 pc-rtt 从 ~30us 降到 ~9-17us。
+/// 代价是每次真正需要睡眠的 park 多烧约 0.65us CPU（见 /tmp/perf_pc.md）。
+constexpr int kSpinBudget = 2048;
 }  // namespace
 
 /**
@@ -120,21 +206,40 @@ public:
 
     WaitNode(ParkingCondition* owner, Scheduler* scheduler,
              std::shared_ptr<Task> task)
-        : owner(owner), m_scheduler(scheduler), m_task(std::move(task)) {}
+        : owner(owner),
+          m_scheduler(scheduler),
+          m_task(std::move(task)),
+          m_managed(scheduler != nullptr) {}
 
     bool Finish(Result result) noexcept {
         auto expected = Result::kWaiting;
-        return m_result.compare_exchange_strong(
+        return m_hot.result.compare_exchange_strong(
             expected, result, std::memory_order_acq_rel);
     }
 
     Result result() const noexcept {
-        return m_result.load(std::memory_order_acquire);
+        return m_hot.result.load(std::memory_order_acquire);
     }
 
+    bool IsNative() const noexcept { return !m_managed; }
+
     void Wake() noexcept {
+        if (!m_managed) {
+#if defined(__linux__)
+            // native 等待者只推进节点自己的代际字并定向 FUTEX_WAKE，不碰
+            // Scheduler 指针，因此无需 m_wake_mutex（Disarm 不写这两个原子字）。
+            m_hot.futex_seq.fetch_add(1, std::memory_order_release);
+            if (m_hot.futex_waiters.load(std::memory_order_acquire) != 0) {
+                (void)FutexWake(&m_hot.futex_seq, 1);
+            }
+#else
+            std::lock_guard<FutexMutex> lock(m_wake_mutex);
+            m_native_cv.notify_one();
+#endif
+            return;
+        }
         // Disarm waits for any in-flight callback to leave this gate, so no
-        // raw Scheduler access survives the waiting G's stack cleanup.
+        // raw Scheduler access survives the waiting G stack cleanup.
         std::lock_guard<FutexMutex> lock(m_wake_mutex);
         if (!m_active) {
             return;
@@ -144,15 +249,6 @@ public:
                 (void)m_scheduler->wake_or_cancel(m_task);
             } catch (...) {
             }
-        } else {
-#if defined(__linux__)
-            owner->m_futex_seq.fetch_add(1, std::memory_order_release);
-            if (owner->m_futex_waiters.load(std::memory_order_acquire) != 0) {
-                (void)FutexWake(&owner->m_futex_seq, 1);
-            }
-#else
-            m_native_cv.notify_one();
-#endif
         }
     }
 
@@ -165,13 +261,19 @@ public:
     Result WaitNative(std::unique_lock<std::mutex>& outer,
                       std::optional<Clock::time_point> deadline) {
 #if defined(__linux__)
-        // futex 无状态等待。三个关键点（第一版曾因此崩溃）：
-        //   1. 每轮循环**先判终态**，不能只依赖 FUTEX_WAIT 的返回码；
-        //   2. 区分 EAGAIN（值已变，继续等）与 ETIMEDOUT（真超时）；
-        //   3. 被唤醒后重读代际，作为下一轮 FUTEX_WAIT 的 expected。
-        std::uint32_t expected =
-            owner->m_futex_seq.load(std::memory_order_acquire);
-        owner->m_futex_waiters.fetch_add(1, std::memory_order_acq_rel);
+        // 双字等待：节点字（notify_one 定向唤醒）+ 广播字（notify_all 一次唤醒全部）。
+        // 三个关键点（第一版曾因此崩溃/丢唤醒）：
+        //   1. 每轮循环先判终态，不能只依赖 futex 的返回码；
+        //   2. 真正睡眠前用 acquire 重读两个代际字并再判一次终态：只要读到唤醒方
+        //      推进后的值，release 侧对 result 的写在 acquire 下必然可见；
+        //   3. 区分 EAGAIN（值已变，继续等）与 ETIMEDOUT（真超时）。
+        const bool use_waitv = FutexWaitvEnabled();
+        std::uint32_t expected = m_hot.futex_seq.load(std::memory_order_acquire);
+        std::uint32_t expected_broadcast = 0;
+        m_hot.futex_waiters.fetch_add(1, std::memory_order_acq_rel);
+        if (use_waitv) {
+            owner->m_broadcast.waiters.fetch_add(1, std::memory_order_acq_rel);
+        }
         outer.unlock();
         for (;;) {
             if (result() != Result::kWaiting) {
@@ -181,19 +283,26 @@ public:
                 (void)Finish(Result::kTimedOut);
                 break;
             }
-            // 短暂自旋：无竞争时（唤醒就在眼前）完全避免 FUTEX_WAIT 系统调用。
-            // 这是 Go runtime / parking_lot 的标准做法，也是本实现在「等待者少」
-            // 场景下相对 condition_variable_any 唯一的劣势来源。
+            // 短暂自旋：无竞争时（唤醒就在眼前）完全避免睡眠系统调用。
             bool spun_through = false;
             for (int spin = 0; spin < kSpinBudget; ++spin) {
                 if (result() != Result::kWaiting) {
                     break;
                 }
-                if (owner->m_futex_seq.load(std::memory_order_acquire) != expected) {
+                if (m_hot.futex_seq.load(std::memory_order_acquire) != expected) {
                     spun_through = true;
                     break;
                 }
-                if (deadline && Clock::now() >= *deadline) {
+                if (use_waitv &&
+                    owner->m_broadcast.seq.load(std::memory_order_acquire) !=
+                        expected_broadcast) {
+                    spun_through = true;
+                    break;
+                }
+                // deadline 每 128 次自旋查一次：clock_gettime 走 vDSO 也要
+                // ~20ns，2048 次自旋若每 16 次查一次就是 2.6us 白烧；128 次的
+                // 超时精度损失 < 50ns，相对一次 futex 唤醒（~20us）可忽略。
+                if (deadline && (spin & 127) == 0 && Clock::now() >= *deadline) {
                     break;
                 }
                 std::atomic_signal_fence(std::memory_order_seq_cst);
@@ -202,31 +311,42 @@ public:
                 break;
             }
             if (spun_through) {
-                expected = owner->m_futex_seq.load(std::memory_order_acquire);
+                expected = m_hot.futex_seq.load(std::memory_order_acquire);
+                if (use_waitv) {
+                    expected_broadcast =
+                        owner->m_broadcast.seq.load(std::memory_order_acquire);
+                }
                 continue;
             }
             if (deadline && Clock::now() >= *deadline) {
                 (void)Finish(Result::kTimedOut);
                 break;
             }
-            errno = 0;
-            const int rc = FutexWait(&owner->m_futex_seq, expected, deadline);
+            expected = m_hot.futex_seq.load(std::memory_order_acquire);
+            if (use_waitv) {
+                expected_broadcast =
+                    owner->m_broadcast.seq.load(std::memory_order_acquire);
+            }
             if (result() != Result::kWaiting) {
                 break;
             }
-            const std::uint32_t latest =
-                owner->m_futex_seq.load(std::memory_order_acquire);
-            if (latest != expected) {
-                expected = latest;
+            errno = 0;
+            int rc;
+            if (use_waitv) {
+                rc = FutexWaitvTwo(&m_hot.futex_seq, expected,
+                                   &owner->m_broadcast.seq, expected_broadcast,
+                                   deadline);
+            } else {
+                rc = FutexWait(&m_hot.futex_seq, expected, deadline);
+            }
+            if (result() != Result::kWaiting) {
+                break;
             }
             if (rc == 0) {
                 continue;  // 被唤醒：重判终态
             }
-            if (errno == EAGAIN) {
-                continue;  // 值已变（可能是别人推进的代际）：重判
-            }
-            if (errno == ETIMEDOUT || errno == EINTR) {
-                // 超时或被信号打断：交给下一轮循环判 deadline / 终态
+            if (errno == EAGAIN || errno == ETIMEDOUT || errno == EINTR) {
+                // 值已变/超时/信号打断：交给下一轮循环判终态与 deadline
                 continue;
             }
             // 其它错误：保守地再判一次终态，仍等待就按超时处理，绝不空转。
@@ -235,11 +355,12 @@ public:
             }
             break;
         }
-        owner->m_futex_waiters.fetch_sub(1, std::memory_order_acq_rel);
-        // 注意：**不重新加锁**。WaitOnce 的契约是「WaitNative 返回时外部锁仍处于
-        // 解锁状态，由 WaitOnce 自己关锁」。原实现把锁交给 cv.wait 管理，返回时
-        // outer 也是解锁的；这里若 outer.lock() 会与 WaitOnce 的后续 lock 冲突，
-        // 触发 EDEADLK（"Resource deadlock avoided"）。
+        if (use_waitv) {
+            owner->m_broadcast.waiters.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        m_hot.futex_waiters.fetch_sub(1, std::memory_order_acq_rel);
+        // 注意：不重新加锁。WaitOnce 的契约是「WaitNative 返回时外部锁仍处于
+        // 解锁状态，由 WaitOnce 自己关锁」。
         return result();
 #else
         std::unique_lock<FutexMutex> lock(m_wake_mutex);
@@ -297,7 +418,23 @@ private:
     ParkingCondition* const owner;
     Scheduler* m_scheduler;
     std::shared_ptr<Task> m_task;
-    std::atomic<Result> m_result{Result::kWaiting};
+
+    // 是否为 native（普通线程）等待。构造后不变：Wake/notify_all 需要据此决定
+    // 走 Scheduler 还是 futex，且不能在 Disarm 清空 m_scheduler 后误判。
+    const bool m_managed;
+    // 等待/唤醒热路径的字段放在同一条 cacheline：等待者自旋同时读 result 与
+    // seq，唤醒者写完 result 立刻推进 seq；同一行只需要一次行所有权转移，
+    // 也避免 node 之间的 false sharing（对象本身 64 字节对齐）。
+    struct alignas(64) HotState {
+        std::atomic<Result> result{Result::kWaiting};
+        // per-node futex：notify_one 只推进**选中节点**自己的代际字并只唤醒它。
+        // 共享代际字时 FUTEX_WAKE 会唤醒任意等待者，被误唤醒的节点看到
+        // result 仍是 kWaiting 就重新 park，而选中节点已摘出 m_waiters，
+        // notify_all 也救不了它（审计 D2，多 native waiter 下 ~0.125%/轮）。
+        std::atomic<std::uint32_t> futex_seq{0};
+        std::atomic<std::uint32_t> futex_waiters{0};
+    };
+    HotState m_hot;
     FutexMutex m_wake_mutex;
     std::condition_variable_any m_native_cv;
     bool m_active{true};
@@ -364,8 +501,10 @@ void ParkingCondition::notify_one() noexcept {
  * step1. 在 `m_mutex` 下把整个等待队列 `swap` 到局部 deque，并逐个
  *        `Finish(kNotified)`；用 `swap` 而不是逐个 `pop` 是为了把临界区压到
  *        「换指针 + 打标记」，唤醒动作全部移到锁外；
- * step2. 释放锁后，只对**真正抢占成功**（`result() == kNotified`）的节点调
- *        `Wake()`——已被超时/取消的节点不能重复唤醒。
+ * step2. 释放锁后，只对**真正抢占成功**的节点唤醒：managed 节点逐个
+ *        Wake()（交给 Scheduler），native 节点由一次广播代际推进覆盖
+ *        （futex_waitv 方案；不可用时逐节点 Wake）。已被超时/取消的节点
+ *        不会重复唤醒。
  *
  * ## 并发/失败语义
  *
@@ -375,17 +514,38 @@ void ParkingCondition::notify_one() noexcept {
  */
 void ParkingCondition::notify_all() noexcept {
     std::deque<std::shared_ptr<WaitNode>> waiters;
+    std::size_t native_notified = 0;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         waiters.swap(m_waiters);
         for (const auto& node : waiters) {
-            (void)node->Finish(WaitNode::Result::kNotified);
+            if (node->Finish(WaitNode::Result::kNotified) && node->IsNative()) {
+                ++native_notified;
+            }
         }
     }
+    // 有 futex_waitv 时，native 节点由「一次广播代际推进 + 一次 FUTEX_WAKE」
+    // 覆盖，不再逐个 wake；managed (Fiber) 节点仍必须逐个交给 Scheduler。
+    bool broadcast = false;
+#if defined(__linux__)
+    broadcast = native_notified != 0 && FutexWaitvEnabled();
+#endif
     for (const auto& node : waiters) {
-        if (node->result() == WaitNode::Result::kNotified) {
-            node->Wake();
+        if (node->result() != WaitNode::Result::kNotified) {
+            continue;
         }
+        if (node->IsNative() && broadcast) {
+            continue;
+        }
+        node->Wake();
+    }
+    if (broadcast) {
+#if defined(__linux__)
+        m_broadcast.seq.fetch_add(1, std::memory_order_release);
+        if (m_broadcast.waiters.load(std::memory_order_acquire) != 0) {
+            (void)FutexWake(&m_broadcast.seq, INT_MAX);
+        }
+#endif
     }
 }
 

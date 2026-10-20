@@ -203,7 +203,20 @@ struct SchedulerConfig {
     // 只决定补充 M 在等待唤醒时多久复查一次 blocking_workers 是否归零；
     // leave_blocking() 会主动 notify，正常情况下无需等满一个周期。
     std::chrono::milliseconds idle_worker_timeout{250};
-    std::size_t fiber_stack_size = 0;
+    // Fiber 栈的初始提交量（字节）。默认 2048（Go 的 2KB 初始栈）；
+    // Linux 页粒度是 4KB，所以归一化规则是
+    //   initial_usable = max(page_align_up(requested), 1 * page)
+    // 请求 2048 时实际初始可用 4096 字节（1 页）。其余部分属于
+    // fiber_stack_reserve_size 预留区，初始为 PROT_NONE，按需增长。
+    std::size_t fiber_stack_size = 2048;
+    // 每个 Fiber 预留的虚拟地址空间（字节），默认 8MiB。初始只提交
+    // fiber_stack_size 对应的一页，SIGSEGV handler 以 64KiB 为粒度向下
+    // mprotect，上限是这块预留区。reserve 不大于初始提交量时退化为固定栈。
+    std::size_t fiber_stack_reserve_size = 8U * 1024U * 1024U;
+    // 是否允许 Fiber 栈按需增长。false、reserve 不足、非 Linux/x86_64、
+    // 非原生上下文后端，或环境变量 GO2CPP_GROWABLE_STACK=0 时退化为固定栈；
+    // 退化路径不安装 SIGSEGV handler，也不使用 sigaltstack。
+    bool fiber_stack_growable = true;
     std::size_t task_affinity_budget = 4;
     // 调用方声明原生阻塞区时，允许 M 的数量超过 P。默认值保持 worker
     // 池弹性；若部署要求严格的一 M 对一 P 上限，可以关闭此开关。
@@ -224,7 +237,7 @@ struct SchedulerConfig {
     // 每个 M 的 FiberBin 容量。只缓存已经完成/失败且上下文已释放的
     // 调度器内部 Fiber；设为 0 表示使用运行时默认值，过大只会增加
     // 每个 worker 的保留内存，不会改变 Fiber 语义。
-    std::size_t fiber_bin_capacity = 32;
+    std::size_t fiber_bin_capacity = 128;
     // 性能敏感的部署可以关闭运行时累计计时；状态机和调度语义不受影响。
     // 默认开启，便于诊断和性能报告。
     bool collect_metrics = true;
@@ -243,7 +256,14 @@ struct TaskOptions {
     TaskClassId task_class = 0;
     // 0 表示由 SchedulerConfig::fiber_bin_capacity 注入；直接构造并加入
     // 调度器的 Task 在未注入时使用 Fiber 运行时默认容量。
-    std::size_t fiber_bin_capacity = 0;
+    std::size_t fiber_bin_capacity = 128;
+    // 新增字段放在末尾，保持既有 TaskOptions{a, b} 聚合初始化语义不变。
+    // 0 表示使用 SchedulerConfig::fiber_stack_reserve_size（再回落到
+    // Fiber::DefaultStackReserveSize()）。
+    std::size_t stack_reserve_size = 0;
+    // 是否允许按需增长；SchedulerConfig::fiber_stack_growable=false 时
+    // spawn() 会强制关闭。
+    bool stack_growable = true;
 };
 
 /** @brief P 的只读运行快照。 */

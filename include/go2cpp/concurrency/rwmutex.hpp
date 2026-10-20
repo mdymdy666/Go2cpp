@@ -55,10 +55,11 @@
 
 #include "go2cpp/sync.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <set>
+#include <deque>
 #include <stdexcept>
 
 namespace go2cpp::sync {
@@ -68,8 +69,20 @@ namespace go2cpp::sync {
  *
  * @details
  * 状态机只有三种形态：**无锁**、**N 个读者**、**1 个写者**。所有状态都受
- * `m_state`（`sync::Mutex`）保护；等待者挂在 `m_ready`
- * （`sync::ConditionVariable`）上。
+ * `m_state`（`sync::Mutex`）保护；读者与写者分别挂在 `m_ready` /
+ * `m_writer_ready` 两个 `sync::ConditionVariable` 上，按角色唤醒。
+ *
+ * ## 唤醒策略（与旧实现的区别）
+ *
+ * 旧实现每次 `Unlock` 都无条件 `NotifyAll`，把读者和写者一起唤醒：被唤醒的
+ * 读者看到 pending writer 又回去睡，既制造 futex 惊群，又让 0 等待者也付一次
+ * 「构造临时通知批次」的堆分配。现在：
+ *
+ * - 0 个等待者：完全短路，不构造通知批次、不进条件变量内部互斥量；
+ * - 有写者排队：只唤醒写者（写者优先），读者继续睡；
+ * - 写者多于一个：广播唤醒（只有队首能前进，其余在 `m_state` 上排队流水
+ *   推进，避免单播把每次交接串行化成一个 futex 唤醒延迟）；
+ * - 没有写者：才放行全部排队读者。
  *
  * | 请求 | 放行条件 |
  * |---|---|
@@ -115,7 +128,10 @@ public:
                 "go2cpp::sync::RWMutex RLock: scheduler unavailable");
         }
         while (m_writing || !m_waiting_writers.empty()) {
-            if (!m_ready.Wait(m_state)) {
+            ++m_waiting_readers;
+            const bool notified = m_ready.Wait(m_state);
+            --m_waiting_readers;
+            if (!notified) {
                 // Wait 返回 false 时有两种可能：G 被取消（内部锁已重新持有）
                 // 或调度器关闭且重锁失败（内部锁不再持有）。公共 API 无法区分，
                 // 这里按「已持有」清理；若实际未持有，Unlock 自己会抛
@@ -148,7 +164,8 @@ public:
         }
         --m_readers;
         if (m_readers == 0 && !m_waiting_writers.empty()) {
-            m_ready.NotifyAll();
+            // 只有队首写者能立刻前进：只交接写者，读者继续保持等待。
+            WakeWriterLocked();
         }
         m_state.Unlock();
     }
@@ -164,18 +181,21 @@ public:
                 "go2cpp::sync::RWMutex Lock: scheduler unavailable");
         }
         const std::uint64_t ticket = m_next_writer_ticket++;
-        m_waiting_writers.insert(ticket);
+        m_waiting_writers.push_back(ticket);
         while (!WriterCanAcquireLocked(ticket)) {
-            if (!m_ready.Wait(m_state)) {
-                m_waiting_writers.erase(ticket);
-                m_ready.NotifyAll();
+            if (!m_writer_ready.Wait(m_state)) {
+                const bool was_head = !m_waiting_writers.empty() &&
+                                      m_waiting_writers.front() == ticket;
+                RemoveWaitingWriterLocked(ticket);
+                RepairWakeAfterWriteCancelLocked(was_head);
                 m_state.Unlock();
                 throw std::logic_error(
                     "go2cpp::sync::RWMutex Lock aborted (G cancelled or "
                     "scheduler shut down)");
             }
         }
-        m_waiting_writers.erase(ticket);
+        // 放行时该票据必然是队首（`WriterCanAcquireLocked` 已判定）。
+        m_waiting_writers.pop_front();
         m_writing = true;
         m_state.Unlock();
     }
@@ -195,10 +215,14 @@ public:
                 "go2cpp::sync::RWMutex Unlock of unlocked RWMutex");
         }
         m_writing = false;
-        // 唤醒全部：FIFO 队首写者会立即取得锁；读者看到 pending writer 会继续
-        // 排队；后续写者看到队首不是自己也会继续等。一次 NotifyAll 覆盖所有
-        // 状态迁移，不需要按角色分别通知。
-        m_ready.NotifyAll();
+        // 按角色唤醒：有写者排队时只唤醒写者（写者优先，读者继续睡）；
+        // 没有写者时才放行读者；两者都没有时完全短路 —— 不构造 NotifyAll 的
+        // 临时批次，也不进条件变量内部互斥量。
+        if (!m_waiting_writers.empty()) {
+            WakeWriterLocked();
+        } else {
+            WakeReadersLocked();
+        }
         m_state.Unlock();
     }
 
@@ -307,33 +331,37 @@ public:
             return false;
         }
         const std::uint64_t ticket = m_next_writer_ticket++;
-        m_waiting_writers.insert(ticket);
+        m_waiting_writers.push_back(ticket);
         for (;;) {
             if (WriterCanAcquireLocked(ticket)) {
-                m_waiting_writers.erase(ticket);
+                m_waiting_writers.pop_front();
                 m_writing = true;
                 m_state.Unlock();
                 return true;
             }
             const auto now = std::chrono::steady_clock::now();
             if (now >= deadline) {
-                m_waiting_writers.erase(ticket);
-                // 撤销的可能是队首票据：必须唤醒其余等待者重新选队首。
-                m_ready.NotifyAll();
+                const bool was_head = !m_waiting_writers.empty() &&
+                                      m_waiting_writers.front() == ticket;
+                RemoveWaitingWriterLocked(ticket);
+                // 撤销的可能是队首票据：把唤醒交接给下一个写者。
+                RepairWakeAfterWriteCancelLocked(was_head);
                 m_state.Unlock();
                 return false;
             }
-            if (m_ready.WaitFor(m_state, deadline - now)) {
+            if (m_writer_ready.WaitFor(m_state, deadline - now)) {
                 continue;
             }
             if (WriterCanAcquireLocked(ticket)) {
-                m_waiting_writers.erase(ticket);
+                m_waiting_writers.pop_front();
                 m_writing = true;
                 m_state.Unlock();
                 return true;
             }
-            m_waiting_writers.erase(ticket);
-            m_ready.NotifyAll();
+            const bool was_head = !m_waiting_writers.empty() &&
+                                  m_waiting_writers.front() == ticket;
+            RemoveWaitingWriterLocked(ticket);
+            RepairWakeAfterWriteCancelLocked(was_head);
             if (std::chrono::steady_clock::now() >= deadline) {
                 m_state.Unlock();
                 return false;
@@ -398,25 +426,81 @@ public:
     }
 
 private:
-    /// @brief 写者放行判定；调用方必须持有 `m_state`。
+    /// @brief 唤醒写者；调用方必须持有 m_state 且写者队列非空。
+    /// @details 只有一个等待写者时单播（唯一等待者就是队首）；多个写者时广播：
+    ///          只有队首能前进，但其余写者会一起从 futex 醒来并在 m_state 上
+    ///          排队流水推进。实测（4 线程纯写）单播会把每次交接串行化成一个
+    ///          futex 唤醒延迟（~30 us/op），广播回到微秒级。与旧实现
+    ///          「写者 + 读者一起 NotifyAll」的区别是读者不再被牵连。
+    void WakeWriterLocked() noexcept {
+        if (m_waiting_writers.size() > 1) {
+            m_writer_ready.NotifyAll();
+        } else {
+            m_writer_ready.NotifyOne();
+        }
+    }
+
+    /// @brief 放行全部排队读者；无人等待时完全短路（不触碰条件变量）。
+    void WakeReadersLocked() noexcept {
+        if (m_waiting_readers != 0) {
+            m_ready.NotifyAll();
+        }
+    }
+
+    /// @brief 撤销写者票据后的唤醒修补。
+    /// @details 只有撤销队首票据才会改变其他等待者的可放行性；队列被清空时
+    ///          必须放行等待中的读者，否则会留下永久睡眠的读者。
+    void RepairWakeAfterWriteCancelLocked(bool removed_head) noexcept {
+        if (!removed_head) {
+            return;
+        }
+        if (!m_waiting_writers.empty()) {
+            WakeWriterLocked();
+        } else {
+            WakeReadersLocked();
+        }
+    }
+
+    /// @brief 从等待队列摘除票据；调用方必须持有 m_state，且票据仍在队列中。
+    void RemoveWaitingWriterLocked(std::uint64_t ticket) {
+        if (!m_waiting_writers.empty() && m_waiting_writers.front() == ticket) {
+            m_waiting_writers.pop_front();
+            return;
+        }
+        const auto it = std::find(m_waiting_writers.begin(),
+                                  m_waiting_writers.end(), ticket);
+        if (it != m_waiting_writers.end()) {
+            m_waiting_writers.erase(it);
+        }
+    }
+
+    /// @brief 写者放行判定；调用方必须持有 m_state。
     bool WriterCanAcquireLocked(std::uint64_t ticket) const {
         return !m_writing && m_readers == 0 && !m_waiting_writers.empty() &&
-               *m_waiting_writers.begin() == ticket;
+               m_waiting_writers.front() == ticket;
     }
 
     /// 保护下面全部可变状态的内部互斥量（协程 / 线程混合）。
     mutable Mutex m_state;
-    /// 状态变化广播：读者等待「无写者且无等待写者」，写者等待「轮到自己」。
+    /// 读者广播：读者等待「无写者且无等待写者」。
     ConditionVariable m_ready;
+    /// 写者广播：每张票据等待「轮到自己」。按角色分成两个队列，避免唤醒到
+    /// 注定继续等待的另一角色（惊群）。写者按票据 FIFO 排队，多写者时用广播
+    /// 唤醒（见 WakeWriterLocked），所以不依赖条件变量的唤醒顺序。
+    ConditionVariable m_writer_ready;
 
     /// 当前读者数量。
     std::size_t m_readers{0};
+    /// 当前阻塞在 m_ready 上的读者数；供唤醒方判断是否值得通知。
+    std::size_t m_waiting_readers{0};
     /// 当前是否有写者持锁。
     bool m_writing{false};
     /// 下一个写者票据；只在 `m_state` 内递增，用于写者 FIFO。
     std::uint64_t m_next_writer_ticket{0};
-    /// 正在等待的写者票据集合（有序，`begin()` 即队首）。
-    std::set<std::uint64_t> m_waiting_writers;
+    /// 正在等待的写者票据队列（push_back 即有序，front() 即队首）。
+    /// 用 deque 而不是 set：票据单调递增，尾部插入天然有序，避免每次 Lock
+    /// 的红黑树节点分配与 O(log n) 插入；取消时线性 erase（罕见路径）。
+    std::deque<std::uint64_t> m_waiting_writers;
 };
 
 }  // namespace go2cpp::sync

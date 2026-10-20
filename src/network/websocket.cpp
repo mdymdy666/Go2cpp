@@ -621,6 +621,32 @@ WebSocketResult WebSocket::write_frame_unlocked(WebSocketOpcode opcode, std::str
     return result;
 }
 
+WebSocketResult WebSocket::send_message(WebSocketOpcode opcode, std::string_view payload) {
+    // 整条消息持锁：分片帧之间不允许插入其它消息的帧（否则对端重组错乱）。
+    std::lock_guard<sync::Mutex> lock(m_write_mutex);
+    if (!m_socket || m_closed.load(std::memory_order_acquire)) {
+        return {WebSocketError::Closed, EBADF, "websocket is closed"};
+    }
+    if (m_config.max_frame_payload == 0) {
+        return {WebSocketError::MessageTooLarge, 0, "frame payload limit is zero"};
+    }
+    std::size_t offset = 0;
+    do {
+        const std::size_t remaining = payload.size() - offset;
+        const std::size_t chunk = std::min(remaining, m_config.max_frame_payload);
+        const bool last = remaining <= m_config.max_frame_payload;
+        const WebSocketOpcode frame_opcode =
+            offset == 0 ? opcode : WebSocketOpcode::Continuation;
+        const auto result =
+            write_frame_unlocked(frame_opcode, payload.substr(offset, chunk), last);
+        if (!result.ok()) {
+            return result;
+        }
+        offset += chunk;
+    } while (offset < payload.size());
+    return WebSocketResult::success();
+}
+
 WebSocketResult WebSocket::send_control(WebSocketOpcode opcode, std::string_view payload) {
     if (payload.size() > 125) return {WebSocketError::Protocol, 0, "control payload too large"};
     return write_frame(opcode, payload, true);
@@ -725,11 +751,17 @@ WebSocketResult WebSocket::read_message(WebSocketMessage& message) {
 WebSocketResult WebSocket::send_text(std::string_view payload) {
     if (m_config.validate_utf8 && !valid_utf8(payload)) return {WebSocketError::Protocol, 0, "invalid UTF-8 text message"};
     if (payload.size() > m_config.max_message_payload) return {WebSocketError::MessageTooLarge, 0, "message payload too large"};
-    return write_frame(WebSocketOpcode::Text, payload, true);
+    if (!m_config.fragment_outgoing || payload.size() <= m_config.max_frame_payload) {
+        return write_frame(WebSocketOpcode::Text, payload, true);
+    }
+    return send_message(WebSocketOpcode::Text, payload);
 }
 WebSocketResult WebSocket::send_binary(std::string_view payload) {
     if (payload.size() > m_config.max_message_payload) return {WebSocketError::MessageTooLarge, 0, "message payload too large"};
-    return write_frame(WebSocketOpcode::Binary, payload, true);
+    if (!m_config.fragment_outgoing || payload.size() <= m_config.max_frame_payload) {
+        return write_frame(WebSocketOpcode::Binary, payload, true);
+    }
+    return send_message(WebSocketOpcode::Binary, payload);
 }
 WebSocketResult WebSocket::ping(std::string_view payload) { return send_control(WebSocketOpcode::Ping, payload); }
 WebSocketResult WebSocket::pong(std::string_view payload) { return send_control(WebSocketOpcode::Pong, payload); }

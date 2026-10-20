@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -223,6 +224,49 @@ inline void RelaxCpu() noexcept {
 #endif
 }
 
+/// 当前单调时钟纳秒数（只在竞争慢路径读取；无竞争热路径不付这个开销）。
+inline std::uint64_t SteadyNowNs() noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+/// 饥饿模式阈值：与 Go `sync.Mutex` 的 `starvationThresholdNs` 对齐（1ms）。
+/// 一个等待者从真正入队起累计等待超过该值，就在再次入队时把锁切到饥饿模式，
+/// 由 `Unlock` 直接按 FIFO 交接所有权。
+constexpr std::uint64_t kStarvationThresholdNs = 1'000'000ULL;
+
+/**
+ * @brief 普通线程在正常模式下的有界自旋预算。
+ *
+ * 2026-10-20 在本机（Ryzen 9 8945HX，6 物理核 / 12 逻辑核，8 OS 线程）
+ * 重新标定，500ms 窗口的稳态数据：
+ *
+ * | 自旋预算 | sync::Mutex | std::mutex（同进程对照）|
+ * |---|---|---|
+ * | 0 | 28–38 ns/op | 31–33 ns/op |
+ * | 8 | 28–34 ns/op | 31–34 ns/op |
+ * | 16 | 27–30 ns/op | 29–33 ns/op |
+ * | 32 | 25–30 ns/op | 27–28 ns/op |
+ * | 64 | 55 ns/op | 30 ns/op |
+ * | 128 | 82–95 ns/op | 28–29 ns/op |
+ * | 2048（旧值） | 175–280 ns/op | — |
+ *
+ * 结论与旧设计相反：**长时间自旋反而更慢**。原因是 SMT 下多个线程持续
+ * `CAS` 同一缓存行会让持锁者和其他 CPU 的流水线互相拖慢；短自旋后让等待者
+ * 进入队列、在**自己的 WaitNode 缓存行**上自旋（WaitNative 的有界自旋），
+ * 解锁者通过 FIFO 令牌交接，反而消除了共享缓存行的风暴。预算取 8
+ * （约 100ns）既能吸收「刚释放就要重新获取」的极短竞争，又不会形成 herd。
+ * 交替 A/B 实测（同一时段，3 轮）：8 → 19.4/20.5/20.1 ns，16 → 20.1/20.8/20.8 ns，
+ * 32 → 25.4/22.3/25.3 ns；4/8/16 线程的无竞争临界区基准也以 8 最优。
+ * 该值只影响性能，不影响语义；其他平台可用编译期宏覆盖后重新标定。
+ */
+#ifndef GO2CPP_MUTEX_SPIN_ATTEMPTS
+#define GO2CPP_MUTEX_SPIN_ATTEMPTS 8
+#endif
+constexpr int kNativeSpinAttempts = GO2CPP_MUTEX_SPIN_ATTEMPTS;
+
 /**
  * @brief `sync` 层的等待节点：一次阻塞（等锁 / 等通知 / 等 WaitGroup 归零）对应一个。
  *
@@ -287,6 +331,32 @@ public:
         return m_result.compare_exchange_strong(
             expected, result, std::memory_order_acq_rel,
             std::memory_order_acquire);
+    }
+
+    /**
+     * @brief 饥饿模式的「所有权直接交接」：认领节点并标记为已授予锁。
+     *
+     * 先写 `m_granted` 再 CAS `m_result`：等待者在自旋中一旦看到
+     * `kNotified` 就会读 `m_granted`，若顺序反过来会出现「看到通知但还没
+     * 看到授予」的窗口，在饥饿模式下会误以为自己需要重新竞争。
+     * 反之，先发布授予、后发布通知，等待者读 `m_result`（acquire）时
+     * 一定能看到之前的 `m_granted` 写（release）。
+     *
+     * @return true 表示本节点赢得了交接，`Wake()` 后调用者直接持有锁。
+     */
+    bool TryFinishAndGrant() noexcept {
+        m_granted.store(true, std::memory_order_release);
+        if (!TryFinish(WaitResult::kNotified)) {
+            // 已被取消/超时认领；撤销标记，节点随后会被回收复用。
+            m_granted.store(false, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    }
+
+    /// @brief 本节点是否通过饥饿模式直接获得了锁（必须持有锁返回）。
+    bool granted() const noexcept {
+        return m_granted.load(std::memory_order_acquire);
     }
 
     void Wake() noexcept {
@@ -463,6 +533,7 @@ public:
         m_task = std::move(task);
         m_backend = CreateWaitBackend();
         m_result.store(WaitResult::kWaiting, std::memory_order_release);
+        m_granted.store(false, std::memory_order_relaxed);
 #if defined(__linux__)
         // 复用的节点必须回到「没有线程睡在 futex 上」的状态；正常路径在
         // WaitNative 返回前已归零，这里再显式清一次，避免上一代异常退出
@@ -480,6 +551,8 @@ private:
     Scheduler* m_scheduler{nullptr};
     std::shared_ptr<Task> m_task;
     std::atomic<WaitResult> m_result{WaitResult::kWaiting};
+    /// @brief 饥饿模式所有权交接标记；普通唤醒保持 false（等待者需重新竞争）。
+    std::atomic<bool> m_granted{false};
     core::FutexMutex m_wake_mutex;
 #if defined(__linux__)
     // 每个等待者自己的 futex 代际字：notify_one 只推进这一个 node，
@@ -894,16 +967,30 @@ std::shared_ptr<WaitBackend> CreateWaitBackend() noexcept {
  * `no_park_depth` 契约计数），因此这里的每条不变量同时约束两种锁。上层使用者：
  * `sync::ConditionVariable`/`WaitGroup`、`channel`、`future`、`IOManager` 的等待节点。
  *
- * ## 状态字（`m_state` 两个位，必须一起理解）
+ * ## 状态字（`m_state` 四个位，必须一起理解）
  *
  * | 位 | 含义 |
  * |---|---|
  * | `kLocked` | 锁已被持有 |
- * | `kWaiter` | 可能有线程睡在 futex 上 / 正在入队 |
+ * | `kWaiter` | 等待队列非空（仅用于诊断与「解锁必须进慢路径」的提示） |
+ * | `kStarving` | 饥饿模式：解锁必须把所有权直接交给 FIFO 队首 |
+ * | `kWoken` | 正常模式下已唤醒一个等待者，它尚未获取/重新入队 |
  *
- * **不变量**：只要可能有线程睡在 futex 上，状态就**永远不会是 0/1** —— 这样新来的
- * `lock()` 无法用 `CAS(0→1)` 快路径绕过仍在睡眠的等待者。这条不变量是 250 倍退化
- * 修复的核心（详见 `docs/gmp-optimization-log.md` 的「sync::Mutex 的 250 倍退化」）。
+ * **正常模式（Go `sync.Mutex` 的 mutexNormal）**：`Unlock` 先把锁真正释放
+ * （清 `kLocked`），再唤醒一个等待者；被唤醒者必须**重新竞争**，新来者也可
+ * 用 CAS 插队。`kWoken` 是「唤醒令牌」：同一时刻最多只有一个被唤醒的等待者，
+ * 它获取锁或重新入队时必须消费令牌，避免每次 `Unlock` 都做一次 futex wake
+ * 的唤醒风暴。
+ *
+ * **饥饿模式（mutexStarving）**：某个等待者从真正入队起累计等待超过
+ * `kStarvationThresholdNs`（1ms）后，在（再次）入队时置 `kStarving`。此后
+ * `Unlock` **不释放锁**，而是把 `kLocked` 的所有权直接交给 FIFO 队首
+ * （`WaitNode::TryFinishAndGrant`），新来者不得插队、只能入队。退出条件：
+ * 队列清空，或被交接者自身等待未超过阈值（说明积压已在阈值内消化）。
+ *
+ * **不变量**：`kWaiter` 与队列非空在 `m_mutex` 下同步维护；`kWoken` 被
+ * 置位时，该等待者已从队列摘除且不在队列里。所有状态字的修改要么在
+ * `m_mutex` 内，要么是只影响 `kLocked` 的 CAS（会保留其余提示位）。
  *
  * ## 队列与唤醒
  *
@@ -919,11 +1006,13 @@ std::shared_ptr<WaitBackend> CreateWaitBackend() noexcept {
  */
 struct Mutex::Impl {
     std::mutex m_mutex;
-    // 同一个原子字节同时发布“已持有”和“已有等待者/等待者正在入队”
-    // 两个状态。Unlock 的 compare_exchange 因此不会读取到旧的等待者
-    // 标记后错误地释放锁，避免丢失唤醒。
+    // 同一个原子字节同时发布锁状态、等待者提示、饥饿模式与唤醒令牌。
+    // 关键点：正常模式下 Unlock 清 kLocked 后新来者仍能 CAS 拿锁；只有
+    // kStarving 会关闭快路径（饥饿模式禁止插队）。
     static constexpr std::uint8_t kLocked = 1U;
     static constexpr std::uint8_t kWaiter = 2U;
+    static constexpr std::uint8_t kStarving = 4U;
+    static constexpr std::uint8_t kWoken = 8U;
     std::atomic<std::uint8_t> m_state{0U};
     // 只统计已经进入等待队列的普通线程。受管 Fiber 不参与该计数：
     // 它们竞争时直接 park（不再做协作 yield 重试，见 LockImpl 的说明）。
@@ -936,6 +1025,80 @@ struct Mutex::Impl {
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
     // 最近一次成功加锁的受管 G（持锁 park 检测用；0 表示未记录）。
     std::atomic<std::uint64_t> m_owner{0};
+
+    /**
+     * @brief 唤醒令牌持有者退出（取消 / context done）时把令牌转交出去。
+     *
+     * 令牌持有者已从队列摘除；它既不获取锁也不重新入队时，必须：
+     * - 清 `kWoken`，否则后续 `Unlock` 会一直认为「唤醒已在路上」而不再唤醒；
+     * - 若此刻锁空闲且仍有等待者，补一次唤醒（正常模式）或直接交接
+     *   （饥饿模式），否则等待者会永久睡在已经空闲的锁上。
+     *
+     * 必须在**不持** `m_mutex` 时调用；`Wake` 在锁外执行。
+     */
+    void DropWakeToken() noexcept {
+        std::shared_ptr<WaitNode> selected;
+        try {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            std::uint8_t state = m_state.load(std::memory_order_acquire);
+            state = static_cast<std::uint8_t>(state & ~kWoken);
+            ReorderWaitersForSelector(m_waiters);
+            const bool starved = (state & kStarving) != 0U;
+            if (m_waiters.empty()) {
+                state = static_cast<std::uint8_t>(state & ~kWaiter);
+                // 没有排队者，也没有可交接对象：空闲时把状态清干净
+                // （含遗留的 kStarving）。
+                if ((state & kLocked) == 0U) {
+                    state = 0U;
+                }
+                m_state.store(state, std::memory_order_release);
+                return;
+            }
+            if ((state & kLocked) != 0U) {
+                // 锁在别人手里：它释放时会看到 kWoken 已清而唤醒下一个。
+                m_state.store(state, std::memory_order_release);
+                return;
+            }
+            // 锁空闲 + 仍有等待者：令牌持有者退出了，必须由这里补交接。
+            while (!m_waiters.empty()) {
+                std::shared_ptr<WaitNode> candidate =
+                    std::move(m_waiters.front());
+                m_waiters.pop_front();
+                if (candidate && !candidate->managed()) {
+                    m_native_waiters.fetch_sub(1U,
+                                               std::memory_order_release);
+                }
+                const bool claimed =
+                    starved ? candidate && candidate->TryFinishAndGrant()
+                            : candidate &&
+                                  candidate->TryFinish(WaitResult::kNotified);
+                if (claimed) {
+                    selected = std::move(candidate);
+                    break;
+                }
+            }
+            if (selected) {
+                if (starved) {
+                    state = static_cast<std::uint8_t>(state | kLocked | kWaiter);
+                } else {
+                    state = static_cast<std::uint8_t>(state | kWoken | kWaiter);
+                }
+                if (m_waiters.empty()) {
+                    state = static_cast<std::uint8_t>(state & ~kWaiter);
+                }
+                m_state.store(state, std::memory_order_release);
+            } else {
+                m_state.store(0U, std::memory_order_release);
+            }
+        } catch (...) {
+            // 极端情况下（系统级 mutex 失败）至少别把令牌永久留在状态里。
+            m_state.fetch_and(static_cast<std::uint8_t>(~kWoken),
+                              std::memory_order_release);
+        }
+        if (selected) {
+            selected->Wake();
+        }
+    }
 };
 
 Mutex::Mutex() : m_impl(std::make_unique<Impl>()) {}
@@ -979,30 +1142,39 @@ bool Mutex::LockForConditionWait() {
  *
  * `Mutex::lock` / `try_lock` / `ConditionVariable::Wait` 都收敛到这里。
  * 它是**混合锁**：无竞争走一次 CAS；受管 G 竞争时直接 park（把 M 让给
- * 别的 G）；普通线程竞争时先用有界自旋吸收短临界区，再落到 futex。
+ * 别的 G）；普通线程竞争时先用很短的有界自旋吸收极短临界区，然后进入
+ * FIFO 等待队列（等待节点在 `WaitNative` 里还有一层自旋，见那里）。
+ *
+ * ## 两态状态机（正常模式 / 饥饿模式）
+ *
+ * - **正常模式**：`Unlock` 先释放锁（清 `kLocked`）再唤醒一个等待者；被
+ *   唤醒者必须回到本函数顶部重新 CAS 竞争，新来者也可以插队。`kWoken`
+ *   令牌保证同一时刻最多一个被唤醒者，避免每次解锁一次 futex 唤醒的
+ *   唤醒风暴。
+ * - **饥饿模式**：某个等待者入队后累计等待超过 1ms，就在（再次）入队时
+ *   置 `kStarving`。此后 `Unlock` 不释放锁，而是把所有权直接交给 FIFO
+ *   队首（`WaitNode::TryFinishAndGrant`），新来者不得插队。被交接者若
+ *   自身等待未超过阈值，会在返回前清掉 `kStarving`，避免一次调度抖动
+ *   让整把锁永久停在 futex 交接模式；队列清空也会退出饥饿模式。
  *
  * ## 步骤
  *
  * step1. 上下文已失效 → 返回 false（先判，避免拿到锁却无法返回）；
- * step2. **无竞争快速路径**：`CAS 0 → kLocked` 成功即返回（绝大多数调用）；
+ * step2. **快速路径**：状态没有 `kLocked/kStarving` 时一次 CAS 拿锁；
  * step3. 判定等待者类型：受管 G / 普通线程 / 手动 Fiber；手动 Fiber 无法
  *        park，直接返回 false；
- * step4. **普通线程**：先做有界自旋（2048 次；已有等待者时只给 4 次以保持
- *        FIFO 公平），越界后进 futex 等待；
- * step5. 走等待路径：从 thread-local 缓存取 `WaitNode`，在 `m_mutex` 下
- *        发布 `kWaiter` 位并做 FIFO 交接；
- * step6. 等待结束（被唤醒/超时/取消）后由 `Unlock` 直接交接或重试。
+ * step4. **普通线程**：短自旋（`kNativeSpinAttempts`）后进入等待队列；
+ * step5. 在 `m_mutex` 下发布 `kWaiter`（必要时 `kStarving`）并 push；
+ * step6. 等待结束：被普通唤醒 → 回到 step2 重新竞争；被饥饿模式交接 →
+ *        直接持锁返回；超时/取消 → 从队列摘除且不持锁返回。
  *
  * ## 并发/失败语义
  *
  * - **快速路径只有一次 CAS**，不加锁、不碰队列；
- * - **受管 G 竞争时直接 park，不自旋也不 yield**——实测自旋只会更慢
- *   （见下方「为什么最终连忙自旋也不做」的 5 组数据）；
- * - **公平性**：等待者按 FIFO 交接；已有等待者时自旋预算降到 4 次，
- *   不允许新来者插队；
- * - `kWaiter` 位只在持有 `m_mutex` 时发布，不会出现「标志已设但未入队，
- *   Unlock 却覆盖标志」的窗口；
+ * - **受管 G 竞争时直接 park，不自旋也不 yield**——实测自旋只会更慢；
  * - **不持锁返回 false**：任何失败路径都在拿到锁之前返回；
+ * - 正常模式下被唤醒者重新竞争，因此**不保证**严格的唤醒即持有；
+ *   1ms 的饥饿模式阈值保证不会无限被插队；
  * - 等待者在队列里用 `shared_ptr` 持有——`Unlock` 是「先出队、锁外 Wake」，
  *   裸指针会让节点在 Wake 前被销毁。
  */
@@ -1027,21 +1199,24 @@ bool Mutex::LockImpl(const ContextPtr& context,
                               std::memory_order_relaxed);
     };
 
-    // step2: 无竞争快速路径——CAS 0 → kLocked，成功即返回（绝大多数情况）。
-    std::uint8_t expected_state = 0U;
-    if (m_impl->m_state.compare_exchange_strong(
-            expected_state, Impl::kLocked, std::memory_order_acquire,
-            std::memory_order_relaxed)) {
-        note_lock_held();
-        return true;
+    // step2: 无竞争快速路径——先于任何等待者类型判定，保证「无竞争只有
+    // 一次 CAS」，不为 CurrentTarget() 的调度器查询/共享指针拷贝付开销。
+    std::uint8_t expected_state =
+        m_impl->m_state.load(std::memory_order_acquire);
+    if ((expected_state & (Impl::kLocked | Impl::kStarving)) == 0U) {
+        if (m_impl->m_state.compare_exchange_weak(
+                expected_state,
+                static_cast<std::uint8_t>(expected_state | Impl::kLocked),
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+            note_lock_held();
+            return true;
+        }
     }
 
-    // step3: 判定等待者类型：受管 G（可 park）、普通线程（走 futex）、
-    // 或手动 Fiber（无法 park，只能失败）。
+    // step3（类型判定只做一次）: 受管 G 可 park；手动 Fiber 无法 park，
+    // 只能失败；已请求取消的 G 也直接失败。
     const WaitTarget target = CurrentTarget();
     if (target.unsupported_manual_fiber) {
-        // 手动恢复的 Fiber 没有可用于 park 的 Scheduler continuation。返回 false
-        // 比阻塞 carrier 线程更安全。
         return false;
     }
     if (!ignore_task_cancellation && target &&
@@ -1049,178 +1224,263 @@ bool Mutex::LockImpl(const ContextPtr& context,
         return false;
     }
 
-    // 受管 Fiber 的竞争路径：**直接进入 WaitNode + park**，不忙自旋、不 yield。
-    //
-    // ## 为什么删掉旧的"协作 yield 重试"（2026-10-18 探针实测）
-    //
-    // 旧实现对受管 G 最多做 256 次 `yield_current()`：每次都是一次完整的
-    // Fiber 挂起 + 重新入队。64 Fiber / 8 M、32,000 次 lock 的探针口径：
-    //   进入协作循环 29,281 次，累计 yield 7,464,941 次，其中只有 196 次
-    //   在循环里真正抢到锁；其余 29,085 次烧完 256 次 yield 后仍然 park。
-    // 平均每次 lock 233 次上下文切换，全是无效功 —— 这就是
-    // M=8/Fiber=64 退化到 73,000~92,000 ns/op 的原因。同一负载 M=1 不走
-    // 这条 yield 路径（直接 park），只要 634 ns/op，相差 115 倍。
-    //
-    // ## 为什么最终连"忙自旋"也不做
-    //
-    // 试过三种自旋预算（8 / 32 上限的自适应衰减、以及不限队列的 64/256），
-    // 5 次中位数对比（场景 B，M=8）：
-    //   自旋 0   ：Fiber=2 780ns、Fiber=8 893ns、Fiber=64 740ns
-    //   自旋 8   ：Fiber=2 1076ns、Fiber=8 948ns、Fiber=64 788ns
-    //   自旋 32  ：Fiber=2 1327ns、Fiber=8 950ns、Fiber=64 770ns
-    // 自旋只会变慢。原因：受管 Fiber 上，持锁者要么正跑在**另一个 M** 上
-    // （unlock→TryFinish→wake 的 park/wake 交接实测只要 390ns，比自旋更
-    // 便宜），要么自己已经 park/yield（自旋纯属空烧）。自旋还要么挡住本 M
-    // 上其他 G，要么越过 FIFO 队列插队。
-    //
-    // 因此这里的策略是：竞争时直接把当前 G 挂起（park 会释放 M 让其他 G
-    // 继续跑），由 Unlock 精确唤醒 FIFO 队首。等待者的控制块走 thread-local
-    // 缓存复用（32 个/线程），稳态零堆分配。
+    // 等待起点：从真正进入等待队列开始累计。超过阈值后在（再次）入队时
+    // 把锁切到饥饿模式（kStarving），由 Unlock 直接按 FIFO 交接所有权。
+    std::uint64_t wait_start_ns = 0U;
+    // 正常模式下「唤醒令牌」的本地持有标记：被 Unlock 唤醒后置 true，
+    // 获取锁/重新入队/放弃等待时必须消费它（见 Impl::DropWakeToken）。
+    bool was_woken = false;
 
-    // std::mutex 在 Linux 上也会先进行短暂自旋；混合锁的 native
-    // 调用者如果立即进入条件变量慢路径，会把很短的临界区放大成一次
-    // futex 唤醒。这里保留较小的有界自旋，并且一旦队列发布立即退出，
-    // 因而不会越过 FIFO waiter。
-    // step4: 普通线程的竞争路径——先做有界自旋，越界后才进 futex 等待。
-    if (!target) {
-        // 自旋预算分两段（2026-10-18 实测重新标定）：
-        //   1. 没有等待者时给足 2048 次（≈18µs，PAUSE 实测 8.7ns）。这一档
-        //      必须覆盖"N 个线程轮流抢同一把锁"的整个窗口：太小（128/256）
-        //      时 8 线程争用会有人 256 次全失败、转入等待队列并睡一次，
-        //      之后每个操作都要付一次 futex 唤醒延迟 —— 这就是
-        //      docs/performance.md 里 4 线程 25~30µs/op 的来源。
-        //      实测 2048 时 8 线程 median 225ns/op；4096 反而更慢（349ns，
-        //      多出来的空转没有收益），1024 则回退到 321ns。
-        //   2. 已有等待者时只给 4 次 —— 严格回到 FIFO handoff，不越过
-        //      队列里的等待者，保持既有公平性承诺。
-        // 越界后进入 WaitNode 等待；WaitNative 侧还有一层有界自旋。
-        constexpr int kNativeSpinAttempts = 2048;
-        constexpr int kNativeSpinWithWaiters = 4;
-        for (int attempt = 0; attempt < kNativeSpinAttempts; ++attempt) {
-            if ((m_impl->m_state.load(std::memory_order_acquire) &
-                 Impl::kWaiter) != 0U &&
-                attempt >= kNativeSpinWithWaiters) {
-                break;
+    const auto wait_exceeded_threshold = [&]() -> bool {
+        return wait_start_ns != 0U &&
+               SteadyNowNs() - wait_start_ns > kStarvationThresholdNs;
+    };
+    const auto abandon_wake_token = [&] {
+        if (!was_woken) {
+            return;
+        }
+        was_woken = false;
+        m_impl->DropWakeToken();
+    };
+
+    for (;;) {
+        // step2: 无竞争/正常模式快速路径——一次 CAS。kStarving 时禁止插队。
+        expected_state = m_impl->m_state.load(std::memory_order_acquire);
+        if ((expected_state & (Impl::kLocked | Impl::kStarving)) == 0U) {
+            std::uint8_t desired = static_cast<std::uint8_t>(
+                expected_state | Impl::kLocked);
+            if (was_woken) {
+                desired = static_cast<std::uint8_t>(desired & ~Impl::kWoken);
             }
-            expected_state = 0U;
             if (m_impl->m_state.compare_exchange_weak(
-                    expected_state, Impl::kLocked,
-                    std::memory_order_acquire,
+                    expected_state, desired, std::memory_order_acquire,
                     std::memory_order_relaxed)) {
+                note_lock_held();
                 return true;
             }
-            RelaxCpu();
         }
-    }
 
-    // Mutex::Unlock 会在释放 m_mutex 后异步执行 Wake，因此即使没有
-    // Context，也必须让队列持有一个 shared_ptr，不能使用栈上节点。
-    // step5: 走等待路径：从 thread-local 缓存取 WaitNode（稳态零堆分配），
-    // 在 m_mutex 下发布 kWaiter 并做 FIFO 交接。
-    std::shared_ptr<WaitNode> owned_waiter =
-        AcquireWaitNode(target.scheduler, target.task);
-    WaitNode* waiter = owned_waiter.get();
-    ContextSubscription subscription(context, owned_waiter);
-    const auto release_waiter = [&] {
-        subscription.Reset();
-        if (owned_waiter) {
-            ReleaseWaitNode(std::move(owned_waiter));
+        // 被唤醒后必须先看取消：已经取消的调用不能持锁返回。
+        if (context && context->IsDone()) {
+            abandon_wake_token();
+            return false;
         }
-    };
-    {
-        std::lock_guard<std::mutex> lock(m_impl->m_mutex);
-        if ((context && context->IsDone()) ||
-            waiter->result() != WaitResult::kWaiting) {
-            release_waiter();
+        if (!ignore_task_cancellation && target &&
+            target.task->cancellation_requested()) {
+            abandon_wake_token();
             return false;
         }
 
-        // 等待者位只在持有队列锁时发布。这样不会出现“等待者已经设置
-        // 标志但尚未入队，Unlock 却覆盖标志”的窗口：Unlock 的无竞争
-        // CAS 可以在本段之前把锁释放掉，当前调用随后重新观察到空闲锁
-        // 并直接取得；如果 CAS 发生在发布之后，则必然看到 kWaiter 并
-        // 进入同一把队列锁完成 FIFO 交接。
-        for (;;) {
-            expected_state = m_impl->m_state.load(std::memory_order_acquire);
-            if ((expected_state & Impl::kLocked) == 0U &&
-                m_impl->m_waiters.empty()) {
-                if (m_impl->m_state.compare_exchange_weak(
-                        expected_state, Impl::kLocked,
-                        std::memory_order_acquire,
-                        std::memory_order_relaxed)) {
-                    note_lock_held();
-                    release_waiter();
-                    return true;
+        // step4: 普通线程在正常模式下先做有界自旋（短预算，见
+        // kNativeSpinAttempts 的标定表）。已有等待者时**不再**缩短预算：
+        // 正常模式允许新来者与等待者公平竞争，锁被释放后自旋者可以直接
+        // CAS 拿到，而不必每次操作都付一次 futex 唤醒。饥饿模式关闭这条
+        // 路径（新来者不得插队）。
+        if (!target && (expected_state & Impl::kStarving) == 0U) {
+            for (int attempt = 0; attempt < kNativeSpinAttempts; ++attempt) {
+                expected_state =
+                    m_impl->m_state.load(std::memory_order_acquire);
+                if ((expected_state & Impl::kStarving) != 0U) {
+                    break;
                 }
-                continue;
-            }
-
-            if ((expected_state & Impl::kWaiter) == 0U) {
-                const std::uint8_t published = static_cast<std::uint8_t>(
-                    expected_state | Impl::kWaiter);
-                if (!m_impl->m_state.compare_exchange_weak(
-                        expected_state, published,
-                        std::memory_order_acq_rel,
-                        std::memory_order_acquire)) {
-                    continue;
+                if ((expected_state & Impl::kLocked) == 0U) {
+                    std::uint8_t desired = static_cast<std::uint8_t>(
+                        expected_state | Impl::kLocked);
+                    if (was_woken) {
+                        desired = static_cast<std::uint8_t>(
+                            desired & ~Impl::kWoken);
+                    }
+                    if (m_impl->m_state.compare_exchange_weak(
+                            expected_state, desired,
+                            std::memory_order_acquire,
+                            std::memory_order_relaxed)) {
+                        note_lock_held();
+                        return true;
+                    }
                 }
+                RelaxCpu();
             }
-            break;
         }
 
-        m_impl->m_waiters.push_back(owned_waiter);
-        if (!target) {
-            m_impl->m_native_waiters.fetch_add(1U, std::memory_order_release);
+        if (wait_start_ns == 0U) {
+            // 从“真正进入等待队列”开始计时：自旋阶段（≤kNativeSpinAttempts
+            // 次 PAUSE）不计入。这样一次调度抢占（线程在用户态自旋时被换出）
+            // 不会误触发饥饿模式，同时仍然保证入队后的等待有 1ms 上界。
+            wait_start_ns = SteadyNowNs();
         }
-        if (!waiter->Arm()) {
-            m_impl->m_waiters.pop_back();
-            if (!target) {
-                m_impl->m_native_waiters.fetch_sub(1U,
-                                                    std::memory_order_release);
+
+        // step5: 走等待路径。每次 park 都需要一个新代际的节点（结果字段
+        // 是终态），因此循环内从 thread-local 缓存取、结束后归还。
+        std::shared_ptr<WaitNode> owned_waiter =
+            AcquireWaitNode(target.scheduler, target.task);
+        WaitNode* waiter = owned_waiter.get();
+        ContextSubscription subscription(context, owned_waiter);
+        bool acquired_under_lock = false;
+        bool abort_before_enqueue = false;
+        {
+            std::lock_guard<std::mutex> lock(m_impl->m_mutex);
+            if ((context && context->IsDone()) ||
+                waiter->result() != WaitResult::kWaiting) {
+                abort_before_enqueue = true;
+            } else {
+                for (;;) {
+                    std::uint8_t state =
+                        m_impl->m_state.load(std::memory_order_acquire);
+                    // 正常模式：锁空闲即可抢占（即使队列还有等待者）。
+                    // 饥饿模式：锁空闲说明没有可交接的持有者（队列已空，
+                    // 或交接刚刚落地），此时直接取得锁是唯一能推进的选择。
+                    if ((state & Impl::kLocked) == 0U) {
+                        std::uint8_t desired = static_cast<std::uint8_t>(
+                            state | Impl::kLocked);
+                        desired = static_cast<std::uint8_t>(
+                            desired & ~Impl::kStarving);
+                        if (was_woken) {
+                            desired = static_cast<std::uint8_t>(
+                                desired & ~Impl::kWoken);
+                        }
+                        if (m_impl->m_state.compare_exchange_weak(
+                                state, desired, std::memory_order_acquire,
+                                std::memory_order_relaxed)) {
+                            acquired_under_lock = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    // 先发布 kWaiter（必要时连 kStarving 一起发布），再
+                    // push 队列：这样持锁者的快速 CAS 会在状态里看到提示，
+                    // 不会在入队过程中把锁释放掉而漏掉唤醒。
+                    std::uint8_t published = static_cast<std::uint8_t>(
+                        state | Impl::kWaiter);
+                    if (wait_exceeded_threshold()) {
+                        published = static_cast<std::uint8_t>(
+                            published | Impl::kStarving);
+                    }
+                    if (was_woken) {
+                        // 重新入队必须消费唤醒令牌，否则后续 Unlock 会一直
+                        // 以为「已有唤醒在路上」而不再叫醒任何人。
+                        published = static_cast<std::uint8_t>(
+                            published & ~Impl::kWoken);
+                    }
+                    if (m_impl->m_state.compare_exchange_weak(
+                            state, published, std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        was_woken = false;
+                        break;
+                    }
+                }
+                if (!acquired_under_lock) {
+                    m_impl->m_waiters.push_back(owned_waiter);
+                    if (!target) {
+                        m_impl->m_native_waiters.fetch_add(
+                            1U, std::memory_order_release);
+                    }
+                    if (!waiter->Arm()) {
+                        m_impl->m_waiters.pop_back();
+                        if (!target) {
+                            m_impl->m_native_waiters.fetch_sub(
+                                1U, std::memory_order_release);
+                        }
+                        if (m_impl->m_waiters.empty()) {
+                            // 没有排队者就不该继续声称饥饿/有等待者。
+                            std::uint8_t state = m_impl->m_state.load(
+                                std::memory_order_acquire);
+                            state = static_cast<std::uint8_t>(
+                                state & ~(Impl::kWaiter | Impl::kStarving));
+                            m_impl->m_state.store(
+                                state, std::memory_order_release);
+                        }
+                        abort_before_enqueue = true;
+                    }
+                }
+            }
+        }
+
+        if (acquired_under_lock) {
+            subscription.Reset();
+            ReleaseWaitNode(std::move(owned_waiter));
+            note_lock_held();
+            return true;
+        }
+        if (abort_before_enqueue) {
+            subscription.Reset();
+            ReleaseWaitNode(std::move(owned_waiter));
+            // 令牌还没有被消费（发布 CAS 未发生）：转交给其他等待者。
+            abandon_wake_token();
+            return false;
+        }
+
+        // step6: 等待被唤醒 / 超时 / 取消。
+        const bool managed_waiter = waiter->managed();
+        const WaitResult result = Await(waiter, ignore_task_cancellation);
+        subscription.Reset();
+
+        if (result == WaitResult::kNotified) {
+            // 饥饿模式：所有权已经直接交接，kLocked 一直保持在状态里，
+            // 不能再去 CAS（那会失败并误以为自己还要等待）。
+            const bool granted = waiter->granted();
+            ReleaseWaitNode(std::move(owned_waiter));
+            if (granted) {
+                // 饥饿模式的退出条件之一（与「队列清空」并列）：被交接的
+                // 等待者自身累计等待没有超过阈值，说明积压已经在阈值内被
+                // 消化，立即恢复正常模式。否则一次偶发调度抖动（某个等待者
+                // 恰好被换出 >1ms）会让整把锁永久停在「每次操作一次 futex
+                // 交接」的高延迟模式，正是本缺陷要消除的稳态退化。
+                if (!wait_exceeded_threshold()) {
+                    std::uint8_t state =
+                        m_impl->m_state.load(std::memory_order_acquire);
+                    while ((state & Impl::kStarving) != 0U) {
+                        if (m_impl->m_state.compare_exchange_weak(
+                                state,
+                                static_cast<std::uint8_t>(
+                                    state & ~Impl::kStarving),
+                                std::memory_order_acq_rel,
+                                std::memory_order_acquire)) {
+                            break;
+                        }
+                    }
+                }
+                note_lock_held();
+                return true;
+            }
+            // 正常模式：只是被叫醒，必须回到循环重新竞争。
+            was_woken = true;
+            continue;
+        }
+
+        // 超时/取消/调度器关闭：把自己从队列里摘掉。Unlock 也可能已经
+        // 摘走并丢弃了僵尸节点，因此这里必须用 find 而不是假定仍在队首。
+        {
+            std::lock_guard<std::mutex> lock(m_impl->m_mutex);
+            const auto position = std::find_if(
+                m_impl->m_waiters.begin(), m_impl->m_waiters.end(),
+                [waiter](const std::shared_ptr<WaitNode>& candidate) {
+                    return candidate.get() == waiter;
+                });
+            if (position != m_impl->m_waiters.end()) {
+                m_impl->m_waiters.erase(position);
+                if (!managed_waiter) {
+                    m_impl->m_native_waiters.fetch_sub(
+                        1U, std::memory_order_release);
+                }
             }
             if (m_impl->m_waiters.empty()) {
-                m_impl->m_state.fetch_and(
-                    static_cast<std::uint8_t>(~Impl::kWaiter),
-                    std::memory_order_release);
-            }
-            release_waiter();
-            return false;
-        }
-    }
-
-    const bool managed_waiter = waiter->managed();
-    const WaitResult result = Await(waiter, ignore_task_cancellation);
-    subscription.Reset();
-    if (result != WaitResult::kNotified) {
-        std::lock_guard<std::mutex> lock(m_impl->m_mutex);
-        const auto position = std::find_if(
-            m_impl->m_waiters.begin(), m_impl->m_waiters.end(),
-            [waiter](const std::shared_ptr<WaitNode>& candidate) {
-                return candidate.get() == waiter;
-            });
-        if (position != m_impl->m_waiters.end()) {
-            m_impl->m_waiters.erase(position);
-            if (!managed_waiter) {
-                m_impl->m_native_waiters.fetch_sub(
-                    1U, std::memory_order_release);
+                std::uint8_t state =
+                    m_impl->m_state.load(std::memory_order_acquire);
+                state = static_cast<std::uint8_t>(state & ~Impl::kWaiter);
+                // 锁空闲且没有唤醒令牌：清掉遗留的饥饿标记（饥饿模式的
+                // 退出条件就是「队列清空且没有在途交接」）。
+                if ((state & Impl::kLocked) == 0U &&
+                    (state & Impl::kWoken) == 0U) {
+                    state = 0U;
+                }
+                m_impl->m_state.store(state, std::memory_order_release);
             }
         }
-        if (m_impl->m_waiters.empty()) {
-            m_impl->m_state.fetch_and(
-                static_cast<std::uint8_t>(~Impl::kWaiter),
-                std::memory_order_release);
-        }
-        if (owned_waiter) {
-            ReleaseWaitNode(std::move(owned_waiter));
-        }
+        ReleaseWaitNode(std::move(owned_waiter));
         return false;
     }
-    if (owned_waiter) {
-        ReleaseWaitNode(std::move(owned_waiter));
-    }
-    note_lock_held();
-    return true;
 }
+
 
 bool Mutex::LockFor(ContextDuration timeout, const ContextPtr& parent) {
     if (parent && parent->IsDone()) {
@@ -1238,15 +1498,26 @@ bool Mutex::LockFor(ContextDuration timeout, const ContextPtr& parent) {
 }
 
 bool Mutex::TryLock() noexcept {
-    std::uint8_t expected = 0U;
-    const bool acquired = m_impl->m_state.compare_exchange_strong(
-        expected, Impl::kLocked, std::memory_order_acquire,
-        std::memory_order_relaxed);
-    return acquired;
+    // 正常模式允许插队，因此只检查「已被持有 / 饥饿模式」两位，保留
+    // kWaiter/kWoken 提示位；饥饿模式下新来者不得插队（Go 语义）。
+    std::uint8_t expected = m_impl->m_state.load(std::memory_order_acquire);
+    for (;;) {
+        if ((expected & (Impl::kLocked | Impl::kStarving)) != 0U) {
+            return false;
+        }
+        const std::uint8_t desired =
+            static_cast<std::uint8_t>(expected | Impl::kLocked);
+        if (m_impl->m_state.compare_exchange_weak(
+                expected, desired, std::memory_order_acquire,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+    }
 }
 
+
 /**
- * @brief 释放 Mutex；若有等待者，把**所有权直接交给 FIFO 队首**。
+ * @brief 释放 Mutex；正常模式释放并唤醒一个等待者，饥饿模式直接交接所有权。
  *
  * ## 定位
  *
@@ -1255,24 +1526,31 @@ bool Mutex::TryLock() noexcept {
  * `m_mutex` 之后调用——否则唤醒一个 Fiber 后它立刻回来抢锁，会形成
  * 「持队列锁 → 唤醒 → 等待者抢锁」的锁序反转。
  *
+ * ## 两态
+ *
+ * - **正常模式**（状态不含 `kStarving`）：摘除 FIFO 队首并置 `kWoken`
+ *   令牌，然后把 `kLocked` 真正清掉，锁外唤醒。被唤醒者必须重新竞争，
+ *   新来者可以插队。若已有 `kWoken`（上一次唤醒还没被消费），只释放锁、
+ *   不再唤醒第二个——这是把「每次解锁一次 futex wake」降为「每个唤醒
+ *   周期一次」的关键。
+ * - **饥饿模式**（状态含 `kStarving`）：不释放 `kLocked`，逐个 `TryFinish`
+ *   队首直到找到一个活节点，标记 `granted` 后锁外 `Wake`；被选中者醒来
+ *   即直接持有锁。队列清空时清掉 `kStarving` 并真正释放。
+ *
  * ## 步骤
  *
- * step1. 持锁 park 检测：只有「解锁者就是记录里的 owner」时才递减计数，
- *        避免 Go 风格跨 G 解锁把计数减错；
- * step2. **无等待者快速路径**：`CAS kLocked → 0` 成功即返回，不进入队列锁。
- *        若等待者位同时存在，CAS 必定失败并转入 step3；
- * step3. **FIFO 交接**（持 `m_mutex`）：先确认锁确实被持有（否则抛
- *        `logic_error`），`ReorderWaitersForSelector` 让选择器重排队列，
- *        然后逐个出队用 `TryFinish(kNotified)` 找第一个能成功认领的等待者；
- *        - 找到：`selected` 非空，`m_state` 保持 `kLocked`（所有权直接交给
- *          队首，`TryLock` 调用者不能插队）；
- *        - 没找到：`m_state` 置 0（真正释放）。
- * step4. 锁外 `Wake()`：让被选中的等待者恢复执行。
+ * step1. 持锁 park 检测：只有「解锁者就是记录里的 owner」时才递减计数；
+ * step2. **快速路径**：`CAS kLocked → 0`，仅在状态恰好是 `kLocked`
+ *        （无等待者/无令牌/非饥饿）时成功，不进入队列锁；
+ * step3. **慢路径**（持 `m_mutex`）：确认锁确实被持有（否则抛
+ *        `logic_error`），`ReorderWaitersForSelector` 重排，再按上面
+ *        两态分别处理；
+ * step4. 锁外 `Wake()`。
  *
  * ## 并发/失败语义
  *
  * - **解锁未持有的 mutex 抛 `logic_error`**（继续下去会让状态永久错乱）；
- * - `kWaiter` 位与 `m_waiters` 非空必须一致：两者都在 `m_mutex` 内更新；
+ * - `kWaiter` 位与 `m_waiters` 非空在 `m_mutex` 内同步维护；
  * - **唤醒在锁外**：这是与 `LockImpl` 的 park 路径配对的约定，违反它会死锁；
  * - `TryFinish` 失败的节点（已被超时/取消）会被跳过并继续找下一个，
  *   因此不会因队首是僵尸节点而丢唤醒；
@@ -1290,9 +1568,8 @@ void Mutex::Unlock() {
             m_impl->m_owner.store(0U, std::memory_order_relaxed);
         }
     }
-    // 无等待者时只需一次 CAS，不进入队列互斥量。若等待者位同时存在，
-    // CAS 必定失败并转入下面的 FIFO 交接路径。
-    // step2: 无等待者快速路径——一次 CAS，不进队列锁。
+    // 无等待者/无令牌/非饥饿时只需一次 CAS 真正释放锁，不进入队列互斥量。
+    // step2: 正常模式快速路径——一次 CAS，不进队列锁。
     std::uint8_t expected_state = Impl::kLocked;
     if (m_impl->m_state.compare_exchange_strong(
             expected_state, 0U, std::memory_order_release,
@@ -1300,51 +1577,90 @@ void Mutex::Unlock() {
         return;
     }
 
-    // step3: FIFO 交接——队列操作在 m_mutex 内与等待者入队线性化。
+    // step3: 慢路径——队列操作在 m_mutex 内与等待者入队线性化。
     std::shared_ptr<WaitNode> selected;
     {
-        // Unlock 与 waiter 发布必须共享同一把队列锁。原子快路径无法
-        // 同时覆盖 waiter 入队和另一个线程重新取得锁的交错，统一在此
-        // 线性化可以避免丢唤醒和“误解锁后来 owner”。
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
-        if ((m_impl->m_state.load(std::memory_order_acquire) &
-             Impl::kLocked) == 0U) {
-            throw std::logic_error("go2cpp::sync::Mutex unlock of unlocked mutex");
+        std::uint8_t state = m_impl->m_state.load(std::memory_order_acquire);
+        if ((state & Impl::kLocked) == 0U) {
+            throw std::logic_error(
+                "go2cpp::sync::Mutex unlock of unlocked mutex");
         }
-        // D3：先让选择器重排队列（只换位置，不改认领语义）；默认无选择器时
-        // 只多一次指针判空，热路径开销可忽略。
+        // D3：先让选择器重排队列（只换位置，不改认领语义）。
         ReorderWaitersForSelector(m_impl->m_waiters);
-        while (!m_impl->m_waiters.empty()) {
-            std::shared_ptr<WaitNode> candidate =
-                std::move(m_impl->m_waiters.front());
-            m_impl->m_waiters.pop_front();
-            if (candidate && !candidate->managed()) {
-                m_impl->m_native_waiters.fetch_sub(
-                    1U, std::memory_order_release);
+
+        if ((state & Impl::kStarving) != 0U) {
+            // 饥饿模式：kLocked 不释放，所有权直接交给 FIFO 队首。
+            // 新来者看到 kStarving 只能入队，不能插队。
+            while (!m_impl->m_waiters.empty()) {
+                std::shared_ptr<WaitNode> candidate =
+                    std::move(m_impl->m_waiters.front());
+                m_impl->m_waiters.pop_front();
+                if (candidate && !candidate->managed()) {
+                    m_impl->m_native_waiters.fetch_sub(
+                        1U, std::memory_order_release);
+                }
+                if (candidate && candidate->TryFinishAndGrant()) {
+                    selected = std::move(candidate);
+                    break;
+                }
             }
-            if (candidate && candidate->TryFinish(WaitResult::kNotified)) {
-                selected = std::move(candidate);
-                break;
+            if (selected) {
+                state = static_cast<std::uint8_t>(state & ~Impl::kWoken);
+                if (m_impl->m_waiters.empty()) {
+                    state = static_cast<std::uint8_t>(state & ~Impl::kWaiter);
+                } else {
+                    state = static_cast<std::uint8_t>(state | Impl::kWaiter);
+                }
+                m_impl->m_state.store(state, std::memory_order_release);
+            } else {
+                // 队列已空：饥饿模式结束，真正释放锁并回到正常模式。
+                m_impl->m_state.store(0U, std::memory_order_release);
             }
-        }
-        if (!selected) {
-            m_impl->m_state.store(0U, std::memory_order_release);
+        } else if ((state & Impl::kWoken) != 0U) {
+            // 正常模式下已有唤醒令牌在途：只释放锁，不再唤醒第二个，
+            // 避免「每个 Unlock 一次 futex wake」的唤醒风暴。令牌持有
+            // 者会获取锁或重新入队，并在那时消费令牌。
+            state = static_cast<std::uint8_t>(state & ~Impl::kLocked);
+            if (m_impl->m_waiters.empty()) {
+                state = static_cast<std::uint8_t>(state & ~Impl::kWaiter);
+            }
+            m_impl->m_state.store(state, std::memory_order_release);
         } else {
-            m_impl->m_state.store(
-                static_cast<std::uint8_t>(Impl::kLocked |
-                                           (m_impl->m_waiters.empty()
-                                                ? 0U
-                                                : Impl::kWaiter)),
-                std::memory_order_release);
+            // 正常模式：先摘除一个等待者并置唤醒令牌，再把锁真正释放。
+            while (!m_impl->m_waiters.empty()) {
+                std::shared_ptr<WaitNode> candidate =
+                    std::move(m_impl->m_waiters.front());
+                m_impl->m_waiters.pop_front();
+                if (candidate && !candidate->managed()) {
+                    m_impl->m_native_waiters.fetch_sub(
+                        1U, std::memory_order_release);
+                }
+                if (candidate && candidate->TryFinish(WaitResult::kNotified)) {
+                    selected = std::move(candidate);
+                    break;
+                }
+            }
+            if (selected) {
+                state = static_cast<std::uint8_t>(
+                    (state & ~Impl::kLocked) | Impl::kWoken);
+                if (m_impl->m_waiters.empty()) {
+                    state = static_cast<std::uint8_t>(state & ~Impl::kWaiter);
+                } else {
+                    state = static_cast<std::uint8_t>(state | Impl::kWaiter);
+                }
+                m_impl->m_state.store(state, std::memory_order_release);
+            } else {
+                m_impl->m_state.store(0U, std::memory_order_release);
+            }
         }
-        // 选定 waiter 后锁在逻辑上仍保持持有：所有权直接交给 FIFO 队首，
-        // 因而 TryLock 调用者不能插队。
     }
     // step4: 锁外唤醒（与 LockImpl 的 park 路径配对；持队列锁唤醒会死锁）。
     if (selected) {
         selected->Wake();
     }
 }
+
 
 void Mutex::lock() {
     if (!Lock()) {

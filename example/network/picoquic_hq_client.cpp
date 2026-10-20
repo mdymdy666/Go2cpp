@@ -19,7 +19,9 @@
 #include "go2cpp/network/quic/picoquic_connection.hpp"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -75,6 +77,30 @@ public:
             return 0;  // 超时也算"暂时没数据"，由上层决定是否继续
         }
         return static_cast<std::size_t>(n);
+    }
+
+    /**
+     * @brief 带等待上限的读（QUIC 封装的 D02/D06 契约）。
+     *
+     * 用 `poll()` 等可读而不是 `recv` 硬阻塞：等待上限由协议层按
+     * 「剩余 deadline / picoquic 下一个定时器」算好传进来，单次不会超过它。
+     * 不实现本方法时基类默认退化为 `Read()`，`Send`/`Receive` 的 5s 超时
+     * 就可能被一次长阻塞击穿。
+     */
+    std::size_t ReadWithTimeout(std::uint8_t* buffer, std::size_t capacity,
+                                int timeout_ms) override {
+        if (m_socket < 0) {
+            return 0;
+        }
+        struct pollfd pfd{m_socket, POLLIN, 0};
+        int rc = 0;
+        do {
+            rc = ::poll(&pfd, 1, timeout_ms < 0 ? -1 : timeout_ms);
+        } while (rc < 0 && errno == EINTR);
+        if (rc <= 0) {
+            return 0;  // 等待超时（或 poll 出错）
+        }
+        return Read(buffer, capacity);
     }
 
     std::size_t Write(const std::uint8_t* data, std::size_t length) override {

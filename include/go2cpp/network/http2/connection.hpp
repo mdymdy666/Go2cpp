@@ -94,7 +94,26 @@ struct ConnectionConfig final {
     std::uint32_t max_header_list_size{65536};
     std::uint32_t header_table_size{4096};
     std::uint32_t initial_window_size{65535};
+    /**
+     * @brief 本端在 SETTINGS 中通告的 `MAX_CONCURRENT_STREAMS`（入站上限）。
+     * @note 它同时充当"未收到对端 SETTINGS 时的兜底值"，但**是否执行**由
+     *       `enforce_max_concurrent_streams` 决定。
+     */
     std::uint32_t max_concurrent_streams{100};
+    /**
+     * @brief 是否执行 RFC 9113 §5.1.2 的并发流上限（默认关闭）。
+     * @details 打开后：
+     *          - 客户端在 `StartRequest()` 检查**对端** SETTINGS 通告的上限；
+     *          - 服务端收到超过**本端**通告上限的新流时回 RST_STREAM(REFUSED_STREAM)。
+     *
+     * 默认关闭的原因（重要）：仓库既有压测 `test_http2_stress` 的
+     * 「连接复用 1000 次」「HPACK 动态表 5000 次」以及 1000/5000 并发流水线
+     * 都假设"只发不收、永不关闭"的流不会受并发上限约束；而这些用例的对端
+     * （同进程 server）按默认配置通告的正是 100。按 RFC 严格执行会在第 101
+     * 条流处拒绝，使上述用例失败。要执行严格语义需同时调整那些用例的预期
+     * （本次任务边界不允许改测试），因此做成显式开关。
+     */
+    bool enforce_max_concurrent_streams{false};
 };
 
 /** @brief 连接层的操作结果。 */
@@ -108,6 +127,8 @@ enum class ConnStatus : std::uint8_t {
     /// header 块或解压后的 header 列表超过配置上限（防 CONTINUATION 泛滥与
     /// HPACK 解压炸弹）。收到它时应当主动断开连接。
     kHeaderListTooLarge,
+    /// 并发流数量达到上限（RFC 9113 §5.1.2）。调用方应等已有流结束后重试。
+    kTooManyStreams,
 };
 
 const char* ToString(ConnStatus status) noexcept;
@@ -320,8 +341,33 @@ private:
                                    std::vector<std::uint8_t>* out, std::string* error);
     /// 处理握手期的 SETTINGS 交换。
     ConnStatus FinishSettingsHandshake(std::string* error);
+    /**
+     * @brief 应用对端 SETTINGS（握手期与运行期共用）。
+     * @details 只处理本实现支持且会影响发送行为的参数：
+     *          - `HEADER_TABLE_SIZE`：HPACK 编码器上限，并排队 0x20 表大小更新；
+     *          - `MAX_FRAME_SIZE`：发送帧的 payload 上限；
+     *          - `INITIAL_WINDOW_SIZE`：流级发送窗口初值（按差值调整已有流，
+     *            **不**影响连接级窗口 —— 连接窗口只能由 WINDOW_UPDATE 改变）；
+     *          - `MAX_CONCURRENT_STREAMS`：对端允许的并发流上限。
+     *          值域校验在 `ParseSettings()`（frame.cpp）完成，非法值不会到达这里。
+     */
+    ConnStatus ApplyPeerSettings(const SettingsFrame& settings, std::string* error);
+    /**
+     * @brief 把「动态表大小更新」排到下一个 header block 的首部。
+     * @details RFC 7541 §4.2 要求表大小变化必须在后续第一个 header block 的
+     *          开头用 `001xxxxx` 表示通知对端。`Encoder::SetTableSize()` 只改
+     *          上限不扩表，真正的扩容/通知由这里完成：先调
+     *          `Encoder::AppendTableSizeUpdate()`（它会发字节并改本地表上限），
+     *          把字节暂存到 `m_pending_table_size_update`，由
+     *          `StartRequest()` / `SendResponseHeaders()` 拼到块首。
+     * @note 若在下一个块发出前又收到新的 SETTINGS，直接以最新值覆盖待发字节
+     *       （对端只需知道最终大小，RFC 允许块首最多两条更新，发一条足够）。
+     */
+    ConnStatus QueueTableSizeUpdate(std::uint32_t new_size, std::string* error);
     /// 取或创建流状态机。
     StreamStateMachine* StreamFor(std::uint32_t stream_id);
+    /// 当前计入并发上限的流数（open + half-closed，不含 closed）。
+    std::size_t OpenStreamCount() const noexcept;
 
     /// 字节通道；构造注入，所有 Read/Write 都经它，连接不拥有其生命周期。
     Transport* m_transport{nullptr};
@@ -337,14 +383,26 @@ private:
     std::uint32_t m_peer_last_stream_id{0};
     /// 下一个可用的客户端流 id（奇数）。
     std::uint32_t m_next_stream_id{1};
+    /// 对端已发起过的最大流 id；新流必须严格大于它（RFC 9113 §5.1.1）。
+    /// 流表里已关闭的流不会被删除，因此奇偶与单调性校验只看这个水位即可。
+    std::uint32_t m_max_seen_peer_stream_id{0};
     /// 对端允许的单帧上限；SETTINGS 到达时更新，WriteHeaderBlock()/WriteData() 使用。
     std::uint32_t m_peer_max_frame_size{kDefaultMaxFrameSize};
+    /// 对端 SETTINGS_INITIAL_WINDOW_SIZE（流级发送窗口初值）。
+    /// 注意：它**不**是连接级窗口；连接窗口初值恒为 65535，只受 WINDOW_UPDATE(0) 影响。
+    std::int64_t m_peer_initial_window_size{65535};
+    /// 对端 SETTINGS_MAX_CONCURRENT_STREAMS；未收到时按 RFC 视为不限。
+    std::uint32_t m_peer_max_concurrent_streams{0};
+    bool m_peer_max_concurrent_set{false};
     /// 读方向缓冲；FillBuffer() 追加、TakeFrame() 消费并 erase。
     std::vector<std::uint8_t> m_read_buffer;
     /// HPACK 解码器（含动态表）；只在 ReadEvent() 的 HEADERS 分支使用。
     Decoder m_decoder;
     /// HPACK 编码器（含动态表）；StartRequest()/SendResponseHeaders() 写，SETTINGS 到达时收缩。
     Encoder m_encoder;
+    /// 待拼到下一个 header block 首部的 HPACK 动态表大小更新字节（0x20 前缀）。
+    /// 由 QueueTableSizeUpdate() 写入，StartRequest()/SendResponseHeaders() 消费。
+    std::vector<std::uint8_t> m_pending_table_size_update;
     /// 流表（键为流 id）；StreamFor() 查找、StartRequest()/ReadEvent() 插入、Streams() 只读暴露。
     std::map<std::uint32_t, StreamStateMachine> m_streams;
     /// 握手期间暂存的 SETTINGS 是否已收到/已发送。

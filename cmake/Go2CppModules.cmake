@@ -40,6 +40,9 @@ add_library(go2cpp_io
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io_backend.cpp)
 add_library(go2cpp_log ${CMAKE_CURRENT_SOURCE_DIR}/src/logging/log.cpp)
+# TLS（TlsTransport）依赖 OpenSSL。公共头 tls_transport.hpp 只前置声明
+# SSL/SSL_CTX，OpenSSL 头不会泄漏给使用方，因此作为 PRIVATE 依赖接入。
+find_package(OpenSSL REQUIRED)
 add_library(go2cpp_network
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/address.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/byte_array.cpp
@@ -47,7 +50,8 @@ add_library(go2cpp_network
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/socket.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/websocket.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/sse.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/sse.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/tls_transport.cpp)
 add_library(go2cpp_config
     ${CMAKE_CURRENT_SOURCE_DIR}/src/config/config.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/config/so_manifest.cpp
@@ -262,6 +266,8 @@ target_link_libraries(go2cpp_sync PUBLIC go2cpp_context go2cpp_scheduler)
 target_link_libraries(go2cpp_future PUBLIC go2cpp_context go2cpp_scheduler)
 target_link_libraries(go2cpp_io PUBLIC go2cpp_context go2cpp_scheduler)
 target_link_libraries(go2cpp_network PUBLIC go2cpp_io go2cpp_context go2cpp_scheduler go2cpp_sync)
+# TlsTransport 的实现细节：OpenSSL 只出现在 .cpp 里。
+target_link_libraries(go2cpp_network PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_hook PUBLIC go2cpp_io go2cpp_fiber
                           go2cpp_config ${CMAKE_DL_LIBS})

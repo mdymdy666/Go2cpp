@@ -113,10 +113,10 @@
  *   见下）；
  * - 响应头只解出 `content-type`，任意名字的响应头被 picohttp 解析器跳过；
  * - 不使用 QPACK 动态表（只用静态表 + literal），压缩率较低；
- * - 超时**不可配置**：`Impl::timeout_ms` 初值就是 `kDefaultTimeoutMs`，
- *   本类没有 setter / 构造参数能改它；
- * - `Connect` 里 `verify_peer = false`（沿用项目现有 QUIC 封装的本地自签
- *   默认），生产环境必须另行打开证书校验；
+ * - 超时可通过 `Options::timeout_ms` 配置；`Send`/`Receive` 用剩余预算驱动
+ *   `PollFor`，不再被一次阻塞读击穿；
+ * - `Connect` 的默认 `verify_peer = false`（本地自签场景），生产应使用
+ *   `Options{verify_peer=true}`；开启后自签名证书会握手失败；
  * - 没有 0-RTT、没有服务端推送处理、没有连接迁移/多路径。
  *
  * **本文件没有未实现的桩**：`client.cpp` 中 `Connect` / `Send` / `Receive` /
@@ -266,6 +266,36 @@ public:
     /// 默认超时：握手/等待响应的总时长（毫秒）。
     static constexpr std::uint32_t kDefaultTimeoutMs = 5000;
 
+    /// 默认响应体上限：64 MiB（D08；0 表示不限制，生产不建议）。
+    static constexpr std::size_t kDefaultMaxResponseBytes = 64U * 1024U * 1024U;
+
+    /**
+     * @brief 连接/请求的可选配置。
+     *
+     * 全部字段都有安全/兼容的默认值；旧的两参数 `Connect` 等价于 `Options{}`。
+     */
+    struct Options {
+        /// 握手与单次等待响应的总时长（毫秒）。
+        std::uint32_t timeout_ms{kDefaultTimeoutMs};
+
+        /**
+         * @brief 是否校验对端证书（D04）。
+         *
+         * 默认 `false` 兼容本地自签名测试；生产必须设为 `true`，此时
+         * `cert_root_file_name` 为空会自动使用系统信任库，自签名证书会握手失败。
+         */
+        bool verify_peer{false};
+
+        /// 根证书（CA bundle）PEM 路径；`verify_peer == false` 时忽略。
+        std::string cert_root_file_name;
+
+        /// `:authority`（如 "example.com:8443"）。为空时退回 SNI（旧行为）。
+        std::string authority;
+
+        /// 响应体最大字节数，超出则关闭连接并报错；0 表示不限制。
+        std::size_t max_response_bytes{kDefaultMaxResponseBytes};
+    };
+
     /**
      * @brief 建立到 `sni` 的 HTTP/3 连接（ALPN 固定为 "h3"）。
      *
@@ -274,12 +304,23 @@ public:
      *
      * @param transport 字节通道，**必须一次 `Read` 返回一个完整 datagram**。
      *                  不接管所有权。
-     * @param sni TLS SNI，同时用作 `:authority`。不能为空。
+     * @param sni TLS SNI，同时用作 `:authority`（可用 `Options::authority` 覆盖）。
+     *            不能为空。
      * @param error 失败原因；可为 nullptr。
      * @return 成功返回对象，失败返回 nullptr。
      */
     static std::unique_ptr<Client> Connect(net::http2::Transport* transport,
                                            const std::string& sni, std::string* error);
+
+    /**
+     * @brief 带配置的建连重载（超时 / 证书校验 / authority / 响应体上限）。
+     *
+     * @param options 见 `Options`；`options.verify_peer == true` 且未给 CA 时
+     *                自动使用系统信任库，找不到则 `Connect` 直接失败（fail-closed）。
+     */
+    static std::unique_ptr<Client> Connect(net::http2::Transport* transport,
+                                           const std::string& sni, const Options& options,
+                                           std::string* error);
 
     ~Client();
     Client(const Client&) = delete;
@@ -312,9 +353,22 @@ public:
     /**
      * @brief 推进一次收发：写出所有待发包，读入一个 datagram 并交给 picoquic。
      *
+     * 单次最多等待约 1s，调用方不会被无界阻塞（D02/D06）。
+     *
      * @return 连接仍可用返回 true；连接已关闭/出错返回 false 并填 `error`。
      */
     bool Poll(std::string* error);
+
+    /**
+     * @brief 主动关闭连接（发送 CONNECTION_CLOSE），幂等。
+     *
+     * 析构也会做 best-effort 关闭；需要确认关闭帧写出或自定义关闭码时调用本方法。
+     *
+     * @param application_error_code 应用层关闭码（0 = 正常关闭）。
+     * @param error 写失败原因；可为 nullptr。
+     * @return 关闭帧是否成功写出。
+     */
+    bool Close(std::uint64_t application_error_code = 0, std::string* error = nullptr);
 
     /// TLS 1.3 握手是否已完成。
     bool HandshakeComplete() const noexcept;

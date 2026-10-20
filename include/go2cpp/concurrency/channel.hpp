@@ -75,6 +75,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <thread>
 #include <type_traits>
 #include <typeinfo>
 #include <unordered_map>
@@ -490,6 +491,67 @@ inline ContextTimePoint SaturatingDeadline(ContextDuration timeout) noexcept {
     return ContextTimePoint::min();
   }
   return now + timeout;
+}
+
+// 是否为「纯原生线程」——只有这种上下文可以在 park 前做用户态自旋。
+// 受管 Fiber 自旋会占住 carrier M 线程，手动 Fiber 没有 Scheduler 后端；
+// 两者的判定需要 Scheduler/Fiber 的完整定义，因此实现放在 channel.cpp。
+bool CanSpinWait() noexcept;
+
+// 自适应自旋预算（单位：PAUSE 迭代次数，本机 1 次 ≈ 9ns）。
+//
+// 「短交接」场景（cap0/cap1 1P1C、request-response）里对端通常只需几微秒
+// 就会到达，先自旋一小段就能完全绕开 futex 的睡眠 + 唤醒；而真正会久等的
+// 场景必须尽快回到内核睡眠，不能烧 CPU。
+//
+// 调参不能只看「自旋失败就缩短」：1P1C 场景里等待方第一次自旋时对端往往
+// 刚从 futex 醒来（约 4µs），固定的短预算会永远失败并把系统锁在
+// 「自旋 2µs + park 4µs」的慢平衡上。因此这里用 park 的实际时长做反馈：
+// - park 很短（≤30µs）说明"其实再等一会就来了" → 预算翻倍；
+// - park 较长说明对端真的慢 → 预算折半。
+// 一旦自旋能覆盖实际交接延迟，后续消息就完全在用户态完成，不再 park。
+// 上限取 2048（≈18µs）：再长只会在单核/超订场景放大"占着 CPU 等对端"的
+// 最坏情况，对命中率没有明显帮助。
+inline int& SpinBudget() noexcept {
+  static thread_local int budget = 512;
+  return budget;
+}
+
+// 根据一次实际 park 的时长调整下一次自旋预算。
+inline void ObserveParkDurationNs(long long parked_ns) noexcept {
+  int& budget = SpinBudget();
+  if (parked_ns <= 30000) {
+    budget = budget >= 2048 ? 2048 : budget * 2;
+  } else {
+    budget = budget <= 128 ? 128 : budget / 2;
+  }
+}
+
+// 在不持有 Channel::m_mutex 的情况下等待 `signaled` 被 release 置位。
+// 返回 true 表示等到；false 表示预算耗尽，调用方应重新加锁并转入 park。
+//
+// 每 512 次 PAUSE（约 4.5µs）让出一次 CPU：如果对端恰好被调度到同一个核
+// （容器 CPU 配额、taskset 单核、宿主超订），纯自旋会把对端饿到时间片耗尽，
+// 反而比直接 park 慢一个数量级（实测可到 ~20µs/消息）；yield 让对端先跑，
+// 跨核场景则只多出一次很短的调度往返。
+inline bool SpinForSignal(const std::atomic<bool>& signaled) noexcept {
+  const int limit = SpinBudget();
+  for (int i = 0; i < limit; ++i) {
+    if (signaled.load(std::memory_order_acquire)) {
+      return true;
+    }
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+    if ((i & 511) == 511) {
+      std::this_thread::yield();
+    }
+  }
+  return signaled.load(std::memory_order_acquire);
 }
 
 // 一个 Select 调用的所有已挂起 case 共享此状态。通道操作在提交传输前必须
@@ -918,10 +980,12 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       }
     }
     for (auto& sender : senders) {
-      sender->cv.notify_one();
+      sender->Signal();
+      sender->NotifyIfParked();
     }
     for (auto& receiver : receivers) {
-      receiver->cv.notify_one();
+      receiver->Signal();
+      receiver->NotifyIfParked();
     }
     NotifyChange();
     return {ChannelStatus::kReady, {}};
@@ -1050,7 +1114,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         m_senders.pop_front();
         sender->accepted = true;
         sender->status = ChannelStatus::kReady;
-        sender->cv.notify_one();
+        sender->Signal();
+        sender->NotifyIfParked();
         ++m_generation;
         lock.unlock();
         NotifyChange();
@@ -1163,7 +1228,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       receiver->ready = true;
       receiver->status = ChannelStatus::kReady;
       m_receivers.pop_front();
-      receiver->cv.notify_one();
+      receiver->Signal();
+      receiver->NotifyIfParked();
       ++m_generation;
       lock.unlock();
       NotifyChange();
@@ -1296,6 +1362,35 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     std::shared_ptr<detail::SelectWaitState> select_state;
     std::size_t select_index{static_cast<std::size_t>(-1)};
     core::ParkingCondition cv;
+    /// @brief 交接/关闭结果的原子发布位，供等待方在 park 前短自旋观察。
+    ///        结果标志仍由 Channel::m_mutex 保护；这里只负责"可以醒了"的
+    ///        release/acquire 握手，避免自旋方永久错过一次交接。
+    /// @brief 该等待者是否在 park 前自旋（仅 capacity<=1 时可能为 true）。
+    ///        由等待方在入队前写入；完成方在 m_mutex 内读取。cap>1 的等待者
+    ///        从不自旋，完成方因此可以完全跳过 signaled/parked 的原子维护。
+    bool spin_wait{false};
+    std::atomic<bool> signaled{false};
+    /// @brief 等待方是否已经真正进入 ParkingCondition（持 m_mutex 写）。
+    ///        对端据此决定要不要 notify：仍在自旋的等待者会自己看到
+    ///        `signaled`，跳过 notify 可省掉一次 ParkingCondition 内部锁；
+    ///        Close 一次唤醒大量等待者时也能跳过已经醒了的节点。
+    std::atomic<bool> parked{false};
+
+    /// @brief 在持 m_mutex 并写完结果标志后调用（只对自旋通道需要）。
+    void Signal() noexcept {
+      if (spin_wait) {
+        signaled.store(true, std::memory_order_release);
+      }
+    }
+
+    /// @brief 只有真正 park 的等待者才需要 ParkingCondition 唤醒。
+    ///        自旋中的等待者会在 `signaled` 上看到结果；跳过 notify 可省掉
+    ///        ParkingCondition 内部互斥量，也避免 Close 对已醒节点做无效唤醒。
+    void NotifyIfParked() noexcept {
+      if (!spin_wait || parked.load(std::memory_order_relaxed)) {
+        cv.notify_one();
+      }
+    }
   };
 
   /**
@@ -1328,6 +1423,33 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     std::shared_ptr<detail::SelectWaitState> select_state;
     std::size_t select_index{static_cast<std::size_t>(-1)};
     core::ParkingCondition cv;
+    /// @brief 交接/关闭结果的原子发布位；语义见 PendingSend::signaled。
+    /// @brief 该等待者是否在 park 前自旋（仅 capacity<=1 时可能为 true）。
+    ///        由等待方在入队前写入；完成方在 m_mutex 内读取。cap>1 的等待者
+    ///        从不自旋，完成方因此可以完全跳过 signaled/parked 的原子维护。
+    bool spin_wait{false};
+    std::atomic<bool> signaled{false};
+    /// @brief 等待方是否已经真正进入 ParkingCondition（持 m_mutex 写）。
+    ///        对端据此决定要不要 notify：仍在自旋的等待者会自己看到
+    ///        `signaled`，跳过 notify 可省掉一次 ParkingCondition 内部锁；
+    ///        Close 一次唤醒大量等待者时也能跳过已经醒了的节点。
+    std::atomic<bool> parked{false};
+
+    /// @brief 在持 m_mutex 并写完结果标志后调用（只对自旋通道需要）。
+    void Signal() noexcept {
+      if (spin_wait) {
+        signaled.store(true, std::memory_order_release);
+      }
+    }
+
+    /// @brief 只有真正 park 的等待者才需要 ParkingCondition 唤醒。
+    ///        自旋中的等待者会在 `signaled` 上看到结果；跳过 notify 可省掉
+    ///        ParkingCondition 内部互斥量，也避免 Close 对已醒节点做无效唤醒。
+    void NotifyIfParked() noexcept {
+      if (!spin_wait || parked.load(std::memory_order_relaxed)) {
+        cv.notify_one();
+      }
+    }
   };
 
   /**
@@ -1519,7 +1641,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       receiver->ok = true;
       receiver->ready = true;
       receiver->status = ChannelStatus::kReady;
-      receiver->cv.notify_one();
+      receiver->Signal();
+      receiver->NotifyIfParked();
       ++m_generation;
       lock.unlock();
       NotifyChange();
@@ -1550,9 +1673,19 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
     // step5: 既无接收者又无空位——登记 PendingSend，并挂 context 回调
     // （取消时立刻唤醒，不必等下一个 send/recv）。
+    //
+    // 自旋只对 capacity <= 1 的通道启用：有缓冲通道（cap64/1024）的吞吐依赖
+    // "等待者睡眠期间生产者批量填缓冲"；自旋会让等待者醒来后逐条 rendezvous，
+    // 把批量交接退化成每消息一次 pending 分配 + 交接（实测 cap1024 从
+    // ~40ns/msg 退化到 ~100ns/msg）。容量 1 没有批量空间，cap0 更是纯 rendezvous。
+    // 受管 Fiber 不参与自旋，否则会占住 carrier M 线程。
+    const bool spin_before_park = detail::CanSpinWait() && m_capacity <= 1;
     std::shared_ptr<PendingSend> pending;
     try {
       pending = std::make_shared<PendingSend>(std::move(value));
+      // 必须在入队前写好：完成方会在 m_mutex 内根据它决定是否维护
+      // signaled/parked 原子协议（cap>1 的等待者直接 park，不需要）。
+      pending->spin_wait = spin_before_park;
       m_senders.emplace_back(pending);
     } catch (...) {
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
@@ -1570,7 +1703,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
     }
 
     // step6: park 等待循环——每次唤醒后重检 accepted/closed/cancelled/
-    // context/deadline，任一成立就清理并返回。
+    // context/deadline，任一成立就清理并返回。原生线程在 park 前先做一次
+    // 自适应短自旋，自旋成功即免掉一次 futex 睡眠 + 唤醒。
+    bool spin_attempted = false;
     for (;;) {
       if (pending->accepted) {
         return {ChannelStatus::kReady, {}};
@@ -1609,6 +1744,25 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         return {ChannelStatus::kTimedOut, pending->error};
       }
 
+      if (spin_before_park && !spin_attempted) {
+        // 自旋期间不持 m_mutex，对端可以正常把它认领走；返回后重新加锁
+        // 并按最新标志裁决，若仍无结果才真正 park。
+        spin_attempted = true;
+        lock.unlock();
+        (void)detail::SpinForSignal(pending->signaled);
+        lock.lock();
+        continue;
+      }
+
+      if (spin_before_park) {
+        pending->parked.store(true, std::memory_order_relaxed);
+      }
+      // 只有启用自旋的通道才需要 park 时长反馈；有缓冲通道（cap>1）的
+      // 高频 park 路径不能为一次 clock_gettime 付费（64 线程压测下实测
+      // 会带来 ~10% 的回退）。
+      const auto park_start = spin_before_park
+                                  ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
       if (deadline.has_value()) {
         auto wait_for = *deadline - std::chrono::steady_clock::now();
         pending->cv.wait_for(lock, wait_for, [&] {
@@ -1620,6 +1774,16 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           return pending->accepted || pending->closed || pending->cancelled ||
                  (context && context->IsDone());
         });
+      }
+      if (spin_before_park) {
+        pending->parked.store(false, std::memory_order_relaxed);
+      }
+      if (spin_before_park &&
+          pending->signaled.load(std::memory_order_acquire)) {
+        detail::ObserveParkDurationNs(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - park_start)
+                .count());
       }
     }
   }
@@ -1681,7 +1845,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         m_senders.pop_front();
         sender->accepted = true;
         sender->status = ChannelStatus::kReady;
-        sender->cv.notify_one();
+        sender->Signal();
+        sender->NotifyIfParked();
         ++m_generation;
         lock.unlock();
         NotifyChange();
@@ -1694,7 +1859,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
         m_senders.pop_front();
         sender->accepted = true;
         sender->status = ChannelStatus::kReady;
-        sender->cv.notify_one();
+        sender->Signal();
+        sender->NotifyIfParked();
         ++m_generation;
         lock.unlock();
         NotifyChange();
@@ -1725,9 +1891,15 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
               detail::ValueOperationError()};
     }
+    // 与 SendUntil 相同：原生线程在 park 前先做一次自适应短自旋，且只对
+    // capacity <= 1 的通道启用（原因见 SendUntil 的注释：有缓冲通道依赖
+    // 等待者睡眠期间批量填/取缓冲，自旋会把批量交接退化成逐条 rendezvous）。
+    const bool spin_before_park = detail::CanSpinWait() && m_capacity <= 1;
     std::shared_ptr<PendingRecv> pending;
     try {
       pending = std::make_shared<PendingRecv>();
+      // 必须在入队前写好：完成方据此决定是否维护 signaled/parked 协议。
+      pending->spin_wait = spin_before_park;
       m_receivers.emplace_back(pending);
     } catch (...) {
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
@@ -1746,6 +1918,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       }
     }
 
+    bool spin_attempted = false;
     for (;;) {
       if (pending->ready) {
         return {std::move(pending->value), pending->ok, true, pending->status,
@@ -1782,6 +1955,25 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
                 pending->error};
       }
 
+      if (spin_before_park && !spin_attempted) {
+        // 与 SendUntil 相同的「先自旋、后 park」：接收方的交接通常由正在
+        // 发送的对端在几百纳秒内完成，能省掉一次 futex 往返。
+        spin_attempted = true;
+        lock.unlock();
+        (void)detail::SpinForSignal(pending->signaled);
+        lock.lock();
+        continue;
+      }
+
+      if (spin_before_park) {
+        pending->parked.store(true, std::memory_order_relaxed);
+      }
+      // 只有启用自旋的通道才需要 park 时长反馈；有缓冲通道（cap>1）的
+      // 高频 park 路径不能为一次 clock_gettime 付费（64 线程压测下实测
+      // 会带来 ~10% 的回退）。
+      const auto park_start = spin_before_park
+                                  ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
       if (deadline.has_value()) {
         auto wait_for = *deadline - std::chrono::steady_clock::now();
         pending->cv.wait_for(lock, wait_for, [&] {
@@ -1793,6 +1985,16 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
           return pending->ready || pending->cancelled ||
                  (context && context->IsDone());
         });
+      }
+      if (spin_before_park) {
+        pending->parked.store(false, std::memory_order_relaxed);
+      }
+      if (spin_before_park &&
+          pending->signaled.load(std::memory_order_acquire)) {
+        detail::ObserveParkDurationNs(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - park_start)
+                .count());
       }
     }
   }
@@ -1852,7 +2054,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>> {
       }
       sender->accepted = true;
       sender->status = ChannelStatus::kReady;
-      sender->cv.notify_one();
+      sender->Signal();
+      sender->NotifyIfParked();
       m_senders.pop_front();
       break;
     }
@@ -2060,6 +2263,10 @@ struct SelectCase {
   std::function<bool(const std::shared_ptr<detail::SelectWaitState>&,
                      std::size_t)>
       arm_checked;
+  // 可选的「无副作用取消探测」：仅 DoneCase 使用。ctx 已结束时返回
+  // CancelledProbe；Select 在回滚（Cancel）之前会重试它，避免循环里
+  // 因 arm 过的 case 被跳过而漏掉取消分支。
+  std::function<SelectProbe()> cancel_probe;
 
   explicit operator bool() const noexcept {
     return static_cast<bool>(probe) || is_default || static_cast<bool>(arm) ||
@@ -2194,6 +2401,7 @@ SelectCase RecvCase(const ChannelPtr<T>& channel) {
         }
       },
       {},
+      {},
       {}};
   result.arm_checked = [channel](
       const std::shared_ptr<detail::SelectWaitState>& state,
@@ -2255,6 +2463,7 @@ SelectCase SendCase(const ChannelPtr<T>& channel, T value) {
         }
       },
       {},
+      {},
       {}};
   result.arm_checked = [channel, shared_value](
       const std::shared_ptr<detail::SelectWaitState>& state,
@@ -2286,6 +2495,7 @@ inline SelectCase DefaultCase() {
                       return probe;
                     },
                     true,
+                    {},
                     {},
                     {},
                     {},
@@ -2446,7 +2656,13 @@ inline SelectCase DoneCase(const ContextPtr& ctx) {
         }
       },
       {},
-      {}};
+      {},
+      [ctx] {
+        if (ctx && ctx->IsDone()) {
+          return detail::CancelledProbe(ctx);
+        }
+        return SelectProbe{};
+      }};
 }
 
 /**
@@ -2503,6 +2719,7 @@ inline SelectCase AfterCase(std::chrono::steady_clock::time_point deadline) {
           timer->Cancel();
         }
       },
+      {},
       {},
       {}};
 }

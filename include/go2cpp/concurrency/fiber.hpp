@@ -128,11 +128,25 @@ public:
         return 128U * 1024U;
     }
 
-    // 创建 Fiber。function 是主体回调；stack_size 是请求的栈容量（字节），
-    // 非法或过小值会由实现归一化为可用容量；构造失败会抛出异常。
-    /** @brief 创建一个 Fiber。@param function 入口函数。@param stack_size 栈大小。 */
+    // 可变长栈的默认虚拟地址预留量。每个 Fiber 只在栈顶提交初始可用量，
+    // 其余页保持 PROT_NONE，由 SIGSEGV handler 按需 mprotect 增长。
+    /** @brief 返回默认预留的虚拟栈空间（字节）。 */
+    static constexpr std::size_t DefaultStackReserveSize() noexcept {
+        return 8U * 1024U * 1024U;
+    }
+
+    // 创建 Fiber。function 是主体回调；stack_size 是请求的初始提交量
+    // （字节），页对齐后的值决定实际可用栈；stack_reserve_size 是预留的
+    // 虚拟地址空间（0 表示 DefaultStackReserveSize()）。growable 为 false、
+    // reserve 不大于初始提交量、或 GO2CPP_GROWABLE_STACK=0 时退化为固定栈。
+    // 非法或过小值会由实现归一化；构造失败会抛出异常。
+    /** @brief 创建一个 Fiber。@param function 入口函数。@param stack_size 初始栈大小。
+     *  @param stack_reserve_size 预留虚拟地址大小，0 用默认值。
+     *  @param stack_growable 是否允许按需增长。 */
     explicit Fiber(Function function,
-                   std::size_t stack_size = DefaultStackSize());
+                   std::size_t stack_size = DefaultStackSize(),
+                   std::size_t stack_reserve_size = 0,
+                   bool stack_growable = true);
     // Scheduler 专用的 FiberBin 接口。只有已经完成或失败、且不再有
     // 可恢复上下文的内部 G Fiber 才允许回收到创建它的 M 的线程本地池。
     // 普通用户 Fiber 不应调用这两个接口；它们不会跨线程转移仍挂起的
@@ -143,7 +157,9 @@ public:
     /** @brief 从当前 M 的缓存获取或创建 Fiber。 */
     static std::unique_ptr<Fiber> AcquireForScheduler(
         Function function, std::size_t stack_size,
-        std::size_t bin_capacity = 32U);
+        std::size_t bin_capacity = 32U,
+        std::size_t stack_reserve_size = 0,
+        bool stack_growable = true);
     // 把已终态且上下文已释放的 Fiber 放回当前 M 的缓存。fiber 为空或
     // 不满足回收条件时会安全丢弃；bin_capacity 是缓存上限。
     /** @brief 将完成或失败的 Fiber 放回当前 M 缓存。 */

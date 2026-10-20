@@ -26,6 +26,13 @@
 #include "go2cpp/detail/context_backend.hpp"
 #include "go2cpp/fiber_local.hpp"
 
+// 只有 Linux x86_64 + 项目自带的汇编上下文后端才启用按需增长。
+// 其它平台/后端保留固定栈语义，不会安装 SIGSEGV handler。
+#if defined(GO2CPP_USE_NATIVE_CONTEXT) && defined(__linux__) && defined(__x86_64__)
+#define GO2CPP_FIBER_GROWABLE_STACK 1
+#include <ucontext.h>
+#endif
+
 #if !defined(GO2CPP_USE_NATIVE_CONTEXT)
 #include <boost/context/detail/fcontext.hpp>
 #include <boost/context/protected_fixedsize_stack.hpp>
@@ -44,6 +51,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <iterator>
 #include <stdexcept>
@@ -86,6 +96,13 @@
 namespace go2cpp {
 namespace {
 
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+// 当前线程正在运行的 Fiber 栈。只有 growable 栈会写入非空值；SIGSEGV
+// handler 据此判断故障地址是否落在某个可变长栈的未提交区。
+struct FiberStack;
+thread_local FiberStack* t_current_growable_stack = nullptr;
+#endif
+
 thread_local Fiber* s_current_fiber = nullptr;
 // 没有运行真实 Fiber 时，每个 OS 线程仍有一个不可 resume 的根上下文。
 // 调度器在 worker 进入/离开 G 时更新这份元数据，Fiber 首次进入时继承它。
@@ -103,17 +120,39 @@ struct FiberTlsRestore final {
     Fiber* m_previous;
 };
 
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+// resume_locked 可能沿父链循环多次，每次 jump 前把 TLS 指向目标栈，返回
+// 后必须恢复到进入 resume 时的栈；否则 handler 会拿着已释放/错误的栈边界
+// 判断故障。析构函数保证所有 return 路径都恢复。
+struct GrowableStackTlsRestore final {
+    explicit GrowableStackTlsRestore(FiberStack* previous) noexcept
+        : m_previous(previous) {}
+    ~GrowableStackTlsRestore() noexcept {
+        t_current_growable_stack = m_previous;
+    }
+
+    GrowableStackTlsRestore(const GrowableStackTlsRestore&) = delete;
+    GrowableStackTlsRestore& operator=(const GrowableStackTlsRestore&) = delete;
+
+    FiberStack* m_previous;
+};
+#endif
+
 std::atomic<std::uint64_t> s_next_fiber_id{1};
 
 // 受保护栈的映射/解除映射成本远高于一次 Fiber 上下文切换。栈不能在
 // Fiber 仍可恢复时复用，因此只在 Fiber 完成、且其 fcontext 已经失效后
 // 放回缓存。先使用当前 M 的 TLS 缓存，跨 M 销毁时再进入有界全局缓存。
 struct CachedStack {
-    std::size_t size{0};
 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+    std::size_t usable{0};
+    // 0 表示固定栈布局（usable + 1 页 guard）；非 0 表示预留虚拟地址大小。
+    // 缓存键是 (usable, reserve)：两种布局的提交方式不同，不能混用。
+    std::size_t reserve{0};
     void* mapping{nullptr};
     std::size_t mapping_size{0};
 #else
+    std::size_t size{0};
     boost::context::stack_context context{};
 #endif
 };
@@ -223,6 +262,129 @@ std::size_t native_page_size() {
 }
 #endif
 
+#if defined(GO2CPP_FIBER_GROWABLE_STACK)
+// 一次 fault 至少提交 64KiB（16 页），避免深递归时每页一次信号。
+constexpr std::size_t kGrowableStackGrowthGranularity = 64U * 1024U;
+// 故障地址与 rsp 的最大允许距离。函数序言会先 sub rsp 再写局部变量，
+// 因此 rsp 可能已经越过 committed；大帧（大数组/内置 alloca）也可能让
+// 两者相距数十 KiB。超过窗口按野指针/超大帧处理，直接 fatal。
+constexpr std::size_t kGrowableStackFaultWindow = 256U * 1024U;
+constexpr std::size_t kGrowableStackAltStackSize = 256U * 1024U;
+
+// handler 内不允许拿锁/分配；这里依赖 x86_64 上指针与 64 位计数器的
+// 无锁原子实现（C++17 保证 is_always_lock_free 可用于编译期断言）。
+static_assert(std::atomic<std::uintptr_t>::is_always_lock_free,
+              "growable stack handler requires lock-free pointer atomics");
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
+              "growable stack growth counter must be lock-free");
+
+std::atomic<std::uint64_t> s_growable_stack_growth_count{0};
+std::atomic<int> s_growable_handler_state{0};  // 0 未安装 1 已安装 2 失败
+std::mutex s_growable_handler_mutex;
+thread_local bool t_growable_altstack_ready = false;
+thread_local bool t_growable_altstack_attempted = false;
+thread_local volatile sig_atomic_t t_growable_in_handler = 0;
+
+[[noreturn]] void growable_stack_fatal(int sig) noexcept {
+    // 恢复内核默认动作、解除屏蔽后重新投递，保留 core dump 语义。
+    // sigaction/sigprocmask/raise/_exit 都是 async-signal-safe 的。
+    struct sigaction action {};
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    (void)::sigaction(sig, &action, nullptr);
+    sigset_t empty;
+    sigemptyset(&empty);
+    (void)::sigprocmask(SIG_SETMASK, &empty, nullptr);
+    (void)::raise(sig);
+    ::_exit(128 + sig);
+}
+
+// 定义在 FiberStack 之后：handler 需要完整的栈边界访问器。
+void growable_stack_segv_handler(int sig, siginfo_t* info,
+                                 void* raw_context) noexcept;
+
+bool growable_stack_env_enabled() noexcept {
+    const char* value = std::getenv("GO2CPP_GROWABLE_STACK");
+    if (value == nullptr || *value == '\0') {
+        return true;
+    }
+    return value[0] != '0' && std::strcmp(value, "false") != 0 &&
+           std::strcmp(value, "off") != 0;
+}
+
+bool ensure_growable_thread_altstack() noexcept {
+    if (t_growable_altstack_ready) {
+        return true;
+    }
+    if (t_growable_altstack_attempted) {
+        return false;
+    }
+    t_growable_altstack_attempted = true;
+    // 必须用 mmap 而不是 malloc：栈溢出时堆元数据可能已被踩坏，备用栈
+    // 必须是独立的匿名映射。线程退出时不主动 munmap，避免信号处理期间
+    // 释放正在使用的备用栈；进程退出统一回收。
+    void* memory = ::mmap(nullptr, kGrowableStackAltStackSize,
+                          PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) {
+        return false;
+    }
+    stack_t alt{};
+    alt.ss_sp = memory;
+    alt.ss_size = kGrowableStackAltStackSize;
+    alt.ss_flags = 0;
+    if (::sigaltstack(&alt, nullptr) != 0) {
+        ::munmap(memory, kGrowableStackAltStackSize);
+        return false;
+    }
+    t_growable_altstack_ready = true;
+    return true;
+}
+
+bool install_growable_stack_handler() noexcept {
+    int state = s_growable_handler_state.load(std::memory_order_acquire);
+    if (state == 1) {
+        return true;
+    }
+    if (state == 2) {
+        return false;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(s_growable_handler_mutex);
+        state = s_growable_handler_state.load(std::memory_order_relaxed);
+        if (state == 1) {
+            return true;
+        }
+        if (state == 2) {
+            return false;
+        }
+        struct sigaction action {};
+        action.sa_sigaction = &growable_stack_segv_handler;
+        sigemptyset(&action.sa_mask);
+        // 不加 SA_NODEFER：handler 执行期间屏蔽 SIGSEGV，配合 TLS 重入标志
+        // 把「handler 内再次 fault」变成明确的 fatal，而不是无限递归。
+        action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        if (::sigaction(SIGSEGV, &action, nullptr) != 0) {
+            s_growable_handler_state.store(2, std::memory_order_release);
+            return false;
+        }
+        s_growable_handler_state.store(1, std::memory_order_release);
+        return true;
+    } catch (...) {
+        s_growable_handler_state.store(2, std::memory_order_release);
+        return false;
+    }
+}
+
+bool ensure_growable_thread_support() noexcept {
+    // 先装备用栈，再装进程级 handler：handler 一装好，任何线程上的
+    // SIGSEGV 都会进入它，因此当前线程必须已经能安全接收信号。
+    return ensure_growable_thread_altstack() &&
+           install_growable_stack_handler();
+}
+#endif
+
 std::size_t checked_stack_mapping_size(std::size_t usable_size,
                                        std::size_t page_size) {
     if (page_size == 0 || usable_size >
@@ -250,22 +412,20 @@ std::size_t align_stack_size(std::size_t requested, std::size_t page_size) {
 }
 #endif
 
-// 归一化用户请求的栈大小：0 用默认值；有原生上下文时至少 2 页
-// （1 页可用 + 1 页 guard），并检查上限。
-// 2 页下限的原因：guard page 要从总大小里扣掉，小于 2 页就没有可用栈了。
+// 归一化初始提交量：0 用 Fiber::DefaultStackSize()（直接构造 Fiber 的
+// 默认值 128KiB）；页对齐；下限 1 页。注意调度器配置的默认请求是 2048，
+// 页对齐后是 4096（1 页），符合 Go 的 2KB 初始栈在 4KB 页上的归一化规则：
+//   initial_usable = max(page_align_up(fiber_stack_size), 1 * page)
+// 固定栈回退仍需要额外的 guard page，所以上限检查保留 checked_mapping_size。
 std::size_t normalize_stack_size(std::size_t requested) {
     if (requested == 0) {
         requested = Fiber::DefaultStackSize();
     }
 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
     const auto page_size = native_page_size();
-    if (page_size > std::numeric_limits<std::size_t>::max() / 2U) {
-        throw std::length_error("fiber minimum stack size overflow");
-    }
-    const auto minimum = page_size * 2U;
     const auto maximum_usable =
         std::numeric_limits<std::size_t>::max() - page_size;
-    const auto at_least_minimum = std::max(requested, minimum);
+    const auto at_least_minimum = std::max(requested, page_size);
     if (at_least_minimum > maximum_usable) {
         throw std::length_error("fiber stack size is too large");
     }
@@ -273,8 +433,8 @@ std::size_t normalize_stack_size(std::size_t requested) {
     if (aligned > maximum_usable) {
         throw std::length_error("fiber aligned stack size is too large");
     }
-    // 提前检查 guard page 加法，确保尚未 resume 的 Fiber 也不会保存
-    // 一个随后会回绕的映射尺寸。
+    // 提前检查固定栈回退的 guard page 加法，确保尚未 resume 的 Fiber
+    // 也不会保存一个随后会回绕的映射尺寸。
     (void)checked_stack_mapping_size(aligned, page_size);
     return aligned;
 #else
@@ -301,45 +461,76 @@ std::size_t normalize_stack_size(std::size_t requested) {
 #endif
 }
 
+#if defined(GO2CPP_FIBER_GROWABLE_STACK)
+// 归一化预留区：0 → 默认 8MiB；页对齐；至少覆盖初始提交量。
+// 只有 reserve > usable 时才可能启用增长；具体退化在 FiberStack 构造中。
+std::size_t normalize_stack_reserve_size(std::size_t requested,
+                                          std::size_t usable,
+                                          std::size_t page_size) {
+    if (requested == 0) {
+        requested = Fiber::DefaultStackReserveSize();
+    }
+    if (requested < usable) {
+        requested = usable;
+    }
+    return align_stack_size(requested, page_size);
+}
+#endif
+
 /**
- * @brief 一个 Fiber 的独立栈：映射 + guard page + 可选 Valgrind 注册。
+ * @brief 一个 Fiber 的独立栈：大预留 + 顶部初始提交 + 可选按需增长。
  *
- * ## 定位
+ * ## 两种布局
  *
- * 每个 `Fiber::Impl` 持有一个。固定大小（`kDefaultFiberStackSize`，默认 128KiB，
- * 经 `normalize_stack_size` 页对齐与上下界夹紧后使用）。
+ * - growable（Linux/x86_64 + 原生上下文 + 环境变量允许）：
+ *     base = mmap(reserve, PROT_NONE, MAP_NORESERVE)
+ *     top  = base + reserve
+ *     committed = top - initial_usable
+ *     mprotect(committed, initial_usable, RW)
+ *   未提交区 [base, committed) 天然是 guard；栈地址（top/base）不变，
+ *   增长只是 committed 向下移动，因此栈上的局部变量指针始终有效。
+ * - 固定栈（关闭增长/reserve 不足/非原生后端）：
+ *   保留旧布局，usable + 1 页 PROT_NONE guard，避免退化路径改变语义。
  *
- * ## 为什么是固定独立栈而不是共享栈
+ * ## 增长
  *
- * 共享栈（coost 风格）每次切换要拷栈，独立栈不用；代价是内存。本项目选
- * 「独立栈 + 池化」，把建栈成本摊掉（见文件头的「与 coost 的取舍差异」）。
- * 这也是 s2/s4 这些短连接场景能跑满的前提。
+ * SIGSEGV handler 在故障地址落在 [base, committed)、rsp 落在预留区且两者
+ * 距离不超过 256KiB 时，以 64KiB 为单位向下 mprotect，然后直接 return。
+ * handler 只调用 async-signal-safe 函数，事件计数用原子变量，不打印日志。
  *
- * ## guard page
+ * ## 池化
  *
- * `checked_mapping_size` 在映射里额外的保护页（`mprotect(PROT_NONE)`），
- * 栈溢出会立刻 SIGSEGV 而不是静默破坏相邻映射 —— 这类 bug 没有 guard page
- * 时表现为「毫不相关的对象被写坏」，排查成本极高。
+ * 缓存键是 (initial_usable, reserve)；固定栈的 reserve 为 0。复用 growable
+ * 栈前必须把增长过的区间重新 mprotect(PROT_NONE) 并把 committed 重置回
+ * top - initial_usable —— 只重置指针会让后续溢出静默写坏已提交内存。
  *
  * ## 生命周期
  *
- * 构造时映射；析构时**交给 `StackCache`** 而不是直接 `munmap`（除非缓存满）。
+ * 构造时映射；析构时交给 `StackCache` 而不是直接 munmap（除非缓存满）。
  * Valgrind 构建会注册/注销栈边界，普通构建被客户端宏消除、不影响热路径。
  */
 struct FiberStack {
 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
-    explicit FiberStack(std::size_t size)
-        : m_requested_size(size), m_page_size(page_size()), m_mapping_size(
-              checked_mapping_size(m_requested_size, m_page_size)),
-          m_mapping(acquire(m_requested_size, m_page_size, m_mapping_size)) {
-        if (m_mapping == MAP_FAILED) {
-            m_mapping = nullptr;
-            throw std::bad_alloc();
-        }
+    explicit FiberStack(std::size_t usable, std::size_t requested_reserve,
+                        bool requested_growable)
+        : m_initial_usable(usable),
+          m_page_size(native_page_size()),
+          m_reserve(resolve_reserve(m_initial_usable, requested_reserve,
+                                    requested_growable, m_page_size)),
+          m_mapping_size(m_reserve != 0
+                             ? m_reserve
+                             : checked_stack_mapping_size(m_initial_usable,
+                                                          m_page_size)),
+          m_mapping(acquire_stack_mapping(m_initial_usable, m_reserve,
+                                          m_page_size, m_mapping_size)) {
+        const auto base = reinterpret_cast<std::uintptr_t>(m_mapping);
+        m_committed.store(
+            m_reserve != 0 ? base + m_mapping_size - m_initial_usable
+                           : base + m_page_size,
+            std::memory_order_relaxed);
 #if defined(GO2CPP_FIBER_HAVE_VALGRIND)
         // 自定义 context 汇编不会自动告诉 Memcheck 新栈边界。注册只在
-        // Memcheck 运行时生效，普通构建会被 Valgrind 客户端宏消除，
-        // 不改变 Fiber 的热路径和栈布局。
+        // Memcheck 运行时生效，普通构建会被 Valgrind 客户端宏消除。
         m_valgrind_stack_id = VALGRIND_STACK_REGISTER(bottom(), stack_pointer());
 #endif
     }
@@ -352,39 +543,107 @@ struct FiberStack {
         }
 #endif
         if (m_mapping != nullptr) {
-            release(m_requested_size, m_page_size, m_mapping_size, m_mapping);
+            release_to_cache();
         }
     }
 
     FiberStack(const FiberStack&) = delete;
     FiberStack& operator=(const FiberStack&) = delete;
 
-    std::size_t usable_size() const noexcept { return m_requested_size; }
+    bool growable() const noexcept { return m_reserve != 0; }
+
+    // 当前已提交区的大小。growable 栈增长后 bottom() 会下移，MakeContext
+    // 在首次 resume 前调用，因此这里返回的就是初始提交量；复用前池化路径
+    // 已把 committed 重置回初始位置。
+    std::size_t usable_size() const noexcept {
+        const auto top = reinterpret_cast<std::uintptr_t>(stack_pointer());
+        return top - reinterpret_cast<std::uintptr_t>(bottom());
+    }
+
+    // 当前已提交区的底部。MakeContext 用它作为新上下文的 rsp 起点；
+    // 增长只改变 committed，不改变 top，所以栈上的地址/指针始终有效。
     const void* bottom() const noexcept {
+        if (m_reserve != 0) {
+            return reinterpret_cast<const void*>(
+                m_committed.load(std::memory_order_relaxed));
+        }
         return static_cast<const char*>(m_mapping) + m_page_size;
     }
+
     void* stack_pointer() const noexcept {
         return static_cast<char*>(m_mapping) + m_mapping_size;
     }
 
-private:
-    static std::size_t page_size() { return native_page_size(); }
+    // ---- SIGSEGV handler 访问器（async-signal-safe）----------------------
+    char* growth_base() const noexcept { return static_cast<char*>(m_mapping); }
+    char* growth_top() const noexcept {
+        return static_cast<char*>(m_mapping) + m_mapping_size;
+    }
+    std::uintptr_t growth_committed() const noexcept {
+        return m_committed.load(std::memory_order_relaxed);
+    }
+    void growth_commit(std::uintptr_t value) noexcept {
+        m_committed.store(value, std::memory_order_relaxed);
+    }
+    std::size_t growth_page_size() const noexcept { return m_page_size; }
 
-    static std::size_t checked_mapping_size(std::size_t usable_size,
-                                             std::size_t page) {
-        return checked_stack_mapping_size(usable_size, page);
+private:
+    // 决定是否真正启用增长。返回 0 表示固定栈布局：
+    //   - 调用方关闭 growable；
+    //   - GO2CPP_GROWABLE_STACK=0；
+    //   - 备用栈/handler 安装失败；
+    //   - reserve 不足以再提交一个 64KiB 增长块。
+    static std::size_t resolve_reserve(std::size_t usable,
+                                       std::size_t requested_reserve,
+                                       bool requested_growable,
+                                       std::size_t page) {
+#if defined(GO2CPP_FIBER_ASAN) || defined(GO2CPP_FIBER_TSAN)
+        // ASAN/TSAN 自己管理栈切换与栈边界；按设计文档回退固定栈，
+        // 避免 sanitizer 把增长后的页误判为越界/泄漏。
+        (void)usable;
+        (void)requested_reserve;
+        (void)requested_growable;
+        (void)page;
+        return 0;
+#elif defined(GO2CPP_FIBER_GROWABLE_STACK)
+        if (!requested_growable || !growable_stack_env_enabled()) {
+            return 0;
+        }
+        const auto reserve =
+            normalize_stack_reserve_size(requested_reserve, usable, page);
+        // reserve == initial_usable（或只多出不足一个增长块）按固定栈处理。
+        // 固定栈路径不安装 SIGSEGV handler，也不分配 sigaltstack。
+        if (reserve <= usable ||
+            reserve - usable < kGrowableStackGrowthGranularity) {
+            return 0;
+        }
+        if (!ensure_growable_thread_support()) {
+            return 0;
+        }
+        return reserve;
+#else
+        (void)requested_reserve;
+        (void)requested_growable;
+        (void)page;
+        return 0;
+#endif
     }
 
-    static void* acquire(std::size_t size, std::size_t page,
-                         std::size_t mapping_size) {
+    // 从池中取一段已经处于「初始提交」状态的映射；没有命中则新建。
+    // 池化键是 (initial_usable, reserve)，固定栈的 reserve 恒为 0。
+    static void* acquire_stack_mapping(std::size_t usable,
+                                       std::size_t reserve,
+                                       std::size_t page,
+                                       std::size_t mapping_size) {
         for (auto it = s_thread_stack_pool.entries.rbegin();
              it != s_thread_stack_pool.entries.rend(); ++it) {
-            if (it->size == size && it->mapping != nullptr) {
+            if (it->usable == usable && it->reserve == reserve &&
+                it->mapping != nullptr) {
                 void* mapping = it->mapping;
                 s_thread_stack_pool.entries.erase(std::next(it).base());
-                // 池里的栈在 allocate() 时已经设好 guard page（PROT_NONE），
-                // release() 只缓存 mapping、从不改动它，所以复用时不需要再
-                // mprotect 一次。实测每次 go() 都白付一次（5000 任务 = 5038 次）。
+                // 池里的 growable 栈在 release_to_cache() 时已经把增长过的
+                // 区间重新 mprotect(PROT_NONE)，committed 也重置回
+                // top - initial_usable；这里不需要再次改动页保护。
                 return mapping;
             }
         }
@@ -392,50 +651,98 @@ private:
             std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
             for (auto it = s_stack_pool.entries.rbegin();
                  it != s_stack_pool.entries.rend(); ++it) {
-                if (it->size == size && it->mapping != nullptr) {
+                if (it->usable == usable && it->reserve == reserve &&
+                    it->mapping != nullptr) {
                     void* mapping = it->mapping;
                     s_stack_pool.entries.erase(std::next(it).base());
                     return mapping;
                 }
             }
         }
-        void* mapping = ::mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (mapping == MAP_FAILED) {
-            return MAP_FAILED;
-        }
-        if (::mprotect(mapping, page, PROT_NONE) != 0) {
-            ::munmap(mapping, mapping_size);
-            throw std::system_error(errno, std::generic_category(),
-                                     "mprotect fiber guard page");
+
+        void* mapping = nullptr;
+        if (reserve != 0) {
+            // 整段预留 PROT_NONE + MAP_NORESERVE；只把顶部初始可用量
+            // 改成 RW。未提交区天然就是 guard page，无需再移动 guard。
+            mapping = ::mmap(nullptr, reserve, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                             -1, 0);
+            if (mapping == MAP_FAILED) {
+                throw std::bad_alloc();
+            }
+            if (::mprotect(static_cast<char*>(mapping) + reserve - usable,
+                           usable, PROT_READ | PROT_WRITE) != 0) {
+                const int error = errno;
+                ::munmap(mapping, reserve);
+                throw std::system_error(error, std::generic_category(),
+                                        "mprotect fiber initial stack");
+            }
+        } else {
+            // 固定栈：保留旧行为，映射末尾额外一页 PROT_NONE guard。
+            mapping = ::mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (mapping == MAP_FAILED) {
+                throw std::bad_alloc();
+            }
+            if (::mprotect(mapping, page, PROT_NONE) != 0) {
+                const int error = errno;
+                ::munmap(mapping, mapping_size);
+                throw std::system_error(error, std::generic_category(),
+                                        "mprotect fiber guard page");
+            }
         }
         return mapping;
     }
 
-    static void release(std::size_t size, std::size_t page,
-                        std::size_t mapping_size, void* mapping) noexcept {
-        (void)page;
-        try {
-            if (s_thread_stack_pool.entries.size() < 8U) {
-                s_thread_stack_pool.entries.push_back(
-                    CachedStack{size, mapping, mapping_size});
-                return;
+    // 回收前把 growable 栈的增长区重新设为 PROT_NONE，并重置 committed。
+    // 这是保证「复用后的 Fiber 仍从初始 1 页开始」且未提交区继续充当
+    // guard 的必要步骤；只重置指针而保留 RW 会让后续溢出静默写坏内存。
+    // mprotect 失败时退回 munmap，绝不把状态不明的页放回池中。
+    void release_to_cache() noexcept {
+        bool cacheable = true;
+        if (m_reserve != 0) {
+            const auto top = reinterpret_cast<std::uintptr_t>(stack_pointer());
+            const auto initial = top - m_initial_usable;
+            const auto committed = m_committed.load(std::memory_order_relaxed);
+            if (committed < initial) {
+                if (::mprotect(reinterpret_cast<void*>(committed),
+                               initial - committed, PROT_NONE) != 0) {
+                    cacheable = false;
+                } else {
+                    m_committed.store(initial, std::memory_order_relaxed);
+                }
             }
-            std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
-            if (s_stack_pool.entries.size() < 128U) {
-                s_stack_pool.entries.push_back(
-                    CachedStack{size, mapping, mapping_size});
-                return;
-            }
-        } catch (...) {
         }
-        ::munmap(mapping, mapping_size);
+        if (cacheable) {
+            try {
+                if (s_thread_stack_pool.entries.size() < 32U) {
+                    s_thread_stack_pool.entries.push_back(
+                        CachedStack{m_initial_usable, m_reserve, m_mapping,
+                                    m_mapping_size});
+                    m_mapping = nullptr;
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
+                if (s_stack_pool.entries.size() < 512U) {
+                    s_stack_pool.entries.push_back(
+                        CachedStack{m_initial_usable, m_reserve, m_mapping,
+                                    m_mapping_size});
+                    m_mapping = nullptr;
+                    return;
+                }
+            } catch (...) {
+            }
+        }
+        ::munmap(m_mapping, m_mapping_size);
+        m_mapping = nullptr;
     }
 
-    std::size_t m_requested_size;
+    std::size_t m_initial_usable;
     std::size_t m_page_size;
+    std::size_t m_reserve;
     std::size_t m_mapping_size;
     void* m_mapping;
+    std::atomic<std::uintptr_t> m_committed{0};
 #if defined(GO2CPP_FIBER_HAVE_VALGRIND)
     unsigned m_valgrind_stack_id{0U};
 #endif
@@ -493,13 +800,13 @@ private:
             return;
         }
         try {
-            if (s_thread_stack_pool.entries.size() < 8U) {
+            if (s_thread_stack_pool.entries.size() < 32U) {
                 s_thread_stack_pool.entries.push_back(CachedStack{size, context});
                 context = {};
                 return;
             }
             std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
-            if (s_stack_pool.entries.size() < 128U) {
+            if (s_stack_pool.entries.size() < 512U) {
                 s_stack_pool.entries.push_back(CachedStack{size, context});
                 context = {};
                 return;
@@ -516,6 +823,95 @@ private:
     boost::context::stack_context m_context;
 #endif
 };
+
+#if defined(GO2CPP_FIBER_GROWABLE_STACK)
+void growable_stack_segv_handler(int sig, siginfo_t* info,
+                                 void* raw_context) noexcept {
+    // handler 内部再次 fault（mprotect 失败、栈边界判断错误、备用栈也
+    // 不可用）时不能递归，直接交给默认动作产生 core。
+    if (t_growable_in_handler != 0) {
+        growable_stack_fatal(sig);
+    }
+    t_growable_in_handler = 1;
+    const int saved_errno = errno;
+
+    FiberStack* stack = t_current_growable_stack;
+    if (sig != SIGSEGV || stack == nullptr || info == nullptr ||
+        raw_context == nullptr || !stack->growable()) {
+        growable_stack_fatal(sig);
+    }
+
+    const auto* context = static_cast<const ucontext_t*>(raw_context);
+    // 取指故障（x86 error code bit 4）不是栈增长；野指针跳到未映射区时
+    // 也走这里，直接恢复默认动作。
+    if ((context->uc_mcontext.gregs[REG_ERR] & 0x10) != 0) {
+        growable_stack_fatal(sig);
+    }
+    const char* fault = static_cast<const char*>(info->si_addr);
+    const char* rsp = reinterpret_cast<const char*>(
+        context->uc_mcontext.gregs[REG_RSP]);
+    const auto committed = stack->growth_committed();
+    const auto base_value =
+        reinterpret_cast<std::uintptr_t>(stack->growth_base());
+    const auto top_value =
+        reinterpret_cast<std::uintptr_t>(stack->growth_top());
+    const auto fault_value = reinterpret_cast<std::uintptr_t>(fault);
+    const auto rsp_value = reinterpret_cast<std::uintptr_t>(rsp);
+
+    // 故障必须落在未提交区 [base, committed)。已提交区内的 fault 不是
+    // 栈增长（可能是破坏性写入命中了仍可写的页），交回默认动作。
+    if (fault == nullptr || fault_value < base_value ||
+        fault_value >= committed) {
+        growable_stack_fatal(sig);
+    }
+    // rsp 必须在预留区内，但不能要求 rsp >= committed：函数序言会先
+    // sub rsp 再写局部变量，实测 rsp 可以比 committed 低几十字节
+    // （probe: fault=committed-8, rsp=committed-0x50）。只要求它和故障
+    // 地址处于同一个 256KiB 窗口内。
+    if (rsp_value < base_value || rsp_value >= top_value) {
+        growable_stack_fatal(sig);
+    }
+    const auto distance = fault_value >= rsp_value
+                              ? fault_value - rsp_value
+                              : rsp_value - fault_value;
+    if (distance > kGrowableStackFaultWindow) {
+        growable_stack_fatal(sig);
+    }
+    // 预留区底部不足一个增长粒度时无法再提交；committed 向下移动，
+    // committed - base 递减到 0 就是“到达上限”的唯一判定点。
+    if (committed - base_value < kGrowableStackGrowthGranularity) {
+        growable_stack_fatal(sig);
+    }
+    const auto page = static_cast<std::uintptr_t>(stack->growth_page_size());
+    // 从 min(fault, rsp) 向下提交：大帧的局部变量可能位于 rsp 上方，
+    // 只按 fault 提交会漏掉 rsp 以下的帧；按两者较小值提交才能让重试
+    // 指令一次成功（前提是二者距离在窗口内）。
+    auto new_low = fault_value < rsp_value ? fault_value : rsp_value;
+    new_low &= ~(page - 1U);
+    new_low = new_low >= kGrowableStackGrowthGranularity
+                  ? new_low - kGrowableStackGrowthGranularity
+                  : base_value;
+    if (new_low < base_value) {
+        new_low = base_value;
+    }
+    if (new_low >= committed) {
+        growable_stack_fatal(sig);
+    }
+    if (::mprotect(reinterpret_cast<void*>(new_low), committed - new_low,
+                   PROT_READ | PROT_WRITE) != 0) {
+        // mprotect 失败（ENOMEM 等）不能重试，否则会无限 SIGSEGV。
+        growable_stack_fatal(sig);
+    }
+    stack->growth_commit(new_low);
+    s_growable_stack_growth_count.fetch_add(1, std::memory_order_relaxed);
+    t_growable_in_handler = 0;
+    // mprotect 成功时一般不动 errno，但实现允许；恢复被中断代码的值，
+    // 避免一次栈增长污染用户可见的 errno。
+    errno = saved_errno;
+    // 直接 return：内核重新执行触发 fault 的指令，此时页已可写。
+    // 不 longjmp、不换上下文，栈地址与所有局部变量指针保持有效。
+}
+#endif
 
 // 父链只保存这份独立元数据，不保存父 Fiber 栈或 owner 的所有权。子 Fiber
 // 持有父记录，因此父对象结束后仍可生成一致的墓碑帧、传播取消状态；
@@ -540,18 +936,23 @@ struct FiberRecord {
 }  // namespace
 
 struct Fiber::Impl {
-    explicit Impl(Fiber* owner, Function function, std::size_t stack_size)
+    explicit Impl(Fiber* owner, Function function, std::size_t stack_size,
+                  std::size_t stack_reserve_size, bool stack_growable)
         : m_owner(owner),
           m_id(s_next_fiber_id.fetch_add(1, std::memory_order_relaxed)),
           m_record(std::make_shared<FiberRecord>(m_id)),
           m_function(std::move(function)),
-          m_stack_size(normalize_stack_size(stack_size)) {
+          m_stack_size(normalize_stack_size(stack_size)),
+          m_stack_reserve_size(stack_reserve_size),
+          m_stack_growable(stack_growable) {
 #if defined(GO2CPP_FIBER_TSAN)
         m_tsan_fiber = __tsan_create_fiber(0);
 #endif
     }
 
-    void reset_for_scheduler(Function function, std::size_t stack_size) {
+    void reset_for_scheduler(Function function, std::size_t stack_size,
+                             std::size_t stack_reserve_size,
+                             bool stack_growable) {
         // 只有 entry 已经返回 caller，且 resume_locked 已将 m_context 和
         // m_stack 清空后才能重绑定。Scheduler 只在 terminal Fiber 上调用
         // 该方法；若后端约束被破坏，宁可抛出也不能复用活动栈。
@@ -570,6 +971,8 @@ struct Fiber::Impl {
         m_id = next_record->id;
         m_record = std::move(next_record);
         m_stack_size = normalized_stack_size;
+        m_stack_reserve_size = stack_reserve_size;
+        m_stack_growable = stack_growable;
         m_caller = nullptr;
         m_scheduler_propagate.store(false, std::memory_order_relaxed);
         m_scheduler_parent_bound = false;
@@ -736,6 +1139,9 @@ struct Fiber::Impl {
         __tsan_switch_to_fiber(self->m_tsan_caller, 0);
 #endif
 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+        // 栈即将交还给调用者；在真正跳转前清掉，避免窗口期内 handler
+        // 把调用者栈上的 fault 误判成这个已完成的 Fiber 栈。
+        t_current_growable_stack = nullptr;
         detail::JumpContext(self->m_caller, self);
 #else
         boost::context::detail::jump_fcontext(self->m_caller, self);
@@ -882,6 +1288,12 @@ struct Fiber::Impl {
         // step2: 记住最初的调用者；本函数可能沿父链循环多轮，退出时必须恢复。
         Fiber* const original_caller = s_current_fiber;
         const FiberTlsRestore tls_restore(original_caller);
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+        // handler 只应看到当前正在执行的 Fiber 栈；进入 resume 时保存
+        // 调用者的栈，jump 返回后恢复（嵌套 Fiber 时是父 Fiber 的栈）。
+        FiberStack* const previous_growable_stack = t_current_growable_stack;
+        const GrowableStackTlsRestore stack_tls_restore(previous_growable_stack);
+#endif
         // step3: 每轮都重新校验状态（上一轮切换后状态可能已变）。
         for (;;) {
             const FiberState current = m_record->state.load(std::memory_order_acquire);
@@ -896,6 +1308,16 @@ struct Fiber::Impl {
             if (m_context == nullptr) {
                 return false;
             }
+#if defined(GO2CPP_FIBER_GROWABLE_STACK)
+            // 构造期只在创建栈的线程安装过 altstack；Fiber 可能迁移到
+            // 另一个 M，必须在真正 jump 前确认当前线程也有备用栈。
+            // 首次之后只是一次 TLS bool + 原子状态读。
+            if (m_stack->growable() && !ensure_growable_thread_support()) {
+                m_record->state.store(FiberState::Failed,
+                                      std::memory_order_release);
+                return false;
+            }
+#endif
             // step4: 进入运行态，清掉上一次挂起的原因与调度器传播标记。
             m_record->state.store(FiberState::Running, std::memory_order_release);
             m_record->reason.store(SuspendReason::None, std::memory_order_release);
@@ -936,7 +1358,11 @@ struct Fiber::Impl {
                 __tsan_switch_to_fiber(m_tsan_fiber, 0);
 #endif
                 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+                t_current_growable_stack =
+                    m_stack->growable() ? m_stack.get() : nullptr;
                 transfer = detail::JumpContext(m_context, this);
+                // 切回调用者后立即恢复；随后 m_stack 可能被 reset 释放。
+                t_current_growable_stack = previous_growable_stack;
                 #else
                 transfer = boost::context::detail::jump_fcontext(m_context, this);
                 #endif
@@ -1015,6 +1441,9 @@ struct Fiber::Impl {
         __tsan_switch_to_fiber(m_tsan_caller, 0);
 #endif
             #if defined(GO2CPP_USE_NATIVE_CONTEXT)
+            // 挂起后执行流回到调用者的 resume_locked；在跳转前清 TLS，
+            // 避免调用者栈上的 fault 被误判为本 Fiber 的栈增长。
+            t_current_growable_stack = nullptr;
             const detail::Transfer transfer = detail::JumpContext(m_caller, this);
             #else
             const boost::context::detail::transfer_t transfer =
@@ -1032,6 +1461,12 @@ struct Fiber::Impl {
 
 
     void finish_switch_to_fiber() noexcept {
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+        // 迁移到新 M 后，resume_locked 在跳转前已设置过；这里再设置一次，
+        // 覆盖 entry() 首次进入和 suspend() 返回后的两条路径。
+        t_current_growable_stack =
+            (m_stack && m_stack->growable()) ? m_stack.get() : nullptr;
+#endif
 #if defined(GO2CPP_FIBER_ASAN)
         // 迁移后这些输出描述的是当前恢复 Fiber 的新 OS 线程，而不是上次
         // 挂起该 Fiber 的线程。
@@ -1042,7 +1477,12 @@ struct Fiber::Impl {
 
     bool initialize_context() noexcept {
         try {
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+            m_stack = std::make_unique<FiberStack>(
+                m_stack_size, m_stack_reserve_size, m_stack_growable);
+#else
             m_stack = std::make_unique<FiberStack>(m_stack_size);
+#endif
             #if defined(GO2CPP_USE_NATIVE_CONTEXT)
             m_context = detail::MakeContext(const_cast<void*>(m_stack->bottom()),
                                             m_stack->usable_size(), &Impl::entry);
@@ -1067,8 +1507,12 @@ struct Fiber::Impl {
     std::shared_ptr<FiberRecord> m_record;
     /// @brief Fiber 主体；`reset_for_scheduler` 会替换成新提交的可调用对象。
     Function m_function;
-    /// @brief 规范化后的栈大小（页对齐 + 上下界夹紧，见 normalize_stack_size）。
+    /// @brief 规范化后的初始提交量（页对齐，见 normalize_stack_size）。
     std::size_t m_stack_size;
+    /// @brief 预留虚拟地址大小；0 表示使用 Fiber::DefaultStackReserveSize()。
+    std::size_t m_stack_reserve_size{0};
+    /// @brief 是否请求按需增长；实际是否增长还受环境变量/后端能力约束。
+    bool m_stack_growable{true};
     /// @brief 独立栈（FiberStack 内部走池化）；Fiber 结束后由 resume_locked 清空，
     ///        非空表示仍在活动 —— reset_for_scheduler 会据此拒绝重绑定。
     std::unique_ptr<FiberStack> m_stack;
@@ -1114,11 +1558,14 @@ struct Fiber::Impl {
 #endif
 };
 
-Fiber::Fiber(Function function, std::size_t stack_size)
-    : m_impl(std::make_unique<Impl>(this, std::move(function), stack_size)) {}
+Fiber::Fiber(Function function, std::size_t stack_size,
+             std::size_t stack_reserve_size, bool stack_growable)
+    : m_impl(std::make_unique<Impl>(this, std::move(function), stack_size,
+                                   stack_reserve_size, stack_growable)) {}
 
 std::unique_ptr<Fiber> Fiber::AcquireForScheduler(
-    Function function, std::size_t stack_size, std::size_t bin_capacity) {
+    Function function, std::size_t stack_size, std::size_t bin_capacity,
+    std::size_t stack_reserve_size, bool stack_growable) {
     const auto capacity = std::min(
         kMaxFiberBinCapacity,
         bin_capacity == 0 ? kDefaultFiberBinCapacity : bin_capacity);
@@ -1126,14 +1573,17 @@ std::unique_ptr<Fiber> Fiber::AcquireForScheduler(
         auto fiber = std::move(s_thread_fiber_bin.entries.back());
         s_thread_fiber_bin.entries.pop_back();
         try {
-            fiber->m_impl->reset_for_scheduler(std::move(function), stack_size);
+            fiber->m_impl->reset_for_scheduler(
+                std::move(function), stack_size, stack_reserve_size,
+                stack_growable);
             return fiber;
         } catch (...) {
             // 重绑定失败时销毁该对象并走普通构造路径。失败不会把
             // 一个状态不明的 Fiber 再次放回池中。
         }
     }
-    return std::make_unique<Fiber>(std::move(function), stack_size);
+    return std::make_unique<Fiber>(std::move(function), stack_size,
+                                   stack_reserve_size, stack_growable);
 }
 
 void Fiber::RecycleForScheduler(std::unique_ptr<Fiber> fiber,

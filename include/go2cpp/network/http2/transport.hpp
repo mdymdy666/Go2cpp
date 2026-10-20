@@ -71,6 +71,30 @@ public:
     virtual std::size_t Read(std::uint8_t* buffer, std::size_t capacity) = 0;
 
     /**
+     * @brief 带等待上限的 `Read`：最多阻塞 `timeout_ms` 毫秒。
+     *
+     * @param timeout_ms 等待上限（毫秒）。`0` 表示只做一次非阻塞尝试；
+     *                   负数表示不限（与 `Read` 等价）。
+     * @return 与 `Read` 相同：>0 读到的字节数；0 表示超时、对端关闭或暂时无数据。
+     *
+     * ## 为什么需要它
+     * `Read` 的契约是「阻塞到有数据或连接关闭」，QUIC 的 `Poll` 若直接调用它，
+     * `Send`/`Receive` 的 deadline 就会被一次长时间阻塞击穿（审计 D02：5s 超时
+     * 实测 8s 才返回）。协议层在带 deadline 的路径上改调本方法，把剩余预算交给
+     * Transport，由 Transport 用 `poll()` / Fiber park-timeout 等机制兑现。
+     *
+     * ## 默认实现与实现者义务
+     * 默认实现忽略超时、直接调用 `Read`，以保持既有实现源码兼容；**凡可能阻塞
+     * 的实现（UDP/TLS/Fiber）都应覆盖本方法并遵守 `timeout_ms`**，否则超时语义
+     * 仍会退化为旧行为（一次阻塞读可超出 deadline）。`Closed()` 依旧用于区分
+     * 「等待超时」与「对端关闭」。
+     */
+    virtual std::size_t ReadWithTimeout(std::uint8_t* buffer, std::size_t capacity,
+                                        int /*timeout_ms*/) {
+        return Read(buffer, capacity);
+    }
+
+    /**
      * @brief 写入全部 `length` 字节。
      * @return 实际写入的字节数；小于 `length` 表示写失败或对端关闭。
      */

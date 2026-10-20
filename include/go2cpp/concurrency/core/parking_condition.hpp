@@ -13,18 +13,21 @@
  *
  * ## 两条路径
  *
- * - **Fiber 路径**：无状态 futex 等待。只用 `m_futex_seq`（32 位代际字）作为
- *   等待条件 —— 等待者记下当前代际后 `FUTEX_WAIT`，唤醒方把它 +1 后
- *   `FUTEX_WAKE`。所谓"无状态"是指**不需要为每个等待者分配内核对象**，
- *   避免了"先建没建"的竞态；
- * - **线程路径**：`std::condition_variable` 风格的 `m_waiters` 队列。
+ * - **Fiber 路径**：Scheduler park。WaitNode 绑定 Task，唤醒方通过
+ *   wake_or_cancel 把 G 重新放回调度队列，不经过内核 futex；
+ * - **线程路径**：每个 WaitNode 自己的 32 位 futex 代际字。notify_one 只推进
+ *   **选中节点**的字并只唤醒它（审计 D2：共享代际字会唤醒错节点，被选中的
+ *   节点留在内核睡眠队列里丢唤醒）；notify_all 走一次共享广播字 + 一次
+ *   FUTEX_WAKE(INT_MAX)（futex_waitv 让等待者同时监听两个字），把 N 次唤醒
+ *   系统调用降为 1 次。不支持 futex_waitv 的环境自动退回逐节点唤醒。
  *
  * ## 为什么必须在 park 前自旋一小段
  *
- * 如果直接 `FUTEX_WAIT`，在"刚检查完条件、还没进入内核"这个窗口里到达的
- * 唤醒会丢失，等待者被迫睡到超时。加 128 次自旋（`kSpinBudget`）让这个
- * 窗口在热路径上极大概率被跨过去 —— 实测 2 个等待者的场景下，无自旋比
- * `std::condition_variable` 慢 3.3 倍，加了自旋后所有场景都更快。
+ * 如果直接 FUTEX_WAIT，在"刚检查完条件、还没进入内核"这个窗口里到达的
+ * 唤醒会丢失，等待者被迫睡到超时。加一小段自旋（kSpinBudget）让这个窗口
+ * 在热路径上极大概率被跨过去 —— 实测 2 个等待者的场景下，无自旋比
+ * std::condition_variable 慢 3.3 倍，加了自旋后所有场景都更快。预算大小与
+ * 是否真正划算随机器（尤其 WSL2 的唤醒延迟）变化，见同文件 .cpp 实测注释。
  *
  * ## 能力清单
  *
@@ -136,13 +139,18 @@ private:
     std::mutex m_mutex;
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
 
-    // ---- futex 无状态等待（Linux）----
-    // 一个 32 位代际字就是全部用户态状态：notify 递增并 FUTEX_WAKE，等待方
-    // 读旧值后 FUTEX_WAIT(expected)。不需要等待者队列/节点分配。
-    // 语义依赖 cond.wait(pred) 本来就容忍虚假唤醒。
-    alignas(64) std::atomic<std::uint32_t> m_futex_seq{0};
-    // 等待者计数：为 0 时 notify 直接跳过系统调用。
-    alignas(64) std::atomic<std::uint32_t> m_futex_waiters{0};
+    // ---- 广播代际字（futex_waitv 混合方案）----
+    // notify_all 需要唤醒 N 个 native waiter。per-node futex 的地址彼此不同，
+    // 逐个 FUTEX_WAKE 就是 N 次系统调用；因此让每个 native waiter 用
+    // futex_waitv 同时监听「自己的节点字 + 这个共享广播字」：notify_one 只推进
+    // 选中节点的字（保持 D2 的定向唤醒），notify_all 只推进一次广播字并做一次
+    // FUTEX_WAKE(INT_MAX)。没有 futex_waitv 的内核/编译环境退回逐节点唤醒。
+    struct BroadcastState {
+        std::atomic<std::uint32_t> seq{0};
+        // 处于 native 等待路径的 waiter 数量：为 0 时广播可跳过系统调用。
+        std::atomic<std::uint32_t> waiters{0};
+    };
+    alignas(64) BroadcastState m_broadcast;
 };
 
 }  // namespace go2cpp::core
