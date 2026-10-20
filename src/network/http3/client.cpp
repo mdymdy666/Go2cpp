@@ -300,6 +300,181 @@ std::int64_t RemainingMs(Clock::time_point deadline) {
     return left.count() < 0 ? 0 : left.count();
 }
 
+/// `:authority` 的最大长度（防止把巨大字符串塞进 HTTP/3 头）。
+constexpr std::size_t kMaxAuthorityLength = 1024;
+/// 服务端控制流缓冲上限：SETTINGS/GOAWAY 都很小，1 MiB 足够且能防 DoS。
+constexpr std::size_t kMaxControlStreamBuffer = 1U << 20;
+/// 单个控制流帧长度上限。
+constexpr std::size_t kMaxControlFrameLength = 1U << 20;
+/// QPACK 单向流累计消费上限（不使用动态表时正常只有几十字节）。
+constexpr std::uint64_t kMaxQpackStreamBytes = 1U << 20;
+
+/**
+ * @brief 校验 authority / SNI 文本：拒绝控制字符、空白和会破坏 URL 的字符。
+ *
+ * 只做“不能注入”的最小校验，不做 DNS 语法校验（SNI 允许任意合法域名）。
+ */
+bool IsValidAuthorityText(const std::string& text) {
+    if (text.empty() || text.size() > kMaxAuthorityLength) {
+        return false;
+    }
+    for (char c : text) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc <= 0x20 || uc == 0x7f) {
+            return false;
+        }
+        switch (c) {
+            case '/':
+            case '?':
+            case '#':
+            case '\\':
+            case '"':
+            case '<':
+            case '>':
+                return false;
+            default:
+                break;
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief 从 `host[:port]` 里拆出 host 与端口（D15）。
+ *
+ * 支持 `example.com`、`example.com:8443`、`[::1]`、`[::1]:8443` 与裸 IPv6
+ * `::1`。不解析 DNS 合法性；只做结构拆分与端口范围校验。
+ */
+bool SplitHostPort(const std::string& input, std::string* host, std::uint16_t* port,
+                   std::string* error) {
+    if (input.empty()) {
+        SetError(error, "host must not be empty");
+        return false;
+    }
+    std::string parsed_host;
+    std::string parsed_port;
+    if (input.front() == '[') {
+        const std::size_t close = input.find(']');
+        if (close == std::string::npos) {
+            SetError(error, "invalid IPv6 host '" + input + "' (missing ']')");
+            return false;
+        }
+        parsed_host = input.substr(1, close - 1);
+        if (close + 1 < input.size()) {
+            if (input[close + 1] != ':') {
+                SetError(error, "invalid host '" + input + "' (expected ':port' after ']')");
+                return false;
+            }
+            parsed_port = input.substr(close + 2);
+        }
+    } else {
+        const std::size_t first = input.find(':');
+        const std::size_t last = input.rfind(':');
+        if (first != std::string::npos && first == last) {
+            parsed_host = input.substr(0, first);
+            parsed_port = input.substr(first + 1);
+        } else {
+            parsed_host = input;  // 无端口，或裸 IPv6 字面量（多个冒号）
+        }
+    }
+    if (parsed_host.empty()) {
+        SetError(error, "host must not be empty in '" + input + "'");
+        return false;
+    }
+    std::uint32_t value = 0;
+    for (char c : parsed_port) {
+        if (c < '0' || c > '9') {
+            SetError(error, "invalid port in '" + input + "'");
+            return false;
+        }
+        value = value * 10U + static_cast<std::uint32_t>(c - '0');
+        if (value > 65535U) {
+            SetError(error, "port out of range in '" + input + "'");
+            return false;
+        }
+    }
+    if (!parsed_port.empty() && value == 0) {
+        SetError(error, "port must be 1..65535 in '" + input + "'");
+        return false;
+    }
+    *host = parsed_host;
+    *port = static_cast<std::uint16_t>(value);
+    return true;
+}
+
+/// 生成 `host[:port]`；IPv6 字面量自动加方括号。
+std::string FormatAuthority(const std::string& host, std::uint16_t port) {
+    std::string out;
+    if (host.find(':') != std::string::npos) {
+        out += '[';
+        out += host;
+        out += ']';
+    } else {
+        out = host;
+    }
+    if (port != 0) {
+        out += ':';
+        out += std::to_string(port);
+    }
+    return out;
+}
+
+/**
+ * @brief 计算 `:authority` 与实际使用的 SNI（D15：两者可分离）。
+ *
+ * 优先级：
+ * 1. `options.authority` 非空 → 原样使用（只做注入校验）；
+ * 2. `options.host` 非空 → 用它的 host（允许它自带端口）；
+ * 3. 否则从 `sni_arg` 拆出 host（旧用法 `host:port` 也能正确拆开）；
+ * 端口依次由 `options.port`、显式 host 的端口、`sni_arg` 的端口决定。
+ * SNI 使用 `options.sni`（拆掉端口），否则用 `sni_arg` 的 host。
+ */
+bool BuildAuthority(const std::string& sni_arg, const Client::Options& options,
+                    std::string* authority, std::string* effective_sni, std::string* error) {
+    std::string sni_host;
+    std::uint16_t sni_port = 0;
+    if (!SplitHostPort(sni_arg, &sni_host, &sni_port, error)) {
+        return false;
+    }
+
+    // D15：SNI 与 authority 的 host 分别演进——给 options.host 不会改变 SNI。
+    std::string authority_host = sni_host;
+    std::uint16_t port = sni_port;
+    if (!options.host.empty()) {
+        std::uint16_t host_port = 0;
+        if (!SplitHostPort(options.host, &authority_host, &host_port, error)) {
+            return false;
+        }
+        port = host_port;
+    }
+    if (options.port != 0) {
+        port = options.port;
+    }
+
+    if (!options.sni.empty()) {
+        std::uint16_t ignored_port = 0;
+        if (!SplitHostPort(options.sni, &sni_host, &ignored_port, error)) {
+            return false;
+        }
+    }
+    if (!IsValidAuthorityText(sni_host)) {
+        SetError(error, "invalid SNI '" + sni_host + "'");
+        return false;
+    }
+
+    if (options.authority.empty()) {
+        *authority = FormatAuthority(authority_host, port);
+    } else {
+        *authority = options.authority;
+    }
+    if (!IsValidAuthorityText(*authority)) {
+        SetError(error, "invalid :authority '" + *authority + "'");
+        return false;
+    }
+    *effective_sni = sni_host;
+    return true;
+}
+
 /**
  * @brief 取关闭类事件的关闭码（审计 D05）。
  *
@@ -352,13 +527,35 @@ struct Client::Impl {
     net::http2::Transport* transport{nullptr};
     std::unique_ptr<quic::PicoquicConnection> connection;
     std::string sni;
+    /// 实际发送的 `:authority`（host[:port]），Connect 时计算一次（D15）。
+    std::string authority;
     std::string alpn;
     bool ready{false};
     bool closed{false};
     std::uint64_t last_error{0};
     std::string close_reason;
     Options options;
-    std::uint64_t last_stream_id{0};
+    std::uint64_t last_stream_id{Client::kInvalidStreamId};
+
+    /// 回调中捕获了异常：置位后由 Poll/Send/Receive 转换为错误（D18）。
+    bool callback_exception{false};
+
+    /// 服务端控制流（stream 3）解析状态（D16）。
+    std::vector<std::uint8_t> control_buffer;
+    /// 单向流的首个 varint 是流类型（control=0x00 / QPACK=0x02/0x03）。
+    bool control_type_seen{false};
+    bool qpack_encoder_type_seen{false};
+    bool qpack_decoder_type_seen{false};
+    bool control_frame_seen{false};
+    bool server_settings_received{false};
+    h3zero_settings_t remote_settings{};
+    bool goaway_received{false};
+    std::uint64_t goaway_id{Client::kInvalidStreamId};
+    bool max_push_id_seen{false};
+    std::uint64_t max_push_id{0};
+    /// QPACK encoder(7) / decoder(11) 流累计消费字节（D16：只读不解析）。
+    std::uint64_t qpack_encoder_bytes{0};
+    std::uint64_t qpack_decoder_bytes{0};
 
     std::map<std::uint64_t, StreamState> streams;
     std::deque<std::uint64_t> pending;
@@ -369,14 +566,35 @@ struct Client::Impl {
         connection.reset();
     }
 
-    /// `:authority`：显式配置优先，否则退回 SNI（保持旧行为）。
-    const std::string& Authority() const {
-        return options.authority.empty() ? sni : options.authority;
-    }
-
     static int Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
                         std::size_t length, picoquic_call_back_event_t event,
                         void* callback_ctx, void* stream_ctx);
+
+    /// 回调主体（异常由 `Callback` 的 try/catch 兜住，见 D18）。
+    void HandleEvent(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
+                     std::size_t length, picoquic_call_back_event_t event);
+
+    /// 按流类型分流：0=请求流，1/2=非法服务端流，3=服务端单向流（D16）。
+    void OnStreamBytes(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
+                       std::size_t length, bool fin);
+
+    /// 服务端单向流：控制流 3 / QPACK encoder 7 / decoder 11。
+    void HandleServerUniStream(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
+                               std::size_t length, bool fin);
+
+    /// 解析控制流上的 SETTINGS / GOAWAY，未知帧按 RFC 9114 §9 忽略（D16）。
+    void HandleControlStream(picoquic_cnx_t* cnx, std::uint8_t* bytes, std::size_t length,
+                             bool fin);
+
+    /// QPACK 单向流只消费不解析，避免流控窗口长期不打开（D16）。
+    void ConsumeQpackStream(picoquic_cnx_t* cnx, bool encoder, std::uint8_t* bytes,
+                            std::size_t length);
+
+    /// 置连接级失败并发送 CONNECTION_CLOSE；幂等。
+    void FailConnection(picoquic_cnx_t* cnx, std::uint64_t h3_error, const char* reason);
+
+    /// PollFor 失败后对外暴露的原因（D18：回调异常优先于底层传输错误）。
+    std::string PollReason(const std::string& poll_error) const;
 
     void HandleStreamData(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
                           std::size_t length, bool fin);
@@ -386,13 +604,6 @@ struct Client::Impl {
 
 /**
  * @brief picoquic 的全局事件回调：把 C 库的连接/流事件翻译成本对象的状态。
- * @param cnx 连接句柄（只在 `ready` 分支用于 `h3zero_protocol_init`）。
- * @param stream_id 事件所属的 QUIC 流 id（流类事件有效）。
- * @param bytes/length 事件携带的数据（`stream_data`/`stream_fin` 为流字节，
- *        `close` 类事件为关闭码）。
- * @param event 事件类型。
- * @param callback_ctx 就是 `Impl*` 自身（picoquic 透传）。
- * @return 0——picoquic 要求回调返回 0；非 0 会被当成致命错误。
  *
  * ## 定位
  *
@@ -401,30 +612,27 @@ struct Client::Impl {
  *
  * ## 步骤
  *
- * step1. **`ready`**：先 `h3zero_protocol_init` 发出 SETTINGS 与 QPACK
- *        encoder/decoder 流，**之后**才允许上层发请求（顺序不能反，否则对端
- *        会在控制流建立前收到 HEADERS）；初始化失败时置 `closed` 并记录原因；
- * step2. **`set_alpn`**：记录协商出的 ALPN（诊断用）；
- * step3. **流事件**：`stream_data`/`stream_fin` 交给 `HandleStreamData`
- *        （按 `fin` 区分是否收尾）；`stream_reset`/`stop_sending` 交给
- *        `FailStream` 标记失败；
- * step4. **关闭类事件**（`close`/`application_close`/`stateless_reset`）：
- *        置 `closed`，用 `DecodeCloseCode` 解析应用层关闭码，并记录首个原因。
+ * step1. **`ready`**：`h3zero_protocol_init` 发出 SETTINGS 与 QPACK
+ *        encoder/decoder 流，成功后才置 `ready`（D14）；
+ * step2. **`set_alpn`**：记录协商出的 ALPN；
+ * step3. **流事件**：按 `stream_id & 0x3` 分流（D16）——
+ *        0 = 客户端双向请求流；1/2 = 服务端非法流（连接错误）；
+ *        3 = 服务端单向流（控制流 3 / QPACK 7/11）；
+ *        `stream_reset`/`stop_sending` 交给 `FailStream` 标记失败；
+ * step4. **关闭类事件**：置 `closed`，用 `CloseErrorCode` 取关闭码。
  *
  * ## 并发/失败语义
  *
  * - **必须返回 0**：picoquic 把非 0 返回值当作致命错误，会直接拆连接；
- * - **回调在 picoquic 自己的线程上执行**，不能阻塞、不能 park；本函数只做
- *   状态更新与数据搬运，没有等待；
+ * - **回调在调用 `Poll`/`Send`/`Receive` 的同一线程同步执行**（不是 picoquic
+ *   自己的线程，picoquic 没有第二线程），不能阻塞、不能 park；
+ * - **D18：整个回调体用 try/catch 包住**。`std::bad_alloc`、`length_error`
+ *   等异常绝不能穿过 C ABI：catch 里只做不抛的赋值与 `picoquic_close`，
+ *   并置 `callback_exception`，由 `Poll` 转成明确错误；
  * - **`self == nullptr` 时返回 0**：`~Impl` 里 `connection.reset()` 会触发
  *   一次 `close` 回调，此时 `callback_ctx` 仍有效，但防御性地判空；
- * - **`ready` 只处理一次**（`if (self->ready) break;`）：picoquic 可能重复
- *   触发，重复 init 会破坏控制流；
- * - **关闭原因只记第一次**（`if (close_reason.empty())`）：后续关闭事件
- *   （如先 `application_close` 再 `close`）不覆盖更具体的信息；
- * - **`stream_id` 的流类型过滤在 `HandleStreamData`/`FailStream` 里做**，
- *   本函数不做——因为它们各自需要不同的过滤理由（只关心双向流 vs 只标记已知流）；
- * - **不抛异常**：C 回调栈不能传播 C++ 异常，所有分支都只做不会抛的操作。
+ * - **`ready` 只处理一次**（`if (self->ready) break;`）：重复 init 会破坏控制流；
+ * - **关闭原因只记第一次**（`if (close_reason.empty())`）。
  */
 int Client::Impl::Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
                            std::size_t length, picoquic_call_back_event_t event,
@@ -433,60 +641,302 @@ int Client::Impl::Callback(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::ui
     if (self == nullptr) {
         return 0;
     }
+    try {
+        self->HandleEvent(cnx, stream_id, bytes, length, event);
+    } catch (...) {
+        // D18：异常不得穿透 C 回调边界。catch 内只做 noexcept 级操作：
+        // 置标志 + picoquic_close（C 函数，不抛），字符串留到上层再拼。
+        self->callback_exception = true;
+        self->closed = true;
+        self->last_error = H3ZERO_INTERNAL_ERROR;
+        if (cnx != nullptr) {
+            (void)picoquic_close(cnx, H3ZERO_INTERNAL_ERROR);
+        }
+    }
+    return 0;
+}
 
+void Client::Impl::HandleEvent(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
+                               std::size_t length, picoquic_call_back_event_t event) {
     switch (event) {
-        // step1: 连接就绪——先建控制流（SETTINGS/QPACK），之后才允许发请求。
         case picoquic_callback_ready: {
-            if (self->ready) {
+            if (ready) {
                 break;
             }
-            // D14：先发 SETTINGS / QPACK streams，成功后才置 ready，避免
-            // HandshakeComplete() 在控制流初始化失败时「撒谎」。
+            // D14：先发 SETTINGS / QPACK streams，成功后才置 ready。
             const int rc = h3zero_protocol_init(cnx);
             if (rc != 0) {
-                self->closed = true;
-                self->last_error = H3ZERO_INTERNAL_ERROR;
-                self->close_reason = "h3zero_protocol_init failed";
+                FailConnection(cnx, H3ZERO_INTERNAL_ERROR, "h3zero_protocol_init failed");
                 break;
             }
-            self->ready = true;
+            ready = true;
             break;
         }
         case picoquic_callback_set_alpn:
             if (bytes != nullptr && length > 0) {
-                self->alpn.assign(reinterpret_cast<const char*>(bytes), length);
+                alpn.assign(reinterpret_cast<const char*>(bytes), length);
             }
             break;
-        // step3: 流事件——数据/收尾交给 HandleStreamData，reset 标记失败。
         case picoquic_callback_stream_data:
-            self->HandleStreamData(cnx, stream_id, bytes, length, false);
+            OnStreamBytes(cnx, stream_id, bytes, length, false);
             break;
         case picoquic_callback_stream_fin:
-            self->HandleStreamData(cnx, stream_id, bytes, length, true);
+            OnStreamBytes(cnx, stream_id, bytes, length, true);
             break;
         case picoquic_callback_stream_reset:
-            self->FailStream(stream_id, "stream reset by peer");
+            FailStream(stream_id, "stream reset by peer");
             break;
         case picoquic_callback_stop_sending:
-            self->FailStream(stream_id, "peer requested stop sending");
+            FailStream(stream_id, "peer requested stop sending");
             break;
-        // step4: 关闭类事件——置 closed、解析关闭码、只记首个原因。
         case picoquic_callback_close:
         case picoquic_callback_application_close:
         case picoquic_callback_stateless_reset:
-            self->closed = true;
+            closed = true;
             // D05：bytes/len 恒为 NULL/0，关闭码从连接上下文取。
-            self->last_error = CloseErrorCode(cnx);
-            if (self->close_reason.empty()) {
-                self->close_reason = (event == picoquic_callback_application_close)
-                                         ? "connection closed by application"
-                                         : "connection closed";
+            last_error = CloseErrorCode(cnx);
+            if (close_reason.empty()) {
+                close_reason = (event == picoquic_callback_application_close)
+                                   ? "connection closed by application"
+                                   : "connection closed";
             }
             break;
         default:
             break;
     }
-    return 0;
+}
+
+void Client::Impl::OnStreamBytes(picoquic_cnx_t* cnx, std::uint64_t stream_id, std::uint8_t* bytes,
+                                 std::size_t length, bool fin) {
+    if (closed) {
+        return;
+    }
+    switch (stream_id & 0x3U) {
+        case 0:  // 客户端发起的双向流：请求的响应
+            HandleStreamData(cnx, stream_id, bytes, length, fin);
+            break;
+        case 1:  // 服务端发起的双向流：HTTP/3 不允许
+            FailConnection(cnx, H3ZERO_STREAM_CREATION_ERROR,
+                           "server-initiated bidirectional stream is not allowed");
+            break;
+        case 2:  // 服务端 push 流：本客户端未启用 push
+            FailConnection(cnx, H3ZERO_STREAM_CREATION_ERROR,
+                           "server push stream received but push is not enabled");
+            break;
+        default:  // 3：服务端发起的单向流
+            HandleServerUniStream(cnx, stream_id, bytes, length, fin);
+            break;
+    }
+}
+
+void Client::Impl::HandleServerUniStream(picoquic_cnx_t* cnx, std::uint64_t stream_id,
+                                         std::uint8_t* bytes, std::size_t length, bool fin) {
+    if (stream_id == 3) {
+        HandleControlStream(cnx, bytes, length, fin);
+        return;
+    }
+    if (stream_id == 7) {
+        ConsumeQpackStream(cnx, true, bytes, length);
+    } else if (stream_id == 11) {
+        ConsumeQpackStream(cnx, false, bytes, length);
+    } else {
+        FailConnection(cnx, H3ZERO_STREAM_CREATION_ERROR,
+                       "unexpected server-initiated unidirectional stream");
+        return;
+    }
+    if (fin && !closed) {
+        FailConnection(cnx, H3ZERO_CLOSED_CRITICAL_STREAM, "QPACK critical stream closed");
+    }
+}
+
+void Client::Impl::HandleControlStream(picoquic_cnx_t* cnx, std::uint8_t* bytes, std::size_t length,
+                                       bool fin) {
+    if (closed) {
+        return;
+    }
+    // 单向流以流类型 varint 开头（RFC 9114 §6.2），控制流类型必须是 0x00。
+    if (!control_type_seen) {
+        if (length == 0) {
+            if (fin) {
+                FailConnection(cnx, H3ZERO_CLOSED_CRITICAL_STREAM,
+                               "control stream closed before its type");
+            }
+            return;
+        }
+        std::uint64_t stream_type = 0;
+        const std::size_t prefix = h3zero_varint_decode(bytes, length, &stream_type);
+        if (prefix == 0 || stream_type != h3zero_stream_type_control) {
+            FailConnection(cnx, H3ZERO_STREAM_CREATION_ERROR, "invalid control stream type");
+            return;
+        }
+        control_type_seen = true;
+        bytes += prefix;
+        length -= prefix;
+    }
+    if (length > kMaxControlStreamBuffer - std::min(control_buffer.size(), kMaxControlStreamBuffer)) {
+        FailConnection(cnx, H3ZERO_EXCESSIVE_LOAD, "control stream buffer exceeds limit");
+        return;
+    }
+    if (bytes != nullptr && length > 0) {
+        control_buffer.insert(control_buffer.end(), bytes, bytes + length);
+    }
+
+    std::size_t pos = 0;
+    while (pos < control_buffer.size()) {
+        const std::uint8_t* base = control_buffer.data();
+        const std::size_t available = control_buffer.size() - pos;
+        std::uint64_t frame_type = 0;
+        const std::size_t type_len = h3zero_varint_decode(base + pos, available, &frame_type);
+        if (type_len == 0) {
+            break;  // 帧类型还没收全
+        }
+        std::uint64_t frame_length = 0;
+        const std::size_t length_len =
+            h3zero_varint_decode(base + pos + type_len, available - type_len, &frame_length);
+        if (length_len == 0) {
+            break;  // 帧长度还没收全
+        }
+        const std::size_t header_len = type_len + length_len;
+        if (frame_length > kMaxControlFrameLength) {
+            FailConnection(cnx, H3ZERO_EXCESSIVE_LOAD, "control frame length exceeds limit");
+            return;
+        }
+        if (available - header_len < frame_length) {
+            break;  // 帧内容还没收全
+        }
+        const std::uint8_t* payload = base + pos + header_len;
+
+        // RFC 9114 §6.2.1：控制流的第一帧必须是 SETTINGS。
+        if (!control_frame_seen) {
+            if (frame_type != h3zero_frame_settings) {
+                FailConnection(cnx, H3ZERO_MISSING_SETTINGS,
+                               "first control stream frame is not SETTINGS");
+                return;
+            }
+            control_frame_seen = true;
+        }
+
+        switch (frame_type) {
+            case h3zero_frame_settings: {
+                if (server_settings_received) {
+                    FailConnection(cnx, H3ZERO_FRAME_UNEXPECTED, "duplicate SETTINGS frame");
+                    return;
+                }
+                h3zero_settings_t decoded{};
+                const std::uint8_t* const end = payload + frame_length;
+                const std::uint8_t* const parsed =
+                    h3zero_settings_components_decode(payload, end, &decoded);
+                if (parsed != end) {
+                    FailConnection(cnx, H3ZERO_SETTINGS_ERROR, "invalid SETTINGS frame");
+                    return;
+                }
+                remote_settings = decoded;
+                server_settings_received = true;
+                break;
+            }
+            case h3zero_frame_goaway: {
+                std::uint64_t stream_id = 0;
+                const std::size_t got = h3zero_varint_decode(payload, frame_length, &stream_id);
+                if (got == 0 || got != frame_length) {
+                    FailConnection(cnx, H3ZERO_FRAME_ERROR, "invalid GOAWAY frame");
+                    return;
+                }
+                // RFC 9114 §5.2：后续 GOAWAY 的流号只能更小（不能“复活”流）。
+                if (goaway_received && stream_id > goaway_id) {
+                    FailConnection(cnx, H3ZERO_ID_ERROR, "GOAWAY stream ID increased");
+                    return;
+                }
+                goaway_received = true;
+                goaway_id = stream_id;
+                break;
+            }
+            case h3zero_frame_max_push_id: {
+                // RFC 9114 §7.2.7：MAX_PUSH_ID 只能由客户端发送；服务端发来属于
+                // 协议违规。这里仍消费并记录（便于诊断），不主动断连，避免与
+                // 非标准实现对撞。
+                std::uint64_t push_id = 0;
+                const std::size_t got = h3zero_varint_decode(payload, frame_length, &push_id);
+                if (got == 0 || got != frame_length) {
+                    FailConnection(cnx, H3ZERO_FRAME_ERROR, "invalid MAX_PUSH_ID frame");
+                    return;
+                }
+                max_push_id_seen = true;
+                max_push_id = push_id;
+                break;
+            }
+            case h3zero_frame_data:
+            case h3zero_frame_header:
+            case h3zero_frame_push_promise:
+            case 2:
+            case 6:
+            case 8:
+            case 9:
+                FailConnection(cnx, H3ZERO_FRAME_UNEXPECTED,
+                               "request/response frame on the control stream");
+                return;
+            default:
+                // RFC 9114 §9：未知帧必须被忽略。
+                break;
+        }
+        pos += header_len + static_cast<std::size_t>(frame_length);
+    }
+
+    if (pos > 0) {
+        control_buffer.erase(control_buffer.begin(),
+                             control_buffer.begin() + static_cast<std::ptrdiff_t>(pos));
+    }
+    if (fin && !closed) {
+        // RFC 9114 §6.2：关闭临界流是连接级错误；若还有半帧则先报 FRAME_ERROR。
+        if (!control_buffer.empty()) {
+            FailConnection(cnx, H3ZERO_FRAME_ERROR, "control stream ended mid-frame");
+        } else {
+            FailConnection(cnx, H3ZERO_CLOSED_CRITICAL_STREAM, "control stream closed by peer");
+        }
+    }
+}
+
+void Client::Impl::ConsumeQpackStream(picoquic_cnx_t* cnx, bool encoder, std::uint8_t* bytes,
+                                      std::size_t length) {
+    if (closed) {
+        return;
+    }
+    bool& type_seen = encoder ? qpack_encoder_type_seen : qpack_decoder_type_seen;
+    if (!type_seen) {
+        if (length == 0) {
+            return;
+        }
+        std::uint64_t stream_type = 0;
+        const std::size_t prefix = h3zero_varint_decode(bytes, length, &stream_type);
+        const std::uint64_t expected =
+            encoder ? h3zero_stream_type_qpack_encoder : h3zero_stream_type_qpack_decoder;
+        if (prefix == 0 || stream_type != expected) {
+            FailConnection(cnx, H3ZERO_STREAM_CREATION_ERROR, "invalid QPACK stream type");
+            return;
+        }
+        type_seen = true;
+        bytes += prefix;
+        length -= prefix;
+    }
+    std::uint64_t& total = encoder ? qpack_encoder_bytes : qpack_decoder_bytes;
+    total += static_cast<std::uint64_t>(length);
+    if (total > kMaxQpackStreamBytes) {
+        FailConnection(cnx, H3ZERO_EXCESSIVE_LOAD, "QPACK stream exceeded the consume limit");
+    }
+    // 不用动态表：只消费字节以保持流控窗口打开，不解析插入/确认指令。
+}
+
+void Client::Impl::FailConnection(picoquic_cnx_t* cnx, std::uint64_t h3_error, const char* reason) {
+    if (closed) {
+        return;
+    }
+    closed = true;
+    last_error = h3_error;
+    if (close_reason.empty() && reason != nullptr) {
+        close_reason = reason;
+    }
+    if (cnx != nullptr) {
+        (void)picoquic_close(cnx, h3_error);
+    }
 }
 
 void Client::Impl::FailStream(std::uint64_t stream_id, const std::string& reason) {
@@ -515,8 +965,7 @@ void Client::Impl::CaptureHeader(StreamState* stream) {
 
 void Client::Impl::HandleStreamData(picoquic_cnx_t* cnx, std::uint64_t stream_id,
                                     std::uint8_t* bytes, std::size_t length, bool fin) {
-    // 服务端控制流（3）、QPACK encoder/decoder（7/11）都是单向流，本实现不使用
-    // 动态表，直接忽略。只解析客户端发起的双向流（0, 4, 8, ...）。
+    // 调用方（OnStreamBytes）已按流类型分流；这里只处理客户端双向流（0, 4, 8, ...）。
     if ((stream_id & 0x3U) != 0) {
         return;
     }
@@ -546,9 +995,8 @@ void Client::Impl::HandleStreamData(picoquic_cnx_t* cnx, std::uint64_t stream_id
                 stream.failed = true;
                 stream.fail_reason = "HTTP/3 parse failed on stream " + std::to_string(stream_id) +
                                      ", error " + HexCode(error_found);
-                last_error = error_found;
                 // 与 picoquic demo 客户端一致：解析失败直接关连接，避免状态机继续跑。
-                (void)picoquic_close(cnx, error_found);
+                FailConnection(cnx, error_found, "HTTP/3 response parsing failed");
                 return;
             }
             if (available_data > 0) {
@@ -558,8 +1006,8 @@ void Client::Impl::HandleStreamData(picoquic_cnx_t* cnx, std::uint64_t stream_id
                     stream.failed = true;
                     stream.fail_reason = "HTTP/3 response body exceeds limit (" +
                                          std::to_string(max_body) + " bytes)";
-                    last_error = H3ZERO_INTERNAL_ERROR;
-                    (void)picoquic_close(cnx, H3ZERO_INTERNAL_ERROR);
+                    FailConnection(cnx, H3ZERO_INTERNAL_ERROR,
+                                   "HTTP/3 response body exceeds the configured limit");
                     return;
                 }
                 if (!stream.flow_opened) {
@@ -599,19 +1047,24 @@ std::unique_ptr<Client> Client::Connect(net::http2::Transport* transport, const 
         SetError(error, "transport is null");
         return nullptr;
     }
-    if (sni.empty()) {
-        SetError(error, "SNI must not be empty");
+
+    // D15：把 `:authority` 与 TLS SNI 分开计算。旧用法 `Connect(transport,
+    // "host:port")` 现在会得到 SNI=host、authority=host:port。
+    std::string effective_sni;
+    std::string authority;
+    if (!BuildAuthority(sni, options, &authority, &effective_sni, error)) {
         return nullptr;
     }
 
     auto impl = std::make_unique<Impl>();
     impl->transport = transport;
-    impl->sni = sni;
+    impl->sni = effective_sni;
+    impl->authority = authority;
     impl->options = options;
 
     quic::PicoquicConfig config;
     config.alpn = "h3";
-    config.sni = sni;
+    config.sni = effective_sni;
     // D04：把证书校验开关与 CA 路径透传到 QUIC 层。默认仍是 false（本地自签），
     // 但调用方现在可以通过 Options 真正打开校验。
     config.verify_peer = options.verify_peer;
@@ -646,6 +1099,7 @@ bool Client::Poll(std::string* error) {
     std::string poll_error;
     if (!state.connection->PollFor(&poll_error, kClientPollWaitMs)) {
         state.closed = true;
+        poll_error = state.PollReason(poll_error);
         if (state.close_reason.empty()) {
             state.close_reason = poll_error;
         }
@@ -653,8 +1107,15 @@ bool Client::Poll(std::string* error) {
         return false;
     }
     if (state.closed) {
-        SetError(error, state.close_reason.empty() ? "connection closed" : state.close_reason);
+        if (state.close_reason.empty()) {
+            state.close_reason = state.PollReason(std::string());
+        }
+        SetError(error, state.close_reason);
         return false;
+    }
+    // D21：成功路径清空上一次残留的错误，避免调用方误读旧超时字符串。
+    if (error != nullptr) {
+        error->clear();
     }
     return true;
 }
@@ -669,7 +1130,7 @@ bool Client::Send(const Request& req, std::string* error) {
     // D10：method/path/header 校验与编码都是纯本地操作，放在握手之前，
     // 参数错误立即返回，不会被 5s 握手超时掩盖。
     std::vector<std::uint8_t> bytes;
-    if (!BuildRequestBytes(req, state.Authority(), &bytes, error)) {
+    if (!BuildRequestBytes(req, state.authority, &bytes, error)) {
         return false;
     }
 
@@ -691,6 +1152,7 @@ bool Client::Send(const Request& req, std::string* error) {
         std::string poll_error;
         if (!state.connection->PollFor(&poll_error, static_cast<int>(remaining))) {
             state.closed = true;
+            poll_error = state.PollReason(poll_error);
             if (state.close_reason.empty()) {
                 state.close_reason = poll_error;
             }
@@ -712,6 +1174,15 @@ bool Client::Send(const Request& req, std::string* error) {
     }
 
     const std::uint64_t stream_id = picoquic_get_next_local_stream_id(cnx, 0);
+
+    // D16：GOAWAY 之后拒绝创建号 >= goaway_id 的新流（RFC 9114 §5.2）。
+    if (state.goaway_received && stream_id >= state.goaway_id) {
+        SetError(error, "server sent GOAWAY (last accepted stream id " +
+                            std::to_string(state.goaway_id) + "); refusing new stream " +
+                            std::to_string(stream_id));
+        return false;
+    }
+
     auto inserted = state.streams.try_emplace(stream_id);
     if (!inserted.second) {
         SetError(error, "QUIC stream " + std::to_string(stream_id) + " already exists");
@@ -728,6 +1199,10 @@ bool Client::Send(const Request& req, std::string* error) {
 
     state.pending.push_back(stream_id);
     state.last_stream_id = stream_id;
+    // D21：成功路径清空错误。
+    if (error != nullptr) {
+        error->clear();
+    }
     return true;
 }
 
@@ -773,6 +1248,10 @@ bool Client::Receive(Response* resp, std::string* error) {
             *resp = stream.response;
             state.streams.erase(it);
             state.pending.pop_front();
+            // D21：成功路径清空错误。
+            if (error != nullptr) {
+                error->clear();
+            }
             return true;
         }
         if (state.closed) {
@@ -790,6 +1269,7 @@ bool Client::Receive(Response* resp, std::string* error) {
         std::string poll_error;
         if (!state.connection->PollFor(&poll_error, static_cast<int>(remaining))) {
             state.closed = true;
+            poll_error = state.PollReason(poll_error);
             if (state.close_reason.empty()) {
                 state.close_reason = poll_error;
             }
@@ -797,6 +1277,13 @@ bool Client::Receive(Response* resp, std::string* error) {
             return false;
         }
     }
+}
+
+std::string Client::Impl::PollReason(const std::string& poll_error) const {
+    if (callback_exception) {
+        return "exception escaped HTTP/3 callback";
+    }
+    return poll_error.empty() ? "connection closed" : poll_error;
 }
 
 bool Client::Close(std::uint64_t application_error_code, std::string* error) {
@@ -840,7 +1327,27 @@ std::string Client::Alpn() const {
 }
 
 std::uint64_t Client::LastStreamId() const noexcept {
-    return m_impl == nullptr ? 0 : m_impl->last_stream_id;
+    return m_impl == nullptr ? kInvalidStreamId : m_impl->last_stream_id;
+}
+
+std::string Client::Authority() const {
+    return m_impl == nullptr ? std::string() : m_impl->authority;
+}
+
+std::string Client::Sni() const {
+    return m_impl == nullptr ? std::string() : m_impl->sni;
+}
+
+bool Client::GoAwayReceived() const noexcept {
+    return m_impl != nullptr && m_impl->goaway_received;
+}
+
+std::uint64_t Client::GoAwayId() const noexcept {
+    return m_impl == nullptr ? kInvalidStreamId : m_impl->goaway_id;
+}
+
+bool Client::ServerSettingsReceived() const noexcept {
+    return m_impl != nullptr && m_impl->server_settings_received;
 }
 
 std::uint64_t Client::ConnectionError() const noexcept {

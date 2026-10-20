@@ -17,15 +17,16 @@
  *
  * **不能**用阻塞 fd：那会让 SSL 内部阻塞整个 worker 线程。
  *
- * ## 明确未实现
+ * ## 安全默认
  *
- * - **证书校验默认关闭**（`verify_peer = false`）。生产必须打开并配置 CA
- *   路径，否则等于不做身份验证 —— 这里为了让自签名证书的本地测试能跑通
- *   才默认关闭，属于**测试便利**而非安全默认；
- * - `verify_peer = true` 时：优先加载显式 `ca_file`/`ca_path`，否则加载系统
- *   默认信任库（`SSL_CTX_set_default_verify_paths`，尊重 `SSL_CERT_FILE` /
- *   `SSL_CERT_DIR`）；`server_name` 非空时校验证书 SAN/CN（IP 字面量走
- *   `X509_VERIFY_PARAM_set1_ip_asc`）；
+ * - **默认校验对端证书**（`verify_peer = true`）：优先加载显式
+ *   `ca_file`/`ca_path`，否则系统默认信任库（`SSL_CTX_set_default_verify_paths`，
+ *   尊重 `SSL_CERT_FILE` / `SSL_CERT_DIR`）；`server_name` 非空时校验证书
+ *   SAN/CN（IP 字面量走 `X509_VERIFY_PARAM_set1_ip_asc`）；
+ * - 自签名/本地测试必须**显式**传 `verify_peer = false`，该开关只用于测试；
+ *   默认值早年是 false（测试便利），审计发现「不安全默认」后改为 true。
+ *   依赖旧默认的调用方会因证书不受信而握手失败，这是 fail-closed 的预期
+ *   行为 —— 正确做法是配置 CA，而不是关闭校验；
  * - **服务端 TLS**（只有客户端）；
  * - **会话复用 / 0-RTT**。
  *
@@ -41,8 +42,10 @@
  * ## 边界与陷阱
  * - 客户端 socket 会被设成**非阻塞**：阻塞 fd 会让 SSL 卡住整个 worker 线程；
  * - 证书校验默认关闭（`verify_peer = false`），生产必须打开并配置 CA；
- * - `Read`/`Write` 把超时、EOF、错误都收敛为「返回 0」，细节在
- *   `LastErrorString()`/`last_error` 路径里；
+ * - `Read`/`Write` 把超时、EOF、错误都收敛为「返回 0」，细节在公开的
+ *   `LastError()`/`LastErrorString()` 里；
+ * - `Close()`/析构会发 close_notify（只发一次，不等对端回包），保证对端
+ *   能区分「正常结束」与「TCP 被截断」；
  * - 只实现客户端，没有服务端 TLS 与会话复用。
  */
 #pragma once
@@ -55,6 +58,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 
 typedef struct ssl_ctx_st SSL_CTX;
@@ -75,7 +79,9 @@ namespace go2cpp::net::http2 {
  * - `m_ssl == nullptr` 时 `Closed()` 恒真，所有读写返回 0；
  * - `m_fd` 与 `m_socket->fd()` 一致，且被设为非阻塞；
  * - `m_eof` 一旦置位就不再尝试 SSL_read/SSL_write；
- * - 非线程安全：与 `Connection` 一样只由一个 Fiber 驱动。
+ * - 非线程安全：与 `Connection` 一样只由一个 Fiber 驱动；只有
+ *   `LastError()`/`LastErrorString()` 允许从其它线程查询；
+ * - `Close()` 之后 `Closed()` 为 true，且 close_notify 至多发送一次。
  */
 class TlsTransport final : public Transport {
 public:
@@ -85,7 +91,8 @@ public:
      * @brief 创建一个客户端 TLS 传输。
      * @param socket 已连接（TCP 握手完成）的 socket，所有权转入。
      * @param server_name SNI 主机名；可为空字符串。
-     * @param verify_peer 是否校验证书链与主机名；测试自签名证书时传 false。
+     * @param verify_peer 是否校验证书链与主机名，**默认 true（安全默认）**；
+     *        只有自签名证书的本地测试才显式传 false，生产禁用。
      * @param timeout 握手或**单次** Read/Write 的总 deadline（不是每轮
      *        WANT_READ/WANT_WRITE 重新计时）；必须是有限值。`Duration::max()`
      *        会被拒绝并返回 nullptr，避免 `poll(-1)` 永久挂起。
@@ -103,7 +110,7 @@ public:
      *        （`h2` 优先、`http/1.1` 兜底）。
      */
     static std::unique_ptr<TlsTransport> CreateClient(
-        Socket::Ptr socket, const std::string& server_name, bool verify_peer = false,
+        Socket::Ptr socket, const std::string& server_name, bool verify_peer = true,
         Duration timeout = Duration{10000}, const std::string& ca_file = {},
         const std::string& ca_path = {});
 
@@ -138,6 +145,30 @@ public:
     std::string TlsVersion() const;
 
     /**
+     * @brief 发送 close_notify 并结束 TLS 会话（可重复调用，只发一次）。
+     * @details 析构会自动调用。只执行一次 `SSL_shutdown` 语义的关闭：把
+     *          close_notify 写进 socket 即返回，不等待对端回包；写缓冲满时
+     *          最多等待 `min(m_timeout, 500ms)` 处理 WANT_WRITE，避免析构
+     *          在坏网络下无限挂起。调用后 `Closed()` 为 true。
+     */
+    void Close();
+
+    /**
+     * @brief 最近一次 `SSL_get_error()` 的结果（OpenSSL 的 `SSL_ERROR_*` 值）。
+     * @return `0`（`SSL_ERROR_NONE`）表示尚未发生错误；`SSL_ERROR_SSL` 表示
+     *         协议/证书错误，`SSL_ERROR_SYSCALL` 表示 TCP 层错误。
+     */
+    int LastError() const noexcept;
+
+    /**
+     * @brief 最近一次 TLS 错误的可读描述。
+     * @details 包含 `SSL_ERROR_*` 名称、`ERR_get_error()` 队列文本，以及证书
+     *          校验失败时的 `X509_verify_cert_error_string()` 原因（自签名、
+     *          过期、主机名不匹配等）。未发生错误时返回空字符串。
+     */
+    std::string LastErrorString() const;
+
+    /**
      * @brief 读最多 capacity 字节（非阻塞 fd + poll 重试）。
      *
      * ## 步骤
@@ -159,6 +190,7 @@ public:
     std::size_t Write(const std::uint8_t* data, std::size_t length) override;
     bool Closed() const noexcept override {
         return m_ssl == nullptr || m_eof ||
+               m_shutdown_sent.load(std::memory_order_acquire) ||
                m_cancelled.load(std::memory_order_acquire);
     }
 
@@ -169,8 +201,8 @@ private:
     std::chrono::steady_clock::time_point Deadline() const;
     /// 等待 fd 就绪；按 100ms 分片检查取消/关闭/总 deadline。true 表示可以重试。
     bool WaitFor(bool want_read, std::chrono::steady_clock::time_point deadline);
-    /// 把 OpenSSL 错误转成可读文本。
-    std::string LastErrorString() const;
+    /// 记录最近一次 SSL_get_error 与 ERR 队列，供公开查询接口使用。
+    void RecordSslError(int ssl_error);
 
     /// 底层 TCP socket（所有权在本类）；构造函数取 fd，Closed() 检查它。
     Socket::Ptr m_socket;
@@ -186,6 +218,14 @@ private:
     bool m_eof{false};
     /// 取消标记；Cancel() 置位，WaitFor()/Closed() 读取（只从 false 变 true）。
     std::atomic<bool> m_cancelled{false};
+    /// close_notify 是否已发出；Close()/析构据此保证只发一次，Closed() 读取。
+    std::atomic<bool> m_shutdown_sent{false};
+    /// 最近一次 SSL_get_error 的结果；0 = SSL_ERROR_NONE，可跨线程查询。
+    std::atomic<int> m_last_ssl_error{0};
+    /// 最近一次错误的可读文本；由 m_error_mutex 保护。
+    std::string m_last_error;
+    /// 保护 m_last_error；RecordSslError() 写、LastErrorString() 读。
+    mutable std::mutex m_error_mutex;
     /// socket fd 副本；构造时取，WaitFor() 与 SSL_set_fd() 使用。
     int m_fd{-1};
 };

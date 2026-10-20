@@ -43,8 +43,9 @@
  * ## 边界与陷阱
  *
  * - 静态注册发生在 `main` 之前；未链接本翻译单元时 `[os]` 段不会出现；
- * - `MaxFileSize` 的 0 表示不限制，负数被归一为 0；
- * - 配置值是 `int`，超大上限会先被 `std::clamp` 钳制。
+ * - `MaxFileSize` 的 0 表示不限制，负数被归一为 0；**没有 clamp**：
+ *   配置类型是 `int`，能表达的最大上限是 `INT_MAX`（约 2 GiB），再大只能设 0；
+ *   `std::clamp` 只用于 `ReadBufferSize` 的 4 KiB..16 MiB。
  */
 #include "go2cpp/os/os.hpp"
 #include "go2cpp/config/config.hpp"
@@ -85,7 +86,9 @@ std::size_t ReadBufferSize() {
     return static_cast<std::size_t>(clamped);
 }
 
-// 0/负数都归一为「不限制」，与配置文档一致。
+// 0/负数都归一为「不限制」。这里**不做 clamp**（也没有可钳的上限）：
+// 配置类型是 int，能显式表达的最大上限是 INT_MAX（约 2 GiB）；更大的文件
+// 只能设 0 表示不限制，或把配置项改成 int64（当前未提供，见审计 D9）。
 std::size_t MaxFileSize() {
     const int configured = ReadIntConfig("os.max_file_size", 268435456);
     return configured > 0 ? static_cast<std::size_t>(configured) : 0;

@@ -2427,6 +2427,12 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     }
 
     if (task->state() != GState::kRunnable || !task->queued()) {
+        // B2：prepare_enqueue 在本函数内已把 m_queued 置 true。若随后任务
+        // 被取消 / 被别的 worker 抢走，这里直接 return 会留下一个没有队列
+        // 节点的 reservation；之后 try_mark_queued 永远失败，G 再也无法
+        // 入队（唤醒丢失）。清掉它：此时任务已不在 kRunnable（或 queued
+        // 本就是 false），不会误清另一个有效节点。
+        task->clear_queued();
         if (registered_here) {
             std::shared_ptr<Task> abandoned;
             {
@@ -3496,6 +3502,34 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     bool retired = false;
     std::size_t maintenance_budget = 0;
 
+    // B1：dequeue 的 claim 失败收尾。旧实现无条件 clear_queued()，会把
+    // 「pop 之后、clear 之前」新发布的 reservation 一起清掉，制造
+    // 「kRunnable 但没有任何队列节点」的唤醒丢失。这里按任务当前状态
+    // 条件清理：确实不再需要队列节点才清，仍可运行且无执行者则补发布自愈。
+    const auto recover_unclaimed = [this](const std::shared_ptr<Task>& task) {
+        bool need_republish = false;
+        {
+            std::lock_guard<std::mutex> lock(task->m_transition_mutex);
+            const auto state = task->m_state.load(std::memory_order_relaxed);
+            const bool executing =
+                task->m_execution_claim.load(std::memory_order_relaxed);
+            if (state == GState::kRunnable && !executing) {
+                // 仍可运行且没有执行者：m_queued 为 true 说明已有更新的
+                // 队列节点（保留）；为 false 说明这个 G 已经没有节点，
+                // 必须补发布，否则它将永久停在 Runnable。
+                need_republish =
+                    !task->m_queued.load(std::memory_order_relaxed);
+            } else {
+                // 已不可运行 / 已被别的 worker claim：刚 pop 的节点是残留，
+                // 清除 queued 不会影响任何有效 reservation。
+                task->m_queued.store(false, std::memory_order_release);
+            }
+        }
+        if (need_republish) {
+            (void)enqueue(task);
+        }
+    };
+
     for (;;) {
         std::shared_ptr<Task> task;
         bool claimed = false;
@@ -3520,7 +3554,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
                 claimed = task->try_mark_running();
                 if (!claimed) {
-                    task->clear_queued();
+                    recover_unclaimed(task);
                 }
             }
         }
@@ -3578,7 +3612,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
                     claimed = task->try_mark_running();
                     if (!claimed) {
-                        task->clear_queued();
+                        recover_unclaimed(task);
                     }
                     return true;
                 };
@@ -3760,10 +3794,9 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
                     claimed = task->try_mark_running();
                     if (!claimed) {
-                        // The node is no longer present in a queue. Clear its
-                        // reservation even when cancellation or a stale
-                        // duplicate made the execution claim fail.
-                        task->clear_queued();
+                        // 节点已经从队列取出：按任务当前状态条件清理
+                        // reservation，必要时补发布自愈（B1）。
+                        recover_unclaimed(task);
                     }
                 }
             }

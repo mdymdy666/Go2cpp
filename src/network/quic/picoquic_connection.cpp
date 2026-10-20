@@ -77,6 +77,8 @@ constexpr int kDefaultPollWaitMs = 1000;
 constexpr int kMaxWaitSliceMs = 1000;
 /// 非阻塞 Transport 连续空转时的退避上限（毫秒），避免 100% CPU（审计 D07）。
 constexpr int kIdleBackoffMaxMs = 20;
+/// 回调内异常时上报的关闭码（与 HTTP/3 INTERNAL_ERROR 同值，见 RFC 9114 §8.1）。
+constexpr std::uint64_t kInternalErrorCode = 0x0102;
 
 /// 距 deadline 的剩余毫秒数（已过期返回 0）。
 std::int64_t RemainingMs(Clock::time_point deadline) {
@@ -152,6 +154,8 @@ struct PicoquicConnection::Impl {
     bool closed{false};
     /// 是否已经发起过本地 close（保证 `picoquic_close` 只调一次）。
     bool close_requested{false};
+    /// 回调中捕获了异常（D18）：C 回调边界绝不能传播 C++ 异常。
+    bool callback_exception{false};
     std::uint64_t last_error{0};
     /// 非阻塞 Transport 空转时的退避步长（毫秒）。
     int idle_backoff_ms{1};
@@ -186,52 +190,63 @@ int PicoquicConnection::Impl::StreamCallback(picoquic_cnx_t* cnx, std::uint64_t 
     if (self == nullptr) {
         return 0;
     }
-    switch (event) {
-        case picoquic_callback_ready:
-            self->handshake_done = true;
-            break;
-        case picoquic_callback_stream_data:
-            if (bytes != nullptr && length > 0) {
-                auto& buf = self->received[stream_id];
-                buf.insert(buf.end(), bytes, bytes + length);
-            }
-            break;
-        case picoquic_callback_stream_fin:
-            if (bytes != nullptr && length > 0) {
-                auto& buf = self->received[stream_id];
-                buf.insert(buf.end(), bytes, bytes + length);
-            }
-            self->finished[stream_id] = true;
-            break;
-        case picoquic_callback_stream_reset:
-            self->stream_error[stream_id] = picoquic_get_remote_stream_error(cnx, stream_id);
-            break;
-        case picoquic_callback_stop_sending:
-            // 对端要求我们停止发送：记录该流不可再写（错误码无意义，记 0）。
-            self->stream_error.emplace(stream_id, 0);
-            break;
-        // D05/D09：picoquic 的关闭类事件 bytes/len 恒为 NULL/0，关闭码必须从
-        // picoquic_get_*_error() 取，不能解 bytes。
-        case picoquic_callback_application_close:
-            self->closed = true;
-            self->last_error = CloseErrorCode(cnx);
-            if (self->poll_error.empty()) {
-                self->poll_error = "connection closed by application";
-            }
-            break;
-        case picoquic_callback_stateless_reset:
-            self->closed = true;
-            self->last_error = CloseErrorCode(cnx);
-            if (self->poll_error.empty()) {
-                self->poll_error = "connection reset (stateless reset)";
-            }
-            break;
-        case picoquic_callback_close:
-            self->closed = true;
-            self->last_error = CloseErrorCode(cnx);
-            break;
-        default:
-            break;
+    // D18：回调体可能做 map/vector 分配（bad_alloc、length_error），异常绝不能
+    // 穿过 picoquic 的 C 帧；catch 内只做不抛的赋值与 picoquic_close。
+    try {
+        switch (event) {
+            case picoquic_callback_ready:
+                self->handshake_done = true;
+                break;
+            case picoquic_callback_stream_data:
+                if (bytes != nullptr && length > 0) {
+                    auto& buf = self->received[stream_id];
+                    buf.insert(buf.end(), bytes, bytes + length);
+                }
+                break;
+            case picoquic_callback_stream_fin:
+                if (bytes != nullptr && length > 0) {
+                    auto& buf = self->received[stream_id];
+                    buf.insert(buf.end(), bytes, bytes + length);
+                }
+                self->finished[stream_id] = true;
+                break;
+            case picoquic_callback_stream_reset:
+                self->stream_error[stream_id] = picoquic_get_remote_stream_error(cnx, stream_id);
+                break;
+            case picoquic_callback_stop_sending:
+                // 对端要求我们停止发送：记录该流不可再写（错误码无意义，记 0）。
+                self->stream_error.emplace(stream_id, 0);
+                break;
+            // D05/D09：picoquic 的关闭类事件 bytes/len 恒为 NULL/0，关闭码必须从
+            // picoquic_get_*_error() 取，不能解 bytes。
+            case picoquic_callback_application_close:
+                self->closed = true;
+                self->last_error = CloseErrorCode(cnx);
+                if (self->poll_error.empty()) {
+                    self->poll_error = "connection closed by application";
+                }
+                break;
+            case picoquic_callback_stateless_reset:
+                self->closed = true;
+                self->last_error = CloseErrorCode(cnx);
+                if (self->poll_error.empty()) {
+                    self->poll_error = "connection reset (stateless reset)";
+                }
+                break;
+            case picoquic_callback_close:
+                self->closed = true;
+                self->last_error = CloseErrorCode(cnx);
+                break;
+            default:
+                break;
+        }
+    } catch (...) {
+        self->callback_exception = true;
+        self->closed = true;
+        self->last_error = kInternalErrorCode;
+        if (cnx != nullptr) {
+            (void)picoquic_close(cnx, kInternalErrorCode);
+        }
     }
     return 0;
 }
@@ -243,7 +258,12 @@ PicoquicConnection::~PicoquicConnection() {
         // D01：析构必须把 CONNECTION_CLOSE 发出去，否则服务端连接槽一直占着
         // （picoquicdemo 默认 -x 256，第 257 个连接会被拒）。best-effort：
         // 这里不报告错误，显式关闭请调 Close()。
-        (void)Close(/*application_error_code=*/0, /*error=*/nullptr);
+        // Transport::Write 由调用方实现，可能抛异常；析构中必须吞掉，
+        // 否则 std::terminate（D18 的同一原则：不让异常越过生命周期边界）。
+        try {
+            (void)Close(/*application_error_code=*/0, /*error=*/nullptr);
+        } catch (...) {
+        }
         // picoquic_free 会连带释放 cnx，不需要单独 delete cnx。
         picoquic_free(m_impl->quic);
         m_impl->quic = nullptr;
@@ -389,6 +409,14 @@ bool PicoquicConnection::PollFor(std::string* error, int timeout_ms) {
         if (!s.PrepareAndSend(error)) {
             return false;
         }
+        if (s.callback_exception) {
+            s.closed = true;
+            s.poll_error = "exception escaped stream callback";
+            if (error != nullptr) {
+                *error = s.poll_error;
+            }
+            return false;
+        }
         if (s.closed) {
             if (error != nullptr) {
                 *error = s.poll_error.empty() ? "connection closed" : s.poll_error;
@@ -469,6 +497,14 @@ bool PicoquicConnection::PollFor(std::string* error, int timeout_ms) {
                                      picoquic_current_time()) != 0) {
             s.poll_error = "picoquic_incoming_packet failed";
             s.closed = true;  // D12：出错后不再继续使用该连接
+            if (error != nullptr) {
+                *error = s.poll_error;
+            }
+            return false;
+        }
+        if (s.callback_exception) {
+            s.closed = true;
+            s.poll_error = "exception escaped stream callback";
             if (error != nullptr) {
                 *error = s.poll_error;
             }

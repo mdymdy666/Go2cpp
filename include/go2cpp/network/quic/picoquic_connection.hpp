@@ -93,7 +93,8 @@ struct PicoquicConfig {
     /// 真正的 HTTP/3 用 `h3`，但那需要额外的 QPACK 解码层（本封装不做）。
     std::string alpn{"hq-interop"};
 
-    /// SNI（TLS 里的服务器名）。
+    /// SNI（TLS 里的服务器名）。HTTP/3 的 `:authority` 由上层单独构造，
+    /// 两者不要混用（同一字段既当 SNI 又当 authority 是审计 D15 的缺陷）。
     std::string sni{"localhost"};
 
     /// 是否验证对端证书。
@@ -123,14 +124,19 @@ struct PicoquicConfig {
  * **非线程安全** —— 所有方法必须在同一个线程（或同一个 Fiber 序列）里调用。
  *
  * ## 定位
- * 被 QUIC/HTTP-3 的示例与测试使用（`example/network/quic_*`、`tests/network/quic_*`），
- * 字节通道由调用方以 `net::http2::Transport*` 注入。与 `http2::Connection` 并列：
- * 后者自己实现协议，前者把协议全部交给 picoquic，只做 Fiber 粘合。
+ * 被 `example/network/picoquic_hq_client.cpp` 与
+ * `src/network/http3/client.cpp`（HTTP/3 客户端）使用；字节通道由调用方以
+ * `net::http2::Transport*` 注入。与 `http2::Connection` 并列：后者自己实现
+ * 协议，前者把协议全部交给 picoquic，只做 Fiber 粘合。
+ * 仓库内**没有** `tests/network/quic_*` 测试（审计 D19：HTTP/3 测试缺口）。
  *
  * ## 不变量
  * - 所有方法必须在同一线程/Fiber 序列调用（非线程安全）；
  * - `HandshakeComplete()` 为真之前 `WriteStream()` 不可用；
  * - `ReadStream()` 返回 0 表示「该流暂时没有数据」，不是 EOF；
+ *   判断结束要用 `StreamFinished(stream_id)`（审计 D17）；
+ * - 回调内发生的 C++ 异常会被捕获并置 `closed`（审计 D18），
+ *   `Poll()` 返回 false 且错误为 "exception escaped stream callback"；
  * - 对象不拥有 `Transport` 的生命周期：`Transport` 必须比本对象**活得久**，
  *   因为析构会尽力发送 CONNECTION_CLOSE（见 `Close()`）后才释放 picoquic 上下文；
  * - 析构是 best-effort 关闭：显式 `Close()` 才能拿到失败原因。
@@ -235,6 +241,9 @@ public:
     bool StreamFinished(std::uint64_t stream_id) const noexcept;
 
     /// 流最近一次 reset 的对端错误码；未 reset 返回 0。
+    ///
+    /// 与 `StreamFinished()` 配合使用：FIN 之后不会再有数据；reset 之后
+    /// 该流的数据应被丢弃（错误码来自 `picoquic_get_remote_stream_error`）。
     std::uint64_t StreamErrorCode(std::uint64_t stream_id) const noexcept;
 
     /// 已收到数据的流号列表（便于调用方知道哪些流有数据）。
@@ -242,6 +251,10 @@ public:
                            std::size_t* count) const;
 
     /// 最近一次错误码（picoquic 的 application/transport error code）。
+    ///
+    /// 关闭类事件触发后为关闭码（对端 application > 本地 application >
+    /// 对端 transport > 本地 transport）；`Close(code)` 后为 `code`。
+    /// 回调内发生 C++ 异常时为 0x0102（HTTP/3 INTERNAL_ERROR）。
     std::uint64_t LastErrorCode() const noexcept;
 
     /// 底层 picoquic 连接句柄（`picoquic_cnx_t*`），仅供调试/扩展用。

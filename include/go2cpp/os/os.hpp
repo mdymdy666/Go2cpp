@@ -110,7 +110,11 @@ bool SaveDefaultConfig(const std::string& path = "app.ini",
 /** @brief `ReadFile` 使用的缓冲区大小（来自 `os.default_read_buffer_size`，带安全钳制）。 */
 std::size_t ReadBufferSize();
 
-/** @brief `ReadFile` 允许的单文件上限（来自 `os.max_file_size`；0 表示不限制）。 */
+/**
+ * @brief `ReadFile` 允许的单文件上限（来自 `os.max_file_size`；0 表示不限制）。
+ * @note 配置项类型是 `int`：能显式表达的最大上限是 `INT_MAX`（约 2 GiB）。
+ *       需要更大的上限时设为 0（不限制），或把配置项改成 `int64`。
+ */
 std::size_t MaxFileSize();
 
 }  // namespace go2cpp::os

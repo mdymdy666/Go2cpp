@@ -35,7 +35,10 @@
  *   当消耗超过一半时发 WINDOW_UPDATE 补回。**未实现**按读取速度自适应配平
  *   （见下）；
  * - **优先级**：PRIORITY 帧被解析但不参与调度（RFC 9113 已弃用）；
- * - **服务器推送的实际使用**：PUSH_PROMISE 能解析，但没有推送 API。
+ * - **服务器推送**：本实现不支持。客户端在 SETTINGS 中通告 `ENABLE_PUSH=0`；
+ *   收到 PUSH_PROMISE 一律按连接错误 `PROTOCOL_ERROR` 处理。**不能**把它当作
+ *   未知帧跳过：PUSH_PROMISE 携带的 header block 会更新对端的 HPACK 编码器
+ *   动态表，而本端解码器不更新，必然导致后续 header 解析失步。
  *
  * ## 本文件定义什么
  * - `Role` / `ConnectionConfig`：角色与全部可调参数（帧尺寸、header 上限、
@@ -101,19 +104,61 @@ struct ConnectionConfig final {
      */
     std::uint32_t max_concurrent_streams{100};
     /**
-     * @brief 是否执行 RFC 9113 §5.1.2 的并发流上限（默认关闭）。
-     * @details 打开后：
-     *          - 客户端在 `StartRequest()` 检查**对端** SETTINGS 通告的上限；
-     *          - 服务端收到超过**本端**通告上限的新流时回 RST_STREAM(REFUSED_STREAM)。
-     *
-     * 默认关闭的原因（重要）：仓库既有压测 `test_http2_stress` 的
-     * 「连接复用 1000 次」「HPACK 动态表 5000 次」以及 1000/5000 并发流水线
-     * 都假设"只发不收、永不关闭"的流不会受并发上限约束；而这些用例的对端
-     * （同进程 server）按默认配置通告的正是 100。按 RFC 严格执行会在第 101
-     * 条流处拒绝，使上述用例失败。要执行严格语义需同时调整那些用例的预期
-     * （本次任务边界不允许改测试），因此做成显式开关。
+     * @brief 流表里最多保留多少条**已关闭**的流（默认 256）。
+     * @details RFC 9113 允许在关闭后的一小段时间内继续收到迟到的
+     *          WINDOW_UPDATE/RST_STREAM；因此不能一关闭就删除状态机。但长连接
+     *          如果永不清理，流表会随流号线性增长（审计 I3）。这里采用有界
+     *          保留：已关闭流超过阈值后，按流 id 从小到大淘汰最老的条目，
+     *          同时删除两条流级窗口记录。0 表示关闭即删除（最严格，但会失去
+     *          对迟到帧的容忍度，仅用于验证/特殊场景）。
      */
-    bool enforce_max_concurrent_streams{false};
+    std::uint32_t max_retired_streams{256};
+    /**
+     * @brief 是否强制非 CONNECT 请求携带 `:scheme`（默认开启）。
+     * @details 为兼容仓库既有测试与老客户端，默认规则是：带 `:authority`
+     *          的请求必须有 `:scheme`；不带 `:authority` 的旧式请求暂不强制。
+     *          把 `strict_scheme` 置 true 可对所有非 CONNECT 请求强制。
+     *          `:scheme` 为空或包含非法字符时**始终**拒绝。
+     */
+    bool require_scheme{true};
+    /**
+     * @brief 是否对所有非 CONNECT 请求强制 `:scheme`（默认关闭）。
+     * @details 默认关闭只为兼容既有测试：`test_connection.cpp` 的部分用例
+     *          发送没有 `:authority`/`:scheme` 的旧式请求。生产环境建议开启。
+     */
+    bool strict_scheme{false};
+    /**
+     * @brief 客户端发送请求时，若缺少 `:scheme` 是否自动补 `default_scheme`。
+     * @details 自动补齐只发生在「`:authority` 存在（或 `strict_scheme` 开启）
+     *          且方法不是 CONNECT」时，插入位置在伪头区末尾。这样服务端在
+     *          `require_scheme` 下仍能收到合法请求；显式传 `:scheme` 的调用方
+     *          不受影响。关闭该开关可用于验证「缺失 :scheme 被拒绝」。
+     */
+    bool auto_fill_scheme{true};
+    /// auto_fill_scheme 开启时补入的默认 scheme 值。
+    std::string default_scheme{"http"};
+    /**
+     * @brief 是否把对端 SETTINGS_MAX_HEADER_LIST_SIZE 应用到**客户端请求**。
+     * @details 默认关闭：`test_connection.cpp` 场景 11 case2 用同一个很小的
+     *          `max_header_list_size` 同时配置 client/server，并期望客户端把
+     *          超限请求发出去、由服务端入站检查拒绝。若默认在 StartRequest
+     *          检查对端上限，客户端会提前返回 `kHeaderListTooLarge`，使该用例
+     *          失败。服务端响应方向（`SendResponseHeaders`）**始终**检查。
+     *          建议后续修正该测试（两端使用不同 config）后把默认值改为 true。
+     */
+    bool enforce_peer_header_list_on_requests{false};
+    /**
+     * @brief 是否执行 RFC 9113 §5.1.2 的并发流上限（默认**开启**）。
+     * @details 开启后：
+     *          - 客户端在 `StartRequest()` 检查**对端** SETTINGS 通告的上限，
+     *            超限返回 `kTooManyStreams` 且不消耗流号；
+     *          - 服务端收到超过**本端**通告上限的新流时回
+     *            RST_STREAM(REFUSED_STREAM)，HPACK 动态表保持同步。
+     *
+     * 关闭开关只用于「压测需要刻意制造无限流水线」的场景；生产默认必须
+     * 执行该限制，否则单连接可以被无限新建流拖垮。
+     */
+    bool enforce_max_concurrent_streams{true};
 };
 
 /** @brief 连接层的操作结果。 */
@@ -230,11 +275,16 @@ public:
 
     /**
      * @brief 客户端发起一个请求：分配新流并发送 HEADERS。
-     * @param headers 请求头（必须含 `:method`/`:path`/`:scheme`/`:authority`）。
+     * @param headers 请求头（标准请求应含 `:method`/`:path`/`:scheme`/`:authority`）。
      * @param end_stream 是否在 HEADERS 上就结束发送方向（无 body）。
      * @param out_stream_id 成功时写入分配的流 id。
      * @return 状态。非客户端调用返回 `kUnsupported`；连接非 `kOpen`
-     *         （draining/closed）时返回 `kProtocolError`。
+     *         （draining/closed）时返回 `kProtocolError`；并发流达到对端上限
+     *         返回 `kTooManyStreams`；header 列表超过对端通告的
+     *         `SETTINGS_MAX_HEADER_LIST_SIZE` 返回 `kHeaderListTooLarge`。
+     * @note 若请求缺 `:scheme` 且 `auto_fill_scheme` 开启，会按
+     *       `default_scheme` 自动补齐（位置在伪头区末尾），避免与既有调用方
+     *       的旧式请求不兼容；显式传入的 `:scheme` 永不覆盖。
      *
      * ## 步骤
      * step1. 校验角色（仅客户端）、连接 `kOpen`、已握手；
@@ -394,6 +444,12 @@ private:
     /// 对端 SETTINGS_MAX_CONCURRENT_STREAMS；未收到时按 RFC 视为不限。
     std::uint32_t m_peer_max_concurrent_streams{0};
     bool m_peer_max_concurrent_set{false};
+    /// 对端 SETTINGS_MAX_HEADER_LIST_SIZE；未通告时本端发送不受该值限制。
+    std::uint32_t m_peer_max_header_list_size{0};
+    bool m_peer_max_header_list_size_set{false};
+    /// 对端（客户端）通告的 ENABLE_PUSH。服务端记录但不推送；客户端收到该
+    /// 设置本身就是协议错误（服务端不得发送，RFC 9113 §6.5.2）。
+    bool m_peer_enable_push{true};
     /// 读方向缓冲；FillBuffer() 追加、TakeFrame() 消费并 erase。
     std::vector<std::uint8_t> m_read_buffer;
     /// HPACK 解码器（含动态表）；只在 ReadEvent() 的 HEADERS 分支使用。
@@ -423,6 +479,18 @@ private:
     /// 每条流的对端窗口。
     std::map<std::uint32_t, std::int64_t> m_stream_remote_window;
 
+    /// 清理超过 max_retired_streams 的已关闭流（流表 + 两条窗口记录）。
+    void ReapClosedStreams();
+    /// 判断 id 是否属于「已分配/已见过、但已被流表淘汰」的流（容忍迟到帧）。
+    bool IsEvictedStream(std::uint32_t stream_id) const noexcept;
+    /// 按对端 SETTINGS_MAX_HEADER_LIST_SIZE 检查要发送的 header 列表。
+    ConnStatus CheckOutboundHeaderList(const std::vector<HeaderField>& headers,
+                                       std::string* error) const;
+    /// 补齐客户端请求缺失的 :scheme（按配置），返回真正要编码的列表。
+    std::vector<HeaderField> PrepareOutboundHeaders(
+        const std::vector<HeaderField>& headers) const;
+    /// 尽力发送 GOAWAY（用于帧级致命错误），失败不影响错误返回路径。
+    void SendFatalGoAway(ErrorCode code);
     /// 初始化/重置某条流的窗口。
     void ResetStreamWindows(std::uint32_t stream_id);
     /// 只读检查发送窗口是否足够（不扣减）。

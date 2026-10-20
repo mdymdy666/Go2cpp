@@ -38,6 +38,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <limits>
@@ -1686,6 +1687,61 @@ void Mutex::lock() {
  * 两者都用 `shared_ptr<WaitNode>` 保存，理由相同：唤醒发生在锁外，
  * 裸指针会让等待方在窗口内销毁节点。
  */
+
+namespace {
+
+/// `ConditionVariable::Wait` 重锁失败的可观测计数（D3，2026-10-20）。
+///
+/// 每 +1 表示 Wait 已经释放调用方的 mutex，却**没能重新持有**它。旧实现
+/// 这时直接 return false，而 Wait 的契约要求「返回 false 时 mutex 仍被
+/// 持有」；上层（RWMutex）据此对内部锁 Unlock() / 修改受保护容器，
+/// 在未持锁状态下就是 UB + 计数泄漏。
+std::atomic<std::uint64_t> g_cv_relock_failures{0};
+
+/// 无 park 重试预算。m_state 这类内部锁的临界区只有若干字段更新，正常
+/// 几次 TryLock 就能取回；预算留足跨核缓存行迁移的延迟。
+constexpr std::size_t kConditionRelockRetryLimit = 8192;
+
+/// @brief 条件变量重锁失败后，用不进入等待队列的 TryLock 抢回外部锁。
+/// @return true 表示已重新持有 mutex；false 表示预算内没抢到。
+/// @note 只用于调度器关闭 / G 已取消导致无法 park 的路径。此时锁通常空闲；
+///       抢不到说明持锁者本身也被挂起，继续等只会把「明确失败」变成挂死。
+bool TryRelockWithoutParking(Mutex& mutex) noexcept {
+    for (std::size_t attempt = 0; attempt < kConditionRelockRetryLimit;
+         ++attempt) {
+        if (mutex.TryLock()) {
+            return true;
+        }
+        RelaxCpu();
+        if ((attempt & 63U) == 63U) {
+            std::this_thread::yield();
+        }
+    }
+    return false;
+}
+
+/// @brief 重锁彻底失败：计数 + 前若干次打诊断 + 抛异常（不持锁）。
+/// @note 抛 std::runtime_error 而不是 std::logic_error，让上层
+///       （RWMutex）能把「锁已丢失」与「调用方用法错误」区分开。
+[[noreturn]] void ThrowConditionRelockFailure() {
+    const std::uint64_t count =
+        g_cv_relock_failures.fetch_add(1, std::memory_order_relaxed) + 1U;
+    if (count <= 8U) {
+        std::fprintf(stderr,
+                     "[go2cpp][sync][D3] ConditionVariable::Wait failed to "
+                     "reacquire its mutex (count=%llu); throwing, mutex NOT "
+                     "held\n",
+                     static_cast<unsigned long long>(count));
+        std::fflush(stderr);
+    }
+    throw std::runtime_error(
+        "go2cpp::sync::ConditionVariable::Wait: failed to reacquire the "
+        "mutex after waking (scheduler shut down while another waiter held "
+        "it); the mutex is NOT held");
+}
+
+}  // namespace
+
 struct ConditionVariable::Impl {
     /// @brief 保护 m_waiters；Wait 入队、NotifyOne/NotifyAll 出队。
     std::mutex m_mutex;
@@ -1714,7 +1770,12 @@ bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
         // Scheduler continuation，因此必须保留进入 Wait 前的锁状态。
         if (!preserve_lock) {
             mutex.Unlock();
-            (void)mutex.LockForConditionWait();
+            // D3：重锁失败 = mutex 未被持有。不能把 false 返回给
+            // 「假定仍持锁」的调用方；先无 park 抢回，抢不回就抛异常。
+            if (!mutex.LockForConditionWait() &&
+                !TryRelockWithoutParking(mutex)) {
+                ThrowConditionRelockFailure();
+            }
         }
         return false;
     };
@@ -1777,8 +1838,16 @@ bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
 
     // Context 取消不会豁免条件变量的重锁规则。Scheduler 关闭不同：Mutex::Lock
     // 拒绝再次 park 已请求取消的 G，但仍可能立即获取锁。
-    const bool relocked = mutex.LockForConditionWait();
-    return relocked && result == WaitResult::kNotified;
+    //
+    // D3：LockForConditionWait 返回 false 表示**未持锁**，与 Wait「返回时
+    // 外部 mutex 必被持有」的契约冲突；旧实现直接把 false 返回给上层，
+    // RWMutex 会在未持锁状态下 Unlock / 修改受保护容器（UB + 泄漏）。
+    // 先用不 park 的 TryLock 抢回（调度器关闭时锁通常空闲），抢不回则抛
+    // 异常，把「锁已丢失」变成可捕获的显式错误。
+    if (!mutex.LockForConditionWait() && !TryRelockWithoutParking(mutex)) {
+        ThrowConditionRelockFailure();
+    }
+    return result == WaitResult::kNotified;
 }
 
 bool ConditionVariable::WaitFor(Mutex& mutex, ContextDuration timeout,
@@ -1962,6 +2031,13 @@ std::uint64_t HeldLockParkCount() noexcept {
     // 单一计数源：`Task::park_for_scheduler()` 覆盖所有 park 路径
     // （含 park_io），比 sync 自己的等待后端更完整。
     return scheduler::mutex_held_park_total();
+}
+
+
+/// @brief D3 诊断：ConditionVariable::Wait 重锁失败次数（进程级累计）。
+/// @note 用 extern "C" 导出，避免为一个诊断计数改动公共头文件/ABI。
+extern "C" std::uint64_t go2cpp_debug_cv_relock_failures() noexcept {
+    return g_cv_relock_failures.load(std::memory_order_relaxed);
 }
 
 }  // namespace go2cpp::sync

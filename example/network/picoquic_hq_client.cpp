@@ -162,16 +162,19 @@ int main(int argc, char** argv) {
     }
     std::printf("[example] request sent (%zu bytes)\n", sent);
 
-    // 3) 收响应
+    // 3) 收响应。D17：用 StreamFinished() 判断 FIN，而不是靠 body 非空/循环次数。
     std::uint8_t buffer[4096];
     std::string body;
-    for (int i = 0; i < 500 && body.empty(); ++i) {
+    for (int i = 0; i < 500 && !connection->StreamFinished(0); ++i) {
         if (!connection->Poll(&error)) {
             std::printf("[example] Poll failed while waiting data: %s\n", error.c_str());
             break;
         }
-        const std::size_t n = connection->ReadStream(0, buffer, sizeof(buffer));
-        if (n > 0) {
+        for (;;) {
+            const std::size_t n = connection->ReadStream(0, buffer, sizeof(buffer));
+            if (n == 0) {
+                break;
+            }
             body.append(reinterpret_cast<const char*>(buffer), n);
         }
     }
@@ -183,6 +186,15 @@ int main(int argc, char** argv) {
     std::printf("[example] received %zu bytes:\n%s\n", body.size(), body.c_str());
 
     const bool ok = body.find("hello from picoquic") != std::string::npos;
+    std::printf("[example] stream_finished=%d last_error=%llu\n",
+                connection->StreamFinished(0) ? 1 : 0,
+                static_cast<unsigned long long>(connection->LastErrorCode()));
+
+    // D01/D05：显式关闭并确认没有写失败（析构也会做一次 best-effort 关闭）。
+    std::string close_error;
+    const bool closed = connection->Close(/*application_error_code=*/0, &close_error);
+    std::printf("[example] close ok=%d error='%s'\n", closed ? 1 : 0, close_error.c_str());
+
     std::printf("[example] === %s ===\n", ok ? "PASS" : "FAIL (content mismatch)");
     return ok ? 0 : 1;
 }

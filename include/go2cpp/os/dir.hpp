@@ -62,6 +62,8 @@
  * ## 边界与陷阱
  *
  * - 不做路径规范化，调用方自行 `Clean`/`Join`；
+ * - 所有按路径的入口遇到**内嵌 NUL** 一律返回 `kInvalidArgument`（`EINVAL`）：
+ *   POSIX API 只认到首个 NUL，不拦会静默操作另一个路径（路径注入）；
  * - `RemoveAll` 用 `lstat`：符号链接只删链接本身，绝不递归进目标；
  * - `MkdirAll` 中途失败不回滚，已创建目录保留（与 `mkdir -p` 一致）。
  */
@@ -133,6 +135,13 @@ FileStatus MkdirAll(const std::string& path, mode_t mode = 0755,
  * @brief 递归删除文件或目录（等价 `rm -rf`）。
  * @param path 目标路径。
  * @return 状态。**路径不存在视为成功**（与 Go 的 `os.RemoveAll` 一致）。
+ * @warning **拒绝 `"."` / `".."`**（以及 `"a/."` 这类最后一段是点段的路径），
+ *          返回 `kInvalidArgument`（`EINVAL`）。这类调用只会清空当前/父目录，
+ *          然后在 `rmdir` 阶段失败 —— 没有成功可能。注意这与 Go 的
+ *          `os.RemoveAll(".")` 不同：Go 会先删子项再报错，本实现选择不删。
+ * @warning 本函数**不做路径规范化**：`RemoveAll("/")` 会尝试清空根目录
+ *          （有权限时），`RemoveAll("..")` 已在上面被拒绝，但 `RemoveAll("../x")`
+ *          仍按传入路径操作。调用方必须自己保证路径来自可信输入。
  * @warning 用 `lstat` 判断类型：**符号链接删链接本身，不递归进目标** ——
  *          这点与 `rm -rf` 一致。若链接指向目录，只删链接。
  * @note 用"先收集子项再递归"的两阶段写法：`readdir` 期间删除条目在某些
@@ -163,8 +172,11 @@ FileStatus Symlink(const std::string& target, const std::string& link_path,
 
 /**
  * @brief 设置文件的访问时间与修改时间。
- * @param path 路径（**不跟随符号链接** —— 用 `AT_SYMLINK_NOFOLLOW` 的话就设不了
- *        链接本身的时间，而 POSIX 只保证对普通文件可设，所以这里跟随链接）。
+ * @param path 路径。**跟随符号链接**：实现是 `utimensat(..., flags=0)`，
+ *        对链接调用时改的是**目标文件**的时间，链接自身的 times 不变
+ *        （与 Go 的 `os.Chtimes` 一致）。要改链接自身的 times 需要
+ *        `AT_SYMLINK_NOFOLLOW`，本 API 不提供 —— POSIX 也只保证对普通文件
+ *        可靠可设。悬空链接返回 `ENOENT`。
  * @param atime 访问时间。
  * @param mtime 修改时间。
  * @return 状态。
@@ -172,6 +184,10 @@ FileStatus Symlink(const std::string& target, const std::string& link_path,
  *       `utimensat`/`futimens` 的封装差异，不是因为 Hook。
  * @note 若想"只设 mtime、保留 atime"，传 `UTIME_OMIT` 需要用
  *       `SetTimesRaw`（本文件未提供 —— 需要时再加，避免过早抽象）。
+ * @warning 跟随语义意味着：把 `SetTimes` 用在不可信路径上时，符号链接会把
+ *          修改作用到链接目标（与 `os.Chtimes` 相同的 TOCTOU 面）；需要
+ *          "只改链接/不跟随"时先用 `StatPath(..., false)` 判断或改用
+ *          `AT_SYMLINK_NOFOLLOW`（本模块暂未暴露）。
  */
 FileStatus SetTimes(const std::string& path, const struct timespec& atime,
                     const struct timespec& mtime, std::string* error = nullptr);

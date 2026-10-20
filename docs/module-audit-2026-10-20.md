@@ -98,3 +98,154 @@ HTTP3 关闭码恒 0 / Poll 无 PTO / 非阻塞 Transport 100% CPU / 响应体�
   （`relocked=false` 时锁未持有，但 RWMutex 的等待队列清理也必须持锁）。
   安全修复需要把 writer 票据队列改成可在无锁状态清理的结构，触发条件极窄
   （调度器关闭 + 取消 + 重锁失败），留待性能改造时一并处理。
+
+
+### 6.4 OS 模块缺陷修复（2026-10-20 14:28）
+
+> 工作树 `/UserData/CodexWorkSpace/Go2Cpp-work`；只改 `src/os/**`、`include/go2cpp/os/**`、
+> `tests/os/**` 与本文档；不 commit（由父 agent 统一提交）。详细报告：`/tmp/fix_os_final.md`。
+
+**已修（D1-D6、D8-D11、D13）**
+
+| 缺陷 | 修复 | 关键位置 |
+|---|---|---|
+| D1 NUL 截断 | 新增 `detail::ContainsNul`；全部路径/名字/值入口拒绝内嵌 NUL（`kInvalidArgument`+`EINVAL`；`Getenv` 返回 nullopt） | `file.hpp`、`file.cpp` Open/Getenv/Setenv/Unsetenv、`dir.cpp` 7 个入口 |
+| D2 ReadFile 上限失效 | 读循环累计 `total`，超过 `os.max_file_size` 立即清空并返回 `kIoFailed`+`EFBIG`；不再依赖 `st_size>0` | `file.cpp` `ReadFile` |
+| D3 OOM 抛异常 | `reserve`/buffer/`append` 包 try/catch，`bad_alloc`/`length_error` → `kIoFailed`+`ENOMEM` | `file.cpp` `ReadFile` |
+| D4 RemoveAll(".")/("..") | 最后一段是 `.`/`..`（含 `a/.`、`a/..`）直接 `kInvalidArgument`+`EINVAL`，在删除任何内容之前拒绝 | `dir.cpp` `RemoveAll` |
+| D5 WriteAt+O_APPEND | `File::m_append`（Open 按 flags 记录，Adopt 用 `F_GETFL` 只读探测），`WriteAt` 返回 -1/`EINVAL` | `file.hpp`、`file.cpp` |
+| D6 SetTimes 文档与实现相反 | 文档改为「跟随符号链接」，补悬空链接 `ENOENT` 说明 | `dir.hpp`、`dir.cpp` |
+| D8 fstat 失败跳过类型校验 | fstat 失败关闭 fd 并返回 `kOpenFailed`/errno（与 `Adopt` 对齐） | `file.cpp` `File::Open` |
+| D9 MaxFileSize 注释失真 | 注释改为「无 clamp；配置是 int，上限 2 GiB-1」 | `config.cpp`、`os.hpp` |
+| D10 O_NONBLOCK 未说明 | `Open` 文档注明 fd 带 `O_CLOEXEC\|O_NONBLOCK`，`Adopt` 不改标志 | `file.hpp` |
+| D11 SIGXFSZ 未说明 | `Write`/`WriteAll` 文档注明默认终止进程与忽略/捕获建议 | `file.hpp` |
+| D13 out==nullptr 无 errno | file 3 处 + dir 3 处统一 `EINVAL` | `file.cpp`、`dir.cpp` |
+| 回归用例 | `test_os_file.cpp` 场景 12、`test_os_dir.cpp` 场景 9（沿用既有 target，不改 CMake） | `tests/os/` |
+
+**验证**
+
+- `ctest --output-on-failure -j4`：**116/116** 通过（`build-work`）。
+- 专项断言（`/tmp/fix_os_d1.cpp`、`/tmp/fix_os_d2.cpp`、`/tmp/fix_os_d4.cpp`、
+  `/tmp/fix_os_d5.cpp`、`/tmp/fix_os_d8d13.cpp`，独立编译并链接 `libgo2cpp_os.so`）：
+  D1 31/31、D2+D3 19/19、D4 12/12、D5 22/22、D8-D13 19/19，共 **103 项 0 失败**。
+- 30 轮重复五组专项：`d1/d2d3/d4/d5/d8d13` 失败数均为 **0**。
+- 修复前后对比（同一探针对 HEAD 旧源码与修复后库）：
+
+| 探针 | 修复前 | 修复后 |
+|---|---|---|
+| D1 `Open("base\0evil")` | ok，fd 有效（实际操作截断路径） | `kInvalidArgument`/EINVAL |
+| D1 `ReadFile("base\0evil")` | ok，5 字节 `hello` | `kInvalidArgument`，空 |
+| D1 `Setenv("A\0B")` | ok（实际设置了 `A`） | `kInvalidArgument`/EINVAL |
+| D2 `ReadFile("/proc/self/status", max=64)` | ok，1498 字节 | `kIoFailed`/EFBIG，0 字节 |
+| D3 1 GiB + `RLIMIT_AS=512MiB` | 子进程 SIGABRT（`bad_alloc` 穿透） | `kIoFailed`/ENOMEM，进程正常 |
+| D4 `RemoveAll(".")` | `kIoFailed`/EINVAL，但子项已删（kept=0） | `kInvalidArgument`/EINVAL，内容完整（kept=1） |
+| D5 `WriteAt` on `O_APPEND` | 返回 1，内容 `AAAZ`（追加） | 返回 -1/EINVAL，内容 `AAA` |
+| D6 `SetTimes(link)` | 目标 mtime 改变、链接不变（跟随），文档却写「不跟随」 | 行为不变，文档已改为「跟随」 |
+| D8 `fstat=EPERM`（seccomp 注入） | `Open` 成功、fd 有效（未校验） | `kOpenFailed`/EPERM，fd 无效 |
+| D13 `Open(out=nullptr)` | `kInvalidArgument`，`errno=0` | `kInvalidArgument`，`errno=EINVAL` |
+
+**无法修复 / 需要决策**
+
+1. **D7 `File::Close()` 丢弃 `close(2)` 错误**（P2）：改成返回 `FileStatus` 会破坏现有调用方与 ABI，
+   属接口决策。本次只在 `file.hpp` 明确记录「错误被丢弃、需先 `Sync()`」，并建议后续新增
+   `FileStatus CloseChecked()`/`Flush()`（不改现有签名）。
+2. **D12 目录 API 缺口**（P3）：`Rename`/`Chmod`/`Chdir`/`Getwd`/`MkdirTemp`/`TempDir` 未实现。
+   这是接口面扩张（命名、Go 语义对齐、`MkdirTemp` 随机命名规则），不属于本次正确性修复边界；
+   `ReadFile` 对目录的拒绝已由 `File::Open` 的 `S_ISREG` 白名单保证，文档已补说明。
+3. **D14 文档缺口**（P3）：`docs/design.md` 无 os 设计章节、`docs/state-machines/` 无 Dir 状态机、
+   `codex.md` 的 os 章节未覆盖目录/路径/配置。本次只更新本文档与代码内 Doxygen；
+   其余章节留待文档重构，避免本次改动膨胀。
+4. **环境限制**：无法注入 `ENOSPC/EDQUOT`（无 root/免密 sudo）与 `close(2)` 延迟错误；
+   `d_type=DT_UNKNOWN` 不可构造（ext4/tmpfs 都填 `d_type`）。D7 仍缺运行时证据。
+
+## 7. 第二轮 P0/P1 修复（2026-10-20 15:00）
+
+> 基线 HEAD `bd99603`；本轮全部改动未提交（待用户确认）。
+
+### 7.1 scheduler fiber 唤醒丢失（根治）
+
+- 根因：`Task::try_mark_queued()` 持 `m_transition_mutex` 做 check-then-store，`try_mark_queued_from_worker()` 用无锁 CAS，二者线性化点不同 → 同一 G 两个队列节点 → 残留节点 claim 失败时 `clear_queued()` 误清新 reservation → G 永久 `kRunnable` 且无队列节点。
+- 修复：`src/concurrency/scheduler.cpp:376-393` 共用 `m_transition_mutex`（仅一处，无 ABI 变化）。
+- 验证：标准复现 12 路×30 轮 **7/12 → 0/24**（720 轮全 DONE）；隔离 6×500 / 6×1000 **0/6、0/6**；ctest 116；串行 `--extra` 30/30；性能 +0.7%/+1.7%（噪声内）。
+
+### 7.2 RWMutex D3 + scheduler 残余
+
+- D3：`ConditionVariable::Wait` 的 `relocked=false` 路径改为无 park `TryLock` 抢回（8192 预算），抢不回抛 `std::runtime_error`（明确 mutex NOT held）；RWMutex 四条等待路径捕获并安全清理，`m_waiting_readers` 原子化。
+- scheduler 残余：三条 dequeue 路径 claim 失败改 `recover_unclaimed`（自愈），`enqueue` 补 `clear_queued`。
+- 验证：ctest 116（两次）；hybrid 6 路×25 轮 0/150；D3 专项（自定义 WaitBackend）旧库 terminate → 新库异常+计数+可复用。
+- 需决策：`AbortAfterLockLoss` 的 `recovered=false` 兜底分支保留写者票据（实际不可达；彻底移除会牺牲 D2 写路径零分配）。
+
+### 7.3 OS 模块（11 项）
+
+D1 NUL 截断→EINVAL、D2 ReadFile 上限（循环累计/EFBIG）、D3 OOM→FileStatus、D4 RemoveAll 拒绝 `.`/`..`、D5 WriteAt+O_APPEND→EINVAL、D6 SetTimes 文档、D8 fstat 失败关 fd、D9/D10/D11 文档、D13 `out==nullptr`→EINVAL。
+验证：103 断言、fuzz 10 万、30 轮、3 个 OS ctest 全绿。
+
+需决策：
+- D7 `Close()` 丢弃 close(2) 错误 → 建议新增 `CloseChecked()`（API/ABI 变更）；
+- D12 缺 `Rename/Chmod/Chdir/Getwd/MkdirTemp`（接口扩张，需产品决策）；
+- D14 design.md/Dir 状态机/codex.md 文档缺口。
+
+### 7.4 HTTP2（20/20 探针）
+
+PUSH_PROMISE/ENABLE_PUSH、`:scheme` 强制、MAX_HEADER_LIST_SIZE、流表清理（`max_retired_streams=256`）、MAX_CONCURRENT_STREAMS 默认 true、帧长超限发 GOAWAY(FRAME_SIZE_ERROR)。
+验证：20/20 探针、checks=50244 fails=0、30 轮 0 崩溃、ASan/UBSan 干净、ctest 116。
+
+需决策：
+- `:scheme` 默认仅对带 `:authority` 请求强制（`test_connection` 场景 8/case3 依赖宽松；`strict_scheme` 可完全严格但需改测试）；
+- 客户端请求方向 header 上限默认关闭（case2 两端同 config 冲突），建议改测试后默认 true；
+- 服务端收到客户端 `ENABLE_PUSH=1` 按 RFC 接受（字面报错会破坏互通）；
+- 未自动发 431；迟到帧水位有极低误判；draining 仍用连接错误。
+
+### 7.5 TLS / 配置
+
+- close_notify：新增公开 `Close()`，析构先 `SSL_shutdown`（WANT_WRITE 重试，预算 min(timeout,500ms)），`m_shutdown_sent` 只发一次；实测服务端 `SHUTDOWN_STATE=0x2`；附带修 SIGPIPE。
+- 错误查询：公开 `LastError()/LastErrorString()`（SSL_get_error + ERR 队列 + verify 原因）。
+- 配置 D3：`\xHH` 双向转义（反斜杠/`#`/`;`/控制字符/首尾空格）；专项 44 项 + 1000 条随机 0 不一致。
+- `verify_peer` 默认 false → **true**（安全默认）。
+
+需决策：
+- `verify_peer` 默认 true 为破坏性安全变更（依赖旧默认可连自签名服务者会 fail-closed），发布说明需写明；
+- 手写值里的字面 `\xHH` 会被解码（可改 `%HH` 前缀）；
+- 键名含 `=`/`#`/`;`/首尾空格仍不能往返；
+- SIGPIPE 未覆盖 Read 内部写。
+
+### 7.6 HTTP3 / QUIC
+
+D09 复核 + 端到端（application_close(7)、stream_reset(0x1234)）；D15 host/port/SNI/authority 拆分（11 组 PASS）；D16 控制流（SETTINGS/GOAWAY/MAX_PUSH_ID、QPACK 7/11 流、push 拒绝、GOAWAY 后 Send 拒绝）；D18 回调 try/catch（bad_alloc 注入不 terminate）；D20 docs/quic.md 重写；D21 剩余项。
+验证：29/29、30 轮 0 崩溃、300×3 建连、ctest 116、-Werror 零警告。
+
+需决策：
+- D19 仓库内无 http3/quic ctest（cmake/tests 不在 agent 边界，验收测试在 /tmp/fix_http3）；
+- `docs/quic-lib-evaluation.md`、`quic-go-reading-guide.md` 过时；
+- POST content-type 固定 text/plain（重复风险）；
+- QPACK 动态表/push/0-RTT/迁移为设计边界。
+
+### 7.7 RWMutex 死锁归因（结论）
+
+- 逐行审查：等待-唤醒配对完整（写者三条、读者两条路径，写者>1 广播）。
+- 当前版 6 路×30 + 4 CPU burner 300s → **0/180**；HEAD 原版同条件 0/180。
+- 反证：HEAD 原版在 hybrid 复现器下 2/75、5/180 卡死（现场锁全空闲、scheduler 停摆）→ 属 HEAD 的 scheduler 唤醒丢失（已由 7.1 修复）。
+- 结论：**无证据表明 RWMutex 改动引入死锁**。
+
+### 7.8 验证汇总
+
+- `ctest`：**116/116**（本轮修复后，含 go2cpp_connection_test / http2_stress / OS 测试）；
+- 各模块专项/压测数据见 7.1-7.7。
+
+### 7.9 未修/需决策总表
+
+| 项 | 归属 | 建议 |
+|---|---|---|
+| `CloseChecked()` | OS | 新增 API，不破坏现有签名 |
+| `Rename/Chmod/Chdir/Getwd/MkdirTemp` | OS | 产品决策后补 |
+| `:scheme` 严格模式 | HTTP2 | 改 `test_connection` 场景 8/case3 后开 |
+| 请求方向 header 上限 | HTTP2 | 改 case2 测试后默认 true |
+| 431 自动发送 | HTTP2 | 上层决定 |
+| verify_peer 默认 true 的发布说明 | TLS | 发布前写 breaking change |
+| 字面 `\xHH` 兼容 | 配置 | 可改 `%HH` |
+| 键名往返 | 配置 | 需要新的键转义规则 |
+| http3/quic ctest | HTTP3 | 需放宽 cmake/tests 边界 |
+| QPACK 动态表/push/0-RTT/迁移 | HTTP3 | 设计边界 |
+| `AbortAfterLockLoss` 兜底分支 | 并发 | 实际不可达，保留 |
+| fiber SIGSEGV handler 覆盖/async-signal-safe | Fiber | 未排期（P2） |
+| `worker_loop` 门槛 `runnable>P` 注释不符 | scheduler | 性能项，未改 |

@@ -29,7 +29,8 @@
  * - `IniFile::Parse` 先构造临时表，成功才 swap，语法错误不会留下半解析状态；
  * - `RuntimeConfig::FromIni` 在副本上操作，校验通过才写回，失败不动原对象；
  * - 监听线程吞掉所有监听器异常并继续轮询，避免一次插件错误终止热加载；
- * - `DumpIni` 的转义不可逆，`IniFile::Parse` 只做 `\n` 到换行的单向替换。
+ * - `DumpIni` 与 `IniFile::Parse` 共用一套 `\xHH` 值转义（约定见
+ *   `EscapeIniValue`），含 `#`/`;`/换行/首尾空格的值可逐字节往返。
  */
 #include "go2cpp/config.hpp"
 
@@ -51,6 +52,82 @@ std::string Trim(std::string value) {
     if (first == std::string::npos) return {};
     const auto last = value.find_last_not_of(" \t\r\n");
     return value.substr(first, last - first + 1);
+}
+
+// ---------------------------------------------------------------------------
+// INI 值转义：DumpIni 与 Parse 的唯一约定
+// ---------------------------------------------------------------------------
+// 编码用 `\xHH`（两位十六进制），解码只在遇到完整序列时发生。未编码的
+// `#`/`;` 仍按行内注释截断、未编码的 `\n` 仍还原为换行，保持对既有手写
+// 配置（例如 go2cpp.ini 的 `format = ...\n`）的兼容。
+//
+// 为什么不用 `\n`/`\t` 风格的可读转义：这会与手写配置里的 Windows 路径
+// 冲突 —— `C:\temp` 会被读成 tab、`\\server\share` 会被读成空格。`\xHH`
+// 在配置里几乎不会自然出现，且未知的 `\xZZ` 会被原样保留。
+
+int HexDigitValue(char character) {
+    if (character >= '0' && character <= '9') return character - '0';
+    if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+    if (character >= 'A' && character <= 'F') return character - 'A' + 10;
+    return -1;
+}
+
+/// 判断 `text[position]` 起是否为完整的 `\xHH` 序列（hex 大小写均可）。
+bool IsHexEscapeAt(const std::string& text, std::size_t position) {
+    return position + 3 < text.size() && text[position] == '\\' &&
+           text[position + 1] == 'x' &&
+           HexDigitValue(text[position + 2]) >= 0 &&
+           HexDigitValue(text[position + 3]) >= 0;
+}
+
+/// 还原 `\xHH`；不完整的 `\xZZ` 或其它反斜杠序列原样保留。
+std::string UnescapeIniValue(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (std::size_t position = 0; position < text.size(); ++position) {
+        if (IsHexEscapeAt(text, position)) {
+            const int high = HexDigitValue(text[position + 2]);
+            const int low = HexDigitValue(text[position + 3]);
+            out += static_cast<char>((high << 4) | low);
+            position += 3;
+            continue;
+        }
+        out += text[position];
+    }
+    return out;
+}
+
+/**
+ * @brief 从 `=` 右侧的原始文本提取值。
+ *
+ * ## 步骤
+ * step1. 找到第一个**未转义**的 `#`/`;` 作为注释起点（扫描时跳过 `\xHH`，
+ *        否则 DumpIni 写出的 `\x23` 会被误判成注释）；
+ * step2. trim 掉语法空白；
+ * step3. 先按旧规则把字面量 `\n` 还原为换行（手写配置兼容），再解码
+ *        `\xHH` —— 顺序不能反，否则解码出的反斜杠会被二次替换。
+ */
+std::string ExtractIniValue(const std::string& raw) {
+    std::size_t end = raw.size();
+    for (std::size_t position = 0; position < raw.size(); ++position) {
+        if (IsHexEscapeAt(raw, position)) {
+            position += 3;  // 跳过 \xHH 的 4 个字符；for 的 ++ 再走 1
+            continue;
+        }
+        if (raw[position] == '#' || raw[position] == ';') {
+            end = position;
+            break;
+        }
+    }
+    std::string value = Trim(raw.substr(0, end));
+    // 兼容旧格式：未编码的字面量 `\n` 还原为换行（go2cpp.ini 的日志格式
+    // 依赖它）。必须在解码 `\xHH` 之前做，避免把解码出的 `\` + `n` 二次替换。
+    for (std::size_t position = 0;
+         (position = value.find("\\n", position)) != std::string::npos;) {
+        value.replace(position, 2, "\n");
+        ++position;
+    }
+    return UnescapeIniValue(value);
 }
 
 bool ParseSize(const std::string& text, std::size_t* value) {
@@ -339,7 +416,8 @@ bool IniFile::Load(const std::string& path, std::string* error) {
  * step1. 构造临时 `parsed_sections`，任何语法错误都不影响旧内容；
  * step2. 逐行 trim；空行/`#`/`;` 注释跳过；`[...]` 切换当前节；
  * step3. `key=value` 按第一个 `=` 切分，空键名报错；
- * step4. 值在第一个 `#`/`;` 处截断，并把字面量 `\n` 还原为换行；
+ * step4. 值交给 `ExtractIniValue`：未转义的 `#`/`;` 截断为注释，字面量
+ *        `\n` 还原为换行，`\xHH` 还原为原始字节（与 `DumpIni` 对称）；
  * step5. 完整解析成功后 `swap` 到 `m_sections`。
  *
  * ## 边界
@@ -369,14 +447,9 @@ bool IniFile::Parse(const std::string& text, std::string* error) {
         const auto equal = clean.find('=');
         if (equal == std::string::npos) { if (error) *error = "配置项缺少 =，行 " + std::to_string(line_number); return false; }
         const auto key = Trim(clean.substr(0, equal));
-        auto value = Trim(clean.substr(equal + 1));
-        const auto comment = value.find_first_of("#;");
-        if (comment != std::string::npos) value = Trim(value.substr(0, comment));
-        // step4: 仅还原字面量 `\n`；`DumpIni` 的转义是单向的
-        for (std::size_t position = 0; (position = value.find("\\n", position)) != std::string::npos;) {
-            value.replace(position, 2, "\n");
-            ++position;
-        }
+        // step4: 行内注释、去空白、`\n` 与 `\xHH` 的还原都集中在
+        // ExtractIniValue，保证与 DumpIni 的转义成对。
+        const auto value = ExtractIniValue(clean.substr(equal + 1));
         if (key.empty()) { if (error) *error = "配置键为空，行 " + std::to_string(line_number); return false; }
         parsed_sections[current][key] = value;
     }
@@ -1104,21 +1177,37 @@ std::string JoinConfigName(const std::string& module, const std::string& key) {
 
 namespace {
 
-/// 把值里的控制字符转义成可见形式，保证生成的 INI 仍是逐行可解析的。
-/// 注意：`IniFile::Parse` 不做反向转义，所以含换行的值导出后再读回会得到
-/// 字面量 `\n` 而不是真正的换行 —— 这是**已知的非往返点**，在 DumpIni 的
-/// 文档注释里已标注。选择转义而不是拒绝，是为了让生成的配置文件永远合法。
+/// 把值里会破坏 INI 结构或首尾空白的字节编码成 `\xHH`。
+/// @details 编码范围：反斜杠、`#`、`;`、换行/回车/制表/NUL，以及值首尾的
+///          空格（内部空格不动，保持可读）。这是与 `ExtractIniValue` 成对的
+///          双向约定：DumpIni 的输出读回后与原值逐字节相等。
+///          `#`/`;` 必须编码，否则读回时会被当成行内注释截断；首尾空格必须
+///          编码，否则会被 Parse 的 Trim 吃掉。
 std::string EscapeIniValue(const std::string& input) {
+    static const char kHexDigits[] = "0123456789abcdef";
+    const auto first_not_space = input.find_first_not_of(' ');
+    const auto last_not_space = input.find_last_not_of(' ');
     std::string out;
     out.reserve(input.size() + 8);
-    for (const char c : input) {
-        switch (c) {
-            case '\n': out += '\\'; out += 'n'; break;
-            case '\r': out += '\\'; out += 'r'; break;
-            case '\t': out += '\\'; out += 't'; break;
-            case '\0': out += '\\'; out += '0'; break;
-            default: out += c; break;
+    for (std::size_t position = 0; position < input.size(); ++position) {
+        const char character = input[position];
+        const bool edge_space =
+            character == ' ' &&
+            (first_not_space == std::string::npos || position < first_not_space ||
+             position > last_not_space);
+        const bool must_escape =
+            edge_space || character == '\\' || character == '#' ||
+            character == ';' || character == '\n' || character == '\r' ||
+            character == '\t' || character == '\0';
+        if (!must_escape) {
+            out += character;
+            continue;
         }
+        const auto byte = static_cast<unsigned char>(character);
+        out += '\\';
+        out += 'x';
+        out += kHexDigits[byte >> 4U];
+        out += kHexDigits[byte & 0x0FU];
     }
     return out;
 }
@@ -1178,7 +1267,8 @@ std::string Config::DumpIni() const {
     std::string out;
     out += "# go2cpp 配置（由 Config::DumpIni 生成）\n";
     out += "# 每个 [section] 对应一个 module，条目形如 key=value；# 开头为注释。\n";
-    out += "# 注意：含换行/制表符的值被转义为 \\n / \\t，读回时是字面量。\n";
+    out += "# 值中的 \\xHH 表示原始字节（如 \\x0a 换行、\\x23 #、\\x3b ;），"
+           "IniFile::Parse 会还原。\n";
 
     for (const auto& [module, vars] : groups) {
         out += "\n";

@@ -112,12 +112,19 @@
  * - 方法只支持 GET / POST；其他 method 在 `Send` 里失败（且要先等握手完成，
  *   见下）；
  * - 响应头只解出 `content-type`，任意名字的响应头被 picohttp 解析器跳过；
- * - 不使用 QPACK 动态表（只用静态表 + literal），压缩率较低；
+ * - 不使用 QPACK 动态表（只用静态表 + literal），压缩率较低；服务端发来的
+ *   QPACK encoder/decoder 流会被**读取并丢弃**（维持流控与协议状态），但不会
+ *   建立动态表，也不会解析插入指令；
  * - 超时可通过 `Options::timeout_ms` 配置；`Send`/`Receive` 用剩余预算驱动
  *   `PollFor`，不再被一次阻塞读击穿；
  * - `Connect` 的默认 `verify_peer = false`（本地自签场景），生产应使用
  *   `Options{verify_peer=true}`；开启后自签名证书会握手失败；
- * - 没有 0-RTT、没有服务端推送处理、没有连接迁移/多路径。
+ * - 没有 0-RTT、没有服务端推送（收到服务端 push 流视为协议错误，连接被关闭）、
+ *   没有连接迁移/多路径。
+ *
+ * **服务端控制流（D16）**：控制流上的 SETTINGS / GOAWAY 会被解析并记录，
+ * 未知帧按 RFC 9114 §9 忽略；收到 GOAWAY 后 `Send` 拒绝再创建新流。
+ * QPACK encoder/decoder 流只被消费（丢弃）以维持流控。详见 `client.cpp`。
  *
  * **本文件没有未实现的桩**：`client.cpp` 中 `Connect` / `Send` / `Receive` /
  * `Poll` / `HandshakeComplete` / `Closed` / `Alpn` / `LastStreamId` /
@@ -257,8 +264,9 @@ struct Response {
  * - `m_impl` 非空（除非对象被 move 走，此时查询接口退化为 Closed()==true、
  *   Alpn() 空串、错误码 0）；
  * - `pending` 中每个 stream_id 都在 `streams` 里有对应的 `StreamState`；
- * - `streams` 只保存客户端发起的双向流（stream_id & 0x3 == 0），服务端控制流
- *   与 QPACK 单向流在回调里被直接忽略；
+ * - `streams` 只保存客户端发起的双向流（stream_id & 0x3 == 0）；
+ *   服务端控制流（3）与 QPACK encoder/decoder 流（7/11）不进入 `streams`，
+ *   而是在回调里被消费（SETTINGS/GOAWAY 解析、QPACK 指令丢弃）；
  * - 每个 `StreamState` 在 `header_captured` 之前不会被当作可交付响应。
  */
 class Client {
@@ -289,8 +297,32 @@ public:
         /// 根证书（CA bundle）PEM 路径；`verify_peer == false` 时忽略。
         std::string cert_root_file_name;
 
-        /// `:authority`（如 "example.com:8443"）。为空时退回 SNI（旧行为）。
+        /**
+         * @brief 显式覆盖 `:authority`（如 "example.com:8443"），优先级最高。
+         *
+         * 为空时由 `host`/`port`（或从 `sni` 拆出的 host/port）生成。
+         * 非空时原样使用，但仍会校验非法字符（CR/LF/空格等）。
+         */
         std::string authority;
+
+        /// `:authority` 的 host 部分；为空时从 `sni` 推断。
+        std::string host;
+
+        /**
+         * @brief `:authority` 的端口；`0` 表示不附加端口。
+         *
+         * HTTP/3 默认端口是 443；非默认端口必须显式给出（例如 14434），
+         * 否则 `:authority` 只有 host，服务端/虚拟主机可能路由错误。
+         */
+        std::uint16_t port{0};
+
+        /**
+         * @brief 覆盖 TLS SNI（与 `:authority` 分离）。
+         *
+         * 为空时使用 `Connect` 的 `sni` 参数；IPv6 字面量会去掉方括号，
+         * 带端口的输入会去掉端口（SNI 不允许端口）。
+         */
+        std::string sni;
 
         /// 响应体最大字节数，超出则关闭连接并报错；0 表示不限制。
         std::size_t max_response_bytes{kDefaultMaxResponseBytes};
@@ -304,7 +336,8 @@ public:
      *
      * @param transport 字节通道，**必须一次 `Read` 返回一个完整 datagram**。
      *                  不接管所有权。
-     * @param sni TLS SNI，同时用作 `:authority`（可用 `Options::authority` 覆盖）。
+     * @param sni TLS SNI。`Options::sni` 为空时用它；若形如 `host:port`
+     *            会拆出端口（SNI 只用 host，端口进入 `:authority`）。
      *            不能为空。
      * @param error 失败原因；可为 nullptr。
      * @return 成功返回对象，失败返回 nullptr。
@@ -325,6 +358,8 @@ public:
     ~Client();
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
+    Client(Client&&) noexcept = default;
+    Client& operator=(Client&&) noexcept = default;
 
     /**
      * @brief 发送一个请求。
@@ -332,6 +367,9 @@ public:
      * 如果握手尚未完成，本方法会先驱动握手直到完成或超时。
      * 请求会立即排入 QUIC 发送队列；真正的数据在后续 `Poll` / `Receive`
      * 中由 picoquic 打包发出。对应的流号见 `LastStreamId()`。
+     *
+     * 收到服务端 GOAWAY 后，若新流号 `>= GoAwayId()` 会直接失败（D16）。
+     * 成功时清空 `*error`（D21）。
      *
      * @param req 请求。GET/POST 之外的 method 会失败。
      * @param error 失败原因；可为 nullptr。
@@ -345,7 +383,7 @@ public:
      * 内部循环 `Poll` 直到该流的 HEADERS 解析完且收到 FIN，或超时。
      *
      * @param resp 输出响应；失败时不修改内容。
-     * @param error 失败原因；可为 nullptr。
+     * @param error 失败原因；可为 nullptr；成功时清空（D21）。
      * @return 成功返回 true。
      */
     bool Receive(Response* resp, std::string* error);
@@ -379,10 +417,44 @@ public:
     /// 协商出的 ALPN。握手前返回空串；成功时必须是 "h3"。
     std::string Alpn() const;
 
-    /// 最近一次 Send 分配的流号。
+    /// “尚未发送过任何请求”的流号哨兵值。
+    static constexpr std::uint64_t kInvalidStreamId = static_cast<std::uint64_t>(-1);
+
+    /// 最近一次 Send 分配的流号；尚未发送过请求时返回 `kInvalidStreamId`。
     std::uint64_t LastStreamId() const noexcept;
 
-    /// 最近一次连接级错误码（HTTP/3 或 QUIC 错误码）。
+    /**
+     * @brief 实际使用的 `:authority`（host[:port]）。
+     *
+     * 由 `Connect` 根据 `Options::authority` / `Options::host` /
+     * `Options::port` / `sni` 计算一次，之后不变。
+     */
+    std::string Authority() const;
+
+    /// 实际使用的 TLS SNI（已去掉端口与 IPv6 方括号，D15）。
+    std::string Sni() const;
+
+    /// 是否收到服务端 GOAWAY。
+    bool GoAwayReceived() const noexcept;
+
+    /**
+     * @brief 服务端 GOAWAY 携带的流号；未收到时返回 `kInvalidStreamId`。
+     *
+     * 语义：服务端承诺处理流号 `< GoAwayId()` 的请求；`Send` 在
+     * `stream_id >= GoAwayId()` 时失败。
+     */
+    std::uint64_t GoAwayId() const noexcept;
+
+    /// 是否已解析到服务端控制流上的 SETTINGS。
+    bool ServerSettingsReceived() const noexcept;
+
+    /**
+     * @brief 最近一次错误码（HTTP/3 或 QUIC 错误码）。
+     *
+     * 注意语义：连接级关闭码优先；响应流解析失败时记录 HTTP/3 帧错误码，
+     * 因此它也可能反映“最近一次流级错误”，不只是连接级。
+     * 回调内捕获到 C++ 异常时为 0x0102（HTTP/3 INTERNAL_ERROR，D18）。
+     */
     std::uint64_t ConnectionError() const noexcept;
 
 private:

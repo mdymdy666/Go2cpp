@@ -111,13 +111,6 @@ std::vector<std::uint8_t> Bytes(const Frame& frame) {
     return out;
 }
 
-std::vector<std::uint8_t> PeerSettings() {
-    return Bytes(MakeSettings({
-        {static_cast<std::uint16_t>(SettingsId::kHeaderTableSize), 4096},
-        {static_cast<std::uint16_t>(SettingsId::kMaxFrameSize), 16384},
-        {static_cast<std::uint16_t>(SettingsId::kInitialWindowSize), 65535},
-    }));
-}
 
 /**
  * @brief 建好一对已握手的 client/server 连接。
@@ -134,6 +127,40 @@ struct Pair {
     std::string error;
 };
 
+bool MakePairWithConfigs(Pair* pair, const ConnectionConfig& client_config,
+                         const ConnectionConfig& server_config) {
+    // 服务端先看到 preface + 客户端 SETTINGS（模拟真实时序）。
+    // 客户端 SETTINGS 取 client_config；服务端用自己的配置握手并回 SETTINGS。
+    std::vector<std::uint8_t> server_inbound(kPreface, kPreface + kPrefaceLen);
+    const auto settings = Bytes(MakeSettings({
+        {static_cast<std::uint16_t>(SettingsId::kHeaderTableSize),
+         client_config.header_table_size},
+        {static_cast<std::uint16_t>(SettingsId::kMaxFrameSize), client_config.max_frame_size},
+        {static_cast<std::uint16_t>(SettingsId::kInitialWindowSize),
+         client_config.initial_window_size},
+        {static_cast<std::uint16_t>(SettingsId::kMaxConcurrentStreams),
+         client_config.max_concurrent_streams},
+    }));
+    server_inbound.insert(server_inbound.end(), settings.begin(), settings.end());
+    pair->server_transport.PushInbound(server_inbound);
+
+    pair->server =
+        std::make_unique<Connection>(&pair->server_transport, Role::kServer, server_config);
+    if (pair->server->Handshake(&pair->error) != ConnStatus::kOk) {
+        return false;
+    }
+    pair->client_transport.PushInbound(pair->server_transport.TakeOutbound());
+    pair->client =
+        std::make_unique<Connection>(&pair->client_transport, Role::kClient, client_config);
+    if (pair->client->Handshake(&pair->error) != ConnStatus::kOk) {
+        return false;
+    }
+    // 客户端握手时会写出 preface + SETTINGS + ACK；服务端已经握手完成，
+    // 这些字节不再需要（服务端不关心 ACK）。清掉以免干扰后续统计。
+    (void)pair->client_transport.TakeOutbound();
+    return true;
+}
+
 bool MakePair(Pair* pair, std::size_t initial_window = 65535,
               std::size_t max_header = 65536) {
     ConnectionConfig config;
@@ -143,30 +170,7 @@ bool MakePair(Pair* pair, std::size_t initial_window = 65535,
     // 但用默认值就没法测「1MB/10MB header 的吞吐与内存放大」—— 那正是本场景的目的。
     config.max_header_block_size = static_cast<std::uint32_t>(max_header);
     config.max_header_list_size = static_cast<std::uint32_t>(max_header);
-
-    std::vector<std::uint8_t> server_inbound(kPreface, kPreface + kPrefaceLen);
-    const auto settings = Bytes(MakeSettings({
-        {static_cast<std::uint16_t>(SettingsId::kHeaderTableSize), 4096},
-        {static_cast<std::uint16_t>(SettingsId::kMaxFrameSize), 16384},
-        {static_cast<std::uint16_t>(SettingsId::kInitialWindowSize),
-         static_cast<std::uint32_t>(initial_window)},
-    }));
-    server_inbound.insert(server_inbound.end(), settings.begin(), settings.end());
-    pair->server_transport.PushInbound(server_inbound);
-
-    pair->server = std::make_unique<Connection>(&pair->server_transport, Role::kServer, config);
-    if (pair->server->Handshake(&pair->error) != ConnStatus::kOk) {
-        return false;
-    }
-    pair->client_transport.PushInbound(pair->server_transport.TakeOutbound());
-    pair->client = std::make_unique<Connection>(&pair->client_transport, Role::kClient, config);
-    if (pair->client->Handshake(&pair->error) != ConnStatus::kOk) {
-        return false;
-    }
-    // 客户端握手时会写出 preface + SETTINGS + ACK；服务端已经握手完成，
-    // 这些字节不再需要（服务端不关心 ACK）。清掉以免干扰后续统计。
-    (void)pair->client_transport.TakeOutbound();
-    return true;
+    return MakePairWithConfigs(pair, config, config);
 }
 
 /// 把 client 写出的字节搬到 server，服务端读 n 个 HEADERS 事件。
@@ -208,6 +212,7 @@ void ScenarioBulkStreams(int stream_count) {
 
     const double start = NowMs();
     int issued = 0;
+    int refused = 0;
     for (int i = 0; i < stream_count; ++i) {
         std::uint32_t stream_id = 0;
         const std::vector<HeaderField> request = {
@@ -215,8 +220,12 @@ void ScenarioBulkStreams(int stream_count) {
             {":path", paths[static_cast<std::size_t>(i)]},
             {":authority", "stress.local"},
         };
-        if (pair.client->StartRequest(request, true, &stream_id, &pair.error) !=
-            ConnStatus::kOk) {
+        const auto status = pair.client->StartRequest(request, true, &stream_id, &pair.error);
+        if (status == ConnStatus::kTooManyStreams) {
+            ++refused;
+            continue;
+        }
+        if (status != ConnStatus::kOk) {
             std::fprintf(stderr, "[stress] bulk: StartRequest #%d failed: %s\n", i,
                          pair.error.c_str());
             break;
@@ -239,12 +248,69 @@ void ScenarioBulkStreams(int stream_count) {
     const double elapsed = NowMs() - start;
     const long rss_after = ReadVmRssKb();
 
-    std::printf("[stress] 并发流 %5d: 发出=%d 收到=%d 耗时=%.1fms 吞吐=%.0f req/s "
+    std::printf("[stress] 并发流 %5d: 接受=%d 拒绝=%d 收到=%d 耗时=%.1fms 吞吐=%.0f req/s "
                 "字节=%zu 内存=%+ldKB load=%.2f\n",
-                stream_count, issued, received, elapsed,
+                stream_count, issued, refused, received, elapsed,
                 elapsed > 0 ? (received * 1000.0 / elapsed) : 0.0, out.size(),
                 (rss_before >= 0 && rss_after >= 0) ? (rss_after - rss_before) : 0, load);
-    Check(received == issued, "bulk: every request must be received");
+    Check(received == issued, "bulk: every accepted request must be received");
+    Check(issued + refused == stream_count,
+          "bulk: every request must be accepted or refused by MAX_CONCURRENT_STREAMS");
+    Check(issued <= 100, "bulk: accepted streams must respect the advertised limit");
+}
+
+// ---------------------------------------------------------------------------
+// 场景 1b：MAX_CONCURRENT_STREAMS 的服务端拒绝路径
+// ---------------------------------------------------------------------------
+void ScenarioServerRefusedStreams() {
+    Pair pair;
+    ConnectionConfig client_config;
+    // 客户端刻意不本地限流，让 120 条流全部上线；服务端按默认上限 100 拒绝。
+    client_config.enforce_max_concurrent_streams = false;
+    ConnectionConfig server_config;  // 默认执行，max_concurrent_streams=100
+    Check(MakePairWithConfigs(&pair, client_config, server_config),
+          "concurrency: MakePair failed");
+    if (g_failures != 0) {
+        return;
+    }
+    constexpr int kStreams = 120;
+    constexpr int kLimit = 100;
+
+    int issued = 0;
+    for (int i = 0; i < kStreams; ++i) {
+        std::uint32_t stream_id = 0;
+        if (pair.client->StartRequest({{":method", "GET"},
+                                       {":path", "/limit/" + std::to_string(i)},
+                                       {":authority", "stress.local"}},
+                                      true, &stream_id, &pair.error) != ConnStatus::kOk) {
+            break;
+        }
+        ++issued;
+    }
+    Check(issued == kStreams, "concurrency: client must issue all streams");
+    pair.server_transport.PushInbound(pair.client_transport.TakeOutbound());
+
+    int accepted = 0;
+    int refused = 0;
+    IncomingEvent event;
+    for (int guard = 0; guard < kStreams * 2 && accepted + refused < kStreams; ++guard) {
+        if (pair.server->ReadEvent(&event, &pair.error) != ConnStatus::kOk) {
+            break;
+        }
+        if (event.kind == IncomingEvent::Kind::kHeaders) {
+            ++accepted;
+        } else if (event.kind == IncomingEvent::Kind::kRstStream &&
+                   event.error_code == ErrorCode::kRefusedStream) {
+            ++refused;
+        }
+    }
+    std::printf("[stress] 并发上限: 发送=%d 接受=%d 拒绝=%d 服务端流表=%zu\n", issued,
+                accepted, refused, pair.server->Streams().size());
+    Check(accepted == kLimit, "concurrency: server must accept up to its limit");
+    Check(refused == kStreams - kLimit,
+          "concurrency: server must refuse the excess streams");
+    Check(pair.server->Streams().size() == static_cast<std::size_t>(kLimit),
+          "concurrency: refused streams must not enter the stream table");
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +470,7 @@ void ScenarioConnectionReuse(int iterations) {
     std::size_t first_bytes = 0;
     const double start = NowMs();
     int done = 0;
+    int refused = 0;
     for (int i = 0; i < iterations; ++i) {
         std::uint32_t stream_id = 0;
         const std::vector<HeaderField> request = {
@@ -412,8 +479,12 @@ void ScenarioConnectionReuse(int iterations) {
             {":authority", "stress.local"},
             {"user-agent", "go2cpp-stress/1.0"},
         };
-        if (pair.client->StartRequest(request, true, &stream_id, &pair.error) !=
-            ConnStatus::kOk) {
+        const auto status = pair.client->StartRequest(request, true, &stream_id, &pair.error);
+        if (status == ConnStatus::kTooManyStreams) {
+            ++refused;
+            continue;
+        }
+        if (status != ConnStatus::kOk) {
             break;
         }
         const auto bytes = pair.client_transport.TakeOutbound();
@@ -433,12 +504,14 @@ void ScenarioConnectionReuse(int iterations) {
     const long rss_after = ReadVmRssKb();
 
     const double avg = done > 0 ? static_cast<double>(total_bytes) / done : 0.0;
-    std::printf("[stress] 连接复用 %5d 次: 首帧=%zuB 平均=%.1fB 总字节=%zuB 耗时=%.1fms "
-                "内存=%+ldKB load=%.2f\n",
-                done, first_bytes, avg, total_bytes, elapsed,
+    std::printf("[stress] 连接复用 %5d 次: 完成=%d 拒绝=%d 首帧=%zuB 平均=%.1fB "
+                "总字节=%zuB 耗时=%.1fms 内存=%+ldKB load=%.2f\n",
+                iterations, done, refused, first_bytes, avg, total_bytes, elapsed,
                 (rss_before >= 0 && rss_after >= 0) ? (rss_after - rss_before) : 0, load);
     // 动态表命中后，后续请求应显著小于首个请求
-    Check(done == iterations, "reuse: all requests must complete");
+    Check(done + refused == iterations,
+          "reuse: every request must be accepted or refused by MAX_CONCURRENT_STREAMS");
+    Check(done <= 100, "reuse: accepted streams must respect the advertised limit");
     Check(avg < static_cast<double>(first_bytes) * 0.5,
           "reuse: HPACK dynamic table should shrink later requests");
 }
@@ -458,6 +531,7 @@ void ScenarioHpackTablePressure(int iterations) {
     const double start = NowMs();
     std::size_t total_bytes = 0;
     int done = 0;
+    int refused = 0;
     for (int i = 0; i < iterations; ++i) {
         std::uint32_t stream_id = 0;
         // 唯一 header：每次都是新值，动态表必然插入并逐出旧条目
@@ -467,8 +541,12 @@ void ScenarioHpackTablePressure(int iterations) {
             {":authority", "stress.local"},
             {"x-request-id", "id-" + std::to_string(i) + "-abcdefghijklmnop"},
         };
-        if (pair.client->StartRequest(request, true, &stream_id, &pair.error) !=
-            ConnStatus::kOk) {
+        const auto status = pair.client->StartRequest(request, true, &stream_id, &pair.error);
+        if (status == ConnStatus::kTooManyStreams) {
+            ++refused;
+            continue;
+        }
+        if (status != ConnStatus::kOk) {
             break;
         }
         const auto bytes = pair.client_transport.TakeOutbound();
@@ -484,11 +562,13 @@ void ScenarioHpackTablePressure(int iterations) {
     const double elapsed = NowMs() - start;
     const long rss_after = ReadVmRssKb();
 
-    std::printf("[stress] HPACK 动态表 %5d 次唯一 header: 总字节=%zuB 耗时=%.1fms "
-                "内存=%+ldKB load=%.2f\n",
-                done, total_bytes, elapsed,
+    std::printf("[stress] HPACK 动态表 %5d 次唯一 header: 完成=%d 拒绝=%d 总字节=%zuB "
+                "耗时=%.1fms 内存=%+ldKB load=%.2f\n",
+                iterations, done, refused, total_bytes, elapsed,
                 (rss_before >= 0 && rss_after >= 0) ? (rss_after - rss_before) : 0, load);
-    Check(done == iterations, "hpack: all unique-header requests must complete");
+    Check(done + refused == iterations,
+          "hpack: every request must be accepted or refused by MAX_CONCURRENT_STREAMS");
+    Check(done <= 100, "hpack: accepted streams must respect the advertised limit");
     // 动态表大小为 4096，条目会被逐出；内存不应随迭代次数线性增长
     if (rss_before >= 0 && rss_after >= 0) {
         const long growth_kb = rss_after - rss_before;
@@ -561,6 +641,7 @@ int main() {
     std::printf("[stress] 注意：项目规则 loadavg > 1.5 的测量作废\n\n");
 
     ScenarioBulkStreams(100);
+    ScenarioServerRefusedStreams();
     ScenarioBulkStreams(1000);
     ScenarioBulkStreams(5000);
 

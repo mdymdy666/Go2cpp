@@ -1,245 +1,240 @@
 # QUIC / HTTP3 模块（2026-10-20 以代码为准订正）
 
-> ## 当前状态：自实现已删除，现为 picoquic + picohttp 薄封装
+> ## 当前状态：picoquic + picohttp 薄封装，自实现已删除
 >
-> 下面「参考实现」的定位声明描述的是 **2026-10-18 之前的自实现**
-> （varint/包头/帧层，1702 行），那套代码已全部删除（见文末「自实现已删除」）。
-> **当前代码是成熟库集成，不是参考实现：**
+> 本文档在 2026-10-20 的 HTTP/3 审计与修复后重写（审计项 D20）。
+> 下面「历史」一节保留 2026-10-18 之前自实现时期的记录，**不代表当前代码**。
 >
-> | 文件 | 行数 | 内容 |
+> **当前代码不是 QUIC 实现，而是成熟库集成：**
+>
+> | 文件 | 行数 | 职责 |
 > |---|---:|---|
-> | `src/network/quic/picoquic_connection.cpp` | 392 | picoquic 客户端连接、握手驱动、按流读写、回调 |
-> | `src/network/http3/client.cpp` | 752 | picohttp h3zero 的 HTTP/3 客户端（HEADERS/DATA、QPACK） |
-> | `example/network/picoquic_hq_client.cpp` | — | 端到端示例（TLS 1.3 握手 + 46 字节响应，验证通过） |
+> | `include/go2cpp/network/quic/picoquic_connection.hpp` | 270 | 裸 QUIC 客户端接口（pimpl，不暴露 picoquic 类型） |
+> | `src/network/quic/picoquic_connection.cpp` | 698 | 唯一 `#include <picoquic.h>` 的 TU：握手驱动、按流收发、关闭、事件翻译 |
+> | `include/go2cpp/network/http3/client.hpp` | 466 | HTTP/3 客户端门面（Request/Response/Client/Options） |
+> | `src/network/http3/client.cpp` | 1357 | 唯一 `#include <h3zero.h>` 的 TU：HEADERS/DATA、QPACK（picohttp）、控制流、GOAWAY |
+> | `example/network/picoquic_hq_client.cpp` | 188 | hq-interop 端到端示例（UDP Transport 的生产参考实现） |
 >
-> - 构建开关 `GO2CPP_WITH_PICOQUIC`（默认 OFF），需要 `PICOQUIC_ROOT` + `PICOTLS_ROOT`；
-> - **依赖已在本机**：`/home/ubunturoot/build-deps/picoquic`（`PICOQUIC_VERSION`
->   "1.1.53.0"，含 `build/libpicoquic-core.a`、`libpicohttp-core.a`、`picoquicdemo`）
->   与 `/home/ubunturoot/build-deps/picotls`（`libpicotls-{core,openssl,minicrypto,fusion}.a`），
->   均已编译；构建时传 `-DPICOQUIC_ROOT/-DPICOTLS_ROOT` 即可（见 `codex.md:549`）；
-> - **当前缺口**：`tests/` 下没有 HTTP3/QUIC 自动化测试，回归保护缺失；
-> - 构建步骤见 `cmake/Go2CppModules.cmake` 的 `GO2CPP_WITH_PICOQUIC` 段
->   与 `docs/quic-lib-evaluation.md`。
->
-> 以下历史内容保留作教训记录。
+> 仓库内**没有** `src/network/quic/varint.cpp`、`packet.cpp`、`frame.cpp`，
+> 也**没有** `tests/network/test_quic_*.cpp` —— 那些文件在 2026-10-18 已删除；
+> 当前 `tests/` 下没有 QUIC/HTTP3 测试（见 §6「已知缺口」，审计 D19）。
+> 如果看到旧文档/旧提交提到这些文件，均为历史记录。
 
 ---
 
-## 历史：自实现时期的能力边界（2026-10-18 之前，已删除）
+## 1. 依赖与构建
 
-> ## ⚠️ 定位声明：**参考实现，不可用于生产**
->
-> 本模块只实现了 QUIC 的**地基** —— varint 编码（RFC 9000 §16）、包头解析（§17）、
-> 帧层（§19）。它**无法建立连接、无法传输数据**，因为缺以下全部：
-> TLS 1.3 握手集成、Initial 密钥派生与 AEAD、**Header Protection**、
-> Packet Number 真实值、丢包检测与 PTO、拥塞控制、流状态机与流控、QPACK。
->
-> **如果需要真正可用的 QUIC/HTTP3，正确做法是集成成熟库**
-> （[picoquic](https://github.com/private-octopus/picoquic) /
-> [ngtcp2](https://github.com/ngtcp2/ngtcp2) /
-> [msquic](https://github.com/microsoft/msquic)），
-> **而不是在这套代码上继续加** —— 成熟实现是数万行、多年迭代的结果。
-> 集成路径与成本评估见 `docs/quic-go-reading-guide.md` 与本文件末节。
->
-> **保留本模块的唯一价值**：作为协议**字节格式**的参考实现，便于对照
-> RFC 9000/9001 理解字段布局；以及那些**边界与 fuzz 测试**本身是有价值的
-> （20 万次 varint 往返、10 万次随机变异）。
->
-> **历史说明**：本模块是在"60 分钟预算内无法完成库集成"的情况下产出的。
-> 这个决策本身有争议 —— 使用者的要求是"找一个库，不要自己实现"。
-> 如果你在评估是否继续投入，**请先决定要不要走库集成路线**，而不是继续扩充本模块。
+### 1.1 依赖（本机路径）
 
-> **这不是一个 QUIC 实现。** 它只覆盖 QUIC 的**最底层结构**：可变长整数与包头解析。
-> 握手、丢包恢复、拥塞控制、QPACK、流复用**全部没有**。
->
-> 之所以先做这一层：QUIC 所有上层字段都建立在 varint 与包头之上，
-> 这里错一个边界，后面全部错位，而且表现为"偶发解析失败"而非立即崩溃，极难定位。
-> 把它做成可独立验证的组件，才有继续往上叠的可能。
+- picoquic **1.1.53.0**：`/home/ubunturoot/build-deps/picoquic`
+  - 头文件：`picoquic/picoquic.h`、`picohttp/h3zero.h`、`picohttp/h3zero_common.h`、`picohttp/demoserver.h`
+  - 静态库：`build/libpicoquic-core.a`、`build/libpicoquic-log.a`、`build/libpicohttp-core.a`
+- picotls：`/home/ubunturoot/build-deps/picotls`
+  - `libpicotls-core.a`、`libpicotls-openssl.a`、`libpicotls-fusion.a`、`libpicotls-minicrypto.a`
+- 系统 OpenSSL 3.0.13（只做证书解析/哈希；TLS 1.3 由 picotls 实现）
 
-## 一、已实现并验证
+### 1.2 CMake
 
-### 1. 可变长整数（RFC 9000 §16）
+```bash
+cmake -S . -B build-work -DGO2CPP_WITH_PICOQUIC=ON \
+      -DPICOQUIC_ROOT=/home/ubunturoot/build-deps/picoquic \
+      -DPICOTLS_ROOT=/home/ubunturoot/build-deps/picotls
+```
 
-`include/go2cpp/network/quic/varint.hpp` + `src/network/quic/varint.cpp`
+`GO2CPP_WITH_PICOQUIC` **默认 OFF**（`cmake/Go2CppModules.cmake:312`）；
+打开后生成 `go2cpp_quic_picoquic`、`go2cpp_http3_picoquic` 两个静态库与
+`go2cpp_picoquic_hq_client` 示例。
 
-| 能力 | 说明 |
+**静态库链接顺序（关键）**：`libpicohttp-core.a` 必须排在
+`libpicoquic-core.a` 之前，否则 `h3zero_*` 的符号解析会失败
+（`cmake/Go2CppModules.cmake:344` 已有注释）。
+
+### 1.3 独立构建（不经 CMake，用于快速验证）
+
+```bash
+PICO=/home/ubunturoot/build-deps/picoquic
+PTLS=/home/ubunturoot/build-deps/picotls
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iinclude \
+    -I$PICO/picoquic -I$PICO/picohttp -I$PTLS/include \
+    -c src/network/quic/picoquic_connection.cpp -o /tmp/q.o
+g++ ... 同样编译 src/network/http3/client.cpp -o /tmp/h3.o
+g++ ... test.cpp /tmp/h3.o /tmp/q.o \
+    $PICO/build/libpicohttp-core.a $PICO/build/libpicoquic-core.a \
+    $PICO/build/libpicoquic-log.a \
+    $PTLS/libpicotls-core.a $PTLS/libpicotls-openssl.a \
+    $PTLS/libpicotls-fusion.a $PTLS/libpicotls-minicrypto.a \
+    -lssl -lcrypto -lpthread
+```
+
+两个 TU 与示例在 `-Werror` 下零警告（2026-10-20 验证）。
+
+---
+
+## 2. 当前能力（以代码为准）
+
+### 2.1 裸 QUIC：`net::quic::PicoquicConnection`
+
+| 方法 | 语义 |
 |---|---|
-4 档长度前缀 | `00`/`01`/`10`/`11` → 1/2/4/8 字节 |
-值上限 | 2^62 − 1 |
-编码 | 总是选能装下的**最短**长度 |
-解码 | **接受非最短编码**（RFC 不要求发送方用最短，接收方必须宽容） |
-增量友好 | 不足时返回 `kNeedMore` 且 `consumed == 0`，调用方可从原位重试 |
+| `Connect(transport, config, error)` | 只创建 picoquic 上下文并发 ClientHello；握手在后续 `Poll` 推进 |
+| `Poll(error)` / `PollFor(error, timeout_ms)` | 发完所有待发包 → 用 `Transport::ReadWithTimeout` 读一个 datagram → 喂 `picoquic_incoming_packet`；等待被 picoquic 下一个定时器（PTO/idle/ACK）与调用方预算截短 |
+| `Close(code, error)` | 主动关闭并**立即**把 CONNECTION_CLOSE 写出去（幂等） |
+| `WriteStream/ReadStream` | 按流收发；`ReadStream` 返回 0 只表示暂无数据 |
+| `StreamFinished(id)` / `StreamErrorCode(id)` | FIN / RESET_STREAM 的状态查询（审计 D17） |
+| `LastErrorCode()` | 关闭码（对端 app > 本地 app > 对端 transport > 本地 transport）或最近错误 |
 
-### 2. 包头解析（RFC 9000 §17）
+事件处理（`Impl::StreamCallback`）覆盖：`ready`、`stream_data`、`stream_fin`、
+`stream_reset`、`stop_sending`、`close`、`application_close`、`stateless_reset`
+（审计 D09）。**回调内异常会被捕获**（D18），不会穿过 picoquic 的 C 调用栈。
 
-`include/go2cpp/network/quic/packet.hpp` + `src/network/quic/packet.cpp`
+### 2.2 HTTP/3：`net::http3::Client`
 
-| 包类型 | 解析出的字段 |
+| 方法 | 语义 |
 |---|---|
-**Initial** | version、DCID、SCID、Token、Length、PN 偏移 |
-**0-RTT** | version、DCID、SCID、Length、PN 偏移 |
-**Handshake** | 同上 |
-**Retry** | version、DCID、SCID、Retry Token（长度由包总长推得）、16 字节完整性标签 |
-**Version Negotiation** | version==0、DCID、SCID、可用版本列表（校验是 4 的倍数） |
-**1-RTT（short）** | DCID（**长度由调用方提供**）、PN 偏移 |
+| `Connect(transport, sni[, Options], error)` | 创建连接；`Options` 控制超时、证书校验、`:authority`/SNI、响应体上限 |
+| `Send(Request, error)` | 编码 HEADERS [+ DATA] 并排队；收到 GOAWAY 后拒绝 `stream_id >= GoAwayId()` 的新流 |
+| `Receive(Response*, error)` | 按 FIFO 等待 FIN + HEADERS，取回 status/body/stream_id |
+| `Poll(error)` / `Close(code, error)` | 单步驱动 / 主动关闭 |
+| `Authority()` / `Sni()` | 实际使用的 `:authority` 与 TLS SNI（D15：两者可分离） |
+| `GoAwayReceived()` / `GoAwayId()` / `ServerSettingsReceived()` | 服务端控制流状态（D16） |
+| `LastStreamId()` | 最近分配的流号；未发送过返回 `kInvalidStreamId`（UINT64_MAX，D21） |
 
-## 二、**没有**实现的部分（逐项列出，避免误解）
+`Options` 字段：
 
-| 缺失 | 属于哪一层 |
-|---|---|
-**TLS 1.3 握手集成** | RFC 9001。QUIC 把 TLS 当"提供密钥的握手"，需要 CRYPTO 帧承载 |
-**Initial 包的密钥派生与加解密** | RFC 9001 §5.2（HKDF-Expand-Label + AEAD）|
-**Header Protection 的解保护/加保护** | RFC 9001 §5.4 |
-**Packet Number 的真实值与编码长度** | 见下方"为什么拿不到" |
-**帧层**（STREAM/ACK/CRYPTO/MAX_DATA…） | RFC 9000 §19 |
-**丢包检测与 PTO** | RFC 9002 |
-**拥塞控制** | RFC 9002（NewReno / CUBIC）|
-**流复用与流控** | RFC 9000 §4 |
-**QPACK（HTTP/3 头部压缩）** | RFC 9204 |
-**连接迁移 / 0-RTT 重放防护** | RFC 9000 §9 |
+```cpp
+struct Options {
+    std::uint32_t timeout_ms{5000};      // 握手/等待响应的总预算
+    bool verify_peer{false};             // 生产必须 true；无 CA 时 fail-closed
+    std::string cert_root_file_name;     // 为空则探测系统信任库
+    std::string authority;               // 最高优先级，完整覆盖 :authority
+    std::string host;                    // authority host；为空则从 sni 推断
+    std::uint16_t port{0};               // 非默认端口必须显式给（如 14434）
+    std::string sni;                     // 覆盖 TLS SNI（与 authority 分离）
+    std::size_t max_response_bytes{64MiB}; // 0 = 不限制（不建议）
+};
+```
 
-## 三、为什么拿不到 Packet Number
+**服务端控制流（D16）**：
+- 控制流（stream 3）的第一个 varint 是流类型 0x00，随后必须先是 SETTINGS；
+- SETTINGS 用 picohttp 的 `h3zero_settings_components_decode` 解析；
+- GOAWAY 被解析并记录；后续 GOAWAY 的流号只能更小（否则 H3_ID_ERROR）；
+- 控制流上的 DATA/HEADERS/PUSH_PROMISE 是 H3_FRAME_UNEXPECTED，控制流关闭是
+  H3_CLOSED_CRITICAL_STREAM；
+- QPACK encoder(7)/decoder(11) 流被**消费并丢弃**（维持流控），不建立动态表；
+- 服务端 push 流（`stream_id & 0x3 == 2`）与双向流（`& 0x3 == 1`）视为
+  H3_STREAM_CREATION_ERROR。
 
-RFC 9001 §5.4 的 header protection 会加密**首字节的低 4 位**和**整个 packet number 字段**。
-没有 header protection 密钥，那几位是伪随机的 —— 所以：
+### 2.3 已知能力边界（设计上不做，不是待补的桩）
 
-- 本模块只给出 `packet_number_offset`（PN 字段的起始偏移）；
-- **不提供** `packet_number_length`，因为那 2 位本身就在受保护区域内（long header 的
-  type-specific 低 2 位 / short header 的低 2 位）。
+- 请求方法只有 GET / POST（picohttp 只提供这两个构造器）；
+- 响应头只解出 `content-type`（picohttp 解析器的限制）；
+- 不使用 QPACK 动态表：只用静态表 + literal，压缩率较低；服务端 encoder 指令
+  只被消费，不解析；
+- 没有 0-RTT、服务端 push（收到即协议错误）、连接迁移/多路径；
+- 客户端单向流（2/6/10）由 `h3zero_protocol_init` 创建，本封装不直接管理。
 
-这是刻意的：**与其给一个在真实流量上必然错的字段，不如明确不给**。
+---
 
-## 四、验证数据
+## 3. 关键契约与陷阱
 
-测试：`tests/network/test_quic_packet.cpp`（424 行，已进 ctest）
+1. **`Transport` 必须是 datagram 语义**：一次 `Read` 返回一个完整 UDP 报文。
+2. **`Transport::ReadWithTimeout` 是实现方义务**：基类默认退化为阻塞 `Read`，
+   不覆盖它时超时仍可能被一次长阻塞击穿（审计 D02）。示例
+   `example/network/picoquic_hq_client.cpp` 用 `poll()` 给出生产参考实现。
+3. **回调线程模型**：picoquic 没有第二线程；回调在调用 `Poll`/`Send`/`Receive`
+   的线程上**同步**执行。旧注释「回调在 picoquic 自己的线程执行」是错的（D20）。
+4. **异常边界（D18）**：两个 C 回调都整体包在 `try/catch(...)` 里；捕获后置
+   `closed`、错误码 0x0102（HTTP/3 INTERNAL_ERROR），并 `picoquic_close`。
+   错误字符串留到 C++ 调用栈再拼（catch 内只做不抛操作）。
+5. **关闭语义**：`Close()` 立即发 CONNECTION_CLOSE；析构复用同一路径
+   （best-effort，吞掉 Transport 异常）。不关闭会耗尽 picoquicdemo 的 256 个
+   连接槽（审计 D01）。
+6. **`:authority` 与 SNI**：`Connect(transport, "host:port")` 会拆成
+   SNI=host、authority=host:port；`Options::host/port/sni/authority` 可分别覆盖。
+   authority 拒绝 CR/LF/空白等注入字符（D15）。
+7. **响应体上限**：`max_response_bytes` 超限即关连接并报错（D08）；流控窗口
+   也只按实际需要/上限打开，不按对端声明长度照单全收。
+8. **`LastStreamId()` 哨兵**：未发送过请求时返回 `kInvalidStreamId`（不是 0，
+   因为 0 是合法流号，D21）。
+9. **超时预算**：`Send`/`Receive` 把剩余预算传给 `PollFor`，不再只检查两次
+   `Poll` 之间（D02）；`PollFor(-1)` 才是无界等待。
 
-| 场景 | 内容 | 结果 |
+---
+
+## 4. 测试与验收（2026-10-20）
+
+- 独立构建：两个 TU + 示例，`-Wall -Wextra -Wpedantic -Werror` **零警告**；
+- 本地验收：`/tmp/fix_http3/acceptance.sh` **29/29 PASS**（25 项原有 +
+  D15 authority/SNI、D16 SETTINGS/GOAWAY、D09 application_close/stream_reset、
+  D18 回调异常）；
+- 30 轮端到端（GET + 5s 超时 + 10 次建连 + 关闭码）：**30/30，0 崩溃**
+  （`/tmp/fix_http3/round30.log`）；
+- 300 次建连 × 3 种模式（pending 析构 / 收响应 / 显式 Close）全部 300/300；
+- `ctest`：见修复报告 `fix_http3_final.md` 的实测数字。
+
+### 4.1 服务端（本地验证）
+
+```bash
+cd /home/ubunturoot/build-deps/picoquic
+./build/picoquicdemo -p 14434 -c certs/cert.pem -k certs/key.pem -w /tmp/quic_www -a h3
+./build/picoquicdemo -p 14433 -c certs/cert.pem -k certs/key.pem -w /tmp/quic_www -a hq-interop
+./build/picoquicdemo -p 14435 -c /tmp/fix_http3/certs/srv.pem -k /tmp/fix_http3/certs/srv.key -w /tmp/quic_www -a h3
+```
+
+D16/D09 的 GOAWAY、application_close、stream_reset 由 `/tmp/fix_http3/h3_test_server`
+（最小 picoquic 服务端，不属于仓库）注入。
+
+---
+
+## 5. 历史：自实现时期（2026-10-18 之前，已删除）
+
+> 以下描述的是**已删除**的代码，仅作教训记录。当前代码不要按这里理解。
+
+自实现只覆盖 QUIC 的**地基**：varint（RFC 9000 §16）、包头（§17）、帧层（§19），
+约 1702 行。它**不能建立连接、不能传输数据**，缺 TLS 1.3、Initial 密钥派生、
+Header Protection、丢包检测/PTO、拥塞控制、流状态机、QPACK。
+
+删除原因：它既不能用于生产，又要占 1702 行维护，还容易让后来者误以为项目支持
+QUIC —— 这个误导风险比代码本身更糟。picoquic 薄封装已经端到端验证，借用成熟
+协议实现，只保留 `Transport` 与 Fiber 的粘合。
+
+历史教训：
+
+1. 「能解析字节」和「能用」是两个数量级的差距；varint 30 行，能建连的 QUIC 是
+   数万行 + 多年迭代。
+2. 选型硬约束要先查：本机 OpenSSL 3.0.13 不支持 QUIC API，直接排除
+   ngtcp2/lsquic/msquic(默认)，只剩 picoquic（自带 picotls）。
+3. 使用者的要求是「找一个库，不要自己实现」；预算不够时应报告做不了，
+   而不是自作主张改方向。
+
+> **历史测试数据**（已失效，不要引用）：自实现时期曾有 varint 20 万次往返、
+> 包头 2 万次往返/10 万次变异、帧层 10 场景与「94/94 ctest」等记录；对应源文件
+> 与测试文件均已删除，当前仓库**没有**这些测试。旧文档里的
+> `tests/network/test_quic_packet.cpp`、`tests/network/test_quic_frame.cpp` 不存在。
+
+### 5.1 库集成评估（已完成，旧评估文档已过时）
+
+`docs/quic-lib-evaluation.md` 与 `docs/quic-go-reading-guide.md` 写于集成之前，
+其中「picoquic 集成被 picotls 阻断、代码未进项目」「本项目连 HTTP/2 都没有」等
+结论**已过时**：picoquic 1.1.53 + picotls 已在本机编译并接入 CMake，
+HTTP/2 也已有完整实现。这两份文档不在本次修复的可改范围（需决策是否重写）。
+
+---
+
+## 6. 已知缺口 / 需决策
+
+| 缺口 | 说明 | 状态 |
 |---|---|---|
-1 | varint 4 档下/上边界（63/64、16383/16384、2^30−1/2^30、2^62−1）+ 非最短编码 + 截断 | ✅ |
-2 | varint 随机往返 **200,000 次** | ✅ |
-3 | Initial（含 token、Length=1200）逐字段比对 | ✅ |
-4 | Handshake / 0-RTT / Retry（token + 16 字节标签） | ✅ |
-5 | Version Negotiation（含"版本列表非 4 倍数应非法"） | ✅ |
-6 | Short header（DCID 长度 0/4/8/20；0 与 21 的合法性边界） | ✅ |
-7 | 畸形输入（fixed bit=0、DCID 声明 21）+ **任意前缀截断必须 kNeedMore** | ✅ |
-8 | **随机变异 fuzz 100,000 次**（ok=22283 / need_more=7712 / invalid=70005 / 不崩溃） | ✅ |
-9 | 包头随机往返 **20,000 次**（4 种 long 类型 × DCID/SCID 长度 0~20） | ✅ |
-
-全量 ctest：**94/94 通过**。
-
-## 五、库集成评估（为什么这一轮没接 picoquic）
-
-按指示先在 Windows 侧试 clone，两个都成功：
-
-| 库 | 规模 | 结论 |
-|---|---|---|
-`picoquic` | 244 个 C/H，约 **176,143 行** | **本轮不可集成** |
-`ngtcp2` | 250 个 C/H，约 **110,292 行** | 未评估到可集成程度 |
-
-**picoquic 的阻断点**：它的 TLS 层依赖 `picotls`，而仓库里 **`picotls/` 目录是空的**、
-`.gitmodules` 也不存在。`CMakeLists.txt` 里 `PICOQUIC_FETCH_PTLS` 默认 **OFF**，
-开启后用 `FetchContent` 从 `https://github.com/h2o/picotls.git` 拉取再编译。
-
-也就是说接入 picoquic 需要：拉 picotls（网络）→ 编译 picotls → 编译 picoquic →
-适配它的事件循环到本项目的 Fiber/IOManager → 才能跑第一个握手。**60 分钟预算内风险过高**，
-而且当时 loadavg 已到 2.3~2.5（多个编译/测试并发），编译大库的时间不可控。
-
-**结论**：库路线**可行但要单独排期**（预估半天：先编通 picoquic 自带的 client/server demo，
-再写适配层）。本轮选择做地基，保证交付的是**能验证的真东西**而不是接了一半的烂摊子。
-
-## 六、如果要继续往上做
-
-建议顺序（每一步都能独立验证）：
-
-1. **帧层**（RFC 9000 §19）：STREAM/ACK/CRYPTO/PADDING/PING/CONNECTION_CLOSE 等，
-   纯逻辑、无密钥，可以直接对照 RFC 写测试；
-2. **Header Protection**（RFC 9001 §5.4）：AES-ECB 或 ChaCha20 的掩码，
-   有了它才能拿到真实 packet number；
-3. **Initial 密钥派生 + AEAD**（RFC 9001 §5.2）：可以先只做
-   "用固定 DCID 派生 initial secrets" → 解出第一包；
-4. TLS 集成 —— 这一步要么接 OpenSSL 的 QUIC API（3.2+ 才有完整支持），
-   要么接 picotls，是本模块之外的最大工程。
+| 仓库内无 HTTP/3/QUIC ctest | 审计 D19：`GO2CPP_WITH_PICOQUIC` 默认 OFF，且无 `tests/network/test_http3_*` | **需决策**：`cmake/`、`tests/` 不在本次修复边界；验收测试在 `/tmp/fix_http3`（不进仓库） |
+| QPACK 动态表 | 只消费 encoder/decoder 流，不解析插入指令 | 设计边界（`h3zero` 客户端同样不用动态表） |
+| 响应头全集 | picohttp 解析器只保留 `:status`/`content-type`/`range` 等 | 设计边界 |
+| 服务端 push / 0-RTT / 迁移 | 未实现 | 设计边界 |
+| 两份旧评估文档 | `quic-lib-evaluation.md`、`quic-go-reading-guide.md` 与现状矛盾 | **需决策**：本次可改文件不含它们 |
 
 ---
 
-## 帧层（RFC 9000 §19）—— 已实现
+## 7. 参考
 
-`include/go2cpp/network/quic/frame.hpp` + `src/network/quic/frame.cpp`。
-
-覆盖 22 种帧类型：PADDING / PING / ACK / ACK_ECN / RESET_STREAM / STOP_SENDING /
-CRYPTO / NEW_TOKEN / STREAM（**8 个变体**）/ MAX_DATA / MAX_STREAM_DATA /
-MAX_STREAMS(bidi,uni) / DATA_BLOCKED / STREAM_DATA_BLOCKED / STREAMS_BLOCKED(bidi,uni) /
-NEW_CONNECTION_ID / RETIRE_CONNECTION_ID / PATH_CHALLENGE / PATH_RESPONSE /
-CONNECTION_CLOSE(transport,app) / HANDSHAKE_DONE。
-
-### 两个关键语义
-
-**1. `length` 参数必须是「包的剩余字节数」，不是缓冲区容量。**
-RFC 9000 §19.8 规定 STREAM 帧的 LEN 位为 0 时，数据**延伸到包尾**。调用方必须
-保证传入的 `length` 恰好到包尾，否则解析边界会错。
-
-**2. 未知帧类型必须当连接错误处理，不能跳过。**
-RFC 9000 §12.4：*An endpoint MUST treat the receipt of a frame of unknown type as a
-connection error of type FRAME_ENCODING_ERROR.*
-QUIC 的扩展帧靠**双方提前协商**，不是靠"接收方忽略不认识的东西"。本模块返回
-`kUnknownType` 只是为了诊断时能区分"新扩展"和"垃圾字节"，**调用方仍应关闭连接**。
-
-### PADDING 的合并消费
-
-连续 N 个 `0x00` 在语义上等于 N 个独立 PADDING 帧。本实现合并消费成一个
-`padding_count = N` 的帧，语义等价且避免上层为空填充做 N 次循环。
-
-### 验证
-
-`tests/network/test_quic_frame.cpp`（10 场景，`failures=0`）：
-22 种帧往返、STREAM 8 变体、无 LEN 位延伸到包尾、ACK/ACK_ECN/Range 列表、
-PADDING 合并、**96 个前缀截断**（至少一次 kNeedMore）、10 例畸形输入、
-未知类型、随机往返 **20,000 次**、随机变异 fuzz **100,000 次**。
-
-### 仍未实现
-
-TLS 1.3 握手、Initial 密钥派生与 AEAD、Header Protection、Packet Number 真实值、
-丢包检测/PTO、拥塞控制、流状态机与流控、QPACK、连接迁移/0-RTT 防重放。
-
-> **选型评估**：5 个候选库（msquic/picoquic/ngtcp2/lsquic/quiche）的对比、
-> 为什么 picoquic 是唯一不需要更换系统 TLS 的库、以及分步打通的卡点，
-> 见 [`quic-lib-evaluation.md`](quic-lib-evaluation.md)。
-
----
-
-## 自实现已删除（2026-10-18）
-
-**`network/quic/` 下的自实现（varint / 包头 / 帧层，1702 行）已全部删除**，
-只保留 `picoquic_connection.hpp/cpp`（对 picoquic 的薄封装）。
-
-### 为什么删
-
-自实现那套**只能解析字节，不能建立连接、不能传输数据** —— 缺 TLS 1.3 握手、
-密钥派生、Header Protection、丢包恢复、拥塞控制、流状态机、QPACK。
-它既不能用于生产，又要占 1702 行需要维护的代码，**而且容易让后来者
-看到 `network/quic/` 就以为项目支持 QUIC** —— 这个误导风险比代码本身更糟。
-
-而 picoquic 薄封装已经**端到端验证通过**（TLS 1.3 握手 + 收发 46 字节正确响应），
-它借用了成熟的协议实现，只需要我们提供 `Transport`（IO 由 Fiber 驱动）。
-**两套 QUIC 共存没有意义，留真的那个。**
-
-### 保留什么
-
-| 保留 | 理由 |
-|---|---|
-`include/go2cpp/network/quic/picoquic_connection.hpp` | 薄封装接口（pimpl，头文件不依赖 picoquic）|
-`src/network/quic/picoquic_connection.cpp` | 唯一 include picoquic 头的地方 |
-`example/network/picoquic_hq_client.cpp` | 端到端验证 + 用法示范 |
-`docs/quic.md`（本文件） | **教训记录**：为什么自实现是错的方向、怎么选库 |
-`docs/quic-lib-evaluation.md` | 5 个候选库的对比与卡点 |
-
-### 教训（这才是删掉代码后要留下的东西）
-
-1. **使用者的要求是「找一个库，不要自己实现」** —— 我在 60 分钟预算内
-   无法完成库集成时，选择了"自己写一个骨架"，这是错的。正确做法是
-   **报告"这个时间窗做不了"**，而不是自作主张改变方向。
-2. **"能解析字节"和"能用"是两个数量级的差距** —— varint 编码 30 行就写完了，
-   但一个能建连的 QUIC 实现是数万行 + 多年迭代。
-3. **选型的硬约束要先查** —— 本机 OpenSSL 3.0.13 **不支持 QUIC API**
-   （`SSL_set_quic_method` 不存在），这一条直接排除了 ngtcp2/lsquic/msquic(默认)，
-   只剩 picoquic（自带 picotls 做 TLS 1.3）。**这个约束花了很久才发现。**
+- RFC 9000（QUIC transport）、RFC 9001（TLS）、RFC 9114（HTTP/3）、RFC 9204（QPACK）
+- picoquic: <https://github.com/private-octopus/picoquic>
+- picotls: <https://github.com/h2o/picotls>

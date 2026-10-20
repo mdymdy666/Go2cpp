@@ -121,8 +121,10 @@
  *
  * - **只接受 `S_ISREG`**：FIFO/pipe/字符设备/eventfd/timerfd/signalfd 的 read
  *   会真阻塞，而本类绕过 Hook，会把整个 worker 线程卡死（本地 DoS）；
- * - `Open` 内部先加 `O_NONBLOCK` 再 `fstat`：否则打开 FIFO 会卡在 `open` 里，
- *   根本到不了类型校验；普通文件上该位是 no-op；
+ * - `Open` 返回的 fd 一定带 `O_CLOEXEC | O_NONBLOCK`：后者防止 `open` 卡在
+ *   FIFO 上、根本到不了类型校验；普通文件上 `O_NONBLOCK` 是 no-op，但调用方
+ *   若把该 fd 传给期望阻塞语义的代码（如边缘触发 poll），需要知道这一点；
+ *   `Adopt` 则**不修改**任何 fd 标志；
  * - `fsync`/`Truncate` 会真实等待磁盘/改变文件长度，热路径上需自行评估。
  */
 #pragma once
@@ -137,6 +139,23 @@
 #include <vector>
 
 namespace go2cpp::os {
+
+/**
+ * @brief 模块内部使用的校验辅助（**不是公开 API**，不保证跨版本稳定）。
+ * @details `std::string` 可以携带内嵌 `'\0'`，而所有 POSIX 路径/名字入口都是
+ *          `const char*` + 隐式长度：`c_str()` 会在首个 `'\0'` 处静默截断，
+ *          导致「校验的路径」与「实际操作的路径」不一致（路径注入）。
+ *          因此所有按路径/名字的公开入口都必须先过这里，返回 `EINVAL`
+ *          （与 Go 的 `syscall.BytePtrFromString` 一致）。
+ */
+namespace detail {
+
+/// @brief 文本中是否含内嵌 NUL（`std::string` 允许，C 字符串不允许）。
+inline bool ContainsNul(std::string_view text) noexcept {
+    return text.find('\0') != std::string_view::npos;
+}
+
+}  // namespace detail
 
 /** @brief `os` 模块的错误码。 */
 enum class OsError : std::uint8_t {
@@ -244,7 +263,8 @@ inline OpenFlag operator|(OpenFlag a, OpenFlag b) noexcept {
  * ## 不变量
  * - `m_fd >= 0` 时句柄可用；`m_fd == -1` 时 `m_owned` 必为 false；
  * - `m_owned == true` 时，析构或 `Close` 恰好关闭一次 fd；
- * - 持有有效 fd 的对象只可能是普通文件（`S_ISREG`）。
+ * - 持有有效 fd 的对象只可能是普通文件（`S_ISREG`）；
+ * - `m_append == true` 时 `WriteAt` 一律返回 -1/EINVAL（见 `WriteAt` 的 note）。
  */
 class File final {
 public:
@@ -259,9 +279,14 @@ public:
 
     /**
      * @brief 打开一个文件。
-     * @param path 路径。空路径返回 `kInvalidArgument`。
+     * @param path 路径。空路径或含内嵌 NUL 的路径返回 `kInvalidArgument`（`EINVAL`）。
      * @param flags 打开标志（可用 `OpenFlag` 的 `|` 组合）。
      * @param mode `O_CREAT` 时使用的权限位。
+     *
+     * @note 返回的 fd 一定带 `O_CLOEXEC | O_NONBLOCK`：`O_NONBLOCK` 是为了让
+     *       `open` 在 FIFO 上不阻塞（否则到不了 `fstat` 类型校验），普通文件上
+     *       它是 no-op。调用方若把该 fd 传给期望阻塞语义的代码（如边缘触发的
+     *       poll 注册），需要自行知道这一点；`Adopt` 则不修改任何 fd 标志。
      */
     static FileStatus Open(const std::string& path, OpenFlag flags, mode_t mode = 0644,
                            File* out = nullptr);
@@ -294,15 +319,29 @@ public:
     /**
      * @brief 写最多 `length` 字节（同步阻塞）。
      * @details 这是**一次写**的语义，可能少写；需要写全请用 `WriteAll`。
+     * @warning 写入超过 `RLIMIT_FSIZE` / 文件系统配额时，内核会向进程发
+     *          `SIGXFSZ`，**默认动作是终止进程** —— 此时 `Write`/`WriteAll`
+     *          还没机会返回 `EFBIG`。在限额环境里写文件前应先
+     *          `signal(SIGXFSZ, SIG_IGN)`（或捕获），再用短写长度与
+     *          `last_error() == EFBIG` 判断。
      */
     ssize_t Write(const void* buffer, std::size_t length) noexcept;
 
-    /** @brief 在指定偏移写（`pwrite`），不改变文件偏移。 */
+    /**
+     * @brief 在指定偏移写（`pwrite`），不改变文件偏移。
+     * @return 写入字节数；失败返回 -1（`last_error()` 有效）。
+     * @note **`O_APPEND` 句柄上直接失败**（`-1` / `EINVAL`）：POSIX 允许
+     *       `pwrite` 在 `O_APPEND` 上忽略 `offset` 并追加到末尾，Linux 至今
+     *       如此（`pwrite(2)` BUGS 有记载）。本类选择显式拒绝而不是静默写到
+     *       错误位置。需要随机写就打开一个**不带** `kAppend` 的句柄。
+     */
     ssize_t WriteAt(const void* buffer, std::size_t length, off_t offset) noexcept;
 
     /**
      * @brief 循环写直到写完（处理 `EINTR` 与部分写）。
      * @return 写入了多少字节；小于 `length` 表示中途失败。
+     * @warning 同 `Write`：超过 `RLIMIT_FSIZE` 会先收到 `SIGXFSZ`（默认终止
+     *          进程）。需要在限额下容错时先忽略/捕获该信号。
      */
     std::size_t WriteAll(const void* buffer, std::size_t length) noexcept;
 
@@ -329,7 +368,6 @@ public:
     /** @brief 是否是一个普通文件（`S_ISREG`）。 */
     bool IsRegular() const noexcept;
 
-    /** @brief 手动关闭。可重复调用（幂等）。 */
     /**
      * @brief 把该文件的所有已写数据与元数据刷到持久存储（`fsync`）。
      * @return 是否成功；失败原因在 `last_error()`。
@@ -361,6 +399,14 @@ public:
      */
     FileStatus Truncate(off_t size) noexcept;
 
+    /**
+     * @brief 手动关闭。可重复调用（幂等）。
+     * @warning `close(2)` 阶段的错误（NFS 上的 `EIO`、`ENOSPC`、延迟写回失败等）
+     *          **被丢弃**：Linux 上 `close` 遇到 `EINTR` 是"已关闭但状态不确定"，
+     *          重试反而可能关掉别人的 fd，而本方法不返回状态。需要确认数据
+     *          落盘时，先 `Sync()` 并检查返回值，再 `Close()`。
+     *          把它改成返回 `FileStatus` 会破坏现有 API，属待决策项（审计 D7）。
+     */
     void Close() noexcept;
 
     /** @brief 底层 fd；已关闭时返回 -1。 */
@@ -375,6 +421,10 @@ public:
 private:
     int m_fd{-1};  ///< 持有的 fd，-1 表示关闭；Open/Adopt/移动赋值写入，Close 置 -1，fd()/valid() 读取
     bool m_owned{false};  ///< 是否拥有 fd（析构/Close 负责关闭）；Adopt 的 take_ownership 决定，移动时随 fd 转移
+    /// fd 是否带 `O_APPEND`：`Open` 按调用方 flags 记录，`Adopt` 用 `F_GETFL`
+    /// 只读探测一次（不修改标志）。`WriteAt` 据此拒绝写入 —— Linux `pwrite`
+    /// 在 `O_APPEND` 句柄上会**忽略 offset**、追加到末尾，静默写错位置比报错危险。
+    bool m_append{false};
     int m_last_error{0};  ///< 最近一次失败的 errno，0 表示成功；各 IO 函数写入，last_error() 读取
 };
 
@@ -386,6 +436,15 @@ private:
  * @brief 整个文件读进 `std::string`。
  * @details 先用 `fstat` 取大小并 reserve，读的过程仍按实际返回追加 ——
  *          因为文件可能在被读期间增长，`st_size` 只作为容量提示。
+ *
+ *          大小上限 `os.max_file_size`（0 表示不限制）在**读循环内累计检查**：
+ *          `st_size==0` 的 procfs 伪文件、读期间被追加的文件都不能绕过；超限
+ *          返回 `kIoFailed` + `EFBIG` 且清空 `out`。
+ *
+ * @note 分配失败（`std::bad_alloc` / `std::length_error`）不会抛出：返回
+ *       `kIoFailed` + `ENOMEM`，`out` 为空，与本模块其它错误的报告方式一致。
+ * @note 路径是目录时返回 `kNotRegularFile`（由 `File::Open` 的 `S_ISREG`
+ *       白名单兜住），不会把目录当文件读。
  */
 FileStatus ReadFile(const std::string& path, std::string* out, std::string* error = nullptr);
 
@@ -403,6 +462,8 @@ FileStatus WriteFile(const std::string& path, std::string_view data,
 /**
  * @brief 读环境变量。
  * @return 存在则返回拷贝值的 `std::string`；不存在返回空 optional。
+ * @note 名字为空或含内嵌 NUL 时返回空 optional（NUL 会被 `getenv` 静默截断，
+ *       按「不存在」处理，避免读到另一个变量的值）。
  * @details **必须拷贝**：`getenv` 返回的是 libc 内部缓冲区的指针，
  *          另一个线程 `setenv` 后该指针可能失效 —— 直接返回 `const char*`
  *          会让调用方拿到悬空指针。本函数返回拷贝，避免该竞态。
@@ -412,13 +473,17 @@ std::optional<std::string> Getenv(const std::string& name);
 /**
  * @brief 设环境变量。
  * @param overwrite 为 false 时，已存在则不覆盖。
+ * @return 名字/值含内嵌 NUL、名字为空或含 `'='` 时返回 `kInvalidArgument`（`EINVAL`）。
  * @note `setenv` 本身不是线程安全的（会动 `environ`）；本函数不加锁，
  *       调用方需自行保证不在多线程下并发修改环境变量。
  */
 FileStatus Setenv(const std::string& name, const std::string& value, bool overwrite = true,
                   std::string* error = nullptr);
 
-/** @brief 删除环境变量。 */
+/**
+ * @brief 删除环境变量。
+ * @return 名字为空或含内嵌 NUL 时返回 `kInvalidArgument`（`EINVAL`）。
+ */
 FileStatus Unsetenv(const std::string& name, std::string* error = nullptr);
 
 /**

@@ -425,6 +425,106 @@ void ScenarioRandomTree() {
     Check(!PathExists(root), "随机树应已被完全删除");
 }
 
+
+// ---------------------------------------------------------------------------
+// 场景 9：审计回归（NUL / RemoveAll 点段 / SetTimes 跟随链接 / EINVAL）
+// ---------------------------------------------------------------------------
+void ScenarioAuditRegressions() {
+    const std::string base = Under("s9");
+    Check(go2cpp::os::MkdirAll(base + "/sub", 0755).ok(), "audit: mkdir");
+    MakeFile(base + "/keep.txt", "keep");
+    MakeFile(base + "/sub/keep2.txt", "keep2");
+
+    // 9.1 路径内嵌 NUL：目录 API 必须 EINVAL，且不操作截断后的路径
+    std::string evil = base + "/keep.txt";
+    evil.push_back('\0');
+    evil += "-suffix";
+    std::vector<go2cpp::os::DirEntry> entries;
+    std::string error;
+    auto status = go2cpp::os::ReadDir(evil, &entries, &error);
+    Check(!status.ok() && status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "audit: ReadDir(NUL) -> EINVAL");
+    status = go2cpp::os::MkdirAll(evil, 0755, &error);
+    Check(!status.ok() && status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "audit: MkdirAll(NUL) -> EINVAL");
+    status = go2cpp::os::RemoveAll(evil, &error);
+    Check(!status.ok() && status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL && PathExists(base + "/keep.txt"),
+          "audit: RemoveAll(NUL) -> EINVAL 且真实文件仍在");
+    std::string link_target;
+    status = go2cpp::os::Readlink(evil, &link_target, &error);
+    Check(!status.ok() && status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "audit: Readlink(NUL) -> EINVAL");
+    status = go2cpp::os::Symlink(evil, base + "/nul_link", &error);
+    Check(!status.ok() && status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL && !PathExists(base + "/nul_link"),
+          "audit: Symlink(target NUL) -> EINVAL 且未创建链接");
+    struct timespec audit_times[2] = {{1600000000, 0}, {1700000000, 0}};
+    status = go2cpp::os::SetTimes(evil, audit_times[0], audit_times[1], &error);
+    Check(!status.ok() && status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "audit: SetTimes(NUL) -> EINVAL");
+    struct ::stat nul_info {};
+    status = go2cpp::os::StatPath(evil, &nul_info, true, &error);
+    Check(!status.ok() && status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "audit: StatPath(NUL) -> EINVAL");
+
+    // 9.2 RemoveAll 拒绝点段结尾（会清空目录再失败）
+    status = go2cpp::os::RemoveAll(base + "/.", &error);
+    Check(!status.ok() && status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "audit: RemoveAll(a/.) -> EINVAL");
+    status = go2cpp::os::RemoveAll(base + "/sub/..", &error);
+    Check(!status.ok() && status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "audit: RemoveAll(a/sub/..) -> EINVAL");
+    Check(PathExists(base + "/keep.txt") && PathExists(base + "/sub/keep2.txt"),
+          "audit: 被拒绝的 RemoveAll 未删除任何内容");
+
+    // 9.3 SetTimes 跟随符号链接：改目标，不改链接自身
+    const std::string link = base + "/time_link";
+    Check(go2cpp::os::Symlink(base + "/keep.txt", link).ok(), "audit: symlink");
+    struct ::stat before {};
+    Check(go2cpp::os::StatPath(link, &before, false).ok(), "audit: lstat link before");
+    status = go2cpp::os::SetTimes(link, audit_times[0], audit_times[1], &error);
+    Check(status.ok(), "audit: SetTimes(link) 成功");
+    struct ::stat target_info {};
+    Check(go2cpp::os::StatPath(base + "/keep.txt", &target_info, true).ok(),
+          "audit: stat target");
+    Check(target_info.st_mtim.tv_sec == audit_times[1].tv_sec,
+          "audit: SetTimes 跟随链接改的是目标 mtime");
+    struct ::stat link_info {};
+    Check(go2cpp::os::StatPath(link, &link_info, false).ok(), "audit: lstat link after");
+    Check(link_info.st_mtim.tv_sec == before.st_mtim.tv_sec &&
+              link_info.st_mtim.tv_nsec == before.st_mtim.tv_nsec,
+          "audit: 链接自身的 mtime 不变");
+
+    // 悬空链接 -> ENOENT（跟随语义的直接证据）
+    const std::string dangling = base + "/dangling";
+    Check(go2cpp::os::Symlink(base + "/missing", dangling).ok(), "audit: dangling link");
+    status = go2cpp::os::SetTimes(dangling, audit_times[0], audit_times[1], &error);
+    Check(!status.ok() && status.system_error == ENOENT,
+          "audit: SetTimes(悬空链接) -> ENOENT");
+
+    // 9.4 out==nullptr 统一 EINVAL
+    status = go2cpp::os::ReadDir(base, nullptr, &error);
+    Check(status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "audit: ReadDir(out=nullptr) -> EINVAL");
+    status = go2cpp::os::Readlink(link, nullptr, &error);
+    Check(status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "audit: Readlink(out=nullptr) -> EINVAL");
+    status = go2cpp::os::StatPath(base, nullptr, true, &error);
+    Check(status.code == go2cpp::os::OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "audit: StatPath(out=nullptr) -> EINVAL");
+}
+
 }  // namespace
 
 int main() {
@@ -453,6 +553,8 @@ int main() {
     ScenarioStress();
     std::printf("[os-dir][场景8] 随机目录树\n");
     ScenarioRandomTree();
+    std::printf("[os-dir][场景9] 审计回归\n");
+    ScenarioAuditRegressions();
 
     // 清理
     go2cpp::os::RemoveAll(Root());

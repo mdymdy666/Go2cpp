@@ -39,6 +39,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <string_view>
 #include <utility>
 
 namespace go2cpp::os {
@@ -60,6 +61,22 @@ std::string Describe(const std::string& what, int err) {
         text += ")";
     }
     return text;
+}
+
+/**
+ * @brief 路径的**最后一段**是否是 `.` 或 `..`（先去掉尾随 `/`）。
+ * @details `RemoveAll("a/.")` 与 `RemoveAll(".")` 的危害相同：都会先清空该目录
+ *          的全部子项，再在 `rmdir("a/.")` / `rmdir(".")` 阶段失败 —— 没有任何
+ *          成功可能，只有破坏性。`a/../b` 这种中间段不受影响，不在此列。
+ */
+bool EndsWithDotSegment(std::string_view path) noexcept {
+    while (path.size() > 1 && path.back() == '/') {
+        path.remove_suffix(1);
+    }
+    const auto slash = path.rfind('/');
+    const std::string_view last =
+        (slash == std::string_view::npos) ? path : path.substr(slash + 1);
+    return last == "." || last == "..";
 }
 
 FileStatus Fail(OsError code, int err, std::string* error, const std::string& what) {
@@ -91,11 +108,16 @@ FileStatus Fail(OsError code, int err, std::string* error, const std::string& wh
 FileStatus ReadDir(const std::string& path, std::vector<DirEntry>* out,
                    std::string* error) {
     if (out == nullptr) {
-        return Fail(OsError::kInvalidArgument, 0, error, "ReadDir: out 为空指针");
+        return Fail(OsError::kInvalidArgument, EINVAL, error,
+                    "ReadDir: out 为空指针");
     }
     out->clear();
     if (path.empty()) {
         return Fail(OsError::kInvalidArgument, EINVAL, error, "ReadDir: 路径为空");
+    }
+    if (detail::ContainsNul(path)) {
+        return Fail(OsError::kInvalidArgument, EINVAL, error,
+                    "ReadDir: 路径含内嵌 NUL");
     }
 
     DIR* dir = ::opendir(path.c_str());
@@ -171,6 +193,10 @@ FileStatus MkdirAll(const std::string& path, mode_t mode, std::string* error) {
     if (path.empty()) {
         return Fail(OsError::kInvalidArgument, EINVAL, error, "MkdirAll: 路径为空");
     }
+    if (detail::ContainsNul(path)) {
+        return Fail(OsError::kInvalidArgument, EINVAL, error,
+                    "MkdirAll: 路径含内嵌 NUL");
+    }
 
     // step2: current 是累积前缀，position 指向下一段的起点
     // 逐段创建：从第一个 '/' 开始，每往后一段就 mkdir 一次。
@@ -227,6 +253,7 @@ FileStatus MkdirAll(const std::string& path, mode_t mode, std::string* error) {
  * @brief 递归删除文件或目录（等价 `rm -rf`，不跟随符号链接）。
  *
  * ## 步骤
+ * step0. 拒绝 `.` / `..` / `a/.` / `a/..`：它们会清空目录再在 rmdir 失败；
  * step1. `lstat` 判断类型；`ENOENT` 视为成功（幂等）；
  * step2. 非目录（含符号链接）直接 `unlink`，绝不递归进链接目标；
  * step3. 目录先收集全部子项名字，避免 readdir 期间删除导致条目被跳过；
@@ -236,6 +263,18 @@ FileStatus MkdirAll(const std::string& path, mode_t mode, std::string* error) {
 FileStatus RemoveAll(const std::string& path, std::string* error) {
     if (path.empty()) {
         return Fail(OsError::kInvalidArgument, EINVAL, error, "RemoveAll: 路径为空");
+    }
+    if (detail::ContainsNul(path)) {
+        return Fail(OsError::kInvalidArgument, EINVAL, error,
+                    "RemoveAll: 路径含内嵌 NUL");
+    }
+    // 显式拒绝 `.` / `..`（含 `a/.`、`a/..` 这类点段结尾）：
+    // 它们会先把当前目录/父目录的子项全部删掉，再在 rmdir 时必然失败，
+    // 调用方拿到的只是一个错误，现场却已被清空 —— 一次误调用就能毁掉工作目录。
+    // Go 的 os.RemoveAll(".") 是先删子项再报错；这里有意更严格（审计 D4）。
+    if (EndsWithDotSegment(path)) {
+        return Fail(OsError::kInvalidArgument, EINVAL, error,
+                    "RemoveAll 拒绝删除 '.' 或 '..'（会清空当前/父目录）: " + path);
     }
 
     // 用 lstat 而非 stat：符号链接要删链接本身，不跟随目标。
@@ -327,11 +366,16 @@ FileStatus RemoveAll(const std::string& path, std::string* error) {
  */
 FileStatus Readlink(const std::string& path, std::string* out, std::string* error) {
     if (out == nullptr) {
-        return Fail(OsError::kInvalidArgument, 0, error, "Readlink: out 为空指针");
+        return Fail(OsError::kInvalidArgument, EINVAL, error,
+                    "Readlink: out 为空指针");
     }
     out->clear();
     if (path.empty()) {
         return Fail(OsError::kInvalidArgument, EINVAL, error, "Readlink: 路径为空");
+    }
+    if (detail::ContainsNul(path)) {
+        return Fail(OsError::kInvalidArgument, EINVAL, error,
+                    "Readlink: 路径含内嵌 NUL");
     }
 
     // 动态扩容：readlink 在缓冲区不够时会**静默截断**并返回缓冲区大小，
@@ -364,6 +408,11 @@ FileStatus Symlink(const std::string& target, const std::string& link_path,
     if (target.empty() || link_path.empty()) {
         return Fail(OsError::kInvalidArgument, EINVAL, error, "Symlink: 路径为空");
     }
+    // target 也会原样交给 symlink(2)；含 NUL 同样会被截断成另一个链接目标。
+    if (detail::ContainsNul(target) || detail::ContainsNul(link_path)) {
+        return Fail(OsError::kInvalidArgument, EINVAL, error,
+                    "Symlink: 路径含内嵌 NUL");
+    }
     if (::symlink(target.c_str(), link_path.c_str()) != 0) {
         return Fail(OsError::kIoFailed, errno, error,
                     "Symlink 创建失败: " + link_path + " -> " + target);
@@ -380,10 +429,16 @@ FileStatus SetTimes(const std::string& path, const struct timespec& atime,
     if (path.empty()) {
         return Fail(OsError::kInvalidArgument, EINVAL, error, "SetTimes: 路径为空");
     }
+    if (detail::ContainsNul(path)) {
+        return Fail(OsError::kInvalidArgument, EINVAL, error,
+                    "SetTimes: 路径含内嵌 NUL");
+    }
     struct timespec times[2];
     times[0] = atime;   // [0] = 访问时间
     times[1] = mtime;   // [1] = 修改时间
     // 走 syscall 而不是 utimensat(): 避开不同 glibc 版本对 timespec 的封装差异。
+    // flags == 0 表示**跟随符号链接**（与 Go 的 os.Chtimes 一致）；若需要
+    // 不跟随，得传 AT_SYMLINK_NOFOLLOW，本 API 暂未暴露该选项。
     const long result =
         ::syscall(SYS_utimensat, AT_FDCWD, path.c_str(), times, 0);
     if (IsSyscallError(result)) {
@@ -399,10 +454,15 @@ FileStatus SetTimes(const std::string& path, const struct timespec& atime,
 FileStatus StatPath(const std::string& path, struct ::stat* out, bool follow_symlink,
                     std::string* error) {
     if (out == nullptr) {
-        return Fail(OsError::kInvalidArgument, 0, error, "StatPath: out 为空指针");
+        return Fail(OsError::kInvalidArgument, EINVAL, error,
+                    "StatPath: out 为空指针");
     }
     if (path.empty()) {
         return Fail(OsError::kInvalidArgument, EINVAL, error, "StatPath: 路径为空");
+    }
+    if (detail::ContainsNul(path)) {
+        return Fail(OsError::kInvalidArgument, EINVAL, error,
+                    "StatPath: 路径含内嵌 NUL");
     }
     const int result = follow_symlink ? ::stat(path.c_str(), out)
                                       : ::lstat(path.c_str(), out);

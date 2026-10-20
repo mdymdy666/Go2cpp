@@ -56,11 +56,14 @@
 #include "go2cpp/sync.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <stdexcept>
+#include <string>
+#include <thread>
 
 namespace go2cpp::sync {
 
@@ -128,14 +131,20 @@ public:
                 "go2cpp::sync::RWMutex RLock: scheduler unavailable");
         }
         while (m_writing || !m_waiting_writers.empty()) {
-            ++m_waiting_readers;
-            const bool notified = m_ready.Wait(m_state);
-            --m_waiting_readers;
+            m_waiting_readers.fetch_add(1, std::memory_order_relaxed);
+            bool notified = false;
+            try {
+                notified = m_ready.Wait(m_state);
+            } catch (const std::runtime_error&) {
+                // D3：Wait 抛 runtime_error 表示它已释放 m_state 却没能重锁
+                // （调度器关闭）。此时**不持有**内部锁，不能 Unlock；先尽力
+                // 取回 m_state 再清理，取不回则带着明确异常退出（绝不 UB）。
+                m_waiting_readers.fetch_sub(1, std::memory_order_relaxed);
+                AbortAfterLockLoss(false, 0);
+            }
+            m_waiting_readers.fetch_sub(1, std::memory_order_relaxed);
             if (!notified) {
-                // Wait 返回 false 时有两种可能：G 被取消（内部锁已重新持有）
-                // 或调度器关闭且重锁失败（内部锁不再持有）。公共 API 无法区分，
-                // 这里按「已持有」清理；若实际未持有，Unlock 自己会抛
-                // logic_error，不会静默破坏状态。
+                // Wait 返回 false ⇒ 契约保证内部锁仍被持有（取消路径）。
                 m_state.Unlock();
                 throw std::logic_error(
                     "go2cpp::sync::RWMutex RLock aborted (G cancelled or "
@@ -183,7 +192,14 @@ public:
         const std::uint64_t ticket = m_next_writer_ticket++;
         m_waiting_writers.push_back(ticket);
         while (!WriterCanAcquireLocked(ticket)) {
-            if (!m_writer_ready.Wait(m_state)) {
+            bool notified = false;
+            try {
+                notified = m_writer_ready.Wait(m_state);
+            } catch (const std::runtime_error&) {
+                // D3：同上，内部锁已丢失；票据必须在能持锁时撤销。
+                AbortAfterLockLoss(true, ticket);
+            }
+            if (!notified) {
                 const bool was_head = !m_waiting_writers.empty() &&
                                       m_waiting_writers.front() == ticket;
                 RemoveWaitingWriterLocked(ticket);
@@ -294,7 +310,13 @@ public:
                 m_state.Unlock();
                 return false;
             }
-            if (m_ready.WaitFor(m_state, deadline - now)) {
+            bool notified = false;
+            try {
+                notified = m_ready.WaitFor(m_state, deadline - now);
+            } catch (const std::runtime_error&) {
+                AbortAfterLockLoss(false, 0);
+            }
+            if (notified) {
                 continue;
             }
             // WaitFor 返回 false：通常是超时（内部锁已重新持有）。但通知可能
@@ -349,7 +371,13 @@ public:
                 m_state.Unlock();
                 return false;
             }
-            if (m_writer_ready.WaitFor(m_state, deadline - now)) {
+            bool notified = false;
+            try {
+                notified = m_writer_ready.WaitFor(m_state, deadline - now);
+            } catch (const std::runtime_error&) {
+                AbortAfterLockLoss(true, ticket);
+            }
+            if (notified) {
                 continue;
             }
             if (WriterCanAcquireLocked(ticket)) {
@@ -426,6 +454,53 @@ public:
     }
 
 private:
+    /// @brief 内部锁丢失后，用不 park 的 TryLock 抢回 m_state 的预算。
+    static constexpr std::size_t kLockRecoveryAttempts = 8192;
+
+    /// @brief `ConditionVariable::Wait` 报告「没能重新持有内部锁」后的收尾。
+    /// @details 正常路径下 Wait 返回 false 时内部锁仍被持有；唯一的例外是
+    ///          调度器关闭导致重锁失败——`sync::ConditionVariable::Wait`
+    ///          以 `std::runtime_error` 报告，并且**不持有**外部 mutex。
+    ///          此时绝不能 `m_state.Unlock()`（会对未持有的锁抛异常），也
+    ///          不能在无锁状态下修改 `m_waiting_writers`（数据竞争/UB）。
+    ///          本函数先用 `TryLock` 在有限预算内抢回内部锁：m_state 的
+    ///          临界区只做字段更新（不 park、不做 IO），正常几次即可取回。
+    ///          取回后撤销写者票据并按需交接唤醒；取不回则保留票据、抛出
+    ///          带明确诊断的异常——错误可观测，而不是静默 UB。
+    [[noreturn]] void AbortAfterLockLoss(bool has_writer_ticket,
+                                         std::uint64_t writer_ticket) {
+        const bool recovered = RecoverInternalLock();
+        if (recovered && has_writer_ticket) {
+            const bool was_head = !m_waiting_writers.empty() &&
+                                  m_waiting_writers.front() == writer_ticket;
+            RemoveWaitingWriterLocked(writer_ticket);
+            RepairWakeAfterWriteCancelLocked(was_head);
+        }
+        if (recovered) {
+            m_state.Unlock();
+        }
+        throw std::logic_error(
+            recovered
+                ? "go2cpp::sync::RWMutex wait aborted (internal mutex was "
+                  "lost while waiting; recovered)"
+                : "go2cpp::sync::RWMutex wait aborted (internal mutex was "
+                  "lost while waiting and could not be recovered)");
+    }
+
+    /// @brief 在有限预算内用 `TryLock` 抢回 m_state（不进入等待队列）。
+    bool RecoverInternalLock() noexcept {
+        for (std::size_t attempt = 0; attempt < kLockRecoveryAttempts;
+             ++attempt) {
+            if (m_state.TryLock()) {
+                return true;
+            }
+            if ((attempt & 63U) == 63U) {
+                std::this_thread::yield();
+            }
+        }
+        return false;
+    }
+
     /// @brief 唤醒写者；调用方必须持有 m_state 且写者队列非空。
     /// @details 只有一个等待写者时单播（唯一等待者就是队首）；多个写者时广播：
     ///          只有队首能前进，但其余写者会一起从 futex 醒来并在 m_state 上
@@ -442,7 +517,7 @@ private:
 
     /// @brief 放行全部排队读者；无人等待时完全短路（不触碰条件变量）。
     void WakeReadersLocked() noexcept {
-        if (m_waiting_readers != 0) {
+        if (m_waiting_readers.load(std::memory_order_relaxed) != 0U) {
             m_ready.NotifyAll();
         }
     }
@@ -492,7 +567,9 @@ private:
     /// 当前读者数量。
     std::size_t m_readers{0};
     /// 当前阻塞在 m_ready 上的读者数；供唤醒方判断是否值得通知。
-    std::size_t m_waiting_readers{0};
+    /// 用 atomic 是因为「内部锁丢失」的兜底路径（D3）必须在**未持锁**的
+    /// 情况下完成自减，否则就是对受保护字段的数据竞争。
+    std::atomic<std::size_t> m_waiting_readers{0};
     /// 当前是否有写者持锁。
     bool m_writing{false};
     /// 下一个写者票据；只在 `m_state` 内递增，用于写者 FIFO。

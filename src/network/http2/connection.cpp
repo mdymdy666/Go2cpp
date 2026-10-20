@@ -27,6 +27,7 @@
 #include "go2cpp/network/http2/connection.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <limits>
 
@@ -38,26 +39,66 @@ namespace {
 constexpr char kClientPreface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 constexpr std::size_t kClientPrefaceLength = sizeof(kClientPreface) - 1;
 
+/// RFC 3986 §3.1：scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )。
+bool IsValidSchemeValue(const std::string& value) {
+    if (value.empty()) return false;
+    const auto is_alpha = [](unsigned char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    };
+    if (!is_alpha(static_cast<unsigned char>(value[0]))) return false;
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
+        if (is_alpha(c) || (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.') {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+/// 按 RFC 9113 §6.5.2 口径计算 header 列表大小：name + value + 32。
+std::size_t HeaderListSize(const std::vector<HeaderField>& fields) {
+    std::size_t total = 0;
+    for (const auto& field : fields) {
+        const std::size_t item = field.name.size() + field.value.size() + 32;
+        if (total > std::numeric_limits<std::size_t>::max() - item) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+        total += item;
+    }
+    return total;
+}
+
 /**
- * @brief 校验 HPACK 解出的字段列表（RFC 9113 §8.1.2 / §8.2.1）。
+ * @brief 校验 HPACK 解出的字段列表（RFC 9113 §8.1.2 / §8.2.1 / §8.3）。
  *
  * ## 规则
  * - 字段名必须非空且全小写（大写是连接错误，旧实现直接接受并投递）；
  * - 伪头（`:` 开头）只能出现在普通字段之前，且不能重复；
- * - 请求头（服务端收到的新流）必须含 `:method` 与 `:path`；
+ * - 请求头（服务端收到的新流）：
+ *   - CONNECT 必须有 `:authority`，不要求 `:path`/`:scheme`（RFC 9113 §8.5）；
+ *   - 其它方法必须有 `:method` 与 `:path`；
+ *   - `require_scheme` 开启时，带 `:authority` 的请求必须有 `:scheme`；
+ *     `strict_scheme` 开启时所有非 CONNECT 请求都必须有 `:scheme`；
+ *   - `:scheme` 非空且符合 RFC 3986 的 scheme 字符集，否则一律拒绝。
  * - 响应头（客户端收到的已有流）若带伪头，只允许 `:status`；
  * - 请求/响应伪头不能混用；trailers 不允许伪头。
  *
- * @note 这里**不**强制要求 `:scheme`：仓库既有连接层测试（test_connection
- *       的 header 上限用例）会发送不带 `:scheme` 的请求，收紧会破坏既有契约；
- *       与 `:method`/`:path` 相比，`:scheme` 缺失的危害小得多，先按现状保留。
+ * @note 兼容说明：仓库既有测试（`test_connection.cpp`）里有部分请求既不带
+ *       `:authority` 也不带 `:scheme`；为不破坏它们，默认只对「带
+ *       `:authority` 的请求」强制 `:scheme`。`strict_scheme=true` 可开启完全
+ *       严格模式（生产建议开启；同时需要修正旧测试）。
  */
 bool ValidatePeerHeaders(const std::vector<HeaderField>& fields, Role role,
-                         bool fresh_stream, std::string* error) {
+                         bool fresh_stream, bool require_scheme, bool strict_scheme,
+                         std::string* error) {
     bool seen_regular = false;
     bool has_method = false;
     bool has_path = false;
+    bool has_scheme = false;
+    bool has_authority = false;
     bool has_status = false;
+    bool is_connect = false;
     for (const auto& field : fields) {
         if (field.name.empty()) {
             if (error != nullptr) *error = "header 字段名不能为空";
@@ -95,17 +136,29 @@ bool ValidatePeerHeaders(const std::vector<HeaderField>& fields, Role role,
                 return false;
             }
             has_method = true;
+            is_connect = (field.value == "CONNECT");
         } else if (field.name == ":path") {
             if (role != Role::kServer || has_path) {
                 if (error != nullptr) *error = "非法或重复的 :path";
                 return false;
             }
             has_path = true;
-        } else if (field.name == ":scheme" || field.name == ":authority") {
-            if (role != Role::kServer) {
-                if (error != nullptr) *error = "响应中不允许出现: " + field.name;
+        } else if (field.name == ":scheme") {
+            if (role != Role::kServer || has_scheme) {
+                if (error != nullptr) *error = "非法或重复的 :scheme";
                 return false;
             }
+            if (!IsValidSchemeValue(field.value)) {
+                if (error != nullptr) *error = "非法的 :scheme 值: " + field.value;
+                return false;
+            }
+            has_scheme = true;
+        } else if (field.name == ":authority") {
+            if (role != Role::kServer || has_authority) {
+                if (error != nullptr) *error = "响应中不允许出现或重复的 :authority";
+                return false;
+            }
+            has_authority = true;
         } else if (field.name == ":status") {
             if (role != Role::kClient || has_status) {
                 if (error != nullptr) *error = "非法或重复的 :status";
@@ -119,9 +172,28 @@ bool ValidatePeerHeaders(const std::vector<HeaderField>& fields, Role role,
     }
     if (fresh_stream) {
         if (role == Role::kServer) {
-            if (!has_method || !has_path) {
-                if (error != nullptr) *error = "请求缺少必需的伪头 :method/:path";
+            if (!has_method) {
+                if (error != nullptr) *error = "请求缺少必需的伪头 :method";
                 return false;
+            }
+            if (is_connect) {
+                // RFC 9113 §8.5：CONNECT 只要求 :authority，且必须省略
+                // :path/:scheme。这里不强制省略，以免误伤客户端扩展。
+                if (!has_authority) {
+                    if (error != nullptr) *error = "CONNECT 请求缺少 :authority";
+                    return false;
+                }
+            } else {
+                if (!has_path) {
+                    if (error != nullptr) *error = "请求缺少必需的伪头 :path";
+                    return false;
+                }
+                if (require_scheme && !has_scheme && (has_authority || strict_scheme)) {
+                    if (error != nullptr) {
+                        *error = "请求缺少必需的伪头 :scheme";
+                    }
+                    return false;
+                }
             }
         } else if (!has_status) {
             if (error != nullptr) *error = "响应缺少伪头 :status";
@@ -194,7 +266,10 @@ ConnStatus Connection::TakeFrame(Frame* out, std::string* error) {
                      std::to_string(header.length) + " > " +
                      std::to_string(m_config.max_frame_size);
         }
-        // 不读取 payload 就无法安全跳过该帧，连接不能继续使用。
+        // RFC 9113 §4.2：超过 SETTINGS_MAX_FRAME_SIZE 的帧必须用
+        // FRAME_SIZE_ERROR 终止连接。先尽力发 GOAWAY（让对端能区分错误
+        // 类型），再置 kClosed；不读取 payload，避免 16MB 内存放大（D14）。
+        SendFatalGoAway(ErrorCode::kFrameSizeError);
         m_state = ConnState::kClosed;
         return ConnStatus::kProtocolError;
     }
@@ -211,6 +286,7 @@ ConnStatus Connection::TakeFrame(Frame* out, std::string* error) {
             *error += ToString(status);
         }
         if (status == FrameStatus::kFrameSizeError) {
+            SendFatalGoAway(ErrorCode::kFrameSizeError);
             m_state = ConnState::kClosed;
             return ConnStatus::kProtocolError;
         }
@@ -304,14 +380,22 @@ ConnStatus Connection::Handshake(std::string* error) {
 
     // 2) 发送本地 SETTINGS
     // step2: 把本地配置编码成 SETTINGS 条目。
-    const std::vector<SettingsEntry> local_settings = {
+    std::vector<SettingsEntry> local_settings = {
         {static_cast<std::uint16_t>(SettingsId::kHeaderTableSize), m_config.header_table_size},
         {static_cast<std::uint16_t>(SettingsId::kMaxFrameSize), m_config.max_frame_size},
         {static_cast<std::uint16_t>(SettingsId::kInitialWindowSize),
          m_config.initial_window_size},
         {static_cast<std::uint16_t>(SettingsId::kMaxConcurrentStreams),
          m_config.max_concurrent_streams},
+        // 让对端知道本端愿意接收的 header 列表上限（§6.5.2）。
+        {static_cast<std::uint16_t>(SettingsId::kMaxHeaderListSize),
+         m_config.max_header_list_size},
     };
+    // RFC 9113 §6.5.2：只有客户端可以发送 ENABLE_PUSH；服务端发送它是协议错误。
+    // 本实现不支持服务器推送，客户端明确通告 0，让对端不要再发 PUSH_PROMISE。
+    if (m_role == Role::kClient) {
+        local_settings.push_back({static_cast<std::uint16_t>(SettingsId::kEnablePush), 0});
+    }
     auto status = WriteFrame(MakeSettings(local_settings), error);
     if (status != ConnStatus::kOk) {
         return status;
@@ -423,13 +507,25 @@ ConnStatus Connection::StartRequest(const std::vector<HeaderField>& headers, boo
         return ConnStatus::kTooManyStreams;
     }
 
+    // 发送侧 header 列表上限：对端通告 SETTINGS_MAX_HEADER_LIST_SIZE 时，
+    // 必须在编码/分配流号之前拒绝超限请求（§6.5.2）。
+    // 兼容开关见 ConnectionConfig::enforce_peer_header_list_on_requests 的注释：
+    // 既有 test_connection 场景 11 case2 依赖"客户端不提前拒绝"。
+    const std::vector<HeaderField> outbound = PrepareOutboundHeaders(headers);
+    if (m_config.enforce_peer_header_list_on_requests) {
+        if (const auto header_status = CheckOutboundHeaderList(outbound, error);
+            header_status != ConnStatus::kOk) {
+            return header_status;
+        }
+    }
+
     // step2: 客户端流号是奇数且单调递增。
     const std::uint32_t stream_id = m_next_stream_id;
     m_next_stream_id += 2;   // 客户端流 id 为奇数且递增
 
     // 表大小更新必须位于 header block 首部（RFC 7541 §4.2），先拼前缀再编码。
     std::vector<std::uint8_t> block = m_pending_table_size_update;
-    if (m_encoder.EncodeBlock(headers, &block, error) != HpackStatus::kOk) {
+    if (m_encoder.EncodeBlock(outbound, &block, error) != HpackStatus::kOk) {
         if (error != nullptr) *error = "HPACK 编码失败";
         return ConnStatus::kProtocolError;
     }
@@ -438,6 +534,7 @@ ConnStatus Connection::StartRequest(const std::vector<HeaderField>& headers, boo
     // step3: 建流状态机；try_emplace 避免默认构造后再赋值。
     auto& machine = m_streams.try_emplace(stream_id, stream_id).first->second;
     if (machine.SendHeaders(end_stream) != StreamEventResult::kOk) {
+        m_streams.erase(stream_id);
         if (error != nullptr) *error = "流状态机拒绝发送 HEADERS";
         return ConnStatus::kProtocolError;
     }
@@ -472,6 +569,11 @@ ConnStatus Connection::WriteData(std::uint32_t stream_id,
                                  const std::vector<std::uint8_t>& data,
                                  bool end_stream,
                                  std::string* error) {
+    // 无论成功还是失败，返回前都清理一次已关闭流（有界保留，见配置注释）。
+    struct ClosedStreamReaper {
+        Connection* self;
+        ~ClosedStreamReaper() { self->ReapClosedStreams(); }
+    } reaper{this};
     if (m_state == ConnState::kClosed) {
         if (error != nullptr) *error = "连接已关闭";
         return ConnStatus::kClosed;
@@ -528,6 +630,10 @@ ConnStatus Connection::WriteData(std::uint32_t stream_id,
 ConnStatus Connection::SendResponseHeaders(std::uint32_t stream_id,
                                            const std::vector<HeaderField>& headers,
                                            bool end_stream, std::string* error) {
+    struct ClosedStreamReaper {
+        Connection* self;
+        ~ClosedStreamReaper() { self->ReapClosedStreams(); }
+    } reaper{this};
     if (m_state == ConnState::kClosed) {
         if (error != nullptr) *error = "连接已关闭";
         return ConnStatus::kClosed;
@@ -536,6 +642,12 @@ ConnStatus Connection::SendResponseHeaders(std::uint32_t stream_id,
     if (machine == nullptr) {
         if (error != nullptr) *error = "未知流";
         return ConnStatus::kProtocolError;
+    }
+    // 发送前先按对端 SETTINGS_MAX_HEADER_LIST_SIZE 检查，避免把超限响应
+    // 写上线、再被对端以 ENHANCE_YOUR_CALM/连接错误拒绝。
+    if (const auto header_status = CheckOutboundHeaderList(headers, error);
+        header_status != ConnStatus::kOk) {
+        return header_status;
     }
     if (machine->SendHeaders(end_stream) != StreamEventResult::kOk) {
         if (error != nullptr) *error = "流状态机拒绝发送响应 HEADERS";
@@ -557,6 +669,10 @@ ConnStatus Connection::SendResponseHeaders(std::uint32_t stream_id,
 
 ConnStatus Connection::ResetStream(std::uint32_t stream_id, ErrorCode code,
                                    std::string* error) {
+    struct ClosedStreamReaper {
+        Connection* self;
+        ~ClosedStreamReaper() { self->ReapClosedStreams(); }
+    } reaper{this};
     if (m_state == ConnState::kClosed) {
         if (error != nullptr) *error = "连接已关闭";
         return ConnStatus::kClosed;
@@ -566,14 +682,20 @@ ConnStatus Connection::ResetStream(std::uint32_t stream_id, ErrorCode code,
         if (error != nullptr) *error = "未知流";
         return ConnStatus::kProtocolError;
     }
-    machine->SendRstStream();
+    // 预检：idle 流上不能发 RST_STREAM（§5.1）。旧实现忽略该结果，可能
+    // 在 idle 流上写出帧；这里把失败映射成协议错误，不写线上。
+    if (machine->SendRstStream() != StreamEventResult::kOk) {
+        if (error != nullptr) *error = "流状态机拒绝发送 RST_STREAM";
+        return ConnStatus::kProtocolError;
+    }
     return WriteFrame(MakeRstStream(stream_id, code), error);
 }
 
 
 std::size_t Connection::OpenStreamCount() const noexcept {
     // RFC 9113 §5.1.2：open 与两个 half-closed 状态都计入并发流上限。
-    // 流表不删除已关闭的流（保留用于 STREAM_CLOSED 判定），所以这里要排除 kClosed。
+    // 流表会**有界保留**已关闭流（默认 256 条，用于容忍迟到的 RST/WINDOW_UPDATE），
+    // 所以这里必须排除 kClosed。
     std::size_t count = 0;
     for (const auto& [stream_id, machine] : m_streams) {
         (void)stream_id;
@@ -582,6 +704,112 @@ std::size_t Connection::OpenStreamCount() const noexcept {
         }
     }
     return count;
+}
+
+void Connection::SendFatalGoAway(ErrorCode code) {
+    if (m_transport == nullptr || m_state == ConnState::kClosed) {
+        return;
+    }
+    const std::uint32_t last =
+        (m_role == Role::kClient) ? 0U : m_max_seen_peer_stream_id;
+    std::string ignored;
+    (void)WriteFrame(MakeGoAway(last, code), &ignored);
+}
+
+void Connection::ReapClosedStreams() {
+    // 只淘汰 closed 的流，且保留最近关闭的 max_retired_streams 条：
+    // 关闭后短时间内的 WINDOW_UPDATE / RST_STREAM 仍可被识别为"已关闭"，
+    // 不会被误判成 idle（D6/D13）；更老的条目删除后，流表不再随流号增长。
+    std::size_t closed_count = 0;
+    for (const auto& entry : m_streams) {
+        if (entry.second.closed()) {
+            ++closed_count;
+        }
+    }
+    while (closed_count > m_config.max_retired_streams) {
+        auto victim = m_streams.end();
+        for (auto it = m_streams.begin(); it != m_streams.end(); ++it) {
+            if (it->second.closed()) {
+                victim = it;
+                break;
+            }
+        }
+        if (victim == m_streams.end()) {
+            break;
+        }
+        const std::uint32_t victim_id = victim->first;
+        m_streams.erase(victim);
+        m_stream_local_window.erase(victim_id);
+        m_stream_remote_window.erase(victim_id);
+        --closed_count;
+    }
+}
+
+bool Connection::IsEvictedStream(std::uint32_t stream_id) const noexcept {
+    if (m_streams.find(stream_id) != m_streams.end()) {
+        return false;
+    }
+    // 本实现只有客户端会主动分配奇数流；服务端不发起流（不支持推送）。
+    if (stream_id == 0 || (stream_id & 1U) == 0U) {
+        return false;
+    }
+    if (m_role == Role::kClient) {
+        // 客户端流号连续分配：小于 m_next_stream_id 的奇数 id 一定分配过。
+        return stream_id < m_next_stream_id;
+    }
+    // 服务端：对端新流 id 必须严格递增；不大于水位线的奇数 id 只可能是
+    // 已关闭并被淘汰的流（也可能是对端跳过的号，忽略其迟到帧的风险很低）。
+    return stream_id <= m_max_seen_peer_stream_id;
+}
+
+ConnStatus Connection::CheckOutboundHeaderList(
+    const std::vector<HeaderField>& headers, std::string* error) const {
+    if (!m_peer_max_header_list_size_set) {
+        return ConnStatus::kOk;
+    }
+    const std::size_t size = HeaderListSize(headers);
+    if (size > m_peer_max_header_list_size) {
+        if (error != nullptr) {
+            *error = "header 列表超过对端 SETTINGS_MAX_HEADER_LIST_SIZE: " +
+                     std::to_string(size) + " > " +
+                     std::to_string(m_peer_max_header_list_size);
+        }
+        return ConnStatus::kHeaderListTooLarge;
+    }
+    return ConnStatus::kOk;
+}
+
+std::vector<HeaderField> Connection::PrepareOutboundHeaders(
+    const std::vector<HeaderField>& headers) const {
+    if (m_role != Role::kClient || !m_config.auto_fill_scheme) {
+        return headers;
+    }
+    bool has_scheme = false;
+    bool has_authority = false;
+    for (const auto& field : headers) {
+        if (field.name == ":scheme") {
+            has_scheme = true;
+        } else if (field.name == ":authority") {
+            has_authority = true;
+        } else if (field.name == ":method" && field.value == "CONNECT") {
+            // RFC 9113 §8.5：CONNECT 必须省略 :scheme/:path，不做补齐。
+            return headers;
+        }
+    }
+    if (has_scheme || (!has_authority && !m_config.strict_scheme)) {
+        return headers;
+    }
+    // 伪头必须位于普通字段之前：插到伪头区的末尾。
+    auto insert_pos = headers.begin();
+    while (insert_pos != headers.end() && !insert_pos->name.empty() &&
+           insert_pos->name[0] == ':') {
+        ++insert_pos;
+    }
+    std::vector<HeaderField> outbound = headers;
+    const auto offset = static_cast<std::ptrdiff_t>(insert_pos - headers.begin());
+    outbound.insert(outbound.begin() + offset,
+                    HeaderField{":scheme", m_config.default_scheme});
+    return outbound;
 }
 
 ConnStatus Connection::ApplyPeerSettings(const SettingsFrame& settings,
@@ -617,6 +845,23 @@ ConnStatus Connection::ApplyPeerSettings(const SettingsFrame& settings,
             case SettingsId::kMaxConcurrentStreams:
                 m_peer_max_concurrent_streams = entry.value;
                 m_peer_max_concurrent_set = true;
+                break;
+            case SettingsId::kMaxHeaderListSize:
+                // 对端愿意接收的 header 列表上限：约束本端发送的请求/响应。
+                m_peer_max_header_list_size = entry.value;
+                m_peer_max_header_list_size_set = true;
+                break;
+            case SettingsId::kEnablePush:
+                // RFC 9113 §6.5.2：服务端不得发送 ENABLE_PUSH，客户端收到
+                // 任何值都是连接错误。服务端收到客户端的 0/1 是合法的，
+                // 只记录（本实现不会推送，1 也只表示"对端允许推送"）。
+                if (m_role == Role::kClient) {
+                    if (error != nullptr) {
+                        *error = "服务端不得发送 SETTINGS_ENABLE_PUSH";
+                    }
+                    return ConnStatus::kProtocolError;
+                }
+                m_peer_enable_push = entry.value != 0;
                 break;
             default:
                 break;
@@ -833,6 +1078,10 @@ ConnStatus Connection::SendGoAway(ErrorCode code, std::string* error) {
  * 协议错误返回 `kProtocolError`；本函数不发 GOAWAY，由调用方决定断连。
  */
 ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
+    struct ClosedStreamReaper {
+        Connection* self;
+        ~ClosedStreamReaper() { self->ReapClosedStreams(); }
+    } reaper{this};
     if (out == nullptr) {
         return ConnStatus::kProtocolError;
     }
@@ -901,28 +1150,18 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
             // step4: 建流/推进状态机；新流必须先初始化窗口。
             const bool fresh_stream =
                 m_streams.find(headers.stream_id) == m_streams.end();
-            // RFC 9113 §8.1.2/§8.2.1：伪头位置与必需项、字段名小写。
-            if (!ValidatePeerHeaders(decoded, m_role, fresh_stream, error)) {
+            // RFC 9113 §8.1.2/§8.2.1/§8.3：伪头位置与必需项、字段名小写、
+            // 请求的 :scheme 约束（兼容规则见 ValidatePeerHeaders 注释）。
+            if (!ValidatePeerHeaders(decoded, m_role, fresh_stream,
+                                     m_config.require_scheme, m_config.strict_scheme,
+                                     error)) {
                 return ConnStatus::kProtocolError;
             }
             if (fresh_stream) {
-                // RFC 9113 §5.1.2：收到的 HEADERS 若使并发流数超过本端通告的
-                // MAX_CONCURRENT_STREAMS，属于流错误（REFUSED_STREAM）。
-                // 注意此时 HPACK 已解码完毕，动态表保持同步，可以直接拒绝该流。
-                if (m_config.enforce_max_concurrent_streams &&
-                    OpenStreamCount() >= m_config.max_concurrent_streams) {
-                    status = WriteFrame(
-                        MakeRstStream(headers.stream_id, ErrorCode::kRefusedStream), error);
-                    if (status != ConnStatus::kOk) {
-                        return status;
-                    }
-                    out->kind = IncomingEvent::Kind::kRstStream;
-                    out->stream_id = headers.stream_id;
-                    out->error_code = ErrorCode::kRefusedStream;
-                    return ConnStatus::kOk;
-                }
                 // RFC 9113 §5.1.1：流 id 由发起方分配，客户端用奇数、服务端用偶数，
                 // 且新流 id 必须严格大于该发起方此前用过的所有流 id。
+                // 先校验 id 再校验并发上限：非法 id 属于连接错误，不能被
+                // REFUSED_STREAM 掩盖。
                 if (m_role == Role::kClient) {
                     // 服务端只能通过 PUSH_PROMISE 发起偶数流；本实现不支持推送。
                     if (error != nullptr) {
@@ -953,6 +1192,21 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
                     }
                     return ConnStatus::kProtocolError;
                 }
+                // RFC 9113 §5.1.2：收到的 HEADERS 若使并发流数超过本端通告的
+                // MAX_CONCURRENT_STREAMS，属于流错误（REFUSED_STREAM）。
+                // 注意此时 HPACK 已解码完毕，动态表保持同步，可以直接拒绝该流。
+                if (m_config.enforce_max_concurrent_streams &&
+                    OpenStreamCount() >= m_config.max_concurrent_streams) {
+                    status = WriteFrame(
+                        MakeRstStream(headers.stream_id, ErrorCode::kRefusedStream), error);
+                    if (status != ConnStatus::kOk) {
+                        return status;
+                    }
+                    out->kind = IncomingEvent::Kind::kRstStream;
+                    out->stream_id = headers.stream_id;
+                    out->error_code = ErrorCode::kRefusedStream;
+                    return ConnStatus::kOk;
+                }
                 m_max_seen_peer_stream_id = headers.stream_id;
             }
             auto& machine =
@@ -979,7 +1233,11 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
             }
             auto* machine = StreamFor(data.stream_id);
             if (machine == nullptr) {
-                if (error != nullptr) *error = "DATA 落在未知流上";
+                if (error != nullptr) {
+                    *error = IsEvictedStream(data.stream_id)
+                                 ? "DATA 落在已关闭并淘汰的流上（STREAM_CLOSED）"
+                                 : "DATA 落在未知流上";
+                }
                 return ConnStatus::kProtocolError;
             }
             const std::size_t received = data.data.size();
@@ -1089,8 +1347,15 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
             }
             auto* machine = StreamFor(rst.stream_id);
             if (machine == nullptr) {
+                if (IsEvictedStream(rst.stream_id)) {
+                    // 流已关闭并从流表淘汰：RFC 9113 §5.1 允许忽略迟到的
+                    // RST_STREAM（对端可能在本端清理后才收到响应）。
+                    out->kind = IncomingEvent::Kind::kRstStream;
+                    out->stream_id = rst.stream_id;
+                    out->error_code = rst.error_code;
+                    return ConnStatus::kOk;
+                }
                 // RFC 9113 §6.4：idle 流上的 RST_STREAM 是连接错误 PROTOCOL_ERROR。
-                // 流表不删除已关闭的流，所以这里"查不到"等价于"从未创建"（idle）。
                 if (error != nullptr) {
                     *error = "RST_STREAM 落在 idle 流上: " +
                              std::to_string(rst.stream_id);
@@ -1132,8 +1397,14 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
             } else {
                 auto it = m_stream_remote_window.find(update.stream_id);
                 if (it == m_stream_remote_window.end()) {
+                    if (IsEvictedStream(update.stream_id)) {
+                        // 已关闭并被淘汰的流：RFC 9113 §5.1/§6.9 允许忽略
+                        // 迟到的 WINDOW_UPDATE（窗口对象已不存在意义）。
+                        out->kind = IncomingEvent::Kind::kWindowUpdate;
+                        out->stream_id = update.stream_id;
+                        return ConnStatus::kOk;
+                    }
                     // RFC 9113 §6.9：idle 流上的 WINDOW_UPDATE 是连接错误。
-                    // 已关闭流仍在表中，可安全忽略（§5.1 允许收尾帧）。
                     if (error != nullptr) {
                         *error = "WINDOW_UPDATE 落在 idle 流上: " +
                                  std::to_string(update.stream_id);
@@ -1146,6 +1417,16 @@ ConnStatus Connection::ReadEvent(IncomingEvent* out, std::string* error) {
             out->stream_id = update.stream_id;
             return ConnStatus::kOk;
         }
+        case FrameType::kPushPromise:
+            // 本实现不支持服务器推送：客户端已在 SETTINGS 中通告 ENABLE_PUSH=0。
+            // 无论角色，收到 PUSH_PROMISE 都是连接错误。必须关闭连接而不是
+            // 当作未知帧跳过 —— 它的 header block 会更新对端 HPACK 编码器
+            // 的动态表，而本端解码器不更新，跳过必然导致后续 header 失步。
+            if (error != nullptr) {
+                *error = "收到 PUSH_PROMISE（本实现不支持服务器推送）";
+            }
+            m_state = ConnState::kClosed;
+            return ConnStatus::kProtocolError;
         case FrameType::kContinuation:
             // RFC 9113 §6.10：CONTINUATION 必须紧跟未带 END_HEADERS 的
             // HEADERS/PUSH_PROMISE/CONTINUATION，且期间不能插入其它帧。

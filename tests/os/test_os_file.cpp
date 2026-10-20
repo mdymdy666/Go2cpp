@@ -504,6 +504,105 @@ void ScenarioConfigIntegration() {
     std::printf("[os] 生成的 app.ini 长度=%zu 字节\n", ini_content.size());
 }
 
+
+// ---------------------------------------------------------------------------
+// 场景 12：审计回归（NUL / ReadFile 上限 / O_APPEND WriteAt / EINVAL / fd 标志）
+// ---------------------------------------------------------------------------
+void ScenarioAuditRegressions() {
+    // 12.1 路径内嵌 NUL：必须 EINVAL，且不得操作截断后的路径
+    const std::string real = Path("nul_base.txt");
+    Check(WriteFile(real, "hello").ok(), "nul: prepare file");
+    std::string evil = real;
+    evil.push_back('\0');
+    evil += "-suffix";
+    File file;
+    auto status = File::Open(evil, OpenFlag::kReadOnly, 0, &file);
+    Check(!status.ok() && status.code == OsError::kInvalidArgument &&
+              status.system_error == EINVAL && !file.valid(),
+          "nul: Open must fail with kInvalidArgument/EINVAL");
+    std::string content = "dirty";
+    Check(!ReadFile(evil, &content).ok() && content.empty(),
+          "nul: ReadFile must fail and clear output");
+    Check(!WriteFile(evil, "overwritten").ok(), "nul: WriteFile must fail");
+    std::string check;
+    Check(ReadFile(real, &check).ok() && check == "hello",
+          "nul: truncated real file must stay untouched");
+
+    // 12.2 环境变量内嵌 NUL
+    Check(Setenv("OS_NUL_NAME", "v").ok(), "nul env: prepare");
+    std::string name = "OS_NUL_NAME";
+    name.push_back('\0');
+    name += "-suffix";
+    Check(!Getenv(name).has_value(), "nul env: Getenv must return nullopt");
+    status = Setenv(name, "x");
+    Check(!status.ok() && status.code == OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "nul env: Setenv(name) must be EINVAL");
+    std::string value = "v";
+    value.push_back('\0');
+    value += "x";
+    status = Setenv("OS_NUL_NAME", value);
+    Check(!status.ok() && status.code == OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "nul env: Setenv(value) must be EINVAL");
+    status = Unsetenv(name);
+    Check(!status.ok() && status.code == OsError::kInvalidArgument &&
+              status.system_error == EINVAL,
+          "nul env: Unsetenv must be EINVAL");
+    Check(Getenv("OS_NUL_NAME").value_or("") == "v",
+          "nul env: rejected calls must not touch the real variable");
+    Check(Unsetenv("OS_NUL_NAME").ok(), "nul env: cleanup");
+
+    // 12.3 ReadFile 上限对 st_size==0 的 procfs 也生效
+    auto max_var = go2cpp::config::Config::Instance().Lookup<int>(
+        "os.max_file_size", 268435456, "");
+    Check(max_var != nullptr, "cap: lookup max_file_size");
+    if (max_var && ::access("/proc/self/status", R_OK) == 0) {
+        const int saved = max_var->GetValue();
+        max_var->SetValue(64);
+        std::string proc;
+        const auto cap_status = ReadFile("/proc/self/status", &proc);
+        Check(!cap_status.ok() && cap_status.system_error == EFBIG && proc.empty(),
+              "cap: 64B limit must reject st_size==0 pseudofile");
+        max_var->SetValue(saved);
+    }
+
+    // 12.4 WriteAt + O_APPEND：显式拒绝，不静默追加
+    const std::string append_path = Path("append_regression.txt");
+    Check(WriteFile(append_path, "AAA").ok(), "append: prepare");
+    File append_file;
+    Check(File::Open(append_path, OpenFlag::kWriteOnly | OpenFlag::kAppend, 0,
+                     &append_file).ok(),
+          "append: open O_APPEND");
+    Check(append_file.WriteAt("Z", 1, 0) == -1 &&
+              append_file.last_error() == EINVAL,
+          "append: WriteAt must fail with EINVAL");
+    std::string append_content;
+    Check(ReadFile(append_path, &append_content).ok() && append_content == "AAA",
+          "append: rejected WriteAt must not modify file");
+    Check(append_file.Write("B", 1) == 1, "append: normal Write still appends");
+
+    // 12.5 out==nullptr 统一 EINVAL
+    status = File::Open(real, OpenFlag::kReadOnly, 0, nullptr);
+    Check(status.code == OsError::kInvalidArgument && status.system_error == EINVAL,
+          "EINVAL: Open(out=nullptr)");
+    status = File::Adopt(-1, false, nullptr);
+    Check(status.code == OsError::kInvalidArgument && status.system_error == EINVAL,
+          "EINVAL: Adopt(out=nullptr)");
+    status = ReadFile(real, nullptr);
+    Check(status.code == OsError::kInvalidArgument && status.system_error == EINVAL,
+          "EINVAL: ReadFile(out=nullptr)");
+
+    // 12.6 Open 返回的 fd 带 O_NONBLOCK|O_CLOEXEC（file.hpp 的文档承诺）
+    File flags_file;
+    Check(File::Open(real, OpenFlag::kReadOnly, 0, &flags_file).ok(),
+          "fd flags: open");
+    const int flags = ::fcntl(flags_file.fd(), F_GETFL);
+    const int fd_flags = ::fcntl(flags_file.fd(), F_GETFD);
+    Check(flags >= 0 && (flags & O_NONBLOCK) != 0, "fd flags: O_NONBLOCK");
+    Check(fd_flags >= 0 && (fd_flags & FD_CLOEXEC) != 0, "fd flags: FD_CLOEXEC");
+}
+
 }  // namespace
 
 int main() {
@@ -532,6 +631,8 @@ int main() {
     ScenarioStress();
     std::printf("[os][场景11] config 集成\n");
     ScenarioConfigIntegration();
+    std::printf("[os][场景12] 审计回归\n");
+    ScenarioAuditRegressions();
 
     if (g_failures == 0) {
         std::printf("\n[os] failures=0\n");
