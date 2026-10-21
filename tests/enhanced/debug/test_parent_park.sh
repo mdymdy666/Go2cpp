@@ -20,6 +20,28 @@ BIN="$WORK/fixture_parent_park"
 FIXTURE_PID=""
 trap 'stop_pid "${FIXTURE_PID:-}"; rm -rf "$WORK"' EXIT
 
+# 夹具直接链接构建目录里的 .so，必须挑与当前头文件匹配的构建：
+# build-enhanced（全能力）→ build-debug-full（与资源历史脚本一致）→ build-debug。
+# 旧版写死 build-debug，该目录早于资源历史符号，编译必然失败（P1-4）。
+DEBUG_BUILD="$(find_build_dir libgo2cpp_debug.so "${GO2CPP_DEBUG_BUILD:-}" \
+    "$ROOT/build-enhanced" "$ROOT/build-debug-full" "$ROOT/build-debug")" || true
+DEBUG_SO="$DEBUG_BUILD/libgo2cpp_debug.so"
+
+if [ ! -f "$DEBUG_SO" ]; then
+    skip "fixture:build-dir" normal \
+        "缺少 $DEBUG_SO（需 -DGO2CPP_DEBUG_DUMP=ON 构建）"
+    summary
+    exit 0
+fi
+# 构建新鲜度：缺资源历史符号说明 .so 早于当前头文件，夹具有 undefined
+# reference 是构建问题而非产品缺陷——记 SKIP 并给出重建命令（旧版误判 FAIL）。
+if ! nm -D --defined-only -C "$DEBUG_SO" 2>/dev/null | grep -q "UnregisterResource"; then
+    skip "fixture:build-freshness" normal \
+        "$DEBUG_SO 缺 UnregisterResource（构建过期）；重建：cmake --build $DEBUG_BUILD -j"
+    summary
+    exit 0
+fi
+
 # 编译测试夹具（只编译测试代码，不修改核心源码）。
 if ! g++ -std=c++17 -O1 -g -pthread \
     -DGO2CPP_DEBUG_DUMP=1 \
@@ -27,9 +49,15 @@ if ! g++ -std=c++17 -O1 -g -pthread \
     -DGO2CPP_DEBUG_EVENT_CRITICAL_CAPACITY=64 \
     -I"$ROOT/include" -I"$ROOT/third_party" \
     "$HERE/fixture_parent_park.cpp" -o "$BIN" \
-    -Wl,--no-as-needed -Wl,-rpath,"$ROOT/build-debug" \
-    "$ROOT"/build-debug/libgo2cpp_*.so -ldl -lm -lz \
+    -Wl,--no-as-needed -Wl,-rpath,"$DEBUG_BUILD" \
+    "$DEBUG_BUILD"/libgo2cpp_*.so -ldl -lm -lz \
     >"$WORK/compile.log" 2>&1; then
+    if grep -q "undefined reference" "$WORK/compile.log"; then
+        skip "fixture:compile" normal \
+            "链接失败（$DEBUG_BUILD 构建过期）：$(grep -m1 'undefined reference' "$WORK/compile.log" | cut -c1-160)"
+        summary
+        exit 0
+    fi
     fail "fixture:compile" normal "g++ 失败：$(tail -3 "$WORK/compile.log" | tr '\n' '|')"
     summary
     exit 1

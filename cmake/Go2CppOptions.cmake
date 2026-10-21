@@ -1,3 +1,23 @@
+# 一键全能力构建（人肉开关）：同时打开 DEBUG_DUMP / DIAGNOSTIC / REPLAY /
+# MIGRATION_API。适合「一条命令产出五能力测试所需的全部二进制」：
+#   cmake -S . -B build-enhanced -DGO2CPP_BUILD_ENHANCED=ON -DGO2CPP_WITH_CLI=ON
+#   cmake --build build-enhanced -j
+# 默认 OFF：各能力开关仍可单独使用，默认构建保持零开销（热路径宏被消除）。
+option(GO2CPP_BUILD_ENHANCED
+       "One-switch preset: DEBUG_DUMP + DIAGNOSTIC + REPLAY + MIGRATION_API" OFF)
+if (GO2CPP_BUILD_ENHANCED)
+    set(GO2CPP_DEBUG_DUMP ON CACHE BOOL "preset by GO2CPP_BUILD_ENHANCED" FORCE)
+    set(GO2CPP_DIAGNOSTIC ON CACHE BOOL "preset by GO2CPP_BUILD_ENHANCED" FORCE)
+    set(GO2CPP_REPLAY ON CACHE BOOL "preset by GO2CPP_BUILD_ENHANCED" FORCE)
+    set(GO2CPP_MIGRATION_API ON CACHE BOOL "preset by GO2CPP_BUILD_ENHANCED" FORCE)
+    # GO2CPP_WITH_CLI 在顶层 CMakeLists 定义（本文件先被 include）；
+    # 用户显式 -DGO2CPP_WITH_CLI=... 时尊重用户选择，否则一并打开。
+    if (NOT DEFINED GO2CPP_WITH_CLI)
+        set(GO2CPP_WITH_CLI ON CACHE BOOL "preset by GO2CPP_BUILD_ENHANCED" FORCE)
+    endif()
+    message(STATUS "GO2CPP_BUILD_ENHANCED=ON: DEBUG_DUMP/DIAGNOSTIC/REPLAY/MIGRATION_API all ON")
+endif()
+
 option(GO2CPP_BUILD_TESTS "Build Go2Cpp runtime tests" ON)
 option(GO2CPP_BUILD_EXAMPLES "Build Go2Cpp runtime examples" ON)
 option(GO2CPP_ENABLE_TSAN "Build with ThreadSanitizer when supported" OFF)

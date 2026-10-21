@@ -159,8 +159,13 @@ def main() -> int:
     lines.append("# 报告: /tmp/test_enhance.md；矩阵: /tmp/test_enhance_matrix.tsv")
     lines.append("```")
     lines.append("")
-    lines.append("依赖：`/tmp/go2cpp-cli-build`、`build-migration`、`build-debug`、"
-                 "`build-diag`、`/tmp/go2cpp-replay-build` 已构建。")
+    lines.append("依赖（按顺序解析，任一命中即可）："
+                 "`build-enhanced`（`-DGO2CPP_BUILD_ENHANCED=ON -DGO2CPP_WITH_CLI=ON`）、"
+                 "`build-cli` / `build-doctor-full`（CLI）、`build-debug-full` / "
+                 "`build-debug`（debug demo）、`build-diag` / `build-doctor-full`"
+                 "（doctor demo）、`build-replay`（回放）、`build-migration`（迁移）。"
+                 "也可用 `GO2CPP_CLI` / `GO2CPP_REPLAY_DIR` / `GO2CPP_DEBUG_DEMO` / "
+                 "`GO2CPP_DIAG_DEMO` / `GO2CPP_MIG_DIR` 显式覆盖。")
 
     with open(REPORT, "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")

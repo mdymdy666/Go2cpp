@@ -8,7 +8,10 @@
 # - 产品缺陷（FAIL）不会中止后续能力，全部跑完后汇总；
 # - 只有脚本自身超时/崩溃（harness）才让本脚本返回非 0；
 # - 矩阵 / 统计 / 报告分别写 /tmp/test_enhance_matrix.tsv、
-#   /tmp/test_enhance_stats.tsv、/tmp/test_enhance.md。
+#   /tmp/test_enhance_stats.tsv、/tmp/test_enhance.md（可用 MATRIX_FILE /
+#   STATS_FILE / REPORT_FILE 覆盖）；这些只是输出文件，不是构建依赖。
+# - 构建产物按「环境变量 → build-enhanced → 各能力构建目录」解析；
+#   不再依赖 /tmp/go2cpp-cli-build。
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -38,9 +41,27 @@ run_one() { # name script timeout
     fi
 }
 
-if [ ! -x /tmp/go2cpp-cli-build/tools/cli/go2cpp-cli ]; then
-    echo "缺少 CLI 构建产物：/tmp/go2cpp-cli-build/tools/cli/go2cpp-cli" >&2
-    exit 2
+# 构建产物定位：环境变量优先，其次探测工作树内的构建目录（见 lib/common.sh）。
+# 旧版本硬编码 /tmp/go2cpp-cli-build，清理 /tmp 或换机器后入口直接失效。
+source "$ENHANCED/lib/common.sh"
+common_init
+
+echo "=== 构建产物解析"
+echo "    ROOT       = $ROOT"
+echo "    CLI        = $CLI"
+echo "    DEBUG_DEMO = $DEBUG_DEMO"
+echo "    DIAG_DEMO  = $DIAG_DEMO"
+echo "    REPLAY_DIR = $REPLAY_DIR"
+echo "    MIG_DIR    = $MIG_DIR"
+
+if [ ! -x "$CLI" ]; then
+    echo "缺少 CLI 构建产物：$CLI" >&2
+    echo "请先构建其一，或用 GO2CPP_CLI=<path> 指定：" >&2
+    echo "  cmake -S . -B build-enhanced -DGO2CPP_BUILD_ENHANCED=ON -DGO2CPP_WITH_CLI=ON" >&2
+    echo "  cmake --build build-enhanced -j" >&2
+    echo "  # 或最小组件构建：cmake -S . -B build-cli -DGO2CPP_WITH_CLI=ON && cmake --build build-cli -j" >&2
+    echo "SKIP: 缺少 CLI，五能力增强矩阵未执行" >&2
+    exit 77
 fi
 
 run_one "debug-matrix" "$ENHANCED/debug/test_debug.sh" 180

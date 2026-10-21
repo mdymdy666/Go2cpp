@@ -1,0 +1,185 @@
+# Go2Cpp CI：默认构建回归 + 全能力构建（Debug / Doctor / 回放 / 迁移 / CLI）。
+#
+# 两条 job 的构建矩阵与 docs/testing.md「现状与 CI（2026-10-21）」一致：
+#   default  → build-work：DEBUG_DUMP/DIAGNOSTIC/REPLAY/MIGRATION_API/WITH_CLI 全 OFF，
+#              跑默认 ctest（当前 123 条 = 审计基线 116 + 2026-10-21 注册的 7 个
+#              孤儿测试；其中 75 条是 example 进程冒烟）。
+#   enhanced → build-enhanced：四项新能力 + CLI 全 ON，跑 ctest 与五能力增强矩阵；
+#              另建 build-migration（tools/migration 独立工程）与 build-replay
+#              （tools/replay 独立工程，链接 build-enhanced 的动态库）。
+#
+# 增强矩阵逐个调用五个能力主矩阵，而不是 tests/enhanced/run_all.sh：后者还会跑
+# 父 park 夹具（审计 P1-4 记录其编译失败）与压测，不适合作为 PR 门禁。各脚本用
+# GO2CPP_* 环境变量指向本 job 的产物；run_all.sh 自 2026-10-21 起也不再使用 /tmp
+# 固定路径，本地仍可用它一次跑全量 10 个增强脚本。
+name: CI
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: "4"
+  # 固定测试密钥（非生产），与 tests/enhanced/lib/common.sh 的默认值一致。
+  MIGRATION_SIGNING_KEY: "hex:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+jobs:
+  default:
+    name: default (ctest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 \
+            libboost-context-dev libssl-dev zlib1g-dev
+
+      - name: Configure (all new capability switches OFF)
+        run: |
+          cmake -S . -B build-work -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGO2CPP_BUILD_TESTS=ON \
+            -DGO2CPP_BUILD_EXAMPLES=ON
+
+      - name: Build
+        run: cmake --build build-work --parallel 4
+
+      - name: ctest
+        timeout-minutes: 15
+        run: ctest --test-dir build-work --output-on-failure --timeout 300
+
+      - name: Upload ctest log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: default-ctest-log
+          path: build-work/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  enhanced:
+    name: enhanced (debug/diagnostic/replay/cli)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 \
+            libboost-context-dev libssl-dev zlib1g-dev
+
+      - name: Configure (all new capability switches ON)
+        run: |
+          cmake -S . -B build-enhanced -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGO2CPP_BUILD_TESTS=ON \
+            -DGO2CPP_BUILD_EXAMPLES=ON \
+            -DGO2CPP_DEBUG_DUMP=ON \
+            -DGO2CPP_DIAGNOSTIC=ON \
+            -DGO2CPP_REPLAY=ON \
+            -DGO2CPP_MIGRATION_API=ON \
+            -DGO2CPP_WITH_CLI=ON
+
+      - name: Build enhanced
+        run: cmake --build build-enhanced --parallel 4
+
+      - name: ctest (enhanced build)
+        timeout-minutes: 20
+        run: ctest --test-dir build-enhanced --output-on-failure --timeout 300
+
+      - name: Build migration tools (standalone project)
+        run: |
+          cmake -S tools/migration -B build-migration -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-migration --parallel 4
+          # tools/migration 独立工程没有 ctest 用例（ctest -N = 0 tests）；
+          # 其 53 项验收由 tools/migration/tests/run_tests.sh 在
+          # "Tools test suites" 步骤执行。
+
+      - name: Build replay tools (standalone project)
+        env:
+          GO2CPP_REPLAY_BUILD_DIR: ${{ github.workspace }}/build-replay
+          GO2CPP_REPLAY_LIB_DIR: ${{ github.workspace }}/build-enhanced
+        run: |
+          ./tools/replay/build.sh
+          ctest --test-dir build-replay --output-on-failure --timeout 120
+
+      - name: Enhanced matrices (5 capabilities)
+        env:
+          GO2CPP_CLI: ${{ github.workspace }}/build-enhanced/tools/cli/go2cpp-cli
+          GO2CPP_DEBUG_DEMO: ${{ github.workspace }}/build-enhanced/go2cpp_debug_subscribe_demo
+          GO2CPP_DIAG_DEMO: ${{ github.workspace }}/build-enhanced/go2cpp_diagnostic_demo
+          GO2CPP_MIG_DIR: ${{ github.workspace }}/build-migration
+          GO2CPP_REPLAY_DIR: ${{ github.workspace }}/build-replay
+          MATRIX_FILE: ${{ github.workspace }}/enhanced-matrix.tsv
+          STATS_FILE: ${{ github.workspace }}/enhanced-stats.tsv
+          REPORT_FILE: ${{ github.workspace }}/enhanced-report.md
+        run: |
+          set -uo pipefail
+          rc=0
+          for name in debug migration replay cli doctor; do
+            script="tests/enhanced/${name}/test_${name}.sh"
+            echo "::group::enhanced ${name}"
+            timeout 300 bash "$script"
+            code=$?
+            echo "::endgroup::"
+            if [ "$code" -eq 77 ]; then
+              echo "::warning::enhanced ${name} skipped (exit 77)"
+            elif [ "$code" -ne 0 ]; then
+              echo "::error::enhanced ${name} failed (exit ${code})"
+              rc=1
+            fi
+          done
+          python3 tests/enhanced/report.py || true
+          exit "$rc"
+
+      - name: Tools test suites
+        env:
+          GO2CPP_CLI: ${{ github.workspace }}/build-enhanced/tools/cli/go2cpp-cli
+        run: |
+          set -euo pipefail
+          bash tools/migration/tests/run_tests.sh build-migration
+          BIN="$GO2CPP_CLI" bash tools/cli/tests/run_all.sh
+          bash tools/replay/scripts/run_all.sh build-replay
+
+      - name: Key scenarios (ctx.cancel / deadlock / full trace)
+        env:
+          GO2CPP_CLI: ${{ github.workspace }}/build-enhanced/tools/cli/go2cpp-cli
+        run: |
+          set -euo pipefail
+          bash tests/scenarios/ctx_cancel_rollback/run_ctx_cancel_rollback.sh build-enhanced
+          bash tests/scenarios/deadlock_routes/run_deadlock_scenario.sh \
+            build-enhanced --clients 100 --load-ms 800
+          SCENARIO="$PWD/build-enhanced/go2cpp_full_trace_scenario" \
+          CLI="$PWD/build-enhanced/tools/cli/go2cpp-cli" \
+          OUT="$PWD/full-trace-out" \
+            bash tests/scenarios/full_trace/run_full_trace.sh 10 8
+
+      - name: Upload enhanced reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: enhanced-reports
+          path: |
+            enhanced-matrix.tsv
+            enhanced-stats.tsv
+            enhanced-report.md
+            full-trace-out/coverage.txt
+            full-trace-out/*.json
+          if-no-files-found: ignore

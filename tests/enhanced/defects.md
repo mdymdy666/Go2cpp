@@ -5,29 +5,31 @@
 > 环境限制：当前 uid=1000，不能 `mount -t tmpfs`，磁盘满用 `/dev/full` /
 > `RLIMIT_FSIZE` 替代；已在报告中标注。
 
-## D1（高）CLI 仍只认 G2CMIG02/v2，无法消费当前 tools/migration 的 G2CMIG03/v3
+## D1（已修复，2026-10-20）CLI 已支持 G2CMIG03/v3
 
-- 位置：
-  - `tools/cli/formats.hpp:38`：`kMigrationMagic = "G2CMIG02"`。
-  - `tools/cli/formats.cpp:190-193`：按 G2CMIG02 识别并打印“G2CMIG02，版本 …”。
-  - `tools/cli/commands.cpp:1240-1252`：`RequireMigrationV2()` 要求 `version == 2`。
-  - `tools/migration/include/migration/format.hpp:105`：当前写端魔数为 `G2CMIG03`、版本 3。
-- 复现：
-  ```bash
-  cd /UserData/CodexWorkSpace/Go2Cpp-work
-  CLI=/tmp/go2cpp-cli-build/tools/cli/go2cpp-cli
-  export MIGRATION_SIGNING_KEY=hex:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
-  build-migration/migrate dump /tmp/fiber.mig
-  xxd -l 8 /tmp/fiber.mig                 # 4732 434d 4947 3033 = G2CMIG03
-  "$CLI" debug /tmp/fiber.mig; echo $?         # 4
-  "$CLI" migrate restore /tmp/fiber.mig; echo $?  # 4
-  GO2CPP_MIGRATE_TOOL=$PWD/build-migration/migrate \
-    "$CLI" migrate dump --pid $$ --gid 1 --out /tmp/x.mig; echo $?  # 1
-  ```
-- 期望：CLI 接受当前 v3（或至少按 v3 魔数识别并分派），`migrate dump` 对真实后端成功时返回 0。
-- 实际：`migrate restore`/`debug` 返回 4（“迁移文件格式不匹配/无法识别”）；`migrate dump` 后端已成功写出 G2CMIG03，但 CLI 的 `ProbeFile` 判为未知格式后返回 1。
-- 影响：CLI 与 tools/migration 的 v3 能力完全脱节；202 条既有 CLI 断言全部使用 G2CMIG02 fixture，未覆盖真实后端。
-- 矩阵证据：`cli-migrate-dump:真实 G2CMIG03 应成功`、`cli-debug:真实 G2CMIG03 应可分析`、`cli-migrate-restore:真实 G2CMIG03 应成功` 三项 FAIL。
+- **状态**：已修复。2026-10-20 起 `go2cpp-cli` 同时识别 v3（`G2CMIG03`，当前写版本）
+  与 v2（`G2CMIG02`，兼容读）；v1（`G2CMIG01`）仍明确拒绝。
+- **修复位置**：
+  - `tools/cli/formats.hpp:38-49`：`kMigrationMagic` 为 `G2CMIG03`，新增
+    `kMigrationMagicV2 = "G2CMIG02"`（仅兼容读）；两种魔数都归入 `kMigrationBinary`。
+  - `tools/cli/formats.cpp:190-200`：按前 8 字节区分 `G2CMIG03`/`G2CMIG02` 并打印版本。
+  - `tools/cli/commands.cpp:1320-1332`：`RequireMigrationSupported()` 接受
+    `version == 3 || version == 2`，错误信息明确「CLI 接受 v3（魔数 G2CMIG03，
+    当前写版本）与 v2（G2CMIG02，兼容读）」。
+- **验证（2026-10-21 复测）**：
+  - `tests/enhanced/migration/test_migration.sh`：**34/34 PASS**，其中
+    `cli-migrate-dump`、`cli-debug`、`cli-migrate-restore` 三项使用真实 G2CMIG03 快照；
+  - `tools/cli/tests/run_all.sh`：**213/213 PASS**。
+- **修复前的历史记录（2026-10-20 18:5x）**：
+  - 原声明：CLI 只认 `G2CMIG02/v2`；`tools/cli/formats.hpp:38` 的 `kMigrationMagic`
+    为 `G2CMIG02`，`tools/cli/commands.cpp:1240-1252` 的 `RequireMigrationV2()` 要求
+    `version == 2`。
+  - 原现象：`migrate restore`/`debug` 对真实 G2CMIG03 返回 4；`migrate dump` 后端已
+    成功写出 G2CMIG03，但 CLI 的 `ProbeFile` 判为未知格式后返回 1。
+  - 原影响：CLI 与 tools/migration v3 能力脱节，202 条既有断言只覆盖 G2CMIG02 fixture。
+  - 原矩阵失败项：`cli-migrate-dump:真实 G2CMIG03 应成功`、
+    `cli-debug:真实 G2CMIG03 应可分析`、`cli-migrate-restore:真实 G2CMIG03 应成功`。
+- 说明：D1 编号保留便于与历史报告对照；本条不再计入未修复缺陷。
 
 ## D2（高）全量 scheduler dump 携带大量已完成 G，内存与 dump 体积线性增长
 

@@ -229,3 +229,11 @@ void run_parking_condition_stress_tests() {
         std::printf("[pc] FAILED\n");
     }
 }
+
+// 2026-10-21 测试固化：本文件原先只有 run_parking_condition_stress_tests()，
+// 没有任何 target 引用（也从未被别的测试 include），等于 231 行从未编译。
+// 这里补一个最小 main 让它能作为独立 ctest 运行；断言逻辑一行未改。
+int main() {
+    run_parking_condition_stress_tests();
+    return g_failures == 0 ? 0 : 1;
+}

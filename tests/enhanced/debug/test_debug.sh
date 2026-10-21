@@ -30,8 +30,17 @@ PROBE=(python3 "$HERE/debug_probe.py" "$DEBUG_SOCK")
 # ---------------- 正常路径 ----------------
 expect_ok "status:CLI 读取协议/组件/订阅者" normal "协议: GO2CPP-DEBUG/1" \
     "${CLI_DEBUG[@]}" status --pid "$DEBUG_PID"
-expect_ok "status:组件数=3" normal "组件 3 个" \
-    "${CLI_DEBUG[@]}" status --pid "$DEBUG_PID"
+# 组件数随构建能力变化：仅 DEBUG_DUMP=3，再加 REPLAY/DIAGNOSTIC 时=4。
+# 旧版硬编码「组件 3 个」，在 build-enhanced / build-doctor-full 上会误报；
+# 这里断言「至少 3 个核心组件」（scheduler/runtime/events），与开关解耦。
+STATUS_OUT="$(timeout "$CASE_TIMEOUT" "${CLI_DEBUG[@]}" status --pid "$DEBUG_PID" 2>&1)"
+STATUS_CODE=$?
+COMPONENTS="$(printf '%s' "$STATUS_OUT" | sed -n 's/.*组件 \([0-9][0-9]*\) 个.*/\1/p' | head -1)"
+if [ "$STATUS_CODE" -eq 0 ] && [ -n "$COMPONENTS" ] && [ "$COMPONENTS" -ge 3 ]; then
+    pass "status:组件数>=3" normal "组件 $COMPONENTS 个"
+else
+    fail "status:组件数>=3" normal "exit=$STATUS_CODE components='${COMPONENTS:-}' head=$(printf '%s' "$STATUS_OUT" | head -3 | tr '\n' '|')"
+fi
 
 expect_ok "dump-json-all:schema" normal '"schema": "go2cpp.dump.all/1"' \
     "${CLI_DEBUG[@]}" dump --pid "$DEBUG_PID"

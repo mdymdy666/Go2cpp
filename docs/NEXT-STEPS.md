@@ -93,7 +93,8 @@ picotls: /home/ubunturoot/build-deps/picotls/（4 个 .a）
 2. 修改 `test_hook.cpp:449` 的断言（或让它覆盖两条路径）
 3. 补 `*_f` 对照测试
 
-**当前状态**：`tests/network/test_hook_fifo.cpp` 记录了两种行为，**已注册**，
+**当前状态**：`tests/network/test_hook_fifo.cpp` 记录了两种行为，**未注册**
+（2026-10-21 审计确认：CMake 中无 `add_executable`/`add_test` 引用，该断言目前不在任何 ctest 中执行），
 断言「`read` 心跳 > 5（sysmon 生效）」，保护现有架构选择。
 
 ### P2：`hook.enable_shutdown` 是无效配置项

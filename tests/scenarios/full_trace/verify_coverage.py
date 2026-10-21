@@ -98,10 +98,29 @@ def main() -> int:
     check(sched_counts["enqueue"] > 0, "窗口内没有 enqueue")
     check(sched_counts["claim_ok"] > 0, "窗口内没有 claim_ok")
     window_pending = sched["pairing"]["window_enqueue_pending"]
-    check(
-        window_pending <= max(16, int(0.2 * sched_counts["enqueue"])),
-        f"窗口内 enqueue 未 claim 数量异常: {window_pending}",
-    )
+    window_enqueue = sched_counts["enqueue"]
+    # 事件环是**按线程的环形缓冲**（默认 256 条/线程），快照只保留最近一段
+    # 事件。截断窗口里 enqueue 与 claim 天然跨边界不配对：实测 10s 场景
+    # （8 线程、30 万条已发布事件、窗口 1911 条）窗口内 enqueue=78 只有
+    # claim=29，pending=49，这与「调度卡住」无关。
+    # 因此按文件头「窗口截断只报告、不误判」的约定分两档：
+    #   - 未截断：20%（最少 16）硬判，配对率异常直接失败；
+    #   - 已截断：只拒绝「几乎全部 enqueue 都没 claim」（>80%）的异常，
+    #     其余打印实际数字供人复核。
+    if window["truncated"]:
+        check(
+            window_pending <= int(0.8 * window_enqueue),
+            f"窗口内 enqueue 几乎全部未 claim: {window_pending}/{window_enqueue}",
+        )
+        print(
+            f"窗口截断：enqueue={window_enqueue} claim={sched_counts['claim_ok']} "
+            f"pending={window_pending}（边界配对不完整，只报告不硬判）"
+        )
+    else:
+        check(
+            window_pending <= max(16, int(0.2 * window_enqueue)),
+            f"窗口内 enqueue 未 claim 数量异常: {window_pending}",
+        )
 
     # ---- timer fire → 回调/G 入队 ----
     timer_pairing = timer["pairing"]

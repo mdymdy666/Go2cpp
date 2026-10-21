@@ -85,6 +85,20 @@ if (GO2CPP_BUILD_TESTS)
         target_sources(go2cpp_tests PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_diagnostic.cpp)
 
+        # ctx.cancel 单测：拒绝路径（bad-argument / not-registered）+
+        # gid/name/address 三种成功定位 + 重复取消 + cancel_race。
+        # test_diagnostic 的 11 个场景不含 ctx.cancel，这里单独成 ctest，
+        # 失败时能直接定位到取消路径而不是整个 go2cpp_tests。
+        add_executable(go2cpp_ctx_cancel_test
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_ctx_cancel.cpp)
+        target_link_libraries(go2cpp_ctx_cancel_test PRIVATE go2cpp_runtime)
+        target_include_directories(go2cpp_ctx_cancel_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_compile_options(go2cpp_ctx_cancel_test PRIVATE
+            -O2 -Wall -Wextra -Wpedantic)
+        add_test(NAME go2cpp_ctx_cancel_test COMMAND go2cpp_ctx_cancel_test)
+        set_tests_properties(go2cpp_ctx_cancel_test PROPERTIES TIMEOUT 120)
+
         # 独立 demo 进程：供 tests/debug/run_diagnostic_e2e.sh 从外部诊断。
         # **不注册 ctest**：ctest 用例总数保持不变；端到端验收由脚本执行。
         add_executable(go2cpp_diagnostic_demo
@@ -626,6 +640,159 @@ if (GO2CPP_BUILD_TESTS)
     set_tests_properties(go2cpp_metrics_test PROPERTIES TIMEOUT 300)
 
     set_tests_properties(go2cpp_high_load_stress PROPERTIES TIMEOUT 180)
+
+    # ---- 孤儿并发/IO 审计测试（2026-10-21 测试固化）----
+    # 这 7 个文件长期存在于 tests/ 但没有任何 target 引用（见
+    # docs/test-audit-2026-10-21.md §2.5，合计约 2900 行）。注册前逐个
+    # 用 build-work 的 Release 库手工编译并实跑通过，再落到 CMake；
+    # 每个都是自带 main 的独立可执行文件，超时按实测耗时留 3~10 倍余量。
+    #
+    # sync_cancel_stress 是 Fiber cancel+cleanup 丢唤醒的独立复现器：
+    # docs/AGENT-HANDOFF.md 与 codex.md 都记录「尚未注册 ctest」，本轮补上。
+    add_executable(go2cpp_channel_concurrency
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_channel_concurrency.cpp)
+    target_link_libraries(go2cpp_channel_concurrency PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_channel_concurrency PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_channel_concurrency PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_channel_concurrency
+             COMMAND go2cpp_channel_concurrency)
+    set_tests_properties(go2cpp_channel_concurrency PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_worker_lifecycle
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_worker_lifecycle.cpp)
+    target_link_libraries(go2cpp_worker_lifecycle PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_worker_lifecycle PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_worker_lifecycle PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_worker_lifecycle COMMAND go2cpp_worker_lifecycle)
+    set_tests_properties(go2cpp_worker_lifecycle PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_future_audit
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_future_audit.cpp)
+    target_link_libraries(go2cpp_future_audit PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_future_audit PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_future_audit PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_future_audit COMMAND go2cpp_future_audit)
+    set_tests_properties(go2cpp_future_audit PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_sync_cancel_stress
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_sync_cancel_stress.cpp)
+    target_link_libraries(go2cpp_sync_cancel_stress PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_sync_cancel_stress PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_sync_cancel_stress PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_sync_cancel_stress COMMAND go2cpp_sync_cancel_stress)
+    # 复现器默认 5000 轮；慢机器 + TSan 下余量到 300s。
+    set_tests_properties(go2cpp_sync_cancel_stress PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_io_audit
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_io_audit.cpp)
+    target_link_libraries(go2cpp_io_audit PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_io_audit PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_io_audit PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_io_audit COMMAND go2cpp_io_audit)
+    set_tests_properties(go2cpp_io_audit PROPERTIES TIMEOUT 300)
+
+    # ParkingCondition 并发压测（futex 代际字丢唤醒护栏）。
+    # 源文件原先只有 run_* 函数没有 main、也没有 target 引用；本轮补 main
+    # （断言逻辑未改）后注册。放最后一条：它只依赖 core::ParkingCondition，
+    # 不经过 hook，任何构建组合都能跑。
+    add_executable(go2cpp_parking_condition_stress
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_parking_condition_stress.cpp)
+    target_link_libraries(go2cpp_parking_condition_stress PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_parking_condition_stress PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_parking_condition_stress PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_parking_condition_stress
+             COMMAND go2cpp_parking_condition_stress)
+    set_tests_properties(go2cpp_parking_condition_stress PROPERTIES TIMEOUT 300)
+
+    # ---- 资源历史单测（默认构建也跑：OFF 时断言空语义）----
+    # 直接调用 debug_resources 的注册表/事件/栈样本与 debug_dump 的四个视图
+    # （resources/locks/channels/history），不启 DebugServer socket；
+    # 比 run_resource_history_demo.sh 更早暴露字段/计数回归。
+    add_executable(go2cpp_resource_history_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_resource_history.cpp)
+    target_link_libraries(go2cpp_resource_history_test PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_resource_history_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_resource_history_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_resource_history_test
+             COMMAND go2cpp_resource_history_test)
+    set_tests_properties(go2cpp_resource_history_test PROPERTIES TIMEOUT 120)
+
+    # ---- 全能力构建的端到端场景（GO2CPP_BUILD_ENHANCED=ON）----
+    # 这些脚本以前只能手工执行（命令散落在 docs/debug-reliability.md）；
+    # 挂到 ctest 后「构建里打开了某项能力」就有一条对应的已跑场景。
+    # 只在本预设构建下注册：默认 build-work 没有这些 demo/CLI，注册必然失败。
+    if (GO2CPP_BUILD_ENHANCED)
+        if (TARGET go2cpp_ctx_cancel_rollback)
+            add_test(NAME go2cpp_scenario_ctx_cancel_rollback
+                     COMMAND bash
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/ctx_cancel_rollback/run_ctx_cancel_rollback.sh
+                         ${CMAKE_CURRENT_BINARY_DIR})
+            set_tests_properties(go2cpp_scenario_ctx_cancel_rollback PROPERTIES
+                TIMEOUT 180)
+        endif()
+        if (TARGET go2cpp_deadlock_routes)
+            # 默认 120 client + 600ms 加载：压测窗口缩短但保持「>100 client
+            # 并发 → 锁顺序死锁 → Doctor 受控解锁」的完整路径。
+            add_test(NAME go2cpp_scenario_deadlock_routes
+                     COMMAND bash
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/deadlock_routes/run_deadlock_scenario.sh
+                         ${CMAKE_CURRENT_BINARY_DIR} --clients 120 --load-ms 600)
+            set_tests_properties(go2cpp_scenario_deadlock_routes PROPERTIES
+                TIMEOUT 300)
+        endif()
+        if (TARGET go2cpp_full_trace_scenario AND GO2CPP_WITH_CLI)
+            add_test(NAME go2cpp_scenario_full_trace
+                     COMMAND ${CMAKE_COMMAND} -E env
+                         SCENARIO=$<TARGET_FILE:go2cpp_full_trace_scenario>
+                         CLI=${CMAKE_CURRENT_BINARY_DIR}/tools/cli/go2cpp-cli
+                         OUT=${CMAKE_CURRENT_BINARY_DIR}/scenario-full-trace
+                         bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/full_trace/run_full_trace.sh
+                              10 8)
+            set_tests_properties(go2cpp_scenario_full_trace PROPERTIES
+                TIMEOUT 180)
+        endif()
+        if (GO2CPP_DEBUG_DUMP AND GO2CPP_WITH_CLI)
+            add_test(NAME go2cpp_scenario_resource_history
+                     COMMAND ${CMAKE_COMMAND} -E env
+                         CLI=${CMAKE_CURRENT_BINARY_DIR}/tools/cli/go2cpp-cli
+                         bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/run_resource_history_demo.sh
+                              ${CMAKE_CURRENT_BINARY_DIR} 10)
+            set_tests_properties(go2cpp_scenario_resource_history PROPERTIES
+                PASS_REGULAR_EXPRESSION "ALL PASS"
+                TIMEOUT 180)
+        endif()
+        if (GO2CPP_MIGRATION_API AND TARGET go2cpp_fiber_adopt_demo)
+            add_test(NAME go2cpp_migration_adopt_roundtrip
+                     COMMAND bash
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tools/migration/tests/adopt_roundtrip.sh
+                         ${CMAKE_CURRENT_BINARY_DIR})
+            set_tests_properties(go2cpp_migration_adopt_roundtrip PROPERTIES
+                TIMEOUT 300)
+        endif()
+    endif()
+
+    # 未注册（实跑不通过，原因如实记录；见 /tmp/test_fix.md）：
+    # - tests/network/test_hook_fifo.cpp：场景 3 用 raw write 在**主线程**把
+    #   F_SETPIPE_SZ=4096 的管道写满，随后没有读者，write_f 永久阻塞，
+    #   测试自身死锁（实测 timeout 300s）；不是产品缺陷，需改成非阻塞填充。
+    # - tests/network/test_hook_behavior.cpp：场景 2 断言「kSleep 关闭后
+    #   心跳 < 5」（期望真阻塞 worker），实测心跳 39——与文件头注释记录的
+    #   已知行为一致（SetOpEnabled 只改标志位，实际 sleep 仍走 park 路径）。
+    #   这是被测试记录的产品缺陷，不能改断言来「通过」，故不注册。
 endif()
 
     # ---- bufio 模块：带缓冲的 IO（语义对齐 Go bufio）----

@@ -20,15 +20,22 @@ SECONDS_RUN="${2:-25}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
+# ctest 传绝对路径，手工调用通常传相对工作树的目录名；统一成绝对路径，
+# 否则 `$ROOT/$BUILD` 在绝对路径下会拼成 `$ROOT//abs/...`（rpath 失效）。
+case "$BUILD" in
+  /*) BUILD_ABS="$BUILD" ;;
+  *) BUILD_ABS="$ROOT/$BUILD" ;;
+esac
+
 CXX="${CXX:-g++}"
 CLI="${CLI:-build-doctor-full/tools/cli/go2cpp-cli}"
 OUT_DIR="${OUT_DIR:-/tmp/resource-history-demo}"
-DEMO_BIN="$BUILD/resource_history_demo"
+DEMO_BIN="$BUILD_ABS/resource_history_demo"
 DEMO_LOG="$OUT_DIR/demo.log"
 mkdir -p "$OUT_DIR"
 
-if [[ ! -f "$BUILD/libgo2cpp_debug.so" ]]; then
-  echo "FAIL: $BUILD 不是 GO2CPP_DEBUG_DUMP=ON 构建" >&2
+if [[ ! -f "$BUILD_ABS/libgo2cpp_debug.so" ]]; then
+  echo "FAIL: $BUILD_ABS 不是 GO2CPP_DEBUG_DUMP=ON 构建" >&2
   exit 2
 fi
 if [[ ! -x "$CLI" ]]; then
@@ -40,9 +47,9 @@ echo "== 编译 demo =="
 # shellcheck disable=SC2046
 "$CXX" -std=c++17 -O2 -g -rdynamic -DGO2CPP_DEBUG_DUMP=1 \
   -I include -I third_party \
-  -Wl,-rpath,"$ROOT/$BUILD" \
+  -Wl,-rpath,"$BUILD_ABS" \
   tests/debug/resource_history_demo.cpp -o "$DEMO_BIN" \
-  $(ls "$BUILD"/libgo2cpp_*.so | grep -v '\.so\.') \
+  $(ls "$BUILD_ABS"/libgo2cpp_*.so | grep -v '\.so\.') \
   -lpthread -ldl || { echo "FAIL: demo 编译失败" >&2; exit 2; }
 
 echo "== 启动 demo（${SECONDS_RUN}s）=="
