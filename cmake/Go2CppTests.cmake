@@ -214,6 +214,24 @@ if (GO2CPP_BUILD_TESTS)
     target_compile_options(go2cpp_channel_deadlock PRIVATE
         -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_tests COMMAND go2cpp_tests)
+
+    # 回放 v5 压力/一致性测试（独立入口）：合成场景默认构建可跑；真实原语
+    # 场景需要 GO2CPP_REPLAY=ON（否则测试内部自动 skip 并记为 PASS）。
+    add_executable(go2cpp_replay_v5_stress
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/test_rwmutex_replay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/test_cv_replay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/test_waitgroup_replay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/test_io_replay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/test_mixed_v5_replay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/replay_v5_stress_main.cpp)
+    target_link_libraries(go2cpp_replay_v5_stress PRIVATE
+        go2cpp_runtime go2cpp_replay_core)
+    target_include_directories(go2cpp_replay_v5_stress PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_replay_v5_stress PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_replay_v5_stress COMMAND go2cpp_replay_v5_stress)
+    set_tests_properties(go2cpp_replay_v5_stress PROPERTIES TIMEOUT 300)
     # 超时从 30 -> 60 -> 120：go2cpp_tests 是全部单元测试的集合。
     # 随调试模块陆续新增测试（debug_* 七个）后整体耗时约 18~30s，且**偶发**更高：
     # 实测撞过两次 Timeout（一次与 build-bench 并行、一次原因不明），
