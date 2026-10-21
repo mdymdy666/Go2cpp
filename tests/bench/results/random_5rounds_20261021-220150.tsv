@@ -1,0 +1,6 @@
+round	seed	scenarios	ops	failures	ok	rc	elapsed_s	mono_wall_s	time_v_wall	rss_kb	cpu_pct_time_v	cpu_pct_calc	user_s	sys_s	debug	events_all	debug_check	load_before	load_after
+1	219483441	workpool,pipeline,mixedlocks,storm	19652	0	1	0	0.251	0.260	0:00.25	6016	16%	16%	0.01	0.03	0			3.54 2.32 2.03	3.54 2.32 2.03
+2	2677951770	pc,pipeline,mixedlocks,storm	27873	0	1	0	0.250	0.260	0:00.25	6400	28%	24%	0.01	0.05	0			3.54 2.32 2.03	3.54 2.32 2.03
+3	3202897593	pc,workpool,pipeline,mixedlocks	28619	0	1	0	0.250	0.260	0:00.25	6140	28%	28%	0.01	0.06	0			3.54 2.32 2.03	3.54 2.32 2.03
+4	1120597490	pc,pipeline,mixedlocks,storm	27808	0	1	0	0.250	0.260	0:00.25	6268	36%	36%	0.02	0.07	0			3.54 2.32 2.03	3.54 2.32 2.03
+5	202402018	pc,rwcache,workpool,pipeline	27621	0	1	0	0.250	0.260	0:00.25	6016	25%	24%	0.01	0.05	0			3.54 2.32 2.03	3.54 2.32 2.03

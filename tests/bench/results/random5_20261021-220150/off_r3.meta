@@ -1,0 +1,21 @@
+round	3
+seed	1120597490
+tag	off
+scenarios	pc,pipeline,mixedlocks,storm
+ops	27808
+failures	0
+ok	1
+rc	0
+elapsed	0.250
+mono_wall	0.260
+wall	0:00.25
+rss_kb	6268
+cpu_pct	36%
+cpu_calc	36%
+user_s	0.02
+sys_s	0.07
+debug	0
+events_all	
+debug_check	
+load_before	3.54 2.32 2.03
+load_after	3.54 2.32 2.03

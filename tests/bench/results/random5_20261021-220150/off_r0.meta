@@ -1,0 +1,21 @@
+round	0
+seed	219483441
+tag	off
+scenarios	workpool,pipeline,mixedlocks,storm
+ops	19652
+failures	0
+ok	1
+rc	0
+elapsed	0.251
+mono_wall	0.260
+wall	0:00.25
+rss_kb	6016
+cpu_pct	16%
+cpu_calc	16%
+user_s	0.01
+sys_s	0.03
+debug	0
+events_all	
+debug_check	
+load_before	3.54 2.32 2.03
+load_after	3.54 2.32 2.03

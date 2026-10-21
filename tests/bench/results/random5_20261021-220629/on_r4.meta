@@ -1,0 +1,21 @@
+round	4
+seed	1705200321
+tag	on
+scenarios	pc,workpool,pipeline,mixedlocks
+ops	1427475
+failures	0
+ok	1
+rc	0
+elapsed	5.356
+mono_wall	5.360
+wall	0:05.35
+rss_kb	7268
+cpu_pct	173%
+cpu_calc	173%
+user_s	3.28
+sys_s	6.01
+debug	1
+events_all	1098326
+debug_check	pass
+load_before	0.66 1.96 2.06
+load_after	0.77 1.96 2.06

@@ -1,0 +1,21 @@
+round	0
+seed	2227925036
+tag	on
+scenarios	pc,rwcache,pipeline,mixedlocks
+ops	1931063
+failures	0
+ok	1
+rc	0
+elapsed	5.750
+mono_wall	5.760
+wall	0:03.86
+rss_kb	7168
+cpu_pct	255%
+cpu_calc	171%
+user_s	3.99
+sys_s	5.87
+debug	1
+events_all	1577981
+debug_check	pass
+load_before	0.64 2.10 2.10
+load_after	0.67 2.08 2.10
