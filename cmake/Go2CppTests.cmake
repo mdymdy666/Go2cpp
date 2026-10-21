@@ -205,6 +205,14 @@ if (GO2CPP_BUILD_TESTS)
         target_compile_options(go2cpp_ctx_cancel_rollback PRIVATE
             -Wall -Wextra -Wpedantic)
     endif()
+    # ---- 场景：channel 互等死锁 → select 语义恢复（timeout / multi / default）----
+    # 不依赖 Doctor；只用 channel + select。默认构建只编译 demo、不注册 ctest；
+    # 增强构建下由 scenario-channel-deadlock 执行（见文件末尾注册段）。
+    add_executable(go2cpp_channel_deadlock
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/channel_deadlock/channel_deadlock_demo.cpp)
+    target_link_libraries(go2cpp_channel_deadlock PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_channel_deadlock PRIVATE
+        -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_tests COMMAND go2cpp_tests)
     # 超时从 30 -> 60 -> 120：go2cpp_tests 是全部单元测试的集合。
     # 随调试模块陆续新增测试（debug_* 七个）后整体耗时约 18~30s，且**偶发**更高：
@@ -822,6 +830,14 @@ if (GO2CPP_BUILD_TESTS)
                 SKIP_RETURN_CODE 77
                 TIMEOUT 300)
         endif()
+
+        # channel 互等死锁 + select 语义（timeout / multi / default）：
+        # 不依赖 Doctor，只需要 demo 可执行文件与 bash；缺文件时脚本 exit 77。
+        add_test(NAME scenario-channel-deadlock
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/channel_deadlock/run_channel_deadlock.sh --ctest)
+        set_tests_properties(scenario-channel-deadlock PROPERTIES
+            SKIP_RETURN_CODE 77
+            TIMEOUT 300)
 
         # 既有增强场景保持注册不变（不属于本次三条；仍走原脚本）。
         if (GO2CPP_DEBUG_DUMP AND GO2CPP_WITH_CLI)

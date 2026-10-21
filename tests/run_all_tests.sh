@@ -150,10 +150,11 @@ fi
 # ---------------------------------------------------------------------------
 # 3) 场景测试（ctest 兜底）
 # ---------------------------------------------------------------------------
-# 三条场景已注册进 ctest（仅增强构建）：scenario-ctx-cancel /
-# scenario-deadlock-routes / scenario-full-trace。ctest 步骤若已跑过包含
-# 这三条的构建目录（例如 BUILD_DIR=build-enhanced），本节默认只记 SKIP
-# 标注覆盖关系，避免同一场景跑两遍；RUN_SCENARIOS_STANDALONE=1 强制独立跑。
+# 四条场景已注册进 ctest（仅增强构建）：scenario-ctx-cancel /
+# scenario-deadlock-routes / scenario-full-trace / scenario-channel-deadlock。
+# ctest 步骤若已跑过包含这四条的构建目录（例如 BUILD_DIR=build-enhanced），
+# 本节默认只记 SKIP 标注覆盖关系，避免同一场景跑两遍；
+# RUN_SCENARIOS_STANDALONE=1 强制独立跑。
 SCENARIO_BUILD="$(pick "${SCENARIO_BUILD_DIR:-}" "$ROOT/build-enhanced" \
     "$ROOT/build-doctor-full")" || true
 CLI_BIN_RESOLVED="$(pick "${CLI_BIN:-}" \
@@ -183,6 +184,8 @@ if [ "$SCENARIOS_IN_CTEST" -eq 1 ] && [ "${RUN_SCENARIOS_STANDALONE:-0}" != "1" 
         "已由 ctest scenario-deadlock-routes 覆盖"
     mark_skip "scenario-full-trace" 0 \
         "已由 ctest scenario-full-trace 覆盖"
+    mark_skip "scenario-channel-deadlock" 0 \
+        "已由 ctest scenario-channel-deadlock 覆盖"
 else
     # 包装脚本自己解析构建目录（GO2CPP_SCENARIO_BUILD_DIR > 当前构建 >
     # build-doctor-full > ...）；缺依赖时 exit 77 → 本入口记为 SKIP。
@@ -192,6 +195,8 @@ else
         "$ROOT/tests/scenarios/run_deadlock_routes_ctest.sh"
     run_scenario "scenario-full-trace" 300 \
         "$ROOT/tests/scenarios/run_full_trace_ctest.sh"
+    run_scenario "scenario-channel-deadlock" 300 \
+        "$ROOT/tests/scenarios/channel_deadlock/run_channel_deadlock.sh"
 fi
 
 # ---------------------------------------------------------------------------
