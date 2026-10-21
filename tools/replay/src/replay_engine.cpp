@@ -154,13 +154,7 @@ bool LoadFile(const std::string& path, LoadedFile* out) {
         }
         // 资源事件的 gid 字段是 actor_gid（全局 Task 编号，可远超 65536），
         // 它们不进入 per-gid 稠密索引，因此不能按 kMaxGid 拒绝。
-        const bool resource_event =
-            event.type == EventType::kResMutexLock ||
-            event.type == EventType::kResMutexUnlock ||
-            event.type == EventType::kResPCWait ||
-            event.type == EventType::kResPCNotify ||
-            event.type == EventType::kResChannelSend ||
-            event.type == EventType::kResChannelRecv;
+        const bool resource_event = IsResourceEventType(event.type);
         if (!resource_event && event.gid > kMaxGid) {
             // 超限 gid 必须在分配任何索引数组之前拒绝：per-gid 稠密数组
             // 会按 max_gid+1 分配，gid=0x7FFFFFFF 会直接 bad_alloc → abort。
@@ -265,19 +259,9 @@ private:
 };
 
 
-/// 资源事件判定（v4）。
+/// 资源事件判定（v4 的 6 种 + v5 的 13 种；谓词由 format.hpp 统一维护）。
 bool IsResourceEvent(EventType type) noexcept {
-    switch (type) {
-        case EventType::kResMutexLock:
-        case EventType::kResMutexUnlock:
-        case EventType::kResPCWait:
-        case EventType::kResPCNotify:
-        case EventType::kResChannelSend:
-        case EventType::kResChannelRecv:
-            return true;
-        default:
-            return false;
-    }
+    return IsResourceEventType(type);
 }
 
 /// 静态重演的资源状态：owner / 加锁时间 / lock 条目下标 / 等待者。
@@ -286,7 +270,16 @@ struct ResourceReplayState {
     std::map<std::uint64_t, std::uint64_t> lock_vtime;
     std::map<std::uint64_t, std::size_t> lock_entry;
     std::map<std::uint64_t, std::vector<std::uint64_t>> waiters;
+    /// v5：RWMutex 的读者数（读锁可多持有者，因此不用 owner）。
+    std::map<std::uint64_t, std::uint32_t> rw_readers;
+    /// v5：WaitGroup 的当前计数（用于校验 value 字段与事件序列自洽）。
+    std::map<std::uint64_t, std::int64_t> wg_count;
 };
+
+/// v5：aux 里是否带某个标志位（低位）。
+bool HasAux(const ResourceTimelineEntry& entry, ResourceAuxFlags flag) noexcept {
+    return (entry.aux & static_cast<std::uint64_t>(flag)) != 0U;
+}
 
 void EraseWaiter(std::vector<std::uint64_t>* waiters, std::uint64_t gid) {
     if (waiters == nullptr || gid == 0U) {
@@ -319,6 +312,10 @@ void AccumulateResourceEvent(const Event& event, ReplayReport* report,
     entry.result = event.resource_result;
     entry.address = event.address;
     entry.waiters = event.waiters;
+    entry.fd = event.res_fd;
+    entry.bytes = event.res_bytes;
+    entry.aux = event.res_aux;
+    entry.value = event.value;
 
     switch (event.type) {
         case EventType::kResMutexLock:
@@ -381,6 +378,112 @@ void AccumulateResourceEvent(const Event& event, ReplayReport* report,
         case EventType::kResChannelRecv:
             ++report->stats.res_channel_recvs;
             break;
+        // ---- v5：RWMutex ----
+        case EventType::kResRwReadLock:
+            if (event.resource_result == 0U) {
+                ++report->stats.res_rw_reads;
+                ++state->rw_readers[key];
+                state->waiters[key].erase(
+                    std::remove(state->waiters[key].begin(),
+                                state->waiters[key].end(), entry.actor_gid),
+                    state->waiters[key].end());
+            } else {
+                ++report->stats.res_rw_read_blocks;
+                state->waiters[key].push_back(entry.actor_gid);
+            }
+            break;
+        case EventType::kResRwWriteLock:
+            if (event.resource_result == 0U) {
+                ++report->stats.res_rw_writes;
+                state->owner[key] = entry.actor_gid;
+                state->waiters[key].erase(
+                    std::remove(state->waiters[key].begin(),
+                                state->waiters[key].end(), entry.actor_gid),
+                    state->waiters[key].end());
+            } else {
+                ++report->stats.res_rw_write_blocks;
+                state->waiters[key].push_back(entry.actor_gid);
+            }
+            break;
+        case EventType::kResRwUnlock: {
+            ++report->stats.res_rw_unlocks;
+            if (HasAux(entry, ResourceAuxFlags::kRead)) {
+                auto& readers = state->rw_readers[key];
+                if (readers == 0U) {
+                    ++report->stats.resource_order_anomalies;
+                } else {
+                    --readers;
+                }
+            } else {
+                const auto owner_it = state->owner.find(key);
+                if (owner_it == state->owner.end() ||
+                    owner_it->second != entry.actor_gid) {
+                    ++report->stats.resource_order_anomalies;
+                } else {
+                    state->owner.erase(owner_it);
+                }
+            }
+            EraseWaiter(&state->waiters[key], entry.target_gid);
+            break;
+        }
+        // ---- v5：ConditionVariable ----
+        case EventType::kResCvWait:
+            ++report->stats.res_cv_waits;
+            if (event.resource_result == 1U) {
+                state->waiters[key].push_back(entry.actor_gid);
+            }
+            break;
+        case EventType::kResCvNotify:
+            ++report->stats.res_cv_notifies;
+            if (entry.target_gid != 0U) {
+                ++report->stats.res_cv_woken;
+                EraseWaiter(&state->waiters[key], entry.target_gid);
+            }
+            break;
+        case EventType::kResCvNotifyAll:
+            ++report->stats.res_cv_notify_alls;
+            report->stats.res_cv_woken += static_cast<std::uint64_t>(
+                entry.value > 0 ? entry.value : 0);
+            // 广播把队列整体换出：等待者集合清空。
+            state->waiters[key].clear();
+            break;
+        // ---- v5：WaitGroup ----
+        case EventType::kResWgAdd:
+            ++report->stats.res_wg_adds;
+            state->wg_count[key] +=
+                static_cast<std::int64_t>(entry.aux & 0xFFFFFFFFULL);
+            break;
+        case EventType::kResWgDone: {
+            ++report->stats.res_wg_dones;
+            const auto delta = static_cast<std::int32_t>(
+                static_cast<std::uint32_t>(entry.aux & 0xFFFFFFFFULL));
+            state->wg_count[key] += delta;
+            // Done 唤醒等待者时 target 就是被唤醒的 gid；等待者集合在此移除。
+            EraseWaiter(&state->waiters[key], entry.target_gid);
+            break;
+        }
+        case EventType::kResWgWait:
+            ++report->stats.res_wg_waits;
+            if (event.resource_result == 1U) {
+                state->waiters[key].push_back(entry.actor_gid);
+            }
+            break;
+        // ---- v5：IO ----
+        case EventType::kResIoRead:
+            ++report->stats.res_io_reads;
+            report->stats.res_io_bytes += entry.bytes;
+            break;
+        case EventType::kResIoWrite:
+            ++report->stats.res_io_writes;
+            report->stats.res_io_bytes += entry.bytes;
+            break;
+        case EventType::kResIoWait:
+            ++report->stats.res_io_waits;
+            break;
+        case EventType::kResIoWake:
+            ++report->stats.res_io_wakes;
+            report->stats.res_io_bytes += entry.bytes;
+            break;
         default:
             break;
     }
@@ -395,6 +498,22 @@ void AccumulateResourceEvent(const Event& event, ReplayReport* report,
     report->stats.resource_checksum = FnvStep(
         report->stats.resource_checksum,
         (static_cast<std::uint64_t>(entry.result) << 32U) ^ entry.waiters);
+    if (IsResourceEventV5(event.type)) {
+        // v5 事件把扩展字段也纳入校验和：fd / bytes / aux / value 任一错位
+        // 都会让 checksum 与录制端不一致。v4 事件不混入，保证旧文件 checksum
+        // 与 v4 工具逐位一致。
+        report->stats.res_v5_checksum =
+            FnvStep(report->stats.res_v5_checksum,
+                    static_cast<std::uint64_t>(
+                        static_cast<std::int64_t>(entry.fd)));
+        report->stats.res_v5_checksum =
+            FnvStep(report->stats.res_v5_checksum, entry.bytes);
+        report->stats.res_v5_checksum =
+            FnvStep(report->stats.res_v5_checksum, entry.aux);
+        report->stats.res_v5_checksum = FnvStep(
+            report->stats.res_v5_checksum,
+            static_cast<std::uint64_t>(entry.value));
+    }
     report->resources.push_back(entry);
 }
 
@@ -407,6 +526,7 @@ ReplayReport AnalyzeLoaded(const LoadedFile& loaded, const ReplayOptions& option
     report.stats.message_checksum = 1469598103934665603ULL;
     report.stats.select_checksum = 1469598103934665603ULL;
     report.stats.resource_checksum = 1469598103934665603ULL;
+    report.stats.res_v5_checksum = 1469598103934665603ULL;
 
     std::map<std::uint64_t, const Event*> parks;
     std::vector<const Event*> wakes;
@@ -591,6 +711,19 @@ ReplayReport AnalyzeLoaded(const LoadedFile& loaded, const ReplayOptions& option
             case EventType::kResPCNotify:
             case EventType::kResChannelSend:
             case EventType::kResChannelRecv:
+            case EventType::kResRwReadLock:
+            case EventType::kResRwWriteLock:
+            case EventType::kResRwUnlock:
+            case EventType::kResCvWait:
+            case EventType::kResCvNotify:
+            case EventType::kResCvNotifyAll:
+            case EventType::kResWgAdd:
+            case EventType::kResWgDone:
+            case EventType::kResWgWait:
+            case EventType::kResIoRead:
+            case EventType::kResIoWrite:
+            case EventType::kResIoWait:
+            case EventType::kResIoWake:
                 AccumulateResourceEvent(event, &report, &resource_state);
                 break;
             default:
@@ -1226,6 +1359,7 @@ ReplayReport Engine::Run(const ReplayReport& base) {
     // 显式写一份，便于调用方一次比较「录制 vs 重放」。
     report.stats.replayed_resource_checksum =
         base.stats.resource_checksum;
+    report.stats.res_v5_checksum = base.stats.res_v5_checksum;
     if (m_timers != nullptr) {
         // 与静态分析的初值保持一致（ReplayStats 默认 0 起）——
         // 两边同一条 fire 序列必须得到同一个 checksum。
@@ -1602,6 +1736,51 @@ std::string ReplayReport::Summary() const {
         }
         out += "\n";
     }
+    if (stats.resource_events > 0) {
+        out += "  resources: events=" + std::to_string(stats.resource_events) +
+               " mutex_locks=" + std::to_string(stats.res_mutex_locks) +
+               " mutex_unlocks=" + std::to_string(stats.res_mutex_unlocks) +
+               " pc_waits=" + std::to_string(stats.res_pc_waits) +
+               " pc_notifies=" + std::to_string(stats.res_pc_notifies) +
+               " channel_sends=" + std::to_string(stats.res_channel_sends) +
+               " channel_recvs=" + std::to_string(stats.res_channel_recvs) +
+               " checksum=" + std::to_string(stats.resource_checksum) + "\n";
+        if (stats.res_rw_reads != 0 || stats.res_rw_writes != 0 ||
+            stats.res_rw_unlocks != 0) {
+            out += "  rwmutex: reads=" + std::to_string(stats.res_rw_reads) +
+                   " writes=" + std::to_string(stats.res_rw_writes) +
+                   " unlocks=" + std::to_string(stats.res_rw_unlocks) +
+                   " read_blocks=" + std::to_string(stats.res_rw_read_blocks) +
+                   " write_blocks=" +
+                   std::to_string(stats.res_rw_write_blocks) + "\n";
+        }
+        if (stats.res_cv_waits != 0 || stats.res_cv_notifies != 0 ||
+            stats.res_cv_notify_alls != 0) {
+            out += "  condvar: waits=" + std::to_string(stats.res_cv_waits) +
+                   " notifies=" + std::to_string(stats.res_cv_notifies) +
+                   " notify_alls=" +
+                   std::to_string(stats.res_cv_notify_alls) +
+                   " woken=" + std::to_string(stats.res_cv_woken) + "\n";
+        }
+        if (stats.res_wg_adds != 0 || stats.res_wg_dones != 0 ||
+            stats.res_wg_waits != 0) {
+            out += "  waitgroup: adds=" + std::to_string(stats.res_wg_adds) +
+                   " dones=" + std::to_string(stats.res_wg_dones) +
+                   " waits=" + std::to_string(stats.res_wg_waits) + "\n";
+        }
+        if (stats.res_io_reads != 0 || stats.res_io_writes != 0 ||
+            stats.res_io_waits != 0 || stats.res_io_wakes != 0) {
+            out += "  io: reads=" + std::to_string(stats.res_io_reads) +
+                   " writes=" + std::to_string(stats.res_io_writes) +
+                   " waits=" + std::to_string(stats.res_io_waits) +
+                   " wakes=" + std::to_string(stats.res_io_wakes) +
+                   " bytes=" + std::to_string(stats.res_io_bytes) + "\n";
+        }
+        if (stats.res_v5_checksum != 0) {
+            out += "  res_v5_checksum=" +
+                   std::to_string(stats.res_v5_checksum) + "\n";
+        }
+    }
     if (virtual_ns > 0) {
         out += "  virtual_ns=" + std::to_string(virtual_ns);
         if (stopped_early) {
@@ -1715,6 +1894,29 @@ std::string ReplayReportJson(const ReplayReport& report) {
            std::to_string(report.stats.resource_lock_hold_ns);
     out += ",\"resource_order_anomalies\":" +
            std::to_string(report.stats.resource_order_anomalies);
+    out += ",\"res_rw_reads\":" + std::to_string(report.stats.res_rw_reads);
+    out += ",\"res_rw_writes\":" + std::to_string(report.stats.res_rw_writes);
+    out += ",\"res_rw_unlocks\":" + std::to_string(report.stats.res_rw_unlocks);
+    out += ",\"res_rw_read_blocks\":" +
+           std::to_string(report.stats.res_rw_read_blocks);
+    out += ",\"res_rw_write_blocks\":" +
+           std::to_string(report.stats.res_rw_write_blocks);
+    out += ",\"res_cv_waits\":" + std::to_string(report.stats.res_cv_waits);
+    out += ",\"res_cv_notifies\":" +
+           std::to_string(report.stats.res_cv_notifies);
+    out += ",\"res_cv_notify_alls\":" +
+           std::to_string(report.stats.res_cv_notify_alls);
+    out += ",\"res_cv_woken\":" + std::to_string(report.stats.res_cv_woken);
+    out += ",\"res_wg_adds\":" + std::to_string(report.stats.res_wg_adds);
+    out += ",\"res_wg_dones\":" + std::to_string(report.stats.res_wg_dones);
+    out += ",\"res_wg_waits\":" + std::to_string(report.stats.res_wg_waits);
+    out += ",\"res_io_reads\":" + std::to_string(report.stats.res_io_reads);
+    out += ",\"res_io_writes\":" + std::to_string(report.stats.res_io_writes);
+    out += ",\"res_io_waits\":" + std::to_string(report.stats.res_io_waits);
+    out += ",\"res_io_wakes\":" + std::to_string(report.stats.res_io_wakes);
+    out += ",\"res_io_bytes\":" + std::to_string(report.stats.res_io_bytes);
+    out += ",\"res_v5_checksum\":" +
+           std::to_string(report.stats.res_v5_checksum);
     out += ",\"message_checksum\":" + std::to_string(report.stats.message_checksum);
     out += ",\"replayed_message_checksum\":" +
            std::to_string(report.stats.replayed_message_checksum);
@@ -1811,6 +2013,10 @@ std::string ReplayReportJson(const ReplayReport& report) {
             out += ",\"address\":" + std::to_string(entry.address);
             out += ",\"waiters\":" + std::to_string(entry.waiters);
             out += ",\"hold_ns\":" + std::to_string(entry.hold_ns);
+            out += ",\"fd\":" + std::to_string(entry.fd);
+            out += ",\"bytes\":" + std::to_string(entry.bytes);
+            out += ",\"aux\":" + std::to_string(entry.aux);
+            out += ",\"value\":" + std::to_string(entry.value);
             out += "}";
         }
         out += "]";

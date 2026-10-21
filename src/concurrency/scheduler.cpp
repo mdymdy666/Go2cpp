@@ -1041,7 +1041,9 @@ void Task::run() {
  *
  * ## 关键不变式
  *
- * - 注册表条目 = 一个尚未终态的 G；G 进终态时移除并 `notify_terminal()`；
+ * - 注册表条目 = 一个尚未终态的 G，或**持锁退出**的终态 G（Doctor
+ *   force-unlock 判定 owner-gone 的证据）；其余终态 G 由 worker 循环按
+ *   节拍轮转回收，不再随历史完成任务数增长；
  * - `incoming` 里的 G 一定**没有 P**（`processor == kInvalidPId`）；
  * - `blocking_workers` 归零前 sysmon 不会再申请补充 M；
  * - `shutdown` 期间 admission 关闭，`enqueue` 失败后调用方必须 `cancel()`。
@@ -1608,42 +1610,87 @@ public:
         }
     }
 
+    // 终态 G 是否可以从注册表摘除。持锁退出的终态 G 是 Doctor
+    // force-unlock 判定 owner-gone 的唯一证据（TaskTerminal 按 gid 查注册
+    // 表），必须保留；这类 G 的数量等于泄漏的 sync::Mutex 数量，不随历史
+    // 完成任务数增长，因此不会重新引入 D2 的线性内存增长。
+    static bool reclaimable_terminal(
+        const std::shared_ptr<Task>& task) noexcept {
+        if (!task) {
+            return true;
+        }
+        return task->terminal() && task->held_mutex_count() == 0U;
+    }
+
+    // 把一条终态 G 追加到调用方存储；容量不足时先扩容，扩容失败返回
+    // false，调用方保留该条目（回收失败是安全的，下个节拍再试）。
+    static bool append_reclaimed(
+        std::vector<std::shared_ptr<Task>>& deferred_destruction,
+        std::shared_ptr<Task>& task) noexcept {
+        if (deferred_destruction.size() == deferred_destruction.capacity()) {
+            const std::size_t target = deferred_destruction.capacity() == 0
+                                           ? std::size_t{32}
+                                           : deferred_destruction.capacity() * 2;
+            try {
+                deferred_destruction.reserve(target);
+            } catch (...) {
+                return false;
+            }
+        }
+        // 容量已保证：shared_ptr 的移动构造不会抛异常。
+        deferred_destruction.emplace_back(std::move(task));
+        return true;
+    }
+
+    // 回收单个注册表条带。常规 worker 循环按节拍轮转调用它，单次扫描量
+    // 与「存活 G 总数 / 16」成正比；shutdown/cancel 路径用下方全表版本。
+    // 调用方不要求持有 Impl::mutex：条带内容只由 registry_mutexes 保护，
+    // 锁层次（Impl::mutex -> 条带锁）保持不变。
+    void collect_terminal_stripe_locked(
+        std::size_t stripe,
+        std::vector<std::shared_ptr<Task>>& deferred_destruction) noexcept {
+        auto& task_registry = task_registries[stripe];
+        std::lock_guard<std::mutex> registry_lock(registry_mutexes[stripe]);
+        // 单次稳定压缩是 O(n)。逐项 vector::erase 会把大批任务完成时的
+        // 回收变成 O(n²)。
+        auto output = task_registry.begin();
+        auto it = task_registry.begin();
+        for (; it != task_registry.end(); ++it) {
+            if (!reclaimable_terminal(*it)) {
+                if (output != it) {
+                    *output = std::move(*it);
+                }
+                ++output;
+                continue;
+            }
+            if (*it && !append_reclaimed(deferred_destruction, *it)) {
+                // 分配失败：保留当前及剩余条目，下个节拍再试。
+                break;
+            }
+        }
+        if (it != task_registry.end()) {
+            // 中途退出时把尚未处理的条目原样前移，避免在注册表里留下
+            // 已回收位置的空洞。
+            for (; it != task_registry.end(); ++it) {
+                if (output != it) {
+                    *output = std::move(*it);
+                }
+                ++output;
+            }
+        }
+        task_registry.erase(output, task_registry.end());
+    }
+
     void collect_terminal_locked(
         std::vector<std::shared_ptr<Task>>& deferred_destruction) noexcept {
         // The registry strongly owns every non-terminal G, including a Fiber
         // parked outside a run queue. This prevents destruction of a suspended
         // stack. Move terminal entries to caller-owned storage so arbitrary
         // user captures are never destroyed while the scheduler lock is held.
+        // 本函数只依赖条带锁；shutdown 路径由调用方额外持有 Impl::mutex。
         for (std::size_t stripe = 0; stripe < kRegistryStripeCount;
              ++stripe) {
-            auto& task_registry = task_registries[stripe];
-            std::lock_guard<std::mutex> registry_lock(
-                registry_mutexes[stripe]);
-            try {
-                deferred_destruction.reserve(deferred_destruction.size() +
-                                             task_registry.size());
-            } catch (...) {
-                // Retaining a terminal entry is safe. A later worker/shutdown
-                // pass can reclaim it when allocation succeeds.
-                continue;
-            }
-            // 单次稳定压缩是 O(n)。逐项 vector::erase 会把大批任务完成时的
-            // 回收变成 O(n²)，且整段移动发生在调度器总锁内。
-            auto output = task_registry.begin();
-            for (auto it = task_registry.begin(); it != task_registry.end();
-                 ++it) {
-                if (!*it || (*it)->terminal()) {
-                    if (*it) {
-                        deferred_destruction.emplace_back(std::move(*it));
-                    }
-                } else {
-                    if (output != it) {
-                        *output = std::move(*it);
-                    }
-                    ++output;
-                }
-            }
-            task_registry.erase(output, task_registry.end());
+            collect_terminal_stripe_locked(stripe, deferred_destruction);
         }
     }
 
@@ -1898,6 +1945,8 @@ public:
     std::atomic<std::size_t> blocking_workers{0};
     std::atomic<std::size_t> next_processor{0};
     std::atomic<std::uint64_t> enqueue_maintenance{0};
+    // 常规回收的轮转游标：每次触发只压缩一个注册表条带。
+    std::atomic<std::size_t> next_terminal_collect_stripe{0};
     std::atomic<std::uint64_t> metric_task_runs{0};
     std::atomic<std::uint64_t> metric_task_completions{0};
     std::atomic<std::uint64_t> metric_fiber_resume_ns{0};
@@ -3741,6 +3790,9 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         m_impl->processors[machine->processor % m_impl->processors.size()];
     bool retired = false;
     std::size_t maintenance_budget = 0;
+    // 距上次终态回收又完成了多少个终态 G。只有进入终态的 G 才会增加
+    // 注册表回收压力，yield/park 不计数。
+    std::size_t terminal_since_collect = 0;
 
     // B1：dequeue 的 claim 失败收尾。旧实现无条件 clear_queued()，会把
     // 「pop 之后、clear 之前」新发布的 reservation 一起清掉，制造
@@ -4146,6 +4198,11 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             // Cancelled/Yielded/Parked），这里只负责记账与后续回收。
             task->run();
             const auto task_state_after_run = task->state();
+            if (task_state_after_run == GState::kDead ||
+                task_state_after_run == GState::kCancelled ||
+                task_state_after_run == GState::kFailed) {
+                ++terminal_since_collect;
+            }
             const auto task_event_type =
                 task_state_after_run == GState::kDead
                     ? SchedulerEventType::kTaskCompleted
@@ -4243,11 +4300,28 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             std::vector<std::shared_ptr<Task>> deferred_destruction;
             const bool draining =
                 m_impl->draining.load(std::memory_order_acquire);
-            if (draining || maintenance_budget >= 64) {
+            const std::size_t collect_interval =
+                m_impl->config.terminal_collect_interval;
+            if (draining) {
+                // 收尾路径必须全表回收，并配合 finish_draining_locked()
+                // 判断注册表是否已全部终态。
                 std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
                 m_impl->collect_terminal_locked(deferred_destruction);
                 (void)m_impl->finish_draining_locked();
-                maintenance_budget = 0;
+                terminal_since_collect = 0;
+            } else if (collect_interval != 0 &&
+                       terminal_since_collect >= collect_interval) {
+                // 常规路径按节拍轮转压缩一个条带：单次扫描量是存活 G 总数
+                // 的 1/16，约 16 个节拍覆盖全表；终态 G 在表内的滞留上限
+                // 是 collect_interval * 16，不随历史完成任务数增长。
+                // 回收只拿条带锁，不争用 admission 锁。
+                const std::size_t stripe =
+                    m_impl->next_terminal_collect_stripe.fetch_add(
+                        1, std::memory_order_relaxed) &
+                    (Scheduler::Impl::kRegistryStripeCount - 1);
+                m_impl->collect_terminal_stripe_locked(stripe,
+                                                       deferred_destruction);
+                terminal_since_collect = 0;
             }
             if (draining) {
                 m_impl->notify_all_workers();
@@ -4287,6 +4361,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
                 m_impl->collect_terminal_locked(deferred_destruction);
             }
+            terminal_since_collect = 0;
             for (auto& retained_task : deferred_destruction) {
                 if (retained_task) {
                     auto abandoned_function =

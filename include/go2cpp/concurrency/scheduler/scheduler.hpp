@@ -260,6 +260,11 @@ struct SchedulerConfig {
     // 可选的生命周期观察者。观察者只在事件发生后被调用，不改变默认
     // GMP 调度策略；空指针表示关闭观测，适合性能敏感部署。
     SchedulerObserverPtr observer;
+    // 常规 worker 循环回收终态 G 的节拍：每完成这么多个终态 G，触发一次
+    // 注册表分片轮转回收。单次只压缩一个条带（共 16 个），约 16 个节拍
+    // 覆盖全表；回收只持有条带锁，不进入全局 admission 锁。
+    // 0 表示关闭周期回收（仅 shutdown/cancel 收尾路径回收）。默认 256。
+    std::size_t terminal_collect_interval = 256;
 };
 
 using TaskClassId = std::uint64_t;

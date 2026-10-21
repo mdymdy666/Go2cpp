@@ -175,6 +175,10 @@ enum class SchedEventCode : std::uint16_t {
     kIoWait = 40,            ///< IOManager 注册等待：gid=G，arg2=fd
     kIoWake = 41,            ///< IOManager 唤醒：gid=G，arg2=fd
     kIoWakeBatch = 42,       ///< IOManager 批量唤醒：arg2=批大小
+    // v5（回放资源事件）：IO 读/写请求。value=fd，arg2=请求字节数（就绪
+    // 等待不搬运数据时为 0），result=ok/blocked/...
+    kIoRead = 43,            ///< IOManager 读方向等待请求：gid=G，value=fd
+    kIoWrite = 44,           ///< IOManager 写方向等待请求：gid=G，value=fd
 
     kSchedulerStart = 50,    ///< 调度器启动：arg2=P 数
     kSchedulerStop = 51,     ///< 调度器停止
@@ -246,6 +250,8 @@ enum class SchedEventCode : std::uint16_t {
     kPCWait = 125,             ///< ParkingCondition 受管等待：gid=G（采样）
     kPCNotify = 126,           ///< notify_one 唤醒：gid=被唤醒 G（0=native）
     kPCNotifyAll = 127,        ///< notify_all：arg2=唤醒节点数
+    kCvNotifyAll = 128,        ///< ConditionVariable::NotifyAll 广播：
+                               ///< gid=actor，arg2=本次广播的候选等待者数
 
     // 130~139：timer 回调投递。kTimerFire 是服务端触发；本组记录「回调被交给
     // 执行器、进而变成可执行 G」的那一步。
@@ -258,6 +264,8 @@ enum class SchedEventCode : std::uint16_t {
                          ///< arg3=PrimitiveReasonCode，stack_id/chain_id 见字段
     kWaitGroupWait = 137, ///< WaitGroup::Wait 阻塞：resource_id，gid=actor
     kWaitGroupDone = 138, ///< WaitGroup::Done 计数变化：resource_id，arg2=新计数
+    kWaitGroupAdd = 139,  ///< WaitGroup::Add 正增量：resource_id，
+                          ///< arg2=新计数，value=本次 delta（v5）
 };
 
 /// 事件码的稳定名字；未知值返回 "kUnknown"。
@@ -308,6 +316,8 @@ inline DebugCategory DebugCategoryOf(SchedEventCode code) noexcept {
         case SchedEventCode::kIoWait:
         case SchedEventCode::kIoWake:
         case SchedEventCode::kIoWakeBatch:
+        case SchedEventCode::kIoRead:
+        case SchedEventCode::kIoWrite:
             return DebugCategory::kIo;
         // ---- 生命周期 ----
         case SchedEventCode::kSchedulerStart:
@@ -343,8 +353,10 @@ inline DebugCategory DebugCategoryOf(SchedEventCode code) noexcept {
         case SchedEventCode::kPCWait:
         case SchedEventCode::kPCNotify:
         case SchedEventCode::kPCNotifyAll:
+        case SchedEventCode::kCvNotifyAll:
         case SchedEventCode::kWaitGroupWait:
         case SchedEventCode::kWaitGroupDone:
+        case SchedEventCode::kWaitGroupAdd:
             return DebugCategory::kPrimitives;
         // ---- timer ----
         case SchedEventCode::kTimerArm:

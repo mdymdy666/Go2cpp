@@ -10,6 +10,7 @@ void run_context_tests();
 void run_channel_tests();
 void run_scheduler_tests();
 void run_scheduler_stress_tests();
+void run_terminal_reclaim_tests();
 void run_dynamic_scheduler_tests();
 void run_fiber_tests();
 void run_fiber_growable_stack_tests();
@@ -46,6 +47,7 @@ void run_debug_signal_dump_tests();
 void run_debug_dump_tests();
 void run_debug_config_tests();
 void run_resource_replay_tests();
+void run_resources_v5_tests();
 void run_timer_debug_tests();
 void run_timer_replay_tests();
 #if defined(GO2CPP_DIAGNOSTIC) && GO2CPP_DIAGNOSTIC
@@ -84,6 +86,7 @@ int main() {
     if (selected("channel")) run_channel_tests();
     if (selected("scheduler")) run_scheduler_tests();
     if (selected("scheduler_stress")) run_scheduler_stress_tests();
+    if (selected("terminal_reclaim")) run_terminal_reclaim_tests();
     if (selected("dynamic")) run_dynamic_scheduler_tests();
     if (selected("fiber")) run_fiber_tests();
     if (selected("fiber_growable")) run_fiber_growable_stack_tests();
@@ -119,6 +122,7 @@ int main() {
     if (selected("debug_dump")) run_debug_dump_tests();
     if (selected("debug_config")) run_debug_config_tests();
     if (selected("resource_replay")) run_resource_replay_tests();
+    if (selected("resources_v5")) run_resources_v5_tests();
     if (selected("timer_debug")) run_timer_debug_tests();
     if (selected("timer_replay")) run_timer_replay_tests();
 #if defined(GO2CPP_DIAGNOSTIC) && GO2CPP_DIAGNOSTIC

@@ -18,10 +18,14 @@ namespace go2cpp::replay {
 namespace {
 
 #if defined(GO2CPP_REPLAY_LINK_RUNTIME) && GO2CPP_REPLAY_LINK_RUNTIME
-/// 资源事件 → v4 事件类型；不支持的事件码返回 false（不录制）。
-bool MapResourceEvent(go2cpp::debug::SchedEventCode code,
-                      EventType* type) {
+/// 资源事件 → 事件类型；不支持的事件码返回 false（不录制）。
+/// `aux` 输出格式层的固定标志位（方向/广播），与录制点提供的 aux 合并。
+bool MapResourceEvent(go2cpp::debug::SchedEventCode code, EventType* type,
+                      std::uint64_t* aux) {
     using go2cpp::debug::SchedEventCode;
+    const auto flag = [aux](ResourceAuxFlags bit) {
+        *aux |= static_cast<std::uint64_t>(bit);
+    };
     switch (code) {
         case SchedEventCode::kMutexLock:
         case SchedEventCode::kMutexFastLock:
@@ -45,6 +49,59 @@ bool MapResourceEvent(go2cpp::debug::SchedEventCode code,
         case SchedEventCode::kChannelRecvOk:
             *type = EventType::kResChannelRecv;
             return true;
+        // ---- v5：RWMutex ----
+        case SchedEventCode::kRwLockRead:
+            *type = EventType::kResRwReadLock;
+            flag(ResourceAuxFlags::kRead);
+            return true;
+        case SchedEventCode::kRwUnlockRead:
+            *type = EventType::kResRwUnlock;
+            flag(ResourceAuxFlags::kRead);
+            return true;
+        case SchedEventCode::kRwLockWrite:
+            *type = EventType::kResRwWriteLock;
+            flag(ResourceAuxFlags::kWrite);
+            return true;
+        case SchedEventCode::kRwUnlockWrite:
+            *type = EventType::kResRwUnlock;
+            flag(ResourceAuxFlags::kWrite);
+            return true;
+        // ---- v5：ConditionVariable ----
+        case SchedEventCode::kCvWait:
+            *type = EventType::kResCvWait;
+            return true;
+        case SchedEventCode::kCvNotify:
+            *type = EventType::kResCvNotify;
+            return true;
+        case SchedEventCode::kCvNotifyAll:
+            *type = EventType::kResCvNotifyAll;
+            flag(ResourceAuxFlags::kNotifyAll);
+            return true;
+        // ---- v5：WaitGroup ----
+        case SchedEventCode::kWaitGroupAdd:
+            *type = EventType::kResWgAdd;
+            return true;
+        case SchedEventCode::kWaitGroupDone:
+            *type = EventType::kResWgDone;
+            return true;
+        case SchedEventCode::kWaitGroupWait:
+            *type = EventType::kResWgWait;
+            return true;
+        // ---- v5：IO ----
+        case SchedEventCode::kIoRead:
+            *type = EventType::kResIoRead;
+            flag(ResourceAuxFlags::kRead);
+            return true;
+        case SchedEventCode::kIoWrite:
+            *type = EventType::kResIoWrite;
+            flag(ResourceAuxFlags::kWrite);
+            return true;
+        case SchedEventCode::kIoWait:
+            *type = EventType::kResIoWait;
+            return true;
+        case SchedEventCode::kIoWake:
+            *type = EventType::kResIoWake;
+            return true;
         default:
             return false;
     }
@@ -58,7 +115,8 @@ void ResourceSinkThunk(void* user,
         return;
     }
     EventType type = EventType::kNote;
-    if (!MapResourceEvent(event.code, &type)) {
+    std::uint64_t aux = event.aux;
+    if (!MapResourceEvent(event.code, &type, &aux)) {
         return;
     }
     std::uint64_t address = 0;
@@ -69,8 +127,8 @@ void ResourceSinkThunk(void* user,
     }
     recorder->Write(MakeResourceEvent(
         type, event.resource_id, event.actor_gid, event.target_gid,
-        static_cast<std::uint32_t>(event.result), address,
-        event.waiters));
+        static_cast<std::uint32_t>(event.result), address, event.waiters,
+        event.fd, event.bytes, aux, static_cast<std::int64_t>(event.value)));
 }
 #endif  // GO2CPP_REPLAY_LINK_RUNTIME
 
@@ -189,7 +247,11 @@ Event MakeResourceEvent(EventType type, std::uint64_t resource_id,
                         std::uint64_t target_gid,
                         std::uint32_t resource_result,
                         std::uint64_t address,
-                        std::uint32_t waiters) {
+                        std::uint32_t waiters,
+                        std::int32_t res_fd,
+                        std::uint32_t res_bytes,
+                        std::uint64_t res_aux,
+                        std::int64_t value) {
     Event event;
     event.type = type;
     // gid 字段与 actor_gid 保持一致：旧工具只认识 gid，也能正确分组。
@@ -201,6 +263,10 @@ Event MakeResourceEvent(EventType type, std::uint64_t resource_id,
     event.resource_result = resource_result;
     event.address = address;
     event.waiters = waiters;
+    event.res_fd = res_fd;
+    event.res_bytes = res_bytes;
+    event.res_aux = res_aux;
+    event.value = value;
     return event;
 }
 

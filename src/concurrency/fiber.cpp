@@ -63,6 +63,7 @@
 #include <cstring>
 #include <exception>
 #include <iterator>
+#include <list>
 #include <stdexcept>
 #include <limits>
 #include <mutex>
@@ -943,8 +944,20 @@ void growable_stack_segv_handler(int sig, siginfo_t* info,
 // 持有父记录，因此父对象结束后仍可生成一致的墓碑帧、传播取消状态；
 // 真正的 fcontext 恢复仍要求父 Fiber 对象存活。错误生命周期会进入 Failed
 // 放弃路径，不能把已经失效的父栈当作可恢复上下文。
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+/// 删除某个 Fiber 的调试元数据（定义见 FiberMetaMap 之后）。
+void EraseFiberDebugMeta(std::uint64_t fiber_id) noexcept;
+#endif
+
 struct FiberRecord {
     explicit FiberRecord(std::uint64_t fiber_id) : id(fiber_id) {}
+    ~FiberRecord() {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        // record 是 Fiber 调试元数据的最后归属：最后一个 shared_ptr 释放
+        // 时同步删除 FiberMetaMap 条目，避免每个 fiber id 永久滞留。
+        EraseFiberDebugMeta(id);
+#endif
+    }
 
     const std::uint64_t id;
     std::shared_ptr<FiberRecord> parent;
@@ -1007,15 +1020,52 @@ struct FiberDebugMeta {
     bool stack_known{false};
 };
 
+/// 元数据表容量上限。正常路径由 `~FiberRecord()` / `reset_for_scheduler()`
+/// 即时删除；上限只是兜底，防止任何遗漏路径让表随历史 fiber 数增长。
+constexpr std::size_t kMaxFiberMetaEntries = 4096;
+/// 触顶时一次淘汰的最旧条目数（批量删除，避免每个新 fiber 都淘汰一次）。
+constexpr std::size_t kFiberMetaEvictBatch = 512;
+
+/// 元数据表：entries 是查询表；order/order_pos 维护插入顺序，容量兜底时
+/// 按「最旧优先」批量淘汰。三者由 FiberMetaMutex 共同保护。
+struct FiberMetaTable {
+    std::unordered_map<std::uint64_t, FiberDebugMeta> entries;
+    std::list<std::uint64_t> order;
+    std::unordered_map<std::uint64_t, std::list<std::uint64_t>::iterator>
+        order_pos;
+};
+
 std::mutex& FiberMetaMutex() {
     static std::mutex* mutex = new std::mutex();
     return *mutex;
 }
 
+FiberMetaTable& FiberMetaTableRef() {
+    static auto* table = new FiberMetaTable();
+    return *table;
+}
+
 std::unordered_map<std::uint64_t, FiberDebugMeta>& FiberMetaMap() {
-    static auto* map =
-        new std::unordered_map<std::uint64_t, FiberDebugMeta>();
-    return *map;
+    return FiberMetaTableRef().entries;
+}
+
+/// 删除某个 fiber id 的元数据（O(1)）；重复调用安全。
+void EraseFiberDebugMeta(std::uint64_t fiber_id) noexcept {
+    if (fiber_id == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(FiberMetaMutex());
+    FiberMetaTable& table = FiberMetaTableRef();
+    const auto found = table.entries.find(fiber_id);
+    if (found == table.entries.end()) {
+        return;
+    }
+    const auto position = table.order_pos.find(fiber_id);
+    if (position != table.order_pos.end()) {
+        table.order.erase(position->second);
+        table.order_pos.erase(position);
+    }
+    table.entries.erase(found);
 }
 
 /// 读取 record 元数据并发布（record 由父链共享，墓碑也可读）。
@@ -1029,7 +1079,34 @@ void PublishFiberDebugMeta(FiberRecord& record) {
         meta.stack_known = record.stack_known;
     }
     std::lock_guard<std::mutex> lock(FiberMetaMutex());
-    FiberMetaMap()[record.id] = std::move(meta);
+    FiberMetaTable& table = FiberMetaTableRef();
+    const auto found = table.entries.find(record.id);
+    if (found != table.entries.end()) {
+        found->second = std::move(meta);
+        return;
+    }
+    if (table.entries.size() >= kMaxFiberMetaEntries) {
+        // 兜底淘汰：按插入顺序删除最旧的一批。只清理元数据，不影响
+        // FiberRecord / 链样本本身（诊断采样本来就是 best-effort）。
+        for (std::size_t index = 0;
+             index < kFiberMetaEvictBatch && !table.order.empty(); ++index) {
+            const std::uint64_t victim = table.order.front();
+            table.order.pop_front();
+            table.order_pos.erase(victim);
+            table.entries.erase(victim);
+        }
+    }
+    const auto inserted = table.entries.emplace(record.id, std::move(meta));
+    if (!inserted.second) {
+        return;
+    }
+    table.order.push_back(record.id);
+    try {
+        table.order_pos.emplace(record.id, std::prev(table.order.end()));
+    } catch (...) {
+        // 位置索引只是兜底淘汰的优化；失败时该条目仍由 ~FiberRecord
+        // 删除，不会永久驻留。
+    }
 }
 #endif  // GO2CPP_DEBUG_DUMP
 
@@ -1070,6 +1147,11 @@ struct Fiber::Impl {
         auto next_record = std::make_shared<FiberRecord>(
             s_next_fiber_id.fetch_add(1, std::memory_order_relaxed));
 
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        // 旧 fiber id 不再对应任何可观测执行流；立即删除，而不是等
+        // Fiber 对象析构或 bin 淘汰（每个任务复用 Fiber 时会走这里）。
+        EraseFiberDebugMeta(m_record->id);
+#endif
         m_function = std::move(function);
         m_id = next_record->id;
         m_record = std::move(next_record);
@@ -1141,6 +1223,10 @@ struct Fiber::Impl {
         m_scheduler_propagate.store(false, std::memory_order_release);
         m_record->state.store(FiberState::Failed, std::memory_order_release);
         fiber_local::detail::Cleanup(m_owner);
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        // 放弃路径不会复用该 record；清掉元数据避免长期滞留。
+        EraseFiberDebugMeta(m_record->id);
+#endif
     }
 
     ~Impl() noexcept {
@@ -1210,6 +1296,11 @@ struct Fiber::Impl {
             // 取得独占 claim 后理论上不可达；保守地 fail-fast，避免 UAF。
             std::terminate();
         }
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+        // 提前清理调试元数据；若仍有父链样本持有该 record，下一次
+        // context_snapshot() 会按需重新发布。
+        EraseFiberDebugMeta(m_record->id);
+#endif
 #if defined(GO2CPP_FIBER_TSAN)
         __tsan_destroy_fiber(m_tsan_fiber);
 #endif
@@ -3073,7 +3164,10 @@ void ResetFiberChains() noexcept {
     table.dropped.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> meta_lock(FiberMetaMutex());
-        FiberMetaMap().clear();
+        FiberMetaTable& table = FiberMetaTableRef();
+        table.entries.clear();
+        table.order.clear();
+        table.order_pos.clear();
     }
 #endif
 }

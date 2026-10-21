@@ -100,7 +100,7 @@ struct TimelineEntry {
 };
 
 /**
- * @brief 一条资源事件（v4：锁/条件变量/channel）。
+ * @brief 一条资源事件（v4：锁/条件变量/channel；v5：RW/CV/WG/IO）。
  *
  * 回放端**只读重演**：不重新竞争，字段全部来自记录，因此序列与
  * owner 完全可复现。`hold_ns` 只在 lock 条目上由配对的 unlock 回填
@@ -117,6 +117,11 @@ struct ResourceTimelineEntry {
     std::uint64_t address{0};
     std::uint32_t waiters{0};
     std::uint64_t hold_ns{0};  ///< 持锁时长（仅 unlock 前的 lock 条目）
+    // ---- v5 追加（v4 文件保持默认值）----
+    std::int32_t fd{-1};       ///< IO 的 fd；非 IO 事件为 -1
+    std::uint32_t bytes{0};    ///< IO 请求/完成的字节数
+    std::uint64_t aux{0};      ///< 标志位（ResourceAuxFlags）+ 附加计数
+    std::int64_t value{0};     ///< 主数值（WaitGroup 计数 / CV 广播数等）
 };
 
 /// 检查点（分片/二分定位「出事点」用）。
@@ -173,6 +178,26 @@ struct ReplayStats {
     /// 事件之前」。回放只读重演，不因此判记录损坏；这里计数供
     /// 诊断参考。
     std::uint64_t resource_order_anomalies{0};
+    // v5：RWMutex / ConditionVariable / WaitGroup / IO 统计。
+    std::uint64_t res_rw_reads{0};        ///< RWMutex 读锁成功次数
+    std::uint64_t res_rw_writes{0};       ///< RWMutex 写锁成功次数
+    std::uint64_t res_rw_unlocks{0};      ///< RWMutex 解锁次数（读+写）
+    std::uint64_t res_rw_read_blocks{0};  ///< 读锁排队次数
+    std::uint64_t res_rw_write_blocks{0}; ///< 写锁排队次数
+    std::uint64_t res_cv_waits{0};        ///< CV 等待次数（含被取消）
+    std::uint64_t res_cv_notifies{0};     ///< CV NotifyOne 次数
+    std::uint64_t res_cv_notify_alls{0};  ///< CV NotifyAll 次数
+    std::uint64_t res_cv_woken{0};        ///< 被唤醒的等待者总数
+    std::uint64_t res_wg_adds{0};         ///< WaitGroup Add 次数
+    std::uint64_t res_wg_dones{0};        ///< WaitGroup Done 次数
+    std::uint64_t res_wg_waits{0};        ///< WaitGroup Wait 次数
+    std::uint64_t res_io_reads{0};        ///< IO 读方向请求次数
+    std::uint64_t res_io_writes{0};       ///< IO 写方向请求次数
+    std::uint64_t res_io_waits{0};        ///< IO 进入等待次数
+    std::uint64_t res_io_wakes{0};        ///< IO 唤醒次数
+    std::uint64_t res_io_bytes{0};        ///< IO 字节数合计（仅记录带 bytes 的事件）
+    /// RW/CV/WG/IO 的序列校验和（与 v4 的 resource_checksum 分开累计）。
+    std::uint64_t res_v5_checksum{0};
     /// 记录中的全局接收序列校验和（FNV-1a 64，按事件 seq 顺序）。
     std::uint64_t message_checksum{0};
     /// 重放实际产生的接收序列校验和（按 fiber 执行顺序）。

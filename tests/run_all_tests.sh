@@ -4,7 +4,7 @@
 # 顺序：
 #   1) ctest          —— 构建目录（默认 build-work）全部用例；
 #   2) enhanced       —— 五能力增强矩阵（tests/enhanced/run_all.sh）；
-#   3) scenarios      —— ctx_cancel_rollback / deadlock_routes / full_trace；
+#   3) scenarios      —— ctest 已注册（仅增强构建）；ctest 未覆盖时独立跑兜底；
 #   4) tools          —— 兜底：migration / cli / replay 已注册进 ctest；
 #                        ctest 已跑过同一构建目录时默认跳过
 #                        （RUN_TOOLS_STANDALONE=1 强制独立跑）。
@@ -17,6 +17,7 @@
 # 环境变量：
 #   BUILD_DIR       ctest 构建目录（默认 build-work → build-enhanced）
 #   SCENARIO_BUILD  场景/demo 构建目录（默认 build-enhanced → build-doctor-full）
+#   RUN_SCENARIOS_STANDALONE  1 = 即使 ctest 已覆盖也独立跑场景
 #   CLI_BIN         go2cpp-cli 路径（默认随场景构建目录解析）
 #   MIG_DIR         tools/migration 构建目录（默认 build-migration）
 #   REPLAY_DIR      tools/replay 构建目录（默认 build-replay）
@@ -146,8 +147,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3) 场景测试
+# 3) 场景测试（ctest 兜底）
 # ---------------------------------------------------------------------------
+# 三条场景已注册进 ctest（仅增强构建）：scenario-ctx-cancel /
+# scenario-deadlock-routes / scenario-full-trace。ctest 步骤若已跑过包含
+# 这三条的构建目录（例如 BUILD_DIR=build-enhanced），本节默认只记 SKIP
+# 标注覆盖关系，避免同一场景跑两遍；RUN_SCENARIOS_STANDALONE=1 强制独立跑。
 SCENARIO_BUILD="$(pick "${SCENARIO_BUILD_DIR:-}" "$ROOT/build-enhanced" \
     "$ROOT/build-doctor-full")" || true
 CLI_BIN_RESOLVED="$(pick "${CLI_BIN:-}" \
@@ -155,32 +160,37 @@ CLI_BIN_RESOLVED="$(pick "${CLI_BIN:-}" \
     "$ROOT/build-cli/tools/cli/go2cpp-cli" \
     "$ROOT/build-doctor-full/tools/cli/go2cpp-cli")" || true
 
-if [ -x "$SCENARIO_BUILD/go2cpp_ctx_cancel_rollback" ]; then
-    run_step "scenario-ctx-cancel" 600 \
-        bash "$ROOT/tests/scenarios/ctx_cancel_rollback/run_ctx_cancel_rollback.sh" \
-        "$SCENARIO_BUILD"
-else
+SCENARIOS_IN_CTEST=0
+if [ -f "$CTEST_BUILD/CTestTestfile.cmake" ] &&
+    grep -q "scenario-deadlock-routes" "$CTEST_BUILD/CTestTestfile.cmake" 2>/dev/null; then
+    SCENARIOS_IN_CTEST=1
+fi
+
+run_scenario() { # <name> <timeout> <包装脚本>
+    if [ -d "$SCENARIO_BUILD" ]; then
+        run_step "$1" "$2" env GO2CPP_SCENARIO_BUILD_DIR="$SCENARIO_BUILD" \
+            bash "$3"
+    else
+        run_step "$1" "$2" bash "$3"
+    fi
+}
+
+if [ "$SCENARIOS_IN_CTEST" -eq 1 ] && [ "${RUN_SCENARIOS_STANDALONE:-0}" != "1" ]; then
     mark_skip "scenario-ctx-cancel" 0 \
-        "缺少 $SCENARIO_BUILD/go2cpp_ctx_cancel_rollback（-DGO2CPP_DIAGNOSTIC=ON）"
-fi
-
-if [ -x "$SCENARIO_BUILD/go2cpp_deadlock_routes" ] && [ -x "$CLI_BIN_RESOLVED" ]; then
-    run_step "scenario-deadlock-routes" 900 \
-        bash "$ROOT/tests/scenarios/deadlock_routes/run_deadlock_scenario.sh" \
-        "$SCENARIO_BUILD" --clients 120 --load-ms 600
-else
+        "已由 ctest scenario-ctx-cancel 覆盖（RUN_SCENARIOS_STANDALONE=1 强制独立跑）"
     mark_skip "scenario-deadlock-routes" 0 \
-        "缺少 deadlock_routes 或 CLI（$SCENARIO_BUILD / $CLI_BIN_RESOLVED）"
-fi
-
-if [ -x "$SCENARIO_BUILD/go2cpp_full_trace_scenario" ] && [ -x "$CLI_BIN_RESOLVED" ]; then
-    run_step "scenario-full-trace" 600 \
-        env SCENARIO="$SCENARIO_BUILD/go2cpp_full_trace_scenario" \
-        CLI="$CLI_BIN_RESOLVED" OUT="$OUT_DIR/full-trace" \
-        bash "$ROOT/tests/scenarios/full_trace/run_full_trace.sh" 10 8
-else
+        "已由 ctest scenario-deadlock-routes 覆盖"
     mark_skip "scenario-full-trace" 0 \
-        "缺少 full_trace 或 CLI（$SCENARIO_BUILD）"
+        "已由 ctest scenario-full-trace 覆盖"
+else
+    # 包装脚本自己解析构建目录（GO2CPP_SCENARIO_BUILD_DIR > 当前构建 >
+    # build-doctor-full > ...）；缺依赖时 exit 77 → 本入口记为 SKIP。
+    run_scenario "scenario-ctx-cancel" 300 \
+        "$ROOT/tests/scenarios/run_ctx_cancel_ctest.sh"
+    run_scenario "scenario-deadlock-routes" 600 \
+        "$ROOT/tests/scenarios/run_deadlock_routes_ctest.sh"
+    run_scenario "scenario-full-trace" 300 \
+        "$ROOT/tests/scenarios/run_full_trace_ctest.sh"
 fi
 
 # ---------------------------------------------------------------------------

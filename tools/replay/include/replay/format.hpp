@@ -60,9 +60,10 @@ namespace go2cpp::replay {
 
 /// 文件魔数（8 字节，含结尾 NUL）。
 inline constexpr char kMagic[8] = {'G', '2', 'C', 'R', 'P', 'L', 'Y', '\0'};
-/// 写端版本：v4 在 v3 基础上新增资源事件（lock/unlock/pc/channel）。
-/// 读端仍接受 v1~v4：旧文件缺少的字段按默认值处理。
-inline constexpr std::uint16_t kFormatVersion = 4;
+/// 写端版本：v5 在 v4 基础上新增 4 族资源事件（RWMutex / ConditionVariable /
+/// WaitGroup / IO），并把资源事件 payload 从 48 字节**尾部追加**到 72 字节。
+/// 读端仍接受 v1~v5：旧文件缺少的字段按默认值处理。
+inline constexpr std::uint16_t kFormatVersion = 5;
 /// 读端接受的最小版本。v1 文件没有 v2 的追加字段，解码器按剩余字节判断。
 inline constexpr std::uint16_t kMinFormatVersion = 1;
 inline constexpr std::uint32_t kFileHeaderSize = 32;
@@ -99,8 +100,54 @@ enum class EventType : std::uint16_t {
     kResPCNotify = 53,     ///< ParkingCondition 唤醒
     kResChannelSend = 54,  ///< channel 发送（含立即完成/阻塞）
     kResChannelRecv = 55,  ///< channel 接收（含立即完成/阻塞）
+    // v5：资源事件扩展（RWMutex / ConditionVariable / WaitGroup / IO）。
+    // payload 在 v4 的 48 字节之后追加 24 字节（见 ResourcePayloadV5）。
+    kResRwReadLock = 56,   ///< RWMutex 读锁（aux: kResAuxRead/kResAuxTry）
+    kResRwWriteLock = 57,  ///< RWMutex 写锁（aux: kResAuxWrite/kResAuxTry）
+    kResRwUnlock = 58,     ///< RWMutex 解锁（aux 的标志位说明释放读还是写）
+    kResCvWait = 59,       ///< ConditionVariable 等待
+    kResCvNotify = 60,     ///< ConditionVariable NotifyOne（target=被唤醒者）
+    kResCvNotifyAll = 61,  ///< ConditionVariable NotifyAll（value=候选等待者数）
+    kResWgAdd = 62,        ///< WaitGroup Add（value=delta，res_aux 低位=新计数）
+    kResWgDone = 63,       ///< WaitGroup Done（value=-1，res_aux 低位=新计数）
+    kResWgWait = 64,       ///< WaitGroup Wait（target=释放等待的 gid）
+    kResIoRead = 65,       ///< IO 读方向请求（res_fd=fd，res_bytes=请求字节）
+    kResIoWrite = 66,      ///< IO 写方向请求
+    kResIoWait = 67,       ///< IO 进入等待（res_fd=fd，waiters=队列深度）
+    kResIoWake = 68,       ///< IO 被唤醒（res_fd=fd，res_bytes=完成字节）
     kEnd = 99,    ///< 文件结束；payload 带总条数与整文件 CRC
 };
+
+/**
+ * @brief v5 资源事件 res_aux 的低 8 位标志（**稳定位，只能追加**）。
+ *
+ * res_aux 的高 32 位留给各事件的附加计数（例如 ConditionVariable 广播的
+ * 候选等待者数），回放端按事件类型解释，不做通用解码。
+ */
+enum class ResourceAuxFlags : std::uint32_t {
+    kNone = 0,
+    kRead = 1U << 0,      ///< RWMutex 读侧 / IO 读方向
+    kWrite = 1U << 1,     ///< RWMutex 写侧 / IO 写方向
+    kTry = 1U << 2,       ///< 非阻塞尝试（TryRLock/TryLock/TryWait）
+    kBatch = 1U << 3,     ///< IO 批量等待（wait_many）或多 fd 请求
+    kNotifyAll = 1U << 4, ///< ConditionVariable 广播
+    kWaiters = 1U << 5,   ///< res_aux 高 32 位携带等待者数
+};
+
+/// res_aux 的附加计数（等待者数 / 候选数）位移。
+inline constexpr std::uint32_t kResourceAuxCountShift = 32;
+
+/// 该事件类型是否属于 v5 新增的资源事件（payload 72 字节）。
+inline constexpr bool IsResourceEventV5(EventType type) noexcept {
+    return static_cast<std::uint16_t>(type) >= 56U &&
+           static_cast<std::uint16_t>(type) <= 68U;
+}
+
+/// 该事件类型是否属于资源事件（v4 的 6 种 + v5 的 13 种）。
+inline constexpr bool IsResourceEventType(EventType type) noexcept {
+    const std::uint16_t raw = static_cast<std::uint16_t>(type);
+    return (raw >= 50U && raw <= 55U) || IsResourceEventV5(type);
+}
 
 /**
  * @brief 消息值的编码方式（`kMeta.value_kind`）。
@@ -246,6 +293,10 @@ struct Event {
     std::uint32_t resource_result{0};///< ResourceResult 数值（0=ok）
     std::uint64_t address{0};        ///< 资源对象地址（诊断定位用）
     std::uint32_t waiters{0};        ///< 操作后的等待者数（近似）
+    // ---- v5：资源事件追加字段（仅 56~68 的 payload 携带）----
+    std::int32_t res_fd{-1};         ///< IO 的 fd；非 IO 事件为 -1
+    std::uint32_t res_bytes{0};      ///< IO 请求/完成的字节数（0=未知/不适用）
+    std::uint64_t res_aux{0};        ///< 标志位（见 ResourceAuxFlags）+ 附加计数
 };
 
 /**

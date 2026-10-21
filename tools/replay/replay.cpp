@@ -307,6 +307,19 @@ void PrintEventLine(const go2cpp::replay::Event& event, std::size_t index) {
         case EventType::kResPCNotify:
         case EventType::kResChannelSend:
         case EventType::kResChannelRecv:
+        case EventType::kResRwReadLock:
+        case EventType::kResRwWriteLock:
+        case EventType::kResRwUnlock:
+        case EventType::kResCvWait:
+        case EventType::kResCvNotify:
+        case EventType::kResCvNotifyAll:
+        case EventType::kResWgAdd:
+        case EventType::kResWgDone:
+        case EventType::kResWgWait:
+        case EventType::kResIoRead:
+        case EventType::kResIoWrite:
+        case EventType::kResIoWait:
+        case EventType::kResIoWake:
             std::printf(" resource=%llu actor=%llu target=%llu result=%u "
                         "address=0x%llx waiters=%u",
                         static_cast<unsigned long long>(event.resource_id),
@@ -315,6 +328,12 @@ void PrintEventLine(const go2cpp::replay::Event& event, std::size_t index) {
                         event.resource_result,
                         static_cast<unsigned long long>(event.address),
                         event.waiters);
+            if (IsResourceEventV5(event.type)) {
+                std::printf(" fd=%d bytes=%u aux=0x%llx value=%lld",
+                            event.res_fd, event.res_bytes,
+                            static_cast<unsigned long long>(event.res_aux),
+                            static_cast<long long>(event.value));
+            }
             break;
         case EventType::kEnd:
             std::printf(" records=%lld dropped=%llu file_crc=0x%08x",
@@ -390,12 +409,7 @@ int RunStep(const Args& args) {
     std::printf("loaded %zu events from %s\n", events.size(), args.path.c_str());
     std::size_t resource_events = 0;
     for (const auto& event : events) {
-        if (event.type == EventType::kResMutexLock ||
-            event.type == EventType::kResMutexUnlock ||
-            event.type == EventType::kResPCWait ||
-            event.type == EventType::kResPCNotify ||
-            event.type == EventType::kResChannelSend ||
-            event.type == EventType::kResChannelRecv) {
+        if (IsResourceEventType(event.type)) {
             ++resource_events;
         }
     }

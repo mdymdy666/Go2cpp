@@ -29,6 +29,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_channel.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_scheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_scheduler_stress.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_terminal_reclaim.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_dynamic_scheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_fiber.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_fiber_growable_stack.cpp
@@ -67,6 +68,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/test_timer_replay.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_config.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/test_resource_replay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/test_resources_v5.cpp
     )
     target_link_libraries(go2cpp_tests PRIVATE go2cpp_runtime
         go2cpp_replay_core)
@@ -77,6 +79,17 @@ if (GO2CPP_BUILD_TESTS)
         target_compile_definitions(go2cpp_tests PRIVATE GO2CPP_TEST_HOOK=1)
     endif()
     target_compile_options(go2cpp_tests PRIVATE -Wall -Wextra -Wpedantic)
+    # v5 资源事件录制/回放 demo：只在 GO2CPP_REPLAY=ON 的构建里编译
+    # （OFF 构建没有运行时录制点，demo 只会记录 0 条事件）。
+    # 不注册 ctest 用例，因此默认构建的用例数不变。
+    if (GO2CPP_REPLAY)
+        add_executable(go2cpp_resources_v5_demo
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/replay/resource_v5_demo.cpp)
+        target_link_libraries(go2cpp_resources_v5_demo PRIVATE
+            go2cpp_runtime go2cpp_replay_core)
+        target_compile_options(go2cpp_resources_v5_demo PRIVATE
+            -Wall -Wextra -Wpedantic)
+    endif()
     # Doctor 测试只在 GO2CPP_DIAGNOSTIC=ON 时编译。默认 OFF 构建既没有
     # DiagnosticAgent 符号，也没有这些测试（保证 ctest 用例数与默认构建
     # 零开销）。ON 时测试并入同一个 go2cpp_tests，**不新增 add_test**，
@@ -161,8 +174,8 @@ if (GO2CPP_BUILD_TESTS)
     endif()
     # ---- 全链路追踪场景（仅 GO2CPP_DEBUG_DUMP=ON）----
     # ≥4 Fiber × channel/mutex/timer/select/PC，跑 10s 后抓取 6 个 JSON 视图。
-    # **不注册 ctest**：ctest 用例总数保持 116；验收由
-    # tests/scenarios/full_trace/run_full_trace.sh 从外部驱动。
+    # 默认构建只编译 demo、不注册 ctest；增强构建下由 scenario-full-trace
+    # 经 tests/scenarios/run_full_trace_ctest.sh 执行（见文件末尾注册段）。
     if (GO2CPP_DEBUG_DUMP)
         add_executable(go2cpp_full_trace_scenario
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/full_trace/full_trace_scenario.cpp)
@@ -172,8 +185,8 @@ if (GO2CPP_BUILD_TESTS)
     endif()
     # ---- 真实场景：100+ HTTP client 并发 → 锁顺序死锁 → Doctor 受控解锁 ----
     # 需要 DebugServer（dump/事件环）与 Doctor（等待图/force-unlock）同时在线。
-    # **不注册 ctest**：ctest 用例总数保持 116 不变；端到端验收由
-    # tests/scenarios/deadlock_routes/run_deadlock_scenario.sh 从外部驱动。
+    # 默认构建只编译 demo、不注册 ctest；增强构建下由 scenario-deadlock-routes
+    # 经 tests/scenarios/run_deadlock_routes_ctest.sh 执行。
     if (GO2CPP_DEBUG_DUMP AND GO2CPP_DIAGNOSTIC)
         add_executable(go2cpp_deadlock_routes
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/deadlock_routes/deadlock_routes_server.cpp)
@@ -183,8 +196,8 @@ if (GO2CPP_BUILD_TESTS)
     endif()
     # ---- 场景：锁顺序死锁 → Doctor ctx.cancel → ContextRollback undo 解死锁 ----
     # 演示「取消等待 + 回滚释放已持锁」，与 mutex-unlock --force 的 stale 路径
-    # 对照。**不注册 ctest**：ctest 用例总数保持 116；验收由
-    # tests/scenarios/ctx_cancel_rollback/run_ctx_cancel_rollback.sh 外部驱动。
+    # 对照。默认构建不注册；增强构建下由 scenario-ctx-cancel 经
+    # tests/scenarios/run_ctx_cancel_ctest.sh 执行。
     if (GO2CPP_DEBUG_DUMP AND GO2CPP_DIAGNOSTIC)
         add_executable(go2cpp_ctx_cancel_rollback
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/ctx_cancel_rollback/ctx_cancel_rollback_demo.cpp)
@@ -773,40 +786,44 @@ if (GO2CPP_BUILD_TESTS)
              COMMAND go2cpp_resource_history_test)
     set_tests_properties(go2cpp_resource_history_test PROPERTIES TIMEOUT 120)
 
-    # ---- 全能力构建的端到端场景（GO2CPP_BUILD_ENHANCED=ON）----
-    # 这些脚本以前只能手工执行（命令散落在 docs/debug-reliability.md）；
-    # 挂到 ctest 后「构建里打开了某项能力」就有一条对应的已跑场景。
-    # 只在本预设构建下注册：默认 build-work 没有这些 demo/CLI，注册必然失败。
+    # ---- 场景测试入 ctest（仅增强构建）----
+    # 三个场景脚本以前只能手工执行；现在统一经 tests/scenarios/run_*_ctest.sh
+    # 包装后注册。包装脚本负责：
+    #   - 解析构建目录（GO2CPP_SCENARIO_BUILD_DIR > build-doctor-full >
+    #     build-debug-full > build-enhanced），显式指定无效目录时直接报错；
+    #   - 缺构建目录 / 可执行 / CLI / python3 时 exit 77，配合
+    #     SKIP_RETURN_CODE=77 记为 Skipped 而不是 Failed。
+    # 只在对应能力开关全开时注册；默认构建（GO2CPP_BUILD_ENHANCED=OFF）
+    # 不注册任何一条，ctest 用例总数保持 130 不变。
     if (GO2CPP_BUILD_ENHANCED)
-        if (TARGET go2cpp_ctx_cancel_rollback)
-            add_test(NAME go2cpp_scenario_ctx_cancel_rollback
-                     COMMAND bash
-                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/ctx_cancel_rollback/run_ctx_cancel_rollback.sh
-                         ${CMAKE_CURRENT_BINARY_DIR})
-            set_tests_properties(go2cpp_scenario_ctx_cancel_rollback PROPERTIES
-                TIMEOUT 180)
+        # 死锁路由：需要 DebugServer + Doctor + CLI。
+        if (GO2CPP_DEBUG_DUMP AND GO2CPP_DIAGNOSTIC AND GO2CPP_WITH_CLI)
+            add_test(NAME scenario-deadlock-routes
+                     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/run_deadlock_routes_ctest.sh)
+            set_tests_properties(scenario-deadlock-routes PROPERTIES
+                SKIP_RETURN_CODE 77
+                TIMEOUT 600)
         endif()
-        if (TARGET go2cpp_deadlock_routes)
-            # 默认 120 client + 600ms 加载：压测窗口缩短但保持「>100 client
-            # 并发 → 锁顺序死锁 → Doctor 受控解锁」的完整路径。
-            add_test(NAME go2cpp_scenario_deadlock_routes
-                     COMMAND bash
-                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/deadlock_routes/run_deadlock_scenario.sh
-                         ${CMAKE_CURRENT_BINARY_DIR} --clients 120 --load-ms 600)
-            set_tests_properties(go2cpp_scenario_deadlock_routes PROPERTIES
+
+        # 全链路 6 视图：需要 DebugServer（dump）+ CLI。
+        if (GO2CPP_DEBUG_DUMP AND GO2CPP_WITH_CLI)
+            add_test(NAME scenario-full-trace
+                     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/run_full_trace_ctest.sh)
+            set_tests_properties(scenario-full-trace PROPERTIES
+                SKIP_RETURN_CODE 77
                 TIMEOUT 300)
         endif()
-        if (TARGET go2cpp_full_trace_scenario AND GO2CPP_WITH_CLI)
-            add_test(NAME go2cpp_scenario_full_trace
-                     COMMAND ${CMAKE_COMMAND} -E env
-                         SCENARIO=$<TARGET_FILE:go2cpp_full_trace_scenario>
-                         CLI=${CMAKE_CURRENT_BINARY_DIR}/tools/cli/go2cpp-cli
-                         OUT=${CMAKE_CURRENT_BINARY_DIR}/scenario-full-trace
-                         bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/full_trace/run_full_trace.sh
-                              10 8)
-            set_tests_properties(go2cpp_scenario_full_trace PROPERTIES
-                TIMEOUT 180)
+
+        # ctx.cancel + ContextRollback：需要 Doctor（DIAGNOSTIC）+ dump 事件。
+        if (GO2CPP_DEBUG_DUMP AND GO2CPP_DIAGNOSTIC)
+            add_test(NAME scenario-ctx-cancel
+                     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/run_ctx_cancel_ctest.sh)
+            set_tests_properties(scenario-ctx-cancel PROPERTIES
+                SKIP_RETURN_CODE 77
+                TIMEOUT 300)
         endif()
+
+        # 既有增强场景保持注册不变（不属于本次三条；仍走原脚本）。
         if (GO2CPP_DEBUG_DUMP AND GO2CPP_WITH_CLI)
             add_test(NAME go2cpp_scenario_resource_history
                      COMMAND ${CMAKE_COMMAND} -E env

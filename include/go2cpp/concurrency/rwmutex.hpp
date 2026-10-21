@@ -110,7 +110,7 @@ class RWMutex final {
 public:
     /// @brief 创建未加锁的读写锁。
     RWMutex() {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
         m_debug_resource =
             GO2CPP_DEBUG_RESOURCE_REGISTER(kRwMutex, this, nullptr);
 #endif
@@ -121,7 +121,7 @@ public:
      * @warning 调用方必须保证没有读者 / 写者持有，也没有等待者；否则未定义。
      */
     ~RWMutex() {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
         GO2CPP_DEBUG_RESOURCE_UNREGISTER(m_debug_resource);
 #endif
     }
@@ -143,13 +143,13 @@ public:
         }
         while (m_writing || !m_waiting_writers.empty()) {
             m_waiting_readers.fetch_add(1, std::memory_order_relaxed);
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-            GO2CPP_DEBUG_RESOURCE_EVENT(
+#if GO2CPP_DEBUG_RESOURCES
+            GO2CPP_DEBUG_RESOURCE_EVENT_V5(
                 kRwLockRead, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
                 ::go2cpp::debug::ResourceResult::kBlocked,
                 static_cast<std::uint32_t>(
                     m_waiting_readers.load(std::memory_order_relaxed)),
-                true);
+                true, 0, -1, 0, 0);
 #endif
             bool notified = false;
             try {
@@ -172,10 +172,10 @@ public:
         }
         ++m_readers;
         m_state.Unlock();
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-        GO2CPP_DEBUG_RESOURCE_EVENT(
+#if GO2CPP_DEBUG_RESOURCES
+        GO2CPP_DEBUG_RESOURCE_EVENT_V5(
             kRwLockRead, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
-            ::go2cpp::debug::ResourceResult::kOk, 0, false);
+            ::go2cpp::debug::ResourceResult::kOk, 0, false, 0, -1, 0, 0);
 #endif
     }
 
@@ -201,10 +201,10 @@ public:
             WakeWriterLocked();
         }
         m_state.Unlock();
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-        GO2CPP_DEBUG_RESOURCE_EVENT(
+#if GO2CPP_DEBUG_RESOURCES
+        GO2CPP_DEBUG_RESOURCE_EVENT_V5(
             kRwUnlockRead, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
-            ::go2cpp::debug::ResourceResult::kOk, 0, false);
+            ::go2cpp::debug::ResourceResult::kOk, 0, false, 0, -1, 0, 0);
 #endif
     }
 
@@ -220,11 +220,12 @@ public:
         }
         const std::uint64_t ticket = m_next_writer_ticket++;
         m_waiting_writers.push_back(ticket);
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-        GO2CPP_DEBUG_RESOURCE_EVENT(
+#if GO2CPP_DEBUG_RESOURCES
+        GO2CPP_DEBUG_RESOURCE_EVENT_V5(
             kRwLockWrite, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
             ::go2cpp::debug::ResourceResult::kBlocked,
-            static_cast<std::uint32_t>(m_waiting_writers.size()), true);
+            static_cast<std::uint32_t>(m_waiting_writers.size()), true, 0, -1,
+            0, 0);
 #endif
         while (!WriterCanAcquireLocked(ticket)) {
             bool notified = false;
@@ -249,10 +250,10 @@ public:
         m_waiting_writers.pop_front();
         m_writing = true;
         m_state.Unlock();
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-        GO2CPP_DEBUG_RESOURCE_EVENT(
+#if GO2CPP_DEBUG_RESOURCES
+        GO2CPP_DEBUG_RESOURCE_EVENT_V5(
             kRwLockWrite, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
-            ::go2cpp::debug::ResourceResult::kOk, 0, false);
+            ::go2cpp::debug::ResourceResult::kOk, 0, false, 0, -1, 0, 0);
 #endif
     }
 
@@ -282,12 +283,12 @@ public:
             WakeReadersLocked();
         }
         m_state.Unlock();
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-        GO2CPP_DEBUG_RESOURCE_EVENT(
+#if GO2CPP_DEBUG_RESOURCES
+        GO2CPP_DEBUG_RESOURCE_EVENT_V5(
             kRwUnlockWrite, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
             woke ? ::go2cpp::debug::ResourceResult::kWake
                  : ::go2cpp::debug::ResourceResult::kOk,
-            0, woke);
+            0, woke, 0, -1, 0, 0);
 #endif
     }
 
@@ -604,7 +605,7 @@ private:
                m_waiting_writers.front() == ticket;
     }
 
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+#if GO2CPP_DEBUG_RESOURCES
     /// @brief 资源级历史编号（构造时注册；OFF 构建不存在该成员）。
     ::go2cpp::debug::ResourceId m_debug_resource{0};
 #endif

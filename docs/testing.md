@@ -655,16 +655,27 @@ TSan 仍需在原生 Linux 机器复核；当前 WSL 会在运行时报告
 
 | 测试面 | 入口 | 2026-10-21 结果 | 进默认 ctest |
 |---|---|---|---|
-| 默认构建 ctest | `ctest --test-dir build-work --output-on-failure` | **116/116 通过**，60.83 s（审计基线）；2026-10-21 注册 7 个孤儿测试后重配置为 **123 条** | ✅ |
+| 默认构建 ctest | `ctest --test-dir build-work --output-on-failure` | 2026-10-21 实测 **130/130 通过**（含 tools 三套与 4 个并发原语测试）；场景只在增强构建注册 | ✅ |
 | 五能力增强主矩阵 | `tests/enhanced/{debug,migration,replay,cli,doctor}/test_*.sh` | **170/170 通过**：debug 36 / migration 34 / replay 34 / cli 31 / doctor 35 | ❌ |
-| 场景：`ctx.cancel` | `tests/scenarios/ctx_cancel_rollback/run_ctx_cancel_rollback.sh` | **65 PASS / 0 FAIL**（cancel / force / external 三模式） | ❌ |
-| 场景：死锁路由 | `tests/scenarios/deadlock_routes/run_deadlock_scenario.sh` | 120 client → 死锁 → force-unlock；19 个显式断言点（审计记录，第 6 节未单列实跑行） | ❌ |
-| 场景：全链路 6 视图 | `tests/scenarios/full_trace/run_full_trace.sh 10 8` | `verify_coverage.py` 做 6 视图覆盖率校验（审计记录，第 6 节未单列实跑行） | ❌ |
+| 场景：`ctx.cancel` | `ctest -R '^scenario-ctx-cancel$'`（包装 `tests/scenarios/run_ctx_cancel_ctest.sh`） | **65 PASS / 0 FAIL**（cancel / force / external 三模式） | ✅ 仅增强构建 |
+| 场景：死锁路由 | `ctest -R '^scenario-deadlock-routes$'`（包装 `tests/scenarios/run_deadlock_routes_ctest.sh`） | 120 client → 死锁 → force-unlock；19 个显式断言点（审计记录，第 6 节未单列实跑行） | ✅ 仅增强构建 |
+| 场景：全链路 6 视图 | `ctest -R '^scenario-full-trace$'`（包装 `tests/scenarios/run_full_trace_ctest.sh`） | `verify_coverage.py` 做 6 视图覆盖率校验（审计记录，第 6 节未单列实跑行） | ✅ 仅增强构建 |
 | 迁移工具 | `tools/migration/tests/run_tests.sh build-migration` | **53/53 通过** | ❌（独立工程） |
 | CLI 工具 | `BIN=<cli> tools/cli/tests/run_all.sh` | **213 PASS / 0 FAIL** | ❌（独立脚本） |
 | 回放工具 | `ctest --test-dir build-replay` + `tools/replay/scripts/run_all.sh build-replay` | 单测通过 + 6 个场景通过 | ⚠️ 仅独立工程 ctest |
 
-> 口径说明：ctest 116 中 75 条是 `example/**` 的进程冒烟（只验证退出码 0），
+> **场景已入 ctest（2026-10-21）**：三条场景只在增强构建注册，默认构建
+> （`GO2CPP_BUILD_ENHANCED=OFF`）不新增用例，`ctest -N` 仍为 **130**。
+> 名称分别是 `scenario-deadlock-routes`（TIMEOUT 600）、`scenario-full-trace`
+> （TIMEOUT 300）、`scenario-ctx-cancel`（TIMEOUT 300），均设置
+> `SKIP_RETURN_CODE=77`。包装脚本按 `GO2CPP_SCENARIO_BUILD_DIR` →
+> 当前工作目录（ctest 运行时即其构建目录）→ `build-doctor-full` →
+> `build-debug-full` → `build-enhanced` 解析构建目录；
+> 找不到构建目录或缺可执行文件/CLI/python3 时 **exit 77**，ctest 记为
+> **Skipped** 而不是 Failed。手工复跑：
+> `GO2CPP_SCENARIO_BUILD_DIR=$PWD/build-enhanced ctest --test-dir build-enhanced -R '^scenario-' --output-on-failure`。
+
+> 口径说明：审计基线 ctest 116 中 75 条是 `example/**` 的进程冒烟（只验证退出码 0），
 > 41 条是测试类；`go2cpp_tls_alpn_test` 只构建、不注册。拆分见审计报告 2.1–2.3。
 > enhanced 的 170 不含父 park（`test_parent_park.sh`）与压测脚本（合计约 190）；
 > 父 park 当前因夹具与旧构建目录不匹配而失败，见审计 P1-4。
@@ -673,13 +684,15 @@ TSan 仍需在原生 Linux 机器复核；当前 WSL 会在运行时报告
 > （`channel_concurrency`、`worker_lifecycle`、`future_audit`、`sync_cancel_stress`、
 > `io_audit`、`hook_fifo`、`hook_behavior`），`build-work` 重配置后
 > `ctest -N` = **123**（实测数量）；新增的 7 条尚未做全量回归，通过情况以实际运行日志为准。
+> 同日晚些时候并发原语补强 + tools 入 ctest 后，`build-work` 实测 **130** 条
+> （130/130 通过）；此后新增的数字以 130 为基线。
 
 ### 一键入口
 
 | 入口 | 覆盖 | 2026-10-21 状态 |
 |---|---|---|
 | `tests/all_enhanced.sh`（转调 `tests/enhanced/run_all.sh`） | 10 个增强脚本：五能力主矩阵 + 父 park + 压测 | 可用。2026-10-21 起构建产物按「`GO2CPP_CLI`/`GO2CPP_*` → `build-enhanced` → `build-cli`/`build-doctor-full` 等专项目录」解析，缺 CLI 时 exit 77（不再硬编码 `/tmp`）。矩阵/报告默认写 `/tmp/test_enhance_matrix.tsv`、`/tmp/test_enhance.md`，可用 `MATRIX_FILE`/`REPORT_FILE` 覆盖 |
-| `tests/run_all_tests.sh` | 建议中的总入口：ctest → enhanced → scenarios → tools/migration → tools/cli → tools/replay | **尚未落地**（当前工作树无此文件）；落地后以它为准 |
+| `tests/run_all_tests.sh` | 总入口：ctest → enhanced → scenarios → tools（ctest 已覆盖时 SKIP 兜底） | 已落地；场景与 tools 步骤在 ctest 已跑过同一构建目录时默认跳过（`RUN_SCENARIOS_STANDALONE=1` / `RUN_TOOLS_STANDALONE=1` 强制独立跑） |
 | `tools/migration/tests/run_tests.sh` | 迁移 53 场景 | 需先构建 `build-migration` |
 | `tools/cli/tests/run_all.sh` | CLI 213 断言 | 需 `BIN=` 指向 `go2cpp-cli` |
 | `tools/replay/scripts/run_all.sh` | 回放 6 场景 | 需先 `tools/replay/build.sh` |
@@ -709,7 +722,7 @@ bash tests/enhanced/doctor/test_doctor.sh
 
 | 目标 | 关键选项 | 用途 | 产物目录 |
 |---|---|---|---|
-| `default` | `GO2CPP_DEBUG_DUMP=OFF`、`GO2CPP_DIAGNOSTIC=OFF`、`GO2CPP_REPLAY=OFF`、`GO2CPP_MIGRATION_API=OFF`、`GO2CPP_WITH_CLI=OFF` | 库 / 测试 / 示例回归；ctest 116 | `build-work` |
+| `default` | `GO2CPP_DEBUG_DUMP=OFF`、`GO2CPP_DIAGNOSTIC=OFF`、`GO2CPP_REPLAY=OFF`、`GO2CPP_MIGRATION_API=OFF`、`GO2CPP_WITH_CLI=OFF` | 库 / 测试 / 示例回归；ctest 130 | `build-work` |
 | `enhanced` | `-DGO2CPP_DEBUG_DUMP=ON -DGO2CPP_DIAGNOSTIC=ON -DGO2CPP_REPLAY=ON -DGO2CPP_WITH_CLI=ON`（建议同时 `-DGO2CPP_MIGRATION_API=ON`） | 新能力 ctest + 增强矩阵 + 场景 | `build-enhanced`（CI）；本地可用 `build-doctor-full` |
 | `migration` | 独立工程：`cmake -S tools/migration` | 迁移 53 场景 + enhanced migration | `build-migration` |
 | `replay` | 独立工程：`tools/replay/build.sh`，`-DGO2CPP_REPLAY=ON`，链接 `build-enhanced` 的 `.so` | 回放单测 + 6 场景 + enhanced replay | `build-replay` |
@@ -736,8 +749,10 @@ GO2CPP_REPLAY_BUILD_DIR="$PWD/build-replay" \
 GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 ```
 
-> 默认构建的 `ctest` 名称与 enhanced 构建相同、数量也相同（116），但执行路径不同：
-> enhanced 构建会真正编译 `#if GO2CPP_DEBUG_DUMP` 段并加入 `test_diagnostic`。
+> 默认构建 `ctest` 为 **130** 条；增强构建额外注册 `scenario-deadlock-routes` /
+> `scenario-full-trace` / `scenario-ctx-cancel` 三条场景（另有既有的
+> `go2cpp_scenario_resource_history` / `go2cpp_migration_adopt_roundtrip`，
+> 取决于选项），并真正编译 `#if GO2CPP_DEBUG_DUMP` 段、加入 `test_diagnostic`。
 > 只跑默认 ctest 不能证明 DebugServer / Doctor / 资源历史 / 迁移 API 可用（审计 P0-1）。
 
 ### CI
@@ -747,7 +762,7 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 
 | job | 步骤 | 超时 |
 |---|---|---|
-| `default` | 安装依赖 → `build-work` 配置/构建 → `ctest`（123） | 30 min（ctest 15 min） |
+| `default` | 安装依赖 → `build-work` 配置/构建 → `ctest`（130） | 30 min（ctest 15 min） |
 | `enhanced` | `build-enhanced` 全开配置/构建 → ctest → 构建 `build-migration` 与 `build-replay` → 五能力主矩阵 → tools 三套（migration/cli/replay）→ 三个关键场景 → 上传矩阵与覆盖率产物 | 60 min |
 
 - runner：`ubuntu-24.04`；依赖：`build-essential`、`cmake`、`ninja-build`、`python3`、
@@ -766,7 +781,7 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 
 - 仍有 5 个孤儿文件未注册（`test_parking_condition_stress.cpp`、3 个 demo、1 个父 park 夹具）；
   2026-10-21 已注册 7 个高风险项（ctest 116→123）；
-- `tests/run_all_tests.sh` 总入口尚未落地（当前只有 `tests/all_enhanced.sh` 覆盖增强矩阵）；
+- `tests/run_all_tests.sh` 已落地（ctest/enhanced/scenarios/tools 四段；场景与 tools 在 ctest 覆盖时跳过独立步骤）；
 - `test_parent_park.sh` 因夹具链接旧 `build-debug` 失败（审计 P1-4），CI 未把它设为门禁；
 - 主工程跨进程迁移 API（`GO2CPP_MIGRATION_API`）仍无自动化用例（审计 P0-4）；
 - 新能力（debug/diagnostic/replay/migration）尚无 ASan/UBSan/TSan/Valgrind 记录；

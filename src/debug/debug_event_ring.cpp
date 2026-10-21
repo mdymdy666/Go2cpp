@@ -670,6 +670,8 @@ const char* SchedEventCodeName(SchedEventCode code) noexcept {
         case SchedEventCode::kIoWait: return "kIoWait";
         case SchedEventCode::kIoWake: return "kIoWake";
         case SchedEventCode::kIoWakeBatch: return "kIoWakeBatch";
+        case SchedEventCode::kIoRead: return "kIoRead";
+        case SchedEventCode::kIoWrite: return "kIoWrite";
         case SchedEventCode::kSchedulerStart: return "kSchedulerStart";
         case SchedEventCode::kSchedulerStop: return "kSchedulerStop";
         case SchedEventCode::kThreadStart: return "kThreadStart";
@@ -722,6 +724,8 @@ const char* SchedEventCodeName(SchedEventCode code) noexcept {
         case SchedEventCode::kParkCaptured: return "kParkCaptured";
         case SchedEventCode::kWaitGroupWait: return "kWaitGroupWait";
         case SchedEventCode::kWaitGroupDone: return "kWaitGroupDone";
+        case SchedEventCode::kCvNotifyAll: return "kCvNotifyAll";
+        case SchedEventCode::kWaitGroupAdd: return "kWaitGroupAdd";
     }
     return "kUnknown";
 }
@@ -1350,6 +1354,7 @@ const char* ResourceKindName(ResourceKind kind) noexcept {
         case ResourceKind::kTimedMutex: return "kTimedMutex";
         case ResourceKind::kSpinMutex: return "kSpinMutex";
         case ResourceKind::kFutexMutex: return "kFutexMutex";
+        case ResourceKind::kIoManager: return "kIoManager";
     }
     return "kUnknown";
 }
@@ -1379,6 +1384,10 @@ ResourceKind ParseResourceKind(const std::string& text) noexcept {
     }
     if (text == "futex_mutex" || text == "kFutexMutex") {
         return ResourceKind::kFutexMutex;
+    }
+    if (text == "io_manager" || text == "iomanager" ||
+        text == "kIoManager") {
+        return ResourceKind::kIoManager;
     }
     return ResourceKind::kUnknown;
 }

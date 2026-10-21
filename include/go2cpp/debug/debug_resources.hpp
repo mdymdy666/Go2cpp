@@ -95,6 +95,7 @@ enum class ResourceKind : std::uint8_t {
     kTimedMutex = 8,
     kSpinMutex = 9,
     kFutexMutex = 10,
+    kIoManager = 11, ///< IOManager 注册的 IO 等待资源（v5：fd 在事件字段里）
 };
 
 /// 资源类别名；未知值返回 "kUnknown"。
@@ -328,6 +329,10 @@ struct ResourceEventRecord {
     std::uint32_t waiters{0};
     std::uint32_t flags{0};
     FiberChainId chain_id{0};
+    // ---- v5 追加：资源事件扩展字段（旧字段语义不变）----
+    std::int32_t fd{-1};      ///< IO 的 fd；非 IO 事件为 -1
+    std::uint32_t bytes{0};   ///< IO 请求/完成的字节数
+    std::uint64_t aux{0};     ///< 标志位（回放 ResourceAuxFlags）+ 附加计数
 };
 
 /**
@@ -468,6 +473,48 @@ void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
         ::go2cpp::debug::RecordResourceEvent(_go2cpp_res_ev);                \
     } while (0)
 
+/**
+ * @brief 记录一条 v5 资源事件（带 fd / bytes / aux 三个扩展字段）。
+ *
+ * 参数语义与 GO2CPP_DEBUG_RESOURCE_EVENT_EX 相同，额外的三个：
+ * - ev_fd：IO 的 fd（非 IO 事件传 -1）；
+ * - ev_bytes：IO 请求/完成的字节数（不适用传 0）；
+ * - ev_aux：标志位（回放端 ResourceAuxFlags）与附加计数。
+ *
+ * @note 宏内不做任何符号解析；OFF 构建展开为 ((void)0)。
+ */
+#define GO2CPP_DEBUG_RESOURCE_EVENT_V5(                                      \
+    ev_code, ev_resource, ev_actor, ev_target, ev_value, ev_result,          \
+    ev_waiters, ev_critical, ev_flags, ev_fd, ev_bytes, ev_aux)              \
+    do {                                                                     \
+        if (!::go2cpp::debug::DebugConfig::Enabled(                          \
+                ::go2cpp::debug::DebugCategoryOf(                            \
+                    ::go2cpp::debug::SchedEventCode::ev_code))) {            \
+            break;                                                           \
+        }                                                                    \
+        ::go2cpp::debug::ResourceEventRecord _go2cpp_res_ev5;                \
+        _go2cpp_res_ev5.code = ::go2cpp::debug::SchedEventCode::ev_code;     \
+        _go2cpp_res_ev5.resource_id =                                        \
+            static_cast<std::uint64_t>(ev_resource);                         \
+        _go2cpp_res_ev5.actor_gid = static_cast<std::uint64_t>(ev_actor);    \
+        _go2cpp_res_ev5.target_gid = static_cast<std::uint64_t>(ev_target);  \
+        _go2cpp_res_ev5.value = static_cast<std::uint64_t>(ev_value);        \
+        _go2cpp_res_ev5.result = (ev_result);                                \
+        _go2cpp_res_ev5.waiters = static_cast<std::uint32_t>(ev_waiters);    \
+        _go2cpp_res_ev5.flags = static_cast<std::uint32_t>(ev_flags);        \
+        _go2cpp_res_ev5.fd = static_cast<std::int32_t>(ev_fd);               \
+        _go2cpp_res_ev5.bytes = static_cast<std::uint32_t>(ev_bytes);        \
+        _go2cpp_res_ev5.aux = static_cast<std::uint64_t>(ev_aux);            \
+        _go2cpp_res_ev5.chain_id =                                           \
+            ::go2cpp::debug::DebugConfig::Enabled(                           \
+                ::go2cpp::debug::DebugCategory::kChains)                     \
+                ? ::go2cpp::debug::CaptureFiberChain(                        \
+                      static_cast<std::uint64_t>(ev_actor),                   \
+                      static_cast<bool>(ev_critical))                        \
+                : 0U;                                                       \
+        ::go2cpp::debug::RecordResourceEvent(_go2cpp_res_ev5);               \
+    } while (0)
+
 #else  // GO2CPP_DEBUG_RESOURCES
 
 #define GO2CPP_DEBUG_RESOURCE_REGISTER(kind, address, name) ((void)0)
@@ -482,6 +529,10 @@ void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
 #define GO2CPP_DEBUG_RESOURCE_EVENT_EX(                                      \
     ev_code, ev_resource, ev_actor, ev_target, ev_value, ev_result,          \
     ev_waiters, ev_critical, ev_flags)                                       \
+    ((void)0)
+#define GO2CPP_DEBUG_RESOURCE_EVENT_V5(                                      \
+    ev_code, ev_resource, ev_actor, ev_target, ev_value, ev_result,          \
+    ev_waiters, ev_critical, ev_flags, ev_fd, ev_bytes, ev_aux)              \
     ((void)0)
 
 #endif  // GO2CPP_DEBUG_DUMP

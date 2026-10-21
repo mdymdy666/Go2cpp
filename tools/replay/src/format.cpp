@@ -78,6 +78,19 @@ const char* EventTypeName(EventType type) noexcept {
         case EventType::kResPCNotify: return "res-pc-notify";
         case EventType::kResChannelSend: return "res-channel-send";
         case EventType::kResChannelRecv: return "res-channel-recv";
+        case EventType::kResRwReadLock: return "res-rw-read-lock";
+        case EventType::kResRwWriteLock: return "res-rw-write-lock";
+        case EventType::kResRwUnlock: return "res-rw-unlock";
+        case EventType::kResCvWait: return "res-cv-wait";
+        case EventType::kResCvNotify: return "res-cv-notify";
+        case EventType::kResCvNotifyAll: return "res-cv-notify-all";
+        case EventType::kResWgAdd: return "res-wg-add";
+        case EventType::kResWgDone: return "res-wg-done";
+        case EventType::kResWgWait: return "res-wg-wait";
+        case EventType::kResIoRead: return "res-io-read";
+        case EventType::kResIoWrite: return "res-io-write";
+        case EventType::kResIoWait: return "res-io-wait";
+        case EventType::kResIoWake: return "res-io-wake";
         case EventType::kEnd: return "end";
     }
     return "unknown";
@@ -239,6 +252,35 @@ void EncodePayload(const Event& event, std::vector<std::uint8_t>& payload) {
             // vtime_ns 必须在 payload 里：资源事件没有 v2 的
             // 「通用 vtime 尾字段」，漏掉它会让锁持有时间恒为 0。
             writer.U64(event.vtime_ns);
+            break;
+        // v5：资源事件扩展。前 48 字节与 v4 完全一致（旧读端可继续解析），
+        // 其后追加 24 字节：fd / bytes / aux / value。旧读端读到 48 字节后
+        // 不再解释剩余内容，因此同一个文件同时满足 v4 与 v5 读端。
+        case EventType::kResRwReadLock:
+        case EventType::kResRwWriteLock:
+        case EventType::kResRwUnlock:
+        case EventType::kResCvWait:
+        case EventType::kResCvNotify:
+        case EventType::kResCvNotifyAll:
+        case EventType::kResWgAdd:
+        case EventType::kResWgDone:
+        case EventType::kResWgWait:
+        case EventType::kResIoRead:
+        case EventType::kResIoWrite:
+        case EventType::kResIoWait:
+        case EventType::kResIoWake:
+            writer.U64(event.resource_id);
+            writer.U64(event.actor_gid);
+            writer.U64(event.target_gid);
+            writer.U32(event.resource_result);
+            writer.U64(event.address);
+            writer.U32(event.waiters);
+            writer.U64(event.vtime_ns);
+            // v5 追加：fd（-1 表示不适用）、字节数、标志/附加量、主数值。
+            writer.U32(static_cast<std::uint32_t>(event.res_fd));
+            writer.U32(event.res_bytes);
+            writer.U64(event.res_aux);
+            writer.I64(event.value);
             break;
         case EventType::kEnd:
             writer.U64(static_cast<std::uint64_t>(event.value));  // records
@@ -469,6 +511,40 @@ bool DecodeEvent(const std::uint8_t* data, std::size_t size, Event* event,
                 out.waiters = reader.U32();
                 if (reader.remaining() >= 8U) {
                     out.vtime_ns = reader.U64();
+                }
+            }
+            break;
+        // v5：资源事件扩展。48 字节基础（与 v4 相同）+ 24 字节追加。
+        // v4 文件里不存在这些类型；v5 读端仍按 remaining 逐段判断，
+        // 因此将来再加字段也不会让本版本解码失败。
+        case EventType::kResRwReadLock:
+        case EventType::kResRwWriteLock:
+        case EventType::kResRwUnlock:
+        case EventType::kResCvWait:
+        case EventType::kResCvNotify:
+        case EventType::kResCvNotifyAll:
+        case EventType::kResWgAdd:
+        case EventType::kResWgDone:
+        case EventType::kResWgWait:
+        case EventType::kResIoRead:
+        case EventType::kResIoWrite:
+        case EventType::kResIoWait:
+        case EventType::kResIoWake:
+            if (reader.ok() && reader.remaining() >= 40U) {
+                out.resource_id = reader.U64();
+                out.actor_gid = reader.U64();
+                out.target_gid = reader.U64();
+                out.resource_result = reader.U32();
+                out.address = reader.U64();
+                out.waiters = reader.U32();
+                if (reader.remaining() >= 8U) {
+                    out.vtime_ns = reader.U64();
+                }
+                if (reader.ok() && reader.remaining() >= 24U) {
+                    out.res_fd = static_cast<std::int32_t>(reader.U32());
+                    out.res_bytes = reader.U32();
+                    out.res_aux = reader.U64();
+                    out.value = reader.I64();
                 }
             }
             break;

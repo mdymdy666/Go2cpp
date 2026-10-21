@@ -2,6 +2,7 @@
 
 #include "go2cpp/concurrency/core/futex_mutex.hpp"
 #include "go2cpp/debug/debug_event_ring.hpp"
+#include "go2cpp/debug/debug_resources.hpp"
 
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -136,6 +137,26 @@ WaitResult decode_outcome(std::uint64_t outcome) noexcept {
     return {static_cast<WaitStatus>(outcome & 0xffU),
             static_cast<int>(static_cast<std::uint32_t>(outcome >> 8U))};
 }
+
+/**
+ * @brief WaitStatus -> 回放资源事件的 ResourceResult（v5）。
+ *
+ * 只做稳定枚举映射，不做语义改写：回放端按 ResourceResult 统计 ok /
+ * timeout / cancelled / closed / failed 五类 IO 结果。
+ */
+#if GO2CPP_DEBUG_RESOURCES
+::go2cpp::debug::ResourceResult ToResourceResult(WaitStatus status) noexcept {
+    using ::go2cpp::debug::ResourceResult;
+    switch (status) {
+        case WaitStatus::kReady: return ResourceResult::kOk;
+        case WaitStatus::kTimeout: return ResourceResult::kTimeout;
+        case WaitStatus::kCancelled: return ResourceResult::kCancelled;
+        case WaitStatus::kClosed: return ResourceResult::kClosed;
+        case WaitStatus::kError: return ResourceResult::kFailed;
+    }
+    return ResourceResult::kFailed;
+}
+#endif  // GO2CPP_DEBUG_RESOURCES
 
 }  // namespace
 
@@ -1905,6 +1926,7 @@ private:
         try {
             pending.reserve(nodes.size());
             while (const auto node = nodes.pop_front()) {
+                record_io_wake(node);
                 pending.push_back(node);
             }
         } catch (...) {
@@ -2085,12 +2107,61 @@ private:
     std::unordered_map<std::uint64_t, TimerRecord> m_deadline_index;
     std::atomic<std::uint64_t> m_next_node_id{0};
     std::atomic<std::uint64_t> m_next_registration_id{0};
+
+    // ---- v5：回放录制的资源编号（ResourceKind::kIoManager）----
+    // 0 = 未注册（GO2CPP_REPLAY/DEBUG_DUMP 都关闭）。IO 事件的 fd 走事件
+    // 的 res_fd 字段，资源编号只用来把「同一个 IOManager」分组。
+    ::go2cpp::debug::ResourceId debug_resource{0};
+
+    /// 当前 fd/方向上排队等待的 G 数（资源事件的 waiters 字段）。
+    /// 只在 GO2CPP_DEBUG_RESOURCES 打开时被事件宏求值；OFF 构建返回 0。
+    std::uint32_t waiter_depth(int fd, IOEvent event) noexcept {
+#if GO2CPP_DEBUG_RESOURCES
+        SlotStripe& stripe = stripe_for(fd);
+        std::lock_guard<std::mutex> lock(stripe.mutex);
+        const auto found = stripe.slots.find(fd);
+        if (found == stripe.slots.end()) {
+            return 0;
+        }
+        return static_cast<std::uint32_t>(
+            queue_for(*found->second, event).size());
+#else
+        (void)fd;
+        (void)event;
+        return 0;
+#endif
+    }
+
+    /// 记录一次 IO 唤醒（v5）。所有唤醒路径都经过 wake_nodes()，因此
+    /// 这里覆盖 epoll 就绪、超时、取消与 close 四种来源。
+    void record_io_wake(const NodePtr& node) noexcept {
+#if GO2CPP_DEBUG_RESOURCES
+        if (!node) {
+            return;
+        }
+        const auto result =
+            decode_outcome(node->outcome.load(std::memory_order_acquire));
+        GO2CPP_DEBUG_RESOURCE_EVENT_V5(
+            kIoWake, debug_resource, 0,
+            node->task ? node->task->id() : 0U, 0U,
+            ToResourceResult(result.status), 0U, true, 0U,
+            static_cast<std::int32_t>(node->fd), 0U, 0U);
+#else
+        (void)node;
+#endif
+    }
 };
 
 IOManager::IOManager(SchedulerConfig config, IOBackendPtr backend)
     : m_scheduler(std::move(config)),
       m_state(std::make_shared<State>(&m_scheduler, std::move(backend))) {
     m_scheduler.set_io_manager(this);
+#if GO2CPP_DEBUG_RESOURCES
+    if (m_state) {
+        m_state->debug_resource =
+            GO2CPP_DEBUG_RESOURCE_REGISTER(kIoManager, this, nullptr);
+    }
+#endif
     std::lock_guard<std::mutex> lock(manager_registry_mutex());
     manager_registry()[&m_scheduler] = this;
     const std::weak_ptr<State> weak_state(m_state);
@@ -2120,6 +2191,12 @@ IOManager::IOManager(SchedulerConfig config, IOBackendPtr backend)
 
 IOManager::~IOManager() {
     shutdown();
+#if GO2CPP_DEBUG_RESOURCES
+    if (m_state) {
+        GO2CPP_DEBUG_RESOURCE_UNREGISTER(m_state->debug_resource);
+        m_state->debug_resource = 0;
+    }
+#endif
     m_scheduler.set_io_manager(nullptr);
     std::lock_guard<std::mutex> lock(manager_registry_mutex());
     const auto found = manager_registry().find(&m_scheduler);
@@ -2254,6 +2331,20 @@ WaitResult IOManager::wait(int fd, IOEvent event,
         (void)m_state->complete(node, WaitStatus::kTimeout, ETIMEDOUT);
     }
 
+#if GO2CPP_DEBUG_RESOURCES
+    // 进入阻塞前记录等待事件：waiters=该 fd/方向当前的排队深度。
+    // 只有真的会 park 的路径才写，因此回放端能看到「请求数 > 等待数」，
+    // 差值就是被立即满足的请求。
+    if (node->outcome.load(std::memory_order_acquire) == 0) {
+        GO2CPP_DEBUG_RESOURCE_EVENT_V5(
+            kIoWait, m_state->debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
+            static_cast<std::uint64_t>(fd),
+            ::go2cpp::debug::ResourceResult::kBlocked,
+            m_state->waiter_depth(fd, event), true, 0,
+            static_cast<std::int32_t>(fd), 0, 0);
+    }
+#endif
+
     // 即使完成事件抢在 park 前到达，也要消耗 pending 交接令牌。无关 permit
     // 和外部唤醒都是伪唤醒，不表示取消。
     for (;;) {
@@ -2279,6 +2370,21 @@ WaitResult IOManager::wait(int fd, IOEvent event,
     }
     const auto result = decode_outcome(node->outcome.load(std::memory_order_acquire));
     m_state->recycle_node(std::move(node));
+#if GO2CPP_DEBUG_RESOURCES
+    // v5：一次 IO 等待请求的最终结果。IOManager 只等就绪、不搬运数据，
+    // 因此 bytes 恒为 0（真实字节数由上层 socket/stream 层决定，不在本层）。
+    if (event == IOEvent::kRead) {
+        GO2CPP_DEBUG_RESOURCE_EVENT_V5(
+            kIoRead, m_state->debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ToResourceResult(result.status), 0, true, 0,
+            static_cast<std::int32_t>(fd), 0, 0);
+    } else {
+        GO2CPP_DEBUG_RESOURCE_EVENT_V5(
+            kIoWrite, m_state->debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+            ToResourceResult(result.status), 0, true, 0,
+            static_cast<std::int32_t>(fd), 0, 0);
+    }
+#endif
     return result;
 }
 

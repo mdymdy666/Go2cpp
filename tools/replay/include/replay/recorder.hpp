@@ -110,12 +110,20 @@ Event MakeCtxEvent(std::uint32_t ctx_id, ContextEventKind kind,
  * @param resource_result `ResourceResult` 数值（0=ok）。
  * @param address 资源对象地址（0=未知；仅诊断用）。
  * @param waiters 操作后的等待者数（近似）。
+ * @param res_fd IO 的 fd（-1=不适用；仅 v5 的 IO 事件使用）。
+ * @param res_bytes IO 请求/完成的字节数（不适用传 0）。
+ * @param res_aux v5 资源事件标志位（`ResourceAuxFlags`）与附加计数。
+ * @param value 主数值：WaitGroup 计数、CV 广播候选数等（无则 0）。
  */
 Event MakeResourceEvent(EventType type, std::uint64_t resource_id,
                         std::uint64_t actor_gid,
                         std::uint64_t target_gid,
                         std::uint32_t resource_result,
-                        std::uint64_t address, std::uint32_t waiters);
+                        std::uint64_t address, std::uint32_t waiters,
+                        std::int32_t res_fd = -1,
+                        std::uint32_t res_bytes = 0,
+                        std::uint64_t res_aux = 0,
+                        std::int64_t value = 0);
 
 /**
  * @brief 线程安全的录制器。
