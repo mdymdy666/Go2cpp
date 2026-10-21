@@ -107,6 +107,48 @@ if (GO2CPP_BUILD_TESTS)
         target_compile_options(go2cpp_diagnostic_demo PRIVATE
             -Wall -Wextra -Wpedantic)
     endif()
+
+    # 并发原语补强：10 类结构压测 / 取消超时 / park-wake 配对 / 资源历史压力。
+    add_executable(go2cpp_primitives_stress
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_primitives_stress.cpp)
+    target_link_libraries(go2cpp_primitives_stress PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_primitives_stress PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_primitives_stress PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_primitives_stress COMMAND go2cpp_primitives_stress)
+    set_tests_properties(go2cpp_primitives_stress PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_primitives_cancel
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_primitives_cancel.cpp)
+    target_link_libraries(go2cpp_primitives_cancel PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_primitives_cancel PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_primitives_cancel PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_primitives_cancel COMMAND go2cpp_primitives_cancel)
+    set_tests_properties(go2cpp_primitives_cancel PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_park_wake_pair
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_park_wake_pair.cpp)
+    target_link_libraries(go2cpp_park_wake_pair PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_park_wake_pair PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_park_wake_pair PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_park_wake_pair COMMAND go2cpp_park_wake_pair)
+    set_tests_properties(go2cpp_park_wake_pair PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_resource_history_stress
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_resource_history_stress.cpp)
+    target_link_libraries(go2cpp_resource_history_stress PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_resource_history_stress PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_resource_history_stress PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_resource_history_stress COMMAND go2cpp_resource_history_stress)
+    set_tests_properties(go2cpp_resource_history_stress PROPERTIES TIMEOUT 120)
+
     # ---- SUBSCRIBE 实时推送 demo（仅 GO2CPP_DEBUG_DUMP=ON）----
     # 不注册 ctest（保持用例总数不变）：由 tests/debug/run_subscribe_demo.sh
     # 在测试脚本里做端到端演示与验收。
@@ -784,6 +826,30 @@ if (GO2CPP_BUILD_TESTS)
                 TIMEOUT 300)
         endif()
     endif()
+
+    # ---- tools 测试（migration / cli / replay 三个独立工程）----
+    # 这三个脚本此前只能手工执行（tests/run_all_tests.sh 第 4 步），本轮
+    # 挂进 ctest。脚本需要各自的独立构建目录，但 ctest 不应在跑测试时偷偷
+    # 触发一次完整构建，因此统一由 tests/tools/run_*.sh 探测已有构建目录：
+    #   - 找到 → 直接执行对应脚本；
+    #   - 找不到 → 打印构建命令并以 77 退出（SKIP_RETURN_CODE=77 记 SKIP）。
+    # 这样默认 build-work 即使没有 build-cli/build-migration/build-replay，
+    # ctest 也不会 FAIL，但也不会把缺失伪造成 PASS。
+    add_test(NAME tools-migration
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/run_migration.sh)
+    set_tests_properties(tools-migration PROPERTIES
+        SKIP_RETURN_CODE 77
+        TIMEOUT 900)
+    add_test(NAME tools-cli
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/run_cli.sh)
+    set_tests_properties(tools-cli PROPERTIES
+        SKIP_RETURN_CODE 77
+        TIMEOUT 900)
+    add_test(NAME tools-replay
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/run_replay.sh)
+    set_tests_properties(tools-replay PROPERTIES
+        SKIP_RETURN_CODE 77
+        TIMEOUT 900)
 
     # 未注册（实跑不通过，原因如实记录；见 /tmp/test_fix.md）：
     # - tests/network/test_hook_fifo.cpp：场景 3 用 raw write 在**主线程**把

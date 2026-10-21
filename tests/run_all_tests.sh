@@ -5,7 +5,9 @@
 #   1) ctest          —— 构建目录（默认 build-work）全部用例；
 #   2) enhanced       —— 五能力增强矩阵（tests/enhanced/run_all.sh）；
 #   3) scenarios      —— ctx_cancel_rollback / deadlock_routes / full_trace；
-#   4) tools          —— migration（独立工程）/ cli / replay（单测 + 6 场景）。
+#   4) tools          —— 兜底：migration / cli / replay 已注册进 ctest；
+#                        ctest 已跑过同一构建目录时默认跳过
+#                        （RUN_TOOLS_STANDALONE=1 强制独立跑）。
 #
 # 设计：
 # - 每步独立计时并写 TSV 汇总；某一步失败不会中断后续步骤（一次拿到全貌）；
@@ -102,6 +104,17 @@ else
         "缺少 $CTEST_BUILD/CTestTestfile.cmake（cmake -S . -B build-work -DGO2CPP_BUILD_TESTS=ON）"
 fi
 
+
+# tools 三套脚本已注册进 ctest（cmake/Go2CppTests.cmake 的 tools-migration /
+# tools-cli / tools-replay）。ctest 步骤已实跑含这三条用例的构建目录时，
+# 第 4 步默认不再重复执行，只记 SKIP 标注覆盖关系；
+# RUN_TOOLS_STANDALONE=1 可强制独立跑。
+TOOLS_IN_CTEST=0
+if [ -f "$CTEST_BUILD/CTestTestfile.cmake" ] &&
+    grep -q "tools-migration" "$CTEST_BUILD/CTestTestfile.cmake" 2>/dev/null; then
+    TOOLS_IN_CTEST=1
+fi
+
 # ---------------------------------------------------------------------------
 # 2) enhanced 五能力矩阵
 # ---------------------------------------------------------------------------
@@ -171,8 +184,14 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4) tools 测试
+# 4) tools 测试（ctest 已覆盖时只做兜底）
 # ---------------------------------------------------------------------------
+if [ "$TOOLS_IN_CTEST" -eq 1 ] && [ "${RUN_TOOLS_STANDALONE:-0}" != "1" ]; then
+    mark_skip "tools-migration" 0 "已由 ctest tools-migration 覆盖（RUN_TOOLS_STANDALONE=1 强制独立跑）"
+    mark_skip "tools-cli" 0 "已由 ctest tools-cli 覆盖"
+    mark_skip "tools-replay-unit" 0 "已由 ctest tools-replay 覆盖"
+    mark_skip "tools-replay-scenarios" 0 "已由 ctest tools-replay 覆盖"
+else
 MIG_DIR_RESOLVED="$(pick "${MIG_DIR:-}" "$ROOT/build-migration")" || true
 if [ -x "$MIG_DIR_RESOLVED/migrate" ]; then
     run_step "tools-migration" 900 \
@@ -203,6 +222,8 @@ if [ -x "$REPLAY_DIR_RESOLVED/replay" ]; then
 else
     mark_skip "tools-replay-scenarios" 0 \
         "缺少 $REPLAY_DIR_RESOLVED/replay（tools/replay/build.sh）"
+fi
+
 fi
 
 # ---------------------------------------------------------------------------
