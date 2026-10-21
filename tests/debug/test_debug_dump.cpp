@@ -27,8 +27,10 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -802,13 +804,16 @@ void run_debug_dump_tests() {
         GO2CPP_CHECK(Contains(payload.text, "normal_event_count="));
     }
 
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
     // -------------------------------------------------------------------
-    // 场景 12：ReadSince 增量游标（订阅的底层语义）
+    // 场景 12：ReadSince 增量游标（v6 时间戳游标）
     // -------------------------------------------------------------------
     {
         EventRing::Reset();
-        const std::uint64_t cursor = EventRing::PublishSeq();
-        GO2CPP_CHECK(cursor == 0);
+        const EventCursor cursor = EventRing::CurrentCursor();
+        GO2CPP_CHECK(cursor.ts_ns == 0);
+        GO2CPP_CHECK(cursor.thread_id == 0);
+        GO2CPP_CHECK(cursor.local_seq == 0);
         for (int i = 0; i < 10; ++i) {
             EventRing::Record(SchedEventCode::kParkEnter,
                               static_cast<std::uint64_t>(i + 1), 0);
@@ -818,14 +823,97 @@ void run_debug_dump_tests() {
         GO2CPP_CHECK(first_batch.front().gid == 1);
         GO2CPP_CHECK(first_batch.back().gid == 4);
         for (std::size_t i = 1; i < first_batch.size(); ++i) {
+            GO2CPP_CHECK(!EventCursorLess(CursorOf(first_batch[i]),
+                                          CursorOf(first_batch[i - 1])));
             GO2CPP_CHECK(first_batch[i - 1].seq < first_batch[i].seq);
         }
-        const auto rest = EventRing::ReadSince(first_batch.back().seq, 0);
+        const auto rest =
+            EventRing::ReadSince(CursorOf(first_batch.back()), 0);
         GO2CPP_REQUIRE(rest.size() == 6U);
         GO2CPP_CHECK(rest.front().gid == 5);
         GO2CPP_CHECK(rest.back().gid == 10);
-        GO2CPP_CHECK(EventRing::ReadSince(rest.back().seq, 0).empty());
+        GO2CPP_CHECK(
+            EventRing::ReadSince(CursorOf(rest.back()), 0).empty());
     }
+
+    // -------------------------------------------------------------------
+    // 场景 12b：多线程 thread_id 稳定 + 时间戳排序 + 游标不重不漏
+    // -------------------------------------------------------------------
+    {
+        EventRing::Reset();
+        const EventCursor start = EventRing::CurrentCursor();
+        constexpr int kThreads = 4;
+        constexpr int kPerThread = 32;
+        std::atomic<int> written{0};
+        std::atomic<bool> release{false};
+        std::vector<std::thread> writers;
+        for (int t = 0; t < kThreads; ++t) {
+            writers.emplace_back([&written, &release, t] {
+                for (int i = 0; i < kPerThread; ++i) {
+                    EventRing::Record(
+                        SchedEventCode::kParkEnter,
+                        static_cast<std::uint64_t>(t * 1000 + i), 0);
+                }
+                written.fetch_add(1, std::memory_order_release);
+                // 保持线程活着：线程退出时 ring 会从全局表摘除，
+                // 快照就看不到这些事件了。
+                while (!release.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+            });
+        }
+        while (written.load(std::memory_order_acquire) < kThreads) {
+            std::this_thread::yield();
+        }
+        const auto all = EventRing::Snapshot(0);
+        GO2CPP_REQUIRE(all.size() ==
+                       static_cast<std::size_t>(kThreads * kPerThread));
+        for (std::size_t i = 1; i < all.size(); ++i) {
+            GO2CPP_CHECK(!EventCursorLess(CursorOf(all[i]),
+                                          CursorOf(all[i - 1])));
+        }
+        std::map<std::uint32_t, std::uint32_t> thread_for_prefix;
+        std::map<std::uint32_t, std::uint64_t> last_seq_for_prefix;
+        for (const auto& event : all) {
+            const std::uint32_t prefix =
+                static_cast<std::uint32_t>(event.gid / 1000U);
+            const auto found = thread_for_prefix.find(prefix);
+            if (found == thread_for_prefix.end()) {
+                thread_for_prefix[prefix] = event.thread_id;
+            } else {
+                GO2CPP_CHECK(found->second == event.thread_id);
+            }
+            const auto seq_found = last_seq_for_prefix.find(prefix);
+            if (seq_found != last_seq_for_prefix.end()) {
+                GO2CPP_CHECK(event.seq == seq_found->second + 1U);
+            }
+            last_seq_for_prefix[prefix] = event.seq;
+        }
+        GO2CPP_CHECK(thread_for_prefix.size() ==
+                     static_cast<std::size_t>(kThreads));
+        // 游标分批：第一批 50 条 + 剩余，合计 128 条且 gid 无重复。
+        const auto batch = EventRing::ReadSince(start, 50);
+        GO2CPP_REQUIRE(batch.size() == 50U);
+        const auto tail = EventRing::ReadSince(CursorOf(batch.back()), 0);
+        GO2CPP_REQUIRE(tail.size() ==
+                       static_cast<std::size_t>(kThreads * kPerThread) - 50U);
+        std::set<std::uint64_t> gids;
+        for (const auto& event : batch) {
+            gids.insert(event.gid);
+        }
+        for (const auto& event : tail) {
+            gids.insert(event.gid);
+        }
+        GO2CPP_CHECK(gids.size() ==
+                     static_cast<std::size_t>(kThreads * kPerThread));
+        GO2CPP_CHECK(
+            EventRing::ReadSince(CursorOf(tail.back()), 0).empty());
+        release.store(true, std::memory_order_release);
+        for (auto& writer : writers) {
+            writer.join();
+        }
+    }
+#endif
 #endif
 
     // -------------------------------------------------------------------

@@ -181,7 +181,7 @@ std::string FormatEventLine(const EventRecord& event) {
 }
 
 std::string BuildSubscriptionHeader(const SubscriptionOptions& options,
-                                    std::uint64_t cursor_start) {
+                                    const EventCursor& cursor_start) {
     std::string payload;
     payload += "schema=go2cpp.dump.events.subscription/1\n";
     payload += "version=1\n";
@@ -191,7 +191,13 @@ std::string BuildSubscriptionHeader(const SubscriptionOptions& options,
     payload += "protocol=GO2CPP-DEBUG-PUSH/1\n";
     payload += "interval_ms=" + std::to_string(options.interval.count()) + "\n";
     payload += "max_events=" + std::to_string(options.max_events) + "\n";
-    payload += "cursor_start=" + std::to_string(cursor_start) + "\n";
+    // v6：游标主键是时间戳；同时导出 thread_id/seq 作为同一纳秒的
+    // 打破并列信息（客户端只需回传这三个值即可无重无漏）。
+    payload += "cursor_start=" + std::to_string(cursor_start.ts_ns) + "\n";
+    payload += "cursor_start_thread_id=" +
+               std::to_string(cursor_start.thread_id) + "\n";
+    payload += "cursor_start_seq=" +
+               std::to_string(cursor_start.local_seq) + "\n";
     payload += "capacity=" + std::to_string(EventRing::kCapacity) + "\n";
     payload += "critical_capacity=" +
                std::to_string(EventRing::kCriticalCapacity) + "\n";
@@ -202,22 +208,29 @@ std::string BuildSubscriptionHeader(const SubscriptionOptions& options,
 std::string BuildPushPayload(const std::vector<EventRecord>& events,
                              std::uint64_t dropped_gap,
                              std::uint64_t dropped_backpressure,
-                             std::uint64_t seq_last) {
+                             std::uint64_t published_total,
+                             const EventCursor& cursor) {
     const std::uint64_t first_seq = events.front().seq;
     const std::uint64_t last_seq = events.back().seq;
     const std::uint64_t dropped_total = dropped_gap + dropped_backpressure;
     std::string payload;
     payload += "schema=go2cpp.dump.events.push/1\n";
     payload += "version=1\n";
+    // first_seq/last_seq 是首尾事件的**per-thread** 序号（兼容旧字段）。
     payload += "first_seq=" + std::to_string(first_seq) + "\n";
     payload += "last_seq=" + std::to_string(last_seq) + "\n";
+    payload += "first_ts_ns=" + std::to_string(events.front().ts_ns) + "\n";
+    payload += "last_ts_ns=" + std::to_string(events.back().ts_ns) + "\n";
     payload += "event_count=" + std::to_string(events.size()) + "\n";
     payload += "dropped_total=" + std::to_string(dropped_total) + "\n";
     payload += "dropped_gap=" + std::to_string(dropped_gap) + "\n";
     payload += "dropped_backpressure=" +
                std::to_string(dropped_backpressure) + "\n";
-    payload += "seq_last=" + std::to_string(seq_last) + "\n";
-    payload += "cursor=" + std::to_string(last_seq) + "\n";
+    // seq_last 自 v6 起是累计发布事件数（仍单调），不再是全局 seq。
+    payload += "seq_last=" + std::to_string(published_total) + "\n";
+    payload += "cursor=" + std::to_string(cursor.ts_ns) + "\n";
+    payload += "cursor_thread_id=" + std::to_string(cursor.thread_id) + "\n";
+    payload += "cursor_seq=" + std::to_string(cursor.local_seq) + "\n";
     payload += "# seq ts_ns tid code gid arg2 pid\n";
     for (const auto& event : events) {
         payload += FormatEventLine(event);
@@ -711,7 +724,8 @@ void DebugServer::ServeSubscription(int fd,
     timeout.tv_sec = 2;
     timeout.tv_usec = 0;
     (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-    std::uint64_t cursor = EventRing::PublishSeq();
+    // v6：订阅起点是当前最新事件的时间戳游标，而不是全局 seq。
+    EventCursor cursor = EventRing::CurrentCursor();
     if (!SendBlocking(fd,
                       OkResponse(BuildSubscriptionHeader(options, cursor)))) {
         ::close(fd);
@@ -726,9 +740,15 @@ void DebugServer::ServeSubscription(int fd,
     std::uint64_t dropped_gap_total = 0;
     std::uint64_t dropped_backpressure_total = 0;
     std::uint64_t idle_rounds = 0;
+    // 同一线程的 local seq 跳号才能精确计数（环形覆盖）；
+    // 跨线程事件的丢失无法从时间戳游标反推，这里只做尽力统计。
+    std::map<std::uint32_t, std::uint64_t> last_seq_by_thread;
+    if (cursor.thread_id != 0U) {
+        last_seq_by_thread[cursor.thread_id] = cursor.local_seq;
+    }
     while (!m_stop.load(std::memory_order_acquire)) {
-        const std::uint64_t published = EventRing::PublishSeq();
-        if (published <= cursor) {
+        const EventCursor latest = EventRing::CurrentCursor();
+        if (EventCursorEqual(latest, cursor)) {
             if (!ClientAlive(fd)) {
                 break;
             }
@@ -738,7 +758,7 @@ void DebugServer::ServeSubscription(int fd,
         std::vector<EventRecord> events =
             EventRing::ReadSince(cursor, options.max_events);
         if (events.empty()) {
-            // 发布序号已前进但环形里暂时看不到记录：写入者可能刚拿到 seq、
+            // 最新游标已前进但环形里暂时看不到记录：写入者可能刚拿到时间戳、
             // 槽位还没发布。短暂重试；连续多轮为空才按「已被覆盖」跳过。
             if (++idle_rounds < 100) {
                 if (!ClientAlive(fd)) {
@@ -747,18 +767,27 @@ void DebugServer::ServeSubscription(int fd,
                 std::this_thread::sleep_for(options.interval);
                 continue;
             }
-            dropped_gap_total += published - cursor;
-            cursor = published;
+            cursor = latest;
             idle_rounds = 0;
             continue;
         }
         idle_rounds = 0;
-        if (events.front().seq > cursor + 1) {
-            dropped_gap_total += events.front().seq - cursor - 1;
+        for (const auto& event : events) {
+            const auto found = last_seq_by_thread.find(event.thread_id);
+            if (found != last_seq_by_thread.end() &&
+                event.seq > found->second + 1U) {
+                dropped_gap_total += event.seq - found->second - 1U;
+            }
+            if (found == last_seq_by_thread.end() ||
+                event.seq > found->second) {
+                last_seq_by_thread[event.thread_id] = event.seq;
+            }
         }
-        const std::uint64_t seq_last = events.back().seq;
+        const EventCursor next_cursor = CursorOf(events.back());
+        const std::uint64_t published = EventRing::PublishedEvents();
         const std::string payload = BuildPushPayload(
-            events, dropped_gap_total, dropped_backpressure_total, published);
+            events, dropped_gap_total, dropped_backpressure_total, published,
+            next_cursor);
         std::size_t written = 0;
         const SendResult result = SendBounded(fd, PushResponse(payload), &written);
         if (result == SendResult::kFailed) {
@@ -768,7 +797,7 @@ void DebugServer::ServeSubscription(int fd,
         if (result == SendResult::kBackpressure) {
             // 背压策略：丢弃最旧的一整批并推进游标，后续帧如实报告。
             dropped_backpressure_total += events.size();
-            cursor = seq_last;
+            cursor = next_cursor;
             if (!ClientAlive(fd)) {
                 break;
             }
@@ -776,9 +805,9 @@ void DebugServer::ServeSubscription(int fd,
                 options.interval, std::chrono::milliseconds(50)));
             continue;
         }
-        cursor = seq_last;
+        cursor = next_cursor;
         // 还有积压就立即继续发下一帧；没有则等待新事件。
-        if (EventRing::PublishSeq() <= cursor) {
+        if (EventCursorEqual(EventRing::CurrentCursor(), cursor)) {
             std::this_thread::sleep_for(options.interval);
         }
     }

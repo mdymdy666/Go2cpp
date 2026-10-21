@@ -109,13 +109,15 @@ TextDump& TextDump::KeyHex(std::string_view key, std::uint64_t value) {
 ConsistencyStamp BeginConsistency() noexcept {
     ConsistencyStamp stamp;
     stamp.supported = EventRing::Enabled();
-    stamp.seq_start = EventRing::PublishSeq();
+    // v6：事件环已无全局 seq，用累计发布事件数作一致性探针
+    // （仍单调；语义从「最后序号」变为「已发布总数」）。
+    stamp.seq_start = EventRing::PublishedEvents();
     stamp.seq_end = stamp.seq_start;
     return stamp;
 }
 
 void EndConsistency(ConsistencyStamp& stamp) noexcept {
-    stamp.seq_end = EventRing::PublishSeq();
+    stamp.seq_end = EventRing::PublishedEvents();
 }
 
 void AppendConsistency(TextDump& text, const ConsistencyStamp& stamp) {
@@ -1086,6 +1088,7 @@ ViewJson EventToJson(const EventRecord& event) {
     ViewJson item;
     item["seq"] = event.seq;
     item["ts_ns"] = event.ts_ns;
+    item["thread_id"] = event.thread_id;
     item["tid"] = event.tid;
     if (event.pid == kInvalidProcessorId) {
         item["pid"] = nullptr;
@@ -1127,13 +1130,23 @@ ViewJson WindowJson(const std::vector<EventRecord>& events,
                     std::uint64_t seq_start, std::uint64_t seq_end) {
     ViewJson window;
     window["event_count"] = events.size();
+    // v6：seq 是 per-thread 序号，跨线程不可直接相减；
+    // first_seq/last_seq 保留为首尾条目的本线程序号，另给出时间戳。
     window["first_seq"] = events.empty() ? 0 : events.front().seq;
     window["last_seq"] = events.empty() ? 0 : events.back().seq;
+    window["first_ts_ns"] = events.empty() ? 0 : events.front().ts_ns;
+    window["last_ts_ns"] = events.empty() ? 0 : events.back().ts_ns;
+    // 按 thread_id 分组检测跳号（ring 覆盖/窗口截断）；
+    // 首条不计，同线程的 normal/critical 两段共享同一计数器。
+    std::map<std::uint32_t, std::uint64_t> last_seq_by_thread;
     std::uint64_t gaps = 0;
-    for (std::size_t index = 1; index < events.size(); ++index) {
-        if (events[index].seq != events[index - 1].seq + 1) {
+    for (const auto& event : events) {
+        const auto found = last_seq_by_thread.find(event.thread_id);
+        if (found != last_seq_by_thread.end() &&
+            event.seq != found->second + 1U) {
             ++gaps;
         }
+        last_seq_by_thread[event.thread_id] = event.seq;
     }
     const std::uint64_t total_published = EventRing::TotalCountAll();
     window["gaps"] = gaps;
@@ -1524,18 +1537,22 @@ ViewJson TimerView(const ViewJson& timer_service,
     std::uint64_t fire_total = 0;
     std::uint64_t fire_with_enqueue = 0;
     // 回调投递与 G 入队按时间邻近关联：执行器提交回调后立刻 spawn，
-    // 两条事件的 seq 只隔少量记录，这里按「同一 timer 的 fire 之后
-    // 最近一次 callback/enqueue」统计。
+    // 两条事件在按时间排序的窗口里只隔少量条目。v6 的 seq 已是
+    // per-thread，不能跨线程相减；改用排序后的条目距离。
     std::uint64_t last_callback_gid = 0;
     std::uint64_t callbacks_without_timer_id = 0;
     // fire → callback → G 入队的近邻关联（同一 timer 线程相邻记录）。
-    std::uint64_t last_fire_seq = 0;
-    std::uint64_t last_callback_seq = 0;
+    std::size_t last_fire_index = 0;
+    std::size_t last_callback_index = 0;
+    bool has_last_fire = false;
+    bool has_last_callback = false;
+    std::size_t event_index = 0;
     std::uint64_t fire_events = 0;
     std::uint64_t fire_events_with_callback = 0;
     std::uint64_t fire_events_with_enqueue = 0;
     std::uint64_t g_enqueue_without_timer_id = 0;
     for (const auto& event : events) {
+        const std::size_t current_index = event_index++;
         const auto code = static_cast<SchedEventCode>(event.code);
         if (!IsTimerEventCode(code) &&
             code != SchedEventCode::kTimerCallback &&
@@ -1563,7 +1580,8 @@ ViewJson TimerView(const ViewJson& timer_service,
                 state.last_fire_ts = event.ts_ns;
                 state.saw_fire = true;
                 ++fire_events;
-                last_fire_seq = event.seq;
+                last_fire_index = current_index;
+                has_last_fire = true;
             } else if (code == SchedEventCode::kTimerCancel) {
                 state.cancel_seq = event.seq;
             } else {
@@ -1584,11 +1602,12 @@ ViewJson TimerView(const ViewJson& timer_service,
                 state.saw_callback = true;
                 item["timer_id_known"] = true;
             }
-            if (last_fire_seq != 0 && event.seq > last_fire_seq &&
-                event.seq - last_fire_seq <= 128) {
+            if (has_last_fire &&
+                current_index - last_fire_index <= 128) {
                 ++fire_events_with_callback;
             }
-            last_callback_seq = event.seq;
+            last_callback_index = current_index;
+            has_last_callback = true;
             last_callback_gid = event.gid;
             item["source_gid"] = event.gid;
         } else {
@@ -1606,8 +1625,8 @@ ViewJson TimerView(const ViewJson& timer_service,
                 item["timer_id_known"] = true;
             }
             item["source_gid"] = last_callback_gid;
-            if (last_callback_seq != 0 && event.seq > last_callback_seq &&
-                event.seq - last_callback_seq <= 128) {
+            if (has_last_callback &&
+                current_index - last_callback_index <= 128) {
                 ++fire_events_with_enqueue;
             }
         }
@@ -1832,7 +1851,7 @@ ViewJson SchedView(const std::vector<EventRecord>& events,
 
     struct Chain {
         std::uint64_t gid{0};
-        std::uint64_t last_seq{0};
+        std::uint64_t last_ts_ns{0};
         std::uint64_t enqueue_seq{0};
         std::uint64_t push_seq{0};
         std::uint64_t pop_seq{0};
@@ -1846,14 +1865,14 @@ ViewJson SchedView(const std::vector<EventRecord>& events,
         std::uint64_t wake_count{0};
     };
     std::map<std::uint64_t, Chain> chain_map;
-    std::uint64_t max_seq_in_window = 0;
+    std::uint64_t max_ts_in_window = 0;
     for (const auto& event : events) {
         const auto code = static_cast<SchedEventCode>(event.code);
         if (!IsSchedulerFlowCode(code)) {
             continue;
         }
-        if (event.seq > max_seq_in_window) {
-            max_seq_in_window = event.seq;
+        if (event.ts_ns > max_ts_in_window) {
+            max_ts_in_window = event.ts_ns;
         }
         flow.push_back(EventToJson(event));
         switch (code) {
@@ -1874,9 +1893,8 @@ ViewJson SchedView(const std::vector<EventRecord>& events,
         }
         Chain& chain = chain_map[event.gid];
         chain.gid = event.gid;
-        if (event.seq > chain.last_seq) {
-            chain.last_seq = event.seq;
-        }
+        // events 已按 (ts_ns, thread_id, seq) 升序，直接记最后一条的时间戳。
+        chain.last_ts_ns = event.ts_ns;
         switch (code) {
             case SchedEventCode::kEnqueue:
                 if (chain.enqueue_seq == 0) {
@@ -1926,7 +1944,7 @@ ViewJson SchedView(const std::vector<EventRecord>& events,
     }
     std::sort(candidates.begin(), candidates.end(),
               [](const Chain* lhs, const Chain* rhs) {
-                  return lhs->last_seq > rhs->last_seq;
+                  return lhs->last_ts_ns > rhs->last_ts_ns;
               });
     if (candidates.size() > 64) {
         candidates.resize(64);
@@ -1987,7 +2005,9 @@ ViewJson SchedView(const std::vector<EventRecord>& events,
     counts["worker_park"] = worker_park;
     counts["worker_unpark"] = worker_unpark;
     counts["sysmon_pass"] = sysmon;
-    counts["max_seq_in_window"] = max_seq_in_window;
+    counts["max_ts_ns"] = max_ts_in_window;
+    // 兼容旧字段名：v6 下该值已无意义，固定为 0。
+    counts["max_seq_in_window"] = 0;
     view["counts"] = counts;
     view["pairing"] = pairing;
     view["chains"] = chains;
@@ -2713,9 +2733,9 @@ std::string BuildViewJson(std::string_view name, std::uint64_t gid,
         return root.dump() + "\n";
     }
 
-    const std::uint64_t seq_start = EventRing::PublishSeq();
+    const std::uint64_t seq_start = EventRing::PublishedEvents();
     const std::vector<EventRecord> events = EventRing::Snapshot(0);
-    const std::uint64_t seq_end = EventRing::PublishSeq();
+    const std::uint64_t seq_end = EventRing::PublishedEvents();
     const ViewJson scheduler = ParseViewJson(scheduler_json);
     const ViewJson timer_service = ParseViewJson(timer_json);
     const ViewJson io_manager = ParseViewJson(io_json);

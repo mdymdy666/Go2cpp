@@ -38,9 +38,10 @@
  * ```
  *
  * 语义与背压：
- * - 订阅从**当前**发布序号开始（`cursor_start`），只推送之后产生的新事件；
+ * - 订阅从**当前最新事件**开始（`cursor_start` = 时间戳，辅以
+ *   `cursor_start_thread_id` / `cursor_start_seq`），只推送之后产生的新事件；
  * - 服务端在独立线程里按 `interval_ms`（默认 20）轮询事件环，用
- *   `EventRing::ReadSince(cursor, max_events)` 取增量，**不阻塞**事件记录方；
+ *   `EventRing::ReadSince(EventCursor, max_events)` 取增量，**不阻塞**事件记录方；
  * - 推送帧最大 `max_events` 条（默认 256），保证单帧有界；
  * - 客户端读得慢时，发送使用 `MSG_DONTWAIT`：整批发送失败即**丢弃最旧**的
  *   这一批并推进游标，后续 push 里的 `dropped_total` / `dropped_backpressure`

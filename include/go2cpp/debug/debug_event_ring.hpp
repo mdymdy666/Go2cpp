@@ -15,13 +15,16 @@
  * seq ts_ns tid code gid arg2 pid
  * ```
  *
- * ## 字段语义（本轮新增 pid；旧字段位置不变，pid 追加在行尾）
+ * ## 字段语义（v6：去全局 seq 原子）
  *
- * - `seq`：**进程内全局单调**序号（1 起，原子递增）。旧版是「每线程独立递增」，
- *   跨线程排序无意义；本轮改为全局唯一，`Snapshot()` 的排序与订阅游标才真正
- *   可用。代价是每次记录一次 `fetch_add`（仅 `GO2CPP_DEBUG_DUMP=ON` 构建）。
- * - `ts_ns`：steady_clock 纳秒，仅同机可比。
- * - `tid`：线程 id 的 32 位哈希。
+ * - `seq`：**每线程单调**序号（1 起，普通自增，无原子）。跨线程不可直接比较；
+ *   事件全序由 `(ts_ns, thread_id, seq)` 定义。旧版（v2~v5）这里是进程级
+ *   `fetch_add` 的全局序号，多核高频路径上每个事件争同一 cacheline，实测是
+ *   park/wake 密集场景的主要固定成本；v6 移除该原子。
+ * - `ts_ns`：steady_clock 纳秒，仅同机可比；**排序主键**。
+ * - `thread_id`：稳定每线程 id（1 起；线程首次记录时从全局 atomic 分配一次，
+ *   之后只读 thread_local）。排序次键，用于打破同一纳秒的并列。
+ * - `tid`：线程 id 的 32 位哈希（仅用于人读/与旧 dump 对照）。
  * - `pid`：事件发生时**当前线程绑定的 P**（`Scheduler::current_processor_id()`
  *   的发布值，由调度器在 worker 绑定/解绑时写入）。未绑定 P 的线程（IO 轮询
  *   线程、普通线程、测试线程）记录为 `kInvalidProcessorId`（`0xFFFFFFFF`）。
@@ -47,7 +50,7 @@
  *
  * 注意：关键区本身仍是环形缓冲 —— 关键事件超过 `kCriticalCapacity` 条时，
  * 更旧的关键事件会被覆盖（这是「不丢失全部」而不是「绝对不丢」）。dump 文本
- * 里的 `critical_event_count` / `seq_at_start` 让消费方可以判断是否发生过截断。
+ * 里的 `critical_event_count` / `published_total` 让消费方可以判断是否发生过截断。
  *
  * ## 全局累计计数（本轮）
  *
@@ -75,11 +78,19 @@
  *
  * `Snapshot()/DumpText()/DumpJson()/ReadSince()` 只读取环形缓冲，不调用调度器、
  * 不改状态。读取是 **best-effort**：与正在写入的线程并发时，单条事件字段可能被
- * 覆盖（用全局唯一的 `seq` 二次校验丢弃撕裂记录）；这适合诊断与重放，不构成
- * 精确的 happens-before 记录。
+ * 覆盖（用「写入前清 seq、写完最后写 seq」的二次校验丢弃撕裂记录）；这适合
+ * 诊断与重放，不构成精确的 happens-before 记录。
  *
- * 导出文本/JSON 自带 `seq_at_start` / `seq_at_end`：两者相同表示快照期间没有
- * 新事件发布；不同则说明存在并发写入（见 debug_dump.hpp 的一致性标记约定）。
+ * 导出文本/JSON 自带 `seq_at_start` / `seq_at_end`（v6 起是**累计发布事件数**，
+ * 仍单调）：两者相同表示快照期间没有新事件发布；不同则说明存在并发写入
+ * （见 debug_dump.hpp 的一致性标记约定）。
+ *
+ * ## 订阅游标（v6）
+ *
+ * `ReadSince` 的游标从「全局 seq」改为 `EventCursor{ts_ns, thread_id, seq}`：
+ * 事件按 `(ts_ns, thread_id, seq)` 全序比较，返回严格大于游标的事件。
+ * 时间戳是主键，`thread_id` 打破同时刻并列，`seq` 再打破同一线程同纳秒并列，
+ * 因此正常（无覆盖）情况下不重不漏。
  */
 
 #include "go2cpp/debug/debug_config.hpp"
@@ -387,14 +398,14 @@ bool SchedEventCodeIsCritical(SchedEventCode code) noexcept;
 
 /// 一条事件记录（固定字段，导出格式与 §1.3 对齐 + v2 的 pid）。
 struct EventRecord {
-    std::uint64_t seq{0};   ///< 全局单调序号（v2 起跨线程唯一）
-    std::uint64_t ts_ns{0}; ///< steady_clock 纳秒（仅同机可比）
+    std::uint64_t seq{0};   ///< 每线程单调序号（1 起；跨线程不可比）
+    std::uint64_t ts_ns{0}; ///< steady_clock 纳秒（排序主键；仅同机可比）
     std::uint64_t gid{0};   ///< Task/G 编号；M 事件时为 M 编号
     std::uint64_t arg2{0};  ///< 事件附加量（原因/结果/目标 P/队列长度）
     std::uint32_t code{0};  ///< SchedEventCode 数值
-    std::uint32_t tid{0};   ///< 线程 id 的 32 位哈希
+    std::uint32_t tid{0};   ///< 线程 id 的 32 位哈希（人读/兼容旧 dump）
     std::uint32_t pid{0};   ///< 当前线程绑定的 P；未绑定为 kInvalidProcessorId
-    std::uint32_t reserved{0}; ///< 保留（显式零，保持 8 字节对齐与未来扩展）
+    std::uint32_t thread_id{0}; ///< 稳定每线程 id（1 起；排序次键）
     std::uint64_t arg3{0};  ///< timer kind / park-wake 原语原因码
     std::uint64_t arg4{0};  ///< timer 来源 gid / park 上下文
 
@@ -409,6 +420,49 @@ struct EventRecord {
     std::uint32_t waiters{0};     ///< 操作后的队列深度（近似）
     std::uint32_t reserved2{0};   ///< 保留（显式零）
 };
+
+/**
+ * @brief 订阅游标：按 `(ts_ns, thread_id, seq)` 定义的事件全序中的位置。
+ *
+ * @details `ts_ns` 是主键；`thread_id` 打破同一纳秒的并列；
+ *          `local_seq` 打破同一线程同一纳秒的并列（保证不重不漏）。
+ *          `{0,0,0}` 表示空环的起始位置。
+ */
+struct EventCursor {
+    std::uint64_t ts_ns{0};
+    std::uint32_t thread_id{0};
+    std::uint64_t local_seq{0};
+};
+
+/// 一条记录对应的游标。
+inline EventCursor CursorOf(const EventRecord& record) noexcept {
+    return EventCursor{record.ts_ns, record.thread_id, record.seq};
+}
+
+/// 游标全序比较（严格小于）。
+inline bool EventCursorLess(const EventCursor& lhs,
+                            const EventCursor& rhs) noexcept {
+    if (lhs.ts_ns != rhs.ts_ns) {
+        return lhs.ts_ns < rhs.ts_ns;
+    }
+    if (lhs.thread_id != rhs.thread_id) {
+        return lhs.thread_id < rhs.thread_id;
+    }
+    return lhs.local_seq < rhs.local_seq;
+}
+
+/// 两个游标是否相等。
+inline bool EventCursorEqual(const EventCursor& lhs,
+                             const EventCursor& rhs) noexcept {
+    return lhs.ts_ns == rhs.ts_ns && lhs.thread_id == rhs.thread_id &&
+           lhs.local_seq == rhs.local_seq;
+}
+
+/// 事件是否严格晚于游标（即应当被订阅者交付）。
+inline bool EventAfterCursor(const EventRecord& record,
+                             const EventCursor& cursor) noexcept {
+    return EventCursorLess(cursor, CursorOf(record));
+}
 
 /**
  * @brief 原语提示作用域（RAII；只影响诊断字段）。
@@ -518,17 +572,32 @@ public:
     static std::size_t ThreadCount() noexcept;
     /// 未注册的线程数（线程数超过 kMaxThreads 时累加）。
     static std::uint64_t DroppedThreads() noexcept;
-    /// 已发布事件总数（全局单调游标；OFF 构建恒为 0）。
+    /// 进程启动以来累计发布的事件数（= TotalCountAll()；OFF 构建恒为 0）。
+    static std::uint64_t PublishedEvents() noexcept;
+    /**
+     * @brief 兼容旧名：v6 起返回累计发布事件数，不再是全局 seq 游标。
+     * @deprecated 新代码用 `PublishedEvents()`；订阅游标用 `CurrentCursor()`。
+     */
     static std::uint64_t PublishSeq() noexcept;
-    /// 采集全部线程环的事件，按 seq 升序返回最近 `max` 条（0=全部）。
+    /// 采集全部线程环的事件，按 `(ts_ns, thread_id, seq)` 升序返回最近 `max` 条。
     static std::vector<EventRecord> Snapshot(std::size_t max = 0);
     /**
-     * @brief 返回 seq > cursor 的事件（按 seq 升序，最多 `max` 条；0=不限）。
+     * @brief 当前最新事件的游标（空环返回 `{0,0,0}`）。
+     * @details 订阅建立时用它作为起点：只推送此后发布的事件。
+     *          需要遍历已注册线程的最后一条记录，O(线程数)。
+     */
+    static EventCursor CurrentCursor();
+    /**
+     * @brief 返回严格大于 cursor 的事件（按 `(ts_ns, thread_id, seq)` 升序，
+     *        最多 `max` 条；0=不限）。
      * @details 优先返回**最旧**的事件：若积压超过 `max`，本次只交付最旧的
-     *          `max` 条，剩余留到下一次，调用方用最后一条的 seq 推进游标。
+     *          `max` 条，剩余留到下一次，调用方用最后一条的 `CursorOf()` 推进游标。
      *          用于 DebugServer 的 `SUBSCRIBE events` 增量推送。
      */
-    static std::vector<EventRecord> ReadSince(std::uint64_t cursor,
+    static std::vector<EventRecord> ReadSince(const EventCursor& cursor,
+                                              std::size_t max = 0);
+    /// 便捷重载：仅按时间戳比较（thread_id/seq 视为 0）。
+    static std::vector<EventRecord> ReadSince(std::uint64_t ts_cursor_ns,
                                               std::size_t max = 0);
     /// 清空所有已注册 ring 的内容（测试与重放会话切换用；**仅**用于无并发写入时）。
     static void Reset() noexcept;

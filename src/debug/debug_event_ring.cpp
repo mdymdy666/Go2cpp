@@ -5,14 +5,15 @@
  * ## 并发模型
  *
  * 每个线程独占自己的 `ThreadRing`，写入者只有本线程，读者是任意线程的
- * `Snapshot()`/`ReadSince()`。写入顺序是「先写槽位字段，最后 release 写 head」；
- * 读者先 acquire 读 head 再复制槽位，并用**全局唯一**的 seq 二次校验：
- * 若复制期间槽位被下一轮覆盖，`slot.seq != record.seq`，该条被丢弃而不是
- * 当成撕裂记录返回。
+ * `Snapshot()`/`ReadSince()`。写入顺序是「先清 seq、写槽位字段、最后写 seq，
+ * 再 release 写 head」；读者先 acquire 读 head 再复制槽位，并用**每线程唯一**
+ * 的 seq 二次校验：若复制期间槽位被下一轮覆盖，`slot.seq != record.seq`，
+ * 该条被丢弃而不是当成撕裂记录返回。
  *
  * ## 两段环形
  *
- * 普通区与关键区各自有独立的 head 与槽位数组，共享全局 seq 计数器。
+ * 普通区与关键区各自有独立的 head 与槽位数组，共享同一 per-thread
+ * 序号计数器（v6：不再有全局 seq 原子）。
  * 关键事件选择目标段由 `SchedEventCodeIsCritical()` 决定；两段互不覆盖。
  * 两段容量都是编译期常量，见 debug_event_ring.hpp。
  */
@@ -84,6 +85,10 @@ Table& GetTable() {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
 
 thread_local ThreadRing t_ring;
+/// 当前线程的稳定 id（1 起；0=未分配，首次记录时分配一次）。
+thread_local std::uint32_t t_thread_id = 0;
+/// 当前线程的事件序号（1 起；普通自增，无原子）。
+thread_local std::uint64_t t_local_seq = 0;
 /// 当前线程已发布的 P；未绑定为 kInvalidProcessorId。
 thread_local std::uint32_t t_processor_id = kInvalidProcessorId;
 /// 当前线程正在执行的 G（0=未绑定）。
@@ -115,10 +120,11 @@ EventTotals& GetTotals() {
 }
 
 /**
- * 全局单调 seq：本轮起跨线程唯一。
- * 只在 ON 构建存在；OFF 构建里 `PublishSeq()` 返回 0，不产生任何符号引用。
+ * 每线程 id 分配器：线程首次记录时 fetch_add 一次，之后只读
+ * thread_local。不在热路径上（每线程一次）；这是去掉每事件全局原子的
+ * 关键：稳定 id 只需分配一次，排序与游标用它而不是全局序号。
  */
-std::atomic<std::uint64_t> g_publish_seq{0};
+std::atomic<std::uint32_t> g_next_thread_id{1};
 
 void AddRing(ThreadRing* ring) {
     Table& table = GetTable();
@@ -147,6 +153,10 @@ void RemoveRing(ThreadRing* ring) {
 
 struct Registration {
     Registration() {
+        // 每线程一次的全局原子：分配稳定 thread_id 后写入 thread_local，
+        // 后续 Record() 只读本地变量。
+        t_thread_id =
+            g_next_thread_id.fetch_add(1, std::memory_order_relaxed);
         t_ring.tid.store(
             static_cast<std::uint32_t>(
                 std::hash<std::thread::id>{}(std::this_thread::get_id())),
@@ -172,13 +182,15 @@ void WriteSlot(SegmentT& segment, const EventRecord& record,
     const std::uint32_t write_index =
         segment.head.load(std::memory_order_relaxed);
     EventRecord& slot = segment.slots[write_index % capacity];
+    // 先失效 seq：读者在此期间复制到残缺记录会因 seq 不匹配而丢弃。
+    slot.seq = 0;
     slot.code = record.code;
     slot.gid = record.gid;
     slot.arg2 = record.arg2;
     slot.ts_ns = record.ts_ns;
     slot.tid = record.tid;
     slot.pid = record.pid;
-    slot.reserved = 0;
+    slot.thread_id = record.thread_id;
     slot.arg3 = record.arg3;
     slot.arg4 = record.arg4;
     slot.resource_id = record.resource_id;
@@ -192,6 +204,17 @@ void WriteSlot(SegmentT& segment, const EventRecord& record,
     // seq 最后写：读者以 seq 作为「本条已完整发布」的判据。
     slot.seq = record.seq;
     segment.head.store(write_index + 1U, std::memory_order_release);
+}
+
+/// 事件全序：时间戳主序，thread_id 次序，同线程再按 local seq。
+bool EventOrderLess(const EventRecord& lhs, const EventRecord& rhs) noexcept {
+    if (lhs.ts_ns != rhs.ts_ns) {
+        return lhs.ts_ns < rhs.ts_ns;
+    }
+    if (lhs.thread_id != rhs.thread_id) {
+        return lhs.thread_id < rhs.thread_id;
+    }
+    return lhs.seq < rhs.seq;
 }
 
 /// 采集单段事件（调用方保证 ring 指针有效）。
@@ -214,6 +237,30 @@ void CollectSegment(const SegmentT& segment, std::size_t capacity,
             continue;
         }
         out.push_back(record);
+    }
+}
+
+/// 取单段最新一条的游标（用于订阅起点）。
+template <typename SegmentT>
+void CollectSegmentCursor(const SegmentT& segment, std::size_t capacity,
+                          EventCursor* cursor) {
+    const std::uint32_t head = segment.head.load(std::memory_order_acquire);
+    if (head == 0U) {
+        return;
+    }
+    const std::uint32_t index = (head - 1U) %
+                                static_cast<std::uint32_t>(capacity);
+    const EventRecord record = segment.slots[index];
+    if (record.seq == 0U) {
+        return;
+    }
+    // 与 CollectSegment 同样的二次校验：正在被覆盖的槽位不作为起点。
+    if (segment.slots[index].seq != record.seq) {
+        return;
+    }
+    const EventCursor candidate = CursorOf(record);
+    if (EventCursorLess(*cursor, candidate)) {
+        *cursor = candidate;
     }
 }
 
@@ -773,9 +820,10 @@ void EventRing::Record(SchedEventCode code, std::uint64_t gid,
     // 不会被登记到全局表（实测：ON 构建 Dump 为空）。
     (void)t_registration;
     EventRecord record;
-    record.seq =
-        g_publish_seq.fetch_add(1, std::memory_order_relaxed) + 1U;
+    // per-thread 序号：普通自增，无原子、无 cacheline 争用。
+    record.seq = ++t_local_seq;
     record.ts_ns = NowNs();
+    record.thread_id = t_thread_id;
     record.gid = gid;
     record.arg2 = arg2;
     record.code = static_cast<std::uint32_t>(code);
@@ -811,9 +859,9 @@ void EventRing::RecordTimer(SchedEventCode code, std::uint64_t timer_id,
     // 与 Record 相同：先 odr-use 注册对象，保证线程 ring 已登记。
     (void)t_registration;
     EventRecord record;
-    record.seq =
-        g_publish_seq.fetch_add(1, std::memory_order_relaxed) + 1U;
+    record.seq = ++t_local_seq;
     record.ts_ns = NowNs();
+    record.thread_id = t_thread_id;
     record.gid = timer_id;
     record.arg2 = deadline_ns;
     record.code = static_cast<std::uint32_t>(code);
@@ -980,13 +1028,16 @@ std::uint64_t EventRing::DroppedThreads() noexcept {
     return GetTable().dropped_threads.load(std::memory_order_relaxed);
 }
 
-std::uint64_t EventRing::PublishSeq() noexcept {
+std::uint64_t EventRing::PublishedEvents() noexcept {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-    return g_publish_seq.load(std::memory_order_acquire);
+    // 累计发布数本身就是单调的；用它代替旧的全局 seq 作一致性探针。
+    return TotalCountAll();
 #else
     return 0;
 #endif
 }
+
+std::uint64_t EventRing::PublishSeq() noexcept { return PublishedEvents(); }
 
 std::vector<EventRecord> EventRing::Snapshot(std::size_t max) {
     std::vector<EventRecord> events;
@@ -1001,10 +1052,7 @@ std::vector<EventRecord> EventRing::Snapshot(std::size_t max) {
         CollectSegment(ring->normal, kNormalSlots, events);
         CollectSegment(ring->critical, kCriticalSlots, events);
     }
-    std::sort(events.begin(), events.end(),
-              [](const EventRecord& lhs, const EventRecord& rhs) {
-                  return lhs.seq < rhs.seq;
-              });
+    std::sort(events.begin(), events.end(), EventOrderLess);
     if (max != 0U && events.size() > max) {
         events.erase(events.begin(),
                      events.end() - static_cast<std::ptrdiff_t>(max));
@@ -1014,20 +1062,41 @@ std::vector<EventRecord> EventRing::Snapshot(std::size_t max) {
     return events;
 }
 
-std::vector<EventRecord> EventRing::ReadSince(std::uint64_t cursor,
+EventCursor EventRing::CurrentCursor() {
+    EventCursor cursor{};
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    Table& table = GetTable();
+    for (auto& slot : table.rings) {
+        ThreadRing* ring = slot.load(std::memory_order_acquire);
+        if (ring == nullptr) {
+            continue;
+        }
+        CollectSegmentCursor(ring->normal, kNormalSlots, &cursor);
+        CollectSegmentCursor(ring->critical, kCriticalSlots, &cursor);
+    }
+#endif
+    return cursor;
+}
+
+std::vector<EventRecord> EventRing::ReadSince(const EventCursor& cursor,
                                               std::size_t max) {
     std::vector<EventRecord> events = Snapshot(0);
     events.erase(std::remove_if(events.begin(), events.end(),
-                                [cursor](const EventRecord& event) {
-                                    return event.seq <= cursor;
+                                [&cursor](const EventRecord& event) {
+                                    return !EventAfterCursor(event, cursor);
                                 }),
                  events.end());
     if (max != 0U && events.size() > max) {
-        // 保留最旧的 max 条：订阅端需要按 seq 连续推进游标，
+        // 保留最旧的 max 条：订阅端需要按全序连续推进游标，
         // 先交付新的会让中间事件永久丢失。
         events.resize(max);
     }
     return events;
+}
+
+std::vector<EventRecord> EventRing::ReadSince(std::uint64_t ts_cursor_ns,
+                                              std::size_t max) {
+    return ReadSince(EventCursor{ts_cursor_ns, 0, 0}, max);
 }
 
 void EventRing::Reset() noexcept {
@@ -1047,9 +1116,8 @@ void EventRing::Reset() noexcept {
             record = EventRecord{};
         }
     }
-    // 注意：本函数只应在无并发写入时调用；并发时 seq 可能被回退，
-    // 导致重复序号（与 v1 的 per-thread seq 行为一致，测试专用）。
-    g_publish_seq.store(0, std::memory_order_release);
+    // 当前线程的序号归零；它线程的序号保持单调（Reset 不跨线程同步）。
+    t_local_seq = 0;
 #endif
 }
 
@@ -1161,6 +1229,7 @@ std::string EventRing::DumpJson(std::size_t max) {
         out += "{\"seq\":" + std::to_string(event.seq);
         out += ",\"ts_ns\":" + std::to_string(event.ts_ns);
         out += ",\"tid\":" + std::to_string(event.tid);
+        out += ",\"thread_id\":" + std::to_string(event.thread_id);
         out += ",\"code\":" +
                JsonString(SchedEventCodeName(
                    static_cast<SchedEventCode>(event.code)));
@@ -1443,7 +1512,7 @@ ResourceId RegisterResource(ResourceKind kind, const void* address,
     info.kind = kind;
     info.address = address;
     info.alive = true;
-    info.created_seq = EventRing::PublishSeq();
+    info.created_seq = EventRing::PublishedEvents();
     info.created_ts_ns = NowNs();
     if (name != nullptr && *name != '\0') {
         info.name = name;
@@ -1476,7 +1545,7 @@ void UnregisterResource(ResourceId id) noexcept {
             return;
         }
         entry.alive = false;
-        entry.destroyed_seq = EventRing::PublishSeq();
+        entry.destroyed_seq = EventRing::PublishedEvents();
         entry.destroyed_ts_ns = NowNs();
         registry.by_address.erase(entry.address);
         ++registry.dead_count;
@@ -1503,7 +1572,7 @@ void UnregisterResourceByAddress(const void* address) noexcept {
     for (auto& entry : registry.entries) {
         if (entry.id == id) {
             entry.alive = false;
-            entry.destroyed_seq = EventRing::PublishSeq();
+            entry.destroyed_seq = EventRing::PublishedEvents();
             entry.destroyed_ts_ns = NowNs();
             ++registry.dead_count;
             break;
@@ -1842,9 +1911,9 @@ void RecordResourceEvent(const ResourceEventRecord& event) noexcept {
             IsCriticalResult(event.result) ||
             event.code == SchedEventCode::kParkCaptured;
         EventRecord record;
-        record.seq =
-            g_publish_seq.fetch_add(1, std::memory_order_relaxed) + 1U;
+        record.seq = ++t_local_seq;
         record.ts_ns = NowNs();
+        record.thread_id = t_thread_id;
         record.gid = event.actor_gid;
         record.arg2 = event.arg2;
         record.code = static_cast<std::uint32_t>(event.code);
