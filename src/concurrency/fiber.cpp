@@ -1657,7 +1657,7 @@ struct Fiber::Impl {
             event.actor_gid = actor;
             event.arg2 = static_cast<std::uint64_t>(reason);
             event.result = go2cpp::debug::ResourceResult::kBlocked;
-            event.chain_id = go2cpp::debug::CaptureFiberChain(actor, true);
+            event.chain_id = go2cpp::debug::CaptureFiberChainForResource(actor, true);
             go2cpp::debug::RecordResourceEvent(event);
         } catch (...) {
         }
@@ -3029,14 +3029,24 @@ const char* FiberStateNameForDebug(std::uint8_t state) noexcept {
     return "kUnknown";
 }
 
-FiberChainId CaptureFiberChain(std::uint64_t gid, bool critical) noexcept {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-    static thread_local std::uint32_t counter = 0;
-    ++counter;
-    const std::uint32_t every = FiberChainSampleEvery();
-    if (!critical && every > 1U && (counter % every) != 0U) {
-        return 0;
+namespace {
+
+/// 采样周期按 2^shift 放大（v7：链捕获也受全局采样位移约束）。
+std::uint32_t ScaleChainEvery(std::uint32_t every,
+                              std::uint32_t shift) noexcept {
+    if (every <= 1U) {
+        every = 1U;
     }
+    if (shift == 0U) {
+        return every;
+    }
+    const std::uint32_t cap = 0xFFFFFFFFU >> shift;
+    return every > cap ? 0xFFFFFFFFU : (every << shift);
+}
+
+/// 链捕获核心（采样判定已在入口完成）。
+FiberChainId CaptureFiberChainCore(std::uint64_t gid) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
     try {
         Fiber* const current = Fiber::Current();
         FiberContextSnapshot frames = current != nullptr
@@ -3111,6 +3121,48 @@ FiberChainId CaptureFiberChain(std::uint64_t gid, bool critical) noexcept {
     } catch (...) {
         return 0;
     }
+#else
+    (void)gid;
+    return 0;
+#endif
+}
+
+}  // namespace
+
+FiberChainId CaptureFiberChain(std::uint64_t gid, bool critical) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    static thread_local std::uint32_t counter = 0;
+    ++counter;
+    std::uint32_t every = FiberChainSampleEvery();
+    if (!critical) {
+        every = ScaleChainEvery(every, DebugConfig::SampleShift());
+        if (every > 1U && (counter % every) != 0U) {
+            return 0;
+        }
+    }
+    return CaptureFiberChainCore(gid);
+#else
+    (void)gid;
+    (void)critical;
+    return 0;
+#endif
+}
+
+FiberChainId CaptureFiberChainForResource(std::uint64_t gid,
+                                          bool critical) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    // v7：资源事件走独立周期，critical（park/阻塞/唤醒）同样受约束。
+    // 与 CaptureStackSampleForResource 配对，共同把 FULL 下的捕获成本
+    // 从「每条事件」降到「每 16 条事件」再乘采样位移。
+    (void)critical;
+    static thread_local std::uint32_t counter = 0;
+    ++counter;
+    const std::uint32_t every = ScaleChainEvery(
+        ResourceChainSampleEvery(), DebugConfig::SampleShift());
+    if (every > 1U && (counter % every) != 1U) {
+        return 0;
+    }
+    return CaptureFiberChainCore(gid);
 #else
     (void)gid;
     (void)critical;

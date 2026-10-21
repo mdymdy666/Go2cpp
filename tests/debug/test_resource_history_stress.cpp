@@ -612,6 +612,8 @@ void TestConcurrentHistoryFiltering() {
 }  // namespace
 
 int main() {
+    // v7：压力测试验证「全量记录 + 1:1 守恒」，显式关闭默认采样。
+    go2cpp::debug::SetDebugEventSampleEvery(1, 1);
     std::printf("=== 资源历史压力测试（10 类 / 过滤 / 事件守恒）===\n");
     const auto total_started = std::chrono::steady_clock::now();
 

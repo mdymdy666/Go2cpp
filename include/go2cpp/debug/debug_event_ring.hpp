@@ -396,6 +396,44 @@ inline DebugCategory DebugCategoryOf(SchedEventCode code) noexcept {
  */
 bool SchedEventCodeIsCritical(SchedEventCode code) noexcept;
 
+// ---------------------------------------------------------------------------
+// 记录级采样（v7：把「事件条数」与「栈捕获」拆成两个独立旋钮）
+// ---------------------------------------------------------------------------
+//
+// 背景（docs/concurrency-baseline.md §3.2）：FULL 配置下 Mutex 事件量
+// 2.3 条/op、RWMutex 9.2 条/op、select 18.8 条/op；`GO2CPP_DEBUG_SAMPLE_SHIFT`
+// 只作用于 RecordSampled 快路径与**非 critical** 的栈捕获，对资源事件与
+// critical 捕获完全无效——于是「采样配置」几乎不省资源事件。
+//
+// v7 把采样语义拆开：
+// - `ResourceEventSampleEvery()`：资源事件**记录**周期（默认 4）。只作用于
+//   非关键结果（ok/would_block/failed）；blocked/wake/timeout/cancelled/closed
+//   与 `kParkCaptured` 始终全量，保证 park/wake/lock/unlock 的配对语义。
+// - `SchedEventSampleEvery()`：调度器高频事件（enqueue/requeue/runqueue
+//   push-pop-claim/GResumed）默认 1/8 记录，避免它们把环形窗口挤满。
+//   显式设 `GO2CPP_DEBUG_SCHED_SAMPLE=1` 可恢复全量。
+// - 采样相位是「第 1 次必记」：低频操作（< N 次）不丢，只有高频重复才被
+//   稀释，因此短测试/单次操作的可观测性不变。
+
+/**
+ * @brief 资源事件记录采样周期（1=每条都记；默认 4）。
+ * @note 环境变量 `GO2CPP_DEBUG_RESOURCE_SAMPLE`（1~1000000）。
+ *       只对非关键结果生效：blocked/wake/timeout/cancelled/closed 全量。
+ */
+std::uint32_t ResourceEventSampleEvery() noexcept;
+
+/**
+ * @brief 调度器高频事件记录采样周期（1=每条都记；默认 8）。
+ * @note 环境变量 `GO2CPP_DEBUG_SCHED_SAMPLE`（1~1000000；1=恢复全量）。
+ *       覆盖 kEnqueue/kRequeueWorker/kRequeueProcessor/kRunQueuePush/
+ *       kRunQueuePop/kRunQueueClaimOk/kGStarted/kGResumed。
+ */
+std::uint32_t SchedEventSampleEvery() noexcept;
+
+/// 覆盖记录级采样周期（测试用；0 表示恢复默认/环境变量）。
+void SetDebugEventSampleEvery(std::uint32_t resource_every,
+                              std::uint32_t sched_every) noexcept;
+
 /// 一条事件记录（固定字段，导出格式与 §1.3 对齐 + v2 的 pid）。
 struct EventRecord {
     std::uint64_t seq{0};   ///< 每线程单调序号（1 起；跨线程不可比）

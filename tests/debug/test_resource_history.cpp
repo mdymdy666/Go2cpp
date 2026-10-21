@@ -217,6 +217,10 @@ void TestViewsAndChannels() {
 }  // namespace
 
 int main() {
+    // v7：本测试验证「全量记录」语义（每条 lock/unlock 都进入历史），
+    // 显式关闭资源事件与 sched 高频事件的默认采样；默认采样语义由
+    // test_debug_config 的采样场景覆盖。
+    go2cpp::debug::SetDebugEventSampleEvery(1, 1);
     std::printf("=== 资源历史单测（registry/events/stacks/views）===\n");
     TestRegistryLifecycle();
     TestMutexEventsAndHistory();

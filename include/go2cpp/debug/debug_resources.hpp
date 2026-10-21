@@ -114,9 +114,9 @@ struct ResourceInfo {
     ResourceKind kind{ResourceKind::kUnknown};
     const void* address{nullptr};
     std::string name;             ///< 注册时提供的名字；空则自动生成
-    std::uint64_t created_seq{0}; ///< 注册时的全局事件序号
+    std::uint64_t created_seq{0}; ///< 注册时的累计发布事件数
     std::uint64_t created_ts_ns{0};
-    std::uint64_t destroyed_seq{0}; ///< 注销时的全局序号；0=仍存活
+    std::uint64_t destroyed_seq{0}; ///< 注销时的累计发布事件数；0=仍存活
     std::uint64_t destroyed_ts_ns{0};
     bool alive{false};
 };
@@ -188,11 +188,30 @@ struct StackSample {
 /**
  * @brief 捕获当前线程的调用栈并登记为样本。
  * @param gid 当前受管 G（0=非受管线程）。
- * @param critical true 时**不采样**，总是捕获；false 时按 1/16 采样。
- * @return 样本编号；采样命中失败或表满返回 0。
+ * @param critical true 时**不采样**，总是捕获；false 时按 1/16 采样
+ *        （再乘 `GO2CPP_DEBUG_SAMPLE_SHIFT`）。
+ * @return 样本编号；采样未命中或表满返回 0。
  * @note 同线程重复捕获相同栈只增加引用计数，不新建样本。
+ * @note 资源事件路径**不要**直接调用本函数：用
+ *       `CaptureStackSampleForResource()`，它走独立的资源采样周期
+ *       （默认 1/16，且 critical 也受约束），这是 FULL 配置下 Mutex
+ *       192× 回落到个位数倍数的关键。
  */
 StackSampleId CaptureStackSample(std::uint64_t gid, bool critical) noexcept;
+
+/**
+ * @brief 资源事件专用的线程栈捕获（独立采样周期）。
+ *
+ * 与 `CaptureStackSample` 的区别：
+ * - 周期取 `ResourceStackSampleEvery()`（默认 16，环境变量
+ *   `GO2CPP_DEBUG_RESOURCE_STACK_SAMPLE`），再乘全局 sample shift；
+ * - `critical` 参数只保留接口兼容，**不再全量**——park/wake/阻塞等
+ *   critical 事件同样按周期采样（v7 的采样语义修正）。
+ *
+ * @return 样本编号；未命中或表满返回 0。
+ */
+StackSampleId CaptureStackSampleForResource(std::uint64_t gid,
+                                            bool critical) noexcept;
 
 /// 查询样本（拷贝）；未找到返回 false。
 bool LookupStackSample(StackSampleId id, StackSample* out);
@@ -248,6 +267,18 @@ struct FiberChainSample {
  * @return 样本编号；采样未命中/无 Fiber/表满返回 0。
  */
 FiberChainId CaptureFiberChain(std::uint64_t gid, bool critical) noexcept;
+
+/**
+ * @brief 资源事件专用的 Fiber 链捕获（独立采样周期）。
+ *
+ * - 周期取 `ResourceChainSampleEvery()`（默认 16，环境变量
+ *   `GO2CPP_DEBUG_RESOURCE_CHAIN_SAMPLE`），再乘全局 sample shift；
+ * - `critical` 参数只保留接口兼容，**不再全量**——park/阻塞/唤醒同样采样；
+ * - 与 `CaptureStackSampleForResource()` 配对使用，二者共同把 FULL 配置下
+ *   「每条资源事件一次 backtrace + 一次 Fiber 链遍历」的成本降一个数量级。
+ */
+FiberChainId CaptureFiberChainForResource(std::uint64_t gid,
+                                          bool critical) noexcept;
 
 /// 查询链样本（拷贝）；未找到返回 false。
 bool LookupFiberChain(FiberChainId id, FiberChainSample* out);
@@ -342,6 +373,25 @@ struct ResourceEventRecord {
  */
 void RecordResourceEvent(const ResourceEventRecord& event) noexcept;
 
+/**
+ * @brief 资源事件是否应当记录（v7 宏级快速过滤）。
+ *
+ * @param code 事件码。
+ * @param result 操作结果；`blocked/wake/timeout/cancelled/closed` 恒返回 true。
+ * @param critical 调用点声明的关键标记；true 时恒返回 true。
+ * @return 非关键事件按 `ResourceEventSampleEvery()` 周期判定（相位 1 必记）。
+ *
+ * 为什么放在宏里：`GO2CPP_DEBUG_RESOURCE_EVENT*` 命中率只有 1/8（默认周期 8），
+ * 但每次调用都要在栈上构造 112 B 的 `ResourceEventRecord`。把判定前移到宏内、
+ * 结构体构造之前，被稀释的 7/8 调用点只花一次线程局部分支（实测 rwmix 每 op
+ * 9 次插桩，是 FULL_NO_CAPTURE 仍有 10× 开销的主因之一）。
+ *
+ * @note 只在 `GO2CPP_DEBUG_DUMP=ON` 构建采样；REPLAY-only 构建恒返回 true，
+ *       保证回放录制的事件流不因诊断采样而缺失。
+ */
+bool ResourceEventWanted(SchedEventCode code, ResourceResult result,
+                         bool critical) noexcept;
+
 // ---------------------------------------------------------------------------
 // 回放录制汇（GO2CPP_REPLAY=ON）
 // ---------------------------------------------------------------------------
@@ -399,9 +449,17 @@ inline constexpr bool ResourceValueDigestible =
 std::uint32_t StackSampleEvery() noexcept;
 /// Fiber 链采样周期（1/N）。
 std::uint32_t FiberChainSampleEvery() noexcept;
+/// 资源事件栈采样周期（1/N；默认 16；`GO2CPP_DEBUG_RESOURCE_STACK_SAMPLE`）。
+std::uint32_t ResourceStackSampleEvery() noexcept;
+/// 资源事件 Fiber 链采样周期（1/N；默认 16；
+/// `GO2CPP_DEBUG_RESOURCE_CHAIN_SAMPLE`）。
+std::uint32_t ResourceChainSampleEvery() noexcept;
 /// 重设采样周期（测试用；0 表示恢复默认/环境变量）。
 void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
                                 std::uint32_t chain_every) noexcept;
+/// 重设资源路径采样周期（测试用；0 表示恢复默认/环境变量）。
+void SetDebugResourceCaptureSampleEvery(std::uint32_t stack_every,
+                                        std::uint32_t chain_every) noexcept;
 
 }  // namespace go2cpp::debug
 
@@ -453,6 +511,11 @@ void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
                     ::go2cpp::debug::SchedEventCode::ev_code))) {            \
             break;                                                           \
         }                                                                    \
+        if (!::go2cpp::debug::ResourceEventWanted(                           \
+                ::go2cpp::debug::SchedEventCode::ev_code, (ev_result),       \
+                static_cast<bool>(ev_critical))) {                           \
+            break;                                                           \
+        }                                                                    \
         ::go2cpp::debug::ResourceEventRecord _go2cpp_res_ev;                 \
         _go2cpp_res_ev.code = ::go2cpp::debug::SchedEventCode::ev_code;      \
         _go2cpp_res_ev.resource_id =                                         \
@@ -466,7 +529,7 @@ void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
         _go2cpp_res_ev.chain_id =                                            \
             ::go2cpp::debug::DebugConfig::Enabled(                           \
                 ::go2cpp::debug::DebugCategory::kChains)                     \
-                ? ::go2cpp::debug::CaptureFiberChain(                        \
+                ? ::go2cpp::debug::CaptureFiberChainForResource(                        \
                       static_cast<std::uint64_t>(ev_actor),                   \
                       static_cast<bool>(ev_critical))                        \
                 : 0U;                                                       \
@@ -492,6 +555,11 @@ void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
                     ::go2cpp::debug::SchedEventCode::ev_code))) {            \
             break;                                                           \
         }                                                                    \
+        if (!::go2cpp::debug::ResourceEventWanted(                           \
+                ::go2cpp::debug::SchedEventCode::ev_code, (ev_result),       \
+                static_cast<bool>(ev_critical))) {                           \
+            break;                                                           \
+        }                                                                    \
         ::go2cpp::debug::ResourceEventRecord _go2cpp_res_ev5;                \
         _go2cpp_res_ev5.code = ::go2cpp::debug::SchedEventCode::ev_code;     \
         _go2cpp_res_ev5.resource_id =                                        \
@@ -508,7 +576,7 @@ void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
         _go2cpp_res_ev5.chain_id =                                           \
             ::go2cpp::debug::DebugConfig::Enabled(                           \
                 ::go2cpp::debug::DebugCategory::kChains)                     \
-                ? ::go2cpp::debug::CaptureFiberChain(                        \
+                ? ::go2cpp::debug::CaptureFiberChainForResource(                        \
                       static_cast<std::uint64_t>(ev_actor),                   \
                       static_cast<bool>(ev_critical))                        \
                 : 0U;                                                       \

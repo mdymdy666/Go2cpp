@@ -301,7 +301,16 @@ class WaitNode final {
 public:
     WaitNode(Scheduler* scheduler, std::shared_ptr<Task> task)
         : m_scheduler(scheduler), m_task(std::move(task)),
-          m_backend(CreateWaitBackend()) {}
+          m_backend(CreateWaitBackend()) {
+        // 无锁读快照（managed()/gid() 在 Unlock 路径被调用，不能加锁）。
+        // TSAN 曾经报告：gid() 无锁读 m_task（shared_ptr）与 Reset() 的
+        // 赋值竞争；这里把「是否受管」与「gid」固化成原子值，
+        // m_task 本身仍只在 m_wake_mutex 下读写。
+        m_has_task.store(static_cast<bool>(m_task),
+                         std::memory_order_relaxed);
+        m_gid.store(m_task ? static_cast<std::uint64_t>(m_task->id()) : 0U,
+                    std::memory_order_relaxed);
+    }
 
     ~WaitNode() { Disarm(); }
 
@@ -319,7 +328,7 @@ public:
         // 防止回调生命周期超过 Scheduler 的关闭过程。
         std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
         m_active = false;
-        m_scheduler = nullptr;
+        m_scheduler.store(nullptr, std::memory_order_release);
     }
 
     WaitResult result() const noexcept {
@@ -399,12 +408,14 @@ private:
             return;
         }
         try {
-            if (m_scheduler != nullptr && m_task) {
+            Scheduler* const scheduler =
+                m_scheduler.load(std::memory_order_acquire);
+            if (scheduler != nullptr && m_task) {
                 // managed waiter 通过所属 Scheduler 恢复。
                 // 已注册 G 走 wake_registered()；该入口仍保留 started G，
                 // 即使 shutdown 或队列分配与这个回调并发。
                 if (m_backend) {
-                    m_backend->Wake(m_scheduler,
+                    m_backend->Wake(scheduler,
                                     std::static_pointer_cast<void>(m_task));
                 }
             } else {
@@ -430,12 +441,17 @@ private:
 public:
 
     bool managed() const noexcept {
-        return m_scheduler != nullptr && static_cast<bool>(m_task);
+        // 无锁路径（Unlock 每次都要判一次）：读原子快照，不触碰
+        // shared_ptr<Task>（其赋值在 m_wake_mutex 下，由 Reset/析构完成）。
+        return m_scheduler.load(std::memory_order_relaxed) != nullptr &&
+               m_has_task.load(std::memory_order_relaxed);
     }
 
     /// @brief 受管等待者的 G 编号；native/未知为 0（调试事件用）。
+    /// @note TSAN 修复：原实现无锁解引用 m_task，与 Reset() 的赋值构成
+    ///       数据竞争；改为构造/Reset 时写入原子快照，读端零锁。
     std::uint64_t gid() const noexcept {
-        return m_task ? static_cast<std::uint64_t>(m_task->id()) : 0U;
+        return m_gid.load(std::memory_order_relaxed);
     }
 
     WaitResult WaitNative() noexcept {
@@ -529,7 +545,9 @@ public:
     }
 
     const std::shared_ptr<Task>& task() const noexcept { return m_task; }
-    Scheduler* scheduler() const noexcept { return m_scheduler; }
+    Scheduler* scheduler() const noexcept {
+        return m_scheduler.load(std::memory_order_acquire);
+    }
     const std::shared_ptr<WaitBackend>& backend() const noexcept {
         return m_backend;
     }
@@ -537,8 +555,12 @@ public:
     void Reset(Scheduler* scheduler, std::shared_ptr<Task> task) noexcept {
         std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
         m_active = false;
-        m_scheduler = scheduler;
+        m_scheduler.store(scheduler, std::memory_order_release);
         m_task = std::move(task);
+        m_has_task.store(static_cast<bool>(m_task),
+                         std::memory_order_relaxed);
+        m_gid.store(m_task ? static_cast<std::uint64_t>(m_task->id()) : 0U,
+                    std::memory_order_relaxed);
         m_backend = CreateWaitBackend();
         m_result.store(WaitResult::kWaiting, std::memory_order_release);
         m_granted.store(false, std::memory_order_relaxed);
@@ -556,8 +578,13 @@ public:
 
 
 private:
-    Scheduler* m_scheduler{nullptr};
+    /// 原子：WakeLocked/Disarm/Reset 在 m_wake_mutex 下写，managed()/
+    /// scheduler() 在锁外读（TSAN 修复，见构造函数注释）。
+    std::atomic<Scheduler*> m_scheduler{nullptr};
     std::shared_ptr<Task> m_task;
+    /// 原子快照：m_task 是否非空 / 其 gid（无锁读，m_task 本身仍受锁保护）。
+    std::atomic<bool> m_has_task{false};
+    std::atomic<std::uint64_t> m_gid{0};
     std::atomic<WaitResult> m_result{WaitResult::kWaiting};
     /// @brief 饥饿模式所有权交接标记；普通唤醒保持 false（等待者需重新竞争）。
     std::atomic<bool> m_granted{false};

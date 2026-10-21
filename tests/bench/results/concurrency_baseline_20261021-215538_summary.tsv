@@ -1,0 +1,1 @@
+config	scenario	rounds	ops_per_sec	p50_ns	p99_ns	p999_ns	events	events_per_op	window_coverage	snapshot_events	stack_samples	stack_dropped	dropped_threads	rss_after_kb	rss_peak_kb	off_ops_per_sec	slowdown	p50_ratio	p99_ratio	overhead_pct	event_detail

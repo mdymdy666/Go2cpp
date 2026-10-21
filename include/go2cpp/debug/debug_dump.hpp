@@ -145,10 +145,10 @@ private:
 };
 
 /**
- * @brief 一次 dump 的一致性探针：基于事件环的**全局发布序号**。
+ * @brief 一次 dump 的一致性探针：基于事件环的**累计发布事件数**。
  *
  * 语义：
- * - `supported == false`（默认 OFF 构建）：事件环不记录，序号恒为 0，
+ * - `supported == false`（默认 OFF 构建）：事件环不记录，计数恒为 0，
  *   消费方**不能**据此判断是否有并发变化；
  * - `supported == true` 且 `seq_start == seq_end`：采集期间没有任何事件发布，
  *   dump 内容在「事件可见性」意义上是一致的；
@@ -156,17 +156,17 @@ private:
  *   （仍可能可用，但消费方不应把它当作同一瞬间的全局视图）。
  *
  * 该标记是**提示**而不是事务：事件环只覆盖被插桩的调度路径，未插桩的状态
- * 变化（例如纯用户态写 Channel 缓冲）不会递增 seq。
+ * 变化（例如纯用户态写 Channel 缓冲）不会递增计数。
  */
 struct ConsistencyStamp {
-    std::uint64_t seq_start{0}; ///< 采集开始前的事件环发布序号
-    std::uint64_t seq_end{0};   ///< 采集结束后的事件环发布序号
+    std::uint64_t seq_start{0}; ///< 采集开始前的累计发布事件数
+    std::uint64_t seq_end{0};   ///< 采集结束后的累计发布事件数
     bool supported{false};      ///< 本构建是否记录事件（决定前两项是否可信）
 
     bool Changed() const noexcept { return seq_start != seq_end; }
 };
 
-/// 开始一次一致性探测（读取 `EventRing::PublishSeq()`，O(1)）。
+/// 开始一次一致性探测（读取 `EventRing::PublishedEvents()`，仅做一次累计计数读）。
 ConsistencyStamp BeginConsistency() noexcept;
 /// 结束探测（再次读取发布序号）；可与 BeginConsistency 成对使用。
 void EndConsistency(ConsistencyStamp& stamp) noexcept;

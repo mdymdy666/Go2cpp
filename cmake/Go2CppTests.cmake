@@ -231,6 +231,48 @@ if (GO2CPP_BUILD_TESTS)
     target_compile_options(go2cpp_replay_v5_stress PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_replay_v5_stress COMMAND go2cpp_replay_v5_stress)
+
+    # 并发原语复杂场景 / 随机 fuzz / 死锁检测（正确性）。
+    add_executable(go2cpp_concurrency_combinations
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_concurrency_combinations.cpp)
+    target_link_libraries(go2cpp_concurrency_combinations PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_concurrency_combinations PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_concurrency_combinations PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_concurrency_combinations COMMAND go2cpp_concurrency_combinations)
+    set_tests_properties(go2cpp_concurrency_combinations PROPERTIES TIMEOUT 120)
+
+    add_executable(go2cpp_concurrency_fuzz
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_concurrency_fuzz.cpp)
+    target_link_libraries(go2cpp_concurrency_fuzz PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_concurrency_fuzz PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_concurrency_fuzz PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_concurrency_fuzz COMMAND go2cpp_concurrency_fuzz)
+    set_tests_properties(go2cpp_concurrency_fuzz PROPERTIES TIMEOUT 180)
+
+    add_executable(go2cpp_deadlock_detection
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_deadlock_detection.cpp)
+    target_link_libraries(go2cpp_deadlock_detection PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_deadlock_detection PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_deadlock_detection PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_deadlock_detection COMMAND go2cpp_deadlock_detection)
+    set_tests_properties(go2cpp_deadlock_detection PROPERTIES TIMEOUT 120)
+
+    # debug 记录正确性（ON 构建验证事件守恒/配对/采样语义；OFF 构建验证零记录契约）。
+    add_executable(go2cpp_debug_record_correctness
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug/test_debug_record_correctness.cpp)
+    target_link_libraries(go2cpp_debug_record_correctness PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_debug_record_correctness PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_debug_record_correctness PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_debug_record_correctness COMMAND go2cpp_debug_record_correctness)
+    set_tests_properties(go2cpp_debug_record_correctness PROPERTIES TIMEOUT 120)
     set_tests_properties(go2cpp_replay_v5_stress PROPERTIES TIMEOUT 300)
     # 超时从 30 -> 60 -> 120：go2cpp_tests 是全部单元测试的集合。
     # 随调试模块陆续新增测试（debug_* 七个）后整体耗时约 18~30s，且**偶发**更高：

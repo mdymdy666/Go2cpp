@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <type_traits>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -82,6 +83,17 @@ Table& GetTable() {
     return *table;
 }
 
+/// 单调时钟纳秒。
+/// @note v7 起移出 `GO2CPP_DEBUG_DUMP` 宏保护：`CaptureStackSampleImpl` 在
+///       OFF 构建里仍然参与编译（只是没有调用者），若 `NowNs` 只在 ON 构建
+///       可见，OFF 构建会因符号缺失编译失败（实测 build-work）。
+std::uint64_t NowNs() noexcept {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
 
 thread_local ThreadRing t_ring;
@@ -103,13 +115,27 @@ thread_local HintSlot t_park_hint;
 thread_local HintSlot t_wake_hint;
 /// 采样计数器（按事件码低 8 位索引；只在本线程读写）。
 thread_local std::uint32_t t_sample_counters[256] = {};
+/// 资源事件记录采样计数器（v7；与 t_sample_counters 分开，避免相位耦合）。
+thread_local std::uint32_t t_resource_sample_counters[256] = {};
+/// 调度器高频事件记录采样计数器（v7）。
+thread_local std::uint32_t t_sched_sample_counters[256] = {};
+/// 线程 id 哈希缓存（注册时计算一次；避免每事件读 ring 的原子字段）。
+thread_local std::uint32_t t_tid_hash = 0;
+/// 本线程的累计计数分片（v7：把 256 个全局原子拆成 16 个分片，
+/// 消除同类事件集中在多核上的 cacheline 争用；读取时求和仍精确）。
+thread_local std::uint32_t t_total_shard = 0;
 
-/// 进程级累计事件计数（按事件码）。堆上常驻，避免静态析构顺序问题。
+/// 累计计数分片数（2 的幂，便于用位与取模）。
+constexpr std::size_t kTotalShards = 16;
+
+/// 进程级累计事件计数（按事件码 x 分片）。堆上常驻，避免静态析构顺序问题。
 struct EventTotals {
-    std::atomic<std::uint64_t> codes[256];
+    std::atomic<std::uint64_t> codes[kTotalShards][256];
     EventTotals() {
-        for (auto& counter : codes) {
-            counter.store(0, std::memory_order_relaxed);
+        for (auto& shard : codes) {
+            for (auto& counter : shard) {
+                counter.store(0, std::memory_order_relaxed);
+            }
         }
     }
 };
@@ -118,6 +144,9 @@ EventTotals& GetTotals() {
     static EventTotals* totals = new EventTotals();
     return *totals;
 }
+
+/// 本线程的计数分片指针（Registration 构造时绑定；之后只解引用）。
+thread_local EventTotals* t_totals = nullptr;
 
 /**
  * 每线程 id 分配器：线程首次记录时 fetch_add 一次，之后只读
@@ -157,10 +186,12 @@ struct Registration {
         // 后续 Record() 只读本地变量。
         t_thread_id =
             g_next_thread_id.fetch_add(1, std::memory_order_relaxed);
-        t_ring.tid.store(
-            static_cast<std::uint32_t>(
-                std::hash<std::thread::id>{}(std::this_thread::get_id())),
-            std::memory_order_relaxed);
+        t_tid_hash = static_cast<std::uint32_t>(
+            std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        t_ring.tid.store(t_tid_hash, std::memory_order_relaxed);
+        t_totals = &GetTotals();
+        t_total_shard = static_cast<std::uint32_t>(
+            t_thread_id & (kTotalShards - 1U));
         AddRing(&t_ring);
     }
     ~Registration() { RemoveRing(&t_ring); }
@@ -168,14 +199,10 @@ struct Registration {
 
 thread_local Registration t_registration;
 
-std::uint64_t NowNs() noexcept {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
-}
-
 /// 把一条记录写入指定段（调用方保证本线程独占该 ring）。
+static_assert(std::is_trivially_copyable<EventRecord>::value,
+              "EventRecord must stay trivially copyable for bulk writes");
+
 template <typename SegmentT>
 void WriteSlot(SegmentT& segment, const EventRecord& record,
                std::size_t capacity) noexcept {
@@ -183,24 +210,12 @@ void WriteSlot(SegmentT& segment, const EventRecord& record,
         segment.head.load(std::memory_order_relaxed);
     EventRecord& slot = segment.slots[write_index % capacity];
     // 先失效 seq：读者在此期间复制到残缺记录会因 seq 不匹配而丢弃。
+    // v7：seq 之外的字段整块 memcpy（EventRecord 是 POD，19 次独立 store
+    // 变成 2 条 cacheline 的批量写），热路径每条事件省约 10 ns。
     slot.seq = 0;
-    slot.code = record.code;
-    slot.gid = record.gid;
-    slot.arg2 = record.arg2;
-    slot.ts_ns = record.ts_ns;
-    slot.tid = record.tid;
-    slot.pid = record.pid;
-    slot.thread_id = record.thread_id;
-    slot.arg3 = record.arg3;
-    slot.arg4 = record.arg4;
-    slot.resource_id = record.resource_id;
-    slot.target_gid = record.target_gid;
-    slot.stack_id = record.stack_id;
-    slot.chain_id = record.chain_id;
-    slot.result = record.result;
-    slot.flags = record.flags;
-    slot.value = record.value;
-    slot.waiters = record.waiters;
+    std::memcpy(reinterpret_cast<char*>(&slot) + sizeof(std::uint64_t),
+                reinterpret_cast<const char*>(&record) + sizeof(std::uint64_t),
+                sizeof(EventRecord) - sizeof(std::uint64_t));
     // seq 最后写：读者以 seq 作为「本条已完整发布」的判据。
     slot.seq = record.seq;
     segment.head.store(write_index + 1U, std::memory_order_release);
@@ -804,6 +819,29 @@ bool SchedEventCodeIsCritical(SchedEventCode code) noexcept {
     }
 }
 
+namespace {
+
+/// v7：默认降采样的调度器高频事件（数值 = SchedEventCode）。
+/// 只包含「同一 G 的日常搬运」码；关键事件（wake/*Rejected/claim fail/
+/// G 终态）不在其中，配对与异常分支不受影响。
+bool IsSchedHotEventCode(std::uint32_t code) noexcept {
+    switch (code) {
+        case 20:  // kEnqueue
+        case 22:  // kRequeueWorker
+        case 23:  // kRequeueProcessor
+        case 30:  // kRunQueuePush
+        case 31:  // kRunQueuePop
+        case 32:  // kRunQueueClaimOk
+        case 101: // kGStarted
+        case 102: // kGResumed
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
 bool EventRing::Enabled() noexcept {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
     return true;
@@ -819,6 +857,21 @@ void EventRing::Record(SchedEventCode code, std::uint64_t gid,
     // 之前发生；若这里不引用它，编译器可以合法地永不构造它，ring 就
     // 不会被登记到全局表（实测：ON 构建 Dump 为空）。
     (void)t_registration;
+    // v7：调度器高频事件默认降采样。pc/select 场景里 enqueue/push/pop/
+    // claim/resume 合计 4~8 条/op，是环形窗口被覆盖 490~1354 倍的主因；
+    // 采样在**累计计数之前**返回，事件量与窗口覆盖同步下降。
+    const std::uint32_t code_value = static_cast<std::uint32_t>(code);
+    if (IsSchedHotEventCode(code_value)) {
+        const std::uint32_t every = SchedEventSampleEvery();
+        if (every > 1U) {
+            std::uint32_t& counter =
+                t_sched_sample_counters[code_value & 0xFFU];
+            ++counter;
+            if ((counter % every) != 1U) {
+                return;
+            }
+        }
+    }
     EventRecord record;
     // per-thread 序号：普通自增，无原子、无 cacheline 争用。
     record.seq = ++t_local_seq;
@@ -826,13 +879,15 @@ void EventRing::Record(SchedEventCode code, std::uint64_t gid,
     record.thread_id = t_thread_id;
     record.gid = gid;
     record.arg2 = arg2;
-    record.code = static_cast<std::uint32_t>(code);
-    record.tid = t_ring.tid.load(std::memory_order_relaxed);
+    record.code = code_value;
+    record.tid = t_tid_hash;
     record.pid = t_processor_id;
     // 累计计数：环形窗口会被覆盖，覆盖率报告用进程级总量。
-    const std::uint32_t code_value = static_cast<std::uint32_t>(code);
-    GetTotals().codes[code_value & 0xFFU].fetch_add(
-        1, std::memory_order_relaxed);
+    // v7：写本线程分片（无跨核争用），读取时求和。
+    if (t_totals != nullptr) {
+        t_totals->codes[t_total_shard][code_value & 0xFFU].fetch_add(
+            1, std::memory_order_relaxed);
+    }
     // park/wake 事件带上当前线程的原语原因（RAII 作用域写入）。
     if (code == SchedEventCode::kParkEnter) {
         record.arg3 = t_park_hint.reason;
@@ -869,8 +924,12 @@ void EventRing::RecordTimer(SchedEventCode code, std::uint64_t timer_id,
     record.pid = t_processor_id;
     record.arg3 = kind;
     record.arg4 = source_gid;
-    GetTotals().codes[static_cast<std::uint32_t>(code) & 0xFFU].fetch_add(
-        1, std::memory_order_relaxed);
+    record.tid = t_tid_hash;
+    if (t_totals != nullptr) {
+        t_totals->codes[t_total_shard]
+                       [static_cast<std::uint32_t>(code) & 0xFFU]
+            .fetch_add(1, std::memory_order_relaxed);
+    }
     // timer 事件走普通区：10k 级 arm 压测不应挤掉关键区里的 wake 线索。
     WriteSlot(t_ring.normal, record, kNormalSlots);
 #else
@@ -931,7 +990,12 @@ void EventRing::RecordSampled(SchedEventCode code, std::uint64_t gid,
     std::uint32_t& counter =
         t_sample_counters[static_cast<std::uint32_t>(code) & 0xFFU];
     ++counter;
-    if (counter % effective != 0U) {
+    // v7：周期是 2 的幂时用位与代替除法（热路径上省 10+ ns）。
+    const bool hit =
+        (effective & (effective - 1U)) == 0U
+            ? (counter & (effective - 1U)) == 0U
+            : (counter % effective) == 0U;
+    if (!hit) {
         return;
     }
     Record(code, gid, arg2);
@@ -945,9 +1009,13 @@ void EventRing::RecordSampled(SchedEventCode code, std::uint64_t gid,
 
 std::uint64_t EventRing::TotalCount(SchedEventCode code) noexcept {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-    return GetTotals()
-        .codes[static_cast<std::uint32_t>(code) & 0xFFU]
-        .load(std::memory_order_relaxed);
+    const std::uint32_t index = static_cast<std::uint32_t>(code) & 0xFFU;
+    EventTotals& totals = GetTotals();
+    std::uint64_t total = 0;
+    for (auto& shard : totals.codes) {
+        total += shard[index].load(std::memory_order_relaxed);
+    }
+    return total;
 #else
     (void)code;
     return 0;
@@ -958,8 +1026,10 @@ std::uint64_t EventRing::TotalCountAll() noexcept {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
     std::uint64_t total = 0;
     EventTotals& totals = GetTotals();
-    for (auto& counter : totals.codes) {
-        total += counter.load(std::memory_order_relaxed);
+    for (auto& shard : totals.codes) {
+        for (auto& counter : shard) {
+            total += counter.load(std::memory_order_relaxed);
+        }
     }
     return total;
 #else
@@ -970,8 +1040,10 @@ std::uint64_t EventRing::TotalCountAll() noexcept {
 void EventRing::ResetTotals() noexcept {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
     EventTotals& totals = GetTotals();
-    for (auto& counter : totals.codes) {
-        counter.store(0, std::memory_order_relaxed);
+    for (auto& shard : totals.codes) {
+        for (auto& counter : shard) {
+            counter.store(0, std::memory_order_relaxed);
+        }
     }
 #endif
 }
@@ -1323,6 +1395,13 @@ namespace {
 
 constexpr std::uint32_t kDefaultStackSampleEvery = 16;
 constexpr std::uint32_t kDefaultChainSampleEvery = 8;
+/// v7：资源事件记录采样周期（1/8）。只稀释非关键成功路径；阻塞/唤醒全量。
+constexpr std::uint32_t kDefaultResourceEventSampleEvery = 8;
+/// v7：调度器高频事件记录采样周期（1/8）。
+constexpr std::uint32_t kDefaultSchedEventSampleEvery = 8;
+/// v7：资源事件栈/链捕获周期（1/16，critical 同样受约束）。
+constexpr std::uint32_t kDefaultResourceStackSampleEvery = 16;
+constexpr std::uint32_t kDefaultResourceChainSampleEvery = 16;
 /// 资源注册表容量上限：含墓碑。满时批量回收最旧的已注销条目；全是存活
 /// 条目时拒绝新注册（返回 0），避免诊断设施无限吃内存。
 constexpr std::size_t kMaxResourceEntries = 4096;
@@ -1350,6 +1429,50 @@ std::atomic<std::uint32_t>& ChainEverySlot() {
     return slot;
 }
 
+std::atomic<std::uint32_t>& ResourceEventEverySlot() {
+    static std::atomic<std::uint32_t> slot{0};
+    return slot;
+}
+
+std::atomic<std::uint32_t>& SchedEventEverySlot() {
+    static std::atomic<std::uint32_t> slot{0};
+    return slot;
+}
+
+std::atomic<std::uint32_t>& ResourceStackEverySlot() {
+    static std::atomic<std::uint32_t> slot{0};
+    return slot;
+}
+
+std::atomic<std::uint32_t>& ResourceChainEverySlot() {
+    static std::atomic<std::uint32_t> slot{0};
+    return slot;
+}
+
+/// 采样周期按 2^shift 放大（v7：资源栈/链与全局位移相乘）。
+std::uint32_t ScaleSampleEvery(std::uint32_t every,
+                               std::uint32_t shift) noexcept {
+    if (every <= 1U) {
+        every = 1U;
+    }
+    if (shift == 0U) {
+        return every;
+    }
+    const std::uint32_t cap = 0xFFFFFFFFU >> shift;
+    return every > cap ? 0xFFFFFFFFU : (every << shift);
+}
+
+/// 惰性读取环境变量并缓存（与 StackSampleEvery 同模式）。
+std::uint32_t LoadEvery(std::atomic<std::uint32_t>& slot, const char* name,
+                        std::uint32_t fallback) noexcept {
+    std::uint32_t value = slot.load(std::memory_order_relaxed);
+    if (value == 0U) {
+        value = ReadSampleEnv(name, fallback);
+        slot.store(value, std::memory_order_relaxed);
+    }
+    return value;
+}
+
 /// 资源注册表：shared_mutex 保护，读多写少（每次资源事件按地址查一次）。
 struct ResourceRegistry {
     mutable std::shared_mutex mutex;
@@ -1364,12 +1487,24 @@ ResourceRegistry& Registry() {
     return *registry;
 }
 
+/// 栈样本表分片数（2 的幂）。按**帧哈希**选分片：相同调用栈仍落在同一
+/// 分片（跨线程去重语义不变），不同栈分散到 16 把锁上。
+constexpr std::size_t kStackShards = 16;
+/// id 低位留给分片内序号（每分片最多 2^28 条，实际受全局 4096 限制）。
+constexpr std::uint32_t kStackShardShift = 28U;
+
+struct StackShard {
+    mutable std::mutex mutex;
+    std::vector<StackSample> samples;
+    std::unordered_map<std::uint64_t, StackSampleId> by_hash;
+    std::uint32_t next_local{1};
+};
+
 /// 栈样本表：相同帧序列按哈希去重，引用计数递增。
 struct StackTable {
-    mutable std::mutex mutex;
-    std::vector<StackSample> samples; ///< index = id - 1
-    std::unordered_map<std::uint64_t, StackSampleId> by_hash;
+    StackShard shards[kStackShards];
     std::atomic<std::uint64_t> dropped{0};
+    std::atomic<std::uint32_t> total{0};
 };
 
 StackTable& StackSamples() {
@@ -1712,25 +1847,91 @@ void SetDebugCaptureSampleEvery(std::uint32_t stack_every,
                            std::memory_order_relaxed);
 }
 
-StackSampleId CaptureStackSample(std::uint64_t gid, bool critical) noexcept {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP && defined(__linux__)
-    // 粒度开关：stacks 关闭时不做 backtrace、不加锁、不建样本。
-    if (!DebugConfig::Enabled(DebugCategory::kStacks)) {
-        return 0;
+std::uint32_t ResourceEventSampleEvery() noexcept {
+    return LoadEvery(ResourceEventEverySlot(), "GO2CPP_DEBUG_RESOURCE_SAMPLE",
+                     kDefaultResourceEventSampleEvery);
+}
+
+std::uint32_t SchedEventSampleEvery() noexcept {
+    return LoadEvery(SchedEventEverySlot(), "GO2CPP_DEBUG_SCHED_SAMPLE",
+                     kDefaultSchedEventSampleEvery);
+}
+
+/// 是否已安装回放录制汇（定义在本文件后部的回放区）。
+bool ReplayRecordingActive() noexcept;
+
+bool ResourceEventWanted(SchedEventCode code, ResourceResult result,
+                         bool critical) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
+    // 回放录制要求事件流完整：只要安装了 sink 就关闭采样，保证回放
+    // 序列与真实操作一一对应（诊断采样只影响 dump 视图）。
+    if (ReplayRecordingActive()) {
+        return true;
     }
-    // 采样：非关键事件每 N 次捕获一条；关键事件（阻塞/唤醒/park）全量。
-    // 全局 sample_shift 再把周期乘 2^n（0 保持不变）。
-    static thread_local std::uint32_t sample_counter = 0;
+    // 关键结果（阻塞/唤醒/超时/取消/关闭）与 park 捕获不受采样影响：
+    // park/wake/lock/unlock 的配对语义必须完整。
+    if (critical || IsCriticalResult(result) ||
+        code == SchedEventCode::kParkCaptured) {
+        return true;
+    }
+    const std::uint32_t every = ResourceEventSampleEvery();
+    if (every <= 1U) {
+        return true;
+    }
+    std::uint32_t& counter =
+        t_resource_sample_counters[static_cast<std::uint32_t>(code) & 0xFFU];
+    ++counter;
+    return (counter % every) == 1U;
+#else
+    // REPLAY-only 构建：事件必须全量转发给录制汇，不能因诊断采样缺失。
+    (void)code;
+    (void)result;
+    (void)critical;
+    return true;
+#endif
+}
+
+std::uint32_t ResourceStackSampleEvery() noexcept {
+    return LoadEvery(ResourceStackEverySlot(),
+                     "GO2CPP_DEBUG_RESOURCE_STACK_SAMPLE",
+                     kDefaultResourceStackSampleEvery);
+}
+
+std::uint32_t ResourceChainSampleEvery() noexcept {
+    return LoadEvery(ResourceChainEverySlot(),
+                     "GO2CPP_DEBUG_RESOURCE_CHAIN_SAMPLE",
+                     kDefaultResourceChainSampleEvery);
+}
+
+void SetDebugEventSampleEvery(std::uint32_t resource_every,
+                              std::uint32_t sched_every) noexcept {
+    ResourceEventEverySlot().store(
+        resource_every == 0 ? kDefaultResourceEventSampleEvery : resource_every,
+        std::memory_order_relaxed);
+    SchedEventEverySlot().store(
+        sched_every == 0 ? kDefaultSchedEventSampleEvery : sched_every,
+        std::memory_order_relaxed);
+}
+
+void SetDebugResourceCaptureSampleEvery(std::uint32_t stack_every,
+                                        std::uint32_t chain_every) noexcept {
+    ResourceStackEverySlot().store(
+        stack_every == 0 ? kDefaultResourceStackSampleEvery : stack_every,
+        std::memory_order_relaxed);
+    ResourceChainEverySlot().store(
+        chain_every == 0 ? kDefaultResourceChainSampleEvery : chain_every,
+        std::memory_order_relaxed);
+}
+
+namespace {
+
+/// 栈捕获核心：`every` 已包含全局位移等所有放大因子。
+/// 采样相位是「第 1 次必命中」：低频调用（< every 次）全部保留原始栈。
+StackSampleId CaptureStackSampleImpl(std::uint64_t gid, std::uint32_t every,
+                                     std::uint32_t& sample_counter) noexcept {
+#if defined(__linux__)
     ++sample_counter;
-    std::uint32_t every = StackSampleEvery();
-    const std::uint32_t shift = DebugConfig::SampleShift();
-    if (shift > 0U) {
-        const std::uint32_t cap = 0xFFFFFFFFU >> shift;
-        every = every > cap ? 0xFFFFFFFFU : (every << shift);
-    }
-    const bool skipped =
-        !critical && every > 1U && (sample_counter % every) != 0U;
-    if (skipped) {
+    if (every > 1U && (sample_counter % every) != 1U) {
         return 0;
     }
     void* buffer[kMaxStackFrames] = {};
@@ -1738,7 +1939,7 @@ StackSampleId CaptureStackSample(std::uint64_t gid, bool critical) noexcept {
     if (frames <= 0) {
         return 0;
     }
-    int skip = 2; // backtrace 自身 + CaptureStackSample
+    int skip = 2; // backtrace 自身 + CaptureStackSampleImpl
     if (skip >= frames) {
         skip = frames - 1;
     }
@@ -1753,24 +1954,35 @@ StackSampleId CaptureStackSample(std::uint64_t gid, bool critical) noexcept {
     const std::uint64_t hash =
         HashFrames(addresses, static_cast<std::size_t>(count));
     StackTable& table = StackSamples();
-    std::lock_guard<std::mutex> lock(table.mutex);
-    const auto found = table.by_hash.find(hash);
-    if (found != table.by_hash.end()) {
-        StackSample& sample = table.samples[found->second - 1U];
-        if (sample.frame_count == static_cast<std::uint32_t>(count) &&
-            std::memcmp(sample.frames.data(), addresses,
-                        sizeof(std::uintptr_t) *
-                            static_cast<std::size_t>(count)) == 0) {
-            ++sample.refs;
-            return sample.id;
+    const std::size_t shard_index =
+        static_cast<std::size_t>(hash) & (kStackShards - 1U);
+    StackShard& shard = table.shards[shard_index];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    const auto found = shard.by_hash.find(hash);
+    if (found != shard.by_hash.end()) {
+        for (StackSample& sample : shard.samples) {
+            if (sample.id != found->second) {
+                continue;
+            }
+            if (sample.frame_count == static_cast<std::uint32_t>(count) &&
+                std::memcmp(sample.frames.data(), addresses,
+                            sizeof(std::uintptr_t) *
+                                static_cast<std::size_t>(count)) == 0) {
+                ++sample.refs;
+                return sample.id;
+            }
+            break;
         }
     }
-    if (table.samples.size() >= kMaxStackSamples) {
+    if (table.total.load(std::memory_order_relaxed) >= kMaxStackSamples) {
         table.dropped.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
     StackSample sample;
-    sample.id = static_cast<StackSampleId>(table.samples.size() + 1U);
+    const std::uint32_t local = shard.next_local++;
+    sample.id = ((static_cast<std::uint32_t>(shard_index) + 1U)
+                 << kStackShardShift) |
+                local;
     sample.thread_id = ThreadHash();
     sample.gid = gid;
     sample.ts_ns = NowNs();
@@ -1779,9 +1991,57 @@ StackSampleId CaptureStackSample(std::uint64_t gid, bool critical) noexcept {
     for (int i = 0; i < count; ++i) {
         sample.frames[static_cast<std::size_t>(i)] = addresses[i];
     }
-    table.samples.push_back(sample);
-    table.by_hash[hash] = sample.id;
+    shard.samples.push_back(sample);
+    shard.by_hash[hash] = sample.id;
+    table.total.fetch_add(1, std::memory_order_relaxed);
     return sample.id;
+#else
+    (void)gid;
+    (void)every;
+    return 0;
+#endif
+}
+
+}  // namespace
+
+/// 显式捕获（park/调度路径与测试）的采样计数器；与资源路径分开，
+/// 避免两条调用链的相位互相推进。
+thread_local std::uint32_t t_direct_stack_counter = 0;
+/// 资源事件栈捕获的采样计数器（独立相位）。
+thread_local std::uint32_t t_resource_stack_counter = 0;
+
+StackSampleId CaptureStackSample(std::uint64_t gid, bool critical) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP && defined(__linux__)
+    // 粒度开关：stacks 关闭时不做 backtrace、不加锁、不建样本。
+    if (!DebugConfig::Enabled(DebugCategory::kStacks)) {
+        return 0;
+    }
+    // 显式 critical 捕获保持「总是捕获」（公开 API 语义，测试与 park
+    // 诊断依赖它）；降采样只作用于非 critical 与资源事件路径。
+    const std::uint32_t every =
+        critical ? 1U
+                 : ScaleSampleEvery(StackSampleEvery(),
+                                    DebugConfig::SampleShift());
+    return CaptureStackSampleImpl(gid, every, t_direct_stack_counter);
+#else
+    (void)gid;
+    (void)critical;
+    return 0;
+#endif
+}
+
+StackSampleId CaptureStackSampleForResource(std::uint64_t gid,
+                                            bool critical) noexcept {
+#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP && defined(__linux__)
+    // v7：资源事件走独立周期，critical（park/阻塞/唤醒）也受采样约束。
+    // 这是 FULL 配置下每条 Mutex ok 事件都 backtrace 的直接解药。
+    (void)critical;
+    if (!DebugConfig::Enabled(DebugCategory::kStacks)) {
+        return 0;
+    }
+    const std::uint32_t every = ScaleSampleEvery(
+        ResourceStackSampleEvery(), DebugConfig::SampleShift());
+    return CaptureStackSampleImpl(gid, every, t_resource_stack_counter);
 #else
     (void)gid;
     (void)critical;
@@ -1794,13 +2054,19 @@ bool LookupStackSample(StackSampleId id, StackSample* out) {
     if (out == nullptr || id == 0) {
         return false;
     }
-    StackTable& table = StackSamples();
-    std::lock_guard<std::mutex> lock(table.mutex);
-    if (id > table.samples.size()) {
+    const std::uint32_t shard_code = id >> kStackShardShift;
+    if (shard_code == 0U || shard_code > kStackShards) {
         return false;
     }
-    *out = table.samples[id - 1U];
-    return true;
+    StackShard& shard = StackSamples().shards[shard_code - 1U];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    for (const StackSample& sample : shard.samples) {
+        if (sample.id == id) {
+            *out = sample;
+            return true;
+        }
+    }
+    return false;
 #else
     (void)id;
     (void)out;
@@ -1841,9 +2107,7 @@ std::vector<StackFrameInfo> ResolveStackSample(StackSampleId id) {
 
 std::size_t StackSampleCount() noexcept {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-    StackTable& table = StackSamples();
-    std::lock_guard<std::mutex> lock(table.mutex);
-    return table.samples.size();
+    return StackSamples().total.load(std::memory_order_relaxed);
 #else
     return 0;
 #endif
@@ -1860,9 +2124,13 @@ std::uint64_t StackSampleDropped() noexcept {
 void ResetStackSamples() noexcept {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
     StackTable& table = StackSamples();
-    std::lock_guard<std::mutex> lock(table.mutex);
-    table.samples.clear();
-    table.by_hash.clear();
+    for (auto& shard : table.shards) {
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        shard.samples.clear();
+        shard.by_hash.clear();
+        shard.next_local = 1;
+    }
+    table.total.store(0, std::memory_order_relaxed);
     table.dropped.store(0, std::memory_order_relaxed);
 #endif
 }
@@ -1878,6 +2146,10 @@ std::mutex g_resource_replay_mutex;
 std::mutex g_resource_record_mutex;
 
 }  // namespace
+
+bool ReplayRecordingActive() noexcept {
+    return g_resource_replay_sink.load(std::memory_order_relaxed) != nullptr;
+}
 
 void SetResourceReplaySink(ResourceReplaySink sink, void* user) noexcept {
     std::lock_guard<std::mutex> lock(g_resource_replay_mutex);
@@ -1907,17 +2179,23 @@ void RecordResourceEvent(const ResourceEventRecord& event) noexcept {
     const auto write_ring = [&event]() {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
         (void)t_registration;
+        const std::uint32_t code_value =
+            static_cast<std::uint32_t>(event.code);
         const bool critical =
             IsCriticalResult(event.result) ||
             event.code == SchedEventCode::kParkCaptured;
+        // 采样已在 `ResourceEventWanted()`（宏内、结构体构造之前）完成；
+        // 走宏的 27 个插桩点在 7/8 的情况下零构造、零调用。直接调用本函数
+        // 的路径（fiber 的 kParkCaptured、IO 与测试）不采样：它们要么关键、
+        // 要么低频。
         EventRecord record;
         record.seq = ++t_local_seq;
         record.ts_ns = NowNs();
         record.thread_id = t_thread_id;
         record.gid = event.actor_gid;
         record.arg2 = event.arg2;
-        record.code = static_cast<std::uint32_t>(event.code);
-        record.tid = t_ring.tid.load(std::memory_order_relaxed);
+        record.code = code_value;
+        record.tid = t_tid_hash;
         record.pid = t_processor_id;
         record.resource_id = event.resource_id;
         record.target_gid = event.target_gid;
@@ -1930,16 +2208,23 @@ void RecordResourceEvent(const ResourceEventRecord& event) noexcept {
             record.arg3 = t_park_hint.reason;
             record.arg4 = t_park_hint.context;
         }
-        record.stack_id = CaptureStackSample(event.actor_gid, critical);
+        // v7：资源路径独立采样周期，critical 同样受约束（STACK_SAMPLE=1
+        // 不再意味着「每条 Mutex ok 事件都 backtrace」）。
+        record.stack_id =
+            CaptureStackSampleForResource(event.actor_gid, critical);
         if (!critical && record.stack_id != 0) {
             record.flags |= kResourceFlagStackSampled;
         }
-        GetTotals()
-            .codes[static_cast<std::uint32_t>(event.code) & 0xFFU]
-            .fetch_add(1, std::memory_order_relaxed);
-        // 资源事件全部走普通区：阻塞/唤醒在长跑里也是高频的，放进关键区会
-        // 把调度器的 wake 线索挤掉。时间线视图用 seq 窗口 + coverage 标注截断。
-        WriteSlot(t_ring.normal, record, kNormalSlots);
+        if (t_totals != nullptr) {
+            t_totals->codes[t_total_shard][code_value & 0xFFU].fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        // v7.1（P1 修复）：资源事件一律写**关键区**。
+        // 此前写普通区，300 条普通噪声就能把 Mutex 慢路径的 lock(blocked)
+        // 与 unlock(wake) 冲掉，造成「有 wake 无 lock」的假配对失败。
+        // 资源事件本身已按 1/8 采样，与 wake 系列共享保留窗口符合
+        // 「异常/交接分支优先保留」的设计目标。
+        WriteSlot(t_ring.critical, record, kCriticalSlots);
 #endif
     };
     // 回放录制：先转发再写环（录制顺序更接近决定点；栈捕获较慢，放在后面）。
