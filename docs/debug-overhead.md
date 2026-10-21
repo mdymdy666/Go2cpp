@@ -436,3 +436,18 @@ GO2CPP_DEBUG_CATEGORIES=park GO2CPP_DEBUG_SAMPLE_SHIFT=5 \
 - 类别归因：`/tmp/category_attribution.tsv`
 - 采集日志：`/tmp/debug_overhead_run.log`，每轮 stderr 在
   `/tmp/go2cpp-debug-overhead/logs/`
+
+## 最终结论（2026-10-21 更新）
+
+**并发原语 debug 即使只开 `primitives` 也有 2–10x 开销**（实测：mutex ~6x、rwmix ~10x、mpmc ~4.5x、pc ~2.1x、select ~4.4x；全开更高：mutex 192x、rwmix 66x）。
+
+因此产品决策为：
+
+1. **生产默认全关**（`GO2CPP_DEBUG_DUMP=OFF`）——不常开事件环/资源历史；
+2. **线上排查依赖**：
+   - **普通日志**（业务日志/错误码/关键路径日志）；
+   - **Doctor 按需诊断**：`status`/`dump`/`deadlock-report`/`ctx.cancel` 是**快照式**操作，不常驻记录，开销只在调用瞬间；
+3. **短时开启 debug**：排障窗口内按类别开（`park,sched` 或 `primitives`），问题定位后立即关闭；
+4. Debug 的定位从「常开监控」改为「**按需诊断工具**」——需要持续监控时，用业务日志 + 外部指标，而不是事件环。
+
+> 一句话：**性能优先的项目默认全关 Debug；线上问题 = 日志定位 + Doctor 现场诊断 + 短时开 Debug 复现。
