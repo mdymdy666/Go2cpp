@@ -1,0 +1,4 @@
+mode	stack_kb	phase	n	n_ok	stack_effective_kb	touched_kb	rss_kb	vsize_kb	vdata_kb	pss_kb	anon_kb	maxrss_kb	threads	note
+thread	64	base	100	0	0	0	5160	8788	356	1774	348	4992	1	
+thread	64	created	100	100	64	56	6520	6241508	19296	3008	1580	5888	101	
+thread	64	touched	100	100	64	56	8312	6241508	19296	4676	3180	8064	1	

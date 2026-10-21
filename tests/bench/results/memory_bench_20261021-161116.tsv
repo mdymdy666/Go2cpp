@@ -1,0 +1,5 @@
+mode	stack_kb	n	n_ok	status	stack_effective_kb	touched_kb	record_rss_kb	stack_rss_kb	total_rss_kb	per_unit_rss_kb	record_vsize_kb	stack_vsize_kb	total_vsize_kb	per_unit_vsize_kb	note
+fiber-direct	64	100	100	OK	64	56	60.0	6004.0	6064.0	60.6	0.0	6928.0	6928.0	69.3	
+fiber-direct	64	1000	1000	OK	64	56	500.0	60064.0	60564.0	60.6	528.0	68000.0	68528.0	68.5	
+thread	64	100	100	OK	64	56	1360.0	1792.0	3152.0	31.5	6232720.0	0.0	6232720.0	62327.2	
+thread	64	1000	1000	OK	64	56	9768.0	16192.0	25960.0	26.0	6294448.0	0.0	6294448.0	6294.4	

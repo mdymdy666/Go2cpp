@@ -1,0 +1,8 @@
+thread	4	100	0	92
+thread	4	1000	0	410
+thread	4	5000	0	49459
+thread	64	100	0	92
+thread	64	1000	0	603
+thread	64	5000	0	10779
+thread	1024	100	0	115
+thread	1024	1000	0	813

@@ -1,0 +1,4 @@
+mode	stack_kb	phase	n	n_ok	stack_effective_kb	touched_kb	rss_kb	vsize_kb	vdata_kb	pss_kb	anon_kb	maxrss_kb	threads	note
+fiber-direct	64	base	1000	0	0	0	5160	8788	356	1778	352	4992	1	
+fiber-direct	64	created	1000	1000	64	56	5660	9316	884	2278	844	5504	1	
+fiber-direct	64	touched	1000	1000	64	56	65724	77316	64884	62342	60908	65536	1	

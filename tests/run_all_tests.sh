@@ -23,6 +23,7 @@
 #   REPLAY_DIR      tools/replay 构建目录（默认 build-replay）
 #   JOBS            ctest 并行度（默认 nproc）
 #   OUT_DIR         日志与汇总输出目录（默认 /tmp/go2cpp-run-all-<pid>）
+#   RUN_MEMORY_BENCH 1 = 额外跑内存基准小矩阵（默认 0，记 SKIP，不拖慢 CI）
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -234,6 +235,22 @@ else
         "缺少 $REPLAY_DIR_RESOLVED/replay（tools/replay/build.sh）"
 fi
 
+fi
+
+# ---------------------------------------------------------------------------
+# 5) 内存基准（OPTIONAL）—— 默认 SKIP，不拖慢常规 CI。
+#
+# 为什么默认不跑：完整矩阵（5 模式 × 3 栈 × 3 数量）会创建最多 5000 个线程/
+# 协程并触页数 GB，耗时数分钟且受机器内存影响；常规回归只需要功能测试通过。
+# RUN_MEMORY_BENCH=1 时跑 QUICK 小矩阵（2 模式 × 64KB × 100/1000），约 10 秒。
+# ---------------------------------------------------------------------------
+if [ "${RUN_MEMORY_BENCH:-0}" = "1" ]; then
+    run_step "bench-memory" 600 \
+        env QUICK=1 OUT_DIR="$OUT_DIR/bench-memory" \
+        bash "$ROOT/tests/bench/run_memory_bench.sh"
+else
+    mark_skip "bench-memory" 0 \
+        "OPTIONAL：RUN_MEMORY_BENCH=1 运行（QUICK 小矩阵，约 10s）"
 fi
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,197 @@
+{
+  "generated_at": "2026-10-21T16:12:53+08:00",
+  "environment": {
+    "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "machine": "x86_64",
+    "cpu_count": 12,
+    "page_size_bytes": 4096,
+    "build_dir": "/UserData/CodexWorkSpace/Go2Cpp-work/build-work",
+    "python": "3.12.3"
+  },
+  "units": "KB（n_ok 为 0 或字段不可用的派生值为 null）",
+  "configs": [
+    {
+      "mode": "thread",
+      "stack_kb": 64,
+      "n": 100,
+      "n_ok": 100,
+      "status": "OK",
+      "exit_code": 0,
+      "elapsed_ms": 86,
+      "stack_effective_kb": 64,
+      "touched_kb": 56,
+      "note": "arena_max=1",
+      "phases": {
+        "base": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "base",
+          "n": 100,
+          "n_ok": 0,
+          "stack_effective_kb": 0,
+          "touched_kb": 0,
+          "rss_kb": 5156,
+          "vsize_kb": 8788,
+          "vdata_kb": 356,
+          "pss_kb": 1811,
+          "anon_kb": 352,
+          "maxrss_kb": 4984,
+          "threads": 1,
+          "note": "arena_max=1"
+        },
+        "created": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "created",
+          "n": 100,
+          "n_ok": 100,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 6204,
+          "vsize_kb": 15720,
+          "vdata_kb": 6888,
+          "pss_kb": 2733,
+          "anon_kb": 1272,
+          "maxrss_kb": 5624,
+          "threads": 101,
+          "note": "arena_max=1"
+        },
+        "touched": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "touched",
+          "n": 100,
+          "n_ok": 100,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 11804,
+          "vsize_kb": 15720,
+          "vdata_kb": 6888,
+          "pss_kb": 8333,
+          "anon_kb": 6872,
+          "maxrss_kb": 10872,
+          "threads": 101,
+          "note": "arena_max=1"
+        }
+      },
+      "total_delta": {
+        "rss_kb": 6648.0,
+        "vsize_kb": 6932.0,
+        "vdata_kb": 6532.0,
+        "pss_kb": 6522.0,
+        "anon_kb": 6520.0
+      },
+      "record_delta": {
+        "rss_kb": 1048.0,
+        "vsize_kb": 6932.0,
+        "vdata_kb": 6532.0,
+        "pss_kb": 922.0
+      },
+      "stack_delta": {
+        "rss_kb": 5600.0,
+        "vsize_kb": 0.0,
+        "vdata_kb": 0.0,
+        "pss_kb": 5600.0
+      },
+      "per_unit": {
+        "rss_kb": 66.48,
+        "vsize_kb": 69.32,
+        "vdata_kb": 65.32,
+        "pss_kb": 65.22,
+        "anon_kb": 65.2
+      }
+    },
+    {
+      "mode": "thread",
+      "stack_kb": 64,
+      "n": 1000,
+      "n_ok": 1000,
+      "status": "OK",
+      "exit_code": 0,
+      "elapsed_ms": 323,
+      "stack_effective_kb": 64,
+      "touched_kb": 56,
+      "note": "arena_max=1",
+      "phases": {
+        "base": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "base",
+          "n": 1000,
+          "n_ok": 0,
+          "stack_effective_kb": 0,
+          "touched_kb": 0,
+          "rss_kb": 5116,
+          "vsize_kb": 8788,
+          "vdata_kb": 356,
+          "pss_kb": 1763,
+          "anon_kb": 352,
+          "maxrss_kb": 4984,
+          "threads": 1,
+          "note": "arena_max=1"
+        },
+        "created": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "created",
+          "n": 1000,
+          "n_ok": 1000,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 14432,
+          "vsize_kb": 77976,
+          "vdata_kb": 65544,
+          "pss_kb": 10953,
+          "anon_kb": 9540,
+          "maxrss_kb": 13304,
+          "threads": 1001,
+          "note": "arena_max=1"
+        },
+        "touched": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "touched",
+          "n": 1000,
+          "n_ok": 1000,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 70432,
+          "vsize_kb": 77976,
+          "vdata_kb": 65544,
+          "pss_kb": 66953,
+          "anon_kb": 65540,
+          "maxrss_kb": 69880,
+          "threads": 1001,
+          "note": "arena_max=1"
+        }
+      },
+      "total_delta": {
+        "rss_kb": 65316.0,
+        "vsize_kb": 69188.0,
+        "vdata_kb": 65188.0,
+        "pss_kb": 65190.0,
+        "anon_kb": 65188.0
+      },
+      "record_delta": {
+        "rss_kb": 9316.0,
+        "vsize_kb": 69188.0,
+        "vdata_kb": 65188.0,
+        "pss_kb": 9190.0
+      },
+      "stack_delta": {
+        "rss_kb": 56000.0,
+        "vsize_kb": 0.0,
+        "vdata_kb": 0.0,
+        "pss_kb": 56000.0
+      },
+      "per_unit": {
+        "rss_kb": 65.316,
+        "vsize_kb": 69.188,
+        "vdata_kb": 65.188,
+        "pss_kb": 65.19,
+        "anon_kb": 65.188
+      }
+    }
+  ]
+}

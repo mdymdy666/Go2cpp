@@ -1,0 +1,3 @@
+mode	stack_kb	n	n_ok	status	stack_effective_kb	touched_kb	record_rss_kb	stack_rss_kb	total_rss_kb	per_unit_rss_kb	record_vsize_kb	stack_vsize_kb	total_vsize_kb	per_unit_vsize_kb	note
+thread	64	100	100	OK	64	56	1048.0	5600.0	6648.0	66.5	6932.0	0.0	6932.0	69.3	arena_max=1
+thread	64	1000	1000	OK	64	56	9316.0	56000.0	65316.0	65.3	69188.0	0.0	69188.0	69.2	arena_max=1

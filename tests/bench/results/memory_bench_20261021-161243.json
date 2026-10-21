@@ -1,0 +1,379 @@
+{
+  "generated_at": "2026-10-21T16:12:47+08:00",
+  "environment": {
+    "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "kernel": "6.6.87.2-microsoft-standard-WSL2",
+    "machine": "x86_64",
+    "cpu_count": 12,
+    "page_size_bytes": 4096,
+    "build_dir": "/UserData/CodexWorkSpace/Go2Cpp-work/build-work",
+    "python": "3.12.3"
+  },
+  "units": "KB（n_ok 为 0 或字段不可用的派生值为 null）",
+  "configs": [
+    {
+      "mode": "fiber-direct",
+      "stack_kb": 64,
+      "n": 100,
+      "n_ok": 100,
+      "status": "OK",
+      "exit_code": 0,
+      "elapsed_ms": 85,
+      "stack_effective_kb": 64,
+      "touched_kb": 56,
+      "note": "",
+      "phases": {
+        "base": {
+          "mode": "fiber-direct",
+          "stack_kb": 64,
+          "phase": "base",
+          "n": 100,
+          "n_ok": 0,
+          "stack_effective_kb": 0,
+          "touched_kb": 0,
+          "rss_kb": 5168,
+          "vsize_kb": 8788,
+          "vdata_kb": 356,
+          "pss_kb": 1783,
+          "anon_kb": 348,
+          "maxrss_kb": 4992,
+          "threads": 1,
+          "note": ""
+        },
+        "created": {
+          "mode": "fiber-direct",
+          "stack_kb": 64,
+          "phase": "created",
+          "n": 100,
+          "n_ok": 100,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 5228,
+          "vsize_kb": 8788,
+          "vdata_kb": 356,
+          "pss_kb": 1843,
+          "anon_kb": 400,
+          "maxrss_kb": 5120,
+          "threads": 1,
+          "note": ""
+        },
+        "touched": {
+          "mode": "fiber-direct",
+          "stack_kb": 64,
+          "phase": "touched",
+          "n": 100,
+          "n_ok": 100,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 11232,
+          "vsize_kb": 15716,
+          "vdata_kb": 6884,
+          "pss_kb": 7847,
+          "anon_kb": 6404,
+          "maxrss_kb": 11136,
+          "threads": 1,
+          "note": ""
+        }
+      },
+      "total_delta": {
+        "rss_kb": 6064.0,
+        "vsize_kb": 6928.0,
+        "vdata_kb": 6528.0,
+        "pss_kb": 6064.0,
+        "anon_kb": 6056.0
+      },
+      "record_delta": {
+        "rss_kb": 60.0,
+        "vsize_kb": 0.0,
+        "vdata_kb": 0.0,
+        "pss_kb": 60.0
+      },
+      "stack_delta": {
+        "rss_kb": 6004.0,
+        "vsize_kb": 6928.0,
+        "vdata_kb": 6528.0,
+        "pss_kb": 6004.0
+      },
+      "per_unit": {
+        "rss_kb": 60.64,
+        "vsize_kb": 69.28,
+        "vdata_kb": 65.28,
+        "pss_kb": 60.64,
+        "anon_kb": 60.56
+      }
+    },
+    {
+      "mode": "fiber-direct",
+      "stack_kb": 64,
+      "n": 1000,
+      "n_ok": 1000,
+      "status": "OK",
+      "exit_code": 0,
+      "elapsed_ms": 137,
+      "stack_effective_kb": 64,
+      "touched_kb": 56,
+      "note": "",
+      "phases": {
+        "base": {
+          "mode": "fiber-direct",
+          "stack_kb": 64,
+          "phase": "base",
+          "n": 1000,
+          "n_ok": 0,
+          "stack_effective_kb": 0,
+          "touched_kb": 0,
+          "rss_kb": 5096,
+          "vsize_kb": 8788,
+          "vdata_kb": 356,
+          "pss_kb": 1744,
+          "anon_kb": 352,
+          "maxrss_kb": 4984,
+          "threads": 1,
+          "note": ""
+        },
+        "created": {
+          "mode": "fiber-direct",
+          "stack_kb": 64,
+          "phase": "created",
+          "n": 1000,
+          "n_ok": 1000,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 5596,
+          "vsize_kb": 9316,
+          "vdata_kb": 884,
+          "pss_kb": 2244,
+          "anon_kb": 844,
+          "maxrss_kb": 5496,
+          "threads": 1,
+          "note": ""
+        },
+        "touched": {
+          "mode": "fiber-direct",
+          "stack_kb": 64,
+          "phase": "touched",
+          "n": 1000,
+          "n_ok": 1000,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 65660,
+          "vsize_kb": 77316,
+          "vdata_kb": 64884,
+          "pss_kb": 62308,
+          "anon_kb": 60908,
+          "maxrss_kb": 65528,
+          "threads": 1,
+          "note": ""
+        }
+      },
+      "total_delta": {
+        "rss_kb": 60564.0,
+        "vsize_kb": 68528.0,
+        "vdata_kb": 64528.0,
+        "pss_kb": 60564.0,
+        "anon_kb": 60556.0
+      },
+      "record_delta": {
+        "rss_kb": 500.0,
+        "vsize_kb": 528.0,
+        "vdata_kb": 528.0,
+        "pss_kb": 500.0
+      },
+      "stack_delta": {
+        "rss_kb": 60064.0,
+        "vsize_kb": 68000.0,
+        "vdata_kb": 64000.0,
+        "pss_kb": 60064.0
+      },
+      "per_unit": {
+        "rss_kb": 60.564,
+        "vsize_kb": 68.528,
+        "vdata_kb": 64.528,
+        "pss_kb": 60.564,
+        "anon_kb": 60.556
+      }
+    },
+    {
+      "mode": "thread",
+      "stack_kb": 64,
+      "n": 100,
+      "n_ok": 100,
+      "status": "OK",
+      "exit_code": 0,
+      "elapsed_ms": 92,
+      "stack_effective_kb": 64,
+      "touched_kb": 56,
+      "note": "",
+      "phases": {
+        "base": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "base",
+          "n": 100,
+          "n_ok": 0,
+          "stack_effective_kb": 0,
+          "touched_kb": 0,
+          "rss_kb": 5180,
+          "vsize_kb": 8788,
+          "vdata_kb": 356,
+          "pss_kb": 1795,
+          "anon_kb": 348,
+          "maxrss_kb": 4992,
+          "threads": 1,
+          "note": ""
+        },
+        "created": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "created",
+          "n": 100,
+          "n_ok": 100,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 6540,
+          "vsize_kb": 6241632,
+          "vdata_kb": 19420,
+          "pss_kb": 3029,
+          "anon_kb": 1580,
+          "maxrss_kb": 5888,
+          "threads": 101,
+          "note": ""
+        },
+        "touched": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "touched",
+          "n": 100,
+          "n_ok": 100,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 12140,
+          "vsize_kb": 6241632,
+          "vdata_kb": 19420,
+          "pss_kb": 8629,
+          "anon_kb": 7180,
+          "maxrss_kb": 11392,
+          "threads": 101,
+          "note": ""
+        }
+      },
+      "total_delta": {
+        "rss_kb": 6960.0,
+        "vsize_kb": 6232844.0,
+        "vdata_kb": 19064.0,
+        "pss_kb": 6834.0,
+        "anon_kb": 6832.0
+      },
+      "record_delta": {
+        "rss_kb": 1360.0,
+        "vsize_kb": 6232844.0,
+        "vdata_kb": 19064.0,
+        "pss_kb": 1234.0
+      },
+      "stack_delta": {
+        "rss_kb": 5600.0,
+        "vsize_kb": 0.0,
+        "vdata_kb": 0.0,
+        "pss_kb": 5600.0
+      },
+      "per_unit": {
+        "rss_kb": 69.6,
+        "vsize_kb": 62328.44,
+        "vdata_kb": 190.64,
+        "pss_kb": 68.34,
+        "anon_kb": 68.32
+      }
+    },
+    {
+      "mode": "thread",
+      "stack_kb": 64,
+      "n": 1000,
+      "n_ok": 1000,
+      "status": "OK",
+      "exit_code": 0,
+      "elapsed_ms": 462,
+      "stack_effective_kb": 64,
+      "touched_kb": 56,
+      "note": "",
+      "phases": {
+        "base": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "base",
+          "n": 1000,
+          "n_ok": 0,
+          "stack_effective_kb": 0,
+          "touched_kb": 0,
+          "rss_kb": 5176,
+          "vsize_kb": 8788,
+          "vdata_kb": 356,
+          "pss_kb": 1791,
+          "anon_kb": 348,
+          "maxrss_kb": 4992,
+          "threads": 1,
+          "note": ""
+        },
+        "created": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "created",
+          "n": 1000,
+          "n_ok": 1000,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 14952,
+          "vsize_kb": 6303236,
+          "vdata_kb": 77424,
+          "pss_kb": 11441,
+          "anon_kb": 9996,
+          "maxrss_kb": 13952,
+          "threads": 1001,
+          "note": ""
+        },
+        "touched": {
+          "mode": "thread",
+          "stack_kb": 64,
+          "phase": "touched",
+          "n": 1000,
+          "n_ok": 1000,
+          "stack_effective_kb": 64,
+          "touched_kb": 56,
+          "rss_kb": 70952,
+          "vsize_kb": 6303236,
+          "vdata_kb": 77424,
+          "pss_kb": 67441,
+          "anon_kb": 65996,
+          "maxrss_kb": 70016,
+          "threads": 1001,
+          "note": ""
+        }
+      },
+      "total_delta": {
+        "rss_kb": 65776.0,
+        "vsize_kb": 6294448.0,
+        "vdata_kb": 77068.0,
+        "pss_kb": 65650.0,
+        "anon_kb": 65648.0
+      },
+      "record_delta": {
+        "rss_kb": 9776.0,
+        "vsize_kb": 6294448.0,
+        "vdata_kb": 77068.0,
+        "pss_kb": 9650.0
+      },
+      "stack_delta": {
+        "rss_kb": 56000.0,
+        "vsize_kb": 0.0,
+        "vdata_kb": 0.0,
+        "pss_kb": 56000.0
+      },
+      "per_unit": {
+        "rss_kb": 65.776,
+        "vsize_kb": 6294.448,
+        "vdata_kb": 77.068,
+        "pss_kb": 65.65,
+        "anon_kb": 65.648
+      }
+    }
+  ]
+}
