@@ -25,7 +25,9 @@ trap 'stop_pid "${FIXTURE_PID:-}"; rm -rf "$WORK"' EXIT
 # 旧版写死 build-debug，该目录早于资源历史符号，编译必然失败（P1-4）。
 DEBUG_BUILD="$(find_build_dir libgo2cpp_debug.so "${GO2CPP_DEBUG_BUILD:-}" \
     "$ROOT/build-enhanced" "$ROOT/build-debug-full" "$ROOT/build-debug")" || true
-DEBUG_SO="$DEBUG_BUILD/libgo2cpp_debug.so"
+# 资源注册表（UnregisterResource）在 debug_event 库里，不是 debug 库；
+# 之前查错库导致构建新鲜度检查始终失败、fixture:compile 被跳过。
+DEBUG_SO="$DEBUG_BUILD/libgo2cpp_debug_event.so"
 
 if [ ! -f "$DEBUG_SO" ]; then
     skip "fixture:build-dir" normal \
