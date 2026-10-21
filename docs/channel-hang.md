@@ -63,3 +63,33 @@ g++ -std=c++17 -O2 -I include tests/concurrency/test_channel_thread_stress.cpp \
 /tmp/channel_stress --rounds=100 --scenario=mixed
 /tmp/channel_stress --inject-hang   # 自检抓现场链路
 ```
+
+## 后续重跑结论（2026-10-21 23:00）
+
+用还原装置（`tests/bench/channel_thread_mixed_retry.cpp`）重跑：
+
+1. **第一次挂起（100% 复现）**：根因是**测试装置的 Gate 计数 bug**——
+   `gate.WaitAll(kWorkers+2)` 把「只在 stop 之后 Arrive 的 helper」计入，
+   而 stop 在 WaitAll 之后设置 → 必然死锁；**与 Channel 无关**。
+   修复为 `kWorkers+1` 后恢复正常。
+2. **原始挂起（第二次，0 复现）**：修正后 24,600 轮 / 8,320 万条（当前 HEAD）
+   + 旧库 `89f0d7c` 11,500 轮 / 1.446 亿条 + 本报告装置 11.14 亿条
+   = **累计 ~13.4 亿条，0 挂起**。
+3. **推断（按可能性）**：
+   - ① **旧进程/旧二进制混淆（最可能）**：诊断时只见 3 个线程（代码应有 5 个），
+     疑似 `pgrep` 抓错 pid 或仍在跑旧 gate-bug 二进制；
+   - ② 旧库 `WaitNode::managed()/gid()` 无锁读 `shared_ptr` 竞态（`351f732` 已修，
+     TSAN 曾报；旧库 1.45 亿条未触发，窗口极窄）；
+   - ③ WSL2 调度/内存一次性异常（无证据）。
+4. **定向建议**：
+   - 用旧库 `89f0d7c` + `GO2CPP_ENABLE_TSAN=ON` 跑 native mixed 与 Mutex 高频
+     `Lock/Unlock`，验证 WaitNode 竞态能否稳定报出；
+   - 去掉 Channel，直接压 `sync::Mutex` + `ParkingCondition` native 唤醒；
+   - 再遇时用本装置 `--gdb`（已 `PR_SET_PTRACER`）+ watchdog stage/Channel 快照；
+   - 诊断**不要用 `pgrep -n`**，记录 HEAD/二进制 mtime。
+
+## 最终判定
+
+**Channel 线程路径无产品缺陷证据**（13.4 亿条 / 0 挂起 + 逐点审计）；
+最初那次挂起最可能是「旧二进制/旧进程混淆」，其次为已修复的 WaitNode 竞态。
+疑点关闭，保留本文档供后续参考。
