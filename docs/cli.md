@@ -369,6 +369,98 @@ go2cpp-cli doctor --socket /tmp/demo.sock --concurrency 10 --command status
 
 ---
 
+### 4.9 `graph`
+
+把并发运行时的现场渲染成状态图：Mermaid（GitHub 直接渲染）、Graphviz DOT、
+JSON（前端可渲染）。数据来自 Doctor（`G2CD/1`）与 DebugServer（`GO2CPP-DEBUG/1`
+的 `VIEW`），或离线的 `--replay` 文件；不链接任何运行时库，纯字符串生成。
+
+```text
+go2cpp-cli graph --pid <pid> --type <type> [--format mermaid|dot|json] [options]
+go2cpp-cli graph --replay <file> --type <type> [--format ...] [options]
+```
+
+| 图（`--type`） | 内容 | 数据源 |
+|---|---|---|
+| `wait-for` | G → 资源 → 持有者；死锁环标红 | Doctor `deadlock-report json=1` 的 edges（owner/waiters）+ DebugServer `VIEW history`（或 `VIEW primitives`）的等待者 gid |
+| `resource` | 资源节点（Mutex/Channel/PC）+ 持有/等待边 + holds/waits/wakes | `VIEW resources` + 每个资源的 `VIEW history <id>` |
+| `fiber-state` | 每个 G 的状态迁移（created→running→parked→ready→completed） | `VIEW sched` 的 flow（事件环）+ `VIEW gmp` 的当前状态快照 |
+| `gmp` | P/M/G 拓扑 + 全局/本地 runqueue + blocked G | `VIEW gmp`；缺失时退回 Doctor `status` 的 machines/processors/runqueue |
+| `sequence` | 资源操作时序（Mermaid `sequenceDiagram`） | 每个资源的 `VIEW history`；窗口被冲刷时退回 `primitives` 的 Mutex/Channel 事件 |
+
+| 参数 | 说明 |
+|---|---|
+| `--pid <PID>` | 在线模式：目标进程 pid（与 `--replay` 二选一）。 |
+| `--replay <FILE>` | 离线模式：JSON dump / `VIEW` 输出 / `# go2cpp-trace`。G2CRPLY 二进制请先用 `replay` 工具导出。 |
+| `--type <TYPE>` | 必填：`wait-for` / `resource` / `fiber-state` / `gmp` / `sequence`。 |
+| `--format <FMT>` | `mermaid`（默认）/ `dot` / `json`。 |
+| `--out <FILE>` | 写入文件；默认 `-`（stdout），临时文件 + rename。 |
+| `--debug-socket <PATH>` | 覆盖 DebugServer socket（默认 `/tmp/go2cpp-<pid>.sock`）。 |
+| `--doctor-socket <PATH>` | 覆盖 Doctor socket（默认 `/tmp/go2cpp-<pid>-doctor.sock`）。 |
+| `--timeout-ms <N>` | 单次请求超时，默认 5000。 |
+| `--max-g <N>` | 最多显示多少个 G，默认 16。 |
+| `--max-resources <N>` | 最多显示多少个资源，默认 48。 |
+| `--max-events <N>` | sequence 最多多少条消息，默认 400。 |
+
+示例：
+
+```bash
+go2cpp-cli graph --pid 1234 --type wait-for --format mermaid
+go2cpp-cli graph --pid 1234 --type resource --format dot > /tmp/res.dot
+go2cpp-cli graph --pid 1234 --type fiber-state --format mermaid
+go2cpp-cli graph --pid 1234 --type gmp --format dot
+go2cpp-cli graph --replay /tmp/history.json --type sequence --format mermaid
+go2cpp-cli graph --pid 1234 --type wait-for --format json --out /tmp/wf.json
+```
+
+**死锁环**：在 G/资源二部图上做有界 DFS，找到的简单环同时写入
+`deadlock_cycles`，并标记环上的节点与边。Mermaid 用
+`classDef deadlock` + `linkStyle ... stroke:#c00000`，DOT 用
+`color="#c00000" penwidth=2`，JSON 用 `"deadlock": true`。
+
+**输出结构**（JSON）：
+
+```json
+{
+  "schema": "go2cpp.graph.wait-for/1",
+  "version": 1,
+  "type": "wait-for",
+  "title": "wait-for @ pid 1234",
+  "ok": true,
+  "notes": ["事件窗口已截断（window.truncated=true）：等待者可能不完整"],
+  "source": {"pid": 1234, "sources": {"debugserver": true, "doctor": true}},
+  "deadlock_cycles": [["res-a", "G11", "res-b", "G12", "res-a"]],
+  "nodes": [{"id": "res-a", "label": "res-a\nkMutex#1\nMutex\nowner=G11", "kind": "resource", "deadlock": true}],
+  "edges": [{"from": "res-a", "to": "G11", "label": "held", "kind": "held", "deadlock": true}]
+}
+```
+
+sequence 额外有 `sequence.participants[]` 与 `sequence.messages[]`（含
+`count`：连续重复通知折叠后的次数）；DOT 版本把时序展开为按时间连接的
+事件节点（`m0 → m1 → ...`）。
+
+**降级契约**（不是静默省略）：
+
+- Doctor 不可用：owner 改由 `VIEW history` 的事件推导，notes 记录缺口；
+- DebugServer 不可用：只画 Doctor 给出的「资源 → owner」与 waiters 计数，
+  不伪造等待者 gid；
+- 两者都不可用：输出只含 note 节点的图，**退出码 3**（提示需要
+  `-DGO2CPP_DEBUG_DUMP=ON` / `-DGO2CPP_DIAGNOSTIC=ON`）；
+- 部分降级（至少一个数据源可用）：退出码 0，notes 写明来源与缺口。
+
+**已知限制**：
+
+- 事件环按线程有界。死锁现场若在建立后较久才采集，park/mutex 事件可能已被
+  高频 timer/PC 事件冲刷；此时 `VIEW history` 为空，图只能展示 Doctor 的
+  owner/waiters 计数。`window.truncated` 会写入 notes，绝不把「窗口内没看到」
+  当成「不存在」。
+- Doctor 的注册名与 DebugServer `resource_id` 没有地址字段可直接对应：
+  实现按 `owner_gid` 匹配；对不上的注册名以独立节点展示，不猜测顺序映射。
+- `--replay` 只接受 JSON 与 `# go2cpp-trace`；`G2CRPLY` 二进制需要先用
+  `replay`/`debug` 工具导出事件。
+
+---
+
 ## 5. 与三个模块的对接点
 
 ### 5.1 DebugServer（`6192f825`）— 已对齐 `GO2CPP-DEBUG/1`
@@ -482,9 +574,16 @@ BIN=./build-cli/tools/cli/go2cpp-cli bash tools/cli/tests/run_all.sh
   非迁移格式、v1 旧魔数、不支持的版本、空文件；
 - `debug`：JSON / trace / ini / `G2CRPLY` / `G2CMIG03` / `G2CMIG02` / 未知格式 / `--json`；
 - 随机参数 500 组（退出码必须在 0..5，无超时）；
-- 压测 200 次启动与 200 次 `status` 请求的 P50/P95/P99。
+- 压测 200 次启动与 200 次 `status` 请求的 P50/P95/P99；
+- `graph`（`tools/cli/tests/run_graph.sh`，由 `run_all.sh` 调用，91 项断言）：
+  五种图 × Mermaid/DOT/JSON、wait-for 环与死锁高亮、DOT `dot -Tsvg` 渲染、
+  `--replay`（sched/history/gmp/resources/trace）、二进制记录拒绝、
+  仅 Doctor / 仅 DebugServer / 无数据源三种降级、参数错误与 `--out`。
 
 测试依赖：`bash`、`python3`（假 server 与二进制 fixture，不进入构建依赖）。
+`run_graph.sh` 使用独立的假数据源 `graph_fake_server.py`（同时实现
+`GO2CPP-DEBUG/1` 与 `G2CD/1`），不依赖真实进程；真实进程联调见
+`tests/scenarios/deadlock_routes`。
 
 ---
 
@@ -492,8 +591,9 @@ BIN=./build-cli/tools/cli/go2cpp-cli bash tools/cli/tests/run_all.sh
 
 1. **仅 Linux/POSIX**：`transport.cpp` 使用 Unix socket 与 `poll`，非 POSIX 平台
    编译期 `#error`；`SelfDirectory()` 依赖 `/proc/self/exe`。
-2. **未与真实 DebugServer 进程联调**：协议按头文件实现，用同协议的假 server
-   做了端到端验证；真实联调需要目标程序调用 `DebugServer::Start()`。
+2. **`dump`/`status` 未与真实 DebugServer 进程联调**：协议按头文件实现，用同协议的假
+   server 做了端到端验证；真实联调需要目标程序调用 `DebugServer::Start()`。
+   （`graph` 已在 `tests/scenarios/deadlock_routes` 的真实进程上联调，见 §4.9/§6。）
 3. **迁移/重放走外部可执行**：CLI 不链接 `tools/migration`、`tools/replay` 的库。
    若对方改为只提供库，需要新增链接或包装可执行文件。
 4. **通用记录注入缺失**（见 5.3），`replay record` 目前只能验证生命周期与参数约定。
@@ -502,3 +602,14 @@ BIN=./build-cli/tools/cli/go2cpp-cli bash tools/cli/tests/run_all.sh
 7. **未做权限模型**：只依赖 socket 权限（服务端 0600），不检查属主。
 8. **`debug` 的字段统计是启发式的**：`fibers`/`tasks`/`goroutines`、`events`/`trace`
    按常见命名探测；若 dump schema 定稿后可改为严格字段。
+9. **`graph` 依赖事件窗口**：事件环按线程有界，死锁建立较久后 park/mutex 事件
+   可能已被冲刷；此时 wait-for 只能显示 Doctor 的 owner/waiters 计数，sequence
+   退回 `primitives` 的 Mutex/Channel 事件。`window.truncated` 会写进 notes。
+10. **`graph` 的 Doctor/DebugServer 名称映射**：两者之间没有地址字段，注册名
+    （`res-a`）与 `resource_id`（`kMutex#1`）只能按 `owner_gid` 匹配；对不上的
+    注册名以独立节点展示，不做顺序猜测。
+11. **`graph --replay` 不支持 `G2CRPLY` 二进制**：格式解析属于 `tools/replay`，
+    CLI 不链接它；需要先用 replay/debug 工具导出 JSON 事件。
+12. **`graph` 的输出规模有上限**（默认 16 G / 48 资源 / 400 消息）：超大进程
+    需要显式调大 `--max-*`，但 Mermaid 在数百节点后会难以阅读，建议按 G 或
+    资源过滤后再渲染。

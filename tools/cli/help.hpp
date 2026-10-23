@@ -22,6 +22,7 @@ void PrintReplayHelp();
 void PrintMigrateHelp();
 void PrintDebugHelp();
 void PrintDoctorHelp();
+void PrintGraphHelp();
 void PrintVersion();
 
 }  // namespace go2cpp::cli

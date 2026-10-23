@@ -22,6 +22,7 @@
 #include "cli.hpp"
 #include "commands.hpp"
 #include "doctor.hpp"
+#include "graph.hpp"
 #include "help.hpp"
 
 #include <csignal>
@@ -59,6 +60,10 @@ int PrintCommandHelp(const std::string& command) {
     }
     if (command == "doctor") {
         go2cpp::cli::PrintDoctorHelp();
+        return 0;
+    }
+    if (command == "graph") {
+        go2cpp::cli::PrintGraphHelp();
         return 0;
     }
     throw CliError(ExitCode::kUsage,
@@ -115,6 +120,9 @@ int main(int argc, char** argv) {
         }
         if (command == "doctor") {
             return go2cpp::cli::RunDoctor(rest);
+        }
+        if (command == "graph") {
+            return go2cpp::cli::RunGraph(rest);
         }
 
         throw CliError(ExitCode::kUsage,

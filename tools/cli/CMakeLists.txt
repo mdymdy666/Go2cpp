@@ -4,6 +4,8 @@
 #   - 只依赖 libc + 项目自带的 nlohmann/json 单头文件，**不链接任何 go2cpp 运行时库**：
 #     dump/status/migrate dump 通过 Unix socket 与目标进程通信，replay/migrate
 #     通过 fork/exec 调用外部后端，所以新增该 target 不会改变库目标的编译或链接；
+#     （doctor/graph 的 G2CD/1 帧编解码来自 header-only 的
+#     include/go2cpp/debug/diagnostic_protocol.hpp，仍然不链接库。）
 #   - 不注册测试、不参与 install(EXPORT)；默认 OFF，只有显式
 #     -DGO2CPP_WITH_CLI=ON 才会进入构建。
 add_executable(go2cpp_cli
@@ -13,7 +15,8 @@ add_executable(go2cpp_cli
     transport.cpp
     commands.cpp
     help.cpp
-    doctor.cpp)
+    doctor.cpp
+    graph.cpp)
 
 set_target_properties(go2cpp_cli PROPERTIES
     OUTPUT_NAME go2cpp-cli

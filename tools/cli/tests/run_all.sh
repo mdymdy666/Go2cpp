@@ -562,6 +562,19 @@ else
     fail "压测用假 server 启动失败"
 fi
 
+# ---------------- 10. graph（并发结构状态图） ----------------
+# graph 有自己的假数据源（DebugServer VIEW + Doctor G2CD）与 91 项断言；
+# 独立脚本运行，失败计入本脚本汇总。
+say "graph（五图 × 三格式 / 环高亮 / --replay / 降级）"
+unset GO2CPP_DEBUG_SOCKET GO2CPP_DOCTOR_SOCKET
+if BIN="$BIN" bash "$TEST_SRC/run_graph.sh" > "$WORK/graph.log" 2>&1; then
+    pass "graph 验收（$(grep -c '^PASS  ' "$WORK/graph.log") 项）"
+else
+    fail "graph 验收失败"
+    tail -40 "$WORK/graph.log" | sed 's/^/      | /'
+fi
+grep '^PASS=' "$WORK/graph.log" | tail -1 | sed 's/^/      graph /'
+
 # ---------------- 汇总 ----------------
 say "汇总"
 printf 'PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
