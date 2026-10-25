@@ -26,3 +26,6 @@ compile_commands.json
 app.ini
 app.ini.tmp
 __pycache__/
+
+# MCP 本地配置（含真实 API key，不入库；模板 mcp/mcp.ini.example）
+mcp/mcp.ini

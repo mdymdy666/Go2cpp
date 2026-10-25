@@ -1,0 +1,8 @@
+[mcp]
+llm.model=deepseek-chat
+llm.base_url=https://api.deepseek.com/v1
+llm.api_key=sk-REPLACE_ME
+llm.timeout_ms=60000
+server.name=go2cpp-mcp
+server.version=0.1.0
+server.workers=1

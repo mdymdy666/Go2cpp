@@ -43,9 +43,8 @@
  * ## 边界与陷阱
  *
  * - 静态注册发生在 `main` 之前；未链接本翻译单元时 `[os]` 段不会出现；
- * - `MaxFileSize` 的 0 表示不限制，负数被归一为 0；**没有 clamp**：
- *   配置类型是 `int`，能表达的最大上限是 `INT_MAX`（约 2 GiB），再大只能设 0；
- *   `std::clamp` 只用于 `ReadBufferSize` 的 4 KiB..16 MiB。
+ * - `MaxFileSize` 的 0 表示不限制，负数被归一为 0；
+ * - 配置值是 `int`，超大上限会先被 `std::clamp` 钳制。
  */
 #include "go2cpp/os/os.hpp"
 #include "go2cpp/config/config.hpp"
@@ -57,6 +56,28 @@ GO2CPP_CONFIG_REGISTER("os", int, default_read_buffer_size, 65536,
                        "ReadFile 每次 read 的缓冲区字节数");
 GO2CPP_CONFIG_REGISTER("os", int, max_file_size, 268435456,
                        "ReadFile 允许读取的单文件大小上限（字节），超过返回错误");
+
+// 进程/IPC 子层默认值。键完整名为 "os.proc.*"，与 ProcessDefaults 的读取一致。
+GO2CPP_CONFIG_REGISTER("os.proc", int, default_grace_ms, 5000,
+                       "子进程 TERM→KILL 宽限期（毫秒）");
+GO2CPP_CONFIG_REGISTER("os.proc", int, default_timeout_ms, 0,
+                       "子进程默认执行超时（毫秒，0 = 不限时）");
+GO2CPP_CONFIG_REGISTER("os.proc", int, max_output_bytes, 1048576,
+                       "每个受控进程保留的输出上限（字节，0 = 不限）");
+GO2CPP_CONFIG_REGISTER("os.proc", int, supervisor_tick_ms, 50,
+                       "Supervisor 条件/配额检查周期（毫秒）");
+GO2CPP_CONFIG_REGISTER("os.proc", int, pool_workers, 4,
+                       "ProcessPool 默认并发槽位");
+GO2CPP_CONFIG_REGISTER("os.proc", int, pool_queue, 64,
+                       "ProcessPool 默认排队上限");
+GO2CPP_CONFIG_REGISTER("os.proc", bool, forward_stderr, false,
+                       "是否默认逐行转发子进程 stderr");
+GO2CPP_CONFIG_REGISTER("os.proc", int, max_open_fds, 0,
+                       "每进程 fd 配额（0 = 不限）");
+GO2CPP_CONFIG_REGISTER("os.proc", int64_t, max_rss_bytes, 0,
+                       "每进程 RSS 配额（字节，0 = 不限）");
+GO2CPP_CONFIG_REGISTER("os.proc", std::string, quota_action, std::string("ignore"),
+                       "配额超限动作：ignore/warn/kill");
 
 namespace go2cpp::os {
 
@@ -86,9 +107,7 @@ std::size_t ReadBufferSize() {
     return static_cast<std::size_t>(clamped);
 }
 
-// 0/负数都归一为「不限制」。这里**不做 clamp**（也没有可钳的上限）：
-// 配置类型是 int，能显式表达的最大上限是 INT_MAX（约 2 GiB）；更大的文件
-// 只能设 0 表示不限制，或把配置项改成 int64（当前未提供，见审计 D9）。
+// 0/负数都归一为「不限制」，与配置文档一致。
 std::size_t MaxFileSize() {
     const int configured = ReadIntConfig("os.max_file_size", 268435456);
     return configured > 0 ? static_cast<std::size_t>(configured) : 0;

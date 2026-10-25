@@ -66,12 +66,23 @@ add_library(go2cpp_rand ${CMAKE_CURRENT_SOURCE_DIR}/src/math/rand.cpp)
 
 # os 模块：文件/目录/环境变量/参数。走 syscall 绕过 Hook（见 os/file.hpp 的边界论证），
 # 依赖 config（src/os/config.cpp 用 Config::SaveToFile 导出 app.ini）。
+# os 模块：文件/目录/环境变量/参数 + 多进程/IPC（R1-R31）。走裸 syscall
+# 绕过 Hook（见 os/proc.hpp 的边界论证），依赖 config 与 io（IOManager 异步适配）。
 add_library(go2cpp_os
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/dir.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/file.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/os/os.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/config.cpp)
-target_link_libraries(go2cpp_os PUBLIC go2cpp_config)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/raw_io.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/io_capability.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/proc.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/channel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/shm.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/mq.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/pty.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/supervisor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/os/pool.cpp)
+target_link_libraries(go2cpp_os PUBLIC go2cpp_config PRIVATE go2cpp_io)
 
 # path 模块：Go `path`（POSIX 纯字符串）+ `path/filepath`（平台相关）。
 # 不依赖 os 模块 —— 边界清晰：os 不做路径规范化，path 不做文件读写。
@@ -319,7 +330,7 @@ if (TARGET go2cpp_hook)
 endif()
 target_link_libraries(go2cpp_runtime INTERFACE
     go2cpp_error go2cpp_control_flow go2cpp_context go2cpp_channel go2cpp_scheduler
-    go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io go2cpp_network go2cpp_log go2cpp_config
+    go2cpp_fiber go2cpp_sync go2cpp_future go2cpp_io go2cpp_network go2cpp_log go2cpp_config go2cpp_os
     go2cpp_math go2cpp_rand go2cpp_path go2cpp_container go2cpp_compress go2cpp_encoding go2cpp_hash
     Threads::Threads
     go2cpp_metrics go2cpp_debug

@@ -9,6 +9,9 @@ endif()
 
 include(cmake/Go2CppOptions.cmake)
 include(cmake/Go2CppModules.cmake)
+# 内核监控模块（go2cpp::os::monitor，eBPF）：需要在 Modules 之后定义（依赖
+# network/scheduler/channel 目标）；eBPF 不可用时自动降级为仅 /proc 采集。
+include(cmake/Go2CppMonitor.cmake)
 include(cmake/Go2CppTests.cmake)
 include(cmake/Go2CppInstall.cmake)
 
@@ -17,4 +20,11 @@ include(cmake/Go2CppInstall.cmake)
 option(GO2CPP_WITH_CLI "Build go2cpp-cli (tools/cli unified command line)" OFF)
 if (GO2CPP_WITH_CLI)
     add_subdirectory(tools/cli)
+endif()
+
+# MCP 框架（内置）：默认 OFF，`-DGO2CPP_WITH_MCP=ON` 启用。
+# 依赖本仓库的 go2cpp_runtime 目标（同仓构建，不再 vendored 副本）。
+option(GO2CPP_WITH_MCP "Build MCP framework (mcp/)" OFF)
+if (GO2CPP_WITH_MCP)
+    add_subdirectory(mcp)
 endif()
