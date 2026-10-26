@@ -27,6 +27,9 @@ if [ -z "$DIR" ] || [ ! -x "$DIR/go2cpp_replay_tests" ] || [ ! -x "$DIR/replay" 
     exit 77
 fi
 
+# 独立工程链接运行时的动态库（debug_event 等）；CI 全新目录下这些 .so 在
+# build-enhanced/build-work，必须显式加入搜索路径，否则 exit 127。
+export LD_LIBRARY_PATH="$DIR:$ROOT/build-enhanced:$ROOT/build-work:${LD_LIBRARY_PATH:-}"
 echo "tools-replay: build_dir=$DIR"
 echo "--- [1/2] 单元测试：go2cpp_replay_tests"
 "$DIR/go2cpp_replay_tests"

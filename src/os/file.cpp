@@ -29,7 +29,8 @@
  *
  * - 所有 IO 自己处理 `EINTR`；Hook 原本替我们做的事现在必须显式做；
  * - `syscall` 成功值可能是 `-1`，所以 `IsSyscallError` 只认 `[-4095, -1]`；
- * - `ReadFile` 的 `st_size` 只是容量提示，文件被并发追加时仍按实际读到为准。
+ * - `ReadFile` 的 `st_size` 只是容量提示；`os.max_file_size` 由读取循环**累计**
+ *   判断 —— procfs 的 `st_size==0` 与「读期间被并发追加」都不能绕过上限。
  */
 #include "go2cpp/os/file.hpp"
 #include "go2cpp/os/os.hpp"
@@ -37,6 +38,8 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <new>
+#include <stdexcept>
 #include <vector>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -96,11 +99,14 @@ const char* ToString(OsError error) noexcept {
 File::~File() noexcept { Close(); }
 
 File::File(File&& other) noexcept
-    : m_fd(other.m_fd), m_owned(other.m_owned), m_last_error(other.m_last_error.load(std::memory_order_relaxed)),
-      m_async(std::move(other.m_async)) {
+    : m_fd(other.m_fd),
+      m_owned(other.m_owned),
+      m_append(other.m_append),
+      m_last_error(other.m_last_error) {
     other.m_fd = -1;
     other.m_owned = false;
-    other.m_last_error.store(0, std::memory_order_relaxed);
+    other.m_append = false;
+    other.m_last_error = 0;
 }
 
 File& File::operator=(File&& other) noexcept {
@@ -108,27 +114,27 @@ File& File::operator=(File&& other) noexcept {
         Close();
         m_fd = other.m_fd;
         m_owned = other.m_owned;
-        m_last_error.store(other.m_last_error.load(std::memory_order_relaxed),
-                           std::memory_order_relaxed);
-        m_async = std::move(other.m_async);
+        m_append = other.m_append;
+        m_last_error = other.m_last_error;
         other.m_fd = -1;
         other.m_owned = false;
-        other.m_last_error.store(0, std::memory_order_relaxed);
+        other.m_append = false;
+        other.m_last_error = 0;
     }
     return *this;
 }
 
 bool File::Sync() noexcept {
     if (!valid()) {
-        m_last_error.store(EBADF, std::memory_order_relaxed);
+        m_last_error = EBADF;
         return false;
     }
     const long result = ::syscall(SYS_fsync, m_fd);
     if (IsSyscallError(result)) {
-        m_last_error.store(errno, std::memory_order_relaxed);
+        m_last_error = errno;
         return false;
     }
-    m_last_error.store(0, std::memory_order_relaxed);
+    m_last_error = 0;
     return true;
 }
 
@@ -137,24 +143,24 @@ FileStatus File::Truncate(off_t size) noexcept {
     if (!valid()) {
         status.code = OsError::kInvalidHandle;
         status.system_error = EBADF;
-        m_last_error.store(EBADF, std::memory_order_relaxed);
+        m_last_error = EBADF;
         return status;
     }
     if (size < 0) {
         // 负大小在 ftruncate 里会返回 EINVAL，但先自己判掉能给出更准的错因。
         status.code = OsError::kInvalidArgument;
         status.system_error = EINVAL;
-        m_last_error.store(EINVAL, std::memory_order_relaxed);
+        m_last_error = EINVAL;
         return status;
     }
     const long result = ::syscall(SYS_ftruncate, m_fd, size);
     if (IsSyscallError(result)) {
         status.code = OsError::kIoFailed;
         status.system_error = errno;
-        m_last_error.store(errno, std::memory_order_relaxed);
+        m_last_error = errno;
         return status;
     }
-    m_last_error.store(0, std::memory_order_relaxed);
+    m_last_error = 0;
     return status;
 }
 
@@ -168,53 +174,9 @@ void File::Close() noexcept {
         m_fd = -1;
         m_owned = false;
     }
+    // 关闭后不再有 fd，O_APPEND 状态一并清掉（重新 Open 会重新设置）。
+    m_append = false;
 }
-
-// ---------------------------------------------------------------------------
-// IO 能力与显式异步（R27-R30）
-// ---------------------------------------------------------------------------
-
-IoCapability File::Capability() const { return DetectIoCapability(m_fd); }
-
-Result<void> File::SetNonBlocking(bool enable) {
-    if (!valid()) {
-        return MakeError(ProcErrorCode::kInvalidArgument, EBADF, "文件未打开",
-                         "File::SetNonBlocking");
-    }
-    const IoCapability capability = Capability();
-    if (!capability.can_nonblocking) {
-        return MakeError(ProcErrorCode::kUnsupported, 0,
-                         "该文件不支持非阻塞: " + capability.reason,
-                         "File::SetNonBlocking");
-    }
-    return SetFdNonBlocking(m_fd, enable);
-}
-
-Result<void> File::EnableAsync(go2cpp::io::IOManager* manager) {
-    if (!valid()) {
-        return MakeError(ProcErrorCode::kInvalidArgument, EBADF, "文件未打开",
-                         "File::EnableAsync");
-    }
-    const IoCapability capability = Capability();
-    if (!capability.async_supported) {
-        return MakeError(ProcErrorCode::kUnsupported, 0,
-                         "该文件不支持异步: " + capability.reason,
-                         "File::EnableAsync");
-    }
-    if (!m_async) {
-        m_async = std::make_unique<AsyncIoBinding>();
-    }
-    return m_async->Enable(m_fd, capability, manager);
-}
-
-Result<void> File::DisableAsync() {
-    if (!m_async) {
-        return OkResult();
-    }
-    return m_async->Disable();
-}
-
-bool File::async_enabled() const noexcept { return m_async && m_async->enabled(); }
 
 // ---------------------------------------------------------------------------
 // 打开 / 接管
@@ -227,6 +189,7 @@ bool File::async_enabled() const noexcept { return m_async && m_async->enabled()
  * step1. 校验输出指针与路径（空路径直接 `EINVAL`）；
  * step2. `RawOpen`：追加 `O_CLOEXEC|O_NONBLOCK`，避免打开 FIFO 时卡在 open；
  * step3. `fstat` 做白名单校验：先判 socket 给出精确错误码，再要求 `S_ISREG`；
+ *        **fstat 本身失败也按失败处理**（不能把未校验的 fd 装进 File）；
  * step4. 只有校验通过才把 fd/owned 写入 `*out`；失败路径先 `RawClose`，不漏 fd。
  *
  * ## 失败语义
@@ -236,10 +199,20 @@ bool File::async_enabled() const noexcept { return m_async && m_async->enabled()
 FileStatus File::Open(const std::string& path, OpenFlag flags, mode_t mode, File* out) {
     FileStatus status;
     if (out == nullptr) {
+        // 与"路径为空"一样是参数错误：统一填 EINVAL，避免调用方按
+        // system_error 分类时看到"无 errno"（审计 D13）。
         status.code = OsError::kInvalidArgument;
+        status.system_error = EINVAL;
         return status;
     }
     if (path.empty()) {
+        status.code = OsError::kInvalidArgument;
+        status.system_error = EINVAL;
+        return status;
+    }
+    // 路径可以带内嵌 '\0'，但 POSIX 只认到首个 NUL：不拦就会静默截断，
+    // 实际打开的是另一个路径（路径注入），所以必须在此之前拒绝。
+    if (detail::ContainsNul(path)) {
         status.code = OsError::kInvalidArgument;
         status.system_error = EINVAL;
         return status;
@@ -257,22 +230,33 @@ FileStatus File::Open(const std::string& path, OpenFlag flags, mode_t mode, File
     // 先判 socket 是为了给出更精确的错误码。
     // step3: 白名单校验：anon_inodefs 的类型位为 0，黑名单必然漏掉
     struct ::stat info {};
-    if (static_cast<int>(::syscall(SYS_fstat, fd, &info)) == 0) {
-        if (S_ISSOCK(info.st_mode)) {
-            (void)RawClose(fd);
-            status.code = OsError::kIsSocket;
-            return status;
-        }
-        if (!S_ISREG(info.st_mode)) {
-            (void)RawClose(fd);
-            status.code = OsError::kNotRegularFile;
-            return status;
-        }
+    if (IsSyscallError(::syscall(SYS_fstat, fd, &info))) {
+        // 与 Adopt 对齐：fstat 失败就无法确认 fd 类型，**绝不能**把未校验的
+        // fd 交给只接受普通文件的 File —— 绕过 S_ISREG 白名单后，
+        // FIFO/socket 的裸 syscall 读会把整个 worker 卡死（file.hpp 1.4）。
+        const int stat_errno = errno;
+        (void)RawClose(fd);
+        status.code = OsError::kOpenFailed;
+        status.system_error = stat_errno;
+        return status;
+    }
+    if (S_ISSOCK(info.st_mode)) {
+        (void)RawClose(fd);
+        status.code = OsError::kIsSocket;
+        return status;
+    }
+    if (!S_ISREG(info.st_mode)) {
+        (void)RawClose(fd);
+        status.code = OsError::kNotRegularFile;
+        return status;
     }
     // step4: 校验全部通过后才转移所有权，失败路径不会泄漏 fd
     *out = File{};
     out->m_fd = fd;
     out->m_owned = true;
+    // 记录 O_APPEND：WriteAt 依赖它拒绝"忽略 offset"的写入（见 file.hpp）。
+    out->m_append = (static_cast<std::uint32_t>(flags) &
+                     static_cast<std::uint32_t>(OpenFlag::kAppend)) != 0;
     return status;
 }
 
@@ -304,7 +288,10 @@ FileStatus File::Create(const std::string& path, mode_t mode, File* out) {
 FileStatus File::Adopt(int fd, bool take_ownership, File* out) {
     FileStatus status;
     if (out == nullptr) {
+        // 与"路径为空"一样是参数错误：统一填 EINVAL，避免调用方按
+        // system_error 分类时看到"无 errno"（审计 D13）。
         status.code = OsError::kInvalidArgument;
+        status.system_error = EINVAL;
         return status;
     }
     if (fd < 0) {
@@ -336,10 +323,14 @@ FileStatus File::Adopt(int fd, bool take_ownership, File* out) {
         status.code = OsError::kNotRegularFile;
         return status;
     }
-    // step5: 所有权按调用方声明记录，不在此处 close 借用 fd
+    // step5: 所有权按调用方声明记录，不在此处 close 借用 fd。
+    // 用 F_GETFL **只读探测** O_APPEND（不修改任何标志位，符合 1.5 的承诺），
+    // 供 WriteAt 判断是否需要拒绝。
+    const int fd_flags = ::fcntl(fd, F_GETFL);
     *out = File{};
     out->m_fd = fd;
     out->m_owned = take_ownership;
+    out->m_append = fd_flags >= 0 && (fd_flags & O_APPEND) != 0;
     return status;
 }
 
@@ -349,34 +340,34 @@ FileStatus File::Adopt(int fd, bool take_ownership, File* out) {
 
 ssize_t File::Read(void* buffer, std::size_t length) noexcept {
     if (m_fd < 0) {
-        m_last_error.store(EBADF, std::memory_order_relaxed);
+        m_last_error = EBADF;
         return -1;
     }
     if (buffer == nullptr && length > 0) {
-        m_last_error.store(EINVAL, std::memory_order_relaxed);
+        m_last_error = EINVAL;
         return -1;
     }
     for (;;) {
         const long result = ::syscall(SYS_read, m_fd, buffer, length);
         if (!IsSyscallError(result)) {
-            m_last_error.store(0, std::memory_order_relaxed);
+            m_last_error = 0;
             return static_cast<ssize_t>(result);
         }
         if (errno == EINTR) {
             continue;   // 绕过 hook 后必须自己重试
         }
-        m_last_error.store(errno, std::memory_order_relaxed);
+        m_last_error = errno;
         return -1;
     }
 }
 
 ssize_t File::ReadAt(void* buffer, std::size_t length, off_t offset) noexcept {
     if (m_fd < 0) {
-        m_last_error.store(EBADF, std::memory_order_relaxed);
+        m_last_error = EBADF;
         return -1;
     }
     if (buffer == nullptr && length > 0) {
-        m_last_error.store(EINVAL, std::memory_order_relaxed);
+        m_last_error = EINVAL;
         return -1;
     }
     for (;;) {
@@ -386,47 +377,54 @@ ssize_t File::ReadAt(void* buffer, std::size_t length, off_t offset) noexcept {
         const long result = ::syscall(SYS_pread, m_fd, buffer, length, offset);
 #endif
         if (!IsSyscallError(result)) {
-            m_last_error.store(0, std::memory_order_relaxed);
+            m_last_error = 0;
             return static_cast<ssize_t>(result);
         }
         if (errno == EINTR) {
             continue;
         }
-        m_last_error.store(errno, std::memory_order_relaxed);
+        m_last_error = errno;
         return -1;
     }
 }
 
 ssize_t File::Write(const void* buffer, std::size_t length) noexcept {
     if (m_fd < 0) {
-        m_last_error.store(EBADF, std::memory_order_relaxed);
+        m_last_error = EBADF;
         return -1;
     }
     if (buffer == nullptr && length > 0) {
-        m_last_error.store(EINVAL, std::memory_order_relaxed);
+        m_last_error = EINVAL;
         return -1;
     }
     for (;;) {
         const long result = ::syscall(SYS_write, m_fd, buffer, length);
         if (!IsSyscallError(result)) {
-            m_last_error.store(0, std::memory_order_relaxed);
+            m_last_error = 0;
             return static_cast<ssize_t>(result);
         }
         if (errno == EINTR) {
             continue;
         }
-        m_last_error.store(errno, std::memory_order_relaxed);
+        m_last_error = errno;
         return -1;
     }
 }
 
 ssize_t File::WriteAt(const void* buffer, std::size_t length, off_t offset) noexcept {
     if (m_fd < 0) {
-        m_last_error.store(EBADF, std::memory_order_relaxed);
+        m_last_error = EBADF;
         return -1;
     }
     if (buffer == nullptr && length > 0) {
-        m_last_error.store(EINVAL, std::memory_order_relaxed);
+        m_last_error = EINVAL;
+        return -1;
+    }
+    // Linux 的 pwrite(2) 在 O_APPEND 句柄上会忽略 offset、把数据追加到末尾
+    // （POSIX 允许，Linux BUGS 有记载）。静默写错位置会破坏并发/随机写的数据，
+    // 所以这里显式失败，让调用方改用不带 O_APPEND 的句柄（审计 D5）。
+    if (m_append) {
+        m_last_error = EINVAL;
         return -1;
     }
     for (;;) {
@@ -436,20 +434,20 @@ ssize_t File::WriteAt(const void* buffer, std::size_t length, off_t offset) noex
         const long result = ::syscall(SYS_pwrite, m_fd, buffer, length, offset);
 #endif
         if (!IsSyscallError(result)) {
-            m_last_error.store(0, std::memory_order_relaxed);
+            m_last_error = 0;
             return static_cast<ssize_t>(result);
         }
         if (errno == EINTR) {
             continue;
         }
-        m_last_error.store(errno, std::memory_order_relaxed);
+        m_last_error = errno;
         return -1;
     }
 }
 
 std::size_t File::WriteAll(const void* buffer, std::size_t length) noexcept {
     if (buffer == nullptr && length > 0) {
-        m_last_error.store(EINVAL, std::memory_order_relaxed);
+        m_last_error = EINVAL;
         return 0;
     }
     const auto* bytes = static_cast<const std::uint8_t*>(buffer);
@@ -470,19 +468,19 @@ std::size_t File::WriteAll(const void* buffer, std::size_t length) noexcept {
 
 off_t File::Seek(off_t offset, int whence) noexcept {
     if (m_fd < 0) {
-        m_last_error.store(EBADF, std::memory_order_relaxed);
+        m_last_error = EBADF;
         return -1;
     }
     for (;;) {
         const long result = ::syscall(SYS_lseek, m_fd, offset, whence);
         if (!IsSyscallError(result)) {
-            m_last_error.store(0, std::memory_order_relaxed);
+            m_last_error = 0;
             return static_cast<off_t>(result);
         }
         if (errno == EINTR) {
             continue;
         }
-        m_last_error.store(errno, std::memory_order_relaxed);
+        m_last_error = errno;
         return -1;
     }
 }
@@ -491,19 +489,19 @@ off_t File::Tell() noexcept { return Seek(0, SEEK_CUR); }
 
 bool File::Stat(struct ::stat* out) const noexcept {
     if (m_fd < 0) {
-        const_cast<File*>(this)->m_last_error.store(EBADF, std::memory_order_relaxed);
+        const_cast<File*>(this)->m_last_error = EBADF;
         return false;
     }
     if (out == nullptr) {
-        const_cast<File*>(this)->m_last_error.store(EINVAL, std::memory_order_relaxed);
+        const_cast<File*>(this)->m_last_error = EINVAL;
         return false;
     }
     const long result = ::syscall(SYS_fstat, m_fd, out);
     if (IsSyscallError(result)) {
-        const_cast<File*>(this)->m_last_error.store(errno, std::memory_order_relaxed);
+        const_cast<File*>(this)->m_last_error = errno;
         return false;
     }
-    const_cast<File*>(this)->m_last_error.store(0, std::memory_order_relaxed);
+    const_cast<File*>(this)->m_last_error = 0;
     return true;
 }
 
@@ -528,15 +526,22 @@ bool File::IsRegular() const noexcept {
  * step1. 校验输出并清空，打开只读句柄；
  * step2. 用 `st_size` 做容量提示，并按 `os.max_file_size` 提前拒绝超大文件；
  * step3. 以 `os.default_read_buffer_size` 为块循环 `read`，直到返回 0（EOF）；
- * step4. 任一次读失败：清空输出、写 errno，避免调用方拿到半份内容。
+ * step4. **累计**读取字节数在循环内检查上限：`st_size==0` 的 procfs 伪文件、
+ *        读期间被并发追加的文件都不能绕过；超限立即清空并返回 `EFBIG`；
+ * step5. 读失败或分配失败（`bad_alloc` / `length_error`）时清空输出并返回
+ *        `FileStatus` —— 本模块的错误一律走返回值，不让异常穿透。
  *
  * ## 并发语义
- * 文件可能在读取期间增长：`st_size` 只用于 `reserve`，不会截断实际读取。
+ * 文件可能在读取期间增长：`st_size` 只用于 `reserve`，实际安全边界由累计
+ * 检查保证（上限为 `os.max_file_size`，0 表示不限制）。
  */
 FileStatus ReadFile(const std::string& path, std::string* out, std::string* error) {
     FileStatus status;
     if (out == nullptr) {
+        // 与"路径为空"一样是参数错误：统一填 EINVAL，避免调用方按
+        // system_error 分类时看到"无 errno"（审计 D13）。
         status.code = OsError::kInvalidArgument;
+        status.system_error = EINVAL;
         return status;
     }
     out->clear();
@@ -563,29 +568,68 @@ FileStatus ReadFile(const std::string& path, std::string* out, std::string* erro
         }
         return status;
     }
-    if (size_hint > 0) {
-        out->reserve(static_cast<std::size_t>(size_hint));
-    }
-    // 缓冲区大小来自配置（os.default_read_buffer_size，带钳制）。
-    // step3: 块大小来自配置并已钳制；循环到 read 返回 0
-    std::vector<char> buffer(ReadBufferSize());
-    for (;;) {
-        const ssize_t got = file.Read(buffer.data(), buffer.size());
-        if (got < 0) {
-            status.code = OsError::kIoFailed;
-            status.system_error = file.last_error();
-            out->clear();
-            if (error != nullptr) {
-                *error = "读失败: " + path + " (errno=" + std::to_string(status.system_error) + ")";
+
+    // step3: 读循环。st_size 只是容量提示 —— procfs 伪文件的 st_size 恒为 0，
+    // 普通文件也可能在读期间被并发追加；所以上限必须在**读取过程中累计判断**，
+    // 而不能只信打开前的 st_size。超限时清空输出并报 EFBIG，绝不交付半份/超限内容。
+    std::size_t total = 0;
+    try {
+        if (size_hint > 0) {
+            out->reserve(static_cast<std::size_t>(size_hint));
+        }
+        // 缓冲区大小来自配置（os.default_read_buffer_size，带钳制）。
+        std::vector<char> buffer(ReadBufferSize());
+        for (;;) {
+            const ssize_t got = file.Read(buffer.data(), buffer.size());
+            if (got < 0) {
+                status.code = OsError::kIoFailed;
+                status.system_error = file.last_error();
+                out->clear();
+                if (error != nullptr) {
+                    *error = "读失败: " + path + " (errno=" +
+                             std::to_string(status.system_error) + ")";
+                }
+                return status;
             }
-            return status;
+            if (got == 0) {
+                break;
+            }
+            const auto count = static_cast<std::size_t>(got);
+            // total 每轮都被下面的检查限制在 <= limit，所以 limit - total 不会下溢。
+            if (limit > 0 && (total >= limit || count > limit - total)) {
+                out->clear();
+                status.code = OsError::kIoFailed;
+                status.system_error = EFBIG;
+                if (error != nullptr) {
+                    *error = "文件超过 os.max_file_size 上限: " + path + " (> " +
+                             std::to_string(limit) + " 字节)";
+                }
+                return status;
+            }
+            out->append(buffer.data(), count);
+            total += count;
         }
-        if (got == 0) {
-            break;
+    } catch (const std::bad_alloc&) {
+        // 分配失败不能穿透成异常：模块约定用 FileStatus 报错（否则调用方
+        // 没有 catch 时直接 std::terminate，DoS 面比"读失败"大得多）。
+        out->clear();
+        status.code = OsError::kIoFailed;
+        status.system_error = ENOMEM;
+        if (error != nullptr) {
+            *error = "内存不足，无法读取: " + path;
         }
-        out->append(buffer.data(), static_cast<std::size_t>(got));
+        return status;
+    } catch (const std::length_error&) {
+        // 文件大于 string::max_size()：同属容量不足，归一为 ENOMEM。
+        out->clear();
+        status.code = OsError::kIoFailed;
+        status.system_error = ENOMEM;
+        if (error != nullptr) {
+            *error = "文件超出可表示大小: " + path;
+        }
+        return status;
     }
-    // step4: 读到 EOF 才算成功；失败路径已清空 out 并写 errno
+    // step5: 读到 EOF 才算成功；失败路径已清空 out 并写 errno
     return status;
 }
 
@@ -625,7 +669,9 @@ FileStatus WriteFile(const std::string& path, std::string_view data, std::string
 // ---------------------------------------------------------------------------
 
 std::optional<std::string> Getenv(const std::string& name) {
-    if (name.empty()) {
+    // 空名与内嵌 NUL 都按「不存在」处理：getenv 会把 NUL 后的内容截掉，
+    // 返回的会是另一个变量的值，比返回 nullopt 更危险。
+    if (name.empty() || detail::ContainsNul(name)) {
         return std::nullopt;
     }
     // 必须拷贝：getenv 返回 libc 内部缓冲区指针，另一个线程 setenv 后即失效。
@@ -639,11 +685,14 @@ std::optional<std::string> Getenv(const std::string& name) {
 FileStatus Setenv(const std::string& name, const std::string& value, bool overwrite,
                    std::string* error) {
     FileStatus status;
-    if (name.empty() || name.find('=') != std::string::npos) {
+    // setenv 的两个参数都是 C 字符串：名字或值里的内嵌 NUL 都会被静默截断，
+    // 结果设置成另一个变量/另一个值，所以一并拒绝。
+    if (name.empty() || name.find('=') != std::string::npos ||
+        detail::ContainsNul(name) || detail::ContainsNul(value)) {
         status.code = OsError::kInvalidArgument;
         status.system_error = EINVAL;
         if (error != nullptr) {
-            *error = "环境变量名非法（不能为空或含 '='）: " + name;
+            *error = "环境变量名/值非法（名不能为空或含 '='；两者都不能含内嵌 NUL）";
         }
         return status;
     }
@@ -660,7 +709,8 @@ FileStatus Setenv(const std::string& name, const std::string& value, bool overwr
 
 FileStatus Unsetenv(const std::string& name, std::string* error) {
     FileStatus status;
-    if (name.empty()) {
+    // 同 Setenv：NUL 后的内容会被截断，实际删的是另一个变量。
+    if (name.empty() || detail::ContainsNul(name)) {
         status.code = OsError::kInvalidArgument;
         status.system_error = EINVAL;
         return status;

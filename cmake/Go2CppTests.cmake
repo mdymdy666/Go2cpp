@@ -406,41 +406,32 @@ if (GO2CPP_BUILD_TESTS)
     set_tests_properties(go2cpp_connection_test PROPERTIES TIMEOUT 180)
 
     # ---- os 模块（开荒版）：文件 + 环境变量 + 命令行参数 ----
+    # 链接 go2cpp_os 库（含 proc/io_capability 等多进程依赖），不再直接编 os 源。
     add_executable(go2cpp_os_test
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/os/test_os_file.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/dir.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/file.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/os.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/config.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/os/test_os_file.cpp)
     target_include_directories(go2cpp_os_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(go2cpp_os_test PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
-    target_link_libraries(go2cpp_os_test PRIVATE go2cpp_config)
+    target_link_libraries(go2cpp_os_test PRIVATE go2cpp_os go2cpp_config)
     add_test(NAME go2cpp_os_test COMMAND go2cpp_os_test)
     set_tests_properties(go2cpp_os_test PROPERTIES TIMEOUT 180)
 
+    # 链接 go2cpp_os 库（含 proc/io_capability 等多进程依赖），不再直接编 os 源。
     add_executable(go2cpp_os_dir_test
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/os/test_os_dir.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/dir.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/file.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/os.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/config.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/os/test_os_dir.cpp)
     target_include_directories(go2cpp_os_dir_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(go2cpp_os_dir_test PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
-    target_link_libraries(go2cpp_os_dir_test PRIVATE go2cpp_config)
+    target_link_libraries(go2cpp_os_dir_test PRIVATE go2cpp_os go2cpp_config)
     add_test(NAME go2cpp_os_dir_test COMMAND go2cpp_os_dir_test)
     set_tests_properties(go2cpp_os_dir_test PROPERTIES TIMEOUT 180)
 
+    # 链接 go2cpp_os 库（含 proc/io_capability 等多进程依赖），不再直接编 os 源。
     add_executable(go2cpp_os_hook_conflict_test
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/os/test_os_hook_conflict.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/dir.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/file.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/os.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/os/config.cpp)
-    target_link_libraries(go2cpp_os_hook_conflict_test PRIVATE go2cpp_config go2cpp_hook)
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/os/test_os_hook_conflict.cpp)
+    target_link_libraries(go2cpp_os_hook_conflict_test PRIVATE go2cpp_os go2cpp_config go2cpp_hook)
     target_compile_options(go2cpp_os_hook_conflict_test PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_os_hook_conflict_test COMMAND go2cpp_os_hook_conflict_test)
