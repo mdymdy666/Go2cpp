@@ -1,5 +1,9 @@
 # channel / future / io 并发设施审计报告（2026-10-18）
 
+> **已合并至 [docs/modules/scheduler.md](modules/scheduler.md)（2026-10-26）。**
+> 本文保留作历史追溯；现行接口、设计、边界与数据以模块文档为准，
+> 本文中的行号与性能结论不再代表当前实现。
+
 范围：`include/go2cpp/concurrency/channel.hpp`、`src/concurrency/channel.cpp`、
 `include/go2cpp/concurrency/future.hpp`、`src/concurrency/future.cpp`、
 `src/network/io.cpp`、`include/go2cpp/network/io.hpp`。

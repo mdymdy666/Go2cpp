@@ -1,5 +1,9 @@
 # Go2Cpp GMP 适用场景（修正版，2026-10-19）
 
+> **已合并至 [docs/modules/scheduler.md](modules/scheduler.md)（2026-10-26）。**
+> 本文保留作历史追溯；现行接口、设计、边界与数据以模块文档为准，
+> 本文中的行号与性能结论不再代表当前实现。
+
 > **本文件已整体重写。** 旧版（`gmp-use-cases.md` 初版）把 `--model thread`（每连接一线程）
 > 当成了 thread-pool + epoll，据此得出的「3.6×」「线程数 1/385」「+3.9%」等结论**全部作废**。
 > 正确基线是 `--model epoll`（固定 worker + 一个 epoll 实例）。

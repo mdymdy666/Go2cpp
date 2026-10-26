@@ -1,3 +1,5 @@
+> **已合并至 [docs/modules/channel.md](modules/channel.md) 与 [docs/modules/sync.md](modules/sync.md)**（channel/sync 的调试开销数据，见两文 §5.2）。本文保留为历史快照。
+
 # 并发原语调试监控开销基线（2026-10-21）
 
 > 结论先行：**调试监控的主要成本不在「写一条事件」，而在「每条事件都抓栈/Fiber 链」。**

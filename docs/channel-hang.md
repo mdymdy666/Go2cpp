@@ -1,3 +1,5 @@
+> **已合并至 [docs/modules/channel.md](modules/channel.md)**（§5.3「线程版挂起调查」）。本文保留为历史快照。
+
 # 线程版 Channel 挂起调查（2026-10-21）
 
 ## 背景

@@ -172,7 +172,15 @@ struct Manager::Impl {
         while (running.load()) {
             auto connection = listener->accept();
             if (!connection) {
-                break;  // 监听 socket 已关闭
+                // accept 失败分两类：Stop() 关闭监听 socket（应退出）与瞬时错误
+                // （EAGAIN/ECONNABORTED/EINTR/EMFILE，并发建连时常见）。旧实现
+                // 一律 break，只要出现一次瞬时失败整个 accept 循环就永久退出，
+                // 后续连接全部被拒（4x100 并发 push 实测丢 21 条）。
+                if (!running.load()) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
             }
             auto connection_ptr = std::move(connection);
             scheduler->spawn([this, connection_ptr]() {

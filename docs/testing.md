@@ -8,7 +8,7 @@
 > 或加注。
 
 > **2026-10-21 20:00 现状索引**：当前工作树（`Go2Cpp-work`，HEAD `18dd4df`）的
-> ctest **130**（含 7 条审计测试、4 条并发原语、tools 三套）、增强构建 **62**、
+> ctest 总数 **32**（共 32 个 ctest）（MCP 集成构建：12 os/monitor + 2 bufio + 18 MCP；历史默认构建 130 / 增强构建 62 见文末历史节）、
 > 五能力增强矩阵 **183**（PASS 182 / SKIP 1 / FAIL 0）、4 条场景（含 channel 互等死锁），
 > 以及 `default`/`enhanced` 两套构建矩阵、一键入口和 CI 说明，统一记录在文末
 > 「现状与 CI（2026-10-21）」一节；逐条清单与完整 `ctest -N` 输出见
@@ -831,3 +831,42 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 - CI（`.github/workflows/ci.yml`）尚未实跑，只有本地验证。
 
 完整缺口、复现命令与固化建议见 [`docs/test-audit-2026-10-21.md`](test-audit-2026-10-21.md)。
+
+## 测试地图（MCP 集成构建，2026-10-26）
+
+**32/32 passed**。
+
+| # | 用例 |
+|---|---|
+| 1 | `go2cpp_os_monitor_collectors` |
+| 2 | `go2cpp_os_monitor_interfaces` |
+| 3 | `go2cpp_os_monitor_ebpf` |
+| 4 | `go2cpp_os_monitor_e2e` |
+| 5 | `go2cpp_os_monitor_stress` |
+| 6 | `go2cpp_os_kernel_monitor` |
+| 7 | `go2cpp_os_tcp_io_monitor` |
+| 8 | `go2cpp_os_monitor_ebpf_nonroot` |
+| 9 | `go2cpp_os_monitor_overhead` |
+| 10 | `go2cpp_os_monitor_ebpf_root` |
+| 11 | `go2cpp_os_kernel_monitor_root` |
+| 12 | `go2cpp_os_tcp_io_monitor_root` |
+| 13 | `go2cpp_bufio_test` |
+| 14 | `go2cpp_bufio_stress` |
+| 15 | `json_rpc` |
+| 16 | `registry` |
+| 17 | `tools` |
+| 18 | `vector` |
+| 19 | `validation` |
+| 20 | `retrieval` |
+| 21 | `process` |
+| 22 | `robot_control` |
+| 23 | `plugin_notify` |
+| 24 | `monitor_client` |
+| 25 | `monitor_tools` |
+| 26 | `monitor_boundaries` |
+| 27 | `monitor_capacity` |
+| 28 | `monitor_concurrent_tools` |
+| 29 | `monitor_args_fuzz` |
+| 30 | `monitor_e2e` |
+| 31 | `monitor_http_faults` |
+| 32 | `docs_consistency` |

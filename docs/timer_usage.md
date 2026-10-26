@@ -1,5 +1,10 @@
 # 定时任务使用指南
 
+> **已合并至 [docs/modules/timer.md](modules/timer.md)（2026-10-26）**。
+> 本文保留作历史快照：其中的路径、行号、计数与性能数字都可能已过期，
+> 现行接口、设计与测试以模块文档为准。
+
+
 定时任务模块由 core::TimerService、core::Timer、core::TimerExecutor 和 Scheduler 的适配接口组成。计时使用 std::chrono::steady_clock，不受系统墙上时间回拨影响。TimerService 只负责登记截止时间、状态和取消，不继承调度器，也不直接恢复 Fiber 栈。
 
 ## 一次性任务

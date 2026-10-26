@@ -141,6 +141,18 @@
 #include <vector>
 
 namespace go2cpp::os {
+namespace detail {
+
+/// @brief 文本中是否含内嵌 NUL（`std::string` 允许，C 字符串不允许）。
+/// @details 所有按路径/名字的公开入口都必须先过这里：`c_str()` 会在首个
+///          NUL 处静默截断，导致「校验的路径」与「实际操作的路径」不一致
+///          （路径注入）；返回 EINVAL（与 Go `syscall.BytePtrFromString` 一致）。
+inline bool ContainsNul(std::string_view text) noexcept {
+    return text.find('\0') != std::string_view::npos;
+}
+
+}  // namespace detail
+
 
 /** @brief `os` 模块的错误码。 */
 enum class OsError : std::uint8_t {

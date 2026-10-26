@@ -1,3 +1,5 @@
+> **已合并至 [docs/modules/sync.md](modules/sync.md)**：park 点清单、临界区禁用与 `SpinMutex` 契约见该文 §4.3；channel 的 park 语义见 [docs/modules/channel.md](modules/channel.md)。本文保留为历史快照。
+
 # 并发 park 点清单（临界区禁用清单）
 
 > 适用版本：2026-10-18。结论来自 `include/go2cpp/network/hook.hpp`、

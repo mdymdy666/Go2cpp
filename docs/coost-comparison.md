@@ -1,5 +1,9 @@
 # coost 对比与 GMP 优化线索
 
+> **已合并至 [docs/modules/fiber.md](modules/fiber.md)（2026-10-26）。**
+> 本文保留作历史追溯；现行接口、设计、边界与数据以模块文档为准，
+> 本文中的行号与性能结论不再代表当前实现。
+
 > ⚠️ **2026-10-19 更新**：本文完成于 s3 修复之前。后续实测确认：
 > Hook 把 `accept4(SOCK_NONBLOCK)` 误归因为用户意图，是 s3 sys 713µs 的主因；
 > coost 的 EPOLLET 做法已被 GMP 采纳（`supports_one_shot()` 改 false +

@@ -1,5 +1,10 @@
 # 定时任务性能基准
 
+> **已合并至 [docs/modules/timer.md](modules/timer.md)（2026-10-26）**。
+> 本文保留作历史快照：其中的路径、行号、计数与性能数字都可能已过期，
+> 现行接口、设计与测试以模块文档为准。
+
+
 `benchmarks/timer_task_benchmark.cpp` 对同一批 5ms 截止时间任务测量三种模型：每任务一个普通线程、Go2Cpp `TimerService` 单计时线程、Scheduler 的 P/Fiber 执行器。输出包括总耗时和回调相对计划时间的 p50/p99 延迟。
 
 构建和运行：

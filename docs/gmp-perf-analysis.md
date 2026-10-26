@@ -1,5 +1,9 @@
 # GMP 性能分析：与 thread / epoll+池 的真实差距（2026-10-18）
 
+> **已合并至 [docs/modules/scheduler.md](modules/scheduler.md)（2026-10-26）。**
+> 本文保留作历史追溯；现行接口、设计、边界与数据以模块文档为准，
+> 本文中的行号与性能结论不再代表当前实现。
+
 - 被测代码：`benchmarks/gmp_vs_thread_epoll_benchmark.cpp`（三模型共用同一协议、
   同一 `process_request`、同一 epoll 客户端）+ 库 `build-quality`（Release `-O2`）
 - 宿主：AMD Ryzen 9 8945HX / 12 逻辑核 / WSL2 6.6.87.2 / g++ 13.3.0

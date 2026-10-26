@@ -1,5 +1,9 @@
 # GMP 各场景优劣分析（实测中）
 
+> **已合并至 [docs/modules/scheduler.md](modules/scheduler.md)（2026-10-26）。**
+> 本文保留作历史追溯；现行接口、设计、边界与数据以模块文档为准，
+> 本文中的行号与性能结论不再代表当前实现。
+
 > 对应 `docs/gmp-use-cases.md`「待补实验」的逐项验证。每轮追加一节。
 > 所有数据同窗口 A/B 连续跑，记录 `/proc/loadavg` 第 4 字段。
 

@@ -1,3 +1,5 @@
+> **已合并至 [docs/modules/channel.md](modules/channel.md) 与 [docs/modules/sync.md](modules/sync.md)**（5.4 场景与压测结论）。本文保留为历史快照。
+
 # 并发原语：随机 + 大数据量 + 多场景 5 轮测试
 
 - 日期：2026-10-21

@@ -1,5 +1,9 @@
 # Fiber 可迁移性研究：safepoint id、句柄表与签名（v3）
 
+> **已合并至 [docs/modules/fiber.md](modules/fiber.md)（2026-10-26）。**
+> 本文保留作历史追溯；现行接口、设计、边界与数据以模块文档为准，
+> 本文中的行号与性能结论不再代表当前实现。
+
 > 研究范围：Go2Cpp 的 Fiber / Channel，最小子集为「无外部资源、只等 channel
 > 的挂起 Fiber」。配套可运行 demo 在 `tools/migration/`。
 >

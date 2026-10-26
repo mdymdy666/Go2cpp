@@ -53,6 +53,12 @@ target_include_directories(mcp_core
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(mcp_core PUBLIC go2cpp_runtime go2cpp_os PRIVATE ${CMAKE_DL_LIBS})
+# network 的 socket.cpp 引用 hook::mark_system_nonblocking；内置构建下
+# 共享库要求显式链接 hook（--as-needed 会因测试自身不引用 hook 而丢弃）。
+if (TARGET go2cpp_hook)
+    target_link_libraries(mcp_core PUBLIC go2cpp_hook)
+    target_link_options(mcp_core INTERFACE "LINKER:--no-as-needed")
+endif()
 target_compile_options(mcp_core PRIVATE -Wall -Wextra -Wpedantic)
 
 # ---------------------------------------------------------------------------

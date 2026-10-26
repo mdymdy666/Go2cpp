@@ -3,6 +3,10 @@
 本仓库提供一个可独立使用的 C++17 库，实现文档明确的 Go 运行时语义子集。
 它是运行时/库，不是 Go 解析器，也不是 Go 到 C++ 的源码转译器。
 
+仓库同时内置三块可选能力（默认 OFF，按需打开）：MCP 框架 `mcp/`（`-DGO2CPP_WITH_MCP=ON`）、
+统一命令行 `tools/cli`（`-DGO2CPP_WITH_CLI=ON`）、主机监控与 eBPF 采集（`bpf/` + `go2cpp::os_monitor`，
+`-DGO2CPP_ENABLE_EBPF=ON`，默认开；eBPF 不可用时自动降级为 `/proc` 采集）。
+
 公共 API 位于 `go2cpp` 命名空间，包含：
 
 - M/P/G 风格调度器：受限 P、本地/全局队列、工作窃取、M 动态增减、显式
@@ -136,3 +140,85 @@ panic/recover 是显式共享状态，库不验证 G/Fiber 身份，调用方应
 
 IOManager::WaitAnyFor() 和 WaitManyFor() 只在该 IOManager 的 managed Fiber
 中挂起并接入 epoll；普通线程返回 EPERM，应直接使用原生 poll/select。
+
+## 目录结构
+
+| 路径 | 内容 |
+| --- | --- |
+| `src/` | 运行时实现，按模块分为 `concurrency/`、`network/`、`os/`、`logging/`、`config/`、`debug/`、`tools/`、`bufio/` 等 |
+| `include/go2cpp/` | 公共头文件；`include/go2cpp/*.hpp` 是兼容转发头，真实定义在模块子目录 |
+| `mcp/` | 内置 MCP 框架：`protocol/`、`server/`、`transport/`、`tools/`、`llm/`、`plugin/`、`vector/`、`retrieval/`、`app/` |
+| `bpf/` | 6 个 eBPF C 程序（sched/futex/syscall/net/tcp/fileio），由 `cmake/embed_bpf.cmake` 编译并嵌入 |
+| `tests/` | 测试源码，按 `tools/`、`concurrency/`、`network/`、`os/`、`debug/`、`bufio/` 等模块划分 |
+| `tools/` | 独立工具：`cli/`、`migration/`、`replay/`、`persistence/` |
+| `cmake/` | 8 个构建模块：选项、模块 target、测试、安装、迁移、监控、eBPF 嵌入、运行时配置 |
+| `docs/` | 设计与使用文档，入口见 [`docs/INDEX.md`](docs/INDEX.md) |
+| `example/` | 按模块分类的可运行示例，清单见 [`example/README.md`](example/README.md) |
+| `benchmarks/` | 独立性能基准（需 `GO2CPP_BUILD_BENCHMARKS=ON`） |
+| `third_party/` | 第三方与 Go 参考源码（大部分归档被 `.gitignore` 排除） |
+| `build-*/`、`Testing/` | 本地构建与 CTest 产物，均被 `.gitignore` 忽略，不入库 |
+
+推荐在源码树外构建（例如 `/UserData/build/go2cpp-mcp-integrated`），避免在仓库内产生
+`build-*/`；仓库内构建同样被忽略。
+
+## CMake 选项
+
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `BUILD_SHARED_LIBS` | `ON` | 构建共享模块（`.so`）；静态构建需同时关闭 Hook |
+| `GO2CPP_BUILD_HOOK` | `ON` | Linux 系统调用 Hook（透明 park Fiber），依赖共享库 |
+| `GO2CPP_BUILD_TESTS` | `ON` | 构建运行时测试并注册 CTest |
+| `GO2CPP_BUILD_EXAMPLES` | `ON` | 构建 `example/` 示例 |
+| `GO2CPP_BUILD_BENCHMARKS` | `OFF` | 构建独立性能基准 |
+| `GO2CPP_ENABLE_TSAN` | `OFF` | 支持时启用 ThreadSanitizer |
+| `GO2CPP_BUILD_ENHANCED` | `OFF` | 一键打开 DEBUG_DUMP + DIAGNOSTIC + REPLAY + MIGRATION_API（未显式指定时也打开 CLI） |
+| `GO2CPP_WITH_MCP` | `OFF` | 构建内置 MCP 框架与 `mcp_server` |
+| `GO2CPP_WITH_CLI` | `OFF` | 构建 `go2cpp-cli` 统一命令行 |
+| `GO2CPP_BUILD_OS_MONITOR_TESTS` | `ON` | 构建 `go2cpp::os::monitor` 测试并并入 CTest |
+| `GO2CPP_ENABLE_EBPF` | `ON` | 编译并嵌入 eBPF 程序；缺少 clang/libbpf/libelf/libz 时自动降级 |
+| `GO2CPP_DEBUG_DUMP` | `OFF` | 事件环 + DebugServer（Unix socket），默认零开销 |
+| `GO2CPP_REPLAY` | `OFF` | 资源事件回放录制（G2CRPLY） |
+| `GO2CPP_DIAGNOSTIC` | `OFF` | 在线诊断 Doctor（命令平面/等待图/受控唤醒） |
+| `GO2CPP_DIAGNOSTIC_QUIC` | `OFF` | Doctor 的 QUIC 承载，需同时打开 DIAGNOSTIC 与 PICOQUIC |
+| `GO2CPP_MIGRATION_API` | `OFF` | 跨进程 Fiber/Channel 迁移实验 API |
+| `GO2CPP_WITH_PICOQUIC` | `OFF` | picoquic 承载的 QUIC/HTTP3 transport |
+| `GO2CPP_DEBUG_EVENT_CAPACITY` | `256` | 每线程普通事件环容量（仅 DEBUG_DUMP=ON） |
+| `GO2CPP_DEBUG_EVENT_CRITICAL_CAPACITY` | `64` | 每线程关键事件环容量（仅 DEBUG_DUMP=ON） |
+| `MCP_BUILD_EXAMPLES` | `ON` | MCP 示例（仅在 `GO2CPP_WITH_MCP=ON` 时生效） |
+
+MCP 集成构建示例：
+
+```sh
+cmake -S . -B /UserData/build/go2cpp-mcp-integrated -DCMAKE_BUILD_TYPE=Release \
+      -DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_TESTS=OFF
+cmake --build /UserData/build/go2cpp-mcp-integrated -j
+```
+
+该配置只注册监控与 bufio 的 14 个 CTest 用例（`GO2CPP_BUILD_OS_MONITOR_TESTS=ON`）；
+完整运行时测试需 `-DGO2CPP_BUILD_TESTS=ON`。
+
+## 文档导航
+
+文档总入口是 [`docs/INDEX.md`](docs/INDEX.md)（全量文档的分类、状态与重复/过时/孤立清单）。常用入口：
+
+- 入门：[getting_started.md](docs/getting_started.md)、[compatibility.md](docs/compatibility.md)、[design.md](docs/design.md)；
+- 核心设计：[scheduler.md](docs/scheduler.md)、[modules.md](docs/modules.md)、[fiber-migration.md](docs/fiber-migration.md)；
+- 使用：[configuration.md](docs/configuration.md)、[logging.md](docs/logging.md)、[fiber_guide.md](docs/fiber_guide.md)、[network.md](docs/network.md)、[cli.md](docs/cli.md)；
+- 诊断：[diagnostic-channel.md](docs/diagnostic-channel.md)、[debug-reliability.md](docs/debug-reliability.md)；
+- 测试与性能：[testing.md](docs/testing.md)、[performance-baseline-2026-10-19.md](docs/performance-baseline-2026-10-19.md)；
+- MCP：[mcp/docs/architecture.md](mcp/docs/architecture.md)；
+- 历史：[AGENT-HANDOFF.md](docs/AGENT-HANDOFF.md)、[NEXT-STEPS.md](docs/NEXT-STEPS.md)（仅追溯，数字不代表现状）。
+
+## 测试
+
+MCP 集成构建（`-DGO2CPP_WITH_MCP=ON`）实测 **Total Tests: 32**（12 os/monitor + 2 bufio + 18 MCP 框架），全部通过；root 用例在无权限时记为 SKIP。
+
+```sh
+ctest --test-dir /UserData/build/go2cpp-mcp-integrated --output-on-failure
+```
+
+MCP 集成构建实测 **全部 32 个 ctest** 通过（**32/32 passed**；12 os/monitor + 2 bufio + 18 MCP 框架，root 用例无权限时 SKIP）。
+
+MCP 内置工具共 **29 个**（22 内置 + 3 检索 + 4 监控）。
+
+MCP 内置工具共 29 个工具（22 内置 + 3 检索 + 4 监控 = 29 个工具）。

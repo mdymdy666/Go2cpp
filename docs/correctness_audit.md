@@ -1,3 +1,5 @@
+> **已合并至 [docs/modules/sync.md](modules/sync.md)**（Mutex/CV/WaitGroup 的锁部分）；Channel/Select 的线性化点见 [docs/modules/channel.md](modules/channel.md)。本文保留为历史快照。
+
 # 运行时逻辑链路审计
 
 本文记录 Go2Cpp 当前实现可以被代码和测试共同支持的正确性范围。这里的“证明”是对状态转换、锁保护范围、线性化点和生命周期的可审计论证；它不能把 C++ 用户违反生命周期或协作约定的程序变成安全程序，也不能替代原生 Linux 上的竞态检测。

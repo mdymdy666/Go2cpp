@@ -1,5 +1,10 @@
 # Go2Cpp GMP 协程 vs 传统 thread + epoll 压测报告
 
+> **已合并至 [docs/modules/io.md](modules/io.md)（2026-10-26）**。
+> 本文保留作历史快照：其中的路径、行号、计数与性能数字都可能已过期，
+> 现行接口、设计与测试以模块文档为准。
+
+
 - 日期：2026-10-18
 - 被测代码：`benchmarks/gmp_vs_thread_epoll_benchmark.cpp`（新增，未改任何既有源文件）
 - 构建脚本：`benchmarks/build_gmp_vs_thread_epoll.sh`（未改 `cmake/Go2CppTests.cmake`）

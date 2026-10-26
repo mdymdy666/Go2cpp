@@ -92,6 +92,10 @@ set_tests_properties(monitor_tools PROPERTIES TIMEOUT 120)
 # e2e 辅助进程：真实 Manager，端口由内核分配并通过 stdout 报告（PORT=<n>）。
 add_executable(fake_monitor_manager fake_monitor_manager.cpp)
 target_link_libraries(fake_monitor_manager PRIVATE go2cpp_os_monitor)
+if (TARGET go2cpp_hook)
+    target_link_libraries(fake_monitor_manager PRIVATE go2cpp_hook)
+    target_link_options(fake_monitor_manager PRIVATE "LINKER:--no-as-needed")
+endif()
 target_compile_options(fake_monitor_manager PRIVATE -Wall -Wextra -Wpedantic)
 
 # 边界：Manager 未启动 / HTTP 500/404 / 超时 / 畸形响应 / 空客户端。

@@ -16,7 +16,7 @@
 | `src/config`、`include/go2cpp/config` | `ConfigVar<T>`、INI 快照、变更监听与热加载事务 | `go2cpp::config` |
 | 仅头文件 | 聚合 umbrella，导出全部模块 target 与 `include/` 路径 | `go2cpp::runtime`（INTERFACE） |
 
-共计 13 个模块 target 加 1 个 `go2cpp::runtime`；完整别名清单见
+共计 24 个模块 target（含条件编译的 `go2cpp_hook`；`math`/`rand`/`path`/`container`/`compress`/`encoding`/`hash`/`metrics`/`debug` 等也各有 target）加 1 个 `go2cpp::runtime` 聚合 target；完整别名清单见
 `cmake/Go2CppModules.cmake` 的 `add_library(... ALIAS ...)` 段。转译代码只需包含
 `go2cpp/runtime.hpp`。
 

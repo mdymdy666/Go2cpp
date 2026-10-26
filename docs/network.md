@@ -1,5 +1,10 @@
 # 网络模块使用说明
 
+> **部分合并：IOManager / epoll 的内部细节已合并至 [docs/modules/io.md](modules/io.md)（2026-10-26）**。
+> 本文其余章节（Socket、FdManager、HTTP/WebSocket/SSE 用法）仍是现行说明；
+> 凡涉及 IOManager 的线程模型与等待语义，以模块文档为准。
+
+
 网络模块位于 `include/go2cpp/network/`，分成地址、字节缓冲、文件描述符元数据、Socket/Stream、分帧、HTTP 和 WebSocket 层。旧的 `go2cpp/address.hpp`、`socket.hpp`、`bytearray.hpp`、`http.hpp` 是兼容转发头，命名空间仍为 `go2cpp`，HTTP 详细类型位于 `go2cpp::http`，底层类型位于 `go2cpp::net`。
 
 ## 线程、Fiber 和等待
