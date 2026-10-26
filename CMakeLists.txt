@@ -28,3 +28,7 @@ option(GO2CPP_WITH_MCP "Build MCP framework (mcp/)" OFF)
 if (GO2CPP_WITH_MCP)
     add_subdirectory(mcp)
 endif()
+
+# Bento 传输协议（自研 UDP 可靠/不可靠混合协议）：默认 OFF。
+# -DGO2CPP_WITH_BENTO=ON 构建 go2cpp_bento 与测试。
+include(cmake/Go2CppBento.cmake)
