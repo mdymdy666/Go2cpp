@@ -41,7 +41,8 @@
  *
  * ## 边界与陷阱
  * - 客户端 socket 会被设成**非阻塞**：阻塞 fd 会让 SSL 卡住整个 worker 线程；
- * - 证书校验默认关闭（`verify_peer = false`），生产必须打开并配置 CA；
+ * - 证书校验默认**开启**（`verify_peer = true`，校验证书链 + 主机名）；
+ *   确需跳过时显式 `verify_peer = false`（仅测试）；
  * - `Read`/`Write` 把超时、EOF、错误都收敛为「返回 0」，细节在公开的
  *   `LastError()`/`LastErrorString()` 里；
  * - `Close()`/析构会发 close_notify（只发一次，不等对端回包），保证对端
