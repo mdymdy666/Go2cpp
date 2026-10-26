@@ -278,8 +278,13 @@ std::string Response::to_string(bool head_request) const {
         stream << item.first << ": " << item.second << "\r\n";
     }
     if (close && !header.has("Connection")) stream << "Connection: close\r\n";
-    if (!body.empty() && !body_forbidden && !header.has("Content-Length"))
+    // 空 body 也必须补 Content-Length: 0：keep-alive 下客户端无法区分
+    // 「无 body」与「body 直到连接关闭」，双方会互等（http1.md §4 已记录）。
+    // 有 Transfer-Encoding（chunked）时不补 CL（两种 framing 互斥）。
+    if (!body_forbidden && !header.has("Content-Length") &&
+        !header.has("Transfer-Encoding")) {
         stream << "Content-Length: " << body.size() << "\r\n";
+    }
     stream << "\r\n";
     if (!head_request && !body_forbidden) stream << body;
     return stream.str();
