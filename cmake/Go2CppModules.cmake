@@ -51,7 +51,14 @@ add_library(go2cpp_network
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/websocket.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/sse.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/tls_transport.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/tls_transport.cpp
+    # HTTP/2 协议核心：此前只在测试目标里编译，导出库缺这些符号，生产
+    # 使用需自行加源文件（见 docs/modules/http2.md §6）。
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/huffman.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/hpack.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/frame.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/stream_state.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/connection.cpp)
 add_library(go2cpp_config
     ${CMAKE_CURRENT_SOURCE_DIR}/src/config/config.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/config/so_manifest.cpp
