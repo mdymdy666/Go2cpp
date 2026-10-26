@@ -1,5 +1,8 @@
 # Stream（SSE 服务端流）状态机
 
+> **配套标注（2026-10-26）**：本文是 [docs/modules/sse.md](../modules/sse.md) 的配套状态机明细；API 与边界以模块文档为准。
+> 注意：表中“Context 取消回调 -> Failed”是简化说法；仅取消、尚未写失败时 `state()` 返回 `Closed`，详见模块文档 §4.4。
+
 - 源文件：`src/network/sse.cpp`（类定义在 `include/go2cpp/network/sse.hpp`）
 - 关键函数：`start`、`send`、`comment`、`tick`、`close`、`state`
 - 状态载体：`http::ResponseWriter::state()`、`m_failed`、Context 取消标记

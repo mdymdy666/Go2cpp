@@ -1,5 +1,8 @@
 # WebSocket P1 使用说明
 
+> **合并标注（2026-10-26）**：本文已并入 [docs/modules/ws.md](modules/ws.md)，模块文档是唯一现行入口。
+> 本文保留作历史速查，不再单独维护；API、默认值、行号与边界以模块文档和当前工作树为准。
+
 P1 提供独立的 RFC 6455 WebSocket 协议层，位于 `go2cpp::net::WebSocket`。它依赖已经建立的 `net::Socket`，可以在普通线程或 IOManager 管理的 Fiber 中使用；协议对象不拥有调度器，也不隐式创建线程。
 
 服务端先用 HTTP Parser 读取 Upgrade 请求，再调用：

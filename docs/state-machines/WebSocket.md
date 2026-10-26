@@ -1,5 +1,7 @@
 # net::WebSocket 状态机
 
+> **配套标注（2026-10-26）**：本文是 [docs/modules/ws.md](../modules/ws.md) 的配套状态机明细；API 与边界以模块文档为准，状态表仍按当前 `src/network/websocket.cpp` 维护。
+
 - 源文件：`src/network/websocket.cpp`（类定义在 `include/go2cpp/network/websocket.hpp`）
 - 关键函数：`AcceptWithPending()`、`Connect()`、`read_message()`、`read_frame()`、
   `close()`、`protocol_error()`、`abort_transport()`

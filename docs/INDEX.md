@@ -257,6 +257,11 @@
 | [modules/mcp.md](modules/mcp.md) | mcp：六层框架、JSON-RPC 分发、事件驱动增量索引、SSE 多会话、插件通知、29 工具与 e2e 数据 | 现行 |
 | [modules/timer.md](modules/timer.md) | timer：Timer/TimerService、multimap+反向索引（不是最小堆/时间轮）、arm/fire/cancel、TimerDecision 周期语义、与 Scheduler 的 TimerExecutor 解耦、边界与实测数据 | 现行 |
 | [modules/io.md](modules/io.md) | io（epoll）：IOManager 64 条带 + EPOLLET 重 arm、poller 线程与 worker 自 poll 双驱动、fd 代际、park/wake 与 Hook 集成、边界与测试 | 现行 |
+| [modules/tls.md](modules/tls.md) | tls：OpenSSL 客户端 Transport、TLS 1.2+ 握手、证书/SNI/主机名校验、ALPN=h2、close_notify 与 SIGPIPE、边界与 TLS/ALPN 测试 | 现行 |
+| [modules/ws.md](modules/ws.md) | ws：RFC 6455 握手、帧格式/掩码/分片、Ping/Pong、Close code、读写并发与超时、状态机与测试 | 现行 |
+| [modules/sse.md](modules/sse.md) | sse：独立模块；Event 编码、增量 Parser（BOM/CRLF/CR/finish）、chunked Stream、心跳/取消/背压、重连边界与测试 | 现行 |
+| [modules/http1.md](modules/http1.md) | http1：HTTP/1.x 消息与增量解析、严格 chunked/trailer、全局 deadline 客户端、keep-alive 服务端、chunked Writer、边界与测试 | 现行 |
+| [modules/http2.md](modules/http2.md) | http2：HPACK/Huffman、10 种帧、7 状态流机、CONTINUATION/双闸/GOAWAY/MAX_CONCURRENT、流控、Transport 与 ctest 数据 | 现行 |
 
 > 合并说明：`channel-hang.md`、`concurrency-5rounds.md`、`concurrency-baseline.md`、
 > `concurrency-park-points.md`、`correctness_audit.md` 已在顶部标注合并去向，正文保留为
@@ -270,4 +275,4 @@
 > `timer`/`io` 的合并：`timer_design_review.md`、`timer_usage.md`、`timer_benchmark.md`
 > 已并入 `modules/timer.md`；`gmp-vs-thread-epoll-2026-10-18.md` 的 IO 结论与
 > `network.md` 的 IOManager 细节已并入 `modules/io.md`（`network.md` 仅部分合并，
-> Socket/HTTP 等章节仍是现行说明）。
+> Socket/WebSocket/SSE 等章节仍是现行说明）。

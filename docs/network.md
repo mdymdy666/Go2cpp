@@ -1,8 +1,14 @@
 # 网络模块使用说明
 
-> **部分合并：IOManager / epoll 的内部细节已合并至 [docs/modules/io.md](modules/io.md)（2026-10-26）**。
-> 本文其余章节（Socket、FdManager、HTTP/WebSocket/SSE 用法）仍是现行说明；
+> **部分合并（2026-10-26）**：IOManager / epoll 的内部细节已合并至 [docs/modules/io.md](modules/io.md)；
+> **HTTP/1.x 已合并至 [docs/modules/http1.md](modules/http1.md)**，**HTTP/2 已合并至
+> [docs/modules/http2.md](modules/http2.md)**；对应章节保留为历史/速查，字段、边界与测试数据以模块文档为准。
+> 本文其余章节（Socket、FdManager、WebSocket、SSE、Hook）仍是现行说明；
 > 凡涉及 IOManager 的线程模型与等待语义，以模块文档为准。
+
+> **2026-10-26 补充**：TLS / WebSocket / SSE 的模块级 API、设计与边界已集中到
+> [modules/tls.md](modules/tls.md)、[modules/ws.md](modules/ws.md)、[modules/sse.md](modules/sse.md)；
+> 本文对应章节保留为网络层总览。TLS 小节的“证书校验默认关闭”已过时，现行默认见模块文档。
 
 
 网络模块位于 `include/go2cpp/network/`，分成地址、字节缓冲、文件描述符元数据、Socket/Stream、分帧、HTTP 和 WebSocket 层。旧的 `go2cpp/address.hpp`、`socket.hpp`、`bytearray.hpp`、`http.hpp` 是兼容转发头，命名空间仍为 `go2cpp`，HTTP 详细类型位于 `go2cpp::http`，底层类型位于 `go2cpp::net`。
@@ -102,8 +108,8 @@ while (connection.ReadEvent(&event, &error) == ConnStatus::kOk) {
 
 **TLS + ALPN**：把 `FiberTransport` 换成 `TlsTransport::CreateClient(socket, "example.com")`，
 `Handshake()` 之后用 `NegotiatedProtocol()` 读 ALPN 结果（应为 `"h2"`）。
-**证书校验默认关闭**（`verify_peer=false`），这是为自签名证书测试的便利，**不是安全默认**，
-生产必须打开并配置 CA。
+**证书校验默认开启**（`verify_peer=true`），这是审计后修正的安全默认；自签名/本地测试才显式传
+`verify_peer=false`，生产应配置 CA 而不是关闭校验（详见 [modules/tls.md](modules/tls.md)）。
 
 ### 已实现并验证
 

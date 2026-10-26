@@ -1,5 +1,8 @@
 # SSE（Server-Sent Events）
 
+> **合并标注（2026-10-26）**：本文已并入 [docs/modules/sse.md](modules/sse.md)，模块文档是唯一现行入口。
+> 本文保留作历史速查，不再单独维护；API、默认值、行号与边界以模块文档和当前工作树为准。
+
 `go2cpp::sse` 提供 HTTP/1.1 服务器推送事件封装。事件编码、增量解析和网络写入分开，底层复用 `net::Socket` 与 `http::ResponseWriter`，普通线程和已接入 `IOManager` 的 Fiber 都可使用。SSE 是单向连接，需要双向通信时使用 WebSocket。
 
 ## 发送事件
