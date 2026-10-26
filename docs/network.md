@@ -1,3 +1,5 @@
+> 已合并至 docs/modules/network.md（模块文档体系整理，2026-10-26）；本文保留作历史细节。
+
 # 网络模块使用说明
 
 > **部分合并（2026-10-26）**：IOManager / epoll 的内部细节已合并至 [docs/modules/io.md](modules/io.md)；

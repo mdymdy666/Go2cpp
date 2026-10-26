@@ -1,3 +1,5 @@
+> **已合并至 [docs/modules/debug.md](modules/debug.md)**：Doctor/DebugServer 分工、单线程命令平面、G2CD/1 帧协议、白名单与命令语义见该文 §5；本文保留为历史快照。
+
 # Doctor：在线诊断通道与受控解锁
 
 > 状态：**已实现并验证**（Unix socket / 单线程命令平面 / 白名单唤醒 / 等待图 /

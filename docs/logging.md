@@ -1,3 +1,5 @@
+> **已合并至 [docs/modules/logging.md](modules/logging.md)**：Level/LogRecord、Filter→Formatter→Sink 流水线、Sink 族、格式化与自定义格式项见该文 §2–§6；本文保留为历史快照。
+
 # Go2Cpp 日志模块
 
 日志模块是独立的 C++17 目标 `go2cpp_log`，默认不依赖 spdlog、fmt 或其他

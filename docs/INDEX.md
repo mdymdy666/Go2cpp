@@ -260,8 +260,18 @@
 | [modules/tls.md](modules/tls.md) | tls：OpenSSL 客户端 Transport、TLS 1.2+ 握手、证书/SNI/主机名校验、ALPN=h2、close_notify 与 SIGPIPE、边界与 TLS/ALPN 测试 | 现行 |
 | [modules/ws.md](modules/ws.md) | ws：RFC 6455 握手、帧格式/掩码/分片、Ping/Pong、Close code、读写并发与超时、状态机与测试 | 现行 |
 | [modules/sse.md](modules/sse.md) | sse：独立模块；Event 编码、增量 Parser（BOM/CRLF/CR/finish）、chunked Stream、心跳/取消/背压、重连边界与测试 | 现行 |
+| [modules/network.md](modules/network.md) | network 总览：分层/构建目标/Hook 22 个操作/HTTP-2 核心边界/QUIC-默认 OFF | 现行 |
+| [modules/tools.md](modules/tools.md) | tools 总览：CLI 7 子命令、迁移（仅 v3）、回放（G2CRPLY v5）、持久化原型 | 现行 |
+| [modules/persistence.md](modules/persistence.md) | 持久化原型：MPSC+批量+fdatasync、段/manifest、2.96x/13.83x | 现行 |
+
+> **基础库**（bufio/compress/container/encoding/hash/math/path）：实现简单、API 稳定，
+> 直接看 `include/go2cpp/<module>/` 头文件注释；无独立模块文档。
 | [modules/http1.md](modules/http1.md) | http1：HTTP/1.x 消息与增量解析、严格 chunked/trailer、全局 deadline 客户端、keep-alive 服务端、chunked Writer、边界与测试 | 现行 |
 | [modules/http2.md](modules/http2.md) | http2：HPACK/Huffman、10 种帧、7 状态流机、CONTINUATION/双闸/GOAWAY/MAX_CONCURRENT、流控、Transport 与 ctest 数据 | 现行 |
+| [modules/debug.md](modules/debug.md) | debug：事件环 per-thread id + ts 排序、双段关键区、资源历史 10 类结构（8 插桩/2 边界）、6 基础视图 + 4 资源视图、DebugServer 只读协议、Doctor 白名单/等待图/死锁判定；合并 3 篇旧文档 | 现行 |
+| [modules/logging.md](modules/logging.md) | logging：Level/LogRecord、Filter→Formatter→Sink 四层、BufferedSink 两把锁与惰性刷新、File/Rotating/Stdout/Memory/Callback、热加载与边界 | 现行 |
+| [modules/metrics.md](modules/metrics.md) | metrics：Counter/Gauge/Histogram、标签族缓存、固定桶与分位插值、Prometheus 文本导出、注册冲突与标签基数边界 | 现行 |
+| [modules/config.md](modules/config.md) | config：INI 语法与 `\xHH` 往返、ConfigVar 两阶段事务、Config 整批热加载、`.lock` 协议、RuntimeConfig 默认值/校验、`GO2CPP_CONFIG_REGISTER`、SO manifest 层 | 现行 |
 
 > 合并说明：`channel-hang.md`、`concurrency-5rounds.md`、`concurrency-baseline.md`、
 > `concurrency-park-points.md`、`correctness_audit.md` 已在顶部标注合并去向，正文保留为

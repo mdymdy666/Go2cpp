@@ -1,3 +1,5 @@
+> **已合并至 [docs/modules/debug.md](modules/debug.md)**：`GO2CPP_DEBUG_DUMP` 全开/关闭的六场景压测与类别归因见该文 §8；数据为 v5 基线，v6/v7 后需复测，本文保留为历史快照。
+
 # GO2CPP_DEBUG_DUMP 开销压测：全开 vs 关闭
 
 > 工作树：`Go2Cpp-work`

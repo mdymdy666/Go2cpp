@@ -1,3 +1,5 @@
+> **已合并至 [docs/modules/config.md](modules/config.md)**：INI 语法、强类型 `ConfigVar`、两阶段热加载、编辑锁协议与参数范围见该文 §2–§9；其中 `fiber_stack_size`（默认 2048、下限 2048）与 `fiber_bin_capacity`（默认 128）两处旧值已被修正，本文保留为历史快照。
+
 # Go2Cpp 配置与热更新
 
 根目录的 `go2cpp.ini` 是可复制的默认模板。解析器支持 `[section]`、`key = value`、
