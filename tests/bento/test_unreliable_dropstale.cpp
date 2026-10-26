@@ -98,7 +98,7 @@ void TestFrameCodec() {
     // 截断、坏版本、未知类型都必须被拒绝。
     BENTO_CHECK(!ParseFrame(frame.data(), kFrameHeaderBytes - 1, &view));
     std::vector<std::uint8_t> bad_version = frame;
-    bad_version[0] = 2;
+    bad_version[0] = static_cast<std::uint8_t>(kProtocolVersion + 1);
     BENTO_CHECK(!ParseFrame(bad_version.data(), bad_version.size(), &view));
     std::vector<std::uint8_t> bad_type = frame;
     bad_type[1] = 0x7F;

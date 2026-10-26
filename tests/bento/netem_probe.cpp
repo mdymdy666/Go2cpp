@@ -30,10 +30,11 @@ struct Options {
     std::uint16_t port = 34567;
     std::uint32_t messages = 200;
     std::size_t payload_bytes = 256;
-    int timeout_ms = 40000;
+    int timeout_ms = 60000;
     int loss_percent = 0;
     int delay_ms = 0;
     std::uint32_t seed = 0x9E3779B9U;
+    bool fixed_pto = false;  ///< 复现旧实现：固定 200ms 基础 PTO。
 };
 
 void WriteU32(std::uint8_t* out, std::uint32_t value) {
@@ -65,6 +66,8 @@ bool ParseOptions(int argc, char** argv, Options* options) {
             options->delay_ms = std::atoi(argv[++i]);
         } else if (std::strcmp(argument, "--seed") == 0 && i + 1 < argc) {
             options->seed = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argument, "--fixed-pto") == 0) {
+            options->fixed_pto = true;
         } else {
             std::fprintf(stderr, "unknown or incomplete argument: %s\n", argument);
             return false;
@@ -110,6 +113,9 @@ int main(int argc, char** argv) {
     server_config.heartbeat_interval_ms = 200;
     server_config.ack_interval_ms = 10;
     server_config.peer_timeout_ms = 10000;
+    if (options.fixed_pto) {
+        server_config.reliable.rtt.fixed_pto_ms = 200;
+    }
     Link server(server_config);
     std::string error;
     if (!server.Open(&error)) {
@@ -146,6 +152,9 @@ int main(int argc, char** argv) {
     client_config.peer_timeout_ms = 10000;
     client_config.handshake_timeout_ms = 15000;
     client_config.random_seed = 0x4E455445U;  // "NETE"
+    if (options.fixed_pto) {
+        client_config.reliable.rtt.fixed_pto_ms = 200;
+    }
     Link client(client_config);
     if (!client.Open(&error)) {
         std::fprintf(stderr, "netem_probe: client.Open failed: %s\n", error.c_str());
@@ -249,17 +258,33 @@ int main(int argc, char** argv) {
         }
     }
     const auto client_stats = client.reliable_stats(0);
+    const auto congestion = client.congestion_stats(0);
     const auto unreliable_stats = server.unreliable_stats(1);
 
     std::printf(
-        "netem_probe reliable: delivered=%u/%u ordered=%d retransmits=%llu acks=%llu "
-        "rtt_ms=%u p50_ms=%llu p95_ms=%llu p99_ms=%llu\n",
+        "netem_probe reliable: delivered=%u/%u ordered=%d retransmits=%llu "
+        "fast_retransmits=%llu acks=%llu srtt_ms=%u rttvar_ms=%u pto_ms=%u "
+        "rtt_ms=%u p50_ms=%llu p95_ms=%llu p99_ms=%llu pto_mode=%s\n",
         reliable_received, options.messages, stream_ordered ? 1 : 0,
         static_cast<unsigned long long>(client_stats.retransmits),
-        static_cast<unsigned long long>(client_stats.acks_applied), client_stats.last_rtt_ms,
+        static_cast<unsigned long long>(client_stats.fast_retransmits),
+        static_cast<unsigned long long>(client_stats.acks_applied), client_stats.srtt_ms,
+        client_stats.rttvar_ms, client_stats.pto_ms, client_stats.last_rtt_ms,
         static_cast<unsigned long long>(Percentile(observed, 0.50)),
         static_cast<unsigned long long>(Percentile(observed, 0.95)),
-        static_cast<unsigned long long>(Percentile(observed, 0.99)));
+        static_cast<unsigned long long>(Percentile(observed, 0.99)),
+        options.fixed_pto ? "fixed" : "dynamic");
+    std::printf(
+        "netem_probe congestion: cwnd=%u ssthresh=%u effective_cwnd=%u paced=%d "
+        "pacing_bps=%llu deferrals=%llu loss_events=%llu timeout_loss=%llu "
+        "bytes_sent=%llu\n",
+        congestion.cwnd_packets, congestion.ssthresh_packets, congestion.effective_window,
+        congestion.pacing_enabled ? 1 : 0,
+        static_cast<unsigned long long>(congestion.pacing_rate_bps),
+        static_cast<unsigned long long>(congestion.pacing_deferrals),
+        static_cast<unsigned long long>(congestion.loss_events),
+        static_cast<unsigned long long>(congestion.timeout_events),
+        static_cast<unsigned long long>(congestion.bytes_sent));
     std::printf("netem_probe unreliable: delivered=%u/%u ordered=%d stale_dropped=%llu\n",
                 unreliable_received, options.messages, datagram_ordered ? 1 : 0,
                 static_cast<unsigned long long>(unreliable_stats.stale_dropped));

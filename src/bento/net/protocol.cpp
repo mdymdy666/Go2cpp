@@ -37,13 +37,30 @@ std::uint32_t ReadU32(const std::uint8_t* in) noexcept {
            (static_cast<std::uint32_t>(in[2]) << 8) | static_cast<std::uint32_t>(in[3]);
 }
 
+/// 分片标志只允许出现在 STREAM 上，且载荷必须够放 8B 子头。
+bool ValidateFragmentFlag(const FrameHeader& header, std::size_t payload_bytes) noexcept {
+    if ((header.flags & kFlagFragmented) == 0) {
+        return true;
+    }
+    return header.type == FrameType::kStream &&
+           payload_bytes >= kStreamFragmentHeaderBytes;
+}
+
+/// FEC 校验片只允许出现在 VIDEO 上。
+bool ValidateFecFlag(const FrameHeader& header) noexcept {
+    if ((header.flags & kFlagFec) == 0) {
+        return true;
+    }
+    return header.type == FrameType::kVideo;
+}
+
 /// 帧类型对应的固定/最小载荷约束。
 bool ValidatePayloadShape(FrameType type, std::size_t payload_bytes) noexcept {
     switch (type) {
         case FrameType::kHello:
         case FrameType::kHelloAck:
-            // 4B magic + 4B session：握手必须能区分随机探测与真实连接。
-            return payload_bytes >= 8;
+            // 4B magic + 4B session + 4B conn_id。
+            return payload_bytes >= 12;
         case FrameType::kStream:
         case FrameType::kDatagram:
             return true;
@@ -56,6 +73,13 @@ bool ValidatePayloadShape(FrameType type, std::size_t payload_bytes) noexcept {
         case FrameType::kBarrier:
             // 屏障序号放在 header.seq，无载荷。
             return payload_bytes == 0;
+        case FrameType::kMaxData:
+            // 绝对上限：8B 大端 u64。
+            return payload_bytes == kMaxDataPayloadBytes;
+        case FrameType::kPmtudProbe:
+        case FrameType::kPmtudAck:
+            // token + target；探针其余字节是填充。
+            return payload_bytes >= kPmtudPayloadBytes;
     }
     return false;
 }
@@ -77,6 +101,9 @@ bool IsKnownFrameType(std::uint8_t raw) noexcept {
         case FrameType::kVideo:
         case FrameType::kAck:
         case FrameType::kBarrier:
+        case FrameType::kMaxData:
+        case FrameType::kPmtudProbe:
+        case FrameType::kPmtudAck:
             return true;
     }
     return false;
@@ -98,6 +125,12 @@ const char* FrameTypeName(FrameType type) noexcept {
             return "ACK";
         case FrameType::kBarrier:
             return "BARRIER";
+        case FrameType::kMaxData:
+            return "MAX_DATA";
+        case FrameType::kPmtudProbe:
+            return "PMTUD_PROBE";
+        case FrameType::kPmtudAck:
+            return "PMTUD_ACK";
     }
     return "UNKNOWN";
 }
@@ -107,8 +140,9 @@ void EncodeHeader(const FrameHeader& header, std::uint8_t* out) noexcept {
     out[1] = static_cast<std::uint8_t>(header.type);
     out[2] = header.channel;
     out[3] = header.flags;
-    WriteU32(out + 4, header.seq);
-    WriteU32(out + 8, header.dep_seq);
+    WriteU32(out + 4, header.conn_id);
+    WriteU32(out + 8, header.seq);
+    WriteU32(out + 12, header.dep_seq);
 }
 
 bool DecodeHeader(const std::uint8_t* data, std::size_t size, FrameHeader* out) noexcept {
@@ -123,8 +157,9 @@ bool DecodeHeader(const std::uint8_t* data, std::size_t size, FrameHeader* out) 
     header.type = static_cast<FrameType>(data[1]);
     header.channel = data[2];
     header.flags = data[3];
-    header.seq = ReadU32(data + 4);
-    header.dep_seq = ReadU32(data + 8);
+    header.conn_id = ReadU32(data + 4);
+    header.seq = ReadU32(data + 8);
+    header.dep_seq = ReadU32(data + 12);
     *out = header;
     return true;
 }
@@ -145,7 +180,12 @@ bool DecodeAck(const std::uint8_t* data, std::size_t size, AckState* out) noexce
 
 std::vector<std::uint8_t> BuildFrame(const FrameHeader& header, const AckState* ack,
                                      const std::uint8_t* payload, std::size_t payload_bytes) {
-    if (payload_bytes > kMaxFramePayload) {
+    // 探针是唯一允许超过 kMaxFramePayload 的帧类型：它的填充字节用于
+    // 试探路径 MTU，仍然限制在 kMaxProbeFrameBytes 内。
+    const std::size_t payload_limit = header.type == FrameType::kPmtudProbe
+                                          ? kMaxProbeFrameBytes - kFrameHeaderBytes
+                                          : kMaxFramePayload;
+    if (payload_bytes > payload_limit) {
         return {};
     }
     if (payload_bytes > 0 && payload == nullptr) {
@@ -157,12 +197,16 @@ std::vector<std::uint8_t> BuildFrame(const FrameHeader& header, const AckState* 
     if (!ValidatePayloadShape(header.type, payload_bytes)) {
         return {};
     }
+    if (!ValidateFragmentFlag(header, payload_bytes) || !ValidateFecFlag(header)) {
+        return {};
+    }
     if (header.version != kProtocolVersion) {
         return {};
     }
-    // ACK/BARRIER 自身不捎带 ACK 段：ACK 帧的载荷已经是 ACK 状态，
-    // BARRIER 只带 header.seq，避免出现两种来源的 ack 字段。
-    if (ack != nullptr && (header.type == FrameType::kAck || header.type == FrameType::kBarrier)) {
+    // ACK/BARRIER 自身不捎带 ACK 段；PMTUD 探针也不捎带，保持尺寸可控。
+    if (ack != nullptr &&
+        (header.type == FrameType::kAck || header.type == FrameType::kBarrier ||
+         header.type == FrameType::kPmtudProbe || header.type == FrameType::kPmtudAck)) {
         return {};
     }
 
@@ -192,18 +236,26 @@ std::vector<std::uint8_t> BuildFrame(const FrameHeader& header, const AckState* 
 }
 
 bool ParseFrame(const std::uint8_t* data, std::size_t size, FrameView* out) noexcept {
-    if (out == nullptr || data == nullptr || size > kMaxFrameBytes) {
+    if (out == nullptr || data == nullptr || size < kFrameHeaderBytes) {
         return false;
     }
     FrameView view;
     if (!DecodeHeader(data, size, &view.header)) {
         return false;
     }
+    // 先拿到类型再决定尺寸上限：只有 PMTUD 探针允许 1500B。
+    const std::size_t frame_limit =
+        view.header.type == FrameType::kPmtudProbe ? kMaxProbeFrameBytes : kMaxFrameBytes;
+    if (size > frame_limit) {
+        return false;
+    }
 
     std::size_t offset = kFrameHeaderBytes;
     if ((view.header.flags & kFlagAck) != 0) {
-        if (view.header.type == FrameType::kAck || view.header.type == FrameType::kBarrier) {
-            // 这两类帧没有「包头后 ACK 段」的合法形态。
+        if (view.header.type == FrameType::kAck || view.header.type == FrameType::kBarrier ||
+            view.header.type == FrameType::kPmtudProbe ||
+            view.header.type == FrameType::kPmtudAck) {
+            // 这些帧没有「包头后 ACK 段」的合法形态。
             return false;
         }
         if (size < offset + kAckBytes) {
@@ -217,10 +269,16 @@ bool ParseFrame(const std::uint8_t* data, std::size_t size, FrameView* out) noex
     }
 
     view.payload_bytes = size - offset;
-    if (view.payload_bytes > kMaxFramePayload) {
+    const std::size_t payload_limit = view.header.type == FrameType::kPmtudProbe
+                                          ? kMaxProbeFrameBytes - offset
+                                          : kMaxFramePayload;
+    if (view.payload_bytes > payload_limit) {
         return false;
     }
     if (!ValidatePayloadShape(view.header.type, view.payload_bytes)) {
+        return false;
+    }
+    if (!ValidateFragmentFlag(view.header, view.payload_bytes) || !ValidateFecFlag(view.header)) {
         return false;
     }
     view.payload = data + offset;
@@ -235,6 +293,24 @@ bool ParseFrame(const std::uint8_t* data, std::size_t size, FrameView* out) noex
     }
 
     *out = view;
+    return true;
+}
+
+void EncodeStreamFragmentHeader(const StreamFragmentHeader& header,
+                                std::uint8_t* out) noexcept {
+    WriteU32(out, header.frame_id);
+    WriteU16(out + 4, header.frag_index);
+    WriteU16(out + 6, header.frag_count);
+}
+
+bool DecodeStreamFragmentHeader(const std::uint8_t* data, std::size_t size,
+                                StreamFragmentHeader* out) noexcept {
+    if (out == nullptr || data == nullptr || size < kStreamFragmentHeaderBytes) {
+        return false;
+    }
+    out->frame_id = ReadU32(data);
+    out->frag_index = ReadU16(data + 4);
+    out->frag_count = ReadU16(data + 6);
     return true;
 }
 

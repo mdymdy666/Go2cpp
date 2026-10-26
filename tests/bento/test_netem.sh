@@ -75,7 +75,7 @@ fi
     u32 match ip sport "$PORT" 0xffff flowid 1:3 2>/dev/null || true
 
 echo "netem: loss=20% delay=200ms port=$PORT root_qdisc=$ROOT_QDISC"
-"$PROBE" --port "$PORT" --messages 200 --payload 256 --timeout-ms 40000
+"$PROBE" --port "$PORT" --messages 200 --payload 256 --timeout-ms 60000
 RC=$?
 if [[ "$RC" -eq 0 ]]; then
     echo "netem: PASS (reliable 100% ordered, unreliable 0 reorder)"

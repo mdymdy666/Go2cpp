@@ -2,20 +2,30 @@
 
 /**
  * @file protocol.hpp
- * @brief Bento Transport Protocol v0.1 的帧格式、常量与编解码。
- * @details 帧头固定 12 字节，网络字节序（大端）：
+ * @brief Bento Transport Protocol v0.2 的帧格式、常量与编解码。
+ * @details 帧头固定 16 字节，网络字节序（大端）：
  *
  *          | 偏移 | 字段    | 类型 | 语义                              |
  *          |------|---------|------|-----------------------------------|
- *          | 0    | ver     | u8   | 协议版本，当前 1                  |
+ *          | 0    | ver     | u8   | 协议版本，当前 2                  |
  *          | 1    | type    | u8   | FrameType                         |
  *          | 2    | chan    | u8   | 通道 id（move=0/click=1/video=2） |
- *          | 3    | flags   | u8   | kFlagAck / kFlagKey / kFlagRetransmit |
- *          | 4    | seq     | u32  | 通道内序列号                      |
- *          | 8    | dep_seq | u32  | 依赖的不可靠 seq，0 表示无依赖    |
+ *          | 3    | flags   | u8   | kFlagAck / kFlagKey / kFlagRetransmit / kFlagFragmented /
+ *          |      |         |      | kFlagEncrypted / kFlagFec / kFlagResume |
+ *          | 4    | conn_id | u32  | 连接标识（HELLO 协商，迁移/0-RTT 复用） |
+ *          | 8    | seq     | u32  | 通道内序列号                      |
+ *          | 12   | dep_seq | u32  | 依赖的不可靠 seq，0 表示无依赖    |
+ *
+ *          conn_id 是 P2 新增字段：接收端按它路由，而不是按源 IP:port；
+ *          因此对端更换本地地址（NAT rebinding / 移动网络切换）后，
+ *          只要 conn_id 相同且（加密模式下）AEAD 校验通过，会话即可延续。
  *
  *          若 flags 含 kFlagAck，帧头后紧跟 8 字节 ACK 段
  *          （ack_seq u32 + ack_bits u32），再之后是载荷。
+ *
+ *          若 STREAM 帧的 flags 含 kFlagFragmented，载荷开头是 8 字节
+ *          分片子头（frame_id u32 + frag_idx u16 + frag_cnt u16），
+ *          其后是该分片的数据。单帧载荷 <= 1300B 的消息不分片。
  *
  *          设计取舍：把 ACK 段做成可选前缀而不是独立固定字段，是为了让
  *          "数据帧捎带 ACK" 与 "纯 ACK 帧" 共用同一套编解码；ack_bits 的
@@ -33,21 +43,28 @@
 
 namespace go2cpp::bento {
 
-/// 协议版本。任何 ver != 1 的帧在解析阶段被拒绝。
-inline constexpr std::uint8_t kProtocolVersion = 1;
+/// 协议版本。任何 ver != kProtocolVersion 的帧在解析阶段被拒绝。
+inline constexpr std::uint8_t kProtocolVersion = 2;
 
-/// 固定帧头字节数。
-inline constexpr std::size_t kFrameHeaderBytes = 12;
+/// 固定帧头字节数（v0.2 起含 4B conn_id）。
+inline constexpr std::size_t kFrameHeaderBytes = 16;
 
 /// 可选 ACK 段字节数（ack_seq + ack_bits）。
 inline constexpr std::size_t kAckBytes = 8;
 
-/// 单帧载荷上限。留出 12B 头 + 8B ACK 后仍在 1280B 的安全 UDP 载荷内，
-/// 避免在真实链路上触发 IP 分片（本协议不依赖 IP 分片）。
+/// 单帧载荷上限。留出 16B 头 + 8B ACK 后仍低于 1500B 的常见以太网 MTU，
+/// 默认路径不依赖 IP 分片。
 inline constexpr std::size_t kMaxFramePayload = 1300;
 
 /// 单帧（头 + ACK + 载荷）上限。
 inline constexpr std::size_t kMaxFrameBytes = kFrameHeaderBytes + kAckBytes + kMaxFramePayload;
+
+/// PMTUD 探测帧允许的完整帧上限（包含 16B 头，不含加密封装开销）。
+/// 常规数据帧仍受 kMaxFrameBytes 限制；只有 kPmtudProbe 例外。
+inline constexpr std::size_t kMaxProbeFrameBytes = 1500;
+
+/// PMTUD 探测/确认帧载荷下限（token u32 + target u32）。
+inline constexpr std::size_t kPmtudPayloadBytes = 8;
 
 /// 通道 id。协议不强制语义，这三个是项目约定值。
 inline constexpr std::uint8_t kChannelMove = 0;
@@ -56,19 +73,45 @@ inline constexpr std::uint8_t kChannelVideo = 2;
 
 /// 帧类型。
 enum class FrameType : std::uint8_t {
-    kHello = 0x01,     ///< 握手请求：载荷 4B magic + 4B session。
-    kHelloAck = 0x02,  ///< 握手响应：回显 session。
+    kHello = 0x01,     ///< 握手请求：载荷 4B magic + 4B session + 4B conn_id。
+    kHelloAck = 0x02,  ///< 握手响应：回显 session 与协商后的 conn_id。
     kStream = 0x03,    ///< 可靠有序消息（seq + ACK + 重传 + 去重）。
     kDatagram = 0x04,  ///< 不可靠消息（seq 单调，接收端 DropStale）。
     kVideo = 0x05,     ///< 视频帧分片：载荷 8B 子头 + 分片数据。
     kAck = 0x06,       ///< 纯 ACK / 心跳：载荷 8B，无数据。
     kBarrier = 0x07,   ///< 因果屏障：header.seq 之前的不可靠 seq 作废。
+    /// 流控窗口更新（MAX_DATA）：载荷 8B 大端绝对上限（接收端承诺可接收
+    /// 的通道累计字节偏移）。通道 id 在 header.channel。语义与 RFC 9000
+    /// 的 MAX_DATA 一致：单调递增，收到较小值忽略。
+    kMaxData = 0x08,
+    /// 路径 MTU 探测：载荷 >= 8B（token u32 + target u32），其余为填充；
+    /// 对端原样回 kPmtudAck。这是 P2 的 PMTUD 探针，不参与应用交付。
+    kPmtudProbe = 0x09,
+    /// 路径 MTU 探测确认：载荷 >= 8B，回显 token 与 target。
+    kPmtudAck = 0x0A,
 };
+
+/// MAX_DATA 帧载荷字节数（u64 绝对上限）。
+inline constexpr std::size_t kMaxDataPayloadBytes = 8;
 
 /// 帧标志位。
 inline constexpr std::uint8_t kFlagAck = 0x01;         ///< 帧头后有 8B ACK 段。
 inline constexpr std::uint8_t kFlagKey = 0x02;         ///< VIDEO 关键帧。
 inline constexpr std::uint8_t kFlagRetransmit = 0x04;  ///< 重传帧（仅用于观测）。
+/// STREAM 载荷前有 8B 分片子头；仅当消息大于 kMaxFramePayload 时置位。
+inline constexpr std::uint8_t kFlagFragmented = 0x08;
+/// 加密帧：外层头之后是内层完整帧的 AEAD 密文 + 16B tag（见 crypto.hpp）。
+/// 未启用 PSK 时该标志永远不出现。
+inline constexpr std::uint8_t kFlagEncrypted = 0x10;
+/// VIDEO 的 XOR FEC 校验片：载荷为 8B 视频子头 + FEC 扩展 + 校验数据。
+/// 仅当发送端配置了 video_fec_group_size > 0 时出现。
+inline constexpr std::uint8_t kFlagFec = 0x20;
+/// 0-RTT 会话恢复后的首批帧：接收端见到该标志先清空旧应用的通道状态，
+/// 再处理本帧；发送端在收到对端 kFlagResumeAck 后停止置位。
+inline constexpr std::uint8_t kFlagResume = 0x40;
+/// 监听方确认已接受 0-RTT 恢复首帧：客户端见到后停止在后续帧上置
+/// kFlagResume。避免“服务端旧心跳先到”导致客户端过早清除恢复标志。
+inline constexpr std::uint8_t kFlagResumeAck = 0x80;
 
 /// @brief 线上帧头（主机内存表示，便于测试与调试）。
 struct FrameHeader {
@@ -76,6 +119,7 @@ struct FrameHeader {
     FrameType type = FrameType::kAck;
     std::uint8_t channel = 0;
     std::uint8_t flags = 0;
+    std::uint32_t conn_id = 0;  ///< P2：连接标识；握手期客户端提议、监听方确认。
     std::uint32_t seq = 0;
     std::uint32_t dep_seq = 0;
 };
@@ -115,11 +159,11 @@ bool IsKnownFrameType(std::uint8_t raw) noexcept;
 /// @brief 帧类型名（日志/测试用）。
 const char* FrameTypeName(FrameType type) noexcept;
 
-/// @brief 编码 12 字节帧头到大端缓冲区。
+/// @brief 编码 16 字节帧头到大端缓冲区。
 /// @param out 至少 kFrameHeaderBytes 字节的可写缓冲。
 void EncodeHeader(const FrameHeader& header, std::uint8_t* out) noexcept;
 
-/// @brief 解码 12 字节帧头并校验版本/类型。
+/// @brief 解码 16 字节帧头并校验版本/类型。
 /// @return 成功返回 true；长度不足、版本不符或类型未知返回 false。
 bool DecodeHeader(const std::uint8_t* data, std::size_t size, FrameHeader* out) noexcept;
 
@@ -139,6 +183,28 @@ std::vector<std::uint8_t> BuildFrame(const FrameHeader& header, const AckState* 
 /// @brief 解析任意类型的完整帧，并做长度与类型相关的边界检查。
 /// @return 格式非法返回 false（调用方应计入 invalid_frames）。
 bool ParseFrame(const std::uint8_t* data, std::size_t size, FrameView* out) noexcept;
+
+/// @brief STREAM 分片子头字节数：frame_id u32 + frag_idx u16 + frag_cnt u16。
+inline constexpr std::size_t kStreamFragmentHeaderBytes = 8;
+
+/// @brief STREAM 每个分片可携带的应用数据上限（帧载荷上限减去子头）。
+inline constexpr std::size_t kStreamFragmentBytes =
+    kMaxFramePayload - kStreamFragmentHeaderBytes;
+
+/// @brief STREAM 分片子头（仅 kFlagFragmented 帧存在）。
+struct StreamFragmentHeader {
+    std::uint32_t frame_id = 0;   ///< 逻辑消息 id；同一消息的所有分片相同。
+    std::uint16_t frag_index = 0; ///< 分片下标，0 起。
+    std::uint16_t frag_count = 1; ///< 分片总数，至少 1。
+};
+
+/// @brief 编码 STREAM 分片子头。
+void EncodeStreamFragmentHeader(const StreamFragmentHeader& header,
+                                std::uint8_t* out) noexcept;
+
+/// @brief 解码 STREAM 分片子头（不校验 index/count 关系，交给通道层）。
+bool DecodeStreamFragmentHeader(const std::uint8_t* data, std::size_t size,
+                                StreamFragmentHeader* out) noexcept;
 
 /// @brief 视频分片子头（8B）：frame_id u32 + frag_idx u16 + frag_cnt u16。
 inline constexpr std::size_t kVideoHeaderBytes = 8;

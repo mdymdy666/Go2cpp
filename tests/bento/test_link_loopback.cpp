@@ -200,8 +200,10 @@ int main() {
     BENTO_CHECK_EQ(server.unreliable_stats(1).messages_delivered, kDatagramCount);
     BENTO_CHECK_EQ(server.unreliable_stats(1).stale_dropped, 0U);
 
-    // 超长载荷必须被拒绝，不能静默截断。
-    const std::vector<std::uint8_t> too_large(go2cpp::bento::kMaxFramePayload + 1, 0x5A);
+    // 超过单条消息上限（分片数 × 1292B）必须被拒绝，不能静默截断；
+    // 1301B 起走 STREAM 分片，不再拒绝（见 test_stream_fragment）。
+    const std::vector<std::uint8_t> too_large(
+        go2cpp::bento::kMaxStreamMessageBytes + 1, 0x5A);
     BENTO_CHECK(!client.SendStream(0, too_large.data(), too_large.size()));
 
     const std::uint64_t p50 = bento_test::Percentile(server_latency_ms, 0.50);
