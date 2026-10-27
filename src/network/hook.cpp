@@ -953,12 +953,54 @@ bool can_wait(const std::shared_ptr<Descriptor>& descriptor) noexcept {
            !descriptor->m_open->m_user_nonblocking;
 }
 
-int wait_error(const go2cpp::IOWaitResult& result) noexcept {
+/**
+ * @brief Hook 错误路径的进程级累计计数（只为诊断，不参与控制流）。
+ *
+ * 这些计数解释「调用为什么返回这个 errno」：例如 `io_timeouts` 增长且
+ * 调用方看到 `EAGAIN`，说明是 `SO_RCVTIMEO/SO_SNDTIMEO` 到期，而不是
+ * 内核缓冲区真的空。全部用 relaxed 原子：热路径（ioctl 透传）只有一次
+ * 非争用自增，不引入锁或额外的内存序约束。
+ */
+struct ErrorCounterState {
+    std::atomic<std::uint64_t> m_io_timeouts{0};
+    std::atomic<std::uint64_t> m_connect_timeouts{0};
+    std::atomic<std::uint64_t> m_eintr_retries{0};
+    std::atomic<std::uint64_t> m_eintr_visible{0};
+    std::atomic<std::uint64_t> m_ioctl_passthroughs{0};
+};
+
+ErrorCounterState& error_counter_state() noexcept {
+    // 函数内 static：避免跨翻译单元的静态初始化顺序依赖（与
+    // descriptor_stripes() 采用同一策略）。
+    static ErrorCounterState state;
+    return state;
+}
+
+inline void count_error(std::atomic<std::uint64_t>& counter) noexcept {
+    counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+/**
+ * @brief 把 IOManager 的等待结果翻译成 libc 的 `errno`。
+ *
+ * @param result 等待结果。
+ * @param timeout_error `kTimeout` 对应的 errno。**必须按调用族区分**：
+ *        - read/write/recv/send/accept 等数据面调用：POSIX（socket(7)）规定
+ *          `SO_RCVTIMEO/SO_SNDTIMEO` 到期返回 `EAGAIN`，与「非阻塞且暂无
+ *          数据」完全同义；返回 `ETIMEDOUT` 会让 OpenSSL/gRPC 之类
+ *          「EAGAIN 重试、ETIMEDOUT 断链」的库在 hook 下行为突变；
+ *        - connect：`ETIMEDOUT` 是 connect(2) 自己的超时语义（连接未建立），
+ *          保持原样。
+ *
+ * `kCancelled/kClosed/kError` 与超时无关，照旧映射。
+ */
+int wait_error(const go2cpp::IOWaitResult& result,
+               int timeout_error) noexcept {
     switch (result.status) {
         case IOWaitStatus::kReady:
             return 0;
         case IOWaitStatus::kTimeout:
-            return ETIMEDOUT;
+            return timeout_error;
         case IOWaitStatus::kCancelled:
             return ECANCELED;
         case IOWaitStatus::kClosed:
@@ -990,7 +1032,8 @@ std::optional<IOManager::TimePoint> deadline_from_timeout(
 
 int native_wait(int fd, IOEvent event,
                 const std::optional<IOManager::TimePoint>& deadline,
-                const std::shared_ptr<Descriptor>& descriptor) {
+                const std::shared_ptr<Descriptor>& descriptor,
+                int timeout_error) {
     // 另一个线程中的 poll 不一定会被 close 可靠中断。有限时长的 poll 切片让
     // 保留的代次检测 close，同时不持有 IOManager，也不会在复用的数字描述符
     // 上永久等待。
@@ -1005,8 +1048,10 @@ int native_wait(int fd, IOEvent event,
         if (deadline) {
             const auto now = IOManager::Clock::now();
             if (*deadline <= now) {
-                // 原始阻塞 socket 契约报告 socket 超时，而不是内部非阻塞探测结果。
-                return ETIMEDOUT;
+                // 与 IOManager::wait 的 kTimeout 走同一映射：数据面调用按
+                // POSIX 的 SO_RCVTIMEO/SO_SNDTIMEO 契约返回 EAGAIN；
+                // connect 由调用方传入 ETIMEDOUT。
+                return timeout_error;
             }
             const auto remaining = *deadline - now;
             // 用短切片轮询，及时观察 close 或 fd 复用。转换前先限制范围：
@@ -1124,6 +1169,10 @@ Result cooperative_io(int fd, Function function, IOEvent event,
     const WaitDecision decision = wait_decision(descriptor, event);
     const bool blocking = !per_call_nonblocking && decision.can_wait;
     const auto deadline = deadline_from_timeout(decision.timeout);
+    // HOOK-03：EINTR 的内部重试预算。只有「本次调用本来会阻塞、且由
+    // IOManager 接管」的路径才消耗它；用户显式非阻塞 / 单次 MSG_DONTWAIT
+    // 调用一次都不重试（信号可见性属于调用方的契约）。
+    int eintr_retries = 0;
     for (;;) {
         Result result;
         {
@@ -1135,8 +1184,19 @@ Result cooperative_io(int fd, Function function, IOEvent event,
             }
             result = invoke_real(function, fd, args...);
         }
-        if (result == static_cast<Result>(-1) && errno == EINTR && manager) {
-            continue;
+        if (result == static_cast<Result>(-1) && errno == EINTR) {
+            const bool retry_allowed =
+                manager != nullptr && blocking &&
+                go2cpp::hook::ShouldRetryAfterEintr(eintr_retries);
+            if (retry_allowed) {
+                ++eintr_retries;
+                count_error(error_counter_state().m_eintr_retries);
+                continue;
+            }
+            // 预算用尽，或本次调用本来就是非阻塞语义：把 EINTR 原样交给
+            // 调用方，由它决定重试/取消。绝不无限吞掉信号。
+            count_error(error_counter_state().m_eintr_visible);
+            return result;
         }
         if (!blocking) {
             return result;
@@ -1150,10 +1210,21 @@ Result cooperative_io(int fd, Function function, IOEvent event,
         // step6: EAGAIN ⇒ 注册 epoll 等待并 park；被唤醒后回到 step4 重试
         // （数据可能已被别的读者取走，不能假设「唤醒 = 有数据」）。
         const auto token = snapshot_descriptor(descriptor).m_token;
-        const int error = manager
-                              ? wait_error(wait_for_io(*manager, fd, event,
-                                                       deadline, token))
-                              : native_wait(fd, event, deadline, descriptor);
+        int error = 0;
+        if (manager) {
+            const auto wait_result =
+                wait_for_io(*manager, fd, event, deadline, token);
+            if (wait_result.status == IOWaitStatus::kTimeout) {
+                count_error(error_counter_state().m_io_timeouts);
+            }
+            // 数据面超时按 POSIX 映射为 EAGAIN（与「缓冲区空」同义）。
+            error = wait_error(wait_result, EAGAIN);
+        } else {
+            error = native_wait(fd, event, deadline, descriptor, EAGAIN);
+            if (error == EAGAIN) {
+                count_error(error_counter_state().m_io_timeouts);
+            }
+        }
         if (error != 0) {
             errno = error;
             return static_cast<Result>(-1);
@@ -1213,15 +1284,23 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
         return invoke_real(s_originals.m_connect, fd, address, length);
     }
 
-    int result;
-    do {
+    int result = 0;
+    {
         DescriptorGuard lifecycle(fd);
         if (snapshot_descriptor(descriptor).m_closed) {
             errno = EBADF;
             return -1;
         }
         result = invoke_real(s_originals.m_connect, fd, address, length);
-    } while (result < 0 && errno == EINTR && manager);
+    }
+    if (result < 0 && errno == EINTR) {
+        // HOOK-03 / POSIX：connect 返回 EINTR 表示「连接建立过程已被信号
+        // 中止」。内核侧这次连接不再处于 in-progress 状态，重试只会得到
+        // EALREADY/ECONNABORTED 之类误导性错误；原样交还调用方，由它决定
+        // 是否重新发起 connect。
+        count_error(error_counter_state().m_eintr_visible);
+        return -1;
+    }
     if (!can_wait(descriptor)) {
         return result;
     }
@@ -1238,10 +1317,23 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
     const auto deadline =
         deadline_from_timeout(connect_wait_timeout(descriptor));
     const auto token = snapshot_descriptor(descriptor).m_token;
-    const int wait_errno =
-        manager ? wait_error(wait_for_io(*manager, fd, IOEvent::kWrite,
-                                         deadline, token))
-                : native_wait(fd, IOEvent::kWrite, deadline, descriptor);
+    int wait_errno = 0;
+    if (manager) {
+        const auto wait_result =
+            wait_for_io(*manager, fd, IOEvent::kWrite, deadline, token);
+        if (wait_result.status == IOWaitStatus::kTimeout) {
+            count_error(error_counter_state().m_connect_timeouts);
+        }
+        // connect 的超时保持 ETIMEDOUT：它表示「连接未建立」，与数据面
+        // SO_*TIMEO 的 EAGAIN 语义不同。
+        wait_errno = wait_error(wait_result, ETIMEDOUT);
+    } else {
+        wait_errno =
+            native_wait(fd, IOEvent::kWrite, deadline, descriptor, ETIMEDOUT);
+        if (wait_errno == ETIMEDOUT) {
+            count_error(error_counter_state().m_connect_timeouts);
+        }
+    }
     if (wait_errno != 0) {
         errno = wait_errno;
         return -1;
@@ -1331,7 +1423,10 @@ SleepOutcome cooperative_sleep_for(Duration duration) {
         // 清空可能残留的计数：正常超时路径计数为 0，这里通常是一次失败的
         // read（EAGAIN），成本可忽略；但必须做，否则会假唤醒。
         std::uint64_t pending = 0;
-        (void)::read(fd, &pending, sizeof(pending));
+        // 必须接收返回值：glibc 的 read 带 warn_unused_result；这里只关心
+        // 「把残留计数读空」，EAGAIN 也是正常结果。
+        const ssize_t drained = ::read(fd, &pending, sizeof(pending));
+        (void)drained;
     }
 
     const auto result = manager->WaitFor(fd, IOEvent::kRead, duration);
@@ -1339,7 +1434,9 @@ SleepOutcome cooperative_sleep_for(Duration duration) {
         result.status == IOWaitStatus::kReady) {
         return SleepOutcome::Completed;
     }
-    errno = wait_error(result);
+    // sleep 与 connect 同族：超时不是错误（上面已提前返回 Completed），
+    // 这里只会传出取消/关闭/底层错误。
+    errno = wait_error(result, ETIMEDOUT);
     return SleepOutcome::Interrupted;
 }
 
@@ -1537,6 +1634,36 @@ std::chrono::milliseconds connect_timeout() noexcept {
     const auto value = s_connect_timeout_ms.load(std::memory_order_acquire);
     return value < 0 ? std::chrono::milliseconds::max()
                      : std::chrono::milliseconds(value);
+}
+
+bool ShouldRetryAfterEintr(int retries_used) noexcept {
+    // 负值按 0 处理（首次调用刚返回 EINTR 时预算还是满的）。
+    return retries_used < kEintrRetryLimit;
+}
+
+HookErrorCounters error_counters() noexcept {
+    const ErrorCounterState& state = error_counter_state();
+    HookErrorCounters counters;
+    counters.io_timeouts =
+        state.m_io_timeouts.load(std::memory_order_relaxed);
+    counters.connect_timeouts =
+        state.m_connect_timeouts.load(std::memory_order_relaxed);
+    counters.eintr_retries =
+        state.m_eintr_retries.load(std::memory_order_relaxed);
+    counters.eintr_visible =
+        state.m_eintr_visible.load(std::memory_order_relaxed);
+    counters.ioctl_passthroughs =
+        state.m_ioctl_passthroughs.load(std::memory_order_relaxed);
+    return counters;
+}
+
+void reset_error_counters() noexcept {
+    ErrorCounterState& state = error_counter_state();
+    state.m_io_timeouts.store(0, std::memory_order_relaxed);
+    state.m_connect_timeouts.store(0, std::memory_order_relaxed);
+    state.m_eintr_retries.store(0, std::memory_order_relaxed);
+    state.m_eintr_visible.store(0, std::memory_order_relaxed);
+    state.m_ioctl_passthroughs.store(0, std::memory_order_relaxed);
 }
 
 ScopedEnable::ScopedEnable() noexcept {
@@ -2520,19 +2647,27 @@ int ioctl(int fd, unsigned long request, ...) {
         errno = ENOSYS;
         return -1;
     }
-    if (!ioctl_has_pointer_argument(request)) {
-        DescriptorGuard lifecycle(fd);
-        if (ioctl_has_no_argument(request)) {
-            return invoke_real(s_originals.m_ioctl, fd, request);
-        }
-        errno = ENOTSUP;
-        return -1;
+
+    // HOOK-02：白名单之外一律**透传**给内核。
+    //
+    // LD_PRELOAD 场景下本 hook 接管宿主进程的全部 ioctl：终端 TIOCGWINSZ、
+    // 串口 TCGETS、网卡 SIOCGIF*、文件系统 FS_IOC_* 都不在协同白名单里。
+    // 旧实现对「无指针参数」的未知命令直接 ENOTSUP，宿主不检查返回值时
+    // 会继续读未初始化的 winsize/termios —— 这是 hook 静默破坏宿主。
+    // 协同处理只保留给确实需要维护元数据的 FIONBIO 与白名单内的纯查询
+    // 命令；其余原样转发，让内核给出它本该给出的错误码。
+    if (ioctl_has_no_argument(request)) {
+        // 无参命令不读取可变参数：调用方可能确实没有传第三个实参。
+        return invoke_real(s_originals.m_ioctl, fd, request);
     }
 
+    // 未知命令的 ABI 无法从 request 判断是否带指针参数；按 glibc 自身
+    // ioctl 的惯例读取一个 void* 并转发，内核只在命令需要时使用该值。
     va_list arguments;
     va_start(arguments, request);
     void* argument = va_arg(arguments, void*);
     va_end(arguments);
+
     if (request == FIONBIO) {
         DescriptorGuard lifecycle(fd);
         auto descriptor = descriptor_for(fd);
@@ -2578,8 +2713,20 @@ int ioctl(int fd, unsigned long request, ...) {
             }
             return result;
         }
+        // 未接管（或非法指针）：原样转发，保留内核的 EFAULT/EINVAL 语义。
+        return invoke_real(s_originals.m_ioctl, fd, request, argument);
     }
-    DescriptorGuard lifecycle(fd);
+
+    if (ioctl_has_pointer_argument(request)) {
+        // FIONREAD/TIOCOUTQ：白名单内的纯查询命令，不修改元数据，只借用
+        // fd 生命周期门转发（与修复前行为一致）。
+        DescriptorGuard lifecycle(fd);
+        return invoke_real(s_originals.m_ioctl, fd, request, argument);
+    }
+
+    // 白名单外：纯透传，不持 DescriptorGuard —— 宿主 ioctl（终端、网卡、
+    // 文件系统）可能阻塞或睡眠，塞进 fd 生命周期临界区会放大死锁面。
+    count_error(error_counter_state().m_ioctl_passthroughs);
     return invoke_real(s_originals.m_ioctl, fd, request, argument);
 }
 

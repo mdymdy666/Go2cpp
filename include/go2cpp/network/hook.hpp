@@ -34,11 +34,11 @@ inline void SetThreadMode(ThreadHookMode mode) noexcept {
 // Hook 默认在进程范围启用。IOManager 所有的 Fiber 使用 epoll；没有
 // IOManager 的受管 Fiber 在延迟接管 socket 后使用有界的原生 poll 后备。
 // 普通线程和非 socket 阻塞 IO 通常直接进入 libc；已经接管的 socket 因
-// 内核标志保持非阻塞而使用原生 poll 后备。已跟踪 fd 以及未知的可变参数
-// fcntl/ioctl 命令遵循下方明确的元数据/ENOTSUP 约定，不承诺无条件转发
-// 到 libc。关闭 Hook 后不再接纳新的 Fiber/epoll 等待，socket 上已有的
-// 元数据在 close 前仍可能使用原生后备。未知可变参数命令返回 ENOTSUP，
-// 不会读取未知类型参数或转发无效 ABI 状态。
+// 内核标志保持非阻塞而使用原生 poll 后备。已跟踪 fd 的命令按本文件
+// 约定协同处理；**ioctl 白名单外的命令一律原样透传**（不拒绝、不伪造
+// 参数），未知 fcntl 命令才返回 ENOTSUP（无法安全判断其可变参数类型）。
+// 关闭 Hook 后不再接纳新的 Fiber/epoll 等待，socket 上已有的元数据在
+// close 前仍可能使用原生后备。
 /** @brief 开启或关闭进程级 Hook 实现。 */
 void set_enabled(bool enabled) noexcept;
 /** @brief 返回当前进程级 Hook 是否启用。 */
@@ -84,6 +84,56 @@ void mark_system_nonblocking(int fd) noexcept;
 void set_connect_timeout(std::chrono::milliseconds timeout) noexcept;
 /** @brief 读取当前 Hook connect 默认超时。 */
 std::chrono::milliseconds connect_timeout() noexcept;
+
+// ---------------------------------------------------------------------------
+// 错误路径契约（HOOK-01 / HOOK-02 / HOOK-03）与诊断计数
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief 单次 hook IO 调用内部的 EINTR 重试上限（不含首次调用）。
+ *
+ * @details 只有「本次调用本来会阻塞、且由 IOManager 接管」的路径才会消耗
+ *          这个预算。用户显式非阻塞 / `MSG_DONTWAIT` 调用与 `connect`
+ *          一次都不重试：前者本来不会睡眠，后者的 EINTR 表示连接已中止
+ *          （POSIX），重试只会得到误导性的 `EALREADY`。
+ */
+inline constexpr int kEintrRetryLimit = 3;
+
+/**
+ * @brief 第 `retries_used` 次 EINTR 之后是否还允许再重试一次。
+ * @param retries_used 已重试次数（0 表示首次调用刚返回 EINTR）。
+ * @return 已重试次数小于 `kEintrRetryLimit` 时返回 true。
+ * @details 把「有限重试」的决策集中在一处，便于测试与诊断；负值按 0 处理。
+ */
+bool ShouldRetryAfterEintr(int retries_used) noexcept;
+
+/**
+ * @brief Hook 错误路径的累计计数快照（进程级、只增）。
+ *
+ * ## 用途
+ *
+ * - `io_timeouts`：`SO_RCVTIMEO/SO_SNDTIMEO` 到期次数。这些调用按 POSIX
+ *   返回 `EAGAIN`；计数器是「超时」与「内核缓冲区真空」的唯一区分手段。
+ * - `connect_timeouts`：connect 等待超时次数（对应 `ETIMEDOUT`，connect
+ *   的超时语义与数据面不同，刻意不映射为 `EAGAIN`）。
+ * - `eintr_retries`：内部实际发起的 EINTR 重试次数（上限
+ *   `kEintrRetryLimit`）。
+ * - `eintr_visible`：把 `EINTR` 原样返回给调用方的次数（预算用尽、
+ *   非阻塞调用或 connect 被信号中止）。
+ * - `ioctl_passthroughs`：ioctl 白名单外命令透传给内核的次数。
+ */
+struct HookErrorCounters final {
+    std::uint64_t io_timeouts{0};
+    std::uint64_t connect_timeouts{0};
+    std::uint64_t eintr_retries{0};
+    std::uint64_t eintr_visible{0};
+    std::uint64_t ioctl_passthroughs{0};
+};
+
+/** @brief 读取错误路径计数快照（线程安全，relaxed 读取）。 */
+HookErrorCounters error_counters() noexcept;
+/** @brief 清零错误路径计数（测试与长跑诊断用）。 */
+void reset_error_counters() noexcept;
 
 // ---------------------------------------------------------------------------
 // 每函数动态开关

@@ -157,7 +157,8 @@ void test_timeout_and_user_nonblocking() {
         timeout_errno.store(errno, std::memory_order_release);
     });
     GO2CPP_CHECK(timed->wait_for(2s));
-    GO2CPP_CHECK(timeout_errno.load(std::memory_order_acquire) == ETIMEDOUT);
+    // SO_RCVTIMEO 到期按 POSIX 返回 EAGAIN（非阻塞语义），不是 ETIMEDOUT。
+    GO2CPP_CHECK(timeout_errno.load(std::memory_order_acquire) == EAGAIN);
     close_pair(timeout_fds);
 
     int nonblocking_fds[2]{-1, -1};
@@ -241,7 +242,8 @@ void test_native_fallback_and_failed_dup() {
 
     // Once a Fiber has adopted the socket, an ordinary thread uses the
     // bounded native-poll fallback. Its absolute deadline must surface as
-    // ETIMEDOUT rather than leaking the internal EAGAIN probe result.
+    // EAGAIN: POSIX socket(7) defines SO_RCVTIMEO expiry as EAGAIN, the
+    // same errno as "no data available" on a nonblocking descriptor.
     const timeval native_timeout{0, 20'000};
     GO2CPP_CHECK(::setsockopt(fds[0], SOL_SOCKET, SO_RCVTIMEO, &native_timeout,
                               sizeof(native_timeout)) == 0);
@@ -254,7 +256,7 @@ void test_native_fallback_and_failed_dup() {
     });
     GO2CPP_JOIN_WITH_WATCHDOG(timeout_reader, 3s);
     GO2CPP_CHECK(native_timeout_errno.load(std::memory_order_acquire) ==
-                 ETIMEDOUT);
+                 EAGAIN);
 
     // A failed replacement must not invalidate the still-open target.
     GO2CPP_CHECK(::dup2(-1, fds[0]) == -1);
@@ -421,7 +423,7 @@ void test_plain_scheduler_lazy_adoption_timeout() {
     GO2CPP_CHECK(peer->wait_for(2s));
     GO2CPP_CHECK(peer_done.load(std::memory_order_acquire));
     GO2CPP_CHECK(waiter->wait_for(2s));
-    GO2CPP_CHECK(read_error.load(std::memory_order_acquire) == ETIMEDOUT);
+    GO2CPP_CHECK(read_error.load(std::memory_order_acquire) == EAGAIN);
     close_pair(fds);
     scheduler.shutdown();
 }
@@ -637,7 +639,7 @@ void test_nested_fiber_io_timeout_and_wake() {
         }
         GO2CPP_CHECK(timeout_child->resume());
         GO2CPP_CHECK(timeout_errno.load(std::memory_order_acquire) ==
-                     ETIMEDOUT);
+                     EAGAIN);
         phase.store(2, std::memory_order_release);
 
         auto wake_child = std::make_shared<go2cpp::Fiber>([&] {
@@ -786,7 +788,8 @@ void test_deep_nested_fiber_io_chain() {
     GO2CPP_CHECK(::write(wake_fds[1], &value, 1) == 1);
     GO2CPP_CHECK(task->wait_for(3s));
     GO2CPP_CHECK(phase.load(std::memory_order_acquire) == 7);
-    GO2CPP_CHECK(timeout_errno.load(std::memory_order_acquire) == ETIMEDOUT);
+    // SO_RCVTIMEO 到期按 POSIX 返回 EAGAIN（非阻塞语义），不是 ETIMEDOUT。
+    GO2CPP_CHECK(timeout_errno.load(std::memory_order_acquire) == EAGAIN);
     GO2CPP_CHECK(wake_errno.load(std::memory_order_acquire) == 0);
     GO2CPP_CHECK(received.load(std::memory_order_acquire) == value);
     close_pair(timeout_fds);

@@ -446,6 +446,19 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_hook_ops_test COMMAND go2cpp_hook_ops_test)
     set_tests_properties(go2cpp_hook_ops_test PROPERTIES TIMEOUT 120)
 
+    # hook 三条 P0 回归（HOOK-01/02/03）：
+    #   - SO_RCVTIMEO/SO_SNDTIMEO 超时必须返回 EAGAIN（非阻塞语义）；
+    #   - 白名单外 ioctl 必须透传内核，不得伪造 ENOTSUP；
+    #   - EINTR 重试预算有限（kEintrRetryLimit）。
+    # 链接 go2cpp_hook 即可让测试进程的 recv/send/ioctl 解析到 interposer。
+    add_executable(go2cpp_hook_p0_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_p0.cpp)
+    target_link_libraries(go2cpp_hook_p0_test PRIVATE go2cpp_hook)
+    target_compile_options(go2cpp_hook_p0_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_hook_p0_test COMMAND go2cpp_hook_p0_test)
+    set_tests_properties(go2cpp_hook_p0_test PROPERTIES TIMEOUT 120)
+
     add_executable(go2cpp_hook_raw_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_raw.cpp)
     target_include_directories(go2cpp_hook_raw_test PRIVATE
