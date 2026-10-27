@@ -21,6 +21,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -223,6 +225,148 @@ void scenario_runnable_accounting(std::size_t workers) {
     scheduler.shutdown();
 }
 
+/// 场景 7：多线程 enqueue / wake / shutdown 混合（SCHED-01/02 定向压测）。
+///
+/// 两条 P0 都出在 worker 的 B1 自愈补发布上：
+///   - SCHED-01：慢路径持 admission 锁调 recover_unclaimed→enqueue，
+///     enqueue 的 worker 分支再锁同一把非递归 mutex → 自锁；
+///   - SCHED-02：take_incoming 持 incoming 条带锁调 enqueue（取 admission），
+///     与 shutdown 的 admission→incoming 反向 → 死锁。
+/// 触发要求 claim 失败且任务恰好停在「Runnable 且无队列节点」，窗口很窄，
+/// 单靠压测难以稳定复现。本场景把小本地队列、高频 yield、并发 park/wake
+/// 与「提交进行中 shutdown」叠在一起，最大化这三条路径的调用频率：
+/// 修复被回退时表现为 shutdown 挂死（ctest 120s 超时）；补发布丢失时表现为
+/// 任务停在非终态或 runnable 计数不归零。
+void scenario_enqueue_wake_shutdown_race() {
+    std::printf("[stress][场景7] enqueue/wake/shutdown 混合（P0 回归）\n");
+    for (int round = 0; round < 4; ++round) {
+        SchedulerConfig config;
+        config.processor_count = 4;
+        config.max_workers = 6;
+        config.min_workers = 4;
+        // 小本地队列让提交频繁溢出到 global/慢路径，提高 admission 与
+        // incoming 交替出现的概率。
+        config.local_queue_limit = 32;
+        config.idle_wait = std::chrono::milliseconds(1);
+        Scheduler scheduler(config);
+        scheduler.start();
+
+        std::atomic<bool> stop{false};
+        std::atomic<int> submitted{0};
+        std::atomic<int> completed{0};
+        std::atomic<int> rejected{0};
+        std::mutex handles_mutex;
+        std::vector<std::shared_ptr<Task>> all_handles;
+        std::vector<std::shared_ptr<Task>> parked_handles;
+        all_handles.reserve(32768);
+        parked_handles.reserve(2048);
+
+        auto producer = [&scheduler, &stop, &handles_mutex, &all_handles,
+                         &parked_handles, &submitted, &completed,
+                         &rejected] {
+            // shutdown 期间继续提交：enqueue() 与 admission/registry 扫描
+            // 持续交叉，直到主线程在 shutdown 返回后置 stop。
+            for (int i = 0; i < 20000 && !stop.load(std::memory_order_acquire);
+                 ++i) {
+                auto task = scheduler.spawn([&scheduler, &completed, i] {
+                    if ((i & 3) == 0) {
+                        // 高频 yield：worker 回队/慢路径的主要来源。
+                        for (int k = 0; k < 2; ++k) {
+                            (void)scheduler.yield_current();
+                        }
+                    }
+                    if ((i & 15) == 0) {
+                        // park 后由 waker 线程或 shutdown 唤醒；park_wait
+                        // 自带 draining 二次检查，不会在 shutdown 中滞留。
+                        auto self = Scheduler::current_task();
+                        if (self) {
+                            (void)scheduler.park_wait(self);
+                        }
+                    }
+                    completed.fetch_add(1, std::memory_order_relaxed);
+                });
+                if (!task) {
+                    rejected.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                submitted.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(handles_mutex);
+                all_handles.emplace_back(task);
+                if ((i & 15) == 0) {
+                    parked_handles.emplace_back(std::move(task));
+                }
+            }
+        };
+
+        std::thread waker([&scheduler, &stop, &handles_mutex,
+                           &parked_handles] {
+            while (!stop.load(std::memory_order_acquire)) {
+                std::vector<std::shared_ptr<Task>> snapshot;
+                {
+                    std::lock_guard<std::mutex> lock(handles_mutex);
+                    snapshot = parked_handles;
+                }
+                for (const auto& task : snapshot) {
+                    if (task && task->state() == GState::kWaiting) {
+                        (void)scheduler.wake(task);
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        });
+
+        std::vector<std::thread> producers;
+        producers.reserve(4);
+        for (int i = 0; i < 4; ++i) {
+            producers.emplace_back(producer);
+        }
+
+        // 等提交进入稳态（生产者仍在循环），再在提交进行中 shutdown：
+        // 复现「incoming 发布 vs admission/registry 扫描」的交叉窗口。
+        const auto submitted_enough = [&] {
+            return submitted.load(std::memory_order_acquire) >= 1000 ||
+                   stop.load(std::memory_order_acquire);
+        };
+        check(wait_until(submitted_enough, std::chrono::milliseconds(1000)),
+              "提交进入稳态");
+        const auto shutdown_started = Clock::now();
+        scheduler.shutdown();
+        const auto shutdown_elapsed = std::chrono::duration_cast<
+            std::chrono::milliseconds>(Clock::now() - shutdown_started);
+        stop.store(true, std::memory_order_release);
+        for (auto& thread : producers) {
+            thread.join();
+        }
+        waker.join();
+
+        check(shutdown_elapsed < std::chrono::milliseconds(5000),
+              "混合负载下 shutdown 在 5s 内完成");
+        check(scheduler.worker_count() == 0, "混合负载后 worker 归零");
+        check(scheduler.runnable_count() == 0, "混合负载后 runnable 归零");
+        check(rejected.load(std::memory_order_relaxed) == 0,
+              "spawn 未返回空句柄");
+        int non_terminal = 0;
+        {
+            std::lock_guard<std::mutex> lock(handles_mutex);
+            for (const auto& task : all_handles) {
+                if (!task) {
+                    continue;
+                }
+                const auto state = task->state();
+                if (state != GState::kDead && state != GState::kCancelled &&
+                    state != GState::kFailed) {
+                    ++non_terminal;
+                }
+            }
+        }
+        check(non_terminal == 0, "shutdown 返回时所有任务已终态");
+        std::printf("  round %d: submitted=%d completed=%d shutdown=%lldms\n",
+                    round, submitted.load(std::memory_order_relaxed),
+                    completed.load(std::memory_order_relaxed),
+                    static_cast<long long>(shutdown_elapsed.count()));
+    }
+}
+
 }  // namespace
 
 void run_scheduler_stress_tests() {
@@ -239,6 +383,7 @@ void run_scheduler_stress_tests() {
     for (std::size_t w : {3U, 4U}) {
         scenario_runnable_accounting(w);
     }
+    scenario_enqueue_wake_shutdown_race();
 
     std::printf("\n[stress] failures=%d\n", g_failures);
     if (g_failures != 0) {

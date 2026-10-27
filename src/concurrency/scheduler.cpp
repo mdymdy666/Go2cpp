@@ -106,7 +106,7 @@ void WarnOnce(std::atomic<bool>& flag, const char* message) noexcept {
 
 #if defined(__linux__)
 /// 打印当前调用栈；只在 abort 前的诊断路径使用。
-void DumpParkCallStack() noexcept {
+[[maybe_unused]] void DumpParkCallStack() noexcept {
     void* frames[32];
     const int count = ::backtrace(frames, 32);
     if (count > 0) {
@@ -128,7 +128,8 @@ void DumpParkCallStack() noexcept {}
  *          release 构建（`NDEBUG`）：**绝不 abort**。降级为普通 `Mutex`
  *          语义（正确但慢），只递增降级计数并在第一次打印警告。
  */
-void ReportParkInNoParkSection(const Task& task, std::uint32_t depth) noexcept {
+void ReportParkInNoParkSection([[maybe_unused]] const Task& task,
+                               [[maybe_unused]] std::uint32_t depth) noexcept {
 #if defined(GO2CPP_DEBUG_LOCKS) || !defined(NDEBUG)
     std::fprintf(stderr,
                  "[FATAL] G%llu parked inside a SpinMutex critical section "
@@ -229,6 +230,39 @@ struct IdlePollScope final {
     ~IdlePollScope() noexcept { t_in_idle_poll = false; }
     IdlePollScope(const IdlePollScope&) = delete;
     IdlePollScope& operator=(const IdlePollScope&) = delete;
+};
+
+// ---------------------------------------------------------------------------
+// 锁序守卫（SCHED-01 / SCHED-02）
+// ---------------------------------------------------------------------------
+//
+// 统一锁序约定：admission(m_impl->mutex) -> 条带锁(registry/incoming)。
+// `enqueue()` 会获取 admission，因此任何持有 incoming 条带锁的路径都不能
+// 调用它：那会形成 incoming -> admission 的反向嵌套，与 shutdown 的
+// admission -> incoming 顺序相撞（SCHED-02）。慢路径曾经在持 admission 时
+// 调用 enqueue()，同一把非递归 mutex 二次加锁直接自锁（SCHED-01）。
+//
+// 这里用线程局部深度把 incoming 登记为叶子锁；`enqueue()` 入口在深度非零时
+// fail-fast。正常路径的代价只是一次 TLS 读，而触发窗口极窄的死锁会变成
+// 可定位的显式失败。
+thread_local std::uint32_t t_incoming_lock_depth = 0;
+
+/// @brief 持 incoming 条带锁并登记持锁深度；析构时先解锁再清深度。
+class IncomingStripeLock final {
+public:
+    explicit IncomingStripeLock(std::mutex& mutex) : m_mutex(mutex) {
+        m_mutex.lock();
+        ++t_incoming_lock_depth;
+    }
+    ~IncomingStripeLock() {
+        m_mutex.unlock();
+        --t_incoming_lock_depth;
+    }
+    IncomingStripeLock(const IncomingStripeLock&) = delete;
+    IncomingStripeLock& operator=(const IncomingStripeLock&) = delete;
+
+private:
+    std::mutex& m_mutex;
 };
 
 // 默认 P 数量 = 硬件并发度。`hardware_concurrency()` 在无法确定时返回 0，
@@ -1032,12 +1066,21 @@ void Task::run() {
  * ## 锁层次（严格顺序，违反就会死锁）
  *
  * ```text
- * m_lifecycle_mutex -> m_mutex -> 条带锁（registry/incoming）
+ * m_lifecycle_mutex -> m_mutex(admission) -> 条带锁（registry/incoming）
  *                  -> P 的 mutex -> m_task_mutex（单 G 状态）
  * ```
  *
  * 任何路径都**不能反向**。`expire_timers` 特意分两阶段（定时器锁内摘节点、
  * 释放后逐条带处理）就是为了不出现「条带锁 → 定时器锁」的反向嵌套。
+ *
+ * **incoming 条带锁是叶子锁**：持锁期间只允许操作该条带的队列/计数与
+ * Task 状态机，**禁止调用 `enqueue()`** —— 它会获取 admission 锁。
+ * 旧实现的 B1 补发布正是在 `take_incoming()` 持 incoming 锁时调用
+ * `enqueue()`，与 shutdown 的 `admission -> incoming` 顺序构成反向嵌套
+ * （SCHED-02）；慢路径持 admission 调 `enqueue()` 则直接自锁（SCHED-01）。
+ * 两条路径现在统一为「锁内只判定，释放锁后补发布」。`IncomingStripeLock`
+ * 用线程局部计数登记 incoming 持锁深度，`enqueue()` 入口据此 fail-fast，
+ * 防止以后再把跨锁调用引回来。
  *
  * ## 关键不变式
  *
@@ -1517,7 +1560,7 @@ public:
         // 心跳先于调度器锁更新。高负载时即使本轮无法取得锁，
         // monitor 线程也不会永久卡在业务队列上，调用者仍能观察到它在线。
         const auto now = steady_now_ns();
-        const auto pass_number =
+        [[maybe_unused]] const auto pass_number =
             sysmon_pass_count.fetch_add(1, std::memory_order_relaxed) + 1;
         GO2CPP_DEBUG_EVENT_SAMPLED(kSysmonPass, 0, pass_number, 32);
         const auto threshold = milliseconds_to_ns(config.long_syscall_threshold);
@@ -1777,8 +1820,7 @@ public:
             std::deque<std::shared_ptr<Task>> incoming;
             bool incoming_empty = false;
             {
-                std::lock_guard<std::mutex> incoming_lock(
-                    incoming_mutexes[stripe]);
+                IncomingStripeLock incoming_lock(incoming_mutexes[stripe]);
                 incoming.swap(incoming_queues[stripe]);
                 incoming_empty = incoming_queues[stripe].empty();
             }
@@ -2446,6 +2488,16 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         GO2CPP_DEBUG_EVENT(kEnqueueRejected, task ? task->id() : 0, 1);
         return false;
     }
+    // 锁序守卫：enqueue() 会获取 admission 锁；若调用方仍持有 incoming
+    // 条带锁，就与 shutdown 的 admission→incoming 顺序构成反向嵌套
+    // （SCHED-02）。正常路径只读一次线程局部变量。
+    if (t_incoming_lock_depth != 0) {
+        auto logger = GO2CPP_LOG_NAME("Scheduler");
+        GO2CPP_LOG_ERROR(logger)
+            << "lock-order violation: enqueue() called while holding an "
+               "incoming stripe lock";
+        std::terminate();
+    }
     const auto initial_state = task->state();
     if (initial_state == GState::kDead || initial_state == GState::kCancelled ||
         initial_state == GState::kFailed) {
@@ -2568,7 +2620,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         }
         const auto incoming_stripe = t_incoming_stripe;
         {
-            std::lock_guard<std::mutex> incoming_lock(
+            IncomingStripeLock incoming_lock(
                 m_impl->incoming_mutexes[incoming_stripe]);
             if (m_impl->accepting.load(std::memory_order_acquire) &&
                 !m_impl->stopping.load(std::memory_order_acquire)) {
@@ -3069,7 +3121,7 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
     const auto stripe = t_incoming_stripe;
     bool published = false;
     {
-        std::lock_guard<std::mutex> lock(m_impl->incoming_mutexes[stripe]);
+        IncomingStripeLock lock(m_impl->incoming_mutexes[stripe]);
         if (m_impl->accepting.load(std::memory_order_acquire) &&
             !m_impl->stopping.load(std::memory_order_acquire)) {
             m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
@@ -3797,35 +3849,36 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     // B1：dequeue 的 claim 失败收尾。旧实现无条件 clear_queued()，会把
     // 「pop 之后、clear 之前」新发布的 reservation 一起清掉，制造
     // 「kRunnable 但没有任何队列节点」的唤醒丢失。这里按任务当前状态
-    // 条件清理：确实不再需要队列节点才清，仍可运行且无执行者则补发布自愈。
-    const auto recover_unclaimed = [this](const std::shared_ptr<Task>& task) {
-        bool need_republish = false;
-        {
-            std::lock_guard<std::mutex> lock(task->m_transition_mutex);
-            const auto state = task->m_state.load(std::memory_order_relaxed);
-            const bool executing =
-                task->m_execution_claim.load(std::memory_order_relaxed);
-            if (state == GState::kRunnable && !executing) {
-                // 仍可运行且没有执行者：m_queued 为 true 说明已有更新的
-                // 队列节点（保留）；为 false 说明这个 G 已经没有节点，
-                // 必须补发布，否则它将永久停在 Runnable。
-                need_republish =
-                    !task->m_queued.load(std::memory_order_relaxed);
-            } else {
-                // 已不可运行 / 已被别的 worker claim：刚 pop 的节点是残留，
-                // 清除 queued 不会影响任何有效 reservation。
-                task->m_queued.store(false, std::memory_order_release);
-            }
+    // 条件清理：确实不再需要队列节点才清，仍可运行且无执行者则需要补发布。
+    //
+    // 注意：本函数只做**判定**，不调用 enqueue()。三个调用点分别在
+    // admission 锁内（慢路径）、incoming 条带锁内（中路径）和无锁
+    // （本地快路径）执行；锁内 enqueue 会自锁或形成反向锁序
+    // （SCHED-01/02）。调用方把判定结果带到所有调度器锁之外再补发布。
+    const auto recover_unclaimed = [](const std::shared_ptr<Task>& task) {
+        std::lock_guard<std::mutex> lock(task->m_transition_mutex);
+        const auto state = task->m_state.load(std::memory_order_relaxed);
+        const bool executing =
+            task->m_execution_claim.load(std::memory_order_relaxed);
+        if (state == GState::kRunnable && !executing) {
+            // 仍可运行且没有执行者：m_queued 为 true 说明已有更新的
+            // 队列节点（保留）；为 false 说明这个 G 已经没有节点，
+            // 必须补发布，否则它将永久停在 Runnable。
+            return !task->m_queued.load(std::memory_order_relaxed);
         }
-        if (need_republish) {
-            (void)enqueue(task);
-        }
+        // 已不可运行 / 已被别的 worker claim：刚 pop 的节点是残留，
+        // 清除 queued 不会影响任何有效 reservation。
+        task->m_queued.store(false, std::memory_order_release);
+        return false;
     };
 
     for (;;) {
         std::shared_ptr<Task> task;
         bool claimed = false;
         bool local_queue_pop = false;
+        // B1 的补发布是延迟动作：三个找活路径都可能持有 admission /
+        // incoming 条带锁，必须等本轮所有调度器锁释放后再 enqueue。
+        std::shared_ptr<Task> unclaimed_republish;
         // step2: 快路径——只碰本 P 的本地队列，不加调度器总锁。
         // 绝大多数 yield 回来的 G 都会回到原 P。本地队列由同一 P 的
         // worker 独占消费；只有本地为空时才进入需要全局 admission 锁的
@@ -3851,7 +3904,9 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     GO2CPP_DEBUG_EVENT(kRunQueueClaimOk, task->id(), 0);
                 } else {
                     GO2CPP_DEBUG_EVENT(kRunQueueClaimFail, task->id(), 0);
-                    recover_unclaimed(task);
+                    if (recover_unclaimed(task)) {
+                        unclaimed_republish = task;
+                    }
                 }
             }
         }
@@ -3874,7 +3929,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     m_impl->config.task_affinity_budget != 0;
                 const auto take_incoming = [&](std::size_t stripe,
                                                bool require_class) {
-                    std::lock_guard<std::mutex> incoming_lock(
+                    IncomingStripeLock incoming_lock(
                         m_impl->incoming_mutexes[stripe]);
                     auto& incoming_queue = m_impl->incoming_queues[stripe];
                     if (incoming_queue.empty()) {
@@ -3914,7 +3969,11 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         GO2CPP_DEBUG_EVENT(kRunQueueClaimOk, task->id(), 0);
                     } else {
                         GO2CPP_DEBUG_EVENT(kRunQueueClaimFail, task->id(), 0);
-                        recover_unclaimed(task);
+                        // 锁内只判定；enqueue 留到条带锁释放后，否则会与
+                        // shutdown 的 admission→incoming 反向（SCHED-02）。
+                        if (recover_unclaimed(task)) {
+                            unclaimed_republish = task;
+                        }
                     }
                     return true;
                 };
@@ -4038,7 +4097,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                                        ::go2cpp::debug::kGlobalQueueTag);
                     return selected;
                 };
-                const auto take_victim = [&](auto& queue, PId victim_id) {
+                const auto take_victim = [&](auto& queue,
+                                             [[maybe_unused]] PId victim_id) {
                     if (prefer_class) {
                         auto it = queue.rbegin();
                         std::size_t scanned = 0;
@@ -4087,7 +4147,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 if (!task && m_impl->processors.size() > 1) {
                     const auto start = m_impl->next_processor.fetch_add(
                         1, std::memory_order_relaxed);
-                    std::uint64_t victim_id = 0;
+                    [[maybe_unused]] std::uint64_t victim_id = 0;
                     for (std::size_t offset = 0;
                          offset < m_impl->processors.size(); ++offset) {
                         auto& victim = m_impl->processors[
@@ -4126,11 +4186,21 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     } else {
                         GO2CPP_DEBUG_EVENT(kRunQueueClaimFail, task->id(), 0);
                         // 节点已经从队列取出：按任务当前状态条件清理
-                        // reservation，必要时补发布自愈（B1）。
-                        recover_unclaimed(task);
+                        // reservation。补发布必须等 admission 锁释放，
+                        // 否则 worker 分支会二次锁同一把 mutex（SCHED-01）。
+                        if (recover_unclaimed(task)) {
+                            unclaimed_republish = task;
+                        }
                     }
                 }
             }
+        }
+
+        // B1 补发布统一放在所有调度器锁释放之后：enqueue() 的 worker 分支
+        // 会获取 admission 锁，而慢路径曾持有 admission（SCHED-01），
+        // 中路径曾持有 incoming 条带锁（SCHED-02）。到这里两种锁都已释放。
+        if (unclaimed_republish) {
+            (void)enqueue(unclaimed_republish);
         }
 
         // Both the local fast path and the admission path arrive here with a
