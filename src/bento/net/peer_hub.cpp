@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <utility>
 
@@ -71,6 +72,13 @@ std::uint32_t RandomNonZeroU32() {
                                 (static_cast<std::uint32_t>(raw[2]) << 8) |
                                 static_cast<std::uint32_t>(raw[3]);
     return value == 0 ? 1U : value;
+}
+
+/// 墙钟毫秒：只用于跨进程可比的握手时间戳，不参与超时计算。
+std::uint64_t WallClockMs() noexcept {
+    using namespace std::chrono;
+    return static_cast<std::uint64_t>(
+        duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count());
 }
 
 /// 地址转可读字符串（仅日志/快照用）。
@@ -133,6 +141,27 @@ struct PeerHub::Peer {
     Relation relation;
     std::map<std::uint8_t, std::unique_ptr<ReliableChannel>> reliable;
     std::map<std::uint8_t, std::unique_ptr<UnreliableChannel>> unreliable;
+
+    // ---- PSK 认证加密（P1）：每 peer 独立 nonce/密钥/wire seq/重放窗口 ----
+    bool secure_enabled = false;      ///< 该 peer 是否走加密握手。
+    bool session_keys_ready = false;  ///< 会话密钥是否就绪。
+    std::uint8_t psk[kPskBytes] = {};
+    std::uint8_t client_nonce[kHandshakeNonceBytes] = {};
+    std::uint8_t server_nonce[kHandshakeNonceBytes] = {};
+    std::uint8_t tx_key[kChaCha20KeyBytes] = {};
+    std::uint8_t rx_key[kChaCha20KeyBytes] = {};
+    SecureDirection tx_direction = SecureDirection::kClientToServer;
+    SecureDirection rx_direction = SecureDirection::kServerToClient;
+    std::uint32_t tx_wire_seq = 0;       ///< 本方向已用的最大 wire seq。
+    std::uint32_t handshake_tx_seq = 1;  ///< 握手帧 wire seq（每会话随机）。
+    ReplayWindow data_rx_window;
+    ReplayWindow handshake_rx_window;
+    std::vector<std::uint8_t> cached_hello;      ///< 加密 HELLO（重传幂等）。
+    std::vector<std::uint8_t> cached_hello_ack;  ///< 加密 HELLO_ACK（重传幂等）。
+
+    // ---- 日志钩子增量（仅注入 hook 时维护） ----
+    std::map<std::uint8_t, std::uint64_t> log_retransmits;
+    std::map<std::uint8_t, std::uint64_t> log_loss_events;
 };
 
 const char* PeerStateName(PeerState state) noexcept {
@@ -161,6 +190,7 @@ PeerHub::PeerHub(PeerHubConfig config) : m_config(std::move(config)), m_rx_buffe
     if (m_config.heartbeat_interval_ms == 0) {
         m_config.heartbeat_interval_ms = 500;
     }
+    m_log_hook = m_config.log_hook;
 }
 
 PeerHub::~PeerHub() {
@@ -170,6 +200,15 @@ PeerHub::~PeerHub() {
 bool PeerHub::Open(std::string* error) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     std::string local_error;
+    if (!m_config.pre_shared_key.empty()) {
+        if (!SetPreSharedKey(m_config.pre_shared_key.data(),
+                             m_config.pre_shared_key.size())) {
+            if (error != nullptr) {
+                *error = "pre_shared_key must be exactly 32 bytes";
+            }
+            return false;
+        }
+    }
     if (!m_socket.Open(m_config.bind_address, m_config.bind_port, &local_error)) {
         if (error != nullptr) {
             *error = local_error;
@@ -192,6 +231,7 @@ void PeerHub::Close() {
     for (auto& entry : m_peers) {
         entry.second->state = PeerState::kClosed;
         ResetChannels(*entry.second);
+        ResetSecureSession(*entry.second);
     }
     m_peers.clear();
     m_by_conn_id.clear();
@@ -246,6 +286,10 @@ PeerHub::Peer* PeerHub::CreatePeer(std::uint32_t peer_id, const sockaddr_storage
     peer->addr_len = len;
     peer->last_rx_ms = NowMs();
     peer->last_tx_ms = peer->last_rx_ms;
+    if (m_secure_enabled) {
+        peer->secure_enabled = true;
+        std::memcpy(peer->psk, m_psk, kPskBytes);
+    }
     Peer* raw = peer.get();
     m_peers.emplace(peer_id, std::move(peer));
     ++m_stats.peers_created;
@@ -258,6 +302,20 @@ void PeerHub::ResetChannels(Peer& peer) {
     peer.relation.Reset();
     peer.next_ack_ms = 0;
     peer.next_heartbeat_ms = 0;
+}
+
+void PeerHub::ResetSecureSession(Peer& peer) {
+    peer.session_keys_ready = false;
+    std::memset(peer.client_nonce, 0, sizeof(peer.client_nonce));
+    std::memset(peer.server_nonce, 0, sizeof(peer.server_nonce));
+    std::memset(peer.tx_key, 0, sizeof(peer.tx_key));
+    std::memset(peer.rx_key, 0, sizeof(peer.rx_key));
+    peer.tx_wire_seq = 0;
+    peer.handshake_tx_seq = 1;
+    peer.data_rx_window.Reset();
+    peer.handshake_rx_window.Reset();
+    peer.cached_hello.clear();
+    peer.cached_hello_ack.clear();
 }
 
 ReliableChannel* PeerHub::GetOrCreateReliable(Peer& peer, std::uint8_t channel) {
@@ -336,8 +394,32 @@ bool PeerHub::SendBuiltFrame(Peer& peer, const std::uint8_t* data, std::size_t b
         data = stamped.data();
         bytes = stamped.size();
     }
+    return SendFrameBytes(peer, data, bytes);
+}
+
+bool PeerHub::SendFrameBytes(Peer& peer, const std::uint8_t* data, std::size_t bytes) {
+    if (peer.session_keys_ready) {
+        return SealAndSend(peer, data, bytes);
+    }
+    if (peer.secure_enabled) {
+        // 加密 peer 在握手完成前不能发明文数据：对端会按明文拒绝，
+        // 静默发送只会让可靠层误以为已入网。
+        ++m_stats.send_errors;
+        EmitLog(LogLevel::kError, LogEvent::kSendError, peer.peer_id,
+                "secure peer not ready", bytes);
+        return false;
+    }
+    return SendRawPacket(peer, data, bytes);
+}
+
+bool PeerHub::SendRawPacket(Peer& peer, const std::uint8_t* data, std::size_t bytes) {
+    if (!m_socket.IsOpen()) {
+        ++m_stats.send_errors;
+        return false;
+    }
     if (!m_socket.SendTo(peer.addr, peer.addr_len, data, bytes)) {
         ++m_stats.send_errors;
+        EmitLog(LogLevel::kError, LogEvent::kSendError, peer.peer_id, "sendto failed", bytes);
         return false;
     }
     ++m_stats.frames_sent;
@@ -345,6 +427,30 @@ bool PeerHub::SendBuiltFrame(Peer& peer, const std::uint8_t* data, std::size_t b
     ++peer.frames_sent;
     peer.bytes_sent += static_cast<std::uint64_t>(bytes);
     peer.last_tx_ms = NowMs();
+    return true;
+}
+
+bool PeerHub::SealAndSend(Peer& peer, const std::uint8_t* frame, std::size_t bytes) {
+    if (!peer.session_keys_ready) {
+        ++m_stats.send_errors;
+        return false;
+    }
+    std::uint32_t seq = peer.tx_wire_seq + 1;
+    if (seq == 0) {
+        seq = 1;  // wire seq 0 保留；2^32 回绕在实际连接中不会发生。
+    }
+    std::vector<std::uint8_t> sealed;
+    if (!SealFrame(peer.tx_key, peer.tx_direction, seq, frame, bytes, &sealed)) {
+        ++m_stats.send_errors;
+        return false;
+    }
+    // 先推进 seq 再发送：发送失败也绝不复用同一 (key, nonce)。
+    peer.tx_wire_seq = seq;
+    if (!SendRawPacket(peer, sealed.data(), sealed.size())) {
+        return false;
+    }
+    ++m_secure_stats.packets_sealed;
+    m_secure_stats.encrypted_bytes_sent += static_cast<std::uint64_t>(sealed.size());
     return true;
 }
 
@@ -364,31 +470,46 @@ bool PeerHub::SendControl(Peer& peer, const FrameHeader& header, const std::uint
         ++m_stats.send_errors;
         return false;
     }
-    if (!m_socket.SendTo(peer.addr, peer.addr_len, frame.data(), frame.size())) {
-        ++m_stats.send_errors;
-        return false;
-    }
-    ++m_stats.frames_sent;
-    m_stats.bytes_sent += static_cast<std::uint64_t>(frame.size());
-    ++peer.frames_sent;
-    peer.bytes_sent += static_cast<std::uint64_t>(frame.size());
-    peer.last_tx_ms = NowMs();
-    return true;
+    return SendFrameBytes(peer, frame.data(), frame.size());
 }
 
 void PeerHub::SendHello(Peer& peer) {
     if (peer.hello_attempts > 0) {
         ++m_stats.hello_retransmits;
+        EmitLog(LogLevel::kDebug, LogEvent::kHandshakeRetry, peer.peer_id,
+                peer.secure_enabled ? "secure hello retransmit" : "hello retransmit",
+                peer.hello_attempts);
     }
     ++peer.hello_attempts;
-    std::uint8_t payload[kHelloPayloadBytes];
-    MakeHelloPayload(peer.session_id, peer.conn_id, payload);
-    FrameHeader header;
-    header.type = FrameType::kHello;
-    header.channel = 0;
-    header.conn_id = peer.conn_id;
-    header.seq = peer.session_id;
-    (void)SendControl(peer, header, payload, sizeof(payload));
+    if (peer.secure_enabled) {
+        if (peer.cached_hello.empty()) {
+            HelloBody body;
+            body.session = peer.session_id;
+            std::memcpy(body.nonce, peer.client_nonce, kHandshakeNonceBytes);
+            body.timestamp_ms = WallClockMs();
+            std::uint8_t raw[kHelloBodyBytes];
+            if (!EncodeHelloBody(body, raw, sizeof(raw)) ||
+                !SealHandshakeFrame(peer.psk, SecureDirection::kClientToServer,
+                                    static_cast<std::uint8_t>(FrameType::kHello),
+                                    peer.session_id, peer.conn_id, peer.handshake_tx_seq, raw,
+                                    sizeof(raw), &peer.cached_hello)) {
+                ++m_stats.send_errors;
+                EmitLog(LogLevel::kError, LogEvent::kSendError, peer.peer_id,
+                        "seal secure hello failed", 0);
+                return;
+            }
+        }
+        (void)SendRawPacket(peer, peer.cached_hello.data(), peer.cached_hello.size());
+    } else {
+        std::uint8_t payload[kHelloPayloadBytes];
+        MakeHelloPayload(peer.session_id, peer.conn_id, payload);
+        FrameHeader header;
+        header.type = FrameType::kHello;
+        header.channel = 0;
+        header.conn_id = peer.conn_id;
+        header.seq = peer.session_id;
+        (void)SendControl(peer, header, payload, sizeof(payload));
+    }
     const std::uint64_t now = NowMs();
     peer.next_hello_ms = now + peer.hello_pto_ms;
     peer.hello_pto_ms = std::min(peer.hello_pto_ms * 2, m_config.hello_max_pto_ms);
@@ -406,6 +527,13 @@ void PeerHub::StartHandshake(Peer& peer) {
         peer.conn_id = RandomNonZeroU32();
     }
     m_by_conn_id[peer.conn_id] = peer.peer_id;
+    ResetSecureSession(peer);
+    if (peer.secure_enabled) {
+        // 每次连接（含重连）都用新 client nonce：旧 HELLO 的重放不会
+        // 被当作当前会话，AEAD nonce 也不会跨会话复用。
+        SecureRandomBytes(peer.client_nonce, kHandshakeNonceBytes);
+        peer.handshake_tx_seq = RandomNonZeroU32();
+    }
     SendHello(peer);
 }
 
@@ -527,6 +655,8 @@ std::vector<PeerInfo> PeerHub::Peers() const {
         info.port = PortOf(peer.addr);
         info.conn_id = peer.conn_id;
         info.outgoing = peer.outgoing;
+        info.secure = peer.secure_enabled;
+        info.secure_ready = peer.session_keys_ready;
         info.hello_attempts = peer.hello_attempts;
         info.frames_received = peer.frames_received;
         info.frames_sent = peer.frames_sent;
@@ -557,6 +687,96 @@ PeerHubStats PeerHub::stats() const {
         }
     }
     return snapshot;
+}
+
+bool PeerHub::SetPreSharedKey(const std::uint8_t* key, std::size_t bytes) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (key == nullptr || bytes != kPskBytes) {
+        return false;
+    }
+    std::memcpy(m_psk, key, kPskBytes);
+    m_secure_enabled = true;
+    for (auto& entry : m_peers) {
+        Peer& peer = *entry.second;
+        if (peer.state == PeerState::kConnected) {
+            // 已建立的会话（明文或加密）不能热换模式：热换会让在途帧
+            // 无法解密、或被对端按明文拒绝。需要 RemovePeer/Connect 重建。
+            continue;
+        }
+        std::memcpy(peer.psk, m_psk, kPskBytes);
+        peer.secure_enabled = true;
+        ResetSecureSession(peer);
+        if (peer.outgoing && peer.state != PeerState::kConnected) {
+            StartHandshake(peer);
+        }
+    }
+    return true;
+}
+
+bool PeerHub::SetPeerPreSharedKey(std::uint32_t peer_id, const std::uint8_t* key,
+                                  std::size_t bytes) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (key == nullptr || bytes != kPskBytes) {
+        return false;
+    }
+    const auto found = m_peers.find(peer_id);
+    if (found == m_peers.end()) {
+        return false;
+    }
+    Peer& peer = *found->second;
+    if (peer.session_keys_ready || peer.state == PeerState::kConnected) {
+        return false;
+    }
+    std::memcpy(peer.psk, key, kPskBytes);
+    peer.secure_enabled = true;
+    ResetSecureSession(peer);
+    if (peer.outgoing) {
+        StartHandshake(peer);
+    }
+    return true;
+}
+
+bool PeerHub::peer_secure(std::uint32_t peer_id) const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    const auto found = m_peers.find(peer_id);
+    return found != m_peers.end() && found->second->secure_enabled;
+}
+
+bool PeerHub::peer_secure_ready(std::uint32_t peer_id) const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    const auto found = m_peers.find(peer_id);
+    return found != m_peers.end() && found->second->session_keys_ready;
+}
+
+PeerSecureStats PeerHub::secure_stats() const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return m_secure_stats;
+}
+
+void PeerHub::SetLogHook(LogHook* hook) noexcept {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_log_hook = hook;
+}
+
+LogHook* PeerHub::log_hook() const noexcept {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return m_log_hook;
+}
+
+void PeerHub::EmitLog(LogLevel level, LogEvent event, std::uint32_t peer_id,
+                      const char* message, std::uint64_t value) {
+    if (m_log_hook != nullptr) {
+        m_log_hook->Emit(level, event, peer_id, message, value);
+    }
+}
+
+bool PeerHub::TimestampAcceptable(std::uint64_t timestamp_ms) const noexcept {
+    if (m_config.handshake_replay_window_ms == 0) {
+        return true;
+    }
+    const std::uint64_t now = WallClockMs();
+    const std::uint64_t delta = now >= timestamp_ms ? now - timestamp_ms : timestamp_ms - now;
+    return delta <= static_cast<std::uint64_t>(m_config.handshake_replay_window_ms);
 }
 
 ReliableChannel::Stats PeerHub::reliable_stats(std::uint32_t peer_id,
@@ -809,6 +1029,11 @@ void PeerHub::MarkConnected(Peer& peer) {
     peer.next_ack_ms = now + m_config.ack_interval_ms;
     peer.next_heartbeat_ms = now + m_config.heartbeat_interval_ms;
     ++m_stats.handshakes;
+    if (peer.secure_enabled) {
+        ++m_secure_stats.handshakes;
+    }
+    EmitLog(LogLevel::kInfo, LogEvent::kPeerConnected, peer.peer_id,
+            peer.secure_enabled ? "peer connected (psk)" : "peer connected", 0);
     if (on_peer_connected) {
         on_peer_connected(peer.peer_id);
     }
@@ -821,6 +1046,11 @@ void PeerHub::DropPeer(Peer& peer, const char* reason) {
     peer.state = PeerState::kTimedOut;
     ++m_stats.timeouts;
     ResetChannels(peer);
+    ResetSecureSession(peer);
+    const bool timeout = reason != nullptr && std::strcmp(reason, "peer timeout") == 0;
+    EmitLog(LogLevel::kWarn,
+            timeout ? LogEvent::kPeerTimeout : LogEvent::kPeerDisconnected, peer.peer_id,
+            reason != nullptr ? reason : "dropped", 0);
     if (on_peer_disconnected) {
         on_peer_disconnected(peer.peer_id, reason);
     }
@@ -888,27 +1118,81 @@ void PeerHub::DispatchFrame(Peer& peer, const FrameView& view) {
 
 void PeerHub::HandlePacket(const std::uint8_t* data, std::size_t bytes,
                            const sockaddr_storage& from, socklen_t from_len) {
-    FrameHeader header;
-    if (!DecodeHeader(data, bytes, &header)) {
+    FrameHeader outer;
+    if (!DecodeHeader(data, bytes, &outer)) {
         ++m_stats.invalid_frames;
+        EmitLog(LogLevel::kWarn, LogEvent::kFrameRejected, 0, "invalid frame header", bytes);
         return;
     }
-    if (header.type == FrameType::kHello || header.type == FrameType::kHelloAck) {
-        FrameView view;
-        if (!ParseFrame(data, bytes, &view)) {
-            ++m_stats.invalid_frames;
-            return;
-        }
-        if (view.header.type == FrameType::kHello) {
-            HandleHello(view, from, from_len);
-        } else {
-            HandleHelloAck(view, from);
-        }
+    if (outer.type == FrameType::kHello) {
+        HandleHelloPacket(data, bytes, outer, from, from_len);
         return;
     }
-    Peer* peer = FindByConnId(header.conn_id);
+    if (outer.type == FrameType::kHelloAck) {
+        HandleHelloAckPacket(data, bytes, outer, from);
+        return;
+    }
+    Peer* peer = FindByConnId(outer.conn_id);
     if (peer == nullptr || peer->state != PeerState::kConnected) {
         ++m_stats.unknown_peer_frames;
+        return;
+    }
+    if (peer->secure_enabled) {
+        if (!peer->session_keys_ready) {
+            ++m_secure_stats.plaintext_rejected;
+            return;
+        }
+        if ((outer.flags & kFlagEncrypted) == 0) {
+            // 加密 peer 只接受加密数据帧：明文注入直接拒绝（降级攻击）。
+            ++m_secure_stats.plaintext_rejected;
+            EmitLog(LogLevel::kWarn, LogEvent::kPlaintextRejected, peer->peer_id,
+                    "plaintext data frame on secure peer", bytes);
+            return;
+        }
+        std::vector<std::uint8_t> inner;
+        OpenStatus status = OpenStatus::kMalformed;
+        if (!OpenFrame(peer->rx_key, peer->rx_direction, &peer->data_rx_window, data, bytes,
+                       &inner, &status)) {
+            switch (status) {
+                case OpenStatus::kReplay:
+                    ++m_secure_stats.replay_drops;
+                    EmitLog(LogLevel::kWarn, LogEvent::kReplayDrop, peer->peer_id,
+                            "secure frame replay", bytes);
+                    break;
+                case OpenStatus::kAuthFailed:
+                    ++m_secure_stats.auth_failures;
+                    EmitLog(LogLevel::kWarn, LogEvent::kAuthFailure, peer->peer_id,
+                            "secure frame auth failed", bytes);
+                    break;
+                default:
+                    ++m_secure_stats.malformed_frames;
+                    break;
+            }
+            return;
+        }
+        ++m_secure_stats.packets_opened;
+        m_secure_stats.encrypted_bytes_received += static_cast<std::uint64_t>(bytes);
+        FrameView view;
+        if (!ParseFrame(inner.data(), inner.size(), &view)) {
+            ++m_secure_stats.malformed_frames;
+            return;
+        }
+        // 只有通过 AEAD 认证的帧才允许更新地址（防注入迁移）。
+        if (!UdpSocket::SamePeer(from, peer->addr)) {
+            peer->addr = from;
+            peer->addr_len = from_len;
+        }
+        peer->last_rx_ms = NowMs();
+        ++peer->frames_received;
+        peer->bytes_received += static_cast<std::uint64_t>(bytes);
+        DispatchFrame(*peer, view);
+        return;
+    }
+    if ((outer.flags & kFlagEncrypted) != 0) {
+        // 明文 peer 收到加密帧：对端配置不一致（或注入），无法处理。
+        ++m_stats.invalid_frames;
+        EmitLog(LogLevel::kWarn, LogEvent::kFrameRejected, peer->peer_id,
+                "encrypted frame on plaintext peer", bytes);
         return;
     }
     FrameView view;
@@ -925,6 +1209,281 @@ void PeerHub::HandlePacket(const std::uint8_t* data, std::size_t bytes,
     ++peer->frames_received;
     peer->bytes_received += static_cast<std::uint64_t>(bytes);
     DispatchFrame(*peer, view);
+}
+
+void PeerHub::HandleHelloPacket(const std::uint8_t* data, std::size_t bytes,
+                                const FrameHeader& outer, const sockaddr_storage& from,
+                                socklen_t from_len) {
+    if ((outer.flags & kFlagEncrypted) != 0) {
+        if (!m_secure_enabled) {
+            // 对端要求加密但本端没有 PSK：无法认证，按非法帧计数。
+            ++m_stats.invalid_frames;
+            EmitLog(LogLevel::kWarn, LogEvent::kAuthFailure, 0,
+                    "secure hello without local psk", bytes);
+            return;
+        }
+        HandleSecureHello(data, bytes, outer, from, from_len);
+        return;
+    }
+    if (m_secure_enabled) {
+        // 加密模式下的明文 HELLO 是降级尝试：不创建 peer、不回 ACK。
+        ++m_secure_stats.plaintext_rejected;
+        EmitLog(LogLevel::kWarn, LogEvent::kPlaintextRejected, 0,
+                "plaintext hello rejected in secure mode", bytes);
+        return;
+    }
+    FrameView view;
+    if (!ParseFrame(data, bytes, &view) || view.header.type != FrameType::kHello) {
+        ++m_stats.invalid_frames;
+        return;
+    }
+    HandleHello(view, from, from_len);
+}
+
+void PeerHub::HandleHelloAckPacket(const std::uint8_t* data, std::size_t bytes,
+                                   const FrameHeader& outer, const sockaddr_storage& from) {
+    if ((outer.flags & kFlagEncrypted) != 0) {
+        // 加密 ACK 按 peer 自己的 PSK 处理，而不是 Hub 默认 PSK：
+        // per-peer SetPeerPreSharedKey 场景下 Hub 本身可以没有默认 PSK。
+        // conn_id 找不到时继续交给 HandleSecureHelloAck：服务端可能因
+        // conn_id 冲突改过 id，内部会按地址回退，并用 AEAD 认证兜底。
+        Peer* peer = FindByConnId(outer.conn_id);
+        if (peer != nullptr && !peer->secure_enabled) {
+            ++m_stats.invalid_frames;
+            return;
+        }
+        HandleSecureHelloAck(data, bytes, outer, from);
+        return;
+    }
+    Peer* peer = FindByConnId(outer.conn_id);
+    if (peer != nullptr && peer->secure_enabled) {
+        // 加密 peer 的明文 HELLO_ACK：拒绝，避免降级到无认证会话。
+        ++m_secure_stats.plaintext_rejected;
+        EmitLog(LogLevel::kWarn, LogEvent::kPlaintextRejected, peer->peer_id,
+                "plaintext hello_ack rejected", bytes);
+        return;
+    }
+    FrameView view;
+    if (!ParseFrame(data, bytes, &view) || view.header.type != FrameType::kHelloAck) {
+        ++m_stats.invalid_frames;
+        return;
+    }
+    HandleHelloAck(view, from);
+}
+
+void PeerHub::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
+                                const FrameHeader& outer, const sockaddr_storage& from,
+                                socklen_t from_len) {
+    std::uint8_t inner_type = 0;
+    std::uint32_t session = 0;
+    std::uint32_t handshake_conn_id = 0;
+    std::vector<std::uint8_t> body;
+    OpenStatus status = OpenStatus::kMalformed;
+    if (!OpenHandshakeFrame(m_psk, SecureDirection::kClientToServer, data, bytes, &inner_type,
+                            &session, &handshake_conn_id, &body, &status)) {
+        if (status == OpenStatus::kAuthFailed) {
+            ++m_secure_stats.auth_failures;
+            EmitLog(LogLevel::kWarn, LogEvent::kAuthFailure, 0,
+                    "secure hello auth failed (wrong psk?)", bytes);
+        } else {
+            ++m_secure_stats.malformed_frames;
+        }
+        return;
+    }
+    if (inner_type != static_cast<std::uint8_t>(FrameType::kHello)) {
+        ++m_secure_stats.malformed_frames;
+        return;
+    }
+    HelloBody hello;
+    if (!DecodeHelloBody(body.data(), body.size(), &hello) || hello.session != session) {
+        ++m_secure_stats.auth_failures;
+        return;
+    }
+    if (!TimestampAcceptable(hello.timestamp_ms)) {
+        ++m_secure_stats.replay_drops;
+        return;
+    }
+    Peer* peer = FindByAddress(from, from_len);
+    if (peer != nullptr && peer->secure_enabled && peer->session_keys_ready &&
+        hello.session == peer->session_id &&
+        std::memcmp(hello.nonce, peer->client_nonce, kHandshakeNonceBytes) == 0) {
+        // HELLO_ACK 丢失后的幂等重传：重发缓存 ACK，不重置会话。
+        ++m_secure_stats.handshake_retries;
+        peer->last_rx_ms = NowMs();
+        if (!peer->cached_hello_ack.empty()) {
+            (void)SendRawPacket(*peer, peer->cached_hello_ack.data(),
+                                peer->cached_hello_ack.size());
+        }
+        if (peer->state != PeerState::kConnected) {
+            MarkConnected(*peer);
+        }
+        return;
+    }
+    if (peer == nullptr) {
+        if (!m_config.accept_unknown_peers) {
+            ++m_stats.unknown_peer_frames;
+            return;
+        }
+        if (m_peers.size() >= m_config.max_peers) {
+            ++m_stats.peers_rejected;
+            EmitLog(LogLevel::kWarn, LogEvent::kHandshakeFailed, 0,
+                    "secure hello rejected: max peers", bytes);
+            return;
+        }
+        peer = CreatePeer(AllocatePeerId(), from, from_len);
+        peer->outgoing = false;
+        peer->session_id = session;
+        peer->conn_id = 0;
+    } else if (peer->session_id != session) {
+        // 同一地址的新会话（对端重启）：旧通道与旧密钥整体作废。
+        if (peer->conn_id != 0) {
+            m_by_conn_id.erase(peer->conn_id);
+        }
+        ResetChannels(*peer);
+        ResetSecureSession(*peer);
+        peer->session_id = session;
+        peer->conn_id = 0;
+    }
+    if (peer->conn_id == 0) {
+        std::uint32_t chosen = handshake_conn_id != 0 ? handshake_conn_id : outer.conn_id;
+        if (chosen == 0 || m_by_conn_id.find(chosen) != m_by_conn_id.end()) {
+            if (chosen != 0) {
+                ++m_stats.conn_id_conflicts;
+            }
+            chosen = RandomNonZeroU32();
+            for (int attempt = 0;
+                 attempt < 8 && m_by_conn_id.find(chosen) != m_by_conn_id.end(); ++attempt) {
+                chosen = RandomNonZeroU32();
+            }
+        }
+        peer->conn_id = chosen;
+        m_by_conn_id[chosen] = peer->peer_id;
+    }
+    // 新会话：安装加密状态并派生会话密钥（每 peer 独立 nonce -> 独立密钥）。
+    peer->secure_enabled = true;
+    std::memcpy(peer->psk, m_psk, kPskBytes);
+    std::memcpy(peer->client_nonce, hello.nonce, kHandshakeNonceBytes);
+    SecureRandomBytes(peer->server_nonce, kHandshakeNonceBytes);
+    peer->tx_direction = SecureDirection::kServerToClient;
+    peer->rx_direction = SecureDirection::kClientToServer;
+    DeriveSessionKey(peer->psk, peer->client_nonce, peer->server_nonce, peer->rx_direction,
+                     peer->rx_key);
+    DeriveSessionKey(peer->psk, peer->client_nonce, peer->server_nonce, peer->tx_direction,
+                     peer->tx_key);
+    peer->session_keys_ready = true;
+    peer->tx_wire_seq = 0;
+    peer->handshake_rx_window.Reset();
+    peer->data_rx_window.Reset();
+    peer->handshake_tx_seq = RandomNonZeroU32();
+    peer->cached_hello_ack.clear();
+    peer->last_rx_ms = NowMs();
+    SendSecureHelloAck(*peer);
+    if (peer->state != PeerState::kConnected) {
+        MarkConnected(*peer);
+    }
+}
+
+void PeerHub::SendSecureHelloAck(Peer& peer) {
+    if (peer.cached_hello_ack.empty()) {
+        HelloAckBody body;
+        body.session = peer.session_id;
+        std::memcpy(body.client_nonce, peer.client_nonce, kHandshakeNonceBytes);
+        std::memcpy(body.server_nonce, peer.server_nonce, kHandshakeNonceBytes);
+        body.timestamp_ms = WallClockMs();
+        std::uint8_t raw[kHelloAckBodyBytes];
+        if (!EncodeHelloAckBody(body, raw, sizeof(raw)) ||
+            !SealHandshakeFrame(peer.psk, SecureDirection::kServerToClient,
+                                static_cast<std::uint8_t>(FrameType::kHelloAck),
+                                peer.session_id, peer.conn_id, peer.handshake_tx_seq, raw,
+                                sizeof(raw), &peer.cached_hello_ack)) {
+            ++m_stats.send_errors;
+            EmitLog(LogLevel::kError, LogEvent::kSendError, peer.peer_id,
+                    "seal secure hello_ack failed", 0);
+            return;
+        }
+    }
+    (void)SendRawPacket(peer, peer.cached_hello_ack.data(), peer.cached_hello_ack.size());
+}
+
+void PeerHub::HandleSecureHelloAck(const std::uint8_t* data, std::size_t bytes,
+                                   const FrameHeader& outer, const sockaddr_storage& from) {
+    Peer* peer = FindByConnId(outer.conn_id);
+    if (peer == nullptr) {
+        // 监听端可能因冲突改过 conn_id：按地址回退，ACK 本身有 AEAD 认证。
+        peer = FindByAddress(from, sizeof(sockaddr_storage));
+        if (peer == nullptr || !peer->outgoing || !peer->secure_enabled) {
+            ++m_stats.unknown_peer_frames;
+            return;
+        }
+        if (outer.conn_id != 0 && outer.conn_id != peer->conn_id) {
+            m_by_conn_id.erase(peer->conn_id);
+            peer->conn_id = outer.conn_id;
+            m_by_conn_id[peer->conn_id] = peer->peer_id;
+        }
+    }
+    if (!peer->outgoing || !peer->secure_enabled) {
+        ++m_stats.invalid_frames;
+        return;
+    }
+    std::uint8_t inner_type = 0;
+    std::uint32_t session = 0;
+    std::uint32_t handshake_conn_id = 0;
+    std::vector<std::uint8_t> body;
+    OpenStatus status = OpenStatus::kMalformed;
+    if (!OpenHandshakeFrame(peer->psk, SecureDirection::kServerToClient, data, bytes,
+                            &inner_type, &session, &handshake_conn_id, &body, &status)) {
+        if (status == OpenStatus::kAuthFailed) {
+            ++m_secure_stats.auth_failures;
+            EmitLog(LogLevel::kWarn, LogEvent::kAuthFailure, peer->peer_id,
+                    "secure hello_ack auth failed (wrong psk?)", bytes);
+        } else {
+            ++m_secure_stats.malformed_frames;
+        }
+        return;
+    }
+    if (inner_type != static_cast<std::uint8_t>(FrameType::kHelloAck)) {
+        ++m_secure_stats.malformed_frames;
+        return;
+    }
+    HelloAckBody ack;
+    if (!DecodeHelloAckBody(body.data(), body.size(), &ack) ||
+        ack.session != peer->session_id ||
+        std::memcmp(ack.client_nonce, peer->client_nonce, kHandshakeNonceBytes) != 0) {
+        ++m_secure_stats.auth_failures;
+        return;
+    }
+    if (!TimestampAcceptable(ack.timestamp_ms)) {
+        ++m_secure_stats.replay_drops;
+        return;
+    }
+    if (!peer->handshake_rx_window.WouldAccept(outer.seq)) {
+        ++m_secure_stats.replay_drops;
+        return;
+    }
+    peer->handshake_rx_window.Accept(outer.seq);
+    if (handshake_conn_id != 0 && handshake_conn_id != peer->conn_id) {
+        m_by_conn_id.erase(peer->conn_id);
+        peer->conn_id = handshake_conn_id;
+        m_by_conn_id[peer->conn_id] = peer->peer_id;
+    }
+    std::memcpy(peer->server_nonce, ack.server_nonce, kHandshakeNonceBytes);
+    peer->tx_direction = SecureDirection::kClientToServer;
+    peer->rx_direction = SecureDirection::kServerToClient;
+    DeriveSessionKey(peer->psk, peer->client_nonce, peer->server_nonce, peer->tx_direction,
+                     peer->tx_key);
+    DeriveSessionKey(peer->psk, peer->client_nonce, peer->server_nonce, peer->rx_direction,
+                     peer->rx_key);
+    peer->session_keys_ready = true;
+    peer->tx_wire_seq = 0;
+    peer->data_rx_window.Reset();
+    if (!UdpSocket::SamePeer(from, peer->addr)) {
+        peer->addr = from;
+        peer->addr_len = sizeof(sockaddr_storage);
+    }
+    peer->last_rx_ms = NowMs();
+    if (peer->state != PeerState::kConnected) {
+        MarkConnected(*peer);
+    }
 }
 
 void PeerHub::Tick(std::uint64_t now_ms) {
@@ -963,6 +1522,28 @@ void PeerHub::Tick(std::uint64_t now_ms) {
                 SendMaxDataFrame(peer, channel.first, limit)) {
                 channel.second->OnMaxDataSent(limit, now_ms);
             }
+            if (m_log_hook != nullptr) {
+                // 可靠层不直接依赖 LogHook：这里按统计增量转成事件，
+                // 每 tick 每通道最多两条，避免逐包回调拖慢热路径。
+                const ReliableChannel::Stats channel_stats = channel.second->stats();
+                std::uint64_t& last_retransmit = peer.log_retransmits[channel.first];
+                if (channel_stats.retransmits > last_retransmit) {
+                    EmitLog(LogLevel::kDebug, LogEvent::kRetransmit, peer.peer_id,
+                            "reliable retransmit",
+                            channel_stats.retransmits - last_retransmit);
+                    last_retransmit = channel_stats.retransmits;
+                }
+                // 丢包 = 快速重传降窗（loss_events）或 PTO 超时降窗
+                // （timeout_loss_events）；两者都会触发重传。
+                const std::uint64_t lost =
+                    channel_stats.loss_events + channel_stats.timeout_loss_events;
+                std::uint64_t& last_loss = peer.log_loss_events[channel.first];
+                if (lost > last_loss) {
+                    EmitLog(LogLevel::kWarn, LogEvent::kPacketLost, peer.peer_id,
+                            "reliable packet loss", lost - last_loss);
+                    last_loss = lost;
+                }
+            }
         }
         if (now_ms >= peer.last_rx_ms && now_ms - peer.last_rx_ms > m_config.peer_timeout_ms) {
             DropPeer(peer, "peer timeout");
@@ -989,6 +1570,7 @@ int PeerHub::RunOnce(int timeout_ms) {
             }
             if (received < 0) {
                 ++m_stats.recv_errors;
+                EmitLog(LogLevel::kError, LogEvent::kRecvError, 0, "recvfrom failed", 0);
                 break;
             }
             ++m_stats.frames_received;

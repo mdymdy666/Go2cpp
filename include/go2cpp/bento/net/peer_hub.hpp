@@ -25,6 +25,19 @@
  *          线格式：完全复用 Bento v0.2（16B 帧头 + 可选 ACK + 载荷），
  *          HELLO/HELLO_ACK 载荷为 4B magic "BENT" + 4B session + 4B conn_id。
  *
+ *          **PSK 加密（P1 补）**：`SetPreSharedKey` / `SetPeerPreSharedKey`
+ *          复用 `crypto.hpp` 与 Link 的握手消息格式（HelloBody/HelloAckBody、
+ *          SealHandshakeFrame、DeriveSessionKey、SealFrame/OpenFrame）。每个
+ *          peer 有独立的 client/server nonce、方向密钥、wire seq 与 64 位
+ *          重放窗口——「每 peer 独立密钥」不是共享一个流。加密模式下：
+ *          - 监听端拒绝明文 HELLO（防降级），主动端拒绝明文 HELLO_ACK；
+ *          - 数据帧必须是 kFlagEncrypted，明文一律计入 plaintext_rejected；
+ *          - 只有 AEAD 验证通过才更新 peer 地址（防注入迁移）。
+ *
+ *          **日志钩子（P1 补）**：`SetLogHook` 注入 `LogHook`，PeerHub 在
+ *          连接/断开/超时、HELLO 重传、可靠层重传与丢包、认证失败、明文
+ *          拒绝、收发错误处发出结构化事件；未注入时零开销。
+ *
  * @author go2cpp contributors
  * @date 2026-10-27
  * @copyright MIT License
@@ -43,7 +56,9 @@
 #include <vector>
 
 #include "go2cpp/bento/net/channel.hpp"
+#include "go2cpp/bento/net/crypto.hpp"
 #include "go2cpp/bento/net/link.hpp"
+#include "go2cpp/bento/net/log_hook.hpp"
 #include "go2cpp/bento/net/protocol.hpp"
 #include "go2cpp/bento/net/relation.hpp"
 
@@ -82,6 +97,12 @@ struct PeerHubConfig {
     std::uint32_t random_seed = 0;
     /// STREAM 通道默认配置（与 Link 默认一致：动态 PTO/快速重传/分片/流控）。
     ReliableChannel::Config reliable;
+    /// PSK 认证加密：非空时必须 32B，启用后所有 peer 默认走加密握手。
+    std::vector<std::uint8_t> pre_shared_key;
+    /// 握手时间戳容忍窗口（毫秒）；0 = 不校验。依赖双方时钟大致同步。
+    std::uint32_t handshake_replay_window_ms = 30000;
+    /// 可选日志钩子（非拥有；生命周期由调用方保证）。
+    LogHook* log_hook = nullptr;
 };
 
 /// @brief 单个 peer 的观测信息快照。
@@ -92,6 +113,8 @@ struct PeerInfo {
     std::uint16_t port = 0;  ///< 远端端口（主机字节序）。
     std::uint32_t conn_id = 0;
     bool outgoing = false;   ///< true = 本端主动发起（AddPeer）的 peer。
+    bool secure = false;     ///< 该 peer 是否启用 PSK。
+    bool secure_ready = false;  ///< 会话密钥是否已就绪。
     std::uint32_t hello_attempts = 0;
     std::uint64_t frames_received = 0;
     std::uint64_t frames_sent = 0;
@@ -120,6 +143,20 @@ struct PeerHubStats {
     std::uint64_t send_errors = 0;
     std::uint64_t recv_errors = 0;
     std::uint64_t poll_errors = 0;
+};
+
+/// @brief PSK 认证加密的 Hub 级计数器（多 peer 聚合）。
+struct PeerSecureStats {
+    std::uint64_t packets_sealed = 0;   ///< 发出的加密帧数。
+    std::uint64_t packets_opened = 0;   ///< 成功解密的加密帧数。
+    std::uint64_t auth_failures = 0;    ///< AEAD 校验失败（错误 PSK/篡改）。
+    std::uint64_t replay_drops = 0;     ///< 重放窗口拒绝的包数。
+    std::uint64_t malformed_frames = 0; ///< 结构/长度非法的加密包。
+    std::uint64_t plaintext_rejected = 0;  ///< 加密 peer/会话收到的明文帧。
+    std::uint64_t handshakes = 0;       ///< 完成的加密握手数。
+    std::uint64_t handshake_retries = 0;   ///< 幂等重发的握手包数。
+    std::uint64_t encrypted_bytes_sent = 0;
+    std::uint64_t encrypted_bytes_received = 0;
 };
 
 /// @brief 多 peer UDP 链路：一个 socket 对 N 个对端，按 peer_id 路由。
@@ -179,6 +216,37 @@ class PeerHub final {
     /// @brief 向指定 peer 发送因果屏障。
     bool SendBarrier(std::uint32_t peer_id, std::uint32_t barrier_seq);
 
+    // ---- PSK 认证加密（P1，复用 crypto.hpp + Link 的握手消息格式） ----
+
+    /// @brief 设置 Hub 默认 PSK（32B），启用认证加密。
+    /// @details 对尚**未**建立会话密钥的 peer 立即生效（正在握手的主动
+    ///          peer 会用新密钥重启）；已连接的 peer 保持不变，避免在途帧
+    ///          无法解密。监听端只接受加密 HELLO。
+    /// @return 长度不是 32B 或 key 为空返回 false（保持原模式）。
+    bool SetPreSharedKey(const std::uint8_t* key, std::size_t bytes);
+
+    /// @brief 为单个 peer 覆盖 PSK（每 peer 独立密钥）。
+    /// @details 必须在会话密钥建立前调用；对主动 peer 会立即重启握手。
+    ///          用途：一个 Hub 同时连接多个不同 PSK 的服务端。
+    /// @return peer 不存在、长度非法、或该 peer 已建立加密会话返回 false。
+    bool SetPeerPreSharedKey(std::uint32_t peer_id, const std::uint8_t* key, std::size_t bytes);
+
+    /// @brief Hub 是否配置了默认 PSK。
+    bool secure() const noexcept {
+        return m_secure_enabled;
+    }
+    /// @brief 指定 peer 是否启用 PSK。
+    bool peer_secure(std::uint32_t peer_id) const;
+    /// @brief 指定 peer 的会话密钥是否就绪（加密握手完成）。
+    bool peer_secure_ready(std::uint32_t peer_id) const;
+    /// @brief 加密计数器快照（线程安全）。
+    PeerSecureStats secure_stats() const;
+
+    // ---- 日志钩子（P1） ----
+    /// @brief 注入日志钩子（传 nullptr 卸载）；不拥有 hook。
+    void SetLogHook(LogHook* hook) noexcept;
+    LogHook* log_hook() const noexcept;
+
     /// @brief 单个 peer 单个通道的可靠层统计（peer 不存在时返回默认值）。
     ReliableChannel::Stats reliable_stats(std::uint32_t peer_id, std::uint8_t channel) const;
     UnreliableChannel::Stats unreliable_stats(std::uint32_t peer_id, std::uint8_t channel) const;
@@ -217,23 +285,39 @@ class PeerHub final {
     std::uint32_t AllocatePeerId();
     Peer* CreatePeer(std::uint32_t peer_id, const sockaddr_storage& addr, socklen_t len);
     void ResetChannels(Peer& peer);
+    void ResetSecureSession(Peer& peer);
     ReliableChannel* GetOrCreateReliable(Peer& peer, std::uint8_t channel);
     UnreliableChannel* GetOrCreateUnreliable(Peer& peer, std::uint8_t channel);
     bool SendBuiltFrame(Peer& peer, const std::uint8_t* data, std::size_t bytes);
     bool SendControl(Peer& peer, const FrameHeader& header, const std::uint8_t* payload,
                      std::size_t bytes);
+    bool SendRawPacket(Peer& peer, const std::uint8_t* data, std::size_t bytes);
+    bool SendFrameBytes(Peer& peer, const std::uint8_t* data, std::size_t bytes);
+    bool SealAndSend(Peer& peer, const std::uint8_t* frame, std::size_t bytes);
     void SendHello(Peer& peer);
+    void SendSecureHelloAck(Peer& peer);
     bool SendAckFrame(Peer& peer, std::uint8_t channel, bool heartbeat);
     bool SendMaxDataFrame(Peer& peer, std::uint8_t channel, std::uint64_t limit);
     void HandlePacket(const std::uint8_t* data, std::size_t bytes, const sockaddr_storage& from,
                       socklen_t from_len);
+    void HandleHelloPacket(const std::uint8_t* data, std::size_t bytes, const FrameHeader& outer,
+                           const sockaddr_storage& from, socklen_t from_len);
+    void HandleHelloAckPacket(const std::uint8_t* data, std::size_t bytes,
+                              const FrameHeader& outer, const sockaddr_storage& from);
     void HandleHello(const FrameView& view, const sockaddr_storage& from, socklen_t from_len);
     void HandleHelloAck(const FrameView& view, const sockaddr_storage& from);
+    void HandleSecureHello(const std::uint8_t* data, std::size_t bytes, const FrameHeader& outer,
+                           const sockaddr_storage& from, socklen_t from_len);
+    void HandleSecureHelloAck(const std::uint8_t* data, std::size_t bytes,
+                              const FrameHeader& outer, const sockaddr_storage& from);
     void DispatchFrame(Peer& peer, const FrameView& view);
     void StartHandshake(Peer& peer);
     void MarkConnected(Peer& peer);
     void DropPeer(Peer& peer, const char* reason);
     void Tick(std::uint64_t now_ms);
+    bool TimestampAcceptable(std::uint64_t timestamp_ms) const noexcept;
+    void EmitLog(LogLevel level, LogEvent event, std::uint32_t peer_id, const char* message,
+                 std::uint64_t value = 0);
 
     PeerHubConfig m_config;
     UdpSocket m_socket;
@@ -243,6 +327,10 @@ class PeerHub final {
     std::uint32_t m_session_id = 0;
     PeerHubStats m_stats;
     std::vector<std::uint8_t> m_rx_buffer;
+    bool m_secure_enabled = false;
+    std::uint8_t m_psk[kPskBytes] = {};
+    PeerSecureStats m_secure_stats;
+    LogHook* m_log_hook = nullptr;
     /// 保护 peer 表、socket 发送与统计；recursive 以支持回调重入 Send*。
     mutable std::recursive_mutex m_mutex;
 };

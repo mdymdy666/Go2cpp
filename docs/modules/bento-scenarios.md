@@ -14,8 +14,10 @@
   | 状态 | 含义 |
   |---|---|
   | 已有 | 有可复用的实现，且有对应测试（`tests/bento/` 下能指到具体文件） |
+  | 已补 | 本轮 P1 新实现并有对应测试（前一次评估为「缺」、本批补齐的条目） |
   | 部分 | 底层构件存在，但缺少场景级能力（协议字段、路由、统计或测试之一） |
   | 缺 | 当前完全没有实现，属于明确的能力空白 |
+  | 不实现 | 评估后明确不做（部署形态/超出传输库职责），理由写在「缺口说明」，不是遗漏 |
   | 不适用 | 该需求绑定 Windows / RDP / 应用语义，不属于通用传输层职责，需由上层实现 |
 
 - **编号引用约定**：`FR/CON/NFR` 取自 RTM；`AX-xxx` 取自 anomalies；`RISK-xxx`
@@ -50,7 +52,7 @@
 | 3.1 | 一个监听端口同时服务 3 个主控 | FR-06、B2-2、AX-085、RISK-028 | **`peer_hub.hpp:PeerHub::AddPeer/RunOnce/SendStream(peer_id,…)`**（P0-1 新增） | 已有 | 本轮新增；`Link` 仍是单 peer，未改动（避免 2000+ 行回归） |
 | 3.2 | 多主控之间不串流、各自通道独立 | RISK-030、AX-085 | `PeerHub` 按 `conn_id` 路由 + 每 peer 独立 `Relation` 与通道表；`test_peer_hub` 场景 1 | 已有 | 测试断言 3×50 条 STREAM + 3×50 条 DATAGRAM 全部按 peer 隔离、零串台 |
 | 3.3 | 主控数量上限与拒绝策略 | AX-023、RISK-032 | `PeerHubConfig::max_peers`、`PeerHubStats::peers_rejected` | 已有 | 无「每 IP 连接数」限流 |
-| 3.4 | 看/控权限（同时可看、仅一人可控） | FR-03、FR-06、RISK-002、RISK-024 | 无 | 缺 | 属应用层仲裁；`PeerHub` 只提供 per-peer 消息通道与 peer 标识 |
+| 3.4 | 看/控权限（同时可看、仅一人可控） | FR-03、FR-06、RISK-002、RISK-024 | **`session_control.hpp:SessionControl`**（P1 新增：`ControlMode{kNone,kView,kInteract}`、`Grant/RequestControl/Revoke`）；`test_session_control` | 已补 | 通用仲裁器保证「多个 View + 最多一个 Interact」；RDP attendee 语义映射仍在上层，`PeerHub` 只提供通道 |
 | 3.5 | 多主控同时高帧率时的带宽公平 | RISK-031、AX-089 | 每 peer 独立 `CongestionController` | 部分 | 有 per-peer 拥塞控制，但没有跨 peer 的全局公平调度/配额 |
 | 3.6 | 主控断开后清理其会话资源 | AX-086、AX-093 | `PeerHub::DropPeer`（peer_timeout）+ `on_peer_disconnected` 回调 | 部分 | 回收动作（撤销控制权、释放邀请）需应用层实现 |
 
@@ -87,16 +89,16 @@
 
 | # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
 |---|---|---|---|---|---|
-| 7.1 | 多个主控竞争控制权，仅一人 INTERACTIVE | FR-03、FR-06、RISK-024、AX-036 | 无 | 缺 | 需应用层仲裁协议；`PeerHub` 只提供 per-peer 通道 |
-| 7.2 | 控制器断开后回收控制权 | RISK-025、AX-037 | `PeerHub` 的 `peer_timeout` + `on_peer_disconnected`；`Link` 的 `on_disconnected` | 部分 | 检测有了，回收动作与状态广播需应用层 |
-| 7.3 | 控制权变更广播给所有主控 | AX-095、AX-097 | `PeerHub` 可对每个 peer 单独 `SendStream`；无广播 API | 部分 | 需应用层遍历 `PeerIds()`；Bento 不内置广播语义 |
+| 7.1 | 多个主控竞争控制权，仅一人 INTERACTIVE | FR-03、FR-06、RISK-024、AX-036 | **`session_control.hpp:SessionControl`**：先到先得/可抢占、唯一控制器、`test_session_control` 场景 1/5 | 已补 | 16 线程并发请求只产生 1 个 Interact；策略可选；应用层只需把输入事件接到 `Renew` |
+| 7.2 | 控制器断开后回收控制权 | RISK-025、AX-037 | `SessionControl::Leave/OnPeerDisconnected`（P1）+ `PeerHub::on_peer_disconnected` 直接接入；`test_session_control` 场景 2 | 部分 | 回收动作已有现成 API；接线到 `on_peer_disconnected` 仍需应用一行回调（Bento 不内建 PeerHub ↔ 仲裁器绑定） |
+| 7.3 | 控制权变更广播给所有主控 | AX-095、AX-097 | `SessionControl::on_change` + `Snapshot().ToJson()`（P1）+ `PeerHub::PeerIds()` | 部分 | 变更事件与可序列化快照已提供；实际发送仍需应用遍历 `PeerIds()`（Bento 不内置广播语义） |
 | 7.4 | UIPI / 提权窗口输入拦截 | RISK-027、AX-071 | 无 | 不适用 | Windows 完整性级别机制，Linux 运行时不存在 |
 
 ## 8. 公网穿透（中转 / 无 P2P / 背压）
 
 | # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
 |---|---|---|---|---|---|
-| 8.1 | 跨网统一经中转，不做 P2P 直连 | CON-09、RISK-006 | 无 | 缺 | Bento 是 UDP 直连（需可达地址）；无公网中继/打洞 |
+| 8.1 | 跨网统一经中转，不做 P2P 直连 | CON-09、RISK-006 | 无（`TcpProxy` 只解决本地回环） | 不实现 | **不实现理由**：Bento 的定位是传输库，UDP 直连要求对端地址可达；公网中转是独立的服务部署形态（JinShan 侧由 Go 中转服务承担，见第 14 节），打洞/NAT 穿透涉及 STUN/TURN、鉴权与运维部署，超出本库职责。可复用的部分是 `TcpProxy`（本地回环转发）与 `PeerHub`（单端口多 peer） |
 | 8.2 | 本地中继：主控把远端地址改写成 127.0.0.1 | FR-04、AX-029 | `tcp_proxy.hpp:TcpProxy` | 部分 | 只解决「本地回环 → 远端」；公网中转需另外部署 |
 | 8.3 | 中转背压：慢客户端不拖垮服务 | RISK-004、AX-014 | `TcpProxy` 有界缓冲 + 背压 + 空闲超时 | 部分 | TCP 侧有；UDP 多 peer 侧无全局背压 |
 | 8.4 | 中转不可达 / 连接超时 | RISK-009、AX-017 | `TcpProxyConfig::connect_timeout_ms`、`stats.dial_failed`；`PeerHub` 握手超时 | 部分 | 重试与提示在调用方 |
@@ -110,7 +112,7 @@
 | 9.1 | 预共享密钥认证加密 | NFR-04、RISK-007 | `link.hpp:Link::SetPreSharedKey`、`crypto.hpp`（ChaCha20-Poly1305、`kPskBytes=32`）、`test_secure_link` | 已有 | 仅 `Link` 支持；`PeerHub` 未接 PSK |
 | 9.2 | 篡改 / 重放 / 明文注入必须被拒 | NFR-04、AX-008、RISK-007 | `crypto.hpp:ReplayWindow`、`OpenStatus`；`test_secure_injection` | 已有 | — |
 | 9.3 | 0-RTT 会话恢复（票据） | NFR-02、RISK-036 | `Link::ExportSessionTicket/Resume`、`test_zero_rtt` | 已有 | 仅 `Link`；票据不含密钥本身 |
-| 9.4 | 多 peer 下的加密与密钥隔离 | FR-06、NFR-04 | 无（`PeerHub` P0 只做明文） | 缺 | 明确记入 P1 缺口：每 peer 独立 PSK 会话 |
+| 9.4 | 多 peer 下的加密与密钥隔离 | FR-06、NFR-04 | **`PeerHub::SetPreSharedKey/SetPeerPreSharedKey`**（P1 复用 `crypto.hpp`）；每 peer 独立 nonce/方向密钥/wire seq/64 位重放窗口；`test_peer_hub_secure` 场景 1/4 | 已补 | 3 peer 加密并发收齐；per-peer 不同 PSK 连两个服务端；错误 PSK 5 次 AEAD 失败且无会话；明文 HELLO/数据帧均被拒 |
 | 9.5 | 错误密钥 / 同 key 双注册的处理 | AX-004、AX-005、RISK-011 | `Link` 的 `auth_failures`；`PeerHub` 无鉴权 | 部分 | 配对策略属应用层；传输层只能给认证失败计数 |
 
 ## 10. 迁移（NAT rebinding / 换网 / 重连）
@@ -142,7 +144,7 @@
 | 12.2 | 多 peer 统计与 per-peer 视角 | FR-06、AX-085 | `peer_hub.hpp:PeerHubStats/PeerInfo`、`reliable_stats(peer_id, channel)` | 已有 | — |
 | 12.3 | 代理层统计（accept/dial/idle/reset） | AX-014、AX-028 | `tcp_proxy.hpp:TcpProxyStats` | 已有 | — |
 | 12.4 | 结构化错误码（而非只有字符串） | NFR-03、AX-096 | 目前只有 `std::string* error` 与回调 `reason` 字符串 | 部分 | 无错误码枚举，调用方无法稳定分支 |
-| 12.5 | 统一日志接入 | RISK-076、AX-024 | 无 | 缺 | Bento 刻意不依赖 go2cpp `log`，目前无日志钩子 |
+| 12.5 | 统一日志接入 | RISK-076、AX-024 | **`log_hook.hpp:LogHook`**（P1）+ `PeerHub::SetLogHook`；`test_log_hook` | 已补 | 回调/级别/按级别与事件计数；连接、握手重传、可靠层重传、丢包、认证失败、超时、明文拒绝均已接入；未注入时零开销 |
 | 12.6 | 帧级非法/未知来源可观测 | AX-008、AX-012 | `LinkStats{invalid_frames, unknown_peer_frames}`、`PeerHubStats` 同名字段 | 已有 | — |
 
 ## 13. 录屏（会话录制 / AVI / 索引）
@@ -176,15 +178,17 @@
 
 | 优先级 | 缺口 | 影响场景 | 建议动作 |
 |---|---|---|---|
-| P0（本轮已补） | 单 peer 限制：一个 socket 无法服务多个主控 | 3.1–3.3 | 新增 `PeerHub`（多 peer 路由 + per-peer 通道），`test_peer_hub` 覆盖 3 peer 隔离 |
-| P0（本轮已补） | 无通用 TCP 回环代理 | 4.1–4.4、8.2 | 新增 `TcpProxy`（并发、半关闭、超时），`test_tcp_proxy` 覆盖 100KB/半关闭/并发 |
-| P1 | `PeerHub` 未接 PSK 加密与 0-RTT | 9.4 | 复用 `crypto.hpp`，每 peer 独立会话密钥 |
+| P0（已补） | 单 peer 限制：一个 socket 无法服务多个主控 | 3.1–3.3 | 新增 `PeerHub`（多 peer 路由 + per-peer 通道），`test_peer_hub` 覆盖 3 peer 隔离 |
+| P0（已补） | 无通用 TCP 回环代理 | 4.1–4.4、8.2 | 新增 `TcpProxy`（并发、半关闭、超时），`test_tcp_proxy` 覆盖 100KB/半关闭/并发 |
+| P1（本轮已补） | 控制权仲裁缺失（唯一控制器/回收/广播） | 3.4、7.1–7.3 | 新增 `SessionControl`；`test_session_control` 覆盖并发/断开/租约/抢占/随机压力 |
+| P1（本轮已补） | `PeerHub` 未接 PSK 加密 | 9.4、9.5 | `SetPreSharedKey/SetPeerPreSharedKey`，每 peer 独立 nonce/密钥/重放窗口 |
+| P1（本轮已补） | 无统一日志钩子 | 12.5 | 新增 `LogHook`，PeerHub 接入连接/重传/丢包/认证事件 |
+| P1 | `PeerHub` 未接 0-RTT 会话恢复 | 9.3 | 票据机制在 `Link` 上；peer 粒度的票据缓存需重新设计 |
 | P1 | `PeerHub` 未接视频通道与 FEC | 2.3、13.3 | 复用 `VideoChannel`，per-peer 重组状态 |
 | P1 | 多 peer 下地址迁移缺测试 | 10.3 | 增加 NAT rebinding 测试（按 conn_id 更新地址） |
 | P1 | 结构化错误码缺失 | 12.4 | 引入 `enum class BentoError`，与字符串并存 |
 | P2 | 带宽整形/乱序注入测试工具 | 1.3、1.5 | 扩展 `udp_proxy`：限速、乱序、抖动 |
 | P2 | 100MB 级大文件压测 | 6.1、6.4 | 应用层分块协议 + 端到端哈希 |
-| P2 | 统一日志钩子 | 12.5 | 可选 `std::function<void(level, msg)>` 注入点 |
 
 ---
 
@@ -195,8 +199,10 @@
 | 场景类别 | 13 类（弱网/混合可靠/多客户端/回环中继/侧信道/大文件/控制权/公网穿透/加密/迁移/差环境/可观测/录屏） |
 | 场景条目 | 66 条 |
 | 已有 | 30 条 |
+| 已补 | 4 条（3.4 看控权限、7.1 控制权仲裁、9.4 多 peer 加密、12.5 日志钩子） |
 | 部分 | 22 条 |
-| 缺 | 5 条 |
+| 缺 | 0 条 |
+| 不实现 | 1 条（8.1 公网中转；理由见该行与第 14 节） |
 | 不适用 | 9 条（另见第 14 节 9 项理由） |
 
 自检清单：
@@ -205,14 +211,14 @@
 - [x] 每行都引用了 JinShan 编号（FR/CON/NFR、AX-xxx 或 RISK-xxx）。
 - [x] 每行的 Go2Cpp 能力都指向真实文件与接口（`include/go2cpp/bento/net/**`、`tests/bento/**`）。
 - [x] 「不适用」项给出理由，而不是简单标成缺失。
-- [x] 缺口按 P0/P1/P2 分级，P0 两项已在本次改动中补齐并有测试。
-- [x] 统计数字与表格行数一致：场景行 66 = 已有 30 + 部分 22 + 缺 5 + 不适用 9，
+- [x] 缺口按 P0/P1/P2 分级；P0 两项与 P1 三项均已在代码中补齐并有测试，8.1 明确标「不实现」并给理由。
+- [x] 统计数字与表格行数一致：场景行 66 = 已有 30 + 已补 4 + 部分 22 + 缺 0 + 不实现 1 + 不适用 9，
       可用以下命令复核：
 
   ```bash
   grep -cE '^\| [0-9]+\.[0-9]+ \|' docs/modules/bento-scenarios.md
   grep -E '^\| [0-9]+\.[0-9]+ \|' docs/modules/bento-scenarios.md \
-    | grep -oE '\| (已有|部分|缺|不适用) \|' | sort | uniq -c
+    | grep -oE '\| (已有|已补|部分|缺|不实现|不适用) \|' | sort | uniq -c
   ```
 
 ---
@@ -222,6 +228,7 @@
 | 日期 | 版本 | 变更 |
 |---|---|---|
 | 2026-10-27 | v1.0 | 首次建立：从 RTM/anomalies/risk-register 抽取 13 类 66 条场景，映射到 Bento 现有能力；记录 P0 两项缺口（多 peer、TCP 回环代理）的补法 |
+| 2026-10-27 | v1.1 | P1 落地：控制权仲裁（`SessionControl`）、多 peer 加密（`PeerHub` PSK）、日志钩子（`LogHook`）补齐；3.4/7.1/9.4/12.5 标「已补」，8.1 标「不实现」并给理由；新增 3 个测试目标，ctest 26/26（netem 无权限 SKIP） |
 
 ---
 
@@ -274,3 +281,60 @@
 - 多 peer 下地址迁移已有实现（按 `conn_id` 更新地址）但缺专项测试。
 - `TcpProxy` 是单线程 poll 模型，连接上限默认 64，定位是工具/本地中继。
 - 仓库无 `.clang-format`，新增文件沿用既有 4 空格/100 列风格，未跑格式化。
+
+---
+
+## 19. P1 落地记录（2026-10-27）
+
+> 本节记录 P1 三项缺口的落地：控制权仲裁、多 peer 加密、日志钩子。改动只落在
+> `include/go2cpp/bento/net/**`、`src/bento/net/**`、`tests/bento/**`、
+> `cmake/Go2CppBento.cmake`、`docs/modules/bento-scenarios.md`；不改 base、不提交。
+
+### 19.1 新增
+
+| 文件 | 作用 |
+|---|---|
+| `include/go2cpp/bento/net/session_control.hpp` + `src/bento/net/session_control.cpp` | 通用控制权仲裁：View/Interact、唯一控制器、先到先得/抢占、租约与断开回收、变更回调与 JSON 快照 |
+| `include/go2cpp/bento/net/log_hook.hpp` | 轻量日志钩子：级别过滤、结构化事件、按级别/事件计数、线程安全 Emit（sink 在锁外调用） |
+| `tests/bento/test_session_control.cpp` | 16 线程并发请求、断开回收、Revoke 禁入、租约过期、抢占、回调/快照、4000 步随机不变式 |
+| `tests/bento/test_peer_hub_secure.cpp` | 3 peer 加密、错误 PSK、明文拒绝、per-peer 不同 PSK、PTO 重传恢复、参数校验 |
+| `tests/bento/test_log_hook.cpp` | 级别/计数/Reset、并发 4000 条、PeerHub 连接/握手重传/重传丢包/超时/认证失败事件 |
+
+### 19.2 修改
+
+| 文件 | 改动 | 理由 |
+|---|---|---|
+| `include/go2cpp/bento/net/peer_hub.hpp` | 新增 `PeerHubConfig{pre_shared_key, handshake_replay_window_ms, log_hook}`、`PeerSecureStats`、PSK/日志 API 与 per-peer 加密状态 | 复用 `crypto.hpp` 与 Link 的握手消息格式（HelloBody/HelloAckBody/SealHandshakeFrame/SealFrame） |
+| `src/bento/net/peer_hub.cpp` | 加密 HELLO/HELLO_ACK、数据帧 Seal/Open、明文与重放拒绝、per-peer 密钥、日志事件 | 每 peer 独立 nonce/方向密钥/wire seq/64 位重放窗口；只有 AEAD 通过才更新地址 |
+| `cmake/Go2CppBento.cmake` | 新增 `session_control.cpp` 与 3 个测试目标、ctest 注册与 TIMEOUT | 让新组件进入既有构建与测试入口 |
+
+### 19.3 验证结果
+
+| 项 | 结果 |
+|---|---|
+| 编译 | 全量构建成功；`-Werror` 下 0 警告 |
+| `bento_test_session_control` | PASS，14,816 断言；16 线程并发请求仅 1 个 Interact；4000 步随机操作不变式成立 |
+| `bento_test_peer_hub_secure` | PASS，506 断言；3 peer 加密 90 STREAM + 60 DATAGRAM 全隔离；错误 PSK 5 次 AEAD 失败且无会话；明文拒绝；per-peer 双 PSK 各 10/10；PTO 重传 32 次后 200 条按序恢复 |
+| `bento_test_log_hook` | PASS，124 断言；8 线程 × 500 条并发计数一致；连接/握手重传/重传/丢包/超时/认证失败事件均命中 |
+| ctest（Bento） | 26/26 通过（原 23 + 新增 3；bento_netem 因无 CAP_NET_ADMIN 按设计 SKIP） |
+| 稳定性 | 三个新测试连续运行 3 次全部 PASS |
+
+### 19.4 实现中发现的坑（已修复）
+
+1. **per-peer 加密 ACK 被 Hub 默认 PSK 判断挡住**：`HandleHelloAckPacket` 最初用
+   `m_secure_enabled` 决定是否处理加密 ACK；`SetPeerPreSharedKey` 场景下 Hub 本身没有
+   默认 PSK，ACK 被当非法帧丢弃 → 服务端已完成握手、客户端永远停在 kConnecting。
+   修复：加密 ACK 改按 `peer->secure_enabled` 分派。
+2. **PTO 丢包不计入 `loss_events`**：`CongestionController::OnTimeout` 只增加
+   `timeout_events`，日志钩子最初只比较 `loss_events`，PTO 场景没有丢包事件。
+   修复：丢包事件按 `loss_events + timeout_loss_events` 的增量计。
+
+### 19.5 已知限制
+
+- `SessionControl` 与 `PeerHub` 不内建绑定：断开回收与广播发送需应用分别接
+  `on_peer_disconnected` 与遍历 `PeerIds()`（避免状态机依赖 socket）。
+- 监听端的 per-peer PSK 只能继承 Hub 默认 PSK（未知来源在收到 HELLO 前无法确定 PSK）；
+  `SetPeerPreSharedKey` 的差异化密钥用于主动端。
+- `PeerHub` 仍未接 0-RTT、VIDEO/FEC、PMTUD；这些仍在 `Link` 上（见 18.5）。
+- 日志事件按每 tick 的统计增量聚合，不逐包回调；极端高重传速率下事件是「批」而不是「逐帧」。
+- 3.4 的「看控权限」只提供通用 View/Interact 原语，RDP attendee 语义映射仍由应用完成。

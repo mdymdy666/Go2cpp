@@ -38,6 +38,7 @@ if (GO2CPP_WITH_BENTO)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/channel.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/link.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/peer_hub.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/session_control.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/tcp_proxy.cpp)
 
     target_include_directories(go2cpp_bento
@@ -98,6 +99,12 @@ if (GO2CPP_WITH_BENTO)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_peer_hub.cpp)
         add_executable(bento_test_tcp_proxy
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_tcp_proxy.cpp)
+        add_executable(bento_test_session_control
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_session_control.cpp)
+        add_executable(bento_test_peer_hub_secure
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_peer_hub_secure.cpp)
+        add_executable(bento_test_log_hook
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_log_hook.cpp)
         add_executable(bento_netem_probe
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/netem_probe.cpp)
 
@@ -123,6 +130,9 @@ if (GO2CPP_WITH_BENTO)
                 bento_test_zero_rtt
                 bento_test_peer_hub
                 bento_test_tcp_proxy
+                bento_test_session_control
+                bento_test_peer_hub_secure
+                bento_test_log_hook
                 bento_netem_probe)
             target_include_directories(${bento_test_target} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
@@ -152,6 +162,9 @@ if (GO2CPP_WITH_BENTO)
         add_test(NAME bento_zero_rtt COMMAND bento_test_zero_rtt)
         add_test(NAME bento_peer_hub COMMAND bento_test_peer_hub)
         add_test(NAME bento_tcp_proxy COMMAND bento_test_tcp_proxy)
+        add_test(NAME bento_session_control COMMAND bento_test_session_control)
+        add_test(NAME bento_peer_hub_secure COMMAND bento_test_peer_hub_secure)
+        add_test(NAME bento_log_hook COMMAND bento_test_log_hook)
         # 用户态弱网代理：无 CAP_NET_ADMIN 时替代 tc netem 的可重复版本。
         # 20% 双向丢包 + 200ms 单向延迟，可靠流要求 100% 按序。
         # 60s 收尾窗口：20% 丢包下 PTO 最坏会退避到 2s，40s 偶发尾部未收完。
@@ -169,6 +182,7 @@ if (GO2CPP_WITH_BENTO)
             bento_flow_control bento_bandwidth bento_stats_json bento_ipv6
             bento_concurrent_send bento_conn_migration bento_fec bento_pmtud
             bento_zero_rtt bento_peer_hub bento_tcp_proxy
+            bento_session_control bento_peer_hub_secure bento_log_hook
             PROPERTIES TIMEOUT 90)
         set_tests_properties(bento_weaknet_proxy PROPERTIES TIMEOUT 150)
         set_tests_properties(bento_netem PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
