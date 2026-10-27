@@ -20,6 +20,7 @@
  * - 所有 Sink 在锁内只做写流/追加，**不刷盘**（`Warn`+ 的 FileSink 例外）；
  * - `BufferedSink` 的两把锁不嵌套：先释放 `m_mutex` 再取 `m_io_mutex`，无锁序死锁；
  * - `LogItemWorker::Submit()` 不在锁内调用用户代码，避免自定义 Sink 重入死锁；
+ *   用户代码里再次打日志会被线程局部重入守卫丢弃并计数（不会递归）；
  * - `LogLine` 析构吞异常：日志失败不影响业务，但也意味着错误被静默。
  */
 #include "go2cpp/log.hpp"
@@ -587,27 +588,64 @@ LogItemWorker::LogItemWorker(LogFilter::ptr filter, LogFormatter::ptr formatter,
     : m_snapshot(std::make_shared<const Snapshot>(Snapshot{
           std::move(filter), std::move(formatter), std::move(sink)})) {}
 
+namespace {
+
+/// 当前线程的 Submit 嵌套深度；>0 表示正在执行用户 Formatter/Sink 代码。
+thread_local std::uint32_t t_submit_depth = 0;
+/// 进程内累计因重入被丢弃的记录数；热路径只在重入分支做一次原子加。
+std::atomic<std::uint64_t> g_reentrant_drops{0};
+
+/// 用 RAII 维护 Submit 嵌套深度，异常路径也能恢复。
+class SubmitDepthGuard final {
+public:
+    SubmitDepthGuard() noexcept { ++t_submit_depth; }
+    ~SubmitDepthGuard() noexcept { --t_submit_depth; }
+    SubmitDepthGuard(const SubmitDepthGuard&) = delete;
+    SubmitDepthGuard& operator=(const SubmitDepthGuard&) = delete;
+};
+
+}  // namespace
+
+std::uint64_t LogItemWorker::ReentrantDropCount() noexcept {
+    return g_reentrant_drops.load(std::memory_order_relaxed);
+}
+
+void LogItemWorker::ResetReentrantDropCount() noexcept {
+    g_reentrant_drops.store(0, std::memory_order_relaxed);
+}
+
 /**
- * @brief 提交一条记录：过滤 -> 格式化 -> 写 Sink。
+ * @brief 提交一条记录：重入守卫 -> 过滤 -> 格式化 -> 写 Sink。
  *
  * ## 步骤
+ * step0. 线程局部重入检查：本线程已在 Formatter/Sink 用户代码里则丢弃并计数；
  * step1. 原子读一次配置快照（热路径不加锁）；
  * step2. 任一组件为空或 filter 拒绝 -> 返回 false，不格式化；
  * step3. 调用户 Formatter 与 Sink —— 此时**没有持有任何 Worker 锁**；
  * step4. 返回是否真正写出。
  *
- * ## 为什么不在锁内调用用户代码
- * 自定义 Sink 可能在 Write 里再次打日志，若持锁调用会形成同一 Worker 的递归锁死。
+ * ## 为什么既要锁外调用又要重入守卫
+ * 自定义 Sink 可能在 Write 里再次打日志：持锁调用会递归锁死，锁外调用则会
+ * 沿同一线程无限递归直到栈溢出。重入守卫把「再次打日志」变成可观测的丢弃，
+ * 让日志系统在任何用户 Sink 下都不会破坏调用线程的栈。
  */
 bool LogItemWorker::Submit(const LogRecord& record) {
+    // step0: 同一线程已经在某条日志的 Formatter/Sink 里，再写日志会沿同一
+    // 调用栈递归（每层 LogLine 析构都会再次进入这里）。直接丢弃并计数，
+    // 保证 Sink 里写日志不会把业务线程打爆。
+    if (t_submit_depth != 0) {
+        g_reentrant_drops.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     const auto snapshot = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
     if (!snapshot) return false;
     // 不在 Worker 锁内调用用户 Formatter/Sink；这样自定义 Sink 再次记录
     // 日志时不会形成同一 Worker 的递归锁死。
+    const SubmitDepthGuard depth_guard;
     // step2: 先过滤，省掉未通过记录的格式化开销。
     if (!snapshot->filter || !snapshot->formatter || !snapshot->sink ||
         !snapshot->filter->Accept(record)) return false;
-    // step3: 锁外调用用户代码，允许 Sink 重入日志系统。
+    // step3: 锁外调用用户代码；重入的日志由 step0 的守卫丢弃。
     const auto formatted = snapshot->formatter->Format(record);
     snapshot->sink->Write(record, formatted);
     return true;

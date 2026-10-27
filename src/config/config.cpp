@@ -587,24 +587,28 @@ ConfigVarBase::ptr Config::LookupBase(const std::string& name) const {
  * @brief 把 INI 中的键批量应用到已注册变量；两阶段提交。
  *
  * ## 步骤
- * step1. 取得事务锁，保证预检+写入不被另一个 `LoadFromIni` 交错；
+ * step1. 取得可重入事务锁，保证预检+写入+发布不被另一个 `LoadFromIni` 交错；
  * step2. 快照全部变量，构造候选值表（未出现的键用当前值）；
  * step3. 逐变量做单字段 `ValidateString`，收集待应用列表；
  * step4. 用完整候选快照跑跨字段事务校验器（任何写入之前）；
  * step5. 逐变量 `ApplyString` 写入但不通知；任一失败则逆序 `RollbackPending`；
- * step6. 释放事务锁（监听器可以再次读/提交配置）；
- * step7. 统一 `NotifyPending`，让模块看到完整的新配置；
- * step8. 执行提交回调；单个回调异常不影响已提交的值。
+ * step6. 仍持事务锁统一 `NotifyPending`，让模块看到完整的新配置；同一线程的
+ *        监听器可以重入提交，其他线程的提交会等本批发布完成；
+ * step7. 在同一个临界区执行提交回调；单个回调异常不影响已提交的值；
+ * step8. 释放事务锁，此时配置值已经完整发布、对外可见。
  *
  * ## 失败语义
  * 预检/事务校验失败时没有任何变量被写入；`ApplyString` 失败时已写变量全部回滚。
  * 通知阶段即使回调抛异常也不回滚（配置值已经对外可见）。
  */
 bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
-    // 预检和提交必须处于同一事务临界区。否则两个监听线程可能分别
-    // 通过预检，随后交错 ApplyString，破坏“整批配置一次发布”的约定。
-    // step1: 事务锁覆盖预检与写入，通知阶段会提前释放
-    std::unique_lock<std::mutex> transaction_lock(m_transaction_mutex);
+    // 预检、写入与发布必须处于同一事务临界区。否则两个加载线程可能分别
+    // 通过预检，随后交错 ApplyString/回滚，破坏“整批配置一次发布”的约定：
+    // 监听器会读到另一个事务尚未发布（甚至即将回滚）的值。
+    // 事务锁使用 recursive_mutex：监听器/提交回调允许在同一线程内再次加载
+    // 配置，而其他线程的加载会一直阻塞到本批发布完成。
+    // step1: 事务锁覆盖预检、写入与发布，直到所有观察者看到完整的一批
+    std::unique_lock<std::recursive_mutex> transaction_lock(m_transaction_mutex);
     // step2: 先取变量快照，避免持锁遍历时被 Lookup/Remove 改变
     const auto variables = List();
     // 先检查所有已注册项对应的文本能否转换；实际写入仍按变量顺序完成，
@@ -641,6 +645,9 @@ bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
     // step5: applied 兼作回滚栈；只记录真正产生 pending 的变量
     std::vector<ConfigVarBase::ptr> applied;
     applied.reserve(pending.size());
+    // 进入发布阶段后不能再回滚（监听器可能已经看到本批值）；只有写入阶段的
+    // 异常才需要逆序回滚尚未发布的暂存值。
+    bool published = false;
     try {
         for (const auto& [variable, text] : pending) {
             if (!variable->ApplyString(text, error)) {
@@ -651,16 +658,16 @@ bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
             }
             if (variable->HasPending()) applied.push_back(variable);
         }
-        // 所有变量已经完成第一阶段提交；通知阶段不持有事务锁，监听器可以
-        // 查询注册表或触发下一次配置加载，避免插件回调与事务锁形成死锁。
-        // step6: 释放事务锁后再广播，允许监听器再次提交配置
-        transaction_lock.unlock();
-        // 监听器读取其他变量时只能看到本次文件提交后的值，不会读到本次
-        // ApplyString 顺序造成的半套状态。并发的新事务可能在此之后开始，
-        // 这是有意的：配置值已经完整发布，回调不阻塞配置刷新线程。
-        // step7: 所有变量已写入，监听器只能看到完整的新值集合
+        // 所有变量已经完成第一阶段提交，现在进入发布阶段。发布仍在事务锁内
+        // 进行：其他线程的 LoadFromIni 无法在两次 NotifyPending 之间插入
+        // 自己的半套写入或回滚，因此每个监听器读到的都是完整的一批。
+        // 事务锁可重入：监听器在同一线程内再次加载配置不会死锁，但会在本批
+        // 通知完成后继续，保证观察者总是先看到已完整发布的一批。
+        // step6: 所有变量已写入，发布阶段仍持有事务锁
+        published = true;
         for (const auto& variable : applied) variable->NotifyPending();
-        // step8: 提交回调属于扩展点，逐个隔离异常
+        // step7: 提交回调与通知同属发布阶段，逐个隔离异常；回调可以读取或
+        // 重入提交配置，其他线程的提交要等本批完全发布之后。
         if (!applied.empty()) {
             std::map<std::uint64_t, CommitListener> listeners;
             try {
@@ -683,8 +690,10 @@ bool Config::LoadFromIni(const IniFile& ini, std::string* error) {
         }
         return true;
     } catch (...) {
-        for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
-            (*it)->RollbackPending();
+        if (!published) {
+            for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
+                (*it)->RollbackPending();
+            }
         }
         throw;
     }

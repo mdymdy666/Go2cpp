@@ -415,9 +415,11 @@ public:
 
     /**
      * @brief 发布事务阶段暂存的监听通知。
-     * @details 回调在释放内部互斥锁和 Config 事务锁后执行，允许回调再次读取
-     *          或提交配置；同一变量在一次事务中只发布最终值，避免中间值触发
-     *          模块重配置。
+     * @details 回调在释放本变量的内部互斥锁后执行；调用方
+     *          （`Config::LoadFromIni`）在整个发布阶段持有可重入事务锁，因此
+     *          回调只会看到完整的一批新值，同一线程内再次读取或提交配置不会
+     *          死锁。同一变量在一次事务中只发布最终值，避免中间值触发模块
+     *          重配置。
      */
     void NotifyPending() noexcept override {
         std::optional<PendingChange> change;
@@ -500,8 +502,10 @@ private:
  *
  * ## 生命周期与线程模型
  * `Instance()` 是函数内静态对象，析构时 `StopWatcher()`；注册表读写由 `m_mutex`
- * 保护，整批文件事务由 `m_transaction_mutex` 串行化。热加载线程只在本类内部创建，
- * 监听器与提交回调都在**释放事务锁之后**执行。
+ * 保护，整批文件事务由可重入的 `m_transaction_mutex` 串行化。热加载线程只在本类
+ * 内部创建；事务锁覆盖预检、写入与**发布**，监听器与提交回调在执行期间持有该锁，
+ * 因此其他线程的事务不会插入到本批发布中途；同一线程（监听器内）再次提交配置
+ * 允许重入。
  *
  * ## 状态机
  * 文件事务有 Idle / Validating / Applying / Pending / Committed / RolledBack
@@ -510,7 +514,8 @@ private:
  *
  * ## 不变量
  * - 一次 `LoadFromIni` 中，所有变量要么全部写入并广播，要么全部回滚；
- * - 事务锁只保护预检+写入，**绝不**包住监听器回调；
+ * - 事务锁保护预检、写入与整批发布（含监听器/提交回调），发布期间其他线程的
+ *   事务被阻塞；同一线程可重入提交；
  * - `m_watching == true` 时 `m_watcher` 一定是可 join 的线程（除非在自身线程内停止）。
  */
 class Config final {
@@ -518,9 +523,10 @@ public:
     /**
      * @brief 一次配置事务完成后的扩展回调。
      * @details 回调执行时，本次文件提交涉及的全部 ConfigVar 已经写入；
-     *          适合 scheduler、logger 等需要整体重建快照的插件。回调在事务锁
-     *          释放后执行，可以查询或再次提交配置；回调异常会被配置中心隔离，
-     *          不会撤销已经提交的配置值。
+     *          适合 scheduler、logger 等需要整体重建快照的插件。回调与
+     *          `NotifyPending` 同处发布阶段并持有可重入事务锁：可以查询或在
+     *          同一线程再次提交配置，其他线程的提交会等本批发布完成；回调
+     *          异常会被配置中心隔离，不会撤销已经提交的配置值。
      */
     using CommitListener = std::function<void(const std::vector<ConfigVarBase::ptr>& changed)>;
     /**
@@ -550,8 +556,9 @@ public:
     // 按名称返回非模板变量；不存在时返回空指针。
     /** @brief 以非模板基类指针查找配置变量。 */
     ConfigVarBase::ptr LookupBase(const std::string& name) const;
-    // 预检所有已注册变量后批量应用 INI 中出现的键。
-    /** @brief 先整体校验再应用 INI 配置。 */
+    // 预检所有已注册变量后批量应用 INI 中出现的键；预检、写入与广播在同一个
+    // 可重入事务临界区内完成，观察者不会看到半批配置。
+    /** @brief 先整体校验、再应用并原子发布 INI 配置。 */
     bool LoadFromIni(const IniFile& ini, std::string* error = nullptr);
     // 对 path 做稳定快照后调用 LoadFromIni。快照失败或 INI 无效时不会
     // 修改已注册变量；生产热更新应使用 path + ".lock" 编辑锁和原子 rename。
@@ -623,8 +630,9 @@ private:
     void stop_watcher_locked() noexcept;
     mutable std::mutex m_mutex;  ///< 保护 m_vars/m_commit_listeners/m_transaction_validators；Lookup/List/Groups/Add* 使用
     // 文件事务锁串行化多个 LoadFromIni/LoadFromFile 调用，保证不同线程
-    // 不会交错写入同一批 ConfigVar 并互相覆盖暂存通知。
-    mutable std::mutex m_transaction_mutex;  ///< 串行化整批 LoadFromIni/LoadFromFile；保证预检与提交不被其他事务交错
+    // 不会交错写入同一批 ConfigVar，也不会在发布中途插入另一个事务。
+    // recursive_mutex：监听器/提交回调允许在同一线程内再次加载配置。
+    mutable std::recursive_mutex m_transaction_mutex;  ///< 串行化整批 LoadFromIni/LoadFromFile（预检+写入+发布）；可重入以支持监听器内提交
     std::unordered_map<std::string, ConfigVarBase::ptr> m_vars;  ///< 完整名到变量的注册表；Lookup/LookupBase/List/Remove/Groups 使用
     std::map<std::uint64_t, CommitListener> m_commit_listeners;  ///< 事务提交后的扩展回调；Add/DelCommitListener 与 LoadFromIni 的快照使用
     std::atomic<std::uint64_t> m_next_commit_listener{1};  ///< 提交监听器 ID 分配器；AddCommitListener fetch_add

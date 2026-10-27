@@ -32,6 +32,9 @@
  *   在锁内调用会把「业务锁 -> stdio 锁 -> 磁盘 IO」串成一条链，放大临界区，
  *   还可能与正在刷盘的线程互等。本模块的 Sink 在锁内只做 `write`/`append`，
  *   刷盘放在锁外或交给调用方的显式 `Flush()`；
+ * - **Sink/Formatter 里再次打日志不会被递归执行**：`LogItemWorker::Submit()`
+ *   维护线程局部重入深度，重入的记录会被直接丢弃并计入
+ *   `LogItemWorker::ReentrantDropCount()`；需要感知丢日志的调用方应检查该计数；
  * - `BufferedSink::kByTime` 是**惰性检查**：长时间没有日志时缓冲不会自动刷出；
  * - 批量写时 `WriteRaw` 的 `LogRecord` 上下文只保留最后一条（见 `BufferedSink` 注释）；
  * - `LogLine` 在析构时提交，且吞掉所有异常（日志失败不能影响业务）。
@@ -632,6 +635,8 @@ private:
  * - 热路径只做一次 `atomic_load` 拿快照，配置变更走「复制-替换」（见 .cpp）；
  * - `Submit()` **不在锁内**调用用户 Formatter/Sink，避免自定义 Sink 再次打日志时
  *   递归锁死；
+ * - `Submit()` 用线程局部重入深度做守卫：在 Formatter/Sink 内再次打日志会被
+ *   直接丢弃并计入 `ReentrantDropCount()`，绝不沿调用栈递归；
  * - 过滤未通过时返回 false 且不格式化（省掉字符串构造）。
  */
 class LogItemWorker {
@@ -640,8 +645,22 @@ public:
     /** @brief 创建工作单元。@param filter 过滤器。@param formatter 格式化器。@param sink 输出目标。 */
     LogItemWorker(LogFilter::ptr filter, LogFormatter::ptr formatter,
                   LogSink::ptr sink);
-    /** @brief 提交一条记录，过滤通过时写入 Sink。 */
+    /**
+     * @brief 提交一条记录，过滤通过时写入 Sink。
+     * @return 真正写出返回 true；被过滤、未配置或重入被丢弃时返回 false。
+     */
     bool Submit(const LogRecord& record);
+    /**
+     * @brief 返回因日志重入而被丢弃的记录累计数（进程级、只增）。
+     * @details 在 Sink/Formatter 内再次打日志时，`Submit()` 会丢弃该记录并递增
+     *          此计数，防止同一线程无限递归到栈溢出。跨线程日志不受影响。
+     */
+    static std::uint64_t ReentrantDropCount() noexcept;
+    /**
+     * @brief 清零重入丢弃计数（测试与诊断用）。
+     * @details 仅影响诊断计数，不改变任何日志行为。
+     */
+    static void ResetReentrantDropCount() noexcept;
     /** @brief 替换过滤器。 */
     void SetFilter(LogFilter::ptr filter);
     /** @brief 设置内置最低级别过滤器。 */

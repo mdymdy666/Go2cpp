@@ -13,12 +13,15 @@
  *    缓冲区最核心的正确性要求（写和刷新在多个线程里交错）；
  * 6. **Formatter 可配置**：`PatternFormatter` 的格式串真正生效，格式项与
  *    `docs/logging.md` 的约定一致；
- * 7. **批量路径生效**：支持 `WriteRaw` 的 Sink 应收到远少于记录数的调用。
+ * 7. **批量路径生效**：支持 `WriteRaw` 的 Sink 应收到远少于记录数的调用；
+ * 8. **Sink 内重入**：回调里再次打日志被丢弃并计数，不递归、不崩溃；重入
+ *    守卫按线程隔离，另一个线程在该回调执行期间仍能正常写日志。
  */
 #include "go2cpp/logging/log.hpp"
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -281,6 +284,99 @@ void ScenarioConcurrent() {
 }
 
 // ---------------------------------------------------------------------------
+// 场景 7：Sink 回调内重入打日志（LOG-01）
+// ---------------------------------------------------------------------------
+void ScenarioReentrantSink() {
+    LogItemWorker::ResetReentrantDropCount();
+    auto logger = std::make_shared<Logger>("reentrant-test");
+    logger->SetLevel(Level::Info);
+    std::atomic<int> callback_calls{0};
+    std::mutex messages_mutex;
+    std::vector<std::string> messages;
+    logger->AddWorker(std::make_shared<LogItemWorker>(
+        std::make_shared<MinimumLevelFilter>(Level::Info),
+        std::make_shared<PatternFormatter>("{message}\n"),
+        std::make_shared<CallbackSink>([&](const LogRecord&, std::string_view text) {
+            callback_calls.fetch_add(1, std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(messages_mutex);
+                messages.emplace_back(text);
+            }
+            // Sink 回调里再次打日志：必须被丢弃并计数，而不是递归到栈溢出。
+            GO2CPP_LOG_ERROR(logger) << "Sink 回调内的重入日志";
+        })));
+
+    GO2CPP_LOG_INFO(logger) << "外层日志";
+    Check(callback_calls.load() == 1, "reentrant: sink callback must run once");
+    Check(LogItemWorker::ReentrantDropCount() == 1,
+          "reentrant: nested log must be counted as dropped");
+    {
+        std::lock_guard<std::mutex> lock(messages_mutex);
+        Check(messages.size() == 1,
+              "reentrant: only the outer record may reach the sink");
+        Check(messages.size() == 1 &&
+                  messages.front().find("外层日志") != std::string::npos,
+              "reentrant: outer message must reach the sink");
+    }
+
+    // 守卫必须在本条记录结束后复位：后续日志仍能正常写出。
+    GO2CPP_LOG_INFO(logger) << "第二条外层日志";
+    Check(callback_calls.load() == 2,
+          "reentrant: logging must recover after the nested drop");
+    Check(LogItemWorker::ReentrantDropCount() == 2,
+          "reentrant: each nested attempt counted once");
+
+    // 重入守卫按线程隔离：Sink 回调执行期间，另一个线程仍可正常写日志。
+    auto cross_memory = std::make_shared<MemorySink>();
+    auto cross_logger = std::make_shared<Logger>("reentrant-cross");
+    cross_logger->SetLevel(Level::Info);
+    cross_logger->AddWorker(std::make_shared<LogItemWorker>(
+        std::make_shared<MinimumLevelFilter>(Level::Info),
+        std::make_shared<PatternFormatter>("{message}\n"), cross_memory));
+
+    std::mutex gate_mutex;
+    std::condition_variable gate_cv;
+    bool in_callback = false;
+    bool helper_done = false;
+    std::thread helper([&] {
+        {
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            (void)gate_cv.wait_for(lock, std::chrono::seconds(5),
+                                   [&] { return in_callback; });
+        }
+        GO2CPP_LOG_INFO(cross_logger) << "另一个线程的日志";
+        {
+            std::lock_guard<std::mutex> lock(gate_mutex);
+            helper_done = true;
+        }
+        gate_cv.notify_all();
+    });
+
+    auto waiting_logger = std::make_shared<Logger>("reentrant-wait");
+    waiting_logger->SetLevel(Level::Info);
+    waiting_logger->AddWorker(std::make_shared<LogItemWorker>(
+        std::make_shared<MinimumLevelFilter>(Level::Info),
+        std::make_shared<PatternFormatter>("{message}\n"),
+        std::make_shared<CallbackSink>([&](const LogRecord&, std::string_view) {
+            {
+                std::lock_guard<std::mutex> lock(gate_mutex);
+                in_callback = true;
+            }
+            gate_cv.notify_all();
+            std::unique_lock<std::mutex> lock(gate_mutex);
+            (void)gate_cv.wait_for(lock, std::chrono::seconds(5),
+                                   [&] { return helper_done; });
+        })));
+    GO2CPP_LOG_INFO(waiting_logger) << "触发跨线程检查";
+    helper.join();
+    Check(cross_memory->Snapshot().size() == 1,
+          "reentrant: other threads must log normally during a sink callback");
+    std::printf("[log-buffer] 重入守卫: 丢弃计数=%llu\n",
+                static_cast<unsigned long long>(
+                    LogItemWorker::ReentrantDropCount()));
+}
+
+// ---------------------------------------------------------------------------
 // 场景 6：Formatter 可配置
 // ---------------------------------------------------------------------------
 void ScenarioConfigurableFormatter() {
@@ -332,6 +428,8 @@ int main() {
     ScenarioConcurrent();
     std::printf("[log-buffer][场景6] Formatter 可配置\n");
     ScenarioConfigurableFormatter();
+    std::printf("[log-buffer][场景7] Sink 回调内重入打日志\n");
+    ScenarioReentrantSink();
 
     if (g_failures == 0) {
         std::printf("\n[log-buffer] failures=0\n");
