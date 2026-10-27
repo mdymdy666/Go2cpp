@@ -36,7 +36,9 @@ if (GO2CPP_WITH_BENTO)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/congestion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/bandwidth.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/channel.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/link.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/link.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/peer_hub.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/tcp_proxy.cpp)
 
     target_include_directories(go2cpp_bento
         PUBLIC
@@ -92,6 +94,10 @@ if (GO2CPP_WITH_BENTO)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_pmtud.cpp)
         add_executable(bento_test_zero_rtt
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_zero_rtt.cpp)
+        add_executable(bento_test_peer_hub
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_peer_hub.cpp)
+        add_executable(bento_test_tcp_proxy
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_tcp_proxy.cpp)
         add_executable(bento_netem_probe
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/netem_probe.cpp)
 
@@ -115,6 +121,8 @@ if (GO2CPP_WITH_BENTO)
                 bento_test_fec
                 bento_test_pmtud
                 bento_test_zero_rtt
+                bento_test_peer_hub
+                bento_test_tcp_proxy
                 bento_netem_probe)
             target_include_directories(${bento_test_target} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
@@ -142,6 +150,8 @@ if (GO2CPP_WITH_BENTO)
         add_test(NAME bento_fec COMMAND bento_test_fec)
         add_test(NAME bento_pmtud COMMAND bento_test_pmtud)
         add_test(NAME bento_zero_rtt COMMAND bento_test_zero_rtt)
+        add_test(NAME bento_peer_hub COMMAND bento_test_peer_hub)
+        add_test(NAME bento_tcp_proxy COMMAND bento_test_tcp_proxy)
         # 用户态弱网代理：无 CAP_NET_ADMIN 时替代 tc netem 的可重复版本。
         # 20% 双向丢包 + 200ms 单向延迟，可靠流要求 100% 按序。
         # 60s 收尾窗口：20% 丢包下 PTO 最坏会退避到 2s，40s 偶发尾部未收完。
@@ -158,7 +168,7 @@ if (GO2CPP_WITH_BENTO)
             bento_crypto bento_secure_link bento_secure_injection bento_congestion
             bento_flow_control bento_bandwidth bento_stats_json bento_ipv6
             bento_concurrent_send bento_conn_migration bento_fec bento_pmtud
-            bento_zero_rtt
+            bento_zero_rtt bento_peer_hub bento_tcp_proxy
             PROPERTIES TIMEOUT 90)
         set_tests_properties(bento_weaknet_proxy PROPERTIES TIMEOUT 150)
         set_tests_properties(bento_netem PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)

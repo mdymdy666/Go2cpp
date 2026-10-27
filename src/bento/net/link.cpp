@@ -262,6 +262,14 @@ bool UdpSocket::Open(const std::string& bind_address, std::uint16_t port, std::s
         }
         const int reuse = 1;
         (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        // 突发流量下内核接收队列是 UDP 的第一道丢包点：默认 rmem ~212KB，
+        // 多 peer 场景下 150 个 80B 小包叠加 skb 开销就可能溢出。统一抬到
+        // 1MB（内核按 rmem_max 截断），显著降低回环与弱网突发丢包。
+        const int socket_buffer_bytes = 1 << 20;
+        (void)::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &socket_buffer_bytes,
+                           sizeof(socket_buffer_bytes));
+        (void)::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &socket_buffer_bytes,
+                           sizeof(socket_buffer_bytes));
         if (::bind(fd, entry->ai_addr, entry->ai_addrlen) < 0) {
             last_error = std::string("bind: ") + std::strerror(errno);
             ::close(fd);

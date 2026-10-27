@@ -1,0 +1,276 @@
+# Bento 场景矩阵：JinShan 真实场景 → Go2Cpp 能力映射
+
+- **版本**：v1.0（2026-10-27）
+- **目的**：把 JinShan 远程桌面工程（只读参考）里真实出现过的运行场景，逐条映射到
+  Go2Cpp `bento` 传输层的能力上，标出「已有 / 部分 / 缺 / 不适用」，作为补齐
+  通用框架能力的依据。
+- **参考基线（只读）**：
+  - `JinShanProject/docs/01-requirements/RTM.md` v1.0（40 条：CON 15 / FR 19 / NFR 6）
+  - `JinShanProject/docs/02-analysis/anomalies.md` v0.1（AX-001–AX-100）
+  - `JinShanProject/docs/02-analysis/risk-register.md` v0.1（RISK-001–RISK-078）
+- **被测代码基线**：`include/go2cpp/bento/net/**`、`src/bento/net/**`、`tests/bento/**`。
+- **状态定义**：
+
+  | 状态 | 含义 |
+  |---|---|
+  | 已有 | 有可复用的实现，且有对应测试（`tests/bento/` 下能指到具体文件） |
+  | 部分 | 底层构件存在，但缺少场景级能力（协议字段、路由、统计或测试之一） |
+  | 缺 | 当前完全没有实现，属于明确的能力空白 |
+  | 不适用 | 该需求绑定 Windows / RDP / 应用语义，不属于通用传输层职责，需由上层实现 |
+
+- **编号引用约定**：`FR/CON/NFR` 取自 RTM；`AX-xxx` 取自 anomalies；`RISK-xxx`
+  取自 risk-register。每行至少引用一个编号，便于反向追溯。
+
+---
+
+## 1. 弱网（高延迟 / 丢包 / 限速 / 抖动 / 断线）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 1.1 | 300ms RTT + 5% 丢包下会话保持 | CON-07、NFR-02、AX-022、RISK-033 | `channel.hpp:ReliableChannel`（RFC 9002 SRTT/RTTVAR、动态 PTO、快速重传）、`RttEstimator` | 已有 | 测试用用户态弱网代理而非真实 `tc netem`；带宽整形未覆盖 |
+| 1.2 | 20% 双向丢包 + 200ms 单向延迟，200 条消息 100% 按序 | CON-07、AX-019、RISK-035 | `tests/bento/udp_proxy.hpp`（用户态丢包/延迟代理）、`netem_probe.cpp`、ctest `bento_weaknet_proxy` | 已有 | PTO 退避上限 2s，最坏 60s 收尾窗口；未测 30% 以上丢包 |
+| 1.3 | 带宽受限与发送速率整形（慢对端不拖垮发送方） | NFR-02、AX-014、RISK-004 | `congestion.hpp:CongestionController`（cwnd + pacing 令牌桶）、`bandwidth.hpp:BandwidthEstimator` | 部分 | 有 pacing，但没有「限速注入」测试工具；udp_proxy 只做丢包/延迟，不做带宽整形 |
+| 1.4 | 心跳误判与断线判定（≤2 次丢失继续，3 次判死） | AX-010、AX-019、RISK-033 | `link.hpp:LinkConfig{peer_timeout_ms, heartbeat_interval_ms}`、`test_rtt_pto` | 已有 | 重连退避/抖动策略在应用层，Bento 只给状态与回调 |
+| 1.5 | 包乱序、重复包、跨 recv 粘包 | AX-012、AX-013 | `ReliableChannel` SACK 位图、去重、`kReceiveWindow`；`test_unreliable_dropstale` | 已有 | 没有专门的「乱序注入器」，乱序只靠网络自然发生 |
+
+## 2. 可靠 / 不可靠混合（画面可丢、控制不可丢）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 2.1 | 控制指令走可靠有序流，画面帧走可丢通道 | FR-02、FR-03、CON-10 | `protocol.hpp:FrameType{kStream,kDatagram,kVideo}`；`channel.hpp:ReliableChannel/UnreliableChannel/VideoChannel` | 已有 | 屏幕采集与编码不在 Bento 职责内（JinShan 用 IRDPSRAPI） |
+| 2.2 | 不可靠消息 DropStale + 因果依赖（dep_seq / BARRIER） | FR-03、AX-035 | `channel.hpp:UnreliableChannel`、`relation.hpp:Relation`、`test_unreliable_dropstale` | 已有 | 无「输入事件 → 画面帧」的端到端因果链测试，Bento 只提供原语 |
+| 2.3 | 视频分片丢失后的 XOR FEC 恢复 | NFR-02、RISK-035 | `channel.hpp:VideoChannel`（`kMaxFecGroupSize=8`）、`test_fec` | 已有 | FEC 只接在 `Link` 上，`PeerHub` 的 P0 范围未接视频 |
+| 2.4 | 多通道隔离（move/click/video 各自 seq 与窗口） | FR-06、CON-08 | `link.hpp:kMaxChannels=8`、每通道独立 seq/窗口/流控 | 已有 | 通道数上限 8，超出丢弃并计数 |
+| 2.5 | 单条消息超过 1300B 自动分片与重组 | FR-14、AX-013 | `protocol.hpp:kStreamFragmentBytes`、`channel.hpp:StreamReassembler`、`test_stream_fragment` | 已有 | 单条消息上限 ≈330KB（256 分片），更大需上层再分块 |
+
+## 3. 多客户端（1 被控 : N 主控）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 3.1 | 一个监听端口同时服务 3 个主控 | FR-06、B2-2、AX-085、RISK-028 | **`peer_hub.hpp:PeerHub::AddPeer/RunOnce/SendStream(peer_id,…)`**（P0-1 新增） | 已有 | 本轮新增；`Link` 仍是单 peer，未改动（避免 2000+ 行回归） |
+| 3.2 | 多主控之间不串流、各自通道独立 | RISK-030、AX-085 | `PeerHub` 按 `conn_id` 路由 + 每 peer 独立 `Relation` 与通道表；`test_peer_hub` 场景 1 | 已有 | 测试断言 3×50 条 STREAM + 3×50 条 DATAGRAM 全部按 peer 隔离、零串台 |
+| 3.3 | 主控数量上限与拒绝策略 | AX-023、RISK-032 | `PeerHubConfig::max_peers`、`PeerHubStats::peers_rejected` | 已有 | 无「每 IP 连接数」限流 |
+| 3.4 | 看/控权限（同时可看、仅一人可控） | FR-03、FR-06、RISK-002、RISK-024 | 无 | 缺 | 属应用层仲裁；`PeerHub` 只提供 per-peer 消息通道与 peer 标识 |
+| 3.5 | 多主控同时高帧率时的带宽公平 | RISK-031、AX-089 | 每 peer 独立 `CongestionController` | 部分 | 有 per-peer 拥塞控制，但没有跨 peer 的全局公平调度/配额 |
+| 3.6 | 主控断开后清理其会话资源 | AX-086、AX-093 | `PeerHub::DropPeer`（peer_timeout）+ `on_peer_disconnected` 回调 | 部分 | 回收动作（撤销控制权、释放邀请）需应用层实现 |
+
+## 4. 回环中继（invitation 改写 + 本地转发）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 4.1 | 本地监听 → 远端连接 → 双向字节转发 | FR-04、AX-029 | **`tcp_proxy.hpp:TcpProxy::Open/Poll`**（P0-2 新增） | 已有 | 通用组件，不绑定 RDP；`test_tcp_proxy` 覆盖 100KB 回显 |
+| 4.2 | 多个 Viewer 各自独立管道、互不串流 | RISK-003、RISK-030、AX-028 | `TcpProxy` 每连接独立 fd 对与缓冲区；`test_tcp_proxy` 场景 3（3 并发） | 已有 | — |
+| 4.3 | 半关闭传播（请求-响应协议不截断响应） | FR-04、AX-020 | `TcpProxy` 的 `shutdown(SHUT_WR)` + `half_close_timeout_ms`；`test_tcp_proxy` 场景 2 | 已有 | — |
+| 4.4 | 端口被占用 / 动态端口分配 | AX-028、RISK-016 | `TcpProxyConfig::listen_port=0`（内核分配）+ `SO_REUSEADDR` | 已有 | 冲突重试策略由调用方决定（Bento 只报错） |
+| 4.5 | invitation XML 解析与地址改写 | FR-04、RISK-014、RISK-015 | 无 | 不适用 | IRDPSRAPI 生成的 XML 是 Windows/RDP 专属；通用代理只负责字节转发 |
+| 4.6 | 慢读 Viewer 的背压与回收 | AX-014、RISK-004 | `TcpProxy` 每方向有界缓冲 + `idle_timeout_ms`；`test_tcp_proxy` 场景 5 | 部分 | TCP 代理有背压；UDP 侧的多 peer 中继没有等价背压 |
+
+## 5. 侧信道（虚拟通道命令 / 文件下发）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 5.1 | 命令通道：长度前缀 + 可靠有序传输 | FR-08、AX-052、RISK-039 | `ReliableChannel`（分片 + 流控 MAX_DATA）、`test_flow_control` | 部分 | 传输原语已有；命令帧格式、执行器、输出回传属应用层 |
+| 5.2 | 大命令/大输出（8KB 命令、10MB 输出） | AX-052、AX-053 | `kMaxStreamMessageBytes`（≈330KB）、`StreamReassembler` | 部分 | 超过 330KB 需上层分块；无 `truncated` 标记与输出上限语义 |
+| 5.3 | Win7 无 RDP8 时侧信道降级到独立 TCP 通道 | RISK-008、RISK-038、AX-081 | 无 | 不适用 | 动态虚拟通道（DVC）是 RDP 专属；Bento 本身就是「独立通道」这一降级形态 |
+| 5.4 | 命令注入防护 | RISK-040、NFR-04 | 无 | 不适用 | 属应用层安全策略（参数数组/白名单），传输层不解析业务 |
+
+## 6. 大文件（100MB / 2GB、哈希校验）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 6.1 | 100MB 双向传输且 SHA256 一致 | FR-14、AX-045、RISK-048 | STREAM 分片 + 流控；`test_stream_fragment`、`test_flow_control` | 部分 | 无文件块协议/断点续传/哈希校验；单条消息 330KB 上限需上层分块 |
+| 6.2 | 0 字节文件与 >2GB 上限 | AX-044、AX-045 | `ReliableChannel::Send(bytes=0)` 边界未覆盖 | 部分 | 0 字节语义、>2GB 拒绝策略需上层定义 |
+| 6.3 | 传输中断后的重试与半文件清理 | AX-049、RISK-047 | 可靠层重传（PTO/快速重传） | 部分 | `.part` 文件、磁盘满、只读目录属本地文件系统语义 |
+| 6.4 | 大文件吞吐压测 | RISK-048、PT | `test_tcp_proxy`（100KB）、`test_peer_hub` 吞吐场景（600×512B ≈ 30 Mbit/s） | 部分 | 现有压测规模为百 KB 级；100MB 级长跑未做 |
+
+## 7. 控制权（唯一控制者 / 抢占 / 回收）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 7.1 | 多个主控竞争控制权，仅一人 INTERACTIVE | FR-03、FR-06、RISK-024、AX-036 | 无 | 缺 | 需应用层仲裁协议；`PeerHub` 只提供 per-peer 通道 |
+| 7.2 | 控制器断开后回收控制权 | RISK-025、AX-037 | `PeerHub` 的 `peer_timeout` + `on_peer_disconnected`；`Link` 的 `on_disconnected` | 部分 | 检测有了，回收动作与状态广播需应用层 |
+| 7.3 | 控制权变更广播给所有主控 | AX-095、AX-097 | `PeerHub` 可对每个 peer 单独 `SendStream`；无广播 API | 部分 | 需应用层遍历 `PeerIds()`；Bento 不内置广播语义 |
+| 7.4 | UIPI / 提权窗口输入拦截 | RISK-027、AX-071 | 无 | 不适用 | Windows 完整性级别机制，Linux 运行时不存在 |
+
+## 8. 公网穿透（中转 / 无 P2P / 背压）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 8.1 | 跨网统一经中转，不做 P2P 直连 | CON-09、RISK-006 | 无 | 缺 | Bento 是 UDP 直连（需可达地址）；无公网中继/打洞 |
+| 8.2 | 本地中继：主控把远端地址改写成 127.0.0.1 | FR-04、AX-029 | `tcp_proxy.hpp:TcpProxy` | 部分 | 只解决「本地回环 → 远端」；公网中转需另外部署 |
+| 8.3 | 中转背压：慢客户端不拖垮服务 | RISK-004、AX-014 | `TcpProxy` 有界缓冲 + 背压 + 空闲超时 | 部分 | TCP 侧有；UDP 多 peer 侧无全局背压 |
+| 8.4 | 中转不可达 / 连接超时 | RISK-009、AX-017 | `TcpProxyConfig::connect_timeout_ms`、`stats.dial_failed`；`PeerHub` 握手超时 | 部分 | 重试与提示在调用方 |
+| 8.5 | 端口/DNS 解析失败要立即暴露 | AX-016、AX-017 | `TcpProxy::Open` / `PeerHub::AddPeer` 返回 `std::string* error`；`UdpSocket::Resolve` | 已有 | 无结构化错误码（见 12.4） |
+| 8.6 | relay 重启后会话重建 | RISK-036、AX-021 | `PeerHub::Connect`（重新握手）、`Link::Resume`（0-RTT） | 部分 | 应用会话重建（邀请、录像状态）属上层 |
+
+## 9. 加密（PSK / AEAD / 重放 / 0-RTT）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 9.1 | 预共享密钥认证加密 | NFR-04、RISK-007 | `link.hpp:Link::SetPreSharedKey`、`crypto.hpp`（ChaCha20-Poly1305、`kPskBytes=32`）、`test_secure_link` | 已有 | 仅 `Link` 支持；`PeerHub` 未接 PSK |
+| 9.2 | 篡改 / 重放 / 明文注入必须被拒 | NFR-04、AX-008、RISK-007 | `crypto.hpp:ReplayWindow`、`OpenStatus`；`test_secure_injection` | 已有 | — |
+| 9.3 | 0-RTT 会话恢复（票据） | NFR-02、RISK-036 | `Link::ExportSessionTicket/Resume`、`test_zero_rtt` | 已有 | 仅 `Link`；票据不含密钥本身 |
+| 9.4 | 多 peer 下的加密与密钥隔离 | FR-06、NFR-04 | 无（`PeerHub` P0 只做明文） | 缺 | 明确记入 P1 缺口：每 peer 独立 PSK 会话 |
+| 9.5 | 错误密钥 / 同 key 双注册的处理 | AX-004、AX-005、RISK-011 | `Link` 的 `auth_failures`；`PeerHub` 无鉴权 | 部分 | 配对策略属应用层；传输层只能给认证失败计数 |
+
+## 10. 迁移（NAT rebinding / 换网 / 重连）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 10.1 | 本端换地址后会话延续（`Link::Migrate`） | AX-010、RISK-033 | `link.hpp:Link::Migrate`、`migration_grace_ms`、`test_conn_migration` | 已有 | 新旧地址族必须一致（IPv4/IPv6 不混用） |
+| 10.2 | 对端地址变化识别与旧地址静默期 | AX-010、RISK-033 | `Link::UpdatePeerAddress` + `conn_id` 路由 + 退役地址窗口 | 已有 | 只有 AEAD 认证通过的帧才允许改地址（加密模式） |
+| 10.3 | 多 peer 下某个 peer 换地址 | FR-06、RISK-033 | `PeerHub::HandlePacket` 按 `conn_id` 更新 `peer.addr` | 部分 | 逻辑已实现，但缺少专门测试（P1） |
+| 10.4 | 重连风暴与端口复用 | AX-091、RISK-034 | `PeerHub::Connect`；`TcpProxy` 的 `SO_REUSEADDR` | 部分 | 退避/抖动/限流在调用方 |
+| 10.5 | 单调时钟 vs 墙钟（NTP 校时不影响超时） | AX-092 | `protocol.hpp:NowMs()`（steady_clock） | 已有 | 握手时间戳用墙钟（跨进程可比），已单独区分 |
+
+## 11. 差环境（Win7 / PE / 低权限 / 缺组件）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 11.1 | 无 CAP_NET_ADMIN 时的弱网测试 | CON-06、NFR-01 | `tests/bento/udp_proxy.hpp`（用户态丢包/延迟） | 已有 | 不能模拟带宽整形与真实链路抖动 |
+| 11.2 | 无 root、纯用户态运行 | CON-06、AX-071 | 全部组件只用普通 UDP/TCP socket，无特权调用 | 已有 | `tc netem` 测试在无权限时 SKIP（`SKIP_RETURN_CODE 77`） |
+| 11.3 | Windows 7 / PE / IRDPSRAPI | CON-03、CON-10、AX-025、AX-070 | 无 | 不适用 | Go2Cpp 是 Linux 运行时；Win32/COM/RDP 能力不在范围内 |
+| 11.4 | 关键组件缺失的降级与提示 | AX-065、AX-073、NFR-03 | 无 | 不适用 | 能力检测与降级矩阵属应用层 |
+| 11.5 | 32 位内存受限（2GB 地址空间） | AX-075、RISK-074 | 有界缓冲：`PeerHubConfig::max_peers`、`TcpProxyConfig::buffer_bytes/max_connections` | 部分 | 没有 32 位构建与内存基线测试 |
+| 11.6 | 端口占用/权限不足时的明确报错 | AX-063、RISK-075 | `Open()` 返回 `std::string* error`（bind/listen 失败原样透出） | 已有 | — |
+
+## 12. 可观测（统计 / 日志 / 错误码）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 12.1 | 链路层与可靠层统计 | NFR-03、C7 | `link.hpp:LinkStats`、`Link::Stats()`、`LinkStatsToJson`、`test_stats_json` | 已有 | — |
+| 12.2 | 多 peer 统计与 per-peer 视角 | FR-06、AX-085 | `peer_hub.hpp:PeerHubStats/PeerInfo`、`reliable_stats(peer_id, channel)` | 已有 | — |
+| 12.3 | 代理层统计（accept/dial/idle/reset） | AX-014、AX-028 | `tcp_proxy.hpp:TcpProxyStats` | 已有 | — |
+| 12.4 | 结构化错误码（而非只有字符串） | NFR-03、AX-096 | 目前只有 `std::string* error` 与回调 `reason` 字符串 | 部分 | 无错误码枚举，调用方无法稳定分支 |
+| 12.5 | 统一日志接入 | RISK-076、AX-024 | 无 | 缺 | Bento 刻意不依赖 go2cpp `log`，目前无日志钩子 |
+| 12.6 | 帧级非法/未知来源可观测 | AX-008、AX-012 | `LinkStats{invalid_frames, unknown_peer_frames}`、`PeerHubStats` 同名字段 | 已有 | — |
+
+## 13. 录屏（会话录制 / AVI / 索引）
+
+| # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
+|---|---|---|---|---|---|
+| 13.1 | 会话录屏与回放 | FR-17、RISK-054、AX-098 | 无 | 不适用 | AVI 封装、`idx1` 索引、损坏标记属应用层文件格式 |
+| 13.2 | 录制不阻塞 UI（独立线程 + 有界队列） | RISK-055 | 无 | 不适用 | 线程模型属应用层；Bento 的接收是单线程 `RunOnce` 模型，可被复用但不是录制器 |
+| 13.3 | 录屏帧的传输通道 | FR-17、FR-02 | `channel.hpp:VideoChannel`（分片 + FEC）、`test_video_fragment`、`test_fec` | 部分 | 可承载帧数据；落盘与回放不在 Bento |
+| 13.4 | 磁盘满导致录制中断 | RISK-056、AX-098 | 无 | 不适用 | 本地文件系统语义 |
+
+---
+
+## 14. 不适用项与理由（汇总）
+
+| 项 | 涉及编号 | 不适用理由 |
+|---|---|---|
+| Win7/PE/32 位 Windows 兼容 | CON-03、AX-070、AX-082 | Go2Cpp 是 Linux 运行时（epoll/poll + POSIX socket），不交付 Windows 桌面形态；Win32 API 与 PE 环境不存在 |
+| IRDPSRAPI / RDP 媒体层 | CON-10、AX-025、AX-031 | `SharingSession/Viewer`、RDP 编码协商、H.264 回退都是 Windows COM 组件；Bento 只做传输，不自研采屏/编码 |
+| invitation XML 解析与改写 | FR-04、RISK-014、RISK-015 | 系统生成的 RDP 邀请串格式随 Windows 版本变化，属 RDP 会话建立；通用回环代理只搬运字节 |
+| 虚拟通道（DVC）协议 | FR-08、RISK-008、AX-081 | DVC 是 RDP 的动态通道，Windows 专属；Bento 提供的是「独立可靠/不可靠通道」这一等价能力 |
+| 控制权仲裁与 UIPI | FR-03、RISK-002、RISK-024、RISK-027 | 控制权是 RDP attendee 语义，UIPI 是 Windows 完整性级别；Bento 只提供 per-peer 消息通道 |
+| 命令注入 / 路径穿越防护 | RISK-040、RISK-046、AX-047 | 属应用层输入校验；传输层不解析业务载荷 |
+| 备份打包上传 / AVI 录制 | FR-18、FR-17、RISK-050、RISK-054 | 文件格式与 HTTP 上传属应用层；Bento 不引入 zip/AVI 依赖 |
+| Go 中转服务部署 | CON-02、CON-14、RISK-075、RISK-077 | JinShan 的中转是 Go 独立服务；Go2Cpp 侧能提供的是传输组件与本地代理，不是部署形态 |
+| 提权重连 / 服务模式（Session 0） | FR-07、RISK-005、RISK-058 | Windows 进程与 UAC 语义，Linux 无对应物 |
+
+---
+
+## 15. 缺口汇总与优先级
+
+| 优先级 | 缺口 | 影响场景 | 建议动作 |
+|---|---|---|---|
+| P0（本轮已补） | 单 peer 限制：一个 socket 无法服务多个主控 | 3.1–3.3 | 新增 `PeerHub`（多 peer 路由 + per-peer 通道），`test_peer_hub` 覆盖 3 peer 隔离 |
+| P0（本轮已补） | 无通用 TCP 回环代理 | 4.1–4.4、8.2 | 新增 `TcpProxy`（并发、半关闭、超时），`test_tcp_proxy` 覆盖 100KB/半关闭/并发 |
+| P1 | `PeerHub` 未接 PSK 加密与 0-RTT | 9.4 | 复用 `crypto.hpp`，每 peer 独立会话密钥 |
+| P1 | `PeerHub` 未接视频通道与 FEC | 2.3、13.3 | 复用 `VideoChannel`，per-peer 重组状态 |
+| P1 | 多 peer 下地址迁移缺测试 | 10.3 | 增加 NAT rebinding 测试（按 conn_id 更新地址） |
+| P1 | 结构化错误码缺失 | 12.4 | 引入 `enum class BentoError`，与字符串并存 |
+| P2 | 带宽整形/乱序注入测试工具 | 1.3、1.5 | 扩展 `udp_proxy`：限速、乱序、抖动 |
+| P2 | 100MB 级大文件压测 | 6.1、6.4 | 应用层分块协议 + 端到端哈希 |
+| P2 | 统一日志钩子 | 12.5 | 可选 `std::function<void(level, msg)>` 注入点 |
+
+---
+
+## 16. 覆盖统计与自检
+
+| 指标 | 数值 |
+|---|---|
+| 场景类别 | 13 类（弱网/混合可靠/多客户端/回环中继/侧信道/大文件/控制权/公网穿透/加密/迁移/差环境/可观测/录屏） |
+| 场景条目 | 66 条 |
+| 已有 | 30 条 |
+| 部分 | 22 条 |
+| 缺 | 5 条 |
+| 不适用 | 9 条（另见第 14 节 9 项理由） |
+
+自检清单：
+
+- [x] 13 类场景齐全，每类至少 2 条具体场景。
+- [x] 每行都引用了 JinShan 编号（FR/CON/NFR、AX-xxx 或 RISK-xxx）。
+- [x] 每行的 Go2Cpp 能力都指向真实文件与接口（`include/go2cpp/bento/net/**`、`tests/bento/**`）。
+- [x] 「不适用」项给出理由，而不是简单标成缺失。
+- [x] 缺口按 P0/P1/P2 分级，P0 两项已在本次改动中补齐并有测试。
+- [x] 统计数字与表格行数一致：场景行 66 = 已有 30 + 部分 22 + 缺 5 + 不适用 9，
+      可用以下命令复核：
+
+  ```bash
+  grep -cE '^\| [0-9]+\.[0-9]+ \|' docs/modules/bento-scenarios.md
+  grep -E '^\| [0-9]+\.[0-9]+ \|' docs/modules/bento-scenarios.md \
+    | grep -oE '\| (已有|部分|缺|不适用) \|' | sort | uniq -c
+  ```
+
+---
+
+## 17. 变更记录
+
+| 日期 | 版本 | 变更 |
+|---|---|---|
+| 2026-10-27 | v1.0 | 首次建立：从 RTM/anomalies/risk-register 抽取 13 类 66 条场景，映射到 Bento 现有能力；记录 P0 两项缺口（多 peer、TCP 回环代理）的补法 |
+
+---
+
+## 18. 落地记录（2026-10-27）
+
+> 本节记录本矩阵对应的代码落地与验证结果。按任务边界，改动只落在
+> `include/go2cpp/bento/net/**`、`src/bento/net/**`、`tests/bento/**`、
+> `cmake/Go2CppBento.cmake`、`docs/modules/bento-scenarios.md`。
+
+### 18.1 新增
+
+| 文件 | 作用 |
+|---|---|
+| `include/go2cpp/bento/net/peer_hub.hpp` + `src/bento/net/peer_hub.cpp` | 多 peer 链路：单 socket + `conn_id` 路由 + per-peer 通道 |
+| `include/go2cpp/bento/net/tcp_proxy.hpp` + `src/bento/net/tcp_proxy.cpp` | 通用 TCP 回环代理：并发连接、半关闭、超时、背压 |
+| `tests/bento/test_peer_hub.cpp` | 1 被控 3 主控、伪造 conn_id、超时隔离、参数校验、吞吐 |
+| `tests/bento/test_tcp_proxy.cpp` | 100KB 回显、半关闭、并发隔离、拨号失败、空闲超时、连接上限、幂等关闭 |
+
+### 18.2 修改
+
+| 文件 | 改动 | 理由 |
+|---|---|---|
+| `src/bento/net/link.cpp` | `UdpSocket::Open` 增加 `SO_RCVBUF/SO_SNDBUF`（1MB） | 多 peer 突发时内核接收队列是最先丢包点，实测 150 个 80B 包丢 8 个 |
+| `cmake/Go2CppBento.cmake` | 两个新源文件；两个测试目标 + ctest 注册 + TIMEOUT | 让新组件进入既有构建/测试入口 |
+
+### 18.3 验证结果
+
+| 项 | 结果 |
+|---|---|
+| 编译 | Bento 39 个目标全部成功，`-Werror` 下 0 警告 |
+| `bento_test_peer_hub` | PASS，389 断言；3 peer × 50 STREAM + 50 DATAGRAM 全隔离；0 串台；吞吐 307KB/80ms ≈ 30.7 Mbit/s |
+| `bento_test_tcp_proxy` | PASS，44 断言；100KB 回显字节一致；半关闭响应完整；3 并发不串流；超时/上限生效 |
+| ctest（Bento） | 23/23 通过（含 21 个测试程序 + weaknet + netem） |
+| 回归 | `bento_test_link_loopback` 866 断言通过，`bento_secure_link` 等 20 个测试全部通过 |
+| 稳定性 | 两个新测试连续运行 5 次全部 PASS，无 flaky |
+
+### 18.4 实现中发现的两个坑（已修复）
+
+1. **控制帧漏写 `conn_id`**：`PeerHub::SendControl` 最初直接 `BuildFrame`，
+   ACK/心跳/MAX_DATA 的 `conn_id=0`，接收端按 `conn_id` 路由查不到 → ACK 回不去
+   → 发送端 `Pump` 被初始 cwnd 卡住。实测表现：每 peer 发 50 条只交付 32 条
+   （32 正好是初始 cwnd）。修复：控制帧统一写 `peer.conn_id`。
+2. **UDP 突发打满内核 rcvbuf**：3 peer × 50 条 80B 包一次性突发，默认
+   rmem ~212KB 叠加 skb 开销会丢包（实测 8/150）。修复：`UdpSocket::Open`
+   把收发缓冲抬到 1MB；测试侧改为「边发边 pump」。
+
+### 18.5 已知限制
+
+- `PeerHub` 未接 PSK/0-RTT/VIDEO/PMTUD（只在 `Link` 上），列为 P1。
+- 多 peer 下地址迁移已有实现（按 `conn_id` 更新地址）但缺专项测试。
+- `TcpProxy` 是单线程 poll 模型，连接上限默认 64，定位是工具/本地中继。
+- 仓库无 `.clang-format`，新增文件沿用既有 4 空格/100 列风格，未跑格式化。
