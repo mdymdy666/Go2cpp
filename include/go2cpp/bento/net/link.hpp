@@ -72,7 +72,13 @@ struct LinkConfig {
     std::uint32_t ack_interval_ms = 20;  ///< 独立 ACK 的最小发送间隔。
     std::uint32_t hello_initial_pto_ms = 200;
     std::uint32_t hello_max_pto_ms = 2000;
-    std::uint32_t hello_max_attempts = 10;
+    /// 重试上限。10 轮在 40% 丢包下不够稳（3 轮对照实测出现 1 次 15s 超时）；
+    /// 配合 handshake_copies 的冗余后 16 轮把失败概率压到可忽略。
+    std::uint32_t hello_max_attempts = 16;
+    /// 每轮 HELLO / HELLO_ACK 的冗余份数（1 = 关闭冗余）。
+    /// 40% 丢包下单包到达率 60%，2 份把单轮成功率从 0.6 提到 0.84，
+    /// 代价只是一条 28B 的控制帧；不影响已完成会话的数据面。
+    std::uint32_t handshake_copies = 2;
     std::uint32_t random_seed = 0;  ///< 0 = 时钟+pid；测试可固定。
     /// ABR 回调最小间隔（毫秒）。带宽变化超过 10% 时才回调。
     std::uint32_t abr_interval_ms = 200;

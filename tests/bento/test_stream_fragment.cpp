@@ -279,7 +279,8 @@ void TestLinkLoopback5000() {
     BENTO_CHECK_EQ(server_stats.messages_reassembled, 2U);
     BENTO_CHECK_EQ(server_stats.fragments_received, 6U);  // 仅分片帧：4+2
     BENTO_CHECK_EQ(client_stats.retransmits, 0U);
-    BENTO_CHECK_EQ(client_stats.pto_ms, 200U);  // 1ms 样本 + 25ms 后仍被 200ms 下限夹住
+    // 1ms 样本：srtt+4*rttvar 收敛到 ~1ms，被新的 50ms 下限夹住。
+    BENTO_CHECK_EQ(client_stats.pto_ms, 50U);
 
     const std::vector<std::uint8_t> too_large(kMaxStreamMessageBytes + 1, 0x7F);
     BENTO_CHECK(!client.SendStream(0, too_large.data(), too_large.size()));

@@ -734,6 +734,7 @@ void Link::HandleHello(const FrameView& view, const sockaddr_storage& from,
     }
 
     // 重复 HELLO 也要回 ACK：HELLO_ACK 丢失时客户端会重发 HELLO。
+    // 每轮回 handshake_copies 份：高丢包链路下把 ACK 丢失概率从 p 降到 p^2。
     std::uint8_t payload[12];
     MakeHelloPayload(session, m_conn_id, payload);
     FrameHeader header;
@@ -741,7 +742,10 @@ void Link::HandleHello(const FrameView& view, const sockaddr_storage& from,
     header.channel = 0;
     header.conn_id = m_conn_id;
     header.seq = session;
-    (void)SendControl(header, nullptr, payload, sizeof(payload));
+    const std::uint32_t copies = std::max<std::uint32_t>(1U, m_config.handshake_copies);
+    for (std::uint32_t copy = 0; copy < copies; ++copy) {
+        (void)SendControl(header, nullptr, payload, sizeof(payload));
+    }
     m_last_rx_ms = NowMs();
     if (m_state != LinkState::kConnected) {
         m_state = LinkState::kConnected;
@@ -1006,7 +1010,15 @@ void Link::HandleHelloPacket(const std::uint8_t* data, std::size_t bytes,
 
 void Link::HandleHelloAckPacket(const std::uint8_t* data, std::size_t bytes,
                                 const FrameHeader& outer, const sockaddr_storage& from) {
-    if (m_is_listener || m_state != LinkState::kConnecting || !PeerMatches(from)) {
+    if (m_is_listener || !PeerMatches(from)) {
+        ++m_stats.unknown_peer_frames;
+        return;
+    }
+    if (m_state == LinkState::kConnected) {
+        // 冗余 HELLO_ACK 的第二份：握手已完成，静默忽略（不属于未知来源）。
+        return;
+    }
+    if (m_state != LinkState::kConnecting) {
         ++m_stats.unknown_peer_frames;
         return;
     }
@@ -1201,7 +1213,11 @@ void Link::SendHello() {
         header.channel = 0;
         header.conn_id = m_conn_id;
         header.seq = m_session_id;
-        (void)SendControl(header, nullptr, payload, sizeof(payload));
+        // 冗余份数：40% 丢包下 2 份把单轮到达率从 60% 提到 84%。
+        const std::uint32_t copies = std::max<std::uint32_t>(1U, m_config.handshake_copies);
+        for (std::uint32_t copy = 0; copy < copies; ++copy) {
+            (void)SendControl(header, nullptr, payload, sizeof(payload));
+        }
     }
     m_next_hello_ms = now + m_hello_pto_ms;
     m_hello_pto_ms = std::min(m_hello_pto_ms * 2, m_config.hello_max_pto_ms);
@@ -1239,12 +1255,20 @@ bool Link::SendAckFrame(std::uint8_t channel, bool heartbeat) {
 
 void Link::Tick(std::uint64_t now_ms) {
     if (m_state == LinkState::kConnecting) {
+        // 握手超时按当前退避节奏自适应：固定超时会在「最后一次 HELLO 刚
+        // 发出」时判失败，等于白扔那轮重传。宽限 = 当前 PTO（<= hello_max_pto），
+        // 短 RTT 链路仍按配置超时快速失败，高 RTT/高丢包链路多等最后一轮。
+        const std::uint64_t grace = std::max<std::uint64_t>(
+            m_hello_pto_ms, m_config.hello_initial_pto_ms);
+        const std::uint64_t timeout =
+            static_cast<std::uint64_t>(m_config.handshake_timeout_ms) + grace;
+        if (m_hello_attempts >= m_config.hello_max_attempts ||
+            (now_ms >= m_handshake_start_ms &&
+             now_ms - m_handshake_start_ms >= timeout)) {
+            Fail("hello timeout");
+            return;
+        }
         if (now_ms >= m_next_hello_ms) {
-            if (m_hello_attempts >= m_config.hello_max_attempts ||
-                now_ms - m_handshake_start_ms >= m_config.handshake_timeout_ms) {
-                Fail("hello timeout");
-                return;
-            }
             SendHello();
         }
     }
@@ -1272,6 +1296,11 @@ void Link::Tick(std::uint64_t now_ms) {
             SendMaxDataFrame(entry.first, limit)) {
             entry.second->OnMaxDataSent(limit, now_ms);
         }
+    }
+    // 不可靠流的乱序缓存也按 tick 驱动：缺口等待超时后跳过，避免丢包
+    // 把实时通道永久卡在某个缺口上。
+    for (auto& entry : m_unreliable) {
+        entry.second->OnTimer(now_ms);
     }
     m_video->OnTimer(now_ms);
     MaybeReportBandwidth(now_ms);
@@ -2049,7 +2078,13 @@ bool Link::SendSecureHelloAck() {
                             &m_cached_hello_ack)) {
         return false;
     }
-    return SendRawPacket(m_cached_hello_ack.data(), m_cached_hello_ack.size());
+    // 冗余份数：同一份缓存密文重发多次是幂等的（接收端按 wire seq 去重）。
+    bool sent = false;
+    const std::uint32_t copies = std::max<std::uint32_t>(1U, m_config.handshake_copies);
+    for (std::uint32_t copy = 0; copy < copies; ++copy) {
+        sent = SendRawPacket(m_cached_hello_ack.data(), m_cached_hello_ack.size()) || sent;
+    }
+    return sent;
 }
 
 bool Link::GenerateX25519KeyPair() {
@@ -2131,7 +2166,11 @@ bool Link::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
         ++m_secure_stats.handshake_retries;
         m_last_rx_ms = NowMs();
         if (!m_cached_hello_ack.empty()) {
-            (void)SendRawPacket(m_cached_hello_ack.data(), m_cached_hello_ack.size());
+            const std::uint32_t copies =
+                std::max<std::uint32_t>(1U, m_config.handshake_copies);
+            for (std::uint32_t copy = 0; copy < copies; ++copy) {
+                (void)SendRawPacket(m_cached_hello_ack.data(), m_cached_hello_ack.size());
+            }
         }
         return true;
     }
@@ -2229,7 +2268,15 @@ bool Link::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
 
 bool Link::HandleSecureHelloAck(const std::uint8_t* data, std::size_t bytes,
                                 const FrameHeader& outer, const sockaddr_storage& from) {
-    if (m_is_listener || m_state != LinkState::kConnecting || !PeerMatches(from)) {
+    if (m_is_listener || !PeerMatches(from)) {
+        ++m_stats.unknown_peer_frames;
+        return false;
+    }
+    if (m_state == LinkState::kConnected) {
+        // 冗余 HELLO_ACK 的第二份：握手已完成，静默忽略。
+        return false;
+    }
+    if (m_state != LinkState::kConnecting) {
         ++m_stats.unknown_peer_frames;
         return false;
     }

@@ -129,85 +129,132 @@ void TestFrameCodec() {
 void TestDropStale() {
     Relation relation;
     std::vector<std::uint32_t> delivered;
-    UnreliableChannel channel(0, &relation,
-                              [&delivered](std::uint32_t seq, const std::uint8_t*, std::size_t) {
-                                  delivered.push_back(seq);
-                              });
+    UnreliableChannel::Config config;
+    // 128 覆盖 11..100 的整段乱序（89 帧）；小窗口会在注入中途触发容量
+    // 淘汰，反而测不到「乱序补齐后按序交付」。
+    config.reorder_window = 128;
+    config.reorder_timeout_ms = 100;
+    UnreliableChannel channel(
+        0, &relation,
+        [&delivered](std::uint32_t seq, const std::uint8_t*, std::size_t) {
+            delivered.push_back(seq);
+        },
+        config);
     channel.SetFrameSink([](const std::uint8_t*, std::size_t) { return true; });
 
-    InjectDatagram(channel, 5, 0, PayloadOf(5));
-    BENTO_CHECK_EQ(delivered.size(), 1U);
-    InjectDatagram(channel, 3, 0, PayloadOf(3));
-    InjectDatagram(channel, 4, 0, PayloadOf(4));
-    InjectDatagram(channel, 2, 0, PayloadOf(2));
-    InjectDatagram(channel, 1, 0, PayloadOf(1));
-    BENTO_CHECK_EQ(delivered.size(), 1U);
-    InjectDatagram(channel, 6, 0, PayloadOf(6));
-    BENTO_CHECK_EQ(delivered.size(), 2U);
-    BENTO_CHECK_EQ(channel.stats().stale_dropped, 4U);
-
-    // 采纳 100 后乱序注入 1..99：全部是旧包，必须 0 采纳。
-    InjectDatagram(channel, 100, 0, PayloadOf(100));
-    std::vector<std::uint32_t> stale_sequences(99);
-    std::iota(stale_sequences.begin(), stale_sequences.end(), 1U);
-    std::mt19937 random(20261026U);
-    std::shuffle(stale_sequences.begin(), stale_sequences.end(), random);
-    for (const std::uint32_t seq : stale_sequences) {
+    // 乱序注入 1..8：全部进乱序缓存，缺口补齐后按序交付（应用层 0 回退）。
+    const std::vector<std::uint32_t> shuffled{5, 3, 1, 7, 2, 8, 4, 6};
+    for (const std::uint32_t seq : shuffled) {
         InjectDatagram(channel, seq, 0, PayloadOf(seq));
     }
-    InjectDatagram(channel, 100, 0, PayloadOf(100));
-    BENTO_CHECK_EQ(delivered.size(), 3U);
+    BENTO_CHECK_EQ(delivered.size(), 8U);
     BENTO_CHECK(StrictlyIncreasing(delivered));
-    BENTO_CHECK_EQ(delivered[0], 5U);
-    BENTO_CHECK_EQ(delivered[1], 6U);
-    BENTO_CHECK_EQ(delivered[2], 100U);
-    BENTO_CHECK_EQ(channel.stats().stale_dropped, 104U);
-    BENTO_CHECK_EQ(channel.stats().messages_delivered, 3U);
+    BENTO_CHECK_EQ(channel.applied_seq(), 8U);
+    BENTO_CHECK_EQ(channel.reorder_pending(), 0U);
+    BENTO_CHECK_EQ(channel.stats().stale_dropped, 0U);
+    // 5/3/7/8 进缓存；1/2/4/6 到达时与水位连续，直接交付并冲刷后续。
+    BENTO_CHECK(channel.stats().reorder_buffered >= 4U);
+
+    // 已交付之后到达的旧包/重复包：真·过期，绝不采纳（0 回退）。
+    InjectDatagram(channel, 4, 0, PayloadOf(4));
+    InjectDatagram(channel, 8, 0, PayloadOf(8));
+    BENTO_CHECK_EQ(delivered.size(), 8U);
+    BENTO_CHECK_EQ(channel.stats().stale_dropped, 2U);
+
+    // 缺口 9 永久丢失：10 先到进缓存，超时后跳过缺口交付（实时性兜底）。
+    InjectDatagram(channel, 10, 0, PayloadOf(10));
+    BENTO_CHECK_EQ(delivered.size(), 8U);
+    channel.OnTimer(NowMs() + config.reorder_timeout_ms + 10);
+    BENTO_CHECK_EQ(delivered.size(), 9U);
+    BENTO_CHECK_EQ(delivered.back(), 10U);
+    BENTO_CHECK_EQ(channel.applied_seq(), 10U);
+    BENTO_CHECK_EQ(channel.stats().reorder_skipped, 1U);
+
+    // 越过 10 之后旧包 9 才到：不再采纳（过期不接受）。
+    InjectDatagram(channel, 9, 0, PayloadOf(9));
+    BENTO_CHECK_EQ(delivered.size(), 9U);
+    BENTO_CHECK_EQ(channel.stats().stale_dropped, 3U);
+
+    // 100 先到、随后 11..99 乱序补齐：全部缓存后按序交付，100 也必须
+    // 排在 99 之后（乱序容忍不等于乱序交付）。
+    InjectDatagram(channel, 100, 0, PayloadOf(100));
+    std::vector<std::uint32_t> middle(89);
+    std::iota(middle.begin(), middle.end(), 11U);
+    std::mt19937 random(20261026U);
+    std::shuffle(middle.begin(), middle.end(), random);
+    for (const std::uint32_t seq : middle) {
+        InjectDatagram(channel, seq, 0, PayloadOf(seq));
+    }
+    BENTO_CHECK_EQ(delivered.size(), 99U);  // 1..8 + 10 + 11..100（缺 9）。
+    BENTO_CHECK(StrictlyIncreasing(delivered));
+    BENTO_CHECK_EQ(delivered.back(), 100U);
+    BENTO_CHECK(std::find(delivered.begin(), delivered.end(), 9U) == delivered.end());
     BENTO_CHECK_EQ(channel.applied_seq(), 100U);
     BENTO_CHECK_EQ(relation.watermark(), 100U);
+    BENTO_CHECK_EQ(channel.stats().stale_dropped, 3U);
+
+    // applied=100 之后注入 1..100：全部是旧包，0 采纳。
+    for (std::uint32_t seq = 1; seq <= 100; ++seq) {
+        InjectDatagram(channel, seq, 0, PayloadOf(seq));
+    }
+    BENTO_CHECK_EQ(delivered.size(), 99U);
+    BENTO_CHECK_EQ(channel.stats().stale_dropped, 103U);
 
     // 长度为 0 的载荷也是合法 DATAGRAM。
     InjectDatagram(channel, 101, 0, {});
-    BENTO_CHECK_EQ(delivered.size(), 4U);
-    BENTO_CHECK_EQ(delivered[3], 101U);
+    BENTO_CHECK_EQ(delivered.size(), 100U);
+    BENTO_CHECK_EQ(delivered.back(), 101U);
     BENTO_CHECK(StrictlyIncreasing(delivered));
 }
 
 void TestCausalDependency() {
     Relation relation;
     std::vector<std::uint32_t> delivered;
-    UnreliableChannel channel(0, &relation,
-                              [&delivered](std::uint32_t seq, const std::uint8_t*, std::size_t) {
-                                  delivered.push_back(seq);
-                              });
+    UnreliableChannel::Config config;
+    config.reorder_window = 16;
+    config.reorder_timeout_ms = 100;
+    UnreliableChannel channel(
+        0, &relation,
+        [&delivered](std::uint32_t seq, const std::uint8_t*, std::size_t) {
+            delivered.push_back(seq);
+        },
+        config);
     channel.SetFrameSink([](const std::uint8_t*, std::size_t) { return true; });
 
-    InjectDatagram(channel, 10, 0, PayloadOf(10));
+    // 先建立连续基线 1..10。
+    for (std::uint32_t seq = 1; seq <= 10; ++seq) {
+        InjectDatagram(channel, seq, 0, PayloadOf(seq));
+    }
+    BENTO_CHECK_EQ(delivered.size(), 10U);
+    BENTO_CHECK(StrictlyIncreasing(delivered));
+
+    // dep 未满足：20 挂起，不交付也不推进 applied。
     InjectDatagram(channel, 20, 12, PayloadOf(20));
-    BENTO_CHECK_EQ(delivered.size(), 1U);
+    BENTO_CHECK_EQ(delivered.size(), 10U);
     BENTO_CHECK_EQ(channel.stats().dependency_deferred, 1U);
     BENTO_CHECK_EQ(relation.pending(), 1U);
 
+    // 11、12 到达 → 水位推进 → 释放 20（因果等待后直接交付，不再进缓存）。
     InjectDatagram(channel, 11, 0, PayloadOf(11));
     InjectDatagram(channel, 12, 0, PayloadOf(12));
-    BENTO_CHECK_EQ(delivered.size(), 4U);
+    BENTO_CHECK_EQ(delivered.size(), 13U);
     BENTO_CHECK(StrictlyIncreasing(delivered));
-    BENTO_CHECK_EQ(delivered[0], 10U);
-    BENTO_CHECK_EQ(delivered[1], 11U);
-    BENTO_CHECK_EQ(delivered[2], 12U);
-    BENTO_CHECK_EQ(delivered[3], 20U);
+    BENTO_CHECK_EQ(delivered.back(), 20U);
     BENTO_CHECK_EQ(relation.pending(), 0U);
 
-    // 依赖被后续帧越过：释放时按 DropStale 丢弃，不产生乱序交付。
+    // 依赖被后续水位越过：30(dep 40) 挂起；50 到达后超时跳过缺口交付，
+    // 水位越过 30，30 按 DropStale 丢弃（不产生回退交付）。
     InjectDatagram(channel, 30, 40, PayloadOf(30));
     BENTO_CHECK_EQ(relation.pending(), 1U);
     InjectDatagram(channel, 50, 0, PayloadOf(50));
+    BENTO_CHECK_EQ(delivered.size(), 13U);  // 50 在缓存等缺口 21..49。
+    channel.OnTimer(NowMs() + config.reorder_timeout_ms + 10);
+    BENTO_CHECK_EQ(delivered.back(), 50U);
     BENTO_CHECK_EQ(relation.pending(), 0U);
-    BENTO_CHECK(StrictlyIncreasing(delivered));
     BENTO_CHECK(std::find(delivered.begin(), delivered.end(), 30U) == delivered.end());
+    BENTO_CHECK(StrictlyIncreasing(delivered));
 
-    // BARRIER：先把 applied 抬到 150，再释放依赖 150 的 200。
-    InjectDatagram(channel, 100, 0, PayloadOf(100));
+    // BARRIER：先把 applied 抬到 150，再释放 dep=150 的 200。
     InjectDatagram(channel, 200, 150, PayloadOf(200));
     BENTO_CHECK_EQ(relation.pending(), 1U);
     channel.OnBarrier(150);

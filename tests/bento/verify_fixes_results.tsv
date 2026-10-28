@@ -1,0 +1,10 @@
+scenario	run	rc	delivered	ordered	p50_ms	p95_ms	retrans	unreliable_delivered	unreliable_ordered	unreliable_stale	wall_ms
+loss_5_delay_50	1	0	200	1	207	276	153	189	1	0	1069
+loss_5_delay_50	2	0	200	1	199	230	151	194	1	0	1059
+loss_5_delay_50	3	0	200	1	185	300	162	190	1	0	1054
+loss_20_delay_200_jitter_50	1	0	200	1	1136	2653	297	161	1	0	3610
+loss_20_delay_200_jitter_50	2	0	200	1	1312	2102	225	165	1	0	3104
+loss_20_delay_200_jitter_50	3	0	200	1	1756	2588	209	155	1	0	3648
+loss_40_delay_100	1	0	200	1	3525	4697	403	125	1	0	7519
+loss_40_delay_100	2	0	200	1	2879	5183	511	119	1	0	6221
+loss_40_delay_100	3	0	200	1	3101	5268	460	123	1	0	6319

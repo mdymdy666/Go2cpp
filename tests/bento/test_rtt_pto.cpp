@@ -52,31 +52,25 @@ struct Harness {
     }
 };
 
-bool WithinPercent50(std::uint32_t actual, std::uint32_t reference) {
-    return static_cast<std::uint64_t>(actual) * 2ULL >= reference &&
-           static_cast<std::uint64_t>(actual) * 2ULL <=
-               static_cast<std::uint64_t>(reference) * 3ULL;
-}
-
 void TestEstimatorFormula() {
     RttEstimator estimator;
     BENTO_CHECK(!estimator.has_sample());
-    // 初始 333ms、rttvar=166ms、max_ack_delay=25ms -> 333+664+25=1022。
-    BENTO_CHECK_EQ(estimator.base_pto_ms(), 1022U);
+    // 无样本：initial_rtt=200、rttvar=100，PTO = 200+4*100 = 600。
+    BENTO_CHECK_EQ(estimator.base_pto_ms(), 600U);
 
     estimator.OnSample(100);
     BENTO_CHECK_EQ(estimator.smoothed_rtt_ms(), 100U);
     BENTO_CHECK_EQ(estimator.rttvar_ms(), 50U);
-    BENTO_CHECK_EQ(estimator.base_pto_ms(), 325U);  // 100 + 200 + 25
+    BENTO_CHECK_EQ(estimator.base_pto_ms(), 300U);  // 100 + 200（不含 ACK 补偿）
 
     estimator.OnSample(200);
     // rttvar = (3*50 + |100-200|)/4 = 62；srtt = (7*100 + 200)/8 = 112。
     BENTO_CHECK_EQ(estimator.rttvar_ms(), 62U);
     BENTO_CHECK_EQ(estimator.smoothed_rtt_ms(), 112U);
-    BENTO_CHECK_EQ(estimator.base_pto_ms(), 385U);  // 112 + 248 + 25
+    BENTO_CHECK_EQ(estimator.base_pto_ms(), 360U);  // 112 + 248
 
-    BENTO_CHECK_EQ(estimator.BackoffPtoMs(0), 385U);
-    BENTO_CHECK_EQ(estimator.BackoffPtoMs(1), 770U);
+    BENTO_CHECK_EQ(estimator.BackoffPtoMs(0), 360U);
+    BENTO_CHECK_EQ(estimator.BackoffPtoMs(1), 720U);
     BENTO_CHECK_EQ(estimator.BackoffPtoMs(3), 2000U);  // 3080 -> max
 }
 
@@ -134,28 +128,32 @@ void TestAdaptation() {
     const DelayResult normal = RunDelay(200);
     const DelayResult far = RunDelay(400);
 
-    // 50ms RTT：公式值 50+4*rttvar+25 低于 200ms 下限，应被夹到 200。
-    BENTO_CHECK_EQ(slow.pto, 200U);
-    BENTO_CHECK(normal.pto >= 200U && normal.pto <= 300U);
-    BENTO_CHECK(far.pto >= 400U && far.pto <= 550U);
+    // 50ms RTT：srtt=50、rttvar 收敛到 0，被 srtt/8 抖动下限抬到
+    // 50+4*6=74ms（旧实现被固定 200ms 下限抬到 200ms，在低延迟链路上
+    // 每个迟到 ACK 都变成一次伪超时重传）。
+    BENTO_CHECK_EQ(slow.pto, 74U);
+    BENTO_CHECK(normal.pto >= 250U && normal.pto <= 350U);
+    BENTO_CHECK(far.pto >= 500U && far.pto <= 700U);
     BENTO_CHECK(slow.pto <= normal.pto);
     BENTO_CHECK(normal.pto <= far.pto);
 
-    // 延迟越大 PTO 越大，且相对「max(RTT, 下限)」落在 ±50% 内。
-    BENTO_CHECK(WithinPercent50(slow.pto, 200U));
-    BENTO_CHECK(WithinPercent50(normal.pto, 200U));
-    BENTO_CHECK(WithinPercent50(far.pto, 400U));
+    // PTO 随 RTT 单调增长，且与 srtt 的偏差不超过 1 个 RTT（rttvar 收敛后）。
+    BENTO_CHECK(slow.pto <= 2U * (slow.srtt + 1U));
+    BENTO_CHECK(normal.pto <= 2U * (normal.srtt + 1U));
+    BENTO_CHECK(far.pto <= 2U * (far.srtt + 1U));
 
     BENTO_CHECK(normal.srtt >= 190U && normal.srtt <= 210U);
     BENTO_CHECK(far.srtt >= 380U && far.srtt <= 420U);
     BENTO_CHECK(far.rttvar < far.srtt);
 
-    // 每个结果都必须严格满足 PTO 公式（含 25ms ACK 延迟补偿与上下限）。
+    // 每个结果都必须严格满足 srtt + 4*max(rttvar, srtt/8)，并夹在 [50ms, 2s]。
     const auto expected = [](const DelayResult& result) {
-        const std::uint64_t formula = static_cast<std::uint64_t>(result.srtt) +
-                                     4ULL * result.rttvar + 25ULL;
+        const std::uint64_t floor = static_cast<std::uint64_t>(result.srtt) / 8ULL;
+        const std::uint64_t rttvar = std::max<std::uint64_t>(result.rttvar, floor);
+        const std::uint64_t formula =
+            static_cast<std::uint64_t>(result.srtt) + 4ULL * rttvar;
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            std::max<std::uint64_t>(formula, 200ULL), 2000ULL));
+            std::max<std::uint64_t>(formula, 50ULL), 2000ULL));
     };
     BENTO_CHECK_EQ(slow.pto, expected(slow));
     BENTO_CHECK_EQ(normal.pto, expected(normal));
@@ -191,12 +189,12 @@ void TestKarnSampling() {
     harness.now += 200;
     harness.channel->OnTimer(harness.now);
     BENTO_CHECK_EQ(harness.channel->stats().retransmits, 1U);
-    BENTO_CHECK_EQ(harness.channel->stats().srtt_ms, 333U);  // 尚未采样
+    BENTO_CHECK_EQ(harness.channel->stats().srtt_ms, 200U);  // 尚未采样
 
     harness.now += 300;  // 若采样会得到 500ms
     harness.AckAll();
     BENTO_CHECK_EQ(harness.channel->stats().acks_applied, 1U);
-    BENTO_CHECK_EQ(harness.channel->stats().srtt_ms, 333U);  // Karn：重传消息不采样
+    BENTO_CHECK_EQ(harness.channel->stats().srtt_ms, 200U);  // Karn：重传消息不采样
     BENTO_CHECK_EQ(harness.channel->stats().last_rtt_ms, 0U);
 
     // 下一条未重传消息才产生首样本。

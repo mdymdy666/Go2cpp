@@ -71,10 +71,10 @@ seq 从 1 开始，`0` 保留为「无效」。32 位回绕由 `SeqGreater`（�
 
 | 值 | 类型 | 载荷 | 可靠性 |
 |---|---|---|---|
-| 0x01 | HELLO | 8B：`"BENT"` + session u32 | 握手重传 200ms→2s，最多 10 次 |
-| 0x02 | HELLO_ACK | 8B：`"BENT"` + 回显 session | 同上，由监听方回复 |
+| 0x01 | HELLO | 8B：`"BENT"` + session u32 | 握手重传 200ms→2s，最多 16 轮；每轮 2 份冗余 |
+| 0x02 | HELLO_ACK | 8B：`"BENT"` + 回显 session | 同上，由监听方回复（重复 HELLO 幂等重发） |
 | 0x03 | STREAM | 应用消息（≤1300B） | 可靠有序：ACK + 重传 + 去重 |
-| 0x04 | DATAGRAM | 应用消息（≤1300B） | 不可靠：DropStale |
+| 0x04 | DATAGRAM | 应用消息（≤1300B） | 不可靠：乱序容忍缓存 + 单调交付 |
 | 0x05 | VIDEO | 8B 子头 + 分片（每片 ≤1200B） | 不可靠分片，接收端重组 |
 | 0x06 | ACK | 8B：ack_seq u32 + ack_bits u32 | 独立 ACK / 心跳 |
 | 0x07 | BARRIER | 无载荷，屏障 seq 在 header.seq | 一次发送，作废旧不可靠 seq |
@@ -139,12 +139,19 @@ Connected ──peer_timeout_ms 内无任何有效帧──> TimedOut
 ### 3.3 UnreliableChannel（DATAGRAM）
 
 - 每通道独立发送 seq，从 1 单调递增；接收端只接受 `seq > applied_seq`。
-- `seq <= applied_seq` → `stale_dropped++`，永不采纳（DropStale）。
+- `seq <= applied_seq` → `stale_dropped++`，永不采纳（真·过期，含重复包）。
+- `seq > applied_seq` 但不连续 → 进乱序缓存（上限 256 帧），等待
+  `reorder_timeout_ms`（默认 200ms，从缺口后最早缓存帧到达开始计时）；
+  缺口补齐或超时后按 seq 升序交付。缓存满/超时未补齐时跳过缺口，
+  只丢弃已经确定丢失的 seq，不再把乱序到达误判为过期。
+- 交付序号仍然**严格递增**（应用层 0 回退）；`ordered=1`。
 - 带 `dep_seq` 且依赖未满足 → 复制载荷放入 Relation pending（上限 128）。
-- 依赖满足/ BARRIER 释放时，若该帧 seq 已被更新的帧越过，仍按 stale 丢弃。
-  结果：交付序号**严格递增**，代价是部分晚到帧被丢弃。
+- 依赖满足/ BARRIER 释放时直接交付（已等待过因果水位，不再二次缓存）；
+  若该帧 seq 已被更新的帧越过，仍按 stale 丢弃。
 - BARRIER：先把所有不可靠通道 applied 抬到 barrier_seq，再释放 Relation
-  pending；barrier 之前的帧永久作废。
+  pending；barrier 之前的帧永久作废（缓存中已被越过的项一并作废）。
+- 可观测：`reorder_buffered / reorder_released / reorder_skipped / reorder_stale /
+  reorder_pending`（见 `UnreliableChannel::Stats`）。
 
 ### 3.4 VideoChannel（VIDEO）
 

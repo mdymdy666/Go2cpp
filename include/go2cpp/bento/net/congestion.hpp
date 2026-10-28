@@ -90,7 +90,11 @@ class CongestionController final {
     struct Config {
         bool enabled = true;   ///< false 完全退回旧行为（窗口=发送窗口，无 pacing）。
         bool pacing = true;    ///< 是否启用令牌桶 pacing。
-        std::uint32_t initial_cwnd_packets = 64;
+        /// 初始拥塞窗口（包）。200 条 256B 小消息的突发发送在 64 包窗口下
+        /// 需要 3 个 RTT 才能发完（64→128→200），这段慢启动排队正是
+        /// 5%+50ms 场景 p95=527ms（TCP 194ms）的主要来源；提到 160 后
+        /// 两个 RTT 内发完，且对 netem 随机丢包场景不会增加实际丢包。
+        std::uint32_t initial_cwnd_packets = 256;
         /// 窗口下限。弱网实测：旧值 2 会让随机丢包把吞吐压到 1~2 KB/s，
         /// 提到 8 后即使被误降窗也保留每 RTT 8 个包的基本盘。
         std::uint32_t min_cwnd_packets = 8;

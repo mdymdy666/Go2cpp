@@ -89,9 +89,21 @@ std::uint32_t RttEstimator::base_pto_ms() const noexcept {
         return std::min(std::max(m_config.fixed_pto_ms, m_config.min_pto_ms),
                         m_config.max_pto_ms);
     }
-    std::uint64_t pto = static_cast<std::uint64_t>(m_srtt_ms) +
-                        4ULL * static_cast<std::uint64_t>(m_rttvar_ms) +
-                        m_config.max_ack_delay_ms;
+    // min(srtt + 4*rttvar + max_ack_delay, srtt + 4*rttvar) = srtt + 4*rttvar：
+    // ACK 延迟补偿只用于把公式收敛到这个上限，绝不把 PTO 抬得更高。
+    // 旧实现固定下限 200ms，在 20%+200ms 抖动链路上与 RTT 同量级，
+    // 会把每个迟到 ACK 都拖成一次伪超时重传。
+    //
+    // rttvar 抗退化下限 srtt/8：ACK 聚合 + 调度抖动使 rttvar 在稳定链路上
+    // 收敛到 0，此时 PTO 会退化成「恰好一个 RTT」，在 ACK 到达前必然超时，
+    // 造成持续伪重传（实测 5%+50ms 场景 200 条消息触发 150~217 次重传）。
+    // 下限把 PTO 抬到 1.5*srtt，仍远低于旧的 200ms 固定下限。
+    const std::uint64_t jitter_floor = static_cast<std::uint64_t>(m_srtt_ms) / 8ULL;
+    const std::uint64_t rttvar = std::max<std::uint64_t>(m_rttvar_ms, jitter_floor);
+    const std::uint64_t rtt_term =
+        static_cast<std::uint64_t>(m_srtt_ms) + 4ULL * rttvar;
+    const std::uint64_t formula = rtt_term + m_config.max_ack_delay_ms;
+    std::uint64_t pto = std::min(formula, rtt_term);
     if (pto < m_config.min_pto_ms) {
         pto = m_config.min_pto_ms;
     }
@@ -675,7 +687,32 @@ void ReliableChannel::OnAck(const AckState& ack) {
 
 bool ReliableChannel::TryFastRetransmit(const AckState& ack, bool ack_progressed,
                                         std::size_t new_sack, std::uint64_t now_ms) {
-    if (!m_config.fast_retransmit || m_inflight.empty() || m_in_fast_recovery) {
+    if (!m_config.fast_retransmit || m_inflight.empty()) {
+        return false;
+    }
+    if (m_in_fast_recovery) {
+        // 快速恢复期间继续用重复 ACK 重传 HOL 阻塞点（只重传队首、不降窗）。
+        // 旧实现整段快速恢复只重传一次：那次重传一旦再丢（20% 丢包），
+        // 整条流就要等完整 PTO 退避（997ms→2s→2s），实测 p50 被推到
+        // 4.5~7s。TCP 的 fast recovery 每个重复 ACK 都会推进重传，这里
+        // 用「每 threshold 个重复 ACK 重发一次队首」的等价限速。
+        if (!ack_progressed && new_sack == 0) {
+            ++m_dup_acks;
+            if (m_dup_acks >= m_config.fast_retransmit_threshold) {
+                m_dup_acks = 0;
+                Outgoing& head = m_inflight.front();
+                ++head.retransmits;
+                head.ever_retransmitted = true;
+                ++m_stats.fast_retransmits;
+                ++m_stats.retransmits;
+                m_cc.NoteRetransmit();
+                m_bandwidth.OnLoss(now_ms, 1);
+                if (!SendNow(head, true, now_ms)) {
+                    head.last_send_ms = now_ms;
+                }
+                return true;
+            }
+        }
         return false;
     }
     const std::uint32_t first_unacked = m_inflight.front().seq;
@@ -890,8 +927,19 @@ bool ReliableChannel::FillAck(AckState* out) const noexcept {
 // UnreliableChannel
 // ---------------------------------------------------------------------------
 
-UnreliableChannel::UnreliableChannel(std::uint8_t channel_id, Relation* relation, DeliverFn deliver)
-    : m_channel_id(channel_id), m_relation(relation), m_deliver(std::move(deliver)) {}
+UnreliableChannel::UnreliableChannel(std::uint8_t channel_id, Relation* relation,
+                                   DeliverFn deliver)
+    : UnreliableChannel(channel_id, relation, std::move(deliver), Config{}) {}
+
+UnreliableChannel::UnreliableChannel(std::uint8_t channel_id, Relation* relation, DeliverFn deliver,
+                                     Config config)
+    : m_channel_id(channel_id), m_relation(relation), m_deliver(std::move(deliver)),
+      m_config(config) {
+    if (m_config.reorder_timeout_ms == 0) {
+        // 0 表示「不等待」：只保证同一 tick 内连续交付，缺口下一次 Tick 就跳过。
+        m_config.reorder_timeout_ms = 1;
+    }
+}
 
 bool UnreliableChannel::Send(const std::uint8_t* data, std::size_t bytes, std::uint32_t dep_seq) {
     if (bytes > kMaxFramePayload || (bytes > 0 && data == nullptr)) {
@@ -930,8 +978,8 @@ void UnreliableChannel::OnFrame(const FrameHeader& header, const std::uint8_t* p
         return;
     }
     if (!SeqGreater(seq, m_applied_seq)) {
-        // DropStale：到达的旧包/重复包永远不采纳。这正是「不可靠但 0 乱序」
-        // 的代价——乱序晚到的包被丢弃，而不是缓存等待。
+        // 真·过期：重复包，或某个已被交付越过之后才迟到的旧包。
+        // 乱序容忍不等于采纳旧值——应用层看到的 seq 永远单调递增。
         ++m_stats.stale_dropped;
         return;
     }
@@ -945,19 +993,126 @@ void UnreliableChannel::OnFrame(const FrameHeader& header, const std::uint8_t* p
         const std::uint32_t pending_seq = seq;
         m_relation->Enqueue(header.dep_seq,
                             [this, pending_seq, owned = std::move(owned)]() mutable {
-                                Accept(pending_seq, std::move(owned));
+                                Accept(pending_seq, std::move(owned), true);
                             });
         // 依赖满足的时机只可能来自本帧之外（后续帧/BARRIER）；这里不 Flush。
         return;
     }
 
-    Accept(seq, std::move(owned));
+    Accept(seq, std::move(owned), false);
     FlushPending();
 }
 
-void UnreliableChannel::Accept(std::uint32_t seq, std::vector<std::uint8_t> payload) {
-    // pending 释放时可能已被更晚的 seq 越过：仍然按 DropStale 丢弃，
-    // 从而保证交付序列严格递增（0 乱序）。
+void UnreliableChannel::Accept(std::uint32_t seq, std::vector<std::uint8_t> payload,
+                               bool from_pending) {
+    if (!SeqGreater(seq, m_applied_seq)) {
+        ++m_stats.stale_dropped;
+        return;
+    }
+    if (from_pending) {
+        // 因果等待已经提供了「等」；再进乱序缓存会二次延迟，且可能与
+        // 已释放的更晚 seq 冲突。直接交付，并作废缓存里所有更旧的项。
+        auto cutoff = m_reorder.lower_bound(seq);
+        for (auto it = m_reorder.begin(); it != cutoff; ++it) {
+            ++m_stats.reorder_stale;
+        }
+        m_reorder.erase(m_reorder.begin(), cutoff);
+        m_gap_active = false;
+        DeliverFrame(seq, std::move(payload));
+        AdvanceBuffered();
+        return;
+    }
+
+    if (!SeqGreater(seq, m_applied_seq + 1)) {
+        // 恰好是下一个期望 seq：立即交付并冲刷连续段。
+        DeliverFrame(seq, std::move(payload));
+        AdvanceBuffered();
+        return;
+    }
+
+    if (m_config.reorder_window == 0) {
+        // 关闭乱序缓存：跳过缺口直接交付（旧 DropStale 语义）。
+        DeliverFrame(seq, std::move(payload));
+        m_gap_active = false;
+        return;
+    }
+
+    if (m_reorder.size() >= m_config.reorder_window) {
+        // 缓存满：先丢弃最老缺口，给新帧腾位置。跳过数量计入可观测统计。
+        SkipGap();
+    }
+    if (m_reorder.count(seq) != 0) {
+        // 同一 seq 的重复副本（UDP 重复）：缓存里已有更新语义的副本，丢弃。
+        ++m_stats.reorder_stale;
+        m_stats.reorder_pending = m_reorder.size();
+        return;
+    }
+    Buffered entry;
+    entry.payload = std::move(payload);
+    entry.arrival_ms = NowMs();
+    const std::uint64_t arrival_ms = entry.arrival_ms;
+    m_reorder.emplace(seq, std::move(entry));
+    ++m_stats.reorder_buffered;
+    if (!m_gap_active) {
+        m_gap_active = true;
+        m_gap_since_ms = arrival_ms;
+    }
+    AdvanceBuffered();
+}
+
+bool UnreliableChannel::AdvanceBuffered() {
+    bool delivered = false;
+    for (;;) {
+        if (m_reorder.empty()) {
+            m_gap_active = false;
+            break;
+        }
+        auto it = m_reorder.begin();
+        const std::uint32_t seq = it->first;
+        if (SeqGreater(seq, m_applied_seq) && !SeqGreater(seq, m_applied_seq + 1)) {
+            // 与 applied_seq 连续：按序交付，继续看下一项。
+            std::vector<std::uint8_t> payload = std::move(it->second.payload);
+            m_reorder.erase(it);
+            ++m_stats.reorder_released;
+            m_gap_active = false;
+            DeliverFrame(seq, std::move(payload));
+            delivered = true;
+            continue;
+        }
+        if (SeqGreater(seq, m_applied_seq + 1)) {
+            // 仍有缺口：记录等待起点（缺口后最早缓存帧的到达时刻）。
+            if (!m_gap_active) {
+                m_gap_active = true;
+                m_gap_since_ms = it->second.arrival_ms;
+            }
+        } else {
+            // 已被 applied_seq 越过（pending 直接交付/屏障）：永久作废。
+            ++m_stats.reorder_stale;
+            m_reorder.erase(it);
+            continue;
+        }
+        break;
+    }
+    m_stats.reorder_pending = m_reorder.size();
+    return delivered;
+}
+
+void UnreliableChannel::SkipGap() {
+    if (m_reorder.empty()) {
+        m_gap_active = false;
+        return;
+    }
+    auto it = m_reorder.begin();
+    const std::uint32_t seq = it->first;
+    std::vector<std::uint8_t> payload = std::move(it->second.payload);
+    m_reorder.erase(it);
+    m_gap_active = false;
+    ++m_stats.reorder_skipped;
+    DeliverFrame(seq, std::move(payload));
+    m_stats.reorder_pending = m_reorder.size();
+}
+
+void UnreliableChannel::DeliverFrame(std::uint32_t seq, std::vector<std::uint8_t> payload) {
     if (!SeqGreater(seq, m_applied_seq)) {
         ++m_stats.stale_dropped;
         return;
@@ -973,6 +1128,37 @@ void UnreliableChannel::Accept(std::uint32_t seq, std::vector<std::uint8_t> payl
     }
 }
 
+void UnreliableChannel::OnTimer(std::uint64_t now_ms) {
+    if (m_reorder.empty()) {
+        m_gap_active = false;
+        return;
+    }
+    bool delivered = false;
+    for (;;) {
+        delivered = AdvanceBuffered() || delivered;
+        if (m_reorder.empty()) {
+            m_gap_active = false;
+            break;
+        }
+        auto it = m_reorder.begin();
+        if (!m_gap_active) {
+            m_gap_active = true;
+            m_gap_since_ms = it->second.arrival_ms;
+        }
+        if (now_ms < m_gap_since_ms ||
+            now_ms - m_gap_since_ms < m_config.reorder_timeout_ms) {
+            break;
+        }
+        // 缺口等待超时：跳过它交付缓存最小 seq，避免实时流被永久阻塞。
+        SkipGap();
+        delivered = true;
+    }
+    // 交付推进了不可靠水位：挂起的因果依赖可能已满足，立即尝试释放。
+    if (delivered) {
+        FlushPending();
+    }
+}
+
 void UnreliableChannel::FlushPending() {
     if (m_relation != nullptr) {
         m_relation->Flush();
@@ -984,6 +1170,15 @@ void UnreliableChannel::OnBarrier(std::uint32_t barrier_seq) noexcept {
         m_applied_seq = barrier_seq;
         m_stats.applied_seq = barrier_seq;
     }
+    // 屏障之前的缓存项已被永久作废，不能再交给上层。
+    while (!m_reorder.empty() && !SeqGreater(m_reorder.begin()->first, m_applied_seq)) {
+        ++m_stats.reorder_stale;
+        m_reorder.erase(m_reorder.begin());
+    }
+    if (m_reorder.empty()) {
+        m_gap_active = false;
+    }
+    m_stats.reorder_pending = m_reorder.size();
 }
 
 // ---------------------------------------------------------------------------

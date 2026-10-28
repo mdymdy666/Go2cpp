@@ -39,6 +39,7 @@ struct Options {
     int delay_ms = 0;
     std::uint32_t seed = 0x9E3779B9U;
     bool fixed_pto = false;  ///< 复现旧实现：固定 200ms 基础 PTO。
+    bool verbose = false;    ///< 每秒打印一次收发进度（诊断长尾卡顿）。
 };
 
 void WriteU32(std::uint8_t* out, std::uint32_t value) {
@@ -77,6 +78,8 @@ bool ParseOptions(int argc, char** argv, Options* options) {
             options->seed = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(argument, "--fixed-pto") == 0) {
             options->fixed_pto = true;
+        } else if (std::strcmp(argument, "--verbose") == 0) {
+            options->verbose = true;
         } else {
             std::fprintf(stderr, "unknown or incomplete argument: %s\n", argument);
             return false;
@@ -256,9 +259,26 @@ int main(int argc, char** argv) {
     }
 
     const std::uint64_t receive_deadline = NowMs() + static_cast<std::uint64_t>(options.timeout_ms);
+    std::uint64_t next_report_ms = NowMs() + 1000;
     while (NowMs() < receive_deadline && reliable_received < options.messages) {
         client.RunOnce(1);
         server.RunOnce(1);
+        if (options.verbose && NowMs() >= next_report_ms) {
+            next_report_ms += 1000;
+            const ReliableChannel::Stats client_now = client.reliable_stats(0);
+            const ReliableChannel::Stats server_now = server.reliable_stats(0);
+            std::fprintf(stderr,
+                         "[progress] t=%llu client_inflight=%zu unsent=%zu acks=%llu "
+                         "retrans=%llu srtt=%u rttvar=%u pto=%u | server_delivered=%llu "
+                         "server_inflight=%zu\n",
+                         static_cast<unsigned long long>(NowMs()),
+                         client_now.inflight, client_now.unsent,
+                         static_cast<unsigned long long>(client_now.acks_applied),
+                         static_cast<unsigned long long>(client_now.retransmits),
+                         client_now.srtt_ms, client_now.rttvar_ms, client_now.pto_ms,
+                         static_cast<unsigned long long>(server_now.messages_delivered),
+                         server_now.inflight);
+        }
     }
     // 多跑 500ms 收尾：让不可靠流的最后一批包与 ACK 到达。
     Pump(client, server, 500);
@@ -302,9 +322,17 @@ int main(int argc, char** argv) {
         static_cast<unsigned long long>(congestion.congestion_loss_events),
         congestion.min_rtt_ms, congestion.loss_rate_permille,
         static_cast<unsigned long long>(congestion.bytes_sent));
-    std::printf("netem_probe unreliable: delivered=%u/%u ordered=%d stale_dropped=%llu\n",
-                unreliable_received, options.messages, datagram_ordered ? 1 : 0,
-                static_cast<unsigned long long>(unreliable_stats.stale_dropped));
+    std::printf(
+        "netem_probe unreliable: delivered=%u/%u ordered=%d stale_dropped=%llu "
+        "reorder_buffered=%llu reorder_released=%llu reorder_skipped=%llu "
+        "reorder_stale=%llu reorder_pending=%zu\n",
+        unreliable_received, options.messages, datagram_ordered ? 1 : 0,
+        static_cast<unsigned long long>(unreliable_stats.stale_dropped),
+        static_cast<unsigned long long>(unreliable_stats.reorder_buffered),
+        static_cast<unsigned long long>(unreliable_stats.reorder_released),
+        static_cast<unsigned long long>(unreliable_stats.reorder_skipped),
+        static_cast<unsigned long long>(unreliable_stats.reorder_stale),
+        unreliable_stats.reorder_pending);
     std::printf(
         "netem_probe link: frames_sent=%llu frames_received=%llu handshakes=%llu "
         "heartbeats=%llu timeouts=%llu\n",

@@ -72,19 +72,32 @@ struct FlowControlStats {
 /// @details 首样本取 srtt=rtt、rttvar=rtt/2；之后按
 ///          rttvar = 3/4*rttvar + 1/4*|srtt-rtt|、srtt = 7/8*srtt + 1/8*rtt
 ///          做整数近似（除法向下取整）。PTO 公式：
-///          srtt + 4*rttvar + max_ack_delay，并夹在 [min_pto, max_pto]。
-///          首样本之前使用 RFC 9002 的初始 RTT（333ms），使 400ms RTT
-///          的链路在第一个 ACK 到达前不会因固定 200ms 而必然重传——
-///          这正是旧实现拿不到干净 RTT 样本的根因。
+///          min(srtt + 4*rttvar + max_ack_delay, srtt + 4*rttvar)
+///          = srtt + 4*rttvar，再夹在 [min_pto(50ms), max_pto(2s)]。
+///          旧实现用固定下限 200ms，在 20%+200ms 抖动链路上与 RTT 同量级，
+///          会制造大量伪 PTO 重传（p95 是 TCP 的 2.2~3.4 倍、重传高 35~150 倍）；
+///          下限降到 50ms 后 PTO 完全由 RTT 样本决定。首样本之前使用
+///          RFC 9002 的初始 RTT（333ms），使 400ms RTT 的链路在第一个
+///          ACK 到达前不会误重传。
 class RttEstimator final {
    public:
     struct Config {
-        std::uint32_t min_pto_ms = 200;      ///< PTO 下限（默认 200ms）。
+        /// PTO 下限（默认 50ms）。旧默认 200ms 与 20%+200ms 场景的 RTT
+        /// 同量级，会把每个迟到的 ACK 都拖成一次伪超时重传；降到 50ms
+        /// 后 PTO 由 srtt+4*rttvar 决定，低延迟链路不再被固定下限抬高。
+        std::uint32_t min_pto_ms = 50;
         std::uint32_t max_pto_ms = 2000;     ///< PTO 上限（默认 2s）。
         /// 对端最大 ACK 延迟补偿。RFC 9002 建议 QUIC 默认 25ms；
         /// 本实现 ACK 间隔 20ms，留 25ms 可避免 PTO 与 ACK 到达竞争。
+        /// 注意 PTO 取 min(公式, srtt+4*rttvar)：该补偿只用于把公式
+        /// 收敛到 srtt+4*rttvar 上限，不会把 PTO 抬得更高。
         std::uint32_t max_ack_delay_ms = 25;
-        std::uint32_t initial_rtt_ms = 333;  ///< 首样本前的初始 RTT。
+        /// 首样本前的初始 RTT。RFC 9002 取 333ms，但本实现的探针/批量
+        /// 发送模式在拿到首个 RTT 样本前就已发完全部消息，初始 PTO 过大会
+        /// 让首轮丢包的恢复整整晚一个 997ms 周期（20%+200ms 场景实测
+        /// p95 被推到 3.4s）。200ms 使无样本 PTO=200+4*100=600ms，仍大于
+        /// 常见 RTT，不会在 ACK 到达前误超时。
+        std::uint32_t initial_rtt_ms = 200;
         /// >0 时禁用自适应，固定使用该基础 PTO；用于对比旧行为/回归实验。
         std::uint32_t fixed_pto_ms = 0;
     };
@@ -220,7 +233,8 @@ class ReliableChannel final {
     /// 接收窗口：距 expected 超过该值的 seq 视为过旧/不可信，直接丢弃。
     static constexpr std::size_t kReceiveWindow = 512;
     /// 动态 PTO 的下限（毫秒），也是无样本时最小等待。
-    static constexpr std::uint32_t kInitialPtoMs = 200;
+    /// 与 RttEstimator::Config::min_pto_ms 的默认值保持一致（50ms）。
+    static constexpr std::uint32_t kInitialPtoMs = 50;
     /// PTO 指数退避上限（毫秒）。
     static constexpr std::uint32_t kMaxPtoMs = 2000;
     /// 每个事件循环 tick 最多补发的超时消息数：避免一次 RunOnce 内突发
@@ -482,17 +496,44 @@ class ReliableChannel final {
     Stats m_stats;
 };
 
-/// @brief 不可靠通道（DATAGRAM），接收端 DropStale。
+/// @brief 不可靠通道（DATAGRAM）：乱序容忍窗口 + 严格单调交付。
+/// @details 接收端不再「见到旧 seq 就丢」：seq > applied_seq 但暂时缺席
+///          前序帧的包先进入 reorder buffer，等待 reorder_timeout_ms
+///          （或缓存达到 reorder_window）后按 seq 升序交付；只有
+///          seq <= applied_seq 的真·过期帧才计入 stale_dropped。这样
+///          应用层看到的 seq 仍然严格递增（0 回退），但高抖动链路上
+///          乱序到达不再被误判为过期（旧实现 20%+200ms 抖动下 600 条
+///          只交付 30 条，stale_dropped=453）。
 class UnreliableChannel final {
    public:
+    /// @brief 乱序容忍配置。
+    struct Config {
+        /// 乱序缓存上限（帧）。0 = 关闭缓存，退回纯 DropStale。
+        /// 这里按「在途帧数」而不是「seq 深度」设上限：探针在 120ms 内
+        /// 背靠背发送 200 条，200ms±50ms 抖动会让几乎全部帧同时乱序，
+        /// 若按 seq 深度 16~64 限制会因内存保护提前放弃缺口。256 覆盖
+        /// 200 帧在途，内存上界 256*1300B ≈ 333KB，可接受。
+        std::size_t reorder_window = 256;
+        /// 缺口等待上限（毫秒）：从缺口出现后最早缓存帧到达开始计时。
+        /// 超时仍未补齐则跳过缺口、交付缓存中的最小 seq，避免实时流
+        /// 被一个永久丢失的包阻塞。0 视为 1ms（只保证同 tick 内连续交付）。
+        std::uint32_t reorder_timeout_ms = 200;
+    };
+
     /// @brief 可观测计数器。
     struct Stats {
         std::uint64_t messages_sent = 0;
         std::uint64_t messages_delivered = 0;
-        std::uint64_t stale_dropped = 0;  ///< seq <= applied_seq 的旧包/重复包。
+        /// 真·过期：seq <= applied_seq（重复包或已交付之后才到的旧包）。
+        std::uint64_t stale_dropped = 0;
         std::uint64_t invalid_frames = 0;
         std::uint64_t dependency_deferred = 0;  ///< 依赖未满足而挂起的帧数。
         std::uint64_t applied_seq = 0;          ///< 最近采纳的 seq。
+        std::uint64_t reorder_buffered = 0;     ///< 进入乱序缓存的帧数。
+        std::uint64_t reorder_released = 0;     ///< 从乱序缓存按序交付的帧数。
+        std::uint64_t reorder_skipped = 0;      ///< 超时/缓存满导致的缺口跳过次数。
+        std::uint64_t reorder_stale = 0;        ///< 缓存中因被越界/屏障作废的帧数。
+        std::size_t reorder_pending = 0;        ///< 当前缓存帧数（快照）。
     };
 
     using DeliverFn =
@@ -501,6 +542,8 @@ class UnreliableChannel final {
 
     /// @param relation 因果水位；可为 nullptr。
     UnreliableChannel(std::uint8_t channel_id, Relation* relation, DeliverFn deliver);
+    UnreliableChannel(std::uint8_t channel_id, Relation* relation, DeliverFn deliver,
+                      Config config);
     ~UnreliableChannel() = default;
 
     UnreliableChannel(const UnreliableChannel&) = delete;
@@ -518,7 +561,12 @@ class UnreliableChannel final {
     /// @brief 处理收到的 DATAGRAM 帧。
     void OnFrame(const FrameHeader& header, const std::uint8_t* payload, std::size_t bytes);
 
-    /// @brief 处理 BARRIER：把 applied_seq 抬到 barrier 以上。
+    /// @brief 驱动乱序缓存：缺口等待超时后跳过缺口交付缓存最小项。
+    /// @note Link 每次事件循环（Tick）调用；也可由测试用假时钟驱动。
+    void OnTimer(std::uint64_t now_ms);
+
+    /// @brief 处理 BARRIER：把 applied_seq 抬到 barrier 以上，并作废缓存中
+    ///        已被屏障越过的帧（它们不再允许交付）。
     void OnBarrier(std::uint32_t barrier_seq) noexcept;
 
     std::uint32_t applied_seq() const noexcept {
@@ -530,18 +578,42 @@ class UnreliableChannel final {
     const Stats& stats() const noexcept {
         return m_stats;
     }
+    const Config& config() const noexcept {
+        return m_config;
+    }
+    std::size_t reorder_pending() const noexcept {
+        return m_reorder.size();
+    }
 
    private:
-    void Accept(std::uint32_t seq, std::vector<std::uint8_t> payload);
+    /// @brief 缓存中的一帧：载荷 + 到达时刻（缺口等待计时基准）。
+    struct Buffered {
+        std::vector<std::uint8_t> payload;
+        std::uint64_t arrival_ms = 0;
+    };
+
+    /// @brief 收下一帧：连续则立即交付，乱序则进缓存；from_pending 表示
+    ///        该帧刚从 Relation 的因果等待队列释放（已等待过，不再缓存）。
+    void Accept(std::uint32_t seq, std::vector<std::uint8_t> payload, bool from_pending);
     void FlushPending();
+    /// @brief 交付所有与 applied_seq 连续的缓存项；返回是否交付过。
+    bool AdvanceBuffered();
+    /// @brief 强制交付缓存中的最小 seq（跳过缺口），并推进 applied_seq。
+    void SkipGap();
+    /// @brief 真正把一帧交给上层；seq 必须大于 applied_seq（否则计入 stale）。
+    void DeliverFrame(std::uint32_t seq, std::vector<std::uint8_t> payload);
 
     const std::uint8_t m_channel_id;
     Relation* const m_relation;
     const DeliverFn m_deliver;
     FrameSink m_sink;
+    Config m_config;
 
     std::uint32_t m_next_tx_seq = 1;
     std::uint32_t m_applied_seq = 0;
+    std::map<std::uint32_t, Buffered> m_reorder;  ///< 按 seq 升序的乱序缓存。
+    std::uint64_t m_gap_since_ms = 0;             ///< 当前缺口的等待起点。
+    bool m_gap_active = false;
     Stats m_stats;
 };
 
