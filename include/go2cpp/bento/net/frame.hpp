@@ -56,6 +56,23 @@ inline constexpr std::uint32_t kFrameMagic = 0x42454e54u;
 /// 帧格式版本。版本不符直接拒绝，不做向后兼容。
 inline constexpr std::uint16_t kFrameVersion = 1;
 
+/**
+ * @brief 线上协议标识：magic + version。
+ * @details 帧布局（20B 头 + CRC32）是通用的，但**协议归属**由这两个字段
+ *          决定。Link 使用默认的 "BENT"/1；任何在帧层之上定义自有协议的
+ *          模块（例如 `app::Session` 的会话层）都应当传入独立的
+ *          magic/version，这样同一个 `FrameDecoder` 只会接受自己那套协议，
+ *          两种协议混接到同一端口时会在 magic/version 阶段明确失败，而不是
+ *          把对方的帧解释成「未知类型」后继续解析。
+ */
+struct FrameFormat {
+    std::uint32_t magic = kFrameMagic;      ///< 帧魔数。
+    std::uint16_t version = kFrameVersion;  ///< 帧格式版本。
+};
+
+/// Link 协议的线上标识（默认值）。
+inline constexpr FrameFormat kDefaultFrameFormat{kFrameMagic, kFrameVersion};
+
 /// 固定帧头字节数：magic(4) + version(2) + type(2) + flags(2) + reserved(2) +
 /// length(4) + checksum(4) = 20。
 inline constexpr std::size_t kGenericFrameHeaderBytes = 20;
@@ -84,8 +101,8 @@ const char* FrameStatusName(FrameStatus status) noexcept;
 
 /// @brief 解码后的帧（头部字段 + 载荷副本）。
 struct Frame {
-    std::uint32_t magic = kFrameMagic;      ///< 解码时填实际值；编码时忽略并写常量。
-    std::uint16_t version = kFrameVersion;  ///< 解码时填实际值；编码时忽略并写常量。
+    std::uint32_t magic = kFrameMagic;      ///< 解码时填实际值；编码时由 FrameFormat 决定。
+    std::uint16_t version = kFrameVersion;  ///< 解码时填实际值；编码时由 FrameFormat 决定。
     std::uint16_t type = 0;                 ///< 上层消息类型。
     std::uint16_t flags = 0;                ///< 上层标志位。
     std::uint16_t reserved = 0;             ///< 必须为 0。
@@ -113,7 +130,7 @@ std::uint32_t ComputeFrameChecksum(const std::uint8_t* header_prefix,
                                    std::size_t payload_bytes) noexcept;
 
 /**
- * @brief 编码一帧（自动填充 magic/version/length/checksum）。
+ * @brief 编码一帧（自动填充 length/checksum，magic/version 用 Link 默认值）。
  * @param frame 待编码帧；只读取 type/flags/reserved/payload。
  * @return 完整字节（20B 头 + 载荷）；载荷超过 kFrameMaxPayload 或 reserved 非 0
  *         时返回空 vector（此时线上不可能产生合法帧，调用方必须处理）。
@@ -121,6 +138,24 @@ std::uint32_t ComputeFrameChecksum(const std::uint8_t* header_prefix,
  * @note 返回空 vector 是唯一失败信号：合法编码最短 20 字节，二者不会混淆。
  */
 std::vector<std::uint8_t> Encode(const Frame& frame);
+
+/**
+ * @brief 编码一帧，使用调用方指定的 protocol magic/version。
+ * @details 上层自有协议（如会话层）用它把自己的帧和 Link 帧区分开：
+ *          同一个帧布局、同一套 CRC，但 magic/version 不同，接收端
+ *          `FrameDecoder` 只认自己那套。
+ * @param format 线上协议标识；magic 为 0 视为非法（返回空 vector）。
+ * @return 同 `Encode(const Frame&)`。
+ */
+std::vector<std::uint8_t> Encode(const Frame& frame, const FrameFormat& format);
+
+/**
+ * @brief 同 `Decode`，但按调用方给定的 magic/version 校验。
+ * @param format 期望的线上协议标识。
+ * @return 同 `Decode`；magic/version 不符分别返回 `kBadMagic`/`kBadVersion`。
+ */
+FrameStatus Decode(const FrameFormat& format, const std::uint8_t* data, std::size_t size,
+                   Frame* out, std::size_t* consumed = nullptr) noexcept;
 
 /**
  * @brief 一次性解析缓冲区开头的一帧。
@@ -160,7 +195,9 @@ FrameStatus Decode(const std::uint8_t* data, std::size_t size, Frame* out,
 class FrameDecoder {
  public:
     /// @param max_payload 允许的单帧载荷上限；传 0 表示只接受空载荷帧。
-    explicit FrameDecoder(std::uint32_t max_payload = kFrameMaxPayload) noexcept;
+    /// @param format 期望的线上协议标识（默认 Link "BENT"/1）。
+    explicit FrameDecoder(std::uint32_t max_payload = kFrameMaxPayload,
+                          FrameFormat format = kDefaultFrameFormat) noexcept;
 
     /// 追加收到的字节。空指针或 0 字节是无操作。
     void Append(const std::uint8_t* data, std::size_t size);
@@ -177,10 +214,14 @@ class FrameDecoder {
     /// 配置的载荷上限。
     std::uint32_t MaxPayload() const noexcept { return m_max_payload; }
 
+    /// 期望的线上协议标识。
+    const FrameFormat& format() const noexcept { return m_format; }
+
  private:
     std::vector<std::uint8_t> m_buffer;  ///< 待解析字节；m_offset 之前是已消费前缀。
     std::size_t m_offset = 0;            ///< 已消费前缀长度；Append 时整体压缩。
     std::uint32_t m_max_payload;         ///< 单帧载荷上限。
+    FrameFormat m_format;                ///< 期望的 magic/version。
 };
 
 }  // namespace go2cpp::bento::net

@@ -20,6 +20,16 @@ namespace bento_test {
 
 inline int g_failures = 0;
 inline int g_checks = 0;
+inline int g_skips = 0;
+
+/// CTest 原生 SKIP 语义：测试进程以该码退出表示环境不满足、用例未执行。
+inline constexpr int kSkipReturnCode = 77;
+
+/// 标记一个环境不满足的用例；整份测试最终以 77 退出，不再静默 PASS。
+inline void Skip(const char* reason) {
+    std::printf("[SKIP] %s\n", reason);
+    ++g_skips;
+}
 
 /// 记录一次断言失败；不中断测试，便于一次看到所有问题。
 #define BENTO_CHECK(condition)                                                          \
@@ -73,12 +83,16 @@ bool PumpUntil(go2cpp::bento::Link& link, Predicate done, int timeout_ms) {
 
 /// 测试结束统一输出。
 inline int Finish(const char* name) {
-    if (g_failures == 0) {
-        std::printf("[PASS] %s (%d checks)\n", name, g_checks);
-        return 0;
+    if (g_failures != 0) {
+        std::fprintf(stderr, "[FAIL] %s: %d/%d checks failed\n", name, g_failures, g_checks);
+        return 1;
     }
-    std::fprintf(stderr, "[FAIL] %s: %d/%d checks failed\n", name, g_failures, g_checks);
-    return 1;
+    if (g_skips != 0) {
+        std::printf("[SKIP] %s: %d checks, %d skipped\n", name, g_checks, g_skips);
+        return kSkipReturnCode;
+    }
+    std::printf("[PASS] %s (%d checks)\n", name, g_checks);
+    return 0;
 }
 
 /// 百分位（输入会被排序）。

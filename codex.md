@@ -1595,3 +1595,81 @@ benchmarks/gmp_vs_thread_epoll_benchmark.cpp
 - 验证：`bash tests/scenarios/ctx_cancel_rollback/run_ctx_cancel_rollback.sh
   build-doctor-full` → PASS=65 FAIL=0；`ctest` → 116/116；`git` 未 commit。
 - 报告：`/tmp/ctx_cancel_rollback.md`。
+
+## 26. 2026-10-27 Bento P1：控制权仲裁 / 多 peer 加密 / 日志钩子（deepseek）
+
+**新增能力**
+- `SessionControl`（`session_control.hpp/.cpp`）：View/Interact 唯一控制器、先到先得/抢占、
+  租约 + 断开回收、变更回调与 `Snapshot().ToJson()`；16 线程并发请求只产生 1 个 Interact。
+- `PeerHub` PSK 加密（`peer_hub.hpp/.cpp`）：`SetPreSharedKey`/`SetPeerPreSharedKey`，
+  每 peer 独立 nonce/方向密钥/wire seq/64 位重放窗口；加密模式下拒绝明文 HELLO/数据帧。
+- `LogHook`（`log_hook.hpp`）：级别过滤、14 类结构化事件、按级别/事件计数、锁外 sink。
+- 测试：`test_session_control`（14,816 checks）、`test_peer_hub_secure`（506）、
+  `test_log_hook`（124）；ctest Bento 26/26（netem 无 CAP_NET_ADMIN 按设计 SKIP）。
+
+**约束 / 陷阱**
+- `Grant(peer, kNone)` 只清 `revoked` 标记，之后该 peer 仍可 `RequestControl` 重新拿到
+  控制权（审查 D-01，P1 安全契约漏洞，本轮未修）。
+- `PeerHub` 的 `on_peer_connected`/`on_peer_disconnected`/`on_stream`/`on_datagram`
+  在 `RunOnce` 持锁期间同步调用；回调里禁止 park/阻塞/重入 `RunOnce`，只可转发或
+  `Send*`（递归锁）。`SessionControl::on_change`/`LogHook` sink 在锁外。
+- 监听端 per-peer PSK 只能继承 Hub 默认 PSK；`SetPeerPreSharedKey` 的差异化密钥只用于主动端。
+- 日志事件有覆盖缺口：握手超时走 `kPeerDisconnected`（不发 `kHandshakeFailed`），
+  帧解析/发送封装失败只计数；`LogHook` 未注入时只累计 `filtered`。
+- Bento 不依赖 base（只链 Threads/hash），并发政策 R1/R3 属结构性例外，
+  ADR 见 `docs/modules/bento-scenarios.md` §20。
+
+**验证 / 状态**
+- 已提交 `1e08723`；文档已于 2026-10-28 按审查 `docs/review/review-p1-modules-api.md` 回改
+  （9.1/9.5/18.5 的 PSK 状态、7.2 回调签名、19 节提交状态、19.6 示例、并发 ADR、CMake 头注释）。
+- 未全量复跑 ctest；审查只复跑 3 个新增测试。首次 `bento_test_peer_hub_secure` 失败归因于
+  共享构建目录的二进制被并发重建（重跑 PASS），CI 应使用独立构建目录。
+
+
+## 27. 2026-10-28 Bento P2 app 层 + UDP/X25519（deepseek）
+
+- 需求：补齐 JinShan 场景缺口 FR-09（下载保存）/FR-15（远程文件访问）/FR-18（备份上传）/
+  CON-06（差环境探测），落地 `udp_transport`/`x25519`；同时修复批2审查
+  （`docs/review/review-batch2-api.md`）A-01/A-02 与 API 一致性关键项。
+- 新增模块（`include|src/bento/app/**`）：
+  - `app::Fetch`（MOD-27）：HTTP(S) 下载、路径沙箱、流式 SHA-256、大小上限、
+    重试/退避、重定向、原子落盘；http 自研 / https 调 curl（缺失返回
+    `kBackendUnavailable`）。
+  - `app::ZipWriter`/`ListZip`/`ExtractZip`（MOD-31）：store-only ZIP32、CRC-32、
+    条目/大小上限、Zip Slip 防护，非 0 method 明确拒绝。
+  - `app::Backup`/`Upload`（MOD-31）：`.part` → rename 原子包；curl PUT/POST、
+    token 走 stdin、指数退避、失败保留本地包。
+  - `app::FileBrowser`（MOD-30）：根目录沙箱 List/Get/Put/Stat、拒绝符号链接、
+    临时文件 + rename、覆盖策略。
+  - `app::Probe`（MOD-37）：15 项只读探测（/proc、cgroup、epoll、rlimit、
+    ifaddrs、statfs、uname）。
+  - `app::Session`（MOD-39）：endpoint → transport → pairing → channel → control
+    → heartbeat → graceful close；transport 工厂可注入。
+  - `net::UdpTransport`：无连接 UDP 的 `ITransport` 实现，错误映射与 TCP 对齐。
+  - `net::X25519*`：RFC 7748 ECDH，TweetNaCl 移植（来源/许可证见 `AI_COLLAB.md`）。
+- 规范修复（批2审查）：
+  - A-01：`bento-scenarios.md` §14 删除 zip/AVI 过时表述，§18/§19 边界声明补
+    app 层，新增 §21 落地登记；§16 自检补 `app/**` 引用范围。
+  - A-02：`docs/INDEX.md` 登记 `modules/bento-scenarios.md`；本节补齐
+    MOD-27/30/31/37/39 记录。
+  - C-01/C-03：fetch/zip/backup/file_browser 从 `go2cpp::bento` 迁入
+    `go2cpp::bento::app`；file_browser 的 `List/Get/Put` 随命名空间收敛。
+  - C-02：backup/zip 状态字符串 kebab → snake_case（kebab 只留给 JSON）。
+  - C-04：fetch/backup 的重复 `SleepBeforeRetry` 抽到
+    `app::detail::SleepBeforeRetry(base, failed_attempt, cap)`
+    （下载 2s / 上传 30s 封顶）。
+  - C-05：删除死枚举 `UploadStatus::kRetryExhausted`；重试耗尽返回最后一次
+    失败分类。
+  - 另补 C-08/C-09：`kFileBrowserMaxEntriesCeiling` 常量替代
+    `file_browser.cpp` 的 `10 * 1000 * 1000` 魔法数；C-12：修正
+    `udp_transport.hpp` 零长读注释（不再是「唯一例外」）。
+- 验证（`/tmp/build-appfix`，Release，Ninja）：
+  - `ninja` 378 目标全成功，`-Werror` 0 警告；
+  - 两次全量 ctest 均 **59/59 通过**：`-j 4` 56.63s（netem 36.59s 实跑）、
+    `-j 2` 64.20s（netem 按设计 SKIP=77，其余 58 项 Passed）；
+  - app 断言：fetch 237、zip 291、backup 111、upload 97、file_browser 1890；
+    net：capability 125、session 259、udp 158、x25519 1160、command 93、
+    file_transfer 162。
+- 未 commit；已知缺口：app 层无 `LogHook` 注入、`Upload` 无远端校验
+  （HEAD/ETag）、`Probe()` 无库内降级消费者、store-only 带宽代价、HTTPS 依赖
+  系统 curl、FileBrowser TOCTOU 与 Backup `.part` 并发（D-05/D-06 未修）。

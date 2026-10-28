@@ -280,6 +280,7 @@
 | [modules/network.md](modules/network.md) | network 总览：分层/构建目标/Hook 22 个操作/HTTP-2 核心边界/QUIC-默认 OFF | 现行 |
 | [modules/tools.md](modules/tools.md) | tools 总览：CLI 7 子命令、迁移（仅 v3）、回放（G2CRPLY v5）、持久化原型 | 现行 |
 | [modules/persistence.md](modules/persistence.md) | 持久化原型：MPSC+批量+fdatasync、段/manifest、2.96x/13.83x | 现行 |
+| [modules/bento-scenarios.md](modules/bento-scenarios.md) | Bento 场景矩阵（JinShan 66 条）+ P0/P1 落地记录 + §21 app 层（fetch/zip/backup/file_browser/capability/session）与 udp_transport/x25519 | 现行 |
 
 > **基础库**（bufio/compress/container/encoding/hash/math/path）：实现简单、API 稳定，
 > 直接看 `include/go2cpp/<module>/` 头文件注释；无独立模块文档。

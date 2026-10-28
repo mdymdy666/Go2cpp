@@ -168,7 +168,7 @@
 | 虚拟通道（DVC）协议 | FR-08、RISK-008、AX-081 | DVC 是 RDP 的动态通道，Windows 专属；Bento 提供的是「独立可靠/不可靠通道」这一等价能力 |
 | 控制权仲裁与 UIPI | FR-03、RISK-002、RISK-024、RISK-027 | 控制权是 RDP attendee 语义，UIPI 是 Windows 完整性级别；Bento 只提供 per-peer 消息通道 |
 | 命令注入 / 路径穿越防护 | RISK-040、RISK-046、AX-047 | 属应用层输入校验；传输层不解析业务载荷 |
-| 备份打包上传 / AVI 录制 | FR-18、FR-17、RISK-050、RISK-054 | 文件格式与 HTTP 上传属应用层；Bento 不引入 zip/AVI 依赖 |
+| AVI 录制 | FR-17、RISK-054 | AVI 封装/索引属应用层文件格式；Bento 只传输视频分片，不引入编码器。备份打包上传（FR-18）已由 app 层实现，见 §21 |
 | Go 中转服务部署 | CON-02、CON-14、RISK-075、RISK-077 | JinShan 的中转是 Go 独立服务；Go2Cpp 侧能提供的是传输组件与本地代理，不是部署形态 |
 | 提权重连 / 服务模式（Session 0） | FR-07、RISK-005、RISK-058 | Windows 进程与 UAC 语义，Linux 无对应物 |
 
@@ -209,7 +209,8 @@
 
 - [x] 13 类场景齐全，每类至少 2 条具体场景。
 - [x] 每行都引用了 JinShan 编号（FR/CON/NFR、AX-xxx 或 RISK-xxx）。
-- [x] 每行的 Go2Cpp 能力都指向真实文件与接口（`include/go2cpp/bento/net/**`、`tests/bento/**`）。
+- [x] 每行的 Go2Cpp 能力都指向真实文件与接口（`include/go2cpp/bento/net/**`、
+      `include/go2cpp/bento/app/**`、`tests/bento/**`）；app 层模块见 §21。
 - [x] 「不适用」项给出理由，而不是简单标成缺失。
 - [x] 缺口按 P0/P1/P2 分级；P0 两项与 P1 三项均已在代码中补齐并有测试，8.1 明确标「不实现」并给理由。
 - [x] 统计数字与表格行数一致：场景行 66 = 已有 30 + 已补 4 + 部分 22 + 缺 0 + 不实现 1 + 不适用 9，
@@ -221,6 +222,9 @@
     | grep -oE '\| (已有|已补|部分|缺|不实现|不适用) \|' | sort | uniq -c
   ```
 
+> §21 的 app 层模块是能力模块而非新的运行场景，因此不改变本节 66 条场景与
+> 30/4/22/0/1/9 的统计口径；它们对应的 FR-09/FR-15/FR-18 与 CON-06 见 21.2。
+
 ---
 
 ## 17. 变更记录
@@ -230,14 +234,17 @@
 | 2026-10-27 | v1.0 | 首次建立：从 RTM/anomalies/risk-register 抽取 13 类 66 条场景，映射到 Bento 现有能力；记录 P0 两项缺口（多 peer、TCP 回环代理）的补法 |
 | 2026-10-27 | v1.1 | P1 落地：控制权仲裁（`SessionControl`）、多 peer 加密（`PeerHub` PSK）、日志钩子（`LogHook`）补齐；3.4/7.1/9.4/12.5 标「已补」，8.1 标「不实现」并给理由；新增 3 个测试目标，ctest 26/26（netem 无权限 SKIP） |
 | 2026-10-28 | v1.2 | 文档回改（审查 `review-p1-modules-api.md` DOC-01～13）：9.1/9.5/18.5 更新为已接 PSK，7.2 按实际回调签名改写，19 节改为已提交并补 19.6 最小示例，12.5 标注事件覆盖缺口，3.6/10.3 标注 private 机制；新增 §20 并发政策例外 ADR。能力与 16 节统计口径不变 |
+| 2026-10-28 | v1.3 | P2 app 层落地登记（§21）：fetch/zip/backup/file_browser/capability/session + net/udp_transport、net/x25519；修正 §14 关于 zip/AVI 的过时表述（AVI 仍不做），§18/§19 边界声明补 app 层；命名空间统一为 `go2cpp::bento::app`（传输层 `go2cpp::bento::net`），状态名统一 snake_case，删除死枚举 `UploadStatus::kRetryExhausted`，退避等待抽到 `app::detail::SleepBeforeRetry` |
 
 ---
 
 ## 18. 落地记录（2026-10-27）
 
-> 本节记录本矩阵对应的代码落地与验证结果。按任务边界，改动只落在
+> 本节记录本矩阵对应的 P0/P1 代码落地与验证结果。P0/P1 改动落在
 > `include/go2cpp/bento/net/**`、`src/bento/net/**`、`tests/bento/**`、
 > `cmake/Go2CppBento.cmake`、`docs/modules/bento-scenarios.md`。
+> 后续批次的 app 层（fetch/zip/backup/file_browser/capability/session）
+> 同样属于本模块边界，登记见 §21。
 
 ### 18.1 新增
 
@@ -290,7 +297,7 @@
 > 本节记录 P1 三项缺口的落地：控制权仲裁、多 peer 加密、日志钩子。改动只落在
 > `include/go2cpp/bento/net/**`、`src/bento/net/**`、`tests/bento/**`、
 > `cmake/Go2CppBento.cmake`、`docs/modules/bento-scenarios.md`；不改 base。
-> 已提交到 HEAD `1e08723`（`feat(bento): 场景缺口补齐（控制权仲裁/多 peer 加密/日志钩子）`）。
+> P2 app 层见 §21。已提交到 HEAD `1e08723`（`feat(bento): 场景缺口补齐（控制权仲裁/多 peer 加密/日志钩子）`）。
 
 ### 19.1 新增
 
@@ -508,3 +515,89 @@ Bento 三个 P1 模块（`SessionControl`、`LogHook`、`PeerHub`）落地时与
 `include/go2cpp/bento/net/log_hook.hpp`（`std::mutex`）、
 `include/go2cpp/bento/net/peer_hub.hpp`（`std::recursive_mutex`、回调约定）、
 `cmake/Go2CppBento.cmake`（依赖只有 Threads/hash）。
+
+
+---
+
+## 21. P2 落地记录（2026-10-28，app 层）
+
+> 本节补齐 §18/§19 之后新增的应用层能力（MOD-27/30/31/37/39）与
+> `net/udp_transport`、`net/x25519`。改动落在
+> `include/go2cpp/bento/app/**`、`src/bento/app/**`、
+> `include|src/bento/net/{udp_transport,x25519}.*`、`tests/bento/**`、
+> `cmake/Go2CppBento.cmake`、`docs/modules/bento-scenarios.md`；不改 base
+> （scheduler/fiber/io 等），app 层只额外依赖 `go2cpp_os` 与 `go2cpp_hash`。
+
+### 21.1 新增模块
+
+| 模块 | 文件 | 作用 | 测试 |
+|---|---|---|---|
+| MOD-27 fetch | `app/fetch.hpp` + `fetch.cpp` | HTTP(S) 下载：URL/路径沙箱、流式 SHA-256、大小上限、重试/退避、重定向、原子落盘；http 自研、https 调 curl | `test_fetch`（进程内真实 HTTP server + 错误路径） |
+| MOD-30 file_browser | `app/file_browser.hpp` + `file_browser.cpp` | 受限根目录 List/Get/Put/Stat：路径沙箱、符号链接拒绝、临时文件 + rename、覆盖策略 | `test_file_browser` |
+| MOD-31 zip | `app/zip.hpp` + `zip.cpp` | store-only ZIP 写入/读取：固定头、CRC-32、条目/大小上限、Zip Slip 防护 | `test_zip` |
+| MOD-31 backup | `app/backup.hpp` + `backup.cpp` | 目录打包为 zip（`.part` → rename）与 curl 上传（token 走 stdin、重试退避、保留本地包） | `test_backup`、`test_upload` |
+| MOD-37 capability | `app/capability.hpp` + `capability.cpp` | 15 项只读环境探测（/proc、epoll、cgroup、rlimit、ifaddrs、statfs、uname） | `test_capability`（注入假路径） |
+| MOD-39 session | `app/session.hpp` + `session.cpp` | 会话编排：endpoint → transport → pairing → channel → control → heartbeat → close | `test_session` |
+| UDP transport | `net/udp_transport.hpp` + `.cpp` | 无连接 UDP 的 `ITransport` 实现，错误映射与 TCP 对齐 | `test_udp_transport`（loopback、零长数据报、错误映射） |
+| X25519 | `net/x25519.hpp` + `.cpp` | RFC 7748 ECDH（TweetNaCl 移植，来源见 21.6） | `test_x25519`（RFC 7748 向量 + 低阶点拒绝） |
+
+> MOD-31 同时覆盖 `zip` 与 `backup` 两个头文件（编号沿用文件头注释，不重复分配）。
+
+### 21.2 需求映射（更新 §14 的结论）
+
+| 编号 | 需求 | 实现 | 结论 |
+|---|---|---|---|
+| FR-09 | 下发「下载并保存」指令 | `app::Fetch` + SHA-256 校验 + 路径沙箱 | 已实现（哈希校验；「可执行校验」未做） |
+| FR-15 | 远程文件访问等价能力 | `app::FileBrowser` 的 List/Get/Put/Stat + 根目录沙箱 | 已实现（等价边界见 21.4） |
+| FR-18 | 自动备份并上传 zip | `app::Backup` + `app::Upload`，失败保留本地包 | 已实现（远端校验未做，见 21.4） |
+| CON-06 | 差环境可用 | `app::Probe` 15 项探测 | 探测已实现（降级决策仍由调用方完成，见 21.4） |
+
+§14 的「备份打包上传」因此从「不适用」移出；「AVI 录制」仍不做。
+
+### 21.3 命名空间与 API 约定
+
+- **命名空间**：传输层新代码用 `go2cpp::bento::net`（`transport.hpp`/`frame.hpp`
+  已是），应用层统一 `go2cpp::bento::app`（fetch/zip/backup/file_browser/
+  capability/session）。本轮把 fetch/zip/backup/file_browser 从
+  `go2cpp::bento` 根迁入 `app`；`app::detail` 只放实现细节（`retry.hpp`），
+  不属于公开 API 承诺。
+- **历史债（本批未动）**：`net/link.hpp`、`net/peer_hub.hpp`、`net/session_control.hpp`
+  等既有文件仍在 `go2cpp::bento` 根。迁移它们需要改 20+ 个测试与全部
+  net 调用点，回归面过大，留待单独批次；新代码不要再往根命名空间加符号。
+- **状态名（app 层）**：`*StatusToString` / `*StateName` 一律返回 snake_case
+  （`invalid_argument`、`input_not_found`），kebab-case 只用于 JSON 字段/标签。
+  net 既有模块（`command.cpp`/`file_transfer.cpp`）与 `os/file.cpp` 仍有 kebab
+  状态名，属历史债，本批未动（超出 app 层边界）；后续统一时按同一约定改。
+- **重试等待**：fetch 与 backup 共用
+  `app::detail::SleepBeforeRetry(base, failed_attempt, cap)`；下载 2s 封顶、
+  上传 30s 封顶，只在调用处传 `cap`，不再各写一份。
+- **枚举**：`UploadStatus::kRetryExhausted` 已删除；重试耗尽返回最后一次失败分类
+  （`kHttpRejected`/`kNetworkError`/`kTimeout`），与 `backup.hpp` 的契约一致。
+
+### 21.4 已知限制
+
+- app 层没有统一 `LogHook` 注入点；下载/上传/会话的审计事件需调用方自行包装
+  （net 层的 `LogHook` 未接 app）。
+- `Upload` 只判断 2xx，**没有远端校验**（HEAD/ETag/回读）；FR-18 的「远端校验」仍缺口。
+- `Probe()` 目前只由测试使用，库内没有「探测结果 → 降级策略」的消费者；
+  CON-06 的「降级策略文档化」仍需上层落地。
+- store-only zip 使上传字节数等于原始字节数；大目录备份的带宽代价未做压缩优化。
+- HTTPS 下载与上传都依赖系统 `curl`；缺失时分别返回 `kBackendUnavailable`/
+  `kCurlMissing`（明文 HTTP 路径不受影响）。
+- `FileBrowser::Get/Put` 的 `overwrite=false` 检查与 `rename` 之间仍有 TOCTOU；
+  `Backup` 的 `.part` 名为固定后缀，不支持同一输出并发备份（审查 D-05/D-06 未修）。
+
+### 21.5 验证结果
+
+| 项 | 结果 |
+|---|---|
+| 构建 | `cmake -S . -B /tmp/build-appfix -G Ninja -DGO2CPP_WITH_BENTO=ON -DGO2CPP_BUILD_TESTS=OFF -DGO2CPP_BENTO_TESTS=ON -DCMAKE_BUILD_TYPE=Release` + `ninja`：378 个目标全部成功，`-Werror` 0 警告 |
+| ctest | 两次全量：`ctest -j 4` **59/59**、56.63s（含 `bento_netem` 36.59s 实跑）；复跑 `ctest -j 2` **59/59**、64.20s（`bento_netem` 按设计 SKIP，`SKIP_RETURN_CODE=77`，其余 58 项 Passed） |
+| app 断言 | fetch 237、zip 291、backup 111、upload 97、file_browser 1890 |
+| net 断言 | capability 125、session 259、udp_transport 158、x25519 1160、command 93、file_transfer 162 |
+| 状态 | 未 commit；与并行批次的 `frame.hpp:FrameFormat`（会话协议隔离）及 session/file_browser 测试增补同树共存。本批改动限于 app 层源码/头文件、对应测试、`x25519.hpp` 来源注释、本文档、`docs/INDEX.md`、`codex.md` 与 `AI_COLLAB.md` |
+
+### 21.6 第三方来源
+
+- `net/x25519` 为 TweetNaCl（public domain）移植，来源/许可证/改动点见
+  `include/go2cpp/bento/net/x25519.hpp` 与 `AI_COLLAB.md`。

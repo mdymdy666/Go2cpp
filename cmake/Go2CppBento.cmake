@@ -35,6 +35,7 @@ if (GO2CPP_WITH_BENTO)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/protocol.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/relation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/crypto.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/x25519.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/congestion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/bandwidth.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/channel.cpp
@@ -73,12 +74,17 @@ if (GO2CPP_WITH_BENTO)
     add_library(go2cpp::bento ALIAS go2cpp_bento)
 
     # MOD-26/28：通用命令协议 + 文件传输（JinShan 场景缺口）。
-    # 依赖 go2cpp_os（os::proc 进程执行）与 go2cpp_hash（SHA-256），因此只在
-    # 完整模块构建里创建；standalone 构建跳过并给出提示，不悄悄降级 API。
+    # MOD-31：通用备份模块（store-only zip + 打包 + 上传）。
+    # 依赖 go2cpp_os（os::proc 进程执行）与 go2cpp_hash（CRC-32/SHA-256），
+    # 因此只在完整模块构建里创建；standalone 构建跳过并给出提示，不悄悄降级 API。
     if (TARGET go2cpp_os AND TARGET go2cpp_hash)
         add_library(go2cpp_bento_app STATIC
             ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/command.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/file_transfer.cpp)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/file_transfer.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/app/zip.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/app/backup.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/app/fetch.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/app/file_browser.cpp)
 
         target_include_directories(go2cpp_bento_app
             PUBLIC
@@ -100,7 +106,8 @@ if (GO2CPP_WITH_BENTO)
     add_library(go2cpp_bento_transport STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/transport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/tcp_transport.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/memory_transport.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/memory_transport.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/udp_transport.cpp)
 
     target_include_directories(go2cpp_bento_transport
         PUBLIC
@@ -112,6 +119,40 @@ if (GO2CPP_WITH_BENTO)
     target_link_libraries(go2cpp_bento_transport PUBLIC Threads::Threads)
     set_target_properties(go2cpp_bento_transport PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_library(go2cpp::bento_transport ALIAS go2cpp_bento_transport)
+
+    # MOD-37：Linux 运行环境能力探测（/proc、权限、epoll、cgroup、网络接口、
+    # 文件系统与 rlimit）。只依赖标准库与 POSIX，独立成目标，便于宿主在
+    # 启动阶段先探测再决定降级策略。
+    add_library(go2cpp_bento_capability STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/app/capability.cpp)
+
+    target_include_directories(go2cpp_bento_capability
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_compile_features(go2cpp_bento_capability PUBLIC cxx_std_17)
+    target_compile_options(go2cpp_bento_capability PRIVATE
+        -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+    set_target_properties(go2cpp_bento_capability PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    add_library(go2cpp::bento_capability ALIAS go2cpp_bento_capability)
+
+    # MOD-39：通用会话编排（endpoint → transport → pairing → channel →
+    # session_control → heartbeat → graceful close）。复用 net 的配对/帧/
+    # 心跳/控制权原语，不复制协议实现。
+    add_library(go2cpp_bento_session STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/app/session.cpp)
+
+    target_include_directories(go2cpp_bento_session
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_compile_features(go2cpp_bento_session PUBLIC cxx_std_17)
+    target_compile_options(go2cpp_bento_session PRIVATE
+        -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+    target_link_libraries(go2cpp_bento_session
+        PUBLIC go2cpp_bento go2cpp_bento_transport Threads::Threads)
+    set_target_properties(go2cpp_bento_session PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    add_library(go2cpp::bento_session ALIAS go2cpp_bento_session)
 
     # 错误体系 + 反射（bento::error / bento::reflect）：只依赖标准库，
     # 与传输层解耦；后续 net 模块可以按需链接本目标复用统一错误/绑定实现。
@@ -212,6 +253,21 @@ if (GO2CPP_WITH_BENTO)
         add_executable(bento_netem_probe
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/netem_probe.cpp)
 
+        # MOD-37/39：环境能力探测与会话编排。两者都不需要外部端口：
+        # 会话测试用 MemoryTransport 注入口，能力测试只读本机环境。
+        add_executable(bento_test_capability
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_capability.cpp)
+        add_executable(bento_test_session
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_session.cpp)
+        foreach(bento_app_module_test bento_test_capability bento_test_session)
+            target_include_directories(${bento_app_module_test} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
+            target_compile_options(${bento_app_module_test} PRIVATE
+                -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+        endforeach()
+        target_link_libraries(bento_test_capability PRIVATE go2cpp_bento_capability)
+        target_link_libraries(bento_test_session PRIVATE go2cpp_bento_session)
+
         # 传输抽象测试：内存/TCP 回环、半关闭、超时、帧粘包/半包/错误。
         add_executable(bento_test_transport
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_transport.cpp)
@@ -221,13 +277,40 @@ if (GO2CPP_WITH_BENTO)
         target_compile_options(bento_test_transport PRIVATE
             -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
 
+        # UDP 数据报与 X25519 独立测试：数据报边界/截断/超时 + RFC 7748 向量。
+        add_executable(bento_test_udp_transport
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_udp_transport.cpp)
+        add_executable(bento_test_x25519
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_x25519.cpp)
+        foreach(bento_primitive_test bento_test_udp_transport bento_test_x25519)
+            target_include_directories(${bento_primitive_test} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
+            target_compile_options(${bento_primitive_test} PRIVATE
+                -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+        endforeach()
+        target_link_libraries(bento_test_udp_transport PRIVATE go2cpp_bento_transport)
+        target_link_libraries(bento_test_x25519 PRIVATE go2cpp_bento)
+
         # MOD-26/28：命令协议与文件传输（依赖完整模块构建里的 app 目标）。
+        # MOD-31：zip/backup/upload 测试。
         if (TARGET go2cpp_bento_app)
             add_executable(bento_test_command
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_command.cpp)
             add_executable(bento_test_file_transfer
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_file_transfer.cpp)
-            foreach(bento_app_test bento_test_command bento_test_file_transfer)
+            add_executable(bento_test_zip
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_zip.cpp)
+            add_executable(bento_test_backup
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_backup.cpp)
+            add_executable(bento_test_upload
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_upload.cpp)
+            add_executable(bento_test_fetch
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_fetch.cpp)
+            add_executable(bento_test_file_browser
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_file_browser.cpp)
+            foreach(bento_app_test bento_test_command bento_test_file_transfer
+                    bento_test_zip bento_test_backup bento_test_upload
+                    bento_test_fetch bento_test_file_browser)
                 target_include_directories(${bento_app_test} PRIVATE
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
                 target_link_libraries(${bento_app_test} PRIVATE go2cpp_bento_app)
@@ -236,7 +319,15 @@ if (GO2CPP_WITH_BENTO)
             endforeach()
             add_test(NAME bento_command COMMAND bento_test_command)
             add_test(NAME bento_file_transfer COMMAND bento_test_file_transfer)
-            set_tests_properties(bento_command bento_file_transfer PROPERTIES TIMEOUT 120)
+            add_test(NAME bento_zip COMMAND bento_test_zip)
+            add_test(NAME bento_backup COMMAND bento_test_backup)
+            add_test(NAME bento_upload COMMAND bento_test_upload)
+            add_test(NAME bento_fetch COMMAND bento_test_fetch)
+            add_test(NAME bento_file_browser COMMAND bento_test_file_browser)
+            # 环境不满足时测试进程以 77 退出 -> CTest 记为 Skipped。
+            set_tests_properties(bento_command bento_file_transfer bento_zip
+                bento_backup bento_upload bento_fetch bento_file_browser
+                PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
         else()
             message(STATUS "Bento command/file transfer tests: OFF")
         endif()
@@ -310,6 +401,12 @@ if (GO2CPP_WITH_BENTO)
         add_test(NAME bento_pairing COMMAND bento_test_pairing)
         add_test(NAME bento_session_table COMMAND bento_test_session_table)
         add_test(NAME bento_transport COMMAND bento_test_transport)
+        add_test(NAME bento_capability COMMAND bento_test_capability)
+        add_test(NAME bento_session COMMAND bento_test_session)
+        set_tests_properties(bento_capability bento_session
+            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME bento_udp_transport COMMAND bento_test_udp_transport)
+        add_test(NAME bento_x25519 COMMAND bento_test_x25519)
         # 用户态弱网代理：无 CAP_NET_ADMIN 时替代 tc netem 的可重复版本。
         # 20% 双向丢包 + 200ms 单向延迟，可靠流要求 100% 按序。
         # 60s 收尾窗口：20% 丢包下 PTO 最坏会退避到 2s，40s 偶发尾部未收完。
@@ -332,6 +429,8 @@ if (GO2CPP_WITH_BENTO)
             bento_pairing bento_session_table
             PROPERTIES TIMEOUT 90)
         set_tests_properties(bento_transport PROPERTIES TIMEOUT 120)
+        set_tests_properties(bento_udp_transport bento_x25519
+            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         set_tests_properties(bento_weaknet_proxy PROPERTIES TIMEOUT 150)
         set_tests_properties(bento_netem PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
     endif()
