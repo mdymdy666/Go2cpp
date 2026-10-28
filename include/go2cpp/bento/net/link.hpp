@@ -51,6 +51,7 @@
 #include "go2cpp/bento/net/crypto.hpp"
 #include "go2cpp/bento/net/protocol.hpp"
 #include "go2cpp/bento/net/relation.hpp"
+#include "go2cpp/bento/net/x25519.hpp"
 
 namespace go2cpp::bento {
 
@@ -78,6 +79,11 @@ struct LinkConfig {
     /// PSK 认证加密：非空时启用（长度必须 32B）；空 = 明文模式，保持旧线格式。
     /// 双方必须配置相同 PSK；监听方未配置 PSK 时无法解密加密 HELLO。
     std::vector<std::uint8_t> pre_shared_key;
+    /// 是否在加密握手中附加临时 X25519 公钥（前向保密，默认开启）。
+    /// false = 纯 PSK 模式：HELLO/ACK 退回旧线格式。0-RTT 会话票据按
+    /// 静态 PSK 重派生密钥，因此只有纯 PSK 会话允许导出/缓存票据；
+    /// X25519 会话（或对端无公钥而回退的会话）不提供 0-RTT 恢复。
+    bool enable_x25519 = true;
     /// 握手时间戳容忍窗口（毫秒）；0 = 不校验。依赖双方时钟大致同步。
     std::uint32_t handshake_replay_window_ms = 30000;
     /// STREAM 通道默认配置：动态 PTO（RFC 9002）、快速重传、分片重组、
@@ -252,6 +258,8 @@ struct SecureStats {
     std::uint64_t plaintext_rejected = 0;  ///< 加密模式收到的明文数据帧。
     std::uint64_t handshakes = 0;          ///< 完成的加密握手数。
     std::uint64_t handshake_retries = 0;   ///< 幂等重发的握手包数。
+    std::uint64_t x25519_handshakes = 0;   ///< 用 X25519 前向保密完成的握手数。
+    std::uint64_t psk_fallbacks = 0;       ///< 对端无公钥、回退纯 PSK 的握手数。
     std::uint64_t encrypted_bytes_sent = 0;
     std::uint64_t encrypted_bytes_received = 0;
     std::uint64_t resumptions = 0;       ///< 成功进入 0-RTT 恢复的会话数。
@@ -355,9 +363,10 @@ class Link final {
     ///       内被丢弃。新地址族必须与对端一致（IPv4/IPv6 不混用）。
     bool Migrate(const std::string& new_address, std::uint16_t new_port = 0,
                  std::string* error = nullptr);
-    /// @brief 导出 0-RTT 会话票据（仅 PSK 模式且会话密钥就绪时非空）。
+    /// @brief 导出 0-RTT 会话票据（仅纯 PSK 会话且密钥就绪时非空）。
     /// @details 票据由 PSK 派生 MAC，含 conn_id、双方 nonce 与两个方向的
-    ///          下一个 wire seq；不包含密钥本身。
+    ///          下一个 wire seq；不包含密钥本身。使用 X25519 的会话
+    ///          （公钥非零）返回空，避免把前向保密会话静默降级成 PSK。
     std::vector<std::uint8_t> ExportSessionTicket();
     /// @brief 用票据恢复会话并直接进入 Connected（0-RTT），不发送 HELLO。
     /// @details 成功后首个 Send* 即用恢复出的会话密钥加密；接收端通过
@@ -434,6 +443,13 @@ class Link final {
                               const FrameHeader& outer, const sockaddr_storage& from);
     bool SendSecureHello();
     bool SendSecureHelloAck();
+    /// @brief 客户端：生成本次握手的临时 X25519 密钥对（覆盖旧值）。
+    bool GenerateX25519KeyPair();
+    /// @brief 清零临时私钥；幂等，握手完成或失败后都必须调用。
+    void ClearX25519Ephemeral();
+    /// @brief 客户端：用临时私钥和对端公钥派生本会话的 tx/rx 密钥。
+    /// @return 对端公钥是低阶点（共享密钥全零）时返回 false。
+    bool DeriveX25519SessionKeys(const std::uint8_t peer_public[kX25519KeyBytes]);
     bool IsKnownClientNonce(const std::uint8_t* nonce) const noexcept;
     void RememberClientNonce(const std::uint8_t* nonce);
     bool TimestampAcceptable(std::uint64_t timestamp_ms) const noexcept;
@@ -530,6 +546,13 @@ class Link final {
     std::uint8_t m_server_nonce[kHandshakeNonceBytes] = {};
     std::uint8_t m_tx_key[kChaCha20KeyBytes] = {};
     std::uint8_t m_rx_key[kChaCha20KeyBytes] = {};
+    // ---- X25519 前向保密：临时私钥只在握手窗口内存在 ----
+    bool m_x25519_private_valid = false;  ///< m_x25519_private 是否仍有效。
+    /// 客户端临时私钥；收到 HELLO_ACK 后立即 SecureZero。
+    std::uint8_t m_x25519_private[kX25519KeyBytes] = {};
+    /// 客户端 HELLO 中发出的 / 监听方 HELLO_ACK 中回发的临时公钥。
+    /// 公钥不是秘密；监听方回退纯 PSK 时置零。
+    std::uint8_t m_x25519_public[kX25519KeyBytes] = {};
     SecureDirection m_tx_direction = SecureDirection::kClientToServer;
     SecureDirection m_rx_direction = SecureDirection::kServerToClient;
     std::uint32_t m_tx_wire_seq = 0;

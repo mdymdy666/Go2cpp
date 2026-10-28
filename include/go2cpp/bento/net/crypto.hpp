@@ -11,6 +11,14 @@
  *          - **PSK 模式**：双方预共享 32B 密钥。HELLO/HELLO_ACK 携带
  *            16B 随机 nonce，用 PSK 派生的握手密钥做 AEAD；双方 nonce
  *            共同派生会话方向密钥，后续每个数据帧都用会话密钥加密。
+ *          - **前向保密（X25519）**：在 HELLO/HELLO_ACK 明文体末尾追加
+ *            32B 临时 X25519 公钥（全零表示本端不提供公钥或回退纯 PSK）。
+ *            双方各自生成临时密钥对，把 `X25519(私钥, 对方公钥)` 的
+ *            共享密钥混入 PSK 后再派生会话密钥；临时私钥用完立即
+ *            `SecureZero`。旧对端按旧长度解析、忽略追加字段，收到零
+ *            公钥时回退旧派生逻辑，因此线格式保持向后兼容。
+ *            注意：0-RTT 会话票据只绑定静态 PSK，`Resume` 恢复出的会话
+ *            是纯 PSK 模式，不具备本节的 X25519 前向保密。
  *          - **防重放**：每方向独立的 64 位滑动窗口（IPsec 风格）。
  *            帧头保留明文的 wire seq 作为 AEAD nonce 与窗口索引；
  *            只有通过 Poly1305 验证的包才会推进窗口，伪造高序号包
@@ -45,6 +53,7 @@
 #include <vector>
 
 #include "go2cpp/bento/net/protocol.hpp"
+#include "go2cpp/bento/net/x25519.hpp"
 
 namespace go2cpp::bento {
 
@@ -80,24 +89,40 @@ inline constexpr std::uint8_t kSecureHandshakeVersion = 1;
 /// HELLO / HELLO_ACK 统一 magic：'B' 'E' 'N' 'T'。
 inline constexpr std::uint8_t kSecureMagic[4] = {'B', 'E', 'N', 'T'};
 
-/// 握手消息明文长度（加密前的帧载荷）。
-inline constexpr std::size_t kHelloBodyBytes = 4 + 1 + 1 + 2 + 4 + kHandshakeNonceBytes + 8;
-inline constexpr std::size_t kHelloAckBodyBytes =
+/// 旧版（不含 X25519 公钥）HELLO 明文体长度：4B magic + 1B ver +
+/// 1B flags + 2B 保留 + 4B session + 16B nonce + 8B 时间戳。
+inline constexpr std::size_t kLegacyHelloBodyBytes =
+    4 + 1 + 1 + 2 + 4 + kHandshakeNonceBytes + 8;
+
+/// 旧版 HELLO_ACK 明文体长度：HELLO 旧布局 + 16B server nonce。
+inline constexpr std::size_t kLegacyHelloAckBodyBytes =
     4 + 1 + 1 + 2 + 4 + kHandshakeNonceBytes + kHandshakeNonceBytes + 8;
 
-/// @brief 握手 HELLO 明文体（36B）。
+/// 当前 HELLO 明文体长度：旧布局 + 32B 临时 X25519 公钥（追加在末尾）。
+inline constexpr std::size_t kHelloBodyBytes = kLegacyHelloBodyBytes + kX25519KeyBytes;
+
+/// 当前 HELLO_ACK 明文体长度：旧布局 + 32B 临时 X25519 公钥。
+inline constexpr std::size_t kHelloAckBodyBytes =
+    kLegacyHelloAckBodyBytes + kX25519KeyBytes;
+
+/// @brief 握手 HELLO 明文体（旧版 36B / 含公钥 68B）。
 struct HelloBody {
     std::uint32_t session = 0;                      ///< 发起方 session id。
     std::uint8_t nonce[kHandshakeNonceBytes] = {};  ///< 16B 随机 nonce。
     std::uint64_t timestamp_ms = 0;                 ///< 发送时刻，防旧包重放。
+    /// 临时 X25519 公钥；全零表示本端不提供公钥（对端回退纯 PSK），
+    /// 或本次按旧长度编码（解码时同样归零）。
+    std::uint8_t x25519_public[kX25519KeyBytes] = {};
 };
 
-/// @brief 握手 HELLO_ACK 明文体（52B）。
+/// @brief 握手 HELLO_ACK 明文体（旧版 52B / 含公钥 84B）。
 struct HelloAckBody {
     std::uint32_t session = 0;
     std::uint8_t client_nonce[kHandshakeNonceBytes] = {};  ///< 回显，绑定请求。
     std::uint8_t server_nonce[kHandshakeNonceBytes] = {};  ///< 监听方随机 nonce。
     std::uint64_t timestamp_ms = 0;
+    /// 监听方临时 X25519 公钥；全零表示沿用纯 PSK 派生。
+    std::uint8_t x25519_public[kX25519KeyBytes] = {};
 };
 
 /// @brief 加密帧打开结果。
@@ -154,6 +179,10 @@ bool AeadOpen(const std::uint8_t key[kChaCha20KeyBytes],
 /// @brief 常量时间比较两个 16B tag。
 bool ConstantTimeEqual16(const std::uint8_t* a, const std::uint8_t* b) noexcept;
 
+/// @brief 把敏感内存清零：volatile 写，编译器不能把循环优化掉。
+/// @details 用于 X25519 临时私钥和共享密钥等生命周期极短的材料。
+void SecureZero(void* data, std::size_t bytes) noexcept;
+
 /// @brief PSK -> 握手方向密钥。
 void DeriveHandshakeKey(const std::uint8_t psk[kPskBytes], SecureDirection direction,
                         std::uint8_t out[kChaCha20KeyBytes]) noexcept;
@@ -163,6 +192,18 @@ void DeriveSessionKey(const std::uint8_t psk[kPskBytes],
                       const std::uint8_t client_nonce[kHandshakeNonceBytes],
                       const std::uint8_t server_nonce[kHandshakeNonceBytes],
                       SecureDirection direction, std::uint8_t out[kChaCha20KeyBytes]) noexcept;
+
+/// @brief PSK + X25519 共享密钥 + 双方 nonce -> 会话方向密钥（前向保密）。
+/// @details 先用 HChaCha20 把 32B 共享密钥完整混入 PSK（域分离标签
+///          "BENTO-X25519-001"），再按 DeriveSessionKey 的 nonce/方向
+///          绑定方式派生。任一端公钥被替换都会得到不同输出，从而
+///          与对端密钥不一致、AEAD 解密失败。
+void DeriveSessionKeyWithX25519(const std::uint8_t psk[kPskBytes],
+                                const std::uint8_t shared[kX25519KeyBytes],
+                                const std::uint8_t client_nonce[kHandshakeNonceBytes],
+                                const std::uint8_t server_nonce[kHandshakeNonceBytes],
+                                SecureDirection direction,
+                                std::uint8_t out[kChaCha20KeyBytes]) noexcept;
 
 /// @brief 构造 12B AEAD nonce：方向 u32 BE || seq u64 BE。
 void MakeSecureNonce(SecureDirection direction, std::uint32_t seq,
@@ -204,13 +245,16 @@ class ReplayWindow final {
 };
 
 /// @brief 编码 HELLO 明文体。
+/// @param bytes 缓冲区长度：>= kHelloBodyBytes 时追加 X25519 公钥；
+///              恰好 kLegacyHelloBodyBytes 时只写旧格式（兼容旧对端）。
+///              其余长度返回 false。
 bool EncodeHelloBody(const HelloBody& body, std::uint8_t* out, std::size_t bytes) noexcept;
-/// @brief 解码并校验 magic/version/长度。
+/// @brief 解码并校验 magic/version/长度；旧长度输入把公钥置零。
 bool DecodeHelloBody(const std::uint8_t* data, std::size_t bytes, HelloBody* out) noexcept;
 
-/// @brief 编码 HELLO_ACK 明文体。
+/// @brief 编码 HELLO_ACK 明文体（长度规则同 EncodeHelloBody）。
 bool EncodeHelloAckBody(const HelloAckBody& body, std::uint8_t* out, std::size_t bytes) noexcept;
-/// @brief 解码并校验 HELLO_ACK 明文体。
+/// @brief 解码并校验 HELLO_ACK 明文体；旧长度输入把公钥置零。
 bool DecodeHelloAckBody(const std::uint8_t* data, std::size_t bytes, HelloAckBody* out) noexcept;
 
 // ---------------------------------------------------------------------------

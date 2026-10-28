@@ -323,7 +323,10 @@ if (GO2CPP_WITH_BENTO)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_udp_transport.cpp)
         add_executable(bento_test_x25519
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_x25519.cpp)
-        foreach(bento_primitive_test bento_test_udp_transport bento_test_x25519)
+        add_executable(bento_test_x25519_handshake
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_x25519_handshake.cpp)
+        foreach(bento_primitive_test bento_test_udp_transport bento_test_x25519
+                bento_test_x25519_handshake)
             target_include_directories(${bento_primitive_test} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
             target_compile_options(${bento_primitive_test} PRIVATE
@@ -331,6 +334,7 @@ if (GO2CPP_WITH_BENTO)
         endforeach()
         target_link_libraries(bento_test_udp_transport PRIVATE go2cpp_bento_transport)
         target_link_libraries(bento_test_x25519 PRIVATE go2cpp_bento)
+        target_link_libraries(bento_test_x25519_handshake PRIVATE go2cpp_bento)
 
         # MOD-26/28：命令协议与文件传输（依赖完整模块构建里的 app 目标）。
         # MOD-31：zip/backup/upload 测试。
@@ -449,6 +453,7 @@ if (GO2CPP_WITH_BENTO)
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME bento_udp_transport COMMAND bento_test_udp_transport)
         add_test(NAME bento_x25519 COMMAND bento_test_x25519)
+        add_test(NAME bento_x25519_handshake COMMAND bento_test_x25519_handshake)
         # 用户态弱网代理：无 CAP_NET_ADMIN 时替代 tc netem 的可重复版本。
         # 20% 双向丢包 + 200ms 单向延迟，可靠流要求 100% 按序。
         # 60s 收尾窗口：20% 丢包下 PTO 最坏会退避到 2s，40s 偶发尾部未收完。
@@ -473,7 +478,7 @@ if (GO2CPP_WITH_BENTO)
             bento_pairing bento_session_table
             PROPERTIES TIMEOUT 90)
         set_tests_properties(bento_transport bento_relay PROPERTIES TIMEOUT 120)
-        set_tests_properties(bento_udp_transport bento_x25519
+        set_tests_properties(bento_udp_transport bento_x25519 bento_x25519_handshake
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         set_tests_properties(bento_relay PROPERTIES SKIP_RETURN_CODE 77)
         set_tests_properties(bento_weaknet_proxy PROPERTIES TIMEOUT 150)

@@ -701,8 +701,30 @@ bool ReliableChannel::TryFastRetransmit(const AckState& ack, bool ack_progressed
     m_dup_acks = 0;
     m_sack_evidence = 0;
     m_in_fast_recovery = true;
-    // 每轮快速恢复只做一次乘性降窗；连续 SACK 空洞不会重复减半。
-    m_cc.OnLoss(now_ms, m_rtt.smoothed_rtt_ms());
+    // 统计同一 SACK 窗口内的「空洞」数：ACK 位图覆盖范围（32 个 seq）内
+    // 尚未被确认、也未被 SACK 的包就是可判定的空洞。窗口外的未确认包可能
+    // 仍在网络中，不能计入（否则高抖动链路会把每个 ACK 都误判成批量丢包）。
+    std::uint32_t holes = 1;
+    if (sack_gap) {
+        holes = 0;
+        for (const Outgoing& message : m_inflight) {
+            const std::uint32_t offset = message.seq - ack.ack_seq;
+            if (offset >= 32) {
+                break;  // inflight 按 seq 递增，之后的只会更远。
+            }
+            ++holes;
+        }
+        if (holes == 0) {
+            holes = 1;
+        }
+    }
+    // 每轮快速恢复只降一次窗；随机丢包时拥塞控制器不会降窗（见 congestion.cpp）。
+    CongestionController::LossContext loss_context;
+    loss_context.now_ms = now_ms;
+    loss_context.srtt_ms = m_rtt.smoothed_rtt_ms();
+    loss_context.holes = holes;
+    loss_context.inflight = m_inflight.size();
+    m_cc.OnLoss(loss_context);
     std::size_t retransmitted = 0;
     for (auto it = m_inflight.begin();
          it != m_inflight.end() && retransmitted < kFastRetransmitBatch; ++it) {
@@ -778,7 +800,14 @@ void ReliableChannel::OnTimer(std::uint64_t now_ms) {
     if (retransmitted > 0 && !m_pto_recovery) {
         // 一次 PTO 丢失事件只降窗一次；ACK 前进后 m_pto_recovery 清除。
         m_pto_recovery = true;
-        m_cc.OnTimeout(now_ms);
+        // PTO 没有 ACK 位图可参考（对端 ACK 可能已经停了），按孤立丢包上报，
+        // 由拥塞控制器结合 SRTT 膨胀与丢包率决定是否真的降窗。
+        CongestionController::LossContext loss_context;
+        loss_context.now_ms = now_ms;
+        loss_context.srtt_ms = m_rtt.smoothed_rtt_ms();
+        loss_context.holes = 1;
+        loss_context.inflight = m_inflight.size();
+        m_cc.OnTimeout(loss_context);
         m_bandwidth.OnLoss(now_ms, retransmitted);
     }
     const std::size_t dropped = m_reassembler.OnTimer(now_ms);

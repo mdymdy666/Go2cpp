@@ -301,6 +301,9 @@ constexpr std::uint8_t kLabelTicketKey[16] = {'B', 'E', 'N', 'T', 'O', '-', 'T',
                                               'I', 'C', 'K', 'E', 'T', '-', '0', '1'};
 constexpr std::uint8_t kLabelPskFingerprint[16] = {'B', 'E', 'N', 'T', 'O', '-', 'P',
                                                    'S', 'K', '-', 'F', 'P', '-', '0', '1'};
+/// X25519 共享密钥混入 PSK 的域分离标签。
+constexpr std::uint8_t kLabelX25519Mix[16] = {'B', 'E', 'N', 'T', 'O', '-', 'X', '2',
+                                               '5', '5', '1', '9', '-', '0', '0', '1'};
 
 const std::uint8_t* DirectionLabel(SecureDirection direction) noexcept {
     return direction == SecureDirection::kClientToServer ? kLabelDataC2S : kLabelDataS2C;
@@ -476,14 +479,58 @@ void DeriveHandshakeKey(const std::uint8_t psk[32], SecureDirection direction,
               out);
 }
 
+namespace {
+
+/// 把 32B 根密钥与双方 nonce、方向标签逐层绑定成方向密钥。
+void DeriveDirectionKey(const std::uint8_t root[32], const std::uint8_t client_nonce[16],
+                        const std::uint8_t server_nonce[16], SecureDirection direction,
+                        std::uint8_t out[32]) noexcept {
+    std::uint8_t bound[32];
+    std::uint8_t stage[32];
+    HChaCha20(root, client_nonce, bound);
+    HChaCha20(bound, server_nonce, stage);
+    HChaCha20(stage, DirectionLabel(direction), out);
+    SecureZero(bound, sizeof(bound));
+    SecureZero(stage, sizeof(stage));
+}
+
+}  // namespace
+
 void DeriveSessionKey(const std::uint8_t psk[32], const std::uint8_t client_nonce[16],
                       const std::uint8_t server_nonce[16], SecureDirection direction,
                       std::uint8_t out[32]) noexcept {
-    std::uint8_t master[32];
-    std::uint8_t bound[32];
-    HChaCha20(psk, client_nonce, master);
-    HChaCha20(master, server_nonce, bound);
-    HChaCha20(bound, DirectionLabel(direction), out);
+    DeriveDirectionKey(psk, client_nonce, server_nonce, direction, out);
+}
+
+void DeriveSessionKeyWithX25519(const std::uint8_t psk[32], const std::uint8_t shared[32],
+                                const std::uint8_t client_nonce[16],
+                                const std::uint8_t server_nonce[16],
+                                SecureDirection direction, std::uint8_t out[32]) noexcept {
+    if (psk == nullptr || shared == nullptr || client_nonce == nullptr ||
+        server_nonce == nullptr || out == nullptr) {
+        return;
+    }
+    // 两层 HChaCha20 把 32B 共享密钥完整混入 PSK：
+    //   mixed = HChaCha20(HChaCha20(HChaCha20(psk, label), shared[0..16]), shared[16..32])
+    // 只混 16B 会让后一半共享密钥不参与，这里两半都吸收。
+    std::uint8_t stage[32];
+    std::uint8_t mixed[32];
+    HChaCha20(psk, kLabelX25519Mix, stage);
+    HChaCha20(stage, shared, mixed);
+    HChaCha20(mixed, shared + 16, stage);
+    DeriveDirectionKey(stage, client_nonce, server_nonce, direction, out);
+    SecureZero(stage, sizeof(stage));
+    SecureZero(mixed, sizeof(mixed));
+}
+
+void SecureZero(void* data, std::size_t bytes) noexcept {
+    if (data == nullptr || bytes == 0) {
+        return;
+    }
+    volatile std::uint8_t* bytes_out = static_cast<volatile std::uint8_t*>(data);
+    for (std::size_t i = 0; i < bytes; ++i) {
+        bytes_out[i] = 0;
+    }
 }
 
 void DerivePskFingerprint(const std::uint8_t psk[32], std::uint8_t out[8]) noexcept {
@@ -565,7 +612,11 @@ bool ReplayWindow::Accept(std::uint32_t seq) noexcept {
 // ---------------------------------------------------------------------------
 
 bool EncodeHelloBody(const HelloBody& body, std::uint8_t* out, std::size_t bytes) noexcept {
-    if (out == nullptr || bytes < kHelloBodyBytes) {
+    if (out == nullptr || bytes < kLegacyHelloBodyBytes) {
+        return false;
+    }
+    const bool with_x25519 = bytes >= kHelloBodyBytes;
+    if (!with_x25519 && bytes != kLegacyHelloBodyBytes) {
         return false;
     }
     std::memcpy(out, kSecureMagic, 4);
@@ -576,11 +627,18 @@ bool EncodeHelloBody(const HelloBody& body, std::uint8_t* out, std::size_t bytes
     Store32BE(out + 8, body.session);
     std::memcpy(out + 12, body.nonce, kHandshakeNonceBytes);
     Store64BE(out + 28, body.timestamp_ms);
+    if (with_x25519) {
+        std::memcpy(out + kLegacyHelloBodyBytes, body.x25519_public, kX25519KeyBytes);
+    }
     return true;
 }
 
 bool DecodeHelloBody(const std::uint8_t* data, std::size_t bytes, HelloBody* out) noexcept {
-    if (data == nullptr || out == nullptr || bytes < kHelloBodyBytes) {
+    if (data == nullptr || out == nullptr || bytes < kLegacyHelloBodyBytes) {
+        return false;
+    }
+    const bool with_x25519 = bytes >= kHelloBodyBytes;
+    if (!with_x25519 && bytes != kLegacyHelloBodyBytes) {
         return false;
     }
     if (std::memcmp(data, kSecureMagic, 4) != 0 || data[4] != kSecureHandshakeVersion) {
@@ -589,12 +647,20 @@ bool DecodeHelloBody(const std::uint8_t* data, std::size_t bytes, HelloBody* out
     out->session = Load32BE(data + 8);
     std::memcpy(out->nonce, data + 12, kHandshakeNonceBytes);
     out->timestamp_ms = Load64BE(data + 28);
+    std::memset(out->x25519_public, 0, sizeof(out->x25519_public));
+    if (with_x25519) {
+        std::memcpy(out->x25519_public, data + kLegacyHelloBodyBytes, kX25519KeyBytes);
+    }
     return out->session != 0;
 }
 
 bool EncodeHelloAckBody(const HelloAckBody& body, std::uint8_t* out,
                         std::size_t bytes) noexcept {
-    if (out == nullptr || bytes < kHelloAckBodyBytes) {
+    if (out == nullptr || bytes < kLegacyHelloAckBodyBytes) {
+        return false;
+    }
+    const bool with_x25519 = bytes >= kHelloAckBodyBytes;
+    if (!with_x25519 && bytes != kLegacyHelloAckBodyBytes) {
         return false;
     }
     std::memcpy(out, kSecureMagic, 4);
@@ -606,12 +672,19 @@ bool EncodeHelloAckBody(const HelloAckBody& body, std::uint8_t* out,
     std::memcpy(out + 12, body.client_nonce, kHandshakeNonceBytes);
     std::memcpy(out + 28, body.server_nonce, kHandshakeNonceBytes);
     Store64BE(out + 44, body.timestamp_ms);
+    if (with_x25519) {
+        std::memcpy(out + kLegacyHelloAckBodyBytes, body.x25519_public, kX25519KeyBytes);
+    }
     return true;
 }
 
 bool DecodeHelloAckBody(const std::uint8_t* data, std::size_t bytes,
                         HelloAckBody* out) noexcept {
-    if (data == nullptr || out == nullptr || bytes < kHelloAckBodyBytes) {
+    if (data == nullptr || out == nullptr || bytes < kLegacyHelloAckBodyBytes) {
+        return false;
+    }
+    const bool with_x25519 = bytes >= kHelloAckBodyBytes;
+    if (!with_x25519 && bytes != kLegacyHelloAckBodyBytes) {
         return false;
     }
     if (std::memcmp(data, kSecureMagic, 4) != 0 || data[4] != kSecureHandshakeVersion) {
@@ -621,6 +694,10 @@ bool DecodeHelloAckBody(const std::uint8_t* data, std::size_t bytes,
     std::memcpy(out->client_nonce, data + 12, kHandshakeNonceBytes);
     std::memcpy(out->server_nonce, data + 28, kHandshakeNonceBytes);
     out->timestamp_ms = Load64BE(data + 44);
+    std::memset(out->x25519_public, 0, sizeof(out->x25519_public));
+    if (with_x25519) {
+        std::memcpy(out->x25519_public, data + kLegacyHelloAckBodyBytes, kX25519KeyBytes);
+    }
     return out->session != 0;
 }
 

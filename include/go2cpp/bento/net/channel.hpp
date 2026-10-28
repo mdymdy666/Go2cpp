@@ -225,9 +225,14 @@ class ReliableChannel final {
     static constexpr std::uint32_t kMaxPtoMs = 2000;
     /// 每个事件循环 tick 最多补发的超时消息数：避免一次 RunOnce 内突发
     /// 上百帧；不是每个 PTO 周期的硬上限（后续 tick 会按 seq 继续补）。
-    static constexpr std::size_t kPtoRetransmitBatch = 4;
+    /// 弱网实测（40% 随机丢包）：4 太小，一个窗口的空洞要跨多个 tick/多个
+    /// PTO 周期才能补齐，端到端 p95 被串行等待推到 40s 量级；8 在突发与
+    /// 时延之间折中（一 tick 最多 8 帧 ≈ 2.4KB）。
+    static constexpr std::size_t kPtoRetransmitBatch = 8;
     /// 单次快速重传最多并行补几个 SACK 空洞（32 位 SACK 窗口内）。
-    static constexpr std::size_t kFastRetransmitBatch = 8;
+    /// 40% 丢包、窗口 128 时一轮会丢 ~50 个包，8 个/次的批量需要 6 轮
+    /// 快速恢复才能补齐；16 把「一次 ACK 推进」能补的空洞翻倍。
+    static constexpr std::size_t kFastRetransmitBatch = 16;
 
     /// @brief 可观测计数器，测试与报告直接读取。
     struct Stats {

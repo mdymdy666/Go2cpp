@@ -48,12 +48,13 @@
  * 不调用可变时间的大数库。**但这不等于完整的侧信道安全证明**：调用方仍应
  * 避免在日志、错误信息或内存交换中泄露私钥。
  *
- * ## 与 `crypto.hpp` 的关系
+ * ## 与 `crypto.hpp` / `link.cpp` 的关系
  *
- * 本模块刻意不依赖 `crypto.hpp`，可单独编译/测试。未来把 X25519 接入 PSK
- * 握手时，建议在 HELLO / HELLO_ACK 中增加临时公钥字段，用
- * `X25519ComputeSharedSecret` 得到共享密钥，再与 PSK 一起送入 HChaCha20
- * 派生会话密钥；本次不改动既有 PSK 线格式，避免破坏兼容性。
+ * 本模块刻意不依赖 `crypto.hpp`，可单独编译/测试。`crypto.hpp` 的
+ * HELLO / HELLO_ACK 明文体末尾已追加 32B 临时公钥（零表示回退纯 PSK）；
+ * 握手实现用 `X25519ComputeSharedSecret` 得到共享密钥，再由
+ * `DeriveSessionKeyWithX25519` 与 PSK、双方 nonce 混合派生会话密钥。
+ * 临时私钥在派生完成后立即用 `SecureZero` 清零，不进入会话状态。
  *
  * ## 使用示例
  *

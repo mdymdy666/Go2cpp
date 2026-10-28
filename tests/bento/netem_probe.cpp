@@ -290,6 +290,7 @@ int main(int argc, char** argv) {
     std::printf(
         "netem_probe congestion: cwnd=%u ssthresh=%u effective_cwnd=%u paced=%d "
         "pacing_bps=%llu deferrals=%llu loss_events=%llu timeout_loss=%llu "
+        "random_loss=%llu congestion_loss=%llu min_rtt_ms=%u loss_permille=%u "
         "bytes_sent=%llu\n",
         congestion.cwnd_packets, congestion.ssthresh_packets, congestion.effective_window,
         congestion.pacing_enabled ? 1 : 0,
@@ -297,6 +298,9 @@ int main(int argc, char** argv) {
         static_cast<unsigned long long>(congestion.pacing_deferrals),
         static_cast<unsigned long long>(congestion.loss_events),
         static_cast<unsigned long long>(congestion.timeout_events),
+        static_cast<unsigned long long>(congestion.random_loss_events),
+        static_cast<unsigned long long>(congestion.congestion_loss_events),
+        congestion.min_rtt_ms, congestion.loss_rate_permille,
         static_cast<unsigned long long>(congestion.bytes_sent));
     std::printf("netem_probe unreliable: delivered=%u/%u ordered=%d stale_dropped=%llu\n",
                 unreliable_received, options.messages, datagram_ordered ? 1 : 0,

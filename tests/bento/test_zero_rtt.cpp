@@ -38,6 +38,9 @@ LinkConfig ListenerConfig(const std::vector<std::uint8_t>& psk) {
     config.heartbeat_interval_ms = 50;
     config.peer_timeout_ms = 5000;
     config.pre_shared_key = psk;
+    // 0-RTT 票据只按静态 PSK 恢复会话密钥；X25519 会话不允许导出票据
+    // （避免静默降级），因此这里显式用纯 PSK 模式测 0-RTT。
+    config.enable_x25519 = false;
     return config;
 }
 
@@ -50,6 +53,7 @@ LinkConfig ClientConfig(const std::vector<std::uint8_t>& psk, std::uint16_t serv
     config.heartbeat_interval_ms = 50;
     config.peer_timeout_ms = 5000;
     config.pre_shared_key = psk;
+    config.enable_x25519 = false;
     return config;
 }
 

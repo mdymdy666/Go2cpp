@@ -97,6 +97,15 @@ std::uint32_t NextWireSeq(const ReplayWindow& window) noexcept {
     return next == 0 ? 1 : next;
 }
 
+/// X25519 公钥是否全零：全零表示对端不提供公钥，应回退纯 PSK。
+bool IsZeroX25519Key(const std::uint8_t key[kX25519KeyBytes]) noexcept {
+    std::uint8_t accumulator = 0;
+    for (std::size_t i = 0; i < kX25519KeyBytes; ++i) {
+        accumulator = static_cast<std::uint8_t>(accumulator | key[i]);
+    }
+    return accumulator == 0;
+}
+
 // ---------------------------------------------------------------------------
 // 进程内 0-RTT 会话缓存（仅监听方角色）
 // ---------------------------------------------------------------------------
@@ -610,6 +619,15 @@ void Link::Connect() {
         m_handshake_tx_seq = RandomNonZeroU32();
         m_tx_direction = SecureDirection::kClientToServer;
         m_rx_direction = SecureDirection::kServerToClient;
+        if (m_config.enable_x25519) {
+            // HELLO 前生成临时密钥对；私钥保留到 HELLO_ACK 到达后立即清零。
+            // 生成失败时公钥保持全零，对端会按纯 PSK 回退（不会静默错误）。
+            (void)GenerateX25519KeyPair();
+        } else {
+            // 显式纯 PSK：不发公钥，HELLO 退回旧长度。
+            ClearX25519Ephemeral();
+            std::memset(m_x25519_public, 0, sizeof(m_x25519_public));
+        }
     }
     SendHello();
 }
@@ -1270,6 +1288,8 @@ void Link::Fail(const char* reason) {
     }
     // 监听方超时后仍保留会话快照，便于重启/重建后接受 0-RTT。
     CacheServerSession();
+    // 握手超时后临时私钥不再有任何用途；不要留在对象内存里。
+    ClearX25519Ephemeral();
     m_state = LinkState::kTimedOut;
     ++m_stats.timeouts;
     m_socket.Close();
@@ -1530,8 +1550,10 @@ bool Link::Migrate(const std::string& new_address, std::uint16_t new_port, std::
 
 std::vector<std::uint8_t> Link::ExportSessionTicket() {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    // 0-RTT 票据按静态 PSK 重派生会话密钥；X25519 会话的密钥混入了
+    // 临时共享密钥，无法从票据安全恢复，因此直接拒绝导出（不静默降级）。
     if (!m_secure_enabled || !m_session_keys_ready || m_conn_id == 0 || m_session_id == 0 ||
-        m_config.session_ticket_lifetime_ms == 0) {
+        m_config.session_ticket_lifetime_ms == 0 || !IsZeroX25519Key(m_x25519_public)) {
         return {};
     }
     SessionTicket ticket;
@@ -1629,8 +1651,11 @@ bool Link::Resume(const std::vector<std::uint8_t>& ticket_bytes) {
 }
 
 void Link::CacheServerSession() {
+    // 与 ExportSessionTicket 同一策略：只缓存纯 PSK 会话，避免
+    // 0-RTT 恢复把 X25519 会话降级成静态 PSK。
     if (!m_is_listener || !m_secure_enabled || !m_session_keys_ready || m_conn_id == 0 ||
-        m_session_id == 0 || m_config.session_ticket_lifetime_ms == 0) {
+        m_session_id == 0 || m_config.session_ticket_lifetime_ms == 0 ||
+        !IsZeroX25519Key(m_x25519_public)) {
         return;
     }
     CachedSession entry;
@@ -1949,6 +1974,8 @@ void Link::ResetSecureSession() {
     std::memset(m_server_nonce, 0, sizeof(m_server_nonce));
     std::memset(m_tx_key, 0, sizeof(m_tx_key));
     std::memset(m_rx_key, 0, sizeof(m_rx_key));
+    ClearX25519Ephemeral();
+    std::memset(m_x25519_public, 0, sizeof(m_x25519_public));
 }
 
 bool Link::TimestampAcceptable(std::uint64_t timestamp_ms) const noexcept {
@@ -1984,14 +2011,17 @@ bool Link::SendSecureHello() {
         HelloBody body;
         body.session = m_session_id;
         std::memcpy(body.nonce, m_client_nonce, kHandshakeNonceBytes);
+        std::memcpy(body.x25519_public, m_x25519_public, kX25519KeyBytes);
         body.timestamp_ms = WallClockMs();
         std::uint8_t raw[kHelloBodyBytes];
-        if (!EncodeHelloBody(body, raw, sizeof(raw))) {
+        const std::size_t raw_bytes =
+            m_config.enable_x25519 ? kHelloBodyBytes : kLegacyHelloBodyBytes;
+        if (!EncodeHelloBody(body, raw, raw_bytes)) {
             return false;
         }
         if (!SealHandshakeFrame(m_psk, SecureDirection::kClientToServer,
                                 static_cast<std::uint8_t>(FrameType::kHello), m_session_id,
-                                m_conn_id, m_handshake_tx_seq, raw, sizeof(raw),
+                                m_conn_id, m_handshake_tx_seq, raw, raw_bytes,
                                 &m_cached_hello)) {
             return false;
         }
@@ -2004,18 +2034,59 @@ bool Link::SendSecureHelloAck() {
     body.session = m_session_id;
     std::memcpy(body.client_nonce, m_client_nonce, kHandshakeNonceBytes);
     std::memcpy(body.server_nonce, m_server_nonce, kHandshakeNonceBytes);
+    std::memcpy(body.x25519_public, m_x25519_public, kX25519KeyBytes);
     body.timestamp_ms = WallClockMs();
     std::uint8_t raw[kHelloAckBodyBytes];
-    if (!EncodeHelloAckBody(body, raw, sizeof(raw))) {
+    // 回退纯 PSK 时用旧 52B 布局：既兼容旧对端，也让线格式与密钥模式一致。
+    const std::size_t raw_bytes =
+        IsZeroX25519Key(m_x25519_public) ? kLegacyHelloAckBodyBytes : kHelloAckBodyBytes;
+    if (!EncodeHelloAckBody(body, raw, raw_bytes)) {
         return false;
     }
     if (!SealHandshakeFrame(m_psk, SecureDirection::kServerToClient,
                             static_cast<std::uint8_t>(FrameType::kHelloAck), m_session_id,
-                            m_conn_id, m_handshake_tx_seq, raw, sizeof(raw),
+                            m_conn_id, m_handshake_tx_seq, raw, raw_bytes,
                             &m_cached_hello_ack)) {
         return false;
     }
     return SendRawPacket(m_cached_hello_ack.data(), m_cached_hello_ack.size());
+}
+
+bool Link::GenerateX25519KeyPair() {
+    ClearX25519Ephemeral();
+    X25519GeneratePrivateKey(m_x25519_private);
+    if (!X25519PublicKeyFromPrivate(m_x25519_private, m_x25519_public)) {
+        ClearX25519Ephemeral();
+        std::memset(m_x25519_public, 0, sizeof(m_x25519_public));
+        return false;
+    }
+    m_x25519_private_valid = true;
+    return true;
+}
+
+void Link::ClearX25519Ephemeral() {
+    SecureZero(m_x25519_private, sizeof(m_x25519_private));
+    m_x25519_private_valid = false;
+}
+
+bool Link::DeriveX25519SessionKeys(const std::uint8_t* peer_public) {
+    if (!m_x25519_private_valid || peer_public == nullptr) {
+        return false;
+    }
+    std::uint8_t shared[kX25519KeyBytes];
+    if (!X25519ComputeSharedSecret(m_x25519_private, peer_public, shared)) {
+        // 低阶公钥：派生失败，不能退回 PSK（否则等于允许降级攻击）。
+        SecureZero(shared, sizeof(shared));
+        ClearX25519Ephemeral();
+        return false;
+    }
+    DeriveSessionKeyWithX25519(m_psk, shared, m_client_nonce, m_server_nonce,
+                               m_tx_direction, m_tx_key);
+    DeriveSessionKeyWithX25519(m_psk, shared, m_client_nonce, m_server_nonce,
+                               m_rx_direction, m_rx_key);
+    SecureZero(shared, sizeof(shared));
+    ClearX25519Ephemeral();
+    return true;
 }
 
 bool Link::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
@@ -2073,7 +2144,42 @@ bool Link::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
         ++m_stats.unknown_peer_frames;
         return false;
     }
-    // 新会话：新 nonce 允许 seq 从 1 重来，先重置握手窗口。
+    // 新会话：先完成可能失败的 X25519 协商，再提交会话状态。否则低阶
+    // 公钥会把 peer/nonce 缓存污染成半初始化状态，影响后续合法重连。
+    std::uint8_t server_nonce[kHandshakeNonceBytes];
+    SecureRandomBytes(server_nonce, kHandshakeNonceBytes);
+    std::uint8_t tx_key[kChaCha20KeyBytes];
+    std::uint8_t rx_key[kChaCha20KeyBytes];
+    std::uint8_t server_public[kX25519KeyBytes] = {};
+    if (m_config.enable_x25519 && !IsZeroX25519Key(hello.x25519_public)) {
+        std::uint8_t private_key[kX25519KeyBytes];
+        std::uint8_t shared[kX25519KeyBytes];
+        X25519GeneratePrivateKey(private_key);
+        const bool derived = X25519PublicKeyFromPrivate(private_key, server_public) &&
+                             X25519ComputeSharedSecret(private_key, hello.x25519_public, shared);
+        if (!derived) {
+            // 不发送 ACK：对端会按握手超时失败，而不是静默降级。
+            SecureZero(private_key, sizeof(private_key));
+            ++m_secure_stats.auth_failures;
+            return false;
+        }
+        DeriveSessionKeyWithX25519(m_psk, shared, hello.nonce, server_nonce,
+                                   SecureDirection::kClientToServer, rx_key);
+        DeriveSessionKeyWithX25519(m_psk, shared, hello.nonce, server_nonce,
+                                   SecureDirection::kServerToClient, tx_key);
+        SecureZero(shared, sizeof(shared));
+        // 监听方发完 ACK 不再需要私钥；这里本地派生完就清零。
+        SecureZero(private_key, sizeof(private_key));
+        ++m_secure_stats.x25519_handshakes;
+    } else {
+        // 对端没有临时公钥（旧版本或显式回退）：保持原有纯 PSK 派生。
+        DeriveSessionKey(m_psk, hello.nonce, server_nonce, SecureDirection::kClientToServer,
+                         rx_key);
+        DeriveSessionKey(m_psk, hello.nonce, server_nonce, SecureDirection::kServerToClient,
+                         tx_key);
+        ++m_secure_stats.psk_fallbacks;
+    }
+    // 新 nonce 允许握手 seq 从 1 重来；低阶公钥路径已在上面提前返回。
     m_handshake_rx_window.Reset();
     m_handshake_rx_window.Accept(outer.seq);
     RememberClientNonce(hello.nonce);
@@ -2083,12 +2189,17 @@ bool Link::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
     m_session_id = hello.session;
     m_conn_id = handshake_conn_id != 0 ? handshake_conn_id : RandomNonZeroU32();
     std::memcpy(m_client_nonce, hello.nonce, kHandshakeNonceBytes);
-    SecureRandomBytes(m_server_nonce, kHandshakeNonceBytes);
+    std::memcpy(m_server_nonce, server_nonce, kHandshakeNonceBytes);
+    std::memcpy(m_tx_key, tx_key, kChaCha20KeyBytes);
+    std::memcpy(m_rx_key, rx_key, kChaCha20KeyBytes);
+    std::memcpy(m_x25519_public, server_public, kX25519KeyBytes);
+    m_x25519_private_valid = false;
+    SecureZero(m_x25519_private, sizeof(m_x25519_private));
     m_tx_direction = SecureDirection::kServerToClient;
     m_rx_direction = SecureDirection::kClientToServer;
-    DeriveSessionKey(m_psk, m_client_nonce, m_server_nonce, m_rx_direction, m_rx_key);
-    DeriveSessionKey(m_psk, m_client_nonce, m_server_nonce, m_tx_direction, m_tx_key);
     m_session_keys_ready = true;
+    SecureZero(tx_key, sizeof(tx_key));
+    SecureZero(rx_key, sizeof(rx_key));
     m_data_rx_window.Reset();
     m_tx_wire_seq = 0;
     m_resume_epoch = false;
@@ -2162,8 +2273,21 @@ bool Link::HandleSecureHelloAck(const std::uint8_t* data, std::size_t bytes,
     std::memcpy(m_server_nonce, ack.server_nonce, kHandshakeNonceBytes);
     m_tx_direction = SecureDirection::kClientToServer;
     m_rx_direction = SecureDirection::kServerToClient;
-    DeriveSessionKey(m_psk, m_client_nonce, m_server_nonce, m_tx_direction, m_tx_key);
-    DeriveSessionKey(m_psk, m_client_nonce, m_server_nonce, m_rx_direction, m_rx_key);
+    if (m_config.enable_x25519 && !IsZeroX25519Key(ack.x25519_public)) {
+        if (!DeriveX25519SessionKeys(ack.x25519_public)) {
+            // 低阶公钥或临时私钥状态丢失：禁止降级回纯 PSK，直接失败。
+            ++m_secure_stats.auth_failures;
+            return false;
+        }
+        ++m_secure_stats.x25519_handshakes;
+    } else {
+        // 旧对端没有公钥：保持原有纯 PSK 派生（兼容旧服务端）。
+        DeriveSessionKey(m_psk, m_client_nonce, m_server_nonce, m_tx_direction, m_tx_key);
+        DeriveSessionKey(m_psk, m_client_nonce, m_server_nonce, m_rx_direction, m_rx_key);
+        std::memset(m_x25519_public, 0, sizeof(m_x25519_public));
+        ClearX25519Ephemeral();
+        ++m_secure_stats.psk_fallbacks;
+    }
     m_session_keys_ready = true;
     m_data_rx_window.Reset();
     m_tx_wire_seq = 0;
