@@ -281,6 +281,11 @@
 | [modules/tools.md](modules/tools.md) | tools 总览：CLI 7 子命令、迁移（仅 v3）、回放（G2CRPLY v5）、持久化原型 | 现行 |
 | [modules/persistence.md](modules/persistence.md) | 持久化原型：MPSC+批量+fdatasync、段/manifest、2.96x/13.83x | 现行 |
 | [modules/bento-scenarios.md](modules/bento-scenarios.md) | Bento 场景矩阵（JinShan 66 条）+ P0/P1 落地记录 + §21 app 层（fetch/zip/backup/file_browser/capability/session）与 udp_transport/x25519 | 现行 |
+| [modules/bento-transport.md](modules/bento-transport.md) | Bento 传输组：ITransport 契约（deadline/半关闭/部分写/幂等关闭）、TcpTransport/MemoryTransport、20B 通用帧与 CRC32、心跳、指数退避、有界 relay；含边界与测试数据 | 现行 |
+| [modules/bento-security.md](modules/bento-security.md) | Bento 安全组：ChaCha20-Poly1305 AEAD、重放窗口、X25519 ECDH（已接线，`afc135a`）、keystore、PSK 握手与前向保密 | 现行 |
+| [modules/bento-session.md](modules/bento-session.md) | Bento 会话组：pairing/session_table/session_control/peer_hub/app::Session，以及与 `tests/bento/PROTOCOL.md` §12 的逐项对齐表 | 现行 |
+| [modules/bento-app.md](modules/bento-app.md) | Bento app 组：fetch/file_browser/backup/zip/capability/command/file_transfer；沙箱、校验与已知缺陷（D-05/D-06） | 现行 |
+| [modules/bento-foundation.md](modules/bento-foundation.md) | Bento 地基组：error/registry/mapping、reflect、udp_transport、keystore 错误码补充 | 现行 |
 
 > **基础库**（bufio/compress/container/encoding/hash/math/path）：实现简单、API 稳定，
 > 直接看 `include/go2cpp/<module>/` 头文件注释；无独立模块文档。

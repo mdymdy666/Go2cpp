@@ -37,3 +37,33 @@
   `docs/modules/bento-scenarios.md` §21。
 - 未修（明确留待后续）：app 层 `LogHook` 注入、`Upload` 远端校验、
   `Probe()` 降级消费者、D-05/D-06 并发缺陷（TOCTOU、`.part` 竞争）。
+
+## 2026-10-28 Bento 文档终审（22 模块 → 5 篇组文档）
+
+### 一、新增与登记
+
+- `docs/modules/bento-transport.md`、`bento-security.md`、`bento-session.md`、
+  `bento-app.md`、`bento-foundation.md`（共 1303 行，内容基线 `afc135a`）。
+- `docs/INDEX.md` 模块文档表登记 5 行；`docs/modules/bento-modules.md` 增加
+  「模块文档」列（21 行）与顶部导航行。
+
+### 二、按代码事实纠正的既有记录（本轮不改代码）
+
+- **X25519 已接线**：`link.cpp` 的 HELLO/HELLO_ACK 携带 32B 临时公钥，
+  `X25519ComputeSharedSecret` + `DeriveSessionKeyWithX25519` 派生会话密钥，
+  `LinkConfig::enable_x25519` 默认 `true`；失败不降级。`bento-modules.md` 原
+  「X25519 集成…后续可选」与本文 §一末条「共享密钥如何派生由上层决定」均已过时。
+- **FR-18 远端校验已实现**：`UploadOptions::verify_remote` +
+  `VerifyRemote`（`src/bento/app/backup.cpp:1077-1090`，提交 `046d39f`）。
+  `docs/modules/bento-scenarios.md` §21.2/§21.4 的「远端校验未做」是更早结论，
+  本轮未改该文件（正被其它任务改动）。
+- **D-05/D-06 现状**：`file_browser.cpp:203-224` 已改为 `link()` 发布、
+  `backup.cpp:901-905` 已改为 `.part.<pid>.<seq>`；本文档终审未做并发复现，
+  不宣称缺陷已消除，`bento-app.md` §5 同时列旧记录与新现状。
+- **PROTOCOL.md §12 修正 7 处**（帧类型范围、flags 解码行为、CRC 引用、
+  ChannelOpen 校验强度、`Flush` 公开性、丢帧范围、ctest 名），详见 `codex.md` §29。
+
+### 三、验证口径
+
+- 示例 10 段全部 `g++ -std=c++17 -Iinclude -fsyntax-only` 通过；相对链接 0 失效；
+- 测试数字均为 `grep -c` 静态计数或引用既有运行记录，**本轮未运行 ctest**。

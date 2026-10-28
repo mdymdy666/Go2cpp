@@ -183,3 +183,54 @@ jobs:
             full-trace-out/coverage.txt
             full-trace-out/*.json
           if-no-files-found: ignore
+
+  # Bento（自研 UDP 可靠/不可靠混合传输）构建与测试。
+  #
+  # 关键点：
+  #   - 测试由独立选项 GO2CPP_BENTO_TESTS（默认 ON）注册，不依赖
+  #     GO2CPP_BUILD_TESTS，因此 -DGO2CPP_BUILD_TESTS=OFF 时 ctest 仍有 Bento
+  #     用例；-R bento 本地实测命中 48 项（47 通过 + bento_netem 因无
+  #     CAP_NET_ADMIN 按 SKIP_RETURN_CODE 77 跳过）。
+  #   - eBPF 依赖是可选的：Go2CppMonitor.cmake 的 GO2CPP_ENABLE_EBPF（默认 ON）
+  #     自行探测 clang/libbpf/libelf/libz，缺任一项静默降级为仅 /proc 采集，
+  #     不影响 Bento 构建与测试。装这四个包只为让 CI 顺带覆盖 eBPF 编译分支，
+  #     要缩短 CI 时间可整行去掉。
+  bento:
+    name: bento (udp transport)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 \
+            libboost-context-dev libssl-dev zlib1g-dev \
+            libclang-dev llvm libelf-dev libbpf-dev
+
+      - name: Configure Bento
+        run: |
+          cmake -S . -B build-bento -G Ninja \
+            -DGO2CPP_WITH_BENTO=ON \
+            -DGO2CPP_BUILD_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Bento
+        run: ninja -C build-bento
+
+      - name: ctest (bento only)
+        timeout-minutes: 10
+        run: ctest --test-dir build-bento -R bento --output-on-failure --timeout 300
+
+      - name: Upload bento test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bento-ctest-log
+          path: |
+            build-bento/Testing/Temporary/LastTest.log
+            build-bento/Testing/Temporary/LastTestsFailed.log
+          if-no-files-found: ignore

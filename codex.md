@@ -1673,3 +1673,67 @@ benchmarks/gmp_vs_thread_epoll_benchmark.cpp
 - 未 commit；已知缺口：app 层无 `LogHook` 注入、`Upload` 无远端校验
   （HEAD/ETag）、`Probe()` 无库内降级消费者、store-only 带宽代价、HTTPS 依赖
   系统 curl、FileBrowser TOCTOU 与 Backup `.part` 并发（D-05/D-06 未修）。
+
+## 28. 2026-10-28 CI 固化：Bento 构建/测试 job（deepseek）
+
+- `.github/workflows/ci.yml` 新增 `bento` job（ubuntu-24.04，timeout 40 分钟）：
+  - 依赖：build-essential/cmake/ninja-build/python3 + libboost-context-dev/
+    libssl-dev/zlib1g-dev + libclang-dev/llvm/libelf-dev/libbpf-dev（eBPF 可选）；
+  - 配置：`cmake -S . -B build-bento -G Ninja -DGO2CPP_WITH_BENTO=ON
+    -DGO2CPP_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release`；
+  - 构建：`ninja -C build-bento`；测试：`ctest --test-dir build-bento -R bento
+    --output-on-failure --timeout 300`；失败上传 `bento-ctest-log` artifact
+    （LastTest.log / LastTestsFailed.log）。
+- 为什么 `GO2CPP_BUILD_TESTS=OFF` 仍有测试：Bento 用例由独立选项
+  `GO2CPP_BENTO_TESTS`（默认 ON）注册，与运行库测试解耦；`-R bento` 本地实测
+  命中 **48 项**（47 通过 + `bento_netem` 无 CAP_NET_ADMIN，按 SKIP=77 跳过），
+  `cmake --build` 共 462 个目标。
+- eBPF 依赖是**可选**的：`cmake/Go2CppMonitor.cmake` 的 `GO2CPP_ENABLE_EBPF`
+  （默认 ON）自行探测 clang/libbpf/libelf/libz，缺任一项静默降级为仅 /proc
+  采集（配置期打印 `eBPF support: OFF`），不影响 Bento。装这四个包只是让 CI
+  顺带覆盖 eBPF 编译分支；要缩短 CI 时间可去掉。
+- 本地验证：pyyaml 的 `yaml.safe_load` 与 `ruby -ryaml` 两路解析均通过，
+  `jobs` 恰为 default/enhanced/bento（name 唯一）；目标树实测配置 + `ninja`
+  462 目标成功 + `ctest -R bento` 48 项（1 SKIP）；未 commit。
+
+## 29. 2026-10-28 Bento 文档终审：22 模块拆成 5 篇组文档 + INDEX / PROTOCOL 对齐（deepseek）
+
+- 需求：为 22 个 bento 模块补独立模块文档（每篇 ≥80 行），登记 `docs/INDEX.md`，
+  给 `docs/modules/bento-modules.md` 补「模块文档」链接列，并核对
+  `tests/bento/PROTOCOL.md` 会话层 §12 与代码的一致性。**只改文档，未改代码、未 commit。**
+- 新增（`docs/modules/`，简体中文，内容基线 `afc135a`，共 1303 行）：
+  - `bento-transport.md`（331 行）：transport/tcp_transport/memory_transport/frame/
+    heartbeat/backoff/relay。含 ITransport 契约（deadline/半关闭/部分写/幂等关闭）、
+    20B 通用帧 + CRC32、心跳假时钟、指数退避抖动、relay 有界背压；2 个完整示例。
+  - `bento-security.md`（246 行）：crypto（AEAD/重放窗口/0-RTT 票据）、x25519
+    （ECDH/低阶点拒绝）、keystore、PSK 握手与前向保密。**核实 X25519 已接线**
+    （`link.cpp` HELLO/ACK 携带 32B 临时公钥，`DeriveSessionKeyWithX25519` 派生密钥，
+    `enable_x25519` 默认 true），推翻 `bento-modules.md` 原「后续可选」表述。
+  - `bento-session.md`（256 行）：pairing/session_table/session_control/peer_hub/
+    app::Session，含 PROTOCOL §12 逐条对齐表与核对记录。
+  - `bento-app.md`（288 行）：fetch/file_browser/backup/zip/capability/command/
+    file_transfer。按代码纠正三处：fetch 无进度回调、backup 无 plan/run 两阶段、
+    FR-18 远端校验已实现（`backup.cpp:1077-1090`）；D-05/D-06 的源码现状与旧记录并列。
+  - `bento-foundation.md`（182 行）：error/registry/mapping、reflect（header-only）、
+    udp_transport、keystore 错误接缝；注明 mapping 无 `MapError`、UdpTransport 无
+    `SetReadTimeout`（超时按调用参数传入）。
+- 对齐与修正：
+  - `docs/INDEX.md`：模块文档表新增 5 行（transport/security/session/app/foundation）。
+  - `docs/modules/bento-modules.md`：表加「模块文档」列（21 行）；修 X25519 行
+    「后续可选」→ 已接线；`IAuthPolicy` → `PairingAuthPolicy`；ctest 口径
+    47/47 → 59/59（注明来源与更早基线）。
+  - `tests/bento/PROTOCOL.md` §12 修正 7 处：Link 帧类型 1..8 → 0x01..0x0A；flags
+    「必须为 0」→ 编码恒 0、解码不校验；CRC 引用由「§2 通用帧」改为 `net::Frame`
+    （§2 的 12B 头不带 CRC）；ChannelOpen 的 peer id 校验是硬错误；`Flush` 非公开；
+    队列满丢帧覆盖所有帧；ctest 名 `bento_session`。末尾加终审注记。
+- 验证：
+  - 5 篇章节齐全（模块清单/API/设计/边界/测试/示例/相关文档），相对链接 0 失效
+    （含 `../../tests/bento/PROTOCOL.md`）；
+  - 10 段 `cpp` 示例全部 `g++ -std=c++17 -Iinclude -fsyntax-only` 通过；
+  - API 抽查 25 处（传输 5、安全 5、会话 5、app 5、地基 5）与头文件签名逐字一致；
+  - 956 个反引号标识符全量扫描，未命中项均为 ctest 目标名、占位符、否定性提及
+    （`mlock`/`SetReadTimeout`/`OnDatagram`）或票据字段前缀，无伪造 API；
+  - 本轮未运行 ctest；文中测试数字均标注 `grep -c` 静态口径或引用既有运行记录。
+- 未 commit。遗留：`bento-scenarios.md` §21.2/§21.4 的「远端校验未做」早于
+  `046d39f`，`AI_COLLAB.md` §三的 D-05/D-06「未修」与当前源码不一致；本轮在
+  `bento-app.md` 与 `AI_COLLAB.md` 新增节里并列说明，未改动那两处历史记录。

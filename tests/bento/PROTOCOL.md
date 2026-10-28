@@ -696,7 +696,7 @@ CMakeLists.txt                           +12 行（standalone 分支 + include�
 | 帧头 | 12B（P2 起 16B，见 §11.1） | 20B 通用帧（`net::Frame`，含 CRC-32） |
 | magic | 载荷内 `"BENT"`（HELLO） | 头 4B `0x53455353`（`"SESS"`） |
 | version | 1 → **2** | **1**（独立命名空间，与 Link 版本无关） |
-| 帧类型 | 1..8（`net::FrameType`） | 0x8001..0x8008（`app::SessionFrameType`） |
+| 帧类型 | 0x01..0x0A（`net::FrameType`，10 种，含 P2 的 MAX_DATA/PMTUD） | 0x8001..0x8008（`app::SessionFrameType`） |
 
 - 用 Link 默认格式（`net::FrameFormat{"BENT", 1}`）的 `net::FrameDecoder`
   解析会话帧返回 `kBadMagic`；用会话格式解析 Link 帧同样失败。两端混接
@@ -711,7 +711,7 @@ CMakeLists.txt                           +12 行（standalone 分支 + include�
 | 0 | magic | u32 | `0x53455353`（`"SESS"`） |
 | 4 | version | u16 | `1` |
 | 6 | type | u16 | `SessionFrameType`（0x8001..0x8008） |
-| 8 | flags | u16 | 必须为 0（会话层未定义 flags） |
+| 8 | flags | u16 | 编码恒为 0；会话层未定义 flags，解码侧当前不校验（保留字段） |
 | 10 | reserved | u16 | 必须为 0 |
 | 12 | length | u32 | 载荷字节数，上限 1 MiB（`kFrameMaxPayload`） |
 | 16 | checksum | u32 | CRC-32/IEEE，覆盖头前 16B + 载荷 |
@@ -719,7 +719,8 @@ CMakeLists.txt                           +12 行（standalone 分支 + include�
 
 会话帧复用 `net::Frame` 的编解码（`net::Encode(frame, format)` /
 `net::FrameDecoder(max_payload, format)`），仅把 magic/version 换成会话层
-自己的取值；CRC 覆盖范围与 §2 的通用帧一致。
+自己的取值；CRC 覆盖帧头前 16B + 载荷（`net::ComputeFrameChecksum`）。
+注意：§2 的 12B 头是 Link 线格式、本身不带 CRC，二者不是同一套帧。
 
 ### 12.3 帧类型与载荷
 
@@ -730,7 +731,7 @@ CMakeLists.txt                           +12 行（standalone 分支 + include�
 | 0x8003 | Data | 2B channel_id + 应用数据 | 仅 Active 状态接受 |
 | 0x8004 | Control | 1B action + 4B peer_id + 1B mode | action: 0=grant，1=revoke；mode: 1=view，2=interact |
 | 0x8005 | Close | 1B `SessionError` | 优雅关闭原因 |
-| 0x8006 | ChannelOpen | 2B channel_id + 4B peer_id | peer_id 是本端 id，非 0 且不同于配置的本端 id 无意义 |
+| 0x8006 | ChannelOpen | 2B channel_id + 4B peer_id | peer_id 必须非 0 且不等于本端 id，否则按 `kProtocolError` 关闭 |
 | 0x8007 | ChannelAck | 2B channel_id | 确认对端 ChannelOpen |
 | 0x8008 | ControlRequest | 4B peer_id + 1B 请求模式 | 仅客户端 → 仲裁端；请求模式见下 |
 
@@ -756,21 +757,25 @@ CMakeLists.txt                           +12 行（standalone 分支 + include�
 - 定时器：配对 `pairing_timeout_ms`、心跳 `heartbeat_interval_ms`/
   `heartbeat_timeout_ms`、关闭窗口 `close_timeout_ms`；逻辑时钟可注入
   （`SessionConfig::now`），测试不需要 sleep。
-- `Poll(timeout_ms)` 的 `timeout_ms` 只影响一次底层 `Read`；`Flush` 每帧
-  另有 `io_timeout_ms` 预算。部分写超时后只重发**剩余字节**，不会整帧重发
+- `Poll(timeout_ms)` 的 `timeout_ms` 只影响一次底层 `Read`；发送循环每帧
+  另有 `io_timeout_ms` 预算（`Flush` 是 `Impl` 内部方法，`Session` 未公开）。部分写超时后只重发**剩余字节**，不会整帧重发
   （否则对端会收到「半帧 + 整帧」）。
-- 发送队列上限 `max_outbox_frames`。队列满时内部帧（ChannelAck、
-  Control 广播、Heartbeat 等）会被丢弃，并累加
-  `SessionStats::dropped_frames`；`Send()` 同时返回 `kQueueFull`。
+- 发送队列上限 `max_outbox_frames`。队列满时**所有**帧（Data 与 ChannelAck、
+  Control 广播、Heartbeat 等内部帧）都入不了队，一律累加
+  `SessionStats::dropped_frames`；应用侧 `Send()` 返回 `kQueueFull`，内部帧的
+  调用方未必检查返回值，必须用 `dropped_frames` 观测（`session.cpp:928-933`）。
 
 ### 12.5 测试证据
 
 | 用例 | 覆盖点 |
 |---|---|
-| `bento_test_session` / `TestSessionWireFormat` | 会话帧 magic/version/类型；Link 解码器拒绝会话帧、会话解码器拒绝 Link 帧 |
+| `bento_session`（可执行文件 `bento_test_session`）/ `TestSessionWireFormat` | 会话帧 magic/version/类型；Link 解码器拒绝会话帧、会话解码器拒绝 Link 帧 |
 | `TestControlRejectsForeignPeer` | 陌生 peer 的 Control 帧 → `kProtocolError` 关闭 |
 | `TestControlGrantMode` | 调用方/配置申请模式与实际广播模式（kView/kInteract） |
 | `TestQueueFullDropsInternalFrames` | 队列满丢内部帧计入 `dropped_frames` |
 | `TestPartialWriteResumesRemainder` | 部分写后只重发剩余字节，对端正常解出一帧 |
 
 `bento_test_frame` 另外覆盖默认 Link 格式的既有行为（未受会话层改动影响）。
+
+> **2026-10-28 文档终审修正**：上表 7 处表述按 `afc135a` 代码校正（Link 帧类型实为 0x01..0x0A、flags 解码不校验、CRC 引用改为 `net::Frame`、ChannelOpen 的 peer id 校验是硬错误、`Flush` 非公开、队列满丢帧覆盖所有帧、ctest 名为 `bento_session`）。
+
