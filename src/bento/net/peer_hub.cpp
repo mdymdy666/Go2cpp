@@ -109,6 +109,22 @@ std::uint16_t PortOf(const sockaddr_storage& addr) noexcept {
     return 0;
 }
 
+/// @brief 标记「正在派发用户回调」；嵌套层数 > 0 时禁止销毁 Peer/通道。
+class CallbackDepthGuard final {
+   public:
+    explicit CallbackDepthGuard(int& depth) noexcept : m_depth(depth) {
+        ++m_depth;
+    }
+    ~CallbackDepthGuard() {
+        --m_depth;
+    }
+    CallbackDepthGuard(const CallbackDepthGuard&) = delete;
+    CallbackDepthGuard& operator=(const CallbackDepthGuard&) = delete;
+
+   private:
+    int& m_depth;
+};
+
 }  // namespace
 
 /// @brief 一个对端的全部会话状态。
@@ -158,6 +174,16 @@ struct PeerHub::Peer {
     ReplayWindow handshake_rx_window;
     std::vector<std::uint8_t> cached_hello;      ///< 加密 HELLO（重传幂等）。
     std::vector<std::uint8_t> cached_hello_ack;  ///< 加密 HELLO_ACK（重传幂等）。
+
+    // ---- 审查修复：延迟销毁与 HELLO 重放防护 ----
+    /// 已进入延迟销毁队列；Connect 重连会清除（仅超时软回收可取消）。
+    bool pending_cleanup = false;
+    /// 已接受过的 client nonce（跨会话保留，拒绝旧 HELLO 重放）。
+    std::vector<std::array<std::uint8_t, kHandshakeNonceBytes>> seen_client_nonces;
+    /// 最近一次接受的新 HELLO 的墙钟时间戳（单调性检查）。
+    std::uint64_t last_hello_timestamp_ms = 0;
+    /// 每个 peer 保留的已见 nonce 数量（与 Link 的 kMaxRememberedClientNonces 一致）。
+    static constexpr std::size_t kMaxRememberedClientNonces = 8;
 
     // ---- 日志钩子增量（仅注入 hook 时维护） ----
     std::map<std::uint8_t, std::uint64_t> log_retransmits;
@@ -228,14 +254,23 @@ bool PeerHub::Open(std::string* error) {
 
 void PeerHub::Close() {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    for (auto& entry : m_peers) {
-        entry.second->state = PeerState::kClosed;
-        ResetChannels(*entry.second);
-        ResetSecureSession(*entry.second);
-    }
-    m_peers.clear();
-    m_by_conn_id.clear();
     m_socket.Close();
+    m_by_conn_id.clear();
+    if (m_callback_depth > 0) {
+        // PEB-01：回调里 Close 时不能销毁正在执行的通道（on_stream 返回后
+        // AdvanceDelivery 仍会写 m_next_rx_seq）。先标记终态，整表清空
+        // 推迟到 RunOnce 末尾的安全点。
+        for (auto& entry : m_peers) {
+            entry.second->state = PeerState::kClosed;
+            entry.second->session_keys_ready = false;
+        }
+        m_pending_cleanup.clear();
+        m_close_deferred = true;
+        return;
+    }
+    m_close_deferred = false;
+    m_pending_cleanup.clear();
+    m_peers.clear();
 }
 
 std::uint32_t PeerHub::AllocatePeerId() {
@@ -332,6 +367,8 @@ ReliableChannel* PeerHub::GetOrCreateReliable(Peer& peer, std::uint8_t channel) 
         [this, peer_id, channel](std::uint32_t /*seq*/, const std::uint8_t* data,
                                  std::size_t bytes) {
             if (on_stream) {
+                // PEB-01：回调里允许 RemovePeer/Close，销毁延迟到安全点。
+                CallbackDepthGuard guard(m_callback_depth);
                 on_stream(peer_id, channel, data, bytes);
             }
         },
@@ -363,6 +400,7 @@ UnreliableChannel* PeerHub::GetOrCreateUnreliable(Peer& peer, std::uint8_t chann
         [this, peer_id, channel](std::uint32_t /*seq*/, const std::uint8_t* data,
                                  std::size_t bytes) {
             if (on_datagram) {
+                CallbackDepthGuard guard(m_callback_depth);
                 on_datagram(peer_id, channel, data, bytes);
             }
         });
@@ -522,7 +560,9 @@ void PeerHub::StartHandshake(Peer& peer) {
     peer.next_hello_ms = now;
     peer.hello_attempts = 0;
     peer.hello_pto_ms = m_config.hello_initial_pto_ms;
-    peer.session_id = m_session_id;
+    // PEB-02：每一代连接用独立 session_id。对端据此识别「新会话」并重置
+    // 通道/重放窗口；复用 Hub 级 session 会让重连后的新流被误判为旧包。
+    peer.session_id = NextSessionId();
     if (peer.conn_id == 0) {
         peer.conn_id = RandomNonZeroU32();
     }
@@ -572,13 +612,8 @@ bool PeerHub::AddPeer(std::uint32_t peer_id, const std::string& address, std::ui
     }
     Peer* peer = CreatePeer(peer_id, addr, addr_len);
     peer->outgoing = true;
-    // 随机 conn_id；极小概率与既有 peer 冲突，冲突时重抽。
-    std::uint32_t conn_id = RandomNonZeroU32();
-    for (int attempt = 0; attempt < 8 && m_by_conn_id.find(conn_id) != m_by_conn_id.end();
-         ++attempt) {
-        conn_id = RandomNonZeroU32();
-    }
-    if (m_by_conn_id.find(conn_id) != m_by_conn_id.end()) {
+    const std::uint32_t conn_id = AllocateConnId();
+    if (conn_id == 0) {
         m_peers.erase(peer_id);
         if (error != nullptr) {
             *error = "could not allocate a unique conn_id";
@@ -600,16 +635,25 @@ bool PeerHub::Connect(std::uint32_t peer_id) {
     if (peer.state == PeerState::kConnecting || peer.state == PeerState::kConnected) {
         return false;
     }
+    const auto pending = m_pending_cleanup.find(peer_id);
+    if (pending != m_pending_cleanup.end() && pending->second) {
+        // RemovePeer 已登记硬删除：不允许在销毁前复活。
+        return false;
+    }
+    // PEB-04：取消超时软回收，重连复用该 peer 记录。
+    peer.pending_cleanup = false;
+    m_pending_cleanup.erase(peer_id);
     ResetChannels(peer);
-    // 新会话必须换 conn_id：旧的接收窗口/对端缓存仍指向上一代会话。
+    ResetSecureSession(peer);
+    // PEB-02：新会话必须换 conn_id：旧的接收窗口/对端缓存仍指向上一代会话。
     if (peer.conn_id != 0) {
         m_by_conn_id.erase(peer.conn_id);
     }
-    peer.conn_id = RandomNonZeroU32();
-    for (int attempt = 0; attempt < 8 && m_by_conn_id.find(peer.conn_id) != m_by_conn_id.end();
-         ++attempt) {
-        peer.conn_id = RandomNonZeroU32();
+    const std::uint32_t conn_id = AllocateConnId();
+    if (conn_id == 0) {
+        return false;
     }
+    peer.conn_id = conn_id;
     StartHandshake(peer);
     return true;
 }
@@ -620,10 +664,39 @@ bool PeerHub::RemovePeer(std::uint32_t peer_id) {
     if (found == m_peers.end()) {
         return false;
     }
-    const std::uint32_t conn_id = found->second->conn_id;
-    DropPeer(*found->second, "removed");
-    m_by_conn_id.erase(conn_id);
-    m_peers.erase(found);
+    Peer& peer = *found->second;
+    const auto pending = m_pending_cleanup.find(peer_id);
+    if (peer.state == PeerState::kClosed && pending != m_pending_cleanup.end() &&
+        pending->second) {
+        // 已在待销毁队列：回调里重复 RemovePeer 是幂等的，不能二次 erase。
+        return false;
+    }
+    if (peer.state != PeerState::kTimedOut && peer.state != PeerState::kClosed) {
+        peer.state = PeerState::kClosed;
+        ++m_stats.timeouts;
+        if (m_callback_depth == 0) {
+            ResetChannels(peer);
+            ResetSecureSession(peer);
+        } else {
+            // 回调栈上可能正在执行该 peer 的通道，销毁推迟到安全点。
+            peer.session_keys_ready = false;
+        }
+        EmitLog(LogLevel::kWarn, LogEvent::kPeerDisconnected, peer_id, "removed", 0);
+        if (on_peer_disconnected) {
+            CallbackDepthGuard guard(m_callback_depth);
+            on_peer_disconnected(peer_id, "removed");
+        }
+    } else {
+        peer.state = PeerState::kClosed;
+        peer.session_keys_ready = false;
+    }
+    if (peer.conn_id != 0) {
+        m_by_conn_id.erase(peer.conn_id);
+    }
+    ScheduleCleanup(peer, true);
+    if (m_callback_depth == 0) {
+        FlushDeferredCleanup();
+    }
     return true;
 }
 
@@ -934,7 +1007,13 @@ void PeerHub::HandleHello(const FrameView& view, const sockaddr_storage& from,
             return;
         }
         if (m_peers.size() >= m_config.max_peers) {
+            // PEB-04：先回收已超时的被动 peer，再判断容量。
+            FlushDeferredCleanup();
+        }
+        if (m_peers.size() >= m_config.max_peers) {
             ++m_stats.peers_rejected;
+            EmitLog(LogLevel::kWarn, LogEvent::kHandshakeFailed, 0,
+                    "plaintext hello rejected: max peers", 0);
             return;
         }
         peer = CreatePeer(AllocatePeerId(), from, from_len);
@@ -942,13 +1021,20 @@ void PeerHub::HandleHello(const FrameView& view, const sockaddr_storage& from,
         peer->session_id = session;
         peer->conn_id = 0;
     } else if (peer->session_id != session) {
-        // 同一地址的新会话（对端重启）：旧通道状态必须整体作废，
+        // 同一地址的新会话（对端重启/重连）：旧通道状态必须整体作废，
         // 否则接收端会停在旧 seq 上永远等不到数据。
         if (peer->conn_id != 0) {
             m_by_conn_id.erase(peer->conn_id);
         }
         ResetChannels(*peer);
         peer->session_id = session;
+        peer->conn_id = 0;
+    } else if (peer->conn_id != 0 && proposed_conn_id != 0 &&
+               proposed_conn_id != peer->conn_id) {
+        // 同一 session 但客户端换了 conn_id（兼容未换 session 的旧客户端）：
+        // 接收侧通道状态必须重置，否则新流 seq=1 会被判 stale。
+        m_by_conn_id.erase(peer->conn_id);
+        ResetChannels(*peer);
         peer->conn_id = 0;
     }
 
@@ -991,34 +1077,44 @@ void PeerHub::HandleHelloAck(const FrameView& view, const sockaddr_storage& from
     }
     const std::uint32_t session = ReadU32(view.payload + 4);
     const std::uint32_t accepted_conn_id = ReadU32(view.payload + 8);
+    if (accepted_conn_id == 0) {
+        ++m_stats.unknown_peer_frames;
+        return;
+    }
+    Peer* peer = nullptr;
     const auto found = m_by_conn_id.find(accepted_conn_id);
-    if (accepted_conn_id == 0 || found == m_by_conn_id.end()) {
+    if (found != m_by_conn_id.end()) {
+        const auto peer_it = m_peers.find(found->second);
+        if (peer_it != m_peers.end()) {
+            peer = peer_it->second.get();
+        }
+    }
+    if (peer == nullptr) {
+        // PEB-02：监听端可能因 conn_id 冲突改过 id；明文 ACK 也按地址回退，
+        // 再用 session 校验兜底（与加密路径同等强度）。
+        peer = FindByAddress(from, sizeof(sockaddr_storage));
+    }
+    if (peer == nullptr) {
         ++m_stats.unknown_peer_frames;
         return;
     }
-    const auto peer_it = m_peers.find(found->second);
-    if (peer_it == m_peers.end()) {
-        ++m_stats.unknown_peer_frames;
-        return;
-    }
-    Peer& peer = *peer_it->second;
-    if (!peer.outgoing || peer.session_id != session || view.header.seq != session) {
+    if (!peer->outgoing || peer->session_id != session || view.header.seq != session) {
         // 允许地址变化（NAT 重绑定），但 session 必须对得上，否则是注入/串台。
         ++m_stats.invalid_frames;
         return;
     }
-    if (accepted_conn_id != peer.conn_id) {
-        m_by_conn_id.erase(peer.conn_id);
-        m_by_conn_id[accepted_conn_id] = peer.peer_id;
-        peer.conn_id = accepted_conn_id;
+    if (accepted_conn_id != peer->conn_id) {
+        m_by_conn_id.erase(peer->conn_id);
+        m_by_conn_id[accepted_conn_id] = peer->peer_id;
+        peer->conn_id = accepted_conn_id;
     }
-    if (!UdpSocket::SamePeer(from, peer.addr)) {
-        peer.addr = from;
-        peer.addr_len = sizeof(sockaddr_storage);
+    if (!UdpSocket::SamePeer(from, peer->addr)) {
+        peer->addr = from;
+        peer->addr_len = sizeof(sockaddr_storage);
     }
-    peer.last_rx_ms = NowMs();
-    if (peer.state != PeerState::kConnected) {
-        MarkConnected(peer);
+    peer->last_rx_ms = NowMs();
+    if (peer->state != PeerState::kConnected) {
+        MarkConnected(*peer);
     }
 }
 
@@ -1035,8 +1131,98 @@ void PeerHub::MarkConnected(Peer& peer) {
     EmitLog(LogLevel::kInfo, LogEvent::kPeerConnected, peer.peer_id,
             peer.secure_enabled ? "peer connected (psk)" : "peer connected", 0);
     if (on_peer_connected) {
+        CallbackDepthGuard guard(m_callback_depth);
         on_peer_connected(peer.peer_id);
     }
+}
+
+std::uint32_t PeerHub::AllocateConnId() {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const std::uint32_t candidate = RandomNonZeroU32();
+        if (m_by_conn_id.find(candidate) == m_by_conn_id.end()) {
+            return candidate;
+        }
+    }
+    return 0;
+}
+
+std::uint32_t PeerHub::NextSessionId() {
+    std::uint8_t raw[4] = {};
+    SecureRandomBytes(raw, sizeof(raw));
+    std::uint32_t value = (static_cast<std::uint32_t>(raw[0]) << 24) |
+                          (static_cast<std::uint32_t>(raw[1]) << 16) |
+                          (static_cast<std::uint32_t>(raw[2]) << 8) |
+                          static_cast<std::uint32_t>(raw[3]);
+    value ^= m_session_id;
+    return value == 0 ? 1U : value;
+}
+
+bool PeerHub::IsKnownClientNonce(const Peer& peer, const std::uint8_t* nonce) const noexcept {
+    for (const auto& seen : peer.seen_client_nonces) {
+        if (std::memcmp(seen.data(), nonce, kHandshakeNonceBytes) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void PeerHub::RememberClientNonce(Peer& peer, const std::uint8_t* nonce) {
+    if (peer.seen_client_nonces.size() >= Peer::kMaxRememberedClientNonces) {
+        peer.seen_client_nonces.erase(peer.seen_client_nonces.begin());
+    }
+    std::array<std::uint8_t, kHandshakeNonceBytes> entry{};
+    std::memcpy(entry.data(), nonce, kHandshakeNonceBytes);
+    peer.seen_client_nonces.push_back(entry);
+}
+
+void PeerHub::ScheduleCleanup(Peer& peer, bool hard_remove) {
+    peer.pending_cleanup = true;
+    const auto found = m_pending_cleanup.find(peer.peer_id);
+    if (found == m_pending_cleanup.end()) {
+        m_pending_cleanup.emplace(peer.peer_id, hard_remove);
+    } else if (hard_remove) {
+        // 同一个 peer 先软回收后又 RemovePeer：升级为硬删除。
+        found->second = true;
+    }
+}
+
+void PeerHub::FlushDeferredCleanup() {
+    if (m_callback_depth > 0 || m_flushing_deferred) {
+        return;
+    }
+    m_flushing_deferred = true;
+    if (m_close_deferred) {
+        m_close_deferred = false;
+        m_pending_cleanup.clear();
+        m_by_conn_id.clear();
+        m_peers.clear();
+        m_flushing_deferred = false;
+        return;
+    }
+    while (!m_pending_cleanup.empty()) {
+        std::map<std::uint32_t, bool> batch;
+        batch.swap(m_pending_cleanup);
+        for (const auto& entry : batch) {
+            const auto found = m_peers.find(entry.first);
+            if (found == m_peers.end()) {
+                continue;
+            }
+            Peer& peer = *found->second;
+            if (!entry.second && !peer.pending_cleanup) {
+                continue;  // 软回收已被 Connect 取消：重连复用该记录。
+            }
+            if (peer.conn_id != 0) {
+                const auto route = m_by_conn_id.find(peer.conn_id);
+                if (route != m_by_conn_id.end() && route->second == peer.peer_id) {
+                    m_by_conn_id.erase(route);
+                }
+            }
+            // erase 会析构 Peer 及其通道；此处回调深度必为 0，调用栈上
+            // 没有正在执行的 AdvanceDelivery/FlushPending。
+            m_peers.erase(found);
+        }
+    }
+    m_flushing_deferred = false;
 }
 
 void PeerHub::DropPeer(Peer& peer, const char* reason) {
@@ -1045,13 +1231,25 @@ void PeerHub::DropPeer(Peer& peer, const char* reason) {
     }
     peer.state = PeerState::kTimedOut;
     ++m_stats.timeouts;
-    ResetChannels(peer);
-    ResetSecureSession(peer);
+    // PEB-01：回调里可能正在执行该 peer 的通道（on_stream/on_datagram）；
+    // 此时 ResetChannels 会销毁调用栈上的通道对象。销毁统一推迟到安全点。
+    if (m_callback_depth == 0) {
+        ResetChannels(peer);
+        ResetSecureSession(peer);
+    } else {
+        peer.session_keys_ready = false;
+    }
     const bool timeout = reason != nullptr && std::strcmp(reason, "peer timeout") == 0;
     EmitLog(LogLevel::kWarn,
             timeout ? LogEvent::kPeerTimeout : LogEvent::kPeerDisconnected, peer.peer_id,
             reason != nullptr ? reason : "dropped", 0);
+    // PEB-04：被动 peer 超时后回收，释放 max_peers 配额；主动 peer 保留
+    // 记录供应用 Connect 重连。软回收可被回调里的 Connect 取消。
+    if (!peer.outgoing) {
+        ScheduleCleanup(peer, false);
+    }
     if (on_peer_disconnected) {
+        CallbackDepthGuard guard(m_callback_depth);
         on_peer_disconnected(peer.peer_id, reason);
     }
 }
@@ -1319,10 +1517,31 @@ void PeerHub::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
         }
         return;
     }
+    if (peer != nullptr) {
+        // PEB-03：已见 nonce / 更旧时间戳的 HELLO 属于重放。必须拒绝且保持
+        // 当前会话不变，否则窗口内抓包重放可反复打断活动会话（会话抖动/DoS）。
+        if (IsKnownClientNonce(*peer, hello.nonce)) {
+            ++m_secure_stats.replay_drops;
+            EmitLog(LogLevel::kWarn, LogEvent::kReplayDrop, peer->peer_id,
+                    "secure hello replay (known nonce)", bytes);
+            return;
+        }
+        if (peer->last_hello_timestamp_ms != 0 &&
+            hello.timestamp_ms < peer->last_hello_timestamp_ms) {
+            ++m_secure_stats.replay_drops;
+            EmitLog(LogLevel::kWarn, LogEvent::kReplayDrop, peer->peer_id,
+                    "secure hello replay (stale timestamp)", bytes);
+            return;
+        }
+    }
     if (peer == nullptr) {
         if (!m_config.accept_unknown_peers) {
             ++m_stats.unknown_peer_frames;
             return;
+        }
+        if (m_peers.size() >= m_config.max_peers) {
+            // PEB-04：先回收已超时的被动 peer，再判断容量。
+            FlushDeferredCleanup();
         }
         if (m_peers.size() >= m_config.max_peers) {
             ++m_stats.peers_rejected;
@@ -1343,6 +1562,14 @@ void PeerHub::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
         ResetSecureSession(*peer);
         peer->session_id = session;
         peer->conn_id = 0;
+    } else if (peer->conn_id != 0 && handshake_conn_id != 0 &&
+               handshake_conn_id != peer->conn_id) {
+        // PEB-02：同一 session 但 client 换了 conn_id（老客户端重连时未换
+        // session）：视作新会话，重置接收侧通道并采纳新 conn_id；否则新流
+        // seq=1 会被旧接收窗口判 stale。
+        m_by_conn_id.erase(peer->conn_id);
+        ResetChannels(*peer);
+        peer->conn_id = 0;
     }
     if (peer->conn_id == 0) {
         std::uint32_t chosen = handshake_conn_id != 0 ? handshake_conn_id : outer.conn_id;
@@ -1362,6 +1589,10 @@ void PeerHub::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
     // 新会话：安装加密状态并派生会话密钥（每 peer 独立 nonce -> 独立密钥）。
     peer->secure_enabled = true;
     std::memcpy(peer->psk, m_psk, kPskBytes);
+    // PEB-03：记录本次已接受的 nonce 与时间戳（跨会话保留，供旧 HELLO 重放
+    // 检测）。必须在安装密钥前更新，保证「已接受」与「已见」一致。
+    RememberClientNonce(*peer, hello.nonce);
+    peer->last_hello_timestamp_ms = hello.timestamp_ms;
     std::memcpy(peer->client_nonce, hello.nonce, kHandshakeNonceBytes);
     SecureRandomBytes(peer->server_nonce, kHandshakeNonceBytes);
     peer->tx_direction = SecureDirection::kServerToClient;
@@ -1554,6 +1785,8 @@ void PeerHub::Tick(std::uint64_t now_ms) {
 int PeerHub::RunOnce(int timeout_ms) {
     // 与 Link 相同的线程模型：持锁覆盖 poll + 分发 + Tick，避免与并发 Send 竞争。
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    // 先清掉上一轮遗留的待销毁 peer（例如并发路径入队后尚未到安全点）。
+    FlushDeferredCleanup();
     if (!m_socket.IsOpen()) {
         return 0;
     }
@@ -1577,11 +1810,17 @@ int PeerHub::RunOnce(int timeout_ms) {
             m_stats.bytes_received += static_cast<std::uint64_t>(received);
             HandlePacket(m_rx_buffer.data(), static_cast<std::size_t>(received), from, from_len);
             ++processed;
+            if (!m_socket.IsOpen()) {
+                // 回调里 Close() 关闭了 socket：本轮不再继续收包。
+                break;
+            }
         }
     } else if (ready < 0) {
         ++m_stats.poll_errors;
     }
     Tick(NowMs());
+    // PEB-01/04：回调栈已退出，销毁延迟队列里的 peer（通道）并释放容量。
+    FlushDeferredCleanup();
     return processed;
 }
 

@@ -1,6 +1,6 @@
 /**
  * @file session_control.cpp
- * @brief 通用会话控制权仲裁实现：唯一控制器、租约回收、变更回调。
+ * @brief 通用会话控制权仲裁实现：唯一控制器、可替换策略、租约回收、变更回调与审计。
  * @author go2cpp contributors
  * @date 2026-10-27
  * @copyright MIT License
@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <utility>
 
@@ -51,6 +52,16 @@ const char* ControlChangeReasonName(ControlChangeReason reason) noexcept {
     return "unknown";
 }
 
+std::shared_ptr<const IControlPolicy> MakeControlPolicy(ControlPolicy policy) {
+    switch (policy) {
+        case ControlPolicy::kPreempt:
+            return std::make_shared<PreemptControlPolicy>();
+        case ControlPolicy::kFirstCome:
+            break;
+    }
+    return std::make_shared<FirstComeControlPolicy>();
+}
+
 std::string ControlSnapshot::ToJson() const {
     std::ostringstream out;
     out << '{';
@@ -72,7 +83,12 @@ std::string ControlSnapshot::ToJson() const {
     return out.str();
 }
 
-SessionControl::SessionControl(SessionControlConfig config) : m_config(config) {
+SessionControl::SessionControl(SessionControlConfig config)
+    : SessionControl(std::move(config), nullptr) {}
+
+SessionControl::SessionControl(SessionControlConfig config,
+                               std::shared_ptr<const IControlPolicy> policy)
+    : m_config(std::move(config)), m_policy(std::move(policy)) {
     // 0 个参与者会让 Join 永远失败，钳到 1；默认模式为 kNone 时加入即无权限，
     // 对调用方没有意义，统一按 kView 处理。
     if (m_config.max_participants == 0) {
@@ -81,11 +97,16 @@ SessionControl::SessionControl(SessionControlConfig config) : m_config(config) {
     if (m_config.default_mode == ControlMode::kNone) {
         m_config.default_mode = ControlMode::kView;
     }
+    // 未显式注入策略时，按 config.policy 选内置实现；显式注入优先，
+    // 使应用无需改库源码即可替换冲突规则。
+    if (!m_policy) {
+        m_policy = MakeControlPolicy(m_config.policy);
+    }
 }
 
 void SessionControl::AppendChange(std::vector<ControlChange>* out, std::uint32_t peer_id,
                                   ControlMode from, ControlMode to,
-                                  ControlChangeReason reason) {
+                                  ControlChangeReason reason, std::uint32_t actor) {
     ++m_generation;
     ++m_stats.changes;
     ControlChange change;
@@ -95,6 +116,17 @@ void SessionControl::AppendChange(std::vector<ControlChange>* out, std::uint32_t
     change.reason = reason;
     change.controller = m_controller;
     change.generation = m_generation;
+    // 审计字段：seq 与 generation 同步；actor 标识发起者；时间戳用单调毫秒。
+    change.seq = m_generation;
+    change.actor = actor;
+    change.timestamp_ms = NowMs();
+    change.session_id = m_config.session_id;
+    if (m_config.audit_capacity != 0) {
+        if (m_audit.size() >= m_config.audit_capacity) {
+            m_audit.pop_front();
+        }
+        m_audit.push_back(change);
+    }
     out->push_back(change);
 }
 
@@ -123,7 +155,9 @@ bool SessionControl::Join(std::uint32_t peer_id) {
             return false;
         }
         ControlMode assigned = m_config.default_mode;
-        if (assigned == ControlMode::kInteract && m_controller != 0) {
+        // 撤销按 peer 身份持久化：曾 Revoke 的 peer 重连也不得直接拿控制权。
+        const bool is_revoked = m_revoked_peers.count(peer_id) != 0;
+        if (assigned == ControlMode::kInteract && (is_revoked || m_controller != 0)) {
             assigned = ControlMode::kView;
         }
         Entry entry;
@@ -134,14 +168,15 @@ bool SessionControl::Join(std::uint32_t peer_id) {
             m_lease_deadline_ms = m_config.lease_ms == 0 ? 0 : NowMs() + m_config.lease_ms;
         }
         AppendChange(&changes, peer_id, ControlMode::kNone, assigned,
-                     ControlChangeReason::kJoined);
+                     ControlChangeReason::kJoined, peer_id);
         joined = true;
     }
     Dispatch(changes);
     return joined;
 }
 
-bool SessionControl::RemoveParticipant(std::uint32_t peer_id, ControlChangeReason reason) {
+bool SessionControl::RemoveParticipant(std::uint32_t peer_id, ControlChangeReason reason,
+                                       std::uint32_t actor) {
     std::vector<ControlChange> changes;
     bool removed = false;
     {
@@ -159,7 +194,7 @@ bool SessionControl::RemoveParticipant(std::uint32_t peer_id, ControlChangeReaso
         if (reason == ControlChangeReason::kDisconnected) {
             ++m_stats.disconnects;
         }
-        AppendChange(&changes, peer_id, from, ControlMode::kNone, reason);
+        AppendChange(&changes, peer_id, from, ControlMode::kNone, reason, actor);
         removed = true;
     }
     Dispatch(changes);
@@ -167,18 +202,23 @@ bool SessionControl::RemoveParticipant(std::uint32_t peer_id, ControlChangeReaso
 }
 
 bool SessionControl::Leave(std::uint32_t peer_id) {
-    return RemoveParticipant(peer_id, ControlChangeReason::kLeft);
+    return RemoveParticipant(peer_id, ControlChangeReason::kLeft, peer_id);
 }
 
 bool SessionControl::OnPeerDisconnected(std::uint32_t peer_id) {
-    return RemoveParticipant(peer_id, ControlChangeReason::kDisconnected);
+    // 断开是被动事件，actor 记 0（系统检测）。
+    return RemoveParticipant(peer_id, ControlChangeReason::kDisconnected, 0);
 }
 
 bool SessionControl::Grant(std::uint32_t peer_id) {
-    return Grant(peer_id, ControlMode::kView);
+    return Grant(peer_id, ControlMode::kView, 0);
 }
 
 bool SessionControl::Grant(std::uint32_t peer_id, ControlMode mode) {
+    return Grant(peer_id, mode, 0);
+}
+
+bool SessionControl::Grant(std::uint32_t peer_id, ControlMode mode, std::uint32_t actor) {
     if (peer_id == 0) {
         return false;
     }
@@ -195,8 +235,8 @@ bool SessionControl::Grant(std::uint32_t peer_id, ControlMode mode) {
         }
         Entry& entry = found->second;
         const ControlMode from = entry.mode;
-        // 显式授权即解除 Revoke 的禁入标记。
-        entry.revoked = false;
+        // 显式授权即解除 Revoke 的禁入标记（撤销状态按 peer 身份持久化）。
+        m_revoked_peers.erase(peer_id);
         if (mode == ControlMode::kInteract) {
             if (m_controller != 0 && m_controller != peer_id) {
                 const auto previous = m_participants.find(m_controller);
@@ -205,7 +245,7 @@ bool SessionControl::Grant(std::uint32_t peer_id, ControlMode mode) {
                     previous->second.mode = ControlMode::kView;
                     if (previous_mode != ControlMode::kView) {
                         AppendChange(&changes, m_controller, previous_mode, ControlMode::kView,
-                                     ControlChangeReason::kPreempted);
+                                     ControlChangeReason::kPreempted, actor);
                     }
                 }
                 ++m_stats.preemptions;
@@ -216,7 +256,7 @@ bool SessionControl::Grant(std::uint32_t peer_id, ControlMode mode) {
                 m_config.lease_ms == 0 ? 0 : NowMs() + m_config.lease_ms;
             if (from != ControlMode::kInteract) {
                 AppendChange(&changes, peer_id, from, ControlMode::kInteract,
-                             ControlChangeReason::kGranted);
+                             ControlChangeReason::kGranted, actor);
             }
         } else {
             if (m_controller == peer_id) {
@@ -225,7 +265,8 @@ bool SessionControl::Grant(std::uint32_t peer_id, ControlMode mode) {
             }
             entry.mode = mode;
             if (from != mode) {
-                AppendChange(&changes, peer_id, from, mode, ControlChangeReason::kGranted);
+                AppendChange(&changes, peer_id, from, mode, ControlChangeReason::kGranted,
+                             actor);
             }
         }
         ++m_stats.grants;
@@ -248,13 +289,14 @@ bool SessionControl::Revoke() {
         if (found != m_participants.end()) {
             const ControlMode from = found->second.mode;
             found->second.mode = ControlMode::kView;
-            // 管理员强制收回：同时禁止其再次请求，直到 Grant 解除。
-            found->second.revoked = true;
+            // 管理员强制收回：按 peer 身份禁止再次请求（跨 Leave/重连保持），
+            // 直到显式 Grant 解除。
+            m_revoked_peers.insert(target);
             m_controller = 0;
             m_lease_deadline_ms = 0;
             ++m_stats.revocations;
             AppendChange(&changes, target, from, ControlMode::kView,
-                         ControlChangeReason::kRevoked);
+                         ControlChangeReason::kRevoked, 0);
             revoked = true;
         }
     }
@@ -263,6 +305,10 @@ bool SessionControl::Revoke() {
 }
 
 bool SessionControl::Revoke(std::uint32_t peer_id) {
+    return Revoke(peer_id, 0);
+}
+
+bool SessionControl::Revoke(std::uint32_t peer_id, std::uint32_t actor) {
     if (peer_id == 0) {
         return false;
     }
@@ -274,8 +320,8 @@ bool SessionControl::Revoke(std::uint32_t peer_id) {
         if (found == m_participants.end()) {
             return false;
         }
-        const bool was_revoked = found->second.revoked;
-        found->second.revoked = true;
+        // 撤销状态按 peer 身份持久化：Leave/断开后重连 Join 也不会清除。
+        m_revoked_peers.insert(peer_id);
         if (m_controller == peer_id) {
             const ControlMode from = found->second.mode;
             found->second.mode = ControlMode::kView;
@@ -283,10 +329,9 @@ bool SessionControl::Revoke(std::uint32_t peer_id) {
             m_lease_deadline_ms = 0;
             ++m_stats.revocations;
             AppendChange(&changes, peer_id, from, ControlMode::kView,
-                         ControlChangeReason::kRevoked);
+                         ControlChangeReason::kRevoked, actor);
         }
-        // 幂等：已经处于撤销态时不再重复回调。
-        (void)was_revoked;
+        // 幂等：已经处于撤销态时不再重复回调（非控制器路径不产事件）。
         revoked = true;
     }
     Dispatch(changes);
@@ -309,7 +354,13 @@ bool SessionControl::RequestControl(std::uint32_t peer_id) {
             return false;
         }
         Entry& entry = found->second;
-        if (entry.revoked) {
+        // kNone 表示「无任何权限」：Grant(peer, kNone) 收回权限后，请求必须
+        // 被拒绝（策略不得绕过权限），需显式 Grant 恢复 kView/kInteract。
+        if (entry.mode == ControlMode::kNone) {
+            ++m_stats.denials;
+            return false;
+        }
+        if (m_revoked_peers.count(peer_id) != 0) {
             ++m_stats.denials;
             return false;
         }
@@ -326,29 +377,47 @@ bool SessionControl::RequestControl(std::uint32_t peer_id) {
             m_lease_deadline_ms =
                 m_config.lease_ms == 0 ? 0 : NowMs() + m_config.lease_ms;
             AppendChange(&changes, peer_id, from, ControlMode::kInteract,
-                         ControlChangeReason::kRequested);
-            granted = true;
-        } else if (m_config.policy == ControlPolicy::kPreempt) {
-            const auto previous = m_participants.find(m_controller);
-            if (previous != m_participants.end()) {
-                const ControlMode previous_mode = previous->second.mode;
-                previous->second.mode = ControlMode::kView;
-                if (previous_mode != ControlMode::kView) {
-                    AppendChange(&changes, m_controller, previous_mode, ControlMode::kView,
-                                 ControlChangeReason::kPreempted);
-                }
-            }
-            ++m_stats.preemptions;
-            const ControlMode from = entry.mode;
-            entry.mode = ControlMode::kInteract;
-            m_controller = peer_id;
-            m_lease_deadline_ms =
-                m_config.lease_ms == 0 ? 0 : NowMs() + m_config.lease_ms;
-            AppendChange(&changes, peer_id, from, ControlMode::kInteract,
-                         ControlChangeReason::kRequested);
+                         ControlChangeReason::kRequested, peer_id);
             granted = true;
         } else {
-            ++m_stats.denials;
+            // 冲突路径交给注入的策略；状态迁移（降级原控制器、审计、统计）
+            // 仍由仲裁器统一执行，策略只回答「批准/拒绝」。
+            ControlRequestContext context;
+            context.peer_id = peer_id;
+            context.peer_mode = entry.mode;
+            context.controller = m_controller;
+            const auto current = m_participants.find(m_controller);
+            if (current != m_participants.end()) {
+                context.controller_mode = current->second.mode;
+            }
+            context.generation = m_generation;
+            context.requests = m_stats.requests;
+            context.participants = m_participants.size();
+            const bool approved =
+                m_policy != nullptr && m_policy->Decide(context) == ControlDecision::kGrant;
+            if (approved) {
+                const auto previous = m_participants.find(m_controller);
+                if (previous != m_participants.end()) {
+                    const ControlMode previous_mode = previous->second.mode;
+                    previous->second.mode = ControlMode::kView;
+                    if (previous_mode != ControlMode::kView) {
+                        AppendChange(&changes, m_controller, previous_mode,
+                                     ControlMode::kView, ControlChangeReason::kPreempted,
+                                     peer_id);
+                    }
+                }
+                ++m_stats.preemptions;
+                const ControlMode from = entry.mode;
+                entry.mode = ControlMode::kInteract;
+                m_controller = peer_id;
+                m_lease_deadline_ms =
+                    m_config.lease_ms == 0 ? 0 : NowMs() + m_config.lease_ms;
+                AppendChange(&changes, peer_id, from, ControlMode::kInteract,
+                             ControlChangeReason::kRequested, peer_id);
+                granted = true;
+            } else {
+                ++m_stats.denials;
+            }
         }
     }
     Dispatch(changes);
@@ -377,8 +446,8 @@ bool SessionControl::is_controller(std::uint32_t peer_id) const {
 
 bool SessionControl::revoked(std::uint32_t peer_id) const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    const auto found = m_participants.find(peer_id);
-    return found != m_participants.end() && found->second.revoked;
+    // 身份级撤销：参与者已 Leave/断开时仍返回 true（重连不得绕过）。
+    return m_revoked_peers.count(peer_id) != 0;
 }
 
 std::uint32_t SessionControl::controller() const {
@@ -420,9 +489,10 @@ ControlSnapshot SessionControl::Snapshot() const {
         participant.peer_id = entry.first;
         participant.mode = entry.second.mode;
         participant.controller = entry.first == m_controller;
-        participant.revoked = entry.second.revoked;
+        participant.revoked = m_revoked_peers.count(entry.first) != 0;
         snapshot.participants.push_back(participant);
     }
+    snapshot.audit.assign(m_audit.begin(), m_audit.end());
     return snapshot;
 }
 
@@ -434,6 +504,11 @@ std::uint64_t SessionControl::generation() const {
 SessionControlStats SessionControl::stats() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_stats;
+}
+
+const char* SessionControl::policy_name() const noexcept {
+    // m_policy 只在构造期赋值，之后只读，无需加锁。
+    return m_policy != nullptr ? m_policy->name() : "none";
 }
 
 bool SessionControl::Tick(std::uint64_t now_ms) {
@@ -451,7 +526,7 @@ bool SessionControl::Tick(std::uint64_t now_ms) {
             found->second.mode = ControlMode::kView;
             ++m_stats.lease_expirations;
             AppendChange(&changes, found->first, from, ControlMode::kView,
-                         ControlChangeReason::kLeaseExpired);
+                         ControlChangeReason::kLeaseExpired, 0);
             reclaimed = true;
         }
         m_controller = 0;

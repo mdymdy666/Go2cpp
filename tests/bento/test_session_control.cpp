@@ -1,6 +1,6 @@
 /**
  * @file test_session_control.cpp
- * @brief 控制权仲裁测试：并发请求、唯一控制器、断开/租约回收、Revoke 与随机压力。
+ * @brief 控制权仲裁测试：并发请求、唯一控制器、断开/租约回收、Revoke、策略注入与审计。
  * @details 覆盖场景矩阵 3.4 / 7.1–7.3（FR-03 / FR-06 / RISK-024 / AX-036）：
  *          - 场景 1：16 个 peer 并发 RequestControl，只有 1 个拿到 kInteract。
  *          - 场景 2：控制器断开（OnPeerDisconnected）自动回收，其他人可接手。
@@ -9,7 +9,13 @@
  *          - 场景 5：可抢占策略下后来者抢占，原控制器降为 kView。
  *          - 场景 6：变更回调顺序/代数、Snapshot JSON、统计计数。
  *          - 场景 7：参数与边界（0、重复 Join、上限、Grant 自动创建）。
- *          - 场景 8：随机操作序列 4000 步，验证「最多一个 Interact」不变式。
+ *          - 场景 8：Grant(kNone) 收回权限后 RequestControl 必须被拒（P1-1）。
+ *          - 场景 9：测试内自定义 IControlPolicy 注入生效，内置策略按枚举回退（P1-2）。
+ *          - 场景 10：审计字段（seq/actor/timestamp/session_id）与 Snapshot().audit（P1-3）。
+ *          - 场景 11：随机操作序列 4000 步，验证「最多一个 Interact」不变式。
+ *          - 场景 12：Revoke 状态跨 Leave/断开/重连 Join 保持（SESS-01）。
+ *          - 场景 13：注入时钟的租约等号边界（deadline-1 不回收、deadline 回收），
+ *            并在同一毫秒内断言 `lease_remaining_ms` 的精确值。
  * @author go2cpp contributors
  * @date 2026-10-27
  * @copyright MIT License
@@ -18,12 +24,15 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "go2cpp/bento/net/session_control.hpp"
@@ -33,11 +42,53 @@ namespace {
 
 using go2cpp::bento::ControlChange;
 using go2cpp::bento::ControlChangeReason;
+using go2cpp::bento::ControlDecision;
 using go2cpp::bento::ControlMode;
 using go2cpp::bento::ControlPolicy;
+using go2cpp::bento::ControlRequestContext;
 using go2cpp::bento::ControlSnapshot;
+using go2cpp::bento::IControlPolicy;
 using go2cpp::bento::SessionControl;
 using go2cpp::bento::SessionControlConfig;
+using go2cpp::bento::SessionControlStats;
+
+/// @brief 租约 deadline 精确已知的仲裁器（供注入时钟的边界用例使用）。
+struct KnownLeaseControl {
+    std::unique_ptr<SessionControl> control;
+    std::uint64_t deadline = 0;
+    ControlSnapshot initial_snapshot;
+};
+
+/// @brief 构造 deadline 精确可算的 SessionControl（deadline = now + lease_ms）。
+/// @details 实现内部用 `NowMs()` 记录 deadline，因此只有 RequestControl 与
+///          紧随其后的 Snapshot 都落在同一毫秒，deadline 才是确定的整数毫秒。
+///          失败时重试（不 sleep），避免偶发跨毫秒让边界断言变成 flaky。
+KnownLeaseControl MakeLeaseControl(std::uint32_t lease_ms) {
+    KnownLeaseControl result;
+    for (int attempt = 0; attempt < 500; ++attempt) {
+        SessionControlConfig config;
+        config.lease_ms = lease_ms;
+        auto control = std::make_unique<SessionControl>(config);
+        if (!control->Join(1) || !control->Join(2)) {
+            continue;
+        }
+        const std::uint64_t before_request = go2cpp::bento::NowMs();
+        const bool granted = control->RequestControl(1);
+        const std::uint64_t after_request = go2cpp::bento::NowMs();
+        const std::uint64_t before_snapshot = go2cpp::bento::NowMs();
+        const ControlSnapshot snapshot = control->Snapshot();
+        const std::uint64_t after_snapshot = go2cpp::bento::NowMs();
+        if (!granted || before_request != after_request || before_request != before_snapshot ||
+            before_snapshot != after_snapshot) {
+            continue;
+        }
+        result.control = std::move(control);
+        result.deadline = before_request + lease_ms;
+        result.initial_snapshot = snapshot;
+        return result;
+    }
+    return result;
+}
 
 /// 统计当前 kInteract 的数量，并断言它与 controller() 一致。
 int CountInteract(const SessionControl& control) {
@@ -65,6 +116,32 @@ void CheckInvariants(const SessionControl& control, const char* where) {
         std::fprintf(stderr, "[FAIL] invariant broken at %s: interact=%d\n", where, interact);
     }
 }
+
+/// 场景 9 用的自定义策略：只批准偶数 peer 抢占，奇数一律拒绝。
+/// 定义在测试文件内，证明「新增策略不改库源码」。
+class EvenPeerPreemptPolicy final : public IControlPolicy {
+   public:
+    const char* name() const noexcept override { return "test_even_preempt"; }
+
+    ControlDecision Decide(const ControlRequestContext& context) const override {
+        ++calls_;
+        last_controller_ = context.controller;
+        last_requests_ = context.requests;
+        last_participants_ = context.participants;
+        return (context.peer_id % 2U) == 0 ? ControlDecision::kGrant : ControlDecision::kDeny;
+    }
+
+    int calls() const { return calls_; }
+    std::uint32_t last_controller() const { return last_controller_; }
+    std::uint64_t last_requests() const { return last_requests_; }
+    std::size_t last_participants() const { return last_participants_; }
+
+   private:
+    mutable int calls_ = 0;
+    mutable std::uint32_t last_controller_ = 0;
+    mutable std::uint64_t last_requests_ = 0;
+    mutable std::size_t last_participants_ = 0;
+};
 
 /// 场景 1：16 个 peer 并发请求，只有 1 个成为控制器，其余保持 View。
 void TestConcurrentRequests() {
@@ -128,6 +205,8 @@ void TestDisconnectReclaim() {
     BENTO_CHECK_EQ(changes.front().reason, ControlChangeReason::kDisconnected);
     BENTO_CHECK_EQ(changes.front().from, ControlMode::kInteract);
     BENTO_CHECK_EQ(changes.front().to, ControlMode::kNone);
+    // 断开是被动事件：审计 actor 记为 0。
+    BENTO_CHECK_EQ(changes.front().actor, 0U);
 
     // 剩余 peer 可以接手，且断开者不再参与仲裁。
     BENTO_CHECK(control.RequestControl(2));
@@ -171,20 +250,19 @@ void TestRevokeBlocksRequest() {
     CheckInvariants(control, "revoke");
 }
 
-/// 场景 4：租约过期后自动回收为 View。
+/// 场景 4：租约过期后自动回收为 View（注入时钟，不依赖 sleep）。
 void TestLeaseExpiry() {
-    SessionControlConfig config;
-    config.lease_ms = 100;
-    SessionControl control(config);
-    BENTO_CHECK(control.Join(1));
-    BENTO_CHECK(control.Join(2));
-    BENTO_CHECK(control.RequestControl(1));
+    KnownLeaseControl lease = MakeLeaseControl(100);
+    BENTO_CHECK(lease.control != nullptr);
+    if (lease.control == nullptr) {
+        return;
+    }
+    SessionControl& control = *lease.control;
     BENTO_CHECK_EQ(control.controller(), 1U);
     // 未过期时 Tick 不回收。
-    BENTO_CHECK(!control.Tick());
+    BENTO_CHECK(!control.Tick(lease.deadline - 1));
     BENTO_CHECK_EQ(control.controller(), 1U);
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    BENTO_CHECK(control.Tick());
+    BENTO_CHECK(control.Tick(lease.deadline));
     BENTO_CHECK_EQ(control.controller(), 0U);
     BENTO_CHECK_EQ(control.mode(1), ControlMode::kView);
     BENTO_CHECK_EQ(control.stats().lease_expirations, 1U);
@@ -192,6 +270,84 @@ void TestLeaseExpiry() {
     BENTO_CHECK(control.RequestControl(2));
     BENTO_CHECK_EQ(control.controller(), 2U);
     CheckInvariants(control, "lease");
+}
+
+/// 场景 13：租约等号边界——`Tick(deadline-1)` 不回收、`Tick(deadline)`
+/// 恰好回收；事件字段、代数与统计守恒；`lease_remaining_ms` 在同一毫秒内精确。
+void TestLeaseBoundaryInjectedClock() {
+    KnownLeaseControl lease = MakeLeaseControl(1000);
+    BENTO_CHECK(lease.control != nullptr);
+    if (lease.control == nullptr) {
+        return;
+    }
+    SessionControl& control = *lease.control;
+    std::vector<ControlChange> changes;
+    control.on_change = [&](const ControlChange& change) { changes.push_back(change); };
+    const std::uint64_t generation_at_grant = control.generation();
+    const std::uint64_t deadline = lease.deadline;
+
+    // 初始快照与 deadline 同一毫秒：剩余量精确等于租约长度。
+    BENTO_CHECK_EQ(lease.initial_snapshot.controller, 1U);
+    BENTO_CHECK_EQ(lease.initial_snapshot.lease_remaining_ms, 1000U);
+
+    // deadline-10 / deadline-1：都未到期，不回收、不产生事件。
+    BENTO_CHECK(!control.Tick(deadline - 10));
+    BENTO_CHECK(!control.Tick(deadline - 1));
+    BENTO_CHECK_EQ(control.controller(), 1U);
+    BENTO_CHECK_EQ(control.mode(1), ControlMode::kInteract);
+    BENTO_CHECK(control.is_controller(1));
+    BENTO_CHECK(control.has_controller());
+    BENTO_CHECK(changes.empty());
+    BENTO_CHECK_EQ(control.stats().lease_expirations, 0U);
+
+    // 恰好 deadline：必须回收（实现是 now < deadline 才续期）。
+    BENTO_CHECK(control.Tick(deadline));
+    BENTO_CHECK_EQ(control.controller(), 0U);
+    BENTO_CHECK(!control.has_controller());
+    BENTO_CHECK_EQ(control.mode(1), ControlMode::kView);
+    BENTO_CHECK_EQ(control.stats().lease_expirations, 1U);
+    BENTO_CHECK_EQ(control.generation(), generation_at_grant + 1);
+    BENTO_CHECK_EQ(control.stats().changes, generation_at_grant + 1);
+    BENTO_CHECK_EQ(changes.size(), static_cast<std::size_t>(1));
+    if (changes.size() == 1) {
+        BENTO_CHECK_EQ(changes[0].peer_id, 1U);
+        BENTO_CHECK_EQ(changes[0].reason, ControlChangeReason::kLeaseExpired);
+        BENTO_CHECK_EQ(changes[0].from, ControlMode::kInteract);
+        BENTO_CHECK_EQ(changes[0].to, ControlMode::kView);
+        // 已知实现偏差（只记录、不在本任务修复）：kLeaseExpired 事件由
+        // AppendChange 在 `m_controller = 0` 之前生成，事件里的 controller
+        // 字段仍是旧控制器；而头文件契约是「变化后的唯一控制器（0=无）」。
+        // 因此这里不锁定该争议字段，终态由下面的 Snapshot().controller 断言。
+        BENTO_CHECK_EQ(changes[0].generation, generation_at_grant + 1);
+    }
+    const ControlSnapshot expired = control.Snapshot();
+    BENTO_CHECK_EQ(expired.controller, 0U);
+    BENTO_CHECK_EQ(expired.lease_remaining_ms, 0U);
+    BENTO_CHECK_EQ(expired.generation, generation_at_grant + 1);
+    CheckInvariants(control, "lease-boundary");
+
+    // 同一个 deadline 再次 Tick、以及更晚的 Tick：不重复回收、不重复计数。
+    BENTO_CHECK(!control.Tick(deadline));
+    BENTO_CHECK(!control.Tick(deadline + 5000));
+    BENTO_CHECK_EQ(control.stats().lease_expirations, 1U);
+    BENTO_CHECK_EQ(changes.size(), static_cast<std::size_t>(1));
+    BENTO_CHECK_EQ(control.generation(), generation_at_grant + 1);
+
+    // 精确剩余量：10ms 租约下 RequestControl 所在毫秒即 deadline-10，
+    // Snapshot 必须精确报告 10ms（不 sleep），且该时刻 Tick 仍不回收。
+    KnownLeaseControl short_lease = MakeLeaseControl(10);
+    BENTO_CHECK(short_lease.control != nullptr);
+    if (short_lease.control == nullptr) {
+        return;
+    }
+    SessionControl& short_control = *short_lease.control;
+    BENTO_CHECK_EQ(short_lease.initial_snapshot.lease_remaining_ms, 10U);
+    BENTO_CHECK(!short_control.Tick(short_lease.deadline - 10));
+    BENTO_CHECK_EQ(short_control.controller(), 1U);
+    BENTO_CHECK(short_control.Tick(short_lease.deadline));
+    BENTO_CHECK_EQ(short_control.controller(), 0U);
+    BENTO_CHECK_EQ(short_control.stats().lease_expirations, 1U);
+    BENTO_CHECK_EQ(short_control.Snapshot().lease_remaining_ms, 0U);
 }
 
 /// 场景 5：可抢占策略。
@@ -219,6 +375,9 @@ void TestPreemptPolicy() {
         BENTO_CHECK_EQ(changes[1].reason, ControlChangeReason::kRequested);
         BENTO_CHECK(changes[1].generation > changes[0].generation);
         BENTO_CHECK_EQ(changes[1].controller, 2U);
+        // 抢占事件的 actor 记录发起抢占的请求者。
+        BENTO_CHECK_EQ(changes[0].actor, 2U);
+        BENTO_CHECK_EQ(changes[1].actor, 2U);
     }
     CheckInvariants(control, "preempt");
 }
@@ -337,7 +496,297 @@ void TestValidationAndConfig() {
                    "lease_expired");
 }
 
-/// 场景 8：随机操作序列，持续验证唯一控制器不变式。
+/// 场景 8（P1-1）：Grant(kNone) 收回权限后，RequestControl 必须一律被拒。
+/// 用 kPreempt 配置证明「权限检查先于策略」，策略无法绕过 kNone。
+void TestGrantNoneBlocksRequest() {
+    SessionControlConfig config;
+    config.policy = ControlPolicy::kPreempt;
+    config.lease_ms = 0;
+    SessionControl control(config);
+    BENTO_CHECK(control.Join(1));
+    BENTO_CHECK(control.Join(2));
+    BENTO_CHECK(control.Join(3));
+    BENTO_CHECK(control.RequestControl(1));
+    BENTO_CHECK_EQ(control.controller(), 1U);
+
+    // Grant(kNone)：收回全部权限但保留参与者记录（并解除 revoke 标记）。
+    BENTO_CHECK(control.Grant(2, ControlMode::kNone));
+    BENTO_CHECK_EQ(control.mode(2), ControlMode::kNone);
+    BENTO_CHECK(!control.revoked(2));
+
+    const SessionControlStats before = control.stats();
+    const std::uint64_t generation_before = control.generation();
+    // 有控制器时：kNone 请求被拒，且不产生任何变更事件。
+    BENTO_CHECK(!control.RequestControl(2));
+    BENTO_CHECK_EQ(control.controller(), 1U);
+    BENTO_CHECK_EQ(control.mode(2), ControlMode::kNone);
+    BENTO_CHECK_EQ(control.generation(), generation_before);
+    BENTO_CHECK_EQ(control.stats().denials, before.denials + 1);
+    BENTO_CHECK_EQ(control.stats().requests, before.requests + 1);
+
+    // 无控制器时同样被拒：kNone 不是「可自行恢复的降级」。
+    BENTO_CHECK(control.Revoke(1));
+    BENTO_CHECK_EQ(control.controller(), 0U);
+    const std::uint64_t generation_after_revoke = control.generation();
+    BENTO_CHECK(!control.RequestControl(2));
+    BENTO_CHECK_EQ(control.controller(), 0U);
+    BENTO_CHECK_EQ(control.generation(), generation_after_revoke);
+
+    // 显式 Grant 恢复权限后才可请求。
+    BENTO_CHECK(control.Grant(2));
+    BENTO_CHECK_EQ(control.mode(2), ControlMode::kView);
+    BENTO_CHECK(control.RequestControl(2));
+    BENTO_CHECK_EQ(control.controller(), 2U);
+
+    // Grant(kNone) 作用于当前控制器时立即回收控制权。
+    BENTO_CHECK(control.Grant(2, ControlMode::kNone));
+    BENTO_CHECK_EQ(control.controller(), 0U);
+    BENTO_CHECK_EQ(control.mode(2), ControlMode::kNone);
+    BENTO_CHECK(!control.RequestControl(2));
+
+    // 已存在但未加入的 peer 被 Grant(kNone) 后同样不可请求。
+    BENTO_CHECK(control.Grant(99, ControlMode::kNone));
+    BENTO_CHECK_EQ(control.mode(99), ControlMode::kNone);
+    BENTO_CHECK(!control.RequestControl(99));
+
+    // 管理路径不受影响：Grant(kInteract) 可直接抢占，并记录 actor。
+    BENTO_CHECK(control.Grant(3, ControlMode::kInteract, 77));
+    BENTO_CHECK_EQ(control.controller(), 3U);
+    const ControlSnapshot snapshot = control.Snapshot();
+    BENTO_CHECK(!snapshot.audit.empty());
+    if (!snapshot.audit.empty()) {
+        BENTO_CHECK_EQ(snapshot.audit.back().reason, ControlChangeReason::kGranted);
+        BENTO_CHECK_EQ(snapshot.audit.back().actor, 77U);
+        BENTO_CHECK_EQ(snapshot.audit.back().to, ControlMode::kInteract);
+    }
+    CheckInvariants(control, "grant_none");
+}
+
+/// 场景 9（P1-2）：测试内自定义策略经构造函数注入即生效，不改库源码。
+void TestCustomPolicyInjection() {
+    // 注入策略优先于 config.policy。
+    SessionControlConfig config;
+    config.policy = ControlPolicy::kFirstCome;
+    config.lease_ms = 0;
+    auto custom = std::make_shared<EvenPeerPreemptPolicy>();
+    SessionControl control(config, custom);
+    BENTO_CHECK_EQ(std::string(control.policy_name()), "test_even_preempt");
+    BENTO_CHECK(control.Join(1));
+    BENTO_CHECK(control.Join(2));
+    BENTO_CHECK(control.Join(3));
+
+    // 无控制器：策略不参与，直接成功。
+    BENTO_CHECK(control.RequestControl(1));
+    BENTO_CHECK_EQ(custom->calls(), 0);
+
+    // 奇数请求：自定义策略拒绝。
+    BENTO_CHECK(!control.RequestControl(3));
+    BENTO_CHECK_EQ(control.controller(), 1U);
+    BENTO_CHECK_EQ(custom->calls(), 1);
+    BENTO_CHECK_EQ(custom->last_controller(), 1U);
+    BENTO_CHECK_EQ(custom->last_participants(), static_cast<std::size_t>(3));
+
+    // 偶数请求：自定义策略批准并抢占（原控制器降 kView）。
+    BENTO_CHECK(control.RequestControl(2));
+    BENTO_CHECK_EQ(control.controller(), 2U);
+    BENTO_CHECK_EQ(control.mode(1), ControlMode::kView);
+    BENTO_CHECK_EQ(control.mode(2), ControlMode::kInteract);
+    BENTO_CHECK_EQ(custom->calls(), 2);
+    BENTO_CHECK_EQ(custom->last_requests(), 3U);  // 累计请求数（含本次）
+    BENTO_CHECK_EQ(control.stats().preemptions, 1U);
+
+    // 已是控制器时的幂等请求（续租）不再进入策略。
+    BENTO_CHECK(control.RequestControl(2));
+    BENTO_CHECK_EQ(custom->calls(), 2);
+
+    // 未注入时按 config.policy 选择内置策略。
+    SessionControlConfig first_come;
+    first_come.lease_ms = 0;
+    SessionControl defaulted(first_come);
+    BENTO_CHECK_EQ(std::string(defaulted.policy_name()), "first_come");
+    BENTO_CHECK(defaulted.Join(1));
+    BENTO_CHECK(defaulted.Join(2));
+    BENTO_CHECK(defaulted.RequestControl(1));
+    BENTO_CHECK(!defaulted.RequestControl(2));
+
+    SessionControlConfig preempt_config;
+    preempt_config.policy = ControlPolicy::kPreempt;
+    preempt_config.lease_ms = 0;
+    SessionControl preempt(preempt_config);
+    BENTO_CHECK_EQ(std::string(preempt.policy_name()), "preempt");
+    BENTO_CHECK(preempt.Join(1));
+    BENTO_CHECK(preempt.Join(2));
+    BENTO_CHECK(preempt.RequestControl(1));
+    BENTO_CHECK(preempt.RequestControl(2));
+    BENTO_CHECK_EQ(preempt.controller(), 2U);
+
+    // 显式注入 nullptr：回退到 config.policy 的内置策略。
+    SessionControl fallback(preempt_config, nullptr);
+    BENTO_CHECK_EQ(std::string(fallback.policy_name()), "preempt");
+
+    // 内置策略工厂与接口一致。
+    BENTO_CHECK_EQ(std::string(go2cpp::bento::MakeControlPolicy(ControlPolicy::kFirstCome)->name()),
+                   "first_come");
+    BENTO_CHECK_EQ(std::string(go2cpp::bento::MakeControlPolicy(ControlPolicy::kPreempt)->name()),
+                   "preempt");
+    CheckInvariants(control, "custom_policy");
+}
+
+/// 场景 10（P1-3）：审计字段与 Snapshot().audit 最近 N 条变更历史。
+void TestAuditTrail() {
+    SessionControlConfig config;
+    config.session_id = 4242;
+    config.audit_capacity = 3;
+    config.lease_ms = 0;
+    SessionControl control(config);
+    std::vector<ControlChange> callbacks;
+    control.on_change = [&](const ControlChange& change) { callbacks.push_back(change); };
+
+    BENTO_CHECK(control.Join(1));                              // seq 1, actor 1
+    BENTO_CHECK(control.Join(2));                              // seq 2, actor 2
+    BENTO_CHECK(control.RequestControl(1));                    // seq 3, actor 1
+    BENTO_CHECK(control.Revoke(1, 88));                        // seq 4, actor 88
+    BENTO_CHECK(control.Grant(2, ControlMode::kInteract, 99)); // seq 5, actor 99
+
+    BENTO_CHECK_EQ(control.generation(), 5U);
+    BENTO_CHECK_EQ(callbacks.size(), static_cast<std::size_t>(5));
+    for (std::size_t i = 0; i < callbacks.size(); ++i) {
+        BENTO_CHECK_EQ(callbacks[i].seq, static_cast<std::uint64_t>(i + 1));
+        BENTO_CHECK_EQ(callbacks[i].generation, static_cast<std::uint64_t>(i + 1));
+        BENTO_CHECK_EQ(callbacks[i].session_id, 4242U);
+        BENTO_CHECK(callbacks[i].timestamp_ms > 0);
+        if (i != 0) {
+            BENTO_CHECK(callbacks[i].timestamp_ms >= callbacks[i - 1].timestamp_ms);
+        }
+    }
+    BENTO_CHECK_EQ(callbacks[0].actor, 1U);
+    BENTO_CHECK_EQ(callbacks[1].actor, 2U);
+    BENTO_CHECK_EQ(callbacks[2].actor, 1U);
+    BENTO_CHECK_EQ(callbacks[3].actor, 88U);
+    BENTO_CHECK_EQ(callbacks[4].actor, 99U);
+
+    // 容量 3：只保留最近 3 条（seq 3/4/5，旧→新）。
+    const ControlSnapshot snapshot = control.Snapshot();
+    BENTO_CHECK_EQ(snapshot.audit.size(), static_cast<std::size_t>(3));
+    if (snapshot.audit.size() == 3) {
+        BENTO_CHECK_EQ(snapshot.audit[0].seq, 3U);
+        BENTO_CHECK_EQ(snapshot.audit[0].reason, ControlChangeReason::kRequested);
+        BENTO_CHECK_EQ(snapshot.audit[0].to, ControlMode::kInteract);
+        BENTO_CHECK_EQ(snapshot.audit[1].seq, 4U);
+        BENTO_CHECK_EQ(snapshot.audit[1].reason, ControlChangeReason::kRevoked);
+        BENTO_CHECK_EQ(snapshot.audit[1].actor, 88U);
+        BENTO_CHECK_EQ(snapshot.audit[2].seq, 5U);
+        BENTO_CHECK_EQ(snapshot.audit[2].reason, ControlChangeReason::kGranted);
+        BENTO_CHECK_EQ(snapshot.audit[2].actor, 99U);
+        BENTO_CHECK_EQ(snapshot.audit[2].controller, 2U);
+        BENTO_CHECK_EQ(snapshot.audit.back().seq, callbacks.back().seq);
+    }
+    // ToJson 保持广播精简：不含审计历史。
+    BENTO_CHECK(control.Snapshot().ToJson().find("\"audit\"") == std::string::npos);
+
+    // audit_capacity = 0：完全关闭审计。
+    SessionControlConfig no_audit;
+    no_audit.audit_capacity = 0;
+    no_audit.lease_ms = 0;
+    SessionControl silent(no_audit);
+    BENTO_CHECK(silent.Join(1));
+    BENTO_CHECK(silent.Snapshot().audit.empty());
+
+    // 容量与全局代数解耦：容量 2 时仍保留最近两条（seq 2/3）。
+    SessionControlConfig capped;
+    capped.audit_capacity = 2;
+    capped.lease_ms = 0;
+    SessionControl small(capped);
+    BENTO_CHECK(small.Join(1));
+    BENTO_CHECK(small.Join(2));
+    BENTO_CHECK(small.Join(3));
+    const ControlSnapshot small_snapshot = small.Snapshot();
+    BENTO_CHECK_EQ(small_snapshot.audit.size(), static_cast<std::size_t>(2));
+    if (small_snapshot.audit.size() == 2) {
+        BENTO_CHECK_EQ(small_snapshot.audit[0].seq, 2U);
+        BENTO_CHECK_EQ(small_snapshot.audit[1].seq, 3U);
+        // 未配置 session_id：审计字段保持默认 0。
+        BENTO_CHECK_EQ(small_snapshot.audit.back().session_id, 0U);
+    }
+    CheckInvariants(control, "audit");
+}
+
+/// 场景 12（SESS-01）：撤销状态按 peer 身份持久化，Leave/断开/重连均不清除。
+void TestRevokeSurvivesReconnect() {
+    SessionControl control;
+    BENTO_CHECK(control.Join(1));
+    BENTO_CHECK(control.Join(2));
+    BENTO_CHECK(control.RequestControl(1));
+    BENTO_CHECK(control.Revoke(1));
+    BENTO_CHECK_EQ(control.controller(), 0U);
+    BENTO_CHECK(control.revoked(1));
+
+    // 主动 Leave 后撤销记录仍在（参与者已不在表中，查询仍为 true）。
+    BENTO_CHECK(control.Leave(1));
+    BENTO_CHECK_EQ(control.mode(1), ControlMode::kNone);
+    BENTO_CHECK(control.revoked(1));
+
+    // 重连 Join 不得清除撤销：强制 kView 且请求被拒。
+    BENTO_CHECK(control.Join(1));
+    BENTO_CHECK(control.revoked(1));
+    BENTO_CHECK_EQ(control.mode(1), ControlMode::kView);
+    BENTO_CHECK(!control.RequestControl(1));
+    BENTO_CHECK_EQ(control.controller(), 0U);
+
+    // 断开重连同样保持。
+    BENTO_CHECK(control.OnPeerDisconnected(1));
+    BENTO_CHECK(control.revoked(1));
+    BENTO_CHECK(control.Join(1));
+    BENTO_CHECK(!control.RequestControl(1));
+
+    // 只有显式 Grant 解除后才可重新请求。
+    BENTO_CHECK(control.Grant(1));
+    BENTO_CHECK(!control.revoked(1));
+    BENTO_CHECK(control.RequestControl(1));
+    BENTO_CHECK_EQ(control.controller(), 1U);
+
+    // default_mode = kInteract：被撤销者重连也不得直接成为控制器。
+    SessionControlConfig eager;
+    eager.default_mode = ControlMode::kInteract;
+    eager.lease_ms = 0;
+    SessionControl direct(eager);
+    BENTO_CHECK(direct.Join(5));
+    BENTO_CHECK_EQ(direct.controller(), 5U);
+    BENTO_CHECK(direct.Revoke(5));
+    BENTO_CHECK(direct.Leave(5));
+    BENTO_CHECK(direct.Join(5));  // 重连
+    BENTO_CHECK_EQ(direct.controller(), 0U);
+    BENTO_CHECK_EQ(direct.mode(5), ControlMode::kView);
+    BENTO_CHECK(direct.revoked(5));
+    BENTO_CHECK(!direct.RequestControl(5));
+
+    // Revoke + Grant(kNone)：显式授权解除撤销，但权限仍是 kNone → 请求继续被拒。
+    SessionControl combined;
+    BENTO_CHECK(combined.Join(1));
+    BENTO_CHECK(combined.Revoke(1));  // 非控制器：只标记禁入
+    BENTO_CHECK(combined.revoked(1));
+    BENTO_CHECK(combined.Grant(1, ControlMode::kNone));
+    BENTO_CHECK(!combined.revoked(1));
+    BENTO_CHECK_EQ(combined.mode(1), ControlMode::kNone);
+    BENTO_CHECK(!combined.RequestControl(1));
+    BENTO_CHECK(combined.Grant(1));
+    BENTO_CHECK(combined.RequestControl(1));
+
+    // Snapshot 反映身份级撤销：重连后的参与者带 revoked 标志。
+    SessionControl view;
+    BENTO_CHECK(view.Join(7));
+    BENTO_CHECK(view.Revoke(7));  // 非控制器：仅标记
+    BENTO_CHECK(view.Leave(7));
+    BENTO_CHECK(view.Join(7));
+    const ControlSnapshot snapshot = view.Snapshot();
+    BENTO_CHECK_EQ(snapshot.participants.size(), static_cast<std::size_t>(1));
+    if (!snapshot.participants.empty()) {
+        BENTO_CHECK(snapshot.participants.front().revoked);
+    }
+    CheckInvariants(control, "revoke_reconnect");
+}
+
+/// 场景 11：随机操作序列，持续验证唯一控制器不变式。
 void TestRandomizedOperations() {
     SessionControlConfig config;
     config.lease_ms = 30;
@@ -393,6 +842,8 @@ void TestRandomizedOperations() {
         CheckInvariants(control, "random");
         // 参与者表不会超过上限，且不变量在每一步都成立。
         BENTO_CHECK(control.participants().size() <= 8);
+        // 审计序号与代数、统计保持守恒。
+        BENTO_CHECK_EQ(control.generation(), control.stats().changes);
     }
     BENTO_CHECK(grant_count > 0);
     BENTO_CHECK(request_count > 0);
@@ -409,9 +860,14 @@ int main() {
     TestDisconnectReclaim();
     TestRevokeBlocksRequest();
     TestLeaseExpiry();
+    TestLeaseBoundaryInjectedClock();
     TestPreemptPolicy();
     TestCallbacksAndSnapshot();
     TestValidationAndConfig();
+    TestGrantNoneBlocksRequest();
+    TestCustomPolicyInjection();
+    TestAuditTrail();
+    TestRevokeSurvivesReconnect();
     TestRandomizedOperations();
     return bento_test::Finish("test_session_control");
 }

@@ -8,6 +8,9 @@
  *          - 场景 3：一个主控静默后按 peer_timeout 独立回收，其余 peer 不受影响。
  *          - 场景 4：AddPeer 参数校验（重复 id / 0 / 未 Open）。
  *          - 场景 5：3 主控 × 200 条 × 512B 的吞吐与全量送达。
+ *          - 场景 6：回调内 RemovePeer/Close 不崩溃、不 UAF（PEB-01，ASan 重点）。
+ *          - 场景 7：超时后 Connect 重连，双向数据恢复（PEB-02）。
+ *          - 场景 8：被动 peer 超时回收后释放 max_peers 配额（PEB-04）。
  * @author go2cpp contributors
  * @date 2026-10-27
  * @copyright MIT License
@@ -425,7 +428,9 @@ void TestPeerTimeoutIsolation() {
     BENTO_CHECK(dropped);
     BENTO_CHECK_EQ(timed_out.size(), static_cast<std::size_t>(1));
     const std::uint32_t dead_peer = timed_out.front();
-    BENTO_CHECK_EQ(server.peer_state(dead_peer), PeerState::kTimedOut);
+    // PEB-04：监听端被动 peer 超时后自动回收，不再占用 max_peers。
+    BENTO_CHECK(!server.HasPeer(dead_peer));
+    BENTO_CHECK_EQ(server.peer_state(dead_peer), PeerState::kClosed);
     // 另一个 peer 仍然可用：发一条消息能送达。
     const std::vector<std::uint8_t> payload = MakeMessage(7, 0, kStreamTag);
     BENTO_CHECK(alive.SendStream(1, 0, payload.data(), payload.size()));
@@ -540,6 +545,207 @@ void TestThroughput() {
                 static_cast<unsigned long long>(elapsed), bps / 1e6);
 }
 
+/// 场景 6（PEB-01）：回调内 RemovePeer/Close 不破坏投递路径（ASan 重点）。
+void TestCallbackRemoval() {
+    // 6a. on_stream 内 RemovePeer：ReliableChannel::AdvanceDelivery 在回调
+    //     返回后仍会写 m_next_rx_seq，通道必须保活到安全点。
+    {
+        PeerHub server(MakeConfig("127.0.0.1"));
+        PeerHub client(MakeConfig("127.0.0.1"));
+        std::string error;
+        BENTO_CHECK(server.Open(&error));
+        BENTO_CHECK(client.Open(&error));
+        int streams = 0;
+        bool second_remove = true;
+        server.on_stream = [&](std::uint32_t peer_id, std::uint8_t, const std::uint8_t*,
+                               std::size_t) {
+            ++streams;
+            BENTO_CHECK(server.RemovePeer(peer_id));
+            // 回调内重复删除必须幂等：旧实现会二次 erase / 迭代器失效。
+            second_remove = server.RemovePeer(peer_id);
+        };
+        BENTO_CHECK(client.AddPeer(1, "127.0.0.1", server.local_port(), &error));
+        BENTO_CHECK(PumpHubs({&server, &client},
+                             [&]() { return client.peer_connected(1) && server.peer_connected(1); },
+                             8000));
+        const std::vector<std::uint8_t> payload = MakeMessage(1, 0, kStreamTag);
+        BENTO_CHECK(client.SendStream(1, 0, payload.data(), payload.size()));
+        BENTO_CHECK(PumpHubs({&server, &client}, [&]() { return streams >= 1; }, 5000));
+        BENTO_CHECK_EQ(streams, 1);
+        BENTO_CHECK(!second_remove);
+        BENTO_CHECK(!server.HasPeer(1));
+        BENTO_CHECK_EQ(server.PeerIds().size(), 0U);
+    }
+
+    // 6b. on_datagram 内 RemovePeer：UnreliableChannel::OnFrame 投递后还会
+    //     执行 FlushPending()，同样要求通道保活到安全点。
+    {
+        PeerHub server(MakeConfig("127.0.0.1"));
+        PeerHub client(MakeConfig("127.0.0.1"));
+        std::string error;
+        BENTO_CHECK(server.Open(&error));
+        BENTO_CHECK(client.Open(&error));
+        int datagrams = 0;
+        server.on_datagram = [&](std::uint32_t peer_id, std::uint8_t, const std::uint8_t*,
+                                 std::size_t) {
+            ++datagrams;
+            (void)server.RemovePeer(peer_id);
+        };
+        BENTO_CHECK(client.AddPeer(1, "127.0.0.1", server.local_port(), &error));
+        BENTO_CHECK(PumpHubs({&server, &client},
+                             [&]() { return client.peer_connected(1) && server.peer_connected(1); },
+                             8000));
+        const std::vector<std::uint8_t> payload = MakeMessage(2, 0, kDatagramTag);
+        BENTO_CHECK(client.SendDatagram(1, 0, payload.data(), payload.size()));
+        BENTO_CHECK(PumpHubs({&server, &client}, [&]() { return datagrams >= 1; }, 5000));
+        BENTO_CHECK_EQ(datagrams, 1);
+        BENTO_CHECK(!server.HasPeer(1));
+    }
+
+    // 6c. on_peer_disconnected 里删除同一 peer：DropPeer 正在 Tick 遍历中。
+    {
+        PeerHubConfig server_config = MakeConfig("127.0.0.1");
+        server_config.peer_timeout_ms = 300;
+        PeerHub server(server_config);
+        PeerHub client(MakeConfig("127.0.0.1"));
+        std::string error;
+        BENTO_CHECK(server.Open(&error));
+        BENTO_CHECK(client.Open(&error));
+        int disconnects = 0;
+        server.on_peer_disconnected = [&](std::uint32_t peer_id, const char*) {
+            ++disconnects;
+            (void)server.RemovePeer(peer_id);
+        };
+        BENTO_CHECK(client.AddPeer(1, "127.0.0.1", server.local_port(), &error));
+        BENTO_CHECK(PumpHubs({&server, &client},
+                             [&]() { return server.peer_connected(1); }, 8000));
+        // 客户端不再运行 -> 服务端 peer 超时，回调里删除同一 peer。
+        BENTO_CHECK(PumpHubs({&server}, [&]() { return disconnects >= 1; }, 5000));
+        BENTO_CHECK_EQ(disconnects, 1);
+        BENTO_CHECK_EQ(server.PeerIds().size(), 0U);
+    }
+
+    // 6d. on_stream 内 Close()：整表清空也要推迟到安全点。
+    {
+        PeerHub server(MakeConfig("127.0.0.1"));
+        PeerHub client(MakeConfig("127.0.0.1"));
+        std::string error;
+        BENTO_CHECK(server.Open(&error));
+        BENTO_CHECK(client.Open(&error));
+        int streams = 0;
+        server.on_stream = [&](std::uint32_t, std::uint8_t, const std::uint8_t*, std::size_t) {
+            ++streams;
+            server.Close();
+        };
+        BENTO_CHECK(client.AddPeer(1, "127.0.0.1", server.local_port(), &error));
+        BENTO_CHECK(PumpHubs({&server, &client},
+                             [&]() { return client.peer_connected(1) && server.peer_connected(1); },
+                             8000));
+        const std::vector<std::uint8_t> payload = MakeMessage(3, 0, kStreamTag);
+        BENTO_CHECK(client.SendStream(1, 0, payload.data(), payload.size()));
+        BENTO_CHECK(PumpHubs({&server, &client}, [&]() { return streams >= 1; }, 5000));
+        BENTO_CHECK_EQ(streams, 1);
+        BENTO_CHECK(!server.is_open());
+        BENTO_CHECK_EQ(server.PeerIds().size(), 0U);
+        // Close 后继续驱动客户端不应崩溃（服务端已无 socket）。
+        PumpFor({&client}, 50);
+    }
+}
+
+/// 场景 7（PEB-02）：明文模式超时后 Connect 重连，双向数据恢复。
+void TestReconnectAfterTimeout() {
+    PeerHubConfig server_config = MakeConfig("127.0.0.1");
+    server_config.peer_timeout_ms = 3000;
+    PeerHub server(server_config);
+    PeerHubConfig client_config = MakeConfig("127.0.0.1");
+    client_config.peer_timeout_ms = 300;
+    PeerHub client(client_config);
+    std::string error;
+    BENTO_CHECK(server.Open(&error));
+    BENTO_CHECK(client.Open(&error));
+    int server_streams = 0;
+    int client_streams = 0;
+    server.on_stream = [&](std::uint32_t, std::uint8_t, const std::uint8_t*, std::size_t) {
+        ++server_streams;
+    };
+    client.on_stream = [&](std::uint32_t, std::uint8_t, const std::uint8_t*, std::size_t) {
+        ++client_streams;
+    };
+    BENTO_CHECK(client.AddPeer(1, "127.0.0.1", server.local_port(), &error));
+    BENTO_CHECK(PumpHubs({&server, &client},
+                         [&]() { return client.peer_connected(1) && server.peer_connected(1); },
+                         8000));
+    // 首条双向数据确认链路正常。
+    const std::vector<std::uint8_t> payload = MakeMessage(5, 0, kStreamTag);
+    BENTO_CHECK(client.SendStream(1, 0, payload.data(), payload.size()));
+    BENTO_CHECK(server.SendStream(server.PeerIds().front(), 0, payload.data(), payload.size()));
+    BENTO_CHECK(PumpHubs(
+        {&server, &client},
+        [&]() { return server_streams >= 1 && client_streams >= 1; }, 5000));
+
+    // 只驱动客户端：收不到服务端心跳 -> 客户端超时（主动 peer 保留记录）。
+    PumpFor({&client}, 800);
+    BENTO_CHECK_EQ(client.peer_state(1), PeerState::kTimedOut);
+    BENTO_CHECK_EQ(server.stats().peers_active, 1U);
+
+    // 重连：新 session + 新 conn_id；服务端按新会话重置通道/接收窗口。
+    BENTO_CHECK(client.Connect(1));
+    BENTO_CHECK(PumpHubs({&server, &client},
+                         [&]() { return client.peer_connected(1); }, 8000));
+    BENTO_CHECK_EQ(server.stats().peers_active, 1U);
+    const int server_before = server_streams;
+    const int client_before = client_streams;
+    BENTO_CHECK(client.SendStream(1, 0, payload.data(), payload.size()));
+    BENTO_CHECK(server.SendStream(server.PeerIds().front(), 0, payload.data(), payload.size()));
+    BENTO_CHECK(PumpHubs(
+        {&server, &client},
+        [&]() {
+            return server_streams > server_before && client_streams > client_before;
+        },
+        5000));
+    std::printf("[INFO] reconnect_plain: server_rx=%d client_rx=%d\n", server_streams,
+                client_streams);
+}
+
+/// 场景 8（PEB-04）：被动 peer 超时回收后释放 max_peers 配额。
+void TestTimedOutPeerReclaimed() {
+    PeerHubConfig server_config = MakeConfig("127.0.0.1");
+    server_config.peer_timeout_ms = 300;
+    server_config.max_peers = 4;
+    PeerHub server(server_config);
+    std::string error;
+    BENTO_CHECK(server.Open(&error));
+    std::vector<std::unique_ptr<PeerHub>> clients;
+    for (int i = 0; i < 4; ++i) {
+        clients.push_back(std::make_unique<PeerHub>(MakeConfig("127.0.0.1")));
+        BENTO_CHECK(clients.back()->Open(&error));
+        BENTO_CHECK(clients.back()->AddPeer(1, "127.0.0.1", server.local_port(), &error));
+    }
+    std::vector<PeerHub*> hubs{&server};
+    for (auto& hub : clients) {
+        hubs.push_back(hub.get());
+    }
+    BENTO_CHECK(PumpHubs(hubs, [&]() { return server.stats().peers_active == 4; }, 8000));
+    BENTO_CHECK_EQ(server.PeerIds().size(), 4U);
+
+    // 客户端全部停止驱动：4 个被动 peer 全部超时并回收。
+    BENTO_CHECK(PumpHubs({&server}, [&]() { return server.stats().timeouts >= 4; }, 5000));
+    BENTO_CHECK_EQ(server.PeerIds().size(), 0U);
+
+    // 配额已释放：第 5 个连接可以进入，且不再计 peers_rejected。
+    const std::uint64_t rejected_before = server.stats().peers_rejected;
+    PeerHub newcomer(MakeConfig("127.0.0.1"));
+    BENTO_CHECK(newcomer.Open(&error));
+    BENTO_CHECK(newcomer.AddPeer(1, "127.0.0.1", server.local_port(), &error));
+    BENTO_CHECK(PumpHubs({&server, &newcomer},
+                         [&]() { return server.stats().peers_active == 1; }, 8000));
+    BENTO_CHECK_EQ(server.stats().peers_rejected, rejected_before);
+    BENTO_CHECK_EQ(server.PeerIds().size(), 1U);
+    std::printf("[INFO] peer_reclaim: timeouts=%llu peers=%zu\n",
+                static_cast<unsigned long long>(server.stats().timeouts),
+                server.PeerIds().size());
+}
+
 }  // namespace
 
 int main() {
@@ -548,5 +754,8 @@ int main() {
     TestPeerTimeoutIsolation();
     TestAddPeerValidation();
     TestThroughput();
+    TestCallbackRemoval();
+    TestReconnectAfterTimeout();
+    TestTimedOutPeerReclaimed();
     return bento_test::Finish("test_peer_hub");
 }

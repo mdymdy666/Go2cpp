@@ -126,3 +126,5 @@ log_concurrent → log, sync
 - config：`02-config.md` §8「裸 std::mutex 与 park」是本政策的具体案例；
 - log：`03-log.md` 需补「并发安全约束/依赖环例外」；
 - 后续新增模块（scheduler/fiber/sync/io/http2…）一律按本政策审查。
+- bento：Bento 不依赖 base（只链 Threads/hash），R1/R3 属结构性例外，
+  决策与约束见 `docs/modules/bento-scenarios.md` §20「ADR-BENTO-001」。

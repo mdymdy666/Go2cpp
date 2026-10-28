@@ -38,6 +38,16 @@
  *          连接/断开/超时、HELLO 重传、可靠层重传与丢包、认证失败、明文
  *          拒绝、收发错误处发出结构化事件；未注入时零开销。
  *
+ *          **回调内删除 / 重连（审查修复）**：在 `on_stream`/`on_datagram`/
+ *          `on_peer_connected`/`on_peer_disconnected` 里调用 `RemovePeer`
+ *          或 `Close()` 是安全的——peer 与通道的销毁会延迟到回调栈退出后的
+ *          安全点（`RunOnce` 末尾或 `RemovePeer` 返回前），正在执行的
+ *          `AdvanceDelivery`/`FlushPending` 不会访问已释放内存。监听端
+ *          被动的超时 peer 会自动从 peer 表回收，不再永久占用 `max_peers`；
+ *          主动 peer 超时后保留记录，供 `Connect` 重连。`Connect` 每次都会
+ *          换 `session_id` 与 `conn_id`（加密 peer 还换 client nonce），
+ *          对端据此识别为新会话并重置接收窗口，避免旧 seq 被误判 stale。
+ *
  * @author go2cpp contributors
  * @date 2026-10-27
  * @copyright MIT License
@@ -46,6 +56,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -69,8 +80,10 @@ enum class PeerState : std::uint8_t {
     kIdle = 0,       ///< 已注册，尚未发起握手（保留给显式 Connect）。
     kConnecting = 1, ///< 已发出 HELLO，等待 HELLO_ACK。
     kConnected = 2,  ///< 握手完成，可收发数据帧。
-    kTimedOut = 3,   ///< 握手或心跳超时（可 Connect 重连）。
-    kClosed = 4,     ///< 已显式关闭/移除。
+    /// 握手或心跳超时：被动 peer 会被自动回收（PeerIds 中消失），
+    /// 主动 peer 保留记录供 Connect 重连。
+    kTimedOut = 3,
+    kClosed = 4,  ///< 已显式关闭/移除（记录可能仍在延迟销毁队列中）。
 };
 
 /// @brief 状态名（日志/测试用）。
@@ -184,10 +197,14 @@ class PeerHub final {
                  std::string* error = nullptr);
 
     /// @brief 对已注册的 peer 重新发起握手（超时/断链后重连）。
-    /// @return peer 存在且处于 kIdle/kTimedOut/kClosed 时返回 true。
+    /// @details 每次重连生成新的 session_id 与 conn_id（加密 peer 还换
+    ///          client nonce），对端按新会话重置通道与重放窗口；因此重连后
+    ///          新流从 seq=1 开始也不会被误判为旧包。已被 `RemovePeer` 删除
+    ///          或已被自动回收的 peer 返回 false。
+    /// @return peer 存在、是主动 peer 且处于 kIdle/kTimedOut/kClosed 时返回 true。
     bool Connect(std::uint32_t peer_id);
 
-    /// @brief 关闭并移除一个 peer。
+    /// @brief 关闭并移除一个 peer（可在回调内调用：销毁延迟到安全点）。
     bool RemovePeer(std::uint32_t peer_id);
 
     bool HasPeer(std::uint32_t peer_id) const;
@@ -314,6 +331,18 @@ class PeerHub final {
     void StartHandshake(Peer& peer);
     void MarkConnected(Peer& peer);
     void DropPeer(Peer& peer, const char* reason);
+    /// 随机分配一个未被占用的 conn_id；16 次仍冲突返回 0。
+    std::uint32_t AllocateConnId();
+    /// 生成每代连接唯一的 session_id。
+    std::uint32_t NextSessionId();
+    /// 该 peer 是否已见过这个 client nonce（HELLO 重放检测）。
+    bool IsKnownClientNonce(const Peer& peer, const std::uint8_t* nonce) const noexcept;
+    /// 记住一个已接受的 client nonce（跨会话保留，FIFO 淘汰）。
+    void RememberClientNonce(Peer& peer, const std::uint8_t* nonce);
+    /// 把 peer 放进延迟销毁队列；hard_remove=true 时不可被 Connect 取消。
+    void ScheduleCleanup(Peer& peer, bool hard_remove);
+    /// 安全点：统一销毁延迟队列中的 peer（回调深度必须为 0）。
+    void FlushDeferredCleanup();
     void Tick(std::uint64_t now_ms);
     bool TimestampAcceptable(std::uint64_t timestamp_ms) const noexcept;
     void EmitLog(LogLevel level, LogEvent event, std::uint32_t peer_id, const char* message,
@@ -331,6 +360,14 @@ class PeerHub final {
     std::uint8_t m_psk[kPskBytes] = {};
     PeerSecureStats m_secure_stats;
     LogHook* m_log_hook = nullptr;
+    /// 正在派发的用户回调嵌套层数；>0 时禁止销毁 peer/通道（PEB-01）。
+    int m_callback_depth = 0;
+    /// 延迟销毁队列：peer_id → 是否硬删除（RemovePeer 为 true）。
+    std::map<std::uint32_t, bool> m_pending_cleanup;
+    /// Close 在回调内被调用：整表清空推迟到安全点。
+    bool m_close_deferred = false;
+    /// 防止 FlushDeferredCleanup 递归。
+    bool m_flushing_deferred = false;
     /// 保护 peer 表、socket 发送与统计；recursive 以支持回调重入 Send*。
     mutable std::recursive_mutex m_mutex;
 };

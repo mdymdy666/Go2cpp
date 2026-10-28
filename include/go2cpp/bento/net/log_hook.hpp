@@ -9,7 +9,8 @@
  *          事件，用于运维告警与排障。本文件因此只提供一个极小的注入点：
  *
  *          - **回调**：`SetSink` 注入 `std::function<void(const LogRecord&)>`；
- *            未注入时所有 Emit 只做计数，零字符串格式化、零分配。
+ *            未注入时只累计 `filtered` 计数（`per_level`/`per_event` 仅在
+ *            有 sink 时累计），零字符串格式化、零分配。
  *          - **级别**：Trace/Debug/Info/Warn/Error，低于 `min_level` 的记录
  *            被计数为 filtered，不回调。
  *          - **计数**：按级别、按事件分别累计，供 `Stats()` 暴露给
@@ -17,8 +18,15 @@
  *
  *          线程模型：`Emit` 可在任意线程调用（PeerHub 的 RunOnce 线程与
  *          并发 Send* 线程都会触发）。实现先在锁内完成级别过滤与计数，
- *          再**复制 sink 到锁外调用**——这样 sink 回调里可以安全地再次
- *          Emit 或调用 PeerHub/SessionControl 的接口，不会自锁。
+ *          再**复制 sink 到锁外调用**——这样 sink 回调里可以安全地调用
+ *          PeerHub/SessionControl 的接口，不会自锁。
+ *
+ *          **重入保护**：sink 内再次 `Emit` 会被直接丢弃并计入
+ *          `LogHookStats::reentrant_dropped`（thread-local 深度守卫），因此
+ *          转发型 sink 不会无限递归到栈溢出。守卫按线程生效：同一线程上
+ *          任意 `LogHook` 实例的嵌套 Emit 都会被丢弃，其他线程不受影响。
+ *          丢弃而不是嵌套调用，是为了保证「一条记录最多进 sink 一次」。
+ *
  *          代价是每条通过过滤的记录复制一次 `std::function`；事件是低频
  *          路径（连接、重传、丢包、认证失败），可以接受。
  *
@@ -143,9 +151,31 @@ struct LogRecord {
 struct LogHookStats {
     std::uint64_t emitted = 0;   ///< 通过过滤并调用了 sink 的记录数。
     std::uint64_t filtered = 0;  ///< 被级别过滤或没有 sink 而跳过的记录数。
+    /// sink 内再次 Emit 被重入守卫丢弃的记录数（防止递归/栈溢出）。
+    std::uint64_t reentrant_dropped = 0;
     std::array<std::uint64_t, kLogLevelCount> per_level{};  ///< 按级别。
     std::array<std::uint64_t, kLogEventCount> per_event{};  ///< 按事件。
 };
+
+namespace detail {
+
+/// @brief 当前线程正在执行的 sink 回调嵌套层数（inline thread_local，跨 TU 唯一）。
+inline thread_local std::uint32_t t_emit_depth = 0;
+
+/// @brief RAII：标记「正在调用 sink」，用于检测重入。
+class EmitDepthGuard final {
+   public:
+    EmitDepthGuard() noexcept {
+        ++t_emit_depth;
+    }
+    ~EmitDepthGuard() {
+        --t_emit_depth;
+    }
+    EmitDepthGuard(const EmitDepthGuard&) = delete;
+    EmitDepthGuard& operator=(const EmitDepthGuard&) = delete;
+};
+
+}  // namespace detail
 
 /// @brief 轻量日志钩子：注入回调、按级别过滤、按级别/事件计数。
 class LogHook final {
@@ -189,6 +219,12 @@ class LogHook final {
         Sink sink;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
+            if (detail::t_emit_depth > 0) {
+                // LOGH-01：sink 内再次 Emit（转发型 sink）直接丢弃并计数，
+                // 否则会无限递归到栈溢出。
+                ++m_stats.reentrant_dropped;
+                return;
+            }
             if (!m_sink || static_cast<std::uint8_t>(level) <
                                static_cast<std::uint8_t>(m_min_level)) {
                 ++m_stats.filtered;
@@ -197,7 +233,7 @@ class LogHook final {
             ++m_stats.emitted;
             ++m_stats.per_level[LevelIndex(level)];
             ++m_stats.per_event[EventIndex(event)];
-            // 复制后在锁外调用：sink 里可以再次 Emit / 查询统计 / 回调 PeerHub。
+            // 复制后在锁外调用：sink 里可以查询统计 / 调用 PeerHub。
             sink = m_sink;
         }
         LogRecord record;
@@ -207,6 +243,7 @@ class LogHook final {
         record.peer_id = peer_id;
         record.value = value;
         record.message = message;
+        detail::EmitDepthGuard guard;
         sink(record);
     }
 

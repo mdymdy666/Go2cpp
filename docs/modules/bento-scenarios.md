@@ -54,7 +54,7 @@
 | 3.3 | 主控数量上限与拒绝策略 | AX-023、RISK-032 | `PeerHubConfig::max_peers`、`PeerHubStats::peers_rejected` | 已有 | 无「每 IP 连接数」限流 |
 | 3.4 | 看/控权限（同时可看、仅一人可控） | FR-03、FR-06、RISK-002、RISK-024 | **`session_control.hpp:SessionControl`**（P1 新增：`ControlMode{kNone,kView,kInteract}`、`Grant/RequestControl/Revoke`）；`test_session_control` | 已补 | 通用仲裁器保证「多个 View + 最多一个 Interact」；RDP attendee 语义映射仍在上层，`PeerHub` 只提供通道 |
 | 3.5 | 多主控同时高帧率时的带宽公平 | RISK-031、AX-089 | 每 peer 独立 `CongestionController` | 部分 | 有 per-peer 拥塞控制，但没有跨 peer 的全局公平调度/配额 |
-| 3.6 | 主控断开后清理其会话资源 | AX-086、AX-093 | `PeerHub::DropPeer`（peer_timeout）+ `on_peer_disconnected` 回调 | 部分 | 回收动作（撤销控制权、释放邀请）需应用层实现 |
+| 3.6 | 主控断开后清理其会话资源 | AX-086、AX-093 | `PeerHub` 内部机制 `DropPeer`（peer_timeout 触发，private 不可直接调用）+ `on_peer_disconnected` 回调 | 部分 | 回收动作（撤销控制权、释放邀请）需应用层实现 |
 
 ## 4. 回环中继（invitation 改写 + 本地转发）
 
@@ -90,7 +90,7 @@
 | # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
 |---|---|---|---|---|---|
 | 7.1 | 多个主控竞争控制权，仅一人 INTERACTIVE | FR-03、FR-06、RISK-024、AX-036 | **`session_control.hpp:SessionControl`**：先到先得/可抢占、唯一控制器、`test_session_control` 场景 1/5 | 已补 | 16 线程并发请求只产生 1 个 Interact；策略可选；应用层只需把输入事件接到 `Renew` |
-| 7.2 | 控制器断开后回收控制权 | RISK-025、AX-037 | `SessionControl::Leave/OnPeerDisconnected`（P1）+ `PeerHub::on_peer_disconnected` 直接接入；`test_session_control` 场景 2 | 部分 | 回收动作已有现成 API；接线到 `on_peer_disconnected` 仍需应用一行回调（Bento 不内建 PeerHub ↔ 仲裁器绑定） |
+| 7.2 | 控制器断开后回收控制权 | RISK-025、AX-037 | `SessionControl::Leave/OnPeerDisconnected`（P1）+ `PeerHub::on_peer_disconnected`（签名 `(peer_id, const char*)`，需一行 lambda 适配）；`test_session_control` 场景 2 | 部分 | 回收 API 已具备；应用用一行 lambda 转调 `OnPeerDisconnected(peer_id)`（Bento 不内建 PeerHub ↔ 仲裁器绑定，示例见 19.6） |
 | 7.3 | 控制权变更广播给所有主控 | AX-095、AX-097 | `SessionControl::on_change` + `Snapshot().ToJson()`（P1）+ `PeerHub::PeerIds()` | 部分 | 变更事件与可序列化快照已提供；实际发送仍需应用遍历 `PeerIds()`（Bento 不内置广播语义） |
 | 7.4 | UIPI / 提权窗口输入拦截 | RISK-027、AX-071 | 无 | 不适用 | Windows 完整性级别机制，Linux 运行时不存在 |
 
@@ -109,11 +109,11 @@
 
 | # | 场景 | JinShan 编号 | Go2Cpp 现有能力（文件:接口） | 状态 | 缺口说明 |
 |---|---|---|---|---|---|
-| 9.1 | 预共享密钥认证加密 | NFR-04、RISK-007 | `link.hpp:Link::SetPreSharedKey`、`crypto.hpp`（ChaCha20-Poly1305、`kPskBytes=32`）、`test_secure_link` | 已有 | 仅 `Link` 支持；`PeerHub` 未接 PSK |
+| 9.1 | 预共享密钥认证加密 | NFR-04、RISK-007 | `link.hpp:Link::SetPreSharedKey`、`peer_hub.hpp:PeerHub::SetPreSharedKey/SetPeerPreSharedKey`（P1）、`crypto.hpp`（ChaCha20-Poly1305、`kPskBytes=32`）、`test_secure_link`、`test_peer_hub_secure` | 已有 | `Link` 与 `PeerHub` 均支持；监听端 per-peer PSK 只能继承 Hub 默认 PSK（见 19.5） |
 | 9.2 | 篡改 / 重放 / 明文注入必须被拒 | NFR-04、AX-008、RISK-007 | `crypto.hpp:ReplayWindow`、`OpenStatus`；`test_secure_injection` | 已有 | — |
 | 9.3 | 0-RTT 会话恢复（票据） | NFR-02、RISK-036 | `Link::ExportSessionTicket/Resume`、`test_zero_rtt` | 已有 | 仅 `Link`；票据不含密钥本身 |
 | 9.4 | 多 peer 下的加密与密钥隔离 | FR-06、NFR-04 | **`PeerHub::SetPreSharedKey/SetPeerPreSharedKey`**（P1 复用 `crypto.hpp`）；每 peer 独立 nonce/方向密钥/wire seq/64 位重放窗口；`test_peer_hub_secure` 场景 1/4 | 已补 | 3 peer 加密并发收齐；per-peer 不同 PSK 连两个服务端；错误 PSK 5 次 AEAD 失败且无会话；明文 HELLO/数据帧均被拒 |
-| 9.5 | 错误密钥 / 同 key 双注册的处理 | AX-004、AX-005、RISK-011 | `Link` 的 `auth_failures`；`PeerHub` 无鉴权 | 部分 | 配对策略属应用层；传输层只能给认证失败计数 |
+| 9.5 | 错误密钥 / 同 key 双注册的处理 | AX-004、AX-005、RISK-011 | `Link` 的 `auth_failures`；`PeerHub::secure_stats().auth_failures`（P1）+ `test_peer_hub_secure` 错误 PSK 场景 | 部分 | 已有 PSK 鉴权与认证失败计数；配对/多 key 策略在应用层，监听端 per-peer PSK 受限（见 19.5） |
 
 ## 10. 迁移（NAT rebinding / 换网 / 重连）
 
@@ -121,7 +121,7 @@
 |---|---|---|---|---|---|
 | 10.1 | 本端换地址后会话延续（`Link::Migrate`） | AX-010、RISK-033 | `link.hpp:Link::Migrate`、`migration_grace_ms`、`test_conn_migration` | 已有 | 新旧地址族必须一致（IPv4/IPv6 不混用） |
 | 10.2 | 对端地址变化识别与旧地址静默期 | AX-010、RISK-033 | `Link::UpdatePeerAddress` + `conn_id` 路由 + 退役地址窗口 | 已有 | 只有 AEAD 认证通过的帧才允许改地址（加密模式） |
-| 10.3 | 多 peer 下某个 peer 换地址 | FR-06、RISK-033 | `PeerHub::HandlePacket` 按 `conn_id` 更新 `peer.addr` | 部分 | 逻辑已实现，但缺少专门测试（P1） |
+| 10.3 | 多 peer 下某个 peer 换地址 | FR-06、RISK-033 | `PeerHub` 内部 `HandlePacket`（private）按 `conn_id` 更新 peer 地址 | 部分 | 逻辑已实现，但缺少专门测试（P1） |
 | 10.4 | 重连风暴与端口复用 | AX-091、RISK-034 | `PeerHub::Connect`；`TcpProxy` 的 `SO_REUSEADDR` | 部分 | 退避/抖动/限流在调用方 |
 | 10.5 | 单调时钟 vs 墙钟（NTP 校时不影响超时） | AX-092 | `protocol.hpp:NowMs()`（steady_clock） | 已有 | 握手时间戳用墙钟（跨进程可比），已单独区分 |
 
@@ -144,7 +144,7 @@
 | 12.2 | 多 peer 统计与 per-peer 视角 | FR-06、AX-085 | `peer_hub.hpp:PeerHubStats/PeerInfo`、`reliable_stats(peer_id, channel)` | 已有 | — |
 | 12.3 | 代理层统计（accept/dial/idle/reset） | AX-014、AX-028 | `tcp_proxy.hpp:TcpProxyStats` | 已有 | — |
 | 12.4 | 结构化错误码（而非只有字符串） | NFR-03、AX-096 | 目前只有 `std::string* error` 与回调 `reason` 字符串 | 部分 | 无错误码枚举，调用方无法稳定分支 |
-| 12.5 | 统一日志接入 | RISK-076、AX-024 | **`log_hook.hpp:LogHook`**（P1）+ `PeerHub::SetLogHook`；`test_log_hook` | 已补 | 回调/级别/按级别与事件计数；连接、握手重传、可靠层重传、丢包、认证失败、超时、明文拒绝均已接入；未注入时零开销 |
+| 12.5 | 统一日志接入 | RISK-076、AX-024 | **`log_hook.hpp:LogHook`**（P1）+ `PeerHub::SetLogHook`；`test_log_hook` | 已补 | 回调/级别/按级别与事件计数；连接、握手重传、可靠层重传、丢包、认证失败、超时、明文拒绝已接入；握手失败仅覆盖 max peers 拒绝，帧解析/发送封装失败无事件（部分事件，缺口见 19.5）；未注入时只累计 `filtered` 计数 |
 | 12.6 | 帧级非法/未知来源可观测 | AX-008、AX-012 | `LinkStats{invalid_frames, unknown_peer_frames}`、`PeerHubStats` 同名字段 | 已有 | — |
 
 ## 13. 录屏（会话录制 / AVI / 索引）
@@ -181,7 +181,7 @@
 | P0（已补） | 单 peer 限制：一个 socket 无法服务多个主控 | 3.1–3.3 | 新增 `PeerHub`（多 peer 路由 + per-peer 通道），`test_peer_hub` 覆盖 3 peer 隔离 |
 | P0（已补） | 无通用 TCP 回环代理 | 4.1–4.4、8.2 | 新增 `TcpProxy`（并发、半关闭、超时），`test_tcp_proxy` 覆盖 100KB/半关闭/并发 |
 | P1（本轮已补） | 控制权仲裁缺失（唯一控制器/回收/广播） | 3.4、7.1–7.3 | 新增 `SessionControl`；`test_session_control` 覆盖并发/断开/租约/抢占/随机压力 |
-| P1（本轮已补） | `PeerHub` 未接 PSK 加密 | 9.4、9.5 | `SetPreSharedKey/SetPeerPreSharedKey`，每 peer 独立 nonce/密钥/重放窗口 |
+| P1（本轮已补） | `PeerHub` PSK 加密缺失（历史缺口） | 9.4、9.5 | `SetPreSharedKey/SetPeerPreSharedKey`，每 peer 独立 nonce/密钥/重放窗口 |
 | P1（本轮已补） | 无统一日志钩子 | 12.5 | 新增 `LogHook`，PeerHub 接入连接/重传/丢包/认证事件 |
 | P1 | `PeerHub` 未接 0-RTT 会话恢复 | 9.3 | 票据机制在 `Link` 上；peer 粒度的票据缓存需重新设计 |
 | P1 | `PeerHub` 未接视频通道与 FEC | 2.3、13.3 | 复用 `VideoChannel`，per-peer 重组状态 |
@@ -229,6 +229,7 @@
 |---|---|---|
 | 2026-10-27 | v1.0 | 首次建立：从 RTM/anomalies/risk-register 抽取 13 类 66 条场景，映射到 Bento 现有能力；记录 P0 两项缺口（多 peer、TCP 回环代理）的补法 |
 | 2026-10-27 | v1.1 | P1 落地：控制权仲裁（`SessionControl`）、多 peer 加密（`PeerHub` PSK）、日志钩子（`LogHook`）补齐；3.4/7.1/9.4/12.5 标「已补」，8.1 标「不实现」并给理由；新增 3 个测试目标，ctest 26/26（netem 无权限 SKIP） |
+| 2026-10-28 | v1.2 | 文档回改（审查 `review-p1-modules-api.md` DOC-01～13）：9.1/9.5/18.5 更新为已接 PSK，7.2 按实际回调签名改写，19 节改为已提交并补 19.6 最小示例，12.5 标注事件覆盖缺口，3.6/10.3 标注 private 机制；新增 §20 并发政策例外 ADR。能力与 16 节统计口径不变 |
 
 ---
 
@@ -277,7 +278,7 @@
 
 ### 18.5 已知限制
 
-- `PeerHub` 未接 PSK/0-RTT/VIDEO/PMTUD（只在 `Link` 上），列为 P1。
+- PSK 已于 19.2 补齐（`PeerHub::SetPreSharedKey/SetPeerPreSharedKey`）；`PeerHub` 仍未接 0-RTT/VIDEO/PMTUD（这些只在 `Link` 上），列为 P1。
 - 多 peer 下地址迁移已有实现（按 `conn_id` 更新地址）但缺专项测试。
 - `TcpProxy` 是单线程 poll 模型，连接上限默认 64，定位是工具/本地中继。
 - 仓库无 `.clang-format`，新增文件沿用既有 4 空格/100 列风格，未跑格式化。
@@ -288,7 +289,8 @@
 
 > 本节记录 P1 三项缺口的落地：控制权仲裁、多 peer 加密、日志钩子。改动只落在
 > `include/go2cpp/bento/net/**`、`src/bento/net/**`、`tests/bento/**`、
-> `cmake/Go2CppBento.cmake`、`docs/modules/bento-scenarios.md`；不改 base、不提交。
+> `cmake/Go2CppBento.cmake`、`docs/modules/bento-scenarios.md`；不改 base。
+> 已提交到 HEAD `1e08723`（`feat(bento): 场景缺口补齐（控制权仲裁/多 peer 加密/日志钩子）`）。
 
 ### 19.1 新增
 
@@ -338,3 +340,171 @@
 - `PeerHub` 仍未接 0-RTT、VIDEO/FEC、PMTUD；这些仍在 `Link` 上（见 18.5）。
 - 日志事件按每 tick 的统计增量聚合，不逐包回调；极端高重传速率下事件是「批」而不是「逐帧」。
 - 3.4 的「看控权限」只提供通用 View/Interact 原语，RDP attendee 语义映射仍由应用完成。
+- 日志事件仍有覆盖缺口：握手超时只发 `kPeerDisconnected`（不发 `kHandshakeFailed`），
+  帧解析失败与发送封装失败只计数、不发 `kFrameRejected`/`kSendError`（审查 D-13/D-14）。
+- 并发模型对 `docs/review/00-concurrency-policy.md` 的 R1/R3 属结构性例外，
+  决策与约束见 §20 ADR-BENTO-001。
+
+### 19.6 最小接线示例（SessionControl + PeerHub 加密）
+
+下面是一个可编译的最小接线：PSK 加密的多 peer 收发、断开回调转给仲裁器、控制权
+变更广播。省略业务协议与错误处理；`PeerHub::on_peer_disconnected` 的签名是
+`(peer_id, const char* reason)`，必须用一行 lambda 适配
+`SessionControl::OnPeerDisconnected(peer_id)`（这也是 7.2 的正确接法）。
+
+```cpp
+#include <cstdint>
+#include <cstdio>
+#include <string>
+
+#include "go2cpp/bento/net/log_hook.hpp"
+#include "go2cpp/bento/net/peer_hub.hpp"
+#include "go2cpp/bento/net/session_control.hpp"
+
+using namespace go2cpp::bento;
+
+int main() {
+    // 1) 日志钩子（可选）：Bento 事件统一落到一处。
+    LogHook log(
+        [](const LogRecord& record) {
+            std::printf("[bento] %s peer=%u value=%llu %s\n", LogEventName(record.event),
+                        record.peer_id, static_cast<unsigned long long>(record.value),
+                        record.message ? record.message : "");
+        },
+        LogLevel::kInfo);
+
+    // 2) 控制权仲裁：先到先得、30s 租约、默认只读。
+    SessionControlConfig control_config;
+    control_config.policy = ControlPolicy::kFirstCome;
+    control_config.lease_ms = 30000;
+    SessionControl control(control_config);
+
+    // 3) PeerHub：监听端，启用 PSK 后只接受加密 HELLO。
+    PeerHubConfig hub_config;
+    hub_config.bind_address = "0.0.0.0";
+    hub_config.bind_port = 0;  // 0 = 内核分配；生产环境应固定端口
+    hub_config.max_peers = 8;
+    hub_config.log_hook = &log;  // 非拥有指针：log 的生命周期必须覆盖 hub
+    PeerHub hub(hub_config);
+    if (!hub.Open()) {
+        return 1;
+    }
+
+    std::uint8_t psk[32] = {};  // 实际从安全配置读取，禁止硬编码
+    if (!hub.SetPreSharedKey(psk, sizeof(psk))) {
+        return 1;
+    }
+
+    // 4) 断开 -> 回收控制权。两个签名不同，必须用一行 lambda 适配。
+    hub.on_peer_disconnected = [&control](std::uint32_t peer_id, const char* /*reason*/) {
+        control.OnPeerDisconnected(peer_id);
+    };
+
+    // 5) 变更 -> 广播 JSON 快照。PeerHub 不内建广播语义，由应用遍历 PeerIds。
+    //    on_change 在 SessionControl 锁外执行；可能由 Hub 回调触发，
+    //    PeerHub::SendStream 线程安全且其锁在同线程可重入，不会自锁。
+    control.on_change = [&control, &hub](const ControlChange&) {
+        const std::string snapshot = control.Snapshot().ToJson();
+        for (std::uint32_t peer_id : hub.PeerIds()) {
+            hub.SendStream(peer_id, 0, snapshot.data(), snapshot.size());
+        }
+    };
+
+    // 6) 入会与授权（真实应用在收到控制协议消息后调用）。
+    control.Join(1);
+    control.Join(2);
+    control.Grant(2, ControlMode::kInteract);  // 管理操作：直接指定控制器
+    control.RequestControl(1);                 // 已有控制器，被拒
+    control.Renew(2);                          // 收到输入事件时续租
+
+    // 7) 单线程驱动：RunOnce 收包并触发回调；Tick 回收过期租约。
+    for (int i = 0; i < 100; ++i) {
+        hub.RunOnce(10);
+        control.Tick();
+    }
+    hub.Close();
+    return 0;
+}
+```
+
+编译（仓库根目录；把 `build-review` 换成你自己的 Bento 构建目录）：
+
+```bash
+g++ -std=c++17 -I include /tmp/bento_wiring.cpp \
+  build-review/libgo2cpp_bento.a -lpthread -o /tmp/bento_wiring
+```
+
+要点：
+- `LogHook::Sink` 在锁外调用，但仍是同步调用；慢 sink 会直接拖慢 `RunOnce`（见 19.5）。
+- `PeerHub` 的四个回调在 Hub 锁内执行，回调里禁止 park/阻塞/重入 `RunOnce`；
+  只做转发和 `Send*`（见 §20 ADR）。
+- `SessionControl::on_change` 在锁外执行，可在里面查询 `Snapshot()`；广播由应用
+  遍历 `PeerIds()` 完成，库不内建发送语义。
+
+---
+
+## 20. ADR-BENTO-001：Bento 并发政策例外（R1/R3）
+
+> 状态：**已接受**（2026-10-28）· 决策者：go2cpp maintainers
+> 关联：`docs/review/00-concurrency-policy.md` R1/R3/R5；审查 `review-p1-modules-api.md` DOC-09、D-12、D-16。
+
+### 20.1 背景
+
+`00-concurrency-policy.md` 要求（R1）新增代码默认用 `sync::Mutex`、禁止裸
+`std::mutex`；（R3）回调一律锁外执行，持锁回调必须标注「不得 park/阻塞」并加断言。
+Bento 三个 P1 模块（`SessionControl`、`LogHook`、`PeerHub`）落地时与两条规则冲突：
+
+- Bento 是**可选、可独立编译**的传输组件，`cmake/Go2CppBento.cmake` 只链 `Threads`
+  与 `hash`，**不依赖 base/scheduler/sync/fiber**；引入 `sync::Mutex` 会把传输层
+  拖进整个运行时依赖。
+- `SessionControl` / `LogHook` 使用裸 `std::mutex`；`PeerHub` 使用
+  `std::recursive_mutex`（支持回调内重入 `Send*`）。
+- `PeerHub` 的 `on_peer_connected` / `on_peer_disconnected` / `on_stream` /
+  `on_datagram` 在 `RunOnce` 持 `m_mutex` 期间同步调用；`SessionControl::on_change`
+  与 `LogHook` sink 已在锁外执行。
+
+### 20.2 决策
+
+1. **R1 例外**：Bento 内部允许裸 `std::mutex` / `std::recursive_mutex`，不使用
+   `sync::Mutex`。理由：Bento 不链接 base，且所有临界区只做内存操作与短时 socket
+   调用，不 park、不跨 Fiber。若未来 Bento 被 Fiber 代码调用，需重新评估（20.5）。
+2. **R3 例外**：`PeerHub` 的四个回调在 Hub 锁内执行，属明确例外；回调契约：
+   - **禁止** park、阻塞（sleep、同步 IO、等待其他线程/锁）；
+   - **禁止**重入 `RunOnce` / `RunFor`；
+   - 允许调用 `Send*`（内部 `recursive_mutex` 同线程可重入）与短小纯内存操作；
+   - 需要重活时，回调只入队，由 `RunOnce` 返回后的应用线程处理。
+   `SessionControl::on_change` 与 `LogHook` sink 保持**锁外**执行，符合 R3。
+3. **R5 落地**：本节即 ADR；失效后果：回调里 park 会阻塞 `RunOnce` 线程，该线程
+   同时持有 peer 表锁 → 所有 peer 的收发/超时被拖住；若在回调里等待另一个持有
+   Hub 锁的线程则直接死锁。
+
+### 20.3 理由
+
+- **独立性优先**：Bento 的卖点是「可单独拷进其他工程」（`GO2CPP_WITH_BENTO=OFF`
+  不影响主库）；依赖 base 会破坏这一点。
+- **回调一致性**：`PeerHub` 在锁内回调可直接读取 peer 状态并安全发送，避免复制
+  快照/延长 peer 生命周期的复杂度；当前回调仅用于应用层转发（一行 lambda），
+  收益大于风险。
+- **可验证**：`test_log_hook` 的并发用例、`test_peer_hub` 的回调路径覆盖同线程
+  重入；`SessionControl` 的 16 线程压测覆盖锁外回调。
+
+### 20.4 后果
+
+- Bento 调用方必须遵守上述回调契约；违反属**调用方缺陷**，库不做运行时断言
+  （无 Fiber 运行时，无法检测 park）。
+- `LogHook` sink 虽锁外执行，仍是**同步**调用；慢 sink 会线性拖慢 `RunOnce`，
+  文档 19.5 已提示。
+- 若未来引入 async sink / 多 listener / Fiber 支持，本 ADR 失效，需重开决策。
+
+### 20.5 复审条件
+
+- Bento 开始依赖 base（sync/scheduler/fiber）；
+- 需要异步日志或回调锁外化；
+- 在 Fiber 环境中调用 Bento，且临界区可能 park。
+
+### 20.6 影响文件
+
+`include/go2cpp/bento/net/session_control.hpp`（`std::mutex`）、
+`include/go2cpp/bento/net/log_hook.hpp`（`std::mutex`）、
+`include/go2cpp/bento/net/peer_hub.hpp`（`std::recursive_mutex`、回调约定）、
+`cmake/Go2CppBento.cmake`（依赖只有 Threads/hash）。

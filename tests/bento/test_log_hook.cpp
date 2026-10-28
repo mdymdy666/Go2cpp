@@ -8,6 +8,8 @@
  *          - 场景 4：HELLO 重传（对端不存在）→ kHandshakeRetry。
  *          - 场景 5：可靠层 PTO 重传/丢包 → kRetransmit + kPacketLost。
  *          - 场景 6：peer 超时 → kPeerTimeout；错误 PSK → kAuthFailure。
+ *          - 场景 7：sink 内再次 Emit 被重入守卫丢弃并计数，不递归（LOGH-01）。
+ *          - 场景 8：PeerHub 持锁调用 sink，sink 内 RemovePeer 不递归/不死锁。
  * @author go2cpp contributors
  * @date 2026-10-27
  * @copyright MIT License
@@ -15,6 +17,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -303,7 +306,8 @@ void TestTimeoutAndAuthEvents() {
     // 客户端不再运行：服务端按 peer_timeout 判死。
     PumpFor({&server}, 900);
     BENTO_CHECK(server_hook.Count(LogEvent::kPeerTimeout) > 0);
-    BENTO_CHECK_EQ(server.peer_state(1), go2cpp::bento::PeerState::kTimedOut);
+    // PEB-04：被动 peer 超时后已从表中回收。
+    BENTO_CHECK_EQ(server.peer_state(1), go2cpp::bento::PeerState::kClosed);
 
     // 错误 PSK：服务端 AEAD 失败 → kAuthFailure。
     PeerHubConfig secure_server_config = MakeConfig("127.0.0.1");
@@ -329,6 +333,104 @@ void TestTimeoutAndAuthEvents() {
     std::printf("[INFO] timeout_auth_events: timeout=%llu auth_failure=%llu\n",
                 static_cast<unsigned long long>(server_hook.Count(LogEvent::kPeerTimeout)),
                 static_cast<unsigned long long>(secure_hook.Count(LogEvent::kAuthFailure)));
+}
+
+/// 场景 7（LOGH-01）：sink 内再次 Emit 被丢弃并计数，不递归。
+void TestReentrantSink() {
+    LogHook hook;
+    std::atomic<int> sink_calls{0};
+    std::atomic<int> nested_attempts{0};
+    hook.SetSink([&](const LogRecord& record) {
+        sink_calls.fetch_add(1);
+        // 转发型 sink：每条记录再 Emit 一次（旧实现会无限递归到栈溢出）。
+        for (int i = 0; i < 3; ++i) {
+            nested_attempts.fetch_add(1);
+            hook.Emit(LogLevel::kInfo, LogEvent::kRetransmit, record.peer_id, "nested", i);
+        }
+    });
+    hook.Info(LogEvent::kPeerConnected, 9, "outer");
+    BENTO_CHECK_EQ(sink_calls.load(), 1);
+    BENTO_CHECK_EQ(nested_attempts.load(), 3);
+    const auto stats = hook.Stats();
+    BENTO_CHECK_EQ(stats.emitted, 1U);
+    BENTO_CHECK_EQ(stats.reentrant_dropped, 3U);
+    BENTO_CHECK_EQ(stats.filtered, 0U);
+    BENTO_CHECK_EQ(stats.per_event[static_cast<std::size_t>(LogEvent::kRetransmit)], 0U);
+    // 外层回调返回后守卫复位，后续 Emit 正常。
+    hook.Info(LogEvent::kPeerConnected, 9, "after");
+    BENTO_CHECK_EQ(sink_calls.load(), 2);
+    BENTO_CHECK_EQ(hook.Stats().emitted, 2U);
+
+    // 守卫按线程生效：主线程在 sink 内阻塞时，另一线程的 Emit 正常送达。
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool in_sink = false;
+    bool other_sent = false;
+    int other_delivered = 0;
+    LogHook cross_hook;
+    cross_hook.SetSink([&](const LogRecord& record) {
+        if (record.peer_id == 1) {
+            std::unique_lock<std::mutex> lock(mutex);
+            in_sink = true;
+            cv.notify_all();
+            cv.wait(lock, [&]() { return other_sent; });
+        } else if (record.peer_id == 2) {
+            std::lock_guard<std::mutex> lock(mutex);
+            ++other_delivered;
+        }
+    });
+    std::thread other([&]() {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&]() { return in_sink; });
+        lock.unlock();
+        cross_hook.Info(LogEvent::kPeerConnected, 2, "other thread");
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            other_sent = true;
+        }
+        cv.notify_all();
+    });
+    cross_hook.Info(LogEvent::kPeerConnected, 1, "main thread");
+    other.join();
+    BENTO_CHECK_EQ(other_delivered, 1);
+    std::printf("[INFO] reentrant_sink: calls=%d dropped=%llu other_thread=%d\n", sink_calls.load(),
+                static_cast<unsigned long long>(hook.Stats().reentrant_dropped), other_delivered);
+}
+
+/// 场景 8（LOGH-01 + PEB-01）：PeerHub 在持锁内调用 sink，sink 调 RemovePeer
+/// 会再次触发 disconnected 日志；重入守卫必须丢弃该条且不递归/不死锁。
+void TestHubSinkReentry() {
+    PeerHubConfig server_config = MakeConfig("127.0.0.1");
+    server_config.peer_timeout_ms = 5000;
+    PeerHub server(server_config);
+    PeerHub client(MakeConfig("127.0.0.1"));
+    std::string error;
+    BENTO_CHECK(server.Open(&error));
+    BENTO_CHECK(client.Open(&error));
+    LogHook hook;
+    int sink_calls = 0;
+    int connected_events = 0;
+    hook.SetSink([&](const LogRecord& record) {
+        ++sink_calls;
+        if (record.event != LogEvent::kPeerConnected) {
+            return;
+        }
+        ++connected_events;
+        // 回调内删除当前 peer：RemovePeer 会再 Emit 一条 disconnected 日志，
+        // 该条必须被 LogHook 的重入守卫丢弃。
+        (void)server.RemovePeer(record.peer_id);
+    });
+    server.SetLogHook(&hook);
+    BENTO_CHECK(client.AddPeer(1, "127.0.0.1", server.local_port(), &error));
+    BENTO_CHECK(PumpHubs({&server, &client},
+                         [&]() { return connected_events > 0; }, 8000));
+    BENTO_CHECK_EQ(connected_events, 1);
+    BENTO_CHECK_EQ(sink_calls, 1);
+    BENTO_CHECK(hook.Stats().reentrant_dropped >= 1);
+    BENTO_CHECK(!server.HasPeer(1));
+    BENTO_CHECK_EQ(server.PeerIds().size(), 0U);
+    std::printf("[INFO] hub_sink_reentry: sink_calls=%d dropped=%llu\n", sink_calls,
+                static_cast<unsigned long long>(hook.Stats().reentrant_dropped));
 }
 
 /// 事件/级别名稳定且互不相同（可做指标标签）。
@@ -364,6 +466,8 @@ int main() {
     TestHandshakeRetryEvent();
     TestRetransmitAndLossEvents();
     TestTimeoutAndAuthEvents();
+    TestReentrantSink();
+    TestHubSinkReentry();
     TestNames();
     return bento_test::Finish("test_log_hook");
 }
