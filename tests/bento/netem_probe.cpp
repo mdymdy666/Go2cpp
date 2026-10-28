@@ -1,7 +1,9 @@
 /**
  * @file netem_probe.cpp
  * @brief 弱网探针：在 tc netem（loss 20% / delay 200ms）下跑可靠 + 不可靠流。
- * @details 单进程双 Link：服务端监听 --port，客户端连接 127.0.0.1。可靠流
+ * @details 单进程双 Link：服务端监听 --port（默认 0：bind 端口 0 后由
+ *          getsockname 取内核分配的随机端口），客户端连接 127.0.0.1。
+ *          默认随机端口保证多测试/多 agent 并发时不会抢同一端口。可靠流
  *          必须 100% 按序到达；不可靠流允许丢包，但交付序号必须严格递增
  *          （DropStale 生效）。输出 p50/p95/p99 与重传统计供报告引用。
  *
@@ -27,7 +29,9 @@ namespace {
 using namespace go2cpp::bento;
 
 struct Options {
-    std::uint16_t port = 34567;
+    /// 0 = 由内核分配（默认）；非 0 才固定端口，仅用于 tc netem 这类
+    /// 需要预先知道端口来安装过滤器的场景。
+    std::uint16_t port = 0;
     std::uint32_t messages = 200;
     std::size_t payload_bytes = 256;
     int timeout_ms = 60000;
@@ -53,7 +57,12 @@ bool ParseOptions(int argc, char** argv, Options* options) {
     for (int i = 1; i < argc; ++i) {
         const char* argument = argv[i];
         if (std::strcmp(argument, "--port") == 0 && i + 1 < argc) {
-            options->port = static_cast<std::uint16_t>(std::strtoul(argv[++i], nullptr, 10));
+            const unsigned long port = std::strtoul(argv[++i], nullptr, 10);
+            if (port > 65535UL) {
+                std::fprintf(stderr, "invalid port: %lu\n", port);
+                return false;
+            }
+            options->port = static_cast<std::uint16_t>(port);
         } else if (std::strcmp(argument, "--messages") == 0 && i + 1 < argc) {
             options->messages = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(argument, "--payload") == 0 && i + 1 < argc) {
@@ -73,7 +82,7 @@ bool ParseOptions(int argc, char** argv, Options* options) {
             return false;
         }
     }
-    if (options->port == 0 || options->messages == 0 || options->payload_bytes < 8 ||
+    if (options->messages == 0 || options->payload_bytes < 8 ||
         options->payload_bytes > kMaxFramePayload || options->loss_percent < 0 ||
         options->loss_percent > 100 || options->delay_ms < 0) {
         std::fprintf(stderr, "invalid range: port/messages/payload/loss/delay\n");
@@ -122,11 +131,15 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "netem_probe: server.Open failed: %s\n", error.c_str());
         return 1;
     }
+    // bind_port == 0 时 Link 内部用 getsockname 回填实际端口；打印出来
+    // 便于日志核对，也证明并发实例拿到的是不同端口。
+    std::printf("netem_probe: listening on 127.0.0.1:%u\n",
+                static_cast<unsigned>(server.local_port()));
 
     // --loss/--delay-ms 非 0 时启用用户态弱网代理（无 CAP_NET_ADMIN 时
     // 代替 tc netem）。客户端连代理，代理按方向丢包/延迟后转发。
     std::unique_ptr<bento_test::UdpProxy> proxy;
-    std::uint16_t peer_port = options.port;
+    std::uint16_t peer_port = server.local_port();
     if (options.loss_percent > 0 || options.delay_ms > 0) {
         sockaddr_in server_address{};
         if (!UdpSocket::ResolveIPv4("127.0.0.1", server.local_port(), &server_address, &error)) {

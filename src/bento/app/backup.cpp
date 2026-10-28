@@ -30,18 +30,22 @@
 #include "go2cpp/bento/app/backup.hpp"
 
 #include "go2cpp/bento/app/detail/retry.hpp"
+#include "go2cpp/hash/sha256.hpp"
 
 #include "go2cpp/os/proc.hpp"
 
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -59,6 +63,8 @@ constexpr int kMaxUploadRetries = 16;              ///< 重试次数硬上限
 constexpr std::size_t kMaxUrlBytes = 8192;         ///< endpoint 长度上限
 constexpr std::size_t kMaxHeaderBytes = 8192;      ///< 单个 header 长度上限
 constexpr std::size_t kMaxErrorBytes = 512;        ///< 错误信息保留长度
+constexpr std::size_t kMaxVerifyHeaderBytes =       ///< 校验响应头上限
+    256 * 1024;
 constexpr std::chrono::seconds kMaxRetryDelay{30}; ///< 单次重试等待上限
 
 /// 临时包序号；只在同一进程内保证唯一（与 fetch/file_browser 的做法一致）。
@@ -396,6 +402,363 @@ Attempt PerformCurl(const std::string& zip_path, const UploadRequest& request,
     return attempt;
 }
 
+// ---------------------------------------------------------------------------
+// Upload 远端校验
+// ---------------------------------------------------------------------------
+
+/// 文件 SHA-256（小写十六进制）与字节数。
+bool HashFile(const fs::path& path, std::string* hex, std::uint64_t* bytes,
+              std::string* error) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        *error = "无法读取待校验文件";
+        return false;
+    }
+    go2cpp::hash::Sha256 hasher;
+    std::array<char, 64 * 1024> buffer{};
+    std::uint64_t total = 0;
+    for (;;) {
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize got = in.gcount();
+        if (got <= 0) {
+            break;
+        }
+        hasher.Write(go2cpp::hash::AsBytes(buffer.data(), static_cast<std::size_t>(got)));
+        total += static_cast<std::uint64_t>(got);
+    }
+    if (in.bad()) {
+        *error = "读取待校验文件失败";
+        return false;
+    }
+    const std::vector<std::uint8_t> digest = hasher.Sum();
+    if (digest.size() != go2cpp::hash::Sha256::kSize) {
+        *error = "SHA-256 计算失败";
+        return false;
+    }
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string text(digest.size() * 2, '0');
+    for (std::size_t i = 0; i < digest.size(); ++i) {
+        text[i * 2] = kHexDigits[digest[i] >> 4];
+        text[i * 2 + 1] = kHexDigits[digest[i] & 0x0fu];
+    }
+    *hex = std::move(text);
+    *bytes = total;
+    return true;
+}
+
+/// 读取响应头转储（限制大小，避免异常响应耗尽内存）。
+bool ReadHeaderDumpFile(const fs::path& path, std::string* text, std::string* error) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        *error = "无法打开远端响应头";
+        return false;
+    }
+    in.seekg(0, std::ios::end);
+    const std::streamoff size = in.tellg();
+    if (size < 0 || static_cast<std::uint64_t>(size) > kMaxVerifyHeaderBytes) {
+        *error = "远端响应头异常";
+        return false;
+    }
+    in.seekg(0, std::ios::beg);
+    text->assign(static_cast<std::size_t>(size), '\0');
+    if (size > 0) {
+        in.read(text->data(), size);
+        if (!in) {
+            *error = "读取远端响应头失败";
+            return false;
+        }
+    }
+    return true;
+}
+
+/// 只保留最后一个响应块的字段（100-continue/重定向会产生多段）。
+void ParseHeaderFields(std::string_view text,
+                       std::vector<std::pair<std::string, std::string>>* fields) {
+    fields->clear();
+    std::size_t position = 0;
+    while (position < text.size()) {
+        const std::size_t newline = text.find('\n', position);
+        const std::size_t end = newline == std::string_view::npos ? text.size() : newline;
+        std::string line(text.substr(position, end - position));
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        position = newline == std::string_view::npos ? text.size() : newline + 1;
+        if (StartsWithIgnoreCase(line, "HTTP/")) {
+            fields->clear();
+            continue;
+        }
+        if (line.empty()) {
+            continue;
+        }
+        const std::size_t colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+        std::string name = Trim(line.substr(0, colon));
+        if (name.empty()) {
+            continue;
+        }
+        fields->emplace_back(std::move(name), Trim(line.substr(colon + 1)));
+    }
+}
+
+/// 从字段中取 Content-Length（取最后一个；格式非法返回 false）。
+bool TryParseContentLength(
+    const std::vector<std::pair<std::string, std::string>>& fields,
+    std::uint64_t* length) {
+    for (auto it = fields.rbegin(); it != fields.rend(); ++it) {
+        if (!EqualsIgnoreCase(it->first, "Content-Length")) {
+            continue;
+        }
+        const std::string value = Trim(it->second);
+        if (value.empty()) {
+            continue;
+        }
+        std::uint64_t parsed = 0;
+        for (const char ch : value) {
+            if (ch < '0' || ch > '9') {
+                return false;
+            }
+            const auto digit = static_cast<std::uint64_t>(ch - '0');
+            if (parsed > (std::numeric_limits<std::uint64_t>::max() - digit) / 10u) {
+                return false;
+            }
+            parsed = parsed * 10u + digit;
+        }
+        *length = parsed;
+        return true;
+    }
+    return false;
+}
+
+/// 规范化 SHA-256 头：裸 64 位十六进制、带引号或 `sha-256=<hex>` 均可。
+bool NormalizeSha256(std::string_view raw, std::string* hex) {
+    std::string value = Trim(raw);
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+        value = value.substr(1, value.size() - 2);
+    }
+    const std::size_t equals = value.rfind('=');
+    if (equals != std::string::npos) {
+        value = Trim(std::string_view(value).substr(equals + 1));
+    }
+    if (value.size() != 64) {
+        return false;
+    }
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    std::string normalized(64, '0');
+    for (std::size_t i = 0; i < 64; ++i) {
+        const char ch = value[i];
+        int digit = -1;
+        if (ch >= '0' && ch <= '9') {
+            digit = ch - '0';
+        } else if (ch >= 'a' && ch <= 'f') {
+            digit = ch - 'a' + 10;
+        } else if (ch >= 'A' && ch <= 'F') {
+            digit = ch - 'A' + 10;
+        }
+        if (digit < 0) {
+            return false;
+        }
+        normalized[i] = kHexDigits[digit];
+    }
+    *hex = std::move(normalized);
+    return true;
+}
+
+/// 从 curl stdout 提取状态码：GET 只有 3 位数；HEAD 还带响应头，取末行。
+int ParseCurlStatus(std::string_view text) {
+    std::size_t end = text.size();
+    while (end > 0) {
+        const std::size_t newline = text.rfind('\n', end - 1);
+        const std::size_t begin = newline == std::string_view::npos ? 0 : newline + 1;
+        const std::string line = Trim(text.substr(begin, end - begin));
+        if (!line.empty()) {
+            return ParseStatusCode(line);
+        }
+        if (newline == std::string_view::npos) {
+            break;
+        }
+        end = newline;
+    }
+    return 0;
+}
+
+/// 构造校验请求的 curl 配置。
+bool BuildVerifyConfig(const UploadRequest& request, const UploadOptions& options,
+                       const fs::path& body_path, const fs::path& headers_path,
+                       std::uint64_t local_bytes, std::string* config, std::string* error) {
+    std::string url;
+    std::string body;
+    std::string headers;
+    if (!EscapeConfigValue(request.endpoint, &url) ||
+        !EscapeConfigValue(body_path.string(), &body) ||
+        !EscapeConfigValue(headers_path.string(), &headers)) {
+        *error = "远端校验路径含换行或 NUL";
+        return false;
+    }
+    std::string text;
+    text += "url = \"" + url + "\"\n";
+    text += "silent\n";
+    text += "show-error\n";
+    text += "globoff\n";
+    text += "dump-header = \"" + headers + "\"\n";
+    text += "write-out = \"%{http_code}\"\n";
+    text += "connect-timeout = \"" + std::to_string(SecondsCeil(options.verify_timeout)) + "\"\n";
+    text += "max-time = \"" + std::to_string(SecondsCeil(options.verify_timeout)) + "\"\n";
+    if (options.verify_mode == RemoteVerifyMode::kHead) {
+        text += "head\n";
+        text += "output = \"/dev/null\"\n";
+    } else {
+        text += "output = \"" + body + "\"\n";
+        // 远端比本地大时立即停止：大小不一致本身就是校验失败。
+        text += "max-filesize = \"" + std::to_string(local_bytes) + "\"\n";
+    }
+    for (const std::string& header : request.headers) {
+        std::string escaped;
+        if (!EscapeConfigValue(header, &escaped)) {
+            *error = "远端校验 header 含换行或 NUL";
+            return false;
+        }
+        text += "header = \"" + escaped + "\"\n";
+    }
+    if (!request.token.empty() && !HasHeader(request.headers, "Authorization")) {
+        std::string escaped;
+        if (!EscapeConfigValue("Authorization: Bearer " + request.token, &escaped)) {
+            *error = "远端校验 token 含换行或 NUL";
+            return false;
+        }
+        text += "header = \"" + escaped + "\"\n";
+    }
+    *config = std::move(text);
+    return true;
+}
+
+/// 执行一次校验请求；只有 2xx 才返回 true。
+bool RunVerifyCurl(const std::string& config, const UploadOptions& options,
+                   std::string* error) {
+    go2cpp::os::ProcessOptions process;
+    process.argv = {"curl", "--config", "-"};
+    process.use_path_search = true;
+    process.timeout = options.verify_timeout + std::chrono::seconds(5);
+    process.grace = std::chrono::seconds(1);
+    process.max_output_bytes = 256 * 1024;
+    const go2cpp::os::Result<go2cpp::os::RunResult> run = go2cpp::os::Run(process, config);
+    if (!run) {
+        *error = "无法启动 curl 进行远端校验";
+        return false;
+    }
+    if (run->status.timed_out) {
+        *error = "远端校验请求超时";
+        return false;
+    }
+    if (!run->status.exited || run->status.exit_code != 0) {
+        *error = run->standard_error.empty()
+                     ? "curl 退出码 " + std::to_string(run->status.exit_code)
+                     : ShortError(run->standard_error);
+        return false;
+    }
+    const int http_status = ParseCurlStatus(run->standard_output);
+    if (http_status < 200 || http_status > 299) {
+        *error = "远端校验 HTTP " + std::to_string(http_status);
+        return false;
+    }
+    return true;
+}
+
+/// 上传成功后的远端校验：GET 比较响应体，HEAD 比较响应头。
+bool VerifyRemote(const std::string& zip_path, const UploadRequest& request,
+                  const UploadOptions& options, std::string* error) {
+    std::string local_hex;
+    std::uint64_t local_bytes = 0;
+    if (!HashFile(fs::path(zip_path), &local_hex, &local_bytes, error)) {
+        return false;
+    }
+    std::error_code ec;
+    fs::path temp_dir = fs::temp_directory_path(ec);
+    if (ec || temp_dir.empty()) {
+        temp_dir = fs::path("/tmp");
+    }
+    const std::uint64_t sequence = g_part_seq.fetch_add(1, std::memory_order_relaxed);
+    const std::string suffix = "." + std::to_string(static_cast<long long>(::getpid())) + "." +
+                               std::to_string(static_cast<unsigned long long>(sequence));
+    const fs::path body_path = temp_dir / ("bento_verify" + suffix + ".body");
+    const fs::path headers_path = temp_dir / ("bento_verify" + suffix + ".headers");
+    struct TempCleanup final {
+        fs::path body;
+        fs::path headers;
+        ~TempCleanup() {
+            RemoveFile(body.string());
+            RemoveFile(headers.string());
+        }
+    } cleanup{body_path, headers_path};
+
+    std::string config;
+    if (!BuildVerifyConfig(request, options, body_path, headers_path, local_bytes, &config,
+                           error)) {
+        return false;
+    }
+    if (!RunVerifyCurl(config, options, error)) {
+        return false;
+    }
+    std::string header_text;
+    if (!ReadHeaderDumpFile(headers_path, &header_text, error)) {
+        return false;
+    }
+    std::vector<std::pair<std::string, std::string>> fields;
+    ParseHeaderFields(header_text, &fields);
+    std::string remote_hex;
+    bool has_remote_hash = false;
+    if (!options.verify_checksum_header.empty()) {
+        for (const auto& field : fields) {
+            if (!EqualsIgnoreCase(field.first, options.verify_checksum_header)) {
+                continue;
+            }
+            if (!NormalizeSha256(field.second, &remote_hex)) {
+                *error = "远端 SHA-256 头格式非法";
+                return false;
+            }
+            has_remote_hash = true;
+            break;
+        }
+    }
+    std::uint64_t remote_length = 0;
+    const bool has_remote_length = TryParseContentLength(fields, &remote_length);
+    if (has_remote_hash && remote_hex != local_hex) {
+        *error = "远端 SHA-256 不一致";
+        return false;
+    }
+    if (options.verify_mode == RemoteVerifyMode::kHead) {
+        if (has_remote_length && remote_length != local_bytes) {
+            *error = "远端 Content-Length 不一致";
+            return false;
+        }
+        if (!has_remote_length && !has_remote_hash) {
+            *error = "HEAD 响应缺少 Content-Length/SHA-256";
+            return false;
+        }
+        return true;
+    }
+    std::string body_hex;
+    std::uint64_t body_bytes = 0;
+    if (!HashFile(body_path, &body_hex, &body_bytes, error)) {
+        return false;
+    }
+    if (body_bytes != local_bytes) {
+        *error = "远端响应体大小不一致";
+        return false;
+    }
+    if (has_remote_length && remote_length != body_bytes) {
+        *error = "远端 Content-Length 与响应体不一致";
+        return false;
+    }
+    if (body_hex != local_hex) {
+        *error = "远端响应体 SHA-256 不一致";
+        return false;
+    }
+    return true;
+}
+
 /// 校验上传参数。
 bool ValidateUploadRequest(const std::string& zip_path, const UploadRequest& request,
                            const UploadOptions& options, std::string* error) {
@@ -454,6 +817,28 @@ bool ValidateUploadRequest(const std::string& zip_path, const UploadRequest& req
     if (HasControl(request.content_type)) {
         *error = "content_type 含控制字符";
         return false;
+    }
+    if (options.verify_remote) {
+        if (options.verify_timeout.count() <= 0 ||
+            options.verify_timeout > std::chrono::minutes(10)) {
+            *error = "verify_timeout 越界";
+            return false;
+        }
+        if (options.verify_mode != RemoteVerifyMode::kGet &&
+            options.verify_mode != RemoteVerifyMode::kHead) {
+            *error = "verify_mode 非法";
+            return false;
+        }
+    }
+    if (options.verify_checksum_header.size() > 128) {
+        *error = "verify_checksum_header 过长";
+        return false;
+    }
+    for (const char ch : options.verify_checksum_header) {
+        if (!IsTokenChar(ch)) {
+            *error = "verify_checksum_header 含非法字符";
+            return false;
+        }
     }
     return true;
 }
@@ -626,6 +1011,16 @@ const char* HttpMethodToString(HttpMethod method) noexcept {
     return "PUT";
 }
 
+const char* RemoteVerifyModeToString(RemoteVerifyMode mode) noexcept {
+    switch (mode) {
+        case RemoteVerifyMode::kGet:
+            return "GET";
+        case RemoteVerifyMode::kHead:
+            return "HEAD";
+    }
+    return "GET";
+}
+
 const char* UploadStatusToString(UploadStatus status) noexcept {
     switch (status) {
         case UploadStatus::kOk:
@@ -644,6 +1039,8 @@ const char* UploadStatusToString(UploadStatus status) noexcept {
             return "timeout";
         case UploadStatus::kLocalIoError:
             return "local_io_error";
+        case UploadStatus::kRemoteVerifyFailed:
+            return "remote_verify_failed";
     }
     return "unknown";
 }
@@ -677,8 +1074,20 @@ UploadResult Upload(const std::string& zip_path, const UploadRequest& request,
         result.http_status = last.http_status;
         result.error = last.error;
         if (last.ok) {
-            result.status = UploadStatus::kOk;
-            result.error.clear();
+            if (!options.verify_remote) {
+                result.status = UploadStatus::kOk;
+                result.error.clear();
+                return result;
+            }
+            std::string verify_error;
+            if (VerifyRemote(zip_path, request, options, &verify_error)) {
+                result.status = UploadStatus::kOk;
+                result.remote_verified = true;
+                result.error.clear();
+                return result;
+            }
+            result.status = UploadStatus::kRemoteVerifyFailed;
+            result.error = verify_error.empty() ? "远端校验失败" : ShortError(verify_error);
             return result;
         }
         if (last.curl_missing) {

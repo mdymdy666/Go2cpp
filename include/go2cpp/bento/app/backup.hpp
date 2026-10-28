@@ -10,7 +10,8 @@
  *             `<out>.part.<pid>.<seq>`（唯一名），成功后才 rename，失败不会
  *             破坏已有的旧包，并发备份也不会互相覆盖临时包。
  *          2. **Upload**：把 zip 通过 HTTP PUT/POST 发给 endpoint，失败按
- *             指数退避重试（默认 3 次），**任何失败都不删除本地包**。
+ *             指数退避重试（默认 3 次），**任何失败都不删除本地包**；可选
+ *             在上传成功后回读远端做大小/SHA-256 校验。
  *
  * ## 上传实现与依赖
  *
@@ -117,6 +118,15 @@ enum class HttpMethod : std::uint8_t {
 /// 方法转文本。
 const char* HttpMethodToString(HttpMethod method) noexcept;
 
+/// 远端校验方式（仅 `UploadOptions::verify_remote == true` 时生效）。
+enum class RemoteVerifyMode : std::uint8_t {
+    kGet = 0,  ///< GET 下载响应体，比较大小与 SHA-256（默认）。
+    kHead = 1, ///< HEAD 只读响应头，比较 Content-Length/SHA-256 头。
+};
+
+/// 校验方式转文本。
+const char* RemoteVerifyModeToString(RemoteVerifyMode mode) noexcept;
+
 /// `Upload` 的状态码。
 enum class UploadStatus : std::uint8_t {
     kOk = 0,               ///< 2xx，上传成功。
@@ -126,7 +136,8 @@ enum class UploadStatus : std::uint8_t {
     kNetworkError = 4,     ///< 连接失败/DNS/TLS/传输中断。
     kHttpRejected = 5,     ///< 服务端返回非 2xx。
     kTimeout = 6,          ///< 请求超时（重试耗尽时保留最后一次失败分类）。
-    kLocalIoError = 7,     ///< 本地进程创建/管道失败。
+    kLocalIoError = 7,       ///< 本地进程创建/管道失败。
+    kRemoteVerifyFailed = 8, ///< 上传成功但远端校验失败（大小/哈希不一致）。
 };
 
 /// 状态转文本。
@@ -156,6 +167,16 @@ struct UploadOptions final {
     std::chrono::milliseconds connect_timeout{10000};
     /// curl 单次请求总超时。
     std::chrono::milliseconds request_timeout{120000};
+
+    /// 上传成功后是否回读远端做大小/哈希校验。默认 false：保持既有行为，
+    /// 不产生任何额外的 GET/HEAD 请求。
+    bool verify_remote{false};
+    /// 远端校验方式：GET（默认，下载响应体算 SHA-256）或 HEAD（只比头）。
+    RemoteVerifyMode verify_mode{RemoteVerifyMode::kGet};
+    /// 响应头中承载 SHA-256 的字段名（不区分大小写）；空串表示忽略校验头。
+    std::string verify_checksum_header{"X-Content-SHA256"};
+    /// 远端校验请求的总超时（与上传的 request_timeout 独立）。
+    std::chrono::milliseconds verify_timeout{30000};
 };
 
 /** @brief `Upload` 的结果。 */
@@ -163,6 +184,7 @@ struct UploadResult final {
     UploadStatus status{UploadStatus::kOk}; ///< 状态。
     int attempts{0};                        ///< 实际请求次数（含首次）。
     int http_status{0};                     ///< 最后一次 HTTP 状态码（0=无响应）。
+    bool remote_verified{false};            ///< verify_remote 校验通过时为 true。
     std::string error;                      ///< 最后一次失败原因。
 
     bool ok() const noexcept { return status == UploadStatus::kOk; }
@@ -179,7 +201,9 @@ struct UploadResult final {
  * - 2xx 成功；其它状态、连接失败、超时都会重试；
  * - 重试耗尽后返回最后一次失败的分类，`attempts == max_retries + 1`；
  * - curl 缺失立即返回 `kCurlMissing`（不重试、不删除包）；
- * - token 只通过 stdin 配置传递，不进入 argv。
+ * - token 只通过 stdin 配置传递，不进入 argv；
+ * - `verify_remote == true` 时，2xx 之后再 GET（或 HEAD）同一 endpoint，
+ *   比较大小与 SHA-256；不一致返回 `kRemoteVerifyFailed`，本地包保留。
  */
 UploadResult Upload(const std::string& zip_path, const UploadRequest& request,
                     const UploadOptions& options = UploadOptions{});

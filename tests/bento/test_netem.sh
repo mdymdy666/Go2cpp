@@ -14,7 +14,10 @@
 set -u
 
 PROBE="${1:-}"
-PORT="${BENTO_NETEM_PORT:-34567}"
+# tc 过滤器需要在探针启动前知道端口，所以这里先随机挑一个；
+# BENTO_NETEM_PORT 可显式覆盖。随机端口避免并发跑多个 netem 测试时
+# 互相把对方的流量算进自己的 qdisc。
+PORT="${BENTO_NETEM_PORT:-$(( (RANDOM % 20000) + 40000 ))}"
 if [[ -z "$PROBE" || ! -x "$PROBE" ]]; then
     echo "SKIP: probe binary missing or not executable: ${PROBE:-<none>}"
     exit 77

@@ -107,7 +107,9 @@ if (GO2CPP_WITH_BENTO)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/transport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/tcp_transport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/memory_transport.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/udp_transport.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/udp_transport.cpp
+        # MOD-15：通用字节中继（有界缓冲/慢客户端/半关闭/超时）。
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/relay.cpp)
 
     target_include_directories(go2cpp_bento_transport
         PUBLIC
@@ -172,6 +174,23 @@ if (GO2CPP_WITH_BENTO)
     set_target_properties(go2cpp_bento_error PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_library(go2cpp::bento_error ALIAS go2cpp_bento_error)
 
+    # MOD-05：通用密钥管理（多来源加载/脱敏/常量时间比较/轮换）。只依赖
+    # error，独立成目标，不给 go2cpp_bento 增加新的链接依赖。
+    add_library(go2cpp_bento_keystore STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/keystore.cpp)
+
+    target_include_directories(go2cpp_bento_keystore
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_compile_features(go2cpp_bento_keystore PUBLIC cxx_std_17)
+    target_compile_options(go2cpp_bento_keystore PRIVATE
+        -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+    target_link_libraries(go2cpp_bento_keystore
+        PUBLIC go2cpp_bento_error Threads::Threads)
+    set_target_properties(go2cpp_bento_keystore PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    add_library(go2cpp::bento_keystore ALIAS go2cpp_bento_keystore)
+
     option(GO2CPP_BENTO_TESTS "Build Bento transport tests" ON)
     if (GO2CPP_BENTO_TESTS)
         enable_testing()
@@ -191,6 +210,18 @@ if (GO2CPP_WITH_BENTO)
         add_test(NAME bento_error COMMAND bento_test_error)
         add_test(NAME bento_reflect COMMAND bento_test_reflect)
         set_tests_properties(bento_error bento_reflect PROPERTIES TIMEOUT 120)
+
+        # MOD-05：密钥加载/脱敏/轮换 + PeerHub/Link PSK 集成（UDP 回环）。
+        add_executable(bento_test_keystore
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_keystore.cpp)
+        target_include_directories(bento_test_keystore PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
+        target_link_libraries(bento_test_keystore PRIVATE
+            go2cpp_bento_keystore go2cpp_bento)
+        target_compile_options(bento_test_keystore PRIVATE
+            -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+        add_test(NAME bento_keystore COMMAND bento_test_keystore)
+        set_tests_properties(bento_keystore PROPERTIES TIMEOUT 180)
 
         add_executable(bento_test_link_loopback
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_link_loopback.cpp)
@@ -275,6 +306,16 @@ if (GO2CPP_WITH_BENTO)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
         target_link_libraries(bento_test_transport PRIVATE go2cpp_bento_transport go2cpp_bento)
         target_compile_options(bento_test_transport PRIVATE
+            -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+
+        # MOD-15：通用字节中继。真实 TCP 回环 + 内存编排传输，覆盖背压/
+        # 慢客户端/半关闭/超时；不依赖外部端口。
+        add_executable(bento_test_relay
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_relay.cpp)
+        target_include_directories(bento_test_relay PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
+        target_link_libraries(bento_test_relay PRIVATE go2cpp_bento_transport)
+        target_compile_options(bento_test_relay PRIVATE
             -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
 
         # UDP 数据报与 X25519 独立测试：数据报边界/截断/超时 + RFC 7748 向量。
@@ -401,6 +442,7 @@ if (GO2CPP_WITH_BENTO)
         add_test(NAME bento_pairing COMMAND bento_test_pairing)
         add_test(NAME bento_session_table COMMAND bento_test_session_table)
         add_test(NAME bento_transport COMMAND bento_test_transport)
+        add_test(NAME bento_relay COMMAND bento_test_relay)
         add_test(NAME bento_capability COMMAND bento_test_capability)
         add_test(NAME bento_session COMMAND bento_test_session)
         set_tests_properties(bento_capability bento_session
@@ -410,8 +452,10 @@ if (GO2CPP_WITH_BENTO)
         # 用户态弱网代理：无 CAP_NET_ADMIN 时替代 tc netem 的可重复版本。
         # 20% 双向丢包 + 200ms 单向延迟，可靠流要求 100% 按序。
         # 60s 收尾窗口：20% 丢包下 PTO 最坏会退避到 2s，40s 偶发尾部未收完。
+        # 不传 --port：探针默认 bind 0，由内核分配随机端口，避免并发
+        # agent/测试抢同一固定端口（同一机器可同时跑多个实例）。
         add_test(NAME bento_weaknet_proxy
-            COMMAND bento_netem_probe --port 34568 --messages 200 --payload 256
+            COMMAND bento_netem_probe --messages 200 --payload 256
                     --timeout-ms 60000 --loss 20 --delay-ms 200)
         # netem 需要 root/CAP_NET_ADMIN；脚本在无权限时 exit 77 -> SKIP。
         add_test(NAME bento_netem
@@ -428,9 +472,10 @@ if (GO2CPP_WITH_BENTO)
             bento_frame bento_heartbeat bento_backoff
             bento_pairing bento_session_table
             PROPERTIES TIMEOUT 90)
-        set_tests_properties(bento_transport PROPERTIES TIMEOUT 120)
+        set_tests_properties(bento_transport bento_relay PROPERTIES TIMEOUT 120)
         set_tests_properties(bento_udp_transport bento_x25519
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        set_tests_properties(bento_relay PROPERTIES SKIP_RETURN_CODE 77)
         set_tests_properties(bento_weaknet_proxy PROPERTIES TIMEOUT 150)
         set_tests_properties(bento_netem PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
     endif()

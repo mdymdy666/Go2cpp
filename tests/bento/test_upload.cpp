@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
@@ -33,6 +34,7 @@
 
 #include "go2cpp/bento/app/backup.hpp"
 #include "go2cpp/bento/app/zip.hpp"
+#include "go2cpp/hash/sha256.hpp"
 #include "test_backup_support.hpp"
 #include "test_util.hpp"
 
@@ -40,6 +42,7 @@ namespace {
 
 namespace fs = std::filesystem;
 using go2cpp::bento::app::HttpMethod;
+using go2cpp::bento::app::RemoteVerifyMode;
 using go2cpp::bento::app::Upload;
 using go2cpp::bento::app::UploadOptions;
 using go2cpp::bento::app::UploadRequest;
@@ -96,6 +99,17 @@ struct HttpRequest final {
 struct HttpResponse final {
     int status{200};
     std::string body;
+    /// 额外响应头；未显式给 Content-Length 时按 body 自动补。
+    std::vector<std::pair<std::string, std::string>> headers;
+
+    HttpResponse() = default;
+    HttpResponse(int status_code, std::string response_body)
+        : status(status_code), body(std::move(response_body)) {}
+    HttpResponse(int status_code, std::string response_body,
+                 std::vector<std::pair<std::string, std::string>> response_headers)
+        : status(status_code),
+          body(std::move(response_body)),
+          headers(std::move(response_headers)) {}
 };
 
 using Handler = std::function<HttpResponse(const HttpRequest&)>;
@@ -293,9 +307,21 @@ private:
         const HttpResponse response = m_handler ? m_handler(request) : HttpResponse{200, {}};
         const std::string body = response.body;
         std::string reply = "HTTP/1.1 " + std::to_string(response.status) + " X\r\n";
-        reply += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+        bool has_content_length = false;
+        for (const auto& header : response.headers) {
+            if (EqualIgnoreCase(header.first, "Content-Length")) {
+                has_content_length = true;
+            }
+            reply += header.first + ": " + header.second + "\r\n";
+        }
+        if (!has_content_length) {
+            reply += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+        }
         reply += "Connection: close\r\n\r\n";
-        reply += body;
+        // HEAD 只回头部：Content-Length 仍表示资源的完整大小。
+        if (!EqualIgnoreCase(request.method, "HEAD")) {
+            reply += body;
+        }
         (void)SendAll(fd, reply);
     }
 
@@ -566,6 +592,242 @@ void TestUploadEmptyArchive() {
     }
 }
 
+/// SHA-256 小写十六进制（测试内比对响应头/响应体）。
+std::string Sha256Hex(const std::vector<std::uint8_t>& data) {
+    const std::array<std::uint8_t, go2cpp::hash::Sha256::kSize> digest =
+        go2cpp::hash::Sha256::Digest(go2cpp::hash::AsBytes(data));
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string text;
+    text.reserve(digest.size() * 2);
+    for (const std::uint8_t byte : digest) {
+        text.push_back(kHex[byte >> 4]);
+        text.push_back(kHex[byte & 0x0fu]);
+    }
+    return text;
+}
+
+/// FR-18：上传成功后 GET 回读，响应体与 SHA-256 头一致 -> kOk。
+void TestUploadRemoteVerifyGetSuccess() {
+    bento_test::TempDir tmp("upload_verify_get_ok");
+    const auto zip = MakeZip(tmp.path(), 128 * 1024);
+    const auto zip_bytes = bento_test::ReadFile(zip);
+    const std::string zip_sha = Sha256Hex(zip_bytes);
+    TestHttpServer server([&zip_bytes, &zip_sha](const HttpRequest& request) {
+        if (request.method == "PUT") {
+            return HttpResponse{201, {}};
+        }
+        if (request.method == "GET") {
+            return HttpResponse{200, std::string(zip_bytes.begin(), zip_bytes.end()),
+                                {{"X-Content-SHA256", zip_sha}}};
+        }
+        return HttpResponse{405, {}};
+    });
+    BENTO_CHECK(server.valid());
+    UploadRequest request;
+    request.endpoint = server.url("/backup/verify");
+    request.method = HttpMethod::kPut;
+    request.token = "verify-token";
+    UploadOptions options;
+    options.retry_delay = 1ms;
+    options.verify_remote = true;
+    options.verify_mode = RemoteVerifyMode::kGet;
+    const auto result = Upload(zip.string(), request, options);
+    BENTO_CHECK(result.ok());
+    BENTO_CHECK_EQ(result.status, UploadStatus::kOk);
+    BENTO_CHECK(result.remote_verified);
+    BENTO_CHECK_EQ(result.attempts, 1);
+    BENTO_CHECK_EQ(result.http_status, 201);
+    const auto requests = server.requests();
+    BENTO_CHECK_EQ(requests.size(), 2U);
+    if (requests.size() == 2) {
+        BENTO_CHECK_EQ(requests[0].method, std::string("PUT"));
+        BENTO_CHECK_EQ(requests[1].method, std::string("GET"));
+        BENTO_CHECK_EQ(HeaderValue(requests[1], "Authorization"),
+                       std::string("Bearer verify-token"));
+    }
+}
+
+/// FR-18：verify_remote 默认 false，不产生额外回读请求（保持旧行为）。
+void TestUploadRemoteVerifyDisabledByDefault() {
+    bento_test::TempDir tmp("upload_verify_off");
+    const auto zip = MakeZip(tmp.path(), 4096);
+    TestHttpServer server([](const HttpRequest&) { return HttpResponse{201, {}}; });
+    BENTO_CHECK(server.valid());
+    UploadRequest request;
+    request.endpoint = server.url("/upload/off");
+    UploadOptions options;
+    options.retry_delay = 1ms;
+    const auto result = Upload(zip.string(), request, options);
+    BENTO_CHECK(result.ok());
+    BENTO_CHECK(!result.remote_verified);
+    const auto requests = server.requests();
+    BENTO_CHECK_EQ(requests.size(), 1U);
+    if (requests.size() == 1) {
+        BENTO_CHECK_EQ(requests[0].method, std::string("PUT"));
+    }
+}
+
+/// FR-18：GET 响应体大小相同但内容不同（无哈希头）-> kRemoteVerifyFailed。
+void TestUploadRemoteVerifyBodyHashMismatch() {
+    bento_test::TempDir tmp("upload_verify_hash");
+    const auto zip = MakeZip(tmp.path(), 64 * 1024);
+    const auto zip_bytes = bento_test::ReadFile(zip);
+    std::vector<std::uint8_t> corrupted = zip_bytes;
+    corrupted[corrupted.size() / 2] ^= 0xFFu;
+    const auto before = bento_test::ReadFile(zip);
+    TestHttpServer server([&corrupted](const HttpRequest& request) {
+        if (request.method == "PUT") {
+            return HttpResponse{201, {}};
+        }
+        return HttpResponse{200, std::string(corrupted.begin(), corrupted.end())};
+    });
+    BENTO_CHECK(server.valid());
+    UploadRequest request;
+    request.endpoint = server.url("/backup/hash-mismatch");
+    UploadOptions options;
+    options.retry_delay = 1ms;
+    options.verify_remote = true;
+    options.verify_mode = RemoteVerifyMode::kGet;
+    const auto result = Upload(zip.string(), request, options);
+    BENTO_CHECK(!result.ok());
+    BENTO_CHECK_EQ(result.status, UploadStatus::kRemoteVerifyFailed);
+    BENTO_CHECK(!result.remote_verified);
+    BENTO_CHECK(!result.error.empty());
+    BENTO_CHECK_EQ(result.attempts, 1);
+    BENTO_CHECK(bento_test::ReadFile(zip) == before);
+}
+
+/// FR-18：响应头 SHA-256 与本地不一致 -> kRemoteVerifyFailed（头优先）。
+void TestUploadRemoteVerifyChecksumHeaderMismatch() {
+    bento_test::TempDir tmp("upload_verify_header");
+    const auto zip = MakeZip(tmp.path(), 32 * 1024);
+    const auto zip_bytes = bento_test::ReadFile(zip);
+    const std::string wrong_sha(64, '0');
+    TestHttpServer server([&zip_bytes, &wrong_sha](const HttpRequest& request) {
+        if (request.method == "PUT") {
+            return HttpResponse{201, {}};
+        }
+        // 头名用小写，验证实现是大小写不敏感的。
+        return HttpResponse{200, std::string(zip_bytes.begin(), zip_bytes.end()),
+                            {{"x-content-sha256", wrong_sha}}};
+    });
+    BENTO_CHECK(server.valid());
+    UploadRequest request;
+    request.endpoint = server.url("/backup/header-mismatch");
+    UploadOptions options;
+    options.retry_delay = 1ms;
+    options.verify_remote = true;
+    options.verify_mode = RemoteVerifyMode::kGet;
+    const auto result = Upload(zip.string(), request, options);
+    BENTO_CHECK_EQ(result.status, UploadStatus::kRemoteVerifyFailed);
+    BENTO_CHECK(!result.remote_verified);
+}
+
+/// FR-18：HEAD 的 Content-Length 与本地 zip 大小一致 -> kOk。
+void TestUploadRemoteVerifyHeadSuccess() {
+    bento_test::TempDir tmp("upload_verify_head_ok");
+    const auto zip = MakeZip(tmp.path(), 16 * 1024);
+    const std::uintmax_t zip_size = fs::file_size(zip);
+    TestHttpServer server([&zip_size](const HttpRequest& request) {
+        if (request.method == "PUT") {
+            return HttpResponse{201, {}};
+        }
+        if (request.method == "HEAD") {
+            return HttpResponse{200, {}, {{"Content-Length", std::to_string(zip_size)}}};
+        }
+        return HttpResponse{405, {}};
+    });
+    BENTO_CHECK(server.valid());
+    UploadRequest request;
+    request.endpoint = server.url("/backup/head-ok");
+    UploadOptions options;
+    options.retry_delay = 1ms;
+    options.verify_remote = true;
+    options.verify_mode = RemoteVerifyMode::kHead;
+    const auto result = Upload(zip.string(), request, options);
+    BENTO_CHECK(result.ok());
+    BENTO_CHECK(result.remote_verified);
+    const auto requests = server.requests();
+    BENTO_CHECK_EQ(requests.size(), 2U);
+    if (requests.size() == 2) {
+        BENTO_CHECK_EQ(requests[1].method, std::string("HEAD"));
+    }
+}
+
+/// FR-18：HEAD 的 Content-Length 与本地不一致 -> kRemoteVerifyFailed。
+void TestUploadRemoteVerifyHeadSizeMismatch() {
+    bento_test::TempDir tmp("upload_verify_head_bad");
+    const auto zip = MakeZip(tmp.path(), 8 * 1024);
+    const std::uintmax_t wrong_size = fs::file_size(zip) + 1;
+    TestHttpServer server([&wrong_size](const HttpRequest& request) {
+        if (request.method == "PUT") {
+            return HttpResponse{201, {}};
+        }
+        if (request.method == "HEAD") {
+            return HttpResponse{200, {}, {{"Content-Length", std::to_string(wrong_size)}}};
+        }
+        return HttpResponse{405, {}};
+    });
+    BENTO_CHECK(server.valid());
+    UploadRequest request;
+    request.endpoint = server.url("/backup/head-bad");
+    UploadOptions options;
+    options.retry_delay = 1ms;
+    options.verify_remote = true;
+    options.verify_mode = RemoteVerifyMode::kHead;
+    const auto result = Upload(zip.string(), request, options);
+    BENTO_CHECK_EQ(result.status, UploadStatus::kRemoteVerifyFailed);
+    BENTO_CHECK(!result.remote_verified);
+}
+
+/// FR-18：GET 回读的响应体被截断 -> kRemoteVerifyFailed（大小校验）。
+void TestUploadRemoteVerifyBodySizeMismatch() {
+    bento_test::TempDir tmp("upload_verify_size");
+    const auto zip = MakeZip(tmp.path(), 48 * 1024);
+    const auto zip_bytes = bento_test::ReadFile(zip);
+    std::vector<std::uint8_t> truncated(zip_bytes.begin(),
+                                        zip_bytes.begin() + zip_bytes.size() / 2);
+    TestHttpServer server([&truncated](const HttpRequest& request) {
+        if (request.method == "PUT") {
+            return HttpResponse{201, {}};
+        }
+        return HttpResponse{200, std::string(truncated.begin(), truncated.end())};
+    });
+    BENTO_CHECK(server.valid());
+    UploadRequest request;
+    request.endpoint = server.url("/backup/size-mismatch");
+    UploadOptions options;
+    options.retry_delay = 1ms;
+    options.verify_remote = true;
+    options.verify_mode = RemoteVerifyMode::kGet;
+    const auto result = Upload(zip.string(), request, options);
+    BENTO_CHECK_EQ(result.status, UploadStatus::kRemoteVerifyFailed);
+    BENTO_CHECK(!result.remote_verified);
+}
+
+/// FR-18：回读请求返回 404 -> kRemoteVerifyFailed（上传本身已成功）。
+void TestUploadRemoteVerifyHttpError() {
+    bento_test::TempDir tmp("upload_verify_404");
+    const auto zip = MakeZip(tmp.path(), 2048);
+    TestHttpServer server([](const HttpRequest& request) {
+        if (request.method == "PUT") {
+            return HttpResponse{201, {}};
+        }
+        return HttpResponse{404, "not found"};
+    });
+    BENTO_CHECK(server.valid());
+    UploadRequest request;
+    request.endpoint = server.url("/backup/404");
+    UploadOptions options;
+    options.retry_delay = 1ms;
+    options.verify_remote = true;
+    options.verify_mode = RemoteVerifyMode::kGet;
+    const auto result = Upload(zip.string(), request, options);
+    BENTO_CHECK_EQ(result.status, UploadStatus::kRemoteVerifyFailed);
+    BENTO_CHECK(!result.remote_verified);
+    BENTO_CHECK_EQ(result.attempts, 1);
+}
+
 } // namespace
 
 int main() {
@@ -579,5 +841,13 @@ int main() {
     TestUploadTokenNotDuplicated();
     TestUploadContentTypeOverride();
     TestUploadEmptyArchive();
+    TestUploadRemoteVerifyGetSuccess();
+    TestUploadRemoteVerifyDisabledByDefault();
+    TestUploadRemoteVerifyBodyHashMismatch();
+    TestUploadRemoteVerifyChecksumHeaderMismatch();
+    TestUploadRemoteVerifyHeadSuccess();
+    TestUploadRemoteVerifyHeadSizeMismatch();
+    TestUploadRemoteVerifyBodySizeMismatch();
+    TestUploadRemoteVerifyHttpError();
     return bento_test::Finish("test_upload");
 }
