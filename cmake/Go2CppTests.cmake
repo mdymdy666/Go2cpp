@@ -43,6 +43,7 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_timer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_beginner_api.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/logging/test_log_config.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/test_config_transaction.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_errors_ns.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_strings.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_strconv.cpp
