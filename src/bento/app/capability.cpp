@@ -9,18 +9,20 @@
 #include "go2cpp/bento/app/capability.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
 #include <cstdint>
-#include <fstream>
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <sys/epoll.h>
@@ -29,6 +31,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
+#include <sys/types.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
@@ -70,40 +73,90 @@ std::string ToHex(std::uint64_t value) {
     return out;
 }
 
-/// 读取整个文本文件；不存在、无权限、是目录都返回 false。
+/// 单次文件读取上限：/proc 文本通常是几十 KB；上限防止把探测路径指向超大
+/// 文件时把进程内存打满。超限按「不可读」处理，能力探测只关心可用性。
+constexpr std::size_t kMaxReadBytes = 8u * 1024u * 1024u;
+
+/// fd 的 RAII 包装，保证 ReadFile 的每条返回路径都关闭描述符。
+class UniqueFd {
+public:
+    explicit UniqueFd(int descriptor) noexcept : m_descriptor(descriptor) {}
+    ~UniqueFd() {
+        if (m_descriptor >= 0) {
+            ::close(m_descriptor);
+        }
+    }
+    UniqueFd(const UniqueFd&) = delete;
+    UniqueFd& operator=(const UniqueFd&) = delete;
+
+    int get() const noexcept { return m_descriptor; }
+
+private:
+    int m_descriptor;
+};
+
+/// 读取整个文本文件；不存在、无权限、是目录、读取超过上限都返回 false。
+/// 直接走 POSIX read：/proc 文件 st_size 为 0，不能用 seek/整块读。
 bool ReadFile(const std::string& path, std::string* out) {
-    std::ifstream input(path.c_str(), std::ios::binary);
-    if (!input.is_open()) {
+    const UniqueFd descriptor(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+    if (descriptor.get() < 0) {
         return false;
     }
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-    if (input.bad()) {
+    struct stat info {};
+    if (::fstat(descriptor.get(), &info) != 0 || !S_ISREG(info.st_mode)) {
         return false;
     }
-    *out = buffer.str();
+    std::string content;
+    const std::size_t reserve_size =
+        info.st_size > 0 ? static_cast<std::size_t>(std::min<off_t>(info.st_size, 65536)) : 4096;
+    content.reserve(reserve_size);
+    std::array<char, 8192> buffer{};
+    for (;;) {
+        const ssize_t count = ::read(descriptor.get(), buffer.data(), buffer.size());
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (count == 0) {
+            break;
+        }
+        content.append(buffer.data(), static_cast<std::size_t>(count));
+        if (content.size() > kMaxReadBytes) {
+            return false;
+        }
+    }
+    *out = std::move(content);
     return true;
 }
 
-std::string Trim(std::string text) {
+std::string_view TrimView(std::string_view text) {
     const auto not_space = [](unsigned char character) { return std::isspace(character) == 0; };
-    text.erase(text.begin(), std::find_if(text.begin(), text.end(), not_space));
-    text.erase(std::find_if(text.rbegin(), text.rend(), not_space).base(), text.end());
+    while (!text.empty() && !not_space(static_cast<unsigned char>(text.front()))) {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && !not_space(static_cast<unsigned char>(text.back()))) {
+        text.remove_suffix(1);
+    }
     return text;
 }
 
 /// 在 `Key: value` 形式的多行文本里查找一行并返回值部分。
-bool LookupLineValue(const std::string& text, const std::string& key, std::string* value) {
+/// 用 string_view 逐行扫描，避免为每一行分配 std::string
+///（/proc/cpuinfo 在 64 核机器上可有数千行）。
+bool LookupLineValue(std::string_view text, std::string_view key, std::string* value) {
     std::size_t position = 0;
-    while (position < text.size()) {
+    while (position <= text.size()) {
         const std::size_t end = text.find('\n', position);
-        const std::size_t length = (end == std::string::npos) ? std::string::npos : end - position;
-        const std::string line = text.substr(position, length);
-        if (line.compare(0, key.size(), key) == 0) {
-            *value = Trim(line.substr(key.size()));
+        const std::size_t length =
+            end == std::string_view::npos ? text.size() - position : end - position;
+        const std::string_view line = text.substr(position, length);
+        if (line.size() >= key.size() && line.compare(0, key.size(), key) == 0) {
+            *value = std::string(TrimView(line.substr(key.size())));
             return true;
         }
-        if (end == std::string::npos) {
+        if (end == std::string_view::npos) {
             break;
         }
         position = end + 1;
@@ -113,7 +166,7 @@ bool LookupLineValue(const std::string& text, const std::string& key, std::strin
 
 /// 解析前导十进制整数；允许尾随单位（meminfo 的 "12345 kB"），
 /// 但必须至少有一位数字。cgroup 的纯数值同样适用。
-bool ParseU64(const std::string& text, std::uint64_t* value) {
+bool ParseU64(std::string_view text, std::uint64_t* value) {
     std::size_t index = 0;
     while (index < text.size() && std::isspace(static_cast<unsigned char>(text[index])) != 0) {
         ++index;
@@ -174,7 +227,9 @@ void ProbeMeminfo(const ProbeOptions& options, CapabilityItem* item) {
         SetDegraded(item, "meminfo 缺少 MemTotal/MemAvailable 字段");
         return;
     }
-    const std::uint64_t available_bytes = available_kb * 1024ULL;
+    // 饱和处理：畸形的大 kB 值不能因为 64 位回绕被误判成「内存不足」。
+    const std::uint64_t available_bytes =
+        available_kb > (UINT64_MAX / 1024U) ? UINT64_MAX : available_kb * 1024ULL;
     std::string detail = "MemTotal=" + std::to_string(total_kb) + " kB, MemAvailable=" +
                          std::to_string(available_kb) + " kB";
     if (available_bytes < options.min_mem_available) {
@@ -198,9 +253,10 @@ void ProbeCpuinfo(const ProbeOptions& options, CapabilityItem* item) {
     std::size_t position = 0;
     while (position < text.size()) {
         const std::size_t end = text.find('\n', position);
-        const std::size_t length = (end == std::string::npos) ? std::string::npos : end - position;
-        const std::string line = text.substr(position, length);
-        if (line.compare(0, 9, "processor") == 0) {
+        const std::size_t length =
+            end == std::string::npos ? text.size() - position : end - position;
+        const std::string_view line(text.data() + position, length);
+        if (line.size() >= 9 && line.compare(0, 9, "processor") == 0) {
             ++processors;
         }
         if (end == std::string::npos) {
@@ -215,9 +271,10 @@ void ProbeCpuinfo(const ProbeOptions& options, CapabilityItem* item) {
     SetAvailable(item, "processors=" + std::to_string(processors));
 }
 
-/// /proc/self/status：验证进程视图可读，并提取 CapEff。
+/// /proc/self/status：验证进程视图可读，并提取 CapEff。可读但既没有 Uid
+/// 也没有 CapEff 时说明 proc 视图不完整，记 degraded 而不是假可用。
 void ProbeSelfStatus(const ProbeOptions& options, CapabilityItem* item,
-                     std::uint64_t* capability_effective) {
+                     std::uint64_t* capability_effective, bool* capability_known) {
     const std::string path = options.proc_root + "/self/status";
     std::string text;
     if (!ReadFile(path, &text)) {
@@ -226,11 +283,17 @@ void ProbeSelfStatus(const ProbeOptions& options, CapabilityItem* item,
     }
     std::string uid_text;
     std::string cap_text;
+    const bool has_uid = LookupLineValue(text, "Uid:", &uid_text);
+    const bool has_cap = LookupLineValue(text, "CapEff:", &cap_text);
+    if (!has_uid && !has_cap) {
+        SetDegraded(item, "status 缺少 Uid/CapEff 字段");
+        return;
+    }
     std::string detail;
-    if (LookupLineValue(text, "Uid:", &uid_text)) {
+    if (has_uid) {
         detail = "Uid=" + uid_text;
     }
-    if (LookupLineValue(text, "CapEff:", &cap_text)) {
+    if (has_cap) {
         if (!detail.empty()) {
             detail += " ";
         }
@@ -254,6 +317,7 @@ void ProbeSelfStatus(const ProbeOptions& options, CapabilityItem* item,
         }
         if (valid) {
             *capability_effective = value;
+            *capability_known = true;
         }
     }
     SetAvailable(item, std::move(detail));
@@ -268,10 +332,16 @@ void ProbeSelfFd(const ProbeOptions& options, CapabilityItem* item) {
         return;
     }
     std::size_t entries = 0;
+    errno = 0;
     while (::readdir(directory) != nullptr) {
         ++entries;
     }
+    const int read_error = errno;
     ::closedir(directory);
+    if (read_error != 0) {
+        SetUnavailable(item, "读取 " + path + " 失败：" + ErrorText(read_error));
+        return;
+    }
     // 固定存在 . 与 ..，其余为实际 fd；条目数只作为明细。
     SetAvailable(item, "entries=" + std::to_string(entries));
 }
@@ -324,23 +394,26 @@ int DetectCgroupVersion(const std::string& root, std::string* detail) {
     return 0;
 }
 
-void ProbeCgroupVersion(const ProbeOptions& options, CapabilityItem* item) {
+void ProbeCgroupVersion(const ProbeOptions& options, int version, const std::string& detail,
+                        CapabilityItem* item) {
     if (!options.check_cgroup) {
         SetDegraded(item, "探测被配置禁用（check_cgroup=false）");
         return;
     }
-    std::string detail;
-    const int version = DetectCgroupVersion(options.cgroup_root, &detail);
     if (version == 0) {
         SetDegraded(item, "无法识别 cgroup 版本（" + options.cgroup_root + " 不可用）");
         return;
     }
-    SetAvailable(item, std::move(detail));
+    SetAvailable(item, detail);
 }
 
 /// cgroup 内存限制：v2 的 memory.max 或 v1 的 memory.limit_in_bytes。
 void ProbeCgroupMemory(const ProbeOptions& options, int version, CapabilityItem* item) {
-    if (!options.check_cgroup || version == 0) {
+    if (!options.check_cgroup) {
+        SetDegraded(item, "探测被配置禁用（check_cgroup=false）");
+        return;
+    }
+    if (version == 0) {
         SetDegraded(item, "cgroup 不可用，无法读取内存限制");
         return;
     }
@@ -355,7 +428,7 @@ void ProbeCgroupMemory(const ProbeOptions& options, int version, CapabilityItem*
         SetDegraded(item, "无法读取 " + path);
         return;
     }
-    text = Trim(text);
+    text = std::string(TrimView(text));
     if (text == "max") {
         SetAvailable(item, "memory limit=unlimited（" + path + "）");
         return;
@@ -365,8 +438,10 @@ void ProbeCgroupMemory(const ProbeOptions& options, int version, CapabilityItem*
         SetDegraded(item, "无法解析内存限制值 \"" + text + "\"（" + path + "）");
         return;
     }
-    // v1 用接近 ULONG_MAX 的值表示无限；统一按「极大值」展示。
-    const bool unlimited = limit_bytes >= (UINT64_MAX / 2U);
+    // v1 的无限制值是 PAGE_COUNTER_MAX * PAGE_SIZE = 9223372036854771712
+    //（≈2^63-4096），高于 2^62；不能用 UINT64_MAX/2（2^63-1）判等，否则
+    // 会把无限制误报成 9.2 EB 的具体限额。
+    const bool unlimited = limit_bytes >= (std::uint64_t{1} << 62);
     const std::string detail = "memory limit=" + (unlimited ? std::string("unlimited")
                                                              : std::to_string(limit_bytes) + " B") +
                                "（" + path + "）";
@@ -381,7 +456,11 @@ void ProbeCgroupMemory(const ProbeOptions& options, int version, CapabilityItem*
 
 /// cgroup CPU 配额：v2 的 cpu.max 或 v1 的 cpu.cfs_quota_us。
 void ProbeCgroupCpu(const ProbeOptions& options, int version, CapabilityItem* item) {
-    if (!options.check_cgroup || version == 0) {
+    if (!options.check_cgroup) {
+        SetDegraded(item, "探测被配置禁用（check_cgroup=false）");
+        return;
+    }
+    if (version == 0) {
         SetDegraded(item, "cgroup 不可用，无法读取 CPU 配额");
         return;
     }
@@ -392,12 +471,17 @@ void ProbeCgroupCpu(const ProbeOptions& options, int version, CapabilityItem* it
             SetDegraded(item, "无法读取 " + path);
             return;
         }
-        std::istringstream stream(Trim(text));
+        std::istringstream stream(std::string(TrimView(text)));
         std::string quota;
         std::string period;
         stream >> quota >> period;
         if (quota.empty()) {
             SetDegraded(item, "cpu.max 内容为空");
+            return;
+        }
+        if (period.empty()) {
+            // 内核格式固定为 "<quota> <period>"；缺 period 说明文件被截断或伪造。
+            SetDegraded(item, "cpu.max 缺少 period 字段");
             return;
         }
         if (quota == "max") {
@@ -422,7 +506,7 @@ void ProbeCgroupCpu(const ProbeOptions& options, int version, CapabilityItem* it
         SetDegraded(item, "无法读取 " + path);
         return;
     }
-    text = Trim(text);
+    text = std::string(TrimView(text));
     if (text == "-1") {
         SetAvailable(item, "cpu quota=unlimited（" + path + "）");
         return;
@@ -626,9 +710,13 @@ std::vector<std::string> CapabilityMatrix::Reasons() const {
         if (item.available()) {
             continue;
         }
-        const std::string& reason =
-            item.reason.empty() ? std::string(CapabilityStatusName(item.status)) : item.reason;
-        reasons.push_back(item.name + ": " + reason);
+        std::string entry = item.name + ": ";
+        if (item.reason.empty()) {
+            entry += CapabilityStatusName(item.status);
+        } else {
+            entry += item.reason;
+        }
+        reasons.push_back(std::move(entry));
     }
     return reasons;
 }
@@ -658,8 +746,7 @@ CapabilityMatrix Probe(const ProbeOptions& options) {
 
     matrix.items.emplace_back();
     matrix.items.back().name = "proc.self.status";
-    ProbeSelfStatus(options, &matrix.items.back(), &capability_effective);
-    capability_known = !matrix.items.back().unavailable();
+    ProbeSelfStatus(options, &matrix.items.back(), &capability_effective, &capability_known);
 
     matrix.items.emplace_back();
     matrix.items.back().name = "proc.self.fd";
@@ -673,12 +760,17 @@ CapabilityMatrix Probe(const ProbeOptions& options) {
     matrix.items.back().name = "ipc.epoll";
     ProbeEpoll(options, &matrix.items.back());
 
+    // 版本检测只做一次：先前 ProbeCgroupVersion 内部又调了一次
+    // DetectCgroupVersion，每次 Probe 多 2 次 stat。
     std::string cgroup_detail;
-    const int cgroup_version = DetectCgroupVersion(options.cgroup_root, &cgroup_detail);
+    int cgroup_version = 0;
+    if (options.check_cgroup) {
+        cgroup_version = DetectCgroupVersion(options.cgroup_root, &cgroup_detail);
+    }
 
     matrix.items.emplace_back();
     matrix.items.back().name = "cgroup.version";
-    ProbeCgroupVersion(options, &matrix.items.back());
+    ProbeCgroupVersion(options, cgroup_version, cgroup_detail, &matrix.items.back());
 
     matrix.items.emplace_back();
     matrix.items.back().name = "cgroup.memory";
