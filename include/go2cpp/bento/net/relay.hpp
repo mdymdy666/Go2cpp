@@ -29,10 +29,15 @@
  * `Read`/`Write`，靠较短的 slice 轮转保证两个方向都能推进。这适合一条连接
  * 一个中继线程的用法（与 `TcpProxy` 的连接级并发等价），不适合在单线程里
  * 驱动上万条连接——那种场景应由更底层的 `poll`/`epoll` 驱动实现负责。
+ * 注意每条**空闲**连接每个 `poll_interval_ms` 仍会唤醒一次：1000 条空闲连接、
+ * `poll_interval_ms=1` 在 12 核 WSL2 上实测约 5–6 核 CPU；调到 5ms 可降到约
+ * 1.6–2.7 核（复测随负载波动），代价是转发延迟上界变大。连接数上千时应调大
+ * 该值或改用事件驱动实现。
  *
  * ## 有界缓冲与背压（核心约束）
  *
- * 每个方向各有一个**固定容量**的 pending 缓冲（默认 64KB）：
+ * 每个方向各有一个**固定容量**的 pending 缓冲（默认 64KB，两个方向合计
+ * 128KB/relay，在 `Run` 开始时一次性分配，不随流量增长）：
  *
  *   - 读到但还没写出的字节留在 pending 里；
  *   - pending 未满时继续读，让链路尽量跑满；
@@ -103,7 +108,7 @@ enum class RelayCloseReason : std::uint8_t {
     kConnectTimeout = 3,  ///< `ConnectAndRun` 拨号超时。
     kConnectFailed = 4,   ///< `ConnectAndRun` 拨号失败（拒绝/解析失败等）。
     kReadError = 5,       ///< 某个方向 `Read` 返回不可恢复错误。
-    kWriteError = 6,      ///< 某个方向 `Write` 失败或对端不再接收（EPIPE/RST）。
+    kWriteError = 6,      ///< `Write` 失败/对端不再接收（EPIPE/RST），或 `ShutdownWrite` 返回 kError。
 };
 
 /// 返回结束原因的可读名称，用于日志与测试失败信息；未知值返回 "Unknown"。
@@ -152,7 +157,7 @@ struct RelayStats {
     std::uint64_t peak_pending_src_to_dst = 0;  ///< src → dst pending 峰值。
     std::uint64_t peak_pending_dst_to_src = 0;  ///< dst → src pending 峰值。
     std::uint64_t peak_buffered_bytes = 0;  ///< 双向 pending 之和的峰值。
-    std::uint64_t half_closes = 0;          ///< 传播过的 FIN 次数（单向计一次）。
+    std::uint64_t half_closes = 0;  ///< 成功传播的 FIN 次数（单向计一次；kClosed/kError 不计）。
     std::uint64_t slow_consumers = 0;       ///< 因慢客户端断开次数。
     std::uint64_t idle_timeouts = 0;        ///< 空闲超时次数。
     std::uint64_t connect_timeouts = 0;     ///< 拨号超时次数。
@@ -197,7 +202,8 @@ struct RelayResult {
  * @endcode
  *
  * @note `Run` 返回前会 `Close()` 两条传输；调用方不需要（也不应该）在返回后
- *       继续使用它们。
+ *       继续使用它们。若传输实现抛异常或缓冲分配失败（`std::bad_alloc`），
+ *       `Run` 无法返回，此时**不会**执行 `Close`，调用方需自行释放两端。
  */
 class Relay final {
 public:

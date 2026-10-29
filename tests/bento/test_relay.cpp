@@ -12,12 +12,19 @@
  *          - 空闲/连接超时：无流量、拨号失败两类超时都必须有界退出；
  *          - 随机分块：每次 Write 上限随机，验证不丢字节、不越界；
  *          - 写错误与极小缓冲：异常路径与边界值。
+ *          - 审查补充（回归）：慢但持续推进不误杀、FIN 必须在 pending 排空后、
+ *            读错误/FIN 错误、配置归一化、跨运行统计、空闲计时复位、
+ *            MemoryTransport 无关性、50 次 TCP 循环 fd 不泄漏。
  * @author go2cpp contributors
  * @date 2026-10-28
  * @copyright MIT License
  */
 
+#include <dirent.h>
+#include <netinet/in.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -35,6 +42,7 @@
 #include <utility>
 #include <vector>
 
+#include "go2cpp/bento/net/memory_transport.hpp"
 #include "go2cpp/bento/net/relay.hpp"
 #include "go2cpp/bento/net/tcp_transport.hpp"
 #include "test_util.hpp"
@@ -46,10 +54,12 @@ using Clock = std::chrono::steady_clock;
 using go2cpp::bento::net::Code;
 using go2cpp::bento::net::Endpoint;
 using go2cpp::bento::net::ITransport;
+using go2cpp::bento::net::MemoryTransport;
 using go2cpp::bento::net::Relay;
 using go2cpp::bento::net::RelayCloseReason;
 using go2cpp::bento::net::RelayOptions;
 using go2cpp::bento::net::RelayResult;
+using go2cpp::bento::net::RelayStats;
 using go2cpp::bento::net::Result;
 using go2cpp::bento::net::TcpTransport;
 
@@ -111,6 +121,20 @@ long CurrentRssKb() {
     return -1;
 }
 
+/// 当前进程打开的 fd 数；读取 /proc 失败返回 -1（断言只在可用时比较）。
+int CurrentFdCount() {
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (dir == nullptr) {
+        return -1;
+    }
+    int count = 0;
+    while (::readdir(dir) != nullptr) {
+        ++count;
+    }
+    ::closedir(dir);
+    return count - 2;  // 扣除 . 与 ..
+}
+
 bool WriteFull(ITransport& transport, const std::vector<std::uint8_t>& data) {
     const Result result = transport.WriteFull(data.data(), data.size(), Ms(5000));
     return result.code == Code::kOk && result.bytes == data.size();
@@ -155,15 +179,20 @@ public:
     bool block_writes = false;       ///< Write 永远超时（模拟发送缓冲长期满）。
     std::size_t max_write_per_call = 0;  ///< 单次 Write 接受上限；0 = 全接受。
     std::function<std::size_t()> write_limit;  ///< 每次 Write 的随机上限（优先）。
+    std::uint32_t write_delay_ms = 0;  ///< 每次 Write 的固定耗时（慢但持续推进）。
     std::uint64_t fail_writes_after = std::numeric_limits<std::uint64_t>::max();
     bool connect_timeout = false;
     bool connect_error = false;
+    bool read_error = false;     ///< Read 直接返回 kError。
+    bool write_error = false;    ///< Write 直接返回 kError。
+    bool shutdown_error = false; ///< ShutdownWrite 返回 kError。
 
     // ---- 观测 ----
     std::uint64_t read_bytes = 0;
     std::uint64_t write_bytes = 0;
     std::uint64_t shutdown_write_calls = 0;
     std::uint64_t close_calls = 0;
+    std::uint64_t bytes_at_shutdown = 0;  ///< ShutdownWrite 时已写出的字节数。
     bool closed = false;
     std::vector<std::uint8_t> received;
 
@@ -184,6 +213,9 @@ public:
         }
         if (capacity == 0) {
             return Result{Code::kOk, 0, 0};
+        }
+        if (read_error) {
+            return Result{Code::kError, EIO, 0};
         }
         if (m_pos < m_input.size()) {
             const std::size_t count = std::min(capacity, m_input.size() - m_pos);
@@ -207,6 +239,9 @@ public:
         if (size == 0) {
             return Result{Code::kOk, 0, 0};
         }
+        if (write_error) {
+            return Result{Code::kError, EIO, 0};
+        }
         if (block_writes) {
             SleepFor(timeout);
             return Result{Code::kTimeout, ETIMEDOUT, 0};
@@ -225,6 +260,9 @@ public:
         if (count == 0) {
             return Result{Code::kClosed, EPIPE, 0};
         }
+        if (write_delay_ms != 0) {
+            std::this_thread::sleep_for(Ms(write_delay_ms));
+        }
         received.insert(received.end(), data, data + count);
         write_bytes += count;
         return Result{Code::kOk, 0, count};
@@ -232,7 +270,11 @@ public:
 
     Result ShutdownWrite() override {
         ++shutdown_write_calls;
+        bytes_at_shutdown = received.size();
         m_write_shutdown = true;
+        if (shutdown_error) {
+            return Result{Code::kError, EIO, 0};
+        }
         return Result{Code::kOk, 0, 0};
     }
 
@@ -261,6 +303,25 @@ struct TcpPair {
     std::unique_ptr<TcpTransport> dialer;
     std::unique_ptr<TcpTransport> acceptor;
 };
+
+/// 判定 loopback TCP 是否真的可用（socket/bind 失败才算环境不满足）。
+///
+/// @details 不能用 `MakeTcpPair` 的返回值做 SKIP 判据：那样 listen/connect/
+///          accept 的实现回归也会被当成「环境不支持」跳过，测试永远是绿的。
+bool TcpLoopbackUsable() {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    const bool bound =
+        ::bind(fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0;
+    (void)::close(fd);
+    return bound;
+}
 
 bool MakeTcpPair(TcpPair* pair) {
     TcpTransport listener;
@@ -299,10 +360,14 @@ RelayOptions MakeTcpOptions() {
 /// 场景 1：真实 TCP 上 100KB 双向同时传输，验证完整性与统计。
 void TestTcpBothDirections() {
     std::printf("[CASE] tcp 100KB both directions\n");
+    if (!TcpLoopbackUsable()) {
+        bento_test::Skip("loopback TCP unavailable");
+        return;
+    }
     TcpPair client_side;
     TcpPair server_side;
     if (!MakeTcpPair(&client_side) || !MakeTcpPair(&server_side)) {
-        bento_test::Skip("loopback TCP unavailable");
+        BENTO_CHECK(false);
         return;
     }
 
@@ -359,10 +424,14 @@ void TestTcpBothDirections() {
 /// 场景 2：请求-响应 + 半关闭。客户端 FIN 后中继必须继续把响应搬回来。
 void TestTcpHalfClose() {
     std::printf("[CASE] tcp request/response half close\n");
+    if (!TcpLoopbackUsable()) {
+        bento_test::Skip("loopback TCP unavailable");
+        return;
+    }
     TcpPair client_side;
     TcpPair server_side;
     if (!MakeTcpPair(&client_side) || !MakeTcpPair(&server_side)) {
-        bento_test::Skip("loopback TCP unavailable");
+        BENTO_CHECK(false);
         return;
     }
 
@@ -434,6 +503,7 @@ void TestSlowConsumer() {
     BENTO_CHECK_EQ(dst.write_bytes, 0U);
     // 关键：读入量被一方缓冲卡住，不会把源端 4MB 全吸进内存。
     BENTO_CHECK(src.read_bytes <= kBufferBytes);
+    BENTO_CHECK_EQ(result.stats.read_src_to_dst, src.read_bytes);
     BENTO_CHECK(result.stats.read_src_to_dst <= kBufferBytes);
     BENTO_CHECK(result.stats.peak_pending_src_to_dst <= kBufferBytes);
     BENTO_CHECK(result.elapsed_ms >= 50);
@@ -681,13 +751,335 @@ void TestTinyBuffer() {
                 static_cast<unsigned long long>(result.stats.peak_pending_src_to_dst));
 }
 
-/// 场景 13：真实 TCP 单向 4MB 压测。给出吞吐指标，验证大流量下不丢字节。
+/// 场景 13：慢但仍在推进的客户端不能被 write_timeout 误杀。
+///
+/// @details 文档承诺「慢但还能动」不触发 kSlowConsumer；旧用例只有「完全
+///          写不动」，缺少这条边界。每次 Write 耗时 10ms 但都写出 4KB，
+///          write_timeout=60ms，必须正常完成。
+void TestSlowButMoving() {
+    std::printf("[CASE] slow but progressing consumer\n");
+    const std::vector<std::uint8_t> payload = MakePattern(101, 64 * 1024);
+    ScriptedTransport src(payload);
+    ScriptedTransport dst;
+    dst.max_write_per_call = 4 * 1024;
+    dst.write_delay_ms = 10;
+
+    RelayOptions options;
+    options.buffer_bytes = kBufferBytes;
+    options.read_chunk_bytes = 16 * 1024;
+    options.read_slice_ms = 0;
+    options.write_slice_ms = 5;
+    options.poll_interval_ms = 1;
+    options.write_timeout_ms = 60;
+    options.idle_timeout_ms = 5000;
+
+    Relay relay;
+    const RelayResult result = relay.Run(src, dst, options);
+
+    BENTO_CHECK(result.completed());
+    BENTO_CHECK_EQ(result.stats.slow_consumers, 0U);
+    BENTO_CHECK(SameBytes(dst.received, payload));
+    BENTO_CHECK(result.elapsed_ms >= 100);
+    BENTO_CHECK(result.elapsed_ms < 2000);
+    std::printf("[INFO] slow-but-moving: elapsed=%llums\n",
+                static_cast<unsigned long long>(result.elapsed_ms));
+}
+
+/// 场景 14：FIN 必须在 pending 全部写出之后，不能提前截断尾部。
+///
+/// @details 源端 256KB 立即 EOF，目标端每次只收 4KB。如果中继在读到 EOF 时
+///          就 ShutdownWrite，最后 ~60KB 会丢失；断言 FIN 时刻的已写字节数。
+void TestFinAfterDrain() {
+    std::printf("[CASE] FIN after pending drained\n");
+    const std::vector<std::uint8_t> payload = MakePattern(102, 256 * 1024);
+    ScriptedTransport src(payload);
+    ScriptedTransport dst;
+    dst.max_write_per_call = 4 * 1024;
+
+    RelayOptions options;
+    options.buffer_bytes = kBufferBytes;
+    options.read_chunk_bytes = 16 * 1024;
+    options.read_slice_ms = 0;
+    options.write_slice_ms = 0;
+    options.poll_interval_ms = 0;
+    options.write_timeout_ms = 0;
+    options.idle_timeout_ms = 0;
+
+    Relay relay;
+    const RelayResult result = relay.Run(src, dst, options);
+
+    BENTO_CHECK(result.completed());
+    BENTO_CHECK(SameBytes(dst.received, payload));
+    BENTO_CHECK_EQ(dst.bytes_at_shutdown, payload.size());
+    BENTO_CHECK_EQ(dst.shutdown_write_calls, 1U);
+    BENTO_CHECK_EQ(src.shutdown_write_calls, 1U);
+    BENTO_CHECK_EQ(result.stats.half_closes, 2U);
+}
+
+/// 场景 15：源端 Read 返回 kError → kReadError，并保留 errno。
+void TestReadError() {
+    std::printf("[CASE] source read error\n");
+    ScriptedTransport src(MakePattern(103, 4096));
+    src.read_error = true;
+    ScriptedTransport dst;
+
+    Relay relay;
+    const RelayResult result = relay.Run(src, dst);
+
+    BENTO_CHECK(result.reason == RelayCloseReason::kReadError);
+    BENTO_CHECK_EQ(result.stats.read_errors, 1U);
+    BENTO_CHECK_EQ(result.stats.write_errors, 0U);
+    BENTO_CHECK_EQ(result.system_error, EIO);
+    BENTO_CHECK(src.closed);
+    BENTO_CHECK(dst.closed);
+}
+
+/// 场景 16：`ShutdownWrite` 返回 kError 时必须报 kWriteError，而不是 Completed。
+void TestShutdownError() {
+    std::printf("[CASE] FIN propagation error\n");
+    ScriptedTransport src;
+    ScriptedTransport dst;
+    dst.shutdown_error = true;
+
+    Relay relay;
+    const RelayResult result = relay.Run(src, dst);
+
+    BENTO_CHECK(result.reason == RelayCloseReason::kWriteError);
+    BENTO_CHECK_EQ(result.stats.write_errors, 1U);
+    BENTO_CHECK_EQ(result.stats.half_closes, 0U);
+    BENTO_CHECK_EQ(result.system_error, EIO);
+    BENTO_CHECK_EQ(src.shutdown_write_calls, 0U);
+    BENTO_CHECK(src.closed);
+    BENTO_CHECK(dst.closed);
+}
+
+/// 场景 17：写侧返回 kError（区别于 EPIPE/kClosed）也必须是 kWriteError。
+void TestWriteErrorKind() {
+    std::printf("[CASE] destination write error\n");
+    ScriptedTransport src(MakePattern(104, 4096));
+    ScriptedTransport dst;
+    dst.write_error = true;
+
+    Relay relay;
+    const RelayResult result = relay.Run(src, dst);
+
+    BENTO_CHECK(result.reason == RelayCloseReason::kWriteError);
+    BENTO_CHECK_EQ(result.stats.write_errors, 1U);
+    BENTO_CHECK_EQ(result.system_error, EIO);
+    BENTO_CHECK_EQ(result.stats.bytes_src_to_dst, 0U);
+}
+
+/// 场景 18：跨运行统计累计；峰值取 max 而不是相加。
+void TestStatsAccumulation() {
+    std::printf("[CASE] stats accumulation\n");
+    Relay relay;
+    {
+        ScriptedTransport src(MakePattern(105, 4096));
+        ScriptedTransport dst;
+        BENTO_CHECK(relay.Run(src, dst).completed());
+    }
+    {
+        ScriptedTransport src(MakePattern(106, 2048));
+        ScriptedTransport dst;
+        BENTO_CHECK(relay.Run(src, dst).completed());
+    }
+    const RelayStats total = relay.Stats();
+    BENTO_CHECK_EQ(total.bytes_src_to_dst, 6144U);
+    BENTO_CHECK_EQ(total.read_src_to_dst, 6144U);
+    BENTO_CHECK_EQ(total.half_closes, 4U);
+
+    RelayStats left;
+    left.peak_pending_src_to_dst = 111;
+    left.peak_buffered_bytes = 222;
+    left.bytes_src_to_dst = 7;
+    RelayStats right;
+    right.peak_pending_src_to_dst = 99;
+    right.peak_buffered_bytes = 333;
+    right.bytes_src_to_dst = 5;
+    left += right;
+    BENTO_CHECK_EQ(left.peak_pending_src_to_dst, 111U);
+    BENTO_CHECK_EQ(left.peak_buffered_bytes, 333U);
+    BENTO_CHECK_EQ(left.bytes_src_to_dst, 12U);
+}
+
+/// 场景 19：配置归一化。buffer=0 → 默认 64KB；read_chunk 超限 → 收敛到 buffer。
+void TestNormalizeBoundaries() {
+    std::printf("[CASE] option normalization\n");
+    {
+        const std::vector<std::uint8_t> payload = MakePattern(107, 256 * 1024);
+        ScriptedTransport src(payload);
+        ScriptedTransport dst;
+        RelayOptions options;
+        options.buffer_bytes = 0;
+        options.read_chunk_bytes = 1024 * 1024;
+        options.read_slice_ms = 0;
+        options.write_slice_ms = 0;
+        options.write_timeout_ms = 0;
+        options.idle_timeout_ms = 0;
+
+        Relay relay;
+        const RelayResult result = relay.Run(src, dst, options);
+        BENTO_CHECK(result.completed());
+        BENTO_CHECK(SameBytes(dst.received, payload));
+        BENTO_CHECK(result.stats.peak_pending_src_to_dst <= 64 * 1024);
+    }
+    {
+        const std::vector<std::uint8_t> payload = MakePattern(108, 8 * 1024);
+        ScriptedTransport src(payload);
+        ScriptedTransport dst;
+        dst.max_write_per_call = 64;
+        RelayOptions options;
+        options.buffer_bytes = 1024;
+        options.read_chunk_bytes = 0;
+        options.read_slice_ms = 0;
+        options.write_slice_ms = 0;
+        options.write_timeout_ms = 0;
+        options.idle_timeout_ms = 0;
+
+        Relay relay;
+        const RelayResult result = relay.Run(src, dst, options);
+        BENTO_CHECK(result.completed());
+        BENTO_CHECK(SameBytes(dst.received, payload));
+        BENTO_CHECK(result.stats.peak_pending_src_to_dst <= 1024);
+    }
+}
+
+/// 场景 20：持续流量必须复位 idle 计时器（空闲超时不能误杀活跃连接）。
+void TestIdleResetByTraffic() {
+    std::printf("[CASE] idle timer reset by traffic\n");
+    auto client_pair = MemoryTransport::CreatePair();
+    auto server_pair = MemoryTransport::CreatePair();
+
+    RelayOptions options;
+    options.buffer_bytes = 16 * 1024;
+    options.read_chunk_bytes = 4 * 1024;
+    options.read_slice_ms = 0;
+    options.write_slice_ms = 5;
+    options.poll_interval_ms = 1;
+    options.write_timeout_ms = 1000;
+    options.idle_timeout_ms = 200;
+
+    RelayResult result;
+    std::thread relay_thread([&] {
+        Relay relay;
+        result = relay.Run(*client_pair.second, *server_pair.first, options);
+    });
+
+    bool io_ok = true;
+    const std::vector<std::uint8_t> chunk = MakePattern(109, 1024);
+    std::vector<std::uint8_t> received(1024);
+    for (int i = 0; i < 10; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        if (client_pair.first->WriteFull(chunk.data(), chunk.size(), Ms(2000)).code != Code::kOk ||
+            server_pair.second->ReadFull(received.data(), received.size(), Ms(2000)).code !=
+                Code::kOk ||
+            !SameBytes(received, chunk)) {
+            io_ok = false;
+            break;
+        }
+    }
+    (void)client_pair.first->ShutdownWrite();
+    (void)server_pair.second->ShutdownWrite();
+    relay_thread.join();
+
+    BENTO_CHECK(io_ok);
+    BENTO_CHECK(result.completed());
+    BENTO_CHECK_EQ(result.stats.idle_timeouts, 0U);
+}
+
+/// 场景 21：ITransport 无关性——同一 Relay 在 MemoryTransport 上双向工作。
+void TestMemoryTransportBidirectional() {
+    std::printf("[CASE] memory transport bidirectional\n");
+    auto client_pair = MemoryTransport::CreatePair();
+    auto server_pair = MemoryTransport::CreatePair();
+    const std::vector<std::uint8_t> request = MakePattern(110, 8 * 1024);
+    const std::vector<std::uint8_t> response = MakePattern(111, 4 * 1024);
+
+    RelayOptions options;
+    options.buffer_bytes = 16 * 1024;
+    options.read_chunk_bytes = 4 * 1024;
+    options.read_slice_ms = 0;
+    options.write_slice_ms = 2;
+    options.poll_interval_ms = 1;
+    options.write_timeout_ms = 1000;
+    options.idle_timeout_ms = 3000;
+
+    RelayResult result;
+    std::thread relay_thread([&] {
+        Relay relay;
+        result = relay.Run(*client_pair.second, *server_pair.first, options);
+    });
+
+    BENTO_CHECK(WriteFull(*client_pair.first, request));
+    BENTO_CHECK(WriteFull(*server_pair.second, response));
+    std::vector<std::uint8_t> received(request.size());
+    BENTO_CHECK(ReadFull(*server_pair.second, &received));
+    BENTO_CHECK(SameBytes(received, request));
+    std::vector<std::uint8_t> returned(response.size());
+    BENTO_CHECK(ReadFull(*client_pair.first, &returned));
+    BENTO_CHECK(SameBytes(returned, response));
+
+    (void)client_pair.first->ShutdownWrite();
+    (void)server_pair.second->ShutdownWrite();
+    relay_thread.join();
+
+    BENTO_CHECK(result.completed());
+    BENTO_CHECK_EQ(result.stats.bytes_src_to_dst, request.size());
+    BENTO_CHECK_EQ(result.stats.bytes_dst_to_src, response.size());
+    BENTO_CHECK_EQ(result.stats.half_closes, 2U);
+}
+
+/// 场景 22：50 次 TCP relay 建立/关闭后 fd 必须回到基线。
+void TestFdLeakCycles() {
+    std::printf("[CASE] 50 tcp relay cycles do not leak fds\n");
+    if (!TcpLoopbackUsable()) {
+        bento_test::Skip("loopback TCP unavailable");
+        return;
+    }
+    const int fd_before = CurrentFdCount();
+    for (int i = 0; i < 50; ++i) {
+        TcpPair client_side;
+        TcpPair server_side;
+        if (!MakeTcpPair(&client_side) || !MakeTcpPair(&server_side)) {
+            BENTO_CHECK(false);
+            return;
+        }
+        RelayResult result;
+        std::thread relay_thread([&] {
+            Relay relay;
+            result = relay.Run(*client_side.acceptor, *server_side.dialer, MakeTcpOptions());
+        });
+        const std::vector<std::uint8_t> payload = MakePattern(static_cast<std::uint32_t>(i), 4096);
+        std::vector<std::uint8_t> received(4096);
+        BENTO_CHECK(client_side.dialer->WriteFull(payload.data(), payload.size(), Ms(5000)).code ==
+                    Code::kOk);
+        BENTO_CHECK(server_side.acceptor->ReadFull(received.data(), received.size(), Ms(5000))
+                        .code == Code::kOk);
+        BENTO_CHECK(SameBytes(received, payload));
+        (void)client_side.dialer->ShutdownWrite();
+        (void)server_side.acceptor->ShutdownWrite();
+        relay_thread.join();
+        BENTO_CHECK(result.completed());
+        (void)client_side.dialer->Close();
+        (void)server_side.acceptor->Close();
+    }
+    const int fd_after = CurrentFdCount();
+    if (fd_before >= 0 && fd_after >= 0) {
+        BENTO_CHECK_EQ(fd_after, fd_before);
+    }
+}
+
+/// 场景 23：真实 TCP 单向 4MB 压测。给出吞吐指标，验证大流量下不丢字节。
 void TestTcpThroughput() {
     std::printf("[CASE] tcp 4MB throughput\n");
+    if (!TcpLoopbackUsable()) {
+        bento_test::Skip("loopback TCP unavailable");
+        return;
+    }
     TcpPair client_side;
     TcpPair server_side;
     if (!MakeTcpPair(&client_side) || !MakeTcpPair(&server_side)) {
-        bento_test::Skip("loopback TCP unavailable");
+        BENTO_CHECK(false);
         return;
     }
 
@@ -744,6 +1136,16 @@ int main() {
     TestRandomChunkIntegrity();
     TestWriteError();
     TestTinyBuffer();
+    TestSlowButMoving();
+    TestFinAfterDrain();
+    TestReadError();
+    TestShutdownError();
+    TestWriteErrorKind();
+    TestStatsAccumulation();
+    TestNormalizeBoundaries();
+    TestIdleResetByTraffic();
+    TestMemoryTransportBidirectional();
+    TestFdLeakCycles();
     TestTcpThroughput();
     return bento_test::Finish("test_relay");
 }
