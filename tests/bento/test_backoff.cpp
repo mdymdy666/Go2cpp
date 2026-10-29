@@ -161,6 +161,71 @@ void TestPeekNominal() {
     BENTO_CHECK_EQ(backoff.Attempts(), 1U);
 }
 
+void TestUpperBoundReachable() {
+    // max 配成 uint32 上限时，指数序列必须真能退到上限：
+    // 内部左移若只到 31 位，会永久卡在 2^31（2147483648），配置的上限失效。
+    Backoff::Config config;
+    config.base_ms = 1;
+    config.max_ms = 0xFFFFFFFFu;
+    config.jitter_ratio = 0.0;
+    config.seed = 11;
+    Backoff backoff(config);
+    std::uint32_t highest = 0;
+    for (int i = 0; i < 40; ++i) {
+        const std::uint32_t delay = backoff.Next();
+        BENTO_CHECK(delay <= config.max_ms);
+        if (delay > highest) {
+            highest = delay;
+        }
+    }
+    BENTO_CHECK_EQ(highest, 0xFFFFFFFFu);
+    BENTO_CHECK_EQ(backoff.PeekNominalMs(), 0xFFFFFFFFu);
+}
+
+void TestCapJitterDistribution() {
+    // 到 30s 上限后抖动必须铺满 [24s, 30s]：若「对称抖动后截断」，
+    // 越界的一半样本会堆在 30000 上，多客户端同一时刻重连，抖动失效。
+    Backoff::Config config;
+    config.base_ms = 1000;
+    config.max_ms = 30000;
+    config.jitter_ratio = 0.2;
+    config.seed = 2024;
+    Backoff backoff(config);
+    for (int i = 0; i < 8; ++i) {
+        (void)backoff.Next();  // 推到上限
+    }
+    constexpr int kSamples = 20000;
+    std::array<std::uint64_t, 10> histogram{};
+    for (int i = 0; i < kSamples; ++i) {
+        const std::uint32_t delay = backoff.Next();
+        BENTO_CHECK(delay >= 24000);
+        BENTO_CHECK(delay <= 30000);
+        std::size_t bucket = static_cast<std::size_t>(delay - 24000) / 600;
+        if (bucket > 9) {
+            bucket = 9;
+        }
+        ++histogram[bucket];
+    }
+    for (std::size_t i = 0; i < histogram.size(); ++i) {
+        const double ratio = static_cast<double>(histogram[i]) / kSamples;
+        BENTO_CHECK(ratio > 0.06 && ratio < 0.14);
+    }
+}
+
+void TestFullJitterNeverZero() {
+    Backoff::Config config;
+    config.base_ms = 1000;
+    config.max_ms = 5000;
+    config.jitter_ratio = 1.0;
+    config.seed = 31;
+    Backoff backoff(config);
+    for (int i = 0; i < 2000; ++i) {
+        const std::uint32_t delay = backoff.Next();
+        BENTO_CHECK(delay >= 1);  // 抖动 100% 也不能退化成 0（忙循环）
+        BENTO_CHECK(delay <= config.max_ms);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -171,5 +236,8 @@ int main() {
     TestReset();
     TestConfigNormalization();
     TestPeekNominal();
+    TestUpperBoundReachable();
+    TestCapJitterDistribution();
+    TestFullJitterNeverZero();
     return bento_test::Finish("test_backoff");
 }

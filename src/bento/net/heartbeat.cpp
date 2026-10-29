@@ -51,7 +51,13 @@ bool Heartbeat::IsAlive(std::uint32_t timeout_ms) const noexcept {
     if (timeout_ms == 0) {
         return false;
     }
-    return Now() - m_last_activity_ms < timeout_ms;
+    const std::uint64_t now = Now();
+    // 注入的时钟可能回退（假时钟、系统时间被调整）。无符号减法会把回退
+    // 变成接近 2^64 的「已过时长」并把对端误判为死亡，这里把回退夹到 0：
+    // 宁可多等一个周期，也不因时钟异常误杀一条活连接。
+    const std::uint64_t elapsed =
+        now >= m_last_activity_ms ? now - m_last_activity_ms : 0;
+    return elapsed < timeout_ms;
 }
 
 void Heartbeat::OnReceiveAt(std::uint64_t now_ms) noexcept {
@@ -64,7 +70,9 @@ bool Heartbeat::Poll() noexcept {
         return false;
     }
     const std::uint64_t now = Now();
-    if (now - m_last_activity_ms >= m_timeout_ms) {
+    const std::uint64_t elapsed =
+        now >= m_last_activity_ms ? now - m_last_activity_ms : 0;
+    if (elapsed >= m_timeout_ms) {
         m_timeout_fired = true;
         ++m_timeouts_fired;
         // 先置状态再回调：回调里重复 Poll 或调用 OnReceive 都不会造成二次触发。
@@ -90,6 +98,8 @@ void Heartbeat::SetInterval(std::uint32_t interval_ms) noexcept {
 }
 
 void Heartbeat::SetTimeout(std::uint32_t timeout_ms) noexcept {
+    // 只改阈值，不撤销「已上报超时」：超时回调可能已经让调用方关掉了连接，
+    // 事后把阈值调大不能让那条连接复活；要复活必须显式 Start 或 OnReceive。
     m_timeout_ms = timeout_ms == 0 ? kDefaultTimeoutMs : timeout_ms;
 }
 

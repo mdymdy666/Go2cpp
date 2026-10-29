@@ -28,9 +28,11 @@ Backoff::Backoff(Config config)
       m_state(config.seed) {}
 
 std::uint32_t Backoff::NominalDelayMs(std::uint32_t attempts) const noexcept {
-    // attempts 最多取 31：base 是 uint32，左移 31 位后仍能放进 uint64，
-    // 更大的指数没有意义（结果早已被上限截断）。
-    const std::uint32_t shift = std::min(attempts, 31u);
+    // attempts 最多取 32：base 是 uint32，左移 32 位后仍在 uint64 内
+    // （0xFFFFFFFF << 32 < 2^64），再大的指数只会被上限截断。
+    // 只取到 31 会漏掉 (2^31, UINT32_MAX] 这段上限：max_ms 配成 UINT32_MAX 时
+    // 永远退不到配置的上限，属于可观测的参数失效。
+    const std::uint32_t shift = std::min(attempts, 32u);
     const std::uint64_t scaled = static_cast<std::uint64_t>(m_base_ms) << shift;
     const std::uint64_t capped = std::min<std::uint64_t>(scaled, m_max_ms);
     return static_cast<std::uint32_t>(capped);
@@ -54,16 +56,20 @@ std::uint32_t Backoff::Next() noexcept {
     if (m_jitter_ratio <= 0.0 || nominal <= 1) {
         return nominal;
     }
-    // 均匀抖动 symmetric：[-span, +span)。用 double 计算后再取整，
-    // 误差不超过 1ms，远小于调用方对退避精度的需求。
-    const double span = static_cast<double>(nominal) * m_jitter_ratio;
-    const double offset = (NextUnit() * 2.0 - 1.0) * span;
-    const double shifted = static_cast<double>(nominal) + offset;
+    // 先确定抖动区间 [lower, upper] 再在区间内均匀采样，upper 受 max 截断。
+    // 不用「nominal ± span 后再 min(…, max)」：那样一旦 nominal*(1+jitter) 越过
+    // max，越界部分会被硬压到 max 上——到 30s 上限时约一半样本堆在 30000，
+    // 多客户端会在同一时刻一起重连，抖动完全失去打散作用。
+    // 区间采样保证 [max*(1-jitter), max] 均匀，随机数消耗仍是每次 1 个。
+    const double nominal_d = static_cast<double>(nominal);
+    const double lower = nominal_d * (1.0 - m_jitter_ratio);
+    const double upper =
+        std::min(nominal_d * (1.0 + m_jitter_ratio), static_cast<double>(m_max_ms));
+    const double shifted = lower + NextUnit() * (upper - lower);
     if (shifted <= 1.0) {
         return 1;
     }
-    const double capped = std::min(shifted, static_cast<double>(m_max_ms));
-    return static_cast<std::uint32_t>(capped + 0.5);
+    return static_cast<std::uint32_t>(shifted + 0.5);
 }
 
 void Backoff::Reset() noexcept {

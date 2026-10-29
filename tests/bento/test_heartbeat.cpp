@@ -97,6 +97,28 @@ void TestTimeoutFiresOnce() {
     BENTO_CHECK_EQ(heartbeat.TimeoutsFired(), 2U);
 }
 
+void TestSetOnTimeoutReplacesHandler() {
+    FakeClock clock{0};
+    int first = 0;
+    int second = 0;
+    Heartbeat heartbeat(60000, 1000, [&clock]() { return clock.now; },
+                        [&first] { ++first; });
+    heartbeat.SetOnTimeout([&second] { ++second; });  // 覆盖构造时传入的回调
+    heartbeat.Start();
+    clock.now = 1000;
+    BENTO_CHECK(!heartbeat.Poll());
+    BENTO_CHECK_EQ(first, 0);
+    BENTO_CHECK_EQ(second, 1);
+
+    // 置空回调后不再有任何副作用，但超时状态仍然生效。
+    heartbeat.SetOnTimeout(nullptr);
+    heartbeat.OnReceiveAt(clock.now);
+    clock.now = 2000;
+    BENTO_CHECK(!heartbeat.Poll());
+    BENTO_CHECK(heartbeat.IsTimedOut());
+    BENTO_CHECK_EQ(second, 1);
+}
+
 void TestStop() {
     FakeClock clock{0};
     int fired = 0;
@@ -141,6 +163,60 @@ void TestIsAliveBoundaries() {
     heartbeat.OnReceiveAt(clock.now);
     BENTO_CHECK(heartbeat.IsAlive(90));
     BENTO_CHECK_EQ(heartbeat.LastActivityMs(), 10090U);
+}
+
+void TestTimedOutIsAliveConsistency() {
+    FakeClock clock{0};
+    std::uint64_t fired = 0;
+    Heartbeat heartbeat(60000, 3000, [&clock]() { return clock.now; },
+                        [&fired] { ++fired; });
+    heartbeat.Start();
+    clock.now = 3000;
+    BENTO_CHECK(!heartbeat.Poll());
+    BENTO_CHECK(heartbeat.IsTimedOut());
+    BENTO_CHECK(!heartbeat.IsAlive());
+
+    // 超时后把阈值调大：纯时间窗看起来「还活着」，但无参 IsAlive 不能
+    // 与已上报的超时自相矛盾（否则调用方会同时看到「判死」和「存活」）。
+    heartbeat.SetTimeout(300000);
+    BENTO_CHECK(heartbeat.IsTimedOut());
+    BENTO_CHECK(!heartbeat.IsAlive());
+    BENTO_CHECK(heartbeat.IsAlive(300000));  // 带参版本仍是纯时间窗查询
+
+    heartbeat.OnReceiveAt(clock.now);  // 恢复活动后才重新判活
+    BENTO_CHECK(!heartbeat.IsTimedOut());
+    BENTO_CHECK(heartbeat.IsAlive());
+    BENTO_CHECK_EQ(fired, 1U);
+}
+
+void TestClockRollback() {
+    FakeClock clock{10000};
+    std::uint64_t fired = 0;
+    Heartbeat heartbeat(1000, 3000, [&clock]() { return clock.now; },
+                        [&fired] { ++fired; });
+    heartbeat.Start(1000);
+
+    clock.now = 5000;  // 时钟回退 5s：无符号减法会下溢成天文数字
+    BENTO_CHECK(heartbeat.IsAlive());
+    BENTO_CHECK(!heartbeat.Poll());
+    BENTO_CHECK_EQ(fired, 0U);
+    BENTO_CHECK(!heartbeat.IsTimedOut());
+
+    clock.now = 12000;  // 回到正常时间：距最后活动 2000ms < 3000ms
+    BENTO_CHECK(heartbeat.IsAlive());
+    BENTO_CHECK(heartbeat.Poll());  // 且已过心跳到期点 11000
+    BENTO_CHECK_EQ(heartbeat.Beats(), 1U);
+}
+
+void TestSetIntervalBeforeStart() {
+    FakeClock clock{0};
+    Heartbeat heartbeat(1000, 90000, [&clock]() { return clock.now; });
+    BENTO_CHECK_EQ(heartbeat.NextBeatMs(), 1000U);
+    heartbeat.SetInterval(5000);  // 未运行：只改配置，不动到期点
+    BENTO_CHECK_EQ(heartbeat.IntervalMs(), 5000U);
+    BENTO_CHECK_EQ(heartbeat.NextBeatMs(), 1000U);
+    heartbeat.Start();  // Start 按新间隔重排
+    BENTO_CHECK_EQ(heartbeat.NextBeatMs(), 5000U);
 }
 
 void TestRestartAndRuntimeConfig() {
@@ -193,8 +269,12 @@ int main() {
     TestDefaultsAndMonotonicClock();
     TestHeartbeatCadence();
     TestTimeoutFiresOnce();
+    TestSetOnTimeoutReplacesHandler();
     TestStop();
     TestIsAliveBoundaries();
+    TestTimedOutIsAliveConsistency();
+    TestClockRollback();
+    TestSetIntervalBeforeStart();
     TestRestartAndRuntimeConfig();
     TestRealClockSmoke();
     return bento_test::Finish("test_heartbeat");

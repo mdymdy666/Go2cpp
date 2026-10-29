@@ -42,6 +42,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <utility>
 
 namespace go2cpp::bento {
 
@@ -113,11 +114,19 @@ class Heartbeat {
      * @return 距最后一次活动 < timeout_ms。
      *
      * @note 只看时间窗，与 IsRunning 无关；这样状态机可以在 Stop 之前先判活。
+     *       注入时钟回退时按「刚有活动」处理（elapsed 夹到 0），不误杀连接。
      */
     bool IsAlive(std::uint32_t timeout_ms) const noexcept;
 
-    /// 用当前配置的 timeout 判活。
-    bool IsAlive() const noexcept { return IsAlive(m_timeout_ms); }
+    /**
+     * @brief 用当前配置的 timeout 判活。
+     *
+     * @details 比带参版本更严格：`Poll()` 上报过超时之后，在 `OnReceive` /
+     *          `Start` 清除该状态之前恒为 false。否则「已判死」与「还活着」
+     *          会同时成立——例如超时后把 `SetTimeout` 调大，无符号时间窗
+     *          已经满足存活条件，但连接其实已经被上报判死了。
+     */
+    bool IsAlive() const noexcept { return !m_timeout_fired && IsAlive(m_timeout_ms); }
 
     /// 记录「刚收到对端一次活动」（任意消息，不限于心跳）。
     void OnReceive() noexcept { OnReceiveAt(Now()); }
@@ -139,16 +148,22 @@ class Heartbeat {
      *          后续 Poll 返回 false（连接已该死，再发心跳没有意义），直到
      *          `OnReceive` 或 `Start` 清除该状态。同一时刻只产生一次心跳，
      *          即使时钟大步跳过多个周期也不补发（心跳只为刷新存活）。
+     *
+     * @warning 本函数是 noexcept。`TimeoutHandler` 若抛异常会直接
+     *          `std::terminate`：回调里只做置标志、关连接这类不抛动作，
+     *          复杂逻辑交给外层状态机。
      */
     bool Poll() noexcept;
 
     /// 设置超时回调（覆盖旧值）。
     void SetOnTimeout(TimeoutHandler handler) { m_on_timeout = std::move(handler); }
 
-    /// 设置心跳间隔；0 表示恢复默认 30s。运行中调整会立即重新排下一次心跳。
+    /// 设置心跳间隔；0 表示恢复默认 30s。运行中调整会立即从当前时刻重排下一次
+    /// 心跳；未运行时只改配置，由下一次 `Start` 重排。
     void SetInterval(std::uint32_t interval_ms) noexcept;
 
-    /// 设置超时阈值；0 表示恢复默认 90s。
+    /// 设置超时阈值；0 表示恢复默认 90s。调大**不会**撤销已经上报的超时状态：
+    /// 连接是否复活由 `OnReceive` / `Start` 决定，避免「回调已关连接却又判活」。
     void SetTimeout(std::uint32_t timeout_ms) noexcept;
 
     /// 下一次应发心跳的单调时刻（毫秒）。
