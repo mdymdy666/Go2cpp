@@ -22,6 +22,12 @@
  *            的 key 数 × 每 key 4 个 client」，操作 O(log n)，单锁足以覆盖
  *            16 线程并发注册且不会出现锁顺序问题；将来若做多 Host 聚合，
  *            可在外层按 key 分片而不改本类接口。
+ *          - **过期索引**：维护 `(deadline, key)` 有序集合，写路径只处理
+ *            「deadline <= now」的队头，而不是每次写操作扫全表。没有这条
+ *            索引时 `Touch` 在 1024 key 的表上要遍历整表（实测
+ *            3625 ns/op）；加入索引后约 200 ns/op（见
+ *            `example/WarningDocement/audit-session-table.md`）。`lease_ms == 0`
+ *            （永不过期）不建索引、不做任何过期扫描。
  *
  *          租约语义（`lease_ms == 0` 表示永不过期，仅测试/嵌入式建议）：
  *          - `AddServer` / `AddClient` / `RemoveClient` / `Touch` 把条目的
@@ -50,7 +56,9 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "go2cpp/bento/net/protocol.hpp"
@@ -195,14 +203,28 @@ class SessionTable final {
     const SessionTableConfig& config() const noexcept { return m_config; }
 
    private:
-    /// 刷新条目的租约（lease_ms == 0 时保持 0）。
-    void RefreshLeaseLocked(SessionEntry& entry, std::uint64_t now_ms) const;
+    using EntryMap = std::map<std::string, SessionEntry>;
+    /// (lease_deadline_ms, key) 有序索引。用 std::set 而不是 multimap：
+    /// pair 的 operator< 天然给出「deadline 最小优先」的顺序，且 erase(pair)
+    /// 能精确删除同一 deadline 下的指定 key（multimap::erase(key) 会误删
+    /// 同 deadline 的其他条目）。
+    using ExpiryIndex = std::set<std::pair<std::uint64_t, std::string>>;
+
+    /// 刷新条目的租约（lease_ms == 0 时保持 0）并同步过期索引。
+    /// 调用方必须已持锁。
+    void RefreshLeaseLocked(SessionEntry& entry, std::uint64_t now_ms);
+    /// 删除条目并同步移除其过期索引项；调用方必须已持锁。
+    void EraseEntryLocked(EntryMap::iterator entry);
     /// 调用方必须已持锁；删除所有过期条目并返回数量。
+    /// 只处理索引中 deadline <= now_ms 的队头，O(k log n)（k = 过期条目数）；
+    /// 没有到期条目时是 O(1)，这是写路径从 O(n) 降到 O(log n) 的关键。
     std::size_t RemoveExpiredLocked(std::uint64_t now_ms);
 
     SessionTableConfig m_config;
     mutable std::mutex m_mutex;
-    std::map<std::string, SessionEntry> m_entries;
+    EntryMap m_entries;
+    /// 过期索引；lease_ms == 0（永不过期）时始终为空。
+    ExpiryIndex m_expiries;
     SessionTableStats m_stats;
 };
 

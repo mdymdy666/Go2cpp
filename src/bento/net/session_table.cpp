@@ -9,9 +9,21 @@
 #include "go2cpp/bento/net/session_table.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace go2cpp::bento {
+
+namespace {
+
+/// 饱和加法：`now + lease_ms` 在 now 接近 UINT64_MAX 时不能回绕成小值，
+/// 否则租约会在“未来”变成过去，条目被误判为立即过期。
+std::uint64_t SaturatingAddMs(std::uint64_t now_ms, std::uint64_t lease_ms) noexcept {
+    const std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
+    return now_ms > max - lease_ms ? max : now_ms + lease_ms;
+}
+
+}  // namespace
 
 const char* SessionStatusName(SessionStatus status) noexcept {
     switch (status) {
@@ -51,22 +63,48 @@ SessionTable::SessionTable(SessionTableConfig config) : m_config(config) {
     }
 }
 
-void SessionTable::RefreshLeaseLocked(SessionEntry& entry, std::uint64_t now_ms) const {
-    entry.lease_deadline_ms = m_config.lease_ms == 0 ? 0 : now_ms + m_config.lease_ms;
+void SessionTable::RefreshLeaseLocked(SessionEntry& entry, std::uint64_t now_ms) {
+    if (m_config.lease_ms == 0) {
+        // 永不过期：不建索引，deadline 固定 0。
+        entry.lease_deadline_ms = 0;
+        return;
+    }
+    // 先摘掉旧索引项再写新 deadline，避免索引里残留旧值导致提前删除。
+    if (entry.lease_deadline_ms != 0) {
+        m_expiries.erase({entry.lease_deadline_ms, entry.key});
+    }
+    entry.lease_deadline_ms = SaturatingAddMs(now_ms, m_config.lease_ms);
+    m_expiries.emplace(entry.lease_deadline_ms, entry.key);
 }
 
 std::size_t SessionTable::RemoveExpiredLocked(std::uint64_t now_ms) {
     std::size_t removed = 0;
-    for (auto it = m_entries.begin(); it != m_entries.end();) {
-        if (it->second.IsExpired(now_ms)) {
-            it = m_entries.erase(it);
-            ++removed;
-            ++m_stats.expirations;
-        } else {
-            ++it;
+    // 索引按 deadline 升序；队头未到期就不可能有其他条目到期，直接返回。
+    while (!m_expiries.empty()) {
+        const auto expiry = m_expiries.begin();
+        if (expiry->first > now_ms) {  // IsExpired 的判定是 now_ms >= deadline
+            break;
         }
+        const std::uint64_t deadline = expiry->first;
+        const std::string key = expiry->second;  // erase 后引用失效，先拷出
+        const auto entry = m_entries.find(key);
+        // 防御陈旧索引项：条目可能已被显式删除。即便条目仍在，也要确认
+        // 它的 deadline 与索引项一致，避免误删刚被续期的条目。
+        if (entry != m_entries.end() && entry->second.lease_deadline_ms == deadline) {
+            m_entries.erase(entry);
+            ++m_stats.expirations;
+            ++removed;
+        }
+        m_expiries.erase(expiry);
     }
     return removed;
+}
+
+void SessionTable::EraseEntryLocked(EntryMap::iterator entry) {
+    if (entry->second.lease_deadline_ms != 0) {
+        m_expiries.erase({entry->second.lease_deadline_ms, entry->first});
+    }
+    m_entries.erase(entry);
 }
 
 SessionStatus SessionTable::AddServer(const std::string& key, std::uint64_t server_id,
@@ -77,7 +115,9 @@ SessionStatus SessionTable::AddServer(const std::string& key, std::uint64_t serv
 
     std::lock_guard<std::mutex> lock(m_mutex);
     RemoveExpiredLocked(now_ms);
-    if (m_entries.find(key) != m_entries.end()) {
+    // lower_bound 一次定位：既判重复，又作为插入 hint 省掉第二次树查找。
+    const auto position = m_entries.lower_bound(key);
+    if (position != m_entries.end() && position->first == key) {
         ++m_stats.duplicate_rejects;
         return SessionStatus::kAlreadyExists;
     }
@@ -91,7 +131,7 @@ SessionStatus SessionTable::AddServer(const std::string& key, std::uint64_t serv
     entry.server_id = server_id;
     entry.created_ms = now_ms;
     RefreshLeaseLocked(entry, now_ms);
-    m_entries.emplace(key, std::move(entry));
+    m_entries.emplace_hint(position, key, std::move(entry));
     ++m_stats.servers_added;
     return SessionStatus::kOk;
 }
@@ -139,7 +179,7 @@ bool SessionTable::Remove(const std::string& key, std::uint64_t now_ms) {
         ++m_stats.not_found;
         return false;
     }
-    m_entries.erase(it);
+    EraseEntryLocked(it);
     ++m_stats.removals;
     return true;
 }
@@ -185,7 +225,7 @@ SessionStatus SessionTable::RemoveServer(const std::string& key, std::uint64_t s
         ++m_stats.not_found;
         return SessionStatus::kNotFound;
     }
-    m_entries.erase(it);
+    EraseEntryLocked(it);
     ++m_stats.removals;
     return SessionStatus::kOk;
 }
