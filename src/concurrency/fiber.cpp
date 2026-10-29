@@ -55,8 +55,9 @@
 #endif
 
 #include <algorithm>
-#include <unordered_map>
 #include <atomic>
+#include <chrono>
+#include <unordered_map>
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
@@ -160,6 +161,10 @@ struct GrowableStackTlsRestore final {
 #endif
 
 std::atomic<std::uint64_t> s_next_fiber_id{1};
+
+// 析构等待 resume 权超时的累计次数（FIBER-02 诊断 API 的数据源）。
+// 正常路径第一次 CAS 就成功，不会触碰该计数。
+std::atomic<std::uint64_t> s_destroy_claim_timeouts{0};
 
 // 受保护栈的映射/解除映射成本远高于一次 Fiber 上下文切换。栈不能在
 // Fiber 仍可恢复时复用，因此只在 Fiber 完成、且其 fcontext 已经失效后
@@ -959,7 +964,9 @@ struct FiberRecord {
 #endif
     }
 
-    const std::uint64_t id;
+    // 原地复用：reset_for_scheduler() 更新 id 而不是替换 record 对象，
+    // 因此这里不能是 const；所有并发读点都在 mutex 内（或持有 resume 权）。
+    std::uint64_t id;
     std::shared_ptr<FiberRecord> parent;
     std::atomic<bool> alive{true};
     std::atomic<FiberState> state{FiberState::Ready};
@@ -976,6 +983,10 @@ struct FiberRecord {
     std::uintptr_t stack_low{0};
     std::uintptr_t stack_high{0};
     bool stack_known{false};
+    /// 构造/reset 时发布的栈请求参数。debug_stack 在 record->mutex 内
+    /// 读取它们，避免并发读 Impl 的非原子字段（FIBER-01）。
+    std::size_t requested_stack_bytes{0};
+    std::size_t reserve_stack_bytes{0};
 };
 
 /// 任务函数名：优先 GO2CPP_FIBER_NAME 的显式名字，其次 typeid 的
@@ -1071,8 +1082,11 @@ void EraseFiberDebugMeta(std::uint64_t fiber_id) noexcept {
 /// 读取 record 元数据并发布（record 由父链共享，墓碑也可读）。
 void PublishFiberDebugMeta(FiberRecord& record) {
     FiberDebugMeta meta;
+    std::uint64_t fiber_id = 0;
     {
         std::lock_guard<std::mutex> lock(record.mutex);
+        // id 会被 reset_for_scheduler() 原地更新，必须在同一把锁内取快照。
+        fiber_id = record.id;
         meta.function = record.function_name;
         meta.stack_low = record.stack_low;
         meta.stack_high = record.stack_high;
@@ -1080,7 +1094,7 @@ void PublishFiberDebugMeta(FiberRecord& record) {
     }
     std::lock_guard<std::mutex> lock(FiberMetaMutex());
     FiberMetaTable& table = FiberMetaTableRef();
-    const auto found = table.entries.find(record.id);
+    const auto found = table.entries.find(fiber_id);
     if (found != table.entries.end()) {
         found->second = std::move(meta);
         return;
@@ -1096,13 +1110,13 @@ void PublishFiberDebugMeta(FiberRecord& record) {
             table.entries.erase(victim);
         }
     }
-    const auto inserted = table.entries.emplace(record.id, std::move(meta));
+    const auto inserted = table.entries.emplace(fiber_id, std::move(meta));
     if (!inserted.second) {
         return;
     }
-    table.order.push_back(record.id);
+    table.order.push_back(fiber_id);
     try {
-        table.order_pos.emplace(record.id, std::prev(table.order.end()));
+        table.order_pos.emplace(fiber_id, std::prev(table.order.end()));
     } catch (...) {
         // 位置索引只是兜底淘汰的优化；失败时该条目仍由 ~FiberRecord
         // 删除，不会永久驻留。
@@ -1122,6 +1136,10 @@ struct Fiber::Impl {
           m_stack_size(normalize_stack_size(stack_size)),
           m_stack_reserve_size(stack_reserve_size),
           m_stack_growable(stack_growable) {
+        // 构造期还没有并发观察者；直接发布栈请求参数。debug_stack 以后
+        // 只从 record 读这两个值，不再碰 Impl 的非原子字段（FIBER-01）。
+        m_record->requested_stack_bytes = m_stack_size;
+        m_record->reserve_stack_bytes = m_stack_reserve_size;
 #if defined(GO2CPP_FIBER_TSAN)
         m_tsan_fiber = __tsan_create_fiber(0);
 #endif
@@ -1144,8 +1162,8 @@ struct Fiber::Impl {
         }
 
         const auto normalized_stack_size = normalize_stack_size(stack_size);
-        auto next_record = std::make_shared<FiberRecord>(
-            s_next_fiber_id.fetch_add(1, std::memory_order_relaxed));
+        const auto next_id =
+            s_next_fiber_id.fetch_add(1, std::memory_order_relaxed);
 
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
         // 旧 fiber id 不再对应任何可观测执行流；立即删除，而不是等
@@ -1153,11 +1171,35 @@ struct Fiber::Impl {
         EraseFiberDebugMeta(m_record->id);
 #endif
         m_function = std::move(function);
-        m_id = next_record->id;
-        m_record = std::move(next_record);
+        m_id = next_id;
+        {
+            // 原地重置同一个 FiberRecord（FIBER-03）：不再替换 shared_ptr。
+            // 所有外部观察者持有的 record 指针因此始终有效，读 m_record
+            // 与重置之间不存在指针竞争。调用方（RecycleForScheduler）已
+            // 保证 use_count()==1，重置不会覆盖别的 Fiber 的父链墓碑。
+            std::lock_guard<std::mutex> lock(m_record->mutex);
+            m_record->id = next_id;
+            m_record->parent.reset();
+            m_record->alive.store(true, std::memory_order_release);
+            m_record->state.store(FiberState::Ready,
+                                  std::memory_order_release);
+            m_record->reason.store(SuspendReason::None,
+                                   std::memory_order_release);
+            m_record->cancellation_requested.store(false,
+                                                   std::memory_order_release);
+            m_record->active_parent_id = 0;
+            m_record->depth = 0;
+            m_record->last_thread = {};
+            m_record->execution = {};
+            m_record->requested_stack_bytes = normalized_stack_size;
+            m_record->reserve_stack_bytes = stack_reserve_size;
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-        m_record->function_name = DescribeFiberFunction(m_function);
+            m_record->function_name = DescribeFiberFunction(m_function);
+            m_record->stack_low = 0;
+            m_record->stack_high = 0;
+            m_record->stack_known = false;
 #endif
+        }
         m_stack_size = normalized_stack_size;
         m_stack_reserve_size = stack_reserve_size;
         m_stack_growable = stack_growable;
@@ -1229,23 +1271,102 @@ struct Fiber::Impl {
 #endif
     }
 
+    // 析构等待 resume 权的预算。正常路径第一次 CAS 就成功（另一个线程
+    // 只在 resume() 期间短暂持有 claim），因此热路径零额外开销；只有
+    // 「另一个线程仍在 resume 时析构」这种契约违例才会进入退避循环。
+    static constexpr std::size_t kDestroyClaimSpins = 64;
+    static constexpr std::chrono::microseconds kDestroyClaimBackoffMin{20};
+    static constexpr std::chrono::microseconds kDestroyClaimBackoffMax{2000};
+    static constexpr std::chrono::microseconds kDestroyClaimBudget{200000};
+
+    /// 有界取得 resume 权（FIBER-02）。成功返回 true 且 m_resume_claim
+    /// 已置 true；超时返回 false 且不修改任何字段。
+    /// @note 先做固定次数的 yield（覆盖「resume 正在收尾」的常见窗口），
+    ///       再用指数退避 sleep，总预算 kDestroyClaimBudget，避免烧核。
+    bool try_claim_for_destroy() noexcept {
+        bool expected = false;
+        if (m_resume_claim.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
+        const auto deadline =
+            std::chrono::steady_clock::now() + kDestroyClaimBudget;
+        auto backoff = kDestroyClaimBackoffMin;
+        for (std::size_t spin = 0;; ++spin) {
+            if (spin < kDestroyClaimSpins) {
+                std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(backoff);
+                backoff = std::min(backoff * 2, kDestroyClaimBackoffMax);
+            }
+            expected = false;
+            if (m_resume_claim.compare_exchange_weak(
+                    expected, true, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+        }
+    }
+
+    /// 超时灾难路径：另一个线程仍持有 resume 权，绝不能销毁 Impl。
+    /// 只写原子墓碑；Running 时主体仍在执行（闭包与栈都在使用中），
+    /// 不做任何上下文清理，等它自然结束。非 Running 时尽力放弃上下文。
+    void on_destroy_timeout() noexcept {
+        m_record->alive.store(false, std::memory_order_release);
+        m_record->cancellation_requested.store(true,
+                                               std::memory_order_release);
+        if (m_record->state.load(std::memory_order_acquire) ==
+            FiberState::Running) {
+            return;
+        }
+        abandon_suspended(
+            "Fiber destroyed while another thread held the resume claim");
+    }
+
+    /// 把 Impl 移入进程级隔离区：进程退出前不析构，避免仍持有 resume 权
+    /// 的线程随后访问已释放对象。只在超时灾难路径调用，不进入热路径。
+    static void quarantine(std::unique_ptr<Impl> impl) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(QuarantineMutex());
+            QuarantineList().push_back(std::move(impl));
+        } catch (...) {
+            // 隔离区分配失败时只能泄漏；析构路径不允许抛异常。
+            (void)impl.release();
+        }
+    }
+
+    static std::mutex& QuarantineMutex() noexcept {
+        static std::mutex* mutex = new std::mutex();
+        return *mutex;
+    }
+
+    static std::vector<std::unique_ptr<Impl>>& QuarantineList() {
+        static auto* list = new std::vector<std::unique_ptr<Impl>>();
+        return *list;
+    }
+
     ~Impl() noexcept {
+        // 析构只允许在 ~Fiber 已经（有界地）取得 resume 权后进入。
+        // 若此时没有 claim，说明另一个线程正在 resume 并使用上下文，
+        // 继续析构就是 UAF；fail-fast 比静默破坏更安全。
+        if (!m_resume_claim.load(std::memory_order_acquire)) {
+            std::terminate();
+        }
+
         // 不能在 Fiber 自身栈上销毁自身；此约束保留为明确的 API 前置条件，
         // 否则没有任何安全位置可以释放当前正在使用的栈。
         if (s_current_fiber == m_owner) {
             std::terminate();
         }
 
-        // 先取得执行 claim，再观察终态。entry() 会先发布 Completed/Failed，
-        // 后由 resume() 释放 claim；若只检查 state，析构可能在这个窗口释放
-        // fcontext/保护栈，导致 resume_locked() 继续访问已释放对象。
-        bool expected_claim = false;
-        while (!m_resume_claim.compare_exchange_weak(
-            expected_claim, true, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
-            expected_claim = false;
-            std::this_thread::yield();
-        }
+        // claim 已由 ~Fiber 有界取得（FIBER-02），可以直接观察终态。
+        // entry() 会先发布 Completed/Failed，后由 resume() 释放 claim；
+        // 若只检查 state，析构可能在这个窗口释放 fcontext/保护栈，导致
+        // resume_locked() 继续访问已释放对象。
 
         // 先发布墓碑，再请求协作式收尾。父链记录不会悬空；析构线程
         // 只有在能够回到原父 Fiber 的情况下才允许恢复挂起栈。
@@ -1870,7 +1991,33 @@ void Fiber::RecycleForScheduler(std::unique_ptr<Fiber> fiber,
     }
 }
 
-Fiber::~Fiber() = default;
+Fiber::~Fiber() {
+    if (!m_impl) {
+        return;
+    }
+    // 不能在 Fiber 自身栈上销毁自身；此约束保留为明确的 API 前置条件。
+    if (s_current_fiber == m_impl->m_owner) {
+        std::terminate();
+    }
+    if (m_impl->try_claim_for_destroy()) {
+        // 已独占 resume 权：~Impl 直接收尾，不再等待。
+        // 注意不能先 m_impl.reset()：~Impl 可能恢复挂起的 Fiber 执行流，
+        // 它在自己的栈上通过 Current()->m_impl 回读本对象（例如
+        // CancellationRequested）。析构期间 m_impl 必须仍指向有效 Impl，
+        // 因此先 delete、再 release 避免 unique_ptr 二次删除。
+        Impl* const impl = m_impl.get();
+        delete impl;
+        (void)m_impl.release();
+        return;
+    }
+    // 另一个线程在整个预算内都没有释放 resume 权（违反「owner 必须长于
+    // 所有 resume()」契约）。继续自旋会烧满一个核，继续析构会让那个线程
+    // 随后访问已释放内存。这里放弃所有权：写原子墓碑、把 Impl 移入
+    // 进程级隔离区，并递增 DestroyTimeoutCount()（FIBER-02）。
+    s_destroy_claim_timeouts.fetch_add(1, std::memory_order_relaxed);
+    m_impl->on_destroy_timeout();
+    Impl::quarantine(std::move(m_impl));
+}
 
 bool Fiber::resume() noexcept { return m_impl->resume(); }
 
@@ -1963,6 +2110,10 @@ std::size_t Fiber::stack_size() const noexcept { return m_impl->m_stack_size; }
 
 std::uint64_t Fiber::id() const noexcept { return m_impl->m_id; }
 
+std::uint64_t Fiber::DestroyTimeoutCount() noexcept {
+    return s_destroy_claim_timeouts.load(std::memory_order_relaxed);
+}
+
 FiberContextFrame Fiber::debug_info() const {
     FiberContextFrame frame;
     const auto record = m_impl->m_record;
@@ -1986,7 +2137,9 @@ FiberContextSnapshot Fiber::context_snapshot() const {
     FiberContextSnapshot result;
     std::shared_ptr<FiberRecord> cursor = m_impl->m_record;
     FiberExecutionBinding root_binding{};
-    const auto current_id = m_impl->m_record->id;
+    // record 不再被替换（FIBER-03），指针比较即可识别「本 Fiber 的记录」，
+    // 无需在锁外读会被 reset 更新的 id。
+    const FiberRecord* const self_record = m_impl->m_record.get();
     while (cursor != nullptr) {
         FiberContextFrame frame;
         std::shared_ptr<FiberRecord> parent;
@@ -1997,7 +2150,7 @@ FiberContextSnapshot Fiber::context_snapshot() const {
             frame.active_parent_id = cursor->active_parent_id;
             frame.depth = cursor->depth;
             frame.alive = cursor->alive.load(std::memory_order_acquire);
-            frame.active = cursor->id == current_id && Current() == this;
+            frame.active = cursor.get() == self_record && Current() == this;
             frame.cancellation_requested =
                 cursor->cancellation_requested.load(std::memory_order_acquire);
             frame.state = cursor->state.load(std::memory_order_acquire);
@@ -2040,19 +2193,24 @@ void Fiber::bind_execution(FiberExecutionBinding binding) noexcept {
 FiberStackDebugSnapshot Fiber::debug_stack() const {
     FiberStackDebugSnapshot snapshot;
     const auto record = m_impl->m_record;
-    snapshot.id = record->id;
     {
         std::lock_guard<std::mutex> lock(record->mutex);
+        snapshot.id = record->id;
         snapshot.state = record->state.load(std::memory_order_acquire);
         snapshot.suspend_reason = record->reason.load(std::memory_order_acquire);
         snapshot.parent_id = record->parent == nullptr ? 0 : record->parent->id;
         snapshot.active_parent_id = record->active_parent_id;
         snapshot.nesting_depth = record->depth;
+        // 栈请求参数在 record 里复制过，锁内读取不需要碰 Impl。
+        snapshot.requested_bytes = record->requested_stack_bytes;
+        snapshot.reserve_bytes = record->reserve_stack_bytes;
     }
-    snapshot.requested_bytes = m_impl->m_stack_size;
-    snapshot.reserve_bytes = m_impl->m_stack_reserve_size;
-    // m_stack 在终态 reset 后为空；并发 reset 与读取之间可能出现过渡值，
-    // 因此本函数刻意不把「读到空」当成错误，只是如实标注 has_stack。
+    // 只有执行本 Fiber 的线程能保证栈在其脚下存活：完成路径（resume_locked）
+    // 会在切回调用者后 reset m_stack，另一个线程先取裸指针再解引用就是
+    // use-after-free（FIBER-01）。因此非当前 Fiber 一律不读栈字段。
+    if (Current() != this) {
+        return snapshot;
+    }
     FiberStack* stack = m_impl->m_stack.get();
     if (stack != nullptr) {
         snapshot.has_stack = true;

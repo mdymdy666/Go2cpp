@@ -438,4 +438,131 @@ void run_fiber_tests() {
     GO2CPP_CHECK(short_lived_fiber.resume());
     GO2CPP_CHECK(short_lived_fiber.state() == FiberState::Completed);
     GO2CPP_CHECK(short_lived_destroyed.load(std::memory_order_acquire) == 1);
+
+    // ------------------------------------------------------------------
+    // FIBER-01/02/03 回归：诊断接口与生命周期并发
+    // ------------------------------------------------------------------
+
+    // FIBER-01：诊断线程并发读 debug_stack，主线程让 Fiber 完成（完成路径
+    // 会 reset m_stack）。修复后非当前 Fiber 只复制 FiberRecord 元数据，
+    // 必须返回 has_stack=false 且绝不崩溃。
+    {
+        std::vector<std::unique_ptr<Fiber>> race_fibers;
+        race_fibers.reserve(16);
+        for (int index = 0; index < 16; ++index) {
+            race_fibers.push_back(std::make_unique<Fiber>(
+                [] { GO2CPP_CHECK(Fiber::Suspend(SuspendReason::Yield)); }));
+            GO2CPP_CHECK(race_fibers.back()->resume());
+        }
+        std::atomic<bool> reader_started{false};
+        std::atomic<bool> reader_stop{false};
+        std::atomic<bool> saw_stack_fields{false};
+        std::atomic<std::uint64_t> snapshot_count{0};
+        std::thread reader([&] {
+            reader_started.store(true, std::memory_order_release);
+            while (!reader_stop.load(std::memory_order_acquire)) {
+                for (auto& fiber : race_fibers) {
+                    const auto snapshot = fiber->debug_stack();
+                    if (snapshot.has_stack || snapshot.mapping_base != 0 ||
+                        snapshot.mapping_top != 0 ||
+                        snapshot.committed_begin != 0 ||
+                        snapshot.current_sp != 0) {
+                        saw_stack_fields.store(true,
+                                               std::memory_order_release);
+                    }
+                    snapshot_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+        GO2CPP_REQUIRE_EVENTUALLY(
+            reader_started.load(std::memory_order_acquire), 2s);
+        for (auto& fiber : race_fibers) {
+            GO2CPP_CHECK(fiber->resume());
+            GO2CPP_CHECK(fiber->state() == FiberState::Completed);
+        }
+        std::this_thread::sleep_for(10ms);
+        reader_stop.store(true, std::memory_order_release);
+        GO2CPP_JOIN_WITH_WATCHDOG(reader, 5s);
+        GO2CPP_CHECK(!saw_stack_fields.load(std::memory_order_acquire));
+        GO2CPP_CHECK(snapshot_count.load(std::memory_order_relaxed) > 0);
+    }
+
+    // FIBER-02：另一个线程仍在 Fiber 内执行时析构。修复后析构等待有界
+    // （约 200ms 预算），超时后放弃所有权而不是无限 yield() 烧核；计数
+    // 必须递增，被隔离的 Impl 让 resume 线程随后安全返回。
+    {
+        const std::uint64_t timeouts_before = Fiber::DestroyTimeoutCount();
+        std::atomic<bool> entered{false};
+        std::atomic<bool> release_spinner{false};
+        std::atomic<bool> resume_returned{false};
+        Fiber* raw_fiber = new Fiber([&] {
+            entered.store(true, std::memory_order_release);
+            while (!release_spinner.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        });
+        std::thread runner([&raw_fiber, &resume_returned] {
+            raw_fiber->resume();
+            resume_returned.store(true, std::memory_order_release);
+        });
+        GO2CPP_REQUIRE_EVENTUALLY(entered.load(std::memory_order_acquire), 2s);
+        const auto destroy_started = std::chrono::steady_clock::now();
+        delete raw_fiber;
+        const auto destroy_elapsed =
+            std::chrono::steady_clock::now() - destroy_started;
+        GO2CPP_CHECK(Fiber::DestroyTimeoutCount() > timeouts_before);
+        GO2CPP_CHECK(destroy_elapsed < 3s);
+        release_spinner.store(true, std::memory_order_release);
+        GO2CPP_JOIN_WITH_WATCHDOG(runner, 5s);
+        GO2CPP_CHECK(resume_returned.load(std::memory_order_acquire));
+        GO2CPP_CHECK(Fiber::DestroyTimeoutCount() == timeouts_before + 1U);
+    }
+
+    // FIBER-03：外部线程持 Fiber* 并发读状态/取消，同时 FiberBin 路径
+    // 反复复用同一个 Fiber（reset record）。修复后 record 原地重置，不再
+    // 替换 shared_ptr，读到的始终是有效元数据。
+    {
+        std::atomic<bool> observer_stop{false};
+        std::atomic<bool> invalid_state{false};
+        std::atomic<std::uint64_t> observer_reads{0};
+        std::atomic<Fiber*> published{nullptr};
+        std::thread observer([&] {
+            while (!observer_stop.load(std::memory_order_acquire)) {
+                Fiber* const fiber = published.load(std::memory_order_acquire);
+                if (fiber == nullptr) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                const FiberState state = fiber->state();
+                if (state != FiberState::Ready &&
+                    state != FiberState::Running &&
+                    state != FiberState::Suspended &&
+                    state != FiberState::Completed &&
+                    state != FiberState::Failed) {
+                    invalid_state.store(true, std::memory_order_release);
+                }
+                (void)fiber->suspend_reason();
+                (void)fiber->debug_info();
+                (void)fiber->debug_stack();
+                (void)fiber->execution_binding();
+                (void)fiber->nesting_depth();
+                (void)fiber->failure();
+                fiber->RequestCancellation();
+                observer_reads.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        for (int round = 0; round < 200; ++round) {
+            auto fiber = Fiber::AcquireForScheduler(
+                [] {}, Fiber::DefaultStackSize(), 8U);
+            GO2CPP_REQUIRE(fiber != nullptr);
+            published.store(fiber.get(), std::memory_order_release);
+            GO2CPP_CHECK(fiber->resume());
+            GO2CPP_CHECK(fiber->state() == FiberState::Completed);
+            Fiber::RecycleForScheduler(std::move(fiber), 8U);
+        }
+        observer_stop.store(true, std::memory_order_release);
+        GO2CPP_JOIN_WITH_WATCHDOG(observer, 10s);
+        GO2CPP_CHECK(!invalid_state.load(std::memory_order_acquire));
+        GO2CPP_CHECK(observer_reads.load(std::memory_order_relaxed) > 0);
+    }
 }

@@ -23,6 +23,8 @@ inline int g_checks = 0;
 /// @brief 记录一次失败（由宏调用，保留文件/行号）。
 inline void RecordFailure(const char* file, int line, const char* expression) {
     ++g_failures;
+    // 先刷 stdout：压测/场景日志与失败行分处两个流，不 flush 会交错。
+    std::fflush(stdout);
     std::fprintf(stderr, "[FAIL] %s:%d: %s\n", file, line, expression);
 }
 

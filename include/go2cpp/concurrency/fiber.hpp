@@ -226,16 +226,19 @@ using FiberContextSnapshot = std::vector<FiberContextFrame>;
  * @brief Fiber 栈的只读快照（诊断与重放用）。
  *
  * ## 边界
- * 全部地址都是进程虚拟地址；`has_stack=false` 表示该 Fiber 已终态、
- * 上下文已释放（`m_stack == nullptr`），此时地址字段全为 0。
- * `current_sp` 只在**当前线程正在执行该 Fiber** 时可读，其它情况为 0 ——
- * 不伪造一个「看起来有意义」的栈指针。
+ * 全部地址都是进程虚拟地址。**栈字段只在当前线程正在执行本 Fiber 时读取**：
+ * `Current() != this` 时一律返回 `has_stack=false`、地址字段全为 0，只复制
+ * `FiberRecord` 里的状态/父链元数据。原因：完成路径会在另一个线程释放
+ * `FiberStack`，诊断线程若先取 `m_stack.get()` 再解引用就是 use-after-free；
+ * 只有执行该 Fiber 的线程能保证栈在其脚下存活。
+ * `current_sp` 同理只在**当前线程正在执行该 Fiber** 时非 0 —— 不伪造一个
+ * 「看起来有意义」的栈指针。
  */
 struct FiberStackDebugSnapshot {
     std::uint64_t id{0};                      ///< Fiber 编号
     FiberState state{FiberState::Ready};      ///< 生命周期状态
     SuspendReason suspend_reason{SuspendReason::None}; ///< 最近挂起原因
-    bool has_stack{false};                    ///< 是否仍有活跃栈（运行/挂起中）
+    bool has_stack{false};                    ///< 仅当前线程执行本 Fiber 时为 true
     bool growable{false};                     ///< 是否启用按需增长
     std::size_t requested_bytes{0};           ///< 归一化后的初始提交请求
     std::size_t reserve_bytes{0};             ///< 预留虚拟地址空间
@@ -326,6 +329,10 @@ public:
     // 标记 Failed，而不是释放后继续恢复或直接终止进程；这条路径无法
     // 展开挂起栈上的局部 RAII，因此规范代码应始终由固定父级收尾。
     // 忽略取消的主体可能阻塞析构。
+    // 等待 resume 权是**有界**的（原子自旋 + 指数退避，预算约 200ms）：
+    // 若另一个线程在析构期间仍持有 resume 权（违反 owner 契约），析构
+    // 不会无限自旋烧核，而是放弃所有权、把 Impl 放进进程级隔离区并递增
+    // DestroyTimeoutCount()，避免随后恢复该 Fiber 的线程访问已释放内存。
     /** @brief 销毁 Fiber 并释放其栈资源。 */
     ~Fiber();
     Fiber(const Fiber&) = delete;
@@ -396,14 +403,24 @@ public:
     // Fiber 的唯一调试编号。编号只在当前进程内有意义，不复用。
     /** @brief 返回 Fiber 唯一 ID。 */
     std::uint64_t id() const noexcept;
+    // 析构等待 resume 权超时、被迫把 Impl 移入隔离区（不立即释放）的
+    // 累计次数。正常路径恒为 0；非 0 表示调用方违反了「owner 长于所有
+    // resume()」的契约。单调递增，适合测试断言与退出诊断。
+    /** @brief 返回析构等待 resume 权超时后隔离 Impl 的累计次数。 */
+    static std::uint64_t DestroyTimeoutCount() noexcept;
     // 返回本 Fiber 的调试帧；调用方不需要持有 Fiber 内部锁。
     /** @brief 返回当前 Fiber 调试帧。 */
     FiberContextFrame debug_info() const;
     FiberContextFrame DebugInfo() const { return debug_info(); }
     /**
      * @brief 返回栈范围、committed 与父 Fiber 的只读快照。
-     * @note best-effort：与 Fiber 自身的 reset/析构并发时可能读到过渡值；
-     *       本函数不加锁、不改状态，只用于诊断与重放记录。
+     *
+     * @details 轻量、无锁、不改状态，只用于诊断与重放记录。**只在
+     *          `Current() == this` 时读取栈字段**：此时栈必然属于当前执行流，
+     *          完成路径不可能并发释放它。其它线程调用返回
+     *          `has_stack=false` 与全 0 地址，只从 `FiberRecord` 复制
+     *          状态/父链元数据 —— 这消除了与 `m_stack.reset()` 的
+     *          use-after-free 竞争（FIBER-01）。
      */
     FiberStackDebugSnapshot debug_stack() const;
     // 返回从本 Fiber 向上追溯的逻辑调用链。Fiber 被迁移或挂起后仍
