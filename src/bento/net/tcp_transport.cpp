@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -102,6 +103,12 @@ bool Resolve(const Endpoint& endpoint, bool passive, std::vector<AddrEntry>* add
         return false;
     }
     return true;
+}
+
+/// 关闭 Nagle：本层承载帧/小消息，延迟优先于合并小包。
+void SetNoDelay(int fd) noexcept {
+    int enabled = 1;
+    (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
 }
 
 /// 设置 O_NONBLOCK + FD_CLOEXEC；失败返回 false，errno 保留。
@@ -256,6 +263,7 @@ Result TcpTransport::Connect(const Endpoint& endpoint, std::chrono::milliseconds
             }
         }
 
+        SetNoDelay(fd);
         m_fd = fd;
         m_listening = false;
         m_write_shutdown = false;
@@ -517,6 +525,7 @@ Result TcpTransport::Adopt(int fd) noexcept {
         (void)::close(fd);
         return Result{Code::kError, EALREADY, 0};
     }
+    SetNoDelay(fd);
     m_fd = fd;
     m_listening = false;
     m_write_shutdown = false;

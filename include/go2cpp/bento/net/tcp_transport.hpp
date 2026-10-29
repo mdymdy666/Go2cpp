@@ -27,6 +27,9 @@
  *   `kError`。
  * - **SIGPIPE 规避**：`send` 使用 `MSG_NOSIGNAL`，对端关闭时返回 `EPIPE`
  *   而不是杀死进程。这是服务端必须处理的常见路径。
+ * - **TCP_NODELAY**：连接建立后关闭 Nagle，避免小帧在 Nagle + delayed ACK
+ *   交互下出现 40ms 级延迟。本层承载的是帧/小消息，延迟优先于合并小包；
+ *   大包吞吐不受影响。
  * - **IPv4/IPv6**：`getaddrinfo(AF_UNSPEC)` 解析，按返回顺序逐个尝试；
  *   `Listen` 对 IPv6 关闭 `IPV6_V6ONLY`，通配监听可同时接受 IPv4 映射地址。
  * - **DNS 不占 deadline**：`getaddrinfo` 没有超时参数，解析阶段不受

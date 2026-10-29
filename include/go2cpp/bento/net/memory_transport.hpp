@@ -40,6 +40,8 @@
  * `TcpTransport` 的测试覆盖。
  */
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <utility>
 
@@ -89,7 +91,8 @@ public:
      *         已完全关闭时返回 `kClosed`（errno `EPIPE`/`ENOTCONN`）。
      *
      * @note 队列无上限，正常情况下不会部分写；保留部分写语义只是为了与
-     *       `ITransport` 契约一致。
+     *       `ITransport` 契约一致。`timeout` 被忽略：写入不会阻塞，也不提供
+     *       背压；生产者快于消费者时内存会持续增长（仅测试用途）。
      */
     Result Write(const std::uint8_t* data, std::size_t size,
                  std::chrono::milliseconds timeout) override;

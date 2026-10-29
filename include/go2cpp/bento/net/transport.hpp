@@ -157,7 +157,7 @@ public:
      * @param endpoint 目标地址；`host` 为空或端口 0 视为非法参数。
      * @param timeout 连接总超时（deadline 语义）。
      * @return `kOk` 表示已建立连接；`kTimeout` 表示超时；`kError` 表示解析
-     *         失败或连接被拒绝；`kClosed` 表示实现已关闭。
+     *         失败或连接被拒绝；`kClosed` 表示实现已关闭且不支持重连（支持重连的实现返回 `kOk`/`kError`）。
      *
      * @note DNS 解析发生在 deadline 之外（`getaddrinfo` 没有超时参数）。
      *       需要严格上界的调用方应传入 IP 字面量。
@@ -205,9 +205,9 @@ public:
      * @brief 关闭连接并释放资源（幂等）。
      * @return 始终 `kOk`；重复调用不产生副作用。
      *
-     * @details 析构函数必须调用它。关闭后 `Read`/`Write` 返回 `kClosed`，
-     *          `Connect` 返回 `kClosed`（实现可以重新 `Connect`，但本接口
-     *          不要求）。
+     * @details 析构函数必须调用它。关闭后 `Read`/`Write` 返回 `kClosed`；
+     *          `Connect` 的行为由实现决定：`TcpTransport` 允许在同一实例上
+     *          重新连接，`MemoryTransport` 返回 `kClosed`。
      */
     virtual Result Close() = 0;
 

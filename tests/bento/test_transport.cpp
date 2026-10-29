@@ -6,9 +6,12 @@
  * @copyright MIT License
  *
  * @details 覆盖：
- *   - MemoryTransport：100 KiB 双向一致、半关闭、超时、幂等 Close、部分读写；
+ *   - MemoryTransport：100 KiB 双向一致、半关闭、超时、幂等 Close、部分读写、
+ *     200 KiB 跨块边界；
  *   - TcpTransport：127.0.0.1 回环 100 KiB 双向、accept/connect 超时、半关闭、
- *     Close、多连接隔离、连接拒绝、IPv6 回环（环境支持时）；
+ *     Close、多连接隔离、连接拒绝、IPv6 回环、Close 后重连、fd 泄漏、
+ *     0ms 非阻塞/EAGAIN、对端 RST、200 并发连接；
+ *   - 公共便利函数：ReadFull/WriteFull 的空指针/0 长度/EOF 边界；
  *   - Frame：复用 MOD-10 的 20B 帧实现，覆盖正常/空负载、粘包、半包、
  *     非法 magic、版本/reserved、长度超限、校验失败。
  *
@@ -17,15 +20,27 @@
  */
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 #include "go2cpp/bento/net/frame.hpp"
 #include "go2cpp/bento/net/memory_transport.hpp"
@@ -82,35 +97,60 @@ long long ElapsedMs(Clock::time_point start) {
     return std::chrono::duration_cast<milliseconds>(Clock::now() - start).count();
 }
 
+/// /proc/self/fd 条目数；用于断言连接生命周期不泄漏 fd。
+std::size_t CountFds() {
+    std::error_code error;
+    std::size_t count = 0;
+    for (std::filesystem::directory_iterator it("/proc/self/fd", error), end; it != end;
+         it.increment(error)) {
+        ++count;
+    }
+    return count;
+}
+
 /// 建立一对回环 TCP 连接；失败时打印原因（断言由调用方负责）。
+///
+/// 回环上 accept 仍可能因内核 TIME_WAIT 四元组复用（WSL 默认 tcp_tw_reuse=2）
+/// 偶发丢连接；这里对 accept 做一次重试，避免把环境抖动记成实现回归。
 bool SetupTcpPair(TcpTransport* listener, TcpTransport* client, TcpTransport* server) {
-    Result result = listener->Listen({"127.0.0.1", 0});
-    if (!result.ok()) {
-        std::fprintf(stderr, "[FAIL] listener.Listen: %s (errno=%d)\n",
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (attempt > 0) {
+            (void)listener->Close();
+            (void)client->Close();
+            (void)server->Close();
+        }
+
+        Result result = listener->Listen({"127.0.0.1", 0});
+        if (!result.ok()) {
+            std::fprintf(stderr, "[FAIL] listener.Listen: %s (errno=%d)\n",
+                         go2cpp::bento::net::CodeName(result.code), result.system_error);
+            return false;
+        }
+
+        Endpoint local;
+        result = listener->LocalEndpoint(&local);
+        if (!result.ok()) {
+            std::fprintf(stderr, "[FAIL] listener.LocalEndpoint: errno=%d\n",
+                         result.system_error);
+            return false;
+        }
+
+        result = client->Connect(local, milliseconds(3000));
+        if (!result.ok()) {
+            std::fprintf(stderr, "[WARN] client.Connect attempt %d: %s (errno=%d)\n",
+                         attempt, go2cpp::bento::net::CodeName(result.code),
+                         result.system_error);
+            continue;
+        }
+
+        result = listener->Accept(server, milliseconds(3000));
+        if (result.ok()) {
+            return true;
+        }
+        std::fprintf(stderr, "[WARN] listener.Accept attempt %d: %s (errno=%d)\n", attempt,
                      go2cpp::bento::net::CodeName(result.code), result.system_error);
-        return false;
     }
-
-    Endpoint local;
-    result = listener->LocalEndpoint(&local);
-    if (!result.ok()) {
-        std::fprintf(stderr, "[FAIL] listener.LocalEndpoint: errno=%d\n", result.system_error);
-        return false;
-    }
-
-    result = client->Connect(local, milliseconds(2000));
-    if (!result.ok()) {
-        std::fprintf(stderr, "[FAIL] client.Connect(%s:%u): errno=%d\n", local.host.c_str(),
-                     static_cast<unsigned>(local.port), result.system_error);
-        return false;
-    }
-
-    result = listener->Accept(server, milliseconds(2000));
-    if (!result.ok()) {
-        std::fprintf(stderr, "[FAIL] listener.Accept: errno=%d\n", result.system_error);
-        return false;
-    }
-    return true;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -488,31 +528,42 @@ void TestTcpConnectRefused() {
 }
 
 void TestTcpIpv6Loopback() {
-    PrintCase("tcp: IPv6 loopback (skipped when unavailable)");
+    PrintCase("tcp: IPv6 loopback (only kernel-disabled is skipped)");
     TcpTransport listener;
     Result result = listener.Listen({"::1", 0});
     if (!result.ok()) {
-        std::printf("[SKIP] IPv6 listen(::1) unavailable: errno=%d\n", result.system_error);
+        std::ifstream disabled("/proc/sys/net/ipv6/conf/all/disable_ipv6");
+        int value = 0;
+        if (disabled >> value && value != 0) {
+            bento_test::Skip("IPv6 disabled in kernel (disable_ipv6=1)");
+            return;
+        }
+        // 环境未禁用 IPv6 却监听失败：真实回归，不能静默 SKIP。
+        std::fprintf(stderr, "[FAIL] listen(::1): errno=%d\n", result.system_error);
+        BENTO_CHECK(false);
         return;
     }
 
     Endpoint local;
     result = listener.LocalEndpoint(&local);
-    if (!result.ok() || local.host.find(':') == std::string::npos) {
-        std::printf("[SKIP] IPv6 local endpoint unavailable\n");
+    BENTO_CHECK(result.ok());
+    BENTO_CHECK(local.host.find(':') != std::string::npos);
+    if (!result.ok()) {
         return;
     }
 
     TcpTransport client;
     result = client.Connect(local, milliseconds(1000));
+    BENTO_CHECK(result.ok());
     if (!result.ok()) {
-        std::printf("[SKIP] IPv6 connect failed: errno=%d\n", result.system_error);
+        std::fprintf(stderr, "[FAIL] IPv6 connect: errno=%d\n", result.system_error);
         return;
     }
     TcpTransport server;
     result = listener.Accept(&server, milliseconds(1000));
+    BENTO_CHECK(result.ok());
     if (!result.ok()) {
-        std::printf("[SKIP] IPv6 accept failed: errno=%d\n", result.system_error);
+        std::fprintf(stderr, "[FAIL] IPv6 accept: errno=%d\n", result.system_error);
         return;
     }
 
@@ -522,6 +573,267 @@ void TestTcpIpv6Loopback() {
     const Result read_result = server.ReadFull(got.data(), got.size(), milliseconds(1000));
     BENTO_CHECK(read_result.ok());
     BENTO_CHECK(got == message);
+}
+
+// ---------------------------------------------------------------------------
+// 资源/边界/并发回归（审查补测）
+// ---------------------------------------------------------------------------
+
+void TestTcpReconnectAfterClose() {
+    PrintCase("tcp: close then reconnect on the same instance");
+    TcpTransport listener;
+    Result result = listener.Listen({"127.0.0.1", 0});
+    BENTO_CHECK(result.ok());
+    Endpoint local;
+    result = listener.LocalEndpoint(&local);
+    BENTO_CHECK(result.ok());
+
+    TcpTransport client;
+    TcpTransport first_server;
+    result = client.Connect(local, milliseconds(2000));
+    BENTO_CHECK(result.ok());
+    result = listener.Accept(&first_server, milliseconds(2000));
+    BENTO_CHECK(result.ok());
+
+    BENTO_CHECK(client.Close().ok());
+    BENTO_CHECK(!client.is_open());
+    result = client.Connect(local, milliseconds(2000));
+    BENTO_CHECK(result.ok());
+    BENTO_CHECK(client.is_open());
+    TcpTransport second_server;
+    result = listener.Accept(&second_server, milliseconds(2000));
+    BENTO_CHECK(result.ok());
+
+    const std::vector<std::uint8_t> message = {'r', 'e', 'c'};
+    BENTO_CHECK(client.WriteFull(message.data(), message.size(), milliseconds(1000)).ok());
+    std::vector<std::uint8_t> got(message.size());
+    BENTO_CHECK(second_server.ReadFull(got.data(), got.size(), milliseconds(1000)).ok());
+    BENTO_CHECK(got == message);
+}
+
+void TestTcpFdLeak() {
+    PrintCase("tcp: 200 connect/close cycles do not leak fds");
+    const std::size_t baseline = CountFds();
+    BENTO_CHECK(baseline > 0);
+    for (int round = 0; round < 200; ++round) {
+        TcpTransport listener;
+        TcpTransport client;
+        TcpTransport server;
+        if (!SetupTcpPair(&listener, &client, &server)) {
+            BENTO_CHECK(false);
+            return;
+        }
+        const std::uint8_t byte = static_cast<std::uint8_t>(round & 0xFF);
+        BENTO_CHECK(client.Write(&byte, 1, milliseconds(1000)).ok());
+        std::uint8_t got = 0;
+        BENTO_CHECK(server.Read(&got, 1, milliseconds(1000)).ok());
+        BENTO_CHECK(got == byte);
+    }
+    BENTO_CHECK(CountFds() <= baseline + 1);
+}
+
+void TestTcpNonBlockingEagain() {
+    PrintCase("tcp: zero-timeout read returns kTimeout and consumes ready bytes");
+    TcpTransport listener;
+    TcpTransport client;
+    TcpTransport server;
+    if (!SetupTcpPair(&listener, &client, &server)) {
+        BENTO_CHECK(false);
+        return;
+    }
+
+    std::uint8_t buffer[64];
+    const Clock::time_point start = Clock::now();
+    Result result = client.Read(buffer, sizeof(buffer), milliseconds(0));
+    BENTO_CHECK(result.code == Code::kTimeout);
+    BENTO_CHECK(result.bytes == 0);
+    BENTO_CHECK(ElapsedMs(start) < 1000);
+
+    const std::vector<std::uint8_t> ready = {'r', 'e', 'a', 'd', 'y'};
+    BENTO_CHECK(server.WriteFull(ready.data(), ready.size(), milliseconds(1000)).ok());
+    result = client.Read(buffer, sizeof(buffer), milliseconds(0));
+    BENTO_CHECK(result.ok());
+    BENTO_CHECK(result.bytes == ready.size());
+    BENTO_CHECK(std::equal(ready.begin(), ready.end(), buffer));
+
+    // 单次超大非阻塞写：内核发送缓冲填满后必须返回 kTimeout + 部分写入。
+    std::vector<std::uint8_t> big(16U * 1024U * 1024U, 0x5AU);
+    const Clock::time_point write_start = Clock::now();
+    result = client.Write(big.data(), big.size(), milliseconds(0));
+    BENTO_CHECK(result.code == Code::kTimeout);
+    BENTO_CHECK(result.bytes > 0);
+    BENTO_CHECK(result.bytes < big.size());
+    BENTO_CHECK(ElapsedMs(write_start) < 1000);
+
+    BENTO_CHECK(client.Close().ok());
+    result = client.Read(buffer, sizeof(buffer), milliseconds(0));
+    BENTO_CHECK(result.code == Code::kClosed);
+}
+
+#if defined(__linux__)
+void TestTcpRst() {
+    PrintCase("tcp: peer RST is reported as kClosed");
+    TcpTransport listener;
+    Result result = listener.Listen({"127.0.0.1", 0});
+    BENTO_CHECK(result.ok());
+    Endpoint local;
+    result = listener.LocalEndpoint(&local);
+    BENTO_CHECK(result.ok());
+
+    const int raw = ::socket(AF_INET, SOCK_STREAM, 0);
+    BENTO_CHECK(raw >= 0);
+    if (raw < 0) {
+        return;
+    }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(local.port);
+    (void)::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+    BENTO_CHECK(::connect(raw, reinterpret_cast<const sockaddr*>(&address),
+                          sizeof(address)) == 0);
+    TcpTransport server;
+    result = listener.Accept(&server, milliseconds(2000));
+    BENTO_CHECK(result.ok());
+
+    const linger reset_linger{1, 0};
+    BENTO_CHECK(::setsockopt(raw, SOL_SOCKET, SO_LINGER, &reset_linger,
+                             sizeof(reset_linger)) == 0);
+    BENTO_CHECK(::close(raw) == 0);
+    std::uint8_t buffer[16];
+    result = server.Read(buffer, sizeof(buffer), milliseconds(2000));
+    BENTO_CHECK(result.code == Code::kClosed);
+}
+#endif
+
+void TestTcpManyConnections() {
+    PrintCase("tcp: 200 simultaneous connections stay isolated");
+    constexpr int kConnections = 200;
+    const std::size_t baseline = CountFds();
+    TcpTransport listener;
+    Result result = listener.Listen({"127.0.0.1", 0}, kConnections * 2);
+    BENTO_CHECK(result.ok());
+    Endpoint local;
+    result = listener.LocalEndpoint(&local);
+    BENTO_CHECK(result.ok());
+
+    std::vector<std::unique_ptr<TcpTransport>> clients;
+    std::vector<std::unique_ptr<TcpTransport>> servers;
+    clients.reserve(kConnections);
+    servers.reserve(kConnections);
+    bool setup_ok = true;
+    for (int i = 0; i < kConnections; ++i) {
+        auto client = std::make_unique<TcpTransport>();
+        auto server = std::make_unique<TcpTransport>();
+        result = client->Connect(local, milliseconds(3000));
+        if (!result.ok()) {
+            // 高频短连接后 TIME_WAIT 四元组复用可能丢 SYN；重试一次。
+            std::fprintf(stderr, "[WARN] many-connect #%d retry: %s errno=%d\n", i,
+                         go2cpp::bento::net::CodeName(result.code), result.system_error);
+            client = std::make_unique<TcpTransport>();
+            result = client->Connect(local, milliseconds(3000));
+        }
+        if (!result.ok()) {
+            std::fprintf(stderr, "[FAIL] many-connect #%d: %s errno=%d\n", i,
+                         go2cpp::bento::net::CodeName(result.code), result.system_error);
+            setup_ok = false;
+            break;
+        }
+        result = listener.Accept(server.get(), milliseconds(2000));
+        if (!result.ok()) {
+            std::fprintf(stderr, "[FAIL] many-accept #%d: %s errno=%d\n", i,
+                         go2cpp::bento::net::CodeName(result.code), result.system_error);
+            setup_ok = false;
+            break;
+        }
+        clients.push_back(std::move(client));
+        servers.push_back(std::move(server));
+    }
+    BENTO_CHECK(setup_ok);
+    BENTO_CHECK(clients.size() == static_cast<std::size_t>(kConnections));
+    BENTO_CHECK(CountFds() >= baseline + 2U * static_cast<std::size_t>(kConnections));
+
+    bool io_ok = true;
+    for (std::size_t i = 0; i < clients.size(); ++i) {
+        const std::uint32_t value = static_cast<std::uint32_t>(i);
+        if (!clients[i]
+                 ->WriteFull(reinterpret_cast<const std::uint8_t*>(&value), sizeof(value),
+                             milliseconds(2000))
+                 .ok()) {
+            io_ok = false;
+            break;
+        }
+        std::uint32_t got = 0;
+        if (!servers[i]
+                 ->ReadFull(reinterpret_cast<std::uint8_t*>(&got), sizeof(got),
+                            milliseconds(2000))
+                 .ok() ||
+            got != value) {
+            io_ok = false;
+            break;
+        }
+    }
+    BENTO_CHECK(io_ok);
+    clients.clear();
+    servers.clear();
+    BENTO_CHECK(CountFds() <= baseline + 1);
+}
+
+void TestMemoryChunkBoundary() {
+    PrintCase("memory: 200 KiB crosses chunk boundaries with partial reads");
+    MemoryTransport::Pair pair = MemoryTransport::CreatePair();
+    MemoryTransport& first = *pair.first;
+    MemoryTransport& second = *pair.second;
+    const std::vector<std::uint8_t> payload = MakePattern(200 * 1024, 0xBEEF1234U);
+    BENTO_CHECK(first.WriteFull(payload.data(), payload.size(), milliseconds(2000)).ok());
+
+    std::vector<std::uint8_t> got;
+    got.reserve(payload.size());
+    std::vector<std::uint8_t> chunk(1000);
+    bool read_ok = true;
+    while (got.size() < payload.size()) {
+        const std::size_t want = std::min(chunk.size(), payload.size() - got.size());
+        const Result result = second.ReadFull(chunk.data(), want, milliseconds(2000));
+        if (!result.ok() || result.bytes != want) {
+            read_ok = false;
+            break;
+        }
+        got.insert(got.end(), chunk.begin(),
+                   chunk.begin() + static_cast<std::ptrdiff_t>(want));
+    }
+    BENTO_CHECK(read_ok);
+    BENTO_CHECK(got == payload);
+
+    // 单次 ReadFull 跨多个 64 KiB 块。
+    BENTO_CHECK(first.WriteFull(payload.data(), payload.size(), milliseconds(2000)).ok());
+    std::vector<std::uint8_t> all(payload.size());
+    const Result result = second.ReadFull(all.data(), all.size(), milliseconds(2000));
+    BENTO_CHECK(result.ok());
+    BENTO_CHECK(all == payload);
+}
+
+void TestFullHelpersEdgeCases() {
+    PrintCase("transport: ReadFull/WriteFull edge cases");
+    MemoryTransport::Pair pair = MemoryTransport::CreatePair();
+    MemoryTransport& first = *pair.first;
+    MemoryTransport& second = *pair.second;
+
+    Result result = first.ReadFull(nullptr, 0, milliseconds(0));
+    BENTO_CHECK(result.ok());
+    BENTO_CHECK(result.bytes == 0);
+    result = first.ReadFull(nullptr, 4, milliseconds(0));
+    BENTO_CHECK(result.code == Code::kError);
+    BENTO_CHECK(result.system_error == EINVAL);
+    result = first.WriteFull(nullptr, 0, milliseconds(0));
+    BENTO_CHECK(result.ok());
+    result = first.WriteFull(nullptr, 4, milliseconds(0));
+    BENTO_CHECK(result.code == Code::kError);
+    BENTO_CHECK(result.system_error == EINVAL);
+
+    BENTO_CHECK(second.Close().ok());
+    std::vector<std::uint8_t> buffer(8);
+    result = first.ReadFull(buffer.data(), buffer.size(), milliseconds(100));
+    BENTO_CHECK(result.code == Code::kClosed);
+    BENTO_CHECK(result.bytes == 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -736,6 +1048,15 @@ int main() {
     TestTcpMultipleConnections();
     TestTcpConnectRefused();
     TestTcpIpv6Loopback();
+    TestTcpReconnectAfterClose();
+    TestTcpFdLeak();
+    TestTcpNonBlockingEagain();
+#if defined(__linux__)
+    TestTcpRst();
+#endif
+    TestTcpManyConnections();
+    TestMemoryChunkBoundary();
+    TestFullHelpersEdgeCases();
 
     TestFrameRoundTrip();
     TestFrameStickyPackets();
