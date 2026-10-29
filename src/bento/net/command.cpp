@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
@@ -175,6 +176,11 @@ std::size_t CommandFrameSize(const Command& command) noexcept {
 // 输出泵：把一路管道读到上限内，并触发回调
 // ---------------------------------------------------------------------------
 
+/// 一次输出泵的读缓冲大小（16KiB）。原来每次在栈上开 64KiB，两个泵
+/// 叠加加上 Execute 的局部量在小栈 Fiber（常见 64KiB）上会顶到栈顶；
+/// 16KiB 单块缓冲既能一次排空 64KiB 管道，又留出足够栈余量。
+inline constexpr std::size_t kCommandPumpBufferBytes = 16 * 1024;
+
 /// 一路输出管道的读取状态。
 struct StreamPump final {
     int fd{-1};                          ///< 读端 fd；-1 表示无。
@@ -200,14 +206,14 @@ void AppendLimited(StreamPump* pump, std::string_view data) {
     }
 }
 
-/// 尽量把该管道读空（最多 16 次 read / 1MB，避免单路饿死另一路）。
-void PumpOnce(StreamPump* pump) {
-    if (pump == nullptr || pump->fd < 0 || pump->eof) {
+/// 尽量把该管道读空（最多 16 次 read / 256KiB，避免单路饿死另一路）。
+void PumpOnce(StreamPump* pump, char* buffer, std::size_t buffer_size) {
+    if (pump == nullptr || pump->fd < 0 || pump->eof || buffer == nullptr ||
+        buffer_size == 0) {
         return;
     }
-    char buffer[64 * 1024];
     for (int round = 0; round < 16; ++round) {
-        const ssize_t count = ::read(pump->fd, buffer, sizeof(buffer));
+        const ssize_t count = ::read(pump->fd, buffer, buffer_size);
         if (count > 0) {
             const std::string_view view(buffer, static_cast<std::size_t>(count));
             AppendLimited(pump, view);
@@ -337,6 +343,11 @@ CommandStatus ValidateCommand(const Command& command, const CommandPolicy& polic
     if (command.timeout_ms > policy.max_timeout_ms) {
         return fail(CommandStatus::kInvalidArgument, "timeout 超过策略上限");
     }
+    if (command.timeout_ms == 0 && !policy.allow_unlimited_timeout) {
+        // 0 表示不限时；若默认放行，远端填 0 就能绕过 max_timeout_ms。
+        return fail(CommandStatus::kInvalidArgument,
+                    "timeout=0 需要策略显式打开 allow_unlimited_timeout");
+    }
     if (CommandFrameSize(command) == 0) {
         return fail(CommandStatus::kInvalidArgument, "请求帧超出长度上限");
     }
@@ -351,7 +362,11 @@ CommandStatus ValidateCommand(const Command& command, const CommandPolicy& polic
     }
 
     // cwd 沙箱：先规范化再比较，避免 `a/../../etc` 绕过前缀检查。
-    if (!command.cwd.empty() && !policy.allowed_cwd_roots.empty()) {
+    if (!policy.allowed_cwd_roots.empty()) {
+        if (command.cwd.empty()) {
+            // 空 cwd 会让子进程继承服务进程的 cwd，等于绕过沙箱。
+            return fail(CommandStatus::kDenied, "启用 cwd 沙箱时 cwd 不能为空");
+        }
         std::error_code ec;
         std::filesystem::path cwd_path = std::filesystem::weakly_canonical(command.cwd, ec);
         if (ec) {
@@ -457,6 +472,10 @@ bool DecodeCommand(const std::uint8_t* data, std::size_t size, Command* out,
     if (size < kCommandFrameHeaderBytes) {
         return fail("帧短于固定头");
     }
+    if (size > kCommandMaxFrameBytes) {
+        // 字段各自合法也可能拼出 >64KiB 的帧；硬上限必须在解析前拒绝。
+        return fail("帧超过请求帧硬上限");
+    }
     if (data[0] != kCommandFrameMagic0 || data[1] != kCommandFrameMagic1) {
         return fail("magic 不匹配");
     }
@@ -513,6 +532,16 @@ bool DecodeCommand(const std::uint8_t* data, std::size_t size, Command* out,
         decoded.argv.emplace_back(reinterpret_cast<const char*>(data + offset), length);
         offset += length;
     }
+    // 编码器拒绝 NUL（C 边界会截断），解码器必须同样拒绝，否则会出现
+    // 「解得出来但再也编不回去」的非规范帧。输出流允许 NUL，id/cwd/argv 不允许。
+    if (HasNul(decoded.id) || HasNul(decoded.cwd)) {
+        return fail("id/cwd 含 NUL");
+    }
+    for (const std::string& arg : decoded.argv) {
+        if (HasNul(arg)) {
+            return fail("argv 含 NUL");
+        }
+    }
     // 解码成功后才写 out：失败路径不改动调用方的对象。
     *out = std::move(decoded);
     return true;
@@ -525,6 +554,16 @@ bool DecodeCommand(const std::uint8_t* data, std::size_t size, Command* out,
 std::vector<std::uint8_t> EncodeCommandResult(const CommandResult& result) {
     if (result.id.size() > kCommandMaxIdBytes ||
         result.message.size() > kCommandMaxMessageBytes) {
+        return {};
+    }
+    // status 是枚举，越界值编码后会被自己的解码器拒绝，破坏往返不变式。
+    if (static_cast<std::uint8_t>(result.status) >
+        static_cast<std::uint8_t>(CommandStatus::kInternal)) {
+        return {};
+    }
+    // 单路输出硬上限；否则 16MiB 总上限内可以塞进 8MiB 的 stdout。
+    if (result.standard_output.size() > kCommandMaxOutputCeiling ||
+        result.standard_error.size() > kCommandMaxOutputCeiling) {
         return {};
     }
     if (HasNul(result.id) || HasNul(result.message)) {
@@ -584,6 +623,10 @@ bool DecodeCommandResult(const std::uint8_t* data, std::size_t size, CommandResu
     if (size < kCommandResultFrameHeaderBytes) {
         return fail("帧短于固定头");
     }
+    if (size > kCommandResultMaxFrameBytes) {
+        // 硬上限先于任何字段解析：避免按对端声明的大小分配内存。
+        return fail("帧超过结果帧硬上限");
+    }
     if (data[0] != kCommandFrameMagic0 || data[1] != kCommandFrameMagic1) {
         return fail("magic 不匹配");
     }
@@ -617,6 +660,10 @@ bool DecodeCommandResult(const std::uint8_t* data, std::size_t size, CommandResu
     if (static_cast<std::size_t>(msg_len) > kCommandMaxMessageBytes) {
         return fail("message 超长");
     }
+    if (static_cast<std::size_t>(out_len) > kCommandMaxOutputCeiling ||
+        static_cast<std::size_t>(err_len) > kCommandMaxOutputCeiling) {
+        return fail("单路输出超过硬上限");
+    }
     const std::size_t payload = static_cast<std::size_t>(id_len) + out_len + err_len + msg_len;
     if (size != kCommandResultFrameHeaderBytes + payload) {
         return fail("帧总长与字段不符");
@@ -635,6 +682,10 @@ bool DecodeCommandResult(const std::uint8_t* data, std::size_t size, CommandResu
     decoded.standard_error.assign(reinterpret_cast<const char*>(data + offset), err_len);
     offset += err_len;
     decoded.message.assign(reinterpret_cast<const char*>(data + offset), msg_len);
+    // 与编码器对称：id/message 含 NUL 的帧不可重编码。两路输出是任意字节，不查。
+    if (HasNul(decoded.id) || HasNul(decoded.message)) {
+        return fail("id/message 含 NUL");
+    }
     *out = std::move(decoded);
     return true;
 }
@@ -703,10 +754,13 @@ CommandResult CommandExecutor::Execute(const Command& command,
     const auto start = std::chrono::steady_clock::now();
     go2cpp::os::ExitStatus exit_status;
     bool reaped = false;
+    bool wait_failed = false;
     bool timed_out = false;
     bool term_sent = false;
     bool kill_sent = false;
     std::chrono::steady_clock::time_point term_time = start;
+    go2cpp::os::ProcError wait_error;
+    std::array<char, kCommandPumpBufferBytes> read_buffer;
 
     // 终止整组；进程组还没建立/已退出时退回单进程 Kill，避免把错误吞掉。
     const auto terminate_tree = [&process](int signal) {
@@ -717,12 +771,40 @@ CommandResult CommandExecutor::Execute(const Command& command,
     };
 
     while (true) {
-        PumpOnce(&stdout_pump);
-        PumpOnce(&stderr_pump);
+        PumpOnce(&stdout_pump, read_buffer.data(), read_buffer.size());
+        PumpOnce(&stderr_pump, read_buffer.data(), read_buffer.size());
+        const bool both_eof = stdout_pump.eof && stderr_pump.eof;
         if (!reaped) {
-            reaped = process.TryWait(&exit_status, nullptr);
+            if (both_eof) {
+                // 两路都 EOF 后不会再有输出；用 Process::Wait（pidfd）等退出，
+                // 不再空转 5ms 轮询——否则每条有输出的短命令都白白多等一个 tick。
+                auto slice = std::chrono::milliseconds(kCommandPollIntervalMs);
+                if (command.timeout_ms > 0 && !term_sent) {
+                    const auto used = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start);
+                    const auto remaining =
+                        static_cast<std::int64_t>(command.timeout_ms) - used.count();
+                    slice = std::chrono::milliseconds(std::max<std::int64_t>(remaining, 0));
+                    slice = std::min(slice,
+                                     std::chrono::milliseconds(kCommandPollIntervalMs));
+                }
+                auto waited = process.Wait(slice);
+                if (waited.ok()) {
+                    exit_status = waited.value();
+                    reaped = true;
+                } else if (waited.error().code != go2cpp::os::ProcErrorCode::kTimeout) {
+                    wait_error = waited.error();
+                    wait_failed = true;
+                }
+            } else {
+                reaped = process.TryWait(&exit_status, &wait_error);
+                if (!reaped && wait_error.code != go2cpp::os::ProcErrorCode::kOk &&
+                    wait_error.code != go2cpp::os::ProcErrorCode::kTimeout) {
+                    wait_failed = true;
+                }
+            }
         }
-        if (reaped) {
+        if (reaped || wait_failed) {
             break;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -741,7 +823,10 @@ CommandResult CommandExecutor::Execute(const Command& command,
                 terminate_tree(SIGKILL);
             }
         }
-        // 等到数据可读或 5ms 到期；两路都 EOF 时纯 sleep 等进程退出。
+        if (both_eof) {
+            continue;  // Wait 已经等过一片，不要再 poll 已 EOF 的 fd。
+        }
+        // 等到数据可读或 5ms 到期。
         pollfd fds[2] = {};
         nfds_t count = 0;
         if (!stdout_pump.eof && stdout_pump.fd >= 0) {
@@ -759,10 +844,10 @@ CommandResult CommandExecutor::Execute(const Command& command,
 
     // 进程已回收，但后台孙进程可能仍持有写端：补读几轮后主动关闭父侧管道，
     // 避免在「sh 启动后台进程并退出」这类场景里永远等不到 EOF。
-    // 8 轮 × 每轮最多 1MB/路，足以覆盖两路输出上限（各 4MB）内的残余数据。
+    // 8 轮 × 每轮最多 256KB/路，足以覆盖两路输出上限（各 4MB）内的残余数据。
     for (int round = 0; round < 8; ++round) {
-        PumpOnce(&stdout_pump);
-        PumpOnce(&stderr_pump);
+        PumpOnce(&stdout_pump, read_buffer.data(), read_buffer.size());
+        PumpOnce(&stderr_pump, read_buffer.data(), read_buffer.size());
         if (stdout_pump.eof && stderr_pump.eof) {
             break;
         }
@@ -789,13 +874,17 @@ CommandResult CommandExecutor::Execute(const Command& command,
     result.output_truncated = stdout_pump.truncated || stderr_pump.truncated;
     result.exit_code = exit_status.exited ? exit_status.exit_code : -1;
 
-    if (timed_out) {
+    if (wait_failed) {
+        result.status = CommandStatus::kInternal;
+        result.message = "等待子进程失败: " + wait_error.ToString();
+    } else if (timed_out) {
         result.status = CommandStatus::kTimeout;
         result.message = kill_sent ? "命令超时，已 SIGKILL 整个进程组"
                                    : "命令超时，已 SIGTERM 整个进程组";
     } else if (exit_status.signaled) {
         result.status = CommandStatus::kAborted;
-        result.message = "命令被信号终止";
+        result.message = std::string("命令被信号终止（") +
+                         go2cpp::os::SignalName(exit_status.signal) + "）";
     } else if (!exit_status.exited) {
         result.status = CommandStatus::kInternal;
         result.message = "wait 未返回有效退出状态";

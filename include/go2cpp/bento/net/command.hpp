@@ -8,7 +8,10 @@
  *
  *          - **协议层**：`Command`（请求）与 `CommandResult`（结果）的
  *            二进制帧编解码，全部整数大端（与 `protocol.hpp` 一致），
- *            解码路径对每一段长度都做上界与精确总长校验，绝不信任对端；
+ *            解码对固定头、每段长度、总长做精确校验：请求帧总长超过
+ *            `kCommandMaxFrameBytes`、结果帧总长超过
+ *            `kCommandResultMaxFrameBytes`、或结果单路输出超过
+ *            `kCommandMaxOutputCeiling` 一律拒绝，不会按对端声明的大小分配内存；
  *          - **执行层**：`CommandExecutor` 基于 `go2cpp::os::proc` 的
  *            `Process` 启动子进程，边读 stdout/stderr 边等退出，超时后
  *            `SIGTERM` → 宽限 → `SIGKILL` **杀整个进程组**（spawn 时
@@ -21,9 +24,9 @@
  * | 命令白名单 | 空 = 全拒绝 | `allow_all=false` 时只执行 `allowed_commands` 中的命令 |
  * | 内置危险命令 | 生效 | `sh`/`rm`/`dd`/`sudo`/`kill`… 即使 `allow_all` 也拒绝，除非 `allow_dangerous` |
  * | 自定义拒绝表 | 空 | `denied_commands` 优先级最高，任何开关都不能绕过 |
- * | cwd 沙箱 | 不限制 | `allowed_cwd_roots` 非空时 cwd 必须落在某个根下且为绝对路径 |
+ * | cwd 沙箱 | 不限制 | `allowed_cwd_roots` 非空时 cwd 必须落在某个根下且为绝对路径；cwd 为空直接拒绝（否则子进程继承服务进程 cwd，沙箱形同虚设） |
  * | 参数长度 | 64 项 × 4KB | 超限在**帧解码之前**就被拒绝（`kInvalidArgument`） |
- * | 超时 | 30s（上限 10min） | 到点先 `SIGTERM` 整组，`kill_grace_ms` 后 `SIGKILL` |
+ * | 超时 | 30s（上限 10min） | 到点先 `SIGTERM` 整组，`kill_grace_ms` 后 `SIGKILL`；`timeout_ms=0`（不限时）只有策略显式打开 `allow_unlimited_timeout` 才允许 |
  * | 输出上限 | 每流 1MB（可配，硬上限 4MB） | 超出部分丢弃并置 `output_truncated`，不会阻塞子进程 |
  *
  * **不经过 shell**：argv 原样交给 `execve`，因此参数里的 `;`、`|`、`$()`
@@ -163,7 +166,9 @@ struct Command final {
     std::string id;
     /// argv；`argv[0]` 是命令名或绝对路径，**不经过 shell**。
     std::vector<std::string> argv;
-    /// 超时毫秒；0 = 不限时，超过策略的 `max_timeout_ms` 会被拒绝。
+    /// 超时毫秒；0 = 不限时，但必须由策略显式打开
+    /// `allow_unlimited_timeout`（否则拒绝），超过策略的 `max_timeout_ms`
+    /// 也会被拒绝。
     std::uint32_t timeout_ms{kCommandDefaultTimeoutMs};
     /// 工作目录；空 = 继承执行器进程的 cwd，非空时必须是绝对路径。
     std::string cwd;
@@ -209,12 +214,17 @@ struct CommandPolicy final {
     std::vector<std::string> allowed_commands;
     /// 额外拒绝的命令名或路径；优先级最高，任何开关都不能绕过。
     std::vector<std::string> denied_commands;
-    /// 允许的 cwd 根目录（绝对路径）；空表示不限制。
+    /// 允许的 cwd 根目录（绝对路径）；空表示不限制。非空时：
+    /// 请求 cwd 必须非空、绝对、规范化后落在某个根下（`..` 与符号链接
+    /// 都会被解析），空 cwd 直接拒绝。
     std::vector<std::string> allowed_cwd_roots;
     /// 每路输出（stdout、stderr 各自）保留的最大字节数。
     std::size_t max_output_bytes{kCommandDefaultMaxOutputBytes};
     /// 允许的最大超时（毫秒）。
     std::uint32_t max_timeout_ms{kCommandMaxTimeoutMs};
+    /// 是否允许 `timeout_ms == 0`（不限时）。默认 false：否则远端只要把
+    /// 超时填 0 就能绕过 `max_timeout_ms`，把执行线程永久占住。
+    bool allow_unlimited_timeout{false};
     /// TERM → KILL 的宽限毫秒数。
     std::uint32_t kill_grace_ms{kCommandDefaultKillGraceMs};
     /// 是否按 PATH 解析 argv[0]（false = 只接受可执行文件路径）。
@@ -246,10 +256,13 @@ struct CommandCallbacks final {
     /// 子进程创建成功后立即回调一次（用于登记 pid/观测）。
     std::function<void(pid_t)> on_spawn;
     /// stdout 每读到一段就回调（数据可能在输出上限之外，仍是线上原始内容）。
+    /// @warning `string_view` 只在下一次读取/回调返回前有效；需要保留请自行拷贝。
     std::function<void(std::string_view)> on_stdout;
     /// stderr 每读到一段就回调。
+    /// @warning 生命周期约束同 `on_stdout`。
     std::function<void(std::string_view)> on_stderr;
     /// 结果确定后回调一次（含被拒绝/启动失败的情况）。
+    /// @warning `result` 是 `Execute` 内的局部对象，回调返回后即失效。
     std::function<void(const CommandResult&)> on_exit;
 };
 
