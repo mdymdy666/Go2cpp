@@ -23,21 +23,22 @@
  *            帧头保留明文的 wire seq 作为 AEAD nonce 与窗口索引；
  *            只有通过 Poly1305 验证的包才会推进窗口，伪造高序号包
  *            无法把窗口推高（避免 DoS）。
- *          - **帧头认证**：加密帧外层 12B 头作为 AEAD 的 AAD；密文内是
- *            完整的 Bento 内层帧（12B 头 + 可选 ACK 段 + 载荷）。接收端
+ *          - **帧头认证**：加密帧外层 16B 头作为 AEAD 的 AAD；密文内是
+ *            完整的 Bento 内层帧（16B 头 + 可选 ACK 段 + 载荷）。接收端
  *            解密后再走原有 ParseFrame/通道逻辑，协议语义零改动。
  *
- *          线上加密帧格式（外层头 12B + 密文 + 16B tag）：
+ *          线上加密帧格式（外层头 16B + 密文 + 16B tag）：
  *
  *          | 偏移 | 字段    | 语义                                      |
  *          |------|---------|-------------------------------------------|
- *          | 0    | ver=1   | 协议版本                                  |
+ *          | 0    | ver=2   | 协议版本（kProtocolVersion）               |
  *          | 1    | type    | 内层帧类型（HELLO/STREAM/...）             |
  *          | 2    | chan    | 内层通道                                  |
  *          | 3    | flags   | 内层 flags | kFlagEncrypted (0x10)         |
- *          | 4    | seq     | 每方向单调递增的 wire seq（从 1 开始）     |
- *          | 8    | dep_seq | 外层保留 0（内层 dep_seq 在密文里）        |
- *          | 12   | ct      | 内层完整帧的 ChaCha20 密文                 |
+ *          | 4    | conn_id | 连接 id（明文可见，参与 AAD 认证）         |
+ *          | 8    | seq     | 每方向单调递增的 wire seq（从 1 开始）     |
+ *          | 12   | dep_seq | 外层保留 0（内层 dep_seq 在密文里）        |
+ *          | 16   | ct      | 内层完整帧的 ChaCha20 密文                 |
  *          | ...  | tag     | Poly1305 16B                              |
  *
  *          nonce = 方向标签 u32 BE || wire seq u64 BE（12B）。方向密钥
@@ -307,7 +308,7 @@ bool SealFrame(const std::uint8_t key[kChaCha20KeyBytes], SecureDirection direct
 /// @param key 本方向接收密钥。
 /// @param direction 发送方方向（决定 nonce 标签）。
 /// @param replay 接收方向的重放窗口；只有认证成功后才会推进。
-/// @param inner 输出内层完整帧。
+/// @param inner 输出内层完整帧；函数入口先清空，失败时不残留旧明文。
 /// @param status 失败原因。
 bool OpenFrame(const std::uint8_t key[kChaCha20KeyBytes], SecureDirection direction,
                ReplayWindow* replay, const std::uint8_t* packet, std::size_t bytes,

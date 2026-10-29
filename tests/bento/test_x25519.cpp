@@ -13,16 +13,22 @@
  *   - 私钥 clamp（低位与最高位不参与运算）；
  *   - 对端 u 坐标最高位忽略；
  *   - 全零、1、p-1、p、p+1 及两个大低阶点的拒绝；
- *   - 空指针参数、确定性与输入不变性。
+ *   - 空指针参数、确定性与输入不变性；
+ *   - 补测：200 轮随机密钥对、u 坐标 mod p 等价（5 vs p+5）、u=2..9 不误拒、
+ *     全零/全 FF 私钥、64 个生成私钥唯一性、4 线程并发派生。
  *
  * 断言只在主线程执行；`test_util.hpp` 的计数器不是原子变量。
  */
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <random>
+#include <set>
+#include <thread>
 
 #include "go2cpp/bento/net/x25519.hpp"
 #include "test_util.hpp"
@@ -308,6 +314,138 @@ void TestGeneratedPrivateKeyVaries() {
     BENTO_CHECK(first != second);
 }
 
+// ---------------------------------------------------------------------------
+// 审查补测：随机批量、坐标约简、极值私钥、并发生成与派生
+// ---------------------------------------------------------------------------
+
+void TestRandomKeyPairAgreement200() {
+    PrintCase("x25519: 200 random key pairs agree (manual scalars)");
+    std::mt19937 rng(0x12345678U);
+    int mismatches = 0;
+    for (int round = 0; round < 200; ++round) {
+        Key alice_private{};
+        Key bob_private{};
+        for (std::uint8_t& byte : alice_private) {
+            byte = static_cast<std::uint8_t>(rng() & 0xFFU);
+        }
+        for (std::uint8_t& byte : bob_private) {
+            byte = static_cast<std::uint8_t>(rng() & 0xFFU);
+        }
+        Key alice_public{};
+        Key bob_public{};
+        Key alice_shared{};
+        Key bob_shared{};
+        BENTO_CHECK(go2cpp::bento::X25519PublicKeyFromPrivate(alice_private.data(),
+                                                              alice_public.data()));
+        BENTO_CHECK(go2cpp::bento::X25519PublicKeyFromPrivate(bob_private.data(),
+                                                              bob_public.data()));
+        BENTO_CHECK(alice_public != bob_public);
+        BENTO_CHECK(go2cpp::bento::X25519ComputeSharedSecret(alice_private.data(),
+                                                             bob_public.data(),
+                                                             alice_shared.data()));
+        BENTO_CHECK(go2cpp::bento::X25519ComputeSharedSecret(bob_private.data(),
+                                                             alice_public.data(),
+                                                             bob_shared.data()));
+        BENTO_CHECK(alice_shared == bob_shared);
+        BENTO_CHECK(!IsZero(alice_shared));
+        mismatches += alice_shared != bob_shared ? 1 : 0;
+    }
+    BENTO_CHECK_EQ(mismatches, 0);
+}
+
+void TestCoordinateModulusEquivalence() {
+    PrintCase("x25519: u coordinate is reduced mod p (5 vs p+5)");
+    Key five{};
+    five[0] = 5;
+    // p + 5 = 2^255 - 14，255 位编码为 0x7FFF...FFF2。
+    Key p_plus_five{};
+    p_plus_five.fill(0xFF);
+    p_plus_five[0] = 0xF2;
+    p_plus_five[31] = 0x7F;
+    Key shared_five{};
+    Key shared_p_plus_five{};
+    BENTO_CHECK(go2cpp::bento::X25519ComputeSharedSecret(kAlicePrivate.data(), five.data(),
+                                                         shared_five.data()));
+    BENTO_CHECK(go2cpp::bento::X25519ComputeSharedSecret(kAlicePrivate.data(),
+                                                         p_plus_five.data(),
+                                                         shared_p_plus_five.data()));
+    BENTO_CHECK(shared_five == shared_p_plus_five);
+    BENTO_CHECK(!IsZero(shared_five));
+}
+
+void TestSmallCoordinatesNotRejected() {
+    PrintCase("x25519: small non-low-order coordinates u=2..9 are accepted");
+    for (std::uint8_t u = 2; u <= 9; ++u) {
+        Key point{};
+        point[0] = u;
+        Key shared{};
+        BENTO_CHECK(go2cpp::bento::X25519ComputeSharedSecret(kAlicePrivate.data(), point.data(),
+                                                             shared.data()));
+        BENTO_CHECK(!IsZero(shared));
+    }
+}
+
+void TestPrivateKeyExtremes() {
+    PrintCase("x25519: all-zero / all-ones private keys still derive valid keys");
+    Key zero_private{};
+    Key ones_private{};
+    ones_private.fill(0xFF);
+    Key zero_public{};
+    Key ones_public{};
+    Key zero_shared{};
+    Key ones_shared{};
+    BENTO_CHECK(go2cpp::bento::X25519PublicKeyFromPrivate(zero_private.data(),
+                                                          zero_public.data()));
+    BENTO_CHECK(go2cpp::bento::X25519PublicKeyFromPrivate(ones_private.data(),
+                                                          ones_public.data()));
+    BENTO_CHECK(!IsZero(zero_public));
+    BENTO_CHECK(!IsZero(ones_public));
+    BENTO_CHECK(zero_public != ones_public);
+    BENTO_CHECK(go2cpp::bento::X25519ComputeSharedSecret(zero_private.data(),
+                                                         ones_public.data(),
+                                                         zero_shared.data()));
+    BENTO_CHECK(go2cpp::bento::X25519ComputeSharedSecret(ones_private.data(),
+                                                         zero_public.data(),
+                                                         ones_shared.data()));
+    BENTO_CHECK(zero_shared == ones_shared);
+}
+
+void TestGeneratedKeysUnique() {
+    PrintCase("x25519: 64 generated private keys are unique");
+    std::set<Key> keys;
+    for (int i = 0; i < 64; ++i) {
+        Key key{};
+        go2cpp::bento::X25519GeneratePrivateKey(key.data());
+        keys.insert(key);
+    }
+    BENTO_CHECK_EQ(keys.size(), 64U);
+}
+
+void TestConcurrentDerivation() {
+    PrintCase("x25519: 4 threads derive the same shared secret");
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    threads.reserve(4);
+    for (int thread = 0; thread < 4; ++thread) {
+        threads.emplace_back([&failures]() {
+            for (int i = 0; i < 100; ++i) {
+                Key private_key = kAlicePrivate;
+                Key shared{};
+                if (!go2cpp::bento::X25519ComputeSharedSecret(private_key.data(),
+                                                              kBobPublic.data(),
+                                                              shared.data()) ||
+                    shared != kRfcShared) {
+                    ++failures;
+                }
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    BENTO_CHECK_EQ(failures.load(), 0);
+}
+
 }  // namespace
 
 int main() {
@@ -327,5 +465,11 @@ int main() {
     TestNullArguments();
     TestDeterministicAndInputsUnchanged();
     TestGeneratedPrivateKeyVaries();
+    TestRandomKeyPairAgreement200();
+    TestCoordinateModulusEquivalence();
+    TestSmallCoordinatesNotRejected();
+    TestPrivateKeyExtremes();
+    TestGeneratedKeysUnique();
+    TestConcurrentDerivation();
     return bento_test::Finish("x25519");
 }

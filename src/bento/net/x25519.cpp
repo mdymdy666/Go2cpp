@@ -67,6 +67,19 @@ void Select(Field p, Field q, int bit) noexcept {
     }
 }
 
+/// @brief 用 volatile 写清零敏感中间值，编译器不能把循环优化掉。
+/// @details 本模块刻意不依赖 crypto.hpp，因此保留一份等价实现；只用于
+///          ScalarMult/Invert 的临时域元素与 clamp 后的标量副本。
+void Zeroize(void* data, std::size_t size) noexcept {
+    if (data == nullptr || size == 0) {
+        return;
+    }
+    volatile std::uint8_t* bytes = static_cast<volatile std::uint8_t*>(data);
+    for (std::size_t i = 0; i < size; ++i) {
+        bytes[i] = 0;
+    }
+}
+
 /// 域加法（不做进位，允许 limb 暂时超出 16 bit）。
 void Add(Field out, const Field a, const Field b) noexcept {
     for (int i = 0; i < 16; ++i) {
@@ -119,6 +132,7 @@ void Invert(Field out, const Field in) noexcept {
     for (int i = 0; i < 16; ++i) {
         out[i] = value[i];
     }
+    Zeroize(value, sizeof(value));
 }
 
 /**
@@ -238,6 +252,15 @@ void ScalarMult(std::uint8_t out[kX25519KeyBytes],
     Invert(c, c);
     Mul(a, a, c);
     Pack(out, a);
+
+    Zeroize(clamped, sizeof(clamped));
+    Zeroize(x, sizeof(x));
+    Zeroize(a, sizeof(a));
+    Zeroize(b, sizeof(b));
+    Zeroize(c, sizeof(c));
+    Zeroize(d, sizeof(d));
+    Zeroize(e, sizeof(e));
+    Zeroize(f, sizeof(f));
 }
 
 /// 用 std::random_device 填满缓冲；每次取 32 位，按小端拆字节。
