@@ -36,9 +36,21 @@ struct AddrEntry {
     socklen_t length = 0;
 };
 
-/// 负超时按 0 处理。
+/// 单次调用的最大超时（24h）。`time_point + duration` 在 64 位纳秒表示下会先溢出：
+/// 实测 `milliseconds::max()` 触发有符号整数溢出（UBSan 报错），deadline 变成
+/// 过去时间，调用立即返回 `kTimeout`。钳制到 24h 既保留「几乎无限等待」的语义，
+/// 又保证加法永不溢出。
+constexpr std::int64_t kMaxTimeoutMs = 24LL * 60 * 60 * 1000;
+
+/// 负超时按 0 处理；超过 `kMaxTimeoutMs` 按上限处理。
 std::chrono::milliseconds NormalizeTimeout(std::chrono::milliseconds timeout) noexcept {
-    return timeout.count() < 0 ? std::chrono::milliseconds(0) : timeout;
+    if (timeout.count() < 0) {
+        return std::chrono::milliseconds(0);
+    }
+    if (timeout.count() > kMaxTimeoutMs) {
+        return std::chrono::milliseconds(kMaxTimeoutMs);
+    }
+    return timeout;
 }
 
 /**
@@ -369,18 +381,31 @@ Result UdpTransport::Read(std::uint8_t* buffer, std::size_t capacity,
         return Result{Code::kError, ENOTCONN, 0};
     }
 
-    const Clock::time_point deadline = Clock::now() + NormalizeTimeout(timeout);
-    for (;;) {
+    const std::chrono::milliseconds budget = NormalizeTimeout(timeout);
+    const Clock::time_point deadline = Clock::now() + budget;
+    // 阻塞模式下先 recv 再 poll：数据通常已就绪，可省掉每包一次 poll 系统调用；
+    // timeout==0 时保持 poll 优先，避免空闲轮询多一次必然失败的系统调用。
+    const bool recv_first = budget.count() > 0;
+    const auto poll_readable = [&](Result* failure) {
         int wait_error = 0;
         const WaitStatus status = WaitFor(m_fd, POLLIN, deadline, &wait_error);
         if (status == WaitStatus::kTimeout) {
-            return Result{Code::kTimeout, ETIMEDOUT, 0};
+            *failure = Result{Code::kTimeout, ETIMEDOUT, 0};
+            return false;
         }
         if (status == WaitStatus::kError) {
-            if (m_fd < 0) {
-                return Result{Code::kClosed, ENOTCONN, 0};
+            *failure =
+                m_fd < 0 ? Result{Code::kClosed, ENOTCONN, 0} : MapIoError(wait_error, 0);
+            return false;
+        }
+        return true;
+    };
+    for (;;) {
+        if (!recv_first) {
+            Result failure;
+            if (!poll_readable(&failure)) {
+                return failure;
             }
-            return MapIoError(wait_error, 0);
         }
 
         const ssize_t received = ::recv(m_fd, buffer, capacity, 0);
@@ -388,7 +413,14 @@ Result UdpTransport::Read(std::uint8_t* buffer, std::size_t capacity,
             return Result{Code::kOk, 0, static_cast<std::size_t>(received)};
         }
         const int error = errno;
-        if (error == EINTR || error == EAGAIN || error == EWOULDBLOCK) {
+        if (error == EINTR) {
+            continue;
+        }
+        if (error == EAGAIN || error == EWOULDBLOCK) {
+            Result failure;
+            if (!poll_readable(&failure)) {
+                return failure;
+            }
             continue;
         }
         return MapIoError(error, 0);
@@ -529,18 +561,31 @@ Result UdpTransport::RecvFrom(std::uint8_t* buffer, std::size_t capacity,
         return Result{Code::kError, EINVAL, 0};
     }
 
-    const Clock::time_point deadline = Clock::now() + NormalizeTimeout(timeout);
-    for (;;) {
+    const std::chrono::milliseconds budget = NormalizeTimeout(timeout);
+    const Clock::time_point deadline = Clock::now() + budget;
+    // 同 Read：阻塞模式先 recvmsg 再 poll，省掉高负载下每包一次 poll；
+    // timeout==0 保持 poll 优先，空闲轮询成本不变。
+    const bool recv_first = budget.count() > 0;
+    const auto poll_readable = [&](Result* failure) {
         int wait_error = 0;
         const WaitStatus status = WaitFor(m_fd, POLLIN, deadline, &wait_error);
         if (status == WaitStatus::kTimeout) {
-            return Result{Code::kTimeout, ETIMEDOUT, 0};
+            *failure = Result{Code::kTimeout, ETIMEDOUT, 0};
+            return false;
         }
         if (status == WaitStatus::kError) {
-            if (m_fd < 0) {
-                return Result{Code::kClosed, ENOTCONN, 0};
+            *failure =
+                m_fd < 0 ? Result{Code::kClosed, ENOTCONN, 0} : MapIoError(wait_error, 0);
+            return false;
+        }
+        return true;
+    };
+    for (;;) {
+        if (!recv_first) {
+            Result failure;
+            if (!poll_readable(&failure)) {
+                return failure;
             }
-            return MapIoError(wait_error, 0);
         }
 
         sockaddr_storage storage{};
@@ -586,7 +631,14 @@ Result UdpTransport::RecvFrom(std::uint8_t* buffer, std::size_t capacity,
         }
 
         const int error = errno;
-        if (error == EINTR || error == EAGAIN || error == EWOULDBLOCK) {
+        if (error == EINTR) {
+            continue;
+        }
+        if (error == EAGAIN || error == EWOULDBLOCK) {
+            Result failure;
+            if (!poll_readable(&failure)) {
+                return failure;
+            }
             continue;
         }
         return MapIoError(error, 0);

@@ -36,7 +36,12 @@
  * 与 `TcpTransport` 一致：每个 `timeout` 是整次调用的 deadline，`EINTR`
  * 后重新计算剩余时间，`EAGAIN`/`EWOULDBLOCK` 转为 poll 等待，超时返回
  * `kTimeout`。`timeout == 0` 表示非阻塞尝试一次（仍会 poll 一次，消费内核
- * 中已经就绪的数据报）；负值按 0 处理。DNS 解析不受 deadline 约束。
+ * 中已经就绪的数据报）；负值按 0 处理，超过 24 小时按 24 小时处理——上限是
+ * 必要的：`steady_clock::time_point + milliseconds::max()` 会触发有符号整数
+ * 溢出，deadline 变成过去时间，调用会立即超时（UBSan 实测）。`timeout > 0`
+ * 时先尝试一次 `recv`/`recvmsg`，只有内核无数据才 `poll`，省掉高负载下每包
+ * 一次系统调用；`timeout == 0` 仍保持 poll 先行，空闲轮询成本不变。DNS 解析
+ * 不受 deadline 约束。
  *
  * ## 错误映射
  *

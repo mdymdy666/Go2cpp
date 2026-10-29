@@ -110,3 +110,46 @@
   `kAlreadyRegistered` 语义（P2-5）、`kAlreadyPaired` 从未返回（P2-6）、
   `m_outbound` 仍为 deque（P2-7）。
 - 未 commit；未改动 `bento` 其他模块、base、构建脚本。
+
+## 2026-10-29 udp_transport 模块审查（压测 / 随机 / 场景 / 解耦 / 测试复查）
+
+### 一、结论
+
+无 P0；修复 2 个 P1、记录 7 个 P2 / 5 个 P3。详见
+`example/WarningDocement/audit-udp-transport.md`。
+
+### 二、代码改动
+
+- `src/bento/net/udp_transport.cpp`：`NormalizeTimeout` 钳制到 24h（修复
+  `milliseconds::max()` 的 `time_point + duration` 有符号溢出，UBSan 实测
+  `chrono.h:225`）；`Read`/`RecvFrom` 在 `timeout > 0` 时改为 recv-first，仅
+  `EAGAIN` 才 `poll`；`timeout == 0` 保持 poll-first（空闲轮询不退化）。
+- `include/go2cpp/bento/net/udp_transport.hpp`：同步超时上限与 recv-first 说明。
+- 未改 base、未改构建脚本。
+
+### 三、测试改动
+
+- `tests/bento/test_udp_transport.cpp`：15 用例 / 158 checks → 22 用例 / 218 checks。
+  新增超时钳制、非阻塞就绪、通配 Bind、connected SendTo 其它对端、connected
+  Read 静默截断、4 线程并发 SendTo、fd 泄漏 7 个用例；修正 1 个过严断言、收紧
+  1 个过宽断言、修掉 IPv6 用例的 SKIP 逃逸。
+- `tests/bento/audit_udp_transport_stress.cpp`：新增独立审计程序（不注册 CTest）。
+
+### 四、验证结果
+
+- 42 万包压测（64B 222.9k pps / 1400B 208.5k pps / 64KB 719.8 MiB/s）+ 2000 轮
+  随机 + 6 场景 + 4 线程并发：audit `--mode=all` **2080 checks / 0 失败**，
+  fd 全程 +0，RSS 4.4 MB。
+- 热路径 microbench：`RecvFrom` 1513→824 ns/call（−45.5%）、`Read`
+  1231→601 ns（−51.2%）、`RecvFrom(0ms)` 无回退。
+- `ctest -R bento` **48/48**（`bento_netem` 无 CAP_NET_ADMIN 按设计 SKIP）。
+- ASan+UBSan 0 报告；valgrind 0 errors / 无泄漏；`-Werror` 0 警告。
+
+### 五、后续状态
+
+- 未修（已记录）：默认 rcvbuf 无调优 API（P2-3）、通配 Bind 单地址族（P2-4）、
+  `WaitFor` 不查 `revents` / `m_fd` 并发竞争（P2-5）、解析失败统一
+  `EHOSTUNREACH`（P2-6）、connected Read 静默截断（P2-7，文档已声明）、
+  主机名每包解析 9.5 µs（P2-1）。
+- 文档 `docs/modules/bento-foundation.md:16` 的「15 用例」待同步为 22。
+- 未 commit。

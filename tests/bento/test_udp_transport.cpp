@@ -15,7 +15,11 @@
  *   - 未连接时 Read/Write 的错误、非法参数、超大报文 EMSGSIZE；
  *   - 多发送方来源地址区分；
  *   - ShutdownWrite 只关闭写方向、Close 后错误；
- *   - IPv6 ::1 回环（环境不支持时跳过）。
+ *   - IPv6 ::1 回环（环境不支持时跳过）；
+ *   - 审计补充（2026-10-29）：`milliseconds::max()` 超时钳制、0 超时消费内核里
+ *     已就绪的数据报、通配 Bind、connected socket 上 `SendTo` 其它对端、
+ *     4 线程并发 `SendTo` 的数据报边界、Bind/Close 与失败 Bind 的 fd 泄漏、
+ *     connected `Read` 的静默截断（文档已声明）。
  */
 
 #include <algorithm>
@@ -26,7 +30,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "go2cpp/bento/net/udp_transport.hpp"
@@ -253,7 +259,9 @@ void TestRecvTimeout() {
     BENTO_CHECK_EQ(received.system_error, ETIMEDOUT);
     BENTO_CHECK(elapsed >= 50);
     BENTO_CHECK(elapsed < 2000);
-    BENTO_CHECK_EQ(info.bytes, static_cast<std::size_t>(12345));
+    // 头文件写明「失败时内容不保证被修改」，所以不断言 info 保持旧值；只确认
+    // 失败结果没有把旧数据当成有效字节数返回。
+    BENTO_CHECK_EQ(received.bytes, static_cast<std::size_t>(0));
 }
 
 void TestNonBlockingTimeoutZero() {
@@ -268,7 +276,8 @@ void TestNonBlockingTimeoutZero() {
                                              nullptr, nullptr);
     const long long elapsed = ElapsedMs(start);
     BENTO_CHECK_EQ(received.code, Code::kTimeout);
-    BENTO_CHECK(elapsed < 1000);
+    // 实测约 0.4us/次；50ms 上界足以吸收调度抖动，又能抓住「0 超时其实阻塞了」。
+    BENTO_CHECK(elapsed < 50);
 }
 
 void TestLargeDatagram() {
@@ -580,7 +589,15 @@ void TestIpv6Loopback() {
 
     const Result receiver_bind = receiver.Bind({"::1", 0});
     if (!receiver_bind.ok()) {
-        bento_test::Skip("IPv6 loopback unavailable");
+        // 只有「环境没有 IPv6」才允许 SKIP；其它 errno 是真实回归，不能逃逸成
+        // SKIP（否则 CTest 会把整份测试标成 Skipped，掩盖 14 个用例的结果）。
+        const bool unsupported = receiver_bind.system_error == EAFNOSUPPORT ||
+                                 receiver_bind.system_error == EADDRNOTAVAIL ||
+                                 receiver_bind.system_error == EPROTONOSUPPORT;
+        BENTO_CHECK(unsupported);
+        if (unsupported) {
+            bento_test::Skip("IPv6 loopback unavailable");
+        }
         return;
     }
     BENTO_CHECK(receiver.LocalEndpoint(&receiver_local).ok());
@@ -604,6 +621,276 @@ void TestIpv6Loopback() {
     BENTO_CHECK(peer.host.find("::1") != std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// 审计补充（2026-10-29）：超时钳制、非阻塞就绪、通配绑定、并发发送、fd 泄漏
+// ---------------------------------------------------------------------------
+
+/// 统计本进程打开的 fd（/proc/self/fd）；opendir 自身占一个，扣掉。
+int CountOpenFds() {
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (dir == nullptr) {
+        return -1;
+    }
+    int count = 0;
+    while (const dirent* entry = ::readdir(dir)) {
+        if (std::strcmp(entry->d_name, ".") != 0 && std::strcmp(entry->d_name, "..") != 0) {
+            ++count;
+        }
+    }
+    ::closedir(dir);
+    return count - 1;
+}
+
+void TestTimeoutClamp() {
+    PrintCase("udp: milliseconds::max() timeout is clamped and still receives");
+    UdpTransport receiver;
+    Endpoint local;
+    BENTO_CHECK(BindLoopback(&receiver, &local));
+
+    // 修复前：deadline 加法溢出（UB）→ deadline 变成过去时间 → 0ms 立即 kTimeout。
+    std::thread delayed_sender([local]() {
+        std::this_thread::sleep_for(milliseconds(30));
+        UdpTransport sender;
+        if (!sender.Bind({"127.0.0.1", 0}).ok()) {
+            return;
+        }
+        const std::uint8_t payload[3] = {7, 8, 9};
+        (void)sender.SendTo(local, payload, sizeof(payload), milliseconds(500));
+    });
+    std::vector<std::uint8_t> buffer(16);
+    const Clock::time_point start = Clock::now();
+    const Result received = receiver.RecvFrom(buffer.data(), buffer.size(),
+                                              milliseconds::max(), nullptr, nullptr);
+    const long long elapsed = ElapsedMs(start);
+    delayed_sender.join();
+    BENTO_CHECK(received.ok());
+    BENTO_CHECK_EQ(received.bytes, static_cast<std::size_t>(3));
+    BENTO_CHECK(elapsed >= 20);
+    BENTO_CHECK(elapsed < 2000);
+}
+
+void TestNonBlockingReadyData() {
+    PrintCase("udp: zero timeout consumes datagram already queued");
+    UdpTransport receiver;
+    UdpTransport sender;
+    Endpoint receiver_local;
+    Endpoint sender_local;
+    BENTO_CHECK(BindLoopback(&receiver, &receiver_local));
+    BENTO_CHECK(BindLoopback(&sender, &sender_local));
+
+    const std::vector<std::uint8_t> payload = {1, 2, 3, 4, 5};
+    BENTO_CHECK(sender
+                    .SendTo(receiver_local, payload.data(), payload.size(),
+                            milliseconds(kTimeoutMs))
+                    .ok());
+    std::vector<std::uint8_t> buffer(16);
+    UdpTransport::RecvInfo info;
+    const Result first =
+        receiver.RecvFrom(buffer.data(), buffer.size(), milliseconds(0), nullptr, &info);
+    BENTO_CHECK(first.ok());
+    BENTO_CHECK_EQ(first.bytes, payload.size());
+    BENTO_CHECK_EQ(info.datagram_bytes, payload.size());
+    BENTO_CHECK(std::equal(payload.begin(), payload.end(), buffer.begin()));
+
+    const Result second =
+        receiver.RecvFrom(buffer.data(), buffer.size(), milliseconds(0), nullptr, nullptr);
+    BENTO_CHECK_EQ(second.code, Code::kTimeout);
+}
+
+void TestWildcardBind() {
+    PrintCase("udp: wildcard Bind receives IPv4 datagram and replies to peer");
+    UdpTransport server;
+    BENTO_CHECK(server.Bind({"", 0}).ok());
+    Endpoint server_local;
+    BENTO_CHECK(server.LocalEndpoint(&server_local).ok());
+    BENTO_CHECK(server_local.port != 0);
+    BENTO_CHECK(server_local.host == "0.0.0.0" || server_local.host == "::");
+
+    UdpTransport client;
+    Endpoint client_local;
+    BENTO_CHECK(BindLoopback(&client, &client_local));
+
+    const std::vector<std::uint8_t> payload = {'w', 'i', 'l', 'd'};
+    BENTO_CHECK(client
+                    .SendTo({"127.0.0.1", server_local.port}, payload.data(),
+                            payload.size(), milliseconds(kTimeoutMs))
+                    .ok());
+    std::vector<std::uint8_t> buffer(64);
+    Endpoint peer;
+    UdpTransport::RecvInfo info;
+    const Result received = server.RecvFrom(buffer.data(), buffer.size(),
+                                            milliseconds(kTimeoutMs), &peer, &info);
+    BENTO_CHECK(received.ok());
+    BENTO_CHECK_EQ(received.bytes, payload.size());
+    BENTO_CHECK_EQ(peer.port, client_local.port);
+    BENTO_CHECK(std::equal(payload.begin(), payload.end(), buffer.begin()));
+
+    // 回给来源地址：peer 可能是 127.0.0.1，也可能是 ::ffff:127.0.0.1。
+    BENTO_CHECK(server
+                    .SendTo(peer, payload.data(), payload.size(), milliseconds(kTimeoutMs))
+                    .ok());
+    BENTO_CHECK(client
+                    .RecvFrom(buffer.data(), buffer.size(), milliseconds(kTimeoutMs), nullptr,
+                              nullptr)
+                    .ok());
+}
+
+void TestSendToOtherPeerOnConnectedSocket() {
+    PrintCase("udp: connected socket can SendTo a different peer");
+    UdpTransport first;
+    UdpTransport second;
+    UdpTransport client;
+    Endpoint first_local;
+    Endpoint second_local;
+    Endpoint client_local;
+    BENTO_CHECK(BindLoopback(&first, &first_local));
+    BENTO_CHECK(BindLoopback(&second, &second_local));
+    BENTO_CHECK(BindLoopback(&client, &client_local));
+    BENTO_CHECK(client.Connect(first_local, milliseconds(kTimeoutMs)).ok());
+
+    std::vector<std::uint8_t> buffer(32);
+    const std::vector<std::uint8_t> direct = {'d'};
+    BENTO_CHECK(client.Write(direct.data(), direct.size(), milliseconds(kTimeoutMs)).ok());
+    BENTO_CHECK_EQ(first
+                       .RecvFrom(buffer.data(), buffer.size(), milliseconds(kTimeoutMs), nullptr,
+                                 nullptr)
+                       .bytes,
+                   direct.size());
+
+    const std::vector<std::uint8_t> other = {'o', 't', 'h', 'e', 'r'};
+    BENTO_CHECK(client
+                    .SendTo(second_local, other.data(), other.size(), milliseconds(kTimeoutMs))
+                    .ok());
+    Endpoint peer;
+    UdpTransport::RecvInfo info;
+    const Result received = second.RecvFrom(buffer.data(), buffer.size(),
+                                            milliseconds(kTimeoutMs), &peer, &info);
+    BENTO_CHECK(received.ok());
+    BENTO_CHECK_EQ(received.bytes, other.size());
+    BENTO_CHECK_EQ(peer.port, client_local.port);
+    BENTO_CHECK(std::equal(other.begin(), other.end(), buffer.begin()));
+}
+
+void TestConnectedReadTruncation() {
+    PrintCase("udp: connected Read truncates silently (documented)");
+    UdpTransport reader;
+    UdpTransport writer;
+    Endpoint reader_local;
+    Endpoint writer_local;
+    BENTO_CHECK(BindLoopback(&reader, &reader_local));
+    BENTO_CHECK(BindLoopback(&writer, &writer_local));
+    BENTO_CHECK(writer.Connect(reader_local, milliseconds(kTimeoutMs)).ok());
+    BENTO_CHECK(reader.Connect(writer_local, milliseconds(kTimeoutMs)).ok());
+
+    const std::vector<std::uint8_t> payload = MakePattern(4096, 0x4096U);
+    BENTO_CHECK(writer.Write(payload.data(), payload.size(), milliseconds(kTimeoutMs)).ok());
+    std::vector<std::uint8_t> small(64);
+    const Result truncated = reader.Read(small.data(), small.size(), milliseconds(kTimeoutMs));
+    BENTO_CHECK(truncated.ok());
+    BENTO_CHECK_EQ(truncated.bytes, small.size());
+    BENTO_CHECK(std::equal(small.begin(), small.end(), payload.begin()));
+    // 截断的剩余部分被内核丢弃，UDP 没有流式补读。
+    const Result extra = reader.Read(small.data(), small.size(), milliseconds(20));
+    BENTO_CHECK_EQ(extra.code, Code::kTimeout);
+}
+
+void TestConcurrentSend() {
+    PrintCase("udp: concurrent SendTo from four threads keeps boundaries");
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 250;
+    UdpTransport server;
+    UdpTransport sender;
+    Endpoint server_local;
+    Endpoint sender_local;
+    BENTO_CHECK(BindLoopback(&server, &server_local));
+    BENTO_CHECK(BindLoopback(&sender, &sender_local));
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int index = 0; index < kThreads; ++index) {
+        threads.emplace_back([&sender, server_local, index]() {
+            std::vector<std::uint8_t> payload(128, static_cast<std::uint8_t>(index + 1));
+            for (int i = 0; i < kPerThread; ++i) {
+                payload[0] = static_cast<std::uint8_t>(index + 1);
+                payload[1] = static_cast<std::uint8_t>(i & 0xFF);
+                (void)sender.SendTo(server_local, payload.data(), payload.size(),
+                                    milliseconds(kTimeoutMs));
+                if ((i % 8) == 7) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                }
+            }
+        });
+    }
+
+    std::vector<std::uint8_t> buffer(kIoBufferBytes);
+    std::array<int, kThreads> received = {0, 0, 0, 0};
+    int corrupt = 0;
+    int total = 0;
+    const Clock::time_point deadline = Clock::now() + milliseconds(5000);
+    while (total < kThreads * kPerThread && Clock::now() < deadline) {
+        Endpoint peer;
+        UdpTransport::RecvInfo info;
+        const Result got = server.RecvFrom(buffer.data(), buffer.size(), milliseconds(200),
+                                           &peer, &info);
+        if (!got.ok()) {
+            continue;
+        }
+        const int tag = buffer[0];
+        bool uniform = got.bytes == 128 && tag >= 1 && tag <= kThreads;
+        for (std::size_t i = 2; uniform && i < got.bytes; ++i) {
+            if (buffer[i] != static_cast<std::uint8_t>(tag)) {
+                uniform = false;
+            }
+        }
+        if (!uniform) {
+            ++corrupt;
+            continue;
+        }
+        ++received[static_cast<std::size_t>(tag - 1)];
+        ++total;
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    BENTO_CHECK_EQ(corrupt, 0);
+    BENTO_CHECK_EQ(total, kThreads * kPerThread);
+    for (int index = 0; index < kThreads; ++index) {
+        BENTO_CHECK_EQ(received[static_cast<std::size_t>(index)], kPerThread);
+    }
+}
+
+void TestNoFdLeak() {
+    PrintCase("udp: Bind/Close and failed Bind do not leak fds");
+    const int before = CountOpenFds();
+    BENTO_CHECK(before >= 0);
+    bool all_ok = true;
+    for (int i = 0; i < 200; ++i) {
+        UdpTransport transport;
+        if (!transport.Bind({"127.0.0.1", 0}).ok() || !transport.Close().ok()) {
+            all_ok = false;
+            break;
+        }
+    }
+    BENTO_CHECK(all_ok);
+
+    UdpTransport holder;
+    BENTO_CHECK(holder.Bind({"127.0.0.1", 0}).ok());
+    Endpoint held;
+    BENTO_CHECK(holder.LocalEndpoint(&held).ok());
+    bool all_failed = true;
+    for (int i = 0; i < 50; ++i) {
+        UdpTransport transport;
+        if (transport.Bind({held.host, held.port}).ok()) {
+            all_failed = false;
+            break;
+        }
+    }
+    BENTO_CHECK(all_failed);
+    // holder 仍占着一个 fd；先关掉再比对基线。
+    BENTO_CHECK(holder.Close().ok());
+    BENTO_CHECK_EQ(CountOpenFds(), before);
+}
+
 }  // namespace
 
 int main() {
@@ -622,5 +909,12 @@ int main() {
     TestShutdownWriteAndClose();
     TestOversizedDatagram();
     TestIpv6Loopback();
+    TestTimeoutClamp();
+    TestNonBlockingReadyData();
+    TestWildcardBind();
+    TestSendToOtherPeerOnConnectedSocket();
+    TestConnectedReadTruncation();
+    TestConcurrentSend();
+    TestNoFdLeak();
     return bento_test::Finish("udp_transport");
 }
