@@ -800,7 +800,13 @@ void ReliableChannel::Acknowledge(Outgoing& message, std::uint64_t now_ms) {
             : message.payload.size();
     m_bandwidth.OnAck(now_ms, app_bytes);
     // Karn 算法：重传过的消息不采样 RTT，避免把重传等待算进 RTT。
-    if (!message.ever_retransmitted && !message.hol_blocked &&
+    // hol_blocked 表示「这条消息的 ACK 时刻可能被 HOL 推迟」，常规情况跳过；
+    // 但在还没有任何 RTT 样本时允许它参与采样：SACK 空洞会把同一突发的
+    // 所有后续消息都标成 hol_blocked，若严格跳过，srtt 会永远锁死在初始值
+    // （1Mbit 场景 200 条消息 0 个样本，PTO 固定 600ms < 实际 RTT 650ms，
+    // 每批消息集体伪超时，实测 274 次重传）。有了首样本后立即恢复严格策略。
+    const bool bootstrap_sample = !m_rtt.has_sample();
+    if (!message.ever_retransmitted && (!message.hol_blocked || bootstrap_sample) &&
         now_ms >= message.first_send_ms) {
         // 本地回环/同机场景实际 RTT 可能 <1ms：钳到 1ms，避免 0 RTT 把
         // srtt/rttvar 退化为 0 并污染统计与 pacing 分母。

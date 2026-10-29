@@ -40,6 +40,14 @@ struct Options {
     std::uint32_t seed = 0x9E3779B9U;
     bool fixed_pto = false;  ///< 复现旧实现：固定 200ms 基础 PTO。
     bool verbose = false;    ///< 每秒打印一次收发进度（诊断长尾卡顿）。
+    // 调参覆盖项（0 = 用库默认值）：一次构建即可扫多组弱网参数。
+    std::uint32_t initial_cwnd = 0;
+    std::uint32_t max_cwnd = 0;
+    std::uint32_t fr_threshold = 0;
+    std::uint32_t initial_rtt_ms = 0;
+    std::uint32_t min_pto_ms = 0;
+    std::uint32_t max_pto_ms = 0;
+    std::uint32_t ack_interval_ms = 0;
 };
 
 void WriteU32(std::uint8_t* out, std::uint32_t value) {
@@ -80,6 +88,27 @@ bool ParseOptions(int argc, char** argv, Options* options) {
             options->fixed_pto = true;
         } else if (std::strcmp(argument, "--verbose") == 0) {
             options->verbose = true;
+        } else if (std::strcmp(argument, "--initial-cwnd") == 0 && i + 1 < argc) {
+            options->initial_cwnd =
+                static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argument, "--max-cwnd") == 0 && i + 1 < argc) {
+            options->max_cwnd =
+                static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argument, "--fr-threshold") == 0 && i + 1 < argc) {
+            options->fr_threshold =
+                static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argument, "--initial-rtt") == 0 && i + 1 < argc) {
+            options->initial_rtt_ms =
+                static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argument, "--min-pto") == 0 && i + 1 < argc) {
+            options->min_pto_ms =
+                static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argument, "--max-pto") == 0 && i + 1 < argc) {
+            options->max_pto_ms =
+                static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (std::strcmp(argument, "--ack-interval-ms") == 0 && i + 1 < argc) {
+            options->ack_interval_ms =
+                static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else {
             std::fprintf(stderr, "unknown or incomplete argument: %s\n", argument);
             return false;
@@ -119,6 +148,31 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // 调参覆盖：只改显式给出的项，其余保持库默认。
+    auto apply_tuning = [&options](LinkConfig& config) {
+        if (options.initial_cwnd != 0) {
+            config.reliable.congestion.initial_cwnd_packets = options.initial_cwnd;
+        }
+        if (options.max_cwnd != 0) {
+            config.reliable.congestion.max_cwnd_packets = options.max_cwnd;
+        }
+        if (options.fr_threshold != 0) {
+            config.reliable.fast_retransmit_threshold = options.fr_threshold;
+        }
+        if (options.initial_rtt_ms != 0) {
+            config.reliable.rtt.initial_rtt_ms = options.initial_rtt_ms;
+        }
+        if (options.min_pto_ms != 0) {
+            config.reliable.rtt.min_pto_ms = options.min_pto_ms;
+        }
+        if (options.max_pto_ms != 0) {
+            config.reliable.rtt.max_pto_ms = options.max_pto_ms;
+        }
+        if (options.ack_interval_ms != 0) {
+            config.ack_interval_ms = options.ack_interval_ms;
+        }
+    };
+
     LinkConfig server_config;
     server_config.bind_address = "127.0.0.1";
     server_config.bind_port = options.port;
@@ -128,6 +182,7 @@ int main(int argc, char** argv) {
     if (options.fixed_pto) {
         server_config.reliable.rtt.fixed_pto_ms = 200;
     }
+    apply_tuning(server_config);
     Link server(server_config);
     std::string error;
     if (!server.Open(&error)) {
@@ -171,6 +226,7 @@ int main(int argc, char** argv) {
     if (options.fixed_pto) {
         client_config.reliable.rtt.fixed_pto_ms = 200;
     }
+    apply_tuning(client_config);
     Link client(client_config);
     if (!client.Open(&error)) {
         std::fprintf(stderr, "netem_probe: client.Open failed: %s\n", error.c_str());
