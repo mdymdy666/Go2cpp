@@ -1,5 +1,3 @@
-#pragma once
-
 /**
  * @file keystore.hpp
  * @brief 通用密钥管理：多来源加载、脱敏、常量时间比较与轮换过渡窗口。
@@ -13,6 +11,9 @@
  *          - **不泄漏明文**：所有错误文本与 `LogSink` 日志只包含来源、
  *            长度与 `Masked()` 掩码，绝不拼接密钥本身。加载失败的输入也
  *            不会出现在错误里（防止把「错误日志」变成密钥泄漏渠道）。
+ *            `Key` 的析构与赋值会用 `explicit_bzero` 清零内部 32B 缓冲，
+ *            `Masked()` 直接生成掩码、不产生完整 hex 临时串；文件加载的
+ *            内容缓冲在返回前清零。`ToHex()` 仍会返回明文，调用方负责清理。
  *          - **轮换过渡**：`Rotate()` 保留上一代密钥一个可配置窗口
  *            （默认 5 分钟），窗口内 `Accepts()` 同时接受新旧密钥，便于
  *            对端逐步换 key；窗口外 `Previous()` 返回空 Key，旧密钥不再
@@ -23,9 +24,12 @@
  *            长度不同的分支不可避免（长度不是秘密），但内容比较总是走完
  *            两个输入的最大长度。
  *
- *          线程模型：`KeyStore` 是配置期对象，内部不加锁。加载/轮换与读取
- *          必须由调用方串行化；加载成功后 `Current()` 保持有效，直到下一次
- *          成功加载或 `Rotate()`。加载失败不会破坏已加载的密钥。
+ *          线程模型：`KeyStore` 是配置期对象，内部不加锁。并发只读
+ *          （`loaded()`/`Current()`/`Previous()`/`HasUsablePrevious()`/
+ *          `Accepts()`）是安全的；所有写操作（`Load*()`/`Rotate()`/
+ *          `SetLogSink()`/`ClearWarnings()`/`SetRotationRetentionMs()`）
+ *          必须与其它访问串行化。加载成功后 `Current()` 保持有效，直到
+ *          下一次成功加载或 `Rotate()`；加载失败不会破坏已加载的密钥。
  *
  *          集成方式：`KeyStore::Key` 提供 `data()/size()`，可直接传给
  *          `PeerHub::SetPreSharedKey` / `Link::SetPreSharedKey`。为避免
@@ -60,15 +64,25 @@ inline constexpr std::size_t kKeyBytes256 = 32;
 inline constexpr std::size_t kKeyMaxBytes = kKeyBytes256;
 
 /// @brief 密钥存储：编码加载、脱敏、比较与轮换。
-/// @note 非线程安全；作为配置期对象使用。
+/// @note 非线程安全写；作为配置期对象使用（并发只读安全）。
 class KeyStore final {
-   public:
+  public:
     /// @brief 单个密钥。默认构造为空 Key（`valid() == false`）。
-    /// @details 内部按 32B 定长存储，拷贝是值语义。`data()`/`ToHex()` 会暴露
-    ///          明文，仅用于传给密码学 API 或持久化；**禁止**写入日志。
+    /// @details 内部按 32B 定长存储，拷贝是值语义。析构/赋值会清零内部
+    ///          缓冲；`data()`/`ToHex()` 仍会暴露明文，仅用于传给密码学
+    ///          API 或持久化，**禁止**写入日志。
     class Key final {
-       public:
+      public:
         Key() = default;
+
+        /// @brief 清零内部缓冲；释放后不留下密钥字节。
+        ~Key();
+
+        Key(const Key&) = default;
+        Key(Key&&) = default;
+        /// @brief 先清零自身，再做 32B 值拷贝；保证未使用区不残留旧密钥。
+        Key& operator=(const Key& other) noexcept;
+        Key& operator=(Key&& other) noexcept;
 
         /// @brief 从字节构造；长度不是 16/32 或 data 为空时返回空 Key。
         static Key FromBytes(const std::uint8_t* data, std::size_t bytes);
@@ -87,10 +101,11 @@ class KeyStore final {
 
         /// @brief 脱敏显示：保留十六进制前 4 后 4 个字符，其余替换为 `*`。
         /// @details 长度与 `ToHex()` 相同（每字节 2 个字符）；空 Key 返回
-        ///          `"<empty>"`。该结果可以安全写入日志。
+        ///          `"<empty>"`。实现直接写掩码，不生成完整明文临时串。
+        ///          该结果可以安全写入日志。
         std::string Masked() const;
 
-       private:
+      private:
         std::array<std::uint8_t, kKeyMaxBytes> m_bytes{};
         std::size_t m_bytes_used = 0;
     };
@@ -171,7 +186,7 @@ class KeyStore final {
     /// @brief 注入日志回调（传空 `LogSink` 卸载）。
     void SetLogSink(LogSink sink);
 
-    /// @brief 累计的非致命告警（目前是文件权限告警）。
+    /// @brief 累计的非致命告警（同一文本只记一次，防止热加载时无界增长）。
     const std::vector<std::string>& warnings() const noexcept;
 
     /// @brief 清空告警，便于测试隔离。
@@ -188,7 +203,7 @@ class KeyStore final {
     static bool ConstantTimeEquals(const std::uint8_t* a, std::size_t a_bytes,
                                    const std::uint8_t* b, std::size_t b_bytes) noexcept;
 
-   private:
+  private:
     /// 解析并原子替换当前密钥；失败不修改状态。
     error::ErrorPtr LoadDecoded(std::string_view text, const char* source);
     void AddWarning(std::string message);
@@ -203,16 +218,15 @@ class KeyStore final {
     mutable std::uint64_t m_sink_failures = 0;
 };
 
-/// @brief 把 KeyStore::Key 应用到任何提供 `SetPreSharedKey(data, size)` 的对象。
+/// @brief 把 KeyStore::Key 应用到任何提供 `SetPreSharedKey(data, size)`
+/// 的对象。
 /// @details 用于 `PeerHub` / `Link`，无需让 keystore 依赖传输层头文件。
 ///          16B Key 对这两个传输对象会返回 false（它们要求 32B PSK）。
-template <typename Target>
-bool ApplyPreSharedKey(Target& target, const KeyStore::Key& key)
-{
+template <typename Target> bool ApplyPreSharedKey(Target& target, const KeyStore::Key& key) {
     if (!key.valid()) {
         return false;
     }
     return target.SetPreSharedKey(key.data(), key.size());
 }
 
-}  // namespace go2cpp::bento
+} // namespace go2cpp::bento

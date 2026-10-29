@@ -27,11 +27,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <random>
 #include <string>
 #include <string_view>
@@ -712,6 +714,343 @@ void TestLinkIntegration() {
 }
 
 // ---------------------------------------------------------------------------
+// 内存卫生 / 告警去重 / 并发只读 / 输入上限 / 权限 / 随机规则
+// ---------------------------------------------------------------------------
+
+/// 16B Key 的 32B 内部缓冲尾部必须为零（32B -> 16B 替换不残留旧密钥）。
+bool TailIsZero(const KeyStore::Key& key) noexcept {
+    for (std::size_t i = key.size(); i < kKeyMaxBytes; ++i) {
+        if (key.data()[i] != 0U) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void TestKeyMemoryHygiene() {
+    const KeyStore::Key wide = MakeKey(0x31, 32);
+    const KeyStore::Key narrow = MakeKey(0x32, 16);
+
+    KeyStore store;
+    BENTO_CHECK(store.Rotate(wide));
+    BENTO_CHECK(store.Rotate(narrow));
+    BENTO_CHECK(TailIsZero(store.Current()));
+
+    // Load 16B 覆盖 32B Current：内部缓冲先清零再写入。
+    BENTO_CHECK(store.LoadFromString(HexEncode(MakeBytes(0x33, 16))) == nullptr);
+    BENTO_CHECK_EQ(store.Current().size(), 16U);
+    BENTO_CHECK(TailIsZero(store.Current()));
+
+    // Key 赋值：目标 32B 缓冲先清零，再写入 16B。
+    KeyStore::Key assigned = wide;
+    assigned = narrow;
+    BENTO_CHECK_EQ(assigned.size(), 16U);
+    BENTO_CHECK(TailIsZero(assigned));
+
+    // 析构后，密钥字节不应再以连续 32B 形式留在对象存储中。
+    const std::vector<std::uint8_t> secret = MakeBytes(0x34, 32);
+    alignas(KeyStore::Key) unsigned char storage[sizeof(KeyStore::Key)];
+    std::memset(storage, 0, sizeof(storage));
+    KeyStore::Key* placed =
+        ::new (storage) KeyStore::Key(KeyStore::Key::FromBytes(secret.data(), secret.size()));
+    BENTO_CHECK_EQ(placed->ToHex(), HexEncode(secret));
+    volatile std::uint8_t first = placed->data()[0];
+    (void)first;
+    placed->~Key();
+    bool found = false;
+    for (std::size_t offset = 0; offset + secret.size() <= sizeof(storage); ++offset) {
+        if (std::memcmp(storage + offset, secret.data(), secret.size()) == 0) {
+            found = true;
+        }
+    }
+    BENTO_CHECK(!found);
+
+    // 空 Key 的缓冲保持全零。
+    const KeyStore::Key empty;
+    BENTO_CHECK(TailIsZero(empty));
+    BENTO_CHECK_EQ(empty.size(), 0U);
+}
+
+void TestWarningsDeduplicated() {
+    const std::string hex = HexEncode(MakeBytes(0x41, 32));
+    TempFile file;
+    BENTO_CHECK(file.valid());
+    BENTO_CHECK(file.Write(hex + "\n"));
+    BENTO_CHECK(file.SetMode(0644));
+    file.Close();
+
+    KeyStore store;
+    for (int i = 0; i < 100; ++i) {
+        BENTO_CHECK(store.LoadFromFile(file.path()) == nullptr);
+    }
+    // 热加载同一宽松权限文件 100 次，告警只累计 1 条。
+    BENTO_CHECK_EQ(store.warnings().size(), 1U);
+    if (!store.warnings().empty()) {
+        BENTO_CHECK(Contains(store.warnings()[0], "0644"));
+    }
+}
+
+void TestConcurrentReads() {
+    const KeyStore::Key key_a = MakeKey(0x51, 32);
+    const KeyStore::Key key_b = MakeKey(0x52, 32);
+    const KeyStore::Key key_c = MakeKey(0x53, 32);
+    KeyStore shared;
+    BENTO_CHECK(shared.Rotate(key_a));
+    BENTO_CHECK(shared.Rotate(key_b));
+
+    constexpr int kThreads = 8;
+    constexpr int kReads = 50000;
+    std::atomic<int> bad{0};
+    std::vector<std::thread> readers;
+    readers.reserve(kThreads);
+    for (int thread = 0; thread < kThreads; ++thread) {
+        readers.emplace_back([&shared, &key_a, &key_b, &key_c, &bad]() {
+            for (int i = 0; i < kReads; ++i) {
+                if (!shared.Accepts(key_a) || !shared.Accepts(key_b) ||
+                    shared.Accepts(key_c) || shared.Current().size() != 32U ||
+                    shared.Previous().size() != 32U) {
+                    bad.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (std::thread& reader : readers) {
+        reader.join();
+    }
+    BENTO_CHECK_EQ(bad.load(), 0);
+
+    // 每线程独立 KeyStore：Load + Accepts 不共享状态。
+    const std::string hex = HexEncode(MakeBytes(0x54, 32));
+    std::atomic<int> local_bad{0};
+    std::vector<std::thread> loaders;
+    loaders.reserve(kThreads);
+    for (int thread = 0; thread < kThreads; ++thread) {
+        loaders.emplace_back([&hex, &key_c, &local_bad]() {
+            KeyStore local;
+            for (int i = 0; i < 10000; ++i) {
+                if (local.LoadFromString(hex) != nullptr ||
+                    !local.Accepts(local.Current()) || local.Accepts(key_c)) {
+                    local_bad.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (std::thread& loader : loaders) {
+        loader.join();
+    }
+    BENTO_CHECK_EQ(local_bad.load(), 0);
+}
+
+void TestInputLimits() {
+    KeyStore store;
+    const std::string oversized(5000, 'a');
+    error::ErrorPtr err = store.LoadFromString(oversized);
+    BENTO_CHECK(err != nullptr);
+    BENTO_CHECK(error::Has(err, error::ErrorCode::kResourceExhausted));
+
+    // 4096 字符在上限内：解码成 2048 字节后按「不是 16/32」拒绝。
+    const std::string at_limit(4096, 'a');
+    err = store.LoadFromString(at_limit);
+    BENTO_CHECK(err != nullptr);
+    BENTO_CHECK(error::Has(err, error::ErrorCode::kInvalidArgument));
+    BENTO_CHECK(Contains(error::ErrorMessage(err), "not 16 or 32"));
+
+    // max_input_bytes=0 回退默认 4096（而不是把一切输入都拒绝）。
+    KeyStore::Config config;
+    config.max_input_bytes = 0;
+    KeyStore fallback(config);
+    err = fallback.LoadFromString(oversized);
+    BENTO_CHECK(err != nullptr);
+    BENTO_CHECK(error::Has(err, error::ErrorCode::kResourceExhausted));
+    err = fallback.LoadFromString(at_limit);
+    BENTO_CHECK(err != nullptr);
+    BENTO_CHECK(error::Has(err, error::ErrorCode::kInvalidArgument));
+
+    const std::string name = "BENTO_KEYSTORE_LIMIT_ENV_" + std::to_string(::getpid());
+    BENTO_CHECK(::setenv(name.c_str(), oversized.c_str(), 1) == 0);
+    err = store.LoadFromEnv(name);
+    BENTO_CHECK(err != nullptr);
+    BENTO_CHECK(error::Has(err, error::ErrorCode::kResourceExhausted));
+    ::unsetenv(name.c_str());
+}
+
+void TestFilePermissionDenied() {
+    if (::geteuid() == 0) {
+        // root 不受文件 mode 0000 限制；条件跳过，不产生 SKIP 退出码。
+        return;
+    }
+    TempFile file;
+    BENTO_CHECK(file.valid());
+    BENTO_CHECK(file.Write(HexEncode(MakeBytes(0x61, 16))));
+    BENTO_CHECK(file.SetMode(0000));
+    file.Close();
+
+    KeyStore store;
+    const error::ErrorPtr err = store.LoadFromFile(file.path());
+    BENTO_CHECK(err != nullptr);
+    BENTO_CHECK(error::Has(err, error::ErrorCode::kPermissionDenied));
+}
+
+void TestRotationSameKey() {
+    const KeyStore::Key key = MakeKey(0x71, 32);
+    KeyStore store;
+    BENTO_CHECK(store.Rotate(key));
+    BENTO_CHECK(store.Rotate(key));
+    BENTO_CHECK(store.Accepts(key));
+    BENTO_CHECK(store.HasUsablePrevious());
+    BENTO_CHECK_EQ(store.Previous().ToHex(), key.ToHex());
+    // 记录语义：相同密钥轮换只刷新窗口，Current/Previous 内容相同。
+}
+
+void TestBase64EdgeCases() {
+    const std::vector<std::uint8_t> raw16 = MakeBytes(0x81, 16);
+    const std::vector<std::uint8_t> raw32 = MakeBytes(0x82, 32);
+    const std::string b64_16 = Base64Encode(raw16);
+    const std::string b64_32 = Base64Encode(raw32);
+
+    KeyStore store;
+    BENTO_CHECK(store.LoadFromString("base64:" + b64_16) == nullptr);
+    BENTO_CHECK_EQ(store.Current().ToHex(), HexEncode(raw16));
+    BENTO_CHECK(store.LoadFromString("base64:" + b64_32) == nullptr);
+    BENTO_CHECK_EQ(store.Current().ToHex(), HexEncode(raw32));
+
+    const std::array<const char*, 8> invalid{
+        "base64:AAAAA",     // data_bytes % 4 == 1
+        "base64:AAA=",      // 解码 2 字节，长度错误
+        "base64:AA==",      // 解码 1 字节，长度错误
+        "base64:A===",      // padding 过多
+        "base64:AAAA====",  // padding 过多
+        "base64:AB$C",      // 非法字符
+        "base64:AB-_",      // 不支持 URL-safe 字符
+        "base64:",          // 空体
+    };
+    for (const char* text : invalid) {
+        const error::ErrorPtr err = store.LoadFromString(text);
+        BENTO_CHECK(err != nullptr);
+        BENTO_CHECK(error::Has(err, error::ErrorCode::kInvalidArgument));
+        BENTO_CHECK_EQ(store.Current().ToHex(), HexEncode(raw32));
+    }
+
+    // 16B 无 padding 形式（22 字符）与 32B 无 padding 形式（43 字符）。
+    std::string no_padding_16 = b64_16;
+    while (!no_padding_16.empty() && no_padding_16.back() == '=') {
+        no_padding_16.pop_back();
+    }
+    BENTO_CHECK(store.LoadFromString("base64:" + no_padding_16) == nullptr);
+    BENTO_CHECK_EQ(store.Current().ToHex(), HexEncode(raw16));
+    std::string no_padding_32 = b64_32;
+    while (!no_padding_32.empty() && no_padding_32.back() == '=') {
+        no_padding_32.pop_back();
+    }
+    BENTO_CHECK(store.LoadFromString("base64:" + no_padding_32) == nullptr);
+    BENTO_CHECK_EQ(store.Current().ToHex(), HexEncode(raw32));
+}
+
+void TestRandomInputsAgainstRules() {
+    std::mt19937 random(0x20261029U);
+    KeyStore store;
+    int successes = 0;
+    int constructed_failures = 0;
+    int random_successes = 0;
+    int random_failures = 0;
+
+    for (int iteration = 0; iteration < 1000; ++iteration) {
+        std::string input;
+        std::vector<std::uint8_t> expected;
+        const int kind = iteration / 200;  // 0/1 合法，2/3 构造非法，4 随机
+        if (kind == 0) {
+            const std::size_t bytes = (random() % 2U == 0U) ? 16U : 32U;
+            expected = MakeBytes(static_cast<std::uint8_t>(random()), bytes);
+            std::string hex = HexEncode(expected);
+            for (char& value : hex) {
+                if (value >= 'a' && value <= 'f' && random() % 2U == 0U) {
+                    value = static_cast<char>(value - 'a' + 'A');
+                }
+            }
+            if (random() % 2U == 0U) {
+                hex = "hex:" + hex;
+            }
+            if (random() % 4U == 0U) {
+                hex = " \n" + hex + "\t";
+            }
+            input = std::move(hex);
+        } else if (kind == 1) {
+            const std::size_t bytes = (random() % 2U == 0U) ? 16U : 32U;
+            expected = MakeBytes(static_cast<std::uint8_t>(random()), bytes);
+            std::string text = Base64Encode(expected);
+            if (random() % 2U == 0U) {
+                while (!text.empty() && text.back() == '=') {
+                    text.pop_back();
+                }
+            }
+            if (random() % 2U == 0U) {
+                text = "base64:" + text;
+            }
+            input = std::move(text);
+        } else if (kind == 2) {
+            // 合法 32B hex 中随机破坏一个字符。
+            std::string text = HexEncode(MakeBytes(static_cast<std::uint8_t>(random()), 32));
+            const std::size_t where = random() % text.size();
+            text[where] = (random() % 2U == 0U) ? 'z' : '$';
+            input = std::move(text);
+        } else if (kind == 3) {
+            // 合法 hex，但解码长度不是 16/32。
+            static constexpr std::size_t kBadLengths[] = {1U, 8U, 15U, 17U, 24U, 31U, 33U, 64U};
+            const std::size_t bytes = kBadLengths[random() % 8U];
+            input = HexEncode(MakeBytes(static_cast<std::uint8_t>(random()), bytes));
+        } else {
+            std::uniform_int_distribution<int> length(0, 130);
+            std::uniform_int_distribution<int> character(0x20, 0x7E);
+            const int size = length(random);
+            std::string text(static_cast<std::size_t>(size), '\0');
+            for (char& value : text) {
+                value = static_cast<char>(character(random));
+            }
+            input = std::move(text);
+        }
+
+        const error::ErrorPtr err = store.LoadFromString(input);
+        if (kind == 0 || kind == 1) {
+            BENTO_CHECK(err == nullptr);
+            if (err == nullptr) {
+                ++successes;
+                BENTO_CHECK_EQ(store.Current().size(), expected.size());
+                BENTO_CHECK_EQ(store.Current().ToHex(), HexEncode(expected));
+            }
+        } else if (kind == 2) {
+            BENTO_CHECK(err != nullptr);
+            if (err != nullptr) {
+                ++constructed_failures;
+                BENTO_CHECK(error::Has(err, error::ErrorCode::kInvalidArgument));
+                if (input.size() >= 8U) {
+                    BENTO_CHECK(!Contains(error::ErrorMessage(err), input));
+                }
+            }
+        } else if (kind == 3) {
+            BENTO_CHECK(err != nullptr);
+            if (err != nullptr) {
+                ++constructed_failures;
+                BENTO_CHECK(error::Has(err, error::ErrorCode::kInvalidArgument));
+                BENTO_CHECK(Contains(error::ErrorMessage(err), "not 16 or 32"));
+            }
+        } else if (err == nullptr) {
+            ++random_successes;
+            BENTO_CHECK(store.Current().size() == 16U || store.Current().size() == 32U);
+        } else {
+            ++random_failures;
+            BENTO_CHECK(error::Has(err, error::ErrorCode::kInvalidArgument) ||
+                        error::Has(err, error::ErrorCode::kResourceExhausted));
+            if (input.size() >= 16U) {
+                BENTO_CHECK(!Contains(error::ErrorMessage(err), input));
+            }
+        }
+    }
+    BENTO_CHECK_EQ(successes, 400);
+    BENTO_CHECK_EQ(constructed_failures, 400);
+    BENTO_CHECK_EQ(random_successes + random_failures, 200);
+}
+
+// ---------------------------------------------------------------------------
 // 随机 / 压测
 // ---------------------------------------------------------------------------
 
@@ -825,6 +1164,14 @@ int main() {
     Run("apply_psk_helper", TestApplyPreSharedKeyHelper);
     Run("peer_hub_integration", TestPeerHubIntegration);
     Run("link_integration", TestLinkIntegration);
+    Run("key_memory_hygiene", TestKeyMemoryHygiene);
+    Run("warnings_deduplicated", TestWarningsDeduplicated);
+    Run("concurrent_reads", TestConcurrentReads);
+    Run("input_limits", TestInputLimits);
+    Run("file_permission_denied", TestFilePermissionDenied);
+    Run("rotation_same_key", TestRotationSameKey);
+    Run("base64_edge_cases", TestBase64EdgeCases);
+    Run("random_inputs_rules", TestRandomInputsAgainstRules);
     Run("random_inputs", TestRandomInputs);
     Run("random_round_trip", TestRandomRoundTrip);
     Run("benchmarks", TestBenchmarks);

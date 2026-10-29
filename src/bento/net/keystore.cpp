@@ -1,6 +1,13 @@
 /**
  * @file keystore.cpp
  * @brief KeyStore 实现：hex/base64 解码、文件权限告警、轮换与常量时间比较。
+ * @details 性能与安全要点：
+ *          - 成功加载路径尽量零堆分配：输入无空白时直接在调用方缓冲上解析，
+ *            解码写入 32B 栈缓冲，不再经 `std::vector`；
+ *          - 未安装 `LogSink` 时不构造日志字符串（`Masked()`/`to_string`），
+ *            热加载路径因此不再产生日志临时分配；
+ *          - 密钥缓冲、文件内容与解码中间缓冲在离开作用域前用
+ *            `explicit_bzero` 清零（编译器不会把它优化成死存储）。
  * @author go2cpp contributors
  * @date 2026-10-28
  * @copyright MIT License
@@ -9,6 +16,7 @@
 #include "go2cpp/bento/net/keystore.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -21,7 +29,6 @@
 #include <system_error>
 #include <unistd.h>
 #include <utility>
-#include <vector>
 
 namespace go2cpp::bento {
 namespace {
@@ -35,6 +42,14 @@ std::uint64_t NowMs() noexcept {
 
 bool IsKeyLength(std::size_t bytes) noexcept {
     return bytes == kKeyBytes128 || bytes == kKeyBytes256;
+}
+
+/// 保证不被优化掉的内存清零（glibc `explicit_bzero`，按字写 + 编译器屏障）。
+void SecureClear(void* data, std::size_t bytes) noexcept {
+    if (data == nullptr || bytes == 0U) {
+        return;
+    }
+    ::explicit_bzero(data, bytes);
 }
 
 char ToLowerAscii(char value) noexcept {
@@ -59,6 +74,15 @@ bool StartsWithIgnoreCase(std::string_view text, std::string_view prefix) noexce
 bool IsAsciiWhitespace(char value) noexcept {
     return value == ' ' || value == '\t' || value == '\r' || value == '\n' || value == '\f' ||
            value == '\v';
+}
+
+bool ContainsAsciiWhitespace(std::string_view text) noexcept {
+    for (const char value : text) {
+        if (IsAsciiWhitespace(value)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string StripWhitespace(std::string_view text) {
@@ -117,7 +141,18 @@ int Base64Value(char value) noexcept {
     return -1;
 }
 
-error::ErrorPtr DecodeHex(std::string_view text, std::vector<std::uint8_t>* out) {
+/// 统一「长度不是 16/32」错误；错误文本只含长度，不回显输入。
+error::ErrorPtr MakeLengthError(std::size_t bytes) {
+    std::string message = "keystore: key length ";
+    message += std::to_string(bytes);
+    message += " bytes is not 16 or 32";
+    return error::NewError(std::move(message), error::ErrorCode::kInvalidArgument);
+}
+
+/// 解码 hex 到 `out`（容量至少 kKeyMaxBytes）。
+/// @details 先完整校验字符，再检查长度，最后写入；错误顺序与旧实现一致
+///          （非 hex 字符优先于长度错误）。`out_bytes` 仅在成功时写入。
+error::ErrorPtr DecodeHex(std::string_view text, std::uint8_t* out, std::size_t* out_bytes) {
     if (text.empty()) {
         return error::NewError("keystore: hex key is empty", error::ErrorCode::kInvalidArgument);
     }
@@ -125,21 +160,29 @@ error::ErrorPtr DecodeHex(std::string_view text, std::vector<std::uint8_t>* out)
         return error::NewError("keystore: hex key has an odd number of characters",
                                error::ErrorCode::kInvalidArgument);
     }
-    std::vector<std::uint8_t> bytes(text.size() / 2U);
-    for (std::size_t i = 0; i < bytes.size(); ++i) {
-        const int high = HexValue(text[i * 2U]);
-        const int low = HexValue(text[i * 2U + 1U]);
-        if (high < 0 || low < 0) {
+    const std::size_t bytes = text.size() / 2U;
+    for (std::size_t i = 0; i < bytes; ++i) {
+        if (HexValue(text[i * 2U]) < 0 || HexValue(text[i * 2U + 1U]) < 0) {
             return error::NewError("keystore: hex key contains a non-hex character",
                                    error::ErrorCode::kInvalidArgument);
         }
-        bytes[i] = static_cast<std::uint8_t>((high << 4) | low);
     }
-    *out = std::move(bytes);
+    if (!IsKeyLength(bytes)) {
+        return MakeLengthError(bytes);
+    }
+    for (std::size_t i = 0; i < bytes; ++i) {
+        const int high = HexValue(text[i * 2U]);
+        const int low = HexValue(text[i * 2U + 1U]);
+        out[i] = static_cast<std::uint8_t>((high << 4) | low);
+    }
+    *out_bytes = bytes;
     return nullptr;
 }
 
-error::ErrorPtr DecodeBase64(std::string_view text, std::vector<std::uint8_t>* out) {
+/// 解码 base64 到 `out`（容量至少 kKeyMaxBytes）。
+/// @details 先校验 padding/长度/字符，再按解码后的字节数做 16/32 检查；
+///          与旧实现一样接受无 padding 与非规范尾部填充位。
+error::ErrorPtr DecodeBase64(std::string_view text, std::uint8_t* out, std::size_t* out_bytes) {
     if (text.empty()) {
         return error::NewError("keystore: base64 key is empty", error::ErrorCode::kInvalidArgument);
     }
@@ -161,35 +204,56 @@ error::ErrorPtr DecodeBase64(std::string_view text, std::vector<std::uint8_t>* o
         return error::NewError("keystore: base64 key has inconsistent padding",
                                error::ErrorCode::kInvalidArgument);
     }
-
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve((data_bytes * 3U) / 4U + 1U);
-    std::uint32_t accumulator = 0;
-    int bits = 0;
     for (std::size_t i = 0; i < data_bytes; ++i) {
-        const int value = Base64Value(text[i]);
-        if (value < 0) {
+        if (Base64Value(text[i]) < 0) {
             return error::NewError("keystore: base64 key contains an invalid character",
                                    error::ErrorCode::kInvalidArgument);
         }
-        accumulator = (accumulator << 6U) | static_cast<std::uint32_t>(value);
+    }
+
+    // 每 6 bit 一个字符，向下取整即解码字节数（尾部 2/3 字符分别产 1/2 字节）。
+    const std::size_t decoded_bytes = (data_bytes * 6U) / 8U;
+    if (!IsKeyLength(decoded_bytes)) {
+        return MakeLengthError(decoded_bytes);
+    }
+
+    std::uint32_t accumulator = 0;
+    int bits = 0;
+    std::size_t written = 0;
+    for (std::size_t i = 0; i < data_bytes; ++i) {
+        accumulator = (accumulator << 6U) | static_cast<std::uint32_t>(Base64Value(text[i]));
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
-            bytes.push_back(static_cast<std::uint8_t>((accumulator >> bits) & 0xFFU));
+            out[written] = static_cast<std::uint8_t>((accumulator >> bits) & 0xFFU);
+            ++written;
         }
     }
-    *out = std::move(bytes);
+    *out_bytes = written;
     return nullptr;
 }
 
 /// 解析一段编码文本；错误信息只描述格式，不回显输入。
+/// @details 无空白时零拷贝解析调用方输入；有空白时只复制一份去空白文本。
 error::ErrorPtr ParseKeyText(std::string_view raw, std::size_t max_bytes, KeyStore::Key* out) {
     if (raw.size() > max_bytes) {
         return error::NewError("keystore: encoded key exceeds the input limit",
                                error::ErrorCode::kResourceExhausted);
     }
-    const std::string text = StripWhitespace(raw);
+
+    // 只在确实含空白时复制；绝大多数调用（配置文件里单行 hex）走零拷贝路径。
+    std::string stripped;
+    std::string_view text = raw;
+    if (ContainsAsciiWhitespace(raw)) {
+        stripped = StripWhitespace(raw);
+        text = stripped;
+    }
+    // RAII：函数任何返回路径都把去空白副本清零（它等价于密钥）。
+    struct StrippedGuard final {
+        std::string& text;
+        ~StrippedGuard() { SecureClear(text.data(), text.size()); }
+    } stripped_guard{stripped};
+
     if (text.empty()) {
         return error::NewError("keystore: empty key input", error::ErrorCode::kInvalidArgument);
     }
@@ -204,32 +268,32 @@ error::ErrorPtr ParseKeyText(std::string_view raw, std::size_t max_bytes, KeySto
         forced_base64 = true;
         body.remove_prefix(7);
     }
-    const std::string normalized = StripWhitespace(body);
-    if (normalized.empty()) {
+    if (body.empty()) {
         return error::NewError("keystore: key body is empty", error::ErrorCode::kInvalidArgument);
     }
 
-    std::vector<std::uint8_t> bytes;
+    std::array<std::uint8_t, kKeyMaxBytes> bytes{};
+    struct BytesGuard final {
+        std::uint8_t* data;
+        std::size_t size;
+        ~BytesGuard() { SecureClear(data, size); }
+    } bytes_guard{bytes.data(), bytes.size()};
+
+    std::size_t decoded_bytes = 0;
     error::ErrorPtr decode_error;
     if (forced_hex) {
-        decode_error = DecodeHex(normalized, &bytes);
+        decode_error = DecodeHex(body, bytes.data(), &decoded_bytes);
     } else if (forced_base64) {
-        decode_error = DecodeBase64(normalized, &bytes);
-    } else if (IsHexText(normalized)) {
-        decode_error = DecodeHex(normalized, &bytes);
+        decode_error = DecodeBase64(body, bytes.data(), &decoded_bytes);
+    } else if (IsHexText(body)) {
+        decode_error = DecodeHex(body, bytes.data(), &decoded_bytes);
     } else {
-        decode_error = DecodeBase64(normalized, &bytes);
+        decode_error = DecodeBase64(body, bytes.data(), &decoded_bytes);
     }
     if (decode_error) {
         return decode_error;
     }
-    if (!IsKeyLength(bytes.size())) {
-        std::string message = "keystore: key length ";
-        message += std::to_string(bytes.size());
-        message += " bytes is not 16 or 32";
-        return error::NewError(std::move(message), error::ErrorCode::kInvalidArgument);
-    }
-    *out = KeyStore::Key::FromBytes(bytes.data(), bytes.size());
+    *out = KeyStore::Key::FromBytes(bytes.data(), decoded_bytes);
     if (!out->valid()) {
         return error::NewError("keystore: failed to construct key", error::ErrorCode::kInternal);
     }
@@ -243,18 +307,35 @@ std::string SystemErrorText(int code) {
 /// 打开失败时把 errno 映射成稳定的 error 语义。
 error::ErrorCode OpenErrorCode(int code) noexcept {
     switch (code) {
-        case EACCES:
-        case EPERM:
-            return error::ErrorCode::kPermissionDenied;
-        case ENOENT:
-        case ENOTDIR:
-            return error::ErrorCode::kNotFound;
-        default:
-            return error::ErrorCode::kUnavailable;
+    case EACCES:
+    case EPERM:
+        return error::ErrorCode::kPermissionDenied;
+    case ENOENT:
+    case ENOTDIR:
+        return error::ErrorCode::kNotFound;
+    default:
+        return error::ErrorCode::kUnavailable;
     }
 }
 
-}  // namespace
+} // namespace
+
+// ---- Key 生命周期 ----
+
+KeyStore::Key::~Key() { SecureClear(m_bytes.data(), m_bytes.size()); }
+
+KeyStore::Key& KeyStore::Key::operator=(const Key& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    // 先清零再拷贝：32B → 16B 的替换不会在后面留下旧密钥的高 16 字节。
+    SecureClear(m_bytes.data(), m_bytes.size());
+    m_bytes = other.m_bytes;
+    m_bytes_used = other.m_bytes_used;
+    return *this;
+}
+
+KeyStore::Key& KeyStore::Key::operator=(Key&& other) noexcept { return *this = other; }
 
 KeyStore::Key KeyStore::Key::FromBytes(const std::uint8_t* data, std::size_t bytes) {
     Key key;
@@ -266,17 +347,11 @@ KeyStore::Key KeyStore::Key::FromBytes(const std::uint8_t* data, std::size_t byt
     return key;
 }
 
-bool KeyStore::Key::valid() const noexcept {
-    return IsKeyLength(m_bytes_used);
-}
+bool KeyStore::Key::valid() const noexcept { return IsKeyLength(m_bytes_used); }
 
-std::size_t KeyStore::Key::size() const noexcept {
-    return m_bytes_used;
-}
+std::size_t KeyStore::Key::size() const noexcept { return m_bytes_used; }
 
-const std::uint8_t* KeyStore::Key::data() const noexcept {
-    return m_bytes.data();
-}
+const std::uint8_t* KeyStore::Key::data() const noexcept { return m_bytes.data(); }
 
 std::string KeyStore::Key::ToHex() const {
     static constexpr char kHexDigits[] = "0123456789abcdef";
@@ -292,18 +367,26 @@ std::string KeyStore::Key::Masked() const {
     if (!valid()) {
         return "<empty>";
     }
-    const std::string hex = ToHex();
-    if (hex.size() <= 8U) {
+    static constexpr char kHexDigits[] = "0123456789abcdef";
+    const std::size_t hex_chars = m_bytes_used * 2U;
+    std::string masked(hex_chars, '*');
+    if (hex_chars <= 8U) {
         // 16/32B 的十六进制串至少 32 字符，这里只是防御未来长度策略变化。
-        return std::string(hex.size(), '*');
+        return masked;
     }
-    std::string masked;
-    masked.reserve(hex.size());
-    masked.append(hex, 0, 4);
-    masked.append(hex.size() - 8U, '*');
-    masked.append(hex, hex.size() - 4U, 4);
+    // 直接写前 4 / 后 4 个十六进制字符，不生成完整明文临时串。
+    masked[0] = kHexDigits[m_bytes[0] >> 4U];
+    masked[1] = kHexDigits[m_bytes[0] & 0x0FU];
+    masked[2] = kHexDigits[m_bytes[1] >> 4U];
+    masked[3] = kHexDigits[m_bytes[1] & 0x0FU];
+    masked[hex_chars - 4U] = kHexDigits[m_bytes[m_bytes_used - 2U] >> 4U];
+    masked[hex_chars - 3U] = kHexDigits[m_bytes[m_bytes_used - 2U] & 0x0FU];
+    masked[hex_chars - 2U] = kHexDigits[m_bytes[m_bytes_used - 1U] >> 4U];
+    masked[hex_chars - 1U] = kHexDigits[m_bytes[m_bytes_used - 1U] & 0x0FU];
     return masked;
 }
+
+// ---- KeyStore ----
 
 KeyStore::KeyStore() : KeyStore(Config{}) {}
 
@@ -364,8 +447,7 @@ error::ErrorPtr KeyStore::LoadFromFile(const std::string& path) {
         return error::NewError("keystore: key file is not a regular file: '" + path + "'",
                                error::ErrorCode::kInvalidArgument);
     }
-    if (info.st_size < 0 ||
-        static_cast<std::uint64_t>(info.st_size) > m_config.max_input_bytes) {
+    if (info.st_size < 0 || static_cast<std::uint64_t>(info.st_size) > m_config.max_input_bytes) {
         std::string message = "keystore: key file exceeds the input limit of ";
         message += std::to_string(m_config.max_input_bytes);
         message += " bytes: '";
@@ -375,9 +457,8 @@ error::ErrorPtr KeyStore::LoadFromFile(const std::string& path) {
     }
     if (m_config.check_file_permissions && (info.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
         std::ostringstream stream;
-        stream << "keystore: warning: key file '" << path << "' mode " << std::oct
-               << std::setw(4) << std::setfill('0')
-               << static_cast<unsigned int>(info.st_mode & 07777U)
+        stream << "keystore: warning: key file '" << path << "' mode " << std::oct << std::setw(4)
+               << std::setfill('0') << static_cast<unsigned int>(info.st_mode & 07777U)
                << " is more permissive than 0600";
         AddWarning(stream.str());
     }
@@ -411,16 +492,18 @@ error::ErrorPtr KeyStore::LoadFromFile(const std::string& path) {
         return error::NewError("keystore: key file is empty: '" + path + "'",
                                error::ErrorCode::kInvalidArgument);
     }
+
+    // 文件内容是编码后的密钥，解析完成后立即清零，避免留在字符串堆缓冲里。
+    struct ContentGuard final {
+        std::string& text;
+        ~ContentGuard() { SecureClear(text.data(), text.size()); }
+    } content_guard{content};
     return LoadDecoded(content, "file");
 }
 
-bool KeyStore::loaded() const noexcept {
-    return m_current.valid();
-}
+bool KeyStore::loaded() const noexcept { return m_current.valid(); }
 
-const KeyStore::Key& KeyStore::Current() const noexcept {
-    return m_current;
-}
+const KeyStore::Key& KeyStore::Current() const noexcept { return m_current; }
 
 const KeyStore::Key& KeyStore::Previous() const noexcept {
     if (HasUsablePrevious()) {
@@ -469,13 +552,15 @@ bool KeyStore::Rotate(const Key& new_key) {
         m_rotated_at_ms = 0;
     }
 
-    std::string message = "keystore: rotated; current=";
-    message += m_current.Masked();
-    message += " previous=";
-    message += m_previous.valid() ? m_previous.Masked() : "<none>";
-    message += " retention_ms=";
-    message += std::to_string(m_config.rotation_retention_ms);
-    Emit(message);
+    if (m_log_sink) {
+        std::string message = "keystore: rotated; current=";
+        message += m_current.Masked();
+        message += " previous=";
+        message += m_previous.valid() ? m_previous.Masked() : "<none>";
+        message += " retention_ms=";
+        message += std::to_string(m_config.rotation_retention_ms);
+        Emit(message);
+    }
     return true;
 }
 
@@ -487,24 +572,18 @@ std::uint64_t KeyStore::rotation_retention_ms() const noexcept {
     return m_config.rotation_retention_ms;
 }
 
-void KeyStore::SetLogSink(LogSink sink) {
-    m_log_sink = std::move(sink);
-}
+void KeyStore::SetLogSink(LogSink sink) { m_log_sink = std::move(sink); }
 
-const std::vector<std::string>& KeyStore::warnings() const noexcept {
-    return m_warnings;
-}
+const std::vector<std::string>& KeyStore::warnings() const noexcept { return m_warnings; }
 
-void KeyStore::ClearWarnings() noexcept {
-    m_warnings.clear();
-}
+void KeyStore::ClearWarnings() noexcept { m_warnings.clear(); }
 
 bool KeyStore::ConstantTimeEquals(const Key& a, const Key& b) noexcept {
     return ConstantTimeEquals(a.data(), a.size(), b.data(), b.size());
 }
 
-bool KeyStore::ConstantTimeEquals(const std::uint8_t* a, std::size_t a_bytes,
-                                  const std::uint8_t* b, std::size_t b_bytes) noexcept {
+bool KeyStore::ConstantTimeEquals(const std::uint8_t* a, std::size_t a_bytes, const std::uint8_t* b,
+                                  std::size_t b_bytes) noexcept {
     if (a == nullptr || b == nullptr) {
         return a_bytes == 0 && b_bytes == 0;
     }
@@ -522,11 +601,14 @@ error::ErrorPtr KeyStore::LoadDecoded(std::string_view text, const char* source)
     Key key;
     error::ErrorPtr parse_error = ParseKeyText(text, m_config.max_input_bytes, &key);
     if (parse_error) {
-        std::string message = "keystore: load from ";
-        message += source;
-        message += " failed: ";
-        message += error::ErrorMessage(parse_error);
-        Emit(message);
+        // 日志是旁路：没有 sink 时不构造日志字符串（热加载失败也不额外分配）。
+        if (m_log_sink) {
+            std::string message = "keystore: load from ";
+            message += source;
+            message += " failed: ";
+            message += error::ErrorMessage(parse_error);
+            Emit(message);
+        }
         return error::Wrap(std::move(parse_error),
                            std::string("keystore: load from ") + source + " failed");
     }
@@ -535,18 +617,24 @@ error::ErrorPtr KeyStore::LoadDecoded(std::string_view text, const char* source)
     m_previous = Key{};
     m_rotated_at_ms = 0;
 
-    std::string message = "keystore: loaded ";
-    message += std::to_string(m_current.size());
-    message += "-byte key from ";
-    message += source;
-    message += "; masked=";
-    message += m_current.Masked();
-    Emit(message);
+    if (m_log_sink) {
+        std::string message = "keystore: loaded ";
+        message += std::to_string(m_current.size());
+        message += "-byte key from ";
+        message += source;
+        message += "; masked=";
+        message += m_current.Masked();
+        Emit(message);
+    }
     return nullptr;
 }
 
 void KeyStore::AddWarning(std::string message) {
-    m_warnings.push_back(message);
+    // 热加载同一权限宽松的文件时避免 warnings 无界增长；重复告警不再刷日志。
+    if (std::find(m_warnings.begin(), m_warnings.end(), message) != m_warnings.end()) {
+        return;
+    }
+    m_warnings.push_back(std::move(message));
     Emit(m_warnings.back());
 }
 
@@ -562,4 +650,4 @@ void KeyStore::Emit(std::string_view message) const {
     }
 }
 
-}  // namespace go2cpp::bento
+} // namespace go2cpp::bento
