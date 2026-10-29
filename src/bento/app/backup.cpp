@@ -388,6 +388,18 @@ Attempt PerformCurl(const std::string& zip_path, const UploadRequest& request,
         attempt.error = "上传超时";
         return attempt;
     }
+    // curl 的 `--max-time` 超时是**请求级**超时：curl 自己打印
+    // "Operation timed out" 后以退出码 28（CURLE_OPERATION_TIMEDOUT）正常
+    // 退出，`os::proc` 的进程级超时不会触发。只认进程级超时的话，调用方
+    // 永远拿不到 kTimeout（会被误判成 kNetworkError），这里显式归类。
+    constexpr int kCurlOperationTimedOut = 28;
+    if (result.status.exited && result.status.exit_code == kCurlOperationTimedOut) {
+        attempt.timed_out = true;
+        attempt.error = result.standard_error.empty()
+                            ? "上传超时"
+                            : ShortError(result.standard_error);
+        return attempt;
+    }
     if (!result.status.exited || result.status.exit_code != 0) {
         attempt.error = result.standard_error.empty()
                             ? "curl 退出码 " + std::to_string(result.status.exit_code)
@@ -938,19 +950,18 @@ BackupResult Backup(const std::vector<std::string>& paths, const std::string& ou
             result.error = "无法从输入路径推导条目名: " + input;
             break;
         }
+        // 顶层名字按 **不带尾斜杠** 的 basename 去重：如果目录用 "a/"、
+        // 文件用 "a" 各自入表，会同时写出目录条目 `a/` 与文件条目 `a`，
+        // 生成的包能写成功却无法解包（目录与文件冲突）。因此两者共用
+        // 同一个 key。
+        if (!root_names.insert(base).second) {
+            zip_status = ZipStatus::kInvalidArgument;
+            result.error = "顶层名字冲突: " + base;
+            break;
+        }
         if (status.type() == fs::file_type::directory) {
-            if (!root_names.insert(base + "/").second) {
-                zip_status = ZipStatus::kInvalidArgument;
-                result.error = "顶层目录重名: " + base;
-                break;
-            }
             zip_status = writer.AddDirectory(input, base);
         } else if (status.type() == fs::file_type::regular) {
-            if (!root_names.insert(base).second) {
-                zip_status = ZipStatus::kInvalidArgument;
-                result.error = "顶层文件重名: " + base;
-                break;
-            }
             zip_status = writer.AddFile(input, base);
         } else {
             ++result.stats.special_skipped;

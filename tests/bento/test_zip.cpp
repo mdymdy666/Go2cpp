@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <sys/stat.h>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -553,6 +554,100 @@ void TestReadLimitsNonZero() {
     BENTO_CHECK(!fs::exists(out));
 }
 
+
+/// T-03：条目数硬上限是 65534（0xFFFF 是 ZIP64 哨兵）。
+/// 写 65535 条会生成一个连自己都读不回来的归档，所以必须在 Open 处拒绝。
+void TestEntryCeiling() {
+    bento_test::TempDir tmp("zip_ceiling");
+    BENTO_CHECK_EQ(go2cpp::bento::app::kZipMaxEntriesCeiling, std::size_t{65534});
+    ZipLimits too_many;
+    too_many.max_entries = 65535;
+    ZipWriter rejected;
+    BENTO_CHECK_EQ(rejected.Open((tmp / "too_many.zip").string(), too_many),
+                   ZipStatus::kInvalidArgument);
+    BENTO_CHECK(!fs::exists(tmp / "too_many.zip"));
+    ZipLimits maximal;
+    maximal.max_entries = go2cpp::bento::app::kZipMaxEntriesCeiling;
+    ZipWriter writer;
+    BENTO_CHECK_EQ(writer.Open((tmp / "max.zip").string(), maximal), ZipStatus::kOk);
+    writer.Abort();
+}
+
+/// T-04：输出目录里预置指向外部的符号链接，解包必须拒绝（ResolveOutputPath）。
+void TestExtractSymlinkEscape() {
+    bento_test::TempDir tmp("zip_symlink_escape");
+    const auto zip = tmp / "link.zip";
+    const std::vector<std::uint8_t> payload = {'p', 'w', 'n'};
+    {
+        ZipWriter writer;
+        BENTO_CHECK(writer.Open(zip.string()) == ZipStatus::kOk);
+        BENTO_CHECK(writer.AddBytes("link/pwn.txt", payload.data(), payload.size()) ==
+                    ZipStatus::kOk);
+        BENTO_CHECK(writer.Close() == ZipStatus::kOk);
+    }
+    const auto outside = tmp / "outside";
+    const auto out = tmp / "out";
+    BENTO_CHECK(fs::create_directories(outside));
+    BENTO_CHECK(fs::create_directories(out));
+    if (::symlink(outside.c_str(), (out / "link").c_str()) != 0) {
+        bento_test::Skip("symlink not supported here");
+        return;
+    }
+    const auto result = ExtractZip(zip.string(), out.string());
+    BENTO_CHECK_EQ(result.status, ZipStatus::kPathRejected);
+    BENTO_CHECK(!result.error.empty());
+    BENTO_CHECK(!fs::exists(outside / "pwn.txt"));
+}
+
+/// T-05：FIFO 等特殊文件跳过并计数，不阻塞、不进包。
+void TestSpecialFileSkipped() {
+    bento_test::TempDir tmp("zip_fifo");
+    const auto src = tmp / "src";
+    BENTO_CHECK(bento_test::WriteText(src / "normal.txt", "x"));
+    if (::mkfifo((src / "pipe").c_str(), 0600) != 0) {
+        bento_test::Skip("mkfifo not supported here");
+        return;
+    }
+    ZipWriter writer;
+    BENTO_CHECK(writer.Open((tmp / "fifo.zip").string()) == ZipStatus::kOk);
+    BENTO_CHECK(writer.AddDirectory(src.string(), "src") == ZipStatus::kOk);
+    BENTO_CHECK(writer.Close() == ZipStatus::kOk);
+    BENTO_CHECK_EQ(writer.stats().special_skipped, 1U);
+    BENTO_CHECK_EQ(writer.stats().files, 1U);
+    const auto listing = ListZip((tmp / "fifo.zip").string());
+    BENTO_CHECK(listing.ok());
+    for (const auto& entry : listing.entries) {
+        BENTO_CHECK(entry.name != "src/pipe");
+    }
+}
+
+/// T-06：EOCD 完好但条目数据区被删掉一段 → 解析拒绝，且输出目录不残留。
+void TestTruncatedEntryData() {
+    bento_test::TempDir tmp("zip_truncated_data");
+    const auto zip = tmp / "data.zip";
+    const auto data = bento_test::RandomBytes(4096, 9);
+    {
+        ZipWriter writer;
+        BENTO_CHECK(writer.Open(zip.string()) == ZipStatus::kOk);
+        BENTO_CHECK(writer.AddBytes("data.bin", data.data(), data.size()) == ZipStatus::kOk);
+        BENTO_CHECK(writer.Close() == ZipStatus::kOk);
+    }
+    auto bytes = bento_test::ReadFile(zip);
+    BENTO_CHECK(!bytes.empty());
+    const std::size_t header = 30 + std::string("data.bin").size();
+    BENTO_CHECK(header + data.size() < bytes.size());
+    bytes.erase(bytes.begin() + static_cast<std::ptrdiff_t>(header),
+                bytes.begin() + static_cast<std::ptrdiff_t>(header + data.size() / 2));
+    const auto broken = tmp / "broken_data.zip";
+    BENTO_CHECK(bento_test::WriteFile(broken, bytes));
+    BENTO_CHECK(ListZip(broken.string()).status != ZipStatus::kOk);
+    const auto out = tmp / "out";
+    const auto result = ExtractZip(broken.string(), out.string());
+    BENTO_CHECK(result.status != ZipStatus::kOk);
+    BENTO_CHECK(!result.error.empty());
+    BENTO_CHECK(!fs::exists(out));
+}
+
 } // namespace
 
 int main() {
@@ -576,5 +671,9 @@ int main() {
     TestReadLimits();
     TestReadZipSlipRejected();
     TestReadLimitsNonZero();
+    TestEntryCeiling();
+    TestExtractSymlinkEscape();
+    TestSpecialFileSkipped();
+    TestTruncatedEntryData();
     return bento_test::Finish("test_zip");
 }

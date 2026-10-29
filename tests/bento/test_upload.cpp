@@ -828,6 +828,32 @@ void TestUploadRemoteVerifyHttpError() {
     BENTO_CHECK_EQ(result.attempts, 1);
 }
 
+
+/// FR-19：curl `--max-time` 超时（退出码 28）必须归类为 kTimeout，
+/// 而不是 kNetworkError —— 否则调用方的超时告警永远不会触发。
+void TestUploadTimeoutClassified() {
+    bento_test::TempDir tmp("upload_timeout_classify");
+    const auto zip = MakeZip(tmp.path(), 1024);
+    TestHttpServer server([](const HttpRequest&) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+        return HttpResponse{200, {}};
+    });
+    BENTO_CHECK(server.valid());
+    UploadRequest request;
+    request.endpoint = server.url("/slow");
+    request.method = HttpMethod::kPut;
+    UploadOptions options;
+    options.max_retries = 0;
+    options.retry_delay = 1ms;
+    options.connect_timeout = 1s;
+    options.request_timeout = 1s;
+    const auto result = Upload(zip.string(), request, options);
+    BENTO_CHECK(!result.ok());
+    BENTO_CHECK_EQ(result.status, UploadStatus::kTimeout);
+    BENTO_CHECK_EQ(result.attempts, 1);
+    BENTO_CHECK(fs::exists(zip));
+}
+
 } // namespace
 
 int main() {
@@ -849,5 +875,6 @@ int main() {
     TestUploadRemoteVerifyHeadSizeMismatch();
     TestUploadRemoteVerifyBodySizeMismatch();
     TestUploadRemoteVerifyHttpError();
+    TestUploadTimeoutClassified();
     return bento_test::Finish("test_upload");
 }

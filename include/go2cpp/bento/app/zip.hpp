@@ -24,11 +24,13 @@
  *
  * ## 上限（防 zip 炸弹 / 防 4GiB 溢出）
  *
- * ZIP32 的偏移与大小都是 32 位；本实现不写 ZIP64。因此所有条目数必须
- * `<= 65535`、归档总字节必须 `< 4GiB`。`ZipLimits` 的默认值更保守
+ * ZIP32 的偏移与大小都是 32 位；本实现不写 ZIP64。EOCD 的条目计数字段是
+ * u16，而 `0xFFFF` 是 ZIP64 的哨兵值（读取端见到它必须按 ZIP64 解析），
+ * 因此**可安全表示的条目数上限是 65534**：写 65535 条会生成一个自己都读
+ * 不回来的归档。归档总字节必须 `< 4GiB`。`ZipLimits` 的默认值更保守
  * （16384 条目 / 单文件 1GiB / 总量 2GiB），调用方可以按场景收紧，
- * 但不能突破硬上限。写入与读取**都**检查上限：读取端先看中央目录声明
- * 的大小，再决定是否解压，避免「小包声明 4GiB」的炸弹。
+ * 但不能突破硬上限。写入与读取**都**检查上限：读取端先看中央目录声明的
+ * 大小，再决定是否解压，避免「小包声明 4GiB」的炸弹。
  *
  * ## 路径与符号链接
  *
@@ -62,8 +64,8 @@ namespace go2cpp::bento::app {
 
 /// 默认条目上限（文件 + 目录）。
 inline constexpr std::size_t kZipDefaultMaxEntries = 16384;
-/// 条目数硬上限（EOCD 的 u16 计数字段）。
-inline constexpr std::size_t kZipMaxEntriesCeiling = 65535;
+/// 条目数硬上限（EOCD 的 u16 计数字段；0xFFFF 是 ZIP64 哨兵，故为 65534）。
+inline constexpr std::size_t kZipMaxEntriesCeiling = 65534;
 /// 默认单条目上限（1GiB）。
 inline constexpr std::uint64_t kZipDefaultMaxEntryBytes = 1ull << 30;
 /// 默认归档总量上限（2GiB）。

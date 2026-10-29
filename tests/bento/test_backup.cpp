@@ -332,6 +332,24 @@ void TestBackupConcurrentSameTarget() {
     }
 }
 
+
+/// T-08：顶层目录与文件同名（来自不同父目录）必须拒绝。
+/// 否则归档会同时写出 `a/` 与 `a`，能打包成功却无法解包。
+void TestBackupDirectoryFileCollision() {
+    bento_test::TempDir tmp("backup_dir_file");
+    const auto dir_input = tmp / "a";
+    const auto file_parent = tmp / "other";
+    BENTO_CHECK(bento_test::WriteText(dir_input / "inner.txt", "inner"));
+    BENTO_CHECK(bento_test::WriteText(file_parent / "a", "file named a"));
+    const auto zip = tmp / "collision.zip";
+    const auto result =
+        Backup({dir_input.string(), (file_parent / "a").string()}, zip.string());
+    BENTO_CHECK(!result.ok());
+    BENTO_CHECK_EQ(result.status, BackupStatus::kInvalidArgument);
+    BENTO_CHECK(!result.error.empty());
+    BENTO_CHECK(!fs::exists(zip));
+}
+
 } // namespace
 
 int main() {
@@ -348,5 +366,6 @@ int main() {
     TestBackupThroughput();
     TestBackupUniqueTempName();
     TestBackupConcurrentSameTarget();
+    TestBackupDirectoryFileCollision();
     return bento_test::Finish("test_backup");
 }

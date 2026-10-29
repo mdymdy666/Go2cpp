@@ -437,13 +437,15 @@ struct ZipWriter::Impl final {
         if (!out) {
             return Fail(ZipStatus::kIoError);
         }
-        const std::uint64_t data_start = Tell(out);
+        // 数据起点可以由「条目头偏移 + 固定头长 + 名字长」直接算出，
+        // 省掉一次 tellp（每次 tellp 在 ofstream 上都是一次 lseek）。
+        const std::uint64_t data_start = offset + kLocalHeaderBytes + name.size();
         go2cpp::hash::Crc32 crc;
         if (!filler(out, crc)) {
             return Fail(ZipStatus::kIoError);
         }
         const std::uint64_t data_end = Tell(out);
-        if (data_start == kInvalidOffset || data_end == kInvalidOffset || data_end < data_start ||
+        if (data_end == kInvalidOffset || data_end < data_start ||
             data_end - data_start != size) {
             return Fail(ZipStatus::kIoError);
         }
@@ -463,6 +465,40 @@ struct ZipWriter::Impl final {
         ++stats.files;
         stats.input_bytes += size;
         return ZipStatus::kOk;
+    }
+
+    /// 写入一个已知大小的普通文件。
+    /// @details 递归遍历阶段已经 stat 过类型与大小，这里不再重复 lstat，
+    ///          直接按 size 精确读满（也避免多一次读到 EOF 的 read 调用）。
+    ZipStatus AddFileFromPath(const std::string& source_path, const std::string& entry_name,
+                              std::uint64_t size) {
+        std::ifstream in(source_path, std::ios::binary);
+        if (!in) {
+            return Fail(ZipStatus::kInputNotFound);
+        }
+        return AddEntry(entry_name, size,
+                        [&in, size](std::ostream& out, go2cpp::hash::Crc32& crc) {
+                            std::array<char, 64 * 1024> buffer{};
+                            std::uint64_t remaining = size;
+                            while (remaining > 0) {
+                                const std::size_t want = static_cast<std::size_t>(
+                                    std::min<std::uint64_t>(remaining, buffer.size()));
+                                in.read(buffer.data(),
+                                        static_cast<std::streamsize>(want));
+                                const std::streamsize got = in.gcount();
+                                if (got <= 0) {
+                                    return false;
+                                }
+                                crc.Write(go2cpp::hash::AsBytes(
+                                    buffer.data(), static_cast<std::size_t>(got)));
+                                out.write(buffer.data(), got);
+                                if (!out) {
+                                    return false;
+                                }
+                                remaining -= static_cast<std::uint64_t>(got);
+                            }
+                            return true;
+                        });
     }
 
     /// 写一个目录条目（name 必须以 `/` 结尾）。
@@ -566,29 +602,8 @@ ZipStatus ZipWriter::AddFile(const std::string& source_path, const std::string& 
     if (ec) {
         return m_impl->Fail(ZipStatus::kIoError);
     }
-    const std::uint64_t size = static_cast<std::uint64_t>(raw_size);
-    std::ifstream in(source_path, std::ios::binary);
-    if (!in) {
-        return m_impl->Fail(ZipStatus::kInputNotFound);
-    }
-    return m_impl->AddEntry(
-        entry_name, size,
-        [&in](std::ostream& out, go2cpp::hash::Crc32& crc) {
-            std::array<char, 64 * 1024> buffer{};
-            while (in) {
-                in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-                const std::streamsize got = in.gcount();
-                if (got <= 0) {
-                    break;
-                }
-                crc.Write(go2cpp::hash::AsBytes(buffer.data(), static_cast<std::size_t>(got)));
-                out.write(buffer.data(), got);
-                if (!out) {
-                    return false;
-                }
-            }
-            return !in.bad();
-        });
+    return m_impl->AddFileFromPath(source_path, entry_name,
+                                   static_cast<std::uint64_t>(raw_size));
 }
 
 ZipStatus ZipWriter::AddBytes(const std::string& entry_name, const std::uint8_t* data,
@@ -629,8 +644,22 @@ ZipStatus ZipWriter::AddDirectory(const std::string& source_dir,
     if (root_status.type() != fs::file_type::directory) {
         return m_impl->Fail(ZipStatus::kPathRejected);
     }
-    const fs::path root(source_dir);
-    std::vector<std::string> relatives;
+    // 绝对化根目录：recursive_directory_iterator 以 root 为前缀生成
+    // entry.path()，绝对化后可以用纯字符串的 lexically_relative 剥离前缀。
+    // 不能用 fs::relative —— 它内部走 weakly_canonical，对每个路径段调用
+    // readlink；实测 2 万个小文件触发 16 万次失败的 readlink，占打包时间 26%。
+    const fs::path root = [&source_dir]() {
+        std::error_code absolute_ec;
+        const fs::path absolute = fs::absolute(source_dir, absolute_ec);
+        return absolute_ec ? fs::path(source_dir) : absolute.lexically_normal();
+    }();
+    // 遍历阶段一次性记下类型与大小，写入阶段不再重复 stat。
+    struct PendingEntry final {
+        std::string relative;
+        std::uintmax_t size{0};
+        bool is_directory{false};
+    };
+    std::vector<PendingEntry> pending;
     fs::recursive_directory_iterator it(root, fs::directory_options::none, ec);
     if (ec) {
         return m_impl->Fail(ZipStatus::kIoError);
@@ -660,16 +689,29 @@ ZipStatus ZipWriter::AddDirectory(const std::string& source_dir,
         if (m_impl->IsExcluded(entry.path())) {
             continue;
         }
-        std::error_code relative_ec;
-        const fs::path relative = fs::relative(entry.path(), root, relative_ec);
-        if (relative_ec || relative.empty() || *relative.begin() == "..") {
+        const fs::path relative = entry.path().lexically_relative(root);
+        if (relative.empty() || *relative.begin() == "..") {
             return m_impl->Fail(ZipStatus::kIoError);
         }
-        relatives.push_back(relative.generic_string());
+        PendingEntry item;
+        item.relative = relative.generic_string();
+        if (status.type() == fs::file_type::directory) {
+            item.is_directory = true;
+        } else {
+            std::error_code size_ec;
+            item.size = fs::file_size(entry.path(), size_ec);
+            if (size_ec) {
+                return m_impl->Fail(ZipStatus::kIoError);
+            }
+        }
+        pending.push_back(std::move(item));
     }
-    std::sort(relatives.begin(), relatives.end());
+    std::sort(pending.begin(), pending.end(),
+              [](const PendingEntry& left, const PendingEntry& right) {
+                  return left.relative < right.relative;
+              });
     const std::size_t root_entries = prefix.empty() ? 0u : 1u;
-    if (m_impl->records.size() + relatives.size() + root_entries >
+    if (m_impl->records.size() + pending.size() + root_entries >
         m_impl->limits.max_entries) {
         return m_impl->Fail(ZipStatus::kTooManyEntries);
     }
@@ -679,27 +721,19 @@ ZipStatus ZipWriter::AddDirectory(const std::string& source_dir,
             return status;
         }
     }
-    for (const std::string& relative : relatives) {
-        const fs::path full = root / fs::path(relative);
-        const std::string name = JoinEntryName(prefix, relative);
-        if (m_impl->IsExcluded(full)) {
-            continue;
-        }
-        std::error_code status_ec;
-        const fs::file_status status = fs::symlink_status(full, status_ec);
-        if (status_ec) {
-            return m_impl->Fail(ZipStatus::kIoError);
-        }
-        if (status.type() == fs::file_type::directory) {
+    for (const PendingEntry& item : pending) {
+        const std::string name = JoinEntryName(prefix, item.relative);
+        if (item.is_directory) {
             const ZipStatus added = m_impl->AddDirectoryEntry(name + "/");
             if (added != ZipStatus::kOk) {
                 return added;
             }
-        } else if (status.type() == fs::file_type::regular) {
-            const ZipStatus added = AddFile(full.string(), name);
-            if (added != ZipStatus::kOk) {
-                return added;
-            }
+            continue;
+        }
+        const ZipStatus added =
+            m_impl->AddFileFromPath((root / item.relative).string(), name, item.size);
+        if (added != ZipStatus::kOk) {
+            return added;
         }
     }
     return ZipStatus::kOk;
