@@ -11,6 +11,8 @@
 #include "go2cpp/bento/net/frame.hpp"
 
 #include <cstring>
+#include <limits>
+#include <new>
 
 #include "go2cpp/hash/crc32.hpp"
 
@@ -64,6 +66,12 @@ FrameStatus ParseOne(const FrameFormat& format, const std::uint8_t* data, std::s
     if (length > max_payload) {
         return FrameStatus::kLengthExceeded;
     }
+    // 32 位平台上 20 + UINT32_MAX 会溢出 size_t，使下面的 size < total 判断失效，
+    // 进而把「声明 4 GiB」误当成完整帧去算 CRC。64 位平台该条件恒为假，会被消除。
+    if (static_cast<std::size_t>(length) >
+        std::numeric_limits<std::size_t>::max() - kGenericFrameHeaderBytes) {
+        return FrameStatus::kLengthExceeded;
+    }
     const std::size_t total = kGenericFrameHeaderBytes + static_cast<std::size_t>(length);
     if (size < total) {
         return FrameStatus::kNeedMoreData;
@@ -78,7 +86,13 @@ FrameStatus ParseOne(const FrameFormat& format, const std::uint8_t* data, std::s
     out->flags = ReadU16(data + 8);
     out->reserved = reserved;
     out->checksum = checksum;
-    out->payload.assign(data + kGenericFrameHeaderBytes, data + total);
+    try {
+        out->payload.assign(data + kGenericFrameHeaderBytes, data + total);
+    } catch (const std::bad_alloc&) {
+        // 本函数与公开的 Decode 都是 noexcept：分配失败必须转成状态码，否则会
+        // 直接 std::terminate。载荷已被 max_payload 限死，正常环境不会触发。
+        return FrameStatus::kOutOfMemory;
+    }
     if (consumed != nullptr) {
         *consumed = total;
     }
@@ -105,6 +119,8 @@ const char* FrameStatusName(FrameStatus status) noexcept {
             return "checksum_mismatch";
         case FrameStatus::kInvalidArgument:
             return "invalid_argument";
+        case FrameStatus::kOutOfMemory:
+            return "out_of_memory";
     }
     return "unknown";
 }
@@ -182,6 +198,21 @@ FrameStatus Decode(const FrameFormat& format, const std::uint8_t* data, std::siz
         return size == 0 ? FrameStatus::kNeedMoreData : FrameStatus::kInvalidArgument;
     }
     return ParseOne(format, data, size, kFrameMaxPayload, out, consumed);
+}
+
+FrameStatus Decode(const FrameFormat& format, std::uint32_t max_payload,
+                   const std::uint8_t* data, std::size_t size, Frame* out,
+                   std::size_t* consumed) noexcept {
+    if (out == nullptr) {
+        return FrameStatus::kInvalidArgument;
+    }
+    if (format.magic == 0) {
+        return FrameStatus::kInvalidArgument;
+    }
+    if (data == nullptr) {
+        return size == 0 ? FrameStatus::kNeedMoreData : FrameStatus::kInvalidArgument;
+    }
+    return ParseOne(format, data, size, max_payload, out, consumed);
 }
 
 FrameDecoder::FrameDecoder(std::uint32_t max_payload, FrameFormat format) noexcept

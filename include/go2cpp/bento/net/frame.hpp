@@ -94,6 +94,7 @@ enum class FrameStatus : std::uint8_t {
     kLengthExceeded = 5,    ///< length 超过上限（默认 1 MiB）。
     kChecksumMismatch = 6,  ///< CRC32 校验失败（载荷或帧头被破坏）。
     kInvalidArgument = 7,   ///< 调用方传了空输出指针。
+    kOutOfMemory = 8,       ///< 载荷缓冲分配失败（解码路径不向外抛异常）。
 };
 
 /// @brief 状态名（日志/测试失败信息用）。
@@ -158,6 +159,23 @@ FrameStatus Decode(const FrameFormat& format, const std::uint8_t* data, std::siz
                    Frame* out, std::size_t* consumed = nullptr) noexcept;
 
 /**
+ * @brief 一次性解析，按调用方给定的协议标识与载荷上限校验。
+ * @param format 期望的线上协议标识；magic 为 0 返回 `kInvalidArgument`。
+ * @param max_payload 允许的单帧载荷上限（语义同 `FrameDecoder` 构造参数）。
+ * @param data 输入字节；`size == 0` 时可为 nullptr。
+ * @param size 可用字节数。
+ * @param out 输出帧；不可为 nullptr。
+ * @param consumed 非空时写入本帧消耗的字节数（只有 `kOk` 时写）。
+ * @return 同 `Decode`；`length > max_payload` 返回 `kLengthExceeded`。
+ *
+ * @details 与 `FrameDecoder` 的可配置上限保持对称：一次性解码不再被硬编码的
+ *          1 MiB 束缚，同时对超限声明仍然在读取载荷之前拒绝。
+ */
+FrameStatus Decode(const FrameFormat& format, std::uint32_t max_payload,
+                   const std::uint8_t* data, std::size_t size, Frame* out,
+                   std::size_t* consumed = nullptr) noexcept;
+
+/**
  * @brief 一次性解析缓冲区开头的一帧。
  * @param data 输入字节。
  * @param size 可用字节数。
@@ -167,6 +185,8 @@ FrameStatus Decode(const FrameFormat& format, const std::uint8_t* data, std::siz
  *
  * @note 本函数无状态：错误后不会修改输入，也不会「吞掉」任何字节；流式场景请用
  *       FrameDecoder，它在错误时会清空自己的缓冲。
+ * @note 载荷缓冲分配失败时返回 `kOutOfMemory`：本函数是 `noexcept`，绝不向外抛
+ *       异常；此时 `out->payload` 的内容未定义，调用方必须按错误路径丢弃它。
  */
 FrameStatus Decode(const std::uint8_t* data, std::size_t size, Frame* out,
                    std::size_t* consumed = nullptr) noexcept;
