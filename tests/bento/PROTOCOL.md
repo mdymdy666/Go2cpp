@@ -71,12 +71,12 @@ seq 从 1 开始，`0` 保留为「无效」。32 位回绕由 `SeqGreater`（�
 
 | 值 | 类型 | 载荷 | 可靠性 |
 |---|---|---|---|
-| 0x01 | HELLO | 8B：`"BENT"` + session u32 | 握手重传 200ms→2s，最多 16 轮；每轮 2 份冗余 |
-| 0x02 | HELLO_ACK | 8B：`"BENT"` + 回显 session | 同上，由监听方回复（重复 HELLO 幂等重发） |
+| 0x01 | HELLO | 12B：`"BENT"` + session u32 + conn_id u32；协商 SACK 扩展时 14B（追加 caps u16） | 握手重传 200ms→2s，最多 16 轮；每轮 2 份冗余 |
+| 0x02 | HELLO_ACK | 12B（同上，回显 session/conn_id）；双方支持时 14B 带 caps | 同上，由监听方回复（重复 HELLO 幂等重发） |
 | 0x03 | STREAM | 应用消息（≤1300B） | 可靠有序：ACK + 重传 + 去重 |
 | 0x04 | DATAGRAM | 应用消息（≤1300B） | 不可靠：乱序容忍缓存 + 单调交付 |
 | 0x05 | VIDEO | 8B 子头 + 分片（每片 ≤1200B） | 不可靠分片，接收端重组 |
-| 0x06 | ACK | 8B：ack_seq u32 + ack_bits u32 | 独立 ACK / 心跳 |
+| 0x06 | ACK | 8B：ack_seq u32 + ack_bits u32；协商后 13..73B（SACK 多块） | 独立 ACK / 心跳 |
 | 0x07 | BARRIER | 无载荷，屏障 seq 在 header.seq | 一次发送，作废旧不可靠 seq |
 
 ### 2.3 可选 ACK 段（8B，仅 flags bit0 = 1）
@@ -88,6 +88,23 @@ seq 从 1 开始，`0` 保留为「无效」。32 位回绕由 `SeqGreater`（�
 
 STREAM 帧总是捎带 ACK 段；ACK 帧的载荷是同构的 8B。`ACK/BARRIER` 不允许再带
 ACK 段（避免两个 ack 来源）。
+
+**SACK 多块扩展（P3，可选）**：纯 ACK 帧在双方 HELLO/HELLO_ACK 的 caps 位
+（bit0 = `kCapSackExt`）都置位时，载荷扩展为 `8B 基础 + 1B 块数 n + n×4B`：
+
+| 偏移 | 字段 | 语义 |
+|---|---|---|
+| +0 | ack_seq u32 | 同旧格式 |
+| +4 | ack_bits u32 | 同旧格式 |
+| +8 | nblocks u8 | 1..16 |
+| +9+4i | start_offset u16 | 相对 ack_seq 的起始偏移（>=1） |
+| +11+4i | length u16 | 连续已收 seq 数（>=1） |
+
+块按 start_offset 严格升序、互不重叠、`start+length <= 0x10000`；非法帧整帧
+丢弃（计入 `invalid_frames`）。数据帧捎带的 ACK 段**永远只有 8B**（帧头 flags
+无空闲位），扩展只出现在纯 ACK 帧。旧端只接受载荷恰好 8B 的 ACK，因此扩展
+只在协商成功后发送；任一端不支持（或加密握手，body 长度固定）→ 双方降级为
+32 位位图，线格式与旧版逐字节一致。
 
 ### 2.4 VIDEO 子头（8B）
 
@@ -685,6 +702,18 @@ CMakeLists.txt                           +12 行（standalone 分支 + include�
    大帧按 N 分组独立校验，组间不共享。
 6. **0-RTT 应用通道重置**：恢复后 stream/datagram 的 seq 从 1 重新开始，
    依赖旧通道 seq 的跨会话因果语义不保留。
+
+### 11.8 SACK 多块扩展（P3，2026-10-29）
+
+- HELLO/HELLO_ACK 载荷 12B→14B：追加 caps u16（bit0 = SACK 扩展）。旧端按
+  `payload_bytes >= 12` 解析并忽略尾部，不会崩；对端为旧端时回 12B、双方降级。
+- 纯 ACK 载荷 8B / 13..73B：`kMaxSackBlocks = 16`、`kAckPayloadMaxBytes = 73`，
+  基础 8B 与旧格式逐字节一致（位图/SACK 语义不变）。
+- 接收端 `FillAck` 把 32 位位图之外的乱序 run 合并上报；超过 16 块时保留近端
+  15 块 + 最远 1 块。发送端用扩展块把「对端已收到」的项移出 inflight，并用
+  最远已收 seq 判定窗口外空洞，精确快速重传，不再等 PTO 整批兜底。
+- 加密会话（PSK）的 HELLO body 长度固定，无法追加 caps，因此**恒为降级**
+  （32 位位图），见 `example/WarningDocement/audit-sack.md` 的已知限制。
 
 ---
 

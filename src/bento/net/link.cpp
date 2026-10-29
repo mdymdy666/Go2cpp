@@ -78,14 +78,34 @@ std::uint64_t WallClockMs() noexcept {
         std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
-void MakeHelloPayload(std::uint32_t session, std::uint32_t conn_id,
-                      std::uint8_t out[12]) noexcept {
+/// 写入 HELLO/HELLO_ACK 载荷（magic + session + conn_id [+ caps]）。
+/// @param caps 能力位；0 表示只写 12B 旧格式（不协商扩展），非 0 时追加
+///             2B 大端 caps 并写满 14B。旧端按 payload_bytes >= 12 解析并
+///             忽略尾部，因此追加字节对旧端安全。
+/// @return 实际写入字节数（kHelloBaseBytes 或 kHelloCapsBytes）。
+std::size_t MakeHelloPayload(std::uint32_t session, std::uint32_t conn_id, std::uint16_t caps,
+                             std::uint8_t* out) noexcept {
     out[0] = 'B';
     out[1] = 'E';
     out[2] = 'N';
     out[3] = 'T';
     WriteU32(out + 4, session);
     WriteU32(out + 8, conn_id);
+    if (caps == 0) {
+        return kHelloBaseBytes;
+    }
+    out[12] = static_cast<std::uint8_t>(caps >> 8);
+    out[13] = static_cast<std::uint8_t>(caps);
+    return kHelloCapsBytes;
+}
+
+/// 从 HELLO/HELLO_ACK 载荷读取能力位；旧格式（< 14B）视为 0（不支持）。
+std::uint16_t ReadHelloCaps(const std::uint8_t* payload, std::size_t bytes) noexcept {
+    if (payload == nullptr || bytes < kHelloCapsBytes) {
+        return 0;
+    }
+    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(payload[12]) << 8) |
+                                      static_cast<std::uint16_t>(payload[13]));
 }
 
 /// 0-RTT 恢复时“下一个 wire seq”。窗口未初始化表示尚未收到任何帧。
@@ -703,7 +723,7 @@ bool Link::PeerMatches(const sockaddr_storage& from) const noexcept {
 
 void Link::HandleHello(const FrameView& view, const sockaddr_storage& from,
                        socklen_t from_len) {
-    if (view.payload_bytes < 12 || !IsHelloMagic(view.payload)) {
+    if (view.payload_bytes < kHelloBaseBytes || !IsHelloMagic(view.payload)) {
         ++m_stats.invalid_frames;
         return;
     }
@@ -717,6 +737,10 @@ void Link::HandleHello(const FrameView& view, const sockaddr_storage& from,
         ++m_stats.unknown_peer_frames;
         return;
     }
+    // 能力协商：旧端 HELLO 只有 12B，ReadHelloCaps 返回 0 → 本端降级。
+    const std::uint16_t peer_caps = ReadHelloCaps(view.payload, view.payload_bytes);
+    const bool peer_sack = (peer_caps & kCapSackExt) != 0;
+    m_sack_ext = m_config.enable_sack_ext && peer_sack;
     if (!m_have_peer) {
         m_peer = from;
         m_peer_len = from_len;
@@ -735,8 +759,12 @@ void Link::HandleHello(const FrameView& view, const sockaddr_storage& from,
 
     // 重复 HELLO 也要回 ACK：HELLO_ACK 丢失时客户端会重发 HELLO。
     // 每轮回 handshake_copies 份：高丢包链路下把 ACK 丢失概率从 p 降到 p^2。
-    std::uint8_t payload[12];
-    MakeHelloPayload(session, m_conn_id, payload);
+    // 双方都支持时才回带 caps 的 14B ACK；对端为旧端时回 12B 旧格式。
+    std::uint8_t payload[kHelloCapsBytes];
+    const std::uint16_t reply_caps =
+        (m_sack_ext && m_config.enable_sack_ext) ? kCapSackExt : 0;
+    const std::size_t payload_bytes =
+        MakeHelloPayload(session, m_conn_id, reply_caps, payload);
     FrameHeader header;
     header.type = FrameType::kHelloAck;
     header.channel = 0;
@@ -744,7 +772,7 @@ void Link::HandleHello(const FrameView& view, const sockaddr_storage& from,
     header.seq = session;
     const std::uint32_t copies = std::max<std::uint32_t>(1U, m_config.handshake_copies);
     for (std::uint32_t copy = 0; copy < copies; ++copy) {
-        (void)SendControl(header, nullptr, payload, sizeof(payload));
+        (void)SendControl(header, nullptr, payload, payload_bytes);
     }
     m_last_rx_ms = NowMs();
     if (m_state != LinkState::kConnected) {
@@ -759,7 +787,7 @@ void Link::HandleHello(const FrameView& view, const sockaddr_storage& from,
 
 void Link::HandleHelloAck(const FrameView& view, const sockaddr_storage& from) {
     (void)from;
-    if (view.payload_bytes < 12 || !IsHelloMagic(view.payload)) {
+    if (view.payload_bytes < kHelloBaseBytes || !IsHelloMagic(view.payload)) {
         ++m_stats.invalid_frames;
         return;
     }
@@ -770,6 +798,9 @@ void Link::HandleHelloAck(const FrameView& view, const sockaddr_storage& from) {
         ++m_stats.invalid_frames;
         return;
     }
+    // 对端 HELLO_ACK 带 caps 才启用扩展；旧端回 12B → 降级 32 位位图。
+    const std::uint16_t peer_caps = ReadHelloCaps(view.payload, view.payload_bytes);
+    m_sack_ext = m_config.enable_sack_ext && (peer_caps & kCapSackExt) != 0;
     m_conn_id = accepted_conn_id;
     m_last_rx_ms = NowMs();
     if (m_state == LinkState::kConnecting) {
@@ -1206,8 +1237,13 @@ void Link::SendHello() {
         // 的重复 HELLO」幂等重发 HELLO_ACK，不会把重传误判为重放攻击。
         (void)SendSecureHello();
     } else {
-        std::uint8_t payload[12];
-        MakeHelloPayload(m_session_id, m_conn_id, payload);
+        std::uint8_t payload[kHelloCapsBytes];
+        // 每次重新握手都从「未协商」开始：只有对端 HELLO_ACK 带 caps 才启用，
+        // 避免重连到旧端时沿用上一会话的协商结果。
+        m_sack_ext = false;
+        const std::uint16_t caps = m_config.enable_sack_ext ? kCapSackExt : 0;
+        const std::size_t payload_bytes =
+            MakeHelloPayload(m_session_id, m_conn_id, caps, payload);
         FrameHeader header;
         header.type = FrameType::kHello;
         header.channel = 0;
@@ -1216,7 +1252,7 @@ void Link::SendHello() {
         // 冗余份数：40% 丢包下 2 份把单轮到达率从 60% 提到 84%。
         const std::uint32_t copies = std::max<std::uint32_t>(1U, m_config.handshake_copies);
         for (std::uint32_t copy = 0; copy < copies; ++copy) {
-            (void)SendControl(header, nullptr, payload, sizeof(payload));
+            (void)SendControl(header, nullptr, payload, payload_bytes);
         }
     }
     m_next_hello_ms = now + m_hello_pto_ms;
@@ -1233,17 +1269,31 @@ bool Link::SendAckFrame(std::uint8_t channel, bool heartbeat) {
     } else {
         ack.ack_seq = 0;
         ack.ack_bits = 0;
+        ack.sack_block_count = 0;
     }
-    std::uint8_t payload[kAckBytes];
-    EncodeAck(ack, payload);
+    // 只有协商成功才发扩展尾部；否则 block_count 清零，编码器只写 8B，
+    // 对旧端保持逐字节兼容的旧格式。
+    if (!m_sack_ext) {
+        ack.sack_block_count = 0;
+    }
+    std::uint8_t payload[kAckPayloadMaxBytes];
+    const std::size_t payload_bytes = EncodeAckPayload(ack, payload, sizeof(payload));
+    if (payload_bytes == 0) {
+        ++m_stats.send_errors;
+        return false;
+    }
     FrameHeader header;
     header.type = FrameType::kAck;
     header.channel = channel;
     header.seq = 0;
-    if (!SendControl(header, nullptr, payload, kAckBytes)) {
+    if (!SendControl(header, nullptr, payload, payload_bytes)) {
         return false;
     }
     ++m_stats.acks_sent;
+    if (payload_bytes > kAckBytes) {
+        ++m_stats.sack_acks_sent;
+        m_stats.sack_blocks_sent += ack.sack_block_count;
+    }
     if (heartbeat) {
         ++m_stats.heartbeats_sent;
     }
@@ -1334,6 +1384,11 @@ void Link::Fail(const char* reason) {
 std::uint32_t Link::conn_id() const {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     return m_conn_id;
+}
+
+bool Link::sack_ext_enabled() const {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return m_sack_ext;
 }
 
 bool Link::ConnIdMatches(const FrameHeader& header) const noexcept {
@@ -2131,6 +2186,9 @@ bool Link::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
         ++m_stats.unknown_peer_frames;
         return false;
     }
+    // 加密握手的 HELLO body 长度固定（旧端严格校验 46/78B），无法追加
+    // caps；因此加密会话一律降级 32 位位图，避免破坏线格式兼容性。
+    m_sack_ext = false;
     std::uint8_t inner_type = 0;
     std::uint32_t session = 0;
     std::uint32_t handshake_conn_id = 0;
@@ -2272,6 +2330,8 @@ bool Link::HandleSecureHelloAck(const std::uint8_t* data, std::size_t bytes,
         ++m_stats.unknown_peer_frames;
         return false;
     }
+    // 加密会话不协商 SACK 扩展（见 HandleSecureHello 的同名说明）。
+    m_sack_ext = false;
     if (m_state == LinkState::kConnected) {
         // 冗余 HELLO_ACK 的第二份：握手已完成，静默忽略。
         return false;

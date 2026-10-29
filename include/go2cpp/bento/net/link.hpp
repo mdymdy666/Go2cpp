@@ -80,6 +80,12 @@ struct LinkConfig {
     /// 代价只是一条 28B 的控制帧；不影响已完成会话的数据面。
     std::uint32_t handshake_copies = 2;
     std::uint32_t random_seed = 0;  ///< 0 = 时钟+pid；测试可固定。
+    /// SACK 多块扩展（纯 ACK 帧可选尾部）。默认开启：HELLO/HELLO_ACK 尾部
+    /// 携带 caps 位，双方都置位才使用扩展；对端是旧端（12B 载荷、无 caps）
+    /// 时自动降级为 32 位位图。加密握手（PSK）的 HELLO body 长度固定，
+    /// 不携带该 caps，因此在加密会话里保持降级——这是已知限制，见
+    /// example/WarningDocement/audit-sack.md。
+    bool enable_sack_ext = true;
     /// ABR 回调最小间隔（毫秒）。带宽变化超过 10% 时才回调。
     std::uint32_t abr_interval_ms = 200;
     /// PSK 认证加密：非空时启用（长度必须 32B）；空 = 明文模式，保持旧线格式。
@@ -224,6 +230,8 @@ struct LinkStats {
     std::uint64_t hello_retransmits = 0;
     std::uint64_t heartbeats_sent = 0;
     std::uint64_t acks_sent = 0;
+    std::uint64_t sack_acks_sent = 0;   ///< 带 SACK 扩展尾部的纯 ACK 帧数。
+    std::uint64_t sack_blocks_sent = 0; ///< 发出的 SACK 扩展块总数。
     std::uint64_t barriers_received = 0;
     std::uint64_t timeouts = 0;
 
@@ -357,6 +365,11 @@ class Link final {
     }
     /// @brief 当前连接 id（HELLO 协商；0 表示尚未协商）。
     std::uint32_t conn_id() const;
+    /// @brief 本会话是否已协商启用 SACK 多块扩展（双方 caps 均置位）。
+    /// @note 握手完成前恒为 false；对端为旧端或加密握手时保持 false，
+    ///       此时纯 ACK 帧只发 32 位位图（旧行为）。加锁读取，供其他线程
+    ///       观测；热路径（SendAckFrame）直接读成员，避免每帧加锁。
+    bool sack_ext_enabled() const;
     /// @brief 当前路径 MTU 估计（UDP 载荷字节）。无探测/无 ICMP 时保守 1200。
     std::uint32_t PathMtu() const;
     /// @brief 注入一条 ICMP“包太大/不可达”结果（平台无 IP_RECVERR 时由上层调用）。
@@ -497,6 +510,8 @@ class Link final {
     socklen_t m_peer_len = 0;
     std::uint32_t m_session_id = 0;
     std::uint32_t m_conn_id = 0;  ///< P2：HELLO 协商的连接 id。
+    /// 本会话是否启用 SACK 多块扩展（双方 caps 交集非空）。
+    bool m_sack_ext = false;
     bool m_resumed = false;       ///< 当前会话是否来自 Resume。
     /// 0-RTT 后到对端首个有效帧之前，所有发出帧都带 kFlagResume。
     bool m_resume_epoch = false;

@@ -8,7 +8,10 @@
  *          - ReliableChannel（STREAM）：发送窗口 256，动态 PTO（RFC 9002
  *            的 SRTT/RTTVAR：srtt + 4*rttvar + max_ack_delay，默认夹在
  *            [200ms, 2s]，每次超时重传再 ×2 退避），3 个重复 ACK 或
- *            SACK 空洞触发快速重传。接收端按 seq 去重、乱序缓存、严格
+ *            SACK 空洞触发快速重传。SACK 由 32 位位图与可选多块扩展
+ *            （kMaxSackBlocks=16，可覆盖到发送窗口末端）共同表达；发送端用
+ *            「最远已收 seq」判定窗口外空洞，把原来只能靠 PTO 整批兜底的
+ *            远端丢包提前快速重传。接收端按 seq 去重、乱序缓存、严格
  *            按序交付；dep_seq 未满足时**不 ACK** 并丢弃该帧，等发送端
  *            重传，从而在不引入乱序的前提下实现因果等待。单条消息超过
  *            1300B 时自动切分（kFlagFragmented + 8B 子头），接收端按
@@ -30,6 +33,7 @@
  * @copyright MIT License
  */
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -240,8 +244,11 @@ class ReliableChannel final {
     /// 每个事件循环 tick 最多补发的超时消息数：避免一次 RunOnce 内突发
     /// 上百帧；不是每个 PTO 周期的硬上限（后续 tick 会按 seq 继续补）。
     /// 弱网实测（40% 随机丢包）：4 太小，一个窗口的空洞要跨多个 tick/多个
-    /// PTO 周期才能补齐，端到端 p95 被串行等待推到 40s 量级；8 在突发与
-    /// 时延之间折中（一 tick 最多 8 帧 ≈ 2.4KB）。
+    /// PTO 周期才能补齐，端到端 p95 被串行等待推到 40s 量级。SACK 多块
+    /// 扩展把「对端已收到」的项预先移出 inflight 后，PTO 兜底集合只剩真实
+    /// 丢失；8 条/批足够在 20%/40% 丢包下把一批空洞补完，而 16 条/批在
+    /// PTO 被伪超时触发时（20%+200ms 抖动场景 srtt 采样偏小）会一次性
+    /// 重发过多仍在网络中的包，实测 20% 场景 p95 反而更不稳。
     static constexpr std::size_t kPtoRetransmitBatch = 8;
     /// 单次快速重传最多并行补几个 SACK 空洞（32 位 SACK 窗口内）。
     /// 40% 丢包、窗口 128 时一轮会丢 ~50 个包，8 个/次的批量需要 6 轮
@@ -255,6 +262,10 @@ class ReliableChannel final {
         std::uint64_t acks_applied = 0;         ///< 被确认并从 inflight 移除的消息数。
         std::uint64_t retransmits = 0;          ///< 重传总次数（含快速重传）。
         std::uint64_t fast_retransmits = 0;     ///< 由重复 ACK/SACK 空洞触发。
+        std::uint64_t pto_retransmits = 0;      ///< 由 PTO 超时兜底触发。
+        std::uint64_t tlp_probes = 0;           ///< 尾包探测（TLP）触发次数。
+        std::uint64_t sack_acks_with_blocks = 0;  ///< 带 SACK 扩展块且被采纳的 ACK 数。
+        std::uint64_t sack_seqs_covered = 0;    ///< 扩展块覆盖的 seq 数（累计）。
         std::uint64_t fragments_sent = 0;       ///< 发出的 STREAM 分片帧数。
         std::uint64_t fragments_received = 0;   ///< 收到的 STREAM 分片帧数。
         std::uint64_t fragments_duplicate = 0;  ///< 重组层重复分片数。
@@ -372,18 +383,24 @@ class ReliableChannel final {
     void OnFrame(const FrameHeader& header, const std::uint8_t* payload, std::size_t bytes,
                  const AckState* piggyback_ack);
 
-    /// @brief 应用累积 ACK + SACK 位图。
+    /// @brief 应用累积 ACK + SACK 位图 + 可选多块扩展。
     void OnAck(const AckState& ack);
 
     /// @brief 驱动超时重传与发送队列。Link 每次事件循环调用。
     void OnTimer(std::uint64_t now_ms);
 
-    /// @brief 生成当前接收状态（ack_seq = 下一个期望 seq）。
+    /// @brief 生成当前接收状态（ack_seq = 下一个期望 seq + 位图 + 扩展块）。
+    /// @note 扩展块总是填充（与是否协商 SACK 扩展无关）；由 Link 在编码时
+    ///       根据能力协商结果决定是否发送扩展尾部（降级只发前 8B）。
     bool FillAck(AckState* out) const noexcept;
 
     /// @brief 是否有尚未发出的 ACK 状态（Link 据此发送独立 ACK 帧）。
     bool HasPendingAck() const noexcept {
-        return m_pending_ack;
+        // 有乱序未交付项时也要周期性重报：SACK 扩展块是发送端定位窗口外
+        // 空洞的唯一证据，而 ACK 本身会丢（弱网 20~40%），且发送端窗口满
+        // 时不会再有新帧到达接收端。只在收到新帧时报一次会让发送端退回
+        // PTO 整批兜底；重报间隔由 Link 的 ack_interval_ms 控制。
+        return m_pending_ack || !m_rx_seen.empty();
     }
 
     /// @brief 标记 ACK 已随帧发出（独立 ACK 或数据帧捎带）。
@@ -454,8 +471,8 @@ class ReliableChannel final {
     void Acknowledge(Outgoing& message, std::uint64_t now_ms);
     void AdvanceDelivery();
     std::uint64_t Now() const noexcept;
-    bool TryFastRetransmit(const AckState& ack, bool ack_progressed,
-                           std::size_t new_sack, std::uint64_t now_ms);
+    bool TryFastRetransmit(bool ack_progressed, std::size_t new_sack,
+                           std::uint64_t now_ms);
     void RefreshRttStats() noexcept;
     void RefreshCongestionStats() noexcept;
 
@@ -486,6 +503,10 @@ class ReliableChannel final {
     std::size_t m_sack_evidence = 0;   ///< 本轮累积确认前进后新增的 SACK 数。
     bool m_in_fast_recovery = false;   ///< 快速重传后等待 ACK 前进。
     std::set<std::uint32_t> m_sacked;  ///< SACK 位图已知收到的 seq。
+    /// 已知被 SACK 的最大 seq（位图 + 扩展块）。**单调保留**：累积确认
+    /// 前进时不清零，因为它表示「对端已收到的最远位置」，是判定远端空洞
+    /// 的边界；ACK 前进后仍大于 ack_seq 的项继续有效。
+    std::uint32_t m_max_sacked = 0;
     std::uint32_t m_delivery_first_seq = 0;  ///< 重组交付时的首分片 seq。
     std::deque<Outgoing> m_unsent;    ///< 已分配 seq、尚未发出（按 seq 升序）。
     std::deque<Outgoing> m_inflight;  ///< 已发出未确认（按 seq 升序）。

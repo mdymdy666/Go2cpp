@@ -39,6 +39,7 @@ struct Options {
     int delay_ms = 0;
     std::uint32_t seed = 0x9E3779B9U;
     bool fixed_pto = false;  ///< 复现旧实现：固定 200ms 基础 PTO。
+    bool no_sack = false;    ///< 关闭 SACK 多块扩展（对照旧端 32 位行为）。
     bool verbose = false;    ///< 每秒打印一次收发进度（诊断长尾卡顿）。
     // 调参覆盖项（0 = 用库默认值）：一次构建即可扫多组弱网参数。
     std::uint32_t initial_cwnd = 0;
@@ -86,6 +87,8 @@ bool ParseOptions(int argc, char** argv, Options* options) {
             options->seed = static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else if (std::strcmp(argument, "--fixed-pto") == 0) {
             options->fixed_pto = true;
+        } else if (std::strcmp(argument, "--no-sack") == 0) {
+            options->no_sack = true;
         } else if (std::strcmp(argument, "--verbose") == 0) {
             options->verbose = true;
         } else if (std::strcmp(argument, "--initial-cwnd") == 0 && i + 1 < argc) {
@@ -150,6 +153,8 @@ int main(int argc, char** argv) {
 
     // 调参覆盖：只改显式给出的项，其余保持库默认。
     auto apply_tuning = [&options](LinkConfig& config) {
+        // 对照实验：关闭能力协商后双方只发 32 位位图 ACK（旧端行为）。
+        config.enable_sack_ext = !options.no_sack;
         if (options.initial_cwnd != 0) {
             config.reliable.congestion.initial_cwnd_packets = options.initial_cwnd;
         }
@@ -391,14 +396,24 @@ int main(int argc, char** argv) {
         unreliable_stats.reorder_pending);
     std::printf(
         "netem_probe link: frames_sent=%llu frames_received=%llu handshakes=%llu "
-        "heartbeats=%llu timeouts=%llu\n",
+        "heartbeats=%llu timeouts=%llu sack_ext=%d/%d sack_acks=%llu "
+        "sack_blocks=%llu pto_retrans=%llu tlp=%llu sack_acked=%llu sack_covered=%llu\n",
         static_cast<unsigned long long>(client.stats().frames_sent + server.stats().frames_sent),
         static_cast<unsigned long long>(client.stats().frames_received +
                                         server.stats().frames_received),
         static_cast<unsigned long long>(client.stats().handshakes + server.stats().handshakes),
         static_cast<unsigned long long>(client.stats().heartbeats_sent +
                                         server.stats().heartbeats_sent),
-        static_cast<unsigned long long>(client.stats().timeouts + server.stats().timeouts));
+        static_cast<unsigned long long>(client.stats().timeouts + server.stats().timeouts),
+        client.sack_ext_enabled() ? 1 : 0, server.sack_ext_enabled() ? 1 : 0,
+        static_cast<unsigned long long>(client.stats().sack_acks_sent +
+                                        server.stats().sack_acks_sent),
+        static_cast<unsigned long long>(client.stats().sack_blocks_sent +
+                                        server.stats().sack_blocks_sent),
+        static_cast<unsigned long long>(client_stats.pto_retransmits),
+        static_cast<unsigned long long>(client_stats.tlp_probes),
+        static_cast<unsigned long long>(client_stats.sack_acks_with_blocks),
+        static_cast<unsigned long long>(client_stats.sack_seqs_covered));
     if (proxy) {
         proxy->Stop();
         std::printf("netem_probe proxy: loss=%d%% delay=%dms forwarded=%llu dropped=%llu\n",

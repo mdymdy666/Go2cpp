@@ -627,8 +627,17 @@ void ReliableChannel::OnAck(const AckState& ack) {
         m_sack_evidence = 0;
         m_in_fast_recovery = false;
         m_pto_recovery = false;
-        // 旧 SACK 位图以旧 ack_seq 为基准，累积确认前进后全部失效。
-        m_sacked.clear();
+        // 位图锚点前移：旧 SACK 记录以旧 ack_seq 为基准，落在新锚点之前的
+        // 项已经等价于累积确认，可以丢弃；但**不能全清**——扩展块可能报得
+        // 比新锚点更远（例如 ack_seq 从 1 跳到 50 而块覆盖 100..150），
+        // 这些证据仍然有效，清掉会让发送端对远端重发。
+        for (auto it = m_sacked.begin(); it != m_sacked.end();) {
+            if (SeqGreater(*it, ack.ack_seq)) {
+                ++it;
+            } else {
+                it = m_sacked.erase(it);
+            }
+        }
     }
 
     // 累积确认：ack_seq 之前的所有消息都已收到。
@@ -639,17 +648,69 @@ void ReliableChannel::OnAck(const AckState& ack) {
         m_inflight.pop_front();
     }
 
-    // SACK：ack_bits 的 bit i 表示 ack_seq+i 已收到（可能跨过空洞）。
-    std::size_t new_sack = 0;
+    // ---- SACK 证据（32 位位图 + 多块扩展）----
+    // 位图 bit i = ack_seq+i；扩展块是位图窗口外的任意连续区间，可把已知
+    // 已收范围推进到发送窗口末端。两者都只表示「对端已收到」：命中的
+    // inflight 项立即移出重传集合，不计入拥塞窗口增长（窗口只由累积 ACK
+    // 驱动，否则一次 SACK 风暴会在丢包减窗前虚增 cwnd）。
+    std::uint32_t max_sacked = m_max_sacked;
     for (std::uint32_t bit = 1; bit < 32; ++bit) {
         if ((ack.ack_bits & (1U << bit)) == 0) {
             continue;
         }
         const std::uint32_t sacked_seq = ack.ack_seq + bit;
-        if (m_sacked.insert(sacked_seq).second) {
-            ++new_sack;
+        m_sacked.insert(sacked_seq);
+        if (SeqGreater(sacked_seq, max_sacked)) {
+            max_sacked = sacked_seq;
         }
     }
+    std::size_t block_seqs = 0;
+    for (std::size_t i = 0; i < ack.sack_block_count; ++i) {
+        const SackBlock& block = ack.sack_blocks[i];
+        if (block.length == 0) {
+            continue;
+        }
+        const std::uint32_t block_last =
+            ack.ack_seq + block.start_offset + block.length - 1;
+        if (SeqGreater(block_last, max_sacked)) {
+            max_sacked = block_last;
+        }
+        block_seqs += block.length;
+    }
+    if (block_seqs > 0) {
+        ++m_stats.sack_acks_with_blocks;
+        m_stats.sack_seqs_covered += block_seqs;
+    }
+
+    // 判定某个 inflight seq 是否被本次 ACK 隐含确认（位图 or 扩展块）。
+    const auto sack_contains = [&ack](std::uint32_t seq) {
+        const std::uint32_t delta = seq - ack.ack_seq;
+        if (delta < 32) {
+            return (ack.ack_bits & (1U << delta)) != 0;
+        }
+        for (std::size_t i = 0; i < ack.sack_block_count; ++i) {
+            const SackBlock& block = ack.sack_blocks[i];
+            // 块内偏移：delta >= start 且 delta-start < length。
+            if (delta >= block.start_offset &&
+                delta - block.start_offset < static_cast<std::uint32_t>(block.length)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::size_t new_sack = 0;
+    for (auto it = m_inflight.begin(); it != m_inflight.end();) {
+        if (!sack_contains(it->seq)) {
+            ++it;
+            continue;
+        }
+        m_sacked.erase(it->seq);
+        Acknowledge(*it, now_ms);
+        it = m_inflight.erase(it);
+        ++new_sack;
+    }
+    m_max_sacked = max_sacked;
     m_sack_evidence += new_sack;
     // 无时间戳回显时，只要出现 SACK 空洞，空洞之后的消息（包括乱序到达、
     // 已被 SACK 的）其 ACK 时刻都可能被 ACK 调度/空洞恢复推迟；保守地
@@ -663,30 +724,17 @@ void ReliableChannel::OnAck(const AckState& ack) {
         }
     }
 
-    for (auto it = m_inflight.begin(); it != m_inflight.end();) {
-        const std::uint32_t delta = it->seq - ack.ack_seq;
-        if (delta < 32 && (ack.ack_bits & (1U << delta)) != 0) {
-            m_sacked.erase(it->seq);
-            Acknowledge(*it, now_ms);
-            // SACK 只是乱序到达的证据，不计入拥塞窗口增长：窗口增长只由
-            // 累积 ACK 驱动（否则一次 SACK 风暴会在丢包减窗前虚增 cwnd）。
-            it = m_inflight.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
     // ACK 腾出了窗口：先增长拥塞窗口，再补发排队消息。
     m_cc.OnAck(acked_now, m_rtt.smoothed_rtt_ms(), now_ms);
     Pump(now_ms);
-    (void)TryFastRetransmit(ack, progressed, new_sack, now_ms);
+    (void)TryFastRetransmit(progressed, new_sack, now_ms);
     RefreshRttStats();
     m_stats.inflight = m_inflight.size();
     m_stats.unsent = m_unsent.size();
 }
 
-bool ReliableChannel::TryFastRetransmit(const AckState& ack, bool ack_progressed,
-                                        std::size_t new_sack, std::uint64_t now_ms) {
+bool ReliableChannel::TryFastRetransmit(bool ack_progressed, std::size_t new_sack,
+                                        std::uint64_t now_ms) {
     if (!m_config.fast_retransmit || m_inflight.empty()) {
         return false;
     }
@@ -701,6 +749,18 @@ bool ReliableChannel::TryFastRetransmit(const AckState& ack, bool ack_progressed
             if (m_dup_acks >= m_config.fast_retransmit_threshold) {
                 m_dup_acks = 0;
                 Outgoing& head = m_inflight.front();
+                // 同一队首的补发至少隔一个 SRTT：扩展 SACK 后接收端每
+                // ack_interval 重报带块 ACK，重复 ACK 以 10ms 级速度累积，
+                // 不限制就会每 30ms 重发一次队首。1Mbit 限速链路的重传本身
+                // 要排队 1s+，不限速实测重传 141~177 次（目标 <150）；按
+                // SRTT 限速后降到 115~131 次，20/40% 场景的 p95 也同步下降
+                // （1306~1712 / 1316~3723ms）。更短的 250ms 上限反而让重传
+                // 与快速恢复互相踩踏（20% p95 升到 2.5s），不采用。
+                const std::uint64_t interval =
+                    std::max<std::uint64_t>(m_rtt.smoothed_rtt_ms(), 1);
+                if (now_ms >= head.last_send_ms && now_ms - head.last_send_ms < interval) {
+                    return false;
+                }
                 ++head.retransmits;
                 head.ever_retransmitted = true;
                 ++m_stats.fast_retransmits;
@@ -716,14 +776,10 @@ bool ReliableChannel::TryFastRetransmit(const AckState& ack, bool ack_progressed
         return false;
     }
     const std::uint32_t first_unacked = m_inflight.front().seq;
-    std::size_t sacked_above = 0;
-    for (const std::uint32_t sacked_seq : m_sacked) {
-        if (SeqGreater(sacked_seq, first_unacked)) {
-            ++sacked_above;
-        }
-    }
-
-    const bool sack_gap = sacked_above >= m_config.fast_retransmit_threshold ||
+    // 「最远已收 seq」超过队首，说明队首与它之间至少有 1 个空洞。旧实现
+    // 只看 32 位位图（sacked_above），位图窗口外的已收 seq 不可见，只能等
+    // PTO 整批兜底；扩展块把最远已收推进到发送窗口末端，空洞因此可判定。
+    const bool sack_gap = SeqGreater(m_max_sacked, first_unacked) &&
                           m_sack_evidence >= m_config.fast_retransmit_threshold;
     bool trigger = sack_gap;
     if (!trigger && !ack_progressed && new_sack == 0) {
@@ -738,15 +794,14 @@ bool ReliableChannel::TryFastRetransmit(const AckState& ack, bool ack_progressed
     m_dup_acks = 0;
     m_sack_evidence = 0;
     m_in_fast_recovery = true;
-    // 统计同一 SACK 窗口内的「空洞」数：ACK 位图覆盖范围（32 个 seq）内
-    // 尚未被确认、也未被 SACK 的包就是可判定的空洞。窗口外的未确认包可能
-    // 仍在网络中，不能计入（否则高抖动链路会把每个 ACK 都误判成批量丢包）。
+    // 空洞数：所有 <= 最远已收 seq 的未确认 inflight 项都是可判定丢失
+    // （它们和已知已收项之间必有缺口），比旧实现的「32 位窗口内计数」更
+    // 精确，也让拥塞控制看到真实批量丢包规模。
     std::uint32_t holes = 1;
     if (sack_gap) {
         holes = 0;
         for (const Outgoing& message : m_inflight) {
-            const std::uint32_t offset = message.seq - ack.ack_seq;
-            if (offset >= 32) {
+            if (SeqGreater(message.seq, m_max_sacked)) {
                 break;  // inflight 按 seq 递增，之后的只会更远。
             }
             ++holes;
@@ -766,10 +821,9 @@ bool ReliableChannel::TryFastRetransmit(const AckState& ack, bool ack_progressed
     for (auto it = m_inflight.begin();
          it != m_inflight.end() && retransmitted < kFastRetransmitBatch; ++it) {
         if (sack_gap) {
-            // 32 位 SACK 窗口内：SACK 已确认的消息已从 inflight 移除，
-            // 仍在窗口内的就是空洞；窗口外的空洞不可知，留给后续 ACK/PTO。
-            const std::uint32_t offset = it->seq - ack.ack_seq;
-            if (offset >= 32) {
+            // 远端已收 seq 之外的项仍在网络中（可能只是迟到），不能计入
+            // 本批重传；<= m_max_sacked 的项才是确定空洞。
+            if (SeqGreater(it->seq, m_max_sacked)) {
                 break;
             }
         } else if (it != m_inflight.begin()) {
@@ -819,13 +873,17 @@ void ReliableChannel::Acknowledge(Outgoing& message, std::uint64_t now_ms) {
 
 void ReliableChannel::OnTimer(std::uint64_t now_ms) {
     Pump(now_ms);
-    // PTO 补发：每个 tick 最多重传 kPtoRetransmitBatch 条已超时消息，
-    // 避免一次 RunOnce 内突发上百帧；后续 tick 继续按 seq 补。弱网下
-    // ACK 位图只有 32 位，空洞之后的大量消息可能早已被对端收到但未被
-    // SACK，因此保留退避、按 tick 限速能明显减少冗余重传。
+    // PTO 兜底补发：每个 tick 最多重传 kPtoRetransmitBatch 条已超时消息。
+    // 扩展 SACK 后，绝大多数「对端已收到」的项在 OnAck 里就被移出 inflight，
+    // 因此这里的兜底集合比只有 32 位位图时小得多；PTO 仍保留为最后防线
+    // （ACK 全丢/对端卡住时只能靠它推进）。
     std::size_t retransmitted = 0;
     for (auto it = m_inflight.begin();
          it != m_inflight.end() && retransmitted < kPtoRetransmitBatch; ++it) {
+        if (m_sacked.count(it->seq) != 0) {
+            // 跨 ACK 保留的 SACK 证据：对端已收到，重传纯属浪费。
+            continue;
+        }
         const std::uint32_t pto = m_rtt.BackoffPtoMs(it->retransmits);
         if (now_ms < it->last_send_ms || now_ms - it->last_send_ms < pto) {
             continue;
@@ -833,11 +891,32 @@ void ReliableChannel::OnTimer(std::uint64_t now_ms) {
         ++it->retransmits;
         it->ever_retransmitted = true;
         ++m_stats.retransmits;
+        ++m_stats.pto_retransmits;
         m_cc.NoteRetransmit();
         ++retransmitted;
         if (!SendNow(*it, true, now_ms)) {
             // 发送失败也推进时间戳，否则同一次 Tick 会反复重试。
             it->last_send_ms = now_ms;
+        }
+    }
+    // TLP（RFC 8985 简化）：没有新数据可发、但仍有未确认数据时，接收端
+    // 可能因为「后面没有包」收不到重复 ACK/SACK，快速重传无法触发，只能
+    // 等整轮 PTO（5% 丢包 + 50ms 延迟实测尾部 p95 被推到 300ms 以上）。
+    // 在 PTO 的一半时刻补发一个探测包，让接收端立刻用累积 ACK + SACK 报告
+    // 状态。探测不递增 retransmits，不参与 PTO 退避——否则一次尾包丢失会
+    // 把后续恢复间隔整体翻倍。
+    if (retransmitted == 0 && m_unsent.empty() && !m_inflight.empty()) {
+        Outgoing& probe = m_inflight.back();
+        const std::uint32_t pto = m_rtt.BackoffPtoMs(probe.retransmits);
+        const std::uint64_t half = std::max<std::uint64_t>(pto / 2, 1);
+        if (m_sacked.count(probe.seq) == 0 && now_ms >= probe.last_send_ms &&
+            now_ms - probe.last_send_ms >= half && now_ms - probe.last_send_ms < pto) {
+            probe.ever_retransmitted = true;
+            ++m_stats.retransmits;
+            ++m_stats.tlp_probes;
+            if (!SendNow(probe, true, now_ms)) {
+                probe.last_send_ms = now_ms;
+            }
         }
     }
     if (retransmitted > 0 && !m_pto_recovery) {
@@ -926,6 +1005,100 @@ bool ReliableChannel::FillAck(AckState* out) const noexcept {
             out->ack_bits |= (1U << i);
         }
     }
+
+    // ---- SACK 多块扩展 ----
+    // m_rx_seen 只保存 > next_rx 的乱序 seq（已交付项在 AdvanceDelivery 中
+    // 擦除），规模上界是接收窗口 512。把 32 位位图之外的乱序项合并成连续
+    // 区间，供对端精确定位「已收到但位图外」的 seq。
+    struct Run {
+        std::uint32_t start_offset;
+        std::uint32_t length;
+    };
+    // 512 窗口最坏是 256 个单包 run；栈上固定数组，fill 在每次数据帧发送时
+    // 都会调用，不能在这里分配堆内存。超出上限时保留近端块 + 最远块（见下）。
+    std::array<Run, kReceiveWindow / 2> runs{};
+    std::size_t run_count = 0;
+    std::uint32_t run_start = 0;
+    std::uint32_t run_last = 0;
+    bool have_run = false;
+    auto flush_run = [&]() {
+        if (!have_run) {
+            return;
+        }
+        have_run = false;
+        const std::uint32_t first = run_start - m_next_rx_seq;
+        const std::uint32_t last = run_last - m_next_rx_seq;
+        if (last < 32) {
+            return;  // 完全落在基础位图内，扩展重复表达没有收益。
+        }
+        // 跨越 32 边界的 run 只保留位图外的部分，保持「基础 8B 已表达全部
+        // 低 32 位」这一不变式，便于旧端/新端解析结果一致。
+        const std::uint32_t begin = first < 32 ? 32 : first;
+        const std::uint32_t length = last - begin + 1;
+        if (begin > 0xFFFFU || length > 0xFFFFU) {
+            return;  // u16 偏移/长度表达不了（接收窗口 512，正常不会发生）。
+        }
+        if (run_count >= runs.size()) {
+            return;
+        }
+        runs[run_count].start_offset = begin;
+        runs[run_count].length = length;
+        ++run_count;
+    };
+    // m_rx_seen 是 std::set<std::uint32_t>，数值序在 seq 回绕（跨 0）时会打乱
+    // 「相对 next_rx 的偏移序」：接近 2^32 的项排在 1 之后，偏移却最小。
+    // 扩展块必须按 start_offset 升序编码，否则解析端按协议拒绝整帧，这里
+    // 先按相对偏移重排。窗口上界 512，栈上数组，不引入堆分配。
+    std::array<std::uint32_t, kReceiveWindow> ordered{};
+    std::size_t ordered_count = 0;
+    for (const std::uint32_t seq : m_rx_seen) {
+        if (!SeqGreater(seq, m_next_rx_seq)) {
+            continue;
+        }
+        if (seq - m_next_rx_seq >= static_cast<std::uint32_t>(kReceiveWindow)) {
+            continue;  // 不能用 break：回绕时窗口外的项可能排在前面。
+        }
+        ordered[ordered_count++] = seq;
+    }
+    const std::uint32_t base = m_next_rx_seq;
+    std::sort(ordered.begin(), ordered.begin() + static_cast<std::ptrdiff_t>(ordered_count),
+              [base](std::uint32_t lhs, std::uint32_t rhs) { return lhs - base < rhs - base; });
+    for (std::size_t i = 0; i < ordered_count; ++i) {
+        const std::uint32_t seq = ordered[i];
+        if (have_run && seq == run_last + 1) {
+            run_last = seq;
+            continue;
+        }
+        flush_run();
+        run_start = seq;
+        run_last = seq;
+        have_run = true;
+    }
+    flush_run();
+
+    // 块数选择：<=16 个区间全报；更多时保留前 15 个（近端，紧邻 HOL 空洞，
+    // 快速重传据此判定确失包）+ 最后 1 个（最远已收 seq，发送端据此跳过
+    // 远端已收项的 PTO 兜底重传）。块按 start_offset 升序，解析端据此校验。
+    std::size_t selected = 0;
+    if (run_count <= kMaxSackBlocks) {
+        for (; selected < run_count; ++selected) {
+            out->sack_blocks[selected].start_offset =
+                static_cast<std::uint16_t>(runs[selected].start_offset);
+            out->sack_blocks[selected].length = static_cast<std::uint16_t>(runs[selected].length);
+        }
+    } else {
+        for (std::size_t i = 0; i + 1 < kMaxSackBlocks; ++i) {
+            out->sack_blocks[selected].start_offset =
+                static_cast<std::uint16_t>(runs[i].start_offset);
+            out->sack_blocks[selected].length = static_cast<std::uint16_t>(runs[i].length);
+            ++selected;
+        }
+        const Run& far = runs[run_count - 1];
+        out->sack_blocks[selected].start_offset = static_cast<std::uint16_t>(far.start_offset);
+        out->sack_blocks[selected].length = static_cast<std::uint16_t>(far.length);
+        ++selected;
+    }
+    out->sack_block_count = static_cast<std::uint8_t>(selected);
     return true;
 }
 

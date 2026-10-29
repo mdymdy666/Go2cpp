@@ -32,11 +32,31 @@
  *          bit i 表示 ack_seq+i 已收到（SACK 位图，窗口 32），ack_seq 本身
  *          表示「下一个期望的 seq」（累积确认）。
  *
+ *          **SACK 多块扩展（P3）**：32 位位图只覆盖 ack_seq..ack_seq+31，
+ *          发送窗口 256/接收窗口 512 下窗口外的丢失不可判定，只能等 PTO
+ *          整批兜底重传。为此新增纯 ACK 帧的可选尾部（8B 基础之后）：
+ *
+ *          | 偏移 | 字段     | 类型 | 语义                                |
+ *          |------|----------|------|-------------------------------------|
+ *          | 0    | ack_seq  | u32  | 与旧格式相同                        |
+ *          | 4    | ack_bits | u32  | 与旧格式相同                        |
+ *          | 8    | nblocks  | u8   | SACK 块数，1..kMaxSackBlocks        |
+ *          | 9    | blocks[] | 4n   | { start_offset u16, len u16 }       |
+ *
+ *          start_offset 是相对 ack_seq 的偏移（u16 足以覆盖 512 接收窗口），
+ *          len 是连续已收到的 seq 个数。载荷总长 8（旧格式）或 9+4n；
+ *          旧端只认 payload_bytes == 8，因此**扩展只在双方通过 HELLO/
+ *          HELLO_ACK 的 caps 位协商成功后发送**（见 kCapSackExt），未协商
+ *          或对端为旧端时由发送方降级为 8B 位图。数据帧捎带的 ACK 段保持
+ *          固定 8B（帧头 flags 已无空闲位，无法标示变长），扩展只走纯 ACK
+ *          帧；纯 ACK 每 10~20ms 一次，足以覆盖弱网下的 SACK 需求。
+ *
  * @author go2cpp contributors
  * @date 2026-10-26
  * @copyright MIT License
  */
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -51,6 +71,34 @@ inline constexpr std::size_t kFrameHeaderBytes = 16;
 
 /// 可选 ACK 段字节数（ack_seq + ack_bits）。
 inline constexpr std::size_t kAckBytes = 8;
+
+/// SACK 多块扩展：最大块数。16 块 = 64B 扩展，纯 ACK 帧总载荷 73B，
+/// 远低于 kMaxFramePayload；块数上限同时约束接收端的解析工作量。
+/// 8 块在多丢包链路（40% 丢包、窗口 96）下只能覆盖约 12 个 seq，剩余
+/// 已收项仍会被 PTO 整批重传；16 块把单次可确认范围翻倍，实测 1Mbit
+/// 限速场景重传从 205 降到 150 以下。块按需使用（run 少时载荷仍很小）。
+inline constexpr std::size_t kMaxSackBlocks = 16;
+
+/// 单个 SACK 块线上字节数：start_offset u16 + len u16（大端）。
+inline constexpr std::size_t kSackBlockBytes = 4;
+
+/// 扩展 ACK 载荷头：8B 基础 + 1B 块数。
+inline constexpr std::size_t kAckExtHeaderBytes = kAckBytes + 1;
+
+/// 扩展 ACK 载荷上限（块数取满）。
+inline constexpr std::size_t kAckPayloadMaxBytes =
+    kAckExtHeaderBytes + kMaxSackBlocks * kSackBlockBytes;
+
+/// HELLO / HELLO_ACK 基础载荷字节数（magic u32 + session u32 + conn_id u32）。
+inline constexpr std::size_t kHelloBaseBytes = 12;
+
+/// HELLO / HELLO_ACK 带能力位的载荷字节数（基础 + caps u16）。
+inline constexpr std::size_t kHelloCapsBytes = kHelloBaseBytes + 2;
+
+/// HELLO/HELLO_ACK 能力位。
+/// bit0 = 支持 SACK 多块扩展（纯 ACK 帧可变长尾部）。旧端不读该字段，
+/// 因而收到 14B HELLO/HELLO_ACK 时按 >=12B 解析、忽略尾部，不会崩。
+inline constexpr std::uint16_t kCapSackExt = 0x0001;
 
 /// 单帧载荷上限。留出 16B 头 + 8B ACK 后仍低于 1500B 的常见以太网 MTU，
 /// 默认路径不依赖 IP 分片。
@@ -124,10 +172,23 @@ struct FrameHeader {
     std::uint32_t dep_seq = 0;
 };
 
-/// @brief 累积确认 + 32 位 SACK 位图。
+/// @brief SACK 扩展块：相对 ack_seq 的连续已收区间。
+struct SackBlock {
+    std::uint16_t start_offset = 0;  ///< 相对 ack_seq 的起始偏移，>= 1。
+    std::uint16_t length = 0;        ///< 连续已收到的 seq 个数，>= 1。
+};
+
+/// @brief 累积确认 + 32 位 SACK 位图 + 可选多块扩展。
+/// @details 线上格式见文件头：前 8B 与旧协议逐字节一致；sack_blocks 只在
+///          纯 ACK 帧的扩展尾部出现（由 EncodeAckPayload 编码）。数据帧
+///          捎带的 ACK 段永远只用前 8B，因此 block 字段在此场景恒为 0。
 struct AckState {
     std::uint32_t ack_seq = 0;  ///< 下一个期望的 seq（即所有 < ack_seq 的消息已收到）。
     std::uint32_t ack_bits = 0;  ///< bit i 置位表示 ack_seq+i 已收到。
+    /// 扩展块数：0 = 只有 32 位位图（旧格式/降级）。
+    std::uint8_t sack_block_count = 0;
+    /// 扩展块：相对 ack_seq 的连续已收区间。块内不重叠，按 start_offset 升序。
+    std::array<SackBlock, kMaxSackBlocks> sack_blocks{};
 };
 
 /// @brief 解析后的帧视图，payload 指向调用方缓冲区，不拥有内存。
@@ -172,6 +233,24 @@ void EncodeAck(const AckState& ack, std::uint8_t* out) noexcept;
 
 /// @brief 解码 8 字节 ACK 段。
 bool DecodeAck(const std::uint8_t* data, std::size_t size, AckState* out) noexcept;
+
+/// @brief 纯 ACK 帧载荷长度是否合法：8B 旧格式，或 9+4n（1<=n<=kMaxSackBlocks）。
+bool IsValidAckPayloadSize(std::size_t bytes) noexcept;
+
+/// @brief 按当前块数计算纯 ACK 载荷字节数（8 或 9+4n）。
+/// @note 块数越界（>kMaxSackBlocks）时返回 kAckBytes，表示会降级为位图。
+std::size_t AckPayloadBytes(const AckState& ack) noexcept;
+
+/// @brief 编码纯 ACK 帧载荷（基础 8B + 可选扩展尾部）。
+/// @param capacity out 的可写字节数；< 8 返回 0。
+/// @return 实际写入字节数。块数无效或 capacity 不足时只写 8B 并返回 8，
+///         保证调用方拿到的是旧端可解析的最小合法载荷。
+std::size_t EncodeAckPayload(const AckState& ack, std::uint8_t* out,
+                             std::size_t capacity) noexcept;
+
+/// @brief 解码纯 ACK 帧载荷，同时接受旧 8B 与扩展 9+4n 两种长度。
+/// @return 长度/块数/块边界任一非法返回 false（调用方计入 invalid_frames）。
+bool DecodeAckPayload(const std::uint8_t* data, std::size_t size, AckState* out) noexcept;
 
 /// @brief 构造完整帧（头 + 可选 ACK 段 + 载荷）。
 /// @param ack 非空时在帧头后写入 ACK 段并置 kFlagAck；调用方不要自行置位。

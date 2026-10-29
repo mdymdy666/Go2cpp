@@ -16,6 +16,11 @@
  *          barrier_seq，所有依赖 <= barrier_seq 的 pending 项都会释放，
  *          其中自身 seq 已被水位越过的项由通道按 DropStale 丢弃。
  *
+ *          SACK 多块扩展（见 protocol.hpp）只作用于可靠通道的重传判定：
+ *          扩展块表达的「对端已收到」不会推进这里的 m_watermark，dep_seq
+ *          仍只由 AdvanceUnreliable/OnBarrier 移动。两套语义保持独立，
+ *          避免可靠通道的乱序缓存影响不可靠流的因果水位。
+ *
  * @author go2cpp contributors
  * @date 2026-10-26
  * @copyright MIT License

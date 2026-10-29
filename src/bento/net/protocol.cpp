@@ -68,8 +68,8 @@ bool ValidatePayloadShape(FrameType type, std::size_t payload_bytes) noexcept {
             // 视频分片子头：frame_id(4) + frag_idx(2) + frag_cnt(2)。
             return payload_bytes >= kVideoHeaderBytes;
         case FrameType::kAck:
-            // 纯 ACK 的载荷就是 8B ACK 段。
-            return payload_bytes == kAckBytes;
+            // 纯 ACK 的载荷是 8B 旧格式，或 9+4n 的 SACK 多块扩展。
+            return IsValidAckPayloadSize(payload_bytes);
         case FrameType::kBarrier:
             // 屏障序号放在 header.seq，无载荷。
             return payload_bytes == 0;
@@ -175,6 +175,113 @@ bool DecodeAck(const std::uint8_t* data, std::size_t size, AckState* out) noexce
     }
     out->ack_seq = ReadU32(data);
     out->ack_bits = ReadU32(data + 4);
+    out->sack_block_count = 0;
+    return true;
+}
+
+bool IsValidAckPayloadSize(std::size_t bytes) noexcept {
+    if (bytes == kAckBytes) {
+        return true;
+    }
+    if (bytes < kAckExtHeaderBytes) {
+        return false;
+    }
+    const std::size_t tail = bytes - kAckExtHeaderBytes;
+    if (tail % kSackBlockBytes != 0) {
+        return false;
+    }
+    const std::size_t blocks = tail / kSackBlockBytes;
+    return blocks >= 1 && blocks <= kMaxSackBlocks;
+}
+
+std::size_t AckPayloadBytes(const AckState& ack) noexcept {
+    if (ack.sack_block_count == 0 || ack.sack_block_count > kMaxSackBlocks) {
+        return kAckBytes;
+    }
+    return kAckExtHeaderBytes + static_cast<std::size_t>(ack.sack_block_count) * kSackBlockBytes;
+}
+
+std::size_t EncodeAckPayload(const AckState& ack, std::uint8_t* out,
+                             std::size_t capacity) noexcept {
+    if (out == nullptr || capacity < kAckBytes) {
+        return 0;
+    }
+    WriteU32(out, ack.ack_seq);
+    WriteU32(out + 4, ack.ack_bits);
+    const std::size_t bytes = AckPayloadBytes(ack);
+    if (bytes == kAckBytes || capacity < bytes) {
+        // 无块、块数非法或缓冲不足：只写旧格式 8B。调用方拿到的永远是
+        // 旧端可解析的合法载荷，降级路径不会产生半截扩展。
+        return kAckBytes;
+    }
+    // 块自检：发送端生成非法块（0 偏移/0 长度/乱序/重叠/越界）时降级为
+    // 8B 位图。宁可少报信息，也不能让对端把整帧当非法帧丢掉——那会让
+    // 本已工作的累积确认一起失效。
+    std::uint32_t previous_end = 0;
+    for (std::size_t i = 0; i < ack.sack_block_count; ++i) {
+        const SackBlock& block = ack.sack_blocks[i];
+        if (block.start_offset == 0 || block.length == 0) {
+            return kAckBytes;
+        }
+        const std::uint32_t end = static_cast<std::uint32_t>(block.start_offset) + block.length;
+        if (end > 0x10000U ||
+            static_cast<std::uint32_t>(block.start_offset) < previous_end) {
+            return kAckBytes;
+        }
+        previous_end = end;
+    }
+    out[8] = ack.sack_block_count;
+    std::size_t offset = kAckExtHeaderBytes;
+    for (std::size_t i = 0; i < ack.sack_block_count; ++i) {
+        WriteU16(out + offset, ack.sack_blocks[i].start_offset);
+        WriteU16(out + offset + 2, ack.sack_blocks[i].length);
+        offset += kSackBlockBytes;
+    }
+    return bytes;
+}
+
+bool DecodeAckPayload(const std::uint8_t* data, std::size_t size, AckState* out) noexcept {
+    if (out == nullptr || data == nullptr || !IsValidAckPayloadSize(size)) {
+        return false;
+    }
+    AckState ack;
+    ack.ack_seq = ReadU32(data);
+    ack.ack_bits = ReadU32(data + 4);
+    if (size == kAckBytes) {
+        *out = ack;
+        return true;
+    }
+    const std::size_t count = data[8];
+    if (count == 0 || count > kMaxSackBlocks) {
+        return false;
+    }
+    if (size != kAckExtHeaderBytes + count * kSackBlockBytes) {
+        return false;
+    }
+    ack.sack_block_count = static_cast<std::uint8_t>(count);
+    std::size_t offset = kAckExtHeaderBytes;
+    std::uint32_t previous_end = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::uint16_t start = ReadU16(data + offset);
+        const std::uint16_t length = ReadU16(data + offset + 2);
+        // start_offset==0 表示 ack_seq 自身已收到，与「ack_seq 是下一个
+        // 期望 seq」矛盾。若接受，发送端会把未确认的队首误判为已收并从
+        // inflight 移除，等于丢消息；0 长度块同理没有信息量。直接拒绝。
+        if (start == 0 || length == 0) {
+            return false;
+        }
+        // 块必须按 start 升序且不重叠（接收端按此生成），既避免重复处理，
+        // 也让「已收到区间」的合并保持单调。u32 运算避免 u16 溢出回绕。
+        const std::uint32_t end = static_cast<std::uint32_t>(start) + length;
+        if (end > 0x10000U || static_cast<std::uint32_t>(start) < previous_end) {
+            return false;
+        }
+        previous_end = end;
+        ack.sack_blocks[i].start_offset = start;
+        ack.sack_blocks[i].length = length;
+        offset += kSackBlockBytes;
+    }
+    *out = ack;
     return true;
 }
 
@@ -285,8 +392,10 @@ bool ParseFrame(const std::uint8_t* data, std::size_t size, FrameView* out) noex
 
     if (view.header.type == FrameType::kAck) {
         // 纯 ACK 帧的 ACK 状态在载荷里；与捎带 ACK 不共用字段，避免歧义。
+        // 这里接受旧 8B 与 SACK 多块扩展两种长度（扩展只在能力协商后出现，
+        // 但解析层不做能力判断：旧端把 9+4n 当非法帧丢弃，不会误解语义）。
         AckState ack;
-        if (!DecodeAck(view.payload, view.payload_bytes, &ack)) {
+        if (!DecodeAckPayload(view.payload, view.payload_bytes, &ack)) {
             return false;
         }
         view.ack = ack;
