@@ -2,7 +2,7 @@
  * @file test_file_browser.cpp
  * @brief MOD-30 文件浏览测试：列目录、Stat、Get/Put、1MB 往返、路径与
  *        符号链接逃逸、不存在、权限、大小上限、条目上限与参数校验。
- * @details 覆盖 12 组场景：
+ * @details 覆盖 19 组场景：
  *          1. 构造（有效/无效根目录）与列根目录（排序、类型、隐藏项）；
  *          2. Stat（根、文件、符号链接、不存在、空指针）；
  *          3. Get（内容、覆盖语义、类型错误、不存在、空参数）；
@@ -11,10 +11,19 @@
  *          6. 符号链接逃逸（默认拒绝；follow=true 时仍以真实路径判据）；
  *          7. 1MB 文件 Get/Put 往返；
  *          8. 大小上限（Get/Put 均拒绝）；
- *          9. 权限拒绝（EACCES；root 用户跳过）；
+ *          9. 权限拒绝（EACCES/只读根；root 时临时降权到 nobody，不 SKIP）；
  *          10. 目录条目上限；
  *          11. follow_symlinks=true 的根内链接；
- *          12. 空指针/空路径/非法选项。
+ *          12. 空指针/空路径/非法选项；
+ *          13. 1200 个强制非法 + 300 个合法随机路径（含 NUL/尾斜杠/超长段）；
+ *          14. D-05 并发发布竞争（8MiB 源 + 抢占目标）；
+ *          15. List 排序（逆序创建，验证不依赖 readdir 顺序）；
+ *          16. 空文件 / Unicode / NAME_MAX / 路径长度 / NUL 参数；
+ *          17. 根目录构造后被删除、替换为符号链接或普通文件（fail-closed）；
+ *          18. follow_symlinks 与覆盖语义（不写穿链接目标）；
+ *          19. 8 线程并发 Get/Put + 同一目标 overwrite=false 竞争。
+ * @note 运行期约 1–2 秒；1 GiB / 10 万次压测在
+ *       `tests/bento/audit_file_browser_stress.cpp` 独立审计程序中执行。
  * @author go2cpp contributors
  * @date 2026-10-28
  * @copyright MIT License
@@ -505,12 +514,8 @@ void TestSizeLimit() {
     RemoveTree(base);
 }
 
-/// 场景 9：权限拒绝（root 用户跳过）。
+/// 场景 9：权限拒绝（root 时临时降权到 nobody，不再 SKIP）。
 void TestPermissionDenied() {
-    if (::geteuid() == 0) {
-        bento_test::Skip("以 root 运行，chmod 000 不能阻止访问，跳过权限用例");
-        return;
-    }
     const fs::path base = MakeTempDir("perm");
     BENTO_CHECK(!base.empty());
     fs::path root;
@@ -519,20 +524,56 @@ void TestPermissionDenied() {
         return;
     }
     std::error_code ec;
+    const fs::path local_dir = base / "local";
+    const fs::path local_ro = base / "local_ro";
     fs::create_directories(root / "locked", ec);
+    fs::create_directories(root / "readonly", ec);
+    fs::create_directories(local_dir, ec);
+    fs::create_directories(local_ro, ec);
     BENTO_CHECK(!ec);
     BENTO_CHECK(WriteFile(root / "secret.txt", "secret"));
+    BENTO_CHECK(WriteFile(root / "readable.txt", "read"));
+    BENTO_CHECK(WriteFile(local_dir / "upload.bin", "upload"));
     BENTO_CHECK(::chmod((root / "locked").c_str(), 0000) == 0);
     BENTO_CHECK(::chmod((root / "secret.txt").c_str(), 0000) == 0);
+    BENTO_CHECK(::chmod((root / "readonly").c_str(), 0555) == 0);
+    BENTO_CHECK(::chmod(local_dir.c_str(), 0777) == 0);
+    BENTO_CHECK(::chmod(local_ro.c_str(), 0555) == 0);
+
+    // root 的 DAC 绕过会让 chmod 000 失效；临时把有效 uid/gid 降到 nobody，
+    // 让同一组断言在 CI 容器（root）里也真实执行。结束时恢复。
+    const bool dropped = ::geteuid() == 0;
+    if (dropped) {
+        BENTO_CHECK(::setegid(65534) == 0);
+        BENTO_CHECK(::seteuid(65534) == 0);
+    }
 
     const FileBrowser browser(root.string());
     std::vector<FileEntry> entries;
+    FileEntry entry;
     BENTO_CHECK_EQ(browser.List("locked", &entries), FileBrowserStatus::kPermissionDenied);
-    BENTO_CHECK_EQ(browser.Get("secret.txt", (base / "secret.copy").string()),
+    BENTO_CHECK_EQ(browser.Get("secret.txt", (local_dir / "secret.copy").string()),
                    FileBrowserStatus::kPermissionDenied);
+    BENTO_CHECK_EQ(browser.Put("readonly/new.txt", (local_dir / "upload.bin").string()),
+                   FileBrowserStatus::kPermissionDenied);
+    BENTO_CHECK_EQ(browser.Get("readable.txt", (local_ro / "readable.copy").string()),
+                   FileBrowserStatus::kPermissionDenied);
+    BENTO_CHECK_EQ(browser.List("", &entries), FileBrowserStatus::kOk);
+    BENTO_CHECK_EQ(browser.Get("readable.txt", (local_dir / "readable.copy").string()),
+                   FileBrowserStatus::kOk);
+    BENTO_CHECK_EQ(browser.Stat("secret.txt", &entry), FileBrowserStatus::kOk);
+    BENTO_CHECK_EQ(entry.size, static_cast<std::uint64_t>(6));
+    BENTO_CHECK_EQ(browser.List("nope", &entries), FileBrowserStatus::kNotFound);
 
-    BENTO_CHECK(::chmod((root / "locked").c_str(), 0755) == 0);
-    BENTO_CHECK(::chmod((root / "secret.txt").c_str(), 0644) == 0);
+    if (dropped) {
+        BENTO_CHECK(::seteuid(0) == 0);
+        BENTO_CHECK(::setegid(0) == 0);
+    }
+    BENTO_CHECK_EQ(::chmod((root / "locked").c_str(), 0755), 0);
+    BENTO_CHECK_EQ(::chmod((root / "secret.txt").c_str(), 0644), 0);
+    BENTO_CHECK_EQ(::chmod((root / "readonly").c_str(), 0755), 0);
+    BENTO_CHECK_EQ(::chmod(local_ro.c_str(), 0755), 0);
+    BENTO_CHECK(!fs::exists(root / "readonly" / "new.txt"));
     RemoveTree(base);
 }
 
@@ -590,7 +631,7 @@ void TestInvalidOptionsAndArguments() {
     RemoveTree(base);
 }
 
-/// 场景 13：随机路径 fuzz（500 个强制非法 + 200 个合法组合）。
+/// 场景 13：随机路径 fuzz（1200 个强制非法 + 300 个合法组合）。
 void TestRandomPathEscapes() {
     const fs::path base = MakeTempDir("fuzz");
     BENTO_CHECK(!base.empty());
@@ -618,9 +659,9 @@ void TestRandomPathEscapes() {
         return path;
     };
 
-    for (int iteration = 0; iteration < 500; ++iteration) {
+    for (int iteration = 0; iteration < 1200; ++iteration) {
         std::string path;
-        switch (rng() % 5) {
+        switch (rng() % 8) {
             case 0:
                 path = "/" + make_valid();
                 break;
@@ -635,20 +676,39 @@ void TestRandomPathEscapes() {
             case 3:
                 path = make_valid() + "\\" + make_valid();
                 break;
-            default:
+            case 4:
                 path = make_valid() + ":x";
+                break;
+            case 5:
+                path = make_valid() + "/";
+                break;
+            case 6:
+                path = make_valid();
+                path.push_back('\0');
+                path += "x";
+                break;
+            default:
+                path.assign(300, 'x');
                 break;
         }
         std::vector<FileEntry> entries;
+        FileEntry entry;
         BENTO_CHECK_EQ(browser.List(path, &entries), FileBrowserStatus::kPathRejected);
+        BENTO_CHECK_EQ(browser.Stat(path, &entry), FileBrowserStatus::kPathRejected);
         BENTO_CHECK_EQ(browser.Get(path, local), FileBrowserStatus::kPathRejected);
         BENTO_CHECK_EQ(browser.Put(path, local), FileBrowserStatus::kPathRejected);
     }
 
-    for (int iteration = 0; iteration < 200; ++iteration) {
+    for (int iteration = 0; iteration < 300; ++iteration) {
         std::vector<FileEntry> entries;
-        const FileBrowserStatus status = browser.List(make_valid(), &entries);
-        BENTO_CHECK(status == FileBrowserStatus::kOk || status == FileBrowserStatus::kNotFound);
+        FileEntry entry;
+        const std::string path = make_valid();
+        const FileBrowserStatus list_status = browser.List(path, &entries);
+        const FileBrowserStatus stat_status = browser.Stat(path, &entry);
+        BENTO_CHECK(list_status == FileBrowserStatus::kOk ||
+                    list_status == FileBrowserStatus::kNotFound);
+        BENTO_CHECK(stat_status == FileBrowserStatus::kOk ||
+                    stat_status == FileBrowserStatus::kNotFound);
     }
 
     RemoveTree(base);
@@ -730,6 +790,392 @@ void TestGetNoOverwriteRace() {
     RemoveTree(base);
 }
 
+/// 场景 14：List 排序（故意逆序创建，不依赖 readdir 的返回顺序）。
+void TestListSortedOrder() {
+    const fs::path base = MakeTempDir("sort");
+    BENTO_CHECK(!base.empty());
+    const fs::path root = base / "root";
+    std::error_code ec;
+    fs::create_directories(root, ec);
+    BENTO_CHECK(!ec);
+    if (base.empty() || ec) {
+        return;
+    }
+    std::vector<std::string> expected;
+    for (int value = 23; value >= 0; --value) {
+        char name[16];
+        std::snprintf(name, sizeof(name), "n%02d", value);
+        expected.emplace_back(name);
+        BENTO_CHECK(WriteFile(root / name, "x"));
+    }
+    BENTO_CHECK(WriteFile(root / "文件-数据.txt", "unicode"));
+    expected.emplace_back("文件-数据.txt");
+    std::sort(expected.begin(), expected.end());
+
+    const FileBrowser browser(root.string());
+    std::vector<FileEntry> entries;
+    BENTO_CHECK_EQ(browser.List("", &entries), FileBrowserStatus::kOk);
+    BENTO_CHECK_EQ(entries.size(), expected.size());
+    std::vector<std::string> actual;
+    actual.reserve(entries.size());
+    for (const FileEntry& entry : entries) {
+        actual.push_back(entry.name);
+    }
+    BENTO_CHECK(actual == expected);
+    BENTO_CHECK(std::is_sorted(entries.begin(), entries.end(),
+                               [](const FileEntry& left, const FileEntry& right) {
+                                   return left.name < right.name;
+                               }));
+    RemoveTree(base);
+}
+
+/// 场景 15：空文件 / Unicode / NAME_MAX / 路径长度 / NUL 参数。
+void TestEmptyUnicodeAndLimits() {
+    const fs::path base = MakeTempDir("edge");
+    BENTO_CHECK(!base.empty());
+    fs::path root;
+    BENTO_CHECK(BuildFixture(base, &root));
+    if (base.empty() || root.empty()) {
+        return;
+    }
+    const FileBrowser browser(root.string());
+    std::vector<FileEntry> entries;
+    FileEntry entry;
+
+    // 0 字节文件往返。
+    BENTO_CHECK(WriteFile(base / "empty.bin", ""));
+    BENTO_CHECK_EQ(browser.Put("sub/empty.bin", (base / "empty.bin").string()),
+                   FileBrowserStatus::kOk);
+    BENTO_CHECK_EQ(fs::file_size(root / "sub" / "empty.bin"),
+                   static_cast<std::uint64_t>(0));
+    BENTO_CHECK_EQ(browser.Get("sub/empty.bin", (base / "empty.out").string()),
+                   FileBrowserStatus::kOk);
+    BENTO_CHECK_EQ(fs::file_size(base / "empty.out"), static_cast<std::uint64_t>(0));
+
+    // Unicode 名称。
+    BENTO_CHECK(WriteFile(root / "数据-ä.txt", "unicode"));
+    BENTO_CHECK_EQ(browser.List("", &entries), FileBrowserStatus::kOk);
+    BENTO_CHECK(std::any_of(entries.begin(), entries.end(), [](const FileEntry& item) {
+        return item.name == "数据-ä.txt";
+    }));
+    BENTO_CHECK_EQ(browser.Get("数据-ä.txt", (base / "unicode.out").string()),
+                   FileBrowserStatus::kOk);
+    std::string text;
+    BENTO_CHECK(ReadFileText(base / "unicode.out", &text));
+    BENTO_CHECK_EQ(text, std::string("unicode"));
+
+    // NAME_MAX：255 不存在 → not_found；256 → path_rejected（不再 io_error）。
+    const std::string name_255(255, 'c');
+    const std::string name_256(256, 'c');
+    BENTO_CHECK_EQ(browser.Stat(name_255, &entry), FileBrowserStatus::kNotFound);
+    BENTO_CHECK_EQ(browser.Stat(name_256, &entry), FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(browser.List(name_256, &entries), FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(browser.Get(name_256, (base / "name256.out").string()),
+                   FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(browser.Put(name_256, (base / "empty.bin").string()),
+                   FileBrowserStatus::kPathRejected);
+
+    // 240 字节长名：临时名不拼接目标名，Put/Get 都不会撞 NAME_MAX。
+    const std::string long_name(240, 'l');
+    BENTO_CHECK(WriteFile(base / "long-source.bin", "long-name"));
+    BENTO_CHECK_EQ(browser.Put(long_name, (base / "long-source.bin").string()),
+                   FileBrowserStatus::kOk);
+    BENTO_CHECK_EQ(browser.Get(long_name, (base / long_name).string()),
+                   FileBrowserStatus::kOk);
+    std::string long_text;
+    BENTO_CHECK(ReadFileText(base / long_name, &long_text));
+    BENTO_CHECK_EQ(long_text, std::string("long-name"));
+
+    // 路径长度边界：1024 合法、1025 拒绝。
+    std::string path_1024;
+    for (int index = 0; index < 16; ++index) {
+        if (index != 0) {
+            path_1024.push_back('/');
+        }
+        path_1024.append(index == 15 ? 64 : 63, 'd');
+    }
+    BENTO_CHECK_EQ(path_1024.size(), static_cast<std::size_t>(1024));
+    BENTO_CHECK_EQ(browser.List(path_1024, &entries), FileBrowserStatus::kNotFound);
+    std::string path_1025 = path_1024;
+    path_1025.push_back('d');
+    BENTO_CHECK_EQ(path_1025.size(), static_cast<std::size_t>(1025));
+    BENTO_CHECK_EQ(browser.List(path_1025, &entries), FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(browser.Get(path_1025, (base / "p1025.out").string()),
+                   FileBrowserStatus::kPathRejected);
+
+    // rel 中的 NUL 按控制字符拒绝。
+    const std::string nul_rel("a\0b", 3);
+    BENTO_CHECK_EQ(browser.List(nul_rel, &entries), FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(browser.Stat(nul_rel, &entry), FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(browser.Get(nul_rel, (base / "nul.out").string()),
+                   FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(browser.Put(nul_rel, (base / "empty.bin").string()),
+                   FileBrowserStatus::kPathRejected);
+
+    // local_path 中的 NUL：不能静默截断后写盘。
+    std::string nul_local = (base / "nul-target").string();
+    nul_local.push_back('\0');
+    nul_local += "evil";
+    BENTO_CHECK_EQ(browser.Get("a.txt", nul_local), FileBrowserStatus::kInvalidArgument);
+    BENTO_CHECK_EQ(browser.Put("nul-upload.bin", nul_local),
+                   FileBrowserStatus::kInvalidArgument);
+    BENTO_CHECK(!fs::exists(base / "nul-target"));
+    BENTO_CHECK(!fs::exists(root / "nul-upload.bin"));
+
+    RemoveTree(base);
+}
+
+/// 场景 16：根目录构造后被删除/替换（fail-closed，不逃逸）。
+void TestRootLifecycle() {
+    const fs::path base = MakeTempDir("rootlife");
+    BENTO_CHECK(!base.empty());
+    const fs::path root = base / "root";
+    const fs::path outside = base / "outside";
+    std::error_code ec;
+    fs::create_directories(root, ec);
+    fs::create_directories(outside, ec);
+    BENTO_CHECK(!ec);
+    if (base.empty() || ec) {
+        return;
+    }
+    BENTO_CHECK(WriteFile(root / "a.txt", "alpha"));
+    BENTO_CHECK(WriteFile(outside / "leak.txt", "outside"));
+    BENTO_CHECK(WriteFile(base / "upload.bin", "upload"));
+    const FileBrowser browser(root.string());
+    std::vector<FileEntry> entries;
+    FileEntry entry;
+    const std::string local = (base / "out.bin").string();
+
+    // 删除根目录：不得复活，也不得把操作落到别处。
+    fs::remove_all(root, ec);
+    BENTO_CHECK(!ec);
+    BENTO_CHECK_EQ(browser.List("", &entries), FileBrowserStatus::kNotFound);
+    BENTO_CHECK_EQ(browser.List("a.txt", &entries), FileBrowserStatus::kNotFound);
+    BENTO_CHECK_EQ(browser.Stat("", &entry), FileBrowserStatus::kNotFound);
+    BENTO_CHECK_EQ(browser.Get("a.txt", local), FileBrowserStatus::kNotFound);
+    BENTO_CHECK_EQ(browser.Put("resurrect.txt", (base / "upload.bin").string()),
+                   FileBrowserStatus::kNotFound);
+    BENTO_CHECK(!fs::exists(root));
+
+    // 替换成指向外部的符号链接：List("") 不得列出外部目录。
+    BENTO_CHECK(::symlink(outside.c_str(), root.c_str()) == 0);
+    BENTO_CHECK_EQ(browser.List("", &entries), FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(browser.List("leak.txt", &entries), FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(browser.Stat("", &entry), FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(browser.Get("leak.txt", local), FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(browser.Put("pwn.txt", (base / "upload.bin").string()),
+                   FileBrowserStatus::kPathRejected);
+    BENTO_CHECK(!fs::exists(outside / "pwn.txt"));
+    std::string outside_text;
+    BENTO_CHECK(ReadFileText(outside / "leak.txt", &outside_text));
+    BENTO_CHECK_EQ(outside_text, std::string("outside"));
+
+    // 替换成普通文件：根不再是目录。
+    fs::remove(root, ec);
+    BENTO_CHECK(WriteFile(root, "not-a-dir"));
+    BENTO_CHECK_EQ(browser.List("", &entries), FileBrowserStatus::kNotFound);
+    BENTO_CHECK_EQ(browser.Get("a.txt", local), FileBrowserStatus::kNotFound);
+    RemoveTree(base);
+}
+
+/// 场景 17：follow_symlinks 与覆盖语义（不写穿链接目标）。
+void TestSymlinkFollowAndOverwrite() {
+    const fs::path base = MakeTempDir("follow");
+    BENTO_CHECK(!base.empty());
+    fs::path root;
+    BENTO_CHECK(BuildFixture(base, &root));
+    if (base.empty() || root.empty()) {
+        return;
+    }
+    const fs::path outside = base / "outside";
+    BENTO_CHECK(WriteFile(outside / "secret.txt", "outside-secret"));
+    FileBrowserOptions follow_options;
+    follow_options.follow_symlinks = true;
+    const FileBrowser follower(root.string(), follow_options);
+    std::vector<FileEntry> entries;
+    FileEntry entry;
+    const std::string local = (base / "follow.out").string();
+
+    BENTO_CHECK_EQ(follower.List("link_in", &entries), FileBrowserStatus::kNotRegular);
+    BENTO_CHECK_EQ(follower.Stat("link_in", &entry), FileBrowserStatus::kOk);
+    BENTO_CHECK_EQ(entry.type, FileEntryType::kFile);
+    BENTO_CHECK_EQ(follower.Get("link_in", local), FileBrowserStatus::kOk);
+    std::string text;
+    BENTO_CHECK(ReadFileText(fs::path(local), &text));
+    BENTO_CHECK_EQ(text, std::string("alpha"));
+    BENTO_CHECK_EQ(follower.Stat("link_out", &entry), FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(follower.List("link_dir", &entries), FileBrowserStatus::kPathRejected);
+
+    // 根内目录链接：follow=true 放行，默认拒绝。
+    std::error_code ec;
+    fs::create_directories(root / "real_dir", ec);
+    BENTO_CHECK(!ec);
+    BENTO_CHECK(WriteFile(root / "real_dir" / "inner.txt", "inner"));
+    BENTO_CHECK(::symlink("real_dir", (root / "alias_dir").c_str()) == 0);
+    BENTO_CHECK_EQ(follower.List("alias_dir", &entries), FileBrowserStatus::kOk);
+    BENTO_CHECK_EQ(FileBrowser(root.string()).List("alias_dir", &entries),
+                   FileBrowserStatus::kPathRejected);
+    BENTO_CHECK_EQ(follower.Put("alias_dir/put.txt", (root / "a.txt").string()),
+                   FileBrowserStatus::kOk);
+    BENTO_CHECK(ReadFileText(root / "real_dir" / "put.txt", &text));
+    BENTO_CHECK_EQ(text, std::string("alpha"));
+
+    // overwrite=true 的 Put 不能写穿符号链接目标。
+    BENTO_CHECK(::symlink((outside / "secret.txt").c_str(),
+                          (root / "evil_link").c_str()) == 0);
+    FileBrowserOptions overwrite_options;
+    overwrite_options.overwrite = true;
+    const FileBrowser overwriter(root.string(), overwrite_options);
+    BENTO_CHECK_EQ(overwriter.Put("evil_link", (root / "a.txt").string()),
+                   FileBrowserStatus::kPathRejected);
+    BENTO_CHECK(fs::is_symlink(root / "evil_link"));
+    BENTO_CHECK(ReadFileText(outside / "secret.txt", &text));
+    BENTO_CHECK_EQ(text, std::string("outside-secret"));
+
+    // overwrite=true 的 Get 到本地符号链接：替换链接本身，不写穿。
+    const fs::path victim = base / "victim.txt";
+    BENTO_CHECK(WriteFile(victim, "victim"));
+    BENTO_CHECK(::symlink(victim.c_str(), (base / "local_link").c_str()) == 0);
+    BENTO_CHECK_EQ(overwriter.Get("a.txt", (base / "local_link").string()),
+                   FileBrowserStatus::kOk);
+    BENTO_CHECK(!fs::is_symlink(base / "local_link"));
+    BENTO_CHECK(ReadFileText(victim, &text));
+    BENTO_CHECK_EQ(text, std::string("victim"));
+    BENTO_CHECK(ReadFileText(base / "local_link", &text));
+    BENTO_CHECK_EQ(text, std::string("alpha"));
+
+    RemoveTree(base);
+}
+
+/// 场景 18：8 线程并发 Get/Put 与同一目标发布竞争。
+void TestConcurrentGetPut() {
+    const fs::path base = MakeTempDir("concurrent");
+    BENTO_CHECK(!base.empty());
+    const fs::path root = base / "root";
+    std::error_code ec;
+    fs::create_directories(root / "conc", ec);
+    BENTO_CHECK(!ec);
+    if (base.empty() || ec) {
+        return;
+    }
+    const FileBrowser browser(root.string());
+    constexpr int kThreads = 8;
+    constexpr int kIterations = 40;
+    std::atomic<int> failures{0};
+    std::atomic<int> completed{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int thread_index = 0; thread_index < kThreads; ++thread_index) {
+        workers.emplace_back([&, thread_index] {
+            const std::string payload =
+                "thread-" + std::to_string(thread_index) + "-" + std::string(4096, 'c');
+            const fs::path source = base / ("src_" + std::to_string(thread_index));
+            if (!WriteFile(source, payload)) {
+                ++failures;
+                return;
+            }
+            const fs::path download = base / ("dst_" + std::to_string(thread_index));
+            FileBrowserOptions overwrite_options;
+            overwrite_options.overwrite = true;
+            const FileBrowser overwrite_browser(root.string(), overwrite_options);
+            for (int iteration = 0; iteration < kIterations; ++iteration) {
+                const std::string name = "conc/t" + std::to_string(thread_index) + "_" +
+                                         std::to_string(iteration) + ".bin";
+                if (overwrite_browser.Put(name, source.string()) != FileBrowserStatus::kOk ||
+                    overwrite_browser.Get(name, download.string()) != FileBrowserStatus::kOk) {
+                    ++failures;
+                    continue;
+                }
+                std::string actual;
+                if (!ReadFileText(download, &actual) || actual != payload) {
+                    ++failures;
+                }
+                ++completed;
+            }
+        });
+    }
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+    BENTO_CHECK_EQ(failures.load(), 0);
+    BENTO_CHECK_EQ(completed.load(), kThreads * kIterations);
+    BENTO_CHECK_EQ(CountPartFiles(root), static_cast<std::size_t>(0));
+
+    // 同一目标 + overwrite=false：每轮恰好一个成功。
+    const fs::path same_source = base / "same.bin";
+    BENTO_CHECK(WriteFile(same_source, "same-target"));
+    constexpr int kRounds = 20;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<int> ok_count{0};
+    std::atomic<int> exists_count{0};
+    std::atomic<int> other_count{0};
+    workers.clear();
+    for (int thread_index = 0; thread_index < kThreads; ++thread_index) {
+        workers.emplace_back([&] {
+            ++ready;
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (int round = 0; round < kRounds; ++round) {
+                const FileBrowserStatus status = browser.Put(
+                    "conc/race_" + std::to_string(round) + ".bin", same_source.string());
+                if (status == FileBrowserStatus::kOk) {
+                    ++ok_count;
+                } else if (status == FileBrowserStatus::kAlreadyExists) {
+                    ++exists_count;
+                } else {
+                    ++other_count;
+                }
+            }
+        });
+    }
+    while (ready.load() < kThreads) {
+        std::this_thread::yield();
+    }
+    go.store(true, std::memory_order_release);
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+    BENTO_CHECK_EQ(ok_count.load(), kRounds);
+    BENTO_CHECK_EQ(exists_count.load(), kRounds * (kThreads - 1));
+    BENTO_CHECK_EQ(other_count.load(), 0);
+    BENTO_CHECK_EQ(CountPartFiles(root), static_cast<std::size_t>(0));
+    RemoveTree(base);
+}
+
+/// 场景 19：FIFO 等特殊文件。
+void TestSpecialFiles() {
+    const fs::path base = MakeTempDir("special");
+    BENTO_CHECK(!base.empty());
+    const fs::path root = base / "root";
+    std::error_code ec;
+    fs::create_directories(root, ec);
+    BENTO_CHECK(!ec);
+    if (base.empty() || ec) {
+        return;
+    }
+    BENTO_CHECK(::mkfifo((root / "pipe").c_str(), 0644) == 0);
+    const FileBrowser browser(root.string());
+    std::vector<FileEntry> entries;
+    FileEntry entry;
+    BENTO_CHECK_EQ(browser.List("", &entries), FileBrowserStatus::kOk);
+    bool saw_pipe = false;
+    for (const FileEntry& item : entries) {
+        if (item.name == "pipe") {
+            saw_pipe = true;
+            BENTO_CHECK_EQ(item.type, FileEntryType::kOther);
+        }
+    }
+    BENTO_CHECK(saw_pipe);
+    BENTO_CHECK_EQ(browser.List("pipe", &entries), FileBrowserStatus::kNotRegular);
+    BENTO_CHECK_EQ(browser.Get("pipe", (base / "pipe.out").string()),
+                   FileBrowserStatus::kNotRegular);
+    BENTO_CHECK_EQ(browser.Stat("pipe", &entry), FileBrowserStatus::kOk);
+    BENTO_CHECK_EQ(entry.type, FileEntryType::kOther);
+    RemoveTree(base);
+}
+
 }  // namespace
 
 int main() {
@@ -746,5 +1192,11 @@ int main() {
     TestInvalidOptionsAndArguments();
     TestRandomPathEscapes();
     TestGetNoOverwriteRace();
+    TestListSortedOrder();
+    TestEmptyUnicodeAndLimits();
+    TestRootLifecycle();
+    TestSymlinkFollowAndOverwrite();
+    TestConcurrentGetPut();
+    TestSpecialFiles();
     return bento_test::Finish("test_file_browser");
 }

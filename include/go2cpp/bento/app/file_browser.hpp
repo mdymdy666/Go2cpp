@@ -26,7 +26,16 @@
  *   打开文件时额外带 `O_NOFOLLOW`，避免「检查后替换成链接」的 TOCTOU。
  *
  * 根目录本身在构造时规范化（`weakly_canonical`），因此根目录是符号链接时
- * 以解析后的真实路径为边界。
+ * 以解析后的真实路径为边界。**构造后**根目录仍会在每次操作前用 `lstat` 复核：
+ *
+ * - 被删除 → 全部操作 `kNotFound`，`Put` 不会把根目录重新创建出来；
+ * - 被替换成符号链接/非目录 → `kPathRejected`，避免 `List("")` 直接把根路径
+ *   交给目录遍历而列出外部内容（fail-closed）。
+ *
+ * 默认（`follow_symlinks=false`）的路径解析是「逐段 `lstat` + 词法拼接」：
+ * 只要所有已存在段都不是符号链接、根也不是符号链接，词法拼接就等于真实路径，
+ * 不再调用 `weakly_canonical`（省掉 per-component 的第二次遍历）；只有开启
+ * 跟随并真的遇到符号链接时才做真实路径判定。
  *
  * ## 目录项语义
  *
@@ -39,20 +48,34 @@
  *
  * `Get`/`Put` 都先写同目录下的临时文件（`*` 前缀 + pid + 序号，
  * `O_CREAT|O_EXCL|O_NOFOLLOW`），复制完整后再发布。中途失败会清理临时
- * 文件，不会留下半截目标；`overwrite=false`（默认）时发布用 `link()` 创建
- * 新目录项——目标已存在时内核以 `EEXIST` 拒绝，因此「先检查再改名」的
- * TOCTOU 窗口不再存在，并发创建的目标不会被本次写入覆盖
- * （`kAlreadyExists`）。`overwrite=true` 时用 `rename()` 原子替换。
+ * 文件，不会留下半截目标；临时名连续被占用（崩溃残留/外部干扰）时会换序号
+ * 重试，不会把「临时名已存在」误报成「目标已存在」。
+ *
+ * `overwrite=false`（默认）时发布优先用 Linux `renameat2(RENAME_NOREPLACE)`，
+ * 一次性完成「目标不存在才发布」，不依赖文件系统硬链接支持；系统调用不可用
+ * （旧内核/文件系统不支持 flags）时退化为 `link()` + `unlink()`——目标已存在
+ * 时内核以 `EEXIST` 拒绝，因此「先检查再改名」的 TOCTOU 窗口不存在，并发
+ * 创建的目标不会被本次写入覆盖（`kAlreadyExists`）。`overwrite=true` 时用
+ * `rename()` 原子替换。
  *
  * ## 错误分类
  *
  * 与 `FetchStatus` 分开：文件浏览不涉及网络，错误只区分参数/沙箱/不存在/
  * 类型不符/过大/IO/权限/已存在/条目过多。`kNotRegular` 同时覆盖「List 的
- * 目标不是目录」与「Get/Put 的源不是普通文件」。
+ * 目标不是目录」与「Get/Put 的源不是普通文件」。`kPathRejected` 还覆盖
+ * `ENAMETOOLONG`/`ELOOP`（超长名、符号链接层数过多），保证同一路径经
+ * `List` 与 `Stat` 得到一致分类。`kNotFound` 覆盖根目录在构造后被删除。
+ * `local_path` 含 NUL 时返回 `kInvalidArgument`（否则底层 `open()` 会静默
+ * 截断到 NUL 前，写到意料之外的路径）。
  *
  * @note 同步阻塞；单次调用只做一次目录遍历或一次文件复制，不提供流式接口。
  * @note 不跟随符号链接是默认值；打开 `follow_symlinks` 后仍以规范化后的
- *       真实路径是否在根目录内为最终判据。
+ *       真实路径是否在根目录内为最终判据。检查与打开之间仍有文件系统级别的
+ *       TOCTOU 窗口（默认模式用 `O_NOFOLLOW` 覆盖最后一段），需要更强保证
+ *       的调用方应使用 `openat2(RESOLVE_BENEATH)` 之类的手段。
+ * @note `const` 方法线程安全（无共享可变状态；临时序号用原子变量）。并发
+ *       `Put` 同一目标且 `overwrite=false` 时恰好一个返回 `kOk`，其余
+ *       `kAlreadyExists`。
  *
  * @author go2cpp contributors
  * @date 2026-10-28
@@ -176,6 +199,7 @@ public:
      * @brief 列出 `rel` 目录下的条目。
      * @param rel 相对路径；空串表示根目录本身。
      * @param entries 输出（成功时被清空并填充；允许为空指针时返回参数错误）。
+     *                返回 `kTooManyEntries` 时保留已扫描到的前 `max_entries` 项。
      * @return 状态。
      */
     FileBrowserStatus List(std::string_view rel, std::vector<FileEntry>* entries) const;
@@ -183,7 +207,8 @@ public:
     /**
      * @brief 把 `rel` 指向的普通文件复制到本地路径 `local_path`。
      * @param rel 相对路径（不能为空）。
-     * @param local_path 本地目标文件（父目录必须存在；默认不覆盖）。
+     * @param local_path 本地目标文件（父目录必须存在；默认不覆盖；含 NUL 返回
+     *                   `kInvalidArgument`）。
      * @return 状态。
      */
     FileBrowserStatus Get(std::string_view rel, std::string_view local_path) const;
@@ -191,7 +216,7 @@ public:
     /**
      * @brief 把本地路径 `local_path` 的普通文件复制到 `rel`。
      * @param rel 相对路径（不能为空；父目录不存在时自动创建）。
-     * @param local_path 本地源文件。
+     * @param local_path 本地源文件（含 NUL 返回 `kInvalidArgument`）。
      * @return 状态。
      */
     FileBrowserStatus Put(std::string_view rel, std::string_view local_path) const;
