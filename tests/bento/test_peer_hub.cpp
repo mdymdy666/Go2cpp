@@ -746,6 +746,192 @@ void TestTimedOutPeerReclaimed() {
                 server.PeerIds().size());
 }
 
+
+/// 场景 9（P1 回归）：明文 HELLO 重传在 conn_id 冲突后必须幂等。
+/// @details 触发旧缺陷的最小条件：客户端 B 提议的 conn_id 已被 A 占用，
+///          服务端按冲突换新值并在 ACK 里告知；此时 B 的 ACK 丢失、原包
+///          重传。旧实现只看「提议值 != 当前值」就重置通道并再换一次
+///          conn_id，导致 B 的 conn_id 与服务端分叉、心跳被计 unknown、
+///          peer 在 peer_timeout 后被误删。新实现记录客户端本代提议值，
+///          同值重传走幂等路径。
+void TestHelloRetransmitAfterConnIdConflict() {
+    PeerHub server(MakeConfig("127.0.0.1"));
+    std::string error;
+    BENTO_CHECK(server.Open(&error));
+    int streams = 0;
+    server.on_stream = [&](std::uint32_t, std::uint8_t, const std::uint8_t*,
+                           std::size_t) { ++streams; };
+
+    const int raw_a = ::socket(AF_INET, SOCK_DGRAM, 0);
+    const int raw_b = ::socket(AF_INET, SOCK_DGRAM, 0);
+    BENTO_CHECK(raw_a >= 0);
+    BENTO_CHECK(raw_b >= 0);
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(server.local_port());
+    BENTO_CHECK(::inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr) == 1);
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    local.sin_port = 0;
+    BENTO_CHECK(::bind(raw_a, reinterpret_cast<sockaddr*>(&local), sizeof(local)) == 0);
+    BENTO_CHECK(::bind(raw_b, reinterpret_cast<sockaddr*>(&local), sizeof(local)) == 0);
+
+    constexpr std::uint32_t kSessionA = 0x4A4A0001U;
+    constexpr std::uint32_t kSessionB = 0x4B4B0002U;
+    constexpr std::uint32_t kProposed = 0x0BADF00DU;
+
+    const auto build_hello = [](std::uint32_t session, std::uint32_t conn_id) {
+        std::uint8_t payload[12] = {'B', 'E', 'N', 'T', 0, 0, 0, 0, 0, 0, 0, 0};
+        WriteU32(payload + 4, session);
+        WriteU32(payload + 8, conn_id);
+        FrameHeader header;
+        header.type = FrameType::kHello;
+        header.channel = 0;
+        header.conn_id = conn_id;
+        header.seq = session;
+        return go2cpp::bento::BuildFrame(header, nullptr, payload, sizeof(payload));
+    };
+    const std::vector<std::uint8_t> hello_a = build_hello(kSessionA, kProposed);
+    const std::vector<std::uint8_t> hello_b = build_hello(kSessionB, kProposed);
+    BENTO_CHECK(!hello_a.empty());
+    BENTO_CHECK(!hello_b.empty());
+
+    // 发一帧并取出 HELLO_ACK 的 conn_id（超时返回 0）。
+    const auto exchange = [&](int fd, const std::vector<std::uint8_t>& frame) -> std::uint32_t {
+        if (::sendto(fd, frame.data(), frame.size(), 0,
+                     reinterpret_cast<const sockaddr*>(&server_addr), sizeof(server_addr)) !=
+            static_cast<ssize_t>(frame.size())) {
+            return 0;
+        }
+        std::uint8_t buffer[2048];
+        for (int attempt = 0; attempt < 500; ++attempt) {
+            server.RunOnce(0);
+            const ssize_t bytes = ::recv(fd, buffer, sizeof(buffer), MSG_DONTWAIT);
+            if (bytes <= 0) {
+                usleep(1000);
+                continue;
+            }
+            go2cpp::bento::FrameView view;
+            if (go2cpp::bento::ParseFrame(buffer, static_cast<std::size_t>(bytes), &view) &&
+                view.header.type == FrameType::kHelloAck) {
+                return view.header.conn_id;
+            }
+        }
+        return 0;
+    };
+
+    const std::uint32_t ack_a = exchange(raw_a, hello_a);
+    BENTO_CHECK_EQ(ack_a, kProposed);
+    // B 提议同一个 conn_id：服务端按冲突换新值，客户端以 ACK 为准。
+    const std::uint32_t ack_b1 = exchange(raw_b, hello_b);
+    BENTO_CHECK(ack_b1 != 0);
+    BENTO_CHECK(ack_b1 != kProposed);
+    BENTO_CHECK_EQ(server.PeerIds().size(), static_cast<std::size_t>(2));
+    const std::uint64_t conflicts_after_first = server.stats().conn_id_conflicts;
+    // B 重传原包（模拟 ACK 丢失）：必须幂等回同一个 conn_id。
+    const std::uint32_t ack_b2 = exchange(raw_b, hello_b);
+    BENTO_CHECK_EQ(ack_b2, ack_b1);
+    BENTO_CHECK_EQ(server.stats().conn_id_conflicts, conflicts_after_first);
+
+    // 重传后 B 的数据帧仍按 ack_b1 路由并交付（通道没有被重置成新会话）。
+    std::vector<std::uint8_t> payload(64, 0x3C);
+    WriteU32(payload.data(), 0xB0000001U);
+    FrameHeader data_header;
+    data_header.type = FrameType::kStream;
+    data_header.channel = 0;
+    data_header.conn_id = ack_b1;
+    data_header.seq = 1;  // STREAM 的 seq=0 是保留值
+    const std::vector<std::uint8_t> data =
+        go2cpp::bento::BuildFrame(data_header, nullptr, payload.data(), payload.size());
+    BENTO_CHECK(!data.empty());
+    BENTO_CHECK(::sendto(raw_b, data.data(), data.size(), 0,
+                         reinterpret_cast<const sockaddr*>(&server_addr), sizeof(server_addr)) ==
+                static_cast<ssize_t>(data.size()));
+    for (int attempt = 0; attempt < 2000 && streams == 0; ++attempt) {
+        server.RunOnce(0);
+        usleep(1000);
+    }
+    BENTO_CHECK_EQ(streams, 1);
+    ::close(raw_a);
+    ::close(raw_b);
+}
+
+/// 场景 10（P1 回归）：RemovePeer 触发 on_peer_disconnected 时，回调里
+/// Connect 必须被拒绝——硬删除意图要先登记，不能出现「Connect 返回 true、
+/// 返回后 peer 被销毁队列删掉」的假重连。
+void TestRemovePeerRejectsReconnectInCallback() {
+    PeerHub server(MakeConfig("127.0.0.1"));
+    PeerHub client(MakeConfig("127.0.0.1"));
+    std::string error;
+    BENTO_CHECK(server.Open(&error));
+    BENTO_CHECK(client.Open(&error));
+    int disconnects = 0;
+    bool connect_result = true;
+    client.on_peer_disconnected = [&](std::uint32_t peer_id, const char* reason) {
+        if (std::strcmp(reason, "removed") == 0) {
+            ++disconnects;
+            connect_result = client.Connect(peer_id);
+        }
+    };
+    BENTO_CHECK(client.AddPeer(1, "127.0.0.1", server.local_port(), &error));
+    BENTO_CHECK(PumpHubs({&server, &client},
+                         [&]() { return client.peer_connected(1) && server.peer_connected(1); },
+                         8000));
+    BENTO_CHECK(client.RemovePeer(1));
+    BENTO_CHECK_EQ(disconnects, 1);
+    BENTO_CHECK(!connect_result);
+    BENTO_CHECK(!client.HasPeer(1));
+    BENTO_CHECK(client.PeerIds().empty());
+    // 服务端把断链当被动 peer 超时回收，不影响断言。
+    PumpFor({&server, &client}, 50);
+}
+
+/// 场景 11（P2 回归）：显式 RemovePeer 不是超时，不得污染 timeouts 计数。
+void TestRemovePeerDoesNotCountAsTimeout() {
+    PeerHub hub(MakeConfig("127.0.0.1"));
+    std::string error;
+    BENTO_CHECK(hub.Open(&error));
+    BENTO_CHECK(hub.AddPeer(1, "127.0.0.1", 9, &error));
+    const std::uint64_t before = hub.stats().timeouts;
+    BENTO_CHECK(hub.RemovePeer(1));
+    BENTO_CHECK_EQ(hub.stats().timeouts, before);
+}
+
+/// 场景 12（P2 回归）：stats().peers_active 必须与 Peers() 里 kConnected
+/// 的数量一致（该字段已从 O(N) 遍历改为增量维护）。
+void TestPeersActiveCountMatchesSnapshot() {
+    PeerHub server(MakeConfig("127.0.0.1"));
+    std::string error;
+    BENTO_CHECK(server.Open(&error));
+    constexpr int kClients = 4;
+    std::vector<std::unique_ptr<PeerHub>> clients;
+    for (int i = 0; i < kClients; ++i) {
+        clients.push_back(std::make_unique<PeerHub>(MakeConfig("127.0.0.1")));
+        BENTO_CHECK(clients.back()->Open(&error));
+        BENTO_CHECK(clients.back()->AddPeer(1, "127.0.0.1", server.local_port(), &error));
+    }
+    std::vector<PeerHub*> hubs{&server};
+    for (auto& client : clients) {
+        hubs.push_back(client.get());
+    }
+    BENTO_CHECK(PumpHubs(hubs, [&]() { return server.stats().peers_active == kClients; }, 8000));
+    const auto count_connected = [&]() {
+        std::size_t connected = 0;
+        for (const auto& peer : server.Peers()) {
+            if (peer.state == PeerState::kConnected) {
+                ++connected;
+            }
+        }
+        return connected;
+    };
+    BENTO_CHECK_EQ(server.stats().peers_active, static_cast<std::uint64_t>(count_connected()));
+    BENTO_CHECK(server.RemovePeer(server.PeerIds().front()));
+    BENTO_CHECK_EQ(server.stats().peers_active, static_cast<std::uint64_t>(count_connected()));
+    PumpFor(hubs, 50);
+    BENTO_CHECK_EQ(server.stats().peers_active, static_cast<std::uint64_t>(count_connected()));
+}
+
 }  // namespace
 
 int main() {
@@ -757,5 +943,9 @@ int main() {
     TestCallbackRemoval();
     TestReconnectAfterTimeout();
     TestTimedOutPeerReclaimed();
+    TestHelloRetransmitAfterConnIdConflict();
+    TestRemovePeerRejectsReconnectInCallback();
+    TestRemovePeerDoesNotCountAsTimeout();
+    TestPeersActiveCountMatchesSnapshot();
     return bento_test::Finish("test_peer_hub");
 }

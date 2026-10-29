@@ -355,6 +355,8 @@ class PeerHub final {
     std::uint32_t m_next_peer_id = 1;
     std::uint32_t m_session_id = 0;
     PeerHubStats m_stats;
+    /// 当前 kConnected 的 peer 数（增量维护，stats() 不再 O(peers) 遍历）。
+    std::uint64_t m_active_peers = 0;
     std::vector<std::uint8_t> m_rx_buffer;
     bool m_secure_enabled = false;
     std::uint8_t m_psk[kPskBytes] = {};
@@ -368,6 +370,13 @@ class PeerHub final {
     bool m_close_deferred = false;
     /// 防止 FlushDeferredCleanup 递归。
     bool m_flushing_deferred = false;
+    /// 发送/接收热路径的复用缓冲。均在持锁下使用，调用链不重入
+    /// （FrameSink 与用户回调不会再次进入同一函数），因此可安全复用，
+    /// 避免每帧一次堆分配。回调里允许 Send*，但用的是 tx 缓冲，
+    /// 与本轮接收解析用的 rx 缓冲互不干扰。
+    mutable std::vector<std::uint8_t> m_tx_frame_scratch;
+    mutable std::vector<std::uint8_t> m_tx_sealed_scratch;
+    mutable std::vector<std::uint8_t> m_rx_inner_scratch;
     /// 保护 peer 表、socket 发送与统计；recursive 以支持回调重入 Send*。
     mutable std::recursive_mutex m_mutex;
 };

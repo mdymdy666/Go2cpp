@@ -10,7 +10,6 @@
 
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -178,6 +177,12 @@ struct PeerHub::Peer {
     // ---- 审查修复：延迟销毁与 HELLO 重放防护 ----
     /// 已进入延迟销毁队列；Connect 重连会清除（仅超时软回收可取消）。
     bool pending_cleanup = false;
+    /// 最近一次 HELLO 里客户端提议的 conn_id（服务端视角）。
+    /// 明文 HELLO 没有 nonce，只能靠它区分「ACK 丢失后的原包重传」与
+    /// 「客户端换了 conn_id 的重连」：重传的提议值不变，重连会换新值。
+    /// 不记录它就会把每次重传当成新会话（重置通道 + 换 conn_id），高并发
+    /// 丢 ACK 时 conn_id 反复抖动，心跳被计 unknown，peer 被误判超时。
+    std::uint32_t client_conn_id = 0;
     /// 已接受过的 client nonce（跨会话保留，拒绝旧 HELLO 重放）。
     std::vector<std::array<std::uint8_t, kHandshakeNonceBytes>> seen_client_nonces;
     /// 最近一次接受的新 HELLO 的墙钟时间戳（单调性检查）。
@@ -256,6 +261,7 @@ void PeerHub::Close() {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     m_socket.Close();
     m_by_conn_id.clear();
+    m_active_peers = 0;
     if (m_callback_depth > 0) {
         // PEB-01：回调里 Close 时不能销毁正在执行的通道（on_stream 返回后
         // AdvanceDelivery 仍会写 m_next_rx_seq）。先标记终态，整表清空
@@ -422,15 +428,16 @@ bool PeerHub::SendBuiltFrame(Peer& peer, const std::uint8_t* data, std::size_t b
         return false;
     }
     // 与 Link 一致：conn_id 由链路层统一戳在帧头上，通道只关心自己的载荷。
-    std::vector<std::uint8_t> stamped;
+    // 复用成员缓冲：每次 Send 都新建 vector 会在大流量下产生每帧一次
+    // malloc/free（10 万帧压测中的主要用户态开销之一）。
     FrameHeader header;
     if (bytes >= kFrameHeaderBytes && DecodeHeader(data, bytes, &header) &&
         header.conn_id != peer.conn_id) {
         header.conn_id = peer.conn_id;
-        stamped.assign(data, data + bytes);
-        EncodeHeader(header, stamped.data());
-        data = stamped.data();
-        bytes = stamped.size();
+        m_tx_frame_scratch.assign(data, data + bytes);
+        EncodeHeader(header, m_tx_frame_scratch.data());
+        data = m_tx_frame_scratch.data();
+        bytes = m_tx_frame_scratch.size();
     }
     return SendFrameBytes(peer, data, bytes);
 }
@@ -477,18 +484,18 @@ bool PeerHub::SealAndSend(Peer& peer, const std::uint8_t* frame, std::size_t byt
     if (seq == 0) {
         seq = 1;  // wire seq 0 保留；2^32 回绕在实际连接中不会发生。
     }
-    std::vector<std::uint8_t> sealed;
-    if (!SealFrame(peer.tx_key, peer.tx_direction, seq, frame, bytes, &sealed)) {
+    if (!SealFrame(peer.tx_key, peer.tx_direction, seq, frame, bytes, &m_tx_sealed_scratch)) {
         ++m_stats.send_errors;
         return false;
     }
     // 先推进 seq 再发送：发送失败也绝不复用同一 (key, nonce)。
     peer.tx_wire_seq = seq;
-    if (!SendRawPacket(peer, sealed.data(), sealed.size())) {
+    if (!SendRawPacket(peer, m_tx_sealed_scratch.data(), m_tx_sealed_scratch.size())) {
         return false;
     }
     ++m_secure_stats.packets_sealed;
-    m_secure_stats.encrypted_bytes_sent += static_cast<std::uint64_t>(sealed.size());
+    m_secure_stats.encrypted_bytes_sent +=
+        static_cast<std::uint64_t>(m_tx_sealed_scratch.size());
     return true;
 }
 
@@ -671,29 +678,31 @@ bool PeerHub::RemovePeer(std::uint32_t peer_id) {
         // 已在待销毁队列：回调里重复 RemovePeer 是幂等的，不能二次 erase。
         return false;
     }
-    if (peer.state != PeerState::kTimedOut && peer.state != PeerState::kClosed) {
-        peer.state = PeerState::kClosed;
-        ++m_stats.timeouts;
-        if (m_callback_depth == 0) {
-            ResetChannels(peer);
-            ResetSecureSession(peer);
-        } else {
-            // 回调栈上可能正在执行该 peer 的通道，销毁推迟到安全点。
-            peer.session_keys_ready = false;
-        }
+    const bool was_live = peer.state != PeerState::kTimedOut && peer.state != PeerState::kClosed;
+    if (peer.state == PeerState::kConnected && m_active_peers > 0) {
+        --m_active_peers;
+    }
+    peer.state = PeerState::kClosed;
+    if (peer.conn_id != 0) {
+        m_by_conn_id.erase(peer.conn_id);
+    }
+    if (was_live && m_callback_depth == 0) {
+        ResetChannels(peer);
+        ResetSecureSession(peer);
+    }
+    peer.session_keys_ready = false;
+    // P1：先把「硬删除」意图登记下来，再触发 on_peer_disconnected。回调里
+    // 调用 Connect 会命中 pending 检查而返回 false；否则会出现「Connect 返回
+    // true、peer 却在回调返回后被销毁队列删掉」的假重连（回调内重连语义）。
+    ScheduleCleanup(peer, true);
+    if (was_live) {
+        // 显式移除不是超时：不再污染 timeouts 计数器（统计口径见头文件）。
         EmitLog(LogLevel::kWarn, LogEvent::kPeerDisconnected, peer_id, "removed", 0);
         if (on_peer_disconnected) {
             CallbackDepthGuard guard(m_callback_depth);
             on_peer_disconnected(peer_id, "removed");
         }
-    } else {
-        peer.state = PeerState::kClosed;
-        peer.session_keys_ready = false;
     }
-    if (peer.conn_id != 0) {
-        m_by_conn_id.erase(peer.conn_id);
-    }
-    ScheduleCleanup(peer, true);
     if (m_callback_depth == 0) {
         FlushDeferredCleanup();
     }
@@ -753,12 +762,9 @@ std::vector<std::uint32_t> PeerHub::PeerIds() const {
 PeerHubStats PeerHub::stats() const {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     PeerHubStats snapshot = m_stats;
-    snapshot.peers_active = 0;
-    for (const auto& entry : m_peers) {
-        if (entry.second->state == PeerState::kConnected) {
-            ++snapshot.peers_active;
-        }
-    }
+    // P2：peers_active 由 MarkConnected/DropPeer/RemovePeer/Flush 增量维护，
+    // stats() 不再 O(peers) 遍历（1000 peer 时被监控/测试高频调用会成为热点）。
+    snapshot.peers_active = m_active_peers;
     return snapshot;
 }
 
@@ -1000,6 +1006,13 @@ void PeerHub::HandleHello(const FrameView& view, const sockaddr_storage& from,
         return;
     }
     Peer* peer = FindByAddress(from, from_len);
+    if (peer != nullptr && peer->state == PeerState::kClosed) {
+        // 已 RemovePeer / Close、正在延迟销毁的记录不能被 HELLO 复活：
+        // 否则回调里删除的 peer 会在同一轮收包中重新进入连接态，随后又被
+        // 销毁队列删掉，对端留下一条「假连接」。
+        ++m_stats.unknown_peer_frames;
+        return;
+    }
     if (peer == nullptr) {
         // 未知来源：只有显式允许时才接受（白名单模式直接丢弃）。
         if (!m_config.accept_unknown_peers) {
@@ -1030,9 +1043,13 @@ void PeerHub::HandleHello(const FrameView& view, const sockaddr_storage& from,
         peer->session_id = session;
         peer->conn_id = 0;
     } else if (peer->conn_id != 0 && proposed_conn_id != 0 &&
-               proposed_conn_id != peer->conn_id) {
+               proposed_conn_id != peer->conn_id &&
+               proposed_conn_id != peer->client_conn_id) {
         // 同一 session 但客户端换了 conn_id（兼容未换 session 的旧客户端）：
         // 接收侧通道状态必须重置，否则新流 seq=1 会被判 stale。
+        // 第三个条件：提议值与上一次相同说明这是「ACK 丢失后的原包重传」，
+        // 必须幂等回 ACK；否则每次重传都换 conn_id，客户端按旧 ACK 发心跳
+        // 会被计 unknown，peer 最终被误判超时（千 peer 压测实测）。
         m_by_conn_id.erase(peer->conn_id);
         ResetChannels(*peer);
         peer->conn_id = 0;
@@ -1055,6 +1072,8 @@ void PeerHub::HandleHello(const FrameView& view, const sockaddr_storage& from,
         m_by_conn_id[chosen] = peer->peer_id;
     }
 
+    // 记录客户端本代提议的 conn_id：后续同值重传按幂等处理（见上）。
+    peer->client_conn_id = proposed_conn_id;
     // 重复 HELLO（ACK 丢失）要幂等回 ACK。
     std::uint8_t payload[kHelloPayloadBytes];
     MakeHelloPayload(peer->session_id, peer->conn_id, payload);
@@ -1119,7 +1138,10 @@ void PeerHub::HandleHelloAck(const FrameView& view, const sockaddr_storage& from
 }
 
 void PeerHub::MarkConnected(Peer& peer) {
-    peer.state = PeerState::kConnected;
+    if (peer.state != PeerState::kConnected) {
+        peer.state = PeerState::kConnected;
+        ++m_active_peers;  // P2：增量维护，供 stats() O(1) 读取。
+    }
     const std::uint64_t now = NowMs();
     peer.last_rx_ms = now;
     peer.next_ack_ms = now + m_config.ack_interval_ms;
@@ -1196,6 +1218,7 @@ void PeerHub::FlushDeferredCleanup() {
         m_pending_cleanup.clear();
         m_by_conn_id.clear();
         m_peers.clear();
+        m_active_peers = 0;
         m_flushing_deferred = false;
         return;
     }
@@ -1217,6 +1240,9 @@ void PeerHub::FlushDeferredCleanup() {
                     m_by_conn_id.erase(route);
                 }
             }
+            if (peer.state == PeerState::kConnected && m_active_peers > 0) {
+                --m_active_peers;
+            }
             // erase 会析构 Peer 及其通道；此处回调深度必为 0，调用栈上
             // 没有正在执行的 AdvanceDelivery/FlushPending。
             m_peers.erase(found);
@@ -1228,6 +1254,9 @@ void PeerHub::FlushDeferredCleanup() {
 void PeerHub::DropPeer(Peer& peer, const char* reason) {
     if (peer.state == PeerState::kTimedOut || peer.state == PeerState::kClosed) {
         return;
+    }
+    if (peer.state == PeerState::kConnected && m_active_peers > 0) {
+        --m_active_peers;
     }
     peer.state = PeerState::kTimedOut;
     ++m_stats.timeouts;
@@ -1347,10 +1376,9 @@ void PeerHub::HandlePacket(const std::uint8_t* data, std::size_t bytes,
                     "plaintext data frame on secure peer", bytes);
             return;
         }
-        std::vector<std::uint8_t> inner;
         OpenStatus status = OpenStatus::kMalformed;
         if (!OpenFrame(peer->rx_key, peer->rx_direction, &peer->data_rx_window, data, bytes,
-                       &inner, &status)) {
+                       &m_rx_inner_scratch, &status)) {
             switch (status) {
                 case OpenStatus::kReplay:
                     ++m_secure_stats.replay_drops;
@@ -1371,7 +1399,7 @@ void PeerHub::HandlePacket(const std::uint8_t* data, std::size_t bytes,
         ++m_secure_stats.packets_opened;
         m_secure_stats.encrypted_bytes_received += static_cast<std::uint64_t>(bytes);
         FrameView view;
-        if (!ParseFrame(inner.data(), inner.size(), &view)) {
+        if (!ParseFrame(m_rx_inner_scratch.data(), m_rx_inner_scratch.size(), &view)) {
             ++m_secure_stats.malformed_frames;
             return;
         }
@@ -1502,6 +1530,11 @@ void PeerHub::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
         return;
     }
     Peer* peer = FindByAddress(from, from_len);
+    if (peer != nullptr && peer->state == PeerState::kClosed) {
+        // 与明文路径一致：延迟销毁中的记录不允许被 HELLO 复活。
+        ++m_stats.unknown_peer_frames;
+        return;
+    }
     if (peer != nullptr && peer->secure_enabled && peer->session_keys_ready &&
         hello.session == peer->session_id &&
         std::memcmp(hello.nonce, peer->client_nonce, kHandshakeNonceBytes) == 0) {
@@ -1734,6 +1767,12 @@ void PeerHub::Tick(std::uint64_t now_ms) {
         if (peer.state != PeerState::kConnected) {
             continue;
         }
+        // 先判超时：已失联的 peer 不必再为它发心跳/ACK/重传，也能让
+        // 被动 peer 早一轮回收、释放 max_peers 配额。
+        if (now_ms >= peer.last_rx_ms && now_ms - peer.last_rx_ms > m_config.peer_timeout_ms) {
+            DropPeer(peer, "peer timeout");
+            continue;
+        }
         if (now_ms >= peer.next_ack_ms) {
             peer.next_ack_ms = now_ms + m_config.ack_interval_ms;
             for (auto& channel : peer.reliable) {
@@ -1775,9 +1814,6 @@ void PeerHub::Tick(std::uint64_t now_ms) {
                     last_loss = lost;
                 }
             }
-        }
-        if (now_ms >= peer.last_rx_ms && now_ms - peer.last_rx_ms > m_config.peer_timeout_ms) {
-            DropPeer(peer, "peer timeout");
         }
     }
 }
