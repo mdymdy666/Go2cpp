@@ -16,6 +16,7 @@
 
 #include "go2cpp/bento/error/error.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -38,6 +39,23 @@ namespace {
 struct ReleaseState {
     std::vector<ErrorPtr> pending;
     bool draining = false;
+
+    /**
+     * @brief 线程退出时排空剩余节点。
+     *
+     * @details 析构函数体先于成员析构执行，此时 `pending` 仍然可用；链式
+     *          析构把下一批节点重新入队后会回到这里（`draining` 已置位，
+     *          内层 `DrainReleaseQueue` 直接返回），由本循环统一释放，
+     *          避免 thread_local 清理阶段访问已析构的队列。
+     */
+    ~ReleaseState() {
+        draining = true;
+        while (!pending.empty()) {
+            ErrorPtr current = std::move(pending.back());
+            pending.pop_back();
+            current.reset();
+        }
+    }
 };
 
 thread_local ReleaseState g_release_state;
@@ -103,11 +121,11 @@ std::vector<ErrorPtr> ExpandDescendants(const std::vector<ErrorPtr>& roots) {
             pending.push_back(*it);
         }
     }
-    std::unordered_set<const Error*> visited;
+    detail::VisitSet visited;
     while (!pending.empty()) {
         ErrorPtr current = std::move(pending.back());
         pending.pop_back();
-        if (!current || !visited.insert(current.get()).second) {
+        if (!current || !visited.Insert(current.get())) {
             continue;
         }
         result.push_back(current);
@@ -136,11 +154,11 @@ bool TraverseAny(const ErrorPtr& root, Predicate predicate) noexcept {
         }
         std::vector<ErrorPtr> pending;
         pending.push_back(root);
-        std::unordered_set<const Error*> visited;
+        detail::VisitSet visited;
         while (!pending.empty()) {
             ErrorPtr current = std::move(pending.back());
             pending.pop_back();
-            if (!current || !visited.insert(current.get()).second) {
+            if (!current || !visited.Insert(current.get())) {
                 continue;
             }
             if (predicate(*current)) {
@@ -226,11 +244,13 @@ WrappedError::~WrappedError() {
 
 std::string WrappedError::Message() const {
     std::string result;
+    // 沿 m_cause 链展开：每层对象的 m_cause 成员在对象存活期间保活下一层，
+    // 而 `this` 由调用方保活，因此整条链在调用期间有效，无需逐层复制
+    // shared_ptr（10 万层链可省约 20 万次引用计数原子操作）。
     const WrappedError* current = this;
-    ErrorPtr owner;
     for (;;) {
         AppendMessagePart(result, current->m_message);
-        ErrorPtr cause = current->m_cause;
+        const ErrorPtr& cause = current->m_cause;
         if (!cause) {
             break;
         }
@@ -239,7 +259,6 @@ std::string WrappedError::Message() const {
             AppendMessagePart(result, cause->Message());
             break;
         }
-        owner = std::move(cause);
         current = nested;
     }
     return result;
@@ -257,6 +276,14 @@ std::vector<ErrorPtr> WrappedError::UnwrapAll(std::size_t level) const {
 }
 
 JoinError::JoinError(std::vector<ErrorPtr> causes) {
+    // 快路径：Join() 已经过滤空指针，直接接管 vector，避免大 Join 再分配
+    // 一次并逐元素搬移（10 万原因时可省一次 800 KB 级分配）。
+    const bool has_null = std::any_of(causes.begin(), causes.end(),
+                                      [](const ErrorPtr& cause) { return !cause; });
+    if (!has_null) {
+        m_causes = std::move(causes);
+        return;
+    }
     m_causes.reserve(causes.size());
     for (auto& cause : causes) {
         if (cause) {
@@ -325,17 +352,13 @@ ErrorPtr Wrap(ErrorPtr cause, std::string message) {
 }
 
 ErrorPtr Join(std::vector<ErrorPtr> causes) {
-    std::vector<ErrorPtr> filtered;
-    filtered.reserve(causes.size());
-    for (auto& cause : causes) {
-        if (cause) {
-            filtered.push_back(std::move(cause));
-        }
-    }
-    if (filtered.empty()) {
+    causes.erase(std::remove_if(causes.begin(), causes.end(),
+                                [](const ErrorPtr& cause) { return !cause; }),
+                 causes.end());
+    if (causes.empty()) {
         return {};
     }
-    return std::make_shared<JoinError>(std::move(filtered));
+    return std::make_shared<JoinError>(std::move(causes));
 }
 
 ErrorPtr Join(std::initializer_list<ErrorPtr> causes) {
@@ -361,11 +384,11 @@ WalkResult WalkErrors(const ErrorPtr& error, const ErrorVisitor& visitor) noexce
         if (error) {
             pending.push_back(error);
         }
-        std::unordered_set<const Error*> visited;
+        detail::VisitSet visited;
         while (!pending.empty()) {
             ErrorPtr current = std::move(pending.back());
             pending.pop_back();
-            if (!current || !visited.insert(current.get()).second) {
+            if (!current || !visited.Insert(current.get())) {
                 continue;
             }
             result.errors.push_back(current);

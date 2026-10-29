@@ -402,6 +402,48 @@ void TestDeepChain() {
     BENTO_ERROR_CHECK(leaf != nullptr);
 }
 
+void TestWalkDeepChain() {
+    constexpr std::size_t kDepth = 20000;
+    const ErrorPtr leaf = NewError("leaf");
+    ErrorPtr root = leaf;
+    for (std::size_t index = 0; index < kDepth; ++index) {
+        root = Wrap(root, "w");
+    }
+    const WalkResult walked = WalkErrors(
+        root, [](const ErrorPtr&) { return ErrorVisitResult::kContinue; });
+    BENTO_ERROR_CHECK(walked.ok);
+    BENTO_ERROR_CHECK_EQ(walked.errors.size(), kDepth + 1);
+    if (walked.errors.size() == kDepth + 1) {
+        BENTO_ERROR_CHECK_EQ(walked.errors.front(), root);
+        BENTO_ERROR_CHECK_EQ(walked.errors.back(), leaf);
+    }
+    root.reset();
+    BENTO_ERROR_CHECK(leaf != nullptr);
+}
+
+void TestCycleUnwrapAllDedup() {
+    auto cycle = std::make_shared<CycleError>();
+    cycle->SetSelf(cycle);
+    const std::vector<ErrorPtr> all = cycle->UnwrapAll(0);
+    BENTO_ERROR_CHECK_EQ(all.size(), std::size_t{1});
+    if (!all.empty()) {
+        BENTO_ERROR_CHECK_EQ(all.front(), ErrorPtr(cycle));
+    }
+    BENTO_ERROR_CHECK_EQ(cycle->UnwrapAll(1).size(), std::size_t{1});
+}
+
+void TestAsInCycle() {
+    auto cycle = std::make_shared<CycleError>();
+    cycle->SetSelf(cycle);
+    const ErrorPtr root = Join({cycle, Wrap(std::make_shared<TaggedError>(9), "ctx")});
+    const auto found = As<TaggedError>(root);
+    BENTO_ERROR_CHECK(found != nullptr);
+    if (found) {
+        BENTO_ERROR_CHECK_EQ(found->Tag(), 9);
+    }
+    BENTO_ERROR_CHECK(Is(root, cycle));
+}
+
 void TestDeepJoinDestruction() {
     const std::size_t depth = 20000;
     const ErrorPtr leaf = NewError("leaf", ErrorCode::kDataLoss);
@@ -502,6 +544,20 @@ void TestCodeRegistryConcurrent() {
 // ErrorTypeRegistry
 // ---------------------------------------------------------------------------
 
+void TestCodeRegistryBulkRoundTrip() {
+    ErrorCodeRegistry& registry = ErrorCodeRegistry::Instance();
+    std::vector<std::pair<std::uint32_t, std::string>> registered;
+    registered.reserve(512);
+    for (int index = 0; index < 512; ++index) {
+        const std::string name = "test.error.bulk." + std::to_string(index);
+        registered.emplace_back(registry.Register(name), name);
+    }
+    for (const auto& entry : registered) {
+        BENTO_ERROR_CHECK_EQ(registry.Lookup(entry.second), entry.first);
+        BENTO_ERROR_CHECK_EQ(registry.Name(entry.first), std::string_view(entry.second));
+    }
+}
+
 void TestTypeRegistryBuiltins() {
     ErrorTypeRegistry& registry = ErrorTypeRegistry::Instance();
     BENTO_ERROR_CHECK(registry.Has("bento.StringError"));
@@ -571,6 +627,35 @@ void TestTypeRegistryIdempotent() {
         registry.Register("test.LeafCustomError", "test.BaseCustomError", 2,
                           []() -> ErrorPtr { return std::make_shared<LeafCustomError>(); }));
     BENTO_ERROR_CHECK_EQ(registry.Size(), size);
+}
+
+void TestTypeRegistryConflictKeepsFirst() {
+    ErrorTypeRegistry& registry = ErrorTypeRegistry::Instance();
+    BENTO_ERROR_CHECK(registry.Register("test.ConflictType", "bento.Error", 1,
+                                        []() -> ErrorPtr { return NewError("first"); }));
+    // 同名不同元数据：幂等返回 true 但保留首次注册（不覆盖工厂/父类型/深度）。
+    BENTO_ERROR_CHECK(registry.Register("test.ConflictType", "other.Parent", 3,
+                                        []() -> ErrorPtr { return NewError("second"); }));
+    BENTO_ERROR_CHECK_EQ(registry.ParentName("test.ConflictType"),
+                         std::string_view("bento.Error"));
+    BENTO_ERROR_CHECK_EQ(registry.Depth("test.ConflictType"), std::uint8_t{1});
+    const ErrorPtr created = registry.Create("test.ConflictType");
+    BENTO_ERROR_CHECK(created != nullptr);
+    if (created) {
+        BENTO_ERROR_CHECK_EQ(created->Message(), std::string("first"));
+    }
+}
+
+void TestTypeRegistryDepthBoundary() {
+    ErrorTypeRegistry& registry = ErrorTypeRegistry::Instance();
+    registry.ClearLastError();
+    BENTO_ERROR_CHECK(registry.Register("test.Depth3", "test.BaseCustomError", 3,
+                                        []() -> ErrorPtr { return NewError("depth3"); }));
+    BENTO_ERROR_CHECK_EQ(registry.Depth("test.Depth3"), std::uint8_t{3});
+    BENTO_ERROR_CHECK_EQ(registry.Register("test.Depth4", "test.Depth3", 4,
+                                           []() -> ErrorPtr { return NewError("depth4"); }),
+                         false);
+    BENTO_ERROR_CHECK_EQ(registry.LastError(), kDepthLimitErrorCode);
 }
 
 void TestTypeRegistryUnknownType() {
@@ -822,14 +907,20 @@ int main() {
     TestCycleSafety();
     TestThrowingUnwrapIsContained();
     TestDeepChain();
+    TestWalkDeepChain();
+    TestCycleUnwrapAllDedup();
+    TestAsInCycle();
     TestDeepJoinDestruction();
     TestCodeRegistryBuiltins();
     TestCodeRegistryIdempotentAndInvalid();
     TestCodeRegistryViewStability();
     TestCodeRegistryConcurrent();
+    TestCodeRegistryBulkRoundTrip();
     TestTypeRegistryBuiltins();
     TestTypeRegistryRegisterMacroType();
     TestTypeRegistryIdempotent();
+    TestTypeRegistryConflictKeepsFirst();
+    TestTypeRegistryDepthBoundary();
     TestTypeRegistryUnknownType();
     TestTypeRegistryRejectsInvalid();
     TestTypeRegistryFactoryFailures();

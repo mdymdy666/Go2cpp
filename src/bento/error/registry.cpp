@@ -142,7 +142,7 @@ bool ErrorTypeRegistry::Register(std::string_view type_name, std::string_view pa
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_types.find(std::string(type_name)) != m_types.end()) {
+    if (m_types.find(type_name) != m_types.end()) {
         return true;
     }
     m_types.emplace(std::string(type_name),
@@ -155,7 +155,7 @@ ErrorPtr ErrorTypeRegistry::Create(std::string_view type_name) const {
     bool found = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        const auto it = m_types.find(std::string(type_name));
+        const auto it = m_types.find(type_name);
         if (it != m_types.end()) {
             found = true;
             try {
@@ -188,12 +188,12 @@ ErrorPtr ErrorTypeRegistry::Create(std::string_view type_name) const {
 
 bool ErrorTypeRegistry::Has(std::string_view type_name) const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_types.find(std::string(type_name)) != m_types.end();
+    return m_types.find(type_name) != m_types.end();
 }
 
 std::string_view ErrorTypeRegistry::ParentName(std::string_view type_name) const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    const auto it = m_types.find(std::string(type_name));
+    const auto it = m_types.find(type_name);
     if (it == m_types.end()) {
         return {};
     }
@@ -202,7 +202,7 @@ std::string_view ErrorTypeRegistry::ParentName(std::string_view type_name) const
 
 std::uint8_t ErrorTypeRegistry::Depth(std::string_view type_name) const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    const auto it = m_types.find(std::string(type_name));
+    const auto it = m_types.find(type_name);
     if (it == m_types.end()) {
         return 0;
     }

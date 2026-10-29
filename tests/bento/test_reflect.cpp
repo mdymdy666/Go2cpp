@@ -46,6 +46,14 @@ struct Config {
     std::string note = "default";
 };
 
+/// @brief 统计 `FieldList<Config>::Fields()` 调用次数（验证字段表缓存）。
+int g_config_fields_calls = 0;
+
+/// @brief 手动构造空 apply 的绑定器，验证 kWrongType 分支。
+struct NullBinderConfig {
+    int value = 7;
+};
+
 /// @brief 确定性伪随机源（splitmix64），测试不读系统熵。
 class Rng {
  public:
@@ -71,11 +79,20 @@ namespace go2cpp::bento::reflect {
 template <>
 struct FieldList<Config> {
     static std::vector<FieldBinder<Config>> Fields() {
+        ++g_config_fields_calls;
         return {
             BENTO_BIND_FIELD(Config, host),   BENTO_BIND_FIELD(Config, port),
             BENTO_BIND_FIELD(Config, ratio),  BENTO_BIND_FIELD(Config, secure),
             BENTO_BIND_FIELD(Config, note),
         };
+    }
+};
+
+/// @brief 空 apply 绑定器：`Bind` 必须报 kWrongType 而不是静默跳过。
+template <>
+struct FieldList<NullBinderConfig> {
+    static std::vector<FieldBinder<NullBinderConfig>> Fields() {
+        return {FieldBinder<NullBinderConfig>{"value", nullptr}};
     }
 };
 
@@ -122,6 +139,15 @@ void TestTypeDescriptors() {
     BENTO_ERROR_CHECK_EQ(static_cast<int>(FieldKind::kInt), 1);
     BENTO_ERROR_CHECK_EQ(static_cast<int>(FieldKind::kDouble), 2);
     BENTO_ERROR_CHECK_EQ(static_cast<int>(FieldKind::kBool), 3);
+}
+
+void TestDescribeUnspecialized() {
+    const TypeDescriptor float_desc = Describe<float>();
+    BENTO_ERROR_CHECK_EQ(std::string_view(float_desc.name), std::string_view("unknown"));
+    BENTO_ERROR_CHECK_EQ(float_desc.is_numeric, false);
+    BENTO_ERROR_CHECK_EQ(float_desc.kind, FieldKind::kString);
+    BENTO_ERROR_CHECK_EQ(Describe<unsigned long long>().size, sizeof(unsigned long long));
+    BENTO_ERROR_CHECK_EQ(std::string(NameOf<float>()), std::string("unknown"));
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +218,23 @@ void TestDoubleCaster() {
         value = 42.0;
         BENTO_ERROR_CHECK(!to_double(text, value));
     }
+}
+
+void TestCasterLongDigitForms() {
+    const caster::StringToInt to_int;
+    const caster::StringToDouble to_double;
+    int value = 0;
+    BENTO_ERROR_CHECK(to_int("0000000000000000000001", value));
+    BENTO_ERROR_CHECK_EQ(value, 1);
+    // 前导零不改变溢出判定；失败时输出参数保持原值。
+    BENTO_ERROR_CHECK(!to_int("0000000000000000000000000000002147483648", value));
+    BENTO_ERROR_CHECK_EQ(value, 1);
+
+    double double_value = 0.0;
+    BENTO_ERROR_CHECK(to_double("0.000000000000000000000000000001", double_value));
+    BENTO_ERROR_CHECK(double_value > 0.0 && double_value < 1e-29);
+    BENTO_ERROR_CHECK(to_double("-0", double_value));
+    BENTO_ERROR_CHECK(std::signbit(double_value));
 }
 
 void TestBoolCaster() {
@@ -383,6 +426,28 @@ void TestBindUnknownFieldPolicy() {
     BENTO_ERROR_CHECK_EQ(config.port, 80);
 }
 
+void TestBindNullApply() {
+    NullBinderConfig config;
+    BindError error;
+    const std::map<std::string, std::string> values{{"value", "1"}};
+    BENTO_ERROR_CHECK(!Bind(config, values, BindOptions{}, &error));
+    BENTO_ERROR_CHECK_EQ(error.kind, BindErrorKind::kWrongType);
+    BENTO_ERROR_CHECK_EQ(error.field, std::string("value"));
+    BENTO_ERROR_CHECK_EQ(config.value, 7);
+}
+
+void TestBindRejectUnknownAndRequireAll() {
+    Config config;
+    BindOptions options;
+    options.reject_unknown = true;
+    options.require_all = true;
+    BindError error;
+    const std::map<std::string, std::string> values{{"unknown", "x"}};
+    // 未声明字段先于缺失字段被报告（遍历 map 时才检查 require_all）。
+    BENTO_ERROR_CHECK(!Bind(config, values, options, &error));
+    BENTO_ERROR_CHECK_EQ(error.kind, BindErrorKind::kUnknownField);
+}
+
 void TestBindRequireAll() {
     Config config;
     const std::map<std::string, std::string> partial{{"host", "h"}};
@@ -460,6 +525,11 @@ void TestBindStringPreserved() {
     BENTO_ERROR_CHECK_EQ(config.note, std::string("a,b;c=d e f 中文 \t tab"));
 }
 
+void TestBindFieldsCached() {
+    // 全部 Bind 用例跑完后，Config 的字段表只构造一次（map/unordered_map 共享）。
+    BENTO_ERROR_CHECK_EQ(g_config_fields_calls, 1);
+}
+
 void TestBindUnorderedMap() {
     const std::unordered_map<std::string, std::string> values{
         {"host", "unordered.example"}, {"secure", "1"}, {"port", "443"}};
@@ -481,8 +551,10 @@ void TestBindUnorderedMap() {
 
 int main() {
     TestTypeDescriptors();
+    TestDescribeUnspecialized();
     TestIntCaster();
     TestDoubleCaster();
+    TestCasterLongDigitForms();
     TestBoolCaster();
     TestStringCaster();
     TestRandomIntRoundTrip();
@@ -492,11 +564,14 @@ int main() {
     TestBindPartialPreservesDefaults();
     TestBindFailureKeepsObject();
     TestBindUnknownFieldPolicy();
+    TestBindNullApply();
+    TestBindRejectUnknownAndRequireAll();
     TestBindRequireAll();
     TestBindOptionalForm();
     TestBindEdgeValues();
     TestBindCaseSensitiveAndEmpty();
     TestBindStringPreserved();
     TestBindUnorderedMap();
+    TestBindFieldsCached();
     return bento_error_test::Finish("bento_test_reflect");
 }

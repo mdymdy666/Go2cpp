@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -208,7 +209,10 @@ class ErrorTypeRegistry {
     void SetLastError(std::uint32_t code, std::string detail) const;
 
     mutable std::mutex m_mutex;
-    std::unordered_map<std::string, TypeInfo> m_types;
+    // 用 `std::map` + 透明比较器：C++17 下可直接用 `std::string_view` 查找，
+    // 避免每次 Create/Has/Depth 构造临时 `std::string`（一次堆分配）。
+    // 类型表规模很小（内置 3 个 + 业务若干个），O(log n) 足够。
+    std::map<std::string, TypeInfo, std::less<>> m_types;
     mutable std::uint32_t m_last_error = 0;
     mutable std::string m_last_error_detail;
 };

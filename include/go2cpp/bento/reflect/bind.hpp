@@ -36,6 +36,9 @@
  * - 先在副本上应用全部字段，全部成功后才提交；任何转换失败都不会留下
  *   “改了一半”的对象（要求 T 可复制构造且可赋值）。
  * - 字段名区分大小写。
+ * - `FieldList<T>::Fields()` 必须是纯函数且字段集合稳定：实现会在首次
+ *   `Bind` 时缓存字段表，后续调用复用（避免每个字段一次 std::function
+ *   分配）。依赖运行期状态的动态字段表不适合用本模块绑定。
  *
  * @author go2cpp contributors
  * @date 2026-10-28
@@ -106,6 +109,14 @@ bool AssignField(T& object, Field T::*member, std::string_view text) {
     return true;
 }
 
+/// @brief 按类型缓存字段表；`FieldList<T>::Fields()` 约定为纯函数。
+/// @note 放在独立的函数模板里，保证同一 T 无论配哪种 Map 都只构造一次。
+template <typename T>
+const std::vector<FieldBinder<T>>& FieldsOf() {
+    static const std::vector<FieldBinder<T>> fields = FieldList<T>::Fields();
+    return fields;
+}
+
 } // namespace detail
 
 /**
@@ -133,7 +144,10 @@ bool BindMap(T& object, const Map& values, const BindOptions& options, BindError
     }
 
     T candidate = object;
-    const std::vector<FieldBinder<T>> fields = FieldList<T>::Fields();
+    // `Fields()` 约定为纯函数、字段集合稳定；按 T 缓存一次即可。每次 Bind
+    // 重建 vector<FieldBinder> 会为每个字段分配一个 std::function，是配置
+    // 绑定路径的主要分配来源（5 字段配置每次约 6 次分配）。
+    const std::vector<FieldBinder<T>>& fields = FieldsOf<T>();
     std::vector<bool> seen(fields.size(), false);
 
     for (const auto& entry : values) {

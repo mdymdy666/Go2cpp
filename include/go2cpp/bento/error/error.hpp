@@ -236,6 +236,47 @@ bool Has(const ErrorPtr& error, ErrorCode code) noexcept;
 
 namespace detail {
 
+/**
+ * @brief 错误图访问集：前 8 个节点内联存储，超过容量后才分配哈希表。
+ *
+ * @details 正常业务错误图通常只有个位数节点；`unordered_set` 的桶分配
+ *          （每次查询 1-2 次）比节点遍历本身更贵。内联数组让常见路径零分配，
+ *          地址去重的语义保持不变。
+ *
+ * @note 溢出后分配哈希表失败会抛 `std::bad_alloc`，由 `Is`/`Has`/`As`
+ *       等 noexcept 入口统一转换为“未匹配/失败”，不做静默降级。
+ */
+class VisitSet {
+ public:
+    /**
+     * @brief 记录一个节点。
+     * @return 首次出现返回 true；重复出现返回 false。
+     */
+    bool Insert(const Error* node) {
+        for (std::size_t index = 0; index < m_inline_count; ++index) {
+            if (m_inline[index] == node) {
+                return false;
+            }
+        }
+        if (!m_overflow) {
+            if (m_inline_count < kInlineCapacity) {
+                m_inline[m_inline_count++] = node;
+                return true;
+            }
+            m_overflow = std::make_unique<std::unordered_set<const Error*>>();
+            m_overflow->reserve(kInlineCapacity * 2U);
+            m_overflow->insert(m_inline, m_inline + m_inline_count);
+        }
+        return m_overflow->insert(node).second;
+    }
+
+ private:
+    static constexpr std::size_t kInlineCapacity = 8; ///< 内联槽位数量。
+    const Error* m_inline[kInlineCapacity] = {};      ///< 内联节点表。
+    std::size_t m_inline_count = 0;                   ///< 已用槽位。
+    std::unique_ptr<std::unordered_set<const Error*>> m_overflow; ///< 溢出后的哈希表。
+};
+
 template <typename T>
 std::shared_ptr<const T> FindFirstError(const ErrorPtr& root) noexcept {
     static_assert(std::is_base_of<Error, T>::value, "T 必须派生自 bento::error::Error");
@@ -245,11 +286,11 @@ std::shared_ptr<const T> FindFirstError(const ErrorPtr& root) noexcept {
         }
         std::vector<ErrorPtr> pending;
         pending.push_back(root);
-        std::unordered_set<const Error*> visited;
+        VisitSet visited;
         while (!pending.empty()) {
             ErrorPtr current = std::move(pending.back());
             pending.pop_back();
-            if (!current || !visited.insert(current.get()).second) {
+            if (!current || !visited.Insert(current.get())) {
                 continue;
             }
             if (const auto found = std::dynamic_pointer_cast<const T>(current)) {
