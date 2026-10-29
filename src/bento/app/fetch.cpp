@@ -32,6 +32,9 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#if defined(__linux__)
+#include <linux/fs.h>  // RENAME_NOREPLACE：排他落盘标志
+#endif
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -707,17 +710,32 @@ public:
     }
 
     /// 读一段字节；`got == 0` 表示对端 EOF。
+    /// @details 大块读取（>= `kDirectReadBytes`）直接把字节 `recv` 进调用方
+    ///          缓冲，省掉「内核 → 内部缓冲 → 调用方缓冲」的两次内存拷贝；
+    ///          小块（头部残留/尾部零头）仍走内部缓冲，语义不变。
     FetchStatus ReadSome(char* output, std::size_t capacity, std::size_t* got,
                          std::string* message) {
         if (capacity == 0) {
             *got = 0;
             return FetchStatus::kOk;
         }
-        if (m_buffer.empty() && !m_eof) {
-            const FetchStatus status = Fill(message);
-            if (status != FetchStatus::kOk) {
-                return status;
-            }
+        if (!m_buffer.empty()) {
+            const std::size_t take = std::min(capacity, m_buffer.size());
+            std::memcpy(output, m_buffer.data(), take);
+            m_buffer.erase(0, take);
+            *got = take;
+            return FetchStatus::kOk;
+        }
+        if (m_eof) {
+            *got = 0;
+            return FetchStatus::kOk;
+        }
+        if (capacity >= kDirectReadBytes) {
+            return ReadDirect(output, capacity, got, message);
+        }
+        const FetchStatus status = Fill(message);
+        if (status != FetchStatus::kOk) {
+            return status;
         }
         const std::size_t take = std::min(capacity, m_buffer.size());
         if (take > 0) {
@@ -729,8 +747,8 @@ public:
     }
 
 private:
-    /// 从 socket 读一次到内部缓冲；超时/错误写 `message`。
-    FetchStatus Fill(std::string* message) {
+    /// 等待 socket 可读；同时受单次空闲超时与本次尝试的总截止时间约束。
+    FetchStatus WaitReadable(std::string* message) {
         for (;;) {
             const Clock::time_point wait_until =
                 std::min(m_deadline, Clock::now() + std::chrono::milliseconds(m_idle_timeout_ms));
@@ -742,22 +760,58 @@ private:
             pollfd pfd{};
             pfd.fd = m_fd;
             pfd.events = POLLIN;
-            int poll_result = 0;
-            do {
-                poll_result = ::poll(&pfd, 1, wait_ms);
-            } while (poll_result < 0 && errno == EINTR);
+            const int poll_result = ::poll(&pfd, 1, wait_ms);
             if (poll_result == 0) {
                 *message = "读取超时";
                 return FetchStatus::kTimeout;
             }
             if (poll_result < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
                 *message = std::string("poll 失败: ") + std::strerror(errno);
                 return FetchStatus::kIoError;
             }
-            std::array<char, 64 * 1024> buffer{};
-            const ssize_t got = ::recv(m_fd, buffer.data(), buffer.size(), 0);
+            return FetchStatus::kOk;
+        }
+    }
+
+    /// 直接把字节读进调用方缓冲（大块 body 的零拷贝路径）。
+    FetchStatus ReadDirect(char* output, std::size_t capacity, std::size_t* got,
+                           std::string* message) {
+        for (;;) {
+            const FetchStatus ready = WaitReadable(message);
+            if (ready != FetchStatus::kOk) {
+                return ready;
+            }
+            const ssize_t result = ::recv(m_fd, output, capacity, 0);
+            if (result > 0) {
+                *got = static_cast<std::size_t>(result);
+                return FetchStatus::kOk;
+            }
+            if (result == 0) {
+                m_eof = true;
+                *got = 0;
+                return FetchStatus::kOk;
+            }
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            *message = std::string("读取失败: ") + std::strerror(errno);
+            return FetchStatus::kIoError;
+        }
+    }
+
+    /// 从 socket 读一次到内部缓冲；超时/错误写 `message`。
+    FetchStatus Fill(std::string* message) {
+        for (;;) {
+            const FetchStatus ready = WaitReadable(message);
+            if (ready != FetchStatus::kOk) {
+                return ready;
+            }
+            const ssize_t got = ::recv(m_fd, m_fill.data(), m_fill.size(), 0);
             if (got > 0) {
-                m_buffer.append(buffer.data(), static_cast<std::size_t>(got));
+                m_buffer.append(m_fill.data(), static_cast<std::size_t>(got));
                 return FetchStatus::kOk;
             }
             if (got == 0) {
@@ -772,10 +826,14 @@ private:
         }
     }
 
+    /// 至少这么大块时才走「直接读进调用方缓冲」的快路径。
+    static constexpr std::size_t kDirectReadBytes = 16 * 1024;
+
     int m_fd{-1};
     std::uint32_t m_idle_timeout_ms{0};
     Clock::time_point m_deadline{};
     std::string m_buffer;
+    std::array<char, 64 * 1024> m_fill{};
     bool m_eof{false};
 };
 
@@ -964,7 +1022,8 @@ class BodySink final {
 public:
     BodySink(int fd, std::uint64_t max_bytes) : m_fd(fd), m_max_bytes(max_bytes) {}
 
-    FetchStatus Append(const char* data, std::size_t size) {
+    /// 追加一段 body；失败时把 errno 翻译成可读诊断（`message` 可为空）。
+    FetchStatus Append(const char* data, std::size_t size, std::string* message) {
         if (size > m_max_bytes - m_bytes) {
             return FetchStatus::kTooLarge;
         }
@@ -977,6 +1036,9 @@ public:
             }
             if (result < 0 && errno == EINTR) {
                 continue;
+            }
+            if (message != nullptr) {
+                *message = std::string("写入临时文件失败: ") + std::strerror(errno);
             }
             return FetchStatus::kIoError;
         }
@@ -1019,7 +1081,7 @@ FetchStatus ReadExact(SocketReader& reader, BodySink& sink, std::uint64_t count,
             *message = "响应体提前结束";
             return FetchStatus::kTruncated;
         }
-        const FetchStatus append = sink.Append(buffer.data(), got);
+        const FetchStatus append = sink.Append(buffer.data(), got, message);
         if (append != FetchStatus::kOk) {
             return append;
         }
@@ -1040,7 +1102,7 @@ FetchStatus ReadUntilEof(SocketReader& reader, BodySink& sink, std::string* mess
         if (got == 0) {
             return FetchStatus::kOk;
         }
-        const FetchStatus append = sink.Append(buffer.data(), got);
+        const FetchStatus append = sink.Append(buffer.data(), got, message);
         if (append != FetchStatus::kOk) {
             return append;
         }
@@ -1319,6 +1381,13 @@ bool BuildHttpsCurlConfig(const std::string& url_text, const std::string& output
     text += "connect-timeout = \"" + FormatSeconds(options.connect_timeout_ms) + "\"\n";
     text += "max-time = \"" + FormatSeconds(options.total_timeout_ms) + "\"\n";
     text += "max-filesize = \"" + std::to_string(options.max_bytes) + "\"\n";
+    // 空闲读超时：curl 没有独立的 read timeout，用 speed-limit/speed-time 近似
+    // —— speed-time 秒窗口内平均速度低于 1 B/s 即中止（退出码 28，映射为 kTimeout）。
+    // 正常下载速度远高于 1 B/s，只有真正卡死时才会触发。
+    const std::uint32_t speed_time_seconds =
+        std::max<std::uint32_t>(1, (options.read_timeout_ms + 999) / 1000);
+    text += "speed-limit = \"1\"\n";
+    text += "speed-time = \"" + std::to_string(speed_time_seconds) + "\"\n";
     text += "write-out = \"%{http_code}\"\n";
     *config = std::move(text);
     return true;
@@ -1522,6 +1591,46 @@ FetchStatus PerformHttpsAttempt(const UrlParts& url, const FetchOptions& options
         }
     }
     return PromoteHttpsOutput(output, temp_path, options, result);
+}
+
+// ---------------------------------------------------------------------------
+// 排他落盘
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief `overwrite=false` 时的排他落盘。
+ * @details 走 `renameat2(RENAME_NOREPLACE)`：并发写同一目标时只有第一个 rename
+ *          成功，其余得到 `EEXIST`，转成 `kTargetExists`，不会互相覆盖。
+ *          `Fetch` 开头的「目标是否存在」检查只是快速拒绝，真正的排他性由这里
+ *          保证（否则检查与 rename 之间的 TOCTOU 窗口会让多个请求都落盘）。
+ * @return true 表示已落盘；false 表示未落盘——此时若 `result->status` 已被置为
+ *         `kTargetExists` / `kIoError` 属于确定性失败，否则表示内核或文件系统
+ *         不支持该标志，调用方应回退到普通 `rename`。
+ */
+bool CommitNoReplace(const std::string& temp_path, const std::string& target,
+                     FetchResult* result) {
+#if defined(__linux__) && defined(RENAME_NOREPLACE)
+    if (::renameat2(AT_FDCWD, temp_path.c_str(), AT_FDCWD, target.c_str(), RENAME_NOREPLACE) ==
+        0) {
+        return true;
+    }
+    const int rename_errno = errno;
+    if (rename_errno == EEXIST) {
+        result->status = FetchStatus::kTargetExists;
+        result->message = "目标已存在且未允许覆盖（并发落盘时后到者被拒绝）";
+        return false;
+    }
+    if (rename_errno != ENOSYS && rename_errno != EINVAL && rename_errno != EOPNOTSUPP) {
+        result->status = FetchStatus::kIoError;
+        result->message = std::string("落盘 rename 失败: ") + std::strerror(rename_errno);
+        return false;
+    }
+#else
+    (void)temp_path;
+    (void)target;
+    (void)result;
+#endif
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1781,12 +1890,25 @@ FetchResult Fetch(std::string_view url, const std::string& dest_dir,
                              result.sha256 + "）";
         }
         if (last_status == FetchStatus::kOk) {
-            std::error_code rename_ec;
-            std::filesystem::rename(temp_path, target, rename_ec);
-            if (rename_ec) {
-                ::unlink(temp_path.c_str());
-                return fail(FetchStatus::kIoError,
-                            std::string("落盘 rename 失败: ") + rename_ec.message());
+            // overwrite=false 时用排他落盘：并发下只有一个请求能成功，其余
+            // 返回 kTargetExists，而不是悄悄互相覆盖。
+            bool committed = false;
+            if (!options.overwrite) {
+                committed = CommitNoReplace(temp_path, target, &result);
+                if (result.status == FetchStatus::kTargetExists ||
+                    result.status == FetchStatus::kIoError) {
+                    ::unlink(temp_path.c_str());
+                    return result;
+                }
+            }
+            if (!committed) {
+                std::error_code rename_ec;
+                std::filesystem::rename(temp_path, target, rename_ec);
+                if (rename_ec) {
+                    ::unlink(temp_path.c_str());
+                    return fail(FetchStatus::kIoError,
+                                std::string("落盘 rename 失败: ") + rename_ec.message());
+                }
             }
             result.status = FetchStatus::kOk;
             result.path = target;

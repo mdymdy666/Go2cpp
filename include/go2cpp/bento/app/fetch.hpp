@@ -67,6 +67,17 @@
  * | URL 长度 | 8192B | 8192B |
  * | 响应头 | 64KiB | 64KiB |
  *
+ * ## 三层超时的实现方式
+ *
+ * - **连接超时**：非阻塞 `connect` + `poll`，同时受 `connect_timeout_ms` 与
+ *   本次尝试的总截止时间约束；
+ * - **单次 IO 空闲超时**：每次 `recv` 前 `poll`，空闲超过 `read_timeout_ms`
+ *   即失败。HTTP 路径精确到毫秒；HTTPS 路径折成 curl 的
+ *   `--speed-limit 1 --speed-time N`（N = `read_timeout_ms` 向上取整的秒数），
+ *   语义是「N 秒窗口内平均速度低于 1 B/s 即中止」，属于近似而非精确计时；
+ * - **总超时**：从本次尝试开始计时，覆盖建连、发送、等待与读取。重试时每次
+ *   尝试重新计时，因此 `attempts` 次尝试各自受 `total_timeout_ms` 约束。
+ *
  * @note `Fetch` 是同步阻塞的：在 Fiber 中调用会阻塞当前 M。需要并发下载时
  *       由调用方放到线程池（与 `os::proc` 的边界一致）。
  * @note 只支持 HTTP/1.1 的 `identity` 编码；响应声明 `gzip`/`br` 等编码时
@@ -238,7 +249,9 @@ bool ParseSha256Hex(std::string_view text, std::string* canonical_lower_hex);
  * @return 结果对象；失败时保证不残留临时文件与目标文件（目标原本不存在时）。
  *
  * @note 目标已存在时由 `options.overwrite` 决定：false 直接返回
- *       `kTargetExists`，不会发起网络请求。
+ *       `kTargetExists`，不会发起网络请求。并发写同一目标时，`overwrite=false`
+ *       通过 `renameat2(RENAME_NOREPLACE)` 排他落盘：只有一个请求成功，其余在
+ *       落盘阶段返回 `kTargetExists`（不覆盖、不残留临时文件）。
  * @note 成功落盘是原子的：内容先写临时文件，校验通过后 `rename`。
  */
 FetchResult Fetch(std::string_view url, const std::string& dest_dir,
