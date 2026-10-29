@@ -57,6 +57,9 @@ constexpr std::size_t kControlRequestBytes = 5;  // 4B peer_id + 1B 请求模式
 
 /// 单次 Read 的栈缓冲：一次读 4 KiB，帧解码器负责拼包。
 constexpr std::size_t kReadBufferBytes = 4096;
+/// 单次 Poll 最多连续读几屏（32 KiB）：读满一屏说明还有积压，
+/// 但必须设上限，避免持续高速数据把定时器/关闭窗口饿死。
+constexpr int kMaxReadsPerPoll = 8;
 
 std::string ErrorText(int error) {
     return std::error_code(error, std::generic_category()).message();
@@ -312,6 +315,7 @@ struct Session::Impl {
             heartbeat->Stop();
         }
         outbox.clear();
+        outbox_offset = 0;
         if (decoder) {
             decoder->Clear();
         }
@@ -462,30 +466,47 @@ struct Session::Impl {
             return;
         }
         std::uint8_t buffer[kReadBufferBytes];
-        const std::chrono::milliseconds budget(timeout_ms > 0 ? timeout_ms : 0);
-        const net::Result result = transport->Read(buffer, sizeof(buffer), budget);
-        if (result.code == net::Code::kTimeout) {
-            return;
-        }
-        if (result.code == net::Code::kClosed) {
-            if (state == SessionState::kClosing) {
-                FinishClose();
+        const std::chrono::milliseconds first_budget(timeout_ms > 0 ? timeout_ms : 0);
+        for (int attempt = 0; attempt < kMaxReadsPerPoll; ++attempt) {
+            const std::chrono::milliseconds budget =
+                attempt == 0 ? first_budget : std::chrono::milliseconds(0);
+            const net::Result result = transport->Read(buffer, sizeof(buffer), budget);
+            if (result.code == net::Code::kTimeout) {
                 return;
             }
-            Fail(SessionError::kTransportClosed, "peer closed the transport");
-            return;
+            if (result.code == net::Code::kClosed) {
+                if (state == SessionState::kClosing) {
+                    FinishClose();
+                    return;
+                }
+                Fail(SessionError::kTransportClosed, "peer closed the transport");
+                return;
+            }
+            if (result.code != net::Code::kOk) {
+                if (state == SessionState::kClosing) {
+                    // 关闭窗口内读失败按正常关闭收尾，不覆盖 last_error。
+                    FinishClose();
+                    return;
+                }
+                Fail(SessionError::kTransportClosed,
+                     "read failed: " + ErrorText(result.system_error));
+                return;
+            }
+            if (result.bytes == 0) {
+                return;
+            }
+            stats.bytes_received += result.bytes;
+            decoder->Append(buffer, result.bytes);
+            ProcessFrames();
+            if (state == SessionState::kClosed) {
+                return;
+            }
+            // 读满一屏说明传输里可能还有积压：继续用 0 预算取下一批，
+            // 把「每次 Poll 只读 4 KiB」的吞吐上限提高 8 倍。
+            if (result.bytes < sizeof(buffer)) {
+                return;
+            }
         }
-        if (result.code != net::Code::kOk) {
-            Fail(SessionError::kTransportClosed,
-                 "read failed: " + ErrorText(result.system_error));
-            return;
-        }
-        if (result.bytes == 0) {
-            return;
-        }
-        stats.bytes_received += result.bytes;
-        decoder->Append(buffer, result.bytes);
-        ProcessFrames();
     }
 
     void ProcessFrames() {
@@ -496,6 +517,12 @@ struct Session::Impl {
                 return;
             }
             if (status != net::FrameStatus::kOk) {
+                if (state == SessionState::kClosing) {
+                    // 关闭窗口内的残余/损坏字节：直接收尾，不把正常关闭
+                    // 改写成 kProtocolError。
+                    FinishClose();
+                    return;
+                }
                 ++stats.protocol_errors;
                 Fail(SessionError::kProtocolError,
                      std::string("frame decode failed: ") + net::FrameStatusName(status));
@@ -510,6 +537,15 @@ struct Session::Impl {
     }
 
     void HandleFrame(const net::Frame& frame) {
+        if (state == SessionState::kClosing) {
+            // 优雅关闭窗口：只等对端的 kClose / EOF。FIN 之后对端仍可能
+            // 发出在途的 Data/Control/Channel 帧（TCP 半关闭语义），它们
+            // 不是协议错误；丢弃而不是关成 kProtocolError。
+            if (frame.type == kFrameClose) {
+                FinishClose();
+            }
+            return;
+        }
         switch (frame.type) {
             case kFramePairing:
                 HandlePairing(frame.payload);
@@ -888,6 +924,14 @@ struct Session::Impl {
 
     void TickTimers() {
         const std::uint64_t now = NowMs();
+        if (state == SessionState::kClosing) {
+            // 关闭窗口内只等对端或超时：配对/心跳/租约定时器不应再把
+            // 正常关闭改写成 kPairingTimeout/kHeartbeatTimeout。
+            if (now >= close_deadline_ms) {
+                FinishClose();
+            }
+            return;
+        }
         if (pairing && state != SessionState::kClosed) {
             const bool changed = pairing->Tick(now);
             if (changed && pairing->state() == PairingState::kClosed &&
@@ -962,8 +1006,16 @@ struct Session::Impl {
             }
             frames.push_back(std::move(bytes));
         }
-        for (auto it = frames.rbegin(); it != frames.rend(); ++it) {
-            outbox.push_front(std::move(*it));
+        if (outbox_offset == 0) {
+            for (auto it = frames.rbegin(); it != frames.rend(); ++it) {
+                outbox.push_front(std::move(*it));
+            }
+            return;
+        }
+        // 队首帧已部分写出：插到它前面会让对端收到「半帧 + 新帧」，只能
+        // 排到队尾，等剩余字节发完再发配对帧。
+        for (auto& frame : frames) {
+            outbox.push_back(std::move(frame));
         }
     }
 
@@ -974,29 +1026,38 @@ struct Session::Impl {
         DrainPairingOutbound();
         while (!outbox.empty()) {
             std::vector<std::uint8_t>& bytes = outbox.front();
-            const net::Result result = transport->WriteFull(
-                bytes.data(), bytes.size(), std::chrono::milliseconds(config.io_timeout_ms));
-            if (result.code == net::Code::kOk) {
-                stats.bytes_sent += bytes.size();
-                ++stats.frames_sent;
+            if (outbox_offset >= bytes.size()) {
+                // 防御：偏移等于帧长说明已写完（正常路径会立即 pop）。
                 outbox.pop_front();
+                outbox_offset = 0;
                 continue;
             }
-            if (result.bytes > 0 && result.bytes <= bytes.size()) {
-                stats.bytes_sent += result.bytes;
+            const net::Result result = transport->WriteFull(
+                bytes.data() + outbox_offset, bytes.size() - outbox_offset,
+                std::chrono::milliseconds(config.io_timeout_ms));
+            if (result.code == net::Code::kOk) {
+                stats.bytes_sent += bytes.size() - outbox_offset;
+                ++stats.frames_sent;
+                outbox.pop_front();
+                outbox_offset = 0;
+                continue;
+            }
+            if (result.bytes > 0) {
+                const std::size_t remaining = bytes.size() - outbox_offset;
+                const std::size_t written = std::min(result.bytes, remaining);
+                stats.bytes_sent += written;
+                outbox_offset += written;
             }
             if (result.code == net::Code::kTimeout) {
-                // `WriteFull` 的 bytes 是超时前已写出的字节数。删掉这段前缀，
-                // 下次只重发剩余后缀；否则对端会收到「半帧 + 整帧」（SESS-01）。
-                if (result.bytes > 0 && result.bytes < bytes.size()) {
-                    bytes.erase(bytes.begin(),
-                                bytes.begin() + static_cast<std::ptrdiff_t>(result.bytes));
-                }
+                // 已写出的前缀记在 outbox_offset 里，下次从断点续写；不再
+                // erase 前缀（大帧 + 多次超时时是 O(n²) 拷贝），也不会重发
+                // 整帧（SESS-01）。
                 return;
             }
-            if (result.bytes == bytes.size()) {
+            if (outbox_offset == bytes.size()) {
                 // 防御：已全部写出但状态非 OK（派生类违约）时不重发整帧。
                 outbox.pop_front();
+                outbox_offset = 0;
             }
             if (state == SessionState::kClosing) {
                 FinishClose();
@@ -1103,6 +1164,8 @@ struct Session::Impl {
     std::unique_ptr<SessionControl> control;
     std::unique_ptr<net::FrameDecoder> decoder;
     std::deque<std::vector<std::uint8_t>> outbox;
+    /// 队首帧已写出的前缀字节数；部分写后从这里续写，避免 erase 前缀。
+    std::size_t outbox_offset = 0;
     SessionChannel channel;
     SessionStats stats;
     std::uint32_t remote_peer_id = 0;

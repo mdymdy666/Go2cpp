@@ -35,7 +35,10 @@
  *          `Connecting` 覆盖「解析端点 + Connect + 配对」全过程；配对成功后
  *          进入 `Paired` 并立即发起通道握手；双方都确认通道后进入 `Active`。
  *          `Closing` 是优雅关闭窗口：本端已发送 `kClose` 并半关闭写方向，
- *          等待对端 `kClose`、EOF 或 `close_timeout_ms` 到期。
+ *          等待对端 `kClose`、EOF 或 `close_timeout_ms` 到期。半关闭后
+ *          对端仍可能在 FIN 之前发出在途的 Data/Control/Channel 帧，
+ *          这些帧在 `Closing` 内一律丢弃（不判协议错误）；配对/心跳/
+ *          租约定时器在关闭窗口内暂停，正常关闭不会被改写成超时错误。
  *
  * ## 字节流上的会话协议
  *
@@ -212,7 +215,7 @@ struct SessionChannel {
 /// @brief 会话计数器快照。
 struct SessionStats {
     std::uint64_t polls = 0;                ///< Poll 调用次数。
-    std::uint64_t frames_sent = 0;          ///< 成功写出的帧数（含重传）。
+    std::uint64_t frames_sent = 0;          ///< 成功写出的帧数（含重传；部分写续传只计一次）。
     std::uint64_t frames_received = 0;      ///< 成功解码的帧数。
     std::uint64_t bytes_sent = 0;           ///< 写出的字节数。
     std::uint64_t bytes_received = 0;       ///< 读入的字节数。
@@ -223,7 +226,9 @@ struct SessionStats {
     std::uint64_t state_changes = 0;        ///< 状态迁移次数。
     std::uint64_t control_requests = 0;     ///< RequestControl 调用次数。
     std::uint64_t protocol_errors = 0;      ///< 协议错误次数。
-    std::uint64_t dropped_frames = 0;       ///< 发送队列满而丢弃的帧数（含内部帧）。
+    /// 发送队列满而丢弃的帧数（含内部帧）；`Closing` 窗口内丢弃的
+    /// 接收帧不计入本字段（它们是正常关闭的在途数据，不是错误）。
+    std::uint64_t dropped_frames = 0;
 };
 
 /**
@@ -329,7 +334,9 @@ class Session final {
 
     /**
      * @brief 驱动一轮 I/O 与定时器。
-     * @param timeout_ms 本次 Read 的阻塞预算（毫秒）；负值按 0 处理。
+     * @param timeout_ms 首次 Read 的阻塞预算（毫秒）；负值按 0 处理。
+     *        读满 4 KiB 后会以 0 预算继续读下一批，单次 Poll 最多 32 KiB，
+     *        用来把高吞吐场景的读上限提高 8 倍而不饿死定时器。
      * @return true 表示会话尚未 Closed；false 表示已进入终态。
      *
      * @details 顺序：读传输 → 解帧并处理 → 自动接受配对 → 定时器

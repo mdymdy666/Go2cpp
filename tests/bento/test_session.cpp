@@ -18,6 +18,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1048,6 +1049,261 @@ void TestPartialWriteResumesRemainder() {
     }
 }
 
+
+/// 场景 19：Closing 状态收到 in-flight 帧应丢弃，不能判协议错误（P1 回归）。
+void TestClosingIgnoresInflightFrames() {
+    auto pair = MemoryTransport::CreatePair();
+    FakeClock clock;
+    TapTransport* tap = nullptr;
+    PairConfigs configs = MakeTapPairConfigs(clock, std::move(pair), &tap);
+    Session client(configs.client);
+    Session server(configs.server);
+    ErrorTrace errors;
+    errors.Attach(client);
+    StateTrace states;
+    states.Attach(client);
+    BENTO_CHECK(Activate(client, server));
+
+    BENTO_CHECK(client.Send("before-close") == SessionError::kNone);
+    client.Close();
+    BENTO_CHECK_EQ(client.state(), SessionState::kClosing);
+
+    // 对端在 FIN 之前发出的数据、控制、通道帧（TCP 半关闭语义）。
+    BENTO_CHECK(tap->InjectWrite(
+        EncodeSessionFrame(go2cpp::bento::app::SessionFrameType::kData, {0, 1, 'x'})));
+    client.Poll(0);
+    BENTO_CHECK_EQ(client.last_error(), SessionError::kNone);
+    BENTO_CHECK(errors.errors.empty());
+    BENTO_CHECK_EQ(client.stats().protocol_errors, std::uint64_t{0});
+
+    BENTO_CHECK(tap->InjectWrite(EncodeSessionFrame(
+        go2cpp::bento::app::SessionFrameType::kControl, {0, 0, 0, 0, 99, 2})));
+    client.Poll(0);
+    BENTO_CHECK_EQ(client.last_error(), SessionError::kNone);
+
+    BENTO_CHECK(tap->InjectWrite(EncodeSessionFrame(
+        go2cpp::bento::app::SessionFrameType::kChannelOpen, {0, 1, 0, 0, 0, 2})));
+    client.Poll(0);
+    BENTO_CHECK_EQ(client.last_error(), SessionError::kNone);
+    BENTO_CHECK_EQ(client.stats().protocol_errors, std::uint64_t{0});
+
+    BENTO_CHECK(PumpBoth(client, server,
+                         [&] {
+                             return client.state() == SessionState::kClosed &&
+                                    server.state() == SessionState::kClosed;
+                         },
+                         3000));
+    BENTO_CHECK_EQ(client.last_error(), SessionError::kNone);
+    BENTO_CHECK(errors.errors.empty());
+    BENTO_CHECK(states.Contains(SessionState::kClosed));
+}
+
+/// 场景 20：部分写后配对重传不能插到半帧前面（P1 回归）。
+void TestPartialWritePairingRetransmit() {
+    auto pair = MemoryTransport::CreatePair();
+    FakeClock clock;
+    TapTransport* tap = nullptr;
+    PairConfigs configs = MakeTapPairConfigs(clock, std::move(pair), &tap);
+    configs.client.pairing_retransmit_ms = 5000;  // 客户端不重传，隔离变量
+    Session client(configs.client);
+    Session server(configs.server);
+    ErrorTrace client_errors;
+    ErrorTrace server_errors;
+    client_errors.Attach(client);
+    server_errors.Attach(server);
+    BENTO_CHECK(client.Start() == SessionError::kNone);
+    BENTO_CHECK(server.Start() == SessionError::kNone);
+
+    // 服务端第一次 Flush 只写出 RESPONSE 的前 7 字节（其余留待续写）。
+    tap->SetWriteMode(TapTransport::WriteMode::kPartialThenTimeout, 7);
+    BENTO_CHECK(PumpBoth(client, server,
+                         [&] { return server.state() == SessionState::kPaired; }, 3000));
+    BENTO_CHECK_EQ(server.state(), SessionState::kPaired);
+
+    // 推进到服务端重传窗口：重传的 RESPONSE 不能插到「半帧」前面。
+    clock.now_ms += configs.server.pairing_retransmit_ms + 1;
+    tap->SetWriteMode(TapTransport::WriteMode::kForward);
+    BENTO_CHECK(PumpBoth(client, server,
+                         [&] {
+                             return client.state() == SessionState::kActive &&
+                                    server.state() == SessionState::kActive;
+                         },
+                         5000));
+    BENTO_CHECK(client_errors.errors.empty());
+    BENTO_CHECK(server_errors.errors.empty());
+    BENTO_CHECK_EQ(client.stats().protocol_errors, std::uint64_t{0});
+    BENTO_CHECK_EQ(server.stats().protocol_errors, std::uint64_t{0});
+
+    DataSink sink;
+    sink.Attach(server);
+    BENTO_CHECK(client.Send("after-retransmit") == SessionError::kNone);
+    BENTO_CHECK(PumpBoth(client, server, [&] { return !sink.messages.empty(); }, 3000));
+    if (!sink.messages.empty()) {
+        BENTO_CHECK_EQ(sink.messages[0], std::string("after-retransmit"));
+    }
+}
+
+/// 场景 21：关闭窗口内配对/心跳定时器不再覆盖正常关闭（P2 回归）。
+void TestCloseWindowSkipsTimers() {
+    auto pair = MemoryTransport::CreatePair();
+    FakeClock clock;
+    PairConfigs configs = MakePairConfigs(clock, std::move(pair));
+    configs.client.pairing_timeout_ms = 100;
+    configs.client.close_timeout_ms = 1000;
+    configs.client.heartbeat_timeout_ms = 200;
+    const std::uint32_t close_timeout_ms = configs.client.close_timeout_ms;
+    Session client(configs.client);
+    ErrorTrace errors;
+    errors.Attach(client);
+    BENTO_CHECK(client.Start() == SessionError::kNone);
+    const std::uint64_t start = clock.now_ms;
+    client.Close();
+    BENTO_CHECK_EQ(client.state(), SessionState::kClosing);
+
+    clock.now_ms = start + 500;  // 越过配对/心跳超时，但关闭窗口未到
+    client.Poll(0);
+    BENTO_CHECK_EQ(client.state(), SessionState::kClosing);
+    BENTO_CHECK_EQ(client.last_error(), SessionError::kNone);
+    BENTO_CHECK(errors.errors.empty());
+
+    clock.now_ms = start + close_timeout_ms + 1;
+    client.Poll(0);
+    BENTO_CHECK_EQ(client.state(), SessionState::kClosed);
+    BENTO_CHECK_EQ(client.last_error(), SessionError::kNone);
+    BENTO_CHECK(errors.errors.empty());
+}
+
+/// 场景 22：应用发送队列满返回 kQueueFull（覆盖缺口）。
+void TestSendQueueFull() {
+    auto pair = MemoryTransport::CreatePair();
+    FakeClock clock;
+    PairConfigs configs = MakePairConfigs(clock, std::move(pair));
+    configs.server.max_outbox_frames = 2;
+    Session client(configs.client);
+    Session server(configs.server);
+    BENTO_CHECK(Activate(client, server));
+    BENTO_CHECK(server.Send("one") == SessionError::kNone);
+    BENTO_CHECK(server.Send("two") == SessionError::kNone);
+    BENTO_CHECK(server.Send("three") == SessionError::kQueueFull);
+    BENTO_CHECK_EQ(server.stats().dropped_frames, std::uint64_t{1});
+    BENTO_CHECK(PumpBoth(client, server,
+                         [&] {
+                             return client.state() == SessionState::kActive &&
+                                    server.state() == SessionState::kActive;
+                         },
+                         3000));
+}
+
+/// 场景 23：断开后用新 Session 重连（Closed 是终态，不支持原地重连）。
+void TestReconnectNewSession() {
+    FakeClock clock;
+    long failures = 0;
+    for (int round = 0; round < 50; ++round) {
+        PairConfigs configs = MakePairConfigs(clock, MemoryTransport::CreatePair());
+        Session client(configs.client);
+        Session server(configs.server);
+        DataSink sink;
+        sink.Attach(server);
+        if (client.Start() != SessionError::kNone || server.Start() != SessionError::kNone) {
+            ++failures;
+            continue;
+        }
+        if (!PumpBoth(client, server,
+                      [&] {
+                          return client.state() == SessionState::kActive &&
+                                 server.state() == SessionState::kActive;
+                      },
+                      3000)) {
+            ++failures;
+            continue;
+        }
+        if (client.Send("reconnect") != SessionError::kNone) {
+            ++failures;
+        }
+        if (!PumpBoth(client, server, [&] { return !sink.messages.empty(); }, 3000)) {
+            ++failures;
+        }
+        client.Close();
+        if (!PumpBoth(client, server,
+                      [&] {
+                          return client.state() == SessionState::kClosed &&
+                                 server.state() == SessionState::kClosed;
+                      },
+                      3000)) {
+            ++failures;
+        }
+    }
+    BENTO_CHECK_EQ(failures, 0L);
+}
+
+/// 场景 24：真实 TCP 连接失败（127.0.0.1:1），失败后必须进入 Closed。
+void TestConnectRefusedPort1() {
+    SessionConfig config;
+    config.endpoint = "127.0.0.1:1";
+    config.pairing_key = "invite-key";
+    config.connect_timeout_ms = 1000;
+    Session session(config);
+    const SessionError error = session.Start();
+    // 少数环境会 DROP 到 1 端口的包；两种失败都接受，但绝不能成功。
+    BENTO_CHECK(error == SessionError::kConnectFailed || error == SessionError::kConnectTimeout);
+    BENTO_CHECK_EQ(session.state(), SessionState::kClosed);
+    BENTO_CHECK(!session.last_error_message().empty());
+}
+
+/// 场景 25：状态名、迁移矩阵与错误名目录。
+void TestStateAndErrorCatalog() {
+    const SessionState states[] = {SessionState::kIdle,    SessionState::kConnecting,
+                                   SessionState::kPaired,  SessionState::kActive,
+                                   SessionState::kClosing, SessionState::kClosed};
+    const char* const state_names[] = {"idle",   "connecting", "paired",
+                                       "active", "closing",    "closed"};
+    for (std::size_t index = 0; index < 6; ++index) {
+        BENTO_CHECK(std::string(SessionStateName(states[index])) == state_names[index]);
+    }
+    const bool allowed[6][6] = {
+        {false, true, false, false, false, true},
+        {false, false, true, false, true, true},
+        {false, false, false, true, true, true},
+        {false, false, false, false, true, true},
+        {false, false, false, false, false, true},
+        {false, false, false, false, false, false},
+    };
+    for (std::size_t from = 0; from < 6; ++from) {
+        for (std::size_t to = 0; to < 6; ++to) {
+            BENTO_CHECK_EQ(IsSessionTransitionAllowed(states[from], states[to]),
+                           allowed[from][to]);
+        }
+    }
+
+    const SessionError errors[] = {
+        SessionError::kNone,
+        SessionError::kInvalidState,
+        SessionError::kInvalidArgument,
+        SessionError::kInvalidEndpoint,
+        SessionError::kTransportUnavailable,
+        SessionError::kConnectTimeout,
+        SessionError::kConnectFailed,
+        SessionError::kPairingFailed,
+        SessionError::kPairingRejected,
+        SessionError::kPairingTimeout,
+        SessionError::kChannelFailed,
+        SessionError::kHeartbeatTimeout,
+        SessionError::kTransportClosed,
+        SessionError::kProtocolError,
+        SessionError::kWriteFailed,
+        SessionError::kQueueFull,
+        SessionError::kMessageTooLarge,
+        SessionError::kControlDenied,
+    };
+    std::set<std::string> error_names;
+    for (SessionError error : errors) {
+        const char* name = SessionErrorName(error);
+        BENTO_CHECK(name != nullptr && *name != '\0');
+        error_names.insert(name);
+    }
+    BENTO_CHECK_EQ(error_names.size(), std::size_t{18});
+}
+
 }  // namespace
 
 int main() {
@@ -1071,5 +1327,12 @@ int main() {
     TestControlGrantMode();
     TestQueueFullDropsInternalFrames();
     TestPartialWriteResumesRemainder();
+    TestClosingIgnoresInflightFrames();
+    TestPartialWritePairingRetransmit();
+    TestCloseWindowSkipsTimers();
+    TestSendQueueFull();
+    TestReconnectNewSession();
+    TestConnectRefusedPort1();
+    TestStateAndErrorCatalog();
     return bento_test::Finish("bento_session");
 }
