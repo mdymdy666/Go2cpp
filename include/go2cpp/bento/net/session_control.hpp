@@ -316,14 +316,18 @@ class SessionControl final {
         ControlMode mode = ControlMode::kNone;
     };
 
-    /// 持锁更新状态并追加一条变更事件（同时写入审计缓冲）；
-    /// `actor` 为发起者 peer_id（0 = 系统/管理端）。
-    void AppendChange(std::vector<ControlChange>* out, std::uint32_t peer_id, ControlMode from,
-                      ControlMode to, ControlChangeReason reason, std::uint32_t actor);
+    /// 持锁生成一条变更事件并写入审计缓冲；返回事件供锁外 Dispatch。
+    /// `timestamp_ms` 由调用方每次操作只取一次时钟，避免每条事件一次
+    /// `clock_gettime`（抢占路径一次操作会产生 2 条事件）。
+    [[nodiscard]] ControlChange AppendChange(std::uint32_t peer_id, ControlMode from,
+                                             ControlMode to, ControlChangeReason reason,
+                                             std::uint32_t actor,
+                                             std::uint64_t timestamp_ms);
     /// 移除参与者并回收其控制权（Leave / OnPeerDisconnected 共用）。
     bool RemoveParticipant(std::uint32_t peer_id, ControlChangeReason reason,
                            std::uint32_t actor);
-    void Dispatch(const std::vector<ControlChange>& changes);
+    /// 锁外按顺序派发事件；`count == 0` 时立即返回。
+    void Dispatch(const ControlChange* changes, std::size_t count);
 
     SessionControlConfig m_config;
     std::shared_ptr<const IControlPolicy> m_policy;
