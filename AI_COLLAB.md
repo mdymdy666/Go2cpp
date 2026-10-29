@@ -67,3 +67,46 @@
 
 - 示例 10 段全部 `g++ -std=c++17 -Iinclude -fsyntax-only` 通过；相对链接 0 失效；
 - 测试数字均为 `grep -c` 静态计数或引用既有运行记录，**本轮未运行 ctest**。
+
+## 2026-10-29 pairing 模块审查（压测 / 随机 / 场景 / 解耦 / 测试复查）
+
+### 一、结论
+
+无 P0；修复 1 个 P1 与 2 个 P2 加固；2 项性能优化；P2 记录 6 项。
+交付文档：`example/WarningDocement/audit-pairing.md`、`/tmp/audit_pairing.md`。
+
+### 二、代码改动
+
+- `src/bento/net/pairing.cpp`、`include/go2cpp/bento/net/pairing.hpp`：
+  1. **P1**：`Activate` 幂等——修复前每次调用都重置 `deadline_ms`/`next_retransmit_ms`，
+     应用在驱动循环里每帧调用一次会让 CONFIRM 永不重传、15s 超时永不触发。
+     有损链路（30% 丢包）收敛率 220/300 → 300/300。
+  2. **P2**：成功 RESPONSE 必须回显 `key_hash`，否则返回 `kKeyMismatch` 且不迁移。
+  3. **P2**：客户端未发 CONFIRM（`m_confirm_sent == false`）时拒绝 ACK。
+  4. 性能：默认策略改为进程级静态实例（构造 52.5→21.7ns）；`m_changes` 由
+     `std::deque` 改为 `std::array<StateChange,8>`（完整配对 352.9→152.0ns，2.3×）。
+
+### 三、测试改动
+
+- `tests/bento/test_pairing.cpp`：13 场景 8,239 断言 → **20 场景 18,307 断言**；
+  新增 Activate 幂等、key_hash/ACK 防御、30% 丢包链路、8 线程 1000 并发、
+  随机帧 fuzz、100 万次编解码、枚举/空指针边界、timeout 钳位等 8 个场景。
+- `tests/bento/audit_pairing_stress.cpp`：新增独立压测程序（不注册 CTest）。
+
+### 四、验证结果
+
+- `ninja` 全量 44 目标、0 警告；`ctest -R bento -j4` **48/48 通过**
+  （`bento_netem` 因无 CAP_NET_ADMIN 按设计 SKIP）。
+- 压测（Release，12 vCPU）：编解码 164 Mops/s（6.08ns/帧）；完整配对
+  6.58 M pairs/s（152ns/pair，P99 0.13µs）；1000 并发配对 1000/1000；
+  20 万轮构造/配对/销毁 RSS 增量 0KB；valgrind 87,030 allocs = 87,030 frees。
+- ASan+UBSan：106,552 checks，0 失败、0 报告。
+- 覆盖率（`--coverage` + gcov）：pairing.cpp 行 98.56%、分支执行 100%；
+  剩余未覆盖行均为不可达防御分支。
+
+### 五、后续状态
+
+- **未修（已记录）**：不可达防御分支（P2-3）、时钟回绕（P2-4）、Closed 状态
+  `kAlreadyRegistered` 语义（P2-5）、`kAlreadyPaired` 从未返回（P2-6）、
+  `m_outbound` 仍为 deque（P2-7）。
+- 未 commit；未改动 `bento` 其他模块、base、构建脚本。

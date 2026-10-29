@@ -15,17 +15,27 @@
  *          - 场景 10：参数/状态校验、Close/Reset、版本与畸形帧。
  *          - 场景 11：回调顺序与统计计数。
  *          - 场景 12：2000 步随机操作，状态迁移始终合法。
+ *          - 场景 13：Activate 幂等（重复调用不重置 15s 超时/1s 重传计时器）。
+ *          - 场景 14：成功 RESPONSE 必须回显 key_hash；未发 CONFIRM 拒绝 ACK。
+ *          - 场景 15：30% 丢包 + 10% 重复 + 乱序链路下的配对收敛。
+ *          - 场景 16：8 线程共 1000 个并发配对与 nonce 唯一性。
+ *          - 场景 17：2000 帧随机 fuzz（非法 version/status/key/nonce）。
+ *          - 场景 18：100 万次 32B 编解码往返与发送队列上限。
  * @author go2cpp contributors
  * @date 2026-10-28
  * @copyright MIT License
  */
 
 #include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "go2cpp/bento/net/pairing.hpp"
@@ -654,6 +664,416 @@ void TestRandomized() {
                 go2cpp::bento::PairingStateName(client.state()));
 }
 
+/// 场景 13：Activate 幂等——重复调用不得重置 15s 超时与 1s 重传计时器。
+/// 回归背景：修复前每次 Activate 都重设 deadline/next_retransmit，应用在
+/// 驱动循环里每帧调用一次就会让 CONFIRM 永不重传、超时永不触发。
+void TestActivateIdempotent() {
+    PairingSession server(Config(0, 4000, 500));
+    PairingSession client(Config(0x4242ULL, 4000, 500));
+    BENTO_CHECK(PairUntilPaired(server, client, 0));
+    BENTO_CHECK_EQ(client.Activate(0), PairingError::kNone);
+    auto confirm = Drain(client);
+    BENTO_CHECK_EQ(confirm.size(), 1U);
+    const std::uint64_t deadline = client.deadline_ms();
+    BENTO_CHECK_EQ(deadline, 4000U);
+
+    // 模拟驱动循环重复调用：计时器必须保持首次 Activate 的值。
+    for (int step = 0; step < 100; ++step) {
+        BENTO_CHECK_EQ(client.Activate(100 + static_cast<std::uint64_t>(step) * 10),
+                       PairingError::kNone);
+    }
+    BENTO_CHECK_EQ(client.deadline_ms(), deadline);
+    BENTO_CHECK_EQ(client.outbound_size(), 0U);  // 不重复排队 CONFIRM
+    BENTO_CHECK_EQ(client.stats().confirms, 1U);
+
+    BENTO_CHECK(!client.Tick(499));
+    BENTO_CHECK_EQ(client.outbound_size(), 0U);
+    BENTO_CHECK(!client.Tick(500));  // 仍按首次 Activate 的 500ms 节奏重传
+    BENTO_CHECK_EQ(client.outbound_size(), 1U);
+    BENTO_CHECK_EQ(client.stats().retransmits, 1U);
+    BENTO_CHECK(client.Tick(4000));  // 超时仍然生效
+    BENTO_CHECK_EQ(client.state(), PairingState::kClosed);
+    BENTO_CHECK_EQ(client.error(), PairingError::kPeerTimeout);
+}
+
+/// 场景 14：成功 RESPONSE 必须回显本端 key_hash；客户端未发 CONFIRM 前
+/// 收到 ACK 属于异常序列，必须拒绝而不是直接 Active。
+void TestResponseKeyHashGuard() {
+    PairingSession client(Config(0x7777ULL, 4000, 500));
+    BENTO_CHECK_EQ(client.Connect("k", 0), PairingError::kNone);
+    (void)Drain(client);
+
+    PairingFrame response;
+    response.type = PairingFrameType::kResponse;
+    response.key_hash = client.key_hash() ^ 1ULL;
+    response.nonce = client.nonce();
+    response.pair_id = 42;
+    response.status = PairingError::kNone;
+    BENTO_CHECK_EQ(client.HandleFrame(response, 10), PairingError::kKeyMismatch);
+    BENTO_CHECK_EQ(client.state(), PairingState::kPending);
+    BENTO_CHECK_EQ(client.pair_id(), 0U);
+
+    response.key_hash = client.key_hash();
+    BENTO_CHECK_EQ(client.HandleFrame(response, 10), PairingError::kNone);
+    BENTO_CHECK_EQ(client.state(), PairingState::kPaired);
+
+    PairingFrame ack;
+    ack.type = PairingFrameType::kConfirm;
+    ack.key_hash = client.key_hash();
+    ack.nonce = client.nonce();
+    ack.pair_id = client.pair_id();
+    BENTO_CHECK_EQ(client.HandleFrame(ack, 20), PairingError::kInvalidState);
+    BENTO_CHECK_EQ(client.state(), PairingState::kPaired);
+
+    BENTO_CHECK_EQ(client.Activate(30), PairingError::kNone);
+    (void)Drain(client);
+    BENTO_CHECK_EQ(client.HandleFrame(ack, 30), PairingError::kNone);
+    BENTO_CHECK_EQ(client.state(), PairingState::kActive);
+}
+
+/// 场景 15：30% 丢包 + 10% 重复 + 0..3 步乱序下，配对在 15s 内收敛。
+/// 该场景同时覆盖「应用每步都调用 Activate」这一真实驱动写法。
+void TestLossyLinkConvergence() {
+    struct InFlight {
+        int deliver_step;
+        bool to_server;
+        PairingFrame frame;
+    };
+    std::mt19937_64 rng(20261029);
+    constexpr int kTrials = 200;
+    int completed = 0;
+    for (int trial = 0; trial < kTrials; ++trial) {
+        PairingSession server(Config());
+        PairingSession client(Config());
+        std::vector<InFlight> pipe;
+        std::uint64_t now = 0;
+        bool done = false;
+        BENTO_CHECK_EQ(server.Register("k", 0), PairingError::kNone);
+        BENTO_CHECK_EQ(client.Connect("k", 0), PairingError::kNone);
+        for (int step = 0; step < 400; ++step) {
+            now += 50;
+            auto flush = [&](PairingSession& from, bool to_server) {
+                PairingFrame frame;
+                while (from.PopOutbound(&frame)) {
+                    if (rng() % 100 < 30) {
+                        continue;  // 丢包 30%
+                    }
+                    const int deliver = step + static_cast<int>(rng() % 4);
+                    pipe.push_back(InFlight{deliver, to_server, frame});
+                    if (rng() % 100 < 10) {
+                        pipe.push_back(InFlight{deliver, to_server, frame});  // 重复 10%
+                    }
+                }
+            };
+            flush(server, false);
+            flush(client, true);
+            for (std::size_t index = 0; index < pipe.size();) {
+                if (pipe[index].deliver_step <= step) {
+                    if (pipe[index].to_server) {
+                        (void)server.HandleFrame(pipe[index].frame, now);
+                    } else {
+                        (void)client.HandleFrame(pipe[index].frame, now);
+                    }
+                    pipe.erase(pipe.begin() + static_cast<std::ptrdiff_t>(index));
+                } else {
+                    ++index;
+                }
+            }
+            if (server.HasPendingConnect()) {
+                (void)server.Response(true, now);
+            }
+            if (client.state() == PairingState::kPaired) {
+                (void)client.Activate(now);  // 每步调用：验证 Activate 幂等
+            }
+            (void)server.Tick(now);
+            (void)client.Tick(now);
+            if (server.state() == PairingState::kActive &&
+                client.state() == PairingState::kActive) {
+                done = true;
+                break;
+            }
+        }
+        if (done) {
+            ++completed;
+        }
+        if (client.state() == PairingState::kActive) {
+            BENTO_CHECK_EQ(server.state(), PairingState::kActive);
+        }
+        if ((server.state() == PairingState::kPaired ||
+             server.state() == PairingState::kActive) &&
+            (client.state() == PairingState::kPaired ||
+             client.state() == PairingState::kActive)) {
+            BENTO_CHECK_EQ(server.pair_id(), client.pair_id());
+        }
+    }
+    BENTO_CHECK(completed * 100 >= kTrials * 98);  // 30% 丢包下 ≥98% 收敛
+    std::printf("[INFO] lossy link: %d/%d trials converged\n", completed, kTrials);
+}
+
+/// 场景 16：1000 个并发配对（8 线程 × 125），nonce 全局唯一。
+void TestThousandPairings() {
+    constexpr unsigned kThreads = 8;
+    constexpr std::size_t kPerThread = 125;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    std::vector<std::vector<std::uint64_t>> nonces(kThreads);
+    std::atomic<int> failures{0};
+    for (unsigned thread_index = 0; thread_index < kThreads; ++thread_index) {
+        threads.emplace_back([&, thread_index]() {
+            nonces[thread_index].reserve(kPerThread);
+            for (std::size_t index = 0; index < kPerThread; ++index) {
+                PairingSession server(Config());
+                PairingSession client(Config());
+                if (!PairUntilActive(server, client, 0)) {
+                    ++failures;
+                    continue;
+                }
+                nonces[thread_index].push_back(client.nonce());
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    BENTO_CHECK_EQ(failures.load(), 0);
+    std::unordered_set<std::uint64_t> unique;
+    for (const auto& bucket : nonces) {
+        for (const std::uint64_t nonce : bucket) {
+            BENTO_CHECK(nonce != 0);
+            unique.insert(nonce);
+        }
+    }
+    BENTO_CHECK_EQ(unique.size(), static_cast<std::size_t>(kThreads) * kPerThread);
+    std::printf("[INFO] concurrent pairings: %zu\n", unique.size());
+}
+
+/// 场景 17：2000 帧随机 fuzz，覆盖非法 version/status/key/nonce 与状态混合。
+void TestRandomFrameFuzz() {
+    std::mt19937_64 rng(0x5f5f5f5fULL);
+    PairingSession server(Config(0x1000ULL, 4000, 500));
+    PairingSession client(Config(0x2000ULL, 4000, 500));
+    for (int step = 0; step < 2000; ++step) {
+        if (rng() % 6 == 0) {
+            switch (rng() % 6) {
+                case 0:
+                    (void)server.Register("k", static_cast<std::uint64_t>(step));
+                    break;
+                case 1:
+                    (void)client.Connect("k", static_cast<std::uint64_t>(step));
+                    break;
+                case 2:
+                    if (server.HasPendingConnect()) {
+                        (void)server.Response((rng() % 2) == 0, static_cast<std::uint64_t>(step));
+                    }
+                    break;
+                case 3:
+                    (void)client.Activate(static_cast<std::uint64_t>(step));
+                    break;
+                case 4: {
+                    PairingFrame frame;
+                    while (client.PopOutbound(&frame)) {
+                        (void)server.HandleFrame(frame, static_cast<std::uint64_t>(step));
+                    }
+                    break;
+                }
+                default: {
+                    PairingFrame frame;
+                    while (server.PopOutbound(&frame)) {
+                        (void)client.HandleFrame(frame, static_cast<std::uint64_t>(step));
+                    }
+                    break;
+                }
+            }
+        }
+        PairingFrame frame;
+        frame.type = static_cast<PairingFrameType>(static_cast<std::uint8_t>(1 + rng() % 4));
+        frame.version = (rng() % 32 == 0) ? static_cast<std::uint8_t>(rng() % 4)
+                                          : static_cast<std::uint8_t>(1);
+        frame.status = (rng() % 4 == 0)
+                           ? PairingError::kNone
+                           : static_cast<PairingError>(static_cast<std::uint8_t>(rng() % 250));
+        frame.key_hash = (rng() % 3 == 0) ? rng() : server.key_hash();
+        frame.nonce = (rng() % 3 == 0) ? rng()
+                                       : (server.nonce() != 0 ? server.nonce() : client.nonce());
+        frame.pair_id = static_cast<std::uint32_t>(rng());
+        (void)server.HandleFrame(frame, static_cast<std::uint64_t>(step));
+        (void)client.HandleFrame(frame, static_cast<std::uint64_t>(step));
+        BENTO_CHECK(ValidState(server.state()));
+        BENTO_CHECK(ValidState(client.state()));
+        BENTO_CHECK(server.outbound_size() <= go2cpp::bento::kPairingMaxOutbound);
+        BENTO_CHECK(client.outbound_size() <= go2cpp::bento::kPairingMaxOutbound);
+        // 客户端只会在服务端回 ACK（服务端已 Active）之后 Active。
+        if (client.state() == PairingState::kActive) {
+            BENTO_CHECK_EQ(server.state(), PairingState::kActive);
+        }
+        PairingFrame drained;
+        while (server.PopOutbound(&drained)) {
+        }
+        while (client.PopOutbound(&drained)) {
+        }
+    }
+}
+
+/// 场景 18：100 万次 32B 编解码往返 + 发送队列上限。
+void TestCodecThroughputSanity() {
+    constexpr std::size_t kIterations = 1000000;
+    PairingFrame frame;
+    frame.type = PairingFrameType::kConnect;
+    frame.key_hash = 0x1122334455667788ULL;
+    frame.nonce = 0x99aabbccddeeff00ULL;
+    frame.pair_id = 0x12345678U;
+    std::uint8_t buffer[kPairingFrameBytes];
+    std::size_t matched = 0;
+    for (std::size_t index = 0; index < kIterations; ++index) {
+        frame.pair_id = static_cast<std::uint32_t>(index);
+        EncodePairingFrame(frame, buffer);
+        PairingFrame decoded;
+        if (DecodePairingFrame(buffer, sizeof(buffer), &decoded) &&
+            decoded.pair_id == frame.pair_id && decoded.key_hash == frame.key_hash &&
+            decoded.nonce == frame.nonce) {
+            ++matched;
+        }
+    }
+    BENTO_CHECK_EQ(matched, kIterations);
+
+    PairingSession client(Config(0x1ULL, 4000, 1));
+    BENTO_CHECK_EQ(client.Connect("k", 0), PairingError::kNone);
+    for (int step = 1; step <= 2000; ++step) {
+        (void)client.Tick(static_cast<std::uint64_t>(step));
+    }
+    BENTO_CHECK_EQ(client.outbound_size(), go2cpp::bento::kPairingMaxOutbound);
+    BENTO_CHECK(client.stats().queue_drops > 0);
+    PairingFrame out;
+    std::size_t popped = 0;
+    while (client.PopOutbound(&out)) {
+        ++popped;
+        BENTO_CHECK_EQ(out.type, PairingFrameType::kConnect);
+    }
+    BENTO_CHECK_EQ(popped, go2cpp::bento::kPairingMaxOutbound);
+}
+
+/// 场景 19：枚举名字/边界 API 全覆盖（日志与指标依赖稳定名字）。
+void TestNamesAndBoundaries() {
+    const PairingState states[] = {PairingState::kIdle, PairingState::kPending,
+                                   PairingState::kPaired, PairingState::kActive,
+                                   PairingState::kClosed};
+    for (const PairingState state : states) {
+        BENTO_CHECK(std::string(go2cpp::bento::PairingStateName(state)) != "unknown");
+    }
+    const PairingRole roles[] = {PairingRole::kNone, PairingRole::kServer, PairingRole::kClient};
+    for (const PairingRole role : roles) {
+        BENTO_CHECK(std::string(go2cpp::bento::PairingRoleName(role)) != "unknown");
+    }
+    const PairingError errors[] = {
+        PairingError::kNone,        PairingError::kKeyMismatch,
+        PairingError::kPeerTimeout, PairingError::kAlreadyRegistered,
+        PairingError::kNotRegistered, PairingError::kAlreadyPaired,
+        PairingError::kInvalidState, PairingError::kInvalidArgument,
+        PairingError::kProtocolVersion, PairingError::kMalformedFrame,
+        PairingError::kRejected,    PairingError::kClosed};
+    for (const PairingError error : errors) {
+        BENTO_CHECK(std::string(go2cpp::bento::PairingErrorName(error)) != "unknown");
+        BENTO_CHECK(go2cpp::bento::IsKnownPairingError(error));
+    }
+    const PairingFrameType types[] = {PairingFrameType::kRegister, PairingFrameType::kConnect,
+                                      PairingFrameType::kResponse, PairingFrameType::kConfirm};
+    for (const PairingFrameType type : types) {
+        BENTO_CHECK(std::string(go2cpp::bento::PairingFrameTypeName(type)) != "unknown");
+    }
+    BENTO_CHECK(!go2cpp::bento::IsKnownPairingError(static_cast<PairingError>(12)));
+    BENTO_CHECK(!go2cpp::bento::IsKnownPairingError(static_cast<PairingError>(255)));
+    BENTO_CHECK_EQ(std::string(go2cpp::bento::PairingStateName(static_cast<PairingState>(9))),
+                   std::string("unknown"));
+    BENTO_CHECK_EQ(std::string(go2cpp::bento::PairingRoleName(static_cast<PairingRole>(9))),
+                   std::string("unknown"));
+    BENTO_CHECK_EQ(std::string(go2cpp::bento::PairingErrorName(static_cast<PairingError>(200))),
+                   std::string("unknown"));
+    BENTO_CHECK_EQ(std::string(go2cpp::bento::PairingFrameTypeName(
+                       static_cast<PairingFrameType>(9))),
+                   std::string("unknown"));
+
+    // 空指针与非法长度必须安全返回，不写输出。
+    PairingSession idle(Config());
+    BENTO_CHECK(!idle.Close());                // Idle 关闭返回 false
+    BENTO_CHECK(!idle.Tick(0));                // Idle 不因 Tick 迁移
+    BENTO_CHECK(!idle.PopOutbound(nullptr));   // 空指针安全
+    EncodePairingFrame(PairingFrame{}, nullptr);  // 空输出缓冲安全
+    BENTO_CHECK(!DecodePairingFrame(nullptr, 32, nullptr));
+
+    // 允许尾部有多余字节；长度不足必须拒绝。
+    std::uint8_t wide[64] = {};
+    PairingFrame frame;
+    frame.type = PairingFrameType::kConnect;
+    EncodePairingFrame(frame, wide);
+    PairingFrame decoded;
+    BENTO_CHECK(DecodePairingFrame(wide, sizeof(wide), &decoded));
+    BENTO_CHECK_EQ(decoded.type, PairingFrameType::kConnect);
+    BENTO_CHECK(!DecodePairingFrame(wide, 0, &decoded));
+
+    // Reset 保留统计计数器。
+    PairingSession reused(Config());
+    BENTO_CHECK_EQ(reused.Register("k", 0), PairingError::kNone);
+    reused.Reset();
+    BENTO_CHECK_EQ(reused.stats().registers, 1U);
+    BENTO_CHECK_EQ(reused.state(), PairingState::kIdle);
+    BENTO_CHECK_EQ(reused.deadline_ms(), 0U);
+}
+
+/// 场景 20：边缘分支（timeout 钳位、Pending 收 ACK/CONFIRM、Active 收错配帧）。
+void TestEdgeBranches() {
+    // timeout_ms=0 钳到 1ms，保证 Tick 有明确截止时间。
+    PairingConfig zero_timeout;
+    zero_timeout.timeout_ms = 0;
+    zero_timeout.nonce = 0xabcdefULL;
+    PairingSession clamped(zero_timeout);
+    BENTO_CHECK_EQ(clamped.config().timeout_ms, 1U);
+    BENTO_CHECK_EQ(clamped.Connect("k", 100), PairingError::kNone);
+    BENTO_CHECK_EQ(clamped.deadline_ms(), 101U);
+    BENTO_CHECK(clamped.Tick(101));
+    BENTO_CHECK_EQ(clamped.state(), PairingState::kClosed);
+
+    // 客户端 Pending 收到 ACK（服务端不可能此时发）→ kInvalidState。
+    PairingSession client(Config(0x1234ULL, 4000, 500));
+    BENTO_CHECK_EQ(client.Connect("k", 0), PairingError::kNone);
+    (void)Drain(client);
+    PairingFrame ack;
+    ack.type = PairingFrameType::kConfirm;
+    ack.key_hash = client.key_hash();
+    ack.nonce = client.nonce();
+    ack.pair_id = 1;
+    BENTO_CHECK_EQ(client.HandleFrame(ack, 0), PairingError::kInvalidState);
+    BENTO_CHECK_EQ(client.state(), PairingState::kPending);
+
+    // 服务端 Pending 收到 CONFIRM → kInvalidState。
+    PairingSession server(Config());
+    BENTO_CHECK_EQ(server.Register("k", 0), PairingError::kNone);
+    BENTO_CHECK_EQ(server.HandleFrame(ack, 0), PairingError::kInvalidState);
+    BENTO_CHECK_EQ(server.state(), PairingState::kPending);
+
+    // 服务端 Active 后收到 nonce 不匹配的 CONFIRM → kKeyMismatch，状态不变。
+    PairingSession active_server(Config());
+    PairingSession active_client(Config(0x2233ULL));
+    BENTO_CHECK(PairUntilActive(active_server, active_client, 0));
+    PairingFrame bad_confirm;
+    bad_confirm.type = PairingFrameType::kConfirm;
+    bad_confirm.key_hash = active_server.key_hash();
+    bad_confirm.nonce = active_server.nonce() ^ 1ULL;
+    bad_confirm.pair_id = active_server.pair_id();
+    BENTO_CHECK_EQ(active_server.HandleFrame(bad_confirm, 0), PairingError::kKeyMismatch);
+    BENTO_CHECK_EQ(active_server.state(), PairingState::kActive);
+
+    // 客户端 Active 后收到重复 RESPONSE → 忽略且不入队。
+    PairingFrame response;
+    response.type = PairingFrameType::kResponse;
+    response.key_hash = active_client.key_hash();
+    response.nonce = active_client.nonce();
+    response.pair_id = active_client.pair_id();
+    response.status = PairingError::kNone;
+    BENTO_CHECK_EQ(active_client.HandleFrame(response, 0), PairingError::kNone);
+    BENTO_CHECK_EQ(active_client.outbound_size(), 0U);
+    BENTO_CHECK_EQ(active_client.state(), PairingState::kActive);
+}
+
 }  // namespace
 
 int main() {
@@ -670,5 +1090,13 @@ int main() {
     TestFrameCodec();
     TestStats();
     TestRandomized();
+    TestActivateIdempotent();
+    TestResponseKeyHashGuard();
+    TestLossyLinkConvergence();
+    TestThousandPairings();
+    TestRandomFrameFuzz();
+    TestCodecThroughputSanity();
+    TestNamesAndBoundaries();
+    TestEdgeBranches();
     return bento_test::Finish("test_pairing");
 }

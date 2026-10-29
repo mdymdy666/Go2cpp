@@ -68,6 +68,7 @@
  * @copyright MIT License
  */
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -258,6 +259,9 @@ class PairingSession final {
     ///          `retransmit_ms` 重发；收到服务端回发的 CONFIRM（ACK）
     ///          才迁移到 Active。这样两端都只在**收到对端确认**后成功
     ///          （RISK-013），不会出现一端 Active、另一端仍 Paired。
+    ///          重复调用是幂等的：只返回 kNone，不重新排队 CONFIRM，也不
+    ///          重置 15s 超时与 1s 重传计时器（否则驱动循环里每帧调用一次
+    ///          就会让重传与超时永久失效）。
     /// @return kNone 成功（已发送或已 Active）；kInvalidState（尚未 Paired
     ///         或本端是服务端）。
     PairingError Activate(std::uint64_t now_ms);
@@ -317,9 +321,14 @@ class PairingSession final {
         PairingError error = PairingError::kNone;
     };
 
+    /// 单次 API 调用内的状态迁移上限。状态机每步最多产生一条迁移，
+    /// 回调内禁止再次调用修改方法（见文件头线程/回调约束），8 是安全上界。
+    /// 用固定数组而不是 deque，避免每次状态迁移都做一次堆分配。
+    static constexpr std::size_t kMaxChanges = 8;
+
     /// 状态迁移（同状态只更新 error，不产生事件）。
     void Transition(PairingState next, PairingError error);
-    /// 把累计的变更事件派发给回调（先交换到局部，避免回调重入污染）。
+    /// 把累计的变更事件派发给回调（先拷贝到局部，避免回调重入污染）。
     void Dispatch();
     /// 入队一帧并统计；队列满时丢弃最旧帧。
     void Enqueue(const PairingFrame& frame);
@@ -335,7 +344,9 @@ class PairingSession final {
     PairingError HandleFrameImpl(const PairingFrame& frame, std::uint64_t now_ms);
 
     PairingConfig m_config;
-    std::shared_ptr<const PairingAuthPolicy> m_policy;
+    /// 实际使用的策略；默认指向进程级静态对象，注入时指向 m_config.policy
+    /// 持有的对象（生命周期与 m_config 一致），因此不需要额外的所有权字段。
+    const PairingAuthPolicy* m_policy = nullptr;
 
     PairingRole m_role = PairingRole::kNone;
     PairingState m_state = PairingState::kIdle;
@@ -353,7 +364,8 @@ class PairingSession final {
     std::uint64_t m_pending_nonce = 0;
 
     std::deque<PairingFrame> m_outbound;
-    std::deque<StateChange> m_changes;
+    std::array<StateChange, kMaxChanges> m_changes{};
+    std::size_t m_change_count = 0;
     PairingStats m_stats;
 };
 

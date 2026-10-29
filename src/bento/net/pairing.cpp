@@ -290,15 +290,23 @@ bool FixedKeyAuthPolicy::HashKey(const std::string& key, std::uint64_t* out) con
 // PairingSession
 // ---------------------------------------------------------------------------
 
+namespace {
+
+/// 进程级默认策略：无状态、线程安全初始化、不产生堆分配。
+const PairingAuthPolicy& DefaultPolicy() noexcept {
+    static const FixedKeyAuthPolicy policy;
+    return policy;
+}
+
+}  // namespace
+
 PairingSession::PairingSession(PairingConfig config) : m_config(std::move(config)) {
     if (m_config.timeout_ms == 0) {
         m_config.timeout_ms = 1;
     }
-    if (m_config.policy) {
-        m_policy = m_config.policy;
-    } else {
-        m_policy = std::make_shared<FixedKeyAuthPolicy>();
-    }
+    // 默认策略进程内共享：避免每个会话一次 make_shared（实测占构造成本
+    // 的 70% 以上）。注入策略的所有权留在 m_config.policy 里。
+    m_policy = m_config.policy ? m_config.policy.get() : &DefaultPolicy();
 }
 
 void PairingSession::Transition(PairingState next, PairingError error) {
@@ -308,26 +316,29 @@ void PairingSession::Transition(PairingState next, PairingError error) {
     if (next == m_state) {
         return;
     }
-    StateChange change;
-    change.from = m_state;
-    change.to = next;
-    change.error = error;
+    if (m_change_count < kMaxChanges) {
+        StateChange& change = m_changes[m_change_count];
+        change.from = m_state;
+        change.to = next;
+        change.error = error;
+        ++m_change_count;
+    }
     m_state = next;
-    m_changes.push_back(change);
 }
 
 void PairingSession::Dispatch() {
-    if (m_changes.empty()) {
+    if (m_change_count == 0) {
         return;
     }
-    std::deque<StateChange> changes;
-    changes.swap(m_changes);
+    const std::size_t count = m_change_count;
+    m_change_count = 0;
+    const std::array<StateChange, kMaxChanges> changes = m_changes;
     const auto callback = on_state_change;
     if (!callback) {
         return;
     }
-    for (const StateChange& change : changes) {
-        callback(change.from, change.to, change.error);
+    for (std::size_t index = 0; index < count; ++index) {
+        callback(changes[index].from, changes[index].to, changes[index].error);
     }
 }
 
@@ -436,11 +447,16 @@ PairingError PairingSession::Activate(std::uint64_t now_ms) {
     if (m_state != PairingState::kPaired) {
         return PairingError::kInvalidState;
     }
-    if (!m_confirm_sent) {
-        m_confirm_sent = true;
-        Enqueue(MakeConfirm(m_key_hash, m_nonce, m_pair_id));
-        ++m_stats.confirms;
+    // 幂等：重复 Activate 只返回成功，不再重置超时/重传计时器。
+    // 若每次调用都重置，应用在驱动循环里每帧调一次就会把 deadline 与
+    // next_retransmit 无限推后：CONFIRM 丢失后永不重传、15s 超时永不触发，
+    // 有损链路下客户端会永久卡在 Paired。
+    if (m_confirm_sent) {
+        return PairingError::kNone;
     }
+    m_confirm_sent = true;
+    Enqueue(MakeConfirm(m_key_hash, m_nonce, m_pair_id));
+    ++m_stats.confirms;
     m_deadline_ms = now_ms + m_config.timeout_ms;
     m_next_retransmit_ms = now_ms + m_config.retransmit_ms;
     return PairingError::kNone;
@@ -545,7 +561,7 @@ PairingError PairingSession::HandleResponse(const PairingFrame& frame, std::uint
     if (m_state == PairingState::kPaired) {
         // 重复响应：pair_id 相同则重放一次 CONFIRM（若已 Activate）。
         if (frame.status == PairingError::kNone && frame.pair_id == m_pair_id &&
-            m_confirm_sent) {
+            frame.key_hash == m_key_hash && m_confirm_sent) {
             Enqueue(MakeConfirm(m_key_hash, m_nonce, m_pair_id));
             ++m_stats.retransmits;
         }
@@ -559,6 +575,11 @@ PairingError PairingSession::HandleResponse(const PairingFrame& frame, std::uint
     if (frame.status == PairingError::kNone) {
         if (frame.pair_id == 0) {
             return PairingError::kMalformedFrame;
+        }
+        // 成功响应必须回显本端 key_hash：非本会话的响应（串话/伪造）不能
+        // 把客户端推进 Paired。失败响应不回显本端指纹，故只在此处校验。
+        if (frame.key_hash != m_key_hash) {
+            return PairingError::kKeyMismatch;
         }
         m_pair_id = frame.pair_id;
         m_outbound.clear();  // 丢弃尚未发出的重复 CONNECT
@@ -591,6 +612,11 @@ PairingError PairingSession::HandleConfirm(const PairingFrame& frame, std::uint6
             return PairingError::kNone;
         }
         if (m_state != PairingState::kPaired) {
+            return PairingError::kInvalidState;
+        }
+        // 未发出 CONFIRM 就收到 ACK 属于异常序列（服务端只有收到 CONFIRM
+        // 才会回 ACK），拒绝它可以避免伪造 ACK 绕过「双向确认」。
+        if (!m_confirm_sent) {
             return PairingError::kInvalidState;
         }
         if (frame.key_hash != m_key_hash || frame.nonce != m_nonce ||
@@ -701,7 +727,7 @@ void PairingSession::Reset() {
     m_confirm_sent = false;
     m_pending_nonce = 0;
     m_outbound.clear();
-    m_changes.clear();
+    m_change_count = 0;
 }
 
 }  // namespace go2cpp::bento
