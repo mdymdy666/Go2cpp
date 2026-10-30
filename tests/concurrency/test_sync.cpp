@@ -997,6 +997,65 @@ void TestHeldLockParkDetection() {
 }
 
 /**
+ * @brief P1 回归：LockFor 超时清理不得抹掉并发 TryLock 写入的 kLocked。
+ *
+ * @details 修复前 `LockImpl` 的超时/取消清理用非原子 `load` + `store`
+ *   改写状态字：读到「锁空闲」后，另一线程的 `TryLock` 可能已用 CAS 置位
+ *   `kLocked`，随后的 `store` 会用旧快照覆盖它，导致两个执行流同时持锁
+ *   （实测 3 秒 9–34 次 `unlock of unlocked mutex`、629–1683 次双持）。
+ *   修复后状态写入统一为 CAS 循环；本用例在 1 秒内同时压两条路径，断言
+ *   双方 `Unlock` 都不抛异常、helper 持锁窗口内主线程不得成功加锁。
+ */
+void TestMutexTimeoutCleanupRace() {
+    go2cpp::sync::Mutex mutex;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> holding{false};
+    std::atomic<long> helper_unlock_errors{0};
+    std::thread helper([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (!mutex.TryLock()) {
+                std::this_thread::yield();
+                continue;
+            }
+            holding.store(true, std::memory_order_seq_cst);
+            std::this_thread::sleep_for(50us);
+            holding.store(false, std::memory_order_seq_cst);
+            try {
+                mutex.Unlock();
+            } catch (const std::logic_error&) {
+                helper_unlock_errors.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+    std::mt19937 rng(20261030U);
+    long overlaps = 0;
+    long main_unlock_errors = 0;
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!mutex.LockFor(std::chrono::microseconds(1 + rng() % 100U))) {
+            continue;
+        }
+        // 主线程已持锁时 helper 不可能再拿到锁；仍看到持锁标记即双持。
+        if (holding.load(std::memory_order_seq_cst)) {
+            ++overlaps;
+        }
+        try {
+            mutex.Unlock();
+        } catch (const std::logic_error&) {
+            ++main_unlock_errors;
+        }
+    }
+    stop.store(true, std::memory_order_relaxed);
+    helper.join();
+    GO2CPP_CHECK(helper_unlock_errors.load(std::memory_order_relaxed) == 0);
+    GO2CPP_CHECK(overlaps == 0);
+    GO2CPP_CHECK(main_unlock_errors == 0);
+    // 所有线程退出后锁必须可再次获取（状态位无残留）。
+    GO2CPP_CHECK(mutex.TryLock());
+    mutex.Unlock();
+}
+
+/**
  * @brief 运行混合同步原语和关闭竞态测试。
  * @return 无；测试失败由统一断言统计。
  */
@@ -1015,6 +1074,7 @@ void run_sync_tests() {
     TestUnlockRacesContextCancellation();
     TestContextCallbackRacesSchedulerShutdown();
     TestHeldLockParkDetection();
+    TestMutexTimeoutCleanupRace();
 }
 
 #ifdef GO2CPP_SYNC_TEST_MAIN

@@ -19,11 +19,14 @@
  *
  * ## 踩过的坑（改动前必读）
  *
- * `Mutex` 的 futex 化重构失败过两次，原因分别是：
+ * `Mutex` 的 futex 化重构失败过两次，另有一次清理路径竞争（P1）：
  * 1. 没有先检查终态、把 `EAGAIN` 与 `ETIMEDOUT` 混为一谈、以及重新读取代际值
  *    三个问题叠加，导致 `io_hook` 里崩溃；
- * 2. 在 `WaitOnce` 外层多包了一层 `lock()`，违反"WaitOnce 负责重新加锁"的
- *    契约，抛 `EDEADLK`。
+ * 2. 在 `WaitOnce` 外层多包了一层 `lock()`，违反「WaitOnce 负责重新加锁」的
+ *    契约，抛 `EDEADLK`；
+ * 3. 超时/取消清理路径用 `load` + `store` 改写 `m_state`，覆盖了并发
+ *    `TryLock` 刚 CAS 写入的 `kLocked`，使两个执行流同时持锁（P1，
+ *    2026-10-30 修复为 CAS 循环；此后所有状态写入都必须走原子 RMW）。
  *
  * 因此这块的注释会特别强调**锁契约**，不要随意简化。
  */
@@ -1024,8 +1027,11 @@ std::shared_ptr<WaitBackend> CreateWaitBackend() noexcept {
  * 队列清空，或被交接者自身等待未超过阈值（说明积压已在阈值内消化）。
  *
  * **不变量**：`kWaiter` 与队列非空在 `m_mutex` 下同步维护；`kWoken` 被
- * 置位时，该等待者已从队列摘除且不在队列里。所有状态字的修改要么在
- * `m_mutex` 内，要么是只影响 `kLocked` 的 CAS（会保留其余提示位）。
+ * 置位时，该等待者已从队列摘除且不在队列里。**所有状态字的修改一律是
+ * 原子 RMW**：只影响 `kLocked` 的 CAS（保留其余提示位），或
+ * `UpdateStateAtomic` 的 CAS 循环（按最新状态重算要改的位）。禁止
+ * `load` + `store`——超时/取消清理曾因此抹掉并发 `TryLock` 写入的
+ * `kLocked`，令两个执行流同时持锁（P1，2026-10-30 修复）。
  *
  * ## 队列与唤醒
  *
@@ -1075,64 +1081,109 @@ struct Mutex::Impl {
      *
      * 必须在**不持** `m_mutex` 时调用；`Wake` 在锁外执行。
      */
+    /**
+     * @brief 以 CAS 循环对状态字做原子读-改-写（本文件唯一的状态写协议）。
+     *
+     * @details 禁止任何 `load` + `store` 写法：读取与写回之间，并发的
+     * `TryLock` / `Lock` 快路径可能已经用 CAS 改写了状态；用旧快照覆盖
+     * 会抹掉它们写入的位（P1 正是清理路径抹掉了 `kLocked`，导致互斥性
+     * 被破坏）。`updater` 每次都接收**最新**状态并重新计算目标值，因此
+     * 只会按自己的意图修改位，不会覆盖并发方的修改。
+     *
+     * @param updater 接收当前状态、返回期望状态的可调用对象。
+     */
+    template <typename Updater>
+    static void UpdateStateAtomic(std::atomic<std::uint8_t>& state,
+                                  Updater&& updater) {
+        std::uint8_t current = state.load(std::memory_order_acquire);
+        while (!state.compare_exchange_weak(
+            current, static_cast<std::uint8_t>(updater(current)),
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+            // compare_exchange_weak 失败时已把最新值写回 current，
+            // 下一轮用新值重算，保证不会用陈旧快照覆盖并发写。
+        }
+    }
+
+    /**
+     * @brief 唤醒令牌持有者退出（取消 / context done）时把令牌转交出去。
+     *
+     * 令牌持有者已从队列摘除；它既不获取锁也不重新入队时，必须：
+     * - 清 `kWoken`，否则后续 `Unlock` 会一直认为「唤醒已在路上」而不再唤醒；
+     * - 若此刻锁空闲且仍有等待者，补一次唤醒（正常模式）或直接交接
+     *   （饥饿模式），否则等待者会永久睡在已经空闲的锁上。
+     *
+     * 必须在**不持** `m_mutex` 时调用；`Wake` 在锁外执行。
+     *
+     * @note 状态写入走 `UpdateStateAtomic`。此处对「锁是否空闲」的观察只
+     *       用于决定要不要补交接；最终写入必须基于 CAS 时的最新状态，
+     *       因为 `TryLock` 不持 `m_mutex`，可能在这段窗口里刚拿到锁。
+     */
     void DropWakeToken() noexcept {
         std::shared_ptr<WaitNode> selected;
         try {
             std::lock_guard<std::mutex> lock(m_mutex);
-            std::uint8_t state = m_state.load(std::memory_order_acquire);
-            state = static_cast<std::uint8_t>(state & ~kWoken);
+            const std::uint8_t observed =
+                m_state.load(std::memory_order_acquire);
+            const bool starved = (observed & kStarving) != 0U;
             ReorderWaitersForSelector(m_waiters);
-            const bool starved = (state & kStarving) != 0U;
-            if (m_waiters.empty()) {
-                state = static_cast<std::uint8_t>(state & ~kWaiter);
-                // 没有排队者，也没有可交接对象：空闲时把状态清干净
-                // （含遗留的 kStarving）。
-                if ((state & kLocked) == 0U) {
-                    state = 0U;
-                }
-                m_state.store(state, std::memory_order_release);
-                return;
-            }
-            if ((state & kLocked) != 0U) {
-                // 锁在别人手里：它释放时会看到 kWoken 已清而唤醒下一个。
-                m_state.store(state, std::memory_order_release);
-                return;
-            }
             // 锁空闲 + 仍有等待者：令牌持有者退出了，必须由这里补交接。
-            while (!m_waiters.empty()) {
-                std::shared_ptr<WaitNode> candidate =
-                    std::move(m_waiters.front());
-                m_waiters.pop_front();
-                if (candidate && !candidate->managed()) {
-                    m_native_waiters.fetch_sub(1U,
-                                               std::memory_order_release);
-                }
-                const bool claimed =
-                    starved ? candidate && candidate->TryFinishAndGrant()
-                            : candidate &&
-                                  candidate->TryFinish(WaitResult::kNotified);
-                if (claimed) {
-                    selected = std::move(candidate);
-                    break;
+            // observed 只决定「要不要尝试」，真正的写入在下面的 CAS 循环里
+            // 以最新状态为准。
+            const bool handover =
+                !m_waiters.empty() && (observed & kLocked) == 0U;
+            if (handover) {
+                while (!m_waiters.empty()) {
+                    std::shared_ptr<WaitNode> candidate =
+                        std::move(m_waiters.front());
+                    m_waiters.pop_front();
+                    if (candidate && !candidate->managed()) {
+                        m_native_waiters.fetch_sub(1U,
+                                                   std::memory_order_release);
+                    }
+                    const bool claimed =
+                        starved ? candidate && candidate->TryFinishAndGrant()
+                                : candidate &&
+                                      candidate->TryFinish(WaitResult::kNotified);
+                    if (claimed) {
+                        selected = std::move(candidate);
+                        break;
+                    }
                 }
             }
-            if (selected) {
-                if (starved) {
-                    state = static_cast<std::uint8_t>(state | kLocked | kWaiter);
-                } else {
-                    state = static_cast<std::uint8_t>(state | kWoken | kWaiter);
+            const bool waiters_left = !m_waiters.empty();
+            UpdateStateAtomic(m_state, [&](std::uint8_t state) {
+                if (selected) {
+                    // 交接成功：正常模式置唤醒令牌，饥饿模式保持所有权位。
+                    // 无论 TryLock 此刻是否已把 kLocked 置位都必须保留它。
+                    const std::uint8_t base =
+                        static_cast<std::uint8_t>(state & ~kWoken);
+                    const std::uint8_t owned =
+                        starved ? static_cast<std::uint8_t>(base | kLocked)
+                                : static_cast<std::uint8_t>(base | kWoken);
+                    std::uint8_t result = owned;
+                    if (waiters_left) {
+                        result = static_cast<std::uint8_t>(result | kWaiter);
+                    } else {
+                        result = static_cast<std::uint8_t>(result & ~kWaiter);
+                    }
+                    return result;
                 }
-                if (m_waiters.empty()) {
-                    state = static_cast<std::uint8_t>(state & ~kWaiter);
+                std::uint8_t desired =
+                    static_cast<std::uint8_t>(state & ~kWoken);
+                if (!waiters_left) {
+                    // 没有排队者：清提示位；空闲时把状态彻底清干净
+                    // （含遗留的 kStarving），但绝不能清掉并发拿到的 kLocked。
+                    desired = static_cast<std::uint8_t>(desired & ~kWaiter);
+                    if ((desired & kLocked) == 0U) {
+                        desired = 0U;
+                    }
                 }
-                m_state.store(state, std::memory_order_release);
-            } else {
-                m_state.store(0U, std::memory_order_release);
-            }
+                return desired;
+            });
         } catch (...) {
             // 极端情况下（系统级 mutex 失败）至少别把令牌永久留在状态里。
             m_state.fetch_and(static_cast<std::uint8_t>(~kWoken),
-                              std::memory_order_release);
+                              std::memory_order_acq_rel);
         }
         if (selected) {
             selected->Wake();
@@ -1464,12 +1515,14 @@ bool Mutex::LockImpl(const ContextPtr& context,
                         }
                         if (m_impl->m_waiters.empty()) {
                             // 没有排队者就不该继续声称饥饿/有等待者。
-                            std::uint8_t state = m_impl->m_state.load(
-                                std::memory_order_acquire);
-                            state = static_cast<std::uint8_t>(
-                                state & ~(Impl::kWaiter | Impl::kStarving));
-                            m_impl->m_state.store(
-                                state, std::memory_order_release);
+                            // 只清提示位：kLocked 可能正被并发 TryLock 写入，
+                            // 必须用 CAS 基于最新状态修改（P1 修复）。
+                            Impl::UpdateStateAtomic(
+                                m_impl->m_state, [](std::uint8_t state) {
+                                    return static_cast<std::uint8_t>(
+                                        state & ~(Impl::kWaiter |
+                                                  Impl::kStarving));
+                                });
                         }
                         abort_before_enqueue = true;
                     }
@@ -1556,16 +1609,20 @@ bool Mutex::LockImpl(const ContextPtr& context,
                 }
             }
             if (m_impl->m_waiters.empty()) {
-                std::uint8_t state =
-                    m_impl->m_state.load(std::memory_order_acquire);
-                state = static_cast<std::uint8_t>(state & ~Impl::kWaiter);
-                // 锁空闲且没有唤醒令牌：清掉遗留的饥饿标记（饥饿模式的
-                // 退出条件就是「队列清空且没有在途交接」）。
-                if ((state & Impl::kLocked) == 0U &&
-                    (state & Impl::kWoken) == 0U) {
-                    state = 0U;
-                }
-                m_impl->m_state.store(state, std::memory_order_release);
+                // 清理方观察到的「锁空闲」可能已被并发 TryLock 改写，
+                // 因此必须在 CAS 循环里按最新状态重算（P1 修复）。
+                Impl::UpdateStateAtomic(
+                    m_impl->m_state, [](std::uint8_t state) {
+                        std::uint8_t desired = static_cast<std::uint8_t>(
+                            state & ~Impl::kWaiter);
+                        // 锁空闲且没有唤醒令牌：清掉遗留的饥饿标记（饥饿
+                        // 模式的退出条件就是「队列清空且没有在途交接」）。
+                        if ((desired & Impl::kLocked) == 0U &&
+                            (desired & Impl::kWoken) == 0U) {
+                            desired = 0U;
+                        }
+                        return desired;
+                    });
             }
         }
         ReleaseWaitNode(std::move(owned_waiter));
@@ -1674,7 +1731,9 @@ void Mutex::Unlock() {
 
     // step3: 慢路径——队列操作在 m_mutex 内与等待者入队线性化。
     std::shared_ptr<WaitNode> selected;
+#if GO2CPP_DEBUG_RESOURCES
     std::uint32_t waiters_after = 0;
+#endif
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
         std::uint8_t state = m_impl->m_state.load(std::memory_order_acquire);
@@ -1702,26 +1761,48 @@ void Mutex::Unlock() {
                 }
             }
             if (selected) {
-                state = static_cast<std::uint8_t>(state & ~Impl::kWoken);
-                if (m_impl->m_waiters.empty()) {
-                    state = static_cast<std::uint8_t>(state & ~Impl::kWaiter);
-                } else {
-                    state = static_cast<std::uint8_t>(state | Impl::kWaiter);
-                }
-                m_impl->m_state.store(state, std::memory_order_release);
+                // 所有权已经交接：保持 kLocked、清掉令牌，并按队列是否
+                // 为空维护 kWaiter。写入走 CAS（并发 TryLock 不持 m_mutex）。
+                Impl::UpdateStateAtomic(
+                    m_impl->m_state,
+                    [waiters_empty = m_impl->m_waiters.empty()](
+                        std::uint8_t state) {
+                        std::uint8_t desired = static_cast<std::uint8_t>(
+                            state & ~Impl::kWoken);
+                        if (waiters_empty) {
+                            desired = static_cast<std::uint8_t>(
+                                desired & ~Impl::kWaiter);
+                        } else {
+                            desired = static_cast<std::uint8_t>(
+                                desired | Impl::kWaiter);
+                        }
+                        return desired;
+                    });
             } else {
                 // 队列已空：饥饿模式结束，真正释放锁并回到正常模式。
-                m_impl->m_state.store(0U, std::memory_order_release);
+                Impl::UpdateStateAtomic(
+                    m_impl->m_state, [](std::uint8_t state) {
+                        return static_cast<std::uint8_t>(
+                            state & ~(Impl::kLocked | Impl::kWoken |
+                                      Impl::kWaiter | Impl::kStarving));
+                    });
             }
         } else if ((state & Impl::kWoken) != 0U) {
             // 正常模式下已有唤醒令牌在途：只释放锁，不再唤醒第二个，
             // 避免「每个 Unlock 一次 futex wake」的唤醒风暴。令牌持有
             // 者会获取锁或重新入队，并在那时消费令牌。
-            state = static_cast<std::uint8_t>(state & ~Impl::kLocked);
-            if (m_impl->m_waiters.empty()) {
-                state = static_cast<std::uint8_t>(state & ~Impl::kWaiter);
-            }
-            m_impl->m_state.store(state, std::memory_order_release);
+            Impl::UpdateStateAtomic(
+                m_impl->m_state,
+                [waiters_empty = m_impl->m_waiters.empty()](
+                    std::uint8_t state) {
+                    std::uint8_t desired = static_cast<std::uint8_t>(
+                        state & ~Impl::kLocked);
+                    if (waiters_empty) {
+                        desired = static_cast<std::uint8_t>(
+                            desired & ~Impl::kWaiter);
+                    }
+                    return desired;
+                });
         } else {
             // 正常模式：先摘除一个等待者并置唤醒令牌，再把锁真正释放。
             while (!m_impl->m_waiters.empty()) {
@@ -1738,19 +1819,36 @@ void Mutex::Unlock() {
                 }
             }
             if (selected) {
-                state = static_cast<std::uint8_t>(
-                    (state & ~Impl::kLocked) | Impl::kWoken);
-                if (m_impl->m_waiters.empty()) {
-                    state = static_cast<std::uint8_t>(state & ~Impl::kWaiter);
-                } else {
-                    state = static_cast<std::uint8_t>(state | Impl::kWaiter);
-                }
-                m_impl->m_state.store(state, std::memory_order_release);
+                // 正常模式交接：清 kLocked 并置唤醒令牌；新来者仍可插队，
+                // 被唤醒者回到 LockImpl 顶部重新竞争。
+                Impl::UpdateStateAtomic(
+                    m_impl->m_state,
+                    [waiters_empty = m_impl->m_waiters.empty()](
+                        std::uint8_t state) {
+                        std::uint8_t desired = static_cast<std::uint8_t>(
+                            (state & ~Impl::kLocked) | Impl::kWoken);
+                        if (waiters_empty) {
+                            desired = static_cast<std::uint8_t>(
+                                desired & ~Impl::kWaiter);
+                        } else {
+                            desired = static_cast<std::uint8_t>(
+                                desired | Impl::kWaiter);
+                        }
+                        return desired;
+                    });
             } else {
-                m_impl->m_state.store(0U, std::memory_order_release);
+                // 没有可交接的等待者：正常释放锁并清掉提示位。
+                Impl::UpdateStateAtomic(
+                    m_impl->m_state, [](std::uint8_t state) {
+                        return static_cast<std::uint8_t>(
+                            state & ~(Impl::kLocked | Impl::kWoken |
+                                      Impl::kWaiter | Impl::kStarving));
+                    });
             }
         }
+#if GO2CPP_DEBUG_RESOURCES
         waiters_after = static_cast<std::uint32_t>(m_impl->m_waiters.size());
+#endif
     }
     // step4: 锁外唤醒（与 LockImpl 的 park 路径配对；持队列锁唤醒会死锁）。
     if (selected) {
@@ -2109,7 +2207,9 @@ WaitGroup::~WaitGroup() {
 
 void WaitGroup::Add(std::int64_t delta) {
     std::deque<std::shared_ptr<WaitNode>> released;
+#if GO2CPP_DEBUG_RESOURCES
     std::int64_t debug_count = 0;
+#endif
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
         if (delta < 0 &&
@@ -2123,7 +2223,9 @@ void WaitGroup::Add(std::int64_t delta) {
             throw std::logic_error("go2cpp::sync::WaitGroup counter overflow");
         }
         m_impl->m_count += delta;
+#if GO2CPP_DEBUG_RESOURCES
         debug_count = m_impl->m_count;
+#endif
         if (m_impl->m_count == 0) {
             for (const auto& waiter : m_impl->m_waiters) {
                 if (waiter) {
