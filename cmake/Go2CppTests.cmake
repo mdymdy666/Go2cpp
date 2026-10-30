@@ -1089,6 +1089,23 @@ endif()
     add_test(NAME go2cpp_bufio_stress COMMAND go2cpp_bufio_stress)
     set_tests_properties(go2cpp_bufio_stress PROPERTIES TIMEOUT 300)
 
+    # ---- bufio 批量 flush：策略/段/部分写/并发/TCP 真实写入 ----
+    add_executable(go2cpp_bufio_batch_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/bufio/test_bufio_batch.cpp)
+    target_link_libraries(go2cpp_bufio_batch_test PRIVATE go2cpp_bufio)
+    target_include_directories(go2cpp_bufio_batch_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_bufio_batch_test PRIVATE -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_bufio_batch_test COMMAND go2cpp_bufio_batch_test)
+    set_tests_properties(go2cpp_bufio_batch_test PROPERTIES TIMEOUT 180)
+
+    # 基准不是正确性用例（耗时长、数据受机器负载影响），只构建不注册 ctest；
+    # 手动运行：./go2cpp_bufio_batch_bench，结果写 /tmp/bufio_batch_bench.md。
+    add_executable(go2cpp_bufio_batch_bench
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/bufio/bench_bufio_batch.cpp)
+    target_link_libraries(go2cpp_bufio_batch_bench PRIVATE go2cpp_bufio)
+    target_compile_options(go2cpp_bufio_batch_bench PRIVATE -O2 -Wall -Wextra -Wpedantic)
+
 if (GO2CPP_BUILD_EXAMPLES)
     # 示例按模块目录维护；目标名取文件名以保持旧版构建接口稳定.
     set(GO2CPP_EXAMPLES
