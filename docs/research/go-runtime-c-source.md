@@ -1,10 +1,14 @@
 # Go runtime 底层 C/汇编源码挖掘报告
 
+> **源码位置（持久保留）**：`E:\CodexWorkspace\GoSrc\{go10,go11,go13,go14}`
+> （go1.0.3 / 1.1 / 1.3 / 1.4 完整源码，含 `src/pkg/runtime/chan.c`、`chan.goc`、`chan.h`）
+> 原 /tmp 副本已迁移到此目录。
+
 > 目的：给 Go2cpp 的 `Channel` / `FastChannel` / Fiber 切换 / Scheduler 找**可以照抄的原件**，不自己造轮子。
 > 所有代码摘自本机克隆的真实源码，标注 `文件:行号`，可直接对照。
 >
 > 挖掘时间：2026-10-30。本机 `/usr/local/go` 只有 Go 1.27.1；历史源码从 gitee 镜像
-> `https://gitee.com/mirrors/go.git` 浅克隆到 `/tmp/go10`、`/tmp/go11`、`/tmp/go13`、`/tmp/go14`（克隆保留，可复查）。
+> `https://gitee.com/mirrors/go.git` 浅克隆到 `E:\CodexWorkspace\GoSrc\go10`、`E:\CodexWorkspace\GoSrc\go11`、`E:\CodexWorkspace\GoSrc\go13`、`E:\CodexWorkspace\GoSrc\go14`（克隆保留，可复查）。
 
 ---
 
@@ -38,27 +42,27 @@
 
 | 版本 | 克隆路径 | chan 实现文件 | `Hchan` 定义位置 | 语言 |
 |---|---|---|---|---|
-| go1.0.3 | `/tmp/go10` | `src/pkg/runtime/chan.c` | `chan.c:32` | 纯 C |
-| go1.1 | `/tmp/go11` | `src/pkg/runtime/chan.c` | `chan.c:38` | 纯 C |
-| go1.3 | `/tmp/go13` | `src/pkg/runtime/chan.goc` | `chan.h:29` | `.goc`（C 方言） |
-| go1.4 | `/tmp/go14` | `src/runtime/chan.go`（Go 重写） | `chan.h:17`（C 结构） | Go + C 结构 |
+| go1.0.3 | `E:\CodexWorkspace\GoSrc\go10` | `src/pkg/runtime/chan.c` | `chan.c:32` | 纯 C |
+| go1.1 | `E:\CodexWorkspace\GoSrc\go11` | `src/pkg/runtime/chan.c` | `chan.c:38` | 纯 C |
+| go1.3 | `E:\CodexWorkspace\GoSrc\go13` | `src/pkg/runtime/chan.goc` | `chan.h:29` | `.goc`（C 方言） |
+| go1.4 | `E:\CodexWorkspace\GoSrc\go14` | `src/runtime/chan.go`（Go 重写） | `chan.h:17`（C 结构） | Go + C 结构 |
 | go1.27.1 | `/usr/local/go` | `src/runtime/chan.go` | `chan.go:34`（Go 结构） | Go |
 
 ### 1.2 版本演进的关键事实（逐条可验证）
 
 - **go1.1 的 `chan.c` 是纯 C**：`void runtime·chansend(ChanType *t, Hchan *c, byte *ep, bool *pres, void *pc)`
-  （`/tmp/go11/src/pkg/runtime/chan.c:160`）。`pres != nil` 表示非阻塞，这是 1.3 改成 `bool block` 的前身。
+  （`E:\CodexWorkspace\GoSrc\go11/src/pkg/runtime/chan.c:160`）。`pres != nil` 表示非阻塞，这是 1.3 改成 `bool block` 的前身。
 - **go1.2 起引入 `.goc`**：`chan.goc` 里 `func chansend1(t *ChanType, c *Hchan, elem *byte) { ... }`
-  （`/tmp/go13/src/pkg/runtime/chan.goc:346`）——函数声明是 Go 语法，函数体是 C；
+  （`E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.goc:346`）——函数声明是 Go 语法，函数体是 C；
   `#pragma textflag NOSPLIT` 之类指令可直接写。
 - **go1.4 的 `chan.go` 是"Go 写的 C"**：它 include 了 `chan.h` 的 C 结构（Go 侧以 `hchan`、`sudog` 小写引用），
-  `makechan` 里 `c.buf = (*uint8)(add(unsafe.Pointer(c), hchanSize))`（`/tmp/go14/src/runtime/chan.go:42`）
+  `makechan` 里 `c.buf = (*uint8)(add(unsafe.Pointer(c), hchanSize))`（`E:\CodexWorkspace\GoSrc\go14/src/runtime/chan.go:42`）
   与 C 版 `chanbuf` 宏完全对应。
 - **`goc.c` 查无此文件**：
   ```
-  /tmp/go11/src/pkg/runtime/goc.c  → 不存在
-  /tmp/go13/src/pkg/runtime/goc.c  → 不存在
-  /tmp/go14/src/runtime/goc.c      → 不存在
+  E:\CodexWorkspace\GoSrc\go11/src/pkg/runtime/goc.c  → 不存在
+  E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/goc.c  → 不存在
+  E:\CodexWorkspace\GoSrc\go14/src/runtime/goc.c      → 不存在
   ```
   调度核心（`newproc`/`schedule`/`execute`/`park`/`ready`）全在 `proc.c`。
 
@@ -84,7 +88,7 @@
 
 ### 2.1 `Hchan`：三代对比
 
-**go1.1（纯 C，`/tmp/go11/src/pkg/runtime/chan.c:38-51`）**：
+**go1.1（纯 C，`E:\CodexWorkspace\GoSrc\go11/src/pkg/runtime/chan.c:38-51`）**：
 
 ```c
 struct	Hchan
@@ -109,7 +113,7 @@ struct	Hchan
   `c->elemalg->copy(c->elemsize, dst, src)`（`chan.c:212`）。这就是 C++ 里 `memcpy` / placement-new 的位置。
 - buffer **紧跟 `Hchan` 之后**（`(c)+1`），一次 `mallocgc(sizeof(*c) + hint*elem->size)` 分配完。
 
-**go1.3（`/tmp/go13/src/pkg/runtime/chan.h:29-46`）**：
+**go1.3（`E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.h:29-46`）**：
 
 ```c
 // The garbage collector is assuming that Hchan can only contain pointers into the stack
@@ -133,7 +137,7 @@ struct	Hchan
 #define chanbuf(c, i) ((byte*)((c)+1)+(uintptr)(c)->elemsize*(i))
 ```
 
-**go1.4（`/tmp/go14/src/runtime/chan.h:17-30`，Go 版直接操作它）**：
+**go1.4（`E:\CodexWorkspace\GoSrc\go14/src/runtime/chan.h:17-30`，Go 版直接操作它）**：
 
 ```c
 struct	Hchan
@@ -191,7 +195,7 @@ type hchan struct {
 
 ### 2.2 `SudoG`（等待节点，FastChannel 的 `SendNode`/`RecvNode` 原型）
 
-**go1.1（`/tmp/go11/src/pkg/runtime/chan.c:21-28`）**：
+**go1.1（`E:\CodexWorkspace\GoSrc\go11/src/pkg/runtime/chan.c:21-28`）**：
 
 ```c
 struct	SudoG
@@ -204,7 +208,7 @@ struct	SudoG
 };
 ```
 
-**go1.3（`/tmp/go13/src/pkg/runtime/chan.h:12-19`）**：
+**go1.3（`E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.h:12-19`）**：
 
 ```c
 struct	SudoG
@@ -217,7 +221,7 @@ struct	SudoG
 };
 ```
 
-**go1.4（`/tmp/go14/src/runtime/runtime.h:228` 起）**：加了 `next`/`prev`（双向链表）、`waitlink`
+**go1.4（`E:\CodexWorkspace\GoSrc\go14/src/runtime/runtime.h:228` 起）**：加了 `next`/`prev`（双向链表）、`waitlink`
 （挂到 `g.waiting`）、`isSelect`、`success` 字段；不再是纯单链表。
 
 **go1.27.1（`/usr/local/go/src/runtime/runtime2.go:404-450`）**：
@@ -260,7 +264,7 @@ struct	WaitQ
 
 ### 2.4 `Gobuf`（协程上下文，Fiber 切换的寄存器集合）
 
-**go1.3（`/tmp/go13/src/pkg/runtime/runtime.h:211-220`）**：
+**go1.3（`E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/runtime.h:211-220`）**：
 
 ```c
 struct	Gobuf
@@ -309,7 +313,7 @@ struct	M {
 `m->waitunlockf` + `m->waitlock` 是 `runtime·park()` 的机制：**在 g0 栈上执行 unlock 回调**，
 这样"解锁 + 睡眠"是原子的（不会出现解锁后被抢占、别人抢先的窗口）。
 
-### 2.6 `SemaRoot` / `SemaWaiter`（`/tmp/go13/src/pkg/runtime/sema.goc:25-44`）
+### 2.6 `SemaRoot` / `SemaWaiter`（`E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/sema.goc:25-44`）
 
 ```c
 struct SemaWaiter
@@ -1098,7 +1102,7 @@ runtime·semrelease(uint32 volatile *addr)
 
 ## 8. 可以直接抄的代码片段（带来源）
 
-### 8.1 抄 `chan.h` 的字段表 → FastChannel（来源：`/tmp/go13/src/pkg/runtime/chan.h:29-42` + `/tmp/go14/src/runtime/chan.h:17-30`；对应现状 `include/go2cpp/concurrency/fast_channel.hpp:517-531`）
+### 8.1 抄 `chan.h` 的字段表 → FastChannel（来源：`E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.h:29-42` + `E:\CodexWorkspace\GoSrc\go14/src/runtime/chan.h:17-30`；对应现状 `include/go2cpp/concurrency/fast_channel.hpp:517-531`）
 
 ```cpp
 template <typename T, std::size_t Cap>
@@ -1285,23 +1289,23 @@ FastChannel 把 `m_lock` 放最前并 `alignas(64)` 独立 cacheline（`fast_cha
 
 ```bash
 # 1. 拉取历史源码（gitee 镜像，本机已验证可用；WSL 内 github 解析为 ::1）
-git clone --depth 1 --single-branch --branch go1.3 https://gitee.com/mirrors/go.git /tmp/go13
-git clone --depth 1 --single-branch --branch go1.4 https://gitee.com/mirrors/go.git /tmp/go14
-git clone --depth 1 --single-branch --branch go1.1 https://gitee.com/mirrors/go.git /tmp/go11
+git clone --depth 1 --single-branch --branch go1.3 https://gitee.com/mirrors/go.git E:\CodexWorkspace\GoSrc\go13
+git clone --depth 1 --single-branch --branch go1.4 https://gitee.com/mirrors/go.git E:\CodexWorkspace\GoSrc\go14
+git clone --depth 1 --single-branch --branch go1.1 https://gitee.com/mirrors/go.git E:\CodexWorkspace\GoSrc\go11
 
 # 2. 确认 goc.c 不存在、chan 实现在哪
-ls /tmp/go13/src/pkg/runtime/ | grep -E 'chan|goc|sema'
+ls E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/ | grep -E 'chan|goc|sema'
 
 # 3. 看 C 结构
-sed -n '29,46p' /tmp/go13/src/pkg/runtime/chan.h      # Hchan
-sed -n '12,19p' /tmp/go13/src/pkg/runtime/chan.h      # SudoG
+sed -n '29,46p' E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.h      # Hchan
+sed -n '12,19p' E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.h      # SudoG
 
 # 4. 看 C 版 send/recv
-sed -n '74,201p'  /tmp/go13/src/pkg/runtime/chan.goc
-sed -n '204,343p' /tmp/go13/src/pkg/runtime/chan.goc
+sed -n '74,201p'  E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.goc
+sed -n '204,343p' E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.goc
 
 # 5. 看汇编
-sed -n '123,185p' /tmp/go13/src/pkg/runtime/asm_amd64.s
+sed -n '123,185p' E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/asm_amd64.s
 
 # 6. 现役版对照
 sed -n '34,55p'   /usr/local/go/src/runtime/chan.go     # hchan
@@ -1324,27 +1328,27 @@ sed -n '402,419p' /usr/local/go/src/runtime/asm_amd64.s # gogo
 
 | 内容 | 文件:行 |
 |---|---|
-| Hchan（1.1 纯 C） | `/tmp/go11/src/pkg/runtime/chan.c:38-51` |
-| Hchan（1.3） | `/tmp/go13/src/pkg/runtime/chan.h:29-46` |
-| Hchan（1.4） | `/tmp/go14/src/runtime/chan.h:17-30` |
+| Hchan（1.1 纯 C） | `E:\CodexWorkspace\GoSrc\go11/src/pkg/runtime/chan.c:38-51` |
+| Hchan（1.3） | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.h:29-46` |
+| Hchan（1.4） | `E:\CodexWorkspace\GoSrc\go14/src/runtime/chan.h:17-30` |
 | hchan（1.27） | `/usr/local/go/src/runtime/chan.go:34-55` |
-| SudoG（1.1） | `/tmp/go11/src/pkg/runtime/chan.c:21-28` |
-| SudoG（1.3） | `/tmp/go13/src/pkg/runtime/chan.h:12-19` |
+| SudoG（1.1） | `E:\CodexWorkspace\GoSrc\go11/src/pkg/runtime/chan.c:21-28` |
+| SudoG（1.3） | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.h:12-19` |
 | sudog（1.27） | `/usr/local/go/src/runtime/runtime2.go:404-450` |
-| Gobuf（1.3） | `/tmp/go13/src/pkg/runtime/runtime.h:211-220` |
-| G（1.3） | `/tmp/go13/src/pkg/runtime/runtime.h:251-290` |
-| M（1.3） | `/tmp/go13/src/pkg/runtime/runtime.h:292-349` |
-| SemaRoot/SemaWaiter | `/tmp/go13/src/pkg/runtime/sema.goc:25-44` |
-| chansend | `/tmp/go13/src/pkg/runtime/chan.goc:74-201` |
-| chanrecv | `/tmp/go13/src/pkg/runtime/chan.goc:204-343` |
-| closechan | `/tmp/go13/src/pkg/runtime/chan.goc:1035-1082` |
-| dequeue/enqueue | `/tmp/go13/src/pkg/runtime/chan.goc:1098-1146` |
-| semacquire/semrelease | `/tmp/go13/src/pkg/runtime/sema.goc:104-185` |
-| park/parkunlock/park0 | `/tmp/go13/src/pkg/runtime/proc.c:1362-1411` |
-| ready | `/tmp/go13/src/pkg/runtime/proc.c:374-389` |
-| schedule | `/tmp/go13/src/pkg/runtime/proc.c:1311-1357` |
-| execute | `/tmp/go13/src/pkg/runtime/proc.c:1128-1150` |
-| gosave/gogo/mcall | `/tmp/go13/src/pkg/runtime/asm_amd64.s:123-185` |
+| Gobuf（1.3） | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/runtime.h:211-220` |
+| G（1.3） | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/runtime.h:251-290` |
+| M（1.3） | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/runtime.h:292-349` |
+| SemaRoot/SemaWaiter | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/sema.goc:25-44` |
+| chansend | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.goc:74-201` |
+| chanrecv | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.goc:204-343` |
+| closechan | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.goc:1035-1082` |
+| dequeue/enqueue | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/chan.goc:1098-1146` |
+| semacquire/semrelease | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/sema.goc:104-185` |
+| park/parkunlock/park0 | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/proc.c:1362-1411` |
+| ready | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/proc.c:374-389` |
+| schedule | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/proc.c:1311-1357` |
+| execute | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/proc.c:1128-1150` |
+| gosave/gogo/mcall | `E:\CodexWorkspace\GoSrc\go13/src/pkg/runtime/asm_amd64.s:123-185` |
 | gogo（1.27） | `/usr/local/go/src/runtime/asm_amd64.s:402-419` |
 | hchan 不变量注释 | `/usr/local/go/src/runtime/chan.go:9-18` |
 | FastChannel 现状 | `include/go2cpp/concurrency/fast_channel.hpp:246-532` |
