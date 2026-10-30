@@ -4,13 +4,14 @@
 覆盖：
 1. 实际执行 `ctest -N` 取 Total Tests 与全部用例名；
 2. 实际启动 mcp_server 调 `tools/list` 取工具数；
-3. README.md 中「N 个 ctest」「Total Tests: N」「N/N passed」「N 个工具」
-   「应输出 N」必须等于实际值；
-4. docs/testing.md 中「ctest 总数 **N**」「N 个 ctest」「N/N passed」必须
+3. 从构建目录 CMakeCache.txt 推导 profile（bento/mcp/osmon/runtime/enhanced），
+   docs/testing.md 的「构建配置与 ctest 数量」表必须登记该 profile，且数字
    等于实际值；
-5. docs/testing.md 的测试地图表格必须逐个列出全部 ctest 名（集合相等），
-   新增测试时忘记改文档会在这里失败；
-6. 工具清单（22 内置 + 3 检索 + 4 监控 = 29）与 tools/list 实际数量一致。
+4. 每个 profile 的「测试地图」必须逐个列出该配置全部 ctest 名（集合相等），
+   标题项数与表格行数必须等于登记总数，新增测试时忘记改文档会在这里失败；
+5. README.md / docs/testing.md 的「N 个 ctest」「Total Tests: N」「N/N passed」
+   数字必须落在已登记的总数集合内；
+6. 工具清单（22 内置 + 3 检索 + 4 监控 + 4 Socket = 33）与 tools/list 实际数量一致。
 
 用法: test_docs_consistency.py <mcp_server> <source_dir> <build_dir>
 """
@@ -109,6 +110,73 @@ def values(pattern, text):
     return result
 
 
+PROFILE_OPTIONS = [
+    ("bento", "GO2CPP_WITH_BENTO"),
+    ("mcp", "GO2CPP_WITH_MCP"),
+    ("osmon", "GO2CPP_BUILD_OS_MONITOR_TESTS"),
+    ("runtime", "GO2CPP_BUILD_TESTS"),
+    ("enhanced", "GO2CPP_BUILD_ENHANCED"),
+]
+
+
+def build_profile(build_dir):
+    '''从 CMakeCache.txt 推导构建 profile（如 ``bento+mcp``）。
+
+    返回 None 表示读不到缓存，调用方按未知配置宽松处理。
+    '''
+    cache_path = os.path.join(build_dir, "CMakeCache.txt")
+    flags = {}
+    try:
+        with open(cache_path, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if "=" not in line or line.lstrip().startswith("//"):
+                    continue
+                key, _, value = line.partition("=")
+                flags[key.strip()] = value.strip().upper()
+    except OSError:
+        return None
+    tags = [tag for tag, option in PROFILE_OPTIONS
+            if flags.get(option + ":BOOL") == "ON"]
+    return "+".join(tags) if tags else "minimal"
+
+
+def profile_table(text):
+    '''解析「构建配置与 ctest 数量」表，返回 {profile: ctest 总数}。'''
+    totals = {}
+    for match in re.finditer(
+            r"\|\s*`([a-z][a-z+_]*)`\s*\|[^|\n]*\|\s*\**(\d+)\**\s*\|",
+            text):
+        totals[match.group(1)] = int(match.group(2))
+    return totals
+
+
+def profile_maps(text):
+    '''解析按 profile 分区的测试地图，返回 {profile: (声明项数, 正文)}。'''
+    maps = {}
+    for match in re.finditer(
+            r"##\s*测试地图（profile\s*`([^`]+)`\s*[，,]\s*(\d+)\s*项）\s*\n(.*?)"
+            r"(?=\n##\s|\Z)",
+            text, re.S):
+        maps[match.group(1)] = (int(match.group(2)), match.group(3))
+    return maps
+
+
+def check_profile_consistency(totals, maps):
+    '''跨 profile 自洽：每个登记项都有地图，项数与表格行数都等于登记总数。'''
+    for name, total in sorted(totals.items()):
+        check(name in maps, f"docs/testing.md 缺少 profile {name} 的测试地图")
+        if name not in maps:
+            continue
+        declared, map_text = maps[name]
+        map_names = set(re.findall(r"\|\s*\d+\s*\|\s*`([^`]+)`\s*\|", map_text))
+        check(declared == total,
+              f"docs/testing.md profile {name} 地图标题项数应等于表中总数",
+              f"{declared} vs {total}")
+        check(len(map_names) == declared,
+              f"docs/testing.md profile {name} 地图行数应等于声明项数",
+              f"{len(map_names)} vs {declared}")
+
+
 def check_all_equal(label, found, expected, path):
     check(bool(found), f"{label}: {path} 中应至少出现一次声明")
     for value in found:
@@ -167,50 +235,66 @@ def main():
     print(f"[docs_consistency] 实际: ctest={actual_total}，工具={actual_tools}",
           flush=True)
 
-    # 3) README 的 ctest 数字。
-    check_all_equal("README ctest 总数", values(r"全部\s+(\d+)\s+个\s+ctest|Total Tests:\s*(\d+)|(\d+)\s+个\s+ctest", readme),
-                    actual_total, "README.md")
-    check_all_equal("README Total Tests",
-                    values(r"Total Tests:\s*(\d+)", readme), actual_total,
-                    "README.md")
-    passed = re.findall(r"(\d+)\s*/\s*(\d+)\s+passed", readme)
-    check(any(int(d) == actual_total and int(t) == actual_total
-              for d, t in passed),
-          f"README.md 应声明当前 {actual_total}/{actual_total} passed（历史基线不拦截）")
+    # 3) 构建 profile 与文档登记的 ctest 总数。
+    profile = build_profile(BUILD_DIR)
+    totals = profile_table(testing)
+    maps = profile_maps(testing)
+    known_totals = set(totals.values()) | {actual_total}
+    print(f"[docs_consistency] 构建 profile={profile}，文档登记="
+          + ", ".join(f"{name}:{value}" for name, value in sorted(totals.items())),
+          flush=True)
 
-    # 4) docs/testing.md 的 ctest 数字。
-    docs_total = values(r"ctest 总数[^\d]{0,12}(\d+)", testing)
-    check_all_equal("docs ctest 总数", docs_total, actual_total, "docs/testing.md")
-    check_all_equal("docs N 个 ctest",
-                    values(r"(\d+)\s+个\s+ctest", testing), actual_total,
-                    "docs/testing.md")
-    docs_passed = re.findall(r"(\d+)\s*/\s*(\d+)\s+passed", testing)
-    check(any(int(d) == actual_total and int(t) == actual_total
-              for d, t in docs_passed),
-          f"docs/testing.md 应声明当前 {actual_total}/{actual_total} passed（历史基线不拦截）")
+    check(bool(totals), "docs/testing.md 应有「构建配置与 ctest 数量」表")
+    check_profile_consistency(totals, maps)
 
-    # 5) docs 测试地图必须逐个列出实际 ctest 名。
-    # 只在「测试地图」章节内解析，避免把覆盖矩阵里的数字表格误当成用例表。
-    map_section = re.search(r"##\s*(?:4\.\s*)?测试地图.*?(?=\n##\s+)", testing,
-                            re.S)
-    map_text = map_section.group(0) if map_section else testing
-    map_names = set(re.findall(r"\|\s*\d+\s*\|\s*`([^`]+)`\s*\|", map_text))
-    check(bool(map_names), "docs/testing.md 应有测试地图表格")
-    missing = sorted(actual_names - map_names)
-    extra = sorted(map_names - actual_names)
-    check(not missing, "docs 测试地图缺少 ctest", ", ".join(missing))
-    if extra:
-        print(f"WARN: docs 测试地图含历史行（不计入失败）: ", ", ".join(extra))
-    check(actual_names.issubset(map_names),
-          "docs 测试地图应与 ctest -N 完全一致",
-          f"表格 {len(map_names)} 项 vs 实际 {len(actual_names)} 项")
+    if profile is None:
+        print("WARN: 读不到 CMakeCache.txt，无法推导构建 profile；跳过绑定校验")
+    elif profile not in totals:
+        print(f"WARN: docs/testing.md 未登记 profile {profile}，跳过总数/地图绑定校验；"
+              "请在「构建配置与 ctest 数量」表与测试地图中登记")
+    else:
+        check(totals[profile] == actual_total,
+              f"docs/testing.md 中 profile {profile} 的 ctest 总数应为 {actual_total}",
+              str(totals[profile]))
+        check(profile in maps, f"docs/testing.md 应有 profile {profile} 的测试地图")
+        if profile in maps:
+            map_text = maps[profile][1]
+            map_names = set(re.findall(r"\|\s*\d+\s*\|\s*`([^`]+)`\s*\|", map_text))
+            missing = sorted(actual_names - map_names)
+            extra = sorted(map_names - actual_names)
+            check(not missing, "docs 测试地图缺少 ctest", ", ".join(missing))
+            if extra:
+                print("WARN: docs 测试地图含其他配置用例（不计入失败）: "
+                      + ", ".join(extra[:10])
+                      + (" ..." if len(extra) > 10 else ""))
 
-    # 6) 工具数：README 的「29 个工具 / 应输出 29」与实际一致。
+    # 4) 文档中的 ctest 数字必须落在已登记的总数集合内。
+    for label, nums, path in (
+            ("README ctest 总数",
+             values(r"全部\s+(\d+)\s+个\s+ctest|Total Tests:\s*(\d+)|(\d+)\s+个\s+ctest",
+                    readme), "README.md"),
+            ("docs ctest 总数",
+             values(r"ctest 总数[^\d]{0,12}(\d+)|Total Tests:\s*(\d+)|(\d+)\s+个\s+ctest",
+                    testing), "docs/testing.md")):
+        check(bool(nums), f"{label}: {path} 中应至少出现一次声明")
+        for value in nums:
+            check(value in known_totals,
+                  f"{label}: {path} 出现未登记的 ctest 总数 {value}",
+                  f"已登记: {sorted(known_totals)}")
+
+    # 5) N/N passed 中的 N 必须是已登记的 ctest 总数。
+    for path, text in (("README.md", readme), ("docs/testing.md", testing)):
+        passed = re.findall(r"(\d+)\s*/\s*(\d+)\s+passed", text)
+        check(any(int(done) == int(total) and int(done) in known_totals
+                  for done, total in passed),
+              f"{path} 应声明 N/N passed（N 为已登记的 ctest 总数）")
+
+    # 6) 工具数：README 的「N 个工具」与 tools/list 实际数量一致。
     check_all_equal("README 工具总数",
                     values(r"(\d+)\s*个工具", readme), actual_tools,
                     "README.md")
     # 「应输出 N」为可选声明（旧 README 格式），不再强制。
-    # 22 内置 + 3 检索 + 4 监控 = 29 的分解也要自洽。
+    # 22 内置 + 3 检索 + 4 监控 + 4 Socket = 33 的分解也要自洽。
     breakdown = re.search(
         r"(\d+)\s*内置\s*\+\s*(\d+)\s*检索\s*\+\s*(\d+)\s*监控"
         r"(?:\s*\+\s*(\d+)\s*Socket)?\s*=\s*(\d+)",

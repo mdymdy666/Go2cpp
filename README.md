@@ -211,14 +211,17 @@ cmake --build /UserData/build/go2cpp-mcp-integrated -j
 
 ## 测试
 
-MCP 集成构建（`-DGO2CPP_WITH_MCP=ON`）实测 **Total Tests: 32**（12 os/monitor + 2 bufio + 18 MCP 框架），全部通过；root 用例在无权限时记为 SKIP。
+ctest 数量随构建配置变化，**以 `ctest -N` 为准**（逐条清单见 [testing.md](docs/testing.md)「测试地图」）：
+
+| 构建配置 | profile | ctest 总数 |
+| --- | --- | --- |
+| Bento + MCP（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`，`.build-bento-wsl`） | `bento+mcp` | **81**（58 bento + 2 bufio + 21 MCP 框架） |
+| MCP 集成（`-DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_OS_MONITOR_TESTS=ON`） | `mcp+osmon` | **35**（12 os/monitor + 2 bufio + 21 MCP 框架） |
+
+Bento + MCP 构建实测 **Total Tests: 81**、**81/81 passed**；MCP 集成构建实测 **35/35 passed**（root 用例无权限时记 SKIP）。
 
 ```sh
-ctest --test-dir /UserData/build/go2cpp-mcp-integrated --output-on-failure
+ctest --test-dir .build-bento-wsl --output-on-failure
 ```
 
-MCP 集成构建实测 **全部 32 个 ctest** 通过（**32/32 passed**；12 os/monitor + 2 bufio + 18 MCP 框架，root 用例无权限时 SKIP）。
-
-MCP 内置工具共 **29 个**（22 内置 + 3 检索 + 4 监控）。
-
-MCP 内置工具共 29 个工具（22 内置 + 3 检索 + 4 监控 = 29 个工具）。
+MCP 内置工具共 **33 个**（22 内置 + 3 检索 + 4 监控 + 4 Socket = 33 个工具）。

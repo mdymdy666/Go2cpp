@@ -7,9 +7,10 @@
 > 反映演进过程，引用时请按当前结构核对；确需表示当前有效路径的段落已就地修正
 > 或加注。
 
-> **2026-10-21 20:00 现状索引**：当前工作树（`Go2Cpp-work`，HEAD `18dd4df`）的
-> ctest 总数 **32**（共 32 个 ctest）（MCP 集成构建：12 os/monitor + 2 bufio + 18 MCP；历史默认构建 130 / 增强构建 62 见文末历史节）、
-> 五能力增强矩阵 **183**（PASS 182 / SKIP 1 / FAIL 0）、4 条场景（含 channel 互等死锁），
+> **2026-10-30 现状索引**：ctest 数量随构建配置变化，**以 `ctest -N` 为准**（逐条清单见文末「测试地图」）。
+> 当前实测 ctest 总数 **81**（共 81 个 ctest；profile `bento+mcp` = 58 bento + 2 bufio + 21 MCP 框架），
+> profile `mcp+osmon` 为 **35**（12 os/monitor + 2 bufio + 21 MCP 框架）；历史默认构建 130 条 / 增强构建 62 条
+> 见文末历史节。五能力增强矩阵 **183**（PASS 182 / SKIP 1 / FAIL 0）、4 条场景（含 channel 互等死锁），
 > 以及 `default`/`enhanced` 两套构建矩阵、一键入口和 CI 说明，统一记录在文末
 > 「现状与 CI（2026-10-21）」一节；逐条清单与完整 `ctest -N` 输出见
 > [`docs/test-audit-2026-10-21.md`](test-audit-2026-10-21.md) 第 9 节。历史章节保持原样。
@@ -832,9 +833,110 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 
 完整缺口、复现命令与固化建议见 [`docs/test-audit-2026-10-21.md`](test-audit-2026-10-21.md)。
 
-## 测试地图（MCP 集成构建，2026-10-26）
+## 构建配置与 ctest 数量（2026-10-30 实测）
 
-**32/32 passed**。
+| profile | 构建开关 | ctest 总数 |
+| --- | --- | --- |
+| `bento+mcp` | `GO2CPP_WITH_BENTO=ON`、`GO2CPP_WITH_MCP=ON` | **81** |
+| `mcp+osmon` | `GO2CPP_WITH_MCP=ON`、`GO2CPP_BUILD_OS_MONITOR_TESTS=ON` | **35** |
+
+> profile 由 CMake 选项自动推导，按固定顺序用 `+` 连接：`bento`（`GO2CPP_WITH_BENTO`）、
+> `mcp`（`GO2CPP_WITH_MCP`）、`osmon`（`GO2CPP_BUILD_OS_MONITOR_TESTS`）、
+> `runtime`（`GO2CPP_BUILD_TESTS`）、`enhanced`（`GO2CPP_BUILD_ENHANCED`）。
+> 新增构建组合时在此登记；`mcp/tests/test_docs_consistency.py` 会按当前构建的 profile
+> 校验上表数字与该 profile 的测试地图逐项一致。
+
+## 测试地图（profile `bento+mcp`，81 项）
+
+对应 `.build-bento-wsl`（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`），实测 **81/81 passed**。构成：58 个 `bento_*` + 2 个 bufio + 21 个 MCP 框架用例；root/权限相关用例无权限时记 SKIP。
+
+| # | 用例 |
+|---|---|
+| 1 | `go2cpp_bufio_test` |
+| 2 | `go2cpp_bufio_stress` |
+| 3 | `bento_socks5` |
+| 4 | `bento_error` |
+| 5 | `bento_reflect` |
+| 6 | `bento_keystore` |
+| 7 | `bento_http_server` |
+| 8 | `bento_ws_server` |
+| 9 | `bento_omni_server` |
+| 10 | `bento_command` |
+| 11 | `bento_file_transfer` |
+| 12 | `bento_zip` |
+| 13 | `bento_backup` |
+| 14 | `bento_upload` |
+| 15 | `bento_fetch` |
+| 16 | `bento_file_browser` |
+| 17 | `bento_link_loopback` |
+| 18 | `bento_unreliable_dropstale` |
+| 19 | `bento_video_fragment` |
+| 20 | `bento_rtt_pto` |
+| 21 | `bento_fast_retransmit` |
+| 22 | `bento_stream_fragment` |
+| 23 | `bento_crypto` |
+| 24 | `bento_secure_link` |
+| 25 | `bento_secure_injection` |
+| 26 | `bento_congestion` |
+| 27 | `bento_flow_control` |
+| 28 | `bento_bandwidth` |
+| 29 | `bento_stats_json` |
+| 30 | `bento_ipv6` |
+| 31 | `bento_concurrent_send` |
+| 32 | `bento_conn_migration` |
+| 33 | `bento_fec` |
+| 34 | `bento_pmtud` |
+| 35 | `bento_zero_rtt` |
+| 36 | `bento_peer_hub` |
+| 37 | `bento_tcp_proxy` |
+| 38 | `bento_session_control` |
+| 39 | `bento_peer_hub_secure` |
+| 40 | `bento_default_encryption` |
+| 41 | `bento_log_hook` |
+| 42 | `bento_link_server` |
+| 43 | `bento_mqtt` |
+| 44 | `bento_token_pairing` |
+| 45 | `bento_frame` |
+| 46 | `bento_coap` |
+| 47 | `bento_heartbeat` |
+| 48 | `bento_backoff` |
+| 49 | `bento_pairing` |
+| 50 | `bento_session_table` |
+| 51 | `bento_transport` |
+| 52 | `bento_relay` |
+| 53 | `bento_capability` |
+| 54 | `bento_session` |
+| 55 | `bento_udp_transport` |
+| 56 | `bento_x25519` |
+| 57 | `bento_x25519_handshake` |
+| 58 | `bento_weaknet_proxy` |
+| 59 | `bento_netem` |
+| 60 | `bento_channel_thread_stress` |
+| 61 | `json_rpc` |
+| 62 | `registry` |
+| 63 | `tools` |
+| 64 | `vector` |
+| 65 | `validation` |
+| 66 | `retrieval` |
+| 67 | `process` |
+| 68 | `robot_control` |
+| 69 | `plugin_notify` |
+| 70 | `monitor_client` |
+| 71 | `monitor_tools` |
+| 72 | `socket_tools` |
+| 73 | `socket_whitelist` |
+| 74 | `monitor_boundaries` |
+| 75 | `monitor_capacity` |
+| 76 | `monitor_concurrent_tools` |
+| 77 | `monitor_args_fuzz` |
+| 78 | `monitor_e2e` |
+| 79 | `monitor_http_faults` |
+| 80 | `socket_e2e` |
+| 81 | `docs_consistency` |
+
+## 测试地图（profile `mcp+osmon`，35 项）
+
+对应 MCP 集成构建（`-DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_OS_MONITOR_TESTS=ON`，`GO2CPP_BUILD_TESTS=OFF`），实测 **35/35 passed**。构成：12 个 os/monitor + 2 个 bufio + 21 个 MCP 框架用例。
 
 | # | 用例 |
 |---|---|
@@ -863,10 +965,13 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 | 23 | `plugin_notify` |
 | 24 | `monitor_client` |
 | 25 | `monitor_tools` |
-| 26 | `monitor_boundaries` |
-| 27 | `monitor_capacity` |
-| 28 | `monitor_concurrent_tools` |
-| 29 | `monitor_args_fuzz` |
-| 30 | `monitor_e2e` |
-| 31 | `monitor_http_faults` |
-| 32 | `docs_consistency` |
+| 26 | `socket_tools` |
+| 27 | `socket_whitelist` |
+| 28 | `monitor_boundaries` |
+| 29 | `monitor_capacity` |
+| 30 | `monitor_concurrent_tools` |
+| 31 | `monitor_args_fuzz` |
+| 32 | `monitor_e2e` |
+| 33 | `monitor_http_faults` |
+| 34 | `socket_e2e` |
+| 35 | `docs_consistency` |

@@ -107,7 +107,7 @@
 
 | 文档 | 一句话说明 | 状态 |
 | --- | --- | --- |
-| [testing.md](testing.md) | 测试矩阵、构建目录、CTest 超时/看门狗与 CI 入口 | 待更新（跨多次重构，含 130 等旧计数） |
+| [testing.md](testing.md) | 测试矩阵、构建目录、CTest 超时/看门狗与 CI 入口 | 现行（ctest 数按构建 profile 登记：`bento+mcp` 81 / `mcp+osmon` 35；历史节仍含 130 等旧计数） |
 | [test-audit-2026-10-21.md](test-audit-2026-10-21.md) | 全量测试审计：0–8 节为早间快照，第 9 节为 `ctest -N` 清单 | 历史 |
 | [performance.md](performance.md) | 2026-10-21 性能数据汇总（并发原语/内存/切换/IO） | 现行 |
 | [performance-baseline-2026-10-19.md](performance-baseline-2026-10-19.md) | **当前唯一有效性能基线**：公平对比方法、三轮优化根因与前后数据 | 现行 |
@@ -224,10 +224,10 @@
 - `gmp-optimization-log.md`、`gmp-perf-analysis.md`、`gmp-use-cases.md`、`gmp-vs-thread-epoll-2026-10-18.md`、
   `coost-comparison.md`：旧 epoll 池模型不公平，作者已自标结论作废。
 - `test-audit-2026-10-21.md` 0–8 节、`NEXT-STEPS.md`、`AGENT-HANDOFF.md`、`annotation-progress.md`、
-  `function-annotation-progress.md`、`so-reload-progress.md`：写死 113/114/115/130/135 等 ctest 计数，
-  当前构建为 14（见下）。
+  `function-annotation-progress.md`、`so-reload-progress.md`：写死 113/114/115/130/135 等 ctest 计数；
+  当前构建的准确数字见 [testing.md](testing.md)「构建配置与 ctest 数量」表（`bento+mcp` 81 / `mcp+osmon` 35）。
 - `modules.md`：原写“13 个模块 target”，本次已修正为 24（含 `math/rand/path/container/compress/encoding/hash/metrics/debug`）；第 1 节表格仍只列 7 个目录。
-- `testing.md`：路径约定与 130/183 等数字跨多次重构，引用前必须按当前树核对。
+- `testing.md`：路径约定与 130/183 等历史数字跨多次重构，引用前必须按当前树核对；当前 ctest 总数已按构建 profile 校准（见其「测试地图」）。
 - `code-review-guide.md`：基线 `bd99603`，行号已漂移，且文件未跟踪。
 - `trace_format.md`：设计未落地，源码无 trace 实现。
 
