@@ -1067,3 +1067,6 @@ kConnecting ──► kOpen ──► kDraining ──► kClosed
 | IOManager/Fiber/epoll 能力 | `include/go2cpp/network/io.hpp:210-348` |
 
 **一句话收尾**：OmniNetServer 的价值不在"支持多少协议"，而在把**连接生命周期、协议识别、并发驱动、背压与关闭**这五件所有服务端都要做错一遍的事，收敛成一套可测试的契约；协议只是这套契约上的可替换插件。
+
+
+> **勘误（2026-10-30 18:35）**：本文基线取自 E:\CodexWorkspace\Go2Cpp 旧副本（HEAD 603c51c，Bento 早期四件套），**与 WSL 工作树最新代码不符**——WSL 已有 22 个 Bento 模块（transport/tcp_transport/memory_transport/frame/heartbeat/backoff/relay/pairing/session_table/keystore/command/fetch/file_browser/zip/backup/capability/session/session_control/peer_hub/crypto/x25519/error/reflect/udp_transport），且服务端 TLS/HTTP2 核心均在库内。§1 现状盘点与 §5 阶段路径需按最新代码复核后再用。
