@@ -1,22 +1,33 @@
 /**
  * @file omni_server.cpp
- * @brief OmniNetServer M0 骨架实现：配置校验、连接表、Memory 回环与 Raw 通道。
+ * @brief OmniNetServer M1 实现：配置校验、真实后端接入（LinkServer/HttpServer）、
+ *        Memory 回环与 Raw 通道。
  * @author go2cpp contributors
  * @date 2026-10-30
  * @copyright MIT License
  *
- * @details M0 的实现边界（与头文件注释一一对应）：
- *          - 只有 Memory 传输 + Raw 协议；没有 socket、线程、Fiber；
- *          - 驱动只有 `PollOnce()`，内存端点以 1ms 粒度轮询；
- *          - 不做分帧：一次成功 `Read()` 的字节数就是一帧；
- *          - Inbound 满时暂停读并计数，不丢帧；
- *          - `Stop()` 幂等且是终态。
+ * @details 组合关系（与头文件注释一一对应）：
+ *          - `transport == kMemory`：M0 的 MemoryTransport + Raw 通道 +
+ *            `PollOnce()` 驱动，没有 socket/线程；
+ *          - `transport == kUdp`：`OmniServerImpl` 持有一个
+ *            `go2cpp::bento::LinkServer`，`Start()` 按 `config.bind` 真实绑定
+ *            UDP 并启动内置接收线程；
+ *          - `transport == kTcp`：持有一个 `go2cpp::bento::HttpServer`，
+ *            `Start()` 真实绑定 TCP 并启动 accept/worker 线程。
+ *
+ *          协议实现全部复用已提交的后端，本文件不复制任何帧编解码或 HTTP
+ *          解析；视图方法只做参数转发与生命周期检查。
  *
  *          `OmniServerImpl` / `ConnectionState` 只在本文件可见，头文件不泄漏
- *          任何实现细节；视图与连接句柄通过 `shared_ptr` 共享内部状态，
- *          因此可以晚于 `NetServer` 析构。
+ *          实现细节；视图与连接句柄通过 `shared_ptr` 共享内部状态，因此可以
+ *          晚于 `NetServer` 析构。
  */
 
+// 先包含 HttpServer：它在 go2cpp::bento 命名空间内使用裸 `net::Socket`，
+// 依赖 go2cpp::bento::net 尚未被 omni_server.hpp 定义。包含顺序反了会把
+// `net::` 解析到 bento::net 并编译失败（http_server.hpp 是已提交后端，
+// 本模块不改它，只保证自己的包含顺序正确）。
+#include "go2cpp/bento/net/http_server.hpp"
 #include "go2cpp/bento/net/omni_server.hpp"
 
 #include <algorithm>
@@ -46,8 +57,12 @@ constexpr std::size_t kMaxFramesPerPoll = 64;
 constexpr std::size_t kMaxReadsPerPoll = 16;
 /// 内存端点没有可等待 fd，`PollOnce(timeout)` 以 1ms 粒度轮询。
 constexpr Milliseconds kPollSlice{1};
-/// M0 的传输调用一律非阻塞（MemoryTransport 的 Write 本身也不阻塞）。
+/// M0/M1 的 Memory 传输调用一律非阻塞（MemoryTransport 的 Write 本身也不阻塞）。
 constexpr Milliseconds kNonBlockingIo{0};
+/// Link 接收线程每次 `RunOnce` 的轮询粒度（毫秒）。
+constexpr std::uint32_t kLinkPollTimeoutMs = 2;
+/// HTTP 后端在 `worker_threads == 0` 时使用的默认 worker 数（与后端一致）。
+constexpr std::size_t kDefaultHttpWorkers = 4;
 
 void SetError(std::string* error, std::string text) {
     if (error != nullptr) {
@@ -194,6 +209,60 @@ OmniError ValidateLimits(const Limits& limits, std::string* error) {
     return OmniError::kOk;
 }
 
+/// 把 `OmniNetConfig` 映射成 LinkServer 配置；只映射有明确语义的字段。
+::go2cpp::bento::LinkServerConfig BuildLinkConfig(const OmniNetConfig& config) {
+    ::go2cpp::bento::LinkServerConfig link;
+    link.hub.bind_address = config.bind.address;
+    link.hub.bind_port = config.bind.port;
+    link.hub.max_peers = std::max<std::size_t>(config.limits.max_connections, 1);
+    // Hub 的 peer_timeout_ms 为 uint32；0 表示"用后端默认"，避免把 0 解释成
+    // "立刻超时"。上限钳制到 1 小时，防止把超时溢出成负数。
+    if (config.limits.idle_timeout.count() > 0) {
+        const auto timeout = std::min<std::int64_t>(config.limits.idle_timeout.count(), 3600000);
+        link.hub.peer_timeout_ms = static_cast<std::uint32_t>(timeout);
+    }
+    // 空 PSK = 显式允许明文（仅限本机回环/测试）；非空必须 32B（Create 已校验）。
+    link.hub.require_encryption = !config.link_psk.empty();
+    link.hub.pre_shared_key = config.link_psk;
+    link.poll_timeout_ms = kLinkPollTimeoutMs;
+    link.start_receiver_thread = true;
+    return link;
+}
+
+/// 把 `OmniNetConfig` 映射成 HttpServer 配置。
+::go2cpp::bento::HttpServerConfig BuildHttpConfig(const OmniNetConfig& config) {
+    ::go2cpp::bento::HttpServerConfig http;
+    http.worker_threads =
+        config.limits.worker_threads == 0 ? kDefaultHttpWorkers : config.limits.worker_threads;
+    http.max_queued_connections = std::max<std::size_t>(config.limits.max_connections, 1);
+    http.max_requests_per_connection = config.limits.max_requests_per_connection;
+    http.max_header_bytes = config.limits.http_max_header_bytes;
+    http.max_body_bytes = config.limits.max_message_bytes;
+    http.accept_timeout = config.limits.accept_timeout;
+    return http;
+}
+
+/// HttpServerResult → OmniError：只保留调用方需要区分的类别。
+OmniError MapHttpListenError(::go2cpp::bento::HttpServerError error) {
+    using ::go2cpp::bento::HttpServerError;
+    switch (error) {
+        case HttpServerError::None:
+            return OmniError::kOk;
+        case HttpServerError::InvalidAddress:
+        case HttpServerError::BindFailed:
+        case HttpServerError::ListenFailed:
+            return OmniError::kBindFailed;
+        case HttpServerError::AlreadyListening:
+        case HttpServerError::AlreadyRunning:
+            return OmniError::kAlreadyStarted;
+        case HttpServerError::NotListening:
+        case HttpServerError::UnsupportedModel:
+        case HttpServerError::ThreadFailure:
+            return OmniError::kInternal;
+    }
+    return OmniError::kInternal;
+}
+
 }  // namespace
 
 namespace detail {
@@ -260,6 +329,14 @@ struct OmniServerImpl final : std::enable_shared_from_this<OmniServerImpl> {
     void CloseConnection(const std::shared_ptr<ConnectionState>& state, CloseReason reason,
                          CloseMode mode);
 
+    /// 视图的手动 Listen：只在 Start 之前允许。
+    bool ListenLink(const std::string& address, std::uint16_t port, std::string* error);
+    bool ListenHttp(const std::string& endpoint, std::string* error);
+    bool ListenHttp(const std::string& host, std::uint16_t port, std::string* error);
+    /// HTTP 路由安装（包装计数）；空 handler 表示取消。
+    void SetHttpHandler(::go2cpp::bento::HttpServer::RequestHandler handler);
+    void SetSseHandler(std::string path, ::go2cpp::bento::HttpServer::SseHandler handler);
+
     NetStats SnapshotStats() const;
     std::size_t ConnectionCount() const;
     std::shared_ptr<ConnectionState> Find(ConnectionId id) const;
@@ -269,12 +346,23 @@ struct OmniServerImpl final : std::enable_shared_from_this<OmniServerImpl> {
     std::atomic<bool> running{false};
     std::atomic<bool> stopped{false};  ///< Stop 后进入终态，不可重启。
     std::atomic<bool> polling{false};  ///< PollOnce 重入检测。
-    mutable std::mutex table_mutex;    ///< 保护 connections / next_id。
+    std::atomic<OmniError> last_error{OmniError::kOk};  ///< 最近一次 Start 的错误码。
+    std::atomic<std::uint16_t> port{0};  ///< Start 成功后的真实监听端口。
+    mutable std::mutex table_mutex;      ///< 保护 connections / next_id。
     std::unordered_map<std::uint64_t, std::shared_ptr<ConnectionState>> connections;
     std::uint64_t next_id{1};                       ///< 单调递增，永不复用。
     std::vector<std::uint8_t> read_scratch;         ///< PollOnce 专用读缓冲（单驱动者）。
     ChannelPtr<RawConnection> accept_channel;        ///< RawServer::Accept() 的唯一通道。
     ServerCounters counters;
+
+    /// UDP 后端；`transport == kUdp` 时非空。
+    std::unique_ptr<::go2cpp::bento::LinkServer> link_backend;
+    ::go2cpp::bento::LinkServerConfig link_config;  ///< 后端配置快照（Create 写入）。
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+    /// TCP 后端；`transport == kTcp` 时非空。
+    std::unique_ptr<::go2cpp::bento::HttpServer> http_backend;
+    ::go2cpp::bento::HttpServerConfig http_config;  ///< 后端配置快照（Create 写入）。
+#endif
 
  private:
     /// 排空出站通道；调用方必须已持有 `state->mutex`。
@@ -324,16 +412,89 @@ OmniServerImpl::~OmniServerImpl() {
 }
 
 bool OmniServerImpl::Start(std::string* error) {
+    SetError(error, std::string{});
+    last_error.store(OmniError::kOk, std::memory_order_release);
     if (stopped.load(std::memory_order_acquire)) {
-        SetError(error, "NetServer 已 Stop，M0 不支持重启；请重新 Create()");
+        SetError(error, "NetServer 已 Stop，M1 不支持同一实例重启；请重新 Create()");
+        last_error.store(OmniError::kAlreadyStarted, std::memory_order_release);
         return false;
     }
     bool expected = false;
     if (!running.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         SetError(error, "Start() 重复调用");
+        last_error.store(OmniError::kAlreadyStarted, std::memory_order_release);
         return false;
     }
-    // M0：Memory 传输没有监听/线程，Start 只做状态切换；Accept 通道在 Create 建好。
+
+    if (config.transport == TransportKind::kUdp) {
+        auto* backend = link_backend.get();
+        if (backend == nullptr) {
+            running.store(false, std::memory_order_release);
+            last_error.store(OmniError::kInternal, std::memory_order_release);
+            SetError(error, "内部错误：UDP 后端未构造");
+            return false;
+        }
+        // 视图可能已经在 Start 之前手动 Listen 过；此时复用，不重复绑定。
+        if (!backend->is_open()) {
+            std::string listen_error;
+            if (!backend->Listen(config.bind.address, config.bind.port, link_config,
+                                 &listen_error)) {
+                running.store(false, std::memory_order_release);
+                last_error.store(OmniError::kBindFailed, std::memory_order_release);
+                SetError(error, "UDP 绑定 " + config.bind.address + ":" +
+                                    std::to_string(config.bind.port) + " 失败：" + listen_error);
+                return false;
+            }
+        }
+        if (!backend->Start()) {
+            running.store(false, std::memory_order_release);
+            last_error.store(OmniError::kInternal, std::memory_order_release);
+            SetError(error, "LinkServer 启动失败（socket 已关闭或未监听）");
+            return false;
+        }
+        port.store(backend->local_port(), std::memory_order_release);
+        return true;
+    }
+
+    if (config.transport == TransportKind::kTcp) {
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+        auto* backend = http_backend.get();
+        if (backend == nullptr) {
+            running.store(false, std::memory_order_release);
+            last_error.store(OmniError::kInternal, std::memory_order_release);
+            SetError(error, "内部错误：HTTP 后端未构造");
+            return false;
+        }
+        if (backend->Port() == 0) {
+            const auto listened =
+                backend->Listen(config.bind.address, config.bind.port, http_config);
+            if (!listened.ok()) {
+                running.store(false, std::memory_order_release);
+                last_error.store(MapHttpListenError(listened.error), std::memory_order_release);
+                SetError(error, "TCP 绑定 " + config.bind.address + ":" +
+                                    std::to_string(config.bind.port) + " 失败：" +
+                                    listened.message);
+                return false;
+            }
+        }
+        const auto started = backend->Start();
+        if (!started.ok()) {
+            running.store(false, std::memory_order_release);
+            last_error.store(OmniError::kInternal, std::memory_order_release);
+            SetError(error, "HttpServer 启动失败：" + started.message);
+            return false;
+        }
+        port.store(backend->Port(), std::memory_order_release);
+        return true;
+#else
+        running.store(false, std::memory_order_release);
+        last_error.store(OmniError::kUnsupported, std::memory_order_release);
+        SetError(error, "本构建未启用 HTTP 后端（go2cpp_network 不可用）");
+        return false;
+#endif
+    }
+
+    // Memory：没有监听/线程，Start 只做状态切换；Accept 通道在 Create 建好。
     return true;
 }
 
@@ -342,6 +503,17 @@ void OmniServerImpl::Stop(CloseMode policy) {
         return;  // 幂等：第二次 Stop 直接返回。
     }
     running.store(false, std::memory_order_release);
+    // 先停真实后端（join 线程、关闭监听 socket），保证端口立即释放。
+    if (link_backend) {
+        link_backend->Stop();
+        port.store(0, std::memory_order_release);
+    }
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+    if (http_backend) {
+        http_backend->Stop();
+        port.store(0, std::memory_order_release);
+    }
+#endif
     if (accept_channel) {
         (void)accept_channel->Close();
     }
@@ -362,6 +534,10 @@ void OmniServerImpl::Stop(CloseMode policy) {
 
 ConnectionId OmniServerImpl::Attach(std::unique_ptr<net::ITransport> transport) {
     if (!transport) {
+        return ConnectionId{};
+    }
+    // M1：真实后端的连接由后端自己建立；外部注入仅保留给 Memory 回环。
+    if (config.transport != TransportKind::kMemory) {
         return ConnectionId{};
     }
     if (!running.load(std::memory_order_acquire) || stopped.load(std::memory_order_acquire)) {
@@ -392,6 +568,10 @@ ConnectionId OmniServerImpl::Attach(std::unique_ptr<net::ITransport> transport) 
 }
 
 std::unique_ptr<net::ITransport> OmniServerImpl::ConnectMemory(std::string* error) {
+    if (config.transport != TransportKind::kMemory) {
+        SetError(error, "ConnectMemory() 仅适用于 Memory 传输；UDP/TCP 请用对应后端");
+        return nullptr;
+    }
     if (!running.load(std::memory_order_acquire) || stopped.load(std::memory_order_acquire)) {
         SetError(error, "服务未启动：先调用 Start()");
         return nullptr;
@@ -404,6 +584,126 @@ std::unique_ptr<net::ITransport> OmniServerImpl::ConnectMemory(std::string* erro
         return nullptr;
     }
     return client;
+}
+
+bool OmniServerImpl::ListenLink(const std::string& address, std::uint16_t listen_port,
+                                std::string* error) {
+    if (link_backend == nullptr) {
+        SetError(error, "Link 后端不可用（transport 不是 UDP）");
+        return false;
+    }
+    if (running.load(std::memory_order_acquire)) {
+        SetError(error, "服务已启动，不能再 Listen()；请在 Start() 之前调用");
+        return false;
+    }
+    if (stopped.load(std::memory_order_acquire)) {
+        SetError(error, "实例已 Stop，不能再次 Listen()；请重新 Create()");
+        return false;
+    }
+    return link_backend->Listen(address, listen_port, link_config, error);
+}
+
+bool OmniServerImpl::ListenHttp(const std::string& endpoint, std::string* error) {
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+    if (http_backend == nullptr) {
+        SetError(error, "HTTP 后端不可用（transport 不是 TCP）");
+        return false;
+    }
+    if (running.load(std::memory_order_acquire)) {
+        SetError(error, "服务已启动，不能再 Listen()；请在 Start() 之前调用");
+        return false;
+    }
+    if (stopped.load(std::memory_order_acquire)) {
+        SetError(error, "实例已 Stop，不能再次 Listen()；请重新 Create()");
+        return false;
+    }
+    const auto result = http_backend->Listen(endpoint, http_config);
+    if (!result.ok()) {
+        SetError(error, result.message);
+        return false;
+    }
+    return true;
+#else
+    (void)endpoint;
+    SetError(error, "本构建未启用 HTTP 后端（go2cpp_network 不可用）");
+    return false;
+#endif
+}
+
+bool OmniServerImpl::ListenHttp(const std::string& host, std::uint16_t listen_port,
+                                std::string* error) {
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+    if (http_backend == nullptr) {
+        SetError(error, "HTTP 后端不可用（transport 不是 TCP）");
+        return false;
+    }
+    if (running.load(std::memory_order_acquire)) {
+        SetError(error, "服务已启动，不能再 Listen()；请在 Start() 之前调用");
+        return false;
+    }
+    if (stopped.load(std::memory_order_acquire)) {
+        SetError(error, "实例已 Stop，不能再 Listen()；请重新 Create()");
+        return false;
+    }
+    const auto result = http_backend->Listen(host, listen_port, http_config);
+    if (!result.ok()) {
+        SetError(error, result.message);
+        return false;
+    }
+    return true;
+#else
+    (void)host;
+    (void)listen_port;
+    SetError(error, "本构建未启用 HTTP 后端（go2cpp_network 不可用）");
+    return false;
+#endif
+}
+
+void OmniServerImpl::SetHttpHandler(::go2cpp::bento::HttpServer::RequestHandler handler) {
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+    if (http_backend == nullptr) {
+        return;
+    }
+    if (!handler) {
+        http_backend->OnRequest(nullptr);
+        return;
+    }
+    std::weak_ptr<OmniServerImpl> weak = weak_from_this();
+    auto wrapped = [weak, handler = std::move(handler)](const http::Request& request) {
+        if (auto impl = weak.lock()) {
+            impl->counters.http_requests.fetch_add(1, std::memory_order_relaxed);
+        }
+        return handler(request);
+    };
+    http_backend->OnRequest(std::move(wrapped));
+#else
+    (void)handler;
+#endif
+}
+
+void OmniServerImpl::SetSseHandler(std::string path,
+                                   ::go2cpp::bento::HttpServer::SseHandler handler) {
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+    if (http_backend == nullptr) {
+        return;
+    }
+    if (!handler) {
+        http_backend->AsSse(std::move(path), nullptr);
+        return;
+    }
+    std::weak_ptr<OmniServerImpl> weak = weak_from_this();
+    auto wrapped = [weak, handler = std::move(handler)](const http::Request& request,
+                                                       sse::Stream& stream) {
+        if (auto impl = weak.lock()) {
+            impl->counters.sse_events.fetch_add(1, std::memory_order_relaxed);
+        }
+        handler(request, stream);
+    };
+    http_backend->AsSse(std::move(path), std::move(wrapped));
+#else
+    (void)path;
+    (void)handler;
+#endif
 }
 
 NetStats OmniServerImpl::SnapshotStats() const {
@@ -428,10 +728,42 @@ NetStats OmniServerImpl::SnapshotStats() const {
     stats.raw_frames = counters.raw_frames.load(std::memory_order_relaxed);
     stats.accept_wait_ms_total = counters.accept_wait_ms_total.load(std::memory_order_relaxed);
     stats.sniff_timeout_total = counters.sniff_timeout_total.load(std::memory_order_relaxed);
+
+    if (config.transport == TransportKind::kUdp && link_backend) {
+        const auto link = link_backend->Stats();
+        const auto hub = link_backend->hub_stats();
+        stats.accepted = link.peers_accepted;
+        stats.active = link.active_peers;
+        stats.closed_graceful = link.peers_disconnected;
+        stats.messages_in = link.stream_messages_received + link.datagram_messages_received;
+        stats.messages_out = link.sends_ok;
+        stats.bytes_in = hub.bytes_received;
+        stats.bytes_out = hub.bytes_sent;
+        stats.dropped =
+            link.sends_would_block + link.sends_failed + link.sends_invalid;
+        stats.rejected_limit = hub.peers_rejected;
+        stats.raw_frames = 0;
+    } else if (config.transport == TransportKind::kTcp) {
+        stats.messages_in = stats.http_requests;
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+        stats.active = http_backend ? http_backend->ActiveConnections() : 0;
+#endif
+        // HttpServer 未暴露累计连接数；accepted 保持 0（M2 在连接层补计数），
+        // 请求量用 http_requests/messages_in 表达，避免给出错误数字。
+        stats.accepted = 0;
+    }
     return stats;
 }
 
 std::size_t OmniServerImpl::ConnectionCount() const {
+    if (config.transport == TransportKind::kUdp && link_backend) {
+        return link_backend->peer_count();
+    }
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+    if (config.transport == TransportKind::kTcp && http_backend) {
+        return http_backend->ActiveConnections();
+    }
+#endif
     std::lock_guard<std::mutex> lock(table_mutex);
     return connections.size();
 }
@@ -554,7 +886,7 @@ std::size_t OmniServerImpl::PumpConnection(const std::shared_ptr<ConnectionState
         if (read.bytes == 0) {
             break;
         }
-        // M0 不分帧：一次 Read 的字节数就是一帧。
+        // M0/M1 Memory 不分帧：一次 Read 的字节数就是一帧。
         RawFrame frame;
         frame.bytes.assign(read_scratch.data(),
                            read_scratch.data() + static_cast<std::ptrdiff_t>(read.bytes));
@@ -762,19 +1094,56 @@ OmniError NetServer::ValidateConfig(const OmniNetConfig& config, std::string* er
     if (const OmniError limits = ValidateLimits(config.limits, error); limits != OmniError::kOk) {
         return limits;
     }
-    // M0 实现门：只落地 Memory 传输与 Raw 协议，其余如实返回 kUnsupported。
-    if (config.transport != TransportKind::kMemory) {
-        return Fail(OmniError::kUnsupported,
-                    std::string("M0 只实现 Memory 传输，收到 ") +
-                        TransportName(config.transport),
+    // V7：M1 实现门。只接受已经接入真实后端的组合，其余如实返回 kUnsupported。
+    switch (config.transport) {
+        case TransportKind::kMemory:
+            for (const ProtocolKind protocol : config.protocols) {
+                if (protocol != ProtocolKind::kRaw) {
+                    return Fail(OmniError::kUnsupported,
+                                std::string("M1 Memory 只实现 Raw 协议，收到 ") +
+                                    ProtocolName(protocol),
+                                error);
+                }
+            }
+            break;
+        case TransportKind::kUdp:
+            if (config.protocols.size() != 1 || config.protocols[0] != ProtocolKind::kLink) {
+                return Fail(OmniError::kUnsupported,
+                            "M1 UDP 只实现 Link 协议（单协议，暂不支持嗅探）", error);
+            }
+            break;
+        case TransportKind::kTcp:
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+            for (const ProtocolKind protocol : config.protocols) {
+                if (protocol != ProtocolKind::kHttp && protocol != ProtocolKind::kSse) {
+                    return Fail(OmniError::kUnsupported,
+                                std::string("M1 TCP 只实现 HTTP/SSE，收到 ") +
+                                    ProtocolName(protocol),
+                                error);
+                }
+            }
+            break;
+#else
+            return Fail(OmniError::kUnsupported,
+                        "本构建未启用 HTTP 后端（go2cpp_network 不可用）", error);
+#endif
+        case TransportKind::kTls:
+            return Fail(OmniError::kUnsupported, "TLS 服务端在 M4 实现", error);
+    }
+    // V8：UDP/TCP 的后端自带线程；Poll 模式由调用方驱动，会让 PollOnce 看起来
+    // "配置成功但不推进"。M1 只允许 Memory 使用 Poll。
+    if (config.transport != TransportKind::kMemory &&
+        config.concurrency == ConcurrencyKind::kPoll) {
+        return Fail(OmniError::kUnsupportedCombination,
+                    "UDP/TCP 后端自带线程，M1 不接受 Poll 并发；请用 Gmp 或 Thread",
                     error);
     }
-    for (const ProtocolKind protocol : config.protocols) {
-        if (protocol != ProtocolKind::kRaw) {
-            return Fail(OmniError::kUnsupported,
-                        std::string("M0 只实现 Raw 协议，收到 ") + ProtocolName(protocol),
-                        error);
-        }
+    // V9：bind 与 PSK（PSK 非空时必须 32 字节）。
+    if (config.bind.address.empty()) {
+        return Fail(OmniError::kInvalidConfig, "bind.address 不能为空", error);
+    }
+    if (!config.link_psk.empty() && config.link_psk.size() != 32) {
+        return Fail(OmniError::kInvalidConfig, "link_psk 非空时必须为 32 字节", error);
     }
     return OmniError::kOk;
 }
@@ -785,10 +1154,23 @@ std::unique_ptr<NetServer> NetServer::Create(const OmniNetConfig& config, std::s
         return nullptr;
     }
     auto impl = std::make_shared<OmniServerImpl>(config);
-    impl->accept_channel = Channel<RawConnection>::Create(config.limits.inbound_capacity);
-    if (!HasProtocol(config, ProtocolKind::kRaw)) {
-        // M0 的 Create 门保证 protocols 只含 kRaw；这条分支只为骨架对称性保留。
-        (void)impl->accept_channel->Close();
+    switch (config.transport) {
+        case TransportKind::kMemory:
+            impl->accept_channel = Channel<RawConnection>::Create(config.limits.inbound_capacity);
+            break;
+        case TransportKind::kUdp:
+            impl->link_config = BuildLinkConfig(config);
+            impl->link_backend = std::make_unique<::go2cpp::bento::LinkServer>();
+            break;
+        case TransportKind::kTcp:
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+            impl->http_config = BuildHttpConfig(config);
+            impl->http_backend = std::make_unique<::go2cpp::bento::HttpServer>();
+#endif
+            break;
+        case TransportKind::kTls:
+            // ValidateConfig 已拒绝；这里只为 switch 完整性保留。
+            break;
     }
     return std::unique_ptr<NetServer>(new NetServer(std::move(impl)));
 }
@@ -811,12 +1193,16 @@ void NetServer::Stop(ShutdownPolicy policy) noexcept {
     }
 }
 
-bool NetServer::running() const noexcept {
+bool NetServer::IsRunning() const noexcept {
     return m_impl != nullptr && m_impl->running.load(std::memory_order_acquire);
 }
 
+bool NetServer::running() const noexcept {
+    return IsRunning();
+}
+
 std::uint16_t NetServer::Port() const noexcept {
-    return 0;  // M0：Memory 传输不绑定端口。
+    return m_impl == nullptr ? 0 : m_impl->port.load(std::memory_order_acquire);
 }
 
 std::size_t NetServer::Connections() const noexcept {
@@ -831,12 +1217,27 @@ const OmniNetConfig& NetServer::config() const noexcept {
     return m_impl->config;
 }
 
+OmniError NetServer::last_error() const noexcept {
+    return m_impl == nullptr ? OmniError::kInternal
+                             : m_impl->last_error.load(std::memory_order_acquire);
+}
+
 RawServer NetServer::AsRawServer() {
     return RawServer(m_impl, m_impl != nullptr && HasProtocol(m_impl->config, ProtocolKind::kRaw));
 }
 
 LinkServer NetServer::AsLinkServer() {
-    return LinkServer(m_impl, m_impl != nullptr && HasProtocol(m_impl->config, ProtocolKind::kLink));
+    const bool valid = m_impl != nullptr && m_impl->link_backend != nullptr &&
+                       HasProtocol(m_impl->config, ProtocolKind::kLink);
+    return LinkServer(m_impl, valid);
+}
+
+HttpServer NetServer::AsHttpServer() {
+    const bool valid =
+        m_impl != nullptr && m_impl->config.transport == TransportKind::kTcp &&
+        (HasProtocol(m_impl->config, ProtocolKind::kHttp) ||
+         HasProtocol(m_impl->config, ProtocolKind::kSse));
+    return HttpServer(m_impl, valid);
 }
 
 std::unique_ptr<net::ITransport> NetServer::ConnectMemory(std::string* error) {
@@ -949,6 +1350,152 @@ bool LinkServer::valid() const noexcept {
 
 ProtocolKind LinkServer::protocol() const noexcept {
     return ProtocolKind::kLink;
+}
+
+bool LinkServer::Listen(const std::string& address, std::uint16_t listen_port,
+                        std::string* error) {
+    if (!valid()) {
+        SetError(error, "Link 视图无效：配置不是 UDP + Link");
+        return false;
+    }
+    return m_impl->ListenLink(address, listen_port, error);
+}
+
+::go2cpp::bento::LinkSendResult LinkServer::Send(
+    ::go2cpp::bento::LinkPeerId peer, std::uint8_t channel, const void* data, std::size_t bytes,
+    ::go2cpp::bento::LinkReliability reliability) {
+    if (!valid()) {
+        return ::go2cpp::bento::LinkSendResult::kNotConnected;
+    }
+    return m_impl->link_backend->Send(peer, channel, data, bytes, reliability);
+}
+
+std::size_t LinkServer::Broadcast(std::uint8_t channel, const void* data, std::size_t bytes,
+                                  ::go2cpp::bento::LinkReliability reliability) {
+    if (!valid()) {
+        return 0;
+    }
+    return m_impl->link_backend->Broadcast(channel, data, bytes, reliability);
+}
+
+std::vector<::go2cpp::bento::LinkPeerId> LinkServer::Peers() const {
+    if (!valid()) {
+        return {};
+    }
+    return m_impl->link_backend->Peers();
+}
+
+bool LinkServer::HasPeer(::go2cpp::bento::LinkPeerId peer) const {
+    return valid() && m_impl->link_backend->HasPeer(peer);
+}
+
+std::size_t LinkServer::peer_count() const {
+    return valid() ? m_impl->link_backend->peer_count() : 0;
+}
+
+std::uint16_t LinkServer::local_port() const noexcept {
+    return valid() ? m_impl->link_backend->local_port() : 0;
+}
+
+void LinkServer::OnPeerConnected(::go2cpp::bento::LinkServer::ConnectHandler handler) {
+    if (valid()) {
+        m_impl->link_backend->OnPeerConnected(std::move(handler));
+    }
+}
+
+void LinkServer::OnPeerDisconnected(::go2cpp::bento::LinkServer::DisconnectHandler handler) {
+    if (valid()) {
+        m_impl->link_backend->OnPeerDisconnected(std::move(handler));
+    }
+}
+
+void LinkServer::OnStream(::go2cpp::bento::LinkServer::MessageHandler handler) {
+    if (valid()) {
+        m_impl->link_backend->OnStream(std::move(handler));
+    }
+}
+
+void LinkServer::OnDatagram(::go2cpp::bento::LinkServer::MessageHandler handler) {
+    if (valid()) {
+        m_impl->link_backend->OnDatagram(std::move(handler));
+    }
+}
+
+::go2cpp::bento::LinkServer* LinkServer::backend() const noexcept {
+    return valid() ? m_impl->link_backend.get() : nullptr;
+}
+
+HttpServer::HttpServer(std::shared_ptr<detail::OmniServerImpl> impl, bool valid) noexcept
+    : m_impl(std::move(impl)), m_valid(valid) {}
+
+bool HttpServer::valid() const noexcept {
+    return m_valid && m_impl != nullptr;
+}
+
+ProtocolKind HttpServer::protocol() const noexcept {
+    return ProtocolKind::kHttp;
+}
+
+bool HttpServer::Listen(const std::string& endpoint, std::string* error) {
+    if (!valid()) {
+        SetError(error, "HTTP 视图无效：配置不是 TCP + HTTP/SSE");
+        return false;
+    }
+    return m_impl->ListenHttp(endpoint, error);
+}
+
+bool HttpServer::Listen(const std::string& host, std::uint16_t listen_port, std::string* error) {
+    if (!valid()) {
+        SetError(error, "HTTP 视图无效：配置不是 TCP + HTTP/SSE");
+        return false;
+    }
+    return m_impl->ListenHttp(host, listen_port, error);
+}
+
+void HttpServer::OnRequest(RequestHandler handler) {
+    if (valid()) {
+        m_impl->SetHttpHandler(std::move(handler));
+    }
+}
+
+void HttpServer::AsSse(std::string path, SseHandler handler) {
+    if (valid()) {
+        m_impl->SetSseHandler(std::move(path), std::move(handler));
+    }
+}
+
+std::uint16_t HttpServer::Port() const noexcept {
+    return valid() ? m_impl->port.load(std::memory_order_acquire) : 0;
+}
+
+std::string HttpServer::LocalAddress() const {
+    if (!valid()) {
+        return {};
+    }
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+    return m_impl->http_backend->LocalAddress();
+#else
+    return {};
+#endif
+}
+
+std::size_t HttpServer::ActiveConnections() const noexcept {
+    if (!valid()) {
+        return 0;
+    }
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+    return m_impl->http_backend->ActiveConnections();
+#else
+    return 0;
+#endif
+}
+
+::go2cpp::bento::HttpServer* HttpServer::backend() const noexcept {
+#if defined(GO2CPP_OMNI_WITH_HTTP)
+    return valid() ? m_impl->http_backend.get() : nullptr;
+#else
+    return nullptr;
+#endif
 }
 
 }  // namespace go2cpp::bento::omni

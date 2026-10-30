@@ -163,11 +163,11 @@ if (GO2CPP_WITH_BENTO)
     set_target_properties(go2cpp_bento_session PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_library(go2cpp::bento_session ALIAS go2cpp_bento_session)
 
-    # M0：组合式 OmniNetServer 骨架（docs/research/omni-net-design.md §5.1）。
-    # 只做配置校验 + 生命周期 + 连接表 + Memory 回环 + Raw 通道；复用
-    # go2cpp_bento_transport 的 MemoryTransport 与 go2cpp_channel 的 Channel<T>，
-    # 不引入 socket/线程/Fiber。standalone 构建缺依赖时跳过并打印提示，
-    # 不让 API 悄悄降级。
+    # M1：组合式 OmniNetServer（docs/research/omni-net-design.md §5.2/§5.3）。
+    # 接入真实后端：UDP → go2cpp_bento 的 LinkServer；TCP → go2cpp_bento_http
+    # 的 HttpServer；Memory → go2cpp_bento_transport 的 MemoryTransport + Raw。
+    # HTTP 目标在本文件后面才定义，因此链接与宏在 HTTP 目标就绪后再追加，
+    # 缺 HTTP 依赖时只关掉 TCP 分支（Create 返回 kUnsupported，不静默降级）。
     if (TARGET go2cpp_channel)
         add_library(go2cpp_bento_omni STATIC
             ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/omni_server.cpp)
@@ -181,7 +181,7 @@ if (GO2CPP_WITH_BENTO)
         target_compile_options(go2cpp_bento_omni PRIVATE
             -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
         target_link_libraries(go2cpp_bento_omni
-            PUBLIC go2cpp_bento_transport go2cpp_channel Threads::Threads)
+            PUBLIC go2cpp_bento_transport go2cpp_channel go2cpp_bento Threads::Threads)
         set_target_properties(go2cpp_bento_omni PROPERTIES POSITION_INDEPENDENT_CODE ON)
         add_library(go2cpp::bento_omni ALIAS go2cpp_bento_omni)
     else()
@@ -244,6 +244,14 @@ if (GO2CPP_WITH_BENTO)
         add_library(go2cpp::bento_http ALIAS go2cpp_bento_http)
     else()
         message(STATUS "Bento HTTP/SSE server: OFF (go2cpp_network not available)")
+    endif()
+
+    # M1：HttpServer 目标就绪后，把 OmniNetServer 的 TCP 分支挂上。
+    if (TARGET go2cpp_bento_omni AND TARGET go2cpp_bento_http)
+        target_link_libraries(go2cpp_bento_omni PUBLIC go2cpp_bento_http)
+        target_compile_definitions(go2cpp_bento_omni PRIVATE GO2CPP_OMNI_WITH_HTTP=1)
+    elseif (TARGET go2cpp_bento_omni)
+        message(STATUS "Bento OmniNetServer: UDP only (go2cpp_bento_http not available)")
     endif()
 
     # WebSocket 服务端骨架：复用 base 的 RFC 6455 协议对象（net::WebSocket）、
@@ -508,6 +516,21 @@ if (GO2CPP_WITH_BENTO)
                 -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
             add_test(NAME bento_omni_server COMMAND bento_test_omni_server)
             set_tests_properties(bento_omni_server PROPERTIES TIMEOUT 120)
+        endif()
+
+        # OmniNetServer M1：真实 UDP LinkServer / TCP HttpServer 回环、生命周期、
+        # 端口重绑、并发与 M0 Memory 兼容。依赖 HTTP 目标（M1 测试同时用
+        # base Socket 作客户端），缺依赖时跳过注册。
+        if (TARGET go2cpp_bento_omni AND TARGET go2cpp_bento_http)
+            add_executable(bento_test_omni_server_m1
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_omni_server_m1.cpp)
+            target_include_directories(bento_test_omni_server_m1 PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
+            target_link_libraries(bento_test_omni_server_m1 PRIVATE go2cpp_bento_omni)
+            target_compile_options(bento_test_omni_server_m1 PRIVATE
+                -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+            add_test(NAME bento_omni_server_m1 COMMAND bento_test_omni_server_m1)
+            set_tests_properties(bento_omni_server_m1 PROPERTIES TIMEOUT 180)
         endif()
 
         # MOD-26/28：命令协议与文件传输（依赖完整模块构建里的 app 目标）。

@@ -234,13 +234,21 @@ OmniError ReferenceCreateResult(TransportKind transport, ProtocolKind protocol) 
     if (transport == TransportKind::kTls) {
         return OmniError::kUnsupported;  // V5：TLS 服务端 M4 才有。
     }
-    if (transport != TransportKind::kMemory) {
-        return OmniError::kUnsupported;  // M0 实现门。
+    if (transport == TransportKind::kMemory) {
+        return protocol == ProtocolKind::kRaw ? OmniError::kOk : OmniError::kUnsupported;
     }
-    if (protocol != ProtocolKind::kRaw) {
-        return OmniError::kUnsupported;  // M0 实现门。
+    // M1：UDP 只实现 Link、TCP 只实现 HTTP/SSE；其它协议是 kUnsupported。
+    // 而本矩阵的基础配置是 NonBlocking + Poll，M1 的真实后端自带线程、
+    // 不接受 Poll（kUnsupportedCombination）。真实后端的合法配置由
+    // test_omni_server_m1.cpp 用 Gmp/Thread 覆盖。
+    if (transport == TransportKind::kUdp && protocol != ProtocolKind::kLink) {
+        return OmniError::kUnsupported;
     }
-    return OmniError::kOk;
+    if (transport == TransportKind::kTcp && protocol != ProtocolKind::kHttp &&
+        protocol != ProtocolKind::kSse) {
+        return OmniError::kUnsupported;
+    }
+    return OmniError::kUnsupportedCombination;
 }
 
 void TestConfigMatrix() {
@@ -367,13 +375,15 @@ void TestConfigMatrix() {
         CHECK_EQ(NetServer::ValidateConfig(config, nullptr), OmniError::kInvalidConfig);
     }
 
-    // 设计稿默认配置（Tcp + Http）在 M0 必须是 kUnsupported，不能"先跑起来"。
+    // M1：设计稿默认配置（Tcp + Http + Gmp）已经落地，Create 必须成功。
     {
         const OmniNetConfig defaults;
         std::string error;
-        CHECK_EQ(NetServer::ValidateConfig(defaults, &error), OmniError::kUnsupported);
-        CHECK(!error.empty());
-        CHECK(NetServer::Create(defaults, &error) == nullptr);
+        CHECK_EQ(NetServer::ValidateConfig(defaults, &error), OmniError::kOk);
+        CHECK(error.empty());
+        auto default_server = NetServer::Create(defaults, &error);
+        CHECK(default_server != nullptr);
+        CHECK(error.empty());
     }
 
     // 视图：Raw 合法则 valid，Link 在 M0 恒为占位视图（valid == false）。
