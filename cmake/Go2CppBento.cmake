@@ -50,7 +50,11 @@ if (GO2CPP_WITH_BENTO)
         # MOD-10/11/12 通用模块：通用帧编解码、心跳、重连退避。
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/frame.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/heartbeat.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/backoff.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/backoff.cpp
+        # CoAP（RFC 7252）最小骨架：报文/选项编解码 + 简单客户端/服务端交换。
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/coap.cpp
+        # MQTT 3.1.1 最小协议骨架（编解码/VLQ/QoS 0-1/会话/纯内存 broker）。
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/mqtt.cpp)
 
     target_include_directories(go2cpp_bento
         PUBLIC
@@ -215,9 +219,62 @@ if (GO2CPP_WITH_BENTO)
         message(STATUS "Bento HTTP/SSE server: OFF (go2cpp_network not available)")
     endif()
 
+    # WebSocket 服务端骨架：复用 base 的 RFC 6455 协议对象（net::WebSocket）、
+    # http::Parser 与 go2cpp_network 的 Socket。独立目标，不给 go2cpp_bento
+    # 增加网络依赖；standalone 构建跳过，API 不悄悄降级。
+    if (TARGET go2cpp_network)
+        add_library(go2cpp_bento_ws STATIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/ws_server.cpp)
+
+        target_include_directories(go2cpp_bento_ws
+            PUBLIC
+                $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+        target_compile_features(go2cpp_bento_ws PUBLIC cxx_std_17)
+        # 零警告是验收条件：本模块独立编译，-Werror 把回归挡在构建期。
+        target_compile_options(go2cpp_bento_ws PRIVATE
+            -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+        target_link_libraries(go2cpp_bento_ws
+            PUBLIC go2cpp_bento go2cpp_network Threads::Threads)
+        set_target_properties(go2cpp_bento_ws PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        add_library(go2cpp::bento_ws ALIAS go2cpp_bento_ws)
+    else()
+        message(STATUS "Bento WebSocket server: OFF (go2cpp_network not available)")
+    endif()
+
+    # SOCKS5（RFC 1928）服务端骨架：无认证握手 + CONNECT（IPv4/域名/IPv6）
+    # + 双向中继。只用 POSIX socket 与标准库，不依赖 go2cpp_network；
+    # 独立目标，standalone 构建也可用。
+    add_library(go2cpp_bento_socks STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/socks5.cpp)
+
+    target_include_directories(go2cpp_bento_socks
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_compile_features(go2cpp_bento_socks PUBLIC cxx_std_17)
+    # 零警告是验收条件：本模块独立编译，-Werror 把回归挡在构建期。
+    target_compile_options(go2cpp_bento_socks PRIVATE
+        -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+    target_link_libraries(go2cpp_bento_socks PUBLIC Threads::Threads)
+    set_target_properties(go2cpp_bento_socks PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    add_library(go2cpp::bento_socks ALIAS go2cpp_bento_socks)
+
     option(GO2CPP_BENTO_TESTS "Build Bento transport tests" ON)
     if (GO2CPP_BENTO_TESTS)
         enable_testing()
+        # SOCKS5 骨架：纯协议编解码 + 真实回环（握手/无认证/CONNECT/域名/
+        # 失败码/中继/非法请求/超时/并发/优雅关闭）；无外部网络依赖。
+        add_executable(bento_test_socks5
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_socks5.cpp)
+        target_include_directories(bento_test_socks5 PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
+        target_link_libraries(bento_test_socks5 PRIVATE go2cpp_bento_socks)
+        target_compile_options(bento_test_socks5 PRIVATE
+            -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+        add_test(NAME bento_socks5 COMMAND bento_test_socks5)
+        set_tests_properties(bento_socks5 PROPERTIES TIMEOUT 120)
+
 
         # 错误/反射：纯本地测试，不依赖 go2cpp_bento（避免把传输层拖进构建）。
         add_executable(bento_test_error
@@ -259,6 +316,20 @@ if (GO2CPP_WITH_BENTO)
                 -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
             add_test(NAME bento_http_server COMMAND bento_test_http_server)
             set_tests_properties(bento_http_server PROPERTIES TIMEOUT 120)
+        endif()
+
+        # WebSocket 服务端骨架：回环端口 + 真实握手/帧客户端，覆盖握手/文本/
+        # 二进制/Ping-Pong/Close/并发/100 条回环/优雅关闭；无外部网络依赖。
+        if (TARGET go2cpp_bento_ws)
+            add_executable(bento_test_ws_server
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_ws_server.cpp)
+            target_include_directories(bento_test_ws_server PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
+            target_link_libraries(bento_test_ws_server PRIVATE go2cpp_bento_ws)
+            target_compile_options(bento_test_ws_server PRIVATE
+                -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+            add_test(NAME bento_ws_server COMMAND bento_test_ws_server)
+            set_tests_properties(bento_ws_server PROPERTIES TIMEOUT 180)
         endif()
 
         add_executable(bento_test_link_loopback
@@ -311,8 +382,23 @@ if (GO2CPP_WITH_BENTO)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_log_hook.cpp)
         add_executable(bento_test_link_server
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_link_server.cpp)
+        # 防御包裹：MQTT/CoAP 测试源文件可能尚未落地（并行任务中间态）。
+        # 缺失时跳过注册并打印提示，避免 add_executable 的 No SOURCES 让
+        # 整个配置阶段失败；文件补齐后自动恢复注册。
+        if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_mqtt.cpp)
+            add_executable(bento_test_mqtt
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_mqtt.cpp)
+        else()
+            message(STATUS "skip bento_test_mqtt (source missing)")
+        endif()
         add_executable(bento_test_frame
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_frame.cpp)
+        if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_coap.cpp)
+            add_executable(bento_test_coap
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_coap.cpp)
+        else()
+            message(STATUS "skip bento_test_coap (source missing)")
+        endif()
         add_executable(bento_test_heartbeat
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_heartbeat.cpp)
         add_executable(bento_test_backoff
@@ -481,8 +567,27 @@ if (GO2CPP_WITH_BENTO)
         add_test(NAME bento_peer_hub_secure COMMAND bento_test_peer_hub_secure)
         add_test(NAME bento_log_hook COMMAND bento_test_log_hook)
         add_test(NAME bento_link_server COMMAND bento_test_link_server)
+        # 防御包裹：MQTT/CoAP 目标只在测试源文件存在时注册；缺失时跳过，
+        # 文件补齐后自动恢复（配置阶段不再整体失败）。
+        foreach(bento_optional_test bento_test_mqtt bento_test_coap)
+            if (TARGET ${bento_optional_test})
+                target_include_directories(${bento_optional_test} PRIVATE
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
+                target_link_libraries(${bento_optional_test} PRIVATE go2cpp_bento)
+                target_compile_options(${bento_optional_test} PRIVATE
+                    -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+            endif()
+        endforeach()
+        if (TARGET bento_test_mqtt)
+            add_test(NAME bento_mqtt COMMAND bento_test_mqtt)
+            set_tests_properties(bento_mqtt PROPERTIES TIMEOUT 90)
+        endif()
         # MOD-10/11/12：帧编解码、心跳、退避的纯本地测试（无网络依赖）。
         add_test(NAME bento_frame COMMAND bento_test_frame)
+        if (TARGET bento_test_coap)
+            add_test(NAME bento_coap COMMAND bento_test_coap)
+            set_tests_properties(bento_coap PROPERTIES TIMEOUT 90)
+        endif()
         add_test(NAME bento_heartbeat COMMAND bento_test_heartbeat)
         add_test(NAME bento_backoff COMMAND bento_test_backoff)
         add_test(NAME bento_pairing COMMAND bento_test_pairing)
