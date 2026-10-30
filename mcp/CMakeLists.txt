@@ -37,6 +37,9 @@ set(MCP_CORE_SOURCES
     src/tools/prompts.cpp
     src/tools/retrieval_tools.cpp
     src/tools/monitor_tools.cpp
+    # Socket 可观测：本进程 socket 注册表/事件/审计 + 四个 socket_* 工具。
+    src/tools/socket_registry.cpp
+    src/tools/socket_tools.cpp
     # MonitorClient 抽象：HTTP 实现 + 测试替身（工具层不直接碰 HTTP）。
     src/tools/monitor_client.cpp
 )

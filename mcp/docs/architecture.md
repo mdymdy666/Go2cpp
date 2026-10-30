@@ -166,7 +166,7 @@ AddDirectory / AddDocument(uri, text)
 - **工具**：`kAdded` 只编码新工具一条向量；`kUpdated` 先比较「名字 + 描述」，
   文本没变（只换 handler/schema）直接复用旧向量，文本变了只重算这一条；
   `kRemoved` 直接从 `VectorIndex` erase。`Application::Create` 先构造检索器
-  （此时订阅注册表事件）再注册内置工具，因此 29 个工具（22 内置 + 3 检索 + 4 监控）是逐个增量入索引的；
+  （此时订阅注册表事件）再注册内置工具，因此 33 个工具（22 内置 + 3 检索 + 4 监控 + 4 Socket）是逐个增量入索引的；
   启动末尾只做一次「索引条目数 == 注册表工具数」自检，不一致才回退 `Refresh()`。
 - **文档**：`AddDocument` 对同一 uri 是整体替换，但按块文本复用旧向量，
   重复加载同一个文件是零向量化开销；`RemoveDocument` 删除该 uri 的全部块；

@@ -363,7 +363,8 @@ void TestConcurrentPush() {
     // 瞬时失败/backlog 竞争），重试后仍有 ~3% 失败；这不是 Manager 逻辑
     // 缺陷（MCP 独立构建 HOOK=OFF 时 0 失败），记录为已知环境限制。
     constexpr int kAllowedErrors = kThreads * kPerThread / 20;  // 5%
-    CHECK_MSG(http_errors.load() <= static_cast<std::uint64_t>(kAllowedErrors),
+    CHECK_MSG(static_cast<std::uint64_t>(http_errors.load()) <=
+                  static_cast<std::uint64_t>(kAllowedErrors),
               "并发 push 网络错误数应 ≤5%，实际 " +
                   std::to_string(http_errors.load()));
     CHECK_MSG(failures.load() == 0,

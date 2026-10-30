@@ -30,13 +30,13 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol
 `--http`、`--plugins`、`--resources`、`--model`、`--base-url`、`--api-key`、
 `--no-retrieval`、`--embedding-dim`、`-v`。
 
-服务端提供 **29 个工具**（22 内置 + 3 检索 + 4 监控）、2 个资源（`bacio:///quote`、
+服务端提供 **33 个工具**（22 内置 + 3 检索 + 4 监控 + 4 Socket）、2 个资源（`bacio:///quote`、
 `document:///life-choices.txt`）、1 个提示。初始化后可发 `tools/list` 查看。
 
 ## 测试
 
 ```bash
-# 18 个 mcp ctest（需 -DMCP_BUILD_TESTS=ON；集成构建共 32 个）
+# 21 个 mcp ctest（需 -DMCP_BUILD_TESTS=ON；集成构建共 35 个）
 ctest --test-dir /UserData/build/go2cpp-mcp-integrated -R 'json_rpc|registry|tools|vector|validation|retrieval' -V
 
 # e2e（stdio 要传 resource_dir，否则 document 资源读不到）

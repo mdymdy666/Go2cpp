@@ -153,3 +153,49 @@
   主机名每包解析 9.5 µs（P2-1）。
 - 文档 `docs/modules/bento-foundation.md:16` 的「15 用例」待同步为 22。
 - 未 commit。
+
+## 2026-10-30 MCP Socket 工具（socket_list / socket_stats / socket_events / socket_close）
+
+### 一、结论
+
+4 个 socket 工具完成并接入 `mcp_server`；`mcp/` 编译 0 警告；35/35 ctest 通过；
+ASan/LSan 0 报告。详细报告见 `example/WarningDocement/audit-mcp-socket.md`。
+
+### 二、代码改动
+
+- 新增 `mcp/include/mcp/tools/socket_registry.hpp`、`mcp/src/tools/socket_registry.cpp`：
+  进程内 socket 注册表（`/proc/self/fd` + `SO_TYPE`/`getsockname`/`getpeername` +
+  `TCP_INFO`）、白名单 inode 校验（防 fd 复用 ABA）、每 fd 256 条事件环、
+  JSON Lines 审计（默认 `log/mcp-socket-audit.log`，fail-closed）。
+- 新增 `mcp/include/mcp/tools/socket_tools.hpp`、`mcp/src/tools/socket_tools.cpp`：
+  四个 MCP 工具，参数校验与 JSON 输出；审计汇可注入（测试用内存实现）。
+- 改 `mcp/src/app/application.cpp`：注册 socket 工具。
+- 改 `mcp/CMakeLists.txt`、`mcp/tests/CMakeLists.txt`：源文件与测试目标接线。
+- 改 `mcp/README.md`、`mcp/docs/architecture.md`：工具总数 33（22+3+4+4）、
+  ctest 21（集成 35）。
+- 未改 base、未 commit。
+
+### 三、测试改动
+
+- 新增 `mcp/tests/test_socket_tools.cpp`（8 用例 / 1479 断言）：真实 TCP/UDP/Unix、
+  TCP_INFO 收发、事件顺序与截断、close+审计、随机 fuzz（1000 组）、压测（2000 次）。
+- 新增 `mcp/tests/test_socket_whitelist.cpp`（8 用例 / 84 断言）：白名单拒绝、
+  普通文件 fd、ABA、fail-closed、审计文件 0600、环形溢出、外部关闭、8 线程并发。
+- 新增 `mcp/tests/test_socket_e2e.py`（34 断言）：真 `mcp_server`（stdio）。
+- 新增 `mcp/tests/socket_test_util.hpp`：真 socket 构造与 fd RAII。
+
+### 四、验证结果
+
+- `.build-mcp-socket-wsl`（Release）：clean 重建 mcp 目标 0 警告；全量 ctest **35/35**
+  （61.19s）。
+- 压测：2000 次混合调用 14,504 ops/s，P50 11.5µs / P95 199.8µs / P99 234.0µs，0 失败。
+- 随机：1000 组 fuzz，接受 317 / 拒绝 683，0 崩溃。
+- `.build-mcp-socket-asan`（Debug + ASan/LSan）：两套件 0 报告，exit 0。
+
+### 五、后续状态
+
+- 未接入：业务侧 socket 创建后不会自动 `Register()`，需改 `src/network`（超出本批边界）；
+  未登记 socket 只能只读观察。
+- 已知限制：事件仅进程内、UDP/Unix 无 TCP_INFO、审计非事务、close 与外部并发
+  关闭同一 fd 存在理论 TOCTOU。见审计报告第 7 节。
+- 未 commit。

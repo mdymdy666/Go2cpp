@@ -212,17 +212,20 @@ def main():
     # 「应输出 N」为可选声明（旧 README 格式），不再强制。
     # 22 内置 + 3 检索 + 4 监控 = 29 的分解也要自洽。
     breakdown = re.search(
-        r"(\d+)\s*内置\s*\+\s*(\d+)\s*检索\s*\+\s*(\d+)\s*监控\s*=\s*(\d+)",
+        r"(\d+)\s*内置\s*\+\s*(\d+)\s*检索\s*\+\s*(\d+)\s*监控"
+        r"(?:\s*\+\s*(\d+)\s*Socket)?\s*=\s*(\d+)",
         readme)
     if breakdown:
-        builtin, retrieval, monitor, total = (int(part) for part in
-                                              breakdown.groups())
-        check(builtin + retrieval + monitor == total,
-              "README 工具分类相加应等于总数", f"{builtin}+{retrieval}+{monitor}!={total}")
-        check(total == actual_tools,
+        builtin, retrieval, monitor, socket, total = breakdown.groups()
+        socket_count = int(socket) if socket else 0
+        parts = int(builtin) + int(retrieval) + int(monitor) + socket_count
+        check(parts == int(total),
+              "README 工具分类相加应等于总数",
+              f"{builtin}+{retrieval}+{monitor}+{socket_count}!={total}")
+        check(int(total) == actual_tools,
               f"README 工具分类总数应为 {actual_tools}", str(total))
     else:
-        check(False, "README.md 应声明「N 内置 + N 检索 + N 监控 = N」的工具分解")
+        check(False, "README.md 应声明「N 内置 + N 检索 + N 监控 [+ N Socket] = N」的工具分解")
 
     print(f"[docs_consistency] {CHECKS} 项断言，失败 {FAILURES}")
     return 1 if FAILURES else 0

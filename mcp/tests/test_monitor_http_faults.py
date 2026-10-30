@@ -9,7 +9,7 @@
 5. 截断响应（Content-Length 大于实际 body）→ isError，不静默成功；
 6. 非 HTTP 垃圾字节 → isError；
 7. 连接拒绝（Manager 未启动）→ isError + 「Manager 已启动」排查提示；
-8. 每个故障之后：进程存活、ping 正常、tools/list 仍为 29 个工具。
+8. 每个故障之后：进程存活、ping 正常、tools/list 仍为 33 个工具。
 
 用法: test_monitor_http_faults.py <mcp_server>
 """
@@ -260,8 +260,8 @@ def main():
 
         listed = client.request("tools/list")
         tool_names = {item["name"] for item in listed["result"]["tools"]}
-        check(len(listed["result"]["tools"]) == 29,
-              "tools/list 共 29 个工具",
+        check(len(listed["result"]["tools"]) == 33,
+              "tools/list 共 33 个工具",
               str(len(listed["result"]["tools"])))
         for name in ("os_monitor_latest", "os_monitor_stats",
                      "os_monitor_kernel", "os_monitor_health"):
@@ -274,7 +274,7 @@ def main():
         check("fault: internal error" in text, "HTTP 500 响应片段", text[:200])
         check(faults.base_url + "/s500" in text, "HTTP 500 消息含 URL", text[:200])
         check(ping_alive(client), "HTTP 500 之后进程存活")
-        check(len(client.request("tools/list")["result"]["tools"]) == 29,
+        check(len(client.request("tools/list")["result"]["tools"]) == 33,
               "HTTP 500 之后工具表完整")
 
         # 2) HTTP 404
@@ -337,7 +337,7 @@ def main():
         # 9) 故障之后工具表与 ping 仍然正常。
         check(ping_alive(client), "全部故障之后进程存活")
         final_tools = client.request("tools/list")["result"]["tools"]
-        check(len(final_tools) == 29, "全部故障之后工具表完整",
+        check(len(final_tools) == 33, "全部故障之后工具表完整",
               str(len(final_tools)))
     finally:
         faults.stop()

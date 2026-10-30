@@ -89,6 +89,20 @@ target_compile_options(test_monitor_tools PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME monitor_tools COMMAND test_monitor_tools)
 set_tests_properties(monitor_tools PROPERTIES TIMEOUT 120)
 
+# Socket 可观测（真实 TCP/UDP/Unix socket）：list/stats/events/close + 审计。
+add_executable(test_socket_tools test_socket_tools.cpp)
+target_link_libraries(test_socket_tools PRIVATE mcp_core)
+target_compile_options(test_socket_tools PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME socket_tools COMMAND test_socket_tools)
+set_tests_properties(socket_tools PROPERTIES TIMEOUT 120)
+
+# 白名单 / fd 复用（ABA）/ 审计 fail-closed / 环形容量 / 并发。
+add_executable(test_socket_whitelist test_socket_whitelist.cpp)
+target_link_libraries(test_socket_whitelist PRIVATE mcp_core)
+target_compile_options(test_socket_whitelist PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME socket_whitelist COMMAND test_socket_whitelist)
+set_tests_properties(socket_whitelist PROPERTIES TIMEOUT 120)
+
 # e2e 辅助进程：真实 Manager，端口由内核分配并通过 stdout 报告（PORT=<n>）。
 add_executable(fake_monitor_manager fake_monitor_manager.cpp)
 target_link_libraries(fake_monitor_manager PRIVATE go2cpp_os_monitor)
@@ -144,6 +158,12 @@ if (Python3_Interpreter_FOUND)
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_monitor_http_faults.py
                      $<TARGET_FILE:mcp_server>)
     set_tests_properties(monitor_http_faults PROPERTIES TIMEOUT 120)
+
+    # socket 工具 e2e：真 mcp_server（stdio）+ 真实审计文件。
+    add_test(NAME socket_e2e
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_socket_e2e.py
+                     $<TARGET_FILE:mcp_server>)
+    set_tests_properties(socket_e2e PROPERTIES TIMEOUT 120)
 
     # 文档一致性：README/docs 声明的 ctest 数、工具数与实际 ctest -N /
     # tools/list 一致，测试地图逐项覆盖全部 ctest。

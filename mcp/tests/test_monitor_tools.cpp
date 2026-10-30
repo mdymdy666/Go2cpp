@@ -301,8 +301,10 @@ int main() {
             CallTool(live, "os_monitor_latest",
                      {{"manager_url", base_url + "/does-not-exist"}, {"timeout_ms", 1000}});
         CHECK(result.first);
-        CHECK(result.second.find("无法访问 Manager") != std::string::npos);
-        CHECK(result.second.find("响应无法解析") != std::string::npos);
+        // 当前 HTTP 客户端能解析无 body 的 404，因此给出的是更明确的
+        // 「HTTP 404 + 路径不存在」诊断（旧断言基于解析失败时的兜底文本）。
+        CHECK(result.second.find("HTTP 404") != std::string::npos);
+        CHECK(result.second.find("路径不存在") != std::string::npos);
     }
 
     // 3.7 参数覆盖地址：manager_url 优先于注册时的 base_url。

@@ -18,6 +18,7 @@
 #include "mcp/tools/builtin_tools.hpp"
 #include "mcp/tools/monitor_tools.hpp"
 #include "mcp/tools/retrieval_tools.hpp"
+#include "mcp/tools/socket_tools.hpp"
 #include "transport/http_transport.hpp"
 #include "transport/stdio_transport.hpp"
 
@@ -97,6 +98,10 @@ std::unique_ptr<Application> Application::Create(AppOptions options, std::string
     tools::RegisterMonitorTools(
         application->m_registry,
         tools::MakeHttpMonitorClient(std::move(monitor_options)));
+
+    // Socket 工具：数据源是进程内注册表（/proc/self/fd + TCP_INFO）；
+    // 关闭仅限业务登记过的 fd，审计默认写 log/mcp-socket-audit.log。
+    tools::RegisterSocketTools(application->m_registry);
 
     // 启动自检：订阅模式下索引应完整覆盖注册表。只有不一致（说明增量路径丢事件，
     // 例如 embedding 失败）时才回退到全量重建，正常启动不发生全量重算。
