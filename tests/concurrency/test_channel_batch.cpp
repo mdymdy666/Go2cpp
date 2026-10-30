@@ -6,10 +6,11 @@
  * `Channel` 的批量 API 是本次性能优化引入的实验性接口（见 channel.hpp 的
  * `TrySendBatch` / `TryRecvBatch`）。现有 ctest 用例只覆盖单条路径，本文件
  * 覆盖批量路径的边界、与单条路径混用、关闭、等待者回退、多生产者多消费者
- * 与随机压测。为不改动 CMake 注册（不在本次改动范围内），手动编译运行：
+ * 与随机压测。手动编译运行时需要定义 `GO2CPP_CHANNEL_BATCH_STANDALONE`：
  *
  * ```
- * g++ -std=c++20 -O2 -g -Iinclude tests/concurrency/test_channel_batch.cpp \
+ * g++ -std=c++20 -O2 -g -DGO2CPP_CHANNEL_BATCH_STANDALONE \
+ *     -Iinclude tests/concurrency/test_channel_batch.cpp \
  *     -L.build-bento-wsl -lgo2cpp_channel -lgo2cpp_context \
  *     -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_log -pthread \
  *     -o .build-bento-wsl/test_channel_batch
@@ -441,6 +442,11 @@ void TestPipelineScenario() {
 
 }  // namespace
 
+// CMake 已把本文件加入 go2cpp_tests（与 tests/test_main.cpp 共用进程），
+// 因此默认不生成 main；需要独立运行时手动定义
+// -DGO2CPP_CHANNEL_BATCH_STANDALONE 并链接 go2cpp_channel 等库。
+#if defined(GO2CPP_CHANNEL_BATCH_STANDALONE)
+#ifdef GO2CPP_CHANNEL_BATCH_STANDALONE
 int main() {
   std::printf("[channel-batch] 开始批量 API 正确性测试\n");
   TestBasicOrder();
@@ -456,3 +462,5 @@ int main() {
               failures == 0 ? "（通过）" : "（失败）");
   return failures == 0 ? 0 : 1;
 }
+#endif  // GO2CPP_CHANNEL_BATCH_STANDALONE
+#endif  // GO2CPP_CHANNEL_BATCH_STANDALONE

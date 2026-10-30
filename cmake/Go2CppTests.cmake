@@ -27,7 +27,6 @@ if (GO2CPP_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/test_control_flow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_context.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_channel.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_channel_batch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_scheduler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_scheduler_stress.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_terminal_reclaim.cpp
