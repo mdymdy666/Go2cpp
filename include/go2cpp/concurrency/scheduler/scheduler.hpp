@@ -480,8 +480,12 @@ public:
     // 将 owner、取消门和首次入队的状态转换合并为一次锁操作。
     // 外部生产者的热路径必须保持这个原子边界，避免在多个状态锁之间
     // 反复切换；失败时不会发布队列节点。
+    // live_tasks 指向所属 Scheduler 的「未终态 G 数」原子计数：首次入队
+    // 成功时 +1，进入终态时 -1。nullptr 表示调用方不是真实调度器
+    // （状态机测试），此时不参与关停计数。
     bool prepare_enqueue(const std::shared_ptr<const void>& owner,
-                         const std::shared_ptr<TaskCancellationGate>& gate) noexcept;
+                         const std::shared_ptr<TaskCancellationGate>& gate,
+                         std::atomic<std::size_t>* live_tasks = nullptr) noexcept;
     // 把任务绑定到唯一 Scheduler。owner 是不透明身份令牌，不会延长
     // Scheduler 对象的生命周期；返回值表示绑定是否成功。
     bool bind_owner(const std::shared_ptr<const void>& owner) noexcept;
@@ -532,6 +536,11 @@ private:
     bool request_cancel(bool notify = true) noexcept;
     bool terminal() const noexcept;
     void notify_terminal() noexcept;
+    // 存活 G 计数钩子。二者都要求调用方持有 m_transition_mutex：
+    // 计数增减与状态转移共用同一线性化点，draining 才能用 O(1) 计数
+    // 代替「每完成一个 G 扫描整张注册表」的 O(n) 判定。
+    void bind_live_counter_locked(std::atomic<std::size_t>* counter) noexcept;
+    void release_live_counter_locked() noexcept;
 
     GId m_id;
     Function m_function;
@@ -547,6 +556,11 @@ private:
     std::atomic<bool> m_deferred_enqueue{false};
     std::atomic<bool> m_wake_pending{false};
     std::atomic<bool> m_registered{false};
+    // 上述计数的弱引用。指针由 Scheduler::Impl 持有、生存期内地址稳定；
+    // 只在 m_live_counted 为 true（已计入且尚未终态）期间访问，终态时
+    // 在同一临界区内清空。m_live_counted 由 m_transition_mutex 保护。
+    std::atomic<std::size_t>* m_live_tasks{nullptr};
+    bool m_live_counted{false};
     std::atomic<bool> m_execution_claim{false};
     std::atomic<bool> m_run_claim{false};
     std::atomic<bool> m_started{false};

@@ -489,7 +489,8 @@ void Task::bind_cancellation_gate(
 
 bool Task::prepare_enqueue(
     const std::shared_ptr<const void>& owner,
-    const std::shared_ptr<TaskCancellationGate>& gate) noexcept {
+    const std::shared_ptr<TaskCancellationGate>& gate,
+    std::atomic<std::size_t>* live_tasks) noexcept {
     if (!owner || !gate) {
         return false;
     }
@@ -511,7 +512,33 @@ bool Task::prepare_enqueue(
         return false;
     }
     m_queued.store(true, std::memory_order_release);
+    // 一个 G 从首次入队成功到进入终态是一个连续的非终态区间：在这里
+    // 计入存活数，终态转移时再递减。draining 只需比较这个计数是否归零，
+    // 不再为每个完成的 G 扫描整张注册表（旧实现的 O(n²) 关停）。
+    bind_live_counter_locked(live_tasks);
     return true;
+}
+
+void Task::bind_live_counter_locked(
+    std::atomic<std::size_t>* counter) noexcept {
+    if (counter == nullptr || m_live_counted) {
+        return;
+    }
+    m_live_tasks = counter;
+    m_live_counted = true;
+    counter->fetch_add(1, std::memory_order_release);
+}
+
+void Task::release_live_counter_locked() noexcept {
+    if (!m_live_counted) {
+        return;
+    }
+    m_live_counted = false;
+    auto* counter = m_live_tasks;
+    m_live_tasks = nullptr;
+    if (counter != nullptr) {
+        counter->fetch_sub(1, std::memory_order_acq_rel);
+    }
 }
 
 bool Task::promote_new() noexcept {
@@ -736,6 +763,7 @@ bool Task::request_cancel(bool notify) noexcept {
             !m_execution_claim.load(std::memory_order_relaxed)) {
             m_state.store(GState::kCancelled, std::memory_order_release);
             m_queued.store(false, std::memory_order_release);
+            release_live_counter_locked();
             became_terminal = true;
         }
         m_wake_pending.store(false, std::memory_order_release);
@@ -803,6 +831,7 @@ bool Task::cancel_if_runnable_unqueued() noexcept {
         m_state.store(GState::kCancelled, std::memory_order_release);
         m_wake_pending.store(false, std::memory_order_relaxed);
         m_deferred_enqueue.store(false, std::memory_order_relaxed);
+        release_live_counter_locked();
     }
     notify_terminal();
     return true;
@@ -907,6 +936,7 @@ void Task::run() {
             {
                 std::lock_guard<std::mutex> lock(m_transition_mutex);
                 m_state.store(GState::kFailed, std::memory_order_release);
+                release_live_counter_locked();
                 m_execution_claim.store(false, std::memory_order_release);
                 m_run_claim.store(false, std::memory_order_release);
             }
@@ -982,6 +1012,7 @@ void Task::run() {
                                                    ? GState::kCancelled
                                                    : GState::kDead);
             m_state.store(terminal_state, std::memory_order_release);
+            release_live_counter_locked();
             // A cancelled-before-first-resume Fiber can still retain the
             // callable. Move it out while updating state, then destroy it
             // after the transition lock is released.
@@ -1913,8 +1944,16 @@ public:
     }
 
     bool finish_draining_locked() noexcept {
-        if (!draining.load(std::memory_order_acquire) ||
-            !all_tasks_terminal_locked()) {
+        if (!draining.load(std::memory_order_acquire)) {
+            return false;
+        }
+        // 快路径：还有 G 未终态时直接返回，不做任何全表扫描。计数归零
+        // 后才做一次全表确认 —— 即使计数因某条漏减路径提前归零，这里也
+        // 会拒绝提前结束，正确性优先于性能。
+        if (live_tasks.load(std::memory_order_acquire) != 0) {
+            return false;
+        }
+        if (!all_tasks_terminal_locked()) {
             return false;
         }
         draining.store(false, std::memory_order_release);
@@ -1979,6 +2018,11 @@ public:
     std::deque<std::shared_ptr<Machine>> machines;
     std::atomic<bool> started{false};
     std::atomic<bool> draining{false};
+    // 注册表中尚未进入终态的 G 数（未启动 / runnable / running / parked）。
+    // 首次入队成功时 +1，终态转移时 -1；两者都在 Task 的
+    // m_transition_mutex 内完成。draining 用「归零」做 O(1) 完成判定，
+    // 再配合一次全表确认兜底，取代旧实现每完成一个 G 扫描全表的 O(n²)。
+    std::atomic<std::size_t> live_tasks{0};
     std::atomic<bool> stopping{false};
     std::atomic<bool> accepting{true};
     std::atomic<std::size_t> runnable{0};
@@ -2217,8 +2261,11 @@ bool Scheduler::shutdown_for(
     // std::thread can; discarding its suspended stack would skip RAII.
     {
         std::unique_lock<std::mutex> lock(m_impl->mutex);
+        // O(1) 快路径：draining 每完成一个 G 都会 notify，若每次唤醒都
+        // 全表扫描，10 万 G 的关停会回到 O(n²)。计数归零后再由
+        // finish_draining_locked() 做一次全表确认兜底。
         const auto terminal = [this] {
-            return m_impl->all_tasks_terminal_locked();
+            return m_impl->live_tasks.load(std::memory_order_acquire) == 0;
         };
         const bool completed =
             bounded ? m_impl->condition.wait_until(lock, deadline, terminal)
@@ -2531,7 +2578,8 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         return false;
     }
     if (!task->prepare_enqueue(m_impl->owner_token,
-                               m_impl->cancellation_gate)) {
+                               m_impl->cancellation_gate,
+                               &m_impl->live_tasks)) {
         GO2CPP_DEBUG_EVENT(kEnqueueRejected, task->id(), 5);
         return false;
     }
@@ -4373,12 +4421,23 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             const std::size_t collect_interval =
                 m_impl->config.terminal_collect_interval;
             if (draining) {
-                // 收尾路径必须全表回收，并配合 finish_draining_locked()
-                // 判断注册表是否已全部终态。
-                std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
-                m_impl->collect_terminal_locked(deferred_destruction);
-                (void)m_impl->finish_draining_locked();
-                terminal_since_collect = 0;
+                // 收尾阶段的完成判定是 O(1) 的：只有最后一个 G 进入终态
+                // 才对全表做一次确认与回收。旧实现在这里每完成一个 G 就
+                // 扫两遍注册表（collect + all_terminal），10 万 G 的
+                // shutdown 因此退化成 O(n²)。
+                if (m_impl->live_tasks.load(std::memory_order_acquire) == 0) {
+                    bool finished = false;
+                    {
+                        std::lock_guard<std::mutex> admission_lock(
+                            m_impl->mutex);
+                        m_impl->collect_terminal_locked(deferred_destruction);
+                        finished = m_impl->finish_draining_locked();
+                        terminal_since_collect = 0;
+                    }
+                    if (finished) {
+                        m_impl->notify_all_workers();
+                    }
+                }
             } else if (collect_interval != 0 &&
                        terminal_since_collect >= collect_interval) {
                 // 常规路径按节拍轮转压缩一个条带：单次扫描量是存活 G 总数
@@ -4393,11 +4452,9 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                                                        deferred_destruction);
                 terminal_since_collect = 0;
             }
-            if (draining) {
-                m_impl->notify_all_workers();
-            } else if (!requeued_self &&
-                       task->state() != GState::kWaiting &&
-                       m_impl->runnable.load(std::memory_order_relaxed) != 0) {
+            if (!draining && !requeued_self &&
+                task->state() != GState::kWaiting &&
+                m_impl->runnable.load(std::memory_order_relaxed) != 0) {
                 // 只有"本 M 真正结束了一个 G、且仍有可运行任务"时才踢一个
                 // 空闲 M。
                 //
@@ -4429,7 +4486,12 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             std::vector<std::shared_ptr<Task>> deferred_destruction;
             {
                 std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
-                m_impl->collect_terminal_locked(deferred_destruction);
+                // draining 中的全表回收推迟到存活计数归零（收尾完成点），
+                // 否则每消费一个 stale 节点都全表扫描会退化成 O(n²)。
+                if (!m_impl->draining.load(std::memory_order_acquire) ||
+                    m_impl->live_tasks.load(std::memory_order_acquire) == 0) {
+                    m_impl->collect_terminal_locked(deferred_destruction);
+                }
             }
             terminal_since_collect = 0;
             for (auto& retained_task : deferred_destruction) {

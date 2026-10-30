@@ -199,3 +199,78 @@ ASan/LSan 0 报告。详细报告见 `example/WarningDocement/audit-mcp-socket.m
 - 已知限制：事件仅进程内、UDP/Unix 无 TCP_INFO、审计非事务、close 与外部并发
   关闭同一 fd 存在理论 TOCTOU。见审计报告第 7 节。
 - 未 commit。
+
+## 2026-10-30 sync::Mutex P1 修复（状态字非原子清理破坏互斥性）
+
+### 一、问题与修复
+
+- **缺陷**：`sync::Mutex` 的超时/取消清理、`Arm()` 失败清理、`DropWakeToken`
+  与 `Unlock` 慢路径共 5 处用非原子 `load`+`store` 改写 `m_state`；
+  `TryLock`/`Lock` 快路径的 CAS 不持 `m_mutex`，store 用旧快照覆盖刚写入的
+  `kLocked`，使两个执行流同时持锁。修复前 3 秒实测 9–34 次
+  `unlock of unlocked mutex`、629–1683 次双持。
+- **修复**：新增 `Mutex::Impl::UpdateStateAtomic`（CAS 循环，
+  `sync.cpp:1084-1106`），把上述 5 处（共 10 个 `store`）全部改为原子 RMW；
+  `m_state.store` 计数归零。状态机（正常/饥饿/唤醒令牌）与分支条件不变，
+  CAS 仍在原 `m_mutex` 临界区内。
+- **顺带**：`waiters_after`/`debug_count` 包进 `#if GO2CPP_DEBUG_RESOURCES`，
+  消除 Release 下 2 个 `-Wunused-but-set-variable`。
+- 只改 `src/concurrency/sync.cpp`；未改 base 其他；未 commit。
+
+### 二、验证
+
+- 修复后 10 轮 × 3 秒：0 次解锁异常、0 次双持（helper 约 13.7 亿次锁操作）。
+- 随机 8×800 × 10 次：0 overlap / 0 unlock_error / clean_after=1。
+- `GO2CPP_TEST_FILTER=sync`、`=locks` 通过；`go2cpp_sync_cancel_stress 5000` 通过。
+- `.build-bento-wsl` 干净重建：`sync.cpp` 0 警告；全量 0 error（其他文件既有
+  24 个警告，不在本任务边界内）。
+- 报告：`example/WarningDocement/audit-base-sync.md` §6/§8；详细数据
+  `/tmp/sync_p1_fix.md`。
+
+### 三、后续状态
+
+- 未 commit；未跑 TSan/ASan（普通 Release，行为复现判定）。
+- Fiber 场景下的 P1 修复未单独压测（复现与回归均为 native 线程）。
+
+## 2026-10-30 scheduler shutdown O(n²) 修复（P1-1）
+
+### 一、结论
+
+修复 `audit-base-scheduler.md` 的 P1-1：draining 阶段每完成一个 G 做两次全表扫描
+导致 `shutdown()` O(n²)。改为 O(1) 存活计数判定；10 万 parked G 关停
+45.2 s → **3.33 s**，40 万积压 >6 min → **13.16 s**。
+
+### 二、代码改动
+
+- `include/go2cpp/concurrency/scheduler/scheduler.hpp`：
+  - `Task::prepare_enqueue()` 增加可选 `live_tasks` 计数指针；
+  - `Task` 新增 `m_live_tasks` / `m_live_counted` 与
+    `bind_live_counter_locked()` / `release_live_counter_locked()`；
+- `src/concurrency/scheduler.cpp`：
+  - `Impl` 新增 `std::atomic<std::size_t> live_tasks`；
+  - 首次入队成功 +1，四个终态转移点 -1（同一 `transition_mutex` 内）；
+  - `finish_draining_locked()` / `shutdown_for()` 等待谓词改为 O(1) 计数，
+    归零后仍做一次全表确认兜底；
+  - worker 完成路径只在计数归零时回收注册表，draining 期间去掉逐 G 广播；
+  - stale 队列节点的回收推迟到计数归零。
+- 未改 base 其他模块；未 commit。
+
+### 三、验证结果
+
+- `.build-bento-wsl` 完整 `ninja`：0 warning / 0 error。
+- 现有 scheduler 测试套件（scheduler/stress/terminal_reclaim/dynamic_scheduler/smoke）：
+  failures=0。
+- 随机 shutdown 竞态 5 seeds × 6000 步 = 30,000 步：0 失败。
+- shutdown/cancel/wake 三方竞态 20 轮 × 4000 任务：0 失败。
+- 扩展性（3 次取最小）：1 万 221 ms、5 万 1,268 ms、10 万 3,325 ms、
+  40 万 13,161 ms（均 `workers=0 / alive=0`）。
+- 详细报告：`/tmp/scheduler_shutdown_fix.md`（副本
+  `/var/tmp/shutdown_fix/scheduler_shutdown_fix.md`）。
+
+### 四、后续状态
+
+- 10 万未达 <2 s：剩余为 10 万个 parked Fiber 的栈释放成本（strace 52.8% 在
+  mmap/munmap/mprotect；单 worker 1,831 ms < 4 worker 3,325 ms）；建议后续在
+  fiber 模块做栈 arena / 批量串行释放，超出本批边界。
+- 未 commit。
+
