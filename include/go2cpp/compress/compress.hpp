@@ -14,25 +14,25 @@
  *   | `gzip.NewWriter` / `*gzip.Writer` | `compress::Gzip::Writer<WriterT>` |
  *   | `flate.DefaultCompression` 等 | `compress::DefaultCompression` 等（每个类也有同名常量） |
  *
- *   **本模块不自研 DEFLATE**。Huffman 编码 + LZ77 滑动窗口是数百行的算法，
- *   自实现几乎必然在「跨块匹配、动态码表、边界距离」上出错，而且自己压、
- *   自己解可以两边同错还能通过测试。这里全部委托系统 zlib（`-lz`），
- *   只负责三件事：
+ *   **DEFLATE 由本模块自研**：编码器在 `src/compress/deflate_writer.hpp`
+ *   （LZ77 + 固定 Huffman），解码器在 `src/compress/deflate_reader.hpp`
+ *   （stored / fixed / dynamic Huffman）。RFC 1950/1952 的头尾与
+ *   adler32/crc32 也在本模块内实现，因此不再依赖系统 zlib。
  *
- *   1. **格式选择**：windowBits `-15` / `15` / `31`；
+ *   本模块负责三件事：
+ *
+ *   1. **格式封装**：raw deflate（RFC 1951）、zlib（RFC 1950）、gzip（RFC 1952）；
  *   2. **流式 IO 适配**：把任意 `ReaderT` / `WriterT`（`streams` 契约）接到
- *      zlib 的 `next_in` / `next_out` 模型上，处理部分读写、短写、EOF、
- *      多成员 gzip、错误码翻译；
+ *      自研编解码器的增量状态机，处理部分读写、短写、EOF、多成员 gzip；
  *   3. **API 形态**：与项目其他模块一致的 `Read(ByteSpan)` / `Write(ByteSpan)`、
  *      粘性 `Err()`、显式 `Flush()` / `Close()`。
  *
- *   因此格式正确性由 zlib 保证，而**互操作**（`gzip -d` 能解、`gzip -c` 能读）
- *   才是本模块需要证明的东西——见 `tests/compress/test_interop.cpp`。
+ *   格式正确性由**独立实现**（Python `zlib`、GNU `gzip`）的双向互操作证明，
+ *   见 `tests/compress/test_interop.cpp`；自己压、自己解只证明内部一致。
  *
  *   ## 依赖
- *   CMake 用 `find_package(ZLIB REQUIRED)` 解析系统 zlib，链接 `go2cpp::compress`
- *   即可传递 `ZLIB::ZLIB`。若目标平台没有 zlib，configure 会直接失败——
- *   这是有意的：**不提供「没有 zlib 时的空实现」**，否则会静默产出坏数据。
+ *   零外部压缩库依赖：链接 `go2cpp::compress` 只需要 `go2cpp::error`，
+ *   不再传递 `ZLIB::ZLIB`，也不需要 `find_package(ZLIB)`。
  *
  *   ## 用法
  *   @code

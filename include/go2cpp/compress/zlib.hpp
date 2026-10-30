@@ -2,8 +2,8 @@
  * @file zlib.hpp
  * @brief `compress::Zlib` —— zlib 格式（RFC 1950：2 字节头 + DEFLATE + adler32 尾）。
  *
- * @details 对应 Go 的 `compress/zlib`。DEFLATE 同样委托系统 zlib，
- *   `windowBits = 15` 让 zlib 负责写入/校验：
+ * @details 对应 Go 的 `compress/zlib`。DEFLATE 由本模块自研，
+ *   `windowBits = 15` 选择 zlib 封装（RFC 1950）；头尾由本模块写入/校验：
  *
  *   - 头 2 字节：`CMF`（0x78，CM=8 + 窗口 32 KiB）与 `FLG`（FLEVEL 由级别决定、
  *     FDICT=0、`(CMF<<8|FLG) % 31 == 0`）；
@@ -15,14 +15,15 @@
  *   1. **不支持预置字典**（`FDICT=1`）：遇到会返回 `ErrDictionary()`。
  *      Go 的 `zlib.NewReaderDict` 需要字典参数，本模块没有这种使用场景，
  *      与其留一个「需要额外状态」的半成品接口，不如明确报错。
- *      （C 类：需要时用 zlib 的 `inflateSetDictionary`/`deflateSetDictionary` 补齐。）
+ *      （需要时可在自研解码器里加字典窗口初始化，当前没有调用场景。）
  *   2. `Resetter` 已支持：`Reader::Reset(source)` / `Writer::Reset(destination)`
- *      复用 zlib 状态；`Writer.Flush` 语义与 Go 相同（`Z_SYNC_FLUSH`）。
+ *      复用 DEFLATE 状态；`Writer.Flush` 写空存储块实现同步冲刷。
  *
  * ## 阅读建议
- * 先看 `Reader` 的「单流」语义（到 `Z_STREAM_END` 即结束，尾后多余字节忽略），
+ * 先看 `Reader` 的「单流」语义（成员结束即结束，尾后多余字节忽略），
  * 再对比 `gzip.hpp` 的多成员；`Writer` 侧与 `Flate::Writer` 完全同构，只是
- * windowBits 为 15、尾部多一个 adler32。错误码翻译在 `inflater.cpp` 文件头。
+ * windowBits 为 15、尾部多一个 adler32。错误分类在
+ * `src/compress/inflater.cpp` 的文件头。
  */
 #pragma once
 

@@ -30,6 +30,13 @@
  * - **服务端 TLS**（只有客户端）；
  * - **会话复用 / 0-RTT**。
  *
+ * ## 构建开关（GO2CPP_WITH_TLS）
+ *
+ * 默认 ON，需要 OpenSSL。`-DGO2CPP_WITH_TLS=OFF` 时不链接
+ * libssl/libcrypto：本类仍保留定义（保证既有目标可链接），但
+ * `CreateClient()` 一律返回 `nullptr`、`Handshake()` 返回 false、
+ * `Read()`/`Write()` 返回 0，**不会**静默降级成明文连接。
+ *
  * ## 本文件定义什么
  * - `TlsTransport`：`Transport` 的 TLS 实现；`CreateClient()` 建上下文，
  *   `Handshake()` 走 TLS 握手并读取 ALPN 结果；

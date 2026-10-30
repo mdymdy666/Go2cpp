@@ -4,6 +4,10 @@
  */
 #include "go2cpp/network/http2/tls_transport.hpp"
 
+// TLS 是可选的：GO2CPP_WITH_TLS=OFF 时本文件只编译下面的 stub，不 include
+// 任何 OpenSSL 头、也不要求链接 libssl/libcrypto。未定义宏时默认保持旧行为。
+#if !defined(GO2CPP_WITH_TLS) || GO2CPP_WITH_TLS
+
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -503,3 +507,96 @@ std::size_t TlsTransport::Write(const std::uint8_t* data, std::size_t length) {
 }
 
 }  // namespace go2cpp::net::http2
+
+#else  // GO2CPP_WITH_TLS == 0
+
+#include <string>
+#include <utility>
+
+namespace go2cpp::net::http2 {
+
+namespace {
+
+/// 编译期关闭 TLS 时的统一诊断文本。
+constexpr const char* kTlsDisabledMessage =
+    "TLS 支持未编译：请在 CMake 中设置 -DGO2CPP_WITH_TLS=ON 并安装 OpenSSL";
+
+}  // namespace
+
+TlsTransport::TlsTransport(Socket::Ptr socket, Duration timeout)
+    : m_socket(std::move(socket)), m_timeout(timeout) {}
+
+TlsTransport::~TlsTransport() = default;
+
+std::unique_ptr<TlsTransport> TlsTransport::CreateClient(
+    Socket::Ptr socket, const std::string& server_name, bool verify_peer,
+    Duration timeout, const std::string& ca_file, const std::string& ca_path) {
+    (void)socket;
+    (void)server_name;
+    (void)verify_peer;
+    (void)timeout;
+    (void)ca_file;
+    (void)ca_path;
+    return nullptr;
+}
+
+std::chrono::steady_clock::time_point TlsTransport::Deadline() const {
+    return std::chrono::steady_clock::now();
+}
+
+bool TlsTransport::WaitFor(bool want_read,
+                           std::chrono::steady_clock::time_point deadline) {
+    (void)want_read;
+    (void)deadline;
+    return false;
+}
+
+void TlsTransport::RecordSslError(int ssl_error) {
+    m_last_ssl_error.store(ssl_error, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(m_error_mutex);
+    m_last_error = kTlsDisabledMessage;
+}
+
+int TlsTransport::LastError() const noexcept {
+    return m_last_ssl_error.load(std::memory_order_acquire);
+}
+
+std::string TlsTransport::LastErrorString() const {
+    std::lock_guard<std::mutex> lock(m_error_mutex);
+    return m_last_error.empty() ? std::string(kTlsDisabledMessage) : m_last_error;
+}
+
+void TlsTransport::Close() {
+    m_shutdown_sent.store(true, std::memory_order_release);
+    m_eof = true;
+}
+
+bool TlsTransport::Handshake(std::string* error) {
+    if (error != nullptr) {
+        *error = kTlsDisabledMessage;
+    }
+    m_eof = true;
+    return false;
+}
+
+std::string TlsTransport::TlsVersion() const {
+    return std::string();
+}
+
+std::size_t TlsTransport::Read(std::uint8_t* buffer, std::size_t capacity) {
+    (void)buffer;
+    (void)capacity;
+    m_eof = true;
+    return 0;
+}
+
+std::size_t TlsTransport::Write(const std::uint8_t* data, std::size_t length) {
+    (void)data;
+    (void)length;
+    m_eof = true;
+    return 0;
+}
+
+}  // namespace go2cpp::net::http2
+
+#endif  // GO2CPP_WITH_TLS

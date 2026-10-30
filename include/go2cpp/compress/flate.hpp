@@ -2,14 +2,13 @@
  * @file flate.hpp
  * @brief `compress::Flate` —— raw DEFLATE（RFC 1951，**无头无尾**）。
  *
- * @details 对应 Go 的 `compress/flate`。DEFLATE 本身（Huffman 编码 + LZ77
- *   滑动窗口）**不在本模块实现**，全部委托系统 zlib（`-lz`）：
+ * @details 对应 Go 的 `compress/flate`。DEFLATE 由本模块自研：
  *
- *   - 压缩：`deflateInit2(level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY)`；
- *   - 解压：`inflateInit2(-15)`。
+ *   - 压缩：LZ77 滑动窗口 + 固定 Huffman（`src/compress/deflate_writer.hpp`）；
+ *   - 解压：stored / fixed / dynamic Huffman（`deflate_reader.hpp`）。
  *
- *   `windowBits = -15` 是 zlib 表达「raw deflate」的唯一方式：负号表示
- *   **不写也不解析** zlib 头（2 字节）与 adler32 尾（4 字节）。
+ *   `windowBits = -15` 仍表示「raw deflate」：不写也不解析 zlib 头（2 字节）
+ *   与 adler32 尾（4 字节）。它只是构造参数，不再传给 zlib。
  *
  *   @warning raw deflate **没有任何校验和**：被篡改的流可能解出「长度不同但
  *   不报错」的数据，也可能报 `ErrCorrupt`，取决于损坏位置。要检测损坏请用
@@ -32,18 +31,18 @@
  *   1. Go 的 `flate.NewWriter` 返回 `(w, error)`；这里把错误存进 Writer 并在
  *      `Err()` / `Write()` / `Flush()` / `Close()` 返回。构造函数不抛异常，
  *      便于和项目其他模块（`bufio`、`os`）的 `Err()` 风格一致。
- *   2. Go 的 `flate.Reader` 是 `io.ReadCloser`；本类的 zlib 状态在析构时释放，
- *      没有 `Close()` 方法（解压不需要「结束」动作）。
- *   3. 支持 `Resetter`（`Reader::Reset` / `Writer::Reset`）：复用 zlib 状态，
+ *   2. Go 的 `flate.Reader` 是 `io.ReadCloser`；本类的 DEFLATE 状态在析构时
+ *      释放，没有 `Close()` 方法（解压不需要「结束」动作）。
+ *   3. 支持 `Resetter`（`Reader::Reset` / `Writer::Reset`）：复用 DEFLATE 状态，
  *      但**不**替上一个 writer 调用 `Close()`（与 Go 一致，半截流责任自负）。
  *
  *   ## 已知未支持项及原因（C 类，有意不做）
  *
  *   | 未支持项 | 原因 |
  *   |---|---|
- *   | 预置字典（Go `flate.NewReaderDict` / `NewWriterDict`） | 需要在 `Writer`/`Reader` 构造时额外传字典并在 `Z_NEED_DICT` 时 `inflateSetDictionary`；当前没有调用场景，且会让 API 出现两个构造重载。需要时可基于 zlib 的 `deflateSetDictionary`/`inflateSetDictionary` 增补。 |
- *   | `Writer.Flush` 的 `Z_FULL_FLUSH` / 字节对齐细节 | Go 的 `Flush` 只保证「当前数据可解」，本模块用 `Z_SYNC_FLUSH` 达到同一目的；没有 `Z_FULL_FLUSH`（重置历史窗口）的公开 API。 |
- *   | 自定义 `dict` 与硬件加速 | DEFLATE 完全委托 zlib，硬件加速（如 zlib-ng）由系统库决定；本模块不参与。 |
+ *   | 预置字典（Go `flate.NewReaderDict` / `NewWriterDict`） | 需要额外传字典并在解析到 FDICT 时装载；当前没有调用场景，且会让 API 出现两个构造重载。遇到 FDICT 时直接报 `ErrDictionary()`。 |
+ *   | `Writer.Flush` 的 `Z_FULL_FLUSH` / 字节对齐细节 | Go 的 `Flush` 只保证「当前数据可解」，本模块写一个空存储块再对齐到字节边界；没有「重置历史窗口」的公开 API。 |
+ *   | 自定义 `dict` 与硬件加速 | 纯 C++ 实现，不做 SIMD/硬件加速；热点是哈希链匹配与位读写。 |
  *
  * ## 阅读建议
  * 先看 `Flate::Writer` 的 `Write` / `Flush` / `Close` 生命周期（最容易踩坑的是
@@ -134,9 +133,9 @@ class Flate {
     const ErrorPtr& Err() const noexcept { return m_engine.Err(); }
 
     /**
-     * @brief 对应 Go `Resetter.Reset`：复用当前 zlib 状态，改绑到新数据源。
+     * @brief 对应 Go `Resetter.Reset`：复用当前 DEFLATE 状态，改绑到新数据源。
      * @param source 新的底层 Reader（生命周期必须覆盖后续读取）。
-     * @return 成功为空错误；只有 zlib 状态复位失败才会返回 `ErrInternal()`。
+     * @return 成功为空错误；只有 DEFLATE 状态复位失败才会返回 `ErrInternal()`。
      * @note 会清空上一次流的错误、EOF 标志与多成员状态，然后从新流的第一个
      *       字节开始解析（gzip 仍按当前 `Multistream()` 设置处理）。
      */
@@ -162,7 +161,7 @@ class Flate {
    * `Write` / `Flush` / `Close`。
    *
    * ## 生命周期与线程模型
-   * 构造即初始化 zlib（非法级别变成粘性错误，不抛异常）；必须显式 `Close()`
+   * 构造即初始化 DEFLATE（非法级别变成粘性错误，不抛异常）；必须显式 `Close()`
    * 才能得到完整流。非线程安全：每个实例独占一个 `WriterEngine`。
    */
   template <typename WriterT>
@@ -201,9 +200,9 @@ class Flate {
     bool Closed() const noexcept { return m_engine.Closed(); }
 
     /**
-     * @brief 对应 Go `Resetter.Reset`：复用 zlib 状态，改绑到新输出并开始新流。
+     * @brief 对应 Go `Resetter.Reset`：复用 DEFLATE 状态，改绑到新输出并开始新流。
      * @param destination 新底层 Writer；生命周期必须覆盖后续写入。
-     * @return 成功为空错误（非法级别 / zlib 复位失败时返回对应错误）。
+     * @return 成功为空错误（非法级别 / DEFLATE 复位失败时返回对应错误）。
      * @warning 与 Go 相同：**不会**替上一次流调用 `Close()`。上一个 sink 里
      *          未 `Close()` 的数据仍是半截流；需要完整流请先 `Close()` 再 `Reset`。
      */

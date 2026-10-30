@@ -40,9 +40,14 @@ add_library(go2cpp_io
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io_backend.cpp)
 add_library(go2cpp_log ${CMAKE_CURRENT_SOURCE_DIR}/src/logging/log.cpp)
-# TLS（TlsTransport）依赖 OpenSSL。公共头 tls_transport.hpp 只前置声明
-# SSL/SSL_CTX，OpenSSL 头不会泄漏给使用方，因此作为 PRIVATE 依赖接入。
-find_package(OpenSSL REQUIRED)
+# TLS（TlsTransport）可选：GO2CPP_WITH_TLS=ON 时才 find_package(OpenSSL)
+# 并链接；OFF 时 tls_transport.cpp 只编译 stub，不引入 libssl/libcrypto。
+# Bento 的 PSK 加密是自研 ChaCha20/X25519，不依赖 OpenSSL；只有 http2/tls
+# 模块需要它，因此默认值保持 ON 以兼容既有行为，但可以整体关掉。
+option(GO2CPP_WITH_TLS "Build the OpenSSL-backed TLS transport" ON)
+if (GO2CPP_WITH_TLS)
+    find_package(OpenSSL REQUIRED)
+endif()
 add_library(go2cpp_network
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/address.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/byte_array.cpp
@@ -108,14 +113,10 @@ add_library(go2cpp_container
     ${CMAKE_CURRENT_SOURCE_DIR}/src/container/container.cpp)
 
 # compress 模块：Go `compress/flate`、`compress/zlib`、`compress/gzip` 的薄封装。
-# **不自研 DEFLATE**：Huffman 编码 + LZ77 滑动窗口全部委托系统 zlib
-# （RFC 1951/1950/1952），本模块只做流式 IO 适配、多成员 gzip 与错误翻译。
-#
-# find_package 而不是硬编码 `-lz` 或 `/usr/lib/libz.so`：库名、版本、是否
-# 拆成 libz.so/libz.a 因发行版而异，导入目标 ZLIB::ZLIB 也自带 include 路径。
-# 缺 zlib 时 configure **直接失败**——有意为之：若退化成「编译通过但不压缩」，
-# 会静默产出坏数据，比构建失败难查得多。
-find_package(ZLIB REQUIRED)
+# **自研 DEFLATE**：LZ77 滑动窗口 + 固定 Huffman 编码在 src/compress/
+# deflate_writer.hpp，解码器（stored/fixed/dynamic Huffman）在
+# deflate_reader.hpp。RFC 1950/1952 的头尾与 adler32/crc32 也由本模块实现，
+# 因此不再需要 find_package(ZLIB)，也不链接 libz。
 add_library(go2cpp_compress
     ${CMAKE_CURRENT_SOURCE_DIR}/src/compress/compress.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/compress/deflater.cpp
@@ -123,7 +124,7 @@ add_library(go2cpp_compress
     ${CMAKE_CURRENT_SOURCE_DIR}/src/compress/inflater.cpp)
 # go2cpp_error 是 PUBLIC 依赖：Reader/Writer 是头文件模板，模板实例化时会调用
 # go2cpp::Is / streams::IoEof，使用方必须能链接到 error 模块。
-target_link_libraries(go2cpp_compress PUBLIC go2cpp_error ZLIB::ZLIB)
+target_link_libraries(go2cpp_compress PUBLIC go2cpp_error)
 
 # encoding 模块：Go `encoding/{base64,hex,binary,csv}` 的 C++ 对应实现。
 # 纯 CPU、无 IO / 调度依赖，只链接 error（错误身份锚点）。
@@ -348,8 +349,16 @@ if (TARGET go2cpp_hook)
 else()
     target_compile_definitions(go2cpp_network PRIVATE GO2CPP_NETWORK_HOOK_ENABLED=0)
 endif()
-# TlsTransport 的实现细节：OpenSSL 只出现在 .cpp 里。
-target_link_libraries(go2cpp_network PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+# TlsTransport 的实现细节：OpenSSL 只出现在 .cpp 里，且只在 TLS=ON 时链接。
+if (GO2CPP_WITH_TLS)
+    target_link_libraries(go2cpp_network PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(go2cpp_network PRIVATE GO2CPP_WITH_TLS=1)
+else()
+    # 关闭时不链接 OpenSSL；tls_transport.cpp 编译成 stub，入口返回 nullptr/
+    # 空结果，测试二进制仍可链接，但不会悄悄降级成明文连接。
+    target_compile_definitions(go2cpp_network PRIVATE GO2CPP_WITH_TLS=0)
+    message(STATUS "TLS transport: OFF (TlsTransport stubs; OpenSSL not linked)")
+endif()
 if (TARGET go2cpp_hook)
     target_link_libraries(go2cpp_hook PUBLIC go2cpp_io go2cpp_fiber
                           go2cpp_config ${CMAKE_DL_LIBS})

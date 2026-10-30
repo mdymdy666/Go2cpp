@@ -2,16 +2,16 @@
  * @file gzip.hpp
  * @brief `compress::Gzip` —— gzip 格式（RFC 1952：10 字节头 + DEFLATE + crc32/ISIZE 尾）。
  *
- * @details 对应 Go 的 `compress/gzip`。DEFLATE 同样委托系统 zlib，
- *   `windowBits = 15 + 16 = 31` 让 zlib 负责写入/校验 gzip 封装：
+ * @details 对应 Go 的 `compress/gzip`。gzip 封装与 DEFLATE 载荷都由本模块
+ *   自己写（`windowBits = 15 + 16 = 31` 只用于选择封装格式）：
  *
  *   - 头 10 字节：magic `1f 8b`、CM=8、FLG=0（不写文件名/注释/额外字段）、
  *     MTIME=0（**不写入时间戳**，保证同样输入产出同样字节，测试可复现）、
- *     XFL（级别提示：级别 9 → 2，级别 1 → 4，其余 0）、OS；
+ *     XFL=0、OS=3（Unix）；
  *   - 尾 8 字节：CRC32（未压缩数据）与 ISIZE（未压缩长度 mod 2^32），
  *     均为**小端序**。
  *
- *   zlib 会在解压时校验 CRC32 与 ISIZE，因此篡改尾部会得到 `ErrChecksum()`，
+ *   解压时会校验 CRC32 与 ISIZE，因此篡改尾部会得到 `ErrChecksum()`，
  *   篡改头部会得到 `ErrHeader()`。
  *
  *   ## 多成员（concatenated gzip）
@@ -20,8 +20,8 @@
  *   `gzip -d ab.gz` 得到两段内容的拼接）。`Gzip::Reader` **默认开启**多成员
  *   解析（对齐 Go 的 `Reader.Multistream(true)` 默认值）：
  *
- *   - 一个成员 `Z_STREAM_END` 后，如果输入缓冲还有字节（或还能从源读到字节），
- *     就 `inflateReset2` 并继续解析下一个成员的头；
+ *   - 一个成员结束后，如果输入缓冲还有字节（或还能从源读到字节），
+ *     就 `ResetForNextMember` 并继续解析下一个成员的头；
  *   - 源正好在某成员结束处耗尽 → 正常 `streams::IoEof()`；
  *   - 成员之间若有**非 gzip 数据**（例如补零），会得到 `ErrHeader()`。
  *
@@ -33,17 +33,17 @@
  *      本模块不写这些字段，也不解析后暴露给调用方。需要「读文件名」这类
  *      元信息的场景可以后续加 `Header()`，但那会让 `Reader` 增加一个
  *      与解压无关的状态对象，目前没有需求。
- *      （C 类：支持它需要放弃 `windowBits=31` 让 zlib 生成头部，改为自己写
- *      10 字节头 + raw deflate + 自己算 crc32/ISIZE，约 100 行；收益是
- *      「可复现的 MTIME/OS/文件名」，当前不需要。）
+ *      （写侧固定最小头；读侧已经能跳过 FEXTRA/FNAME/FCOMMENT/FHCRC，
+ *      只是不把字段值暴露给调用方。要暴露时增加一个 `Header()` 即可。）
  *   2. `Resetter` 已支持：`Reader::Reset(source)` / `Writer::Reset(destination)`。
- *   3. 只支持单个 gzip 头部的 10 字节基础字段；不解析 FHCRC/FEXTRA。
+ *   3. 写侧只写 10 字节基础头；读侧支持并跳过 FEXTRA/FNAME/FCOMMENT/FHCRC。
  *
  * ## 阅读建议
  * 先看「多成员（concatenated gzip）」一节——这是 gzip 与 zlib 最大的行为
  * 差异，也是 `Reader::Multistream` 与 `ReaderEngine` 状态机的来源；再看
  * `Gzip::Writer`，它的生命周期与 `Zlib::Writer` / `Flate::Writer` 完全一致。
- * 头/尾字节的解析与 crc32/ISIZE 校验全部由 zlib 完成，本模块只选 windowBits。
+ * 头/尾字节的解析与 crc32/ISIZE 校验都在 `deflate_reader.hpp` /
+ * `deflate_writer.hpp` 里完成，本模块只做格式选择与流式 IO。
  */
 #pragma once
 
