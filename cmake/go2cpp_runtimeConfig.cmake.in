@@ -2,9 +2,7 @@
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
-# go2cpp::compress 的 PUBLIC 依赖是 ZLIB::ZLIB；导出的 target 文件会引用这个
-# 导入目标，所以安装包的使用者这里必须先把 ZLIB 找出来。
-find_dependency(ZLIB)
+# go2cpp::compress 已改为自研 deflate/inflate，不再依赖 ZLIB。
 if (NOT @GO2CPP_NATIVE_CONTEXT@)
     find_dependency(Boost 1.70 COMPONENTS context)
 endif()
