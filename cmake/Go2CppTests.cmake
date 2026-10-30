@@ -538,6 +538,9 @@ if (GO2CPP_BUILD_TESTS)
         -O2 -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_hook_correctness_test COMMAND go2cpp_hook_correctness_test)
     set_tests_properties(go2cpp_hook_correctness_test PROPERTIES TIMEOUT 180)
+    else()
+        message(STATUS "skip go2cpp_hook_correctness_test (GO2CPP_WITH_HOOK=OFF)")
+    endif()
 
 
     # nanosleep / usleep / clock_nanosleep 的 hook 行为：Fiber 里应 park，
