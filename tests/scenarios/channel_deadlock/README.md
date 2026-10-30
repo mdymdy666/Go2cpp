@@ -76,7 +76,8 @@ $BIN --mode=default  --repro=10 --default-retries=3 --default-interval-ms=20
 ```
 
 脚本支持 `--quick`（repro=1）、`--ctest`（由 ctest 以构建目录为 CWD 调用）。
-缺 `go2cpp_channel_deadlock` 时脚本 `exit 77`，ctest 记为 SKIP。
+ctest 模式下缺 `go2cpp_channel_deadlock` 时脚本按**失败**上报（exit 1），
+不再退化成 SKIP；只有手工运行且未构建时才 `exit 77`。
 
 ## 实测输出
 

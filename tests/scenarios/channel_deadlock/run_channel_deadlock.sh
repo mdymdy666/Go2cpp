@@ -20,7 +20,8 @@
 # 构建目录解析顺序：
 #   BUILD_DIR 参数 > GO2CPP_SCENARIO_BUILD_DIR > 当前目录（含 CMakeCache.txt）
 #   > build-doctor-full > build-enhanced > build-debug-full > build-work
-# 缺 demo 可执行文件时 exit 77（ctest 记为 SKIP）。
+# ctest 模式下缺 demo 可执行文件按**失败**上报（FAIL，exit 1）；
+# 只有手工运行且未构建时才 exit 77（环境缺件，SKIP）。
 #
 # ctest 包装：cmake 以 `--ctest` 调用；此时当前工作目录就是构建目录。
 set -u
@@ -62,11 +63,20 @@ fi
 
 BIN="${BUILD_DIR}/go2cpp_channel_deadlock"
 if [ -z "${BUILD_DIR}" ] || [ ! -x "${BIN}" ]; then
-    echo "SKIP: 缺少 ${BIN}" >&2
+    # audit-base-channel.md C5：缺 demo 原先一律 exit 77，ctest 记 SKIP，
+    # 构建/配置回归永远看不到红灯。ctest 模式下 demo 是本构建的产物，
+    # 缺件必须按失败上报；只有手工运行（尚未构建）才保留 77 表示缺件。
+    echo "FAIL: 缺少 ${BIN}" >&2
     echo "  先构建：flock /tmp/go2cpp_build.lock cmake --build ${BUILD_DIR:-build-doctor-full} --target go2cpp_channel_deadlock -j" >&2
+    if [ "${CTEST_MODE}" -eq 1 ]; then
+        exit 1
+    fi
+    echo "SKIP: 手工运行且未构建 demo（ctest 模式下会按失败处理）" >&2
     exit 77
 fi
 if ! command -v timeout >/dev/null 2>&1; then
+    # coreutils 缺失属于环境依赖：保留 77，cmake 侧显式声明
+    # SKIP_RETURN_CODE=77，ctest 记 SKIPPED 而不是 PASS。
     echo "SKIP: 需要 coreutils timeout" >&2
     exit 77
 fi

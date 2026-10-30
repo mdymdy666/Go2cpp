@@ -681,6 +681,26 @@ if (GO2CPP_WITH_BENTO)
         set_tests_properties(bento_relay PROPERTIES SKIP_RETURN_CODE 77)
         set_tests_properties(bento_weaknet_proxy PROPERTIES TIMEOUT 150)
         set_tests_properties(bento_netem PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+
+        # channel 线程压测：Bento 构建默认 GO2CPP_BUILD_TESTS=OFF，是仓库里
+        # 唯一默认开启测试的构建；审计 audit-base-channel.md C2 指出 channel
+        # 在该构建的 ctest 里零覆盖。完整测试套件未启用时在这里补一个轻量
+        # 入口（2 轮 × 2 万条 × 7 场景，约 2s）；GO2CPP_BUILD_TESTS=ON 的
+        # 构建已注册 go2cpp_channel_thread_stress，避免同一装置跑两遍。
+        if (NOT GO2CPP_BUILD_TESTS)
+            add_executable(bento_channel_thread_stress
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_channel_thread_stress.cpp)
+            target_link_libraries(bento_channel_thread_stress PRIVATE
+                go2cpp_runtime)
+            target_compile_options(bento_channel_thread_stress PRIVATE
+                -Wall -Wextra -Wpedantic ${BENTO_OPT_FLAGS})
+            add_test(NAME bento_channel_thread_stress
+                     COMMAND bento_channel_thread_stress
+                         --rounds=2 --msgs=20000 --scenario=all
+                         --hang-sec=60 --no-gdb)
+            set_tests_properties(bento_channel_thread_stress
+                PROPERTIES TIMEOUT 300)
+        endif()
     endif()
 
     message(STATUS "Bento transport: ON (tests=${GO2CPP_BENTO_TESTS})")

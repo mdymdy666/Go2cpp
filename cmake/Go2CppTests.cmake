@@ -216,6 +216,18 @@ if (GO2CPP_BUILD_TESTS)
         -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_tests COMMAND go2cpp_tests)
 
+    # ---- 场景：channel 互等死锁 → select 语义恢复（timeout / multi / default）----
+    # 不依赖 Doctor / CLI / DEBUG_DUMP，只需要 go2cpp_channel_deadlock 与 bash。
+    # 审计 audit-base-channel.md C5：原先只在 GO2CPP_BUILD_ENHANCED 注册，
+    # 默认测试构建永不运行；且缺 demo 时脚本 exit 77 被当成 SKIP。现在默认
+    # 测试构建也注册，--ctest 下缺 demo 由脚本按失败上报（见 C5 修复）。
+    # 本用例使默认测试构建的 ctest 用例数 +1（审计记录原为 130）。
+    add_test(NAME scenario-channel-deadlock
+             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/channel_deadlock/run_channel_deadlock.sh --ctest)
+    set_tests_properties(scenario-channel-deadlock PROPERTIES
+        SKIP_RETURN_CODE 77
+        TIMEOUT 300)
+
     # 回放 v5 压力/一致性测试（独立入口）：合成场景默认构建可跑；真实原语
     # 场景需要 GO2CPP_REPLAY=ON（否则测试内部自动 skip 并记为 PASS）。
     add_executable(go2cpp_replay_v5_stress
@@ -810,6 +822,27 @@ if (GO2CPP_BUILD_TESTS)
              COMMAND go2cpp_channel_concurrency)
     set_tests_properties(go2cpp_channel_concurrency PROPERTIES TIMEOUT 300)
 
+    # 817 行线程版 channel 高频混合压测（mpmc64 / mpmc8_64 / mpmc8_0 /
+    # mpmc1 / mpmc0 / rtt0 / mixed，纯 std::thread，不启动 Scheduler）。
+    # 审计 example/WarningDocement/audit-base-channel.md C2 记录：本文件
+    # 长期只靠手工编译运行，817 行压力在 ctest 中完全不存在。这里按审计
+    # 建议以**小规模**注册（2 轮 × 2 万条 × 7 场景，实测约 2s），长跑仍用
+    # 二进制直接加参数：--rounds=100 --msgs=100000 --no-gdb。
+    # 自带 main，自行汇总 g_errors 并返回非零；挂起由 watchdog（--hang-sec）
+    # 判定后 _exit(3)，不会被 TIMEOUT 静默吞掉。
+    add_executable(go2cpp_channel_thread_stress
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_channel_thread_stress.cpp)
+    target_link_libraries(go2cpp_channel_thread_stress PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_channel_thread_stress PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_channel_thread_stress PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_channel_thread_stress
+             COMMAND go2cpp_channel_thread_stress
+                 --rounds=2 --msgs=20000 --scenario=all
+                 --hang-sec=60 --no-gdb)
+    set_tests_properties(go2cpp_channel_thread_stress PROPERTIES TIMEOUT 300)
+
     add_executable(go2cpp_worker_lifecycle
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_worker_lifecycle.cpp)
     target_link_libraries(go2cpp_worker_lifecycle PRIVATE go2cpp_runtime)
@@ -889,7 +922,8 @@ if (GO2CPP_BUILD_TESTS)
     #   - 缺构建目录 / 可执行 / CLI / python3 时 exit 77，配合
     #     SKIP_RETURN_CODE=77 记为 Skipped 而不是 Failed。
     # 只在对应能力开关全开时注册；默认构建（GO2CPP_BUILD_ENHANCED=OFF）
-    # 不注册任何一条，ctest 用例总数保持 130 不变。
+    # 不注册这里的任何一条增强场景。channel 互等死锁场景不依赖增强能力，
+    # 已移到文件前部的默认测试构建注册（audit C5，用例数 +1）。
     if (GO2CPP_BUILD_ENHANCED)
         # 死锁路由：需要 DebugServer + Doctor + CLI。
         if (GO2CPP_DEBUG_DUMP AND GO2CPP_DIAGNOSTIC AND GO2CPP_WITH_CLI)
@@ -918,13 +952,8 @@ if (GO2CPP_BUILD_TESTS)
                 TIMEOUT 300)
         endif()
 
-        # channel 互等死锁 + select 语义（timeout / multi / default）：
-        # 不依赖 Doctor，只需要 demo 可执行文件与 bash；缺文件时脚本 exit 77。
-        add_test(NAME scenario-channel-deadlock
-                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/scenarios/channel_deadlock/run_channel_deadlock.sh --ctest)
-        set_tests_properties(scenario-channel-deadlock PROPERTIES
-            SKIP_RETURN_CODE 77
-            TIMEOUT 300)
+        # channel 互等死锁场景已上移到默认测试构建（见文件前部
+        # scenario-channel-deadlock 注册，audit C5），此处不再重复注册。
 
         # 既有增强场景保持注册不变（不属于本次三条；仍走原脚本）。
         if (GO2CPP_DEBUG_DUMP AND GO2CPP_WITH_CLI)
