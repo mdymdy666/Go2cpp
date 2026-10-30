@@ -564,32 +564,41 @@ if (GO2CPP_BUILD_TESTS)
 
     # nanosleep / usleep / clock_nanosleep 的 hook 行为：Fiber 里应 park，
     # 普通线程里真阻塞；clock_nanosleep 还要验证 TIMER_ABSTIME 的两种分支。
-    add_executable(go2cpp_hook_sleep_test
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_sleep.cpp)
-    target_link_libraries(go2cpp_hook_sleep_test PRIVATE go2cpp::runtime go2cpp_hook pthread)
-    target_include_directories(go2cpp_hook_sleep_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-    add_test(NAME go2cpp_hook_sleep_test COMMAND go2cpp_hook_sleep_test)
-    set_tests_properties(go2cpp_hook_sleep_test PROPERTIES TIMEOUT 180)
+    if (TARGET go2cpp_hook)
+        add_executable(go2cpp_hook_sleep_test
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_sleep.cpp)
+        target_link_libraries(go2cpp_hook_sleep_test PRIVATE
+            go2cpp::runtime go2cpp_hook pthread)
+        target_include_directories(go2cpp_hook_sleep_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        add_test(NAME go2cpp_hook_sleep_test COMMAND go2cpp_hook_sleep_test)
+        set_tests_properties(go2cpp_hook_sleep_test PROPERTIES TIMEOUT 180)
+    else()
+        message(STATUS "skip go2cpp_hook_sleep_test (GO2CPP_WITH_HOOK=OFF)")
+    endif()
 
 
+    if (TARGET go2cpp_hook)
         add_executable(go2cpp_fiber_transport_test
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_fiber_transport.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/connection.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/frame.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/hpack.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/huffman.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/stream_state.cpp)
-    target_include_directories(go2cpp_fiber_transport_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(go2cpp_fiber_transport_test PRIVATE
-        go2cpp_scheduler go2cpp_network go2cpp_io go2cpp_hook
-        go2cpp_fiber go2cpp_sync)
-    target_compile_options(go2cpp_fiber_transport_test PRIVATE
-        -O2 -Wall -Wextra -Wpedantic)
-    add_test(NAME go2cpp_fiber_transport_test
-             COMMAND go2cpp_fiber_transport_test)
-    set_tests_properties(go2cpp_fiber_transport_test PROPERTIES TIMEOUT 180)
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_fiber_transport.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/connection.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/frame.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/hpack.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/huffman.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/stream_state.cpp)
+        target_include_directories(go2cpp_fiber_transport_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_link_libraries(go2cpp_fiber_transport_test PRIVATE
+            go2cpp_scheduler go2cpp_network go2cpp_io go2cpp_hook
+            go2cpp_fiber go2cpp_sync)
+        target_compile_options(go2cpp_fiber_transport_test PRIVATE
+            -O2 -Wall -Wextra -Wpedantic)
+        add_test(NAME go2cpp_fiber_transport_test
+                 COMMAND go2cpp_fiber_transport_test)
+        set_tests_properties(go2cpp_fiber_transport_test PROPERTIES TIMEOUT 180)
+    else()
+        message(STATUS "skip go2cpp_fiber_transport_test (GO2CPP_WITH_HOOK=OFF)")
+    endif()
 
     # ---- HTTP/2 压力与边界测试（子代理新增）----
     add_executable(go2cpp_http2_stress
@@ -740,6 +749,17 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_config_registry_macro_test
              COMMAND go2cpp_config_registry_macro_test)
     set_tests_properties(go2cpp_config_registry_macro_test PROPERTIES TIMEOUT 120)
+
+    # ---- config 文本编解码改走 Reflect：标量/结构体/旧格式兼容/字段级 diff ----
+    # 自带 main 的场景化测试（独立可执行，便于单独运行定位失败场景）。
+    add_executable(go2cpp_config_reflect_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/config/test_config_reflect.cpp)
+    target_link_libraries(go2cpp_config_reflect_test PRIVATE go2cpp_config)
+    target_compile_options(go2cpp_config_reflect_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_config_reflect_test
+             COMMAND go2cpp_config_reflect_test)
+    set_tests_properties(go2cpp_config_reflect_test PROPERTIES TIMEOUT 180)
 
     # ---- config/SO 热重载 manifest：解析、静态校验与两阶段事务 ----
     # 假 loader 注入，不编译/不加载真实 .so；ctest -R so_manifest 命中。
