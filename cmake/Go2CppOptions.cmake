@@ -29,6 +29,18 @@ option(GO2CPP_BUILD_BENCHMARKS "Build standalone performance benchmarks" OFF)
 # ON 时记录 park/wake/runqueue 事件并启用 Unix socket 服务，用于重放与迁移。
 option(GO2CPP_DEBUG_DUMP "Build debug dump event ring and Unix socket server" OFF)
 
+# SocketDebug（最小实现）：per-fd 计数 + 256 条事件环 + 关闭归档。
+# 默认 OFF：宏只在 go2cpp_network 内部定义，socket_debug.hpp 里默认为 0，
+#   socket.cpp 的 GO2CPP_SOCKET_DEBUG_RECORD(...) 走 if constexpr(false) 被
+#   整块丢弃，热路径零开销，也不产生任何 SocketDebug 符号。
+# ON 时只给 go2cpp_network 与专项测试目标注入宏：其他模块不 include 该头，
+#   因此不会出现「同一个类两种定义」的 ODR 风险，也不会触发全量重编译。
+option(GO2CPP_DEBUG_SOCKET
+       "Build per-socket debug counters and 256-event rings" OFF)
+if (GO2CPP_DEBUG_SOCKET)
+    message(STATUS "SocketDebug: ON (per-fd counters + 256-event ring)")
+endif()
+
 # 回放资源事件录制（GO2CPP_REPLAY=ON）。
 #
 # 只启用「资源注册表 + 资源事件转发」，不启用事件环/在线诊断：

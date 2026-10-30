@@ -48,6 +48,9 @@ add_library(go2cpp_network
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/byte_array.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/fd_manager.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/socket.cpp
+    # SocketDebug 最小实现：OFF 时该 TU 为空（只有 include + #if），
+    # 接入点也被宏消除，因此默认构建的产物与之前一致。
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/network/socket_debug.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/websocket.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/sse.cpp
@@ -329,6 +332,12 @@ if (GO2CPP_DEBUG_DUMP)
     target_link_libraries(go2cpp_fiber PUBLIC go2cpp_debug_event)
 endif()
 target_link_libraries(go2cpp_network PUBLIC go2cpp_io go2cpp_context go2cpp_scheduler go2cpp_sync)
+# SocketDebug 的编译期宏只注入 network 自身：socket_debug.cpp 与 socket.cpp
+# 同属这个 target，宏定义一致；不 include socket_debug.hpp 的其他模块不受
+# 影响（也不会因为一个调试开关触发全量重编译）。
+if (GO2CPP_DEBUG_SOCKET)
+    target_compile_definitions(go2cpp_network PRIVATE GO2CPP_DEBUG_SOCKET=1)
+endif()
 # HOOK=OFF 时不存在 go2cpp_hook 目标。Socket::accept 对
 # hook::mark_system_nonblocking 的调用必须随宏一起消失，否则共享库会留下
 # 未解析符号，只链接 network/io 的程序直接链接失败；HOOK=ON 时把 hook 作为

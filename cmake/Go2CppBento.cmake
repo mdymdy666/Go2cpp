@@ -40,6 +40,7 @@ if (GO2CPP_WITH_BENTO)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/bandwidth.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/channel.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/link.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/link_server.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/peer_hub.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/session_control.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/tcp_proxy.cpp
@@ -191,6 +192,29 @@ if (GO2CPP_WITH_BENTO)
     set_target_properties(go2cpp_bento_keystore PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_library(go2cpp::bento_keystore ALIAS go2cpp_bento_keystore)
 
+    # HTTP/SSE 服务端骨架：复用 base 的 http1 解析器、SSE 流写入器与
+    # go2cpp_network 的 Socket。独立目标，不给 go2cpp_bento 增加网络依赖；
+    # standalone 构建（没有 go2cpp_network）时跳过，API 不悄悄降级。
+    if (TARGET go2cpp_network)
+        add_library(go2cpp_bento_http STATIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/http_server.cpp)
+
+        target_include_directories(go2cpp_bento_http
+            PUBLIC
+                $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+        target_compile_features(go2cpp_bento_http PUBLIC cxx_std_17)
+        # 零警告是验收条件：本模块独立编译，-Werror 把回归挡在构建期。
+        target_compile_options(go2cpp_bento_http PRIVATE
+            -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+        target_link_libraries(go2cpp_bento_http
+            PUBLIC go2cpp_bento go2cpp_network Threads::Threads)
+        set_target_properties(go2cpp_bento_http PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        add_library(go2cpp::bento_http ALIAS go2cpp_bento_http)
+    else()
+        message(STATUS "Bento HTTP/SSE server: OFF (go2cpp_network not available)")
+    endif()
+
     option(GO2CPP_BENTO_TESTS "Build Bento transport tests" ON)
     if (GO2CPP_BENTO_TESTS)
         enable_testing()
@@ -222,6 +246,20 @@ if (GO2CPP_WITH_BENTO)
             -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
         add_test(NAME bento_keystore COMMAND bento_test_keystore)
         set_tests_properties(bento_keystore PROPERTIES TIMEOUT 180)
+
+        # HTTP/SSE 服务端骨架：回环端口 + 真实 socket 客户端，覆盖 GET/POST/
+        # SSE 推流/404/优雅关闭/并发/异常隔离；无外部网络依赖。
+        if (TARGET go2cpp_bento_http)
+            add_executable(bento_test_http_server
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_http_server.cpp)
+            target_include_directories(bento_test_http_server PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
+            target_link_libraries(bento_test_http_server PRIVATE go2cpp_bento_http)
+            target_compile_options(bento_test_http_server PRIVATE
+                -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+            add_test(NAME bento_http_server COMMAND bento_test_http_server)
+            set_tests_properties(bento_http_server PROPERTIES TIMEOUT 120)
+        endif()
 
         add_executable(bento_test_link_loopback
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_link_loopback.cpp)
@@ -271,6 +309,8 @@ if (GO2CPP_WITH_BENTO)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_peer_hub_secure.cpp)
         add_executable(bento_test_log_hook
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_log_hook.cpp)
+        add_executable(bento_test_link_server
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_link_server.cpp)
         add_executable(bento_test_frame
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_frame.cpp)
         add_executable(bento_test_heartbeat
@@ -402,6 +442,7 @@ if (GO2CPP_WITH_BENTO)
                 bento_test_session_control
                 bento_test_peer_hub_secure
                 bento_test_log_hook
+                bento_test_link_server
                 bento_test_frame
                 bento_test_heartbeat
                 bento_test_backoff
@@ -439,6 +480,7 @@ if (GO2CPP_WITH_BENTO)
         add_test(NAME bento_session_control COMMAND bento_test_session_control)
         add_test(NAME bento_peer_hub_secure COMMAND bento_test_peer_hub_secure)
         add_test(NAME bento_log_hook COMMAND bento_test_log_hook)
+        add_test(NAME bento_link_server COMMAND bento_test_link_server)
         # MOD-10/11/12：帧编解码、心跳、退避的纯本地测试（无网络依赖）。
         add_test(NAME bento_frame COMMAND bento_test_frame)
         add_test(NAME bento_heartbeat COMMAND bento_test_heartbeat)
@@ -474,6 +516,7 @@ if (GO2CPP_WITH_BENTO)
             bento_concurrent_send bento_conn_migration bento_fec bento_pmtud
             bento_zero_rtt bento_peer_hub bento_tcp_proxy
             bento_session_control bento_peer_hub_secure bento_log_hook
+            bento_link_server
             bento_frame bento_heartbeat bento_backoff
             bento_pairing bento_session_table
             PROPERTIES TIMEOUT 90)

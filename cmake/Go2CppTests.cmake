@@ -442,6 +442,23 @@ if (GO2CPP_BUILD_TESTS)
     set_tests_properties(go2cpp_os_hook_conflict_test PROPERTIES TIMEOUT 120)
 
 
+    # ---- SocketDebug 最小实现：per-fd 计数 / 256 条事件环 / 关闭归档 ----
+    # 独立可执行文件而不并入 go2cpp_tests：避免改 tests/test_main.cpp，
+    # 失败时也能单独定位。OFF 构建同样注册——测试会断言「编译期关闭」契约
+    # （Enabled() 恒 false、Snapshot 为空、无 SocketDebug 符号），
+    # 于是两种构建各有可执行的回归，而不是「OFF 就不测」。
+    add_executable(go2cpp_socket_debug_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_socket_debug.cpp)
+    target_link_libraries(go2cpp_socket_debug_test PRIVATE go2cpp_network)
+    target_include_directories(go2cpp_socket_debug_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_definitions(go2cpp_socket_debug_test PRIVATE
+        GO2CPP_DEBUG_SOCKET=$<BOOL:${GO2CPP_DEBUG_SOCKET}>)
+    target_compile_options(go2cpp_socket_debug_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_socket_debug_test COMMAND go2cpp_socket_debug_test)
+    set_tests_properties(go2cpp_socket_debug_test PROPERTIES TIMEOUT 180)
+
     add_executable(go2cpp_hook_ops_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_ops.cpp)
     target_link_libraries(go2cpp_hook_ops_test PRIVATE go2cpp_hook)

@@ -7,6 +7,7 @@
 #include "go2cpp/network/socket.hpp"
 #include "go2cpp/network/fd_manager.hpp"
 #include "go2cpp/network/hook.hpp"
+#include "go2cpp/network/socket_debug.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -176,6 +177,8 @@ void Socket::finalize_deferred_close() noexcept {
     }
     FdManager::instance().erase(fd);
     if (owner) (void)::close(fd);
+    // 延迟关闭与普通 close 走同一个归档点：在途操作归零后只记一次。
+    GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordClose(fd));
     m_operation_condition.notify_all();
 }
 bool Socket::is_closing() const noexcept {
@@ -290,6 +293,8 @@ Socket::Ptr Socket::accept(Duration timeout) {
 #endif
             auto result = FromFd(accepted, storage.ss_family, m_type, m_protocol);
             if (result) result->m_connected = true;
+            // 新连接 fd 由 accept4 创建；在唯一归属点记录一次 accept。
+            GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordAccept(accepted));
             end_operation(); return result;
         }
         if (errno == EINTR) continue;
@@ -305,8 +310,21 @@ Socket::Ptr Socket::accept(Duration timeout) {
 bool Socket::connect(const Address& address, Duration timeout) {
     const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
     int fd = -1; if (!begin_operation(fd)) return false;
+#if GO2CPP_DEBUG_SOCKET
+    // connect 的端到端耗时（含 EINPROGRESS 等待与 SO_ERROR 查询）。每个出口
+    // 都必须调用一次，保证 connects == connect_ok + 失败次数 的守恒关系。
+    const auto debug_started = std::chrono::steady_clock::now();
+    const auto record_connect = [fd, debug_started](int error) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - debug_started).count();
+        SocketDebug::RecordConnect(fd, error, static_cast<std::uint64_t>(elapsed));
+    };
+#endif
     if (m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
         errno = ECANCELED;
+#if GO2CPP_DEBUG_SOCKET
+        record_connect(ECANCELED);
+#endif
         end_operation();
         return false;
     }
@@ -315,19 +333,42 @@ bool Socket::connect(const Address& address, Duration timeout) {
         m_remote = std::make_shared<UnknownAddress>(address.addr(), address.addr_len());
     }
     const int result = ::connect(fd, address.addr(), address.addr_len());
-    if (result == 0) { { std::lock_guard<std::mutex> lock(m_mutex); m_connected = true; } end_operation(); return true; }
-    if (errno != EINPROGRESS && errno != EALREADY) { end_operation(); return false; }
+    if (result == 0) {
+        { std::lock_guard<std::mutex> lock(m_mutex); m_connected = true; }
+#if GO2CPP_DEBUG_SOCKET
+        record_connect(0);
+#endif
+        end_operation(); return true;
+    }
+    if (errno != EINPROGRESS && errno != EALREADY) {
+#if GO2CPP_DEBUG_SOCKET
+        record_connect(errno);
+#endif
+        end_operation(); return false;
+    }
     const auto start = std::chrono::steady_clock::now();
     auto left = remaining(timeout, start);
     const int wait_error = wait_ready(fd, io::IOEvent::kWrite, left, cancel_generation);
-    if (wait_error != 0) { errno = wait_error; end_operation(); return false; }
+    if (wait_error != 0) {
+        errno = wait_error;
+#if GO2CPP_DEBUG_SOCKET
+        record_connect(wait_error);
+#endif
+        end_operation(); return false;
+    }
     int error = 0; socklen_t length = sizeof(error);
     if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0) {
         if (error) errno = error;
+#if GO2CPP_DEBUG_SOCKET
+        record_connect(error != 0 ? error : errno);
+#endif
         end_operation();
         return false;
     }
     { std::lock_guard<std::mutex> lock(m_mutex); m_connected = true; }
+#if GO2CPP_DEBUG_SOCKET
+    record_connect(0);
+#endif
     end_operation(); return true;
 }
 bool Socket::reconnect(Duration timeout) {
@@ -364,6 +405,9 @@ bool Socket::close() noexcept {
     lock.unlock();
     FdManager::instance().erase(fd);
     m_operation_condition.notify_all();
+    // Socket 视角的生命周期在这里结束；owner=false 时 fd 已交还调用方，但本
+    // 对象不再跟踪它，归档后 Snapshot/Events 仍可读到最后状态。
+    GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordClose(fd));
     return !owner || ::close(fd) == 0;
 }
 bool Socket::shutdown(int how) noexcept {
@@ -560,6 +604,10 @@ SocketResult Socket::sendv(const iovec* buffers, std::size_t count, int flags, D
     Duration effective = timeout;
     if (effective == Duration::max()) { std::lock_guard<std::mutex> lock(m_mutex); effective = m_send_timeout; }
     const auto result = send_impl(fd, &message, flags, effective, cancel_generation);
+    // 一次用户调用记一条事件：partial 重试已在 send_impl 内部完成，不重复计数。
+    GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordWrite(
+        fd, result.ok() ? static_cast<std::uint64_t>(result.transferred) : 0,
+        result.error));
     end_operation();
     return result;
 }
@@ -574,6 +622,9 @@ SocketResult Socket::recvv(iovec* buffers, std::size_t count, int flags, Duratio
     Duration effective = timeout;
     if (effective == Duration::max()) { std::lock_guard<std::mutex> lock(m_mutex); effective = m_recv_timeout; }
     const auto result = recv_impl(fd, &message, flags, effective, cancel_generation);
+    GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordRead(
+        fd, result.ok() ? static_cast<std::uint64_t>(result.transferred) : 0,
+        result.error));
     end_operation();
     return result;
 }
@@ -589,6 +640,9 @@ SocketResult Socket::send_to(const void* data, std::size_t length, const Address
     Duration effective = timeout;
     if (effective == Duration::max()) { std::lock_guard<std::mutex> lock(m_mutex); effective = m_send_timeout; }
     const auto result = send_impl(fd, &message, flags, effective, cancel_generation);
+    GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordWrite(
+        fd, result.ok() ? static_cast<std::uint64_t>(result.transferred) : 0,
+        result.error));
     end_operation();
     return result;
 }
@@ -605,6 +659,9 @@ SocketResult Socket::recv_from(void* data, std::size_t length, AddressPtr& from,
     if (effective == Duration::max()) { std::lock_guard<std::mutex> lock(m_mutex); effective = m_recv_timeout; }
     auto result = recv_impl(fd, &message, flags, effective, cancel_generation);
     if (result.ok()) from = Address::Create(reinterpret_cast<sockaddr*>(&storage), message.msg_namelen);
+    GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordRead(
+        fd, result.ok() ? static_cast<std::uint64_t>(result.transferred) : 0,
+        result.error));
     end_operation();
     return result;
 }
