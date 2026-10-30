@@ -336,4 +336,24 @@ errno noinline），不是寄存器保存。
   回退 general-dynamic（注释已写）。
 - 未 commit。
 
+## 2026-10-30 FastChannel 数据面通道（子 agent：极简实现）
 
+- 新增 `include/go2cpp/concurrency/fast_channel.hpp`：
+  - `FastChannel<T, Cap>`：编译期容量、`std::array` 零堆分配、单锁 MPMC
+    （`detail::ChannelSpinLock`），无 Context/超时/取消/select/调试；
+  - `FastSpscChannel<T, Cap>`：单生产者单消费者无锁 ring（原子 head/tail，
+    acquire/release），阻塞时才用一把 mutex 登记等待者；
+  - 阻塞语义复用 Channel P0 的 per-node futex / Scheduler park 原语，
+    支持 Fiber↔Fiber / Fiber↔Thread / Thread↔Fiber / Thread↔Thread。
+- 新增 `tests/concurrency/test_fast_channel.cpp`（功能/并发/FIFO/close/随机/
+  Fiber×Thread 四组合/5 个真实场景）、`bench_fast_channel.cpp`、
+  `go_channel_bench.go`（Go 对照）。
+- `cmake/Go2CppTests.cmake` 末尾注册 `go2cpp_fast_channel_test`（ctest）与
+  `go2cpp_fast_channel_bench`（不注册 ctest）。
+- 基准（空载，taskset 2,3，200k×5，median）：SPSC cap1024 20.6ns
+  （Go 25.5，0.81×）、cap64 25.6ns（Go 24.8，1.03×，min 17.4ns）；
+  FastChannel cap64 118.6ns、cap1024 95.3ns、cap0 814ns。
+- 已知限制：FastChannel 的 park 路径未无锁化，单条延迟高于 Go 同 P
+  goroutine handoff；cap0 无缓冲每次都要 park；满负载（其他 agent 的
+  -j12 构建，load 200+）下测试会超时，空载通过。
+- 状态：未 commit。
