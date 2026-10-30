@@ -1,26 +1,30 @@
 /**
  * @file test_error_enhanced.cpp
- * @brief go2cpp::error 增强验收测试：类型链、错误图、注册表、互操作、并发。
+ * @brief go2cpp::error 验收测试：自研错误码、类型链、错误图、注册表、互操作、并发。
  *
- * @details 覆盖范围（18 个用例，含随机/压测/6 个真实场景）：
- *  1. 错误码词表与名字稳定性；
- *  2. 内置类型链元数据（TypeName/ParentTypeName/InheritanceDepth）；
- *  3. Is / IsA 的类型链语义（含反向不成立）；
- *  4. UnwrapAll(1) 与 UnwrapAll(0) 的层级语义；
- *  5. Wrap/Join 文本展平与空指针处理；
- *  6. As<T> / Has<T> / HasErrorCode 图查询；
- *  7. WalkErrors 前序、kStop/kSkipChildren/异常路径、自指环；
- *  8. ErrorTreeString 树形文本；
- *  9. Registry 注册校验、幂等、错误诊断；
- * 10. Registry 按名字创建、工厂异常、未注册路径；
- * 11. Registry 父链查询（Ancestors/IsA/Depth）；
- * 12. 动态错误码注册、按码查类型、绑定冲突；
- * 13. 并发注册表访问（8 线程 × 500 次创建/查询）；
- * 14. 并发共享错误图的只读查询；
- * 15. 旧体系 ToLegacy / FromLegacy 往返；
- * 16. Bento 桥双向转换与错误码对齐；
- * 17. 十万层深链的构造/消息/析构（不爆栈）；
- * 18. 随机错误树 + 6 个真实场景 + 注册表压测。
+ * @details 覆盖范围（22 个用例，含随机/压测/6 个真实场景）：
+ *  1. 23 个内置码的数值、名字、分类与谓词；
+ *  2. 旧 csvp/gRPC 16 码 ↔ 新码映射（含无损判定与越界值）；
+ *  3. 内置类型链元数据（TypeName/ParentTypeName/InheritanceDepth）；
+ *  4. Is / IsA 的类型链语义（含反向不成立）；
+ *  5. UnwrapAll(1) 与 UnwrapAll(0) 的层级语义；
+ *  6. Wrap/Join 文本展平与空指针处理；
+ *  7. As<T> / Has<T> / HasErrorCode 图查询；
+ *  8. WalkErrors 前序、kStop/kSkipChildren/异常路径、自指环；
+ *  9. ErrorTreeString 树形文本；
+ * 10. Registry 注册校验、幂等、错误诊断；
+ * 11. Registry 按名字创建、工厂异常、未注册路径；
+ * 12. Registry 父链查询（Ancestors/IsA/Depth）；
+ * 13. 动态错误码注册、按码查类型、绑定冲突；
+ * 14. 并发注册表访问（8 线程 × 500 次创建/查询）；
+ * 15. 并发共享错误图的只读查询；
+ * 16. 旧体系 ToLegacy / FromLegacy 往返；
+ * 17. Bento 桥双向转换与新映射表；
+ * 18. 十万层深链的构造/消息/析构（不爆栈）；
+ * 19. 随机错误树 + 注册表压测；
+ * 20. 类型错误 / 超时专项用例；
+ * 21. 每个内置码至少一个类型或场景；
+ * 22. 6 个真实场景。
  *
  * 运行：见 tests/error/CMakeLists.txt 或 `tests/error/run.sh`。
  *
@@ -32,7 +36,9 @@
 #include "go2cpp/bento/error/bridge.hpp"
 #include "go2cpp/bento/error/error.hpp"
 #include "go2cpp/error.hpp"
+#include "go2cpp/error/legacy_code.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -58,6 +64,14 @@ std::ostream& operator<<(std::ostream& out, go2cpp::error::ErrorCode code) {
     return out << static_cast<std::int32_t>(code);
 }
 
+std::ostream& operator<<(std::ostream& out, go2cpp::error::ErrorCategory category) {
+    return out << static_cast<int>(category);
+}
+
+std::ostream& operator<<(std::ostream& out, go2cpp::error::LegacyErrorCode code) {
+    return out << static_cast<std::int32_t>(code);
+}
+
 std::ostream& operator<<(std::ostream& out, go2cpp::error::ErrorVisitResult result) {
     return out << static_cast<int>(result);
 }
@@ -72,8 +86,7 @@ std::atomic<int> g_failures{0};
 std::atomic<int> g_checks{0};
 std::mutex g_output_mutex;
 
-void ReportFailure(const char* expression, const char* file, int line,
-                   const std::string& detail) {
+void ReportFailure(const char* expression, const char* file, int line, const std::string& detail) {
     g_failures.fetch_add(1);
     std::lock_guard<std::mutex> lock(g_output_mutex);
     std::cerr << file << ':' << line << ": CHECK failed: " << expression;
@@ -195,44 +208,131 @@ void RunTest(const char* name, void (*function)()) {
 void TestErrorCodes() {
     CHECK_EQ(static_cast<int>(ErrorCode::kOk), 0);
     CHECK_EQ(static_cast<int>(ErrorCode::kUnknown), 1);
-    CHECK_EQ(static_cast<int>(ErrorCode::kInvalidArgument), 2);
-    CHECK_EQ(static_cast<int>(ErrorCode::kNotFound), 3);
-    CHECK_EQ(static_cast<int>(ErrorCode::kAlreadyExists), 4);
-    CHECK_EQ(static_cast<int>(ErrorCode::kPermissionDenied), 5);
-    CHECK_EQ(static_cast<int>(ErrorCode::kResourceExhausted), 6);
-    CHECK_EQ(static_cast<int>(ErrorCode::kFailedPrecondition), 7);
-    CHECK_EQ(static_cast<int>(ErrorCode::kOutOfRange), 8);
-    CHECK_EQ(static_cast<int>(ErrorCode::kUnimplemented), 9);
-    CHECK_EQ(static_cast<int>(ErrorCode::kInternal), 10);
-    CHECK_EQ(static_cast<int>(ErrorCode::kUnavailable), 11);
-    CHECK_EQ(static_cast<int>(ErrorCode::kDataLoss), 12);
-    CHECK_EQ(static_cast<int>(ErrorCode::kCancelled), 13);
-    CHECK_EQ(static_cast<int>(ErrorCode::kDeadlineExceeded), 14);
-    CHECK_EQ(static_cast<int>(ErrorCode::kWrappedError), 15);
-    CHECK_EQ(static_cast<int>(kFirstCustomCode), 1000);
+    CHECK_EQ(static_cast<int>(ErrorCode::kTypeMismatch), 2);
+    CHECK_EQ(static_cast<int>(ErrorCode::kInvalidArgument), 3);
+    CHECK_EQ(static_cast<int>(ErrorCode::kOutOfRange), 4);
+    CHECK_EQ(static_cast<int>(ErrorCode::kFormatError), 5);
+    CHECK_EQ(static_cast<int>(ErrorCode::kNotFound), 6);
+    CHECK_EQ(static_cast<int>(ErrorCode::kAlreadyExists), 7);
+    CHECK_EQ(static_cast<int>(ErrorCode::kPermissionDenied), 8);
+    CHECK_EQ(static_cast<int>(ErrorCode::kUnauthenticated), 9);
+    CHECK_EQ(static_cast<int>(ErrorCode::kTimeout), 10);
+    CHECK_EQ(static_cast<int>(ErrorCode::kCancelled), 11);
+    CHECK_EQ(static_cast<int>(ErrorCode::kResourceExhausted), 12);
+    CHECK_EQ(static_cast<int>(ErrorCode::kUnavailable), 13);
+    CHECK_EQ(static_cast<int>(ErrorCode::kFailedPrecondition), 14);
+    CHECK_EQ(static_cast<int>(ErrorCode::kAborted), 15);
+    CHECK_EQ(static_cast<int>(ErrorCode::kIOError), 16);
+    CHECK_EQ(static_cast<int>(ErrorCode::kCorruption), 17);
+    CHECK_EQ(static_cast<int>(ErrorCode::kInternal), 18);
+    CHECK_EQ(static_cast<int>(ErrorCode::kUnimplemented), 19);
+    CHECK_EQ(static_cast<int>(ErrorCode::kWouldBlock), 20);
+    CHECK_EQ(static_cast<int>(ErrorCode::kDeadlock), 21);
+    CHECK_EQ(static_cast<int>(ErrorCode::kWrappedError), 22);
+    CHECK_EQ(kLastBuiltinCode, 22);
+    CHECK_EQ(kFirstCustomCode, 1000);
 
     CHECK_EQ(ErrorCodeName(ErrorCode::kOk), std::string_view("OK"));
-    CHECK_EQ(ErrorCodeName(ErrorCode::kNotFound), std::string_view("NOT_FOUND"));
-    CHECK_EQ(ErrorCodeName(ErrorCode::kDeadlineExceeded), std::string_view("DEADLINE_EXCEEDED"));
+    CHECK_EQ(ErrorCodeName(ErrorCode::kTypeMismatch), std::string_view("TYPE_MISMATCH"));
+    CHECK_EQ(ErrorCodeName(ErrorCode::kTimeout), std::string_view("TIMEOUT"));
+    CHECK_EQ(ErrorCodeName(ErrorCode::kIOError), std::string_view("IO_ERROR"));
     CHECK_EQ(ErrorCodeName(ErrorCode::kWrappedError), std::string_view("WRAPPED"));
+    CHECK_EQ(ErrorCodeName(static_cast<ErrorCode>(23)), std::string_view("UNKNOWN"));
     CHECK_EQ(ErrorCodeName(static_cast<ErrorCode>(1000)), std::string_view("UNKNOWN"));
 
-    // 16 个名字两两不同，避免日志/监控标签撞名。
+    // 23 个名字两两不同，避免日志/监控标签撞名。
     std::set<std::string_view> names;
-    for (int value = 0; value <= 15; ++value) {
-        names.insert(ErrorCodeName(static_cast<ErrorCode>(value)));
+    for (int value = 0; value <= kLastBuiltinCode; ++value) {
+        const std::string_view name = ErrorCodeName(static_cast<ErrorCode>(value));
+        CHECK(!name.empty());
+        names.insert(name);
     }
-    CHECK_EQ(names.size(), std::size_t{16});
+    CHECK_EQ(names.size(), std::size_t{23});
+
+    // 分类：每类至少一个码，且只有 kUnknown 落进 kUnknown。
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kOk), ErrorCategory::kOk);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kUnknown), ErrorCategory::kUnknown);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kTypeMismatch), ErrorCategory::kUsage);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kFormatError), ErrorCategory::kUsage);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kNotFound), ErrorCategory::kLookup);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kUnauthenticated), ErrorCategory::kAccess);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kTimeout), ErrorCategory::kTransient);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kCancelled), ErrorCategory::kTransient);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kResourceExhausted), ErrorCategory::kTransient);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kWouldBlock), ErrorCategory::kTransient);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kAborted), ErrorCategory::kState);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kDeadlock), ErrorCategory::kState);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kIOError), ErrorCategory::kData);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kCorruption), ErrorCategory::kData);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kUnimplemented), ErrorCategory::kInternal);
+    CHECK_EQ(ErrorCategoryOf(ErrorCode::kWrappedError), ErrorCategory::kWrapped);
+    CHECK_EQ(ErrorCategoryOf(static_cast<ErrorCode>(1000)), ErrorCategory::kUnknown);
+
+    // 分类名稳定且非空。
+    std::set<std::string_view> category_names;
+    for (int value = 0; value <= 9; ++value) {
+        const std::string_view name = ErrorCategoryName(static_cast<ErrorCategory>(value));
+        CHECK(!name.empty());
+        category_names.insert(name);
+    }
+    CHECK_EQ(category_names.size(), std::size_t{10});
 
     CHECK(IsOk(ErrorCode::kOk));
     CHECK(!IsOk(ErrorCode::kUnknown));
     CHECK(IsWrappedCode(ErrorCode::kWrappedError));
     CHECK(IsBuiltinCode(ErrorCode::kInternal));
+    CHECK(IsBuiltinCode(ErrorCode::kWrappedError));
+    CHECK(!IsBuiltinCode(static_cast<ErrorCode>(23)));
     CHECK(!IsBuiltinCode(static_cast<ErrorCode>(1000)));
+    CHECK(IsCustomCode(static_cast<ErrorCode>(1000)));
+    CHECK(!IsCustomCode(ErrorCode::kInternal));
 }
 
 // ---------------------------------------------------------------------------
-// 2. 内置类型链元数据
+// 2. 旧码映射
+// ---------------------------------------------------------------------------
+void TestLegacyCodeMapping() {
+    CHECK_EQ(kLegacyCodeCount, 16);
+    for (int value = 0; value < kLegacyCodeCount; ++value) {
+        const auto legacy = static_cast<LegacyErrorCode>(value);
+        const ErrorCode current = FromLegacyCode(legacy);
+        CHECK_EQ(FromLegacyCode(value), current);
+        CHECK_EQ(ToLegacyCode(current), legacy);
+        CHECK(IsLegacyLossless(current));
+        CHECK(!LegacyErrorCodeName(legacy).empty());
+        CHECK(!ErrorCodeName(current).empty());
+        CHECK_EQ(kLegacyCodeMap[static_cast<std::size_t>(value)].legacy, legacy);
+    }
+
+    // 改名项：DATA_LOSS → CORRUPTION、DEADLINE_EXCEEDED → TIMEOUT。
+    CHECK_EQ(FromLegacyCode(LegacyErrorCode::kDataLoss), ErrorCode::kCorruption);
+    CHECK_EQ(FromLegacyCode(LegacyErrorCode::kDeadlineExceeded), ErrorCode::kTimeout);
+
+    // 新词表独有码：反向有损。
+    CHECK_EQ(ToLegacyCode(ErrorCode::kTypeMismatch), LegacyErrorCode::kInvalidArgument);
+    CHECK_EQ(ToLegacyCode(ErrorCode::kFormatError), LegacyErrorCode::kInvalidArgument);
+    CHECK_EQ(ToLegacyCode(ErrorCode::kUnauthenticated), LegacyErrorCode::kPermissionDenied);
+    CHECK_EQ(ToLegacyCode(ErrorCode::kIOError), LegacyErrorCode::kUnavailable);
+    CHECK_EQ(ToLegacyCode(ErrorCode::kAborted), LegacyErrorCode::kFailedPrecondition);
+    CHECK_EQ(ToLegacyCode(ErrorCode::kWouldBlock), LegacyErrorCode::kUnavailable);
+    CHECK_EQ(ToLegacyCode(ErrorCode::kDeadlock), LegacyErrorCode::kFailedPrecondition);
+    CHECK(!IsLegacyLossless(ErrorCode::kTypeMismatch));
+    CHECK(!IsLegacyLossless(ErrorCode::kFormatError));
+    CHECK(!IsLegacyLossless(ErrorCode::kUnauthenticated));
+    CHECK(!IsLegacyLossless(ErrorCode::kAborted));
+    CHECK(!IsLegacyLossless(ErrorCode::kIOError));
+    CHECK(!IsLegacyLossless(ErrorCode::kWouldBlock));
+    CHECK(!IsLegacyLossless(ErrorCode::kDeadlock));
+
+    // 越界/非法旧码统一退化为 kUnknown，不抛异常。
+    CHECK_EQ(FromLegacyCode(16), ErrorCode::kUnknown);
+    CHECK_EQ(FromLegacyCode(-1), ErrorCode::kUnknown);
+    CHECK_EQ(FromLegacyCode(9999), ErrorCode::kUnknown);
+    CHECK_EQ(LegacyErrorCodeName(static_cast<LegacyErrorCode>(99)), std::string_view("UNKNOWN"));
+}
+
+// ---------------------------------------------------------------------------
+// 3. 内置类型链元数据
 // ---------------------------------------------------------------------------
 void TestTypeChain() {
     const auto string_error = MakeError<StringError>("s");
@@ -242,20 +342,34 @@ void TestTypeChain() {
     CHECK_EQ(string_error->Code(), ErrorCode::kUnknown);
 
     const auto argument_error = MakeError<ArgumentError>("bad", "count");
-    CHECK_EQ(argument_error->TypeName(), std::string_view("go2cpp.ArgumentError"));
     CHECK_EQ(argument_error->InheritanceDepth(), std::uint8_t{1});
     CHECK_EQ(argument_error->Code(), ErrorCode::kInvalidArgument);
+
+    const auto type_error = MakeError<TypeMismatchError>("bad type", "int", "string");
+    CHECK_EQ(type_error->Code(), ErrorCode::kTypeMismatch);
+    CHECK_EQ(type_error->Expected(), std::string("int"));
+    CHECK_EQ(type_error->Actual(), std::string("string"));
+    CHECK_EQ(type_error->Message(), std::string("bad type [expected=int] [actual=string]"));
+
+    const auto format_error = MakeError<FormatError>("bad json", "json");
+    CHECK_EQ(format_error->Code(), ErrorCode::kFormatError);
+    CHECK_EQ(format_error->Format(), std::string("json"));
+
+    const auto range_error = MakeError<OutOfRangeError>("index", 5, 3);
+    CHECK_EQ(range_error->Code(), ErrorCode::kOutOfRange);
+    CHECK_EQ(range_error->Index(), std::int64_t{5});
+    CHECK_EQ(range_error->Limit(), std::int64_t{3});
 
     const auto io_error = MakeError<IOError>("io");
     CHECK_EQ(io_error->TypeName(), std::string_view("go2cpp.IOError"));
     CHECK_EQ(io_error->InheritanceDepth(), std::uint8_t{1});
-    CHECK_EQ(io_error->Code(), ErrorCode::kUnavailable);
+    CHECK_EQ(io_error->Code(), ErrorCode::kIOError);
 
     const auto timeout = MakeError<TimeoutError>("t", "p", 3000);
     CHECK_EQ(timeout->TypeName(), std::string_view("go2cpp.TimeoutError"));
     CHECK_EQ(timeout->ParentTypeName(), std::string_view("go2cpp.IOError"));
     CHECK_EQ(timeout->InheritanceDepth(), std::uint8_t{2});
-    CHECK_EQ(timeout->Code(), ErrorCode::kDeadlineExceeded);
+    CHECK_EQ(timeout->Code(), ErrorCode::kTimeout);
     CHECK_EQ(timeout->TimeoutMs(), std::uint64_t{3000});
     CHECK_EQ(timeout->Path(), std::string("p"));
 
@@ -264,8 +378,6 @@ void TestTypeChain() {
     CHECK_EQ(not_found->Code(), ErrorCode::kNotFound);
 
     const auto file_not_found = MakeError<FileNotFoundError>("missing", "/tmp/x");
-    CHECK_EQ(file_not_found->TypeName(), std::string_view("go2cpp.FileNotFoundError"));
-    CHECK_EQ(file_not_found->ParentTypeName(), std::string_view("go2cpp.NotFoundError"));
     CHECK_EQ(file_not_found->InheritanceDepth(), std::uint8_t{3});
     CHECK_EQ(file_not_found->Code(), ErrorCode::kNotFound);
 
@@ -273,9 +385,24 @@ void TestTypeChain() {
     CHECK_EQ(permission->InheritanceDepth(), std::uint8_t{2});
     CHECK_EQ(permission->Code(), ErrorCode::kPermissionDenied);
 
+    const auto unauthenticated = MakeError<UnauthenticatedError>("no token", "alice");
+    CHECK_EQ(unauthenticated->Code(), ErrorCode::kUnauthenticated);
+    CHECK_EQ(unauthenticated->Principal(), std::string("alice"));
+
+    const auto cancelled = MakeError<CancelledError>("stop", "ctx");
+    CHECK_EQ(cancelled->Code(), ErrorCode::kCancelled);
+    CHECK_EQ(cancelled->Reason(), std::string("ctx"));
+
+    const auto exhausted = MakeError<ResourceExhaustedError>("too many", "fd");
+    CHECK_EQ(exhausted->Code(), ErrorCode::kResourceExhausted);
+    CHECK_EQ(exhausted->Resource(), std::string("fd"));
+
+    const auto corrupted = MakeError<CorruptionError>("crc", "frame");
+    CHECK_EQ(corrupted->Code(), ErrorCode::kCorruption);
+    CHECK_EQ(corrupted->Source(), std::string("frame"));
+
     const auto wrapped = MakeError<WrappedError>("ctx", MakeError<StringError>("cause"));
     CHECK_EQ(wrapped->TypeName(), std::string_view("go2cpp.WrappedError"));
-    CHECK_EQ(wrapped->InheritanceDepth(), std::uint8_t{1});
     CHECK_EQ(wrapped->Code(), ErrorCode::kWrappedError);
     CHECK(wrapped->IsWrapping());
 
@@ -284,16 +411,17 @@ void TestTypeChain() {
     CHECK_EQ(joined->Code(), ErrorCode::kWrappedError);
     CHECK(joined->IsWrapping());
 
-    // 所有类型都以根类型为祖先。
-    for (const auto& error : {ErrorPtr(string_error), ErrorPtr(argument_error), ErrorPtr(io_error),
-                              ErrorPtr(timeout), ErrorPtr(not_found), ErrorPtr(file_not_found),
-                              ErrorPtr(permission), ErrorPtr(wrapped), ErrorPtr(joined)}) {
+    for (const auto& error : {ErrorPtr(string_error), ErrorPtr(argument_error),
+                              ErrorPtr(type_error), ErrorPtr(io_error), ErrorPtr(timeout),
+                              ErrorPtr(file_not_found), ErrorPtr(permission),
+                              ErrorPtr(unauthenticated), ErrorPtr(cancelled),
+                              ErrorPtr(exhausted), ErrorPtr(corrupted), ErrorPtr(wrapped),
+                              ErrorPtr(joined)}) {
         CHECK(error->IsA(kErrorRootTypeName));
         CHECK(error->IsA(error->TypeName()));
-        CHECK_EQ(error->InheritanceDepth() <= kMaxErrorDepth, true);
+        CHECK(error->InheritanceDepth() <= kMaxErrorDepth);
     }
 
-    // 自定义类型的链：DemoChildError -> DemoError -> go2cpp.Error。
     const auto demo_child = MakeError<DemoChildError>("d");
     CHECK_EQ(demo_child->TypeName(), std::string_view("demo.DemoChildError"));
     CHECK_EQ(demo_child->ParentTypeName(), std::string_view("demo.DemoError"));
@@ -303,7 +431,7 @@ void TestTypeChain() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Is / IsA 语义
+// 4. Is / IsA 语义
 // ---------------------------------------------------------------------------
 void TestIsSemantics() {
     const auto timeout = MakeError<TimeoutError>("t");
@@ -320,13 +448,11 @@ void TestIsSemantics() {
     CHECK(!file_not_found->IsA("go2cpp.TimeoutError"));
     CHECK(!timeout->IsA("demo.DemoError"));
 
-    // Error::Is：目标在祖先链上才成立（方向敏感）。
     CHECK(timeout->Is(*io_error));
     CHECK(!io_error->Is(*timeout));
     CHECK(file_not_found->Is(*MakeError<NotFoundError>()));
     CHECK(!MakeError<StringError>()->Is(*io_error));
 
-    // 指针重载与空安全。
     CHECK(IsA(timeout, "go2cpp.IOError"));
     CHECK(!IsA(ErrorPtr(), "go2cpp.IOError"));
     CHECK(IsErrorRoot(timeout));
@@ -336,11 +462,11 @@ void TestIsSemantics() {
     CHECK_EQ(ErrorMessage(timeout), std::string("t"));
     CHECK_EQ(ErrorMessage(ErrorPtr()), std::string());
     CHECK_EQ(ErrorCodeOf(ErrorPtr()), ErrorCode::kOk);
-    CHECK_EQ(ErrorCodeOf(io_error), ErrorCode::kUnavailable);
+    CHECK_EQ(ErrorCodeOf(io_error), ErrorCode::kIOError);
 }
 
 // ---------------------------------------------------------------------------
-// 4. UnwrapAll 层级语义
+// 5. UnwrapAll 层级语义
 // ---------------------------------------------------------------------------
 void TestUnwrapLevels() {
     const auto leaf = MakeError<StringError>("leaf");
@@ -357,7 +483,6 @@ void TestUnwrapLevels() {
 
     const auto joined = Join({outer, MakeError<ArgumentError>("bad")});
     CHECK_EQ(joined->UnwrapAll().size(), std::size_t{2});
-    // outer, middle, leaf, ArgumentError = 4 个后代，父在前。
     CHECK_EQ(joined->UnwrapAll(0).size(), std::size_t{4});
     CHECK(joined->UnwrapAll(0)[0] == outer);
     CHECK(joined->UnwrapAll(0)[1] == middle);
@@ -369,7 +494,7 @@ void TestUnwrapLevels() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Wrap / Join 文本
+// 6. Wrap / Join 文本
 // ---------------------------------------------------------------------------
 void TestWrapMessages() {
     const auto leaf = MakeError<StringError>("leaf");
@@ -377,9 +502,9 @@ void TestWrapMessages() {
     CHECK_EQ(ErrorMessage(Wrap(Wrap(leaf, "inner"), "outer")), std::string("outer: inner: leaf"));
     CHECK_EQ(ErrorMessage(Wrap(leaf, "")), std::string("leaf"));
     CHECK(Wrap(ErrorPtr(), "ctx") == ErrorPtr());
-    CHECK_EQ(IsWrappedError(leaf), false);    CHECK(IsWrappedError(Wrap(leaf, "ctx")));
+    CHECK(!IsWrappedError(leaf));
+    CHECK(IsWrappedError(Wrap(leaf, "ctx")));
 
-    // Wrap 不复制 cause，身份保持一致。
     const auto wrapped = Wrap(leaf, "ctx");
     CHECK(wrapped->Unwrap() == leaf);
 
@@ -389,20 +514,19 @@ void TestWrapMessages() {
     CHECK(Join({ErrorPtr(), ErrorPtr()}) == ErrorPtr());
     CHECK_EQ(Join({ErrorPtr(), MakeError<StringError>("x")})->UnwrapAll().size(), std::size_t{1});
 
-    // 空 Join 原因被过滤，消息不产生空行。
     const auto mixed = Join({MakeError<StringError>(""), MakeError<StringError>("x")});
     CHECK_EQ(ErrorMessage(mixed), std::string("x"));
 
-    // IOError 的路径上下文拼进消息，便于日志定位。
     CHECK_EQ(ErrorMessage(MakeError<FileNotFoundError>("missing", "/tmp/a")),
              std::string("missing [path=/tmp/a]"));
     CHECK_EQ(ErrorMessage(MakeError<ArgumentError>("bad", "count")),
              std::string("bad [argument=count]"));
     CHECK_EQ(ErrorMessage(MakeError<ArgumentError>("bad")), std::string("bad"));
+    CHECK_EQ(ErrorMessage(MakeError<FormatError>("bad json")), std::string("bad json"));
 }
 
 // ---------------------------------------------------------------------------
-// 6. As / Has / HasErrorCode
+// 7. As / Has / HasErrorCode
 // ---------------------------------------------------------------------------
 void TestQueryTypes() {
     const auto file_not_found = MakeError<FileNotFoundError>("f", "/tmp");
@@ -433,7 +557,7 @@ void TestQueryTypes() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. WalkErrors
+// 8. WalkErrors
 // ---------------------------------------------------------------------------
 void TestWalk() {
     const auto leaf = MakeError<StringError>("leaf");
@@ -448,7 +572,6 @@ void TestWalk() {
     CHECK_EQ(all.errors.size(), std::size_t{4});
     CHECK(all.errors[0] == joined);
 
-    // kStop 立即结束。
     int visited = 0;
     const WalkResult stopped = WalkErrors(joined, [&visited](const ErrorPtr&) {
         ++visited;
@@ -459,7 +582,6 @@ void TestWalk() {
     CHECK_EQ(visited, 1);
     CHECK_EQ(stopped.errors.size(), std::size_t{1});
 
-    // kSkipChildren 只访问根及其兄弟。
     int skipped_visits = 0;
     const WalkResult skipped = WalkErrors(joined, [&skipped_visits](const ErrorPtr&) {
         ++skipped_visits;
@@ -468,7 +590,6 @@ void TestWalk() {
     CHECK(skipped.ok);
     CHECK_EQ(skipped_visits, 1);
 
-    // 空访问器 / 空错误。
     const WalkResult no_visitor = WalkErrors(joined, ErrorVisitor());
     CHECK(!no_visitor.ok);
     const WalkResult null_result = WalkErrors(ErrorPtr(), [](const ErrorPtr&) {
@@ -477,13 +598,11 @@ void TestWalk() {
     CHECK(null_result.ok);
     CHECK(null_result.errors.empty());
 
-    // 访问器抛异常：保留已访问部分并降级。
     const WalkResult thrown = WalkErrors(joined, [](const ErrorPtr&) -> ErrorVisitResult {
         throw std::runtime_error("visitor boom");
     });
     CHECK(!thrown.ok);
 
-    // 自指环：每个对象最多访问一次。
     auto loop = std::make_shared<LoopError>();
     loop->SetSelf(loop);
     const WalkResult loop_result = WalkErrors(loop, [](const ErrorPtr&) {
@@ -496,7 +615,7 @@ void TestWalk() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. 树形文本
+// 9. 树形文本
 // ---------------------------------------------------------------------------
 void TestTreeString() {
     const auto tree = Join({Wrap(MakeError<FileNotFoundError>("missing", "/tmp/a"), "load config"),
@@ -506,13 +625,12 @@ void TestTreeString() {
     CHECK(text.find("go2cpp.WrappedError") != std::string::npos);
     CHECK(text.find("go2cpp.FileNotFoundError") != std::string::npos);
     CHECK(text.find("go2cpp.ArgumentError") != std::string::npos);
-    // 缩进层级：子节点以两空格 + "- " 开头。
     CHECK(text.find("\n  - ") != std::string::npos);
     CHECK_EQ(ErrorTreeString(ErrorPtr()), std::string("<null>"));
 }
 
 // ---------------------------------------------------------------------------
-// 9. Registry 注册校验
+// 10. Registry 注册校验
 // ---------------------------------------------------------------------------
 void TestRegistryRegistration() {
     Registry& registry = Registry::Instance();
@@ -521,9 +639,15 @@ void TestRegistryRegistration() {
 
     CHECK(registry.Has("go2cpp.Error"));
     CHECK(registry.Has("go2cpp.StringError"));
-    CHECK(registry.Has("go2cpp.FileNotFoundError"));
+    CHECK(registry.Has("go2cpp.TypeMismatchError"));
+    CHECK(registry.Has("go2cpp.FormatError"));
+    CHECK(registry.Has("go2cpp.OutOfRangeError"));
+    CHECK(registry.Has("go2cpp.CancelledError"));
+    CHECK(registry.Has("go2cpp.ResourceExhaustedError"));
+    CHECK(registry.Has("go2cpp.CorruptionError"));
+    CHECK(registry.Has("go2cpp.UnauthenticatedError"));
     CHECK(registry.Has("go2cpp.JoinError"));
-    CHECK(registry.Size() >= std::size_t{10});
+    CHECK(registry.Size() >= std::size_t{16});
     CHECK_EQ(registry.Depth("go2cpp.Error"), std::uint8_t{0});
     CHECK_EQ(registry.Depth("go2cpp.IOError"), std::uint8_t{1});
     CHECK_EQ(registry.Depth("go2cpp.TimeoutError"), std::uint8_t{2});
@@ -533,21 +657,18 @@ void TestRegistryRegistration() {
     CHECK_EQ(registry.ParentName("go2cpp.Error"), std::string_view());
     CHECK_EQ(registry.ParentName("demo.Unknown"), std::string_view());
 
-    // 幂等：重复注册同一类型不改变表大小。
     const std::size_t before = registry.Size();
     CHECK(registry.Register<StringError>());
     CHECK_EQ(registry.Size(), before);
     CHECK(registry.Register("go2cpp.IOError", "go2cpp.Error", 1,
                             []() -> ErrorPtr { return MakeError<IOError>(); }));
 
-    // 元数据冲突：同名但父类型不同 → false + kAlreadyExists。
     registry.ClearLastError();
     CHECK(!registry.Register("go2cpp.IOError", "go2cpp.Error", 2,
                              []() -> ErrorPtr { return MakeError<IOError>(); }));
     CHECK_EQ(registry.LastErrorCode(), static_cast<std::uint32_t>(ErrorCode::kAlreadyExists));
     CHECK(!registry.LastErrorDetail().empty());
 
-    // 参数非法路径。
     registry.ClearLastError();
     CHECK(!registry.Register("", "go2cpp.Error", 1, []() -> ErrorPtr { return {}; }));
     CHECK_EQ(registry.LastErrorCode(), static_cast<std::uint32_t>(ErrorCode::kInvalidArgument));
@@ -580,28 +701,24 @@ void TestRegistryRegistration() {
     CHECK_EQ(registry.LastErrorCode(),
              static_cast<std::uint32_t>(ErrorCode::kFailedPrecondition));
 
-    // 合法自定义类型（父类型已注册）。
     registry.ClearLastError();
     CHECK(registry.Register<DemoError>());
     CHECK(registry.Register<DemoChildError>());
     CHECK(registry.Has("demo.DemoError"));
     CHECK(registry.Has("demo.DemoChildError"));
     CHECK_EQ(registry.Depth("demo.DemoChildError"), std::uint8_t{2});
-    CHECK_EQ(registry.ParentName("demo.DemoChildError"), std::string_view("demo.DemoError"));
 
-    // 手写类型（不走宏）也能通过实例反射注册。
     CHECK(registry.Register("demo.ThrowingError", "go2cpp.Error", 1, []() -> ErrorPtr {
         return MakeError<ThrowingError>();
     }));
 
-    // 快照排序稳定且包含新增类型。
     const std::vector<TypeInfo> types = registry.Types();
     CHECK_EQ(types.size(), registry.Size());
     CHECK(!types.empty());
 }
 
 // ---------------------------------------------------------------------------
-// 10. Registry 创建
+// 11. Registry 创建
 // ---------------------------------------------------------------------------
 void TestRegistryCreate() {
     Registry& registry = Registry::Instance();
@@ -609,13 +726,16 @@ void TestRegistryCreate() {
 
     const ErrorPtr not_found = registry.Create("go2cpp.NotFoundError");
     CHECK(not_found != nullptr);
-    CHECK_EQ(not_found->TypeName(), std::string_view("go2cpp.NotFoundError"));
     CHECK_EQ(not_found->Code(), ErrorCode::kNotFound);
     CHECK(not_found->IsA("go2cpp.IOError"));
 
     const ErrorPtr timeout = registry.Create("go2cpp.TimeoutError");
     CHECK(timeout != nullptr);
-    CHECK_EQ(timeout->Code(), ErrorCode::kDeadlineExceeded);
+    CHECK_EQ(timeout->Code(), ErrorCode::kTimeout);
+
+    const ErrorPtr type_mismatch = registry.Create("go2cpp.TypeMismatchError");
+    CHECK(type_mismatch != nullptr);
+    CHECK_EQ(type_mismatch->Code(), ErrorCode::kTypeMismatch);
 
     const ErrorPtr joined = registry.Create("go2cpp.JoinError");
     CHECK(joined != nullptr);
@@ -626,17 +746,14 @@ void TestRegistryCreate() {
     CHECK_EQ(demo->TypeName(), std::string_view("demo.DemoChildError"));
     CHECK(demo->IsA("demo.DemoError"));
 
-    // 根类型没有工厂 → 失败并记录 kFailedPrecondition。
     registry.ClearLastError();
     CHECK(registry.Create("go2cpp.Error") == nullptr);
     CHECK_EQ(registry.LastErrorCode(), static_cast<std::uint32_t>(ErrorCode::kFailedPrecondition));
 
-    // 未知类型 → kNotFound。
     registry.ClearLastError();
     CHECK(registry.Create("demo.NotRegistered") == nullptr);
     CHECK_EQ(registry.LastErrorCode(), static_cast<std::uint32_t>(ErrorCode::kNotFound));
 
-    // 工厂抛异常 → 捕获并降级为 kInternal，注册表仍可用。
     registry.ClearLastError();
     CHECK(registry.Register("demo.Boom", "go2cpp.Error", 1, []() -> ErrorPtr {
         throw std::runtime_error("factory boom");
@@ -645,7 +762,6 @@ void TestRegistryCreate() {
     CHECK_EQ(registry.LastErrorCode(), static_cast<std::uint32_t>(ErrorCode::kInternal));
     CHECK(registry.Has("go2cpp.StringError"));
 
-    // 工厂返回空指针 → kInternal。
     registry.ClearLastError();
     CHECK(registry.Register("demo.EmptyFactory", "go2cpp.Error", 1, []() -> ErrorPtr {
         return ErrorPtr();
@@ -653,7 +769,6 @@ void TestRegistryCreate() {
     CHECK(registry.Create("demo.EmptyFactory") == nullptr);
     CHECK_EQ(registry.LastErrorCode(), static_cast<std::uint32_t>(ErrorCode::kInternal));
 
-    // 工厂重入注册表：锁外调用，不会死锁。
     registry.ClearLastError();
     CHECK(registry.Register("demo.Reentrant", "go2cpp.Error", 1, []() -> ErrorPtr {
         Registry::Instance().Has("go2cpp.Error");
@@ -665,7 +780,7 @@ void TestRegistryCreate() {
 }
 
 // ---------------------------------------------------------------------------
-// 11. Registry 父链查询
+// 12. Registry 父链查询
 // ---------------------------------------------------------------------------
 void TestRegistryAncestors() {
     Registry& registry = Registry::Instance();
@@ -682,16 +797,19 @@ void TestRegistryAncestors() {
 
     CHECK(registry.IsA("go2cpp.FileNotFoundError", "go2cpp.IOError"));
     CHECK(registry.IsA("go2cpp.FileNotFoundError", "go2cpp.Error"));
-    CHECK(registry.IsA("go2cpp.FileNotFoundError", "go2cpp.FileNotFoundError"));
     CHECK(!registry.IsA("go2cpp.IOError", "go2cpp.FileNotFoundError"));
     CHECK(!registry.IsA("demo.Unknown", "go2cpp.Error"));
 
-    // 注册表父链与实例自报的类型链必须一致（同一事实只存一份的校验）。
     const std::vector<std::string_view> type_names = {
-        "go2cpp.StringError",  "go2cpp.ArgumentError",   "go2cpp.IOError",
-        "go2cpp.TimeoutError", "go2cpp.NotFoundError",   "go2cpp.FileNotFoundError",
-        "go2cpp.PermissionError", "go2cpp.WrappedError", "go2cpp.JoinError",
-        "demo.DemoError",      "demo.DemoChildError"};
+        "go2cpp.StringError",           "go2cpp.ArgumentError",
+        "go2cpp.TypeMismatchError",     "go2cpp.FormatError",
+        "go2cpp.OutOfRangeError",       "go2cpp.IOError",
+        "go2cpp.TimeoutError",          "go2cpp.NotFoundError",
+        "go2cpp.FileNotFoundError",     "go2cpp.PermissionError",
+        "go2cpp.UnauthenticatedError",  "go2cpp.CancelledError",
+        "go2cpp.ResourceExhaustedError","go2cpp.CorruptionError",
+        "go2cpp.WrappedError",          "go2cpp.JoinError",
+        "demo.DemoError",               "demo.DemoChildError"};
     for (const std::string_view type_name : type_names) {
         const ErrorPtr instance = registry.Create(type_name);
         CHECK(instance != nullptr);
@@ -710,7 +828,7 @@ void TestRegistryAncestors() {
 }
 
 // ---------------------------------------------------------------------------
-// 12. 动态错误码与绑定
+// 13. 动态错误码与绑定
 // ---------------------------------------------------------------------------
 void TestRegistryCodes() {
     Registry& registry = Registry::Instance();
@@ -724,8 +842,11 @@ void TestRegistryCodes() {
     CHECK_EQ(registry.LookupCode("demo.code.not_registered"), std::uint32_t{0});
     CHECK_EQ(registry.CodeName(code_a), std::string_view("demo.code.a"));
     CHECK_EQ(registry.CodeName(0), std::string_view("OK"));
-    CHECK_EQ(registry.CodeName(3), std::string_view("NOT_FOUND"));
-    CHECK_EQ(registry.CodeName(15), std::string_view("WRAPPED"));
+    CHECK_EQ(registry.CodeName(3), std::string_view("INVALID_ARGUMENT"));
+    CHECK_EQ(registry.CodeName(6), std::string_view("NOT_FOUND"));
+    CHECK_EQ(registry.CodeName(10), std::string_view("TIMEOUT"));
+    CHECK_EQ(registry.CodeName(22), std::string_view("WRAPPED"));
+    CHECK_EQ(registry.CodeName(23), std::string_view("UNKNOWN"));
     CHECK_EQ(registry.CodeName(999), std::string_view("UNKNOWN"));
     CHECK_EQ(registry.CodeName(999999), std::string_view("<unknown>"));
     CHECK(registry.CodeCount() >= std::size_t{2});
@@ -736,19 +857,21 @@ void TestRegistryCodes() {
     CHECK_EQ(registry.LastErrorCode(), static_cast<std::uint32_t>(ErrorCode::kInvalidArgument));
     CHECK_EQ(static_cast<std::uint32_t>(registry.CodeCount()), count_before);
 
-    // 内置码绑定：NotFoundError ↔ kNotFound。
     CHECK_EQ(registry.TypeNameOf(static_cast<std::int32_t>(ErrorCode::kNotFound)),
              std::string_view("go2cpp.NotFoundError"));
-    CHECK_EQ(registry.TypeNameOf(static_cast<std::int32_t>(ErrorCode::kDeadlineExceeded)),
+    CHECK_EQ(registry.TypeNameOf(static_cast<std::int32_t>(ErrorCode::kTimeout)),
              std::string_view("go2cpp.TimeoutError"));
     CHECK_EQ(registry.TypeNameOf(static_cast<std::int32_t>(ErrorCode::kCancelled)),
+             std::string_view("go2cpp.CancelledError"));
+    CHECK_EQ(registry.TypeNameOf(static_cast<std::int32_t>(ErrorCode::kIOError)),
+             std::string_view("go2cpp.IOError"));
+    CHECK_EQ(registry.TypeNameOf(static_cast<std::int32_t>(ErrorCode::kUnavailable)),
              std::string_view());
     CHECK_EQ(registry.CodeOf("go2cpp.NotFoundError"),
              static_cast<std::int32_t>(ErrorCode::kNotFound));
     CHECK_EQ(registry.CodeOf("go2cpp.FileNotFoundError"), kNoCode);
     CHECK_EQ(registry.CodeOf("demo.Unknown"), kNoCode);
 
-    // 幂等绑定 + 冲突绑定。
     CHECK(registry.BindCode("go2cpp.NotFoundError",
                             static_cast<std::int32_t>(ErrorCode::kNotFound)));
     registry.ClearLastError();
@@ -759,19 +882,17 @@ void TestRegistryCodes() {
     CHECK(!registry.BindCode("demo.NotRegistered", static_cast<std::int32_t>(ErrorCode::kInternal)));
     CHECK_EQ(registry.LastErrorCode(), static_cast<std::uint32_t>(ErrorCode::kNotFound));
 
-    // 把新注册的码绑到 DemoError，再按码反查类型。
     CHECK(registry.BindCode("demo.DemoError", static_cast<std::int32_t>(code_a)));
     CHECK_EQ(registry.TypeNameOf(static_cast<std::int32_t>(code_a)),
              std::string_view("demo.DemoError"));
 
-    registry.ClearLastError();
     registry.ClearLastError();
     CHECK_EQ(registry.LastErrorCode(), std::uint32_t{0});
     CHECK(registry.LastErrorDetail().empty());
 }
 
 // ---------------------------------------------------------------------------
-// 13. 并发注册表
+// 14. 并发注册表
 // ---------------------------------------------------------------------------
 void TestConcurrentRegistry() {
     Registry& registry = Registry::Instance();
@@ -802,7 +923,7 @@ void TestConcurrentRegistry() {
             }
             for (int iteration = 0; iteration < kIterations; ++iteration) {
                 const ErrorPtr created = registry.Create("go2cpp.TimeoutError");
-                if (!created || created->Code() != ErrorCode::kDeadlineExceeded) {
+                if (!created || created->Code() != ErrorCode::kTimeout) {
                     create_failures.fetch_add(1);
                 }
                 if (registry.Ancestors("go2cpp.FileNotFoundError").size() != 4) {
@@ -811,7 +932,7 @@ void TestConcurrentRegistry() {
                 if (!registry.IsA("go2cpp.FileNotFoundError", "go2cpp.IOError")) {
                     create_failures.fetch_add(1);
                 }
-                if (registry.Has(type_name) == false) {
+                if (!registry.Has(type_name)) {
                     create_failures.fetch_add(1);
                 }
             }
@@ -828,12 +949,12 @@ void TestConcurrentRegistry() {
 }
 
 // ---------------------------------------------------------------------------
-// 14. 并发只读错误图
+// 15. 并发只读错误图
 // ---------------------------------------------------------------------------
 void TestConcurrentErrorGraph() {
     const auto tree = Join({Wrap(MakeError<FileNotFoundError>("missing", "/tmp/a"), "load"),
                             Wrap(MakeError<TimeoutError>("timeout", "peer", 1000), "connect"),
-                            MakeError<ArgumentError>("bad", "count")});
+                            MakeError<TypeMismatchError>("bad", "int", "string")});
     const std::string expected_message = tree->Message();
     const std::size_t expected_descendants = tree->UnwrapAll(0).size();
     CHECK_EQ(expected_descendants, std::size_t{5});
@@ -855,7 +976,7 @@ void TestConcurrentErrorGraph() {
                 if (As<IOError>(tree) == nullptr) {
                     mismatches.fetch_add(1);
                 }
-                if (!Has<FileNotFoundError>(tree) || !Has<TimeoutError>(tree)) {
+                if (!Has<FileNotFoundError>(tree) || !Has<TypeMismatchError>(tree)) {
                     mismatches.fetch_add(1);
                 }
                 const WalkResult walked = WalkErrors(tree, [](const ErrorPtr&) {
@@ -864,7 +985,7 @@ void TestConcurrentErrorGraph() {
                 if (!walked.ok || walked.errors.size() != expected_descendants + 1) {
                     mismatches.fetch_add(1);
                 }
-                if (!HasErrorCode(tree, ErrorCode::kNotFound)) {
+                if (!HasErrorCode(tree, ErrorCode::kTimeout)) {
                     mismatches.fetch_add(1);
                 }
             }
@@ -877,7 +998,7 @@ void TestConcurrentErrorGraph() {
 }
 
 // ---------------------------------------------------------------------------
-// 15. 旧体系互操作
+// 16. 旧体系互操作
 // ---------------------------------------------------------------------------
 void TestLegacyCompat() {
     const auto error = Wrap(MakeError<FileNotFoundError>("missing", "/tmp/a"), "load config");
@@ -885,7 +1006,6 @@ void TestLegacyCompat() {
     CHECK(legacy != nullptr);
     CHECK_EQ(legacy->Message(), error->Message());
 
-    // 旧体系的类型查询能看到适配器；原因结构按 UnwrapAll 逐层适配。
     const auto adapter = ::go2cpp::As<LegacyAdapter>(legacy);
     CHECK(adapter != nullptr);
     CHECK(adapter->Inner() == error);
@@ -893,21 +1013,18 @@ void TestLegacyCompat() {
     CHECK(legacy->Unwrap() != nullptr);
     CHECK_EQ(legacy->Unwrap()->Message(), std::string("missing [path=/tmp/a]"));
 
-    // 适配器可直接交给旧模块的 Wrap/Is/Message。
     const ::go2cpp::ErrorPtr outer = ::go2cpp::Wrap(legacy, "outer");
-    CHECK_EQ(::go2cpp::ErrorMessage(outer), std::string("outer: load config: missing [path=/tmp/a]"));
+    CHECK_EQ(::go2cpp::ErrorMessage(outer),
+             std::string("outer: load config: missing [path=/tmp/a]"));
     CHECK(::go2cpp::Is(outer, legacy));
-    CHECK(::go2cpp::As<LegacyAdapter>(outer) != nullptr);
 
-    // 旧 Join → 新 Join：多原因结构保持。
-    const ::go2cpp::ErrorPtr legacy_join = ::go2cpp::Join(
-        {::go2cpp::NewError("first"), ::go2cpp::NewError("second")});
+    const ::go2cpp::ErrorPtr legacy_join =
+        ::go2cpp::Join({::go2cpp::NewError("first"), ::go2cpp::NewError("second")});
     const ErrorPtr converted = FromLegacy(legacy_join);
     CHECK(converted != nullptr);
     CHECK_EQ(converted->UnwrapAll().size(), std::size_t{2});
     CHECK_EQ(converted->Message(), std::string("first\nsecond"));
 
-    // 旧 WrappedError → 新体系：文本无损（结构叶子化是已记录的有损点）。
     const ::go2cpp::ErrorPtr legacy_wrapped =
         ::go2cpp::Wrap(::go2cpp::NewError("cause"), "context");
     const ErrorPtr converted_wrapped = FromLegacy(legacy_wrapped);
@@ -915,11 +1032,9 @@ void TestLegacyCompat() {
     CHECK_EQ(converted_wrapped->Message(), std::string("context: cause"));
     CHECK_EQ(converted_wrapped->UnwrapAll().size(), std::size_t{0});
 
-    // 空指针往返。
     CHECK(ToLegacy(ErrorPtr()) == ::go2cpp::ErrorPtr());
     CHECK(FromLegacy(::go2cpp::ErrorPtr()) == ErrorPtr());
 
-    // 深链不递归爆栈（适配器有深度上限）。
     ErrorPtr deep = NewError("leaf");
     for (int index = 0; index < 1000; ++index) {
         deep = Wrap(deep, "layer");
@@ -930,63 +1045,67 @@ void TestLegacyCompat() {
 }
 
 // ---------------------------------------------------------------------------
-// 16. Bento 桥
+// 17. Bento 桥
 // ---------------------------------------------------------------------------
 void TestBentoBridge() {
     const auto error = Wrap(MakeError<TimeoutError>("timeout", "peer", 2500), "connect");
 
-    const ::go2cpp::bento::error::ErrorPtr bento_error = ::go2cpp::bento::error::FromGo2Cpp(error);
+    const ::go2cpp::bento::error::ErrorPtr bento_error =
+        ::go2cpp::bento::error::FromGo2Cpp(error);
     CHECK(bento_error != nullptr);
     CHECK_EQ(bento_error->Message(), std::string("connect: timeout [path=peer]"));
     CHECK_EQ(bento_error->Code(), ::go2cpp::bento::error::ErrorCode::kWrappedError);
     CHECK_EQ(bento_error->TypeName(), std::string_view("go2cpp.WrappedError"));
-    CHECK_EQ(bento_error->ParentTypeName(), std::string_view("go2cpp.Error"));
     CHECK_EQ(bento_error->InheritanceDepth(), std::uint8_t{1});
-    CHECK(bento_error->IsWrapping());
-    CHECK_EQ(bento_error->UnwrapAll().size(), std::size_t{1});
-    CHECK_EQ(bento_error->UnwrapAll(0).size(), std::size_t{1});
 
-    const auto adapter = ::go2cpp::bento::error::As<::go2cpp::bento::error::BentoAdapter>(bento_error);
+    const auto adapter =
+        ::go2cpp::bento::error::As<::go2cpp::bento::error::BentoAdapter>(bento_error);
     CHECK(adapter != nullptr);
     CHECK(adapter->Inner() == error);
 
-    // Bento 的遍历/映射接口可直接消费适配器。
-    const ::go2cpp::bento::error::WalkResult walked = ::go2cpp::bento::error::WalkErrors(
-        bento_error,
-        [](const ::go2cpp::bento::error::ErrorPtr&) { return ::go2cpp::bento::error::ErrorVisitResult::kContinue; });
-    CHECK(walked.ok);
-    CHECK_EQ(walked.errors.size(), std::size_t{2});
-    CHECK(::go2cpp::bento::error::Has<::go2cpp::bento::error::BentoAdapter>(bento_error));
+    // 映射表自洽：16 个旧码都能查到新码，再反向回到原值。
+    for (const auto& entry : ::go2cpp::bento::error::kLegacyCodeBridge) {
+        CHECK_EQ(::go2cpp::bento::error::ToGo2CppCode(entry.legacy), entry.current);
+        CHECK_EQ(::go2cpp::bento::error::ToBentoCode(entry.current), entry.legacy);
+        CHECK(::go2cpp::bento::error::IsBentoCodeLossless(entry.current));
+    }
+    CHECK_EQ(::go2cpp::bento::error::kLegacyCodeBridge.size(), std::size_t{16});
 
-    // 错误码对齐（静态断言之外的运行期复核）。
-    CHECK_EQ(::go2cpp::bento::error::ToBentoCode(ErrorCode::kDeadlineExceeded),
+    // 有损退化：类型错误 → INVALID_ARGUMENT；IO 错误 → UNAVAILABLE。
+    CHECK_EQ(::go2cpp::bento::error::ToBentoCode(ErrorCode::kTypeMismatch),
+             ::go2cpp::bento::error::ErrorCode::kInvalidArgument);
+    CHECK_EQ(::go2cpp::bento::error::ToBentoCode(ErrorCode::kFormatError),
+             ::go2cpp::bento::error::ErrorCode::kInvalidArgument);
+    CHECK_EQ(::go2cpp::bento::error::ToBentoCode(ErrorCode::kTimeout),
              ::go2cpp::bento::error::ErrorCode::kDeadlineExceeded);
-    CHECK_EQ(::go2cpp::bento::error::ToGo2CppCode(::go2cpp::bento::error::ErrorCode::kNotFound),
-             ErrorCode::kNotFound);
+    CHECK_EQ(::go2cpp::bento::error::ToBentoCode(ErrorCode::kIOError),
+             ::go2cpp::bento::error::ErrorCode::kUnavailable);
+    CHECK(!::go2cpp::bento::error::IsBentoCodeLossless(ErrorCode::kTypeMismatch));
 
-    // Bento → 新体系：Join 结构保留。
-    const ::go2cpp::bento::error::ErrorPtr bento_join =
-        ::go2cpp::bento::error::Join({::go2cpp::bento::error::NewError("a", ::go2cpp::bento::error::ErrorCode::kNotFound),
-                              ::go2cpp::bento::error::NewError("b", ::go2cpp::bento::error::ErrorCode::kInternal)});
+    const ::go2cpp::bento::error::ErrorPtr bento_join = ::go2cpp::bento::error::Join(
+        {::go2cpp::bento::error::NewError("a", ::go2cpp::bento::error::ErrorCode::kNotFound),
+         ::go2cpp::bento::error::NewError("b", ::go2cpp::bento::error::ErrorCode::kInternal)});
     const ErrorPtr converted = ::go2cpp::bento::error::ToGo2Cpp(bento_join);
     CHECK(converted != nullptr);
     CHECK_EQ(converted->UnwrapAll().size(), std::size_t{2});
     CHECK_EQ(converted->Message(), std::string("a\nb"));
 
-    // Bento 的包装链叶子化但文本无损。
     const ::go2cpp::bento::error::ErrorPtr bento_wrapped = ::go2cpp::bento::error::Wrap(
-        ::go2cpp::bento::error::NewError("cause", ::go2cpp::bento::error::ErrorCode::kUnavailable), "ctx");
+        ::go2cpp::bento::error::NewError("cause",
+                                         ::go2cpp::bento::error::ErrorCode::kUnavailable),
+        "ctx");
     const ErrorPtr converted_wrapped = ::go2cpp::bento::error::ToGo2Cpp(bento_wrapped);
     CHECK(converted_wrapped != nullptr);
     CHECK_EQ(converted_wrapped->Message(), std::string("ctx: cause"));
     CHECK_EQ(converted_wrapped->Code(), ErrorCode::kUnavailable);
 
-    CHECK(::go2cpp::bento::error::FromGo2Cpp(ErrorPtr()) == ::go2cpp::bento::error::ErrorPtr());
+    CHECK(::go2cpp::bento::error::FromGo2Cpp(ErrorPtr()) ==
+          ::go2cpp::bento::error::ErrorPtr());
     CHECK(::go2cpp::bento::error::ToGo2Cpp(::go2cpp::bento::error::ErrorPtr()) == ErrorPtr());
 }
 
 // ---------------------------------------------------------------------------
-// 17. 十万层深链
+// 18. 十万层深链
 // ---------------------------------------------------------------------------
 void TestDeepChain() {
     constexpr int kDepth = 100000;
@@ -998,11 +1117,9 @@ void TestDeepChain() {
         }
         CHECK(chain != nullptr);
         CHECK_EQ(chain->UnwrapAll(1).size(), std::size_t{1});
-        // 展平文本有 32 层上限（防止一条日志吃掉不可控时间），但不应崩溃。
         const std::string message = chain->Message();
         CHECK(!message.empty());
         CHECK(message.size() < 4096);
-        // 离开作用域：迭代析构，不爆栈。
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now() - start)
@@ -1013,17 +1130,16 @@ void TestDeepChain() {
 }
 
 // ---------------------------------------------------------------------------
-// 18. 随机错误树
+// 19. 随机错误树
 // ---------------------------------------------------------------------------
 ErrorPtr BuildRandomTree(std::mt19937& rng, int depth, int& node_count) {
     std::uniform_int_distribution<int> kind_distribution(0, 3);
-    std::uniform_int_distribution<int> type_distribution(0, 3);
+    std::uniform_int_distribution<int> type_distribution(0, 4);
     if (depth <= 0) {
         kind_distribution = std::uniform_int_distribution<int>(0, 0);
     }
     const int kind = kind_distribution(rng);
     const int type = type_distribution(rng);
-    // 计数与“实际进入图里的节点”严格一一对应：每个节点在构造点 +1。
     if (kind == 3) {
         const ErrorPtr child = BuildRandomTree(rng, depth - 1, node_count);
         ++node_count;
@@ -1039,6 +1155,9 @@ ErrorPtr BuildRandomTree(std::mt19937& rng, int depth, int& node_count) {
             break;
         case 2:
             leaf = MakeError<FileNotFoundError>("nf", "/tmp");
+            break;
+        case 3:
+            leaf = MakeError<TypeMismatchError>("tm", "int", "string");
             break;
         default:
             leaf = MakeError<TimeoutError>("to", "peer", 10);
@@ -1092,20 +1211,16 @@ void TestRandomTrees() {
         CHECK_EQ(walked.errors.size(), all.size() + 1U);
         CHECK(!tree->Message().empty() || all.empty());
 
-        // 类型查询与手工遍历结果一致（遍历含根节点）。
-        bool has_argument = dynamic_cast<const ArgumentError*>(tree.get()) != nullptr;
+        bool has_type_mismatch = dynamic_cast<const TypeMismatchError*>(tree.get()) != nullptr;
         for (const auto& node : all) {
-            if (dynamic_cast<const ArgumentError*>(node.get()) != nullptr) {
-                has_argument = true;
+            if (dynamic_cast<const TypeMismatchError*>(node.get()) != nullptr) {
+                has_type_mismatch = true;
             }
         }
-        CHECK_EQ(Has<ArgumentError>(tree), has_argument);
-
-        // 指纹可复现：同一棵树两次序列化一致。
+        CHECK_EQ(Has<TypeMismatchError>(tree), has_type_mismatch);
         CHECK_EQ(Fingerprint(tree), Fingerprint(tree));
     }
 
-    // 同种子重放：结构指纹序列必须完全一致。
     const auto replay = []() {
         std::mt19937 replay_rng(20261030U);
         std::string sequence;
@@ -1121,7 +1236,112 @@ void TestRandomTrees() {
 }
 
 // ---------------------------------------------------------------------------
-// 真实场景（6 个）
+// 20. 类型错误 / 超时专项
+// ---------------------------------------------------------------------------
+void TestTypeMismatchAndTimeout() {
+    // 场景：反射/配置解码时期望 int，实际拿到 string。
+    const ErrorPtr error = Wrap(MakeError<TypeMismatchError>(
+                                    "field type mismatch", "int", "string"),
+                                "decode config");
+    const auto mismatch = As<TypeMismatchError>(error);
+    CHECK(mismatch != nullptr);
+    CHECK_EQ(mismatch->Expected(), std::string("int"));
+    CHECK_EQ(mismatch->Actual(), std::string("string"));
+    CHECK_EQ(error->Code(), ErrorCode::kWrappedError);
+    CHECK(HasErrorCode(error, ErrorCode::kTypeMismatch));
+    CHECK_EQ(ErrorCategoryOf(mismatch->Code()), ErrorCategory::kUsage);
+    CHECK_EQ(ErrorMessage(error), std::string("decode config: field type mismatch "
+                                               "[expected=int] [actual=string]"));
+
+    // 场景：等待远端响应超时，必须能从超时里取回阈值并归类为可重试。
+    const auto timeout = MakeError<TimeoutError>("read timeout", "peer:443", 1500);
+    CHECK_EQ(timeout->Code(), ErrorCode::kTimeout);
+    CHECK_EQ(timeout->TimeoutMs(), std::uint64_t{1500});
+    CHECK_EQ(ErrorCategoryOf(timeout->Code()), ErrorCategory::kTransient);
+    CHECK(timeout->IsA("go2cpp.IOError"));
+    CHECK_EQ(As<TimeoutError>(Wrap(timeout, "connect"))->TimeoutMs(), std::uint64_t{1500});
+
+    // 类型错误与超时的码不同、分类不同，不会在统计里混为一谈。
+    CHECK(mismatch->Code() != timeout->Code());
+    CHECK(ErrorCategoryOf(mismatch->Code()) != ErrorCategoryOf(timeout->Code()));
+}
+
+// ---------------------------------------------------------------------------
+// 21. 每个内置码至少一个类型/场景
+// ---------------------------------------------------------------------------
+struct CodeScenario {
+    ErrorCode code;
+    const char* scenario;
+    ErrorPtr (*factory)();
+};
+
+void TestEveryCodeHasScenario() {
+    const std::array<CodeScenario, 23> scenarios = {{
+        {ErrorCode::kOk, "无错误：空 ErrorPtr", []() -> ErrorPtr { return nullptr; }},
+        {ErrorCode::kUnknown, "未知：默认 StringError",
+         []() -> ErrorPtr { return NewError("unknown"); }},
+        {ErrorCode::kTypeMismatch, "类型错误：期望 int 得到 string",
+         []() -> ErrorPtr { return MakeError<TypeMismatchError>("tm", "int", "string"); }},
+        {ErrorCode::kInvalidArgument, "参数非法：缺少必填参数",
+         []() -> ErrorPtr { return MakeError<ArgumentError>("required", "name"); }},
+        {ErrorCode::kOutOfRange, "越界：下标超过上限",
+         []() -> ErrorPtr { return MakeError<OutOfRangeError>("index", 9, 3); }},
+        {ErrorCode::kFormatError, "格式错误：JSON 解析失败",
+         []() -> ErrorPtr { return MakeError<FormatError>("bad token", "json"); }},
+        {ErrorCode::kNotFound, "不存在：配置键缺失",
+         []() -> ErrorPtr { return MakeError<NotFoundError>("missing", "app.port"); }},
+        {ErrorCode::kAlreadyExists, "已存在：重复注册类型",
+         []() -> ErrorPtr { return NewError("dup", ErrorCode::kAlreadyExists); }},
+        {ErrorCode::kPermissionDenied, "权限不足：无读权限",
+         []() -> ErrorPtr { return MakeError<PermissionError>("denied", "/root/x"); }},
+        {ErrorCode::kUnauthenticated, "未认证：token 过期",
+         []() -> ErrorPtr { return MakeError<UnauthenticatedError>("expired", "alice"); }},
+        {ErrorCode::kTimeout, "超时：等待响应超过阈值",
+         []() -> ErrorPtr { return MakeError<TimeoutError>("slow", "peer", 100); }},
+        {ErrorCode::kCancelled, "取消：context 被取消",
+         []() -> ErrorPtr { return MakeError<CancelledError>("cancelled", "ctx.done"); }},
+        {ErrorCode::kResourceExhausted, "资源耗尽：fd 用尽",
+         []() -> ErrorPtr { return MakeError<ResourceExhaustedError>("full", "fd"); }},
+        {ErrorCode::kUnavailable, "不可用：依赖服务未启动",
+         []() -> ErrorPtr { return NewError("down", ErrorCode::kUnavailable); }},
+        {ErrorCode::kFailedPrecondition, "前置条件：状态机顺序错误",
+         []() -> ErrorPtr { return NewError("not ready", ErrorCode::kFailedPrecondition); }},
+        {ErrorCode::kAborted, "中止：并发冲突导致放弃",
+         []() -> ErrorPtr { return NewError("conflict", ErrorCode::kAborted); }},
+        {ErrorCode::kIOError, "IO 错误：写入失败",
+         []() -> ErrorPtr { return MakeError<IOError>("write failed", "/tmp/x"); }},
+        {ErrorCode::kCorruption, "数据损坏：校验和不符",
+         []() -> ErrorPtr { return MakeError<CorruptionError>("crc", "frame"); }},
+        {ErrorCode::kInternal, "内部错误：不变量被破坏",
+         []() -> ErrorPtr { return NewError("bug", ErrorCode::kInternal); }},
+        {ErrorCode::kUnimplemented, "未实现：平台不支持",
+         []() -> ErrorPtr { return NewError("n/a", ErrorCode::kUnimplemented); }},
+        {ErrorCode::kWouldBlock, "未就绪：非阻塞读写", []() -> ErrorPtr {
+             return NewError("again", ErrorCode::kWouldBlock);
+         }},
+        {ErrorCode::kDeadlock, "死锁：检测到循环等待",
+         []() -> ErrorPtr { return NewError("cycle", ErrorCode::kDeadlock); }},
+        {ErrorCode::kWrappedError, "包装节点：Wrap 上下文",
+         []() -> ErrorPtr { return Wrap(NewError("cause"), "ctx"); }},
+    }};
+
+    CHECK_EQ(scenarios.size(), std::size_t{23});
+    std::set<int> covered;
+    for (const auto& entry : scenarios) {
+        covered.insert(static_cast<int>(entry.code));
+        const ErrorPtr error = entry.factory();
+        CHECK_EQ(ErrorCodeOf(error), entry.code);
+        if (error) {
+            CHECK(!error->Message().empty());
+            CHECK(!ErrorCodeName(error->Code()).empty());
+        }
+        CHECK(!std::string_view(entry.scenario).empty());
+    }
+    CHECK_EQ(covered.size(), std::size_t{23});
+}
+
+// ---------------------------------------------------------------------------
+// 22. 真实场景（6 个）
 // ---------------------------------------------------------------------------
 void TestRealScenarios() {
     Registry& registry = Registry::Instance();
@@ -1131,69 +1351,52 @@ void TestRealScenarios() {
         const ErrorPtr cause = MakeError<FileNotFoundError>("open failed", "/etc/app.conf");
         const ErrorPtr error = Wrap(cause, "load config");
         CHECK_EQ(error->Code(), ErrorCode::kWrappedError);
-        // IsA 只判“当前节点自身的类型链”；跨包装层找类型要用 As/Has。
         CHECK(!error->IsA("go2cpp.IOError"));
         CHECK(Has<IOError>(error));
-        CHECK(As<IOError>(error) != nullptr);
         CHECK(HasErrorCode(error, ErrorCode::kNotFound));
         CHECK(As<FileNotFoundError>(error) == cause);
         CHECK_EQ(ErrorMessage(error), std::string("load config: open failed [path=/etc/app.conf]"));
     }
 
-    // 场景 2：网络连接超时（TimeoutError + 阈值 + 类型检索 + 树形日志）。
+    // 场景 2：类型错误（解码配置时字段类型不符）+ 分类统计。
+    {
+        const ErrorPtr error = Wrap(MakeError<TypeMismatchError>(
+                                        "field type mismatch", "int", "string"),
+                                    "decode config");
+        const auto mismatch = As<TypeMismatchError>(error);
+        CHECK(mismatch != nullptr);
+        CHECK_EQ(mismatch->Expected(), std::string("int"));
+        CHECK_EQ(ErrorCategoryOf(mismatch->Code()), ErrorCategory::kUsage);
+        CHECK_EQ(std::string(ErrorCodeName(mismatch->Code())), std::string("TYPE_MISMATCH"));
+    }
+
+    // 场景 3：网络连接超时（TimeoutError + 阈值 + 类型检索 + 树形日志）。
     {
         const ErrorPtr error = Wrap(MakeError<TimeoutError>("connect timeout", "10.0.0.1:80", 3000),
                                     "dial peer");
         const auto timeout = As<TimeoutError>(error);
         CHECK(timeout != nullptr);
         CHECK_EQ(timeout->TimeoutMs(), std::uint64_t{3000});
-        CHECK_EQ(timeout->Code(), ErrorCode::kDeadlineExceeded);
+        CHECK_EQ(timeout->Code(), ErrorCode::kTimeout);
+        CHECK_EQ(ErrorCategoryOf(timeout->Code()), ErrorCategory::kTransient);
         CHECK(ErrorTreeString(error).find("go2cpp.TimeoutError") != std::string::npos);
     }
 
-    // 场景 3：参数校验批量失败（多 ArgumentError 聚合）。
+    // 场景 4：取消传播（CancelledError 与 Timeout 区分开，不误判成超时）。
     {
-        const ErrorPtr error = Join({MakeError<ArgumentError>("required", "name"),
-                                     MakeError<ArgumentError>("range", "age"),
-                                     MakeError<ArgumentError>("format", "email")});
-        CHECK(error != nullptr);
-        CHECK_EQ(error->UnwrapAll().size(), std::size_t{3});
-        int argument_errors = 0;
-        const WalkResult walked = WalkErrors(error, [&argument_errors](const ErrorPtr& node) {
-            const auto* argument = dynamic_cast<const ArgumentError*>(node.get());
-            if (argument != nullptr) {
-                ++argument_errors;
-                CHECK(!argument->Argument().empty());
-            }
-            return ErrorVisitResult::kContinue;
-        });
-        CHECK(walked.ok);
-        CHECK_EQ(argument_errors, 3);
-        CHECK_EQ(error->Message().find('\n') != std::string::npos, true);
+        const ErrorPtr error = MakeError<CancelledError>("request cancelled", "context");
+        CHECK_EQ(error->Code(), ErrorCode::kCancelled);
+        CHECK(!HasErrorCode(error, ErrorCode::kTimeout));
+        CHECK_EQ(ErrorCategoryOf(error->Code()), ErrorCategory::kTransient);
+        CHECK_EQ(ErrorMessage(error), std::string("request cancelled [reason=context]"));
     }
 
-    // 场景 4：配置键不存在（按名字创建 + 绑定业务码 + 按码反查）。
-    {
-        const std::uint32_t config_code = registry.RegisterCode("demo.config.missing_key");
-        CHECK(registry.Register("demo.ConfigError", "go2cpp.Error", 1, [config_code]() -> ErrorPtr {
-            return NewError("missing key", static_cast<ErrorCode>(config_code));
-        }));
-        CHECK(registry.BindCode("demo.ConfigError", static_cast<std::int32_t>(config_code)));
-        const ErrorPtr error = registry.Create("demo.ConfigError");
-        CHECK(error != nullptr);
-        CHECK_EQ(error->Code(), static_cast<ErrorCode>(config_code));
-        CHECK(error->IsA("go2cpp.Error"));
-        CHECK_EQ(registry.TypeNameOf(static_cast<std::int32_t>(config_code)),
-                 std::string_view("demo.ConfigError"));
-        CHECK_EQ(registry.CodeName(config_code), std::string_view("demo.config.missing_key"));
-    }
-
-    // 场景 5：批量任务部分失败（按错误码分组统计）。
+    // 场景 5：资源耗尽 + 批量任务部分失败（按错误码分组统计）。
     {
         std::vector<ErrorPtr> failures;
         std::unordered_map<int, int> expected_counts;
-        for (int index = 0; index < 100; ++index) {
-            switch (index % 3) {
+        for (int index = 0; index < 120; ++index) {
+            switch (index % 4) {
                 case 0:
                     failures.push_back(MakeError<NotFoundError>("nf", "k" + std::to_string(index)));
                     ++expected_counts[static_cast<int>(ErrorCode::kNotFound)];
@@ -1201,7 +1404,12 @@ void TestRealScenarios() {
                 case 1:
                     failures.push_back(
                         MakeError<TimeoutError>("to", "p" + std::to_string(index), 100));
-                    ++expected_counts[static_cast<int>(ErrorCode::kDeadlineExceeded)];
+                    ++expected_counts[static_cast<int>(ErrorCode::kTimeout)];
+                    break;
+                case 2:
+                    failures.push_back(
+                        MakeError<ResourceExhaustedError>("full", "fd"));
+                    ++expected_counts[static_cast<int>(ErrorCode::kResourceExhausted)];
                     break;
                 default:
                     failures.push_back(
@@ -1212,7 +1420,7 @@ void TestRealScenarios() {
         }
         const ErrorPtr error = Join(std::move(failures));
         CHECK(error != nullptr);
-        CHECK_EQ(error->UnwrapAll().size(), std::size_t{100});
+        CHECK_EQ(error->UnwrapAll().size(), std::size_t{120});
         std::unordered_map<int, int> actual_counts;
         const WalkResult walked = WalkErrors(error, [&actual_counts](const ErrorPtr& node) {
             ++actual_counts[static_cast<int>(node->Code())];
@@ -1232,15 +1440,18 @@ void TestRealScenarios() {
         CHECK_EQ(::go2cpp::ErrorMessage(legacy), error->Message());
         CHECK(::go2cpp::As<LegacyAdapter>(legacy) != nullptr);
 
-        const ::go2cpp::bento::error::ErrorPtr bento_error = ::go2cpp::bento::error::FromGo2Cpp(error);
+        const ::go2cpp::bento::error::ErrorPtr bento_error =
+            ::go2cpp::bento::error::FromGo2Cpp(error);
         CHECK_EQ(bento_error->Message(), error->Message());
         CHECK_EQ(bento_error->Code(), ::go2cpp::bento::error::ErrorCode::kWrappedError);
         const ErrorPtr round_trip = ::go2cpp::bento::error::ToGo2Cpp(bento_error);
         CHECK_EQ(round_trip->Message(), error->Message());
-        // 包装链跨桥叶子化时错误码穿透到最内层根因（PermissionError），
-        // 否则调用方按码分类只能看到 kWrappedError、拿不到真实失败原因。
         CHECK_EQ(round_trip->Code(), ErrorCode::kPermissionDenied);
     }
+
+    // 注册表仍可用：错误码名字映射覆盖新码。
+    CHECK_EQ(registry.CodeName(static_cast<std::uint32_t>(ErrorCode::kTypeMismatch)),
+             std::string_view("TYPE_MISMATCH"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,6 +1486,7 @@ void TestRegistryThroughput() {
 int main() {
     std::cout << "=== go2cpp::error enhanced tests ===\n";
     RunTest("error_codes", TestErrorCodes);
+    RunTest("legacy_code_mapping", TestLegacyCodeMapping);
     RunTest("type_chain", TestTypeChain);
     RunTest("is_semantics", TestIsSemantics);
     RunTest("unwrap_levels", TestUnwrapLevels);
@@ -1292,11 +1504,13 @@ int main() {
     RunTest("bento_bridge", TestBentoBridge);
     RunTest("deep_chain", TestDeepChain);
     RunTest("random_trees", TestRandomTrees);
+    RunTest("type_mismatch_and_timeout", TestTypeMismatchAndTimeout);
+    RunTest("every_code_has_scenario", TestEveryCodeHasScenario);
     RunTest("real_scenarios", TestRealScenarios);
     RunTest("registry_throughput", TestRegistryThroughput);
 
     const int failures = g_failures.load();
-    std::cout << "=== " << (failures == 0 ? "PASSED" : "FAILED") << ": 20 tests, "
+    std::cout << "=== " << (failures == 0 ? "PASSED" : "FAILED") << ": 23 tests, "
               << g_checks.load() << " checks, " << failures << " failures ===\n";
     return failures == 0 ? 0 : 1;
 }

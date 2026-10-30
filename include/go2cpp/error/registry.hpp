@@ -4,7 +4,8 @@
  * @file registry.hpp
  * @brief 错误类型反射表 + 动态错误码表。
  *
- * @details 参考 csvp 的 `CsvErrorTypeRegistry` / `ErrorCodeRegistry`，把两套
+ * @details 沿用「类型反射表 + 动态错误码表」的分工（早期参考过 csvp 的
+ *          `CsvErrorTypeRegistry` / `ErrorCodeRegistry`），把两套
  *          注册能力合并进一个 `Registry`，解决两个不同问题：
  *
  * - **类型反射**：`类型名 -> 工厂 / 父类型 / 继承深度`。用于日志、配置、
@@ -325,9 +326,9 @@ class Registry {
      *         未注册返回 `"<unknown>"`。
      */
     std::string_view CodeName(std::uint32_t code) const {
-        // 只有 0–15 是枚举的合法取值；16–999 是保留空洞，直接归为 UNKNOWN，
+        // 只有 0–22 是枚举的合法取值；23–999 是保留空洞，直接归为 UNKNOWN，
         // 避免把越界值 static_cast 成枚举（那是未定义行为）。
-        if (code <= static_cast<std::uint32_t>(ErrorCode::kWrappedError)) {
+        if (code <= static_cast<std::uint32_t>(kLastBuiltinCode)) {
             return ErrorCodeName(static_cast<ErrorCode>(code));
         }
         if (code < static_cast<std::uint32_t>(kFirstCustomCode)) {
@@ -425,21 +426,40 @@ class Registry {
         RegisterRoot(kErrorRootTypeName);
         Register<StringError>();
         Register<ArgumentError>();
+        Register<TypeMismatchError>();
+        Register<FormatError>();
+        Register<OutOfRangeError>();
         Register<IOError>();
         Register<TimeoutError>();
         Register<NotFoundError>();
         Register<FileNotFoundError>();
         Register<PermissionError>();
+        Register<UnauthenticatedError>();
+        Register<CancelledError>();
+        Register<ResourceExhaustedError>();
+        Register<CorruptionError>();
         Register<WrappedError>();
         Register<JoinError>();
 
         // 按码找类型只对“代表类型”有意义，同一码不允许多个类型抢占。
+        // 这里只绑定有专属类型的码；其余内置码（kAlreadyExists/kUnavailable/
+        // kFailedPrecondition/kAborted/kInternal/kUnimplemented/kWouldBlock/
+        // kDeadlock）没有代表类型，用 StringError 携带。
         BindCode("go2cpp.StringError", static_cast<std::int32_t>(ErrorCode::kUnknown));
         BindCode("go2cpp.ArgumentError", static_cast<std::int32_t>(ErrorCode::kInvalidArgument));
+        BindCode("go2cpp.TypeMismatchError", static_cast<std::int32_t>(ErrorCode::kTypeMismatch));
+        BindCode("go2cpp.FormatError", static_cast<std::int32_t>(ErrorCode::kFormatError));
+        BindCode("go2cpp.OutOfRangeError", static_cast<std::int32_t>(ErrorCode::kOutOfRange));
         BindCode("go2cpp.NotFoundError", static_cast<std::int32_t>(ErrorCode::kNotFound));
         BindCode("go2cpp.PermissionError", static_cast<std::int32_t>(ErrorCode::kPermissionDenied));
-        BindCode("go2cpp.IOError", static_cast<std::int32_t>(ErrorCode::kUnavailable));
-        BindCode("go2cpp.TimeoutError", static_cast<std::int32_t>(ErrorCode::kDeadlineExceeded));
+        BindCode("go2cpp.UnauthenticatedError",
+                 static_cast<std::int32_t>(ErrorCode::kUnauthenticated));
+        BindCode("go2cpp.TimeoutError", static_cast<std::int32_t>(ErrorCode::kTimeout));
+        BindCode("go2cpp.CancelledError", static_cast<std::int32_t>(ErrorCode::kCancelled));
+        BindCode("go2cpp.ResourceExhaustedError",
+                 static_cast<std::int32_t>(ErrorCode::kResourceExhausted));
+        BindCode("go2cpp.IOError", static_cast<std::int32_t>(ErrorCode::kIOError));
+        BindCode("go2cpp.CorruptionError", static_cast<std::int32_t>(ErrorCode::kCorruption));
         BindCode("go2cpp.WrappedError", static_cast<std::int32_t>(ErrorCode::kWrappedError));
     }
 

@@ -4,8 +4,9 @@
  * @file bridge.hpp
  * @brief `go2cpp::error` 与 `bento::error` 的互操作桥（薄封装，不改动原模块）。
  *
- * @details Bento 的 `bento/error` 是独立实现的通用错误图，语义与新体系高度
- *          一致（同样的 16 个 `ErrorCode`、不可变节点、包装/聚合）。为了
+ * @details Bento 的 `bento/error` 是独立实现的通用错误图，模型与新体系
+ *          一致（不可变节点、包装/聚合、按地址去重的图查询），但错误码
+ *          词表不同：Bento 沿用 csvp 的 16 码，Go2Cpp 用自研的 23 码。为了
  *          避免两套错误在模块边界上“各说各话”，本文件提供零依赖的双向
  *          适配器：
  *
@@ -20,8 +21,10 @@
  *
  * ## 错误码契约
  *
- * 两侧枚举必须逐值一致，本文件用 16 条 `static_assert` 在编译期锁定；
- * 任一侧增删或改值都会立刻编译失败，而不是运行期静默错位。
+ * 两侧枚举**不再逐值一致**：`kLegacyCodeBridge` 给出 csvp/gRPC 16 码 →
+ * Go2Cpp 23 码的映射表，`ToGo2CppCode()` 查表、`ToBentoCode()` 反向有损
+ * 退化。16 条往返约束仍由 `static_assert` 在编译期锁定：任一侧改值都会
+ * 立刻编译失败，而不是运行期静默错位。
  *
  * @author go2cpp contributors
  * @date 2026-10-30
@@ -31,6 +34,7 @@
 #include "go2cpp/bento/error/error.hpp"
 #include "go2cpp/error/error.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -45,39 +49,142 @@ namespace go2cpp::bento::error {
 /// @brief 跨体系适配的递归深度上限，防止异常深图递归爆栈。
 inline constexpr std::size_t kMaxBridgeDepth = 64;
 
-#define GO2CPP_ERROR_BRIDGE_CODE_ALIGN(name)                                                        \
-    static_assert(static_cast<std::int32_t>(::go2cpp::error::ErrorCode::name) ==                    \
-                      static_cast<std::int32_t>(ErrorCode::name),                   \
-                  "go2cpp::error::ErrorCode 与 bento::error::ErrorCode 数值不一致：" #name)
+/**
+ * @brief 一条跨词表映射记录。
+ *
+ * @details `legacy` 是 Bento/csvp 的 16 码，`current` 是 Go2Cpp 自研码，
+ *          `note` 记录语义差异，排查跨体系日志时可直接对着表看。
+ */
+struct LegacyCodeBridgeEntry {
+    ErrorCode legacy;                   ///< Bento/csvp 错误码（0–15）。
+    ::go2cpp::error::ErrorCode current; ///< Go2Cpp 错误码（0–22）。
+    std::string_view note;              ///< 语义说明。
+};
 
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kOk);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kUnknown);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kInvalidArgument);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kNotFound);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kAlreadyExists);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kPermissionDenied);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kResourceExhausted);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kFailedPrecondition);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kOutOfRange);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kUnimplemented);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kInternal);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kUnavailable);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kDataLoss);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kCancelled);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kDeadlineExceeded);
-GO2CPP_ERROR_BRIDGE_CODE_ALIGN(kWrappedError);
+/**
+ * @brief csvp/gRPC 16 码 → Go2Cpp 23 码的映射表。
+ *
+ * @details 两侧**不再要求数值一致**：Go2Cpp 的码按失败原因分类（类型/
+ *          格式/超时/取消/IO/并发……），旧词表只作为兼容面存在。完整设计
+ *          见 `go2cpp/error/code.hpp`；纯数值兼容入口见
+ *          `go2cpp/error/legacy_code.hpp` 的 `FromLegacyCode()`。
+ */
+inline constexpr std::array<LegacyCodeBridgeEntry, 16> kLegacyCodeBridge = {{
+    {ErrorCode::kOk, ::go2cpp::error::ErrorCode::kOk, "同义"},
+    {ErrorCode::kUnknown, ::go2cpp::error::ErrorCode::kUnknown, "同义"},
+    {ErrorCode::kInvalidArgument, ::go2cpp::error::ErrorCode::kInvalidArgument, "同义"},
+    {ErrorCode::kNotFound, ::go2cpp::error::ErrorCode::kNotFound, "同义"},
+    {ErrorCode::kAlreadyExists, ::go2cpp::error::ErrorCode::kAlreadyExists, "同义"},
+    {ErrorCode::kPermissionDenied, ::go2cpp::error::ErrorCode::kPermissionDenied, "同义"},
+    {ErrorCode::kResourceExhausted, ::go2cpp::error::ErrorCode::kResourceExhausted, "同义"},
+    {ErrorCode::kFailedPrecondition, ::go2cpp::error::ErrorCode::kFailedPrecondition, "同义"},
+    {ErrorCode::kOutOfRange, ::go2cpp::error::ErrorCode::kOutOfRange, "同义"},
+    {ErrorCode::kUnimplemented, ::go2cpp::error::ErrorCode::kUnimplemented, "同义"},
+    {ErrorCode::kInternal, ::go2cpp::error::ErrorCode::kInternal, "同义"},
+    {ErrorCode::kUnavailable, ::go2cpp::error::ErrorCode::kUnavailable, "同义"},
+    {ErrorCode::kDataLoss, ::go2cpp::error::ErrorCode::kCorruption, "改名：本地语义是数据损坏/校验失败"},
+    {ErrorCode::kCancelled, ::go2cpp::error::ErrorCode::kCancelled, "同义"},
+    {ErrorCode::kDeadlineExceeded, ::go2cpp::error::ErrorCode::kTimeout, "改名：deadline 归入统一的超时码"},
+    {ErrorCode::kWrappedError, ::go2cpp::error::ErrorCode::kWrappedError, "同义"},
+}};
 
-#undef GO2CPP_ERROR_BRIDGE_CODE_ALIGN
-
-/// @brief 新体系错误码 → Bento 错误码（数值一致，零成本转换）。
-inline ErrorCode ToBentoCode(::go2cpp::error::ErrorCode code) noexcept {
-    return static_cast<ErrorCode>(static_cast<std::int32_t>(code));
+/// @brief Bento/csvp 错误码 → Go2Cpp 错误码（查表；未知值退化为 `kUnknown`）。
+constexpr ::go2cpp::error::ErrorCode ToGo2CppCode(ErrorCode code) noexcept {
+    for (const LegacyCodeBridgeEntry& entry : kLegacyCodeBridge) {
+        if (entry.legacy == code) {
+            return entry.current;
+        }
+    }
+    return ::go2cpp::error::ErrorCode::kUnknown;
 }
 
-/// @brief Bento 错误码 → 新体系错误码（数值一致，零成本转换）。
-inline ::go2cpp::error::ErrorCode ToGo2CppCode(ErrorCode code) noexcept {
-    return static_cast<::go2cpp::error::ErrorCode>(static_cast<std::int32_t>(code));
+/**
+ * @brief Go2Cpp 错误码 → Bento/csvp 错误码（**有损**）。
+ *
+ * @details 旧词表装不下的新码按语义就近退化：类型/格式错误 →
+ *          INVALID_ARGUMENT；未认证 → PERMISSION_DENIED；IO 错误/未就绪 →
+ *          UNAVAILABLE；中止/死锁 → FAILED_PRECONDITION；数据损坏 →
+ *          DATA_LOSS。无损性可用 `IsBentoCodeLossless()` 判断。
+ * @note 这是跨体系边界的最后手段；能直接传新码时不要先退化成 Bento 码。
+ */
+constexpr ErrorCode ToBentoCode(::go2cpp::error::ErrorCode code) noexcept {
+    switch (code) {
+        case ::go2cpp::error::ErrorCode::kOk:
+            return ErrorCode::kOk;
+        case ::go2cpp::error::ErrorCode::kUnknown:
+            return ErrorCode::kUnknown;
+        case ::go2cpp::error::ErrorCode::kTypeMismatch:
+            return ErrorCode::kInvalidArgument;
+        case ::go2cpp::error::ErrorCode::kInvalidArgument:
+            return ErrorCode::kInvalidArgument;
+        case ::go2cpp::error::ErrorCode::kOutOfRange:
+            return ErrorCode::kOutOfRange;
+        case ::go2cpp::error::ErrorCode::kFormatError:
+            return ErrorCode::kInvalidArgument;
+        case ::go2cpp::error::ErrorCode::kNotFound:
+            return ErrorCode::kNotFound;
+        case ::go2cpp::error::ErrorCode::kAlreadyExists:
+            return ErrorCode::kAlreadyExists;
+        case ::go2cpp::error::ErrorCode::kPermissionDenied:
+            return ErrorCode::kPermissionDenied;
+        case ::go2cpp::error::ErrorCode::kUnauthenticated:
+            return ErrorCode::kPermissionDenied;
+        case ::go2cpp::error::ErrorCode::kTimeout:
+            return ErrorCode::kDeadlineExceeded;
+        case ::go2cpp::error::ErrorCode::kCancelled:
+            return ErrorCode::kCancelled;
+        case ::go2cpp::error::ErrorCode::kResourceExhausted:
+            return ErrorCode::kResourceExhausted;
+        case ::go2cpp::error::ErrorCode::kUnavailable:
+            return ErrorCode::kUnavailable;
+        case ::go2cpp::error::ErrorCode::kFailedPrecondition:
+            return ErrorCode::kFailedPrecondition;
+        case ::go2cpp::error::ErrorCode::kAborted:
+            return ErrorCode::kFailedPrecondition;
+        case ::go2cpp::error::ErrorCode::kIOError:
+            return ErrorCode::kUnavailable;
+        case ::go2cpp::error::ErrorCode::kCorruption:
+            return ErrorCode::kDataLoss;
+        case ::go2cpp::error::ErrorCode::kInternal:
+            return ErrorCode::kInternal;
+        case ::go2cpp::error::ErrorCode::kUnimplemented:
+            return ErrorCode::kUnimplemented;
+        case ::go2cpp::error::ErrorCode::kWouldBlock:
+            return ErrorCode::kUnavailable;
+        case ::go2cpp::error::ErrorCode::kDeadlock:
+            return ErrorCode::kFailedPrecondition;
+        case ::go2cpp::error::ErrorCode::kWrappedError:
+            return ErrorCode::kWrappedError;
+    }
+    return ErrorCode::kUnknown;
 }
+
+/**
+ * @brief Go2Cpp 码能否经 Bento 码无损往返。
+ * @details 为 true 的 16 个码跨桥不丢语义；其余新码会退化（见 `ToBentoCode`）。
+ */
+constexpr bool IsBentoCodeLossless(::go2cpp::error::ErrorCode code) noexcept {
+    return ToGo2CppCode(ToBentoCode(code)) == code;
+}
+
+namespace detail {
+
+/// @brief 16 个旧码经「新码 → Bento 码」必须回到原值（映射表自洽性检查）。
+constexpr bool BridgeRoundTrips() noexcept {
+    for (const LegacyCodeBridgeEntry& entry : kLegacyCodeBridge) {
+        if (ToBentoCode(entry.current) != entry.legacy) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace detail
+
+static_assert(kLegacyCodeBridge.size() == 16, "映射表必须覆盖 csvp/gRPC 的全部 16 个码");
+static_assert(detail::BridgeRoundTrips(),
+              "kLegacyCodeBridge 与 ToBentoCode 不一致：16 个旧码必须能经新码往返");
+
 
 /**
  * @brief 把新体系错误适配成 `bento::error::Error`。

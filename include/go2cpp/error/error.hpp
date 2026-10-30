@@ -4,8 +4,8 @@
  * @file error.hpp
  * @brief 带类型链的不可变错误体系：错误码、类型反射、包装/聚合与图查询。
  *
- * @details 本文件是 `go2cpp::error` 的核心，参考 csvp 的 `csvp::Error`
- *          设计并入 Go2Cpp：
+ * @details 本文件是 `go2cpp::error` 的核心，沿用「不可变错误节点 + 类型链
+ *          + 错误图」的模型；错误码词表是 Go2Cpp 自研的（见 `code.hpp`）：
  *
  * - **类型链**：每个错误类型自报 `TypeName()` / `ParentTypeName()` /
  *   `InheritanceDepth()`，`Is()` 沿类型链判断“是不是某种错误”；
@@ -45,8 +45,9 @@
  * ## 内存与并发
  *
  * 错误对象不可变，`Message()` / `Code()` / `Is()` 等只读方法可并发调用。
- * `WrappedError` / `JoinError` 的析构通过线程本地工作表迭代展开，十万层
- * 的深链析构不会爆栈（见 `detail::DestroyPending()`）。
+ * `WrappedError` / `JoinError` 的析构通过**当前执行上下文**的工作表迭代
+ * 展开，十万层的深链析构不会爆栈（见 `detail::DestroyWorkTable`）；工作表
+ * 由 `ErrorLocal` 承载，链接 Fiber 后随 G 迁移，普通线程退化为线程局部。
  *
  * @author go2cpp contributors
  * @date 2026-10-30
@@ -54,6 +55,7 @@
  */
 
 #include "go2cpp/error/code.hpp"
+#include "go2cpp/error/error_local.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -257,11 +259,138 @@ class ArgumentError final : public Error {
     std::string m_argument; ///< 参数名；构造时设置。
 };
 
+/// @brief 类型错误：`kTypeMismatch`，可携带期望/实际类型名。
+class TypeMismatchError final : public Error {
+ public:
+    GO2CPP_ERROR_TYPE("go2cpp.TypeMismatchError", Error)
+
+    TypeMismatchError() = default;
+
+    /**
+     * @brief 创建类型错误。
+     * @param message 错误说明。
+     * @param expected 期望的类型名；非空时 `Message()` 追加 `[expected=...]`。
+     * @param actual 实际类型名；非空时追加 `[actual=...]`。
+     */
+    explicit TypeMismatchError(std::string message, std::string expected = {},
+                               std::string actual = {})
+        : m_message(std::move(message)),
+          m_expected(std::move(expected)),
+          m_actual(std::move(actual)) {}
+
+    std::string Message() const override {
+        std::string result = m_message;
+        if (!m_expected.empty()) {
+            result += " [expected=";
+            result += m_expected;
+            result += ']';
+        }
+        if (!m_actual.empty()) {
+            result += " [actual=";
+            result += m_actual;
+            result += ']';
+        }
+        return result;
+    }
+    ErrorCode Code() const noexcept override { return ErrorCode::kTypeMismatch; }
+
+    /// @brief 期望的类型名；未提供时为空。
+    const std::string& Expected() const noexcept { return m_expected; }
+    /// @brief 实际类型名；未提供时为空。
+    const std::string& Actual() const noexcept { return m_actual; }
+
+ private:
+    std::string m_message;  ///< 错误说明。
+    std::string m_expected; ///< 期望类型名。
+    std::string m_actual;   ///< 实际类型名。
+};
+
+/// @brief 格式错误：`kFormatError`，解析失败时携带格式名（json/csv/frame 等）。
+class FormatError final : public Error {
+ public:
+    GO2CPP_ERROR_TYPE("go2cpp.FormatError", Error)
+
+    FormatError() = default;
+
+    /**
+     * @brief 创建格式错误。
+     * @param message 错误说明。
+     * @param format 出错的格式名；非空时 `Message()` 追加 `[format=...]`。
+     */
+    explicit FormatError(std::string message, std::string format = {})
+        : m_message(std::move(message)), m_format(std::move(format)) {}
+
+    std::string Message() const override {
+        if (m_format.empty()) {
+            return m_message;
+        }
+        std::string result = m_message;
+        result += " [format=";
+        result += m_format;
+        result += ']';
+        return result;
+    }
+    ErrorCode Code() const noexcept override { return ErrorCode::kFormatError; }
+
+    /// @brief 出错的格式名；未提供时为空。
+    const std::string& Format() const noexcept { return m_format; }
+
+ private:
+    std::string m_message; ///< 错误说明。
+    std::string m_format;  ///< 格式名。
+};
+
+/// @brief 越界错误：`kOutOfRange`，可携带下标与上限。
+class OutOfRangeError final : public Error {
+ public:
+    GO2CPP_ERROR_TYPE("go2cpp.OutOfRangeError", Error)
+
+    OutOfRangeError() = default;
+
+    /**
+     * @brief 创建越界错误。
+     * @param message 错误说明。
+     * @param index 越界下标；负数表示未记录。
+     * @param limit 允许的上限（不含）；负数表示未记录。
+     */
+    explicit OutOfRangeError(std::string message, std::int64_t index = -1,
+                             std::int64_t limit = -1)
+        : m_message(std::move(message)), m_index(index), m_limit(limit) {}
+
+    std::string Message() const override {
+        std::string result = m_message;
+        if (m_index >= 0) {
+            result += " [index=";
+            result += std::to_string(m_index);
+            result += ']';
+        }
+        if (m_limit >= 0) {
+            result += " [limit=";
+            result += std::to_string(m_limit);
+            result += ']';
+        }
+        return result;
+    }
+    ErrorCode Code() const noexcept override { return ErrorCode::kOutOfRange; }
+
+    /// @brief 越界下标；负数表示未记录。
+    std::int64_t Index() const noexcept { return m_index; }
+    /// @brief 允许上限（不含）；负数表示未记录。
+    std::int64_t Limit() const noexcept { return m_limit; }
+
+ private:
+    std::string m_message;  ///< 错误说明。
+    std::int64_t m_index = -1; ///< 越界下标。
+    std::int64_t m_limit = -1; ///< 允许上限。
+};
+
 /**
- * @brief I/O 错误：读写失败、设备不可用等，默认码 `kUnavailable`。
+ * @brief I/O 错误：读写失败、设备错误等，默认码 `kIOError`。
  *
  * @details 作为 `TimeoutError` / `NotFoundError` / `PermissionError` 的
  *          基类提供路径上下文；子类通过构造函数指定更精确的错误码。
+ *          「对端暂不可用」用 `kUnavailable`，不归入 IO：前者通常可重试，
+ *          后者说明数据面已经失败。
  */
 class IOError : public Error {
  public:
@@ -273,10 +402,10 @@ class IOError : public Error {
      * @brief 创建 I/O 错误。
      * @param message 错误说明。
      * @param path 关联路径；非空时 `Message()` 追加 `[path=...]`。
-     * @param code 错误码；默认 `kUnavailable`（重试可能成功）。
+     * @param code 错误码；默认 `kIOError`。
      */
     explicit IOError(std::string message, std::string path = {},
-                     ErrorCode code = ErrorCode::kUnavailable)
+                     ErrorCode code = ErrorCode::kIOError)
         : m_message(std::move(message)), m_path(std::move(path)), m_code(code) {}
 
     std::string Message() const override {
@@ -295,17 +424,18 @@ class IOError : public Error {
     const std::string& Path() const noexcept { return m_path; }
 
  private:
-    std::string m_message;                     ///< 错误说明。
-    std::string m_path;                        ///< 关联路径。
-    ErrorCode m_code = ErrorCode::kUnavailable; ///< 错误码。
+    std::string m_message;                      ///< 错误说明。
+    std::string m_path;                         ///< 关联路径。
+    ErrorCode m_code = ErrorCode::kIOError;     ///< 错误码。
 };
 
-/// @brief 超时错误：`kDeadlineExceeded`，是 I/O 错误的特化。
+
+/// @brief 超时错误：`kTimeout`，是 I/O 错误的特化。
 class TimeoutError final : public IOError {
  public:
     GO2CPP_ERROR_TYPE("go2cpp.TimeoutError", IOError)
 
-    TimeoutError() : IOError(std::string(), std::string(), ErrorCode::kDeadlineExceeded) {}
+    TimeoutError() : IOError(std::string(), std::string(), ErrorCode::kTimeout) {}
 
     /**
      * @brief 创建超时错误。
@@ -314,7 +444,7 @@ class TimeoutError final : public IOError {
      * @param timeout_ms 超时阈值（毫秒）；0 表示未记录。
      */
     explicit TimeoutError(std::string message, std::string path = {}, std::uint64_t timeout_ms = 0)
-        : IOError(std::move(message), std::move(path), ErrorCode::kDeadlineExceeded),
+        : IOError(std::move(message), std::move(path), ErrorCode::kTimeout),
           m_timeout_ms(timeout_ms) {}
 
     /// @brief 超时阈值（毫秒）；0 表示未记录。
@@ -372,32 +502,263 @@ class PermissionError final : public IOError {
         : IOError(std::move(message), std::move(path), ErrorCode::kPermissionDenied) {}
 };
 
+/// @brief 未认证：`kUnauthenticated`，缺少/无效/过期凭证。
+class UnauthenticatedError final : public Error {
+ public:
+    GO2CPP_ERROR_TYPE("go2cpp.UnauthenticatedError", Error)
+
+    UnauthenticatedError() = default;
+
+    /**
+     * @brief 创建未认证错误。
+     * @param message 错误说明。
+     * @param principal 涉及的身份；非空时 `Message()` 追加 `[principal=...]`。
+     */
+    explicit UnauthenticatedError(std::string message, std::string principal = {})
+        : m_message(std::move(message)), m_principal(std::move(principal)) {}
+
+    std::string Message() const override {
+        if (m_principal.empty()) {
+            return m_message;
+        }
+        std::string result = m_message;
+        result += " [principal=";
+        result += m_principal;
+        result += ']';
+        return result;
+    }
+    ErrorCode Code() const noexcept override { return ErrorCode::kUnauthenticated; }
+
+    /// @brief 涉及的身份；未提供时为空。
+    const std::string& Principal() const noexcept { return m_principal; }
+
+ private:
+    std::string m_message;   ///< 错误说明。
+    std::string m_principal; ///< 身份标识。
+};
+
+/// @brief 已取消：`kCancelled`，context 取消或主动中止。
+class CancelledError final : public Error {
+ public:
+    GO2CPP_ERROR_TYPE("go2cpp.CancelledError", Error)
+
+    CancelledError() = default;
+
+    /**
+     * @brief 创建取消错误。
+     * @param message 错误说明。
+     * @param reason 取消原因；非空时 `Message()` 追加 `[reason=...]`。
+     */
+    explicit CancelledError(std::string message, std::string reason = {})
+        : m_message(std::move(message)), m_reason(std::move(reason)) {}
+
+    std::string Message() const override {
+        if (m_reason.empty()) {
+            return m_message;
+        }
+        std::string result = m_message;
+        result += " [reason=";
+        result += m_reason;
+        result += ']';
+        return result;
+    }
+    ErrorCode Code() const noexcept override { return ErrorCode::kCancelled; }
+
+    /// @brief 取消原因；未提供时为空。
+    const std::string& Reason() const noexcept { return m_reason; }
+
+ private:
+    std::string m_message; ///< 错误说明。
+    std::string m_reason;  ///< 取消原因。
+};
+
+/// @brief 资源耗尽：`kResourceExhausted`，可携带资源名（fd/memory/...）。
+class ResourceExhaustedError final : public Error {
+ public:
+    GO2CPP_ERROR_TYPE("go2cpp.ResourceExhaustedError", Error)
+
+    ResourceExhaustedError() = default;
+
+    /**
+     * @brief 创建资源耗尽错误。
+     * @param message 错误说明。
+     * @param resource 资源名；非空时 `Message()` 追加 `[resource=...]`。
+     */
+    explicit ResourceExhaustedError(std::string message, std::string resource = {})
+        : m_message(std::move(message)), m_resource(std::move(resource)) {}
+
+    std::string Message() const override {
+        if (m_resource.empty()) {
+            return m_message;
+        }
+        std::string result = m_message;
+        result += " [resource=";
+        result += m_resource;
+        result += ']';
+        return result;
+    }
+    ErrorCode Code() const noexcept override { return ErrorCode::kResourceExhausted; }
+
+    /// @brief 资源名；未提供时为空。
+    const std::string& Resource() const noexcept { return m_resource; }
+
+ private:
+    std::string m_message;  ///< 错误说明。
+    std::string m_resource; ///< 资源名。
+};
+
+/// @brief 数据损坏：`kCorruption`，校验失败/截断/非法编码。
+class CorruptionError final : public Error {
+ public:
+    GO2CPP_ERROR_TYPE("go2cpp.CorruptionError", Error)
+
+    CorruptionError() = default;
+
+    /**
+     * @brief 创建数据损坏错误。
+     * @param message 错误说明。
+     * @param source 数据来源；非空时 `Message()` 追加 `[source=...]`。
+     */
+    explicit CorruptionError(std::string message, std::string source = {})
+        : m_message(std::move(message)), m_source(std::move(source)) {}
+
+    std::string Message() const override {
+        if (m_source.empty()) {
+            return m_message;
+        }
+        std::string result = m_message;
+        result += " [source=";
+        result += m_source;
+        result += ']';
+        return result;
+    }
+    ErrorCode Code() const noexcept override { return ErrorCode::kCorruption; }
+
+    /// @brief 数据来源；未提供时为空。
+    const std::string& Source() const noexcept { return m_source; }
+
+ private:
+    std::string m_message; ///< 错误说明。
+    std::string m_source;  ///< 数据来源。
+};
+
 namespace detail {
 
-/// @brief 深链析构的线程本地工作表；见 `WrappedError::~WrappedError`。
-inline thread_local std::vector<ErrorPtr> t_destroy_pending;
-
-/// @brief 是否已有析构循环在处理中（重入标记）。
-inline thread_local bool t_destroy_draining = false;
-
 /**
- * @brief 把待释放节点放入工作表并迭代释放，避免深链递归析构爆栈。
+ * @brief 深链析构工作表：每个执行上下文（Fiber 或线程）一份。
  *
  * @details 模式：第一个进入的析构函数开启 `draining`，之后重入的
  *          `WrappedError`/`JoinError` 析构只把子节点推进工作表就返回；
- *          外层循环逐个 `reset()`，每层释放都是常数栈深。析构函数不能
- *          抛异常，`push_back` 的 `bad_alloc` 被吞掉并放弃进一步展开
- *          （此时仍会正常释放已入表节点，只是可能退回少量递归）。
+ *          外层循环逐个 `reset()`，每层释放都是常数栈深。
+ *
+ *          **为什么放在 `ErrorLocal` 里**：工作表必须跟随逻辑执行流。
+ *          如果挂在 `thread_local` 上，Fiber 从 M1 迁到 M2 后表会对不上；
+ *          更糟的是 Fiber 在 M1 结束、表里还有待释放节点时，回收发生在
+ *          错误的线程上。`ErrorLocal` 在链接了 Fiber 的程序里绑定 G，
+ *          普通线程仍退化为 `thread_local`，两种场景共用这一份代码。
+ *
+ *          析构函数不能抛异常：`push_back` 的 `bad_alloc` 被吞掉并直接
+ *          释放当前节点（可能退回少量递归，但不会泄漏）。
  */
-inline void DrainDestroyQueue() noexcept {
-    while (!t_destroy_pending.empty()) {
-        ErrorPtr node = std::move(t_destroy_pending.back());
-        t_destroy_pending.pop_back();
+struct DestroyWorkTable {
+    std::vector<ErrorPtr> pending; ///< 待释放节点（LIFO，顺序无关）。
+    bool draining = false;         ///< 是否已有析构循环在处理。
+
+    /**
+     * @brief 上下文结束时的兜底排空。
+     * @details 正常路径下析构循环会把表排空；只有 Fiber 在异常路径下被
+     *          销毁时才可能残留节点。析构体直接排空，避免把 `shared_ptr`
+     *          泄漏到上下文销毁之后。
+     */
+    ~DestroyWorkTable() {
+        draining = true;
+        while (!pending.empty()) {
+            ErrorPtr node = std::move(pending.back());
+            pending.pop_back();
+            node.reset();
+        }
+    }
+};
+
+/// @brief 当前执行上下文的析构工作表。
+inline ErrorLocal<DestroyWorkTable>& DestroyTable() noexcept {
+    static ErrorLocal<DestroyWorkTable> table;
+    return table;
+}
+
+/// @brief 排空工作表；重入时直接返回，由外层循环负责。
+inline void DrainDestroyQueue(DestroyWorkTable& table) noexcept {
+    while (!table.pending.empty()) {
+        ErrorPtr node = std::move(table.pending.back());
+        table.pending.pop_back();
         node.reset();
     }
 }
 
+/**
+ * @brief 把一个原因交给当前上下文的析构工作表，必要时开启迭代释放。
+ * @param node 待释放节点；空指针直接返回。
+ */
+inline void EnqueueDestroy(ErrorPtr node) noexcept {
+    if (!node) {
+        return;
+    }
+    DestroyWorkTable* table = nullptr;
+    try {
+        table = &DestroyTable().GetOrCreate();
+        if (table->draining) {
+            table->pending.push_back(std::move(node));
+            return;
+        }
+        table->pending.push_back(std::move(node));
+    } catch (...) {
+        // 分配失败：直接释放当前节点（析构函数不能抛）。
+        node.reset();
+        return;
+    }
+    table->draining = true;
+    DrainDestroyQueue(*table);
+    table->draining = false;
+}
+
+/**
+ * @brief 把一批原因交给当前上下文的析构工作表。
+ * @param causes 节点列表；非空项被移出并统一释放。
+ */
+inline void EnqueueDestroyAll(std::vector<ErrorPtr>& causes) noexcept {
+    if (causes.empty()) {
+        return;
+    }
+    DestroyWorkTable* table = nullptr;
+    try {
+        table = &DestroyTable().GetOrCreate();
+    } catch (...) {
+        for (auto& cause : causes) {
+            cause.reset();
+        }
+        return;
+    }
+    const bool already_draining = table->draining;
+    for (auto& cause : causes) {
+        if (!cause) {
+            continue;
+        }
+        try {
+            table->pending.push_back(std::move(cause));
+        } catch (...) {
+            cause.reset();
+        }
+    }
+    if (already_draining) {
+        return;
+    }
+    table->draining = true;
+    DrainDestroyQueue(*table);
+    table->draining = false;
+}
+
 } // namespace detail
+
 
 /**
  * @brief 单原因包装：`Message()` 展平连续包装为 `"a: b: c"`。
@@ -420,25 +781,7 @@ class WrappedError final : public Error {
     WrappedError(std::string message, ErrorPtr cause)
         : m_message(std::move(message)), m_cause(std::move(cause)) {}
 
-    ~WrappedError() override {
-        if (!m_cause) {
-            return;
-        }
-        if (detail::t_destroy_draining) {
-            try {
-                detail::t_destroy_pending.push_back(std::move(m_cause));
-            } catch (...) {
-            }
-            return;
-        }
-        detail::t_destroy_draining = true;
-        try {
-            detail::t_destroy_pending.push_back(std::move(m_cause));
-            detail::DrainDestroyQueue();
-        } catch (...) {
-        }
-        detail::t_destroy_draining = false;
-    }
+    ~WrappedError() override { detail::EnqueueDestroy(std::move(m_cause)); }
 
     WrappedError(const WrappedError&) = delete;
     WrappedError& operator=(const WrappedError&) = delete;
@@ -504,33 +847,7 @@ class JoinError final : public Error {
         m_causes.erase(std::remove(m_causes.begin(), m_causes.end(), nullptr), m_causes.end());
     }
 
-    ~JoinError() override {
-        if (m_causes.empty()) {
-            return;
-        }
-        if (detail::t_destroy_draining) {
-            try {
-                for (auto& cause : m_causes) {
-                    if (cause) {
-                        detail::t_destroy_pending.push_back(std::move(cause));
-                    }
-                }
-            } catch (...) {
-            }
-            return;
-        }
-        detail::t_destroy_draining = true;
-        try {
-            for (auto& cause : m_causes) {
-                if (cause) {
-                    detail::t_destroy_pending.push_back(std::move(cause));
-                }
-            }
-            detail::DrainDestroyQueue();
-        } catch (...) {
-        }
-        detail::t_destroy_draining = false;
-    }
+    ~JoinError() override { detail::EnqueueDestroyAll(m_causes); }
 
     JoinError(const JoinError&) = delete;
     JoinError& operator=(const JoinError&) = delete;
@@ -920,6 +1237,44 @@ inline std::string ErrorTreeString(const ErrorPtr& error) {
         out.pop_back();
     }
     return out;
+}
+
+
+// ---------------------------------------------------------------------------
+// 当前执行上下文的最近错误
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief 当前执行上下文的「最近错误」槽。
+ *
+ * @details 这是错误体系的**工作状态**，不是返回值：调用方在跨挂起点
+ *          （`co_await`/`Fiber::Suspend`/回调）保留最近一次失败时使用。
+ *          在 Fiber 内绑定 G、随迁移走；普通线程退化为线程局部。
+ *
+ * @note 只保存一个共享指针，不参与错误图查询；需要完整上下文时仍应显式
+ *       传递 `ErrorPtr`，不要用本槽替代参数。
+ */
+inline ErrorLocal<ErrorPtr>& CurrentErrorSlot() noexcept {
+    static ErrorLocal<ErrorPtr> slot;
+    return slot;
+}
+
+/// @brief 清除当前执行上下文的最近错误。
+inline void ClearCurrentError() noexcept { CurrentErrorSlot().Reset(); }
+
+/// @brief 记录当前执行上下文的最近错误；传空指针等价于清除。
+inline void SetCurrentError(ErrorPtr error) {
+    if (!error) {
+        ClearCurrentError();
+        return;
+    }
+    CurrentErrorSlot().GetOrCreate() = std::move(error);
+}
+
+/// @brief 读取当前执行上下文的最近错误；没有时返回空指针。
+inline ErrorPtr CurrentError() noexcept {
+    ErrorPtr* const slot = CurrentErrorSlot().TryGet();
+    return slot != nullptr ? *slot : ErrorPtr();
 }
 
 } // namespace go2cpp::error
