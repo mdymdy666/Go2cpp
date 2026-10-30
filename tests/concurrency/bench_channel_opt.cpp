@@ -191,6 +191,132 @@ double MicroPair(std::size_t capacity, std::uint64_t total,
          (2.0 * static_cast<double>(total));
 }
 
+/// 纯快路径 SPSC：双方只用 TrySend/TryRecv 轮询重试，**永不 park**。
+/// 用来把「跨核锁成本」与「park/futex 成本」分离：如果它与普通 SPSC 接近，
+/// 说明瓶颈在锁的 cacheline 传递；如果远低于普通 SPSC，说明瓶颈在 park。
+double TrySpsc(std::size_t capacity, std::uint64_t total,
+               std::atomic<std::uint64_t>* order_violations) {
+  auto channel = go2cpp::MakeChannel<std::uint64_t>(capacity);
+  StartGate gate;
+  std::atomic<std::uint64_t> violations{0};
+  std::atomic<std::uint64_t> checksum{0};
+  std::thread producer([&] {
+    gate.Wait();
+    for (std::uint64_t i = 0; i < total; ++i) {
+      while (!channel->TrySend(i).Ok()) {
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+      }
+    }
+  });
+  std::thread consumer([&] {
+    gate.Wait();
+    std::uint64_t local_sum = 0;
+    std::uint64_t local_violations = 0;
+    for (std::uint64_t i = 0; i < total; ++i) {
+      for (;;) {
+        auto result = channel->TryRecv();
+        if (result.ok) {
+          if (*result.value != i) {
+            ++local_violations;
+          }
+          local_sum += *result.value;
+          break;
+        }
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+      }
+    }
+    checksum.store(local_sum, std::memory_order_relaxed);
+    violations.store(local_violations, std::memory_order_relaxed);
+  });
+  const auto started = Clock::now();
+  gate.Open();
+  producer.join();
+  consumer.join();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      Clock::now() - started);
+  Escape(checksum.load(std::memory_order_relaxed));
+  order_violations->fetch_add(violations.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+  return static_cast<double>(elapsed.count()) / static_cast<double>(total);
+}
+
+#if !defined(GO2CPP_BENCH_NO_BATCH)
+/// 批量 API 的 SPSC 吞吐：生产者/消费者各以 batch 条为一批。
+double BatchSpsc(std::size_t capacity, std::size_t batch, std::uint64_t total,
+                 std::atomic<std::uint64_t>* order_violations) {
+  auto channel = go2cpp::MakeChannel<std::uint64_t>(capacity);
+  StartGate gate;
+  std::atomic<std::uint64_t> violations{0};
+  std::atomic<std::uint64_t> checksum{0};
+  std::thread producer([&] {
+    gate.Wait();
+    std::vector<std::uint64_t> values(batch);
+    std::uint64_t next = 0;
+    while (next < total) {
+      const std::size_t n = static_cast<std::size_t>(
+          std::min<std::uint64_t>(batch, total - next));
+      for (std::size_t k = 0; k < n; ++k) {
+        values[k] = next + k;
+      }
+      std::size_t offset = 0;
+      while (offset < n) {
+        const std::size_t sent =
+            channel->TrySendBatch(values.data() + offset, n - offset);
+        if (sent == 0) {
+#if defined(__x86_64__)
+          __builtin_ia32_pause();
+#endif
+          continue;
+        }
+        offset += sent;
+      }
+      next += n;
+    }
+  });
+  std::thread consumer([&] {
+    gate.Wait();
+    std::vector<std::uint64_t> buffer(batch);
+    std::uint64_t expect = 0;
+    std::uint64_t local_sum = 0;
+    std::uint64_t local_violations = 0;
+    while (expect < total) {
+      const std::size_t got =
+          channel->TryRecvBatch(buffer.data(), buffer.size());
+      if (got == 0) {
+#if defined(__x86_64__)
+        __builtin_ia32_pause();
+#endif
+        continue;
+      }
+      for (std::size_t k = 0; k < got; ++k) {
+        if (buffer[k] != expect) {
+          ++local_violations;
+        }
+        local_sum += buffer[k];
+        ++expect;
+      }
+    }
+    checksum.store(local_sum, std::memory_order_relaxed);
+    violations.store(local_violations, std::memory_order_relaxed);
+  });
+  const auto started = Clock::now();
+  gate.Open();
+  producer.join();
+  consumer.join();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      Clock::now() - started);
+  Escape(checksum.load(std::memory_order_relaxed));
+  order_violations->fetch_add(violations.load(std::memory_order_relaxed),
+                              std::memory_order_relaxed);
+  return static_cast<double>(elapsed.count()) / static_cast<double>(total);
+}
+
+#endif  // GO2CPP_BENCH_NO_BATCH
+
 /// 空通道上的非阻塞探测成本。
 double EmptyTryRecv(std::size_t capacity, std::uint64_t iterations,
                     std::atomic<std::uint64_t>* order_violations) {
@@ -265,6 +391,36 @@ int main(int argc, char** argv) {
       Samples samples;
       for (int i = 0; i < reps; ++i) {
         samples.Add(MicroPair(capacity, total / 2, &violations));
+      }
+      PrintRow("Channel cap=" + std::to_string(capacity), samples);
+    }
+    std::printf("\n");
+  }
+
+  #if !defined(GO2CPP_BENCH_NO_BATCH)
+  if (all || mode == "batch") {
+    std::printf("[1c] 批量 API（TrySendBatch/TryRecvBatch）SPSC\n");
+    for (const std::size_t capacity : {std::size_t{64}, std::size_t{1024}}) {
+      for (const std::size_t batch : {std::size_t{8}, std::size_t{32}}) {
+        Samples samples;
+        for (int i = 0; i < reps; ++i) {
+          samples.Add(BatchSpsc(capacity, batch, total, &violations));
+        }
+        PrintRow("Channel cap=" + std::to_string(capacity) + " batch=" +
+                     std::to_string(batch),
+                 samples);
+      }
+    }
+    std::printf("\n");
+  }
+  #endif  // GO2CPP_BENCH_NO_BATCH
+
+  if (all || mode == "tryspsc") {
+    std::printf("[1b] 纯快路径 SPSC（TrySend/TryRecv 轮询，永不 park）\n");
+    for (const std::size_t capacity : {std::size_t{64}, std::size_t{1024}}) {
+      Samples samples;
+      for (int i = 0; i < reps; ++i) {
+        samples.Add(TrySpsc(capacity, total, &violations));
       }
       PrintRow("Channel cap=" + std::to_string(capacity), samples);
     }

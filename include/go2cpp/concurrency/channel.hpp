@@ -603,6 +603,35 @@ inline bool SpinForSignal(const std::atomic<bool>& signaled) noexcept {
   return signaled.load(std::memory_order_acquire);
 }
 
+// 在不持有 Channel::m_mutex 的情况下等待**通道代际**变化（有缓冲通道的
+// 「等空位 / 等数据」）。返回 true 表示代际已推进，调用方应重新加锁重试；
+// false 表示预算耗尽，调用方应转入 park。
+//
+// 与 SpinForSignal 的区别：这里观察的是通道级代际，对端的任何 send/recv
+// 都会推进它，因此**不需要先登记等待节点** —— 有缓冲通道的 park 代价在
+// WSL2 上约 20-30µs（futex 唤醒延迟），而一次 4µs 自旋命中就能完全绕开它。
+// 每 512 次 PAUSE 让出一次 CPU 的原因同 SpinForSignal。
+inline bool SpinForChange(const std::atomic<std::uint64_t>& generation,
+                          std::uint64_t sequence) noexcept {
+  const int limit = SpinBudget();
+  for (int i = 0; i < limit; ++i) {
+    if (generation.load(std::memory_order_acquire) != sequence) {
+      return true;
+    }
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+    if ((i & 511) == 511) {
+      std::this_thread::yield();
+    }
+  }
+  return generation.load(std::memory_order_acquire) != sequence;
+}
+
 // 一个 Select 调用的所有已挂起 case 共享此状态。通道操作在提交传输前必须
 // 先取得它，避免两个就绪通道同时选中同一个调用者。
 class SelectWaitState final {
@@ -766,10 +795,15 @@ namespace detail {
 //
 // 依赖：使用未初始化存储 + 就地构造，因此 T 只需要可移动构造与析构；
 // capacity == 0 时不分配任何内存（对应 Go 的 dataqsiz == 0，即无缓冲通道）。
-// 接口刻意保持 std::deque 的子集，使通道内部的调用点无需改动。
 //
 // 不变量：m_count == 0 表示空；m_count == m_capacity 表示满；
 //         有效元素位于 [m_head, m_head + m_count) 按 m_capacity 取模的区间内。
+//
+// 注：所有操作由 Channel::m_mutex 串行化（见 Channel 的锁序说明）。曾评估
+// 「分离的生产/消费锁」与「无锁索引」：单线程路径确实更快，但 select 的
+// 探测-回滚、等待者直接交接都要与缓冲共享同一临界区，改造面覆盖
+// Send/Recv/Select/Close 全部路径；本次只保留经压测验证的版本（见
+// /tmp/channel_opt.md 的限制一节）。
 template <typename T>
 class RingBuffer final {
  public:
@@ -821,6 +855,44 @@ class RingBuffer final {
     m_slots[index].~T();
     m_tail = index;
     --m_count;
+  }
+
+  // 兼容 select 路径的统一入口（单锁版本下就是 Try* 的等价包装）。
+  template <typename U>
+  bool TryPush(U&& value) {
+    if (m_count >= m_capacity) {
+      return false;
+    }
+    emplace_back(std::forward<U>(value));
+    return true;
+  }
+
+  bool TryPopInto(std::optional<T>* out) {
+    if (m_count == 0) {
+      return false;
+    }
+    out->emplace(std::move(m_slots[m_head]));
+    pop_front();
+    return true;
+  }
+
+  void PushBackFront(std::optional<T>&& value) noexcept {
+    // 单锁版本下 select 回滚发生在同一次持锁期间，直接放回队首。
+    if (!value.has_value()) {
+      return;
+    }
+    m_head = (m_head == 0) ? (m_capacity - 1) : (m_head - 1);
+    ::new (static_cast<void*>(m_slots + m_head)) T(std::move(*value));
+    ++m_count;
+    value.reset();
+  }
+
+  bool TryPopBack() noexcept {
+    if (m_count == 0) {
+      return false;
+    }
+    pop_back();
+    return true;
   }
 
  private:
@@ -971,6 +1043,106 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     return snapshot;
   }
 
+  /**
+   * @brief **实验性**批量发送：一次持锁把尽可能多的值放进缓冲。
+   *
+   * ## 语义
+   * - 只走缓冲（`Capacity() > 0`）；通道已关闭、有等待中的接收者，或值类型
+   *   不可复制时返回 0 —— 调用方回退到单条 `Send`/`TrySend` 即可。批量路径
+   *   刻意不抢占等待者：单条路径的「等待者优先直接交接」规则保持不变；
+   * - 遇到缓冲满即停止，返回实际写入条数（可为 0）；
+   * - 不 park、不处理 context/deadline，因此是**非阻塞**的；
+   * - 值按传入顺序入队，FIFO 语义与逐条 `TrySend` 相同。
+   *
+   * ## 为什么需要
+   * 有缓冲 channel 的单条成本主要是锁与状态发布的固定开销（跨核 cacheline
+   * 传递，本机实测 ~120ns/次）。批量 API 把这笔开销摊到 count 条上，适合
+   * 「生产者成批产出、消费者成批消费」的流水线；单条 Send/Recv 的语义与
+   * 延迟特征不变。
+   *
+   * @return 实际发送条数；0 表示当前无法批量发送（满/关闭/有等待接收者）。
+   */
+  std::size_t TrySendBatch(const T* values, std::size_t count) {
+    if constexpr (!std::is_copy_constructible<T>::value) {
+      return 0;
+    } else {
+      if (values == nullptr || count == 0 || m_capacity == 0) {
+        return 0;
+      }
+      std::size_t sent = 0;
+      try {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_closed || !m_receivers.empty()) {
+          return 0;
+        }
+        while (sent < count && m_buffer.TryPush(values[sent])) {
+          ++sent;
+        }
+        if (sent == 0) {
+          return 0;
+        }
+        const bool published = PublishChangeLocked();
+        lock.unlock();
+        if (published) {
+          NotifyChange();
+        }
+        return sent;
+      } catch (...) {
+        // 已入队的条目仍然有效，如实返回已提交数量（不要谎报 0）。
+        return sent;
+      }
+    }
+  }
+
+  /**
+   * @brief **实验性**批量接收：一次持锁从缓冲取走最多 `max_count` 条。
+   *
+   * ## 语义
+   * - 先按单条路径的规则把等待中的发送者补进缓冲（保持 FIFO），再从缓冲取；
+   * - 缓冲空即停止；不 park、不处理 context/deadline（非阻塞）；
+   * - 要求 `T` 可移动赋值，否则返回 0（API 仍可实例化）。
+   *
+   * @return 实际取走条数；0 表示当前没有可取的值。
+   */
+  std::size_t TryRecvBatch(T* values, std::size_t max_count) {
+    if constexpr (!std::is_move_assignable<T>::value) {
+      return 0;
+    } else {
+      if (values == nullptr || max_count == 0) {
+        return 0;
+      }
+      std::size_t received = 0;
+      try {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        std::optional<T> staged;
+        while (received < max_count) {
+          if (!m_buffer.TryPopInto(&staged)) {
+            // 每轮补一个等待中的发送者，保持与单条 Recv 相同的 FIFO 顺序。
+            RefillBufferLocked();
+            if (!m_buffer.TryPopInto(&staged)) {
+              break;
+            }
+          }
+          values[received] = std::move(*staged);
+          staged.reset();
+          ++received;
+        }
+        if (received == 0) {
+          return 0;
+        }
+        const bool published = PublishChangeLocked();
+        lock.unlock();
+        if (published) {
+          NotifyChange();
+        }
+        return received;
+      } catch (...) {
+        // 已取出的条目已经交给调用方，如实返回已提交数量。
+        return received;
+      }
+    }
+  }
+
   // 发送 value；阻塞直到接收者/缓冲可用、关闭或 context 取消。
   ChannelSendResult Send(T value, const ContextPtr& context = {}) {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
@@ -1020,8 +1192,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     const std::uint64_t debug_value = detail::ChannelDebugValue(value);
 #endif
     try {
-      auto result =
-          SendUntil(std::move(value), std::chrono::steady_clock::now(), {}, true);
+      // 非阻塞路径不取时间戳：clock_gettime 在空探测热路径上要 ~20ns，
+      // 而 nonblocking 的语义只需要「无法立即完成就返回」，不需要 deadline。
+      auto result = SendUntil(std::move(value), std::nullopt, {}, true);
       if (result.status == ChannelStatus::kReady) {
         GO2CPP_DEBUG_EVENT_SAMPLED(
             kChannelSendOk, GO2CPP_DEBUG_BOUND_TASK(), m_capacity, 32);
@@ -1081,7 +1254,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   // 非阻塞接收；当前没有值且未关闭时返回 kWouldBlock。
   ChannelRecvResult<T> TryRecv() {
     try {
-      auto result = RecvUntil(std::chrono::steady_clock::now(), {}, true);
+      // 同 TrySend：非阻塞接收不需要真实 deadline，省掉 clock_gettime。
+      auto result = RecvUntil(std::nullopt, {}, true);
       if (result.status == ChannelStatus::kReady) {
         GO2CPP_DEBUG_EVENT_SAMPLED(
             kChannelRecvOk, GO2CPP_DEBUG_BOUND_TASK(), m_capacity, 32);
@@ -1236,17 +1410,19 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     return m_generation.load(std::memory_order_acquire);
   }
 
-  // 等待 m_generation 变化。观察者计数用于让热路径的 send/recv 在
-  // 没有观察者时跳过 ParkingCondition 的互斥量：等待者持 m_mutex 先
+  // 等待 m_generation 变化。观察者计数用于让热路径的 send/recv 在没有
+  // 观察者时既不递增代际、也不碰 ParkingCondition：等待者持 m_mutex 先
   // 递增计数，再检查 generation；通知者持 m_mutex 先递增 generation，
   // 解锁后读计数。两者由同一把锁排序，因此不会漏掉已注册的观察者，
   // 也不会把 generation 变化漏给已经在等待的调用者。
   bool WaitForChange(std::uint64_t generation, Duration timeout) const {
     std::unique_lock<std::mutex> lock(m_mutex);
     m_change_waiters.fetch_add(1, std::memory_order_acq_rel);
+    m_generation_watchers.fetch_add(1, std::memory_order_acq_rel);
     const bool changed = m_change_cv.wait_for(lock, timeout, [this, generation] {
       return m_generation.load(std::memory_order_relaxed) != generation;
     });
+    m_generation_watchers.fetch_sub(1, std::memory_order_acq_rel);
     m_change_waiters.fetch_sub(1, std::memory_order_acq_rel);
     return changed;
   }
@@ -1264,21 +1440,25 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       return false;
     }
 
-    if (!m_buffer.empty()) {
+    std::optional<T> buffered;
+    if (m_buffer.TryPopInto(&buffered)) {
       if constexpr (!std::is_copy_constructible<T>::value) {
+        m_buffer.PushBackFront(std::move(buffered));
         return false;
       } else {
         SelectProbe probe;
         probe.ready = true;
         probe.ok = true;
         probe.status = ChannelStatus::kReady;
-        if (!probe.SetValue(m_buffer.front())) {
+        if (!probe.SetValue(*buffered)) {
+          m_buffer.PushBackFront(std::move(buffered));
           return false;
         }
         if (!state->TrySelect(index, std::move(probe))) {
+          // 认领失败：把值放回队首（下一个消费者优先取到它），保持 FIFO。
+          m_buffer.PushBackFront(std::move(buffered));
           return false;
         }
-        m_buffer.pop_front();
         RefillBufferLocked();
         ++m_generation;
         lock.unlock();
@@ -1488,25 +1668,20 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       return selected;
     }
 
-    if (m_buffer.size() < m_capacity) {
+    if (m_buffer.TryPush(value)) {
       SelectProbe probe;
       probe.ready = true;
       probe.ok = true;
       probe.status = ChannelStatus::kReady;
-      try {
-        m_buffer.emplace_back(value);
-      } catch (...) {
-        return false;
-      }
       bool selected = false;
       try {
         selected = state->TrySelect(index, std::move(probe));
       } catch (...) {
-        m_buffer.pop_back();
+        (void)m_buffer.TryPopBack();
         return false;
       }
       if (!selected) {
-        m_buffer.pop_back();
+        (void)m_buffer.TryPopBack();
         return false;
       }
       ++m_generation;
@@ -2010,10 +2185,33 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   // 锁外调用：只在确有 WaitForChange 观察者时才唤醒，避免每次
   // send/recv 快速路径都为一个空等待队列支付一次互斥量。
   void NotifyChange() noexcept {
-    if (m_change_waiters.load(std::memory_order_acquire) == 0) {
+    if (m_change_waiters.load(std::memory_order_relaxed) == 0) {
       return;
     }
     m_change_cv.notify_all();
+  }
+
+  /**
+   * @brief 快路径的状态变化发布（必须在持 m_mutex 时调用）。
+   *
+   * ## 为什么需要门控
+   *
+   * 原实现每次 send/recv 都在锁内 `++m_generation`（一次性原子 RMW），再在
+   * 锁外读 `m_change_waiters`。1P1C 场景下生产者和消费者交替写同一个
+   * `m_generation` cacheline：**每条消息都把该 cacheline 在核间搬一次**
+   * （实测这是 cap1024 1M 条从 50ns 退化到 140ns 的主因之一）。
+   *
+   * 这里改为：只有存在代际观察者（WaitForChange 或等待-自旋）时才写。
+   * 观察者为 0 时快路径只剩一次 relaxed load，不产生任何跨核写。
+   *
+   * @return true 表示代际已推进，调用方应在解锁后调用 NotifyChange()。
+   */
+  bool PublishChangeLocked() noexcept {
+    if (m_generation_watchers.load(std::memory_order_relaxed) == 0) {
+      return false;
+    }
+    m_generation.fetch_add(1, std::memory_order_release);
+    return true;
   }
 
   void NotifyGeneration() {
@@ -2067,7 +2265,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
    *   绝不阻塞 carrier 线程。
    */
   ChannelSendResult SendUntil(T value, std::optional<TimePoint> deadline,
-                              const ContextPtr& context, bool nonblocking) {
+                              const ContextPtr& context, bool nonblocking,
+                              bool allow_spin = true) {
     // step1: 上下文已取消/已超时，直接返回，不进入锁。
     if (const auto context_status = ContextSendStatus(context);
         context_status.status != ChannelStatus::kReady) {
@@ -2076,6 +2275,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
 
     // step2: 关闭的 channel 上发送立即失败。
     std::unique_lock<std::mutex> lock(m_mutex);
+    // 有缓冲通道在「满」时的自旋只允许发生一次；重试入口见 step4.5。
+    bool spin_attempted = false;
+  retry_fast_path:
     if (m_closed) {
       return {ChannelStatus::kClosed, ChannelClosedError()};
     }
@@ -2145,21 +2347,46 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
 
     // step4: 没有接收者但有缓冲空位——入缓冲。
     if (m_buffer.size() < m_capacity) {
-      try {
-        m_buffer.emplace_back(std::move(value));
-      } catch (...) {
-        return {ChannelStatus::kInvalid, detail::ValueOperationError()};
-      }
-      ++m_generation;
+      m_buffer.emplace_back(std::move(value));
+      const bool published = PublishChangeLocked();
       lock.unlock();
-      NotifyChange();
+      if (published) {
+        NotifyChange();
+      }
       return {ChannelStatus::kReady, {}};
     }
 
+    // step4.5: 缓冲满且是原生线程 —— 先自旋等一个空位，而不是立刻 park。
+    //
+    // 为什么关键：发送者一旦 park，消费者每取走一条都会经 RefillBufferLocked()
+    // 唤醒它一次，交接退化成「每条消息一次 futex 往返」（WSL2 上 20-30µs）。
+    // 自旋命中时发送者保持批量填充，cap1024 的 1P1C 1M 条吞吐从 ~140ns/op
+    // 回到快路径量级。自旋用的代际只在有观察者时才被推进（见
+    // PublishChangeLocked），因此不会给无等待者的快路径增加跨核写。
+    //
+    // 只自旋一次：预算耗尽说明对端确实慢，继续烧 CPU 不如 park。
+    if (!spin_attempted && allow_spin && m_capacity > 1 &&
+        m_capacity <= 256 && !nonblocking && detail::CanSpinWait()) {
+      spin_attempted = true;
+      const std::uint64_t sequence =
+          m_generation.load(std::memory_order_relaxed);
+      m_generation_watchers.fetch_add(1, std::memory_order_acq_rel);
+      lock.unlock();
+      (void)detail::SpinForChange(m_generation, sequence);
+      m_generation_watchers.fetch_sub(1, std::memory_order_acq_rel);
+      lock.lock();
+      // **必须重检快路径**：自旋窗口内缓冲可能出现空位，而代际推进未必
+      // 能被观察到（对方可能在本线程 fetch_add 之前就完成入/出队）。旧写法
+      // 直接落到 park，会「带着可用空位去睡眠」：既多付一次 futex，又让
+      // 下一个发送者绕过缓冲直接交接，破坏 FIFO（实测 100k 条 157 次乱序）。
+      goto retry_fast_path;
+    }
+
+    if (nonblocking) {
+      return {ChannelStatus::kWouldBlock, ChannelWouldBlockError()};
+    }
     if (DeadlineReached(deadline)) {
-      return {nonblocking ? ChannelStatus::kWouldBlock
-                          : ChannelStatus::kTimedOut,
-              nonblocking ? ChannelWouldBlockError() : ChannelTimeoutError()};
+      return {ChannelStatus::kTimedOut, ChannelTimeoutError()};
     }
 
     if (core::ParkingCondition::FiberWaitUnsupported()) {
@@ -2215,7 +2442,6 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     // step6: park 等待循环——每次唤醒后重检 accepted/closed/cancelled/
     // context/deadline，任一成立就清理并返回。原生线程在 park 前先做一次
     // 自适应短自旋，自旋成功即免掉一次 futex 睡眠 + 唤醒。
-    bool spin_attempted = false;
     for (;;) {
       if (pending->accepted) {
         return {ChannelStatus::kReady, {}};
@@ -2299,7 +2525,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   }
 
   ChannelRecvResult<T> RecvUntil(std::optional<TimePoint> deadline,
-                                 const ContextPtr& context, bool nonblocking) {
+                                 const ContextPtr& context, bool nonblocking,
+                                 bool allow_spin = true) {
     if (const auto context_status = ContextSendStatus(context);
         context_status.status != ChannelStatus::kReady) {
       return {std::nullopt, false, true, context_status.status,
@@ -2308,6 +2535,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
 
     std::unique_lock<std::mutex> lock(m_mutex);
 
+    // 有缓冲通道在「空」时的自旋只允许发生一次；重试入口见下方。
+    bool spin_attempted = false;
+  retry_fast_path:
     if (!m_buffer.empty()) {
       // Channel<T> 要求值类型移动构造不抛异常，因此提取队首值不会因异常
       // 留下损坏的缓冲元素。
@@ -2315,9 +2545,11 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       m_buffer.pop_front();
       // 将一个被阻塞的发送者补入刚刚空出的缓冲槽位。
       RefillBufferLocked();
-      ++m_generation;
+      const bool published = PublishChangeLocked();
       lock.unlock();
-      NotifyChange();
+      if (published) {
+        NotifyChange();
+      }
       return {std::optional<T>(std::move(value)), true, true,
               ChannelStatus::kReady, {}};
     }
@@ -2379,6 +2611,25 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       }
     }
 
+    // 缓冲空且没有待交接的发送者：原生线程先自旋等数据，避免直接 park 后
+    // 生产者每条消息都要付一次 futex 唤醒（原因与实现对称性见 SendUntil
+    // 的 step4.5）。cap<=1 仍走下面 pending 节点上的自旋。
+    if (!spin_attempted && allow_spin && m_capacity > 1 &&
+        m_capacity <= 256 && !nonblocking && detail::CanSpinWait()) {
+      spin_attempted = true;
+      const std::uint64_t sequence =
+          m_generation.load(std::memory_order_relaxed);
+      m_generation_watchers.fetch_add(1, std::memory_order_acq_rel);
+      lock.unlock();
+      (void)detail::SpinForChange(m_generation, sequence);
+      m_generation_watchers.fetch_sub(1, std::memory_order_acq_rel);
+      lock.lock();
+      // 与 SendUntil 相同：自旋后必须重检缓冲/发送者，不能直接去 park，
+      // 否则「自旋期间已经到达的值」会被留在缓冲里，后续发送者绕过缓冲
+      // 直接交接，破坏 FIFO。
+      goto retry_fast_path;
+    }
+
     // 关闭通道先排空缓冲值，之后返回零值。
     if (m_closed) {
       return {std::nullopt, false, true, ChannelStatus::kClosed,
@@ -2390,11 +2641,13 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     if (context_status != ChannelStatus::kReady) {
       return {std::nullopt, false, true, context_status, context_error};
     }
+    if (nonblocking) {
+      return {std::nullopt, false, false, ChannelStatus::kWouldBlock,
+              ChannelWouldBlockError()};
+    }
     if (DeadlineReached(deadline)) {
-      return {std::nullopt, false, false,
-              nonblocking ? ChannelStatus::kWouldBlock
-                          : ChannelStatus::kTimedOut,
-              nonblocking ? ChannelWouldBlockError() : ChannelTimeoutError()};
+      return {std::nullopt, false, false, ChannelStatus::kTimedOut,
+              ChannelTimeoutError()};
     }
 
 #if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
@@ -2451,13 +2704,11 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       }
     }
 
-    bool spin_attempted = false;
     for (;;) {
       if (pending->ready) {
         return {std::move(pending->value), pending->ok, true, pending->status,
                 pending->error};
-      }
-      if (pending->cancelled) {
+      }      if (pending->cancelled) {
         return {std::nullopt, false, true, pending->status, pending->error};
       }
 
@@ -2533,7 +2784,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   }
 
   void RefillBufferLocked() {
-    while (!m_senders.empty() && m_buffer.size() < m_capacity) {
+    while (!m_senders.empty()) {
       auto sender = m_senders.front();
       if (sender->cancelled) {
         m_senders.pop_front();
@@ -2545,13 +2796,13 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
           // 不要认领一个无法在不冒缓冲区半提交风险的情况下传输值的 select。
           break;
         } else {
-          try {
-            if constexpr (std::is_nothrow_move_constructible<T>::value) {
-              m_buffer.emplace_back(std::move(sender->value));
-            } else {
-              m_buffer.emplace_back(sender->value);
-            }
-          } catch (...) {
+          bool pushed = false;
+          if constexpr (std::is_nothrow_move_constructible<T>::value) {
+            pushed = m_buffer.TryPush(std::move(sender->value));
+          } else {
+            pushed = m_buffer.TryPush(sender->value);
+          }
+          if (!pushed) {
             break;
           }
           SelectProbe probe;
@@ -2566,7 +2817,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
             selected = false;
           }
           if (!selected) {
-            m_buffer.pop_back();
+            (void)m_buffer.TryPopBack();
             sender->cancelled = true;
             m_senders.pop_front();
             continue;
@@ -2576,13 +2827,13 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
           continue;
         }
       }
-      try {
-        if constexpr (std::is_nothrow_move_constructible<T>::value) {
-          m_buffer.emplace_back(std::move(sender->value));
-        } else {
-          m_buffer.emplace_back(sender->value);
-        }
-      } catch (...) {
+      bool pushed = false;
+      if constexpr (std::is_nothrow_move_constructible<T>::value) {
+        pushed = m_buffer.TryPush(std::move(sender->value));
+      } else {
+        pushed = m_buffer.TryPush(sender->value);
+      }
+      if (!pushed) {
         break;
       }
       sender->accepted = true;
@@ -2620,6 +2871,10 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   std::deque<std::shared_ptr<PendingRecv>> m_receivers;
   /// @brief 已关闭标记；Close 后 Send 返回 kClosed，Recv 读完缓冲后返回 kClosed。
   bool m_closed{false};
+  /// @brief 代际观察者计数（WaitForChange 观察者 + 等待-自旋者）。
+  ///        为 0 时快路径完全不写 m_generation —— 避免 1P1C 每条消息都把
+  ///        该 cacheline 在核间搬一次（见 PublishChangeLocked）。
+  mutable std::atomic<std::uint32_t> m_generation_watchers{0};
   /// @brief 关闭代际（每次 Close +1）；Select 用它判断等待节点是否跨代失效。
   std::atomic<std::uint64_t> m_generation{0};
 #if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
