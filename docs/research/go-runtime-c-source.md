@@ -1,8 +1,10 @@
 # Go runtime 底层 C/汇编源码挖掘报告
 
-> **源码位置（持久保留）**：`E:\CodexWorkspace\GoSrc\{go10,go11,go13,go14}`
+> **源码位置（双平台持久保留）**：
+> - Windows：`E:\CodexWorkspace\GoSrc\{go10,go11,go13,go14}`
+> - Linux/WSL：`/UserData/CodexWorkSpace/GoSrc/{go10,go11,go13,go14}`
 > （go1.0.3 / 1.1 / 1.3 / 1.4 完整源码，含 `src/pkg/runtime/chan.c`、`chan.goc`、`chan.h`）
-> 原 /tmp 副本已迁移到此目录。
+> 原 /tmp 副本已迁移到上述两处。
 
 > 目的：给 Go2cpp 的 `Channel` / `FastChannel` / Fiber 切换 / Scheduler 找**可以照抄的原件**，不自己造轮子。
 > 所有代码摘自本机克隆的真实源码，标注 `文件:行号`，可直接对照。
