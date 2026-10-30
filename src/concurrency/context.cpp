@@ -56,23 +56,54 @@ namespace go2cpp
      */
     struct DoneSignal::State
     {
-        /// @brief 保护 done 与两张回调表；Signal 与 AddCallback/RemoveCallback 竞争它。
+        /// @brief 一条待执行回调：Id 用于注销，function 在信号锁外执行。
+        struct CallbackEntry
+        {
+            CallbackId id{0};
+            std::function<void()> callback;
+        };
+
+        /// @brief 保护 done 的写入与两张回调表；Signal 与 AddCallback/RemoveCallback 竞争它。
         mutable std::mutex mutex;
         /// @brief 等待载体：受管 G 在此 park、普通线程走原生条件变量（ParkingCondition 分流）。
         mutable core::ParkingCondition cv;
         /// @brief 完成标志；置真后不可回退（单向）。
-        bool done{false};
+        /// @details 这是**唯一**的完成状态。写入始终在 mutex 内（Signal），读取走
+        ///          无锁 acquire（IsDone/Wait 谓词），因此取消的热路径检查不再取锁。
+        std::atomic<bool> done{false};
+        /// @brief 当前登记的 Wait* 等待者数量（受 mutex 保护）。
+        /// @details Signal 在无人等待时跳过 notify_all，省掉一次条件变量锁与 futex
+        ///          唤醒；计数只影响性能，不参与正确性判断（谓词仍会重检 done）。
+        std::size_t waiter_count{0};
+
+        /// @brief 在 mutex 持有期内登记/注销一个等待者，保证 Signal 看不到半登记状态。
+        struct WaiterScope
+        {
+            explicit WaiterScope(State &owner) noexcept : state(owner)
+            {
+                ++state.waiter_count;
+            }
+            ~WaiterScope() { --state.waiter_count; }
+            WaiterScope(const WaiterScope &) = delete;
+            WaiterScope &operator=(const WaiterScope &) = delete;
+            State &state;
+        };
         /// @brief 下一个回调 Id（从 1 起，0 表示无效）。
         CallbackId next_id{1};
         // 内部回调（例如 ContextRollback）必须先于用户观察回调执行。
         // 两组回调仍然都在 Signal() 的锁外调用，避免回调重入信号对象。
+        // 用连续 vector 而不是 unordered_map：注册/注销是 O(1) 尾插 + 线性扫描，
+        // 取消时整体 swap 搬出，避免每个回调一次哈希节点分配。
         /// @brief 内部回调表（先执行）；由 AddCallbackImpl 写入、Signal 一次性搬出。
-        std::unordered_map<CallbackId, std::function<void()>> internal_callbacks;
+        std::vector<CallbackEntry> internal_callbacks;
         /// @brief 用户回调表（后执行）；由 AddCallback/RemoveCallback 维护、Signal 搬出。
-        std::unordered_map<CallbackId, std::function<void()>> callbacks;
+        std::vector<CallbackEntry> callbacks;
     };
 
-    DoneSignal::DoneSignal() : m_state(std::make_shared<State>()) {}
+    DoneSignal::DoneSignal()
+        : m_state(std::make_shared<State>()), m_done_flag(&m_state->done)
+    {
+    }
     DoneSignal::~DoneSignal() = default;
 
     /// @brief 无限等待直到信号完成。
@@ -87,10 +118,20 @@ namespace go2cpp
     /// @note 没有超时上界；需要上界时用 WaitFor / WaitUntil。
     void DoneSignal::Wait() const
     {
+        // 快路径：已完成则不再加锁；已取消 Context 上的重复等待很常见。
+        if (IsDone())
+        {
+            return;
+        }
         const auto state = m_state;
         std::unique_lock<std::mutex> lock(state->mutex);
-        state->cv.wait(lock, [state]
-                       { return state->done; });
+        if (state->done.load(std::memory_order_relaxed))
+        {
+            return;
+        }
+        State::WaiterScope waiter(*state);
+        state->cv.wait(lock, [&state]
+                       { return state->done.load(std::memory_order_acquire); });
     }
 
     /// @brief 等待至多 timeout，返回信号是否已完成。
@@ -101,10 +142,19 @@ namespace go2cpp
     /// @note 超时只结束"本次等待"，不改变信号状态——信号一旦完成就永久保持完成。
     bool DoneSignal::WaitFor(ContextDuration timeout) const
     {
+        if (IsDone())
+        {
+            return true;
+        }
         const auto state = m_state;
         std::unique_lock<std::mutex> lock(state->mutex);
-        return state->cv.wait_for(lock, timeout, [state]
-                                  { return state->done; });
+        if (state->done.load(std::memory_order_relaxed))
+        {
+            return true;
+        }
+        State::WaiterScope waiter(*state);
+        return state->cv.wait_for(lock, timeout, [&state]
+                                  { return state->done.load(std::memory_order_acquire); });
     }
 
     /// @brief 等待到绝对截止时间，返回信号是否已完成。
@@ -114,23 +164,19 @@ namespace go2cpp
     /// @note 绝对时限便于在循环中重试而不会因每轮重新计时而无限延后。
     bool DoneSignal::WaitUntil(ContextTimePoint deadline) const
     {
+        if (IsDone())
+        {
+            return true;
+        }
         const auto state = m_state;
         std::unique_lock<std::mutex> lock(state->mutex);
-        return state->cv.wait_until(lock, deadline, [state]
-                                    { return state->done; });
-    }
-
-    /// @brief 非阻塞查询信号是否已完成。
-    /// @details 只有一步：加锁读取 state->done 后立即返回。
-    /// @return 已完成返回 true。
-    /// @warning 本函数声明为 noexcept，但实现里会加锁（m_state->mutex）。锁竞争时
-    ///          std::mutex::lock 可能抛 std::system_error，从而触发 std::terminate。
-    ///          这是已知的接口与实现不匹配（台账 X-25 系列），保留现状是因为调用点
-    ///          都在可接受终止的路径上；若要修，应去掉 noexcept 或改用原子读。
-    bool DoneSignal::IsDone() const noexcept
-    {
-        std::lock_guard<std::mutex> lock(m_state->mutex);
-        return m_state->done;
+        if (state->done.load(std::memory_order_relaxed))
+        {
+            return true;
+        }
+        State::WaiterScope waiter(*state);
+        return state->cv.wait_until(lock, deadline, [&state]
+                                    { return state->done.load(std::memory_order_acquire); });
     }
 
     /// @brief 注册一个"仅观察用"的完成回调。
@@ -171,7 +217,7 @@ namespace go2cpp
         bool invoke_now = false;
         {
             std::lock_guard<std::mutex> lock(m_state->mutex);
-            if (m_state->done)
+            if (m_state->done.load(std::memory_order_relaxed))
             {
                 invoke_now = true;
             }
@@ -184,7 +230,7 @@ namespace go2cpp
                 }
                 auto &callbacks = internal ? m_state->internal_callbacks
                                            : m_state->callbacks;
-                callbacks.emplace(id, std::move(callback));
+                callbacks.push_back(State::CallbackEntry{id, std::move(callback)});
             }
         }
         if (invoke_now)
@@ -217,8 +263,22 @@ namespace go2cpp
             return;
         }
         std::lock_guard<std::mutex> lock(m_state->mutex);
-        m_state->callbacks.erase(id);
-        m_state->internal_callbacks.erase(id);
+        // 两组都是小 vector；用「与尾元素交换后 pop」避免整段搬移，同时把
+        // 注销成本限制在 O(已登记回调数)，不再有哈希节点释放。
+        const auto remove_from = [id](std::vector<State::CallbackEntry> &entries)
+        {
+            for (auto it = entries.begin(); it != entries.end(); ++it)
+            {
+                if (it->id == id)
+                {
+                    *it = std::move(entries.back());
+                    entries.pop_back();
+                    return;
+                }
+            }
+        };
+        remove_from(m_state->callbacks);
+        remove_from(m_state->internal_callbacks);
     }
 
     /// @brief 把信号置为完成，并按固定顺序通知所有等待者与回调。
@@ -242,47 +302,45 @@ namespace go2cpp
     {
         // step1: 先把两组回调搬到局部 vector，锁内只做状态翻转与搬运，
         //        绝不在持锁状态下执行用户代码（回调可能重入本对象）。
-        std::vector<std::function<void()>> internal_callbacks;
-        std::vector<std::function<void()>> callbacks;
+        std::vector<State::CallbackEntry> internal_callbacks;
+        std::vector<State::CallbackEntry> callbacks;
+        bool has_waiters = false;
         {
             std::lock_guard<std::mutex> lock(m_state->mutex);
-            if (m_state->done)
+            if (m_state->done.load(std::memory_order_relaxed))
             {
                 return;  // 幂等：已完成则直接返回，不重复通知
             }
-            m_state->done = true;
-            internal_callbacks.reserve(m_state->internal_callbacks.size());
-            for (auto &entry : m_state->internal_callbacks)
-            {
-                internal_callbacks.push_back(std::move(entry.second));
-            }
-            m_state->internal_callbacks.clear();
-            callbacks.reserve(m_state->callbacks.size());
-            for (auto &entry : m_state->callbacks)
-            {
-                callbacks.push_back(std::move(entry.second));
-            }
-            m_state->callbacks.clear();
+            // release：先让 done=true 之前写入的取消状态（error/cause）对
+            // acquire 读 IsDone 的线程可见。
+            m_state->done.store(true, std::memory_order_release);
+            internal_callbacks.swap(m_state->internal_callbacks);
+            callbacks.swap(m_state->callbacks);
+            has_waiters = m_state->waiter_count != 0;
         }
         // step2: 唤醒所有 Wait 者。放在执行回调之前，让等待方尽早恢复。
-        m_state->cv.notify_all();
+        //        没有登记等待者时跳过：notify_all 本身要取等待队列锁。
+        if (has_waiters)
+        {
+            m_state->cv.notify_all();
+        }
         // step3: 内部回调先执行（ContextRollback 依赖这个顺序）。
-        for (auto &callback : internal_callbacks)
+        for (auto &entry : internal_callbacks)
         {
             try
             {
-                callback();
+                entry.callback();
             }
             catch (...)
             {
             }
         }
         // step4: 用户回调后执行；单个回调抛异常被吞掉，不阻断其余回调。
-        for (auto &callback : callbacks)
+        for (auto &entry : callbacks)
         {
             try
             {
-                callback();
+                entry.callback();
             }
             catch (...)
             {
@@ -326,6 +384,10 @@ namespace go2cpp
 
         std::mutex s_clock_mutex;
         Context::NowFunction s_now_function;
+        // 是否安装了测试时钟。发布版本里没有任何注入时，Now() 走一次
+        // acquire 原子读后直接 steady_clock::now()，不再每取一次时间都
+        // 抢 s_clock_mutex 并拷贝 std::function。
+        std::atomic<bool> s_has_custom_clock{false};
 
         ContextTimePoint SaturatingDeadline(ContextTimePoint now,
                                             ContextDuration timeout) noexcept
@@ -666,7 +728,8 @@ namespace go2cpp
                 }
 
                 // step2: 本轮的局部收集区——标记、摘 timer、摘回调、收集后代。
-                std::vector<std::shared_ptr<State>> descendants;
+                // 注意：不再为每个节点单独分配 descendants vector，子节点直接
+                // 压回 work 复用容量。深度取消时这是每节点一次 malloc 的节省。
                 ErrorPtr local_error = item.error;
                 ErrorPtr local_cause = item.cause;
                 TimerService::Id old_timer = 0;
@@ -707,7 +770,8 @@ namespace go2cpp
                     {
                         if (auto child = weak_child.lock())
                         {
-                            descendants.emplace_back(std::move(child));
+                            work.push_back({std::move(child), local_error,
+                                            local_cause, false});
                         }
                     }
                     item.state->children.clear();
@@ -726,11 +790,6 @@ namespace go2cpp
                     before_done_callbacks.emplace_back(std::move(callback));
                 }
                 to_signal.emplace_back(item.state);
-                for (auto &child : descendants)
-                {
-                    work.push_back(
-                        {std::move(child), local_error, local_cause, false});
-                }
             }
             // step5: 两阶段完成——先逆序执行 before_done 回调，再逆序 Signal。
             // 所有 Context 状态都已先标记取消，再让 rollback scope 冻结其
@@ -1259,7 +1318,8 @@ namespace go2cpp
 
     // ContextRollback 的公开方法定义放在 Context::State 完整定义之后，
     // 这样回调只依赖自己的共享状态，不需要暴露 Context 的内部节点。
-    ContextRollback::ContextRollback(ContextPtr parent, bool rollback_on_cancel)
+    ContextRollback::ContextRollback(const ContextPtr &parent,
+                                     bool rollback_on_cancel)
         : m_state(std::make_shared<State>())
     {
         m_state->rollback_on_cancel = rollback_on_cancel;
@@ -1736,15 +1796,25 @@ namespace go2cpp
             const Id id = m_next_id.fetch_add(1, std::memory_order_relaxed);
             const Id actual_id = id == 0 ? m_next_id.fetch_add(1, std::memory_order_relaxed)
                                          : id;
+            bool wake_worker = false;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 if (m_stopping)
                 {
                     return 0;
                 }
+                // 只有「新 timer 成为新的最早截止时间」才需要唤醒 worker：
+                // 否则 worker 已经睡在更早（或相同）的 deadline 上，醒来后会
+                // 重新取最早项。批量创建远 deadline 的 timeout 不再每次都
+                // 付一次 futex 唤醒。
+                wake_worker =
+                    m_entries.empty() || deadline < m_entries.begin()->first;
                 m_entries.emplace(deadline, Entry{deadline, actual_id, state});
             }
-            m_cv.notify_all();
+            if (wake_worker)
+            {
+                m_cv.notify_one();
+            }
             return actual_id;
         }
 
@@ -1768,7 +1838,9 @@ namespace go2cpp
                     }
                 }
             }
-            m_cv.notify_all();
+            // 不 notify：被移除的 timer 即使曾是 worker 的唤醒点，worker 也只会
+            // 在旧 deadline 上多醒一次并重新计算最早项，不会漏掉任何仍登记的
+            // timer。取消短命 WithTimeout 因此省掉一次 futex 唤醒。
         }
 
         void TimerService::Run()
@@ -1814,7 +1886,8 @@ namespace go2cpp
     } // namespace
 
     Context::Context(std::shared_ptr<State> state)
-        : m_state(std::move(state)), m_done(m_state->done) {}
+        : m_state(std::move(state)), m_done(m_state->done),
+          m_deadline(m_state->deadline) {}
 
     DoneSignal::CallbackId Context::AddBeforeDoneCallback(
         std::function<void()> callback)
@@ -1935,6 +2008,8 @@ namespace go2cpp
                 else
                 {
                     child->m_state->deadline = requested_deadline;
+                    // 同步不可变缓存（Deadline()/HasDeadline() 的无锁来源）。
+                    child->m_deadline = requested_deadline;
                 }
             }
             if (requested_deadline != ContextTimePoint::max())
@@ -2002,8 +2077,6 @@ namespace go2cpp
         return MakeValueContext(parent, nullptr, key, {}, std::move(value));
     }
 
-    bool Context::IsDone() const noexcept { return m_state->done.IsDone(); }
-
     ErrorPtr Context::Err() const
     {
         std::lock_guard<std::mutex> lock(m_state->mutex);
@@ -2015,14 +2088,6 @@ namespace go2cpp
         std::lock_guard<std::mutex> lock(m_state->mutex);
         return m_state->cause;
     }
-
-    std::optional<ContextTimePoint> Context::Deadline() const
-    {
-        std::lock_guard<std::mutex> lock(m_state->mutex);
-        return m_state->deadline;
-    }
-
-    bool Context::HasDeadline() const { return Deadline().has_value(); }
 
     std::any Context::LookupValue(const void *token, const std::string &name) const
     {
@@ -2040,18 +2105,30 @@ namespace go2cpp
 
     void Context::SetNowFunctionForTesting(NowFunction now)
     {
-        std::lock_guard<std::mutex> lock(s_clock_mutex);
-        s_now_function = std::move(now);
+        {
+            std::lock_guard<std::mutex> lock(s_clock_mutex);
+            s_now_function = std::move(now);
+        }
+        // release 配对 Now() 的 acquire：要么看到旧时钟，要么看到完整的
+        // std::function；不会出现「标志为真但函数只写了一半」。
+        s_has_custom_clock.store(true, std::memory_order_release);
     }
 
     void Context::ResetNowFunctionForTesting()
     {
-        std::lock_guard<std::mutex> lock(s_clock_mutex);
-        s_now_function = {};
+        {
+            std::lock_guard<std::mutex> lock(s_clock_mutex);
+            s_now_function = {};
+        }
+        s_has_custom_clock.store(false, std::memory_order_release);
     }
 
     ContextTimePoint Context::Now()
     {
+        if (!s_has_custom_clock.load(std::memory_order_acquire))
+        {
+            return Clock::now();
+        }
         NowFunction now;
         {
             std::lock_guard<std::mutex> lock(s_clock_mutex);

@@ -30,6 +30,7 @@
 #include "go2cpp/error.hpp"
 
 #include <any>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -89,8 +90,14 @@ namespace go2cpp
         /** @brief 等待到绝对截止时间。@return 已完成返回 true。 */
         bool WaitUntil(ContextTimePoint deadline) const;
         // 查询信号是否已关闭，不阻塞。
-        /** @brief 返回信号是否已经完成。 */
-        bool IsDone() const noexcept;
+        /** @brief 返回信号是否已经完成。
+         *  @details 快路径：只做一次 acquire 原子读，不取 State::mutex。
+         *           m_done_flag 指向 State::done，生命周期由 m_state 保证；
+         *           复制 DoneSignal 会一并复制该指针，因此副本观察同一信号。 */
+        bool IsDone() const noexcept
+        {
+            return m_done_flag->load(std::memory_order_acquire);
+        }
 
         bool wait_for(ContextDuration timeout) const { return WaitFor(timeout); }
         bool wait_until(ContextTimePoint deadline) const { return WaitUntil(deadline); }
@@ -112,6 +119,14 @@ namespace go2cpp
         //   这正是 Context 能用一份镜像成员表达同一信号的前提。
         // - 可空？构造时必然分配（见 DoneSignal() 实现），运行期不为空。
         std::shared_ptr<State> m_state;
+
+        // 无锁完成标志的地址，等于 &m_state->done。**不是**独立存储：它只是
+        // 让头文件内联的 IsDone() 不必接触不完整类型 State。
+        // - 保护：指针本身构造后不变；*m_done_flag 是 atomic<bool>。
+        // - 不变式：只要 m_state 存活就有效；复制/赋值必须与 m_state 一起复制。
+        // - 为什么不用 m_state->done 直接读：State 定义在 .cpp，头文件内联
+        //   函数无法解引用不完整类型。
+        std::atomic<bool> *m_done_flag{nullptr};
 
         CallbackId AddCallbackImpl(std::function<void()> callback,
                                    bool internal) const;
@@ -217,8 +232,8 @@ namespace go2cpp
         /** @brief 返回可供内部注册回调的完成信号。 */
         DoneSignal &Done() noexcept { return m_done; }
         // 查询是否已取消；返回值是当前快照。
-        /** @brief 返回 Context 是否已取消或到期。 */
-        bool IsDone() const noexcept;
+        /** @brief 返回 Context 是否已取消或到期。@details 无锁原子读。 */
+        bool IsDone() const noexcept { return m_done.IsDone(); }
         // 返回标准取消错误；未取消时返回空。
         /** @brief 返回标准 Canceled/DeadlineExceeded 错误。 */
         ErrorPtr Err() const;
@@ -226,11 +241,13 @@ namespace go2cpp
         /** @brief 返回取消时记录的原始 Cause。 */
         ErrorPtr Cause() const;
         // 返回截止时间；没有截止时间时为空。
-        /** @brief 返回截止时间；没有截止时间时返回空值。 */
-        std::optional<ContextTimePoint> Deadline() const;
+        /** @brief 返回截止时间；没有截止时间时返回空值。
+         *  @details 截止时间在 Context 发布后不再改变，故直接读不可变缓存，
+         *           不再为每次查询取 State::mutex。 */
+        std::optional<ContextTimePoint> Deadline() const { return m_deadline; }
         // 查询是否设置了截止时间。
         /** @brief 判断 Context 是否设置了截止时间。 */
-        bool HasDeadline() const;
+        bool HasDeadline() const noexcept { return m_deadline.has_value(); }
 
         /** @brief 使用字符串键查询类型擦除值。 */
         std::any Value(const std::string &key) const;
@@ -301,6 +318,12 @@ namespace go2cpp
         //   且此后再不重新赋值。
         DoneSignal m_done;
 
+        // **不可变缓存**：创建时从 State 继承、WithDeadline 在返回前覆盖。
+        // - 保护：只在 Context 尚未发布给其他线程时写入（构造函数 / WithDeadline
+        //   返回前），发布后只读，因此 Deadline()/HasDeadline() 无需加锁。
+        // - 不变式：与 m_state->deadline 保持一致；State 侧的值仍用于派生子节点。
+        std::optional<ContextTimePoint> m_deadline;
+
         friend ContextPtr Background();
         friend ContextPtr TODO();
         friend std::pair<ContextPtr, CancelFunc> WithCancel(const ContextPtr &);
@@ -358,7 +381,9 @@ namespace go2cpp
         // rollback_on_cancel 为 true 时，child Context 被父级取消或 deadline
         // 取消后，尚未提交的 undo 会在 child Done 已线性化后由触发取消的
         // 线程执行；普通 Done 观察回调会在内部 undo 之后运行。
-        explicit ContextRollback(ContextPtr parent,
+        // parent 只在构造期用于派生 child，按 const 引用传入避免一次
+        // shared_ptr 拷贝（调用方随后仍可正常释放自己的句柄）。
+        explicit ContextRollback(const ContextPtr &parent,
                                  bool rollback_on_cancel = true);
         ~ContextRollback() noexcept;
 
