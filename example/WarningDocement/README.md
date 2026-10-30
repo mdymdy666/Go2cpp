@@ -35,8 +35,26 @@
 - 每条限制必须能指到 example 或 src/include 的具体行；
 - 不修改 `example/` 源码，本目录只承载文档。
 
-## 补充索引（2026-10-30 晚）
+## 补充索引（2026-10-30）
 
-- [audit-mcp-socket](audit-mcp-socket.md)：MCP Socket 工具（33 工具，14.5k ops/s）
-- [network-p1-fix](network-p1-fix.md)：网络 P1 修复（Fiber errno / HOOK=OFF）
-- [audit-base-network](audit-base-network.md)：网络基础审计（TCP 28.7k conn/s / UDP 41.9k pkt/s）
+「已归档」表之外，10-30 新增的审计与修复报告：
+
+### 基础模块审计（任务 1.1）
+
+- [audit-base-network](audit-base-network.md)：网络基础（TCP 28.7k conn/s / UDP 41.9k pkt/s；无 P0，2 个 P1，修复见 network-p1-fix）。
+- [audit-base-scheduler](audit-base-scheduler.md)：scheduler（无 P0；P1：draining O(n²)、每个 G 预留 8 MiB 虚拟地址）。
+- [audit-base-fiber](audit-base-fiber.md)：fiber（实现无 P0/P1；测试侧 2 个 P1，含 FIBER-03 UAF）。
+- [audit-base-channel](audit-base-channel.md)：channel（无丢值/重复/死锁；依赖超标 + 测试覆盖 P1）。
+- [audit-base-sync](audit-base-sync.md)：sync（1 个 P1 正确性缺陷，已修复并验证）。
+- [audit-base-timer](audit-base-timer.md)：timer（无实现缺陷；2 个 P1 测试缺陷；取消语义一条）。
+
+### 能力审计与修复
+
+- [audit-mcp-socket](audit-mcp-socket.md)：MCP Socket 四工具（35/35 ctest、ASan/LSan 0 报告；业务侧未自动登记）。
+- [network-p1-fix](network-p1-fix.md)：网络 P1-1/P1-2 修复验证（Fiber errno / HOOK=OFF）。
+
+## 计划中（文件尚未落地，不建立链接）
+
+- Socket Debug 模式审计报告（任务 1.2，报告名待定）。
+- Bento 新服务端审计报告：HTTP/SSE、WS、LinkServer、MQTT、CoAP、SOCKS5 六个骨架已提交且单测 6/6 通过，
+  但尚无「压测 + 随机 + ≥5 场景」的 audit 报告（见 [docs/modules/bento-servers.md](../../docs/modules/bento-servers.md)）。

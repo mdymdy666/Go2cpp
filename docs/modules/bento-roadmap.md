@@ -4,6 +4,8 @@
 > 任务 1 = **底层能力提升**（检查 + Debug + MCP）；
 > 任务 2 = **广度调研**（网络场景 × 协议 + OmniNetServer 架构设计）；
 > 任务 3 = **多模块开发**（历史网络协议一网打尽，后续）。
+>
+> 2026-10-30 更新：任务 3 的 6 个服务端骨架（HTTP/SSE、Link、CoAP、MQTT、SOCKS5、WS）全部提交，状态见 §3。
 
 ## 任务 1：底层能力提升（检查 + Debug + MCP）
 
@@ -78,12 +80,31 @@ Channel<TcpFrame> / Channel<UdpDatagram> / Channel<HttpRequest> ...
 - **阻塞/非阻塞可配**：Config 决定 fd 模式与并发模型（阻塞=线程/非阻塞=Fiber/epoll）；
 - **分阶段**：先 LinkServer（复用现有 channel/link），再 HTTP/SSE（复用 base），最后 WS/自定义。
 
-## 任务 3：多模块开发（历史网络协议一网打尽，后续）
+## 任务 3：多模块开发（🟡 6 个骨架已收口，验收进行中）
 
-- 按任务 2 调研结论，逐个协议实现（HTTP/2、WS、SSE、MQTT、CoAP、SOCKS5、gRPC 帧、Raft 传输…）；
-- 每个协议：实现 + 压测 + 5 场景 + audit 文档 + 三遍审查。
+### 3.1 已落地（2026-10-30，单测 6/6 通过）
+
+| 模块 | 源码 | 状态 | 证据 / 缺口 |
+|---|---|---|---|
+| HTTP/SSE Server | `include/go2cpp/bento/net/http_server.hpp`、`src/bento/net/http_server.cpp` | ✅ 已提交 `32ff39b` | 9 用例 / 87 checks；压测/场景/audit ⏳ |
+| LinkServer（UDP 1:N） | `include/go2cpp/bento/net/link_server.hpp`、`src/bento/net/link_server.cpp` | ✅ 已提交 `280e38e` | 11 用例 / 1469 checks；压测/场景/audit ⏳ |
+| CoAP（RFC 7252） | `include/go2cpp/bento/net/coap.hpp`、`src/bento/net/coap.cpp` | ✅ 已提交 `42b70b0` | 24 用例 / 38572 checks；压测/场景/audit ⏳ |
+| MQTT 3.1.1 | `include/go2cpp/bento/net/mqtt.hpp`、`src/bento/net/mqtt.cpp` | ✅ 已提交 `5b80e86` | 27 用例 / 36232 checks（含 broker 路由哨兵修复）；压测/场景/audit ⏳ |
+| SOCKS5（RFC 1928） | `include/go2cpp/bento/net/socks5.hpp`、`src/bento/net/socks5.cpp` | ✅ 已提交 `04372cb` | 15 用例 / 204 checks（协议层 + 真实回环）；压测/场景/audit ⏳ |
+| WebSocket Server | `include/go2cpp/bento/net/ws_server.hpp`、`src/bento/net/ws_server.cpp` | ✅ 已提交 `bad224b` | 8 用例 / 83 checks；压测/场景/audit ⏳ |
+
+- 一览、用法与限制见 [bento-servers.md](bento-servers.md)。
+- 构建：`-DGO2CPP_WITH_BENTO=ON` 全量配置通过，6 个测试目标全部注册；
+  2026-10-30 实测 `ctest -R "bento_socks5|bento_http_server|bento_ws_server|bento_link_server|bento_mqtt|bento_coap"` 6/6 通过（19.2 s）。
+
+### 3.2 待办（都是验收，不是开发）
+
+- 为 6 个模块补压测、随机、≥5 场景与 `audit-*.md`，每个协议经三遍审查后，再按
+  `docs/research/net-scenarios.md` 的门槛改为「验收完成」；
+- 补齐服务端缺口：TLS（HTTP/WS/SOCKS5）、连接级限流与指标导出、HTTP/2 与路由参数；
+- 后续协议：gRPC 帧、Raft 传输、DDS QoS 等（顺序按 `net-scenarios.md` 的 P2 收益排）。
 
 ## 规则
 
-- 任务 1 产出代码+文档；任务 2 产出调研文档；任务 3 后续；
+- 任务 1 产出代码+文档；任务 2 产出调研文档；任务 3 产出协议骨架，验收后续；
 - 0 警告 + ctest 全过；不引入第三方库。

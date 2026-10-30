@@ -286,6 +286,8 @@
 | [modules/bento-session.md](modules/bento-session.md) | Bento 会话组：pairing/session_table/session_control/peer_hub/app::Session，以及与 `tests/bento/PROTOCOL.md` §12 的逐项对齐表 | 现行 |
 | [modules/bento-app.md](modules/bento-app.md) | Bento app 组：fetch/file_browser/backup/zip/capability/command/file_transfer；沙箱、校验与已知缺陷（D-05/D-06） | 现行 |
 | [modules/bento-foundation.md](modules/bento-foundation.md) | Bento 地基组：error/registry/mapping、reflect、udp_transport、keystore 错误码补充 | 现行 |
+| [modules/bento-servers.md](modules/bento-servers.md) | Bento 网络服务器一览：HTTP/SSE、WS、LinkServer（UDP 可靠+不可靠）、MQTT 3.1.1、CoAP、SOCKS5 的用法/并发模型/限制与 6/6 实测数据 | 现行 |
+| [modules/bento-roadmap.md](modules/bento-roadmap.md) | Bento 任务 1/2/3 进度板：网络与并发基础审计、Debug 与 MCP、22 场景调研、OmniNetServer 设计、任务 3 多模块状态 | 现行 |
 
 > **基础库**（bufio/compress/container/encoding/hash/math/path）：实现简单、API 稳定，
 > 直接看 `include/go2cpp/<module>/` 头文件注释；无独立模块文档。
