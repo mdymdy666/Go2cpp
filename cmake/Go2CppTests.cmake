@@ -302,10 +302,13 @@ if (GO2CPP_BUILD_TESTS)
     # 的全量运行里；这里再单独注册一条 ctest，失败时能直接定位到栈增长，
     # 而不是看到整个 go2cpp_tests 超时/崩溃。复用同一二进制避免再链接一份
     # runtime；filter 入口与 go2cpp_known_filter_runs 的机制一致。
+    #
+    # 不要加 PASS_REGULAR_EXPRESSION（P1-2）：CTest 在输出匹配时会忽略
+    # 进程退出码，而模块第一行 announce 在任何断言之前输出，于是任何
+    # GO2CPP_CHECK 失败都会被吞成 Passed。这里只依赖退出码判定。
     add_test(NAME go2cpp_fiber_growable_stack COMMAND go2cpp_tests)
     set_tests_properties(go2cpp_fiber_growable_stack PROPERTIES
         ENVIRONMENT "GO2CPP_TEST_FILTER=fiber_growable"
-        PASS_REGULAR_EXPRESSION "fiber growable stack"
         TIMEOUT 120)
 
     add_executable(go2cpp_scheduler_smoke

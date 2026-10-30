@@ -327,6 +327,14 @@ void run_fiber_tests() {
     // 都只保存 continuation；唤醒后应先回到 inner，再回到 outer，
     // 不能直接把 outer 的后续代码提前执行。
     go2cpp::SchedulerConfig nested_config;
+#if defined(__SANITIZE_ADDRESS__)
+    // ASan 下 fiber 实现按设计禁用增长栈（fiber.cpp 的 resolve_reserve），
+    // Scheduler 默认 2KiB 初始提交归一化后只有 1 页固定栈，容不下插桩后的
+    // scheduler/测试栈帧（实测 stack-overflow 位于 initialize_context）。
+    // 这里只放大本测试调度器 G 的初始栈，不改变被测语义；非 ASan 构建
+    // 仍走默认的 2KiB 初始提交 + 增长栈。
+    nested_config.fiber_stack_size = 512U * 1024U;
+#endif
     nested_config.processor_count = 1;
     nested_config.min_workers = 1;
     nested_config.max_workers = 1;
@@ -518,51 +526,87 @@ void run_fiber_tests() {
         GO2CPP_CHECK(Fiber::DestroyTimeoutCount() == timeouts_before + 1U);
     }
 
-    // FIBER-03：外部线程持 Fiber* 并发读状态/取消，同时 FiberBin 路径
-    // 反复复用同一个 Fiber（reset record）。修复后 record 原地重置，不再
-    // 替换 shared_ptr，读到的始终是有效元数据。
+    // FIBER-03：外部线程并发读状态/请求取消，同时 FiberBin 路径反复复用
+    // 同一个 Fiber（reset record）。修复后 record 原地重置，不再替换
+    // shared_ptr，读到的始终是有效元数据。
+    //
+    // 生命周期协议（测试侧修复 P1-1）：Fiber 的唯一 owner 是
+    // unique_ptr，observer 不能跨越 RecycleForScheduler 持有裸指针。
+    // 回收契约规定 record 的 use_count()!=1 时静默丢弃该 Fiber（见
+    // fiber.cpp 的 RecycleForScheduler），unique_ptr 随即析构对象；若
+    // observer 手里还留着裸指针，下一次解引用就是 heap-use-after-free
+    // （ASan 实测）。因此这里用 publish_mutex 串行化「发布/清空指针」与
+    // 「一轮完整读取」：主线程清空指针并重新拿到锁之后，observer 不可能
+    // 仍在使用旧指针，回收时 use_count 必然为 1，FiberBin 复用路径依然
+    // 被覆盖。指针只在锁内可见，不参与锁外的生命周期判断。
     {
         std::atomic<bool> observer_stop{false};
         std::atomic<bool> invalid_state{false};
+        // P2-3：此前 200 轮可能早于 observer 的首次调度，observer_reads
+        // 保持 0 导致假失败（valgrind 下已复现）。计数用 release/acquire
+        // 发布，并在首轮显式等待一次读取完成。
         std::atomic<std::uint64_t> observer_reads{0};
-        std::atomic<Fiber*> published{nullptr};
+        std::mutex publish_mutex;
+        Fiber* published = nullptr;  // 受 publish_mutex 保护，不跨越回收点。
         std::thread observer([&] {
             while (!observer_stop.load(std::memory_order_acquire)) {
-                Fiber* const fiber = published.load(std::memory_order_acquire);
-                if (fiber == nullptr) {
+                bool read_this_round = false;
+                {
+                    std::lock_guard<std::mutex> lock(publish_mutex);
+                    Fiber* const fiber = published;
+                    if (fiber != nullptr) {
+                        const FiberState state = fiber->state();
+                        if (state != FiberState::Ready &&
+                            state != FiberState::Running &&
+                            state != FiberState::Suspended &&
+                            state != FiberState::Completed &&
+                            state != FiberState::Failed) {
+                            invalid_state.store(true, std::memory_order_release);
+                        }
+                        (void)fiber->suspend_reason();
+                        (void)fiber->debug_info();
+                        (void)fiber->debug_stack();
+                        (void)fiber->execution_binding();
+                        (void)fiber->nesting_depth();
+                        (void)fiber->failure();
+                        fiber->RequestCancellation();
+                        observer_reads.fetch_add(1,
+                                                std::memory_order_release);
+                        read_this_round = true;
+                    }
+                }
+                if (!read_this_round) {
                     std::this_thread::yield();
-                    continue;
                 }
-                const FiberState state = fiber->state();
-                if (state != FiberState::Ready &&
-                    state != FiberState::Running &&
-                    state != FiberState::Suspended &&
-                    state != FiberState::Completed &&
-                    state != FiberState::Failed) {
-                    invalid_state.store(true, std::memory_order_release);
-                }
-                (void)fiber->suspend_reason();
-                (void)fiber->debug_info();
-                (void)fiber->debug_stack();
-                (void)fiber->execution_binding();
-                (void)fiber->nesting_depth();
-                (void)fiber->failure();
-                fiber->RequestCancellation();
-                observer_reads.fetch_add(1, std::memory_order_relaxed);
             }
         });
         for (int round = 0; round < 200; ++round) {
             auto fiber = Fiber::AcquireForScheduler(
                 [] {}, Fiber::DefaultStackSize(), 8U);
             GO2CPP_REQUIRE(fiber != nullptr);
-            published.store(fiber.get(), std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lock(publish_mutex);
+                published = fiber.get();
+            }
             GO2CPP_CHECK(fiber->resume());
             GO2CPP_CHECK(fiber->state() == FiberState::Completed);
+            if (round == 0) {
+                // 首轮等 observer 完整读一次再回收：这一轮之后每轮都有
+                // 真实并发读取，observer_reads>0 的断言也不再赌调度时序。
+                GO2CPP_REQUIRE_EVENTUALLY(
+                    observer_reads.load(std::memory_order_acquire) > 0, 5s);
+            }
+            {
+                // 拿到锁即代表 observer 已完成（或尚未开始）对旧指针的
+                // 访问；此后回收不会与任何 observer 读取重叠。
+                std::lock_guard<std::mutex> lock(publish_mutex);
+                published = nullptr;
+            }
             Fiber::RecycleForScheduler(std::move(fiber), 8U);
         }
         observer_stop.store(true, std::memory_order_release);
         GO2CPP_JOIN_WITH_WATCHDOG(observer, 10s);
         GO2CPP_CHECK(!invalid_state.load(std::memory_order_acquire));
-        GO2CPP_CHECK(observer_reads.load(std::memory_order_relaxed) > 0);
+        GO2CPP_CHECK(observer_reads.load(std::memory_order_acquire) > 0);
     }
 }
