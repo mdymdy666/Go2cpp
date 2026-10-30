@@ -357,3 +357,42 @@ errno noinline），不是寄存器保存。
   goroutine handoff；cap0 无缓冲每次都要 park；满负载（其他 agent 的
   -j12 构建，load 200+）下测试会超时，空载通过。
 - 状态：未 commit。
+
+## 2026-10-30 网络批量 syscall + 零拷贝（子 agent）
+
+- 新增 `Socket::recv_batch`（recvmmsg）/`send_batch`（sendmmsg）/`send_file`（sendfile），
+  头文件 `include/go2cpp/network/socket.hpp`，实现 `src/network/socket.cpp`；
+  仓库没有独立 UdpSocket/TcpSocket（TCP/UDP 统一由 Socket 承载），批量 API 落在 Socket 上。
+- 基准（WSL2 loopback，taskset 2,3，5 次中位数，3 轮复测）：
+  UDP 批量收发 **1.36–1.44×**（内核每包 ~3.1 µs 限制，syscall 仅 ~1.3 µs）；
+  TCP 小消息 writev 批量 **10.3–13.4×**；sendfile 零拷贝 **1.54–1.63×**（3662 vs 2253 MiB/s）。
+- 新增 `tests/network/test_net_batch.cpp`（46,156 断言：参数/超时/取消/关闭/
+  sendfile offset+EOF+慢读+对端关闭/Fiber/300 轮随机/5 个场景）与
+  `tests/network/bench_net_batch.cpp`；`cmake/Go2CppTests.cmake` 注册
+  `go2cpp_net_batch_test`（ctest）与 `bench_net_batch`（不注册 ctest）。
+- 验证：现有 network/io/fd_manager 测试全过；新测试 ASan+UBSan 0 错误；普通构建 30 轮稳定。
+- 已知限制：UDP 2× 未达；UDP GSO 在本环境 `EINVAL` 未集成；未 commit。
+- 详细报告：`/tmp/net_batch.md`。
+
+## 2026-10-30 Reflect 序列化模块（子 agent：网络层序列化）
+
+- 新增 `include/go2cpp/reflect/**`（11 个头文件）与 `src/reflect/**`（4 个实现）：
+  `TypeId`/`TypeTraits`/`TypeRegistry`（内置固定 id + 动态/固定 id 注册）、
+  `Serializer<T>` 钩子与通用 `Serialize/Deserialize`、字段反射
+  （`FieldDescriptor` + `GO2CPP_REFLECT_FIELD` + `FindField` 按名访问）、
+  varint + 字段名去重 + 可选 RLE、JSON-like 文本与二进制紧凑两种格式、
+  `ReflectCodec` 与 `ReflectFrameCodec`（Bento 通用帧对接）。
+- 构建：`cmake/Go2CppReflect.cmake` 定义 `go2cpp_reflect`（`-Wall -Wextra
+  -Wpedantic -Werror`）；`CMakeLists.txt` 末尾接入。未改
+  `include/go2cpp/bento/reflect/**`，旧 Bento 反射保持兼容。
+- 测试：`tests/reflect/test_reflect_codec.cpp`（16 用例，10969 checks）在
+  `.build-bento-wsl` 下全部 PASS（`ctest -R reflect_codec`）；含随机往返、
+  3000 轮 fuzz、RLE 压缩炸弹/截断、帧粘包/半包/CRC、6 个真实场景。
+- 压测（Release -O3，单线程，约 60B 消息）：二进制编+解 2,165,648 ops/s
+  （0.462 µs/op），文本 747,389 ops/s（1.338 µs/op）。
+- ASan+UBSan（`-fsanitize=address,undefined`，leak 检测开启）16/16 PASS，
+  0 报告；临时构建目录已清理。
+- 详细报告：`/tmp/reflect_codec.md`。
+- 已知限制：文本模式不支持「仅特化 Serializer、无 FieldList」的类型；
+  二进制未知字段直接拒绝（暂无 schema 兼容跳过）；字段宏要求结构体可默认构造。
+- 状态：未 commit。

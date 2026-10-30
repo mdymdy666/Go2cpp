@@ -46,3 +46,6 @@ endif()
 # Bento 传输协议（自研 UDP 可靠/不可靠混合协议）：默认 OFF。
 # -DGO2CPP_WITH_BENTO=ON 构建 go2cpp_bento 与测试。
 include(cmake/Go2CppBento.cmake)
+
+# Reflect 序列化模块（TypeId/Registry + 序列化 + 压缩 + 格式化 + 帧对接）。
+include(cmake/Go2CppReflect.cmake)
