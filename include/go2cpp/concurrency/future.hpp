@@ -98,12 +98,17 @@ namespace detail {
  * @brief Future 等待期间的 Context 回调作用域守卫。
  * @details Wait 后端可能抛出扩展点异常；守卫保证异常展开时仍移除 Done
  *          回调，避免取消树长期保留 Future 状态。析构函数永不向外抛出。
+ *
+ *          守卫只保存 `const Context*`，不复制 `ContextPtr`：Context 的
+ *          生命周期由 Wait 的调用方保证（参数是 const 引用，调用期间不会
+ *          释放），因此这里不需要为了“保活”再做一次原子引用计数。等待
+ *          路径因此少两次 shared_ptr 原子操作。
  */
 class FutureCallbackGuard final {
 public:
     /** @brief 创建尚未绑定回调 ID 的守卫。 */
-    explicit FutureCallbackGuard(ContextPtr context) noexcept
-        : m_context(std::move(context)) {}
+    explicit FutureCallbackGuard(const Context* context) noexcept
+        : m_context(context) {}
 
     /** @brief 移除尚未清理的 Context 回调。 */
     ~FutureCallbackGuard() noexcept { Reset(); }
@@ -116,10 +121,13 @@ public:
 
     /** @brief 立即移除回调；重复调用安全。 */
     void Reset() noexcept {
-        auto context = std::move(m_context);
+        const Context* const context = m_context;
         const auto id = m_id;
+        m_context = nullptr;
         m_id = 0;
-        if (!context || id == 0) return;
+        if (context == nullptr || id == 0) {
+            return;
+        }
         try {
             context->Done().RemoveCallback(id);
         } catch (...) {
@@ -128,7 +136,7 @@ public:
     }
 
 private:
-    ContextPtr m_context;
+    const Context* m_context;
     DoneSignal::CallbackId m_id{0};
 };
 
@@ -208,12 +216,74 @@ enum class FutureStateKind : std::uint8_t {
     kError,
     kException,
     kCancelled,
+    // 仅状态字内部使用：CAS 成功的写者已占用状态，正在写 payload。
+    kClaimed,
 };
 
+// 共享状态字（m_word）的位布局：低 3 位是终态种类，bit3 表示 payload
+// 已写完并对外发布。把“占用”和“发布”拆成两步，是为了让写者用一次
+// CAS 独占 payload、再用一次 release store 发布终态；读端只需一次
+// acquire load 即可安全读取 payload，不需要互斥锁。
+constexpr std::uint32_t kFutureKindMask = 0x7u;
+constexpr std::uint32_t kFuturePublishedBit = 0x8u;
+constexpr std::uint32_t kFuturePendingWord = 0u;
+constexpr std::uint32_t kFutureClaimedWord = 5u;
+constexpr std::uint32_t kFutureValueWord =
+    static_cast<std::uint32_t>(FutureStateKind::kValue);
+constexpr std::uint32_t kFutureErrorWord =
+    static_cast<std::uint32_t>(FutureStateKind::kError);
+constexpr std::uint32_t kFutureExceptionWord =
+    static_cast<std::uint32_t>(FutureStateKind::kException);
+constexpr std::uint32_t kFutureCancelledWord =
+    static_cast<std::uint32_t>(FutureStateKind::kCancelled);
+
+/** @brief 把已发布的状态字映射为对外的 FutureStatus。 */
+inline FutureStatus FutureStatusFromWord(std::uint32_t word) noexcept {
+    switch (word & kFutureKindMask) {
+    case kFutureValueWord:
+        return FutureStatus::kReady;
+    case kFutureErrorWord:
+        return FutureStatus::kError;
+    case kFutureExceptionWord:
+        return FutureStatus::kException;
+    case kFutureCancelledWord:
+        return FutureStatus::kCancelled;
+    default:
+        // pending / claimed：尚未发布，等待方按“未完成”处理。
+        return FutureStatus::kTimedOut;
+    }
+}
+
 // 每个 Future 等待者有独立的取消标记。不能把标记放在共享状态中，
-// 否则一个调用者的超时会误唤醒并影响其他等待者。
+// 否则一个调用者的超时会误唤醒并影响其他等待者。回调只会写一次
+// （Context 的 DoneSignal 保证回调至多执行一次），等待者只读。
 struct FutureWaitRegistration final {
     std::atomic<bool> cancelled{false};
+};
+
+/**
+ * @brief 等待者计数的 RAII 增减。
+ * @details 构造时发布“本线程即将阻塞”，析构时撤销。完成方据此判断是否
+ *          需要唤醒后端：无人等待时连一次虚调用都不做。递减放在析构里
+ *          保证等待后端抛异常时计数不会泄漏（否则完成方会永远多做一次
+ *          NotifyAll，虽然正确但会拖慢完成路径）。
+ */
+class FutureWaiterCount final {
+public:
+    explicit FutureWaiterCount(std::atomic<std::uint32_t>& count) noexcept
+        : m_count(count) {
+        m_count.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    ~FutureWaiterCount() noexcept {
+        m_count.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    FutureWaiterCount(const FutureWaiterCount&) = delete;
+    FutureWaiterCount& operator=(const FutureWaiterCount&) = delete;
+
+private:
+    std::atomic<std::uint32_t>& m_count;
 };
 
 template <typename T, bool IsVoid = std::is_void_v<T>>
@@ -228,27 +298,43 @@ class FutureState;
  * 写端只负责把它推进到**某个终态**，读端等待并读取。生命周期由
  * `shared_ptr` 管理，因此读写两端的销毁顺序不需要协调。
  *
- * ## 一次性终态机
+ * ## 一次性终态机（原子字，无互斥锁）
  *
- * `m_kind`（`FutureStateKind`）从 `kPending` 出发，只能**成功迁移一次**：
- * `SetValue`、`SetError`、`SetException`、`Cancel` 四者互斥，
- * 后到者返回 false 并被忽略。这个"先到先得"由 `m_mutex` 保证，
- * 是 Future 语义的核心 —— 不存在"第二次完成"。
+ * `m_word` 是 32 位原子字：低 3 位是终态种类，bit3 是“payload 已发布”。
+ * 写端先用一次 CAS 把 `kPending` 换成 `kClaimed`，**CAS 成功者独占写
+ * payload**，再用 release 语义发布 `kind | kPublished`。CAS 失败者直接
+ * 返回 false，因此 `SetValue / SetError / SetException / Cancel` 仍然
+ * 只有第一个成功——与旧实现的互斥锁语义完全一致。
  *
- * ## 能力
+ * 因为 CAS 与发布之间不再持锁，**无等待者时完成路径是纯原子操作**：
+ * 不碰 `m_mutex`，也不调用唤醒后端。这正是 Go 中 `sync.Once` +
+ * “先写结果再关 channel”能达到的成本量级。
  *
- * - `SetValue`：先构造值再持锁，避免用户类型的构造/移动在锁内阻塞等待者；
- * - `SetError` / `SetException` / `Cancel`：分别对应业务错误、异常、取消；
- * - `Wait` / `WaitUntil`：通过 `m_wait_backend` 等待终态，支持超时与
- *   `Context` 取消；
- * - `TakeResult` / `Get`：终态后读取，未完成时按 API 约定阻塞或返回无效。
+ * ## 读端快路径
+ *
+ * 读端用一次 acquire load 读 `m_word`；已发布时直接返回状态并读取
+ * payload（release/acquire 建立 happens-before）。`Get`/`Status` 在
+ * 已就绪时因此**无锁**，这是最常见的调用形态。
+ *
+ * ## 等待与唤醒
+ *
+ * 真正需要阻塞时才使用 `m_mutex` + `FutureWaitBackend`：
+ *
+ * - `m_waiters` 记录当前阻塞的等待者数量。完成路径看到 0 时跳过
+ *   `NotifyAll()`，避免每完成一个 Future 都做一次虚调用/系统调用；
+ * - 有等待者时，完成路径在 `m_mutex` 内发布终态。这一步不能省：
+ *   `FutureWaitBackend::Wait` 接收 `unique_lock`，等待者的谓词检查与
+ *   “进入条件等待”之间必须与发布串行化，否则可能丢失唤醒；
+ * - 等待者在 `m_mutex` 内先递增 `m_waiters`、再**复检**终态，闭合
+ *   “完成方在计数前看到 0、等待者随后才进入等待”的窗口。
  *
  * ## 并发要点
  *
- * - 所有字段由 `m_mutex` 保护，但**值的构造在锁外**；
- * - 推进终态后调用 `m_wait_backend->NotifyAll()`，唤醒全部等待者 ——
- *   唤醒发生在锁外，避免"唤醒时等待者还要抢锁"的抖动；
- * - `m_wait_backend` 在构造时从全局注册表取，之后不再变化。
+ * - payload（`m_value` / `m_error` / `m_exception`）由 CAS 赢家单写，
+ *   发布前读端不会读取；发布后只读；
+ * - Context 只以 `const Context*` 形式参与，不拷贝 `shared_ptr`；
+ * - 等待仍然经过 `FutureWaitBackend::Wait`，可替换后端（自定义调度器、
+ *   事件循环）的行为不变。
  */
 template <typename T>
 class FutureState<T, false> final
@@ -259,17 +345,14 @@ public:
     FutureState& operator=(const FutureState&) = delete;
 
     bool SetValue(T value) {
-        // 在持有状态锁之前构造值，避免用户类型的构造函数阻塞其他等待者。
+        // 值在 CAS 之前构造：用户类型的拷贝/移动不会落在“占用状态”与
+        // “发布状态”之间；构造抛异常时状态仍是 pending，可重试。
         auto stored = std::make_shared<const T>(std::move(value));
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_kind != FutureStateKind::kPending) {
-                return false;
-            }
-            m_value = std::move(stored);
-            m_kind = FutureStateKind::kValue;
+        if (!Claim()) {
+            return false;
         }
-        m_wait_backend->NotifyAll();
+        m_value = std::move(stored);
+        Publish(FutureStateKind::kValue);
         return true;
     }
 
@@ -277,15 +360,11 @@ public:
         if (!error) {
             error = NewError("go2cpp::Promise::SetError received null error");
         }
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_kind != FutureStateKind::kPending) {
-                return false;
-            }
-            m_error = std::move(error);
-            m_kind = FutureStateKind::kError;
+        if (!Claim()) {
+            return false;
         }
-        m_wait_backend->NotifyAll();
+        m_error = std::move(error);
+        Publish(FutureStateKind::kError);
         return true;
     }
 
@@ -294,15 +373,11 @@ public:
             return SetError(NewError(
                 "go2cpp::Promise::SetException received null exception"));
         }
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_kind != FutureStateKind::kPending) {
-                return false;
-            }
-            m_exception = std::move(exception);
-            m_kind = FutureStateKind::kException;
+        if (!Claim()) {
+            return false;
         }
-        m_wait_backend->NotifyAll();
+        m_exception = std::move(exception);
+        Publish(FutureStateKind::kException);
         return true;
     }
 
@@ -310,51 +385,53 @@ public:
         if (!error) {
             error = CanceledError();
         }
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_kind != FutureStateKind::kPending) {
-                return false;
-            }
-            m_error = std::move(error);
-            m_kind = FutureStateKind::kCancelled;
+        if (!Claim()) {
+            return false;
         }
-        m_wait_backend->NotifyAll();
+        m_error = std::move(error);
+        Publish(FutureStateKind::kCancelled);
         return true;
     }
 
     FutureStatus Wait(const ContextPtr& context,
                       std::optional<ContextTimePoint> deadline) const {
-        // 热路径：终态已发布时不需要等待票据，也不需要 Context 回调。
-        // Get 绝大多数发生在 SetValue 之后，这里省掉一次 make_shared
-        // 和一次 weak_from_this。
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_kind != FutureStateKind::kPending) {
-                return StatusLocked(false, context, deadline);
-            }
-            // 无 Context 的零时长/已过期等待（TryGet、GetFor(0)）：
-            // 直接按本地 deadline 返回，不分配等待票据。
-            if (!context && deadline && Context::Now() >= *deadline) {
-                return FutureStatus::kTimedOut;
-            }
+        // 快路径 1：终态已发布。一次 acquire load，无锁，也不碰 Context。
+        // Get 绝大多数发生在 SetValue 之后，这条路径是主要收益来源。
+        FutureStatus status = FutureStatus::kInvalid;
+        if (TryGetPublished(status)) {
+            return status;
         }
-        const auto registration =
-            std::make_shared<FutureWaitRegistration>();
-        const std::weak_ptr<const FutureState> weak_state =
-            this->shared_from_this();
-        FutureCallbackGuard callback_guard(context);
 
-        // 先注册回调，再取得状态锁。若取消已经发生，AddCallback 会同步
-        // 执行回调；此时尚未持有状态锁，不会发生自锁。
-        if (context && !context->IsDone()) {
-            callback_guard.SetId(context->Done().AddCallback(
-                [weak_state, registration] {
+        const Context* const raw_context = context.get();
+        // 快路径 2：Context 已取消/到期。省掉等待票据分配和回调注册；
+        // 若终态在两次检查之间发布，仍以终态为准（与旧实现一致）。
+        if (raw_context != nullptr && raw_context->IsDone()) {
+            if (TryGetPublished(status)) {
+                return status;
+            }
+            return ContextCancelStatus(raw_context);
+        }
+        // 快路径 3：无 Context 的零时长/已过期等待（TryGet、GetFor(0)）：
+        // 直接按本地 deadline 返回，不分配任何等待对象。
+        if (raw_context == nullptr && deadline &&
+            Context::Now() >= *deadline) {
+            return FutureStatus::kTimedOut;
+        }
+
+        // 慢路径：只有真正要阻塞时才分配等待票据、注册取消回调。
+        auto registration = std::make_shared<FutureWaitRegistration>();
+        FutureCallbackGuard callback_guard(raw_context);
+        if (raw_context != nullptr) {
+            // 先注册回调，再取得状态锁：若取消已经发生，AddCallback 会
+            // 同步执行回调；此时尚未持有状态锁，不会自锁。
+            callback_guard.SetId(raw_context->Done().AddCallback(
+                [weak_state = this->weak_from_this(), registration] {
                     const auto state = weak_state.lock();
                     if (!state) {
                         return;
                     }
-                    // WaitOnce 在发布 waiter 前一直持有 m_mutex。回调先
-                    // 取得同一把锁再通知，保证取消不会落在发布窗口之前。
+                    // 与等待者的谓词检查共用 m_mutex：保证“标记取消”与
+                    // “检查谓词 → 进入等待”串行化，不会丢唤醒。
                     {
                         std::lock_guard<std::mutex> lock(state->m_mutex);
                         registration->cancelled.store(
@@ -365,89 +442,120 @@ public:
         }
 
         std::unique_lock<std::mutex> lock(m_mutex);
-        const auto predicate = [&] {
-            return m_kind != FutureStateKind::kPending ||
-                   registration->cancelled.load(std::memory_order_acquire) ||
-                   (context && context->IsDone());
+        const auto cancelled = [&]() noexcept {
+            return registration->cancelled.load(std::memory_order_acquire) ||
+                   (raw_context != nullptr && raw_context->IsDone());
         };
-
-        if (m_kind == FutureStateKind::kPending &&
-            !registration->cancelled.load(std::memory_order_acquire) &&
-            !(context && context->IsDone()) &&
-            (!deadline || Context::Now() < *deadline)) {
-            if (deadline) {
-                (void)m_wait_backend->Wait(lock, *deadline, predicate);
-            } else {
-                (void)m_wait_backend->Wait(lock, std::nullopt, predicate);
+        if (!TryGetPublished(status) && !cancelled() &&
+            !(deadline && Context::Now() >= *deadline) &&
+            !core::ParkingCondition::CancellationRequested()) {
+            // 计数必须在复检之前：完成方要么看到计数、在锁内发布并唤醒，
+            // 要么在计数之前发布，被下面的复检看到。
+            FutureWaiterCount waiter_count(m_waiters);
+            if (!TryGetPublished(status) && !cancelled()) {
+                const auto predicate = [&]() {
+                    FutureStatus ignored;
+                    return TryGetPublished(ignored) || cancelled();
+                };
+                if (deadline) {
+                    (void)m_wait_backend->Wait(lock, *deadline, predicate);
+                } else {
+                    (void)m_wait_backend->Wait(lock, std::nullopt, predicate);
+                }
             }
         }
-
-        const FutureStatus result = StatusLocked(
-            registration->cancelled.load(std::memory_order_acquire), context,
-            deadline);
+        status = StatusLocked(cancelled(), raw_context, deadline);
         lock.unlock();
         callback_guard.Reset();
-        return result;
+        return status;
     }
 
     FutureStatus Status() const noexcept {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        switch (m_kind) {
-        case FutureStateKind::kPending:
-            return FutureStatus::kTimedOut;
-        case FutureStateKind::kValue:
-            return FutureStatus::kReady;
-        case FutureStateKind::kError:
-            return FutureStatus::kError;
-        case FutureStateKind::kException:
-            return FutureStatus::kException;
-        case FutureStateKind::kCancelled:
-            return FutureStatus::kCancelled;
+        FutureStatus status = FutureStatus::kTimedOut;
+        if (TryGetPublished(status)) {
+            return status;
         }
-        return FutureStatus::kInvalid;
+        return FutureStatus::kTimedOut;
     }
 
     std::shared_ptr<const T> Value() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        // 只在发布后读取 payload；未发布时返回空，避免与写者竞争。
+        if ((m_word.load(std::memory_order_acquire) & kFuturePublishedBit) ==
+            0) {
+            return {};
+        }
         return m_value;
     }
 
     ErrorPtr ErrorValue() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        if ((m_word.load(std::memory_order_acquire) & kFuturePublishedBit) ==
+            0) {
+            return {};
+        }
         return m_error;
     }
 
     std::exception_ptr ExceptionValue() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        if ((m_word.load(std::memory_order_acquire) & kFuturePublishedBit) ==
+            0) {
+            return {};
+        }
         return m_exception;
     }
 
-private:
-    FutureStatus StatusLocked(bool registration_cancelled,
-                              const ContextPtr& context,
-                              std::optional<ContextTimePoint> deadline) const {
-        switch (m_kind) {
-        case FutureStateKind::kValue:
-            return FutureStatus::kReady;
-        case FutureStateKind::kError:
-            return FutureStatus::kError;
-        case FutureStateKind::kException:
-            return FutureStatus::kException;
-        case FutureStateKind::kCancelled:
-            return FutureStatus::kCancelled;
-        case FutureStateKind::kPending:
-            break;
+    /** @brief 已发布时取回终态；未发布返回 false。用于 Get 的无锁快路径。 */
+    bool TryGetPublished(FutureStatus& status) const noexcept {
+        const std::uint32_t word = m_word.load(std::memory_order_acquire);
+        if ((word & kFuturePublishedBit) == 0) {
+            return false;
         }
+        status = FutureStatusFromWord(word);
+        return true;
+    }
 
-        if (registration_cancelled || (context && context->IsDone())) {
-            const auto context_error = context ? context->Err() : ErrorPtr{};
-            if (context_error && Is(context_error, DeadlineExceededError())) {
-                return FutureStatus::kDeadlineExceeded;
+private:
+    /** @brief 抢占唯一写者资格；成功者负责写 payload 并发布。 */
+    bool Claim() noexcept {
+        std::uint32_t expected = kFuturePendingWord;
+        return m_word.compare_exchange_strong(
+            expected, kFutureClaimedWord, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+
+    /** @brief 发布终态并唤醒等待者。 */
+    void Publish(FutureStateKind kind) noexcept {
+        const std::uint32_t word =
+            static_cast<std::uint32_t>(kind) | kFuturePublishedBit;
+        // 有等待者时必须持锁发布：等待者的谓词检查在锁内，这样“发布”
+        // 与“检查后进入等待”被串行化，notify 不会落在两者之间而丢失。
+        if (m_waiters.load(std::memory_order_acquire) != 0) {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_word.store(word, std::memory_order_release);
             }
-            return FutureStatus::kCancelled;
+            // 唤醒在锁外，避免被唤醒者立刻再抢锁。
+            m_wait_backend->NotifyAll();
+            return;
+        }
+        m_word.store(word, std::memory_order_release);
+        // 等待者可能在 store 之后才递增计数。补一次广播：此时它还没进入
+        // 等待，会在复检中看到终态；若已经进入等待，这次广播正好唤醒它。
+        if (m_waiters.load(std::memory_order_acquire) != 0) {
+            m_wait_backend->NotifyAll();
+        }
+    }
+
+    FutureStatus StatusLocked(bool cancelled, const Context* context,
+                              std::optional<ContextTimePoint> deadline) const {
+        FutureStatus status = FutureStatus::kInvalid;
+        if (TryGetPublished(status)) {
+            return status;
+        }
+        if (cancelled) {
+            return ContextCancelStatus(context);
         }
         const auto now = Context::Now();
-        if (context) {
+        if (context != nullptr) {
             const auto context_deadline = context->Deadline();
             if (context_deadline && now >= *context_deadline) {
                 // Context 的截止时间优先于本次等待的本地 deadline；定时器
@@ -466,27 +574,26 @@ private:
         return FutureStatus::kTimedOut;
     }
 
+    static FutureStatus ContextCancelStatus(const Context* context) {
+        const auto context_error =
+            context != nullptr ? context->Err() : ErrorPtr{};
+        if (context_error && Is(context_error, DeadlineExceededError())) {
+            return FutureStatus::kDeadlineExceeded;
+        }
+        return FutureStatus::kCancelled;
+    }
+
     mutable std::mutex m_mutex;
     std::shared_ptr<FutureWaitBackend> m_wait_backend;
-    FutureStateKind m_kind{FutureStateKind::kPending};
+    mutable std::atomic<std::uint32_t> m_word{kFuturePendingWord};
+    mutable std::atomic<std::uint32_t> m_waiters{0};
+    // payload：CAS 赢家单写，发布后只读。读端通过 m_word 的
+    // release/acquire 建立 happens-before，因此不需要额外加锁。
     std::shared_ptr<const T> m_value;
     ErrorPtr m_error;
     std::exception_ptr m_exception;
 };
 
-/**
- * @brief void Future 的共享状态特化。
- *
- * ## 与 `FutureState<T, false>` 的差异
- *
- * 只有一个：**没有 `m_value`**。`SetValue()` 无参，仅用于"成功完成"这个
- * 信号本身。其余部分（一次性终态机、等待后端、错误/异常/取消、
- * 唤醒时机）与非 void 版本**完全一致**。
- *
- * 单独特化而不是用 `std::optional<T>` 包一层，是为了让 void Future 不产生
- * 任何值存储开销 —— `Future<void>` 常见于"只关心完成信号"的场景
- * （如一组任务的汇合点）。
- */
 template <typename T>
 class FutureState<T, true> final
     : public std::enable_shared_from_this<FutureState<T, true>> {
@@ -496,14 +603,10 @@ public:
     FutureState& operator=(const FutureState&) = delete;
 
     bool SetValue() {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_kind != FutureStateKind::kPending) {
-                return false;
-            }
-            m_kind = FutureStateKind::kValue;
+        if (!Claim()) {
+            return false;
         }
-        m_wait_backend->NotifyAll();
+        Publish(FutureStateKind::kValue);
         return true;
     }
 
@@ -511,15 +614,11 @@ public:
         if (!error) {
             error = NewError("go2cpp::Promise::SetError received null error");
         }
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_kind != FutureStateKind::kPending) {
-                return false;
-            }
-            m_error = std::move(error);
-            m_kind = FutureStateKind::kError;
+        if (!Claim()) {
+            return false;
         }
-        m_wait_backend->NotifyAll();
+        m_error = std::move(error);
+        Publish(FutureStateKind::kError);
         return true;
     }
 
@@ -528,15 +627,11 @@ public:
             return SetError(NewError(
                 "go2cpp::Promise::SetException received null exception"));
         }
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_kind != FutureStateKind::kPending) {
-                return false;
-            }
-            m_exception = std::move(exception);
-            m_kind = FutureStateKind::kException;
+        if (!Claim()) {
+            return false;
         }
-        m_wait_backend->NotifyAll();
+        m_exception = std::move(exception);
+        Publish(FutureStateKind::kException);
         return true;
     }
 
@@ -544,42 +639,41 @@ public:
         if (!error) {
             error = CanceledError();
         }
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_kind != FutureStateKind::kPending) {
-                return false;
-            }
-            m_error = std::move(error);
-            m_kind = FutureStateKind::kCancelled;
+        if (!Claim()) {
+            return false;
         }
-        m_wait_backend->NotifyAll();
+        m_error = std::move(error);
+        Publish(FutureStateKind::kCancelled);
         return true;
     }
 
     FutureStatus Wait(const ContextPtr& context,
                       std::optional<ContextTimePoint> deadline) const {
-        // 热路径：终态已发布时不需要等待票据，也不需要 Context 回调。
-        // Get 绝大多数发生在 SetValue 之后，这里省掉一次 make_shared
-        // 和一次 weak_from_this。
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_kind != FutureStateKind::kPending) {
-                return StatusLocked(false, context, deadline);
-            }
-            // 无 Context 的零时长/已过期等待（TryGet、GetFor(0)）：
-            // 直接按本地 deadline 返回，不分配等待票据。
-            if (!context && deadline && Context::Now() >= *deadline) {
-                return FutureStatus::kTimedOut;
-            }
+        // 快路径 1：终态已发布。一次 acquire load，无锁，也不碰 Context。
+        FutureStatus status = FutureStatus::kInvalid;
+        if (TryGetPublished(status)) {
+            return status;
         }
-        const auto registration =
-            std::make_shared<FutureWaitRegistration>();
-        const std::weak_ptr<const FutureState> weak_state =
-            this->shared_from_this();
-        FutureCallbackGuard callback_guard(context);
-        if (context && !context->IsDone()) {
-            callback_guard.SetId(context->Done().AddCallback(
-                [weak_state, registration] {
+
+        const Context* const raw_context = context.get();
+        // 快路径 2：Context 已取消/到期。省掉等待票据分配和回调注册。
+        if (raw_context != nullptr && raw_context->IsDone()) {
+            if (TryGetPublished(status)) {
+                return status;
+            }
+            return ContextCancelStatus(raw_context);
+        }
+        // 快路径 3：无 Context 的零时长/已过期等待（TryGet、GetFor(0)）。
+        if (raw_context == nullptr && deadline &&
+            Context::Now() >= *deadline) {
+            return FutureStatus::kTimedOut;
+        }
+
+        auto registration = std::make_shared<FutureWaitRegistration>();
+        FutureCallbackGuard callback_guard(raw_context);
+        if (raw_context != nullptr) {
+            callback_guard.SetId(raw_context->Done().AddCallback(
+                [weak_state = this->weak_from_this(), registration] {
                     const auto state = weak_state.lock();
                     if (!state) {
                         return;
@@ -594,86 +688,104 @@ public:
         }
 
         std::unique_lock<std::mutex> lock(m_mutex);
-        const auto predicate = [&] {
-            return m_kind != FutureStateKind::kPending ||
-                   registration->cancelled.load(std::memory_order_acquire) ||
-                   (context && context->IsDone());
+        const auto cancelled = [&]() noexcept {
+            return registration->cancelled.load(std::memory_order_acquire) ||
+                   (raw_context != nullptr && raw_context->IsDone());
         };
-        if (m_kind == FutureStateKind::kPending &&
-            !registration->cancelled.load(std::memory_order_acquire) &&
-            !(context && context->IsDone()) &&
-            (!deadline || Context::Now() < *deadline)) {
-            if (deadline) {
-                (void)m_wait_backend->Wait(lock, *deadline, predicate);
-            } else {
-                (void)m_wait_backend->Wait(lock, std::nullopt, predicate);
+        if (!TryGetPublished(status) && !cancelled() &&
+            !(deadline && Context::Now() >= *deadline) &&
+            !core::ParkingCondition::CancellationRequested()) {
+            FutureWaiterCount waiter_count(m_waiters);
+            if (!TryGetPublished(status) && !cancelled()) {
+                const auto predicate = [&]() {
+                    FutureStatus ignored;
+                    return TryGetPublished(ignored) || cancelled();
+                };
+                if (deadline) {
+                    (void)m_wait_backend->Wait(lock, *deadline, predicate);
+                } else {
+                    (void)m_wait_backend->Wait(lock, std::nullopt, predicate);
+                }
             }
         }
-        const FutureStatus result = StatusLocked(
-            registration->cancelled.load(std::memory_order_acquire), context,
-            deadline);
+        status = StatusLocked(cancelled(), raw_context, deadline);
         lock.unlock();
         callback_guard.Reset();
-        return result;
+        return status;
     }
 
     FutureStatus Status() const noexcept {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        switch (m_kind) {
-        case FutureStateKind::kPending:
-            return FutureStatus::kTimedOut;
-        case FutureStateKind::kValue:
-            return FutureStatus::kReady;
-        case FutureStateKind::kError:
-            return FutureStatus::kError;
-        case FutureStateKind::kException:
-            return FutureStatus::kException;
-        case FutureStateKind::kCancelled:
-            return FutureStatus::kCancelled;
+        FutureStatus status = FutureStatus::kTimedOut;
+        if (TryGetPublished(status)) {
+            return status;
         }
-        return FutureStatus::kInvalid;
+        return FutureStatus::kTimedOut;
     }
 
     ErrorPtr ErrorValue() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        if ((m_word.load(std::memory_order_acquire) & kFuturePublishedBit) ==
+            0) {
+            return {};
+        }
         return m_error;
     }
 
     std::exception_ptr ExceptionValue() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        if ((m_word.load(std::memory_order_acquire) & kFuturePublishedBit) ==
+            0) {
+            return {};
+        }
         return m_exception;
     }
 
-private:
-    FutureStatus StatusLocked(bool registration_cancelled,
-                              const ContextPtr& context,
-                              std::optional<ContextTimePoint> deadline) const {
-        switch (m_kind) {
-        case FutureStateKind::kValue:
-            return FutureStatus::kReady;
-        case FutureStateKind::kError:
-            return FutureStatus::kError;
-        case FutureStateKind::kException:
-            return FutureStatus::kException;
-        case FutureStateKind::kCancelled:
-            return FutureStatus::kCancelled;
-        case FutureStateKind::kPending:
-            break;
+    /** @brief 已发布时取回终态；未发布返回 false。用于 Get 的无锁快路径。 */
+    bool TryGetPublished(FutureStatus& status) const noexcept {
+        const std::uint32_t word = m_word.load(std::memory_order_acquire);
+        if ((word & kFuturePublishedBit) == 0) {
+            return false;
         }
+        status = FutureStatusFromWord(word);
+        return true;
+    }
 
-        if (registration_cancelled || (context && context->IsDone())) {
-            const auto context_error = context ? context->Err() : ErrorPtr{};
-            if (context_error && Is(context_error, DeadlineExceededError())) {
-                return FutureStatus::kDeadlineExceeded;
+private:
+    bool Claim() noexcept {
+        std::uint32_t expected = kFuturePendingWord;
+        return m_word.compare_exchange_strong(
+            expected, kFutureClaimedWord, std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+
+    void Publish(FutureStateKind kind) noexcept {
+        const std::uint32_t word =
+            static_cast<std::uint32_t>(kind) | kFuturePublishedBit;
+        if (m_waiters.load(std::memory_order_acquire) != 0) {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_word.store(word, std::memory_order_release);
             }
-            return FutureStatus::kCancelled;
+            m_wait_backend->NotifyAll();
+            return;
+        }
+        m_word.store(word, std::memory_order_release);
+        if (m_waiters.load(std::memory_order_acquire) != 0) {
+            m_wait_backend->NotifyAll();
+        }
+    }
+
+    FutureStatus StatusLocked(bool cancelled, const Context* context,
+                              std::optional<ContextTimePoint> deadline) const {
+        FutureStatus status = FutureStatus::kInvalid;
+        if (TryGetPublished(status)) {
+            return status;
+        }
+        if (cancelled) {
+            return ContextCancelStatus(context);
         }
         const auto now = Context::Now();
-        if (context) {
+        if (context != nullptr) {
             const auto context_deadline = context->Deadline();
             if (context_deadline && now >= *context_deadline) {
-                // Context 的截止时间优先于本次等待的本地 deadline；定时器
-                // 线程可能尚未来得及把 done 标志发布到回调观察者。
                 return FutureStatus::kDeadlineExceeded;
             }
         }
@@ -686,9 +798,19 @@ private:
         return FutureStatus::kTimedOut;
     }
 
+    static FutureStatus ContextCancelStatus(const Context* context) {
+        const auto context_error =
+            context != nullptr ? context->Err() : ErrorPtr{};
+        if (context_error && Is(context_error, DeadlineExceededError())) {
+            return FutureStatus::kDeadlineExceeded;
+        }
+        return FutureStatus::kCancelled;
+    }
+
     mutable std::mutex m_mutex;
     std::shared_ptr<FutureWaitBackend> m_wait_backend;
-    FutureStateKind m_kind{FutureStateKind::kPending};
+    mutable std::atomic<std::uint32_t> m_word{kFuturePendingWord};
+    mutable std::atomic<std::uint32_t> m_waiters{0};
     ErrorPtr m_error;
     std::exception_ptr m_exception;
 };
@@ -915,6 +1037,21 @@ public:
     /** @brief 等待相对时长。 */
     FutureStatus WaitFor(ContextDuration timeout,
                          const ContextPtr& context = {}) const {
+        if (!m_state) {
+            return FutureStatus::kInvalid;
+        }
+        // 已就绪快路径：连 deadline 计算（Context::Now）都省掉。
+        FutureStatus status = FutureStatus::kInvalid;
+        if (m_state->TryGetPublished(status)) {
+            return status;
+        }
+        if (timeout <= ContextDuration::zero()) {
+            // 零/负超时只探测当前状态：不计算 deadline，也不注册取消回调。
+            if (context && context->IsDone()) {
+                return m_state->Wait(context, std::nullopt);
+            }
+            return FutureStatus::kTimedOut;
+        }
         return WaitUntil(context, detail::DeadlineAfter<T>(timeout));
     }
 
@@ -925,7 +1062,14 @@ public:
         if (!m_state) {
             return FutureStatus::kInvalid;
         }
-        return m_state->Wait(context, detail::MergeDeadline<T>(context, deadline));
+        // 已完成时 deadline 合并与 Context 检查都不参与（与旧语义一致），
+        // 一次 acquire load 即可返回。
+        FutureStatus status = FutureStatus::kInvalid;
+        if (m_state->TryGetPublished(status)) {
+            return status;
+        }
+        return m_state->Wait(context,
+                             detail::MergeDeadline<T>(context, deadline));
     }
 
     // 等待并返回值/错误/异常的结构化结果，不抛出异常。
@@ -938,7 +1082,29 @@ public:
     /** @brief 在相对时限内等待并返回结构化结果。 */
     FutureResult<T> GetResultFor(ContextDuration timeout,
                                  const ContextPtr& context = {}) const {
-        return GetResultUntil(context, detail::DeadlineAfter<T>(timeout));
+        FutureResult<T> result;
+        if (!m_state) {
+            result.status = FutureStatus::kInvalid;
+            return result;
+        }
+        // 已就绪快路径：连 deadline 计算都省掉（TryGet/GetFor(0) 是热点）。
+        if (!m_state->TryGetPublished(result.status)) {
+            if (timeout <= ContextDuration::zero()) {
+                // 零/负超时只探测：不计算 deadline，也不注册取消回调。
+                if (context && context->IsDone()) {
+                    result.status = m_state->Wait(context, std::nullopt);
+                } else {
+                    result.status = FutureStatus::kTimedOut;
+                }
+            } else {
+                result.status = m_state->Wait(
+                    context,
+                    detail::MergeDeadline<T>(context,
+                                             detail::DeadlineAfter<T>(timeout)));
+            }
+        }
+        FillResult(result);
+        return result;
     }
 
     /** @brief 在绝对截止时间前等待并返回结构化结果。 */
@@ -950,18 +1116,13 @@ public:
             result.status = FutureStatus::kInvalid;
             return result;
         }
-        result.status = m_state->Wait(
-            context, detail::MergeDeadline<T>(context, deadline));
-        if (result.status == FutureStatus::kReady ||
-            result.status == FutureStatus::kError ||
-            result.status == FutureStatus::kException ||
-            result.status == FutureStatus::kCancelled) {
-            if constexpr (!std::is_void_v<T>) {
-                result.value = m_state->Value();
-            }
-            result.error = m_state->ErrorValue();
-            result.exception = m_state->ExceptionValue();
+        // 已就绪快路径：一次 acquire load，完全绕开 deadline 合并、Context
+        // 访问与状态锁 —— Get 的绝大多数调用发生在 Promise 完成之后。
+        if (!m_state->TryGetPublished(result.status)) {
+            result.status = m_state->Wait(
+                context, detail::MergeDeadline<T>(context, deadline));
         }
+        FillResult(result);
         return result;
     }
 
@@ -1011,6 +1172,21 @@ public:
     }
 
 private:
+    /** @brief 按终态把 payload 填进结果（只拷贝对应的一项）。 */
+    void FillResult(FutureResult<T>& result) const {
+        if constexpr (!std::is_void_v<T>) {
+            if (result.status == FutureStatus::kReady) {
+                result.value = m_state->Value();
+            }
+        }
+        if (result.status == FutureStatus::kError ||
+            result.status == FutureStatus::kCancelled) {
+            result.error = m_state->ErrorValue();
+        } else if (result.status == FutureStatus::kException) {
+            result.exception = m_state->ExceptionValue();
+        }
+    }
+
     explicit Future(std::shared_ptr<detail::FutureState<T>> state)
         : m_state(std::move(state)) {}
 
