@@ -1,6 +1,11 @@
 # bento-security 模块组：AEAD 加密、X25519 密钥交换、密钥库与握手
 
 > **状态**：现行（三个模块均已交付；`crypto` 与 `x25519` 已在 `Link` 握手中启用）。
+> **默认安全（2026-10-30）**：`LinkConfig::require_encryption` 与
+> `PeerHubConfig::require_encryption` **默认 `true`**——没有 32B PSK 时
+> `Open`/`Connect` 直接失败（`SecurityError::kEncryptionRequired`）；旧端
+> （无 X25519 公钥）默认拒绝。明文退化为显式 `require_encryption=false`，
+> 旧端回退需显式 `allow_legacy_peer=true`。迁移见 §3.6。
 > **日期**：2026-10-28；**适用基线**：`afc135a`（`feat(bento): X25519 前向保密 + 弱网拥塞控制修复`）。
 > **源码位置**：`include/go2cpp/bento/net/{crypto,x25519,keystore,link}.hpp`（334 / 128 / 218 / 572 行）、`src/bento/net/{crypto,x25519,keystore,link}.cpp`（963 / 287 / 565 / 2364 行）。
 > **引用约定**：`xxx()` 均为基线源码中可检索的真实函数；常量写作 `kXxx`；`Link::` 前缀表示链路层入口，其余属 `go2cpp::bento` 命名空间。
@@ -33,7 +38,7 @@
 - **端点被控**：PSK 与会话密钥在进程内存中，拿到内存即可解密；无 `mlock`/HSM。
 - **PSK 分发**：如何把 32B PSK 安全送到两端不在本模块范围（`KeyStore` 只负责读入与保存形式）。
 - **身份与证书**：无证书、无签名、无 PKI。双方共用一个 PSK，任何持 PSK 者可冒充任一端；X25519 公钥未认证，只靠 PSK 混合间接绑定。
-- **降级到明文**：加密开启后不会退回明文，但允许对端无公钥时回退纯 PSK（`psk_fallbacks`），这是兼容旧对端的显式设计。
+- **降级到明文**：默认策略下不会退回明文——无 PSK 时 `Open`/`Connect` 失败，监听方丢弃明文 HELLO 且不回 ACK。唯一降级是「对端无 X25519 公钥 → 回退纯 PSK」，默认同样拒绝（`allow_legacy_peer=false`）；只有显式 `allow_legacy_peer=true` 才允许并计入 `psk_fallbacks`，此时链路仍加密但没有前向保密。
 - 拒绝服务：窗口机制只防伪造高序号推动窗口，不防带宽耗尽；时间戳校验依赖双方墙钟大致同步。
 
 ## 3. API 参考
@@ -95,14 +100,43 @@
 
 | 签名 | 语义 | 安全约束 |
 |---|---|---|
-| `bool Link::SetPreSharedKey(const std::uint8_t* key, std::size_t bytes)` | 设置 32B PSK，启用认证加密 | 长度非 32B 返回 `false` 并保持原模式；须在 `Open`/`Connect` 前调用 |
+| `bool Link::SetPreSharedKey(const std::uint8_t* key, std::size_t bytes)` | 设置 32B PSK，启用认证加密 | 长度非 32B 返回 `false` 并保持原模式；**必须在 `Open`/`Connect` 之前调用**（默认策略下 `Open` 会拒绝无 PSK 的配置） |
 | `bool secure() const`、`bool session_established() const`、`const SecureStats& secure_stats() const` | 加密模式、会话密钥就绪、加解密计数（含 `x25519_handshakes`、`psk_fallbacks`、`replay_drops`） | 只读观测 |
 | `std::vector<std::uint8_t> ExportSessionTicket()` / `bool Resume(const std::vector<std::uint8_t>& ticket)` | 导出 0-RTT 票据 / 用票据恢复并直接进入 `kConnected` | **仅纯 PSK 会话**可用，X25519 会话返回空/`false`；成功后用 `ReplayWindow::InitializeBefore` 恢复序号 |
-| `LinkConfig::pre_shared_key`、`enable_x25519`（默认 `true`）、`handshake_replay_window_ms`（默认 30000）、`session_ticket_lifetime_ms`（默认 60000） | 握手配置 | `enable_x25519=false` 时 HELLO/ACK 退回旧线格式 |
+| `LinkConfig::pre_shared_key`、`enable_x25519`（默认 `true`）、`handshake_replay_window_ms`（默认 30000）、`session_ticket_lifetime_ms`（默认 60000） | 握手配置 | `enable_x25519=false` 时 HELLO/ACK 退回旧线格式；默认策略下还需同时 `allow_legacy_peer=true`，否则 `Open` 拒绝 |
+| `LinkConfig::require_encryption`（**默认 `true`**）、`allow_legacy_peer`（默认 `false`） | 默认安全策略：无 PSK 拒绝启动、旧端默认拒绝 | `require_encryption=false` 是**显式不安全**的明文退化；`allow_legacy_peer=true` 允许无 X25519 公钥的旧端回退纯 PSK（无前向保密） |
+| `bool Link::Connect()`（返回值由 `void` 改为 `bool`，旧代码忽略返回值仍可编译） | 发起握手；策略拒绝时返回 `false` | 原因见 `Link::security_error()`：`kEncryptionRequired` / `kLegacyPeerRejected` / `kInvalidPsk` |
 | `bool SealFrame(const std::uint8_t key[kChaCha20KeyBytes], SecureDirection direction, std::uint32_t seq, const std::uint8_t* inner, std::size_t bytes, std::vector<std::uint8_t>* out)` / `bool OpenFrame(const std::uint8_t key[kChaCha20KeyBytes], SecureDirection direction, ReplayWindow* replay, const std::uint8_t* packet, std::size_t bytes, std::vector<std::uint8_t>* inner, OpenStatus* status)` | 完整内层帧 ↔ 加密外层帧；握手帧另有 `SealHandshakeFrame`/`OpenHandshakeFrame` | `seq` 非 0；外层 16B 头作 AAD，`conn_id` 明文可见并参与认证；`replay` 非空时只有认证成功才 `Accept` |
 | 私有实现：`SendSecureHello()`、`SendSecureHelloAck()`、`HandleSecureHello()`、`HandleSecureHelloAck()`、`GenerateX25519KeyPair()`、`DeriveX25519SessionKeys()`、`ClearX25519Ephemeral()` | 握手收发与 X25519 接线点 | 私有成员，仅用于说明行为，不属于公开契约 |
 
 **帧开销以实现为准**：`kFrameHeaderBytes = 16`（protocol.hpp，v0.2 起含 4B `conn_id`），`kSecureOverheadBytes = 16 + 16 = 32`。`crypto.hpp` 顶部注释与 `PROTOCOL.md` §9.2 的「12B 外层头 / 28B 开销」是历史值，与 `SealFrame`/`OpenFrame` 实现不符。
+
+### 3.6 默认安全策略与迁移（2026-10-30）
+
+`LinkConfig` / `PeerHubConfig` 新增两个字段，默认值即「公网可部署」的安全姿态：
+
+| 字段 | 默认 | 语义 |
+|---|---|---|
+| `require_encryption` | **`true`** | `true`：无 32B PSK 时 `Link::Open`/`PeerHub::Open` 返回 `false`，`Link::Connect`/`PeerHub::Connect` 返回 `false`，`security_error()` 为 `kEncryptionRequired`；监听方丢弃明文 HELLO/HELLO_ACK 且不回 ACK。`false`：显式允许明文（帧头无 MAC、载荷明文），**不安全**，仅限本机调试/迁移期。 |
+| `allow_legacy_peer` | **`false`** | `true`：允许无 X25519 公钥的旧对端回退纯 PSK（仍加密、无前向保密，计 `psk_fallbacks`）；`false`：拒绝旧端并计 `legacy_peer_rejections`。纯 PSK 自配置（`enable_x25519=false`）也必须同时置 `true`，否则 `Open` 以 `kLegacyPeerRejected` 拒绝这对自相矛盾的配置。 |
+
+错误码 `SecurityError`（`crypto.hpp`；`SecurityErrorName()` / `SecurityErrorMessage()` 提供稳定符号名与错误串，`Open` 的 `error` 输出即后者）：
+
+| 值 | 触发点 | 迁移动作 |
+|---|---|---|
+| `kOk` | 无策略错误 | — |
+| `kEncryptionRequired` | `Link::Open/Connect`、`PeerHub::Open/Connect` 在无 PSK 时 | 配置 32B `pre_shared_key`，或用 `KeyStore` + `ApplyPreSharedKey` 在 `Open` **之前**设置 PSK |
+| `kLegacyPeerRejected` | 对端无 X25519 公钥（旧端）；或本端 `enable_x25519=false` 却未 `allow_legacy_peer=true` | 升级对端；或在明确接受「无前向保密」后显式 `allow_legacy_peer=true` |
+| `kInvalidPsk` | `pre_shared_key` 长度不是 32B | 换成 32B PSK（`Link`/`PeerHub` 不接受 16B） |
+
+**迁移清单（从旧版本升级）**
+
+1. 生产/公网：两端配置同一 32B `pre_shared_key`。只做这一步即可启用默认加密（X25519 前向保密默认开启）。
+2. 旧代码「先 `Open` 再 `SetPreSharedKey`」：默认策略下 `Open` 会失败。把 PSK 设置移到 `Open` 之前（`ApplyPreSharedKey` 同样要求先于 `Open`）。
+3. 本机调试/迁移期仍要明文：对相应端点显式 `require_encryption=false`；`Link::insecure_plaintext()` 为 `true` 时便于日志与审计发现。
+4. 必须兼容旧端（无 X25519）：显式 `allow_legacy_peer=true`，并监控 `psk_fallbacks`；`legacy_peer_rejections` 表示默认策略拒绝了多少旧端。
+5. `PeerHub` 的 per-peer PSK：仍要给 Hub 一个默认 32B PSK 作为占位（逐 peer 的 `SetPeerPreSharedKey` 会覆盖它），否则 `PeerHub::Open` 以 `kEncryptionRequired` 拒绝。
+6. 0-RTT：票据恢复出的会话是纯 PSK；`require_encryption` 只约束握手建立，不影响 `Resume` 的密钥派生，但 `enable_x25519=false` 的纯 PSK 配置仍需 `allow_legacy_peer=true` 才能 `Open`。
 
 ## 4. 设计：握手流程、密钥派生与前向保密
 
@@ -110,11 +144,11 @@
 
 1. **客户端发起**：`Connect()` 内 `ResetSecureSession()` → `SecureRandomBytes(m_client_nonce, 16)` → `m_handshake_tx_seq = RandomNonZeroU32()` → `GenerateX25519KeyPair()`（`X25519GeneratePrivateKey` + `X25519PublicKeyFromPrivate`）。生成失败时公钥保持全零，对端按纯 PSK 回退。
 2. **HELLO 封装**：`EncodeHelloBody` 写 magic `"BENT"`、version=1、session、16B nonce、8B 墙钟时间戳，末尾追加 32B 临时公钥（旧布局 36B / 新布局 68B）；`SealHandshakeFrame` 用 `DeriveHandshakeKey(psk, kClientToServer)` 做 AEAD，密文缓存进 `m_cached_hello`，重传复用同一密文（幂等且不重用 `(key, nonce)`）。
-3. **监听方验包**：`HandleSecureHello` → `OpenHandshakeFrame`（失败按 `kAuthFailed` 计 `auth_failures`，否则 `malformed_frames`）→ `DecodeHelloBody` 校验 session → `TimestampAcceptable`（默认 ±30s）→ 相同 client nonce 的重复 HELLO 幂等重发缓存 ACK → `IsKnownClientNonce` 命中则按重放拒绝（最多记 8 个）。
+3. **监听方验包**：`HandleSecureHello` → `OpenHandshakeFrame`（失败按 `kAuthFailed` 计 `auth_failures`，否则 `malformed_frames`）→ `DecodeHelloBody` 校验 session → `TimestampAcceptable`（默认 ±30s）→ **默认策略检查**（`require_encryption && !allow_legacy_peer && 公钥全零` → 计 `legacy_peer_rejections` 并丢弃，不回 ACK）→ 相同 client nonce 的重复 HELLO 幂等重发缓存 ACK → `IsKnownClientNonce` 命中则按重放拒绝（最多记 8 个）。
 4. **监听方 X25519**：若 `enable_x25519 && !IsZeroX25519Key(hello.x25519_public)`，本地生成临时密钥并 `X25519ComputeSharedSecret`；任一失败**不发送 ACK**、计 `auth_failures` 并返回（低阶点失败后绝不降级）。成功则 `DeriveSessionKeyWithX25519` 派生 tx/rx，`SecureZero` 共享密钥与临时私钥，计 `x25519_handshakes`。
 5. **回退分支**：对端公钥全零（旧版本或显式关闭）走 `DeriveSessionKey`，计 `psk_fallbacks`，线格式同时退到旧长度。
 6. **HELLO_ACK**：`HelloAckBody` 回显 client nonce、填 server nonce 与监听方临时公钥，用 `DeriveHandshakeKey(psk, kServerToClient)` 封装；监听方派生完成后即清零私钥，不进入会话状态。
-7. **客户端收尾**：`HandleSecureHelloAck` 校验 session 与 client nonce 一致（不一致按 `auth_failures` 拒绝）、时间戳、握手窗口 `WouldAccept`/`Accept`；公钥非零则 `DeriveX25519SessionKeys`（`X25519ComputeSharedSecret` + `DeriveSessionKeyWithX25519` + `ClearX25519Ephemeral`），失败直接返回、**不降级**；公钥零则 `DeriveSessionKey` 并计 `psk_fallbacks`。
+7. **客户端收尾**：`HandleSecureHelloAck` 校验 session 与 client nonce 一致（不一致按 `auth_failures` 拒绝）、时间戳、**默认策略检查**（公钥全零且未 `allow_legacy_peer` → 计 `legacy_peer_rejections`、`security_error()=kLegacyPeerRejected` 并 `Fail`）；握手窗口 `WouldAccept`/`Accept`；公钥非零则 `DeriveX25519SessionKeys`（`X25519ComputeSharedSecret` + `DeriveSessionKeyWithX25519` + `ClearX25519Ephemeral`），失败直接返回、**不降级**；公钥零（仅显式降级）则 `DeriveSessionKey` 并计 `psk_fallbacks`。
 8. **数据面**：此后 `SealAndSend` 每帧 `SealFrame`（seq 从 1 递增，发送失败也推进），接收端 `OpenFrame` 解密后再走原有 `ParseFrame`/通道逻辑，可靠性语义不变。
 
 **前向保密的实际边界**：X25519 已接线（`afc135a`）。`m_x25519_private` 只在握手窗口内存在，`ClearX25519Ephemeral()` 用 `SecureZero` 清零；会话密钥混入了**双方**临时公钥算出的共享密钥，因此只掌握静态 PSK 的旁观者无法解出该会话（`test_x25519_handshake.cpp` 的 `forward secrecy` 用例验证「仅公钥 + PSK 无法解密」）。`docs/modules/bento-modules.md` 第 51 行仍写「X25519 集成到 crypto HELLO …… 后续可选」，该记录对应更早提交（`046d39f`），已被 `afc135a` 的代码推翻；本文以代码为准。
@@ -139,7 +173,8 @@
 - **算法/长度上限**：AEAD 单帧密文受 `kMaxProbeFrameBytes = 1500` 限制，`kSecureOverheadBytes = 32`；key/nonce/tag 固定 32/12/16B，无变体参数。
 - **常量时间范围**：tag 比较、`ConstantTimeEquals`、Montgomery ladder 条件交换是常数时间；`KeyStore` 的长度分支与 hex/base64 解码不是（长度不视为秘密）。
 - **公钥有效性**：只检查共享密钥全零（RFC 7748 建议的最低限度），不做子群成员/扭曲点检查；更强防护需上层静态密钥或证书，本模块不提供。
-- **客户端临时密钥生成失败会回退纯 PSK**（公钥全零）：连接仍加密但**没有前向保密**，只能通过 `psk_fallbacks` 计数观测；监听方遇到低阶点则拒绝握手、不发 ACK。
+- **客户端临时密钥生成失败会回退纯 PSK**（公钥全零）：连接仍加密但**没有前向保密**，只能通过 `psk_fallbacks` 计数观测；监听方遇到低阶点则拒绝握手、不发 ACK。默认策略（`allow_legacy_peer=false`）下这种对端会被拒绝并计 `legacy_peer_rejections`。
+- **默认策略不是证书**：`require_encryption=true` 只保证「链路加密 + 拒绝旧端」，PSK 仍是唯一身份凭据；它不能防止持 PSK 者冒充任一端，也不解决 PSK 分发。
 - **未实现**：HKDF、Ed25519/ECDSA 签名、公钥证书绑定、密钥协商的双向身份认证、轮换期间的会话迁移、`mlock`/HSM 集成。
 
 ## 7. 测试数据
@@ -155,6 +190,7 @@
 | `test_x25519.cpp` | 47 | RFC 7748 §6.1 Alice/Bob 与 §5.2 标量向量（含 1 次/1000 次迭代）、双向一致性、clamp、最高位忽略、低阶点 0/1/p-1/p/p+1 拒绝、空指针与确定性 |
 | `test_x25519_handshake.cpp` | 179 | KDF 双方一致且共享密钥两半都参与；仅公钥+PSK 无法解密；新旧对端回退；篡改 ACK 公钥致解密失败；低阶点拒绝且不回 ACK；256 轮随机一致性 |
 | `test_keystore.cpp` | 200 | hex/base64 加载与非法输入拒绝、失败不破坏已加载密钥、`Masked()` 前 4 后 4、常量时间比较、轮换窗口、日志/错误不含明文、500 组随机输入 |
+| `test_default_encryption.cpp` | 127 | 默认值（`require_encryption=true`/`allow_legacy_peer=false`）、无 PSK 的 Link/PeerHub 拒绝与错误码、显式明文端到端、默认加密端到端（Link + PeerHub，`psk_fallbacks==0`）、旧监听/旧客户端两个方向的默认拒绝、PeerHub 监听端拒绝零公钥 HELLO、显式 `allow_legacy_peer=true` 后的回退与计数 |
 
 运行：`ctest -R '^bento_'`（在构建目录执行，覆盖全部 `bento_*` 目标）。本文档编写期间**未运行** ctest，因此不声称「已验证通过」。
 
@@ -243,4 +279,4 @@ int main() {
 - [bento-transport.md](./bento-transport.md)：加密帧如何进入 UDP 链路与通道层。
 - [bento-foundation.md](./bento-foundation.md)：`keystore` 错误码、mapping 集成与边界补充（本文不重复）。
 - [bento-scenarios.md](./bento-scenarios.md)：弱网/故障注入等场景下的加密行为。
-- [PROTOCOL.md](../../tests/bento/PROTOCOL.md)：§9.2 加密帧格式、§9.3 PSK 握手与密钥派生。
+- [PROTOCOL.md](../../tests/bento/PROTOCOL.md)：§9.2 加密帧格式、§9.3 PSK 握手与密钥派生、§13 默认加密与迁移。

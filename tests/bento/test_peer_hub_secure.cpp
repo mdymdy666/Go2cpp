@@ -564,7 +564,10 @@ void TestPlaintextRejected() {
     BENTO_CHECK(server.Open(&error));
 
     // 3a. 无 PSK 的明文客户端：HELLO 被拒绝，服务端不创建 peer。
-    PeerHub plain_client(MakeConfig("127.0.0.1", {}));
+    // 这是「故意用明文客户端」的用例，必须显式关闭默认加密策略才能 Open。
+    PeerHubConfig plain_client_config = MakeConfig("127.0.0.1", {});
+    plain_client_config.require_encryption = false;
+    PeerHub plain_client(plain_client_config);
     BENTO_CHECK(plain_client.Open(&error));
     BENTO_CHECK(plain_client.AddPeer(1, "127.0.0.1", server.local_port(), &error));
     PumpFor({&server, &plain_client}, 600);
@@ -631,7 +634,8 @@ void TestPerPeerPsk() {
     BENTO_CHECK(server_a.Open(&error));
     BENTO_CHECK(server_b.Open(&error));
 
-    PeerHub client(MakeConfig("127.0.0.1", {}));
+    // per-peer PSK 仍需一个默认 PSK 才能通过 Open 的默认安全校验。
+    PeerHub client(MakeConfig("127.0.0.1", psk_a));
     BENTO_CHECK(client.Open(&error));
     BENTO_CHECK(client.AddPeer(1, "127.0.0.1", server_a.local_port(), &error));
     BENTO_CHECK(client.AddPeer(2, "127.0.0.1", server_b.local_port(), &error));
@@ -1031,7 +1035,9 @@ void TestPskValidation() {
     BENTO_CHECK(client.peer_secure_ready(1));
 
     // 未配置 PSK 的 peer 在明文模式下保持 secure=false。
-    PeerHub plain(MakeConfig("127.0.0.1", {}));
+    PeerHubConfig plain_config = MakeConfig("127.0.0.1", {});
+    plain_config.require_encryption = false;
+    PeerHub plain(plain_config);
     BENTO_CHECK(plain.Open(&error));
     BENTO_CHECK(plain.AddPeer(1, "127.0.0.1", 9, &error));
     BENTO_CHECK(!plain.peer_secure(1));
@@ -1039,8 +1045,12 @@ void TestPskValidation() {
 
     // 已连接的明文 peer 不会被 Hub 级 PSK「热升级」：否则在途帧会被对端
     // 按明文拒绝。明文会话必须保持可用。
-    PeerHub plain_server(MakeConfig("127.0.0.1", {}));
-    PeerHub plain_client(MakeConfig("127.0.0.1", {}));
+    PeerHubConfig plain_server_config = MakeConfig("127.0.0.1", {});
+    plain_server_config.require_encryption = false;
+    PeerHub plain_server(plain_server_config);
+    PeerHubConfig plain_peer_client_config = MakeConfig("127.0.0.1", {});
+    plain_peer_client_config.require_encryption = false;
+    PeerHub plain_client(plain_peer_client_config);
     BENTO_CHECK(plain_server.Open(&error));
     BENTO_CHECK(plain_client.Open(&error));
     int plain_received = 0;
@@ -1165,6 +1175,9 @@ void TestSecureHelloReplayRejected() {
     PeerHubConfig server_config = MakeConfig("127.0.0.1", psk);
     server_config.peer_timeout_ms = 3000;
     server_config.handshake_replay_window_ms = 30000;
+    // BuildSecureHello 手工构造的 HELLO 不带 X25519 公钥（模拟旧端），
+    // 本用例只验证 nonce 重放，显式允许纯 PSK 降级。
+    server_config.allow_legacy_peer = true;
     PeerHub server(server_config);
     std::string error;
     BENTO_CHECK(server.Open(&error));

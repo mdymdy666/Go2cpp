@@ -617,9 +617,10 @@ void TestPeerHubIntegration() {
     server_config.peer_timeout_ms = 5000;
     PeerHub server(server_config);
     std::string open_error;
-    BENTO_CHECK(server.Open(&open_error));
+    // 默认加密策略：PSK 必须在 Open 之前设置，否则 Open 返回 kEncryptionRequired。
     BENTO_CHECK(ApplyPreSharedKey(server, store.Current()));
     BENTO_CHECK(server.secure());
+    BENTO_CHECK(server.Open(&open_error));
 
     PeerHubConfig client_config;
     client_config.bind_address = "127.0.0.1";
@@ -627,9 +628,9 @@ void TestPeerHubIntegration() {
     client_config.heartbeat_interval_ms = 100;
     client_config.peer_timeout_ms = 5000;
     PeerHub client(client_config);
-    BENTO_CHECK(client.Open(&open_error));
     BENTO_CHECK(ApplyPreSharedKey(client, store.Current()));
     BENTO_CHECK(client.secure());
+    BENTO_CHECK(client.Open(&open_error));
     BENTO_CHECK(client.AddPeer(1, "127.0.0.1", server.local_port(), &open_error));
 
     bool server_connected = false;
@@ -673,6 +674,7 @@ void TestLinkIntegration() {
     Link server(server_config);
     BENTO_CHECK(ApplyPreSharedKey(server, store.Current()));
     std::string open_error;
+    // 默认加密策略：PSK 必须在 Open 之前设置。
     BENTO_CHECK(server.Open(&open_error));
     BENTO_CHECK(server.secure());
 
@@ -686,8 +688,8 @@ void TestLinkIntegration() {
     client_config.handshake_timeout_ms = 3000;
     Link client(client_config);
     BENTO_CHECK(ApplyPreSharedKey(client, store.Current()));
-    BENTO_CHECK(client.Open(&open_error));
     BENTO_CHECK(client.secure());
+    BENTO_CHECK(client.Open(&open_error));
     client.Connect();
 
     const bool connected = bento_test::PumpUntil(

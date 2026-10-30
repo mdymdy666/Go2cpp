@@ -110,7 +110,19 @@ struct PeerHubConfig {
     std::uint32_t random_seed = 0;
     /// STREAM 通道默认配置（与 Link 默认一致：动态 PTO/快速重传/分片/流控）。
     ReliableChannel::Config reliable;
+    /// ---- 默认安全策略（准 P0） ----
+    /// 是否强制加密（**默认 true**）。true 时 `Open` 在没有 32B 默认 PSK
+    /// 时失败并返回 `SecurityError::kEncryptionRequired`；监听端拒绝明文
+    /// HELLO，主动端拒绝明文 HELLO_ACK。
+    /// false = 显式允许明文（旧行为），**不安全**，仅限本机调试/迁移期。
+    /// @note per-peer PSK 场景（`SetPeerPreSharedKey`）仍需给 Hub 配置一个
+    ///       默认 PSK 作为占位，否则 `Open` 会直接拒绝；逐 peer 的值会覆盖它。
+    bool require_encryption = true;
+    /// 显式降级开关（**默认 false**）：允许没有 X25519 公钥的旧端回退
+    /// 纯 PSK（仍是加密，但没有前向保密）。
+    bool allow_legacy_peer = false;
     /// PSK 认证加密：非空时必须 32B，启用后所有 peer 默认走加密握手。
+    /// require_encryption=true（默认）时该字段必填。
     std::vector<std::uint8_t> pre_shared_key;
     /// 握手时间戳容忍窗口（毫秒）；0 = 不校验。依赖双方时钟大致同步。
     std::uint32_t handshake_replay_window_ms = 30000;
@@ -168,6 +180,12 @@ struct PeerSecureStats {
     std::uint64_t plaintext_rejected = 0;  ///< 加密 peer/会话收到的明文帧。
     std::uint64_t handshakes = 0;       ///< 完成的加密握手数。
     std::uint64_t handshake_retries = 0;   ///< 幂等重发的握手包数。
+    std::uint64_t x25519_handshakes = 0;   ///< 用 X25519 前向保密完成的握手数。
+    std::uint64_t psk_fallbacks = 0;       ///< 对端无公钥、回退纯 PSK 的握手数。
+    /// 因 require_encryption=true 且无 PSK 拒绝的明文握手数。
+    std::uint64_t encryption_required_rejections = 0;
+    /// 因对端缺少 X25519 公钥且 allow_legacy_peer=false 拒绝的握手数。
+    std::uint64_t legacy_peer_rejections = 0;
     std::uint64_t encrypted_bytes_sent = 0;
     std::uint64_t encrypted_bytes_received = 0;
 };
@@ -258,6 +276,12 @@ class PeerHub final {
     bool peer_secure_ready(std::uint32_t peer_id) const;
     /// @brief 加密计数器快照（线程安全）。
     PeerSecureStats secure_stats() const;
+
+    /// @brief 最近一次安全策略拒绝的原因；`SecurityError::kOk` 表示没有。
+    /// @details 由 Open/AddPeer/Connect/握手路径写入；下一次 Open 开始时清零。
+    SecurityError security_error() const noexcept {
+        return m_security_error;
+    }
 
     // ---- 日志钩子（P1） ----
     /// @brief 注入日志钩子（传 nullptr 卸载）；不拥有 hook。
@@ -361,6 +385,8 @@ class PeerHub final {
     bool m_secure_enabled = false;
     std::uint8_t m_psk[kPskBytes] = {};
     PeerSecureStats m_secure_stats;
+    /// 最近一次安全策略拒绝原因（kOk = 没有）。
+    SecurityError m_security_error = SecurityError::kOk;
     LogHook* m_log_hook = nullptr;
     /// 正在派发的用户回调嵌套层数；>0 时禁止销毁 peer/通道（PEB-01）。
     int m_callback_depth = 0;

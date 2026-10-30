@@ -94,6 +94,7 @@ void TestIpv6Loopback() {
     }
 
     LinkConfig server_config;
+    server_config.require_encryption = false;
     server_config.bind_address = "::1";
     server_config.heartbeat_interval_ms = 100;
     server_config.peer_timeout_ms = 5000;
@@ -106,6 +107,7 @@ void TestIpv6Loopback() {
     BENTO_CHECK(server.local_port() > 0);
 
     LinkConfig client_config;
+    client_config.require_encryption = false;
     client_config.bind_address = "::1";
     // remote 必须优先于旧字段 peer_address（这里故意给不可达 IPv4）。
     client_config.remote = "::1";

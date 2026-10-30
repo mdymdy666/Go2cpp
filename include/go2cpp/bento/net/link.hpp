@@ -88,7 +88,23 @@ struct LinkConfig {
     bool enable_sack_ext = true;
     /// ABR 回调最小间隔（毫秒）。带宽变化超过 10% 时才回调。
     std::uint32_t abr_interval_ms = 200;
-    /// PSK 认证加密：非空时启用（长度必须 32B）；空 = 明文模式，保持旧线格式。
+    /// ---- 默认安全策略（准 P0） ----
+    /// 是否强制加密（**默认 true**）。true 时：
+    ///  - `Open`/`Connect` 在没有 32B PSK 时失败，返回
+    ///    `SecurityError::kEncryptionRequired`；
+    ///  - 监听方丢弃明文 HELLO 且不回 ACK（拒绝降级尝试）；
+    ///  - 对端没有 X25519 公钥时拒绝握手，除非 `allow_legacy_peer=true`。
+    /// false = 显式允许明文：保留旧行为（帧头无 MAC、载荷明文），
+    /// **不安全**，仅限本机调试/迁移期使用；生产环境不要关闭。
+    bool require_encryption = true;
+    /// 显式降级开关（**默认 false**）。require_encryption=true 时，允许
+    /// 没有 X25519 公钥的旧对端回退纯 PSK：链路仍是加密的（机密性/完整性
+    /// 保留），但失去前向保密。纯 PSK 自配置（`enable_x25519=false`）也
+    /// 必须同时置 true，否则 `Open` 会以 kLegacyPeerRejected 拒绝这对
+    /// 自相矛盾的配置（本端不提供公钥、却要求对端必须提供）。
+    bool allow_legacy_peer = false;
+    /// PSK 认证加密：非空时启用（长度必须 32B）。
+    /// require_encryption=true（默认）时该字段必填；false 时可为空（明文）。
     /// 双方必须配置相同 PSK；监听方未配置 PSK 时无法解密加密 HELLO。
     std::vector<std::uint8_t> pre_shared_key;
     /// 是否在加密握手中附加临时 X25519 公钥（前向保密，默认开启）。
@@ -276,6 +292,10 @@ struct SecureStats {
     std::uint64_t psk_fallbacks = 0;       ///< 对端无公钥、回退纯 PSK 的握手数。
     std::uint64_t encrypted_bytes_sent = 0;
     std::uint64_t encrypted_bytes_received = 0;
+    /// 因 require_encryption=true 且本端无 PSK 而拒绝的明文握手数。
+    std::uint64_t encryption_required_rejections = 0;
+    /// 因对端缺少 X25519 公钥且 allow_legacy_peer=false 而拒绝的握手数。
+    std::uint64_t legacy_peer_rejections = 0;
     std::uint64_t resumptions = 0;       ///< 成功进入 0-RTT 恢复的会话数。
     std::uint64_t zero_rtt_frames = 0;   ///< 0-RTT 恢复后首个飞行内接受的帧数。
     std::uint64_t tickets_exported = 0;  ///< 成功导出的会话票据数。
@@ -312,9 +332,22 @@ class Link final {
     const SecureStats& secure_stats() const noexcept {
         return m_secure_stats;
     }
+    /// @brief 最近一次安全策略拒绝的原因；`SecurityError::kOk` 表示没有。
+    /// @details 由 Open/Connect/握手路径写入；下次 Open/Connect 开始时清零。
+    SecurityError security_error() const noexcept {
+        return m_security_error;
+    }
+    /// @brief 是否处于显式明文模式（require_encryption=false 且无 PSK）。
+    /// @warning 明文模式无机密性、无完整性、无身份认证，仅用于调试/迁移。
+    bool insecure_plaintext() const noexcept;
 
     /// @brief 客户端：发送 HELLO 进入 Connecting。监听方调用无效。
-    void Connect();
+    /// @return 已进入 kConnecting 返回 true；配置/安全策略拒绝返回 false。
+    /// @details require_encryption=true（默认）且没有 PSK 时返回 false，并把
+    ///          `security_error()` 置为 `SecurityError::kEncryptionRequired`。
+    ///          监听方、未 Open、状态非 kIdle 时同样返回 false（安全错误保持
+    ///          kOk，表示不是策略问题）。旧代码忽略返回值仍然兼容。
+    bool Connect();
 
     /// @brief 主动关闭（不触发 on_disconnected）。
     void Close();
@@ -562,6 +595,8 @@ class Link final {
 
     bool m_secure_enabled = false;
     bool m_session_keys_ready = false;
+    /// 最近一次安全策略拒绝原因（kOk = 没有）。
+    SecurityError m_security_error = SecurityError::kOk;
     std::uint8_t m_psk[kPskBytes] = {};
     std::uint8_t m_client_nonce[kHandshakeNonceBytes] = {};
     std::uint8_t m_server_nonce[kHandshakeNonceBytes] = {};

@@ -360,6 +360,38 @@ const std::uint8_t* DirectionLabel(SecureDirection direction) noexcept {
 // 基础密码学原语
 // ---------------------------------------------------------------------------
 
+const char* SecurityErrorName(SecurityError error) noexcept {
+    switch (error) {
+        case SecurityError::kOk:
+            return "kOk";
+        case SecurityError::kEncryptionRequired:
+            return "kEncryptionRequired";
+        case SecurityError::kLegacyPeerRejected:
+            return "kLegacyPeerRejected";
+        case SecurityError::kInvalidPsk:
+            return "kInvalidPsk";
+    }
+    return "kUnknown";
+}
+
+const char* SecurityErrorMessage(SecurityError error) noexcept {
+    switch (error) {
+        case SecurityError::kOk:
+            return "kOk: security policy satisfied";
+        case SecurityError::kEncryptionRequired:
+            return "kEncryptionRequired: encryption is required but no 32-byte "
+                   "pre-shared key is configured (set pre_shared_key or explicitly "
+                   "disable require_encryption, which is insecure)";
+        case SecurityError::kLegacyPeerRejected:
+            return "kLegacyPeerRejected: peer has no X25519 public key and "
+                   "allow_legacy_peer=false (set allow_legacy_peer=true to accept "
+                   "PSK-only legacy peers, which loses forward secrecy)";
+        case SecurityError::kInvalidPsk:
+            return "kInvalidPsk: pre_shared_key must be exactly 32 bytes";
+    }
+    return "kUnknown: unknown security error";
+}
+
 void SecureRandomBytes(std::uint8_t* out, std::size_t bytes) {
     if (out == nullptr || bytes == 0) {
         return;

@@ -405,6 +405,8 @@ if (GO2CPP_WITH_BENTO)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_session_control.cpp)
         add_executable(bento_test_peer_hub_secure
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_peer_hub_secure.cpp)
+        add_executable(bento_test_default_encryption
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_default_encryption.cpp)
         add_executable(bento_test_log_hook
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_log_hook.cpp)
         add_executable(bento_test_link_server
@@ -573,6 +575,7 @@ if (GO2CPP_WITH_BENTO)
                 bento_test_tcp_proxy
                 bento_test_session_control
                 bento_test_peer_hub_secure
+                bento_test_default_encryption
                 bento_test_log_hook
                 bento_test_link_server
                 bento_test_frame
@@ -611,6 +614,7 @@ if (GO2CPP_WITH_BENTO)
         add_test(NAME bento_tcp_proxy COMMAND bento_test_tcp_proxy)
         add_test(NAME bento_session_control COMMAND bento_test_session_control)
         add_test(NAME bento_peer_hub_secure COMMAND bento_test_peer_hub_secure)
+        add_test(NAME bento_default_encryption COMMAND bento_test_default_encryption)
         add_test(NAME bento_log_hook COMMAND bento_test_log_hook)
         add_test(NAME bento_link_server COMMAND bento_test_link_server)
         # 防御包裹：MQTT/CoAP 目标只在测试源文件存在时注册；缺失时跳过，
@@ -670,7 +674,8 @@ if (GO2CPP_WITH_BENTO)
             bento_flow_control bento_bandwidth bento_stats_json bento_ipv6
             bento_concurrent_send bento_conn_migration bento_fec bento_pmtud
             bento_zero_rtt bento_peer_hub bento_tcp_proxy
-            bento_session_control bento_peer_hub_secure bento_log_hook
+            bento_session_control bento_peer_hub_secure bento_default_encryption
+            bento_log_hook
             bento_link_server
             bento_frame bento_heartbeat bento_backoff
             bento_pairing bento_session_table

@@ -25,6 +25,15 @@ namespace {
 /// HELLO / HELLO_ACK 载荷字节数：4B magic + 4B session + 4B conn_id。
 constexpr std::size_t kHelloPayloadBytes = 12;
 
+/// 全零公钥表示本端/对端不提供 X25519 公钥（纯 PSK 回退或旧端）。
+bool IsZeroX25519Key(const std::uint8_t key[kX25519KeyBytes]) noexcept {
+    std::uint8_t accumulator = 0;
+    for (std::size_t i = 0; i < kX25519KeyBytes; ++i) {
+        accumulator = static_cast<std::uint8_t>(accumulator | key[i]);
+    }
+    return accumulator == 0;
+}
+
 /// HELLO / HELLO_ACK 载荷 magic：'B' 'E' 'N' 'T'（与 Link 同格式）。
 bool IsHelloMagic(const std::uint8_t* payload) noexcept {
     return payload != nullptr && payload[0] == 'B' && payload[1] == 'E' && payload[2] == 'N' &&
@@ -173,6 +182,10 @@ struct PeerHub::Peer {
     ReplayWindow handshake_rx_window;
     std::vector<std::uint8_t> cached_hello;      ///< 加密 HELLO（重传幂等）。
     std::vector<std::uint8_t> cached_hello_ack;  ///< 加密 HELLO_ACK（重传幂等）。
+    // ---- X25519 前向保密（默认开启；公钥全零表示本端不提供） ----
+    bool x25519_private_valid = false;  ///< x25519_private 是否仍有效。
+    std::uint8_t x25519_private[kX25519KeyBytes] = {};
+    std::uint8_t x25519_public[kX25519KeyBytes] = {};
 
     // ---- 审查修复：延迟销毁与 HELLO 重放防护 ----
     /// 已进入延迟销毁队列；Connect 重连会清除（仅超时软回收可取消）。
@@ -230,12 +243,23 @@ PeerHub::~PeerHub() {
 
 bool PeerHub::Open(std::string* error) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_security_error = SecurityError::kOk;
+    // 默认安全策略先于 socket 创建校验：无 PSK 的 Hub 不允许出网/监听。
+    if (m_config.require_encryption && !m_secure_enabled &&
+        m_config.pre_shared_key.empty()) {
+        m_security_error = SecurityError::kEncryptionRequired;
+        if (error != nullptr) {
+            *error = SecurityErrorMessage(m_security_error);
+        }
+        return false;
+    }
     std::string local_error;
     if (!m_config.pre_shared_key.empty()) {
         if (!SetPreSharedKey(m_config.pre_shared_key.data(),
                              m_config.pre_shared_key.size())) {
+            m_security_error = SecurityError::kInvalidPsk;
             if (error != nullptr) {
-                *error = "pre_shared_key must be exactly 32 bytes";
+                *error = SecurityErrorMessage(m_security_error);
             }
             return false;
         }
@@ -347,6 +371,9 @@ void PeerHub::ResetChannels(Peer& peer) {
 
 void PeerHub::ResetSecureSession(Peer& peer) {
     peer.session_keys_ready = false;
+    SecureZero(peer.x25519_private, sizeof(peer.x25519_private));
+    peer.x25519_private_valid = false;
+    std::memset(peer.x25519_public, 0, sizeof(peer.x25519_public));
     std::memset(peer.client_nonce, 0, sizeof(peer.client_nonce));
     std::memset(peer.server_nonce, 0, sizeof(peer.server_nonce));
     std::memset(peer.tx_key, 0, sizeof(peer.tx_key));
@@ -531,13 +558,17 @@ void PeerHub::SendHello(Peer& peer) {
             HelloBody body;
             body.session = peer.session_id;
             std::memcpy(body.nonce, peer.client_nonce, kHandshakeNonceBytes);
+            std::memcpy(body.x25519_public, peer.x25519_public, kX25519KeyBytes);
             body.timestamp_ms = WallClockMs();
             std::uint8_t raw[kHelloBodyBytes];
-            if (!EncodeHelloBody(body, raw, sizeof(raw)) ||
+            const std::size_t raw_bytes = IsZeroX25519Key(peer.x25519_public)
+                                              ? kLegacyHelloBodyBytes
+                                              : kHelloBodyBytes;
+            if (!EncodeHelloBody(body, raw, raw_bytes) ||
                 !SealHandshakeFrame(peer.psk, SecureDirection::kClientToServer,
                                     static_cast<std::uint8_t>(FrameType::kHello),
                                     peer.session_id, peer.conn_id, peer.handshake_tx_seq, raw,
-                                    sizeof(raw), &peer.cached_hello)) {
+                                    raw_bytes, &peer.cached_hello)) {
                 ++m_stats.send_errors;
                 EmitLog(LogLevel::kError, LogEvent::kSendError, peer.peer_id,
                         "seal secure hello failed", 0);
@@ -580,6 +611,15 @@ void PeerHub::StartHandshake(Peer& peer) {
         // 被当作当前会话，AEAD nonce 也不会跨会话复用。
         SecureRandomBytes(peer.client_nonce, kHandshakeNonceBytes);
         peer.handshake_tx_seq = RandomNonZeroU32();
+        // 默认提供临时 X25519 公钥（前向保密）。生成失败时公钥保持全零，
+        // 严格对端会按 kLegacyPeerRejected 拒绝——绝不静默降级。
+        X25519GeneratePrivateKey(peer.x25519_private);
+        if (X25519PublicKeyFromPrivate(peer.x25519_private, peer.x25519_public)) {
+            peer.x25519_private_valid = true;
+        } else {
+            SecureZero(peer.x25519_private, sizeof(peer.x25519_private));
+            std::memset(peer.x25519_public, 0, sizeof(peer.x25519_public));
+        }
     }
     SendHello(peer);
 }
@@ -639,6 +679,11 @@ bool PeerHub::Connect(std::uint32_t peer_id) {
         return false;
     }
     Peer& peer = *found->second;
+    if (m_config.require_encryption && !peer.secure_enabled) {
+        // 默认安全：没有 PSK 的 peer 不允许重新发起明文握手。
+        m_security_error = SecurityError::kEncryptionRequired;
+        return false;
+    }
     if (peer.state == PeerState::kConnecting || peer.state == PeerState::kConnected) {
         return false;
     }
@@ -1451,9 +1496,14 @@ void PeerHub::HandleHelloPacket(const std::uint8_t* data, std::size_t bytes,
         HandleSecureHello(data, bytes, outer, from, from_len);
         return;
     }
-    if (m_secure_enabled) {
-        // 加密模式下的明文 HELLO 是降级尝试：不创建 peer、不回 ACK。
+    if (m_secure_enabled || m_config.require_encryption) {
+        // 加密模式（或默认安全策略）下的明文 HELLO 是降级尝试：
+        // 不创建 peer、不回 ACK。
         ++m_secure_stats.plaintext_rejected;
+        if (m_config.require_encryption && !m_secure_enabled) {
+            ++m_secure_stats.encryption_required_rejections;
+            m_security_error = SecurityError::kEncryptionRequired;
+        }
         EmitLog(LogLevel::kWarn, LogEvent::kPlaintextRejected, 0,
                 "plaintext hello rejected in secure mode", bytes);
         return;
@@ -1482,11 +1532,16 @@ void PeerHub::HandleHelloAckPacket(const std::uint8_t* data, std::size_t bytes,
         return;
     }
     Peer* peer = FindByConnId(outer.conn_id);
-    if (peer != nullptr && peer->secure_enabled) {
-        // 加密 peer 的明文 HELLO_ACK：拒绝，避免降级到无认证会话。
+    if ((peer != nullptr && peer->secure_enabled) || m_config.require_encryption) {
+        // 加密 peer（或默认安全策略）的明文 HELLO_ACK：拒绝，避免降级到
+        // 无认证会话。
         ++m_secure_stats.plaintext_rejected;
-        EmitLog(LogLevel::kWarn, LogEvent::kPlaintextRejected, peer->peer_id,
-                "plaintext hello_ack rejected", bytes);
+        if (m_config.require_encryption && (peer == nullptr || !peer->secure_enabled)) {
+            ++m_secure_stats.encryption_required_rejections;
+            m_security_error = SecurityError::kEncryptionRequired;
+        }
+        EmitLog(LogLevel::kWarn, LogEvent::kPlaintextRejected,
+                peer != nullptr ? peer->peer_id : 0, "plaintext hello_ack rejected", bytes);
         return;
     }
     FrameView view;
@@ -1529,7 +1584,17 @@ void PeerHub::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
         ++m_secure_stats.replay_drops;
         return;
     }
+    if (m_config.require_encryption && !m_config.allow_legacy_peer &&
+        IsZeroX25519Key(hello.x25519_public)) {
+        // 默认安全：旧端没有临时公钥 -> 拒绝。不回 HELLO_ACK，发起方按
+        // 握手超时明确失败；绝不静默降级到无前向保密的纯 PSK。
+        ++m_secure_stats.legacy_peer_rejections;
+        EmitLog(LogLevel::kWarn, LogEvent::kHandshakeFailed, 0,
+                "secure hello rejected: legacy peer without x25519 public key", bytes);
+        return;
+    }
     Peer* peer = FindByAddress(from, from_len);
+    bool created_peer = false;
     if (peer != nullptr && peer->state == PeerState::kClosed) {
         // 与明文路径一致：延迟销毁中的记录不允许被 HELLO 复活。
         ++m_stats.unknown_peer_frames;
@@ -1586,6 +1651,7 @@ void PeerHub::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
         peer->outgoing = false;
         peer->session_id = session;
         peer->conn_id = 0;
+        created_peer = true;
     } else if (peer->session_id != session) {
         // 同一地址的新会话（对端重启）：旧通道与旧密钥整体作废。
         if (peer->conn_id != 0) {
@@ -1619,21 +1685,63 @@ void PeerHub::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
         peer->conn_id = chosen;
         m_by_conn_id[chosen] = peer->peer_id;
     }
-    // 新会话：安装加密状态并派生会话密钥（每 peer 独立 nonce -> 独立密钥）。
+    // 新会话：先完成可能失败的 X25519 协商，再提交会话状态（与 Link 一致：
+    // 低阶公钥不能把 peer 污染成半初始化状态）。
     peer->secure_enabled = true;
     std::memcpy(peer->psk, m_psk, kPskBytes);
+    std::uint8_t server_nonce[kHandshakeNonceBytes];
+    SecureRandomBytes(server_nonce, kHandshakeNonceBytes);
+    std::uint8_t tx_key[kChaCha20KeyBytes] = {};
+    std::uint8_t rx_key[kChaCha20KeyBytes] = {};
+    std::uint8_t server_public[kX25519KeyBytes] = {};
+    if (!IsZeroX25519Key(hello.x25519_public)) {
+        std::uint8_t private_key[kX25519KeyBytes];
+        std::uint8_t shared[kX25519KeyBytes];
+        X25519GeneratePrivateKey(private_key);
+        const bool derived =
+            X25519PublicKeyFromPrivate(private_key, server_public) &&
+            X25519ComputeSharedSecret(private_key, hello.x25519_public, shared);
+        SecureZero(private_key, sizeof(private_key));
+        if (!derived) {
+            // 低阶公钥：不发送 ACK（对端按握手超时失败），绝不退回纯 PSK。
+            SecureZero(shared, sizeof(shared));
+            ++m_secure_stats.auth_failures;
+            EmitLog(LogLevel::kWarn, LogEvent::kAuthFailure, peer->peer_id,
+                    "secure hello x25519 derivation failed", bytes);
+            if (created_peer) {
+                ScheduleCleanup(*peer, false);
+            }
+            return;
+        }
+        DeriveSessionKeyWithX25519(peer->psk, shared, hello.nonce, server_nonce,
+                                   SecureDirection::kClientToServer, rx_key);
+        DeriveSessionKeyWithX25519(peer->psk, shared, hello.nonce, server_nonce,
+                                   SecureDirection::kServerToClient, tx_key);
+        SecureZero(shared, sizeof(shared));
+        ++m_secure_stats.x25519_handshakes;
+    } else {
+        // 对端没有临时公钥（旧版本或显式回退）：保持纯 PSK 派生。
+        DeriveSessionKey(peer->psk, hello.nonce, server_nonce, SecureDirection::kClientToServer,
+                         rx_key);
+        DeriveSessionKey(peer->psk, hello.nonce, server_nonce, SecureDirection::kServerToClient,
+                         tx_key);
+        ++m_secure_stats.psk_fallbacks;
+    }
     // PEB-03：记录本次已接受的 nonce 与时间戳（跨会话保留，供旧 HELLO 重放
     // 检测）。必须在安装密钥前更新，保证「已接受」与「已见」一致。
     RememberClientNonce(*peer, hello.nonce);
     peer->last_hello_timestamp_ms = hello.timestamp_ms;
     std::memcpy(peer->client_nonce, hello.nonce, kHandshakeNonceBytes);
-    SecureRandomBytes(peer->server_nonce, kHandshakeNonceBytes);
+    std::memcpy(peer->server_nonce, server_nonce, kHandshakeNonceBytes);
+    std::memcpy(peer->x25519_public, server_public, kX25519KeyBytes);
+    peer->x25519_private_valid = false;
+    SecureZero(peer->x25519_private, sizeof(peer->x25519_private));
     peer->tx_direction = SecureDirection::kServerToClient;
     peer->rx_direction = SecureDirection::kClientToServer;
-    DeriveSessionKey(peer->psk, peer->client_nonce, peer->server_nonce, peer->rx_direction,
-                     peer->rx_key);
-    DeriveSessionKey(peer->psk, peer->client_nonce, peer->server_nonce, peer->tx_direction,
-                     peer->tx_key);
+    std::memcpy(peer->rx_key, rx_key, kChaCha20KeyBytes);
+    std::memcpy(peer->tx_key, tx_key, kChaCha20KeyBytes);
+    SecureZero(tx_key, sizeof(tx_key));
+    SecureZero(rx_key, sizeof(rx_key));
     peer->session_keys_ready = true;
     peer->tx_wire_seq = 0;
     peer->handshake_rx_window.Reset();
@@ -1654,12 +1762,17 @@ void PeerHub::SendSecureHelloAck(Peer& peer) {
         std::memcpy(body.client_nonce, peer.client_nonce, kHandshakeNonceBytes);
         std::memcpy(body.server_nonce, peer.server_nonce, kHandshakeNonceBytes);
         body.timestamp_ms = WallClockMs();
+        std::memcpy(body.x25519_public, peer.x25519_public, kX25519KeyBytes);
         std::uint8_t raw[kHelloAckBodyBytes];
-        if (!EncodeHelloAckBody(body, raw, sizeof(raw)) ||
+        // 回退纯 PSK 时用旧 52B 布局：既兼容旧对端，也让线格式与密钥模式一致。
+        const std::size_t raw_bytes = IsZeroX25519Key(peer.x25519_public)
+                                          ? kLegacyHelloAckBodyBytes
+                                          : kHelloAckBodyBytes;
+        if (!EncodeHelloAckBody(body, raw, raw_bytes) ||
             !SealHandshakeFrame(peer.psk, SecureDirection::kServerToClient,
                                 static_cast<std::uint8_t>(FrameType::kHelloAck),
                                 peer.session_id, peer.conn_id, peer.handshake_tx_seq, raw,
-                                sizeof(raw), &peer.cached_hello_ack)) {
+                                raw_bytes, &peer.cached_hello_ack)) {
             ++m_stats.send_errors;
             EmitLog(LogLevel::kError, LogEvent::kSendError, peer.peer_id,
                     "seal secure hello_ack failed", 0);
@@ -1720,6 +1833,17 @@ void PeerHub::HandleSecureHelloAck(const std::uint8_t* data, std::size_t bytes,
         ++m_secure_stats.replay_drops;
         return;
     }
+    if (m_config.require_encryption && !m_config.allow_legacy_peer &&
+        IsZeroX25519Key(ack.x25519_public)) {
+        // 对端是旧端或显式纯 PSK：默认拒绝，握手不会被标记为完成，peer 会
+        // 在 hello timeout 后进入 kTimedOut 并触发 on_peer_disconnected。
+        ++m_secure_stats.legacy_peer_rejections;
+        m_security_error = SecurityError::kLegacyPeerRejected;
+        EmitLog(LogLevel::kWarn, LogEvent::kHandshakeFailed, peer->peer_id,
+                "secure hello_ack rejected: legacy peer without x25519 public key",
+                bytes);
+        return;
+    }
     if (!peer->handshake_rx_window.WouldAccept(outer.seq)) {
         ++m_secure_stats.replay_drops;
         return;
@@ -1733,10 +1857,35 @@ void PeerHub::HandleSecureHelloAck(const std::uint8_t* data, std::size_t bytes,
     std::memcpy(peer->server_nonce, ack.server_nonce, kHandshakeNonceBytes);
     peer->tx_direction = SecureDirection::kClientToServer;
     peer->rx_direction = SecureDirection::kServerToClient;
-    DeriveSessionKey(peer->psk, peer->client_nonce, peer->server_nonce, peer->tx_direction,
-                     peer->tx_key);
-    DeriveSessionKey(peer->psk, peer->client_nonce, peer->server_nonce, peer->rx_direction,
-                     peer->rx_key);
+    if (!IsZeroX25519Key(ack.x25519_public)) {
+        if (!peer->x25519_private_valid) {
+            // 本端没保留临时私钥却收到带公钥的 ACK：不能降级，直接失败。
+            ++m_secure_stats.auth_failures;
+            return;
+        }
+        std::uint8_t shared[kX25519KeyBytes];
+        if (!X25519ComputeSharedSecret(peer->x25519_private, ack.x25519_public, shared)) {
+            SecureZero(shared, sizeof(shared));
+            ++m_secure_stats.auth_failures;
+            return;
+        }
+        DeriveSessionKeyWithX25519(peer->psk, shared, peer->client_nonce, peer->server_nonce,
+                                   peer->tx_direction, peer->tx_key);
+        DeriveSessionKeyWithX25519(peer->psk, shared, peer->client_nonce, peer->server_nonce,
+                                   peer->rx_direction, peer->rx_key);
+        SecureZero(shared, sizeof(shared));
+        ++m_secure_stats.x25519_handshakes;
+    } else {
+        // allow_legacy_peer=true 才可能走到这里：旧对端没有公钥，回退纯 PSK。
+        DeriveSessionKey(peer->psk, peer->client_nonce, peer->server_nonce, peer->tx_direction,
+                         peer->tx_key);
+        DeriveSessionKey(peer->psk, peer->client_nonce, peer->server_nonce, peer->rx_direction,
+                         peer->rx_key);
+        ++m_secure_stats.psk_fallbacks;
+    }
+    SecureZero(peer->x25519_private, sizeof(peer->x25519_private));
+    peer->x25519_private_valid = false;
+    std::memcpy(peer->x25519_public, ack.x25519_public, kX25519KeyBytes);
     peer->session_keys_ready = true;
     peer->tx_wire_seq = 0;
     peer->data_rx_window.Reset();

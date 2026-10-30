@@ -46,6 +46,8 @@ using go2cpp::bento::PeerHubConfig;
 
 PeerHubConfig MakeConfig(const char* address) {
     PeerHubConfig config;
+    // 本文件聚焦明文链路行为（加密路径由独立测试覆盖），显式关闭默认策略。
+    config.require_encryption = false;
     config.bind_address = address;
     config.bind_port = 0;
     config.heartbeat_interval_ms = 100;

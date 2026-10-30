@@ -444,6 +444,7 @@ void TestReliableChannelTimeout() {
 
 void TestLinkCongestionStatsExport() {
     LinkConfig server_config;
+    server_config.require_encryption = false;
     server_config.bind_address = "127.0.0.1";
     server_config.bind_port = 0;
     server_config.peer_timeout_ms = 5000;
@@ -452,6 +453,7 @@ void TestLinkCongestionStatsExport() {
     BENTO_CHECK(server.Open(&error));
 
     LinkConfig client_config;
+    client_config.require_encryption = false;
     client_config.bind_address = "127.0.0.1";
     client_config.bind_port = 0;
     client_config.peer_address = "127.0.0.1";

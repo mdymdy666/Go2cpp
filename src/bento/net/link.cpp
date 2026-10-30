@@ -554,6 +554,30 @@ Link::~Link() {
 
 bool Link::Open(std::string* error) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_security_error = SecurityError::kOk;
+    // 默认安全策略在打开 socket 之前校验：fail fast，不留下半初始化的监听端。
+    if (m_config.require_encryption && !m_secure_enabled &&
+        m_config.pre_shared_key.empty()) {
+        // 检查运行时状态而不只看配置字段：SetPreSharedKey() 允许在 Open
+        // 之前单独调用（既有 API 契约），这条路径同样满足默认安全策略。
+        m_security_error = SecurityError::kEncryptionRequired;
+        if (error != nullptr) {
+            *error = SecurityErrorMessage(m_security_error);
+        }
+        return false;
+    }
+    if (m_config.require_encryption && !m_config.enable_x25519 &&
+        !m_config.allow_legacy_peer) {
+        // 本端不发公钥却要求对端必须发，是自相矛盾的严格配置：显式降级
+        // 必须同时置 allow_legacy_peer=true，避免「以为自己有前向保密」。
+        m_security_error = SecurityError::kLegacyPeerRejected;
+        if (error != nullptr) {
+            *error =
+                "kLegacyPeerRejected: enable_x25519=false is an explicit PSK-only "
+                "degradation; set allow_legacy_peer=true to acknowledge it";
+        }
+        return false;
+    }
     std::string local_error;
     if (!m_socket.Open(m_config.bind_address, m_config.bind_port, &local_error)) {
         if (error != nullptr) {
@@ -597,8 +621,9 @@ bool Link::Open(std::string* error) {
     if (!m_config.pre_shared_key.empty()) {
         if (!SetPreSharedKey(m_config.pre_shared_key.data(), m_config.pre_shared_key.size())) {
             m_socket.Close();
+            m_security_error = SecurityError::kInvalidPsk;
             if (error != nullptr) {
-                *error = "pre_shared_key must be exactly 32 bytes";
+                *error = SecurityErrorMessage(m_security_error);
             }
             return false;
         }
@@ -607,10 +632,17 @@ bool Link::Open(std::string* error) {
     return true;
 }
 
-void Link::Connect() {
+bool Link::Connect() {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_security_error = SecurityError::kOk;
+    if (m_config.require_encryption && !m_secure_enabled) {
+        // 纵深防御：即使 Open 后被绕过（例如未来放宽 Open 校验），
+        // Connect 也不会把明文 HELLO 发到网上。
+        m_security_error = SecurityError::kEncryptionRequired;
+        return false;
+    }
     if (!m_socket.IsOpen() || m_state != LinkState::kIdle || !m_peer_configured) {
-        return;
+        return false;
     }
     const std::uint64_t now = NowMs();
     m_state = LinkState::kConnecting;
@@ -650,6 +682,11 @@ void Link::Connect() {
         }
     }
     SendHello();
+    return true;
+}
+
+bool Link::insecure_plaintext() const noexcept {
+    return !m_config.require_encryption && !m_secure_enabled;
 }
 
 void Link::Close() {
@@ -723,6 +760,14 @@ bool Link::PeerMatches(const sockaddr_storage& from) const noexcept {
 
 void Link::HandleHello(const FrameView& view, const sockaddr_storage& from,
                        socklen_t from_len) {
+    if (m_config.require_encryption) {
+        // 纵深防御：严格模式（默认）下监听方绝不接受明文 HELLO，也不回
+        // ACK，让发起方按握手超时失败而不是静默降级。正常路径在 Open()
+        // 就因缺少 PSK 被拒绝，这里防的是未来放宽 Open 后重新打开的缺口。
+        ++m_secure_stats.plaintext_rejected;
+        ++m_secure_stats.encryption_required_rejections;
+        return;
+    }
     if (view.payload_bytes < kHelloBaseBytes || !IsHelloMagic(view.payload)) {
         ++m_stats.invalid_frames;
         return;
@@ -2216,6 +2261,13 @@ bool Link::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
         ++m_secure_stats.replay_drops;
         return false;
     }
+    if (m_config.require_encryption && !m_config.allow_legacy_peer &&
+        IsZeroX25519Key(hello.x25519_public)) {
+        // 默认安全：旧端没有临时公钥 -> 拒绝。不回 HELLO_ACK，发起方按
+        // 握手超时明确失败；绝不静默降级到无前向保密的纯 PSK。
+        ++m_secure_stats.legacy_peer_rejections;
+        return false;
+    }
     const bool current_session =
         m_session_keys_ready && hello.session == m_session_id &&
         std::memcmp(hello.nonce, m_client_nonce, kHandshakeNonceBytes) == 0;
@@ -2367,6 +2419,15 @@ bool Link::HandleSecureHelloAck(const std::uint8_t* data, std::size_t bytes,
     }
     if (!TimestampAcceptable(ack.timestamp_ms)) {
         ++m_secure_stats.replay_drops;
+        return false;
+    }
+    if (m_config.require_encryption && !m_config.allow_legacy_peer &&
+        IsZeroX25519Key(ack.x25519_public)) {
+        // 对端是旧端或显式纯 PSK：默认安全策略拒绝，直接让链路失败，
+        // 而不是悄悄丢掉前向保密（allow_legacy_peer=true 才允许回退）。
+        ++m_secure_stats.legacy_peer_rejections;
+        m_security_error = SecurityError::kLegacyPeerRejected;
+        Fail(SecurityErrorMessage(m_security_error));
         return false;
     }
     if (!m_handshake_rx_window.WouldAccept(outer.seq)) {

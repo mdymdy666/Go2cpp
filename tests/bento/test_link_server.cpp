@@ -111,6 +111,8 @@ std::uint32_t VerifyPayload(const std::uint8_t* data, std::size_t bytes, std::ui
 
 PeerHubConfig MakeClientConfig() {
     PeerHubConfig config;
+    // LinkServer 的既有用例是明文链路；显式关闭默认加密策略。
+    config.require_encryption = false;
     config.bind_address = "127.0.0.1";
     config.bind_port = 0;
     config.heartbeat_interval_ms = 100;
@@ -133,6 +135,7 @@ LinkServerConfig MakeServerConfig() {
     config.hub.hello_max_pto_ms = 500;
     config.hub.hello_max_attempts = 16;
     config.hub.max_peers = 8;
+    config.hub.require_encryption = false;
     config.poll_timeout_ms = 2;
     return config;
 }

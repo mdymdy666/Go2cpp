@@ -84,6 +84,7 @@ void RunSackNegotiationCase(bool client_sack, bool server_sack) {
     constexpr std::uint32_t kMessages = 100;
 
     LinkConfig server_config;
+    server_config.require_encryption = false;
     server_config.bind_address = "127.0.0.1";
     server_config.bind_port = 0;
     server_config.heartbeat_interval_ms = 50;
@@ -102,6 +103,7 @@ void RunSackNegotiationCase(bool client_sack, bool server_sack) {
     BENTO_CHECK(proxy.Start(&error));
 
     LinkConfig client_config;
+    client_config.require_encryption = false;
     client_config.bind_address = "127.0.0.1";
     client_config.bind_port = 0;
     client_config.peer_address = "127.0.0.1";
@@ -177,6 +179,7 @@ void RunSackNegotiationCase(bool client_sack, bool server_sack) {
 
 int main() {
     LinkConfig server_config;
+    server_config.require_encryption = false;
     server_config.bind_address = "127.0.0.1";
     server_config.bind_port = 0;
     server_config.heartbeat_interval_ms = 100;
@@ -190,6 +193,7 @@ int main() {
     }
 
     LinkConfig client_config;
+    client_config.require_encryption = false;
     client_config.bind_address = "127.0.0.1";
     client_config.bind_port = 0;
     client_config.peer_address = "127.0.0.1";

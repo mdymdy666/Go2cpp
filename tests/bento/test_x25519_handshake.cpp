@@ -508,6 +508,8 @@ void TestLegacyServerFallback() {
     BENTO_CHECK(legacy.Open("127.0.0.1", 0, &error));
 
     LinkConfig client_config = ClientConfig(legacy.local_port(), psk);
+    // 显式接受无 X25519 公钥的旧服务端（否则默认策略会拒绝）。
+    client_config.allow_legacy_peer = true;
     client_config.hello_initial_pto_ms = 100;
     Link client(client_config);
     BENTO_CHECK(client.Open(&error));
@@ -567,7 +569,10 @@ void TestLegacyServerFallback() {
 void TestLegacyClientFallback() {
     std::printf("[CASE] link: new server falls back to psk against legacy client\n");
     const Psk psk = MakePsk(0x91);
-    Link server(ServerConfig(psk));
+    LinkConfig server_config = ServerConfig(psk);
+    // 显式接受无 X25519 公钥的旧客户端（否则默认策略会拒绝）。
+    server_config.allow_legacy_peer = true;
+    Link server(server_config);
     std::string error;
     BENTO_CHECK(server.Open(&error));
     bool connected = false;
@@ -845,10 +850,12 @@ void TestZeroRttPolicy() {
     {
         LinkConfig server_config = ServerConfig(psk);
         server_config.enable_x25519 = false;
+        server_config.allow_legacy_peer = true;
         Link server(server_config);
         BENTO_CHECK(server.Open(&error));
         LinkConfig client_config = ClientConfig(server.local_port(), psk);
         client_config.enable_x25519 = false;
+        client_config.allow_legacy_peer = true;
         Link client(client_config);
         BENTO_CHECK(client.Open(&error));
         bool server_connected = false;

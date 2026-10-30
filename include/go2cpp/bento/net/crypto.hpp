@@ -135,6 +135,28 @@ enum class OpenStatus : std::uint8_t {
     kNotEncrypted = 4,  ///< 帧未置 kFlagEncrypted。
 };
 
+/// @brief 默认安全策略的安全配置/协商错误码。
+/// @details 与 OpenStatus 分开：OpenStatus 描述「单个加密包为什么打不开」，
+///          SecurityError 描述「这条链路为什么不允许建立」。`Link::Open`、
+///          `Link::Connect`、`PeerHub::Open` 等在拒绝时把对应值写入
+///          `security_error()`，同时把 SecurityErrorMessage() 写进 error
+///          字符串，保证日志与测试能拿到稳定、可检索的原因，而不必解析
+///          自由文本。
+enum class SecurityError : std::uint8_t {
+    kOk = 0,                  ///< 无安全配置错误。
+    kEncryptionRequired = 1,  ///< require_encryption=true 但没有可用的 32B PSK。
+    kLegacyPeerRejected = 2,  ///< 对端没有 X25519 公钥（旧端），且未显式允许降级。
+    kInvalidPsk = 3,          ///< PSK 长度不是 32B（或指针为空）。
+};
+
+/// @brief 错误码的稳定符号名（日志/测试断言用）；未知值返回 "kUnknown"。
+const char* SecurityErrorName(SecurityError error) noexcept;
+
+/// @brief 错误码的稳定错误串，格式 "kXxx: <一句话说明>"。
+/// @details 直接作为 `Open`/`AddPeer` 的 error 输出，调用方可用
+///          `std::strstr(error, "kEncryptionRequired")` 判断类别。
+const char* SecurityErrorMessage(SecurityError error) noexcept;
+
 /// @brief 生成密码学随机字节（std::random_device，无第三方依赖）。
 /// @note 仅在握手/测试等低频路径调用；不要用于每包 nonce 生成。
 void SecureRandomBytes(std::uint8_t* out, std::size_t bytes);

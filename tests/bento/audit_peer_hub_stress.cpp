@@ -206,6 +206,8 @@ void PrintLatency(const char* tag, const std::vector<std::uint32_t>& samples) {
 PeerHubConfig MakeConfig(std::size_t max_peers, std::uint32_t peer_timeout_ms = 3000,
                          std::uint32_t handshake_timeout_ms = 2000) {
     PeerHubConfig config;
+    // 本文件的明文场景显式关闭默认加密策略；加密场景由 MakeSecureConfig 恢复。
+    config.require_encryption = false;
     config.bind_address = "127.0.0.1";
     config.bind_port = 0;
     config.heartbeat_interval_ms = 100;
@@ -858,6 +860,8 @@ std::vector<std::uint8_t> MakePsk(std::uint8_t seed) {
 PeerHubConfig MakeSecureConfig(const std::vector<std::uint8_t>& psk, std::size_t max_peers) {
     PeerHubConfig config = MakeConfig(max_peers, 4000, 2000);
     config.pre_shared_key = psk;
+    // MakeConfig 默认关掉了 require_encryption，加密场景要恢复默认安全策略。
+    config.require_encryption = true;
     return config;
 }
 
@@ -890,6 +894,9 @@ void RunPerPeerPskScenario() {
     }
 
     PeerHubConfig psk_client_config = MakeConfig(8, 4000, 2000);
+    // per-peer PSK 仍需一个默认 PSK 才能通过 Open 的默认安全校验；
+    // 每个 peer 的值随后被 SetPeerPreSharedKey 覆盖。
+    psk_client_config.pre_shared_key = psks[0];
     psk_client_config.bind_address = ClientBindAddress(0);
     PeerHub client(psk_client_config);
     CHECK(client.Open());

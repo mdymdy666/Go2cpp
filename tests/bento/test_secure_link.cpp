@@ -194,7 +194,9 @@ void TestPlaintextClientRejectedBySecureServer() {
     BENTO_CHECK(server.Open(&error));
 
     // 客户端不配置 PSK：HELLO 是明文，安全监听方必须拒绝而不是降级。
+    // 这是「故意混用明文端」的用例，必须显式关闭默认加密策略才能 Open。
     LinkConfig client_config = ClientConfig(server.local_port());
+    client_config.require_encryption = false;
     client_config.hello_initial_pto_ms = 50;
     client_config.hello_max_pto_ms = 100;
     client_config.hello_max_attempts = 3;
@@ -214,7 +216,9 @@ void TestPlaintextClientRejectedBySecureServer() {
 
 void TestSecureClientRejectedByPlaintextServer() {
     const auto psk = MakePsk(0x41);
+    // 明文监听端是显式不安全配置；默认策略下 Open 会直接拒绝。
     LinkConfig server_config = ServerConfig();
+    server_config.require_encryption = false;
     Link server(server_config);
     std::string error;
     BENTO_CHECK(server.Open(&error));

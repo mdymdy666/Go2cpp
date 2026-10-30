@@ -82,6 +82,7 @@ bool HasNumber(const std::map<std::string, double>& values, const char* key) {
 
 void TestStatsAndJson() {
     LinkConfig server_config;
+    server_config.require_encryption = false;
     server_config.bind_address = "127.0.0.1";
     server_config.heartbeat_interval_ms = 100;
     server_config.peer_timeout_ms = 8000;
@@ -94,6 +95,7 @@ void TestStatsAndJson() {
     }
 
     LinkConfig client_config;
+    client_config.require_encryption = false;
     client_config.bind_address = "127.0.0.1";
     client_config.remote = "127.0.0.1";
     client_config.peer_port = server.local_port();

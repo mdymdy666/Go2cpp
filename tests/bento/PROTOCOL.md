@@ -815,3 +815,59 @@ CMakeLists.txt                           +12 行（standalone 分支 + include�
 
 > **2026-10-28 文档终审修正**：上表 7 处表述按 `afc135a` 代码校正（Link 帧类型实为 0x01..0x0A、flags 解码不校验、CRC 引用改为 `net::Frame`、ChannelOpen 的 peer id 校验是硬错误、`Flush` 非公开、队列满丢帧覆盖所有帧、ctest 名为 `bento_session`）。
 
+---
+
+## 13. 默认加密（2026-10-30，准 P0）
+
+> 针对 `docs/reports/2026-10-30-backlog.md` §3「Bento 全链路无加密」。**线格式不变**：
+> 加密帧仍是 §11.1 的 16B 外层头 + 密文 + 16B tag；握手仍是 68B HELLO / 84B HELLO_ACK
+> （X25519）。变化的是**默认策略**与 PeerHub 的 X25519 接线。
+
+### 13.1 默认值
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `LinkConfig::require_encryption` | `true` | 无 32B PSK 时 `Open`/`Connect` 失败（`kEncryptionRequired`）；监听方丢弃明文 HELLO 且不回 ACK |
+| `LinkConfig::allow_legacy_peer` | `false` | 对端无 X25519 公钥时拒绝（`kLegacyPeerRejected`） |
+| `PeerHubConfig::require_encryption` | `true` | 同上；`PeerHub::Open` 无默认 PSK 直接失败 |
+| `PeerHubConfig::allow_legacy_peer` | `false` | 同上 |
+
+`Link::Connect()` 由 `void` 改为 `bool`；源码兼容（忽略返回值仍可编译），策略拒绝时返回
+`false` 并写 `security_error()`。稳定错误码见 `crypto.hpp` 的 `SecurityError`
+（`kOk` / `kEncryptionRequired` / `kLegacyPeerRejected` / `kInvalidPsk`），
+`SecurityErrorMessage()` 生成的字符串直接作为 `Open`/`AddPeer` 的 `error` 输出。
+
+### 13.2 PeerHub 的 X25519
+
+此前 `PeerHub` 的加密握手固定写 32B 全零公钥（纯 PSK）。本次补齐：
+
+- `StartHandshake` 生成临时密钥对，`SendHello` 按公钥是否为零选择 68B/36B 布局；
+- 监听端收到非零公钥时生成临时密钥并 `DeriveSessionKeyWithX25519`，ACK 回发公钥；
+- 客户端按 ACK 公钥派生；`psk_fallbacks` 只在 `allow_legacy_peer=true` 且对端无公钥时增加；
+- 每 peer 的临时私钥在会话建立/重置时 `SecureZero`，不跨会话复用。
+
+### 13.3 旧端兼容与降级
+
+- 旧端（无 X25519 公钥）在默认策略下**两个方向都拒绝**：监听端收到零公钥 HELLO 不回
+  ACK（计 `legacy_peer_rejections`），客户端收到零公钥 ACK 立即 `Fail`
+  （`security_error()==kLegacyPeerRejected`）。
+- 显式降级：两端各自配置 `allow_legacy_peer=true` 后回退纯 PSK，链路仍加密但没有前向保密，
+  计 `psk_fallbacks`。纯 PSK 自配置（`enable_x25519=false`）必须同时置
+  `allow_legacy_peer=true`，否则 `Open` 以 `kLegacyPeerRejected` 拒绝。
+- 明文：`require_encryption=false` 显式保留旧行为（帧头无 MAC、载荷明文），**不安全**，
+  不要在公网使用；`Link::insecure_plaintext()` 可观测。
+
+### 13.4 迁移
+
+1. 两端配置同一 32B PSK（`pre_shared_key` 或 `KeyStore` + `ApplyPreSharedKey`），且**在 `Open` 之前**设置。
+2. 旧端未升级时按 §13.3 显式 `allow_legacy_peer=true`，并监控 `psk_fallbacks` / `legacy_peer_rejections`。
+3. 本机调试需要明文时显式 `require_encryption=false`。
+4. per-peer PSK 的 `PeerHub` 仍需默认 PSK 占位（逐 peer 覆盖）。
+5. 0-RTT 票据恢复出的会话是纯 PSK；`Resume` 不受 `require_encryption` 影响，但纯 PSK 配置仍需 `allow_legacy_peer=true` 才能 `Open`。
+
+### 13.5 测试
+
+`bento_default_encryption`（`tests/bento/test_default_encryption.cpp`，127 checks）覆盖：
+默认值断言、无 PSK 的 Link/PeerHub 拒绝、显式明文端到端、默认加密端到端（Link + PeerHub，
+断言 `psk_fallbacks==0`）、旧监听/旧客户端两个方向的默认拒绝、PeerHub 监听端拒绝零公钥
+HELLO、显式 `allow_legacy_peer=true` 后的回退与计数。完整回归见 `ctest -R bento`。

@@ -153,6 +153,9 @@ int main(int argc, char** argv) {
 
     // 调参覆盖：只改显式给出的项，其余保持库默认。
     auto apply_tuning = [&options](LinkConfig& config) {
+        // 弱网探针是性能对照工具，不承载生产数据；显式关闭默认加密策略
+        // （require_encryption=false）以保留纯明文基线，避免与加密开销混淆。
+        config.require_encryption = false;
         // 对照实验：关闭能力协商后双方只发 32 位位图 ACK（旧端行为）。
         config.enable_sack_ext = !options.no_sack;
         if (options.initial_cwnd != 0) {
