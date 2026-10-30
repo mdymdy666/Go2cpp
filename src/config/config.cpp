@@ -1119,8 +1119,8 @@ bool BindRuntimeConfig(Config& config, RuntimeConfig* target, std::string* error
             const auto warn_it = candidates.find("timer.warn_after_days");
             const auto error_it = candidates.find("timer.error_after_days");
             if (warn_it == candidates.end() || error_it == candidates.end() ||
-                !ValueCodec<std::size_t>::Decode(warn_it->second, &warn) ||
-                !ValueCodec<std::size_t>::Decode(error_it->second, &error)) {
+                !ConfigDecode<std::size_t>(warn_it->second, &warn) ||
+                !ConfigDecode<std::size_t>(error_it->second, &error)) {
                 if (validation_error) *validation_error = "timer 阈值候选值转换失败";
                 return false;
             }

@@ -22,6 +22,10 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
 endif()
 
 include(cmake/Go2CppOptions.cmake)
+# Reflect 库定义必须在 Modules 之前：go2cpp_config 的配置编解码依赖
+# go2cpp_reflect（字段反射 + JSON + ReflectCodec）。测试目标放在
+# Go2CppReflectTests.cmake，于 Bento 之后 include。
+include(cmake/Go2CppReflect.cmake)
 include(cmake/Go2CppModules.cmake)
 # 内核监控模块（go2cpp::os::monitor，eBPF）：需要在 Modules 之后定义（依赖
 # network/scheduler/channel 目标）；eBPF 不可用时自动降级为仅 /proc 采集。
@@ -47,5 +51,5 @@ endif()
 # -DGO2CPP_WITH_BENTO=ON 构建 go2cpp_bento 与测试。
 include(cmake/Go2CppBento.cmake)
 
-# Reflect 序列化模块（TypeId/Registry + 序列化 + 压缩 + 格式化 + 帧对接）。
-include(cmake/Go2CppReflect.cmake)
+# Reflect 测试（帧对接测试优先复用 go2cpp_bento，因此必须在 Bento 之后）。
+include(cmake/Go2CppReflectTests.cmake)

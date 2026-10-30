@@ -86,6 +86,14 @@ struct SoReloadResult final {
     bool applied{false};            ///< 是否真的提交了一代（同 revision 幂等命中为 false；ForceRescan 为 true）
     std::uint64_t revision{0};      ///< 本次尝试的 manifest revision
     std::vector<std::string> loaded;  ///< 本次新加载并提交的 SO 名（失败时为空）
+    /**
+     * @brief SO 名 → 本次变化的 artifact 字段名（按 `FieldDescriptor` 顺序）。
+     * @details 字段名来自 `SoArtifactIdentity` 的字段表（`version`、`path`、
+     *          `sha256`、`abi_version`、`symbol_prefix`、`group`、
+     *          `dependencies`）。新增的 SO 标记为全部字段；未被重新加载的 SO
+     *          不出现在表里。失败事务不填充（`ok == false`）。
+     */
+    std::map<std::string, std::vector<std::string>> changed_fields;
     std::string error;              ///< 首条中文诊断；成功时为空
 
     /// 便于 `if (const auto result = reloader.Reload(m))` 使用。

@@ -16,7 +16,8 @@
  * ## 本文件定义什么
  *
  * - `IniFile`：section/key/value 解析与查询，不做类型转换、范围校验或同步；
- * - `ValueCodec`：字符串与 bool/Level/vector 等类型的编解码；
+ * - `ConfigEncode`/`ConfigDecode`（`config_codec.hpp`）：统一委托 Reflect 的
+ *   字段反射 + JSON 文本编解码，支持旧配置兼容与结构体配置；
  * - `ConfigVarBase`/`ConfigVar<T>`：强类型、可校验、可监听、支持事务暂存的配置项；
  * - `Config`：进程级注册表 + 文件监听 + 两阶段提交（预检→写入→统一通知）；
  * - `RuntimeConfig`/`LoadRuntimeConfig`：调度器/日志/定时器阈值的只读快照；
@@ -42,6 +43,7 @@
 // 简单、可审查的 ini 配置。解析器只处理 section、key=value 和注释，避免
 // 引入 YAML 等重量依赖；运行时配置在加载后统一校验，再交给各模块应用。
 
+#include "go2cpp/config/config_codec.hpp"
 #include "go2cpp/log.hpp"
 #include "go2cpp/scheduler/scheduler.hpp"
 
@@ -55,9 +57,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
-#include <sstream>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -102,90 +104,9 @@ private:
     std::unordered_map<std::string, Section> m_sections;  ///< 节/键/值表；Load/Parse 整体替换（swap），Get/Has 只读；无锁，调用方需自行同步
 };
 
-/** @brief 默认配置值与字符串之间的流式转换器。 */
-/**
- * ## 定位
- * `ConfigVar<T>` 的文本编解码策略：`ToString`/`ValidateString`/`FromString` 都经
- * 由它。主模板面向可流式输入输出的标量，`std::string`/`bool`/`log::Level`/
- * `std::vector<T>` 各有特化。
- *
- * ## 不变量
- * - `Decode` 必须消费**整个**文本（`stream >> ws` 后要求 eof），否则 `"1x"` 会
- *   被误读成 `1`；
- * - `Decode` 失败不得修改输出参数；`Encode` 的结果必须能被同一 `Decode` 读回。
- */
-template <typename T>
-struct ValueCodec {
-    /** @brief 将配置值编码为文本。 */
-    static std::string Encode(const T& value) {
-        std::ostringstream stream;
-        stream << value;
-        return stream.str();
-    }
-    /** @brief 从文本解码配置值。@return 成功返回 true。 */
-    static bool Decode(const std::string& text, T* value) {
-        if (!value) return false;
-        std::istringstream stream(text);
-        T parsed{};
-        stream >> parsed;
-        if (stream.fail()) return false;
-        stream >> std::ws;
-        if (!stream.eof()) return false;
-        *value = std::move(parsed);
-        return true;
-    }
-};
-
-template <>
-struct ValueCodec<std::string> {
-    /** @brief 原样编码字符串。 */
-    static std::string Encode(const std::string& value) { return value; }
-    /** @brief 将文本写入字符串。 */
-    static bool Decode(const std::string& text, std::string* value) { if (!value) return false; *value = text; return true; }
-};
-
-template <>
-struct ValueCodec<bool> {
-    /** @brief 编码布尔值为 true/false。 */
-    static std::string Encode(bool value) { return value ? "true" : "false"; }
-    /** @brief 解析常见布尔文本。 */
-    static bool Decode(const std::string& text, bool* value) {
-        if (!value) return false;
-        std::string clean = text;
-        for (auto& character : clean) if (character >= 'A' && character <= 'Z') character = static_cast<char>(character - 'A' + 'a');
-        if (clean == "1" || clean == "true" || clean == "yes" || clean == "on") *value = true;
-        else if (clean == "0" || clean == "false" || clean == "no" || clean == "off") *value = false;
-        else return false;
-        return true;
-    }
-};
-
-template <>
-struct ValueCodec<log::Level> {
-    /** @brief 编码日志级别。 */
-    static std::string Encode(log::Level value) { return log::ToString(value); }
-    /** @brief 解析日志级别文本。 */
-    static bool Decode(const std::string& text, log::Level* value) { return log::ParseLevel(text, value); }
-};
-
-template <typename T>
-struct ValueCodec<std::vector<T>> {
-    /** @brief 以逗号分隔编码列表。 */
-    static std::string Encode(const std::vector<T>& value) {
-        std::ostringstream stream;
-        for (std::size_t i = 0; i < value.size(); ++i) { if (i) stream << ','; stream << ValueCodec<T>::Encode(value[i]); }
-        return stream.str();
-    }
-    /** @brief 解析逗号分隔列表。 */
-    static bool Decode(const std::string& text, std::vector<T>* value) {
-        if (!value) return false;
-        std::vector<T> parsed;
-        std::istringstream stream(text); std::string item;
-        while (std::getline(stream, item, ',')) { T element{}; if (!ValueCodec<T>::Decode(item, &element)) return false; parsed.push_back(std::move(element)); }
-        *value = std::move(parsed); return true;
-    }
-};
-
+// 配置值的文本编解码统一在 config_codec.hpp：`ConfigEncode`/`ConfigDecode`
+// 委托 Reflect（字段反射 + JSON 文本；结构体走 ReflectCodec 文本消息），
+// 旧的流式 ValueCodec 已移除。
 // 配置变量的非模板接口。Config 中保存它的智能指针，热加载器通过本类
 // 完成枚举、字符串校验和写入，而具体类型由 ConfigVar<T> 提供。
 /** @brief 配置变量的非模板基类，提供统一字符串校验和加载接口。 */
@@ -241,13 +162,17 @@ private:
 struct RuntimeConfig;
 
 template <typename T>
-// 强类型、可监听的配置变量。依赖 ValueCodec<T> 做文本转换，以不可变
-// shared_ptr 发布读取快照，以互斥量保护校验器和监听器；向上层提供无锁
-//（原子 shared_ptr 读）读取、范围校验和变更通知。
+// 强类型、可监听的配置变量。文本转换委托 ConfigEncode/ConfigDecode（Reflect
+// 字段反射 + JSON），以不可变 shared_ptr 发布读取快照，以互斥量保护校验器
+// 和监听器；向上层提供无锁（原子 shared_ptr 读）读取、范围校验和变更通知。
+// 值相等判断走 ConfigValuesEqual：结构体按字段表逐字段比较，无需手写
+// operator==。
 /**
  * @brief 线程安全的强类型配置变量。
  * @details Validator 在提交前校验，Listener 在成功变更后通知；值以共享
- *          指针原子发布，读操作不长时间持有配置锁。
+ *          指针原子发布，读操作不长时间持有配置锁。`T` 可以是内置标量、
+ *          `std::vector`、`log::Level`，也可以是带 `GO2CPP_REFLECT_FIELD`
+ *          字段表的结构体（嵌套结构体同样支持）。
  */
 /**
  * ## 定位
@@ -308,7 +233,7 @@ public:
               return false;
           }
           const auto current = std::atomic_load_explicit(&m_value, std::memory_order_acquire);
-          if (current && *current == value) return true;
+          if (current && ConfigValuesEqual(*current, value)) return true;
           old_value = current ? *current : T{};
           std::atomic_store_explicit(&m_value, std::make_shared<const T>(value),
                                      std::memory_order_release);
@@ -349,14 +274,16 @@ public:
     /** @brief 删除指定监听器。 */
     void DelListener(std::uint64_t id) { std::lock_guard<std::mutex> lock(m_mutex); m_listeners.erase(id); }
     /** @brief 将当前值编码为字符串。 */
-    std::string ToString() const override { return ValueCodec<T>::Encode(GetValue()); }
+    std::string ToString() const override {
+        std::string text;
+        std::string encode_error;
+        (void)ConfigEncode(GetValue(), &text, &encode_error);
+        return text;
+    }
     /** @brief 校验文本而不修改当前值。 */
     bool ValidateString(const std::string& value, std::string* error = nullptr) const override {
         T parsed{};
-        if (!ValueCodec<T>::Decode(value, &parsed)) {
-            if (error) *error = "配置值转换失败: " + name();
-            return false;
-        }
+        if (!DecodeText(value, &parsed, error)) return false;
         Validator validator;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -368,7 +295,7 @@ public:
     /** @brief 校验并从文本应用新值。 */
     bool FromString(const std::string& value, std::string* error = nullptr) override {
         T parsed{};
-        if (!ValueCodec<T>::Decode(value, &parsed)) { if (error) *error = "配置值转换失败: " + name(); return false; }
+        if (!DecodeText(value, &parsed, error)) return false;
         return SetValue(parsed, error);
     }
 
@@ -380,10 +307,7 @@ public:
      */
     bool ApplyString(const std::string& value, std::string* error = nullptr) override {
         T parsed{};
-        if (!ValueCodec<T>::Decode(value, &parsed)) {
-            if (error) *error = "配置值转换失败: " + name();
-            return false;
-        }
+        if (!DecodeText(value, &parsed, error)) return false;
         Validator validator;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -400,7 +324,7 @@ public:
             return false;
         }
         const auto current = std::atomic_load_explicit(&m_value, std::memory_order_acquire);
-        if (current && *current == parsed) {
+        if (current && ConfigValuesEqual(*current, parsed)) {
             m_pending.reset();
             return true;
         }
@@ -474,6 +398,26 @@ public:
     }
 
 private:
+    /**
+     * @brief 统一的文本解码入口：ConfigDecode + 变量名诊断。
+     * @details 把 Reflect 的字段级诊断（未知字段/类型不符/越界）拼上完整
+     *          配置名，调用方（INI 事务、热加载）能直接指出是哪一项坏了。
+     * @return 解码成功返回 true；失败时 `*parsed` 保持不变。
+     */
+    bool DecodeText(const std::string& text, T* parsed, std::string* error) const {
+        std::string decode_error;
+        if (ConfigDecode<T>(text, parsed, &decode_error)) {
+            return true;
+        }
+        if (error != nullptr) {
+            *error = "配置值转换失败: " + name();
+            if (!decode_error.empty()) {
+                *error += "（" + decode_error + "）";
+            }
+        }
+        return false;
+    }
+
     struct PendingChange {
         // 保存旧快照而不是旧值副本，回滚时无需再次分配 T，能够在
         // bad_alloc 等异常路径下保持 noexcept 回滚的确定性。

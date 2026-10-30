@@ -74,6 +74,54 @@ struct SoSpec final {
 };
 
 /**
+ * @brief `SoSpec` 的 artifact 身份视图：**字段级 diff** 的比较对象。
+ *
+ * ## 定位
+ * `SameSoArtifact` 与 `SoReloader` 的变更诊断都通过本结构做字段级比较：
+ * 字段表由 `GO2CPP_REFLECT_FIELD` 生成，比较时直接使用
+ * `ConfigFieldDiff`（`FieldDescriptor` 的名称/偏移/大小），不再手写一长串
+ * `left.xxx == right.xxx`。
+ *
+ * ## 为什么用独立视图而不是直接反射 `SoSpec`
+ * `SoSpec::dependencies` 是 `std::vector<std::string>`，Reflect 没有它的
+ * 字段级序列化；这里把依赖排序后连接成一个字符串字段，既保留了「集合语义」
+ * （顺序无关），又让所有字段都能参与统一的字段级比较。
+ *
+ * ## 不变量
+ * - 只包含影响「是否需要重新加载」的字段：`group`/`path`/`sha256`/`version`/
+ *   `abi_version`/`symbol_prefix`/`dependencies`；
+ * - `keep_versions`/`retire_policy`/`candidate` 不在视图里，它们变化不触发
+ *   `dlopen`（与既有 `SameSoArtifact` 语义一致）。
+ */
+struct SoArtifactIdentity final {
+    std::string group;          ///< 依赖组名。
+    std::string path;           ///< 版本化文件路径。
+    std::string sha256;         ///< 文件内容 SHA-256。
+    std::string version;        ///< 版本标识。
+    std::string abi_version;    ///< manifest 声明 ABI。
+    std::string symbol_prefix;  ///< 符号前缀。
+    std::string dependencies;   ///< 依赖名按字典序以 `\n` 连接；顺序无关。
+};
+
+/** @brief 由 spec 构造 artifact 身份视图（依赖排序后连接）。 */
+SoArtifactIdentity ArtifactIdentityOf(const SoSpec& spec);
+
+/**
+ * @brief 返回两个 spec 的字段级差异（变化字段名，按字段表顺序）。
+ * @details 名称来自 `FieldDescriptor::name`，可直接写进热更日志/事务结果。
+ *          完全相同时返回空列表。
+ */
+std::vector<std::string> SoArtifactFieldChanges(const SoSpec& left,
+                                                const SoSpec& right);
+
+/**
+ * @brief 返回 artifact 字段表的全部字段名（按字段表顺序）。
+ * @details 新增 SO 没有旧版本可比，`SoReloader` 用它把「全部字段都是新的」
+ *          记进 `SoReloadResult::changed_fields`。
+ */
+std::vector<std::string> SoArtifactFieldNames();
+
+/**
  * @brief 一条静态校验诊断。
  *
  * ## 定位
@@ -201,9 +249,11 @@ public:
  * @brief 判断两个 spec 是否需要重新加载（artifact 身份是否变化）。
  *
  * ## 定位
- * `SoReloader` 计算变更集时使用。只比较会影响已加载代码的字段：`group`、
- * `path`、`sha256`、`version`、`abi_version`、`symbol_prefix`、排序后的
- * `dependencies`。`keep_versions`/`retire_policy`/`candidate` 变化不触发 `dlopen`。
+ * `SoReloader` 计算变更集时使用。实现走
+ * `ConfigFieldDiff(ArtifactIdentityOf(left), ArtifactIdentityOf(right))`：
+ * 逐字段比较 `group`、`path`、`sha256`、`version`、`abi_version`、
+ * `symbol_prefix`、排序后的 `dependencies`。`keep_versions`/`retire_policy`/
+ * `candidate` 变化不触发 `dlopen`。
  *
  * ## 并发/失败语义
  * 纯函数，不分配除字符串比较外的资源；不抛异常（`noexcept` 仅用于声明
@@ -212,3 +262,29 @@ public:
 bool SameSoArtifact(const SoSpec& left, const SoSpec& right);
 
 }  // namespace go2cpp::config
+
+/**
+ * @brief `SoArtifactIdentity` 的字段表：字段级 diff 的字段来源。
+ * @details `kName` 用于 Reflect 文本消息的类型路由；`kId` 落在动态类型区
+ *          （>= 16），本模块不注册到全局 `TypeRegistry`，因此不会与业务类型
+ *          抢占 id —— 它只被本文件的 `ConfigFieldDiff` 使用。
+ */
+template <>
+struct go2cpp::reflect::FieldList<go2cpp::config::SoArtifactIdentity> {
+    static constexpr go2cpp::reflect::TypeId kId = 200;
+    static constexpr const char* kName = "SoArtifactIdentity";
+
+    static const go2cpp::reflect::FieldDescriptor* Fields(std::size_t& count) {
+        static const go2cpp::reflect::FieldDescriptor fields[] = {
+            GO2CPP_REFLECT_FIELD(go2cpp::config::SoArtifactIdentity, group),
+            GO2CPP_REFLECT_FIELD(go2cpp::config::SoArtifactIdentity, path),
+            GO2CPP_REFLECT_FIELD(go2cpp::config::SoArtifactIdentity, sha256),
+            GO2CPP_REFLECT_FIELD(go2cpp::config::SoArtifactIdentity, version),
+            GO2CPP_REFLECT_FIELD(go2cpp::config::SoArtifactIdentity, abi_version),
+            GO2CPP_REFLECT_FIELD(go2cpp::config::SoArtifactIdentity, symbol_prefix),
+            GO2CPP_REFLECT_FIELD(go2cpp::config::SoArtifactIdentity, dependencies),
+        };
+        count = sizeof(fields) / sizeof(fields[0]);
+        return fields;
+    }
+};

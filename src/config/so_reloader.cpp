@@ -333,6 +333,19 @@ SoReloadResult SoReloader::ReloadImpl(const SoManifest& manifest,
     }
 
     std::vector<std::string> changed_names(changed.begin(), changed.end());
+    // 字段级 diff：变更判定已经由 SameSoArtifact（反射字段表）完成，这里把
+    // 「哪几个字段变了」一并记录下来，供诊断/日志与调用方观察。
+    std::map<std::string, std::vector<std::string>> changed_fields;
+    for (const auto& name : changed_names) {
+        const auto next = manifest.specs.find(name);
+        if (next == manifest.specs.end()) continue;
+        const auto old = current.specs.find(name);
+        if (old == current.specs.end()) {
+            changed_fields[name] = SoArtifactFieldNames();
+        } else {
+            changed_fields[name] = SoArtifactFieldChanges(old->second, next->second);
+        }
+    }
     std::vector<std::string> order;
     if (!manifest.BuildLoadOrder(changed_names, &order, &validation_error)) {
         return fail(validation_error);
@@ -448,6 +461,7 @@ SoReloadResult SoReloader::ReloadImpl(const SoManifest& manifest,
     result.applied = true;
     result.revision = manifest.revision;
     result.loaded = std::move(loaded);
+    result.changed_fields = std::move(changed_fields);
     return result;
 }
 

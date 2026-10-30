@@ -658,12 +658,58 @@ bool SoManifest::HashFile(const std::string& path, std::string* hex,
     return true;
 }
 
+SoArtifactIdentity ArtifactIdentityOf(const SoSpec& spec) {
+    // 依赖顺序不构成语义：排序后连接成一个字符串字段，既保留「集合」语义，
+    // 又让字段表只含可序列化的标量，能直接参与统一的字段级 diff。
+    std::vector<std::string> dependencies = spec.dependencies;
+    std::sort(dependencies.begin(), dependencies.end());
+    std::string joined;
+    for (const auto& dependency : dependencies) {
+        if (!joined.empty()) {
+            joined += '\n';
+        }
+        joined += dependency;
+    }
+    SoArtifactIdentity identity;
+    identity.group = spec.group;
+    identity.path = spec.path;
+    identity.sha256 = spec.sha256;
+    identity.version = spec.version;
+    identity.abi_version = spec.abi_version;
+    identity.symbol_prefix = spec.symbol_prefix;
+    identity.dependencies = std::move(joined);
+    return identity;
+}
+
+std::vector<std::string> SoArtifactFieldChanges(const SoSpec& left,
+                                                const SoSpec& right) {
+    const std::vector<ConfigFieldChange> changes = ConfigFieldDiff(
+        ArtifactIdentityOf(left), ArtifactIdentityOf(right));
+    std::vector<std::string> names;
+    names.reserve(changes.size());
+    for (const auto& change : changes) {
+        names.push_back(change.name);
+    }
+    return names;
+}
+
+std::vector<std::string> SoArtifactFieldNames() {
+    std::size_t count = 0;
+    const go2cpp::reflect::FieldDescriptor* fields =
+        go2cpp::reflect::FieldList<SoArtifactIdentity>::Fields(count);
+    std::vector<std::string> names;
+    names.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        names.emplace_back(fields[index].name);
+    }
+    return names;
+}
+
 bool SameSoArtifact(const SoSpec& left, const SoSpec& right) {
-    return left.group == right.group && left.path == right.path &&
-           left.sha256 == right.sha256 && left.version == right.version &&
-           left.abi_version == right.abi_version &&
-           left.symbol_prefix == right.symbol_prefix &&
-           left.dependencies == right.dependencies;
+    // 字段级比较：字段表由 GO2CPP_REFLECT_FIELD 生成，新增/调整参与比较的
+    // artifact 字段只需改 FieldList，不再同步维护一长串手写比较链。
+    return ConfigFieldDiff(ArtifactIdentityOf(left), ArtifactIdentityOf(right))
+        .empty();
 }
 
 }  // namespace go2cpp::config

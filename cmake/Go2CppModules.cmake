@@ -69,6 +69,7 @@ add_library(go2cpp_network
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/http2/connection.cpp)
 add_library(go2cpp_config
     ${CMAKE_CURRENT_SOURCE_DIR}/src/config/config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/config/config_codec.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/config/so_manifest.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/config/so_reloader.cpp)
 
@@ -257,6 +258,10 @@ set(GO2CPP_MODULE_TARGETS
     go2cpp_network
     go2cpp_log
     go2cpp_config
+    # go2cpp_config 的公共头（config_codec.hpp）与模板实例化依赖 Reflect；
+    # 它必须随 config 一起安装/导出，否则 install(EXPORT) 会因
+    # 「go2cpp_config 依赖不在导出集的 go2cpp_reflect」而失败。
+    go2cpp_reflect
     go2cpp_os
     go2cpp_math
     go2cpp_rand
@@ -306,7 +311,7 @@ target_include_directories(go2cpp_runtime INTERFACE
 target_link_libraries(go2cpp_context PUBLIC go2cpp_error go2cpp_scheduler)
 target_link_libraries(go2cpp_channel PUBLIC go2cpp_context go2cpp_error)
 target_link_libraries(go2cpp_scheduler PUBLIC go2cpp_fiber go2cpp_log)
-target_link_libraries(go2cpp_config PUBLIC go2cpp_scheduler go2cpp_log go2cpp_hash)
+target_link_libraries(go2cpp_config PUBLIC go2cpp_scheduler go2cpp_log go2cpp_hash go2cpp_reflect)
 if (GO2CPP_NATIVE_CONTEXT)
     # Linux x86_64 uses the internal context ABI; it no longer needs the
     # Boost.Context protected-stack implementation at link time.
