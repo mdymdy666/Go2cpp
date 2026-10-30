@@ -446,7 +446,6 @@ void TestPipelineScenario() {
 // 因此默认不生成 main；需要独立运行时手动定义
 // -DGO2CPP_CHANNEL_BATCH_STANDALONE 并链接 go2cpp_channel 等库。
 #if defined(GO2CPP_CHANNEL_BATCH_STANDALONE)
-#ifdef GO2CPP_CHANNEL_BATCH_STANDALONE
 int main() {
   std::printf("[channel-batch] 开始批量 API 正确性测试\n");
   TestBasicOrder();
@@ -462,5 +461,4 @@ int main() {
               failures == 0 ? "（通过）" : "（失败）");
   return failures == 0 ? 0 : 1;
 }
-#endif  // GO2CPP_CHANNEL_BATCH_STANDALONE
 #endif  // GO2CPP_CHANNEL_BATCH_STANDALONE

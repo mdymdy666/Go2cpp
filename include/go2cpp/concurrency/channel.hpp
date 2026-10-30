@@ -59,6 +59,7 @@
 
 #include "go2cpp/context.hpp"
 #include "go2cpp/core/parking_condition.hpp"
+#include "go2cpp/concurrency/core/futex_mutex.hpp"
 #include "go2cpp/core/timer.hpp"
 #include "go2cpp/debug/debug_event_ring.hpp"
 #include "go2cpp/debug/debug_resources.hpp"
@@ -750,6 +751,271 @@ class SelectWaitState final {
   SelectProbe m_probe;
 };
 
+// ---------------------------------------------------------------------------
+// P0 单锁化所需的等待基础设施
+//
+// 设计要点（对应 docs/research/go-channel-opt.md §7 P0 #1/#2/#3/#4/#5）：
+//
+// 1. **等待队列归 Channel 所有**：节点是侵入式双链表，队列只持裸指针；
+//    入队/出队/摘链全部在 Channel 自旋锁内完成，notify 不再经过
+//    ParkingCondition 的内部 deque 与内部锁。
+// 2. **节点池化**：节点从线程本地空闲链取还（上限 128，对应 Go 的
+//    `p.sudogbuf[128]`），稳态每次阻塞收发 0 次堆分配。
+// 3. **per-node futex**：每个节点有自己的 32 位唤醒字，唤醒方只推进目标
+//    节点的字并 FUTEX_WAKE(1)（审计 D2：共享字会唤醒错节点）。
+// 4. **取消不持节点**：Context 回调只持 `weak_ptr<CancelHub>` + token，
+//    在 hub 锁与 Channel 锁内按 token 定位节点，CAS signal 后唤醒。
+//    回调从不直接解引用队列外的节点，节点生命周期完全由等待者栈帧持有。
+// 5. **不能持锁 park**：自旋锁只在极短的临界区内持有；等待者入队后立刻
+//    解锁，futex/调度器 park 都发生在锁外。
+// ---------------------------------------------------------------------------
+
+/// @brief 等待节点的唤醒协议状态（锁外原子字，只负责「可以醒了」）。
+enum class WaitSignal : std::uint32_t {
+  kWaiting = 0,
+  /// @brief 已被交接/已放入值（结果细节仍在 Channel 锁内）。
+  kReady = 1,
+  /// @brief 通道已关闭。
+  kClosed = 2,
+  /// @brief 被取消、超时或排队清理。
+  kCancelled = 3,
+};
+
+/// @brief 等待节点公共头：池化、侵入式链表、per-node futex、Fiber 绑定。
+///
+/// 生命周期契约：节点地址由等待者线程独占（池也是线程本地的），
+/// Channel 队列与取消回调只允许在持有 Channel 锁时访问节点；等待者退出
+/// 等待并归还池之后，任何路径都不再持有该地址。
+struct WaitNodeBase {
+  /// @brief 唤醒协议字；交接方用 CAS 0→kReady/kClosed/kCancelled 决定唯一赢家。
+  std::atomic<std::uint32_t> signal{0};
+  /// @brief 该节点自己的 futex 代际字；唤醒方 fetch_add 后 FUTEX_WAKE。
+  std::atomic<std::uint32_t> seq{0};
+  /// @brief 是否已经真正进入 FUTEX_WAIT（0/1，仅用于跳过无谓系统调用）。
+  std::atomic<std::uint32_t> parked{0};
+  /// @brief 取消回调定位节点用的身份（每次从池取出时递增，复用地址后必变）。
+  std::uint32_t generation{0};
+  /// @brief 侵入式双向链表指针（仅 Channel 锁内读写）。
+  WaitNodeBase* next{nullptr};
+  WaitNodeBase* prev{nullptr};
+  /// @brief 是否仍在 Channel 队列中（锁内维护）。
+  bool linked{false};
+  /// @brief 是否由受管 Fiber 等待（true 时走 Scheduler park/wake）。
+  bool managed{false};
+  /// @brief 受管等待的 Scheduler（类型擦除，channel.cpp 内转换）。
+  void* scheduler{nullptr};
+  /// @brief 受管等待的 Task（类型擦除，避免 header 依赖 scheduler.hpp）。
+  std::shared_ptr<void> task;
+  /// @brief select 节点归属；普通 Send/Recv 节点为空。
+  std::shared_ptr<SelectWaitState> select_state;
+  /// @brief select 节点的 case 下标。
+  std::size_t select_index{static_cast<std::size_t>(-1)};
+
+  /// @brief 归还池前把全部字段恢复成「新建」状态。
+  void ResetBase() noexcept {
+    signal.store(0, std::memory_order_relaxed);
+    seq.store(0, std::memory_order_relaxed);
+    parked.store(0, std::memory_order_relaxed);
+    generation = 0;
+    next = nullptr;
+    prev = nullptr;
+    linked = false;
+    managed = false;
+    scheduler = nullptr;
+    task.reset();
+    select_state.reset();
+    select_index = static_cast<std::size_t>(-1);
+  }
+
+  bool IsSelect() const noexcept { return select_state != nullptr; }
+};
+
+/// @brief 取消回调与 Channel 生命周期的解耦点。
+///
+/// Context 可能比 Channel 活得久；回调只持 `weak_ptr<CancelHub>`，Channel
+/// 析构时在 hub 锁内把 owner 置空，之后到达的回调看到空指针直接返回。
+/// 锁序固定为 hub.mutex → Channel 锁，析构路径先置空再 Close，不构成环。
+template <typename ChannelT>
+struct CancelHub {
+  std::mutex mutex;
+  ChannelT* owner{nullptr};
+};
+
+/// @brief 侵入式双向等待队列（裸指针；节点由等待者线程持有）。
+template <typename Node>
+class WaitQueue {
+ public:
+  bool empty() const noexcept { return m_size == 0; }
+  std::size_t size() const noexcept { return m_size; }
+  Node* front() const noexcept { return static_cast<Node*>(m_head); }
+  Node* back() const noexcept { return static_cast<Node*>(m_tail); }
+  WaitNodeBase* head() const noexcept { return m_head; }
+
+  void push_back(Node* node) noexcept {
+    WaitNodeBase* base = node;
+    base->prev = m_tail;
+    base->next = nullptr;
+    if (m_tail != nullptr) {
+      m_tail->next = base;
+    } else {
+      m_head = base;
+    }
+    m_tail = base;
+    base->linked = true;
+    ++m_size;
+  }
+
+  Node* pop_front() noexcept {
+    WaitNodeBase* node = m_head;
+    if (node == nullptr) {
+      return nullptr;
+    }
+    Unlink(node);
+    return static_cast<Node*>(node);
+  }
+
+  /// @brief O(1) 摘链（节点不在队列中时无副作用）。
+  void erase(Node* node) noexcept {
+    if (node == nullptr || !node->linked) {
+      return;
+    }
+    Unlink(node);
+  }
+
+  void swap(WaitQueue& other) noexcept {
+    std::swap(m_head, other.m_head);
+    std::swap(m_tail, other.m_tail);
+    std::swap(m_size, other.m_size);
+  }
+
+ private:
+  void Unlink(WaitNodeBase* node) noexcept {
+    if (node->prev != nullptr) {
+      node->prev->next = node->next;
+    } else {
+      m_head = node->next;
+    }
+    if (node->next != nullptr) {
+      node->next->prev = node->prev;
+    } else {
+      m_tail = node->prev;
+    }
+    node->prev = nullptr;
+    node->next = nullptr;
+    node->linked = false;
+    --m_size;
+  }
+
+  WaitNodeBase* m_head{nullptr};
+  WaitNodeBase* m_tail{nullptr};
+  std::size_t m_size{0};
+};
+
+/// @brief 线程本地节点池（稳态零分配；上限 128，超出后释放）。
+template <typename Node>
+class WaitNodePool {
+ public:
+  static Node* Acquire() {
+    auto& pool = Local();
+    if (!pool.empty()) {
+      Node* node = pool.back();
+      pool.pop_back();
+      return node;
+    }
+    return new Node();
+  }
+
+  static void Release(Node* node) noexcept {
+    if (node == nullptr) {
+      return;
+    }
+    node->Reset();
+    auto& pool = Local();
+    if (pool.size() < kLocalCapacity) {
+      pool.push_back(node);
+    } else {
+      delete node;
+    }
+  }
+
+ private:
+  static constexpr std::size_t kLocalCapacity = 128;
+
+  static std::vector<Node*>& Local() {
+    static thread_local std::vector<Node*> pool;
+    return pool;
+  }
+};
+
+// ---- 自旋锁：无竞争一次 CAS，有竞争先 PAUSE 自旋，最后 futex 兜底 ----
+
+/// @brief 仅供 Channel 队列使用的互斥门（自旋 + futex）。
+///
+/// 为什么不是自研的两态 spinlock：那版 `exchange(0) + FUTEX_WAKE(1)` 依赖
+/// 「被唤醒者一定会接手锁并继续唤醒链」。实测 MPMC 绑定 2 核时该依赖不成立
+/// （等待者被信号打断/EAGAIN 重试路径退出唤醒链），锁空闲却有人永久睡在
+/// futex 上（gdb 栈：消费者在 LockSlow、生产者在 WaitNative）。
+///
+/// 这里复用审计过的 `core::FutexMutex`（locked+waiters 双位状态、唤醒链确认
+/// 有人接手、对「被唤醒者已退出」继续唤醒下一个），并在外层加 64 次 PAUSE
+/// 自旋：Channel 临界区只有几十条指令，短竞争完全在用户态解决；只有真正
+/// 久的竞争才进入 FUTEX_WAIT。**任何时候都不允许持本锁 park。**
+class ChannelSpinLock {
+ public:
+  ChannelSpinLock() noexcept = default;
+  ChannelSpinLock(const ChannelSpinLock&) = delete;
+  ChannelSpinLock& operator=(const ChannelSpinLock&) = delete;
+
+  void lock() noexcept {
+    for (int spin = 0; spin < kSpinIterations; ++spin) {
+      if (m_gate.try_lock()) {
+        return;
+      }
+      Relax();
+    }
+    m_gate.lock();
+  }
+
+  bool try_lock() noexcept { return m_gate.try_lock(); }
+  void unlock() noexcept { m_gate.unlock(); }
+
+ private:
+  static constexpr int kSpinIterations = 64;
+
+  static void Relax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+  }
+
+  alignas(64) core::FutexMutex m_gate;
+};
+
+// ---- 平台原语（实现在 src/concurrency/channel.cpp，避免 header 依赖） ----
+
+/// @brief 唤醒一个在该 futex 字上等待的线程（用于 per-node 唤醒字）。
+void ChannelFutexWake(std::atomic<std::uint32_t>* word) noexcept;
+/// @brief 在 futex 字上等待（带超时）；返回后调用方自行重检状态。
+void ChannelFutexWait(std::atomic<std::uint32_t>* word, std::uint32_t expected,
+                      const std::optional<ContextTimePoint>& deadline) noexcept;
+
+/// @brief 原生线程等待：自旋 → FUTEX_WAIT → 重检 signal/seq。
+void ChannelWaitNative(WaitNodeBase* node,
+                       const std::optional<ContextTimePoint>& deadline) noexcept;
+
+/// @brief 把自己绑定到受管 Scheduler；返回 false 表示当前上下文不能 park。
+bool ChannelBindManaged(WaitNodeBase* node) noexcept;
+
+/// @brief 受管等待一次 park；返回 false 表示被取消/无法继续等待。
+bool ChannelParkOnce(WaitNodeBase* node) noexcept;
+
+/// @brief 唤醒一个受管等待节点（Scheduler::wake_or_cancel）。
+void ChannelWakeManaged(WaitNodeBase* node) noexcept;
+
 }  // namespace detail
 
 
@@ -984,11 +1250,20 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
 
   explicit Channel(std::size_t capacity = 0)
       : m_capacity(capacity), m_buffer(capacity) {
+    // 取消回调只持 weak_ptr<CancelHub>，因此 Channel 不是 shared_ptr 管理时
+    // 也不会出现「回调访问已析构 Channel」的窗口。
+    m_cancel_hub = std::make_shared<detail::CancelHub<Channel<T>>>();
+    m_cancel_hub->owner = this;
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
     m_debug_resource = GO2CPP_DEBUG_RESOURCE_REGISTER(kChannel, this, nullptr);
 #endif
   }
   ~Channel() noexcept {
+    // 先切断取消回调进入 Channel 的通道，再唤醒剩余等待者。
+    if (m_cancel_hub) {
+      std::lock_guard<std::mutex> gate(m_cancel_hub->mutex);
+      m_cancel_hub->owner = nullptr;
+    }
     (void)Close();
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
     GO2CPP_DEBUG_RESOURCE_UNREGISTER(m_debug_resource);
@@ -1004,13 +1279,13 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   // 返回当前缓冲区长度；不包含正在交接的等待者。
   /** @brief 返回当前缓冲区内元素数量。 */
   std::size_t Len() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
     return m_buffer.size();
   }
   // 查询通道是否已关闭。
   /** @brief 返回 Channel 是否已关闭。 */
   bool IsClosed() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
     return m_closed;
   }
   bool closed() const { return IsClosed(); }
@@ -1021,19 +1296,21 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
    */
   ChannelDebugSnapshot DebugSnapshot() const {
     ChannelDebugSnapshot snapshot;
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
     snapshot.capacity = m_capacity;
     snapshot.length = m_buffer.size();
     snapshot.closed = m_closed;
     snapshot.send_waiters = m_senders.size();
     snapshot.recv_waiters = m_receivers.size();
-    for (const auto& node : m_senders) {
-      if (node != nullptr && node->select_state) {
+    for (detail::WaitNodeBase* node = m_senders.head(); node != nullptr;
+         node = node->next) {
+      if (node->select_state != nullptr) {
         ++snapshot.select_senders;
       }
     }
-    for (const auto& node : m_receivers) {
-      if (node != nullptr && node->select_state) {
+    for (detail::WaitNodeBase* node = m_receivers.head(); node != nullptr;
+         node = node->next) {
+      if (node->select_state != nullptr) {
         ++snapshot.select_receivers;
       }
     }
@@ -1071,7 +1348,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       }
       std::size_t sent = 0;
       try {
-        std::unique_lock<std::mutex> lock(m_mutex);
+        std::unique_lock<detail::ChannelSpinLock> lock(m_lock);
         if (m_closed || !m_receivers.empty()) {
           return 0;
         }
@@ -1113,7 +1390,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       }
       std::size_t received = 0;
       try {
-        std::unique_lock<std::mutex> lock(m_mutex);
+        std::unique_lock<detail::ChannelSpinLock> lock(m_lock);
         std::optional<T> staged;
         while (received < max_count) {
           if (!m_buffer.TryPopInto(&staged)) {
@@ -1282,19 +1559,17 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   // 关闭操作幂等并唤醒所有阻塞操作。重复关闭返回 kAlreadyClosed，不抛
   // C++ 异常；关闭后发送返回关闭状态，接收在排空缓冲后返回零值。
   ChannelSendResult Close() noexcept {
-    std::deque<std::shared_ptr<PendingSend>> senders;
-    std::deque<std::shared_ptr<PendingRecv>> receivers;
+    bool published = false;
     {
-      std::lock_guard<std::mutex> lock(m_mutex);
+      std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
       if (m_closed) {
         return {ChannelStatus::kAlreadyClosed, ChannelAlreadyClosedError()};
       }
       m_closed = true;
-      ++m_generation;
-      senders.swap(m_senders);
-      receivers.swap(m_receivers);
-      for (auto& sender : senders) {
-        if (sender->select_state) {
+      m_generation.fetch_add(1, std::memory_order_release);
+      published = true;
+      while (PendingSend* sender = m_senders.pop_front()) {
+        if (sender->IsSelect()) {
           SelectProbe probe;
           probe.ready = true;
           probe.status = ChannelStatus::kClosed;
@@ -1303,19 +1578,26 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
             (void)sender->select_state->TrySelect(sender->select_index,
                                                   std::move(probe));
           } catch (...) {
-            // Close 仍须唤醒该 select；选择结果不可提交时，把节点
-            // 取消掉，避免异常穿过 Close 并留下永远等待的 Fiber。
+            // Close 仍须唤醒该 select；选择结果不可提交时把节点取消掉，
+            // 避免异常穿过 Close 并留下永远等待的 Fiber。
             sender->select_state->Cancel();
           }
-          sender->cancelled = true;
+          sender->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kClosed),
+              std::memory_order_release);
+          ReleaseSelectNode(sender);
           continue;
         }
         sender->closed = true;
         sender->status = ChannelStatus::kClosed;
         sender->error = ChannelClosedError();
+        sender->signal.store(
+            static_cast<std::uint32_t>(detail::WaitSignal::kClosed),
+            std::memory_order_release);
+        WakeNodeLocked(sender);
       }
-      for (auto& receiver : receivers) {
-        if (receiver->select_state) {
+      while (PendingRecv* receiver = m_receivers.pop_front()) {
+        if (receiver->IsSelect()) {
           SelectProbe probe;
           probe.ready = true;
           probe.status = ChannelStatus::kClosed;
@@ -1326,24 +1608,25 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
           } catch (...) {
             receiver->select_state->Cancel();
           }
-          receiver->cancelled = true;
+          receiver->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kClosed),
+              std::memory_order_release);
+          ReleaseSelectNode(receiver);
           continue;
         }
         receiver->ready = true;
         receiver->ok = false;
         receiver->status = ChannelStatus::kClosed;
         receiver->error = ChannelClosedError();
+        receiver->signal.store(
+            static_cast<std::uint32_t>(detail::WaitSignal::kClosed),
+            std::memory_order_release);
+        WakeNodeLocked(receiver);
       }
     }
-    for (auto& sender : senders) {
-      sender->Signal();
-      sender->NotifyIfParked();
+    if (published) {
+      NotifyChange();
     }
-    for (auto& receiver : receivers) {
-      receiver->Signal();
-      receiver->NotifyIfParked();
-    }
-    NotifyChange();
     return {ChannelStatus::kReady, {}};
   }
 
@@ -1368,37 +1651,31 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
    * @return 本次尝试唤醒的普通等待节点数（不含 select 节点与 change 观察者）。
    */
   std::size_t ForceWakeWaiters() {
-    std::vector<std::shared_ptr<PendingSend>> senders;
-    std::vector<std::shared_ptr<PendingRecv>> receivers;
-    {
-      std::lock_guard<std::mutex> lock(m_mutex);
-      senders.assign(m_senders.begin(), m_senders.end());
-      receivers.assign(m_receivers.begin(), m_receivers.end());
-    }
     std::size_t woken = 0;
-    for (auto& sender : senders) {
-      if (!sender || sender->select_state) {
-        continue;
+    {
+      std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
+      for (detail::WaitNodeBase* node = m_senders.head(); node != nullptr;
+           node = node->next) {
+        if (node->select_state != nullptr) {
+          continue;
+        }
+        // 只推进节点自己的 futex 字；等待者醒来重检状态后会继续等待。
+        node->seq.fetch_add(1, std::memory_order_release);
+        WakeNodeLocked(node);
+        ++woken;
       }
-      // spin_wait 节点在「已发布但还没真正 park」的窗口里只认 signaled；
-      // 置位让它提前结束自旋并重新加锁重检（重检后仍不满足会继续等）。
-      if (sender->spin_wait) {
-        sender->signaled.store(true, std::memory_order_release);
+      for (detail::WaitNodeBase* node = m_receivers.head(); node != nullptr;
+           node = node->next) {
+        if (node->select_state != nullptr) {
+          continue;
+        }
+        node->seq.fetch_add(1, std::memory_order_release);
+        WakeNodeLocked(node);
+        ++woken;
       }
-      sender->NotifyIfParked();
-      ++woken;
     }
-    for (auto& receiver : receivers) {
-      if (!receiver || receiver->select_state) {
-        continue;
-      }
-      if (receiver->spin_wait) {
-        receiver->signaled.store(true, std::memory_order_release);
-      }
-      receiver->NotifyIfParked();
-      ++woken;
-    }
-    if (m_change_waiters.load(std::memory_order_acquire) != 0) {
+    if (m_change_waiters.load(std::memory_order_relaxed) != 0) {
+      std::lock_guard<std::mutex> lock(m_change_mutex);
       m_change_cv.notify_all();
     }
     return woken;
@@ -1416,14 +1693,32 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   // 解锁后读计数。两者由同一把锁排序，因此不会漏掉已注册的观察者，
   // 也不会把 generation 变化漏给已经在等待的调用者。
   bool WaitForChange(std::uint64_t generation, Duration timeout) const {
-    std::unique_lock<std::mutex> lock(m_mutex);
-    m_change_waiters.fetch_add(1, std::memory_order_acq_rel);
-    m_generation_watchers.fetch_add(1, std::memory_order_acq_rel);
-    const bool changed = m_change_cv.wait_for(lock, timeout, [this, generation] {
-      return m_generation.load(std::memory_order_relaxed) != generation;
-    });
-    m_generation_watchers.fetch_sub(1, std::memory_order_acq_rel);
-    m_change_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    // 注册（Channel 自旋锁内）与等待（m_change_mutex + ParkingCondition）分开：
+    // 自旋锁绝不能在持有时 park。注册时先检查代际，闭合「通知先于注册」的
+    // 窗口；通知方在自旋锁内推进代际、解锁后再拿 m_change_mutex 广播，因此
+    // 谓词检查与 notify 之间不会丢唤醒。
+    {
+      std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
+      m_change_waiters.fetch_add(1, std::memory_order_relaxed);
+      m_generation_watchers.fetch_add(1, std::memory_order_relaxed);
+      if (m_generation.load(std::memory_order_acquire) != generation) {
+        m_change_waiters.fetch_sub(1, std::memory_order_relaxed);
+        m_generation_watchers.fetch_sub(1, std::memory_order_relaxed);
+        return true;
+      }
+    }
+    bool changed = false;
+    {
+      std::unique_lock<std::mutex> lock(m_change_mutex);
+      changed = m_change_cv.wait_for(lock, timeout, [this, generation] {
+        return m_generation.load(std::memory_order_acquire) != generation;
+      });
+    }
+    {
+      std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
+      m_change_waiters.fetch_sub(1, std::memory_order_relaxed);
+      m_generation_watchers.fetch_sub(1, std::memory_order_relaxed);
+    }
     return changed;
   }
 
@@ -1435,7 +1730,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     if (!state || state->IsSelected()) {
       return false;
     }
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::unique_lock<detail::ChannelSpinLock> lock(m_lock);
     if (state->IsSelected()) {
       return false;
     }
@@ -1460,7 +1755,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
           return false;
         }
         RefillBufferLocked();
-        ++m_generation;
+        m_generation.fetch_add(1, std::memory_order_release);
         lock.unlock();
         NotifyChange();
         return true;
@@ -1470,27 +1765,33 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     const std::size_t sender_scan_limit = m_senders.size();
     for (std::size_t scanned = 0;
          scanned < sender_scan_limit && !m_senders.empty(); ++scanned) {
-      auto sender = m_senders.front();
+      PendingSend* sender = m_senders.front();
       if (sender->select_state == state) {
         m_senders.pop_front();
-        m_senders.emplace_back(std::move(sender));
+        m_senders.push_back(sender);
         continue;
       }
-      if (sender->cancelled) {
+      if (sender->signal.load(std::memory_order_acquire) !=
+          static_cast<std::uint32_t>(detail::WaitSignal::kWaiting)) {
+        // 已被取消/超时的节点：从队列摘除。普通节点由等待者自己归还池，
+        // select 节点没有外部持有者，这里归还。
         m_senders.pop_front();
+        if (sender->IsSelect()) {
+          ReleaseSelectNode(sender);
+        }
         continue;
       }
-      if (sender->select_state) {
+      if (sender->IsSelect()) {
         if constexpr (!std::is_copy_constructible<T>::value) {
-          sender->cancelled = true;
           m_senders.pop_front();
+          ReleaseSelectNode(sender);
           continue;
         } else {
           SelectProbe recv_probe;
           recv_probe.ready = true;
           recv_probe.ok = true;
           recv_probe.status = ChannelStatus::kReady;
-          if (!recv_probe.SetValue(sender->value)) {
+          if (!recv_probe.SetValue(*sender->value)) {
             return false;
           }
           SelectProbe send_probe;
@@ -1504,14 +1805,15 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
               return false;
             }
             if (sender->select_state->IsSelected()) {
-              sender->cancelled = true;
               m_senders.pop_front();
+              ReleaseSelectNode(sender);
               continue;
             }
             continue;
           }
           m_senders.pop_front();
-          ++m_generation;
+          ReleaseSelectNode(sender);
+          m_generation.fetch_add(1, std::memory_order_release);
           lock.unlock();
           NotifyChange();
           return true;
@@ -1524,7 +1826,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
         probe.ready = true;
         probe.ok = true;
         probe.status = ChannelStatus::kReady;
-        if (!probe.SetValue(sender->value)) {
+        if (!probe.SetValue(*sender->value)) {
           return false;
         }
         if (!state->TrySelect(index, std::move(probe))) {
@@ -1533,9 +1835,11 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
         m_senders.pop_front();
         sender->accepted = true;
         sender->status = ChannelStatus::kReady;
-        sender->Signal();
-        sender->NotifyIfParked();
-        ++m_generation;
+        sender->signal.store(
+            static_cast<std::uint32_t>(detail::WaitSignal::kReady),
+            std::memory_order_release);
+        WakeNodeLocked(sender);
+        m_generation.fetch_add(1, std::memory_order_release);
         lock.unlock();
         NotifyChange();
         return true;
@@ -1555,11 +1859,12 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       return selected;
     }
 
-    auto pending = std::make_shared<PendingRecv>();
+    PendingRecv* pending = AcquireRecvNode();
     pending->select_state = state;
     pending->select_index = index;
-    m_receivers.emplace_back(std::move(pending));
-    ++m_generation;
+    pending->generation = NextWaiterGeneration();
+    m_receivers.push_back(pending);
+    m_generation.fetch_add(1, std::memory_order_release);
     lock.unlock();
     NotifyChange();
     return true;
@@ -1572,7 +1877,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     if (!state || state->IsSelected()) {
       return false;
     }
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::unique_lock<detail::ChannelSpinLock> lock(m_lock);
     if (state->IsSelected()) {
       return false;
     }
@@ -1580,24 +1885,28 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     const std::size_t receiver_scan_limit = m_receivers.size();
     for (std::size_t scanned = 0;
          scanned < receiver_scan_limit && !m_receivers.empty(); ++scanned) {
-      auto receiver = m_receivers.front();
+      PendingRecv* receiver = m_receivers.front();
       if (receiver->select_state == state) {
         m_receivers.pop_front();
-        m_receivers.emplace_back(std::move(receiver));
+        m_receivers.push_back(receiver);
         continue;
       }
-      if (receiver->cancelled) {
+      if (receiver->signal.load(std::memory_order_acquire) !=
+          static_cast<std::uint32_t>(detail::WaitSignal::kWaiting)) {
         m_receivers.pop_front();
+        if (receiver->IsSelect()) {
+          ReleaseSelectNode(receiver);
+        }
         continue;
       }
       SelectProbe send_probe;
       send_probe.ready = true;
       send_probe.ok = true;
       send_probe.status = ChannelStatus::kReady;
-      if (receiver->select_state) {
+      if (receiver->IsSelect()) {
         if constexpr (!std::is_copy_constructible<T>::value) {
-          receiver->cancelled = true;
           m_receivers.pop_front();
+          ReleaseSelectNode(receiver);
           continue;
         } else {
           SelectProbe recv_probe;
@@ -1619,14 +1928,15 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
               return false;
             }
             if (receiver->select_state->IsSelected()) {
-              receiver->cancelled = true;
               m_receivers.pop_front();
+              ReleaseSelectNode(receiver);
               continue;
             }
             continue;
           }
           m_receivers.pop_front();
-          ++m_generation;
+          ReleaseSelectNode(receiver);
+          m_generation.fetch_add(1, std::memory_order_release);
           lock.unlock();
           NotifyChange();
           return true;
@@ -1647,9 +1957,11 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       receiver->ready = true;
       receiver->status = ChannelStatus::kReady;
       m_receivers.pop_front();
-      receiver->Signal();
-      receiver->NotifyIfParked();
-      ++m_generation;
+      receiver->signal.store(
+          static_cast<std::uint32_t>(detail::WaitSignal::kReady),
+          std::memory_order_release);
+      WakeNodeLocked(receiver);
+      m_generation.fetch_add(1, std::memory_order_release);
       lock.unlock();
       NotifyChange();
       return true;
@@ -1684,22 +1996,24 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
         (void)m_buffer.TryPopBack();
         return false;
       }
-      ++m_generation;
+      m_generation.fetch_add(1, std::memory_order_release);
       lock.unlock();
       NotifyChange();
       return true;
     }
 
-    std::shared_ptr<PendingSend> pending;
+    PendingSend* pending = AcquireSendNode();
     try {
-      pending = std::make_shared<PendingSend>(value);
+      pending->value.emplace(value);
     } catch (...) {
+      ReleaseSendNode(pending);
       return false;
     }
     pending->select_state = state;
     pending->select_index = index;
-    m_senders.emplace_back(std::move(pending));
-    ++m_generation;
+    pending->generation = NextWaiterGeneration();
+    m_senders.push_back(pending);
+    m_generation.fetch_add(1, std::memory_order_release);
     lock.unlock();
     NotifyChange();
     return true;
@@ -1711,27 +2025,29 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     }
     bool changed = false;
     {
-      std::lock_guard<std::mutex> lock(m_mutex);
-      for (auto it = m_senders.begin(); it != m_senders.end();) {
-        if ((*it)->select_state == state) {
-          (*it)->cancelled = true;
-          it = m_senders.erase(it);
+      std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
+      detail::WaitNodeBase* node = m_senders.head();
+      while (node != nullptr) {
+        detail::WaitNodeBase* next = node->next;
+        if (node->select_state.get() == state.get()) {
+          m_senders.erase(static_cast<PendingSend*>(node));
+          ReleaseSelectNode(static_cast<PendingSend*>(node));
           changed = true;
-        } else {
-          ++it;
         }
+        node = next;
       }
-      for (auto it = m_receivers.begin(); it != m_receivers.end();) {
-        if ((*it)->select_state == state) {
-          (*it)->cancelled = true;
-          it = m_receivers.erase(it);
+      node = m_receivers.head();
+      while (node != nullptr) {
+        detail::WaitNodeBase* next = node->next;
+        if (node->select_state.get() == state.get()) {
+          m_receivers.erase(static_cast<PendingRecv*>(node));
+          ReleaseSelectNode(static_cast<PendingRecv*>(node));
           changed = true;
-        } else {
-          ++it;
         }
+        node = next;
       }
       if (changed) {
-        ++m_generation;
+        m_generation.fetch_add(1, std::memory_order_release);
       }
     }
     if (changed) {
@@ -1743,379 +2059,273 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   /**
    * @brief 一个被登记的发送者（无缓冲、或缓冲已满时挂在 `m_senders`）。
    *
-   * ## 定位
+   * ## 与 P0 前的区别
    *
-   * `SendUntil` 在无法立即交接时创建它并 park；接收方 `Recv` 从 `m_senders` 队头
-   * 取走它完成 rendezvous（**绕过缓冲**），或 `Close` 遍历它置 `closed`。
-   *
-   * ## 字段的两组职责（不要混）
-   *
-   * | 组 | 字段 | 用途 |
-   * |---|---|---|
-   * | 交接结果 | `accepted`/`closed`/`cancelled`/`status`/`error` | 发送方醒来后据此构造 `ChannelSendResult` |
-   * | select 归属 | `select_state`/`select_index` | 属于哪个 select、第几个 case（普通 Send 为 null / 最大值） |
-   * | 等待载体 | `cv` | 发送者在此 park，等接收者取走值 |
+   * - 不再有 `core::ParkingCondition cv`：唤醒直接推进节点自己的 futex 字；
+   * - 不再是 `shared_ptr`：节点由等待者线程从 `WaitNodePool` 取还，Channel
+   *   队列只持裸指针；取消回调按（地址, generation）定位，不持有节点；
+   * - 结果标志（`accepted`/`closed`/`status`/`error`）仍由 Channel 自旋锁
+   *   保护，`signal` 原子字只负责「可以醒了」的唤醒协议，两者都按
+   *   「先写锁内标志、再发布 signal、最后唤醒」的固定顺序写入。
    *
    * ## 不变量
    *
-   * - 三个布尔位（`accepted`/`closed`/`cancelled`）**至多一个为真**：它们由
-   *   `Unlock`/`Close`/取消回调三个源在 `m_mutex` 内竞争写入；
-   * - `accepted == true` 时 `value` 已被移走（接收者持有），不要再读。
+   * - `accepted == true` 时 `value` 已被移走（接收者持有），不要再读；
+   * - `accepted`/`closed` 至多一个为真；两者都为假时 `status` 说明取消/超时。
    */
-  struct PendingSend {
-    explicit PendingSend(T item) : value(std::move(item)) {}
-    /// @brief 待发送的值；被接收者 `std::move` 取走后不要读。
-    T value;
-    /// @brief 是否已成功交接给接收者（与 `closed`/`cancelled` 互斥）。
+  struct PendingSend final : detail::WaitNodeBase {
+    /// @brief 待发送的值；被接收者取走后为空。
+    std::optional<T> value;
+    /// @brief 是否已成功交接给接收者（与 `closed` 互斥）。
     bool accepted{false};
     /// @brief 是否因 channel 关闭而失败（对应 `kClosed`/`kAlreadyClosed`）。
     bool closed{false};
-    bool cancelled{false};
     ChannelStatus status{ChannelStatus::kWouldBlock};
     ErrorPtr error;
-    std::shared_ptr<detail::SelectWaitState> select_state;
-    std::size_t select_index{static_cast<std::size_t>(-1)};
-    core::ParkingCondition cv;
-    /// @brief 交接/关闭结果的原子发布位，供等待方在 park 前短自旋观察。
-    ///        结果标志仍由 Channel::m_mutex 保护；这里只负责"可以醒了"的
-    ///        release/acquire 握手，避免自旋方永久错过一次交接。
-    /// @brief 该等待者是否在 park 前自旋（仅 capacity<=1 时可能为 true）。
-    ///        由等待方在入队前写入；完成方在 m_mutex 内读取。cap>1 的等待者
-    ///        从不自旋，完成方因此可以完全跳过 signaled/parked 的原子维护。
-    bool spin_wait{false};
-    std::atomic<bool> signaled{false};
-    /// @brief 等待方是否已经真正进入 ParkingCondition（持 m_mutex 写）。
-    ///        对端据此决定要不要 notify：仍在自旋的等待者会自己看到
-    ///        `signaled`，跳过 notify 可省掉一次 ParkingCondition 内部锁；
-    ///        Close 一次唤醒大量等待者时也能跳过已经醒了的节点。
-    std::atomic<bool> parked{false};
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-    /// @brief 所属 channel 的调试资源编号与等待者 gid（仅资源事件用）。
-    std::uint64_t debug_channel{0};
-    std::uint64_t debug_waiter_gid{0};
-#endif
 
-    /// @brief 在持 m_mutex 并写完结果标志后调用（只对自旋通道需要）。
-    void Signal() noexcept {
-      if (spin_wait) {
-        signaled.store(true, std::memory_order_release);
-      }
-    }
-
-    /// @brief 只有真正 park 的等待者才需要 ParkingCondition 唤醒。
-    ///        自旋中的等待者会在 `signaled` 上看到结果；跳过 notify 可省掉
-    ///        ParkingCondition 内部互斥量，也避免 Close 对已醒节点做无效唤醒。
-    void NotifyIfParked() noexcept {
-      if (!spin_wait || parked.load(std::memory_order_relaxed)) {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-        GO2CPP_DEBUG_RESOURCE_EVENT(
-            kChannelWake, debug_channel, GO2CPP_DEBUG_BOUND_TASK(),
-            debug_waiter_gid, 0, go2cpp::debug::ResourceResult::kWake, 0,
-            true);
-#else
-        GO2CPP_DEBUG_EVENT(kChannelWake, 0, 1);
-#endif
-        // 外层优先：ParkingCondition::notify_one 内部的 kPCNotify 不会把
-        // 这次唤醒的语义改写成 kParkingCondition。
-        GO2CPP_DEBUG_WAKE_HINT(kChannelSend);
-        cv.notify_one();
-      }
+    /// @brief 归还池前恢复「新建」状态（同时释放残留值）。
+    void Reset() noexcept {
+      ResetBase();
+      value.reset();
+      accepted = false;
+      closed = false;
+      status = ChannelStatus::kWouldBlock;
+      error.reset();
     }
   };
 
   /**
    * @brief 一个被登记的接收者（无缓冲、或缓冲已空时挂在 `m_receivers`）。
    *
-   * ## 定位
-   *
-   * `RecvUntil` 在无法立即取到值时创建它并 park；发送方 `Send` 直接把值塞进它的
-   * `value` 并置 `ready`（**绕过缓冲**），或 `Close` 遍历它置 `cancelled`。
-   *
-   * ## 与 `PendingSend` 的对称性
-   *
-   * 两者字段一一对应（`accepted` ↔ `ready`、`closed` ↔ `cancelled`），但含义相反：
-   * 发送方关心「值有没有被取走」，接收方关心「有没有拿到值」。
-   *
-   * ## 不变量
-   *
-   * - `ready && ok` 时 `value` 必有值；`!ok` 时 `value` 为空；
-   * - `cancelled == true` 时不会再被任何发送方写入（`m_mutex` 内竞争）。
+   * 与 `PendingSend` 对称：`ready` ↔ `accepted`；两者都由 Channel 自旋锁
+   * 保护，唤醒协议走同一个 `signal`/`seq` 原子字。`ready && ok` 时
+   * `value` 必有值；`ok == false` 时 `value` 为空（关闭）。
    */
-  struct PendingRecv {
+  struct PendingRecv final : detail::WaitNodeBase {
     /// @brief 接收到的值；`ready == false` 时为空。
     std::optional<T> value;
-    /// @brief 是否已有值可取（与 `cancelled` 互斥）。
+    /// @brief 是否已有值可取（与取消/超时互斥）。
     bool ready{false};
     bool ok{false};
-    bool cancelled{false};
     ChannelStatus status{ChannelStatus::kWouldBlock};
     ErrorPtr error;
-    std::shared_ptr<detail::SelectWaitState> select_state;
-    std::size_t select_index{static_cast<std::size_t>(-1)};
-    core::ParkingCondition cv;
-    /// @brief 交接/关闭结果的原子发布位；语义见 PendingSend::signaled。
-    /// @brief 该等待者是否在 park 前自旋（仅 capacity<=1 时可能为 true）。
-    ///        由等待方在入队前写入；完成方在 m_mutex 内读取。cap>1 的等待者
-    ///        从不自旋，完成方因此可以完全跳过 signaled/parked 的原子维护。
-    bool spin_wait{false};
-    std::atomic<bool> signaled{false};
-    /// @brief 等待方是否已经真正进入 ParkingCondition（持 m_mutex 写）。
-    ///        对端据此决定要不要 notify：仍在自旋的等待者会自己看到
-    ///        `signaled`，跳过 notify 可省掉一次 ParkingCondition 内部锁；
-    ///        Close 一次唤醒大量等待者时也能跳过已经醒了的节点。
-    std::atomic<bool> parked{false};
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-    /// @brief 所属 channel 的调试资源编号与等待者 gid（仅资源事件用）。
-    std::uint64_t debug_channel{0};
-    std::uint64_t debug_waiter_gid{0};
-#endif
 
-    /// @brief 在持 m_mutex 并写完结果标志后调用（只对自旋通道需要）。
-    void Signal() noexcept {
-      if (spin_wait) {
-        signaled.store(true, std::memory_order_release);
-      }
-    }
-
-    /// @brief 只有真正 park 的等待者才需要 ParkingCondition 唤醒。
-    ///        自旋中的等待者会在 `signaled` 上看到结果；跳过 notify 可省掉
-    ///        ParkingCondition 内部互斥量，也避免 Close 对已醒节点做无效唤醒。
-    void NotifyIfParked() noexcept {
-      if (!spin_wait || parked.load(std::memory_order_relaxed)) {
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-        GO2CPP_DEBUG_RESOURCE_EVENT(
-            kChannelWake, debug_channel, GO2CPP_DEBUG_BOUND_TASK(),
-            debug_waiter_gid, 0, go2cpp::debug::ResourceResult::kWake, 0,
-            true);
-#else
-        GO2CPP_DEBUG_EVENT(kChannelWake, 0, 2);
-#endif
-        GO2CPP_DEBUG_WAKE_HINT(kChannelRecv);
-        cv.notify_one();
-      }
+    /// @brief 归还池前恢复「新建」状态（同时释放残留值）。
+    void Reset() noexcept {
+      ResetBase();
+      value.reset();
+      ready = false;
+      ok = false;
+      status = ChannelStatus::kWouldBlock;
+      error.reset();
     }
   };
+
+  // -------------------------------------------------------------------------
+  // 节点池 / 唤醒 / 取消 / 等待辅助
+  // -------------------------------------------------------------------------
+
+  static PendingSend* AcquireSendNode() {
+    return detail::WaitNodePool<PendingSend>::Acquire();
+  }
+  static PendingRecv* AcquireRecvNode() {
+    return detail::WaitNodePool<PendingRecv>::Acquire();
+  }
+  static void ReleaseSendNode(PendingSend* node) noexcept {
+    detail::WaitNodePool<PendingSend>::Release(node);
+  }
+  static void ReleaseRecvNode(PendingRecv* node) noexcept {
+    detail::WaitNodePool<PendingRecv>::Release(node);
+  }
+  /// @brief select 节点没有等待者栈帧持有，交接/摘除方负责归还。
+  static void ReleaseSelectNode(PendingSend* node) noexcept {
+    detail::WaitNodePool<PendingSend>::Release(node);
+  }
+  static void ReleaseSelectNode(PendingRecv* node) noexcept {
+    detail::WaitNodePool<PendingRecv>::Release(node);
+  }
+
+  /// @brief 等待节点身份（每次从池取出递增，地址复用时必然变化）。
+  static std::uint32_t NextWaiterGeneration() noexcept {
+    static thread_local std::uint32_t generation = 0;
+    return ++generation;
+  }
+
+  /// @brief 持 Channel 锁调用：推进目标节点自己的 futex 字并定向唤醒。
+  /// @note 调用前必须已经在锁内写完结果标志并发布 `signal`。
+  static void WakeNodeLocked(detail::WaitNodeBase* node) noexcept {
+    node->seq.fetch_add(1, std::memory_order_release);
+    if (node->managed) {
+      // 受管 Fiber：交给 Scheduler；同样在锁内完成，节点在解锁后不再被
+      // 访问，因此不需要额外的 wake gate/refcount。
+      detail::ChannelWakeManaged(node);
+      return;
+    }
+    if (node->parked.load(std::memory_order_relaxed) != 0) {
+      detail::ChannelFutexWake(&node->seq);
+    }
+  }
+
+  /**
+   * @brief 取消回调入口：按（地址, generation）定位节点并唤醒。
+   *
+   * 回调只持 `weak_ptr<CancelHub>`；这里在 Channel 锁内定位，节点若已
+   * 不在队列（交接完成/等待者已退出）就直接返回，绝不访问队列外节点。
+   */
+  void CancelWaiter(std::uint64_t address, std::uint32_t generation) noexcept {
+    std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
+    if (CancelOneLocked(m_senders.head(), address, generation)) {
+      return;
+    }
+    (void)CancelOneLocked(m_receivers.head(), address, generation);
+  }
+
+  static bool CancelOneLocked(detail::WaitNodeBase* node,
+                              std::uint64_t address,
+                              std::uint32_t generation) noexcept {
+    for (; node != nullptr; node = node->next) {
+      if (reinterpret_cast<std::uint64_t>(node) != address ||
+          node->generation != generation) {
+        continue;
+      }
+      std::uint32_t expected =
+          static_cast<std::uint32_t>(detail::WaitSignal::kWaiting);
+      if (node->signal.compare_exchange_strong(
+              expected,
+              static_cast<std::uint32_t>(detail::WaitSignal::kCancelled),
+              std::memory_order_acq_rel, std::memory_order_acquire)) {
+        WakeNodeLocked(node);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /// @brief 注册「到期/取消时唤醒该节点」的 Context 回调。
+  ///
+  /// @warning 必须在**不持有 Channel 锁**时调用：Context 已取消时
+  ///          `AddCallback` 会同步执行回调，而回调会走 hub.mutex → Channel
+  ///          锁；自旋锁不可重入，持锁注册会立刻自锁。
+  /// @return 回调 id；无 context 时为 0。分配失败向上抛，由调用方清理。
+  DoneSignal::CallbackId AddCancelCallback(const ContextPtr& context,
+                                           detail::WaitNodeBase* node) {
+    if (!context) {
+      return 0;
+    }
+    std::weak_ptr<detail::CancelHub<Channel<T>>> weak_hub = m_cancel_hub;
+    const std::uint64_t address = reinterpret_cast<std::uint64_t>(node);
+    const std::uint32_t generation = node->generation;
+    return context->Done().AddCallback([weak_hub, address, generation] {
+      if (auto hub = weak_hub.lock()) {
+        std::lock_guard<std::mutex> gate(hub->mutex);
+        if (hub->owner != nullptr) {
+          hub->owner->CancelWaiter(address, generation);
+        }
+      }
+    });
+  }
+
+  /// @brief 等待节点被唤醒/取消/超时。返回时 Channel 锁未持有。
+  void WaitOnNode(detail::WaitNodeBase* node,
+                  const std::optional<TimePoint>& deadline) {
+    if (!node->managed) {
+      detail::ChannelWaitNative(node, deadline);
+      return;
+    }
+    // 受管 Fiber 的超时必须由 Timer 唤醒（park 期间不能依赖 futex 超时）。
+    core::Timer timer;
+    if (deadline.has_value()) {
+      std::weak_ptr<detail::CancelHub<Channel<T>>> weak_hub = m_cancel_hub;
+      const std::uint64_t address = reinterpret_cast<std::uint64_t>(node);
+      const std::uint32_t generation = node->generation;
+      try {
+        timer = core::TimerService::Default().Schedule(
+            *deadline, [weak_hub, address, generation] {
+              if (auto hub = weak_hub.lock()) {
+                std::lock_guard<std::mutex> gate(hub->mutex);
+                if (hub->owner != nullptr) {
+                  hub->owner->CancelWaiter(address, generation);
+                }
+              }
+            });
+      } catch (...) {
+        // 定时器服务不可用：退化为只依赖调度器的取消/交接唤醒。
+      }
+    }
+    for (;;) {
+      if (node->signal.load(std::memory_order_acquire) !=
+          static_cast<std::uint32_t>(detail::WaitSignal::kWaiting)) {
+        break;
+      }
+      if (deadline.has_value() && std::chrono::steady_clock::now() >= *deadline) {
+        break;
+      }
+      if (!detail::ChannelParkOnce(node)) {
+        std::uint32_t expected =
+            static_cast<std::uint32_t>(detail::WaitSignal::kWaiting);
+        (void)node->signal.compare_exchange_strong(
+            expected,
+            static_cast<std::uint32_t>(detail::WaitSignal::kCancelled),
+            std::memory_order_acq_rel, std::memory_order_acquire);
+        break;
+      }
+    }
+    timer.Cancel();
+  }
 
 #if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
  public:
   // -------------------------------------------------------------------------
-  // 跨进程迁移：等待状态导出 / 接纳（最小子集）
+  // 跨进程迁移：P0 池化后暂不支持
   //
-  // 支持范围：无缓冲通道、单生产者单消费者、无 select、无 deadline/context。
-  // 迁移等待路径**不**进入 ParkingCondition：它把等待节点挂在队列上之后直接
-  // park 当前 Fiber。这样挂起栈帧里没有 WaitNode/Scheduler/堆控制块等跨进程
-  // 无效引用；恢复由宿主 resume，唤醒方不需要 Scheduler。
+  // P0 把等待节点从 `shared_ptr<PendingRecv>`（堆节点 + 控制块）改为
+  // 「thread_local 池 + 裸指针 + per-node futex」。迁移协议要求导出
+  // shared_ptr 的（对象指针, 控制块指针）并在新进程重建引用计数，这与
+  // 池化节点的所有权模型不兼容。这里保留接口但明确拒绝，避免给出语义
+  // 不完整的近似实现；迁移需要等独立的节点所有权设计（P2 之后）。
   // -------------------------------------------------------------------------
 
-  /**
-   * @brief 导出当前唯一的等待者（仅接收方向）。
-   * @details 复杂场景（有缓冲、多个等待者、select、已关闭）明确拒绝，
-   *          不做语义等价的近似导出。
-   */
   bool ExportWaitState(ChannelWaitState* out, std::string* error) override {
-    if (out == nullptr) {
-      if (error != nullptr) *error = "ChannelWaitState 输出为空";
-      return false;
+    if (out != nullptr) {
+      *out = ChannelWaitState{};
     }
-    *out = ChannelWaitState{};
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_capacity != 0 || !m_buffer.empty()) {
-      if (error != nullptr) {
-        *error = "迁移只支持无缓冲通道（capacity=" +
-                 std::to_string(m_capacity) + "）";
-      }
-      return false;
+    if (error != nullptr) {
+      *error = "P0 池化等待节点后不再支持跨进程导出（GO2CPP_MIGRATION_API）";
     }
-    if (!m_senders.empty()) {
-      if (error != nullptr) *error = "通道上存在等待发送者，超出单生产者单消费者子集";
-      return false;
-    }
-    if (m_receivers.size() != 1) {
-      if (error != nullptr) {
-        *error = "通道上必须恰好有一个接收等待者（实际 " +
-                 std::to_string(m_receivers.size()) + "）";
-      }
-      return false;
-    }
-    if (m_closed) {
-      if (error != nullptr) *error = "已关闭的通道不能导出等待状态";
-      return false;
-    }
-    const auto& node = m_receivers.front();
-    if (!node || node->select_state) {
-      if (error != nullptr) *error = "select 等待者不在迁移子集内";
-      return false;
-    }
-    if (node->ready || node->cancelled) {
-      if (error != nullptr) *error = "等待节点已经就绪，导出没有意义";
-      return false;
-    }
-    // std::shared_ptr 是「对象指针 + 控制块指针」两个机器字；迁移必须同时
-    // 重建两者，否则恢复侧析构会访问旧进程的引用计数。
-    static_assert(sizeof(node) == 2U * sizeof(std::uint64_t),
-                  "std::shared_ptr 必须是两机器字布局");
-    std::uint64_t words[2] = {0, 0};
-    std::memcpy(words, &node, sizeof(words));
-    out->kind = 1;
-    out->channel_address = reinterpret_cast<std::uint64_t>(this);
-    out->node_address = words[0];
-    out->control_block = words[1];
-    out->value_bytes = sizeof(T);
-    out->has_value = node->ready ? 1U : 0U;
-    return true;
+    return false;
   }
 
-  /**
-   * @brief 把导入的接收等待者挂回队列。
-   * @details `state.pending_slot` 必须是**新栈**上的 shared_ptr 槽：就地
-   *          构造会接管一份真实引用，避免发送方取走队列引用后节点被提前
-   *          销毁。旧栈槽里的字节来自生成进程，不能调用其析构（控制块在
-   *          旧进程），只能直接覆盖。
-   */
-  bool AdoptWaitState(const ChannelWaitState& state,
-                      ChannelWaitState* adopted,
+  bool AdoptWaitState(const ChannelWaitState& state, ChannelWaitState* adopted,
                       std::string* error) override {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (state.kind != 1) {
-      if (error != nullptr) *error = "迁移只支持接收等待（kind=1）";
-      return false;
-    }
-    if (state.value_bytes != sizeof(T)) {
-      if (error != nullptr) {
-        *error = "等待值类型大小不匹配（快照 " +
-                 std::to_string(state.value_bytes) + "，当前 " +
-                 std::to_string(sizeof(T)) + "）";
-      }
-      return false;
-    }
-    if (m_capacity != 0 || !m_buffer.empty() || !m_senders.empty() ||
-        !m_receivers.empty() || m_closed) {
-      if (error != nullptr) *error = "目标通道必须为空的无缓冲通道";
-      return false;
-    }
-    auto node = std::make_shared<PendingRecv>();
-    node->spin_wait = false;
-    m_receivers.emplace_back(node);
-    ++m_generation;
-    if (state.pending_slot != 0) {
-      auto* slot = reinterpret_cast<std::shared_ptr<PendingRecv>*>(
-          static_cast<std::uintptr_t>(state.pending_slot));
-      new (slot) std::shared_ptr<PendingRecv>(node);
-    }
-    // 额外保持一份引用，直到导入器完成栈槽构造（ReleaseMigrationHold）。
-    m_migration_hold = node;
+    (void)state;
     if (adopted != nullptr) {
       *adopted = ChannelWaitState{};
-      adopted->kind = 1;
-      adopted->channel_address = reinterpret_cast<std::uint64_t>(this);
-      std::uint64_t words[2] = {0, 0};
-      std::memcpy(words, &node, sizeof(words));
-      adopted->node_address = words[0];
-      adopted->control_block = words[1];
-      adopted->pending_slot = state.pending_slot;
-      adopted->value_bytes = sizeof(T);
     }
-    return true;
+    if (error != nullptr) {
+      *error = "P0 池化等待节点后不再支持跨进程接纳（GO2CPP_MIGRATION_API）";
+    }
+    return false;
   }
 
-  /** @brief 通道对象（`Channel<T>` 本体）的起始地址。 */
   std::uint64_t MigrationObjectAddress() const noexcept override {
     return reinterpret_cast<std::uint64_t>(this);
   }
 
-  /** @brief 通道对象大小（句柄重定位的内部偏移上界）。 */
   std::uint64_t MigrationObjectSize() const noexcept override {
     return sizeof(Channel<T>);
   }
 
-  /** @brief 等待节点大小（句柄重定位的内部偏移上界）。 */
   std::uint64_t MigrationNodeSize() const noexcept override {
     return sizeof(PendingRecv);
   }
 
-  /** @brief 释放 Adopt 期间额外持有的节点引用。 */
-  void ReleaseMigrationHold() noexcept override { m_migration_hold.reset(); }
+  void ReleaseMigrationHold() noexcept override {}
 
-  /**
-   * @brief 判断当前等待是否落在迁移子集（调用方必须已持有 m_mutex）。
-   * @note 只做状态检查，不修改通道。
-   */
   bool CanAdoptMigrationWait(std::optional<TimePoint> deadline,
                              const ContextPtr& context) const noexcept {
-    if (deadline.has_value() || context) return false;
-    if (m_capacity != 0 || m_closed) return false;
-    if (!m_buffer.empty() || !m_senders.empty() || !m_receivers.empty()) {
-      return false;
-    }
-    return true;
-  }
-
-  /**
-   * @brief 创建迁移等待节点（noinline：把分配器临时留在独立栈帧里）。
-   *
-   * @details make_shared 与 deque 入队会在调用者栈上留下容器内部指针
-   * （`_M_node` 等）。这些是死值，但导出侧的指针审计无法证明它们已失效，
-   * 会把它们判成未登记堆指针。把这两步放进 noinline 辅助函数后，它们
-   * 的栈帧在返回后会被随后的 `Fiber::Suspend` 调用帧覆盖，审计面对的就
-   * 只剩真正活跃的指针。
-   */
-  [[gnu::noinline]] static std::shared_ptr<PendingRecv>
-  MakeMigrationWaitNode() {
-    auto node = std::make_shared<PendingRecv>();
-    node->spin_wait = false;
-    return node;
-  }
-
-  /// @brief 把迁移等待节点挂进接收队列（noinline，原因见上）。
-  [[gnu::noinline]] void EnqueueMigrationWaitNode(
-      const std::shared_ptr<PendingRecv>& node) {
-    // push_back 返回 void；emplace_back 在 C++17 返回元素引用，内联后会在
-    // 调用者栈上留下 deque block 内的元素地址（堆指针），导出审计会把它
-    // 误判成未登记堆指针。
-    m_receivers.push_back(node);
-    ++m_generation;
-  }
-
-  /**
-   * @brief 迁移子集的阻塞接收：登记节点后直接 park 当前 Fiber。
-   *
-   * @details 调用方必须持有 `lock`（指向 m_mutex）。等待期间释放锁；
-   * 返回时重新持有。恢复后 `self`/`pending` 可能已被导入路径重定位到
-   * 新对象，代码只通过这两个栈上指针访问，不缓存其它堆地址。
-   */
-  ChannelRecvResult<T> RecvMigratable(std::unique_lock<std::mutex>& lock,
-                                      Fiber* self) {
-    std::shared_ptr<PendingRecv> pending;
-    try {
-      pending = MakeMigrationWaitNode();
-    } catch (...) {
-      return {std::nullopt, false, true, ChannelStatus::kInvalid,
-              detail::ValueOperationError()};
-    }
-    EnqueueMigrationWaitNode(pending);
-    for (;;) {
-      if (pending->ready) {
-        return {std::move(pending->value), pending->ok, true, pending->status,
-                pending->error};
-      }
-      if (pending->cancelled) {
-        return {std::nullopt, false, true, pending->status, pending->error};
-      }
-      self->BeginMigrationWait(this, pending.get(), &pending, 1);
-      lock.unlock();
-      const bool suspended = Fiber::Suspend(SuspendReason::Park);
-      if (!lock.owns_lock()) {
-        lock.lock();
-      }
-      self->EndMigrationWait();
-      if (!suspended) {
-        ErasePending(m_receivers, pending);
-        ++m_generation;
-        return {std::nullopt, false, true, ChannelStatus::kInvalid,
-                detail::ValueOperationError()};
-      }
-      // 恢复后重新检查（发送方可能已交接；也可能只是被宿主提前 resume）。
-    }
+    (void)deadline;
+    (void)context;
+    return false;
   }
 
  private:
@@ -2188,11 +2398,12 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     if (m_change_waiters.load(std::memory_order_relaxed) == 0) {
       return;
     }
+    std::lock_guard<std::mutex> lock(m_change_mutex);
     m_change_cv.notify_all();
   }
 
   /**
-   * @brief 快路径的状态变化发布（必须在持 m_mutex 时调用）。
+   * @brief 快路径的状态变化发布（必须在持 Channel 自旋锁时调用）。
    *
    * ## 为什么需要门控
    *
@@ -2273,23 +2484,28 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       return context_status;
     }
 
-    // step2: 关闭的 channel 上发送立即失败。
-    std::unique_lock<std::mutex> lock(m_mutex);
-    // 有缓冲通道在「满」时的自旋只允许发生一次；重试入口见 step4.5。
+    // step2: 全程只持 Channel 自旋锁；park 前一定解锁。
+    std::unique_lock<detail::ChannelSpinLock> lock(m_lock);
     bool spin_attempted = false;
   retry_fast_path:
     if (m_closed) {
       return {ChannelStatus::kClosed, ChannelClosedError()};
     }
 
-    // step3: 优先交接给等待中的接收者（select 节点走 TrySelect，普通节点直接塞值）。
+    // step3: 优先交接给等待中的接收者。等待队列是侵入式链表，摘链 O(1)；
+    // 节点生命周期由等待者线程持有，交接方在锁内访问后立刻不再引用。
     while (!m_receivers.empty()) {
-      auto receiver = m_receivers.front();
-      if (receiver->cancelled) {
+      PendingRecv* receiver = m_receivers.front();
+      if (receiver->signal.load(std::memory_order_acquire) !=
+          static_cast<std::uint32_t>(detail::WaitSignal::kWaiting)) {
+        // 已被取消/超时：取消回调不摘链，这里清理。普通节点由等待者归还池。
         m_receivers.pop_front();
+        if (receiver->IsSelect()) {
+          ReleaseSelectNode(receiver);
+        }
         continue;
       }
-      if (receiver->select_state) {
+      if (receiver->IsSelect()) {
         if constexpr (std::is_copy_constructible<T>::value) {
           SelectProbe probe;
           probe.ready = true;
@@ -2312,17 +2528,17 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
             return {ChannelStatus::kInvalid, detail::ValueOperationError()};
           }
           m_receivers.pop_front();
+          ReleaseSelectNode(receiver);
           if (!selected) {
-            receiver->cancelled = true;
             continue;
           }
-          ++m_generation;
+          m_generation.fetch_add(1, std::memory_order_release);
           lock.unlock();
           NotifyChange();
           return {ChannelStatus::kReady, {}};
         } else {
-          receiver->cancelled = true;
           m_receivers.pop_front();
+          ReleaseSelectNode(receiver);
           continue;
         }
       }
@@ -2334,14 +2550,18 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
         return {ChannelStatus::kInvalid, detail::ValueOperationError()};
       }
       m_receivers.pop_front();
-      receiver->ok = true;
       receiver->ready = true;
+      receiver->ok = true;
       receiver->status = ChannelStatus::kReady;
-      receiver->Signal();
-      receiver->NotifyIfParked();
-      ++m_generation;
+      receiver->signal.store(
+          static_cast<std::uint32_t>(detail::WaitSignal::kReady),
+          std::memory_order_release);
+      WakeNodeLocked(receiver);
+      const bool published = PublishChangeLocked();
       lock.unlock();
-      NotifyChange();
+      if (published) {
+        NotifyChange();
+      }
       return {ChannelStatus::kReady, {}};
     }
 
@@ -2356,17 +2576,10 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       return {ChannelStatus::kReady, {}};
     }
 
-    // step4.5: 缓冲满且是原生线程 —— 先自旋等一个空位，而不是立刻 park。
-    //
-    // 为什么关键：发送者一旦 park，消费者每取走一条都会经 RefillBufferLocked()
-    // 唤醒它一次，交接退化成「每条消息一次 futex 往返」（WSL2 上 20-30µs）。
-    // 自旋命中时发送者保持批量填充，cap1024 的 1P1C 1M 条吞吐从 ~140ns/op
-    // 回到快路径量级。自旋用的代际只在有观察者时才被推进（见
-    // PublishChangeLocked），因此不会给无等待者的快路径增加跨核写。
-    //
-    // 只自旋一次：预算耗尽说明对端确实慢，继续烧 CPU 不如 park。
-    if (!spin_attempted && allow_spin && m_capacity > 1 &&
-        m_capacity <= 256 && !nonblocking && detail::CanSpinWait()) {
+    // step4.5: 缓冲满且是原生线程——先自旋等一个空位，而不是立刻 park。
+    // 与 P0 前一致：只自旋一次，预算耗尽说明对端确实慢。
+    if (!spin_attempted && allow_spin && m_capacity > 1 && m_capacity <= 256 &&
+        !nonblocking && detail::CanSpinWait()) {
       spin_attempted = true;
       const std::uint64_t sequence =
           m_generation.load(std::memory_order_relaxed);
@@ -2375,10 +2588,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       (void)detail::SpinForChange(m_generation, sequence);
       m_generation_watchers.fetch_sub(1, std::memory_order_acq_rel);
       lock.lock();
-      // **必须重检快路径**：自旋窗口内缓冲可能出现空位，而代际推进未必
-      // 能被观察到（对方可能在本线程 fetch_add 之前就完成入/出队）。旧写法
-      // 直接落到 park，会「带着可用空位去睡眠」：既多付一次 futex，又让
-      // 下一个发送者绕过缓冲直接交接，破坏 FIFO（实测 100k 条 157 次乱序）。
+      // 自旋窗口内缓冲可能出现空位；必须重检快路径，不能带着空位直接 park。
       goto retry_fast_path;
     }
 
@@ -2388,140 +2598,251 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     if (DeadlineReached(deadline)) {
       return {ChannelStatus::kTimedOut, ChannelTimeoutError()};
     }
-
     if (core::ParkingCondition::FiberWaitUnsupported()) {
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
-    // step5: 既无接收者又无空位——登记 PendingSend，并挂 context 回调
-    // （取消时立刻唤醒，不必等下一个 send/recv）。
-    //
-    // 自旋只对 capacity <= 1 的通道启用：有缓冲通道（cap64/1024）的吞吐依赖
-    // "等待者睡眠期间生产者批量填缓冲"；自旋会让等待者醒来后逐条 rendezvous，
-    // 把批量交接退化成每消息一次 pending 分配 + 交接（实测 cap1024 从
-    // ~40ns/msg 退化到 ~100ns/msg）。容量 1 没有批量空间，cap0 更是纯 rendezvous。
-    // 受管 Fiber 不参与自旋，否则会占住 carrier M 线程。
-    const bool spin_before_park = detail::CanSpinWait() && m_capacity <= 1;
-    std::shared_ptr<PendingSend> pending;
+
+    // step5: 登记节点并挂 context 取消回调。节点从线程本地池取，稳态零分配。
+    PendingSend* node = nullptr;
     try {
-      pending = std::make_shared<PendingSend>(std::move(value));
-      // 必须在入队前写好：完成方会在 m_mutex 内根据它决定是否维护
-      // signaled/parked 原子协议（cap>1 的等待者直接 park，不需要）。
-      pending->spin_wait = spin_before_park;
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-      pending->debug_channel = m_debug_resource;
-      pending->debug_waiter_gid = GO2CPP_DEBUG_BOUND_TASK();
-#endif
-      m_senders.emplace_back(pending);
+      node = AcquireSendNode();
+      node->value.emplace(std::move(value));
     } catch (...) {
+      if (node != nullptr) {
+        ReleaseSendNode(node);
+      }
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+    }
+    node->generation = NextWaiterGeneration();
+    const bool native_waiter = detail::CanSpinWait();
+    if (!native_waiter && !detail::ChannelBindManaged(node)) {
+      ReleaseSendNode(node);
+      return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+    }
+    m_senders.push_back(node);
+    // 窗口闭合：注册取消回调期间释放过 Channel 锁，可能已有接收者入队或
+    // 缓冲出现空位。如果此刻直接去睡，两个方向会各自在队列里互等（P0
+    // 第一版的挂起根因）。这里在同一临界区内撤销入队并完成发送。
+    if (!m_receivers.empty()) {
+      while (!m_receivers.empty()) {
+        PendingRecv* receiver = m_receivers.front();
+        if (receiver->signal.load(std::memory_order_acquire) !=
+            static_cast<std::uint32_t>(detail::WaitSignal::kWaiting)) {
+          m_receivers.pop_front();
+          if (receiver->IsSelect()) {
+            ReleaseSelectNode(receiver);
+          }
+          continue;
+        }
+        if (receiver->IsSelect()) {
+          if constexpr (!std::is_copy_constructible<T>::value) {
+            m_receivers.pop_front();
+            ReleaseSelectNode(receiver);
+            continue;
+          } else {
+            SelectProbe probe;
+            probe.ready = true;
+            probe.ok = true;
+            probe.status = ChannelStatus::kReady;
+            bool value_ok = false;
+            try {
+              value_ok = probe.SetValue(*node->value);
+            } catch (...) {
+              m_senders.erase(node);
+              ReleaseSendNode(node);
+              return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+            }
+            if (!value_ok) {
+              m_senders.erase(node);
+              ReleaseSendNode(node);
+              return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+            }
+            bool selected = false;
+            try {
+              selected = receiver->select_state->TrySelect(
+                  receiver->select_index, std::move(probe));
+            } catch (...) {
+              m_senders.erase(node);
+              ReleaseSendNode(node);
+              return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+            }
+            m_receivers.pop_front();
+            ReleaseSelectNode(receiver);
+            if (!selected) {
+              continue;
+            }
+            m_senders.erase(node);
+            ReleaseSendNode(node);
+            m_generation.fetch_add(1, std::memory_order_release);
+            lock.unlock();
+            NotifyChange();
+            return {ChannelStatus::kReady, {}};
+          }
+        }
+        try {
+          receiver->value.emplace(std::move(*node->value));
+        } catch (...) {
+          m_senders.erase(node);
+          ReleaseSendNode(node);
+          return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+        }
+        m_receivers.pop_front();
+        receiver->ready = true;
+        receiver->ok = true;
+        receiver->status = ChannelStatus::kReady;
+        receiver->signal.store(
+            static_cast<std::uint32_t>(detail::WaitSignal::kReady),
+            std::memory_order_release);
+        WakeNodeLocked(receiver);
+        m_senders.erase(node);
+        ReleaseSendNode(node);
+        const bool published = PublishChangeLocked();
+        lock.unlock();
+        if (published) {
+          NotifyChange();
+        }
+        return {ChannelStatus::kReady, {}};
+      }
+    }
+    if (m_buffer.size() < m_capacity) {
+      m_buffer.emplace_back(std::move(*node->value));
+      m_senders.erase(node);
+      ReleaseSendNode(node);
+      const bool published = PublishChangeLocked();
+      lock.unlock();
+      if (published) {
+        NotifyChange();
+      }
+      return {ChannelStatus::kReady, {}};
     }
     // 发送方即将 park：只在阻塞路径记录（缓冲命中/立即交接无开销）。
     GO2CPP_DEBUG_PARK_HINT(kChannelSend);
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
     GO2CPP_DEBUG_RESOURCE_EVENT_EX(
         kChannelSend, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
-        detail::ChannelDebugValue(pending->value),
+        node->value.has_value() ? detail::ChannelDebugValue(*node->value) : 0,
         go2cpp::debug::ResourceResult::kBlocked,
         static_cast<std::uint32_t>(m_senders.size()), true,
         detail::ChannelDebugValueFlags<T>());
 #else
     GO2CPP_DEBUG_EVENT(kChannelSend, 0, m_capacity);
 #endif
+    // 注册取消回调必须在不持 Channel 锁时进行：若 context 已取消，
+    // AddCallback 会同步执行回调，而回调需要 Channel 锁（自旋锁不可重入）。
     CallbackGuard callback_guard{context};
     if (context) {
+      lock.unlock();
       try {
-        callback_guard.id = context->Done().AddCallback(
-            [pending] { pending->cv.notify_one(); });
+        callback_guard.id = AddCancelCallback(context, node);
       } catch (...) {
-        ErasePending(m_senders, pending);
-        ++m_generation;
+        lock.lock();
+        // 极端路径：注册失败时先看是否已经被交接/关闭，再决定清理。
+        if (node->accepted) {
+          lock.unlock();
+          ReleaseSendNode(node);
+          return {ChannelStatus::kReady, {}};
+        }
+        if (node->closed) {
+          ErrorPtr error = node->error;
+          lock.unlock();
+          ReleaseSendNode(node);
+          return {ChannelStatus::kClosed, error ? error : ChannelClosedError()};
+        }
+        if (node->linked) {
+          node->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kCancelled),
+              std::memory_order_release);
+          m_senders.erase(node);
+        }
+        lock.unlock();
+        ReleaseSendNode(node);
         return {ChannelStatus::kInvalid, detail::ValueOperationError()};
       }
+      lock.lock();
     }
 
-    // step6: park 等待循环——每次唤醒后重检 accepted/closed/cancelled/
-    // context/deadline，任一成立就清理并返回。原生线程在 park 前先做一次
-    // 自适应短自旋，自旋成功即免掉一次 futex 睡眠 + 唤醒。
+    // step6: 等待循环。每次醒来后在锁内重检 accepted/closed/context/deadline；
+    // 都不成立就回到锁外睡眠（自旋 + futex / Scheduler park）。
+    ChannelSendResult result{ChannelStatus::kWouldBlock, {}};
+    bool moved_change = false;
     for (;;) {
-      if (pending->accepted) {
-        return {ChannelStatus::kReady, {}};
+      if (node->accepted) {
+        result = {ChannelStatus::kReady, {}};
+        break;
       }
-      if (pending->closed) {
-        return {ChannelStatus::kClosed,
-                pending->error ? pending->error : ChannelClosedError()};
-      }
-      if (pending->cancelled) {
-        return {pending->status, pending->error};
+      if (node->closed) {
+        result = {ChannelStatus::kClosed,
+                  node->error ? node->error : ChannelClosedError()};
+        break;
       }
 
       ErrorPtr context_error;
       const auto context_status = ContextRecvStatus(context, &context_error);
       if (context_status != ChannelStatus::kReady ||
           core::ParkingCondition::CancellationRequested()) {
-        pending->cancelled = true;
-        pending->status = context_status != ChannelStatus::kReady
-                              ? context_status
-                              : ChannelStatus::kCancelled;
-        pending->error = context_error ? context_error : CanceledError();
-        ErasePending(m_senders, pending);
-        ++m_generation;
-        lock.unlock();
-        NotifyChange();
-        return {pending->status, pending->error};
+        node->status = context_status != ChannelStatus::kReady
+                           ? context_status
+                           : ChannelStatus::kCancelled;
+        node->error = context_error ? context_error : CanceledError();
+        if (node->linked) {
+          node->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kCancelled),
+              std::memory_order_release);
+          m_senders.erase(node);
+        }
+        moved_change = true;
+        result = {node->status, node->error};
+        break;
       }
       if (DeadlineReached(deadline)) {
-        pending->cancelled = true;
-        pending->status = ChannelStatus::kTimedOut;
-        pending->error = ChannelTimeoutError();
-        ErasePending(m_senders, pending);
-        ++m_generation;
-        lock.unlock();
-        NotifyChange();
-        return {ChannelStatus::kTimedOut, pending->error};
+        node->status = ChannelStatus::kTimedOut;
+        node->error = ChannelTimeoutError();
+        if (node->linked) {
+          node->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kCancelled),
+              std::memory_order_release);
+          m_senders.erase(node);
+        }
+        moved_change = true;
+        result = {ChannelStatus::kTimedOut, node->error};
+        break;
+      }
+      if (node->signal.load(std::memory_order_acquire) !=
+          static_cast<std::uint32_t>(detail::WaitSignal::kWaiting)) {
+        // 取消回调已置位但 context/deadline 尚未可见（理论上不会发生）：
+        // 按取消返回，绝不在已终止的节点上空转。
+        node->status = ChannelStatus::kCancelled;
+        node->error = CanceledError();
+        if (node->linked) {
+          m_senders.erase(node);
+        }
+        moved_change = true;
+        result = {node->status, node->error};
+        break;
       }
 
-      if (spin_before_park && !spin_attempted) {
-        // 自旋期间不持 m_mutex，对端可以正常把它认领走；返回后重新加锁
-        // 并按最新标志裁决，若仍无结果才真正 park。
-        spin_attempted = true;
-        lock.unlock();
-        (void)detail::SpinForSignal(pending->signaled);
-        lock.lock();
-        continue;
-      }
-
-      if (spin_before_park) {
-        pending->parked.store(true, std::memory_order_relaxed);
-      }
-      // 只有启用自旋的通道才需要 park 时长反馈；有缓冲通道（cap>1）的
-      // 高频 park 路径不能为一次 clock_gettime 付费（64 线程压测下实测
-      // 会带来 ~10% 的回退）。
-      const auto park_start = spin_before_park
-                                  ? std::chrono::steady_clock::now()
-                                  : std::chrono::steady_clock::time_point{};
-      if (deadline.has_value()) {
-        auto wait_for = *deadline - std::chrono::steady_clock::now();
-        pending->cv.wait_for(lock, wait_for, [&] {
-          return pending->accepted || pending->closed || pending->cancelled ||
-                 (context && context->IsDone());
-        });
-      } else {
-        pending->cv.wait(lock, [&] {
-          return pending->accepted || pending->closed || pending->cancelled ||
-                 (context && context->IsDone());
-        });
-      }
-      if (spin_before_park) {
-        pending->parked.store(false, std::memory_order_relaxed);
-      }
-      if (spin_before_park &&
-          pending->signaled.load(std::memory_order_acquire)) {
-        detail::ObserveParkDurationNs(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - park_start)
-                .count());
-      }
+      lock.unlock();
+      WaitOnNode(node, deadline);
+      lock.lock();
     }
+
+    // 收尾：兜底摘链（正常路径已在上面摘过或被交接方摘走）。
+    if (node->linked) {
+      node->signal.store(
+          static_cast<std::uint32_t>(detail::WaitSignal::kCancelled),
+          std::memory_order_release);
+      m_senders.erase(node);
+      moved_change = true;
+    }
+    if (moved_change) {
+      m_generation.fetch_add(1, std::memory_order_release);
+    }
+    lock.unlock();
+    if (moved_change) {
+      NotifyChange();
+    }
+    ReleaseSendNode(node);
+    return result;
   }
 
   ChannelRecvResult<T> RecvUntil(std::optional<TimePoint> deadline,
@@ -2533,9 +2854,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
               context_status.error};
     }
 
-    std::unique_lock<std::mutex> lock(m_mutex);
-
-    // 有缓冲通道在「空」时的自旋只允许发生一次；重试入口见下方。
+    std::unique_lock<detail::ChannelSpinLock> lock(m_lock);
     bool spin_attempted = false;
   retry_fast_path:
     if (!m_buffer.empty()) {
@@ -2556,15 +2875,18 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
 
     // 无缓冲发送者可以直接与该接收者会合交接。
     while (!m_senders.empty()) {
-      auto sender = m_senders.front();
-      if (sender->cancelled) {
+      PendingSend* sender = m_senders.front();
+      if (sender->signal.load(std::memory_order_acquire) !=
+          static_cast<std::uint32_t>(detail::WaitSignal::kWaiting)) {
         m_senders.pop_front();
+        if (sender->IsSelect()) {
+          ReleaseSelectNode(sender);
+        }
         continue;
       }
-      if (sender->select_state) {
+      if (sender->IsSelect()) {
         // 在值可以传输前不能先认领已选中的发送者。对可能抛异常的值类型
-        // 要求存在 noexcept 的复制/移动路径；否则保留发送者在队列中，
-        // 返回可恢复的操作失败。
+        // 要求存在 noexcept 的复制/移动路径；否则保留发送者在队列中。
         if constexpr (!std::is_nothrow_move_constructible<T>::value &&
                       !std::is_nothrow_copy_constructible<T>::value) {
           return {std::nullopt, false, true, ChannelStatus::kInvalid,
@@ -2576,46 +2898,58 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
           probe.status = ChannelStatus::kReady;
           if (!sender->select_state->TrySelect(sender->select_index,
                                                std::move(probe))) {
-            sender->cancelled = true;
             m_senders.pop_front();
+            ReleaseSelectNode(sender);
             continue;
           }
         }
       }
       if constexpr (std::is_nothrow_move_constructible<T>::value) {
-        T value = std::move(sender->value);
+        T value = std::move(*sender->value);
         m_senders.pop_front();
-        sender->accepted = true;
-        sender->status = ChannelStatus::kReady;
-        sender->Signal();
-        sender->NotifyIfParked();
-        ++m_generation;
+        if (sender->IsSelect()) {
+          ReleaseSelectNode(sender);
+        } else {
+          sender->accepted = true;
+          sender->status = ChannelStatus::kReady;
+          sender->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kReady),
+              std::memory_order_release);
+          WakeNodeLocked(sender);
+        }
+        const bool published = PublishChangeLocked();
         lock.unlock();
-        NotifyChange();
+        if (published) {
+          NotifyChange();
+        }
         return {std::optional<T>(std::move(value)), true, true,
                 ChannelStatus::kReady, {}};
       } else {
-        // 唯一剩余的可接受路径是 noexcept 复制。返回复制值，避免选中后
-        // 再调用可能抛异常的移动构造。
-        T value = sender->value;
+        // 唯一剩余的可接受路径是 noexcept 复制。
+        T value = *sender->value;
         m_senders.pop_front();
-        sender->accepted = true;
-        sender->status = ChannelStatus::kReady;
-        sender->Signal();
-        sender->NotifyIfParked();
-        ++m_generation;
+        if (sender->IsSelect()) {
+          ReleaseSelectNode(sender);
+        } else {
+          sender->accepted = true;
+          sender->status = ChannelStatus::kReady;
+          sender->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kReady),
+              std::memory_order_release);
+          WakeNodeLocked(sender);
+        }
+        const bool published = PublishChangeLocked();
         lock.unlock();
-        NotifyChange();
-        return {std::optional<T>(value), true, true,
-                ChannelStatus::kReady, {}};
+        if (published) {
+          NotifyChange();
+        }
+        return {std::optional<T>(value), true, true, ChannelStatus::kReady, {}};
       }
     }
 
-    // 缓冲空且没有待交接的发送者：原生线程先自旋等数据，避免直接 park 后
-    // 生产者每条消息都要付一次 futex 唤醒（原因与实现对称性见 SendUntil
-    // 的 step4.5）。cap<=1 仍走下面 pending 节点上的自旋。
-    if (!spin_attempted && allow_spin && m_capacity > 1 &&
-        m_capacity <= 256 && !nonblocking && detail::CanSpinWait()) {
+    // 缓冲空且没有待交接的发送者：原生线程先自旋等数据。
+    if (!spin_attempted && allow_spin && m_capacity > 1 && m_capacity <= 256 &&
+        !nonblocking && detail::CanSpinWait()) {
       spin_attempted = true;
       const std::uint64_t sequence =
           m_generation.load(std::memory_order_relaxed);
@@ -2624,9 +2958,6 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       (void)detail::SpinForChange(m_generation, sequence);
       m_generation_watchers.fetch_sub(1, std::memory_order_acq_rel);
       lock.lock();
-      // 与 SendUntil 相同：自旋后必须重检缓冲/发送者，不能直接去 park，
-      // 否则「自旋期间已经到达的值」会被留在缓冲里，后续发送者绕过缓冲
-      // 直接交接，破坏 FIFO。
       goto retry_fast_path;
     }
 
@@ -2649,37 +2980,102 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       return {std::nullopt, false, false, ChannelStatus::kTimedOut,
               ChannelTimeoutError()};
     }
-
-#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
-    // 迁移等待子集：显式开启迁移的 Fiber + 无缓冲空通道 + 无 context/deadline。
-    // 走独立路径，避免在挂起栈上留下 ParkingCondition 的堆等待节点。
-    if (Fiber* const migration_fiber = Fiber::Current();
-        migration_fiber != nullptr && migration_fiber->migration_enabled() &&
-        CanAdoptMigrationWait(deadline, context)) {
-      return RecvMigratable(lock, migration_fiber);
-    }
-#endif
     if (core::ParkingCondition::FiberWaitUnsupported()) {
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
               detail::ValueOperationError()};
     }
-    // 与 SendUntil 相同：原生线程在 park 前先做一次自适应短自旋，且只对
-    // capacity <= 1 的通道启用（原因见 SendUntil 的注释：有缓冲通道依赖
-    // 等待者睡眠期间批量填/取缓冲，自旋会把批量交接退化成逐条 rendezvous）。
-    const bool spin_before_park = detail::CanSpinWait() && m_capacity <= 1;
-    std::shared_ptr<PendingRecv> pending;
+
+    PendingRecv* node = nullptr;
     try {
-      pending = std::make_shared<PendingRecv>();
-      // 必须在入队前写好：完成方据此决定是否维护 signaled/parked 协议。
-      pending->spin_wait = spin_before_park;
-#if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-      pending->debug_channel = m_debug_resource;
-      pending->debug_waiter_gid = GO2CPP_DEBUG_BOUND_TASK();
-#endif
-      m_receivers.emplace_back(pending);
+      node = AcquireRecvNode();
     } catch (...) {
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
               detail::ValueOperationError()};
+    }
+    node->generation = NextWaiterGeneration();
+    const bool native_waiter = detail::CanSpinWait();
+    if (!native_waiter && !detail::ChannelBindManaged(node)) {
+      ReleaseRecvNode(node);
+      return {std::nullopt, false, true, ChannelStatus::kInvalid,
+              detail::ValueOperationError()};
+    }
+    m_receivers.push_back(node);
+    // 窗口闭合：注册取消回调期间可能已有发送者入队（与 SendUntil 对称）。
+    // 在同一临界区内撤销入队并完成接收，避免双向互等。
+    while (!m_senders.empty()) {
+      PendingSend* sender = m_senders.front();
+      if (sender->signal.load(std::memory_order_acquire) !=
+          static_cast<std::uint32_t>(detail::WaitSignal::kWaiting)) {
+        m_senders.pop_front();
+        if (sender->IsSelect()) {
+          ReleaseSelectNode(sender);
+        }
+        continue;
+      }
+      if (sender->IsSelect()) {
+        if constexpr (!std::is_nothrow_move_constructible<T>::value &&
+                      !std::is_nothrow_copy_constructible<T>::value) {
+          m_receivers.erase(node);
+          ReleaseRecvNode(node);
+          return {std::nullopt, false, true, ChannelStatus::kInvalid,
+                  detail::ValueOperationError()};
+        } else {
+          SelectProbe probe;
+          probe.ready = true;
+          probe.ok = true;
+          probe.status = ChannelStatus::kReady;
+          if (!sender->select_state->TrySelect(sender->select_index,
+                                               std::move(probe))) {
+            m_senders.pop_front();
+            ReleaseSelectNode(sender);
+            continue;
+          }
+        }
+      }
+      if constexpr (std::is_nothrow_move_constructible<T>::value) {
+        T value = std::move(*sender->value);
+        m_senders.pop_front();
+        m_receivers.erase(node);
+        ReleaseRecvNode(node);
+        if (sender->IsSelect()) {
+          ReleaseSelectNode(sender);
+        } else {
+          sender->accepted = true;
+          sender->status = ChannelStatus::kReady;
+          sender->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kReady),
+              std::memory_order_release);
+          WakeNodeLocked(sender);
+        }
+        const bool published = PublishChangeLocked();
+        lock.unlock();
+        if (published) {
+          NotifyChange();
+        }
+        return {std::optional<T>(std::move(value)), true, true,
+                ChannelStatus::kReady, {}};
+      } else {
+        T value = *sender->value;
+        m_senders.pop_front();
+        m_receivers.erase(node);
+        ReleaseRecvNode(node);
+        if (sender->IsSelect()) {
+          ReleaseSelectNode(sender);
+        } else {
+          sender->accepted = true;
+          sender->status = ChannelStatus::kReady;
+          sender->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kReady),
+              std::memory_order_release);
+          WakeNodeLocked(sender);
+        }
+        const bool published = PublishChangeLocked();
+        lock.unlock();
+        if (published) {
+          NotifyChange();
+        }
+        return {std::optional<T>(value), true, true, ChannelStatus::kReady, {}};
+      }
     }
     // 接收方即将 park：只在阻塞路径记录（缓冲命中/立即交接无开销）。
     GO2CPP_DEBUG_PARK_HINT(kChannelRecv);
@@ -2691,106 +3087,130 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
 #else
     GO2CPP_DEBUG_EVENT(kChannelRecv, 0, m_capacity);
 #endif
+    // 注册取消回调必须在不持 Channel 锁时进行（原因见 SendUntil）。
     CallbackGuard callback_guard{context};
     if (context) {
+      lock.unlock();
       try {
-        callback_guard.id = context->Done().AddCallback(
-            [pending] { pending->cv.notify_one(); });
+        callback_guard.id = AddCancelCallback(context, node);
       } catch (...) {
-        ErasePending(m_receivers, pending);
-        ++m_generation;
+        lock.lock();
+        if (node->ready) {
+          ChannelRecvResult<T> ready_result{std::move(node->value), node->ok,
+                                            true, node->status, node->error};
+          lock.unlock();
+          ReleaseRecvNode(node);
+          return ready_result;
+        }
+        if (node->linked) {
+          node->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kCancelled),
+              std::memory_order_release);
+          m_receivers.erase(node);
+        }
+        lock.unlock();
+        ReleaseRecvNode(node);
         return {std::nullopt, false, true, ChannelStatus::kInvalid,
                 detail::ValueOperationError()};
       }
+      lock.lock();
     }
 
+    ChannelRecvResult<T> result{std::nullopt, false, true,
+                                ChannelStatus::kWouldBlock, {}};
+    bool moved_change = false;
     for (;;) {
-      if (pending->ready) {
-        return {std::move(pending->value), pending->ok, true, pending->status,
-                pending->error};
-      }      if (pending->cancelled) {
-        return {std::nullopt, false, true, pending->status, pending->error};
+      if (node->ready) {
+        result = {std::move(node->value), node->ok, true, node->status,
+                  node->error};
+        break;
+      }
+      if (node->signal.load(std::memory_order_acquire) ==
+          static_cast<std::uint32_t>(detail::WaitSignal::kClosed)) {
+        result = {std::nullopt, false, true, ChannelStatus::kClosed,
+                  ChannelClosedError()};
+        break;
       }
 
       context_error.reset();
       const auto status = ContextRecvStatus(context, &context_error);
       if (status != ChannelStatus::kReady ||
           core::ParkingCondition::CancellationRequested()) {
-        pending->cancelled = true;
-        pending->status = status != ChannelStatus::kReady
-                              ? status
-                              : ChannelStatus::kCancelled;
-        pending->error = context_error ? context_error : CanceledError();
-        ErasePending(m_receivers, pending);
-        ++m_generation;
-        lock.unlock();
-        NotifyChange();
-        return {std::nullopt, false, true, pending->status, pending->error};
+        node->status = status != ChannelStatus::kReady
+                           ? status
+                           : ChannelStatus::kCancelled;
+        node->error = context_error ? context_error : CanceledError();
+        if (node->linked) {
+          node->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kCancelled),
+              std::memory_order_release);
+          m_receivers.erase(node);
+        }
+        moved_change = true;
+        result = {std::nullopt, false, true, node->status, node->error};
+        break;
       }
       if (DeadlineReached(deadline)) {
-        pending->cancelled = true;
-        pending->status = ChannelStatus::kTimedOut;
-        pending->error = ChannelTimeoutError();
-        ErasePending(m_receivers, pending);
-        ++m_generation;
-        lock.unlock();
-        NotifyChange();
-        return {std::nullopt, false, false, ChannelStatus::kTimedOut,
-                pending->error};
+        node->status = ChannelStatus::kTimedOut;
+        node->error = ChannelTimeoutError();
+        if (node->linked) {
+          node->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kCancelled),
+              std::memory_order_release);
+          m_receivers.erase(node);
+        }
+        moved_change = true;
+        result = {std::nullopt, false, false, ChannelStatus::kTimedOut,
+                  node->error};
+        break;
+      }
+      if (node->signal.load(std::memory_order_acquire) !=
+          static_cast<std::uint32_t>(detail::WaitSignal::kWaiting)) {
+        node->status = ChannelStatus::kCancelled;
+        node->error = CanceledError();
+        if (node->linked) {
+          m_receivers.erase(node);
+        }
+        moved_change = true;
+        result = {std::nullopt, false, true, node->status, node->error};
+        break;
       }
 
-      if (spin_before_park && !spin_attempted) {
-        // 与 SendUntil 相同的「先自旋、后 park」：接收方的交接通常由正在
-        // 发送的对端在几百纳秒内完成，能省掉一次 futex 往返。
-        spin_attempted = true;
-        lock.unlock();
-        (void)detail::SpinForSignal(pending->signaled);
-        lock.lock();
-        continue;
-      }
-
-      if (spin_before_park) {
-        pending->parked.store(true, std::memory_order_relaxed);
-      }
-      // 只有启用自旋的通道才需要 park 时长反馈；有缓冲通道（cap>1）的
-      // 高频 park 路径不能为一次 clock_gettime 付费（64 线程压测下实测
-      // 会带来 ~10% 的回退）。
-      const auto park_start = spin_before_park
-                                  ? std::chrono::steady_clock::now()
-                                  : std::chrono::steady_clock::time_point{};
-      if (deadline.has_value()) {
-        auto wait_for = *deadline - std::chrono::steady_clock::now();
-        pending->cv.wait_for(lock, wait_for, [&] {
-          return pending->ready || pending->cancelled ||
-                 (context && context->IsDone());
-        });
-      } else {
-        pending->cv.wait(lock, [&] {
-          return pending->ready || pending->cancelled ||
-                 (context && context->IsDone());
-        });
-      }
-      if (spin_before_park) {
-        pending->parked.store(false, std::memory_order_relaxed);
-      }
-      if (spin_before_park &&
-          pending->signaled.load(std::memory_order_acquire)) {
-        detail::ObserveParkDurationNs(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - park_start)
-                .count());
-      }
+      lock.unlock();
+      WaitOnNode(node, deadline);
+      lock.lock();
     }
+
+    if (node->linked) {
+      node->signal.store(
+          static_cast<std::uint32_t>(detail::WaitSignal::kCancelled),
+          std::memory_order_release);
+      m_receivers.erase(node);
+      moved_change = true;
+    }
+    if (moved_change) {
+      m_generation.fetch_add(1, std::memory_order_release);
+    }
+    lock.unlock();
+    if (moved_change) {
+      NotifyChange();
+    }
+    ReleaseRecvNode(node);
+    return result;
   }
 
   void RefillBufferLocked() {
     while (!m_senders.empty()) {
-      auto sender = m_senders.front();
-      if (sender->cancelled) {
+      PendingSend* sender = m_senders.front();
+      if (sender->signal.load(std::memory_order_acquire) !=
+          static_cast<std::uint32_t>(detail::WaitSignal::kWaiting)) {
         m_senders.pop_front();
+        if (sender->IsSelect()) {
+          ReleaseSelectNode(sender);
+        }
         continue;
       }
-      if (sender->select_state) {
+      if (sender->IsSelect()) {
         if constexpr (!std::is_nothrow_move_constructible<T>::value &&
                       !std::is_nothrow_copy_constructible<T>::value) {
           // 不要认领一个无法在不冒缓冲区半提交风险的情况下传输值的 select。
@@ -2798,9 +3218,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
         } else {
           bool pushed = false;
           if constexpr (std::is_nothrow_move_constructible<T>::value) {
-            pushed = m_buffer.TryPush(std::move(sender->value));
+            pushed = m_buffer.TryPush(std::move(*sender->value));
           } else {
-            pushed = m_buffer.TryPush(sender->value);
+            pushed = m_buffer.TryPush(*sender->value);
           }
           if (!pushed) {
             break;
@@ -2816,39 +3236,31 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
           } catch (...) {
             selected = false;
           }
+          m_senders.pop_front();
+          ReleaseSelectNode(sender);
           if (!selected) {
             (void)m_buffer.TryPopBack();
-            sender->cancelled = true;
-            m_senders.pop_front();
-            continue;
           }
-          sender->cancelled = true;
-          m_senders.pop_front();
           continue;
         }
       }
       bool pushed = false;
       if constexpr (std::is_nothrow_move_constructible<T>::value) {
-        pushed = m_buffer.TryPush(std::move(sender->value));
+        pushed = m_buffer.TryPush(std::move(*sender->value));
       } else {
-        pushed = m_buffer.TryPush(sender->value);
+        pushed = m_buffer.TryPush(*sender->value);
       }
       if (!pushed) {
         break;
       }
+      m_senders.pop_front();
       sender->accepted = true;
       sender->status = ChannelStatus::kReady;
-      sender->Signal();
-      sender->NotifyIfParked();
-      m_senders.pop_front();
+      sender->signal.store(static_cast<std::uint32_t>(detail::WaitSignal::kReady),
+                           std::memory_order_release);
+      WakeNodeLocked(sender);
       break;
     }
-  }
-
-  template <typename Node>
-  static void ErasePending(std::deque<std::shared_ptr<Node>>& queue,
-                           const std::shared_ptr<Node>& node) {
-    queue.erase(std::remove(queue.begin(), queue.end(), node), queue.end());
   }
 
   /// @brief 固定容量（创建后不变）；0 表示无缓冲 rendezvous。
@@ -2857,30 +3269,30 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   /// @brief 资源级历史编号（构造时注册；OFF 构建不存在该成员）。
   go2cpp::debug::ResourceId m_debug_resource{0};
 #endif
-  /// @brief 保护 buffer/senders/receivers/closed；Send/Recv/Close/Select 全部竞争它。
-  mutable std::mutex m_mutex;
-  /// @brief 状态变化通知（有值可收 / 有空间可发 / 已关闭）；等待者在锁外 park 在它上面。
+  /// @brief 保护 buffer/senders/receivers/closed；Send/Recv/Close/Select 全竞争它。
+  ///        自旋锁只在极短临界区内持有，**绝不允许持锁 park**。
+  mutable detail::ChannelSpinLock m_lock;
+  /// @brief WaitForChange 的等待互斥量与条件变量（冷路径，独立于自旋锁）。
+  mutable std::mutex m_change_mutex;
+  /// @brief 状态变化通知；等待者在锁外 park 在它上面（仅 WaitForChange）。
   mutable core::ParkingCondition m_change_cv;
   /// @brief 正在 m_change_cv 上等待的线程/G 数量；为 0 时省掉一次 notify_all。
   mutable std::atomic<std::uint32_t> m_change_waiters{0};
-  /// @brief 环形缓冲（cap==0 时不分配）；Send 入队、Recv 出队，索引回绕在 RingBuffer 内部。
+  /// @brief 环形缓冲（cap==0 时不分配）；Send 入队、Recv 出队。
   detail::RingBuffer<T> m_buffer;
-  /// @brief 已登记但尚未拿到接收者的发送者队列；Recv 从这里直接取走值完成交接（绕过缓冲）。
-  std::deque<std::shared_ptr<PendingSend>> m_senders;
-  /// @brief 已登记但尚未拿到值的接收者队列；Send 直接把值塞给它完成交接。
-  std::deque<std::shared_ptr<PendingRecv>> m_receivers;
+  /// @brief 已登记但尚未拿到接收者的发送者队列（裸指针，节点由等待者持有）。
+  detail::WaitQueue<PendingSend> m_senders;
+  /// @brief 已登记但尚未拿到值的接收者队列（裸指针，节点由等待者持有）。
+  detail::WaitQueue<PendingRecv> m_receivers;
   /// @brief 已关闭标记；Close 后 Send 返回 kClosed，Recv 读完缓冲后返回 kClosed。
   bool m_closed{false};
   /// @brief 代际观察者计数（WaitForChange 观察者 + 等待-自旋者）。
-  ///        为 0 时快路径完全不写 m_generation —— 避免 1P1C 每条消息都把
-  ///        该 cacheline 在核间搬一次（见 PublishChangeLocked）。
+  ///        为 0 时快路径完全不写 m_generation。
   mutable std::atomic<std::uint32_t> m_generation_watchers{0};
-  /// @brief 关闭代际（每次 Close +1）；Select 用它判断等待节点是否跨代失效。
+  /// @brief 关闭/状态代际（原子：Generation() 需要无锁读；热路径已门控不写）。
   std::atomic<std::uint64_t> m_generation{0};
-#if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
-  /// @brief AdoptWaitState 创建的新节点保活引用；ReleaseMigrationHold 释放。
-  std::shared_ptr<PendingRecv> m_migration_hold;
-#endif
+  /// @brief 取消回调与 Channel 生命周期的解耦点（弱引用捕获）。
+  std::shared_ptr<detail::CancelHub<Channel<T>>> m_cancel_hub;
 };
 
 template <typename T>

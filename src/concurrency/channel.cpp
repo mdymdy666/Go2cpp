@@ -34,10 +34,19 @@
 #include "go2cpp/scheduler.hpp"
 
 #include <atomic>
+#include <cstdio>
 #include <chrono>
 #include <cstdint>
 #include <stdexcept>
 #include <thread>
+
+#if defined(__linux__)
+#include <cerrno>
+#include <ctime>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace go2cpp {
 namespace {
@@ -98,6 +107,159 @@ bool CanSpinWait() noexcept {
   // - 手动 Fiber 没有 Scheduler 归属，ParkingCondition 会拒绝阻塞，
   //   自旋同样不应该发生（它会把 carrier 线程钉住）。
   return Scheduler::current_task_ptr() == nullptr && Fiber::Current() == nullptr;
+}
+
+namespace {
+
+inline void CpuRelax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__)
+  asm volatile("yield" ::: "memory");
+#else
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
+/// @brief 相对超时的 FUTEX_WAIT_PRIVATE。
+/// @return 0 被唤醒；-1 且 errno 为 EAGAIN/ETIMEDOUT/EINTR 时由调用方重检。
+int FutexWaitRelative(std::atomic<std::uint32_t>* word,
+                      std::uint32_t expected,
+                      const std::optional<ContextTimePoint>& deadline) noexcept {
+  timespec rel{};
+  const timespec* timeout = nullptr;
+  if (deadline.has_value()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (*deadline <= now) {
+      errno = ETIMEDOUT;
+      return -1;
+    }
+    const auto diff = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        *deadline - now);
+    rel.tv_sec = static_cast<time_t>(diff.count() / 1000000000LL);
+    rel.tv_nsec = static_cast<long>(diff.count() % 1000000000LL);
+    timeout = &rel;
+  }
+  return static_cast<int>(
+      ::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(word),
+                FUTEX_WAIT_PRIVATE, expected, timeout, nullptr, 0));
+}
+
+}  // namespace
+
+void ChannelFutexWait(std::atomic<std::uint32_t>* word,
+                      std::uint32_t expected,
+                      const std::optional<ContextTimePoint>& deadline) noexcept {
+  (void)FutexWaitRelative(word, expected, deadline);
+}
+
+void ChannelFutexWake(std::atomic<std::uint32_t>* word) noexcept {
+  (void)::syscall(SYS_futex, reinterpret_cast<std::uint32_t*>(word),
+                  FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+}
+
+void ChannelWaitNative(WaitNodeBase* node,
+                       const std::optional<ContextTimePoint>& deadline) noexcept {
+  const int spin_limit = SpinBudget();
+  for (;;) {
+    if (node->signal.load(std::memory_order_acquire) != 0) {
+      return;
+    }
+    // 自旋覆盖「唤醒已在路上」的窗口；预算由 SendUntil 的 park 时长反馈调整。
+    bool spun_through = false;
+    for (int i = 0; i < spin_limit; ++i) {
+      if (node->signal.load(std::memory_order_acquire) != 0) {
+        spun_through = true;
+        break;
+      }
+      CpuRelax();
+      if ((i & 511) == 511) {
+        std::this_thread::yield();
+      }
+    }
+    if (spun_through) {
+      return;
+    }
+    if (deadline.has_value() &&
+        std::chrono::steady_clock::now() >= *deadline) {
+      return;
+    }
+    const std::uint32_t expected = node->seq.load(std::memory_order_acquire);
+    if (node->signal.load(std::memory_order_acquire) != 0) {
+      return;
+    }
+    node->parked.store(1, std::memory_order_relaxed);
+    if (node->signal.load(std::memory_order_acquire) != 0) {
+      node->parked.store(0, std::memory_order_relaxed);
+      return;
+    }
+    const auto park_start = std::chrono::steady_clock::now();
+    const int rc = FutexWaitRelative(&node->seq, expected, deadline);
+    node->parked.store(0, std::memory_order_relaxed);
+    if (rc == 0) {
+      ObserveParkDurationNs(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - park_start)
+              .count());
+      continue;
+    }
+    if (errno == EAGAIN || errno == EINTR || errno == ETIMEDOUT) {
+      // 值已变/被信号打断/超时：交给下一轮循环重判 signal 与 deadline。
+      continue;
+    }
+    // 其它错误：保守返回，让调用方按当前状态决定结果，绝不空转。
+    return;
+  }
+}
+
+bool ChannelBindManaged(WaitNodeBase* node) noexcept {
+  Scheduler* const scheduler = Scheduler::current_scheduler();
+  auto task = Scheduler::current_task();
+  if (scheduler == nullptr || !task) {
+    return false;
+  }
+  node->managed = true;
+  node->scheduler = scheduler;
+  node->task = task;
+  return true;
+}
+
+bool ChannelParkOnce(WaitNodeBase* node) noexcept {
+  auto* const scheduler = static_cast<Scheduler*>(node->scheduler);
+  auto task = std::static_pointer_cast<Task>(node->task);
+  if (scheduler == nullptr || !task) {
+    return false;
+  }
+  if (node->signal.load(std::memory_order_acquire) != 0) {
+    return true;
+  }
+  if (task->cancellation_requested()) {
+    return false;
+  }
+  const bool suspended = scheduler->park_wait(task);
+  if (node->signal.load(std::memory_order_acquire) != 0) {
+    return true;
+  }
+  if (task->cancellation_requested() ||
+      (!suspended && !scheduler->is_running()) ||
+      Scheduler::current_scheduler() != scheduler ||
+      Scheduler::current_task().get() != task.get()) {
+    return false;
+  }
+  // 无关的唤醒许可/被动 unpark 都是 spurious：回到调用方重检后继续 park。
+  return true;
+}
+
+void ChannelWakeManaged(WaitNodeBase* node) noexcept {
+  auto* const scheduler = static_cast<Scheduler*>(node->scheduler);
+  auto task = std::static_pointer_cast<Task>(node->task);
+  if (scheduler == nullptr || !task) {
+    return;
+  }
+  try {
+    (void)scheduler->wake_or_cancel(task);
+  } catch (...) {
+  }
 }
 
 }  // namespace detail
