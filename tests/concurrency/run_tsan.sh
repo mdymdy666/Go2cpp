@@ -76,7 +76,7 @@ LIBS=(
     -lgo2cpp_network -lgo2cpp_math -lgo2cpp_rand -lgo2cpp_path
     -lgo2cpp_container -lgo2cpp_compress -lgo2cpp_encoding
     -lgo2cpp_metrics -lgo2cpp_debug -lgo2cpp_sync -lgo2cpp_debug_event
-    -lgo2cpp_hook -lgo2cpp_io -lgo2cpp_context -lgo2cpp_error
+    ${HOOK_LIB:+-lgo2cpp_hook} -lgo2cpp_io -lgo2cpp_context -lgo2cpp_error
     -lgo2cpp_config -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_log
     -lgo2cpp_hash -lz -ldl -lm
 )

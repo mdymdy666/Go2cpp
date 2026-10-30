@@ -447,12 +447,17 @@ if (GO2CPP_BUILD_TESTS)
     set_tests_properties(go2cpp_os_dir_test PROPERTIES TIMEOUT 180)
 
     # 链接 go2cpp_os 库（含 proc/io_capability 等多进程依赖），不再直接编 os 源。
-    add_executable(go2cpp_os_hook_conflict_test
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/os/test_os_hook_conflict.cpp)
-    target_link_libraries(go2cpp_os_hook_conflict_test PRIVATE go2cpp_os go2cpp_config go2cpp_hook)
+    if (TARGET go2cpp_hook)
+        add_executable(go2cpp_os_hook_conflict_test
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/os/test_os_hook_conflict.cpp)
+        target_link_libraries(go2cpp_os_hook_conflict_test PRIVATE
+            go2cpp_os go2cpp_config go2cpp_hook)
     target_compile_options(go2cpp_os_hook_conflict_test PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_os_hook_conflict_test COMMAND go2cpp_os_hook_conflict_test)
+    else()
+        message(STATUS "skip go2cpp_os_hook_conflict_test (GO2CPP_WITH_HOOK=OFF)")
+    endif()
     set_tests_properties(go2cpp_os_hook_conflict_test PROPERTIES TIMEOUT 120)
 
 
@@ -1218,4 +1223,27 @@ if (GO2CPP_BUILD_BENCHMARKS)
         target_compile_options(go2cpp_gmp_vs_thread_epoll_benchmark PRIVATE
             -O2 -Wall -Wextra -Wpedantic)
     endif()
+
+
+endif()
+
+# ---- FastChannel 数据面通道（新增模块；不改现有 Channel）----
+# 测试覆盖功能/并发/FIFO/close/随机/Fiber×Thread 四种组合/5 个真实场景；
+# 基准不注册 ctest，由 taskset + 手动运行生成报告数据。
+if (GO2CPP_BUILD_TESTS)
+    add_executable(go2cpp_fast_channel_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_fast_channel.cpp)
+    target_link_libraries(go2cpp_fast_channel_test PRIVATE go2cpp_runtime)
+    target_include_directories(go2cpp_fast_channel_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_compile_options(go2cpp_fast_channel_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_fast_channel_test COMMAND go2cpp_fast_channel_test)
+    set_tests_properties(go2cpp_fast_channel_test PROPERTIES TIMEOUT 300)
+
+    add_executable(go2cpp_fast_channel_bench
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/bench_fast_channel.cpp)
+    target_link_libraries(go2cpp_fast_channel_bench PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_fast_channel_bench PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
 endif()
