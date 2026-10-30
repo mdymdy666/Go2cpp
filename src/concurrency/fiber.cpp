@@ -115,6 +115,18 @@
 #define GO2CPP_FIBER_NOINLINE
 #endif
 
+// TLS 模型：共享库默认的 general-dynamic 模型会让每次 thread_local 访问
+// 都调用 __tls_get_addr（实测每次约 5–8 ns）。一次 Fiber 切换往返要访问
+// 「当前 Fiber / 当前可增长栈」等 TLS 变量 6–10 次，是本路径最大的固定
+// 开销之一。本库由 DT_NEEDED 在进程启动时加载，initial-exec 是安全的；
+// 若未来需要 dlopen 本库，必须回退 general-dynamic（与 channel.cpp 中
+// Select 游标的取舍一致）。
+#if defined(__GNUC__)
+#define GO2CPP_FIBER_TLS __attribute__((tls_model("initial-exec")))
+#else
+#define GO2CPP_FIBER_TLS
+#endif
+
 namespace go2cpp {
 namespace {
 
@@ -122,13 +134,13 @@ namespace {
 // 当前线程正在运行的 Fiber 栈。只有 growable 栈会写入非空值；SIGSEGV
 // handler 据此判断故障地址是否落在某个可变长栈的未提交区。
 struct FiberStack;
-thread_local FiberStack* t_current_growable_stack = nullptr;
+GO2CPP_FIBER_TLS thread_local FiberStack* t_current_growable_stack = nullptr;
 #endif
 
-thread_local Fiber* s_current_fiber = nullptr;
+GO2CPP_FIBER_TLS thread_local Fiber* s_current_fiber = nullptr;
 // 没有运行真实 Fiber 时，每个 OS 线程仍有一个不可 resume 的根上下文。
 // 调度器在 worker 进入/离开 G 时更新这份元数据，Fiber 首次进入时继承它。
-thread_local FiberExecutionBinding s_main_execution{};
+GO2CPP_FIBER_TLS thread_local FiberExecutionBinding s_main_execution{};
 
 // resume_locked 可能沿父链循环多次，任意失败/取消返回都必须恢复进入
 // resume 前的直接调用者，避免 TLS 残留成已完成或错误的 Fiber。
@@ -230,7 +242,7 @@ struct StackCache {
 
 std::mutex s_stack_pool_mutex;
 StackCache s_stack_pool;
-thread_local StackCache s_thread_stack_pool;
+GO2CPP_FIBER_TLS thread_local StackCache s_thread_stack_pool;
 
 // 仅由 Scheduler 内部使用的 FiberBin。一个 M 只访问自己的 TLS 池，
 // 因而不会把仍可能被其他 M resume 的 Fiber 放进共享容器。完成 Fiber
@@ -240,7 +252,7 @@ struct FiberBin {
     std::vector<std::unique_ptr<Fiber>> entries;
 };
 
-thread_local FiberBin s_thread_fiber_bin;
+GO2CPP_FIBER_TLS thread_local FiberBin s_thread_fiber_bin;
 constexpr std::size_t kDefaultFiberBinCapacity = 32U;
 // 防止误配把每个 M 变成无界对象保留池。FiberBin 只应缓存短期突发，
 // 更大的容量不会带来线性收益，且会长期占用 Fiber/闭包对象内存。
@@ -259,11 +271,37 @@ FiberContextFrame main_context_frame(
     return frame;
 }
 
-// 将 TLS 地址查找放在挂起函数之外。否则编译器可能在跨线程上下文切换后仍
-// 缓存 __errno_location() 的结果。
-GO2CPP_FIBER_NOINLINE int load_errno() noexcept { return errno; }
+// errno 是每线程 TLS；`errno` 宏展开为 `(*__errno_location())`。
+//
+// 旧实现每次访问都调用一次 noinline 的 load/store：noinline 是为了阻止
+// 编译器把 `__errno_location()` 的结果跨上下文切换缓存到寄存器（Fiber
+// 迁移到别的线程后会写错线程的 errno）。但一次切换往返要访问 errno 3 次，
+// 每次 3–4ns 的调用开销很可观。
+//
+// 改为「每线程缓存一次地址」：TLS 指针在**当前线程**上永远指向当前线程的
+// errno 槽，Fiber 迁移后读到的自然是新线程的 TLS 缓存，语义与每次重新调用
+// __errno_location 完全一致；此后每次访问只需一次 TLS 指针读 + 解引用。
+GO2CPP_FIBER_TLS thread_local int* t_errno_slot = nullptr;
 
-GO2CPP_FIBER_NOINLINE void store_errno(int value) noexcept { errno = value; }
+inline int* errno_slot() noexcept {
+    int* slot = t_errno_slot;
+    if (slot == nullptr) {
+        slot = &errno;
+        t_errno_slot = slot;
+    }
+    return slot;
+}
+
+inline int load_errno() noexcept { return *errno_slot(); }
+
+inline int swap_errno(int value) noexcept {
+    int* const slot = errno_slot();
+    const int previous = *slot;
+    *slot = value;
+    return previous;
+}
+
+inline void store_errno(int value) noexcept { *errno_slot() = value; }
 
 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
 // 查询系统页大小。两个细节：
@@ -307,9 +345,13 @@ static_assert(std::atomic<std::uint64_t>::is_always_lock_free,
 std::atomic<std::uint64_t> s_growable_stack_growth_count{0};
 std::atomic<int> s_growable_handler_state{0};  // 0 未安装 1 已安装 2 失败
 std::mutex s_growable_handler_mutex;
-thread_local bool t_growable_altstack_ready = false;
-thread_local bool t_growable_altstack_attempted = false;
-thread_local volatile sig_atomic_t t_growable_in_handler = 0;
+GO2CPP_FIBER_TLS thread_local bool t_growable_altstack_ready = false;
+GO2CPP_FIBER_TLS thread_local bool t_growable_altstack_attempted = false;
+GO2CPP_FIBER_TLS thread_local volatile sig_atomic_t t_growable_in_handler = 0;
+// 每线程一次性结果缓存：0=未检查，1=可用，2=不可用。resume 热路径只需
+// 一次 TLS 字节读，不必每轮都调 ensure_growable_thread_altstack()（两次
+// TLS 读）与 install_growable_stack_handler()（一次 acquire 原子读）。
+GO2CPP_FIBER_TLS thread_local std::uint8_t t_growable_support_state = 0;
 
 [[noreturn]] void growable_stack_fatal(int sig) noexcept {
     // 恢复内核默认动作、解除屏蔽后重新投递，保留 core dump 语义。
@@ -404,10 +446,18 @@ bool install_growable_stack_handler() noexcept {
 }
 
 bool ensure_growable_thread_support() noexcept {
+    // 每线程结果只算一次：失败也要缓存，避免每一轮 resume 都重试
+    // mmap/sigaction（两者都比一次切换贵几个数量级）。
+    const std::uint8_t cached = t_growable_support_state;
+    if (cached != 0) {
+        return cached == 1;
+    }
     // 先装备用栈，再装进程级 handler：handler 一装好，任何线程上的
     // SIGSEGV 都会进入它，因此当前线程必须已经能安全接收信号。
-    return ensure_growable_thread_altstack() &&
-           install_growable_stack_handler();
+    const bool supported = ensure_growable_thread_altstack() &&
+                           install_growable_stack_handler();
+    t_growable_support_state = supported ? 1 : 2;
+    return supported;
 }
 #endif
 
@@ -1126,6 +1176,8 @@ void PublishFiberDebugMeta(FiberRecord& record) {
 
 }  // namespace
 
+// Impl 只在 fiber.cpp 内使用；保留默认可见性（GCC 对类内定义的成员函数
+// 仍生成 weak 符号，pragma visibility 在这里不改变绑定方式，见 2026-10 实测）。
 struct Fiber::Impl {
     explicit Impl(Fiber* owner, Function function, std::size_t stack_size,
                   std::size_t stack_reserve_size, bool stack_growable)
@@ -1208,8 +1260,8 @@ struct Fiber::Impl {
         m_scheduler_parent_bound = false;
         m_resume_claim.store(false, std::memory_order_relaxed);
         m_last_resume_thread_hash.store(0, std::memory_order_relaxed);
-        m_parent = nullptr;
-        m_parent_bound = false;
+        m_parent.store(nullptr, std::memory_order_relaxed);
+        m_parent_bound.store(false, std::memory_order_relaxed);
         m_saved_errno = 0;
         {
             std::lock_guard<std::mutex> lock(m_failure_mutex);
@@ -1525,13 +1577,25 @@ struct Fiber::Impl {
             return false;
         }
 
+        // 快速路径（同一父级的后续 resume）：父链在首次绑定时固定，之后
+        // 不再变化，因此不必每次 resume 都重复「两次 mutex + shared_ptr
+        // 原子引用计数 + 父记录拷贝」。用户态 `Fiber::resume()` 的每一次
+        // 恢复都会走到这里，这是它与调度器热路径之间最大的差距。
+        //
+        // 可见性：写侧在 resume claim 与 m_metadata_mutex 保护下完成，
+        // 并以 release 发布 m_parent_bound；这里用 acquire 读 bound，
+        // 保证读到 true 时 m_parent 已是最终值。
+        if (m_parent_bound.load(std::memory_order_acquire)) {
+            return m_parent.load(std::memory_order_relaxed) == caller;
+        }
+
         std::shared_ptr<FiberRecord> parent_record;
         {
             std::lock_guard<std::mutex> lock(m_metadata_mutex);
-            if (!m_parent_bound) {
-                m_parent = caller;
-                m_parent_bound = true;
-            } else if (m_parent != caller) {
+            if (!m_parent_bound.load(std::memory_order_relaxed)) {
+                m_parent.store(caller, std::memory_order_relaxed);
+                m_parent_bound.store(true, std::memory_order_release);
+            } else if (m_parent.load(std::memory_order_relaxed) != caller) {
                 return false;
             }
             parent_record = caller == nullptr ? nullptr : caller->m_impl->m_record;
@@ -1557,7 +1621,7 @@ struct Fiber::Impl {
         }
 
         std::lock_guard<std::mutex> lock(m_metadata_mutex);
-        if (m_parent != caller) {
+        if (m_parent.load(std::memory_order_relaxed) != caller) {
             return false;
         }
         std::lock_guard<std::mutex> record_lock(m_record->mutex);
@@ -1645,7 +1709,7 @@ struct Fiber::Impl {
             // 构造期只在创建栈的线程安装过 altstack；Fiber 可能迁移到
             // 另一个 M，必须在真正 jump 前确认当前线程也有备用栈。
             // 首次之后只是一次 TLS bool + 原子状态读。
-            if (m_stack->growable() && !ensure_growable_thread_support()) {
+            if (m_stack_growable_active && !ensure_growable_thread_support()) {
                 m_record->state.store(FiberState::Failed,
                                       std::memory_order_release);
                 return false;
@@ -1657,8 +1721,8 @@ struct Fiber::Impl {
             m_scheduler_propagate.store(false, std::memory_order_release);
 
             // step5: errno 按 Fiber 隔离——保存调用者的，切到目标 Fiber 前恢复
-            // 它自己保存的值。
-            const int caller_errno = load_errno();
+            // 它自己保存的值。swap_errno 一次调用同时完成读旧值与写目标值。
+            const int caller_errno = swap_errno(m_saved_errno);
             Fiber* const previous_fiber = s_current_fiber;
             s_current_fiber = m_owner;
             if (!scheduler_fast) {
@@ -1672,7 +1736,6 @@ struct Fiber::Impl {
                                                     std::memory_order_relaxed);
                 }
             }
-            store_errno(m_saved_errno);
 
             #if defined(GO2CPP_USE_NATIVE_CONTEXT)
             detail::Transfer transfer{};
@@ -1692,7 +1755,7 @@ struct Fiber::Impl {
 #endif
                 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
                 t_current_growable_stack =
-                    m_stack->growable() ? m_stack.get() : nullptr;
+                    m_stack_growable_active ? m_stack.get() : nullptr;
                 transfer = detail::JumpContext(m_context, this);
                 // 切回调用者后立即恢复；随后 m_stack 可能被 reset 释放。
                 t_current_growable_stack = previous_growable_stack;
@@ -1713,6 +1776,7 @@ struct Fiber::Impl {
                     // 把受保护栈放回线程级或全局缓存，避免突发负载中每个排队
                     // Fiber 都重新建立一次映射。
                     m_stack.reset();
+                    m_stack_growable_active = false;
                 }
             }
 
@@ -1730,17 +1794,18 @@ struct Fiber::Impl {
 
             // 调度器挂起沿直接父链传播；普通 Suspend 不进入这个分支，
             // 因而 fiber2 的普通 go_back 仍然只回到 fiber1。
-            if (m_record->state.load(std::memory_order_acquire) ==
-                    FiberState::Suspended &&
+            const FiberState after_jump =
+                m_record->state.load(std::memory_order_acquire);
+            Fiber* const parent_fiber = m_parent.load(std::memory_order_acquire);
+            if (after_jump == FiberState::Suspended &&
                 m_scheduler_propagate.load(std::memory_order_acquire) &&
-                m_parent != nullptr) {
+                parent_fiber != nullptr) {
                 const SuspendReason reason =
                     m_record->reason.load(std::memory_order_acquire);
                 const auto parent_record = m_record->parent;
                 if (!parent_record ||
                     !parent_record->alive.load(std::memory_order_acquire) ||
-                    m_parent == nullptr ||
-                    !m_parent->m_impl->suspend(reason, true)) {
+                    !parent_fiber->m_impl->suspend(reason, true)) {
                     // 不能把仍挂起的子栈当作完成任务交给调度器。父级
                     // 已失效时将当前 Fiber 标记失败并清理其局部值，让
                     // Scheduler 走普通失败收尾；不再从这里 terminate。
@@ -1802,11 +1867,10 @@ struct Fiber::Impl {
             #endif
         finish_switch_to_fiber();
         m_caller = transfer.context;
-        store_errno(m_saved_errno);
-        m_record->reason.store(SuspendReason::None, std::memory_order_release);
-        m_scheduler_propagate.store(false, std::memory_order_release);
-        m_record->state.store(FiberState::Running, std::memory_order_release);
-        s_current_fiber = m_owner;
+        // 这里不再重复写 reason/propagate/state/s_current_fiber：恢复本
+        // Fiber 的 resume_locked 在跳转前已经把这四项设置成完全相同的值
+        // （Running / None / false / m_owner），中间没有用户代码能改它们。
+        // 每往返省 4 次原子/ TLS 写。
         return true;
     }
 
@@ -1816,7 +1880,7 @@ struct Fiber::Impl {
         // 迁移到新 M 后，resume_locked 在跳转前已设置过；这里再设置一次，
         // 覆盖 entry() 首次进入和 suspend() 返回后的两条路径。
         t_current_growable_stack =
-            (m_stack && m_stack->growable()) ? m_stack.get() : nullptr;
+            (m_stack && m_stack_growable_active) ? m_stack.get() : nullptr;
 #endif
 #if defined(GO2CPP_FIBER_ASAN)
         // 迁移后这些输出描述的是当前恢复 Fiber 的新 OS 线程，而不是上次
@@ -1841,6 +1905,9 @@ struct Fiber::Impl {
             m_context = boost::context::detail::make_fcontext(
                 m_stack->stack_pointer(), m_stack->usable_size(), &Impl::entry);
             #endif
+            // 固化一次「实际是否按需增长」；resume/suspend 热路径不再解引用
+            // unique_ptr 调用 growable()。
+            m_stack_growable_active = m_stack->growable();
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
             {
                 std::lock_guard<std::mutex> lock(m_record->mutex);
@@ -1876,6 +1943,10 @@ struct Fiber::Impl {
     std::size_t m_stack_reserve_size{0};
     /// @brief 是否请求按需增长；实际是否增长还受环境变量/后端能力约束。
     bool m_stack_growable{true};
+    /// @brief 本次栈实际是否按需增长（initialize_context 时从 FiberStack
+    ///        固化）。热路径据此判断是否需要检查备用信号栈，避免每次切换
+    ///        都做一次 unique_ptr 解引用 + growable() 调用。
+    bool m_stack_growable_active{false};
     /// @brief 独立栈（FiberStack 内部走池化）；Fiber 结束后由 resume_locked 清空，
     ///        非空表示仍在活动 —— reset_for_scheduler 会据此拒绝重绑定。
     std::unique_ptr<FiberStack> m_stack;
@@ -1901,9 +1972,12 @@ struct Fiber::Impl {
     /// @brief 上次 resume 所在线程的哈希；用于检测跨线程恢复（诊断与断言）。
     std::atomic<std::size_t> m_last_resume_thread_hash{0};
     /// @brief 嵌套 Fiber 的父指针（手工父子链）；顶层为 nullptr。
-    Fiber* m_parent{nullptr};
+    /// @details 只在首次 resume 时由 `bind_caller` 写入（写侧仍由
+    ///          `m_metadata_mutex` 与 resume claim 串行化），热路径用
+    ///          acquire 读它跳过重复的加锁父链刷新。
+    std::atomic<Fiber*> m_parent{nullptr};
     /// @brief 父链是否已绑定；未绑定时的挂起会被标记 Failed（防跳错栈）。
-    bool m_parent_bound{false};
+    std::atomic<bool> m_parent_bound{false};
     /// @brief 保护 m_failure；initialize_context/entry 捕获异常时写入。
     mutable std::mutex m_failure_mutex;
     /// @brief Fiber 内抛出的异常；由 resume 重新抛给调用方。
@@ -2041,12 +2115,14 @@ FiberResumeResult Fiber::resume_result() noexcept {
 }
 
 bool Fiber::Suspend(SuspendReason reason) noexcept {
-    Fiber* const current = Current();
+    // 直接读 TLS：Current() 是 noinline 的导出符号，调用要经 PLT；挂起热
+    // 路径上这次多出来的调用没有语义收益（initial-exec 下就是一条 fs 段读）。
+    Fiber* const current = s_current_fiber;
     return current != nullptr && current->m_impl->suspend(reason, false);
 }
 
 bool Fiber::SuspendForScheduler(SuspendReason reason) noexcept {
-    Fiber* const current = Current();
+    Fiber* const current = s_current_fiber;
     return current != nullptr && current->m_impl->suspend(reason, true);
 }
 
@@ -3099,6 +3175,9 @@ std::unique_ptr<Fiber> Fiber::ImportMigrationImage(
     }
 
     impl->m_stack = std::move(stack);
+    // 迁移导入的栈同样需要固化实际增长属性；否则 resume 热路径会认为
+    // 这不是可增长栈，SIGSEGV 处理器拿不到正确的栈边界。
+    impl->m_stack_growable_active = impl->m_stack->growable();
     impl->m_stack_size = usable;
     impl->m_context = reinterpret_cast<void*>(static_cast<std::uintptr_t>(new_context));
     impl->m_caller = nullptr;

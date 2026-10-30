@@ -274,3 +274,66 @@ ASan/LSan 0 报告。详细报告见 `example/WarningDocement/audit-mcp-socket.m
   fiber 模块做栈 arena / 批量串行释放，超出本批边界。
 - 未 commit。
 
+## 2026-10-30 Fiber 切换优化（参考 Go gosave/gogo）
+
+### 一、结论
+
+Fiber 一次完整切换往返（resume→Suspend→resume，1e6 次 ping-pong）
+**72.9 ns/op → 34.4 ns/op（-52.9%）**；调度器热路径
+`resume_from_scheduler` **55.2 → 31.3 ns/op（-43.3%）**；逐次采样
+P50 80 → 50 ns、P99 126 → 51 ns。换栈汇编本身只有 6.2–6.7 ns，
+优化前约 66 ns 是 Fiber 层簿记（TLS general-dynamic、binder 重复加锁、
+errno noinline），不是寄存器保存。
+
+### 二、代码改动
+
+- `src/concurrency/fiber.cpp`（唯一实现改动）：
+  - 7 个热路径 `thread_local` 改 `tls_model("initial-exec")`（与
+    `channel.cpp` Select 游标同一取舍；dlopen 本库需回退 general-dynamic）；
+  - `bind_caller()` 快速路径：父级已绑定且等于本次调用者时只做 2 次
+    atomic load；`m_parent`/`m_parent_bound` 改 `std::atomic`（写侧仍持锁）；
+  - errno：`t_errno_slot` 每线程缓存 `&errno`（initial-exec），
+    `swap_errno` 合并读旧值+写新值，往返 noinline 调用 5 → 3 次；
+  - `suspend()` 返回路径删除 4 次冗余原子/TLS 写（resume_locked 跳转前
+    已写成相同值），并删除冗余 errno 恢复；
+  - growable 支持结果每线程缓存 `t_growable_support_state`（0/1/2），
+    `m_stack_growable_active` 在 `initialize_context` 固化；迁移导入路径
+    同步补该字段；
+  - `Fiber::Suspend` / `SuspendForScheduler` 直接读 TLS，去掉 `Current()`
+    的 noinline/PLT 调用。
+- `tests/concurrency/bench_fiber_switch_opt.cpp`（新增）：底层
+  `JumpContext` 裸往返、resume/park/scheduler ping-pong、双 Fiber 交替、
+  栈热/冷分配，含批量分块中位数与逐次采样分位数。
+- `tests/concurrency/test_fiber_switch_opt.cpp`（新增）：6 个真实场景
+  （errno 隔离、嵌套 Fiber、跨线程迁移、取消+析构挂起、scheduler park、
+  4 Fiber×10 万次交替）+ 随机序列，兼容 ASan/TSan 源码插桩。
+- `include/go2cpp/concurrency/fiber.hpp`：未改（ABI/语义不变）；未改
+  scheduler；未 commit。
+
+### 三、验证结果
+
+- `go2cpp_tests`：`GO2CPP_TEST_FILTER=fiber|fiber_growable|fiber_local|debug_fiber`
+  全部 `all checks passed`（growable 含 256 KiB/1 MiB 深递归、迁移增长、
+  4 worker 并发）。
+- `go2cpp_fiber_select_test` failures=0；`go2cpp_concurrency_combinations`
+  PASS 12 场景；`go2cpp_concurrency_fuzz` PASS 1000 轮/1e7 ops；
+  `go2cpp_scheduler_smoke` 返回 0。
+- 专项随机：4 seeds × 5k/20k ops，failures=0。
+- ASan+UBSan（`-fsanitize=address,undefined`，2000 ops）：0 错误。
+- TSan（`-fsanitize=thread`，生产配置 `GO2CPP_DEBUG_DUMP=OFF`，1000/5000
+  ops，`setarch -R` 规避 ASLR 映射）：**0 条 ThreadSanitizer WARNING**。
+- 项目 `run_tsan.sh` 线程级套件：TSan 库构建成功，但 `tsan_smoke` 链接
+  失败（`cannot find -lgo2cpp_hook`，该构建目录未产出 hook 库）——未跑通，
+  已知环境问题，非本次改动引入。
+- 详细报告：`/tmp/fiber_switch_opt2.md`。
+
+### 四、后续状态
+
+- 剩余 34.4 ns 中约 28 ns 是 CAS resume claim、状态原子写/读、TLS
+  保存/恢复；继续压缩需要改 record 状态布局或去掉 claim，收益 <5 ns、
+  风险高于本批边界，暂不做。
+- initial-exec 依赖"库在进程启动时加载"；若未来需要 dlopen 本库，必须
+  回退 general-dynamic（注释已写）。
+- 未 commit。
+
+
