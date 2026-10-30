@@ -339,6 +339,14 @@ public:
     }
 
     void Disarm() noexcept {
+        // ===== NATIVE LOCK-FREE RESET =====
+        // native 节点的唤醒路径（WakeNativeLocked / WakeFast）只写 m_hot 的
+        // 原子字，从不读 m_active / m_scheduler / m_task，因此不需要门锁。
+        if (!managed()) {
+            m_active = false;
+            m_scheduler.store(nullptr, std::memory_order_release);
+            return;
+        }
         // 回调可能已经离开 DoneSignal 的注册表。这里等待其 Wake 调用完成，
         // 防止回调生命周期超过 Scheduler 的关闭过程。
         std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
@@ -386,6 +394,21 @@ public:
         return m_hot.granted.load(std::memory_order_acquire);
     }
 
+    /**
+     * @brief 快路径唤醒：等待者仍在自旋、不会睡 futex 时使用。
+     *
+     * 与 `Wake()` 的区别是它允许在「无队列锁」下调用：调用方必须已经通过
+     * 原子槽**独占**该节点（同一节点不会同时被两个通知方唤醒）。
+     * 先推进 `futex_seq`（唤醒字）再由调用方发布终态，等待者看到终态时
+     * 本函数已经返回，不存在「通知方还在写、等待者已释放节点」的窗口。
+     */
+    void WakeFast() noexcept {
+        // 独占槽保证：等待者还没睡进 futex（futex_waiters 必为 0），
+        // 且快路径只接受无 Context 的调用（不可能被取消）。因此只需要
+        // 一次 release store 发布终态，不需要 CAS 或推进 futex 代际。
+        m_hot.result.store(WaitResult::kNotified, std::memory_order_release);
+    }
+
     void Wake() noexcept {
 #if defined(__linux__)
         // native 快路径：普通线程等待者只看 m_hot.futex_seq / m_hot.result，唤醒
@@ -408,7 +431,7 @@ public:
     // 区分同一个缓存节点的不同等待代次。
     bool TryCancelAndWake(std::uint64_t generation) noexcept {
         std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
-        if (generation != m_generation ||
+        if (generation != m_generation.load(std::memory_order_relaxed) ||
             !TryFinish(WaitResult::kCancelled)) {
             return false;
         }
@@ -425,8 +448,7 @@ public:
     // 读取唤醒代际。每次 Wake 递增；等待者用它判断"我记下的代际是否已过期"
     // （过期说明通知已发生，无需再 park）。读时持锁，与 WakeLocked 的写互斥。
     std::uint64_t generation() noexcept {
-        std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
-        return m_generation;
+        return m_generation.load(std::memory_order_acquire);
     }
 
 private:
@@ -480,6 +502,17 @@ private:
 
 public:
 
+    // ===== WG LONG SPIN =====
+    /// @brief 覆盖 WaitNative 的连续无进展自旋预算（0 = 用全局默认）。
+    /// @details WaitGroup 的 Done 是「一次原子发布 + 可能的 futex_wake」：
+    ///          只要等待者还在自旋，futex_waiters 就是 0，Done 完全不用
+    ///          进内核（WSL2 一次 FUTEX_WAKE 实测 19–20µs）。把 WG 等待者
+    ///          的自旋窗口拉长到覆盖常见「创建后很快 Done」的延迟，就能
+    ///          把这 20µs 从唤醒延迟里彻底去掉。
+    void SetSpinBudget(std::uint32_t attempts) noexcept {
+        m_spin_budget = attempts;
+    }
+
     bool managed() const noexcept {
         // 无锁热路径（每次入队/唤醒都要判一次）：只读一个原子快照，
         // 不触碰 shared_ptr<Task>（其赋值在 m_wake_mutex 下由 Reset 完成）。
@@ -522,9 +555,13 @@ public:
             if (result() != WaitResult::kWaiting) {
                 return result();
             }
+            const std::uint32_t spin_budget =
+                m_spin_budget != 0U
+                    ? m_spin_budget
+                    : static_cast<std::uint32_t>(kWaitSpinBudget);
             int idle_spins = 0;
             long long total_spins = 0;
-            while (idle_spins < kWaitSpinBudget &&
+            while (idle_spins < static_cast<int>(spin_budget) &&
                    total_spins < kWaitSpinTotalBudget) {
                 if (result() != WaitResult::kWaiting) {
                     return result();
@@ -592,6 +629,26 @@ public:
     }
 
     void Reset(Scheduler* scheduler, std::shared_ptr<Task> task) noexcept {
+        if (scheduler == nullptr && !task && !managed()) {
+            // native 节点复用：唤醒方只写 m_hot 原子字，不读门保护字段。
+            m_scheduler.store(nullptr, std::memory_order_release);
+            m_task.reset();
+            m_gid.store(0U, std::memory_order_relaxed);
+            m_backend.reset();
+            m_hot.result.store(WaitResult::kWaiting,
+                               std::memory_order_release);
+            m_hot.granted.store(false, std::memory_order_relaxed);
+#if defined(__linux__)
+            m_hot.futex_waiters.store(0U, std::memory_order_relaxed);
+#endif
+            m_spin_budget = 0U;
+            const std::uint64_t next =
+                m_generation.fetch_add(1U, std::memory_order_relaxed) + 1U;
+            if (next == 0U) {
+                m_generation.store(1U, std::memory_order_relaxed);
+            }
+            return;
+        }
         std::lock_guard<core::FutexMutex> lock(m_wake_mutex);
         m_active = false;
         m_scheduler.store(scheduler, std::memory_order_release);
@@ -609,9 +666,10 @@ public:
         // 让唤醒方误判仍需 FUTEX_WAKE。
         m_hot.futex_waiters.store(0U, std::memory_order_relaxed);
 #endif
-        ++m_generation;
-        if (m_generation == 0U) {
-            m_generation = 1U;
+        const std::uint64_t next_generation =
+            m_generation.fetch_add(1U, std::memory_order_relaxed) + 1U;
+        if (next_generation == 0U) {
+            m_generation.store(1U, std::memory_order_relaxed);
         }
     }
 
@@ -648,6 +706,8 @@ private:
         std::atomic<std::uint32_t> futex_waiters{0};
     } m_hot;
     core::FutexMutex m_wake_mutex;
+    /// @brief 本节点的自旋预算覆盖值（0 = 全局默认）；见 SetSpinBudget。
+    std::uint32_t m_spin_budget{0U};
 #if !defined(__linux__)
     // 非 Linux 平台没有 futex，native 等待者退回原生条件变量。Linux 下
     // 这两个成员不参与编译：每个 WaitNode 少 88 字节，也省掉构造/析构
@@ -657,7 +717,8 @@ private:
 #endif
     std::shared_ptr<WaitBackend> m_backend;
     bool m_active{false};
-    std::uint64_t m_generation{1U};
+    /// @brief 节点复用代次；原子量，native Reset 无锁递增，回调无锁读。
+    std::atomic<std::uint64_t> m_generation{1U};
 };
 
 // WaitNode 只在等待期间被队列或取消回调引用。完成一次等待后将对象放回
@@ -680,7 +741,13 @@ void ReleaseWaitNode(std::shared_ptr<WaitNode> waiter) noexcept {
     if (!waiter) {
         return;
     }
-    waiter->Reset(nullptr, {});
+    // ===== CV FAST PATH TUNE =====
+    // native 节点没有需要清空的用户对象（m_task 恒空），热字段由下一次
+    // AcquireWaitNode 的 Reset 覆盖。这里省掉一次字段清空（约 30 cycles）。
+    // managed 节点必须清空，避免 thread-local 缓存延长 Task/Scheduler 生命期。
+    if (waiter->managed()) {
+        waiter->Reset(nullptr, {});
+    }
     if (t_wait_node_cache.size() < 32U) {
         t_wait_node_cache.push_back(std::move(waiter));
     }
@@ -2007,6 +2074,16 @@ std::atomic<std::uint64_t> g_cv_relock_failures{0};
 /// 几次 TryLock 就能取回；预算留足跨核缓存行迁移的延迟。
 constexpr std::size_t kConditionRelockRetryLimit = 8192;
 
+/// @brief 1P1C 无锁快路径的自旋预算（PAUSE 次数，约 18µs）。
+/// @details 等待者在此期间绝不进入 futex；超预算才退回可睡眠的通用路径。
+constexpr std::uint32_t kCvFastSpinBudget = 2048U;
+
+/// @brief 重锁前的短自旋预算（PAUSE 次数，约 4µs）。
+/// @details 通知方在 Notify 之后才 Unlock，被唤醒者醒来时锁通常仍被它
+///          持有几十 ns。先 TryLock 自旋能避免走 LockImpl 的「入队/park」
+///          慢路径（实测该路径占 Wait 总时间的 30% 以上）。
+constexpr std::size_t kConditionRelockSpinLimit = 512U;
+
 /// @brief 条件变量重锁失败后，用不进入等待队列的 TryLock 抢回外部锁。
 /// @return true 表示已重新持有 mutex；false 表示预算内没抢到。
 /// @note 只用于调度器关闭 / G 已取消导致无法 park 的路径。此时锁通常空闲；
@@ -2065,6 +2142,14 @@ struct alignas(64) ConditionVariable::Impl {
     ///          进锁做一次注定失败的线性查找。计数与队列**都在 `m_mutex`
     ///          内**维护，因此读到 0 时队列必然为空，不会漏唤醒。
     std::atomic<std::size_t> m_waiter_count{0U};
+    // ---- 1P1C 无锁快路径（独立缓存行，不碰上面的队列锁行）----
+    /// @brief 唯一 native 等待者的原子槽（0 = 空）。
+    /// @details 只有「普通线程 + 无取消 Context」能进入。等待者进入后不再
+    ///          访问 m_mutex / m_single / m_waiters；通知方也无需取队列锁，
+    ///          一次交接只写两个原子字（槽 + 节点终态）。
+    ///          裸指针的生命周期由等待者自己的 shared_ptr 保证：等待者只有
+    ///          在看到终态后才释放节点，而通知方在发布终态前已写完唤醒字。
+    alignas(64) std::atomic<std::uintptr_t> m_fast_waiter{0U};
     // ---- 冷字段：第 2 个及以后的等待者（FIFO 溢出桶）----
     /// @brief 通知等待队列（FIFO）；存 shared_ptr 以便锁外 Wake 时节点仍存活。
     std::deque<std::shared_ptr<WaitNode>> m_waiters;
@@ -2085,6 +2170,17 @@ struct alignas(64) ConditionVariable::Impl {
     }
 };
 
+bool ConditionVariable::RelockAfterConditionWait(Mutex& mutex) noexcept {
+    for (std::size_t attempt = 0; attempt < kConditionRelockSpinLimit;
+         ++attempt) {
+        if (mutex.TryLock()) {
+            return true;
+        }
+        RelaxCpu();
+    }
+    return mutex.LockForConditionWait();
+}
+
 ConditionVariable::ConditionVariable() : m_impl(std::make_unique<Impl>()) {
 #if GO2CPP_DEBUG_RESOURCES
     m_impl->m_debug_resource =
@@ -2095,8 +2191,12 @@ ConditionVariable::ConditionVariable() : m_impl(std::make_unique<Impl>()) {
 ConditionVariableDebugSnapshot ConditionVariable::DebugSnapshotInternal() const {
     ConditionVariableDebugSnapshot snapshot;
     std::lock_guard<std::mutex> lock(m_impl->m_mutex);
-    snapshot.waiters =
-        m_impl->m_waiters.size() + (m_impl->m_single ? 1U : 0U);
+    snapshot.waiters = m_impl->m_waiters.size() +
+                       (m_impl->m_single ? 1U : 0U) +
+                       (m_impl->m_fast_waiter.load(std::memory_order_acquire) !=
+                                0U
+                            ? 1U
+                            : 0U);
     return snapshot;
 }
 
@@ -2124,7 +2224,7 @@ bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
             mutex.Unlock();
             // D3：重锁失败 = mutex 未被持有。不能把 false 返回给
             // 「假定仍持锁」的调用方；先无 park 抢回，抢不回就抛异常。
-            if (!mutex.LockForConditionWait() &&
+            if (!RelockAfterConditionWait(mutex) &&
                 !TryRelockWithoutParking(mutex)) {
                 ThrowConditionRelockFailure();
             }
@@ -2147,6 +2247,130 @@ bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
     // 原子量/互斥量/条件变量的控制块（实测约 40~60 ns）比一次交接还贵。
     auto waiter = AcquireWaitNode(target.scheduler, target.task);
     ContextSubscription subscription(context, waiter);
+
+    // ===== CV FAST PATH (1P1C) =====
+    // 普通线程 + 无取消上下文：用无锁原子槽做「唯一等待者」交接。
+    // 快路径只碰两个缓存行（CV 的槽 + 节点热字段），不取队列锁、
+    // 不做 shared_ptr 拷贝、不进 futex；超出自旋预算才退回通用路径。
+    if (!target && !context) {
+        std::uintptr_t expected = 0U;
+        if (m_impl->m_fast_waiter.compare_exchange_strong(
+                expected, reinterpret_cast<std::uintptr_t>(waiter.get()),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            const std::uintptr_t self_slot =
+                reinterpret_cast<std::uintptr_t>(waiter.get());
+            const auto clear_slot = [this, self_slot] {
+                // 正常路径下通知方已经把槽清空：一次 load 即可跳过 CAS，
+                // 避免为一次注定失败的 RMW 再拉一次缓存行所有权。
+                if (m_impl->m_fast_waiter.load(std::memory_order_acquire) !=
+                    self_slot) {
+                    return;
+                }
+                std::uintptr_t mine = self_slot;
+                (void)m_impl->m_fast_waiter.compare_exchange_strong(
+                    mine, 0U, std::memory_order_acq_rel,
+                    std::memory_order_relaxed);
+            };
+            try {
+                mutex.Unlock();
+            } catch (...) {
+                clear_slot();
+                (void)waiter->TryFinish(WaitResult::kCancelled);
+                waiter->Disarm();
+                subscription.Reset();
+                ReleaseWaitNode(std::move(waiter));
+                throw;
+            }
+            // ===== CV SLOT-ONLY NOTIFY =====
+            // 自旋只读 CV 的槽缓存行：通知方 exchange 槽就等于完成交接，
+            // 不必再写等待者节点行（少一次跨核缓存行所有权迁移）。
+            std::uint32_t spin = 0U;
+            while (m_impl->m_fast_waiter.load(std::memory_order_acquire) ==
+                       self_slot &&
+                   spin < kCvFastSpinBudget) {
+                RelaxCpu();
+                ++spin;
+            }
+            if (m_impl->m_fast_waiter.load(std::memory_order_acquire) ==
+                self_slot) {
+                // ===== CV FAST PATH HANDOFF FIX =====
+                // 入队与「让出快槽」必须在同一个 m_mutex 临界区内完成。
+                // 否则存在致命窗口：槽已清空、节点还没进队列时，通知方
+                // 的 exchange 得到 0 且读 waiter_count == 0 直接返回 ——
+                // 通知被丢掉，等待者随后入队并永久挂起（pingpong 死锁）。
+                bool published = false;
+                bool slot_cleared = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_impl->m_mutex);
+                    if (m_impl->m_fast_waiter.load(
+                            std::memory_order_acquire) == self_slot) {
+                        if (m_impl->m_single == nullptr &&
+                            m_impl->m_waiters.empty()) {
+                            m_impl->m_single = waiter;
+                        } else {
+                            m_impl->m_waiters.push_back(waiter);
+                        }
+                        m_impl->m_waiter_count.fetch_add(
+                            1U, std::memory_order_release);
+                        published = true;
+                    }
+                    // ===== CV SLOT RACE FIX =====
+                    // 入队与清槽同临界区；若通知方在「槽仍指向本节点」时
+                    // 用快路径 exchange 取走了它（即便本节点已入队），
+                    // 那次交接已经完成，本节点必须自行摘队返回，绝不能
+                    // 再进入 Await —— 否则没有任何人会再唤醒它。
+                    std::uintptr_t mine = self_slot;
+                    slot_cleared =
+                        m_impl->m_fast_waiter.compare_exchange_strong(
+                            mine, 0U, std::memory_order_acq_rel,
+                            std::memory_order_relaxed);
+                }
+                if (!published) {
+                    // 槽已被通知方取走：交接已完成，按「已通知」返回。
+                    (void)RelockAfterConditionWait(mutex);
+                    subscription.Reset();
+                    ReleaseWaitNode(std::move(waiter));
+                    return true;
+                }
+                if (!slot_cleared) {
+                    // 入队后、清槽前被通知方快路径认领：本节点已在队列里，
+                    // 自己摘掉并返回成功。
+                    if (m_impl->m_waiter_count.load(
+                            std::memory_order_acquire) != 0U) {
+                        std::lock_guard<std::mutex> lock(m_impl->m_mutex);
+                        if (m_impl->DetachWaiter(waiter)) {
+                            m_impl->m_waiter_count.fetch_sub(
+                                1U, std::memory_order_release);
+                        }
+                    }
+                    (void)RelockAfterConditionWait(mutex);
+                    subscription.Reset();
+                    ReleaseWaitNode(std::move(waiter));
+                    return true;
+                }
+                const WaitResult slow = Await(waiter.get());
+                subscription.Reset();
+                if (m_impl->m_waiter_count.load(
+                        std::memory_order_acquire) != 0U) {
+                    std::lock_guard<std::mutex> lock(m_impl->m_mutex);
+                    if (m_impl->DetachWaiter(waiter)) {
+                        m_impl->m_waiter_count.fetch_sub(
+                            1U, std::memory_order_release);
+                    }
+                }
+                (void)RelockAfterConditionWait(mutex);
+                ReleaseWaitNode(std::move(waiter));
+                return slow == WaitResult::kNotified;
+            }
+            (void)RelockAfterConditionWait(mutex);
+            subscription.Reset();
+            ReleaseWaitNode(std::move(waiter));
+            return true;
+        }
+        // 槽已被占用：继续走通用慢路径（mutex 此刻仍被持有）。
+    }
+    // ===== CV FAST PATH END =====
+
     bool abort_before_publish = false;
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
@@ -2234,7 +2458,8 @@ bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
     // RWMutex 会在未持锁状态下 Unlock / 修改受保护容器（UB + 泄漏）。
     // 先用不 park 的 TryLock 抢回（调度器关闭时锁通常空闲），抢不回则抛
     // 异常，把「锁已丢失」变成可捕获的显式错误。
-    if (!mutex.LockForConditionWait() && !TryRelockWithoutParking(mutex)) {
+    if (!RelockAfterConditionWait(mutex) &&
+        !TryRelockWithoutParking(mutex)) {
         ReleaseWaitNode(std::move(waiter));
         ThrowConditionRelockFailure();
     }
@@ -2259,7 +2484,18 @@ bool ConditionVariable::WaitFor(Mutex& mutex, ContextDuration timeout,
 }
 
 void ConditionVariable::NotifyOne() noexcept {
-    // 快路径：没有等待者时连队列锁都不取。计数与队列在同一把锁内维护，
+    // 1P1C 快路径：独占槽里有 native 等待者时，无锁认领并唤醒。
+    // 必须排在「计数为 0 直接返回」之前 —— 快路径等待者不计入计数。
+    {
+        // 一次 RMW 写槽行即完成交接：等待者自旋读的就是这一行。
+        // exchange 的 release 语义保证 Notify 之前的用户态写对等待者可见。
+        const std::uintptr_t slot =
+            m_impl->m_fast_waiter.exchange(0U, std::memory_order_acq_rel);
+        if (slot != 0U) {
+            return;
+        }
+    }
+    // 慢路径：没有等待者时连队列锁都不取。计数与队列在同一把锁内维护，
     // 读到 0 时队列必然为空，不存在漏唤醒。
     if (m_impl->m_waiter_count.load(std::memory_order_acquire) == 0U) {
         return;
@@ -2302,6 +2538,11 @@ void ConditionVariable::NotifyOne() noexcept {
 }
 
 void ConditionVariable::NotifyAll() noexcept {
+    // 先摘走无锁槽里的唯一 native 等待者（与队列节点互不重叠）。
+    {
+        // 槽里的等待者只靠「槽被取走」感知通知，不需要额外唤醒写。
+        (void)m_impl->m_fast_waiter.exchange(0U, std::memory_order_acq_rel);
+    }
     std::deque<std::shared_ptr<WaitNode>> waiters;
     {
         std::lock_guard<std::mutex> lock(m_impl->m_mutex);
@@ -2566,6 +2807,10 @@ bool WaitGroup::Wait(const ContextPtr& context) {
     // 节点从线程本地缓存复用（与 Mutex / Cond 同一条缓存），避免为一次
     // Wait 分配一个含原子量与互斥量的控制块。
     auto waiter = AcquireWaitNode(target.scheduler, target.task);
+    // WG 的唤醒方只需发布一次计数归零：让等待者在 Done 到达前一直自旋，
+    // WakeNativeLocked 看到 futex_waiters == 0 就完全不调用 FUTEX_WAKE。
+    // 8192 次 PAUSE ≈ 70µs；真实长等待超出后仍会正常睡进 futex。
+    waiter->SetSpinBudget(32768U);
     ContextSubscription subscription(context, waiter);
     bool already_done = false;
     bool cancelled = false;

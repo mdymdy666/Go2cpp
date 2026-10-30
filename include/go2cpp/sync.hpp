@@ -426,6 +426,9 @@ public:
     ConditionVariableDebugSnapshot DebugSnapshotInternal() const;
 
 private:
+    /// @brief Wait 的重锁：短自旋 TryLock 优先，失败回退通用加锁路径。
+    /// @return true 表示返回时 mutex 已被重新持有。
+    static bool RelockAfterConditionWait(Mutex& mutex) noexcept;
 
     struct Impl;
     std::unique_ptr<Impl> m_impl;
