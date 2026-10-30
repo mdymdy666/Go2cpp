@@ -29,6 +29,7 @@ void run_scheduler_tests() {
         std::atomic<int> workers_stopped{0};
         std::atomic<int> tasks_started{0};
         std::atomic<int> tasks_terminal{0};
+        std::atomic<int> tasks_suspended{0};
         std::atomic<int> tasks_cancelled{0};
 
         void OnEvent(const SchedulerEvent& event) noexcept override {
@@ -50,8 +51,12 @@ void run_scheduler_tests() {
                     break;
                 case SchedulerEventType::kTaskCompleted:
                 case SchedulerEventType::kTaskFailed:
-                case SchedulerEventType::kTaskSuspended:
                     tasks_terminal.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                case SchedulerEventType::kTaskSuspended:
+                    // 挂起（park）不是终态：混入终态计数会掩盖真正的
+                    // kTaskCompleted/kTaskFailed 丢失。
+                    tasks_suspended.fetch_add(1, std::memory_order_relaxed);
                     break;
                 case SchedulerEventType::kTaskCancelled:
                     tasks_cancelled.fetch_add(1, std::memory_order_relaxed);
@@ -180,6 +185,8 @@ void run_scheduler_tests() {
     GO2CPP_CHECK(observer->workers_stopped.load(std::memory_order_relaxed) >= 1);
     GO2CPP_CHECK(observer->tasks_started.load(std::memory_order_relaxed) >=
                  task_count);
+    GO2CPP_CHECK(observer->tasks_cancelled.load(std::memory_order_relaxed) ==
+                 0);
     GO2CPP_CHECK(observer->tasks_terminal.load(std::memory_order_relaxed) >=
                  task_count);
     for (const auto& processor : scheduler.processors()) {

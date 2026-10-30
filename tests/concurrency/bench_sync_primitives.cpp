@@ -305,6 +305,11 @@ void BenchWaitGroupWakeup() {
             CpuRelax();
         }
         std::this_thread::sleep_for(std::chrono::microseconds(20));
+        // sleep 返回后 CPU 可能刚从低功耗态恢复；先忙等约 8µs 让流水线
+        // 与时钟稳定，再开始计时，避免把唤醒抖动算进 Done。
+        for (int k = 0; k < 1000; ++k) {
+            CpuRelax();
+        }
         const std::uint64_t start = NowNs();
         wg.Done();
         const std::uint64_t done_end = NowNs();

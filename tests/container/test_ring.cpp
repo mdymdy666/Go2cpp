@@ -318,9 +318,13 @@ void TestSingleNodeDestructor() {
 }
 
 void TestDeleteRingNull() {
-    go2cpp_container_test::Announce("ring: DeleteRing(nullptr)");
+    go2cpp_container_test::Announce("ring: DeleteRing(nullptr) 不干扰现存链");
+    // nullptr 必须是无操作：既不崩溃，也不能破坏其它链。
+    IntRing* ring = MakeN(2);  // 1, 2
+    CONTAINER_REQUIRE(ring != nullptr);
     IntRing::DeleteRing(nullptr);
-    CONTAINER_CHECK(true);
+    Verify(ring, 2, SumN(2));
+    IntRing::DeleteRing(ring);
 }
 
 }  // namespace

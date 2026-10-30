@@ -353,9 +353,10 @@ void TestImmediateConditionAndWaitGroupAbort() {
     cancelled.second();
     GO2CPP_CHECK(!condition.Wait(mutex, cancelled.first));
     const bool native_probe_after_cancel = mutex.TryLock();
+    // 断言：Wait(false) 返回时调用方必须仍持有 mutex（契约规定的
+    // unlock/relock）。旧注释写成「未持锁的回归也算通过」，与断言相反；
+    // 这里只承认「仍持锁」一种结果。
     GO2CPP_CHECK(!native_probe_after_cancel);
-    // Either the expected relock or a regression that returned unlocked leaves
-    // exactly one logical lock to release here.
     mutex.Unlock();
 
     // Zero and negative durations create an already-expired context

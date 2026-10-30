@@ -98,10 +98,11 @@ void scenario_spawn_shutdown_loop() {
         check(!scheduler.is_running(), "调度器已停止");
         // shutdown 之后提交必须安全失败，不能挂起。
         auto late = scheduler.spawn([] {});
-        check(late != nullptr, "shutdown 后 spawn 返回非空");
-        if (late) {
-            check(late->state() == GState::kCancelled, "shutdown 后任务被取消");
-        }
+        // spawn 契约：拒绝时也返回已取消句柄，绝不返回 nullptr。旧写法把
+        // 「非空」与「已取消」拆开，且状态检查被 if (late) 包住——句柄为空
+        // 时反而静默通过。这里合并为一条不可逃逸的断言。
+        check(late != nullptr && late->state() == GState::kCancelled,
+              "shutdown 后 spawn 返回已取消句柄");
     }
 }
 
@@ -252,7 +253,10 @@ void scenario_enqueue_wake_shutdown_race() {
         scheduler.start();
 
         std::atomic<bool> stop{false};
+        // shutdown 开始后仍有提交，是场景 7 唯一有效的覆盖证据。
+        std::atomic<bool> shutdown_requested{false};
         std::atomic<int> submitted{0};
+        std::atomic<int> submitted_during_shutdown{0};
         std::atomic<int> completed{0};
         std::atomic<int> rejected{0};
         std::mutex handles_mutex;
@@ -261,8 +265,9 @@ void scenario_enqueue_wake_shutdown_race() {
         all_handles.reserve(32768);
         parked_handles.reserve(2048);
 
-        auto producer = [&scheduler, &stop, &handles_mutex, &all_handles,
-                         &parked_handles, &submitted, &completed,
+        auto producer = [&scheduler, &stop, &shutdown_requested,
+                         &submitted_during_shutdown, &handles_mutex,
+                         &all_handles, &parked_handles, &submitted, &completed,
                          &rejected] {
             // shutdown 期间继续提交：enqueue() 与 admission/registry 扫描
             // 持续交叉，直到主线程在 shutdown 返回后置 stop。
@@ -290,6 +295,10 @@ void scenario_enqueue_wake_shutdown_race() {
                     continue;
                 }
                 submitted.fetch_add(1, std::memory_order_relaxed);
+                if (shutdown_requested.load(std::memory_order_acquire)) {
+                    submitted_during_shutdown.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
                 std::lock_guard<std::mutex> lock(handles_mutex);
                 all_handles.emplace_back(task);
                 if ((i & 15) == 0) {
@@ -329,6 +338,7 @@ void scenario_enqueue_wake_shutdown_race() {
         };
         check(wait_until(submitted_enough, std::chrono::milliseconds(1000)),
               "提交进入稳态");
+        shutdown_requested.store(true, std::memory_order_release);
         const auto shutdown_started = Clock::now();
         scheduler.shutdown();
         const auto shutdown_elapsed = std::chrono::duration_cast<
@@ -343,8 +353,10 @@ void scenario_enqueue_wake_shutdown_race() {
               "混合负载下 shutdown 在 5s 内完成");
         check(scheduler.worker_count() == 0, "混合负载后 worker 归零");
         check(scheduler.runnable_count() == 0, "混合负载后 runnable 归零");
-        check(rejected.load(std::memory_order_relaxed) == 0,
-              "spawn 未返回空句柄");
+        // 旧断言 rejected==0 恒真（spawn 结构上从不返回空句柄），改为
+        // 检查场景本身确实发生：shutdown 开始后仍有提交与 admission 交叉。
+        check(submitted_during_shutdown.load(std::memory_order_relaxed) > 0,
+              "shutdown 期间确有提交（场景有效）");
         int non_terminal = 0;
         {
             std::lock_guard<std::mutex> lock(handles_mutex);
@@ -360,9 +372,12 @@ void scenario_enqueue_wake_shutdown_race() {
             }
         }
         check(non_terminal == 0, "shutdown 返回时所有任务已终态");
-        std::printf("  round %d: submitted=%d completed=%d shutdown=%lldms\n",
+        std::printf("  round %d: submitted=%d during_shutdown=%d "
+                    "completed=%d rejected=%d shutdown=%lldms\n",
                     round, submitted.load(std::memory_order_relaxed),
+                    submitted_during_shutdown.load(std::memory_order_relaxed),
                     completed.load(std::memory_order_relaxed),
+                    rejected.load(std::memory_order_relaxed),
                     static_cast<long long>(shutdown_elapsed.count()));
     }
 }

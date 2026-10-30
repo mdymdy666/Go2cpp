@@ -184,12 +184,14 @@ void scenario_repeated() {
     std::mutex m;
     int turn = 0;
     constexpr int kRounds = 1000;
+    std::atomic<int> consumed{0};
 
     std::thread consumer([&] {
         std::unique_lock<std::mutex> lk(m);
         for (int i = 0; i < kRounds; ++i) {
             (void)cond.wait(lk, [&] { return turn == 1; });
             turn = 0;
+            consumed.fetch_add(1, std::memory_order_release);
         }
     });
     for (int i = 0; i < kRounds; ++i) {
@@ -208,7 +210,8 @@ void scenario_repeated() {
         }
     }
     consumer.join();
-    check(true, "1000 轮重入完成");
+    check(consumed.load(std::memory_order_acquire) == kRounds,
+          "1000 轮重入完成（消费者每轮都被唤醒）");
 }
 
 }  // namespace

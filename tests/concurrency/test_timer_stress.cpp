@@ -18,7 +18,7 @@
  * 1. 高频一次性定时器：连续建/触发，验证计数精确；
  * 2. **状态不残留**：A 触发完后新建 B，验证 B 不继承 A 的回调；
  * 3. 并发多线程：N 线程各自建/毁，验证并发注册/取消路径无数据竞争；
- * 4. 随机取消：随机延迟后 Cancel，验证取消后绝不触发；
+ * 4. 随机取消：随机延迟后 Cancel，验证取消后绝不触发、保留的必定触发；
  * 5. 周期定时器 + 取消：周期触发若干次后取消，验证停止；
  * 6. 混合压力：随机混合上述形态，跑多轮，验证无异常触发、析构安全。
  */
@@ -31,6 +31,7 @@
 #include <mutex>
 #include <random>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -106,8 +107,9 @@ void ScenarioNoStateResidue() {
                 WaitUntil([&] { return generation_a.load() > 0; }, 5s);
             Check(fired, "residue: generation A did not fire");
         }
-        // 旧一代 State 已释放；新建下一代，验证它不会继承上一代的回调
-        WaitUntil([] { return true; }, 1ms);
+        // 旧一代 State 已释放；新建下一代，验证它不会继承上一代的回调。
+        // 真实等待 1ms：恒真谓词会让等待立即返回，断言两侧间隔不足 1µs。
+        std::this_thread::sleep_for(1ms);
         const int a_after_release = generation_a.load();
 
         {
@@ -118,7 +120,7 @@ void ScenarioNoStateResidue() {
                 WaitUntil([&] { return generation_b.load() > 0; }, 5s);
             Check(fired, "residue: generation B did not fire");
         }
-        WaitUntil([] { return true; }, 1ms);
+        std::this_thread::sleep_for(1ms);
 
         // 关键断言：下一代触发不能带动上一代的回调
         Check(generation_a.load() == a_after_release,
@@ -181,25 +183,45 @@ void ScenarioConcurrent() {
 void ScenarioRandomCancel() {
     auto& service = go2cpp::core::TimerService::Default();
     std::mt19937 rng(20261017);
-    std::uniform_int_distribution<int> delay_us(0, 800);
+    // 延迟取 200~300ms：Cancel 紧随 ScheduleAfter，必然早于截止时间。
+    // 若用 0~800µs，回调可能已被 timer worker 领取，按契约 Cancel 不会
+    // 打断已领取的回调，fired==kept 会变成偶发失败。
+    std::uniform_int_distribution<int> delay_ms(200, 300);
     constexpr int kRounds = 500;
     std::atomic<int> fired{0};
+    // 未取消的句柄必须存活到最终断言。旧写法每轮在循环末尾析构句柄
+    // （析构=Cancel），500 个定时器全部被取消、0 个触发，场景名不副实。
+    std::vector<go2cpp::core::Timer> kept;
+    kept.reserve(kRounds);
+    int cancelled = 0;
     for (int i = 0; i < kRounds; ++i) {
         auto timer = service.ScheduleAfter(
-            std::chrono::microseconds(delay_us(rng)), [&fired] {
+            std::chrono::milliseconds(delay_ms(rng)), [&fired] {
                 fired.fetch_add(1, std::memory_order_relaxed);
             });
-        // 随机决定是否立即取消
-        if (delay_us(rng) % 2 == 0) {
+        // 随机决定是否立即取消；保留的句柄移入 kept 等待真实触发。
+        if (rng() % 2 == 0) {
             timer.Cancel();
+            ++cancelled;
             Check(!timer.Active(), "random-cancel: cancelled timer still active");
+        } else {
+            kept.push_back(std::move(timer));
         }
     }
-    // 等足够久让所有未取消的定时器都触发
-    WaitUntil([] { return true; }, 50ms);
-    // 取消过的定时器不能再增长：再等一轮，计数必须稳定
+    Check(static_cast<int>(kept.size()) + cancelled == kRounds,
+          "random-cancel: timer handle accounting");
+    // 两条分支都必须被覆盖，否则「全部取消」时 expected==0 会空跑通过。
+    Check(cancelled > 0 && !kept.empty(),
+          "random-cancel: both branches covered");
+    // 等保留的定时器全部触发：触发数必须精确等于保留数。
+    const int expected = static_cast<int>(kept.size());
+    Check(WaitUntil([&] { return fired.load() >= expected; }, 5s),
+          "random-cancel: kept timers did not all fire");
+    Check(fired.load() == expected,
+          "random-cancel: fired count mismatch (cancel leaked or lost)");
+    // 取消过的定时器不能再增长：真实等待一个窗口后计数必须稳定。
     const int settled = fired.load();
-    WaitUntil([] { return true; }, 100ms);
+    std::this_thread::sleep_for(100ms);
     Check(fired.load() == settled,
           "random-cancel: cancelled timer fired after settling");
 }
@@ -219,7 +241,8 @@ void ScenarioRepeating() {
     timer.Cancel();
     Check(!timer.Active(), "repeating: timer still active after cancel");
     const int after_cancel = ticks.load();
-    WaitUntil([] { return true; }, 30ms);
+    // 真实等待 30ms；恒真谓词会让「取消后不再触发」的断言立即采样。
+    std::this_thread::sleep_for(30ms);
     Check(ticks.load() == after_cancel,
           "repeating: ticked after cancel");
 
@@ -278,9 +301,9 @@ void ScenarioMixedStress() {
             }
         }
     }
-    WaitUntil([] { return true; }, 300ms);
+    std::this_thread::sleep_for(300ms);
     const int settled = one_shot.load();
-    WaitUntil([] { return true; }, 200ms);
+    std::this_thread::sleep_for(200ms);
     Check(one_shot.load() == settled,
           "mixed: one-shot fired after settling window");
 }

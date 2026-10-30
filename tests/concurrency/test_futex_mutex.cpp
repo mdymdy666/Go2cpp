@@ -343,10 +343,21 @@ void CheckContentionStateReturnsToZero() {
  */
 void check_scoped_lock() {
     go2cpp::core::FutexMutex gate;
+    // lock_guard 组合必须真正互斥：持锁期间另一线程不得进入临界区。
+    std::atomic<bool> contender_entered{false};
+    std::thread contender;
     {
         std::lock_guard<go2cpp::core::FutexMutex> lock(gate);
-        GO2CPP_CHECK(true);
+        contender = std::thread([&gate, &contender_entered] {
+            gate.lock();
+            contender_entered.store(true, std::memory_order_release);
+            gate.unlock();
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        GO2CPP_CHECK(!contender_entered.load(std::memory_order_acquire));
     }
+    contender.join();
+    GO2CPP_CHECK(contender_entered.load(std::memory_order_acquire));
     {
         std::unique_lock<go2cpp::core::FutexMutex> lock(gate);
         GO2CPP_CHECK(lock.owns_lock());
