@@ -473,13 +473,17 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_socket_debug_test COMMAND go2cpp_socket_debug_test)
     set_tests_properties(go2cpp_socket_debug_test PROPERTIES TIMEOUT 180)
 
-    add_executable(go2cpp_hook_ops_test
-        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_ops.cpp)
-    target_link_libraries(go2cpp_hook_ops_test PRIVATE go2cpp_hook)
-    target_compile_options(go2cpp_hook_ops_test PRIVATE
-        -O2 -Wall -Wextra -Wpedantic)
-    add_test(NAME go2cpp_hook_ops_test COMMAND go2cpp_hook_ops_test)
-    set_tests_properties(go2cpp_hook_ops_test PROPERTIES TIMEOUT 120)
+    if (TARGET go2cpp_hook)
+        add_executable(go2cpp_hook_ops_test
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_ops.cpp)
+        target_link_libraries(go2cpp_hook_ops_test PRIVATE go2cpp_hook)
+        target_compile_options(go2cpp_hook_ops_test PRIVATE
+            -O2 -Wall -Wextra -Wpedantic)
+        add_test(NAME go2cpp_hook_ops_test COMMAND go2cpp_hook_ops_test)
+        set_tests_properties(go2cpp_hook_ops_test PROPERTIES TIMEOUT 120)
+    else()
+        message(STATUS "skip go2cpp_hook_ops_test (GO2CPP_WITH_HOOK=OFF)")
+    endif()
 
     # hook 三条 P0 回归（HOOK-01/02/03）：
     #   - SO_RCVTIMEO/SO_SNDTIMEO 超时必须返回 EAGAIN（非阻塞语义）；
