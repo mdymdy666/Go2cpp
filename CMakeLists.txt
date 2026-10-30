@@ -2,6 +2,20 @@ cmake_minimum_required(VERSION 3.20)
 
 project(go2cpp_runtime VERSION 0.1.0 LANGUAGES CXX)
 
+# 立即绑定所有 PLT/GOT 重定位（等价 LD_BIND_NOW=1）。
+#
+# 共享库默认使用懒绑定：首次调用某个跨库符号时，ld.so 的
+# _dl_runtime_resolve_xsavec 会把完整的 xsave 状态（AVX-512 机器上可达
+# 数 KB）压到**当前栈**上。Bento 的 Fiber 栈初始只有 1 页（默认
+# fiber_stack_size=2048 归一化到 4KB），在较深的调度/关停调用链里首次
+# 解析符号时，这个 xsave 区域会越过栈边界写进 guard page，表现为
+# `do_lookup_x`/`_dl_fixup` 处的 SIGSEGV（实测 scheduler 测试必现）。
+# 启动期一次性绑定把这段运行期栈开销彻底消除，代价只是进程启动时多解析
+# 几百个符号。
+if (UNIX AND NOT APPLE)
+    add_link_options(-Wl,-z,now)
+endif()
+
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
     NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|riscv|ppc|s390")
     enable_language(ASM)
