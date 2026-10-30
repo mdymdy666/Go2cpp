@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ThreadSanitizer 冒烟：构建插桩版 runtime，编译并运行锁/通道/CV/PC 测试。
+# ThreadSanitizer 冒烟：构建插桩版 runtime，编译并运行锁/通道/CV/PC/Timer 测试。
 #
 # 只用于本地验证，不注册 ctest。用法：
 #   tests/concurrency/run_tsan.sh
