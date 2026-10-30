@@ -2,8 +2,8 @@
  * Go2Cpp x86_64 context backend.
  *
  * The register layout and first-entry convention are derived from the
- * Apache-2.0 licensed coost/TBOX context implementation and the original
- * Boost.Context x86_64 layout.  This file intentionally exposes only the
+ * Apache-2.0 licensed coost/TBOX context implementation and the classical
+ * x86_64 fcontext layout.  This file intentionally exposes only the
  * Go2Cpp-prefixed ABI declared in detail/context_backend.hpp.
  *
  * The C++ FiberStack allocator supplies a page-aligned mmap region with a

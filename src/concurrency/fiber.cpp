@@ -28,25 +28,20 @@
 #include "go2cpp/detail/context_backend.hpp"
 #include "go2cpp/fiber_local.hpp"
 
-// 只有 Linux x86_64 + 项目自带的汇编上下文后端才启用按需增长。
-// 其它平台/后端保留固定栈语义，不会安装 SIGSEGV handler。
-#if defined(GO2CPP_USE_NATIVE_CONTEXT) && defined(__linux__) && defined(__x86_64__)
+// 上下文切换与栈分配全部由项目自研实现（context_x64.S + FiberStack），
+// 只支持 Linux x86_64；CMake 在其它平台直接拒绝配置。
+// 按需增长只在 Linux x86_64 上启用；其它平台保留固定栈语义。
+#if defined(__linux__) && defined(__x86_64__)
 #define GO2CPP_FIBER_GROWABLE_STACK 1
 #include <ucontext.h>
 #endif
 
-#if !defined(GO2CPP_USE_NATIVE_CONTEXT)
-#include <boost/context/detail/fcontext.hpp>
-#include <boost/context/protected_fixedsize_stack.hpp>
-#include <boost/context/stack_traits.hpp>
-#else
 #include <sys/mman.h>
 #include <unistd.h>
 #if defined(__has_include)
 #if __has_include(<valgrind/valgrind.h>)
 #include <valgrind/valgrind.h>
 #define GO2CPP_FIBER_HAVE_VALGRIND 1
-#endif
 #endif
 #endif
 
@@ -132,12 +127,10 @@
 namespace go2cpp {
 namespace {
 
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
 // 当前线程正在运行的 Fiber 栈。只有 growable 栈会写入非空值；SIGSEGV
 // handler 据此判断故障地址是否落在某个可变长栈的未提交区。
 struct FiberStack;
 GO2CPP_FIBER_TLS thread_local FiberStack* t_current_growable_stack = nullptr;
-#endif
 
 GO2CPP_FIBER_TLS thread_local Fiber* s_current_fiber = nullptr;
 // 没有运行真实 Fiber 时，每个 OS 线程仍有一个不可 resume 的根上下文。
@@ -156,7 +149,6 @@ struct FiberTlsRestore final {
     Fiber* m_previous;
 };
 
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
 // resume_locked 可能沿父链循环多次，每次 jump 前把 TLS 指向目标栈，返回
 // 后必须恢复到进入 resume 时的栈；否则 handler 会拿着已释放/错误的栈边界
 // 判断故障。析构函数保证所有 return 路径都恢复。
@@ -172,7 +164,6 @@ struct GrowableStackTlsRestore final {
 
     FiberStack* m_previous;
 };
-#endif
 
 std::atomic<std::uint64_t> s_next_fiber_id{1};
 
@@ -181,20 +172,15 @@ std::atomic<std::uint64_t> s_next_fiber_id{1};
 std::atomic<std::uint64_t> s_destroy_claim_timeouts{0};
 
 // 受保护栈的映射/解除映射成本远高于一次 Fiber 上下文切换。栈不能在
-// Fiber 仍可恢复时复用，因此只在 Fiber 完成、且其 fcontext 已经失效后
+// Fiber 仍可恢复时复用，因此只在 Fiber 完成、且其上下文已经失效后
 // 放回缓存。先使用当前 M 的 TLS 缓存，跨 M 销毁时再进入有界全局缓存。
 struct CachedStack {
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
     std::size_t usable{0};
     // 0 表示固定栈布局（usable + 1 页 guard）；非 0 表示预留虚拟地址大小。
     // 缓存键是 (usable, reserve)：两种布局的提交方式不同，不能混用。
     std::size_t reserve{0};
     void* mapping{nullptr};
     std::size_t mapping_size{0};
-#else
-    std::size_t size{0};
-    boost::context::stack_context context{};
-#endif
 };
 
 /**
@@ -213,7 +199,7 @@ struct CachedStack {
  * | `s_thread_stack_pool` | thread_local | 是 | 同 M 上的 Fiber 复用（绝大多数） |
  * | `s_stack_pool` | 全局 + `s_stack_pool_mutex` | 否 | 跨 M 销毁时的兜底，有界 |
  *
- * ## 为什么必须等 fcontext 失效
+ * ## 为什么必须等上下文失效
  *
  * 栈在 Fiber **仍可恢复时绝不能复用** —— 会把旧栈帧的数据暴露给新 Fiber。
  * 只有「Fiber 已完成、`reset_for_scheduler` 已清空 m_context/m_stack」的栈
@@ -221,21 +207,14 @@ struct CachedStack {
  *
  * ## 析构
  *
- * 把缓存里所有映射 `munmap`（或交还 boost 的 allocator），不泄漏。
+ * 把缓存里所有映射 `munmap`，不泄漏。
  */
 struct StackCache {
     ~StackCache() noexcept {
         for (auto& entry : entries) {
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
             if (entry.mapping != nullptr) {
                 ::munmap(entry.mapping, entry.mapping_size);
             }
-#else
-            if (entry.context.sp != nullptr) {
-                boost::context::protected_fixedsize_stack allocator(entry.size);
-                allocator.deallocate(entry.context);
-            }
-#endif
         }
     }
 
@@ -305,7 +284,6 @@ inline int swap_errno(int value) noexcept {
 
 inline void store_errno(int value) noexcept { *errno_slot() = value; }
 
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
 // 查询系统页大小。两个细节：
 // 1. `sysconf` 失败时可能**覆盖 errno**，所以进入前保存、返回前恢复，
 //    否则会把无关的 errno 泄漏给调用方；
@@ -334,7 +312,6 @@ std::size_t native_page_size() {
     static const std::size_t cached = query_native_page_size();
     return cached;
 }
-#endif
 
 #if defined(GO2CPP_FIBER_GROWABLE_STACK)
 // 一次 fault 至少提交 64KiB（16 页），避免深递归时每页一次信号。
@@ -481,7 +458,6 @@ std::size_t checked_stack_mapping_size(std::size_t usable_size,
     return usable_size + page_size;
 }
 
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
 // 把栈大小向上对齐到页边界。`mmap`/`mprotect` 要求页对齐，
 // 不对齐会让 guard page 落不到正确位置。
 // 加法前检查溢出 —— 接近 `SIZE_MAX` 的请求直接抛 length_error 而不是回绕成小值。
@@ -496,7 +472,6 @@ std::size_t align_stack_size(std::size_t requested, std::size_t page_size) {
     }
     return requested + padding;
 }
-#endif
 
 // 归一化初始提交量：0 用 Fiber::DefaultStackSize()（直接构造 Fiber 的
 // 默认值 128KiB）；页对齐；下限 1 页。注意调度器配置的默认请求是 2048，
@@ -507,7 +482,6 @@ std::size_t normalize_stack_size(std::size_t requested) {
     if (requested == 0) {
         requested = Fiber::DefaultStackSize();
     }
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
     const auto page_size = native_page_size();
     const auto maximum_usable =
         std::numeric_limits<std::size_t>::max() - page_size;
@@ -523,28 +497,6 @@ std::size_t normalize_stack_size(std::size_t requested) {
     // 也不会保存一个随后会回绕的映射尺寸。
     (void)checked_stack_mapping_size(aligned, page_size);
     return aligned;
-#else
-    const auto minimum = boost::context::stack_traits::minimum_size();
-    const auto page_size = boost::context::stack_traits::page_size();
-    const auto maximum = std::numeric_limits<std::size_t>::max();
-    if (page_size == 0 || page_size > maximum / 2U) {
-        throw std::length_error("fiber page size is invalid");
-    }
-    const auto safe_maximum = maximum - 2U * page_size;
-    if (minimum > safe_maximum) {
-        throw std::length_error("fiber minimum stack size is invalid");
-    }
-    std::size_t result = std::min(std::max(requested, minimum), safe_maximum);
-    if (!boost::context::stack_traits::is_unbounded()) {
-        const auto configured_maximum =
-            boost::context::stack_traits::maximum_size();
-        if (configured_maximum < minimum) {
-            throw std::length_error("fiber maximum stack size is invalid");
-        }
-        result = std::min(result, configured_maximum);
-    }
-    return result;
-#endif
 }
 
 #if defined(GO2CPP_FIBER_GROWABLE_STACK)
@@ -563,7 +515,6 @@ std::size_t normalize_stack_reserve_size(std::size_t requested,
 }
 #endif
 
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
 // ---------------------------------------------------------------------------
 // 栈槽 arena：把 N 个 reserve 等大的槽放进一次 mmap
 // ---------------------------------------------------------------------------
@@ -862,7 +813,6 @@ void StackArenaRelease(StackArena* arena, void* slot) noexcept {
     } catch (...) {
     }
 }
-#endif  // GO2CPP_USE_NATIVE_CONTEXT
 
 /**
  * @brief 一个 Fiber 的独立栈：大预留 + 顶部初始提交 + 可选按需增长。
@@ -899,7 +849,6 @@ void StackArenaRelease(StackArena* arena, void* slot) noexcept {
  * Valgrind 构建会注册/注销栈边界，普通构建被客户端宏消除、不影响热路径。
  */
 struct FiberStack {
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
     explicit FiberStack(std::size_t usable, std::size_t requested_reserve,
                         bool requested_growable)
         : m_initial_usable(usable),
@@ -1239,82 +1188,6 @@ private:
 #if defined(GO2CPP_FIBER_HAVE_VALGRIND)
     unsigned m_valgrind_stack_id{0U};
 #endif
-#else
-    explicit FiberStack(std::size_t size)
-        : m_requested_size(size),
-          m_allocator(size),
-          m_context(acquire(m_allocator, m_requested_size)) {}
-
-    ~FiberStack() noexcept { release(m_allocator, m_requested_size, m_context); }
-
-    FiberStack(const FiberStack&) = delete;
-    FiberStack& operator=(const FiberStack&) = delete;
-
-    std::size_t usable_size() const noexcept {
-        return m_context.size - boost::context::stack_traits::page_size();
-    }
-
-    const void* bottom() const noexcept {
-        return static_cast<const char*>(m_context.sp) - usable_size();
-    }
-
-    void* stack_pointer() const noexcept { return m_context.sp; }
-
-private:
-    static boost::context::stack_context acquire(
-        boost::context::protected_fixedsize_stack& allocator,
-        std::size_t size) {
-        for (auto it = s_thread_stack_pool.entries.rbegin();
-             it != s_thread_stack_pool.entries.rend(); ++it) {
-            if (it->size == size) {
-                const auto context = it->context;
-                s_thread_stack_pool.entries.erase(std::next(it).base());
-                return context;
-            }
-        }
-        {
-            std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
-            for (auto it = s_stack_pool.entries.rbegin();
-                 it != s_stack_pool.entries.rend(); ++it) {
-                if (it->size == size) {
-                    const auto context = it->context;
-                    s_stack_pool.entries.erase(std::next(it).base());
-                    return context;
-                }
-            }
-        }
-        return allocator.allocate();
-    }
-
-    static void release(boost::context::protected_fixedsize_stack& allocator,
-                        std::size_t size,
-                        boost::context::stack_context& context) noexcept {
-        if (context.sp == nullptr) {
-            return;
-        }
-        try {
-            if (s_thread_stack_pool.entries.size() < 32U) {
-                s_thread_stack_pool.entries.push_back(CachedStack{size, context});
-                context = {};
-                return;
-            }
-            std::lock_guard<std::mutex> lock(s_stack_pool_mutex);
-            if (s_stack_pool.entries.size() < 512U) {
-                s_stack_pool.entries.push_back(CachedStack{size, context});
-                context = {};
-                return;
-            }
-        } catch (...) {
-            // 缓存只用于性能优化；容量不足或分配失败时回收到系统。
-        }
-        allocator.deallocate(context);
-        context = {};
-    }
-
-    std::size_t m_requested_size;
-    boost::context::protected_fixedsize_stack m_allocator;
-    boost::context::stack_context m_context;
-#endif
 };
 
 #if defined(GO2CPP_FIBER_GROWABLE_STACK)
@@ -1412,7 +1285,7 @@ void growable_stack_segv_handler(int sig, siginfo_t* info,
 
 // 父链只保存这份独立元数据，不保存父 Fiber 栈或 owner 的所有权。子 Fiber
 // 持有父记录，因此父对象结束后仍可生成一致的墓碑帧、传播取消状态；
-// 真正的 fcontext 恢复仍要求父 Fiber 对象存活。错误生命周期会进入 Failed
+// 真正的上下文恢复仍要求父 Fiber 对象存活。错误生命周期会进入 Failed
 // 放弃路径，不能把已经失效的父栈当作可恢复上下文。
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
 /// 删除某个 Fiber 的调试元数据（定义见 FiberMetaMap 之后）。
@@ -1442,6 +1315,14 @@ struct FiberRecord {
     std::size_t depth{0};
     std::thread::id last_thread{};
     FiberExecutionBinding execution{};
+    /// M 亲和：最近一次运行所在的 M/P 与 LockToCurrentM 绑定（0=未绑定）。
+    /// 写侧只有持有 resume 权的执行流，读侧可能是调度器/诊断线程，因此用
+    /// 原子保存；统计计数只增不减，重置只在 reset_for_scheduler() 时发生。
+    std::atomic<std::uint64_t> affinity_machine{0};
+    std::atomic<std::uint64_t> affinity_processor{0};
+    std::atomic<std::uint64_t> locked_machine{0};
+    std::atomic<std::uint64_t> affinity_hits{0};
+    std::atomic<std::uint64_t> affinity_migrations{0};
     /// 以下仅为调试元数据（GO2CPP_DEBUG_DUMP=ON 时填充）：
     /// 任务实际函数名（typeid demangle / GO2CPP_FIBER_NAME）与栈地址范围。
     std::string function_name;
@@ -1457,7 +1338,7 @@ struct FiberRecord {
 /// 任务函数名：优先 GO2CPP_FIBER_NAME 的显式名字，其次 typeid 的
 /// target_type 名（std::function 的 target_type 才能拿到真实 lambda/函数
 /// 指针类型；直接 typeid(Function) 只会得到 std::function<void()>）。
-std::string DescribeFiberFunction(const Fiber::Function& function) {
+[[maybe_unused]] std::string DescribeFiberFunction(const Fiber::Function& function) {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
     const char* explicit_name = go2cpp::debug::TakeNextFiberName();
     if (explicit_name != nullptr && *explicit_name != '\0') {
@@ -1661,6 +1542,13 @@ struct Fiber::Impl {
             m_record->depth = 0;
             m_record->last_thread = {};
             m_record->execution = {};
+            // 复用 Fiber 即换了一个逻辑 G：亲和状态必须清零，否则新 G 会
+            // 继承上一个任务「最近 M」甚至 LockToCurrentM 绑定。
+            m_record->affinity_machine.store(0, std::memory_order_relaxed);
+            m_record->affinity_processor.store(0, std::memory_order_relaxed);
+            m_record->locked_machine.store(0, std::memory_order_relaxed);
+            m_record->affinity_hits.store(0, std::memory_order_relaxed);
+            m_record->affinity_migrations.store(0, std::memory_order_relaxed);
             m_record->requested_stack_bytes = normalized_stack_size;
             m_record->reserve_stack_bytes = stack_reserve_size;
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
@@ -1709,7 +1597,7 @@ struct Fiber::Impl {
     }
 
     void abandon_suspended(const char* message) noexcept {
-        // 挂起的 fcontext 没有正在执行的指令，释放其栈是安全的；但栈上
+        // 挂起的上下文没有正在执行的指令，释放其栈是安全的；但栈上
         // 的 C++ 局部变量无法再展开。因此只能显式标记 Failed，并清理
         // FiberLocal 值，不能伪造 Completed。这个路径只允许在已经取得
         // m_resume_claim 后执行，避免与另一个 resume 并发访问上下文。
@@ -1836,7 +1724,7 @@ struct Fiber::Impl {
 
         // claim 已由 ~Fiber 有界取得（FIBER-02），可以直接观察终态。
         // entry() 会先发布 Completed/Failed，后由 resume() 释放 claim；
-        // 若只检查 state，析构可能在这个窗口释放 fcontext/保护栈，导致
+        // 若只检查 state，析构可能在这个窗口释放上下文/保护栈，导致
         // resume_locked() 继续访问已释放对象。
 
         // 先发布墓碑，再请求协作式收尾。父链记录不会悬空；析构线程
@@ -1901,11 +1789,7 @@ struct Fiber::Impl {
     }
 
     static void entry(
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
         detail::Transfer transfer
-#else
-        boost::context::detail::transfer_t transfer
-#endif
     ) noexcept {
         auto* const self = static_cast<Impl*>(const_cast<void*>(transfer.data));
         self->finish_switch_to_fiber();
@@ -1942,14 +1826,10 @@ struct Fiber::Impl {
 #if defined(GO2CPP_FIBER_TSAN)
         __tsan_switch_to_fiber(self->m_tsan_caller, 0);
 #endif
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
         // 栈即将交还给调用者；在真正跳转前清掉，避免窗口期内 handler
         // 把调用者栈上的 fault 误判成这个已完成的 Fiber 栈。
         t_current_growable_stack = nullptr;
         detail::JumpContext(self->m_caller, self);
-#else
-        boost::context::detail::jump_fcontext(self->m_caller, self);
-#endif
         std::terminate();
     }
 
@@ -2064,7 +1944,7 @@ struct Fiber::Impl {
      *
      * 这是**整个 Fiber 机制的唯一切换点**：`Fiber::Resume`、`Task::run` 的
      * trampoline、`Scheduler` 的 G 执行都收敛到这里。它下面是
-     * `jump_fcontext`（或原生 asm 版本），上面是所有并发原语。
+     * `detail::JumpContext`（context_x64.S），上面是所有并发原语。
      *
      * ## 步骤
      *
@@ -2104,12 +1984,10 @@ struct Fiber::Impl {
         // step2: 记住最初的调用者；本函数可能沿父链循环多轮，退出时必须恢复。
         Fiber* const original_caller = s_current_fiber;
         const FiberTlsRestore tls_restore(original_caller);
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
         // handler 只应看到当前正在执行的 Fiber 栈；进入 resume 时保存
         // 调用者的栈，jump 返回后恢复（嵌套 Fiber 时是父 Fiber 的栈）。
         FiberStack* const previous_growable_stack = t_current_growable_stack;
         const GrowableStackTlsRestore stack_tls_restore(previous_growable_stack);
-#endif
         // step3: 每轮都重新校验状态（上一轮切换后状态可能已变）。
         for (;;) {
             const FiberState current = m_record->state.load(std::memory_order_acquire);
@@ -2138,6 +2016,28 @@ struct Fiber::Impl {
             m_record->state.store(FiberState::Running, std::memory_order_release);
             m_record->reason.store(SuspendReason::None, std::memory_order_release);
             m_scheduler_propagate.store(false, std::memory_order_release);
+            // M 亲和：记录本次恢复真正落在哪个 M/P。调度器 worker 在进入 G
+            // 之前已经把 t_machine_id/t_processor_id 发布到本线程的
+            // main_fiber 绑定（s_main_execution），这里读到的是执行本
+            // Fiber 的 M；非受管 resume（普通线程直接 resume）machine 为 0，
+            // 不做记录，避免把「没有 M」误记成迁移。
+            const std::uint64_t resume_machine = s_main_execution.machine_id;
+            if (resume_machine != 0) {
+                const std::uint64_t previous_machine =
+                    m_record->affinity_machine.exchange(
+                        resume_machine, std::memory_order_relaxed);
+                m_record->affinity_processor.store(
+                    s_main_execution.processor_id,
+                    std::memory_order_relaxed);
+                if (previous_machine != 0 &&
+                    previous_machine != resume_machine) {
+                    m_record->affinity_migrations.fetch_add(
+                        1, std::memory_order_relaxed);
+                } else {
+                    m_record->affinity_hits.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+            }
 
             // step5: errno 按 Fiber 隔离——保存调用者的，切到目标 Fiber 前恢复
             // 它自己保存的值。swap_errno 一次调用同时完成读旧值与写目标值。
@@ -2156,11 +2056,7 @@ struct Fiber::Impl {
                 }
             }
 
-            #if defined(GO2CPP_USE_NATIVE_CONTEXT)
             detail::Transfer transfer{};
-            #else
-            boost::context::detail::transfer_t transfer{};
-            #endif
             {
 #if defined(GO2CPP_FIBER_ASAN)
                 void* caller_fake_stack = nullptr;
@@ -2172,15 +2068,11 @@ struct Fiber::Impl {
                 m_tsan_caller = __tsan_get_current_fiber();
                 __tsan_switch_to_fiber(m_tsan_fiber, 0);
 #endif
-                #if defined(GO2CPP_USE_NATIVE_CONTEXT)
                 t_current_growable_stack =
                     m_stack_growable_active ? m_stack.get() : nullptr;
                 transfer = detail::JumpContext(m_context, this);
                 // 切回调用者后立即恢复；随后 m_stack 可能被 reset 释放。
                 t_current_growable_stack = previous_growable_stack;
-                #else
-                transfer = boost::context::detail::jump_fcontext(m_context, this);
-                #endif
 #if defined(GO2CPP_FIBER_ASAN)
                 __sanitizer_finish_switch_fiber(caller_fake_stack, nullptr,
                                                 nullptr);
@@ -2282,15 +2174,10 @@ struct Fiber::Impl {
 #if defined(GO2CPP_FIBER_TSAN)
         __tsan_switch_to_fiber(m_tsan_caller, 0);
 #endif
-            #if defined(GO2CPP_USE_NATIVE_CONTEXT)
             // 挂起后执行流回到调用者的 resume_locked；在跳转前清 TLS，
             // 避免调用者栈上的 fault 被误判为本 Fiber 的栈增长。
             t_current_growable_stack = nullptr;
             const detail::Transfer transfer = detail::JumpContext(m_caller, this);
-            #else
-            const boost::context::detail::transfer_t transfer =
-                boost::context::detail::jump_fcontext(m_caller, this);
-            #endif
         finish_switch_to_fiber();
         m_caller = transfer.context;
         // 这里不再重复写 reason/propagate/state/s_current_fiber：恢复本
@@ -2302,12 +2189,10 @@ struct Fiber::Impl {
 
 
     void finish_switch_to_fiber() noexcept {
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
         // 迁移到新 M 后，resume_locked 在跳转前已设置过；这里再设置一次，
         // 覆盖 entry() 首次进入和 suspend() 返回后的两条路径。
         t_current_growable_stack =
             (m_stack && m_stack_growable_active) ? m_stack.get() : nullptr;
-#endif
 #if defined(GO2CPP_FIBER_ASAN)
         // 迁移后这些输出描述的是当前恢复 Fiber 的新 OS 线程，而不是上次
         // 挂起该 Fiber 的线程。
@@ -2318,7 +2203,6 @@ struct Fiber::Impl {
 
     bool initialize_context() noexcept {
         try {
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
             // FiberBin 复用时栈保留在 Fiber 上：布局一致就复位增长区后直接
             // 重建上下文；不一致才丢弃重取。调度器默认参数固定，正常路径
             // 总是命中，一次任务切换因此不再触碰任何系统调用。
@@ -2335,16 +2219,8 @@ struct Fiber::Impl {
                 m_stack = std::make_unique<FiberStack>(
                     m_stack_size, m_stack_reserve_size, m_stack_growable);
             }
-#else
-            m_stack = std::make_unique<FiberStack>(m_stack_size);
-#endif
-            #if defined(GO2CPP_USE_NATIVE_CONTEXT)
             m_context = detail::MakeContext(const_cast<void*>(m_stack->bottom()),
                                             m_stack->usable_size(), &Impl::entry);
-            #else
-            m_context = boost::context::detail::make_fcontext(
-                m_stack->stack_pointer(), m_stack->usable_size(), &Impl::entry);
-            #endif
             // 固化一次「实际是否按需增长」；resume/suspend 热路径不再解引用
             // unique_ptr 调用 growable()。
             m_stack_growable_active = m_stack->growable();
@@ -2390,17 +2266,10 @@ struct Fiber::Impl {
     /// @brief 独立栈（FiberStack 内部走池化）；Fiber 结束后由 resume_locked 清空，
     ///        非空表示仍在活动 —— reset_for_scheduler 会据此拒绝重绑定。
     std::unique_ptr<FiberStack> m_stack;
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
     /// @brief 当前 Fiber 的上下文；首次 resume 前为 nullptr，结束后清空。
     detail::Context m_context{nullptr};
     /// @brief 切换前的调用方上下文；Suspend 时切回它。
     detail::Context m_caller{nullptr};
-#else
-    /// @brief 当前 Fiber 的 fcontext；首次 resume 前为 nullptr，结束后清空。
-    boost::context::detail::fcontext_t m_context{nullptr};
-    /// @brief 切换前的调用方 fcontext；Suspend 时切回它。
-    boost::context::detail::fcontext_t m_caller{nullptr};
-#endif
     /// @brief 是否把 SuspendReason 向上传播给父 Fiber（嵌套 Fiber 的取消传播）。
     std::atomic<bool> m_scheduler_propagate{false};
     /// @brief Scheduler 父链是否已绑定；绑定后不允许跨父级恢复。
@@ -2623,6 +2492,75 @@ std::exception_ptr Fiber::failure() const {
 }
 
 std::size_t Fiber::stack_size() const noexcept { return m_impl->m_stack_size; }
+
+// ---------------------------------------------------------------------------
+// M 亲和 / LockToCurrentM（等价 Go runnext 的投递提示与 LockOSThread）
+// ---------------------------------------------------------------------------
+
+std::uint64_t Fiber::preferred_machine() const noexcept {
+    return m_impl->m_record->affinity_machine.load(std::memory_order_acquire);
+}
+
+std::uint64_t Fiber::preferred_processor() const noexcept {
+    return m_impl->m_record->affinity_processor.load(std::memory_order_acquire);
+}
+
+std::uint64_t Fiber::locked_machine() const noexcept {
+    return m_impl->m_record->locked_machine.load(std::memory_order_acquire);
+}
+
+std::uint64_t Fiber::affinity_hits() const noexcept {
+    return m_impl->m_record->affinity_hits.load(std::memory_order_relaxed);
+}
+
+std::uint64_t Fiber::affinity_migrations() const noexcept {
+    return m_impl->m_record->affinity_migrations.load(
+        std::memory_order_relaxed);
+}
+
+bool Fiber::lock_to_machine(std::uint64_t machine_id) noexcept {
+    if (!m_impl) {
+        return false;
+    }
+    // 0 表示解除绑定；调度器在发现绑定 M 已死亡时用 0 复位。
+    m_impl->m_record->locked_machine.store(machine_id,
+                                           std::memory_order_release);
+    return true;
+}
+
+std::uint64_t Fiber::LockToCurrentM() noexcept {
+    Fiber* const current = s_current_fiber;
+    if (current == nullptr) {
+        // main_fiber 没有可绑定的 G：它的执行流由调用方直接持有。
+        return 0;
+    }
+    const std::uint64_t machine = s_main_execution.machine_id;
+    if (machine == 0) {
+        // 非受管线程：没有 M 可绑定。
+        return 0;
+    }
+    current->m_impl->m_record->locked_machine.store(machine,
+                                                    std::memory_order_release);
+    return machine;
+}
+
+bool Fiber::UnlockFromM() noexcept {
+    Fiber* const current = s_current_fiber;
+    if (current == nullptr) {
+        return false;
+    }
+    return current->m_impl->m_record->locked_machine.exchange(
+               0, std::memory_order_acq_rel) != 0;
+}
+
+std::uint64_t Fiber::CurrentLockedMachine() noexcept {
+    Fiber* const current = s_current_fiber;
+    if (current == nullptr) {
+        return 0;
+    }
+    return current->m_impl->m_record->locked_machine.load(
+        std::memory_order_acquire);
+}
 
 std::uint64_t Fiber::id() const noexcept { return m_impl->m_id; }
 
@@ -3490,11 +3428,7 @@ std::unique_ptr<Fiber> Fiber::ImportMigrationImage(
     const std::size_t usable = MigrationRoundUpStackSize(
         std::max<std::size_t>(Fiber::DefaultStackSize(),
                               static_cast<std::size_t>(snapshot.stack_bytes)));
-#if defined(GO2CPP_USE_NATIVE_CONTEXT)
     auto stack = std::make_unique<FiberStack>(usable, 0U, false);
-#else
-    auto stack = std::make_unique<FiberStack>(usable);
-#endif
     const auto new_top = reinterpret_cast<std::uint64_t>(stack->stack_pointer());
     const auto new_bottom = reinterpret_cast<std::uint64_t>(stack->bottom());
     if (new_top - new_bottom < snapshot.stack_bytes) {
@@ -3653,12 +3587,12 @@ struct ChainTable {
     std::atomic<std::uint64_t> dropped{0};
 };
 
-ChainTable& ChainSamples() {
+[[maybe_unused]] ChainTable& ChainSamples() {
     static ChainTable* table = new ChainTable();
     return *table;
 }
 
-std::uint64_t HashChain(const FiberChainSample& sample) noexcept {
+[[maybe_unused]] std::uint64_t HashChain(const FiberChainSample& sample) noexcept {
     std::uint64_t hash = 1469598103934665603ULL;
     const auto mix = [&hash](std::uint64_t value) {
         for (int byte = 0; byte < 8; ++byte) {
@@ -3681,14 +3615,14 @@ std::uint64_t HashChain(const FiberChainSample& sample) noexcept {
     return hash;
 }
 
-std::uint64_t SteadyNs() noexcept {
+[[maybe_unused]] std::uint64_t SteadyNs() noexcept {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count());
 }
 
-std::uint32_t ThreadHash() noexcept {
+[[maybe_unused]] std::uint32_t ThreadHash() noexcept {
     return static_cast<std::uint32_t>(
         std::hash<std::thread::id>{}(std::this_thread::get_id()));
 }
@@ -3709,7 +3643,7 @@ const char* FiberStateNameForDebug(std::uint8_t state) noexcept {
 namespace {
 
 /// 采样周期按 2^shift 放大（v7：链捕获也受全局采样位移约束）。
-std::uint32_t ScaleChainEvery(std::uint32_t every,
+[[maybe_unused]] std::uint32_t ScaleChainEvery(std::uint32_t every,
                               std::uint32_t shift) noexcept {
     if (every <= 1U) {
         every = 1U;
@@ -3722,7 +3656,7 @@ std::uint32_t ScaleChainEvery(std::uint32_t every,
 }
 
 /// 链捕获核心（采样判定已在入口完成）。
-FiberChainId CaptureFiberChainCore(std::uint64_t gid) noexcept {
+[[maybe_unused]] FiberChainId CaptureFiberChainCore(std::uint64_t gid) noexcept {
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
     try {
         Fiber* const current = Fiber::Current();
