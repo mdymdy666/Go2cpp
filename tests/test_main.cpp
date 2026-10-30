@@ -23,6 +23,7 @@ void run_beginner_api_tests();
 void run_log_config_tests();
 void run_config_transaction_tests();
 void run_network_tests();
+void run_socket_observer_tests();
 void run_sse_tests();
 void run_futex_mutex_tests();
 void run_parking_condition_tests();
@@ -100,6 +101,7 @@ int main() {
     if (selected("log")) run_log_config_tests();
     if (selected("config_transaction")) run_config_transaction_tests();
     if (selected("network")) run_network_tests();
+    if (selected("socket_observer")) run_socket_observer_tests();
     if (selected("sse")) run_sse_tests();
     if (selected("futex_mutex")) run_futex_mutex_tests();
     if (selected("parking_condition")) run_parking_condition_tests();

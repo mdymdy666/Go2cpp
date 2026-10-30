@@ -27,9 +27,12 @@
  *
  * ## 边界（如实声明）
  *
- * - 不做 socket 创建拦截：本版本不修改 `src/network`，业务方需在创建 socket
- *   后调用 `SocketRegistry::Register()` 才会进入可关闭白名单；未登记 socket
- *   只能只读观察（`socket_list` 中 `registered=false`、`closable=false`）。
+ * - 自动登记：MCP 侧安装 `network` 的生命周期钩子（见
+ *   `socket_autoregister.hpp`），启用 MCP 后 `go2cpp::net::Socket`（含
+ *   `ListenTCP`/`DialTCP`/accept 连接）创建即进入可关闭白名单。安装前已存在
+ *   的 socket、或直接用 `::socket()` 创建的裸 fd 仍需业务方显式
+ *   `SocketRegistry::Register()`；未登记 socket 只能只读观察
+ *   （`socket_list` 中 `registered=false`、`closable=false`）。
  * - 事件是**进程内**的：只覆盖本注册表登记后发生的事件，进程重启即丢失；
  *   环形缓冲满后丢弃最旧事件并累加 `dropped_events`。
  * - UDP/Unix socket 没有 `TCP_INFO`，字节数只来自应用层埋点；`tcp.available`
@@ -250,6 +253,19 @@ public:
 
     /// 移出白名单（不关闭 fd）；返回是否存在过。
     bool Unregister(int fd);
+
+    /**
+     * @brief 按 socket 身份注销（fd 复用保护）：inode 与登记时一致才注销。
+     * @param mark_closed true 表示 Socket 已关闭：标记墓碑并追加 closed 事件；
+     *        false 表示 fd 仍存活（`Socket::release()` 移交或上层主动排除），
+     *        只移出白名单，不写 closed 事件。
+     * @return 确实注销返回 true；fd 已失效/已复用/不在白名单返回 false。
+     *
+     * @details 自动登记的关闭钩子在 `::close(fd)` 之前触发，此时 fd 仍指向
+     *          原 socket；先比对 `/proc/self/fd` 的 inode，若号码已被内核
+     *          复用给新 socket，则保持新条目不动，避免 ABA 误注销。
+     */
+    bool UnregisterIfSameSocket(int fd, bool mark_closed = true);
 
     /// 应用层埋点：本端读/写字节。
     void RecordRead(int fd, std::uint64_t bytes);

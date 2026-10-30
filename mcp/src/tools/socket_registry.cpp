@@ -707,6 +707,43 @@ bool SocketRegistry::Unregister(int fd) {
     return true;
 }
 
+bool SocketRegistry::UnregisterIfSameSocket(int fd, bool mark_closed) {
+    if (fd < 0) {
+        return false;
+    }
+    // 先探测再取锁：readlink/getsockopt 是系统调用，不放进注册表锁内。
+    Probe probe;
+    std::string probe_error;
+    if (!ProbeFd(fd, &probe, &probe_error)) {
+        // fd 已关闭或已不是 socket：保留条目，交给 List 扫描补墓碑，
+        // 避免把「fd 已消失」误判成「新 socket 需要注销」。
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto iterator = m_entries.find(fd);
+    if (iterator == m_entries.end()) {
+        return false;
+    }
+    Entry& entry = iterator->second;
+    if (entry.inode != probe.inode) {
+        // fd 号码已被内核复用给别的 socket：本次注销属于旧 socket，
+        // 不能动新条目（ABA 保护）。
+        return false;
+    }
+    if (!entry.registered) {
+        return false;
+    }
+    if (mark_closed) {
+        MarkClosedLocked(entry, "socket 生命周期结束（自动注销）");
+    } else {
+        entry.registered = false;
+        AppendEventLocked(entry, SocketEventKind::kCloseRequested, 0, 0,
+                          "detached");
+    }
+    return true;
+}
+
 void SocketRegistry::RecordRead(int fd, std::uint64_t bytes) {
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto iterator = m_entries.find(fd);

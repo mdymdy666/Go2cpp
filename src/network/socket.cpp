@@ -49,6 +49,60 @@ int poll_wait(int fd, short events, std::chrono::milliseconds timeout) {
 }
 }
 
+// ---------------------------------------------------------------------------
+// Socket 生命周期观察者（可选钩子；基座不依赖 MCP）。
+// ---------------------------------------------------------------------------
+// 职责：把「创建 / 关闭 / 移交」三个生命周期点以进程级回调的形式暴露给上层
+// 模块（当前使用方是 MCP 的 socket 自动登记）。方向必须是 network ← 上层：
+// 本文件不 include 任何 mcp 头、不链接 mcp 目标，只导出一个 C 链接的函数
+// 指针槽位，由 MCP 侧在启动时通过 `go2cpp_network_set_socket_observer`
+// 安装。未安装时热路径只有一次 acquire 原子读；安装后创建/关闭各回调一次。
+//
+// 关闭事件在 `::close(fd)` **之前**发出：此时 fd 仍指向本 socket，观察者
+// 可以用 `/proc/self/fd` 的 inode 校验身份；fd 被复用时不会误注销新登记。
+//
+// `GO2CPP_SOCKET_OBSERVER=0` 可在编译期整体裁剪（默认 1）。
+#ifndef GO2CPP_SOCKET_OBSERVER
+#define GO2CPP_SOCKET_OBSERVER 1
+#endif
+
+namespace {
+#if GO2CPP_SOCKET_OBSERVER
+/// 事件码与 `mcp/include/mcp/tools/socket_autoregister.hpp` 的 C ABI 对齐，
+/// 改动必须两边同步（mcp 测试会断言数值一致）。
+constexpr int kSocketObserverCreated = 1;   ///< fd 已创建（含 accept）。
+constexpr int kSocketObserverClosed = 2;    ///< fd 即将关闭，仍然有效。
+constexpr int kSocketObserverDetached = 3;  ///< release()：fd 已移交给调用方。
+
+using SocketObserverFn = void (*)(int fd, int event);
+/// 观察者槽位；默认空（未安装），此时所有挂接点只剩一次原子读。
+std::atomic<SocketObserverFn> g_socket_observer{nullptr};
+
+/// 通知观察者；观察者抛出的异常绝不允许打断 socket 生命周期。
+void NotifySocketObserver(int fd, int event) noexcept {
+    if (fd < 0) return;
+    const SocketObserverFn observer =
+        g_socket_observer.load(std::memory_order_acquire);
+    if (observer == nullptr) return;
+    try {
+        observer(fd, event);
+    } catch (...) {
+        // 观测失败不影响 socket 本身；上层自行决定是否记录错误。
+    }
+}
+#endif
+}  // namespace
+
+/// @brief 安装/卸载进程级 socket 生命周期观察者（传 nullptr 即卸载）。
+/// @note C 链接：MCP 等上层模块无需链接本仓库的 C++ 符号即可安装。
+extern "C" void go2cpp_network_set_socket_observer(void (*observer)(int, int)) {
+#if GO2CPP_SOCKET_OBSERVER
+    g_socket_observer.store(observer, std::memory_order_release);
+#else
+    (void)observer;
+#endif
+}
+
 Socket::Socket(int family, int type, int protocol, int fd, bool owner)
     : m_fd(fd), m_family(family), m_type(type), m_protocol(protocol), m_owner(owner) {
     if (m_fd >= 0) {
@@ -66,6 +120,11 @@ Socket::Socket(int family, int type, int protocol, int fd, bool owner)
         }
         errno = saved_errno;
         FdManager::instance().get(m_fd, true);
+#if GO2CPP_SOCKET_OBSERVER
+        // 唯一创建点：socket()/socketpair()/accept4() 出来的 fd 都经过这里
+        // 进入观察者；构造失败（init_nonblock 失败）时不发通知。
+        NotifySocketObserver(m_fd, kSocketObserverCreated);
+#endif
     }
 }
 Socket::~Socket() { close(); }
@@ -176,6 +235,10 @@ void Socket::finalize_deferred_close() noexcept {
         m_close_pending = false;
     }
     FdManager::instance().erase(fd);
+#if GO2CPP_SOCKET_OBSERVER
+    // 延迟关闭与普通 close 共用同一个通知点：fd 仍有效，先通知再真正 close。
+    NotifySocketObserver(fd, kSocketObserverClosed);
+#endif
     if (owner) (void)::close(fd);
     // 延迟关闭与普通 close 走同一个归档点：在途操作归零后只记一次。
     GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordClose(fd));
@@ -254,6 +317,11 @@ int Socket::release() noexcept {
     m_fd = -1; m_owner = false; m_connected = false;
     lock.unlock();
     if (fd >= 0) FdManager::instance().erase(fd);
+#if GO2CPP_SOCKET_OBSERVER
+    // 所有权移交给调用方：本对象不再管理该 fd，通知观察者移出白名单；
+    // detached 不标记「已关闭」，因为 fd 仍存活、可能被业务继续使用。
+    NotifySocketObserver(fd, kSocketObserverDetached);
+#endif
     m_operation_condition.notify_all();
     return fd;
 }
@@ -405,6 +473,10 @@ bool Socket::close() noexcept {
     lock.unlock();
     FdManager::instance().erase(fd);
     m_operation_condition.notify_all();
+#if GO2CPP_SOCKET_OBSERVER
+    // 必须在 ::close(fd) 之前：fd 仍指向本 socket，观察者可用 inode 校验。
+    NotifySocketObserver(fd, kSocketObserverClosed);
+#endif
     // Socket 视角的生命周期在这里结束；owner=false 时 fd 已交还调用方，但本
     // 对象不再跟踪它，归档后 Snapshot/Events 仍可读到最后状态。
     GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordClose(fd));

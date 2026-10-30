@@ -752,3 +752,203 @@ void run_network_tests() {
     GO2CPP_JOIN_WITH_WATCHDOG(pending_server, std::chrono::seconds(3));
     pending_client_socket->close();
 }
+
+// ---------------------------------------------------------------------------
+// Socket 生命周期观察者（`src/network/socket.cpp` 的可选 C 钩子）。
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr int kObserverCreated = 1;
+constexpr int kObserverClosed = 2;
+constexpr int kObserverDetached = 3;
+using SocketObserverCallback = void (*)(int fd, int event);
+
+// 基座导出的 C 链接安装函数；测试手工声明，验证不依赖 MCP 也能安装。
+extern "C" void go2cpp_network_set_socket_observer(
+    SocketObserverCallback observer);
+
+struct ObserverLog {
+    std::mutex mutex;
+    std::vector<std::pair<int, int>> events;
+    std::size_t valid_at_close{0};
+    std::size_t invalid_at_close{0};
+    std::size_t valid_at_detach{0};
+
+    void Record(int fd, int event) {
+        std::lock_guard<std::mutex> lock(mutex);
+        events.emplace_back(fd, event);
+        const bool valid = ::fcntl(fd, F_GETFD) != -1;
+        if (event == kObserverClosed) {
+            if (valid) {
+                ++valid_at_close;
+            } else {
+                ++invalid_at_close;
+            }
+        } else if (event == kObserverDetached && valid) {
+            ++valid_at_detach;
+        }
+    }
+    std::size_t Count(int event) {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::size_t count = 0;
+        for (const auto& item : events) {
+            if (item.second == event) {
+                ++count;
+            }
+        }
+        return count;
+    }
+    bool SawFd(int fd, int event) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (const auto& item : events) {
+            if (item.first == fd && item.second == event) {
+                return true;
+            }
+        }
+        return false;
+    }
+    void Clear() {
+        std::lock_guard<std::mutex> lock(mutex);
+        events.clear();
+        valid_at_close = 0;
+        invalid_at_close = 0;
+        valid_at_detach = 0;
+    }
+};
+
+ObserverLog* g_observer_log = nullptr;
+
+void RecordObserverEvent(int fd, int event) {
+    if (g_observer_log != nullptr) {
+        g_observer_log->Record(fd, event);
+    }
+}
+
+void ThrowingObserver(int, int) { throw std::runtime_error("observer failure"); }
+
+}  // namespace
+
+/**
+ * @brief 验证 socket.cpp 的生命周期钩子：安装/卸载、创建/accept/close/
+ *        release、fd 有效性与并发计数守恒。
+ * @details 不链接 MCP：这里只验证基座 C ABI，自动登记语义由 mcp 测试覆盖。
+ */
+void run_socket_observer_tests() {
+    go2cpp_tests::announce("network socket lifecycle observer");
+    ObserverLog log;
+    g_observer_log = &log;
+
+    // 1) 未安装：创建/关闭不产生任何回调。
+    {
+        auto socket = go2cpp::net::Socket::CreateTCP(AF_INET);
+        GO2CPP_REQUIRE(socket != nullptr);
+        GO2CPP_CHECK(log.Count(kObserverCreated) == 0);
+        GO2CPP_CHECK(socket->close());
+        GO2CPP_CHECK(log.Count(kObserverClosed) == 0);
+    }
+
+    go2cpp_network_set_socket_observer(&RecordObserverEvent);
+
+    // 2) 创建 + 关闭：created/closed 各一次；closed 回调时 fd 仍然有效。
+    {
+        log.Clear();
+        auto socket = go2cpp::net::Socket::CreateTCP(AF_INET);
+        GO2CPP_REQUIRE(socket != nullptr);
+        GO2CPP_CHECK(log.Count(kObserverCreated) == 1);
+        GO2CPP_CHECK(log.SawFd(socket->fd(), kObserverCreated));
+        const int fd = socket->fd();
+        GO2CPP_CHECK(socket->close());
+        GO2CPP_CHECK(log.Count(kObserverClosed) == 1);
+        GO2CPP_CHECK(log.SawFd(fd, kObserverClosed));
+        GO2CPP_CHECK(log.valid_at_close == std::size_t{1});
+        GO2CPP_CHECK(log.invalid_at_close == std::size_t{0});
+    }
+
+    // 3) accept：监听 fd 与接入连接都触发 created。
+    {
+        log.Clear();
+        auto listener = go2cpp::net::Socket::CreateTCP(AF_INET);
+        GO2CPP_REQUIRE(listener &&
+                       listener->bind(*go2cpp::net::IPv4Address::Create(
+                           "127.0.0.1", 0)) &&
+                       listener->listen(4));
+        auto address = std::dynamic_pointer_cast<go2cpp::net::IPv4Address>(
+            listener->local_address());
+        GO2CPP_REQUIRE(address != nullptr);
+        auto client = go2cpp::net::DialTCP("127.0.0.1", address->port(),
+                                           std::chrono::seconds(2));
+        GO2CPP_REQUIRE(client != nullptr);
+        auto server = listener->accept(std::chrono::seconds(2));
+        GO2CPP_REQUIRE(server != nullptr);
+        GO2CPP_CHECK(log.Count(kObserverCreated) == 3);
+        GO2CPP_CHECK(log.SawFd(listener->fd(), kObserverCreated));
+        GO2CPP_CHECK(log.SawFd(client->fd(), kObserverCreated));
+        GO2CPP_CHECK(log.SawFd(server->fd(), kObserverCreated));
+        server->close();
+        client->close();
+        listener->close();
+        GO2CPP_CHECK(log.Count(kObserverClosed) == 3);
+    }
+
+    // 4) release：detached 且 fd 仍然有效；显式关闭移交的 fd。
+    {
+        log.Clear();
+        auto socket = go2cpp::net::Socket::CreateUDP(AF_INET);
+        GO2CPP_REQUIRE(socket != nullptr);
+        const int fd = socket->release();
+        GO2CPP_CHECK(fd >= 0);
+        GO2CPP_CHECK(log.Count(kObserverDetached) == 1);
+        GO2CPP_CHECK(log.valid_at_detach == std::size_t{1});
+        GO2CPP_CHECK(::fcntl(fd, F_GETFD) != -1);
+        GO2CPP_CHECK(::close(fd) == 0);
+    }
+
+    // 5) 观察者抛异常：被基座吞掉，socket 生命周期不受影响。
+    {
+        go2cpp_network_set_socket_observer(&ThrowingObserver);
+        auto socket = go2cpp::net::Socket::CreateTCP(AF_INET);
+        GO2CPP_REQUIRE(socket != nullptr);
+        GO2CPP_CHECK(socket->valid());
+        GO2CPP_CHECK(socket->close());
+    }
+
+    // 6) 并发创建/关闭：created == closed，无崩溃/丢事件。
+    {
+        go2cpp_network_set_socket_observer(&RecordObserverEvent);
+        log.Clear();
+        constexpr int kThreads = 8;
+        constexpr int kIterations = 25;
+        std::vector<std::thread> threads;
+        threads.reserve(static_cast<std::size_t>(kThreads));
+        for (int index = 0; index < kThreads; ++index) {
+            threads.emplace_back([] {
+                for (int iteration = 0; iteration < kIterations; ++iteration) {
+                    auto socket = go2cpp::net::Socket::CreateTCP(AF_INET);
+                    if (!socket) {
+                        continue;
+                    }
+                    socket->close();
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        const std::size_t expected =
+            static_cast<std::size_t>(kThreads) * static_cast<std::size_t>(kIterations);
+        GO2CPP_CHECK(log.Count(kObserverCreated) == expected);
+        GO2CPP_CHECK(log.Count(kObserverClosed) == expected);
+    }
+
+    // 7) 卸载：不再回调。
+    go2cpp_network_set_socket_observer(nullptr);
+    {
+        log.Clear();
+        auto socket = go2cpp::net::Socket::CreateTCP(AF_INET);
+        GO2CPP_REQUIRE(socket != nullptr);
+        GO2CPP_CHECK(socket->close());
+        GO2CPP_CHECK(log.Count(kObserverCreated) == 0);
+        GO2CPP_CHECK(log.Count(kObserverClosed) == 0);
+    }
+    g_observer_log = nullptr;
+}

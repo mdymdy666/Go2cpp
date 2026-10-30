@@ -40,6 +40,8 @@ set(MCP_CORE_SOURCES
     # Socket 可观测：本进程 socket 注册表/事件/审计 + 四个 socket_* 工具。
     src/tools/socket_registry.cpp
     src/tools/socket_tools.cpp
+    # Socket 自动登记：安装 network 生命周期观察者，业务 socket 创建即入表。
+    src/tools/socket_autoregister.cpp
     # MonitorClient 抽象：HTTP 实现 + 测试替身（工具层不直接碰 HTTP）。
     src/tools/monitor_client.cpp
 )

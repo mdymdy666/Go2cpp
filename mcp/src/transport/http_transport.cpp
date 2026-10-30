@@ -21,6 +21,7 @@
 #include "go2cpp/network/socket.hpp"
 #include "go2cpp/scheduler/scheduler.hpp"
 #include "go2cpp/tools/go.hpp"
+#include "mcp/tools/socket_autoregister.hpp"
 
 namespace go2cpp::mcp {
 
@@ -230,6 +231,9 @@ bool HttpTransport::Start(std::uint16_t& actual_port, std::string& error) {
         error = "监听失败: " + m_options.host + ":" + std::to_string(m_options.port);
         return false;
     }
+    // 自动登记钩子可能已把监听 fd 写入业务白名单；MCP 自身 fd 不允许被
+    // socket_close 关闭，这里立即排除（移出白名单但不关闭 fd）。
+    tools::ExcludeSocketFromAutoRegister(m_listener->fd());
     actual_port = m_options.port;
     if (actual_port == 0) {
         const auto local =
@@ -292,6 +296,8 @@ void HttpTransport::Run() {
         if (!connection) {
             continue;
         }
+        // 服务自身接入连接同样排除：它们由本传输拥有，不属于业务 socket。
+        tools::ExcludeSocketFromAutoRegister(connection->fd());
         go2cpp::go(scheduler, [this, connection]() mutable {
             HandleConnection(std::move(connection));
         });

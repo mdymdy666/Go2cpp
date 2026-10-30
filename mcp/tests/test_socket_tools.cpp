@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -30,6 +31,9 @@
 #include "socket_test_util.hpp"
 #include "test_util.hpp"
 
+#include "go2cpp/network/address.hpp"
+#include "go2cpp/network/socket.hpp"
+#include "mcp/tools/socket_autoregister.hpp"
 #include "mcp/tools/socket_registry.hpp"
 #include "mcp/tools/socket_tools.hpp"
 #include "mcp/validation/validators.hpp"
@@ -638,6 +642,305 @@ void TestThroughput() {
     CHECK(static_cast<double>(kIterations) / elapsed_s > 100.0);
 }
 
+// ---------------------------------------------------------------------------
+// 自动登记：go2cpp::net::Socket 生命周期 → SocketRegistry 白名单。
+// ---------------------------------------------------------------------------
+
+/// 重置观察者与注册表，保证自动登记用例之间零串扰。
+void ResetAutoRegister() {
+    go2cpp::mcp::tools::UninstallSocketAutoRegister();
+    SocketRegistry::Instance().Reset();
+    go2cpp::mcp::tools::InstallSocketAutoRegister();
+}
+
+const go2cpp::mcp::tools::SocketSnapshot* FindSnapshot(
+    const std::vector<go2cpp::mcp::tools::SocketSnapshot>& sockets, int fd) {
+    for (const auto& socket : sockets) {
+        if (socket.fd == fd) {
+            return &socket;
+        }
+    }
+    return nullptr;
+}
+
+/// 建一个 127.0.0.1:0 的监听 Socket（自动登记的真实业务场景）。
+go2cpp::net::Socket::Ptr MakeListener() {
+    auto listener = go2cpp::net::Socket::CreateTCP(AF_INET);
+    if (!listener) {
+        return {};
+    }
+    auto address = go2cpp::net::IPv4Address::Create("127.0.0.1", 0);
+    if (!address || !listener->bind(*address) || !listener->listen(4)) {
+        return {};
+    }
+    return listener;
+}
+
+/// 创建即登记：socket_list 可见、registered/closable/label/listening 正确；
+/// close 后从列表消失且注册表清空。
+void TestAutoRegisterBasic() {
+    ResetAutoRegister();
+    SocketRegistry& registry = SocketRegistry::Instance();
+    auto listener = MakeListener();
+    CHECK(listener != nullptr);
+    if (!listener) {
+        return;
+    }
+    const int fd = listener->fd();
+    CHECK(go2cpp::mcp::tools::IsSocketAutoRegistered(fd));
+
+    std::string warning;
+    auto sockets = registry.List(true, &warning);
+    const auto* snapshot = FindSnapshot(sockets, fd);
+    CHECK(snapshot != nullptr);
+    if (snapshot != nullptr) {
+        CHECK(snapshot->registered);
+        CHECK(snapshot->closable);
+        CHECK_EQ(snapshot->label,
+                 std::string(go2cpp::mcp::tools::kSocketAutoRegisterLabel));
+        CHECK(snapshot->state == SocketState::kListening);
+        CHECK(!snapshot->inode.empty());
+    }
+
+    // 工具层：socket_list 能查到且 registered=true。
+    Registry tools;
+    auto audit = std::make_shared<MemorySocketAuditSink>();
+    RegisterSocketTools(tools, audit);
+    const auto [is_error, text] =
+        CallTool(tools, "socket_list", json::object());
+    CHECK(!is_error);
+    const json out = ParseJson(text);
+    bool found = false;
+    bool registered = false;
+    for (const auto& item : out["sockets"]) {
+        if (item["fd"] == fd) {
+            found = true;
+            registered = item["registered"].get<bool>();
+        }
+    }
+    CHECK(found);
+    CHECK(registered);
+
+    CHECK(listener->close());
+    CHECK(!go2cpp::mcp::tools::IsSocketAutoRegistered(fd));
+    sockets = registry.List(true, &warning);
+    CHECK(FindSnapshot(sockets, fd) == nullptr);
+    CHECK(registry.size() == std::size_t{0});
+}
+
+/// accept 出的连接同样自动登记；socket_close 工具可关闭并写审计。
+void TestAutoRegisterAccept() {
+    ResetAutoRegister();
+    auto listener = MakeListener();
+    CHECK(listener != nullptr);
+    if (!listener) {
+        return;
+    }
+    auto address = std::dynamic_pointer_cast<go2cpp::net::IPv4Address>(
+        listener->local_address());
+    CHECK(address != nullptr);
+    if (!address) {
+        return;
+    }
+    auto client = go2cpp::net::DialTCP("127.0.0.1", address->port(),
+                                       std::chrono::seconds(2));
+    CHECK(client != nullptr);
+    auto server = listener->accept(std::chrono::seconds(2));
+    CHECK(server != nullptr);
+    if (!server) {
+        return;
+    }
+    const int server_fd = server->fd();
+    CHECK(go2cpp::mcp::tools::IsSocketAutoRegistered(server_fd));
+
+    Registry tools;
+    auto audit = std::make_shared<MemorySocketAuditSink>();
+    RegisterSocketTools(tools, audit);
+    const auto [is_error, text] = CallTool(
+        tools, "socket_close", {{"fd", server_fd}, {"reason", "auto-accept"}});
+    CHECK(!is_error);
+    const json out = ParseJson(text);
+    CHECK(out["closed"] == true);
+    CHECK(::fcntl(server_fd, F_GETFD) == -1);
+    CHECK(!go2cpp::mcp::tools::IsSocketAutoRegistered(server_fd));
+    CHECK(audit->size() == 1);
+    CHECK(audit->Records()[0]["result"] == "ok");
+
+    // fd 已被工具关闭：release 只交出所有权，绝不能让析构再次 close 该号码。
+    (void)server->release();
+    client->close();
+    listener->close();
+}
+
+/// fd 复用（ABA）：外部关闭后号码被新 socket 占用，旧 inode 的注销必须被拒绝。
+void TestAutoRegisterFdReuse() {
+    ResetAutoRegister();
+    SocketRegistry& registry = SocketRegistry::Instance();
+    auto socket = go2cpp::net::Socket::CreateTCP(AF_INET);
+    CHECK(socket != nullptr);
+    if (!socket) {
+        return;
+    }
+    const int fd = socket->fd();
+    CHECK(go2cpp::mcp::tools::IsSocketAutoRegistered(fd));
+    // 绕过 Socket 对象直接关闭（模拟外部 close），旧条目仍是登记状态。
+    CHECK(::close(fd) == 0);
+
+    int reused = -1;
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        const int candidate = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (candidate < 0) {
+            break;
+        }
+        if (candidate == fd) {
+            reused = candidate;
+            break;
+        }
+        ::close(candidate);
+    }
+
+    if (reused == fd) {
+        // 旧条目 inode 与新 fd 不同：按 fd 的注销必须被拒绝（ABA 保护）。
+        CHECK(!registry.UnregisterIfSameSocket(fd, true));
+        // release 的 detached 通知同样不应注销（inode 不匹配）。
+        (void)socket->release();
+        std::string warning;
+        const auto sockets = registry.List(true, &warning);
+        const auto* snapshot = FindSnapshot(sockets, fd);
+        CHECK(snapshot != nullptr);
+        if (snapshot != nullptr) {
+            // 旧条目已补墓碑，新 socket 以未登记（只读）展示。
+            CHECK(!snapshot->registered);
+            CHECK(!snapshot->closable);
+        }
+        ::close(reused);
+    } else {
+        if (reused >= 0) {
+            ::close(reused);
+        }
+        (void)socket->release();
+        std::printf(
+            "[socket_tools] fd 复用未命中（fd=%d），ABA 分支按环境跳过\n", fd);
+    }
+}
+
+/// 排除 MCP 自身 fd：不登记/不可关闭；close 后新 socket 仍正常登记。
+void TestAutoRegisterExclude() {
+    ResetAutoRegister();
+    auto listener = MakeListener();
+    CHECK(listener != nullptr);
+    if (!listener) {
+        return;
+    }
+    const int fd = listener->fd();
+    CHECK(go2cpp::mcp::tools::IsSocketAutoRegistered(fd));
+    go2cpp::mcp::tools::ExcludeSocketFromAutoRegister(fd);
+    CHECK(!go2cpp::mcp::tools::IsSocketAutoRegistered(fd));
+
+    std::string warning;
+    const auto sockets = SocketRegistry::Instance().List(true, &warning);
+    const auto* snapshot = FindSnapshot(sockets, fd);
+    CHECK(snapshot != nullptr);
+    if (snapshot != nullptr) {
+        CHECK(!snapshot->registered);
+        CHECK(!snapshot->closable);
+    }
+
+    listener->close();
+    auto next = go2cpp::net::Socket::CreateTCP(AF_INET);
+    CHECK(next != nullptr);
+    if (next) {
+        CHECK(go2cpp::mcp::tools::IsSocketAutoRegistered(next->fd()));
+        next->close();
+    }
+}
+
+/// 并发创建/关闭：无崩溃、计数回零；socket_list 全程可用。
+void TestAutoRegisterConcurrency() {
+    ResetAutoRegister();
+    constexpr int kThreads = 8;
+    constexpr int kIterations = 25;
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(kThreads));
+    for (int index = 0; index < kThreads; ++index) {
+        threads.emplace_back([&failures] {
+            for (int iteration = 0; iteration < kIterations; ++iteration) {
+                auto socket = go2cpp::net::Socket::CreateTCP(AF_INET);
+                if (!socket) {
+                    failures.fetch_add(1);
+                    continue;
+                }
+                if (!socket->valid()) {
+                    failures.fetch_add(1);
+                }
+                socket->close();
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    CHECK(failures.load() == 0);
+    CHECK(go2cpp::mcp::tools::AutoRegisteredSocketCount() == std::size_t{0});
+    CHECK(SocketRegistry::Instance().size() == std::size_t{0});
+}
+
+/// 随机生命周期：TCP/UDP 混合创建/关闭/List 300 步，登记状态逐步一致。
+void TestAutoRegisterRandomLifecycle() {
+    ResetAutoRegister();
+    std::mt19937 random(20261030);
+    std::vector<go2cpp::net::Socket::Ptr> live;
+    for (int step = 0; step < 300; ++step) {
+        const unsigned action = random() % 4U;
+        if (action <= 1U || live.size() < 4) {
+            auto socket = (random() % 2U == 0U)
+                              ? go2cpp::net::Socket::CreateTCP(AF_INET)
+                              : go2cpp::net::Socket::CreateUDP(AF_INET);
+            CHECK(socket != nullptr);
+            if (socket) {
+                CHECK(go2cpp::mcp::tools::IsSocketAutoRegistered(socket->fd()));
+                live.push_back(std::move(socket));
+            }
+        } else if (action == 2U && !live.empty()) {
+            const std::size_t index =
+                static_cast<std::size_t>(random() % live.size());
+            const int fd = live[index]->fd();
+            live[index]->close();
+            CHECK(!go2cpp::mcp::tools::IsSocketAutoRegistered(fd));
+            live.erase(live.begin() + static_cast<std::ptrdiff_t>(index));
+        } else {
+            std::string warning;
+            const auto sockets = SocketRegistry::Instance().List(true, &warning);
+            for (const auto& socket : sockets) {
+                if (socket.registered) {
+                    CHECK(go2cpp::mcp::tools::IsSocketAutoRegistered(socket.fd));
+                }
+            }
+        }
+    }
+    for (auto& socket : live) {
+        socket->close();
+    }
+    live.clear();
+    CHECK(go2cpp::mcp::tools::AutoRegisteredSocketCount() == std::size_t{0});
+    CHECK(SocketRegistry::Instance().size() == std::size_t{0});
+}
+
+/// 卸载后恢复「未启用 MCP」的基座行为：不登记。
+void TestAutoRegisterUninstall() {
+    ResetAutoRegister();
+    go2cpp::mcp::tools::UninstallSocketAutoRegister();
+    auto socket = go2cpp::net::Socket::CreateTCP(AF_INET);
+    CHECK(socket != nullptr);
+    if (!socket) {
+        return;
+    }
+    CHECK(!go2cpp::mcp::tools::IsSocketAutoRegistered(socket->fd()));
+    socket->close();
+    go2cpp::mcp::tools::InstallSocketAutoRegister();
+}
+
 }  // namespace
 
 int main() {
@@ -649,6 +952,13 @@ int main() {
     TestCloseAudit();
     TestUdpUnix();
     TestRandomArguments();
+    TestAutoRegisterBasic();
+    TestAutoRegisterAccept();
+    TestAutoRegisterFdReuse();
+    TestAutoRegisterExclude();
+    TestAutoRegisterConcurrency();
+    TestAutoRegisterRandomLifecycle();
+    TestAutoRegisterUninstall();
     TestThroughput();
     return go2cpp::mcp::test::Summary("socket_tools");
 }

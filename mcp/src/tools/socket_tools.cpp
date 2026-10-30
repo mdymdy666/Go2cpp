@@ -18,6 +18,7 @@
 #include <string>
 #include <utility>
 
+#include "mcp/tools/socket_autoregister.hpp"
 #include "mcp/tools/tool_builder.hpp"
 
 namespace go2cpp::mcp::tools {
@@ -241,8 +242,9 @@ ToolResult HandleEvents(const ToolContext& context, SocketRegistry& registry) {
     }
     if (!found_record) {
         out["hint"] =
-            "该 fd 是本进程 socket 但未登记，没有事件记录；业务方需先调用 "
-            "SocketRegistry::Register() 才会进入可观测白名单";
+            "该 fd 是本进程 socket 但未登记，没有事件记录；go2cpp::net::Socket "
+            "由 MCP 自动登记，裸 fd 需业务方调用 SocketRegistry::Register() 才"
+            "会进入可观测白名单";
     } else if (events.empty()) {
         out["hint"] = "该 socket 尚无事件";
     }
@@ -267,6 +269,11 @@ ToolResult HandleClose(const ToolContext& context, SocketRegistry& registry,
     }
 
     const SocketCloseOutcome outcome = registry.Close(fd, reason, audit);
+    if (outcome.ok) {
+        // 工具直接 ::close(fd)、绕过 Socket 对象，不会触发观察者 closed
+        // 事件；同步自动登记集合，避免 fd 号复用后被误判。
+        ForgetAutoRegisteredSocket(fd);
+    }
     json audit_info = json::object();
     audit_info["id"] = outcome.audit_id;
     audit_info["sink"] = outcome.audit_sink;
@@ -287,6 +294,10 @@ ToolResult HandleClose(const ToolContext& context, SocketRegistry& registry,
 
 void RegisterSocketTools(Registry& registry,
                          std::shared_ptr<SocketAuditSink> audit) {
+    // 安装 network 侧生命周期钩子：业务用 go2cpp::net::Socket 创建的 socket
+    // （含 accept 连接）自动进入注册表，socket_close 不再只对显式登记 fd 生效。
+    // 幂等；未启用 MCP 的进程永远不会走到这里，基座热路径只剩一次原子读。
+    InstallSocketAutoRegister();
     if (!audit) {
         audit = std::make_shared<FileSocketAuditSink>(DefaultSocketAuditPath());
     }
