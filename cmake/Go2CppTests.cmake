@@ -478,6 +478,25 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_socket_debug_test COMMAND go2cpp_socket_debug_test)
     set_tests_properties(go2cpp_socket_debug_test PROPERTIES TIMEOUT 180)
 
+    # ---- 批量 syscall（recvmmsg/sendmmsg）与零拷贝（sendfile）----
+    # 独立可执行：自带 main，覆盖批量收发、超时/取消、Fiber 内使用、
+    # 300 轮随机与 5 个真实场景；不并入 go2cpp_tests，失败时能单独定位。
+    add_executable(go2cpp_net_batch_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_net_batch.cpp)
+    target_link_libraries(go2cpp_net_batch_test PRIVATE go2cpp_runtime)
+    target_compile_options(go2cpp_net_batch_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_net_batch_test COMMAND go2cpp_net_batch_test)
+    set_tests_properties(go2cpp_net_batch_test PROPERTIES TIMEOUT 300)
+
+    # 批量/零拷贝基准：不注册 ctest（耗时、随机器负载变化），需要时手动
+    # `ninja bench_net_batch && ./bench_net_batch`，结果写 /tmp/net_batch_bench.tsv。
+    add_executable(bench_net_batch
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/bench_net_batch.cpp)
+    target_link_libraries(bench_net_batch PRIVATE go2cpp_runtime)
+    target_compile_options(bench_net_batch PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+
     if (TARGET go2cpp_hook)
         add_executable(go2cpp_hook_ops_test
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_ops.cpp)

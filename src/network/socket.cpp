@@ -13,6 +13,9 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/sendfile.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
@@ -20,6 +23,7 @@
 #include <algorithm>
 #include <cstring>
 #include <climits>
+#include <vector>
 
 namespace go2cpp::net {
 
@@ -32,6 +36,40 @@ std::chrono::milliseconds remaining(std::chrono::milliseconds timeout,
     if (elapsed >= timeout) return std::chrono::milliseconds(0);
     return timeout - elapsed;
 }
+
+/// @brief 在作用域内屏蔽 SIGPIPE，并在恢复前消费本线程 pending 的 SIGPIPE。
+/// @details `sendfile(2)` 没有 `MSG_NOSIGNAL` 参数：对端关闭后继续发送时，
+///          内核会向调用线程投递 SIGPIPE，默认动作是终止整个进程。库不能
+///          替用户改进程级 handler，因此只做线程级阻塞；析构时先 `sigtimedwait`
+///          取走 pending 再恢复掩码，否则恢复的一瞬间仍会按默认动作投递。
+///          参考 `src/network/http2/tls_transport.cpp` 的同类处理（同一陷阱：
+///          仅阻塞不消费 pending，恢复掩码时仍会杀死进程）。
+class ScopedSigpipeBlock {
+public:
+    ScopedSigpipeBlock() {
+        ::sigemptyset(&m_blocked);
+        ::sigaddset(&m_blocked, SIGPIPE);
+        m_active = ::pthread_sigmask(SIG_BLOCK, &m_blocked, &m_previous) == 0;
+    }
+    ~ScopedSigpipeBlock() {
+        if (!m_active) return;
+        sigset_t pending;
+        if (::sigpending(&pending) == 0 && ::sigismember(&pending, SIGPIPE) == 1) {
+            struct timespec zero {};
+            siginfo_t info {};
+            while (::sigtimedwait(&m_blocked, &info, &zero) == SIGPIPE) {
+            }
+        }
+        ::pthread_sigmask(SIG_SETMASK, &m_previous, nullptr);
+    }
+    ScopedSigpipeBlock(const ScopedSigpipeBlock&) = delete;
+    ScopedSigpipeBlock& operator=(const ScopedSigpipeBlock&) = delete;
+
+private:
+    sigset_t m_previous{};
+    sigset_t m_blocked{};
+    bool m_active{false};
+};
 
 int poll_wait(int fd, short events, std::chrono::milliseconds timeout) {
     pollfd descriptor{fd, events, 0};
@@ -737,6 +775,226 @@ SocketResult Socket::recv_from(void* data, std::size_t length, AddressPtr& from,
     end_operation();
     return result;
 }
+// ---------------------------------------------------------------------------
+// 批量收发与零拷贝
+// ---------------------------------------------------------------------------
+// 设计要点（为什么这样写）：
+// 1. 批量 API 复用单包路径的等待/取消/关闭协议：先 begin_operation 固定 fd，
+//    再按 cancel_generation 检查代际，EAGAIN 时交给 wait_ready 统一处理
+//    Fiber park / poll 分片，因此批量与单包的超时、取消、关闭语义一致。
+// 2. recvmmsg/sendmmsg 都是「一次系统调用处理 vlen 条消息」。批量接收采用
+//    非阻塞语义：有多少收多少，不为了凑满 count 而二次等待——高负载下内核
+//    队列本身就有多个包，低负载时等待下一个包只会放大延迟。
+// 3. 每个槽位自带 iovec 与 sockaddr_storage，不复用共享缓冲；mmsghdr 数组
+//    按调用长度分配一次，循环内只重置长度字段（recvmmsg 会回写 msg_len /
+//    msg_namelen，必须每轮重置）。
+// 4. sendmmsg 部分成功时直接返回已发送条数，不重试剩余部分：重试会把
+//    已经进入内核的数据报再发一遍。调用方按 transferred 自行推进。
+// 5. sendfile 只处理「输出端是 socket」的场景，数据不经过用户态缓冲区。
+//    中途错误返回已发送字节数（文件偏移已被内核推进），避免调用方重复发送。
+
+SocketResult Socket::recv_batch(RecvBatchEntry* entries, std::size_t count, int flags,
+                                Duration timeout) {
+    if (entries == nullptr || count == 0 || count > kMaxBatch) return {-1, EINVAL};
+    for (std::size_t index = 0; index < count; ++index) {
+        if (entries[index].data == nullptr || entries[index].capacity == 0) {
+            return {-1, EINVAL};
+        }
+    }
+    const auto cancel_generation = m_read_cancel_generation.load(std::memory_order_acquire);
+    int fd = -1;
+    if (!begin_operation(fd)) return {-1, errno};
+    if (m_read_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
+        end_operation();
+        return {-1, ECANCELED};
+    }
+    Duration effective = timeout;
+    if (effective == Duration::max()) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        effective = m_recv_timeout;
+    }
+    const auto result =
+        recv_batch_impl(fd, entries, count, flags, effective, cancel_generation);
+    // 调试记录仍按字节统计：批量只是减少系统调用次数，不改变「读了多少字节」。
+    std::uint64_t bytes = 0;
+    if (result.ok()) {
+        for (ssize_t index = 0; index < result.transferred; ++index) {
+            bytes += entries[index].received;
+        }
+    }
+    GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordRead(fd, bytes, result.error));
+    end_operation();
+    return result;
+}
+
+SocketResult Socket::recv_batch_impl(int fd, RecvBatchEntry* entries, std::size_t count,
+                                     int flags, Duration timeout,
+                                     std::uint64_t cancel_generation) {
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<iovec> vectors(count);
+    std::vector<mmsghdr> messages(count);
+    for (;;) {
+        if (is_closing() ||
+            m_read_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
+            return {-1, ECANCELED};
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            vectors[index].iov_base = entries[index].data;
+            vectors[index].iov_len = entries[index].capacity;
+            std::memset(&messages[index], 0, sizeof(messages[index]));
+            messages[index].msg_hdr.msg_name = &entries[index].from;
+            messages[index].msg_hdr.msg_namelen = sizeof(sockaddr_storage);
+            messages[index].msg_hdr.msg_iov = &vectors[index];
+            messages[index].msg_hdr.msg_iovlen = 1;
+        }
+        const int received =
+            ::recvmmsg(fd, messages.data(), static_cast<unsigned int>(count),
+                       flags | MSG_DONTWAIT, nullptr);
+        if (received > 0) {
+            for (int index = 0; index < received; ++index) {
+                entries[index].received = messages[index].msg_len;
+                entries[index].from_length = messages[index].msg_hdr.msg_namelen;
+            }
+            return {received, 0};
+        }
+        if (received == 0) return {0, 0};
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return {-1, errno};
+        auto left = remaining(timeout, started);
+        if (left.count() == 0 && left != Duration::max()) return {-1, ETIMEDOUT};
+        const int wait_error = wait_ready(fd, io::IOEvent::kRead, left, cancel_generation);
+        if (wait_error != 0) return {-1, wait_error};
+    }
+}
+
+SocketResult Socket::send_batch(const SendBatchEntry* entries, std::size_t count, int flags,
+                                Duration timeout) {
+    if (entries == nullptr || count == 0 || count > kMaxBatch) return {-1, EINVAL};
+    for (std::size_t index = 0; index < count; ++index) {
+        if (entries[index].data == nullptr) return {-1, EINVAL};
+    }
+    const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
+    int fd = -1;
+    if (!begin_operation(fd)) return {-1, errno};
+    if (m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
+        end_operation();
+        return {-1, ECANCELED};
+    }
+    Duration effective = timeout;
+    if (effective == Duration::max()) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        effective = m_send_timeout;
+    }
+    const auto result =
+        send_batch_impl(fd, entries, count, flags, effective, cancel_generation);
+    std::uint64_t bytes = 0;
+    if (result.ok()) {
+        for (ssize_t index = 0; index < result.transferred; ++index) {
+            bytes += entries[index].length;
+        }
+    }
+    GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordWrite(fd, bytes, result.error));
+    end_operation();
+    return result;
+}
+
+SocketResult Socket::send_batch_impl(int fd, const SendBatchEntry* entries, std::size_t count,
+                                     int flags, Duration timeout,
+                                     std::uint64_t cancel_generation) {
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<iovec> vectors(count);
+    std::vector<mmsghdr> messages(count);
+    for (;;) {
+        if (is_closing() ||
+            m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
+            return {-1, ECANCELED};
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            vectors[index].iov_base = const_cast<void*>(entries[index].data);
+            vectors[index].iov_len = entries[index].length;
+            std::memset(&messages[index], 0, sizeof(messages[index]));
+            messages[index].msg_hdr.msg_name = const_cast<sockaddr*>(entries[index].to);
+            messages[index].msg_hdr.msg_namelen = entries[index].to != nullptr
+                                                      ? entries[index].to_length
+                                                      : 0;
+            messages[index].msg_hdr.msg_iov = &vectors[index];
+            messages[index].msg_hdr.msg_iovlen = 1;
+        }
+        const int sent = ::sendmmsg(fd, messages.data(), static_cast<unsigned int>(count),
+                                    flags | MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (sent >= 0) return {sent, 0};
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return {-1, errno};
+        auto left = remaining(timeout, started);
+        if (left.count() == 0 && left != Duration::max()) return {-1, ETIMEDOUT};
+        const int wait_error = wait_ready(fd, io::IOEvent::kWrite, left, cancel_generation);
+        if (wait_error != 0) return {-1, wait_error};
+    }
+}
+
+SocketResult Socket::send_file(int in_fd, off_t* offset, std::size_t count, Duration timeout) {
+    if (in_fd < 0) return {-1, EBADF};
+    // 文件传输可能持续很久，整段调用都在屏蔽 SIGPIPE 的作用域内。
+    ScopedSigpipeBlock sigpipe_block;
+    if (count == 0) return {0, 0};
+    const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
+    int fd = -1;
+    if (!begin_operation(fd)) return {-1, errno};
+    if (m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
+        end_operation();
+        return {-1, ECANCELED};
+    }
+    Duration effective = timeout;
+    if (effective == Duration::max()) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        effective = m_send_timeout;
+    }
+    const auto result =
+        send_file_impl(fd, in_fd, offset, count, effective, cancel_generation);
+    GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordWrite(
+        fd, result.ok() ? static_cast<std::uint64_t>(result.transferred) : 0, result.error));
+    end_operation();
+    return result;
+}
+
+SocketResult Socket::send_file_impl(int fd, int in_fd, off_t* offset, std::size_t count,
+                                    Duration timeout, std::uint64_t cancel_generation) {
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t total = 0;
+    while (total < count) {
+        if (is_closing() ||
+            m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
+            return total > 0 ? SocketResult{static_cast<ssize_t>(total), 0}
+                             : SocketResult{-1, ECANCELED};
+        }
+        // count 参数是 size_t；sendfile 内部按页拆分，一次调用即可传剩余全部。
+        const ssize_t sent = ::sendfile(fd, in_fd, offset, count - total);
+        if (sent > 0) {
+            total += static_cast<std::size_t>(sent);
+            continue;
+        }
+        // 返回 0 表示文件已 EOF（或 offset 已到末尾），不是错误。
+        if (sent == 0) return {static_cast<ssize_t>(total), 0};
+        if (errno == EINTR) continue;
+        // 中途出错时保留已发送进度：文件偏移已由内核推进，调用方不能重发。
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            return total > 0 ? SocketResult{static_cast<ssize_t>(total), 0}
+                             : SocketResult{-1, errno};
+        }
+        auto left = remaining(timeout, started);
+        if (left.count() == 0 && left != Duration::max()) {
+            return total > 0 ? SocketResult{static_cast<ssize_t>(total), 0}
+                             : SocketResult{-1, ETIMEDOUT};
+        }
+        const int wait_error = wait_ready(fd, io::IOEvent::kWrite, left, cancel_generation);
+        if (wait_error != 0) {
+            return total > 0 ? SocketResult{static_cast<ssize_t>(total), 0}
+                             : SocketResult{-1, wait_error};
+        }
+    }
+    return {static_cast<ssize_t>(total), 0};
+}
+
 AddressPtr Socket::local_address() const {
     int fd = -1;
     if (!const_cast<Socket*>(this)->begin_operation(fd)) return {};

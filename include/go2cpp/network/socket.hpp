@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <string>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/uio.h>
 
 namespace go2cpp::net {
@@ -34,6 +35,33 @@ struct SocketResult {
     ssize_t transferred{-1};
     int error{0};
     bool ok() const noexcept { return transferred >= 0 && error == 0; }
+};
+
+/**
+ * @brief 批量接收中的一个数据报槽位（recvmmsg 的每条消息）。
+ * @details 调用方负责填 `data` / `capacity`，返回后读 `received` /
+ *          `from` / `from_length`。每个槽位自带缓冲区，不复用同一块内存——
+ *          批量收包不会因为共享缓冲区而互相覆盖。
+ * @note 主要面向数据报套接字（UDP / Unix datagram）；流式套接字上一次
+ *       recvmmsg 可能只填满前几个槽位，剩余数据仍留在内核。
+ */
+struct RecvBatchEntry {
+    void* data{nullptr};      ///< 接收缓冲区首地址，必须非空。
+    std::size_t capacity{0};  ///< 缓冲区容量，必须大于 0。
+    std::size_t received{0};  ///< 实际收到的字节数（返回时写）。
+    sockaddr_storage from{};  ///< 来源地址（返回时写）。
+    socklen_t from_length{0}; ///< 来源地址实际长度（返回时写）。
+};
+
+/**
+ * @brief 批量发送中的一个数据报（sendmmsg 的每条消息）。
+ * @note `to` 为空表示使用已 connect 的对端地址；非空时用 `to`/`to_length`。
+ */
+struct SendBatchEntry {
+    const void* data{nullptr};   ///< 数据首地址，必须非空。
+    std::size_t length{0};       ///< 数据长度（UDP 允许 0，表示空数据报）。
+    const sockaddr* to{nullptr}; ///< 目标地址；为空表示已连接的对端。
+    socklen_t to_length{0};      ///< 目标地址长度。
 };
 
 /** @brief 可选的 Socket 等待后端，默认使用当前 IOManager 或 poll。 */
@@ -49,6 +77,8 @@ class Socket final : public std::enable_shared_from_this<Socket> {
 public:
     using Ptr = std::shared_ptr<Socket>;
     using Duration = std::chrono::milliseconds;
+    /// @brief 单次批量收发允许的最大条数（与内核 UIO_MAXIOV 对齐）。
+    static constexpr std::size_t kMaxBatch = 1024;
     static Ptr CreateTCP(int family = AF_INET);
     static Ptr CreateUDP(int family = AF_INET);
     static Ptr CreateUnix(bool datagram = false);
@@ -108,6 +138,50 @@ public:
     SocketResult recv_from(void* data, std::size_t length, AddressPtr& from,
                            int flags = 0, Duration timeout = Duration::max());
 
+    /**
+     * @brief 一次 recvmmsg(2) 收取多个数据报（UDP 批量接收）。
+     * @param entries 槽位数组，每项由调用方提供独立缓冲区。
+     * @param count 槽位数量，范围 1..kMaxBatch。
+     * @param flags 透传给 recvmmsg 的 flags（如 MSG_TRUNC）。
+     * @param timeout 无数据时的最长等待；Duration::max() 表示采用 recv 超时。
+     * @return `transferred` 为实际收包数（1..count）；完全失败时为 -1，
+     *         `error` 给出 errno（超时 ETIMEDOUT、取消 ECANCELED、关闭 EBADF）。
+     * @note 非阻塞语义：只取「当前内核队列里已到达」的包，不承诺凑满 count。
+     *       这正是批量场景要的——一次系统调用带走所有已就绪数据报。
+     *       返回后第 i 个槽位的 `received` / `from` 才有效（i < transferred）。
+     */
+    SocketResult recv_batch(RecvBatchEntry* entries, std::size_t count,
+                            int flags = 0, Duration timeout = Duration::max());
+
+    /**
+     * @brief 一次 sendmmsg(2) 发送多个数据报（UDP 批量发送）。
+     * @param entries 待发送的数据报数组，每项自带 data/length/目标地址。
+     * @param count 条数，范围 1..kMaxBatch。
+     * @param flags 透传给 sendmmsg 的 flags（内部始终附加 MSG_NOSIGNAL）。
+     * @param timeout 缓冲区满时的最长等待；Duration::max() 表示采用 send 超时。
+     * @return `transferred` 为**成功提交给内核的条数**，可能小于 count；
+     *         调用方应把 [transferred, count) 作为下一批继续。只有一条都
+     *         没发出时才返回 -1，`error` 给出 errno。
+     * @note 部分成功不重试：重试会重复发送已经进入内核的数据报。
+     */
+    SocketResult send_batch(const SendBatchEntry* entries, std::size_t count,
+                            int flags = 0, Duration timeout = Duration::max());
+
+    /**
+     * @brief 用 sendfile(2) 零拷贝把文件内容发送到本 socket（TCP 文件传输）。
+     * @param in_fd 输入文件描述符（普通文件或 memfd）。
+     * @param offset 非空时从 *offset 起发送并推进它；为空时用文件当前偏移并推进。
+     * @param count 期望发送的字节数。
+     * @param timeout 发送缓冲区满时的最长等待。
+     * @return `transferred` 为已发送字节数（可能小于 count：对端关闭、
+     *         超时或文件提前 EOF）；完全失败时 -1 并给出 errno。
+     * @note 数据不经过用户态缓冲区，由内核页缓存直接 DMA 到网卡。
+     *       中途出错时返回已发送字节数（error=0），调用方按
+     *       `transferred < count` 判断是否继续，文件偏移已由内核推进。
+     */
+    SocketResult send_file(int in_fd, off_t* offset, std::size_t count,
+                           Duration timeout = Duration::max());
+
     AddressPtr local_address() const;
     AddressPtr remote_address() const;
     bool set_recv_timeout(Duration timeout);
@@ -148,6 +222,14 @@ private:
                            Duration timeout, std::uint64_t cancel_generation);
     SocketResult recv_impl(int fd, msghdr* message, int flags, Duration timeout,
                            std::uint64_t cancel_generation);
+    SocketResult recv_batch_impl(int fd, RecvBatchEntry* entries, std::size_t count,
+                                 int flags, Duration timeout,
+                                 std::uint64_t cancel_generation);
+    SocketResult send_batch_impl(int fd, const SendBatchEntry* entries,
+                                 std::size_t count, int flags, Duration timeout,
+                                 std::uint64_t cancel_generation);
+    SocketResult send_file_impl(int fd, int in_fd, off_t* offset, std::size_t count,
+                                Duration timeout, std::uint64_t cancel_generation);
     int m_fd{-1};
     int m_family{AF_UNSPEC};
     int m_type{0};
