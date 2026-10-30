@@ -1,13 +1,15 @@
 /**
  * @file test_tsan_smoke.cpp
- * @brief ThreadSanitizer 冒烟测试：锁 / 条件变量 / 通道 / ParkingCondition。
+ * @brief ThreadSanitizer 冒烟测试：锁 / 条件变量 / 通道 / ParkingCondition / Timer。
  *
  * 刻意避开 Scheduler/Fiber（自定义栈与 TSAN 的栈切换不兼容），只使用普通
- * OS 线程 + 原语的线程路径。配合 run_tsan.sh 用 `-fsanitize=thread` 构建。
+ * OS 线程 + 原语的线程路径；TimerService 自身只起普通线程，不经过 Fiber
+ * 调度器，因此可以纳入。配合 run_tsan.sh 用 `-fsanitize=thread` 构建。
  */
 
 #include "go2cpp/channel.hpp"
 #include "go2cpp/concurrency/core/parking_condition.hpp"
+#include "go2cpp/core/timer.hpp"
 #include "go2cpp/sync.hpp"
 #include "test_support.hpp"
 
@@ -17,6 +19,7 @@
 #include <cstdio>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -145,6 +148,50 @@ void TestParkingCondition() {
     GO2CPP_CHECK(woken.load() == kWaiters);
 }
 
+void TestTimer() {
+    go2cpp_tests::announce("tsan: timer 4 threads x 400 schedule/cancel");
+    auto& service = go2cpp::core::TimerService::Default();
+    constexpr int kThreads = 4;
+    constexpr int kOps = 400;
+    constexpr int kKept = kOps / 2;
+    std::atomic<int> fired{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&] {
+            std::vector<go2cpp::core::Timer> held;
+            held.reserve(kKept);
+            for (int i = 0; i < kOps; ++i) {
+                auto timer = service.ScheduleAfter(
+                    std::chrono::microseconds(50 + (i % 20) * 10), [&fired] {
+                        fired.fetch_add(1, std::memory_order_relaxed);
+                    });
+                if ((i & 1) == 0) {
+                    timer.Cancel();
+                } else {
+                    held.emplace_back(std::move(timer));
+                }
+            }
+            // held 随 lambda 返回析构（等价 Cancel）；已触发的回调不再重入。
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    // TSan 下调度会变慢：给未取消的定时器留出触发窗口，再验证计数稳定。
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (fired.load(std::memory_order_relaxed) == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(1ms);
+    }
+    GO2CPP_CHECK(fired.load(std::memory_order_relaxed) > 0);
+    std::this_thread::sleep_for(200ms);
+    const int settled = fired.load(std::memory_order_relaxed);
+    std::this_thread::sleep_for(100ms);
+    GO2CPP_CHECK(fired.load(std::memory_order_relaxed) == settled);
+    GO2CPP_CHECK(settled <= kThreads * kKept);
+}
+
 }  // namespace
 
 int main() {
@@ -153,11 +200,12 @@ int main() {
     TestChannel();
     TestConditionVariable();
     TestParkingCondition();
+    TestTimer();
     if (go2cpp_tests::g_failures.load(std::memory_order_acquire) != 0) {
         std::fprintf(stderr, "[tsan] FAIL: %d checks\n",
                      go2cpp_tests::g_failures.load(std::memory_order_acquire));
         return 1;
     }
-    std::printf("[tsan] PASS (4 scenarios)\n");
+    std::printf("[tsan] PASS (5 scenarios)\n");
     return 0;
 }

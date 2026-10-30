@@ -5,7 +5,8 @@
  * ## 模块定位
  *
  * `Channel<T>` 是 Go `chan T` 的对应物：带缓冲/无缓冲、`Send/Recv/TrySend/
- * TryRecv/Close/Range`，语义与 Go 的 `hchan` 对齐（预分配环形缓冲 +
+ * TryRecv/Close`（没有 Go 的 `range` 语法糖，排空请循环 `Recv`），语义与
+ * Go 的 `hchan` 对齐（预分配环形缓冲 +
  * `sendx/recvx/dataqsiz`，**刻意不用 `std::deque`**，见 §缓冲策略）。
  *
  * 它建在同步原语之上、业务代码之下：
@@ -48,8 +49,9 @@
  *
  * - 无缓冲 channel 的 `Send` 会等到有接收者（会 park），`cap==0` 不分配缓冲；
  * - `Close` 后 `Recv` 返回 `kClosed`；对已关闭的 channel `Send` 返回
- *   `kAlreadyClosed`（不抛异常）；
- * - `Range` 语义：关闭后仍能把缓冲区里的剩余值读完，再退出；
+ *   `kClosed`（不抛异常）；`kAlreadyClosed` 只用于重复 `Close()`；
+ * - 排空语义：关闭后仍能把缓冲区里的剩余值读完，再收 `kClosed` 退出
+ *   （没有 `Range` 成员，需要调用方循环 `Recv`）；
  * - 手动 Fiber（未归属 Scheduler）里 `Select` 返回 `kInvalid`，而
  *   `ParkingCondition` 返回 `kCancelled` —— 两者语义不同，别当成等价。
  */
@@ -2616,7 +2618,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   std::deque<std::shared_ptr<PendingSend>> m_senders;
   /// @brief 已登记但尚未拿到值的接收者队列；Send 直接把值塞给它完成交接。
   std::deque<std::shared_ptr<PendingRecv>> m_receivers;
-  /// @brief 已关闭标记；Close 后 Send 返回 kAlreadyClosed，Recv 读完缓冲后返回 kClosed。
+  /// @brief 已关闭标记；Close 后 Send 返回 kClosed，Recv 读完缓冲后返回 kClosed。
   bool m_closed{false};
   /// @brief 关闭代际（每次 Close +1）；Select 用它判断等待节点是否跨代失效。
   std::atomic<std::uint64_t> m_generation{0};

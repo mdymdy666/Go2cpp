@@ -1,22 +1,26 @@
 /**
- * @file test_timer_bin_stress.cpp
+ * @file test_timer_stress.cpp
  * @brief Timer 的正确性与压力测试。
  *
  * ## 为什么这个测试必须存在
  *
- * 对象池最大的风险是**复用未清空的旧状态**。Timer::State 持有
- * std::function / 弱引用 / 执行器，如果归还时没清干净，下一次复用会
- * "意外带着上一次的回调"触发 —— 这类 bug 不会崩，只会让回调多跑一次，
- * 极难在生产里发现。所以本文件的重点是**验证 reset 的彻底性**。
+ * Timer::State 持有 std::function / 弱引用 / 执行器，一旦取消或触发后
+ * 回调/状态残留，定时器就可能"意外带着上一次的回调"触发 —— 这类 bug
+ * 不会崩，只会让回调多跑一次，极难在生产里发现。所以本文件的重点是
+ * **验证取消、触发与析构的彻底性**。
+ *
+ * 历史说明：`dce497a` 曾引入 TimerBin 对象池，`b8fc1c0` 已回退；当前
+ * 实现每次 `make_shared` 新建 `Timer::State`，**不存在槽位复用**。
+ * 场景 2 因此只验证"上一代的回调不会在新一代触发"，不再声称覆盖池复用。
  *
  * ## 六个场景（1-6）
  *
- * 1. 高频一次性定时器：连续建/触发，验证计数精确、池被复用；
- * 2. **状态不残留**：A 触发完后复用同一槽位给 B，验证 B 不继承 A 的回调；
- * 3. 并发多线程：N 线程各自建/毁，验证 thread_local 池无数据竞争；
+ * 1. 高频一次性定时器：连续建/触发，验证计数精确；
+ * 2. **状态不残留**：A 触发完后新建 B，验证 B 不继承 A 的回调；
+ * 3. 并发多线程：N 线程各自建/毁，验证并发注册/取消路径无数据竞争；
  * 4. 随机取消：随机延迟后 Cancel，验证取消后绝不触发；
  * 5. 周期定时器 + 取消：周期触发若干次后取消，验证停止；
- * 6. 混合压力：随机混合上述形态，跑多轮，验证无泄漏、无异常触发。
+ * 6. 混合压力：随机混合上述形态，跑多轮，验证无异常触发、析构安全。
  */
 #include "go2cpp/core/timer.hpp"
 
@@ -102,7 +106,7 @@ void ScenarioNoStateResidue() {
                 WaitUntil([&] { return generation_a.load() > 0; }, 5s);
             Check(fired, "residue: generation A did not fire");
         }
-        // 等这一代的 State 完全释放（引用计数归零）后，它可能被复用
+        // 旧一代 State 已释放；新建下一代，验证它不会继承上一代的回调
         WaitUntil([] { return true; }, 1ms);
         const int a_after_release = generation_a.load();
 
@@ -219,7 +223,7 @@ void ScenarioRepeating() {
     Check(ticks.load() == after_cancel,
           "repeating: ticked after cancel");
 
-    // 复用路径：连续建/取消周期定时器，验证池不会泄漏回调
+    // 反复建/取消周期定时器，验证取消路径不会残留回调
     for (int i = 0; i < 100; ++i) {
         std::atomic<int> local{0};
         auto t = service.ScheduleEvery(50ms, [&local] {
@@ -267,7 +271,7 @@ void ScenarioMixedStress() {
                 break;
             }
             default: {
-                // 创建后立刻让其析构（等价于 Cancel），验证析构路径回池安全
+                // 创建后立刻让其析构（等价于 Cancel），验证析构路径安全
                 auto t = service.ScheduleAfter(50ms, [] {});
                 (void)t.StateValue();
                 break;

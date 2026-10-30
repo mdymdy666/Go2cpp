@@ -1,6 +1,6 @@
 /**
  * @file test_io_audit.cpp
- * @brief IOManager 并发审计的独立测试（不注册 ctest）。
+ * @brief IOManager 并发审计测试（已注册为 ctest 用例 `go2cpp_io_audit`）。
  *
  * 覆盖审计清单：
  * - EPOLLHUP / EPOLLERR 必须唤醒等待者；
@@ -12,7 +12,8 @@
  *   队头 active 时提前 break，本测试用于暴露该窗口）；
  * - wait_any 在 fd 关闭时返回关闭状态。
  *
- * 编译与运行见 scripts/run_concurrency_audit.sh。
+ * 也可由 scripts/run_concurrency_audit.sh 独立编译运行；CMake 目标
+ * `go2cpp_io_audit` 注册为 ctest 用例（见 cmake/Go2CppTests.cmake）。
  */
 
 #include "go2cpp/io.hpp"

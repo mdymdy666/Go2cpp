@@ -16,9 +16,9 @@
 | Buffered(n) | `Send(v)`（n < cap） | Buffered(n+1) | 入缓冲；若有等待接收者则改为直接交接 |
 | Buffered(cap) | `Send(v)` | WaitingSender | 缓冲满，发送者排到 `m_senders` |
 | Buffered(n) | `Recv()` | Buffered(n-1) | 出队；随后 `DispatchSenders` 从 `m_senders` 补入（保持 FIFO） |
-| 任意 | `Close()` | Closed | 唤醒全部 `m_senders`/`m_receivers`（`kClosed`/`kAlreadyClosed`），`m_generation++` |
-| Closed | `Send(v)` | Closed | 返回 `kAlreadyClosed`，不抛异常 |
-| Closed | `Recv()`（缓冲非空） | Closed | 仍返回缓冲里的值（`Range` 依赖这点） |
+| 任意 | `Close()` | Closed | 唤醒全部 `m_senders`/`m_receivers`（等待者得到 `kClosed`），`m_generation++` |
+| Closed | `Send(v)` | Closed | 返回 `kClosed`，不抛异常 |
+| Closed | `Recv()`（缓冲非空） | Closed | 仍返回缓冲里的值（Close 后读尽剩余值的语义依赖这点） |
 | Closed | `Recv()`（缓冲空） | Closed | 返回 `kClosed` |
 
 ## 2. 不变量

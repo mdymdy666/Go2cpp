@@ -275,8 +275,10 @@ public:
         // 按角色唤醒：有写者排队时只唤醒写者（写者优先，读者继续睡）；
         // 没有写者时才放行读者；两者都没有时完全短路 —— 不构造 NotifyAll 的
         // 临时批次，也不进条件变量内部互斥量。
+#if GO2CPP_DEBUG_RESOURCES
         const bool woke = !m_waiting_writers.empty() ||
                           m_waiting_readers.load(std::memory_order_relaxed) != 0U;
+#endif
         if (!m_waiting_writers.empty()) {
             WakeWriterLocked();
         } else {

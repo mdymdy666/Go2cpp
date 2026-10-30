@@ -12,8 +12,9 @@
 ## 1. 概述
 
 `go2cpp::Channel<T>` 是 Go `chan T` 的对应物：容量 0 的无缓冲会合点、容量 > 0 的
-有界 FIFO 缓冲、`Send/TrySend/SendFor`、`Recv/TryRecv/RecvFor`、`Close/Range` 式
-排空，以及把 N 个 channel 操作折叠成一次等待的 `Select` 系列。
+有界 FIFO 缓冲、`Send/TrySend/SendFor`、`Recv/TryRecv/RecvFor`、`Close` 后排空
+（没有 `Range` 成员，调用方循环 `Recv` 直到 `kClosed`），以及把 N 个 channel
+操作折叠成一次等待的 `Select` 系列。
 
 它建在同步原语之上、业务代码之下（`include/go2cpp/concurrency/channel.hpp:5-19`）：
 
@@ -286,9 +287,8 @@ NotifyChange();
 | `Recv`（有缓冲） | 先读完缓冲，再 `kClosed` | `channel.hpp:2380-2384` |
 | `TrySend`（关闭后） | `kClosed`（不是 `kWouldBlock`） | `channel.hpp:2076-2079` |
 
-> 注意：头文件 `channel.hpp:50-51` 的注释写「对已关闭的 channel `Send` 返回
-> `kAlreadyClosed`」，但实现（`SendUntil` 的 `m_closed` 检查）返回的是 `kClosed`；
-> `kAlreadyClosed` 只用于重复 `Close()`。以代码为准，本文按实现描述。
+> 说明：`Send` 在关闭后统一返回 `kClosed`（`SendUntil` 的 `m_closed` 检查），
+> `kAlreadyClosed` 只用于重复 `Close()`。头文件 `channel.hpp` 顶部注释已与实现同步。
 
 ### 4.2 阻塞与超时
 
