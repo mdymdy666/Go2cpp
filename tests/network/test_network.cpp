@@ -428,6 +428,66 @@ void run_network_tests() {
     GO2CPP_CHECK(fiber_close_peer->close());
     manager.Shutdown();
 
+    // Fiber 内 recv 超时必须返回 ETIMEDOUT，而不是 0 或 EAGAIN。
+    // 回归点（P1-1）：等待在 IOManager::wait_for 里 park，Fiber 可能被迁移到
+    // 另一个 OS 线程；错误码若靠 errno 跨 park 传递，会读到 park 前线程的
+    // TLS 旧值（0/EAGAIN）。这里用默认多 worker 的 IOManager 强制覆盖迁移，
+    // 并连续多轮降低偶发通过概率。
+    {
+        go2cpp::IOManager timeout_manager;
+        GO2CPP_REQUIRE(timeout_manager.Start());
+        int timeout_pair[2]{-1, -1};
+        GO2CPP_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, timeout_pair) == 0);
+        auto timeout_socket =
+            go2cpp::net::Socket::FromFd(timeout_pair[0], AF_UNIX, SOCK_STREAM);
+        auto timeout_peer =
+            go2cpp::net::Socket::FromFd(timeout_pair[1], AF_UNIX, SOCK_STREAM);
+        GO2CPP_REQUIRE(timeout_socket && timeout_peer);
+        for (int round = 0; round < 8; ++round) {
+            std::atomic<bool> timeout_done{false};
+            std::atomic<int> timeout_error{-1};
+            timeout_manager.Go([timeout_socket, &timeout_done, &timeout_error] {
+                char value{};
+                const auto result = timeout_socket->recv(
+                    &value, 1, 0, std::chrono::milliseconds(40));
+                timeout_error.store(result.error, std::memory_order_release);
+                timeout_done.store(true, std::memory_order_release);
+            });
+            GO2CPP_REQUIRE_EVENTUALLY(
+                timeout_done.load(std::memory_order_acquire),
+                std::chrono::seconds(3));
+            GO2CPP_CHECK(timeout_error.load(std::memory_order_acquire) ==
+                         ETIMEDOUT);
+        }
+        // 取消同样必须返回 ECANCELED。取消动作放在 Fiber 里执行，才能拿到
+        // 当前 IOManager 的唤醒通知（普通线程没有可通知的 manager）。
+        std::atomic<bool> cancel_started{false};
+        std::atomic<bool> cancel_done{false};
+        std::atomic<int> cancel_error{0};
+        auto cancel_reader = timeout_manager.Go(
+            [timeout_socket, &cancel_started, &cancel_done, &cancel_error] {
+                cancel_started.store(true, std::memory_order_release);
+                char value{};
+                const auto result = timeout_socket->recv(&value, 1);
+                cancel_error.store(result.error, std::memory_order_release);
+                cancel_done.store(true, std::memory_order_release);
+            });
+        GO2CPP_REQUIRE_EVENTUALLY(
+            cancel_started.load(std::memory_order_acquire),
+            std::chrono::seconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        auto cancel_fiber = timeout_manager.Go([timeout_socket] {
+            GO2CPP_CHECK(timeout_socket->cancel_read());
+        });
+        GO2CPP_REQUIRE_EVENTUALLY(cancel_done.load(std::memory_order_acquire),
+                                  std::chrono::seconds(3));
+        GO2CPP_CHECK(cancel_error.load(std::memory_order_acquire) == ECANCELED);
+        GO2CPP_CHECK(cancel_reader->wait_for(std::chrono::seconds(2)));
+        GO2CPP_CHECK(cancel_fiber->wait_for(std::chrono::seconds(2)));
+        GO2CPP_CHECK(timeout_peer->close());
+        timeout_manager.Shutdown();
+    }
+
     // close 必须唤醒普通线程中的无限期 recv，并等待 in-flight 操作退出；
     // 这条测试专门覆盖 close 与阻塞系统调用的生命周期边界，防止 fd
     // 已被复用后旧操作继续使用同一个整数 fd。
@@ -529,8 +589,12 @@ void run_network_tests() {
                 char value{};
                 const auto result = race_socket->recv(
                     &value, 1, 0, std::chrono::seconds(2));
-                if (result.error != 0 && result.error != ECANCELED &&
-                    result.error != EBADF && result.error != ETIMEDOUT) {
+                // 收紧：失败结果必须带明确 errno（ECANCELED/EBADF/ETIMEDOUT）。
+                // error==0 表示失败原因被吞掉（历史 P1：Fiber park 后 errno
+                // 读到 park 前线程的 TLS 旧值），必须立即失败而不是放行。
+                if (result.error == 0 ||
+                    (result.error != ECANCELED && result.error != EBADF &&
+                     result.error != ETIMEDOUT)) {
                     unexpected_errors.fetch_add(1, std::memory_order_relaxed);
                 }
                 readers_done.fetch_add(1, std::memory_order_release);

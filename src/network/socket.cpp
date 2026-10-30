@@ -285,7 +285,9 @@ Socket::Ptr Socket::accept(Duration timeout) {
             // 误归因为用户意图并拒绝 park，让 Socket 层退化成 100ms 分片轮询
             // （每片一次 DEL+ADD；s3 实测每请求 10.3 次 epoll_ctl、9.3 次
             // futex）。必须在 FromFd 之前纠正，保证首次 recv 就走 park 路径。
+#if defined(GO2CPP_NETWORK_HOOK_ENABLED) && GO2CPP_NETWORK_HOOK_ENABLED
             go2cpp::hook::mark_system_nonblocking(accepted);
+#endif
             auto result = FromFd(accepted, storage.ss_family, m_type, m_protocol);
             if (result) result->m_connected = true;
             end_operation(); return result;
@@ -436,6 +438,7 @@ int Socket::wait_ready(int fd, io::IOEvent event, Duration timeout,
     if (waiter) {
         const int result = waiter->wait(fd, event, timeout);
         if (cancelled()) { errno = ECANCELED; return ECANCELED; }
+        if (result != 0) errno = result;
         return result;
     }
     // step4: 受管 Fiber——按 100ms 分片循环 wait_for，让 close() 能打断无限等待。
@@ -446,12 +449,23 @@ int Socket::wait_ready(int fd, io::IOEvent event, Duration timeout,
                 fd, event, timeout == Duration::max() || timeout > Duration(100)
                         ? Duration(100)
                         : timeout);
+            // park 返回后必须重新检查取消/关闭/超时：Fiber 可能已经迁移到
+            // 另一个 OS 线程，errno 也随之变成那个线程的 TLS 副本，不能
+            // 沿用 park 前的 errno，也不能只看 wait_for 的 status。每个返回
+            // 点都在当前线程重新写 errno，并把错误码显式返回给上层。
             if (cancelled()) { errno = ECANCELED; return ECANCELED; }
             if (result.ready()) return 0;
-            if (result.status != io::WaitStatus::kTimeout) {
-                return result.system_error ? result.system_error : ECANCELED;
-            }
             if (is_closing()) { errno = ECANCELED; return ECANCELED; }
+            if (result.status == io::WaitStatus::kClosed) {
+                errno = EBADF;
+                return EBADF;
+            }
+            if (result.status != io::WaitStatus::kTimeout) {
+                const int error =
+                    result.system_error != 0 ? result.system_error : ECANCELED;
+                errno = error;
+                return error;
+            }
             if (timeout != Duration::max() && remaining(timeout, started).count() == 0) {
                 errno = ETIMEDOUT;
                 return ETIMEDOUT;
@@ -468,7 +482,10 @@ int Socket::wait_ready(int fd, io::IOEvent event, Duration timeout,
         if (slice == Duration::max() || slice > Duration(100)) slice = Duration(100);
         const int result = poll_wait(fd, event == io::IOEvent::kRead ? POLLIN : POLLOUT, slice);
         if (cancelled()) { errno = ECANCELED; return ECANCELED; }
-        if (result != ETIMEDOUT) return result;
+        if (result != ETIMEDOUT) {
+            if (result != 0) errno = result;
+            return result;
+        }
         if (is_closing()) { errno = ECANCELED; return ECANCELED; }
         if (timeout != Duration::max() && remaining(timeout, started).count() == 0) {
             errno = ETIMEDOUT;
@@ -495,8 +512,14 @@ SocketResult Socket::send_impl(int fd, const msghdr* message, int flags,
         if (count >= 0) return {count, 0};
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return {-1, errno};
-        auto left = timeout; if (!wait_or_retry(fd, io::IOEvent::kWrite, left, start,
-                                                 cancel_generation)) return {-1, errno};
+        // 等待错误只能用返回值传递。Fiber 在 wait_for 里 park 后可能迁移到
+        // 另一个 OS 线程，errno 也随之换成那个线程的 TLS 副本；GCC 还会把
+        // 同一个 __errno_location() 指针缓存在寄存器里跨调用复用，导致恢复
+        // 后读到 park 前的旧值（0 或 EAGAIN），把真实超时/取消吞掉。
+        auto left = remaining(timeout, start);
+        if (left.count() == 0 && left != Duration::max()) return {-1, ETIMEDOUT};
+        const int wait_error = wait_ready(fd, io::IOEvent::kWrite, left, cancel_generation);
+        if (wait_error != 0) return {-1, wait_error};
     }
 }
 
@@ -510,8 +533,14 @@ SocketResult Socket::recv_impl(int fd, msghdr* message, int flags, Duration time
         if (count >= 0) return {count, 0};
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return {-1, errno};
-        auto left = timeout; if (!wait_or_retry(fd, io::IOEvent::kRead, left, start,
-                                                cancel_generation)) return {-1, errno};
+        // 等待错误只能用返回值传递。Fiber 在 wait_for 里 park 后可能迁移到
+        // 另一个 OS 线程，errno 也随之换成那个线程的 TLS 副本；GCC 还会把
+        // 同一个 __errno_location() 指针缓存在寄存器里跨调用复用，导致恢复
+        // 后读到 park 前的旧值（0 或 EAGAIN），把真实超时/取消吞掉。
+        auto left = remaining(timeout, start);
+        if (left.count() == 0 && left != Duration::max()) return {-1, ETIMEDOUT};
+        const int wait_error = wait_ready(fd, io::IOEvent::kRead, left, cancel_generation);
+        if (wait_error != 0) return {-1, wait_error};
     }
 }
 SocketResult Socket::send(const void* data, std::size_t length, int flags, Duration timeout) {

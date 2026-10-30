@@ -329,6 +329,16 @@ if (GO2CPP_DEBUG_DUMP)
     target_link_libraries(go2cpp_fiber PUBLIC go2cpp_debug_event)
 endif()
 target_link_libraries(go2cpp_network PUBLIC go2cpp_io go2cpp_context go2cpp_scheduler go2cpp_sync)
+# HOOK=OFF 时不存在 go2cpp_hook 目标。Socket::accept 对
+# hook::mark_system_nonblocking 的调用必须随宏一起消失，否则共享库会留下
+# 未解析符号，只链接 network/io 的程序直接链接失败；HOOK=ON 时把 hook 作为
+# 私有依赖接进来，保证符号在加载期可解析。
+if (TARGET go2cpp_hook)
+    target_link_libraries(go2cpp_network PRIVATE go2cpp_hook)
+    target_compile_definitions(go2cpp_network PRIVATE GO2CPP_NETWORK_HOOK_ENABLED=1)
+else()
+    target_compile_definitions(go2cpp_network PRIVATE GO2CPP_NETWORK_HOOK_ENABLED=0)
+endif()
 # TlsTransport 的实现细节：OpenSSL 只出现在 .cpp 里。
 target_link_libraries(go2cpp_network PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 if (TARGET go2cpp_hook)
