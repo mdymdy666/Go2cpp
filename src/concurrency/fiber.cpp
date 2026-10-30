@@ -55,8 +55,10 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <unordered_map>
 #include <cerrno>
 #include <csignal>
@@ -308,7 +310,7 @@ inline void store_errno(int value) noexcept { *errno_slot() = value; }
 // 1. `sysconf` 失败时可能**覆盖 errno**，所以进入前保存、返回前恢复，
 //    否则会把无关的 errno 泄漏给调用方；
 // 2. 结果要检查能否放进 `size_t`（32 位平台上 long 可能更宽）。
-std::size_t native_page_size() {
+std::size_t query_native_page_size() {
     const int saved_errno = errno;
     const long raw_page_size = ::sysconf(_SC_PAGESIZE);
     if (raw_page_size <= 0) {
@@ -323,6 +325,14 @@ std::size_t native_page_size() {
         throw std::length_error("fiber page size is not representable");
     }
     return static_cast<std::size_t>(page_size);
+}
+
+/// @brief 进程页大小（生命周期内不变，缓存一次）。
+/// @details 每次 Fiber 构造都要用页大小做对齐；sysconf 虽被 glibc 缓存，
+///          仍是一次函数调用。函数局部 static 由编译器保证线程安全。
+std::size_t native_page_size() {
+    static const std::size_t cached = query_native_page_size();
+    return cached;
 }
 #endif
 
@@ -553,6 +563,307 @@ std::size_t normalize_stack_reserve_size(std::size_t requested,
 }
 #endif
 
+#if defined(GO2CPP_USE_NATIVE_CONTEXT)
+// ---------------------------------------------------------------------------
+// 栈槽 arena：把 N 个 reserve 等大的槽放进一次 mmap
+// ---------------------------------------------------------------------------
+//
+// ## 为什么需要（实测，WSL2 / 2026-10-30，20k 次取平均）
+//
+// | 系统调用 | 成本 |
+// |---|---:|
+// | `mmap(8 MiB, PROT_NONE)` | ~1.1 µs |
+// | `mprotect(4 KiB)` | ~1.9–7 µs |
+// | `munmap(8 MiB)` | ~2.7–8 µs |
+//
+// 逐栈方案下每个新 Fiber 都要一次 mmap + 一次 mprotect；100k 并发全部
+// 结束时，超过缓存容量（TLS 32 + 全局 512）的 99k 个栈逐个 munmap，是
+// 批量完成 11.6 µs/fiber 的主要构成之一。arena 把这些成本按槽数摊开：
+//
+// - 创建：优先复用已提交过初始窗口的空闲槽（**零系统调用**）；新槽只做
+//   一次 mprotect 提交顶部窗口；
+// - 销毁：槽回到空闲表，不 munmap；整个 arena 空了才 munmap 一次。
+//
+// ## 语义不变
+//
+// 槽内布局与逐栈方案完全相同：`[base, top)` 是 reserve，顶部
+// `initial_usable` 已提交 RW，其余 PROT_NONE；SIGSEGV handler 仍按
+// committed 边界向下增长。arena 只改变「这段 reserve 从哪来」，所以
+// `FiberStack` 的 base/top/committed 访问器与增长逻辑完全不用感知 arena。
+//
+// ## 保留预算
+//
+// 全部槽都空闲的 arena 最多保留约 `kStackArenaRetainedSlots` 个槽的映射，
+// 保证单 Fiber 反复创建/销毁（churn）零系统调用；超出的整体 munmap，
+// 避免峰值 100k 并发退出后长期占住 819 GiB 虚拟地址。
+//
+// ## 大小类
+//
+// 槽跨度必须等于 reserve（调用方已页对齐）；同一个 reserve 下不同
+// initial_usable（默认 128KiB vs 调度器 4KiB）也各占一类，因为槽里已提交
+// 的窗口必须与新 Fiber 期望的窗口完全一致。超过 `kStackArenaMaxClasses`
+// 个类时退回逐栈 mmap，行为与旧实现一致。
+constexpr std::size_t kStackArenaMaxClasses = 8;
+constexpr std::size_t kStackArenaInitialSlots = 8;
+constexpr std::size_t kStackArenaMaxSlots = 64;
+constexpr std::size_t kStackArenaRetainedSlots = 64;
+
+#if defined(GO2CPP_FIBER_GROWABLE_STACK)
+// 栈增长步长：首轮 64KiB，逐次翻倍到 1MiB，把深栈的 mprotect 次数从
+// O(reserve/64KiB) 降到 O(log2(reserve/64KiB))。已提交页只有真正写到
+// 才会分配物理页，多提交 VA 不增加 RSS；代价是未提交区的 guard 检测
+// 粒度从 64KiB 放宽到最多 1MiB（仍在 256KiB 的 fault 窗口判定之内）。
+constexpr std::uintptr_t kStackGrowthChunkMax = 1U * 1024U * 1024U;
+#endif
+
+struct StackArena {
+    char* base{nullptr};
+    std::size_t slot_size{0};
+    std::size_t mapping_size{0};
+    std::size_t slot_count{0};
+    std::size_t class_index{0};
+    /// @brief 已提交过初始窗口、可直接复用的空闲槽（后进先出）。
+    std::vector<void*> free_slots;
+    /// @brief 尚未使用过的槽游标；这些槽的顶部窗口仍是 PROT_NONE。
+    std::size_t next_slot{0};
+    /// @brief 当前是否所有槽都在空闲表里（可能已被登记到 fully_free 链）。
+    bool fully_free{false};
+    /// @brief 是否已在 fully_free 链中占位；防止同一 arena 反复入链。
+    bool queued_fully_free{false};
+};
+
+struct StackArenaClass {
+    std::size_t slot_size{0};
+    /// @brief 初始提交窗口。必须与 slot_size 一起做键：同一个 reserve 下
+    ///        usable 不同（默认 128KiB vs 调度器 4KiB）的槽不能串用，否则
+    ///        新 Fiber 的 committed 会与槽里实际 RW 的窗口不一致。
+    std::size_t usable{0};
+    /// @brief 下一个新 arena 的槽数：8 → 16 → 32 → 64，按需翻倍。
+    std::size_t next_arena_slots{kStackArenaInitialSlots};
+    std::vector<std::unique_ptr<StackArena>> arenas;
+    /// @brief 有空闲槽可复用的 arena（可能多个）。
+    std::deque<StackArena*> with_free;
+    /// @brief 还有未使用槽的 arena；同一时刻至多一个。
+    StackArena* bump_arena{nullptr};
+    /// @brief 曾经变空的 arena（惰性清理：取用后可能已不再全空）。
+    std::deque<StackArena*> fully_free;
+};
+
+struct StackArenaRegistry {
+    std::mutex mutex;
+    std::array<StackArenaClass, kStackArenaMaxClasses> classes{};
+    std::size_t class_count{0};
+    std::size_t total_free_slots{0};
+};
+
+/// @brief 进程级 arena 注册表。
+/// @note 故意用 `new` 且不注册析构：Fiber 可能在任意静态析构阶段销毁，
+///       注册表必须活到进程结束。泄漏的只是空表与已映射 arena，由内核在
+///       进程退出时回收（与 fiber_local 的注册表同一取舍）。
+StackArenaRegistry& StackArenaRegistryRef() noexcept {
+    static StackArenaRegistry* registry = new StackArenaRegistry();
+    return *registry;
+}
+
+/// @brief 创建 arena 并把第一个槽交给调用方。
+/// @param committed 输出 false：新槽顶部窗口仍是 PROT_NONE，由调用方提交。
+/// @return 槽地址；mmap 失败返回 nullptr（调用方退回逐栈 mmap）。
+/// @note 调用方必须已持有 registry.mutex。
+void* StackArenaCreateLocked(StackArenaClass& arena_class,
+                             std::size_t class_index,
+                             bool* committed) noexcept {
+    std::size_t slots = arena_class.next_arena_slots;
+    if (slots == 0) {
+        slots = kStackArenaInitialSlots;
+    }
+    const std::size_t slot_size = arena_class.slot_size;
+    void* mapping = MAP_FAILED;
+    while (slots > 0) {
+        mapping = ::mmap(nullptr, slots * slot_size, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (mapping != MAP_FAILED) {
+            break;
+        }
+        if (slots == 1) {
+            return nullptr;
+        }
+        slots /= 2;
+    }
+    if (mapping == MAP_FAILED) {
+        return nullptr;
+    }
+    std::unique_ptr<StackArena> arena(new (std::nothrow) StackArena());
+    if (!arena) {
+        ::munmap(mapping, slots * slot_size);
+        return nullptr;
+    }
+    try {
+        arena->free_slots.reserve(slots);
+    } catch (...) {
+        ::munmap(mapping, slots * slot_size);
+        return nullptr;
+    }
+    arena->base = static_cast<char*>(mapping);
+    arena->slot_size = slot_size;
+    arena->mapping_size = slots * slot_size;
+    arena->slot_count = slots;
+    arena->class_index = class_index;
+    arena->next_slot = 1;
+    StackArena* const raw = arena.get();
+    try {
+        arena_class.arenas.push_back(std::move(arena));
+    } catch (...) {
+        ::munmap(mapping, slots * slot_size);
+        return nullptr;
+    }
+    arena_class.bump_arena = raw;
+    if (arena_class.next_arena_slots < kStackArenaMaxSlots) {
+        arena_class.next_arena_slots *= 2;
+    }
+    *committed = false;
+    return raw->base;
+}
+
+/// @brief 取一个 reserve 恰为 `slot_size` 的槽。
+/// @param out_arena 输出槽所属 arena（释放时原样返回）。
+/// @param out_committed 输出该槽顶部窗口是否已提交（true 时无需 mprotect）。
+/// @return 槽地址；返回 nullptr 表示大小类已满或 mmap 失败，调用方应退回
+///         逐栈 mmap。
+void* StackArenaAcquire(std::size_t slot_size, std::size_t usable,
+                        StackArena** out_arena, bool* out_committed) {
+    *out_arena = nullptr;
+    *out_committed = false;
+    StackArenaRegistry& registry = StackArenaRegistryRef();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    StackArenaClass* arena_class = nullptr;
+    for (std::size_t index = 0; index < registry.class_count; ++index) {
+        if (registry.classes[index].slot_size == slot_size &&
+            registry.classes[index].usable == usable) {
+            arena_class = &registry.classes[index];
+            break;
+        }
+    }
+    if (arena_class == nullptr) {
+        if (registry.class_count >= kStackArenaMaxClasses) {
+            return nullptr;
+        }
+        arena_class = &registry.classes[registry.class_count];
+        arena_class->slot_size = slot_size;
+        arena_class->usable = usable;
+        arena_class->next_arena_slots = kStackArenaInitialSlots;
+        ++registry.class_count;
+    }
+    if (!arena_class->with_free.empty()) {
+        StackArena* const arena = arena_class->with_free.front();
+        arena_class->with_free.pop_front();
+        void* const slot = arena->free_slots.back();
+        arena->free_slots.pop_back();
+        arena->fully_free = false;
+        if (!arena->free_slots.empty()) {
+            arena_class->with_free.push_back(arena);
+        }
+        --registry.total_free_slots;
+        *out_arena = arena;
+        *out_committed = true;
+        return slot;
+    }
+    if (arena_class->bump_arena != nullptr &&
+        arena_class->bump_arena->next_slot <
+            arena_class->bump_arena->slot_count) {
+        StackArena* const arena = arena_class->bump_arena;
+        void* const slot = arena->base + arena->next_slot * arena->slot_size;
+        ++arena->next_slot;
+        *out_arena = arena;
+        return slot;
+    }
+    const std::size_t class_index =
+        static_cast<std::size_t>(arena_class - registry.classes.data());
+    void* const slot = StackArenaCreateLocked(*arena_class, class_index,
+                                              out_committed);
+    if (slot != nullptr) {
+        *out_arena = arena_class->bump_arena;
+    }
+    return slot;
+}
+
+/// @brief 把处于「初始提交」状态的槽放回 arena 空闲表。
+/// @note slot 的顶部窗口必须是 RW、committed 必须已复位（调用方负责）。
+///       失败（OOM 导致的登记失败）时宁可漏掉一个槽，也不能让异常穿过
+///       `noexcept` 的析构路径。
+void StackArenaRelease(StackArena* arena, void* slot) noexcept {
+    if (arena == nullptr || slot == nullptr) {
+        return;
+    }
+    try {
+        // 先判断是否需要整体回收，但把 munmap 放到锁外：一次 512MiB arena
+        // 的 munmap 实测可达百余 µs，持锁会把其它线程的建栈一起卡住。
+        std::vector<std::unique_ptr<StackArena>> retired;
+        {
+            StackArenaRegistry& registry = StackArenaRegistryRef();
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            StackArenaClass& arena_class = registry.classes[arena->class_index];
+            // capacity 在创建时已 reserve(slot_count)，这里不会分配。
+            arena->free_slots.push_back(slot);
+            ++registry.total_free_slots;
+            if (arena->free_slots.size() == 1) {
+                arena_class.with_free.push_back(arena);
+            }
+            if (arena->free_slots.size() == arena->slot_count) {
+                // 记住「曾经全空」：即便此刻总空闲量还没超预算，后续别的
+                // 线程释放槽把总量推高时也能回收它们，残余量因此收敛到
+                // kStackArenaRetainedSlots 附近，而不是随线程数累积。
+                arena->fully_free = true;
+                if (!arena->queued_fully_free) {
+                    arena->queued_fully_free = true;
+                    arena_class.fully_free.push_back(arena);
+                }
+            }
+            // 超出保留预算时从 fully_free 链按需回收。取用后已不再全空的
+            // arena 是惰性残留项，直接跳过（标志位为 false）。
+            while (registry.total_free_slots > kStackArenaRetainedSlots &&
+                   !arena_class.fully_free.empty()) {
+                StackArena* candidate = arena_class.fully_free.front();
+                arena_class.fully_free.pop_front();
+                if (candidate == nullptr) {
+                    continue;
+                }
+                candidate->queued_fully_free = false;
+                if (!candidate->fully_free ||
+                    candidate->free_slots.size() != candidate->slot_count) {
+                    continue;
+                }
+                // 整个 arena 已空且超出保留预算：从所有索引摘除并把所有权
+                // 移出临界区。此刻所有槽都在空闲表里，没有其它线程能再引用。
+                if (arena_class.bump_arena == candidate) {
+                    arena_class.bump_arena = nullptr;
+                }
+                for (auto it = arena_class.with_free.begin();
+                     it != arena_class.with_free.end(); ++it) {
+                    if (*it == candidate) {
+                        arena_class.with_free.erase(it);
+                        break;
+                    }
+                }
+                registry.total_free_slots -= candidate->slot_count;
+                candidate->fully_free = false;
+                for (auto it = arena_class.arenas.begin();
+                     it != arena_class.arenas.end(); ++it) {
+                    if (it->get() == candidate) {
+                        retired.push_back(std::move(*it));
+                        arena_class.arenas.erase(it);
+                        break;
+                    }
+                }
+            }
+        }
+        for (auto& arena_ptr : retired) {
+            ::munmap(arena_ptr->base, arena_ptr->mapping_size);
+        }
+    } catch (...) {
+    }
+}
+#endif  // GO2CPP_USE_NATIVE_CONTEXT
+
 /**
  * @brief 一个 Fiber 的独立栈：大预留 + 顶部初始提交 + 可选按需增长。
  *
@@ -571,13 +882,15 @@ std::size_t normalize_stack_reserve_size(std::size_t requested,
  * ## 增长
  *
  * SIGSEGV handler 在故障地址落在 [base, committed)、rsp 落在预留区且两者
- * 距离不超过 256KiB 时，以 64KiB 为单位向下 mprotect，然后直接 return。
- * handler 只调用 async-signal-safe 函数，事件计数用原子变量，不打印日志。
+ * 距离不超过 256KiB 时，从 64KiB 起步、逐次翻倍（上限 1MiB）向下 mprotect，
+ * 然后直接 return。handler 只调用 async-signal-safe 函数，事件计数用原子
+ * 变量，不打印日志。
  *
  * ## 池化
  *
- * 缓存键是 (initial_usable, reserve)；固定栈的 reserve 为 0。复用 growable
- * 栈前必须把增长过的区间重新 mprotect(PROT_NONE) 并把 committed 重置回
+ * growable 栈由进程级 arena 按 (reserve, initial_usable) 分档复用；固定栈
+ * 仍走 (initial_usable, 0) 的 TLS + 全局两级缓存。复用任何栈前都必须把
+ * 增长过的区间重新 mprotect(PROT_NONE) 并把 committed 重置回
  * top - initial_usable —— 只重置指针会让后续溢出静默写坏已提交内存。
  *
  * ## 生命周期
@@ -597,8 +910,8 @@ struct FiberStack {
                              ? m_reserve
                              : checked_stack_mapping_size(m_initial_usable,
                                                           m_page_size)),
-          m_mapping(acquire_stack_mapping(m_initial_usable, m_reserve,
-                                          m_page_size, m_mapping_size)) {
+          m_mapping(nullptr) {
+        acquire_mapping();
         const auto base = reinterpret_cast<std::uintptr_t>(m_mapping);
         m_committed.store(
             m_reserve != 0 ? base + m_mapping_size - m_initial_usable
@@ -627,6 +940,39 @@ struct FiberStack {
     FiberStack& operator=(const FiberStack&) = delete;
 
     bool growable() const noexcept { return m_reserve != 0; }
+
+    /// @brief 按当前环境解析出的 reserve（供 FiberBin 复用判定）。
+    static std::size_t expected_reserve(std::size_t usable,
+                                        std::size_t requested_reserve,
+                                        bool requested_growable) {
+        return resolve_reserve(usable, requested_reserve, requested_growable,
+                               native_page_size());
+    }
+
+#if defined(GO2CPP_FIBER_GROWABLE_STACK)
+    /// @brief 下一次增长要提交的字节数（SIGSEGV handler 读取）。
+    std::uintptr_t growth_chunk() const noexcept {
+        return m_growth_chunk.load(std::memory_order_relaxed);
+    }
+    /// @brief 增长成功后步长翻倍，封顶 kStackGrowthChunkMax。
+    void growth_chunk_double() noexcept {
+        const auto current = m_growth_chunk.load(std::memory_order_relaxed);
+        m_growth_chunk.store(current >= kStackGrowthChunkMax / 2
+                                 ? kStackGrowthChunkMax
+                                 : current * 2,
+                             std::memory_order_relaxed);
+    }
+    /// @brief 复位为 64KiB（新 Fiber 或栈复用时）。
+    void growth_chunk_reset() noexcept {
+        m_growth_chunk.store(kGrowableStackGrowthGranularity,
+                             std::memory_order_relaxed);
+    }
+#endif
+
+    /// @brief 供 FiberBin 跨任务复用同一栈：把增长区退回 PROT_NONE，
+    ///        上下文由调用方用 MakeContext 重建。
+    /// @return false 表示栈状态不可复用，调用方应丢弃重取。
+    bool prepare_reuse() noexcept { return reset_growth(); }
 
     // 诊断用：实际生效的预留大小与映射大小。构造参数 reserve 为 0 时
     // 也会解析出默认预留（8MiB）或固定栈映射，因此快照必须报告这里的
@@ -711,12 +1057,47 @@ private:
 #endif
     }
 
+    /// @brief 取一段处于「初始提交」状态的映射。
+    /// @details growable 走 arena：优先复用已提交顶部窗口的空闲槽（零系统
+    ///          调用），新槽只做一次 mprotect。固定栈和 arena 退化路径走旧的
+    ///          逐栈缓存，行为与旧实现完全一致。
+    void acquire_mapping() {
+        if (m_reserve != 0) {
+            bool committed = false;
+            m_mapping = StackArenaAcquire(m_reserve, m_initial_usable,
+                                          &m_arena, &committed);
+            if (m_mapping != nullptr) {
+                if (committed) {
+                    // 复用的槽：顶部窗口仍是 RW、committed 已复位，零系统调用。
+                    return;
+                }
+                if (::mprotect(static_cast<char*>(m_mapping) + m_reserve -
+                                   m_initial_usable,
+                               m_initial_usable, PROT_READ | PROT_WRITE) != 0) {
+                    const int error = errno;
+                    // 新槽还没有登记进空闲表；失败时只能漏掉这个槽——
+                    // 绝不能单独 munmap：它只是 arena 映射中的一段。
+                    m_mapping = nullptr;
+                    m_arena = nullptr;
+                    throw std::system_error(error, std::generic_category(),
+                                            "mprotect fiber initial stack");
+                }
+                return;
+            }
+            // 大小类已满（>kStackArenaMaxClasses 种 reserve）或 arena 创建
+            // 失败：退回逐栈 mmap，行为与旧实现一致。
+        }
+        m_mapping = acquire_stack_mapping_from_cache(
+            m_initial_usable, m_reserve, m_page_size, m_mapping_size);
+    }
+
     // 从池中取一段已经处于「初始提交」状态的映射；没有命中则新建。
     // 池化键是 (initial_usable, reserve)，固定栈的 reserve 恒为 0。
-    static void* acquire_stack_mapping(std::size_t usable,
-                                       std::size_t reserve,
-                                       std::size_t page,
-                                       std::size_t mapping_size) {
+    // growable 的常规路径由 arena 承担，这里只服务固定栈与 arena 退化。
+    static void* acquire_stack_mapping_from_cache(std::size_t usable,
+                                                  std::size_t reserve,
+                                                  std::size_t page,
+                                                  std::size_t mapping_size) {
         for (auto it = s_thread_stack_pool.entries.rbegin();
              it != s_thread_stack_pool.entries.rend(); ++it) {
             if (it->usable == usable && it->reserve == reserve &&
@@ -777,25 +1158,47 @@ private:
     }
 
     // 回收前把 growable 栈的增长区重新设为 PROT_NONE，并重置 committed。
-    // 这是保证「复用后的 Fiber 仍从初始 1 页开始」且未提交区继续充当
-    // guard 的必要步骤；只重置指针而保留 RW 会让后续溢出静默写坏内存。
-    // mprotect 失败时退回 munmap，绝不把状态不明的页放回池中。
-    void release_to_cache() noexcept {
-        bool cacheable = true;
-        if (m_reserve != 0) {
-            const auto top = reinterpret_cast<std::uintptr_t>(stack_pointer());
-            const auto initial = top - m_initial_usable;
-            const auto committed = m_committed.load(std::memory_order_relaxed);
-            if (committed < initial) {
-                if (::mprotect(reinterpret_cast<void*>(committed),
-                               initial - committed, PROT_NONE) != 0) {
-                    cacheable = false;
-                } else {
-                    m_committed.store(initial, std::memory_order_relaxed);
-                }
-            }
+    // 这是保证「复用后的 Fiber 仍从初始窗口开始」且未提交区继续充当 guard
+    // 的必要步骤；只重置指针而保留 RW 会让后续溢出静默写坏内存。
+    // @return false 表示 mprotect 失败，这段映射不能再复用（调用方丢弃）。
+    bool reset_growth() noexcept {
+#if defined(GO2CPP_FIBER_GROWABLE_STACK)
+        growth_chunk_reset();
+#endif
+        if (m_reserve == 0) {
+            return true;
         }
-        if (cacheable) {
+        const auto top = reinterpret_cast<std::uintptr_t>(stack_pointer());
+        const auto initial = top - m_initial_usable;
+        const auto committed = m_committed.load(std::memory_order_relaxed);
+        if (committed >= initial) {
+            return true;
+        }
+        if (::mprotect(reinterpret_cast<void*>(committed), initial - committed,
+                       PROT_NONE) != 0) {
+            return false;
+        }
+        m_committed.store(initial, std::memory_order_relaxed);
+        return true;
+    }
+
+    // 回收策略：
+    // - arena 槽：复位增长区后直接回空闲表（不 munmap）；复位失败时宁可
+    //   漏掉一个槽，也绝不能单独 munmap arena 内部的一段；
+    // - 固定栈 / arena 退化：沿用原有的 TLS + 全局两级缓存，满则 munmap。
+    void release_to_cache() noexcept {
+        const bool reset_ok = reset_growth();
+        if (m_arena != nullptr) {
+            StackArena* const arena = m_arena;
+            m_arena = nullptr;
+            void* const slot = m_mapping;
+            m_mapping = nullptr;
+            if (reset_ok) {
+                StackArenaRelease(arena, slot);
+            }
+            return;
+        }
+        if (reset_ok) {
             try {
                 if (s_thread_stack_pool.entries.size() < 32U) {
                     s_thread_stack_pool.entries.push_back(
@@ -815,8 +1218,10 @@ private:
             } catch (...) {
             }
         }
-        ::munmap(m_mapping, m_mapping_size);
-        m_mapping = nullptr;
+        if (m_mapping != nullptr) {
+            ::munmap(m_mapping, m_mapping_size);
+            m_mapping = nullptr;
+        }
     }
 
     std::size_t m_initial_usable;
@@ -824,7 +1229,13 @@ private:
     std::size_t m_reserve;
     std::size_t m_mapping_size;
     void* m_mapping;
+    /// @brief 非空表示这段映射来自 arena；析构时归还空闲表而不是 munmap。
+    StackArena* m_arena{nullptr};
     std::atomic<std::uintptr_t> m_committed{0};
+#if defined(GO2CPP_FIBER_GROWABLE_STACK)
+    /// @brief 下一次增长的提交步长（64KiB 起，逐次翻倍到 1MiB）。
+    std::atomic<std::uintptr_t> m_growth_chunk{kGrowableStackGrowthGranularity};
+#endif
 #if defined(GO2CPP_FIBER_HAVE_VALGRIND)
     unsigned m_valgrind_stack_id{0U};
 #endif
@@ -970,9 +1381,12 @@ void growable_stack_segv_handler(int sig, siginfo_t* info,
     // 指令一次成功（前提是二者距离在窗口内）。
     auto new_low = fault_value < rsp_value ? fault_value : rsp_value;
     new_low &= ~(page - 1U);
-    new_low = new_low >= kGrowableStackGrowthGranularity
-                  ? new_low - kGrowableStackGrowthGranularity
-                  : base_value;
+    // 几何增长：每次至少提交当前步长（64KiB 起，逐次翻倍到 1MiB）。
+    // 深递归 8MiB 栈的 mprotect 次数因此从 ~130 次降到 ~10 次。多提交的
+    // VA 只有真正写到才分配物理页（RSS 不变），代价是未提交区的 guard
+    // 检测粒度从 64KiB 放宽到最多 1MiB；rsp/fault 窗口判定仍保持不变。
+    const auto chunk = static_cast<std::uintptr_t>(stack->growth_chunk());
+    new_low = new_low > chunk ? new_low - chunk : base_value;
     if (new_low < base_value) {
         new_low = base_value;
     }
@@ -985,6 +1399,7 @@ void growable_stack_segv_handler(int sig, siginfo_t* info,
         growable_stack_fatal(sig);
     }
     stack->growth_commit(new_low);
+    stack->growth_chunk_double();
     s_growable_stack_growth_count.fetch_add(1, std::memory_order_relaxed);
     t_growable_in_handler = 0;
     // mprotect 成功时一般不动 errno，但实现允许；恢复被中断代码的值，
@@ -1203,12 +1618,15 @@ struct Fiber::Impl {
     void reset_for_scheduler(Function function, std::size_t stack_size,
                              std::size_t stack_reserve_size,
                              bool stack_growable) {
-        // 只有 entry 已经返回 caller，且 resume_locked 已将 m_context 和
-        // m_stack 清空后才能重绑定。Scheduler 只在 terminal Fiber 上调用
-        // 该方法；若后端约束被破坏，宁可抛出也不能复用活动栈。
+        // 只有 entry 已经返回 caller、resume_locked 已清空 m_context 后
+        // 才能重绑定。Scheduler 只在 terminal Fiber 上调用该方法；若后端
+        // 约束被破坏，宁可抛出也不能复用活动栈。
         const auto state = m_record->state.load(std::memory_order_acquire);
+        // 栈可以在终态后保留（调度器路径的 FiberBin 复用）：只要上下文已经
+        // 释放且没有并发 resume，栈就是一段「初始提交状态」的普通映射，
+        // initialize_context() 会复位增长区并就地重建上下文。
         if ((state != FiberState::Completed && state != FiberState::Failed) ||
-            m_context != nullptr || m_stack != nullptr ||
+            m_context != nullptr ||
             m_resume_claim.load(std::memory_order_acquire)) {
             throw std::logic_error("cannot rebind an active Fiber");
         }
@@ -1255,6 +1673,7 @@ struct Fiber::Impl {
         m_stack_size = normalized_stack_size;
         m_stack_reserve_size = stack_reserve_size;
         m_stack_growable = stack_growable;
+        m_stack_growable_active = false;
         m_caller = nullptr;
         m_scheduler_propagate.store(false, std::memory_order_relaxed);
         m_scheduler_parent_bound = false;
@@ -1772,11 +2191,18 @@ struct Fiber::Impl {
                                 ? nullptr
                                 : transfer.context;
                 if (m_context == nullptr) {
-                    // entry() 返回调用者前已经展开全部用户栈帧。现在可以立即
-                    // 把受保护栈放回线程级或全局缓存，避免突发负载中每个排队
-                    // Fiber 都重新建立一次映射。
-                    m_stack.reset();
                     m_stack_growable_active = false;
+                    // 调度器路径（scheduler_fast）不释放栈：Fiber 通常回到
+                    // FiberBin 跨任务复用，下一次 reset_for_scheduler 只需
+                    // 重建上下文，省掉「归还栈 → 重新取槽 → 重新提交」的
+                    // 往返（复用时零系统调用）。若该 Fiber 没有被回收，析构
+                    // 时仍由 FiberStack 正常归还 arena；保留量由 bin 容量限制。
+                    if (!scheduler_fast) {
+                        // entry() 返回调用者前已经展开全部用户栈帧。现在可以
+                        // 立即把受保护栈放回线程级或全局缓存，避免突发负载中
+                        // 每个排队 Fiber 都重新建立一次映射。
+                        m_stack.reset();
+                    }
                 }
             }
 
@@ -1893,8 +2319,22 @@ struct Fiber::Impl {
     bool initialize_context() noexcept {
         try {
 #if defined(GO2CPP_USE_NATIVE_CONTEXT)
-            m_stack = std::make_unique<FiberStack>(
-                m_stack_size, m_stack_reserve_size, m_stack_growable);
+            // FiberBin 复用时栈保留在 Fiber 上：布局一致就复位增长区后直接
+            // 重建上下文；不一致才丢弃重取。调度器默认参数固定，正常路径
+            // 总是命中，一次任务切换因此不再触碰任何系统调用。
+            if (m_stack != nullptr) {
+                const std::size_t expected = FiberStack::expected_reserve(
+                    m_stack_size, m_stack_reserve_size, m_stack_growable);
+                if (m_stack->usable_size() != m_stack_size ||
+                    m_stack->reserve_size() != expected ||
+                    !m_stack->prepare_reuse()) {
+                    m_stack.reset();
+                }
+            }
+            if (m_stack == nullptr) {
+                m_stack = std::make_unique<FiberStack>(
+                    m_stack_size, m_stack_reserve_size, m_stack_growable);
+            }
 #else
             m_stack = std::make_unique<FiberStack>(m_stack_size);
 #endif

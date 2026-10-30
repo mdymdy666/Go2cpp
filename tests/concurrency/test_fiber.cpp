@@ -5,6 +5,8 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <condition_variable>
 #include <chrono>
 #include <limits>
@@ -25,6 +27,51 @@ struct LifetimeProbe {
 
     std::atomic<int>& m_destroyed;
 };
+
+/// @brief 读取 /proc/self/status 的 VmSize（KiB）。
+/// @note 栈 arena 的保留/回收是进程级行为，只能通过 /proc 观测；Linux
+///       测试环境可用，读不到时返回 0（相关断言会失败并暴露问题）。
+std::size_t ReadVmSizeKiB() {
+    FILE* status = std::fopen("/proc/self/status", "r");
+    if (status == nullptr) {
+        return 0;
+    }
+    char line[256];
+    std::size_t kib = 0;
+    while (std::fgets(line, sizeof(line), status) != nullptr) {
+        if (std::strncmp(line, "VmSize:", 7) == 0) {
+            (void)std::sscanf(line + 7, "%zu", &kib);
+            break;
+        }
+    }
+    std::fclose(status);
+    return kib;
+}
+
+/// @brief 每层约 256 字节 volatile 局部的深递归（验证几何增长的栈增长）。
+__attribute__((noinline)) std::uint64_t DeepWalk(std::size_t depth) {
+    volatile char pad[256];
+    pad[0] = static_cast<char>(depth & 0x7F);
+    pad[255] = static_cast<char>((depth >> 7) & 0x7F);
+    if (depth == 0) {
+        return static_cast<std::uint64_t>(
+            static_cast<unsigned char>(pad[0]) +
+            static_cast<unsigned char>(pad[255]));
+    }
+    const std::uint64_t below = DeepWalk(depth - 1);
+    return below + static_cast<std::uint64_t>(
+                       static_cast<unsigned char>(pad[0]) +
+                       static_cast<unsigned char>(pad[255]));
+}
+
+std::uint64_t ExpectedDeepWalk(std::size_t depth) {
+    std::uint64_t sum = 0;
+    for (std::size_t d = 0; d <= depth; ++d) {
+        sum += static_cast<unsigned char>(d & 0x7F);
+        sum += static_cast<unsigned char>((d >> 7) & 0x7F);
+    }
+    return sum;
+}
 
 }  // namespace
 
@@ -608,5 +655,159 @@ void run_fiber_tests() {
         GO2CPP_JOIN_WITH_WATCHDOG(observer, 10s);
         GO2CPP_CHECK(!invalid_state.load(std::memory_order_acquire));
         GO2CPP_CHECK(observer_reads.load(std::memory_order_acquire) > 0);
+    }
+
+    // ---- 栈 arena：批量创建/完成不泄漏虚拟地址，重复批次复用槽 ----------
+    {
+        constexpr std::size_t kWaveCount = 256;
+        const std::size_t before_kib = ReadVmSizeKiB();
+        std::size_t first_peak_kib = 0;
+        for (int wave = 0; wave < 3; ++wave) {
+            std::vector<std::unique_ptr<Fiber>> fibers;
+            fibers.reserve(kWaveCount);
+            for (std::size_t i = 0; i < kWaveCount; ++i) {
+                fibers.push_back(std::make_unique<Fiber>(
+                    [] { Fiber::Suspend(SuspendReason::Park); }, 4096));
+                GO2CPP_REQUIRE(fibers.back() != nullptr);
+                GO2CPP_CHECK(fibers.back()->resume());
+            }
+            const std::size_t peak_kib = ReadVmSizeKiB();
+            // 256 个 8MiB 预留 ≈ 2GiB 虚拟地址；arena 不应少给。
+            GO2CPP_CHECK(peak_kib >= before_kib + 1024U * 1024U);
+            if (wave == 0) {
+                first_peak_kib = peak_kib;
+            } else {
+                // 后续批次应复用已保留的槽，峰值不随批次线性增长。
+                GO2CPP_CHECK(peak_kib <= first_peak_kib + 512U * 1024U);
+            }
+            for (auto& fiber : fibers) {
+                GO2CPP_CHECK(fiber->resume());
+                GO2CPP_CHECK(fiber->state() == FiberState::Completed);
+            }
+            fibers.clear();
+            const std::size_t after_kib = ReadVmSizeKiB();
+            GO2CPP_CHECK(after_kib <= peak_kib);
+            // 完成后只保留有界的空闲 arena（默认 8MiB 槽 ≤ 64 个 ≈ 512MiB），
+            // 其余整体 munmap；旧实现会留下约 544×8MiB 的逐栈缓存。
+            GO2CPP_CHECK(after_kib <= before_kib + 1024U * 1024U);
+        }
+    }
+
+    // ---- 几何增长：深层递归（约 3.5MiB）在 16MiB 预留内完成 ----------------
+    {
+        constexpr std::size_t kDepth = 12000;
+        std::atomic<bool> checksum_ok{false};
+        Fiber deep(
+            [&checksum_ok] {
+                const std::uint64_t got = DeepWalk(kDepth);
+                checksum_ok.store(got == ExpectedDeepWalk(kDepth),
+                                  std::memory_order_release);
+            },
+            64U * 1024U, 16U * 1024U * 1024U, true);
+        GO2CPP_CHECK(deep.resume());
+        while (deep.state() == FiberState::Suspended) {
+            GO2CPP_CHECK(deep.resume());
+        }
+        GO2CPP_CHECK(deep.state() == FiberState::Completed);
+        GO2CPP_CHECK(checksum_ok.load(std::memory_order_acquire));
+    }
+
+    // ---- 多大小类：不同 reserve 各自成类，互不串用 ------------------------
+    {
+        std::atomic<int> completed{0};
+        std::vector<std::unique_ptr<Fiber>> fibers;
+        for (std::size_t mib = 1; mib <= 10; ++mib) {
+            fibers.push_back(std::make_unique<Fiber>(
+                [&completed] {
+                    completed.fetch_add(1, std::memory_order_relaxed);
+                    Fiber::Suspend(SuspendReason::Yield);
+                    completed.fetch_add(1, std::memory_order_relaxed);
+                },
+                4096, mib * 1024U * 1024U, true));
+        }
+        for (auto& fiber : fibers) {
+            GO2CPP_CHECK(fiber->resume());
+        }
+        for (auto& fiber : fibers) {
+            GO2CPP_CHECK(fiber->resume());
+            GO2CPP_CHECK(fiber->state() == FiberState::Completed);
+        }
+        GO2CPP_CHECK(completed.load(std::memory_order_relaxed) == 20);
+    }
+
+    // ---- 同一 reserve、不同初始窗口：arena 类必须按 (reserve, usable) 匹配 ----
+    {
+        std::atomic<int> mixed{0};
+        {
+            Fiber small([&mixed] { mixed.fetch_add(1, std::memory_order_relaxed); },
+                        4096, 8U * 1024U * 1024U, true);
+            GO2CPP_CHECK(small.resume());
+            GO2CPP_CHECK(small.state() == FiberState::Completed);
+        }
+        {
+            // 若复用上面那个 4KiB 窗口的槽，初始上下文会落在 PROT_NONE 区域
+            // 并触发不可增长的 SIGSEGV；这里一旦串用就是硬崩。
+            Fiber large([&mixed] { mixed.fetch_add(1, std::memory_order_relaxed); },
+                        128U * 1024U, 8U * 1024U * 1024U, true);
+            GO2CPP_CHECK(large.resume());
+            GO2CPP_CHECK(large.state() == FiberState::Completed);
+        }
+        GO2CPP_CHECK(mixed.load(std::memory_order_relaxed) == 2);
+    }
+
+    // ---- 增长过的槽复用：committed 必须复位到初始窗口 ----------------------
+    {
+        std::atomic<std::size_t> usable_before{0};
+        std::atomic<std::size_t> usable_after{0};
+        {
+            Fiber deep(
+                [&usable_before] {
+                    usable_before.store(
+                        Fiber::Current()->debug_stack().usable_bytes,
+                        std::memory_order_relaxed);
+                    volatile std::uint64_t sink = DeepWalk(6000);
+                    (void)sink;
+                },
+                64U * 1024U, 16U * 1024U * 1024U, true);
+            GO2CPP_CHECK(deep.resume());
+            GO2CPP_CHECK(deep.state() == FiberState::Completed);
+        }
+        {
+            Fiber next(
+                [&usable_after] {
+                    usable_after.store(
+                        Fiber::Current()->debug_stack().usable_bytes,
+                        std::memory_order_relaxed);
+                },
+                64U * 1024U, 16U * 1024U * 1024U, true);
+            GO2CPP_CHECK(next.resume());
+            GO2CPP_CHECK(next.state() == FiberState::Completed);
+        }
+        GO2CPP_CHECK(usable_before.load(std::memory_order_relaxed) ==
+                     64U * 1024U);
+        // 深度递归已让第一个 Fiber 的 committed 下移；槽回收时必须重新
+        // mprotect(PROT_NONE) 并复位，第二个 Fiber 只能拿到初始 64KiB。
+        GO2CPP_CHECK(usable_after.load(std::memory_order_relaxed) ==
+                     64U * 1024U);
+    }
+
+    // ---- 调度器栈复用：FiberBin 回收的 Fiber 保留栈，任务不重复建栈 ------
+    {
+        constexpr std::size_t kTasks = 512;
+        const std::size_t before_kib = ReadVmSizeKiB();
+        std::atomic<std::size_t> runs{0};
+        for (std::size_t i = 0; i < kTasks; ++i) {
+            auto fiber = Fiber::AcquireForScheduler(
+                [&runs] { runs.fetch_add(1, std::memory_order_relaxed); },
+                4096, 64U);
+            GO2CPP_REQUIRE(fiber != nullptr);
+            GO2CPP_CHECK(fiber->resume_from_scheduler());
+            GO2CPP_CHECK(fiber->state() == FiberState::Completed);
+            Fiber::RecycleForScheduler(std::move(fiber), 64U);
+        }
+        GO2CPP_CHECK(runs.load(std::memory_order_relaxed) == kTasks);
+        const std::size_t after_kib = ReadVmSizeKiB();
+        // bin 最多保留 64 个栈（64 × 8MiB = 512MiB）；不随 512 个任务增长。
+        GO2CPP_CHECK(after_kib <= before_kib + 1024U * 1024U);
     }
 }
