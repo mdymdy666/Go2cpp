@@ -33,3 +33,4 @@ mcp/mcp.ini
 # CTest 本地产物（git 根目录下执行 ctest 时生成）
 /Testing/
 .build-bento-wsl/
+/.build-*/
