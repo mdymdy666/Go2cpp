@@ -29,6 +29,17 @@
  * std::condition_variable 慢 3.3 倍，加了自旋后所有场景都更快。预算大小与
  * 是否真正划算随机器（尤其 WSL2 的唤醒延迟）变化，见同文件 .cpp 实测注释。
  *
+ * ## 等待队列（P0 结构）
+ *
+ * 队列是**侵入式双向链表 + 每个等待者线程本地的节点池**：
+ *
+ * - 入队/摘链都是 O(1)，取消/超时清理不再需要 `std::find` + `erase` 中间
+ *   元素（旧 `std::deque<std::shared_ptr<WaitNode>>` 在 N 个等待者逐个被
+ *   唤醒时是 O(N²)）；
+ * - 节点复用，稳态零堆分配；
+ * - 队列锁只保护链接关系与计数，节点结果字段是独立原子量，等待者自旋
+ *   不需要拿队列锁；managed 唤醒的 Scheduler 访问由每个节点自己的门保护。
+ *
  * ## 能力清单
  *
  * - `wait / wait_for / wait_until`：带谓词等待，**调用方必须持有传入的外部
@@ -46,12 +57,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
+
+#include "go2cpp/concurrency/core/futex_mutex.hpp"
 
 namespace go2cpp::core {
 
@@ -60,10 +72,9 @@ namespace go2cpp::core {
 /**
  * 同时服务 Fiber 与普通线程的条件等待适配器。
  *
- * 依赖：Scheduler/Fiber 提供受管等待路径，std::condition_variable 提供
- * 普通线程路径。对上层提供带谓词的 wait/wait_for/wait_until，并要求调用
- * 方持有传入的外部互斥锁；它本身不拥有业务状态，也不负责通知条件的
- * 产生。
+ * 依赖：Scheduler/Fiber 提供受管等待路径，per-node futex 提供普通线程路径。
+ * 对上层提供带谓词的 wait/wait_for/wait_until，并要求调用方持有传入的外部
+ * 互斥锁；它本身不拥有业务状态，也不负责通知条件的产生。
  */
 /**
  * @brief 等待队列中单个节点的只读快照。
@@ -162,7 +173,7 @@ public:
 
     /**
      * @brief 采集等待队列的只读快照（等待者数量与各节点状态）。
-     * @note 持 `m_mutex` 遍历队列；不唤醒、不修改任何节点。
+     * @note 持队列锁遍历侵入式链表；不唤醒、不修改任何节点。
      */
     ParkingConditionDebugSnapshot DebugSnapshot() const;
 
@@ -176,8 +187,15 @@ private:
 
     // mutable：DebugSnapshot() 需要作为 const 观测接口持锁遍历等待队列；
     // 只影响 const 限定，不改变任何同步语义。
-    mutable std::mutex m_mutex;
-    std::deque<std::shared_ptr<WaitNode>> m_waiters;
+    //
+    // 队列锁只保护「链表的链接关系 + 等待者计数」，临界区是几条指针赋值。
+    // 节点自己的结果/futex 代际是原子字段：等待者自旋、通知者的 Finish、
+    // 以及 managed 唤醒都不需要这把锁（managed 走节点私有的 m_wake_mutex，
+    // 即 Disarm 门）。锁序：队列锁与节点门从不嵌套获取。
+    mutable FutexMutex m_queue_mutex;
+    WaitNode* m_head{nullptr};
+    WaitNode* m_tail{nullptr};
+    std::size_t m_waiter_count{0};
 
     // ---- 广播代际字（futex_waitv 混合方案）----
     // notify_all 需要唤醒 N 个 native waiter。per-node futex 的地址彼此不同，

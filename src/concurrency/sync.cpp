@@ -321,8 +321,6 @@ public:
         // TSAN 曾经报告：gid() 无锁读 m_task（shared_ptr）与 Reset() 的
         // 赋值竞争；这里把「是否受管」与「gid」固化成原子值，
         // m_task 本身仍只在 m_wake_mutex 下读写。
-        m_has_task.store(static_cast<bool>(m_task),
-                         std::memory_order_relaxed);
         m_managed.store(scheduler != nullptr && static_cast<bool>(m_task),
                         std::memory_order_relaxed);
         m_gid.store(m_task ? static_cast<std::uint64_t>(m_task->id()) : 0U,
@@ -598,8 +596,6 @@ public:
         m_active = false;
         m_scheduler.store(scheduler, std::memory_order_release);
         m_task = std::move(task);
-        m_has_task.store(static_cast<bool>(m_task),
-                         std::memory_order_relaxed);
         m_managed.store(scheduler != nullptr && static_cast<bool>(m_task),
                         std::memory_order_relaxed);
         m_gid.store(m_task ? static_cast<std::uint64_t>(m_task->id()) : 0U,
@@ -625,12 +621,14 @@ private:
     /// scheduler() 在锁外读（TSAN 修复，见构造函数注释）。
     std::atomic<Scheduler*> m_scheduler{nullptr};
     std::shared_ptr<Task> m_task;
-    /// 原子快照：m_task 是否非空 / 其 gid（无锁读，m_task 本身仍受锁保护）。
-    std::atomic<bool> m_has_task{false};
-    /// @brief `m_has_task && m_scheduler != nullptr` 的合成快照。
-    /// @details `managed()` 在每次入队/唤醒时都被调用，原先要读两个原子
-    ///          并做一次短路；合并成一个 bool 后只剩一次 acquire 读。
+    /// @brief 「本节点是否受管」的原子快照（无锁读）。
+    /// @details `managed()` 在每次入队/唤醒时都被调用；`m_scheduler` /
+    ///          `m_task` 只在 `m_wake_mutex` 下写，锁外读它们会构成数据
+    ///          竞争（TSAN 曾报告），因此固化成一次 acquire 读。
+    ///          旧实现还额外维护过 `m_has_task`，但它自始至终没有任何
+    ///          读取点（死字段），已删除：每次 wait 少一次原子写。
     std::atomic<bool> m_managed{false};
+    /// @brief 受管 G 的编号快照；native/未知为 0（调试事件用，无锁读）。
     std::atomic<std::uint64_t> m_gid{0};
     /**
      * @brief 等待者热字段：全部收在同一条缓存行上。
