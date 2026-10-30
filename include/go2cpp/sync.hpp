@@ -2,11 +2,25 @@
 
 #include "go2cpp/context.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
+
+// ---- 本次构建是否记录资源级事件（推导与 go2cpp/debug/debug_resources.hpp 一致）----
+// sync.hpp 不包含那个较重的 debug 头，但 Mutex 的内联快路径必须知道「资源
+// 事件是否参与编译」：参与时必须把每次加锁/解锁留在 .so 的完整实现里逐次
+// 记录，不能走内联快路径。
+#ifndef GO2CPP_DEBUG_RESOURCES
+#if (defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP) || \
+    (defined(GO2CPP_REPLAY) && GO2CPP_REPLAY)
+#define GO2CPP_DEBUG_RESOURCES 1
+#else
+#define GO2CPP_DEBUG_RESOURCES 0
+#endif
+#endif
 
 namespace go2cpp::sync {
 namespace go2cpp::debug {
@@ -14,11 +28,28 @@ class DebugMutex;
 class DebugConditionVariable;
 }  // namespace go2cpp::debug
 
+namespace detail {
+
+/// @brief 持锁 park 检测开关（-1=未解析，0=关，1=开）。
+/// @details 定义在 sync.cpp；写入口是 SetHeldLockParkDetection()。
+///          在公共头暴露是为了让 Mutex 的内联快路径能以一次 relaxed load
+///          读到它——否则每次加锁都要多做一次跨库函数调用。
+extern std::atomic<int> g_held_park_detect;
+
+/// @brief 检测开关的热路径读法：一次 relaxed load + 可预测分支。
+/// @note 变量在 sync.cpp 里由静态初始化按「环境变量 / NDEBUG」定好初值，
+///       因此热路径没有「尚未解析」这一层分支。
+inline bool held_park_detection_on() noexcept {
+    return g_held_park_detect.load(std::memory_order_relaxed) != 0;
+}
+
+}  // namespace detail
+
 
 /**
  * @brief Mutex 的调试只读快照（第 8 轮，P3 锁观测）。
  *
- * @note **持有者身份不可知**：`Mutex::Impl::m_state` 只记录「已持有」与
+ * @note **持有者身份不可知**：`Mutex::m_state` 只记录「已持有」与
  *       「有等待者」两个位，不记录 owner（Go 风格所有权允许 A 加锁、B 解锁）。
  *       因此本快照**不包含** owner 字段。持锁 park 检测在开启时会额外记录
  *       最近一次加锁的受管 G（诊断用的近似值），但不作为快照的权威 owner。
@@ -31,7 +62,7 @@ struct MutexDebugSnapshot {
     std::size_t fiber_waiters{0};      ///< 其中受管 Fiber 的数量（= waiters - native_waiters）。
 
     // ---- 状态字（第 26 轮补全：owner / kLocked / kWaiter / kStarving / kWoken）----
-    // `state_bits` 是 `Mutex::Impl::m_state` 的原始值；四个 bit 与
+    // `state_bits` 是 `Mutex::m_state` 的原始值；四个 bit 与
     // Go sync.Mutex 对应：kLocked=1, kWaiter=2, kStarving=4, kWoken=8。
     // 单独给出布尔字段是为了让 CLI 不必硬编码位值；新增字段放在末尾，
     // 保持既有聚合初始化兼容。
@@ -201,6 +232,14 @@ std::shared_ptr<WaitBackend> CreateWaitBackend() noexcept;
  * 对上层提供 Lock/TryLock/LockFor 及 BasicLockable 小写接口。对象必须
  * 长于所有使用者和等待者；不支持递归加锁，成功 Lock 必须恰好对应一次
  * Unlock。Unlock 不要求由同一 G/线程调用，采用 Go 风格所有权。
+ *
+ * ## 快路径（第 27 轮：去间接）
+ *
+ * 状态字 `m_state` **内联在 Mutex 对象起始**（不再住在 `Impl` 里），因此
+ * 无竞争 `Lock`/`Unlock` 只需一次 relaxed load + **一次 CAS**：既不解引用
+ * `m_impl`（唯一的堆间接），也不查调度器、不碰等待队列、不调用任何虚函数。
+ * 所有需要 `Impl` 的逻辑（自旋、FIFO 队列、饥饿交接、超时/取消清理、
+ * 跨线程解锁唤醒）都留在慢路径，语义与之前完全一致。
  */
 class Mutex final {
 public:
@@ -215,8 +254,59 @@ public:
     Mutex& operator=(Mutex&&) = delete;
 
     // 阻塞直到获得锁或 context 取消；返回 true 表示已持有锁。
+    /**
+     * @brief 阻塞获取锁（无 Context 重载）。
+     *
+     * @details 单独拆出无参重载，让 `mutex.Lock()` 不再构造一个空的
+     *          `shared_ptr` 临时对象；无竞争路径只有一次 relaxed load +
+     *          一次 CAS。快路径失败后交给 `LockImpl`（定义在 sync.cpp）。
+     */
+    bool Lock() {
+#if GO2CPP_DEBUG_RESOURCES
+        return LockImpl({}, false);
+#else
+        // 先 relaxed load 再 CAS：无竞争时只多一次 L1 load；一旦有等待者
+        // （状态里带 kWaiter/kWoken），这避免了「先 CAS(0) 必然失败、再
+        // CAS(expected) 成功」的第二次缓存行争用（4t/16t 实测快约 3 ns/op）。
+        std::uint8_t expected = m_state.load(std::memory_order_relaxed);
+        if ((expected & (kLockedBit | kStarvingBit)) == 0U &&
+            m_state.compare_exchange_weak(
+                expected,
+                static_cast<std::uint8_t>(expected | kLockedBit),
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+            if (detail::held_park_detection_on()) {
+                NoteLockHeldSlow();
+            }
+            return true;
+        }
+        return LockImpl({}, false);
+#endif
+    }
     /** @brief 阻塞获取锁，支持 Context 取消。 */
-    bool Lock(const ContextPtr& context = {});
+    bool Lock(const ContextPtr& context) {
+#if GO2CPP_DEBUG_RESOURCES
+        return LockImpl(context, false);
+#else
+        if (context && context->IsDone()) {
+            return false;
+        }
+        // 先 relaxed load 再 CAS：无竞争时只多一次 L1 load；一旦有等待者
+        // （状态里带 kWaiter/kWoken），这避免了「先 CAS(0) 必然失败、再
+        // CAS(expected) 成功」的第二次缓存行争用（4t/16t 实测快约 3 ns/op）。
+        std::uint8_t expected = m_state.load(std::memory_order_relaxed);
+        if ((expected & (kLockedBit | kStarvingBit)) == 0U &&
+            m_state.compare_exchange_weak(
+                expected,
+                static_cast<std::uint8_t>(expected | kLockedBit),
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+            if (detail::held_park_detection_on()) {
+                NoteLockHeldSlow();
+            }
+            return true;
+        }
+        return LockImpl(context, false);
+#endif
+    }
     // 最多等待 timeout；parent/context 取消或超时返回 false。
     /** @brief 在相对超时内获取锁。 */
     bool LockFor(ContextDuration timeout,
@@ -226,7 +316,23 @@ public:
     bool TryLock() noexcept;
     // 释放锁并按 FIFO 唤醒下一个等待者；未持有锁时报告逻辑错误。
     /** @brief 释放锁并唤醒一个 FIFO 等待者。 */
-    void Unlock();
+    void Unlock() {
+#if GO2CPP_DEBUG_RESOURCES
+        UnlockSlow();
+#else
+        // 检测必须在 CAS 之前读 owner：释放之后 owner 可能已被新持有者改写。
+        if (detail::held_park_detection_on()) {
+            NoteUnlockHeldSlow();
+        }
+        std::uint8_t expected = kLockedBit;
+        if (m_state.compare_exchange_strong(expected, 0U,
+                                            std::memory_order_release,
+                                            std::memory_order_acquire)) {
+            return;
+        }
+        UnlockSlow();
+#endif
+    }
 
     // BasicLockable 兼容拼写。lock() 在普通线程上竞争时阻塞；受管 G
     // 无法继续等待（例如 Scheduler 正在关闭）时抛出 std::logic_error。
@@ -243,9 +349,29 @@ public:
 private:
 
     friend class ConditionVariable;
+
+    // 状态位（Impl 里的同名常量直接引用这里，保证快路径与慢路径同源）。
+    static constexpr std::uint8_t kLockedBit = 1U;
+    static constexpr std::uint8_t kWaiterBit = 2U;
+    static constexpr std::uint8_t kStarvingBit = 4U;
+    static constexpr std::uint8_t kWokenBit = 8U;
+
     /** @brief 条件变量返回前使用；忽略 G 取消标记并完成不可中断重锁。 */
     bool LockForConditionWait();
+    /** @brief 完整加锁实现：Lock 快路径失败后的慢路径落点。 */
     bool LockImpl(const ContextPtr& context, bool ignore_task_cancellation);
+    /** @brief Unlock 快路径 CAS 失败后的队列交接（原 Unlock 实现）。 */
+    void UnlockSlow();
+    /** @brief 持锁 park 检测的冷路径；只在检测开关打开时调用。 */
+    void NoteLockHeldSlow();
+    void NoteUnlockHeldSlow();
+
+    // 快路径状态字（kLocked=1, kWaiter=2, kStarving=4, kWoken=8）。
+    // 内联在 Mutex 对象上：无竞争 Lock/Unlock 只碰这一个字节，不再经过
+    // m_impl 指针解引用（那是一次额外的依赖 load）。独占一条缓存行，
+    // 避免与 Impl 里的等待队列/等待者计数/owner 假共享。
+    // **放在对象起始**：CAS 的地址就是 `this`，热路径少一条 `lea`。
+    alignas(64) std::atomic<std::uint8_t> m_state{0U};
 
     struct Impl;
     std::unique_ptr<Impl> m_impl;
