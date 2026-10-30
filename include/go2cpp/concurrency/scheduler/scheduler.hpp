@@ -199,6 +199,34 @@ public:
 using SchedulerObserverPtr = std::shared_ptr<SchedulerObserver>;
 
 /**
+ * @brief 唤醒/恢复时的投递策略（可运行期切换，用于 A/B 对比与调参）。
+ *
+ * ## 背景
+ *
+ * G 在哪个 M 上恢复决定了 TLS/栈/用户数据的缓存温度。Go 的 `goready`
+ * 走「唤醒者自己 P 的 runnext → 本地运行队列 → 全局队列」，并在有空闲
+ * spinning M 时直接 handoff；Bento 的 P 没有唯一 owner，因此把「同 M」
+ * 表达为「最近 M 所在 P 的快速槽」。
+ *
+ * ## 策略
+ *
+ * - `kLastMachine`（① 纯亲和）：优先把 G 投回最近运行的 P 的快速槽，
+ *   **不**做轮询分散；无法亲和时回退目标 P 队列；
+ * - `kRunNext`（② Go 式，默认）：worker 本地唤醒/yield 直接进本 P 的
+ *   runnext；外部唤醒投到最近 M 所在 P 的 runnext；仍失败才走本地队列
+ *   与全局队列；
+ * - `kRoundRobin`（③ 对照）：按 P 编号轮转投递到队列尾，用于证明亲和
+ *   策略确实带来收益。
+ *
+ * 三种策略都不改变正确性，只改变「投到哪个队列/槽」。
+ */
+enum class WakePolicy : std::uint8_t {
+    kLastMachine = 0,
+    kRunNext = 1,
+    kRoundRobin = 2,
+};
+
+/**
  * @brief Scheduler 启动和运行参数。
  * @details 字段可通过 config 模块加载；线程数、P 数和栈容量会在启动期
  *          校验，动态配置不得拆开修改相互依赖的结构参数。
@@ -265,6 +293,9 @@ struct SchedulerConfig {
     // 覆盖全表；回收只持有条带锁，不进入全局 admission 锁。
     // 0 表示关闭周期回收（仅 shutdown/cancel 收尾路径回收）。默认 256。
     std::size_t terminal_collect_interval = 256;
+    // 唤醒投递策略（见 WakePolicy）。默认 Go 式 runnext；运行期可用
+    // Scheduler::set_wake_policy() 切换做 A/B 对比。
+    WakePolicy wake_policy = WakePolicy::kRunNext;
 };
 
 using TaskClassId = std::uint64_t;
@@ -312,6 +343,12 @@ struct MachineSnapshot {
     // 该 M 是否为「补充 M」：为阻塞区补位的动态 worker。补充 M 在
     // blocking_workers 归零后立即退休；基础 M 恒为 false 且常驻到 shutdown。
     bool replacement{false};
+    // ---- M 亲和 / runnext 观测（每个 M 独立计数，便于定位负载倾斜）----
+    std::size_t runnext_hits{0};      ///< 本 M 从 runnext 取到 G 的次数
+    std::size_t inbox_hits{0};        ///< 本 M 从定向槽取到 G 的次数
+    std::size_t same_machine_resumes{0};  ///< 在本 M 上续跑的 G 次数
+    std::size_t cross_machine_resumes{0}; ///< 从别的 M 迁移来的 G 次数
+    std::size_t locked_redirects{0};  ///< 本 M 重定向回绑定 M 的次数
 };
 
 // 调度器热点计数器。所有时间均为 steady_clock 纳秒，采用累计值，便于
@@ -363,6 +400,28 @@ struct SchedulerMetrics {
     std::uint64_t local_queue_pops{0};
     /// @brief 从别的 P 窃取到 G 的次数；占比高说明负载不均衡。
     std::uint64_t steal_pops{0};
+
+    // ---- M 亲和 / runnext 观测（用于计算命中率）----
+    /// @brief 投递到 P 快速槽（runnext）的累计次数。
+    std::uint64_t runnext_pushes{0};
+    /// @brief 从快速槽直接取到 G 的累计次数（命中）。
+    std::uint64_t runnext_pops{0};
+    /// @brief 快速槽被占满时被挤到本地队列的累计次数。
+    std::uint64_t runnext_displaced{0};
+    /// @brief 投递到 M 定向槽（inbox，LockToCurrentM/严格同 M）的次数。
+    std::uint64_t inbox_pushes{0};
+    /// @brief 从 M 定向槽取到 G 的次数。
+    std::uint64_t inbox_pops{0};
+    /// @brief 唤醒时命中「最近 M」投递提示的次数。
+    std::uint64_t affinity_wakes{0};
+    /// @brief 别的 M 误取到 LockToCurrentM 的 G、重定向回绑定 M 的次数。
+    std::uint64_t pinned_redirects{0};
+    /// @brief G 在同一个 M 上恢复的次数。
+    std::uint64_t same_machine_resumes{0};
+    /// @brief G 跨 M 迁移恢复的次数。
+    std::uint64_t cross_machine_resumes{0};
+    /// @brief 从别的 P 的快速槽窃取成功的次数。
+    std::uint64_t steal_runnext{0};
 };
 
 /**
@@ -464,6 +523,20 @@ public:
     PId last_processor_id() const noexcept {
         return m_last_processor_id.load(std::memory_order_relaxed);
     }
+    // 最近一次运行所在的 M（0=尚未在受管 M 上运行）。唤醒方把它作为
+    // M 亲和提示：优先投回该 M 所在 P 的快速槽（runnext）。
+    MId last_machine_id() const noexcept {
+        return m_affinity_machine.load(std::memory_order_acquire);
+    }
+    // LockToCurrentM 绑定的 M（0=未绑定）。绑定后该 G 只在绑定 M 上恢复。
+    MId locked_machine_id() const noexcept {
+        return m_locked_machine.load(std::memory_order_acquire);
+    }
+    // 把当前 G 绑定到它正在运行的 M（等价 Go 的 runtime.LockOSThread）。
+    // 只允许在该 G 自己的执行流里调用；成功返回 true。
+    bool lock_to_current_m() noexcept;
+    // 解除 M 绑定；绑定 M 死亡时调度器也会自动调用。
+    bool unlock_from_m() noexcept;
     TaskClassId task_class() const noexcept;
     /// @brief 当前 G 持有的 `sync::Mutex` 数量（仅持锁 park 检测开启时维护）。
     std::uint32_t held_mutex_count() const noexcept {
@@ -671,6 +744,11 @@ private:
     std::atomic<bool> m_cancel_requested{false};
     MId m_last_machine_id{0};
     std::atomic<PId> m_last_processor_id{0};
+    // M 亲和：最近运行的 M 与 LockToCurrentM 绑定。唤醒方（可能是外部
+    // 线程）读这两个值做投递决策，因此必须是原子；写侧由执行该 G 的
+    // worker 在 run() 内同步 Fiber 记录，同一 G 不会被并发执行。
+    std::atomic<MId> m_affinity_machine{0};
+    std::atomic<MId> m_locked_machine{0};
     bool m_binding_published{false};
     mutable std::mutex m_failure_mutex;
     std::exception_ptr m_failure;
@@ -740,6 +818,32 @@ public:
     Scheduler& operator=(const Scheduler&) = delete;
 
     void start();
+    /**
+     * @brief 把当前线程当作 m0，执行一个可被调度的 main G（Go 的 main
+     *        goroutine + runtime.main 的等价物）。
+     *
+     * ## 语义
+     *
+     * - 当前线程登记成一台不拥有 `std::thread` 的 M（绑定 P0），与普通
+     *   worker 走**完全相同的**取任务/执行路径，因此 main G 可以 park /
+     *   wake / yield / 使用 channel / 等待子 G；
+     * - main G 通过 `LockToCurrentM` 语义绑定到这台 M：调度器只把它投进
+     *   该 M 的定向槽，别的 M 误取到会重定向，所以它不会迁移；
+     * - main G 进入终态后停止整个调度器（draining + join），`run_main`
+     *   返回 true 表示 main 正常完成。
+     *
+     * ## 前提与边界
+     *
+     * 必须在 `start()` 之后、由**非 worker** 线程调用；同一 Scheduler 只能
+     * 调用一次。main 返回等价 Go 的 `main` 返回：调度器停止，未完成的 G
+     * 被取消（正在运行的 G 会在自己的安全点退出）。这与 Go 进程退出语义
+     * 一致，但不会调用 `std::exit`，调用方仍可正常析构。
+     *
+     * @param function main 入口（在 Fiber 上执行）。
+     * @return main 正常完成返回 true；调度器未启动/重复调用/入队失败返回
+     *         false。
+     */
+    bool run_main(Task::Function function);
     void shutdown();
     // 请求停止并在给定时间内等待所有 Fiber/worker 完成。返回 true 表示
     // 已完成并已回收 worker；返回 false 表示超时或从 worker 自身调用。
@@ -906,6 +1010,15 @@ public:
     }
     bool Cancel(const std::shared_ptr<Task>& task) { return cancel(task); }
 
+    /**
+     * @brief 运行期切换唤醒投递策略（A/B 对比与线上调参）。
+     * @param policy 新策略；只影响后续唤醒，已入队的 G 不会被搬动。
+     * @note 与 config.wake_policy 同义；线程安全，可在调度运行期间调用。
+     */
+    void set_wake_policy(WakePolicy policy) noexcept;
+    /** @brief 返回当前生效的唤醒投递策略。 */
+    WakePolicy wake_policy() const noexcept;
+
     std::size_t processor_count() const noexcept;
     std::size_t worker_count() const noexcept;
     std::size_t runnable_count() const noexcept;
@@ -1014,9 +1127,18 @@ public:
     static PId CurrentProcessorId() noexcept { return current_processor_id(); }
 
 private:
+    // 前向声明提前到这里：publish_runnext/publish_to_machine 的参数用到
+    // Impl::Processor；类内嵌套类型必须先声明再使用。
+    class Impl;
+
     // 仅供拥有该 G 执行权的 worker 在 resume 返回后调用。
+    // prefer_runnext：把 G 放进本 P 的快速槽（唤醒语义）还是队列尾
+    // （yield 语义）。Go 的 goyield 用 runqput(next=false)，只有 goready
+    // 用 runnext；两者混用会让持续 yield 的 G 一直占住快速槽，把被唤醒
+    // 的 G 挤进队列而饿死（实测 1P/1M 的 Join 场景必现）。
     bool requeue_from_worker(const std::shared_ptr<Task>& task,
-                             bool allow_notify = true);
+                             bool allow_notify = true,
+                             bool prefer_runnext = true);
     // requeue_from_worker() 的「已预留 m_queued」版本：跳过入队权检查，
     // 直接发布本地队列节点。任何失败出口都会先 clear_queued() 并返回
     // false，由调用方走原有回退链（不会留下无节点的 reservation）。
@@ -1026,6 +1148,17 @@ private:
     // admission 队列，避免混合锁交接每次争用全局 incoming stripe。
     bool requeue_to_processor(const std::shared_ptr<Task>& task,
                               PId processor_id);
+    // 把已经占用 m_queued 的任务发布到 P 的 runnext 快速槽；被挤出的旧
+    // 任务落到同一 P 的本地队列（满时再进全局队列）。返回 false 表示
+    // 调用方需要回滚 m_queued 计数并走常规 enqueue()。
+    // 参数用 PId 而不是 Impl::Processor&：Impl 是 .cpp 内的不完整类型，
+    // 头文件无法引用它的嵌套类型（编译期硬约束）。
+    bool publish_runnext(PId processor_id, const std::shared_ptr<Task>& task,
+                         bool allow_notify);
+    // 把任务发布到指定 M 的定向槽（inbox）。用于 LockToCurrentM 的
+    // 严格绑定与「最近 M 空闲」的定向唤醒；M 不存在/已死亡返回 false。
+    bool publish_to_machine(MId machine_id, const std::shared_ptr<Task>& task,
+                            bool allow_notify);
     static void leave_blocking_for(Scheduler* scheduler,
                                    MId machine_id) noexcept;
     bool park_with_reason(const std::shared_ptr<Task>& task,

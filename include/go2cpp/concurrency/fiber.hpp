@@ -387,6 +387,48 @@ public:
     /** @brief 设置取消请求，实际停止在下一次安全点处理。 */
     void RequestCancellation() noexcept;
 
+    // -----------------------------------------------------------------
+    // M 亲和（Go `runnext` + `runtime.LockOSThread` 的等价物）
+    // -----------------------------------------------------------------
+    //
+    // Fiber 记录「最近一次真正运行在哪个 M 上」，调度器把该值作为唤醒时
+    // 的投递提示（优先投回同一 M 的快速槽），从而让 TLS、栈和用户数据
+    // 留在同一个 CPU 的缓存里。这里只暴露只读观测接口，投递策略由
+    // Scheduler 决定；Fiber 模块不依赖 Scheduler 类型（M 用 uint64 表达）。
+
+    /** @brief 返回最近一次运行所在的 M；0 表示尚未在受管 M 上运行。 */
+    std::uint64_t preferred_machine() const noexcept;
+    /** @brief 返回最近一次运行所在的 P（诊断用；0 表示未知）。 */
+    std::uint64_t preferred_processor() const noexcept;
+    /**
+     * @brief 把当前 Fiber 固定到当前 M（等价 Go 的 `runtime.LockOSThread`）。
+     *
+     * @details 绑定后 Scheduler 只会把该 G 投递到绑定 M 的定向槽，并在别的
+     *          M 误取到时重定向，因此该 G 不会迁移。适用于依赖线程局部状态
+     *          （TLS、线程绑定的第三方库、线程亲和的信号/定时器）的场景。
+     *
+     *          约束与 Go 相同：绑定期间若该 G 阻塞等待另一条必须由同一 M
+     *          推进的工作，会形成死锁；M 一旦死亡（shutdown/收缩），绑定
+     *          自动失效，G 回到普通调度路径。绑定不阻止 park/wake，也不会
+     *          把 M 从系统调用里救回来。
+     *
+     * @return 成功返回绑定的 M id；不在受管 G 中（主线程/main_fiber）或
+     *         当前线程没有发布执行绑定时返回 0。
+     */
+    static std::uint64_t LockToCurrentM() noexcept;
+    /** @brief 解除当前 Fiber 的 M 绑定。@return 之前是否处于绑定状态。 */
+    static bool UnlockFromM() noexcept;
+    /** @brief 返回当前 Fiber 的绑定 M；未绑定返回 0。 */
+    static std::uint64_t CurrentLockedMachine() noexcept;
+    /** @brief 返回本 Fiber 的绑定 M；未绑定返回 0。 */
+    std::uint64_t locked_machine() const noexcept;
+    /** @brief 把本 Fiber 绑定到指定 M（0 表示解除）；供调度器同步使用。 */
+    bool lock_to_machine(std::uint64_t machine_id) noexcept;
+    /** @brief 本 Fiber 发生「跨 M 恢复」的累计次数（诊断）。 */
+    std::uint64_t affinity_migrations() const noexcept;
+    /** @brief 本 Fiber 发生「同 M 恢复」的累计次数（诊断）。 */
+    std::uint64_t affinity_hits() const noexcept;
+
     // 查询当前状态；返回 FiberState 枚举值。
     /** @brief 返回 Fiber 当前生命周期状态。 */
     FiberState state() const noexcept;
