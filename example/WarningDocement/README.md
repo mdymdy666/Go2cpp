@@ -34,3 +34,9 @@
 - 新增示例若引入新约束，在对应模块文档追加条目并更新本表计数；
 - 每条限制必须能指到 example 或 src/include 的具体行；
 - 不修改 `example/` 源码，本目录只承载文档。
+
+## 补充索引（2026-10-30 晚）
+
+- [audit-mcp-socket](audit-mcp-socket.md)：MCP Socket 工具（33 工具，14.5k ops/s）
+- [network-p1-fix](network-p1-fix.md)：网络 P1 修复（Fiber errno / HOOK=OFF）
+- [audit-base-network](audit-base-network.md)：网络基础审计（TCP 28.7k conn/s / UDP 41.9k pkt/s）

@@ -309,3 +309,7 @@
 > 已并入 `modules/timer.md`；`gmp-vs-thread-epoll-2026-10-18.md` 的 IO 结论与
 > `network.md` 的 IOManager 细节已并入 `modules/io.md`（`network.md` 仅部分合并，
 > Socket/WebSocket/SSE 等章节仍是现行说明）。
+
+## 调研文档（补充）
+
+- [socket-debug-mode](research/socket-debug-mode.md)：Socket Debug 模式调研（方案 D：自持计数 + 事件复用 + 第 11 视图）
