@@ -1394,7 +1394,7 @@ public:
     // safely retain the same object even when later workers are appended.
     // is_replacement=true 表示这是为阻塞区补位的动态 M：阻塞结束后可退休。
     bool spawn_worker_locked(Scheduler* scheduler, bool is_replacement) {
-        if (!scheduler || stopping.load(std::memory_order_acquire) ||
+        if (!scheduler || stopping() ||
             machines.size() >= std::numeric_limits<std::size_t>::max() ||
             active_workers.load(std::memory_order_relaxed) >=
                 config.max_workers) {
@@ -1507,8 +1507,8 @@ public:
             return;
         }
         if (!started.load(std::memory_order_acquire) ||
-            draining.load(std::memory_order_acquire) ||
-            stopping.load(std::memory_order_acquire)) {
+            draining() ||
+            stopping()) {
             return;
         }
         try {
@@ -1519,8 +1519,8 @@ public:
         }
         std::unique_lock<std::mutex> lock(mutex);
         if (!started.load(std::memory_order_acquire) ||
-            draining.load(std::memory_order_acquire) ||
-            stopping.load(std::memory_order_acquire)) {
+            draining() ||
+            stopping()) {
             return;
         }
         const auto queued = runnable.load(std::memory_order_acquire);
@@ -1631,7 +1631,7 @@ public:
                 }
                 if (processor.active_machines.load(
                         std::memory_order_relaxed) == 0 &&
-                    !stopping.load(std::memory_order_acquire)) {
+                    !stopping()) {
                     processor.state.store(PState::kIdle,
                                           std::memory_order_release);
                 }
@@ -1661,11 +1661,11 @@ public:
             std::unique_lock<std::mutex> lock(sysmon_wait_mutex);
             sysmon_wait_condition.wait_for(lock, wait_interval, [this] {
                 return sysmon_stop.load(std::memory_order_acquire) ||
-                       stopping.load(std::memory_order_acquire) ||
+                       stopping() ||
                        sysmon_retry_pending.load(std::memory_order_acquire);
             });
             const bool stop = sysmon_stop.load(std::memory_order_acquire) ||
-                              stopping.load(std::memory_order_acquire);
+                              stopping();
             lock.unlock();
             if (stop) {
                 break;
@@ -1944,7 +1944,7 @@ public:
     }
 
     bool finish_draining_locked() noexcept {
-        if (!draining.load(std::memory_order_acquire)) {
+        if (!draining()) {
             return false;
         }
         // 快路径：还有 G 未终态时直接返回，不做任何全表扫描。计数归零
@@ -1956,8 +1956,8 @@ public:
         if (!all_tasks_terminal_locked()) {
             return false;
         }
-        draining.store(false, std::memory_order_release);
-        stopping.store(true, std::memory_order_release);
+        set_draining(false);
+        set_stopping(true);
         return true;
     }
 
@@ -2017,14 +2017,81 @@ public:
     // vector relocation of an existing shared_ptr slot.
     std::deque<std::shared_ptr<Machine>> machines;
     std::atomic<bool> started{false};
-    std::atomic<bool> draining{false};
+    // ------------------------------------------------------------------
+    // 生命周期标志合并（park/wake 热路径只读一次）
+    // ------------------------------------------------------------------
+    //
+    // 原实现把 draining / stopping / accepting 拆成三个 std::atomic<bool>，
+    // 每次 park 要读两次（draining + stopping），每次 wake 还要多读一次
+    // accepting。三个标志只有 shutdown 一个写者、语义又都是「单调关停」，
+    // 因此合并成一个原子位图后，热路径只需一次 acquire load 就能同时拿到
+    // 两个停止标志——与 Go 1.3 gopark/park0 只读 `sched.gcwaiting` 一个
+    // 全局字的结构一致（proc.c:1355-1390）。
+    //
+    // 写者顺序：位图是唯一真值，不存在第二份状态需要同步。fetch_or /
+    // fetch_and 使用 acq_rel，保证置位前的队列/注册表写入对读到 flag 的
+    // park 方可见（与原先 release store 等价）。
+    static constexpr std::uint8_t kDrainingFlag = 1U;
+    static constexpr std::uint8_t kStoppingFlag = 2U;
+    static constexpr std::uint8_t kNotAcceptingFlag = 4U;
+    std::atomic<std::uint8_t> lifecycle_flags{0U};
+
+    bool draining() const noexcept {
+        return (lifecycle_flags.load(std::memory_order_acquire) &
+                kDrainingFlag) != 0U;
+    }
+    bool stopping() const noexcept {
+        return (lifecycle_flags.load(std::memory_order_acquire) &
+                kStoppingFlag) != 0U;
+    }
+    bool accepting() const noexcept {
+        return (lifecycle_flags.load(std::memory_order_acquire) &
+                kNotAcceptingFlag) == 0U;
+    }
+    /// @brief park/wake 热路径的合并判断：一次 load 同时看两个停止标志。
+    bool stop_requested() const noexcept {
+        return (lifecycle_flags.load(std::memory_order_acquire) &
+                (kDrainingFlag | kStoppingFlag)) != 0U;
+    }
+    void set_draining(bool on) noexcept {
+        if (on) {
+            lifecycle_flags.fetch_or(kDrainingFlag, std::memory_order_acq_rel);
+        } else {
+            lifecycle_flags.fetch_and(static_cast<std::uint8_t>(~kDrainingFlag),
+                                      std::memory_order_acq_rel);
+        }
+    }
+    /// @brief 新工作是否已被拒绝接纳（accepting=false 或 draining/stopping）。
+    /// @details wake/requeue 的入口检查原先要读三次独立原子；现在与
+    ///          park 共用同一个位图，一次 acquire load 即可判定。
+    bool accept_blocked() const noexcept {
+        return (lifecycle_flags.load(std::memory_order_acquire) &
+                (kDrainingFlag | kStoppingFlag | kNotAcceptingFlag)) != 0U;
+    }
+    void set_stopping(bool on) noexcept {
+        if (on) {
+            lifecycle_flags.fetch_or(kStoppingFlag, std::memory_order_acq_rel);
+        } else {
+            lifecycle_flags.fetch_and(static_cast<std::uint8_t>(~kStoppingFlag),
+                                      std::memory_order_acq_rel);
+        }
+    }
+    void set_accepting(bool on) noexcept {
+        if (on) {
+            lifecycle_flags.fetch_and(
+                static_cast<std::uint8_t>(~kNotAcceptingFlag),
+                std::memory_order_acq_rel);
+        } else {
+            lifecycle_flags.fetch_or(kNotAcceptingFlag,
+                                     std::memory_order_acq_rel);
+        }
+    }
     // 注册表中尚未进入终态的 G 数（未启动 / runnable / running / parked）。
     // 首次入队成功时 +1，终态转移时 -1；两者都在 Task 的
     // m_transition_mutex 内完成。draining 用「归零」做 O(1) 完成判定，
     // 再配合一次全表确认兜底，取代旧实现每完成一个 G 扫描全表的 O(n²)。
     std::atomic<std::size_t> live_tasks{0};
-    std::atomic<bool> stopping{false};
-    std::atomic<bool> accepting{true};
+    // draining / stopping / accepting 的唯一位图与访问器见本类上方。
     std::atomic<std::size_t> runnable{0};
     std::atomic<std::size_t> active_workers{0};
     std::atomic<std::size_t> running_workers{0};
@@ -2107,12 +2174,12 @@ Scheduler::~Scheduler() {
 void Scheduler::start() {
     std::unique_lock<std::mutex> lock(m_impl->mutex);
     if (m_impl->started.load(std::memory_order_acquire) ||
-        m_impl->stopping.load(std::memory_order_acquire)) {
+        m_impl->stopping()) {
         return;
     }
 
     m_impl->started.store(true, std::memory_order_release);
-    m_impl->accepting.store(true, std::memory_order_release);
+    m_impl->set_accepting(true);
     m_impl->sysmon_stop.store(false, std::memory_order_release);
     try {
         for (std::size_t i = 0; i < m_impl->config.min_workers; ++i) {
@@ -2126,7 +2193,7 @@ void Scheduler::start() {
         }
     } catch (...) {
         m_impl->sysmon_active.store(false, std::memory_order_release);
-        m_impl->accepting.store(false, std::memory_order_release);
+        m_impl->set_accepting(false);
         lock.unlock();
         // Drain and join the workers that were successfully created before
         // propagating the thread-creation failure. Leaving a partially
@@ -2198,10 +2265,10 @@ bool Scheduler::shutdown_for(
     {
         std::unique_lock<std::mutex> lock(m_impl->mutex);
         was_started = m_impl->started.load(std::memory_order_acquire);
-        if (!m_impl->draining.load(std::memory_order_acquire) &&
-            !m_impl->stopping.load(std::memory_order_acquire)) {
-            m_impl->accepting.store(false, std::memory_order_release);
-            m_impl->draining.store(true, std::memory_order_release);
+        if (!m_impl->draining() &&
+            !m_impl->stopping()) {
+            m_impl->set_accepting(false);
+            m_impl->set_draining(true);
             m_impl->begin_shutdown_locked(deferred_destruction,
                                            completion_notifications);
         }
@@ -2222,8 +2289,8 @@ bool Scheduler::shutdown_for(
     if (!was_started) {
         {
             std::lock_guard<std::mutex> lock(m_impl->mutex);
-            m_impl->stopping.store(true, std::memory_order_release);
-            m_impl->draining.store(false, std::memory_order_release);
+            m_impl->set_stopping(true);
+            m_impl->set_draining(false);
             m_impl->collect_terminal_locked(deferred_destruction);
             for (auto& processor : m_impl->processors) {
                 processor.state.store(PState::kDead,
@@ -2285,8 +2352,8 @@ bool Scheduler::shutdown_for(
             completion_notifications.clear();
             return false;
         }
-        m_impl->stopping.store(true, std::memory_order_release);
-        m_impl->draining.store(false, std::memory_order_release);
+        m_impl->set_stopping(true);
+        m_impl->set_draining(false);
     }
     m_impl->stop_sysmon(true);
     m_impl->notify_all_workers();
@@ -2378,8 +2445,8 @@ void Scheduler::shutdown() {
 
 bool Scheduler::is_running() const noexcept {
     return m_impl && m_impl->started.load(std::memory_order_acquire) &&
-           !m_impl->draining.load(std::memory_order_acquire) &&
-           !m_impl->stopping.load(std::memory_order_acquire);
+           !m_impl->draining() &&
+           !m_impl->stopping();
 }
 
 
@@ -2555,10 +2622,10 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     const bool from_worker =
         current_scheduler() == this && t_processor_id < m_impl->processors.size();
     const bool drain_resume =
-        m_impl->draining.load(std::memory_order_acquire) &&
+        m_impl->draining() &&
         task->started() && task->cancellation_requested();
-    if ((!m_impl->accepting.load(std::memory_order_acquire) && !drain_resume) ||
-        m_impl->stopping.load(std::memory_order_acquire)) {
+    if ((!m_impl->accepting() && !drain_resume) ||
+        m_impl->stopping()) {
         bool notify = false;
         if (task->owned_by(m_impl->owner_token)) {
             task->request_cancel(false);
@@ -2670,8 +2737,8 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         {
             IncomingStripeLock incoming_lock(
                 m_impl->incoming_mutexes[incoming_stripe]);
-            if (m_impl->accepting.load(std::memory_order_acquire) &&
-                !m_impl->stopping.load(std::memory_order_acquire)) {
+            if (m_impl->accepting() &&
+                !m_impl->stopping()) {
                 m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
                 try {
                     m_impl->incoming_queues[incoming_stripe].emplace_back(task);
@@ -2719,8 +2786,8 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         }
     } else {
         std::unique_lock<std::mutex> admission_lock(m_impl->mutex);
-        if ((!m_impl->accepting.load(std::memory_order_acquire) && !drain_resume) ||
-            m_impl->stopping.load(std::memory_order_acquire)) {
+        if ((!m_impl->accepting() && !drain_resume) ||
+            m_impl->stopping()) {
             task->clear_queued();
             task->request_cancel(false);
             admission_lock.unlock();
@@ -2804,9 +2871,7 @@ bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
     if (!task || processor_id >= m_impl->processors.size()) {
         return false;
     }
-    if (!m_impl->accepting.load(std::memory_order_acquire) ||
-        m_impl->draining.load(std::memory_order_acquire) ||
-        m_impl->stopping.load(std::memory_order_acquire)) {
+    if (m_impl->accept_blocked()) {
         return false;
     }
     if (!task->try_mark_queued()) {
@@ -2818,9 +2883,7 @@ bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
     bool notify_worker = false;
     {
         std::lock_guard<std::mutex> queue_lock(processor.mutex);
-        if (!m_impl->accepting.load(std::memory_order_acquire) ||
-            m_impl->draining.load(std::memory_order_acquire) ||
-            m_impl->stopping.load(std::memory_order_acquire)) {
+        if (m_impl->accept_blocked()) {
             retry_regular_enqueue = true;
         } else {
             m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
@@ -2865,9 +2928,7 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
     // registry 和全局 admission。只使用 P 队列锁，避免每次 Fiber 切换
     // 都争用调度器总锁。shutdown 仍通过 draining/stopping 的二次检查与
     // P 队列锁建立一致的排空顺序。
-    if (!m_impl->accepting.load(std::memory_order_acquire) ||
-        m_impl->draining.load(std::memory_order_acquire) ||
-        m_impl->stopping.load(std::memory_order_acquire)) {
+    if (m_impl->accept_blocked()) {
         return enqueue(task);
     }
 
@@ -2876,9 +2937,7 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
     bool notify_worker = false;
     {
         std::lock_guard<std::mutex> queue_lock(processor.mutex);
-        if (!m_impl->accepting.load(std::memory_order_acquire) ||
-            m_impl->draining.load(std::memory_order_acquire) ||
-            m_impl->stopping.load(std::memory_order_acquire)) {
+        if (m_impl->accept_blocked()) {
             retry_regular_enqueue = true;
         } else if (task->try_mark_queued_from_worker()) {
             // 计数必须先于节点发布，否则另一个 worker 可能先 pop 节点
@@ -2918,7 +2977,7 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
 
 bool Scheduler::yield(const std::shared_ptr<Task>& task) {
     if (!task || current_scheduler() != this ||
-        current_task().get() != task.get() || task->cancellation_requested() ||
+        current_task_ptr() != task.get() || task->cancellation_requested() ||
         !task->mark_yielded_fast()) {
         return false;
     }
@@ -2950,13 +3009,11 @@ bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
     GO2CPP_DEBUG_EVENT(kParkEnter, task ? task->id() : 0,
                        static_cast<std::uint64_t>(SuspendReason::Park));
     if (!task || current_scheduler() != this ||
-        current_task().get() != task.get()) {
+        current_task_ptr() != task.get()) {
         GO2CPP_DEBUG_EVENT(kParkRejected, task ? task->id() : 0, 1);
         return false;
     }
-    if (m_impl->draining.load(std::memory_order_acquire) ||
-        m_impl->stopping.load(std::memory_order_acquire) ||
-        task->cancellation_requested()) {
+    if (m_impl->stop_requested() || task->cancellation_requested()) {
         GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 2);
         return false;
     }
@@ -2969,9 +3026,7 @@ bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
         GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 3);
         return false;
     }
-    if (m_impl->draining.load(std::memory_order_acquire) ||
-        m_impl->stopping.load(std::memory_order_acquire) ||
-        task->cancellation_requested()) {
+    if (m_impl->stop_requested() || task->cancellation_requested()) {
         (void)task->wake_for_wait();
         GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 2);
         return false;
@@ -2994,7 +3049,7 @@ bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
 /// @note 调用方必须已经在线性化等待队列中注册了唤醒节点。
 bool Scheduler::park_wait_for_cleanup(const std::shared_ptr<Task>& task) {
     if (!task || current_scheduler() != this ||
-        current_task().get() != task.get()) {
+        current_task_ptr() != task.get()) {
         GO2CPP_DEBUG_EVENT(kParkRejected, task ? task->id() : 0, 1);
         return false;
     }
@@ -3018,13 +3073,11 @@ bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
     GO2CPP_DEBUG_EVENT(kParkEnter, task ? task->id() : 0,
                        static_cast<std::uint64_t>(SuspendReason::Io));
     if (!task || current_scheduler() != this ||
-        current_task().get() != task.get()) {
+        current_task_ptr() != task.get()) {
         GO2CPP_DEBUG_EVENT(kParkRejected, task ? task->id() : 0, 1);
         return false;
     }
-    if (m_impl->draining.load(std::memory_order_acquire) ||
-        m_impl->stopping.load(std::memory_order_acquire) ||
-        task->cancellation_requested()) {
+    if (m_impl->stop_requested() || task->cancellation_requested()) {
         GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 2);
         return false;
     }
@@ -3037,9 +3090,7 @@ bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
         GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 3);
         return false;
     }
-    if (m_impl->draining.load(std::memory_order_acquire) ||
-        m_impl->stopping.load(std::memory_order_acquire) ||
-        task->cancellation_requested()) {
+    if (m_impl->stop_requested() || task->cancellation_requested()) {
         (void)task->wake_for_io();
         GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 2);
         return false;
@@ -3059,7 +3110,7 @@ bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
     GO2CPP_DEBUG_EVENT(kParkEnter, task ? task->id() : 0,
                        static_cast<std::uint64_t>(reason));
     if (!task || current_scheduler() != this ||
-        current_task().get() != task.get()) {
+        current_task_ptr() != task.get()) {
         GO2CPP_DEBUG_EVENT(kParkRejected, task ? task->id() : 0, 1);
         return false;
     }
@@ -3068,8 +3119,7 @@ bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
     ParkAction action = ParkAction::kRejected;
     {
         std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
-        if (m_impl->draining.load(std::memory_order_acquire) ||
-            m_impl->stopping.load(std::memory_order_acquire) ||
+        if (m_impl->stop_requested() ||
             task->cancellation_requested()) {
             GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 2);
             return false;
@@ -3100,9 +3150,24 @@ bool Scheduler::wake(const std::shared_ptr<Task>& task) {
 
 bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
     GO2CPP_DEBUG_EVENT(kWakeRequest, task ? task->id() : 0, 0);
-    if (!task || !m_impl || !task->owned_by(m_impl->owner_token)) {
+    if (!task || !m_impl) {
         return false;
     }
+#if !defined(NDEBUG)
+    // 调试构建保留完整的所有权复核，跨调度器误用会在测试期直接暴露。
+    if (!task->owned_by(m_impl->owner_token)) {
+        return false;
+    }
+#else
+    // release 快路径：`registered()` 为真说明该 G 走过
+    // `enqueue() -> prepare_enqueue()` 的 owner 绑定（`try_register()`
+    // 只在其成功之后调用），因此无需为一次复核再取
+    // `Task::m_transition_mutex`。未注册的 G（从未入队 / 已回收）仍走
+    // 完整校验，不会绕过所有权检查。
+    if (!task->registered() && !task->owned_by(m_impl->owner_token)) {
+        return false;
+    }
+#endif
     const auto action = task->wake_for_wait();
     if (action == WakeAction::kPending) {
         GO2CPP_DEBUG_EVENT(kWakePending, task->id(), 0);
@@ -3170,8 +3235,8 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
     bool published = false;
     {
         IncomingStripeLock lock(m_impl->incoming_mutexes[stripe]);
-        if (m_impl->accepting.load(std::memory_order_acquire) &&
-            !m_impl->stopping.load(std::memory_order_acquire)) {
+        if (m_impl->accepting() &&
+            !m_impl->stopping()) {
             m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
             try {
                 m_impl->incoming_queues[stripe].emplace_back(task);
@@ -3327,9 +3392,7 @@ bool Scheduler::wake_io_batch(
             ++end;
         }
         if (processor_id >= m_impl->processors.size() ||
-            !m_impl->accepting.load(std::memory_order_acquire) ||
-            m_impl->draining.load(std::memory_order_acquire) ||
-            m_impl->stopping.load(std::memory_order_acquire)) {
+            m_impl->accept_blocked()) {
             for (std::size_t item = index; item < end; ++item) {
                 fallback.push_back(pending[item].task);
             }
@@ -3342,9 +3405,7 @@ bool Scheduler::wake_io_batch(
         std::size_t published = 0;
         {
             std::lock_guard<std::mutex> queue_lock(processor.mutex);
-            if (!m_impl->accepting.load(std::memory_order_acquire) ||
-                m_impl->draining.load(std::memory_order_acquire) ||
-                m_impl->stopping.load(std::memory_order_acquire)) {
+            if (m_impl->accept_blocked()) {
                 for (std::size_t item = index; item < end; ++item) {
                     fallback.push_back(pending[item].task);
                 }
@@ -3396,9 +3457,24 @@ bool Scheduler::wake_io_batch(
 
 bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
     GO2CPP_DEBUG_EVENT(kWakeRequest, task ? task->id() : 0, 0);
-    if (!task || !task->owned_by(m_impl->owner_token)) {
+    if (!task) {
         return false;
     }
+#if !defined(NDEBUG)
+    // 调试构建保留完整的所有权复核，跨调度器误用会在测试期直接暴露。
+    if (!task->owned_by(m_impl->owner_token)) {
+        return false;
+    }
+#else
+    // release 快路径：`registered()` 为真说明该 G 走过
+    // `enqueue() -> prepare_enqueue()` 的 owner 绑定（`try_register()`
+    // 只在其成功之后调用），因此无需为一次复核再取
+    // `Task::m_transition_mutex`。未注册的 G（从未入队 / 已回收）仍走
+    // 完整校验，不会绕过所有权检查。
+    if (!task->registered() && !task->owned_by(m_impl->owner_token)) {
+        return false;
+    }
+#endif
     const auto action = task->wake_for_wait();
     if (action == WakeAction::kPending) {
         // The running G will consume the permit if it parks. It is not
@@ -3931,7 +4007,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         // 绝大多数 yield 回来的 G 都会回到原 P。本地队列由同一 P 的
         // worker 独占消费；只有本地为空时才进入需要全局 admission 锁的
         // 全局队列/窃取路径。
-        if (!m_impl->stopping.load(std::memory_order_acquire) &&
+        if (!m_impl->stopping() &&
             m_impl->running_workers.load(std::memory_order_acquire) != 0 &&
             m_impl->runnable.load(std::memory_order_acquire) >
                 m_impl->processors.size()) {
@@ -3958,10 +4034,10 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 }
             }
         }
-        if (task && m_impl->stopping.load(std::memory_order_acquire)) {
+        if (task && m_impl->stopping()) {
             task->request_cancel(false);
         }
-        if (!task && !m_impl->stopping.load(std::memory_order_acquire)) {
+        if (!task && !m_impl->stopping()) {
             // step3: 中路径——扫描 incoming 分条队列（跨线程投递入口）。
             // 每个 stripe 有自己的锁；先按任务类亲和匹配，再从 start 开始
             // 轮转扫全部 stripe，避免固定顺序造成饥饿。
@@ -4067,7 +4143,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 }
             }
         }
-        if (task && m_impl->stopping.load(std::memory_order_acquire)) {
+        if (task && m_impl->stopping()) {
             task->request_cancel(false);
         }
         if (!task) {
@@ -4087,7 +4163,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
 #else
             std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
 #endif
-            if (!m_impl->stopping.load(std::memory_order_acquire)) {
+            if (!m_impl->stopping()) {
                 const bool prefer_class =
                     machine->last_task_class.load(std::memory_order_relaxed) != 0 &&
                     machine->affinity_budget.load(std::memory_order_relaxed) != 0 &&
@@ -4417,7 +4493,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             }
             std::vector<std::shared_ptr<Task>> deferred_destruction;
             const bool draining =
-                m_impl->draining.load(std::memory_order_acquire);
+                m_impl->draining();
             const std::size_t collect_interval =
                 m_impl->config.terminal_collect_interval;
             if (draining) {
@@ -4488,7 +4564,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
                 // draining 中的全表回收推迟到存活计数归零（收尾完成点），
                 // 否则每消费一个 stale 节点都全表扫描会退化成 O(n²)。
-                if (!m_impl->draining.load(std::memory_order_acquire) ||
+                if (!m_impl->draining() ||
                     m_impl->live_tasks.load(std::memory_order_acquire) == 0) {
                     m_impl->collect_terminal_locked(deferred_destruction);
                 }
@@ -4508,7 +4584,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             m_impl->notify_all_workers();
         }
 
-        if (m_impl->stopping.load(std::memory_order_acquire)) {
+        if (m_impl->stopping()) {
             machine->state.store(MState::kStopping, std::memory_order_release);
             break;
         }
@@ -4528,7 +4604,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         // ------------------------------------------------------------------
         const Impl::IoIdlePoller* idle_poller =
             m_impl->io_poller.load(std::memory_order_acquire);
-        if (idle_poller != nullptr && !m_impl->draining.load(std::memory_order_acquire) &&
+        if (idle_poller != nullptr && !m_impl->draining() &&
             !m_impl->config.allow_idle_shrink &&
             (!machine->replacement ||
              m_impl->blocking_workers.load(std::memory_order_acquire) != 0)) {
@@ -4545,7 +4621,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             m_impl->io_waiting_workers.fetch_add(1, std::memory_order_release);
             const bool work_pending =
                 m_impl->runnable.load(std::memory_order_acquire) != 0 ||
-                m_impl->stopping.load(std::memory_order_acquire);
+                m_impl->stopping();
             int polled = 0;
             if (!work_pending) {
                 auto timeout_ms =
@@ -4632,7 +4708,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                                       : m_impl->config.idle_wait;
         const bool woke = m_impl->condition.wait_for(
             lock, idle_timeout, [this, replacement, idle_shrink] {
-                if (m_impl->stopping.load(std::memory_order_acquire) ||
+                if (m_impl->stopping() ||
                     m_impl->runnable.load(std::memory_order_acquire) != 0) {
                     return true;
                 }
@@ -4651,7 +4727,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         const auto blocking_now =
             m_impl->blocking_workers.load(std::memory_order_acquire);
         const bool stopping_now =
-            m_impl->stopping.load(std::memory_order_acquire);
+            m_impl->stopping();
         bool retire = false;
         if (!stopping_now && runnable_now == 0) {
             if (replacement && !idle_shrink) {
@@ -4692,7 +4768,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         }
         if (own_processor.active_machines.load(std::memory_order_relaxed) == 0) {
             own_processor.state.store(
-                m_impl->stopping.load(std::memory_order_acquire)
+                m_impl->stopping()
                     ? PState::kDead
                     : PState::kIdle,
                 std::memory_order_release);
