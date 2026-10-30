@@ -451,6 +451,34 @@ void BenchSpinMutexThreads(int threads) {
     (void)counter.load();
 }
 
+/// N 个线程并发 Add(1)/Done()（始终无等待者）：验证原子计数与
+/// 「无等待者时整条锁路径被跳过」的扩展性。
+void BenchWaitGroupAddDoneThreads(int threads) {
+    go2cpp::sync::WaitGroup wg;
+    SpinBarrier barrier(threads);
+    const long long per_thread = g_iterations / threads;
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(threads));
+    for (int t = 0; t < threads; ++t) {
+        workers.emplace_back([&] {
+            barrier.Wait();
+            for (long long i = 0; i < per_thread; ++i) {
+                wg.Add(1);
+                wg.Done();
+            }
+        });
+    }
+    const auto start = Clock::now();
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    const auto elapsed = Clock::now() - start;
+    const long long ops = per_thread * threads;
+    char name[64];
+    std::snprintf(name, sizeof(name), "wg.adddone.%dt", threads);
+    ReportThroughput(name, OpsPerSec(elapsed, ops), NsPer(elapsed, ops));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -458,6 +486,15 @@ int main(int argc, char** argv) {
         const long long parsed = std::atoll(argv[1]);
         if (parsed > 0) {
             g_iterations = parsed;
+        }
+    }
+    // `--no-rw`：跳过 RWMutex/SpinMutex 两段。sync 原语回归只需要
+    // Mutex/CV/WaitGroup；RWMutex 的改动属于另一条工作线，混进来只会
+    // 让本基准的耗时与结论都不可控。
+    bool skip_rw = false;
+    for (int i = 2; i < argc; ++i) {
+        if (std::string(argv[i]) == "--no-rw") {
+            skip_rw = true;
         }
     }
     std::printf("iterations per case: %lld\n", g_iterations);
@@ -474,7 +511,13 @@ int main(int argc, char** argv) {
 
     PrintSection("WaitGroup");
     BenchWaitGroupAddDone();
+    BenchWaitGroupAddDoneThreads(4);
+    BenchWaitGroupAddDoneThreads(16);
     BenchWaitGroupWakeup();
+
+    if (skip_rw) {
+        return 0;
+    }
 
     PrintSection("RWMutex");
     BenchRWMutexSingleThread();
