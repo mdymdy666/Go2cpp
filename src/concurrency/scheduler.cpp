@@ -208,21 +208,32 @@ struct LockStatGuard {
 std::atomic<GId> s_next_g_id{1};
 std::atomic<MId> s_next_m_id{1};
 
-thread_local Scheduler* t_scheduler = nullptr;
-thread_local std::shared_ptr<Task> t_task;
-thread_local MId t_machine_id = 0;
-thread_local PId t_processor_id = 0;
+// 热路径 thread_local 统一使用 initial-exec TLS 模型。共享库默认是
+// general-dynamic：每次访问都要调用 __tls_get_addr，而 park/wake/yield
+// 一次往返要读十几次（callgrind 基线里 __tls_get_addr 占 10.5% 指令）。
+// 调度器库在进程启动时随可执行文件加载（不是 dlopen 插件），
+// initial-exec 把访问退化成一条 fs 段读。
+#if defined(__GNUC__) || defined(__clang__)
+#define GO2CPP_SCHED_HOT_TLS __attribute__((tls_model("initial-exec")))
+#else
+#define GO2CPP_SCHED_HOT_TLS
+#endif
+
+thread_local Scheduler* t_scheduler GO2CPP_SCHED_HOT_TLS = nullptr;
+thread_local std::shared_ptr<Task> t_task GO2CPP_SCHED_HOT_TLS;
+thread_local MId t_machine_id GO2CPP_SCHED_HOT_TLS = 0;
+thread_local PId t_processor_id GO2CPP_SCHED_HOT_TLS = 0;
 // BlockingRegion is deliberately non-nestable: one M has one state
 // transition, and rejecting nested scopes avoids double accounting. The
 // machine id is retained so a misuse that lets a Fiber migrate before its
 // region is destroyed can still clear the original M's state.
-thread_local MId t_blocking_machine_id = 0;
+thread_local MId t_blocking_machine_id GO2CPP_SCHED_HOT_TLS = 0;
 
 /// @brief 当前线程是否正处在 worker 的 IO 空闲轮询里。
 /// @details poll 内部会处理就绪事件并把 G 投回本 P；投递者随后立刻 `continue`
 ///          回主循环取任务，因此不需要再唤醒别的 worker。只在
 ///          `requeue_from_worker`（本 P 投递）里短路，跨 P 投递照常通知。
-thread_local bool t_in_idle_poll = false;
+thread_local bool t_in_idle_poll GO2CPP_SCHED_HOT_TLS = false;
 
 /// @brief 在作用域内置位 `t_in_idle_poll` 的 RAII 守卫。
 struct IdlePollScope final {
@@ -245,7 +256,7 @@ struct IdlePollScope final {
 // 这里用线程局部深度把 incoming 登记为叶子锁；`enqueue()` 入口在深度非零时
 // fail-fast。正常路径的代价只是一次 TLS 读，而触发窗口极窄的死锁会变成
 // 可定位的显式失败。
-thread_local std::uint32_t t_incoming_lock_depth = 0;
+thread_local std::uint32_t t_incoming_lock_depth GO2CPP_SCHED_HOT_TLS = 0;
 
 /// @brief 持 incoming 条带锁并登记持锁深度；析构时先解锁再清深度。
 class IncomingStripeLock final {
@@ -295,6 +306,137 @@ std::int64_t milliseconds_to_ns(
     return milliseconds * scale;
 }
 
+
+/**
+ * @brief 每个 P 的本地可运行队列：256 槽有界 MPMC 环形队列。
+ *
+ * ## 来源
+ *
+ * 结构照抄 Go 1.3 `runtime/proc.c:2912-3027` 的 runq（Go 1.27 逐行同构）：
+ * `head` 由消费者用 CAS 抢占、`tail` 由生产者发布、每个槽用序号标记
+ * 可见性；满时 `push()` 返回 false，由调用方溢出到全局队列（对应
+ * `runqputslow`），窃取从 `head` 批量取（对应 `runqgrab`）。
+ *
+ * ## 与 Go 的差异（为什么 tail 也要 CAS）
+ *
+ * Go 的 runq 是「owner-only 单生产者 + CAS 多消费者」：写 tail 的只有该 P
+ * 的 owner M。Bento 的 P 没有唯一 owner（replacement M 可与基础 M 共享
+ * 同一个 P，外部唤醒也可能把 G 精确投递到目标 P），因此生产端同样可能
+ * 并发，`tail` 用 CAS 仲裁，得到标准的 Vyukov 有界 MPMC 队列。
+ *
+ * ## 不变量
+ *
+ * - 槽位在 `sequence == position` 时才可被生产者写入，`sequence ==
+ *   position + 1` 时才可被消费者读取；`sequence` 的 release/acquire 同时
+ *   承担 `task` 的发布；
+ * - 同一节点只会被一个消费者取走（CAS head 的唯一赢家）；
+ * - 元素是 `shared_ptr<Task>`：队列节点本身就是注册表之外的第二份强引用，
+ *   已取消的残留节点在出队前不会析构。
+ */
+class LocalRunQueue final {
+public:
+    static constexpr std::size_t kCapacity = 256;
+    static constexpr std::size_t kMask = kCapacity - 1;
+
+    LocalRunQueue() noexcept {
+        for (std::size_t i = 0; i < kCapacity; ++i) {
+            m_cells[i].sequence.store(i, std::memory_order_relaxed);
+        }
+    }
+    LocalRunQueue(const LocalRunQueue&) = delete;
+    LocalRunQueue& operator=(const LocalRunQueue&) = delete;
+
+    /// @brief 入队；队列满返回 false，调用方必须改投全局队列。
+    bool push(std::shared_ptr<Task> task) noexcept {
+        if (!task) {
+            return false;
+        }
+        std::size_t position = m_tail.load(std::memory_order_relaxed);
+        for (;;) {
+            Cell& cell = m_cells[position & kMask];
+            const std::size_t sequence =
+                cell.sequence.load(std::memory_order_acquire);
+            const auto difference =
+                static_cast<std::int64_t>(sequence) -
+                static_cast<std::int64_t>(position);
+            if (difference == 0) {
+                if (m_tail.compare_exchange_weak(position, position + 1,
+                                                 std::memory_order_relaxed,
+                                                 std::memory_order_relaxed)) {
+                    cell.task = std::move(task);
+                    cell.sequence.store(position + 1,
+                                        std::memory_order_release);
+                    return true;
+                }
+            } else if (difference < 0) {
+                return false;  // 满
+            } else {
+                position = m_tail.load(std::memory_order_relaxed);
+            }
+        }
+    }
+
+    /// @brief 出队；队列空返回空指针。
+    std::shared_ptr<Task> pop() noexcept {
+        std::size_t position = m_head.load(std::memory_order_relaxed);
+        for (;;) {
+            Cell& cell = m_cells[position & kMask];
+            const std::size_t sequence =
+                cell.sequence.load(std::memory_order_acquire);
+            const auto difference =
+                static_cast<std::int64_t>(sequence) -
+                static_cast<std::int64_t>(position + 1);
+            if (difference == 0) {
+                if (m_head.compare_exchange_weak(position, position + 1,
+                                                 std::memory_order_relaxed,
+                                                 std::memory_order_relaxed)) {
+                    auto task = std::move(cell.task);
+                    cell.sequence.store(position + kMask + 1,
+                                        std::memory_order_release);
+                    return task;
+                }
+            } else if (difference < 0) {
+                return {};
+            } else {
+                position = m_head.load(std::memory_order_relaxed);
+            }
+        }
+    }
+
+    /// @brief 近似长度；只在快照/超限判定里使用，不参与正确性。
+    std::size_t size() const noexcept {
+        const auto head = m_head.load(std::memory_order_acquire);
+        const auto tail = m_tail.load(std::memory_order_acquire);
+        return tail >= head ? static_cast<std::size_t>(tail - head) : 0U;
+    }
+
+    bool empty() const noexcept { return size() == 0U; }
+
+    /// @brief 批量窃取（Go runqgrab 的一次偷一半）；返回实际取到的个数。
+    std::size_t steal(std::shared_ptr<Task>* out, std::size_t max) noexcept {
+        std::size_t count = 0;
+        while (count < max) {
+            auto task = pop();
+            if (!task) {
+                break;
+            }
+            out[count++] = std::move(task);
+        }
+        return count;
+    }
+
+private:
+    struct Cell {
+        std::atomic<std::size_t> sequence{0};
+        std::shared_ptr<Task> task;
+    };
+
+    // 槽位数组与两个游标分开缓存行，避免生产者/消费者互相拖拽同一行。
+    alignas(64) std::array<Cell, kCapacity> m_cells{};
+    alignas(64) std::atomic<std::size_t> m_head{0};
+    alignas(64) std::atomic<std::size_t> m_tail{0};
+};
+
 }  // namespace
 
 // Tasks retain only a weak handle. This short gate excludes Scheduler
@@ -312,12 +454,61 @@ Task::Task(Function function, TaskOptions options)
     : m_id(s_next_g_id.fetch_add(1, std::memory_order_relaxed)),
       m_function(std::move(function)),
       m_options(options),
-      m_state(GState::kNew) {}
+      m_state_word(static_cast<std::uint32_t>(GState::kNew)) {}
 
 Task::~Task() = default;
 
+
+// ---------------------------------------------------------------------------
+// 打包状态字（P0-1）
+// ---------------------------------------------------------------------------
+//
+// 旧实现用 `m_transition_mutex` 把「状态迁移」和「唤醒令牌」放在同一个
+// 临界区里；两个字段拆成独立原子后，park 与 wake 之间存在不可消除的
+// 窗口（wake 读到 Running → park 提交 Waiting → wake 置令牌，令牌永远
+// 无人消费）。这里把两者压进同一个 32 位字，所有迁移都用 CAS 竞争这个
+// 字，令牌的发布/消费与状态迁移由同一条原子指令线性化。
+void Task::StoreStateValue(GState state, std::memory_order order) noexcept {
+    std::uint32_t word = m_state_word.load(std::memory_order_relaxed);
+    for (;;) {
+        const std::uint32_t desired =
+            (word & ~kStateMask) | static_cast<std::uint32_t>(state);
+        if (m_state_word.compare_exchange_weak(word, desired, order,
+                                               std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+void Task::StoreWakePending(bool pending,
+                            std::memory_order order) noexcept {
+    std::uint32_t word = m_state_word.load(std::memory_order_relaxed);
+    for (;;) {
+        const std::uint32_t desired =
+            pending ? (word | kWakePendingBit) : (word & ~kWakePendingBit);
+        if (m_state_word.compare_exchange_weak(word, desired, order,
+                                               std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+bool Task::ExchangeWakePending(bool pending,
+                               std::memory_order order) noexcept {
+    std::uint32_t word = m_state_word.load(std::memory_order_relaxed);
+    for (;;) {
+        const bool previous = (word & kWakePendingBit) != 0U;
+        const std::uint32_t desired =
+            pending ? (word | kWakePendingBit) : (word & ~kWakePendingBit);
+        if (m_state_word.compare_exchange_weak(word, desired, order,
+                                               std::memory_order_relaxed)) {
+            return previous;
+        }
+    }
+}
+
 Task::Function Task::release_callable() noexcept {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
     return std::move(m_function);
 }
 
@@ -326,7 +517,7 @@ GId Task::id() const noexcept {
 }
 
 GState Task::state() const noexcept {
-    return m_state.load(std::memory_order_acquire);
+    return StateValue(std::memory_order_acquire);
 }
 
 bool Task::queued() const noexcept {
@@ -398,8 +589,8 @@ void Task::notify_terminal() noexcept {
 }
 
 bool Task::try_mark_queued() noexcept {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    if (m_state.load(std::memory_order_relaxed) != GState::kRunnable ||
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+    if (StateValue(std::memory_order_relaxed) != GState::kRunnable ||
         m_execution_claim.load(std::memory_order_relaxed) ||
         m_queued.load(std::memory_order_relaxed)) {
         return false;
@@ -417,8 +608,8 @@ bool Task::try_mark_queued_from_worker() noexcept {
     // 的 reservation，最终 G 停在 Runnable 且没有任何队列节点，表现为
     // 「fiber 唤醒丢失」：worker 全部空闲、队列全空、被唤醒的 G 永不运行。
     // 该函数只在本地回队/IO 批量唤醒路径调用，未竞争时加锁开销可忽略。
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    if (m_state.load(std::memory_order_relaxed) != GState::kRunnable ||
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+    if (StateValue(std::memory_order_relaxed) != GState::kRunnable ||
         m_execution_claim.load(std::memory_order_relaxed) ||
         m_queued.load(std::memory_order_relaxed)) {
         return false;
@@ -428,7 +619,7 @@ bool Task::try_mark_queued_from_worker() noexcept {
 }
 
 void Task::clear_queued() noexcept {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
     m_queued.store(false, std::memory_order_release);
 }
 
@@ -441,13 +632,13 @@ bool Task::consume_deferred_enqueue() noexcept {
 }
 
 void Task::request_wake() noexcept {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    m_wake_pending.store(true, std::memory_order_release);
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+    StoreWakePending(true, std::memory_order_release);
 }
 
 bool Task::consume_wake() noexcept {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    return m_wake_pending.exchange(false, std::memory_order_acq_rel);
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+    return ExchangeWakePending(false, std::memory_order_acq_rel);
 }
 
 bool Task::try_register() noexcept {
@@ -465,7 +656,7 @@ bool Task::bind_owner(const std::shared_ptr<const void>& owner) noexcept {
     if (!owner) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
     if (!m_owner_anchor) {
         m_owner_anchor = owner;
         return true;
@@ -477,13 +668,13 @@ bool Task::owned_by(const std::shared_ptr<const void>& owner) const noexcept {
     if (!owner) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
     return m_owner_anchor && m_owner_anchor.get() == owner.get();
 }
 
 void Task::bind_cancellation_gate(
     const std::shared_ptr<TaskCancellationGate>& gate) noexcept {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
     m_cancellation_gate = gate;
 }
 
@@ -494,16 +685,16 @@ bool Task::prepare_enqueue(
     if (!owner || !gate) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
     if (!m_owner_anchor) {
         m_owner_anchor = owner;
     } else if (m_owner_anchor.get() != owner.get()) {
         return false;
     }
     m_cancellation_gate = gate;
-    const auto state = m_state.load(std::memory_order_relaxed);
+    const auto state = StateValue(std::memory_order_relaxed);
     if (state == GState::kNew) {
-        m_state.store(GState::kRunnable, std::memory_order_release);
+        StoreStateValue(GState::kRunnable, std::memory_order_release);
     } else if (state != GState::kRunnable) {
         return false;
     }
@@ -542,20 +733,20 @@ void Task::release_live_counter_locked() noexcept {
 }
 
 bool Task::promote_new() noexcept {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    if (m_state.load(std::memory_order_relaxed) != GState::kNew) {
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+    if (StateValue(std::memory_order_relaxed) != GState::kNew) {
         return false;
     }
-    m_state.store(GState::kRunnable, std::memory_order_release);
+    StoreStateValue(GState::kRunnable, std::memory_order_release);
     return true;
 }
 
 WakeAction Task::wake_for_scheduler() noexcept {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    const auto state = m_state.load(std::memory_order_relaxed);
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+    const auto state = StateValue(std::memory_order_relaxed);
     if (state == GState::kWaiting) {
-        m_wake_pending.store(false, std::memory_order_relaxed);
-        m_state.store(GState::kRunnable, std::memory_order_release);
+        StoreWakePending(false, std::memory_order_relaxed);
+        StoreStateValue(GState::kRunnable, std::memory_order_release);
         if (m_execution_claim.load(std::memory_order_relaxed)) {
             // park() changed the logical state before the cooperative callable
             // returned. Let the owning worker publish the next run only after
@@ -566,7 +757,7 @@ WakeAction Task::wake_for_scheduler() noexcept {
         return WakeAction::kEnqueue;
     }
     if (state == GState::kRunning) {
-        m_wake_pending.store(true, std::memory_order_release);
+        StoreWakePending(true, std::memory_order_release);
         return WakeAction::kPending;
     }
     return WakeAction::kRejected;
@@ -577,27 +768,47 @@ WakeAction Task::wake_for_io() noexcept {
 }
 
 WakeAction Task::wake_for_wait() noexcept {
-    // 与 park_for_scheduler() 共用转换锁。仅依赖原子状态不足以保护
-    // wake_pending：park 可能先读到 Running 和 pending=false，随后 wake
-    // 发布 pending=true，而 park 再把状态写成 Waiting，最终留下无人入队
-    // 的 G。锁内完成状态转换和 permit 发布，确保 wake 要么被 park 消耗，
-    // 要么观察到 Waiting 并负责将 G 转回 Runnable。
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    const GState state = m_state.load(std::memory_order_relaxed);
-    if (state == GState::kWaiting) {
-        m_wake_pending.store(false, std::memory_order_release);
-        m_state.store(GState::kRunnable, std::memory_order_release);
-        if (m_execution_claim.load(std::memory_order_acquire)) {
-            m_deferred_enqueue.store(true, std::memory_order_release);
+    return wake_for_wait_impl(false);
+}
+
+WakeAction Task::wake_for_wait_reserve() noexcept {
+    return wake_for_wait_impl(true);
+}
+
+WakeAction Task::wake_for_wait_impl(bool reserve_queue) noexcept {
+    // 无锁 CAS 循环：状态与令牌在同一个 32 位字里，wake 与 park 各自用
+    // CAS 竞争同一个字，不会出现「令牌已发布但挂起已提交」的窗口。
+    for (;;) {
+        std::uint32_t word = m_state_word.load(std::memory_order_acquire);
+        const GState state = StateOfWord(word);
+        if (state == GState::kWaiting) {
+            // 目标字不带令牌位：转 Runnable 的同时清掉旧令牌。
+            if (!m_state_word.compare_exchange_strong(
+                    word, static_cast<std::uint32_t>(GState::kRunnable),
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                continue;
+            }
+            if (m_execution_claim.load(std::memory_order_acquire)) {
+                m_deferred_enqueue.store(true, std::memory_order_release);
+                return WakeAction::kPending;
+            }
+            if (reserve_queue) {
+                // 状态 CAS 已是唯一线性化点；第二个唤醒者读到 Runnable
+                // 会返回 kRejected，不会重复占位。
+                m_queued.store(true, std::memory_order_release);
+            }
+            return WakeAction::kEnqueue;
+        }
+        if (state == GState::kRunning) {
+            if (!m_state_word.compare_exchange_strong(
+                    word, word | kWakePendingBit,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                continue;
+            }
             return WakeAction::kPending;
         }
-        return WakeAction::kEnqueue;
+        return WakeAction::kRejected;
     }
-    if (state == GState::kRunning) {
-        m_wake_pending.store(true, std::memory_order_release);
-        return WakeAction::kPending;
-    }
-    return WakeAction::kRejected;
 }
 
 /**
@@ -618,12 +829,12 @@ WakeAction Task::wake_for_wait() noexcept {
  * step1. **契约检查**（必须在状态转换之前）：若调用者确实是当前 G，检查
  *        它是否在 `SpinMutex` 临界区（`no_park_depth`，禁止）或持有普通
  *        `Mutex`（`held_mutexes`，允许但记日志）；
- * step2. 取 `m_transition_mutex`——状态转换与 `wake_pending` 的消费必须在
- *        同一临界区内，否则「先通知后挂起」会丢唤醒；
+ * step2. **无锁 CAS**：状态与唤醒令牌打包在同一个 32 位字里，不需要锁；
  * step3. 校验状态：不是 `kRunning` 就返回 `kRejected`（已被取消/已死）；
- * step4. **消费唤醒令牌**：`m_wake_pending.exchange(false)` 为真说明挂起前
- *        已经有人唤醒过，此时返回 `kRequeued`，让调用方留在当前执行流；
- * step5. 提交 `kWaiting` 并返回 `kParked`。
+ * step4. 字的 bit8 为真说明挂起前已经有人唤醒过：清令牌并返回 `kRequeued`，
+ *        让调用方留在当前执行流；
+ * step5. 整个字（Running 且无令牌）匹配时 CAS 成 `kWaiting` 并返回 `kParked`；
+ *        CAS 失败说明并发的 wake 改了字，重读后按新状态处理。
  *
  * ## 并发/失败语义
  *
@@ -632,8 +843,8 @@ WakeAction Task::wake_for_wait() noexcept {
  * - 契约检查只在该 G 确实是当前 G 时执行——`park_for_scheduler` 是公开接口，
  *   外部线程误调时不应把别的 G 的计数算到这次调用头上；
  * - `noexcept`：本函数不分配、不加可能抛出的锁，失败只能通过返回值表达；
- * - **不变量**：返回 `kParked` 后 `m_state == kWaiting` 且 `m_wake_pending == false`；
- *   返回 `kRequeued` 后 `m_state` 仍为 `kRunning` 且令牌已被消费。
+ * - **不变量**：返回 `kParked` 后状态字 == `kWaiting` 且令牌位为 0；
+ *   返回 `kRequeued` 后状态字仍为 `kRunning` 且令牌位已被清。
  */
 ParkAction Task::park_for_scheduler() noexcept {
     // step1: 契约检查——必须在状态转换之前（返回 kParked 后就离开执行流了）。
@@ -650,29 +861,44 @@ ParkAction Task::park_for_scheduler() noexcept {
             ReportParkWhileHoldingMutex(*this);
         }
     }
-    // step2: 状态转换与令牌消费必须在同一临界区内，否则会丢唤醒。
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    // step3: 只有 kRunning 才能 park；否则说明已被取消或已终态。
-    if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
-        return ParkAction::kRejected;
+    // step2: 无锁提交。状态与唤醒令牌打包在同一个 32 位字里：
+    //        「转 Waiting」的 CAS 要求整个字（Running 且无令牌）都匹配。
+    //        并发 wake 只有两种可能——先把令牌位置位（本 CAS 失败，重试后
+    //        消费令牌返回 kRequeued），或在本 CAS 之后看到 Waiting 并负责
+    //        把 G 转回 Runnable；不存在「令牌落地但没人消费」的窗口。
+    for (;;) {
+        const std::uint32_t word =
+            m_state_word.load(std::memory_order_acquire);
+        // step3: 只有 kRunning 才能 park；否则说明已被取消或已终态。
+        if (StateOfWord(word) != GState::kRunning) {
+            return ParkAction::kRejected;
+        }
+        // step4: 挂起前已收到唤醒 → 清令牌并留在当前执行流（kRequeued）。
+        if ((word & kWakePendingBit) != 0U) {
+            std::uint32_t expected = word;
+            if (m_state_word.compare_exchange_strong(
+                    expected, word & ~kWakePendingBit,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                return ParkAction::kRequeued;
+            }
+            continue;
+        }
+        // step5: 提交挂起（目标字不含令牌位）。
+        std::uint32_t expected = word;
+        if (m_state_word.compare_exchange_strong(
+                expected, static_cast<std::uint32_t>(GState::kWaiting),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return ParkAction::kParked;
+        }
     }
-    // step4: 挂起前已收到唤醒 → 消费令牌并留在当前执行流（kRequeued）。
-    if (m_wake_pending.exchange(false, std::memory_order_acq_rel)) {
-        // Fiber 提交挂起前已经收到唤醒。消费该令牌并留在当前执行流，
-        // 避免先通知后挂起造成丢失唤醒。
-        return ParkAction::kRequeued;
-    }
-    // step5: 提交挂起。
-    m_state.store(GState::kWaiting, std::memory_order_release);
-    return ParkAction::kParked;
 }
 
 
 bool Task::try_mark_running() {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
     if (!m_queued.load(std::memory_order_relaxed) ||
         m_execution_claim.load(std::memory_order_relaxed) ||
-        m_state.load(std::memory_order_relaxed) != GState::kRunnable) {
+        StateValue(std::memory_order_relaxed) != GState::kRunnable) {
         return false;
     }
     // Dequeue reservation and the runnable -> running transition are one
@@ -680,58 +906,88 @@ bool Task::try_mark_running() {
     // between these updates.
     m_queued.store(false, std::memory_order_relaxed);
     m_execution_claim.store(true, std::memory_order_relaxed);
-    m_state.store(GState::kRunning, std::memory_order_release);
+    StoreStateValue(GState::kRunning, std::memory_order_release);
     return true;
 }
 
 
+bool Task::claim_from_queue() noexcept {
+    // dequeue 即 claim：队列节点由 pop 者独占，因此不需要再取转换锁。
+    // 顺序很重要——先抢 execution_claim（此后外部 try_mark_queued 会因
+    // claim 为 true 而拒绝），再清 queued，最后推进状态；三步都用原子
+    // 操作，任意并发方看到的都是「已有执行者」或「尚未出队」之一。
+    // 只做一次 CAS：Runnable -> Running 本身就是执行权的唯一仲裁点。
+    // 在 CAS 成功之前 m_queued 仍为 true，外部 try_mark_queued 会被
+    // 「已排队」拒绝；CAS 成功后再发布 execution_claim 并清 queued，
+    // 这个窗口里外部看到的仍是「已排队 + Running」，不会重复入队。
+    // （先抢 claim 再改状态要多付一次 RMW，实测在 1P2M 的 CV 往返上
+    //   每次切换多 ~8ns，因此合并成单 CAS。）
+    for (;;) {
+        std::uint32_t word = m_state_word.load(std::memory_order_acquire);
+        if (StateOfWord(word) != GState::kRunnable) {
+            return false;
+        }
+        if (m_state_word.compare_exchange_strong(
+                word, static_cast<std::uint32_t>(GState::kRunning),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            m_queued.store(false, std::memory_order_release);
+            m_execution_claim.store(true, std::memory_order_release);
+            return true;
+        }
+    }
+}
+
 bool Task::mark_runnable() {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    if (m_state.load(std::memory_order_relaxed) != GState::kWaiting) {
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+    if (StateValue(std::memory_order_relaxed) != GState::kWaiting) {
         return false;
     }
-    m_state.store(GState::kRunnable, std::memory_order_release);
-    m_wake_pending.store(false, std::memory_order_relaxed);
+    StoreStateValue(GState::kRunnable, std::memory_order_release);
+    StoreWakePending(false, std::memory_order_relaxed);
     return true;
 }
 
 bool Task::mark_yielded() {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+    if (StateValue(std::memory_order_relaxed) != GState::kRunning) {
         return false;
     }
     // A wake received while the G was running has been superseded by the
     // explicit yield: the G is already being requeued and must not consume
     // that old token on a later park.
-    m_state.store(GState::kRunnable, std::memory_order_release);
-    m_wake_pending.store(false, std::memory_order_release);
+    StoreStateValue(GState::kRunnable, std::memory_order_release);
+    StoreWakePending(false, std::memory_order_release);
     return true;
 }
 
 bool Task::mark_yielded_fast() noexcept {
-    GState expected = GState::kRunning;
-    if (!m_state.compare_exchange_strong(expected, GState::kRunnable,
-                                         std::memory_order_acq_rel,
-                                         std::memory_order_acquire)) {
-        return false;
+    for (;;) {
+        std::uint32_t word = m_state_word.load(std::memory_order_acquire);
+        if (StateOfWord(word) != GState::kRunning) {
+            return false;
+        }
+        // yield 明确放弃旧令牌：G 已经在回队，不应在下次 park 消费它。
+        if (m_state_word.compare_exchange_strong(
+                word, static_cast<std::uint32_t>(GState::kRunnable),
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return true;
+        }
     }
-    m_wake_pending.store(false, std::memory_order_release);
-    return true;
 }
 
 bool Task::mark_waiting() {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+    if (StateValue(std::memory_order_relaxed) != GState::kRunning) {
         return false;
     }
-    m_state.store(GState::kWaiting, std::memory_order_release);
+    StoreStateValue(GState::kWaiting, std::memory_order_release);
     return true;
 }
 
 bool Task::cancel() {
     std::shared_ptr<TaskCancellationGate> gate;
     {
-        std::lock_guard<std::mutex> lock(m_transition_mutex);
+        std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
         gate = m_cancellation_gate.lock();
     }
     const auto self = weak_from_this().lock();
@@ -747,8 +1003,8 @@ bool Task::cancel() {
 bool Task::request_cancel(bool notify) noexcept {
     bool became_terminal = false;
     {
-        std::lock_guard<std::mutex> lock(m_transition_mutex);
-        const auto state = m_state.load(std::memory_order_relaxed);
+        std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+        const auto state = StateValue(std::memory_order_relaxed);
         if (state == GState::kDead || state == GState::kCancelled ||
             state == GState::kFailed) {
             return false;
@@ -761,12 +1017,12 @@ bool Task::request_cancel(bool notify) noexcept {
         // stack cleanup finishes normally. Only an unstarted G is terminal immediately.
         if (!m_started.load(std::memory_order_relaxed) &&
             !m_execution_claim.load(std::memory_order_relaxed)) {
-            m_state.store(GState::kCancelled, std::memory_order_release);
+            StoreStateValue(GState::kCancelled, std::memory_order_release);
             m_queued.store(false, std::memory_order_release);
             release_live_counter_locked();
             became_terminal = true;
         }
-        m_wake_pending.store(false, std::memory_order_release);
+        StoreWakePending(false, std::memory_order_release);
         if (became_terminal) {
             m_deferred_enqueue.store(false, std::memory_order_release);
         }
@@ -778,8 +1034,8 @@ bool Task::request_cancel(bool notify) noexcept {
 }
 
 bool Task::resume_after_failed_park() noexcept {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    const GState state = m_state.load(std::memory_order_relaxed);
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+    const GState state = StateValue(std::memory_order_relaxed);
     // 只有"执行权确实还握在当前执行流里"时才能声明回 Running。
     if (!m_execution_claim.load(std::memory_order_relaxed)) {
         return false;
@@ -793,30 +1049,39 @@ bool Task::resume_after_failed_park() noexcept {
     if (state != GState::kWaiting && state != GState::kRunnable) {
         return false;
     }
-    m_state.store(GState::kRunning, std::memory_order_release);
+    StoreStateValue(GState::kRunning, std::memory_order_release);
     m_deferred_enqueue.store(false, std::memory_order_relaxed);
-    m_wake_pending.store(false, std::memory_order_relaxed);
+    StoreWakePending(false, std::memory_order_relaxed);
     return true;
 }
 
 bool Task::recover_orphan_running() noexcept {
-    std::lock_guard<std::mutex> lock(m_transition_mutex);
-    if (m_state.load(std::memory_order_relaxed) != GState::kRunning) {
+    // 热路径快检：run() 正常返回后状态是 kWaiting（park）或 kRunnable
+    // （yield），既不是 kRunning 也就无需进入临界区。只有真实出现
+    // 「run 已返回但仍停在 kRunning」的异常窗口才需要加锁复核。
+    if (StateValue(std::memory_order_acquire) != GState::kRunning) {
+        return false;
+    }
+    std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+    if (StateValue(std::memory_order_relaxed) != GState::kRunning) {
         return false;
     }
     if (m_execution_claim.load(std::memory_order_relaxed)) {
         // 仍有执行者持有执行权：这不是孤儿，不能抢。
         return false;
     }
-    m_state.store(GState::kRunnable, std::memory_order_release);
+    StoreStateValue(GState::kRunnable, std::memory_order_release);
+    // 孤儿 Running 可能残留一个「运行期间收到」的唤醒令牌；G 重新入队
+    // 后不应在下次 park 消费它，否则会把一次普通挂起误判成已唤醒。
+    StoreWakePending(false, std::memory_order_release);
     m_deferred_enqueue.store(true, std::memory_order_release);
     return true;
 }
 
 bool Task::cancel_if_runnable_unqueued() noexcept {
     {
-        std::lock_guard<std::mutex> lock(m_transition_mutex);
-        if (m_state.load(std::memory_order_relaxed) != GState::kRunnable ||
+        std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+        if (StateValue(std::memory_order_relaxed) != GState::kRunnable ||
             m_queued.load(std::memory_order_relaxed) ||
             m_execution_claim.load(std::memory_order_relaxed)) {
             return false;
@@ -828,8 +1093,8 @@ bool Task::cancel_if_runnable_unqueued() noexcept {
             return false;
         }
         m_cancel_requested.store(true, std::memory_order_release);
-        m_state.store(GState::kCancelled, std::memory_order_release);
-        m_wake_pending.store(false, std::memory_order_relaxed);
+        StoreStateValue(GState::kCancelled, std::memory_order_release);
+        StoreWakePending(false, std::memory_order_relaxed);
         m_deferred_enqueue.store(false, std::memory_order_relaxed);
         release_live_counter_locked();
     }
@@ -881,22 +1146,21 @@ void Task::run() {
         // 过程中（run_claim 尚未释放）。本次执行权作废，必须把 G 交回可
         // 运行状态：否则它会永久停在 kRunning 且无人认领，
         // Scheduler::shutdown() 将永远等不到它的终态。
-        std::lock_guard<std::mutex> lock(m_transition_mutex);
-        if (m_state.load(std::memory_order_relaxed) == GState::kRunning) {
-            m_state.store(GState::kRunnable, std::memory_order_release);
+        std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+        if (StateValue(std::memory_order_relaxed) == GState::kRunning) {
+            StoreStateValue(GState::kRunnable, std::memory_order_release);
             m_deferred_enqueue.store(true, std::memory_order_release);
         }
         m_execution_claim.store(false, std::memory_order_release);
         return;
     }
 
-    Fiber* fiber = nullptr;
+    // 热路径：已发布的 Fiber 指针不再取 m_transition_mutex。写侧
+    // （首次创建、终态回收）始终持锁并 release 发布，执行权由
+    // m_run_claim 串行化，因此这里 acquire 读到的是稳定指针。
+    Fiber* fiber = m_fiber_ptr.load(std::memory_order_acquire);
     // 本次 run() 是否刚刚创建了执行栈：用于区分「首次启动」与「再次恢复」。
     bool created_fiber_now = false;
-    {
-        std::lock_guard<std::mutex> lock(m_transition_mutex);
-        fiber = m_fiber.get();
-    }
     if (fiber == nullptr) {
         try {
             const auto stack_size = m_options.stack_size == 0
@@ -919,9 +1183,10 @@ void Task::run() {
                 stack_size, m_options.fiber_bin_capacity,
                 stack_reserve_size, m_options.stack_growable);
             {
-                std::lock_guard<std::mutex> lock(m_transition_mutex);
+                std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
                 if (!m_fiber) {
                     m_fiber = std::move(created_fiber);
+                    m_fiber_ptr.store(m_fiber.get(), std::memory_order_release);
                     m_started.store(true, std::memory_order_release);
                     created_fiber_now = true;
                 }
@@ -934,8 +1199,8 @@ void Task::run() {
                 m_failure = error;
             }
             {
-                std::lock_guard<std::mutex> lock(m_transition_mutex);
-                m_state.store(GState::kFailed, std::memory_order_release);
+                std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
+                StoreStateValue(GState::kFailed, std::memory_order_release);
                 release_live_counter_locked();
                 m_execution_claim.store(false, std::memory_order_release);
                 m_run_claim.store(false, std::memory_order_release);
@@ -996,11 +1261,11 @@ void Task::run() {
     Function completed_function;
     std::unique_ptr<Fiber> completed_fiber;
     {
-        std::lock_guard<std::mutex> lock(m_transition_mutex);
+        std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
         if (!resumed || fiber_state == FiberState::Completed ||
             fiber_state == FiberState::Failed) {
             m_deferred_enqueue.store(false, std::memory_order_relaxed);
-            m_wake_pending.store(false, std::memory_order_relaxed);
+            StoreWakePending(false, std::memory_order_relaxed);
             if (fiber_failure) {
                 std::lock_guard<std::mutex> failure_lock(m_failure_mutex);
                 m_failure = fiber_failure;
@@ -1011,7 +1276,7 @@ void Task::run() {
                                                    std::memory_order_relaxed)
                                                    ? GState::kCancelled
                                                    : GState::kDead);
-            m_state.store(terminal_state, std::memory_order_release);
+            StoreStateValue(terminal_state, std::memory_order_release);
             release_live_counter_locked();
             // A cancelled-before-first-resume Fiber can still retain the
             // callable. Move it out while updating state, then destroy it
@@ -1023,28 +1288,46 @@ void Task::run() {
             // retains the public Task handle after completion; retaining a
             // Task must not retain an already-finished G stack.
             completed_fiber = std::move(m_fiber);
-        } else if (fiber_state == FiberState::Suspended &&
-                   m_state.load(std::memory_order_relaxed) ==
-                       GState::kRunning) {
+            m_fiber_ptr.store(nullptr, std::memory_order_release);
+        } else if (fiber_state == FiberState::Suspended) {
             // Direct Fiber::Suspend calls are supported for advanced users.
-            // Scheduler helpers set the state before switching, while this
-            // fallback maps a raw suspension to the matching queue state.
-            // A cancellation/wake can race with the context switch before
-            // the Fiber has published Suspended. In that window the notifier
-            // records a pending permit while the state is still Running;
-            // never overwrite that permit with Waiting or shutdown can strand
-            // the G forever.
-            const bool pending_wake =
-                m_wake_pending.load(std::memory_order_relaxed);
-            const bool cancellation_requested =
-                m_cancel_requested.load(std::memory_order_relaxed);
-            if (fiber->suspend_reason() == SuspendReason::Yield ||
-                pending_wake || cancellation_requested) {
-                m_state.store(GState::kRunnable, std::memory_order_release);
-                m_deferred_enqueue.store(true, std::memory_order_release);
-                m_wake_pending.store(false, std::memory_order_release);
-            } else {
-                m_state.store(GState::kWaiting, std::memory_order_release);
+            // Scheduler helpers set the state before switching；这里只处理
+            // 「裸 Suspend」的回退映射。
+            //
+            // 状态与令牌必须来自同一次字读取：wake 现在不再取转换锁，
+            // 若分两次读 state/pending，会漏掉「读到 Running 之后才置位」
+            // 的令牌，把 G 留在 Waiting 且无人入队。CAS 失败说明并发方
+            // 已经迁移了状态，重读后按新状态处理。
+            for (;;) {
+                std::uint32_t word =
+                    m_state_word.load(std::memory_order_acquire);
+                if (StateOfWord(word) != GState::kRunning) {
+                    break;
+                }
+                const bool pending_wake = (word & kWakePendingBit) != 0U;
+                const bool cancellation_requested =
+                    m_cancel_requested.load(std::memory_order_relaxed);
+                const bool requeue_now =
+                    fiber->suspend_reason() == SuspendReason::Yield ||
+                    pending_wake || cancellation_requested;
+                if (!requeue_now) {
+                    // 目标字不带令牌位：提交 Waiting 的同时清掉旧令牌。
+                    if (m_state_word.compare_exchange_strong(
+                            word,
+                            static_cast<std::uint32_t>(GState::kWaiting),
+                            std::memory_order_acq_rel,
+                            std::memory_order_acquire)) {
+                        break;
+                    }
+                    continue;
+                }
+                if (m_state_word.compare_exchange_strong(
+                        word, static_cast<std::uint32_t>(GState::kRunnable),
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire)) {
+                    m_deferred_enqueue.store(true, std::memory_order_release);
+                    break;
+                }
             }
         }
         m_execution_claim.store(false, std::memory_order_release);
@@ -1056,7 +1339,7 @@ void Task::run() {
         m_run_claim.store(false, std::memory_order_release);
     }
     if (became_terminal) {
-        const GState final_state = m_state.load(std::memory_order_relaxed);
+        const GState final_state = StateValue(std::memory_order_relaxed);
         if (final_state == GState::kFailed) {
             GO2CPP_DEBUG_EVENT(
                 kGFailed, id(),
@@ -1092,7 +1375,7 @@ void Task::run() {
  * | `m_machines` | M 数组（基础 M + 按需补充的 replacement M） |
  * | `m_registry`（16 条带） | 所有**未终态** G 的强引用；shutdown 靠它等终态 |
  * | `m_incoming`（16 条带） | 外部生产者投递的新 G，worker 轮询认领 |
- * | `m_tasks`/`m_state` | admission 计数与运行状态 |
+ * | `m_tasks` / `live_tasks` | admission 计数与存活 G 计数 |
  *
  * ## 锁层次（严格顺序，违反就会死锁）
  *
@@ -1158,10 +1441,13 @@ public:
 
         /// @brief P 编号（0 起，0 合法；不要用 `!=0` 判断存在）。
         PId id;
-        /// @brief 保护 queue；本地入队/出队/窃取都拿它。
-        mutable std::mutex mutex;
-        /// @brief 本地 runqueue（FIFO）；worker 优先从这里取 G。
-        std::deque<std::shared_ptr<Task>> queue;
+        /// @brief 冷路径互斥（shutdown 排空与快照）；热路径不再进入。
+        /// @details 本地队列本身是 256 槽无锁环形，push/pop 由 CAS 仲裁；
+        ///          这把锁只在 begin_shutdown_locked() 等冷路径用于串行化
+        ///          「排空 / 重新发布」的整段动作。
+        mutable detail::HotSpinLock mutex;
+        /// @brief 本地 runqueue（256 槽有界 MPMC 环形，FIFO）；worker 优先取它。
+        LocalRunQueue queue;
         /// @brief 快照用状态（idle/running/dead）。
         std::atomic<PState> state{PState::kIdle};
         /// @brief 附着到本 P 的 M 总数（含 blocking/detached 的 M）。
@@ -1807,11 +2093,9 @@ public:
         // Started Gs must remain runnable so their Fiber can return through its
         // trampoline and execute stack-local destructors.
         for (auto& processor : processors) {
-            std::lock_guard<std::mutex> queue_lock(processor.mutex);
+            std::lock_guard<detail::HotSpinLock> queue_lock(processor.mutex);
             std::deque<std::shared_ptr<Task>> resumable;
-            while (!processor.queue.empty()) {
-                auto task = std::move(processor.queue.front());
-                processor.queue.pop_front();
+            while (auto task = processor.queue.pop()) {
                 if (task->started()) {
                     task->request_cancel(false);
                     resumable.emplace_back(std::move(task));
@@ -1823,7 +2107,13 @@ public:
                     deferred_destruction.emplace_back(std::move(task));
                 }
             }
-            processor.queue.swap(resumable);
+            // 队列已换成无锁环形，不能整段 swap 回去；逐个重新发布，
+            // 满时转入全局队列（本函数稍后的 global 排空会统一收尾）。
+            for (auto& task : resumable) {
+                if (!processor.queue.push(task)) {
+                    global_queue.emplace_back(std::move(task));
+                }
+            }
         }
 
         std::deque<std::shared_ptr<Task>> resumable_global;
@@ -2800,13 +3090,13 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
                               1, std::memory_order_relaxed);
         auto& processor =
             m_impl->processors[preferred % m_impl->processors.size()];
-        std::lock_guard<std::mutex> queue_lock(processor.mutex);
         const bool use_global =
             processor.queue.size() >= m_impl->config.local_queue_limit;
         m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
         try {
-            if (!use_global) {
-                processor.queue.push_back(task);
+            // 本地环满（或 local_queue_limit=0）时溢出到全局队列，对应
+            // Go 的 runqputslow；环形 push 本身不分配、不抛异常。
+            if (!use_global && processor.queue.push(task)) {
                 GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(), processor.id);
             } else {
                 m_impl->global_queue.push_back(task);
@@ -2879,36 +3169,28 @@ bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
     }
 
     auto& processor = m_impl->processors[processor_id];
-    bool retry_regular_enqueue = false;
     bool notify_worker = false;
-    {
-        std::lock_guard<std::mutex> queue_lock(processor.mutex);
-        if (m_impl->accept_blocked()) {
-            retry_regular_enqueue = true;
-        } else {
-            m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
-            try {
-                processor.queue.push_back(task);
-                GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(), processor_id);
-                // 该 P 已有运行中的 M 时，它会在当前 G 返回后消费本地
-                // 队列；此时唤醒额外 M 只会制造 futex 抖动。
-                const auto running = processor.running_machines.load(
-                    std::memory_order_relaxed);
-                const auto active = processor.active_machines.load(
-                    std::memory_order_relaxed);
-                notify_worker = running == 0 ||
-                                (processor.queue.size() >= 16U &&
-                                 running < active);
-            } catch (...) {
-                m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
-                task->clear_queued();
-                retry_regular_enqueue = true;
-            }
-        }
-    }
-    if (retry_regular_enqueue) {
+    if (m_impl->accept_blocked()) {
         task->clear_queued();
         return false;
+    }
+    m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+    if (!processor.queue.push(task)) {
+        // 本地环满：清掉 reservation 后交回调用方的常规入队回退链。
+        m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+        task->clear_queued();
+        return false;
+    }
+    GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(), processor_id);
+    {
+        // 该 P 已有运行中的 M 时，它会在当前 G 返回后消费本地队列；
+        // 此时唤醒额外 M 只会制造 futex 抖动。
+        const auto running = processor.running_machines.load(
+            std::memory_order_relaxed);
+        const auto active = processor.active_machines.load(
+            std::memory_order_relaxed);
+        notify_worker = running == 0 ||
+                        (processor.queue.size() >= 16U && running < active);
     }
     if (notify_worker) {
         m_impl->notify_worker();
@@ -2933,41 +3215,85 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
     }
 
     auto& processor = m_impl->processors[t_processor_id];
-    bool retry_regular_enqueue = false;
     bool notify_worker = false;
-    {
-        std::lock_guard<std::mutex> queue_lock(processor.mutex);
-        if (m_impl->accept_blocked()) {
-            retry_regular_enqueue = true;
-        } else if (task->try_mark_queued_from_worker()) {
-            // 计数必须先于节点发布，否则另一个 worker 可能先 pop 节点
-            // 再递减尚未增加的 runnable，造成下溢。
-            m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
-            try {
-                processor.queue.push_back(task);
-                GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(),
-                                   t_processor_id);
-                // 当前 M 正在执行这个 G；本地回队无需再次唤醒另一个
-                // M，减少每次 Fiber handoff 的条件变量切换。
-                const auto running = processor.running_machines.load(
-                    std::memory_order_relaxed);
-                const auto active = processor.active_machines.load(
-                    std::memory_order_relaxed);
-                notify_worker =
-                    allow_notify && !t_in_idle_poll &&
-                    (running == 0 ||
-                     (processor.queue.size() >= 16U && running < active));
-            } catch (...) {
-                m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
-                task->clear_queued();
-                retry_regular_enqueue = true;
-            }
-        } else {
-            return false;
-        }
-    }
-    if (retry_regular_enqueue) {
+    if (m_impl->accept_blocked()) {
         return enqueue(task);
+    }
+    if (!task->try_mark_queued_from_worker()) {
+        return false;
+    }
+    // 计数必须先于节点发布：无锁环的消费者可能立刻 pop，若先发布再记账
+    // 会先递减尚未增加的 runnable，造成 size_t 下溢。
+    m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+    if (!processor.queue.push(task)) {
+        m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+        task->clear_queued();
+        return enqueue(task);
+    }
+    GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(), t_processor_id);
+    {
+        // 当前 M 正在执行这个 G；本地回队无需再次唤醒另一个 M，
+        // 减少每次 Fiber handoff 的条件变量切换。
+        const auto running = processor.running_machines.load(
+            std::memory_order_relaxed);
+        const auto active = processor.active_machines.load(
+            std::memory_order_relaxed);
+        notify_worker =
+            allow_notify && !t_in_idle_poll &&
+            (running == 0 ||
+             (processor.queue.size() >= 16U && running < active));
+    }
+    if (notify_worker) {
+        m_impl->notify_worker();
+    }
+    return true;
+}
+
+bool Scheduler::requeue_from_worker_reserved(const std::shared_ptr<Task>& task,
+                                             bool allow_notify) {
+    // 前置条件：调用方已在 wake_for_wait_reserve() 的成功分支里占用了
+    // m_queued。因此这里只做「发布队列节点」，不再取 Task 的转换锁 ——
+    // 入队权与状态转换已经在一个临界区里完成。
+    //
+    // 失败出口必须 clear_queued()：调用方的回退链（requeue_from_worker /
+    // requeue_to_processor / enqueue）都要求 m_queued 未被占用，否则
+    // prepare_enqueue()/try_mark_queued() 会拒绝发布，留下无节点的
+    // reservation。
+    if (!task || current_scheduler() != this ||
+        t_processor_id >= m_impl->processors.size()) {
+        if (task) {
+            task->clear_queued();
+        }
+        return false;
+    }
+    if (m_impl->accept_blocked()) {
+        task->clear_queued();
+        return false;
+    }
+
+    auto& processor = m_impl->processors[t_processor_id];
+    bool notify_worker = false;
+    if (m_impl->accept_blocked()) {
+        task->clear_queued();
+        return false;
+    }
+    // 计数必须先于节点发布，理由同 requeue_from_worker()。
+    m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+    if (!processor.queue.push(task)) {
+        m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
+        task->clear_queued();
+        return false;
+    }
+    GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(), t_processor_id);
+    {
+        const auto running = processor.running_machines.load(
+            std::memory_order_relaxed);
+        const auto active = processor.active_machines.load(
+            std::memory_order_relaxed);
+        notify_worker =
+            allow_notify && !t_in_idle_poll &&
+            (running == 0 ||
+             (processor.queue.size() >= 16U && running < active));
     }
     if (notify_worker) {
         m_impl->notify_worker();
@@ -3168,7 +3494,15 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
         return false;
     }
 #endif
-    const auto action = task->wake_for_wait();
+    // 本 M 上的同步唤醒（无缓冲 channel / Mutex 交接的热路径）可以在
+    // 同一个临界区里顺带预留入队权：wake 的状态转换与 try_mark_queued 的
+    // 「检查 + 置位」本来就共用 m_transition_mutex，分两次取锁只是多付
+    // 一次无争用也要 10ns 量级的锁。外部线程唤醒仍走完整路径。
+    const bool worker_local =
+        current_scheduler() == this &&
+        t_processor_id < m_impl->processors.size() && task->registered();
+    const auto action = worker_local ? task->wake_for_wait_reserve()
+                                     : task->wake_for_wait();
     if (action == WakeAction::kPending) {
         GO2CPP_DEBUG_EVENT(kWakePending, task->id(), 0);
         return false;
@@ -3178,6 +3512,11 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
         return false;
     }
     if (!task->registered()) {
+        if (worker_local) {
+            // 注册表在本 M 做出判断之后被回收：预留的入队权必须退回，
+            // 否则 enqueue() 的 prepare_enqueue() 会看到 m_queued=true。
+            task->clear_queued();
+        }
         // A task can leave the registry while its final wake callback is
         // racing with shutdown.  Fall back to the fully checked path rather
         // than publishing a node without a lifetime anchor.
@@ -3188,6 +3527,11 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
         }
         GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 3);
         return false;
+    }
+    if (worker_local && requeue_from_worker_reserved(task)) {
+        GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(),
+                           m_impl->runnable.load(std::memory_order_relaxed));
+        return true;
     }
     if (current_scheduler() == this &&
         t_processor_id < m_impl->processors.size() &&
@@ -3404,7 +3748,7 @@ bool Scheduler::wake_io_batch(
         bool notify_worker = false;
         std::size_t published = 0;
         {
-            std::lock_guard<std::mutex> queue_lock(processor.mutex);
+            std::lock_guard<detail::HotSpinLock> queue_lock(processor.mutex);
             if (m_impl->accept_blocked()) {
                 for (std::size_t item = index; item < end; ++item) {
                     fallback.push_back(pending[item].task);
@@ -3418,17 +3762,18 @@ bool Scheduler::wake_io_batch(
                     if (!task->try_mark_queued_from_worker()) {
                         continue;
                     }
-                    try {
-                        processor.queue.push_back(task);
+                    m_impl->runnable.fetch_add(1,
+                                               std::memory_order_relaxed);
+                    if (processor.queue.push(task)) {
                         GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(),
                                            processor_id);
                         GO2CPP_DEBUG_EVENT(
                             kWakeEnqueued, task->id(),
                             m_impl->runnable.load(std::memory_order_relaxed));
                         ++published;
-                        m_impl->runnable.fetch_add(1,
+                    } else {
+                        m_impl->runnable.fetch_sub(1,
                                                    std::memory_order_relaxed);
-                    } catch (...) {
                         task->clear_queued();
                         fallback.push_back(task);
                     }
@@ -3737,7 +4082,7 @@ std::vector<ProcessorSnapshot> Scheduler::processors() const {
     }
     result.reserve(m_impl->processors.size());
     for (const auto& processor : m_impl->processors) {
-        std::lock_guard<std::mutex> lock(processor.mutex);
+        // 无锁环的 size() 本身就是 acquire 读，不再需要冷路径锁。
         result.push_back(ProcessorSnapshot{
             processor.id, processor.state.load(std::memory_order_acquire),
             processor.queue.size()});
@@ -3980,8 +4325,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     // （本地快路径）执行；锁内 enqueue 会自锁或形成反向锁序
     // （SCHED-01/02）。调用方把判定结果带到所有调度器锁之外再补发布。
     const auto recover_unclaimed = [](const std::shared_ptr<Task>& task) {
-        std::lock_guard<std::mutex> lock(task->m_transition_mutex);
-        const auto state = task->m_state.load(std::memory_order_relaxed);
+        std::lock_guard<detail::HotSpinLock> lock(task->m_transition_mutex);
+        const auto state = task->StateValue(std::memory_order_relaxed);
         const bool executing =
             task->m_execution_claim.load(std::memory_order_relaxed);
         if (state == GState::kRunnable && !executing) {
@@ -4011,19 +4356,15 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             m_impl->running_workers.load(std::memory_order_acquire) != 0 &&
             m_impl->runnable.load(std::memory_order_acquire) >
                 m_impl->processors.size()) {
-            {
-                std::lock_guard<std::mutex> queue_lock(own_processor.mutex);
-                if (!own_processor.queue.empty()) {
-                    task = std::move(own_processor.queue.front());
-                    own_processor.queue.pop_front();
-                    local_queue_pop = true;
-                    GO2CPP_DEBUG_EVENT(kRunQueuePop, task->id(),
-                                       own_processor.id);
-                }
+            task = own_processor.queue.pop();
+            if (task) {
+                local_queue_pop = true;
+                GO2CPP_DEBUG_EVENT(kRunQueuePop, task->id(),
+                                   own_processor.id);
             }
             if (task) {
                 m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
-                claimed = task->try_mark_running();
+                claimed = task->claim_from_queue();
                 if (claimed) {
                     GO2CPP_DEBUG_EVENT(kRunQueueClaimOk, task->id(), 0);
                 } else {
@@ -4088,7 +4429,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     m_impl->incoming_count.fetch_sub(
                         1, std::memory_order_release);
                     m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
-                    claimed = task->try_mark_running();
+                    claimed = task->claim_from_queue();
                     if (claimed) {
                         GO2CPP_DEBUG_EVENT(kRunQueueClaimOk, task->id(), 0);
                     } else {
@@ -4171,31 +4512,6 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 const auto preferred_class =
                     machine->last_task_class.load(std::memory_order_relaxed);
                 const auto scan_limit = m_impl->config.task_affinity_budget;
-                const auto take_local = [&](auto& queue) {
-                    if (prefer_class) {
-                        auto it = queue.begin();
-                        std::size_t scanned = 0;
-                        for (; it != queue.end() && scanned < scan_limit;
-                             ++it, ++scanned) {
-                            if (*it && (*it)->task_class() == preferred_class) {
-                                auto selected = std::move(*it);
-                                queue.erase(it);
-                                GO2CPP_DEBUG_EVENT(kRunQueuePop,
-                                                   selected->id(),
-                                                   own_processor.id);
-                                return selected;
-                            }
-                        }
-                    }
-                    if (queue.empty()) {
-                        return std::shared_ptr<Task>{};
-                    }
-                    auto selected = std::move(queue.front());
-                    queue.pop_front();
-                    GO2CPP_DEBUG_EVENT(kRunQueuePop, selected->id(),
-                                       own_processor.id);
-                    return selected;
-                };
                 const auto take_global = [&](auto& queue) {
                     if (prefer_class) {
                         auto it = queue.begin();
@@ -4221,42 +4537,16 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                                        ::go2cpp::debug::kGlobalQueueTag);
                     return selected;
                 };
-                const auto take_victim = [&](auto& queue,
-                                             [[maybe_unused]] PId victim_id) {
-                    if (prefer_class) {
-                        auto it = queue.rbegin();
-                        std::size_t scanned = 0;
-                        for (; it != queue.rend() && scanned < scan_limit;
-                             ++it, ++scanned) {
-                            if (*it && (*it)->task_class() == preferred_class) {
-                                auto base = std::next(it).base();
-                                auto selected = std::move(*base);
-                                queue.erase(base);
-                                GO2CPP_DEBUG_EVENT(kRunQueuePop,
-                                                   selected->id(), victim_id);
-                                return selected;
-                            }
-                        }
-                    }
-                    if (queue.empty()) {
-                        return std::shared_ptr<Task>{};
-                    }
-                    auto selected = std::move(queue.back());
-                    queue.pop_back();
-                    GO2CPP_DEBUG_EVENT(kRunQueuePop, selected->id(),
-                                       victim_id);
-                    return selected;
-                };
-
                 // Rescue resumes are serviced first: they exist only after
                 // queue allocation failure or a shutdown wake handoff.
                 task = m_impl->emergency_pop_locked();
 
-                // Prefer the local FIFO queue.
+                // Prefer the local FIFO queue（无锁环，出队节点即独占）。
                 if (!task) {
-                    std::lock_guard<std::mutex> queue_lock(own_processor.mutex);
-                    if (!own_processor.queue.empty()) {
-                        task = take_local(own_processor.queue);
+                    task = own_processor.queue.pop();
+                    if (task) {
+                        GO2CPP_DEBUG_EVENT(kRunQueuePop, task->id(),
+                                           own_processor.id);
                     }
                 }
 
@@ -4265,13 +4555,16 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     task = take_global(m_impl->global_queue);
                 }
 
-                // Finally steal from the back of another P. A bounded scan
-                // avoids monopolizing the scheduler when all processors are
-                // busy.
+                // Finally steal from another P. 照抄 Go runqgrab：一次抢
+                // 一半（上限 32），自己留一个先跑，其余放回本 P 的环；
+                // 本 P 环也满则转入全局队列（此处仍持有 admission 锁）。
                 if (!task && m_impl->processors.size() > 1) {
                     const auto start = m_impl->next_processor.fetch_add(
                         1, std::memory_order_relaxed);
                     [[maybe_unused]] std::uint64_t victim_id = 0;
+                    std::shared_ptr<Task> stolen[32];
+                    std::size_t stolen_count = 0;
+                    Impl::Processor* stolen_from = nullptr;
                     for (std::size_t offset = 0;
                          offset < m_impl->processors.size(); ++offset) {
                         auto& victim = m_impl->processors[
@@ -4279,17 +4572,37 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         if (&victim == &own_processor) {
                             continue;
                         }
-                        std::lock_guard<std::mutex> queue_lock(victim.mutex);
-                        if (!victim.queue.empty()) {
-                            task = take_victim(victim.queue, victim.id);
-                            if (task) {
-                                m_impl->metric_steal_pops.fetch_add(
-                                    1, std::memory_order_relaxed);
-                                victim_id =
-                                    static_cast<std::uint64_t>(victim.id);
-                            }
+                        const auto victim_size = victim.queue.size();
+                        if (victim_size == 0) {
+                            continue;
+                        }
+                        const auto want = std::min<std::size_t>(
+                            victim_size - victim_size / 2,
+                            sizeof(stolen) / sizeof(stolen[0]));
+                        stolen_count = victim.queue.steal(stolen, want);
+                        if (stolen_count != 0) {
+                            victim_id = static_cast<std::uint64_t>(victim.id);
+                            stolen_from = &victim;
                             break;
                         }
+                    }
+                    if (stolen_count != 0) {
+                        task = std::move(stolen[0]);
+                        for (std::size_t i = 1; i < stolen_count; ++i) {
+                            if (!own_processor.queue.push(stolen[i])) {
+                                try {
+                                    m_impl->global_queue.push_back(
+                                        std::move(stolen[i]));
+                                } catch (...) {
+                                    if (stolen_from != nullptr) {
+                                        (void)stolen_from->queue.push(
+                                            std::move(stolen[i]));
+                                    }
+                                }
+                            }
+                        }
+                        m_impl->metric_steal_pops.fetch_add(
+                            1, std::memory_order_relaxed);
                     }
                     if (task) {
                         GO2CPP_DEBUG_EVENT(kStealOk, task->id(), victim_id);
@@ -4304,7 +4617,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
 
                 if (task) {
                     m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
-                    claimed = task->try_mark_running();
+                    claimed = task->claim_from_queue();
                     if (claimed) {
                         GO2CPP_DEBUG_EVENT(kRunQueueClaimOk, task->id(), 0);
                     } else {
@@ -4378,20 +4691,25 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                                                      std::memory_order_relaxed);
             own_processor.state.store(PState::kRunning,
                                       std::memory_order_release);
-            t_task = task;
-            GO2CPP_DEBUG_BIND_TASK(task->id());
+            // 用移动而不是拷贝赋值：任务所有权只是从局部变量搬到 TLS
+            // 槽，shared_ptr 的拷贝会额外做两次原子引用计数（uncontended
+            // lock inc/dec 在热路径上约 10ns/往返），而移动是纯指针搬运。
+            // 本轮结束时再移动回 task，TLS 槽恢复为空，语义与原先的
+            // t_task = task / t_task.reset() 完全一致。
+            t_task = std::move(task);
+            GO2CPP_DEBUG_BIND_TASK(t_task->id());
             Fiber::BindCurrentExecution(FiberExecutionBinding{
                 reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,
                 t_processor_id, true});
             m_impl->emit_event(SchedulerEvent{
-                SchedulerEventType::kTaskStarted, task->id(), t_machine_id,
+                SchedulerEventType::kTaskStarted, t_task->id(), t_machine_id,
                 t_processor_id, GState::kRunning});
             const bool collect_metrics = m_impl->config.collect_metrics;
             const auto run_started = collect_metrics ? steady_now_ns() : 0;
             // step5: 执行 G。返回值通过 task 的终态体现（Dead/Failed/
             // Cancelled/Yielded/Parked），这里只负责记账与后续回收。
-            task->run();
-            const auto task_state_after_run = task->state();
+            t_task->run();
+            const auto task_state_after_run = t_task->state();
             if (task_state_after_run == GState::kDead ||
                 task_state_after_run == GState::kCancelled ||
                 task_state_after_run == GState::kFailed) {
@@ -4406,7 +4724,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     ? SchedulerEventType::kTaskCancelled
                     : SchedulerEventType::kTaskSuspended;
             m_impl->emit_event(SchedulerEvent{
-                task_event_type, task->id(), t_machine_id, t_processor_id,
+                task_event_type, t_task->id(), t_machine_id, t_processor_id,
                 task_state_after_run});
             if (collect_metrics) {
                 const auto resume_elapsed =
@@ -4416,7 +4734,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     1, std::memory_order_relaxed);
                 m_impl->metric_fiber_resume_ns.fetch_add(
                     resume_elapsed, std::memory_order_relaxed);
-                if (task->terminal()) {
+                if (t_task->terminal()) {
                     m_impl->metric_task_completions.fetch_add(
                         1, std::memory_order_relaxed);
                 }
@@ -4425,7 +4743,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         1, std::memory_order_relaxed);
                 }
             }
-            t_task.reset();
+            task = std::move(t_task);
             GO2CPP_DEBUG_UNBIND_TASK();
             Fiber::BindCurrentExecution(FiberExecutionBinding{
                 reinterpret_cast<std::uintptr_t>(this), 0, t_machine_id,

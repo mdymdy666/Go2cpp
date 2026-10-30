@@ -379,6 +379,71 @@ struct SchedulerMetrics {
  * @details 保存入口函数、取消状态、生命周期和等待结果；Scheduler 负责
  *          将任务放入本地、P 或全局队列并保证同一时刻只在一个 M 上运行。
  */
+
+namespace detail {
+
+/**
+ * @brief 调度器热路径的轻量互斥锁（TTAS 自旋 + yield 退避）。
+ *
+ * `std::mutex`（glibc pthread_mutex）即使无争用也要走完整状态机与 futex
+ * 快路径：callgrind 基线里一次 lock+unlock 约 145 条指令，park/wake
+ * 一次往返要付 6 次，占 20% 以上的指令数。Task 的状态转换、P 的本地
+ * 队列临界区都只有几条到几十条指令，且绝大多数时候没有竞争者，因此
+ * 用「一次 exchange 抢占 + 竞争时先 pause 自旋、再让出时间片」替代。
+ *
+ * 语义与 std::mutex 一致：lock()/unlock()/try_lock()，不可重入，
+ * 不提供递归与超时；与 lock_guard/unique_lock 兼容。
+ */
+class HotSpinLock {
+public:
+    HotSpinLock() noexcept = default;
+    ~HotSpinLock() = default;
+    HotSpinLock(const HotSpinLock&) = delete;
+    HotSpinLock& operator=(const HotSpinLock&) = delete;
+
+    void lock() noexcept {
+        if (!m_flag.exchange(true, std::memory_order_acquire)) {
+            return;
+        }
+        for (;;) {
+            // 竞争者存在：先只读自旋（缓存行在持有者手里，读比 RMW 便宜），
+            // 超过预算后让出时间片，避免持有者被抢占时形成活锁。
+            std::uint32_t spins = 0;
+            while (m_flag.load(std::memory_order_relaxed)) {
+                if (++spins < kSpinBudget) {
+                    CpuRelax();
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+            if (!m_flag.exchange(true, std::memory_order_acquire)) {
+                return;
+            }
+        }
+    }
+
+    void unlock() noexcept { m_flag.store(false, std::memory_order_release); }
+
+    bool try_lock() noexcept {
+        return !m_flag.exchange(true, std::memory_order_acquire);
+    }
+
+private:
+    static constexpr std::uint32_t kSpinBudget = 128;
+
+    static void CpuRelax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        asm volatile("yield" ::: "memory");
+#endif
+    }
+
+    std::atomic<bool> m_flag{false};
+};
+
+}  // namespace detail
+
 class Task : public std::enable_shared_from_this<Task> {
 public:
     using Function = std::function<void()>;
@@ -502,8 +567,19 @@ public:
     // 真正 resume 仍由 execution_claim 串行化，因此不会让两个 M 同时进入
     // 同一个 Fiber。
     WakeAction wake_for_wait() noexcept;
+    // 与 wake_for_wait() 相同，但在 Waiting -> Runnable 且没有执行者的
+    // 分支里顺带置位 m_queued（队列节点预留），把「唤醒状态转换」和
+    // 「入队权预留」合并进同一个临界区。调用方必须随后调用
+    // requeue_from_worker_reserved()；任何回退到普通入队/外部投递的路径
+    // 都必须先 clear_queued()。返回 kPending/kRejected 时不做预留。
+    WakeAction wake_for_wait_reserve() noexcept;
     ParkAction park_for_scheduler() noexcept;
     bool try_mark_running();
+    // P0-3：队列节点出队后的无锁执行权认领。节点已由 pop 者独占，
+    // 因此「抢 execution_claim → 清 queued → Runnable->Running」不需要
+    // 转换锁；抢不到 claim 说明节点是并发残留，返回 false 交回调用方
+    // 走 recover_unclaimed() 收尾。
+    bool claim_from_queue() noexcept;
     // Scheduler 使用的状态转换。mark_runnable() 只唤醒已经等待的任务；
     // 对运行中的任务记录 pending 唤醒令牌，并由当前 G 的 yield/park 路径
     // 完成后续转换。
@@ -532,8 +608,30 @@ public:
 
 private:
     friend class Scheduler;
+    // ---- 打包状态字（低 8 位 GState，bit 8 是 wake 令牌） -------------
+    static constexpr std::uint32_t kStateMask = 0xFFU;
+    static constexpr std::uint32_t kWakePendingBit = 0x100U;
+    static GState StateOfWord(std::uint32_t word) noexcept {
+        return static_cast<GState>(word & kStateMask);
+    }
+    GState StateValue(std::memory_order order = std::memory_order_acquire)
+        const noexcept {
+        return StateOfWord(m_state_word.load(order));
+    }
+    bool WakePendingValue(std::memory_order order = std::memory_order_acquire)
+        const noexcept {
+        return (m_state_word.load(order) & kWakePendingBit) != 0U;
+    }
+    /// @brief 保留令牌位地改写状态（CAS 循环）。
+    void StoreStateValue(GState state, std::memory_order order) noexcept;
+    /// @brief 只改令牌位（CAS 循环），保留状态。
+    void StoreWakePending(bool pending, std::memory_order order) noexcept;
+    /// @brief 交换令牌位，返回旧值（等价 std::atomic<bool>::exchange）。
+    bool ExchangeWakePending(bool pending, std::memory_order order) noexcept;
+
     Function release_callable() noexcept;
     bool request_cancel(bool notify = true) noexcept;
+    WakeAction wake_for_wait_impl(bool reserve_queue) noexcept;
     bool terminal() const noexcept;
     void notify_terminal() noexcept;
     // 存活 G 计数钩子。二者都要求调用方持有 m_transition_mutex：
@@ -546,15 +644,21 @@ private:
     Function m_function;
     TaskOptions m_options;
     std::unique_ptr<go2cpp::Fiber> m_fiber;
+    // run() 热路径免锁读取的 Fiber 指针。写侧始终在 m_transition_mutex
+    // 内与 m_fiber 同步更新（release），读侧用 acquire；执行权由
+    // m_run_claim 串行化，同一时刻最多一个执行者读写它。
+    std::atomic<go2cpp::Fiber*> m_fiber_ptr{nullptr};
     // 当前 G 持有的 sync::Mutex 数量。只在开启"持锁 park 检测"时维护。
     std::atomic<std::uint32_t> m_held_mutexes{0};
     // 当前 G 处于 sync::SpinMutex 临界区的嵌套深度。>0 时 park 入口
     // 按 debug/release 两种策略处理（abort / 降级计数）。
     std::atomic<std::uint32_t> m_no_park_depth{0};
-    std::atomic<GState> m_state;
+    // 打包状态字：低 8 位是 GState，bit 8 是 wake 令牌。
+    // 状态与令牌必须由同一次 CAS 线性化；拆成两个原子会让 park 与
+    // wake 之间留下「令牌已发布、挂起已提交、却没人消费」的丢唤醒窗口。
+    std::atomic<std::uint32_t> m_state_word;
     std::atomic<bool> m_queued{false};
     std::atomic<bool> m_deferred_enqueue{false};
-    std::atomic<bool> m_wake_pending{false};
     std::atomic<bool> m_registered{false};
     // 上述计数的弱引用。指针由 Scheduler::Impl 持有、生存期内地址稳定；
     // 只在 m_live_counted 为 true（已计入且尚未终态）期间访问，终态时
@@ -578,7 +682,10 @@ private:
     std::shared_ptr<Task> m_completion_notification_next;
     std::atomic<bool> m_completion_notification_queued{false};
     std::atomic<bool> m_completion_notified{false};
-    mutable std::mutex m_transition_mutex;
+    // 状态转换锁只保护几条原子读写的组合（见 detail::HotSpinLock 注释），
+    // 用轻量自旋锁替代 std::mutex：park/wake 往返的 6 次加锁从这里省下
+    // 大部分指令数。
+    mutable detail::HotSpinLock m_transition_mutex;
     mutable std::mutex m_completion_mutex;
     mutable core::ParkingCondition m_completion_condition;
 };
@@ -910,6 +1017,11 @@ private:
     // 仅供拥有该 G 执行权的 worker 在 resume 返回后调用。
     bool requeue_from_worker(const std::shared_ptr<Task>& task,
                              bool allow_notify = true);
+    // requeue_from_worker() 的「已预留 m_queued」版本：跳过入队权检查，
+    // 直接发布本地队列节点。任何失败出口都会先 clear_queued() 并返回
+    // false，由调用方走原有回退链（不会留下无节点的 reservation）。
+    bool requeue_from_worker_reserved(const std::shared_ptr<Task>& task,
+                                      bool allow_notify = true);
     // 外部 M 唤醒 G 时优先投递到 G 最近运行的 P，失败时回退到普通
     // admission 队列，避免混合锁交接每次争用全局 incoming stripe。
     bool requeue_to_processor(const std::shared_ptr<Task>& task,
