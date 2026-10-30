@@ -455,10 +455,10 @@ if (GO2CPP_BUILD_TESTS)
     target_compile_options(go2cpp_os_hook_conflict_test PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_os_hook_conflict_test COMMAND go2cpp_os_hook_conflict_test)
+    set_tests_properties(go2cpp_os_hook_conflict_test PROPERTIES TIMEOUT 120)
     else()
         message(STATUS "skip go2cpp_os_hook_conflict_test (GO2CPP_WITH_HOOK=OFF)")
     endif()
-    set_tests_properties(go2cpp_os_hook_conflict_test PROPERTIES TIMEOUT 120)
 
 
     # ---- SocketDebug 最小实现：per-fd 计数 / 256 条事件环 / 关闭归档 ----
@@ -507,6 +507,7 @@ if (GO2CPP_BUILD_TESTS)
         message(STATUS "skip go2cpp_hook_p0_test (GO2CPP_WITH_HOOK=OFF)")
     endif()
 
+    if (TARGET go2cpp_hook)
     add_executable(go2cpp_hook_raw_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_raw.cpp)
     target_include_directories(go2cpp_hook_raw_test PRIVATE
@@ -518,10 +519,14 @@ if (GO2CPP_BUILD_TESTS)
         -O2 -Wall -Wextra -Wpedantic)
     add_test(NAME go2cpp_hook_raw_test COMMAND go2cpp_hook_raw_test)
     set_tests_properties(go2cpp_hook_raw_test PROPERTIES TIMEOUT 120)
+    else()
+        message(STATUS "skip go2cpp_hook_raw_test (GO2CPP_WITH_HOOK=OFF)")
+    endif()
 
     # hook 正确性验证：结合 os::File / hook / 网络 socket，用心跳 Fiber 判定
     # 「park 了 Fiber」还是「阻塞了 worker」。验证使用者的红线：
     # hook 绝不能影响正常的系统调用（非 socket fd 必须零影响）。
+    if (TARGET go2cpp_hook)
     add_executable(go2cpp_hook_correctness_test
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/network/test_hook_correctness.cpp)
     target_include_directories(go2cpp_hook_correctness_test PRIVATE
