@@ -56,6 +56,18 @@ enable_testing()
 add_test(NAME error_enhanced COMMAND error_enhanced_test)
 set_tests_properties(error_enhanced PROPERTIES TIMEOUT 300)
 
+
+# ---------------------------------------------------------------------------
+# 默认线程后端：不 include error_fiber.hpp、不链接 Fiber 运行时。
+# ---------------------------------------------------------------------------
+add_executable(error_local_thread_test test_error_local_thread.cpp)
+target_include_directories(error_local_thread_test PRIVATE ${GO2CPP_ERROR_INCLUDE_DIR})
+target_compile_options(error_local_thread_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+target_link_libraries(error_local_thread_test PRIVATE Threads::Threads)
+
+add_test(NAME error_local_thread COMMAND error_local_thread_test)
+set_tests_properties(error_local_thread PROPERTIES TIMEOUT 60)
+
 # ---------------------------------------------------------------------------
 # Fiber 迁移测试：需要原生 context 后端，只在 Linux x86_64 构建。
 # ---------------------------------------------------------------------------
@@ -93,6 +105,31 @@ if (GO2CPP_ERROR_NATIVE_CONTEXT)
 
     add_test(NAME error_fiber COMMAND error_fiber_test)
     set_tests_properties(error_fiber PROPERTIES TIMEOUT 300)
+
+    # defer 状态迁移测试：control_flow.cpp 与 Fiber 运行时编进同一个可执行，
+    # 保证 ErrorLocal 的 Fiber 后端安装方与使用方在同一个 DSO 内。
+    add_executable(error_control_flow_fiber_test
+        test_control_flow_fiber.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/tools/control_flow.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/fiber.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/fiber_local.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/context_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/context_x64.S
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/debug/debug_event_ring.cpp)
+
+    target_include_directories(error_control_flow_fiber_test PRIVATE
+        ${GO2CPP_ERROR_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party)
+    target_compile_definitions(error_control_flow_fiber_test PRIVATE GO2CPP_USE_NATIVE_CONTEXT=1)
+    target_compile_options(error_control_flow_fiber_test PRIVATE -Wall -Wextra -Wpedantic)
+    set_source_files_properties(test_control_flow_fiber.cpp PROPERTIES COMPILE_OPTIONS "-Werror")
+    if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+        target_compile_options(error_control_flow_fiber_test PRIVATE -O2)
+    endif()
+    target_link_libraries(error_control_flow_fiber_test PRIVATE Threads::Threads)
+
+    add_test(NAME error_control_flow_fiber COMMAND error_control_flow_fiber_test)
+    set_tests_properties(error_control_flow_fiber PROPERTIES TIMEOUT 300)
 else()
     message(STATUS "error_fiber_test: skipped (需要 Linux x86_64 原生 context)")
 endif()

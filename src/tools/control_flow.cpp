@@ -10,7 +10,7 @@
  * ## 本文件定义什么
  *
  * - `detail::PanicState`：带 mutex 的 panic 状态；
- * - 线程本地的 defer 深度/异常记录与 `DeferCallbackScope`；
+ * - 执行体局部的 defer 深度/异常记录（`ErrorLocal`）与 `DeferCallbackScope`；
  * - `defer::run_now`、`panic::call/clear`、`recover::take/operator()/peek`。
  *
  * ## 阅读建议
@@ -20,10 +20,12 @@
  *
  * ## 边界与陷阱
  *
- * `take()` 只在当前线程的 defer 回调内成功；`panic::call` 不跳栈；defer
+ * `take()` 只在当前执行上下文（Fiber 或线程）的 defer 回调内成功；`panic::call` 不跳栈；defer
  * 回调里的异常只记录到 `LastDeferException()`，不会继续传播。
  */
 #include "go2cpp/control_flow.hpp"
+
+#include "go2cpp/error/error_local.hpp"
 
 #include <mutex>
 
@@ -53,42 +55,97 @@ struct PanicState {
     bool recovered{false};    ///< 是否已被 recover 处理；take()/operator() 置真，call_info()/clear() 置假
 };
 
-thread_local unsigned int s_defer_depth = 0; ///< 当前线程 defer 回调嵌套深度；DeferCallbackScope 增减
-thread_local std::exception_ptr s_defer_exception; ///< 最近一次 defer 回调异常；RecordDeferException 写，LastDeferException 读
+namespace {
 
 /**
- * @brief 标记「当前线程正处于 defer 回调」的 RAII 作用域。
+ * @brief defer 回调状态：嵌套深度 + 最近一次回调异常。
+ *
+ * @details 这两个字段属于**当前执行体**而不是当前 OS 线程：Fiber 可以在
+ *          defer 回调里挂起、被调度到另一个 M 上恢复，恢复后 `recover`
+ *          仍必须认为自己在 defer 边界内，`LastDeferException()` 也必须
+ *          读到同一份异常。因此放进 `ErrorLocal`：普通线程退化为线程局部，
+ *          安装 Fiber 后端后绑定 G、随迁移走。
+ *
+ * @note 合并成一个槽而不是两个：`InDeferCallback()` 是最频繁的查询，
+ *       一次哈希查找即可同时覆盖深度与异常两个字段。
+ */
+struct DeferState {
+    unsigned int depth{0};        ///< defer 回调嵌套深度；DeferCallbackScope 增减
+    std::exception_ptr exception; ///< 最近一次 defer 回调异常；RecordDeferException 写，LastDeferException 读
+};
+
+/// @brief 当前执行上下文的 defer 状态槽。
+error::ErrorLocal<DeferState>& DeferStateSlot() noexcept {
+    static error::ErrorLocal<DeferState> slot;
+    return slot;
+}
+
+} // namespace
+
+/**
+ * @brief 标记「当前执行体正处于 defer 回调」的 RAII 作用域。
  *
  * ## 定位
  * `defer::run_now()` 进入时构造、退出时析构；`recover::take()` 靠它判断
  * 是否允许恢复。
  *
  * ## 不变量
- * 构造时 `s_defer_depth` 加 1、析构时恢复旧值；支持嵌套 defer。
+ * 构造时深度加 1、析构时恢复旧值；支持嵌套 defer。
+ *
+ * ## 生命周期与迁移
+ * 作用域对象在 Fiber 栈上，跨挂起点存活；它只保存槽内状态的裸指针，
+ * 状态本身由 `ErrorLocal` 后端持有（Fiber 后端下属于 G，迁移不改变地址）。
+ * 槽位分配失败时退化为「不在 defer 边界」，而不是让异常穿过 noexcept。
  */
 class DeferCallbackScope final {
 public:
-    DeferCallbackScope() noexcept : m_previous(s_defer_depth) {
-        ++s_defer_depth;
+    DeferCallbackScope() noexcept {
+        try {
+            m_state = &DeferStateSlot().GetOrCreate();
+            m_previous = m_state->depth;
+            m_state->depth = m_previous + 1;
+        } catch (...) {
+            // 分配失败：本次不标记 defer 边界；defer 的析构路径不能抛。
+            m_state = nullptr;
+            m_previous = 0;
+        }
     }
 
-    ~DeferCallbackScope() noexcept { s_defer_depth = m_previous; }
+    ~DeferCallbackScope() noexcept {
+        if (m_state != nullptr) {
+            m_state->depth = m_previous;
+        }
+    }
 
 private:
-    unsigned int m_previous; ///< 进入作用域前的深度；析构时恢复，支持嵌套 defer
+    DeferState* m_state{nullptr}; ///< 当前执行体状态；为空表示槽位分配失败
+    unsigned int m_previous{0};   ///< 进入作用域前的深度；析构时恢复，支持嵌套 defer
 };
 
-bool InDeferCallback() noexcept { return s_defer_depth != 0; }
+bool InDeferCallback() noexcept {
+    const DeferState* const state = DeferStateSlot().TryGet();
+    return state != nullptr && state->depth != 0;
+}
 
 void RecordDeferException(std::exception_ptr exception) noexcept {
-    s_defer_exception = std::move(exception);
+    try {
+        DeferStateSlot().GetOrCreate().exception = std::move(exception);
+    } catch (...) {
+        // 槽位分配失败：丢弃本次异常记录，不能让异常穿过 noexcept 的 defer 边界。
+    }
 }
 
 std::exception_ptr LastDeferException() noexcept {
-    return s_defer_exception;
+    const DeferState* const state = DeferStateSlot().TryGet();
+    return state != nullptr ? state->exception : std::exception_ptr();
 }
 
-void ClearDeferException() noexcept { s_defer_exception = {}; }
+void ClearDeferException() noexcept {
+    DeferState* const state = DeferStateSlot().TryGet();
+    if (state != nullptr) {
+        state->exception = std::exception_ptr();
+    }
+}
 
 }  // namespace detail
 

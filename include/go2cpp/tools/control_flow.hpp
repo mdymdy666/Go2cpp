@@ -88,7 +88,7 @@ class DeferCallbackScope;
  * ## 生命周期与线程模型
  * 构造时捕获回调与参数（按值），析构或 `run_now()` 时执行一次；不可拷贝/
  * 不可移动，保证「一个作用域一个 defer」。回调异常不会逃出析构，而是记录到
- * 当前线程的 `LastDeferException()`。
+ * 当前执行上下文（Fiber 或线程）的 `LastDeferException()`。
  *
  * ## 不变量
  * - `m_active` 为真时 `m_callable` 非空；
@@ -221,7 +221,7 @@ using Defer = defer;
  * ## 生命周期与线程模型
  * 构造时分配 `detail::PanicState`；拷贝共享同一状态。内部用 mutex 保护
  * `info`/`active`/`recovered`，查询可从任意线程发起；但 `take()` 只允许在
- * 当前线程的 defer 回调内成功。
+ * 当前执行上下文的 defer 回调内成功。
  *
  * ## 状态机
  * `Idle -(call)-> Active -(recover::take/operator())-> Recovered -(clear)-> Idle`，
@@ -293,7 +293,7 @@ using Panic = panic;
  *
  * ## 生命周期与线程模型
  * 持有 `weak_ptr<PanicState>`，不延长 panic 的生命周期；`bind()`/`reset()`
- * 可重绑定。所有读取都在锁内完成；`take()`/`operator()` 额外检查当前线程
+ * 可重绑定。所有读取都在锁内完成；`take()`/`operator()` 额外检查当前执行上下文
  * 是否处于 defer 回调。
  *
  * ## 不变量
@@ -335,9 +335,9 @@ private:
 
 using Recover = recover;
 
-/** @brief 读取当前线程/Fiber 最近一次 defer 回调记录的异常。 */
+/** @brief 读取当前执行上下文（Fiber 或线程）最近一次 defer 回调记录的异常。 */
 std::exception_ptr LastDeferException() noexcept;
-/** @brief 清除当前线程/Fiber 记录的 defer 异常。 */
+/** @brief 清除当前执行上下文（Fiber 或线程）记录的 defer 异常。 */
 void ClearDeferException() noexcept;
 
 }  // namespace go2cpp
