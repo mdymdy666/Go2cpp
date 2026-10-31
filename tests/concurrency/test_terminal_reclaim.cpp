@@ -71,14 +71,25 @@ void TestEveryCompletionReclaims() {
     std::vector<go2cpp::GId> gids;
     handles.reserve(kChecked + kFlush);
     gids.reserve(kChecked);
-    for (int index = 0; index < kChecked + kFlush; ++index) {
+    for (int index = 0; index < kChecked; ++index) {
         auto task = scheduler.spawn(
             [&done] { done.fetch_add(1, std::memory_order_relaxed); });
         GO2CPP_REQUIRE(static_cast<bool>(task));
         handles.push_back(task);
-        if (index < kChecked) {
-            gids.push_back(task->id());
-        }
+        gids.push_back(task->id());
+    }
+    // 先等被检查的 G 全部完成，再单独提交 flush 批：flush 的完成事件才是
+    // 驱动「后续条带轮转」的扫描源。两批混在一起提交时，288 个任务超过
+    // 本地环 256 槽，队列溢出会让完成顺序偏离提交顺序；一旦 flush 批先于
+    // 被检查的 G 完成，最后完成的那些 G 就等不到覆盖自己条带的扫描，测试
+    // 会假红（与实现无关：原版在宿主高负载下 20 次实测 6 次超时）。
+    GO2CPP_REQUIRE_EVENTUALLY(done.load(std::memory_order_acquire) == kChecked,
+                              5s);
+    for (int index = 0; index < kFlush; ++index) {
+        auto task = scheduler.spawn(
+            [&done] { done.fetch_add(1, std::memory_order_relaxed); });
+        GO2CPP_REQUIRE(static_cast<bool>(task));
+        handles.push_back(task);
     }
     GO2CPP_REQUIRE_EVENTUALLY(
         done.load(std::memory_order_acquire) == kChecked + kFlush, 5s);
