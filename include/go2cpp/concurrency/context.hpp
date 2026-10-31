@@ -57,6 +57,8 @@ namespace go2cpp
     namespace detail
     {
         struct DoneSignalAccess;
+        struct ContextBlock;
+        struct ContextFactory;
     }
 
     /**
@@ -71,10 +73,15 @@ namespace go2cpp
     public:
         using CallbackId = std::uint64_t;
 
+        struct State;
+
         /** @brief 创建未完成的通知信号。 */
         DoneSignal();
-        DoneSignal(const DoneSignal &) = default;
-        DoneSignal &operator=(const DoneSignal &) = default;
+        // 拷贝会把「借用」状态提升为持有：副本自己撑住 Context 所在块，
+        // 因此 ctx->Done() 的副本可以在 Context 句柄销毁后继续安全使用
+        // （Context 内部的 m_done 保持借用、不持有，避免自引用环）。
+        DoneSignal(const DoneSignal &other) noexcept;
+        DoneSignal &operator=(const DoneSignal &other) noexcept;
         DoneSignal(DoneSignal &&) noexcept = default;
         DoneSignal &operator=(DoneSignal &&) noexcept = default;
         /** @brief 释放信号状态。 */
@@ -111,21 +118,41 @@ namespace go2cpp
         void RemoveCallback(CallbackId id) const;
 
     private:
-        struct State;
+        // 借用标签：状态由外部所有者（Context::State）持有，本句柄不参与
+        // 所有权、不分配任何内存。Context 用它零成本暴露内嵌的完成信号。
+        struct BorrowTag final
+        {
+        };
+
+        // 借用构造：只允许状态所有者（Context / Context::State）使用。
+        // state 必须存活到本句柄（及其全部副本）销毁为止；由所有者保证。
+        DoneSignal(BorrowTag, State *state) noexcept;
+
+        // 统一访问器：拥有模式解引用 m_state，借用模式解引用 m_borrowed。
+        State &state() const noexcept;
 
         // 通知的内部状态，多份 DoneSignal 句柄共享同一份。
         // - 保护：State::mutex（见 .cpp）；本句柄自身无锁。
-        // - 不变式：复制 DoneSignal 会共享此指针（因此副本是"同一个信号"），
-        //   这正是 Context 能用一份镜像成员表达同一信号的前提。
-        // - 可空？构造时必然分配（见 DoneSignal() 实现），运行期不为空。
+        // - 不变式：拥有模式下非空；借用模式下为空，改由 m_borrowed 指出状态。
+        // - 复制语义：默认复制三个成员，副本因此与源指向同一份状态。
         std::shared_ptr<State> m_state;
 
-        // 无锁完成标志的地址，等于 &m_state->done。**不是**独立存储：它只是
+        // 借用模式的状态指针。Context::State 内嵌完成状态后，Context 的
+        // Done() 只需一个裸指针，不再为每个 Context 额外分配一份状态。
+        // - 保护：指针构造后不变；指向的对象由所有者（Context::State）维持。
+        // - 不变式：与 m_state 互斥使用；任一时刻只有一个非空。
+        State *m_borrowed{nullptr};
+
+        // 借用副本的保活句柄：指向 Context 所在块（由 weak 提升而来）。
+        // - 只有「拷贝了借用句柄」的副本才非空；Context 内部的 m_done 恒为空，
+        //   否则 Context 会持有自己的控制块，引用计数永远不归零。
+        // - 保护：指针本身构造后不变；提升只在拷贝/赋值时发生一次。
+        std::shared_ptr<void> m_owner;
+
+        // 无锁完成标志的地址，等于 &state().done。**不是**独立存储：它只是
         // 让头文件内联的 IsDone() 不必接触不完整类型 State。
         // - 保护：指针本身构造后不变；*m_done_flag 是 atomic<bool>。
-        // - 不变式：只要 m_state 存活就有效；复制/赋值必须与 m_state 一起复制。
-        // - 为什么不用 m_state->done 直接读：State 定义在 .cpp，头文件内联
-        //   函数无法解引用不完整类型。
+        // - 不变式：只要状态存活就有效；复制/赋值必须与状态一起复制。
         std::atomic<bool> *m_done_flag{nullptr};
 
         CallbackId AddCallbackImpl(std::function<void()> callback,
@@ -288,7 +315,13 @@ namespace go2cpp
         static ContextTimePoint Now();
 
     private:
-        explicit Context(std::shared_ptr<State> state);
+        // state 指向本 Context 所属的共享块内状态；生命周期由 ContextPtr
+        // 持有的块控制块保证（Context 与 State 同块，见 context.cpp）。
+        explicit Context(State *state);
+        // 把内嵌完成状态包装成借用型 DoneSignal（状态类型不完整，故放 .cpp）。
+        static DoneSignal MakeBorrowedDone(DoneSignal::State *state);
+        // 返回与 State 共享同一控制块的句柄，供取消函数/父链/timer 保活。
+        std::shared_ptr<State> StateHandle() const;
         static ContextPtr MakeChild(const ContextPtr &parent);
         static ContextPtr MakeValueContext(const ContextPtr &parent,
                                            const void *token,
@@ -301,13 +334,14 @@ namespace go2cpp
             std::function<void()> callback);
         void RemoveBeforeDoneCallback(DoneSignal::CallbackId id) const noexcept;
 
-        // 取消树的节点状态，由本句柄与所有派生句柄共享。
+        // 取消树的节点状态，与 Context 对象位于同一块分配（单次分配方案）。
         // - 保护：State 自带 mutex（见 .cpp 中 State 定义），本指针本身只读。
-        // - 不变式：构造后再不改指；Context 的私有构造函数是唯一入口，
-        //   外部只能经 Background/TODO/WithCancel 等工厂拿到实例。
-        // - 生命周期：与 State 同步；CancelFunc 另持有 State 的 weak_ptr，
-        //   所以句柄全部销毁后取消能力是否仍在取决于 State 是否还有owner。
-        std::shared_ptr<State> m_state;
+        // - 不变式：非空、构造后不改指；Context 与 State 同属 ContextBlock，
+        //   只要还有任一 ContextPtr / CancelFunc 存活，块就存活，指针即有效。
+        // - 为什么是裸指针：若这里持有 shared_ptr，就会形成
+        //   "Context -> 控制块 -> ContextBlock -> Context" 的自引用环，
+        //   引用计数永远不归零；同块布局让裸指针天然获得生命周期保证。
+        State *m_state;
 
         // **镜像成员**：值是 m_state->done 的拷贝。DoneSignal 复制时共享内部
         // State，所以它与 m_state->done 实际是同一个信号，不会出现两份状态。
@@ -334,6 +368,7 @@ namespace go2cpp
         friend std::pair<ContextPtr, CancelFunc> WithTimeout(const ContextPtr &,
                                                              ContextDuration);
         friend class ContextRollback;
+        friend struct detail::ContextFactory;
     };
 
     // ContextRollback 把一个临时子 Context 和一组局部补偿动作绑定在一起。
