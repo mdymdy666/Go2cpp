@@ -403,11 +403,28 @@ std::atomic<int> g_worker_count{0};                    ///< 当前 worker 数
 std::atomic<std::uint64_t> g_worker_ops[kMaxWorkers];  ///< 每 worker 已操作数
 std::atomic<int> g_worker_kind[kMaxWorkers];           ///< 每 worker 当前类别
 std::atomic<int> g_worker_is_fiber[kMaxWorkers];       ///< 每 worker 是否 Fiber
+std::atomic<Task*> g_fiber_tasks[kMaxWorkers];  ///< fiber worker 的 Task（watchdog 诊断）
+std::atomic<int> g_fiber_task_count{0};         ///< fiber worker 数量（watchdog 诊断）
+Scheduler* g_scheduler{nullptr};                ///< 当前 Scheduler（watchdog 诊断）
 std::atomic<bool> g_stop_watchdog{false};
 std::atomic<bool> g_watchdog_fired{false};
 
 struct Shared;
 std::atomic<Shared*> g_shared{nullptr};  ///< 当前轮共享对象（watchdog 诊断用）
+
+/** @brief G 状态名（watchdog 诊断用）。 */
+const char* GStateName(go2cpp::GState state) {
+    switch (state) {
+        case go2cpp::GState::kNew: return "New";
+        case go2cpp::GState::kRunnable: return "Runnable";
+        case go2cpp::GState::kRunning: return "Running";
+        case go2cpp::GState::kWaiting: return "Waiting";
+        case go2cpp::GState::kDead: return "Dead";
+        case go2cpp::GState::kCancelled: return "Cancelled";
+        case go2cpp::GState::kFailed: return "Failed";
+    }
+    return "?";
+}
 
 /** @brief 死锁看门狗：连续 hang_sec 秒无进展就打印现场并强制退出。 */
 void WatchdogMain();
@@ -654,6 +671,31 @@ void WatchdogMain() {
                          "[watchdog]   fast_mpmc len=%zu closed=%d\n",
                          shared->fast_mpmc.Len(),
                          static_cast<int>(shared->fast_mpmc.IsClosed()));
+            const int ftasks =
+                g_fiber_task_count.load(std::memory_order_acquire);
+            for (int fi = 0; fi < ftasks && fi < kMaxWorkers; ++fi) {
+                const Task* const t =
+                    g_fiber_tasks[fi].load(std::memory_order_relaxed);
+                if (t == nullptr) {
+                    continue;
+                }
+                std::fprintf(stderr,
+                             "[watchdog]   fibtask#%d id=%llu state=%s "
+                             "queued=%d cancel=%d lastP=%zu\n",
+                             fi, static_cast<unsigned long long>(t->id()),
+                             GStateName(t->state()),
+                             static_cast<int>(t->queued()),
+                             static_cast<int>(t->cancellation_requested()),
+                             static_cast<std::size_t>(
+                                 t->last_processor_id()));
+            }
+            if (g_scheduler != nullptr) {
+                std::fprintf(
+                    stderr,
+                    "[watchdog]   scheduler runnable=%zu global=%zu\n",
+                    g_scheduler->RunnableCount(),
+                    g_scheduler->GlobalRunnableCount());
+            }
         }
         std::fflush(stderr);
         // 进程里可能有多把锁处于半状态，不走析构，直接终止。
@@ -2093,6 +2135,10 @@ RoundResult RunRound(int round, Scheduler* scheduler, std::uint64_t baseline_rss
     thread_pool.reserve(static_cast<std::size_t>(threads));
     std::vector<std::shared_ptr<Task>> fiber_tasks;
     fiber_tasks.reserve(static_cast<std::size_t>(fibers));
+    for (int i = 0; i < kMaxWorkers; ++i) {
+        g_fiber_tasks[i].store(nullptr, std::memory_order_relaxed);
+    }
+    g_fiber_task_count.store(fibers, std::memory_order_release);
 
     g_phase.store("参与者启动", std::memory_order_relaxed);
     const long long start_ns = NowNs();
@@ -2114,6 +2160,11 @@ RoundResult RunRound(int round, Scheduler* scheduler, std::uint64_t baseline_rss
             std::_Exit(4);
         }
         fiber_tasks.push_back(std::move(task));
+        const int fiber_slot = i - threads;
+        if (fiber_slot >= 0 && fiber_slot < kMaxWorkers) {
+            g_fiber_tasks[fiber_slot].store(task.get(),
+                                            std::memory_order_release);
+        }
     }
 
     g_phase.store("混合压测进行中", std::memory_order_relaxed);
@@ -2213,6 +2264,10 @@ RoundResult RunRound(int round, Scheduler* scheduler, std::uint64_t baseline_rss
     }
 
     // 显式析构：让下一轮的 RSS 能真实反映释放情况。
+    for (int i = 0; i < kMaxWorkers; ++i) {
+        g_fiber_tasks[i].store(nullptr, std::memory_order_release);
+    }
+    g_fiber_task_count.store(0, std::memory_order_release);
     g_shared.store(nullptr, std::memory_order_release);
     shared.reset();
     return result;
@@ -2490,6 +2545,7 @@ int main(int argc, char** argv) {
     std::thread watchdog(WatchdogMain);
 
     Scheduler scheduler(g_cfg.sched_p);
+    g_scheduler = &scheduler;
     scheduler.start();
 
     std::vector<RoundResult> rounds;
