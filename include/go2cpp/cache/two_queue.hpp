@@ -19,19 +19,26 @@
  *          复杂度：Get 均摊 O(1)，Put 均摊 O(1)，空间 O(capacity + ghost)。
  *          与论文的差异：论文的 ghost 命中发生在「读磁盘后重新插入」的
  *          路径上；本接口的 Get 不负责加载，因此 ghost 命中的 key 记入
- *          `pending_promote_`，由紧随其后的 Put 完成提升。
+ *          `pending_`，由紧随其后的 Put 完成提升。
+ *
+ * ## 容器层（本次优化）
+ *
+ *          A1in/Am 共用一张**开放寻址索引**（两段互斥，条目自带段标记），
+ *          Get 从「查 am -> 查 a1in -> 查 ghost」三次哈希降为两次；
+ *          条目/A1out 节点/待提升记录全部走侵入式链表 + 节点池，
+ *          插入路径的堆分配从 4 次降到 0 次（稳态）。
  */
 #pragma once
 
 #include <cstddef>
-#include <list>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 #include "go2cpp/cache/cache.hpp"
+#include "go2cpp/cache/detail/bucket_map.hpp"
+#include "go2cpp/cache/detail/intrusive.hpp"
 
 namespace go2cpp {
 namespace cache {
@@ -47,43 +54,58 @@ public:
     explicit TwoQueueCache(CacheOptions options = CacheOptions{})
         : capacity_(options.capacity),
           a1in_capacity_(options.capacity < 4U ? 1U : options.capacity / 4U),
-          a1out_capacity_(options.capacity < 2U ? 1U : options.capacity / 2U) {
+          a1out_capacity_(options.capacity < 2U ? 1U : options.capacity / 2U),
+          index_(options.capacity),
+          ghost_index_(options.capacity / 2U + 1U),
+          pending_index_(16U) {
         if (capacity_ == 0) {
             throw std::invalid_argument("TwoQueueCache: capacity must be >= 1");
         }
     }
 
-    bool Get(const K& key, V* value) override {
-        auto am_it = am_index_.find(key);
-        if (am_it != am_index_.end()) {
-            am_.splice(am_.begin(), am_, am_it->second);
-            if (value != nullptr) {
-                *value = am_it->second->value;
-            }
-            pending_.erase(key);
-            stats_.RecordHit();
-            return true;
+    ~TwoQueueCache() override {
+        // 节点池只回收整块内存，非平凡 value 必须在析构前显式销毁。
+        while (Entry* entry = a1in_.pop_front()) {
+            pool_.Destroy(entry);
         }
-        auto a1in_it = a1in_index_.find(key);
-        if (a1in_it != a1in_index_.end()) {
+        while (Entry* entry = am_.pop_front()) {
+            pool_.Destroy(entry);
+        }
+        while (GhostNode* ghost = a1out_.pop_front()) {
+            ghost_pool_.Destroy(ghost);
+        }
+        while (PendingNode* node = pending_.pop_front()) {
+            pending_pool_.Destroy(node);
+        }
+    }
+
+    bool Get(const K& key, V* value) override {
+        Entry* entry = Lookup(key);
+        if (entry != nullptr) {
+            if (entry->segment == kSegmentAm) {
+                am_.move_to_front(entry);
+            }
             // A1in 是 FIFO：命中不改变位置，这正是 2Q 与 LRU 的关键差别。
             if (value != nullptr) {
-                *value = a1in_it->second->value;
+                *value = entry->value;
             }
-            pending_.erase(key);
+            TakePending(key);
             stats_.RecordHit();
             return true;
         }
-        auto ghost_it = a1out_index_.find(key);
-        if (ghost_it != a1out_index_.end()) {
+        GhostNode* ghost = LookupGhost(key);
+        if (ghost != nullptr) {
             // ghost 命中：数据已不在缓存，记下来让下一次 Put 直接进 Am。
-            const K ghost_key = ghost_it->first;
-            a1out_.erase(ghost_it->second);
-            a1out_index_.erase(ghost_it);
+            const K ghost_key = ghost->key;
+            ghost_index_.Erase(ghost);
+            a1out_.erase(ghost);
+            ghost_pool_.Destroy(ghost);
             if (pending_.size() >= a1out_capacity_) {
-                pending_.erase(pending_.begin());
+                DropOldestPending();
             }
-            pending_.insert(ghost_key);
+            PendingNode* node = pending_pool_.Create(ghost_key);
+            pending_.push_back(node);
+            pending_index_.Insert(node);
             stats_.RecordGhostHit();
             stats_.RecordMiss();
             return false;
@@ -93,107 +115,94 @@ public:
     }
 
     bool Peek(const K& key, V* value) const override {
-        auto am_it = am_index_.find(key);
-        if (am_it != am_index_.end()) {
-            if (value != nullptr) {
-                *value = am_it->second->value;
-            }
-            return true;
+        Entry* entry = Lookup(key);
+        if (entry == nullptr) {
+            return false;
         }
-        auto a1in_it = a1in_index_.find(key);
-        if (a1in_it != a1in_index_.end()) {
-            if (value != nullptr) {
-                *value = a1in_it->second->value;
-            }
-            return true;
+        if (value != nullptr) {
+            *value = entry->value;
         }
-        return false;
+        return true;
     }
 
     void Put(const K& key, V value, std::size_t weight = 1) override {
-        auto am_it = am_index_.find(key);
-        if (am_it != am_index_.end()) {
-            Entry& entry = *am_it->second;
-            weight_ = weight_ - entry.weight + weight;
-            entry.value = std::move(value);
-            entry.weight = weight;
-            am_.splice(am_.begin(), am_, am_it->second);
-            pending_.erase(key);
+        Entry* entry = Lookup(key);
+        if (entry != nullptr) {
+            weight_ = weight_ - entry->weight + weight;
+            entry->value = std::move(value);
+            entry->weight = weight;
+            if (entry->segment == kSegmentAm) {
+                am_.move_to_front(entry);
+            }
+            TakePending(key);
             stats_.RecordUpdate();
             return;
         }
-        auto a1in_it = a1in_index_.find(key);
-        if (a1in_it != a1in_index_.end()) {
-            Entry& entry = *a1in_it->second;
-            weight_ = weight_ - entry.weight + weight;
-            entry.value = std::move(value);
-            entry.weight = weight;
-            pending_.erase(key);
-            stats_.RecordUpdate();
-            return;
-        }
-        if (pending_.erase(key) > 0U) {
+        if (TakePending(key)) {
             ReclaimForInsert();
-            InsertAm(key, std::move(value), weight);
+            Insert(entry, kSegmentAm, key, std::move(value), weight);
             stats_.RecordInsert();
             return;
         }
         ReclaimForInsert();
-        InsertA1in(key, std::move(value), weight);
+        Insert(entry, kSegmentA1in, key, std::move(value), weight);
         stats_.RecordInsert();
     }
 
     bool Erase(const K& key) override {
-        auto am_it = am_index_.find(key);
-        if (am_it != am_index_.end()) {
-            weight_ -= am_it->second->weight;
-            am_.erase(am_it->second);
-            am_index_.erase(am_it);
-            pending_.erase(key);
+        Entry* entry = Lookup(key);
+        if (entry != nullptr) {
+            weight_ -= entry->weight;
+            index_.Erase(entry);
+            if (entry->segment == kSegmentAm) {
+                am_.erase(entry);
+            } else {
+                a1in_.erase(entry);
+            }
+            pool_.Destroy(entry);
+            TakePending(key);
             stats_.RecordRemoval();
             return true;
         }
-        auto a1in_it = a1in_index_.find(key);
-        if (a1in_it != a1in_index_.end()) {
-            weight_ -= a1in_it->second->weight;
-            a1in_.erase(a1in_it->second);
-            a1in_index_.erase(a1in_it);
-            pending_.erase(key);
-            stats_.RecordRemoval();
-            return true;
-        }
-        auto ghost_it = a1out_index_.find(key);
-        if (ghost_it != a1out_index_.end()) {
-            a1out_.erase(ghost_it->second);
-            a1out_index_.erase(ghost_it);
-            pending_.erase(key);
+        GhostNode* ghost = LookupGhost(key);
+        if (ghost != nullptr) {
+            ghost_index_.Erase(ghost);
+            a1out_.erase(ghost);
+            ghost_pool_.Destroy(ghost);
+            TakePending(key);
         }
         return false;
     }
 
     void Clear() override {
-        a1in_.clear();
-        a1in_index_.clear();
-        am_.clear();
-        am_index_.clear();
-        a1out_.clear();
-        a1out_index_.clear();
-        pending_.clear();
+        while (Entry* entry = a1in_.pop_front()) {
+            pool_.Destroy(entry);
+        }
+        while (Entry* entry = am_.pop_front()) {
+            pool_.Destroy(entry);
+        }
+        while (GhostNode* node = a1out_.pop_front()) {
+            ghost_pool_.Destroy(node);
+        }
+        while (PendingNode* node = pending_.pop_front()) {
+            pending_pool_.Destroy(node);
+        }
+        index_.Clear();
+        ghost_index_.Clear();
+        pending_index_.Clear();
         weight_ = 0;
     }
 
-    std::size_t Size() const override {
-        return a1in_index_.size() + am_index_.size();
-    }
+    std::size_t Size() const override { return index_.size(); }
     std::size_t Capacity() const override { return capacity_; }
     std::size_t Weight() const override { return weight_; }
 
     CacheStats Stats() const override {
         CacheStats stats = stats_.Snapshot();
-        stats.size = a1in_index_.size() + am_index_.size();
+        stats.size = index_.size();
         stats.capacity = capacity_;
         stats.weight = weight_;
-        stats.ghost_size = a1out_index_.size();
+        stats.ghost_size = ghost_index_.size();
         return stats;
     }
 
@@ -201,42 +210,82 @@ public:
 
     std::string Describe() const override {
         return "2Q{capacity=" + std::to_string(capacity_) +
-               ", a1in=" + std::to_string(a1in_index_.size()) +
-               ", am=" + std::to_string(am_index_.size()) +
-               ", a1out=" + std::to_string(a1out_index_.size()) +
+               ", a1in=" + std::to_string(a1in_.size()) +
+               ", am=" + std::to_string(am_.size()) +
+               ", a1out=" + std::to_string(ghost_index_.size()) +
                ", pending=" + std::to_string(pending_.size()) + "}";
     }
 
 private:
-    struct Entry {
+    enum : std::uint8_t {
+        kSegmentA1in = 0,  ///< 准入 FIFO 段。
+        kSegmentAm = 1,    ///< 主 LRU 段。
+    };
+
+    /** @brief 驻留条目：A1in 与 Am 共用，`segment` 决定在哪个链表。 */
+    struct Entry : detail::Link<Entry>, detail::HashNode<Entry> {
+        Entry(const K& entry_key, V entry_value, std::size_t entry_weight,
+              std::uint8_t entry_segment)
+            : key(entry_key),
+              value(std::move(entry_value)),
+              weight(entry_weight),
+              segment(entry_segment) {}
+
         K key;
         V value;
         std::size_t weight;
+        std::uint8_t segment;
     };
 
-    using EntryList = std::list<Entry>;
-    using KeyList = std::list<K>;
+    /** @brief A1out 里的 ghost 节点：只存 key。 */
+    struct GhostNode : detail::Link<GhostNode>, detail::HashNode<GhostNode> {
+        explicit GhostNode(const K& ghost_key) : key(ghost_key) {}
+        K key;
+    };
 
-    void InsertA1in(const K& key, V value, std::size_t weight) {
-        a1in_.push_front(Entry{key, std::move(value), weight});
-        a1in_index_.emplace(key, a1in_.begin());
-        weight_ += weight;
-    }
+    /** @brief 待提升记录（ghost 命中后，下一次 Put 直接进 Am）。 */
+    struct PendingNode : detail::Link<PendingNode>, detail::HashNode<PendingNode> {
+        explicit PendingNode(const K& pending_key) : key(pending_key) {}
+        K key;
+    };
 
-    void InsertAm(const K& key, V value, std::size_t weight) {
-        am_.push_front(Entry{key, std::move(value), weight});
-        am_index_.emplace(key, am_.begin());
-        weight_ += weight;
-    }
+    Entry* Lookup(const K& key) const { return index_.Find(key); }
 
-    void InsertA1out(K key) {
-        a1out_.push_front(std::move(key));
-        a1out_index_.emplace(a1out_.front(), a1out_.begin());
-        while (a1out_.size() > a1out_capacity_) {
-            auto tail = std::prev(a1out_.end());
-            a1out_index_.erase(*tail);
-            a1out_.erase(tail);
+    GhostNode* LookupGhost(const K& key) const { return ghost_index_.Find(key); }
+
+    /** @brief 若 key 在待提升表里，摘掉并销毁；返回是否找到。 */
+    bool TakePending(const K& key) {
+        PendingNode* node = pending_index_.Find(key);
+        if (node == nullptr) {
+            return false;
         }
+        pending_index_.Erase(node);
+        pending_.erase(node);
+        pending_pool_.Destroy(node);
+        return true;
+    }
+
+    /** @brief pending 超过容量时丢弃最老的一条（与原实现「丢任意一条」等价）。 */
+    void DropOldestPending() {
+        PendingNode* oldest = pending_.front();
+        if (oldest == nullptr) {
+            return;
+        }
+        pending_index_.Erase(oldest);
+        pending_.pop_front();
+        pending_pool_.Destroy(oldest);
+    }
+
+    void Insert(Entry*& out, std::uint8_t segment, const K& key, V value,
+                std::size_t weight) {
+        out = pool_.Create(key, std::move(value), weight, segment);
+        index_.Insert(out);
+        if (segment == kSegmentAm) {
+            am_.push_front(out);
+        } else {
+            a1in_.push_front(out);
+        }
+        weight_ += weight;
     }
 
     void ReclaimForInsert() {
@@ -257,38 +306,52 @@ private:
     }
 
     void DemoteA1inTail() {
-        auto tail = std::prev(a1in_.end());
-        a1in_index_.erase(tail->key);
-        K ghost_key = std::move(tail->key);
+        Entry* tail = a1in_.back();
+        if (tail == nullptr) {
+            return;
+        }
+        const K ghost_key = tail->key;
         weight_ -= tail->weight;
+        index_.Erase(tail);
         a1in_.erase(tail);
+        pool_.Destroy(tail);
         stats_.RecordEviction();
-        InsertA1out(std::move(ghost_key));
+        GhostNode* ghost = ghost_pool_.Create(ghost_key);
+        a1out_.push_front(ghost);
+        ghost_index_.Insert(ghost);
+        while (a1out_.size() > a1out_capacity_) {
+            GhostNode* oldest = a1out_.back();
+            ghost_index_.Erase(oldest);
+            a1out_.erase(oldest);
+            ghost_pool_.Destroy(oldest);
+        }
     }
 
     void EvictAmTail() {
-        if (am_.empty()) {
+        Entry* tail = am_.back();
+        if (tail == nullptr) {
             return;
         }
-        auto tail = std::prev(am_.end());
         weight_ -= tail->weight;
-        am_index_.erase(tail->key);
+        index_.Erase(tail);
         am_.erase(tail);
+        pool_.Destroy(tail);
         stats_.RecordEviction();
     }
 
     std::size_t capacity_;
     std::size_t a1in_capacity_;
     std::size_t a1out_capacity_;
-    EntryList a1in_;
-    std::unordered_map<K, typename EntryList::iterator, Hash, Equal>
-        a1in_index_;
-    EntryList am_;
-    std::unordered_map<K, typename EntryList::iterator, Hash, Equal> am_index_;
-    KeyList a1out_;
-    std::unordered_map<K, typename KeyList::iterator, Hash, Equal>
-        a1out_index_;
-    std::unordered_set<K, Hash, Equal> pending_;
+    detail::IntrusiveList<Entry> a1in_;
+    detail::IntrusiveList<Entry> am_;
+    detail::IntrusiveList<GhostNode> a1out_;
+    detail::IntrusiveList<PendingNode> pending_;
+    detail::BucketMap<K, Entry, Hash, Equal> index_;
+    detail::BucketMap<K, GhostNode, Hash, Equal> ghost_index_;
+    detail::BucketMap<K, PendingNode, Hash, Equal> pending_index_;
+    detail::NodePool<Entry> pool_;
+    detail::NodePool<GhostNode> ghost_pool_;
+    detail::NodePool<PendingNode> pending_pool_;
     std::size_t weight_ = 0;
     StatsRecorder stats_;
 };

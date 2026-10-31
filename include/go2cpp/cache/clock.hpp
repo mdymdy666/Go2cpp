@@ -17,6 +17,17 @@
  *
  *          复杂度：Get / Put / Erase 均摊 O(1)（淘汰最多扫描 2×capacity
  *          个槽位），空间 O(capacity) 且无逐条目的堆分配。
+ *
+ * ## 容器层（本次优化）
+ *
+ *          key -> 槽位的索引从 `std::unordered_map` 换成侵入式链式哈希
+ *          `detail::BucketMap`：索引节点（key + 槽号 + 桶链指针）来自定长
+ *          节点池，插入/删除是纯指针改写、0 次 malloc；Get 不再追一次
+ *          「桶数组 -> 节点 -> 槽」的三跳，而是「桶 -> 节点（含槽号）->
+ *          槽」两跳。
+ *
+ *          另外，hand 指针的 `% capacity_` 换成了「自增 + 到头归零」——
+ *          整数除法在热路径上是 20~40 周期的固定开销，而它只需要一次比较。
  */
 #pragma once
 
@@ -24,11 +35,12 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "go2cpp/cache/cache.hpp"
+#include "go2cpp/cache/detail/bucket_map.hpp"
+#include "go2cpp/cache/detail/intrusive.hpp"
 
 namespace go2cpp {
 namespace cache {
@@ -42,7 +54,9 @@ class ClockCache final : public Cache<K, V> {
 public:
     /** @brief 构造；capacity 必须 >= 1。 */
     explicit ClockCache(CacheOptions options = CacheOptions{})
-        : capacity_(options.capacity), slots_(options.capacity) {
+        : capacity_(options.capacity),
+          slots_(options.capacity),
+          index_(options.capacity) {
         if (capacity_ == 0) {
             throw std::invalid_argument("ClockCache: capacity must be >= 1");
         }
@@ -52,13 +66,18 @@ public:
         }
     }
 
+    ~ClockCache() override {
+        // 节点池只回收整块内存，非平凡 value 必须在析构前显式销毁。
+        index_.ForEach([this](IndexNode* node) { pool_.Destroy(node); });
+    }
+
     bool Get(const K& key, V* value) override {
-        auto it = index_.find(key);
-        if (it == index_.end()) {
+        IndexNode* node = index_.Find(key);
+        if (node == nullptr) {
             stats_.RecordMiss();
             return false;
         }
-        Slot& slot = slots_[it->second];
+        Slot& slot = slots_[node->slot];
         slot.referenced = true;
         if (value != nullptr) {
             *value = *slot.value;
@@ -68,20 +87,20 @@ public:
     }
 
     bool Peek(const K& key, V* value) const override {
-        auto it = index_.find(key);
-        if (it == index_.end()) {
+        const IndexNode* node = index_.Find(key);
+        if (node == nullptr) {
             return false;
         }
         if (value != nullptr) {
-            *value = *slots_[it->second].value;
+            *value = *slots_[node->slot].value;
         }
         return true;
     }
 
     void Put(const K& key, V value, std::size_t weight = 1) override {
-        auto it = index_.find(key);
-        if (it != index_.end()) {
-            Slot& slot = slots_[it->second];
+        IndexNode* node = index_.Find(key);
+        if (node != nullptr) {
+            Slot& slot = slots_[node->slot];
             weight_ = weight_ - slot.weight + weight;
             slot.value = std::move(value);
             slot.weight = weight;
@@ -96,41 +115,46 @@ public:
         } else {
             victim = FindVictim();
             Slot& old = slots_[victim];
-            index_.erase(*old.key);
+            IndexNode* old_node = old.node;
             weight_ -= old.weight;
-            old.key.reset();
+            index_.Erase(old_node);
+            pool_.Destroy(old_node);
             old.value.reset();
+            old.node = nullptr;
             stats_.RecordEviction();
         }
         Slot& slot = slots_[victim];
-        slot.key = key;
         slot.value = std::move(value);
         slot.weight = weight;
         slot.referenced = true;
-        index_.emplace(key, victim);
+        IndexNode* fresh = pool_.Create(key, victim);
+        slot.node = fresh;
+        index_.Insert(fresh);
         weight_ += weight;
         stats_.RecordInsert();
     }
 
     bool Erase(const K& key) override {
-        auto it = index_.find(key);
-        if (it == index_.end()) {
+        IndexNode* node = index_.Find(key);
+        if (node == nullptr) {
             return false;
         }
-        const std::size_t slot_index = it->second;
+        const std::size_t slot_index = node->slot;
         Slot& slot = slots_[slot_index];
         weight_ -= slot.weight;
-        slot.key.reset();
         slot.value.reset();
+        slot.node = nullptr;
         slot.referenced = false;
-        index_.erase(it);
+        index_.Erase(node);
+        pool_.Destroy(node);
         free_slots_.push_back(slot_index);
         stats_.RecordRemoval();
         return true;
     }
 
     void Clear() override {
-        index_.clear();
+        index_.ForEach([this](IndexNode* node) { pool_.Destroy(node); });
+        index_.Clear();
         weight_ = 0;
         hand_ = 0;
         free_slots_.clear();
@@ -162,34 +186,47 @@ public:
     }
 
 private:
+    /** @brief 索引节点：key + 槽号 + 桶链指针（侵入式，来自池）。 */
+    struct IndexNode : detail::HashNode<IndexNode> {
+        IndexNode(const K& node_key, std::size_t node_slot)
+            : key(node_key), slot(node_slot) {}
+
+        K key;
+        std::size_t slot;
+    };
+
+    /** @brief 环上一个槽位；`node == nullptr` 表示空槽。 */
     struct Slot {
-        std::optional<K> key;
         std::optional<V> value;
+        IndexNode* node = nullptr;
         bool referenced = false;
         std::size_t weight = 0;
     };
 
+    void AdvanceHand() noexcept {
+        ++hand_;
+        if (hand_ == capacity_) {
+            hand_ = 0;
+        }
+    }
+
     std::size_t FindVictim() noexcept {
-        while (true) {
+        for (;;) {
             Slot& slot = slots_[hand_];
-            if (!slot.key.has_value()) {
+            if (slot.node == nullptr || !slot.referenced) {
                 const std::size_t victim = hand_;
-                hand_ = (hand_ + 1U) % capacity_;
-                return victim;
-            }
-            if (!slot.referenced) {
-                const std::size_t victim = hand_;
-                hand_ = (hand_ + 1U) % capacity_;
+                AdvanceHand();
                 return victim;
             }
             slot.referenced = false;
-            hand_ = (hand_ + 1U) % capacity_;
+            AdvanceHand();
         }
     }
 
     std::size_t capacity_;
     std::vector<Slot> slots_;
-    std::unordered_map<K, std::size_t, Hash, Equal> index_;
+    detail::BucketMap<K, IndexNode, Hash, Equal> index_;
+    detail::NodePool<IndexNode> pool_;
     std::vector<std::size_t> free_slots_;
     std::size_t hand_ = 0;
     std::size_t weight_ = 0;
