@@ -250,6 +250,8 @@ private:
     std::string m_prefetched;
     /// m_prefetched 的读游标；read_exact() 推进。
     std::size_t m_prefetched_offset{0};
+    /// m_prefetched 中有效字节数（缓冲容量可能更大）；read_exact() 使用。
+    std::size_t m_prefetched_valid{0};
 };
 
 }  // namespace go2cpp::net

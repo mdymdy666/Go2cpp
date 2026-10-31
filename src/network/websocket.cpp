@@ -394,7 +394,10 @@ WebSocket::Ptr WebSocket::Connect(Socket::Ptr socket, std::string host, std::str
 WebSocket::WebSocket(Socket::Ptr socket, WebSocketRole role, WebSocketConfig config,
                      std::string pending)
     : m_socket(std::move(socket)), m_role(role), m_config(config),
-      m_prefetched(std::move(pending)) {}
+      m_prefetched(std::move(pending)) {
+    // 握手剩余的字节立即生效；之后 m_prefetched 兼作 16KB 预读缓冲。
+    m_prefetched_valid = m_prefetched.size();
+}
 
 WebSocket::~WebSocket() {
     m_closed.store(true, std::memory_order_release);
@@ -413,9 +416,12 @@ WebSocketResult WebSocket::read_exact(void* data, std::size_t size) {
     auto* output = static_cast<std::uint8_t*>(data);
     const auto start = std::chrono::steady_clock::now();
     std::size_t offset = 0;
+    // 预读块大小：一帧的 header/扩展/掩码/payload 通常一次 recv 就能取回，
+    // 原来每个字段各一次 recv（最多 4 次系统调用/帧）。
+    constexpr std::size_t kPrefetchChunk = 16 * 1024;
     while (offset < size) {
-        if (m_prefetched_offset < m_prefetched.size()) {
-            const auto available = m_prefetched.size() - m_prefetched_offset;
+        if (m_prefetched_offset < m_prefetched_valid) {
+            const auto available = m_prefetched_valid - m_prefetched_offset;
             const auto copied = std::min(available, size - offset);
             std::memcpy(output + offset, m_prefetched.data() + m_prefetched_offset, copied);
             m_prefetched_offset += copied;
@@ -429,14 +435,21 @@ WebSocketResult WebSocket::read_exact(void* data, std::size_t size) {
             if (elapsed >= timeout) timeout = Socket::Duration::zero();
             else timeout -= elapsed;
         }
-        const auto result = m_socket->recv(output + offset, size - offset, 0, timeout);
+        try {
+            if (m_prefetched.size() < kPrefetchChunk) m_prefetched.resize(kPrefetchChunk);
+        } catch (const std::bad_alloc&) {
+            return {WebSocketError::MessageTooLarge, ENOMEM,
+                    "prefetch buffer allocation failed"};
+        }
+        const auto result = m_socket->recv(m_prefetched.data(), m_prefetched.size(), 0, timeout);
         if (!result.ok()) {
             const auto error = result.error == ETIMEDOUT ? WebSocketError::Timeout :
                 (result.error == ECANCELED || result.error == EBADF ? WebSocketError::Closed : WebSocketError::Io);
             return {error, result.error, result_message(error, result.error, {})};
         }
         if (result.transferred == 0) return {WebSocketError::Closed, 0, "peer closed"};
-        offset += static_cast<std::size_t>(result.transferred);
+        m_prefetched_valid = static_cast<std::size_t>(result.transferred);
+        m_prefetched_offset = 0;
     }
     return WebSocketResult::success();
 }
@@ -590,7 +603,24 @@ WebSocketResult WebSocket::write_frame_unlocked(WebSocketOpcode opcode, std::str
         std::copy(mask_key.begin(), mask_key.end(), header.begin() + header_size);
         header_size += mask_key.size();
     }
-    // step4: 先写头；失败即认为连接不可用。
+    // step4: 小帧把 header 与 payload 合并成一次 write；原来每帧固定 2 次
+    // 系统调用（先写头、再写 payload）。大帧仍分段写，避免为了合并而
+    // 拷贝大块数据。512B 覆盖绝大多数控制/小消息帧。
+    constexpr std::size_t kInlineFramePayload = 512;
+    if (!mask && payload.size() <= kInlineFramePayload) {
+        std::array<std::uint8_t, 14 + kInlineFramePayload> buffer{};
+        std::memcpy(buffer.data(), header.data(), header_size);
+        if (!payload.empty()) {
+            std::memcpy(buffer.data() + header_size, payload.data(), payload.size());
+        }
+        auto result = write_all(buffer.data(), header_size + payload.size());
+        if (!result.ok()) {
+            abort_transport();
+            m_closed.store(true, std::memory_order_release);
+        }
+        return result;
+    }
+    // step5: 大帧或掩码帧先写头；失败即认为连接不可用。
     auto result = write_all(header.data(), header_size);
     if (!result.ok()) {
         abort_transport();

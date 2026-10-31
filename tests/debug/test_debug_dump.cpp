@@ -491,6 +491,8 @@ void run_debug_dump_tests() {
         GO2CPP_CHECK(status.valid && status.ok);
         GO2CPP_CHECK(Contains(status.payload, "protocol=GO2CPP-DEBUG/1"));
         GO2CPP_CHECK(Contains(status.payload, "debug_dump="));
+        // B-02：DebugServer 监听 AF_UNIX，TCP_NODELAY 不适用，状态应为 unknown。
+        GO2CPP_CHECK(Contains(status.payload, "accept_nodelay=unknown"));
 
         const Response dump = ParseResponse(server.HandleCommand("DUMP scheduler"));
         GO2CPP_CHECK(dump.valid && dump.ok);

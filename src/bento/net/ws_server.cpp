@@ -283,33 +283,23 @@ WsServerResult WsServer::Start() {
     m_rejected.store(0, std::memory_order_release);
     m_messages.store(0, std::memory_order_release);
     m_next_connection_id.store(1, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lock(m_queue_mutex);
-        m_queue_closed = false;
-        m_queue.clear();
-    }
     m_running.store(true, std::memory_order_release);
 
-    const std::size_t worker_count = m_config.worker_threads;
-    try {
-        m_workers.reserve(worker_count);
-        for (std::size_t index = 0; index < worker_count; ++index) {
-            m_workers.emplace_back([this]() { WorkerLoop(); });
-        }
-        m_acceptor = std::thread([this]() { AcceptLoop(); });
-    } catch (const std::exception& error) {
-        // 线程创建失败：先让已启动的 worker 退出，再回滚运行标记。
-        m_stopping.store(true, std::memory_order_release);
-        {
-            std::lock_guard<std::mutex> lock(m_queue_mutex);
-            m_queue_closed = true;
-        }
-        m_queue_cv.notify_all();
-        JoinWorkers();
+    // 每连接一个 Fiber（与 Go net/http + gorilla/websocket 的模型一致）：
+    // worker_threads 只决定 OS 线程数量，连接数不再受线程池大小限制。
+    SchedulerConfig config;
+    config.processor_count = m_config.worker_threads;
+    config.max_workers = m_config.worker_threads;
+    config.min_workers = m_config.worker_threads;
+    config.collect_metrics = false;
+    auto manager = std::make_shared<io::IOManager>(config);
+    if (!manager->start()) {
         m_running.store(false, std::memory_order_release);
         return WsServerResult::Failure(WsServerError::ThreadFailure,
-                                       std::string("创建服务线程失败: ") + error.what());
+                                       "创建 Fiber 调度器失败");
     }
+    m_manager = std::move(manager);
+    m_manager->go([this]() { AcceptLoop(); });
     return WsServerResult::Success();
 }
 
@@ -321,38 +311,21 @@ void WsServer::Stop() noexcept {
     }
     m_stopping.store(true, std::memory_order_release);
 
-    // step1: 关闭队列并丢弃尚未处理的连接（锁外 close，避免持锁做系统调用）。
-    std::deque<net::Socket::Ptr> dropped;
-    {
-        std::lock_guard<std::mutex> lock(m_queue_mutex);
-        m_queue_closed = true;
-        dropped.swap(m_queue);
-    }
-    m_queue_cv.notify_all();
-    for (auto& connection : dropped) {
-        if (connection) {
-            (void)connection->close();
-        }
-    }
-
-    // step2: shutdown 所有活动连接，唤醒阻塞在握手 recv / 帧 recv 上的 worker。
+    // step1: shutdown 所有活动连接，唤醒阻塞在握手 recv / 帧 recv 上的 Fiber。
     CloseAllConnections();
-
-    // step3: accept 线程按 accept_timeout 轮询停止标记，最多等一个超时周期。
-    if (m_acceptor.joinable()) {
-        try {
-            m_acceptor.join();
-        } catch (...) {
-            // join 失败（例如线程已被 detach）不影响后续清理。
-        }
+    // step2: shutdown 监听 socket，让 accept 的等待尽快返回。
+    if (m_listener) {
+        (void)m_listener->shutdown(SHUT_RDWR);
     }
-
-    // step4: 关闭监听 socket（join 之后关闭，避免 accept 使用已释放对象）。
+    // step3: 停止 Fiber 调度器；AcceptLoop 最多一个 accept 超时周期内退出。
+    auto manager = m_manager;
+    m_manager.reset();
+    if (manager) {
+        manager->shutdown();
+    }
+    // step4: 兜底再唤醒一次，并释放监听 socket。
+    CloseAllConnections();
     CloseListener();
-
-    // step5: 等待所有 worker 收尾，并兜底再唤醒一次（覆盖注册竞态窗口）。
-    JoinWorkers();
-    CloseAllConnections();
 }
 
 std::string WsServer::LocalAddress() const {
@@ -381,20 +354,30 @@ void WsServer::AcceptLoop() {
             (void)connection->close();
             return;
         }
-        bool queued = false;
+        // 先登记再起 Fiber：Stop() 扫描活动表时不会漏掉正在启动的连接。
         {
-            std::lock_guard<std::mutex> lock(m_queue_mutex);
-            if (!m_queue_closed && m_queue.size() < m_config.max_queued_connections) {
-                m_queue.push_back(std::move(connection));
-                queued = true;
-            }
+            std::lock_guard<std::mutex> lock(m_active_mutex);
+            m_active.emplace(connection.get(), connection);
         }
-        if (queued) {
-            m_queue_cv.notify_one();
-        } else if (connection) {
-            // 队列满：骨架级背压直接拒绝，让客户端看到连接被关闭。
+        m_active_count.fetch_add(1, std::memory_order_acq_rel);
+        if (!m_manager) {
             (void)connection->close();
+            m_active_count.fetch_sub(1, std::memory_order_acq_rel);
+            std::lock_guard<std::mutex> lock(m_active_mutex);
+            m_active.erase(connection.get());
+            return;
         }
+        m_manager->go([this, connection]() {
+            if (!m_stopping.load(std::memory_order_acquire)) {
+                ServeConnection(connection);
+            }
+            (void)connection->close();
+            {
+                std::lock_guard<std::mutex> lock(m_active_mutex);
+                m_active.erase(connection.get());
+            }
+            m_active_count.fetch_sub(1, std::memory_order_acq_rel);
+        });
     }
 }
 
@@ -433,19 +416,17 @@ void WsServer::WorkerLoop() {
 }
 
 bool WsServer::ReadHandshake(const net::Socket::Ptr& connection, http::Parser& parser,
-                             http::Request& request) {
-    std::array<char, kHandshakeReadChunk> buffer{};
+                             http::Request& request, char* buffer, std::size_t capacity) {
     for (;;) {
         if (m_stopping.load(std::memory_order_acquire)) {
             return false;
         }
-        const auto count = connection->recv(buffer.data(), buffer.size());
+        const auto count = connection->recv(buffer, capacity);
         if (count.transferred <= 0) {
             return false;
         }
         const auto parsed = parser.feed(
-            std::string_view(buffer.data(), static_cast<std::size_t>(count.transferred)),
-            request);
+            std::string_view(buffer, static_cast<std::size_t>(count.transferred)), request);
         if (parsed.state == http::ParseState::Error) {
             return false;
         }
@@ -466,7 +447,10 @@ void WsServer::ServeConnection(const net::Socket::Ptr& connection) {
     http::Parser parser(limits);
 
     http::Request request;
-    if (!ReadHandshake(connection, parser, request)) {
+    // 连接级握手缓冲：避免 4KB 栈数组在 4KB 初始 Fiber 栈上触发栈增长。
+    std::vector<char> handshake_buffer(4096);
+    if (!ReadHandshake(connection, parser, request, handshake_buffer.data(),
+                       handshake_buffer.size())) {
         return;
     }
     // Parser 可能把紧随 Upgrade 请求之后的首个 WebSocket 帧一起读进缓冲区，
