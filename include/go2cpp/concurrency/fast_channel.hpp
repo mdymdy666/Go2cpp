@@ -245,6 +245,12 @@ class FastSpscChannel final {
       return FastStatus::kOk;
     }
     if (m_closed.load(std::memory_order_acquire)) {
+      // 关闭语义：先排空缓冲再返回 kClosed。上面的 Pop 与本次 closed 检查
+      // 之间，生产者可能刚 push 最后一个值再 Close；这里再取一次，避免
+      // kClosed 遮蔽 Close 前入环的值。
+      if (Pop(out)) {
+        return FastStatus::kOk;
+      }
       out = T{};
       return FastStatus::kClosed;
     }
@@ -301,6 +307,10 @@ class FastSpscChannel final {
         return FastStatus::kOk;
       }
       if (m_closed.load(std::memory_order_acquire)) {
+        // 同 TryRecv：关闭后先把 Close 前入环的值排空，再返回 kClosed。
+        if (Pop(out)) {
+          return FastStatus::kOk;
+        }
         out = T{};
         return FastStatus::kClosed;
       }
@@ -571,6 +581,13 @@ class FastChannel final {
       }
     }
     if (m_closed.load(std::memory_order_acquire)) {
+      // 关闭语义：先排空缓冲再返回 kClosed（TryDequeue 与 closed 检查之间
+      // 的入环窗口）。
+      if constexpr (Cap > 0) {
+        if (TryDequeue(out)) {
+          return FastStatus::kOk;
+        }
+      }
       out = T{};
       return FastStatus::kClosed;
     }
@@ -638,6 +655,13 @@ class FastChannel final {
         }
       }
       if (m_closed.load(std::memory_order_acquire)) {
+        // 关闭语义：先排空缓冲再返回 kClosed。上一条 TryDequeue 与本次
+        // closed 检查之间 producer 可能刚入环最后一个值再 Close。
+        if constexpr (Cap > 0) {
+          if (TryDequeue(out)) {
+            return FastStatus::kOk;
+          }
+        }
         out = T{};
         return FastStatus::kClosed;
       }
@@ -1128,9 +1152,12 @@ class FastChannel final {
  * 只保留「lock → 判满/判空 → 入缓冲/出缓冲 → unlock」四步，用于和
  * `FastChannel`（Vyukov ring）做同场对照，量化「去掉同一地址 RMW 争用」
  * 带来的收益。语义与 `FastChannel` 完全一致。
+ *
+ * 刻意**不声明为 final**：`FastChannel<T, 1>` 的单槽特化直接继承本类
+ * （1 槽容量下 Vyukov ring 的 seq 协议退化，见文件末尾特化注释）。
  */
 template <typename T, std::size_t Cap>
-class FastChannelLock final {
+class FastChannelLock {
  public:
   static_assert(std::is_nothrow_move_constructible<T>::value, "");
   static_assert(std::is_nothrow_move_assignable<T>::value, "");
@@ -1493,6 +1520,63 @@ class FastChannelLock final {
   detail::WaitQueue<SendNode> m_senders;
   detail::WaitQueue<RecvNode> m_receivers;
   alignas(64) std::array<detail::FastSlot<T>, Cap> m_slots;
+};
+
+// ===========================================================================
+// FastChannel<T, 1>：单槽特化（Vyukov ring 在 Cap == 1 时协议退化）
+// ===========================================================================
+
+/**
+ * @brief `FastChannel<T, 1>` 特化：单槽容量退化为单锁实现。
+ *
+ * ## 为什么必须特化（而不是继续用 Vyukov ring）
+ *
+ * 主模板用「每槽 seq 序号」区分可写/可读：生产者写完后把 seq 置为
+ * `pos + 1`，消费者读完后再置为 `pos + Cap`。容量为 1 时
+ * `pos + Cap == pos + 1`，两个状态退化成同一个值：
+ *
+ * - 消费者刚 CAS 推进 `dequeue_pos`、还没读走值时，槽 seq 仍是 `pos + 1`；
+ *   生产者下一轮的 `pos' = pos + 1` 看到 `seq == pos'`，判定「可写」，直接
+ *   覆盖消费者尚未取走的值（数据竞争 + 丢值）；
+ * - 生产者因此永远看不到「满」（`seq < pos` 不会出现），可以无限入队把
+ *   seq 推到很远。消费者随后在 `TryDequeue` 的 `diff > 0` 分支里不断把
+ *   `pos` 重置回原地，形成**活锁**。实测：producer 连续 TrySend 2000 个
+ *   后 `dequeue_pos == 0`、`slot.seq == 2000`，consumer 在
+ *   `FastChannel::Recv -> TryDequeue` 永久自旋，`Close()` 也无法把它唤醒
+ *   （它根本没走到 park / closed 检查）。
+ *
+ * Vyukov 队列的协议要求 `Cap >= 2`：生产者绕回同一槽之前，消费者至少有
+ * 一步余量发布新 seq。1 槽容量不硬套无锁 ring，直接复用单锁版
+ * `FastChannelLock<T, 1>`：锁内「直交 / 入槽 / 出槽」是全序的，不存在 seq
+ * 歧义；Close 的唤醒与关闭后排空语义也与主模板一致（先取缓冲，再返回
+ * `kClosed`）。
+ *
+ * ## 语义与主模板的一致性
+ *
+ * - `TrySend` 满时 `kWouldBlock`、关闭后 `kClosed`；
+ * - `Recv` 空时 park，关闭后在排空缓冲的前提下返回 `kClosed`；
+ * - `Close` 幂等并唤醒全部等待者（`FastChannelLock::Close` 逐个
+ *   `pop_front` + 发布 `kClosed` + futex/scheduler 唤醒）；
+ * - `Len()` / `Capacity()` / `IsClosed()` 与主模板同名同义。
+ */
+template <typename T>
+class FastChannel<T, 1> final : public FastChannelLock<T, 1> {
+ public:
+  using Base = FastChannelLock<T, 1>;
+
+  static constexpr std::size_t kCapacity = 1;
+
+  FastChannel() = default;
+  ~FastChannel() noexcept { this->Close(); }
+
+  FastChannel(const FastChannel&) = delete;
+  FastChannel& operator=(const FastChannel&) = delete;
+
+  static constexpr std::size_t Capacity() noexcept { return 1; }
+
+  std::size_t Len() const noexcept {
+    return const_cast<Base*>(static_cast<const Base*>(this))->Len();
+  }
 };
 
 }  // namespace go2cpp

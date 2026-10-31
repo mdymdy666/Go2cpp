@@ -1855,7 +1855,25 @@ void RunSelect(Scenario scenario, long long ops, UnitState& state,
                         Select({go2cpp::RecvCase(a), go2cpp::RecvCase(b)}, {},
                                50ms);
                     if (result.status == ChannelStatus::kClosed) {
-                        break;
+                        // D1 语义修正：select 先返回某个已关闭 case 是合法
+                        // 语义（Go 在多个 case 就绪时也可能选中 closed
+                        // case），但关闭通道的缓冲值必须排空，且只有两个
+                        // 通道都关闭才能退出。先各自 TryRecv 排空（关闭后
+                        // TryRecv 仍先返回缓冲值，再返回 kClosed）。
+                        for (const auto& channel : {a, b}) {
+                            for (;;) {
+                                auto drained = channel->TryRecv();
+                                if (!drained.Ok()) {
+                                    break;
+                                }
+                                consumed.fetch_add(
+                                    1, std::memory_order_relaxed);
+                            }
+                        }
+                        if (a->IsClosed() && b->IsClosed()) {
+                            break;
+                        }
+                        continue;
                     }
                     if (result.selected &&
                         result.status != ChannelStatus::kReady) {
@@ -2512,22 +2530,58 @@ void RunSchedulerPark(Scenario scenario, long long ops, UnitState& state,
             break;
         }
         case Scenario::S4: {
-            // Scheduler shutdown 与任务并发：提交一批任务后立刻 shutdown，
-            // shutdown 必须排空已提交任务且不崩溃。
+            // Scheduler shutdown 与任务并发：提交一批任务后立刻 shutdown。
+            //
+            // 语义澄清（D2）：`shutdown()` 是**合作式关停**，设计语义为
+            // 「关闭 admission + 取消尚未开始的 G + 等运行中的 G 自然退出」
+            // （见 src/concurrency/scheduler.cpp 的 shutdown_for 注释 step2），
+            // **不是**排空队列。因此这里不再假设 16 个任务全部执行，只断言：
+            // shutdown 正常返回、16 个 G 全部进入终态、计数不越界、不崩溃。
+            // 需要「全部执行完再关停」的调用方应先等待任务完成（下方对照）。
             for (long long i = 0; i < ops / 256 + 1; ++i) {
                 auto scheduler = std::make_unique<Scheduler>(2);
                 scheduler->start();
                 std::atomic<long long> done{0};
+                std::vector<std::shared_ptr<go2cpp::Task>> tasks;
+                tasks.reserve(16);
                 for (int t = 0; t < 16; ++t) {
-                    (void)scheduler->spawn(
-                        [&] { done.fetch_add(1, std::memory_order_relaxed); });
+                    tasks.push_back(scheduler->spawn(
+                        [&] { done.fetch_add(1, std::memory_order_relaxed); }));
                 }
                 scheduler->shutdown();
-                state.Expect(done.load() == 16,
-                             "S4 shutdown 未排空已提交任务");
+                long long terminated = 0;
+                for (const auto& task : tasks) {
+                    const auto st = task->state();
+                    if (st == go2cpp::scheduler::GState::kDead ||
+                        st == go2cpp::scheduler::GState::kCancelled) {
+                        ++terminated;
+                    }
+                }
+                state.Expect(terminated == 16,
+                             "S4 shutdown 后仍有任务未进入终态");
+                state.Expect(done.load() <= 16, "S4 任务计数越界");
                 scheduler.reset();
                 state.Closed();
-                state.Ok(16);
+                state.Ok(done.load());
+            }
+            // 对照（正向）：先等全部任务完成，再 shutdown，必须全部执行。
+            {
+                Scheduler scheduler(2);
+                scheduler.start();
+                std::atomic<long long> done{0};
+                std::vector<std::shared_ptr<go2cpp::Task>> tasks;
+                tasks.reserve(16);
+                for (int t = 0; t < 16; ++t) {
+                    tasks.push_back(scheduler.spawn(
+                        [&] { done.fetch_add(1, std::memory_order_relaxed); }));
+                }
+                for (const auto& task : tasks) {
+                    WaitTasks({task}, state, "S4 前置排空");
+                }
+                scheduler.shutdown();
+                state.Expect(done.load() == 16,
+                             "S4 先等完成后 shutdown 应全部执行");
+                state.Ok(done.load());
             }
             break;
         }

@@ -1689,15 +1689,43 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       }
       while (PendingRecv* receiver = m_receivers.pop_front()) {
         if (receiver->IsSelect()) {
-          SelectProbe probe;
-          probe.ready = true;
-          probe.status = ChannelStatus::kClosed;
-          probe.error = ChannelClosedError();
-          try {
-            (void)receiver->select_state->TrySelect(receiver->select_index,
-                                                    std::move(probe));
-          } catch (...) {
-            receiver->select_state->Cancel();
+          // D1：关闭时缓冲里可能还有 Close 之前入队的值。select 等待者没有
+          // 自己的栈帧做「先排空」重试，必须在提交 kClosed 之前把缓冲值
+          // 以 kReady 结果交付给这个 case；交付不出去（另一个 case 已选中）
+          // 就把值放回队首，交给后续 Recv/Select。这样不会出现「通道已关闭
+          // 且缓冲非空，select 却返回 kClosed」的丢值。
+          bool delivered = false;
+          if constexpr (std::is_copy_constructible<T>::value) {
+            std::optional<T> buffered;
+            if (m_buffer.TryPopInto(&buffered)) {
+              SelectProbe probe;
+              probe.ready = true;
+              probe.ok = true;
+              probe.status = ChannelStatus::kReady;
+              if (probe.SetValue(*buffered)) {
+                try {
+                  delivered = receiver->select_state->TrySelect(
+                      receiver->select_index, std::move(probe));
+                } catch (...) {
+                  delivered = false;
+                }
+              }
+              if (!delivered) {
+                m_buffer.PushBackFront(std::move(buffered));
+              }
+            }
+          }
+          if (!delivered) {
+            SelectProbe probe;
+            probe.ready = true;
+            probe.status = ChannelStatus::kClosed;
+            probe.error = ChannelClosedError();
+            try {
+              (void)receiver->select_state->TrySelect(receiver->select_index,
+                                                      std::move(probe));
+            } catch (...) {
+              receiver->select_state->Cancel();
+            }
           }
           receiver->signal.store(
               static_cast<std::uint32_t>(detail::WaitSignal::kClosed),
@@ -1705,13 +1733,25 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
           ReleaseSelectNode(receiver);
           continue;
         }
-        receiver->ready = true;
-        receiver->ok = false;
-        receiver->status = ChannelStatus::kClosed;
-        receiver->error = ChannelClosedError();
-        receiver->signal.store(
-            static_cast<std::uint32_t>(detail::WaitSignal::kClosed),
-            std::memory_order_release);
+        // D1：普通等待者同理。Send 与 Close 并发时缓冲里可能刚入队了一个值
+        // （Send 走了「入缓冲」而不是「直交」分支），此时把接收者直接判成
+        // kClosed 会丢掉它。先交付缓冲值，缓冲为空才给 kClosed。
+        if (m_buffer.TryPopInto(&receiver->value)) {
+          receiver->ready = true;
+          receiver->ok = true;
+          receiver->status = ChannelStatus::kReady;
+          receiver->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kReady),
+              std::memory_order_release);
+        } else {
+          receiver->ready = true;
+          receiver->ok = false;
+          receiver->status = ChannelStatus::kClosed;
+          receiver->error = ChannelClosedError();
+          receiver->signal.store(
+              static_cast<std::uint32_t>(detail::WaitSignal::kClosed),
+              std::memory_order_release);
+        }
         WakeNodeLocked(receiver);
       }
     }

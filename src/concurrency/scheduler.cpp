@@ -2713,6 +2713,18 @@ bool Scheduler::run_main(Task::Function function) {
 /**
  * @brief 合作式关停：关闭 admission、取消未启动 G、给运行中 G 设取消、等全部终态。
  *
+ * ## 设计语义（D2，重要）
+ *
+ * `shutdown()`/`shutdown_for()` **不是**「排空队列」：调用时仍在队列里、
+ * 尚未开始执行的已提交任务会被**取消**（进入 `kCancelled` 终态），不会
+ * 被执行。需要「已提交任务全部跑完再关停」的调用方，必须先自行等待这些
+ * 任务完成（`Task::state()` / `WaitGroup` / `Future`），再调用 shutdown。
+ *
+ * 这样设计的原因：GMP 的关停是合作式的，没有安全点可以切断正在执行的
+ * C++ 栈；若 shutdown 先排空队列，一个持续提交新任务的调用方可以让它
+ * 永远无法返回（活锁）。取消未开始的任务则保证关停有确定的上界：已在
+ * 运行的 G 在下一个 park 点看到取消标志后退出，未开始的 G 直接进终态。
+ *
  * ## 步骤
  *
  * step1. 关闭 admission（新的 `go()` 被拒绝）并置 draining；
