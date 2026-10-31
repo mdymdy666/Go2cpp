@@ -94,6 +94,103 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND GO2CPP_CONCURRENCY_HOT_FLAGS)
         endif()
     endforeach()
 endif()
+
+# ---------------------------------------------------------------------------
+# 网络 / Bento 热路径编译选项（汇编审查 Top-8：feed_impl 66/119 个调用走 @plt）
+#
+# 与上面并发热库同一套理由：共享库内的外部调用默认经 PLT 跳板（一次额外
+# 间接跳转 + GOT 载入，并阻止调用点的调度优化）。顶层已启用 -Wl,-z,now，
+# 重定位在加载期一次性完成，-fno-plt 不会退回懒绑定，也不会重新引入
+# xsave 栈溢出路径。
+#
+# 注意：
+#   - 只作用于 go2cpp_network 与 go2cpp_bento*，不改全局 CMAKE_CXX_FLAGS；
+#   - go2cpp_hook 必须保持默认（它的 LD_PRELOAD 拦截语义依赖 PLT）；
+#   - bento 目标在本文件之后（Go2CppBento.cmake）才定义，因此用
+#     cmake_language(DEFER) 把选项附加推迟到顶层 CMakeLists 处理结束时。
+# ---------------------------------------------------------------------------
+option(GO2CPP_NETWORK_HOT_FLAGS
+    "Enable -fno-plt on the network/bento hot libraries" ON)
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND GO2CPP_NETWORK_HOT_FLAGS)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(-fno-plt GO2CPP_NETWORK_HAVE_NO_PLT)
+    if (GO2CPP_NETWORK_HAVE_NO_PLT)
+        function(go2cpp_apply_network_hot_flags)
+            foreach(network_hot_target
+                    go2cpp_network
+                    go2cpp_bento
+                    go2cpp_bento_app
+                    go2cpp_bento_transport
+                    go2cpp_bento_capability
+                    go2cpp_bento_session
+                    go2cpp_bento_omni
+                    go2cpp_bento_error
+                    go2cpp_bento_keystore
+                    go2cpp_bento_http
+                    go2cpp_bento_ws
+                    go2cpp_bento_socks)
+                if (TARGET ${network_hot_target})
+                    target_compile_options(${network_hot_target} PRIVATE -fno-plt)
+                endif()
+            endforeach()
+        endfunction()
+        cmake_language(DEFER CALL go2cpp_apply_network_hot_flags)
+        message(STATUS "network/bento hot flags: -fno-plt")
+    endif()
+endif()
+# ---------------------------------------------------------------------------
+# TLS 访问模型：整 TU 的 initial-exec（TLS 内联落地）
+#
+# 变量级 tls_model("initial-exec") 只覆盖变量本身的数据访问；非平凡
+# thread_local 的初始化守卫（__tls_guard）是编译器生成的独立 TLS 符号，
+# 仍按 TU 默认的 local-dynamic 寻址，所以同库仍有 `call __tls_get_addr`
+# （scheduler 基线 78 条）。只有整个 TU 加 -ftls-model=initial-exec 才能把
+# 数据访问和 guard 一起内联；影子编译/链接实测 10 个目标 261 -> 0。
+#
+# 范围：并发 6 库 + io/network/bufio/p2p。这些目标已核对过 TU 依赖闭包，
+# 不含 tools/replay 的 default-visibility inline thread_local
+# （replay_source.hpp / gid.hpp / ucx.hpp）——那类符号在 -shared 下会生成
+# R_X86_64_TPOFF32，GNU ld 直接拒绝链接。
+#
+# 独立开关 GO2CPP_TLS_INITIAL_EXEC：默认 ON；需要把这些库真正 dlopen 的
+# 场景显式关掉，整体回到 general-dynamic。原因：initial-exec 会让 .so 带上
+# DF_STATIC_TLS，dlopen 时从 glibc 静态 TLS surplus 分配（实测约 1.6KB；
+# scheduler.so 单库 960B，本组 10 库合计 2KB+），叠加后必报
+# "cannot allocate memory in static TLS block"。走 DT_NEEDED 的常规
+# 进程启动没有这个约束。
+#
+# 附加时机：io/network/bufio 在本块之后定义，p2p 更是到 Go2CppP2P.cmake 才
+# 定义，所以用 cmake_language(DEFER) 推迟到顶层目录处理结束时再附加。
+# 与 GO2CPP_CONCURRENCY_HOT_FLAGS 正交：后者管 -fno-semantic-interposition /
+# -fno-plt，本开关只管 TLS 模型，两者可独立关闭。
+# ---------------------------------------------------------------------------
+option(GO2CPP_TLS_INITIAL_EXEC
+    "Use -ftls-model=initial-exec on the concurrency/io/network/bufio/p2p libraries (turn OFF when these libraries must be dlopen()ed)" ON)
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND GO2CPP_TLS_INITIAL_EXEC)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(-ftls-model=initial-exec GO2CPP_HOT_HAVE_TLS_INITIAL_EXEC)
+    if (GO2CPP_HOT_HAVE_TLS_INITIAL_EXEC)
+        function(go2cpp_apply_tls_initial_exec)
+            foreach(tls_ie_target
+                    go2cpp_context
+                    go2cpp_channel
+                    go2cpp_scheduler
+                    go2cpp_fiber
+                    go2cpp_sync
+                    go2cpp_future
+                    go2cpp_io
+                    go2cpp_network
+                    go2cpp_bufio
+                    go2cpp_p2p)
+                if (TARGET ${tls_ie_target})
+                    target_compile_options(${tls_ie_target} PRIVATE -ftls-model=initial-exec)
+                endif()
+            endforeach()
+        endfunction()
+        cmake_language(DEFER CALL go2cpp_apply_tls_initial_exec)
+        message(STATUS "TLS: -ftls-model=initial-exec on concurrency/io/network/bufio/p2p")
+    endif()
+endif()
 add_library(go2cpp_io
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io_backend.cpp)
