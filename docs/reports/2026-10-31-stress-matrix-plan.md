@@ -2,6 +2,33 @@
 
 > 时间点：**全部网络（6 协议 + OmniNetServer + Socket→Bufio）和并发（Cond/RW/Context/Select/M 亲和/MainFiber）全部完成并提交后**才执行。
 
+
+## 最终巨量测试（用户 10-31 追加，最高优先级）
+
+**定义**：不用「每结构分开跑」——**全部混合**（所有并发结构 + 所有真实场景混在一个程序里），
+**十亿量级（10^9）× 3 轮**。
+
+**混合内容**（一个压测程序内同时运行）：
+- 线程池（N 个 OS 线程）+ Fiber 池（M 个 Fiber，多 P Scheduler）
+- 每个 worker 随机执行：Channel send/recv + FastChannel + Mutex + CV + WG + RW + Select
+  + Context cancel/timeout + Error 传播 + 网络（socketpair/loopback 收发）+ 嵌套操作 + 关闭竞态
+- 场景混合：Context 取消/网络通信/线程 Fiber 混合/关闭竞态/嵌套/超时/错误/批量背压/高负载/随机
+
+**规模**：总操作数 **10^9**，跑 **3 轮**（即 3×10^9）。
+
+**断言（全真实）**：
+- 每类操作计数一致（send=recv、add=done、notify=wait 等）
+- FIFO / 无丢失 / 无重复 / 无乱序
+- 无死锁（watchdog 180s 无进展即失败）
+- RSS 稳定（无泄漏）
+- Error 状态一致（Fiber 迁移后）
+- Context 取消后状态一致（无残留）
+- 最终 waiters=0 / 队列排空 / WG 计数归零
+
+**产出**：`docs/reports/2026-10-31-stress-final.md`（3 轮结果 + 每类操作计数 + 失败记录）
+
+---
+
 ## 要求
 
 1. **每个并发结构**都要验证（不是只 Channel）：
@@ -34,6 +61,10 @@
 | S10 | **随机/模糊** | 随机操作序列（1000 万次随机 send/recv/lock/wait/cancel）+ 模型对拍 |
 
 ## 执行方式
+
+**第一优先：最终巨量测试（10^9 × 3 轮，全部混合）**
+
+**第二：分结构矩阵（10 场景 × 10^8 × 3 轮/结构）作为补充定位**
 
 - 每个结构：10 场景 × 10^8 × 3 轮；
 - 预计总量：~15 结构 × 10 × 3 = 450 组 × 10^8 ≈ 4.5×10^10 次操作；
