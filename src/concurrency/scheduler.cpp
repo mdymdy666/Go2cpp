@@ -261,7 +261,7 @@ thread_local std::uint32_t t_incoming_lock_depth GO2CPP_SCHED_HOT_TLS = 0;
 /// @brief 持 incoming 条带锁并登记持锁深度；析构时先解锁再清深度。
 class IncomingStripeLock final {
 public:
-    explicit IncomingStripeLock(std::mutex& mutex) : m_mutex(mutex) {
+    explicit IncomingStripeLock(detail::HotSpinLock& mutex) : m_mutex(mutex) {
         m_mutex.lock();
         ++t_incoming_lock_depth;
     }
@@ -273,7 +273,7 @@ public:
     IncomingStripeLock& operator=(const IncomingStripeLock&) = delete;
 
 private:
-    std::mutex& m_mutex;
+    detail::HotSpinLock& m_mutex;
 };
 
 // 默认 P 数量 = 硬件并发度。`hardware_concurrency()` 在无法确定时返回 0，
@@ -646,26 +646,56 @@ bool Task::wait() const {
     if (Scheduler::current_task().get() == this) {
         return false;
     }
+    // 完成快路径：join 绝大多数发生在 G 已进入终态之后，此时不需要
+    // 触碰完成互斥量与等待原语。
+    if (terminal()) {
+        return true;
+    }
+    const std::uint32_t seq = m_completion_seq.load(std::memory_order_seq_cst);
     std::unique_lock<std::mutex> lock(m_completion_mutex);
-    return m_completion_condition.wait(lock, [this] { return terminal(); });
+    m_completion_waiters.fetch_add(1, std::memory_order_seq_cst);
+    const bool done = m_completion_condition.wait(lock, [this, seq] {
+        return terminal() ||
+               m_completion_seq.load(std::memory_order_seq_cst) != seq;
+    });
+    m_completion_waiters.fetch_sub(1, std::memory_order_seq_cst);
+    return done;
 }
 
 bool Task::wait_for(std::chrono::steady_clock::duration timeout) const {
     if (Scheduler::current_task().get() == this) {
         return false;
     }
+    if (terminal()) {
+        return true;
+    }
+    const std::uint32_t seq = m_completion_seq.load(std::memory_order_seq_cst);
     std::unique_lock<std::mutex> lock(m_completion_mutex);
-    return m_completion_condition.wait_for(
-        lock, timeout, [this] { return terminal(); });
+    m_completion_waiters.fetch_add(1, std::memory_order_seq_cst);
+    const bool done = m_completion_condition.wait_for(
+        lock, timeout, [this, seq] {
+            return terminal() ||
+                   m_completion_seq.load(std::memory_order_seq_cst) != seq;
+        });
+    m_completion_waiters.fetch_sub(1, std::memory_order_seq_cst);
+    return done;
 }
 
 void Task::notify_terminal() noexcept {
     if (m_completion_notified.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
-    // Synchronize with a waiter's predicate -> cv.wait transition. Merely
-    // notifying an atomic terminal flag can lose the notification between
-    // those two steps while the waiter still owns completion_mutex.
+    // 发布完成序号。等待方在谓词里用同一个字做 seq_cst 读，于是两者构成
+    // 一条全序：notifier 的「写序号 → 读等待者数」与等待方的「增等待者数
+    // → 读序号」要么让 notifier 看到等待者（走加锁 + notify_all，并在
+    // 持锁期间与等待方的 Arm 串行化），要么让等待方在谓词里直接看到序号
+    // 已推进而不再睡眠。两种情形都不会丢唤醒。
+    m_completion_seq.fetch_add(1, std::memory_order_seq_cst);
+    if (m_completion_waiters.load(std::memory_order_seq_cst) == 0) {
+        return;
+    }
+    // 有等待者时必须持锁再通知：等待方在持锁状态下完成「登记 + 谓词复查」，
+    // 拿到这把锁才能保证通知发生在登记之后。
     {
         std::lock_guard<std::mutex> lock(m_completion_mutex);
     }
@@ -741,11 +771,11 @@ bool Task::bind_owner(const std::shared_ptr<const void>& owner) noexcept {
         return false;
     }
     std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
-    if (!m_owner_anchor) {
-        m_owner_anchor = owner;
+    if (m_owner_anchor == nullptr) {
+        m_owner_anchor = owner.get();
         return true;
     }
-    return m_owner_anchor.get() == owner.get();
+    return m_owner_anchor == owner.get();
 }
 
 bool Task::owned_by(const std::shared_ptr<const void>& owner) const noexcept {
@@ -753,13 +783,16 @@ bool Task::owned_by(const std::shared_ptr<const void>& owner) const noexcept {
         return false;
     }
     std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
-    return m_owner_anchor && m_owner_anchor.get() == owner.get();
+    return m_owner_anchor != nullptr && m_owner_anchor == owner.get();
 }
 
 void Task::bind_cancellation_gate(
     const std::shared_ptr<TaskCancellationGate>& gate) noexcept {
     std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
-    m_cancellation_gate = gate;
+    if (!m_gate_bound) {
+        m_cancellation_gate = gate;
+        m_gate_bound = true;
+    }
 }
 
 bool Task::prepare_enqueue(
@@ -770,12 +803,15 @@ bool Task::prepare_enqueue(
         return false;
     }
     std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
-    if (!m_owner_anchor) {
-        m_owner_anchor = owner;
-    } else if (m_owner_anchor.get() != owner.get()) {
+    if (m_owner_anchor == nullptr) {
+        m_owner_anchor = owner.get();
+    } else if (m_owner_anchor != owner.get()) {
         return false;
     }
-    m_cancellation_gate = gate;
+    if (!m_gate_bound) {
+        m_cancellation_gate = gate;
+        m_gate_bound = true;
+    }
     const auto state = StateValue(std::memory_order_relaxed);
     if (state == GState::kNew) {
         StoreStateValue(GState::kRunnable, std::memory_order_release);
@@ -1910,6 +1946,17 @@ public:
         if (no_grow) {
             return;
         }
+        // 满员快路径：普通可运行任务的需求以 P 数量为上限（见下方
+        // extra_ceiling = processor_count + effective_blocking），所以
+        // 「没有阻塞 M 且 active_workers 已达 P 数量」时扩容不可能发生。
+        // 只读两个原子就返回：否则 4P/4M 空任务 churn 会每 8 个任务抢一次
+        // admission 锁并遍历 machines，实测把 1e6 任务从 1.5us/task 拖到
+        // 5.8us/task（GO2CPP_NO_GROW=1 对照可复现）。
+        if (blocking_workers.load(std::memory_order_acquire) == 0 &&
+            active_workers.load(std::memory_order_acquire) >=
+                config.processor_count) {
+            return;
+        }
         if (!started.load(std::memory_order_acquire) ||
             draining() ||
             stopping()) {
@@ -2128,7 +2175,7 @@ public:
         std::size_t stripe,
         std::vector<std::shared_ptr<Task>>& deferred_destruction) noexcept {
         auto& task_registry = task_registries[stripe];
-        std::lock_guard<std::mutex> registry_lock(registry_mutexes[stripe]);
+        std::lock_guard<detail::HotSpinLock> registry_lock(registry_mutexes[stripe]);
         // 单次稳定压缩是 O(n)。逐项 vector::erase 会把大批任务完成时的
         // 回收变成 O(n²)。
         auto output = task_registry.begin();
@@ -2323,7 +2370,7 @@ public:
         // this scan cannot be lost.
         for (std::size_t stripe = 0; stripe < kRegistryStripeCount;
              ++stripe) {
-            std::lock_guard<std::mutex> registry_lock(
+            std::lock_guard<detail::HotSpinLock> registry_lock(
                 registry_mutexes[stripe]);
             for (const auto& task : task_registries[stripe]) {
                 if (!task) {
@@ -2365,7 +2412,7 @@ public:
     bool all_tasks_terminal_locked() const {
         for (std::size_t stripe = 0; stripe < kRegistryStripeCount;
              ++stripe) {
-            std::lock_guard<std::mutex> registry_lock(
+            std::lock_guard<detail::HotSpinLock> registry_lock(
                 registry_mutexes[stripe]);
             if (!std::all_of(task_registries[stripe].begin(),
                              task_registries[stripe].end(),
@@ -2416,8 +2463,12 @@ public:
     // 多 worker 时所有线程串行化在同一把锁上 —— 这是 3+ worker 数量级劣化的强嫌疑。
     std::atomic<bool> has_observer{false};
     mutable std::mutex mutex;
-    mutable std::array<std::mutex, kRegistryStripeCount> registry_mutexes;
-    std::array<std::mutex, kIncomingStripeCount> incoming_mutexes;
+    // 条带锁只在「注册表增删/回收」的短临界区里持有，且绝大多数时候没有
+    // 竞争者。用 HotSpinLock 替代 std::mutex：失败路径要付 futex 状态机，
+    // 在每任务一次入队的热路径上是可观的固定成本（见 detail::HotSpinLock）。
+    mutable std::array<detail::HotSpinLock, kRegistryStripeCount>
+        registry_mutexes;
+    std::array<detail::HotSpinLock, kIncomingStripeCount> incoming_mutexes;
     std::array<std::deque<std::shared_ptr<Task>>, kIncomingStripeCount>
         incoming_queues;
     std::atomic<std::size_t> incoming_count{0};
@@ -3174,7 +3225,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     // 入队仍在锁内完成 try_register + vector 发布的原子边界。
     if (!task->registered()) {
         const auto registry_stripe = Scheduler::Impl::registry_stripe(*task);
-        std::lock_guard<std::mutex> registry_lock(
+        std::lock_guard<detail::HotSpinLock> registry_lock(
             m_impl->registry_mutexes[registry_stripe]);
         if (!task->registered()) {
             registered_here = task->try_register();
@@ -3213,7 +3264,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
             {
                 const auto registry_stripe =
                     Scheduler::Impl::registry_stripe(*task);
-                std::lock_guard<std::mutex> registry_lock(
+                std::lock_guard<detail::HotSpinLock> registry_lock(
                     m_impl->registry_mutexes[registry_stripe]);
                 auto& task_registry =
                     m_impl->task_registries[registry_stripe];
@@ -3286,7 +3337,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
             if (registered_here) {
                 const auto registry_stripe =
                     Scheduler::Impl::registry_stripe(*task);
-                std::lock_guard<std::mutex> registry_lock(
+                std::lock_guard<detail::HotSpinLock> registry_lock(
                     m_impl->registry_mutexes[registry_stripe]);
                 auto& task_registry =
                     m_impl->task_registries[registry_stripe];
@@ -3343,7 +3394,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
                 if (registered_here) {
                     const auto registry_stripe =
                         Scheduler::Impl::registry_stripe(*task);
-                    std::lock_guard<std::mutex> registry_lock(
+                    std::lock_guard<detail::HotSpinLock> registry_lock(
                         m_impl->registry_mutexes[registry_stripe]);
                     auto& task_registry =
                         m_impl->task_registries[registry_stripe];
@@ -4586,7 +4637,8 @@ std::vector<TaskSnapshot> Scheduler::DebugSnapshotTasks() const {
     // 分片遍历：每片单独持锁，不长时间阻塞其它分片的新增/回收。
     // 用 task_registries.size() 而不是硬编码 16，避免与常量漂移。
     for (std::size_t stripe = 0; stripe < m_impl->task_registries.size(); ++stripe) {
-        std::lock_guard<std::mutex> lock(m_impl->registry_mutexes[stripe]);
+        std::lock_guard<detail::HotSpinLock> lock(
+            m_impl->registry_mutexes[stripe]);
         // 不按 registry 大小 reserve：过滤后存活 G 通常只有个位数，
         // 按全量预留会在历史任务很多时白白分配大块内存。
         for (const auto& task : m_impl->task_registries[stripe]) {
@@ -4617,7 +4669,7 @@ bool Scheduler::IsTaskAlive(GId id) const {
     // 不枚举全量注册表；开销与历史任务数无关。
     const std::size_t stripe =
         static_cast<std::size_t>(id) & (Impl::kRegistryStripeCount - 1);
-    std::lock_guard<std::mutex> registry_lock(
+    std::lock_guard<detail::HotSpinLock> registry_lock(
         m_impl->registry_mutexes[stripe]);
     for (const auto& task : m_impl->task_registries[stripe]) {
         if (task && task->id() == id) {
@@ -4635,7 +4687,7 @@ TaskTerminalState Scheduler::TaskTerminal(GId id) const {
     }
     const std::size_t stripe =
         static_cast<std::size_t>(id) & (Impl::kRegistryStripeCount - 1);
-    std::lock_guard<std::mutex> registry_lock(
+    std::lock_guard<detail::HotSpinLock> registry_lock(
         m_impl->registry_mutexes[stripe]);
     for (const auto& task : m_impl->task_registries[stripe]) {
         if (!task || task->id() != id) {
@@ -4813,6 +4865,10 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
     // 距上次终态回收又完成了多少个终态 G。只有进入终态的 G 才会增加
     // 注册表回收压力，yield/park 不计数。
     std::size_t terminal_since_collect = 0;
+    // 热路径统计开关。`SchedulerConfig::collect_metrics` 默认关闭，关闭时
+    // worker 不再为投递/迁移计数付跨核原子 RMW，也不在每次 run 前后取钟。
+    // 配置只在 start() 前设定，因此循环外缓存一次即可。
+    const bool hot_stats = m_impl->config.collect_metrics;
 
     // B1：dequeue 的 claim 失败收尾。旧实现无条件 clear_queued()，会把
     // 「pop 之后、clear 之前」新发布的 reservation 一起清掉，制造
@@ -4880,12 +4936,15 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         if (!m_impl->stopping()) {
             task = machine->inbox.take();
             if (task) {
-                m_impl->metric_inbox_pops.fetch_add(
-                    1, std::memory_order_relaxed);
-                machine->inbox_hits.fetch_add(1, std::memory_order_relaxed);
+                if (hot_stats) {
+                    m_impl->metric_inbox_pops.fetch_add(
+                        1, std::memory_order_relaxed);
+                    machine->inbox_hits.fetch_add(1,
+                                                  std::memory_order_relaxed);
+                }
             } else {
                 task = own_processor.runnext.take();
-                if (task) {
+                if (task && hot_stats) {
                     m_impl->metric_runnext_pops.fetch_add(
                         1, std::memory_order_relaxed);
                     machine->runnext_hits.fetch_add(1,
@@ -4984,7 +5043,15 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         }
                     }
                     task = std::move(*selected);
-                    incoming_queue.erase(selected);
+                    // deque::erase(begin) 必须搬移全部剩余元素（O(n)）；
+                    // 外部生产者按 FIFO 追加，worker 默认路径
+                    // （require_class=false）永远取队首，长队列下这条路径
+                    // 会把取任务退化成 O(n²)。取队首时改用 pop_front()。
+                    if (selected == incoming_queue.begin()) {
+                        incoming_queue.pop_front();
+                    } else {
+                        incoming_queue.erase(selected);
+                    }
                     GO2CPP_DEBUG_EVENT(kRunQueuePop, task->id(),
                                        ::go2cpp::debug::kGlobalQueueTag);
                     if (incoming_queue.empty()) {
@@ -5181,8 +5248,10 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                                 }
                             }
                         }
-                        m_impl->metric_steal_pops.fetch_add(
-                            1, std::memory_order_relaxed);
+                        if (hot_stats) {
+                            m_impl->metric_steal_pops.fetch_add(
+                                1, std::memory_order_relaxed);
+                        }
                     }
                     if (task) {
                         GO2CPP_DEBUG_EVENT(kStealOk, task->id(), victim_id);
@@ -5255,18 +5324,20 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             machine->state.store(MState::kRunning, std::memory_order_release);
             // M 亲和命中统计：本次恢复与 G 最近一次运行的 M 是否相同。
             // 首次运行（last_machine==0）不计入，避免把冷启动算成命中。
-            const MId last_machine = task->last_machine_id();
-            if (last_machine != 0) {
-                if (last_machine == t_machine_id) {
-                    m_impl->metric_same_machine_resumes.fetch_add(
-                        1, std::memory_order_relaxed);
-                    machine->same_machine_resumes.fetch_add(
-                        1, std::memory_order_relaxed);
-                } else {
-                    m_impl->metric_cross_machine_resumes.fetch_add(
-                        1, std::memory_order_relaxed);
-                    machine->cross_machine_resumes.fetch_add(
-                        1, std::memory_order_relaxed);
+            if (hot_stats) {
+                const MId last_machine = task->last_machine_id();
+                if (last_machine != 0) {
+                    if (last_machine == t_machine_id) {
+                        m_impl->metric_same_machine_resumes.fetch_add(
+                            1, std::memory_order_relaxed);
+                        machine->same_machine_resumes.fetch_add(
+                            1, std::memory_order_relaxed);
+                    } else {
+                        m_impl->metric_cross_machine_resumes.fetch_add(
+                            1, std::memory_order_relaxed);
+                        machine->cross_machine_resumes.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
                 }
             }
             const auto task_class = task->task_class();
@@ -5327,7 +5398,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             m_impl->emit_event(SchedulerEvent{
                 SchedulerEventType::kTaskStarted, t_task->id(), t_machine_id,
                 t_processor_id, GState::kRunning});
-            const bool collect_metrics = m_impl->config.collect_metrics;
+            const bool collect_metrics = hot_stats;
             const auto run_started = collect_metrics ? steady_now_ns() : 0;
             // step5: 执行 G。返回值通过 task 的终态体现（Dead/Failed/
             // Cancelled/Yielded/Parked），这里只负责记账与后续回收。

@@ -288,9 +288,12 @@ struct SchedulerConfig {
     // 调度器内部 Fiber；设为 0 表示使用运行时默认值，过大只会增加
     // 每个 worker 的保留内存，不会改变 Fiber 语义。
     std::size_t fiber_bin_capacity = 128;
-    // 性能敏感的部署可以关闭运行时累计计时；状态机和调度语义不受影响。
-    // 默认开启，便于诊断和性能报告。
-    bool collect_metrics = true;
+    // 是否采集运行时累计统计（`SchedulerMetrics` / 每任务 resume 计时 /
+    // worker 热路径上的投递计数）。状态机和调度语义不受影响。
+    // **默认关闭**：短任务场景下每次调度都要付两次 clock_gettime 和若干
+    // 跨核原子累加，实测占「任务创建+调度」成本的可观比例；需要诊断时
+    // 显式打开即可（打开后行为与旧版完全一致）。
+    bool collect_metrics = false;
     // 可选的生命周期观察者。观察者只在事件发生后被调用，不改变默认
     // GMP 调度策略；空指针表示关闭观测，适合性能敏感部署。
     SchedulerObserverPtr observer;
@@ -761,8 +764,17 @@ private:
     // 无分配救援队列链接。只在所属 Scheduler 的接纳互斥锁下修改，且
     // 不会形成环。
     std::shared_ptr<Task> m_emergency_next;
-    std::shared_ptr<const void> m_owner_anchor;
+    // 所属 Scheduler 的身份令牌。存裸指针而不是 shared_ptr：
+    //   - 它只在 `owned_by()` 里做地址比较，从不解引用；
+    //   - 每个 G 存一份 shared_ptr 会让 enqueue 与 Task 析构各付一次
+    //     控制块原子 RMW（实测在短任务提交路径上是可观的开销）；
+    //   - Scheduler 对 G 的所有权语义由 registry/队列的强引用保证，不靠
+    //     这个字段续命。因此裸指针不改变生命周期约束。
+    const void* m_owner_anchor{nullptr};
     std::weak_ptr<TaskCancellationGate> m_cancellation_gate;
+    // 取消门只需绑定一次（同一 G 始终属于同一 Scheduler）。首次绑定后
+    // 跳过 weak_ptr 赋值，省掉后续每次入队的控制块原子操作。
+    bool m_gate_bound{false};
     std::shared_ptr<Task> m_completion_notification_next;
     std::atomic<bool> m_completion_notification_queued{false};
     std::atomic<bool> m_completion_notified{false};
@@ -772,6 +784,13 @@ private:
     mutable detail::HotSpinLock m_transition_mutex;
     mutable std::mutex m_completion_mutex;
     mutable core::ParkingCondition m_completion_condition;
+    // 完成信号：进入终态时递增一次。等待方用它与 notifier 建立 seq_cst
+    // 全序，从而支持「无等待者时 notifier 不加锁、直接返回」的快路径，
+    // 同时不可能丢唤醒。
+    std::atomic<std::uint32_t> m_completion_seq{0};
+    // 当前阻塞在 m_completion_condition 上的等待者数（只在持
+    // m_completion_mutex 时增减）。notifier 只在它非零时才加锁 + 唤醒。
+    mutable std::atomic<std::uint32_t> m_completion_waiters{0};
 };
 
 /**
