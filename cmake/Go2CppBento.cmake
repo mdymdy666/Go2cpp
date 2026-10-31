@@ -533,6 +533,25 @@ if (GO2CPP_WITH_BENTO)
             set_tests_properties(bento_omni_server_m1 PROPERTIES TIMEOUT 180)
         endif()
 
+        # 六协议（HTTP/SSE、LinkServer、WS、MQTT、CoAP、SOCKS5）+ OmniNetServer M1
+        # 的统一正确性真实场景与性能基准（吞吐 / p50-p99-p999 / 写路径三档对比）。
+        # 只新增测试与文档，不改协议实现；ctest 里只跑正确性部分（--correctness），
+        # 性能部分由 `taskset -c 2,3 ./bento_bench_protocols --perf` 手工触发，
+        # 避免 CI 机器负载不可控时把吞吐数据写进回归基线。
+        if (TARGET go2cpp_bento_omni AND TARGET go2cpp_bento_http AND TARGET go2cpp_bento_ws
+            AND TARGET go2cpp_bento_socks AND TARGET go2cpp_bufio)
+            add_executable(bento_bench_protocols
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/bench_protocols.cpp)
+            target_include_directories(bento_bench_protocols PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
+            target_link_libraries(bento_bench_protocols PRIVATE
+                go2cpp_bento_omni go2cpp_bento_ws go2cpp_bento_socks go2cpp_bufio)
+            target_compile_options(bento_bench_protocols PRIVATE
+                -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+            add_test(NAME bento_bench_protocols COMMAND bento_bench_protocols --correctness)
+            set_tests_properties(bento_bench_protocols PROPERTIES TIMEOUT 900)
+        endif()
+
         # MOD-26/28：命令协议与文件传输（依赖完整模块构建里的 app 目标）。
         # MOD-31：zip/backup/upload 测试。
         if (TARGET go2cpp_bento_app)
