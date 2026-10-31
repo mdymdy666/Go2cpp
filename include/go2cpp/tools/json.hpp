@@ -42,6 +42,23 @@
  *   - 本地位置：`third_party/nlohmann/json.hpp`，由 CMake 的 third_party
  *     包含路径暴露为 `#include "nlohmann/json.hpp"`。
  *
+ * ## 依赖治理状态（2026-10-30，降级 TODO）
+ *
+ * 任务要求用 Reflect 模块的 JSON-like 格式化替换本文件。实际检查
+ * `include/go2cpp/bento/reflect/`：目前只有 CSV/config 用的
+ * `TypeTraits<T>`、`FieldList<T>` 与 `Bind`，**没有 JSON 值类型、解析或
+ * 序列化接口**（目录内 grep 无 JSON 相关符号），因此无法在不丢失
+ * `Json` / `ParseJson` 调用面的前提下替换。
+ *
+ * 按任务约定走降级路径：暂不硬替换，保留 vendored 的 nlohmann 单头
+ * （header-only，不参与链接，不进入 `go2cpp_runtime` 的链接依赖）；
+ * Reflect 交付 JSON 格式化后再迁移。
+ *
+ * TODO(deps-cleanup, 2026-10-30): Reflect 提供 JSON 后端后，删除对
+ * `nlohmann/json.hpp` 的 include，保持 `Json` / `ParseJson` /
+ * `JsonScanDepth` 的调用面不变，并把 `third_party/nlohmann` 从默认
+ * 包含路径中移除。
+ *
  * @note 本头文件**不进入** `go2cpp/runtime.hpp` 聚合头：引入 900+ KB 的单头
  *       文件会显著增加所有使用者的编译时间，而 JSON 并非运行时语义的一部分。
  *       需要 JSON 的翻译单元显式包含 `go2cpp/json.hpp` 即可。

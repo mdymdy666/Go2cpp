@@ -1,0 +1,11 @@
+# 统一行尾：仓库内一律 LF（多 agent/Windows-WSL 混用时防止 CRLF 互相覆盖）
+* text=auto eol=lf
+
+# 二进制文件不参与转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.zip binary
+*.gz binary
+*.so binary
+*.a binary

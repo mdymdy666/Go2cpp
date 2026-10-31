@@ -396,3 +396,20 @@ errno noinline），不是寄存器保存。
 - 已知限制：文本模式不支持「仅特化 Serializer、无 FieldList」的类型；
   二进制未知字段直接拒绝（暂无 schema 兼容跳过）；字段宏要求结构体可默认构造。
 - 状态：未 commit。
+
+---
+
+## 2026-10-31 网络协议正确性 + 性能统一基准（deepseek）
+
+- **改动**：新增 `tests/bento/bench_protocols.cpp`（六协议 + OmniNetServer M1 的
+  真实场景正确性 + 吞吐/延迟基准 + 写路径三档对比）；`cmake/Go2CppBento.cmake`
+  注册 `bento_bench_protocols` 目标（ctest 只跑 `--correctness`，性能手工触发）；
+  新增 `docs/reports/2026-10-31-http-perf.md`。**未改动任何协议实现。**
+- **测试**：`--correctness` 37 场景 / 237 断言 / 0 失败（ctest `bento_bench_protocols`
+  6.04s 通过）；性能数据见报告。
+- **关键发现**：① 服务端 accept socket 未设 `TCP_NODELAY`，WS/SOCKS5 小包往返会被
+  Nagle+延迟 ACK 压成 ~40ms（基准用客户端 `TCP_QUICKACK` 绕过，产品侧建议 accept
+  后设 NODELAY）；② CoAP 客户端默认随机种子固定，多实例会用相同 (MID,Token) 被
+  去重缓存误判；③ 小包 bufio 提升 21~33 倍，≥4KB 大包 bufio 反而慢 19%（应直写）。
+- **状态**：正确性全绿；性能数据已归档；未见协议实现缺陷，只有上述可优化点。
+- **复现**：`taskset -c 2,3 ./.build-bento-wsl/bento_bench_protocols --correctness|--perf`
