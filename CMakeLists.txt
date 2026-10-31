@@ -70,3 +70,7 @@ include(cmake/Go2CppApp.cmake)
 # 缓存淘汰策略模块（header-only）：LRU / LRU-K / 2Q / W-TinyLFU / GDSF / ARC / CLOCK。
 # 测试目标 go2cpp_cache_test、基准 go2cpp_cache_bench 由该文件定义。
 include(cmake/Go2CppCache.cmake)
+
+# Go 风格接口层（net/sync/chan/context/error/time/io）：默认 OFF。
+# -DGO2CPP_WITH_GO_API=ON 构建封装头与 go_api_* 测试。
+include(cmake/Go2CppGoApi.cmake)
