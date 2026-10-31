@@ -874,7 +874,7 @@ WakeAction Task::wake_for_wait_impl(bool reserve_queue) noexcept {
             }
             if (m_execution_claim.load(std::memory_order_acquire)) {
                 m_deferred_enqueue.store(true, std::memory_order_release);
-                return WakeAction::kPending;
+                return WakeAction::kRegistered;
             }
             if (reserve_queue) {
                 // 状态 CAS 已是唯一线性化点；第二个唤醒者读到 Runnable
@@ -3574,6 +3574,20 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
     // 会先递减尚未增加的 runnable，造成 size_t 下溢。
     m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
     const auto policy = m_impl->wake_policy.load(std::memory_order_relaxed);
+
+    // LockToCurrentM 是硬约束而不是提示：锁定 G 只能进绑定 M 的定向槽。
+    // yield 回队与同 M 同步唤醒也必须走这里，否则锁定 G 会被投进 runnext
+    // 或本地环，同 P 的其它 M 取到后再做一次误取重定向（多付一次跨线程
+    // 投递，也放宽了「只在绑定 M 上恢复」的语义）。
+    const MId locked = task->locked_machine_id();
+    if (locked != 0 && policy != WakePolicy::kRoundRobin) {
+        if (publish_to_machine(locked, task, true)) {
+            GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(), locked);
+            return true;
+        }
+        // 绑定 M 已退场：解除绑定，回退到普通投递路径。
+        task->unlock_from_m();
+    }
     if (policy == WakePolicy::kRunNext && prefer_runnext) {
         // Go 式：被唤醒的 G 进本 P 的 runnext，当前 M 下一轮直接取它，
         // 不经过 256 槽环，也不给别的 M 从队尾偷走的机会。
@@ -3646,6 +3660,20 @@ bool Scheduler::requeue_from_worker_reserved(const std::shared_ptr<Task>& task,
     // 计数必须先于节点发布，理由同 requeue_from_worker()。
     m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
     const auto policy = m_impl->wake_policy.load(std::memory_order_relaxed);
+
+    // LockToCurrentM 是硬约束而不是提示：锁定 G 只能进绑定 M 的定向槽。
+    // yield 回队与同 M 同步唤醒也必须走这里，否则锁定 G 会被投进 runnext
+    // 或本地环，同 P 的其它 M 取到后再做一次误取重定向（多付一次跨线程
+    // 投递，也放宽了「只在绑定 M 上恢复」的语义）。
+    const MId locked = task->locked_machine_id();
+    if (locked != 0 && policy != WakePolicy::kRoundRobin) {
+        if (publish_to_machine(locked, task, true)) {
+            GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(), locked);
+            return true;
+        }
+        // 绑定 M 已退场：解除绑定，回退到普通投递路径。
+        task->unlock_from_m();
+    }
     if (policy == WakePolicy::kRunNext) {
         if (publish_runnext(t_processor_id, task,
                             allow_notify && !t_in_idle_poll)) {
@@ -3885,8 +3913,17 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
     const auto action = worker_local ? task->wake_for_wait_reserve()
                                      : task->wake_for_wait();
     if (action == WakeAction::kPending) {
+        // G 正在执行：唤醒只能登记成令牌位，由它下一个 park 点消费，
+        // 这里没有发布队列节点，按契约返回 false。
         GO2CPP_DEBUG_EVENT(kWakePending, task->id(), 0);
         return false;
+    }
+    if (action == WakeAction::kRegistered) {
+        // G 已提交 Waiting、执行权尚未释放：状态已推进到 kRunnable 并置
+        // deferred_enqueue，执行权释放后由拥有者的收尾路径补入队。
+        // 唤醒请求已经登记成功。
+        GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(), 0);
+        return true;
     }
     if (action != WakeAction::kEnqueue) {
         GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 2);
@@ -4007,7 +4044,8 @@ bool Scheduler::wake_io(const std::shared_ptr<Task>& task) {
         return false;
     }
     const auto action = task->wake_for_io();
-    if (action == WakeAction::kPending) {
+    if (action == WakeAction::kPending ||
+        action == WakeAction::kRegistered) {
         GO2CPP_DEBUG_EVENT(kWakePending, task->id(), 0);
         return true;
     }
@@ -4095,7 +4133,8 @@ bool Scheduler::wake_io_batch(
                 continue;
             }
             const auto action = task->wake_for_io();
-            if (action == WakeAction::kPending) {
+            if (action == WakeAction::kPending ||
+                action == WakeAction::kRegistered) {
                 GO2CPP_DEBUG_EVENT(kWakePending, task->id(), 0);
                 continue;
             }
@@ -4219,10 +4258,14 @@ bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
 #endif
     const auto action = task->wake_for_wait();
     if (action == WakeAction::kPending) {
-        // The running G will consume the permit if it parks. It is not
-        // immediately runnable because its C++ callable still owns the M.
+        // 运行中的 G 会在下次 park 时消费令牌；没有发布队列节点。
         GO2CPP_DEBUG_EVENT(kWakePending, task->id(), 0);
         return false;
+    }
+    if (action == WakeAction::kRegistered) {
+        // suspend 已提交、执行权尚未释放：deferred 入队由拥有者收尾完成。
+        GO2CPP_DEBUG_EVENT(kWakeEnqueued, task->id(), 0);
+        return true;
     }
     if (action == WakeAction::kRejected) {
         GO2CPP_DEBUG_EVENT(kWakeRejected, task->id(), 2);
@@ -4941,7 +4984,11 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         1, std::memory_order_release);
                     m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
                     if (locked_elsewhere(task)) {
-                        // 锁内只判定：锁外 enqueue 会按绑定 M 重新投递。
+                        // 锁内只判定：锁外按绑定 M 重新投递。取出时已从
+                        // runnable 减 1，但该 G 仍可运行（只是换投递位置），
+                        // 这里补回计数；锁外 publish 不再重复记账。
+                        m_impl->runnable.fetch_add(
+                            1, std::memory_order_relaxed);
                         redirect_pending = task;
                         task.reset();
                         return true;
@@ -5166,9 +5213,26 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             (void)enqueue(unclaimed_republish);
         }
         if (redirect_pending) {
-            // 锁定到别的 M 的 G 在锁外重新入队：enqueue 会按绑定 M 投递，
-            // 失败时由 enqueue 的取消路径收敛。
-            (void)enqueue(redirect_pending);
+            // 锁定到别的 M 的 G 在锁外重新投递。此时节点已从队列取出、
+            // 但尚未 claim，m_queued 仍为 true：普通 enqueue() 会被
+            // prepare_enqueue() 以「已排队」拒绝，把 G 丢成「Runnable
+            // 但没有任何队列节点」——实测这是 run_main 偶发全空闲挂死
+            // 的根因（锁定 main G 被别的 M 取到 → redirect → enqueue
+            // 失败 → 任务无人再取）。直接投回绑定 M 的定向槽，保留节点
+            // 与 runnable 计数。
+            const MId locked = redirect_pending->locked_machine_id();
+            if (locked == 0 ||
+                !publish_to_machine(locked, redirect_pending, true)) {
+                // 绑定 M 已退场：解除绑定后放回本 P 队列（计数不变）。
+                redirect_pending->unlock_from_m();
+                if (!own_processor.queue.push(redirect_pending)) {
+                    // 本地环也满：还原计数并清 queued 后走常规入队。
+                    m_impl->runnable.fetch_sub(
+                        1, std::memory_order_relaxed);
+                    redirect_pending->clear_queued();
+                    (void)enqueue(redirect_pending);
+                }
+            }
         }
 
         // Both the local fast path and the admission path arrive here with a

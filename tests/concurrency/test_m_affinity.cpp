@@ -239,6 +239,7 @@ void TestLockedWakeLatency() {
     constexpr int kRounds = 50;
     std::atomic<bool> ready{false};
     std::atomic<bool> done{false};
+    std::atomic<int> resumed{0};
     std::atomic<std::uint64_t> machine{0};
     auto task = scheduler.spawn([&] {
         machine.store(Fiber::LockToCurrentM(), std::memory_order_release);
@@ -248,6 +249,7 @@ void TestLockedWakeLatency() {
             if (!self || !scheduler.park(self)) {
                 break;
             }
+            resumed.fetch_add(1, std::memory_order_relaxed);
         }
         done.store(true, std::memory_order_release);
         (void)Fiber::UnlockFromM();
@@ -258,8 +260,13 @@ void TestLockedWakeLatency() {
         CHECK(WaitUntil([&] { return task->state() == GState::kWaiting; }));
         const auto begin = std::chrono::steady_clock::now();
         CHECK(scheduler.wake(task));
+        // G 恢复后会立刻再次 park，`state()==kRunning` 的窗口只有几百
+        // 纳秒，外部 1ms 轮询必然漏掉（旧断言把正常唤醒误判成挂死，每轮
+        // 白等 2s）。改用 G 自己递增的 resumed 计数作为「唤醒已生效」的
+        // 可观测信号。
         CHECK(WaitUntil([&] {
-            return task->state() == GState::kRunning;
+            return resumed.load(std::memory_order_relaxed) > i ||
+                   done.load(std::memory_order_acquire);
         }, 2s));
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::microseconds>(
@@ -272,7 +279,9 @@ void TestLockedWakeLatency() {
         }));
     }
     CHECK(task->wait_for(10s));
-    std::printf("[locked-latency] worst_wake_us=%lld\n", worst_us);
+    CHECK(resumed.load() == kRounds);
+    std::printf("[locked-latency] worst_wake_us=%lld resumed=%d\n", worst_us,
+                resumed.load());
     CHECK(machine.load() != 0);
     CHECK(worst_us < 5000);
     scheduler.shutdown();
@@ -415,13 +424,18 @@ void TestRandomMix() {
                 done.fetch_add(1, std::memory_order_relaxed);
             }));
         }
-        // 主线程持续唤醒仍未完成的 G（park 的 G 没有其他唤醒源）。
+        // 主线程持续唤醒仍未完成的 G（park 的 G 没有其他唤醒源），并
+        // 顺手消费 channel：不做这个消费者，所有 G 都可能停在 Send 上等
+        // 缓冲空间（容量 8，Send 是阻塞语义；能执行 TryRecv 的 G 一旦全部
+        // 结束就再没人腾槽位），30s 也不会进展。基线版本同样 5/5 失败，
+        // 这是测试自身的死锁，不是调度器缺陷。
         CHECK(WaitUntil([&] {
             for (auto& task : tasks) {
                 if (task->state() == GState::kWaiting) {
                     (void)scheduler.wake(task);
                 }
             }
+            (void)channel->TryRecv();
             return done.load() == task_count;
         }, 30s));
         std::printf("[random] round=%d processors=%zu tasks=%d done=%d\n",
@@ -522,6 +536,14 @@ void ScenarioParkStorm() {
             CHECK(WaitUntil([&] {
                 return progress[i].load(std::memory_order_acquire) >= k + 1;
             }, 10s));
+            // progress 在 park 之前发布：G 可能还没真正挂起（也可能刚被
+            // 上一轮唤醒、尚未执行到下一次 park），此时 wake 没有等待者，
+            // 会直接返回 false。先等状态落到 Waiting 再唤醒——这不是放宽
+            // 断言，唤醒仍然要求成功。
+            CHECK(WaitUntil([&] {
+                return tasks[static_cast<std::size_t>(i)]->state() ==
+                       GState::kWaiting;
+            }, 2s));
             CHECK(scheduler.wake(tasks[static_cast<std::size_t>(i)]));
         }
     }

@@ -62,7 +62,13 @@ using PId = std::uint32_t;
 enum class WakeAction : std::uint8_t {
     kRejected,
     kEnqueue,
+    // G 正在执行：唤醒只能登记成令牌位，由它下一个 park 点消费；没有
+    // 为它发布队列节点，因此算「未直接入队」。
     kPending,
+    // G 已提交 suspend、但执行权尚未释放：状态已推进到 kRunnable 并置
+    // deferred_enqueue，执行权释放后由拥有者的收尾路径补入队。与
+    // kPending 的区别是「一定会重新入队」，对调用方算唤醒成功。
+    kRegistered,
 };
 
 /** @brief Fiber park 请求的处理结果。 */
