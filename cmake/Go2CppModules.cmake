@@ -35,6 +35,53 @@ add_library(go2cpp_fiber
 target_sources(go2cpp_fiber PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/context_x64.S)
 add_library(go2cpp_sync ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/sync.cpp)
 add_library(go2cpp_future ${CMAKE_CURRENT_SOURCE_DIR}/src/concurrency/future.cpp)
+
+# ---------------------------------------------------------------------------
+# 并发热路径编译选项（并发优化清单 #9）
+#
+# 下面 6 个库构成每次 park/wake/通道操作都要穿过的热路径。它们按共享库构建，
+# GCC 因此认为同库内的全局符号可被运行时插替（ELF interposition），从而放弃
+# 跨 TU 内联、函数克隆等过程间优化；同时库内对外部符号的调用都要经过 PLT
+# 跳板。
+#
+# - -fno-semantic-interposition：允许编译器在「同库内」内联/克隆导出函数。
+#   它不改变 ELF 语义（符号仍导出、仍可被动态链接器解析），只去掉 GCC 为支持
+#   运行时插替而加的保守屏障；
+# - -fno-plt：外部调用直接走 GOT 间接，省掉 PLT 跳板与一次额外跳转，也让
+#   编译器对调用点有更好的调度空间。与顶层已启用的 -Wl,-z,now 兼容：重定位
+#   仍在启动期一次性完成，不会回到懒绑定的 xsave 栈崩溃路径。
+#
+# 作用范围严格限制在这 6 个库目标：不改全局 CMAKE_CXX_FLAGS，也不碰
+# go2cpp_hook —— 它的 LD_PRELOAD 拦截语义依赖 PLT，必须保持默认。
+# ---------------------------------------------------------------------------
+option(GO2CPP_CONCURRENCY_HOT_FLAGS
+    "Enable -fno-semantic-interposition/-fno-plt on the concurrency hot libraries" ON)
+if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND GO2CPP_CONCURRENCY_HOT_FLAGS)
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(-fno-semantic-interposition
+        GO2CPP_HOT_HAVE_NO_SEMANTIC_INTERPOSITION)
+    check_cxx_compiler_flag(-fno-plt GO2CPP_HOT_HAVE_NO_PLT)
+
+    set(GO2CPP_HOT_LIB_TARGETS
+        go2cpp_context
+        go2cpp_channel
+        go2cpp_scheduler
+        go2cpp_fiber
+        go2cpp_sync
+        go2cpp_future)
+    foreach(hot_target IN LISTS GO2CPP_HOT_LIB_TARGETS)
+        set(hot_target_flags)
+        if (GO2CPP_HOT_HAVE_NO_SEMANTIC_INTERPOSITION)
+            list(APPEND hot_target_flags -fno-semantic-interposition)
+        endif()
+        if (GO2CPP_HOT_HAVE_NO_PLT)
+            list(APPEND hot_target_flags -fno-plt)
+        endif()
+        if (hot_target_flags AND TARGET ${hot_target})
+            target_compile_options(${hot_target} PRIVATE ${hot_target_flags})
+        endif()
+    endforeach()
+endif()
 add_library(go2cpp_io
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/network/io_backend.cpp)

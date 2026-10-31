@@ -233,7 +233,9 @@ bool ChannelBindManaged(WaitNodeBase* node) noexcept {
 
 bool ChannelParkOnce(WaitNodeBase* node) noexcept {
   auto* const scheduler = static_cast<Scheduler*>(node->scheduler);
-  auto task = std::static_pointer_cast<Task>(node->task);
+  // 直接引用节点里已保活的 shared_ptr：不再为每次 park 构造临时
+  // shared_ptr<Task>（原 static_pointer_cast 的 +1/−1 两次原子 RMW）。
+  const std::shared_ptr<Task>& task = node->task;
   if (scheduler == nullptr || !task) {
     return false;
   }
@@ -250,7 +252,9 @@ bool ChannelParkOnce(WaitNodeBase* node) noexcept {
   if (task->cancellation_requested() ||
       (!suspended && !scheduler->is_running()) ||
       Scheduler::current_scheduler() != scheduler ||
-      Scheduler::current_task().get() != task.get()) {
+      // current_task() 返回 shared_ptr 拷贝（一次 +1/−1 原子 RMW），这里
+      // 只需要裸指针，改用零开销的 current_task_ptr()。
+      Scheduler::current_task_ptr() != task.get()) {
     return false;
   }
   // 无关的唤醒许可/被动 unpark 都是 spurious：回到调用方重检后继续 park。
@@ -259,7 +263,8 @@ bool ChannelParkOnce(WaitNodeBase* node) noexcept {
 
 void ChannelWakeManaged(WaitNodeBase* node) noexcept {
   auto* const scheduler = static_cast<Scheduler*>(node->scheduler);
-  auto task = std::static_pointer_cast<Task>(node->task);
+  // 同 ChannelParkOnce：唤醒路径也直接引用节点内的 shared_ptr，零拷贝。
+  const std::shared_ptr<Task>& task = node->task;
   if (scheduler == nullptr || !task) {
     return;
   }

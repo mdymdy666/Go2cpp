@@ -96,6 +96,19 @@
 
 namespace go2cpp {
 
+// 等待节点用 `shared_ptr<Task>` 保活受管等待的 Task（见 WaitNodeBase::task）。
+// 这里只做前置声明：channel.hpp 不能包含 scheduler.hpp（那个头很重，而且会把
+// 调度器内部结构暴露给每个 Channel 使用者）；Task 的完整定义只在
+// src/concurrency/channel.cpp 里使用。
+//
+// `go2cpp::Task` 是 `scheduler::Task` 的别名（scheduler.hpp 里
+// `using Task = scheduler::Task;`），所以前置声明必须写成同样的别名形式，
+// 否则会与真实定义冲突（两个不同的 Task 类型）。
+namespace scheduler {
+class Task;
+}
+using Task = scheduler::Task;
+
 /**
  * @brief Channel/Select 操作结果状态。
  * @details kReady 表示成功，kClosed 表示已关闭读取，其他状态描述取消、
@@ -781,6 +794,13 @@ enum class WaitSignal : std::uint32_t {
   kCancelled = 3,
 };
 
+/// @brief 取消回调 packed 值里的节点地址掩码（低 48 位）。
+///
+/// 与 16 位 generation 打包进一个 uint64，才能让取消闭包落进
+/// `std::function` 的 16 字节 SBO（消除每次带 Context 阻塞的一次 malloc）。
+/// 依据：Linux x86_64 用户态地址不超过 47 位、且节点按 8 字节对齐。
+inline constexpr std::uint64_t kCancelAddressMask = 0x0000FFFFFFFFFFFFULL;
+
 /// @brief 等待节点公共头：池化、侵入式链表、per-node futex、Fiber 绑定。
 ///
 /// 生命周期契约：节点地址由等待者线程独占（池也是线程本地的），
@@ -804,8 +824,21 @@ struct WaitNodeBase {
   bool managed{false};
   /// @brief 受管等待的 Scheduler（类型擦除，channel.cpp 内转换）。
   void* scheduler{nullptr};
-  /// @brief 受管等待的 Task（类型擦除，避免 header 依赖 scheduler.hpp）。
-  std::shared_ptr<void> task;
+  /// @brief 受管等待的 Task（前置声明 + 引用计数保活，避免 header 依赖 scheduler.hpp）。
+  ///
+  /// ## 为什么是 shared_ptr<Task> 而不是 shared_ptr<void>
+  /// 原实现用 `shared_ptr<void>` 做类型擦除，热路径每次 park/wake 都要
+  /// `static_pointer_cast<Task>` 构造一个临时 shared_ptr（+1/−1 两次跨核
+  /// RMW）。改成前置声明的 `shared_ptr<Task>` 后，`ChannelParkOnce` /
+  /// `ChannelWakeManaged` 可以把成员引用直接交给 Scheduler，零拷贝、零原子
+  /// 操作。`shared_ptr<void>` 与 `shared_ptr<Task>` 的表示完全一致（对象指针
+  /// + 控制块指针，16 字节），因此 sizeof/布局不变。
+  ///
+  /// ## 生命周期
+  /// 持有者仍是节点自身：`ChannelBindManaged` 在 park 前把 Scheduler 的
+  /// shared_ptr 存进来，`ResetBase` 在节点归还池时释放。等待期间 Task 由
+  /// Scheduler 注册表与这里的引用共同保活。
+  std::shared_ptr<Task> task;
   /// @brief select 节点归属；普通 Send/Recv 节点为空。
   std::shared_ptr<SelectWaitState> select_state;
   /// @brief select 节点的 case 下标。
@@ -2357,13 +2390,18 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
   /// @brief 持 Channel 锁调用：推进目标节点自己的 futex 字并定向唤醒。
   /// @note 调用前必须已经在锁内写完结果标志并发布 `signal`。
   static void WakeNodeLocked(detail::WaitNodeBase* node) noexcept {
-    node->seq.fetch_add(1, std::memory_order_release);
     if (node->managed) {
       // 受管 Fiber：交给 Scheduler；同样在锁内完成，节点在解锁后不再被
       // 访问，因此不需要额外的 wake gate/refcount。
+      //
+      // 注意：`seq` 只是 native futex 的代际字，受管路径完全不读它，所以
+      // 不能在这里推进 —— 唤醒方通常不在节点所在核，这一行会在**持锁期间**
+      // 制造一次跨核 RMW，纯属浪费。
       detail::ChannelWakeManaged(node);
       return;
     }
+    // native：先推进代际字，再按需 FUTEX_WAKE（两步都在锁内完成）。
+    node->seq.fetch_add(1, std::memory_order_release);
     if (node->parked.load(std::memory_order_relaxed) != 0) {
       detail::ChannelFutexWake(&node->seq);
     }
@@ -2387,8 +2425,13 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
                               std::uint64_t address,
                               std::uint32_t generation) noexcept {
     for (; node != nullptr; node = node->next) {
+      // generation 只比较低 16 位：取消回调把 generation 截断进 packed
+      // 值（见 AddCancelCallback），Timer 路径仍传完整 32 位，这里统一截断
+      // 比较。ABA 需要同一节点在回调存活窗口内被复用 65536 次，而回调存活
+      // 期不超过一次等待（纳秒级），实际不可能命中。
       if (reinterpret_cast<std::uint64_t>(node) != address ||
-          node->generation != generation) {
+          static_cast<std::uint16_t>(node->generation) !=
+              static_cast<std::uint16_t>(generation)) {
         continue;
       }
       std::uint32_t expected =
@@ -2415,15 +2458,31 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     if (!context) {
       return 0;
     }
-    std::weak_ptr<detail::CancelHub<Channel<T>>> weak_hub = m_cancel_hub;
+    // 闭包必须 ≤16 字节才能落进 libstdc++ 的 `std::function` SBO；原来的
+    // `[weak_ptr(16B), address(8B), generation(4B)]` 是 28 字节，每次带
+    // Context 的阻塞收发都要多一次 operator new（高并发下是 arena 竞争）。
+    //
+    // 现在拆成两个 8 字节：
+    // - `hub`：裸指针。生命周期契约与 `this` 相同 —— 本回调由
+    //   `CallbackGuard` 在等待返回前 `RemoveCallback`，所以回调最多活到
+    //   「等待结束」；等待期间调用者正阻塞在 Channel 成员函数里，Channel
+    //   （连同它持有的 CancelHub）必然存活。Channel 析构会先把
+    //   `hub->owner` 置空，那里仍然加 hub 锁，因此不会读到半销毁的 owner。
+    // - `packed`：48 位节点地址 + 16 位 generation（截断理由见
+    //   CancelOneLocked 的比较处）。
+    detail::CancelHub<Channel<T>>* hub = m_cancel_hub.get();
     const std::uint64_t address = reinterpret_cast<std::uint64_t>(node);
-    const std::uint32_t generation = node->generation;
-    return context->Done().AddCallback([weak_hub, address, generation] {
-      if (auto hub = weak_hub.lock()) {
-        std::lock_guard<std::mutex> gate(hub->mutex);
-        if (hub->owner != nullptr) {
-          hub->owner->CancelWaiter(address, generation);
-        }
+    const std::uint64_t packed =
+        (address & detail::kCancelAddressMask) |
+        (static_cast<std::uint64_t>(
+             static_cast<std::uint16_t>(node->generation))
+         << 48);
+    return context->Done().AddCallback([hub, packed] {
+      std::lock_guard<std::mutex> gate(hub->mutex);
+      if (hub->owner != nullptr) {
+        hub->owner->CancelWaiter(
+            packed & detail::kCancelAddressMask,
+            static_cast<std::uint32_t>(packed >> 48));
       }
     });
   }
