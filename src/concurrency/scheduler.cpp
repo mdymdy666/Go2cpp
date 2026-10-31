@@ -225,6 +225,63 @@ thread_local Scheduler* t_scheduler GO2CPP_SCHED_HOT_TLS = nullptr;
 thread_local std::shared_ptr<Task> t_task GO2CPP_SCHED_HOT_TLS;
 thread_local MId t_machine_id GO2CPP_SCHED_HOT_TLS = 0;
 thread_local PId t_processor_id GO2CPP_SCHED_HOT_TLS = 0;
+// ---------------------------------------------------------------------------
+// 阶段 1 提交侧去共享原子（2026-11-01-scheduler-opt-review.md P2/P3/P4）
+// ---------------------------------------------------------------------------
+//
+// 下面三组状态原本都是「每个任务一次全局原子 RMW」，且只服务启发式判定 /
+// 标识分配，没有精确性要求：
+//   - P2：next_processor 轮转（投递分摊）；
+//   - P3：enqueue_maintenance 维护票（每 64/1024 次做一次维护）；
+//   - P4：s_next_g_id（Task 构造时分配 GId）。
+// 改成线程局部后，热路径不再触碰共享缓存行，只剩一次 fs 段读。
+
+/// @brief P2：本线程的 P 轮转游标。
+thread_local std::size_t t_processor_rr GO2CPP_SCHED_HOT_TLS = 0;
+/// @brief P2：游标是否已经从全局种子领过起始偏移。
+thread_local bool t_processor_rr_seeded GO2CPP_SCHED_HOT_TLS = false;
+
+/// @brief P2：选择一个 P 编号（0..count-1）。
+/// @details 首次调用从 `seed` 领一个起始偏移（每线程一次全局 RMW），之后
+///          完全本地自增。多生产者靠不同起始偏移自然错开；单生产者下就是
+///          严格轮转。轮转只影响投递分摊的公平性，精确性没有要求——P 的
+///          队列满/空闲另有判定，取模的 P 数变化也不影响正确性。
+std::size_t pick_processor_round_robin(std::atomic<std::size_t>& seed,
+                                       std::size_t count) noexcept {
+    if (count == 0) {
+        return 0;
+    }
+    if (!t_processor_rr_seeded) {
+        t_processor_rr = seed.fetch_add(1, std::memory_order_relaxed);
+        t_processor_rr_seeded = true;
+    }
+    return t_processor_rr++ % count;
+}
+
+/// @brief P3：enqueue 维护票（本地自增，替代每任务一次全局 fetch_add）。
+thread_local std::uint64_t t_maintenance_ticket GO2CPP_SCHED_HOT_TLS = 0;
+
+/// @brief P4：GId 分段大小。每段一次全局 RMW，摊到 256 个 Task 构造上。
+constexpr GId kGIdSegmentSize = 256;
+thread_local GId t_g_id_next GO2CPP_SCHED_HOT_TLS = 0;
+thread_local GId t_g_id_end GO2CPP_SCHED_HOT_TLS = 0;
+
+/// @brief P4：分配一个进程内唯一的 GId。
+/// @details 全局唯一性保留（段从 s_next_g_id 一次领 256 个，段基单调），
+///          但不再保证全局严格连续：同一线程的 ID 段内连续，跨线程可能
+///          交错出现「后分配的 ID 小于先分配的 ID」。注册表条带仍均匀：
+///          段基数是 256 的倍数，低 4 位在每段内按 0..15 循环。GId 是
+///          64 位，正常进程不可能耗尽。
+GId allocate_g_id() noexcept {
+    if (t_g_id_next == t_g_id_end) {
+        const GId base =
+            s_next_g_id.fetch_add(kGIdSegmentSize, std::memory_order_relaxed);
+        t_g_id_next = base;
+        t_g_id_end = base + kGIdSegmentSize;
+    }
+    return t_g_id_next++;
+}
+
 // BlockingRegion is deliberately non-nestable: one M has one state
 // transition, and rejecting nested scopes avoids double accounting. The
 // machine id is retained so a misuse that lets a Fiber migrate before its
@@ -348,34 +405,17 @@ public:
     LocalRunQueue(const LocalRunQueue&) = delete;
     LocalRunQueue& operator=(const LocalRunQueue&) = delete;
 
-    /// @brief 入队；队列满返回 false，调用方必须改投全局队列。
-    bool push(std::shared_ptr<Task> task) noexcept {
-        if (!task) {
-            return false;
-        }
-        std::size_t position = m_tail.load(std::memory_order_relaxed);
-        for (;;) {
-            Cell& cell = m_cells[position & kMask];
-            const std::size_t sequence =
-                cell.sequence.load(std::memory_order_acquire);
-            const auto difference =
-                static_cast<std::int64_t>(sequence) -
-                static_cast<std::int64_t>(position);
-            if (difference == 0) {
-                if (m_tail.compare_exchange_weak(position, position + 1,
-                                                 std::memory_order_relaxed,
-                                                 std::memory_order_relaxed)) {
-                    cell.task = std::move(task);
-                    cell.sequence.store(position + 1,
-                                        std::memory_order_release);
-                    return true;
-                }
-            } else if (difference < 0) {
-                return false;  // 满
-            } else {
-                position = m_tail.load(std::memory_order_relaxed);
-            }
-        }
+    /// @brief 入队（左值：队列节点做一次 shared_ptr 拷贝）。
+    /// @details P12：形参从 by-value 改成 const 引用。原实现每个任务
+    ///          多付「形参拷贝 + 形参析构」两次控制块 RMW；队列节点本来
+    ///          就要持有一份强引用，因此这里只剩节点赋值这一次。
+    bool push(const std::shared_ptr<Task>& task) noexcept {
+        return push_impl(task);
+    }
+
+    /// @brief 入队（右值：直接移动，零引用计数操作）。
+    bool push(std::shared_ptr<Task>&& task) noexcept {
+        return push_impl(std::move(task));
     }
 
     /// @brief 出队；队列空返回空指针。
@@ -428,6 +468,37 @@ public:
     }
 
 private:
+    /// @brief push 的公共实现：左值拷贝一次，右值移动。
+    template <typename TaskPtr>
+    bool push_impl(TaskPtr&& task) noexcept {
+        if (!task) {
+            return false;
+        }
+        std::size_t position = m_tail.load(std::memory_order_relaxed);
+        for (;;) {
+            Cell& cell = m_cells[position & kMask];
+            const std::size_t sequence =
+                cell.sequence.load(std::memory_order_acquire);
+            const auto difference =
+                static_cast<std::int64_t>(sequence) -
+                static_cast<std::int64_t>(position);
+            if (difference == 0) {
+                if (m_tail.compare_exchange_weak(position, position + 1,
+                                                 std::memory_order_relaxed,
+                                                 std::memory_order_relaxed)) {
+                    cell.task = std::forward<TaskPtr>(task);
+                    cell.sequence.store(position + 1,
+                                        std::memory_order_release);
+                    return true;
+                }
+            } else if (difference < 0) {
+                return false;  // 满
+            } else {
+                position = m_tail.load(std::memory_order_relaxed);
+            }
+        }
+    }
+
     struct Cell {
         std::atomic<std::size_t> sequence{0};
         std::shared_ptr<Task> task;
@@ -468,16 +539,16 @@ public:
     RunNextSlot(const RunNextSlot&) = delete;
     RunNextSlot& operator=(const RunNextSlot&) = delete;
 
-    /// @brief 放入槽；被挤出的旧任务通过 displaced 返回。空任务返回 false。
-    bool push(std::shared_ptr<Task> task,
+    /// @brief 放入槽（左值：槽内做一次 shared_ptr 拷贝）。
+    bool push(const std::shared_ptr<Task>& task,
               std::shared_ptr<Task>& displaced) noexcept {
-        if (!task) {
-            return false;
-        }
-        std::lock_guard<detail::HotSpinLock> lock(m_mutex);
-        displaced = std::move(m_task);
-        m_task = std::move(task);
-        return true;
+        return push_impl(task, displaced);
+    }
+
+    /// @brief 放入槽（右值：直接移动，零引用计数操作）。
+    bool push(std::shared_ptr<Task>&& task,
+              std::shared_ptr<Task>& displaced) noexcept {
+        return push_impl(std::move(task), displaced);
     }
 
     /// @brief 取走槽内任务；空槽返回空指针。
@@ -493,6 +564,18 @@ public:
     }
 
 private:
+    template <typename TaskPtr>
+    bool push_impl(TaskPtr&& task,
+                   std::shared_ptr<Task>& displaced) noexcept {
+        if (!task) {
+            return false;
+        }
+        std::lock_guard<detail::HotSpinLock> lock(m_mutex);
+        displaced = std::move(m_task);
+        m_task = std::forward<TaskPtr>(task);
+        return true;
+    }
+
     mutable detail::HotSpinLock m_mutex;
     std::shared_ptr<Task> m_task;
 };
@@ -757,7 +840,9 @@ struct TaskCancellationGate {
 };
 
 Task::Task(Function function, TaskOptions options)
-    : m_id(s_next_g_id.fetch_add(1, std::memory_order_relaxed)),
+    // P4：GId 来自线程本地段（一次全局 RMW 摊到 256 个 Task 构造），
+    // 不再每个任务对 s_next_g_id 做一次共享 fetch_add。
+    : m_id(allocate_g_id()),
       m_function(std::move(function)),
       m_options(options),
       m_state_word(static_cast<std::uint32_t>(GState::kNew)) {}
@@ -2111,6 +2196,7 @@ public:
             processors[processor_id].active_machines.fetch_sub(
                 1, std::memory_order_relaxed);
             active_workers.fetch_sub(1, std::memory_order_relaxed);
+            needs_grow.store(true, std::memory_order_relaxed);
             machines.pop_back();
             throw;
         }
@@ -2204,6 +2290,10 @@ public:
         if (no_grow) {
             return;
         }
+        // P18：进入维护即清除事件位。置位方（worker 退出）总是先递减
+        // active_workers 再 store(true)，因此「先清位、后读计数」不会漏掉
+        // 一次已经完成的递减：若读到的仍是满员值，那说明没有未完成的退出。
+        needs_grow.store(false, std::memory_order_relaxed);
         // 满员快路径：普通可运行任务的需求以 P 数量为上限（见下方
         // extra_ceiling = processor_count + effective_blocking），所以
         // 「没有阻塞 M 且 active_workers 已达 P 数量」时扩容不可能发生。
@@ -2690,7 +2780,7 @@ public:
         // 快路径：还有 G 未终态时直接返回，不做任何全表扫描。计数归零
         // 后才做一次全表确认 —— 即使计数因某条漏减路径提前归零，这里也
         // 会拒绝提前结束，正确性优先于性能。
-        if (live_tasks.load(std::memory_order_acquire) != 0) {
+        if (live_tasks_total() != 0) {
             return false;
         }
         if (!all_tasks_terminal_locked()) {
@@ -2841,14 +2931,49 @@ public:
     // 首次入队成功时 +1，终态转移时 -1；两者都在 Task 的
     // m_transition_mutex 内完成。draining 用「归零」做 O(1) 完成判定，
     // 再配合一次全表确认兜底，取代旧实现每完成一个 G 扫描全表的 O(n²)。
-    std::atomic<std::size_t> live_tasks{0};
+    // P5：存活 G 计数按「首次入队的目标 P」分片（16 个缓存行槽位，索引
+    // & 15）。任务在自己的 P 上进入终态时递减的就是自己的分片行，缓存行
+    // 留在本核；生产者递增写目标 P 的行。原来 2 次全局 RMW（4P 下争用
+    // 一条缓存行，20-40ns/次）被摊到 4 条互不争用的行上。
+    static constexpr std::size_t kLiveTaskShardCount = 16;
+    struct LiveTaskShard {
+        alignas(64) std::atomic<std::size_t> value{0};
+    };
+    std::array<LiveTaskShard, kLiveTaskShardCount> live_task_shards{};
+
+    /// @brief 取分片计数；processor_hint 是首次入队时的目标 P 编号。
+    std::atomic<std::size_t>* live_task_shard(
+        std::size_t processor_hint) noexcept {
+        const std::size_t index =
+            processor_hint & (kLiveTaskShardCount - 1);
+        return &live_task_shards[index].value;
+    }
+
+    /// @brief 存活 G 数的精确聚合（draining 判零必须用它，不能用近似值）。
+    /// @details 只有 processor_count 个分片可能被使用（分片索引来自
+    ///          target_hint % processor_count），所以聚合读 ≤ min(16, P) 行。
+    std::size_t live_tasks_total() const noexcept {
+        const std::size_t shards = std::max<std::size_t>(
+            1U, std::min<std::size_t>(kLiveTaskShardCount,
+                                      processors.size()));
+        std::size_t total = 0;
+        for (std::size_t i = 0; i < shards; ++i) {
+            total += live_task_shards[i].value.load(
+                std::memory_order_acquire);
+        }
+        return total;
+    }
+
     // draining / stopping / accepting 的唯一位图与访问器见本类上方。
     std::atomic<std::size_t> runnable{0};
     std::atomic<std::size_t> active_workers{0};
     std::atomic<std::size_t> running_workers{0};
     std::atomic<std::size_t> blocking_workers{0};
     std::atomic<std::size_t> next_processor{0};
-    std::atomic<std::uint64_t> enqueue_maintenance{0};
+    // P18：扩容需求事件位。worker 退出（active_workers 递减之后）与阻塞
+    // 进入会置位；enqueue 的稳态路径只读这一位（一次 relaxed load），
+    // 不再逐任务读取 active_workers/runnable 做四个布尔判定。
+    std::atomic<bool> needs_grow{true};
     // 常规回收的轮转游标：每次触发只压缩一个注册表条带。
     std::atomic<std::size_t> next_terminal_collect_stripe{0};
     std::atomic<std::uint64_t> metric_task_runs{0};
@@ -3011,6 +3136,7 @@ bool Scheduler::run_main(Task::Function function) {
             }
         }
         m_impl->active_workers.fetch_sub(1, std::memory_order_relaxed);
+        m_impl->needs_grow.store(true, std::memory_order_relaxed);
         m_impl->processors[0].active_machines.fetch_sub(
             1, std::memory_order_relaxed);
         return false;
@@ -3165,7 +3291,7 @@ bool Scheduler::shutdown_for(
         // 全表扫描，10 万 G 的关停会回到 O(n²)。计数归零后再由
         // finish_draining_locked() 做一次全表确认兜底。
         const auto terminal = [this] {
-            return m_impl->live_tasks.load(std::memory_order_acquire) == 0;
+            return m_impl->live_tasks_total() == 0;
         };
         const bool completed =
             bounded ? m_impl->condition.wait_until(lock, deadline, terminal)
@@ -3458,6 +3584,13 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     const bool drain_resume =
         m_impl->draining() &&
         task->started() && task->cancellation_requested();
+    // P5：首次入队的目标 P 同时决定存活计数的分片——任务在该 P 上执行结束
+    // 时递减的是它自己的分片行。这里只算一次，后面的直投 / 外部生产者
+    // 投递复用同一个提示（轮转游标因此每任务只前进一次）。
+    const std::size_t target_hint =
+        from_worker ? static_cast<std::size_t>(t_processor_id)
+                    : pick_processor_round_robin(m_impl->next_processor,
+                                                 m_impl->processors.size());
     if ((!m_impl->accepting() && !drain_resume) ||
         m_impl->stopping()) {
         bool notify = false;
@@ -3480,7 +3613,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     }
     if (!task->prepare_enqueue(m_impl->owner_token,
                                m_impl->cancellation_gate,
-                               &m_impl->live_tasks)) {
+                               m_impl->live_task_shard(target_hint))) {
         GO2CPP_DEBUG_EVENT(kEnqueueRejected, task->id(), 5);
         return false;
     }
@@ -3565,8 +3698,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         // 直投它只需一次 CAS + 一次 runnable 记账；环满（256 槽）时才
         // 回退到 incoming 条带，因此长队列/积压语义完全保留。
         if (m_impl->accepting() && !m_impl->stopping()) {
-            const auto direct = m_impl->next_processor.fetch_add(
-                1, std::memory_order_relaxed);
+            const auto direct = target_hint;
             auto& direct_processor =
                 m_impl->processors[direct % m_impl->processors.size()];
             if (direct_processor.queue.push(task)) {
@@ -3647,10 +3779,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
             task->notify_terminal();
             return false;
         }
-        const auto preferred =
-            from_worker ? static_cast<std::size_t>(t_processor_id)
-                        : m_impl->next_processor.fetch_add(
-                              1, std::memory_order_relaxed);
+        const auto preferred = target_hint;
         auto& processor =
             m_impl->processors[preferred % m_impl->processors.size()];
         const bool use_global =
@@ -3697,21 +3826,15 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         }
     }
 
-    const auto maintenance_ticket =
-        m_impl->enqueue_maintenance.fetch_add(1, std::memory_order_relaxed);
-    const bool initial_workers_missing =
-        m_impl->active_workers.load(std::memory_order_relaxed) <
-        m_impl->config.min_workers;
-    const bool replacement_may_be_needed =
-        m_impl->active_workers.load(std::memory_order_relaxed) <=
-            m_impl->config.min_workers &&
-        m_impl->runnable.load(std::memory_order_relaxed) != 0;
-    const bool processor_workers_missing =
-        m_impl->active_workers.load(std::memory_order_relaxed) <
-        m_impl->processors.size();
-    if (initial_workers_missing || replacement_may_be_needed ||
-        (processor_workers_missing && (maintenance_ticket & 63U) == 0U) ||
-        (!processor_workers_missing && (maintenance_ticket & 1023U) == 0U)) {
+    // P3：维护票改成线程局部自增——原实现每任务一次全局 fetch_add，只为
+    // 拿一个「每 64/1024 次做一次维护」的票，票价远高于买到的维护。
+    // P18：稳态不再逐任务读 active_workers/runnable；只有「扩容事件位被置」
+    // 或本地采样命中 64 的倍数时才进入 maybe_grow（其内部自带走满员快
+    // 路径，成本是两次 relaxed load）。worker 退出与阻塞进入会重新置位，
+    // 因此最坏延迟是 64 个任务。
+    ++t_maintenance_ticket;
+    if (m_impl->needs_grow.load(std::memory_order_relaxed) ||
+        (t_maintenance_ticket & 63U) == 0U) {
         m_impl->maybe_grow(this);
     }
     m_impl->notify_worker();
@@ -3953,9 +4076,8 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
     // 用来测「不保留亲和」的代价。
     Impl::Processor* target = &processor;
     if (policy == WakePolicy::kRoundRobin && m_impl->processors.size() > 1) {
-        target = &m_impl->processors[
-            m_impl->next_processor.fetch_add(1, std::memory_order_relaxed) %
-            m_impl->processors.size()];
+        target = &m_impl->processors[pick_processor_round_robin(
+            m_impl->next_processor, m_impl->processors.size())];
     }
     if (!target->queue.push(task)) {
         m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
@@ -4035,9 +4157,8 @@ bool Scheduler::requeue_from_worker_reserved(const std::shared_ptr<Task>& task,
     }
     Impl::Processor* target = &processor;
     if (policy == WakePolicy::kRoundRobin && m_impl->processors.size() > 1) {
-        target = &m_impl->processors[
-            m_impl->next_processor.fetch_add(1, std::memory_order_relaxed) %
-            m_impl->processors.size()];
+        target = &m_impl->processors[pick_processor_round_robin(
+            m_impl->next_processor, m_impl->processors.size())];
     }
     if (!target->queue.push(task)) {
         m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
@@ -4315,9 +4436,8 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
     if (m_impl->wake_policy.load(std::memory_order_relaxed) ==
             WakePolicy::kRoundRobin &&
         !m_impl->processors.empty()) {
-        preferred_processor = static_cast<PId>(
-            m_impl->next_processor.fetch_add(1, std::memory_order_relaxed) %
-            m_impl->processors.size());
+        preferred_processor = static_cast<PId>(pick_processor_round_robin(
+            m_impl->next_processor, m_impl->processors.size()));
     }
     if (preferred_processor < m_impl->processors.size() &&
         requeue_to_processor(task, preferred_processor)) {
@@ -4420,9 +4540,8 @@ bool Scheduler::wake_io(const std::shared_ptr<Task>& task) {
     if (m_impl->wake_policy.load(std::memory_order_relaxed) ==
             WakePolicy::kRoundRobin &&
         !m_impl->processors.empty()) {
-        preferred_processor = static_cast<PId>(
-            m_impl->next_processor.fetch_add(1, std::memory_order_relaxed) %
-            m_impl->processors.size());
+        preferred_processor = static_cast<PId>(pick_processor_round_robin(
+            m_impl->next_processor, m_impl->processors.size()));
     }
     if (preferred_processor < m_impl->processors.size() &&
         requeue_to_processor(task, preferred_processor)) {
@@ -4635,9 +4754,8 @@ bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
     if (m_impl->wake_policy.load(std::memory_order_relaxed) ==
             WakePolicy::kRoundRobin &&
         !m_impl->processors.empty()) {
-        preferred_processor = static_cast<PId>(
-            m_impl->next_processor.fetch_add(1, std::memory_order_relaxed) %
-            m_impl->processors.size());
+        preferred_processor = static_cast<PId>(pick_processor_round_robin(
+            m_impl->next_processor, m_impl->processors.size()));
     }
     if (preferred_processor < m_impl->processors.size() &&
         requeue_to_processor(task, preferred_processor)) {
@@ -5489,8 +5607,8 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 // 一半（上限 32），自己留一个先跑，其余放回本 P 的环；
                 // 本 P 环也满则转入全局队列（此处仍持有 admission 锁）。
                 if (!task && m_impl->processors.size() > 1) {
-                    const auto start = m_impl->next_processor.fetch_add(
-                        1, std::memory_order_relaxed);
+                    const auto start = pick_processor_round_robin(
+                        m_impl->next_processor, m_impl->processors.size());
                     [[maybe_unused]] std::uint64_t victim_id = 0;
                     std::shared_ptr<Task> stolen[32];
                     std::size_t stolen_count = 0;
@@ -5811,7 +5929,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 // 才对全表做一次确认与回收。旧实现在这里每完成一个 G 就
                 // 扫两遍注册表（collect + all_terminal），10 万 G 的
                 // shutdown 因此退化成 O(n²)。
-                if (m_impl->live_tasks.load(std::memory_order_acquire) == 0) {
+                if (m_impl->live_tasks_total() == 0) {
                     bool finished = false;
                     {
                         std::lock_guard<std::mutex> admission_lock(
@@ -5875,7 +5993,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 // draining 中的全表回收推迟到存活计数归零（收尾完成点），
                 // 否则每消费一个 stale 节点都全表扫描会退化成 O(n²)。
                 if (!m_impl->draining() ||
-                    m_impl->live_tasks.load(std::memory_order_acquire) == 0) {
+                    m_impl->live_tasks_total() == 0) {
                     m_impl->collect_terminal_locked(deferred_destruction);
                 }
             }
@@ -6102,6 +6220,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             machine->state.store(MState::kStopping, std::memory_order_release);
             // 持锁减计数：多个补充 M 同时退休时不会一起跌破常驻底线。
             m_impl->active_workers.fetch_sub(1, std::memory_order_relaxed);
+            m_impl->needs_grow.store(true, std::memory_order_relaxed);
             own_processor.active_machines.fetch_sub(1,
                                                     std::memory_order_relaxed);
             retired = true;
@@ -6123,6 +6242,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                     1, std::memory_order_relaxed);
             }
             m_impl->active_workers.fetch_sub(1, std::memory_order_relaxed);
+            m_impl->needs_grow.store(true, std::memory_order_relaxed);
         }
         if (own_processor.active_machines.load(std::memory_order_relaxed) == 0) {
             own_processor.state.store(
