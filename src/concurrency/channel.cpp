@@ -19,10 +19,15 @@
  *   而不用比字符串；
  * - `Select(...)`：多路复用核心，类型无关所以能从模板里抽出来。
  *
- * ## Select 的语义（与 Go 对齐）
+ * ## Select 的语义（Go 对齐 + 有值优先增强）
  *
  * - 多个 case 同时就绪时**随机选一个**（线程本地 xorshift 取探测起点，
  *   既保证公平、避免固定优先级饿死后面的 case，也避免全局游标争用）；
+ * - 随机之上叠加**有值优先**（审计 D1 真正修复）：probe 会真正完成传输
+ *   （recv 取走值、send 发出值），这类结果立刻返回；closed / nil / 构造
+ *   失败不产生任何传输，先暂存，等本轮扫描确认没有可交付的值、也没有可
+ *   完成的发送时才返回。因此「已关闭且空」的 case 不会遮蔽同一 select 中
+ *   另一个通道的缓冲值。完整语义与取舍见 `docs/modules/select-semantics.md`；
  * - 有 `default` 且无 case 就绪时立刻走 default，不阻塞；
  * - 无 `default` 时注册到各 channel 的等待队列并 park，被任意一方唤醒后
  *   抢占式地"取走"结果 —— 多个 channel 同时唤醒它时只有一个能拿到；
@@ -436,14 +441,24 @@ SelectResult Select(const std::vector<SelectCase>& cases,
   // step2 开始：主循环。每次重试都从线程本地的随机起点开始探测，近似 Go 的
   // 随机选择（per-P fastrand），避免"永远从下标 0 开始"导致后面的 case 被
   // 饿死；也不再有全局游标 cacheline 争用。
+  //
+  // D1 真正修复（有值/可发送优先）：probe 会真正完成一次传输（recv 取走值、
+  // send 发出值），所以「有值」与「可发送」的结果必须立刻返回；而 closed /
+  // nil / 构造失败这三种就绪结果**没有发生任何传输**，可以暂存到本轮扫描
+  // 结束再决定。这样同一个 select 里「已关闭且空」的 case 不会遮蔽另一个
+  // 通道的缓冲值 —— 只有确实没有可交付的值、也没有可完成的发送时，才把
+  // 暂存的 closed 结果返回（审计 D1 的根因）。
+  //
+  // 注意这里只用现有的 probe 接口实现，不改变 SelectCase/SelectProbe 的
+  // 布局：多 agent 共享工作树时，公共结构体的尺寸变化会让「旧库 + 新头」的
+  // 增量构建在切换点崩溃（曾实测 SEGFAULT）。
   for (;;) {
     const std::size_t offset = NextSelectOffset(cases.size());
+    std::size_t deferred_index = SelectResult::kNoSelection;
+    SelectProbe deferred_probe;
     for (std::size_t n = 0; n < cases.size(); ++n) {
       const std::size_t index = (offset + n) % cases.size();
-      if (cases[index].is_default) {
-        continue;
-      }
-      if (!cases[index].probe) {
+      if (cases[index].is_default || !cases[index].probe) {
         continue;
       }
       SelectProbe probe;
@@ -453,12 +468,29 @@ SelectResult Select(const std::vector<SelectCase>& cases,
         return {SelectResult::kNoSelection, false, false, {},
                 ChannelStatus::kInvalid, detail::ValueOperationError()};
       }
-      if (probe.ready) {
+      if (!probe.ready) {
+        continue;
+      }
+      if (probe.status == ChannelStatus::kReady) {
+        // 传输已经发生（有值 / 发送成功），必须立刻返回。
         GO2CPP_DEBUG_EVENT(kChannelSelect, GO2CPP_DEBUG_BOUND_TASK(),
                            static_cast<std::uint64_t>(index));
         return {index, true, probe.ok, std::move(probe.value), probe.status,
                 std::move(probe.error), std::move(probe.typed_value)};
       }
+      // closed / nil / invalid / cancelled：无副作用，延后到扫描结束。
+      if (deferred_index == SelectResult::kNoSelection) {
+        deferred_index = index;
+        deferred_probe = std::move(probe);
+      }
+    }
+    if (deferred_index != SelectResult::kNoSelection) {
+      GO2CPP_DEBUG_EVENT(kChannelSelect, GO2CPP_DEBUG_BOUND_TASK(),
+                         static_cast<std::uint64_t>(deferred_index));
+      return {deferred_index, true, deferred_probe.ok,
+              std::move(deferred_probe.value), deferred_probe.status,
+              std::move(deferred_probe.error),
+              std::move(deferred_probe.typed_value)};
     }
 
     // 已就绪的 channel 操作与取消之间存在竞争，语义与 Go 的 select 一致。
