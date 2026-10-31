@@ -33,6 +33,7 @@
  */
 
 #include "go2cpp/bento/net/socks5.hpp"
+#include "go2cpp/network/socket.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -752,6 +753,12 @@ void Socks5Server::AcceptReady() {
             continue;
         }
         SetCloExec(client_fd);
+        // SOCKS5 握手与中继都是 2~10B 的小包往返；不关 Nagle 会被延迟 ACK
+        // 压成每轮约 40ms（基准实测建连 p99 51.7ms 同源）。这里复用网络层
+        // 的开关与实现，保证与 HttpServer / WsServer 的 accept 路径一致。
+        if (go2cpp::net::Socket::TcpNoDelayDefault()) {
+            (void)go2cpp::net::Socket::SetTcpNoDelay(client_fd);
+        }
 
         auto connection = std::make_unique<Connection>();
         connection->id = m_next_connection_id++;

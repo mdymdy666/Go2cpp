@@ -71,6 +71,10 @@ private:
     bool m_active{false};
 };
 
+/// @brief `accept()` 新连接是否自动开启 TCP_NODELAY 的进程级开关。
+/// @details 读多写少；用原子变量，测试里做「关闭 / 开启」A/B 对比时无数据竞争。
+std::atomic<bool> g_tcp_nodelay_default{true};
+
 int poll_wait(int fd, short events, std::chrono::milliseconds timeout) {
     pollfd descriptor{fd, events, 0};
     const int milliseconds = timeout == std::chrono::milliseconds::max()
@@ -375,6 +379,20 @@ bool Socket::listen(int backlog) {
     const bool result = ::listen(fd, backlog) == 0;
     end_operation(); return result;
 }
+bool Socket::SetTcpNoDelay(int fd) noexcept {
+    if (fd < 0) {
+        errno = EBADF;
+        return false;
+    }
+    const int enabled = 1;
+    return ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) == 0;
+}
+void Socket::SetTcpNoDelayDefault(bool enabled) noexcept {
+    g_tcp_nodelay_default.store(enabled, std::memory_order_release);
+}
+bool Socket::TcpNoDelayDefault() noexcept {
+    return g_tcp_nodelay_default.load(std::memory_order_acquire);
+}
 Socket::Ptr Socket::accept(Duration timeout) {
     const auto start = std::chrono::steady_clock::now();
     const auto cancel_generation = m_read_cancel_generation.load(std::memory_order_acquire);
@@ -398,7 +416,19 @@ Socket::Ptr Socket::accept(Duration timeout) {
             go2cpp::hook::mark_system_nonblocking(accepted);
 #endif
             auto result = FromFd(accepted, storage.ss_family, m_type, m_protocol);
-            if (result) result->m_connected = true;
+            if (result) {
+                result->m_connected = true;
+                // 新连接用于 TCP 时立即关闭 Nagle：HTTP 头、WS 帧、SOCKS5
+                // 握手都是小包，若等服务端前一个小包的延迟 ACK（Linux 默认
+                // 40ms），一次往返就会被压成 40ms 量级。UDP 没有 accept；
+                // Unix socket 不接受 IPPROTO_TCP 选项（EOPNOTSUPP），所以
+                // 必须按地址族过滤，不能无条件 setsockopt。
+                if (m_type == SOCK_STREAM &&
+                    (storage.ss_family == AF_INET || storage.ss_family == AF_INET6) &&
+                    TcpNoDelayDefault()) {
+                    (void)SetTcpNoDelay(accepted);
+                }
+            }
             // 新连接 fd 由 accept4 创建；在唯一归属点记录一次 accept。
             GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordAccept(accepted));
             end_operation(); return result;

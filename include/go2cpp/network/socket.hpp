@@ -84,6 +84,25 @@ public:
     static Ptr CreateUnix(bool datagram = false);
     static Ptr FromFd(int fd, int family, int type, int protocol = 0,
                       bool owner = true);
+    /**
+     * @brief 给一个已建立的 TCP socket 开启 `TCP_NODELAY`（关闭 Nagle）。
+     * @param fd 内核文件描述符；调用方负责保证它仍有效。
+     * @return 成功返回 true；fd 无效、不是 TCP（UDP / Unix socket 返回
+     *         `EOPNOTSUPP`）或 `setsockopt` 失败返回 false。
+     * @note 只影响本端发送：小包不再等待前一个未确认小包的 ACK 才发。
+     *       本库在 `accept()` 里自动调用（见 `TcpNoDelayDefault()`），
+     *       直接用 `::accept` 的协议实现（如 `Socks5Server`）需要自行调用。
+     */
+    static bool SetTcpNoDelay(int fd) noexcept;
+    /**
+     * @brief 设置 `accept()` 返回的新 TCP 连接是否默认开启 `TCP_NODELAY`。
+     * @details 默认开启。关闭只用于「修复前行为」的对比实验与回归定位；
+     *          生产路径不应关闭——不关 Nagle 时小包往返会被延迟 ACK 压成
+     *          约 40ms（见 `docs/reports/2026-10-31-http-perf.md` 第 6.1 节）。
+     */
+    static void SetTcpNoDelayDefault(bool enabled) noexcept;
+    /// @brief 查询 `accept()` 是否自动开启 `TCP_NODELAY`（默认 true）。
+    static bool TcpNoDelayDefault() noexcept;
     ~Socket();
 
     Socket(const Socket&) = delete;

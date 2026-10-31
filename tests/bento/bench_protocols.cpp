@@ -48,6 +48,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -60,6 +61,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/socket.h>
 
 // 顺序敏感：http_server.hpp / ws_server.hpp 在 `namespace go2cpp::bento` 内
 // 写 `net::Socket`，必须赶在定义 `go2cpp::bento::net` 的头文件（coap/mqtt）
@@ -3928,12 +3930,648 @@ void Run() {
 }  // namespace write_path
 
 // ===========================================================================
-// 4. 入口：参数解析与调度
+// 4. TCP_NODELAY：产品 accept 路径的小包延迟、开关与 UDP/Unix 隔离
+// ===========================================================================
+//
+// 背景（docs/reports/2026-10-31-http-perf.md §6.1）：服务端 accept 出来的
+// socket 不设 TCP_NODELAY 时，小包会被 Nagle 压住，等接收方延迟 ACK 40ms
+// 才放行。本组场景全部走**产品服务端**：先 `SetTcpNoDelayDefault(false)`
+// 复现修复前行为，再 `true` 验证修复后，同一路径、同一负载对比。
+namespace nodelay_bench {
+
+using go2cpp::bento::HttpServer;
+using go2cpp::bento::HttpServerConfig;
+using go2cpp::bento::WsServer;
+using go2cpp::bento::WsServerConfig;
+using go2cpp::net::Socket;
+using go2cpp::net::WebSocketOpcode;
+
+/// 读一个带 Content-Length 的 HTTP 响应；保留跨调用残余字节。
+class HttpResponseReader {
+public:
+    explicit HttpResponseReader(Socket& socket) : m_socket(socket) {}
+
+    bool Read(std::string* body) {
+        for (;;) {
+            if (m_header_end == std::string::npos) {
+                m_header_end = m_data.find("\r\n\r\n");
+                if (m_header_end != std::string::npos) {
+                    const std::size_t position = m_data.find("Content-Length: ");
+                    if (position == std::string::npos || position > m_header_end) {
+                        return false;
+                    }
+                    std::size_t value = 0;
+                    for (std::size_t index = position + 16;
+                         index < m_data.size() && m_data[index] >= '0' && m_data[index] <= '9';
+                         ++index) {
+                        value = value * 10 + static_cast<std::size_t>(m_data[index] - '0');
+                    }
+                    m_content_length = value;
+                }
+            }
+            if (m_header_end != std::string::npos) {
+                const std::size_t total = m_header_end + 4 + m_content_length;
+                if (m_data.size() >= total) {
+                    if (body != nullptr) {
+                        *body = m_data.substr(m_header_end + 4, m_content_length);
+                    }
+                    m_data.erase(0, total);
+                    m_header_end = std::string::npos;
+                    m_content_length = 0;
+                    return true;
+                }
+            }
+            char buffer[1024];
+            const auto result = m_socket.recv(buffer, sizeof(buffer));
+            if (result.transferred <= 0) {
+                return false;
+            }
+            m_data.append(buffer, static_cast<std::size_t>(result.transferred));
+        }
+    }
+
+private:
+    Socket& m_socket;
+    std::string m_data;
+    std::size_t m_header_end{std::string::npos};
+    std::size_t m_content_length{0};
+};
+
+/// fd 的 TCP_NODELAY 当前值；查询失败（如 Unix socket）返回 -1。
+int TcpNoDelayValue(int fd) {
+    int value = -1;
+    socklen_t length = sizeof(value);
+    if (::getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &value, &length) != 0) {
+        return -1;
+    }
+    return value;
+}
+
+bool WriteAll(Socket& socket, std::string_view data) {
+    std::size_t sent = 0;
+    while (sent < data.size()) {
+        const auto result = socket.send(data.data() + sent, data.size() - sent);
+        if (result.transferred <= 0) {
+            return false;
+        }
+        sent += static_cast<std::size_t>(result.transferred);
+    }
+    return true;
+}
+
+/// 读满字节；**不设** TCP_QUICKACK——否则会替服务端解除 Nagle 抑制，
+/// 测不到修复前行为。
+bool ReadExactPlain(Socket& socket, void* data, std::size_t size) {
+    std::size_t got = 0;
+    while (got < size) {
+        const auto result =
+            socket.recv(static_cast<char*>(data) + got, size - got);
+        if (result.transferred <= 0) {
+            return false;
+        }
+        got += static_cast<std::size_t>(result.transferred);
+    }
+    return true;
+}
+
+/// 一次 IPv4 TCP accept 的结果。
+struct AcceptedPair {
+    Socket::Ptr accepted;
+    Socket::Ptr client;
+};
+
+AcceptedPair AcceptOneTcp() {
+    AcceptedPair pair;
+    auto listener = Socket::CreateTCP();
+    const auto address = go2cpp::net::IPv4Address::Create("127.0.0.1", 0);
+    if (!listener || !address || !listener->bind(*address) || !listener->listen(16)) {
+        return pair;
+    }
+    const auto local =
+        std::dynamic_pointer_cast<go2cpp::net::IPAddress>(listener->local_address());
+    if (!local) {
+        return pair;
+    }
+    std::thread acceptor([&] {
+        pair.accepted = listener->accept(std::chrono::milliseconds(2000));
+    });
+    pair.client = go2cpp::net::DialTCP("127.0.0.1", local->port(),
+                                       std::chrono::milliseconds(2000));
+    acceptor.join();
+    return pair;
+}
+
+/// 一次 AF_UNIX stream accept 的结果。
+AcceptedPair AcceptOneUnix() {
+    AcceptedPair pair;
+    auto listener = Socket::CreateUnix(false);
+    // 抽象命名空间：进程退出自动释放，不落文件、不需要 unlink。
+    const go2cpp::net::UnixAddress address(std::string(1, '\0') + "go2cpp_nodelay_test");
+    if (!listener || !listener->bind(address) || !listener->listen(16)) {
+        return pair;
+    }
+    std::thread acceptor([&] {
+        pair.accepted = listener->accept(std::chrono::milliseconds(2000));
+    });
+    pair.client = Socket::CreateUnix(false);
+    const bool connected =
+        pair.client && pair.client->connect(address, std::chrono::milliseconds(2000));
+    acceptor.join();
+    if (!connected) {
+        pair.client.reset();
+    }
+    return pair;
+}
+
+/// Socket 层：默认开/关的 accept 值、UDP/Unix 不被误设且收发正常。
+void CheckSocketLayer() {
+    BeginScenario("NODELAY", "Socket accept 默认 NODELAY=1 / 关闭开关=0；UDP/Unix 隔离");
+
+    // 1) 默认开：accept 出来的 fd 必须是 TCP_NODELAY=1，且数据面正常。
+    BENCH_CHECK(Socket::TcpNoDelayDefault());
+    {
+        const AcceptedPair pair = AcceptOneTcp();
+        BENCH_CHECK(static_cast<bool>(pair.accepted));
+        BENCH_CHECK(static_cast<bool>(pair.client));
+        if (pair.accepted) {
+            BENCH_CHECK_EQ(TcpNoDelayValue(pair.accepted->fd()), 1);
+            const char byte = 'x';
+            BENCH_CHECK(pair.accepted->send(&byte, 1).transferred == 1);
+            char echo = 0;
+            if (pair.client) {
+                BENCH_CHECK(pair.client->recv(&echo, 1).transferred == 1);
+            }
+            BENCH_CHECK_EQ(echo, 'x');
+        }
+        if (pair.client) {
+            (void)pair.client->close();
+        }
+    }
+
+    // 2) 关闭开关：新 accept 的连接应为 0（Linux 默认），证明开关真实生效。
+    {
+        Socket::SetTcpNoDelayDefault(false);
+        const AcceptedPair pair = AcceptOneTcp();
+        BENCH_CHECK(static_cast<bool>(pair.accepted));
+        if (pair.accepted) {
+            BENCH_CHECK_EQ(TcpNoDelayValue(pair.accepted->fd()), 0);
+        }
+        if (pair.client) {
+            (void)pair.client->close();
+        }
+        Socket::SetTcpNoDelayDefault(true);
+    }
+
+    // 3) AF_UNIX：accept 必须成功、收发正常；TCP_NODELAY 查询/设置都失败。
+    {
+        const AcceptedPair pair = AcceptOneUnix();
+        BENCH_CHECK(static_cast<bool>(pair.accepted));
+        BENCH_CHECK(static_cast<bool>(pair.client));
+        if (pair.accepted) {
+            BENCH_CHECK_EQ(TcpNoDelayValue(pair.accepted->fd()), -1);
+            errno = 0;
+            const bool set_ok = Socket::SetTcpNoDelay(pair.accepted->fd());
+            const int set_errno = errno;
+            BENCH_CHECK(!set_ok);
+            BENCH_CHECK(set_errno == EOPNOTSUPP || set_errno == ENOPROTOOPT);
+            const char byte = 'u';
+            BENCH_CHECK(pair.accepted->send(&byte, 1).transferred == 1);
+            char echo = 0;
+            if (pair.client) {
+                BENCH_CHECK(pair.client->recv(&echo, 1).transferred == 1);
+            }
+            BENCH_CHECK_EQ(echo, 'u');
+        }
+        if (pair.client) {
+            (void)pair.client->close();
+        }
+    }
+
+    // 4) UDP：helper 安全失败（EOPNOTSUPP/ENOPROTOOPT），回环收发不受影响。
+    {
+        auto server = Socket::CreateUDP();
+        const auto address = go2cpp::net::IPv4Address::Create("127.0.0.1", 0);
+        BENCH_CHECK(static_cast<bool>(server));
+        BENCH_CHECK(static_cast<bool>(address));
+        if (server && address) {
+            BENCH_CHECK(server->bind(*address));
+            const auto local =
+                std::dynamic_pointer_cast<go2cpp::net::IPAddress>(server->local_address());
+            BENCH_CHECK(static_cast<bool>(local));
+            errno = 0;
+            const bool set_ok = Socket::SetTcpNoDelay(server->fd());
+            const int set_errno = errno;
+            BENCH_CHECK(!set_ok);
+            BENCH_CHECK(set_errno == EOPNOTSUPP || set_errno == ENOPROTOOPT);
+            if (local) {
+                auto client = Socket::CreateUDP();
+                BENCH_CHECK(static_cast<bool>(client));
+                if (client) {
+                    const char payload[] = "udp";
+                    BENCH_CHECK(client->send_to(payload, 3, *local).transferred == 3);
+                    char buffer[8] = {};
+                    go2cpp::net::AddressPtr from;
+                    const auto received =
+                        server->recv_from(buffer, sizeof(buffer), from, 0,
+                                          std::chrono::milliseconds(1000));
+                    BENCH_CHECK(received.transferred == 3);
+                    BENCH_CHECK_EQ(std::string(buffer, 3), std::string("udp"));
+                    (void)client->close();
+                }
+            }
+            (void)server->close();
+        }
+    }
+}
+
+/// HTTP：同一连接流水线 2 个 GET，读 2 个 2B 响应。返回两个响应的完成延迟。
+bool MeasureHttpLatency(bool enable_nodelay, std::vector<std::uint64_t>* first,
+                        std::vector<std::uint64_t>* second) {
+    Socket::SetTcpNoDelayDefault(enable_nodelay);
+    HttpServer server;
+    HttpServerConfig config;
+    config.worker_threads = 1;
+    config.max_requests_per_connection = 1000000;
+    server.OnRequest([](const go2cpp::http::Request&) {
+        go2cpp::http::Response response;
+        response.status = go2cpp::http::Status::OK;
+        response.body = "ok";
+        return response;
+    });
+    const auto listened = server.Listen("127.0.0.1:0", config);
+    if (!listened.ok() || !server.Start().ok()) {
+        Socket::SetTcpNoDelayDefault(true);
+        return false;
+    }
+    bool ok = true;
+    auto client = go2cpp::net::DialTCP("127.0.0.1", server.Port(),
+                                       std::chrono::milliseconds(3000));
+    if (!client) {
+        server.Stop();
+        Socket::SetTcpNoDelayDefault(true);
+        return false;
+    }
+    // 只关客户端发送侧的 Nagle；被测对象是服务端 accept 出来的 socket。
+    SetNoDelay(client);
+    (void)client->set_recv_timeout(std::chrono::milliseconds(3000));
+    HttpResponseReader reader(*client);
+    const std::string pipelined = http_bench::MakeGet("/hello") + http_bench::MakeGet("/hello");
+    for (int round = 0; round < 30 && ok; ++round) {
+        const std::uint64_t started = NowNs();
+        std::string body;
+        if (!WriteAll(*client, pipelined) || !reader.Read(&body) || body != "ok") {
+            ok = false;
+            break;
+        }
+        first->push_back(NowNs() - started);
+        if (!reader.Read(&body) || body != "ok") {
+            ok = false;
+            break;
+        }
+        second->push_back(NowNs() - started);
+    }
+    (void)client->close();
+    server.Stop();
+    Socket::SetTcpNoDelayDefault(true);
+    return ok;
+}
+
+/// 随机流水线：每轮 1~4 个 POST（body 1~32B），读回全部回显。
+bool MeasureRandomPipeline(std::vector<std::uint64_t>* samples) {
+    Socket::SetTcpNoDelayDefault(true);
+    HttpServer server;
+    HttpServerConfig config;
+    config.worker_threads = 1;
+    config.max_requests_per_connection = 1000000;
+    server.OnRequest([](const go2cpp::http::Request& request) {
+        go2cpp::http::Response response;
+        response.status = go2cpp::http::Status::OK;
+        response.body = request.body;
+        return response;
+    });
+    const auto listened = server.Listen("127.0.0.1:0", config);
+    if (!listened.ok() || !server.Start().ok()) {
+        return false;
+    }
+    bool ok = true;
+    auto client = go2cpp::net::DialTCP("127.0.0.1", server.Port(),
+                                       std::chrono::milliseconds(3000));
+    if (!client) {
+        server.Stop();
+        return false;
+    }
+    SetNoDelay(client);
+    (void)client->set_recv_timeout(std::chrono::milliseconds(3000));
+    HttpResponseReader reader(*client);
+    std::mt19937 generator(20261031U);
+    std::uniform_int_distribution<int> depth_distribution(1, 4);
+    std::uniform_int_distribution<int> size_distribution(1, 32);
+    for (int round = 0; round < 20 && ok; ++round) {
+        const int depth = depth_distribution(generator);
+        std::string payload;
+        std::vector<std::string> bodies;
+        for (int index = 0; index < depth; ++index) {
+            const auto size = static_cast<std::size_t>(size_distribution(generator));
+            const std::string body(size, static_cast<char>('a' + index % 26));
+            bodies.push_back(body);
+            payload += http_bench::MakePost("/echo", body);
+        }
+        const std::uint64_t started = NowNs();
+        if (!WriteAll(*client, payload)) {
+            ok = false;
+            break;
+        }
+        std::string received;
+        for (int index = 0; index < depth; ++index) {
+            if (!reader.Read(&received) || received != bodies[static_cast<std::size_t>(index)]) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            samples->push_back(NowNs() - started);
+        }
+    }
+    (void)client->close();
+    server.Stop();
+    return ok;
+}
+
+/// WS：连续发 2 条 Text，读 2 条 echo。返回首帧/次帧到达延迟。
+bool MeasureWsLatency(bool enable_nodelay, std::vector<std::uint64_t>* first,
+                      std::vector<std::uint64_t>* second) {
+    Socket::SetTcpNoDelayDefault(enable_nodelay);
+    WsServer server;
+    std::uint16_t port = 0;
+    if (!ws_bench::StartServer(server, &port, 1)) {
+        Socket::SetTcpNoDelayDefault(true);
+        return false;
+    }
+    bool ok = true;
+    ws_bench::RawClient client;
+    if (!client.Connect(port, "/ws")) {
+        server.Stop();
+        Socket::SetTcpNoDelayDefault(true);
+        return false;
+    }
+    for (int round = 0; round < 30 && ok; ++round) {
+        const std::uint64_t started = NowNs();
+        WebSocketOpcode opcode = WebSocketOpcode::Text;
+        std::string payload;
+        if (!client.SendFrame(WebSocketOpcode::Text, "hello") ||
+            !client.SendFrame(WebSocketOpcode::Text, "hello") ||
+            !client.ReadFrame(&opcode, &payload) || payload != "hello") {
+            ok = false;
+            break;
+        }
+        first->push_back(NowNs() - started);
+        if (!client.ReadFrame(&opcode, &payload) || payload != "hello") {
+            ok = false;
+            break;
+        }
+        second->push_back(NowNs() - started);
+    }
+    client.Close();
+    server.Stop();
+    Socket::SetTcpNoDelayDefault(true);
+    return ok;
+}
+
+/// 上游：等首字节，然后分两段推送（间隔 25ms），用于观察中继写路径的 Nagle。
+class PushUpstream {
+public:
+    ~PushUpstream() { Stop(); }
+
+    bool Start(std::uint16_t* port) {
+        m_listener = Socket::CreateTCP();
+        const auto address = go2cpp::net::IPv4Address::Create("127.0.0.1", 0);
+        if (!m_listener || !address || !m_listener->bind(*address) ||
+            !m_listener->listen(16)) {
+            return false;
+        }
+        const auto local =
+            std::dynamic_pointer_cast<go2cpp::net::IPAddress>(m_listener->local_address());
+        if (!local) {
+            return false;
+        }
+        *port = local->port();
+        m_thread = std::thread([this] { AcceptLoop(); });
+        return true;
+    }
+
+    void Stop() {
+        m_stop.store(true, std::memory_order_release);
+        if (m_listener) {
+            (void)m_listener->close();
+        }
+        if (m_thread.joinable()) {
+            m_thread.join();
+        }
+        for (auto& worker : m_workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        m_workers.clear();
+        m_listener.reset();
+    }
+
+    /// 最近一次把 BB 交给内核的时刻（ns）；0 表示本轮尚未发送。
+    /// @details 客户端用它算「BB 真正到达 - BB 交给内核」的差：修复前 Nagle
+    ///          会把 BB 压在 Send-Q 等 ACK，这个差就是被延迟 ACK 拖住的时间。
+    std::atomic<std::uint64_t> last_bb_sent_ns{0};
+
+private:
+    void AcceptLoop() {
+        while (!m_stop.load(std::memory_order_acquire)) {
+            auto connection = m_listener->accept(std::chrono::milliseconds(5));
+            if (!connection) {
+                continue;
+            }
+            m_workers.emplace_back([this, connection] {
+                char trigger = 0;
+                if (connection->recv(&trigger, 1).transferred <= 0) {
+                    (void)connection->close();
+                    return;
+                }
+                SetNoDelay(connection);
+                (void)connection->send("AA", 2);
+                // 让 proxy 先把 AA 转发出去（客户端只读、不 ACK），再发 BB；
+                // BB 会撞上 AA 未确认的窗口，正好暴露 Nagle。
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                last_bb_sent_ns.store(NowNs(), std::memory_order_release);
+                (void)connection->send("BB", 2);
+                char drain[64];
+                while (!m_stop.load(std::memory_order_acquire) &&
+                       connection->recv(drain, sizeof(drain)).transferred > 0) {
+                }
+                (void)connection->close();
+            });
+        }
+    }
+
+    Socket::Ptr m_listener;
+    std::thread m_thread;
+    std::vector<std::thread> m_workers;
+    std::atomic<bool> m_stop{false};
+};
+
+/// SOCKS5：CONNECT 后触发上游分两段推送，测「AA 读完 → BB 读完」的间隔。
+bool MeasureSocksLatency(bool enable_nodelay, std::vector<std::uint64_t>* gap) {
+    Socket::SetTcpNoDelayDefault(enable_nodelay);
+    PushUpstream upstream;
+    std::uint16_t upstream_port = 0;
+    if (!upstream.Start(&upstream_port)) {
+        Socket::SetTcpNoDelayDefault(true);
+        return false;
+    }
+    go2cpp::bento::socks5::Socks5ServerConfig config;
+    config.listen_port = 0;
+    config.max_connections = 16;
+    config.handshake_timeout_ms = 5000;
+    config.idle_timeout_ms = 5000;
+    go2cpp::bento::socks5::Socks5Server proxy(config);
+    if (!proxy.Open() || !proxy.Start()) {
+        Socket::SetTcpNoDelayDefault(true);
+        return false;
+    }
+    bool ok = true;
+    for (int round = 0; round < 8 && ok; ++round) {
+        upstream.last_bb_sent_ns.store(0, std::memory_order_release);
+        auto client = go2cpp::net::DialTCP("127.0.0.1", proxy.local_port(),
+                                           std::chrono::milliseconds(3000));
+        if (!client) {
+            ok = false;
+            break;
+        }
+        SetNoDelay(client);
+        (void)client->set_recv_timeout(std::chrono::milliseconds(3000));
+        // 握手阶段用 bench 的辅助（内部会设 QUICKACK，无妨）：reply 被立即
+        // ACK，后面的 AA 才能立即发出，BB 才会暴露 Nagle。
+        if (!socks_bench::Greeting(*client) ||
+            !socks_bench::ConnectIPv4(*client, "127.0.0.1", upstream_port, nullptr) ||
+            !socks_bench::WriteAll(*client, "T", 1)) {
+            (void)client->close();
+            ok = false;
+            break;
+        }
+        char aa[2] = {0, 0};
+        char bb[2] = {0, 0};
+        if (!ReadExactPlain(*client, aa, 2)) {
+            (void)client->close();
+            ok = false;
+            break;
+        }
+        if (!ReadExactPlain(*client, bb, 2)) {
+            (void)client->close();
+            ok = false;
+            break;
+        }
+        const std::uint64_t bb_done = NowNs();
+        const std::uint64_t bb_sent =
+            upstream.last_bb_sent_ns.load(std::memory_order_acquire);
+        if (aa[0] != 'A' || bb[0] != 'B' || bb_sent == 0) {
+            (void)client->close();
+            ok = false;
+            break;
+        }
+        // 只统计「交给内核 → 真正到达客户端」这一段：修复前它就是 Nagle
+        // 等延迟 ACK 的时间，修复后应接近 0。
+        gap->push_back(bb_done - bb_sent);
+        (void)client->close();
+    }
+    proxy.Stop();
+    proxy.Close();
+    upstream.Stop();
+    Socket::SetTcpNoDelayDefault(true);
+    return ok;
+}
+
+Latency SummarizeCopy(const std::vector<std::uint64_t>& samples) {
+    auto copy = samples;
+    return Summarize(copy);
+}
+
+void PrintAb(const char* name, const std::vector<std::uint64_t>& before,
+             const std::vector<std::uint64_t>& after) {
+    const Latency old = SummarizeCopy(before);
+    const Latency now = SummarizeCopy(after);
+    std::printf(
+        "[NODELAY] %-26s 修复前 p50=%8.2fus p99=%8.2fus | 修复后 p50=%8.2fus p99=%8.2fus\n",
+        name, static_cast<double>(old.p50_ns) / 1000.0,
+        static_cast<double>(old.p99_ns) / 1000.0,
+        static_cast<double>(now.p50_ns) / 1000.0,
+        static_cast<double>(now.p99_ns) / 1000.0);
+}
+
+/// 阈值：修复前 p50 > 20ms；修复后 p99 < 1ms。单位 ns。
+constexpr std::uint64_t kSlowP50Ns = 20ULL * 1000ULL * 1000ULL;
+constexpr std::uint64_t kFastP99Ns = 1ULL * 1000ULL * 1000ULL;
+
+void Run() {
+    CheckSocketLayer();
+
+    BeginScenario("NODELAY", "HTTP keep-alive 流水线 2 个小响应（A/B 延迟）");
+    {
+        std::vector<std::uint64_t> first_before, second_before, first_after, second_after;
+        BENCH_CHECK(MeasureHttpLatency(false, &first_before, &second_before));
+        BENCH_CHECK(MeasureHttpLatency(true, &first_after, &second_after));
+        PrintAb("HTTP 第 2 个响应", second_before, second_after);
+        const Latency slow = SummarizeCopy(second_before);
+        const Latency fast = SummarizeCopy(second_after);
+        BENCH_CHECK(slow.p50_ns > kSlowP50Ns);
+        BENCH_CHECK(fast.p99_ns < kFastP99Ns);
+
+        // 随机测试：流水线深度 1~4、body 1~32B，验证修复不是只对固定形状
+        // 有效，且多请求合并写后仍在 1ms 内。
+        BeginScenario("NODELAY", "随机流水线 1~4 个 POST / 1~32B body（正确性 + p99）");
+        std::vector<std::uint64_t> random_samples;
+        const bool random_ok = MeasureRandomPipeline(&random_samples);
+        BENCH_CHECK(random_ok);
+        const Latency random_latency = SummarizeCopy(random_samples);
+        std::printf("[NODELAY] %-26s p50=%8.2fus p99=%8.2fus\n", "随机流水线",
+                    static_cast<double>(random_latency.p50_ns) / 1000.0,
+                    static_cast<double>(random_latency.p99_ns) / 1000.0);
+        BENCH_CHECK(random_latency.p99_ns < kFastP99Ns);
+    }
+
+    BeginScenario("NODELAY", "WebSocket 连续 2 条 echo（A/B 首帧延迟）");
+    {
+        std::vector<std::uint64_t> first_before, second_before, first_after, second_after;
+        BENCH_CHECK(MeasureWsLatency(false, &first_before, &second_before));
+        BENCH_CHECK(MeasureWsLatency(true, &first_after, &second_after));
+        PrintAb("WS 首帧", first_before, first_after);
+        const Latency slow = SummarizeCopy(first_before);
+        const Latency fast = SummarizeCopy(first_after);
+        BENCH_CHECK(slow.p50_ns > kSlowP50Ns);
+        BENCH_CHECK(fast.p99_ns < kFastP99Ns);
+    }
+
+    BeginScenario("NODELAY", "SOCKS5 中继上游两段小包（A/B 段间隔）");
+    {
+        std::vector<std::uint64_t> before, after;
+        BENCH_CHECK(MeasureSocksLatency(false, &before));
+        BENCH_CHECK(MeasureSocksLatency(true, &after));
+        PrintAb("SOCKS5 BB 到达延迟", before, after);
+        const Latency slow = SummarizeCopy(before);
+        const Latency fast = SummarizeCopy(after);
+        BENCH_CHECK(slow.p50_ns > kSlowP50Ns);
+        BENCH_CHECK(fast.p99_ns < kFastP99Ns);
+    }
+
+    Socket::SetTcpNoDelayDefault(true);
+}
+
+}  // namespace nodelay_bench
+
+// ===========================================================================
+// 5. 入口：参数解析与调度
 // ===========================================================================
 
 struct Options {
     bool correctness{true};
     bool perf{true};
+    bool nodelay{false};            ///< 只跑 TCP_NODELAY 专项（延迟 A/B + 隔离）。
     std::vector<std::string> only;  ///< 空表示全部
 };
 
@@ -3964,6 +4602,13 @@ Options ParseArgs(int argc, char** argv) {
                 options.correctness = false;
                 saw_mode = true;
             }
+        } else if (arg == "--nodelay") {
+            options.nodelay = true;
+            if (!saw_mode) {
+                options.correctness = false;
+                options.perf = false;
+                saw_mode = true;
+            }
         } else if (arg.rfind("--only=", 0) == 0) {
             std::string list = arg.substr(7);
             std::size_t start = 0;
@@ -3980,7 +4625,7 @@ Options ParseArgs(int argc, char** argv) {
                 start = comma + 1;
             }
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("用法: %s [--correctness|--perf] [--only=http,ws,...]\n", argv[0]);
+            std::printf("用法: %s [--correctness|--perf|--nodelay] [--only=http,ws,...]\n", argv[0]);
             std::exit(0);
         }
     }
@@ -4003,6 +4648,9 @@ int main(int argc, char** argv) {
     const bool want_omni = Wanted(options, "omni");
     const bool want_write = Wanted(options, "write");
 
+    if (options.nodelay) {
+        nodelay_bench::Run();
+    }
     if (options.correctness) {
         if (want_http) {
             http_bench::CheckCorrectness();
