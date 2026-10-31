@@ -215,10 +215,10 @@ ctest 数量随构建配置变化，**以 `ctest -N` 为准**（逐条清单见 
 
 | 构建配置 | profile | ctest 总数 |
 | --- | --- | --- |
-| Bento + MCP（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`，`.build-bento-wsl`） | `bento+mcp` | **81**（58 bento + 2 bufio + 21 MCP 框架） |
+| Bento + MCP（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`，`.build-bento-wsl`） | `bento+mcp` | **85**（60 bento + 3 bufio + 1 reflect_codec + 21 MCP 框架） |
 | MCP 集成（`-DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_OS_MONITOR_TESTS=ON`） | `mcp+osmon` | **35**（12 os/monitor + 2 bufio + 21 MCP 框架） |
 
-Bento + MCP 构建实测 **Total Tests: 81**、**81/81 passed**；MCP 集成构建实测 **35/35 passed**（root 用例无权限时记 SKIP）。
+Bento + MCP 构建实测 **Total Tests: 85**、**85/85 passed**；MCP 集成构建实测 **35/35 passed**（root 用例无权限时记 SKIP）。
 
 ```sh
 ctest --test-dir .build-bento-wsl --output-on-failure

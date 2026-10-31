@@ -8,7 +8,7 @@
 > 或加注。
 
 > **2026-10-30 现状索引**：ctest 数量随构建配置变化，**以 `ctest -N` 为准**（逐条清单见文末「测试地图」）。
-> 当前实测 ctest 总数 **81**（共 81 个 ctest；profile `bento+mcp` = 58 bento + 2 bufio + 21 MCP 框架），
+> 当前实测 ctest 总数 **85**（共 85 个 ctest；profile `bento+mcp` = 60 bento + 3 bufio + 1 reflect_codec + 21 MCP 框架），
 > profile `mcp+osmon` 为 **35**（12 os/monitor + 2 bufio + 21 MCP 框架）；历史默认构建 130 条 / 增强构建 62 条
 > 见文末历史节。五能力增强矩阵 **183**（PASS 182 / SKIP 1 / FAIL 0）、4 条场景（含 channel 互等死锁），
 > 以及 `default`/`enhanced` 两套构建矩阵、一键入口和 CI 说明，统一记录在文末
@@ -837,7 +837,7 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 
 | profile | 构建开关 | ctest 总数 |
 | --- | --- | --- |
-| `bento+mcp` | `GO2CPP_WITH_BENTO=ON`、`GO2CPP_WITH_MCP=ON` | **81** |
+| `bento+mcp` | `GO2CPP_WITH_BENTO=ON`、`GO2CPP_WITH_MCP=ON` | **85** |
 | `mcp+osmon` | `GO2CPP_WITH_MCP=ON`、`GO2CPP_BUILD_OS_MONITOR_TESTS=ON` | **35** |
 
 > profile 由 CMake 选项自动推导，按固定顺序用 `+` 连接：`bento`（`GO2CPP_WITH_BENTO`）、
@@ -846,93 +846,97 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 > 新增构建组合时在此登记；`mcp/tests/test_docs_consistency.py` 会按当前构建的 profile
 > 校验上表数字与该 profile 的测试地图逐项一致。
 
-## 测试地图（profile `bento+mcp`，81 项）
+## 测试地图（profile `bento+mcp`，85 项）
 
-对应 `.build-bento-wsl`（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`），实测 **81/81 passed**。构成：58 个 `bento_*` + 2 个 bufio + 21 个 MCP 框架用例；root/权限相关用例无权限时记 SKIP。
+对应 `.build-bento-wsl`（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`），实测 **85/85 passed**。构成：60 个 `bento_*` + 3 个 bufio + 1 个 `reflect_codec` + 21 个 MCP 框架用例；root/权限相关用例无权限时记 SKIP。
 
 | # | 用例 |
 |---|---|
 | 1 | `go2cpp_bufio_test` |
 | 2 | `go2cpp_bufio_stress` |
-| 3 | `bento_socks5` |
-| 4 | `bento_error` |
-| 5 | `bento_reflect` |
-| 6 | `bento_keystore` |
-| 7 | `bento_http_server` |
-| 8 | `bento_ws_server` |
-| 9 | `bento_omni_server` |
-| 10 | `bento_command` |
-| 11 | `bento_file_transfer` |
-| 12 | `bento_zip` |
-| 13 | `bento_backup` |
-| 14 | `bento_upload` |
-| 15 | `bento_fetch` |
-| 16 | `bento_file_browser` |
-| 17 | `bento_link_loopback` |
-| 18 | `bento_unreliable_dropstale` |
-| 19 | `bento_video_fragment` |
-| 20 | `bento_rtt_pto` |
-| 21 | `bento_fast_retransmit` |
-| 22 | `bento_stream_fragment` |
-| 23 | `bento_crypto` |
-| 24 | `bento_secure_link` |
-| 25 | `bento_secure_injection` |
-| 26 | `bento_congestion` |
-| 27 | `bento_flow_control` |
-| 28 | `bento_bandwidth` |
-| 29 | `bento_stats_json` |
-| 30 | `bento_ipv6` |
-| 31 | `bento_concurrent_send` |
-| 32 | `bento_conn_migration` |
-| 33 | `bento_fec` |
-| 34 | `bento_pmtud` |
-| 35 | `bento_zero_rtt` |
-| 36 | `bento_peer_hub` |
-| 37 | `bento_tcp_proxy` |
-| 38 | `bento_session_control` |
-| 39 | `bento_peer_hub_secure` |
-| 40 | `bento_default_encryption` |
-| 41 | `bento_log_hook` |
-| 42 | `bento_link_server` |
-| 43 | `bento_mqtt` |
-| 44 | `bento_token_pairing` |
-| 45 | `bento_frame` |
-| 46 | `bento_coap` |
-| 47 | `bento_heartbeat` |
-| 48 | `bento_backoff` |
-| 49 | `bento_pairing` |
-| 50 | `bento_session_table` |
-| 51 | `bento_transport` |
-| 52 | `bento_relay` |
-| 53 | `bento_capability` |
-| 54 | `bento_session` |
-| 55 | `bento_udp_transport` |
-| 56 | `bento_x25519` |
-| 57 | `bento_x25519_handshake` |
-| 58 | `bento_weaknet_proxy` |
-| 59 | `bento_netem` |
-| 60 | `bento_channel_thread_stress` |
-| 61 | `json_rpc` |
-| 62 | `registry` |
-| 63 | `tools` |
-| 64 | `vector` |
-| 65 | `validation` |
-| 66 | `retrieval` |
-| 67 | `process` |
-| 68 | `robot_control` |
-| 69 | `plugin_notify` |
-| 70 | `monitor_client` |
-| 71 | `monitor_tools` |
-| 72 | `socket_tools` |
-| 73 | `socket_whitelist` |
-| 74 | `monitor_boundaries` |
-| 75 | `monitor_capacity` |
-| 76 | `monitor_concurrent_tools` |
-| 77 | `monitor_args_fuzz` |
-| 78 | `monitor_e2e` |
-| 79 | `monitor_http_faults` |
-| 80 | `socket_e2e` |
-| 81 | `docs_consistency` |
+| 3 | `go2cpp_bufio_batch_test` |
+| 4 | `bento_socks5` |
+| 5 | `bento_error` |
+| 6 | `bento_reflect` |
+| 7 | `bento_keystore` |
+| 8 | `bento_http_server` |
+| 9 | `bento_ws_server` |
+| 10 | `bento_omni_server` |
+| 11 | `bento_omni_server_m1` |
+| 12 | `bento_bench_protocols` |
+| 13 | `bento_command` |
+| 14 | `bento_file_transfer` |
+| 15 | `bento_zip` |
+| 16 | `bento_backup` |
+| 17 | `bento_upload` |
+| 18 | `bento_fetch` |
+| 19 | `bento_file_browser` |
+| 20 | `bento_link_loopback` |
+| 21 | `bento_unreliable_dropstale` |
+| 22 | `bento_video_fragment` |
+| 23 | `bento_rtt_pto` |
+| 24 | `bento_fast_retransmit` |
+| 25 | `bento_stream_fragment` |
+| 26 | `bento_crypto` |
+| 27 | `bento_secure_link` |
+| 28 | `bento_secure_injection` |
+| 29 | `bento_congestion` |
+| 30 | `bento_flow_control` |
+| 31 | `bento_bandwidth` |
+| 32 | `bento_stats_json` |
+| 33 | `bento_ipv6` |
+| 34 | `bento_concurrent_send` |
+| 35 | `bento_conn_migration` |
+| 36 | `bento_fec` |
+| 37 | `bento_pmtud` |
+| 38 | `bento_zero_rtt` |
+| 39 | `bento_peer_hub` |
+| 40 | `bento_tcp_proxy` |
+| 41 | `bento_session_control` |
+| 42 | `bento_peer_hub_secure` |
+| 43 | `bento_default_encryption` |
+| 44 | `bento_log_hook` |
+| 45 | `bento_link_server` |
+| 46 | `bento_mqtt` |
+| 47 | `bento_token_pairing` |
+| 48 | `bento_frame` |
+| 49 | `bento_coap` |
+| 50 | `bento_heartbeat` |
+| 51 | `bento_backoff` |
+| 52 | `bento_pairing` |
+| 53 | `bento_session_table` |
+| 54 | `bento_transport` |
+| 55 | `bento_relay` |
+| 56 | `bento_capability` |
+| 57 | `bento_session` |
+| 58 | `bento_udp_transport` |
+| 59 | `bento_x25519` |
+| 60 | `bento_x25519_handshake` |
+| 61 | `bento_weaknet_proxy` |
+| 62 | `bento_netem` |
+| 63 | `bento_channel_thread_stress` |
+| 64 | `reflect_codec` |
+| 65 | `json_rpc` |
+| 66 | `registry` |
+| 67 | `tools` |
+| 68 | `vector` |
+| 69 | `validation` |
+| 70 | `retrieval` |
+| 71 | `process` |
+| 72 | `robot_control` |
+| 73 | `plugin_notify` |
+| 74 | `monitor_client` |
+| 75 | `monitor_tools` |
+| 76 | `socket_tools` |
+| 77 | `socket_whitelist` |
+| 78 | `monitor_boundaries` |
+| 79 | `monitor_capacity` |
+| 80 | `monitor_concurrent_tools` |
+| 81 | `monitor_args_fuzz` |
+| 82 | `monitor_e2e` |
+| 83 | `monitor_http_faults` |
+| 84 | `socket_e2e` |
+| 85 | `docs_consistency` |
 
 ## 测试地图（profile `mcp+osmon`，35 项）
 
