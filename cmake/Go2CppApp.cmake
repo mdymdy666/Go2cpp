@@ -142,3 +142,26 @@ if (GO2CPP_WITH_APP AND GO2CPP_APP_TESTS)
         set_tests_properties(app_http PROPERTIES TIMEOUT 300)
     endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# 示例：应用层流表（stream_demo，ResourceTransfer + KvStream）。
+#
+# 顶层 CMakeLists 在 include 本文件**之前**就 add_subdirectory(example/app)，
+# 因此 example/app/CMakeLists.txt 里还看不到 go2cpp_app 目标。示例需要链接
+# 静态库 go2cpp_app（及其 hash/Bento 依赖），只能在这里注册：
+#   cmake --build .build-bento-wsl --target go2cpp_stream_demo
+# ---------------------------------------------------------------------------
+if (GO2CPP_WITH_APP AND GO2CPP_BUILD_EXAMPLES AND EXISTS
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/app/stream_demo/main.cpp)
+    add_executable(go2cpp_stream_demo
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/app/stream_demo/main.cpp)
+    target_link_libraries(go2cpp_stream_demo PRIVATE go2cpp_app)
+    target_compile_options(go2cpp_stream_demo PRIVATE
+        -Wall -Wextra -Wpedantic)
+    # 与其他 example/app 示例保持同一输出位置，README 里的路径统一为
+    # .build-bento-wsl/example/app/go2cpp_stream_demo。
+    set_target_properties(go2cpp_stream_demo PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/example/app)
+elseif (GO2CPP_WITH_APP AND GO2CPP_BUILD_EXAMPLES)
+    message(STATUS "example/app: stream_demo 跳过（源文件不存在）")
+endif()

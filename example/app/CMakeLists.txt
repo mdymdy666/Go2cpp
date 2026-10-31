@@ -63,3 +63,40 @@ if (TARGET go2cpp_bento)
 else()
     message(STATUS "example/app: chat_server 示例跳过（go2cpp_bento 未构建）")
 endif()
+
+# ---------------------------------------------------------------------------
+# 新能力示例：P2P 打洞 / 缓存策略对比 / 应用层流表。
+#
+# 注意 add_subdirectory(example/app) 在顶层 CMakeLists 中的位置早于
+# Go2CppApp.cmake 与 Go2CppCache.cmake：
+#   - go2cpp_p2p 在 Go2CppP2P.cmake 中已定义，可直接判断 TARGET；
+#   - go2cpp_cache 是 header-only INTERFACE 目标，此刻尚未定义，因此
+#     cache_demo 直接使用仓库 include 目录（同一份头文件；若以后调整顺序，
+#     下面的 TARGET 分支会自动改为链接 go2cpp_cache 目标）；
+#   - go2cpp_app 是静态库且依赖 go2cpp_hash/go2cpp_bento，必须在
+#     Go2CppApp.cmake 定义之后再注册，见该文件末尾的 stream_demo。
+# ---------------------------------------------------------------------------
+if (TARGET go2cpp_p2p)
+    # P2P：STUN echo 服务器 + 两个 peer 进程（文件信令 + UDP 打洞）。
+    add_executable(go2cpp_p2p_demo p2p_demo/main.cpp)
+    go2cpp_app_target(go2cpp_p2p_demo go2cpp_p2p)
+else()
+    message(STATUS "example/app: p2p_demo 跳过（go2cpp_p2p 未构建）")
+endif()
+
+if (EXISTS ${CMAKE_SOURCE_DIR}/include/go2cpp/cache/cache.hpp)
+    # 缓存：7 种策略 × 3 个场景的命中率对比（header-only，无需链接库）。
+    add_executable(go2cpp_cache_demo cache_demo/main.cpp)
+    target_compile_features(go2cpp_cache_demo PRIVATE cxx_std_17)
+    target_compile_options(go2cpp_cache_demo PRIVATE ${GO2CPP_APP_WARNINGS})
+    target_include_directories(go2cpp_cache_demo PRIVATE
+        ${CMAKE_SOURCE_DIR}/include)
+    if (TARGET go2cpp_cache)
+        target_link_libraries(go2cpp_cache_demo PRIVATE go2cpp_cache)
+    else()
+        find_package(Threads REQUIRED)
+        target_link_libraries(go2cpp_cache_demo PRIVATE Threads::Threads)
+    endif()
+else()
+    message(STATUS "example/app: cache_demo 跳过（cache 头文件不存在）")
+endif()
