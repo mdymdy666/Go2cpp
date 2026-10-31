@@ -267,27 +267,53 @@ std::string Response::to_string(bool head_request) const {
     if (!valid_http_version_token(version)) return {};
     const int code = static_cast<int>(status);
     const bool body_forbidden = (code >= 100 && code < 200) || code == 204 || code == 304;
-    std::ostringstream stream; stream << version << " " << static_cast<int>(status) << " " << status_text(status) << "\r\n";
-    for (const auto& item : header.entries()) {
+    const auto& entries = header.entries();
+    // 直接拼接到一个 string：原实现用 ostringstream，每个响应要构造流对象、
+    // 逐字段格式化再 str() 复制一次，是 HTTP 服务端每请求最大的一笔固定开销。
+    std::string out;
+    out.reserve(version.size() + 48 + body.size() + entries.size() * 40);
+    out.append(version);
+    out.push_back(' ');
+    {
+        char code_buffer[8];
+        const auto code_end =
+            std::to_chars(code_buffer, code_buffer + sizeof(code_buffer), code).ptr;
+        out.append(code_buffer, code_end);
+    }
+    out.push_back(' ');
+    out.append(status_text(status));
+    out.append("\r\n");
+    const bool has_connection = header.has("Connection");
+    const bool has_content_length = header.has("Content-Length");
+    const bool has_transfer_encoding = header.has("Transfer-Encoding");
+    for (const auto& item : entries) {
         // 1xx/204/304 不允许实体 framing；过滤用户手工设置的 CL/TE，
         // 避免下游继续等待一个永远不会出现的 body。
         if (body_forbidden && (equal_ci(item.first, "Content-Length") ||
                                equal_ci(item.first, "Transfer-Encoding"))) {
             continue;
         }
-        stream << item.first << ": " << item.second << "\r\n";
+        out.append(item.first);
+        out.append(": ");
+        out.append(item.second);
+        out.append("\r\n");
     }
-    if (close && !header.has("Connection")) stream << "Connection: close\r\n";
+    if (close && !has_connection) out.append("Connection: close\r\n");
     // 空 body 也必须补 Content-Length: 0：keep-alive 下客户端无法区分
     // 「无 body」与「body 直到连接关闭」，双方会互等（http1.md §4 已记录）。
     // 有 Transfer-Encoding（chunked）时不补 CL（两种 framing 互斥）。
-    if (!body_forbidden && !header.has("Content-Length") &&
-        !header.has("Transfer-Encoding")) {
-        stream << "Content-Length: " << body.size() << "\r\n";
+    if (!body_forbidden && !has_content_length && !has_transfer_encoding) {
+        char length_buffer[24];
+        const auto length_end = std::to_chars(length_buffer,
+                                              length_buffer + sizeof(length_buffer),
+                                              body.size()).ptr;
+        out.append("Content-Length: ");
+        out.append(length_buffer, length_end);
+        out.append("\r\n");
     }
-    stream << "\r\n";
-    if (!head_request && !body_forbidden) stream << body;
-    return stream.str();
+    out.append("\r\n");
+    if (!head_request && !body_forbidden) out.append(body);
+    return out;
 }
 
 Parser::Parser(ParserLimits limits) : m_limits(limits) {}
@@ -335,40 +361,85 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
         return {ParseState::NeedMore, bytes.size(), {}};
     }
     if (header_end + 4 > m_limits.max_header_bytes) { m_error = "header too large"; return {ParseState::Error, bytes.size(), m_error}; }
-    const std::string header_block = m_buffer.substr(0, header_end);
+    const std::string_view header_block(m_buffer.data(), header_end);
     std::size_t line_end = header_block.find("\r\n");
-    if (line_end == std::string::npos || line_end > m_limits.max_line_bytes) return {ParseState::Error, bytes.size(), "invalid start line"};
-    const std::string start_line = header_block.substr(0, line_end);
-    std::istringstream start(start_line); std::string first, second, third, extra; start >> first >> second >> third;
-    if (first.empty() || second.empty() || third.empty() || (!response && (start >> extra)))
+    if (line_end == std::string::npos || line_end > m_limits.max_line_bytes)
         return {ParseState::Error, bytes.size(), "invalid start line"};
+    const std::string_view start_line = header_block.substr(0, line_end);
+    // 起始行手写切分：istringstream 每请求要构造流对象并分配，是解析热路径上
+    // 最大的一笔固定开销。
+    std::string_view first;
+    std::string_view second;
+    std::string_view third;
+    {
+        const auto first_space = start_line.find(' ');
+        if (first_space == std::string_view::npos || first_space == 0)
+            return {ParseState::Error, bytes.size(), "invalid start line"};
+        first = start_line.substr(0, first_space);
+        const auto second_space = start_line.find(' ', first_space + 1);
+        if (second_space == std::string_view::npos || second_space == first_space + 1)
+            return {ParseState::Error, bytes.size(), "invalid start line"};
+        second = start_line.substr(first_space + 1, second_space - first_space - 1);
+        third = start_line.substr(second_space + 1);
+        if (third.empty()) return {ParseState::Error, bytes.size(), "invalid start line"};
+        // 请求行只有三段；响应行的第三段是 reason-phrase，可以含空格。
+        if (!response && third.find(' ') != std::string_view::npos)
+            return {ParseState::Error, bytes.size(), "invalid start line"};
+    }
     if (response) {
-        if (!valid_http_version_token(first) || second.empty()) return {ParseState::Error, bytes.size(), "invalid response"};
+        if (!valid_http_version_token(first) || second.empty())
+            return {ParseState::Error, bytes.size(), "invalid response"};
         if (second.size() != 3 || !std::all_of(second.begin(), second.end(),
                                                 [](unsigned char c) { return std::isdigit(c); }))
             return {ParseState::Error, bytes.size(), "invalid status"};
-        int code = 0; try { code = std::stoi(second); } catch (...) { return {ParseState::Error, bytes.size(), "invalid status"}; }
-        result->version = first; result->status = static_cast<Status>(code);
+        int code = 0;
+        const auto parsed_code =
+            std::from_chars(second.data(), second.data() + second.size(), code);
+        if (parsed_code.ec != std::errc() ||
+            parsed_code.ptr != second.data() + second.size())
+            return {ParseState::Error, bytes.size(), "invalid status"};
+        result->version.assign(first);
+        result->status = static_cast<Status>(code);
     } else {
-        request->method = parse_method(first); if (request->method == Method::Unknown || !valid_request_target(second) || !valid_http_version_token(third)) return {ParseState::Error, bytes.size(), "invalid request"};
-        request->target = second; request->version = third;
+        request->method = parse_method(first);
+        if (request->method == Method::Unknown || !valid_request_target(second) ||
+            !valid_http_version_token(third))
+            return {ParseState::Error, bytes.size(), "invalid request"};
+        request->target.assign(second);
+        request->version.assign(third);
     }
-    std::size_t content_length = 0; bool has_length = false; bool chunked = false; bool has_transfer_encoding = false;
+    std::size_t content_length = 0;
+    bool has_length = false;
+    bool chunked = false;
+    bool has_transfer_encoding = false;
     for (std::size_t offset = line_end + 2; offset < header_block.size();) {
         const auto found_end = header_block.find("\r\n", offset);
-        const auto end = found_end == std::string::npos ? header_block.size() : found_end;
-        const auto colon = header_block.find(':', offset); if (colon == std::string::npos || colon >= end || colon == offset) return {ParseState::Error, bytes.size(), "invalid header"};
-        const auto name = header_block.substr(offset, colon - offset); const auto value = trim(std::string_view(header_block).substr(colon + 1, end - colon - 1));
-        if (name.find_first_of("\r\n\0 \t") != std::string::npos) return {ParseState::Error, bytes.size(), "invalid header name"};
-        for (const unsigned char c : value) if (c < 0x20U && c != '\t') return {ParseState::Error, bytes.size(), "invalid header value"};
-        if (equal_ci(name, "Content-Length")) { std::size_t parsed = 0; if (!parse_size(value, parsed) || (has_length && parsed != content_length)) return {ParseState::Error, bytes.size(), "invalid content length"}; content_length = parsed; has_length = true; }
+        const auto end = found_end == std::string_view::npos ? header_block.size() : found_end;
+        const auto colon = header_block.find(':', offset);
+        if (colon == std::string_view::npos || colon >= end || colon == offset)
+            return {ParseState::Error, bytes.size(), "invalid header"};
+        const std::string_view name = header_block.substr(offset, colon - offset);
+        const auto value = trim(header_block.substr(colon + 1, end - colon - 1));
+        if (name.find_first_of("\r\n") != std::string_view::npos)
+            return {ParseState::Error, bytes.size(), "invalid header name"};
+        for (const unsigned char c : value)
+            if (c < 0x20U && c != '\t')
+                return {ParseState::Error, bytes.size(), "invalid header value"};
+        if (equal_ci(name, "Content-Length")) {
+            std::size_t parsed = 0;
+            if (!parse_size(value, parsed) || (has_length && parsed != content_length))
+                return {ParseState::Error, bytes.size(), "invalid content length"};
+            content_length = parsed;
+            has_length = true;
+        }
         if (equal_ci(name, "Transfer-Encoding")) {
             if (has_transfer_encoding || !parse_transfer_encoding(value, chunked))
                 return {ParseState::Error, bytes.size(), "unsupported transfer encoding"};
             has_transfer_encoding = true;
         }
-        if (response) result->header.add(name, value); else request->header.add(name, value);
-        if (found_end == std::string::npos) break;
+        if (response) result->header.add(std::string(name), value);
+        else request->header.add(std::string(name), value);
+        if (found_end == std::string_view::npos) break;
         offset = end + 2;
     }
     if (chunked && has_length) return {ParseState::Error, bytes.size(), "content length with chunked"};

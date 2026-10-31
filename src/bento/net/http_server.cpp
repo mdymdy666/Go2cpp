@@ -207,40 +207,33 @@ HttpServerResult HttpServer::Start() {
                                         "尚未调用 Listen()");
     }
     if (m_running.load(std::memory_order_acquire)) {
-        return HttpServerResult::Failure(HttpServerError::AlreadyRunning, "服务已经启动");
+        return HttpServerResult::Failure(HttpServerError::AlreadyRunning,
+                                        "服务已经启动");
     }
     if (m_config.model == HttpConcurrencyModel::NonBlocking) {
-        return HttpServerResult::Failure(HttpServerError::UnsupportedModel,
-                                        "NonBlocking 模型尚未实现，当前仅支持 Blocking 线程模型");
+        return HttpServerResult::Failure(
+            HttpServerError::UnsupportedModel,
+            "NonBlocking 模型尚未实现，当前为每连接一 Fiber 的调度模型");
     }
     m_stopping.store(false, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lock(m_queue_mutex);
-        m_queue_closed = false;
-        m_queue.clear();
-    }
     m_running.store(true, std::memory_order_release);
 
-    const std::size_t worker_count = m_config.worker_threads;
-    try {
-        m_workers.reserve(worker_count);
-        for (std::size_t index = 0; index < worker_count; ++index) {
-            m_workers.emplace_back([this]() { WorkerLoop(); });
-        }
-        m_acceptor = std::thread([this]() { AcceptLoop(); });
-    } catch (const std::exception& error) {
-        // 线程创建失败：先让已启动的 worker 退出，再回滚运行标记。
-        m_stopping.store(true, std::memory_order_release);
-        {
-            std::lock_guard<std::mutex> lock(m_queue_mutex);
-            m_queue_closed = true;
-        }
-        m_queue_cv.notify_all();
-        JoinWorkers();
+    // 每连接一个 Fiber（与 Go net/http 的 goroutine-per-connection 对齐）：
+    // worker_threads 只决定 OS 线程（P）数量，连接数不再受线程池大小限制，
+    // 从而消除「4 条 keep-alive 连接 + 2 个 worker 时后两条连接饥饿」的问题。
+    SchedulerConfig config;
+    config.processor_count = m_config.worker_threads;
+    config.max_workers = m_config.worker_threads;
+    config.min_workers = m_config.worker_threads;
+    config.collect_metrics = false;
+    auto manager = std::make_shared<io::IOManager>(config);
+    if (!manager->start()) {
         m_running.store(false, std::memory_order_release);
         return HttpServerResult::Failure(HttpServerError::ThreadFailure,
-                                        std::string("创建服务线程失败: ") + error.what());
+                                        "创建 Fiber 调度器失败");
     }
+    m_manager = std::move(manager);
+    m_manager->go([this]() { AcceptLoop(); });
     return HttpServerResult::Success();
 }
 
@@ -252,38 +245,23 @@ void HttpServer::Stop() noexcept {
     }
     m_stopping.store(true, std::memory_order_release);
 
-    // step1: 关闭队列并丢弃尚未处理的连接（锁外 close，避免持锁做系统调用）。
-    std::deque<net::Socket::Ptr> dropped;
-    {
-        std::lock_guard<std::mutex> lock(m_queue_mutex);
-        m_queue_closed = true;
-        dropped.swap(m_queue);
-    }
-    m_queue_cv.notify_all();
-    for (auto& connection : dropped) {
-        if (connection) {
-            (void)connection->close();
-        }
-    }
-
-    // step2: shutdown 所有活动连接，唤醒阻塞在 recv / SSE 写入上的 worker。
+    // step1: shutdown 所有活动连接，唤醒阻塞在 recv 上的连接 Fiber。
     CloseAllConnections();
-
-    // step3: accept 线程按 accept_timeout 轮询停止标记，最多等一个超时周期。
-    if (m_acceptor.joinable()) {
-        try {
-            m_acceptor.join();
-        } catch (...) {
-            // join 失败（例如线程已被 detach）不影响后续清理。
-        }
+    // step2: shutdown 监听 socket，让 accept 的等待尽快返回。
+    if (m_listener) {
+        (void)m_listener->shutdown(SHUT_RDWR);
     }
-
-    // step4: 关闭监听 socket（join 之后关闭，避免 accept 使用已释放对象）。
+    // step3: 停止 Fiber 调度器。AcceptLoop 最多在一个 accept 超时周期内退出；
+    // 连接 Fiber 在 step1 之后读到 EOF 自行结束。
+    auto manager = m_manager;
+    m_manager.reset();
+    if (manager) {
+        manager->shutdown();
+    }
+    // step4: 兜底再唤醒一次（覆盖扫描活动表之后才登记、且已被 shutdown 的竞态）。
+    CloseAllConnections();
+    // step5: 释放监听 socket。
     CloseListener();
-
-    // step5: 等待所有 worker 收尾，并兜底再唤醒一次（覆盖注册竞态窗口）。
-    JoinWorkers();
-    CloseAllConnections();
 }
 
 std::string HttpServer::LocalAddress() const {
@@ -312,20 +290,31 @@ void HttpServer::AcceptLoop() {
             (void)connection->close();
             return;
         }
-        bool queued = false;
+        // 先登记再起 Fiber：Stop() 扫描活动表时不会漏掉正在启动的连接。
         {
-            std::lock_guard<std::mutex> lock(m_queue_mutex);
-            if (!m_queue_closed && m_queue.size() < m_config.max_queued_connections) {
-                m_queue.push_back(std::move(connection));
-                queued = true;
-            }
+            std::lock_guard<std::mutex> lock(m_active_mutex);
+            m_active.emplace(connection.get(), connection);
         }
-        if (queued) {
-            m_queue_cv.notify_one();
-        } else if (connection) {
-            // 队列满：骨架级背压直接拒绝，让客户端看到连接被关闭。
+        m_active_count.fetch_add(1, std::memory_order_acq_rel);
+        if (!m_manager) {
             (void)connection->close();
+            m_active_count.fetch_sub(1, std::memory_order_acq_rel);
+            std::lock_guard<std::mutex> lock(m_active_mutex);
+            m_active.erase(connection.get());
+            return;
         }
+        // 一条连接一个 Fiber：同连接内 keep-alive 请求串行，不同连接完全并行。
+        m_manager->go([this, connection]() {
+            if (!m_stopping.load(std::memory_order_acquire)) {
+                ServeConnection(connection);
+            }
+            (void)connection->close();
+            {
+                std::lock_guard<std::mutex> lock(m_active_mutex);
+                m_active.erase(connection.get());
+            }
+            m_active_count.fetch_sub(1, std::memory_order_acq_rel);
+        });
     }
 }
 
@@ -364,7 +353,8 @@ void HttpServer::WorkerLoop() {
 }
 
 bool HttpServer::ReadRequest(const net::Socket::Ptr& connection, http::Parser& parser,
-                             std::string& pending, http::Request& request) {
+                             std::string& pending, http::Request& request, char* buffer,
+                             std::size_t capacity) {
     for (;;) {
         if (m_stopping.load(std::memory_order_acquire)) {
             return false;
@@ -380,13 +370,12 @@ bool HttpServer::ReadRequest(const net::Socket::Ptr& connection, http::Parser& p
             }
             continue;
         }
-        std::array<char, 8192> buffer{};
-        const auto count = connection->recv(buffer.data(), buffer.size());
+        const auto count = connection->recv(buffer, capacity);
         if (count.transferred <= 0) {
             return false;
         }
         const auto parsed = parser.feed(
-            std::string_view(buffer.data(), static_cast<std::size_t>(count.transferred)),
+            std::string_view(buffer, static_cast<std::size_t>(count.transferred)),
             request);
         if (parsed.state == http::ParseState::Error) {
             return false;
@@ -403,6 +392,9 @@ void HttpServer::ServeConnection(const net::Socket::Ptr& connection) {
     limits.max_body_bytes = m_config.max_body_bytes;
     http::Parser parser(limits);
     std::string pending;
+    // 连接级读缓冲：一次 recv 16KB，避免每次都在 Fiber 栈上分配 8KB
+    // （Fiber 初始栈只有 4KB，栈数组会触发栈增长甚至溢出）。
+    std::vector<char> read_buffer(16 * 1024);
     net::SocketStream stream(connection, false);
     // B-06：可选的 bufio 批量写端。`bufio::Writer` 按引用持有
     // `SocketBatchWriter`，因此先声明 sink 再声明 writer，析构顺序反过来，
@@ -420,7 +412,8 @@ void HttpServer::ServeConnection(const net::Socket::Ptr& connection) {
             return;
         }
         http::Request request;
-        if (!ReadRequest(connection, parser, pending, request)) {
+        if (!ReadRequest(connection, parser, pending, request, read_buffer.data(),
+                         read_buffer.size())) {
             return;
         }
         // 同一 recv 里可能还有流水线的下一个请求，留给下一轮。

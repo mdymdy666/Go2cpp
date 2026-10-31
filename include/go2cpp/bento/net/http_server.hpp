@@ -64,6 +64,7 @@
 
 #include "go2cpp/network/http.hpp"
 #include "go2cpp/network/socket.hpp"
+#include "go2cpp/network/io.hpp"
 #include "go2cpp/network/sse.hpp"
 
 #include <atomic>
@@ -248,7 +249,8 @@ private:
     void ServeSse(const net::Socket::Ptr& connection, const http::Request& request,
                   const SseHandler& handler);
     bool ReadRequest(const net::Socket::Ptr& connection, http::Parser& parser,
-                     std::string& pending, http::Request& request);
+                     std::string& pending, http::Request& request, char* buffer,
+                     std::size_t capacity);
     SseHandler FindSseHandler(const std::string& path) const;
     RequestHandler FindRequestHandler() const;
     void CloseAllConnections() noexcept;
@@ -259,6 +261,8 @@ private:
     HttpServerConfig m_config;
     /// 监听 socket；Listen() 创建，Stop() 关闭并重置。
     net::Socket::Ptr m_listener;
+    /// 每连接一 Fiber 的调度器（IOManager）；Start() 创建，Stop() 关闭。
+    std::shared_ptr<io::IOManager> m_manager;
     /// 实际监听地址字符串；Port()/LocalAddress() 读取。
     std::string m_local_address;
     /// 实际监听端口；Listen() 写入，Port() 读取。
