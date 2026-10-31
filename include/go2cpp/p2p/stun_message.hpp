@@ -171,6 +171,79 @@ struct StunMessage {
     bool GetErrorCode(std::uint16_t* code, std::string* reason) const;
 };
 
+/// 一个 STUN 属性的零拷贝视图：`value` 指向原始线格式缓冲区，不拥有内存。
+struct StunAttributeView {
+    std::uint16_t type = 0;
+    const std::uint8_t* value = nullptr;
+    std::uint16_t length = 0;
+};
+
+/**
+ * @brief STUN 消息的零拷贝视图。
+ * @details 解析阶段不做任何堆分配，属性按需顺序扫描 TLV。视图只在原始数据报
+ *          缓冲区的生命周期内有效，因此适合「接收缓冲 → 就地解析 → 就地回包」
+ *          的热路径（STUN echo 服务器、打洞连通性检查）。
+ */
+class StunMessageView {
+public:
+    StunMessageView() = default;
+
+    bool valid() const noexcept { return m_data != nullptr; }
+    std::uint16_t method() const noexcept { return m_method; }
+    StunClass klass() const noexcept { return m_klass; }
+    /// 12 字节事务 ID（指向原始缓冲区，不拷贝）。
+    const std::uint8_t* transaction_id() const noexcept { return m_transaction_id; }
+
+    /// 属性个数（线性扫描，不分配）。
+    std::size_t attribute_count() const noexcept;
+    /// 取第 index 个属性；越界返回 false。
+    bool attribute_at(std::size_t index, StunAttributeView* out) const noexcept;
+    /// 查找第一个指定类型的属性；不存在返回 false。
+    bool find(std::uint16_t type, StunAttributeView* out) const noexcept;
+
+    std::optional<std::uint32_t> GetU32(std::uint16_t type) const noexcept;
+    std::optional<Endpoint> GetAddress(std::uint16_t type, bool xored) const noexcept;
+    /// 优先返回 XOR-MAPPED-ADDRESS，退化到 MAPPED-ADDRESS。
+    std::optional<Endpoint> GetMappedAddress() const noexcept;
+    /// 解析 ERROR-CODE；`reason` 非空时才构造字符串。
+    bool GetErrorCode(std::uint16_t* code, std::string* reason) const;
+
+private:
+    friend std::optional<StunMessageView> ParseStunMessageView(const void*, std::size_t,
+                                                               std::string*);
+    const std::uint8_t* m_data = nullptr;            ///< 消息起始（含 20 字节头）。
+    std::size_t m_length = 0;                        ///< 整条消息字节数。
+    std::uint16_t m_method = kStunMethodBinding;
+    StunClass m_klass = StunClass::kRequest;
+    const std::uint8_t* m_transaction_id = nullptr;  ///< 指向原始缓冲区内 12 字节。
+};
+
+/// 零拷贝解析：校验头部与属性 TLV 结构，属性指针指向原始缓冲区。
+std::optional<StunMessageView> ParseStunMessageView(const void* data, std::size_t length,
+                                                    std::string* error = nullptr);
+
+/**
+ * @brief 直接把 Binding Request 写进调用方缓冲区（零堆分配）。
+ * @param transaction_id 非空时输出本次事务 ID（供后续匹配响应）。
+ * @return 写入字节数；容量不足或参数非法返回 0。
+ * @note 线格式长度固定为 `kStunHeaderSize + 4 + 20`（当前 SOFTWARE 15 字节 +
+ *       1 字节填充）；调用方给 ≥64 字节缓冲即可。
+ */
+std::size_t BuildBindingRequestWire(std::uint8_t* out, std::size_t capacity,
+                                    std::array<std::uint8_t, kStunTransactionIdSize>* transaction_id);
+
+/**
+ * @brief 直接把 Binding Success Response 写进调用方缓冲区（零堆分配）。
+ * @param response_origin 非空时附加 RESPONSE-ORIGIN。
+ * @param other_address  非空时附加 OTHER-ADDRESS。
+ * @param software       非空时附加 SOFTWARE。
+ * @return 写入字节数；容量不足或参数非法返回 0。
+ */
+std::size_t BuildBindingSuccessWire(
+    std::uint8_t* out, std::size_t capacity,
+    const std::array<std::uint8_t, kStunTransactionIdSize>& transaction_id, const Endpoint& mapped,
+    const Endpoint* response_origin, const Endpoint* other_address, std::string_view software);
+
 /// 组合 method 与 class 为 16 位 type（RFC 5389 §6 的比特交错布局）。
 std::uint16_t EncodeStunType(std::uint16_t method, StunClass klass) noexcept;
 

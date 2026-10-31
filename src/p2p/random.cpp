@@ -12,6 +12,7 @@
 #include <sys/random.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -75,6 +76,30 @@ void FillDeterministic(std::uint8_t* data, std::size_t length) noexcept {
     }
 }
 
+/// 一次 getrandom 批量预取的字节数：STUN 事务 ID / 中继请求 ID 每次只取
+/// 4~12 字节，逐次调用会变成「每包一次系统调用」（实测约 0.3~0.5us）。
+/// 池化后仍是内核 CSPRNG 的输出（只是批量取回），语义不变。
+constexpr std::size_t kRandomPoolSize = 1024;
+
+struct RandomPool {
+    std::uint8_t bytes[kRandomPoolSize] = {};
+    /// used == kRandomPoolSize 表示需要重新填充（首次使用也走这条路径）。
+    std::size_t used = kRandomPoolSize;
+};
+
+thread_local RandomPool g_random_pool;
+
+void RefillPool(RandomPool* pool) noexcept {
+    std::size_t filled = FillFromGetrandom(pool->bytes, kRandomPoolSize);
+    if (filled < kRandomPoolSize) {
+        filled += FillFromUrandom(pool->bytes + filled, kRandomPoolSize - filled);
+    }
+    if (filled < kRandomPoolSize) {
+        FillDeterministic(pool->bytes + filled, kRandomPoolSize - filled);
+    }
+    pool->used = 0;
+}
+
 }  // namespace
 
 void SecureRandomBytes(void* data, std::size_t length) {
@@ -82,12 +107,16 @@ void SecureRandomBytes(void* data, std::size_t length) {
         return;
     }
     auto* bytes = static_cast<std::uint8_t*>(data);
-    std::size_t filled = FillFromGetrandom(bytes, length);
-    if (filled < length) {
-        filled += FillFromUrandom(bytes + filled, length - filled);
-    }
-    if (filled < length) {
-        FillDeterministic(bytes + filled, length - filled);
+    RandomPool& pool = g_random_pool;
+    while (length > 0) {
+        if (pool.used >= kRandomPoolSize) {
+            RefillPool(&pool);
+        }
+        const std::size_t chunk = std::min(length, kRandomPoolSize - pool.used);
+        std::memcpy(bytes, pool.bytes + pool.used, chunk);
+        pool.used += chunk;
+        bytes += chunk;
+        length -= chunk;
     }
 }
 

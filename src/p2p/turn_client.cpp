@@ -51,7 +51,7 @@ RelayClient::RelayClient(DatagramTransport* transport, RelayClientConfig config)
 }
 
 RelayClient::~RelayClient() {
-    if (m_allocated) {
+    if (m_allocated.load(std::memory_order_relaxed)) {
         Release();
     }
 }
@@ -64,6 +64,13 @@ std::uint32_t RelayClient::NextRequestId() {
     return m_next_request_id;
 }
 
+void RelayClient::EnsureSendBuffer(std::size_t bytes) {
+    // 只增不减：稳态下 SendTo 不再触发分配，也不会把已扩容的缓冲缩回去。
+    if (m_send_buffer.size() < bytes) {
+        m_send_buffer.resize(bytes);
+    }
+}
+
 bool RelayClient::Request(std::uint8_t type, const std::vector<std::uint8_t>& body,
                           std::chrono::milliseconds timeout, std::uint8_t* status,
                           std::vector<std::uint8_t>* response_body, std::string* error) {
@@ -73,18 +80,18 @@ bool RelayClient::Request(std::uint8_t type, const std::vector<std::uint8_t>& bo
         }
         return false;
     }
-    detail::RelayMessage request;
-    request.type = static_cast<detail::RelayMessageType>(type);
-    request.request_id = NextRequestId();
-    request.body = body;
-    const std::vector<std::uint8_t> wire = detail::SerializeRelayMessage(request);
-    if (wire.empty()) {
+    const std::uint32_t request_id = NextRequestId();
+    m_request_wire.resize(detail::kRelayHeaderSize + body.size());
+    if (detail::BuildRelayMessage(
+            m_request_wire.data(), m_request_wire.size(),
+            static_cast<detail::RelayMessageType>(type), request_id,
+            body.empty() ? nullptr : body.data(), body.size()) == 0) {
         if (error != nullptr) {
             *error = "中继请求序列化失败";
         }
         return false;
     }
-    if (!m_transport->SendTo(m_config.server, wire.data(), wire.size())) {
+    if (!m_transport->SendTo(m_config.server, m_request_wire.data(), m_request_wire.size())) {
         if (error != nullptr) {
             *error = "中继请求发送失败";
         }
@@ -108,15 +115,15 @@ bool RelayClient::Request(std::uint8_t type, const std::vector<std::uint8_t>& bo
             }
             return false;
         }
-        detail::RelayMessage response;
-        if (!detail::ParseRelayMessage(buffer.data(), static_cast<std::size_t>(received),
-                                       &response)) {
+        detail::RelayMessageView response;
+        if (!detail::ParseRelayMessageView(buffer.data(), static_cast<std::size_t>(received),
+                                           &response)) {
             continue;
         }
-        if (response.request_id != request.request_id) {
+        if (response.request_id != request_id) {
             continue;
         }
-        if (response.body.empty()) {
+        if (response.body_length == 0) {
             if (error != nullptr) {
                 *error = "中继响应缺少状态码";
             }
@@ -124,7 +131,7 @@ bool RelayClient::Request(std::uint8_t type, const std::vector<std::uint8_t>& bo
         }
         *status = response.body[0];
         if (response_body != nullptr) {
-            *response_body = std::move(response.body);
+            response_body->assign(response.body, response.body + response.body_length);
         }
         return true;
     }
@@ -136,7 +143,7 @@ bool RelayClient::Request(std::uint8_t type, const std::vector<std::uint8_t>& bo
 
 bool RelayClient::Allocate(std::string* error) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_allocated) {
+    if (m_allocated.load(std::memory_order_relaxed)) {
         return true;
     }
     const int attempts = std::max(1, m_config.allocate_attempts);
@@ -163,8 +170,8 @@ bool RelayClient::Allocate(std::string* error) {
             continue;
         }
         m_relayed = relayed;
-        m_lifetime_ms = lifetime;
-        m_allocated = true;
+        m_lifetime_ms.store(lifetime, std::memory_order_relaxed);
+        m_allocated.store(true, std::memory_order_release);
         return true;
     }
     if (error != nullptr) {
@@ -175,7 +182,7 @@ bool RelayClient::Allocate(std::string* error) {
 
 bool RelayClient::Refresh(std::string* error) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_allocated) {
+    if (!m_allocated.load(std::memory_order_relaxed)) {
         if (error != nullptr) {
             *error = "尚未分配中继端点";
         }
@@ -198,27 +205,27 @@ bool RelayClient::Refresh(std::string* error) {
     std::size_t offset = 1;
     std::uint32_t lifetime = 0;
     if (detail::ReadU32Body(response_body, &offset, &lifetime)) {
-        m_lifetime_ms = lifetime;
+        m_lifetime_ms.store(lifetime, std::memory_order_relaxed);
     }
     return true;
 }
 
 void RelayClient::Release() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_allocated || m_transport == nullptr) {
-        m_allocated = false;
+    if (!m_allocated.load(std::memory_order_relaxed) || m_transport == nullptr) {
+        m_allocated.store(false, std::memory_order_release);
         return;
     }
     std::uint8_t status = 0;
     std::string ignored;
     (void)Request(static_cast<std::uint8_t>(detail::RelayMessageType::kReleaseRequest), {},
                   std::chrono::milliseconds(200), &status, nullptr, &ignored);
-    m_allocated = false;
+    m_allocated.store(false, std::memory_order_release);
     m_relayed = Endpoint();
 }
 
 bool RelayClient::allocated() const noexcept {
-    return m_allocated;
+    return m_allocated.load(std::memory_order_acquire);
 }
 
 Endpoint RelayClient::relayed_endpoint() const {
@@ -226,56 +233,60 @@ Endpoint RelayClient::relayed_endpoint() const {
 }
 
 std::uint32_t RelayClient::lifetime_ms() const noexcept {
-    return m_lifetime_ms;
+    return m_lifetime_ms.load(std::memory_order_relaxed);
 }
 
 bool RelayClient::SendTo(const Endpoint& peer, const void* data, std::size_t length) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_allocated || m_transport == nullptr || !peer.valid()) {
+    // 数据面只读 allocated 原子标志：不与控制面/接收路径抢同一把互斥量。
+    if (!m_allocated.load(std::memory_order_acquire) || m_transport == nullptr || !peer.valid()) {
         return false;
     }
     if (length > detail::kRelayMaxBody - 32) {
         return false;
     }
-    std::vector<std::uint8_t> body;
-    body.reserve(3 + 16 + length);
-    detail::AppendEndpointBody(&body, peer);
-    const auto* bytes = static_cast<const std::uint8_t*>(data);
-    if (length > 0) {
-        if (bytes == nullptr) {
-            return false;
-        }
-        body.insert(body.end(), bytes, bytes + length);
-    }
-    detail::RelayMessage message;
-    message.type = detail::RelayMessageType::kSendIndication;
-    message.request_id = 0;
-    message.body = std::move(body);
-    const std::vector<std::uint8_t> wire = detail::SerializeRelayMessage(message);
-    if (wire.empty() || !m_transport->SendTo(m_config.server, wire.data(), wire.size())) {
+    const bool ipv4 = peer.IsIPv4();
+    if (!ipv4 && !peer.IsIPv6()) {
         return false;
     }
-    ++m_packets_sent;
-    m_bytes_sent += length;
+    if (length > 0 && data == nullptr) {
+        return false;
+    }
+    const std::size_t body_length = 3 + (ipv4 ? 4U : 16U) + length;
+    const std::size_t total = detail::kRelayHeaderSize + body_length;
+    EnsureSendBuffer(total);
+    std::uint8_t* out = m_send_buffer.data();
+    (void)detail::BuildRelayHeader(out, total, detail::RelayMessageType::kSendIndication, 0,
+                                   body_length);
+    const std::size_t endpoint_bytes = detail::EncodeEndpointBody(
+        out + detail::kRelayHeaderSize, total - detail::kRelayHeaderSize, peer);
+    if (endpoint_bytes == 0) {
+        return false;
+    }
+    if (length > 0) {
+        std::memcpy(out + detail::kRelayHeaderSize + endpoint_bytes, data, length);
+    }
+    if (!m_transport->SendTo(m_config.server, out, total)) {
+        return false;
+    }
+    m_packets_sent.fetch_add(1, std::memory_order_relaxed);
+    m_bytes_sent.fetch_add(length, std::memory_order_relaxed);
     return true;
 }
 
 int RelayClient::RecvFrom(Endpoint* peer, void* buffer, std::size_t capacity,
                           std::chrono::milliseconds timeout) {
-    // 只在校验状态时持锁：接收等待可能长达数秒，持锁会让并发的 SendTo 被
-    // 卡住。数据报接收本身是「唯一读端」语义，由调用方保证串行。
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_allocated || m_transport == nullptr) {
-            return -1;
-        }
+    // 只读取一次状态：接收等待可能长达数秒，不能持锁。
+    if (!m_allocated.load(std::memory_order_acquire) || m_transport == nullptr) {
+        return -1;
     }
     if (buffer == nullptr && capacity > 0) {
         return -1;
     }
     const Clock::time_point deadline = Clock::now() + timeout;
+    // 稳态（每次都有数据报可读）时不读时钟：只有空包/EINTR/无效包才重算剩余
+    // 预算。旧实现每个数据包都要 Clock::now()（vDSO 约 20ns）+ duration_cast。
+    std::chrono::milliseconds left = timeout;
     for (;;) {
-        const std::chrono::milliseconds left = Remaining(deadline);
         if (left.count() <= 0) {
             return 0;
         }
@@ -283,55 +294,56 @@ int RelayClient::RecvFrom(Endpoint* peer, void* buffer, std::size_t capacity,
         const int received =
             m_transport->RecvFrom(&source, m_recv_buffer.data(), m_recv_buffer.size(), left);
         if (received == 0) {
+            left = Remaining(deadline);
             continue;
         }
         if (received < 0) {
             return -1;
         }
-        detail::RelayMessage message;
-        if (!detail::ParseRelayMessage(m_recv_buffer.data(),
-                                       static_cast<std::size_t>(received), &message)) {
+        detail::RelayMessageView message;
+        if (!detail::ParseRelayMessageView(m_recv_buffer.data(),
+                                           static_cast<std::size_t>(received), &message)) {
+            left = Remaining(deadline);
             continue;
         }
         if (message.type != detail::RelayMessageType::kDataIndication) {
+            left = Remaining(deadline);
             continue;
         }
         std::size_t offset = 0;
         Endpoint sender;
-        if (!detail::ReadEndpointBody(message.body, &offset, &sender)) {
+        if (!detail::ReadEndpointBodyView(message.body, message.body_length, &offset, &sender)) {
+            left = Remaining(deadline);
             continue;
         }
-        const std::size_t payload_length = message.body.size() - offset;
+        const std::size_t payload_length = message.body_length - offset;
         const std::size_t copied = std::min(payload_length, capacity);
         if (copied > 0) {
-            std::memcpy(buffer, message.body.data() + offset, copied);
+            std::memcpy(buffer, message.body + offset, copied);
         }
         if (peer != nullptr) {
             *peer = sender;
         }
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            ++m_packets_received;
-            m_bytes_received += copied;
-        }
+        m_packets_received.fetch_add(1, std::memory_order_relaxed);
+        m_bytes_received.fetch_add(copied, std::memory_order_relaxed);
         return static_cast<int>(copied);
     }
 }
 
 std::uint64_t RelayClient::bytes_sent() const noexcept {
-    return m_bytes_sent;
+    return m_bytes_sent.load(std::memory_order_relaxed);
 }
 
 std::uint64_t RelayClient::bytes_received() const noexcept {
-    return m_bytes_received;
+    return m_bytes_received.load(std::memory_order_relaxed);
 }
 
 std::uint64_t RelayClient::packets_sent() const noexcept {
-    return m_packets_sent;
+    return m_packets_sent.load(std::memory_order_relaxed);
 }
 
 std::uint64_t RelayClient::packets_received() const noexcept {
-    return m_packets_received;
+    return m_packets_received.load(std::memory_order_relaxed);
 }
 
 }  // namespace go2cpp::p2p

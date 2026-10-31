@@ -1,5 +1,3 @@
-#pragma once
-
 /**
  * @file turn.hpp
  * @brief 简化 TURN：中继服务器（Allocation + Send/Data）与客户端。
@@ -15,15 +13,20 @@
  *             客户端。
  *
  *          线格式与实现细节见 `src/p2p/relay_protocol.hpp`。服务器是单线程
- *          poll 循环，可同时服务多个 allocation；客户端不是线程安全的
- *          （`Allocate/Refresh/Release/SendTo/RecvFrom` 必须串行调用），
- *          因为所有请求共用同一个 `DatagramTransport`。
+ *          poll 循环，可同时服务多个 allocation；客户端的控制面
+ *          （`Allocate/Refresh/Release`）必须串行，数据面允许
+ *          「一个 SendTo 线程 + 一个 RecvFrom 线程」并发（两者使用独立的
+ *          scratch 缓冲；SendTo 之间仍必须串行）。
+ *
+ *          数据面每包不分配堆内存：发送用成员 scratch 直接拼「头 + 端点 +
+ *          载荷」一次交给传输层；接收用零拷贝视图直接指向接收缓冲。
  *
  * @author go2cpp contributors
  * @date 2026-10-31
  * @copyright MIT License
  */
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -43,7 +46,7 @@ struct RelayServerConfig {
     /**
      * @brief 对外通告的地址（只取 IP，端口用 relay 端点的实际端口）。
      * @details 当 `bind_endpoint` 是 `0.0.0.0` 时必须设置，否则客户端拿到的
-     *          relay 地址不可达。为空时使用监听地址的 IP（要求监听地址具体）。
+     * relay 地址不可达。为空时使用监听地址的 IP（要求监听地址具体）。
      */
     Endpoint advertised_address;
     /// allocation 生命周期；客户端需要在此之前 Refresh。
@@ -117,8 +120,10 @@ struct RelayClientConfig {
 /**
  * @brief 简化 TURN 客户端。
  *
- * @details 所有方法共用构造时传入的 `DatagramTransport`，因此**不支持并发
- *          调用**。析构时会尽力发送 Release（失败忽略）。
+ * @details 所有方法共用构造时传入的 `DatagramTransport`，因此**控制面不支持
+ *          并发调用**。`SendTo` 与 `RecvFrom` 可以分属两个线程并发（数据面
+ *          使用独立缓冲）；`SendTo` 之间必须串行。析构时会尽力发送 Release
+ *          （失败忽略）。
  */
 class RelayClient {
 public:
@@ -164,21 +169,28 @@ private:
     bool Request(const std::uint8_t type, const std::vector<std::uint8_t>& body,
                  std::chrono::milliseconds timeout, std::uint8_t* status,
                  std::vector<std::uint8_t>* response_body, std::string* error);
+    /// @brief 把发送缓冲扩到至少 `bytes` 字节（热路径只增不减，避免反复分配）。
+    void EnsureSendBuffer(std::size_t bytes);
 
     DatagramTransport* m_transport = nullptr;
     RelayClientConfig m_config;
     Endpoint m_relayed;
-    std::uint32_t m_lifetime_ms = 0;
-    bool m_allocated = false;
+    std::atomic<std::uint32_t> m_lifetime_ms{0};
+    /// 数据面热路径无锁读取；控制面在锁内 store。
+    std::atomic<bool> m_allocated{false};
     std::uint32_t m_next_request_id = 0;
     mutable std::mutex m_mutex;
-    std::uint64_t m_bytes_sent = 0;
-    std::uint64_t m_bytes_received = 0;
-    std::uint64_t m_packets_sent = 0;
-    std::uint64_t m_packets_received = 0;
+    std::atomic<std::uint64_t> m_bytes_sent{0};
+    std::atomic<std::uint64_t> m_bytes_received{0};
+    std::atomic<std::uint64_t> m_packets_sent{0};
+    std::atomic<std::uint64_t> m_packets_received{0};
     std::vector<std::uint8_t> m_recv_buffer;
     /// 请求-响应缓冲（成员而非栈数组：避免在 Fiber 的 4KB 栈上放 64KB）。
     std::vector<std::uint8_t> m_request_buffer;
+    /// 控制面请求序列化 scratch：只由 Allocate/Refresh/Release 在锁内使用。
+    std::vector<std::uint8_t> m_request_wire;
+    /// 数据面发送 scratch：头 + 端点 + 载荷，一次 sendto，无堆分配。
+    std::vector<std::uint8_t> m_send_buffer;
 };
 
 }  // namespace go2cpp::p2p

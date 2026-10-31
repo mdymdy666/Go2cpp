@@ -308,6 +308,10 @@ bool Endpoint::IsLoopback() const noexcept {
 }
 
 bool Endpoint::operator==(const Endpoint& other) const noexcept {
+    // 数据面每包都会比较「数据报来源 == 已锁定的 peer」。旧实现各构造一次
+    // 16 字节 AddressBytes()（memset + memcpy）再逐字节比较；这里直接比
+    // sockaddr 字段：IPv4 两次 load + 两个 32 位比较，IPv6 一次 16 字节
+    // SSE 比较，省掉两次临时数组构造。
     if (m_length != other.m_length) {
         return false;
     }
@@ -317,10 +321,19 @@ bool Endpoint::operator==(const Endpoint& other) const noexcept {
     if (m_storage.ss_family != other.m_storage.ss_family) {
         return false;
     }
-    if (port() != other.port()) {
-        return false;
+    if (m_storage.ss_family == AF_INET) {
+        const auto* left = reinterpret_cast<const sockaddr_in*>(&m_storage);
+        const auto* right = reinterpret_cast<const sockaddr_in*>(&other.m_storage);
+        return left->sin_port == right->sin_port &&
+               left->sin_addr.s_addr == right->sin_addr.s_addr;
     }
-    return AddressBytes() == other.AddressBytes();
+    if (m_storage.ss_family == AF_INET6) {
+        const auto* left = reinterpret_cast<const sockaddr_in6*>(&m_storage);
+        const auto* right = reinterpret_cast<const sockaddr_in6*>(&other.m_storage);
+        return left->sin6_port == right->sin6_port &&
+               std::memcmp(&left->sin6_addr, &right->sin6_addr, sizeof(in6_addr)) == 0;
+    }
+    return false;
 }
 
 bool Endpoint::operator<(const Endpoint& other) const noexcept {

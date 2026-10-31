@@ -242,9 +242,10 @@ private:
         if (!client.valid()) {
             return;
         }
-        const auto request = ParseStunMessage(buffer, static_cast<std::size_t>(received));
-        if (!request.has_value() || request->klass != StunClass::kRequest ||
-            request->method != kStunMethodBinding) {
+        // 零拷贝解析：属性直接指进接收栈缓冲，不再为每个属性分配 vector。
+        const auto request = ParseStunMessageView(buffer, static_cast<std::size_t>(received));
+        if (!request.has_value() || request->klass() != StunClass::kRequest ||
+            request->method() != kStunMethodBinding) {
             return;
         }
         ++m_requests;
@@ -269,25 +270,29 @@ private:
             }
         }
 
-        StunMessage response =
-            StunMessage::MakeBindingSuccess(request->transaction_id, client);
+        // 直接写线格式：XOR-MAPPED/MAPPED/[RESPONSE-ORIGIN]/[OTHER-ADDRESS]/
+        // [SOFTWARE] 全部就地编码，每请求 0 次堆分配、0 次中间拷贝。
+        const std::size_t software_padded =
+            (m_config.software.size() + 3U) & ~std::size_t{3};
+        const std::size_t needed =
+            kStunHeaderSize + 5U * (4U + 4U + 16U) + 4U + software_padded;
+        if (m_response_buffer.size() < needed) {
+            m_response_buffer.resize(needed);
+        }
+        std::array<std::uint8_t, kStunTransactionIdSize> transaction_id{};
+        std::memcpy(transaction_id.data(), request->transaction_id(), transaction_id.size());
         const Endpoint origin = m_sockets[response_index].endpoint;
-        response.AddAddress(kStunAttributeResponseOrigin, origin, false);
         const Endpoint other = alternate_endpoint();
-        if (other.valid()) {
-            response.AddAddress(kStunAttributeOtherAddress, other, false);
-        }
-        if (!m_config.software.empty()) {
-            response.AddAttribute(kStunAttributeSoftware, m_config.software.data(),
-                                  m_config.software.size());
-        }
-        const std::vector<std::uint8_t> wire = SerializeStunMessage(response);
-        if (wire.empty()) {
+        const std::size_t wire_size = BuildBindingSuccessWire(
+            m_response_buffer.data(), m_response_buffer.size(), transaction_id, client, &origin,
+            other.valid() ? &other : nullptr, m_config.software);
+        if (wire_size == 0) {
             return;
         }
-        const ssize_t sent = ::sendto(m_sockets[response_index].fd, wire.data(), wire.size(), 0,
-                                      client.sockaddr_ptr(), client.sockaddr_length());
-        if (sent == static_cast<ssize_t>(wire.size())) {
+        const ssize_t sent =
+            ::sendto(m_sockets[response_index].fd, m_response_buffer.data(), wire_size, 0,
+                     client.sockaddr_ptr(), client.sockaddr_length());
+        if (sent == static_cast<ssize_t>(wire_size)) {
             ++m_responses;
         }
     }
@@ -302,6 +307,8 @@ private:
     std::thread m_thread;
     std::atomic<std::uint64_t> m_requests{0};
     std::atomic<std::uint64_t> m_responses{0};
+    /// 响应线格式 scratch（单线程 poll 线程独占；只增不减，稳态零分配）。
+    std::vector<std::uint8_t> m_response_buffer;
 };
 
 StunServer::StunServer(StunServerConfig config)

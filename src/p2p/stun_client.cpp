@@ -9,6 +9,7 @@
 #include "go2cpp/p2p/stun_client.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <vector>
@@ -96,8 +97,8 @@ std::optional<StunExchangeResult> StunClient::Exchange(const StunMessage& reques
             return std::nullopt;
         }
         std::string parse_error;
-        const auto message = ParseStunMessage(buffer.data(), static_cast<std::size_t>(received),
-                                              &parse_error);
+        auto message = ParseStunMessage(buffer.data(), static_cast<std::size_t>(received),
+                                        &parse_error);
         if (!message.has_value()) {
             continue;
         }
@@ -110,7 +111,8 @@ std::optional<StunExchangeResult> StunClient::Exchange(const StunMessage& reques
             continue;
         }
         StunExchangeResult result;
-        result.message = *message;
+        // 直接移动解析结果：省掉 attributes vector 与每个属性 value 的深拷贝。
+        result.message = std::move(*message);
         result.source = source;
         result.rtt = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started);
         return result;
@@ -123,25 +125,86 @@ std::optional<StunExchangeResult> StunClient::Exchange(const StunMessage& reques
 
 std::optional<Endpoint> StunClient::Binding(std::chrono::milliseconds timeout,
                                             std::string* error) {
-    const StunMessage request = StunMessage::MakeBindingRequest();
-    const auto result = Exchange(request, timeout, error);
-    if (!result.has_value()) {
-        return std::nullopt;
-    }
-    if (result->message.klass == StunClass::kErrorResponse) {
-        std::uint16_t code = 0;
-        std::string reason;
-        result->message.GetErrorCode(&code, &reason);
+    // 快路径：请求用栈缓冲直接写线格式（SOFTWARE 属性 + 事务 ID），响应用
+    // 零拷贝视图读取。整条路径不分配堆内存（错误路径除外），比走
+    // MakeBindingRequest + Serialize + Parse 的通用路径少 6~8 次分配/拷贝。
+    if (m_transport == nullptr || !m_server.valid()) {
         if (error != nullptr) {
-            *error = "STUN 服务器返回错误 " + std::to_string(code) + ": " + reason;
+            *error = "STUN 客户端未配置传输或服务器地址";
         }
         return std::nullopt;
     }
-    const auto mapped = result->message.GetMappedAddress();
-    if (!mapped.has_value() && error != nullptr) {
-        *error = "STUN 响应缺少 XOR-MAPPED-ADDRESS/MAPPED-ADDRESS";
+    std::array<std::uint8_t, 64> wire{};
+    std::array<std::uint8_t, kStunTransactionIdSize> transaction_id{};
+    const std::size_t wire_size =
+        BuildBindingRequestWire(wire.data(), wire.size(), &transaction_id);
+    if (wire_size == 0) {
+        if (error != nullptr) {
+            *error = "STUN 序列化失败";
+        }
+        return std::nullopt;
     }
-    return mapped;
+    const Clock::time_point started = Clock::now();
+    if (!m_transport->SendTo(m_server, wire.data(), wire_size)) {
+        if (error != nullptr) {
+            *error = "STUN 请求发送失败（" + m_server.ToString() + "）";
+        }
+        return std::nullopt;
+    }
+    const Clock::time_point deadline = started + timeout;
+    std::vector<std::uint8_t>& buffer = m_buffer;
+    // 与 relay 接收路径相同：拿到响应就返回，不为每个数据报读一次时钟。
+    std::chrono::milliseconds left = timeout;
+    for (;;) {
+        if (left.count() <= 0) {
+            break;
+        }
+        Endpoint source;
+        const int received = m_transport->RecvFrom(&source, buffer.data(), buffer.size(), left);
+        if (received == 0) {
+            left = Remaining(deadline);
+            continue;
+        }
+        if (received < 0) {
+            if (error != nullptr) {
+                *error = "STUN 响应接收失败";
+            }
+            return std::nullopt;
+        }
+        const auto view =
+            ParseStunMessageView(buffer.data(), static_cast<std::size_t>(received));
+        if (!view.has_value() || view->method() != kStunMethodBinding) {
+            left = Remaining(deadline);
+            continue;
+        }
+        if (std::memcmp(view->transaction_id(), transaction_id.data(), transaction_id.size()) !=
+            0) {
+            left = Remaining(deadline);
+            continue;
+        }
+        if (view->klass() == StunClass::kErrorResponse) {
+            std::uint16_t code = 0;
+            std::string reason;
+            view->GetErrorCode(&code, &reason);
+            if (error != nullptr) {
+                *error = "STUN 服务器返回错误 " + std::to_string(code) + ": " + reason;
+            }
+            return std::nullopt;
+        }
+        if (view->klass() != StunClass::kSuccessResponse) {
+            left = Remaining(deadline);
+            continue;
+        }
+        const auto mapped = view->GetMappedAddress();
+        if (!mapped.has_value() && error != nullptr) {
+            *error = "STUN 响应缺少 XOR-MAPPED-ADDRESS/MAPPED-ADDRESS";
+        }
+        return mapped;
+    }
+    if (error != nullptr) {
+        *error = "STUN 请求超时（" + m_server.ToString() + "）";
+    }
+    return std::nullopt;
 }
 
 std::optional<StunExchangeResult> StunClient::BindingWithChange(

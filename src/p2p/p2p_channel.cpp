@@ -135,6 +135,39 @@ bool LooksLikeStun(const std::uint8_t* data, std::size_t length) {
     return data != nullptr && length >= kStunHeaderSize && ReadU32(data + 4) == kStunMagicCookie;
 }
 
+/**
+ * @brief 待匹配的 STUN 检查事务 ID（固定容量环形表）。
+ * @details 旧实现是 `std::vector<std::array<...>>`：打洞期间每轮每个 target 都
+ *          push_back，超过上限再 erase(begin())（O(n) 搬移），每次连接至少
+ *          1 次堆分配 + 多次 memmove。环形表容量固定，Push/Contains 都是
+ *          纯栈操作，且保持「保留最近 32 个」的语义。
+ */
+struct PendingChecks {
+    void Push(const std::array<std::uint8_t, kStunTransactionIdSize>& id) noexcept {
+        m_items[(m_head + m_count) % kMaxPendingChecks] = id;
+        if (m_count < kMaxPendingChecks) {
+            ++m_count;
+        } else {
+            m_head = (m_head + 1U) % kMaxPendingChecks;
+        }
+    }
+
+    bool Contains(const std::uint8_t* id) const noexcept {
+        for (std::size_t index = 0; index < m_count; ++index) {
+            if (std::memcmp(m_items[(m_head + index) % kMaxPendingChecks].data(), id,
+                            kStunTransactionIdSize) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    std::array<std::array<std::uint8_t, kStunTransactionIdSize>, kMaxPendingChecks> m_items{};
+    std::size_t m_head = 0;
+    std::size_t m_count = 0;
+};
+
 std::chrono::milliseconds Remaining(Clock::time_point deadline) {
     const Clock::time_point now = Clock::now();
     if (now >= deadline) {
@@ -391,7 +424,9 @@ public:
         if (!relayed && snapshot.state != P2PState::kConnected) {
             return false;
         }
-        const Endpoint peer = snapshot.peer;
+        // 快照对象不可变且存活到 Impl 析构：直接引用，省掉每包 136 字节
+        // （sockaddr_storage + socklen）的结构体拷贝。
+        const Endpoint& peer = snapshot.peer;
         if (!peer.valid()) {
             return false;
         }
@@ -419,15 +454,21 @@ public:
             return 0;
         }
         const Clock::time_point deadline = Clock::now() + timeout;
+        // 稳态数据包路径不读时钟：只有空包/控制帧/无效包才重算剩余预算，
+        // 正常数据报直接返回（省掉每包一次 steady_clock::now）。
+        std::chrono::milliseconds left = timeout;
         for (;;) {
-            // 每轮只取一次时钟：keepalive 判定、超时判定与 touch 复用它。
-            const std::int64_t now_ns = NowNanos();
-            MaybeSendKeepalive(now_ns);
-            if (PeerTimedOut(now_ns)) {
-                SetFailed("对端静默超过 peer_timeout");
-                return 0;
+            // 每轮只取一次时钟；当 keepalive 与 peer_timeout 都关闭时
+            // （纯数据面压测）完全跳过 steady_clock::now() 的 vDSO 调用。
+            std::int64_t now_ns = 0;
+            if (m_track_activity) {
+                now_ns = NowNanos();
+                MaybeSendKeepalive(now_ns);
+                if (PeerTimedOut(now_ns)) {
+                    SetFailed("对端静默超过 peer_timeout");
+                    return 0;
+                }
             }
-            const std::chrono::milliseconds left = Remaining(deadline);
             if (left.count() <= 0) {
                 return 0;
             }
@@ -436,17 +477,21 @@ public:
             const int received = relayed ? RecvViaRelay(&source, ClampPoll(left, kRecvPollMs))
                                          : RecvDirect(&source, ClampPoll(left, kRecvPollMs));
             if (received == 0) {
+                left = Remaining(deadline);
                 continue;
             }
             if (received < 0) {
                 SetError("Recv: 接收失败");
                 return 0;
             }
-            TouchPeer(now_ns);
+            if (m_track_activity) {
+                TouchPeer(now_ns);
+            }
             const auto* bytes = m_recv_buffer.data();
             const std::size_t received_bytes = static_cast<std::size_t>(received);
             if (LooksLikeStun(bytes, received_bytes)) {
                 HandleStun(bytes, received_bytes, source, relayed);
+                left = Remaining(deadline);
                 continue;
             }
             FrameType type = FrameType::kData;
@@ -455,6 +500,7 @@ public:
             std::size_t payload_length = 0;
             if (!ParseFrame(bytes, received_bytes, &type, &sequence, &payload, &payload_length)) {
                 Bump(m_stats.dropped_packets);
+                left = Remaining(deadline);
                 continue;
             }
             if (type == FrameType::kKeepalive) {
@@ -465,14 +511,17 @@ public:
                                : SendDirect(source, m_rx_frame_scratch.data(),
                                             m_rx_frame_scratch.size()));
                 Bump(m_stats.keepalives_received);
+                left = Remaining(deadline);
                 continue;
             }
             if (type == FrameType::kKeepaliveAck) {
                 UpdateRtt();
+                left = Remaining(deadline);
                 continue;
             }
             if (!SourceMatchesPeer(source)) {
                 Bump(m_stats.dropped_packets);
+                left = Remaining(deadline);
                 continue;
             }
             const std::size_t copied = std::min(payload_length, capacity);
@@ -485,7 +534,9 @@ public:
                 Bump(m_stats.relayed_packets_received);
             }
             UpdateSequenceGap(sequence);
-            m_last_receive_ns.store(now_ns, std::memory_order_relaxed);
+            if (m_track_activity) {
+                m_last_receive_ns.store(now_ns, std::memory_order_relaxed);
+            }
             return copied;
         }
     }
@@ -748,21 +799,26 @@ private:
 
     void HandleStun(const std::uint8_t* data, std::size_t length, const Endpoint& source,
                     bool relayed) {
-        const auto message = ParseStunMessage(data, length);
-        if (!message.has_value() || message->method != kStunMethodBinding) {
+        // 数据面里混入的 STUN 包：视图解析（0 分配）+ 栈上直接写 Success 回包，
+        // 不再构造 StunMessage / vector 属性（旧实现每包 10+ 次分配）。
+        const auto message = ParseStunMessageView(data, length);
+        if (!message.has_value() || message->method() != kStunMethodBinding) {
             return;
         }
-        if (message->klass == StunClass::kRequest) {
+        if (message->klass() == StunClass::kRequest) {
             // 连接后收到对端重传的检查包：回一个 Success，避免对端超时重试。
-            StunMessage response = StunMessage::MakeBindingSuccess(message->transaction_id, source);
-            const std::vector<std::uint8_t> wire = SerializeStunMessage(response);
-            if (!wire.empty()) {
-                (void)(relayed ? SendViaRelay(source, wire.data(), wire.size())
-                               : SendDirect(source, wire.data(), wire.size()));
+            std::array<std::uint8_t, 128> wire{};
+            std::array<std::uint8_t, kStunTransactionIdSize> transaction_id{};
+            std::memcpy(transaction_id.data(), message->transaction_id(), transaction_id.size());
+            const std::size_t wire_size = BuildBindingSuccessWire(
+                wire.data(), wire.size(), transaction_id, source, nullptr, nullptr, {});
+            if (wire_size > 0) {
+                (void)(relayed ? SendViaRelay(source, wire.data(), wire_size)
+                               : SendDirect(source, wire.data(), wire_size));
             }
             return;
         }
-        if (message->klass == StunClass::kSuccessResponse) {
+        if (message->klass() == StunClass::kSuccessResponse) {
             Bump(m_stats.connectivity_checks_received);
         }
     }
@@ -825,7 +881,7 @@ private:
 
     bool TryDirect(const std::vector<Endpoint>& targets, Clock::time_point deadline,
                    Clock::time_point started) {
-        std::vector<std::array<std::uint8_t, kStunTransactionIdSize>> pending;
+        PendingChecks pending;
         Clock::time_point next_check = started;
         const auto interval = std::max(m_config.check_interval, std::chrono::milliseconds(1));
         while (Clock::now() < deadline) {
@@ -851,23 +907,27 @@ private:
             if (!LooksLikeStun(bytes, static_cast<std::size_t>(received))) {
                 continue;
             }
-            const auto message = ParseStunMessage(bytes, static_cast<std::size_t>(received));
-            if (!message.has_value() || message->method != kStunMethodBinding) {
+            const auto message =
+                ParseStunMessageView(bytes, static_cast<std::size_t>(received));
+            if (!message.has_value() || message->method() != kStunMethodBinding) {
                 continue;
             }
-            if (message->klass == StunClass::kRequest) {
-                StunMessage response =
-                    StunMessage::MakeBindingSuccess(message->transaction_id, source);
-                const std::vector<std::uint8_t> wire = SerializeStunMessage(response);
-                if (!wire.empty()) {
-                    (void)SendDirect(source, wire.data(), wire.size());
+            if (message->klass() == StunClass::kRequest) {
+                std::array<std::uint8_t, 128> wire{};
+                std::array<std::uint8_t, kStunTransactionIdSize> transaction_id{};
+                std::memcpy(transaction_id.data(), message->transaction_id(),
+                            transaction_id.size());
+                const std::size_t wire_size = BuildBindingSuccessWire(
+                    wire.data(), wire.size(), transaction_id, source, nullptr, nullptr, {});
+                if (wire_size > 0) {
+                    (void)SendDirect(source, wire.data(), wire_size);
                 }
                 Bump(m_stats.connectivity_checks_received);
                 Establish(source, false);
                 return true;
             }
-            if (message->klass == StunClass::kSuccessResponse &&
-                IsPendingTransaction(pending, message->transaction_id)) {
+            if (message->klass() == StunClass::kSuccessResponse &&
+                pending.Contains(message->transaction_id())) {
                 Bump(m_stats.connectivity_checks_received);
                 Establish(source, false);
                 return true;
@@ -890,23 +950,22 @@ private:
                 return false;
             }
         }
-        std::vector<std::array<std::uint8_t, kStunTransactionIdSize>> pending;
+        PendingChecks pending;
         Clock::time_point next_check = started;
         const auto interval = std::max(m_config.check_interval, std::chrono::milliseconds(1));
         while (Clock::now() < deadline) {
             const Clock::time_point now = Clock::now();
             if (now >= next_check) {
                 for (const Endpoint& target : targets) {
-                    const StunMessage request = StunMessage::MakeBindingRequest();
-                    const std::vector<std::uint8_t> wire = SerializeStunMessage(request);
-                    if (wire.empty()) {
+                    std::array<std::uint8_t, 64> wire{};
+                    std::array<std::uint8_t, kStunTransactionIdSize> transaction_id{};
+                    const std::size_t wire_size =
+                        BuildBindingRequestWire(wire.data(), wire.size(), &transaction_id);
+                    if (wire_size == 0) {
                         continue;
                     }
-                    if (relay->SendTo(target, wire.data(), wire.size())) {
-                        pending.push_back(request.transaction_id);
-                        if (pending.size() > kMaxPendingChecks) {
-                            pending.erase(pending.begin());
-                        }
+                    if (relay->SendTo(target, wire.data(), wire_size)) {
+                        pending.Push(transaction_id);
                         Bump(m_stats.connectivity_checks_sent);
                     }
                 }
@@ -927,23 +986,27 @@ private:
             if (!LooksLikeStun(bytes, static_cast<std::size_t>(received))) {
                 continue;
             }
-            const auto message = ParseStunMessage(bytes, static_cast<std::size_t>(received));
-            if (!message.has_value() || message->method != kStunMethodBinding) {
+            const auto message =
+                ParseStunMessageView(bytes, static_cast<std::size_t>(received));
+            if (!message.has_value() || message->method() != kStunMethodBinding) {
                 continue;
             }
-            if (message->klass == StunClass::kRequest) {
-                StunMessage response =
-                    StunMessage::MakeBindingSuccess(message->transaction_id, source);
-                const std::vector<std::uint8_t> wire = SerializeStunMessage(response);
-                if (!wire.empty()) {
-                    (void)relay->SendTo(source, wire.data(), wire.size());
+            if (message->klass() == StunClass::kRequest) {
+                std::array<std::uint8_t, 128> wire{};
+                std::array<std::uint8_t, kStunTransactionIdSize> transaction_id{};
+                std::memcpy(transaction_id.data(), message->transaction_id(),
+                            transaction_id.size());
+                const std::size_t wire_size = BuildBindingSuccessWire(
+                    wire.data(), wire.size(), transaction_id, source, nullptr, nullptr, {});
+                if (wire_size > 0) {
+                    (void)relay->SendTo(source, wire.data(), wire_size);
                 }
                 Bump(m_stats.connectivity_checks_received);
                 Establish(source, true);
                 return true;
             }
-            if (message->klass == StunClass::kSuccessResponse &&
-                IsPendingTransaction(pending, message->transaction_id)) {
+            if (message->klass() == StunClass::kSuccessResponse &&
+                pending.Contains(message->transaction_id())) {
                 Bump(m_stats.connectivity_checks_received);
                 Establish(source, true);
                 return true;
@@ -952,31 +1015,20 @@ private:
         return false;
     }
 
-    bool SendCheckDirect(
-        const Endpoint& target,
-        std::vector<std::array<std::uint8_t, kStunTransactionIdSize>>* pending) {
-        const StunMessage request = StunMessage::MakeBindingRequest();
-        const std::vector<std::uint8_t> wire = SerializeStunMessage(request);
-        if (wire.empty() || !SendDirect(target, wire.data(), wire.size())) {
+    bool SendCheckDirect(const Endpoint& target, PendingChecks* pending) {
+        // 检查包直接写栈缓冲：不再构造 StunMessage（SOFTWARE 属性 vector 分配）
+        // 再 Serialize（body + output 两次分配）。事务 ID 从 TLS 随机池取，
+        // 也省掉了每个检查包一次 getrandom 系统调用。
+        std::array<std::uint8_t, 64> wire{};
+        std::array<std::uint8_t, kStunTransactionIdSize> transaction_id{};
+        const std::size_t wire_size =
+            BuildBindingRequestWire(wire.data(), wire.size(), &transaction_id);
+        if (wire_size == 0 || !SendDirect(target, wire.data(), wire_size)) {
             return false;
         }
-        pending->push_back(request.transaction_id);
-        if (pending->size() > kMaxPendingChecks) {
-            pending->erase(pending->begin());
-        }
+        pending->Push(transaction_id);
         Bump(m_stats.connectivity_checks_sent);
         return true;
-    }
-
-    static bool IsPendingTransaction(
-        const std::vector<std::array<std::uint8_t, kStunTransactionIdSize>>& pending,
-        const std::array<std::uint8_t, kStunTransactionIdSize>& transaction_id) {
-        for (const auto& item : pending) {
-            if (item == transaction_id) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /// @brief 连接成功：发布新快照并重置时间戳/序列基线。
@@ -993,6 +1045,9 @@ private:
     }
 
     P2PConfig m_config;
+    /// keepalive / peer_timeout 都关闭时，Recv 循环不必每轮取 steady_clock。
+    const bool m_track_activity = m_config.keepalive_interval.count() > 0 ||
+                                  m_config.peer_timeout.count() > 0;
     std::shared_ptr<DatagramTransport> m_transport;
     /// 保护 error / 候选集合 / 快照历史；收发热路径不再使用它。
     mutable std::mutex m_mutex;
