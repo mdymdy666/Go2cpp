@@ -64,6 +64,31 @@ Go2Cpp 仓库里有一个协作目录：
 - 在 `acceptance.md` 记录：用例/数据/结论；
 - 如果接口不满足，**继续提**（在 requests 里加一条，注明「上一条不满足的补充」）。
 
+## ★ 通用性判定（Go2Cpp 的边界，必须先读）
+
+**Go2Cpp 只做「通用层」——拒绝不通用的要求。**
+
+| 类别 | 判定 | 例子 |
+|---|---|---|
+| **通用**（Go2Cpp 做） | 多项目可复用、与业务无关 | 并发原语、网络传输、缓存淘汰、错误体系、序列化、Go 风格 API、有界队列、背压、超时/取消、连接池、限流 |
+| **专属**（JinShan 自己做） | 只服务 JinShan 的协议/业务 | RDRL 帧格式（magic `RDRL`/type 1-9/错误码表）、IRDPSRAPI 封装、invitation 改写、命令白名单、会话状态机 |
+| **可抽象**（Go2Cpp 提供通用抽象，JinShan 填语义） | 机制通用、语义专属 | 「帧编解码」→ 通用 length-prefix + CRC32；「配对表」→ 通用 Hub/Registry；「1:1 中继」→ 通用 RelayPipe（背压+慢 peer） |
+
+**判定方法**：问一句「别的项目（游戏/AI 推理/IM）会用吗？」
+- 会 → 通用（Go2Cpp 做）；
+- 不会（只有远程桌面用）→ 专属（JinShan 自己做）；
+- 机制会、语义不会 → 抽象（Go2Cpp 提供通用机制，JinShan 填协议）。
+
+**你会被拒绝的情况**（Go2Cpp 会回「不做」）：
+- 要求实现 RDRL 协议本身（type 1-9 的语义）；
+- 要求封装 IRDPSRAPI / Win32 UI；
+- 要求实现 JinShan 的错误码表（只提供通用 Error 体系）；
+- 要求「按 JinShan 的业务流程定制」的接口。
+
+**你能得到的情况**：
+- 通用能力（已有：并发/网络/缓存/错误/Go API）；
+- 通用抽象（新增：FrameCodec/Hub/RelayPipe——机制通用，语义你填）。
+
 ## 硬性约束（必须遵守）
 
 1. **接口保持 Go 风格**（`net.Conn`/`sync.Mutex`/`chan`/`context`/`error`）——JinShan 的 Go 代码要能「几乎不改」就迁移；

@@ -35,6 +35,18 @@ collab/
 ④ 双方在 acceptance.md 记录验收（测试/数据）
 ```
 
+## 四、原则（★ 最重要：只做通用层）
+
+**Go2Cpp 只做「通用层」——拒绝不通用的要求。**
+
+| 类别 | 谁做 | 例子 |
+|---|---|---|
+| **通用** | **Go2Cpp** | 并发/网络/缓存/错误/序列化/Go API/有界队列/背压/超时/连接池/限流 |
+| **专属** | **JinShan** | RDRL 帧语义（type 1-9）、IRDPSRAPI、invitation 改写、命令白名单、业务状态机 |
+| **可抽象** | **Go2Cpp 提供机制，JinShan 填语义** | FrameCodec（length-prefix+CRC32）/Hub（配对注册）/RelayPipe（背压+慢 peer） |
+
+判定：「别的项目（游戏/AI 推理/IM）会用吗？」——会→通用；不会→专属；机制会语义不会→抽象。
+
 ## 四、原则
 
 - **Go 标准库没有的，Go2Cpp 补**（如缓存 7 策略、P2P 穿透、Relay 协议、Fiber 调度）；
