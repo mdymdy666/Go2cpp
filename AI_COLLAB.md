@@ -591,3 +591,28 @@ errno noinline），不是寄存器保存。
   - 压测：P2P 内存回环 1e7 包 222.7 → 134.1 ns/包（-40%）；UDP 1e7 包 215.7k pps、
     丢包 0.017%、零损坏；PeerHub `sendto` -5.6%、48 次 `sendmmsg`；1 GiB 资源 +14.8%。
 - **状态**：完成，未提交（多 agent 共享工作树）。报告：`/tmp/batch2_opt.md`。
+
+## 2026-10-31 · app 层汇编级审查与优化（流表/帧/资源/KV）
+
+- **改动内容**
+  - `StreamTable`：`PickNext` 从「每帧两遍全表遍历 + 父链 `map::find`」改为
+    **就绪最小堆（按 `(finish,id)`）+ 待补产列表 `m_idle`**；`Stream` 增加
+    `ready_slot/producer_slot/idle_slot` 三个 O(1) 索引；`ConsumePending`/`Requeue`
+    成为发送完成/回滚的正式 API（清 pending 但保留 payload 容量）。
+  - `LiveStreamCount` O(N)→O(1) 计数器；`PruneClosedStreams` 每 Step O(1) 早退 +
+    关闭顺序 FIFO 懒删除（不再每轮全表扫描 + vector + sort）。
+  - `Frame`：新增借用视图 `view/view_bytes` 与 `Size()/Bytes()`；新增
+    `DecodeFrameView` + `FrameDecoder::NextView`（零拷贝）；`Connection::Step` 改用
+    `NextView` 并以 `m_in_handle` 禁止事件回调重入解码器；`WriteFrame` 复用
+    `m_write_buffer`（稳态 0 分配）。
+  - 资源/KV：`ResourceReceiver::OnData` 整块直通（省一次整块 memcpy，新增
+    `CommitChunk`）；`KvTable::ToBinaryInto` 让 HEADERS 复用 payload 容量。
+- **关键文件**：`include/go2cpp/app/{stream_table,frame,connection,kv,resource}.hpp`、
+  `src/app/{stream_table,frame,connection,kv,kv_stream,resource}.cpp`、
+  `tests/app/app_test_stream_table.cpp`（适配 `ConsumePending`）。
+- **测试**：8 个 app 可执行文件全过（63 场景；frame 21100 / stream_table 335 / kv 98 /
+  connection 180 / resource 174 / bento 25 / http 29 / load 2328 checks）；ASan 全过。
+- **数据**：`PickNext` 256 流 2553 → 124 ns/帧（20.6x）；端到端 KV 512 流
+  7.7 → 2.5–3.1 µs/流；1e8 帧压测 124 ns/帧 / 12.4 s / 8.1 Mfps / RSS 4 MiB；
+  1 GiB 资源（SHA-256 校验）268 MiB/s 不变（SHA 主导）；资源生产 +6%。
+- **状态**：完成，未提交（多 agent 共享工作树）。报告：`/tmp/asm_app.md`。

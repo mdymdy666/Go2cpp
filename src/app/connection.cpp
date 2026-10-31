@@ -176,6 +176,8 @@ Connection::Connection(TransportPtr transport, Role role, ConnectionConfig confi
         m_config.read_chunk_bytes = 64u * 1024u;
     }
     m_read_buffer.resize(std::max<std::size_t>(4096, m_config.read_chunk_bytes));
+    m_write_buffer.reserve(static_cast<std::size_t>(m_config.max_frame_payload) +
+                           kFrameHeaderBytes);
     m_last_ping_ms = NowMs();
 }
 
@@ -271,16 +273,17 @@ bool Connection::WriteFrame(const Frame& frame) {
     if (m_closed || m_transport == nullptr) {
         return false;
     }
-    std::vector<std::uint8_t> bytes = EncodeFrame(frame);
-    if (bytes.empty()) {
+    // 复用成员缓冲：稳态下这里 0 分配（原来每帧一次 EncodeFrame 分配 + 拷贝）。
+    m_write_buffer.clear();
+    if (!AppendEncodedFrame(frame, &m_write_buffer)) {
         return false;
     }
-    if (!m_transport->WriteAll(bytes.data(), bytes.size())) {
+    if (!m_transport->WriteAll(m_write_buffer.data(), m_write_buffer.size())) {
         FailConnection(ErrorCode::kInternalError, "transport write failed");
         return false;
     }
     ++m_stats.frames_sent;
-    m_stats.bytes_sent += frame.payload.size();
+    m_stats.bytes_sent += frame.Size();
     return true;
 }
 
@@ -328,6 +331,11 @@ bool Connection::Start(std::string* error) {
 
 int Connection::Step(std::uint32_t timeout_ms) {
     std::lock_guard<std::recursive_mutex> lock(m_io_mutex);
+    if (m_in_handle) {
+        // 事件回调里重入 Step：此时当前帧的载荷是解码缓冲的借用视图，
+        // 追加数据会让它失效，直接拒绝（回调返回后下一轮 Step 照常推进）。
+        return 0;
+    }
     if (m_closed) {
         return -1;
     }
@@ -342,7 +350,7 @@ int Connection::Step(std::uint32_t timeout_ms) {
     auto drain = [this, &processed, max_frames] {
         while (processed < max_frames) {
             Frame frame;
-            const FrameStatus status = m_decoder.Next(&frame);
+            const FrameStatus status = m_decoder.NextView(&frame);
             if (status == FrameStatus::kNeedMoreData) {
                 break;
             }
@@ -353,7 +361,9 @@ int Connection::Step(std::uint32_t timeout_ms) {
                 return false;
             }
             ++m_stats.frames_received;
+            m_in_handle = true;
             HandleFrame(frame);
+            m_in_handle = false;
             ++processed;
             if (m_closed) {
                 return false;
@@ -516,28 +526,32 @@ void Connection::FlushLocked() {
         if (stream == nullptr) {
             break;
         }
-        Frame frame = std::move(*stream->pending);
-        stream->pending.reset();
-        const std::size_t bytes = frame.payload.size();
-        if (frame.type == FrameType::kData && bytes > 0 &&
+        // 零拷贝：直接用流上的 pending 缓冲（不再 move 出来再 reset）。
+        Frame& frame = stream->pending;
+        const std::size_t bytes = frame.Size();
+        const FrameType frame_type = frame.type;
+        const bool end_stream = frame.EndStream();
+        if (frame_type == FrameType::kData && bytes > 0 &&
             !m_table.ConsumeSend(*stream, bytes)) {
             // 理论上 PickNext 已保证窗口足够；并发更新导致回退时重排。
-            stream->pending = std::move(frame);
+            m_table.Requeue(*stream);
             ++m_stats.flow_control_blocks;
             break;
         }
         if (!WriteFrame(frame)) {
             break;
         }
+        // 帧已写出：清空 pending 但保留 payload 容量，下一帧生产零分配。
+        m_table.ConsumePending(*stream);
         bool ok = true;
-        if (frame.type == FrameType::kData) {
-            ok = m_table.SendData(*stream, bytes, frame.EndStream());
-        } else if (frame.type == FrameType::kHeaders) {
-            ok = m_table.SendHeaders(*stream, frame.EndStream());
+        if (frame_type == FrameType::kData) {
+            ok = m_table.SendData(*stream, bytes, end_stream);
+        } else if (frame_type == FrameType::kHeaders) {
+            ok = m_table.SendHeaders(*stream, end_stream);
         } else {
             m_table.ChargeFinish(*stream, bytes);
         }
-        if (frame.type == FrameType::kData) {
+        if (frame_type == FrameType::kData) {
             m_table.ChargeFinish(*stream, bytes);
         }
         ++m_stats.flush_rounds;
@@ -560,7 +574,7 @@ void Connection::FlushLocked() {
         } else {
             budget -= bytes;
         }
-        if (frame.EndStream() && stream->closed()) {
+        if (end_stream && stream->closed()) {
             const std::uint32_t id = stream->id;
             CleanupStream(id);
         }
@@ -591,7 +605,7 @@ void Connection::SendPendingPingLocked(std::uint64_t now_ms) {
 // ---------------------------------------------------------------------------
 
 void Connection::HandleFrame(const Frame& frame) {
-    m_stats.bytes_received += frame.payload.size();
+    m_stats.bytes_received += frame.Size();
     switch (frame.type) {
         case FrameType::kHeaders:
             HandleHeaders(frame);
@@ -630,7 +644,7 @@ void Connection::HandleHeaders(const Frame& frame) {
     }
     KvTable table;
     std::string error;
-    if (!KvTable::ParseBinary(frame.payload.data(), frame.payload.size(), &table,
+    if (!KvTable::ParseBinary(frame.Bytes(), frame.Size(), &table,
                               &error)) {
         Frame rst;
         rst.type = FrameType::kRstStream;
@@ -794,7 +808,7 @@ void Connection::HandleData(const Frame& frame) {
         return;
     }
     const std::uint32_t id = stream->id;
-    const std::size_t bytes = frame.payload.size();
+    const std::size_t bytes = frame.Size();
     if (!m_table.ReceiveData(*stream, bytes, frame.EndStream())) {
         FailConnection(ErrorCode::kFlowControlError,
                        "flow control violation on stream " + std::to_string(id));
@@ -822,7 +836,7 @@ void Connection::HandleData(const Frame& frame) {
                 return;
             }
             std::string error;
-            if (!it->second->OnData(frame.payload.data(), bytes, &error)) {
+            if (!it->second->OnData(frame.Bytes(), bytes, &error)) {
                 Event event;
                 event.type = EventType::kError;
                 event.stream_id = id;
@@ -884,7 +898,7 @@ void Connection::HandleData(const Frame& frame) {
                 return;
             }
             std::string error;
-            if (!it->second->OnData(frame.payload.data(), bytes, &error)) {
+            if (!it->second->OnData(frame.Bytes(), bytes, &error)) {
                 Event event;
                 event.type = EventType::kResourceComplete;
                 event.stream_id = id;
@@ -940,7 +954,7 @@ void Connection::HandleData(const Frame& frame) {
             Event event;
             event.type = EventType::kData;
             event.stream_id = id;
-            event.data = frame.payload;
+            event.data.assign(frame.Bytes(), frame.Bytes() + bytes);
             event.bytes = bytes;
             Publish(std::move(event));
             if (m_config.auto_window_update) {
@@ -973,7 +987,7 @@ void Connection::HandleRstStream(const Frame& frame) {
         return;
     }
     ErrorCode code = ErrorCode::kNoError;
-    if (!DecodeRstStream(frame.payload.data(), frame.payload.size(), &code)) {
+    if (!DecodeRstStream(frame.Bytes(), frame.Size(), &code)) {
         FailConnection(ErrorCode::kFrameSizeError, "invalid RST_STREAM payload");
         return;
     }
@@ -996,7 +1010,7 @@ void Connection::HandleSettings(const Frame& frame) {
         return;
     }
     if (frame.HasFlag(kFlagAck)) {
-        if (!frame.payload.empty()) {
+        if (!frame.Empty()) {
             FailConnection(ErrorCode::kFrameSizeError, "SETTINGS ACK with payload");
             return;
         }
@@ -1008,7 +1022,7 @@ void Connection::HandleSettings(const Frame& frame) {
         return;
     }
     std::vector<SettingsEntry> entries;
-    if (!DecodeSettings(frame.payload.data(), frame.payload.size(), &entries)) {
+    if (!DecodeSettings(frame.Bytes(), frame.Size(), &entries)) {
         FailConnection(ErrorCode::kFrameSizeError, "invalid SETTINGS payload");
         return;
     }
@@ -1070,7 +1084,7 @@ void Connection::HandlePing(const Frame& frame) {
         return;
     }
     std::array<std::uint8_t, 8> opaque{};
-    if (!DecodePing(frame.payload.data(), frame.payload.size(), &opaque)) {
+    if (!DecodePing(frame.Bytes(), frame.Size(), &opaque)) {
         FailConnection(ErrorCode::kFrameSizeError, "invalid PING payload");
         return;
     }
@@ -1097,7 +1111,7 @@ void Connection::HandleGoAway(const Frame& frame) {
     std::uint32_t last_stream_id = 0;
     ErrorCode code = ErrorCode::kNoError;
     std::string debug;
-    if (!DecodeGoAway(frame.payload.data(), frame.payload.size(), &last_stream_id, &code,
+    if (!DecodeGoAway(frame.Bytes(), frame.Size(), &last_stream_id, &code,
                       &debug)) {
         FailConnection(ErrorCode::kFrameSizeError, "invalid GOAWAY payload");
         return;
@@ -1113,7 +1127,7 @@ void Connection::HandleGoAway(const Frame& frame) {
 
 void Connection::HandleWindowUpdate(const Frame& frame) {
     std::uint32_t increment = 0;
-    if (!DecodeWindowUpdate(frame.payload.data(), frame.payload.size(), &increment)) {
+    if (!DecodeWindowUpdate(frame.Bytes(), frame.Size(), &increment)) {
         FailConnection(ErrorCode::kFrameSizeError, "invalid WINDOW_UPDATE payload");
         return;
     }
@@ -1136,7 +1150,7 @@ void Connection::HandlePriority(const Frame& frame) {
     }
     std::uint32_t parent = 0;
     std::uint16_t weight = 16;
-    if (!DecodePriority(frame.payload.data(), frame.payload.size(), &parent, &weight)) {
+    if (!DecodePriority(frame.Bytes(), frame.Size(), &parent, &weight)) {
         FailConnection(ErrorCode::kFrameSizeError, "invalid PRIORITY payload");
         return;
     }
@@ -1151,7 +1165,7 @@ void Connection::HandleResourceIndex(const Frame& frame) {
     }
     ResourceIndex index;
     std::string error;
-    if (!ResourceIndex::Decode(frame.payload.data(), frame.payload.size(), &index,
+    if (!ResourceIndex::Decode(frame.Bytes(), frame.Size(), &index,
                                &error)) {
         Event event;
         event.type = EventType::kError;

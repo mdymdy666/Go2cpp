@@ -662,12 +662,27 @@ bool ResourceReceiver::OnData(const std::uint8_t* payload, std::size_t size,
         SetError(error, m_error);
         return false;
     }
+    if (offset == 0 && m_chunk_buffer.empty() &&
+        data_bytes == static_cast<std::size_t>(expected)) {
+        // 整块直通：块头与整块数据在同一段载荷里，直接校验/落盘/哈希，
+        // 省掉一次整块 memcpy（1 GiB 资源就是省 1 GiB 的搬运）。
+        return CommitChunk(index, data, data_bytes, crc, error);
+    }
     m_chunk_buffer.insert(m_chunk_buffer.end(), data, data + data_bytes);
     if (m_chunk_buffer.size() != expected) {
         return true;
     }
-    // 块完整：先校验 CRC，再落盘 + 更新哈希，坏块不污染 sink。
-    const std::uint32_t actual = Crc32Of(m_chunk_buffer.data(), m_chunk_buffer.size());
+    // 碎块拼满：先校验 CRC，再落盘 + 更新哈希，坏块不污染 sink。
+    const bool committed =
+        CommitChunk(index, m_chunk_buffer.data(), m_chunk_buffer.size(), crc, error);
+    m_chunk_buffer.clear();
+    return committed;
+}
+
+bool ResourceReceiver::CommitChunk(std::uint32_t index, const std::uint8_t* data,
+                                   std::size_t size, std::uint32_t crc,
+                                   std::string* error) {
+    const std::uint32_t actual = Crc32Of(data, size);
     if (actual != crc) {
         ++m_stats.crc_failures;
         m_error = "resource chunk crc mismatch at " + std::to_string(index) + ": " +
@@ -675,21 +690,18 @@ bool ResourceReceiver::OnData(const std::uint8_t* payload, std::size_t size,
         SetError(error, m_error);
         return false;
     }
-    const std::uint64_t absolute =
-        m_meta.ChunkOffset(index);
-    if (!m_sink->Write(absolute, m_chunk_buffer.data(), m_chunk_buffer.size())) {
+    const std::uint64_t absolute = m_meta.ChunkOffset(index);
+    if (!m_sink->Write(absolute, data, size)) {
         m_error = "resource sink write failed at chunk " + std::to_string(index);
         SetError(error, m_error);
         return false;
     }
     if (!m_partial || index >= m_start_chunk) {
-        m_sha->sha.Write(go2cpp::hash::AsBytes(m_chunk_buffer.data(),
-                                               m_chunk_buffer.size()));
+        m_sha->sha.Write(go2cpp::hash::AsBytes(data, size));
     }
-    m_stats.bytes += m_chunk_buffer.size();
+    m_stats.bytes += size;
     ++m_stats.chunks;
     ++m_completed_chunks;
-    m_chunk_buffer.clear();
     return true;
 }
 
@@ -812,14 +824,15 @@ bool ResourceProducer::BuildHeaders(std::uint32_t max_payload, Frame* out) {
     if (m_start_chunk != 0) {
         table.Set("app.resume", std::to_string(m_start_chunk));
     }
-    std::vector<std::uint8_t> payload = table.ToBinary();
-    if (payload.size() > max_payload || payload.size() > kMaxFramePayloadLimit) {
+    table.ToBinaryInto(&out->payload);
+    if (out->payload.size() > max_payload ||
+        out->payload.size() > kMaxFramePayloadLimit) {
+        out->payload.clear();
         m_done = true;
         return false;
     }
     out->type = FrameType::kHeaders;
     out->flags = kFlagEndHeaders;
-    out->payload = std::move(payload);
     m_headers_sent = true;
     if (m_empty || m_meta.chunk_count == 0) {
         out->flags = static_cast<std::uint8_t>(out->flags | kFlagEndStream);

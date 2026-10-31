@@ -419,7 +419,12 @@ class ResourceReceiver {
     const std::string& sha256_hex() const noexcept { return m_stats.sha256_hex; }
 
    private:
-    bool FlushChunk(std::string* error);
+    /**
+     * @brief 提交一个完整块：CRC 校验 → 落盘 → 更新 SHA-256 与统计。
+     * @param data 整块数据（可以是中间缓冲，也可以直接是帧载荷——整块直通）。
+     */
+    bool CommitChunk(std::uint32_t index, const std::uint8_t* data,
+                     std::size_t size, std::uint32_t crc, std::string* error);
 
     ResourceMeta m_meta;                            ///< 元数据。
     std::unique_ptr<ResourceSink> m_sink;           ///< 落点。

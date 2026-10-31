@@ -84,9 +84,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -182,17 +182,25 @@ struct Stream {
     std::int64_t finish = 0;                   ///< WFQ 虚拟完成时间。
 
     FrameProducerPtr producer;                 ///< 发送源。
-    std::optional<Frame> pending;              ///< 已生产未发出的帧。
+    Frame pending;                             ///< 已生产未发出的帧（缓冲复用）。
+    bool has_pending = false;                  ///< pending 是否有效。
+
+    /// @brief 内部索引哨兵：不在对应容器里。
+    static constexpr std::uint32_t kNoSlot = 0xFFFFFFFFu;
+
+    std::uint32_t ready_slot = kNoSlot;        ///< ready 堆内下标（流表维护）。
+    std::uint32_t producer_slot = kNoSlot;     ///< 生产者列表内下标（流表维护）。
+    std::uint32_t idle_slot = kNoSlot;         ///< 待补产列表内下标（流表维护）。
 
     /// @brief 已打开（不是 idle/closed）。
     bool active() const noexcept { return opened && state != StreamState::kClosed; }
     /// @brief 是否已关闭。
     bool closed() const noexcept { return state == StreamState::kClosed; }
     /// @brief 是否还有未发送的帧。
-    bool has_pending() const noexcept { return pending.has_value(); }
+    bool has_pending_frame() const noexcept { return has_pending; }
     /// @brief 待发帧的载荷字节数。
     std::uint32_t pending_bytes() const noexcept {
-        return pending.has_value() ? pending->Length() : 0u;
+        return has_pending ? pending.Length() : 0u;
     }
     /// @brief 当前状态是否允许发送。
     bool can_send() const noexcept {
@@ -313,6 +321,16 @@ class StreamTable {
     /// @brief 扣除一条 DATA 帧的发送窗口与统计（发送成功后调用）。
     bool ConsumeSend(Stream& stream, std::size_t bytes) noexcept;
 
+    /**
+     * @brief 取走并清空流的待发帧（发送成功后调用）。
+     * @details 释放 `has_pending` 并移出 ready 堆，**保留 payload 缓冲容量**，
+     *          下一帧生产时零分配复用。这是热路径「每帧零 malloc」的关键。
+     */
+    void ConsumePending(Stream& stream) noexcept;
+
+    /// @brief 把流重新放回 ready 堆（发送回滚等罕见路径用）。
+    void Requeue(Stream& stream) noexcept;
+
     /// @brief WFQ 信用推进（发送成功后调用，参数为已发字节）。
     void ChargeFinish(Stream& stream, std::size_t bytes) noexcept;
 
@@ -403,6 +421,7 @@ class StreamTable {
     /// @brief 重置统计（不影响流）。
     void ResetStats() noexcept;
 
+
    private:
     void RefreshState(Stream& stream) noexcept;
     bool HasReadyAncestor(const Stream& stream) const noexcept;
@@ -412,8 +431,29 @@ class StreamTable {
     void RecordCreated();
     std::size_t LiveStreamCount() const noexcept;
 
+    // ---- ready 最小堆（按 (finish, id)）与生产者索引 ----
+    void HeapSwap(std::size_t a, std::size_t b) noexcept;
+    void SiftUp(std::size_t i) noexcept;
+    void SiftDown(std::size_t i) noexcept;
+    void PushReady(Stream& stream) noexcept;
+    void RemoveReady(Stream& stream) noexcept;
+    void RefillReady(std::uint32_t max_payload);
+    void AddProducer(Stream& stream) noexcept;
+    void RemoveProducerAt(std::size_t index) noexcept;
+    void AddIdle(Stream& stream) noexcept;
+    void RemoveIdleAt(std::size_t index) noexcept;
+    void DrainIdle(std::uint32_t max_payload);
+    void DetachIndexes(Stream& stream) noexcept;
+
     StreamTableConfig m_config;              ///< 配置。
     StreamMap m_streams;                     ///< 流表。
+    std::vector<Stream*> m_ready;            ///< ready 最小堆（就绪流，仅堆内有效）。
+    std::vector<Stream*> m_producers;        ///< 挂有发送源的流（生产候选）。
+    std::vector<Stream*> m_idle;             ///< 无待发帧、等待补产的流（通常 1 条）。
+    std::vector<Stream*> m_held;             ///< PickNext 的父优先暂存（复用）。
+    bool m_refill_hint = true;               ///< 连接级窗口恢复后提示 refill 一次。
+    std::deque<std::uint32_t> m_closed_order;///< 关闭顺序（O(1) 淘汰）。
+    std::size_t m_live_streams = 0;          ///< 非 closed 流计数。
     std::uint32_t m_next_local_id = 1;       ///< 下一个本端流 id。
     std::uint32_t m_last_local_id = 0;       ///< 最近分配的本端流 id。
     std::int64_t m_conn_send_window = 0;     ///< 连接级发送窗口。

@@ -150,14 +150,184 @@ std::uint32_t StreamTable::AllocateLocalId() {
     return id;
 }
 
-std::size_t StreamTable::LiveStreamCount() const noexcept {
-    std::size_t count = 0;
-    for (const auto& item : m_streams) {
-        if (item.second->state != StreamState::kClosed) {
-            ++count;
+std::size_t StreamTable::LiveStreamCount() const noexcept { return m_live_streams; }
+
+// ---------------------------------------------------------------------------
+// ready 最小堆（按 (finish, id) 排序）+ 生产者索引
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// @brief ready 堆比较：finish 小者优先，同 finish 按 id 升序（确定性）。
+bool ReadyBefore(const Stream& a, const Stream& b) noexcept {
+    if (a.finish != b.finish) {
+        return a.finish < b.finish;
+    }
+    return a.id < b.id;
+}
+
+}  // namespace
+
+void StreamTable::HeapSwap(std::size_t a, std::size_t b) noexcept {
+    Stream* tmp = m_ready[a];
+    m_ready[a] = m_ready[b];
+    m_ready[b] = tmp;
+    m_ready[a]->ready_slot = static_cast<std::uint32_t>(a);
+    m_ready[b]->ready_slot = static_cast<std::uint32_t>(b);
+}
+
+void StreamTable::SiftUp(std::size_t i) noexcept {
+    while (i > 0) {
+        const std::size_t parent = (i - 1) / 2;
+        if (!ReadyBefore(*m_ready[i], *m_ready[parent])) {
+            return;
+        }
+        HeapSwap(i, parent);
+        i = parent;
+    }
+}
+
+void StreamTable::SiftDown(std::size_t i) noexcept {
+    const std::size_t count = m_ready.size();
+    while (true) {
+        const std::size_t left = i * 2 + 1;
+        if (left >= count) {
+            return;
+        }
+        std::size_t best = left;
+        const std::size_t right = left + 1;
+        if (right < count && ReadyBefore(*m_ready[right], *m_ready[left])) {
+            best = right;
+        }
+        if (!ReadyBefore(*m_ready[best], *m_ready[i])) {
+            return;
+        }
+        HeapSwap(i, best);
+        i = best;
+    }
+}
+
+void StreamTable::PushReady(Stream& stream) noexcept {
+    if (stream.ready_slot != Stream::kNoSlot) {
+        return;  // 已在堆中（幂等）。
+    }
+    stream.ready_slot = static_cast<std::uint32_t>(m_ready.size());
+    m_ready.push_back(&stream);
+    SiftUp(m_ready.size() - 1);
+}
+
+void StreamTable::RemoveReady(Stream& stream) noexcept {
+    if (stream.ready_slot == Stream::kNoSlot) {
+        return;
+    }
+    const std::size_t index = stream.ready_slot;
+    stream.ready_slot = Stream::kNoSlot;
+    const std::size_t last = m_ready.size() - 1;
+    if (index == last) {
+        m_ready.pop_back();
+        return;
+    }
+    m_ready[index] = m_ready[last];
+    m_ready[index]->ready_slot = static_cast<std::uint32_t>(index);
+    m_ready.pop_back();
+    SiftUp(index);
+    SiftDown(index);
+}
+
+void StreamTable::AddProducer(Stream& stream) noexcept {
+    if (stream.producer_slot != Stream::kNoSlot) {
+        return;
+    }
+    stream.producer_slot = static_cast<std::uint32_t>(m_producers.size());
+    m_producers.push_back(&stream);
+}
+
+void StreamTable::RemoveProducerAt(std::size_t index) noexcept {
+    if (index >= m_producers.size()) {
+        return;
+    }
+    Stream* victim = m_producers[index];
+    victim->producer_slot = Stream::kNoSlot;
+    const std::size_t last = m_producers.size() - 1;
+    if (index != last) {
+        m_producers[index] = m_producers[last];
+        m_producers[index]->producer_slot = static_cast<std::uint32_t>(index);
+    }
+    m_producers.pop_back();
+}
+
+void StreamTable::DetachIndexes(Stream& stream) noexcept {
+    RemoveReady(stream);
+    if (stream.idle_slot != Stream::kNoSlot) {
+        RemoveIdleAt(stream.idle_slot);
+    }
+    if (stream.producer_slot != Stream::kNoSlot) {
+        RemoveProducerAt(stream.producer_slot);
+    }
+}
+
+void StreamTable::AddIdle(Stream& stream) noexcept {
+    if (stream.idle_slot != Stream::kNoSlot) {
+        return;  // 已在待补产列表里（幂等）。
+    }
+    stream.idle_slot = static_cast<std::uint32_t>(m_idle.size());
+    m_idle.push_back(&stream);
+}
+
+void StreamTable::RemoveIdleAt(std::size_t index) noexcept {
+    if (index >= m_idle.size()) {
+        return;
+    }
+    Stream* victim = m_idle[index];
+    victim->idle_slot = Stream::kNoSlot;
+    const std::size_t last = m_idle.size() - 1;
+    if (index != last) {
+        m_idle[index] = m_idle[last];
+        m_idle[index]->idle_slot = static_cast<std::uint32_t>(index);
+    }
+    m_idle.pop_back();
+}
+
+void StreamTable::DrainIdle(std::uint32_t max_payload) {
+    // 为「没有待发帧」的流各补产一帧。稳态下这里只有刚发完的那一条，
+    // 因此摊到每帧就是 O(1)；窗口不足的流会留在列表里下轮再试。
+    std::size_t i = 0;
+    while (i < m_idle.size()) {
+        Stream* stream = m_idle[i];
+        if (stream->closed() || stream->producer_done || !stream->producer) {
+            RemoveIdleAt(i);
+            continue;
+        }
+        if (!stream->has_pending) {
+            FillPending(*stream, max_payload);  // 成功时内部入堆。
+        }
+        if (stream->has_pending || stream->producer_done) {
+            RemoveIdleAt(i);
+        } else {
+            ++i;
         }
     }
-    return count;
+}
+
+void StreamTable::RefillReady(std::uint32_t max_payload) {
+    m_refill_hint = false;
+    DrainIdle(max_payload);
+    for (std::size_t i = 0; i < m_producers.size();) {
+        Stream* stream = m_producers[i];
+        // 已有待发帧的先入堆：生产者结束（producer_done）的流也可能还剩最后
+        // 一帧没发出去（窗口不足时「生产完就结束」），不能连带 pending 一起丢。
+        if (stream->has_pending && IsReady(*stream)) {
+            PushReady(*stream);  // 窗口恢复：把已有待发帧的流重新入堆。
+        }
+        // 只有「生产者结束且没有待发帧」才算真正做完；producer_done 但仍卡着
+        // 最后一帧（窗口不足）的流必须留在候选里，等窗口恢复后重新入堆。
+        if (stream->closed() || !stream->producer ||
+            (stream->producer_done && !stream->has_pending)) {
+            RemoveProducerAt(i);  // 已结束：从候选里摘除（O(1) swap-remove）。
+            continue;
+        }
+        ++i;
+    }
 }
 
 Stream* StreamTable::CreateLocal(StreamKind kind, FrameProducerPtr producer,
@@ -188,7 +358,12 @@ Stream* StreamTable::CreateLocal(StreamKind kind, FrameProducerPtr producer,
     stream->producer = std::move(producer);
     Stream* raw = stream.get();
     m_streams.emplace(id, std::move(stream));
+    ++m_live_streams;
     RecordCreated();
+    if (raw->producer) {
+        AddProducer(*raw);
+        AddIdle(*raw);  // 首次调度前需要生产 HEADERS。
+    }
     return raw;
 }
 
@@ -217,6 +392,7 @@ Stream* StreamTable::CreateRemote(std::uint32_t id, StreamKind kind,
     stream->opened_at_ms = NowMs();
     Stream* raw = stream.get();
     m_streams.emplace(id, std::move(stream));
+    ++m_live_streams;
     RecordCreated();
     return raw;
 }
@@ -236,11 +412,35 @@ bool StreamTable::Erase(std::uint32_t id) noexcept {
     if (it == m_streams.end()) {
         return false;
     }
+    Stream& stream = *it->second;
+    if (stream.state != StreamState::kClosed && m_live_streams > 0) {
+        --m_live_streams;
+    }
+    DetachIndexes(stream);
     m_streams.erase(it);
     return true;
 }
 
 void StreamTable::RecordCreated() { ++m_total_created; }
+
+namespace {
+
+/// @brief 把流标记为 closed 并记账（幂等；只在真正转变时计数）。
+void MarkClosedLocked(Stream& stream, std::size_t* live, std::uint64_t* total_closed,
+                      std::deque<std::uint32_t>* closed_order, std::uint64_t now_ms) {
+    if (stream.state == StreamState::kClosed) {
+        return;
+    }
+    stream.state = StreamState::kClosed;
+    stream.closed_at_ms = now_ms;
+    ++(*total_closed);
+    if (*live > 0) {
+        --(*live);
+    }
+    closed_order->push_back(stream.id);
+}
+
+}  // namespace
 
 void StreamTable::RefreshState(Stream& stream) noexcept {
     if (!stream.opened) {
@@ -248,11 +448,7 @@ void StreamTable::RefreshState(Stream& stream) noexcept {
         return;
     }
     if (stream.local_closed && stream.remote_closed) {
-        if (stream.state != StreamState::kClosed) {
-            stream.closed_at_ms = NowMs();
-            ++m_total_closed;
-        }
-        stream.state = StreamState::kClosed;
+        MarkClosedLocked(stream, &m_live_streams, &m_total_closed, &m_closed_order, NowMs());
         return;
     }
     if (stream.local_closed) {
@@ -267,11 +463,7 @@ void StreamTable::RefreshState(Stream& stream) noexcept {
 }
 
 void StreamTable::MarkClosed(Stream& stream) noexcept {
-    if (stream.state != StreamState::kClosed) {
-        stream.state = StreamState::kClosed;
-        stream.closed_at_ms = NowMs();
-        ++m_total_closed;
-    }
+    MarkClosedLocked(stream, &m_live_streams, &m_total_closed, &m_closed_order, NowMs());
     stream.local_closed = true;
     stream.remote_closed = true;
 }
@@ -375,10 +567,21 @@ bool StreamTable::Close(Stream& stream) noexcept {
 void StreamTable::AttachProducer(Stream& stream, FrameProducerPtr producer) noexcept {
     stream.producer = std::move(producer);
     stream.producer_done = false;
+    if (stream.producer) {
+        AddProducer(stream);
+        if (!stream.has_pending) {
+            AddIdle(stream);
+        }
+    } else if (stream.producer_slot != Stream::kNoSlot) {
+        RemoveProducerAt(stream.producer_slot);
+    }
 }
 
 bool StreamTable::FillPending(Stream& stream, std::uint32_t max_payload) {
-    if (stream.pending.has_value()) {
+    if (stream.has_pending) {
+        if (IsReady(stream)) {
+            PushReady(stream);
+        }
         return true;
     }
     if (!stream.producer || stream.producer_done) {
@@ -404,40 +607,45 @@ bool StreamTable::FillPending(Stream& stream, std::uint32_t max_payload) {
             return false;
         }
     }
-    Frame frame;
+    // 复用 pending 的缓冲：稳态下这里的 payload 已有足够容量，不再分配。
+    Frame& frame = stream.pending;
+    frame.Clear();
     if (!stream.producer->Produce(allowed, &frame)) {
         if (stream.producer->done()) {
             stream.producer_done = true;
         }
         return false;
     }
-    if (frame.payload.size() > kMaxFramePayloadLimit ||
-        frame.payload.size() > limit) {
+    if (frame.Size() > kMaxFramePayloadLimit || frame.Size() > limit) {
         // 生产者违约：不把非法帧放进调度器。
+        frame.Clear();
         stream.producer_done = true;
         return false;
     }
     frame.stream_id = stream.id;
-    stream.pending = std::move(frame);
+    stream.has_pending = true;
     if (stream.producer->done()) {
         stream.producer_done = true;
+    }
+    if (IsReady(stream)) {
+        PushReady(stream);
     }
     return true;
 }
 
 bool StreamTable::IsReady(const Stream& stream) const noexcept {
-    if (!stream.pending.has_value()) {
+    if (!stream.has_pending) {
         return false;
     }
-    const Frame& frame = *stream.pending;
+    const Frame& frame = stream.pending;
     if (frame.type != FrameType::kData) {
         return true;
     }
-    if (frame.payload.empty()) {
+    if (frame.Empty()) {
         return true;  // 空 DATA（结束确认）不占窗口。
     }
     const std::int64_t window = SendWindow(stream);
-    return window >= static_cast<std::int64_t>(frame.payload.size());
+    return window >= static_cast<std::int64_t>(frame.Size());
 }
 
 bool StreamTable::HasReadyAncestor(const Stream& stream) const noexcept {
@@ -458,34 +666,44 @@ bool StreamTable::HasReadyAncestor(const Stream& stream) const noexcept {
 }
 
 Stream* StreamTable::PickNext(std::uint32_t max_payload) {
-    // 第一遍：给所有可发送流准备一帧（窗口不足时会跳过）。
-    for (auto& item : m_streams) {
-        Stream& stream = *item.second;
-        if (!stream.pending.has_value()) {
-            FillPending(stream, max_payload);
-        }
+    // 1) 补产：给「上一帧刚发完」的流准备下一帧（稳态只有 1 条 → O(1)）。
+    //    这一步让 ready 堆里始终包含全部「可发」的流，WFQ 才能按
+    //    finish 选到真正最小的那条，而不是被迫选堆里唯一剩下的。
+    // 2) 兜底：堆空或连接窗口刚恢复时做一次全量刷新（低频）。
+    if (!m_idle.empty()) {
+        DrainIdle(max_payload);
     }
-    // 第二遍：父优先 + WFQ。
+    if (m_ready.empty() || m_refill_hint) {
+        RefillReady(max_payload);
+    }
+    m_held.clear();
     Stream* best = nullptr;
-    for (auto& item : m_streams) {
-        Stream& stream = *item.second;
-        if (stream.opened && !stream.can_send()) {
+    while (!m_ready.empty()) {
+        Stream* stream = m_ready.front();
+        RemoveReady(*stream);
+        if (stream->opened && !stream->can_send()) {
+            continue;  // 已关闭/被重置：不再参与调度。
+        }
+        if (!IsReady(*stream)) {
+            // 窗口在入堆后被吃掉：等对端 WINDOW_UPDATE 后由 refill 重新入堆。
             continue;
         }
-        if (!IsReady(stream)) {
+        if (HasReadyAncestor(*stream)) {
+            m_held.push_back(stream);  // 父优先：本轮先让父流走。
             continue;
         }
-        if (HasReadyAncestor(stream)) {
-            continue;
-        }
-        if (best == nullptr) {
-            best = &stream;
-            continue;
-        }
-        if (stream.finish < best->finish ||
-            (stream.finish == best->finish && stream.id < best->id)) {
-            best = &stream;
-        }
+        best = stream;
+        break;
+    }
+    for (Stream* stream : m_held) {
+        PushReady(*stream);
+    }
+    m_held.clear();
+    if (best != nullptr) {
+        // 返回后流仍持有 pending（调用方可能还没写出）：保持在就绪堆里，
+        // 下一次 PickNext 仍能选中它——与原「每轮扫全表」的语义一致。
+        // 调用方写出帧后必须调 ConsumePending，届时才真正出堆。
+        PushReady(*best);
     }
     return best;
 }
@@ -493,7 +711,7 @@ Stream* StreamTable::PickNext(std::uint32_t max_payload) {
 bool StreamTable::HasWork() const noexcept {
     for (const auto& item : m_streams) {
         const Stream& stream = *item.second;
-        if (stream.pending.has_value()) {
+        if (stream.has_pending) {
             return true;
         }
         if ((!stream.opened || stream.can_send()) && stream.producer &&
@@ -519,7 +737,7 @@ std::size_t StreamTable::BlockedCount() const noexcept {
     for (const auto& item : m_streams) {
         const Stream& stream = *item.second;
         if ((!stream.opened || stream.can_send()) && stream.producer &&
-            !stream.producer_done && !stream.pending.has_value()) {
+            !stream.producer_done && !stream.has_pending) {
             ++count;
         }
     }
@@ -538,12 +756,31 @@ bool StreamTable::ConsumeSend(Stream& stream, std::size_t bytes) noexcept {
     return true;
 }
 
+void StreamTable::ConsumePending(Stream& stream) noexcept {
+    RemoveReady(stream);
+    stream.has_pending = false;
+    stream.pending.Clear();  // 保留 payload 容量供下一帧复用。
+    if (stream.producer && !stream.producer_done && !stream.closed()) {
+        AddIdle(stream);  // 下一帧的生产候选（由 PickNext 补产，保持 O(1)/帧）。
+    }
+}
+
+void StreamTable::Requeue(Stream& stream) noexcept {
+    if (IsReady(stream)) {
+        PushReady(stream);
+    }
+}
+
 void StreamTable::ChargeFinish(Stream& stream, std::size_t bytes) noexcept {
     if (bytes == 0) {
         return;
     }
     const std::uint32_t weight = std::max<std::uint16_t>(1, stream.weight);
     stream.finish += static_cast<std::int64_t>(bytes) * (1 << 20) / weight;
+    // 理论上发送后流已出堆；若调用方在其它时机推进信用，这里维持堆序。
+    if (stream.ready_slot != Stream::kNoSlot) {
+        SiftDown(stream.ready_slot);
+    }
 }
 
 std::int64_t StreamTable::SendWindow(const Stream& stream) const noexcept {
@@ -562,6 +799,8 @@ bool StreamTable::OnWindowUpdate(std::uint32_t stream_id, std::uint32_t incremen
             return false;
         }
         m_conn_send_window += static_cast<std::int64_t>(increment);
+        // 连接窗口恢复：被阻塞的流要重新参与生产/调度。
+        m_refill_hint = true;
         return true;
     }
     Stream* stream = Find(stream_id);
@@ -574,6 +813,9 @@ bool StreamTable::OnWindowUpdate(std::uint32_t stream_id, std::uint32_t incremen
         return false;
     }
     stream->send_window += static_cast<std::int64_t>(increment);
+    if (stream->has_pending && IsReady(*stream)) {
+        PushReady(*stream);  // 只重排这一条，不惊动全表。
+    }
     return true;
 }
 
@@ -600,6 +842,8 @@ bool StreamTable::SetInitialWindowSize(std::int64_t new_window, std::string* err
     if (m_conn_send_window < 0) {
         m_conn_send_window = 0;
     }
+    // 所有流窗口按同一 delta 变化：整体重新评估一次（低频事件）。
+    m_refill_hint = true;
     return true;
 }
 
@@ -706,7 +950,7 @@ std::size_t StreamTable::active_streams() const noexcept {
 std::size_t StreamTable::pending_streams() const noexcept {
     std::size_t count = 0;
     for (const auto& item : m_streams) {
-        if (item.second->pending.has_value()) {
+        if (item.second->has_pending) {
             ++count;
         }
     }
@@ -714,23 +958,24 @@ std::size_t StreamTable::pending_streams() const noexcept {
 }
 
 void StreamTable::PruneClosedStreams() {
-    std::vector<std::pair<std::uint64_t, std::uint32_t>> closed_streams;
-    closed_streams.reserve(m_streams.size());
-    for (const auto& item : m_streams) {
-        if (item.second->state == StreamState::kClosed) {
-            closed_streams.emplace_back(item.second->closed_at_ms, item.first);
-        }
-    }
     const std::size_t keep = m_config.max_retired_streams;
-    if (closed_streams.size() <= keep) {
-        return;
+    if (m_closed_order.size() <= keep) {
+        return;  // 绝大多数 Step 走这里：O(1)，不再扫全表。
     }
-    // 先关闭的先淘汰：保留最近的 `keep` 条，避免刚关闭的流被立刻删除
-    // （调用方可能还持有它的引用直到本轮处理结束）。
-    std::sort(closed_streams.begin(), closed_streams.end());
-    const std::size_t remove = closed_streams.size() - keep;
-    for (std::size_t i = 0; i < remove; ++i) {
-        m_streams.erase(closed_streams[i].second);
+    // 按关闭顺序 FIFO 淘汰（closed_at_ms 单调，等价于原「保留最近 keep 条」）。
+    while (m_closed_order.size() > keep) {
+        const std::uint32_t id = m_closed_order.front();
+        m_closed_order.pop_front();
+        const auto it = m_streams.find(id);
+        if (it == m_streams.end()) {
+            continue;  // 已被 Erase：懒删除，直接跳过。
+        }
+        Stream& stream = *it->second;
+        if (stream.state != StreamState::kClosed) {
+            continue;
+        }
+        DetachIndexes(stream);
+        m_streams.erase(it);
         ++m_retired_streams;
     }
 }
@@ -743,5 +988,7 @@ void StreamTable::ResetStats() noexcept {
     m_total_resets = 0;
     m_retired_streams = 0;
 }
+
+
 
 }  // namespace go2cpp::app

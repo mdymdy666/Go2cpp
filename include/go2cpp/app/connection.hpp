@@ -352,7 +352,9 @@ class Connection {
     StreamTable m_table;                      ///< 流表。
     FrameDecoder m_decoder;                   ///< 帧解码器。
     std::vector<std::uint8_t> m_read_buffer;  ///< 读缓冲。
+    std::vector<std::uint8_t> m_write_buffer; ///< 发送编码缓冲（复用，稳态零分配）。
     std::vector<std::uint8_t> m_rx_pending;   ///< preface 之前的暂存。
+    bool m_in_handle = false;                 ///< 正在处理帧（禁止解码器重入）。
     bool m_preface_received = false;          ///< 是否收到对端 preface。
     bool m_settings_received = false;         ///< 是否收到对端 SETTINGS。
     bool m_started = false;                   ///< 是否已 Start。

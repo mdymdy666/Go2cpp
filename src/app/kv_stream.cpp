@@ -128,14 +128,15 @@ bool KvProducer::ProduceHeaders(std::uint32_t max_payload, Frame* out) {
     if (!m_body.empty()) {
         m_header_table.Set(kKvPartialKey, "1");
     }
-    std::vector<std::uint8_t> payload = m_header_table.ToBinary();
-    if (payload.size() > max_payload || payload.size() > kMaxFramePayloadLimit) {
+    m_header_table.ToBinaryInto(&out->payload);
+    if (out->payload.size() > max_payload ||
+        out->payload.size() > kMaxFramePayloadLimit) {
+        out->payload.clear();
         m_done = true;
         return false;
     }
     out->type = FrameType::kHeaders;
     out->flags = kFlagEndHeaders;
-    out->payload = std::move(payload);
     m_headers_sent = true;
     m_produced_bytes += out->payload.size();
     if (m_body.empty()) {

@@ -32,6 +32,56 @@ bool KnownType(FrameType type) noexcept {
     return false;
 }
 
+/**
+ * @brief 解码共用实现。
+ * @param copy_payload true=拷贝载荷到 `out->payload`；false=置借用视图。
+ */
+FrameStatus DecodeImpl(const std::uint8_t* data, std::size_t size,
+                       std::uint32_t max_payload, Frame* out, std::size_t* consumed,
+                       bool copy_payload) noexcept {
+    if (out == nullptr || (data == nullptr && size != 0)) {
+        return FrameStatus::kInvalidArgument;
+    }
+    out->stream_id = 0;
+    out->type = FrameType::kData;
+    out->flags = 0;
+    out->Clear();
+    if (size < kFrameHeaderBytes) {
+        return FrameStatus::kNeedMoreData;
+    }
+    const std::uint32_t length = (static_cast<std::uint32_t>(data[0]) << 16) |
+                                 (static_cast<std::uint32_t>(data[1]) << 8) |
+                                 static_cast<std::uint32_t>(data[2]);
+    const FrameType type = static_cast<FrameType>(data[3]);
+    if (!KnownType(type)) {
+        return FrameStatus::kInvalidType;
+    }
+    const std::uint8_t flags = data[4];
+    const std::uint32_t stream_field = GetU32(data + 5);
+    if ((stream_field & 0x80000000u) != 0) {
+        return FrameStatus::kInvalidStreamId;
+    }
+    if (length > max_payload || length > kMaxFramePayloadLimit) {
+        return FrameStatus::kLengthExceeded;
+    }
+    const std::size_t total = kFrameHeaderBytes + static_cast<std::size_t>(length);
+    if (size < total) {
+        return FrameStatus::kNeedMoreData;
+    }
+    out->stream_id = stream_field & kMaxStreamId;
+    out->type = type;
+    out->flags = flags;
+    if (copy_payload) {
+        out->payload.assign(data + kFrameHeaderBytes, data + total);
+    } else {
+        out->SetView(length == 0 ? nullptr : data + kFrameHeaderBytes, length);
+    }
+    if (consumed != nullptr) {
+        *consumed = total;
+    }
+    return FrameStatus::kOk;
+}
+
 }  // namespace
 
 const char* FrameTypeName(FrameType type) noexcept {
@@ -108,49 +158,19 @@ const char* FrameStatusName(FrameStatus status) noexcept {
 
 FrameStatus DecodeFrame(const std::uint8_t* data, std::size_t size, Frame* out,
                         std::size_t* consumed) noexcept {
-    return DecodeFrame(data, size, kDefaultMaxFramePayload, out, consumed);
+    return DecodeImpl(data, size, kDefaultMaxFramePayload, out, consumed, true);
 }
 
 FrameStatus DecodeFrame(const std::uint8_t* data, std::size_t size,
                         std::uint32_t max_payload, Frame* out,
                         std::size_t* consumed) noexcept {
-    if (out == nullptr || (data == nullptr && size != 0)) {
-        return FrameStatus::kInvalidArgument;
-    }
-    out->stream_id = 0;
-    out->type = FrameType::kData;
-    out->flags = 0;
-    out->payload.clear();
-    if (size < kFrameHeaderBytes) {
-        return FrameStatus::kNeedMoreData;
-    }
-    const std::uint32_t length = (static_cast<std::uint32_t>(data[0]) << 16) |
-                                 (static_cast<std::uint32_t>(data[1]) << 8) |
-                                 static_cast<std::uint32_t>(data[2]);
-    const FrameType type = static_cast<FrameType>(data[3]);
-    if (!KnownType(type)) {
-        return FrameStatus::kInvalidType;
-    }
-    const std::uint8_t flags = data[4];
-    const std::uint32_t stream_field = GetU32(data + 5);
-    if ((stream_field & 0x80000000u) != 0) {
-        return FrameStatus::kInvalidStreamId;
-    }
-    if (length > max_payload || length > kMaxFramePayloadLimit) {
-        return FrameStatus::kLengthExceeded;
-    }
-    const std::size_t total = kFrameHeaderBytes + static_cast<std::size_t>(length);
-    if (size < total) {
-        return FrameStatus::kNeedMoreData;
-    }
-    out->stream_id = stream_field & kMaxStreamId;
-    out->type = type;
-    out->flags = flags;
-    out->payload.assign(data + kFrameHeaderBytes, data + total);
-    if (consumed != nullptr) {
-        *consumed = total;
-    }
-    return FrameStatus::kOk;
+    return DecodeImpl(data, size, max_payload, out, consumed, true);
+}
+
+FrameStatus DecodeFrameView(const std::uint8_t* data, std::size_t size,
+                            std::uint32_t max_payload, Frame* out,
+                            std::size_t* consumed) noexcept {
+    return DecodeImpl(data, size, max_payload, out, consumed, false);
 }
 
 std::vector<std::uint8_t> EncodeFrame(const Frame& frame) {
@@ -188,8 +208,12 @@ void FrameDecoder::Append(const std::uint8_t* data, std::size_t size) {
     if (data == nullptr || size == 0) {
         return;
     }
-    // 已消费前缀超过一半时整体压缩，避免长连接缓冲无限增长。
-    if (m_offset > 0 && m_offset >= m_buffer.size() / 2) {
+    // 已消费前缀：全消费时直接复用容量；超过一半时整体压缩，避免长连接
+    // 缓冲无限增长。压缩/复用也是「借用视图失效」的边界（见 NextView）。
+    if (m_offset >= m_buffer.size()) {
+        m_buffer.clear();
+        m_offset = 0;
+    } else if (m_offset > 0 && m_offset >= m_buffer.size() / 2) {
         m_buffer.erase(m_buffer.begin(),
                        m_buffer.begin() + static_cast<std::ptrdiff_t>(m_offset));
         m_offset = 0;
@@ -206,8 +230,8 @@ FrameStatus FrameDecoder::Next(Frame* out) {
         return FrameStatus::kNeedMoreData;
     }
     std::size_t consumed = 0;
-    const FrameStatus status = DecodeFrame(m_buffer.data() + m_offset, available,
-                                           m_max_payload, out, &consumed);
+    const FrameStatus status = DecodeImpl(m_buffer.data() + m_offset, available,
+                                          m_max_payload, out, &consumed, true);
     if (status == FrameStatus::kOk) {
         m_offset += consumed;
         if (m_offset == m_buffer.size()) {
@@ -218,6 +242,28 @@ FrameStatus FrameDecoder::Next(Frame* out) {
     }
     if (status != FrameStatus::kNeedMoreData) {
         // 帧边界已不可信：清空缓冲，由调用方关闭连接。
+        Clear();
+    }
+    return status;
+}
+
+FrameStatus FrameDecoder::NextView(Frame* out) {
+    if (out == nullptr) {
+        return FrameStatus::kInvalidArgument;
+    }
+    const std::size_t available = m_buffer.size() - m_offset;
+    if (available == 0) {
+        return FrameStatus::kNeedMoreData;
+    }
+    std::size_t consumed = 0;
+    const FrameStatus status = DecodeFrameView(m_buffer.data() + m_offset, available,
+                                               m_max_payload, out, &consumed);
+    if (status == FrameStatus::kOk) {
+        // 不 clear：载荷是 m_buffer 的借用视图，保留字节直到下一次 Append。
+        m_offset += consumed;
+        return FrameStatus::kOk;
+    }
+    if (status != FrameStatus::kNeedMoreData) {
         Clear();
     }
     return status;

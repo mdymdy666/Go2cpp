@@ -150,16 +150,53 @@ struct SettingsEntry {
     std::uint32_t value = 0;                          ///< 参数值。
 };
 
-/// @brief 一帧（头部字段 + 载荷副本）。
+/// @brief 一帧（头部字段 + 载荷）。
+///
+/// @details 载荷有两种持有方式：
+///          - **拥有**：`payload` 里存字节（发送侧构造、`DecodeFrame` 拷贝版）；
+///          - **借用**：`view` 指向外部缓冲（`DecodeFrameView` / `NextView`），
+///            `payload` 保持为空。借用帧只在「解码器缓冲下一次被追加/压缩之前」
+///            有效，调用方必须在该窗口内消费完，或把它拷贝成拥有的字节。
+///          所有读取都必须走 `Size()` / `Bytes()`：直接读 `payload` 会漏掉借用帧。
 struct Frame {
     std::uint32_t stream_id = 0;          ///< 流 id（0 = 连接级）。
     FrameType type = FrameType::kData;    ///< 帧类型。
     std::uint8_t flags = kFlagNone;       ///< 标志位。
-    std::vector<std::uint8_t> payload;    ///< 载荷副本。
+    std::vector<std::uint8_t> payload;    ///< 载荷副本（拥有时有效）。
+    const std::uint8_t* view = nullptr;   ///< 借用视图基址（非空表示借用）。
+    std::uint32_t view_bytes = 0;         ///< 借用视图字节数。
 
     /// 载荷字节数。
-    std::uint32_t Length() const noexcept {
-        return static_cast<std::uint32_t>(payload.size());
+    std::uint32_t Length() const noexcept { return static_cast<std::uint32_t>(Size()); }
+
+    /// 载荷字节数（借用/拥有统一入口）。
+    std::size_t Size() const noexcept {
+        return view != nullptr ? static_cast<std::size_t>(view_bytes) : payload.size();
+    }
+
+    /// 载荷基址（可能为 nullptr，当 Size()==0）。
+    const std::uint8_t* Bytes() const noexcept {
+        return view != nullptr ? view : payload.data();
+    }
+
+    /// 载荷是否为空。
+    bool Empty() const noexcept { return Size() == 0; }
+
+    /// 是否借用外部缓冲。
+    bool is_view() const noexcept { return view != nullptr; }
+
+    /// @brief 置为借用视图（清空拥有缓冲）。
+    void SetView(const std::uint8_t* data, std::uint32_t size) noexcept {
+        payload.clear();
+        view = data;
+        view_bytes = size;
+    }
+
+    /// @brief 清空载荷（保留拥有缓冲的容量，供下一帧复用）。
+    void Clear() noexcept {
+        view = nullptr;
+        view_bytes = 0;
+        payload.clear();
     }
 
     /// @brief 是否置位给定标志。
@@ -209,6 +246,18 @@ FrameStatus DecodeFrame(const std::uint8_t* data, std::size_t size,
                         std::size_t* consumed = nullptr) noexcept;
 
 /**
+ * @brief 零拷贝解码：载荷以**借用视图**返回，不分配、不拷贝。
+ * @details 语义与 `DecodeFrame` 相同，唯一区别是成功后 `out->is_view()==true`，
+ *          `out->Bytes()` 指向 `data + 9`。**生命周期契约**：视图只在 `data`
+ *          这段内存被改写/释放之前有效；调用方若需要跨过该窗口保留载荷，
+ *          必须自己拷贝（`out->payload.assign(out->Bytes(), out->Bytes()+out->Size())`）。
+ *          接收热路径（帧处理完即丢弃）用它省掉一次 malloc + memcpy。
+ */
+FrameStatus DecodeFrameView(const std::uint8_t* data, std::size_t size,
+                            std::uint32_t max_payload, Frame* out,
+                            std::size_t* consumed = nullptr) noexcept;
+
+/**
  * @brief 编码一帧（自动填充 24 位长度字段）。
  * @return 完整字节（9B 头 + 载荷）；载荷超过 `kMaxFramePayloadLimit`、R 位
  *         非 0 或类型未知时返回空 vector（合法帧最短 9 字节，不会混淆）。
@@ -239,8 +288,17 @@ class FrameDecoder {
     /// @brief 追加收到的字节。
     void Append(const std::uint8_t* data, std::size_t size);
 
-    /// @brief 取出下一帧；`kOk` 表示 `out` 已填充。
+    /// @brief 取出下一帧；`kOk` 表示 `out` 已填充（载荷为拷贝，跨 Append 安全）。
     FrameStatus Next(Frame* out);
+
+    /**
+     * @brief 取出下一帧，载荷以借用视图返回（零拷贝）。
+     * @details 省掉每帧一次分配 + 拷贝，代价是视图的生命周期契约：
+     *          返回 `kOk` 后，`out->Bytes()` 指向内部缓冲，**只在调用下一次
+     *          `Append`/`NextView`/`Clear` 之前有效**。适合「解出即处理、
+     *          不保留」的接收热路径（如 `Connection::Step`）。
+     */
+    FrameStatus NextView(Frame* out);
 
     /// @brief 尚未消费的字节数（含半包）。
     std::size_t PendingBytes() const noexcept { return m_buffer.size() - m_offset; }

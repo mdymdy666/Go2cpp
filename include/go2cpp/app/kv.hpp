@@ -130,6 +130,12 @@ class KvTable {
     std::vector<std::uint8_t> ToBinary() const;
 
     /**
+     * @brief 二进制编码写入既有缓冲（复用容量，热路径零分配）。
+     * @param out 输出缓冲；`nullptr` 时什么都不做。写入前会 clear（保留容量）。
+     */
+    void ToBinaryInto(std::vector<std::uint8_t>* out) const;
+
+    /**
      * @brief 解析二进制编码。
      * @param data 输入。
      * @param size 字节数。

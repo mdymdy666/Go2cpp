@@ -81,19 +81,21 @@ class FixedProducer final : public FrameProducer {
 
 /// 模拟连接层发送一帧：扣窗口、推进状态、推进 WFQ。
 bool SendOne(StreamTable& table, Stream& stream) {
-    Frame frame = std::move(*stream.pending);
-    stream.pending.reset();
+    Frame frame = std::move(stream.pending);
     const std::size_t bytes = frame.payload.size();
-    if (frame.type == FrameType::kData && bytes > 0 &&
-        !table.ConsumeSend(stream, bytes)) {
+    const FrameType type = frame.type;
+    const bool end_stream = frame.EndStream();
+    // 真实连接层在写出帧之后调用 ConsumePending：清 pending + 登记下一帧的生产候选。
+    table.ConsumePending(stream);
+    if (type == FrameType::kData && bytes > 0 && !table.ConsumeSend(stream, bytes)) {
         return false;
     }
     bool ok = true;
-    if (frame.type == FrameType::kData) {
-        ok = table.SendData(stream, bytes, frame.EndStream());
+    if (type == FrameType::kData) {
+        ok = table.SendData(stream, bytes, end_stream);
         table.ChargeFinish(stream, bytes);
-    } else if (frame.type == FrameType::kHeaders) {
-        ok = table.SendHeaders(stream, frame.EndStream());
+    } else if (type == FrameType::kHeaders) {
+        ok = table.SendHeaders(stream, end_stream);
     }
     return ok;
 }

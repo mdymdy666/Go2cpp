@@ -311,13 +311,21 @@ std::size_t KvTable::BinarySize() const noexcept {
 
 std::vector<std::uint8_t> KvTable::ToBinary() const {
     std::vector<std::uint8_t> out;
-    out.reserve(BinarySize());
-    PutVarint(out, m_entries.size());
-    for (const Entry& entry : m_entries) {
-        PutString(out, entry.first);
-        PutString(out, entry.second);
-    }
+    ToBinaryInto(&out);
     return out;
+}
+
+void KvTable::ToBinaryInto(std::vector<std::uint8_t>* out) const {
+    if (out == nullptr) {
+        return;
+    }
+    out->clear();
+    out->reserve(BinarySize());
+    PutVarint(*out, m_entries.size());
+    for (const Entry& entry : m_entries) {
+        PutString(*out, entry.first);
+        PutString(*out, entry.second);
+    }
 }
 
 bool KvTable::ParseBinary(const std::uint8_t* data, std::size_t size, KvTable* out,
