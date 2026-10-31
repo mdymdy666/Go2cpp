@@ -83,6 +83,20 @@ if (GO2CPP_WITH_P2P)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/p2p/bench_p2p.cpp)
         target_link_libraries(p2p_bench PRIVATE go2cpp_p2p)
         target_compile_options(p2p_bench PRIVATE -O2 -Wall -Wextra -Wpedantic)
+
+        # 每包固定税压测（1e7 包，真实 UDP 回环）：仅构建，不进 ctest。
+        add_executable(p2p_bench_fixed_tax
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/p2p/bench_p2p_fixed_tax.cpp)
+        target_link_libraries(p2p_bench_fixed_tax PRIVATE go2cpp_p2p)
+        target_compile_options(p2p_bench_fixed_tax PRIVATE
+            -O2 -Wall -Wextra -Wpedantic)
+
+        # 每包用户态开销微基准（内存 transport，无内核 syscall）。
+        add_executable(p2p_bench_memory
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/p2p/bench_p2p_memory.cpp)
+        target_link_libraries(p2p_bench_memory PRIVATE go2cpp_p2p)
+        target_compile_options(p2p_bench_memory PRIVATE
+            -O2 -Wall -Wextra -Wpedantic)
     endif()
 
     message(STATUS "P2P NAT traversal: ON (tests=${GO2CPP_P2P_TESTS})")

@@ -562,3 +562,32 @@ errno noinline），不是寄存器保存。
   428 条 0 失效；`.build-bento-wsl` 全量实测 149 passed / 7 failed / 74 not run（原因已写入 testing.md）；
   `mcp+osmon` 独立构建目录全量 20/20 passed。
 - **状态**：未改任何代码；未 commit。
+
+## 2026-11-01 网络/应用优化 批 2（每包/每帧固定税）
+
+- **改动**
+  - P2P（`src/p2p/p2p_channel.cpp`）：连接状态改为不可变 `ConnectionSnapshot` 原子指针；
+    统计/时间戳/keepalive 标志全部原子化；per-packet 0 mutex；数据帧/keepalive/ACK 复用
+    `m_tx_frame_scratch`/`m_rx_frame_scratch`（删除每包 `MakeFrame` 分配）；relay 指针原子化，
+    Close 不再销毁 relay 对象（消除 Close/Send 并发 UAF）；每轮只取一次时钟。
+  - PeerHub（`src/bento/net/peer_hub.cpp` + hpp）：`SendControl` 改用
+    `m_tx_control_scratch` + `BuildControlFrameInto`（控制帧每帧 0 堆分配）；`Tick()` 内
+    `BeginTxBatch/FlushTxBatch` 把 ACK/心跳/MAX_DATA/重传帧合并为 `sendmmsg`（每批 64，
+    部分成功逐帧回退），统计在 flush 合并。
+  - Resource（`src/app/resource.cpp` + hpp）：新增 `ChunkSource::View` 零拷贝视图
+    （`MemoryChunkSource` 实现）；整块一帧或视图可用时逐帧直读 `Frame::payload`（单拷贝，
+    无中间块缓冲）；文件/生成式分帧源保留整块缓冲；去掉每块 `assign(bytes,0)` 清零。
+  - 新增基准：`tests/p2p/bench_p2p_fixed_tax.cpp`（1e7 包 UDP）、`tests/p2p/bench_p2p_memory.cpp`
+    （1e7 包内存微基准），`cmake/Go2CppP2P.cmake` 只构建不注册 ctest。
+- **关键文件**：`src/p2p/p2p_channel.cpp`、`src/bento/net/peer_hub.cpp`、
+  `include/go2cpp/bento/net/peer_hub.hpp`、`src/app/resource.cpp`、
+  `include/go2cpp/app/resource.hpp`、`tests/p2p/bench_p2p_fixed_tax.cpp`、
+  `tests/p2p/bench_p2p_memory.cpp`、`cmake/Go2CppP2P.cmake`。
+- **测试**
+  - `p2p_test_p2p` 94、`p2p_test_stun` 2052、`p2p_test_tcp_punch` 1、`p2p_test_p2p_interprocess` 4；
+  - `bento_test_peer_hub` 502、`bento_test_peer_hub_secure` 825；
+  - `app_test_frame` 21100、`app_test_stream_table` 335、`app_test_resource` 174、`app_test_kv` 98、
+    `app_test_connection` 180、`app_test_load` 2328（1 GiB SHA-256 校验通过）；
+  - 压测：P2P 内存回环 1e7 包 222.7 → 134.1 ns/包（-40%）；UDP 1e7 包 215.7k pps、
+    丢包 0.017%、零损坏；PeerHub `sendto` -5.6%、48 次 `sendmmsg`；1 GiB 资源 +14.8%。
+- **状态**：完成，未提交（多 agent 共享工作树）。报告：`/tmp/batch2_opt.md`。

@@ -333,6 +333,12 @@ class PeerHub final {
     bool SendControl(Peer& peer, const FrameHeader& header, const std::uint8_t* payload,
                      std::size_t bytes);
     bool SendRawPacket(Peer& peer, const std::uint8_t* data, std::size_t bytes);
+    /// @brief 进入批量发送模式（Tick 内多个 ACK/重传帧合并为一次 sendmmsg）。
+    void BeginTxBatch();
+    /// @brief 退出批量并真正发送；部分成功时逐帧回退单发。
+    void FlushTxBatch();
+    /// @brief 把一帧追加到待发批次（拷贝到连续缓冲，供 iovec 引用）。
+    bool QueueDatagram(Peer& peer, const std::uint8_t* data, std::size_t bytes);
     bool SendFrameBytes(Peer& peer, const std::uint8_t* data, std::size_t bytes);
     bool SealAndSend(Peer& peer, const std::uint8_t* frame, std::size_t bytes);
     void SendHello(Peer& peer);
@@ -401,8 +407,21 @@ class PeerHub final {
     /// 避免每帧一次堆分配。回调里允许 Send*，但用的是 tx 缓冲，
     /// 与本轮接收解析用的 rx 缓冲互不干扰。
     mutable std::vector<std::uint8_t> m_tx_frame_scratch;
+    /// 控制帧复用缓冲（ACK/心跳/MAX_DATA/BARRIER/HELLO）：避免每帧一次堆分配。
+    mutable std::vector<std::uint8_t> m_tx_control_scratch;
     mutable std::vector<std::uint8_t> m_tx_sealed_scratch;
     mutable std::vector<std::uint8_t> m_rx_inner_scratch;
+    /// 批量发送项：peer 必在 Tick 内有效（peer 销毁推迟到安全点）。
+    struct PendingDatagram {
+        Peer* peer = nullptr;
+        sockaddr_storage addr{};
+        socklen_t addr_len = 0;
+        std::size_t offset = 0;
+        std::size_t bytes = 0;
+    };
+    std::vector<std::uint8_t> m_tx_batch_bytes;
+    std::vector<PendingDatagram> m_tx_batch;
+    bool m_tx_batching = false;
     /// 保护 peer 表、socket 发送与统计；recursive 以支持回调重入 Send*。
     mutable std::recursive_mutex m_mutex;
 };

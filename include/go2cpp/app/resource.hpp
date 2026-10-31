@@ -142,6 +142,22 @@ class ChunkSource {
 
     /// @brief 是否可随机读（文件/内存 true；生成器 true）。
     virtual bool random_access() const { return true; }
+
+    /**
+     * @brief 零拷贝视图：若源能直接暴露底层内存，返回 `[offset, offset+max_bytes)`。
+     * @details 默认返回 false（调用方用 `Read` 拷贝）。内存源实现它，
+     *          发送端可直接对底层缓冲算块 CRC，省掉一次整块拷贝。
+     * @param data 输出只读指针（视图生命周期 = 源对象）。
+     * @param size 输出可用字节数。
+     */
+    virtual bool View(std::uint64_t offset, std::size_t max_bytes,
+                      const std::uint8_t** data, std::size_t* size) {
+        (void)offset;
+        (void)max_bytes;
+        (void)data;
+        (void)size;
+        return false;
+    }
 };
 
 /// @brief 内存资源源（共享底层缓冲，复制廉价）。
@@ -154,6 +170,8 @@ class MemoryChunkSource final : public ChunkSource {
     std::size_t Read(std::uint64_t offset, std::uint8_t* out,
                      std::size_t max_bytes) override;
     bool random_access() const override { return true; }
+    bool View(std::uint64_t offset, std::size_t max_bytes, const std::uint8_t** data,
+              std::size_t* size) override;
 
     /// @brief 底层数据（只读）。
     const std::vector<std::uint8_t>& data() const noexcept { return *m_data; }
@@ -332,21 +350,28 @@ class ResourceProducer final : public FrameProducer {
     std::uint32_t start_chunk() const noexcept { return m_start_chunk; }
 
    private:
-    bool LoadChunk(std::string* error);
     bool BuildHeaders(std::uint32_t max_payload, Frame* out);
+    /// @brief 载入下一块并选择读写路径（直读 payload / 整块缓冲）。
+    bool BeginChunk(std::uint32_t max_payload);
 
     ResourceMeta m_meta;                    ///< 元数据。
     std::shared_ptr<ChunkSource> m_source;  ///< 数据源。
     std::uint32_t m_start_chunk = 0;        ///< 起始块。
     std::uint32_t m_next_chunk = 0;         ///< 下一块。
-    std::vector<std::uint8_t> m_chunk;      ///< 当前块缓冲。
-    std::uint32_t m_chunk_index = 0;        ///< 当前块索引。
-    std::uint32_t m_chunk_offset = 0;       ///< 当前块内偏移。
-    std::uint32_t m_chunk_crc = 0;          ///< 当前块 CRC。
-    bool m_headers_sent = false;            ///< HEADERS 是否已发。
-    bool m_done = false;                    ///< 是否完成。
-    bool m_empty = false;                   ///< 空资源。
-    std::uint64_t m_produced_bytes = 0;     ///< 已生产的数据字节。
+    /// 兼容路径的整块缓冲（仅 `random_access()==false` 的源使用）。
+    std::vector<std::uint8_t> m_chunk;
+    std::uint64_t m_chunk_base = 0;   ///< 当前块在资源中的绝对偏移。
+    std::uint32_t m_chunk_bytes = 0;  ///< 当前块总字节数。
+    std::uint32_t m_chunk_index = 0;  ///< 当前块索引。
+    std::uint32_t m_chunk_offset = 0; ///< 当前块内偏移。
+    std::uint32_t m_chunk_crc = 0;    ///< 当前块 CRC。
+    bool m_chunk_crc_ready = false;   ///< 当前块 CRC 是否已算出。
+    bool m_direct = true;             ///< 源声明支持可重复随机读。
+    bool m_chunk_direct = false;      ///< 当前块是否走「逐帧直读 payload」。
+    bool m_headers_sent = false;      ///< HEADERS 是否已发。
+    bool m_done = false;              ///< 是否完成。
+    bool m_empty = false;             ///< 空资源。
+    std::uint64_t m_produced_bytes = 0;  ///< 已生产的数据字节。
 };
 
 /**

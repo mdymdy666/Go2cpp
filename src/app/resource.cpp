@@ -306,6 +306,17 @@ std::size_t MemoryChunkSource::Read(std::uint64_t offset, std::uint8_t* out,
     return take;
 }
 
+bool MemoryChunkSource::View(std::uint64_t offset, std::size_t max_bytes,
+                             const std::uint8_t** data, std::size_t* size) {
+    if (data == nullptr || size == nullptr || offset >= m_data->size()) {
+        return false;
+    }
+    const std::size_t available = m_data->size() - static_cast<std::size_t>(offset);
+    *data = m_data->data() + static_cast<std::size_t>(offset);
+    *size = std::min(available, max_bytes);
+    return true;
+}
+
 FileChunkSource::FileChunkSource(std::string path) : m_path(std::move(path)) {}
 
 FileChunkSource::~FileChunkSource() {
@@ -551,6 +562,13 @@ std::string Sha256Hex(const std::uint8_t* data, std::size_t size) {
     return ToHex(digest.data(), digest.size());
 }
 
+void StoreU32At(std::uint8_t* out, std::uint32_t value) noexcept {
+    out[0] = static_cast<std::uint8_t>((value >> 24U) & 0xFFU);
+    out[1] = static_cast<std::uint8_t>((value >> 16U) & 0xFFU);
+    out[2] = static_cast<std::uint8_t>((value >> 8U) & 0xFFU);
+    out[3] = static_cast<std::uint8_t>(value & 0xFFU);
+}
+
 std::uint32_t Crc32Of(const std::uint8_t* data, std::size_t size) {
     return go2cpp::hash::Crc32::ChecksumIEEE(go2cpp::hash::AsBytes(data, size));
 }
@@ -784,6 +802,9 @@ ResourceProducer::ResourceProducer(ResourceMeta meta, std::shared_ptr<ChunkSourc
     if (m_source == nullptr || m_meta.chunk_count == 0) {
         m_empty = true;
     }
+    // 可重复随机读的源走「逐帧直读进 payload」的单拷贝路径；否则回退
+    // 到整块读入 m_chunk 的兼容路径（老语义）。
+    m_direct = m_source != nullptr && m_source->random_access();
 }
 
 bool ResourceProducer::BuildHeaders(std::uint32_t max_payload, Frame* out) {
@@ -807,25 +828,56 @@ bool ResourceProducer::BuildHeaders(std::uint32_t max_payload, Frame* out) {
     return true;
 }
 
-bool ResourceProducer::LoadChunk(std::string* /*error*/) {
+bool ResourceProducer::BeginChunk(std::uint32_t max_payload) {
     if (m_next_chunk >= m_meta.chunk_count) {
         return false;
     }
-    const std::uint32_t bytes = m_meta.ChunkBytes(m_next_chunk);
+    const std::uint32_t index = m_next_chunk;
+    const std::uint32_t bytes = m_meta.ChunkBytes(index);
     if (bytes == 0) {
         return false;
     }
-    m_chunk.assign(bytes, 0);
-    const std::uint64_t offset = m_meta.ChunkOffset(m_next_chunk);
-    const std::size_t got = ReadFull(*m_source, offset, m_chunk.data(), bytes);
-    if (got != bytes) {
-        m_done = true;
-        return false;
-    }
-    m_chunk_index = m_next_chunk;
+    m_chunk_index = index;
+    m_chunk_bytes = bytes;
+    m_chunk_base = m_meta.ChunkOffset(index);
     m_chunk_offset = 0;
-    m_chunk_crc = Crc32Of(m_chunk.data(), m_chunk.size());
+    m_chunk_crc = 0;
+    m_chunk_crc_ready = false;
+    m_chunk_direct = false;
     ++m_next_chunk;
+
+    if (m_direct) {
+        const std::size_t capacity = max_payload > kResourceChunkHeaderBytes
+                                         ? max_payload - kResourceChunkHeaderBytes
+                                         : 0;
+        if (bytes <= capacity) {
+            // 整块能装进一帧：读进 payload 后再算 CRC，无需预扫描。
+            m_chunk_direct = true;
+        } else {
+            // 能直接看到底层内存的源：零拷贝算块 CRC，随后逐帧直读 payload。
+            const std::uint8_t* view = nullptr;
+            std::size_t view_size = 0;
+            if (m_source->View(m_chunk_base, bytes, &view, &view_size) &&
+                view_size >= bytes) {
+                m_chunk_direct = true;
+                m_chunk_crc = Crc32Of(view, bytes);
+                m_chunk_crc_ready = true;
+            }
+        }
+    }
+    if (!m_chunk_direct) {
+        // 需要分帧且拿不到零拷贝视图：块 CRC 必须先于首帧已知，预扫描会把
+        // 源的读取放大一倍（生成式源还会翻倍 CPU），因此整块读入复用缓冲
+        // ——一次读 + 每帧一次拷贝，整体反而更省。缓冲随块大小复用。
+        m_chunk.resize(bytes);
+        const std::size_t got = ReadFull(*m_source, m_chunk_base, m_chunk.data(), bytes);
+        if (got != bytes) {
+            m_done = true;
+            return false;
+        }
+        m_chunk_crc = Crc32Of(m_chunk.data(), m_chunk.size());
+        m_chunk_crc_ready = true;
+    }
     return true;
 }
 
@@ -836,22 +888,18 @@ bool ResourceProducer::Produce(std::uint32_t max_payload, Frame* out) {
     if (!m_headers_sent) {
         return BuildHeaders(max_payload, out);
     }
-    if (m_empty) {
+    if (m_empty || max_payload <= kResourceChunkHeaderBytes) {
         return false;
     }
-    if (m_chunk_offset >= m_chunk.size()) {
-        m_chunk.clear();
-        m_chunk_offset = 0;
-        if (!LoadChunk(nullptr)) {
+    if (m_chunk_offset >= m_chunk_bytes) {
+        if (!BeginChunk(max_payload)) {
             return false;
         }
     }
-    if (max_payload <= kResourceChunkHeaderBytes) {
-        return false;
-    }
     const std::size_t capacity =
         static_cast<std::size_t>(max_payload - kResourceChunkHeaderBytes);
-    const std::size_t take = std::min(capacity, m_chunk.size() - m_chunk_offset);
+    const std::size_t remaining = m_chunk_bytes - m_chunk_offset;
+    const std::size_t take = std::min(capacity, remaining);
     out->type = FrameType::kData;
     out->flags = 0;
     out->payload.clear();
@@ -859,13 +907,27 @@ bool ResourceProducer::Produce(std::uint32_t max_payload, Frame* out) {
     PutU32(out->payload, m_chunk_index);
     PutU32(out->payload, m_chunk_offset);
     PutU32(out->payload, m_chunk_crc);
-    out->payload.insert(out->payload.end(),
-                        m_chunk.begin() + static_cast<std::ptrdiff_t>(m_chunk_offset),
-                        m_chunk.begin() +
-                            static_cast<std::ptrdiff_t>(m_chunk_offset + take));
+    out->payload.resize(kResourceChunkHeaderBytes + take);
+    std::uint8_t* const payload = out->payload.data() + kResourceChunkHeaderBytes;
+    if (!m_chunk_direct) {
+        std::memcpy(payload, m_chunk.data() + m_chunk_offset, take);
+    } else {
+        const std::size_t got =
+            ReadFull(*m_source, m_chunk_base + m_chunk_offset, payload, take);
+        if (got != take) {
+            m_done = true;
+            return false;
+        }
+        if (!m_chunk_crc_ready) {
+            // 整块一帧：数据已经读进 payload，就地算 CRC 再回填块头。
+            m_chunk_crc = Crc32Of(payload, take);
+            m_chunk_crc_ready = true;
+            StoreU32At(out->payload.data() + 8, m_chunk_crc);
+        }
+    }
     m_chunk_offset += static_cast<std::uint32_t>(take);
     m_produced_bytes += take;
-    if (m_next_chunk >= m_meta.chunk_count && m_chunk_offset == m_chunk.size()) {
+    if (m_next_chunk >= m_meta.chunk_count && m_chunk_offset == m_chunk_bytes) {
         out->SetFlag(kFlagEndStream);
         m_done = true;
     }

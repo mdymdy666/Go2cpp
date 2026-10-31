@@ -22,6 +22,86 @@
 namespace go2cpp::bento {
 namespace {
 
+/// @brief 帧载荷形状校验（与 protocol.cpp 的 ValidatePayloadShape 保持一致）。
+bool ValidateControlPayloadShape(FrameType type, std::size_t payload_bytes) noexcept {
+    switch (type) {
+        case FrameType::kHello:
+        case FrameType::kHelloAck:
+            // 4B magic + 4B session + 4B conn_id。
+            return payload_bytes >= 12;
+        case FrameType::kStream:
+        case FrameType::kDatagram:
+            return true;
+        case FrameType::kVideo:
+            return payload_bytes >= kVideoHeaderBytes;
+        case FrameType::kAck:
+            return IsValidAckPayloadSize(payload_bytes);
+        case FrameType::kBarrier:
+            return payload_bytes == 0;
+        case FrameType::kMaxData:
+            return payload_bytes == kMaxDataPayloadBytes;
+        case FrameType::kPmtudProbe:
+        case FrameType::kPmtudAck:
+            return payload_bytes >= kPmtudPayloadBytes;
+    }
+    return false;
+}
+
+/// @brief 把完整帧写进复用缓冲：控制帧路径每帧零堆分配。
+/// @details 校验规则与 protocol.cpp 的 `BuildFrame` 逐条对齐；这里只服务
+///          PeerHub 内部固定形状的控制帧，不对外暴露。
+bool BuildControlFrameInto(const FrameHeader& header, const AckState* ack,
+                           const std::uint8_t* payload, std::size_t payload_bytes,
+                           std::vector<std::uint8_t>* out) {
+    if (out == nullptr || payload_bytes > kMaxFramePayload) {
+        return false;
+    }
+    if (payload_bytes > 0 && payload == nullptr) {
+        return false;
+    }
+    if (!IsKnownFrameType(static_cast<std::uint8_t>(header.type))) {
+        return false;
+    }
+    if (!ValidateControlPayloadShape(header.type, payload_bytes)) {
+        return false;
+    }
+    if ((header.flags & kFlagFragmented) != 0 && header.type != FrameType::kStream) {
+        return false;
+    }
+    if ((header.flags & kFlagFec) != 0 && header.type != FrameType::kVideo) {
+        return false;
+    }
+    if ((header.flags & kFlagFragmented) != 0 && payload_bytes < kStreamFragmentHeaderBytes) {
+        return false;
+    }
+    if (header.version != kProtocolVersion) {
+        return false;
+    }
+    if (ack != nullptr &&
+        (header.type == FrameType::kAck || header.type == FrameType::kBarrier ||
+         header.type == FrameType::kPmtudProbe || header.type == FrameType::kPmtudAck)) {
+        return false;
+    }
+    const std::size_t ack_bytes = ack != nullptr ? kAckBytes : 0;
+    out->resize(kFrameHeaderBytes + ack_bytes + payload_bytes);
+    FrameHeader wire = header;
+    if (ack != nullptr) {
+        wire.flags = static_cast<std::uint8_t>(wire.flags | kFlagAck);
+    } else {
+        wire.flags = static_cast<std::uint8_t>(wire.flags & static_cast<std::uint8_t>(~kFlagAck));
+    }
+    EncodeHeader(wire, out->data());
+    std::size_t offset = kFrameHeaderBytes;
+    if (ack != nullptr) {
+        EncodeAck(*ack, out->data() + offset);
+        offset += kAckBytes;
+    }
+    if (payload_bytes > 0) {
+        std::memcpy(out->data() + offset, payload, payload_bytes);
+    }
+    return true;
+}
+
 /// HELLO / HELLO_ACK 载荷字节数：4B magic + 4B session + 4B conn_id。
 constexpr std::size_t kHelloPayloadBytes = 12;
 
@@ -489,6 +569,9 @@ bool PeerHub::SendRawPacket(Peer& peer, const std::uint8_t* data, std::size_t by
         ++m_stats.send_errors;
         return false;
     }
+    if (m_tx_batching) {
+        return QueueDatagram(peer, data, bytes);
+    }
     if (!m_socket.SendTo(peer.addr, peer.addr_len, data, bytes)) {
         ++m_stats.send_errors;
         EmitLog(LogLevel::kError, LogEvent::kSendError, peer.peer_id, "sendto failed", bytes);
@@ -500,6 +583,90 @@ bool PeerHub::SendRawPacket(Peer& peer, const std::uint8_t* data, std::size_t by
     peer.bytes_sent += static_cast<std::uint64_t>(bytes);
     peer.last_tx_ms = NowMs();
     return true;
+}
+
+void PeerHub::BeginTxBatch() {
+    m_tx_batching = true;
+    m_tx_batch.clear();
+    m_tx_batch_bytes.clear();
+}
+
+bool PeerHub::QueueDatagram(Peer& peer, const std::uint8_t* data, std::size_t bytes) {
+    if (data == nullptr || bytes == 0) {
+        return false;
+    }
+    const std::size_t offset = m_tx_batch_bytes.size();
+    m_tx_batch_bytes.insert(m_tx_batch_bytes.end(), data, data + bytes);
+    PendingDatagram item;
+    item.peer = &peer;
+    item.addr = peer.addr;
+    item.addr_len = peer.addr_len;
+    item.offset = offset;
+    item.bytes = bytes;
+    m_tx_batch.push_back(item);
+    return true;
+}
+
+void PeerHub::FlushTxBatch() {
+    m_tx_batching = false;
+    const std::size_t total = m_tx_batch.size();
+    if (total == 0) {
+        m_tx_batch_bytes.clear();
+        return;
+    }
+    if (!m_socket.IsOpen()) {
+        // 回调里 Close() 关掉了 socket：本批帧全部作废（与逐帧发送失败等价）。
+        m_tx_batch.clear();
+        m_tx_batch_bytes.clear();
+        return;
+    }
+    // 每批最多 64 条：栈数组避免每 tick 一次堆分配；sendmmsg 一次处理。
+    constexpr std::size_t kBatchChunk = 64;
+    const std::uint64_t now_ms = NowMs();
+    std::size_t index = 0;
+    while (index < total) {
+        const std::size_t count = std::min(kBatchChunk, total - index);
+        struct mmsghdr messages[kBatchChunk];
+        struct iovec iovecs[kBatchChunk];
+        std::memset(messages, 0, sizeof(messages));
+        for (std::size_t i = 0; i < count; ++i) {
+            PendingDatagram& item = m_tx_batch[index + i];
+            iovecs[i].iov_base = m_tx_batch_bytes.data() + item.offset;
+            iovecs[i].iov_len = item.bytes;
+            messages[i].msg_hdr.msg_name = &item.addr;
+            messages[i].msg_hdr.msg_namelen = item.addr_len;
+            messages[i].msg_hdr.msg_iov = &iovecs[i];
+            messages[i].msg_hdr.msg_iovlen = 1;
+        }
+        const int sent =
+            ::sendmmsg(m_socket.fd(), messages, static_cast<unsigned int>(count), 0);
+        for (std::size_t i = 0; i < count; ++i) {
+            PendingDatagram& item = m_tx_batch[index + i];
+            bool ok = sent >= 0 && i < static_cast<std::size_t>(sent);
+            if (!ok) {
+                // 部分成功/整批失败：逐帧回退，保证每帧的发送结果都被记录。
+                ok = m_socket.SendTo(item.addr, item.addr_len,
+                                     m_tx_batch_bytes.data() + item.offset, item.bytes);
+            }
+            if (!ok) {
+                ++m_stats.send_errors;
+                EmitLog(LogLevel::kError, LogEvent::kSendError,
+                        item.peer != nullptr ? item.peer->peer_id : 0, "sendmmsg failed",
+                        item.bytes);
+                continue;
+            }
+            ++m_stats.frames_sent;
+            m_stats.bytes_sent += static_cast<std::uint64_t>(item.bytes);
+            if (item.peer != nullptr) {
+                ++item.peer->frames_sent;
+                item.peer->bytes_sent += static_cast<std::uint64_t>(item.bytes);
+                item.peer->last_tx_ms = now_ms;
+            }
+        }
+        index += count;
+    }
+    m_tx_batch.clear();
+    m_tx_batch_bytes.clear();
 }
 
 bool PeerHub::SealAndSend(Peer& peer, const std::uint8_t* frame, std::size_t bytes) {
@@ -537,12 +704,11 @@ bool PeerHub::SendControl(Peer& peer, const FrameHeader& header, const std::uint
     // 回不去，发送端窗口卡死（实测：50 条只交付 32 条）。
     FrameHeader stamped = header;
     stamped.conn_id = peer.conn_id;
-    const std::vector<std::uint8_t> frame = BuildFrame(stamped, nullptr, payload, bytes);
-    if (frame.empty()) {
+    if (!BuildControlFrameInto(stamped, nullptr, payload, bytes, &m_tx_control_scratch)) {
         ++m_stats.send_errors;
         return false;
     }
-    return SendFrameBytes(peer, frame.data(), frame.size());
+    return SendFrameBytes(peer, m_tx_control_scratch.data(), m_tx_control_scratch.size());
 }
 
 void PeerHub::SendHello(Peer& peer) {
@@ -1900,6 +2066,8 @@ void PeerHub::HandleSecureHelloAck(const std::uint8_t* data, std::size_t bytes,
 }
 
 void PeerHub::Tick(std::uint64_t now_ms) {
+    // 本轮 tick 产生的 ACK/心跳/MAX_DATA/重传帧先入批，末尾一次 sendmmsg。
+    BeginTxBatch();
     for (auto& entry : m_peers) {
         Peer& peer = *entry.second;
         if (peer.state == PeerState::kConnecting) {
@@ -1965,6 +2133,7 @@ void PeerHub::Tick(std::uint64_t now_ms) {
             }
         }
     }
+    FlushTxBatch();
 }
 
 int PeerHub::RunOnce(int timeout_ms) {
