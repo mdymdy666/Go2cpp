@@ -995,6 +995,97 @@ class ChannelSpinLock {
   alignas(64) core::FutexMutex m_gate;
 };
 
+// ---- select 锁集（对齐 Go selectgo 的 sellock / selunlock） ----
+
+/// @brief 类型擦除后的一把 channel 锁：全序键 + 加/解锁函数。
+///
+/// 为什么需要类型擦除：`Select` 主循环在非模板的
+/// `src/concurrency/channel.cpp` 里实现，拿不到 `Channel<T>` 的类型；而锁
+/// 必须由 `Channel<T>` 自己的实例提供，因此把「键 + 函数指针」打包传递。
+struct SelectLockEntry {
+  /// @brief 全序键：channel 对象地址（生命周期内不变且唯一）。
+  const void* key{nullptr};
+  /// @brief 加锁；noexcept，与 ChannelSpinLock::lock 一致。
+  void (*lock)(const void* key) noexcept = nullptr;
+  /// @brief 解锁；必须与 lock 成对且按相反顺序调用。
+  void (*unlock)(const void* key) noexcept = nullptr;
+
+  explicit operator bool() const noexcept {
+    return key != nullptr && lock != nullptr && unlock != nullptr;
+  }
+};
+
+/// @brief Go `selectgo` 里 sellock 的对应物：按 channel 地址全序加锁。
+///
+/// ## 为什么必须排序
+/// 一次 select 要同时持有全部参与 channel 的锁，「检查就绪 + 登记等待节点」
+/// 才是一个原子步骤（对应 Go 的 `sellock` 之后集中处理所有 case）。若两个
+/// select 以各自的 case 顺序加锁，就会形成 A→B / B→A 的锁序环：两个 goroutine
+/// 各持一把锁、互等对方的另一把，永久挂起。Go 的解法是先对 hchan 指针做
+/// 堆排序得到全局一致的顺序再加锁（`runtime/chan.go` 的 lockorder），这里
+/// 用 `std::sort` 达到同样效果。
+///
+/// ## 去重
+/// 同一个 channel 可以同时出现在一个 select 的两个 case 里（例如同一通道
+/// 上同时收发）；ChannelSpinLock 不可重入，重复加锁会自锁。排序后相邻同键
+/// 只保留一项。
+///
+/// ## RAII
+/// 析构按加锁顺序逆序解锁；Select 的异常/提前返回路径无需手工回滚。锁函数
+/// 为 noexcept，加锁过程不会抛异常留下「部分持锁」状态。
+class SelectLockSet {
+ public:
+  SelectLockSet() = default;
+  ~SelectLockSet() { Release(); }
+  SelectLockSet(const SelectLockSet&) = delete;
+  SelectLockSet& operator=(const SelectLockSet&) = delete;
+
+  /// @brief 登记一个 channel 锁；空 entry（nil channel）被忽略。
+  void Add(const SelectLockEntry& entry) {
+    if (entry) {
+      m_entries.push_back(entry);
+    }
+  }
+
+  /// @brief 按 key 排序去重后依次加锁；重复调用是幂等的。
+  void Acquire() {
+    if (m_entries.size() == m_locked) {
+      return;
+    }
+    std::sort(m_entries.begin(), m_entries.end(),
+              [](const SelectLockEntry& lhs, const SelectLockEntry& rhs) {
+                return lhs.key < rhs.key;
+              });
+    m_entries.erase(std::unique(m_entries.begin(), m_entries.end(),
+                                [](const SelectLockEntry& lhs,
+                                   const SelectLockEntry& rhs) {
+                                  return lhs.key == rhs.key;
+                                }),
+                    m_entries.end());
+    for (; m_locked < m_entries.size(); ++m_locked) {
+      m_entries[m_locked].lock(m_entries[m_locked].key);
+    }
+  }
+
+  /// @brief 逆序释放已持有的锁；重复调用是幂等的。
+  void Release() noexcept {
+    while (m_locked > 0) {
+      --m_locked;
+      m_entries[m_locked].unlock(m_entries[m_locked].key);
+    }
+  }
+
+  /// @brief 当前已持有的锁数量（调试与测试用）。
+  std::size_t LockedCount() const noexcept { return m_locked; }
+
+  /// @brief 去重排序后的锁数量（调试与测试用）。
+  std::size_t Size() const { return m_entries.size(); }
+
+ private:
+  std::vector<SelectLockEntry> m_entries;
+  std::size_t m_locked{0};
+};
+
 // ---- 平台原语（实现在 src/concurrency/channel.cpp，避免 header 依赖） ----
 
 /// @brief 唤醒一个在该 futex 字上等待的线程（用于 per-node 唤醒字）。
@@ -1722,15 +1813,59 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     return changed;
   }
 
-  // 注册 select 接收 case。持有通道锁时再次检查就绪，避免发送者在探测
-  // 与发布等待节点之间插入；调用方选择其他 case 或超时/取消获胜后，
-  // DisarmSelect 会移除节点。
+  // ---- select 统一加锁（对齐 Go selectgo 的 sellock / selunlock） ----
+
+  /// @brief 返回 select 锁集的排序键。channel 对象地址在其生命周期内不变，
+  ///        足以作为全序键；同一 channel 在一个 select 中出现多次时由
+  ///        SelectLockSet 去重（ChannelSpinLock 不可重入）。
+  const void* SelectLockKey() const noexcept { return this; }
+
+  /// @brief 按 lockorder 加锁。调用方必须已按 SelectLockKey 排序后调用。
+  void SelectLock() const noexcept { m_lock.lock(); }
+
+  /// @brief 按 lockorder 逆序解锁。
+  void SelectUnlock() const noexcept { m_lock.unlock(); }
+
+  /// @brief arm/disarm 在锁内推进 generation 后，由 Select 在锁外调用。
+  void NotifySelectChange() noexcept { NotifyChange(); }
+
+  // 注册 select 接收 case（单 case 加锁的兼容包装）。
+  // 新代码应使用 SelectLockSet 一次性持有整组锁，然后调用
+  // ArmSelectRecvLocked —— 逐 case 加锁/解锁无法保证 arm 阶段的原子性。
   bool ArmSelectRecv(const std::shared_ptr<detail::SelectWaitState>& state,
                      std::size_t index) {
     if (!state || state->IsSelected()) {
       return false;
     }
-    std::unique_lock<detail::ChannelSpinLock> lock(m_lock);
+    bool armed = false;
+    bool notify = false;
+    {
+      std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
+      armed = ArmSelectRecvLocked(state, index, &notify);
+    }
+    if (notify) {
+      NotifyChange();
+    }
+    return armed;
+  }
+
+  // 注册 select 接收 case 的无锁版本。
+  //
+  // 持有通道锁时再次检查就绪，避免发送者在探测与发布等待节点之间插入。
+  //
+  // @pre 调用方已按 SelectLockKey 全序持有本 channel 的锁（见 SelectLockSet）。
+  // @param notify 输出：本调用推进了代际，调用方必须在解锁后 NotifyChange()。
+  bool ArmSelectRecvLocked(
+      const std::shared_ptr<detail::SelectWaitState>& state, std::size_t index,
+      bool* notify) {
+    if (notify == nullptr) {
+      return false;
+    }
+    *notify = false;
+    if (!state || state->IsSelected()) {
+      return false;
+    }
+    // 先锁后验：锁外看起来未选中，持锁后仍需重查（防 ABA / 迟到选择）。
     if (state->IsSelected()) {
       return false;
     }
@@ -1756,8 +1891,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
         }
         RefillBufferLocked();
         m_generation.fetch_add(1, std::memory_order_release);
-        lock.unlock();
-        NotifyChange();
+        *notify = true;
         return true;
       }
     }
@@ -1814,8 +1948,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
           m_senders.pop_front();
           ReleaseSelectNode(sender);
           m_generation.fetch_add(1, std::memory_order_release);
-          lock.unlock();
-          NotifyChange();
+          *notify = true;
           return true;
         }
       }
@@ -1840,8 +1973,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
             std::memory_order_release);
         WakeNodeLocked(sender);
         m_generation.fetch_add(1, std::memory_order_release);
-        lock.unlock();
-        NotifyChange();
+        *notify = true;
         return true;
       }
     }
@@ -1852,10 +1984,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       probe.status = ChannelStatus::kClosed;
       probe.error = ChannelClosedError();
       const bool selected = state->TrySelect(index, std::move(probe));
-      lock.unlock();
-      if (selected) {
-        NotifyChange();
-      }
+      *notify = selected;
       return selected;
     }
 
@@ -1865,19 +1994,43 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     pending->generation = NextWaiterGeneration();
     m_receivers.push_back(pending);
     m_generation.fetch_add(1, std::memory_order_release);
-    lock.unlock();
-    NotifyChange();
+    *notify = true;
     return true;
   }
 
-  // 注册 select 发送 case。SendCase 按约定要求值可复制，使 arm 失败时值
-  // 仍保留到其他 case 被选中。
+  // 注册 select 发送 case（单 case 加锁的兼容包装）。SendCase 按约定要求
+  // 值可复制，使 arm 失败时值仍保留到其他 case 被选中。
   bool ArmSelectSend(const std::shared_ptr<detail::SelectWaitState>& state,
                      std::size_t index, const T& value) {
     if (!state || state->IsSelected()) {
       return false;
     }
-    std::unique_lock<detail::ChannelSpinLock> lock(m_lock);
+    bool armed = false;
+    bool notify = false;
+    {
+      std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
+      armed = ArmSelectSendLocked(state, index, value, &notify);
+    }
+    if (notify) {
+      NotifyChange();
+    }
+    return armed;
+  }
+
+  // 注册 select 发送 case 的无锁版本。
+  //
+  // @pre 调用方已按 SelectLockKey 全序持有本 channel 的锁（见 SelectLockSet）。
+  // @param notify 输出：本调用推进了代际，调用方必须在解锁后 NotifyChange()。
+  bool ArmSelectSendLocked(const std::shared_ptr<detail::SelectWaitState>& state,
+                           std::size_t index, const T& value, bool* notify) {
+    if (notify == nullptr) {
+      return false;
+    }
+    *notify = false;
+    if (!state || state->IsSelected()) {
+      return false;
+    }
+    // 先锁后验：锁外看起来未选中，持锁后仍需重查（防 ABA / 迟到选择）。
     if (state->IsSelected()) {
       return false;
     }
@@ -1937,8 +2090,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
           m_receivers.pop_front();
           ReleaseSelectNode(receiver);
           m_generation.fetch_add(1, std::memory_order_release);
-          lock.unlock();
-          NotifyChange();
+          *notify = true;
           return true;
         }
       }
@@ -1962,8 +2114,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
           std::memory_order_release);
       WakeNodeLocked(receiver);
       m_generation.fetch_add(1, std::memory_order_release);
-      lock.unlock();
-      NotifyChange();
+      *notify = true;
       return true;
     }
 
@@ -1973,10 +2124,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       probe.status = ChannelStatus::kClosed;
       probe.error = ChannelClosedError();
       const bool selected = state->TrySelect(index, std::move(probe));
-      lock.unlock();
-      if (selected) {
-        NotifyChange();
-      }
+      *notify = selected;
       return selected;
     }
 
@@ -1997,8 +2145,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
         return false;
       }
       m_generation.fetch_add(1, std::memory_order_release);
-      lock.unlock();
-      NotifyChange();
+      *notify = true;
       return true;
     }
 
@@ -2014,11 +2161,11 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     pending->generation = NextWaiterGeneration();
     m_senders.push_back(pending);
     m_generation.fetch_add(1, std::memory_order_release);
-    lock.unlock();
-    NotifyChange();
+    *notify = true;
     return true;
   }
 
+  // 撤销 select 注册的节点（单 case 加锁的兼容包装）。
   void DisarmSelect(const std::shared_ptr<detail::SelectWaitState>& state) {
     if (!state) {
       return;
@@ -2026,6 +2173,24 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     bool changed = false;
     {
       std::lock_guard<detail::ChannelSpinLock> lock(m_lock);
+      changed = DisarmSelectLocked(state);
+    }
+    if (changed) {
+      NotifyChange();
+    }
+  }
+
+  // 撤销 select 注册的节点的无锁版本。
+  //
+  // @pre 调用方已按 SelectLockKey 全序持有本 channel 的锁（见 SelectLockSet）。
+  // @return true 表示移除过等待节点（调用方需在解锁后 NotifyChange）。
+  bool DisarmSelectLocked(
+      const std::shared_ptr<detail::SelectWaitState>& state) {
+    if (!state) {
+      return false;
+    }
+    bool changed = false;
+    {
       detail::WaitNodeBase* node = m_senders.head();
       while (node != nullptr) {
         detail::WaitNodeBase* next = node->next;
@@ -2050,9 +2215,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
         m_generation.fetch_add(1, std::memory_order_release);
       }
     }
-    if (changed) {
-      NotifyChange();
-    }
+    return changed;
   }
 
  private:
@@ -3475,6 +3638,18 @@ struct SelectCase {
   // CancelledProbe；Select 在回滚（Cancel）之前会重试它，避免循环里
   // 因 arm 过的 case 被跳过而漏掉取消分支。
   std::function<SelectProbe()> cancel_probe;
+  // 内建 channel case 的 select 锁集入口与无锁版 arm/disarm。
+  // Select 主循环按 SelectLockKey 全序一次性持有整组锁（Go selectgo 的
+  // sellock），再调用 arm_locked，使「重验就绪 + 登记等待节点」在锁集内
+  // 原子完成；非 channel case（DoneCase/AfterCase）不参与 channel 锁序。
+  detail::SelectLockEntry lock_entry;
+  std::function<bool(const std::shared_ptr<detail::SelectWaitState>&,
+                     std::size_t, bool*)>
+      arm_locked;
+  std::function<bool(const std::shared_ptr<detail::SelectWaitState>&)>
+      disarm_locked;
+  // 锁外通知：arm_locked/disarm_locked 推进 generation 后由 Select 调用。
+  std::function<void()> notify_change;
 
   explicit operator bool() const noexcept {
     return static_cast<bool>(probe) || is_default || static_cast<bool>(arm) ||
@@ -3610,11 +3785,41 @@ SelectCase RecvCase(const ChannelPtr<T>& channel) {
       },
       {},
       {},
+      {},
+      {},
+      {},
+      {},
       {}};
   result.arm_checked = [channel](
       const std::shared_ptr<detail::SelectWaitState>& state,
       std::size_t index) {
     return !channel || channel->ArmSelectRecv(state, index);
+  };
+  // 锁集入口：key 用 channel 对象地址，函数指针在 Channel<T> 上实例化。
+  result.lock_entry = detail::SelectLockEntry{
+      channel ? channel->SelectLockKey() : nullptr,
+      [](const void* key) noexcept {
+        static_cast<const Channel<T>*>(key)->SelectLock();
+      },
+      [](const void* key) noexcept {
+        static_cast<const Channel<T>*>(key)->SelectUnlock();
+      }};
+  result.arm_locked = [channel](
+                          const std::shared_ptr<detail::SelectWaitState>& state,
+                          std::size_t index, bool* notify) {
+    if (!channel) {
+      return false;
+    }
+    return channel->ArmSelectRecvLocked(state, index, notify);
+  };
+  result.disarm_locked =
+      [channel](const std::shared_ptr<detail::SelectWaitState>& state) {
+        return channel ? channel->DisarmSelectLocked(state) : false;
+      };
+  result.notify_change = [channel] {
+    if (channel) {
+      channel->NotifySelectChange();
+    }
   };
   result.unsupported = !std::is_copy_constructible<T>::value;
   return result;
@@ -3672,6 +3877,10 @@ SelectCase SendCase(const ChannelPtr<T>& channel, T value) {
       },
       {},
       {},
+      {},
+      {},
+      {},
+      {},
       {}};
   result.arm_checked = [channel, shared_value](
       const std::shared_ptr<detail::SelectWaitState>& state,
@@ -3680,6 +3889,34 @@ SelectCase SendCase(const ChannelPtr<T>& channel, T value) {
       return !channel || channel->ArmSelectSend(state, index, *shared_value);
     }
     return true;
+  };
+  result.lock_entry = detail::SelectLockEntry{
+      channel ? channel->SelectLockKey() : nullptr,
+      [](const void* key) noexcept {
+        static_cast<const Channel<T>*>(key)->SelectLock();
+      },
+      [](const void* key) noexcept {
+        static_cast<const Channel<T>*>(key)->SelectUnlock();
+      }};
+  result.arm_locked = [channel, shared_value](
+                          const std::shared_ptr<detail::SelectWaitState>& state,
+                          std::size_t index, bool* notify) {
+    if constexpr (std::is_copy_constructible<T>::value) {
+      if (!channel) {
+        return false;
+      }
+      return channel->ArmSelectSendLocked(state, index, *shared_value, notify);
+    }
+    return true;
+  };
+  result.disarm_locked =
+      [channel](const std::shared_ptr<detail::SelectWaitState>& state) {
+        return channel ? channel->DisarmSelectLocked(state) : false;
+      };
+  result.notify_change = [channel] {
+    if (channel) {
+      channel->NotifySelectChange();
+    }
   };
   result.unsupported = !std::is_copy_constructible<T>::value;
   return result;
@@ -3703,6 +3940,10 @@ inline SelectCase DefaultCase() {
                       return probe;
                     },
                     true,
+                    {},
+                    {},
+                    {},
+                    {},
                     {},
                     {},
                     {},
@@ -3870,7 +4111,11 @@ inline SelectCase DoneCase(const ContextPtr& ctx) {
           return detail::CancelledProbe(ctx);
         }
         return SelectProbe{};
-      }};
+      },
+      {},
+      {},
+      {},
+      {}};
 }
 
 /**
@@ -3927,6 +4172,10 @@ inline SelectCase AfterCase(std::chrono::steady_clock::time_point deadline) {
           timer->Cancel();
         }
       },
+      {},
+      {},
+      {},
+      {},
       {},
       {},
       {}};

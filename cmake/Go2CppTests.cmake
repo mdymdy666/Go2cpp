@@ -782,6 +782,18 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_fiber_select_test COMMAND go2cpp_fiber_select_test)
     set_tests_properties(go2cpp_fiber_select_test PROPERTIES TIMEOUT 120)
 
+    # ---- Select lockorder（对齐 Go selectgo 的 sellock）：锁序/死锁/随机压力 ----
+    # 覆盖两个 select 以相反 case 顺序操作同一组 channel、同 channel 双 case
+    # 去重、随机 case 组合、关闭拆除与线程/Fiber 混合。
+    add_executable(go2cpp_select_lockorder_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrency/test_select_lockorder.cpp)
+    target_link_libraries(go2cpp_select_lockorder_test PRIVATE
+        go2cpp_channel go2cpp_context go2cpp_scheduler go2cpp_fiber go2cpp_error)
+    target_compile_options(go2cpp_select_lockorder_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_select_lockorder_test COMMAND go2cpp_select_lockorder_test)
+    set_tests_properties(go2cpp_select_lockorder_test PROPERTIES TIMEOUT 300)
+
     # ---- compress 模块：flate / zlib / gzip（薄封装系统 zlib）----
     # 一个可执行文件包含全部测试段：单元、随机、系统 gzip 互操作、8 个真实场景
     # 与低熵/高熵压测。拆成多个 target 只会重复编译模板实例，没有收益。

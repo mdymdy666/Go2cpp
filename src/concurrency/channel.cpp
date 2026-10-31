@@ -37,8 +37,10 @@
 #include <cstdio>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 #if defined(__linux__)
 #include <cerrno>
@@ -352,9 +354,43 @@ SelectResult Select(const std::vector<SelectCase>& cases,
   // step1 的一部分：统一的拆除器。Disarm 只负责清理，所以即使某个
   // 用户提供的 case 在拆除时抛异常，也不能阻止其余 channel 的注册项
   // 被移除 —— 否则会泄漏等待节点。
+  //
+  // 内建 channel case 的撤销同样遵守 select 锁序：先按 SelectLockKey 全序
+  // 持有整组 channel 锁，在一个锁集内摘除全部等待节点（对齐 Go selectgo
+  // 结尾的 sellock），再在锁外通知代际观察者；非 channel 的外部注册
+  // （DoneCase/AfterCase）不参与 channel 锁序，放在锁外处理。
   const auto disarm = [](const std::vector<SelectCase>& select_cases,
                          const std::shared_ptr<detail::SelectWaitState>& state) {
+    std::vector<std::function<void()>> pending_notifies;
+    {
+      detail::SelectLockSet locks;
+      for (const auto& item : select_cases) {
+        locks.Add(item.lock_entry);
+      }
+      locks.Acquire();
+      for (const auto& item : select_cases) {
+        if (!item.disarm_locked) {
+          continue;
+        }
+        bool changed = false;
+        try {
+          changed = item.disarm_locked(state);
+        } catch (...) {
+          // 与单 case 版本一致：一个 case 的清理失败不能阻止其余清理。
+          changed = false;
+        }
+        if (changed && item.notify_change) {
+          pending_notifies.push_back(item.notify_change);
+        }
+      }
+    }
+    for (const auto& notify : pending_notifies) {
+      notify();
+    }
     for (const auto& item : select_cases) {
+      if (item.disarm_locked) {
+        continue;
+      }
       if (item.disarm) {
         try {
           item.disarm(state);
@@ -462,14 +498,61 @@ SelectResult Select(const std::vector<SelectCase>& cases,
 
     // step3 开始：注册阶段。为本次等待创建共享状态，然后把每个 case
     // arm 到对应 channel 的等待队列上。任何一个失败都必须完整回滚。
+    //
+    // 内建 channel case 走 Go selectgo 的 sellock 路径：先把所有参与 channel
+    // 的锁按地址排序（SelectLockSet 内部去重），一次性持有整组锁，然后在
+    // 锁内逐个「重验就绪 + 登记等待节点」。与逐 case 加锁/解锁相比：
+    // - 两个 select 即使 case 顺序相反，加锁顺序也一致，不会形成锁序环；
+    // - arm 阶段对其它线程是原子的，不存在「一半 case 已登记、另一半还没
+    //   登记」的窗口被第三方 select 抢先交接。
     bool has_poll_case = false;
     auto wait_state = std::make_shared<detail::SelectWaitState>();
+    // arm 在锁内推进 generation，通知必须等解锁后统一发出；声明在 try 外
+    // 是为了在 arm 中途抛异常时也能补发，避免观察者漏掉一次代际变化。
+    std::vector<std::function<void()>> pending_notifies;
     try {
+      {
+        detail::SelectLockSet locks;
+        for (const auto& item : cases) {
+          locks.Add(item.lock_entry);
+        }
+        locks.Acquire();
+        for (std::size_t index = 0; index < cases.size(); ++index) {
+          if (!cases[index].arm_locked) {
+            continue;
+          }
+          bool notify = false;
+          const bool armed =
+              cases[index].arm_locked(wait_state, index, &notify);
+          if (notify && cases[index].notify_change) {
+            pending_notifies.push_back(cases[index].notify_change);
+          }
+          if (!armed && !wait_state->IsSelected()) {
+            throw std::runtime_error(
+                "channel select case registration failed");
+          }
+        }
+      }
+      // 锁外通知：arm 在锁内推进了 generation，唤醒 WaitForChange 观察者。
+      for (const auto& notify : pending_notifies) {
+        notify();
+      }
+      pending_notifies.clear();
+      // 非 channel case（DoneCase/AfterCase/用户自定义）按原顺序 arm，
+      // 它们各自管理外部事件源，不参与 channel 锁序。
       for (std::size_t index = 0; index < cases.size(); ++index) {
+        if (cases[index].arm_locked) {
+          continue;
+        }
         if (!cases[index].arm && !cases[index].arm_checked) {
           has_poll_case = has_poll_case ||
                           (!cases[index].is_default && cases[index].probe);
           continue;
+        }
+        if (wait_state->IsSelected()) {
+          // 内建 channel case 已经在锁内获胜；继续注册只会留下待清理的
+          // 外部回调，直接跳过。
+          break;
         }
         bool armed = true;
         if (cases[index].arm_checked) {
@@ -482,6 +565,9 @@ SelectResult Select(const std::vector<SelectCase>& cases,
         }
       }
     } catch (...) {
+      for (const auto& notify : pending_notifies) {
+        notify();
+      }
       wait_state->Cancel();
       try {
         disarm(cases, wait_state);
