@@ -31,6 +31,7 @@ include(cmake/Go2CppModules.cmake)
 # network/scheduler/channel 目标）；eBPF 不可用时自动降级为仅 /proc 采集。
 include(cmake/Go2CppMonitor.cmake)
 include(cmake/Go2CppTests.cmake)
+include(cmake/Go2CppP2P.cmake)
 include(cmake/Go2CppInstall.cmake)
 
 # 统一命令行入口（tools/cli）。默认 OFF：

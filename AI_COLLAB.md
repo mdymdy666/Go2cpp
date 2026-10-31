@@ -484,3 +484,58 @@ errno noinline），不是寄存器保存。
 - 边界：未改任何现有协议实现；未 commit。
 - 已知限制：无 HPACK、HEADERS 单帧（超限自动分区到 DATA）、HTTP 隧道半双工、
   跨进程续传只校验续传段 SHA-256、事件队列有界 65536。
+
+---
+
+## 2026-10-31 网络层 4 项待办清理（B-01/B-02/B-03/B-06，子 agent：清网络层）
+
+- B-01（P0）SOCKS5 建连 50ms：根因不是 Nagle，而是 `Socks5Server::Poll()` 的 pollfd
+  掩码在 kGreeting/kRequest 只监听 POLLIN，握手响应待写时没有 POLLOUT，只能等 50ms
+  轮询超时才刷出（strace 实测两次 send 间隔 52ms）。修复：所有阶段统一补待写方向
+  POLLOUT；上游 raw connect socket 补 TCP_NODELAY。复测（taskset 2,3，loadavg 0.5~2.4）：
+  p50 50.6ms→0.30~0.33ms，p99 52.6ms→0.64~0.79ms（4 轮），吞吐 42→2660~2933 ops/s。
+- B-02（P1）tcp_proxy accept 补 TCP_NODELAY（core bento 不链接 network，用同语义
+  setsockopt；Stats 加 nodelay_applied/nodelay_failed）。debug_server 经核实监听
+  AF_UNIX，TCP_NODELAY 不适用，改为按 SO_DOMAIN 仅 TCP 域设置，STATUS 暴露
+  accept_nodelay。socks5 upstream_fd 同类缺口一并补。
+- B-03（P1）CoAP 默认种子：`random_seed=0` 表示每客户端自动生成
+  （random_device ^ steady_clock ^ pid ^ 原子序号）；显式非 0 仍可复现。
+  新增「双默认客户端请求同一服务端不串响应」测试。
+- B-06（P1）HttpServer 示范接入 bufio：`use_bufio` 默认关，响应拆头+体两段
+  `FlushBatch()` 一次 writev，超容量直写旁路（B-04）；`GetWriteStats()` 计数。
+  实测单连接 3000 请求：默认 8439 ops/s，bufio 8060（0.955×），默认关是正确决策。
+- 测试：bento_test_socks5 204 / tcp_proxy 46 / coap 38587 / http_server 109 全过；
+  `--correctness` 37 场景 237 断言、`--nodelay` 5 场景 41 断言全过；
+  全量 ctest 146 Passed / 5 Failed（并发锁、状态矩阵、tools 缺产物，均与本次无关）/
+  75 Not Run（其他模块未构建）。
+- 文件：src/bento/net/{socks5,tcp_proxy,coap,http_server}.cpp、src/debug/debug_server.cpp
+  + 对应头文件 + 4 个测试；报告 /tmp/net_todo_clear.md。未 commit。
+
+---
+
+## 2026-10-31 P2P 公网穿透（子 agent：P2P 公网穿透）
+
+- **新增** `include/go2cpp/p2p/**` + `src/p2p/**`：STUN（RFC 5389 子集）、
+  RFC 3489 四类 NAT 检测、本地 STUN echo 服务器（双 IP/4 socket/CHANGE-REQUEST）、
+  ICE 简化（host/srflx/relay 候选 + 优先级 + 并行连通性检查）、UDP 打洞、
+  简化 TURN（Allocation/Send/Data + 服务器数据面 + 统计）、TCP 同时打开、
+  `P2PChannel`（打洞/降级/keepalive/RTT/序列号缺口统计）。
+- **新增** `tests/p2p/**`：4 个测试可执行 + 统一入口 `run_p2p_tests.sh` +
+  基准 `bench_p2p`；24 个场景，含 4 类模拟 NAT、跨进程 fork+exec 打洞、
+  2000 包压测、500 条随机数据、500 轮解析 fuzz。
+- **新增** `cmake/Go2CppP2P.cmake`；顶层 `CMakeLists.txt` 在
+  `Go2CppTests.cmake` 之后、`Go2CppInstall.cmake` 之前 include 一行。
+  `GO2CPP_WITH_P2P` / `GO2CPP_P2P_TESTS` 默认 ON，零外部依赖。
+- **文档** `docs/modules/p2p-nat-traversal.md`（原理/设计/部署/信令接口/限制）。
+- **测试**（`.build-bento-wsl`，Release）：
+  - `p2p_test_stun`：约 2030 断言 0 失败（四类 NAT 判定全对）；1000 次 Binding
+    约 9919 req/s，P50 0.088ms；
+  - `p2p_test_p2p`：94 断言 0 失败；FullCone/PortRestricted 打洞成功，
+    Symmetric 降级中继成功；2000 包 100% 到达约 109MB/s；
+  - `p2p_test_tcp_punch`：TCP 同时打开成功；
+  - `p2p_test_p2p_interprocess`：两进程 host 直连与 srflx 打洞均 PASS；
+  - `ctest -R p2p`：4/4 通过（6.9s）。
+- **已知限制**：对称 NAT 不可打洞（只能中继）；STUN/TURN 无鉴权；
+  ICE 无 nomination/角色；数据面无重传/拥塞控制；TCP 打洞平台相关；
+  IPv6 打洞未覆盖（端点/STUN 支持 IPv6，MockNat 与 TCP 打洞仅 IPv4）。
+- **状态**：未 commit；未改任何既有模块实现。
