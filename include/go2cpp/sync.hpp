@@ -36,9 +36,10 @@ namespace detail {
 ///          读到它——否则每次加锁都要多做一次跨库函数调用。
 extern std::atomic<int> g_held_park_detect;
 
-/// @brief 检测开关的热路径读法：一次 relaxed load + 可预测分支。
+/// @brief 检测开关的热路径读法：**仅一次 relaxed load** + 可预测分支。
 /// @note 变量在 sync.cpp 里由静态初始化按「环境变量 / NDEBUG」定好初值，
-///       因此热路径没有「尚未解析」这一层分支。
+///       因此热路径没有「尚未解析」这一层分支；环境变量解析与 owner 检查
+///       都在显式 noinline 的冷函数里，不会被内联进 Lock/Unlock 的内联体。
 inline bool held_park_detection_on() noexcept {
     return g_held_park_detect.load(std::memory_order_relaxed) != 0;
 }
@@ -320,6 +321,9 @@ public:
 #if GO2CPP_DEBUG_RESOURCES
         UnlockSlow();
 #else
+        // 热路径成本：一次 relaxed load + 可预测分支；检测关闭（默认）时
+        // 这就是全部开销。owner 检查本身在 noinline 冷路径
+        // NoteUnlockHeldSlow() 的首行：owner==0 时直接返回，不查当前 G。
         // 检测必须在 CAS 之前读 owner：释放之后 owner 可能已被新持有者改写。
         if (detail::held_park_detection_on()) {
             NoteUnlockHeldSlow();
@@ -362,7 +366,10 @@ private:
     bool LockImpl(const ContextPtr& context, bool ignore_task_cancellation);
     /** @brief Unlock 快路径 CAS 失败后的队列交接（原 Unlock 实现）。 */
     void UnlockSlow();
-    /** @brief 持锁 park 检测的冷路径；只在检测开关打开时调用。 */
+    /** @brief 持锁 park 检测的冷路径；只在检测开关打开时调用。
+     *  @note 两个函数都显式 noinline（定义在 sync.cpp）：Lock/Unlock 内联
+     *        快路径只保留一次 relaxed load + 一次调用，不在调用点展开 owner
+     *        检查或当前 G 查询；Unlock 侧先读 owner，owner==0 时不查当前 G。 */
     void NoteLockHeldSlow();
     void NoteUnlockHeldSlow();
 

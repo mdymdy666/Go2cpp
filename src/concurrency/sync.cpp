@@ -105,6 +105,15 @@ int WakeFutex(std::atomic<std::uint32_t>* word, int n) {
 }  // namespace
 #endif  // __linux__
 
+// 冷路径统一标注 noinline：持锁检测的 owner 检查、当前 G 查询只应在检测
+// 开启的罕见路径上执行。显式标注可把契约锁死，不依赖构建选项（将来若开
+// LTO，也不会被内联回 Lock/Unlock 的快路径）。
+#if defined(__GNUC__) || defined(__clang__)
+#define GO2CPP_SYNC_COLD __attribute__((noinline))
+#else
+#define GO2CPP_SYNC_COLD
+#endif
+
 namespace go2cpp::sync {
 
 // ---- 持锁 park 检测（最小实现） ----
@@ -114,7 +123,9 @@ namespace go2cpp::sync {
 namespace {
 
 /// @brief 首次使用时的默认值解析（冷路径：读环境变量 / 按 NDEBUG 决定）。
-int ResolveHeldParkDefault() noexcept {
+/// @note 显式 noinline：这是 .so 初始化阶段只跑一次的冷代码，绝不能被内联
+///       进任何热路径（getenv/atoi 会污染 Lock/Unlock 的代码布局）。
+GO2CPP_SYNC_COLD int ResolveHeldParkDefault() noexcept {
     if (const char* value = std::getenv("GO2CPP_DETECT_HELD_PARK")) {
         return std::atoi(value) != 0 ? 1 : 0;
     }
@@ -453,21 +464,56 @@ public:
 
 private:
     /**
-     * @brief native 等待者的无锁唤醒：只推进节点私有的 futex 代际。
-     * @note 调用方必须已确认 。本函数刻意不读  /
-     *       （它们只在  下写），因此不会与
-     *        构成数据竞争。即使这次唤醒落在复用后的节点上，也
-     *       只是一次虚假唤醒 —— 等待者看到终态才会返回，否则重新挂起。
+     * @brief native 等待者的无锁唤醒：有 futex 等待者时才推进代际。
+     * @note 调用方必须已确认节点独占（`TryFinish` 成功）且 `result()` 已发布
+     *       终态；本函数刻意不读 `m_task` / `m_scheduler`（它们只在
+     *       `m_wake_mutex` 下写），因此不会与 `Reset()` 构成数据竞争。
+     *       即使这次唤醒落在复用后的节点上，也只是一次虚假唤醒 —— 等待者
+     *       看到终态才会返回，否则重新挂起。
+     *
+     * ## 为什么没有 futex 等待者时不推进代际（B 批）
+     *
+     * `futex_seq` 只是 FUTEX_WAIT 的唤醒字、以及等待者自旋时的「有进展」
+     * 信号；等待者真正的返回谓词是 `m_hot.result`。若 `futex_waiters == 0`，
+     * 说明没有任何线程睡在 futex 上，推进代际只会对一条可能被多核共享的
+     * 缓存行做一次 `lock xadd`（跨核 RMW，20~40 cycles），却无人消费。
+     *
+     * ## 不丢唤醒的论证
+     *
+     * 记唤醒方 `W1: result.store(终态, acq_rel CAS 的 release 侧)`（调用方
+     * 已经做）、`W2: load(futex_waiters)`；等待方 `A: futex_waiters.fetch_add
+     * (1, acq_rel)` 后 `B: result.load(acquire)`（见 WaitNative）。
+     *
+     * - `W2` 读到 0 => A 的 RMW 不在 W2 之前（RMW 的写立即进入该原子量的
+     *   coherence order；W2 若排在 A 之后必读到 >=1）；
+     * - 若 B 仍读到 kWaiting，则 W1 排在 B 之后（同一条 result 的 coherence
+     *   顺序），于是 `W1 < W2 < A < B < W1` 矛盾。
+     *
+     * 所以 B 必看到终态：等待者要么在自旋里直接返回，要么在 A 之后立刻
+     * 返回，不会带着旧代际睡进 FUTEX_WAIT。反过来，只要 W2 看到非 0，
+     * 就照旧推进代际并 FUTEX_WAKE，覆盖「已经睡下」的等待者。
+     * 该论证只用相干性 + 同线程 program order；实际硬件依赖 x86-TSO / ARM
+     * 的缓存一致性（跨核可见性不会比 coherence order 更晚）。若将来移植到
+     * 更弱的模型且验证不了，回退方式就是恢复「无条件 fetch_add」一行。
      */
     void WakeNativeLocked() noexcept {
 #if defined(__linux__)
-        // 代际推进必须无条件执行：它既是等待者的"通知已发生"信号，
-        // 也是 FUTEX_WAIT 的唤醒字。只有确实有人睡在 futex 上时才付
-        // 一次系统调用；正在自旋的等待者会通过代际/结果自行发现。
-        m_hot.futex_seq.fetch_add(1, std::memory_order_release);
-        if (m_hot.futex_waiters.load(std::memory_order_acquire) != 0U) {
-            (void)WakeFutex(&m_hot.futex_seq, 1);
+        if (m_hot.futex_waiters.load(std::memory_order_acquire) == 0U) {
+            // 无 futex 等待者：终态已经发布，自旋者会自行看到。不碰代际字，
+            // 省掉一次跨核 RMW 与随之而来的缓存行独占。
+            return;
         }
+        // 有线程睡在 futex 上：推进代际（它同时是 FUTEX_WAIT 的期望字），
+        // 再唤醒一个。唤醒数 1 即可：每个等待者醒来后都会重判终态。
+        AdvanceFutexSeqLocked();
+#endif
+    }
+
+    /// @brief 推进代际并唤醒一个 futex 等待者（与等待方握手，见上方论证）。
+    void AdvanceFutexSeqLocked() noexcept {
+#if defined(__linux__)
+        m_hot.futex_seq.fetch_add(1, std::memory_order_release);
+        (void)WakeFutex(&m_hot.futex_seq, 1);
 #endif
     }
 
@@ -724,7 +770,37 @@ private:
 // WaitNode 只在等待期间被队列或取消回调引用。完成一次等待后将对象放回
 // 当前 M 的小缓存，避免混合 Mutex 在短临界区竞争时反复分配控制块和
 // condition_variable。缓存节点已清空 scheduler/task，不延长用户对象生命期。
-thread_local std::vector<std::shared_ptr<WaitNode>> t_wait_node_cache;
+//
+// ## 为什么显式指定 initial-exec（B 批）
+//
+// 共享库里 `thread_local` 默认是 general-dynamic 模型：编译器在编译期不知道
+// 该变量相对线程指针（`fs` 段）的偏移，每次访问都要把模块 id 交给
+// `__tls_get_addr` 做一次运行期解析（PLT 间接调用 + 模块查找，实测 >=10ns）。
+// `AcquireWaitNode` / `ReleaseWaitNode` 每次等待各读两次缓存，一次 park
+// 往返就多 4 次 `__tls_get_addr`，这是等待路径上一笔纯固定税。
+//
+// 本库由可执行文件在进程启动时经 DT_NEEDED 加载（不是 dlopen 插件），
+// 链接器能在静态 TLS 块里预留槽位，initial-exec 把访问退化成一条 `fs:` 段读
+// （与 channel.cpp / scheduler.cpp 的既有先例一致）。
+//
+// ## 回退条件（不要无声改回去）
+//
+// 必须回退为 general-dynamic（或改为运行期显式初始化）的情形：
+// 1. 将来需要支持 `dlopen` 本库（动态插件、热加载）—— initial-exec 变量占用
+//    静态 TLS 槽位，dlopen 时静态 TLS 块已固定，加载会失败并报
+//    "cannot allocate memory in static TLS block"；
+// 2. 主程序自身已有大量 initial-exec TLS，挤压 64KB 静态 TLS 预算；
+// 3. 需要把 sync 编译进被 dlopen 的插件 DSO。
+// 回退方式：把下面的 `tls_model("initial-exec")` 改成 `"global-dynamic"`，
+// 或删掉宏（GCC 默认即 general-dynamic）。
+#if defined(__GNUC__) || defined(__clang__)
+#define GO2CPP_SYNC_HOT_TLS __attribute__((tls_model("initial-exec")))
+#else
+#define GO2CPP_SYNC_HOT_TLS
+#endif
+
+thread_local std::vector<std::shared_ptr<WaitNode>> t_wait_node_cache
+    GO2CPP_SYNC_HOT_TLS;
 
 std::shared_ptr<WaitNode> AcquireWaitNode(Scheduler* scheduler,
                                           std::shared_ptr<Task> task) {
@@ -781,12 +857,22 @@ WaitTarget CurrentTarget() noexcept {
     // 每次快路径 CAS 失败后的第一段热代码（4t/16t 争用基准实测）。
     Scheduler* const scheduler = Scheduler::current_scheduler();
     if (scheduler == nullptr) {
+        // 非受管线程：只有「手动 Fiber」需要在 park 前被识别出来。
         const bool manual_fiber = Fiber::Current() != nullptr;
         return {nullptr, {}, manual_fiber};
     }
     auto task = Scheduler::current_task();
-    const bool manual_fiber = Fiber::Current() != nullptr && !task;
-    return {scheduler, std::move(task), manual_fiber};
+    // B 批：受管热路径（task 非空）直接短路，不再查询 `Fiber::Current()`。
+    // 后者是 fiber.cpp 里的 noinline 导出符号，跨 TU 调用要经 PLT；而原表达式
+    // `Fiber::Current() != nullptr && !task` 在 task 非空时结果恒为 false，
+    // 这次查询没有任何语义收益。受管 G 每次等锁/等通知都会走到这里，它是
+    // 4t/16t 争用基准里每次 park 的固定成本之一。
+    if (task) {
+        return {scheduler, std::move(task), false};
+    }
+    // 只有「有 scheduler 但当前没有 G」（调度器线程自身）才需要再问 Fiber。
+    const bool manual_fiber = Fiber::Current() != nullptr;
+    return {scheduler, {}, manual_fiber};
 }
 
 /**
@@ -1381,7 +1467,10 @@ bool Mutex::LockForConditionWait() {
     return LockImpl({}, true);
 }
 
-void Mutex::NoteLockHeldSlow() {
+/// @brief 记录「本 G 持锁」（B 批：冷路径，显式 noinline）。
+/// @details 定义在 .cpp、且本文件不开 LTO，本来就不会被内联进头文件快路径；
+///          显式 noinline 是为了把契约锁死，不依赖构建选项。
+GO2CPP_SYNC_COLD void Mutex::NoteLockHeldSlow() {
     Task* const self = Scheduler::current_task_ptr();
     if (self == nullptr) {
         return;
@@ -1391,7 +1480,17 @@ void Mutex::NoteLockHeldSlow() {
                           std::memory_order_relaxed);
 }
 
-void Mutex::NoteUnlockHeldSlow() {
+/// @brief 记录「本 G 释放锁」（B 批：冷路径，且先读 owner 再查当前 G）。
+/// @details 先读 owner：绝大多数 Mutex 的 `m_owner` 恒为 0（检测关闭，或这次
+///          解锁本就不是被记录的那一把）。owner==0 时直接返回，**不做跨 TU 的
+///          `current_task_ptr()` 调用**（那是一次 PLT 调用 + 一次 TLS 读）。
+///          只有 owner 非零、可能命中「持锁 park」的罕见路径才去问当前 G。
+///          两次读 owner 都必须保留：第二次用最新值判断「解锁者就是记录里的
+///          owner」，避免与并发的加锁/解锁交错时把别人的计数减错。
+GO2CPP_SYNC_COLD void Mutex::NoteUnlockHeldSlow() {
+    if (m_impl->m_owner.load(std::memory_order_relaxed) == 0U) {
+        return;
+    }
     Task* const self = Scheduler::current_task_ptr();
     if (self == nullptr) {
         return;
