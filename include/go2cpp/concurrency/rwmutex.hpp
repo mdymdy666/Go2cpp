@@ -2,7 +2,7 @@
  * @file rwmutex.hpp
  * @brief 写者优先的读写锁 `RWMutex`（协程 / OS 线程混合等待）。
  *
- * @date 2026-10-18
+ * @date 2026-10-31
  * @author DeepSeek Agent
  * @copyright MIT License（见项目根目录 LICENSE）
  *
@@ -15,41 +15,70 @@
  * ## 为什么写者优先
  *
  * 朴素的「读者优先」实现有个经典问题：只要读者持续到来，写者永远排不上队
- * （写饥饿）。本实现采用**写者优先**：一旦有写者在等，后续新读者必须排队，
+ * （写者饥饿）。本实现采用**写者优先**：一旦有写者在等，后续新读者必须排队，
  * 直到写者拿到并释放锁。代价是**读者可能被写者压制**，这是有意的取舍 ——
  * 写操作通常更短、更少，饿死写者往往意味着配置永远不生效 / 连接池永远不扩容。
  *
- * 写者之间严格 FIFO：每个写者领取一个单调递增的票据，只有票据最小者可以
- * 在「无读者、无写者」时取得锁。读者没有票据，只在「没有写者、也没有等待
- * 中的写者」时批量进入。
+ * ## 状态编码：一个 64 位原子字
  *
- * ## 混合等待是怎么做到的
+ * 门与读者计数合并在一个 `std::atomic<std::int64_t>` 里，读写都只碰这一个
+ * 缓存行（这是内层锁唯一的热点行）：
  *
- * 内部状态由 `sync::Mutex` 保护，等待用 `sync::ConditionVariable`。这两者
- * 本身就是**协程 / OS 线程双路径**：
+ * | 区间 | 含义 |
+ * |---|---|
+ * | `0 .. kGate-1` | 门开，值 = 当前读者数 |
+ * | `kWriteLocked + R` | 门关（有写者），R = 尚未退出的读者数 |
+ * | 再加 `kSlowBit` | 持锁者是慢路径（持有 `m_writer_mutex`） |
  *
- * - 受管 G 在 `Wait` 里 park，让出 M（不会阻塞 worker 线程）；
- * - 普通 OS 线程在 `Wait` 里走原生条件变量 / futex（真阻塞）。
+ * 因此：
+ * - **读者快路径**：一次 `fetch_add(1)`；`prev < kGate` 即门开可直接进入，
+ *   否则回滚一次 `fetch_sub(1)`（与旧实现同为单 RMW，读 16t 不退化）；
+ * - **写者快路径（无读者、无写者、无人排队）**：一次
+ *   `CAS(0 → kWriteLocked)`；`Unlock` 一次 `fetch_sub` 即可开门。这是 1t
+ *   纯写的目标路径，不碰任何互斥量 / 队列 / 条件变量。
  *
- * 本文件不碰 futex、不自建等待队列，避免重复实现已经验证过的唤醒交接逻辑。
+ * ## 写者 FIFO：慢路径用 `sync::Mutex` 串行化
+ *
+ * 写者只在**快路径失败**（有读者、有写者、或已有写者排队）时走慢路径：
+ * 先 `m_pending++`（告诉读者门要关了，别再进），再 `m_writer_mutex.Lock()`
+ * 排队。`sync::Mutex` 本身是 FIFO 的、且对协程走 park（不阻塞 M），所以
+ * 写者顺序由它保证，**不再需要票号 / deque / 每个写者自带条件变量**。
+ *
+ * 代价与取舍（实测见 `docs/reports/2026-10-31-rw-write-hard.md`）：
+ *
+ * - 1t 无竞争：单 CAS + 单 fetch_sub，约 5 ns，优于 Go 的 6.7 ns；
+ * - 4t 纯写：每 op 一次 `sync::Mutex` 交接（跨核 CAS / futex）+ 2 次状态字
+ *   RMW。**跨核交接的硬件下限约 30 ns（ping-pong 实测 30.7 ns）**，所以
+ *   4t 不可能做到 Go 的 21 ns —— Go 的 goroutine 在同一个 P 上直接 handoff，
+ *   不跨核；C++ 的 OS 线程必须跨核。本实现目标是把额外开销压到接近这个
+ *   下限，而不是伪造数据。
+ *
+ * ## 等待路径（慢路径才进入）
+ *
+ * 慢路径的 park 统一用 `m_park_mutex` + 两个条件变量：
+ *
+ * - `m_reader_cv`：读者等「门开且无写者排队」；
+ * - `m_writer_cv`：写者等「上一个写者开门」或「读者退完」。
+ *
+ * 条件检查与 `Wait` 都在 `m_park_mutex` 下完成；**通知方也先取同一把
+ * 互斥量再 `NotifyAll`**（只在其等待者计数非 0 时才取，无等待者时只多一次
+ * 原子 load），因此不存在「检查完条件、还没入队就被通知」的丢唤醒窗口
+ * —— 这正是旧实现 8 线程 50/50 混合负载下卡死的原因（写者 park 与
+ * `NotifyOne` 之间的窗口，见 `tests/concurrency/test_locks.cpp` 的 8t 用例）。
  *
  * ## ⚠️ 使用边界
  *
  * 1. **读锁持有者不得再申请写锁**：写锁要求「无任何读者」，而调用者自己就是
- *    读者，必然永久等待（自死锁）。`RWMutex` 无法识别这种升级请求，不提供
- *    `Upgrade`，也不做 owner 检测。
- * 2. **临界区内不要 park**：与 `sync::Mutex` 一样，读锁持有者若因 IO / 阻塞
- *    等待 park，写者会一直等这把读锁；写者优先又会让后续读者也排队，最终把
- *    整个读写锁拖死。需要 IO 的临界区请拆分：锁内只拷贝数据，锁外做 IO。
- * 3. **写锁不可重入**：同一 G 重复 `Lock()` 会自死锁。需要重入请用
- *    `RecursiveMutex`（并阅读它的警告）。
- * 4. 读锁可以重入（同一执行流拿两次读锁 = 两个读者名额，必须 `RUnlock` 两次），
- *    但**仅在没有任何写者等待时安全**。若已有写者排队，再调用 `RLock` /
- *    `RLockFor` 会等写者先完成，而写者又在等调用者释放手上的读锁 —— 自死锁。
- *    持读锁期间如需再取读锁，请用非阻塞的 `TryRLock`。读者没有 owner 记录，
- *    这一点与 Go 的 `RWMutex`（不可递归读）不同，本实现是放宽而非收紧。
- * 5. 对象必须长于所有使用者和等待者；销毁一把仍被持有 / 有等待者的锁是未
- *    定义行为。
+ *    读者，必然永久等待（自死锁）。本类不提供 `Upgrade`，也不做 owner 检测。
+ * 2. **写锁临界区内不要 park**：写者持有 `m_writer_mutex`，其他写者会被排住；
+ *    若持锁写者因 IO park，写者队列整体停摆。需要 IO 的临界区请拆分。
+ * 3. **写锁不可重入**：同一 G 重复 `Lock()` 会自死锁（`m_writer_mutex` 不可递归）。
+ * 4. **读锁可以重入**：同一执行流拿两次读锁 = 两个读者名额，必须 `RUnlock`
+ *    两次；但若已有写者排队，重入会等写者先完成 —— 而写者又在等调用者释放
+ *    手上的读锁，构成自死锁。持读锁期间如需再取读锁，请用非阻塞的
+ *    `TryRLock`（它在有写者排队时返回 false，不会阻塞）。
+ * 5. 对象必须长于所有使用者和等待者；销毁一把仍被持有 / 有等待者的锁是
+ *    未定义行为。
  */
 #pragma once
 
@@ -57,14 +86,11 @@
 
 #include "go2cpp/debug/debug_resources.hpp"
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <stdexcept>
-#include <string>
 #include <thread>
 
 namespace go2cpp::sync {
@@ -73,52 +99,22 @@ namespace go2cpp::sync {
  * @brief 写者优先的读写锁。
  *
  * @details
- * 状态机只有三种形态：**无锁**、**N 个读者**、**1 个写者**。读者门是一个
- * 带符号原子计数（见 `m_reader_count`），写者队列与票据受 `m_state`
- * （`sync::Mutex`）保护；读者等待 `m_ready`，写者 park 时睡在各自登记到
- * 队列节点里的 `sync::ConditionVariable` 上。
- *
- * ## 唤醒策略（与旧实现的区别）
- *
- * 旧实现每次 `Unlock` 都无条件 `NotifyAll`，把读者和写者一起唤醒：被唤醒的
- * 读者看到 pending writer 又回去睡，既制造 futex 惊群，又让 0 等待者也付一次
- * 「构造临时通知批次」的堆分配。现在：
- *
- * - 0 个等待者：完全短路，不构造通知批次、不进条件变量内部互斥量；
- * - 读者快路径：门开着时只做一次原子 `fetch_add`，不碰 `m_state`；
- * - 写者交接：上一任写者把读者门连同交接令牌交给队首，正在自旋的队首
- *   直接登记；只有已经 park 的队首才被**精确 NotifyOne**（不再广播）；
- * - 短临界区：读者 / 写者在 park 前先自旋（写者按时间预算），把
- *   「关门-退读者-开门」的短窗口消化在用户态，避开 futex 往返；
- * - 写者优先：有写者排队时读者门保持关闭，读者继续等，直到写者队列清空。
+ * 状态机：**门开（N 个读者）** 或 **门关（最多 1 个写者 + R 个尚未退出的读者）**。
+ * 读者与写者都只通过 `m_state` 这一个原子字裁决，`m_writer_mutex` 只负责
+ * 慢路径写者的 FIFO 排队，`m_park_mutex` + 条件变量只负责真正的 park。
  *
  * | 请求 | 放行条件 |
  * |---|---|
- * | `RLock` | 读者门开着（`m_reader_count >= 0`）且没有写者在排队 |
- * | `Lock` | 自己是等待队列票据最小者，且已关闭读者门、现有读者全部退出 |
+ * | `RLock` | 状态字门开（`< kGate`）且没有写者在排队 |
+ * | `Lock` | 快路径：状态字为 0 时单 CAS 关门；慢路径：拿到 `m_writer_mutex` 后关门并等读者归零 |
  * | `TryRLock` | 同 `RLock` 的放行条件，不等待 |
  * | `TryLock` | 同 `Lock` 的放行条件（含「没有等待中的写者」），不等待 |
  *
- * `TryLock` 在「锁空闲但已有写者在排队」时返回 false，这是为了不破坏写者
+ * `TryLock` 在「锁空闲但已有写者排队」时返回 false，这是为了不破坏写者
  * FIFO；`std::shared_mutex` 对 `try_lock` 的公平性不作保证，这里选择更严格
  * 的语义并写进文档。
- *
- * ## 等待路径
- *
- * `Wait` / `WaitFor` 内部把 `m_state` 原子地释放并挂起调用者：
- * Fiber 走 park，OS 线程走原生等待。返回后 `m_state` 重新被持有，循环重新
- * 检查谓词。谓词风格天然免疫虚假唤醒，也不会丢唤醒。
  */
 class RWMutex final {
-private:
-    /// @brief 写者等待节点：票据 + 该写者 park 时登记的条件变量。
-    /// @details `cv == nullptr` 表示这个写者正在自旋（不在内核里睡），
-    ///          交接时不要对它发通知；只有真正 park 的队首才需要 Notify。
-    struct WriterWaiter {
-        std::uint64_t ticket{0};
-        ConditionVariable* cv{nullptr};
-    };
-
 public:
     /// @brief 创建未加锁的读写锁。
     RWMutex() {
@@ -149,107 +145,55 @@ public:
      * @throw std::logic_error 调度器不可用 / G 被取消导致内部等待无法重锁。
      */
     void RLock() {
-        // 快路径：单变量原子 RMW。写者关门用同一个变量做 `fetch_sub`，
+        // 快路径：一次 fetch_add。门开（结果落在 [0, kGate)）且没有写者
+        // 排队时直接进入。读者快路径与写者关门作用在同一个原子字上，
         // 因此「读者进入」与「写者关门」有唯一的全局顺序，不存在两个变量
-        // 互相看不见的窗口（旧双变量设计正是因此丢唤醒）。
+        // 互相看不见的窗口。
         const std::int64_t previous =
-            m_reader_count.fetch_add(1, std::memory_order_acq_rel);
-        if (previous >= 0) {
-            return;
-        }
-        // 门已关：回滚并等待写者。回滚可能让计数回到「门关且无读者」，
-        // 此时必须补一次写者唤醒，否则写者会睡在一个已经归零的计数上。
-        std::int64_t after =
-            m_reader_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
-        if (after == -kReaderGate) {
-            WakeWriterIfWaiting();
-        }
-        // 门刚关时先做有界自旋：本次优化的目标负载里写者临界区通常只有
-        // 几条指令，等一次 futex 唤醒往返（~2.3us）远贵于自旋几百纳秒。
-        // 自旋期间只在门开的一瞬间做一次 RMW 登记，失败立即回滚；门持续
-        // 关闭（写者临界区长 / 写者排队）才落到 m_state + 条件变量慢路径。
-        for (std::size_t spin = 0; spin < kReaderSpin; ++spin) {
-            CpuRelax();
-            if (m_reader_count.load(std::memory_order_acquire) < 0) {
-                continue;
-            }
-            const std::int64_t acquired =
-                m_reader_count.fetch_add(1, std::memory_order_acq_rel);
-            if (acquired >= 0) {
-                return;
-            }
-            after =
-                m_reader_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
-            if (after == -kReaderGate) {
-                WakeWriterIfWaiting();
-            }
-        }
-        if (!m_state.Lock()) {
-            throw std::logic_error(
-                "go2cpp::sync::RWMutex RLock: scheduler unavailable");
-        }
-        while (m_reader_count.load(std::memory_order_acquire) < 0 ||
-               m_writing || !m_waiting_writers.empty()) {
-            m_waiting_readers.fetch_add(1, std::memory_order_relaxed);
+            m_state.fetch_add(1, std::memory_order_acq_rel);
+        if (previous >= 0 && previous < kGate &&
+            m_pending.load(std::memory_order_acquire) == 0) {
 #if GO2CPP_DEBUG_RESOURCES
             GO2CPP_DEBUG_RESOURCE_EVENT_V5(
-                kRwLockRead, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
-                ::go2cpp::debug::ResourceResult::kBlocked,
-                static_cast<std::uint32_t>(
-                    m_waiting_readers.load(std::memory_order_relaxed)),
-                true, 0, -1, 0, 0);
+                kRwLockRead, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0,
+                0, ::go2cpp::debug::ResourceResult::kOk, 0, false, 0, -1, 0,
+                0);
 #endif
-            bool notified = false;
-            try {
-                notified = m_ready.Wait(m_state);
-            } catch (const std::runtime_error&) {
-                // D3：Wait 抛 runtime_error 表示它已释放 m_state 却没能重锁
-                // （调度器关闭）。此时**不持有**内部锁，不能 Unlock；先尽力
-                // 取回 m_state 再清理，取不回则带着明确异常退出（绝不 UB）。
-                m_waiting_readers.fetch_sub(1, std::memory_order_relaxed);
-                AbortAfterLockLoss(false, 0);
-            }
-            m_waiting_readers.fetch_sub(1, std::memory_order_relaxed);
-            if (!notified) {
-                // Wait 返回 false ⇒ 契约保证内部锁仍被持有（取消路径）。
-                m_state.Unlock();
-                throw std::logic_error(
-                    "go2cpp::sync::RWMutex RLock aborted (G cancelled or "
-                    "scheduler shut down)");
-            }
+            return;
         }
-        // 持锁时写者无法关门（它也要取 m_state），因此这里的登记必定成功。
-        m_reader_count.fetch_add(1, std::memory_order_acq_rel);
-        m_state.Unlock();
-#if GO2CPP_DEBUG_RESOURCES
-        GO2CPP_DEBUG_RESOURCE_EVENT_V5(
-            kRwLockRead, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
-            ::go2cpp::debug::ResourceResult::kOk, 0, false, 0, -1, 0, 0);
-#endif
+        // 门关：回滚登记，再走 park 路径。回滚可能把「门关 + 剩余读者」
+        // 变成「门关 + 读者归零」，必须补一次写者唤醒，否则写者会睡在
+        // 一个已经归零的计数上。
+        const std::int64_t after =
+            m_state.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if ((after & kWriteBit) != 0 && (after & kLowMask) == 0) {
+            WakeDrainWatchers();
+        }
+        RLockSlow();
     }
 
     /**
      * @brief 释放读锁。
-     * @details 最后一个读者离开且写者门已关时，精确唤醒等待中的写者队首；
-     *          门开着时什么都不做（读者快路径不取内部锁）。
+     * @details 最后一个读者离开且写者门已关时，精确唤醒等待读者归零的写者；
+     *          门开着时什么都不做（读者快路径不取任何锁）。
      * @throw std::logic_error 当前没有读者（重复解锁 / 从未加锁）。
      */
     void RUnlock() {
         const std::int64_t previous =
-            m_reader_count.fetch_sub(1, std::memory_order_acq_rel);
-        // 门关时计数整体偏移了 -kReaderGate，这里先还原成真实读者数。
+            m_state.fetch_sub(1, std::memory_order_acq_rel);
+        const bool closed = (previous & kWriteBit) != 0;
         const std::int64_t readers_before =
-            previous >= 0 ? previous : previous + kReaderGate;
+            closed ? (previous & kLowMask) : previous;
         if (readers_before <= 0) {
             // 没有读者可减：重复解锁 / 从未加锁。恢复计数后报错，
             // 保持「抛异常前不改变状态」的既有语义。
-            m_reader_count.fetch_add(1, std::memory_order_relaxed);
+            m_state.fetch_add(1, std::memory_order_relaxed);
             throw std::logic_error(
                 "go2cpp::sync::RWMutex RUnlock of unlocked RWMutex");
         }
-        if (readers_before == 1) {
-            // 最后一个读者：写者门若已关，唤醒等待中的写者。
-            WakeWriterIfWaiting();
+        if (closed && readers_before == 1) {
+            // 最后一个读者：写者可能正等着读者归零。
+            WakeDrainWatchers();
         }
 #if GO2CPP_DEBUG_RESOURCES
         GO2CPP_DEBUG_RESOURCE_EVENT_V5(
@@ -260,203 +204,59 @@ public:
 
     /**
      * @brief 获取写锁（独占），写者之间 FIFO。
-     * @details 等待条件：无写者、无读者、且自己是等待队列中票据最小的写者。
+     * @details 快路径：状态字为 0（无读者、无写者、无人排队）时一次 CAS
+     *          直接关门；否则走慢路径排队。
      * @throw std::logic_error 调度器不可用 / G 被取消导致内部等待无法重锁。
      */
     void Lock() {
-        if (!m_state.Lock()) {
-            throw std::logic_error(
-                "go2cpp::sync::RWMutex Lock: scheduler unavailable");
-        }
-        const std::uint64_t ticket = m_next_writer_ticket++;
-        m_waiting_writers.push_back(WriterWaiter{ticket, nullptr});
-        // 本写者是否已经持有/关闭了读者门。门在同一时刻只属于一个写者：
-        // 上一个写者释放时若还有写者排队，会把门直接交接下来。
-        bool gate_closed = false;
+        // 快路径：先看有没有写者在排队，再单 CAS 关门。无竞争（1t）时
+        // 只有一次原子 load + 一次 CAS，不碰任何互斥量。
+        if (m_pending.load(std::memory_order_acquire) == 0) {
+            std::int64_t expected = 0;
+            if (m_state.compare_exchange_strong(
+                    expected, kWriteLocked, std::memory_order_acquire,
+                    std::memory_order_relaxed)) {
 #if GO2CPP_DEBUG_RESOURCES
-        GO2CPP_DEBUG_RESOURCE_EVENT_V5(
-            kRwLockWrite, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
-            ::go2cpp::debug::ResourceResult::kBlocked,
-            static_cast<std::uint32_t>(m_waiting_writers.size()), true, 0, -1,
-            0, 0);
+                GO2CPP_DEBUG_RESOURCE_EVENT_V5(
+                    kRwLockWrite, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(),
+                    0, 0, ::go2cpp::debug::ResourceResult::kOk, 0, false, 0,
+                    -1, 0, 0);
 #endif
-        for (;;) {
-            // ---- 持 m_state 的判定：队首 + 无写者 ----
-            if (!m_writing && !m_waiting_writers.empty() &&
-                m_waiting_writers.front().ticket == ticket) {
-                if (!gate_closed) {
-                    const std::int64_t current =
-                        m_reader_count.load(std::memory_order_acquire);
-                    if (current >= 0) {
-                        // 门开着：队首写者关闭它，然后等剩余读者退出。
-                        gate_closed = true;
-                        const std::int64_t readers = m_reader_count.fetch_sub(
-                            kReaderGate, std::memory_order_acq_rel);
-                        if (readers == 0) {
-                            AcquireWriteLocked(ticket);
-                            return;
-                        }
-                    } else if (current == -kReaderGate) {
-                        // 门已由上一个写者交接下来，且没有读者：直接继承。
-                        gate_closed = true;
-                        AcquireWriteLocked(ticket);
-                        return;
-                    } else {
-                        // 门关着但仍有读者未退完（门是本写者刚关上的）。
-                        gate_closed = true;
-                    }
-                } else if (m_reader_count.load(std::memory_order_acquire) ==
-                           -kReaderGate) {
-                    // 最后一批读者已经退出：获取写锁（门保持关闭）。
-                    AcquireWriteLocked(ticket);
-                    return;
-                }
-            }
-            // ---- 无锁自旋：等交接令牌，或等自己关上的门里读者退完 ----
-            // 关键优化：交接/退读者都是“短事件”，自旋命中即可完全避开
-            // m_state 争用与 futex 唤醒；只有长时间等不到时才 park。
-            m_state.Unlock();
-            const auto spin_deadline =
-                std::chrono::steady_clock::now() + kWriterSpinBudget;
-            std::size_t spin_count = 0;
-            for (;;) {
-                if (m_write_handoff.load(std::memory_order_acquire) == ticket) {
-                    break;
-                }
-                if (gate_closed &&
-                    m_reader_count.load(std::memory_order_acquire) ==
-                        -kReaderGate) {
-                    break;
-                }
-                CpuRelax();
-                if ((++spin_count & 255U) == 0U &&
-                    std::chrono::steady_clock::now() >= spin_deadline) {
-                    break;
-                }
-            }
-            if (!m_state.Lock()) {
-                // 调度器关闭等极端情况：先把自己关上的门开回去，再尽力
-                // 抢回内部锁撤销票据；绝不带着半状态返回。
-                if (gate_closed) {
-                    m_reader_count.fetch_add(kReaderGate,
-                                             std::memory_order_acq_rel);
-                }
-                if (RecoverInternalLock()) {
-                    const bool was_head =
-                        !m_waiting_writers.empty() &&
-                        m_waiting_writers.front().ticket == ticket;
-                    RemoveWaitingWriterLocked(ticket);
-                    RepairWakeAfterWriteCancelLocked(was_head);
-                    m_state.Unlock();
-                }
-                throw std::logic_error(
-                    "go2cpp::sync::RWMutex Lock: scheduler unavailable");
-            }
-            // 关键：唤醒条件必须在**重新持有 m_state 之后**再判一次。
-            // 自旋阶段看到的 ready 只是提示；交接令牌 / 读者归零可能恰好在
-            // 自旋结束与这次 Lock 之间发生，若不再判一次就会把已经发出的
-            // Notify 丢掉，然后永远睡下去。
-            const std::uint64_t handoff =
-                m_write_handoff.load(std::memory_order_acquire);
-            // 防御：交接令牌只可能指向队首；若队列已变化则清掉陈旧令牌，
-            // 避免“令牌命中但永远轮不到自己”的自旋死循环。
-            if (handoff == ticket && !m_waiting_writers.empty() &&
-                m_waiting_writers.front().ticket != ticket) {
-                m_write_handoff.store(0, std::memory_order_release);
-            }
-            if ((handoff == ticket && !m_waiting_writers.empty() &&
-                 m_waiting_writers.front().ticket == ticket) ||
-                (gate_closed &&
-                 m_reader_count.load(std::memory_order_acquire) ==
-                     -kReaderGate)) {
-                continue;
-            }
-            // ---- park：每个等待者睡在自己的条件变量上 ----
-            // 交接时 Unlock 只 Notify 队首的那一个 CV，而不是广播。旧实现
-            // 每次交接 NotifyAll，8 线程纯写会在「唤醒-抢锁-再睡」之间形成
-            // 惊群（实测单次 op 从 ~1us 恶化到 ~75us）。
-            {
-                ConditionVariable wait_cv;
-                const auto waiter = FindWaitingWriterLocked(ticket);
-                if (waiter != m_waiting_writers.end()) {
-                    waiter->cv = &wait_cv;
-                }
-                bool notified = false;
-                try {
-                    notified = wait_cv.Wait(m_state);
-                } catch (const std::runtime_error&) {
-                    // D3：内部锁已丢失；门必须在能持锁时开回去，否则读者
-                    // 会永久看到「有写者」而饿死。
-                    if (gate_closed) {
-                        m_reader_count.fetch_add(kReaderGate,
-                                                 std::memory_order_acq_rel);
-                    }
-                    AbortAfterLockLoss(true, ticket);
-                }
-                const auto after_wake = FindWaitingWriterLocked(ticket);
-                if (after_wake != m_waiting_writers.end()) {
-                    after_wake->cv = nullptr;
-                }
-                if (!notified) {
-                    if (gate_closed) {
-                        m_reader_count.fetch_add(kReaderGate,
-                                                 std::memory_order_acq_rel);
-                    }
-                    const bool was_head = !m_waiting_writers.empty() &&
-                                          m_waiting_writers.front().ticket ==
-                                              ticket;
-                    RemoveWaitingWriterLocked(ticket);
-                    RepairWakeAfterWriteCancelLocked(was_head);
-                    m_state.Unlock();
-                    throw std::logic_error(
-                        "go2cpp::sync::RWMutex Lock aborted (G cancelled or "
-                        "scheduler shut down)");
-                }
+                return;
             }
         }
+        LockSlow(false, std::chrono::milliseconds::zero(), {});
     }
 
     /**
-     * @brief 释放写锁；队列非空时把写锁交给队首，否则放行读者。
+     * @brief 释放写锁。
      * @throw std::logic_error 当前没有写者（重复解锁 / 从未加锁）。
      */
     void Unlock() {
-        if (!m_state.Lock()) {
-            throw std::logic_error(
-                "go2cpp::sync::RWMutex Unlock: scheduler unavailable");
-        }
-        if (!m_writing) {
-            m_state.Unlock();
+        const std::int64_t snapshot = m_state.load(std::memory_order_acquire);
+        if ((snapshot & kWriteBit) == 0) {
             throw std::logic_error(
                 "go2cpp::sync::RWMutex Unlock of unlocked RWMutex");
         }
-#if GO2CPP_DEBUG_RESOURCES
-        const bool woke = !m_waiting_writers.empty() ||
-                          m_waiting_readers.load(std::memory_order_relaxed) !=
-                              0U;
-#endif
-        m_writing = false;
-        // 写者优先的交接：队列里还有写者时**不开门**，直接把关闭的读者门
-        // 交给下一个写者，这样新读者无法在交接窗口插队。交接令牌让下一个
-        // 写者即使正在自旋也能立刻看到（不必先被条件变量唤醒）；只有已经
-        // park 的写者才需要精确 Notify。队列清空时才开门并放行读者。
-        if (!m_waiting_writers.empty()) {
-            m_write_handoff.store(m_waiting_writers.front().ticket,
-                                  std::memory_order_release);
-            WakeFrontWriterLocked();
-        } else {
-            m_write_handoff.store(0, std::memory_order_release);
-            m_reader_count.fetch_add(kReaderGate, std::memory_order_acq_rel);
-            WakeReadersLocked();
+        const bool slow = (snapshot & kSlowBit) != 0;
+        // 开门：一次性把「写者位 + 慢路径位 + 门偏移」全部还原。
+        // 写者持锁期间读者不可能登记（门关），因此低位读者数必为 0。
+        m_state.fetch_sub(kFastRelease + (slow ? kSlowBit : 0),
+                          std::memory_order_release);
+        if (slow) {
+            m_writer_mutex.Unlock();
         }
-        m_state.Unlock();
 #if GO2CPP_DEBUG_RESOURCES
         GO2CPP_DEBUG_RESOURCE_EVENT_V5(
             kRwUnlockWrite, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
-            woke ? ::go2cpp::debug::ResourceResult::kWake
-                 : ::go2cpp::debug::ResourceResult::kOk,
+            (m_waiting_readers.load(std::memory_order_relaxed) != 0U ||
+             m_gate_waiters.load(std::memory_order_relaxed) != 0U)
+                ? ::go2cpp::debug::ResourceResult::kWake
+                : ::go2cpp::debug::ResourceResult::kOk,
             0, false, 0, -1, 0, 0);
 #endif
+        WakeReadersIfWaiting();
+        WakeGateIfWaiting();
     }
 
     /**
@@ -466,14 +266,15 @@ public:
     bool TryRLock() noexcept {
         try {
             const std::int64_t previous =
-                m_reader_count.fetch_add(1, std::memory_order_acq_rel);
-            if (previous >= 0) {
+                m_state.fetch_add(1, std::memory_order_acq_rel);
+            if (previous >= 0 && previous < kGate &&
+                m_pending.load(std::memory_order_acquire) == 0) {
                 return true;
             }
             const std::int64_t after =
-                m_reader_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
-            if (after == -kReaderGate) {
-                WakeWriterIfWaiting();
+                m_state.fetch_sub(1, std::memory_order_acq_rel) - 1;
+            if ((after & kWriteBit) != 0 && (after & kLowMask) == 0) {
+                WakeDrainWatchers();
             }
             return false;
         } catch (...) {
@@ -488,31 +289,13 @@ public:
      */
     bool TryLock() noexcept {
         try {
-            if (!m_state.Lock()) {
+            if (m_pending.load(std::memory_order_acquire) != 0) {
                 return false;
             }
-            if (m_writing || m_reader_count.load(std::memory_order_acquire) !=
-                                 0 ||
-                !m_waiting_writers.empty()) {
-                m_state.Unlock();
-                return false;
-            }
-            // 门开着且无读者：关闭门。读者快路径不需要 m_state，可能在上
-            // 面的 load 与这次 fetch_sub 之间抢先登记，因此必须检查返回值：
-            // 只要有人抢到，就开回门并失败（TryLock 不等待）。
-            const std::int64_t readers =
-                m_reader_count.fetch_sub(kReaderGate,
-                                         std::memory_order_acq_rel);
-            if (readers != 0) {
-                m_reader_count.fetch_add(kReaderGate,
-                                         std::memory_order_acq_rel);
-                m_state.Unlock();
-                return false;
-            }
-            m_writing = true;
-            m_write_handoff.store(0, std::memory_order_release);
-            m_state.Unlock();
-            return true;
+            std::int64_t expected = 0;
+            return m_state.compare_exchange_strong(
+                expected, kWriteLocked, std::memory_order_acquire,
+                std::memory_order_relaxed);
         } catch (...) {
             return false;
         }
@@ -528,62 +311,75 @@ public:
         if (timeout <= std::chrono::milliseconds::zero()) {
             return TryRLock();
         }
+        if (TryRLock()) {
+            return true;
+        }
         const auto deadline = std::chrono::steady_clock::now() + timeout;
+        if (!m_park_mutex.Lock()) {
+            return false;
+        }
         for (;;) {
-            // 快路径复用 TryRLock：门开着时连 m_state 都不碰。
-            if (TryRLock()) {
-                return true;
+            const std::int64_t current = m_state.load(std::memory_order_acquire);
+            if (current >= 0 && current < kGate &&
+                m_pending.load(std::memory_order_acquire) == 0) {
+                const std::int64_t registered =
+                    m_state.fetch_add(1, std::memory_order_acq_rel);
+                if (registered >= 0 && registered < kGate) {
+                    m_park_mutex.Unlock();
+                    return true;
+                }
+                const std::int64_t after =
+                    m_state.fetch_sub(1, std::memory_order_acq_rel) - 1;
+                if ((after & kWriteBit) != 0 && (after & kLowMask) == 0) {
+                    WakeDrainWatchers();
+                }
             }
             const auto now = std::chrono::steady_clock::now();
             if (now >= deadline) {
+                m_park_mutex.Unlock();
                 return false;
-            }
-            if (!m_state.Lock()) {
-                return false;
-            }
-            if (m_reader_count.load(std::memory_order_acquire) >= 0 &&
-                !m_writing && m_waiting_writers.empty()) {
-                m_reader_count.fetch_add(1, std::memory_order_acq_rel);
-                m_state.Unlock();
-                return true;
             }
             m_waiting_readers.fetch_add(1, std::memory_order_relaxed);
             bool notified = false;
             try {
-                notified = m_ready.WaitFor(m_state, deadline - now);
-            } catch (const std::runtime_error&) {
+                notified = WaitReaderLocked(deadline - now);
+            } catch (...) {
                 m_waiting_readers.fetch_sub(1, std::memory_order_relaxed);
-                AbortAfterLockLoss(false, 0);
+                throw;
             }
             m_waiting_readers.fetch_sub(1, std::memory_order_relaxed);
-            if (notified) {
-                m_state.Unlock();
-                continue;
+            if (!notified) {
+                // WaitFor 返回 false：通常是超时（内部锁已重新持有）。
+                // 通知可能恰好与超时同时发生，回到循环再判一次谓词。
+                const std::int64_t after =
+                    m_state.load(std::memory_order_acquire);
+                if (after >= 0 && after < kGate &&
+                    m_pending.load(std::memory_order_acquire) == 0) {
+                    const std::int64_t registered =
+                        m_state.fetch_add(1, std::memory_order_acq_rel);
+                    if (registered >= 0 && registered < kGate) {
+                        m_park_mutex.Unlock();
+                        return true;
+                    }
+                    const std::int64_t rolled =
+                        m_state.fetch_sub(1, std::memory_order_acq_rel) - 1;
+                    if ((rolled & kWriteBit) != 0 &&
+                        (rolled & kLowMask) == 0) {
+                        WakeDrainWatchers();
+                    }
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    m_park_mutex.Unlock();
+                    return false;
+                }
             }
-            // WaitFor 返回 false：通常是超时（内部锁已重新持有）。通知可能
-            // 恰好与超时同时发生，先再判一次谓词，避免漏掉已经放行的机会。
-            if (m_reader_count.load(std::memory_order_acquire) >= 0 &&
-                !m_writing && m_waiting_writers.empty()) {
-                m_reader_count.fetch_add(1, std::memory_order_acq_rel);
-                m_state.Unlock();
-                return true;
-            }
-            const bool expired = std::chrono::steady_clock::now() >= deadline;
-            m_state.Unlock();
-            if (expired) {
-                return false;
-            }
-            throw std::logic_error(
-                "go2cpp::sync::RWMutex RLockFor aborted (G cancelled or "
-                "scheduler shut down)");
         }
     }
 
     /**
      * @brief 在超时内获取写锁。
      * @param timeout 最长等待时间；`<= 0` 等价于一次 `TryLock`。
-     * @return 成功返回 true 且已持有写锁；超时返回 false，等待票据被撤销，
-     *         且**不改变读写状态**。
+     * @return 成功返回 true 且已持有写锁；超时返回 false，且**不改变读写状态**。
      * @throw std::logic_error G 被取消 / 调度器关闭导致等待中止（非超时）。
      */
     bool LockFor(std::chrono::milliseconds timeout) {
@@ -591,190 +387,73 @@ public:
             return TryLock();
         }
         const auto deadline = std::chrono::steady_clock::now() + timeout;
-        if (!m_state.Lock()) {
-            return false;
-        }
-        const std::uint64_t ticket = m_next_writer_ticket++;
-        m_waiting_writers.push_back(WriterWaiter{ticket, nullptr});
-        bool gate_closed = false;
-        // 尝试推进：队首写者关门并在无读者时立即获取。返回 true 表示已持有
-        // 写锁（内部锁已释放）。
-        const auto try_acquire = [&]() -> bool {
-            if (m_writing || m_waiting_writers.front().ticket != ticket) {
-                return false;
-            }
-            if (!gate_closed) {
-                const std::int64_t current =
-                    m_reader_count.load(std::memory_order_acquire);
-                if (current >= 0) {
-                    const std::int64_t readers = m_reader_count.fetch_sub(
-                        kReaderGate, std::memory_order_acq_rel);
-                    gate_closed = true;
-                    if (readers != 0) {
-                        return false;
-                    }
-                } else if (current == -kReaderGate) {
-                    gate_closed = true;
-                } else {
-                    gate_closed = true;
-                    return false;
-                }
-            } else if (m_reader_count.load(std::memory_order_acquire) !=
-                       -kReaderGate) {
-                return false;
-            }
-            AcquireWriteLocked(ticket);
+        if (TryLock()) {
             return true;
-        };
-        for (;;) {
-            if (try_acquire()) {
-                return true;
-            }
-            // 与 Lock() 相同的短自旋：定时路径不追求极致延迟，但同样
-            // 不该为一次“读者马上退完”付 futex 往返。
-            if (gate_closed) {
-                for (std::size_t spin = 0; spin < kWriterDrainSpin; ++spin) {
-                    if (m_reader_count.load(std::memory_order_acquire) ==
-                        -kReaderGate) {
-                        break;
-                    }
-                    CpuRelax();
-                }
-                if (try_acquire()) {
-                    return true;
-                }
-            }
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) {
-                if (gate_closed) {
-                    m_reader_count.fetch_add(kReaderGate,
-                                             std::memory_order_acq_rel);
-                }
-                const bool was_head =
-                    !m_waiting_writers.empty() &&
-                    m_waiting_writers.front().ticket == ticket;
-                RemoveWaitingWriterLocked(ticket);
-                RepairWakeAfterWriteCancelLocked(was_head);
-                m_state.Unlock();
-                return false;
-            }
-            {
-                ConditionVariable wait_cv;
-                const auto waiter = FindWaitingWriterLocked(ticket);
-                if (waiter != m_waiting_writers.end()) {
-                    waiter->cv = &wait_cv;
-                }
-                bool notified = false;
-                try {
-                    notified = wait_cv.WaitFor(m_state, deadline - now);
-                } catch (const std::runtime_error&) {
-                    if (gate_closed) {
-                        m_reader_count.fetch_add(kReaderGate,
-                                                 std::memory_order_acq_rel);
-                    }
-                    AbortAfterLockLoss(true, ticket);
-                }
-                const auto after_wake = FindWaitingWriterLocked(ticket);
-                if (after_wake != m_waiting_writers.end()) {
-                    after_wake->cv = nullptr;
-                }
-                if (notified) {
-                    continue;
-                }
-            }
-            // WaitFor 返回 false：通知可能恰好与超时同时到达，再推进一次。
-            if (try_acquire()) {
-                return true;
-            }
-            if (gate_closed) {
-                m_reader_count.fetch_add(kReaderGate,
-                                         std::memory_order_acq_rel);
-            }
-            const bool was_head = !m_waiting_writers.empty() &&
-                                  m_waiting_writers.front().ticket == ticket;
-            RemoveWaitingWriterLocked(ticket);
-            RepairWakeAfterWriteCancelLocked(was_head);
-            if (std::chrono::steady_clock::now() >= deadline) {
-                m_state.Unlock();
-                return false;
-            }
-            m_state.Unlock();
-            throw std::logic_error(
-                "go2cpp::sync::RWMutex LockFor aborted (G cancelled or "
-                "scheduler shut down)");
         }
+        return LockSlow(true, timeout, deadline);
     }
 
     /**
      * @brief 当前读者数量快照（含调用者自己）。
      * @return 读者数量。诊断用途，只表示调用瞬间的值。
-     * @note noexcept：内部锁不可用时返回 0（调度器关闭阶段诊断值无意义）。
      */
     std::size_t ReaderCount() const noexcept {
-        // 语义与旧实现一致：
-        // - 持写锁期间恒为 0（门关代表「读者不可见」，而不是负数）；
-        // - 写者只在排队、尚未持锁时，读者仍能看到自己的真实名额数。
-        // 先看 m_writing 再读计数：读取瞬态（正在回滚的读者快路径）不会
-        // 被写锁持有者观察到。
-        if (m_writing.load(std::memory_order_acquire)) {
+        const std::int64_t current = m_state.load(std::memory_order_acquire);
+        if ((current & kWriteHeldBit) != 0) {
+            // 写者已进入临界区：旧实现语义下读者数恒为 0。
             return 0U;
         }
-        const std::int64_t count =
-            m_reader_count.load(std::memory_order_acquire);
-        const std::int64_t readers =
-            count >= 0 ? count : count + kReaderGate;
+        const std::int64_t readers = (current & kWriteBit) != 0
+                                         ? (current & kLowMask)
+                                         : current;
         return readers > 0 ? static_cast<std::size_t>(readers) : 0U;
     }
 
     /**
      * @brief 当前是否有写者持有写锁。
      * @return 持有返回 true。诊断用途，只表示调用瞬间的值。
+     * @note 单次原子 load：不再像旧实现那样为诊断去取内部互斥量。
      */
     bool IsWriteLocked() const noexcept {
-        try {
-            if (!m_state.Lock()) {
-                return false;
-            }
-            const bool writing = m_writing;
-            m_state.Unlock();
-            return writing;
-        } catch (...) {
-            return false;
-        }
+        return (m_state.load(std::memory_order_acquire) & kWriteHeldBit) != 0;
     }
 
     /**
-     * @brief 当前是否有写者在等待队列中（不含已持锁的写者）。
+     * @brief 当前是否有写者在等待（不含已持锁的写者）。
      * @return 有等待写者返回 true。诊断用途，也用于验证写者优先。
      */
     bool HasPendingWriter() const noexcept {
-        try {
-            if (!m_state.Lock()) {
-                return false;
-            }
-            const bool pending = !m_waiting_writers.empty();
-            m_state.Unlock();
-            return pending;
-        } catch (...) {
-            return false;
-        }
+        return m_pending.load(std::memory_order_acquire) != 0;
     }
 
 private:
-    /// @brief 写者关闭读者门时从计数里减去的偏移量。
-    /// @details 取一个远大于任何真实读者数的值，使「门关」状态在数值上
-    ///          可以同时编码「还有多少读者没退完」。
-    static constexpr std::int64_t kReaderGate = 1LL << 40;
+    /// @brief 读者计数容量 / 门偏移。远大于任何真实读者数。
+    static constexpr std::int64_t kGate = 1LL << 40;
+    /// @brief 写者持有位（门关）。
+    static constexpr std::int64_t kWriteBit = 1LL << 62;
+    /// @brief 慢路径标记位：持锁写者同时持有 `m_writer_mutex`。
+    static constexpr std::int64_t kSlowBit = 1LL << 61;
+    /// @brief 写者已持有位：读者全部退出、写者正式进入临界区后置位。
+    /// @details 与 kWriteBit（门已关，可能还在等读者退出）分开，是为
+    ///          了让 IsWriteLocked() 保持旧语义：读者临界区里即使写者
+    ///          已经关门在等它退出，也必须返回 false。
+    static constexpr std::int64_t kWriteHeldBit = 1LL << 60;
+    /// @brief 低位读者计数掩码。
+    static constexpr std::int64_t kLowMask = kGate - 1;
+    /// @brief 快路径一次性关门 + 立即持有（原值必为 0，无读者）。
+    static constexpr std::int64_t kWriteLocked = kWriteBit + kWriteHeldBit;
+    /// @brief 慢路径关门时一次性加上的增量（含慢路径位，不含「已持有」位）。
+    static constexpr std::int64_t kSlowClose = kWriteBit + kSlowBit;
+    /// @brief 慢路径关门时读者已归零：关门与「已持有」合并成一次 CAS。
+    static constexpr std::int64_t kSlowCloseHeld =
+        kWriteBit + kSlowBit + kWriteHeldBit;
+    /// @brief Unlock 需要减掉的全部写者位（快路径）。
+    static constexpr std::int64_t kFastRelease = kWriteBit + kWriteHeldBit;
 
-    /// @brief 读者在门关后、park 前的自旋次数（约几百纳秒）。
-    static constexpr std::size_t kReaderSpin = 2048;
-    /// @brief 写者等交接令牌 / 等读者退完时的时间预算。
-    /// @details 用时间而不是固定 pause 次数：短临界区（本优化的目标负载）
-    ///          里等待者常常要跨越多次写者交接才轮到自己，按次数自旋会
-    ///          过早 park；而一次 futex 唤醒往返（~2.3us）足以抵消自旋。
-    static constexpr std::chrono::microseconds kWriterSpinBudget{100};
-    /// @brief 写者关闭门后等读者退完的短自旋次数（定时路径复用）。
-    static constexpr std::size_t kWriterDrainSpin = 1024;
+    /// @brief 写者等门 / 等读者归零时的短自旋次数。
+    static constexpr std::size_t kWriterSpin = 4096;
+    /// @brief 读者等写者放行时的短自旋次数。
+    static constexpr std::size_t kReaderSpin = 256;
 
     /// @brief 一次 CPU 让步提示；不进入内核（yield 仅作非 x86 兜底）。
     static void CpuRelax() noexcept {
@@ -791,163 +470,313 @@ private:
 #endif
     }
 
-    /// @brief 在持 m_state 且已满足获取条件时完成写锁登记。
-    /// @details 弹出自己的票据、清掉交接令牌、置 m_writing，然后释放内部锁。
-    ///          调用方必须保证票据是队首（本类的所有调用点都已判定）。
-    void AcquireWriteLocked(std::uint64_t ticket) {
-        (void)ticket;
-        m_waiting_writers.pop_front();
-        m_write_handoff.store(0, std::memory_order_release);
-        m_writing.store(true, std::memory_order_release);
-        m_state.Unlock();
+    /**
+     * @brief 写者慢路径：FIFO 排队、关门、等读者归零。
+     * @param timed 是否是带超时的调用（`LockFor`）。
+     * @param timeout 仅诊断用，保留与 `LockFor` 的对称语义。
+     * @param deadline 截止时间；`timed == false` 时忽略。
+     * @return 获得写锁返回 true；超时返回 false（状态已还原）。
+     * @throw std::logic_error 调度器不可用 / 等待中止。
+     */
+    bool LockSlow(bool timed, std::chrono::milliseconds timeout,
+                  std::chrono::steady_clock::time_point deadline) {
+        (void)timeout;
+        // 先宣告「有写者在等」：读者快路径看到它就不再进门，保证写者优先。
+        m_pending.fetch_add(1, std::memory_order_acq_rel);
+        bool holding_writer_mutex = false;
+        if (timed) {
+            if (deadline <= std::chrono::steady_clock::now()) {
+                m_pending.fetch_sub(1, std::memory_order_acq_rel);
+                return false;
+            }
+            if (!m_writer_mutex.LockFor(deadline - std::chrono::steady_clock::now())) {
+                m_pending.fetch_sub(1, std::memory_order_acq_rel);
+                return false;
+            }
+            holding_writer_mutex = true;
+        } else {
+            if (!m_writer_mutex.Lock()) {
+                m_pending.fetch_sub(1, std::memory_order_acq_rel);
+                throw std::logic_error(
+                    "go2cpp::sync::RWMutex Lock: scheduler unavailable");
+            }
+            holding_writer_mutex = true;
+        }
+        // 关门。关门后读者不能再登记，剩余读者会逐个退出。
+        // already_held：本次关门的 CAS 是否已经把「已持有」位一并置上。
+        bool already_held = false;
+        for (;;) {
+            const std::int64_t current = m_state.load(std::memory_order_acquire);
+            if (current == 0) {
+                // 无读者：关门与「已持有」合并成一次 CAS —— 纯写争用的
+                // 主路径，每 op 少一次 fetch_or。
+                std::int64_t expected = 0;
+                if (m_state.compare_exchange_strong(
+                        expected, kSlowCloseHeld, std::memory_order_acquire,
+                        std::memory_order_relaxed)) {
+                    already_held = true;
+                    break;
+                }
+                continue;
+            }
+            if (current > 0 && current < kGate) {
+                // 门开但有读者：一次 CAS 关门（把读者数带上一起关门）。
+                std::int64_t expected = current;
+                if (m_state.compare_exchange_strong(
+                        expected, current + kSlowClose,
+                        std::memory_order_acquire,
+                        std::memory_order_relaxed)) {
+                    break;
+                }
+                continue;
+            }
+            // 门已关：上一个写者还在临界区（或正在等读者）。等它开门。
+            if (timed && std::chrono::steady_clock::now() >= deadline) {
+                m_pending.fetch_sub(1, std::memory_order_acq_rel);
+                if (holding_writer_mutex) {
+                    m_writer_mutex.Unlock();
+                }
+                return false;
+            }
+            WaitGateOpen(timed, deadline);
+        }
+        // 等读者归零（正常情况下读者已经在退出，很快）。
+        while ((m_state.load(std::memory_order_acquire) & kLowMask) != 0) {
+            if (timed && std::chrono::steady_clock::now() >= deadline) {
+                // 超时：把门开回去，保持「不改变读写状态」的契约。
+                m_state.fetch_sub(already_held ? kSlowCloseHeld
+                                             : kSlowClose,
+                                  std::memory_order_release);
+                m_pending.fetch_sub(1, std::memory_order_acq_rel);
+                if (holding_writer_mutex) {
+                    m_writer_mutex.Unlock();
+                }
+                WakeReadersIfWaiting();
+                return false;
+            }
+            WaitReadersDrain(timed, deadline);
+        }
+        // 读者已全部退出：正式持有写锁（IsWriteLocked 从这里为真）。
+        // 无读者的主路径已在关门的 CAS 里置过该位，这里只补
+        // 「关门时还有读者」的慢路径。
+        if (!already_held) {
+            m_state.fetch_or(kWriteHeldBit, std::memory_order_release);
+        }
+        m_pending.fetch_sub(1, std::memory_order_acq_rel);
 #if GO2CPP_DEBUG_RESOURCES
         GO2CPP_DEBUG_RESOURCE_EVENT_V5(
             kRwLockWrite, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
             ::go2cpp::debug::ResourceResult::kOk, 0, false, 0, -1, 0, 0);
 #endif
+        return true;
     }
 
-    /// @brief 内部锁丢失后，用不 park 的 TryLock 抢回 m_state 的预算。
-    static constexpr std::size_t kLockRecoveryAttempts = 8192;
-
-    /// @brief `ConditionVariable::Wait` 报告「没能重新持有内部锁」后的收尾。
-    /// @details 正常路径下 Wait 返回 false 时内部锁仍被持有；唯一的例外是
-    ///          调度器关闭导致重锁失败——`sync::ConditionVariable::Wait`
-    ///          以 `std::runtime_error` 报告，并且**不持有**外部 mutex。
-    ///          此时绝不能 `m_state.Unlock()`（会对未持有的锁抛异常），也
-    ///          不能在无锁状态下修改 `m_waiting_writers`（数据竞争/UB）。
-    ///          本函数先用 `TryLock` 在有限预算内抢回内部锁：m_state 的
-    ///          临界区只做字段更新（不 park、不做 IO），正常几次即可取回。
-    ///          取回后撤销写者票据并按需交接唤醒；取不回则保留票据、抛出
-    ///          带明确诊断的异常——错误可观测，而不是静默 UB。
-    [[noreturn]] void AbortAfterLockLoss(bool has_writer_ticket,
-                                         std::uint64_t writer_ticket) {
-        const bool recovered = RecoverInternalLock();
-        if (recovered && has_writer_ticket) {
-            const bool was_head =
-                !m_waiting_writers.empty() &&
-                m_waiting_writers.front().ticket == writer_ticket;
-            RemoveWaitingWriterLocked(writer_ticket);
-            RepairWakeAfterWriteCancelLocked(was_head);
+    /**
+     * @brief 读者慢路径：park 到「门开且无写者排队」。
+     * @throw std::logic_error 调度器不可用 / 等待中止。
+     */
+    void RLockSlow() {
+        if (!m_park_mutex.Lock()) {
+            throw std::logic_error(
+                "go2cpp::sync::RWMutex RLock: scheduler unavailable");
         }
-        if (recovered) {
-            m_state.Unlock();
-        }
-        throw std::logic_error(
-            recovered
-                ? "go2cpp::sync::RWMutex wait aborted (internal mutex was "
-                  "lost while waiting; recovered)"
-                : "go2cpp::sync::RWMutex wait aborted (internal mutex was "
-                  "lost while waiting and could not be recovered)");
-    }
-
-    /// @brief 在有限预算内用 `TryLock` 抢回 m_state（不进入等待队列）。
-    bool RecoverInternalLock() noexcept {
-        for (std::size_t attempt = 0; attempt < kLockRecoveryAttempts;
-             ++attempt) {
-            if (m_state.TryLock()) {
-                return true;
+        for (;;) {
+            const std::int64_t current = m_state.load(std::memory_order_acquire);
+            if (current >= 0 && current < kGate &&
+                m_pending.load(std::memory_order_acquire) == 0) {
+                // 登记后必须复查返回值：写者的快路径 CAS 不取 m_park_mutex，
+                // 可能在「检查门开」与「fetch_add」之间抢先关门。此时
+                // fetch_add 返回的是门关状态（>= kGate），必须回滚继续等。
+                const std::int64_t registered =
+                    m_state.fetch_add(1, std::memory_order_acq_rel);
+                if (registered >= 0 && registered < kGate) {
+                    m_park_mutex.Unlock();
+#if GO2CPP_DEBUG_RESOURCES
+                GO2CPP_DEBUG_RESOURCE_EVENT_V5(
+                    kRwLockRead, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(),
+                    0, 0, ::go2cpp::debug::ResourceResult::kOk, 0, false, 0,
+                    -1, 0, 0);
+#endif
+                    return;
+                }
+                const std::int64_t after =
+                    m_state.fetch_sub(1, std::memory_order_acq_rel) - 1;
+                if ((after & kWriteBit) != 0 && (after & kLowMask) == 0) {
+                    WakeDrainWatchers();
+                }
             }
-            if ((attempt & 63U) == 63U) {
-                std::this_thread::yield();
+            m_waiting_readers.fetch_add(1, std::memory_order_relaxed);
+#if GO2CPP_DEBUG_RESOURCES
+            GO2CPP_DEBUG_RESOURCE_EVENT_V5(
+                kRwLockRead, m_debug_resource, GO2CPP_DEBUG_BOUND_TASK(), 0, 0,
+                ::go2cpp::debug::ResourceResult::kBlocked,
+                static_cast<std::uint32_t>(
+                    m_waiting_readers.load(std::memory_order_relaxed)),
+                true, 0, -1, 0, 0);
+#endif
+            bool notified = false;
+            try {
+                notified = m_reader_cv.Wait(m_park_mutex);
+            } catch (const std::runtime_error&) {
+                m_waiting_readers.fetch_sub(1, std::memory_order_relaxed);
+                throw std::logic_error(
+                    "go2cpp::sync::RWMutex RLock aborted (internal wait "
+                    "lost)");
+            }
+            m_waiting_readers.fetch_sub(1, std::memory_order_relaxed);
+            if (!notified) {
+                m_park_mutex.Unlock();
+                throw std::logic_error(
+                    "go2cpp::sync::RWMutex RLock aborted (G cancelled or "
+                    "scheduler shut down)");
             }
         }
-        return false;
     }
 
-    /// @brief 唤醒写者队首；调用方必须持有 m_state 且写者队列非空。
-    /// @details 每个 park 的写者睡在**自己的**条件变量上（指针登记在队列
-    ///          节点里），因此这里精确 Notify 队首，不再广播。只有队首可能
-    ///          被交接令牌放行；其余写者继续睡到轮到自己，避免惊群。
-    void WakeFrontWriterLocked() noexcept {
-        if (m_waiting_writers.empty()) {
-            return;
-        }
-        ConditionVariable* waiter_cv = m_waiting_writers.front().cv;
-        if (waiter_cv != nullptr) {
-            waiter_cv->NotifyOne();
-        }
-    }
-
-    /// @brief 放行全部排队读者；无人等待时完全短路（不触碰条件变量）。
-    void WakeReadersLocked() noexcept {
-        if (m_waiting_readers.load(std::memory_order_relaxed) != 0U) {
-            m_ready.NotifyAll();
-        }
-    }
-
-    /// @brief 撤销写者票据后的交接 / 唤醒修补。
-    /// @details 只有撤销队首票据才会改变其他等待者的可放行性：
-    ///          - 还有写者排队：若门仍关着（上一任写者把门交接了下来），把
-    ///            交接令牌转给新队首；门开着则清掉令牌，让新队首自己关门。
-    ///          - 队列已空：清掉令牌；门若仍关着必须开回去，再放行读者，
-    ///            否则读者会永久等待一个不存在的写者。
-    void RepairWakeAfterWriteCancelLocked(bool removed_head) noexcept {
-        if (!removed_head) {
-            return;
-        }
-        // 有写者正在持锁：门和交接令牌都由它在 Unlock 时处理。等待者取消
-        // 绝不能在这里开门（否则读者会在写者临界区内进入）或提前交接。
-        if (m_writing.load(std::memory_order_acquire)) {
-            m_write_handoff.store(0, std::memory_order_release);
-            return;
-        }
-        if (!m_waiting_writers.empty()) {
-            if (m_reader_count.load(std::memory_order_acquire) < 0) {
-                m_write_handoff.store(m_waiting_writers.front().ticket,
-                                      std::memory_order_release);
-            } else {
-                m_write_handoff.store(0, std::memory_order_release);
+    /**
+     * @brief 写者等「上一个写者开门」。
+     * @details 先短自旋（交接窗口通常只有几条指令），再 park。
+     */
+    void WaitGateOpen(bool timed,
+                      std::chrono::steady_clock::time_point deadline) {
+        for (std::size_t spin = 0; spin < kWriterSpin; ++spin) {
+            if (m_state.load(std::memory_order_acquire) == 0) {
+                return;
             }
-            WakeFrontWriterLocked();
+            CpuRelax();
+        }
+        if (!m_park_mutex.Lock()) {
+            throw std::logic_error(
+                "go2cpp::sync::RWMutex Lock: scheduler unavailable");
+        }
+        m_gate_waiters.fetch_add(1, std::memory_order_relaxed);
+        while (m_state.load(std::memory_order_acquire) != 0) {
+            bool notified = false;
+            try {
+                if (timed) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline) {
+                        notified = false;
+                        break;
+                    }
+                    notified = m_writer_cv.WaitFor(m_park_mutex, deadline - now);
+                } else {
+                    notified = m_writer_cv.Wait(m_park_mutex);
+                }
+            } catch (const std::runtime_error&) {
+                m_gate_waiters.fetch_sub(1, std::memory_order_relaxed);
+                throw std::logic_error(
+                    "go2cpp::sync::RWMutex Lock aborted (internal wait lost)");
+            }
+            if (!notified && !timed) {
+                m_gate_waiters.fetch_sub(1, std::memory_order_relaxed);
+                m_park_mutex.Unlock();
+                throw std::logic_error(
+                    "go2cpp::sync::RWMutex Lock aborted (G cancelled or "
+                    "scheduler shut down)");
+            }
+        }
+        m_gate_waiters.fetch_sub(1, std::memory_order_relaxed);
+        m_park_mutex.Unlock();
+    }
+
+    /**
+     * @brief 写者等「读者全部退出」。
+     * @details 与 `WaitGateOpen` 共用 `m_writer_cv`（各自重查自己的谓词）。
+     */
+    void WaitReadersDrain(bool timed,
+                          std::chrono::steady_clock::time_point deadline) {
+        for (std::size_t spin = 0; spin < kWriterSpin; ++spin) {
+            if ((m_state.load(std::memory_order_acquire) & kLowMask) == 0) {
+                return;
+            }
+            CpuRelax();
+        }
+        if (!m_park_mutex.Lock()) {
+            throw std::logic_error(
+                "go2cpp::sync::RWMutex Lock: scheduler unavailable");
+        }
+        m_drain_waiters.fetch_add(1, std::memory_order_relaxed);
+        while ((m_state.load(std::memory_order_acquire) & kLowMask) != 0) {
+            bool notified = false;
+            try {
+                if (timed) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline) {
+                        break;
+                    }
+                    notified = m_writer_cv.WaitFor(m_park_mutex, deadline - now);
+                } else {
+                    notified = m_writer_cv.Wait(m_park_mutex);
+                }
+            } catch (const std::runtime_error&) {
+                m_drain_waiters.fetch_sub(1, std::memory_order_relaxed);
+                throw std::logic_error(
+                    "go2cpp::sync::RWMutex Lock aborted (internal wait lost)");
+            }
+            if (!notified && !timed) {
+                m_drain_waiters.fetch_sub(1, std::memory_order_relaxed);
+                m_park_mutex.Unlock();
+                throw std::logic_error(
+                    "go2cpp::sync::RWMutex Lock aborted (G cancelled or "
+                    "scheduler shut down)");
+            }
+        }
+        m_drain_waiters.fetch_sub(1, std::memory_order_relaxed);
+        m_park_mutex.Unlock();
+    }
+
+    /// @brief 带截止时间的读者等待（供 `RLockFor` 使用）。
+    bool WaitReaderLocked(std::chrono::steady_clock::duration budget) {
+        try {
+            return m_reader_cv.WaitFor(m_park_mutex, budget);
+        } catch (const std::runtime_error&) {
+            throw std::logic_error(
+                "go2cpp::sync::RWMutex RLockFor aborted (internal wait lost)");
+        }
+    }
+
+    /// @brief 唤醒等「读者归零」的写者；无人等待时只多一次原子 load。
+    void WakeDrainWatchers() noexcept {
+        if (m_drain_waiters.load(std::memory_order_relaxed) == 0U) {
             return;
         }
-        m_write_handoff.store(0, std::memory_order_release);
-        if (m_reader_count.load(std::memory_order_acquire) < 0) {
-            m_reader_count.fetch_add(kReaderGate, std::memory_order_acq_rel);
-        }
-        WakeReadersLocked();
+        WakeWriterWaiters();
     }
 
-    /// @brief 按票据查找等待节点；调用方必须持有 m_state。
-    std::deque<WriterWaiter>::iterator FindWaitingWriterLocked(
-        std::uint64_t ticket) {
-        return std::find_if(
-            m_waiting_writers.begin(), m_waiting_writers.end(),
-            [ticket](const WriterWaiter& waiter) {
-                return waiter.ticket == ticket;
-            });
-    }
-
-    /// @brief 从等待队列摘除票据；调用方必须持有 m_state，且票据仍在队列中。
-    void RemoveWaitingWriterLocked(std::uint64_t ticket) {
-        if (!m_waiting_writers.empty() &&
-            m_waiting_writers.front().ticket == ticket) {
-            m_waiting_writers.pop_front();
+    /// @brief 唤醒等「上一个写者开门」的写者；无人等待时短路。
+    void WakeGateIfWaiting() noexcept {
+        if (m_gate_waiters.load(std::memory_order_relaxed) == 0U) {
             return;
         }
-        const auto it = FindWaitingWriterLocked(ticket);
-        if (it != m_waiting_writers.end()) {
-            m_waiting_writers.erase(it);
-        }
+        WakeWriterWaiters();
     }
 
-    /// @brief 读者计数刚归零且写者门已关时，唤醒等待中的写者。
-    /// @details 没有任何写者时零开销返回（只多一次原子读）。
-    void WakeWriterIfWaiting() noexcept {
-        if (m_reader_count.load(std::memory_order_acquire) >= 0) {
+    /// @brief 唤醒 park 中的读者；无人等待时短路。
+    void WakeReadersIfWaiting() noexcept {
+        if (m_waiting_readers.load(std::memory_order_relaxed) == 0U) {
             return;
         }
         try {
-            if (!m_state.Lock()) {
+            if (!m_park_mutex.Lock()) {
                 return;
             }
-            if (!m_waiting_writers.empty()) {
-                WakeFrontWriterLocked();
-            }
-            m_state.Unlock();
+            m_reader_cv.NotifyAll();
+            m_park_mutex.Unlock();
         } catch (...) {
-            // 唤醒修补失败不能越过 RUnlock 的 noexcept 边界。
+            // 唤醒失败不能越过 noexcept 边界。
+        }
+    }
+
+    /// @brief 唤醒 `m_writer_cv` 上的全部写者（各自重查谓词）。
+    void WakeWriterWaiters() noexcept {
+        try {
+            if (!m_park_mutex.Lock()) {
+                return;
+            }
+            m_writer_cv.NotifyAll();
+            m_park_mutex.Unlock();
+        } catch (...) {
         }
     }
 
@@ -955,38 +784,29 @@ private:
     /// @brief 资源级历史编号（构造时注册；OFF 构建不存在该成员）。
     ::go2cpp::debug::ResourceId m_debug_resource{0};
 #endif
-    /// 保护下面全部可变状态的内部互斥量（协程 / 线程混合）。
-    mutable Mutex m_state;
-    /// 读者广播：读者等待「无写者且无等待写者」。
-    ConditionVariable m_ready;
-
-    /// 读者门：`>= 0` 为读者数（门开着）；`== -kReaderGate` 为门关且无
-    /// 读者（写者可获取）；`-kReaderGate < 值 < 0` 为门关但仍有读者未退完。
-    /// 读者进入与写者关门都作用在这**同一个**原子量上，因此二者有唯一的
-    /// 全局顺序（旧版用「计数 + 布尔门」两个变量，存在互相看不见的窗口）。
-    // 独占缓存行：读者快路径只触碰这一个原子量，写者慢路径的 m_writing /
-    // 等待队列在别的行上。共享一行会让每次读者 RMW 都作废写者正在读的行。
-    alignas(64) mutable std::atomic<std::int64_t> m_reader_count{0};
-    /// 写者交接令牌：`0` = 无交接；否则为“已被授权获取写锁”的队首票据。
-    /// 上一任写者 `Unlock` 时若还有写者排队，就在**不开门**的前提下把令牌
-    /// 交给队首；正在自旋的写者看到令牌即可直接登记，完全跳过 futex。
-    /// 独立缓存行：写者自旋读它，读者只碰 m_reader_count，避免互相作废。
-    alignas(64) std::atomic<std::uint64_t> m_write_handoff{0};
-    /// 当前阻塞在 m_ready 上的读者数；供唤醒方判断是否值得通知。
-    /// 用 atomic 是因为「内部锁丢失」的兜底路径（D3）必须在**未持锁**的
-    /// 情况下完成自减，否则就是对受保护字段的数据竞争。
+    /// @brief 读者计数 + 写者门 + 慢路径标记的合并状态字。
+    /// @details 独占缓存行：读写快路径都只碰这一行。
+    alignas(64) mutable std::atomic<std::int64_t> m_state{0};
+    /// @brief 正在慢路径等待的写者数（>0 时读者不再走快路径）。
+    /// @details 独立缓存行：读者快路径每次 RLock 读它，不能和写者的
+    ///          状态字更新假共享。
+    alignas(64) std::atomic<std::size_t> m_pending{0};
+    /// @brief 写者 FIFO 排队（慢路径专用；协程走 park、线程走 futex）。
+    /// @details `sync::Mutex` 自带 FIFO 与饥饿保护，慢路径直接复用它，
+    ///          不再手写票号 / 队列 / 每个写者一个条件变量。
+    Mutex m_writer_mutex;
+    /// @brief 慢路径 park 共用的内部互斥量（包住条件检查与 `Wait`）。
+    Mutex m_park_mutex;
+    /// @brief 读者等待：门开且无写者排队。
+    ConditionVariable m_reader_cv;
+    /// @brief 写者等待：上一个写者开门 / 读者全部退出。
+    ConditionVariable m_writer_cv;
+    /// @brief 阻塞在 `m_reader_cv` 上的读者数（唤醒短路用）。
     std::atomic<std::size_t> m_waiting_readers{0};
-    /// 当前是否有写者持锁。
-    /// @note 用原子量：`ReaderCount()` 是 noexcept 诊断接口、且必须在不取
-    ///       `m_state` 的情况下判断「是否有写者持锁」，否则会与写者路径构成
-    ///       数据竞争（TSAN）。所有写入仍发生在 `m_state` 临界区内。
-    mutable std::atomic<bool> m_writing{false};
-    /// 下一个写者票据；只在 `m_state` 内递增，用于写者 FIFO。
-    std::uint64_t m_next_writer_ticket{0};
-    /// 正在等待的写者票据队列（push_back 即有序，front() 即队首）。
-    /// 用 deque 而不是 set：票据单调递增，尾部插入天然有序，避免每次 Lock
-    /// 的红黑树节点分配与 O(log n) 插入；取消时线性 erase（罕见路径）。
-    std::deque<WriterWaiter> m_waiting_writers;
+    /// @brief 阻塞在 `m_writer_cv` 上等「门开」的写者数。
+    std::atomic<std::size_t> m_gate_waiters{0};
+    /// @brief 阻塞在 `m_writer_cv` 上等「读者归零」的写者数。
+    std::atomic<std::size_t> m_drain_waiters{0};
 };
 
 }  // namespace go2cpp::sync
