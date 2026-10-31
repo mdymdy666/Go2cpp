@@ -31,6 +31,8 @@
 
 #include "go2cpp/bento/net/http_server.hpp"
 #include "go2cpp/bento/net/ws_server.hpp"
+#include "go2cpp/bento/net/mqtt.hpp"
+#include "go2cpp/bento/net/coap.hpp"
 
 #include "go2cpp/network/address.hpp"
 #include "go2cpp/network/io.hpp"
@@ -221,6 +223,134 @@ void ServeUdp(std::uint16_t port, int workers) {
     manager.shutdown();
 }
 
+/// 单条 MQTT 连接：一个 broker + 流式解码，出站包原样写回。
+void MqttConnectionLoop(const Socket::Ptr& connection) {
+    go2cpp::bento::net::MqttBroker broker;
+    std::string assigned;
+    if (broker.OpenSession("bench-0", &assigned) != go2cpp::bento::net::MqttStatus::kOk) {
+        return;
+    }
+    std::vector<char> buffer(64 * 1024);
+    std::vector<go2cpp::bento::net::MqttOutbound> outbound;
+    for (;;) {
+        const auto received = connection->recv(buffer.data(), buffer.size());
+        if (received.transferred <= 0) {
+            return;
+        }
+        outbound.clear();
+        (void)broker.HandleBytes(
+            assigned, reinterpret_cast<const std::uint8_t*>(buffer.data()),
+            static_cast<std::size_t>(received.transferred), &outbound);
+        for (const auto& message : outbound) {
+            (void)connection->send(message.bytes.data(), message.bytes.size());
+        }
+    }
+}
+
+/// MQTT：每连接一 Fiber + 每连接一个 broker（单连接自订阅回环）。
+void ServeMqtt(std::uint16_t port, int workers) {
+    go2cpp::io::IOManager manager(MakeSchedulerConfig(workers));
+    if (!manager.start()) {
+        std::fprintf(stderr, "mqtt: manager start failed\n");
+        std::exit(1);
+    }
+    manager.go([&manager, port]() {
+        auto listener = Socket::CreateTCP(AF_INET);
+        if (!listener) {
+            std::exit(1);
+        }
+        int reuse = 1;
+        (void)listener->set_option(SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        const auto address = go2cpp::net::Address::LookupAny(
+            "127.0.0.1:" + std::to_string(port), AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (!address || !listener->bind(*address) || !listener->listen(512)) {
+            std::fprintf(stderr, "mqtt: bind/listen failed: %s\n", std::strerror(errno));
+            std::exit(1);
+        }
+        unsigned bound = 0;
+        if (const auto ip = std::dynamic_pointer_cast<go2cpp::net::IPAddress>(
+                listener->local_address())) {
+            bound = ip->port();
+        }
+        PrintReady(bound);
+        while (g_stop == 0) {
+            auto connection = listener->accept();
+            if (!connection) {
+                continue;
+            }
+            manager.go([connection]() {
+                MqttConnectionLoop(connection);
+                (void)connection->close();
+            });
+        }
+        (void)listener->close();
+    });
+    while (g_stop == 0) {
+        ::sleep(1);
+    }
+    manager.shutdown();
+}
+
+/// CoAP：一个 Fiber 串行收发包，CoapServer 负责解码/去重/组装响应。
+void ServeCoap(std::uint16_t port, int workers) {
+    go2cpp::io::IOManager manager(MakeSchedulerConfig(workers));
+    if (!manager.start()) {
+        std::fprintf(stderr, "coap: manager start failed\n");
+        std::exit(1);
+    }
+    auto socket = Socket::CreateUDP(AF_INET);
+    if (!socket) {
+        std::exit(1);
+    }
+    int reuse = 1;
+    (void)socket->set_option(SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    const auto address = go2cpp::net::Address::LookupAny(
+        "127.0.0.1:" + std::to_string(port), AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (!address || !socket->bind(*address)) {
+        std::fprintf(stderr, "coap: bind failed: %s\n", std::strerror(errno));
+        std::exit(1);
+    }
+    unsigned bound = 0;
+    if (const auto ip = std::dynamic_pointer_cast<go2cpp::net::IPAddress>(
+            socket->local_address())) {
+        bound = ip->port();
+    }
+    PrintReady(bound);
+    manager.go([socket]() {
+        go2cpp::net::AddressPtr peer;
+        go2cpp::bento::net::CoapServer server(
+            [&socket, &peer](const std::vector<std::uint8_t>& wire) {
+                if (!peer) {
+                    return false;
+                }
+                const auto result = socket->send_to(wire.data(), wire.size(), *peer);
+                return result.transferred == static_cast<ssize_t>(wire.size());
+            });
+        server.SetHandler([](const go2cpp::bento::net::CoapMessage& request) {
+            if (request.code == go2cpp::bento::net::CoapCode::kGet) {
+                return go2cpp::bento::net::CoapResponse::Content({'o', 'k'}, 0);
+            }
+            return go2cpp::bento::net::CoapServer::DefaultResponse(request.code);
+        });
+        std::vector<char> buffer(4096);
+        while (g_stop == 0) {
+            go2cpp::net::AddressPtr from;
+            const auto received = socket->recv_from(buffer.data(), buffer.size(), from, 0);
+            if (received.transferred <= 0) {
+                continue;
+            }
+            peer = std::move(from);
+            (void)server.Handle(reinterpret_cast<const std::uint8_t*>(buffer.data()),
+                                static_cast<std::size_t>(received.transferred));
+        }
+    });
+    while (g_stop == 0) {
+        ::sleep(1);
+    }
+    (void)socket->close();
+    manager.shutdown();
+}
+
 /// HTTP：bento::HttpServer 内部每连接一 Fiber；handler 返回固定 12 字节。
 void ServeHttp(std::uint16_t port, int workers) {
     HttpServer server;
@@ -310,6 +440,10 @@ int main(int argc, char** argv) {
         ServeHttp(port, workers);
     } else if (mode == "ws") {
         ServeWs(port, workers);
+    } else if (mode == "mqtt") {
+        ServeMqtt(port, workers);
+    } else if (mode == "coap") {
+        ServeCoap(port, workers);
     } else {
         std::fprintf(stderr, "unknown mode: %s\n", mode.c_str());
         return 2;
