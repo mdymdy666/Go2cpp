@@ -3,9 +3,12 @@
 本仓库提供一个可独立使用的 C++17 库，实现文档明确的 Go 运行时语义子集。
 它是运行时/库，不是 Go 解析器，也不是 Go 到 C++ 的源码转译器。
 
-仓库同时内置三块可选能力（默认 OFF，按需打开）：MCP 框架 `mcp/`（`-DGO2CPP_WITH_MCP=ON`）、
-统一命令行 `tools/cli`（`-DGO2CPP_WITH_CLI=ON`）、主机监控与 eBPF 采集（`bpf/` + `go2cpp::os_monitor`，
-`-DGO2CPP_ENABLE_EBPF=ON`，默认开；eBPF 不可用时自动降级为 `/proc` 采集）。
+仓库同时内置多块可选能力：MCP 框架 `mcp/`（`-DGO2CPP_WITH_MCP=ON`，默认 OFF）、
+统一命令行 `tools/cli`（`-DGO2CPP_WITH_CLI=ON`，默认 OFF）、主机监控与 eBPF 采集
+（`bpf/` + `go2cpp::os_monitor`，`-DGO2CPP_ENABLE_EBPF=ON`，默认开；eBPF 不可用时自动降级为
+`/proc` 采集）、P2P 公网穿透 `go2cpp::p2p`（`-DGO2CPP_WITH_P2P=ON`，默认 ON）、应用层流表框架
+`go2cpp::app`（`-DGO2CPP_WITH_APP=ON`，默认 OFF）与 header-only 缓存策略库 `go2cpp::cache`
+（默认可用，7 种淘汰策略）。
 
 公共 API 位于 `go2cpp` 命名空间，包含：
 
@@ -61,7 +64,11 @@ ctest --test-dir build --output-on-failure
   `mixed_runtime_demo.cpp`、`context_rollback_demo.cpp`、`timer_task_demo.cpp`；
 - `example/network/`：`network_demo.cpp`、`io_wait_many_demo.cpp`、
   `io_hook_demo.cpp`（仅 Linux Hook 构建）、`sse_demo.cpp`、`websocket_demo.cpp`；
-- `example/logging/log_config_demo.cpp`、`example/tools/control_flow_demo.cpp`。
+- `example/logging/log_config_demo.cpp`、`example/tools/control_flow_demo.cpp`；
+- `example/app/`：`web_server_simple`、`web_server_full`、`chat_server_simple`、`chat_server_full`
+  四个服务示例（不注册 ctest，用 curl/客户端驱动），另有 `p2p_demo`、`cache_demo`、`stream_demo`
+  等演示程序；清单与运行方式见 [`example/app/README.md`](example/app/README.md)，需
+  `-DGO2CPP_WITH_APP=ON` 或对应模块开关。
 
 其中 `mixed_runtime_demo.cpp` 展示普通线程与 Fiber 的同步、FiberLocal 值、
 线程级 Hook 策略和显式 `BlockingRegion`。日志和配置的完整新手示例是
@@ -107,6 +114,10 @@ go2cpp::shutdown_default_scheduler();
 `go2cpp::log`、`go2cpp::config`，以及 Hook 构建下的 `go2cpp::hook`）既可在源码树中
 单独使用，也会与 `go2cpp::runtime` umbrella target 一起导出。
 
+2026-10-31 新增三个可选模块 target：`go2cpp::p2p`（NAT 穿透，`-DGO2CPP_WITH_P2P=ON`，默认 ON）、
+`go2cpp::app`（应用层流表框架，`-DGO2CPP_WITH_APP=ON`，默认 OFF）、`go2cpp::cache`（header-only
+7 策略缓存，INTERFACE）。三者都不进入 `install(EXPORT)`，头文件随整个 `include/` 目录安装。
+
 
 新手完整示例是 `example/concurrency/beginner_demo.cpp`，构建后运行：
 
@@ -145,7 +156,10 @@ IOManager::WaitAnyFor() 和 WaitManyFor() 只在该 IOManager 的 managed Fiber
 
 | 路径 | 内容 |
 | --- | --- |
-| `src/` | 运行时实现，按模块分为 `concurrency/`、`network/`、`os/`、`logging/`、`config/`、`debug/`、`tools/`、`bufio/` 等 |
+| `src/` | 运行时实现，按模块分为 `concurrency/`、`network/`、`os/`、`logging/`、`config/`、`debug/`、`tools/`、`bufio/`、`p2p/`、`app/` 等 |
+| `include/go2cpp/p2p/` | 公网穿透头文件：STUN 消息/客户端/服务器、ICE 候选与信令、TURN 客户端/服务器、`P2PChannel`、TCP 同时打开 |
+| `include/go2cpp/app/` | 应用层流表框架头文件：帧、流表、连接、资源、KV、传输适配（Memory/Bento/HTTP） |
+| `include/go2cpp/cache/` | header-only 缓存策略：`Cache<K,V>` 接口 + LRU/LRU-K/2Q/W-TinyLFU/GDSF/ARC/CLOCK + 工厂/分片 |
 | `include/go2cpp/` | 公共头文件；`include/go2cpp/*.hpp` 是兼容转发头，真实定义在模块子目录 |
 | `mcp/` | 内置 MCP 框架：`protocol/`、`server/`、`transport/`、`tools/`、`llm/`、`plugin/`、`vector/`、`retrieval/`、`app/` |
 | `bpf/` | 6 个 eBPF C 程序（sched/futex/syscall/net/tcp/fileio），由 `cmake/embed_bpf.cmake` 编译并嵌入 |
@@ -174,6 +188,11 @@ IOManager::WaitAnyFor() 和 WaitManyFor() 只在该 IOManager 的 managed Fiber
 | `GO2CPP_BUILD_ENHANCED` | `OFF` | 一键打开 DEBUG_DUMP + DIAGNOSTIC + REPLAY + MIGRATION_API（未显式指定时也打开 CLI） |
 | `GO2CPP_WITH_MCP` | `OFF` | 构建内置 MCP 框架与 `mcp_server` |
 | `GO2CPP_WITH_CLI` | `OFF` | 构建 `go2cpp-cli` 统一命令行 |
+| `GO2CPP_WITH_P2P` | `ON` | 构建 P2P 公网穿透模块与 `go2cpp::p2p`（零外部依赖） |
+| `GO2CPP_P2P_TESTS` | `ON` | 注册 4 个 `p2p_*` ctest（不依赖 `GO2CPP_BUILD_TESTS`） |
+| `GO2CPP_WITH_APP` | `OFF` | 构建应用层流表框架 `go2cpp_app` 与 8 个 `app_*` ctest |
+| `GO2CPP_APP_TESTS` | `ON` | 注册 `app_*` ctest（仅在 `GO2CPP_WITH_APP=ON` 时生效） |
+| `MCP_BUILD_TESTS` | （未声明 option） | 注册 21 个 MCP 框架 ctest；需显式 `-DMCP_BUILD_TESTS=ON` |
 | `GO2CPP_BUILD_OS_MONITOR_TESTS` | `ON` | 构建 `go2cpp::os::monitor` 测试并并入 CTest |
 | `GO2CPP_ENABLE_EBPF` | `ON` | 编译并嵌入 eBPF 程序；缺少 clang/libbpf/libelf/libz 时自动降级 |
 | `GO2CPP_DEBUG_DUMP` | `OFF` | 事件环 + DebugServer（Unix socket），默认零开销 |
@@ -194,8 +213,9 @@ cmake -S . -B /UserData/build/go2cpp-mcp-integrated -DCMAKE_BUILD_TYPE=Release \
 cmake --build /UserData/build/go2cpp-mcp-integrated -j
 ```
 
-该配置只注册监控与 bufio 的 14 个 CTest 用例（`GO2CPP_BUILD_OS_MONITOR_TESTS=ON`）；
-完整运行时测试需 `-DGO2CPP_BUILD_TESTS=ON`。
+该配置（`GO2CPP_BUILD_TESTS=OFF`）只注册 20 个 CTest 用例（12 os/monitor + 3 bufio +
+4 p2p + 1 reflect_codec）；完整运行时测试需 `-DGO2CPP_BUILD_TESTS=ON`，MCP 框架用例还需
+显式 `-DMCP_BUILD_TESTS=ON`。
 
 ## 文档导航
 
@@ -215,12 +235,22 @@ ctest 数量随构建配置变化，**以 `ctest -N` 为准**（逐条清单见 
 
 | 构建配置 | profile | ctest 总数 |
 | --- | --- | --- |
-| Bento + MCP（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`，`.build-bento-wsl`） | `bento+mcp` | **85**（60 bento + 3 bufio + 1 reflect_codec + 21 MCP 框架） |
-| MCP 集成（`-DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_OS_MONITOR_TESTS=ON`） | `mcp+osmon` | **35**（12 os/monitor + 2 bufio + 21 MCP 框架） |
+| 主构建 `.build-bento-wsl`（Bento + MCP + runtime + app + p2p） | `bento+mcp+runtime` | **230**（59 bento + 8 app + 4 p2p + 2 cache + 3 bufio + 1 reflect_codec + 21 MCP 框架 + 132 运行时/示例/工具） |
+| Bento + MCP（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`，`GO2CPP_BUILD_TESTS=OFF`） | `bento+mcp` | **80**（60 bento + 12 os/monitor + 3 bufio + 4 p2p + 1 reflect_codec） |
+| MCP 集成（`-DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_OS_MONITOR_TESTS=ON`） | `mcp+osmon` | **20**（12 os/monitor + 3 bufio + 4 p2p + 1 reflect_codec） |
 
-Bento + MCP 构建实测 **Total Tests: 85**、**85/85 passed**；MCP 集成构建实测 **35/35 passed**（root 用例无权限时记 SKIP）。
+主构建注册 **Total Tests: 230**，2026-10-31 全量 `ctest` 实测 149 passed / 7 failed / 74 not run
+（示例可执行未编译、`libgo2cpp_debug.so` 与源码 ABI 不一致、`go2cpp_tests` 的 spin-mutex 计数断言
+时序敏感、3 个 `tools-*` 缺 CLI/迁移/回放产物；详见 [testing.md](docs/testing.md)「测试地图」）。
+`mcp+osmon` 配置同日在独立构建目录实测 **20/20 passed**。80/20 都不含 21 个 MCP 框架用例：
+`MCP_BUILD_TESTS` 没有 `option()` 声明，需要显式 `-DMCP_BUILD_TESTS=ON`。
 
 ```sh
+cmake -S . -B .build-bento-wsl -DCMAKE_BUILD_TYPE=Release \
+      -DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON -DMCP_BUILD_TESTS=ON \
+      -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_WITH_APP=ON -DGO2CPP_WITH_P2P=ON \
+      -DGO2CPP_BUILD_OS_MONITOR_TESTS=OFF
+cmake --build .build-bento-wsl --parallel
 ctest --test-dir .build-bento-wsl --output-on-failure
 ```
 

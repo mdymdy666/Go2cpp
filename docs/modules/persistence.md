@@ -50,6 +50,6 @@
 
 ## 7. 相关
 
-- 回放：[replay](../replay.md)（`tools/replay`，G2CRPLY v5）；
+- 回放：[replay-service](../replay-service.md)（`tools/replay`，G2CRPLY v5）；
 - 工具总览：[tools.md](tools.md)；
 - 旧文档 [persistence-benchmark.md](../persistence-benchmark.md) 已合并至本文。

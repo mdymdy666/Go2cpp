@@ -539,3 +539,26 @@ errno noinline），不是寄存器保存。
   ICE 无 nomination/角色；数据面无重传/拥塞控制；TCP 打洞平台相关；
   IPv6 打洞未覆盖（端点/STUN 支持 IPv6，MockNat 与 TCP 打洞仅 IPv4）。
 - **状态**：未 commit；未改任何既有模块实现。
+
+---
+
+## 2026-10-31 文档全面对齐（子 agent：文档对齐）
+
+- **盘点**：`.build-bento-wsl`（profile `bento+mcp+runtime`）`ctest -N` 实测 **230**；`docs/testing.md`
+  仍登记 85。另用同一份源码重新 configure 两个配置实测：`bento+mcp`（`GO2CPP_BUILD_TESTS=OFF`）**80**、
+  `mcp+osmon` **20**（旧文档写 85/35）。差异原因：`MCP_BUILD_TESTS` 未声明为 CMake option，
+  未显式传参时 21 个 MCP 用例不注册；`GO2CPP_P2P_TESTS` 默认 ON 且不依赖 `GO2CPP_BUILD_TESTS`。
+- **docs/testing.md**：现状索引与「构建配置与 ctest 数量」表改为 230/80/20，新增三份逐项测试地图
+  （230 项主构建、80、20），补 p2p/cache/app/example 的分类构成与注册条件说明。
+- **docs/INDEX.md**：模块表补 `modules/app-framework.md`、`modules/p2p-nat-traversal.md`、
+  `modules/cache.md`、`modules/bento-modules.md`、`modules/concurrency-usage.md`；调研节补
+  `research/cache-algorithms.md`；顶部统计改为 73 主题 + 19 状态机 + 24 review + 8 research。
+- **docs/modules.md**：第 1 节补 p2p/app/cache 三行与 target，修正 `GO2CPP_MODULE_TARGETS` 计数
+  （24 常驻 + 条件 hook + 3 新模块），测试布局补 `tests/{p2p,app,cache}` 与 `example/app`。
+- **docs/modules/cache.md**：新建（7 策略接口/论文差异/复杂度/测试/实测摘要/限制/边界）。
+- **README**：可选能力、示例清单、模块 target、目录结构、CMake 选项（`GO2CPP_WITH_P2P`/`GO2CPP_P2P_TESTS`/
+  `GO2CPP_WITH_APP`/`GO2CPP_APP_TESTS`/`MCP_BUILD_TESTS`）、测试表与主构建命令全部对齐。
+- **验证**：`ctest -R docs_consistency` 通过（28 断言 0 失败，profile 强校验生效）；文档相对链接扫描
+  428 条 0 失效；`.build-bento-wsl` 全量实测 149 passed / 7 failed / 74 not run（原因已写入 testing.md）；
+  `mcp+osmon` 独立构建目录全量 20/20 passed。
+- **状态**：未改任何代码；未 commit。

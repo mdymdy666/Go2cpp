@@ -7,12 +7,14 @@
 > 反映演进过程，引用时请按当前结构核对；确需表示当前有效路径的段落已就地修正
 > 或加注。
 
-> **2026-10-30 现状索引**：ctest 数量随构建配置变化，**以 `ctest -N` 为准**（逐条清单见文末「测试地图」）。
-> 当前实测 ctest 总数 **85**（共 85 个 ctest；profile `bento+mcp` = 60 bento + 3 bufio + 1 reflect_codec + 21 MCP 框架），
-> profile `mcp+osmon` 为 **35**（12 os/monitor + 2 bufio + 21 MCP 框架）；历史默认构建 130 条 / 增强构建 62 条
-> 见文末历史节。五能力增强矩阵 **183**（PASS 182 / SKIP 1 / FAIL 0）、4 条场景（含 channel 互等死锁），
-> 以及 `default`/`enhanced` 两套构建矩阵、一键入口和 CI 说明，统一记录在文末
-> 「现状与 CI（2026-10-21）」一节；逐条清单与完整 `ctest -N` 输出见
+> **2026-10-31 现状索引**：ctest 数量随构建配置变化，**以 `ctest -N` 为准**（逐条清单见文末「测试地图」）。
+> 当前主构建 `.build-bento-wsl`（profile `bento+mcp+runtime`）实测 ctest 总数 **230**：
+> 59 bento + 8 app + 4 p2p + 2 cache + 3 bufio + 1 reflect_codec + 21 MCP 框架 + 132 运行时/示例/工具。
+> profile `bento+mcp`（`GO2CPP_BUILD_TESTS=OFF`）为 **80**，`mcp+osmon` 为 **20**——这两个配置不注册
+> 21 个 MCP 框架测试，因为 `MCP_BUILD_TESTS` 没有声明为 CMake option，需要显式 `-DMCP_BUILD_TESTS=ON`。
+> 历史默认构建 130 条 / 增强构建 62 条见文末历史节；五能力增强矩阵 **183**（PASS 182 / SKIP 1 / FAIL 0）、
+> 4 条场景（含 channel 互等死锁），以及 `default`/`enhanced` 两套构建矩阵、一键入口和 CI 说明，统一记录在
+> 文末「现状与 CI（2026-10-21）」一节；逐条清单与完整 `ctest -N` 输出见
 > [`docs/test-audit-2026-10-21.md`](test-audit-2026-10-21.md) 第 9 节。历史章节保持原样。
 
 本文记录在规范 WSL 工作区执行的构建、测试和工具检查命令：
@@ -833,114 +835,286 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 
 完整缺口、复现命令与固化建议见 [`docs/test-audit-2026-10-21.md`](test-audit-2026-10-21.md)。
 
-## 构建配置与 ctest 数量（2026-10-30 实测）
+## 构建配置与 ctest 数量（2026-10-31 实测）
 
 | profile | 构建开关 | ctest 总数 |
 | --- | --- | --- |
-| `bento+mcp` | `GO2CPP_WITH_BENTO=ON`、`GO2CPP_WITH_MCP=ON` | **85** |
-| `mcp+osmon` | `GO2CPP_WITH_MCP=ON`、`GO2CPP_BUILD_OS_MONITOR_TESTS=ON` | **35** |
+| `bento+mcp+runtime` | `GO2CPP_WITH_BENTO=ON`、`GO2CPP_WITH_MCP=ON`、`MCP_BUILD_TESTS=ON`、`GO2CPP_BUILD_TESTS=ON`、`GO2CPP_WITH_APP=ON`、`GO2CPP_WITH_P2P=ON`（`.build-bento-wsl`，Release） | **230** |
+| `bento+mcp` | `GO2CPP_WITH_BENTO=ON`、`GO2CPP_WITH_MCP=ON`；`GO2CPP_BUILD_TESTS=OFF`，未传 `MCP_BUILD_TESTS` | **80** |
+| `mcp+osmon` | `GO2CPP_WITH_MCP=ON`、`GO2CPP_BUILD_OS_MONITOR_TESTS=ON`；`GO2CPP_BUILD_TESTS=OFF` | **20** |
 
 > profile 由 CMake 选项自动推导，按固定顺序用 `+` 连接：`bento`（`GO2CPP_WITH_BENTO`）、
 > `mcp`（`GO2CPP_WITH_MCP`）、`osmon`（`GO2CPP_BUILD_OS_MONITOR_TESTS`）、
 > `runtime`（`GO2CPP_BUILD_TESTS`）、`enhanced`（`GO2CPP_BUILD_ENHANCED`）。
 > 新增构建组合时在此登记；`mcp/tests/test_docs_consistency.py` 会按当前构建的 profile
 > 校验上表数字与该 profile 的测试地图逐项一致。
+>
+> 三个数字的差异全部来自测试注册条件（2026-10-31 用同一份源码重新 configure 后 `ctest -N` 实测）：
+>
+> - **`bento+mcp+runtime`（230，`.build-bento-wsl`）**：打开 `GO2CPP_BUILD_TESTS`，运行时单元/审计/压测
+>   与 `example/` 示例全部注册（132 项）；显式 `-DMCP_BUILD_TESTS=ON` 注册 21 个 MCP 框架用例。
+>   这是当前唯一完整构建。
+> - **`bento+mcp`（80）**：`GO2CPP_BUILD_TESTS=OFF` 后只剩 60 Bento + 12 os/monitor（默认 ON）
+>   + 3 bufio + 4 p2p（`GO2CPP_P2P_TESTS` 默认 ON，不依赖 `GO2CPP_BUILD_TESTS`）+ 1 reflect_codec。
+> - **`mcp+osmon`（20）**：12 os/monitor + 3 bufio + 4 p2p + 1 reflect_codec。
+> - `MCP_BUILD_TESTS` 在 `mcp/CMakeLists.txt` 中没有 `option()` 声明，未显式传参时为空（视为 OFF），
+>   所以 80/20 两个配置都不含 21 个 MCP 用例；需要 MCP 测试时显式加 `-DMCP_BUILD_TESTS=ON`。
 
-## 测试地图（profile `bento+mcp`，85 项）
+## 测试地图（profile `bento+mcp+runtime`，230 项）
 
-对应 `.build-bento-wsl`（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`），实测 **85/85 passed**。构成：60 个 `bento_*` + 3 个 bufio + 1 个 `reflect_codec` + 21 个 MCP 框架用例；root/权限相关用例无权限时记 SKIP。
+对应 `.build-bento-wsl`（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON -DMCP_BUILD_TESTS=ON -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_WITH_APP=ON -DGO2CPP_WITH_P2P=ON`，Release，`GO2CPP_BUILD_OS_MONITOR_TESTS=OFF`），2026-10-31 注册 **230 项**；当日全量 `ctest` 实测 **149 passed / 7 failed / 74 not run**（失败原因见下）。构成：59 `bento_*` + 8 `app_*` + 4 `p2p_*` + 2 cache + 3 bufio + 1 `reflect_codec` + 21 MCP 框架 + 132 运行时/示例/工具（含 3 个 `tools-*` 与 `scenario-channel-deadlock`）。p2p/cache/app 三组是 2026-10-31 新增模块的测试；root/权限相关用例无权限时记 SKIP。
+
+> **本次全量失败的 7 项与 74 项 not run 都不是 p2p/cache/app 新模块的问题**（这三组 14 项全过）：
+>
+> - **2 项资源历史测试**（`go2cpp_resource_history_stress`、`go2cpp_resource_history_test`）：
+>   `libgo2cpp_debug.so.0: undefined symbol go2cpp::net::Socket::TcpNoDelayDefault`——共享库与当前
+>   源码 ABI 不一致（构建产物过期），重建库后应恢复；
+> - **`go2cpp_tests`**：`tests/concurrency/test_spin_mutex.cpp:357/377/391` 的计数断言
+>   （`MutexHeldParkTotal` / `SpinDegradeTotal`）在本次运行时序下失败 3 处（单独复跑 exit 0，
+>   属时序敏感的计数断言）；
+> - **`go2cpp_state_matrix`**：`Waiting × wake_for_wait` 的 wake 结果不符；
+> - **3 个 `tools-*`**：本轮构建的 CLI / 迁移 / 回放均为 OFF，脚本在「缺产物」分支因 `set -u`
+>   报未绑定变量（`run_cli.sh:25`、`run_migration.sh:26`、`run_replay.sh:25`）；
+> - **74 项 not run**：示例/测试可执行未在本轮构建中编译（`ctest -N` 仍会注册，但没有产物）。
+>
+> 重建全部目标后应重跑；本文只登记注册集合与逐项清单，不把这轮结果当作全绿证据。
 
 | # | 用例 |
 |---|---|
-| 1 | `go2cpp_bufio_test` |
-| 2 | `go2cpp_bufio_stress` |
-| 3 | `go2cpp_bufio_batch_test` |
-| 4 | `bento_socks5` |
-| 5 | `bento_error` |
-| 6 | `bento_reflect` |
-| 7 | `bento_keystore` |
-| 8 | `bento_http_server` |
-| 9 | `bento_ws_server` |
-| 10 | `bento_omni_server` |
-| 11 | `bento_omni_server_m1` |
-| 12 | `bento_bench_protocols` |
-| 13 | `bento_command` |
-| 14 | `bento_file_transfer` |
-| 15 | `bento_zip` |
-| 16 | `bento_backup` |
-| 17 | `bento_upload` |
-| 18 | `bento_fetch` |
-| 19 | `bento_file_browser` |
-| 20 | `bento_link_loopback` |
-| 21 | `bento_unreliable_dropstale` |
-| 22 | `bento_video_fragment` |
-| 23 | `bento_rtt_pto` |
-| 24 | `bento_fast_retransmit` |
-| 25 | `bento_stream_fragment` |
-| 26 | `bento_crypto` |
-| 27 | `bento_secure_link` |
-| 28 | `bento_secure_injection` |
-| 29 | `bento_congestion` |
-| 30 | `bento_flow_control` |
-| 31 | `bento_bandwidth` |
-| 32 | `bento_stats_json` |
-| 33 | `bento_ipv6` |
-| 34 | `bento_concurrent_send` |
-| 35 | `bento_conn_migration` |
-| 36 | `bento_fec` |
-| 37 | `bento_pmtud` |
-| 38 | `bento_zero_rtt` |
-| 39 | `bento_peer_hub` |
-| 40 | `bento_tcp_proxy` |
-| 41 | `bento_session_control` |
-| 42 | `bento_peer_hub_secure` |
-| 43 | `bento_default_encryption` |
-| 44 | `bento_log_hook` |
-| 45 | `bento_link_server` |
-| 46 | `bento_mqtt` |
-| 47 | `bento_token_pairing` |
-| 48 | `bento_frame` |
-| 49 | `bento_coap` |
-| 50 | `bento_heartbeat` |
-| 51 | `bento_backoff` |
-| 52 | `bento_pairing` |
-| 53 | `bento_session_table` |
-| 54 | `bento_transport` |
-| 55 | `bento_relay` |
-| 56 | `bento_capability` |
-| 57 | `bento_session` |
-| 58 | `bento_udp_transport` |
-| 59 | `bento_x25519` |
-| 60 | `bento_x25519_handshake` |
-| 61 | `bento_weaknet_proxy` |
-| 62 | `bento_netem` |
-| 63 | `bento_channel_thread_stress` |
-| 64 | `reflect_codec` |
-| 65 | `json_rpc` |
-| 66 | `registry` |
-| 67 | `tools` |
-| 68 | `vector` |
-| 69 | `validation` |
-| 70 | `retrieval` |
-| 71 | `process` |
-| 72 | `robot_control` |
-| 73 | `plugin_notify` |
-| 74 | `monitor_client` |
-| 75 | `monitor_tools` |
-| 76 | `socket_tools` |
-| 77 | `socket_whitelist` |
-| 78 | `monitor_boundaries` |
-| 79 | `monitor_capacity` |
-| 80 | `monitor_concurrent_tools` |
-| 81 | `monitor_args_fuzz` |
-| 82 | `monitor_e2e` |
-| 83 | `monitor_http_faults` |
-| 84 | `socket_e2e` |
-| 85 | `docs_consistency` |
+| 1 | `go2cpp_primitives_stress` |
+| 2 | `go2cpp_primitives_cancel` |
+| 3 | `go2cpp_park_wake_pair` |
+| 4 | `go2cpp_resource_history_stress` |
+| 5 | `go2cpp_tests` |
+| 6 | `scenario-channel-deadlock` |
+| 7 | `go2cpp_replay_v5_stress` |
+| 8 | `go2cpp_concurrency_combinations` |
+| 9 | `go2cpp_concurrency_fuzz` |
+| 10 | `go2cpp_deadlock_detection` |
+| 11 | `go2cpp_debug_record_correctness` |
+| 12 | `go2cpp_unknown_filter_rejected` |
+| 13 | `go2cpp_known_filter_runs` |
+| 14 | `go2cpp_fiber_growable_stack` |
+| 15 | `go2cpp_scheduler_smoke` |
+| 16 | `go2cpp_high_load_stress` |
+| 17 | `go2cpp_timer_stress` |
+| 18 | `go2cpp_state_machine` |
+| 19 | `go2cpp_scheduler_queue_latency` |
+| 20 | `go2cpp_hpack_test` |
+| 21 | `go2cpp_frame_test` |
+| 22 | `go2cpp_stream_state_test` |
+| 23 | `go2cpp_connection_test` |
+| 24 | `go2cpp_os_test` |
+| 25 | `go2cpp_os_dir_test` |
+| 26 | `go2cpp_socket_debug_test` |
+| 27 | `go2cpp_net_batch_test` |
+| 28 | `go2cpp_http2_stress` |
+| 29 | `go2cpp_http2_boundary` |
+| 30 | `go2cpp_state_matrix` |
+| 31 | `go2cpp_http2_state_matrix` |
+| 32 | `go2cpp_http2_state_desync_repro` |
+| 33 | `go2cpp_log_buffer_test` |
+| 34 | `go2cpp_math_test` |
+| 35 | `go2cpp_rand_test` |
+| 36 | `go2cpp_path_test` |
+| 37 | `go2cpp_path_filepath_test` |
+| 38 | `go2cpp_container_test` |
+| 39 | `go2cpp_config_registry_macro_test` |
+| 40 | `go2cpp_config_reflect_test` |
+| 41 | `go2cpp_so_manifest_test` |
+| 42 | `go2cpp_fiber_select_test` |
+| 43 | `go2cpp_select_lockorder_test` |
+| 44 | `go2cpp_compress_test` |
+| 45 | `go2cpp_encoding_test` |
+| 46 | `go2cpp_hash_test` |
+| 47 | `go2cpp_metrics_test` |
+| 48 | `go2cpp_channel_concurrency` |
+| 49 | `go2cpp_channel_thread_stress` |
+| 50 | `go2cpp_worker_lifecycle` |
+| 51 | `go2cpp_future_audit` |
+| 52 | `go2cpp_sync_cancel_stress` |
+| 53 | `go2cpp_io_audit` |
+| 54 | `go2cpp_parking_condition_stress` |
+| 55 | `go2cpp_resource_history_test` |
+| 56 | `tools-migration` |
+| 57 | `tools-cli` |
+| 58 | `tools-replay` |
+| 59 | `go2cpp_bufio_test` |
+| 60 | `go2cpp_bufio_stress` |
+| 61 | `go2cpp_bufio_batch_test` |
+| 62 | `go2cpp_debug_module_demo` |
+| 63 | `go2cpp_runtime_demo` |
+| 64 | `go2cpp_runtime_basic_demo` |
+| 65 | `go2cpp_runtime_full` |
+| 66 | `go2cpp_fiber_sync_demo` |
+| 67 | `go2cpp_managed_pipeline_demo` |
+| 68 | `go2cpp_dynamic_gmp_demo` |
+| 69 | `go2cpp_dynamic_gmp_demo_new` |
+| 70 | `go2cpp_dynamic_gmp_full` |
+| 71 | `go2cpp_mixed_runtime_demo` |
+| 72 | `go2cpp_beginner_demo` |
+| 73 | `go2cpp_channel_demo` |
+| 74 | `go2cpp_channel_full` |
+| 75 | `go2cpp_context_demo` |
+| 76 | `go2cpp_context_full` |
+| 77 | `go2cpp_sync_demo` |
+| 78 | `go2cpp_sync_full` |
+| 79 | `go2cpp_future_full` |
+| 80 | `go2cpp_config_demo` |
+| 81 | `go2cpp_config_full` |
+| 82 | `go2cpp_runtime_config_demo` |
+| 83 | `go2cpp_runtime_config_full` |
+| 84 | `go2cpp_config_center_demo` |
+| 85 | `go2cpp_config_center_full` |
+| 86 | `go2cpp_control_flow_demo` |
+| 87 | `go2cpp_control_flow_full` |
+| 88 | `go2cpp_io_wait_many_demo` |
+| 89 | `go2cpp_network_demo` |
+| 90 | `go2cpp_websocket_demo` |
+| 91 | `go2cpp_websocket_full` |
+| 92 | `go2cpp_sse_demo` |
+| 93 | `go2cpp_sse_basic_demo` |
+| 94 | `go2cpp_sse_full` |
+| 95 | `go2cpp_context_rollback_demo` |
+| 96 | `go2cpp_log_config_demo` |
+| 97 | `go2cpp_log_demo` |
+| 98 | `go2cpp_log_full` |
+| 99 | `go2cpp_timer_task_demo` |
+| 100 | `go2cpp_timer_full` |
+| 101 | `go2cpp_parking_condition_demo` |
+| 102 | `go2cpp_parking_condition_full` |
+| 103 | `go2cpp_scheduler_demo` |
+| 104 | `go2cpp_scheduler_full` |
+| 105 | `go2cpp_thread_policy_demo` |
+| 106 | `go2cpp_thread_policy_full` |
+| 107 | `go2cpp_fiber_local_demo` |
+| 108 | `go2cpp_fiber_local_full` |
+| 109 | `go2cpp_fiber_stack_limit_demo` |
+| 110 | `go2cpp_fiber_stack_limit_full` |
+| 111 | `go2cpp_future_demo` |
+| 112 | `go2cpp_futex_mutex_demo` |
+| 113 | `go2cpp_fd_manager_demo` |
+| 114 | `go2cpp_http_demo` |
+| 115 | `go2cpp_http_full` |
+| 116 | `go2cpp_fd_manager_full` |
+| 117 | `go2cpp_io_backend_demo` |
+| 118 | `go2cpp_io_backend_basic_demo` |
+| 119 | `go2cpp_io_backend_full` |
+| 120 | `go2cpp_address_bytearray_demo` |
+| 121 | `go2cpp_address_full` |
+| 122 | `go2cpp_bytearray_full` |
+| 123 | `go2cpp_errors_demo` |
+| 124 | `go2cpp_error_full` |
+| 125 | `go2cpp_strings_demo` |
+| 126 | `go2cpp_strings_full` |
+| 127 | `go2cpp_strconv_demo` |
+| 128 | `go2cpp_strconv_full` |
+| 129 | `go2cpp_fmt_demo` |
+| 130 | `go2cpp_fmt_full` |
+| 131 | `go2cpp_streams_demo` |
+| 132 | `go2cpp_streams_full` |
+| 133 | `go2cpp_time_demo` |
+| 134 | `go2cpp_time_full` |
+| 135 | `go2cpp_fast_channel_test` |
+| 136 | `p2p_test_stun` |
+| 137 | `p2p_test_p2p` |
+| 138 | `p2p_test_tcp_punch` |
+| 139 | `p2p_test_p2p_interprocess` |
+| 140 | `bento_socks5` |
+| 141 | `bento_error` |
+| 142 | `bento_reflect` |
+| 143 | `bento_keystore` |
+| 144 | `bento_http_server` |
+| 145 | `bento_ws_server` |
+| 146 | `bento_omni_server` |
+| 147 | `bento_omni_server_m1` |
+| 148 | `bento_bench_protocols` |
+| 149 | `bento_command` |
+| 150 | `bento_file_transfer` |
+| 151 | `bento_zip` |
+| 152 | `bento_backup` |
+| 153 | `bento_upload` |
+| 154 | `bento_fetch` |
+| 155 | `bento_file_browser` |
+| 156 | `bento_link_loopback` |
+| 157 | `bento_unreliable_dropstale` |
+| 158 | `bento_video_fragment` |
+| 159 | `bento_rtt_pto` |
+| 160 | `bento_fast_retransmit` |
+| 161 | `bento_stream_fragment` |
+| 162 | `bento_crypto` |
+| 163 | `bento_secure_link` |
+| 164 | `bento_secure_injection` |
+| 165 | `bento_congestion` |
+| 166 | `bento_flow_control` |
+| 167 | `bento_bandwidth` |
+| 168 | `bento_stats_json` |
+| 169 | `bento_ipv6` |
+| 170 | `bento_concurrent_send` |
+| 171 | `bento_conn_migration` |
+| 172 | `bento_fec` |
+| 173 | `bento_pmtud` |
+| 174 | `bento_zero_rtt` |
+| 175 | `bento_peer_hub` |
+| 176 | `bento_tcp_proxy` |
+| 177 | `bento_session_control` |
+| 178 | `bento_peer_hub_secure` |
+| 179 | `bento_default_encryption` |
+| 180 | `bento_log_hook` |
+| 181 | `bento_link_server` |
+| 182 | `bento_mqtt` |
+| 183 | `bento_token_pairing` |
+| 184 | `bento_frame` |
+| 185 | `bento_coap` |
+| 186 | `bento_heartbeat` |
+| 187 | `bento_backoff` |
+| 188 | `bento_pairing` |
+| 189 | `bento_session_table` |
+| 190 | `bento_transport` |
+| 191 | `bento_relay` |
+| 192 | `bento_capability` |
+| 193 | `bento_session` |
+| 194 | `bento_udp_transport` |
+| 195 | `bento_x25519` |
+| 196 | `bento_x25519_handshake` |
+| 197 | `bento_weaknet_proxy` |
+| 198 | `bento_netem` |
+| 199 | `reflect_codec` |
+| 200 | `app_frame` |
+| 201 | `app_stream_table` |
+| 202 | `app_resource` |
+| 203 | `app_kv` |
+| 204 | `app_connection` |
+| 205 | `app_load` |
+| 206 | `app_bento` |
+| 207 | `app_http` |
+| 208 | `go2cpp_cache_test` |
+| 209 | `go2cpp_cache_bench` |
+| 210 | `json_rpc` |
+| 211 | `registry` |
+| 212 | `tools` |
+| 213 | `vector` |
+| 214 | `validation` |
+| 215 | `retrieval` |
+| 216 | `process` |
+| 217 | `robot_control` |
+| 218 | `plugin_notify` |
+| 219 | `monitor_client` |
+| 220 | `monitor_tools` |
+| 221 | `socket_tools` |
+| 222 | `socket_whitelist` |
+| 223 | `monitor_boundaries` |
+| 224 | `monitor_capacity` |
+| 225 | `monitor_concurrent_tools` |
+| 226 | `monitor_args_fuzz` |
+| 227 | `monitor_e2e` |
+| 228 | `monitor_http_faults` |
+| 229 | `socket_e2e` |
+| 230 | `docs_consistency` |
 
-## 测试地图（profile `mcp+osmon`，35 项）
+## 测试地图（profile `bento+mcp`，80 项）
 
-对应 MCP 集成构建（`-DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_OS_MONITOR_TESTS=ON`，`GO2CPP_BUILD_TESTS=OFF`），实测 **35/35 passed**。构成：12 个 os/monitor + 2 个 bufio + 21 个 MCP 框架用例。
+对应 `-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`（`GO2CPP_BUILD_TESTS=OFF`、未开 `MCP_BUILD_TESTS`），2026-10-31 重新 configure 后 `ctest -N` 实测 **80 项**（只登记注册集合，不声明通过数）。构成：60 Bento + 12 os/monitor + 3 bufio + 4 p2p + 1 reflect_codec。
 
 | # | 用例 |
 |---|---|
@@ -958,24 +1132,96 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 | 12 | `go2cpp_os_tcp_io_monitor_root` |
 | 13 | `go2cpp_bufio_test` |
 | 14 | `go2cpp_bufio_stress` |
-| 15 | `json_rpc` |
-| 16 | `registry` |
-| 17 | `tools` |
-| 18 | `vector` |
-| 19 | `validation` |
-| 20 | `retrieval` |
-| 21 | `process` |
-| 22 | `robot_control` |
-| 23 | `plugin_notify` |
-| 24 | `monitor_client` |
-| 25 | `monitor_tools` |
-| 26 | `socket_tools` |
-| 27 | `socket_whitelist` |
-| 28 | `monitor_boundaries` |
-| 29 | `monitor_capacity` |
-| 30 | `monitor_concurrent_tools` |
-| 31 | `monitor_args_fuzz` |
-| 32 | `monitor_e2e` |
-| 33 | `monitor_http_faults` |
-| 34 | `socket_e2e` |
-| 35 | `docs_consistency` |
+| 15 | `go2cpp_bufio_batch_test` |
+| 16 | `p2p_test_stun` |
+| 17 | `p2p_test_p2p` |
+| 18 | `p2p_test_tcp_punch` |
+| 19 | `p2p_test_p2p_interprocess` |
+| 20 | `bento_socks5` |
+| 21 | `bento_error` |
+| 22 | `bento_reflect` |
+| 23 | `bento_keystore` |
+| 24 | `bento_http_server` |
+| 25 | `bento_ws_server` |
+| 26 | `bento_omni_server` |
+| 27 | `bento_omni_server_m1` |
+| 28 | `bento_bench_protocols` |
+| 29 | `bento_command` |
+| 30 | `bento_file_transfer` |
+| 31 | `bento_zip` |
+| 32 | `bento_backup` |
+| 33 | `bento_upload` |
+| 34 | `bento_fetch` |
+| 35 | `bento_file_browser` |
+| 36 | `bento_link_loopback` |
+| 37 | `bento_unreliable_dropstale` |
+| 38 | `bento_video_fragment` |
+| 39 | `bento_rtt_pto` |
+| 40 | `bento_fast_retransmit` |
+| 41 | `bento_stream_fragment` |
+| 42 | `bento_crypto` |
+| 43 | `bento_secure_link` |
+| 44 | `bento_secure_injection` |
+| 45 | `bento_congestion` |
+| 46 | `bento_flow_control` |
+| 47 | `bento_bandwidth` |
+| 48 | `bento_stats_json` |
+| 49 | `bento_ipv6` |
+| 50 | `bento_concurrent_send` |
+| 51 | `bento_conn_migration` |
+| 52 | `bento_fec` |
+| 53 | `bento_pmtud` |
+| 54 | `bento_zero_rtt` |
+| 55 | `bento_peer_hub` |
+| 56 | `bento_tcp_proxy` |
+| 57 | `bento_session_control` |
+| 58 | `bento_peer_hub_secure` |
+| 59 | `bento_default_encryption` |
+| 60 | `bento_log_hook` |
+| 61 | `bento_link_server` |
+| 62 | `bento_mqtt` |
+| 63 | `bento_token_pairing` |
+| 64 | `bento_frame` |
+| 65 | `bento_coap` |
+| 66 | `bento_heartbeat` |
+| 67 | `bento_backoff` |
+| 68 | `bento_pairing` |
+| 69 | `bento_session_table` |
+| 70 | `bento_transport` |
+| 71 | `bento_relay` |
+| 72 | `bento_capability` |
+| 73 | `bento_session` |
+| 74 | `bento_udp_transport` |
+| 75 | `bento_x25519` |
+| 76 | `bento_x25519_handshake` |
+| 77 | `bento_weaknet_proxy` |
+| 78 | `bento_netem` |
+| 79 | `bento_channel_thread_stress` |
+| 80 | `reflect_codec` |
+
+## 测试地图（profile `mcp+osmon`，20 项）
+
+对应 `-DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_OS_MONITOR_TESTS=ON`（`GO2CPP_BUILD_TESTS=OFF`），2026-10-31 在独立构建目录（`-DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_OS_MONITOR_TESTS=ON`，Release）全量实测 **20/20 passed**（66.5 s；非 root 的 root 用例按 `SKIP_RETURN_CODE 77` 记 SKIP）。构成：12 os/monitor + 3 bufio + 4 p2p + 1 reflect_codec；MCP 框架用例未注册（同 `MCP_BUILD_TESTS` 原因）。
+
+| # | 用例 |
+|---|---|
+| 1 | `go2cpp_os_monitor_collectors` |
+| 2 | `go2cpp_os_monitor_interfaces` |
+| 3 | `go2cpp_os_monitor_ebpf` |
+| 4 | `go2cpp_os_monitor_e2e` |
+| 5 | `go2cpp_os_monitor_stress` |
+| 6 | `go2cpp_os_kernel_monitor` |
+| 7 | `go2cpp_os_tcp_io_monitor` |
+| 8 | `go2cpp_os_monitor_ebpf_nonroot` |
+| 9 | `go2cpp_os_monitor_overhead` |
+| 10 | `go2cpp_os_monitor_ebpf_root` |
+| 11 | `go2cpp_os_kernel_monitor_root` |
+| 12 | `go2cpp_os_tcp_io_monitor_root` |
+| 13 | `go2cpp_bufio_test` |
+| 14 | `go2cpp_bufio_stress` |
+| 15 | `go2cpp_bufio_batch_test` |
+| 16 | `p2p_test_stun` |
+| 17 | `p2p_test_p2p` |
+| 18 | `p2p_test_tcp_punch` |
+| 19 | `p2p_test_p2p_interprocess` |
+| 20 | `reflect_codec` |

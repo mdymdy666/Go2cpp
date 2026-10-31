@@ -1,7 +1,7 @@
 # Go2Cpp 文档索引（INDEX）
 
-> 盘点基准：`HEAD 1b46de8`（MCP 已内置），2026-10-26。
-> 统计：`docs/` 下 **102 篇既有文档**（不含本索引）= 73 篇主题文档（23,894 行）+ 19 篇状态机 + 10 篇 review；
+> 盘点基准：`HEAD 6c08210`，2026-10-31。
+> 统计：`docs/` 下 **73 篇主题文档**（不含本索引）+ 19 篇状态机 + 24 篇 review + 8 篇 research；
 > 另有 MCP 架构文档 `mcp/docs/architecture.md`。
 > 本索引是文档的唯一入口；新增/改名文档必须在此登记。代码语义不在本索引范围内。
 
@@ -51,7 +51,7 @@
 | [dependencies.md](dependencies.md) | Go 1.4.3/1.23.0 参考源码、第三方依赖与版本、归档校验方式 | 现行 |
 | [design.md](design.md) | 运行时范围、模块划分、线程/Fiber/IO 契约与不承诺项 | 现行 |
 | [extensibility.md](extensibility.md) | 各模块核心职责、可替换边界、不应承担的职责 | 现行 |
-| [modules.md](modules.md) | 模块目录 → CMake target → 头文件布局 → 依赖边界 | 待更新（计数已修为 24，但第 1 节表格仍只列 7 个目录） |
+| [modules.md](modules.md) | 模块目录 → CMake target → 头文件布局 → 依赖边界 | 现行（2026-10-31 补 p2p/app/cache 与 tests 布局） |
 
 ## 二、核心设计（13）
 
@@ -107,7 +107,7 @@
 
 | 文档 | 一句话说明 | 状态 |
 | --- | --- | --- |
-| [testing.md](testing.md) | 测试矩阵、构建目录、CTest 超时/看门狗与 CI 入口 | 现行（ctest 数按构建 profile 登记：`bento+mcp` 81 / `mcp+osmon` 35；历史节仍含 130 等旧计数） |
+| [testing.md](testing.md) | 测试矩阵、构建目录、CTest 超时/看门狗与 CI 入口 | 现行（ctest 数按构建 profile 登记：`bento+mcp+runtime` 230 / `bento+mcp` 80 / `mcp+osmon` 20；历史节仍含 130 等旧计数） |
 | [test-audit-2026-10-21.md](test-audit-2026-10-21.md) | 全量测试审计：0–8 节为早间快照，第 9 节为 `ctest -N` 清单 | 历史 |
 | [performance.md](performance.md) | 2026-10-21 性能数据汇总（并发原语/内存/切换/IO） | 现行 |
 | [performance-baseline-2026-10-19.md](performance-baseline-2026-10-19.md) | **当前唯一有效性能基线**：公平对比方法、三轮优化根因与前后数据 | 现行 |
@@ -225,7 +225,8 @@
   `coost-comparison.md`：旧 epoll 池模型不公平，作者已自标结论作废。
 - `test-audit-2026-10-21.md` 0–8 节、`NEXT-STEPS.md`、`AGENT-HANDOFF.md`、`annotation-progress.md`、
   `function-annotation-progress.md`、`so-reload-progress.md`：写死 113/114/115/130/135 等 ctest 计数；
-  当前构建的准确数字见 [testing.md](testing.md)「构建配置与 ctest 数量」表（`bento+mcp` 81 / `mcp+osmon` 35）。
+  当前构建的准确数字见 [testing.md](testing.md)「构建配置与 ctest 数量」表
+  （`bento+mcp+runtime` 230 / `bento+mcp` 80 / `mcp+osmon` 20）。
 - `modules.md`：原写“13 个模块 target”，本次已修正为 24（含 `math/rand/path/container/compress/encoding/hash/metrics/debug`）；第 1 节表格仍只列 7 个目录。
 - `testing.md`：路径约定与 130/183 等历史数字跨多次重构，引用前必须按当前树核对；当前 ctest 总数已按构建 profile 校准（见其「测试地图」）。
 - `code-review-guide.md`：基线 `bd99603`，行号已漂移，且文件未跟踪。
@@ -297,6 +298,11 @@
 | [modules/logging.md](modules/logging.md) | logging：Level/LogRecord、Filter→Formatter→Sink 四层、BufferedSink 两把锁与惰性刷新、File/Rotating/Stdout/Memory/Callback、热加载与边界 | 现行 |
 | [modules/metrics.md](modules/metrics.md) | metrics：Counter/Gauge/Histogram、标签族缓存、固定桶与分位插值、Prometheus 文本导出、注册冲突与标签基数边界 | 现行 |
 | [modules/config.md](modules/config.md) | config：INI 语法与 `\xHH` 往返、ConfigVar 两阶段事务、Config 整批热加载、`.lock` 协议、RuntimeConfig 默认值/校验、`GO2CPP_CONFIG_REGISTER`、SO manifest 层 | 现行 |
+| [modules/bento-modules.md](modules/bento-modules.md) | Bento 模块覆盖矩阵（JinShan 39 模块 → Go2Cpp）：逐模块实现、测试数、状态与模块文档链接 | 现行 |
+| [modules/concurrency-usage.md](modules/concurrency-usage.md) | 并发迁移手册：Thread → Fiber 的写法、四条铁律、边界识别与常见坑（与设计文档互补） | 现行 |
+| [modules/app-framework.md](modules/app-framework.md) | app：HTTP/2 风格流表、9B 帧头、两级窗口、依赖树 + WFQ、资源分块/SHA-256/续传、KV 流、Bento/HTTP 适配与限制 | 现行 |
+| [modules/p2p-nat-traversal.md](modules/p2p-nat-traversal.md) | p2p：STUN（RFC 5389 子集）、四类 NAT 检测、ICE 候选/信令、UDP 打洞、简化 TURN、TCP 同时打开、`P2PChannel` 与实测数据 | 现行 |
+| [modules/cache.md](modules/cache.md) | cache：LRU/LRU-K/2Q/W-TinyLFU/GDSF/ARC/CLOCK 统一接口、7 策略差异、复杂度、测试与基准摘要 | 现行（2026-10-31 新增） |
 
 > 合并说明：`channel-hang.md`、`concurrency-5rounds.md`、`concurrency-baseline.md`、
 > `concurrency-park-points.md`、`correctness_audit.md` 已在顶部标注合并去向，正文保留为
@@ -315,3 +321,5 @@
 ## 调研文档（补充）
 
 - [socket-debug-mode](research/socket-debug-mode.md)：Socket Debug 模式调研（方案 D：自持计数 + 事件复用 + 第 11 视图）
+- [cache-algorithms](research/cache-algorithms.md)：缓存淘汰算法专题（LRU → LRU-K → 2Q → W-TinyLFU → GDSF/ARC/CLOCK），
+  含论文对照、本仓库实现差异、5 场景 × 7 策略完整基准与限制；模块入口见 [modules/cache.md](modules/cache.md)。

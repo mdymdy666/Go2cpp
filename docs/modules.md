@@ -14,9 +14,16 @@
 | `src/os`、`include/go2cpp/os` | 文件句柄（`os::File`：Open/Create/Read/Write/Seek/Stat/Sync/Truncate）、目录遍历（`ReadDir`/`MkdirAll`/`RemoveAll`）、符号链接、环境变量、`Args` | `go2cpp::os` |
 | `src/logging`、`include/go2cpp/logging` | 日志等级、Formatter/Item、Sink、Logger 父级传播 | `go2cpp::log` |
 | `src/config`、`include/go2cpp/config` | `ConfigVar<T>`、INI 快照、变更监听与热加载事务 | `go2cpp::config` |
+| `src/p2p`、`include/go2cpp/p2p` | STUN（RFC 5389 子集）、四类 NAT 检测、ICE 候选/信令、UDP 打洞、简化 TURN、TCP 同时打开、`P2PChannel` | `go2cpp::p2p`（默认 ON，见 `cmake/Go2CppP2P.cmake`） |
+| `src/app`、`include/go2cpp/app` | 应用层流表框架：9B 帧头、流状态机、两级窗口、依赖树 + WFQ、资源分块/校验/续传、KV 流、Bento/HTTP 传输适配 | `go2cpp::app`（默认 OFF，见 `cmake/Go2CppApp.cmake`） |
+| `include/go2cpp/cache` | header-only 缓存策略：LRU/LRU-K/2Q/W-TinyLFU/GDSF/ARC/CLOCK + 工厂/分片/线程安全装饰器 | `go2cpp::cache`（INTERFACE，见 `cmake/Go2CppCache.cmake`） |
 | 仅头文件 | 聚合 umbrella，导出全部模块 target 与 `include/` 路径 | `go2cpp::runtime`（INTERFACE） |
 
-共计 24 个模块 target（含条件编译的 `go2cpp_hook`；`math`/`rand`/`path`/`container`/`compress`/`encoding`/`hash`/`metrics`/`debug` 等也各有 target）加 1 个 `go2cpp::runtime` 聚合 target；完整别名清单见
+`GO2CPP_MODULE_TARGETS` 共 24 个常驻 target（`error`/`control_flow`/`context`/`channel`/`scheduler`/`fiber`/
+`sync`/`future`/`io`/`network`/`log`/`config`/`reflect`/`os`/`math`/`rand`/`path`/`container`/`compress`/
+`encoding`/`hash`/`metrics`/`debug_event`/`debug`），Linux 共享构建再追加条件编译的 `go2cpp_hook`
+（25 个）；另有 `go2cpp_p2p`、`go2cpp_app`、`go2cpp_cache` 三个新模块 target，它们不进入
+`GO2CPP_MODULE_TARGETS` 与 `install(EXPORT)`。再加 1 个 `go2cpp::runtime` 聚合 target；完整别名清单见
 `cmake/Go2CppModules.cmake` 的 `add_library(... ALIAS ...)` 段。转译代码只需包含
 `go2cpp/runtime.hpp`。
 
@@ -58,11 +65,12 @@
 
 ## 4. 测试与示例布局
 
-测试和示例分别按相同模块放入 `tests/{tools,concurrency,logging,network}` 与
-`example/{tools,concurrency,logging,network}`。CMake 保持显式文件列表，便于审计和
+测试和示例按模块放入 `tests/{tools,concurrency,logging,network,os,debug,bufio,bento,p2p,app,cache}`
+与 `example/{tools,concurrency,logging,network,app}`。CMake 保持显式文件列表，便于审计和
 交叉编译，不使用 glob 隐藏新增源文件。新增测试与示例必须同时登记到
-`cmake/Go2CppTests.cmake`；测试还须在 `tests/test_main.cpp` 注册以支持
-`GO2CPP_TEST_FILTER`，示例须登记进 `example/README.md` 的速查表。
+`cmake/Go2CppTests.cmake`（或对应模块的 `Go2Cpp{Bento,P2P,App,Cache}.cmake`）；
+运行时会话的测试还须在 `tests/test_main.cpp` 注册以支持 `GO2CPP_TEST_FILTER`，
+示例须登记进 `example/README.md` 的速查表。
 
 ## 附：`os` 模块的接入状态（如实记录）
 
