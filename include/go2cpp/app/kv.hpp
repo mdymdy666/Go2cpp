@@ -104,7 +104,11 @@ class KvTable {
     bool Erase(std::string_view key);
 
     /// @brief 清空。
-    void Clear() noexcept { m_entries.clear(); }
+    void Clear() noexcept {
+        m_entries.clear();
+        m_index.clear();
+        m_index_used = 0;
+    }
 
     /// @brief 值是否全为可打印 ASCII（不含控制字符/非 ASCII）。
     bool PrintableAscii() const noexcept;
@@ -146,7 +150,45 @@ class KvTable {
     bool operator!=(const KvTable& other) const noexcept { return !(*this == other); }
 
    private:
+    /// @brief 条目数不超过该值时只用线性扫描，不建哈希索引。
+    /// @details 小表（HEADERS 常见 3-10 条）的线性比较比维护哈希表更省：
+    ///          免去一次索引分配与探测，且这些键通常在同一 cache line 内。
+    static constexpr std::size_t kLinearScanLimit = 8;
+
+    /// @brief 键不存在时的哨兵下标。
+    static constexpr std::size_t kNoIndex = static_cast<std::size_t>(-1);
+
+    /**
+     * @brief 哈希索引槽（开放寻址 + 线性探测）。
+     * @details 槽里存的是 `m_entries` 的**下标**而不是 `string_view`：
+     *          `m_entries` 扩容或 `erase` 时 `Entry` 会被移动，短键（SSO）
+     *          的字符数据跟着对象走，任何指向键的视图都会悬垂。存下标 +
+     *          每次比较时回查 `m_entries[下标].first`，既零拷贝又不依赖地址稳定。
+     *          `hash` 先做一次整数比较，冲突时才比较字符串。
+     */
+    struct IndexSlot {
+        std::uint64_t hash = 0;         ///< 键的 64 位哈希。
+        std::uint32_t entry_plus_one = 0;  ///< `m_entries` 下标 + 1；0 表示空槽。
+    };
+
+    /// @brief 键的 64 位哈希（FNV-1a）；只在进程内分槽，不上线。
+    static std::uint64_t HashKey(std::string_view key) noexcept;
+
+    /// @brief 返回键在 `m_entries` 中的下标；不存在返回 kNoIndex。
+    /// @details 索引为空（小表）时退化为线性扫描，语义与旧实现完全一致。
+    std::size_t Locate(std::string_view key) const noexcept;
+
+    /// @brief 按当前 `m_entries` 重建索引；条目数 <= kLinearScanLimit 时清空索引。
+    void RebuildIndex();
+
+    /// @brief 把一条已存在的条目插入索引；调用方保证索引已分配且键不重复。
+    void IndexInsert(std::size_t entry_index) noexcept;
+
     std::vector<Entry> m_entries;  ///< 有序条目。
+    /// 哈希索引；`empty()` 表示小表/未启用，此时走线性扫描。容量始终是 2 的幂，
+    /// 负载因子 <= 0.5，保证线性探测一定能遇到空槽。
+    std::vector<IndexSlot> m_index;
+    std::size_t m_index_used = 0;  ///< 已占用槽数（用于判断是否需要扩容）。
 };
 
 /**

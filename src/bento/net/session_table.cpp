@@ -90,7 +90,7 @@ std::size_t SessionTable::RemoveExpiredLocked(std::uint64_t now_ms) {
         const auto entry = m_entries.find(key);
         // 防御陈旧索引项：条目可能已被显式删除。即便条目仍在，也要确认
         // 它的 deadline 与索引项一致，避免误删刚被续期的条目。
-        if (entry != m_entries.end() && entry->second.lease_deadline_ms == deadline) {
+        if (entry != m_entries.end() && entry->second->lease_deadline_ms == deadline) {
             m_entries.erase(entry);
             ++m_stats.expirations;
             ++removed;
@@ -101,10 +101,21 @@ std::size_t SessionTable::RemoveExpiredLocked(std::uint64_t now_ms) {
 }
 
 void SessionTable::EraseEntryLocked(EntryMap::iterator entry) {
-    if (entry->second.lease_deadline_ms != 0) {
-        m_expiries.erase({entry->second.lease_deadline_ms, entry->first});
+    if (entry->second->lease_deadline_ms != 0) {
+        m_expiries.erase({entry->second->lease_deadline_ms, entry->first});
     }
     m_entries.erase(entry);
+}
+
+SessionEntry& SessionTable::MutableEntryLocked(EntryMap::iterator it) {
+    // use_count() == 1 表示只有表持有该条目，此时原地修改不会影响任何已交出的
+    // 快照；FindShared 复制指针发生在同一把锁内，所以这个判断在锁保护下是精确的。
+    if (it->second.use_count() == 1) {
+        return *it->second;
+    }
+    auto copy = std::make_shared<SessionEntry>(*it->second);
+    it->second = copy;
+    return *copy;
 }
 
 SessionStatus SessionTable::AddServer(const std::string& key, std::uint64_t server_id,
@@ -131,7 +142,7 @@ SessionStatus SessionTable::AddServer(const std::string& key, std::uint64_t serv
     entry.server_id = server_id;
     entry.created_ms = now_ms;
     RefreshLeaseLocked(entry, now_ms);
-    m_entries.emplace_hint(position, key, std::move(entry));
+    m_entries.emplace_hint(position, key, std::make_shared<SessionEntry>(std::move(entry)));
     ++m_stats.servers_added;
     return SessionStatus::kOk;
 }
@@ -149,11 +160,12 @@ SessionStatus SessionTable::AddClient(const std::string& key, std::uint64_t clie
         ++m_stats.not_found;
         return SessionStatus::kNotFound;
     }
-    if (it->second.HasClient(client_id)) {
+    const SessionEntry& current = *it->second;
+    if (current.HasClient(client_id)) {
         ++m_stats.duplicate_rejects;
         return SessionStatus::kAlreadyExists;
     }
-    if (it->second.clients.size() >= m_config.max_clients_per_key) {
+    if (current.clients.size() >= m_config.max_clients_per_key) {
         ++m_stats.full_rejects;
         return SessionStatus::kFull;
     }
@@ -161,8 +173,10 @@ SessionStatus SessionTable::AddClient(const std::string& key, std::uint64_t clie
     SessionClient client;
     client.client_id = client_id;
     client.joined_ms = now_ms;
-    it->second.clients.push_back(client);
-    RefreshLeaseLocked(it->second, now_ms);
+    // 写时复制：已交出的 FindShared 快照必须保持查询时刻的内容。
+    SessionEntry& writable = MutableEntryLocked(it);
+    writable.clients.push_back(client);
+    RefreshLeaseLocked(writable, now_ms);
     ++m_stats.clients_added;
     return SessionStatus::kOk;
 }
@@ -197,7 +211,7 @@ SessionStatus SessionTable::RemoveClient(const std::string& key, std::uint64_t c
         ++m_stats.not_found;
         return SessionStatus::kNotFound;
     }
-    auto& clients = it->second.clients;
+    const auto& clients = it->second->clients;
     const auto client_it =
         std::find_if(clients.begin(), clients.end(), [client_id](const SessionClient& client) {
             return client.client_id == client_id;
@@ -206,8 +220,11 @@ SessionStatus SessionTable::RemoveClient(const std::string& key, std::uint64_t c
         ++m_stats.not_found;
         return SessionStatus::kNotFound;
     }
-    clients.erase(client_it);
-    RefreshLeaseLocked(it->second, now_ms);
+    const std::size_t offset = static_cast<std::size_t>(client_it - clients.begin());
+    // 写时复制：旧快照保持查询时刻的 clients。
+    SessionEntry& writable = MutableEntryLocked(it);
+    writable.clients.erase(writable.clients.begin() + static_cast<std::ptrdiff_t>(offset));
+    RefreshLeaseLocked(writable, now_ms);
     ++m_stats.removals;
     return SessionStatus::kOk;
 }
@@ -221,7 +238,7 @@ SessionStatus SessionTable::RemoveServer(const std::string& key, std::uint64_t s
     std::lock_guard<std::mutex> lock(m_mutex);
     RemoveExpiredLocked(now_ms);
     const auto it = m_entries.find(key);
-    if (it == m_entries.end() || it->second.server_id != server_id) {
+    if (it == m_entries.end() || it->second->server_id != server_id) {
         ++m_stats.not_found;
         return SessionStatus::kNotFound;
     }
@@ -242,22 +259,34 @@ bool SessionTable::Touch(const std::string& key, std::uint64_t now_ms) {
         ++m_stats.not_found;
         return false;
     }
-    RefreshLeaseLocked(it->second, now_ms);
+    // 写时复制：续租只替换表内指针，旧快照的 lease_deadline_ms 保持不变。
+    SessionEntry& writable = MutableEntryLocked(it);
+    RefreshLeaseLocked(writable, now_ms);
     ++m_stats.touches;
     return true;
 }
 
-std::optional<SessionEntry> SessionTable::Find(const std::string& key,
-                                               std::uint64_t now_ms) const {
+std::shared_ptr<const SessionEntry> SessionTable::FindShared(const std::string& key,
+                                                             std::uint64_t now_ms) const {
     if (key.empty()) {
-        return std::nullopt;
+        return nullptr;
     }
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto it = m_entries.find(key);
-    if (it == m_entries.end() || it->second.IsExpired(now_ms)) {
+    if (it == m_entries.end() || it->second->IsExpired(now_ms)) {
+        return nullptr;
+    }
+    // 只有引用计数递增，不复制 key/clients；写路径的写时复制保证快照不被改写。
+    return it->second;
+}
+
+std::optional<SessionEntry> SessionTable::Find(const std::string& key,
+                                               std::uint64_t now_ms) const {
+    const std::shared_ptr<const SessionEntry> entry = FindShared(key, now_ms);
+    if (entry == nullptr) {
         return std::nullopt;
     }
-    return it->second;
+    return *entry;
 }
 
 std::vector<SessionEntry> SessionTable::List(std::uint64_t now_ms) const {
@@ -265,8 +294,8 @@ std::vector<SessionEntry> SessionTable::List(std::uint64_t now_ms) const {
     std::vector<SessionEntry> entries;
     entries.reserve(m_entries.size());
     for (const auto& pair : m_entries) {
-        if (!pair.second.IsExpired(now_ms)) {
-            entries.push_back(pair.second);
+        if (!pair.second->IsExpired(now_ms)) {
+            entries.push_back(*pair.second);
         }
     }
     return entries;
@@ -278,7 +307,7 @@ bool SessionTable::Contains(const std::string& key, std::uint64_t now_ms) const 
     }
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto it = m_entries.find(key);
-    return it != m_entries.end() && !it->second.IsExpired(now_ms);
+    return it != m_entries.end() && !it->second->IsExpired(now_ms);
 }
 
 std::size_t SessionTable::size() const {

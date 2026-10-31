@@ -289,6 +289,120 @@ void KvBinaryRoundTripAndRandom() {
     }
 }
 
+void KvHashIndexCorrectness() {
+    APP_SCENARIO("kv: hash index correct across resize/erase/copy/random");
+
+    // 阈值边界：<=8 条走线性扫描，第 9 条起建哈希索引；两种路径结果必须一致。
+    const std::vector<std::size_t> counts = {0, 1, 7, 8, 9, 16, 17, 64};
+    for (std::size_t count : counts) {
+        KvTable table;
+        for (std::size_t i = 0; i < count; ++i) {
+            table.Set("key" + std::to_string(i), "value" + std::to_string(i));
+        }
+        APP_REQUIRE(table.size() == count);
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::string* value = table.Find("key" + std::to_string(i));
+            APP_REQUIRE(value != nullptr);
+            APP_CHECK(*value == "value" + std::to_string(i));
+        }
+        APP_CHECK(table.Find("key" + std::to_string(count)) == nullptr);
+        APP_CHECK(table.Find("") == nullptr);
+        if (count == 0) {
+            continue;
+        }
+        // 覆盖：值更新、位置不变、顺序不变。
+        APP_CHECK(!table.Set("key0", "updated"));
+        APP_CHECK(table.entries().front().first == "key0");
+        APP_CHECK(table.Get("key0") == "updated");
+        APP_CHECK(table.size() == count);
+        // 删除首项后顺序保持，其余键仍可查（索引整体重建）。
+        APP_CHECK(table.Erase("key0"));
+        APP_CHECK(!table.Erase("key0"));
+        APP_CHECK(table.size() == count - 1);
+        if (count > 1) {
+            APP_CHECK(table.entries().front().first == "key1");
+        }
+        for (std::size_t i = 1; i < count; ++i) {
+            APP_CHECK(table.Find("key" + std::to_string(i)) != nullptr);
+        }
+    }
+
+    // 大表 + 复制/移动：索引存的是下标，拷贝/移动后依然有效。
+    KvTable big;
+    for (std::size_t i = 0; i < 512; ++i) {
+        big.Set("k" + std::to_string(i), std::to_string(i * 3));
+    }
+    const KvTable copied = big;
+    KvTable moved = std::move(big);
+    for (std::size_t i = 0; i < 512; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        const std::string expected = std::to_string(i * 3);
+        APP_CHECK(copied.Get(key) == expected);
+        APP_CHECK(moved.Get(key) == expected);
+    }
+    APP_CHECK(copied.Find("k512") == nullptr);
+
+    // 清空必须连带清索引；清空后还能继续使用。
+    moved.Clear();
+    APP_CHECK(moved.empty());
+    APP_CHECK(moved.Find("k0") == nullptr);
+    moved.Set("k0", "v");
+    APP_CHECK(moved.Get("k0") == "v");
+
+    // 随机对拍：影子模型是「保持插入顺序的 vector + 线性查找」，与旧实现同构。
+    std::mt19937_64 rng(20261101);
+    KvTable table;
+    std::vector<std::pair<std::string, std::string>> shadow;
+    auto shadow_find = [&shadow](const std::string& key) -> std::string* {
+        for (auto& item : shadow) {
+            if (item.first == key) {
+                return &item.second;
+            }
+        }
+        return nullptr;
+    };
+    for (int round = 0; round < 8000; ++round) {
+        const std::string key = "k" + std::to_string(rng() % 40);
+        const int op = static_cast<int>(rng() % 3);
+        if (op == 0) {
+            const std::string value = "v" + std::to_string(rng() % 1000);
+            const bool added = table.Set(key, value);
+            std::string* existing = shadow_find(key);
+            if (existing != nullptr) {
+                *existing = value;
+                APP_CHECK(!added);
+            } else {
+                shadow.emplace_back(key, value);
+                APP_CHECK(added);
+            }
+        } else if (op == 1) {
+            const bool erased = table.Erase(key);
+            auto it = std::find_if(shadow.begin(), shadow.end(),
+                                   [&key](const std::pair<std::string, std::string>& item) {
+                                       return item.first == key;
+                                   });
+            if (it != shadow.end()) {
+                shadow.erase(it);
+                APP_CHECK(erased);
+            } else {
+                APP_CHECK(!erased);
+            }
+        } else {
+            const std::string* value = table.Find(key);
+            const std::string* expected = shadow_find(key);
+            APP_CHECK((value == nullptr) == (expected == nullptr));
+            if (value != nullptr && expected != nullptr) {
+                APP_CHECK(*value == *expected);
+            }
+        }
+        APP_CHECK(table.size() == shadow.size());
+    }
+    APP_REQUIRE(table.entries().size() == shadow.size());
+    for (std::size_t i = 0; i < shadow.size(); ++i) {
+        APP_CHECK(table.entries()[i] == shadow[i]);
+    }
+}
+
 #if defined(GO2CPP_APP_HAS_BENTO)
 void BentoBridgeRoundTrip() {
     APP_SCENARIO("bento bridge: app frame <-> 20B Bento frame");
@@ -321,6 +435,25 @@ void BentoBridgeRoundTrip() {
         APP_CHECK(decoded.flags == frame.flags);
         APP_CHECK(decoded.payload == frame.payload);
     }
+    // 单次编码的字节必须与「先 EncodeFrame 再 Bento Encode」的旧路径逐字节一致。
+    std::vector<Frame> samples(2);
+    samples[0].type = FrameType::kHeaders;
+    samples[0].stream_id = 42;
+    samples[0].flags = 3;
+    samples[0].payload = app_test::MakePattern(1234, 77);
+    samples[1].type = FrameType::kSettings;
+    samples[1].stream_id = 0;
+    for (const Frame& sample : samples) {
+        const std::vector<std::uint8_t> app_bytes = EncodeFrame(sample);
+        APP_REQUIRE(!app_bytes.empty());
+        go2cpp::bento::net::Frame legacy;
+        legacy.type = go2cpp::app::bento_bridge::kAppFrameType;
+        legacy.flags = 0;
+        legacy.payload = app_bytes;
+        const std::vector<std::uint8_t> legacy_bytes = go2cpp::bento::net::Encode(legacy);
+        APP_CHECK(legacy_bytes == go2cpp::app::bento_bridge::Encode(sample));
+    }
+
     // 半包 + 粘包。
     Frame a;
     a.type = FrameType::kHeaders;
@@ -357,6 +490,7 @@ int main() {
     StandardPayloadRoundTrips();
     KvTextParsing();
     KvBinaryRoundTripAndRandom();
+    KvHashIndexCorrectness();
 #if defined(GO2CPP_APP_HAS_BENTO)
     BentoBridgeRoundTrip();
 #endif

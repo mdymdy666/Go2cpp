@@ -54,6 +54,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -179,6 +180,19 @@ class SessionTable final {
     std::optional<SessionEntry> Find(const std::string& key,
                                      std::uint64_t now_ms = NowMs()) const;
 
+    /**
+     * @brief 零拷贝查询：返回条目的共享只读快照；不存在/已过期返回 nullptr。
+     * @details 与 `Find` 的拷贝语义不同：这里只对 `shared_ptr` 做一次引用计数
+     *          递增，不复制邀请密钥字符串与 clients 数组，也不需要调用方持锁。
+     *          写路径（AddClient / RemoveClient / Touch）采用**写时复制**：
+     *          先克隆条目再替换表内指针，因此已经交出的快照在锁外读取时
+     *          不会被并发修改，语义与 `Find` 返回的副本一致。
+     * @note 返回值非空只代表「查询时刻未过期」；之后条目过期或被删除都不会
+     *       让快照失效（删除只从表中摘除，快照由引用计数保命）。
+     */
+    std::shared_ptr<const SessionEntry> FindShared(const std::string& key,
+                                                   std::uint64_t now_ms = NowMs()) const;
+
     /// @brief 列出所有未过期条目（按 key 字典序）。
     std::vector<SessionEntry> List(std::uint64_t now_ms = NowMs()) const;
 
@@ -203,7 +217,9 @@ class SessionTable final {
     const SessionTableConfig& config() const noexcept { return m_config; }
 
    private:
-    using EntryMap = std::map<std::string, SessionEntry>;
+    /// 值用 `shared_ptr` 以便 `FindShared` 在锁外安全持有条目：写路径采用
+    /// 写时复制（克隆后替换表内指针），已交出的快照永远不会被原地修改。
+    using EntryMap = std::map<std::string, std::shared_ptr<SessionEntry>>;
     /// (lease_deadline_ms, key) 有序索引。用 std::set 而不是 multimap：
     /// pair 的 operator< 天然给出「deadline 最小优先」的顺序，且 erase(pair)
     /// 能精确删除同一 deadline 下的指定 key（multimap::erase(key) 会误删
@@ -215,6 +231,9 @@ class SessionTable final {
     void RefreshLeaseLocked(SessionEntry& entry, std::uint64_t now_ms);
     /// 删除条目并同步移除其过期索引项；调用方必须已持锁。
     void EraseEntryLocked(EntryMap::iterator entry);
+    /// @brief 取出可写条目：无外部快照时原地返回，否则克隆替换（写时复制）。
+    /// 调用方必须已持锁。
+    SessionEntry& MutableEntryLocked(EntryMap::iterator it);
     /// 调用方必须已持锁；删除所有过期条目并返回数量。
     /// 只处理索引中 deadline <= now_ms 的队头，O(k log n)（k = 过期条目数）；
     /// 没有到期条目时是 O(1)，这是写路径从 O(n) 降到 O(log n) 的关键。

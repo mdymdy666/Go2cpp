@@ -31,6 +31,14 @@ std::uint16_t ReadU16BE(const std::uint8_t* in) noexcept {
                                       static_cast<std::uint16_t>(in[1]));
 }
 
+/// 确保视频重组缓冲至少覆盖到 end 字节；按 2 倍几何增长，避免每片一次重新分配。
+void EnsureReassemblyBytes(std::vector<std::uint8_t>* data, std::size_t end) {
+    if (data->size() >= end) {
+        return;
+    }
+    data->resize(std::max(end, data->size() * 2), 0);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -1552,9 +1560,7 @@ void VideoChannel::OnFrame(const FrameHeader& header, const std::uint8_t* payloa
         Reassembly reassembly;
         reassembly.frag_count = video_header.frag_count;
         reassembly.last_update_ms = NowMs();
-        reassembly.data.assign(static_cast<std::size_t>(video_header.frag_count) * kFragmentBytes,
-                               0);
-        reassembly.received.assign(video_header.frag_count, 0);
+        // data 按需增长；received 是内联数组，默认构造已清零。
         it = m_active.emplace(video_header.frame_id, std::move(reassembly)).first;
         m_max_active_frame_id = video_header.frame_id;
     }
@@ -1577,6 +1583,7 @@ void VideoChannel::OnFrame(const FrameHeader& header, const std::uint8_t* payloa
     const std::size_t write_offset =
         static_cast<std::size_t>(video_header.frag_index) * kFragmentBytes;
     if (frag_bytes > 0) {
+        EnsureReassemblyBytes(&reassembly.data, write_offset + frag_bytes);
         std::memcpy(reassembly.data.data() + write_offset, payload + kVideoHeaderBytes, frag_bytes);
     }
     if (is_last) {
@@ -1633,9 +1640,7 @@ void VideoChannel::OnFecParity(const FrameHeader& header, const std::uint8_t* pa
         Reassembly reassembly;
         reassembly.frag_count = video_header.frag_count;
         reassembly.last_update_ms = NowMs();
-        reassembly.data.assign(static_cast<std::size_t>(video_header.frag_count) * kFragmentBytes,
-                               0);
-        reassembly.received.assign(video_header.frag_count, 0);
+        // 与 OnFrame 相同：data 按需增长，received 内联清零。
         it = m_active.emplace(video_header.frame_id, std::move(reassembly)).first;
         m_max_active_frame_id = video_header.frame_id;
     }
@@ -1721,6 +1726,10 @@ bool VideoChannel::TryRecover(std::uint32_t frame_id, Reassembly& reassembly) {
             if (length > block.max_len) {
                 continue;
             }
+            // 已收到的分片一定写过自己那一段；但校验头声明的长度可能比实际
+            // 收到的长（损坏/恶意），读取前统一确保覆盖到 length，避免越界读。
+            EnsureReassemblyBytes(&reassembly.data,
+                                  static_cast<std::size_t>(index) * kFragmentBytes + length);
             const std::uint8_t* fragment =
                 reassembly.data.data() + index * kFragmentBytes;
             for (std::uint16_t j = 0; j < length; ++j) {
@@ -1730,9 +1739,10 @@ bool VideoChannel::TryRecover(std::uint32_t frame_id, Reassembly& reassembly) {
         if (missing_len > block.max_len) {
             continue;
         }
-        std::uint8_t* target = reassembly.data.data() + missing_index * kFragmentBytes;
         if (missing_len > 0) {
-            std::memcpy(target, recovered.data(), missing_len);
+            const std::size_t target_offset = missing_index * kFragmentBytes;
+            EnsureReassemblyBytes(&reassembly.data, target_offset + missing_len);
+            std::memcpy(reassembly.data.data() + target_offset, recovered.data(), missing_len);
         }
         reassembly.received[missing_index] = 1;
         ++reassembly.received_count;

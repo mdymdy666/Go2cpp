@@ -47,12 +47,77 @@ KvTable::KvTable(std::initializer_list<Entry> entries) {
 }
 
 const std::string* KvTable::Find(std::string_view key) const noexcept {
-    for (const Entry& entry : m_entries) {
-        if (entry.first == key) {
-            return &entry.second;
-        }
+    const std::size_t index = Locate(key);
+    return index == kNoIndex ? nullptr : &m_entries[index].second;
+}
+
+std::uint64_t KvTable::HashKey(std::string_view key) noexcept {
+    // FNV-1a 64：每字节一次异或 + 一次乘法，短键上比通用哈希更便宜，
+    // 且不依赖标准库实现（跨编译器结果一致，便于复现基准）。
+    std::uint64_t hash = 1469598103934665603ULL;  // FNV offset basis
+    for (char c : key) {
+        hash ^= static_cast<std::uint8_t>(c);
+        hash *= 1099511628211ULL;  // FNV prime
     }
-    return nullptr;
+    return hash;
+}
+
+std::size_t KvTable::Locate(std::string_view key) const noexcept {
+    if (m_index.empty()) {
+        for (std::size_t i = 0; i < m_entries.size(); ++i) {
+            if (m_entries[i].first == key) {
+                return i;
+            }
+        }
+        return kNoIndex;
+    }
+    const std::size_t mask = m_index.size() - 1;
+    const std::uint64_t hash = HashKey(key);
+    std::size_t slot = static_cast<std::size_t>(hash) & mask;
+    // 负载因子 <= 0.5，探测链上必然存在空槽，循环一定终止。
+    for (;;) {
+        const IndexSlot& probe = m_index[slot];
+        if (probe.entry_plus_one == 0) {
+            return kNoIndex;
+        }
+        if (probe.hash == hash && m_entries[probe.entry_plus_one - 1].first == key) {
+            return static_cast<std::size_t>(probe.entry_plus_one - 1);
+        }
+        slot = (slot + 1) & mask;
+    }
+}
+
+void KvTable::IndexInsert(std::size_t entry_index) noexcept {
+    if (m_index.empty()) {
+        return;
+    }
+    const std::uint64_t hash = HashKey(m_entries[entry_index].first);
+    const std::size_t mask = m_index.size() - 1;
+    std::size_t slot = static_cast<std::size_t>(hash) & mask;
+    while (m_index[slot].entry_plus_one != 0) {
+        slot = (slot + 1) & mask;
+    }
+    m_index[slot].hash = hash;
+    m_index[slot].entry_plus_one = static_cast<std::uint32_t>(entry_index + 1);
+    ++m_index_used;
+}
+
+void KvTable::RebuildIndex() {
+    if (m_entries.size() <= kLinearScanLimit) {
+        // 小表：保留已分配的容量（下次变大时直接复用），但按「未启用」处理。
+        m_index.clear();
+        m_index_used = 0;
+        return;
+    }
+    std::size_t capacity = 16;
+    while (capacity < m_entries.size() * 2) {
+        capacity <<= 1;
+    }
+    m_index.assign(capacity, IndexSlot{});
+    m_index_used = 0;
+    for (std::size_t i = 0; i < m_entries.size(); ++i) {
+        IndexInsert(i);
+    }
 }
 
 std::string KvTable::Get(std::string_view key, std::string_view fallback) const {
@@ -61,23 +126,36 @@ std::string KvTable::Get(std::string_view key, std::string_view fallback) const 
 }
 
 bool KvTable::Set(std::string key, std::string value) {
-    for (Entry& entry : m_entries) {
-        if (entry.first == key) {
-            entry.second = std::move(value);
-            return false;
-        }
+    const std::size_t existing = Locate(key);
+    if (existing != kNoIndex) {
+        m_entries[existing].second = std::move(value);
+        return false;
     }
     m_entries.emplace_back(std::move(key), std::move(value));
+    if (m_entries.size() > kLinearScanLimit) {
+        // 第 9 条起建索引；之后每次新增，负载超过 0.5 才整体重建。
+        if (m_index.empty() || (m_index_used + 1) * 2 > m_index.size()) {
+            RebuildIndex();
+        } else {
+            IndexInsert(m_entries.size() - 1);
+        }
+    }
     return true;
 }
 
 bool KvTable::Erase(std::string_view key) {
-    const auto it = std::find_if(m_entries.begin(), m_entries.end(),
-                                 [key](const Entry& entry) { return entry.first == key; });
-    if (it == m_entries.end()) {
+    const std::size_t index = Locate(key);
+    if (index == kNoIndex) {
         return false;
     }
-    m_entries.erase(it);
+    m_entries.erase(m_entries.begin() + static_cast<std::ptrdiff_t>(index));
+    if (m_entries.size() > kLinearScanLimit) {
+        // erase 会移动后续条目，下标索引整体失效；删除不是热路径，直接重建。
+        RebuildIndex();
+    } else {
+        m_index.clear();
+        m_index_used = 0;
+    }
     return true;
 }
 

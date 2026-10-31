@@ -210,6 +210,47 @@ int main() {
     BENTO_CHECK(cold_server.secure_stats().resumptions >= 1U);
     BENTO_CHECK(cold_server.secure_stats().zero_rtt_frames >= 1U);
 
+    // 服务端缓存条目过期（客户端票据仍有效）：重建监听方后，进程内缓存不能让
+    // 过期会话被 0-RTT 恢复 —— 查询路径必须惰性删除并丢弃首包。
+    LinkConfig short_cache_config = ListenerConfig(psk);
+    short_cache_config.session_ticket_lifetime_ms = 20;
+    Link short_cache_server(short_cache_config);
+    BENTO_CHECK(short_cache_server.Open(&error));
+    const std::uint16_t short_cache_port = short_cache_server.local_port();
+    Link cache_client(ClientConfig(psk, short_cache_port));
+    BENTO_CHECK(cache_client.Open(&error));
+    bool cache_connected = false;
+    cache_client.on_connected = [&cache_connected]() { cache_connected = true; };
+    cache_client.Connect();
+    BENTO_CHECK(bento_test::PumpUntil(
+        cache_client, short_cache_server, [&]() { return cache_connected; }, 5000));
+    // 监听方导出票据时会把会话写进进程内缓存（20ms 后过期）。
+    BENTO_CHECK_EQ(short_cache_server.ExportSessionTicket().size(), kSessionTicketBytes);
+    const std::vector<std::uint8_t> live_ticket = cache_client.ExportSessionTicket();
+    BENTO_CHECK_EQ(live_ticket.size(), kSessionTicketBytes);
+    cache_client.Close();
+    short_cache_server.Close();
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    LinkConfig rebuilt_config = short_cache_config;
+    rebuilt_config.bind_port = short_cache_port;
+    Link rebuilt(rebuilt_config);
+    BENTO_CHECK(rebuilt.Open(&error));
+    std::size_t delivered = 0;
+    rebuilt.on_datagram = [&delivered](std::uint8_t, const std::uint8_t*, std::size_t) {
+        ++delivered;
+    };
+    Link late_client(ClientConfig(psk, short_cache_port));
+    BENTO_CHECK(late_client.Open(&error));
+    BENTO_CHECK(late_client.Resume(live_ticket));  // 客户端票据 60s 有效
+    const char* late_message = "stale-cache";
+    BENTO_CHECK(late_client.SendDatagram(1, late_message, std::strlen(late_message)));
+    (void)bento_test::PumpUntil(late_client, rebuilt, []() { return false; }, 100);
+    BENTO_CHECK_EQ(delivered, 0U);
+    BENTO_CHECK_EQ(rebuilt.secure_stats().resumptions, 0U);
+    late_client.Close();
+    rebuilt.Close();
+
     std::printf(
         "[INFO] 0rtt: ticket=%zuB handshakes=%llu resumptions=%llu zero_rtt=%llu "
         "opened=%llu\n",

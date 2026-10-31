@@ -563,6 +563,93 @@ void TestConcurrentStatsConsistency() {
     BENTO_CHECK_EQ(table.Tick(1000000), static_cast<std::size_t>(kThreads));
 }
 
+
+/// 场景 19：FindShared 零拷贝快照 + 写时复制语义。
+void TestFindSharedSnapshot() {
+    SessionTable table(Config(4, 90000, 16));
+    BENTO_CHECK_EQ(table.AddServer("k", 100, 1000), SessionStatus::kOk);
+    BENTO_CHECK_EQ(table.AddClient("k", 1, 1000), SessionStatus::kOk);
+
+    auto snapshot = table.FindShared("k", 1000);
+    BENTO_CHECK(snapshot != nullptr);
+    BENTO_CHECK_EQ(snapshot->server_id, 100U);
+    BENTO_CHECK_EQ(snapshot->ClientCount(), 1U);
+    BENTO_CHECK_EQ(snapshot->lease_deadline_ms, 91000U);
+    BENTO_CHECK(!table.FindShared("missing", 1000));
+    BENTO_CHECK(!table.FindShared("", 1000));
+    BENTO_CHECK(!table.FindShared("k", 91000));  // 过期
+
+    // 写时复制：AddClient 之后旧快照仍是 1 个 client，新快照是 2 个。
+    BENTO_CHECK_EQ(table.AddClient("k", 2, 2000), SessionStatus::kOk);
+    BENTO_CHECK_EQ(snapshot->ClientCount(), 1U);
+    BENTO_CHECK(!snapshot->HasClient(2));
+    auto fresh = table.FindShared("k", 2000);
+    BENTO_CHECK(fresh != nullptr);
+    BENTO_CHECK_EQ(fresh->ClientCount(), 2U);
+    BENTO_CHECK(fresh->HasClient(2));
+
+    // Touch / RemoveClient 同样不修改已交出的快照。
+    const std::uint64_t fresh_deadline = fresh->lease_deadline_ms;
+    BENTO_CHECK(table.Touch("k", 3000));
+    BENTO_CHECK_EQ(fresh->lease_deadline_ms, fresh_deadline);
+    BENTO_CHECK_EQ(table.FindShared("k", 3000)->lease_deadline_ms, fresh_deadline + 1000);
+
+    BENTO_CHECK_EQ(table.RemoveClient("k", 2, 4000), SessionStatus::kOk);
+    BENTO_CHECK_EQ(fresh->ClientCount(), 2U);
+    BENTO_CHECK_EQ(table.FindShared("k", 4000)->ClientCount(), 1U);
+
+    // 删除条目后已交出的快照仍可安全读取（引用计数保命），但表里查不到了。
+    const std::uint64_t server_id = snapshot->server_id;
+    BENTO_CHECK(table.Remove("k", 5000));
+    BENTO_CHECK_EQ(snapshot->server_id, server_id);
+    BENTO_CHECK(snapshot->HasClient(1));
+    BENTO_CHECK(!table.FindShared("k", 5000));
+    BENTO_CHECK(!table.Find("k", 5000).has_value());
+}
+
+/// 场景 20：读者只拿快照、写者克隆替换：锁外读取无数据竞争且字段自洽。
+void TestFindSharedConcurrent() {
+    SessionTable table(Config(4, 90000, 16));
+    BENTO_CHECK_EQ(table.AddServer("race", 1, 1000), SessionStatus::kOk);
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> reads{0};
+    std::atomic<std::uint64_t> mismatches{0};
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 3; ++i) {
+        readers.emplace_back([&]() {
+            while (!stop.load(std::memory_order_acquire)) {
+                const auto entry = table.FindShared("race", 1000);
+                if (entry == nullptr) {
+                    continue;
+                }
+                // 快照自身不可变：读到的字段必须始终自洽。这里只累加原子计数，
+                // 不在并发线程里调用 BENTO_CHECK —— 测试框架的 g_checks/g_failures
+                // 是普通 int，并发自增本身就是数据竞争（TSan 会报）。
+                if (entry->ClientCount() > 4U || entry->server_id != 1U) {
+                    mismatches.fetch_add(1, std::memory_order_relaxed);
+                }
+                reads.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (std::uint64_t round = 1; round <= 300; ++round) {
+        const std::uint64_t client_id = (round % 4) + 1;
+        (void)table.AddClient("race", client_id, 1000 + round);
+        (void)table.Touch("race", 1000 + round);
+        (void)table.RemoveClient("race", client_id, 1000 + round);
+    }
+    stop.store(true, std::memory_order_release);
+    for (std::thread& reader : readers) {
+        reader.join();
+    }
+    BENTO_CHECK(reads.load() > 0U);
+    BENTO_CHECK_EQ(mismatches.load(), 0U);
+    const auto final_entry = table.Find("race", 1000);
+    BENTO_CHECK(final_entry.has_value());
+    BENTO_CHECK_EQ(final_entry->server_id, 1U);
+    BENTO_CHECK_EQ(final_entry->ClientCount(), 0U);
+}
+
 }  // namespace
 
 int main() {
@@ -584,5 +671,7 @@ int main() {
     TestLongKey();
     TestDefaultClock();
     TestConcurrentStatsConsistency();
+    TestFindSharedSnapshot();
+    TestFindSharedConcurrent();
     return bento_test::Finish("test_session_table");
 }

@@ -21,6 +21,18 @@ using BentoFrame = go2cpp::bento::net::Frame;
 /// Bento 通用帧的默认线上标识（"BENT"/1）；应用层帧靠 type 字段区分。
 FrameFormat Format() { return go2cpp::bento::net::kDefaultFrameFormat; }
 
+void WriteU16(std::uint8_t* out, std::uint16_t value) noexcept {
+    out[0] = static_cast<std::uint8_t>(value >> 8);
+    out[1] = static_cast<std::uint8_t>(value);
+}
+
+void WriteU32(std::uint8_t* out, std::uint32_t value) noexcept {
+    out[0] = static_cast<std::uint8_t>(value >> 24);
+    out[1] = static_cast<std::uint8_t>(value >> 16);
+    out[2] = static_cast<std::uint8_t>(value >> 8);
+    out[3] = static_cast<std::uint8_t>(value);
+}
+
 }  // namespace
 
 const char* StatusName(Status status) noexcept {
@@ -40,15 +52,34 @@ const char* StatusName(Status status) noexcept {
 }
 
 std::vector<std::uint8_t> Encode(const Frame& frame, const Config& config) {
-    std::vector<std::uint8_t> app_bytes = EncodeFrame(frame);
-    if (app_bytes.empty()) {
+    // 单次分配 + 单次写：先按「20B Bento 头 + 9B App 头 + 载荷」算出总长，
+    // 预分配后直接把 App 帧序列化到 20B 之后，再补 Bento 头与 CRC。
+    // 旧实现先 EncodeFrame 分配一次、再 bento::Encode 分配并整体 memcpy 一次，
+    // 对大帧等于多付一遍整帧内存带宽。
+    const std::size_t app_bytes = kFrameHeaderBytes + frame.payload.size();
+    if (app_bytes > go2cpp::bento::net::kFrameMaxPayload) {
+        // 超过 Bento 单帧载荷上限：旧路径会在 bento::Encode 里返回空。
         return {};
     }
-    BentoFrame bento;
-    bento.type = config.frame_type;
-    bento.flags = 0;
-    bento.payload = std::move(app_bytes);
-    return go2cpp::bento::net::Encode(bento, Format());
+    std::vector<std::uint8_t> out;
+    out.reserve(go2cpp::bento::net::kGenericFrameHeaderBytes + app_bytes);
+    out.resize(go2cpp::bento::net::kGenericFrameHeaderBytes);
+    // AppendEncodedFrame 只写 9B 头 + 载荷，且在容量足够时不会重新分配。
+    if (!AppendEncodedFrame(frame, &out)) {
+        return {};
+    }
+    std::uint8_t* header = out.data();
+    WriteU32(header, Format().magic);
+    WriteU16(header + 4, Format().version);
+    WriteU16(header + 6, config.frame_type);
+    WriteU16(header + 8, 0);   // flags
+    WriteU16(header + 10, 0);  // reserved：当前版本必须为 0
+    WriteU32(header + 12, static_cast<std::uint32_t>(app_bytes));
+    // CRC 覆盖帧头前 16B + App 帧载荷，与 bento::net::Encode 完全一致。
+    const std::uint32_t checksum = go2cpp::bento::net::ComputeFrameChecksum(
+        header, out.data() + go2cpp::bento::net::kGenericFrameHeaderBytes, app_bytes);
+    WriteU32(header + 16, checksum);
+    return out;
 }
 
 Status Decode(const std::uint8_t* data, std::size_t size, Frame* out,

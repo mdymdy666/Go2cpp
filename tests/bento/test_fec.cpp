@@ -207,6 +207,49 @@ int main() {
     BENTO_CHECK_EQ(sent.size(), 4U);
     BENTO_CHECK_EQ(plain.stats().fec_parity_sent, 0U);
 
+    // ---- 乱序重组：末片先到、中间片后到；按需增长的缓冲不能越界 ----
+    {
+        std::vector<Delivered> out_of_order;
+        VideoChannel rx([](const std::uint8_t*, std::size_t) { return true; },
+                        Deliver(&out_of_order));
+        std::vector<std::vector<std::uint8_t>> frames;
+        VideoChannel tx(Capture(&frames), [](std::uint32_t, bool, const std::uint8_t*,
+                                             std::size_t) {});
+        const std::vector<std::uint8_t> data = MakeData(8 * 1200 + 37, 21);  // 9 片
+        BENTO_CHECK(tx.SendFrame(1, false, data.data(), data.size()));
+        BENTO_CHECK_EQ(frames.size(), 9U);
+        std::vector<WireFrame> wire;
+        for (const auto& bytes : frames) {
+            wire.push_back(ParseWire(bytes));
+        }
+        for (std::size_t i = wire.size(); i-- > 0;) {
+            BENTO_CHECK(Feed(rx, wire[i].bytes));
+        }
+        BENTO_CHECK_EQ(out_of_order.size(), 1U);
+        BENTO_CHECK(out_of_order[0].data == data);
+        BENTO_CHECK_EQ(rx.stats().frames_delivered, 1U);
+    }
+
+    // ---- 最大分片数（256）只到首片：不交付、超时丢弃 ----
+    {
+        std::vector<Delivered> partial;
+        VideoChannel rx([](const std::uint8_t*, std::size_t) { return true; },
+                        Deliver(&partial));
+        std::vector<std::vector<std::uint8_t>> frames;
+        VideoChannel tx(Capture(&frames), [](std::uint32_t, bool, const std::uint8_t*,
+                                             std::size_t) {});
+        const std::vector<std::uint8_t> data = MakeData(255 * 1200 + 100, 23);  // 256 片
+        BENTO_CHECK(tx.SendFrame(7, true, data.data(), data.size()));
+        BENTO_CHECK_EQ(frames.size(), 256U);
+        const WireFrame first = ParseWire(frames.front());
+        BENTO_CHECK_EQ(first.frag_count, 256U);
+        BENTO_CHECK(first.frag_index == 0U);
+        BENTO_CHECK(Feed(rx, frames.front()));
+        BENTO_CHECK_EQ(partial.size(), 0U);
+        rx.OnTimer(NowMs() + VideoChannel::kReassemblyTimeoutMs + 100);
+        BENTO_CHECK_EQ(rx.stats().frames_incomplete_dropped, 1U);
+    }
+
     std::printf(
         "[INFO] fec: rx_parity=%llu recovered=%llu incomplete_dropped=%llu "
         "tx_parity=%llu\n",

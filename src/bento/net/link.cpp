@@ -20,8 +20,8 @@
 #include <chrono>
 #include <cstring>
 #include <iomanip>
-#include <map>
 #include <mutex>
+#include <unordered_map>
 #include <sstream>
 #include <utility>
 
@@ -145,9 +145,23 @@ struct CachedSession {
 };
 
 std::mutex g_session_cache_mutex;
-std::map<std::uint32_t, CachedSession> g_session_cache;
+/// 键是 conn_id（uint32），用哈希表而不是红黑树：查询/插入都不需要比较键。
+std::unordered_map<std::uint32_t, CachedSession> g_session_cache;
+/// 上次全表清理的时间（毫秒，0 = 从未清理）；受 g_session_cache_mutex 保护。
+std::uint64_t g_session_cache_last_purge_ms = 0;
+/// 全表清理的最小间隔。会话缓存只用于「监听方对象重建后接受 0-RTT 首包」，
+/// 过期条目多留不到 1 秒既无害（查询自己校验 expires_ms）也不影响正确性，
+/// 却能把「每次握手 O(会话数)」的全表扫描降为每秒最多一次。
+constexpr std::uint64_t kSessionCachePurgeIntervalMs = 1000;
 
-void PurgeExpiredSessions(std::uint64_t now_ms) {
+/// 低频清理过期会话；调用方必须持 g_session_cache_mutex。
+void PurgeExpiredSessionsLocked(std::uint64_t now_ms) {
+    // 时钟回拨（now < last）时直接清理，避免差值下溢后长时间不清理。
+    if (g_session_cache_last_purge_ms != 0 && now_ms >= g_session_cache_last_purge_ms &&
+        now_ms - g_session_cache_last_purge_ms < kSessionCachePurgeIntervalMs) {
+        return;
+    }
+    g_session_cache_last_purge_ms = now_ms;
     for (auto it = g_session_cache.begin(); it != g_session_cache.end();) {
         if (it->second.expires_ms <= now_ms) {
             it = g_session_cache.erase(it);
@@ -1800,10 +1814,12 @@ void Link::CacheServerSession() {
     }
     entry.server_next_wire_seq = next;
     entry.client_rx_window = m_data_rx_window;
-    entry.expires_ms = NowMs() + m_config.session_ticket_lifetime_ms;
+    const std::uint64_t now = NowMs();
+    entry.expires_ms = now + m_config.session_ticket_lifetime_ms;
     std::lock_guard<std::mutex> cache_lock(g_session_cache_mutex);
-    PurgeExpiredSessions(NowMs());
-    g_session_cache[entry.conn_id] = entry;
+    PurgeExpiredSessionsLocked(now);
+    // insert_or_assign 直接移动整条会话，省掉 operator[] 的默认构造 + 赋值拷贝。
+    g_session_cache.insert_or_assign(entry.conn_id, std::move(entry));
 }
 
 bool Link::TryAdoptCachedSession(const std::uint8_t* packet, std::size_t bytes,
@@ -1815,10 +1831,18 @@ bool Link::TryAdoptCachedSession(const std::uint8_t* packet, std::size_t bytes,
     CachedSession entry;
     {
         std::lock_guard<std::mutex> cache_lock(g_session_cache_mutex);
-        PurgeExpiredSessions(NowMs());
+        const std::uint64_t now = NowMs();
+        PurgeExpiredSessionsLocked(now);
         auto it = g_session_cache.find(outer.conn_id);
-        if (it == g_session_cache.end() || it->second.expires_ms <= NowMs() ||
-            it->second.local_port != m_socket.local_port()) {
+        if (it == g_session_cache.end()) {
+            return false;
+        }
+        if (it->second.expires_ms <= now) {
+            // 惰性删除自己：批量清理被节流时，过期条目不会长期占着缓存。
+            g_session_cache.erase(it);
+            return false;
+        }
+        if (it->second.local_port != m_socket.local_port()) {
             return false;
         }
         entry = it->second;
@@ -1888,6 +1912,7 @@ bool Link::TryAdoptCachedSession(const std::uint8_t* packet, std::size_t bytes,
 void Link::ClearSessionCache() {
     std::lock_guard<std::mutex> cache_lock(g_session_cache_mutex);
     g_session_cache.clear();
+    g_session_cache_last_purge_ms = 0;
 }
 
 SendStatus Link::TrySendStream(std::uint8_t channel, const void* data, std::size_t bytes,

@@ -709,6 +709,12 @@ class VideoChannel final {
     }
 
    private:
+    /// @brief 一帧视频的重组状态。
+    /// @details `data` 按需增长：只在分片真正写到的偏移处扩容，不再于首片到达时
+    ///          一次性分配 `frag_count * kFragmentBytes` 并清零。视频帧最常见的
+    ///          结局是「只到前几片就丢帧」，预分配等于白付一次几十 KB 的分配 +
+    ///          memset（frag_count = 256 时是 300 KiB）。`received` 用内联数组，
+    ///          再省掉每帧一次小分配。
     struct Reassembly {
         std::uint16_t frag_count = 0;
         std::uint16_t received_count = 0;
@@ -716,7 +722,7 @@ class VideoChannel final {
         bool key = false;
         std::uint64_t last_update_ms = 0;
         std::vector<std::uint8_t> data;
-        std::vector<std::uint8_t> received;
+        std::array<std::uint8_t, kMaxFragments> received{};  ///< 1 = 已收到该片。
     };
 
     /// @brief 一组的 XOR 校验状态。parity 覆盖 [group_start, group_start+count)。
