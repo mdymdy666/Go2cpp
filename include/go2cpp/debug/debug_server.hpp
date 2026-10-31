@@ -176,6 +176,8 @@ private:
     std::atomic<std::uint64_t> m_subscribers{0};
     std::uint64_t m_started_ns{0};
     std::atomic<std::uint64_t> m_requests{0};
+    /// 最近一条 accept 连接的 TCP_NODELAY 状态：-1 不适用/未接受，0 关闭，1 开启。
+    std::atomic<int> m_last_accept_nodelay{-1};
 };
 
 // ---------------------------------------------------------------------------

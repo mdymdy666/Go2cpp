@@ -63,6 +63,11 @@ struct TcpProxyConfig {
     std::size_t max_connections = 64;
     /// listen(2) 的 backlog。
     int backlog = 64;
+    /// accept 后是否设置 `TCP_NODELAY`（默认开，B-02）。
+    /// @note 核心 bento 库不依赖 `network` 模块，这里用同语义的本地
+    ///       `setsockopt(TCP_NODELAY)` 实现；代理流量多为握手/控制小包，
+    ///       不关 Nagle 会被延迟 ACK 拖到每轮约 40ms。
+    bool tcp_nodelay{true};
 };
 
 /// @brief 代理计数器。字段语义与 JinShan AX-014/AX-028 的可观测要求对齐：
@@ -81,6 +86,10 @@ struct TcpProxyStats {
     std::uint64_t linger_timeouts = 0;  ///< 半关闭后 linger 超时强关数。
     std::uint64_t connect_timeouts = 0; ///< connect 目标超时数。
     std::uint64_t resets = 0;          ///< 读写错误（ECONNRESET 等）导致的中断数。
+    /// accept 后成功设置 `TCP_NODELAY` 的连接数（B-02；回归断言用）。
+    std::uint64_t nodelay_applied = 0;
+    /// accept 后设置 `TCP_NODELAY` 失败的连接数（正常应为 0；失败只记数不拒绝）。
+    std::uint64_t nodelay_failed = 0;
 };
 
 /// @brief 通用 TCP 回环代理（单线程 poll 驱动，非阻塞）。

@@ -311,6 +311,9 @@ void TestEcho100K() {
     BENTO_CHECK(stats.bytes_to_target >= kEchoBytes);
     BENTO_CHECK(stats.bytes_to_client >= kEchoBytes);
     BENTO_CHECK_EQ(stats.dial_failed, 0U);
+    // B-02：每条 accept 出来的连接都必须成功设置 TCP_NODELAY。
+    BENTO_CHECK_EQ(stats.nodelay_applied, stats.accepted);
+    BENTO_CHECK_EQ(stats.nodelay_failed, 0U);
     std::printf("[INFO] echo_100k: to_target=%llu to_client=%llu\n",
                 static_cast<unsigned long long>(stats.bytes_to_target),
                 static_cast<unsigned long long>(stats.bytes_to_client));

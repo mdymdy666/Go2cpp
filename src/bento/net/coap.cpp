@@ -9,8 +9,12 @@
 
 #include "go2cpp/bento/net/coap.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <random>
 #include <utility>
 
 namespace go2cpp::bento::net {
@@ -536,8 +540,37 @@ CoapResponse CoapResponse::Created() {
 // 客户端
 // ---------------------------------------------------------------------------
 
+std::uint64_t CoapDefaultRandomSeed() noexcept {
+    // 进程内序号：同一毫秒内并发构造多个客户端也能拿到不同种子。
+    static std::atomic<std::uint64_t> sequence{0};
+    std::uint64_t entropy = 0;
+    try {
+        std::random_device device;
+        entropy = (static_cast<std::uint64_t>(device()) << 32) ^
+                  static_cast<std::uint64_t>(device());
+    } catch (...) {
+        // 没有可用熵源时退化为时间 + pid + 序号，仍然保证实例间不同。
+    }
+    const std::uint64_t now_ns = static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::uint64_t pid = static_cast<std::uint64_t>(::getpid());
+    const std::uint64_t seq = sequence.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t seed =
+        entropy ^ now_ns ^ (pid << 32) ^ (seq * 0x9e3779b97f4a7c15ull);
+    // 0 保留给「自动种子」，避免与默认构造的语义冲突。
+    return seed == 0 ? 0x9e3779b97f4a7c15ull : seed;
+}
+
+namespace {
+/// 客户端种子解析：0 = 自动生成，非 0 = 调用方显式注入（可复现）。
+std::uint64_t ResolveClientSeed(std::uint64_t seed) noexcept {
+    return seed == 0 ? CoapDefaultRandomSeed() : seed;
+}
+}  // namespace
+
 CoapClient::CoapClient(CoapSendFn send, CoapClientConfig config)
-    : m_send(std::move(send)), m_config(config), m_rng_state(config.random_seed) {
+    : m_send(std::move(send)), m_config(config),
+      m_rng_state(ResolveClientSeed(config.random_seed)) {
     if (m_config.ack_timeout_ms == 0) {
         m_config.ack_timeout_ms = 1;
     }

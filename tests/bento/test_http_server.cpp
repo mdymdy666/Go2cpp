@@ -523,6 +523,75 @@ void TestHandlerExceptionIsolation() {
     server.Stop();
 }
 
+/// B-06：`use_bufio` 下小响应把「头 + 体」拆两段、一次 writev 写出；
+/// 超过缓冲容量的响应走单次 send 旁路（B-04 的长度分流）。
+void TestBufferedWritePath() {
+    HttpServer server;
+    HttpServerConfig config;
+    config.use_bufio = true;
+    config.bufio_capacity = 4096;
+    server.OnRequest([](const Request& request) {
+        Response response;
+        if (request.path() == "/small") {
+            response.body = "small-body";
+        } else if (request.path() == "/binary") {
+            // body 自身包含 CRLFCRLF：头/体拆分只能认第一个空行。
+            response.body = std::string(200, 'x') + "\r\n\r\n" + std::string(100, 'y');
+        } else if (request.path() == "/large") {
+            response.body = std::string(8192, 'L');
+        } else if (request.path() == "/empty") {
+            // 空 body（Content-Length: 0）：to_string 只产出头段，覆盖
+            // 「body_size == 0 时只有一段」的批量写路径。
+            response.status = Status::OK;
+        } else {
+            response.status = Status::NotFound;
+        }
+        return response;
+    });
+    const auto listened = server.Listen("127.0.0.1", 0, config);
+    BENTO_CHECK(listened.ok());
+    BENTO_CHECK(server.Start().ok());
+
+    HttpClient client;
+    BENTO_CHECK(client.Connect(server.Port()));
+
+    // 1) 小响应：头 + 体一次 writev。
+    Response small;
+    BENTO_CHECK(client.Send(GetRequest("/small")));
+    BENTO_CHECK(client.ReadResponse(small));
+    BENTO_CHECK(small.status == Status::OK);
+    BENTO_CHECK_EQ(small.body, std::string("small-body"));
+
+    // 2) 体里含 CRLFCRLF：拆分边界仍是第一个空行，body 原样。
+    Response binary;
+    BENTO_CHECK(client.Send(GetRequest("/binary")));
+    BENTO_CHECK(client.ReadResponse(binary));
+    BENTO_CHECK_EQ(binary.body.size(), static_cast<std::size_t>(200 + 4 + 100));
+    BENTO_CHECK_EQ(binary.body.find("\r\n\r\n"), static_cast<std::size_t>(200));
+
+    // 3) 超过容量的大响应：走单次 send 旁路，内容不能截断。
+    Response large;
+    BENTO_CHECK(client.Send(GetRequest("/large")));
+    BENTO_CHECK(client.ReadResponse(large));
+    BENTO_CHECK_EQ(large.body.size(), static_cast<std::size_t>(8192));
+
+    // 4) 空 body（Content-Length: 0）：只有头段，仍走批量 flush。
+    Response empty;
+    BENTO_CHECK(client.Send(GetRequest("/empty")));
+    BENTO_CHECK(client.ReadResponse(empty));
+    BENTO_CHECK(empty.status == Status::OK);
+    BENTO_CHECK(empty.body.empty());
+
+    const auto stats = server.GetWriteStats();
+    BENTO_CHECK_EQ(stats.responses, 4U);
+    BENTO_CHECK_EQ(stats.writev_calls, 3U);   // small / binary / empty
+    BENTO_CHECK_EQ(stats.direct_writes, 1U);  // large
+    BENTO_CHECK_EQ(stats.write_errors, 0U);
+
+    client.Close();
+    server.Stop();
+}
+
 }  // namespace
 
 int main() {
@@ -535,5 +604,6 @@ int main() {
     TestStopWakesBlockedSse();
     TestConcurrentRequests();
     TestHandlerExceptionIsolation();
+    TestBufferedWritePath();
     return bento_test::Finish("test_http_server");
 }

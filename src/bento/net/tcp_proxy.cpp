@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -24,6 +25,14 @@
 
 namespace go2cpp::bento {
 namespace {
+
+/// 关闭 Nagle：与 `network::Socket::SetTcpNoDelay()` 同语义。
+/// @note `go2cpp_bento` 是 core 协议库，不链接 `network` 模块（否则会把
+///       HTTP/WS/TLS 整条依赖链拖进来），因此在这里直接做一次 setsockopt。
+bool SetTcpNoDelayCompat(int fd) noexcept {
+    const int enabled = 1;
+    return ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) == 0;
+}
 
 /// 解析地址（SOCK_STREAM）。返回第一条可用地址；失败时写 error。
 bool ResolveStream(const std::string& host, std::uint16_t port, sockaddr_storage* out,
@@ -309,6 +318,16 @@ void TcpProxy::AcceptReady() {
             ++m_stats.rejected;
             (void)::close(client_fd);
             continue;
+        }
+        // 代理承载的多是握手/控制帧等小包；不关 Nagle 会被延迟 ACK 压成
+        // 每轮约 40ms。与 `Socks5Server::AcceptReady()` 的 accept 路径一致，
+        // 失败只计数不拒绝连接（B-02）。
+        if (m_config.tcp_nodelay) {
+            if (SetTcpNoDelayCompat(client_fd)) {
+                ++m_stats.nodelay_applied;
+            } else {
+                ++m_stats.nodelay_failed;
+            }
         }
         const int target_fd = ::socket(m_target_addr.ss_family, SOCK_STREAM, IPPROTO_TCP);
         if (target_fd < 0) {

@@ -913,6 +913,11 @@ bool Socks5Server::StartConnect(Connection& connection, std::uint64_t now_ms) {
         return false;
     }
     SetCloExec(upstream_fd);
+    // 中继到上游同样是握手/控制小包；与 client_fd 的 accept 路径保持一致
+    // （B-02 同类缺口：raw connect 出来的 socket 同样不经过 Socket 类）。
+    if (go2cpp::net::Socket::TcpNoDelayDefault()) {
+        (void)go2cpp::net::Socket::SetTcpNoDelay(upstream_fd);
+    }
     connection.upstream_fd = upstream_fd;
 
     const int rc = ::connect(upstream_fd, reinterpret_cast<const sockaddr*>(&target.address),
@@ -1219,6 +1224,18 @@ int Socks5Server::Poll(int timeout_ms) {
                 }
                 break;
         }
+        // 任何阶段只要还有待写数据，就必须监听对应方向的 POLLOUT：否则
+        // 输出只能等下一次 poll 超时（50ms）才被 ServiceConnection 刷出。
+        // 握手响应（method selection / CONNECT reply）都只有 2~10 字节，原先
+        // kGreeting/kRequest 只监听 POLLIN，导致每条短连接固定多等一个 50ms
+        // 周期（B-01 的 p99/p50 50ms 根因，strace 实测两次 send 间隔 52ms）。
+        if (connection.ToClientPending()) {
+            client_events |= POLLOUT;
+        }
+        if (connection.ToUpstreamPending()) {
+            upstream_events |= POLLOUT;
+        }
+
         if (client_events != 0) {
             pollfd entry{};
             entry.fd = connection.client_fd;

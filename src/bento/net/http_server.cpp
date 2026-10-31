@@ -8,6 +8,8 @@
 
 #include "go2cpp/bento/net/http_server.hpp"
 
+#include "go2cpp/network/bufio_socket.hpp"
+
 #include <sys/socket.h>
 
 #include <algorithm>
@@ -15,6 +17,7 @@
 #include <cerrno>
 #include <cstring>
 #include <exception>
+#include <optional>
 #include <utility>
 
 namespace go2cpp::bento {
@@ -43,6 +46,11 @@ HttpServerConfig NormalizeConfig(HttpServerConfig config) {
     if (config.max_body_bytes == 0) {
         config.max_body_bytes = 8 * 1024 * 1024;
     }
+    if (config.bufio_capacity == 0) {
+        config.bufio_capacity = 4096;
+    }
+    config.bufio_capacity = std::min<std::size_t>(
+        1024 * 1024, std::max<std::size_t>(16, config.bufio_capacity));
     return config;
 }
 
@@ -52,6 +60,31 @@ std::string SystemErrorText(int error) {
         return {};
     }
     return std::strerror(error);
+}
+
+/// @brief 用 bufio 一次 writev 写出「响应头 + 响应体」两段（B-06）。
+/// @details 头/体边界取第一个空行；两段都先进入 4 KB 缓冲，再由
+///          `FlushBatch()` 合并成一次 `writev(2)`（段来自同一块缓冲，不需要
+///          把头和体先拼成一个字符串）。
+/// @return true 表示两段都写完且批量 flush 成功；失败时错误已粘在 writer 上。
+bool WriteBufferedResponse(net::BufferedSocketWriter& writer,
+                           std::string_view wire) {
+    const std::size_t split = wire.find("\r\n\r\n");
+    const std::size_t head_size =
+        split == std::string_view::npos ? wire.size() : split + 4;
+    const streams::WriteResult head = writer.Write(wire.data(), head_size);
+    if (head.error || head.count != head_size) {
+        return false;
+    }
+    const std::size_t body_size = wire.size() - head_size;
+    if (body_size != 0) {
+        const streams::WriteResult body =
+            writer.Write(wire.data() + head_size, body_size);
+        if (body.error || body.count != body_size) {
+            return false;
+        }
+    }
+    return writer.FlushBatch().ok();
 }
 
 }  // namespace
@@ -257,6 +290,15 @@ std::string HttpServer::LocalAddress() const {
     return m_local_address;
 }
 
+HttpServer::WriteStats HttpServer::GetWriteStats() const noexcept {
+    WriteStats stats;
+    stats.responses = m_write_responses.load(std::memory_order_acquire);
+    stats.writev_calls = m_write_batches.load(std::memory_order_acquire);
+    stats.direct_writes = m_write_direct.load(std::memory_order_acquire);
+    stats.write_errors = m_write_errors.load(std::memory_order_acquire);
+    return stats;
+}
+
 void HttpServer::AcceptLoop() {
     while (!m_stopping.load(std::memory_order_acquire)) {
         auto connection = m_listener->accept(m_config.accept_timeout);
@@ -362,6 +404,16 @@ void HttpServer::ServeConnection(const net::Socket::Ptr& connection) {
     http::Parser parser(limits);
     std::string pending;
     net::SocketStream stream(connection, false);
+    // B-06：可选的 bufio 批量写端。`bufio::Writer` 按引用持有
+    // `SocketBatchWriter`，因此先声明 sink 再声明 writer，析构顺序反过来，
+    // writer 先于 sink 销毁。
+    std::optional<net::SocketBatchWriter> batch_sink;
+    std::optional<net::BufferedSocketWriter> buffered;
+    if (m_config.use_bufio) {
+        batch_sink.emplace(connection);
+        buffered.emplace(*batch_sink, m_config.bufio_capacity);
+        net::ApplyProtocolBatchDefaults(*buffered);
+    }
 
     for (std::size_t served = 0; served < m_config.max_requests_per_connection; ++served) {
         if (m_stopping.load(std::memory_order_acquire)) {
@@ -402,8 +454,26 @@ void HttpServer::ServeConnection(const net::Socket::Ptr& connection) {
         if (wire.empty()) {
             return;
         }
-        if (!stream.write_all(wire.data(), wire.size())) {
-            return;
+        const bool buffered_path =
+            m_config.use_bufio && wire.size() <= m_config.bufio_capacity;
+        if (buffered_path) {
+            if (!WriteBufferedResponse(*buffered, wire)) {
+                m_write_errors.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            m_write_responses.fetch_add(1, std::memory_order_relaxed);
+            m_write_batches.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (!stream.write_all(wire.data(), wire.size())) {
+                if (m_config.use_bufio) {
+                    m_write_errors.fetch_add(1, std::memory_order_relaxed);
+                }
+                return;
+            }
+            m_write_responses.fetch_add(1, std::memory_order_relaxed);
+            if (m_config.use_bufio) {
+                m_write_direct.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         if (request.close || response.close) {
             return;

@@ -139,6 +139,12 @@ struct HttpServerConfig {
     std::chrono::milliseconds accept_timeout{100};
     /// SSE 写入配置（事件大小上限、心跳间隔、写超时等）。
     sse::StreamOptions sse_options{};
+    /// 是否用 `bufio::Writer` 批量写响应（B-06 示范接入）；默认关闭，便于 A/B。
+    /// 开启后小响应（头 + 体总长 ≤ `bufio_capacity`）拆成「头、体」两段并
+    /// `FlushBatch()` 一次 `writev`；超过容量的响应走单次 `send` 旁路（B-04）。
+    bool use_bufio{false};
+    /// bufio 缓冲容量（字节）；0 按 4096 处理，内部钳制到 [16, 1 MiB]。
+    std::size_t bufio_capacity{4096};
 };
 
 /**
@@ -225,6 +231,16 @@ public:
 
     const HttpServerConfig& config() const noexcept { return m_config; }
 
+    /// @brief 写路径累计统计（B-06 验证用）；未开启 `use_bufio` 时计数恒 0。
+    struct WriteStats {
+        std::uint64_t responses{0};     ///< 成功写出的响应数（含 HEAD，所有路径都计）。
+        std::uint64_t writev_calls{0};  ///< 批量 flush（一次 writev）次数（仅 use_bufio）。
+        std::uint64_t direct_writes{0}; ///< 大响应旁路单次 send 次数（仅 use_bufio）。
+        std::uint64_t write_errors{0};  ///< 写失败次数（仅 use_bufio 路径计数）。
+    };
+    /// @brief 读一次写路径计数快照（原子读，无需加锁）。
+    WriteStats GetWriteStats() const noexcept;
+
 private:
     void AcceptLoop();
     void WorkerLoop();
@@ -261,6 +277,12 @@ private:
     std::atomic<bool> m_stopping{false};
     /// 活动连接计数；worker 注册/注销时增减。
     std::atomic<std::size_t> m_active_count{0};
+
+    /// 写路径计数（B-06）：成功响应数 / writev 次数 / 直写次数 / 失败次数。
+    std::atomic<std::uint64_t> m_write_responses{0};
+    std::atomic<std::uint64_t> m_write_batches{0};
+    std::atomic<std::uint64_t> m_write_direct{0};
+    std::atomic<std::uint64_t> m_write_errors{0};
 
     /// accept 线程；Start() 创建，Stop() join。
     std::thread m_acceptor;

@@ -6,6 +6,7 @@
 #include "go2cpp/debug/debug_server.hpp"
 
 #include "go2cpp/json.hpp"
+#include "go2cpp/network/socket.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -37,6 +38,27 @@ constexpr std::size_t kMaxResponseBytes = 64ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kMaxSubscriptions = 16;
 /// 已预留的订阅线程数（fetch_add 先占名额，线程结束时释放）。
 std::atomic<std::size_t> g_subscription_threads{0};
+
+/// @brief 给 accept 出来的连接补 `TCP_NODELAY`（B-02）。
+/// @details DebugServer 当前监听 Unix domain socket（`/tmp/go2cpp-<pid>.sock`），
+///          Nagle 算法只存在于 TCP，对 AF_UNIX 设置会返回 ENOPROTOOPT；因此这里
+///          先按 `SO_DOMAIN` 判断，只在 TCP 域上设置——既不产生无效系统调用，
+///          也保证将来改成 TCP 监听时不会漏掉。
+/// @return 1 = 已设置成功；0 = 显式关闭/设置失败；-1 = 非 TCP 域或查询失败。
+int ApplyAcceptNoDelay(int fd) noexcept {
+    int domain = 0;
+    socklen_t length = sizeof(domain);
+    if (::getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &length) != 0) {
+        return -1;
+    }
+    if (domain != AF_INET && domain != AF_INET6) {
+        return -1;
+    }
+    if (!go2cpp::net::Socket::TcpNoDelayDefault()) {
+        return 0;
+    }
+    return go2cpp::net::Socket::SetTcpNoDelay(fd) ? 1 : 0;
+}
 
 const char* const kKnownComponents[] = {
     "scheduler", "fiber", "channel", "parking_condition", "mutex",
@@ -335,7 +357,7 @@ void DrainClient(int fd, std::size_t max_bytes, int timeout_ms) {
     }
 }
 
-bool IsKnownComponent(const std::string& name) {
+[[maybe_unused]] bool IsKnownComponent(const std::string& name) {
     for (const char* known : kKnownComponents) {
         if (name == known) {
             return true;
@@ -400,6 +422,7 @@ bool DebugServer::Start(const std::string& path) {
         return true;
     }
 #if !(defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP)
+    (void)path;  // OFF 构建不监听 socket，参数仅用于保持公开接口稳定。
     {
         std::lock_guard<std::mutex> lock(m_error_mutex);
         m_last_error = "debug-dump-disabled";
@@ -515,6 +538,8 @@ void DebugServer::Run() noexcept {
         if (client < 0) {
             continue;
         }
+        m_last_accept_nodelay.store(ApplyAcceptNoDelay(client),
+                                    std::memory_order_relaxed);
         HandleClient(client);
         ::close(client);
     }
@@ -1001,6 +1026,10 @@ std::string DebugServer::HandleCommand(const std::string& line) {
         status += "components=" + std::to_string(Components().size()) + "\n";
         status += "subscribers=" + std::to_string(m_subscribers.load()) + "\n";
         status += "requests=" + std::to_string(m_requests.load()) + "\n";
+        const int nodelay = m_last_accept_nodelay.load(std::memory_order_relaxed);
+        status += "accept_nodelay=";
+        status += nodelay < 0 ? "unknown" : (nodelay == 0 ? "off" : "on");
+        status += "\n";
         return OkResponse(status);
     }
     if (command == "LIST") {

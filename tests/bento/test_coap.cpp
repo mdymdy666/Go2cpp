@@ -968,16 +968,19 @@ void TestClientErrorsAndClamps() {
 }
 
 void TestClientDeterminism() {
+    // 显式种子必须可复现（测试/回放依赖这一条）：同种子 + 同请求序列 -> 同字节。
     std::vector<std::vector<std::uint8_t>> first_sent;
     std::vector<std::vector<std::uint8_t>> second_sent;
+    CoapClientConfig config;
+    config.random_seed = 0x0123456789abcdefull;
     CoapClient first([&first_sent](const std::vector<std::uint8_t>& wire) {
         first_sent.push_back(wire);
         return true;
-    });
+    }, config);
     CoapClient second([&second_sent](const std::vector<std::uint8_t>& wire) {
         second_sent.push_back(wire);
         return true;
-    });
+    }, config);
     BENTO_CHECK(first.SendRequest(CoapCode::kGet, "/d", {}, std::nullopt, 1000));
     BENTO_CHECK(second.SendRequest(CoapCode::kGet, "/d", {}, std::nullopt, 1000));
     BENTO_CHECK(first_sent.size() == 1);
@@ -985,7 +988,93 @@ void TestClientDeterminism() {
     if (!first_sent.empty() && !second_sent.empty()) {
         BENTO_CHECK(first_sent[0] == second_sent[0]);
     }
+
+    // 默认配置（B-03）：每个客户端自动换种子，不能生成相同的 (MID, Token)。
+    std::vector<std::vector<std::uint8_t>> default_first;
+    std::vector<std::vector<std::uint8_t>> default_second;
+    CoapClient auto_first([&default_first](const std::vector<std::uint8_t>& wire) {
+        default_first.push_back(wire);
+        return true;
+    });
+    CoapClient auto_second([&default_second](const std::vector<std::uint8_t>& wire) {
+        default_second.push_back(wire);
+        return true;
+    });
+    BENTO_CHECK(auto_first.SendRequest(CoapCode::kGet, "/d", {}, std::nullopt, 1000));
+    BENTO_CHECK(auto_second.SendRequest(CoapCode::kGet, "/d", {}, std::nullopt, 1000));
+    if (default_first.size() == 1 && default_second.size() == 1) {
+        const CoapMessage one = DecodeOk(default_first[0]);
+        const CoapMessage two = DecodeOk(default_second[0]);
+        BENTO_CHECK(one.message_id != two.message_id || one.token != two.token);
+    }
 }
+
+/// B-03 端到端：两个「默认配置」客户端请求同一服务端，服务端 handler 必须
+/// 各调一次、响应不能串到另一个请求（旧默认固定种子会被去重命中）。
+void TestDefaultSeedClientsDoNotAlias() {
+    CoapServer server;
+    int handled = 0;
+    server.SetHandler([&handled](const CoapMessage& request) {
+        ++handled;
+        CoapResponse response;
+        response.code = CoapCode::kContent;
+        const std::string path = request.UriPath();
+        response.payload.assign(path.begin(), path.end());
+        return response;
+    });
+
+    CoapClient* active = nullptr;
+    server.SetSendFn([&active](const std::vector<std::uint8_t>& wire) {
+        if (active == nullptr) {
+            return false;
+        }
+        return active->HandleDatagram(wire);
+    });
+
+    std::vector<std::vector<std::uint8_t>> first_sent;
+    std::vector<std::vector<std::uint8_t>> second_sent;
+    CoapClient first([&first_sent, &server](const std::vector<std::uint8_t>& wire) {
+        first_sent.push_back(wire);
+        return server.Handle(wire).has_value();
+    });
+    CoapClient second([&second_sent, &server](const std::vector<std::uint8_t>& wire) {
+        second_sent.push_back(wire);
+        return server.Handle(wire).has_value();
+    });
+    std::vector<std::string> first_payloads;
+    std::vector<std::string> second_payloads;
+    first.OnEvent([&first_payloads](CoapClientEvent event, const CoapMessage& message) {
+        if (event == CoapClientEvent::kResponse) {
+            first_payloads.emplace_back(message.payload.begin(), message.payload.end());
+        }
+    });
+    second.OnEvent([&second_payloads](CoapClientEvent event, const CoapMessage& message) {
+        if (event == CoapClientEvent::kResponse) {
+            second_payloads.emplace_back(message.payload.begin(), message.payload.end());
+        }
+    });
+
+    active = &first;
+    BENTO_CHECK(first.SendRequest(CoapCode::kGet, "/alpha", {}, std::nullopt, 1000));
+    active = &second;
+    BENTO_CHECK(second.SendRequest(CoapCode::kGet, "/beta", {}, std::nullopt, 1000));
+
+    BENTO_CHECK_EQ(server.HandlerCalls(), static_cast<std::uint64_t>(2));
+    BENTO_CHECK_EQ(first_payloads.size(), static_cast<std::size_t>(1));
+    BENTO_CHECK_EQ(second_payloads.size(), static_cast<std::size_t>(1));
+    if (!first_payloads.empty()) {
+        BENTO_CHECK_EQ(first_payloads[0], std::string("/alpha"));
+    }
+    if (!second_payloads.empty()) {
+        BENTO_CHECK_EQ(second_payloads[0], std::string("/beta"));
+    }
+    if (!first_sent.empty() && !second_sent.empty()) {
+        const CoapMessage one = DecodeOk(first_sent[0]);
+        const CoapMessage two = DecodeOk(second_sent[0]);
+        BENTO_CHECK(one.message_id != two.message_id || one.token != two.token);
+    }
+}
+
 
 void TestNonConfirmableExchange() {
     Loopback loop;
@@ -1247,6 +1336,7 @@ int main() {
     TestClientResetAndIgnored();
     TestClientErrorsAndClamps();
     TestClientDeterminism();
+    TestDefaultSeedClientsDoNotAlias();
     TestNonConfirmableExchange();
     TestRandomRoundtripFuzz();
     TestMutatedAndTruncatedFuzz();

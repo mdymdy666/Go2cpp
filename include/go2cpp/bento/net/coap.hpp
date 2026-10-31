@@ -415,6 +415,14 @@ enum class CoapClientEvent : std::uint8_t {
 };
 
 /**
+ * @brief 生成一个默认的 CoAP 随机种子（熵 + 单调时间 + pid + 进程内序号）。
+ * @details 只用于让默认配置的多个客户端 / 多进程不撞种子，不是密码学安全
+ *          随机源；测试需要复现时请显式设置 `CoapClientConfig::random_seed`。
+ * @return 非 0 种子（0 保留给「自动生成」语义）。
+ */
+std::uint64_t CoapDefaultRandomSeed() noexcept;
+
+/**
  * @brief 客户端配置。
  */
 struct CoapClientConfig {
@@ -423,8 +431,11 @@ struct CoapClientConfig {
     /// 最多重传次数（不含首发）；0 表示首发后超时即放弃。
     unsigned max_retransmit = 4;
     /// 随机种子：相同种子在同一请求序列下产生相同的 Token/Message ID，
-    /// 便于测试复现；生产环境可用 `CoapNowMs()` 或系统熵初始化。
-    std::uint64_t random_seed = 0x636f61705f636c69ull;
+    /// 便于测试复现；**0 表示每个客户端构造时自动生成**（熵 + 时间 + pid +
+    /// 序号）。默认值曾是固定常量 `0x636f61705f636c69`，多实例在同一请求序列
+    /// 下会生成相同的 (Message ID, Token)，被服务端去重命中后返回上一响应
+    /// （B-03）；显式设置非 0 值仍可复现测试序列。
+    std::uint64_t random_seed = 0;
     /// 自动生成 Token 的字节数（1..8）。
     std::size_t token_bytes = 4;
 };
