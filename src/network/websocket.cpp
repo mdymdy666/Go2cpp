@@ -29,12 +29,131 @@
 #include <cctype>
 #include <cerrno>
 #include <cstring>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <limits>
 #include <new>
 #include <random>
 #include <sstream>
 
 namespace go2cpp::net {
+
+/**
+ * @brief 每连接掩码键生成器（ChaCha8 + 64 字节输出缓冲）。
+ *
+ * ## 为什么不是 std::random_device
+ * 原实现客户端每发一帧都构造一次 `std::random_device` 并取 4 字节：构造函数
+ * 初始化资源、`_M_getval` 每次走 glibc 熵源（WSL 实测 ~35 µs/帧），而掩码键
+ * 只需要「对攻击者不可预测」的 4 字节。RFC 6455 §10.3 要求掩码键不可预测，
+ * 因此这里用 ChaCha8（Go 的 crypto/rand 内部同族设计）而不是 xorshift：
+ * 固定 32 字节密钥 + 单调计数器生成密钥流，输出缓冲摊掉 8 轮核心开销，
+ * 每帧只剩 4 次字节装载，约 5 ns。
+ *
+ * ## 线程模型
+ * 只在 `write_frame_unlocked()` 内使用，调用方持有 `m_write_mutex`，
+ * 因此不需要额外同步。
+ */
+struct WebSocket::MaskRng final {
+    /// 32 字节密钥（8 个 32 位字）；连接建立后固定。
+    std::uint32_t key[8]{};
+    /// 64 位块计数器；每次 refill 自增，决定密钥流位置。
+    std::uint64_t counter{0};
+    /// 当前 64 字节输出块。
+    std::uint8_t block[64]{};
+    /// block 中已消费的字节数；== 64 表示需要 refill。
+    std::size_t position{64};
+
+    MaskRng() noexcept { seed(); }
+
+    /// 播种：优先系统熵源；不可用时退回时钟 + 对象地址混合（仍然每连接不同）。
+    void seed() noexcept {
+        std::uint64_t words[4]{};
+        try {
+            std::random_device device;
+            for (auto& value : words)
+                value = (static_cast<std::uint64_t>(device()) << 32) ^
+                        static_cast<std::uint64_t>(device());
+        } catch (...) {
+            const auto now = static_cast<std::uint64_t>(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            for (std::size_t i = 0; i < 4; ++i)
+                words[i] = now * 0x9E3779B97F4A7C15ULL + i;
+        }
+        // 混入对象地址：即使熵源在同一时钟粒度返回相同值，不同连接也不同种子。
+        const auto address = reinterpret_cast<std::uintptr_t>(this);
+        for (std::size_t i = 0; i < 4; ++i) {
+            words[i] ^= static_cast<std::uint64_t>(address) + 0x9E3779B97F4A7C15ULL * (i + 1);
+            // splitmix64 打散，保证 8 个 32 位密钥字互不相关。
+            std::uint64_t mixed = words[i];
+            mixed += 0x9E3779B97F4A7C15ULL;
+            mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ULL;
+            mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBULL;
+            mixed ^= (mixed >> 31);
+            words[i] = mixed;
+        }
+        for (std::size_t i = 0; i < 4; ++i) {
+            key[2 * i] = static_cast<std::uint32_t>(words[i] & 0xFFFFFFFFULL);
+            key[2 * i + 1] = static_cast<std::uint32_t>(words[i] >> 32);
+        }
+    }
+
+    static void quarter_round(std::uint32_t& a, std::uint32_t& b, std::uint32_t& c,
+                              std::uint32_t& d) noexcept {
+        a += b; d ^= a; d = (d << 16) | (d >> 16);
+        c += d; b ^= c; b = (b << 12) | (b >> 20);
+        a += b; d ^= a; d = (d << 8) | (d >> 24);
+        c += d; b ^= c; b = (b << 7) | (b >> 25);
+    }
+
+    /// 生成下一个 64 字节块（ChaCha8：4 个双轮）。
+    void refill() noexcept {
+        static constexpr std::uint32_t kSigma[4] = {0x61707865U, 0x3320646eU,
+                                                    0x79622d32U, 0x6b206574U};
+        std::uint32_t working[16];
+        working[0] = kSigma[0];
+        working[1] = kSigma[1];
+        working[2] = kSigma[2];
+        working[3] = kSigma[3];
+        for (std::size_t i = 0; i < 8; ++i) working[4 + i] = key[i];
+        working[12] = static_cast<std::uint32_t>(counter & 0xFFFFFFFFULL);
+        working[13] = static_cast<std::uint32_t>(counter >> 32);
+        working[14] = 0;
+        working[15] = 0;
+        std::uint32_t input[16];
+        std::memcpy(input, working, sizeof(input));
+        for (int round = 0; round < 8; round += 2) {
+            quarter_round(working[0], working[4], working[8], working[12]);
+            quarter_round(working[1], working[5], working[9], working[13]);
+            quarter_round(working[2], working[6], working[10], working[14]);
+            quarter_round(working[3], working[7], working[11], working[15]);
+            quarter_round(working[0], working[5], working[10], working[15]);
+            quarter_round(working[1], working[6], working[11], working[12]);
+            quarter_round(working[2], working[7], working[8], working[13]);
+            quarter_round(working[3], working[4], working[9], working[14]);
+        }
+        for (std::size_t i = 0; i < 16; ++i) {
+            const std::uint32_t value = working[i] + input[i];
+            block[i * 4 + 0] = static_cast<std::uint8_t>(value & 0xFFU);
+            block[i * 4 + 1] = static_cast<std::uint8_t>((value >> 8) & 0xFFU);
+            block[i * 4 + 2] = static_cast<std::uint8_t>((value >> 16) & 0xFFU);
+            block[i * 4 + 3] = static_cast<std::uint8_t>((value >> 24) & 0xFFU);
+        }
+        ++counter;
+        position = 0;
+    }
+
+    /// 取 4 字节掩码键（小端）。
+    std::uint32_t next() noexcept {
+        if (position >= sizeof(block)) refill();
+        const std::uint32_t value = static_cast<std::uint32_t>(block[position]) |
+                                    (static_cast<std::uint32_t>(block[position + 1]) << 8) |
+                                    (static_cast<std::uint32_t>(block[position + 2]) << 16) |
+                                    (static_cast<std::uint32_t>(block[position + 3]) << 24);
+        position += 4;
+        return value;
+    }
+};
 
 namespace {
 
@@ -46,6 +165,34 @@ std::string trim_copy(std::string_view value) {
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.remove_prefix(1);
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.remove_suffix(1);
     return std::string(value);
+}
+
+/// 4 字节掩码键展开到 payload（原地异或）。
+/// 掩码键每 4 字节循环一次，因此可以按 16/8/4 字节整字异或，尾部再按字节收尾。
+/// 1 KB 帧从「每字节 3~4 条指令」降到「每 16 字节 4 条指令」。
+void apply_mask(std::uint8_t* data, std::size_t size,
+                const std::array<std::uint8_t, 4>& key) noexcept {
+    const std::uint32_t word = static_cast<std::uint32_t>(key[0]) |
+                               (static_cast<std::uint32_t>(key[1]) << 8) |
+                               (static_cast<std::uint32_t>(key[2]) << 16) |
+                               (static_cast<std::uint32_t>(key[3]) << 24);
+    std::size_t index = 0;
+#if defined(__SSE2__)
+    const __m128i pattern = _mm_set1_epi32(static_cast<int>(word));
+    for (; index + 16 <= size; index += 16) {
+        const auto chunk = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data + index));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(data + index), _mm_xor_si128(chunk, pattern));
+    }
+#endif
+    const std::uint64_t wide = static_cast<std::uint64_t>(word) |
+                               (static_cast<std::uint64_t>(word) << 32);
+    for (; index + 8 <= size; index += 8) {
+        std::uint64_t value = 0;
+        std::memcpy(&value, data + index, sizeof(value));
+        value ^= wide;
+        std::memcpy(data + index, &value, sizeof(value));
+    }
+    for (; index < size; ++index) data[index] = static_cast<std::uint8_t>(data[index] ^ key[index & 3U]);
 }
 
 bool equal_ci(std::string_view left, std::string_view right) noexcept {
@@ -538,10 +685,9 @@ WebSocketResult WebSocket::read_frame(Frame& frame) {
         return {WebSocketError::MessageTooLarge, ENOMEM, "frame allocation failed"};
     }
     if (length != 0 && !(result = read_exact(frame.payload.data(), frame.payload.size())).ok()) return result;
-    // step4: 解掩码（服务端收到的帧必须带掩码）。
-    if (frame.masked) {
-        for (std::size_t i = 0; i < frame.payload.size(); ++i) frame.payload[i] ^= mask[i % 4];
-    }
+    // step4: 解掩码（服务端收到的帧必须带掩码）。整字展开：1 KB 帧约 64 条
+    // SSE2 指令 + 尾处理，替代原来每字节 3~4 条。
+    if (frame.masked) apply_mask(frame.payload.data(), frame.payload.size(), mask);
     return WebSocketResult::success();
 }
 
@@ -594,12 +740,14 @@ WebSocketResult WebSocket::write_frame_unlocked(WebSocketOpcode opcode, std::str
     }
     std::array<std::uint8_t, 4> mask_key{};
     if (mask) {
-        try {
-            std::random_device random;
-            for (auto& byte : mask_key) byte = static_cast<std::uint8_t>(random());
-        } catch (...) {
-            return {WebSocketError::Io, EIO, "unable to create websocket mask"};
-        }
+        // 每连接只播种一次；此后每帧 4 次字节装载（原实现每帧一次
+        // std::random_device 构造 + 4 次取熵，WSL 实测 ~35 µs/帧）。
+        if (!m_mask_rng) m_mask_rng = std::make_unique<MaskRng>();
+        const std::uint32_t key = m_mask_rng->next();
+        mask_key[0] = static_cast<std::uint8_t>(key & 0xFFU);
+        mask_key[1] = static_cast<std::uint8_t>((key >> 8) & 0xFFU);
+        mask_key[2] = static_cast<std::uint8_t>((key >> 16) & 0xFFU);
+        mask_key[3] = static_cast<std::uint8_t>((key >> 24) & 0xFFU);
         std::copy(mask_key.begin(), mask_key.end(), header.begin() + header_size);
         header_size += mask_key.size();
     }
@@ -608,7 +756,9 @@ WebSocketResult WebSocket::write_frame_unlocked(WebSocketOpcode opcode, std::str
     // 拷贝大块数据。512B 覆盖绝大多数控制/小消息帧。
     constexpr std::size_t kInlineFramePayload = 512;
     if (!mask && payload.size() <= kInlineFramePayload) {
-        std::array<std::uint8_t, 14 + kInlineFramePayload> buffer{};
+        // 只要 [0, header_size + payload.size()) 会被写/发送，不必先清零
+        // 526 字节（原实现每小帧一次 memset）。
+        std::array<std::uint8_t, 14 + kInlineFramePayload> buffer;
         std::memcpy(buffer.data(), header.data(), header_size);
         if (!payload.empty()) {
             std::memcpy(buffer.data() + header_size, payload.data(), payload.size());
@@ -636,13 +786,15 @@ WebSocketResult WebSocket::write_frame_unlocked(WebSocketOpcode opcode, std::str
         }
         return result;
     }
-    std::vector<std::uint8_t> masked;
+    // 复用缓冲：首帧分配一次，之后每帧只有 memcpy + 整字异或。
+    std::vector<std::uint8_t>& masked = m_mask_scratch;
     try {
-        masked.assign(payload.begin(), payload.end());
+        masked.resize(payload.size());
     } catch (const std::bad_alloc&) {
         return {WebSocketError::MessageTooLarge, ENOMEM, "frame allocation failed"};
     }
-    for (std::size_t i = 0; i < masked.size(); ++i) masked[i] ^= mask_key[i % 4];
+    if (!payload.empty()) std::memcpy(masked.data(), payload.data(), payload.size());
+    apply_mask(masked.data(), masked.size(), mask_key);
     result = write_all(masked.data(), masked.size());
     if (!result.ok()) {
         abort_transport();
@@ -703,8 +855,10 @@ WebSocketResult WebSocket::protocol_error(std::string message, std::uint16_t cod
 WebSocketResult WebSocket::read_message(WebSocketMessage& message) {
     std::lock_guard<sync::Mutex> lock(m_read_mutex);
     if (m_closed.load(std::memory_order_acquire)) return {WebSocketError::Closed, 0, "websocket is closed"};
+    // Frame 提到循环外：payload 的 vector 容量跨帧复用，稳定负载下每帧零分配
+    // 且 resize() 同尺寸为空操作（不再每帧一次 malloc + memset）。
+    Frame frame;
     for (;;) {
-        Frame frame;
         auto result = read_frame(frame);
         if (!result.ok()) return result;
         if (frame.opcode == WebSocketOpcode::Ping) {

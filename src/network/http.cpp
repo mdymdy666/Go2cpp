@@ -89,11 +89,25 @@ bool has_connection_token(const Headers& headers, std::string_view wanted) {
     }
     return false;
 }
-std::string trim(std::string_view value) {
+/// 统计 \n 个数（glibc memchr 走向量化路径，~32 B/cycle）。
+std::size_t count_newlines(const char* data, std::size_t size) noexcept {
+    std::size_t count = 0;
+    const char* cursor = data;
+    const char* const end = data + size;
+    while (cursor < end) {
+        const void* found = std::memchr(cursor, '\n', static_cast<std::size_t>(end - cursor));
+        if (found == nullptr) break;
+        ++count;
+        cursor = static_cast<const char*>(found) + 1;
+    }
+    return count;
+}
+std::string_view trim_view(std::string_view value) noexcept {
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.remove_prefix(1);
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.remove_suffix(1);
-    return std::string(value);
+    return value;
 }
+std::string trim(std::string_view value) { return std::string(trim_view(value)); }
 bool parse_size(std::string_view value, std::size_t& output) {
     value = std::string_view(value.data(), value.size());
     if (value.empty()) return false;
@@ -200,6 +214,21 @@ bool split_url(const std::string& url, std::string& host, std::string& target,
     return true;
 }
 std::size_t find_header_end(const std::string& buffer) { return buffer.find("\r\n\r\n"); }
+// 方法名的静态字面量视图：序列化热路径不再每请求构造 std::string。
+std::string_view method_token(Method method) noexcept {
+    switch (method) {
+    case Method::Delete: return "DELETE";
+    case Method::Get: return "GET";
+    case Method::Head: return "HEAD";
+    case Method::Post: return "POST";
+    case Method::Put: return "PUT";
+    case Method::Connect: return "CONNECT";
+    case Method::Options: return "OPTIONS";
+    case Method::Trace: return "TRACE";
+    case Method::Patch: return "PATCH";
+    default: return {};
+    }
+}
 }
 
 std::string method_name(Method method) {
@@ -220,15 +249,16 @@ Method parse_method(std::string_view value) {
     if (value == "PATCH") return Method::Patch;
     return Method::Unknown;
 }
-std::string status_text(Status status) {
+std::string_view status_text_view(Status status) noexcept {
     switch (status) { case Status::Continue: return "Continue"; case Status::SwitchingProtocols: return "Switching Protocols"; case Status::OK: return "OK"; case Status::Created: return "Created"; case Status::Found: return "Found";
     case Status::NoContent: return "No Content"; case Status::BadRequest: return "Bad Request"; case Status::Unauthorized: return "Unauthorized";
     case Status::Forbidden: return "Forbidden"; case Status::NotFound: return "Not Found"; case Status::MethodNotAllowed: return "Method Not Allowed";
     case Status::RequestTimeout: return "Request Timeout"; case Status::Conflict: return "Conflict"; case Status::PayloadTooLarge: return "Payload Too Large";
     case Status::InternalError: return "Internal Server Error"; case Status::NotImplemented: return "Not Implemented";
     case Status::BadGateway: return "Bad Gateway"; case Status::ServiceUnavailable: return "Service Unavailable";
-    case Status::GatewayTimeout: return "Gateway Timeout"; default: return ""; }
+    case Status::GatewayTimeout: return "Gateway Timeout"; default: return {}; }
 }
+std::string status_text(Status status) { return std::string(status_text_view(status)); }
 
 bool Headers::equal_name(std::string_view left, std::string_view right) noexcept {
     if (left.size() != right.size()) return false;
@@ -253,13 +283,37 @@ std::string Request::query() const { const auto pos = target.find('?'); return p
 void Request::add_cookie(std::string name, std::string value) { const auto old = header.get("Cookie"); header.set("Cookie", old.empty() ? name + "=" + value : old + "; " + name + "=" + value); }
 std::string Request::path_value(std::string_view name) const { auto found = path_values.find(std::string(name)); return found == path_values.end() ? std::string{} : found->second; }
 std::string Request::to_string() const {
-    if (method_name(method).empty() || !valid_request_target(target) ||
+    const std::string_view token = method_token(method);
+    if (token.empty() || !valid_request_target(target) ||
         !valid_http_version_token(version)) return {};
-    std::ostringstream stream; stream << method_name(method) << " " << target << " " << version << "\r\n";
-    for (const auto& item : header.entries()) stream << item.first << ": " << item.second << "\r\n";
-    if (close && !header.has("Connection")) stream << "Connection: close\r\n";
-    if (!body.empty() && !header.has("Content-Length")) stream << "Content-Length: " << body.size() << "\r\n";
-    stream << "\r\n" << body; return stream.str();
+    // Connection / Content-Length 只在同一次头表扫描里判断，替代两次 has() 线性扫描。
+    bool has_connection = false;
+    bool has_content_length = false;
+    for (const auto& item : header.entries()) {
+        if (!has_connection) has_connection = equal_ci(item.first, "Connection");
+        if (!has_content_length) has_content_length = equal_ci(item.first, "Content-Length");
+    }
+    std::size_t total = token.size() + target.size() + version.size() + body.size() + 32;
+    for (const auto& item : header.entries())
+        total += item.first.size() + item.second.size() + 4;
+    if (close && !has_connection) total += 19;
+    if (!body.empty() && !has_content_length) total += 20;
+    std::string wire;
+    wire.reserve(total);
+    wire.append(token).push_back(' ');
+    wire.append(target).push_back(' ');
+    wire.append(version).append("\r\n");
+    for (const auto& item : header.entries())
+        wire.append(item.first).append(": ").append(item.second).append("\r\n");
+    if (close && !has_connection) wire.append("Connection: close\r\n");
+    if (!body.empty() && !has_content_length) {
+        char digits[24];
+        const auto converted = std::to_chars(digits, digits + sizeof(digits), body.size());
+        wire.append("Content-Length: ").append(digits, converted.ptr).append("\r\n");
+    }
+    wire.append("\r\n");
+    wire.append(body);
+    return wire;
 }
 void Response::set_cookie(std::string name, std::string value, std::string attributes) { std::string result = std::move(name) + "=" + std::move(value); if (!attributes.empty()) result += "; " + attributes; header.add("Set-Cookie", std::move(result)); }
 void Response::redirect(std::string location, Status code) { status = code; header.set("Location", std::move(location)); }
@@ -281,11 +335,18 @@ std::string Response::to_string(bool head_request) const {
         out.append(code_buffer, code_end);
     }
     out.push_back(' ');
-    out.append(status_text(status));
+    // status_text() 返回 std::string（一次分配）；这里只要视图。
+    out.append(status_text_view(status));
     out.append("\r\n");
-    const bool has_connection = header.has("Connection");
-    const bool has_content_length = header.has("Content-Length");
-    const bool has_transfer_encoding = header.has("Transfer-Encoding");
+    // 三次 has() 线性扫描合并成一次：头越多省得越多。
+    bool has_connection = false;
+    bool has_content_length = false;
+    bool has_transfer_encoding = false;
+    for (const auto& item : entries) {
+        if (!has_connection) has_connection = equal_ci(item.first, "Connection");
+        if (!has_content_length) has_content_length = equal_ci(item.first, "Content-Length");
+        if (!has_transfer_encoding) has_transfer_encoding = equal_ci(item.first, "Transfer-Encoding");
+    }
     for (const auto& item : entries) {
         // 1xx/204/304 不允许实体 framing；过滤用户手工设置的 CL/TE，
         // 避免下游继续等待一个永远不会出现的 body。
@@ -412,6 +473,12 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
     bool has_length = false;
     bool chunked = false;
     bool has_transfer_encoding = false;
+    // 每个头都要 emplace_back：先按 CRLF 计数预留，消除 vector 扩容与搬移。
+    {
+        const auto header_lines = count_newlines(header_block.data(), header_block.size());
+        if (response) result->header.reserve(header_lines);
+        else request->header.reserve(header_lines);
+    }
     for (std::size_t offset = line_end + 2; offset < header_block.size();) {
         const auto found_end = header_block.find("\r\n", offset);
         const auto end = found_end == std::string_view::npos ? header_block.size() : found_end;
@@ -419,7 +486,7 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
         if (colon == std::string_view::npos || colon >= end || colon == offset)
             return {ParseState::Error, bytes.size(), "invalid header"};
         const std::string_view name = header_block.substr(offset, colon - offset);
-        const auto value = trim(header_block.substr(colon + 1, end - colon - 1));
+        const std::string_view value = trim_view(header_block.substr(colon + 1, end - colon - 1));
         if (name.find_first_of("\r\n") != std::string_view::npos)
             return {ParseState::Error, bytes.size(), "invalid header name"};
         for (const unsigned char c : value)
@@ -437,8 +504,8 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
                 return {ParseState::Error, bytes.size(), "unsupported transfer encoding"};
             has_transfer_encoding = true;
         }
-        if (response) result->header.add(std::string(name), value);
-        else request->header.add(std::string(name), value);
+        if (response) result->header.add(std::string(name), std::string(value));
+        else request->header.add(std::string(name), std::string(value));
         if (found_end == std::string_view::npos) break;
         offset = end + 2;
     }
@@ -664,6 +731,26 @@ Request NewRequest(Method method, std::string target, std::string body) { Reques
 
 ResponseWriter::ResponseWriter(net::Socket::Ptr socket, std::chrono::milliseconds timeout)
     : m_socket(std::move(socket)), m_timeout(timeout) {}
+// 把 iovec 数组完整写出：writev 允许只写出一部分，返回后要按已写字节
+// 前进到下一个 iovec（必要时只推进当前段的基址）。
+static bool write_all_vectors(net::SocketStream& stream, iovec* vectors, std::size_t count) {
+    std::size_t first = 0;
+    while (first < count) {
+        const auto written = stream.writev(vectors + first, count - first);
+        if (written <= 0) return false;
+        auto remaining = static_cast<std::size_t>(written);
+        while (first < count && remaining >= vectors[first].iov_len) {
+            remaining -= vectors[first].iov_len;
+            ++first;
+        }
+        if (first < count && remaining > 0) {
+            vectors[first].iov_base =
+                static_cast<char*>(vectors[first].iov_base) + remaining;
+            vectors[first].iov_len -= remaining;
+        }
+    }
+    return true;
+}
 bool ResponseWriter::start(Response response) {
     if (!m_socket || m_state != StreamState::Idle) return false;
     response.header.erase("Content-Length");
@@ -685,20 +772,25 @@ bool ResponseWriter::start(Response response) {
 bool ResponseWriter::write(std::string_view chunk) {
     if (!m_socket || m_state != StreamState::HeadersCommitted) return false;
     if (chunk.empty()) return true;
-    std::ostringstream prefix;
-    prefix << std::hex << chunk.size() << "\r\n";
-    const auto prefix_wire = prefix.str();
+    // chunk 前缀（十六进制长度 + CRLF）直接写在栈上：原实现每块构造一次
+    // std::ostringstream（locale/虚表/分配）再 str() 复制一次。
+    char prefix[24];
+    const auto converted = std::to_chars(prefix, prefix + 20, chunk.size(), 16);
+    char* cursor = converted.ptr;
+    *cursor++ = '\r';
+    *cursor++ = '\n';
+    static constexpr char kSuffix[] = "\r\n";
+    // prefix / payload / CRLF 合成一次 writev：原实现是 3 次 send（3 次系统调用）。
+    // SSE 每个事件一块，收益与事件数线性相关。
+    iovec vectors[3]{};
+    vectors[0].iov_base = prefix;
+    vectors[0].iov_len = static_cast<std::size_t>(cursor - prefix);
+    vectors[1].iov_base = const_cast<char*>(chunk.data());
+    vectors[1].iov_len = chunk.size();
+    vectors[2].iov_base = const_cast<char*>(kSuffix);
+    vectors[2].iov_len = sizeof(kSuffix) - 1;
     net::SocketStream stream(m_socket, false);
-    if (!stream.write_all(prefix_wire.data(), prefix_wire.size())) {
-        m_state = StreamState::Failed;
-        return false;
-    }
-    if (!stream.write_all(chunk.data(), chunk.size())) {
-        m_state = StreamState::Failed;
-        return false;
-    }
-    static constexpr char suffix[] = "\r\n";
-    if (!stream.write_all(suffix, 2)) {
+    if (!write_all_vectors(stream, vectors, 3)) {
         m_state = StreamState::Failed;
         return false;
     }
@@ -764,9 +856,12 @@ void Server::serve_connection(net::Socket::Ptr connection, std::size_t max_reque
     // step1: 空连接直接返回；准备解析器与流水线剩余缓冲。
     if (!connection) return;
     Parser parser; std::string pending;
+    // 接收缓冲移出循环且不做零初始化：recv 会覆盖 [0, transferred)，
+    // 只有这段会被读取。原来每请求一次 8 KB 栈清零（rep stos）。
+    std::array<char, 8192> buffer;
     // step2: keep-alive 主循环，单连接串行处理，上限 max_requests。
     for (std::size_t i = 0; i < max_requests && !m_stopped.load(std::memory_order_acquire); ++i) {
-        Request request; std::array<char, 8192> buffer{}; ParseResult parsed;
+        Request request; ParseResult parsed;
         // 读出一个完整请求：NeedMore 时继续 recv。
         do {
             if (!pending.empty()) { parsed = parser.feed(pending, request); pending.clear(); }
@@ -776,10 +871,20 @@ void Server::serve_connection(net::Socket::Ptr connection, std::size_t max_reque
         // step3: 同一 recv 里可能还有下一个请求，留给下一轮。
         pending = parser.take_remaining();
         // step4: 精确匹配路由，未命中用 fallback；handler 异常转 500 并强制 close。
-        Response response; Handler selected = m_fallback;
-        for (const auto& [method, path, handler] : m_routes) if (method == request.method && path == request.path()) { selected = handler; break; }
-        if (selected) {
-            try { response = selected(request); }
+        // 路径只算一次视图（原来每个候选路由都分配一次 Request::path()），
+        // 命中结果用指针而不是按值拷贝 std::function。
+        const std::string_view request_path = request.path_view();
+        Response response;
+        const Handler* selected = &m_fallback;
+        for (const auto& route : m_routes) {
+            if (std::get<0>(route) == request.method &&
+                std::string_view(std::get<1>(route)) == request_path) {
+                selected = &std::get<2>(route);
+                break;
+            }
+        }
+        if (*selected) {
+            try { response = (*selected)(request); }
             catch (...) { response = Response{}; response.status = Status::InternalError; response.close = true; }
         } else response.status = Status::NotFound;
         // step5: 写响应；close 标志决定是否结束本连接。

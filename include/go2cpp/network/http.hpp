@@ -81,6 +81,8 @@ public:
     std::vector<std::string> values(std::string_view name) const;
     const std::vector<Entry>& entries() const noexcept { return m_entries; }
     void clear() noexcept { m_entries.clear(); }
+    /// 预留头容量：解析器按 CRLF 计数一次性预留，避免逐头扩容搬移。
+    void reserve(std::size_t count) { m_entries.reserve(count); }
 
 private:
     static bool equal_name(std::string_view left, std::string_view right) noexcept;
@@ -119,6 +121,13 @@ public:
     bool close{false};
 
     std::string path() const;
+    /// 路径视图（截到 '?' 之前）：指向 target，生命周期与 Request 相同。
+    /// 路由匹配用它可避免每个候选路由都分配一次 std::string。
+    std::string_view path_view() const noexcept {
+        const auto pos = target.find('?');
+        return pos == std::string::npos ? std::string_view(target)
+                                        : std::string_view(target.data(), pos);
+    }
     std::string query() const;
     void add_cookie(std::string name, std::string value);
     std::string path_value(std::string_view name) const;

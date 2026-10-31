@@ -202,6 +202,14 @@ private:
         std::vector<std::uint8_t> payload;
     };
 
+    /**
+     * @brief 每连接掩码键生成器。
+     * @details ChaCha8（8 轮）+ 64 字节输出缓冲：连接建立后只播种一次，
+     *          每帧取 4 字节，不再触碰 std::random_device / getentropy。
+     *          定义在 websocket.cpp，头文件只保留不完整类型。
+     */
+    struct MaskRng;
+
     WebSocket(Socket::Ptr socket, WebSocketRole role, WebSocketConfig config,
               std::string pending = {});
     WebSocketResult read_exact(void* data, std::size_t size);
@@ -252,6 +260,10 @@ private:
     std::size_t m_prefetched_offset{0};
     /// m_prefetched 中有效字节数（缓冲容量可能更大）；read_exact() 使用。
     std::size_t m_prefetched_valid{0};
+    /// 连接级掩码键 PRNG；懒创建（服务端角色永远用不到，不付播种成本）。
+    std::unique_ptr<MaskRng> m_mask_rng;
+    /// 客户端掩码帧的复用缓冲：避免每帧一次 vector 分配 + 拷贝。
+    std::vector<std::uint8_t> m_mask_scratch;
 };
 
 }  // namespace go2cpp::net

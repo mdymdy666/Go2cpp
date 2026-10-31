@@ -255,8 +255,13 @@ private:
     int m_protocol{0};
     bool m_owner{true};
     bool m_connected{false};
-    Duration m_recv_timeout{Duration::max()};
-    Duration m_send_timeout{Duration::max()};
+    // 超时只有「快照」语义：send/recv 每次调用读一次配置。改成原子毫秒计数后，
+    // 热路径不再为了读一次超时去抢 m_mutex（每次系统调用省一次 lock/unlock）。
+    std::atomic<std::int64_t> m_recv_timeout{Duration::max().count()};
+    std::atomic<std::int64_t> m_send_timeout{Duration::max().count()};
+    // m_closing 的只读镜像：is_closing() 在 send/recv 重试循环里反复调用，
+    // 原来是每次一把 m_mutex；关闭标记一旦为真就永久为真，适合原子发布。
+    std::atomic<bool> m_closing_flag{false};
     AddressPtr m_remote;
     std::shared_ptr<SocketWaiter> m_waiter;
     mutable std::mutex m_mutex;

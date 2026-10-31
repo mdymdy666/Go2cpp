@@ -287,14 +287,15 @@ void Socket::finalize_deferred_close() noexcept {
     m_operation_condition.notify_all();
 }
 bool Socket::is_closing() const noexcept {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_closing || m_fd < 0;
+    // 关闭标记一旦为真就永久为真，且所有把 m_fd 置 -1 的路径都先置位它，
+    // 因此单次 acquire 读即可回答「还能不能用」，不必再抢 m_mutex。
+    return m_closing_flag.load(std::memory_order_acquire);
 }
 int Socket::fd() const noexcept { std::lock_guard<std::mutex> lock(m_mutex); return m_fd; }
 bool Socket::valid() const noexcept { return fd() >= 0; }
 bool Socket::connected() const noexcept { std::lock_guard<std::mutex> lock(m_mutex); return m_connected; }
-Socket::Duration Socket::recv_timeout() const noexcept { std::lock_guard<std::mutex> lock(m_mutex); return m_recv_timeout; }
-Socket::Duration Socket::send_timeout() const noexcept { std::lock_guard<std::mutex> lock(m_mutex); return m_send_timeout; }
+Socket::Duration Socket::recv_timeout() const noexcept { return Duration(m_recv_timeout.load(std::memory_order_relaxed)); }
+Socket::Duration Socket::send_timeout() const noexcept { return Duration(m_send_timeout.load(std::memory_order_relaxed)); }
 bool Socket::init_nonblock() {
     // 先用**原始** syscall 读标志，避免进入 Hook 的 fcntl。
     //
@@ -342,6 +343,7 @@ int Socket::release() noexcept {
     }
     const int fd = m_fd;
     m_closing = true;
+    m_closing_flag.store(true, std::memory_order_release);
     ++m_generation;
     lock.unlock();
     io::IOManager::NotifyCloseAll(fd);
@@ -522,6 +524,7 @@ bool Socket::close() noexcept {
     }
     const int fd = m_fd;
     m_closing = true;
+    m_closing_flag.store(true, std::memory_order_release);
     ++m_generation;
     const bool owner = m_owner;
     lock.unlock();
@@ -688,7 +691,11 @@ bool Socket::wait_or_retry(int fd, io::IOEvent event, Duration& left,
 }
 SocketResult Socket::send_impl(int fd, const msghdr* message, int flags,
                                Duration timeout, std::uint64_t cancel_generation) {
-    const auto start = std::chrono::steady_clock::now();
+    // timeout == max（默认）时 remaining() 直接返回 timeout、不读起点，
+    // 因此不必为每包付一次 vDSO 时钟调用（实测 ~18 ns）。
+    const auto start = timeout == Duration::max()
+        ? std::chrono::steady_clock::time_point{}
+        : std::chrono::steady_clock::now();
     for (;;) {
         if (is_closing() || m_write_cancel_generation.load(std::memory_order_acquire) !=
                                 cancel_generation) return {-1, ECANCELED};
@@ -709,7 +716,11 @@ SocketResult Socket::send_impl(int fd, const msghdr* message, int flags,
 
 SocketResult Socket::recv_impl(int fd, msghdr* message, int flags, Duration timeout,
                                std::uint64_t cancel_generation) {
-    const auto start = std::chrono::steady_clock::now();
+    // timeout == max（默认）时 remaining() 直接返回 timeout、不读起点，
+    // 因此不必为每包付一次 vDSO 时钟调用（实测 ~18 ns）。
+    const auto start = timeout == Duration::max()
+        ? std::chrono::steady_clock::time_point{}
+        : std::chrono::steady_clock::now();
     for (;;) {
         if (is_closing() || m_read_cancel_generation.load(std::memory_order_acquire) !=
                                 cancel_generation) return {-1, ECANCELED};
@@ -742,7 +753,7 @@ SocketResult Socket::sendv(const iovec* buffers, std::size_t count, int flags, D
     }
     msghdr message{}; message.msg_iov = const_cast<iovec*>(buffers); message.msg_iovlen = count;
     Duration effective = timeout;
-    if (effective == Duration::max()) { std::lock_guard<std::mutex> lock(m_mutex); effective = m_send_timeout; }
+    if (effective == Duration::max()) effective = send_timeout();
     const auto result = send_impl(fd, &message, flags, effective, cancel_generation);
     // 一次用户调用记一条事件：partial 重试已在 send_impl 内部完成，不重复计数。
     GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordWrite(
@@ -760,7 +771,7 @@ SocketResult Socket::recvv(iovec* buffers, std::size_t count, int flags, Duratio
     }
     msghdr message{}; message.msg_iov = buffers; message.msg_iovlen = count;
     Duration effective = timeout;
-    if (effective == Duration::max()) { std::lock_guard<std::mutex> lock(m_mutex); effective = m_recv_timeout; }
+    if (effective == Duration::max()) effective = recv_timeout();
     const auto result = recv_impl(fd, &message, flags, effective, cancel_generation);
     GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordRead(
         fd, result.ok() ? static_cast<std::uint64_t>(result.transferred) : 0,
@@ -778,7 +789,7 @@ SocketResult Socket::send_to(const void* data, std::size_t length, const Address
     iovec vector{const_cast<void*>(data), length}; msghdr message{}; message.msg_name = const_cast<sockaddr*>(to.addr());
     message.msg_namelen = to.addr_len(); message.msg_iov = &vector; message.msg_iovlen = 1;
     Duration effective = timeout;
-    if (effective == Duration::max()) { std::lock_guard<std::mutex> lock(m_mutex); effective = m_send_timeout; }
+    if (effective == Duration::max()) effective = send_timeout();
     const auto result = send_impl(fd, &message, flags, effective, cancel_generation);
     GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordWrite(
         fd, result.ok() ? static_cast<std::uint64_t>(result.transferred) : 0,
@@ -796,7 +807,7 @@ SocketResult Socket::recv_from(void* data, std::size_t length, AddressPtr& from,
     iovec vector{data, length}; sockaddr_storage storage{}; msghdr message{}; message.msg_name = &storage;
     message.msg_namelen = sizeof(storage); message.msg_iov = &vector; message.msg_iovlen = 1;
     Duration effective = timeout;
-    if (effective == Duration::max()) { std::lock_guard<std::mutex> lock(m_mutex); effective = m_recv_timeout; }
+    if (effective == Duration::max()) effective = recv_timeout();
     auto result = recv_impl(fd, &message, flags, effective, cancel_generation);
     if (result.ok()) from = Address::Create(reinterpret_cast<sockaddr*>(&storage), message.msg_namelen);
     GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordRead(
@@ -839,10 +850,7 @@ SocketResult Socket::recv_batch(RecvBatchEntry* entries, std::size_t count, int 
         return {-1, ECANCELED};
     }
     Duration effective = timeout;
-    if (effective == Duration::max()) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        effective = m_recv_timeout;
-    }
+    if (effective == Duration::max()) effective = recv_timeout();
     const auto result =
         recv_batch_impl(fd, entries, count, flags, effective, cancel_generation);
     // 调试记录仍按字节统计：批量只是减少系统调用次数，不改变「读了多少字节」。
@@ -911,10 +919,7 @@ SocketResult Socket::send_batch(const SendBatchEntry* entries, std::size_t count
         return {-1, ECANCELED};
     }
     Duration effective = timeout;
-    if (effective == Duration::max()) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        effective = m_send_timeout;
-    }
+    if (effective == Duration::max()) effective = send_timeout();
     const auto result =
         send_batch_impl(fd, entries, count, flags, effective, cancel_generation);
     std::uint64_t bytes = 0;
@@ -975,10 +980,7 @@ SocketResult Socket::send_file(int in_fd, off_t* offset, std::size_t count, Dura
         return {-1, ECANCELED};
     }
     Duration effective = timeout;
-    if (effective == Duration::max()) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        effective = m_send_timeout;
-    }
+    if (effective == Duration::max()) effective = send_timeout();
     const auto result =
         send_file_impl(fd, in_fd, offset, count, effective, cancel_generation);
     GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordWrite(
@@ -1046,7 +1048,7 @@ AddressPtr Socket::remote_address() const {
 bool Socket::set_recv_timeout(Duration timeout) {
     if (timeout.count() < 0) return false;
     int fd = -1; if (!begin_operation(fd)) return false;
-    { std::lock_guard<std::mutex> lock(m_mutex); m_recv_timeout = timeout; }
+    m_recv_timeout.store(timeout.count(), std::memory_order_relaxed);
     FdManager::instance().set_timeout(fd, true, timeout);
     end_operation();
     return true;
@@ -1054,7 +1056,7 @@ bool Socket::set_recv_timeout(Duration timeout) {
 bool Socket::set_send_timeout(Duration timeout) {
     if (timeout.count() < 0) return false;
     int fd = -1; if (!begin_operation(fd)) return false;
-    { std::lock_guard<std::mutex> lock(m_mutex); m_send_timeout = timeout; }
+    m_send_timeout.store(timeout.count(), std::memory_order_relaxed);
     FdManager::instance().set_timeout(fd, false, timeout);
     end_operation();
     return true;
