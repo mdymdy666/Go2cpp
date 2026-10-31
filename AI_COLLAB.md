@@ -413,3 +413,74 @@ errno noinline），不是寄存器保存。
   去重缓存误判；③ 小包 bufio 提升 21~33 倍，≥4KB 大包 bufio 反而慢 19%（应直写）。
 - **状态**：正确性全绿；性能数据已归档；未见协议实现缺陷，只有上述可优化点。
 - **复现**：`taskset -c 2,3 ./.build-bento-wsl/bento_bench_protocols --correctness|--perf`
+
+
+---
+
+## 2026-10-31 example/app 双版本应用示例（子 agent：example 双版本）
+
+- 新增 `example/app/**`：web_server（simple/full）与 chat_server（simple/full）
+  四个可运行服务示例；每版 README 含功能、运行方式与 curl/客户端测试步骤；
+  `example/app/README.md` 含 simple vs full 对照表与学习路径。
+- 构建：`CMakeLists.txt` 在 `Go2CppBento.cmake` 之后执行
+  `add_subdirectory(example/app)`（仅 `GO2CPP_BUILD_EXAMPLES=ON` 时）；
+  `example/app/CMakeLists.txt` 按 Bento 目标存在性注册四个 target。服务类示例
+  监听端口并等待信号，因此不注册 ctest。
+- 测试（`.build-bento-wsl`，Release）：
+  - web_simple：curl 200/400/404/405、`/health`、SIGTERM 优雅关闭 exit=0；
+  - web_full：静态文件/路由参数/JSON API/异常 500/目录穿越 403/OPTIONS 204/
+    SSE welcome+tick+demo+heartbeat/200 并发请求/SIGTERM exit=0；
+  - chat_simple：双客户端广播、WHO、退出码 0；
+  - chat_full：9 peer 覆盖房间隔离、私聊、在线列表、历史回放、重复昵称、
+    未加入、未知命令、超长消息、心跳超时、token 重连、并发发送、持久化、
+    优雅关闭；测试断言 26 项全部 PASS。
+- 依赖：`bento::HttpServer`、`bento::LinkServer`/`PeerHub`、`Scheduler`、`Channel`；
+  未改库代码。
+- 已知限制：full 版总行数（web 1739 / chat 1791，含项目规范注释）超出任务
+  参考的 400–600；UDP 明文、token 仅存内存、无身份认证（均为示例边界，
+  见各 README）。
+- 状态：未 commit。
+
+## 2026-10-31 缓存淘汰算法专题（子 agent：cache-topic）
+
+- 新增 include/go2cpp/cache/**：统一 Cache<K,V> 接口 + 7 种策略
+  （LRU / LRU-K(2) / 2Q / W-TinyLFU / GDSF / ARC / CLOCK）+ 工厂、分片、
+  线程安全包装 + 5 场景负载生成器。
+- 新增 tests/cache/**：12 个测试 TU（单元/随机/5 场景/压测）+ 基准
+  go2cpp_cache_bench。
+- 新增 docs/research/cache-algorithms.md（1039 行）：10 种算法综述、
+  防扫描与 GDSF 权重专节、多场景选型表、实测数据。
+- 新增 cmake/Go2CppCache.cmake，顶层 CMakeLists.txt 末尾 include；
+  header-only INTERFACE target，未改现有模块。
+- 构建（.build-bento-wsl，Release，GCC 13.3）：go2cpp_cache_test、
+  go2cpp_cache_bench 均 0 警告。
+- 测试：ctest -R cache 2/2 通过；go2cpp_cache_test 全绿（0.64 s）；
+  go2cpp_cache_bench --full 35 组数据（命中率/吞吐/峰值内存/扫描恢复）。
+- 关键实测：weighted 场景 GDSF 0.8158 vs LRU 0.5579；CDN GDSF 0.7483 vs
+  LRU 0.4771；scan 场景 LRU-K 0.5197 / ARC 0.5104 / LRU 0.3674；
+  TinyLFU 热点 0.7821。
+- 已知限制：GDSF 只设字节预算时条目数和元数据内存会放大，文档给出
+  条目上限建议；LIRS / CLOCK-Pro / S3-FIFO 仅综述未实现。
+- 状态：未 commit。
+
+---
+
+## 2026-10-31 应用层框架（流表/资源传输/KV 流，子 agent：应用层框架）
+
+- 新增 `include/go2cpp/app/**`（10 个头）与 `src/app/**`（10 个实现）：9B 帧头
+  （DATA/HEADERS/PRIORITY/RST/SETTINGS/PING/GOAWAY/WINDOW_UPDATE/RESOURCE_INDEX）、
+  流状态机、连接/流两级窗口、依赖树 + WFQ 调度、资源分块（SHA-256/CRC-32/断点
+  续传/索引）、KV 流（小表单帧/大表流式/每键一流）、Bento 20B 帧桥、Bento Link
+  STREAM 传输适配、HttpServer 批式隧道。
+- 新增 `tests/app/**`（8 个可执行、62 个场景）：流表 12、资源 10、KV 10、连接 11、
+  帧 7、负载 3、Bento 4、HTTP 5；含 1000 并发流与 1 GiB 资源。
+- CMake：`cmake/Go2CppApp.cmake`，`-DGO2CPP_WITH_APP=ON` 打开（默认 OFF）；
+  测试注册 8 个 ctest（`app_*`）。
+- 实测（Release，`.build-bento-wsl`）：4 MiB 内存资源 21 ms（190 MiB/s）；
+  1 GiB 资源 3992 ms（256 MiB/s）+ 元数据扫描 3348 ms；1000 并发 KV 流 14 ms
+  （客户端 1002 帧）；1 MiB over Bento Link 7.7 MiB/s（每 2 ms 驱动 RunOnce 的
+  测试频率限制）；256 KiB over HttpServer 6 次请求。
+- 文档：`docs/modules/app-framework.md`（设计/API/用法/与 HTTP/2 对比/限制）。
+- 边界：未改任何现有协议实现；未 commit。
+- 已知限制：无 HPACK、HEADERS 单帧（超限自动分区到 DATA）、HTTP 隧道半双工、
+  跨进程续传只校验续传段 SHA-256、事件队列有界 65536。

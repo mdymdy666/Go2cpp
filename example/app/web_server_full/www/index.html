@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Go2Cpp web_server_full</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <h1>Go2Cpp web_server_full</h1>
+    <p class="hint">静态文件、路由参数、中间件、JSON API、SSE 与优雅关闭的完整示例。</p>
+
+    <section>
+      <h2>可直接点开的接口</h2>
+      <ul>
+        <li><a href="/health">/health</a>：健康检查（JSON）</li>
+        <li><a href="/api/echo?name=go2cpp&amp;times=2">/api/echo?name=go2cpp&amp;times=2</a>：回显参数</li>
+        <li><a href="/api/items/42">/api/items/42</a>：路由参数</li>
+        <li><a href="/api/routes">/api/routes</a>：已注册路由</li>
+        <li><a href="/api/stats">/api/stats</a>：请求数 / SSE 订阅数</li>
+        <li><a href="/api/time">/api/time</a>：服务器时间</li>
+        <li><a href="/api/boom">/api/boom</a>：故意抛异常，验证 500 JSON</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>实时统计</h2>
+      <pre id="stats">加载中…</pre>
+    </section>
+
+    <section>
+      <h2>SSE 事件（/events）</h2>
+      <button id="broadcast" type="button">POST /api/broadcast 发一条事件</button>
+      <ul id="events"></ul>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

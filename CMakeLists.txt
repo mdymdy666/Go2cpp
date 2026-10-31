@@ -51,5 +51,21 @@ endif()
 # -DGO2CPP_WITH_BENTO=ON 构建 go2cpp_bento 与测试。
 include(cmake/Go2CppBento.cmake)
 
+# 应用级示例（example/app）：web_server / chat_server 的 simple 与 full 两版。
+# 它们依赖 Bento 的 HttpServer/LinkServer，必须放在 Go2CppBento.cmake 之后；
+# app/CMakeLists.txt 内部按 TARGET 存在性判断，Bento 关闭时只打印跳过原因。
+if (GO2CPP_BUILD_EXAMPLES)
+    add_subdirectory(example/app)
+endif()
+
 # Reflect 测试（帧对接测试优先复用 go2cpp_bento，因此必须在 Bento 之后）。
 include(cmake/Go2CppReflectTests.cmake)
+
+# 应用层框架（HTTP/2 风格流表 + 资源传输 + KV 流）：默认 OFF。
+# -DGO2CPP_WITH_APP=ON 构建 go2cpp_app 与其测试；Bento 目标存在时自动接入
+# 帧桥 / Link 传输，HttpServer 目标存在时接入 HTTP 隧道。
+include(cmake/Go2CppApp.cmake)
+
+# 缓存淘汰策略模块（header-only）：LRU / LRU-K / 2Q / W-TinyLFU / GDSF / ARC / CLOCK。
+# 测试目标 go2cpp_cache_test、基准 go2cpp_cache_bench 由该文件定义。
+include(cmake/Go2CppCache.cmake)
