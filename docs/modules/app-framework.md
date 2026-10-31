@@ -377,6 +377,10 @@ conn.SendKvPerKey(table, &ids);
 - 接收线程跑 `Link::RunOnce`，Connection 在自己的线程 `Step`，二者通过队列 +
   条件变量同步；
 - 不接管 Link 生命周期；生产环境可在 `on_disconnected` 里关闭 Connection。
+- **与 LinkServer 的关系**：`LinkServer` 是 `Link`/`PeerHub` 之上的多 peer 服务端。
+  每个 peer 可以按同样方式包装：`WriteAll` 转 `LinkServer::Send(peer, channel, …,
+  kReliable)`，`OnStream(peer, channel, …)` 转 `OnLinkData`。适配器本身不需要改，
+  只是把「单 peer 的 Link」换成「按 peer 路由的回调」。
 
 ### 8.3 Bento 通用帧桥
 
