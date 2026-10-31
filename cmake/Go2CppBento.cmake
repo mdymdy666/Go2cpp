@@ -291,7 +291,12 @@ if (GO2CPP_WITH_BENTO)
     # 零警告是验收条件：本模块独立编译，-Werror 把回归挡在构建期。
     target_compile_options(go2cpp_bento_socks PRIVATE
         -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
+    # socks5 的 TCP_NODELAY 复用 net::Socket 的标准实现（accept 后设），
+    # 因此需要链接 go2cpp_network；否则 Socket::SetTcpNoDelay 未定义。
     target_link_libraries(go2cpp_bento_socks PUBLIC Threads::Threads)
+    if (TARGET go2cpp_network)
+        target_link_libraries(go2cpp_bento_socks PRIVATE go2cpp_network)
+    endif()
     set_target_properties(go2cpp_bento_socks PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_library(go2cpp::bento_socks ALIAS go2cpp_bento_socks)
 
