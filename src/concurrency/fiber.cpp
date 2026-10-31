@@ -403,12 +403,21 @@ void growable_stack_segv_handler(int sig, siginfo_t* info,
                                  void* raw_context) noexcept;
 
 bool growable_stack_env_enabled() noexcept {
-    const char* value = std::getenv("GO2CPP_GROWABLE_STACK");
-    if (value == nullptr || *value == '\0') {
-        return true;
-    }
-    return value[0] != '0' && std::strcmp(value, "false") != 0 &&
-           std::strcmp(value, "off") != 0;
+    // 环境变量在进程启动后视为常量：每个任务的 initialize_context() 都会
+    // 重新解析一次 reserve（见 resolve_reserve），glibc getenv() 需要遍历
+    // environ 并对每个名字做 strncmp。callgrind 在 4P/4M 空任务 churn 上
+    // 测得 getenv + __strncmp_avx2 合计约 8.7% 指令，全部来自这条每任务
+    // 路径。缓存一次结果，语义与 Go runtime「启动期读取环境变量」一致；
+    // 运行期再 setenv 不会改变已经创建过的 Fiber 行为（本来也不保证）。
+    static const bool enabled = [] {
+        const char* value = std::getenv("GO2CPP_GROWABLE_STACK");
+        if (value == nullptr || *value == '\0') {
+            return true;
+        }
+        return value[0] != '0' && std::strcmp(value, "false") != 0 &&
+               std::strcmp(value, "off") != 0;
+    }();
+    return enabled;
 }
 
 bool ensure_growable_thread_altstack() noexcept {

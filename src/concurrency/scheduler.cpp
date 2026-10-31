@@ -50,7 +50,9 @@
 #include <exception>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -495,6 +497,252 @@ private:
     std::shared_ptr<Task> m_task;
 };
 
+// ---------------------------------------------------------------------------
+// Task 共享块分配池（Task 对象 + shared_ptr 控制块的那一次整块分配）
+// ---------------------------------------------------------------------------
+//
+// spawn() 用 `std::allocate_shared<Task>` 一次分配「Task 对象 + 控制块」，
+// 大小 704B 且要求 64 字节对齐（Task 含 alignas(64) 的完成原语）。glibc 对
+// align>16 的请求走 posix_memalign → _mid_memalign，释放走 free 的
+// merge/consolidate 慢路径；callgrind 在 4P/4M 空任务 churn 上测得
+// 「分配 + 释放」合计约 17% 指令，其中对齐分配约 9%。
+//
+// 池只复用**内存**：allocate_shared 的销毁器仍在引用归零时正常调用
+// `~Task()`（用户回调、异常、Fiber 句柄都在那里释放），再把整块内存交回
+// 池。因此不存在「对象被复用却没有重置」的风险，也不需要改动 Task 的
+// 构造/析构语义。
+//
+// 结构（单 size class，因为同一进程里只有 Task 走这条路径）：
+//   - 每线程固定数组缓存：无锁、无分配，容量有界（96 块 ≈ 66KiB/线程）；
+//   - 缓存空/满时与进程级 free-list 批量交换（一次 48 块，只锁一次）；
+//   - 新内存按 64 块一个 chunk 向系统申请，chunk 记录在池里，池析构时释放。
+class TaskBlockPool final {
+public:
+    static constexpr std::size_t kBlockAlign = 64;
+    static constexpr std::size_t kMaxPooledBlock = 4096;
+    static constexpr std::size_t kThreadCacheCapacity = 96;
+
+    static TaskBlockPool& Instance() noexcept {
+        static TaskBlockPool pool;
+        return pool;
+    }
+
+    TaskBlockPool(const TaskBlockPool&) = delete;
+    TaskBlockPool& operator=(const TaskBlockPool&) = delete;
+
+    /// @brief 记录块大小（由分配器在首次分配前设置）。
+    /// @return true 表示尺寸与既有 size class 一致，可以走池。
+    /// @note 快路径只读一个原子：这条路径在每个任务的分配/释放上都要
+    ///       走一次，早期实现在这里加了 std::mutex，单次分配白付一对
+    ///       futex 原子操作。只有首次确定 size class 时才需要锁。
+    bool SetBlockSize(std::size_t bytes) noexcept {
+        const std::size_t block = RoundUp(bytes);
+        if (block == 0 || block > kMaxPooledBlock) {
+            return false;
+        }
+        std::size_t current = m_block_size.load(std::memory_order_acquire);
+        if (current == 0) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_block_size.load(std::memory_order_relaxed) == 0) {
+                m_block_size.store(block, std::memory_order_release);
+            }
+            current = m_block_size.load(std::memory_order_acquire);
+        }
+        return current == block;
+    }
+
+    /// @brief 取一块不少于 bytes 字节、64 字节对齐的内存。
+    /// @return nullptr 表示该尺寸/对齐超出池能力，调用方必须走系统分配。
+    void* Acquire(std::size_t bytes, std::size_t align) noexcept {
+        if (align > kBlockAlign || !SetBlockSize(bytes)) {
+            return nullptr;
+        }
+        ThreadCache& cache = t_task_block_cache;
+        if (cache.count != 0) {
+            return cache.blocks[--cache.count];
+        }
+        Refill(cache);
+        if (cache.count != 0) {
+            return cache.blocks[--cache.count];
+        }
+        return nullptr;
+    }
+
+    /// @brief 归还一块由 Acquire() 取出的内存（原地析构已完成）。
+    void Release(void* block, std::size_t bytes) noexcept {
+        if (block == nullptr) {
+            return;
+        }
+        const std::size_t rounded = RoundUp(bytes);
+        if (rounded == 0 || rounded > kMaxPooledBlock) {
+            return;
+        }
+        ThreadCache& cache = t_task_block_cache;
+        if (cache.count == kThreadCacheCapacity) {
+            Recycle(cache);
+        }
+        if (cache.count < kThreadCacheCapacity) {
+            cache.blocks[cache.count++] = block;
+        }
+    }
+
+private:
+    static constexpr std::size_t kGlobalBatch = 48;
+    static constexpr std::size_t kChunkBlocks = 64;
+
+    struct ThreadCache {
+        void* blocks[kThreadCacheCapacity];
+        std::size_t count;
+    };
+
+    static std::size_t RoundUp(std::size_t bytes) noexcept {
+        return (bytes + kBlockAlign - 1U) & ~(kBlockAlign - 1U);
+    }
+
+    TaskBlockPool() noexcept = default;
+
+    ~TaskBlockPool() {
+        for (void* chunk : m_chunks) {
+            ::operator delete(chunk, std::align_val_t(kBlockAlign));
+        }
+    }
+
+    /// @brief 从全局 free-list 批量补充本地缓存；不足时申请新 chunk。
+    void Refill(ThreadCache& cache) noexcept {
+        const std::size_t block_size =
+            m_block_size.load(std::memory_order_acquire);
+        if (block_size == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(m_mutex);
+        while (cache.count < kGlobalBatch && !m_free.empty()) {
+            cache.blocks[cache.count++] = m_free.back();
+            m_free.pop_back();
+        }
+        if (cache.count >= kGlobalBatch || m_exhausted) {
+            return;
+        }
+        void* chunk = nullptr;
+        try {
+            chunk = ::operator new(block_size * kChunkBlocks,
+                                   std::align_val_t(kBlockAlign));
+            m_chunks.push_back(chunk);
+        } catch (...) {
+            // 池只是分配优化；失败时让调用方回退到系统对齐分配。
+            m_exhausted = true;
+            if (chunk != nullptr) {
+                ::operator delete(chunk, std::align_val_t(kBlockAlign));
+            }
+            return;
+        }
+        auto* base = static_cast<unsigned char*>(chunk);
+        for (std::size_t i = 0; i < kChunkBlocks; ++i) {
+            cache.blocks[cache.count++] = base + i * block_size;
+        }
+    }
+
+    /// @brief 把本地缓存的一半批量还回全局 free-list。
+    void Recycle(ThreadCache& cache) noexcept {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::size_t half = cache.count / 2U;
+        while (half != 0) {
+            try {
+                m_free.push_back(cache.blocks[--cache.count]);
+            } catch (...) {
+                ++cache.count;
+                return;
+            }
+            --half;
+        }
+    }
+
+    // TLS 缓存：POD（无构造/析构），不产生 TLS guard。
+    // 用 initial-exec 模型：共享库默认 general-dynamic 时每次访问都要
+    // 调 __tls_get_addr（30~50 cycles）。这里的 TLS 在每条任务分配/
+    // 释放路径上都要读一次，必须与调度器其它热 TLS 用同一模型。
+    static thread_local ThreadCache t_task_block_cache GO2CPP_SCHED_HOT_TLS;
+
+    std::mutex m_mutex;
+    std::vector<void*> m_free;
+    std::vector<void*> m_chunks;
+    std::atomic<std::size_t> m_block_size{0};
+    bool m_exhausted{false};
+};
+
+thread_local TaskBlockPool::ThreadCache TaskBlockPool::t_task_block_cache GO2CPP_SCHED_HOT_TLS{};
+
+/// @brief allocate_shared 专用分配器：Task 控制块走池，其它回退系统分配。
+template <typename T>
+class TaskBlockAllocator {
+public:
+    using value_type = T;
+
+    TaskBlockAllocator() noexcept = default;
+    template <typename U>
+    TaskBlockAllocator(const TaskBlockAllocator<U>&) noexcept {}
+
+    T* allocate(std::size_t n) {
+        const std::size_t bytes = n * sizeof(T);
+        // allocate 与 deallocate 的判定条件必须逐字对称：若某次分配走了
+        // 系统路径，释放时必须也走系统 delete，否则池会「收养」一块永远
+        // 不会被回收的外来内存。
+        if (n == 1U && bytes <= TaskBlockPool::kMaxPooledBlock &&
+            alignof(T) <= TaskBlockPool::kBlockAlign) {
+            if (void* block = TaskBlockPool::Instance().Acquire(bytes,
+                                                                alignof(T))) {
+                return static_cast<T*>(block);
+            }
+        }
+        return static_cast<T*>(::operator new(bytes,
+                                             std::align_val_t(alignof(T))));
+    }
+
+    void deallocate(T* p, std::size_t n) noexcept {
+        if (p == nullptr) {
+            return;
+        }
+        const std::size_t bytes = n * sizeof(T);
+        if (n == 1U && bytes <= TaskBlockPool::kMaxPooledBlock &&
+            alignof(T) <= TaskBlockPool::kBlockAlign) {
+            TaskBlockPool::Instance().Release(p, bytes);
+            return;
+        }
+        ::operator delete(p, bytes, std::align_val_t(alignof(T)));
+    }
+
+    template <typename U>
+    bool operator==(const TaskBlockAllocator<U>&) const noexcept {
+        return true;
+    }
+    template <typename U>
+    bool operator!=(const TaskBlockAllocator<U>&) const noexcept {
+        return false;
+    }
+};
+
+
+
+/// @brief CPU 自旋提示（x86 `pause` / ARM `yield`）。
+/// @details 空闲自旋等待新工作时用它替代裸空转：pause 让 HT 兄弟核拿到
+///          执行端口，同时避免空转循环把分支预测和流水线打满。
+inline void CpuRelax() noexcept {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
+/// @brief 空闲 worker 在进入条件变量等待前的自旋轮数。
+/// @details 每轮只读 runnable/stopping 两个原子 + 一条 pause（约 10~15ns），
+///          512 轮 ≈ 5~7µs。持续空闲时每个 idle_wait 周期只烧这么多 CPU，
+///          可以忽略；而短任务 churn 下它让 worker 不必为每个 G 付一次
+///          futex 睡眠/唤醒往返（1~3µs）。
+constexpr std::size_t kIdleSpinRounds = 512;
+
+
 }  // namespace
 
 // Tasks retain only a weak handle. This short gate excludes Scheduler
@@ -643,7 +891,9 @@ bool Task::terminal() const noexcept {
 }
 
 bool Task::wait() const {
-    if (Scheduler::current_task().get() == this) {
+    // 自等待检测只需要指针比较：current_task() 会复制一份 shared_ptr，
+    // 在 join 热路径上白付两次控制块原子操作。
+    if (Scheduler::current_task_ptr() == this) {
         return false;
     }
     // 完成快路径：join 绝大多数发生在 G 已进入终态之后，此时不需要
@@ -651,32 +901,27 @@ bool Task::wait() const {
     if (terminal()) {
         return true;
     }
-    const std::uint32_t seq = m_completion_seq.load(std::memory_order_seq_cst);
+    // 谓词只看终态：GState 的终态不可逆，序号只用于让「通知先于登记」
+    // 的窗口可见，而终态本身已经承担了同一职责（notify_terminal 在
+    // 状态发布之后才读等待者数，见那里的 Dekker 论证）。
     std::unique_lock<std::mutex> lock(m_completion_mutex);
     m_completion_waiters.fetch_add(1, std::memory_order_seq_cst);
-    const bool done = m_completion_condition.wait(lock, [this, seq] {
-        return terminal() ||
-               m_completion_seq.load(std::memory_order_seq_cst) != seq;
-    });
+    m_completion_condition.wait(lock, [this] { return terminal(); });
     m_completion_waiters.fetch_sub(1, std::memory_order_seq_cst);
-    return done;
+    return true;
 }
 
 bool Task::wait_for(std::chrono::steady_clock::duration timeout) const {
-    if (Scheduler::current_task().get() == this) {
+    if (Scheduler::current_task_ptr() == this) {
         return false;
     }
     if (terminal()) {
         return true;
     }
-    const std::uint32_t seq = m_completion_seq.load(std::memory_order_seq_cst);
     std::unique_lock<std::mutex> lock(m_completion_mutex);
     m_completion_waiters.fetch_add(1, std::memory_order_seq_cst);
     const bool done = m_completion_condition.wait_for(
-        lock, timeout, [this, seq] {
-            return terminal() ||
-                   m_completion_seq.load(std::memory_order_seq_cst) != seq;
-        });
+        lock, timeout, [this] { return terminal(); });
     m_completion_waiters.fetch_sub(1, std::memory_order_seq_cst);
     return done;
 }
@@ -685,15 +930,23 @@ void Task::notify_terminal() noexcept {
     if (m_completion_notified.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
-    // 发布完成序号。等待方在谓词里用同一个字做 seq_cst 读，于是两者构成
-    // 一条全序：notifier 的「写序号 → 读等待者数」与等待方的「增等待者数
-    // → 读序号」要么让 notifier 看到等待者（走加锁 + notify_all，并在
-    // 持锁期间与等待方的 Arm 串行化），要么让等待方在谓词里直接看到序号
-    // 已推进而不再睡眠。两种情形都不会丢唤醒。
-    m_completion_seq.fetch_add(1, std::memory_order_seq_cst);
+    // 无等待者时零开销：绝大多数 G 从来没人 join，旧实现在这里无条件做
+    // 一次 seq_cst fetch_add（x86 上是 lock xadd，~20-40 cycles）。
+    //
+    // 正确性（Dekker）：本函数只在状态已以 release 发布为终态之后调用。
+    // notifier: [S] store(terminal, release) → [L] load(waiters, seq_cst)；
+    // waiter:   [P] load(terminal, acquire) → [A] lock → [W] waiters++
+    //           (seq_cst) → [R] 谓词里 load(terminal, acquire)。
+    // L 与 W 都是 seq_cst，构成全序：
+    //  - 若 L 在 W 之前（读到 0）：W 在 S 之后，R 在 W 之后，故 R 必看到
+    //    终态，waiter 不睡；
+    //  - 若 W 在 L 之前：L 看到等待者，走加锁 + notify_all，而 waiter 的
+    //    Arm 在持锁状态下完成，通知不会落在 Arm 之前。
+    // 两条路径都不会丢唤醒，因此序号自增可以只在「确实有人等」时做。
     if (m_completion_waiters.load(std::memory_order_seq_cst) == 0) {
         return;
     }
+    m_completion_seq.fetch_add(1, std::memory_order_seq_cst);
     // 有等待者时必须持锁再通知：等待方在持锁状态下完成「登记 + 谓词复查」，
     // 拿到这把锁才能保证通知发生在登记之后。
     {
@@ -1687,7 +1940,12 @@ public:
      *          必然重新检查队列，因此不会丢工作。
      */
     void notify_worker() noexcept {
-        condition.notify_one();
+        // 没有等待者时跳过 notify_one：glibc 的 pthread_cond_signal 即使
+        // 无人等待也要读 __wrefs/__wseq 并做 futex 记账（~20-50 cycles），
+        // 而 4P/4M 空任务 churn 下这是每个 G 都走一次的路径。
+        if (sleeping_workers.load(std::memory_order_relaxed) != 0) {
+            condition.notify_one();
+        }
         const IoIdlePoller* poller = io_poller.load(std::memory_order_acquire);
         if (poller != nullptr && poller->wake &&
             io_waiting_workers.load(std::memory_order_acquire) != 0) {
@@ -2489,6 +2747,13 @@ public:
     // 当前正停在 IO 后端 epoll_wait 里的 worker 数。只有它非零时 notify
     // 才需要写 eventfd。
     std::atomic<std::size_t> io_waiting_workers{0};
+    // 正睡在 condition 上的 worker 数。notify_worker() 只在这个计数非零
+    // 时才调用 condition.notify_one()：唤醒一个没有等待者的条件变量在
+    // glibc 里仍要做原子读与 futex 记账，短任务 churn 下这是提交侧的
+    // 固定成本。计数在 worker 进入 wait_for 之前递增、返回后递减，与
+    // 谓词（runnable != 0）配合不会丢唤醒：enqueue 先加 runnable 再
+    // notify，worker 无论看到哪个顺序都不会睡过新工作。
+    std::atomic<std::size_t> sleeping_workers{0};
     std::deque<std::shared_ptr<Task>> global_queue;
     std::shared_ptr<Task> emergency_head;
     std::shared_ptr<Task> emergency_tail;
@@ -2728,7 +2993,8 @@ bool Scheduler::run_main(Task::Function function) {
         m_impl->processors[0].active_machines.fetch_add(
             1, std::memory_order_relaxed);
     }
-    auto task = std::make_shared<Task>(std::move(function));
+    auto task = std::allocate_shared<Task>(TaskBlockAllocator<Task>{},
+                                          std::move(function));
     // 绑定到本 M：调度器只把 main G 投进这台 M 的定向槽；别的 M 从队列
     // 误取到时，worker_loop 会把它重定向回来。
     task->m_locked_machine.store(machine->id, std::memory_order_release);
@@ -3155,7 +3421,8 @@ std::shared_ptr<Task> Scheduler::spawn(Task::Function function,
     if (options.fiber_bin_capacity == 0) {
         options.fiber_bin_capacity = m_impl->config.fiber_bin_capacity;
     }
-    auto task = std::make_shared<Task>(std::move(function), options);
+    auto task = std::allocate_shared<Task>(TaskBlockAllocator<Task>{},
+                                          std::move(function), options);
     GO2CPP_DEBUG_EVENT(kGCreated, task ? task->id() : 0, 0);
     if (!enqueue(task)) {
         task->cancel();
@@ -3290,6 +3557,24 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
     // use the short incoming queue and never contend with worker dequeue.
     if (!from_worker && !drain_resume) {
         bool published = false;
+        // ---- 外部生产者直投 P 队列（Go runqput 的等价路径）----------
+        // 旧路径把每个外部任务都塞进 incoming 条带：一次条带锁 + 一次
+        // deque 节点分配 + 三个跨核原子（runnable / incoming_count /
+        // nonempty_mask）。rdtsc 分段实测占提交侧 415ns（总 1258ns）。
+        // 本地环本来就是无锁 MPMC（tail 用 CAS 仲裁，多生产者也安全），
+        // 直投它只需一次 CAS + 一次 runnable 记账；环满（256 槽）时才
+        // 回退到 incoming 条带，因此长队列/积压语义完全保留。
+        if (m_impl->accepting() && !m_impl->stopping()) {
+            const auto direct = m_impl->next_processor.fetch_add(
+                1, std::memory_order_relaxed);
+            auto& direct_processor =
+                m_impl->processors[direct % m_impl->processors.size()];
+            if (direct_processor.queue.push(task)) {
+                m_impl->runnable.fetch_add(1, std::memory_order_relaxed);
+                published = true;
+            }
+        }
+        if (!published) {
         // 同一生产者固定到同一条带，保留单生产者提交的 FIFO；第一次
         // 进入时才从全局分配条带，后续任务不再为选择条带做原子递增。
         static thread_local std::size_t t_incoming_stripe =
@@ -3321,6 +3606,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
                     m_impl->runnable.fetch_sub(1, std::memory_order_relaxed);
                 }
             }
+        }
         }
         if (!published) {
             if (task->started()) {
@@ -4972,10 +5258,11 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
         // 绝大多数 yield 回来的 G 都会回到原 P。本地队列由同一 P 的
         // worker 独占消费；只有本地为空时才进入需要全局 admission 锁的
         // 全局队列/窃取路径。
+        // 外部生产者现在直投本地环（见 enqueue），因此这里不能再要求
+        // 「积压超过 P 数」才取本地环 —— 那会让刚投进来的 G 停在环里
+        // 无人消费。无条件尝试一次 pop：环空时只是一次 head/tail 读。
         if (!task && !m_impl->stopping() &&
-            m_impl->running_workers.load(std::memory_order_acquire) != 0 &&
-            m_impl->runnable.load(std::memory_order_acquire) >
-                m_impl->processors.size()) {
+            m_impl->running_workers.load(std::memory_order_acquire) != 0) {
             task = own_processor.queue.pop();
             if (task) {
                 local_queue_pop = true;
@@ -5680,6 +5967,34 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             // 的条件变量等待，避免忙循环。
         }
 
+        // ------------------------------------------------------------------
+        // 空闲自旋（Go 的 spinning M）：短任务 churn 下生产者交付下一个 G
+        // 只要几百纳秒，而一次「condition_variable 睡眠 → futex 唤醒」往返
+        // 是 1~3µs。没有这段自旋时，空闲 worker 每处理一个空任务都要先睡
+        // 再被 futex 叫醒：实测 4P/4M 空任务 churn 的提交循环结束时任务
+        // 已全部执行完（说明瓶颈是唤醒而非执行），1P 下提交侧 1055ns/task
+        // 也几乎全是这次往返。
+        //
+        // 自旋有界（kIdleSpinRounds 次 pause），期间只读 runnable / stopping
+        // 两个原子，不碰任何队列锁；轮数用尽后仍回落到条件变量等待，
+        // 因此空闲 CPU 占用与 shutdown 收敛性都不变。
+        for (std::size_t spin = 0; spin < kIdleSpinRounds; ++spin) {
+            if (m_impl->runnable.load(std::memory_order_acquire) != 0 ||
+                m_impl->stopping() ||
+                m_impl->main_done.load(std::memory_order_acquire)) {
+                break;
+            }
+            CpuRelax();
+        }
+        if (m_impl->runnable.load(std::memory_order_acquire) != 0) {
+            // 有新工作：回主循环重扫（下次进入这里时重新获得完整自旋预算）。
+            continue;
+        }
+        if (m_impl->stopping() ||
+            m_impl->main_done.load(std::memory_order_acquire)) {
+            continue;
+        }
+
         machine->state.store(MState::kParked, std::memory_order_release);
         GO2CPP_DEBUG_EVENT_SAMPLED(
             kWorkerPark, machine->id,
@@ -5700,6 +6015,11 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
 #else
         std::unique_lock<std::mutex> lock(m_impl->mutex);
 #endif
+        // 登记「本 M 即将睡在 condition 上」：notify_worker() 依据这个
+        // 计数决定是否需要 condition.notify_one()。必须在检查谓词之前
+        // 递增 —— 生产者先加 runnable 再读该计数，两者配合保证不会
+        // 「生产者看到 0 不 notify，worker 随后睡下」而丢唤醒。
+        m_impl->sleeping_workers.fetch_add(1, std::memory_order_relaxed);
         if (m_impl->finish_draining_locked()) {
             lock.unlock();
             m_impl->notify_all_workers();
@@ -5755,6 +6075,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                        m_impl->blocking_workers.load(
                            std::memory_order_acquire) == 0;
             });
+        m_impl->sleeping_workers.fetch_sub(1, std::memory_order_relaxed);
         // 退休判定与计数修改仍在同一个持锁临界区内：wait_for 返回后锁没有
         // 释放，因此这里的 runnable/blocking 观测即最终状态，不会出现
         // 「判定空闲后、置 kStopping 前」被新 G 插队的窗口。
