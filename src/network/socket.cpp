@@ -162,6 +162,8 @@ Socket::Socket(int family, int type, int protocol, int fd, bool owner)
         }
         errno = saved_errno;
         FdManager::instance().get(m_fd, true);
+        // 无锁快照：必须在对象对外可见（FromFd 返回）之前发布。
+        m_fd_fast.store(m_fd, std::memory_order_release);
 #if GO2CPP_SOCKET_OBSERVER
         // 唯一创建点：socket()/socketpair()/accept4() 出来的 fd 都经过这里
         // 进入观察者；构造失败（init_nonblock 失败）时不发通知。
@@ -197,57 +199,101 @@ Socket::Ptr Socket::CreateUnix(bool datagram) {
  * 都必须先走这里：它保证「关闭」不会在系统调用中途把 fd 抽走。上层的
  * `SocketStream`、`http2::FiberTransport`、benchmark 的服务端循环都依赖它。
  *
- * ## 步骤
- * step1. `shared_from_this()` 取一份自引用 —— 即使调用方随后释放最后一个
- *        `Socket::Ptr`，对象也会活到 `end_operation()`；
- * step2. 在 `m_mutex` 下检查 `m_closing`/`m_fd`，已关闭则 EBADF 返回；
- * step3. 首个在途操作把自引用存进 `m_inflight_keepalive`（只在 inflight==0
- *        时写，避免每次操作都改这个字段）；
- * step4. `++m_inflight` 后把 fd 拷给调用方。
+ * ## 热路径（不加锁）
+ * step1. `m_inflight.fetch_add(1, acq_rel)` —— 唯一一次原子 RMW；
+ * step2. 读 `m_closing_flag`（seq_cst）：关闭已开始则回滚并返回 EBADF；
+ * step3. **只有 0→1 边界**才 `shared_from_this()` 提升一次自引用并存进
+ *        `m_inflight_keepalive`；其余在途操作直接复用，不再每包一次原子提升
+ *        （原来每次 recv/send 都要 weak→strong 再析构，共两次原子 RMW）；
+ * step4. 读 `m_fd_fast` 快照并返回给调用方（每次 op 不再抢 m_mutex）。
+ *
+ * ## 与关闭的线性化（为什么无锁也安全）
+ * 关闭方先 `m_closing_flag.store(true, release)`，再等 `m_inflight` 归零；
+ * 两侧的 RMW/读都用 seq_cst（或与之构成 acquire/release 的 acq_rel），因此：
+ *  - begin 的 fetch_add 若发生在关闭方读 inflight 之前，关闭方看到 ≥1，
+ *    不会关闭 fd；begin 随后读到 closing=true，回滚并返回 EBADF，绝不把
+ *    可能被复用的旧 fd 交给系统调用；
+ *  - 反之关闭方先看到 0 并关闭 fd，begin 的 closing 检查（seq_cst）必然
+ *    读到 true，同样回滚。
+ * 两条路径都不存在「用已关闭 fd 做系统调用」的窗口，也不需要每 op 加锁。
  *
  * ## 配对
  * 必须与 `end_operation()` 成对；漏掉会让 `release()` 永远等不到 inflight 归零，
  * 关闭路径卡死。
  */
 bool Socket::begin_operation(int& fd) noexcept {
+    const std::size_t prev = m_inflight.fetch_add(1, std::memory_order_acq_rel);
+    if (m_closing_flag.load(std::memory_order_seq_cst)) {
+        end_operation();  // 走统一归零路径：可能正是关闭者等待的最后一次递减。
+        errno = EBADF;
+        return false;
+    }
+    if (prev == 0 && !InstallKeepalive()) {
+        end_operation();
+        errno = EBADF;
+        return false;
+    }
+    const int snapshot = m_fd_fast.load(std::memory_order_acquire);
+    if (snapshot < 0) {
+        end_operation();
+        errno = EBADF;
+        return false;
+    }
+    fd = snapshot;
+    return true;
+}
+/**
+ * @brief 0→1 边界安装自引用：整个生命周期内最多调用一次（每次「从空闲到
+ *        有在途操作」的转换一次），把原来的每包两跳原子引用计数降为零。
+ * @return 成功返回 true；对象不是 shared_ptr 管理（或关闭已开始）返回 false。
+ * @note 拿锁是为了与 `end_operation()` 的归零释放配对；热路径（inflight>0）
+ *       不经过这里，因此不影响 send/recv 的开销。
+ */
+bool Socket::InstallKeepalive() noexcept {
     std::shared_ptr<Socket> keep_alive;
     try {
         keep_alive = shared_from_this();
     } catch (...) {
-        errno = EBADF;
         return false;
     }
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_closing || m_fd < 0) { errno = EBADF; return false; }
-    if (m_inflight == 0) {
+    // 拿锁期间关闭可能已经开始：再确认一次，避免给正在关闭的对象续命。
+    if (m_closing_flag.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (m_inflight_keepalive == nullptr) {
         m_inflight_keepalive = std::move(keep_alive);
     }
-    fd = m_fd;
-    ++m_inflight;
     return true;
 }
 /**
  * @brief 结束一次在途操作；关闭正在等待时，这里是收尾点。
  *
  * ## 步骤
- * step1. `--m_inflight`，在锁内判断是否成为最后一个在途操作；
- * step2. 归零时把 `m_inflight_keepalive` 移到局部变量 —— 保证锁外收尾期间
- *        对象不被析构；
+ * step1. `m_inflight.fetch_sub(1)`，热路径直接返回（还有别的在途操作）；
+ * step2. 归零时在 `m_mutex` 下把 `m_inflight_keepalive` 移到局部变量 ——
+ *        保证锁外收尾期间对象不被析构；只有这一刻需要加锁；
  * step3. 若 `m_closing` 且归零：**先** `notify_all` 唤醒 `wait_close_state()`
  *        的等待者，**再** `finalize_deferred_close()`（顺序不能反：关闭者需要
  *        先看到 inflight==0 的谓词成立才继续）。
+ * @note 计数异常（重复 end）时恢复 0，避免无符号下溢把关闭路径永久卡住。
  */
 void Socket::end_operation() noexcept {
+    const std::size_t prev = m_inflight.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev == 0) {
+        m_inflight.store(0, std::memory_order_release);
+        return;
+    }
+    if (prev > 1) {
+        return;
+    }
     bool notify = false;
     std::shared_ptr<Socket> keep_alive;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_inflight > 0) --m_inflight;
-        notify = m_closing && m_inflight == 0;
-        if (m_inflight == 0) {
-            // 将 self-reference 移到局部变量，确保锁外收尾完成前对象仍存活。
-            keep_alive = std::move(m_inflight_keepalive);
-        }
+        notify = m_closing && m_inflight.load(std::memory_order_relaxed) == 0;
+        // 将 self-reference 移到局部变量，确保锁外收尾完成前对象仍存活。
+        keep_alive = std::move(m_inflight_keepalive);
     }
     if (notify) {
         // 等待者在同一把 m_mutex 下检查 m_inflight 并发布 ParkingCondition
@@ -259,7 +305,8 @@ void Socket::end_operation() noexcept {
 bool Socket::wait_close_state(bool wait_fd_closed) noexcept {
     std::unique_lock<std::mutex> lock(m_mutex);
     return m_operation_condition.wait(lock, [this, wait_fd_closed] {
-        return wait_fd_closed ? (m_fd < 0) : (m_inflight == 0);
+        return wait_fd_closed ? (m_fd < 0)
+                              : (m_inflight.load(std::memory_order_acquire) == 0);
     });
 }
 void Socket::finalize_deferred_close() noexcept {
@@ -267,11 +314,14 @@ void Socket::finalize_deferred_close() noexcept {
     bool owner = false;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_close_pending || m_inflight != 0 || m_fd < 0) return;
+        if (!m_close_pending || m_inflight.load(std::memory_order_acquire) != 0 || m_fd < 0) {
+            return;
+        }
         // 在状态锁内一次性摘除 fd，保证只有一个最终关闭者。
         fd = m_fd;
         owner = m_owner;
         m_fd = -1;
+        m_fd_fast.store(-1, std::memory_order_release);
         m_owner = false;
         m_connected = false;
         m_close_pending = false;
@@ -291,7 +341,11 @@ bool Socket::is_closing() const noexcept {
     // 因此单次 acquire 读即可回答「还能不能用」，不必再抢 m_mutex。
     return m_closing_flag.load(std::memory_order_acquire);
 }
-int Socket::fd() const noexcept { std::lock_guard<std::mutex> lock(m_mutex); return m_fd; }
+int Socket::fd() const noexcept {
+    // 无锁快照（与 begin_operation 取到的是同一个发布点）；语义仍是「瞬时值」，
+    // 调用方不应跨系统调用持有它。
+    return m_fd_fast.load(std::memory_order_acquire);
+}
 bool Socket::valid() const noexcept { return fd() >= 0; }
 bool Socket::connected() const noexcept { std::lock_guard<std::mutex> lock(m_mutex); return m_connected; }
 Socket::Duration Socket::recv_timeout() const noexcept { return Duration(m_recv_timeout.load(std::memory_order_relaxed)); }
@@ -359,6 +413,7 @@ int Socket::release() noexcept {
     }
     lock.lock();
     m_fd = -1; m_owner = false; m_connected = false;
+    m_fd_fast.store(-1, std::memory_order_release);
     lock.unlock();
     if (fd >= 0) FdManager::instance().erase(fd);
 #if GO2CPP_SOCKET_OBSERVER
@@ -541,6 +596,7 @@ bool Socket::close() noexcept {
     }
     lock.lock();
     m_fd = -1; m_connected = false;
+    m_fd_fast.store(-1, std::memory_order_release);
     lock.unlock();
     FdManager::instance().erase(fd);
     m_operation_condition.notify_all();

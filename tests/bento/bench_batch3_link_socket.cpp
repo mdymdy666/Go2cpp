@@ -21,6 +21,7 @@
  * @copyright MIT License
  */
 
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -198,7 +199,7 @@ void PrintTx(const char* name, std::uint64_t probes, std::uint64_t ok, const Sam
 
 /// @brief 与真实测量同节奏的空转对照：只做时间测量，不调 Send。
 void RunSpinCase() {
-    constexpr int kSamples = 5000;
+    constexpr int kSamples = 1000;
     constexpr double kIntervalNs = 200e3;
     Samples samples(kSamples);
     double next = NowNs();
@@ -261,22 +262,40 @@ void RunLinkTxCase(const char* name, bool busy) {
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
 
-    constexpr int kSamples = 5000;
+    constexpr int kSamples = 1000;
     constexpr double kIntervalNs = 200e3;  // 200µs 一个探测点
     std::uint8_t payload[64];
     std::memset(payload, 0xA5, sizeof(payload));
     Samples samples(kSamples);
     std::uint64_t sent = 0;
+    int slow_count = 0;
+    const double case_deadline = NowNs() + 60e9;  // 防止锁饥饿把基准拖成无限长
     double next = NowNs();
     for (int i = 0; i < kSamples; ++i) {
+        if (NowNs() > case_deadline) {
+            break;
+        }
         next += kIntervalNs;
         while (NowNs() < next) {
             // 自旋到下一个探测点，避免 sleep 粒度把样本噪声放大。
         }
+        rusage ru_begin{};
+        getrusage(RUSAGE_THREAD, &ru_begin);
         const double begin = NowNs();
         const double cpu_begin = ThreadCpuNs();
         sent += client.SendDatagram(1, payload, sizeof(payload)) ? 1 : 0;
-        samples.Add((NowNs() - begin) / 1000.0, (ThreadCpuNs() - cpu_begin) / 1000.0);
+        const double wall_us = (NowNs() - begin) / 1000.0;
+        const double cpu_us = (ThreadCpuNs() - cpu_begin) / 1000.0;
+        rusage ru_end{};
+        getrusage(RUSAGE_THREAD, &ru_end);
+        samples.Add(wall_us, cpu_us);
+        if (wall_us > 1000.0 && slow_count < 8) {
+            ++slow_count;
+            std::fprintf(stderr,
+                         "[%s] slow i=%d wall=%.0fus cpu=%.1fus nivcsw=%ld nvcsw=%ld\n", name, i,
+                         wall_us, cpu_us, ru_end.ru_nivcsw - ru_begin.ru_nivcsw,
+                         ru_end.ru_nvcsw - ru_begin.ru_nvcsw);
+        }
     }
     flood_stop.store(true);
     if (flood_thread.joinable()) {
@@ -289,7 +308,7 @@ void RunLinkTxCase(const char* name, bool busy) {
     if (client_thread.joinable()) {
         client_thread.join();
     }
-    PrintTx(name, kSamples, sent, samples, server_received.load(), client_received.load());
+    PrintTx(name, samples.size(), sent, samples, server_received.load(), client_received.load());
 }
 
 // ---------------------------------------------------------------------------
@@ -497,6 +516,81 @@ void RunTcpRtt(std::uint64_t rounds) {
     listener->close();
 }
 
+// ---------------------------------------------------------------------------
+// sock_mt：多线程并发 send（一个 Socket 被 8 个线程同时发 20 万包）
+// ---------------------------------------------------------------------------
+// 这是 Socket 去锁优化最能体现收益的场景：基线每个 op 都要抢该 Socket 的
+// `m_mutex`，去锁后只剩 in-flight 计数器的一次原子加法。
+void RunSharedSocketMultiThreadTimed(int threads, std::uint64_t per_thread) {
+    auto receiver = go2cpp::net::Socket::CreateUDP(AF_INET);
+    auto any_addr = go2cpp::net::ResolveUDPAddr("127.0.0.1", 0);
+    if (!receiver || !any_addr || !receiver->bind(*any_addr)) {
+        std::fprintf(stderr, "[sock_mt] setup failed\n");
+        return;
+    }
+    auto receiver_addr = receiver->local_address();
+    if (!receiver_addr) {
+        return;
+    }
+    // 接收线程必须带超时，否则 stop 置位后仍会无限阻塞在 recv_from。
+    (void)receiver->set_recv_timeout(go2cpp::net::Socket::Duration(50));
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> received{0};
+    std::thread receiver_thread([&]() {
+        std::uint8_t buffer[256];
+        while (!stop.load(std::memory_order_relaxed)) {
+            go2cpp::net::AddressPtr from;
+            const auto result = receiver->recv_from(buffer, sizeof(buffer), from);
+            if (result.transferred > 0) {
+                received.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    });
+    auto shared = go2cpp::net::Socket::CreateUDP(AF_INET);
+    if (!shared->connect(*receiver_addr)) {
+        stop.store(true);
+        receiver_thread.join();
+        return;
+    }
+    std::uint8_t payload[64];
+    std::memset(payload, 0x5C, sizeof(payload));
+    std::atomic<std::uint64_t> sent{0};
+    std::atomic<int> ready{0};
+    const double cpu_before = ProcessCpuNs();
+    const double begin = NowNs();
+    std::vector<std::thread> senders;
+    senders.reserve(static_cast<std::size_t>(threads));
+    for (int i = 0; i < threads; ++i) {
+        senders.emplace_back([&]() {
+            ready.fetch_add(1, std::memory_order_release);
+            while (ready.load(std::memory_order_acquire) < threads) {
+            }
+            for (std::uint64_t n = 0; n < per_thread; ++n) {
+                const auto result = shared->send(payload, sizeof(payload));
+                if (result.transferred > 0) {
+                    sent.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (std::thread& sender : senders) {
+        sender.join();
+    }
+    const double elapsed_ns = NowNs() - begin;
+    const double cpu_ns = ProcessCpuNs() - cpu_before;
+    stop.store(true, std::memory_order_relaxed);
+    receiver_thread.join();
+    shared->close();
+    receiver->close();
+    std::printf(
+        "[sock_mt] threads=%d sent=%llu rx=%llu ops_per_s=%.0f cpu_ns_per_op=%.1f\n", threads,
+        static_cast<unsigned long long>(sent.load()),
+        static_cast<unsigned long long>(received.load()),
+        static_cast<double>(sent.load()) / (elapsed_ns / 1e9),
+        cpu_ns / static_cast<double>(sent.load()));
+    std::fflush(stdout);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -521,6 +615,9 @@ int main(int argc, char** argv) {
         RunUnixPairRtt(200000);
         RunUdpRtt(100000);
         RunTcpRtt(100000);
+    }
+    if (mode == "sock_mt" || mode == "all") {
+        RunSharedSocketMultiThreadTimed(8, 200000);
     }
     return 0;
 }

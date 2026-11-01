@@ -215,10 +215,18 @@ public:
     bool cancel_write() noexcept;
 
 private:
-    /** @brief 为一次系统调用固定 fd 和代际，阻止 close 期间新操作进入。 */
+    /**
+     * @brief 为一次系统调用固定 fd 和代际，阻止 close 期间新操作进入。
+     * @details 热路径**不加锁**：一次 `m_inflight.fetch_add` + 两次原子读
+     *          （关闭标志、fd 快照）。自引用只在 0→1 边界提升一次并缓存到
+     *          `m_inflight_keepalive`，不再每次操作 `shared_from_this()`。
+     *          与 `close()` 的线性化见 socket.cpp 的实现注释。
+     */
     bool begin_operation(int& fd) noexcept;
     /** @brief 系统调用结束后减少 in-flight 计数并唤醒关闭者。 */
     void end_operation() noexcept;
+    /** @brief 0→1 边界安装自引用；对象不由 shared_ptr 管理时返回 false。 */
+    bool InstallKeepalive() noexcept;
     /**
      * @brief 等待关闭流程达到指定状态。
      * @param wait_fd_closed 为 true 时等待 fd 彻底失效，否则只等待在途操作归零。
@@ -268,7 +276,14 @@ private:
     // ParkingCondition 复用 m_mutex 保护的谓词，普通线程阻塞等待、受管
     // Fiber park；close/release 等待在途操作时不会占住 M，也不会丢通知。
     core::ParkingCondition m_operation_condition;
-    std::size_t m_inflight{0};
+    // in-flight 计数改成原子：send/recv 热路径只做一次 fetch_add/fetch_sub，
+    // 不再为每次系统调用抢 m_mutex；只有 0↔1 边界与关闭路径才碰锁。
+    // 谓词（等待 inflight 归零）用 acquire 读，保证 fd 关闭前的可见性。
+    std::atomic<std::size_t> m_inflight{0};
+    // m_fd 的无锁只读快照：begin_operation 免锁取 fd；所有写 m_fd 的路径
+    // （构造失败 / close / release / 延迟关闭）都必须在同一临界区内同步它，
+    // 且顺序为「先置 m_closing_flag，再更新此快照」，见 socket.cpp。
+    std::atomic<int> m_fd_fast{-1};
     // 在途操作期间自持有对象，防止最后一个外部 shared_ptr 释放后提前析构。
     std::shared_ptr<Socket> m_inflight_keepalive;
     bool m_closing{false};
