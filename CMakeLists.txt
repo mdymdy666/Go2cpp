@@ -82,3 +82,6 @@ include(cmake/Go2CppGoApi.cmake)
 # 校验和 + 半包重组，默认 ON（-DGO2CPP_WITH_FRAME=OFF 关闭）。测试目标
 # go2cpp_frame_codec_test 由该文件定义；RDRL/RDCH 对接见 docs/modules/frame-codec.md。
 include(cmake/Go2CppFrame.cmake)
+
+# 嵌入式存储（SQLite，GO2CPP_WITH_SQLITE 默认 OFF）。
+include(cmake/Go2CppStorage.cmake)
