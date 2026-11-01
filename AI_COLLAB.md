@@ -649,3 +649,37 @@ errno noinline），不是寄存器保存。
     10ms 心跳抖动 P99=0ms（load average ≈3.8，数字偏保守）。
 - **状态**：完成，未提交（多 agent 共享工作树）。报告：`/tmp/hub_lease.md`。
   已知边界：未接入 install(EXPORT)；每 Lease/Heartbeat 一个线程；Hub 单锁未分片。
+
+## 2026-11-01 WebRTC 媒体端到端（M0+M1）
+
+- **改动内容**
+  - 新增 `go2cpp::media`：X11 XShm 采集 → 编码（raw-bgra / raw-i420 / 自研 16x16 块差分
+    `delta-i420`（无损）/ H.264 探测）→ Bento `VideoChannel` 1200B 分片 → UDP 回环 →
+    重组 → 解码 → SDL2/无头渲染；延迟以 32B `MediaHeader` 的 `capture_ns` 为时基，
+    输出 p50/p99/p999。
+  - 复用**未修改**的 `bento::VideoChannel` 分片/重组；新增 `MediaHeader`
+    （magic `G2MF` + codec + w/h + frame_id + payload_len + capture_ns）。
+  - 差分编码：16x16 宏块脏块 bitmap + 块内 RLE，I420 域内逐字节无损；静止帧收敛到
+    36B/帧；每 N 帧强制关键帧，丢帧后自愈。
+  - 构建：新增 `cmake/Go2CppMedia.cmake`（`-DGO2CPP_WITH_MEDIA=ON`，默认 OFF），
+    顶层 `CMakeLists.txt` 追加一行 include；media 只编译 Bento 的
+    protocol/relation/congestion/bandwidth/fec/channel 六个 TU
+    （`go2cpp_media_bento_core`），不链接 link/peer_hub 等无关目标——既缩小依赖面，
+    也让并行开发期间媒体模块可独立构建。
+- **关键文件**：`include/go2cpp/media/*.hpp`（8）、`src/media/*.cpp`（11 +
+  `codec_internal.hpp`）、`tests/media/*.cpp`（7 + `media_test_util.hpp`）、
+  `cmake/Go2CppMedia.cmake`、`docs/modules/webrtc-media.md`。
+- **测试**（`.build-bento-wsl`，Release；`ctest -R media_`）
+  - `media_frame` / `media_codec` / `media_capture` / `media_transport` /
+    `media_render` / `media_e2e` / `media_h264` 全 PASS（7/7，2.1s，1102 断言）。
+  - 端到端 8 场景逐帧校验：static 100 帧 p50=0.24ms / p99=0.36ms / 2038fps；
+    patch 100 帧 p99=0.98ms；X11 真实采集 30 帧 p99=1.00ms；
+    丢 1 分片 → 该帧丢弃 → 强制关键帧后逐字节一致。
+  - 差分编码：静止 128x96 关键帧 18512B → 差分帧 36B（514x）；噪声压缩比 1.004。
+  - H.264：`h264_nvenc` / `libx264` 各 30 帧，PSNR 37.09 / 37.08 dB。
+- **环境限制**（实测，已写进模块文档）：`XGetImage` 抓 WSLg root window 必 BadMatch
+  → 只能走 XShm；`net.core.rmem_max=208KB` → 单帧突发 >300KB 丢包（默认 320x240）；
+  无 libavcodec/x264/vpx 开发头文件 → H.264 只能子进程或探测。
+- **状态**：完成 M0+M1，未提交（多 agent 共享工作树）。报告：`/tmp/webrtc_media.md`。
+  已知边界：无 DTLS/SRTP、ICE、GCC/码率自适应、jitter buffer；帧格式是 Bento 自研，
+  不兼容 RTP；1080p 受 rmem_max 与单帧分片上限限制。
