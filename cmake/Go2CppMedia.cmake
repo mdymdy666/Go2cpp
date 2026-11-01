@@ -89,7 +89,10 @@ if (GO2CPP_WITH_MEDIA)
         # 弱网收尾：包级抖动缓冲（重排/去重/丢包检测/自适应深度）与
         # 降级策略（分辨率/帧率/码率/断线重连）。
         ${CMAKE_CURRENT_SOURCE_DIR}/src/media/jitter_buffer.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/degradation.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/degradation.cpp
+        # 音频链路：PulseAudio/ALSA 子进程采集与播放、G.711/PCM/Opus（dlopen）、
+        # RTP 风格分片/重组、抖动缓冲；不修改既有视频链路。
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio.cpp)
 
     target_include_directories(go2cpp_media
         PUBLIC
@@ -150,11 +153,14 @@ if (GO2CPP_WITH_MEDIA)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_jitter_buffer.cpp)
         add_executable(media_test_degradation
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_degradation.cpp)
+        # 音频：1e5 帧 PCM 一致、G.711 穷举、Opus 往返、RTP 分片/重组、抖动缓冲、
+        # UDP 回环、Pulse 采集/播放 smoke、1e7 压测。
+        add_executable(media_test_audio ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_audio.cpp)
 
         foreach(media_test media_test_frame media_test_codec media_test_capture
                 media_test_transport media_test_render media_test_e2e media_test_h264
                 media_test_sfu media_test_signaling media_test_jitter_buffer
-                media_test_degradation)
+                media_test_degradation media_test_audio)
             target_include_directories(${media_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/media)
             target_link_libraries(${media_test} PRIVATE go2cpp_media)
             target_compile_options(${media_test} PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -171,12 +177,13 @@ if (GO2CPP_WITH_MEDIA)
         add_test(NAME media_signaling COMMAND media_test_signaling)
         add_test(NAME media_jitter_buffer COMMAND media_test_jitter_buffer)
         add_test(NAME media_degradation COMMAND media_test_degradation)
+        add_test(NAME media_audio COMMAND media_test_audio)
         set_tests_properties(media_frame media_codec media_capture media_transport
             media_render media_e2e media_h264 media_sfu media_signaling
-            media_jitter_buffer media_degradation
+            media_jitter_buffer media_degradation media_audio
             PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
 
-        message(STATUS "Media pipeline: tests ON (11 targets)")
+        message(STATUS "Media pipeline: tests ON (12 targets)")
     endif()
 
     message(STATUS "Media pipeline: ON")
