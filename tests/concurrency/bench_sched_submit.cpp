@@ -99,10 +99,17 @@ int main(int argc, char** argv) {
     std::vector<double> wall_ns;
     submit_cycles.reserve(static_cast<std::size_t>(rounds));
     wall_ns.reserve(static_cast<std::size_t>(rounds));
+    // 每任务提交侧 rdtsc 的完整分布：p10/p25 对宿主噪声不敏感，是本次
+    // A/B（全局 runnable -> per-P 分片）的主口径。
+    std::vector<std::uint64_t> dist;
+    dist.reserve(tasks);
+    std::vector<double> p10_by_round;
+    std::vector<double> p25_by_round;
 
     for (int round = 0; round < rounds; ++round) {
         std::atomic<std::size_t> done{0};
         std::uint64_t submit_ticks = 0;
+        dist.clear();
         const std::uint64_t wall_start = NowNs();
         for (std::size_t i = 0; i < tasks; ++i) {
             const std::uint64_t begin = ReadTsc();
@@ -110,7 +117,9 @@ int main(int argc, char** argv) {
                 done.fetch_add(1, std::memory_order_release);
             });
             const std::uint64_t end = ReadTsc();
-            submit_ticks += end - begin;
+            const std::uint64_t delta = end - begin;
+            submit_ticks += delta;
+            dist.push_back(delta);
         }
         while (done.load(std::memory_order_acquire) != tasks) {
             std::this_thread::yield();
@@ -121,16 +130,35 @@ int main(int argc, char** argv) {
             static_cast<double>(submit_ticks) / static_cast<double>(tasks);
         submit_cycles.push_back(cycles);
         wall_ns.push_back(wall);
+        std::vector<std::uint64_t> sorted = dist;
+        std::sort(sorted.begin(), sorted.end());
+        const auto quantile = [&sorted](double q) {
+            const std::size_t index = static_cast<std::size_t>(
+                q * static_cast<double>(sorted.size() - 1));
+            return static_cast<double>(sorted[index]);
+        };
+        p10_by_round.push_back(quantile(0.10));
+        p25_by_round.push_back(quantile(0.25));
         std::printf(
-            "[round %d] submit %.1f cyc/task (%.1f ns)  wall %.1f ns/task\n",
-            round, cycles, cycles / tsc_ghz, wall);
+            "[round %d] submit %.1f cyc/task (%.1f ns)  wall %.1f ns/task  "
+            "p10 %.1f p25 %.1f p50 %.1f p90 %.1f cyc\n",
+            round, cycles, cycles / tsc_ghz, wall, quantile(0.10),
+            quantile(0.25), quantile(0.50), quantile(0.90));
     }
 
     const double best_submit =
         *std::min_element(submit_cycles.begin(), submit_cycles.end());
     const double best_wall = *std::min_element(wall_ns.begin(), wall_ns.end());
+    const double best_p10 = *std::min_element(p10_by_round.begin(),
+                                              p10_by_round.end());
+    const double best_p25 = *std::min_element(p25_by_round.begin(),
+                                              p25_by_round.end());
     std::printf("[min] submit %.1f cyc/task (%.1f ns)  wall %.1f ns/task\n",
                 best_submit, best_submit / tsc_ghz, best_wall);
+    std::printf("[pmin] submit_p10 %.1f cyc (%.2f ns)  submit_p25 %.1f cyc "
+                "(%.2f ns)  wall %.1f ns/task\n",
+                best_p10, best_p10 / tsc_ghz, best_p25, best_p25 / tsc_ghz,
+                best_wall);
     scheduler.shutdown();
     return 0;
 }
