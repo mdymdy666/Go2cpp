@@ -919,3 +919,107 @@ errno noinline），不是寄存器保存。
 - **状态**：完成，未 commit。报告 `/tmp/metrics_prometheus.md`。
   已知边界：端点无缓存/gzip/鉴权；分位数是桶内插值估算；文本解析只认本项目
   导出形态（第三方文本的乱序桶/时间戳会跳过）。
+
+
+## 2026-11-01 · 日志轮转 + 配置热更新（ops-log-config）
+
+- **改动内容**
+  - 新增 `include/go2cpp/logging/rotate.hpp`：`RotatingLogFile` / `RotatingLogSink` /
+    `RotationOptions` / `RotationPeriod`。按大小（`max_bytes`）与本地自然小时/
+    自然日（`period`）轮转；`max_files` 保留 N 份并按文件名删除最旧；归档用
+    自研 `compress::Gzip` 压缩（`.gz.tmp` + 原子 rename，失败保留原文件）；
+    写入先进入内存缓冲，`fwrite` 完整成功后才移除，轮转临界区只做
+    flush/fsync/rename/fopen，压缩与清理走单后台线程——轮转期间零丢失。
+  - 新增 `include/go2cpp/config/watch.hpp`：`FileWatcher`（Linux inotify 优先、
+    轮询兜底；监听父目录，只订阅 CLOSE_WRITE/MOVED_TO 等稳定事件）、
+    `ConfigStore<T>`（8 槽引用计数 + 原子 active 索引，读侧无锁）、
+    `ConfigWatcher<T>`（监听 → debounce → loader/validator → 原子发布 → 回调，
+    失败保留旧配置）。
+  - 新增 `tests/logging/test_log_rotate.cpp`（8 场景，含 1e6 条/12 次轮转压测）、
+    `tests/config/test_config_watch.cpp`（9 场景，含 1e4 次变更与无锁读并发）。
+  - 新增 `cmake/Go2CppOpsLogConfig.cmake`（两个 ctest 目标，默认 ON）；
+    顶层 `CMakeLists.txt` 末尾追加一行 include。
+  - 新增 `docs/modules/ops-log-config.md`。**未改动** `log.hpp` / `config.hpp`
+    及任何既有源码、测试。
+- **测试**（`.build-bento-wsl`，Release，`-Wall -Wextra -Wpedantic -Werror`）
+  - `ctest -R 'go2cpp_(log_rotate|config_watch)_test'`：**2/2 PASS**
+    （8.61 s + 3.13 s）。
+  - 日志：1e6 条 / 39.9 MB / 12 次轮转，逐行验证 0..999999 **0 丢失、
+    0 重复、0 乱序、0 撕裂**；12 个 `.gz` 全部通过 `Gzip::Reader` 的
+    CRC32/ISIZE 校验；并发 8 线程 × 5000 条、8 个真实场景（含打开失败恢复、
+    保留策略、按天轮转、随机混合）全部 PASS。
+  - 配置：1e4 次原子替换变更 **0 失败**（221.8 µs/次）；4 读者 + 2000 次
+    发布共 956 万次 `Load()` **0 撕裂**；删除重建、非法配置保留旧值、
+    validator 拒绝、轮询回退、Stop 语义全部 PASS。
+  - TSAN（`setarch -R`，WSL 需关闭 ASLR）：配置热更新测试 PASS，
+    **0 条 ThreadSanitizer 警告**。
+- **数据**（WSL ext4，/tmp，单次运行）
+  - 日志：write 0.176 s（约 227 MB/s）、close（压缩+清理）0.182 s、
+    端到端 0.358 s（106 MB/s）。
+  - 配置：`ConfigStore::Load()` 3.58 ns/次；`Store()` 1.0 µs/次（1 写 + 4 读）；
+    inotify 1e4 次变更事件数恰好 10000。
+- **状态**：完成，未 commit。报告 `/tmp/ops_log_config.md`。
+  已知边界：日志磁盘长期不可写超过 64 MiB 缓冲安全阀会拒收新数据并计数；
+  配置快照槽位固定 8 个（长期持有需 `share()`）；轮询模式同尺寸原地覆盖
+  可能受文件系统时间戳粒度影响；未在 Windows 上验证。
+
+### 2026-11-01 · LSM 功能层：Queue（MQ）/ Subscribe（Watch）/ MemCache
+
+- **范围**：在 aecc513 的 KV 引擎之上补三个功能层，**共用同一套 LSM**。
+  新增文件，未改动 `kv.hpp` / `kv.cpp` / `wal.*` / `memtable.*` / `sstable.*`。
+- **新增**
+  - `include/go2cpp/storage/queue.hpp` + `src/storage/queue.cpp`（MQ）：
+    `Append/Consume/Ack/Seek/FlushCursors/Sync`，at-least-once；
+    游标是 KV 记录 `queue/<topic>/<consumer>/offset`，每 4096 次 Ack 批量
+    写一次 `WriteBatch`；内存 deque + 日志冷读预取（4096 条/次）。
+  - `include/go2cpp/storage/watch.hpp` + `src/storage/watch.cpp`（订阅）：
+    `Watch/Unwatch/Put/Delete/Write/Notify/Replay/FlushOffsets`；
+    写 KV 成功后再发事件，事件写变更日志（同 WAL 格式）；
+    同步（默认）与异步（单线程 + 背压）两种派发；订阅游标
+    `watch/<id>/offset` 存 KV；无订阅者时写路径只多一次原子读。
+  - `include/go2cpp/storage/memcache.hpp` + `src/storage/memcache.cpp`（缓存）：
+    `Set/Get/Peek/Delete/Expire/Clear/PurgeExpired`，TTL（复用
+    `cache/detail/time_wheel.hpp` 的 256 桶时间轮）+ LRU（复用
+    `cache/detail/intrusive.hpp` 的侵入式链表与节点池）+ 分片锁；
+    `persist` 写穿 KV、`read_through` 回填。
+  - `src/storage/seglog.{hpp,cpp}`：Queue/Watch 共用的「WAL 顺序追加 +
+    SSTable 段索引」层（写端复用 `WalWriter`，段封口把稀疏检查点写成
+    SSTable，读端自带按偏移定位的扫描器，恢复时截断尾部垃圾）。
+  - 测试：`tests/storage/{queue,watch,memcache}_test.cpp` +
+    `tests/storage/features_bench.cpp`。
+  - 文档：`docs/modules/storage-features.md`、`docs/reports/asm-storage-features.md`。
+  - `cmake/Go2CppKv.cmake`：库追加 4 个源文件，新增 3 个测试目标 + 1 个 bench 目标。
+- **测试**（`.build-bento-wsl`，Release，`-Wall -Wextra -Wpedantic -Werror`）
+  - `go2cpp_queue_test --n=1000000`：**PASS**（59 209 checks / 0 failures）。
+    1e6 全量 append+consume+ack，offset 严格 0..999999，0 丢失 0 重复；
+    游标持久化（重开 KV 续上）；fork+SIGKILL 崩溃恢复（Head=100000、
+    游标=10、续写 offset=100000）；256KB 段滚动产生多段 + `.idx`；
+    尾部垃圾截断后可继续追加。
+  - `go2cpp_watch_test --n=100000`：**PASS**（111 180 checks / 0 failures）。
+    1e5 次写触发回调，seq 严格连续、key 顺序一致；Replay 全量/区间；
+    稳定 id 游标持久化；异步模式 1e4 条全部派发且顺序正确；无订阅者时
+    events=0、日志 0 字节。
+  - `go2cpp_memcache_test --n=10000000`：**PASS**（574 checks / 0 failures）。
+    1e7 Get+Set（容量 1e6，命中率 99.9%）、TTL 过期与覆盖清 TTL、
+    LRU 淘汰与命中提升、4 线程 × 5e5 并发、写穿 + 回填。
+- **数据**（1e7，WSL ext4，`taskset -c 0-3`，日志 `/tmp/bench_1e7.log`）
+  - Queue：append 196.1 ns（509 万/s）、consume 24.2 ns（4125 万/s）、
+    consume+ack 69.7 ns（1434 万/s）、冷读 2 169.6 ns；
+    裸 WAL 追加（SegLog 40B）71.6 ns → append 距下限 **2.7×**。
+  - Watch：写 + 同步回调 785.4 ns（127 万/s，回调本身 53 ns）；
+    无订阅者 533.8 ns（KV::Put 基线 460.8 ns，+16%）。
+  - MemCache：Get 859.8 ns（116 万/s）、Peek 570.9 ns、Set 721.5 ns；
+    **纯查找与项目 LruCache（585.3 ns）持平**；裸 unordered_map 143.9 ns。
+  - 下限：memcpy 46~61 GB/s、裸顺序写 /dev/shm 1.73 GB/s、/tmp 0.54 GB/s、
+    fdatasync 1.8~2.1 ms。
+- **优化前后**（同进程 A/B，`QueueOptions.topic_cache`）
+  - queue.append：n=2e6 188.1 → **114.4 ns（−39.2%）**；
+    n=1e7 302.3 → **196.1 ns（−35.1%）**。
+  - MemCache 的条目重排与 Get 侧过期扫描节流：1e7 实测**无统计显著收益**
+    （噪声 ±25%），如实记录，未包装成优化。
+  - objdump：`MemCache::Impl::Get` 有 7 个 `lock` 前缀（统计计数器），
+    已识别「分片内普通计数」可省 ~8%，因落在噪声内未做。
+- **状态**：完成，**未 commit**。报告 `/tmp/lsm_features.md` 与
+  `docs/reports/asm-storage-features.md`。已知边界：冷读每次 Refill 都会
+  打开段索引（未做索引缓存）；Queue 单 topic 消费串行；Watch 前缀线性匹配；
+  MemCache 分片数应按并发度配置（单线程 8 分片比 1 分片慢 14%）。

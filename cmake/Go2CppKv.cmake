@@ -30,7 +30,11 @@ add_library(go2cpp_kv
     ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/memtable.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/wal.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/sstable.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/kv.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/kv.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/seglog.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/queue.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/watch.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/memcache.cpp)
 add_library(go2cpp::kv ALIAS go2cpp_kv)
 
 target_include_directories(go2cpp_kv
@@ -92,4 +96,28 @@ if (GO2CPP_BUILD_TESTS)
     target_compile_options(go2cpp_kv_bench PRIVATE -Wall -Wextra)
     add_test(NAME go2cpp_kv_bench COMMAND go2cpp_kv_bench --n=1000000)
     set_tests_properties(go2cpp_kv_bench PROPERTIES TIMEOUT 900)
+
+    # ---- 功能层：Queue（MQ）/ Watch（订阅）/ MemCache（内存缓存） ----
+    # 三者共用同一个 LSM：Queue/Watch 的游标是 KV 记录，MemCache 可写穿。
+    foreach(feature queue watch memcache)
+        add_executable(go2cpp_${feature}_test
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/storage/${feature}_test.cpp)
+        target_link_libraries(go2cpp_${feature}_test PRIVATE go2cpp_kv)
+        target_include_directories(go2cpp_${feature}_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/storage)
+        target_compile_options(go2cpp_${feature}_test PRIVATE -Wall -Wextra)
+        add_test(NAME go2cpp_${feature}_test COMMAND go2cpp_${feature}_test)
+        set_tests_properties(go2cpp_${feature}_test PROPERTIES TIMEOUT 900)
+    endforeach()
+
+    # ---- 功能层基准：Queue ops/s、Watch 回调开销、MemCache Get/Set ops/s ----
+    add_executable(go2cpp_storage_features_bench
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/storage/features_bench.cpp)
+    target_link_libraries(go2cpp_storage_features_bench PRIVATE go2cpp_kv)
+    target_include_directories(go2cpp_storage_features_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/storage)
+    target_compile_options(go2cpp_storage_features_bench PRIVATE -Wall -Wextra)
+    add_test(NAME go2cpp_storage_features_bench
+             COMMAND go2cpp_storage_features_bench --n=1000000)
+    set_tests_properties(go2cpp_storage_features_bench PROPERTIES TIMEOUT 900)
 endif()
