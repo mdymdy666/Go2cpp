@@ -4040,8 +4040,25 @@ bool Scheduler::publish_runnext(PId processor_id,
             std::memory_order_relaxed);
         const auto active = processor.active_machines.load(
             std::memory_order_relaxed);
-        if (running == 0 ||
-            (processor.queue.size() >= 16U && running < active)) {
+        if (running == 0) {
+            // 本 P 没有运行中的 M ⇒ owner M 正在睡，而 runnext 只有 owner
+            // 会消费：worker 的窃取路径明确跳过别的 P 的 runnext（见
+            // worker_loop 里 steal 段的注释）。此时用 `notify_one()` 唤醒的
+            // 是调度器等待队列的队首，它属于哪个 P 由「谁先睡下」决定，
+            // 与 G 被投到哪个 P 无关 —— 被唤醒的 M 查自己的环、全局队列，
+            // 再窃取其余 P 的**环**（都跳过 runnext），没活可干就回去睡；
+            // 而 owner M 仍睡着，直到 idle_wait 超时才醒。
+            //
+            // 实测（4P/4M，一次 sync::Mutex 竞争的 park→wake 的
+            // 「Unlock 返回 → worker 恢复 Fiber」段）中位 9.67 ms，恰好等于
+            // `SchedulerConfig::idle_wait` 的默认值 10 ms；把 idle_wait 调成
+            // 2 ms / 50 ms，该段同步变成 1.8 ms / 51.8 ms。改成本函数的广播
+            // 后同一场景降到 14.5 µs。
+            //
+            // 广播只发生在这条「本 P 确实空转、worker 正在睡」的路径上；
+            // 有 M 在跑时仍走 notify_one，不引入额外的 futex 抖动。
+            m_impl->notify_all_workers();
+        } else if (processor.queue.size() >= 16U && running < active) {
             m_impl->notify_worker();
         }
     }
@@ -4144,8 +4161,32 @@ bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
 
     // ② Go 式（默认）：投到目标 P 的 runnext。同一 P 的 M 下一轮直接取，
     // 这是 Go `goready` 的快速槽语义；被挤出者自动落回本地环。
+    //
+    // ## 只在「本 P 有 M 在跑」时才用 runnext
+    //
+    // runnext 是**只有本 P 的 owner M 会消费**的槽：worker 的窃取路径明确
+    // 跳过别的 P 的 runnext（见 worker_loop 里 steal 段的注释，那是有意的
+    // 缓存亲和设计）。而本 P 没有运行中的 M 时，唤醒只能走
+    // `notify_worker()` 里的 `notify_one()`，它唤醒的是调度器条件变量等待
+    // 队列的**队首**——属于哪个 P 完全由「谁先睡下」决定，与 G 被投到哪个
+    // P 无关。
+    //
+    // 两者叠加就是一个稳定的丢唤醒窗口：G 落进 P 的 runnext → notify_one
+    // 叫醒了 P' 的 M → 它查自己的环、全局队列，再窃取其余 P 的**环**
+    // （全部跳过 runnext）→ 没活可干，回去睡；而 P 的 owner M 仍睡着，
+    // 直到 `idle_wait` 超时才醒。实测（4P/4M，一次 sync::Mutex 竞争的
+    // park→wake 的「Unlock 返回 → worker 恢复 Fiber」段）中位 **9.67 ms**，
+    // 恰好等于 `SchedulerConfig::idle_wait` 的默认值 10 ms；把它调成
+    // 2 ms / 50 ms，该段同步变成 1.8 ms / 51.8 ms。而单 worker 时
+    // notify_one 必然命中 owner，同段只有 19 µs —— 这正是「多 P 才出现」
+    // 的证据。
+    //
+    // 因此空转 P 上改投本地环：环里的 G 可被任意 M 窃取，notify_one 叫醒
+    // 谁都行。有 M 在跑时仍走 runnext，亲和性收益保留在真正的热路径上。
     if (policy != WakePolicy::kRoundRobin) {
-        if (publish_runnext(processor_id, task, true)) {
+        const auto running = processor.running_machines.load(
+            std::memory_order_relaxed);
+        if (running != 0 && publish_runnext(processor_id, task, true)) {
             GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(), processor_id);
             if (affinity != 0 &&
                 task->last_processor_id() == processor_id) {
