@@ -28,6 +28,7 @@ include(cmake/Go2CppOptions.cmake)
 include(cmake/Go2CppReflect.cmake)
 include(cmake/Go2CppModules.cmake)
 include(cmake/Go2CppRelay.cmake)
+include(cmake/Go2CppRelayPipe.cmake)
 # 内核监控模块（go2cpp::os::monitor，eBPF）：需要在 Modules 之后定义（依赖
 # network/scheduler/channel 目标）；eBPF 不可用时自动降级为仅 /proc 采集。
 include(cmake/Go2CppMonitor.cmake)

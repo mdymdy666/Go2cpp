@@ -616,3 +616,36 @@ errno noinline），不是寄存器保存。
   7.7 → 2.5–3.1 µs/流；1e8 帧压测 124 ns/帧 / 12.4 s / 8.1 Mfps / RSS 4 MiB；
   1 GiB 资源（SHA-256 校验）268 MiB/s 不变（SHA 主导）；资源生产 +6%。
 - **状态**：完成，未提交（多 agent 共享工作树）。报告：`/tmp/asm_app.md`。
+
+## 2026-11-01 · relay 通用组件：Hub（REQ-003）+ Lease/Heartbeat（REQ-005）
+
+- **改动内容**
+  - 新增 `go2cpp::relay::Hub`：key → 多连接注册表，单锁 + 快照；`CloseKey`
+    锁内摘表、锁外逐条 `Close()`（回调里可重入 Hub）；重复 Register/Unregister/
+    CloseKey 均幂等；不内置配额，不关闭未显式关闭的连接（析构不关）。
+    连接契约复用 `go2cpp::streams::Closer`（= Go io.Closer），类内别名
+    `Hub::Stream`；与 RelayPipe 的 `relay::Stream` 无重定义，且可隐式转换注册。
+  - 新增 `go2cpp::relay::Lease`：构造即布防，`steady_clock` +
+    `wait_until` + generation 续约；`on_expire` 至多一次；到期后 Renew 无效；
+    Stop/析构幂等；回调内可 Stop（自线程 detach）。
+  - 新增 `go2cpp::relay::Heartbeat`：ticker 语义；send false/异常 → on_dead
+    一次；Context 取消静默停止；取消回调只持 weak_ptr；Stop 幂等、可重启。
+  - 构建：`cmake/Go2CppRelay.cmake` 改为聚合入口（只 include），目标与测试定义在
+    `cmake/Go2CppRelayHubLease.cmake`；与 RelayPipe 的 `Go2CppRelayPipe.cmake`
+    （目标 `go2cpp_relay_pipe`）分开，避免并行 agent 互相覆盖。
+- **关键文件**：`include/go2cpp/relay/{hub,lease}.hpp`、`src/relay/{hub,lease}.cpp`、
+  `tests/relay/{test_hub,test_lease,test_lease_90s,test_lease_clockjump,test_heartbeat,
+  test_relay_scenarios,bench_relay}.cpp`、`tests/relay/{relay_test_util.hpp,fake_clock_jump.cpp}`、
+  `cmake/Go2CppRelay.cmake`、`cmake/Go2CppRelayHubLease.cmake`、`docs/modules/hub-lease.md`。
+- **测试**（`.build-bento-wsl`，Release；ctest 标签 relay）
+  - `relay_hub` PASS（含 1e5 次并发 Register/Lookup/Unregister、CloseKey 竞态、2 万步随机对拍）；
+  - `relay_lease` PASS（到期一次/续约重置/Stop/析构/0 超时/并发续约/300 租约/随机）；
+  - `relay_heartbeat` PASS；`relay_scenarios` PASS（7 个真实场景）；
+  - `relay_lease_clockjump` PASS（LD_PRELOAD 墙钟 ±1h，租约仍按单调时钟 800/700ms 到期）；
+  - `relay_hub_tsan` PASS（TSan 无报告，`setarch --addr-no-randomize` 规避 WSL 启动问题）；
+  - `relay_lease_90s` PASS（`elapsed=90000 ms`，`fired=1`）。
+  - 压测：Hub 单线程 95.5 ns/迭代（10.47 Mops/s）；8 线程只读 Lookup 262 ns/次；
+    CloseKey 72.1 ns/连接；Lease Renew 80.5 ns/次；50ms 租约迟到 P99=10ms；
+    10ms 心跳抖动 P99=0ms（load average ≈3.8，数字偏保守）。
+- **状态**：完成，未提交（多 agent 共享工作树）。报告：`/tmp/hub_lease.md`。
+  已知边界：未接入 install(EXPORT)；每 Lease/Heartbeat 一个线程；Hub 单锁未分片。
