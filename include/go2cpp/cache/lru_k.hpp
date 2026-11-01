@@ -16,8 +16,9 @@
  *              淘汰时取主表中 reference time 最小的条目。严格符合 LRU-2
  *              的定义，而不是用 LRU 近似。
  *
- *          复杂度：主表 Get/Put O(log n)（`std::map` 定位最小引用时间），
- *          corral Get/Put 均摊 O(1)。空间 O(capacity)。
+ *          复杂度：主表 Get/Put O(1)（时间轮定位最老引用时间：指针插入/
+ *          删除 + 8 层锦标赛树刷新；只有桶 min 被摘时才重扫该桶，同圈
+ *          单桶最多 256 条），corral Get/Put 均摊 O(1)。空间 O(capacity)。
  *
  *          与论文的差异：论文的 corral 容量是「页面数的一个小比例」，
  *          这里是 100%；论文用页面 ID + 时间戳，这里用通用 key/value。
@@ -26,23 +27,28 @@
  *
  * ## 容器层（本次优化）
  *
- *          优化前这条路径是三套容器的叠加：corral 的 `list` + `unordered_map`、
- *          主表的 `unordered_map`、以及参考时间的 `std::map<uint64_t, K>`。
- *          实测每次 `Get` 命中要发生 **1.02 次 `operator new`**——全部来自
- *          `std::map` 的 erase + emplace（参考时间每次访问都要换一个位置）。
+ *          057257b 之前这条路径是三套容器的叠加：corral 的 `list` +
+ *          `unordered_map`、主表的 `unordered_map`、以及参考时间的
+ *          `std::map<uint64_t, K>`；报告记录的「每次命中 1.02 次
+ *          `operator new`」来自 `std::map` 的 erase + emplace。
  *
- *          现在：
+ *          057257b 已经把前两层换成侵入式结构，并用 C++17 的
+ *          `extract` + `insert` 原地换 key，把命中路径的堆分配降到 0。
+ *          本次实测确认：**当前基线命中路径已经是 0 分配**，剩余成本是
+ *          每次命中两次 O(log n) 红黑树遍历（extract 一次、insert 一次）。
+ *
+ *          本次再把参考时间索引换成 **256 桶时间轮**（见
+ *          `detail/time_wheel.hpp`）：
  *            - 主表与 corral 合并成一张开放寻址索引，条目用 `in_main` 标记；
- *              命中路径只查一次哈希（原先是主表查一次、未命中再查 corral 一次）。
- *            - corral 是侵入式 FIFO 链表，节点来自池，插入 0 分配。
- *            - 参考时间索引仍然是 `std::map`（严格有序语义不变），但用
- *              C++17 的 `extract` + `insert` 原地换 key，**不再分配/释放节点**。
+ *            - corral 是侵入式 FIFO 链表，节点来自池，插入 0 分配；
+ *            - 参考时间索引是定长时间轮 + 每桶侵入式链表 + 桶 min 锦标赛树：
+ *              命中时 `Erase` 旧时间戳、`Insert` 新时间戳，都是 O(1) 指针
+ *              操作；淘汰直接读锦标赛树根，O(1)；全程 0 次堆分配。
  */
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -50,6 +56,7 @@
 #include "go2cpp/cache/cache.hpp"
 #include "go2cpp/cache/detail/bucket_map.hpp"
 #include "go2cpp/cache/detail/intrusive.hpp"
+#include "go2cpp/cache/detail/time_wheel.hpp"
 
 namespace go2cpp {
 namespace cache {
@@ -149,7 +156,7 @@ public:
         }
         weight_ -= entry->weight;
         if (entry->in_main) {
-            refs_.erase(entry->reference_time);
+            refs_.Erase(entry);
         } else {
             history_.erase(entry);
         }
@@ -162,7 +169,7 @@ public:
     void Clear() override {
         index_.ForEach([this](Entry* entry) { pool_.Destroy(entry); });
         index_.Clear();
-        refs_.clear();
+        refs_.Clear();
         history_.clear_links();
         weight_ = 0;
     }
@@ -192,7 +199,10 @@ public:
     }
 
 private:
-    /** @brief 条目：corral 时挂 FIFO 链表，主表时只被参考时间索引引用。 */
+    /**
+     * @brief 条目：corral 时 `prev/next` 挂 FIFO 链表，主表时同一对指针
+     *        被时间轮的桶链表复用（两者互斥，见 time_wheel.hpp 的契约）。
+     */
     struct Entry : detail::Link<Entry>, detail::HashNode<Entry> {
         Entry(const K& entry_key, V entry_value, std::size_t entry_weight,
               std::uint64_t last_visit_time)
@@ -220,18 +230,13 @@ private:
     }
 
     void TouchMain(Entry* entry) {
-        // 参考时间整体右移：ref <- last <- now。用 extract/insert 原地换 key，
-        // 避免 std::map 每次 erase+emplace 的节点分配/释放。
-        auto node = refs_.extract(entry->reference_time);
+        // 参考时间整体右移：ref <- last <- now。时间轮用条目自带的
+        // prev/next 做桶链表，摘除/插入都是 O(1) 指针操作，不再有
+        // 红黑树的两次 O(log n) 遍历。
+        refs_.Erase(entry);
         entry->reference_time = entry->last_visit;
         entry->last_visit = NextTimestamp();
-        if (!node.empty()) {
-            node.key() = entry->reference_time;
-            node.mapped() = entry;
-            refs_.insert(std::move(node));
-        } else {
-            refs_.emplace(entry->reference_time, entry);
-        }
+        refs_.Insert(entry);
     }
 
     void PromoteToMain(Entry* entry, std::uint64_t reference_time) {
@@ -245,7 +250,7 @@ private:
         }
         entry->reference_time = reference_time;
         entry->last_visit = last_visit;
-        refs_.emplace(reference_time, entry);
+        refs_.Insert(entry);
         // 历史 -> 主表只是换了一个容器，总权重不变（weight_ 已包含它）。
     }
 
@@ -269,14 +274,13 @@ private:
     }
 
     void EvictMain() {
-        if (refs_.empty()) {
+        Entry* entry = refs_.Min();
+        if (entry == nullptr) {
             return;
         }
-        const auto victim = refs_.begin();
-        Entry* entry = victim->second;
         weight_ -= entry->weight;
         index_.Erase(entry);
-        refs_.erase(victim);
+        refs_.Erase(entry);
         pool_.Destroy(entry);
         stats_.RecordEviction();
     }
@@ -286,7 +290,7 @@ private:
     detail::IntrusiveList<Entry> history_;
     detail::BucketMap<K, Entry, Hash, Equal> index_;
     detail::NodePool<Entry> pool_;
-    std::map<std::uint64_t, Entry*> refs_;
+    detail::TimestampWheel<Entry> refs_;
     std::uint64_t clock_ = 0;
     std::uint64_t history_evictions_ = 0;
     std::size_t weight_ = 0;
