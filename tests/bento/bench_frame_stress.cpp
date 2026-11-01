@@ -438,6 +438,107 @@ void BenchChecksum(std::size_t payload_bytes, std::uint64_t iterations) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 基准 E2：零拷贝编码（EncodeInto）——复用输出缓冲，每帧 0 次堆分配。
+// ---------------------------------------------------------------------------
+void BenchEncodeInto(std::size_t payload_bytes, std::uint64_t iterations) {
+    const Frame frame = MakeFrame(0x1234, 0x0007, payload_bytes, 3);
+    const std::uint64_t frame_bytes = kGenericFrameHeaderBytes + payload_bytes;
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(frame_bytes));
+    std::uint64_t sink = 0;
+    std::uint64_t failures = 0;
+    const std::uint64_t allocs0 = AllocCount();
+    const std::uint64_t bytes0 = AllocBytes();
+    const auto begin = Clock::now();
+    for (std::uint64_t i = 0; i < iterations; ++i) {
+        std::size_t written = 0;
+        if (!EncodeInto(frame, out.data(), out.size(), &written)) {
+            ++failures;
+        }
+        sink += written;
+    }
+    const double seconds = SecondsSince(begin);
+    char name[96];
+    std::snprintf(name, sizeof(name), "encode-into payload=%zu", payload_bytes);
+    Report(MakeMeasurement(name, iterations, iterations * frame_bytes, seconds,
+                           AllocCount() - allocs0, AllocBytes() - bytes0));
+    STRESS_CHECK_EQ(sink, iterations * frame_bytes);
+    STRESS_CHECK_EQ(failures, 0U);
+}
+
+// ---------------------------------------------------------------------------
+// 基准 E3：零拷贝解码（DecodeView）——不拷贝 payload，每帧 0 次堆分配。
+// ---------------------------------------------------------------------------
+void BenchDecodeView(std::size_t payload_bytes, std::uint64_t iterations) {
+    const std::vector<std::uint8_t> bytes = Encode(MakeFrame(0x2222, 0x0001, payload_bytes, 5));
+    const std::uint64_t frame_bytes = kGenericFrameHeaderBytes + payload_bytes;
+    std::uint64_t sink = 0;
+    std::uint64_t failures = 0;
+    const std::uint64_t allocs0 = AllocCount();
+    const std::uint64_t bytes0 = AllocBytes();
+    FrameView view;
+    const auto begin = Clock::now();
+    for (std::uint64_t i = 0; i < iterations; ++i) {
+        if (DecodeView(bytes.data(), bytes.size(), &view) != FrameStatus::kOk) {
+            ++failures;
+        }
+        sink += view.size();
+    }
+    const double seconds = SecondsSince(begin);
+    char name[96];
+    std::snprintf(name, sizeof(name), "decode-view payload=%zu", payload_bytes);
+    Report(MakeMeasurement(name, iterations, iterations * frame_bytes, seconds,
+                           AllocCount() - allocs0, AllocBytes() - bytes0));
+    STRESS_CHECK_EQ(sink, iterations * payload_bytes);
+    STRESS_CHECK_EQ(failures, 0U);
+}
+
+// ---------------------------------------------------------------------------
+// 基准 E4：流式零拷贝（NextView）——粘包批次里不做 payload 拷贝。
+// ---------------------------------------------------------------------------
+void BenchNextView(std::size_t payload_bytes, std::uint64_t iterations) {
+    constexpr std::uint64_t kBatch = 64;
+    iterations -= iterations % kBatch;
+    std::vector<Frame> frames;
+    frames.reserve(static_cast<std::size_t>(kBatch));
+    for (std::uint64_t i = 0; i < kBatch; ++i) {
+        frames.push_back(MakeFrame(static_cast<std::uint16_t>(i), 0, payload_bytes,
+                                   static_cast<std::uint8_t>(i)));
+    }
+    const std::vector<std::uint8_t> stream = MakeStream(frames);
+    FrameDecoder decoder;
+    FrameView view;
+    std::uint64_t received = 0;
+    std::uint64_t decode_failures = 0;
+    const std::uint64_t allocs0 = AllocCount();
+    const std::uint64_t bytes0 = AllocBytes();
+    const auto begin = Clock::now();
+    std::uint64_t remaining = iterations;
+    while (remaining > 0) {
+        decoder.Append(stream.data(), stream.size());
+        for (std::uint64_t i = 0; i < kBatch; ++i) {
+            if (decoder.NextView(&view) != FrameStatus::kOk) {
+                ++decode_failures;
+            }
+            ++received;
+        }
+        if (decoder.NextView(&view) != FrameStatus::kNeedMoreData) {
+            ++decode_failures;
+        }
+        remaining -= kBatch;
+    }
+    const double seconds = SecondsSince(begin);
+    char name[96];
+    std::snprintf(name, sizeof(name), "stream-view payload=%zu batch=%llu", payload_bytes,
+                  static_cast<unsigned long long>(kBatch));
+    Report(MakeMeasurement(name, iterations,
+                           iterations * (kGenericFrameHeaderBytes + payload_bytes), seconds,
+                           AllocCount() - allocs0, AllocBytes() - bytes0));
+    STRESS_CHECK_EQ(received, iterations);
+    STRESS_CHECK_EQ(decode_failures, 0U);
+}
+
 // ---------------------------------------------------------------------------
 // 基准 F：缓冲压缩悬崖（小帧 + 大帧半包交替到达）。
 //
@@ -1054,6 +1155,17 @@ int main(int argc, char** argv) {
     BenchChecksum(1400, small_iters);
     BenchChecksum(65536, quick ? 4096ull : 16384ull);
     BenchChecksum(kFrameMaxPayload, large_iters);
+
+    // 零拷贝 API 对照：同负载、同迭代次数，只换 API。
+    BenchEncodeInto(64, small_iters);
+    BenchEncodeInto(1400, small_iters);
+    BenchEncodeInto(65536, quick ? 4096ull : 16384ull);
+    BenchEncodeInto(kFrameMaxPayload, large_iters);
+    BenchDecodeView(64, small_iters);
+    BenchDecodeView(1400, small_iters);
+    BenchDecodeView(kFrameMaxPayload, large_iters);
+    BenchNextView(64, quick ? 100000ull : 500000ull);
+    BenchNextView(1400, quick ? 50000ull : 250000ull);
 
     ScenarioStickyAndPartial();
     BenchCompactionCliff(quick ? 8 : 64);

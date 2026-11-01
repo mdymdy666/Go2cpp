@@ -30,6 +30,27 @@
  * 无平台分支）。`Table::operator[]` 仍暴露**基础 256 表**，与 Go
  * `MakeTable` 的可见语义一致；派生表是从它逐级推出的内部加速结构。
  *
+ * ## x86-64 硬件加速（SSE4.2 `crc32q` / PCLMULQDQ 折叠）
+ *
+ * 表驱动是**唯一可移植路径**，保留为回退；x86-64 上另有两条硬件路径：
+ *
+ *   | 多项式 | 指令 | 说明 |
+ *   |---|---|---|
+ *   | `Castagnoli`（CRC-32C） | `crc32q`（SSE4.2） | 该指令的多项式固定就是 CRC-32C，8 字节/条 |
+ *   | `IEEE`（CRC-32） | `pclmulqdq` 折叠（PCLMUL + SSE4.1） | `crc32q` **不支持** IEEE，只能走无进位乘法折叠 + Barrett 归约 |
+ *
+ * 分派策略三层，优先级从高到低：
+ *   1. 编译期全局启用（`-msse4.2 -mpclmul` 时 `__SSE4_2__`/`__PCLMUL__` 已定义，
+ *      直接调用，无运行期分支）；
+ *   2. 运行期 CPUID（`__builtin_cpu_supports("pclmul"/"sse4.2")`），函数级
+ *      `__attribute__((target(...)))` 编译，不污染全局编译选项；
+ *   3. 表驱动（所有其它情况，含非 x86 平台）。
+ *
+ * **正确性优先**：三条路径必须逐字节一致（`tests/hash/` 用 zlib 与独立
+ * 逐位参考实现双向对拍），所以硬件路径只做「同一线性变换的更快表达」，
+ * 不改变 `Update` 的取反语义。IEEE 折叠只处理 16 字节整数倍前缀，尾部
+ * （<16B）交回表驱动，避免 partial-block 的移位分支。
+ *
  * ## 与 Go `hash/crc32` 的对应关系
  * | Go | 本实现 |
  * |---|---|
@@ -51,13 +72,13 @@
  * 选择」的算法：gzip/ZIP/PNG 用 IEEE，iSCSI/ext4 元数据用 Castagnoli，
  * 误码检测要求更高时用 Koopman。因此除了摘要器 `Crc32`，这里还公开可复用的
  * 查表类型 `Table` 与一次性函数。实现位于协议栈最底层，不依赖其它模块；
- * 当前仓库的直接调用方只有 `tests/hash/hash_test_support.hpp`（与 Python
- * `zlib.crc32` 对拍），生产代码尚未接入。
+ * 直接调用方是 `bento::net::ComputeFrameChecksum`（帧校验）与
+ * `tests/hash/`（与 Python `zlib.crc32` 对拍）。
  *
  * ## 本文件定义什么
  *
  * - `IEEE`/`Castagnoli`/`Koopman`：三个反射形式的多项式常量；
- * - `Table`：基础 256 表 + 7 张 slicing-by-8 派生表；
+ * - `Table`：基础 256 表 + 7 张 slicing-by-8 派生表 + 多项式标识；
  * - `MakeTable`：编译期生成查表（三个内建表因此是常量初始化，无运行期竞态）；
  * - `IEEETable`/`CastagnoliTable`/`KoopmanTable`：进程级静态表；
  * - `Crc32`：流式摘要器（`Hash` 子类），持有 `const Table*`。
@@ -72,7 +93,9 @@
  *
  * - 空输入 `Checksum` 返回 0：`Update(0, ...)` 进入取反再离开取反，正好抵消；
  * - `Crc32` 只存 `Table*`，表先于摘要器销毁就是悬垂指针（内建表除外）；
- * - 分段计算必须用 `Update` 串接；两个 `Checksum` 结果不能相加/异或。
+ * - 分段计算必须用 `Update` 串接；两个 `Checksum` 结果不能相加/异或；
+ * - 硬件路径与表路径共享同一 `Table` 语义：自定义表（`MakeTable` 生成）
+ *   只要多项式是 IEEE/Castagnoli 也会走硬件，`polynomial` 字段就是判据。
  */
 #pragma once
 
@@ -88,7 +111,7 @@ namespace go2cpp::hash {
 inline constexpr std::uint32_t IEEE = 0xedb88320u;
 /// Castagnoli 多项式（反射，CRC-32C），对应 Go `crc32.Castagnoli`。
 inline constexpr std::uint32_t Castagnoli = 0x82f63b78u;
-/// Koopman 多项式（反射，CRC-32K），对应 Go `crc32.Koopman`。
+/// Koopman 多项式（反射），对应 Go `crc32.Koopman`。
 inline constexpr std::uint32_t Koopman = 0xeb31d82eu;
 
 /**
@@ -115,6 +138,10 @@ struct Table {
     /// slicing-by-8 的表数量。
     static constexpr std::size_t kSlices = 8;
 
+    /// 生成该表的反射多项式。**只作分派判据**（IEEE/Castagnoli 可走硬件），
+    /// 不参与查表计算；手工构造的 `Table` 保持 0 时一律走表驱动。
+    std::uint32_t polynomial = 0;
+
     /// 依次排列的 8 张表（基础表在前）。
     std::array<std::uint32_t, kBaseEntries * kSlices> entries{};
 
@@ -134,6 +161,7 @@ struct Table {
  */
 constexpr Table MakeTable(std::uint32_t poly) noexcept {
     Table table{};
+    table.polynomial = poly;
     for (std::size_t i = 0; i < Table::kBaseEntries; ++i) {
         std::uint32_t crc = static_cast<std::uint32_t>(i);
         for (int bit = 0; bit < 8; ++bit) {
@@ -170,8 +198,7 @@ extern const Table KoopmanTable;
  * 给需要**流式** CRC 的调用方使用：每收到一段数据 `Write` 一次，最后用
  * `Sum32()`/`Sum()` 取结果；一次性场景直接用静态 `ChecksumIEEE`/
  * `Checksum`/`Update`，不必构造对象。作为 `Hash&` 擦除后也可参与「一次遍历
- * 多个摘要」。当前仓库调用方仅为 `tests/hash/`；`compress` 的 gzip 编码器
- * 是预期的生产调用方（帧尾 CRC32）。
+ * 多个摘要」。生产调用方是 `bento::net` 的帧校验。
  *
  * ## 生命周期与线程模型
  *
@@ -221,6 +248,10 @@ class Crc32 final : public Hash {
      * @param table 查表。
      * @param data 追加的数据。
      * @return `crc(data_so_far ++ data)`。
+     *
+     * @details 三条实现路径（硬件 Castagnoli / 硬件 IEEE 折叠 / 表驱动）在
+     *          任意 `crc` 初值与任意分段下都等价；分派只看 `table.polynomial`
+     *          与运行期 CPU 特性，调用方无需感知。
      */
     static std::uint32_t Update(std::uint32_t crc, const Table& table,
                                 ByteSpan data) noexcept;

@@ -729,6 +729,216 @@ void TestRandomizedAdversarial() {
     }
 }
 
+
+/// 零拷贝编码：EncodeInto 与 Encode 逐字节一致，容量/参数边界不越界写。
+void TestEncodeInto() {
+    const std::size_t sizes[] = {0, 1, 16, 64, 1300, 65535, kFrameMaxPayload};
+    for (const std::size_t size : sizes) {
+        const Frame in = MakeFrame(0x2222, 0x00ff, size, 9);
+        const std::vector<std::uint8_t> expected = Encode(in);
+        BENTO_CHECK(!expected.empty());
+        std::vector<std::uint8_t> out(expected.size() + 16, 0xa5);
+        std::size_t written = 0;
+        BENTO_CHECK(EncodeInto(in, out.data(), expected.size(), &written));
+        BENTO_CHECK_EQ(written, expected.size());
+        BENTO_CHECK(std::memcmp(out.data(), expected.data(), expected.size()) == 0);
+        // 守卫字节：越界写会被发现（缓冲比实际帧长 16 字节）。
+        for (std::size_t i = expected.size(); i < out.size(); ++i) {
+            BENTO_CHECK_EQ(out[i], 0xa5u);
+        }
+        // 容量差 1 字节：必须失败，且不写 written。
+        written = 12345;
+        BENTO_CHECK(!EncodeInto(in, out.data(), expected.size() - 1, &written));
+        BENTO_CHECK_EQ(written, static_cast<std::size_t>(12345));
+        // nullptr / 非法帧 / 非法 format。
+        BENTO_CHECK(!EncodeInto(in, nullptr, expected.size()));
+        Frame bad = in;
+        bad.reserved = 1;
+        BENTO_CHECK(!EncodeInto(bad, out.data(), out.size()));
+        BENTO_CHECK(!EncodeInto(in, FrameFormat{0, kFrameVersion}, out.data(), out.size()));
+        Frame oversize;
+        oversize.payload.resize(kFrameMaxPayload + 1);
+        std::vector<std::uint8_t> large(kMaxEncodedFrameBytes);
+        BENTO_CHECK(!EncodeInto(oversize, large.data(), large.size()));
+        // 自定义 format：与 Encode(frame, format) 字节一致。
+        const FrameFormat custom{0x11223344u, 7};
+        std::vector<std::uint8_t> custom_out(expected.size());
+        BENTO_CHECK(EncodeInto(in, custom, custom_out.data(), custom_out.size()));
+        BENTO_CHECK(custom_out == Encode(in, custom));
+    }
+    BENTO_CHECK_EQ(kMaxEncodedFrameBytes,
+                   kGenericFrameHeaderBytes + static_cast<std::size_t>(kFrameMaxPayload));
+}
+
+/// 零拷贝解码：DecodeView 与 Decode 的字段/状态/consumed 完全一致。
+void TestDecodeView() {
+    const std::size_t sizes[] = {0, 1, 16, 1300, kFrameMaxPayload};
+    for (const std::size_t size : sizes) {
+        const Frame in = MakeFrame(0x3333, 0x000f, size, 4);
+        const std::vector<std::uint8_t> bytes = Encode(in);
+        FrameView view;
+        std::size_t consumed = 0;
+        BENTO_CHECK(DecodeView(bytes.data(), bytes.size(), &view, &consumed) ==
+                    FrameStatus::kOk);
+        BENTO_CHECK_EQ(consumed, bytes.size());
+        BENTO_CHECK_EQ(view.magic, kFrameMagic);
+        BENTO_CHECK_EQ(view.version, kFrameVersion);
+        BENTO_CHECK_EQ(view.type, in.type);
+        BENTO_CHECK_EQ(view.flags, in.flags);
+        BENTO_CHECK_EQ(view.reserved, static_cast<std::uint16_t>(0));
+        BENTO_CHECK_EQ(view.Length(), static_cast<std::uint32_t>(size));
+        BENTO_CHECK_EQ(view.size(), size);
+        BENTO_CHECK_EQ(view.empty(), size == 0);
+        // 零拷贝：载荷指针必须落在输入缓冲内部，且内容与源 payload 一致。
+        BENTO_CHECK(view.data() == bytes.data() + kGenericFrameHeaderBytes);
+        if (size != 0) {
+            BENTO_CHECK(std::memcmp(view.data(), in.payload.data(), size) == 0);
+        }
+        Frame copy;
+        BENTO_CHECK(Decode(bytes.data(), bytes.size(), &copy) == FrameStatus::kOk);
+        BENTO_CHECK_EQ(copy.type, view.type);
+        BENTO_CHECK_EQ(copy.checksum, view.checksum);
+        BENTO_CHECK(copy.payload == in.payload);
+    }
+
+    // 错误路径：同一字节序列下 DecodeView 与 Decode 必须给同一状态码。
+    const std::vector<std::uint8_t> good = Encode(MakeFrame(1, 0, 40, 1));
+    std::vector<std::vector<std::uint8_t>> cases;
+    {
+        auto bytes = good;
+        bytes[0] ^= 0xffu;
+        cases.push_back(bytes);
+    }
+    {
+        auto bytes = good;
+        WriteU16(bytes.data() + 4, static_cast<std::uint16_t>(kFrameVersion + 1));
+        cases.push_back(bytes);
+    }
+    {
+        auto bytes = good;
+        WriteU16(bytes.data() + 10, 1);
+        cases.push_back(bytes);
+    }
+    {
+        auto bytes = good;
+        WriteU32(bytes.data() + 12, kFrameMaxPayload + 1);
+        cases.push_back(bytes);
+    }
+    {
+        auto bytes = good;
+        bytes[16] ^= 0x80u;
+        cases.push_back(bytes);
+    }
+    {
+        auto bytes = good;
+        bytes.resize(10);
+        cases.push_back(bytes);
+    }
+    for (const auto& bytes : cases) {
+        Frame copy;
+        FrameView view;
+        BENTO_CHECK_EQ(Decode(bytes.data(), bytes.size(), &copy),
+                       DecodeView(bytes.data(), bytes.size(), &view));
+    }
+
+    // 参数矩阵（与 Decode 对齐）。
+    FrameView view;
+    BENTO_CHECK(DecodeView(nullptr, 0, &view) == FrameStatus::kNeedMoreData);
+    BENTO_CHECK(DecodeView(nullptr, 1, &view) == FrameStatus::kInvalidArgument);
+    BENTO_CHECK(DecodeView(good.data(), good.size(), nullptr) == FrameStatus::kInvalidArgument);
+    BENTO_CHECK(DecodeView(FrameFormat{0, kFrameVersion}, good.data(), good.size(), &view) ==
+                FrameStatus::kInvalidArgument);
+    BENTO_CHECK(DecodeView(kDefaultFrameFormat, 39, good.data(), good.size(), &view) ==
+                FrameStatus::kLengthExceeded);
+    BENTO_CHECK(DecodeView(kDefaultFrameFormat, 40, good.data(), good.size(), &view) ==
+                FrameStatus::kOk);
+}
+
+/// 流式零拷贝：NextView 与 Next 逐帧一致，视图指向解码器内部缓冲。
+void TestNextView() {
+    constexpr int kCount = 5;
+    std::vector<std::vector<std::uint8_t>> encoded;
+    std::vector<Frame> frames;
+    std::vector<std::uint8_t> stream;
+    for (int i = 0; i < kCount; ++i) {
+        Frame frame = MakeFrame(static_cast<std::uint16_t>(200 + i), 0,
+                                31 + static_cast<std::size_t>(i) * 13,
+                                static_cast<std::uint8_t>(i));
+        encoded.push_back(Encode(frame));
+        stream.insert(stream.end(), encoded.back().begin(), encoded.back().end());
+        frames.push_back(std::move(frame));
+    }
+
+    // 粘包：一次 Append 全部，逐个 NextView 消费。
+    FrameDecoder decoder;
+    decoder.Append(stream.data(), stream.size());
+    int seen = 0;
+    for (;;) {
+        FrameView view;
+        const FrameStatus status = decoder.NextView(&view);
+        if (status != FrameStatus::kOk) {
+            BENTO_CHECK(status == FrameStatus::kNeedMoreData);
+            break;
+        }
+        BENTO_CHECK(seen < kCount);
+        if (seen < kCount) {
+            BENTO_CHECK_EQ(view.type, frames[static_cast<std::size_t>(seen)].type);
+            BENTO_CHECK_EQ(view.size(), frames[static_cast<std::size_t>(seen)].payload.size());
+            BENTO_CHECK(std::memcmp(view.data(), frames[static_cast<std::size_t>(seen)].payload.data(),
+                                    view.size()) == 0);
+        }
+        ++seen;
+    }
+    BENTO_CHECK_EQ(seen, kCount);
+    BENTO_CHECK_EQ(decoder.PendingBytes(), 0U);
+
+    // 半包：逐字节喂，前 n-1 次都必须 kNeedMoreData。
+    FrameDecoder partial;
+    const std::vector<std::uint8_t>& bytes = encoded[2];
+    for (std::size_t i = 0; i + 1 < bytes.size(); ++i) {
+        partial.Append(&bytes[i], 1);
+        FrameView view;
+        BENTO_CHECK(partial.NextView(&view) == FrameStatus::kNeedMoreData);
+    }
+    partial.Append(&bytes.back(), 1);
+    FrameView view;
+    BENTO_CHECK(partial.NextView(&view) == FrameStatus::kOk);
+    BENTO_CHECK_EQ(view.type, frames[2].type);
+    BENTO_CHECK(std::memcmp(view.data(), frames[2].payload.data(), view.size()) == 0);
+    BENTO_CHECK_EQ(partial.PendingBytes(), 0U);
+
+    // 坏帧：错误码与 Next 一致，且缓冲被清空（fail-fast）。
+    FrameDecoder bad_decoder;
+    std::vector<std::uint8_t> bad = encoded[0];
+    bad[0] ^= 0xffu;
+    bad_decoder.Append(bad.data(), bad.size());
+    FrameView bad_view;
+    BENTO_CHECK(bad_decoder.NextView(&bad_view) == FrameStatus::kBadMagic);
+    BENTO_CHECK_EQ(bad_decoder.PendingBytes(), 0U);
+    bad_decoder.Append(encoded[1].data(), encoded[1].size());
+    FrameView recovered;
+    BENTO_CHECK(bad_decoder.NextView(&recovered) == FrameStatus::kOk);
+    BENTO_CHECK_EQ(recovered.type, frames[1].type);
+
+    // nullptr 输出。
+    BENTO_CHECK(partial.NextView(nullptr) == FrameStatus::kInvalidArgument);
+
+    // 压缩路径：已消费前缀 + 半包残留时 Append，触发 memmove 压缩，
+    // 视图必须仍指向正确内容。
+    FrameDecoder compact;
+    compact.Append(encoded[0].data(), encoded[0].size());
+    compact.Append(encoded[1].data(), 7);
+    FrameView first;
+    BENTO_CHECK(compact.NextView(&first) == FrameStatus::kOk);
+    BENTO_CHECK_EQ(first.type, frames[0].type);
+    BENTO_CHECK_EQ(compact.PendingBytes(), 7U);
+    compact.Append(encoded[1].data() + 7, encoded[1].size() - 7);
+    FrameView second;
+    BENTO_CHECK(compact.NextView(&second) == FrameStatus::kOk);
+    BENTO_CHECK_EQ(second.type, frames[1].type);
+    BENTO_CHECK(std::memcmp(second.data(), frames[1].payload.data(), second.size()) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -752,5 +962,9 @@ int main() {
     TestDecodeArgumentMatrix();
     TestConcurrentDecoders();
     TestRandomizedAdversarial();
+    // 零拷贝 API（EncodeInto / DecodeView / NextView）与拷贝版逐字节对拍。
+    TestEncodeInto();
+    TestDecodeView();
+    TestNextView();
     return bento_test::Finish("test_frame");
 }

@@ -151,4 +151,53 @@ void RunStressTests() {
 #else
     std::printf("[hash] instrumented build: throughput thresholds skipped\n");
 #endif
+
+    // 硬件路径 vs 表驱动：1e7 随机数据、随机分段。
+    // x86-64 上 IEEE 走 PCLMULQDQ 折叠、Castagnoli 走 crc32q；把 polynomial
+    // 置 0 可强制同一个 Update 走表驱动，二者必须逐字节一致（含分段拼接）。
+    {
+        std::uint64_t rng = 0x243f6a8885a308d3ull;
+        const auto next = [&rng]() {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            return rng;
+        };
+        constexpr std::size_t kRandomBytes = 10000000;
+        std::vector<std::uint8_t> random(kRandomBytes);
+        for (auto& byte : random) {
+            byte = static_cast<std::uint8_t>(next());
+        }
+        Table ieee_table = MakeTable(IEEE);
+        ieee_table.polynomial = 0;
+        Table castagnoli_table = MakeTable(Castagnoli);
+        castagnoli_table.polynomial = 0;
+
+        std::uint32_t hw_ieee = 0;
+        std::uint32_t tab_ieee = 0;
+        std::uint32_t hw_cast = 0;
+        std::uint32_t tab_cast = 0;
+        std::size_t offset = 0;
+        std::size_t segments = 0;
+        while (offset < kRandomBytes) {
+            const std::size_t take =
+                std::min<std::size_t>(kRandomBytes - offset, 1 + next() % 4096u);
+            const ByteSpan piece = AsBytes(random.data() + offset, take);
+            hw_ieee = Crc32::Update(hw_ieee, IEEETable, piece);
+            tab_ieee = Crc32::Update(tab_ieee, ieee_table, piece);
+            hw_cast = Crc32::Update(hw_cast, CastagnoliTable, piece);
+            tab_cast = Crc32::Update(tab_cast, castagnoli_table, piece);
+            offset += take;
+            ++segments;
+        }
+        HASH_CHECK(hw_ieee == tab_ieee);
+        HASH_CHECK(hw_cast == tab_cast);
+        // 与一次性结果一致（同一数据、从 0 开始），验证分段拼接语义。
+        HASH_CHECK(hw_ieee == Crc32::ChecksumIEEE(AsBytes(random)));
+        HASH_CHECK(hw_cast == Crc32::Checksum(AsBytes(random), CastagnoliTable));
+        std::printf("[hash] hw-vs-table 1e7: segments=%zu ieee=%08x castagnoli=%08x %s\n",
+                    segments, hw_ieee, hw_cast,
+                    (hw_ieee == tab_ieee && hw_cast == tab_cast) ? "OK" : "FAIL");
+        std::fflush(stdout);
+    }
 }

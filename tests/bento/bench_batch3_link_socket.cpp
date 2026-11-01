@@ -4,7 +4,7 @@
  * @details 本程序是**独立基准**（不进 ctest），用同一份源码在改动前后各跑
  *          一次，给出可对比的数字：
  *
- *          - `link_tx`：Link 发送 API 调用延迟（p50/p99/max）。
+ *          - `link_tx`：Link 发送 API 调用延迟（wall p50/p90/p99 + 线程 CPU 时间）。
  *            两个子场景：
  *              * `idle`：接收线程 `RunOnce(5)` 大部分时间阻塞在 poll；
  *              * `busy`：对端持续灌包，接收线程每轮处理到 kMaxFramesPerRun。
@@ -13,6 +13,8 @@
  *          - `sock_rtt`：Socket 层 ping-pong（unix socketpair / UDP / TCP），
  *            每次 op 都走 `begin_operation()` + `end_operation()`，用于观察
  *            去锁优化后的每 op 成本。
+ *          - `spin`：与 link_tx 同节奏但**不调用 Send**，用于识别环境噪声
+ *            （WSL2 时钟跳变 / 宿主调度）对 wall 延迟分布的污染。
  *
  * @author go2cpp contributors
  * @date 2026-11-01
@@ -48,8 +50,13 @@ double NowNs() {
             .count());
 }
 
-/// @brief 进程 CPU 时间（用户 + 系统），纳秒。用于估算每 op 的 CPU 成本。
-double CpuNs() {
+double ThreadCpuNs() {
+    timespec ts{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<double>(ts.tv_sec) * 1e9 + static_cast<double>(ts.tv_nsec);
+}
+
+double ProcessCpuNs() {
     timespec ts{};
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
     return static_cast<double>(ts.tv_sec) * 1e9 + static_cast<double>(ts.tv_nsec);
@@ -59,49 +66,60 @@ double CpuNs() {
 class Samples {
    public:
     explicit Samples(std::size_t reserve) {
-        m_values.reserve(reserve);
+        m_wall.reserve(reserve);
+        m_cpu.reserve(reserve);
     }
-    void Add(double us) {
-        m_values.push_back(us);
+    void Add(double wall_us, double cpu_us) {
+        m_wall.push_back(wall_us);
+        m_cpu.push_back(cpu_us);
     }
     double Percentile(double p) const {
-        if (m_values.empty()) {
+        return PercentileOf(m_wall, p);
+    }
+    double CpuPercentile(double p) const {
+        return PercentileOf(m_cpu, p);
+    }
+    double Max() const {
+        return m_wall.empty() ? 0.0 : *std::max_element(m_wall.begin(), m_wall.end());
+    }
+    double Mean() const {
+        if (m_wall.empty()) {
             return 0.0;
         }
-        std::vector<double> copy = m_values;
+        double sum = 0.0;
+        for (double v : m_wall) {
+            sum += v;
+        }
+        return sum / static_cast<double>(m_wall.size());
+    }
+    std::size_t size() const {
+        return m_wall.size();
+    }
+    /// @brief wall 超过 threshold_us 的样本数。
+    std::size_t CountAbove(double threshold_us) const {
+        std::size_t count = 0;
+        for (double v : m_wall) {
+            if (v > threshold_us) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+   private:
+    static double PercentileOf(const std::vector<double>& values, double p) {
+        if (values.empty()) {
+            return 0.0;
+        }
+        std::vector<double> copy = values;
         std::sort(copy.begin(), copy.end());
         const std::size_t index = static_cast<std::size_t>(
             std::min<double>(static_cast<double>(copy.size() - 1), p * (copy.size() - 1)));
         return copy[index];
     }
-    double Max() const {
-        return m_values.empty() ? 0.0 : *std::max_element(m_values.begin(), m_values.end());
-    }
-    double Mean() const {
-        if (m_values.empty()) {
-            return 0.0;
-        }
-        double sum = 0.0;
-        for (double v : m_values) {
-            sum += v;
-        }
-        return sum / static_cast<double>(m_values.size());
-    }
-    std::size_t size() const {
-        return m_values.size();
-    }
-
-   private:
-    std::vector<double> m_values;
+    std::vector<double> m_wall;
+    std::vector<double> m_cpu;
 };
-
-/// @brief 把一段可调用对象记为一次延迟样本。
-template <typename Fn>
-double TimeUs(Fn&& fn) {
-    const double begin = NowNs();
-    fn();
-    return (NowNs() - begin) / 1000.0;
-}
 
 go2cpp::bento::LinkConfig MakeServerConfig() {
     go2cpp::bento::LinkConfig config;
@@ -162,8 +180,39 @@ bool ConnectPair(go2cpp::bento::Link& server, go2cpp::bento::Link& client,
 }
 
 // ---------------------------------------------------------------------------
-// link_tx：发送 API 调用延迟（空闲 / 接收繁忙）
+// link_tx / spin：发送 API 调用延迟（空闲 / 接收繁忙 / 对照）
 // ---------------------------------------------------------------------------
+
+void PrintTx(const char* name, std::uint64_t probes, std::uint64_t ok, const Samples& samples,
+             std::uint64_t server_rx, std::uint64_t client_rx) {
+    std::printf(
+        "[link_tx:%s] probes=%llu ok=%llu p50=%.1fus p90=%.1fus p99=%.1fus max=%.1fus "
+        "mean=%.1fus gt1ms=%zu cpu_p50=%.2fus cpu_p99=%.2fus server_rx=%llu client_rx=%llu\n",
+        name, static_cast<unsigned long long>(probes), static_cast<unsigned long long>(ok),
+        samples.Percentile(0.50), samples.Percentile(0.90), samples.Percentile(0.99),
+        samples.Max(), samples.Mean(), samples.CountAbove(1000.0), samples.CpuPercentile(0.50),
+        samples.CpuPercentile(0.99), static_cast<unsigned long long>(server_rx),
+        static_cast<unsigned long long>(client_rx));
+    std::fflush(stdout);
+}
+
+/// @brief 与真实测量同节奏的空转对照：只做时间测量，不调 Send。
+void RunSpinCase() {
+    constexpr int kSamples = 5000;
+    constexpr double kIntervalNs = 200e3;
+    Samples samples(kSamples);
+    double next = NowNs();
+    for (int i = 0; i < kSamples; ++i) {
+        next += kIntervalNs;
+        while (NowNs() < next) {
+        }
+        const double begin = NowNs();
+        const double cpu_begin = ThreadCpuNs();
+        asm volatile("" ::: "memory");
+        samples.Add((NowNs() - begin) / 1000.0, (ThreadCpuNs() - cpu_begin) / 1000.0);
+    }
+    PrintTx("spin", kSamples, kSamples, samples, 0, 0);
+}
 
 void RunLinkTxCase(const char* name, bool busy) {
     go2cpp::bento::Link server{MakeServerConfig()};
@@ -224,8 +273,10 @@ void RunLinkTxCase(const char* name, bool busy) {
         while (NowNs() < next) {
             // 自旋到下一个探测点，避免 sleep 粒度把样本噪声放大。
         }
-        const double us = TimeUs([&]() { sent += client.SendDatagram(1, payload, sizeof(payload)); });
-        samples.Add(us);
+        const double begin = NowNs();
+        const double cpu_begin = ThreadCpuNs();
+        sent += client.SendDatagram(1, payload, sizeof(payload)) ? 1 : 0;
+        samples.Add((NowNs() - begin) / 1000.0, (ThreadCpuNs() - cpu_begin) / 1000.0);
     }
     flood_stop.store(true);
     if (flood_thread.joinable()) {
@@ -238,15 +289,7 @@ void RunLinkTxCase(const char* name, bool busy) {
     if (client_thread.joinable()) {
         client_thread.join();
     }
-
-    std::printf(
-        "[link_tx:%s] send=%llu ok=%llu p50=%.1fus p99=%.1fus p999=%.1fus max=%.1fus "
-        "mean=%.1fus server_rx=%llu client_rx=%llu\n",
-        name, static_cast<unsigned long long>(kSamples), static_cast<unsigned long long>(sent),
-        samples.Percentile(0.50), samples.Percentile(0.99), samples.Percentile(0.999),
-        samples.Max(), samples.Mean(), static_cast<unsigned long long>(server_received.load()),
-        static_cast<unsigned long long>(client_received.load()));
-    std::fflush(stdout);
+    PrintTx(name, kSamples, sent, samples, server_received.load(), client_received.load());
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +328,7 @@ void RunLinkStress(std::uint64_t total) {
     std::uint8_t payload[64];
     std::memset(payload, 0x11, sizeof(payload));
     std::uint64_t ok = 0;
-    const double cpu_before = CpuNs();
+    const double cpu_before = ThreadCpuNs();
     const double begin = NowNs();
     for (std::uint64_t i = 0; i < total; ++i) {
         if (client.SendDatagram(1, payload, sizeof(payload))) {
@@ -293,7 +336,7 @@ void RunLinkStress(std::uint64_t total) {
         }
     }
     const double elapsed = NowNs() - begin;
-    const double cpu = CpuNs() - cpu_before;
+    const double cpu = ThreadCpuNs() - cpu_before;
     stop.store(true);
     if (server_thread.joinable()) {
         server_thread.join();
@@ -344,7 +387,7 @@ void RunUnixPairRtt(std::uint64_t rounds) {
     RttReport report;
     report.name = "unix";
     report.rounds = rounds;
-    const double cpu_before = CpuNs();
+    const double cpu_before = ProcessCpuNs();
     const double begin = NowNs();
     for (std::uint64_t i = 0; i < rounds; ++i) {
         (void)a->send(payload, sizeof(payload));
@@ -353,40 +396,42 @@ void RunUnixPairRtt(std::uint64_t rounds) {
         (void)a->recv(buffer, sizeof(buffer));
     }
     report.elapsed_ns = NowNs() - begin;
-    report.cpu_ns = CpuNs() - cpu_before;
+    report.cpu_ns = ProcessCpuNs() - cpu_before;
     PrintRtt(report);
 }
 
 void RunUdpRtt(std::uint64_t rounds) {
     auto server = go2cpp::net::Socket::CreateUDP(AF_INET);
     auto client = go2cpp::net::Socket::CreateUDP(AF_INET);
-    auto server_addr = go2cpp::net::ResolveUDPAddr("127.0.0.1", 0);
-    if (!server || !client || !server_addr || !server->bind(*server_addr)) {
+    auto any_addr = go2cpp::net::ResolveUDPAddr("127.0.0.1", 0);
+    if (!server || !client || !any_addr || !server->bind(*any_addr) || !client->bind(*any_addr)) {
         std::fprintf(stderr, "[sock_rtt:udp] setup failed\n");
         return;
     }
-    auto bound = server->local_address();
-    if (!bound) {
+    auto server_addr = server->local_address();
+    if (!server_addr) {
         std::fprintf(stderr, "[sock_rtt:udp] local_address failed\n");
         return;
     }
-    (void)client->connect(*bound);
     std::uint8_t payload[64];
     std::memset(payload, 0x44, sizeof(payload));
     std::uint8_t buffer[128];
     RttReport report;
     report.name = "udp";
     report.rounds = rounds;
-    const double cpu_before = CpuNs();
+    const double cpu_before = ProcessCpuNs();
     const double begin = NowNs();
     for (std::uint64_t i = 0; i < rounds; ++i) {
-        (void)client->send(payload, sizeof(payload));
-        (void)server->recv(buffer, sizeof(buffer));
-        (void)server->send_to(payload, sizeof(payload), *bound);
-        (void)client->recv(buffer, sizeof(buffer));
+        (void)client->send_to(payload, sizeof(payload), *server_addr);
+        go2cpp::net::AddressPtr from;
+        (void)server->recv_from(buffer, sizeof(buffer), from);
+        if (from) {
+            (void)server->send_to(payload, sizeof(payload), *from);
+        }
+        (void)client->recv_from(buffer, sizeof(buffer), from);
     }
     report.elapsed_ns = NowNs() - begin;
-    report.cpu_ns = CpuNs() - cpu_before;
+    report.cpu_ns = ProcessCpuNs() - cpu_before;
     PrintRtt(report);
 }
 
@@ -438,14 +483,14 @@ void RunTcpRtt(std::uint64_t rounds) {
     RttReport report;
     report.name = "tcp";
     report.rounds = rounds;
-    const double cpu_before = CpuNs();
+    const double cpu_before = ProcessCpuNs();
     const double begin = NowNs();
     for (std::uint64_t i = 0; i < rounds; ++i) {
         (void)client->send(payload, sizeof(payload));
         (void)client->recv(buffer, sizeof(buffer));
     }
     report.elapsed_ns = NowNs() - begin;
-    report.cpu_ns = CpuNs() - cpu_before;
+    report.cpu_ns = ProcessCpuNs() - cpu_before;
     PrintRtt(report);
     client->close();
     server_thread.join();
@@ -459,8 +504,12 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::printf("=== bench_batch3 (mode=%s) ===\n", mode.c_str());
     if (mode == "link_tx" || mode == "all") {
+        RunSpinCase();
         RunLinkTxCase("idle", false);
         RunLinkTxCase("busy", true);
+    }
+    if (mode == "spin") {
+        RunSpinCase();
     }
     if (mode == "link_stress" || mode == "all") {
         const std::uint64_t total = argc > 2
