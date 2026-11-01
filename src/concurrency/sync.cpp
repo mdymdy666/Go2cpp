@@ -145,6 +145,17 @@ namespace detail {
 // Mutex::Lock，读到的是零初始化值（关闭），最多少记一次诊断计数。
 std::atomic<int> g_held_park_detect{ResolveHeldParkDefault()};
 
+// 每线程缓存：-1 表示本线程尚未从全局抄过值。POD + initial-exec，
+// 头文件里的内联快路径读它就是一条 `mov %fs:off`（无 GOT、无守卫）。
+thread_local std::int8_t t_held_park_cache GO2CPP_SYNC_TLS_IE = -1;
+
+std::int8_t ResolveHeldParkCache() noexcept {
+    const std::int8_t value =
+        g_held_park_detect.load(std::memory_order_relaxed) != 0 ? 1 : 0;
+    t_held_park_cache = value;
+    return value;
+}
+
 }  // namespace detail
 
 namespace {
@@ -851,11 +862,16 @@ struct WaitTarget {
     }
 };
 
-WaitTarget CurrentTarget() noexcept {
+/// @param known_scheduler 调用方已经读到的当前调度器（可为 nullptr）。
+///        传入非空值时省掉一次 `current_scheduler()` 的跨库调用；调用方
+///        （`ConditionVariable::Wait`）本来就要先读一次 TLS 才能判定快路径。
+WaitTarget CurrentTarget(Scheduler* const known_scheduler) noexcept {
     // 普通线程（绝大多数争用场景）没有 scheduler：此时 `current_task()`
     // 必然是空 shared_ptr，不必付一次 TLS 访问 + 引用计数拷贝。这正是
     // 每次快路径 CAS 失败后的第一段热代码（4t/16t 争用基准实测）。
-    Scheduler* const scheduler = Scheduler::current_scheduler();
+    Scheduler* const scheduler = known_scheduler != nullptr
+                                     ? known_scheduler
+                                     : Scheduler::current_scheduler();
     if (scheduler == nullptr) {
         // 非受管线程：只有「手动 Fiber」需要在 park 前被识别出来。
         const bool manual_fiber = Fiber::Current() != nullptr;
@@ -874,6 +890,9 @@ WaitTarget CurrentTarget() noexcept {
     const bool manual_fiber = Fiber::Current() != nullptr;
     return {scheduler, {}, manual_fiber};
 }
+
+/// @brief 无参重载：自行读一次当前调度器（慢路径/诊断路径用）。
+WaitTarget CurrentTarget() noexcept { return CurrentTarget(nullptr); }
 
 /**
  * @brief 把等待节点注册到 Context 的取消信号上，析构时自动注销（RAII）。
@@ -2308,7 +2327,22 @@ ConditionVariable::~ConditionVariable() {
 bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
     // 必须先识别手动 Fiber。即使 Context 已取消，也不能走普通线程的
     // unlock/relock 路径，否则竞争中的重锁会阻塞 carrier 线程。
-    const WaitTarget target = CurrentTarget();
+    //
+    // ===== 短路（本轮）=====
+    // 1P1C 快路径只对「纯普通线程」开放，而判定它只需要一次 TLS 读。
+    // 原实现无条件调用 CurrentTarget()：普通线程会白付一次跨库调用 +
+    // 一次 `current_task()` 的 std::shared_ptr 拷贝（非平凡 thread_local，
+    // 要过动态初始化守卫 + 控制块判断）。这里先用 `current_scheduler()`
+    // 判定，纯 native 线程直接保持默认构造的 WaitTarget（与 CurrentTarget
+    // 在 scheduler==nullptr、Fiber::Current()==nullptr 时的返回值逐字段一致）；
+    // 受管 G 分支把已读到的 scheduler 传进去，避免重复读 TLS。
+    Scheduler* const current = Scheduler::current_scheduler();
+    WaitTarget target;
+    if (current != nullptr) {
+        target = CurrentTarget(current);
+    } else if (Fiber::Current() != nullptr) {
+        target.unsupported_manual_fiber = true;
+    }
     const auto abort_wait = [this, &mutex](bool preserve_lock) {
 #if GO2CPP_DEBUG_RESOURCES
         GO2CPP_DEBUG_RESOURCE_EVENT_V5(
@@ -2586,12 +2620,20 @@ void ConditionVariable::NotifyOne() noexcept {
     // 1P1C 快路径：独占槽里有 native 等待者时，无锁认领并唤醒。
     // 必须排在「计数为 0 直接返回」之前 —— 快路径等待者不计入计数。
     {
-        // 一次 RMW 写槽行即完成交接：等待者自旋读的就是这一行。
-        // exchange 的 release 语义保证 Notify 之前的用户态写对等待者可见。
-        const std::uintptr_t slot =
-            m_impl->m_fast_waiter.exchange(0U, std::memory_order_acq_rel);
-        if (slot != 0U) {
-            return;
+        // 空槽是绝大多数调用的真实形态（持锁方每次改完状态都顺手通知一次）。
+        // 先用一次 acquire load 判空：不拉缓存行独占、不产生 locked 前缀。
+        // 原实现无条件 exchange(0)，即使无人等待也要付一次隐式 lock（~20 cyc）。
+        //
+        // 非空才 exchange。**不能**用裸 store 代替：
+        //   通知方读 A → 另一个等待者 CAS(0→B) 成功 → 通知方 store 0
+        // 会把 B 刚发布的槽覆盖掉，B 的唤醒永久丢失（同一槽只能被认领一次）。
+        // exchange 把「读 + 清」合成一次不可分割的 RMW，认领与清空同时成立。
+        if (m_impl->m_fast_waiter.load(std::memory_order_acquire) != 0U) {
+            const std::uintptr_t slot =
+                m_impl->m_fast_waiter.exchange(0U, std::memory_order_acq_rel);
+            if (slot != 0U) {
+                return;
+            }
         }
     }
     // 慢路径：没有等待者时连队列锁都不取。计数与队列在同一把锁内维护，
@@ -2993,12 +3035,21 @@ std::int64_t WaitGroup::Count() const noexcept {
 }
 
 void SetHeldLockParkDetection(bool enabled) noexcept {
+    // 调用线程的缓存立即同步，保证「设置后在本线程测量/验证」的语义；
+    // 其它线程仍是「首次访问时读全局」，见 t_held_park_cache 的注释。
+    detail::t_held_park_cache = enabled ? 1 : 0;
     detail::g_held_park_detect.store(enabled ? 1 : 0,
                                      std::memory_order_relaxed);
 }
 
 bool HeldLockParkDetection() noexcept {
+#if defined(GO2CPP_HELD_PARK_DETECT_RUNTIME)
     return detail::held_park_detection_on();
+#else
+    // 编译期关闭的构建：如实报告「没有热路径检测」，而不是回读一个
+    // 不会被任何热路径消费的全局开关。
+    return false;
+#endif
 }
 
 std::uint64_t HeldLockParkCount() noexcept {

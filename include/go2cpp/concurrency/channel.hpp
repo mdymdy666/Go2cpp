@@ -2838,10 +2838,15 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       return {ChannelStatus::kReady, {}};
     }
 
+    // 走到这里已确定要进慢路径：线程归属只判定一次，下面「允许自旋」与
+    // 「是否绑定 managed」共用同一个结果。两者之间只有自旋与锁操作（都不
+    // park），归属不可能变化；原实现每次 SendUntil 付两次 CanSpinWait 的
+    // 跨库调用（current_task_ptr + Fiber::Current）。
+    const bool native_caller = detail::CanSpinWait();
     // step4.5: 缓冲满且是原生线程——先自旋等一个空位，而不是立刻 park。
     // 与 P0 前一致：只自旋一次，预算耗尽说明对端确实慢。
     if (!spin_attempted && allow_spin && m_capacity > 1 && m_capacity <= 256 &&
-        !nonblocking && detail::CanSpinWait()) {
+        !nonblocking && native_caller) {
       spin_attempted = true;
       const std::uint64_t sequence =
           m_generation.load(std::memory_order_relaxed);
@@ -2876,8 +2881,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
     node->generation = NextWaiterGeneration();
-    const bool native_waiter = detail::CanSpinWait();
-    if (!native_waiter && !detail::ChannelBindManaged(node)) {
+    if (!native_caller && !detail::ChannelBindManaged(node)) {
       ReleaseSendNode(node);
       return {ChannelStatus::kInvalid, detail::ValueOperationError()};
     }
@@ -3209,9 +3213,11 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       }
     }
 
+    // 同 SendUntil：进入慢路径后线程归属只判定一次，自旋与绑定共用。
+    const bool native_caller = detail::CanSpinWait();
     // 缓冲空且没有待交接的发送者：原生线程先自旋等数据。
     if (!spin_attempted && allow_spin && m_capacity > 1 && m_capacity <= 256 &&
-        !nonblocking && detail::CanSpinWait()) {
+        !nonblocking && native_caller) {
       spin_attempted = true;
       const std::uint64_t sequence =
           m_generation.load(std::memory_order_relaxed);
@@ -3255,8 +3261,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
               detail::ValueOperationError()};
     }
     node->generation = NextWaiterGeneration();
-    const bool native_waiter = detail::CanSpinWait();
-    if (!native_waiter && !detail::ChannelBindManaged(node)) {
+    if (!native_caller && !detail::ChannelBindManaged(node)) {
       ReleaseRecvNode(node);
       return {std::nullopt, false, true, ChannelStatus::kInvalid,
               detail::ValueOperationError()};

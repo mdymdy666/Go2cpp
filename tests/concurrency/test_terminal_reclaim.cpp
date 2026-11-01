@@ -163,6 +163,8 @@ void TestLockHoldingTerminalRetained() {
     go2cpp_tests::announce("terminal G holding a sync::Mutex stays registered");
     const bool saved_detection = go2cpp::sync::HeldLockParkDetection();
     go2cpp::sync::SetHeldLockParkDetection(true);
+    // Release 构建把检测编译期关闭 → 不记录 owner，跳过 owner 断言。
+    const bool detection_active = go2cpp::sync::HeldLockParkDetection();
 
     go2cpp::Scheduler scheduler(SingleWorkerConfig(1));
     scheduler.start();
@@ -175,9 +177,11 @@ void TestLockHoldingTerminalRetained() {
     GO2CPP_REQUIRE(owner->wait_for(5s));
     const auto snapshot = abandoned.DebugSnapshotInternal();
     GO2CPP_CHECK(snapshot.held);
-    GO2CPP_CHECK(snapshot.owner_known);
-    GO2CPP_CHECK(snapshot.owner_gid ==
-                 static_cast<std::uint64_t>(owner->id()));
+    if (detection_active) {
+        GO2CPP_CHECK(snapshot.owner_known);
+        GO2CPP_CHECK(snapshot.owner_gid ==
+                     static_cast<std::uint64_t>(owner->id()));
+    }
 
     // 足够多的完成把回收游标推过全部 16 个条带。
     constexpr int kFlush = 64;

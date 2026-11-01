@@ -420,12 +420,13 @@ public:
     LocalRunQueue(const LocalRunQueue&) = delete;
     LocalRunQueue& operator=(const LocalRunQueue&) = delete;
 
-    /// @brief 入队（裸指针：节点不持有强引用）。
-    /// @details 所有权契约见 Task::mark_queue_node() 的注释：调度器内部每个
-    ///          已注册 G 由注册表自持强引用保活，因此队列节点只存裸指针，
-    ///          生产侧不再付一次控制块 +1（原实现的 push 每任务一次原子）。
-    bool push(Task* task) noexcept {
-        if (task == nullptr) {
+    /// @brief 入队（节点持有一次强引用）。
+    /// @details P7 之后注册表不再兜底：队列节点自己就是 Task 的生命周期锚点，
+    ///          生产者付一次控制块 +1，消费者把引用**移动**出槽位（不再 +1），
+    ///          完成时随局部 shared_ptr 析构释放。这样每次入队-出队往返只需
+    ///          一次控制块 RMW，而不是「注册表 hold + 出队 borrow」两次。
+    bool push(const std::shared_ptr<Task>& task) noexcept {
+        if (!task) {
             return false;
         }
         std::size_t position = m_tail.load(std::memory_order_relaxed);
@@ -456,7 +457,8 @@ public:
     /// @details 消费端仍按每个槽自己的 sequence 判定可见性，因此「预留
     ///          tail 后逐个发布」不会让消费者看到未写完的槽位；本函数不做
     ///          部分预留，槽位不够就整批返回 0，避免留下空洞。
-    std::size_t push_batch(Task* const* tasks, std::size_t count) noexcept {
+    std::size_t push_batch(const std::shared_ptr<Task>* tasks,
+                           std::size_t count) noexcept {
         if (tasks == nullptr || count == 0) {
             return 0;
         }
@@ -492,9 +494,8 @@ public:
     }
 
     /// @brief 出队；队列空返回空指针。
-    /// @details 节点里是裸指针，这里先把注册表的自持强引用拷出来（一次
-    ///          控制块 +1），再清掉节点标记 —— 顺序不能反，否则注册表
-    ///          可能在两步之间回收该 G。
+    /// @details 槽位里的强引用被**移动**出来（零控制块 RMW），节点的生命
+    ///          周期责任同时从队列转交给调用方。
     std::shared_ptr<Task> pop() noexcept {
         std::size_t position = m_head.load(std::memory_order_relaxed);
         for (;;) {
@@ -508,11 +509,14 @@ public:
                 if (m_head.compare_exchange_weak(position, position + 1,
                                                  std::memory_order_relaxed,
                                                  std::memory_order_relaxed)) {
-                    Task* const raw = cell.task;
-                    cell.task = nullptr;
+                    std::shared_ptr<Task> task = std::move(cell.task);
+                    cell.task.reset();
                     cell.sequence.store(position + kMask + 1,
                                         std::memory_order_release);
-                    return adopt_popped(raw);
+                    if (task) {
+                        task->clear_queue_node();
+                    }
+                    return task;
                 }
             } else if (difference < 0) {
                 return {};
@@ -548,28 +552,19 @@ public:
 private:
     struct Cell {
         std::atomic<std::size_t> sequence{0};
-        /// 裸指针（见 push() 的所有权契约）；空表示槽位已消费。
-        Task* task{nullptr};
+        /// 强引用（见 push() 的所有权契约）；空表示槽位已消费。
+        std::shared_ptr<Task> task;
     };
 
-    /// @brief 发布一个槽位：先标节点在位，再写指针，最后 release 发布序号。
+    /// @brief 发布一个槽位：先标节点在位，再写引用，最后 release 发布序号。
+    /// @details 引用在这里完成一次拷贝（+1），之后由消费者移动接手。
     static void publish_cell(Cell& cell, std::size_t position,
-                             Task* task) noexcept {
-        if (task != nullptr) {
+                             const std::shared_ptr<Task>& task) noexcept {
+        if (task) {
             task->mark_queue_node();
         }
         cell.task = task;
         cell.sequence.store(position + 1, std::memory_order_release);
-    }
-
-    /// @brief 消费方接手：先取强引用，再清节点标记（顺序不可反）。
-    static std::shared_ptr<Task> adopt_popped(Task* raw) noexcept {
-        if (raw == nullptr) {
-            return {};
-        }
-        std::shared_ptr<Task> strong = raw->borrow_registry_strong();
-        raw->clear_queue_node();
-        return strong;
     }
 
     // 槽位数组与两个游标分开缓存行，避免生产者/消费者互相拖拽同一行。
@@ -607,31 +602,36 @@ public:
     RunNextSlot(const RunNextSlot&) = delete;
     RunNextSlot& operator=(const RunNextSlot&) = delete;
 
-    /// @brief 放入槽（裸指针，所有权契约同 LocalRunQueue::push）。
-    /// @param displaced 被挤出的旧任务（裸指针）；调用方必须先取强引用
-    ///        （borrow_registry_strong）再 clear_queue_node，顺序不能反。
-    bool push(Task* task, Task*& displaced) noexcept {
-        if (task == nullptr) {
+    /// @brief 放入槽（强引用，所有权契约同 LocalRunQueue::push）。
+    /// @param displaced 被挤出的旧任务强引用；调用方要么重新入队，要么让
+    ///        它在自己的作用域结束时释放（队列同时只锚定一个 G）。
+    bool push(const std::shared_ptr<Task>& task,
+              std::shared_ptr<Task>& displaced) noexcept {
+        if (!task) {
             return false;
         }
         std::lock_guard<detail::HotSpinLock> lock(m_mutex);
-        displaced = m_task;
+        displaced = std::move(m_task);
         m_task = task;
         task->mark_queue_node();
+        if (displaced) {
+            // 槽位已换人：被挤出的 G 不再有任何队列节点，标记必须先清掉，
+            // 否则注册表回收门槛（!has_queue_node）会把它永久留在表里。
+            displaced->clear_queue_node();
+        }
         return true;
     }
 
-    /// @brief 取走槽内任务；空槽返回空指针。
+    /// @brief 取走槽内任务；空槽返回空指针（引用被移动，零 RMW）。
     std::shared_ptr<Task> take() noexcept {
         std::lock_guard<detail::HotSpinLock> lock(m_mutex);
-        Task* const raw = m_task;
-        m_task = nullptr;
-        if (raw == nullptr) {
+        std::shared_ptr<Task> task = std::move(m_task);
+        m_task.reset();
+        if (!task) {
             return {};
         }
-        std::shared_ptr<Task> strong = raw->borrow_registry_strong();
-        raw->clear_queue_node();
-        return strong;
+        task->clear_queue_node();
+        return task;
     }
 
     /// @brief 槽是否为空（诊断/快照用，非同步判定）。
@@ -642,7 +642,7 @@ public:
 
 private:
     mutable detail::HotSpinLock m_mutex;
-    Task* m_task{nullptr};
+    std::shared_ptr<Task> m_task;
 };
 
 // ---------------------------------------------------------------------------
@@ -2747,7 +2747,7 @@ public:
             // 队列已换成无锁环形，不能整段 swap 回去；逐个重新发布，
             // 满时转入全局队列（本函数稍后的 global 排空会统一收尾）。
             for (auto& task : resumable) {
-                if (!processor.queue.push(task.get())) {
+                if (!processor.queue.push(task)) {
                     global_queue.emplace_back(std::move(task));
                 }
             }
@@ -3881,7 +3881,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
             const auto direct = target_hint;
             auto& direct_processor =
                 m_impl->processors[direct % m_impl->processors.size()];
-            if (direct_processor.queue.push(task.get())) {
+            if (direct_processor.queue.push(task)) {
                 m_impl->runnable_add(direct);
                 published = true;
             }
@@ -3966,7 +3966,7 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         try {
             // 本地环满（或 local_queue_limit=0）时溢出到全局队列，对应
             // Go 的 runqputslow；环形 push 本身不分配、不抛异常。
-            if (!use_global && processor.queue.push(task.get())) {
+            if (!use_global && processor.queue.push(task)) {
                 GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(), processor.id);
             } else {
                 m_impl->global_queue.push_back(task);
@@ -4032,20 +4032,16 @@ bool Scheduler::publish_runnext(PId processor_id,
         return false;
     }
     auto& processor = m_impl->processors[processor_id];
-    Task* displaced_raw = nullptr;
-    if (!processor.runnext.push(task.get(), displaced_raw)) {
+    std::shared_ptr<Task> displaced;
+    if (!processor.runnext.push(task, displaced)) {
         return false;
     }
     m_impl->metric_runnext_pushes.fetch_add(1, std::memory_order_relaxed);
-    if (displaced_raw != nullptr) {
+    if (displaced) {
         m_impl->metric_runnext_displaced.fetch_add(1,
                                                    std::memory_order_relaxed);
-        // 先取强引用再清节点标记：中间任何时刻注册表都不能回收它。
-        std::shared_ptr<Task> displaced =
-            displaced_raw->borrow_registry_strong();
-        displaced_raw->clear_queue_node();
         // 旧任务必须继续可运行：先尝试本地环尾，满时由 enqueue 收敛。
-        if (!processor.queue.push(displaced.get())) {
+        if (!processor.queue.push(displaced)) {
             displaced->clear_queued();
             (void)enqueue(displaced);
         }
@@ -4093,20 +4089,17 @@ bool Scheduler::publish_to_machine(MId machine_id,
     if (!target) {
         return false;
     }
-    Task* displaced_raw = nullptr;
-    if (!target->inbox.push(task.get(), displaced_raw)) {
+    std::shared_ptr<Task> displaced;
+    if (!target->inbox.push(task, displaced)) {
         return false;
     }
     m_impl->metric_inbox_pushes.fetch_add(1, std::memory_order_relaxed);
-    if (displaced_raw != nullptr) {
+    if (displaced) {
         // 定向槽只有一个位置：被挤出的任务回落到该 M 所属 P 的队列。
-        std::shared_ptr<Task> displaced =
-            displaced_raw->borrow_registry_strong();
-        displaced_raw->clear_queue_node();
         auto& processor = m_impl->processors[
             static_cast<std::size_t>(target->processor) %
             m_impl->processors.size()];
-        if (!processor.queue.push(displaced.get())) {
+        if (!processor.queue.push(displaced)) {
             displaced->clear_queued();
             (void)enqueue(displaced);
         }
@@ -4177,7 +4170,7 @@ bool Scheduler::requeue_to_processor(const std::shared_ptr<Task>& task,
     }
 
     // 回退（含 ③ 轮询对照）：目标 P 的本地环尾。
-    if (!processor.queue.push(task.get())) {
+    if (!processor.queue.push(task)) {
         // 本地环满：清掉 reservation 后交回调用方的常规入队回退链。
         m_impl->runnable_sub(processor_id);
         task->clear_queued();
@@ -4259,7 +4252,7 @@ bool Scheduler::requeue_from_worker(const std::shared_ptr<Task>& task,
         target = &m_impl->processors[pick_processor_round_robin(
             m_impl->next_processor, m_impl->processors.size())];
     }
-    if (!target->queue.push(task.get())) {
+    if (!target->queue.push(task)) {
         m_impl->runnable_sub(target->id);
         task->clear_queued();
         return enqueue(task);
@@ -4340,7 +4333,7 @@ bool Scheduler::requeue_from_worker_reserved(const std::shared_ptr<Task>& task,
         target = &m_impl->processors[pick_processor_round_robin(
             m_impl->next_processor, m_impl->processors.size())];
     }
-    if (!target->queue.push(task.get())) {
+    if (!target->queue.push(task)) {
         m_impl->runnable_sub(target->id);
         task->clear_queued();
         return false;
@@ -4847,7 +4840,7 @@ bool Scheduler::wake_io_batch(
                         continue;
                     }
                     m_impl->runnable_add(processor_id);
-                    if (processor.queue.push(task.get())) {
+                    if (processor.queue.push(task)) {
                         GO2CPP_DEBUG_EVENT(kRunQueuePush, task->id(),
                                            processor_id);
                         GO2CPP_DEBUG_EVENT(
@@ -5832,13 +5825,10 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                         task = std::move(stolen[0]);
                         // tail 批量发布：剩余窃取结果一次 CAS 预留槽位，
                         // 不再逐个 push 各做一次 tail CAS。
-                        Task* batch[32];
                         const std::size_t batch_count = stolen_count - 1;
-                        for (std::size_t i = 0; i < batch_count; ++i) {
-                            batch[i] = stolen[i + 1].get();
-                        }
                         const std::size_t published =
-                            own_processor.queue.push_batch(batch, batch_count);
+                            own_processor.queue.push_batch(stolen + 1,
+                                                           batch_count);
                         for (std::size_t i = published; i < batch_count; ++i) {
                             try {
                                 m_impl->global_queue.push_back(
@@ -5846,7 +5836,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                             } catch (...) {
                                 if (stolen_from != nullptr) {
                                     (void)stolen_from->queue.push(
-                                        stolen[i + 1].get());
+                                        stolen[i + 1]);
                                 }
                             }
                         }
@@ -5908,7 +5898,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 !publish_to_machine(locked, redirect_pending, true)) {
                 // 绑定 M 已退场：解除绑定后放回本 P 队列（计数不变）。
                 redirect_pending->unlock_from_m();
-                if (!own_processor.queue.push(redirect_pending.get())) {
+                if (!own_processor.queue.push(redirect_pending)) {
                     // 本地环也满：还原计数并清 queued 后走常规入队。
                     m_impl->runnable_sub(own_processor.id);
                     redirect_pending->clear_queued();
@@ -6218,7 +6208,7 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
             // 定向槽里的 G 还没有执行者：放回本 P 队列，交给 shutdown 的
             // 排空逻辑统一处理（否则 shutdown 会等一个没人取的 G）。
             if (auto pending = machine->inbox.take()) {
-                if (!own_processor.queue.push(pending.get())) {
+                if (!own_processor.queue.push(pending)) {
                     std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
                     try {
                         m_impl->global_queue.push_back(std::move(pending));

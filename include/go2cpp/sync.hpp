@@ -22,6 +22,16 @@
 #endif
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+/// @brief sync 热路径 TLS 的模型标注（initial-exec）。
+/// @details 本库由可执行文件经 DT_NEEDED 在启动时加载，链接器能在静态 TLS
+///          块里预留槽位，因此访问退化为一条 `mov %fs:off`；若将来要支持
+///          dlopen 本库，必须改回 global-dynamic。
+#define GO2CPP_SYNC_TLS_IE __attribute__((tls_model("initial-exec")))
+#else
+#define GO2CPP_SYNC_TLS_IE
+#endif
+
 namespace go2cpp::sync {
 namespace go2cpp::debug {
 class DebugMutex;
@@ -36,13 +46,52 @@ namespace detail {
 ///          读到它——否则每次加锁都要多做一次跨库函数调用。
 extern std::atomic<int> g_held_park_detect;
 
-/// @brief 检测开关的热路径读法：**仅一次 relaxed load** + 可预测分支。
-/// @note 变量在 sync.cpp 里由静态初始化按「环境变量 / NDEBUG」定好初值，
-///       因此热路径没有「尚未解析」这一层分支；环境变量解析与 owner 检查
-///       都在显式 noinline 的冷函数里，不会被内联进 Lock/Unlock 的内联体。
+/// @brief 每线程的开关缓存（-1 = 尚未解析，0 = 关，1 = 开）。
+/// @details initial-exec TLS 的 POD：热路径访问是一条 `mov %fs:off`，
+///          不经过 GOT，也没有 thread_local 动态初始化守卫。
+extern thread_local std::int8_t t_held_park_cache GO2CPP_SYNC_TLS_IE;
+
+/// @brief 解析并写入本线程缓存（冷路径，定义在 sync.cpp）。
+/// @note 显式 noinline：只在每线程第一次加解锁时执行一次。
+std::int8_t ResolveHeldParkCache() noexcept;
+
+/// @brief 检测开关的热路径读法：**一次 TLS 读 + 可预测分支**。
+///
+/// 改动前是「GOT 取 `g_held_park_detect` 地址 + 解引用」两次依赖 load
+/// （变量在另一 TU、默认可见性，-fPIC 下必须经 GOT，且无法假设不被插入）。
+/// 改成每线程缓存后：
+/// - 稳态（缓存已解析）只有 3 条指令、零 GOT 访问、零跨库依赖；
+/// - 首次访问走一次 noinline 的 `ResolveHeldParkCache()`，把全局值抄进 TLS。
+///
+/// **一致性**：`SetHeldLockParkDetection()` 会同时写全局与**调用线程**的
+/// 缓存，因此「设置后马上在本线程验证」的语义不变；其它线程的缓存由
+/// 首次访问时的全局值决定——本检测是启动期/测试期开启的诊断功能，
+/// 允许已运行线程的开关生效延迟到它们的下一次冷路径刷新。
+#if !defined(GO2CPP_HELD_PARK_DETECT_RUNTIME)
+// Release（NDEBUG）默认把检测**编译期**关闭：`held_park_detection_on()`
+// 直接是常量 false，`if (held_park_detection_on()) NoteLockHeldSlow();`
+// 在 Lock/Unlock 的内联快路径里被整段消除（0 条指令、0 分支、0 数据访问）。
+// Debug 构建或显式定义 GO2CPP_HELD_PARK_DETECT_RUNTIME=1 时保留运行时开关。
+#if !defined(NDEBUG)
+#define GO2CPP_HELD_PARK_DETECT_RUNTIME 1
+#endif
+#endif
+
+#if defined(GO2CPP_HELD_PARK_DETECT_RUNTIME)
 inline bool held_park_detection_on() noexcept {
-    return g_held_park_detect.load(std::memory_order_relaxed) != 0;
+    const std::int8_t cached = t_held_park_cache;
+    if (cached >= 0) [[likely]] {
+        return cached != 0;
+    }
+    return ResolveHeldParkCache() != 0;
 }
+#else
+/// @brief 编译期关闭：热路径零指令。
+/// @note 本构建里 `SetHeldLockParkDetection(true)` 不会让热路径开始记录
+///       owner/计数——`HeldLockParkDetection()` 也返回 false 以如实反映
+///       「本构建没有热路径检测」。需要该诊断时请用 Debug 构建。
+constexpr bool held_park_detection_on() noexcept { return false; }
+#endif
 
 }  // namespace detail
 

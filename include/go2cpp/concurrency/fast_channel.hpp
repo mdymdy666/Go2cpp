@@ -266,12 +266,16 @@ class FastSpscChannel final {
       if (m_closed.load(std::memory_order_acquire)) {
         return FastStatus::kClosed;
       }
-      if (detail::CanSpinWait() && SpinForSpace()) {
+      // 线程归属判定只做一次：两次调用之间只有 SpinForSpace 自旋（纯
+      // pause，不 park、不切换 Fiber），结果必然相同。原实现每轮付两次
+      // 跨库调用链（CanSpinWait → current_task_ptr + Fiber::Current）。
+      const bool native_caller = detail::CanSpinWait();
+      if (native_caller && SpinForSpace()) {
         continue;
       }
       SpscWaiter node;
       node.Reset();
-      if (!detail::CanSpinWait() && !detail::ChannelBindManaged(&node)) {
+      if (!native_caller && !detail::ChannelBindManaged(&node)) {
         return FastStatus::kUnsupported;
       }
       {
@@ -314,12 +318,14 @@ class FastSpscChannel final {
         out = T{};
         return FastStatus::kClosed;
       }
-      if (detail::CanSpinWait() && SpinForData()) {
+      // 同 Send：自旋不改变线程归属，一次判定即可。
+      const bool native_caller = detail::CanSpinWait();
+      if (native_caller && SpinForData()) {
         continue;
       }
       SpscWaiter node;
       node.Reset();
-      if (!detail::CanSpinWait() && !detail::ChannelBindManaged(&node)) {
+      if (!native_caller && !detail::ChannelBindManaged(&node)) {
         return FastStatus::kUnsupported;
       }
       {
@@ -1210,7 +1216,10 @@ class FastChannelLock {
       if (status != FastStatus::kWouldBlock) {
         return status;
       }
-      if (detail::CanSpinWait() && SpinForSpace()) {
+      // 一次判定覆盖「自旋」与「登记」两个分支：两者之间只做
+      // WaitNode 池获取与一次 PushLocked 重试，都不 park，线程归属不变。
+      const bool native_caller = detail::CanSpinWait();
+      if (native_caller && SpinForSpace()) {
         continue;
       }
       SendNode* const node = detail::WaitNodePool<SendNode>::Acquire();
@@ -1229,7 +1238,7 @@ class FastChannelLock {
           detail::WaitNodePool<SendNode>::Release(node);
           return FastStatus::kClosed;
         }
-        if (!detail::CanSpinWait() && !detail::ChannelBindManaged(node)) {
+        if (!native_caller && !detail::ChannelBindManaged(node)) {
           lock.unlock();
           detail::WaitNodePool<SendNode>::Release(node);
           return FastStatus::kUnsupported;
@@ -1281,7 +1290,9 @@ class FastChannelLock {
       if (status != FastStatus::kWouldBlock) {
         return status;
       }
-      if (detail::CanSpinWait() && SpinForData()) {
+      // 同 Send：自旋与登记之间不 park，一次判定即可。
+      const bool native_caller = detail::CanSpinWait();
+      if (native_caller && SpinForData()) {
         continue;
       }
       RecvNode* const node = detail::WaitNodePool<RecvNode>::Acquire();
@@ -1301,7 +1312,7 @@ class FastChannelLock {
           detail::WaitNodePool<RecvNode>::Release(node);
           return FastStatus::kClosed;
         }
-        if (!detail::CanSpinWait() && !detail::ChannelBindManaged(node)) {
+        if (!native_caller && !detail::ChannelBindManaged(node)) {
           lock.unlock();
           detail::WaitNodePool<RecvNode>::Release(node);
           return FastStatus::kUnsupported;

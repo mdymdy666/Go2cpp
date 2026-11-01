@@ -957,6 +957,13 @@ void TestContextCallbackRacesSchedulerShutdown() {
 void TestHeldLockParkDetection() {
     const bool saved = go2cpp::sync::HeldLockParkDetection();
     go2cpp::sync::SetHeldLockParkDetection(true);
+    // Release 构建把该检测编译期关闭（热路径零指令），此时开关不会让任何
+    // 加锁路径开始计数；用例只对「检测真实存在」的构建（Debug / 显式
+    // 定义 GO2CPP_HELD_PARK_DETECT_RUNTIME）有意义。
+    if (!go2cpp::sync::HeldLockParkDetection()) {
+        go2cpp::sync::SetHeldLockParkDetection(saved);
+        return;
+    }
     const std::uint64_t baseline = go2cpp::sync::HeldLockParkCount();
 
     go2cpp::Scheduler scheduler(SchedulerConfig(2));

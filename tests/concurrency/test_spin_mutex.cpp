@@ -347,6 +347,10 @@ void TestPureComputationInsideCriticalSection() {
 void TestPlainMutexHeldPark() {
     const bool saved_detection = go2cpp::sync::HeldLockParkDetection();
     go2cpp::sync::SetHeldLockParkDetection(true);
+    // Release 构建把「持锁 park 检测」编译期关闭（热路径零开销），此时
+    // 开关不会让任何路径开始计数；只验证「不 abort、不误报 SpinMutex」，
+    // 计数的正向断言留给 Debug 构建（那里检测真实生效）。
+    const bool detection_active = go2cpp::sync::HeldLockParkDetection();
     {
         IOManager manager(MakeConfig(2));
         GO2CPP_CHECK(manager.Start());
@@ -354,7 +358,9 @@ void TestPlainMutexHeldPark() {
         const std::uint64_t held_before = MutexHeldParkTotal();
         const ReadParkRun run = RunReadScenario(manager, false, true, false);
         GO2CPP_CHECK(run.saw_read);
-        GO2CPP_CHECK(MutexHeldParkTotal() >= held_before + 1U);
+        if (detection_active) {
+            GO2CPP_CHECK(MutexHeldParkTotal() >= held_before + 1U);
+        }
         GO2CPP_CHECK(SpinDegradeTotal() == spin_before);
         manager.shutdown();
     }
