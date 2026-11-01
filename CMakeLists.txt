@@ -27,6 +27,7 @@ include(cmake/Go2CppOptions.cmake)
 # Go2CppReflectTests.cmake，于 Bento 之后 include。
 include(cmake/Go2CppReflect.cmake)
 include(cmake/Go2CppModules.cmake)
+include(cmake/Go2CppRelay.cmake)
 # 内核监控模块（go2cpp::os::monitor，eBPF）：需要在 Modules 之后定义（依赖
 # network/scheduler/channel 目标）；eBPF 不可用时自动降级为仅 /proc 采集。
 include(cmake/Go2CppMonitor.cmake)
@@ -51,6 +52,7 @@ endif()
 # Bento 传输协议（自研 UDP 可靠/不可靠混合协议）：默认 OFF。
 # -DGO2CPP_WITH_BENTO=ON 构建 go2cpp_bento 与测试。
 include(cmake/Go2CppBento.cmake)
+include(cmake/Go2CppMedia.cmake)
 
 # 应用级示例（example/app）：web_server / chat_server 的 simple 与 full 两版。
 # 它们依赖 Bento 的 HttpServer/LinkServer，必须放在 Go2CppBento.cmake 之后；
@@ -74,3 +76,8 @@ include(cmake/Go2CppCache.cmake)
 # Go 风格接口层（net/sync/chan/context/error/time/io）：默认 OFF。
 # -DGO2CPP_WITH_GO_API=ON 构建封装头与 go_api_* 测试。
 include(cmake/Go2CppGoApi.cmake)
+
+# 通用帧编解码（include/go2cpp/frame/）：magic/version 定界 + 变长载荷 + 可插拔
+# 校验和 + 半包重组，默认 ON（-DGO2CPP_WITH_FRAME=OFF 关闭）。测试目标
+# go2cpp_frame_codec_test 由该文件定义；RDRL/RDCH 对接见 docs/modules/frame-codec.md。
+include(cmake/Go2CppFrame.cmake)
