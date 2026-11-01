@@ -250,7 +250,7 @@ public:
     enum class PushResult {
         kOk,       ///< 入队成功。
         kClosed,   ///< 队列已关闭（取消/方向失败），chunk 未入队。
-        kStalled,  ///< 等待超过停滞预算，chunk 未入队。
+        kStalled,  ///< 持续满且一个容量未在预算内排空，chunk 未入队。
     };
 
     ChunkQueue(std::size_t capacity, std::chrono::milliseconds stall_timeout)

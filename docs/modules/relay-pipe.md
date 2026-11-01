@@ -30,7 +30,7 @@
 | `src/relay/relay_pipe.cpp` | 有界队列、双方向读/写线程、deadline 看门狗、统计与取消 | 850 行 |
 | `tests/relay/test_relay_pipe.cpp` | 8 组行为/随机/压测（自带 main） | 587 行 |
 | `tests/relay/relay_test_support.hpp` | 内存 `TestStream`、确定性模式、`AsyncRun` | 334 行 |
-| `cmake/Go2CppRelayPipe.cmake` | `go2cpp_relay_pipe` 库 + `relay_pipe` ctest 接入 | 约 80 行 |
+| `cmake/Go2CppRelayPipe.cmake` | `go2cpp_relay_pipe` 库 + `relay_pipe` ctest 接入 | 73 行 |
 
 构建入口：顶层 `CMakeLists.txt` 在 `Go2CppModules.cmake` 之后直接 include
 `cmake/Go2CppRelayPipe.cmake`，创建独立的 `go2cpp_relay_pipe` 目标；Hub/Lease
@@ -184,16 +184,29 @@ class SocketStream final : public go2cpp::relay::Stream {
   explicit SocketStream(go2cpp::net::Socket socket) : m_socket(std::move(socket)) {}
 
   go2cpp::streams::ReadResult Read(char* buffer, std::size_t size) override {
-    auto result = m_socket.Recv(buffer, size);   // 适配层：超时/EOF 转成 ErrorPtr
-    // ... 把 n==0 且对端关闭映射成 streams::IoEof()
-    return {result.count, result.error};
+    const auto result = m_socket.recv(buffer, size);
+    if (result.transferred == 0) {
+      return {0, go2cpp::streams::IoEof()};        // 对端关闭 → EOF
+    }
+    if (!result.ok()) {
+      return {0, go2cpp::NewError("socket recv errno=" +
+                                  std::to_string(result.error))};
+    }
+    return {static_cast<std::size_t>(result.transferred), {}};
   }
   go2cpp::streams::WriteResult Write(const char* data, std::size_t size) override {
-    return m_socket.Send(data, size);            // 允许短写
+    const auto result = m_socket.send(data, size);
+    if (!result.ok()) {
+      return {0, go2cpp::NewError("socket send errno=" +
+                                  std::to_string(result.error))};
+    }
+    return {static_cast<std::size_t>(result.transferred), {}};
   }
   go2cpp::ErrorPtr Close() override {
     // 先 shutdown(SHUT_RDWR) 再 close，确保能打断另一线程的阻塞 write
-    return m_socket.Close();
+    m_socket.shutdown(SHUT_RDWR);
+    m_socket.close();
+    return {};
   }
 
  private:
@@ -207,6 +220,10 @@ if (!pipe.Run(ctx, &err)) {
   // err 是第一条失败；pipe.Stats() 给 dropped/timeouts
 }
 ```
+
+> 上面的 `SocketResult` 映射是适配层职责：流式套接字上 `recv` 返回
+> `transferred == 0` 表示对端关闭，必须转成 `streams::IoEof()`；`errno` 转成
+> `ErrorPtr`。`Socket::send` 允许短写，正好符合 `Stream::Write` 契约。
 
 内存管道只需实现同一组三个方法；`tests/relay/relay_test_support.hpp` 的
 `TestStream` 是完整参考（支持 EOF、阻塞写、慢写、短写、空闲等待与并发 Close）。
@@ -282,10 +299,12 @@ ctest --test-dir .build-bento-wsl -R '^relay_pipe$' --output-on-failure
 === relay pipe: all checks passed ===
 ```
 
-三次连跑范围（同一 WSL2 机器，Release）：1e7 双向 47–50 ms（389–406 MiB/s），
-1e8 双向 446–577 ms（330–428 MiB/s），RSS 6.2–6.8 MiB（`/usr/bin/time -v`）。
-SHA-256 是纯标量实现（约 400 MiB/s），吞吐瓶颈主要在摘要与内存拷贝，不是中继逻辑；
-测试进程的队列内存始终不超过 `queue_cap`（1e8 用例没有缓存 200 MB 数据）。
+多轮连跑（同一 WSL2 机器，Release，12 vCPU）：
+低负载（load≈2–4）时 1e7 双向 47–50 ms（389–406 MiB/s）、1e8 双向 446–577 ms
+（330–428 MiB/s）；共享构建把 load 推到 ≈10 时，1e7 为 135 ms、1e8 为 960 ms。
+RSS 稳定在 6.2–6.8 MiB（`/usr/bin/time -v`）。SHA-256 是纯标量实现（约 400 MiB/s），
+吞吐瓶颈主要在摘要与内存拷贝，不是中继逻辑；测试进程的队列内存始终不超过
+`queue_cap`（1e8 用例没有缓存 200 MB 数据）。
 
 ASan/TSan 另做了一次独立构建验证（2026-11-01）：
 
@@ -348,7 +367,8 @@ ASAN_OPTIONS=detect_leaks=0 /tmp/relay_pipe_asan     # 全过
 - 新增 `include/go2cpp/relay/relay_pipe.hpp`、`src/relay/relay_pipe.cpp`；
 - 有界字节队列 + 持续满慢 peer 判定 + 写 deadline 看门狗 + 每方向独立失败；
 - 8 组测试：1e7/1e8 byte-exact、慢 peer、写超时、4 管道并发、40 轮随机、取消、API 边界；
-- CMake：`go2cpp_relay` 目标（与 Hub/Lease 共用）与 `relay_pipe` ctest；
-- 实测：1e7 双向 47–50 ms（389–406 MiB/s），1e8 双向 446–577 ms（330–428 MiB/s），
-  RSS 6.2–6.8 MiB；ASan/TSan 独立构建全过；
+- CMake：独立目标 `go2cpp_relay_pipe` 与 `relay_pipe` ctest（Hub/Lease 另用
+  `go2cpp_relay`，互不覆盖）；
+- 实测：低负载 1e7 双向 47–50 ms、1e8 双向 446–577 ms；load≈10 时
+  1e7 135 ms、1e8 960 ms；RSS 6.2–6.8 MiB；ASan/TSan 独立构建全过；
 - 已知限制见 §9，未提交（多 agent 共享工作树）。
