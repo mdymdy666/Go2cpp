@@ -61,6 +61,27 @@
 
 namespace go2cpp::time {
 
+namespace detail {
+
+/**
+ * @brief 把 UTC 秒数可重入地拆成 `std::tm`。
+ *
+ * POSIX 用 `gmtime_r`；Windows CRT 只提供 `gmtime_s`，其参数顺序是
+ * `(输出, 输入)`（MS 语义），与 C11 Annex K 的 `(输入, 输出)` 相反，
+ * 因此两个平台必须分开写。失败时返回全零 `std::tm`（调用方按 1900/1/1 渲染）。
+ */
+inline std::tm GmtimeUtc(std::time_t seconds) noexcept {
+    std::tm out{};
+#if defined(_WIN32)
+    if (gmtime_s(&out, &seconds) != 0) out = std::tm{};
+#else
+    gmtime_r(&seconds, &out);
+#endif
+    return out;
+}
+
+}  // namespace detail
+
 // ============================================================================
 // Duration（对应 time.Duration：int64 纳秒）
 // ============================================================================
@@ -405,8 +426,7 @@ public:
         // step1: 秒 + 纳秒余数
         const std::time_t seconds = static_cast<std::time_t>(Unix());
         const std::int64_t nanos = UnixNano() - static_cast<std::int64_t>(seconds) * 1000000000LL;
-        std::tm broken{};
-        gmtime_r(&seconds, &broken);
+        const std::tm broken = detail::GmtimeUtc(seconds);
         char buffer[64];
         std::snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d", broken.tm_year + 1900,
                       broken.tm_mon + 1, broken.tm_mday, broken.tm_hour, broken.tm_min, broken.tm_sec);
