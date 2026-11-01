@@ -1108,6 +1108,20 @@ bool Task::wait_for(std::chrono::steady_clock::duration timeout) const {
 }
 
 void Task::notify_terminal() noexcept {
+    // P16：绝大多数 G 从来没人 join，这里连「只通知一次」的标志位都不碰。
+    // 旧实现在函数入口无条件做一次 `exchange`（x86 上是 `lock xchg`，
+    // 无争用也要 20~30 cycles），对每个终态 G 都是一次白付的缓存行 RMW。
+    //
+    // 正确性（Dekker，与下面 waiters 判定的论证同源）：
+    //   notifier: [S] store(terminal, release) → [L] load(waiters, seq_cst)
+    //   waiter:   [P] publish(waiter, release) → [A] lock → [W] waiters++
+    //             (seq_cst) → [R] 谓词里 load(terminal, acquire)
+    // L 与 W 都是 seq_cst，构成全序：L 读到 0 意味着 W 在 L 之后、因此也在
+    // S 之后，R 在 W 之后 → R 必看到终态，等待者不会睡，通知可以省略。
+    // 若 L 读到非零，说明等待者已登记，此时才需要 exchange 去重并通知。
+    if (m_completion_waiters.load(std::memory_order_seq_cst) == 0) {
+        return;
+    }
     if (m_completion_notified.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
@@ -1245,6 +1259,7 @@ bool Task::prepare_enqueue(
     std::lock_guard<detail::HotSpinLock> lock(m_transition_mutex);
     if (m_owner_anchor == nullptr) {
         m_owner_anchor = owner.get();
+        m_owner_bound.store(true, std::memory_order_release);
     } else if (m_owner_anchor != owner.get()) {
         return false;
     }
@@ -2607,6 +2622,23 @@ public:
         registry_heads[stripe] = &task;
     }
 
+    /// @brief 把 G 注册进条带链表（若尚未注册）。调用方持条带锁。
+    /// @return 本次调用是否完成了注册（false 表示已经在表里）。
+    /// @details P7 之后注册表只用来看得到「可能被外部唤醒/查询」的 G：
+    ///          park 前的等待者、持锁退出的终态 G。run-to-completion 的
+    ///          G 完全不进表，因此提交热路径不再付条带锁 + try_register CAS
+    ///          + 自持引用。
+    bool register_task_locked(const std::shared_ptr<Task>& task) noexcept {
+        if (!task || task->registered()) {
+            return false;
+        }
+        if (!task->try_register()) {
+            return false;
+        }
+        link_registered_locked(*task, task);
+        return true;
+    }
+
     /// @brief 从条带链表摘除并取走注册表持有的强引用（锁内调用）。
     /// @return 注册表的强引用；调用方必须在锁外释放它（可能析构 Task）。
     /// @details 返回空表示该 G 不在本链上（防御性分支，不改变语义）。
@@ -3823,22 +3855,13 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         return false;
     }
 
-    bool registered_here = false;
-    // IO/定时器唤醒的 G 通常已经在注册表中。已注册任务只需重新发布
-    // 队列节点，不再为每次 wake 争用对应条带的 registry mutex；首次
-    // 入队仍在锁内完成 try_register + vector 发布的原子边界。
-    if (!task->registered()) {
-        const auto registry_stripe = Scheduler::Impl::registry_stripe(*task);
-        std::lock_guard<detail::HotSpinLock> registry_lock(
-            m_impl->registry_mutexes[registry_stripe]);
-        if (!task->registered()) {
-            // 侵入式链表头插：O(1)、不分配、不抛异常（旧 vector 版本要
-            // 扩容并整体拷贝 shared_ptr，还可能 bad_alloc）。
-            task->try_register();
-            m_impl->link_registered_locked(*task, task);
-            registered_here = true;
-        }
-    }
+    // ---- P7：延迟注册 -------------------------------------------------
+    // 这里**不再**把 G 挂进注册表。热队列节点（LocalRunQueue::Cell /
+    // RunNextSlot / incoming / global deque）各自持有强引用，已经独立承担
+    // 生命周期锚点的职责；注册表只在「这个 G 可能被外部唤醒或被诊断查询」
+    // 时才有价值 —— 那正是 park 之前由 Scheduler::ensure_registered() 做的。
+    // 由此省掉提交热路径上的：条带锁 acquire/release（跨核共享行两次
+    // RMW）、try_register 的 CAS、自持引用 +1，以及回收时的对称开销。
 
     if (task->state() != GState::kRunnable || !task->queued()) {
         // B2：prepare_enqueue 在本函数内已把 m_queued 置 true。若随后任务
@@ -3847,21 +3870,6 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
         // 入队（唤醒丢失）。清掉它：此时任务已不在 kRunnable（或 queued
         // 本就是 false），不会误清另一个有效节点。
         task->clear_queued();
-        if (registered_here) {
-            std::shared_ptr<Task> abandoned;
-            {
-                const auto registry_stripe =
-                    Scheduler::Impl::registry_stripe(*task);
-                std::lock_guard<detail::HotSpinLock> registry_lock(
-                    m_impl->registry_mutexes[registry_stripe]);
-                // 摘链并把注册表持有的强引用移交出来（锁外销毁）。
-                abandoned = m_impl->unlink_registered_locked(*task);
-            }
-            task->m_registered.store(false, std::memory_order_release);
-            if (abandoned && task->terminal()) {
-                auto abandoned_function = abandoned->release_callable();
-            }
-        }
         return false;
     }
 
@@ -3932,18 +3940,6 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
             }
             task->clear_queued();
             task->request_cancel(false);
-            if (registered_here) {
-                const auto registry_stripe =
-                    Scheduler::Impl::registry_stripe(*task);
-                std::lock_guard<detail::HotSpinLock> registry_lock(
-                    m_impl->registry_mutexes[registry_stripe]);
-                // 摘链：返回的强引用在这里析构（可能销毁 Task），因此
-                // 必须放在锁内生命周期之外 —— 用一个局部量接住再让它在
-                // 块末释放，仍属于「锁外析构」。
-                std::shared_ptr<Task> abandoned =
-                    m_impl->unlink_registered_locked(*task);
-                task->m_registered.store(false, std::memory_order_release);
-            }
             task->notify_terminal();
             return false;
         }
@@ -3984,15 +3980,6 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
                 task->clear_queued();
                 task->request_cancel(false);
                 admission_lock.unlock();
-                if (registered_here) {
-                    const auto registry_stripe =
-                        Scheduler::Impl::registry_stripe(*task);
-                    std::lock_guard<detail::HotSpinLock> registry_lock(
-                        m_impl->registry_mutexes[registry_stripe]);
-                    std::shared_ptr<Task> abandoned =
-                        m_impl->unlink_registered_locked(*task);
-                    task->m_registered.store(false, std::memory_order_release);
-                }
                 task->notify_terminal();
                 return false;
             }
@@ -4379,6 +4366,18 @@ bool Scheduler::yield_current() {
     return yield(current_task());
 }
 
+void Scheduler::ensure_registered(const std::shared_ptr<Task>& task) {
+    if (!task || !m_impl || task->registered()) {
+        return;
+    }
+    // 锁序：只取条带锁，不嵌套 admission / transition 锁；调用点都在
+    // 这些锁之外，因此不会引入新的锁层次。
+    const std::size_t stripe = Scheduler::Impl::registry_stripe(*task);
+    std::lock_guard<detail::HotSpinLock> registry_lock(
+        m_impl->registry_mutexes[stripe]);
+    m_impl->register_task_locked(task);
+}
+
 bool Scheduler::park(const std::shared_ptr<Task>& task) {
     return park_with_reason(task, SuspendReason::Park);
 }
@@ -4396,6 +4395,10 @@ bool Scheduler::park_wait(const std::shared_ptr<Task>& task) {
         return false;
     }
 
+    // P7：进入 Waiting 前注册。等待中的 G 可能被外部线程 wake、被
+    // shutdown 扫描取消、被 Doctor 按 gid 查询，注册表是这些路径唯一的
+    // 枚举入口；run-to-completion 的 G 不付出这笔开销。
+    ensure_registered(task);
     // WaitNode 已经在线性化队列中发布，Task 的 Waiting 状态可以直接
     // 原子提交。第二次检查覆盖 shutdown 与 park 的交错；若 shutdown
     // 已开始，回滚 Waiting 状态并让调用方走取消路径，不能遗留悬挂 G。
@@ -4433,6 +4436,7 @@ bool Scheduler::park_wait_for_cleanup(const std::shared_ptr<Task>& task) {
     }
     GO2CPP_DEBUG_EVENT(kParkEnter, task->id(),
                        static_cast<std::uint64_t>(SuspendReason::Park));
+    ensure_registered(task);
     const ParkAction action = task->park_for_scheduler();
     if (action != ParkAction::kParked) {
         GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 3);
@@ -4463,6 +4467,7 @@ bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
     // state before the second shutdown check; shutdown either observes it in
     // its registry scan or is observed here without taking the scheduler
     // admission mutex on every socket wait.
+    ensure_registered(task);
     const auto action = task->park_for_scheduler();
     if (action != ParkAction::kParked) {
         GO2CPP_DEBUG_EVENT(kParkRejected, task->id(), 3);
@@ -4494,6 +4499,8 @@ bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
     }
     // Shutdown scans waiting Gs under this same mutex. Do not enter waiting
     // after the scan has begun.
+    // P7：注册必须先于 admission 锁（条带锁不可嵌套在 admission 之下）。
+    ensure_registered(task);
     ParkAction action = ParkAction::kRejected;
     {
         std::lock_guard<std::mutex> admission_lock(m_impl->mutex);
@@ -4537,12 +4544,11 @@ bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
         return false;
     }
 #else
-    // release 快路径：`registered()` 为真说明该 G 走过
-    // `enqueue() -> prepare_enqueue()` 的 owner 绑定（`try_register()`
-    // 只在其成功之后调用），因此无需为一次复核再取
-    // `Task::m_transition_mutex`。未注册的 G（从未入队 / 已回收）仍走
-    // 完整校验，不会绕过所有权检查。
-    if (!task->registered() && !task->owned_by(m_impl->owner_token)) {
+    // release 快路径：`owner_bound()` 为真说明该 G 走过
+    // `enqueue() -> prepare_enqueue()` 的 owner 绑定。P7 之后注册表不再
+    // 覆盖所有 G，不能用 `registered()` 做判据；owner_bound 是免锁的
+    // 独立快路径位，未绑定 owner 的 G 仍走完整校验。
+    if (!task->owner_bound() && !task->owned_by(m_impl->owner_token)) {
         return false;
     }
 #endif
@@ -4886,12 +4892,11 @@ bool Scheduler::wake_or_cancel(const std::shared_ptr<Task>& task) {
         return false;
     }
 #else
-    // release 快路径：`registered()` 为真说明该 G 走过
-    // `enqueue() -> prepare_enqueue()` 的 owner 绑定（`try_register()`
-    // 只在其成功之后调用），因此无需为一次复核再取
-    // `Task::m_transition_mutex`。未注册的 G（从未入队 / 已回收）仍走
-    // 完整校验，不会绕过所有权检查。
-    if (!task->registered() && !task->owned_by(m_impl->owner_token)) {
+    // release 快路径：`owner_bound()` 为真说明该 G 走过
+    // `enqueue() -> prepare_enqueue()` 的 owner 绑定。P7 之后注册表不再
+    // 覆盖所有 G，不能用 `registered()` 做判据；owner_bound 是免锁的
+    // 独立快路径位，未绑定 owner 的 G 仍走完整校验。
+    if (!task->owner_bound() && !task->owned_by(m_impl->owner_token)) {
         return false;
     }
 #endif
@@ -6002,6 +6007,13 @@ void Scheduler::worker_loop(std::shared_ptr<void> opaque_machine) {
                 task_state_after_run == GState::kCancelled ||
                 task_state_after_run == GState::kFailed) {
                 ++terminal_since_collect;
+                if (t_task->held_mutex_count() != 0U) {
+                    // Doctor 的 owner-gone 判定依赖「按 gid 查得到终态」。
+                    // 持锁退出的 G 是唯一需要这条证据的类别（数量等于
+                    // 泄漏的同步原语数，不随历史任务数增长），因此只对它们
+                    // 补注册；普通 run-to-completion 的 G 永远不进表。
+                    ensure_registered(t_task);
+                }
                 // main G 返回：通知所有 M 退出循环（Go 的 main 返回即进程
                 // 退出；这里保留 shutdown 的 draining 收尾，而不是直接杀
                 // 线程），由 run_main 在主线程上完成 join。

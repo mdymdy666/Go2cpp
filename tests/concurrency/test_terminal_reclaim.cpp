@@ -99,13 +99,48 @@ void TestEveryCompletionReclaims() {
     scheduler.shutdown();
 }
 
-/// 关闭周期回收时，终态 G 仍留在注册表；作为上一条用例的对照。
+/// 关闭周期回收时，**注册过的**终态 G 仍留在注册表；作为上一条用例的对照。
+///
+/// P7 语义：注册表只登记「可能被外部唤醒 / 被诊断按 gid 查询」的 G ——
+/// 进入过 Waiting 的等待者，以及持锁退出的终态 G。run-to-completion 的 G
+/// 完全不进表（提交热路径因此不再付条带锁 + CAS + 自持引用），对它们
+/// `TaskTerminal()` 返回 kUnknown 是设计语义（kUnknown 不等于「已终止」）。
+/// 所以这里用一次真实的 park/wake 往返让 G 拿到注册表条目，再验证节拍
+/// 关闭时该条目不会被回收。
 void TestDisabledIntervalKeepsTerminal() {
     go2cpp_tests::announce("terminal G retained when reclaim tick is disabled");
     go2cpp::Scheduler scheduler(SingleWorkerConfig(0));
     scheduler.start();
 
-    constexpr int kTasks = 64;
+    std::atomic<int> done{0};
+    auto task = scheduler.spawn([&done] {
+        auto* const current = go2cpp::Scheduler::current_scheduler();
+        GO2CPP_REQUIRE(current != nullptr);
+        // 挂起直到被外部唤醒：这一步把 G 注册进条带链表。
+        (void)current->park_current();
+        done.fetch_add(1, std::memory_order_relaxed);
+    });
+    GO2CPP_REQUIRE(static_cast<bool>(task));
+    GO2CPP_REQUIRE_EVENTUALLY(task->state() == go2cpp::GState::kWaiting, 5s);
+    GO2CPP_REQUIRE(scheduler.wake(task));
+    GO2CPP_REQUIRE_EVENTUALLY(done.load(std::memory_order_acquire) == 1, 5s);
+    // 没有周期回收：注册过的终态条目应当仍在表内，且能查到具体终态。
+    GO2CPP_CHECK(scheduler.TaskTerminal(task->id()) ==
+                 go2cpp::TaskTerminalState::kCompleted);
+    scheduler.shutdown();
+}
+
+/// P7 新增：run-to-completion 的 G 从不进入注册表。
+///
+/// 证明两件事：
+/// 1. 终态查询返回 kUnknown（设计语义），而不是把这类 G 留在表里；
+/// 2. 大量短任务不会让注册表随历史任务数增长（D2 的更强形式）。
+void TestRunToCompletionNeverRegistered() {
+    go2cpp_tests::announce("run-to-completion G never enters registry");
+    go2cpp::Scheduler scheduler(SingleWorkerConfig(1));
+    scheduler.start();
+
+    constexpr int kTasks = 512;
     std::atomic<int> done{0};
     std::vector<std::shared_ptr<go2cpp::Task>> handles;
     std::vector<go2cpp::GId> gids;
@@ -120,8 +155,9 @@ void TestDisabledIntervalKeepsTerminal() {
     }
     GO2CPP_REQUIRE_EVENTUALLY(done.load(std::memory_order_acquire) == kTasks,
                               5s);
-    // 没有周期回收，也没有 claim 失败收尾路径：终态条目应当仍在表内。
-    GO2CPP_CHECK(CountUnknown(scheduler, gids) == 0U);
+    // 全部完成且都没有注册：查询一律 kUnknown，对外快照为空。
+    GO2CPP_CHECK(CountUnknown(scheduler, gids) == gids.size());
+    GO2CPP_CHECK(scheduler.DebugSnapshotTasks().empty());
     scheduler.shutdown();
 }
 
@@ -192,8 +228,14 @@ void TestLockHoldingTerminalRetained() {
     }
     GO2CPP_REQUIRE_EVENTUALLY(done.load(std::memory_order_acquire) == kFlush,
                               5s);
-    GO2CPP_CHECK(scheduler.TaskTerminal(owner->id()) ==
-                 go2cpp::TaskTerminalState::kCompleted);
+    if (detection_active) {
+        // 只有开启了热路径持锁检测，「持锁退出」才被记录进
+        // Task::held_mutex_count()，P7 也才会为这类 G 补注册（Doctor 的
+        // owner-gone 证据链依赖它）。Release 构建编译期关闭检测，这类 G
+        // 与普通 run-to-completion G 无法区分，按 P7 语义不注册。
+        GO2CPP_CHECK(scheduler.TaskTerminal(owner->id()) ==
+                     go2cpp::TaskTerminalState::kCompleted);
+    }
     // D2 已修部分不回退：终态 G 不出现在对外快照里。
     for (const auto& task_snapshot : scheduler.DebugSnapshotTasks()) {
         GO2CPP_CHECK(task_snapshot.id != owner->id());
@@ -209,6 +251,7 @@ void TestLockHoldingTerminalRetained() {
 void run_terminal_reclaim_tests() {
     TestEveryCompletionReclaims();
     TestDisabledIntervalKeepsTerminal();
+    TestRunToCompletionNeverRegistered();
     TestDefaultIntervalBoundsGrowth();
     TestLockHoldingTerminalRetained();
 }

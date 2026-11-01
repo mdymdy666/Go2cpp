@@ -649,6 +649,12 @@ public:
     bool try_register() noexcept;
     // 仅供调度器唤醒快路径观察注册表强引用是否已经发布。
     bool registered() const noexcept;
+    // owner 绑定的无锁快路径（P7）：注册表不再覆盖所有 G，release 构建的
+    // 归属校验需要有独立、免锁的判据。由 prepare_enqueue() 在 transition
+    // 锁内与 m_owner_anchor 一起置位，之后不再清零。
+    bool owner_bound() const noexcept {
+        return m_owner_bound.load(std::memory_order_acquire);
+    }
     // 将 owner、取消门和首次入队的状态转换合并为一次锁操作。
     // 外部生产者的热路径必须保持这个原子边界，避免在多个状态锁之间
     // 反复切换；失败时不会发布队列节点。
@@ -797,6 +803,8 @@ private:
     //   - Scheduler 对 G 的所有权语义由 registry/队列的强引用保证，不靠
     //     这个字段续命。因此裸指针不改变生命周期约束。
     const void* m_owner_anchor{nullptr};
+    /// @brief owner 已绑定的快路径标志（见 owner_bound()）。
+    std::atomic<bool> m_owner_bound{false};
     std::weak_ptr<TaskCancellationGate> m_cancellation_gate;
     // 取消门只需绑定一次（同一 G 始终属于同一 Scheduler）。首次绑定后
     // 跳过 weak_ptr 赋值，省掉后续每次入队的控制块原子操作。
@@ -1234,6 +1242,10 @@ private:
                                    MId machine_id) noexcept;
     bool park_with_reason(const std::shared_ptr<Task>& task,
                           go2cpp::SuspendReason reason);
+    // P7 延迟注册：把 G 挂进注册表条带（幂等）。只在「这个 G 可能被外部
+    // 唤醒或被诊断按 gid 查询」之前调用 —— park 提交前，以及持锁退出的
+    // 终态 G（Doctor 的 owner-gone 证据）。run-to-completion 的 G 不注册。
+    void ensure_registered(const std::shared_ptr<Task>& task);
 
     // 不透明共享槽在 Scheduler 增删 machine 记录时保持动态 worker 的地址稳定。
     void worker_loop(std::shared_ptr<void> machine);
