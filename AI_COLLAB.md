@@ -818,3 +818,104 @@ errno noinline），不是寄存器保存。
 - **状态**：完成，未 commit。报告 `/tmp/asm_app_rest.md`。
   未做（有量化理由）：ready 堆数组冗余 finish/id（再省 5~8 ns/帧）、KvTable arena+view
   （改所有权 API）、Connection 无锁化（上限 7.6%）。
+
+## 2026-11-01 KV 存储引擎（`go2cpp/storage/kv`）
+
+- **改动**：新增零依赖嵌入式 KV（开放寻址 MemTable + WAL + mmap SSTable + Arena +
+  WriteBatch + epoch 无锁读），核心实现 ~2.6k 行（LevelDB 的 1/10）。
+- **关键文件**：`include/go2cpp/storage/kv.hpp`、`src/storage/{arena,memtable,wal,sstable,kv}.cpp`
+  （+ `format.hpp`/4 个内部头）、`cmake/Go2CppKv.cmake`、
+  `tests/storage/{kv_test,kv_recovery_test,kv_concurrent_test,kv_bench}.cpp`、
+  `docs/modules/storage-kv.md`、`docs/reports/asm-storage-kv.md`。
+- **测试**：`ctest -R go2cpp_kv` **4/4 通过**（52665 断言功能 + 22 崩溃恢复 + 10031 并发）；
+  覆盖 kill -9 后 WAL 重放、WAL 截断/位翻转、1MB value、64KB key、空 key/空 value、
+  8 线程并发写读、边写边迭代。
+- **数据**（1e7、`taskset -c 4-11`、ext4、gcc 13.3 -O2）：写 **56.3 万 ops/s**、
+  读 **47.5 万 ops/s**、8 线程读 **238.6 万 ops/s**、sync 写 630（单线程）/
+  **2525**（8 线程 group commit）。实测下限：随机访存 **155 ns/次**、
+  `fdatasync` 中位 **556 µs**；MemTable Get 4.2x、KV Get 13.6x 下限。
+  objdump：`MemTable::Lookup` 149 指令 / 0 call / 0 lock / 0 分配；
+  CRC32C 走 SSE4.2 `crc32` 指令；SSTable 读无 `read/pread`。
+- **状态**：完成，未 commit。报告 `/tmp/kv_storage.md`（另存 `docs/reports/asm-storage-kv.md`）。
+  已知短板：读为 LevelDB 公开数据的 0.48x（段级 Bloom ×2.5 + TLB miss）；
+  迭代器为快照式（全量排序），只适合中小数据集。
+
+## 2026-11-01 · Go 标准库缺口（os/signal、hash/crc32、crypto/rand、flag）
+
+- **改动内容**：新增四个 header-only 兼容层 + 4 个测试目标（追加到
+  `cmake/Go2CppGoApi.cmake` 的清单，既有三个目标定义不变）。
+  - `os/signal`：`sigaction`（进程级）+ self-pipe（写端非阻塞）+ 常驻分发线程。
+    不用 `signalfd` 的原因：`pthread_sigmask` 只影响当前线程，进程里任一未屏蔽
+    线程会按默认处置吃掉信号。handler 只做 async-signal-safe 三件事：读原子掩码、
+    `write(2)` 一字节、无监听者时 `SIG_DFL` + `raise(2)`（Go 的 dieFromSignal）。
+    `Notify/Stop/Ignore/Reset` 全实现，通道满丢弃、多次 Notify 并集。
+  - `hash/crc32`：**零新算法**，映射到既有 `go2cpp/hash/crc32.hpp`（PCLMULQDQ
+    IEEE + SSE4.2 Castagnoli + slicing-by-8）。
+  - `crypto/rand`：`getrandom(2)` 优先 / `/dev/urandom` 兜底；自带 32 位 limb
+    无符号 `BigInt`（Montgomery 模幂 + 前 60 素数试除 + Miller-Rabin）；
+    `Int` 按 **Go 1.27** 语义用 `max-1` 的位长（2 的幂时少读一字节、
+    `max==1` 不读源）；`Prime` 最高两位置 1。
+  - `flag`：`FlagSet` + 包级 `CommandLine`；`-x=v`/`-x v`/`--`/bool 不消费参数/
+    首个非 flag 参数终止/`-h` 返回 `kHelp`；内联完整 `ParseDuration` 文法
+    （`tools/time.hpp` 尚未实现，未来应改为转发）。
+- **关键文件**：`include/go2cpp/go/{os_signal,crc32,crypto_rand,flag}.hpp`、
+  `tests/go_api/test_go_{crc32,crypto_rand,flag,signal}.cpp`、
+  `tests/go_api/scripts/gen_{crc32,rand}_oracle.go`、
+  `tests/go_api/testdata/{crc32,rand}_oracle.txt`、`cmake/Go2CppGoApi.cmake`、
+  `docs/modules/go-stdlib-gaps.md`。
+- **测试**（`-Wall -Wextra -Wpedantic -Werror`）
+  - `go_api_crc32` 7 场景 PASS：1e6 字节 × 3 多项式与 **Go 1.27 oracle 逐项相等**；
+    同数据与不查表的逐位实现相等；2000 次随机切分 `Update` 拼接一致；19 种边界长度。
+  - `go_api_crypto_rand` 9 场景 PASS：`Int` **75 个值逐值等于 Go**；400 个候选
+    （2..256 位）素性判定与 Go `ProbablyPrime(20)` 一致；1e6 字节 125000 个
+    8 字节块零重复、卡方 297.3；2..256 位 15 个素数位长/最高两位/素性全过。
+  - `go_api_flag` 10 场景 PASS：四种赋值、bool 三形态、Duration 11 合法 + 8 非法、
+    5 条错误路径、`--`/位置参数、NFlag/Visit/VisitAll/Lookup/Set、`-h`、PrintDefaults。
+  - `go_api_signal` 8 场景 PASS：子进程 `kill(2)` 端到端、Stop、Ignore、双通道、
+    **Stop 后默认处置恢复（子进程被 SIGTERM 杀死，waitpid 见 WIFSIGNALED）**、
+    无缓冲通道 100 次信号不阻塞、多次 Notify 并集。
+- **数据**（Release，单核，64 × 1 MiB）：crc32 **IEEE 18.38 GB/s /
+  Castagnoli 12.18 GB/s / Koopman 3.20 GB/s**；flag/signal 无性能指标（一次解析 /
+  每信号一次分发）。
+- **状态**：完成，未 commit。报告 `/tmp/go_stdlib_gaps.md`。
+  两处 cmake 中间态（其他 agent 的 `Go2CppMetricsPrometheus.cmake` 与
+  `Go2CppKv.cmake` 引用了未创建的测试源）导致 `.build-bento-wsl` 一度无法
+  regenerate；最终四个目标在主目录 ctest **4/4 通过**（crypto_rand 的二进制用
+  `ninja -t commands` 提取的同参数命令手工重编，`strings` 确认旧版已消失）。已知边界：未提供
+  `signal.NotifyContext`；`BigInt` 无符号；`Prime` 始终使用传入 Source
+  （Go 1.26+ 忽略它）；`flag` 解析失败不退出进程（与 Go `ExitOnError` 的刻意差异）。
+
+
+## 2026-11-01 · 监控指标导出（Prometheus）+ HTTP /metrics
+
+- **改动内容**
+  - 新增 `include/go2cpp/metrics/prometheus.hpp` / `src/metrics/prometheus.cpp`：
+    Prometheus 文本格式 0.0.4 导出（HELP/TYPE/样本/转义/NaN·Inf），
+    histogram 分位数族 `<name>_quantile{quantile="0.5"}`（p50/p90/p99，
+    桶内线性插值，与 `Histogram::Quantile()` 同语义）；`TextWriter` 纯
+    `std::string::append` + `std::to_chars`，热路径 0 堆分配；
+    `AppendQuantileFamilies` 对任意导出文本追加分位数（允许 out 与输入同一对象）。
+  - 新增 `include/go2cpp/metrics/endpoint.hpp` / `src/metrics/endpoint.cpp`：
+    `PrometheusEndpoint` 挂 `/metrics`（GET/HEAD 200、404、405+Allow、
+    `text/plain; version=0.0.4`），`Attach(server)` / `Attach(server, fallback)`
+    模板适配 `bento::HttpServer` 的 `OnRequest`，不硬依赖 bento 库。
+  - 新增 `tests/metrics/{test_prometheus,test_prometheus_endpoint,bench_prometheus}.cpp`
+    与 `cmake/Go2CppMetricsPrometheus.cmake`（挂到现有 `go2cpp_metrics`，
+    新增 `PUBLIC go2cpp_network` 依赖：endpoint 用 `http::Headers::set`）。
+  - `docs/modules/metrics-prometheus.md`。**未改动** `metrics.hpp` / `metrics.cpp`。
+- **测试**（`.build-bento-wsl`，Release）
+  - `ctest -R go2cpp_metrics`：**3/3 PASS**（现有 `go2cpp_metrics_test` 1.85s、
+    新 `go2cpp_metrics_prometheus_test` 84 断言 0 失败、`go2cpp_metrics_endpoint_test`
+    38 断言 0 失败）。
+  - 官方 `prometheus_client.parser` 解析导出文本：3 族 / 9 样本全部接受。
+  - 并发：4 写 + 8 读 × 100 次导出，0 解析失败 / 0 单调性失败，最终计数精确。
+  - 真实 `bento::HttpServer` + `http::Get`：200/404/405/HEAD/fallback/4 线程并发抓取。
+- **数据**（`taskset -c 2`，1e6 系列，3 次最小，load 3.94）
+  - 纯渲染 **28.04 ns/指标（1349 MB/s），memcpy 的 5.79×**（memcpy 7808 MB/s）；
+  - 端到端（Registry + 导出）**100.53 ns/指标（377 MB/s）**；现有
+    `Registry::Render()` 基线 131.25 ns（差异为负载波动，两者同一函数）；
+  - 分位数后处理 1e4 histogram 系列（10 桶）：**12.35 ms（1.24 µs/系列）**，
+    首版 O(n²) 934 ms 的 **75×**（上一行序列快路径 + 标签哈希索引）。
+- **状态**：完成，未 commit。报告 `/tmp/metrics_prometheus.md`。
+  已知边界：端点无缓存/gzip/鉴权；分位数是桶内插值估算；文本解析只认本项目
+  导出形态（第三方文本的乱序桶/时间戳会跳过）。

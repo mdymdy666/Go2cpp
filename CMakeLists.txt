@@ -54,6 +54,7 @@ endif()
 # -DGO2CPP_WITH_BENTO=ON 构建 go2cpp_bento 与测试。
 include(cmake/Go2CppBento.cmake)
 include(cmake/Go2CppMedia.cmake)
+include(cmake/Go2CppMetricsPrometheus.cmake)
 
 # 应用级示例（example/app）：web_server / chat_server 的 simple 与 full 两版。
 # 它们依赖 Bento 的 HttpServer/LinkServer，必须放在 Go2CppBento.cmake 之后；
@@ -82,6 +83,9 @@ include(cmake/Go2CppGoApi.cmake)
 # 校验和 + 半包重组，默认 ON（-DGO2CPP_WITH_FRAME=OFF 关闭）。测试目标
 # go2cpp_frame_codec_test 由该文件定义；RDRL/RDCH 对接见 docs/modules/frame-codec.md。
 include(cmake/Go2CppFrame.cmake)
+
+# RPC 框架（Go 风格服务注册/调用/流式）：默认 ON，定义见 cmake/Go2CppRpc.cmake。
+include(cmake/Go2CppRpc.cmake)
 
 # 嵌入式存储（SQLite，GO2CPP_WITH_SQLITE 默认 OFF）。
 include(cmake/Go2CppStorage.cmake)
