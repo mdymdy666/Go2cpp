@@ -114,8 +114,14 @@ struct DegradationConfig {
     /// 丢包率阈值：低于它才认为可以恢复。
     double loss_recover = 0.02;
 
-    /// 带宽 EWMA 的移位量（alpha = 1 / (1 << shift)）。
-    std::uint32_t bandwidth_ewma_shift = 2;
+    /// 普通丢包降级的冷却时间（毫秒）。持续的中等丢包只降一级，避免
+    /// 每个 `downgrade_hold_ms` 都再降一级直到保底档。
+    /// 严重丢包（>= `loss_severe`）不受此冷却限制。
+    std::uint32_t loss_cooldown_ms = 1000;
+
+    /// 带宽 EWMA 的移位量（alpha = 1 / (1 << shift)）。默认 1（alpha=0.5）：
+    /// BBR 的 delivery_rate 本身已经是滑窗平滑值，这里再重平滑会让降级迟钝。
+    std::uint32_t bandwidth_ewma_shift = 1;
 };
 
 /// @brief 一次网络状况采样。
@@ -247,6 +253,8 @@ class DegradationController {
     std::int64_t m_upgrade_blocked_until_ms = 0;
     std::int64_t m_next_due_ms = 0;
     std::int64_t m_smoothed_bps = 0;
+    std::int64_t m_last_loss_downgrade_ms = 0;
+    bool m_loss_downgraded = false;
     bool m_has_sample = false;
     bool m_paced = false;
     bool m_keyframe_request = false;

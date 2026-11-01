@@ -105,9 +105,9 @@ struct JitterBufferConfig {
     /// 等待深度上限（弱网保护，避免无限追高）。
     std::int64_t max_delay_ns = 400'000'000;
 
-    /// 抖动倍数（Q8 定点：1024 = 1.0x，2048 = 2.0x）。默认 2.0x 是
+    /// 抖动倍数（Q8 定点：256 = 1.0x，512 = 2.0x）。默认 2.0x 是
     /// 「覆盖约 2 倍 EWMA 抖动」的经验值；调大更抗抖但延迟更高。
-    std::uint32_t jitter_factor_q8 = 2048;
+    std::uint32_t jitter_factor_q8 = 512;
 
     /// true = 深度随抖动自适应；false = 固定 `base_delay_ns`。
     bool adaptive = true;
@@ -286,6 +286,9 @@ class JitterBuffer {
     std::int64_t m_prev_arrival_ns = 0;  ///< 上一包到达时刻。
     std::int64_t m_hole_deadline_ns = 0; ///< 当前空洞的判定时刻。
     std::int64_t m_first_arrival_ns = 0; ///< 首包到达时刻。
+    /// @brief 时间戳 -> 纳秒的定点比例（Q16）。构造期算好 `1e9/hz`，
+    ///        热路径只需一次 64 位乘法 + 右移，避免运行时 64 位除法（~20-30 周期）。
+    std::int64_t m_ts_scale_q16 = 0;
 
     std::uint32_t m_prev_timestamp = 0; ///< 上一包媒体时间戳。
     bool m_anchored = false;            ///< 是否已锚定首包。

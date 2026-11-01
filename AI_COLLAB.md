@@ -740,3 +740,48 @@ errno noinline），不是寄存器保存。
 - **状态**：完成 M0+M1，未提交（多 agent 共享工作树）。报告：`/tmp/webrtc_media.md`。
   已知边界：无 DTLS/SRTP、ICE、GCC/码率自适应、jitter buffer；帧格式是 Bento 自研，
   不兼容 RTP；1080p 受 rmem_max 与单帧分片上限限制。
+
+## 2026-11-01 WebRTC 弱网收尾（抖动缓冲 + 降级策略）
+
+- **改动内容**
+  - 新增 `go2cpp::media::JitterBuffer`（`jitter_buffer.hpp/.cpp`）：包级环形缓冲
+    （`seq & (capacity-1)` 定位，Push/Pop 均摊 O(1)、热路径零堆分配），RFC 3550
+    抖动 EWMA（`J += (|D|-J)/16`）+ 目标深度 `clamp(base + 2J, 10ms, 400ms)`，
+    空洞超时跳过（一次 Pop 可连续跳过整段丢包）、迟到帧丢弃/8 槽补发队列、
+    断流重锚与 32 位序号回绕。
+  - 新增 `go2cpp::media::DegradationController` / `ReconnectSupervisor` /
+    `Downscale2xBgra`（`degradation.hpp/.cpp`）：四档阶梯（320x240@30 →
+    320x240@15 → 160x120@15 → 160x120@10）、降级 200ms 快 / 升级 3s 慢的滞回、
+    中等丢包冷却 1s、与 `bento::BandwidthEstimator` 的 `FromBbr` 联动、
+    档内连续码率 `adaptive_bitrate_bps`、帧率相位控制、指数退避
+    （100→5000ms，±20% 确定性抖动）+ 重连后关键帧重建、2:1 盒式下采样。
+  - 构建：`cmake/Go2CppMedia.cmake` 追加 2 个源文件与 2 个测试目标
+    （`media_test_jitter_buffer` / `media_test_degradation`），测试总数 9 → 11。
+    **未修改任何既有源文件**。
+- **关键文件**：`include/go2cpp/media/jitter_buffer.hpp`、`degradation.hpp`、
+  `src/media/jitter_buffer.cpp`、`degradation.cpp`、
+  `tests/media/test_jitter_buffer.cpp`、`test_degradation.cpp`、
+  `cmake/Go2CppMedia.cmake`、`docs/modules/jitter-degradation.md`。
+- **测试**（`.build-bento-wsl`，Release，`taskset -c 2`）
+  - `ctest -R media_`：**11/11 PASS**（2.16s）。新增两个：jitter 17,269 断言 /
+    0.18s、degradation 184 断言 / 0.00s。
+  - JitterBuffer：顺序 2000 帧、块内乱序 2048 帧（reordered=1718）100% 按序、
+    重复 ×3（duplicates=1000）、5% 丢包（lost=99/100）、连丢 10 一次跳过、
+    迟到两种策略、断流重锚、32 位回绕 600 帧 0 误判、
+    **±50ms 抖动 1e5 帧 → 100.000% 交付 / 0 违序 / target 90.53ms / held p99 77ms**。
+  - 压测 1e6 帧：**Push 21.66 ns、Pop 3.13 ns**（6 次中位数，load 9.87）；
+    低负载复测 18.7 / 2.7 ns。内存常量 798,720 B，1e6 帧堆增长 1,216 B。
+  - 降级：阶梯 3 级降、丢包 6%/15% 触发、恢复 3 次升级、帧率 30fps 输入
+    → 300/150/99、重连 8 次退避、BBR 真实估计器三级降、滞回 0 次震荡、
+    下采样 320x240→160x120 逐像素 0 mismatch。
+- **性能证据**：`Push` 189 指令 / 4 call（UpdateJitter、memcpy、ResetTo、
+  PushLate）/ 0 lock / 0 分配；`PopInternal` 142 指令 / **0 call**；
+  `ShouldDeliverFrame` 37 指令 / 0 call；重定位表证实 `operator new[]` 只在
+  构造函数出现。离下限：Push **1.44×**（对实测 memcpy 15.00 ns）、Pop **2.1×**。
+  强制内联 `UpdateJitter` 的实验为负结果（21.17 vs 19.15 ns），已回退。
+- **环境限制**：WSL 内 DNS 返回回环、`web_fetch` 对 raw.githubusercontent 报
+  「解析到内网」，开源检索只到 web_search 层；libwebrtc/pion/GStreamer 三者的
+  许可证或依赖均不适合移植，取舍已写进文档 §2.3。
+- **状态**：完成，未提交（多 agent 共享工作树）。报告：`/tmp/jitter_degradation.md`。
+  已知边界：未与真实 UDP `tc netem` 联合压测；未接进 `pipeline.cpp`（按任务边界
+  只新增不改现有）；单线程；补发队列固定 8 槽；末包丢包不可检测。

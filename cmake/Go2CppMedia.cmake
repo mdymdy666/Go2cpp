@@ -85,7 +85,11 @@ if (GO2CPP_WITH_MEDIA)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/media/pipeline.cpp
         # SFU（多房间选择性转发）与 SDP 风格信令；不修改既有媒体链路。
         ${CMAKE_CURRENT_SOURCE_DIR}/src/media/sfu.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/signaling.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/signaling.cpp
+        # 弱网收尾：包级抖动缓冲（重排/去重/丢包检测/自适应深度）与
+        # 降级策略（分辨率/帧率/码率/断线重连）。
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/jitter_buffer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/degradation.cpp)
 
     target_include_directories(go2cpp_media
         PUBLIC
@@ -141,10 +145,16 @@ if (GO2CPP_WITH_MEDIA)
         add_executable(media_test_h264 ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_h264.cpp)
         add_executable(media_test_sfu ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_sfu.cpp)
         add_executable(media_test_signaling ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_signaling.cpp)
+        # 弱网收尾：抖动缓冲（功能/随机/1e6 帧压测）与降级策略（阶梯/重连/BBR/下采样）。
+        add_executable(media_test_jitter_buffer
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_jitter_buffer.cpp)
+        add_executable(media_test_degradation
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_degradation.cpp)
 
         foreach(media_test media_test_frame media_test_codec media_test_capture
                 media_test_transport media_test_render media_test_e2e media_test_h264
-                media_test_sfu media_test_signaling)
+                media_test_sfu media_test_signaling media_test_jitter_buffer
+                media_test_degradation)
             target_include_directories(${media_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/media)
             target_link_libraries(${media_test} PRIVATE go2cpp_media)
             target_compile_options(${media_test} PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -159,11 +169,14 @@ if (GO2CPP_WITH_MEDIA)
         add_test(NAME media_h264 COMMAND media_test_h264)
         add_test(NAME media_sfu COMMAND media_test_sfu)
         add_test(NAME media_signaling COMMAND media_test_signaling)
+        add_test(NAME media_jitter_buffer COMMAND media_test_jitter_buffer)
+        add_test(NAME media_degradation COMMAND media_test_degradation)
         set_tests_properties(media_frame media_codec media_capture media_transport
             media_render media_e2e media_h264 media_sfu media_signaling
+            media_jitter_buffer media_degradation
             PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
 
-        message(STATUS "Media pipeline: tests ON (9 targets)")
+        message(STATUS "Media pipeline: tests ON (11 targets)")
     endif()
 
     message(STATUS "Media pipeline: ON")
