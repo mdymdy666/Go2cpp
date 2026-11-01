@@ -552,7 +552,20 @@ void TestThroughput() {
     std::vector<std::uint8_t> payload(kPayload, 0);
     const Clock::time_point started = Clock::now();
     int send_failures = 0;
+    // 应用层发送窗口：UDP 没有重传，P2P 也不做可靠传输，接收端 socket 缓冲
+    // 由内核 `net.core.rmem_max` 封顶（本机默认 212992B ≈ 400 个 524B 包，
+    // P2PConfig 请求的 4MiB 会被内核静默截断）。一次暴发 2000 包必然溢出丢包，
+    // 那是内核缓冲的物理上限，不是 P2PChannel 能修好的。真实业务（音视频、
+    // 文件分块）本来就要自己限在途包数，这里按 256 包窗口发送，让「98% 到达」
+    // 断言测的是 P2P 数据面而不是内核队列深度。
+    constexpr int kSendWindow = 256;
     for (int index = 0; index < kPackets; ++index) {
+        if (index >= kSendWindow) {
+            const Clock::time_point wait_deadline = Clock::now() + 5s;
+            while (received.load() <= index - kSendWindow && Clock::now() < wait_deadline) {
+                std::this_thread::yield();
+            }
+        }
         const std::uint64_t now_micros = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(
                 Clock::now().time_since_epoch())

@@ -151,17 +151,45 @@ class FrameProducer {
 /// @brief 帧生产者的唯一所有权指针。
 using FrameProducerPtr = std::unique_ptr<FrameProducer>;
 
+struct Stream;  // ReadyEntry 只持指针，前向声明即可（Stream 定义在下方）。
+
+/// @brief ready 最小堆项：把比较键 `(finish, id)` 与流指针放进同一个 24B 项。
+///
+/// @details 旧实现堆数组只存 `Stream*`，每层 sift 比较都要顺着指针跳到
+///          `Stream` 里读 `finish`/`id`（256 条流 ≈ 50 KiB，跨 L2），一次
+///          下沉 8 层 ≈ 24 次指针追逐。把键复制进堆项后，比较只读堆数组
+///          （256 项 ≈ 6 KiB，常驻 L1），指针仅在返回结果/回写 slot 时解引用。
+struct alignas(32) ReadyEntry {
+    std::int64_t finish = 0;   ///< 入堆时的 finish 快照（ChargeFinish 负责同步）。
+    std::uint32_t id = 0;      ///< 流 id（同 finish 时按 id 升序，保证确定性）。
+    std::uint32_t pad = 0;     ///< 显式对齐填充：让每项恰好 32B。
+    Stream* stream = nullptr;  ///< 对应流。
+};
+static_assert(sizeof(ReadyEntry) == 32, "ReadyEntry 必须 32B 对齐（两项一 cacheline）");
+
 /**
  * @brief 一条流的状态、窗口、优先级与发送源。
  *
  * @note 由 `StreamTable` 创建并持有；外部只通过指针访问，不直接构造。
  */
 struct Stream {
+    /// @brief 内部索引哨兵：不在对应容器里。
+    static constexpr std::uint32_t kNoSlot = 0xFFFFFFFFu;
+
+    // ---- 热字段（每帧调度只碰前 64B）----
+    // ready 堆的每层 sift 都要读 finish（比较键），并在移动后回写 ready_slot。
+    // 把 finish/id/三个 slot/weight/state 压进同一个 cacheline：sift 的
+    // 「比较 + 回写」不再额外触碰 Stream 尾部，指针追逐只剩堆项里的那一次。
+    std::int64_t finish = 0;                   ///< WFQ 虚拟完成时间。
     std::uint32_t id = 0;                      ///< 流 id。
+    std::uint32_t ready_slot = kNoSlot;        ///< ready 堆内下标（流表维护）。
+    std::uint32_t producer_slot = kNoSlot;     ///< 生产者列表内下标（流表维护）。
+    std::uint32_t idle_slot = kNoSlot;         ///< 待补产列表内下标（流表维护）。
+    std::uint16_t weight = 16;                 ///< 权重（1..256）。
     StreamState state = StreamState::kIdle;    ///< 当前状态。
     StreamKind kind = StreamKind::kKv;         ///< 业务类型。
-    std::uint16_t weight = 16;                 ///< 权重（1..256）。
     std::uint32_t parent_id = 0;               ///< 依赖树父节点（0=根）。
+    std::uint32_t reset_error = 0;             ///< RST_STREAM 错误码。
     /// 依赖树父节点的**直接指针缓存**：父链遍历（`HasReadyAncestor`/`IsAncestor`）
     /// 不再每跳做一次 `std::map::find`（红黑树 ~log n 次指针追逐），改成指针链。
     /// 由 `StreamTable` 维护；父流被 `Erase`/`PruneClosedStreams` 删除时置空，
@@ -183,19 +211,10 @@ struct Stream {
     std::uint64_t frames_received = 0;         ///< 本流接收帧数。
     std::uint64_t opened_at_ms = 0;            ///< 打开时刻（毫秒）。
     std::uint64_t closed_at_ms = 0;            ///< 关闭时刻（毫秒）。
-    std::uint32_t reset_error = 0;             ///< RST_STREAM 错误码。
-    std::int64_t finish = 0;                   ///< WFQ 虚拟完成时间。
 
     FrameProducerPtr producer;                 ///< 发送源。
     Frame pending;                             ///< 已生产未发出的帧（缓冲复用）。
     bool has_pending = false;                  ///< pending 是否有效。
-
-    /// @brief 内部索引哨兵：不在对应容器里。
-    static constexpr std::uint32_t kNoSlot = 0xFFFFFFFFu;
-
-    std::uint32_t ready_slot = kNoSlot;        ///< ready 堆内下标（流表维护）。
-    std::uint32_t producer_slot = kNoSlot;     ///< 生产者列表内下标（流表维护）。
-    std::uint32_t idle_slot = kNoSlot;         ///< 待补产列表内下标（流表维护）。
 
     /// @brief 已打开（不是 idle/closed）。
     bool active() const noexcept { return opened && state != StreamState::kClosed; }
@@ -439,7 +458,6 @@ class StreamTable {
     std::size_t LiveStreamCount() const noexcept;
 
     // ---- ready 最小堆（按 (finish, id)）与生产者索引 ----
-    void HeapSwap(std::size_t a, std::size_t b) noexcept;
     void SiftUp(std::size_t i) noexcept;
     void SiftDown(std::size_t i) noexcept;
     void PushReady(Stream& stream) noexcept;
@@ -454,7 +472,7 @@ class StreamTable {
 
     StreamTableConfig m_config;              ///< 配置。
     StreamMap m_streams;                     ///< 流表。
-    std::vector<Stream*> m_ready;            ///< ready 最小堆（就绪流，仅堆内有效）。
+    std::vector<ReadyEntry> m_ready;         ///< ready 最小堆（项内含比较键，sift 不追指针）。
     std::vector<Stream*> m_producers;        ///< 挂有发送源的流（生产候选）。
     std::vector<Stream*> m_idle;             ///< 无待发帧、等待补产的流（通常 1 条）。
     std::vector<Stream*> m_held;             ///< PickNext 的父优先暂存（复用）。

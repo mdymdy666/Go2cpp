@@ -159,8 +159,16 @@ std::size_t StreamTable::LiveStreamCount() const noexcept { return m_live_stream
 
 namespace {
 
+/// @brief ready 堆的分支因子。2 叉堆 256 项要下沉 8 层；4 叉只要 4 层。
+/// @details flush 消融实测：每帧对堆顶 ChargeFinish 后的下沉是串行依赖链
+///          （每层的 index 依赖上一层选中的子项），8 层 × ~12 cycles ≈ 100
+///          cycles，是单帧最大的固定成本。4 叉堆每层比较 4 个子项（同层
+///          entry 可并行 load），层数减半，依赖链随之减半。
+inline constexpr std::size_t kHeapBranch = 4;
+
 /// @brief ready 堆比较：finish 小者优先，同 finish 按 id 升序（确定性）。
-bool ReadyBefore(const Stream& a, const Stream& b) noexcept {
+/// @note 只读堆项自身（24B，通常同一条 cacheline），不追 Stream 指针。
+bool EntryBefore(const ReadyEntry& a, const ReadyEntry& b) noexcept {
     if (a.finish != b.finish) {
         return a.finish < b.finish;
     }
@@ -169,51 +177,62 @@ bool ReadyBefore(const Stream& a, const Stream& b) noexcept {
 
 }  // namespace
 
-void StreamTable::HeapSwap(std::size_t a, std::size_t b) noexcept {
-    Stream* tmp = m_ready[a];
-    m_ready[a] = m_ready[b];
-    m_ready[b] = tmp;
-    m_ready[a]->ready_slot = static_cast<std::uint32_t>(a);
-    m_ready[b]->ready_slot = static_cast<std::uint32_t>(b);
-}
-
+// sift 统一用 hole 法：待移动项先存寄存器，逐层把子/父项搬进空位，最后
+// 一次落位。相比逐层 swap（每层 3 个 8B 写 + 2 次 ready_slot 回写），
+// 每层只搬 1 项 + 回写 1 个 slot，且比较完全在堆数组内完成。
 void StreamTable::SiftUp(std::size_t i) noexcept {
+    ReadyEntry hole = m_ready[i];
     while (i > 0) {
-        const std::size_t parent = (i - 1) / 2;
-        if (!ReadyBefore(*m_ready[i], *m_ready[parent])) {
-            return;
+        const std::size_t parent = (i - 1) / kHeapBranch;
+        ReadyEntry& up = m_ready[parent];
+        if (!EntryBefore(hole, up)) {
+            break;
         }
-        HeapSwap(i, parent);
+        m_ready[i] = up;
+        m_ready[i].stream->ready_slot = static_cast<std::uint32_t>(i);
         i = parent;
     }
+    m_ready[i] = hole;
+    m_ready[i].stream->ready_slot = static_cast<std::uint32_t>(i);
 }
 
 void StreamTable::SiftDown(std::size_t i) noexcept {
     const std::size_t count = m_ready.size();
+    ReadyEntry hole = m_ready[i];
     while (true) {
-        const std::size_t left = i * 2 + 1;
-        if (left >= count) {
-            return;
+        const std::size_t first = i * kHeapBranch + 1;
+        if (first >= count) {
+            break;
         }
-        std::size_t best = left;
-        const std::size_t right = left + 1;
-        if (right < count && ReadyBefore(*m_ready[right], *m_ready[left])) {
-            best = right;
+        // 4 个子项同层连续：一次取 4 项比较，选出最小者。
+        std::size_t best = first;
+        const std::size_t last = std::min(first + kHeapBranch, count);
+        for (std::size_t child = first + 1; child < last; ++child) {
+            if (EntryBefore(m_ready[child], m_ready[best])) {
+                best = child;
+            }
         }
-        if (!ReadyBefore(*m_ready[best], *m_ready[i])) {
-            return;
+        if (!EntryBefore(m_ready[best], hole)) {
+            break;
         }
-        HeapSwap(i, best);
+        m_ready[i] = m_ready[best];
+        m_ready[i].stream->ready_slot = static_cast<std::uint32_t>(i);
         i = best;
     }
+    m_ready[i] = hole;
+    m_ready[i].stream->ready_slot = static_cast<std::uint32_t>(i);
 }
 
 void StreamTable::PushReady(Stream& stream) noexcept {
     if (stream.ready_slot != Stream::kNoSlot) {
         return;  // 已在堆中（幂等）。
     }
+    ReadyEntry entry;
+    entry.finish = stream.finish;
+    entry.id = stream.id;
+    entry.stream = &stream;
     stream.ready_slot = static_cast<std::uint32_t>(m_ready.size());
-    m_ready.push_back(&stream);
+    m_ready.push_back(entry);
     SiftUp(m_ready.size() - 1);
 }
 
@@ -229,10 +248,16 @@ void StreamTable::RemoveReady(Stream& stream) noexcept {
         return;
     }
     m_ready[index] = m_ready[last];
-    m_ready[index]->ready_slot = static_cast<std::uint32_t>(index);
+    m_ready[index].stream->ready_slot = static_cast<std::uint32_t>(index);
     m_ready.pop_back();
-    SiftUp(index);
-    SiftDown(index);
+    // 尾部项换到 index 后，只需修正一个方向：比父小则上浮，否则下沉。
+    // （旧实现无条件 SiftUp + SiftDown：上浮后 index 处已换成父项，第二次
+    //   下沉作用在错误的元素上，靠「父项必然不小于其子」才侥幸无害。）
+    if (index > 0 && EntryBefore(m_ready[index], m_ready[(index - 1) / kHeapBranch])) {
+        SiftUp(index);
+    } else {
+        SiftDown(index);
+    }
 }
 
 void StreamTable::AddProducer(Stream& stream) noexcept {
@@ -690,7 +715,7 @@ Stream* StreamTable::PickNext(std::uint32_t max_payload) {
         // 旧实现对所有候选都 RemoveReady+PushReady（每帧 2 次 O(log n) sift），
         // 256 流规模下这是 ~600ns/帧 的纯浪费；这里把「留在堆里」当常态，
         // 只有真正要让位的流（关闭/窗口不足/父优先）才出堆。
-        Stream* stream = m_ready.front();
+        Stream* stream = m_ready.front().stream;
         if (stream->opened && !stream->can_send()) {
             RemoveReady(*stream);  // 已关闭/被重置：不再参与调度。
             continue;
@@ -819,7 +844,9 @@ void StreamTable::ChargeFinish(Stream& stream, std::size_t bytes) noexcept {
         stream.finish += static_cast<std::int64_t>(bytes) * (1 << 20) / weight;
     }
     // 流仍在就绪堆里时 finish 变大 → 只需下沉（finish 单调增，永不需上浮）。
+    // 堆项里的 finish 是快照：先同步再下沉，比较才不会用旧键。
     if (stream.ready_slot != Stream::kNoSlot) {
+        m_ready[stream.ready_slot].finish = stream.finish;
         SiftDown(stream.ready_slot);
     }
 }

@@ -9,6 +9,7 @@
 #include "go2cpp/p2p/p2p_channel.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -45,42 +46,48 @@ enum class FrameType : std::uint8_t {
     kKeepaliveAck = 3,
 };
 
+// 线上字节序固定大端。x86-64 是 little-endian：一次 unaligned load/store
+// 加 bswap（2~3 条指令）比逐字节移位拼接（8~12 条）省一半以上。
 std::uint16_t ReadU16(const std::uint8_t* data) noexcept {
-    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[0]) << 8U) |
-                                      static_cast<std::uint16_t>(data[1]));
+    std::uint16_t value = 0;
+    std::memcpy(&value, data, sizeof(value));
+    return __builtin_bswap16(value);
 }
 
 std::uint32_t ReadU32(const std::uint8_t* data) noexcept {
-    return (static_cast<std::uint32_t>(data[0]) << 24U) |
-           (static_cast<std::uint32_t>(data[1]) << 16U) |
-           (static_cast<std::uint32_t>(data[2]) << 8U) | static_cast<std::uint32_t>(data[3]);
+    std::uint32_t value = 0;
+    std::memcpy(&value, data, sizeof(value));
+    return __builtin_bswap32(value);
 }
 
 void StoreU16(std::uint8_t* out, std::uint16_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>(value >> 8U);
-    out[1] = static_cast<std::uint8_t>(value & 0xFFU);
+    value = __builtin_bswap16(value);
+    std::memcpy(out, &value, sizeof(value));
 }
 
 void StoreU32(std::uint8_t* out, std::uint32_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>((value >> 24U) & 0xFFU);
-    out[1] = static_cast<std::uint8_t>((value >> 16U) & 0xFFU);
-    out[2] = static_cast<std::uint8_t>((value >> 8U) & 0xFFU);
-    out[3] = static_cast<std::uint8_t>(value & 0xFFU);
+    value = __builtin_bswap32(value);
+    std::memcpy(out, &value, sizeof(value));
 }
 
-/// @brief 把完整帧写进调用方复用的缓冲：容量足够时每包零堆分配。
-void BuildFrameInto(std::vector<std::uint8_t>* out, FrameType type, std::uint32_t sequence,
-                    const void* payload, std::size_t length) {
-    out->resize(kDataHeaderSize + length);
-    std::uint8_t* data = out->data();
-    StoreU32(data, kDataMagic);
-    data[4] = kDataVersion;
-    data[5] = static_cast<std::uint8_t>(type);
-    StoreU16(data + 6, static_cast<std::uint16_t>(length));
-    StoreU32(data + 8, sequence);
+/// @brief 帧写缓冲容量（12B 头 + 单包上限 1200B）。
+inline constexpr std::size_t kFrameCapacity = kDataHeaderSize + kP2PMaxPayload;
+
+/// @brief 把完整帧写进调用方提供的定长缓冲，返回帧字节数。
+/// @details 旧实现用 `vector::resize`：容量足够时不分配，但对新增的
+///          `length` 个元素做值初始化（每包一次 512B memset，约 10~20ns）。
+///          改成写定长数组后每包零分配、零清零，只写真实载荷。
+std::size_t BuildFrameInto(std::uint8_t* out, FrameType type, std::uint32_t sequence,
+                           const void* payload, std::size_t length) noexcept {
+    StoreU32(out, kDataMagic);
+    out[4] = kDataVersion;
+    out[5] = static_cast<std::uint8_t>(type);
+    StoreU16(out + 6, static_cast<std::uint16_t>(length));
+    StoreU32(out + 8, sequence);
     if (length > 0) {
-        std::memcpy(data + kDataHeaderSize, payload, length);
+        std::memcpy(out + kDataHeaderSize, payload, length);
     }
+    return kDataHeaderSize + length;
 }
 
 /// @brief 连接状态快照：发布后不再修改，读路径只需一次 acquire load。
@@ -104,6 +111,22 @@ std::int64_t ToNanos(std::chrono::milliseconds value) noexcept {
 /// @brief 统计计数器的无锁自增（relaxed：只要求最终一致）。
 void Bump(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) noexcept {
     counter.fetch_add(amount, std::memory_order_relaxed);
+}
+
+/// @brief 数据面热路径的**单写者**自增：relaxed load+store，无 `lock` 前缀。
+///
+/// @details 线程模型规定同一时刻只有一个 Send 线程和一个 Recv 线程，因此
+///          `packets_sent`/`bytes_sent`（Send 写）与 `packets_received`/
+///          `bytes_received`（Recv 写）都不存在并发写者。`fetch_add` 在这
+///          种场景下仍然发 `lock xadd`（独占 cacheline，单核约 10 周期），
+///          而 load+add+store 只是普通访存。`Stats()` 的并发读仍由 relaxed
+///          原子保证单字段自洽。
+///          **前提**：调用方遵守「Send/Recv 不在多线程同时调用」；违反时
+///          会丢计数（旧实现不会）——控制面计数继续用 `Bump`。
+template <typename T>
+void BumpLocal(std::atomic<T>& counter, T amount = 1) noexcept {
+    counter.store(static_cast<T>(counter.load(std::memory_order_relaxed) + amount),
+                  std::memory_order_relaxed);
 }
 
 bool ParseFrame(const std::uint8_t* data, std::size_t length, FrameType* type,
@@ -430,17 +453,19 @@ public:
         if (!peer.valid()) {
             return false;
         }
+        // 单发送线程：序号用 load+store 即可（fetch_add 的原子性在此多余）。
         const std::uint32_t sequence =
-            m_send_sequence.fetch_add(1, std::memory_order_relaxed) + 1U;
-        BuildFrameInto(&m_tx_frame_scratch, FrameType::kData, sequence, data, length);
-        const bool sent =
-            relayed ? SendViaRelay(peer, m_tx_frame_scratch.data(), m_tx_frame_scratch.size())
-                    : SendDirect(peer, m_tx_frame_scratch.data(), m_tx_frame_scratch.size());
+            m_send_sequence.load(std::memory_order_relaxed) + 1U;
+        m_send_sequence.store(sequence, std::memory_order_relaxed);
+        const std::size_t wire_bytes =
+            BuildFrameInto(m_tx_frame.data(), FrameType::kData, sequence, data, length);
+        const bool sent = relayed ? SendViaRelay(peer, m_tx_frame.data(), wire_bytes)
+                                  : SendDirect(peer, m_tx_frame.data(), wire_bytes);
         if (sent) {
-            Bump(m_stats.packets_sent);
-            m_stats.bytes_sent.fetch_add(length, std::memory_order_relaxed);
+            BumpLocal(m_stats.packets_sent);
+            BumpLocal(m_stats.bytes_sent, length);
             if (relayed) {
-                Bump(m_stats.relayed_packets_sent);
+                BumpLocal(m_stats.relayed_packets_sent);
             }
         }
         return sent;
@@ -453,10 +478,20 @@ public:
         if (!IsConnected()) {
             return 0;
         }
-        const Clock::time_point deadline = Clock::now() + timeout;
-        // 稳态数据包路径不读时钟：只有空包/控制帧/无效包才重算剩余预算，
-        // 正常数据报直接返回（省掉每包一次 steady_clock::now）。
+        // deadline 惰性化：数据包快路径（收到合法数据帧）完全不取时钟。
+        // steady_clock::now() 走 vDSO 也要 ~15-20ns，是 Recv 每包最大的
+        // 纯用户态开销；只有空轮询/控制帧/无效包才需要真正的截止时间。
+        // 首次 poll 最多消耗 min(timeout, kRecvPollMs)，因此实际超时上界
+        // 是 timeout + 一个 poll 窗口（旧实现严格为 timeout）。
         std::chrono::milliseconds left = timeout;
+        Clock::time_point deadline{};
+        bool have_deadline = false;
+        const auto ensure_deadline = [&]() {
+            if (!have_deadline) {
+                deadline = Clock::now() + left;
+                have_deadline = true;
+            }
+        };
         for (;;) {
             // 每轮只取一次时钟；当 keepalive 与 peer_timeout 都关闭时
             // （纯数据面压测）完全跳过 steady_clock::now() 的 vDSO 调用。
@@ -477,6 +512,7 @@ public:
             const int received = relayed ? RecvViaRelay(&source, ClampPoll(left, kRecvPollMs))
                                          : RecvDirect(&source, ClampPoll(left, kRecvPollMs));
             if (received == 0) {
+                ensure_deadline();
                 left = Remaining(deadline);
                 continue;
             }
@@ -491,6 +527,7 @@ public:
             const std::size_t received_bytes = static_cast<std::size_t>(received);
             if (LooksLikeStun(bytes, received_bytes)) {
                 HandleStun(bytes, received_bytes, source, relayed);
+                ensure_deadline();
                 left = Remaining(deadline);
                 continue;
             }
@@ -499,28 +536,31 @@ public:
             const std::uint8_t* payload = nullptr;
             std::size_t payload_length = 0;
             if (!ParseFrame(bytes, received_bytes, &type, &sequence, &payload, &payload_length)) {
-                Bump(m_stats.dropped_packets);
+                BumpLocal(m_stats.dropped_packets);
+                ensure_deadline();
                 left = Remaining(deadline);
                 continue;
             }
             if (type == FrameType::kKeepalive) {
                 // keepalive ACK 用接收侧专用 scratch：与另一线程的 Send() 互不干扰。
-                BuildFrameInto(&m_rx_frame_scratch, FrameType::kKeepaliveAck, sequence, nullptr, 0);
-                (void)(relayed ? SendViaRelay(source, m_rx_frame_scratch.data(),
-                                              m_rx_frame_scratch.size())
-                               : SendDirect(source, m_rx_frame_scratch.data(),
-                                            m_rx_frame_scratch.size()));
+                const std::size_t ack_bytes = BuildFrameInto(
+                    m_rx_frame.data(), FrameType::kKeepaliveAck, sequence, nullptr, 0);
+                (void)(relayed ? SendViaRelay(source, m_rx_frame.data(), ack_bytes)
+                               : SendDirect(source, m_rx_frame.data(), ack_bytes));
                 Bump(m_stats.keepalives_received);
+                ensure_deadline();
                 left = Remaining(deadline);
                 continue;
             }
             if (type == FrameType::kKeepaliveAck) {
                 UpdateRtt();
+                ensure_deadline();
                 left = Remaining(deadline);
                 continue;
             }
             if (!SourceMatchesPeer(source)) {
-                Bump(m_stats.dropped_packets);
+                BumpLocal(m_stats.dropped_packets);
+                ensure_deadline();
                 left = Remaining(deadline);
                 continue;
             }
@@ -528,10 +568,10 @@ public:
             if (copied > 0) {
                 std::memcpy(buffer, payload, copied);
             }
-            Bump(m_stats.packets_received);
-            m_stats.bytes_received.fetch_add(copied, std::memory_order_relaxed);
+            BumpLocal(m_stats.packets_received);
+            BumpLocal(m_stats.bytes_received, copied);
             if (relayed) {
-                Bump(m_stats.relayed_packets_received);
+                BumpLocal(m_stats.relayed_packets_received);
             }
             UpdateSequenceGap(sequence);
             if (m_track_activity) {
@@ -705,16 +745,14 @@ private:
     }
 
     void UpdateSequenceGap(std::uint32_t sequence) noexcept {
-        if (!m_has_data_sequence.load(std::memory_order_relaxed)) {
-            m_has_data_sequence.store(true, std::memory_order_relaxed);
-            m_last_data_sequence.store(sequence, std::memory_order_relaxed);
-            return;
-        }
+        // 序号从 1 开始，0 即「尚未收到数据包」的哨兵：省掉一个独立的
+        // has 标志（旧实现每包都多一次 atomic load）。首包的 gap 恒为 0
+        // （sequence=1 → 1-0-1=0），与旧语义一致。
         const std::uint32_t last = m_last_data_sequence.load(std::memory_order_relaxed);
         if (sequence > last) {
             const std::uint32_t gap = sequence - last - 1U;
             if (gap > 0 && gap < 100000U) {
-                m_stats.sequence_gaps.fetch_add(gap, std::memory_order_relaxed);
+                BumpLocal(m_stats.sequence_gaps, gap);
             }
             m_last_data_sequence.store(sequence, std::memory_order_relaxed);
         }
@@ -756,11 +794,12 @@ private:
             return;
         }
         const std::uint32_t sequence = ++m_keepalive_sequence;
-        BuildFrameInto(&m_rx_frame_scratch, FrameType::kKeepalive, sequence, nullptr, 0);
+        const std::size_t wire_bytes =
+            BuildFrameInto(m_rx_frame.data(), FrameType::kKeepalive, sequence, nullptr, 0);
         const bool relayed = snapshot.state == P2PState::kRelayed;
         const bool sent =
-            relayed ? SendViaRelay(peer, m_rx_frame_scratch.data(), m_rx_frame_scratch.size())
-                    : SendDirect(peer, m_rx_frame_scratch.data(), m_rx_frame_scratch.size());
+            relayed ? SendViaRelay(peer, m_rx_frame.data(), wire_bytes)
+                    : SendDirect(peer, m_rx_frame.data(), wire_bytes);
         if (sent) {
             Bump(m_stats.keepalives_sent);
         }
@@ -1038,7 +1077,6 @@ private:
         m_last_receive_ns.store(now_ns, std::memory_order_relaxed);
         m_last_keepalive_ns.store(now_ns, std::memory_order_relaxed);
         m_has_pending_keepalive.store(false, std::memory_order_relaxed);
-        m_has_data_sequence.store(false, std::memory_order_relaxed);
         m_last_data_sequence.store(0, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(m_mutex);
         m_error.clear();
@@ -1058,18 +1096,21 @@ private:
     std::atomic<const ConnectionSnapshot*> m_snapshot{nullptr};
     std::vector<std::unique_ptr<ConnectionSnapshot>> m_snapshot_history;
     /// 统计：每个字段独立原子，读快照允许轻微不一致（与旧实现一致）。
+    /// 发送侧（Send 线程每包写）与接收侧（Recv 线程每包写）分处不同
+    /// cacheline：否则两个线程每包都互相打掉对方刚写热的 cacheline
+    /// （伪共享），真实双线程收发的固定税会翻倍。
     struct AtomicStats {
-        std::atomic<std::uint64_t> packets_sent{0};
-        std::atomic<std::uint64_t> packets_received{0};
+        alignas(64) std::atomic<std::uint64_t> packets_sent{0};
         std::atomic<std::uint64_t> bytes_sent{0};
-        std::atomic<std::uint64_t> bytes_received{0};
+        std::atomic<std::uint64_t> relayed_packets_sent{0};
         std::atomic<std::uint64_t> keepalives_sent{0};
-        std::atomic<std::uint64_t> keepalives_received{0};
         std::atomic<std::uint64_t> connectivity_checks_sent{0};
+        alignas(64) std::atomic<std::uint64_t> packets_received{0};
+        std::atomic<std::uint64_t> bytes_received{0};
+        std::atomic<std::uint64_t> relayed_packets_received{0};
+        std::atomic<std::uint64_t> keepalives_received{0};
         std::atomic<std::uint64_t> connectivity_checks_received{0};
         std::atomic<std::uint64_t> dropped_packets{0};
-        std::atomic<std::uint64_t> relayed_packets_sent{0};
-        std::atomic<std::uint64_t> relayed_packets_received{0};
         std::atomic<std::uint32_t> sequence_gaps{0};
         std::atomic<double> rtt_ms{0.0};
         std::atomic<double> rtt_avg_ms{0.0};
@@ -1079,7 +1120,6 @@ private:
     std::atomic<std::int64_t> m_last_receive_ns{NowNanos()};
     std::atomic<std::int64_t> m_last_keepalive_ns{NowNanos()};
     std::atomic<bool> m_has_pending_keepalive{false};
-    std::atomic<bool> m_has_data_sequence{false};
     std::atomic<std::uint32_t> m_last_data_sequence{0};
     std::atomic<bool> m_closed{false};
     // Send() 允许与 Recv() 在不同线程并发，序号必须是原子的。
@@ -1088,10 +1128,9 @@ private:
     std::uint64_t m_rtt_samples = 0;         // 仅 Recv 线程
     double m_rtt_sum = 0.0;                  // 仅 Recv 线程
     /// 复用帧缓冲：Send 用 tx、Recv 内的 keepalive/ACK 用 rx，互不干扰。
-    std::vector<std::uint8_t> m_tx_frame_scratch =
-        std::vector<std::uint8_t>(kDataHeaderSize + kP2PMaxPayload);
-    std::vector<std::uint8_t> m_rx_frame_scratch =
-        std::vector<std::uint8_t>(kDataHeaderSize + kP2PMaxPayload);
+    /// 定长数组（非 vector）：建帧不再对载荷做值初始化，每包省一次 memset。
+    std::array<std::uint8_t, kFrameCapacity> m_tx_frame{};
+    std::array<std::uint8_t, kFrameCapacity> m_rx_frame{};
     /// relay 对象由 owner 持有到析构，裸指针原子发布给热路径。
     std::unique_ptr<RelayClient> m_relay_owner;
     std::atomic<RelayClient*> m_relay{nullptr};
