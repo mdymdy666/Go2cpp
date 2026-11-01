@@ -37,6 +37,7 @@ if (GO2CPP_WITH_BENTO)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/crypto.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/x25519.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/congestion.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/fec.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/bandwidth.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/channel.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/link.cpp
@@ -115,6 +116,7 @@ if (GO2CPP_WITH_BENTO)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/tcp_transport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/memory_transport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/udp_transport.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/udp_batch.cpp
         # MOD-15：通用字节中继（有界缓冲/慢客户端/半关闭/超时）。
         ${CMAKE_CURRENT_SOURCE_DIR}/src/bento/net/relay.cpp)
 
@@ -406,6 +408,8 @@ if (GO2CPP_WITH_BENTO)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_conn_migration.cpp)
         add_executable(bento_test_fec
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_fec.cpp)
+        add_executable(bento_test_fec_codec
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_fec_codec.cpp)
         add_executable(bento_test_pmtud
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_pmtud.cpp)
         add_executable(bento_test_zero_rtt
@@ -495,6 +499,10 @@ if (GO2CPP_WITH_BENTO)
         # UDP 数据报与 X25519 独立测试：数据报边界/截断/超时 + RFC 7748 向量。
         add_executable(bento_test_udp_transport
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_udp_transport.cpp)
+        add_executable(bento_test_udp_batch
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_udp_batch.cpp)
+        add_executable(bento_bench_weaknet
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/bench_weaknet.cpp)
         add_executable(bento_test_x25519
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento/test_x25519.cpp)
         add_executable(bento_test_x25519_handshake
@@ -507,6 +515,8 @@ if (GO2CPP_WITH_BENTO)
                 -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
         endforeach()
         target_link_libraries(bento_test_udp_transport PRIVATE go2cpp_bento_transport)
+        target_link_libraries(bento_test_udp_batch PRIVATE go2cpp_bento_transport)
+        target_link_libraries(bento_bench_weaknet PRIVATE go2cpp_bento_transport)
         target_link_libraries(bento_test_x25519 PRIVATE go2cpp_bento)
         target_link_libraries(bento_test_x25519_handshake PRIVATE go2cpp_bento)
 
@@ -616,6 +626,7 @@ if (GO2CPP_WITH_BENTO)
                 bento_test_concurrent_send
                 bento_test_conn_migration
                 bento_test_fec
+                bento_test_fec_codec
                 bento_test_pmtud
                 bento_test_zero_rtt
                 bento_test_peer_hub
@@ -630,7 +641,9 @@ if (GO2CPP_WITH_BENTO)
                 bento_test_backoff
                 bento_test_pairing
                 bento_test_session_table
-                bento_netem_probe)
+                bento_netem_probe
+                bento_test_udp_batch
+                bento_bench_weaknet)
             target_include_directories(${bento_test_target} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/bento)
             target_link_libraries(${bento_test_target} PRIVATE go2cpp_bento)
@@ -655,6 +668,7 @@ if (GO2CPP_WITH_BENTO)
         add_test(NAME bento_concurrent_send COMMAND bento_test_concurrent_send)
         add_test(NAME bento_conn_migration COMMAND bento_test_conn_migration)
         add_test(NAME bento_fec COMMAND bento_test_fec)
+        add_test(NAME bento_fec_codec COMMAND bento_test_fec_codec)
         add_test(NAME bento_pmtud COMMAND bento_test_pmtud)
         add_test(NAME bento_zero_rtt COMMAND bento_test_zero_rtt)
         add_test(NAME bento_peer_hub COMMAND bento_test_peer_hub)
@@ -700,6 +714,8 @@ if (GO2CPP_WITH_BENTO)
         set_tests_properties(bento_capability bento_session
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         add_test(NAME bento_udp_transport COMMAND bento_test_udp_transport)
+        add_test(NAME bento_udp_batch COMMAND bento_test_udp_batch)
+        add_test(NAME bento_bench_weaknet COMMAND bento_bench_weaknet)
         add_test(NAME bento_x25519 COMMAND bento_test_x25519)
         add_test(NAME bento_x25519_handshake COMMAND bento_test_x25519_handshake)
         # 用户态弱网代理：无 CAP_NET_ADMIN 时替代 tc netem 的可重复版本。

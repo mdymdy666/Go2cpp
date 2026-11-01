@@ -440,7 +440,17 @@ void ReliableChannel::Pump(std::uint64_t now_ms) {
     while (!m_unsent.empty() && m_inflight.size() < kSendWindow) {
         // 拥塞窗口 + pacing 令牌双重门控：cwnd 满或令牌不足都不发新数据；
         // 已排队消息保留在 m_unsent，等 ACK/定时器继续 Pump。
-        if (!m_cc.AllowSend(now_ms, m_inflight.size())) {
+        // 在途计数必须剔除「已被 SACK 确认、只等累积 ACK 前移」的项：
+        // 它们已经到达对端，不再占用瓶颈队列。旧实现按 m_inflight.size()
+        // 门控，一次乱序就会让 cwnd 被虚占、Pump 提前停下（窗口 bug）。
+        std::size_t unacked_inflight = 0;
+        for (const Outgoing& inflight_message : m_inflight) {
+            if (m_sacked.count(inflight_message.seq) == 0) {
+                ++unacked_inflight;
+            }
+        }
+        if (!m_cc.AllowSend(now_ms, unacked_inflight)) {
+            ++m_stats.send_window_blocked;
             break;
         }
         Outgoing message = std::move(m_unsent.front());
@@ -452,11 +462,16 @@ void ReliableChannel::Pump(std::uint64_t now_ms) {
             m_unsent.push_front(std::move(message));
             break;
         }
+        if (m_config.fec.enabled) {
+            AppendFecSource(message.seq, message.payload.data(), message.payload.size(),
+                            message.fragmented);
+        }
         m_unsent.pop_front();
         m_inflight.push_back(std::move(message));
         m_cc.OnPacketSent(now_ms, wire_bytes);
         ++m_stats.fragments_sent;
     }
+    SendFecOutbox(now_ms);
     RefreshCongestionStats();
 }
 
@@ -558,6 +573,9 @@ void ReliableChannel::OnFrame(const FrameHeader& header, const std::uint8_t* pay
     m_rx_bytes_total += wire_bytes;
 
     m_rx_seen.insert(seq);
+    if (!fragmented) {
+        RememberFecPayload(seq, payload, bytes);
+    }
     Received frame;
     frame.fragmented = fragmented;
     if (bytes > 0) {
@@ -588,6 +606,7 @@ void ReliableChannel::AdvanceDelivery() {
             Received frame = std::move(it->second);
             m_rx_buffer.erase(it);
             const std::uint32_t seq = m_next_rx_seq;
+            MoveFecPayloadToHistory(seq);
             if (frame.fragmented) {
                 StreamFragmentHeader fragment;
                 if (frame.payload.size() < kStreamFragmentHeaderBytes ||
@@ -733,7 +752,10 @@ void ReliableChannel::OnAck(const AckState& ack) {
     }
 
     // ACK 腾出了窗口：先增长拥塞窗口，再补发排队消息。
-    m_cc.OnAck(acked_now, m_rtt.smoothed_rtt_ms(), now_ms);
+    // 传本次 ACK 里真实采到的 RTT（Acknowledge 写入 last_rtt_ms），
+    // 而不是 srtt 本身：把平滑值当新样本会让 min_rtt 永远不动、
+    // BBR 的 BDP/RTO 全部退化成自反馈（旧实现的实际缺陷）。
+    m_cc.OnAck(acked_now, m_stats.last_rtt_ms, now_ms);
     Pump(now_ms);
     (void)TryFastRetransmit(progressed, new_sack, now_ms);
     RefreshRttStats();
@@ -833,6 +855,11 @@ bool ReliableChannel::TryFastRetransmit(bool ack_progressed, std::size_t new_sac
             // 本批重传；<= m_max_sacked 的项才是确定空洞。
             if (SeqGreater(it->seq, m_max_sacked)) {
                 break;
+            }
+            // 已由扩展块确认的项不是空洞：跳过而不是重传（旧实现会把
+            // 它们当空洞补发，弱网下重传量虚高、接收端重复帧增加）。
+            if (m_sacked.count(it->seq) != 0) {
+                continue;
             }
         } else if (it != m_inflight.begin()) {
             // 纯重复 ACK（无 SACK 信息）只能确定最小未确认这一条。
@@ -940,6 +967,8 @@ void ReliableChannel::OnTimer(std::uint64_t now_ms) {
         m_cc.OnTimeout(loss_context);
         m_bandwidth.OnLoss(now_ms, retransmitted);
     }
+    PruneFecGroups(now_ms);
+    SendFecOutbox(now_ms);
     const std::size_t dropped = m_reassembler.OnTimer(now_ms);
     m_stats.reassembly_timeouts += dropped;
     RefreshRttStats();
@@ -1805,6 +1834,384 @@ void VideoChannel::DropReassembly(std::map<std::uint32_t, Reassembly>::iterator 
     m_fec.erase(it->first);
     m_active.erase(it);
     ++m_stats.frames_incomplete_dropped;
+}
+
+
+// ---------------------------------------------------------------------------
+// ReliableChannel: FEC 发送侧
+// ---------------------------------------------------------------------------
+
+void ReliableChannel::AppendFecSource(std::uint32_t seq, const std::uint8_t* payload,
+                                      std::size_t bytes, bool fragmented) {
+    if (!m_config.fec.enabled) {
+        return;
+    }
+    const std::uint16_t data_shards = m_config.fec.data_shards;
+    if (data_shards < 2 || m_config.fec.parity_shards < 1) {
+        return;
+    }
+    if (fragmented) {
+        // 分片帧不参与 FEC：恢复后无法判定分片标志，注入会破坏重组。
+        // 当前组作废，这些帧仍由重传兜底。
+        if (m_fec_send_group.filled > 0) {
+            ++m_stats.fec_groups_skipped;
+            m_fec_send_group = FecSendGroup();
+        }
+        return;
+    }
+    if (m_fec_send_group.filled == 0) {
+        m_fec_send_group = FecSendGroup();
+        m_fec_send_group.group_id = m_next_fec_group_id++;
+        m_fec_send_group.base_seq = seq;
+        m_fec_send_group.payloads.resize(data_shards);
+        m_fec_send_group.lengths.assign(data_shards, 0);
+        m_fec_send_group.usable = true;
+    }
+    const std::uint32_t offset = seq - m_fec_send_group.base_seq;
+    if (offset >= data_shards) {
+        // seq 不连续（回绕/跨组）：当前组作废，重新开组。
+        m_fec_send_group.usable = false;
+        FlushFecGroup();
+        AppendFecSource(seq, payload, bytes, false);
+        return;
+    }
+    if (bytes > 0xFFFFU) {
+        m_fec_send_group.usable = false;
+        FlushFecGroup();
+        return;
+    }
+    m_fec_send_group.payloads[offset].assign(payload, payload + bytes);
+    m_fec_send_group.lengths[offset] = static_cast<std::uint16_t>(bytes);
+    m_fec_send_group.max_len = std::max(m_fec_send_group.max_len, bytes);
+    ++m_fec_send_group.filled;
+
+    if (m_fec_send_group.filled >= data_shards) {
+        FlushFecGroup();
+    }
+}
+
+void ReliableChannel::FlushFecGroup() {
+    if (m_fec_send_group.filled == 0) {
+        return;
+    }
+    const std::uint16_t data_shards = m_config.fec.data_shards;
+    const std::uint16_t parity_shards = m_config.fec.parity_shards;
+    const bool complete = m_fec_send_group.usable && m_fec_send_group.filled == data_shards;
+    const std::size_t max_payload =
+        FecEncoder::MaxPayloadFor(kMaxFramePayload, kFecHeaderBytes, data_shards);
+    const bool fits = m_fec_send_group.max_len <= max_payload &&
+                      m_fec_send_group.max_len <= m_config.fec.max_payload_bytes;
+    if (!complete || !fits) {
+        ++m_stats.fec_groups_skipped;
+        m_fec_send_group = FecSendGroup();
+        return;
+    }
+
+    FecEncoder encoder(m_config.fec.kind, data_shards, parity_shards);
+    for (std::uint16_t i = 0; i < data_shards; ++i) {
+        const std::vector<std::uint8_t>& payload = m_fec_send_group.payloads[i];
+        if (!encoder.AddSource(i, payload.data(), payload.size())) {
+            ++m_stats.fec_groups_skipped;
+            m_fec_send_group = FecSendGroup();
+            return;
+        }
+    }
+    std::vector<FecShard> parity;
+    std::size_t max_len = 0;
+    if (!encoder.Encode(&parity, &max_len)) {
+        ++m_stats.fec_groups_skipped;
+        m_fec_send_group = FecSendGroup();
+        return;
+    }
+
+    bool encoded = true;
+    const std::size_t outbox_before = m_fec_outbox.size();
+    for (std::uint16_t j = 0; j < parity_shards && encoded; ++j) {
+        FecFrameHeader fec_header;
+        fec_header.kind = static_cast<std::uint8_t>(m_config.fec.kind);
+        fec_header.group_id = m_fec_send_group.group_id;
+        fec_header.base_seq = m_fec_send_group.base_seq;
+        fec_header.data_shards = data_shards;
+        fec_header.parity_shards = parity_shards;
+        fec_header.parity_index = j;
+        fec_header.max_len = static_cast<std::uint16_t>(max_len);
+        const std::vector<std::uint8_t> fec_payload = BuildFecPayload(
+            fec_header, m_fec_send_group.lengths.data(), parity[j].data.data());
+        if (fec_payload.empty()) {
+            encoded = false;
+            break;
+        }
+        FrameHeader header;
+        header.type = FrameType::kFec;
+        header.channel = m_channel_id;
+        header.seq = m_fec_send_group.group_id;
+        const std::vector<std::uint8_t> frame =
+            BuildFrame(header, nullptr, fec_payload.data(), fec_payload.size());
+        if (frame.empty()) {
+            encoded = false;
+            break;
+        }
+        m_fec_outbox.push_back(std::move(frame));
+    }
+    if (encoded) {
+        ++m_stats.fec_groups_encoded;
+    } else {
+        ++m_stats.fec_groups_skipped;
+        m_fec_outbox.resize(outbox_before);
+    }
+    m_fec_send_group = FecSendGroup();
+}
+
+void ReliableChannel::SendFecOutbox(std::uint64_t now_ms) {
+    while (!m_fec_outbox.empty()) {
+        const std::vector<std::uint8_t>& frame = m_fec_outbox.front();
+        if (!m_sink || !m_sink(frame.data(), frame.size())) {
+            ++m_stats.send_failures;
+            break;
+        }
+        ++m_stats.fec_frames_sent;
+        m_stats.fec_bytes_sent += frame.size();
+        m_cc.OnSend(frame.size(), now_ms);
+        m_fec_outbox.pop_front();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReliableChannel: FEC 接收侧
+// ---------------------------------------------------------------------------
+
+void ReliableChannel::RememberFecPayload(std::uint32_t seq, const std::uint8_t* payload,
+                                         std::size_t bytes) {
+    if (!m_config.fec.enabled) {
+        return;
+    }
+    m_fec_rx_payloads[seq].assign(payload, payload + bytes);
+}
+
+void ReliableChannel::MoveFecPayloadToHistory(std::uint32_t seq) {
+    if (!m_config.fec.enabled) {
+        return;
+    }
+    auto it = m_fec_rx_payloads.find(seq);
+    if (it == m_fec_rx_payloads.end()) {
+        return;
+    }
+    if (m_config.fec_delivered_history > 0) {
+        m_fec_history[seq] = std::move(it->second);
+        while (m_fec_history.size() > m_config.fec_delivered_history) {
+            m_fec_history.erase(m_fec_history.begin());
+        }
+    }
+    m_fec_rx_payloads.erase(it);
+}
+
+void ReliableChannel::OnFecFrame(const FrameHeader& header, const std::uint8_t* payload,
+                                 std::size_t bytes) {
+    if (header.channel != m_channel_id) {
+        ++m_stats.invalid_frames;
+        return;
+    }
+    if (!m_config.fec.enabled) {
+        return;
+    }
+    FecPayloadView view;
+    if (!ParseFecPayload(payload, bytes, &view)) {
+        ++m_stats.invalid_frames;
+        return;
+    }
+    const FecFrameHeader& fec_header = view.header;
+    auto it = m_fec_rx_groups.find(fec_header.base_seq);
+    if (it == m_fec_rx_groups.end()) {
+        if (m_fec_rx_groups.size() >= m_config.fec_max_groups) {
+            auto oldest = m_fec_rx_groups.begin();
+            for (auto cur = m_fec_rx_groups.begin(); cur != m_fec_rx_groups.end(); ++cur) {
+                if (cur->second.created_ms < oldest->second.created_ms) {
+                    oldest = cur;
+                }
+            }
+            m_fec_rx_groups.erase(oldest);
+            ++m_stats.fec_groups_expired;
+        }
+        FecRecvGroup group;
+        group.group_id = fec_header.group_id;
+        group.base_seq = fec_header.base_seq;
+        group.data_shards = fec_header.data_shards;
+        group.parity_shards = fec_header.parity_shards;
+        group.kind = fec_header.kind;
+        group.max_len = fec_header.max_len;
+        group.created_ms = Now();
+        group.lengths.resize(fec_header.data_shards, 0);
+        for (std::uint16_t i = 0; i < fec_header.data_shards; ++i) {
+            group.lengths[i] = FecLengthAt(view, i);
+        }
+        group.parities.resize(fec_header.parity_shards);
+        group.have_parity.assign(fec_header.parity_shards, false);
+        it = m_fec_rx_groups.emplace(fec_header.base_seq, std::move(group)).first;
+    }
+    FecRecvGroup& group = it->second;
+    if (group.data_shards != fec_header.data_shards ||
+        group.parity_shards != fec_header.parity_shards || group.kind != fec_header.kind ||
+        group.max_len != fec_header.max_len) {
+        ++m_stats.invalid_frames;
+        return;
+    }
+    if (fec_header.parity_index >= group.have_parity.size()) {
+        ++m_stats.invalid_frames;
+        return;
+    }
+    if (group.have_parity[fec_header.parity_index]) {
+        ++m_stats.fec_duplicate_parity;
+        return;
+    }
+    group.parities[fec_header.parity_index].assign(view.parity, view.parity + fec_header.max_len);
+    group.have_parity[fec_header.parity_index] = true;
+
+    (void)TryRecoverFec(fec_header.base_seq, Now());
+}
+
+bool ReliableChannel::TryRecoverFec(std::uint32_t base_seq, std::uint64_t now_ms) {
+    auto group_it = m_fec_rx_groups.find(base_seq);
+    if (group_it == m_fec_rx_groups.end()) {
+        return false;
+    }
+    FecRecvGroup& group = group_it->second;
+    const std::uint16_t data_shards = group.data_shards;
+    if (data_shards < 2 || group.max_len == 0) {
+        m_fec_rx_groups.erase(group_it);
+        return false;
+    }
+    std::vector<bool> present(data_shards, false);
+    std::vector<const std::vector<std::uint8_t>*> known(data_shards, nullptr);
+    std::uint16_t missing = 0;
+    for (std::uint16_t i = 0; i < data_shards; ++i) {
+        const std::uint32_t seq = base_seq + i;
+        auto rx_it = m_fec_rx_payloads.find(seq);
+        if (rx_it != m_fec_rx_payloads.end()) {
+            present[i] = true;
+            known[i] = &rx_it->second;
+            continue;
+        }
+        auto history_it = m_fec_history.find(seq);
+        if (history_it != m_fec_history.end()) {
+            present[i] = true;
+            known[i] = &history_it->second;
+            continue;
+        }
+        if (SeqGreater(m_next_rx_seq, seq)) {
+            // 已交付且历史副本已淘汰：无法参与解码，放弃本组。
+            m_fec_rx_groups.erase(group_it);
+            ++m_stats.fec_recovery_failures;
+            return false;
+        }
+        ++missing;
+    }
+    if (missing == 0) {
+        m_fec_rx_groups.erase(group_it);
+        return true;
+    }
+    std::uint16_t parity_count = 0;
+    for (bool have : group.have_parity) {
+        if (have) {
+            ++parity_count;
+        }
+    }
+    if (parity_count < missing) {
+        return false;  // 继续等校验帧或迟到的数据帧
+    }
+
+    FecDecoder decoder(static_cast<FecKind>(group.kind), data_shards, group.parity_shards);
+    if (!decoder.SetMaxLen(group.max_len)) {
+        m_fec_rx_groups.erase(group_it);
+        ++m_stats.fec_recovery_failures;
+        return false;
+    }
+    for (std::uint16_t i = 0; i < data_shards; ++i) {
+        if (!present[i]) {
+            continue;
+        }
+        std::size_t bytes = known[i]->size();
+        if (i < group.lengths.size()) {
+            bytes = std::min<std::size_t>(bytes, group.lengths[i]);
+        }
+        if (!decoder.AddSource(i, known[i]->data(), bytes)) {
+            m_fec_rx_groups.erase(group_it);
+            ++m_stats.fec_recovery_failures;
+            return false;
+        }
+    }
+    for (std::uint16_t j = 0; j < group.parity_shards; ++j) {
+        if (!group.have_parity[j]) {
+            continue;
+        }
+        if (!decoder.AddParity(j, group.parities[j].data(), group.parities[j].size())) {
+            m_fec_rx_groups.erase(group_it);
+            ++m_stats.fec_recovery_failures;
+            return false;
+        }
+    }
+    std::vector<FecShard> recovered;
+    std::string error;
+    if (!decoder.Recover(&recovered, &error)) {
+        m_fec_rx_groups.erase(group_it);
+        ++m_stats.fec_recovery_failures;
+        return false;
+    }
+
+    const std::vector<std::uint16_t> lengths = group.lengths;
+    m_fec_rx_groups.erase(group_it);
+    (void)now_ms;
+    bool injected = false;
+    for (const FecShard& shard : recovered) {
+        if (shard.index >= data_shards) {
+            continue;
+        }
+        const std::uint32_t seq = base_seq + shard.index;
+        if (SeqGreater(m_next_rx_seq, seq) || m_rx_seen.count(seq) != 0) {
+            continue;
+        }
+        std::size_t length = shard.data.size();
+        if (shard.index < lengths.size()) {
+            length = std::min<std::size_t>(length, lengths[shard.index]);
+        }
+        FrameHeader synthetic;
+        synthetic.type = FrameType::kStream;
+        synthetic.channel = m_channel_id;
+        synthetic.flags = 0;
+        synthetic.seq = seq;
+        synthetic.dep_seq = 0;
+        OnFrame(synthetic, shard.data.data(), length, nullptr);
+        ++m_stats.fec_frames_recovered;
+        injected = true;
+    }
+    if (injected) {
+        m_pending_ack = true;
+    }
+    return true;
+}
+
+void ReliableChannel::PruneFecGroups(std::uint64_t now_ms) {
+    if (!m_config.fec.enabled) {
+        return;
+    }
+    for (auto it = m_fec_rx_groups.begin(); it != m_fec_rx_groups.end();) {
+        if (now_ms >= it->second.created_ms &&
+            now_ms - it->second.created_ms >= m_config.fec.group_timeout_ms) {
+            const std::uint32_t base = it->second.base_seq;
+            const std::uint16_t shards = it->second.data_shards;
+            for (std::uint16_t i = 0; i < shards; ++i) {
+                m_fec_rx_payloads.erase(base + i);
+            }
+            it = m_fec_rx_groups.erase(it);
+            ++m_stats.fec_groups_expired;
+        } else {
+            ++it;
+        }
+    }
+    const std::size_t limit =
+        std::max<std::size_t>(static_cast<std::size_t>(m_config.fec.data_shards) * 4U, 64U);
+    while (m_fec_rx_payloads.size() > limit) {
+        m_fec_rx_payloads.erase(m_fec_rx_payloads.begin());
+    }
 }
 
 }  // namespace go2cpp::bento

@@ -137,6 +137,10 @@ enum class FrameType : std::uint8_t {
     kPmtudProbe = 0x09,
     /// 路径 MTU 探测确认：载荷 >= 8B，回显 token 与 target。
     kPmtudAck = 0x0A,
+    /// 通用 FEC 校验分片：载荷 16B 子头 + k 个 u16 原始长度 + max_len 字节
+    /// 校验数据（见 FecFrameHeader）。header.channel 与被保护的数据通道一致，
+    /// header.seq 独立编号（校验帧不占用数据 seq 空间）。
+    kFec = 0x0B,
 };
 
 /// MAX_DATA 帧载荷字节数（u64 绝对上限）。
@@ -301,5 +305,53 @@ void EncodeVideoHeader(const VideoFragmentHeader& header, std::uint8_t* out) noe
 /// @brief 解码视频分片子头（不校验 frag_index/frag_count 关系）。
 bool DecodeVideoHeader(const std::uint8_t* data, std::size_t size,
                        VideoFragmentHeader* out) noexcept;
+
+// ---------------------------------------------------------------------------
+// FEC 帧（FrameType::kFec）
+// ---------------------------------------------------------------------------
+
+/// FEC 子头固定字节数。
+inline constexpr std::size_t kFecHeaderBytes = 16;
+
+/// @brief FEC 子头。紧跟其后是 data_shards 个 u16 原始长度（大端），
+///        再之后是 max_len 字节的校验数据。
+struct FecFrameHeader {
+    std::uint8_t kind = 0;           ///< 0 = XOR，1 = Reed-Solomon（同 FecKind）。
+    std::uint8_t flags = 0;          ///< 保留，当前必须为 0。
+    std::uint16_t group_id = 0;      ///< 组号，单调递增（用于日志与去重）。
+    std::uint32_t base_seq = 0;      ///< 组内第一个数据帧的可靠 seq。
+    std::uint16_t data_shards = 0;   ///< k。
+    std::uint16_t parity_shards = 0; ///< m。
+    std::uint16_t parity_index = 0;  ///< 本帧是第几个校验分片（0..m-1）。
+    std::uint16_t max_len = 0;       ///< 组内最大原始载荷长度（校验数据长度）。
+};
+
+/// @brief 解析后的 FEC 载荷视图（指向调用方缓冲区）。
+struct FecPayloadView {
+    FecFrameHeader header;
+    const std::uint8_t* lengths = nullptr;  ///< k 个 u16 大端长度，紧跟在子头后。
+    const std::uint8_t* parity = nullptr;   ///< max_len 字节校验数据。
+};
+
+/// @brief FEC 载荷总字节数（子头 + 长度表 + parity）。
+std::size_t FecPayloadBytes(const FecFrameHeader& header) noexcept;
+
+/// @brief 编码 FEC 子头（不含长度表与 parity）。
+void EncodeFecHeader(const FecFrameHeader& header, std::uint8_t* out) noexcept;
+
+/// @brief 解码 FEC 子头并做形状校验（k 在 [2,64]、m 在 [1,16]、index<m、k+m<=255）。
+bool DecodeFecHeader(const std::uint8_t* data, std::size_t size, FecFrameHeader* out) noexcept;
+
+/// @brief 构造完整 FEC 载荷；长度表按原始长度写入，parity 必须 >= max_len。
+/// @return 参数非法或载荷超过单帧上限时返回空 vector。
+std::vector<std::uint8_t> BuildFecPayload(const FecFrameHeader& header,
+                                          const std::uint16_t* lengths,
+                                          const std::uint8_t* parity);
+
+/// @brief 解析 FEC 载荷并校验总长度与长度表。
+bool ParseFecPayload(const std::uint8_t* data, std::size_t size, FecPayloadView* out) noexcept;
+
+/// @brief 读取载荷视图里第 index 个原始长度。
+std::uint16_t FecLengthAt(const FecPayloadView& view, std::size_t index) noexcept;
 
 }  // namespace go2cpp::bento

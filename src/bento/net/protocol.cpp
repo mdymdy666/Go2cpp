@@ -80,6 +80,9 @@ bool ValidatePayloadShape(FrameType type, std::size_t payload_bytes) noexcept {
         case FrameType::kPmtudAck:
             // token + target；探针其余字节是填充。
             return payload_bytes >= kPmtudPayloadBytes;
+        case FrameType::kFec:
+            // FEC 子头 + 长度表 + parity 的最小形状；完整校验在 DecodeFecHeader。
+            return payload_bytes >= kFecHeaderBytes;
     }
     return false;
 }
@@ -104,6 +107,7 @@ bool IsKnownFrameType(std::uint8_t raw) noexcept {
         case FrameType::kMaxData:
         case FrameType::kPmtudProbe:
         case FrameType::kPmtudAck:
+        case FrameType::kFec:
             return true;
     }
     return false;
@@ -131,6 +135,8 @@ const char* FrameTypeName(FrameType type) noexcept {
             return "PMTUD_PROBE";
         case FrameType::kPmtudAck:
             return "PMTUD_ACK";
+        case FrameType::kFec:
+            return "FEC";
     }
     return "UNKNOWN";
 }
@@ -438,6 +444,120 @@ bool DecodeVideoHeader(const std::uint8_t* data, std::size_t size,
     out->frag_index = ReadU16(data + 4);
     out->frag_count = ReadU16(data + 6);
     return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// FEC 帧编解码
+// ---------------------------------------------------------------------------
+
+std::size_t FecPayloadBytes(const FecFrameHeader& header) noexcept {
+    return kFecHeaderBytes + static_cast<std::size_t>(header.data_shards) * 2U +
+           static_cast<std::size_t>(header.max_len);
+}
+
+void EncodeFecHeader(const FecFrameHeader& header, std::uint8_t* out) noexcept {
+    out[0] = header.kind;
+    out[1] = header.flags;
+    WriteU16(out + 2, header.group_id);
+    WriteU32(out + 4, header.base_seq);
+    WriteU16(out + 8, header.data_shards);
+    WriteU16(out + 10, header.parity_shards);
+    WriteU16(out + 12, header.parity_index);
+    WriteU16(out + 14, header.max_len);
+}
+
+bool DecodeFecHeader(const std::uint8_t* data, std::size_t size, FecFrameHeader* out) noexcept {
+    if (out == nullptr || data == nullptr || size < kFecHeaderBytes) {
+        return false;
+    }
+    FecFrameHeader header;
+    header.kind = data[0];
+    header.flags = data[1];
+    header.group_id = ReadU16(data + 2);
+    header.base_seq = ReadU32(data + 4);
+    header.data_shards = ReadU16(data + 8);
+    header.parity_shards = ReadU16(data + 10);
+    header.parity_index = ReadU16(data + 12);
+    header.max_len = ReadU16(data + 14);
+    if (header.kind > 1 || header.flags != 0) {
+        return false;
+    }
+    if (header.data_shards < 2 || header.data_shards > 64) {
+        return false;
+    }
+    if (header.parity_shards < 1 || header.parity_shards > 16) {
+        return false;
+    }
+    if (header.kind == 0 && header.parity_shards != 1) {
+        return false;
+    }
+    if (static_cast<std::uint32_t>(header.data_shards) + header.parity_shards > 255U) {
+        return false;
+    }
+    if (header.parity_index >= header.parity_shards) {
+        return false;
+    }
+    if (header.max_len == 0) {
+        return false;
+    }
+    *out = header;
+    return true;
+}
+
+std::vector<std::uint8_t> BuildFecPayload(const FecFrameHeader& header,
+                                          const std::uint16_t* lengths,
+                                          const std::uint8_t* parity) {
+    if (lengths == nullptr || parity == nullptr) {
+        return {};
+    }
+    if (header.data_shards == 0 || header.max_len == 0) {
+        return {};
+    }
+    const std::size_t total = FecPayloadBytes(header);
+    if (total > kMaxFramePayload) {
+        return {};
+    }
+    std::vector<std::uint8_t> payload(total, 0);
+    EncodeFecHeader(header, payload.data());
+    std::size_t offset = kFecHeaderBytes;
+    for (std::uint16_t i = 0; i < header.data_shards; ++i) {
+        if (lengths[i] > header.max_len) {
+            return {};
+        }
+        WriteU16(payload.data() + offset, lengths[i]);
+        offset += 2;
+    }
+    for (std::size_t i = 0; i < header.max_len; ++i) {
+        payload[offset + i] = parity[i];
+    }
+    return payload;
+}
+
+bool ParseFecPayload(const std::uint8_t* data, std::size_t size, FecPayloadView* out) noexcept {
+    if (out == nullptr || data == nullptr) {
+        return false;
+    }
+    FecFrameHeader header;
+    if (!DecodeFecHeader(data, size, &header)) {
+        return false;
+    }
+    if (size != FecPayloadBytes(header)) {
+        return false;
+    }
+    FecPayloadView view;
+    view.header = header;
+    view.lengths = data + kFecHeaderBytes;
+    view.parity = data + kFecHeaderBytes + static_cast<std::size_t>(header.data_shards) * 2U;
+    *out = view;
+    return true;
+}
+
+std::uint16_t FecLengthAt(const FecPayloadView& view, std::size_t index) noexcept {
+    if (index >= view.header.data_shards || view.lengths == nullptr) {
+        return 0;
+    }
+    return ReadU16(view.lengths + index * 2U);
 }
 
 }  // namespace go2cpp::bento

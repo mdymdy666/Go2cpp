@@ -44,6 +44,7 @@
 
 #include "go2cpp/bento/net/bandwidth.hpp"
 #include "go2cpp/bento/net/congestion.hpp"
+#include "go2cpp/bento/net/fec.hpp"
 #include "go2cpp/bento/net/protocol.hpp"
 #include "go2cpp/bento/net/relation.hpp"
 
@@ -301,6 +302,16 @@ class ReliableChannel final {
         std::uint64_t flow_control_violations = 0;  ///< 对端超窗发送被拒。
         std::uint64_t max_data_sent = 0;
         std::uint64_t max_data_received = 0;
+
+        // FEC（默认关闭；开启后由 kFec 帧承载校验分片）。
+        std::uint64_t fec_groups_encoded = 0;    ///< 发出的 FEC 组数。
+        std::uint64_t fec_frames_sent = 0;       ///< 发出的校验帧数。
+        std::uint64_t fec_bytes_sent = 0;        ///< 校验帧占用的线上字节。
+        std::uint64_t fec_groups_skipped = 0;    ///< 因不完整/超长放弃的组。
+        std::uint64_t fec_frames_recovered = 0;  ///< 由 FEC 恢复并注入交付的帧数。
+        std::uint64_t fec_recovery_failures = 0; ///< 组可解但解码失败的次数。
+        std::uint64_t fec_groups_expired = 0;    ///< 超时清理的接收组数。
+        std::uint64_t fec_duplicate_parity = 0;  ///< 重复的校验帧数。
     };
 
     /// 交付回调：seq + 载荷。载荷只在回调期间有效。
@@ -327,6 +338,13 @@ class ReliableChannel final {
         std::uint32_t max_data_refresh_ms = 200;
         /// 交付速率/丢包率估计参数（ABR 输入）。
         BandwidthEstimator::Config bandwidth;
+        /// 可选的前向纠错分组（默认关闭）。开启后每 k 个连续、非分片的
+        /// STREAM 帧附带 m 个 kFec 校验帧，接收端用任意 k 个分片恢复丢失帧。
+        FecConfig fec;
+        /// 接收端保留的已交付载荷历史（FEC 解码需要组内已交付分片）。
+        std::size_t fec_delivered_history = 64;
+        /// 接收端同时跟踪的 FEC 组上限。
+        std::size_t fec_max_groups = 8;
     };
 
     /// @brief 可注入时钟（毫秒），默认 NowMs()；测试用假时钟做确定性时序。
@@ -382,6 +400,11 @@ class ReliableChannel final {
     /// @brief 处理收到的 STREAM 帧（内部先应用捎带的 ACK）。
     void OnFrame(const FrameHeader& header, const std::uint8_t* payload, std::size_t bytes,
                  const AckState* piggyback_ack);
+
+    /// @brief 处理收到的 FEC 校验帧（FrameType::kFec，channel 与本通道一致）。
+    /// @details 只在 Config::fec.enabled 时生效；凑够可解分片后恢复缺失的
+    ///          STREAM 帧并走正常接收路径（计入 SACK/交付/流控）。
+    void OnFecFrame(const FrameHeader& header, const std::uint8_t* payload, std::size_t bytes);
 
     /// @brief 应用累积 ACK + SACK 位图 + 可选多块扩展。
     void OnAck(const AckState& ack);
@@ -468,6 +491,21 @@ class ReliableChannel final {
 
     bool SendNow(Outgoing& message, bool retransmit, std::uint64_t now_ms);
     void Pump(std::uint64_t now_ms);
+
+    // ---- FEC 发送侧（分组编码与校验帧发送） ----
+    /// @brief 把一个已发送的数据帧加入当前 FEC 组；分片帧不参与。
+    void AppendFecSource(std::uint32_t seq, const std::uint8_t* payload, std::size_t bytes,
+                         bool fragmented);
+    /// @brief 收满 k 个或作废当前组；完整且不超长时编码 m 个 kFec 帧。
+    void FlushFecGroup();
+    /// @brief 把待发校验帧交给 FrameSink。
+    void SendFecOutbox(std::uint64_t now_ms);
+
+    // ---- FEC 接收侧（组跟踪与恢复） ----
+    bool TryRecoverFec(std::uint32_t base_seq, std::uint64_t now_ms);
+    void PruneFecGroups(std::uint64_t now_ms);
+    void RememberFecPayload(std::uint32_t seq, const std::uint8_t* payload, std::size_t bytes);
+    void MoveFecPayloadToHistory(std::uint32_t seq);
     void Acknowledge(Outgoing& message, std::uint64_t now_ms);
     void AdvanceDelivery();
     std::uint64_t Now() const noexcept;
@@ -515,6 +553,35 @@ class ReliableChannel final {
     bool m_pending_ack = false;
     bool m_pto_recovery = false;  ///< 已为当前 PTO 丢失事件降过窗，等 ACK 前进清除。
     Stats m_stats;
+
+    // ---- FEC 状态 ----
+    struct FecSendGroup {
+        std::uint16_t group_id = 0;
+        std::uint32_t base_seq = 0;
+        std::uint16_t filled = 0;
+        bool usable = true;
+        std::size_t max_len = 0;
+        std::vector<std::vector<std::uint8_t>> payloads;
+        std::vector<std::uint16_t> lengths;
+    };
+    struct FecRecvGroup {
+        std::uint16_t group_id = 0;
+        std::uint32_t base_seq = 0;
+        std::uint16_t data_shards = 0;
+        std::uint16_t parity_shards = 0;
+        std::uint8_t kind = 0;
+        std::uint16_t max_len = 0;
+        std::uint64_t created_ms = 0;
+        std::vector<std::uint16_t> lengths;
+        std::vector<std::vector<std::uint8_t>> parities;
+        std::vector<bool> have_parity;
+    };
+    FecSendGroup m_fec_send_group;
+    std::uint16_t m_next_fec_group_id = 0;
+    std::deque<std::vector<std::uint8_t>> m_fec_outbox;
+    std::map<std::uint32_t, FecRecvGroup> m_fec_rx_groups;  ///< key = base_seq。
+    std::map<std::uint32_t, std::vector<std::uint8_t>> m_fec_rx_payloads;
+    std::map<std::uint32_t, std::vector<std::uint8_t>> m_fec_history;
 };
 
 /// @brief 不可靠通道（DATAGRAM）：乱序容忍窗口 + 严格单调交付。
