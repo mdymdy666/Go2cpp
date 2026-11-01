@@ -199,7 +199,9 @@ UdpSocket::~UdpSocket() {
 
 UdpSocket::UdpSocket(UdpSocket&& other) noexcept
     : m_fd(other.m_fd), m_local_port(other.m_local_port), m_family(other.m_family) {
+    m_fd_cache.store(other.m_fd, std::memory_order_relaxed);
     other.m_fd = -1;
+    other.m_fd_cache.store(-1, std::memory_order_relaxed);
     other.m_local_port = 0;
     other.m_family = AF_UNSPEC;
 }
@@ -208,9 +210,11 @@ UdpSocket& UdpSocket::operator=(UdpSocket&& other) noexcept {
     if (this != &other) {
         Close();
         m_fd = other.m_fd;
+        m_fd_cache.store(other.m_fd, std::memory_order_relaxed);
         m_local_port = other.m_local_port;
         m_family = other.m_family;
         other.m_fd = -1;
+        other.m_fd_cache.store(-1, std::memory_order_relaxed);
         other.m_local_port = 0;
         other.m_family = AF_UNSPEC;
     }
@@ -266,6 +270,8 @@ bool UdpSocket::ResolveIPv4(const std::string& address, std::uint16_t port, sock
 }
 
 bool UdpSocket::Open(const std::string& bind_address, std::uint16_t port, std::string* error) {
+    // Open 与 Close/迁移互斥；发送/接收持共享锁，不会被 Open 阻塞。
+    std::unique_lock<std::shared_mutex> lifecycle(m_lifecycle);
     if (m_fd >= 0) {
         if (error != nullptr) {
             *error = "socket already open";
@@ -326,6 +332,8 @@ bool UdpSocket::Open(const std::string& bind_address, std::uint16_t port, std::s
             continue;
         }
         m_fd = fd;
+        // 先发布无锁快照，再把对象交给调用方；接收/发送线程读它决定 fd。
+        m_fd_cache.store(fd, std::memory_order_release);
         m_family = entry->ai_family;
         if (local.ss_family == AF_INET) {
             sockaddr_in local_v4{};
@@ -347,14 +355,18 @@ bool UdpSocket::Open(const std::string& bind_address, std::uint16_t port, std::s
 }
 
 void UdpSocket::Close() noexcept {
+    // 独占锁：等在途的 poll/recv/sendto 退出后再关 fd，避免 fd 被复用。
+    std::unique_lock<std::shared_mutex> lifecycle(m_lifecycle);
     if (m_fd >= 0) {
         ::close(m_fd);
         m_fd = -1;
     }
+    m_fd_cache.store(-1, std::memory_order_release);
     m_local_port = 0;
 }
 
 void UdpSocket::ConfigurePathMtu(bool enable) noexcept {
+    std::shared_lock<std::shared_mutex> lifecycle(m_lifecycle);
     if (m_fd < 0) {
         return;
     }
@@ -372,6 +384,7 @@ void UdpSocket::ConfigurePathMtu(bool enable) noexcept {
 }
 
 int UdpSocket::ReceiveMtuError(std::uint32_t* reported_mtu) noexcept {
+    std::shared_lock<std::shared_mutex> lifecycle(m_lifecycle);
     if (m_fd < 0 || reported_mtu == nullptr) {
         return -1;
     }
@@ -427,12 +440,15 @@ int UdpSocket::ReceiveMtuError(std::uint32_t* reported_mtu) noexcept {
 
 bool UdpSocket::SendTo(const sockaddr_storage& peer, socklen_t peer_len,
                        const std::uint8_t* data, std::size_t bytes) noexcept {
-    if (m_fd < 0 || data == nullptr || peer_len == 0 ||
+    // 共享锁：与接收线程的 poll/recv 并发（不互斥），只与 Close/Open 互斥。
+    std::shared_lock<std::shared_mutex> lifecycle(m_lifecycle);
+    const int fd = m_fd;
+    if (fd < 0 || data == nullptr || peer_len == 0 ||
         (peer.ss_family != AF_INET && peer.ss_family != AF_INET6)) {
         return false;
     }
     for (;;) {
-        const ssize_t sent = ::sendto(m_fd, data, bytes, 0,
+        const ssize_t sent = ::sendto(fd, data, bytes, 0,
                                       reinterpret_cast<const sockaddr*>(&peer), peer_len);
         if (sent == static_cast<ssize_t>(bytes)) {
             return true;
@@ -452,11 +468,15 @@ bool UdpSocket::SendTo(const sockaddr_in& peer, const std::uint8_t* data,
 }
 
 int UdpSocket::WaitReadable(int timeout_ms) noexcept {
-    if (m_fd < 0) {
+    // 共享锁覆盖整个 poll：发送同样持共享锁，因此「接收线程阻塞在 poll」
+    // 不再阻塞任何 sendto（这正是基线里发送被接收循环卡住的根因之一）。
+    std::shared_lock<std::shared_mutex> lifecycle(m_lifecycle);
+    const int fd = m_fd;
+    if (fd < 0) {
         return -1;
     }
     pollfd descriptor{};
-    descriptor.fd = m_fd;
+    descriptor.fd = fd;
     descriptor.events = POLLIN;
     for (;;) {
         const int result = ::poll(&descriptor, 1, timeout_ms);
@@ -475,13 +495,15 @@ int UdpSocket::WaitReadable(int timeout_ms) noexcept {
 
 int UdpSocket::RecvFrom(std::uint8_t* buffer, std::size_t capacity, sockaddr_storage* from,
                         socklen_t* from_len) noexcept {
-    if (m_fd < 0 || buffer == nullptr) {
+    std::shared_lock<std::shared_mutex> lifecycle(m_lifecycle);
+    const int fd = m_fd;
+    if (fd < 0 || buffer == nullptr) {
         return -1;
     }
     for (;;) {
         sockaddr_storage peer{};
         socklen_t peer_length = sizeof(peer);
-        const ssize_t received = ::recvfrom(m_fd, buffer, capacity, 0,
+        const ssize_t received = ::recvfrom(fd, buffer, capacity, 0,
                                             reinterpret_cast<sockaddr*>(&peer), &peer_length);
         if (received >= 0) {
             if (from != nullptr) {
@@ -555,9 +577,7 @@ Link::Link(LinkConfig config) : m_config(std::move(config)), m_rx_buffer(65536) 
     m_video = std::make_unique<VideoChannel>(
         [this](const std::uint8_t* data, std::size_t bytes) { return SendBuiltFrame(data, bytes); },
         [this](std::uint32_t frame_id, bool key, const std::uint8_t* data, std::size_t bytes) {
-            if (on_video) {
-                on_video(kChannelVideo, frame_id, key, data, bytes);
-            }
+            PushVideoEvent(frame_id, key, data, bytes);
         },
         VideoChannel::Config{m_config.video_fec_group_size});
 }
@@ -567,7 +587,7 @@ Link::~Link() {
 }
 
 bool Link::Open(std::string* error) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_security_error = SecurityError::kOk;
     // 默认安全策略在打开 socket 之前校验：fail fast，不留下半初始化的监听端。
     if (m_config.require_encryption && !m_secure_enabled &&
@@ -633,7 +653,8 @@ bool Link::Open(std::string* error) {
     ResetPmtud(now);
     m_socket.ConfigurePathMtu(m_config.enable_pmtud);
     if (!m_config.pre_shared_key.empty()) {
-        if (!SetPreSharedKey(m_config.pre_shared_key.data(), m_config.pre_shared_key.size())) {
+        if (!SetPreSharedKeyLocked(m_config.pre_shared_key.data(),
+                                    m_config.pre_shared_key.size())) {
             m_socket.Close();
             m_security_error = SecurityError::kInvalidPsk;
             if (error != nullptr) {
@@ -647,55 +668,58 @@ bool Link::Open(std::string* error) {
 }
 
 bool Link::Connect() {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    m_security_error = SecurityError::kOk;
-    if (m_config.require_encryption && !m_secure_enabled) {
-        // 纵深防御：即使 Open 后被绕过（例如未来放宽 Open 校验），
-        // Connect 也不会把明文 HELLO 发到网上。
-        m_security_error = SecurityError::kEncryptionRequired;
-        return false;
-    }
-    if (!m_socket.IsOpen() || m_state != LinkState::kIdle || !m_peer_configured) {
-        return false;
-    }
-    const std::uint64_t now = NowMs();
-    m_state = LinkState::kConnecting;
-    m_handshake_start_ms = now;
-    m_next_hello_ms = now;
-    m_hello_attempts = 0;
-    m_hello_pto_ms = m_config.hello_initial_pto_ms;
-    if (m_session_id == 0) {
-        m_session_id =
-            m_config.random_seed != 0
-                ? m_config.random_seed
-                : static_cast<std::uint32_t>(now ^ (static_cast<std::uint64_t>(::getpid()) << 16));
-    }
-    // conn_id 由客户端提议、监听方在 HELLO_ACK 中确认；后续所有帧按它路由。
-    if (m_conn_id == 0) {
-        m_conn_id = RandomNonZeroU32();
-    }
-    m_resumed = false;
-    m_resume_epoch = false;
-    m_have_retired_peer = false;
-    if (m_secure_enabled) {
-        // 每次连接使用新的 client nonce，避免会话密钥复用；旧 nonce 会被
-        // 监听方记入重放缓存，重连不会被误判为重放。
-        ResetSecureSession();
-        SecureRandomBytes(m_client_nonce, kHandshakeNonceBytes);
-        m_handshake_tx_seq = RandomNonZeroU32();
-        m_tx_direction = SecureDirection::kClientToServer;
-        m_rx_direction = SecureDirection::kServerToClient;
-        if (m_config.enable_x25519) {
-            // HELLO 前生成临时密钥对；私钥保留到 HELLO_ACK 到达后立即清零。
-            // 生成失败时公钥保持全零，对端会按纯 PSK 回退（不会静默错误）。
-            (void)GenerateX25519KeyPair();
-        } else {
-            // 显式纯 PSK：不发公钥，HELLO 退回旧长度。
-            ClearX25519Ephemeral();
-            std::memset(m_x25519_public, 0, sizeof(m_x25519_public));
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_security_error = SecurityError::kOk;
+        if (m_config.require_encryption && !m_secure_enabled) {
+            // 纵深防御：即使 Open 后被绕过（例如未来放宽 Open 校验），
+            // Connect 也不会把明文 HELLO 发到网上。
+            m_security_error = SecurityError::kEncryptionRequired;
+            return false;
         }
+        if (!m_socket.IsOpen() || m_state != LinkState::kIdle || !m_peer_configured) {
+            return false;
+        }
+        const std::uint64_t now = NowMs();
+        m_state = LinkState::kConnecting;
+        m_handshake_start_ms = now;
+        m_next_hello_ms = now;
+        m_hello_attempts = 0;
+        m_hello_pto_ms = m_config.hello_initial_pto_ms;
+        if (m_session_id == 0) {
+            m_session_id = m_config.random_seed != 0
+                               ? m_config.random_seed
+                               : static_cast<std::uint32_t>(
+                                     now ^ (static_cast<std::uint64_t>(::getpid()) << 16));
+        }
+        // conn_id 由客户端提议、监听方在 HELLO_ACK 中确认；后续所有帧按它路由。
+        if (m_conn_id == 0) {
+            m_conn_id = RandomNonZeroU32();
+        }
+        m_resumed = false;
+        m_resume_epoch = false;
+        m_have_retired_peer = false;
+        if (m_secure_enabled) {
+            // 每次连接使用新的 client nonce，避免会话密钥复用；旧 nonce 会被
+            // 监听方记入重放缓存，重连不会被误判为重放。
+            ResetSecureSession();
+            SecureRandomBytes(m_client_nonce, kHandshakeNonceBytes);
+            m_handshake_tx_seq = RandomNonZeroU32();
+            m_tx_direction = SecureDirection::kClientToServer;
+            m_rx_direction = SecureDirection::kServerToClient;
+            if (m_config.enable_x25519) {
+                // HELLO 前生成临时密钥对；私钥保留到 HELLO_ACK 到达后立即清零。
+                // 生成失败时公钥保持全零，对端会按纯 PSK 回退（不会静默错误）。
+                (void)GenerateX25519KeyPair();
+            } else {
+                // 显式纯 PSK：不发公钥，HELLO 退回旧长度。
+                ClearX25519Ephemeral();
+                std::memset(m_x25519_public, 0, sizeof(m_x25519_public));
+            }
+        }
+        SendHello();  // 只入队，出锁后统一发送。
     }
-    SendHello();
+    (void)DrainTx();
     return true;
 }
 
@@ -704,53 +728,187 @@ bool Link::insecure_plaintext() const noexcept {
 }
 
 void Link::Close() {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    // 关闭前把服务端会话快照写入缓存，供对端下一次 0-RTT 恢复使用。
-    CacheServerSession();
-    m_state = LinkState::kClosed;
-    m_socket.Close();
-    if (m_secure_enabled) {
-        ResetSecureSession();
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // 关闭前把服务端会话快照写入缓存，供对端下一次 0-RTT 恢复使用。
+        CacheServerSession();
+        m_state = LinkState::kClosed;
+        m_socket.Close();
+        if (m_secure_enabled) {
+            ResetSecureSession();
+        }
     }
+    // 丢弃队列里还没发出的帧，并唤醒等待这些帧的发送线程（返回失败）。
+    // 锁顺序与 SendBuiltFrame 一致（m_mutex → m_tx_mutex），不会与 drainer 交叉。
+    {
+        std::lock_guard<std::mutex> tx_lock(m_tx_mutex);
+        m_tx_queue.clear();
+        m_tx_drained = m_tx_enqueued;
+        m_tx_last_ok = false;
+        m_tx_pending.store(false, std::memory_order_release);
+    }
+    m_tx_cv.notify_all();
 }
 
 int Link::RunOnce(int timeout_ms) {
-    // 接收循环单线程：持锁覆盖 poll+分发+Tick，避免与并发 Send 竞争。
-    // 发送线程最多被阻塞一个 timeout_ms；测试通常传 1ms，生产可传 0。
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    // 阶段 1（锁外）：poll。socket 层用共享锁保护 fd 生命周期，发送路径也
+    // 持共享锁，因此「接收线程阻塞在 poll」不再阻塞任何 Send*（基线里发送
+    // 线程会被整段 poll 挡住，p99 达到 timeout 的量级）。
     if (!m_socket.IsOpen()) {
+        DispatchEvents();
         return 0;
     }
-    PollPathMtuErrors();
+    int wait_ms = timeout_ms;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_socket.IsOpen()) {
+            return 0;
+        }
+        PollPathMtuErrors();
+        // 关键：poll 超时钳制到最近定时器。旧实现直接 poll(timeout_ms)，
+        // 应用传 RunOnce(50) 时 ACK tick（ack_interval）/PTO/TLP/心跳全被
+        // 推迟最多 50ms——单线程事件循环里可靠层的时间精度等于调用方
+        // 的 timeout，而不是协议的定时器。定时器已到期时返回 0（先干活）。
+        wait_ms = ClampPollTimeout(timeout_ms, NowMs());
+    }
+    const int ready = m_socket.WaitReadable(wait_ms);
     int processed = 0;
-    const int ready = m_socket.WaitReadable(timeout_ms);
+    bool rx_drained = false;
     if (ready > 0) {
         while (processed < kMaxFramesPerRun) {
-            sockaddr_storage from{};
-            socklen_t from_len = sizeof(from);
-            const int received =
-                m_socket.RecvFrom(m_rx_buffer.data(), m_rx_buffer.size(), &from, &from_len);
-            if (received == 0) {
-                break;
+            bool stop = false;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                sockaddr_storage from{};
+                socklen_t from_len = sizeof(from);
+                const int received = m_socket.RecvFrom(m_rx_buffer.data(), m_rx_buffer.size(),
+                                                       &from, &from_len);
+                if (received <= 0) {
+                    if (received < 0) {
+                        ++m_stats.recv_errors;
+                    } else {
+                        // EAGAIN：内核接收队列已抽干（不是「本轮帧数到上限」），
+                        // 接收方马上要回到 poll 睡眠——必须立刻把 ACK 发出去，
+                        // 否则对端要多等一个 ack_interval 才拿到确认。
+                        rx_drained = true;
+                    }
+                    break;
+                }
+                ++m_stats.frames_received;
+                m_stats.bytes_received += static_cast<std::uint64_t>(received);
+                HandleFrame(m_rx_buffer.data(), static_cast<std::size_t>(received), from, from_len);
+                ++processed;
+                stop = (m_state == LinkState::kTimedOut || m_state == LinkState::kClosed);
             }
-            if (received < 0) {
-                ++m_stats.recv_errors;
-                break;
+            // 锁外：派发本帧产生的回调 / 发出本帧入队的帧。锁只覆盖「一帧」，
+            // 发送线程最多等一帧的处理时间，而不是整批 256 帧或一个 poll 周期。
+            if (m_events_pending.load(std::memory_order_acquire)) {
+                DispatchEvents();
             }
-            ++m_stats.frames_received;
-            m_stats.bytes_received += static_cast<std::uint64_t>(received);
-            HandleFrame(m_rx_buffer.data(), static_cast<std::size_t>(received), from, from_len);
-            ++processed;
-            if (m_state == LinkState::kTimedOut || m_state == LinkState::kClosed) {
+            if (m_tx_pending.load(std::memory_order_acquire)) {
+                DrainTx();
+            }
+            if (stop) {
                 break;
             }
         }
     } else if (ready < 0) {
+        std::lock_guard<std::mutex> lock(m_mutex);
         ++m_stats.poll_errors;
     }
-    PollPathMtuErrors();
-    Tick(NowMs());
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        PollPathMtuErrors();
+        if (processed > 0) {
+            // quickack：本批数据已确认收到、接收队列也抽干了，立刻回 ACK。
+            // 队列没抽干时按「每 2 帧 / 出现乱序」阈值合并，避免 ACK 风暴。
+            FlushImmediateAcks(NowMs(), rx_drained);
+        }
+        Tick(NowMs());
+    }
+    if (m_events_pending.load(std::memory_order_acquire)) {
+        DispatchEvents();
+    }
+    if (m_tx_pending.load(std::memory_order_acquire)) {
+        DrainTx();
+    }
     return processed;
+}
+
+std::uint64_t Link::NextTimerDeadlineMs(std::uint64_t now_ms) const {
+    std::uint64_t next = 0;
+    auto consider = [&next](std::uint64_t deadline) {
+        if (deadline == 0) {
+            return;
+        }
+        if (next == 0 || deadline < next) {
+            next = deadline;
+        }
+    };
+    if (m_state == LinkState::kConnecting) {
+        consider(m_next_hello_ms);  // 握手重传必须准时。
+    }
+    if (m_state != LinkState::kConnected) {
+        return next;
+    }
+    bool pending_ack = false;
+    for (const auto& entry : m_reliable) {
+        if (entry.second->HasPendingAck()) {
+            pending_ack = true;
+        }
+        consider(entry.second->NextTimerDeadlineMs());
+    }
+    for (const auto& entry : m_unreliable) {
+        consider(entry.second->NextTimerDeadlineMs());
+    }
+    if (m_video != nullptr) {
+        consider(m_video->NextTimerDeadlineMs());
+    }
+    if (pending_ack) {
+        consider(m_next_ack_tick_ms);
+    }
+    consider(m_next_heartbeat_ms);
+    (void)now_ms;
+    return next;
+}
+
+int Link::ClampPollTimeout(int timeout_ms, std::uint64_t now_ms) const {
+    if (timeout_ms <= 0) {
+        return timeout_ms;  // 0/负数 = 非阻塞或调用方特殊语义，保持原样。
+    }
+    const std::uint64_t deadline = NextTimerDeadlineMs(now_ms);
+    if (deadline == 0) {
+        return timeout_ms;
+    }
+    if (deadline <= now_ms) {
+        return 0;  // 定时器已到期：先跑 Tick，别睡。
+    }
+    const std::uint64_t wait_ms = deadline - now_ms;
+    return static_cast<int>(
+        std::min<std::uint64_t>(static_cast<std::uint64_t>(timeout_ms), wait_ms));
+}
+
+void Link::FlushImmediateAcks(std::uint64_t now_ms, bool rx_drained) {
+    if (m_state != LinkState::kConnected) {
+        return;
+    }
+    bool sent = false;
+    for (auto& entry : m_reliable) {
+        ReliableChannel& channel = *entry.second;
+        if (!channel.HasUnackedInput()) {
+            continue;  // 没有新数据帧：SACK 周期性重报交给 Tick。
+        }
+        if (!rx_drained && !channel.WantsImmediateAck()) {
+            continue;  // 还有积压：按 2 帧/乱序阈值合并，避免 ACK 风暴。
+        }
+        if (SendAckFrame(entry.first, false)) {
+            sent = true;
+        }
+    }
+    if (sent) {
+        // 刚确认过：把周期 ACK 往后推一个间隔，避免同一批数据连发两帧 ACK。
+        m_next_ack_tick_ms = now_ms + m_config.ack_interval_ms;
+    }
 }
 
 int Link::RunFor(int duration_ms) {
@@ -838,9 +996,7 @@ void Link::HandleHello(const FrameView& view, const sockaddr_storage& from,
         m_state = LinkState::kConnected;
         ++m_stats.handshakes;
         ResetPmtud(m_last_rx_ms);
-        if (on_connected) {
-            on_connected();
-        }
+        PushConnectedEvent();
     }
 }
 
@@ -866,9 +1022,7 @@ void Link::HandleHelloAck(const FrameView& view, const sockaddr_storage& from) {
         m_state = LinkState::kConnected;
         ++m_stats.handshakes;
         ResetPmtud(m_last_rx_ms);
-        if (on_connected) {
-            on_connected();
-        }
+        PushConnectedEvent();
     }
 }
 
@@ -1043,6 +1197,16 @@ void Link::DispatchFrame(const FrameView& view) {
         case FrameType::kVideo:
             m_video->OnFrame(view.header, view.payload, view.payload_bytes);
             break;
+        case FrameType::kFec: {
+            auto it = m_reliable.find(view.header.channel);
+            if (it == m_reliable.end()) {
+                // 校验帧先于数据帧到达或通道已关闭：合法但无意义。
+                ++m_stats.unknown_peer_frames;
+                break;
+            }
+            it->second->OnFecFrame(view.header, view.payload, view.payload_bytes);
+            break;
+        }
         case FrameType::kAck:
             HandleAckFrame(view);
             break;
@@ -1139,9 +1303,7 @@ ReliableChannel* Link::GetOrCreateReliable(std::uint8_t channel) {
     auto created = std::make_unique<ReliableChannel>(
         channel, &m_relation,
         [this, channel](std::uint32_t /*seq*/, const std::uint8_t* data, std::size_t bytes) {
-            if (on_stream) {
-                on_stream(channel, data, bytes);
-            }
+            PushStreamEvent(channel, data, bytes);
         },
         m_config.reliable);
     created->SetFrameSink([this](const std::uint8_t* data, std::size_t bytes) {
@@ -1163,9 +1325,7 @@ UnreliableChannel* Link::GetOrCreateUnreliable(std::uint8_t channel) {
     auto created = std::make_unique<UnreliableChannel>(
         channel, &m_relation,
         [this, channel](std::uint32_t /*seq*/, const std::uint8_t* data, std::size_t bytes) {
-            if (on_datagram) {
-                on_datagram(channel, data, bytes);
-            }
+            PushDatagramEvent(channel, data, bytes);
         });
     created->SetFrameSink([this](const std::uint8_t* data, std::size_t bytes) {
         return SendBuiltFrame(data, bytes);
@@ -1176,6 +1336,10 @@ UnreliableChannel* Link::GetOrCreateUnreliable(std::uint8_t channel) {
 }
 
 bool Link::SendBuiltFrame(const std::uint8_t* data, std::size_t bytes) {
+    return EnqueueTxFrame(data, bytes);
+}
+
+bool Link::EnqueueTxFrame(const std::uint8_t* data, std::size_t bytes) {
     if (!m_socket.IsOpen()) {
         return false;
     }
@@ -1183,9 +1347,14 @@ bool Link::SendBuiltFrame(const std::uint8_t* data, std::size_t bytes) {
         ++m_stats.send_errors;
         return false;
     }
+    if (bytes > m_rx_buffer.size()) {
+        ++m_stats.send_errors;
+        return false;
+    }
     // 统一在这里写入 conn_id / kFlagResume：所有通道只负责自己的载荷，
-    // 不需要知道链路层连接标识。帧很小（<=1.5KB），复制成本可忽略。
-    std::vector<std::uint8_t> stamped;
+    // 不需要知道链路层连接标识。复用成员 scratch，避免每帧一次堆分配。
+    const std::uint8_t* frame = data;
+    std::size_t frame_bytes = bytes;
     if ((m_conn_id != 0 || m_resume_epoch || m_send_resume_ack) && bytes >= kFrameHeaderBytes) {
         FrameHeader header;
         if (DecodeHeader(data, bytes, &header)) {
@@ -1203,17 +1372,232 @@ bool Link::SendBuiltFrame(const std::uint8_t* data, std::size_t bytes) {
                 changed = true;
             }
             if (changed) {
-                stamped.assign(data, data + bytes);
-                EncodeHeader(header, stamped.data());
-                data = stamped.data();
-                bytes = stamped.size();
+                m_tx_stamp_scratch.assign(data, data + bytes);
+                EncodeHeader(header, m_tx_stamp_scratch.data());
+                frame = m_tx_stamp_scratch.data();
+                frame_bytes = m_tx_stamp_scratch.size();
             }
         }
     }
+    // 入队而不是直接发送：真正的 seal/sendto 由 DrainTx() 在锁外完成。
+    TxPacket packet;
+    packet.frame.assign(frame, frame + frame_bytes);
+    {
+        std::lock_guard<std::mutex> tx_lock(m_tx_mutex);
+        if (m_tx_queue.size() >= kMaxTxQueue) {
+            ++m_stats.send_errors;  // 接收线程长期不 drain：按 UDP 语义丢弃。
+            return false;
+        }
+        ++m_tx_enqueued;
+        m_tx_queue.push_back(std::move(packet));
+    }
+    m_tx_pending.store(true, std::memory_order_release);
+    return true;
+}
+
+bool Link::SendPacketLocked(const std::uint8_t* data, std::size_t bytes) {
+    // 调用方必须持有 m_mutex：seal 需要 tx key / wire seq，sendto 需要 peer。
     if (m_secure_enabled) {
         return SealAndSend(data, bytes);
     }
     return SendRawPacket(data, bytes);
+}
+
+bool Link::DrainTx() {
+    // 循环直到队列为空：等待者醒来后重新检查，而不是「等自己的序号被处理」。
+    // 这样即使自己的帧是在 drainer 取批之后才入队的，也会由自己接手发出，
+    // 不会出现「等一个永远不会发生的 drained 序号」。
+    for (;;) {
+        std::vector<TxPacket> batch;
+        std::uint64_t upto = 0;
+        {
+            std::unique_lock<std::mutex> tx_lock(m_tx_mutex);
+            if (m_tx_queue.empty()) {
+                if (m_tx_draining) {
+                    // 已有线程在发：等它收尾后重查（它可能刚取走了我们的帧）。
+                    m_tx_cv.wait(tx_lock, [this] { return !m_tx_draining; });
+                    continue;
+                }
+                m_tx_pending.store(false, std::memory_order_release);
+                return true;
+            }
+            if (m_tx_draining) {
+                // N 个发送线程不会各自抢锁做 seal+sendto（那会退化成串行）；
+                // 只保留一个 drainer，其他人等这一批结束再看队列。
+                m_tx_cv.wait(tx_lock, [this] { return !m_tx_draining; });
+                continue;
+            }
+            m_tx_draining = true;
+            upto = m_tx_enqueued;
+            batch.reserve(m_tx_queue.size());
+            while (!m_tx_queue.empty()) {
+                batch.push_back(std::move(m_tx_queue.front()));
+                m_tx_queue.pop_front();
+            }
+            m_tx_pending.store(false, std::memory_order_release);
+        }
+        bool ok = true;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (const TxPacket& packet : batch) {
+                if (!SendPacketLocked(packet.frame.data(), packet.frame.size())) {
+                    ok = false;
+                }
+            }
+        }
+        bool more = false;
+        {
+            std::lock_guard<std::mutex> tx_lock(m_tx_mutex);
+            m_tx_draining = false;
+            if (upto > m_tx_drained) {
+                m_tx_drained = upto;
+            }
+            m_tx_last_ok = ok;
+            more = !m_tx_queue.empty();
+            if (more) {
+                m_tx_pending.store(true, std::memory_order_release);
+            }
+        }
+        m_tx_cv.notify_all();
+        if (!more) {
+            return ok;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 回调事件：锁内入队、锁外派发
+// ---------------------------------------------------------------------------
+//
+// 基线的 recursive_mutex 之所以存在，是因为回调在持锁期间同步触发、而回调
+// 里允许再次 Send*。改成事件后：
+//   * 锁内只做一次「拷贝载荷 + push_back」，回调耗时不进入临界区；
+//   * 派发时不再持有任何链路锁，回调里 Send*/Close 都不会重入；
+//   * 无回调（例如压测只计数）时零开销：连事件都不入队。
+
+void Link::PushConnectedEvent() {
+    if (!on_connected) {
+        return;
+    }
+    LinkEvent event;
+    event.kind = LinkEvent::Kind::kConnected;
+    m_events.push_back(std::move(event));
+    m_events_pending.store(true, std::memory_order_release);
+}
+
+void Link::PushDisconnectedEvent(const char* reason) {
+    if (!on_disconnected) {
+        return;
+    }
+    LinkEvent event;
+    event.kind = LinkEvent::Kind::kDisconnected;
+    event.reason = reason;  // Fail() 的 reason 都是字符串字面量，生命周期静态。
+    m_events.push_back(std::move(event));
+    m_events_pending.store(true, std::memory_order_release);
+}
+
+void Link::PushStreamEvent(std::uint8_t channel, const std::uint8_t* data, std::size_t bytes) {
+    if (!on_stream) {
+        return;
+    }
+    LinkEvent event;
+    event.kind = LinkEvent::Kind::kStream;
+    event.channel = channel;
+    if (data != nullptr && bytes > 0) {
+        event.data.assign(data, data + bytes);
+    }
+    m_events.push_back(std::move(event));
+    m_events_pending.store(true, std::memory_order_release);
+}
+
+void Link::PushDatagramEvent(std::uint8_t channel, const std::uint8_t* data, std::size_t bytes) {
+    if (!on_datagram) {
+        return;
+    }
+    LinkEvent event;
+    event.kind = LinkEvent::Kind::kDatagram;
+    event.channel = channel;
+    if (data != nullptr && bytes > 0) {
+        event.data.assign(data, data + bytes);
+    }
+    m_events.push_back(std::move(event));
+    m_events_pending.store(true, std::memory_order_release);
+}
+
+void Link::PushVideoEvent(std::uint32_t frame_id, bool key, const std::uint8_t* data,
+                          std::size_t bytes) {
+    if (!on_video) {
+        return;
+    }
+    LinkEvent event;
+    event.kind = LinkEvent::Kind::kVideo;
+    event.channel = kChannelVideo;
+    event.frame_id = frame_id;
+    event.key = key;
+    if (data != nullptr && bytes > 0) {
+        event.data.assign(data, data + bytes);
+    }
+    m_events.push_back(std::move(event));
+    m_events_pending.store(true, std::memory_order_release);
+}
+
+void Link::PushBandwidthEvent(std::uint64_t bitrate_bps) {
+    if (!on_bandwidth) {
+        return;
+    }
+    LinkEvent event;
+    event.kind = LinkEvent::Kind::kBandwidth;
+    event.bandwidth = bitrate_bps;
+    m_events.push_back(std::move(event));
+    m_events_pending.store(true, std::memory_order_release);
+}
+
+void Link::DispatchEvents() {
+    std::vector<LinkEvent> events;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_events.empty()) {
+            m_events_pending.store(false, std::memory_order_release);
+            return;
+        }
+        events.swap(m_events);
+        m_events_pending.store(false, std::memory_order_release);
+    }
+    for (const LinkEvent& event : events) {
+        switch (event.kind) {
+            case LinkEvent::Kind::kConnected:
+                if (on_connected) {
+                    on_connected();
+                }
+                break;
+            case LinkEvent::Kind::kDisconnected:
+                if (on_disconnected) {
+                    on_disconnected(event.reason);
+                }
+                break;
+            case LinkEvent::Kind::kStream:
+                if (on_stream) {
+                    on_stream(event.channel, event.data.data(), event.data.size());
+                }
+                break;
+            case LinkEvent::Kind::kDatagram:
+                if (on_datagram) {
+                    on_datagram(event.channel, event.data.data(), event.data.size());
+                }
+                break;
+            case LinkEvent::Kind::kVideo:
+                if (on_video) {
+                    on_video(kChannelVideo, event.frame_id, event.key, event.data.data(),
+                             event.data.size());
+                }
+                break;
+            case LinkEvent::Kind::kBandwidth:
+                if (on_bandwidth) {
+                    on_bandwidth(event.bandwidth);
+                }
+                break;
+        }
+    }
 }
 
 bool Link::SendRawPacket(const std::uint8_t* data, std::size_t bytes) {
@@ -1226,8 +1610,9 @@ bool Link::SendRawPacket(const std::uint8_t* data, std::size_t bytes) {
         if (m_config.enable_pmtud && errno == EMSGSIZE) {
             // DF 生效时内核会直接拒绝超路径 MTU 的包；按 UDP 载荷回退一档。
             const std::uint32_t overhead = m_peer.ss_family == AF_INET6 ? 48U : 28U;
-            NotifyPathMtuError(bytes > overhead ? static_cast<std::uint32_t>(bytes) - overhead
-                                               : kMinPathMtu);
+            NotifyPathMtuErrorLocked(bytes > overhead
+                                         ? static_cast<std::uint32_t>(bytes) - overhead
+                                         : kMinPathMtu);
         }
         return false;
     }
@@ -1431,9 +1816,7 @@ void Link::Fail(const char* reason) {
     m_state = LinkState::kTimedOut;
     ++m_stats.timeouts;
     m_socket.Close();
-    if (on_disconnected) {
-        on_disconnected(reason);
-    }
+    PushDisconnectedEvent(reason);
 }
 
 // ---------------------------------------------------------------------------
@@ -1441,12 +1824,12 @@ void Link::Fail(const char* reason) {
 // ---------------------------------------------------------------------------
 
 std::uint32_t Link::conn_id() const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     return m_conn_id;
 }
 
 bool Link::sack_ext_enabled() const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     return m_sack_ext;
 }
 
@@ -1492,9 +1875,7 @@ void Link::ResetApplicationChannels() {
     m_video = std::make_unique<VideoChannel>(
         [this](const std::uint8_t* data, std::size_t bytes) { return SendBuiltFrame(data, bytes); },
         [this](std::uint32_t frame_id, bool key, const std::uint8_t* data, std::size_t bytes) {
-            if (on_video) {
-                on_video(kChannelVideo, frame_id, key, data, bytes);
-            }
+            PushVideoEvent(frame_id, key, data, bytes);
         },
         VideoChannel::Config{m_config.video_fec_group_size});
 }
@@ -1514,12 +1895,17 @@ void Link::NoteResumeEpoch(std::uint8_t flags) {
 }
 
 std::uint32_t Link::PathMtu() const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     return m_path_mtu;
 }
 
 void Link::NotifyPathMtuError(std::uint32_t reported_mtu) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    NotifyPathMtuErrorLocked(reported_mtu);
+}
+
+void Link::NotifyPathMtuErrorLocked(std::uint32_t reported_mtu) {
+    // 调用方已持有 m_mutex（SendRawPacket / PollPathMtuErrors 都在锁内）。
     if (reported_mtu == 0) {
         return;
     }
@@ -1546,7 +1932,7 @@ void Link::PollPathMtuErrors() {
         if (result <= 0) {
             break;
         }
-        NotifyPathMtuError(reported);
+        NotifyPathMtuErrorLocked(reported);
     }
 }
 
@@ -1665,7 +2051,7 @@ void Link::HandlePmtudAck(const FrameView& view) {
 }
 
 bool Link::Migrate(const std::string& new_address, std::uint16_t new_port, std::string* error) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_socket.IsOpen()) {
         if (error != nullptr) {
             *error = "socket not open";
@@ -1692,7 +2078,7 @@ bool Link::Migrate(const std::string& new_address, std::uint16_t new_port, std::
 }
 
 std::vector<std::uint8_t> Link::ExportSessionTicket() {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     // 0-RTT 票据按静态 PSK 重派生会话密钥；X25519 会话的密钥混入了
     // 临时共享密钥，无法从票据安全恢复，因此直接拒绝导出（不静默降级）。
     if (!m_secure_enabled || !m_session_keys_ready || m_conn_id == 0 || m_session_id == 0 ||
@@ -1730,66 +2116,69 @@ std::vector<std::uint8_t> Link::ExportSessionTicket() {
 }
 
 bool Link::Resume(const std::vector<std::uint8_t>& ticket_bytes) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (!m_secure_enabled) {
-        ++m_secure_stats.tickets_rejected;
-        return false;
-    }
-    SessionTicket ticket;
-    if (!DecodeSessionTicket(ticket_bytes.data(), ticket_bytes.size(), m_psk, &ticket)) {
-        ++m_secure_stats.tickets_rejected;
-        return false;
-    }
-    const std::uint64_t now = NowMs();
-    if (ticket.expires_ms <= now) {
-        ++m_secure_stats.tickets_rejected;
-        return false;
-    }
-    if (!m_socket.IsOpen() || (!m_is_listener && !m_peer_configured)) {
-        ++m_secure_stats.tickets_rejected;
-        return false;
-    }
-    if (m_state == LinkState::kConnected || m_state == LinkState::kConnecting) {
-        ++m_secure_stats.tickets_rejected;
-        return false;
-    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_secure_enabled) {
+            ++m_secure_stats.tickets_rejected;
+            return false;
+        }
+        SessionTicket ticket;
+        if (!DecodeSessionTicket(ticket_bytes.data(), ticket_bytes.size(), m_psk, &ticket)) {
+            ++m_secure_stats.tickets_rejected;
+            return false;
+        }
+        const std::uint64_t now = NowMs();
+        if (ticket.expires_ms <= now) {
+            ++m_secure_stats.tickets_rejected;
+            return false;
+        }
+        if (!m_socket.IsOpen() || (!m_is_listener && !m_peer_configured)) {
+            ++m_secure_stats.tickets_rejected;
+            return false;
+        }
+        if (m_state == LinkState::kConnected || m_state == LinkState::kConnecting) {
+            ++m_secure_stats.tickets_rejected;
+            return false;
+        }
 
-    m_conn_id = ticket.conn_id;
-    m_session_id = ticket.session_id;
-    std::memcpy(m_client_nonce, ticket.client_nonce, kHandshakeNonceBytes);
-    std::memcpy(m_server_nonce, ticket.server_nonce, kHandshakeNonceBytes);
-    if (m_is_listener) {
-        m_tx_direction = SecureDirection::kServerToClient;
-        m_rx_direction = SecureDirection::kClientToServer;
-        m_tx_wire_seq = ticket.server_next_wire_seq - 1;
-        m_data_rx_window.InitializeBefore(ticket.client_next_wire_seq);
-        m_have_peer = false;
-        m_peer = sockaddr_storage{};
-        m_peer_len = 0;
-    } else {
-        m_tx_direction = SecureDirection::kClientToServer;
-        m_rx_direction = SecureDirection::kServerToClient;
-        m_tx_wire_seq = ticket.client_next_wire_seq - 1;
-        m_data_rx_window.InitializeBefore(ticket.server_next_wire_seq);
+        m_conn_id = ticket.conn_id;
+        m_session_id = ticket.session_id;
+        std::memcpy(m_client_nonce, ticket.client_nonce, kHandshakeNonceBytes);
+        std::memcpy(m_server_nonce, ticket.server_nonce, kHandshakeNonceBytes);
+        if (m_is_listener) {
+            m_tx_direction = SecureDirection::kServerToClient;
+            m_rx_direction = SecureDirection::kClientToServer;
+            m_tx_wire_seq = ticket.server_next_wire_seq - 1;
+            m_data_rx_window.InitializeBefore(ticket.client_next_wire_seq);
+            m_have_peer = false;
+            m_peer = sockaddr_storage{};
+            m_peer_len = 0;
+        } else {
+            m_tx_direction = SecureDirection::kClientToServer;
+            m_rx_direction = SecureDirection::kServerToClient;
+            m_tx_wire_seq = ticket.client_next_wire_seq - 1;
+            m_data_rx_window.InitializeBefore(ticket.server_next_wire_seq);
+        }
+        DeriveSessionKey(m_psk, m_client_nonce, m_server_nonce, m_tx_direction, m_tx_key);
+        DeriveSessionKey(m_psk, m_client_nonce, m_server_nonce, m_rx_direction, m_rx_key);
+        m_session_keys_ready = true;
+        m_state = LinkState::kConnected;
+        m_resumed = true;
+        m_resume_epoch = !m_is_listener;
+        m_peer_resume_epoch_seen = false;
+        m_send_resume_ack = false;
+        m_have_retired_peer = false;
+        m_last_rx_ms = now;
+        m_next_ack_tick_ms = now + m_config.ack_interval_ms;
+        m_next_heartbeat_ms = now + m_config.heartbeat_interval_ms;
+        ResetApplicationChannels();
+        ResetPmtud(now);
+        ++m_secure_stats.resumptions;
+        PushConnectedEvent();
     }
-    DeriveSessionKey(m_psk, m_client_nonce, m_server_nonce, m_tx_direction, m_tx_key);
-    DeriveSessionKey(m_psk, m_client_nonce, m_server_nonce, m_rx_direction, m_rx_key);
-    m_session_keys_ready = true;
-    m_state = LinkState::kConnected;
-    m_resumed = true;
-    m_resume_epoch = !m_is_listener;
-    m_peer_resume_epoch_seen = false;
-    m_send_resume_ack = false;
-    m_have_retired_peer = false;
-    m_last_rx_ms = now;
-    m_next_ack_tick_ms = now + m_config.ack_interval_ms;
-    m_next_heartbeat_ms = now + m_config.heartbeat_interval_ms;
-    ResetApplicationChannels();
-    ResetPmtud(now);
-    ++m_secure_stats.resumptions;
-    if (on_connected) {
-        on_connected();
-    }
+    // Resume 是同步 API：调用方不会立刻跑 RunOnce，所以这里先把事件派发掉
+    // （基线在锁内同步回调，语义等价）。回调里 Send*/Close 都安全。
+    DispatchEvents();
     return true;
 }
 
@@ -1903,9 +2292,7 @@ bool Link::TryAdoptCachedSession(const std::uint8_t* packet, std::size_t bytes,
             it->second.client_rx_window = trial_window;
         }
     }
-    if (on_connected) {
-        on_connected();
-    }
+    PushConnectedEvent();
     return true;
 }
 
@@ -1917,15 +2304,23 @@ void Link::ClearSessionCache() {
 
 SendStatus Link::TrySendStream(std::uint8_t channel, const void* data, std::size_t bytes,
                                std::uint32_t dep_seq) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (m_state != LinkState::kConnected) {
-        return SendStatus::kError;
+    SendStatus status = SendStatus::kError;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_state != LinkState::kConnected) {
+            return SendStatus::kError;
+        }
+        ReliableChannel* target = GetOrCreateReliable(channel);
+        if (target == nullptr) {
+            return SendStatus::kError;
+        }
+        status = target->TrySend(static_cast<const std::uint8_t*>(data), bytes, dep_seq);
     }
-    ReliableChannel* target = GetOrCreateReliable(channel);
-    if (target == nullptr) {
-        return SendStatus::kError;
+    if (status != SendStatus::kOk) {
+        return status;  // WouldBlock：窗口满，没有帧入队，不需要 drain。
     }
-    return target->TrySend(static_cast<const std::uint8_t*>(data), bytes, dep_seq);
+    // 锁外把队列里的帧真正发出去（可能与其他发送线程合并成一批）。
+    return DrainTx() ? SendStatus::kOk : SendStatus::kError;
 }
 
 bool Link::SendStream(std::uint8_t channel, const void* data, std::size_t bytes,
@@ -1935,46 +2330,67 @@ bool Link::SendStream(std::uint8_t channel, const void* data, std::size_t bytes,
 
 bool Link::ConcurrentSend(std::uint8_t channel, const void* data, std::size_t bytes,
                           std::uint32_t dep_seq) {
-    // 显式多线程入口：与 SendStream 共用同一把锁，语义完全一致。
+    // 显式多线程入口：与 SendStream 同一路径（内部发送队列保证串行化）。
     return SendStream(channel, data, bytes, dep_seq);
 }
 
 bool Link::SendDatagram(std::uint8_t channel, const void* data, std::size_t bytes,
                         std::uint32_t dep_seq) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (m_state != LinkState::kConnected) {
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_state != LinkState::kConnected) {
+            return false;
+        }
+        UnreliableChannel* target = GetOrCreateUnreliable(channel);
+        if (target == nullptr) {
+            return false;
+        }
+        queued = target->Send(static_cast<const std::uint8_t*>(data), bytes, dep_seq);
+    }
+    if (!queued) {
         return false;
     }
-    UnreliableChannel* target = GetOrCreateUnreliable(channel);
-    if (target == nullptr) {
-        return false;
-    }
-    return target->Send(static_cast<const std::uint8_t*>(data), bytes, dep_seq);
+    return DrainTx();
 }
 
 bool Link::SendVideoFrame(std::uint32_t frame_id, bool key, const void* data,
                            std::size_t bytes) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (m_state != LinkState::kConnected) {
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_state != LinkState::kConnected) {
+            return false;
+        }
+        queued = m_video->SendFrame(frame_id, key, static_cast<const std::uint8_t*>(data), bytes);
+    }
+    if (!queued) {
         return false;
     }
-    return m_video->SendFrame(frame_id, key, static_cast<const std::uint8_t*>(data), bytes);
+    return DrainTx();
 }
 
 bool Link::SendBarrier(std::uint32_t barrier_seq) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (m_state != LinkState::kConnected) {
+    bool queued = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_state != LinkState::kConnected) {
+            return false;
+        }
+        FrameHeader header;
+        header.type = FrameType::kBarrier;
+        header.channel = 0;
+        header.seq = barrier_seq;
+        queued = SendControl(header, nullptr, nullptr, 0);
+    }
+    if (!queued) {
         return false;
     }
-    FrameHeader header;
-    header.type = FrameType::kBarrier;
-    header.channel = 0;
-    header.seq = barrier_seq;
-    return SendControl(header, nullptr, nullptr, 0);
+    return DrainTx();
 }
 
 ReliableChannel::Stats Link::reliable_stats(std::uint8_t channel) const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_reliable.find(channel);
     if (it == m_reliable.end()) {
         return {};
@@ -1983,7 +2399,7 @@ ReliableChannel::Stats Link::reliable_stats(std::uint8_t channel) const {
 }
 
 UnreliableChannel::Stats Link::unreliable_stats(std::uint8_t channel) const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_unreliable.find(channel);
     if (it == m_unreliable.end()) {
         return {};
@@ -1992,12 +2408,12 @@ UnreliableChannel::Stats Link::unreliable_stats(std::uint8_t channel) const {
 }
 
 VideoChannel::Stats Link::video_stats() const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     return m_video->stats();
 }
 
 CongestionStats Link::congestion_stats(std::uint8_t channel) const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_reliable.find(channel);
     if (it == m_reliable.end()) {
         return {};
@@ -2030,12 +2446,12 @@ LinkStats Link::StatsUnlocked() const {
 }
 
 LinkStats Link::Stats() const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     return StatsUnlocked();
 }
 
 std::string Link::StatsJson() const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     return LinkStatsToJson(StatsUnlocked());
 }
 
@@ -2048,7 +2464,7 @@ std::uint64_t Link::BandwidthEstimateUnlocked() const {
 }
 
 std::uint64_t Link::BandwidthEstimate() const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     return BandwidthEstimateUnlocked();
 }
 
@@ -2068,7 +2484,7 @@ double Link::LossRateUnlocked() const {
 }
 
 double Link::LossRate() const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
     return LossRateUnlocked();
 }
 
@@ -2091,7 +2507,7 @@ void Link::MaybeReportBandwidth(std::uint64_t now_ms) {
         return;
     }
     m_last_reported_bps = bitrate;
-    on_bandwidth(bitrate);
+    PushBandwidthEvent(bitrate);
 }
 
 // ---------------------------------------------------------------------------
@@ -2099,7 +2515,12 @@ void Link::MaybeReportBandwidth(std::uint64_t now_ms) {
 // ---------------------------------------------------------------------------
 
 bool Link::SetPreSharedKey(const std::uint8_t* key, std::size_t bytes) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return SetPreSharedKeyLocked(key, bytes);
+}
+
+bool Link::SetPreSharedKeyLocked(const std::uint8_t* key, std::size_t bytes) {
+    // 调用方已持有 m_mutex（Open() 在锁内配置 PSK）。
     if (key == nullptr || bytes != kPskBytes) {
         return false;
     }
@@ -2394,9 +2815,7 @@ bool Link::HandleSecureHello(const std::uint8_t* data, std::size_t bytes,
         ++m_stats.handshakes;
         ++m_secure_stats.handshakes;
         ResetPmtud(m_last_rx_ms);
-        if (on_connected) {
-            on_connected();
-        }
+        PushConnectedEvent();
     }
     return true;
 }
@@ -2495,9 +2914,7 @@ bool Link::HandleSecureHelloAck(const std::uint8_t* data, std::size_t bytes,
         ++m_stats.handshakes;
         ++m_secure_stats.handshakes;
         ResetPmtud(m_last_rx_ms);
-        if (on_connected) {
-            on_connected();
-        }
+        PushConnectedEvent();
     }
     return true;
 }

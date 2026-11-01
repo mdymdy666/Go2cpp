@@ -95,6 +95,12 @@ std::uint64_t NowMs() noexcept {
         std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
+std::uint64_t NowUs() noexcept {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(now).count());
+}
+
 bool IsKnownFrameType(std::uint8_t raw) noexcept {
     switch (static_cast<FrameType>(raw)) {
         case FrameType::kHello:

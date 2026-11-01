@@ -264,6 +264,17 @@ std::size_t StreamReassembler::OnTimer(std::uint64_t now_ms) {
     return dropped;
 }
 
+std::uint64_t StreamReassembler::NextTimerDeadlineMs() const noexcept {
+    std::uint64_t next = 0;
+    for (const auto& entry : m_active) {
+        const std::uint64_t deadline = entry.second.last_update_ms + m_config.timeout_ms;
+        if (next == 0 || deadline < next) {
+            next = deadline;
+        }
+    }
+    return next;
+}
+
 // ---------------------------------------------------------------------------
 // ReliableChannel
 // ---------------------------------------------------------------------------
@@ -510,7 +521,7 @@ bool ReliableChannel::SendNow(Outgoing& message, bool retransmit, std::uint64_t 
     }
     message.last_send_ms = now_ms;
     // 数据帧已捎带当前接收状态，独立 ACK 不必重复发送。
-    m_pending_ack = false;
+    MarkAckSent();
     return true;
 }
 
@@ -573,6 +584,13 @@ void ReliableChannel::OnFrame(const FrameHeader& header, const std::uint8_t* pay
     m_rx_bytes_total += wire_bytes;
 
     m_rx_seen.insert(seq);
+    // 延迟 ACK 记账：in-order 帧计入「2 帧阈值」；乱序帧要求立即 ACK。
+    // 旧实现只在 Link 的 ack_interval tick 上发 ACK，回环 10ms 的 tick
+    // 会把突发末尾额外压 ~4ms，并把 RTT 估计污染成 3-4ms。
+    ++m_frames_since_ack;
+    if (seq != m_next_rx_seq) {
+        m_out_of_order_since_ack = true;
+    }
     if (!fragmented) {
         RememberFecPayload(seq, payload, bytes);
     }
@@ -976,6 +994,35 @@ void ReliableChannel::OnTimer(std::uint64_t now_ms) {
     m_stats.unsent = m_unsent.size();
 }
 
+std::uint64_t ReliableChannel::NextTimerDeadlineMs() const noexcept {
+    std::uint64_t next = 0;
+    auto consider = [&next](std::uint64_t deadline) {
+        if (deadline == 0) {
+            return;
+        }
+        if (next == 0 || deadline < next) {
+            next = deadline;
+        }
+    };
+    for (const Outgoing& message : m_inflight) {
+        if (m_sacked.count(message.seq) != 0) {
+            continue;  // 对端已收到，不会再触发 PTO。
+        }
+        consider(message.last_send_ms + m_rtt.BackoffPtoMs(message.retransmits));
+    }
+    // TLP：与 OnTimer 的判定完全一致（无新数据可发、仍有未确认数据）。
+    if (m_unsent.empty() && !m_inflight.empty()) {
+        const Outgoing& probe = m_inflight.back();
+        const std::uint32_t pto = m_rtt.BackoffPtoMs(probe.retransmits);
+        const std::uint64_t half = std::max<std::uint64_t>(pto / 2, 1);
+        if (m_sacked.count(probe.seq) == 0 && half < pto) {
+            consider(probe.last_send_ms + half);
+        }
+    }
+    consider(m_reassembler.NextTimerDeadlineMs());
+    return next;
+}
+
 void ReliableChannel::OnMaxData(std::uint64_t limit) noexcept {
     ++m_stats.max_data_received;
     if (limit <= m_peer_max_data) {
@@ -1342,6 +1389,15 @@ void UnreliableChannel::DeliverFrame(std::uint32_t seq, std::vector<std::uint8_t
     if (m_deliver) {
         m_deliver(seq, payload.data(), payload.size());
     }
+}
+
+std::uint64_t UnreliableChannel::NextTimerDeadlineMs() const noexcept {
+    if (!m_gap_active || m_reorder.empty()) {
+        return 0;
+    }
+    return m_gap_since_ms +
+           static_cast<std::uint64_t>(m_config.reorder_timeout_ms == 0 ? 1
+                                                                       : m_config.reorder_timeout_ms);
 }
 
 void UnreliableChannel::OnTimer(std::uint64_t now_ms) {
@@ -1825,6 +1881,17 @@ void VideoChannel::OnTimer(std::uint64_t now_ms) {
             ++it;
         }
     }
+}
+
+std::uint64_t VideoChannel::NextTimerDeadlineMs() const noexcept {
+    std::uint64_t next = 0;
+    for (const auto& entry : m_active) {
+        const std::uint64_t deadline = entry.second.last_update_ms + kReassemblyTimeoutMs;
+        if (next == 0 || deadline < next) {
+            next = deadline;
+        }
+    }
+    return next;
 }
 
 void VideoChannel::DropReassembly(std::map<std::uint32_t, Reassembly>::iterator it) {

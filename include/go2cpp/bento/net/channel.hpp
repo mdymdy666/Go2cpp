@@ -204,6 +204,9 @@ class StreamReassembler final {
     /// @brief 丢弃超过 timeout_ms 未更新的半成品。返回丢弃数量。
     std::size_t OnTimer(std::uint64_t now_ms);
 
+    /// @brief 最早半成品超时的绝对毫秒；0 = 无半成品。
+    std::uint64_t NextTimerDeadlineMs() const noexcept;
+
     const Stats& stats() const noexcept {
         return m_stats;
     }
@@ -429,7 +432,32 @@ class ReliableChannel final {
     /// @brief 标记 ACK 已随帧发出（独立 ACK 或数据帧捎带）。
     void MarkAckSent() noexcept {
         m_pending_ack = false;
+        m_frames_since_ack = 0;
+        m_out_of_order_since_ack = false;
     }
+
+    /// @brief 是否有「新数据帧到达、独立 ACK 还没发出」的状态。
+    /// @details 与 HasPendingAck 的区别：后者还包含「乱序项要周期性重报」
+    ///          （没有新帧也要按 ack_interval 重发 SACK 证据）。快速 ACK
+    ///          只看新数据，避免在没有新帧时打出 ACK 风暴。
+    bool HasUnackedInput() const noexcept {
+        return m_pending_ack;
+    }
+
+    /// @brief 是否该立刻发独立 ACK（不等 ack_interval）。
+    /// @details 两条规则：① 已积累 >=2 个新帧（RFC 1122 延迟 ACK 的
+    ///          「每两个满长段确认一次」，让发送端 cwnd 持续打开）；
+    ///          ② 出现乱序（尽快把 SACK 证据送到发送端，触发快速重传）。
+    ///          第三种情形「接收队列抽干」由 Link::RunOnce 判断：接收方
+    ///          即将空闲时必须马上确认，否则对端要多等一个 ack_interval。
+    bool WantsImmediateAck() const noexcept {
+        return m_pending_ack && (m_frames_since_ack >= 2 || m_out_of_order_since_ack);
+    }
+
+    /// @brief 下一个需要 OnTimer 处理的绝对毫秒（PTO/TLP）；0 = 没有。
+    /// @details Link 用它把 poll 超时钳制到真实定时器，而不是盲目睡满
+    ///          调用方给的 timeout_ms。
+    std::uint64_t NextTimerDeadlineMs() const noexcept;
 
     std::uint8_t channel_id() const noexcept {
         return m_channel_id;
@@ -551,6 +579,8 @@ class ReliableChannel final {
     std::map<std::uint32_t, Received> m_rx_buffer;
     std::set<std::uint32_t> m_rx_seen;
     bool m_pending_ack = false;
+    std::uint32_t m_frames_since_ack = 0;   ///< 上次 ACK 之后新收的数据帧数。
+    bool m_out_of_order_since_ack = false;  ///< 上次 ACK 之后是否见过乱序。
     bool m_pto_recovery = false;  ///< 已为当前 PTO 丢失事件降过窗，等 ACK 前进清除。
     Stats m_stats;
 
@@ -652,6 +682,9 @@ class UnreliableChannel final {
     /// @brief 驱动乱序缓存：缺口等待超时后跳过缺口交付缓存最小项。
     /// @note Link 每次事件循环（Tick）调用；也可由测试用假时钟驱动。
     void OnTimer(std::uint64_t now_ms);
+
+    /// @brief 缺口跳过超时的绝对毫秒；0 = 当前没有计时中的缺口。
+    std::uint64_t NextTimerDeadlineMs() const noexcept;
 
     /// @brief 处理 BARRIER：把 applied_seq 抬到 barrier 以上，并作废缓存中
     ///        已被屏障越过的帧（它们不再允许交付）。
@@ -764,6 +797,9 @@ class VideoChannel final {
 
     /// @brief 清理超时的半成品重组状态（含其 FEC 状态）。
     void OnTimer(std::uint64_t now_ms);
+
+    /// @brief 最早半成品重组超时的绝对毫秒；0 = 没有半成品。
+    std::uint64_t NextTimerDeadlineMs() const noexcept;
 
     const Stats& stats() const noexcept {
         return m_stats;

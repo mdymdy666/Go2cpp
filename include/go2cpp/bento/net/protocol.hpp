@@ -218,6 +218,13 @@ inline bool SeqGreaterOrEqual(std::uint32_t a, std::uint32_t b) noexcept {
 /// @brief 当前单调时钟毫秒数（steady_clock，不受系统时间调整影响）。
 std::uint64_t NowMs() noexcept;
 
+/// @brief 当前单调时钟微秒数（steady_clock，不受系统时间调整影响）。
+/// @details 延迟统计专用。毫秒时钟会把 <1ms 的延迟量化成 0/1，无法与
+///          TCP/UDP 的微秒级探针对比（回环真实单向延迟 ~20-60us）。
+///          协议内部定时器仍用毫秒（保守、实现简单），只有测量与报告
+///          走本函数；不要用它做超时判断，避免无谓的精度依赖。
+std::uint64_t NowUs() noexcept;
+
 /// @brief 帧类型是否是已定义类型。
 bool IsKnownFrameType(std::uint8_t raw) noexcept;
 

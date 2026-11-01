@@ -7,14 +7,20 @@
  *
  *          - **接收**：RunOnce/RunFor 由使用方在单一接收线程驱动，采用
  *            「poll + 每次 tick 检查定时器」的阻塞模型，不额外起线程。
+ *            **poll 期间不持状态锁**：`m_mutex` 只覆盖单帧处理/Tick 的短临界区，
+ *            接收空闲时发送线程完全不受影响。
  *          - **发送**：SendStream/SendDatagram/SendVideoFrame/SendBarrier/
- *            ConcurrentSend 可以在任意线程并发调用；Link 内部用递归互斥量
- *            串行化对通道状态、socket 与统计的访问。因为持锁期间可能触发
- *            回调（回调里允许再次 Send*），所以使用 recursive_mutex。
+ *            ConcurrentSend 可以在任意线程并发调用。发送路径先把帧投递到
+ *            `m_tx_queue`（`m_tx_mutex` + `m_tx_cv`），再由任一线程（通常是
+ *            调用者本身，接收线程负责兜底）`DrainTx()` 批量出队；seal/sendto
+ *            只在 `m_mutex` 内占据「一帧」的临界区，不再跨 poll/整批接收。
+ *            多线程同时发送时只有一个线程成为 drainer，避免 N 个线程各自
+ *            抢锁做 seal+sendto。
  *          - **回调**：on_connected/on_disconnected/on_stream/on_datagram/
- *            on_video/on_bandwidth 都在 RunOnce 的接收线程内同步执行；
- *            回调里可以继续调用 Send*，但不要调用 RunOnce（会阻塞持锁的
- *            发送线程，且接收线程不可重入）。
+ *            on_video/on_bandwidth 都在 RunOnce 的接收线程内派发，但**已移出
+ *            锁外**：锁内只入队事件，派发在 `DispatchEvents()` 中执行。因此
+ *            回调里可以安全地再次调用 Send 系列 / Close（不再依赖递归锁），
+ *            也不会把用户回调的耗时算进临界区拖慢发送线程。
  *
  *          设备地址支持 IPv4、IPv6 与主机名（getaddrinfo AF_UNSPEC）。
  *
@@ -38,12 +44,16 @@
 #include <sys/socket.h>
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -178,11 +188,13 @@ class UdpSocket final {
     /// @brief 关闭 fd；幂等。
     void Close() noexcept;
 
+    /// @brief 是否已绑定（无锁读原子快照，可在发送/接收线程任意调用）。
     bool IsOpen() const noexcept {
-        return m_fd >= 0;
+        return m_fd_cache.load(std::memory_order_acquire) >= 0;
     }
+    /// @brief 当前 fd 的无锁快照（可能已是过期值，仅供诊断/系统调用快速路径）。
     int fd() const noexcept {
-        return m_fd;
+        return m_fd_cache.load(std::memory_order_acquire);
     }
     std::uint16_t local_port() const noexcept {
         return m_local_port;
@@ -193,6 +205,8 @@ class UdpSocket final {
     }
 
     /// @brief 发送一个数据报到通用地址。返回 false 表示 sendto 失败。
+    /// @note 内部持 `m_lifecycle` 共享锁：与 wait/poll 并发不互斥，只与
+    ///       Open/Close（独占）互斥，因此发送不会被接收线程的 poll 阻塞。
     bool SendTo(const sockaddr_storage& peer, socklen_t peer_len, const std::uint8_t* data,
                 std::size_t bytes) noexcept;
 
@@ -228,6 +242,13 @@ class UdpSocket final {
     int m_fd = -1;
     std::uint16_t m_local_port = 0;
     int m_family = AF_UNSPEC;
+    /// fd 的无锁只读快照：IsOpen()/fd() 在发送与接收线程每帧调用，不能取锁；
+    /// 所有改 m_fd 的路径（Open/Close/移动赋值）都在独占锁内同步它。
+    std::atomic<int> m_fd_cache{-1};
+    /// fd 生命周期读写锁：poll/recv/send 取共享锁，Open/Close/Migrate 取独占锁。
+    /// 发送持共享锁与 poll 共存（不互斥），因此「接收线程阻塞在 poll」不再
+    /// 阻塞任何发送；Close 需要等 poll 返回（与原实现等锁的语义一致）。
+    mutable std::shared_mutex m_lifecycle;
 };
 
 /// @brief 链路层计数器 + 可靠通道聚合统计（P1 扩展）。
@@ -353,7 +374,8 @@ class Link final {
     void Close();
 
     /// @brief 处理一轮收发与定时器。返回本轮收到的帧数。
-    /// @note 只在接收线程调用；持锁期间会阻塞并发发送。
+    /// @note 只在接收线程调用。**poll 不持状态锁**：`m_mutex` 只覆盖单帧
+    ///       处理与 Tick 的短临界区，因此并发 Send* 不会被接收超时阻塞。
     int RunOnce(int timeout_ms);
 
     /// @brief 循环运行指定时长。
@@ -453,7 +475,9 @@ class Link final {
     /// @brief 拥塞控制统计（cwnd/ssthresh/pacing/丢包/超时）。
     CongestionStats congestion_stats(std::uint8_t channel) const;
 
-    /// 以下回调均在 RunOnce 内同步触发；回调里可以继续调用 Send*。
+    /// 以下回调均在 RunOnce 内触发，但**已移出状态锁**：锁内只入队事件，
+    /// RunOnce 在锁外 `DispatchEvents()` 派发。回调里可以安全地继续调用
+    /// Send*/Close（不再依赖 recursive_mutex），回调耗时不进入临界区。
     std::function<void()> on_connected;
     std::function<void(const char* reason)> on_disconnected;
     std::function<void(std::uint8_t channel, const std::uint8_t* data, std::size_t bytes)>
@@ -471,6 +495,9 @@ class Link final {
     static constexpr std::size_t kMaxChannels = 8;
     /// 单个 RunOnce 最多处理的帧数，避免持续流量饿死定时器。
     static constexpr int kMaxFramesPerRun = 256;
+    /// 发送队列上限：超过后 `SendBuiltFrame` 直接丢弃（UDP 语义允许丢包），
+    /// 避免接收线程长期不跑 RunOnce 时队列无界膨胀。
+    static constexpr std::size_t kMaxTxQueue = 4096;
 
     ReliableChannel* GetOrCreateReliable(std::uint8_t channel);
     UnreliableChannel* GetOrCreateUnreliable(std::uint8_t channel);
@@ -526,12 +553,72 @@ class Link final {
     void SendHello();
     bool SendAckFrame(std::uint8_t channel, bool heartbeat);
     void Tick(std::uint64_t now_ms);
+    /// @brief 下一个需要 RunOnce 处理的定时器的绝对毫秒；0 = 没有。
+    /// @details 覆盖 hello 重传、ACK tick、心跳、各通道 PTO/TLP、重组超时。
+    std::uint64_t NextTimerDeadlineMs(std::uint64_t now_ms) const;
+    /// @brief 把 poll 超时钳制到最近定时器：应用传大 timeout 也不会让
+    ///        ACK/PTO/心跳整体晚到。定时器已过期时返回 0（先干活再睡）。
+    int ClampPollTimeout(int timeout_ms, std::uint64_t now_ms) const;
+    /// @brief 收到数据后立即补发独立 ACK（quickack），不等 ack_interval。
+    /// @param rx_drained 本次 RunOnce 是否已把接收队列抽干（即将空闲）。
+    void FlushImmediateAcks(std::uint64_t now_ms, bool rx_drained);
     void MaybeReportBandwidth(std::uint64_t now_ms);
     std::uint64_t BandwidthEstimateUnlocked() const;
     double LossRateUnlocked() const;
     LinkStats StatsUnlocked() const;
     void Fail(const char* reason);
     bool PeerMatches(const sockaddr_storage& from) const noexcept;
+
+    // ---- 非递归锁下的「锁内版本」入口 ----
+    // 调用方必须已经持有 m_mutex；公开方法负责加锁后转调。
+    /// @brief SetPreSharedKey 的锁内版本（Open() 已持 m_mutex 时使用）。
+    bool SetPreSharedKeyLocked(const std::uint8_t* key, std::size_t bytes);
+    /// @brief NotifyPathMtuError 的锁内版本（sendto/ICMP 轮询路径使用）。
+    void NotifyPathMtuErrorLocked(std::uint32_t reported_mtu);
+
+    // ---- 发送队列（收发分离的核心） ----
+    /// @brief 锁内调用：给帧打上 conn_id/kFlagResume 后投递到发送队列。
+    /// @return 入队成功；队列满/未连接返回 false（不触碰 socket）。
+    bool EnqueueTxFrame(const std::uint8_t* data, std::size_t bytes);
+    /// @brief 锁外调用：把队列里的帧交给 socket。并发调用时只有一个 drainer，
+    ///        其余调用者等待自己入队的帧被处理完（条件变量）。
+    bool DrainTx();
+    /// @brief 锁内调用：真正的 seal（如需）+ sendto。临界区只有一帧。
+    bool SendPacketLocked(const std::uint8_t* data, std::size_t bytes);
+
+    // ---- 回调事件（锁内入队、锁外派发） ----
+    void PushConnectedEvent();
+    void PushDisconnectedEvent(const char* reason);
+    void PushStreamEvent(std::uint8_t channel, const std::uint8_t* data, std::size_t bytes);
+    void PushDatagramEvent(std::uint8_t channel, const std::uint8_t* data, std::size_t bytes);
+    void PushVideoEvent(std::uint32_t frame_id, bool key, const std::uint8_t* data,
+                        std::size_t bytes);
+    void PushBandwidthEvent(std::uint64_t bitrate_bps);
+    /// @brief 锁外派发 `m_events`；回调里再 Send*/Close 都是安全的。
+    void DispatchEvents();
+
+    /// @brief 锁内入队的回调事件；RunOnce 在锁外派发。
+    struct LinkEvent {
+        enum class Kind : std::uint8_t {
+            kConnected,
+            kDisconnected,
+            kStream,
+            kDatagram,
+            kVideo,
+            kBandwidth,
+        };
+        Kind kind = Kind::kConnected;
+        std::uint8_t channel = 0;
+        std::uint32_t frame_id = 0;
+        bool key = false;
+        std::uint64_t bandwidth = 0;
+        const char* reason = nullptr;
+        std::vector<std::uint8_t> data;
+    };
+    /// @brief 待发送帧（已打 conn_id/resume 标记，尚未 seal/sendto）。
+    struct TxPacket {
+        std::vector<std::uint8_t> frame;
+    };
 
     LinkConfig m_config;
     UdpSocket m_socket;
@@ -621,8 +708,28 @@ class Link final {
     std::vector<std::array<std::uint8_t, kHandshakeNonceBytes>> m_seen_client_nonces;
     SecureStats m_secure_stats;
 
-    /// 保护通道表、socket 发送、统计与流控状态；recursive 以支持回调重入。
-    mutable std::recursive_mutex m_mutex;
+    // ---- 发送队列（链路的「收发分离」层） ----
+    // m_tx_mutex 只保护队列本身，不保护链路状态；seal/sendto 仍在 m_mutex 内，
+    // 但临界区只有「一帧」，不再覆盖 poll 或整批接收。
+    std::mutex m_tx_mutex;
+    std::condition_variable m_tx_cv;
+    std::deque<TxPacket> m_tx_queue;
+    std::uint64_t m_tx_enqueued = 0;  ///< 累计入队序号（用于等待自己已被 drain）
+    std::uint64_t m_tx_drained = 0;   ///< drainer 已处理到的序号
+    bool m_tx_draining = false;       ///< 已有一个线程在取批发帧
+    bool m_tx_last_ok = true;         ///< 最近一批的实际发送结果
+    std::atomic<bool> m_tx_pending{false};  ///< 队列非空的快速判断（免锁空转）
+
+    // ---- 回调事件（锁内入队、锁外派发；避免 recursive_mutex） ----
+    std::vector<LinkEvent> m_events;
+    std::atomic<bool> m_events_pending{false};
+
+    /// @brief 发送侧复用 scratch：打 conn_id/kFlagResume 时不再每帧一次堆分配。
+    std::vector<std::uint8_t> m_tx_stamp_scratch;
+
+    /// 保护通道表、socket 发送、统计与流控状态。
+    /// 非递归：所有用户回调都在锁外派发，因此回调里 Send*/Close 不会重入本锁。
+    mutable std::mutex m_mutex;
 };
 
 }  // namespace go2cpp::bento
