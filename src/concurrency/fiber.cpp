@@ -55,6 +55,7 @@
 #include <chrono>
 #include <deque>
 #include <unordered_map>
+#include <cassert>
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
@@ -273,9 +274,18 @@ GO2CPP_FIBER_TLS thread_local StackCache s_thread_stack_pool;
 // 的上下文已经失效，放回这里的对象只会在下一次 AcquireForScheduler
 // 时重新绑定任务；普通用户创建的 Fiber 不经过此路径。
 struct FiberBin {
-    std::vector<std::unique_ptr<Fiber>> entries;
+    // P9：定长槽位替代 std::vector。FiberBin 在每条任务的回收/复用路径上
+    // 都要访问一次，vector 的 size()/push_back 边界检查与 TLS 容器的
+    // 构造/析构都是纯开销；容量本来就是「缓存优化」语义，超限时不缓存
+    // （unique_ptr 正常析构，栈仍回收到栈缓存），正确性不变。
+    static constexpr std::size_t kSlots = 128;
+    std::array<std::unique_ptr<Fiber>, kSlots> entries{};
+    std::size_t count{0};
 };
 
+// 每个 M 一个槽（M 与 P 一对一绑定，等价 per-P 槽）。Fiber 的公开接口
+// （fiber.hpp）不在本次改动范围内，而 TLS 槽与「把槽挂在 Processor 上」
+// 是同一份数据、同一条访问路径，且天然没有跨 M 竞争。
 GO2CPP_FIBER_TLS thread_local FiberBin s_thread_fiber_bin;
 constexpr std::size_t kDefaultFiberBinCapacity = 32U;
 // 防止误配把每个 M 变成无界对象保留池。FiberBin 只应缓存短期突发，
@@ -1385,6 +1395,42 @@ struct FiberRecord {
     /// 读取它们，避免并发读 Impl 的非原子字段（FIBER-01）。
     std::size_t requested_stack_bytes{0};
     std::size_t reserve_stack_bytes{0};
+
+    /// @brief 无锁整块重置（P9）：把 record 恢复成新建时的初始态。
+    /// @details 调用前提：本 Fiber 是 record 的唯一持有者
+    ///          （`use_count()==1`，由 RecycleForScheduler 验证）。没有并发
+    ///          观察者，因此不需要 `mutex`；旧实现在这里每次复用都加/解锁
+    ///          一把 pthread mutex。原子字段用 release 发布，与
+    ///          initialize_context()/resume 的 acquire 顺序保持一致。
+    void ResetForReuse(std::uint64_t next_id, std::size_t stack_bytes,
+                       std::size_t reserve_bytes) noexcept {
+        // 非原子字段：一次调用内整块重置，全部是线程本地写，没有可见性
+        // 要求（真正发布发生在后续 resume 的 release 序里）。
+        id = next_id;
+        parent.reset();
+        active_parent_id = 0;
+        depth = 0;
+        last_thread = {};
+        execution = {};
+        stack_low = 0;
+        stack_high = 0;
+        stack_known = false;
+        requested_stack_bytes = stack_bytes;
+        reserve_stack_bytes = reserve_bytes;
+        // 原子字段：唯一持有者前提下 relaxed 已足够；这里统一用 release，
+        // x86 上不多花一条指令，语义更保守。
+        alive.store(true, std::memory_order_release);
+        state.store(FiberState::Ready, std::memory_order_release);
+        reason.store(SuspendReason::None, std::memory_order_release);
+        cancellation_requested.store(false, std::memory_order_release);
+        // 复用 Fiber 即换了一个逻辑 G：亲和状态必须清零，否则新 G 会
+        // 继承上一个任务「最近 M」甚至 LockToCurrentM 绑定。
+        affinity_machine.store(0, std::memory_order_relaxed);
+        affinity_processor.store(0, std::memory_order_relaxed);
+        locked_machine.store(0, std::memory_order_relaxed);
+        affinity_hits.store(0, std::memory_order_relaxed);
+        affinity_migrations.store(0, std::memory_order_relaxed);
+    }
 };
 
 /// 任务函数名：优先 GO2CPP_FIBER_NAME 的显式名字，其次 typeid 的
@@ -1594,41 +1640,21 @@ struct Fiber::Impl {
 #endif
         m_function = std::move(function);
         m_id = next_id;
-        {
-            // 原地重置同一个 FiberRecord（FIBER-03）：不再替换 shared_ptr。
-            // 所有外部观察者持有的 record 指针因此始终有效，读 m_record
-            // 与重置之间不存在指针竞争。调用方（RecycleForScheduler）已
-            // 保证 use_count()==1，重置不会覆盖别的 Fiber 的父链墓碑。
-            std::lock_guard<std::mutex> lock(m_record->mutex);
-            m_record->id = next_id;
-            m_record->parent.reset();
-            m_record->alive.store(true, std::memory_order_release);
-            m_record->state.store(FiberState::Ready,
-                                  std::memory_order_release);
-            m_record->reason.store(SuspendReason::None,
-                                   std::memory_order_release);
-            m_record->cancellation_requested.store(false,
-                                                   std::memory_order_release);
-            m_record->active_parent_id = 0;
-            m_record->depth = 0;
-            m_record->last_thread = {};
-            m_record->execution = {};
-            // 复用 Fiber 即换了一个逻辑 G：亲和状态必须清零，否则新 G 会
-            // 继承上一个任务「最近 M」甚至 LockToCurrentM 绑定。
-            m_record->affinity_machine.store(0, std::memory_order_relaxed);
-            m_record->affinity_processor.store(0, std::memory_order_relaxed);
-            m_record->locked_machine.store(0, std::memory_order_relaxed);
-            m_record->affinity_hits.store(0, std::memory_order_relaxed);
-            m_record->affinity_migrations.store(0, std::memory_order_relaxed);
-            m_record->requested_stack_bytes = normalized_stack_size;
-            m_record->reserve_stack_bytes = stack_reserve_size;
+        // 原地重置同一个 FiberRecord（FIBER-03）：不再替换 shared_ptr。
+        // 所有外部观察者持有的 record 指针因此始终有效，读 m_record
+        // 与重置之间不存在指针竞争。
+        //
+        // **无锁整块重置**（P9）：调用方（RecycleForScheduler）已验证
+        // `m_record.use_count() == 1`，本 Fiber 是 record 的唯一持有者，
+        // 不存在并发观察者，因此 `record->mutex` 不再需要。旧实现每次
+        // 复用都要加/解锁一把 pthread mutex，callgrind 上占整条复用路径
+        // 约 12% 指令。前提被破坏时 debug 构建的 assert 立刻暴露。
+        assert(m_record.use_count() == 1);
+        m_record->ResetForReuse(next_id, normalized_stack_size,
+                                stack_reserve_size);
 #if defined(GO2CPP_DEBUG_DUMP) && GO2CPP_DEBUG_DUMP
-            m_record->function_name = DescribeFiberFunction(m_function);
-            m_record->stack_low = 0;
-            m_record->stack_high = 0;
-            m_record->stack_known = false;
+        m_record->function_name = DescribeFiberFunction(m_function);
 #endif
-        }
         m_stack_size = normalized_stack_size;
         m_stack_reserve_size = stack_reserve_size;
         m_stack_growable = stack_growable;
@@ -1642,8 +1668,11 @@ struct Fiber::Impl {
         m_switch.store(StateBits(FiberState::Ready),
                        std::memory_order_release);
         m_saved_errno = 0;
-        {
-            std::lock_guard<std::mutex> lock(m_failure_mutex);
+        // P9：绝大多数复用的 Fiber 从未失败（m_failure 为空）。空指针
+        // 不需要加锁清理；非空时也只有本线程能观察（bin 独占 + 唯一
+        // record 持有者），同样无需取 m_failure_mutex。第二把 pthread
+        // mutex 因此从每任务复用路径上消失。
+        if (m_failure) {
             m_failure = {};
         }
 #if defined(GO2CPP_MIGRATION_API) && GO2CPP_MIGRATION_API
@@ -2493,9 +2522,10 @@ std::unique_ptr<Fiber> Fiber::AcquireForScheduler(
     const auto capacity = std::min(
         kMaxFiberBinCapacity,
         bin_capacity == 0 ? kDefaultFiberBinCapacity : bin_capacity);
-    if (capacity != 0 && !s_thread_fiber_bin.entries.empty()) {
-        auto fiber = std::move(s_thread_fiber_bin.entries.back());
-        s_thread_fiber_bin.entries.pop_back();
+    const std::size_t slots = std::min(capacity, FiberBin::kSlots);
+    if (slots != 0 && s_thread_fiber_bin.count != 0) {
+        auto fiber =
+            std::move(s_thread_fiber_bin.entries[--s_thread_fiber_bin.count]);
         try {
             fiber->m_impl->reset_for_scheduler(
                 std::move(function), stack_size, stack_reserve_size,
@@ -2528,13 +2558,14 @@ void Fiber::RecycleForScheduler(std::unique_ptr<Fiber> fiber,
         !fiber->m_impl || fiber->m_impl->m_record.use_count() != 1) {
         return;
     }
-    try {
-        if (s_thread_fiber_bin.entries.size() < capacity) {
-            s_thread_fiber_bin.entries.emplace_back(std::move(fiber));
+    {
+        // P9：定长槽内联存放，不做堆分配，也不再有 vector 扩容路径。
+        const std::size_t slots = std::min(capacity, FiberBin::kSlots);
+        if (s_thread_fiber_bin.count < slots) {
+            s_thread_fiber_bin.entries[s_thread_fiber_bin.count++] =
+                std::move(fiber);
         }
-    } catch (...) {
-        // FiberBin 只是分配优化；容量不足或 OOM 时由 unique_ptr 正常
-        // 销毁对象，FiberStack 仍会回收到原有栈缓存。
+        // 槽位已满：unique_ptr 析构该 Fiber（FiberStack 仍回收到栈缓存）。
     }
 }
 

@@ -527,6 +527,31 @@ public:
     bool queued() const noexcept;
     bool started() const noexcept;
     bool cancellation_requested() const noexcept;
+    // ---- 调度器热队列接口（仅内部使用）--------------------------------
+    //
+    // 热队列（P 的 256 槽本地环、runnext 单槽）里只放**裸指针**：每个已注册
+    // 的非终态 G 都被注册表的自持强引用（m_registry_hold）保活着，因此队列
+    // 节点不需要再做一次控制块 +1。队列消费方必须在清掉节点标记之前先
+    // borrow_registry_strong()，否则注册表可能在两步之间回收该 G。
+    /// @brief 标记本 G 当前在某个热队列里有一个节点。
+    void mark_queue_node() noexcept {
+        m_node_live.store(true, std::memory_order_relaxed);
+    }
+    /// @brief 消费掉节点后清标记；必须晚于 borrow_registry_strong()。
+    void clear_queue_node() noexcept {
+        m_node_live.store(false, std::memory_order_relaxed);
+    }
+    /// @brief 本 G 是否还有热队列节点（注册表回收门槛）。
+    bool has_queue_node() const noexcept {
+        return m_node_live.load(std::memory_order_relaxed);
+    }
+    /// @brief 取注册表自持的强引用（一次控制块 +1）。
+    /// @note 只允许在节点标记仍为 true 时调用：注册表摘链要求标记已清，
+    ///       因此这里读到的是稳定引用，不会与 unlink 竞争。
+    std::shared_ptr<Task> borrow_registry_strong() const noexcept {
+        return m_registry_hold;
+    }
+
     // 最近一次运行该 G 的 P。外部唤醒者只把它作为亲和性提示，真正的
     // 执行权仍由 Task 状态机串行化。
     PId last_processor_id() const noexcept {
@@ -759,7 +784,8 @@ private:
     std::atomic<MId> m_affinity_machine{0};
     std::atomic<MId> m_locked_machine{0};
     bool m_binding_published{false};
-    mutable std::mutex m_failure_mutex;
+    // 失败传播：写入与读取都在 m_transition_mutex 下完成（临界区只有一次
+    // 指针赋值），不再为每个 Task 各带一把 std::mutex。
     std::exception_ptr m_failure;
     // 无分配救援队列链接。只在所属 Scheduler 的接纳互斥锁下修改，且
     // 不会形成环。
@@ -782,14 +808,34 @@ private:
     // 用轻量自旋锁替代 std::mutex：park/wake 往返的 6 次加锁从这里省下
     // 大部分指令数。
     mutable detail::HotSpinLock m_transition_mutex;
-    mutable std::mutex m_completion_mutex;
-    mutable core::ParkingCondition m_completion_condition;
-    // 完成信号：进入终态时递增一次。等待方用它与 notifier 建立 seq_cst
-    // 全序，从而支持「无等待者时 notifier 不加锁、直接返回」的快路径，
-    // 同时不可能丢唤醒。
-    std::atomic<std::uint32_t> m_completion_seq{0};
-    // 当前阻塞在 m_completion_condition 上的等待者数（只在持
-    // m_completion_mutex 时增减）。notifier 只在它非零时才加锁 + 唤醒。
+    // ---- registry 侵入式链表（阶段 1：vector<shared_ptr> → 侵入式链表）----
+    //
+    // 节点内嵌在 Task 里，注册/摘除都是 O(1) 的三次指针赋值；不再有
+    // vector 扩容（每次扩容整体搬迁元素，每个 shared_ptr 两次控制块原子）
+    // 与回收时的压缩搬迁。**强所有权由 m_registry_hold 自持**：注册时 +1、
+    // 摘除时把引用移交给调用方再释放，因此链表里的裸指针在「被链接期间」
+    // 永远有效 —— 不是裸指针裸回收，链上不存在悬空指针窗口。
+    Task* m_registry_prev{nullptr};
+    Task* m_registry_next{nullptr};
+    std::shared_ptr<Task> m_registry_hold;
+    // 热队列节点在位标记：为 true 时注册表不得回收本 G（队列里存的是裸指针）。
+    std::atomic<bool> m_node_live{false};
+
+    // ---- 完成等待原语：惰性创建（去每任务可等待句柄）------------------
+    //
+    // 绝大多数 G 从来没人 join。旧实现把 std::mutex + ParkingCondition
+    // （192B，且带 alignas(64)）内嵌进每个 Task：每个任务都要构造/析构
+    // 它们、多占 3 个缓存行，Task 因此被撑到 640B。现在只有**真正要阻塞
+    // 等待**的 G 才分配 CompletionWaiter；完成路径在无等待者时只做一次
+    // 原子读（原实现已有快路径），分配为零。
+    struct CompletionWaiter;
+    CompletionWaiter* completion_waiter() const;
+    mutable std::atomic<CompletionWaiter*> m_completion_waiter{nullptr};
+    // 当前阻塞在 CompletionWaiter::condition 上的等待者数。notifier 只在
+    // 它非零时才去取 waiter 并唤醒。等待者侧的发布顺序：
+    //   publish(waiter, release) -> waiters++ (seq_cst) -> 谓词复查
+    // notifier 侧：store(terminal, release) -> load(waiters, seq_cst)。
+    // 两条 seq_cst 操作构成全序，不会丢唤醒（Dekker）。
     mutable std::atomic<std::uint32_t> m_completion_waiters{0};
 };
 
