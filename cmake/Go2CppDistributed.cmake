@@ -60,10 +60,14 @@ elseif (EXISTS ${GO2CPP_DISTRIBUTED_ROOT}/src/relay/hub.cpp AND
         ${GO2CPP_DISTRIBUTED_ROOT}/src/relay/hub.cpp
         ${GO2CPP_DISTRIBUTED_ROOT}/src/relay/lease.cpp)
     set(GO2CPP_DISTRIBUTED_RELAY_LIB "")
-    if (TARGET go2cpp_socket_bufio_standalone)
+    if (TARGET go2cpp_network AND TARGET go2cpp_context AND TARGET go2cpp_scheduler)
+        set(GO2CPP_DISTRIBUTED_BASE_LIB
+            go2cpp_network go2cpp_context go2cpp_scheduler go2cpp_io go2cpp_sync)
+    elseif (TARGET go2cpp_socket_bufio_standalone)
         # 该静态库由 Go2CppBento.cmake 在 standalone 模式下创建，包含
         # socket/context/scheduler 等最小依赖集。
         set(GO2CPP_DISTRIBUTED_BASE_LIB go2cpp_socket_bufio_standalone)
+
     elseif (TARGET go2cpp_network AND TARGET go2cpp_context AND TARGET go2cpp_scheduler)
         set(GO2CPP_DISTRIBUTED_BASE_LIB
             go2cpp_network go2cpp_context go2cpp_scheduler go2cpp_io go2cpp_sync)
@@ -93,6 +97,10 @@ set_target_properties(go2cpp_distributed PROPERTIES
     SOVERSION 0)
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set_target_properties(go2cpp_distributed PROPERTIES INSTALL_RPATH "$ORIGIN")
+endif()
+# TCP 协调者需要 go2cpp::net::Socket/Address 等共享符号，所有分支统一补链接。
+if (TARGET go2cpp_network)
+    list(APPEND GO2CPP_DISTRIBUTED_BASE_LIB go2cpp_network)
 endif()
 target_link_libraries(go2cpp_distributed
     PUBLIC ${GO2CPP_DISTRIBUTED_RELAY_LIB} ${GO2CPP_DISTRIBUTED_BASE_LIB}
