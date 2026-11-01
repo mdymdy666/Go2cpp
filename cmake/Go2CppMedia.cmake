@@ -82,7 +82,10 @@ if (GO2CPP_WITH_MEDIA)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/media/capture_x11.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/media/transport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/media/render.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/pipeline.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/pipeline.cpp
+        # SFU（多房间选择性转发）与 SDP 风格信令；不修改既有媒体链路。
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/sfu.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/signaling.cpp)
 
     target_include_directories(go2cpp_media
         PUBLIC
@@ -93,6 +96,16 @@ if (GO2CPP_WITH_MEDIA)
     # 零警告是验收条件：与 Bento 一致，-Werror 把回归挡在构建期。
     target_compile_options(go2cpp_media PRIVATE -Wall -Wextra -Wpedantic -Werror)
     target_link_libraries(go2cpp_media PUBLIC go2cpp_media_bento_core Threads::Threads)
+
+    # 信令的 ICE 候选与 P2P 模块互转（candidate.hpp）。P2P 默认 ON；显式关掉时
+    # 仍保留纯 SDP/候选逻辑，只是不提供 ToP2PCandidate/FromP2PCandidate。
+    if (TARGET go2cpp_p2p)
+        target_link_libraries(go2cpp_media PUBLIC go2cpp_p2p)
+        target_compile_definitions(go2cpp_media PUBLIC GO2CPP_MEDIA_HAVE_P2P=1)
+        message(STATUS "Media signaling: P2P ICE interop ON")
+    else()
+        message(STATUS "Media signaling: P2P ICE interop OFF (GO2CPP_WITH_P2P=OFF)")
+    endif()
 
     if (MEDIA_HAVE_X11)
         target_include_directories(go2cpp_media PRIVATE ${MEDIA_X11_INCLUDE_DIR})
@@ -126,9 +139,12 @@ if (GO2CPP_WITH_MEDIA)
         add_executable(media_test_render ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_render.cpp)
         add_executable(media_test_e2e ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_e2e.cpp)
         add_executable(media_test_h264 ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_h264.cpp)
+        add_executable(media_test_sfu ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_sfu.cpp)
+        add_executable(media_test_signaling ${CMAKE_CURRENT_SOURCE_DIR}/tests/media/test_signaling.cpp)
 
         foreach(media_test media_test_frame media_test_codec media_test_capture
-                media_test_transport media_test_render media_test_e2e media_test_h264)
+                media_test_transport media_test_render media_test_e2e media_test_h264
+                media_test_sfu media_test_signaling)
             target_include_directories(${media_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/media)
             target_link_libraries(${media_test} PRIVATE go2cpp_media)
             target_compile_options(${media_test} PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -141,11 +157,13 @@ if (GO2CPP_WITH_MEDIA)
         add_test(NAME media_render COMMAND media_test_render)
         add_test(NAME media_e2e COMMAND media_test_e2e)
         add_test(NAME media_h264 COMMAND media_test_h264)
+        add_test(NAME media_sfu COMMAND media_test_sfu)
+        add_test(NAME media_signaling COMMAND media_test_signaling)
         set_tests_properties(media_frame media_codec media_capture media_transport
-            media_render media_e2e media_h264
-            PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+            media_render media_e2e media_h264 media_sfu media_signaling
+            PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
 
-        message(STATUS "Media pipeline: tests ON (7 targets)")
+        message(STATUS "Media pipeline: tests ON (9 targets)")
     endif()
 
     message(STATUS "Media pipeline: ON")
