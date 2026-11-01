@@ -85,3 +85,4 @@ include(cmake/Go2CppFrame.cmake)
 
 # 嵌入式存储（SQLite，GO2CPP_WITH_SQLITE 默认 OFF）。
 include(cmake/Go2CppStorage.cmake)
+include(cmake/Go2CppKv.cmake)
