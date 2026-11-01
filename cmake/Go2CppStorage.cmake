@@ -49,7 +49,9 @@ message(STATUS "SQLite storage: ON (sqlite3 ${GO2CPP_SQLITE3_VERSION}, "
 
 # 公共头只前置声明 sqlite3/sqlite3_stmt，不包含 <sqlite3.h>，所以 sqlite3
 # 的 include 路径与库都作为 PRIVATE 依赖；使用方需要原生句柄时自己链接。
-add_library(go2cpp_storage ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/db.cpp)
+add_library(go2cpp_storage
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/db.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/storage/orm.cpp)
 add_library(go2cpp::storage ALIAS go2cpp_storage)
 target_include_directories(go2cpp_storage
     PUBLIC
@@ -107,5 +109,32 @@ if (GO2CPP_STORAGE_TESTS)
     target_include_directories(go2cpp_storage_bench PRIVATE
         ${GO2CPP_SQLITE3_INCLUDE_DIRS})
     target_compile_options(go2cpp_storage_bench PRIVATE
+        -Wall -Wextra -Wpedantic)
+
+    # ORM 层测试：映射 / CRUD（1e6 行）/ 迁移 / 事务 / 查询 / 边界。
+    add_executable(go2cpp_storage_orm_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/storage/orm_test.cpp)
+    target_link_libraries(go2cpp_storage_orm_test PRIVATE go2cpp_storage)
+    # 反射桥接测试用 GO2CPP_REFLECT_FIELD，需要 reflect 模块的实现
+    # （FieldOps 里的 Serialize/WriteJson 等）。reflect 默认 ON；这里按
+    # target 存在性保护，standalone 构建缺 reflect 时只跳过该项测试。
+    if (TARGET go2cpp_reflect)
+        target_link_libraries(go2cpp_storage_orm_test PRIVATE go2cpp_reflect)
+    endif()
+    target_compile_options(go2cpp_storage_orm_test PRIVATE
+        -Wall -Wextra -Wpedantic)
+    add_test(NAME go2cpp_storage_orm_test
+             COMMAND go2cpp_storage_orm_test)
+    set_tests_properties(go2cpp_storage_orm_test PROPERTIES TIMEOUT 900)
+
+    # ORM 性能对比：原生 sqlite3 vs ORM（1e6 插入/查询/更新/删除）。
+    # 与 go2cpp_storage_bench 一样不注册 ctest——它是基准而不是回归测试。
+    add_executable(go2cpp_storage_orm_bench
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/storage/orm_bench.cpp)
+    target_link_libraries(go2cpp_storage_orm_bench PRIVATE
+        go2cpp_storage ${GO2CPP_SQLITE3_LIBRARIES})
+    target_include_directories(go2cpp_storage_orm_bench PRIVATE
+        ${GO2CPP_SQLITE3_INCLUDE_DIRS})
+    target_compile_options(go2cpp_storage_orm_bench PRIVATE
         -Wall -Wextra -Wpedantic)
 endif()

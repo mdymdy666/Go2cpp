@@ -427,7 +427,9 @@ Error EnsureStatement(DB& db, const std::string& sql, Stmt& target) {
 // Session
 // ===========================================================================
 
-Session::Session(DB& db) : m_db(&db) {}
+thread_local Session* Session::t_transaction_owner = nullptr;
+
+Session::Session(DB& db) : m_db(&db), m_raw(db.Handle()) {}
 Session::~Session() = default;
 
 Session::TableState* Session::StateLocked(const TableDef& table,
@@ -435,6 +437,9 @@ Session::TableState* Session::StateLocked(const TableDef& table,
     if (table.columns == nullptr) {
         error = Error(kErrMapping, 0, "table mapping has no columns");
         return nullptr;
+    }
+    if (table.columns == m_last_table_key && m_last_table != nullptr) {
+        return m_last_table;
     }
     const auto cached = m_tables.find(table.columns);
     if (cached != m_tables.end()) {
@@ -453,6 +458,8 @@ Session::TableState* Session::StateLocked(const TableDef& table,
         error = built;
         return nullptr;
     }
+    m_last_table_key = table.columns;
+    m_last_table = raw;
     return raw;
 }
 
@@ -475,7 +482,7 @@ Stmt* Session::StatementLocked(const std::string& sql, Error& error) {
 
 Result<std::int64_t> Session::InsertImpl(const TableDef& table, void* object,
                                          bool fill_key) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto lock = Lock();
     Error error;
     TableState* state = StateLocked(table, error);
     if (state == nullptr) {
@@ -513,7 +520,8 @@ Result<std::int64_t> Session::InsertImpl(const TableDef& table, void* object,
     if (!statement->Done()) {
         return Error(kErrMapping, 0, "INSERT statement did not complete");
     }
-    const std::int64_t row_id = m_db->LastInsertRowId();
+    const std::int64_t row_id = static_cast<std::int64_t>(
+        sqlite3_last_insert_rowid(m_raw));
     if (fill_key && state->auto_increment && state->primary_key >= 0) {
         const Column& key = table.columns[state->primary_key];
         if (key.assign != nullptr) {
@@ -524,7 +532,7 @@ Result<std::int64_t> Session::InsertImpl(const TableDef& table, void* object,
 }
 
 Result<int> Session::UpdateImpl(const TableDef& table, const void* object) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto lock = Lock();
     Error error;
     TableState* state = StateLocked(table, error);
     if (state == nullptr) {
@@ -565,11 +573,11 @@ Result<int> Session::UpdateImpl(const TableDef& table, const void* object) {
     if (!statement->Done()) {
         return Error(kErrMapping, 0, "UPDATE statement did not complete");
     }
-    return m_db->Changes();
+    return sqlite3_changes(m_raw);
 }
 
 Result<int> Session::DeleteImpl(const TableDef& table, std::int64_t key) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto lock = Lock();
     Error error;
     TableState* state = StateLocked(table, error);
     if (state == nullptr) {
@@ -579,10 +587,10 @@ Result<int> Session::DeleteImpl(const TableDef& table, std::int64_t key) {
     if (Error prepared = EnsureStatement(*m_db, state->delete_sql, *statement)) {
         return prepared;
     }
+    const Value key_value(key);
     if (Error reset = statement->Reset()) {
         return reset;
     }
-    const Value key_value(key);
     if (Error bound = statement->BindValues(&key_value, 1)) {
         return bound;
     }
@@ -592,12 +600,12 @@ Result<int> Session::DeleteImpl(const TableDef& table, std::int64_t key) {
     if (!statement->Done()) {
         return Error(kErrMapping, 0, "DELETE statement did not complete");
     }
-    return m_db->Changes();
+    return sqlite3_changes(m_raw);
 }
 
 Result<bool> Session::FindImpl(const TableDef& table, std::int64_t key,
                                void* object) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto lock = Lock();
     Error error;
     TableState* state = StateLocked(table, error);
     if (state == nullptr) {
@@ -607,10 +615,10 @@ Result<bool> Session::FindImpl(const TableDef& table, std::int64_t key,
     if (Error prepared = EnsureStatement(*m_db, state->find_sql, *statement)) {
         return prepared;
     }
+    const Value key_value(key);
     if (Error reset = statement->Reset()) {
         return reset;
     }
-    const Value key_value(key);
     if (Error bound = statement->BindValues(&key_value, 1)) {
         return bound;
     }
@@ -639,7 +647,7 @@ Result<std::int64_t> Session::ForEachRow(const std::string& sql,
                                          const Value* params,
                                          std::size_t param_count, RowSink sink,
                                          void* context) {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto lock = Lock();
     Error error;
     Stmt* statement = StatementLocked(sql, error);
     if (statement == nullptr) {
@@ -674,12 +682,12 @@ Result<std::int64_t> Session::ForEachRow(const std::string& sql,
 }
 
 std::size_t Session::CachedStatementCount() const {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto lock = Lock();
     return m_statements.size();
 }
 
 void Session::ClearStatementCache() {
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    auto lock = Lock();
     // 表状态里的 CRUD 语句与查询语句一并释放；下次使用时惰性重建
     // （TableState 保留 SQL 文本与列索引，不丢映射信息）。
     for (auto& entry : m_tables) {

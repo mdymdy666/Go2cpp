@@ -1079,8 +1079,12 @@ public:
      * @param body 无参可调用对象，返回 `Error` 或 `void`。
      * @return 提交结果，或 `body` 的错误（已回滚），或提交错误。
      *
-     * @note 递归互斥量保证 `body` 内继续调用本会话不会死锁；`body` 抛异常时
-     *       由 `storage::Transaction` 的 RAII 回滚后继续向外传播。
+     * @details 事务持有会话锁；同一线程在 `body` 内继续调用本会话时通过
+     *          thread-local 标记跳过重复加锁（不重入锁，热路径也不用
+     *          recursive_mutex）。`body` 抛异常时由 `storage::Transaction`
+     *          的 RAII 回滚后继续向外传播。
+     * @warning 不要在 `body` 里把同一个 `Session` 交给其它线程使用：
+     *          那个线程会阻塞在会话锁上直到事务结束。
      */
     template <typename F>
     Error Transaction(F&& body) {
@@ -1088,7 +1092,10 @@ public:
         static_assert(std::is_same_v<ResultType, Error> ||
                           std::is_same_v<ResultType, void>,
                       "Session::Transaction body must return Error or void");
-        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
+        if (t_transaction_owner != this) {
+            lock.lock();
+        }
         if (m_db->InTransaction()) {
             return Error(kErrTransaction, 0,
                          "Transaction() called inside an active transaction");
@@ -1097,6 +1104,9 @@ public:
         if (Error error = transaction.Begin()) {
             return error;
         }
+        // 事务体内同线程调用不再加锁；离开作用域（含异常）恢复原标记。
+        TransactionOwnerGuard guard{t_transaction_owner};
+        t_transaction_owner = this;
         if constexpr (std::is_same_v<ResultType, Error>) {
             if (Error error = body()) {
                 (void)transaction.Rollback();
@@ -1133,15 +1143,40 @@ public:
 private:
     struct TableState;
 
+    /// @brief 事务期间恢复 thread-local 标记的 RAII 守卫。
+    struct TransactionOwnerGuard {
+        Session* previous = nullptr;
+        ~TransactionOwnerGuard() { Session::t_transaction_owner = previous; }
+    };
+
     /// @brief 取/建表状态；失败写 `error` 并返回 nullptr。
     TableState* StateLocked(const TableDef& table, Error& error);
     /// @brief 取/建预编译语句；失败写 `error` 并返回 nullptr。
     Stmt* StatementLocked(const std::string& sql, Error& error);
 
+    /// @brief 加会话锁；事务 body 内同线程已持锁时返回未上锁的 unique_lock。
+    /// @note 非事务路径每次加锁（互斥量无竞争快路径）；事务路径零锁。
+    std::unique_lock<std::mutex> Lock() const {
+        std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
+        if (t_transaction_owner != this) {
+            lock.lock();
+        }
+        return lock;
+    }
+
     DB* m_db = nullptr;
-    mutable std::recursive_mutex m_mutex;
+    /// @brief 缓存的原生句柄：避免每行 `LastInsertRowId()`/`Changes()` 走
+    ///        `DB` 的互斥量与 `Handle()`。生命周期由 `DB` 保证（Session 不得
+    ///        比 DB 活得久）。
+    sqlite3* m_raw = nullptr;
+    mutable std::mutex m_mutex;
+    /// @brief 当前线程正持有本会话事务的标记（见 Transaction）。
+    static thread_local Session* t_transaction_owner;
     std::unordered_map<const void*, std::unique_ptr<TableState>> m_tables;
     std::unordered_map<std::string, Stmt> m_statements;
+    /// @brief 最近使用的表状态：单表热路径免哈希查找。
+    const void* m_last_table_key = nullptr;
+    TableState* m_last_table = nullptr;
 };
 
 /**

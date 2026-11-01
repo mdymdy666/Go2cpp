@@ -170,7 +170,7 @@ struct Sample {
 
 GO2CPP_ORM_TABLE(Sample, "samples",
                  GO2CPP_ORM_COLUMN(Sample, id).PrimaryKey().AutoIncrement(),
-                 GO2CPP_ORM_COLUMN(Sample, value).Indexed(),
+                 GO2CPP_ORM_COLUMN(Sample, value),
                  GO2CPP_ORM_COLUMN(Sample, tag))
 
 namespace {
