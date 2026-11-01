@@ -448,18 +448,19 @@ bool WriteMarkdown(const std::string& path, const Summary& summary) {
 
     // ---- 表 B ----
     text += "## 3. 场景 B：每个池\n\n";
-    text += "| 池 | 时机 | 首次/中位 | p95 | 稳态/二次 | ΔVmRSS | Δheap | ΔVmSize | 槽数 | 单槽 | 来源 |\n";
-    text += "|---|---|---|---|---|---|---|---|---|---|---|\n";
+    text += "| 池 | 时机 | 首次/中位 | p95 | 稳态/二次 | ΔVmRSS | ΔVmHWM | Δheap | ΔVmSize | 槽数 | 单槽 | 来源 |\n";
+    text += "|---|---|---|---|---|---|---|---|---|---|---|---|\n";
     for (const PoolMeasurement& measurement : summary.pools) {
-        char buffer[900];
+        char buffer[960];
         std::snprintf(
             buffer, sizeof(buffer),
-            "| `%s` | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n",
+            "| `%s` | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | `%s` |\n",
             measurement.info->id, KindName(measurement.info->kind),
             TimeOrDash(measurement.median_init_ns).c_str(),
             TimeOrDash(measurement.p95_init_ns).c_str(),
             TimeOrDash(measurement.median_steady_ns).c_str(),
             HumanKiBDelta(measurement.memory.rss_kib).c_str(),
+            HumanKiBDelta(measurement.memory.hwm_kib).c_str(),
             MemoryText(measurement).c_str(),
             VaText(measurement).c_str(),
             SlotsText(*measurement.info).c_str(),
