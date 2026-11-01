@@ -350,7 +350,22 @@ bool KvTable::ParseBinary(const std::uint8_t* data, std::size_t size, KvTable* o
         return false;
     }
     offset += consumed;
+    const std::size_t expected = static_cast<std::size_t>(count);
     KvTable parsed;
+    // 旧实现逐条 Set：512 键要触发 ~10 次 RebuildIndex（每次把已插入的键全部
+    // 重新哈希一遍），实测 20.0 us/次。这里一次性把 entries 与哈希索引都按
+    // 最终规模开好，解析期间不再扩容、不再重建，只做一次哈希。
+    parsed.m_entries.reserve(expected);
+    const bool indexed = expected > kLinearScanLimit;
+    std::size_t mask = 0;
+    if (indexed) {
+        std::size_t capacity = 16;
+        while (capacity < expected * 2) {
+            capacity <<= 1;
+        }
+        parsed.m_index.assign(capacity, IndexSlot{});
+        mask = capacity - 1;
+    }
     for (std::uint64_t i = 0; i < count; ++i) {
         std::string key;
         std::string value;
@@ -364,11 +379,48 @@ bool KvTable::ParseBinary(const std::uint8_t* data, std::size_t size, KvTable* o
             return false;
         }
         offset += consumed;
-        parsed.Set(std::move(key), std::move(value));
+        // 与 Set 相同的语义：重复键覆盖值、保留首次出现的位置。
+        std::size_t found = kNoIndex;
+        if (indexed) {
+            const std::uint64_t hash = HashKey(key);
+            std::size_t slot = static_cast<std::size_t>(hash) & mask;
+            for (;;) {
+                IndexSlot& probe = parsed.m_index[slot];
+                if (probe.entry_plus_one == 0) {
+                    probe.hash = hash;
+                    probe.entry_plus_one =
+                        static_cast<std::uint32_t>(parsed.m_entries.size() + 1);
+                    ++parsed.m_index_used;
+                    break;
+                }
+                if (probe.hash == hash &&
+                    parsed.m_entries[probe.entry_plus_one - 1].first == key) {
+                    found = static_cast<std::size_t>(probe.entry_plus_one - 1);
+                    break;
+                }
+                slot = (slot + 1) & mask;
+            }
+        } else {
+            for (std::size_t j = 0; j < parsed.m_entries.size(); ++j) {
+                if (parsed.m_entries[j].first == key) {
+                    found = j;
+                    break;
+                }
+            }
+        }
+        if (found != kNoIndex) {
+            parsed.m_entries[found].second = std::move(value);
+            continue;
+        }
+        parsed.m_entries.emplace_back(std::move(key), std::move(value));
     }
     if (offset != size) {
         SetError(error, "trailing bytes in kv payload");
         return false;
+    }
+    if (!indexed && parsed.m_entries.size() > kLinearScanLimit) {
+        // count <= kLinearScanLimit 时不可能走到这里；保留重建以与 Set 一致。
+        parsed.RebuildIndex();
     }
     *out = std::move(parsed);
     return true;

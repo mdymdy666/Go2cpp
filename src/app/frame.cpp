@@ -15,21 +15,70 @@
 namespace go2cpp::app {
 namespace {
 
-/// @brief 帧类型是否已知。
-bool KnownType(FrameType type) noexcept {
-    switch (type) {
-        case FrameType::kData:
-        case FrameType::kHeaders:
-        case FrameType::kPriority:
-        case FrameType::kRstStream:
-        case FrameType::kSettings:
-        case FrameType::kPing:
-        case FrameType::kGoAway:
-        case FrameType::kWindowUpdate:
-        case FrameType::kResourceIndex:
-            return true;
+/**
+ * @brief 一次未对齐 32 位读 + 字节序转换（大端网络序 → 主机序）。
+ * @details 旧实现逐字节 `movzx + shift + or`（4 次 load、3 次 shift、3 次 or），
+ *          这里是 1 次 `mov` + 1 条 `bswap`。调用方契约仍是「至少 4 字节可读」。
+ */
+inline std::uint32_t LoadBE32(const std::uint8_t* p) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    std::uint32_t value = 0;
+    std::memcpy(&value, p, sizeof(value));
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    return value;
+#else
+    return __builtin_bswap32(value);
+#endif
+#else
+    return (static_cast<std::uint32_t>(p[0]) << 24) |
+           (static_cast<std::uint32_t>(p[1]) << 16) |
+           (static_cast<std::uint32_t>(p[2]) << 8) | static_cast<std::uint32_t>(p[3]);
+#endif
+}
+
+/// @brief 一次未对齐 16 位读 + 字节序转换。
+inline std::uint16_t LoadBE16(const std::uint8_t* p) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    std::uint16_t value = 0;
+    std::memcpy(&value, p, sizeof(value));
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    return value;
+#else
+    return __builtin_bswap16(value);
+#endif
+#else
+    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8) |
+                                      static_cast<std::uint16_t>(p[1]));
+#endif
+}
+
+/// @brief 一次未对齐 64 位读 + 字节序转换。
+inline std::uint64_t LoadBE64(const std::uint8_t* p) noexcept {
+#if defined(__GNUC__) || defined(__clang__)
+    std::uint64_t value = 0;
+    std::memcpy(&value, p, sizeof(value));
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    return value;
+#else
+    return __builtin_bswap64(value);
+#endif
+#else
+    std::uint64_t value = 0;
+    for (int i = 0; i < 8; ++i) {
+        value = (value << 8) | static_cast<std::uint64_t>(p[i]);
     }
-    return false;
+    return value;
+#endif
+}
+
+/// @brief 帧类型是否已知（位图判定：一条 `bt`/`shr+and`）。
+bool KnownType(FrameType type) noexcept {
+    // 合法类型：0x00..0x04、0x06、0x07、0x08、0x0d。
+    constexpr std::uint32_t kKnown = (1u << 0x00) | (1u << 0x01) | (1u << 0x02) |
+                                     (1u << 0x03) | (1u << 0x04) | (1u << 0x06) |
+                                     (1u << 0x07) | (1u << 0x08) | (1u << 0x0d);
+    const std::uint32_t value = static_cast<std::uint32_t>(type);
+    return value <= 0x0du && ((kKnown >> value) & 1u) != 0;
 }
 
 /**
@@ -49,10 +98,10 @@ FrameStatus DecodeImpl(const std::uint8_t* data, std::size_t size,
     if (size < kFrameHeaderBytes) {
         return FrameStatus::kNeedMoreData;
     }
-    const std::uint32_t length = (static_cast<std::uint32_t>(data[0]) << 16) |
-                                 (static_cast<std::uint32_t>(data[1]) << 8) |
-                                 static_cast<std::uint32_t>(data[2]);
-    const FrameType type = static_cast<FrameType>(data[3]);
+    // 一次 32 位大端读同时拿到 length(高 24 位) 与 type(低 8 位)。
+    const std::uint32_t head = LoadBE32(data);
+    const std::uint32_t length = head >> 8;
+    const FrameType type = static_cast<FrameType>(head & 0xFFu);
     if (!KnownType(type)) {
         return FrameStatus::kInvalidType;
     }
@@ -309,25 +358,11 @@ void PutString(std::vector<std::uint8_t>& out, std::string_view value) {
     out.insert(out.end(), value.begin(), value.end());
 }
 
-std::uint16_t GetU16(const std::uint8_t* in) noexcept {
-    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(in[0]) << 8) |
-                                      static_cast<std::uint16_t>(in[1]));
-}
+std::uint16_t GetU16(const std::uint8_t* in) noexcept { return LoadBE16(in); }
 
-std::uint32_t GetU32(const std::uint8_t* in) noexcept {
-    return (static_cast<std::uint32_t>(in[0]) << 24) |
-           (static_cast<std::uint32_t>(in[1]) << 16) |
-           (static_cast<std::uint32_t>(in[2]) << 8) |
-           static_cast<std::uint32_t>(in[3]);
-}
+std::uint32_t GetU32(const std::uint8_t* in) noexcept { return LoadBE32(in); }
 
-std::uint64_t GetU64(const std::uint8_t* in) noexcept {
-    std::uint64_t value = 0;
-    for (int i = 0; i < 8; ++i) {
-        value = (value << 8) | static_cast<std::uint64_t>(in[i]);
-    }
-    return value;
-}
+std::uint64_t GetU64(const std::uint8_t* in) noexcept { return LoadBE64(in); }
 
 bool GetVarint(const std::uint8_t* in, std::size_t size, std::uint64_t* value,
                std::size_t* consumed) noexcept {

@@ -162,6 +162,11 @@ struct Stream {
     StreamKind kind = StreamKind::kKv;         ///< 业务类型。
     std::uint16_t weight = 16;                 ///< 权重（1..256）。
     std::uint32_t parent_id = 0;               ///< 依赖树父节点（0=根）。
+    /// 依赖树父节点的**直接指针缓存**：父链遍历（`HasReadyAncestor`/`IsAncestor`）
+    /// 不再每跳做一次 `std::map::find`（红黑树 ~log n 次指针追逐），改成指针链。
+    /// 由 `StreamTable` 维护；父流被 `Erase`/`PruneClosedStreams` 删除时置空，
+    /// 与「父不存在」的旧语义一致（视为无父）。
+    Stream* parent = nullptr;
     bool local = false;                        ///< 是否本端发起。
     bool opened = false;                       ///< 是否已收到/发出 HEADERS。
     bool local_closed = false;                 ///< 本端发送方向已关闭。
@@ -427,6 +432,8 @@ class StreamTable {
     bool HasReadyAncestor(const Stream& stream) const noexcept;
     bool IsReady(const Stream& stream) const noexcept;
     void MarkClosed(Stream& stream) noexcept;
+    /// @brief 把「父指针指向 `stream`」的子流改成无父（删除流前调用）。
+    void ClearChildParents(Stream& stream) noexcept;
     std::uint32_t AllocateLocalId();
     void RecordCreated();
     std::size_t LiveStreamCount() const noexcept;

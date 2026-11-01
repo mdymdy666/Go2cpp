@@ -70,9 +70,18 @@ std::vector<std::uint8_t> Encode(const Frame& frame, const Config& config = {});
  * @param out 输出 App 帧。
  * @param consumed 非空时写入消耗字节数（仅 kOk）。
  * @param config 桥接配置。
+ * @note 载荷**拷贝**进 `out->payload`（调用方可以长期持有）。
  */
 Status Decode(const std::uint8_t* data, std::size_t size, Frame* out,
               std::size_t* consumed = nullptr, const Config& config = {});
+
+/**
+ * @brief 零拷贝版本：载荷以借用视图返回，指向 `data` 内部。
+ * @details 省掉「Bento 解码 → App 解码」之间的第二次拷贝与一次分配；
+ *          生命周期与 `data` 绑定（见 `frame.hpp` 的借用契约）。
+ */
+Status DecodeView(const std::uint8_t* data, std::size_t size, Frame* out,
+                  std::size_t* consumed = nullptr, const Config& config = {});
 
 /**
  * @brief 流式桥接解码器（处理粘包/半包）。
@@ -88,8 +97,12 @@ class Decoder {
     /// @brief 追加字节。
     void Append(const std::uint8_t* data, std::size_t size);
 
-    /// @brief 取出下一个 App 帧。
+    /// @brief 取出下一个 App 帧（载荷拷贝，可跨 Append 持有）。
     Status Next(Frame* out);
+
+    /// @brief 取出下一个 App 帧，载荷借用解码器内部缓冲（零拷贝）。
+    /// @warning 视图只在解码器缓冲下一次 `Append`/`NextView`/`Clear` 之前有效。
+    Status NextView(Frame* out);
 
     /// @brief 未消费字节数。
     std::size_t PendingBytes() const noexcept;

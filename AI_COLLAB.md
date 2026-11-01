@@ -785,3 +785,36 @@ errno noinline），不是寄存器保存。
 - **状态**：完成，未提交（多 agent 共享工作树）。报告：`/tmp/jitter_degradation.md`。
   已知边界：未与真实 UDP `tc netem` 联合压测；未接进 `pipeline.cpp`（按任务边界
   只新增不改现有）；单线程；补发队列固定 8 槽；末包丢包不可检测。
+
+
+## 2026-11-01 · app 层剩余优化（流表 ready 堆/帧零视图/KV Parse/SHA-NI/锁）
+
+- **改动内容**
+  - `StreamTable`：`PickNext` 堆顶命中时不再 `RemoveReady`+`PushReady`（旧实现每帧 2 次
+    O(log n) sift）；`ConsumePending` 清 pending 后**留在堆里**（补产不改变 finish，堆序仍有效），
+    只有无后续帧才出堆；`ChargeFinish` 权重为 2 的幂时用查表左移替代 64 位 `idiv`；
+    `Stream` 新增 `Stream* parent` 指针缓存，`HasReadyAncestor`/`IsAncestor` 不再每跳
+    `std::map::find`（`Erase`/`PruneClosedStreams` 前把子流父指针置空）。
+  - `Frame`：`GetU16/U32/U64` 改为一次未对齐 `memcpy` + `bswap`；`DecodeImpl` 一次 32 位
+    大端读同时取 length/type；`KnownType` 改位图判定。
+  - `bento_bridge`：新增 `DecodeView` 与 `Decoder::NextView`（Bento→App 载荷零拷贝，
+    旧路径每帧 1 次 malloc + 2 次 memcpy）。
+  - `KvTable::ParseBinary`：按 count 一次性预分配 entries + 哈希索引，解析期不再
+    重建索引（旧实现 512 键触发 ~10 次全量重哈希），重复键仍原地覆盖。
+  - 资源：新增 `include/go2cpp/app/sha256_ni.hpp`（x86 SHA-NI 压缩函数 + 运行时
+    `__builtin_cpu_supports("sha")` 检测 + 软件回退），`resource.cpp` 三处 SHA 接入。
+  - `Connection`：`m_closed` 改 `std::atomic<bool>`，`closed()` 无锁读（0.23 ns vs 4.64 ns）。
+- **关键文件**：`include/go2cpp/app/{stream_table,connection,bento_bridge,sha256_ni}.hpp`、
+  `src/app/{stream_table,frame,kv,resource,connection,bento_bridge}.cpp`。
+- **测试**：`ctest -R app_` **8/8 通过**（63 场景、24069 断言 0 失败）；
+  SHA-256 另做 NIST 向量 + 301 组长度 + 200 组随机分片对拍，资源 1 GiB 摘要逐字节一致。
+- **数据**（CPU 时间口径、同核、5 轮 min，load 5~7）：
+  `PickNext` 256 流 60.26→**7.01 ns/op**（8.6×）；flush 256 流 112.57→**60.65 ns/帧**（1.86×）；
+  flush 256 流依赖树 121.84→**59.50**（2.05×）；`KvTable::ParseBinary` 512 键
+  18320→**10746 ns**（1.70×，分配 16→**2 次/Parse**）；`ResourceReceiver` 1 GiB
+  2597→**575.6 ms（394→1779 MiB/s，4.5×）**；SHA-256 0.42→**2.29 GB/s**（5.3×）；
+  帧视图解码 3.26→3.21 ns。1e8 帧压测：256 流 116.68→**59.65 ns/帧（16.77 Mfps）**，
+  RSS 3.4~3.9 MiB 零增长。
+- **状态**：完成，未 commit。报告 `/tmp/asm_app_rest.md`。
+  未做（有量化理由）：ready 堆数组冗余 finish/id（再省 5~8 ns/帧）、KvTable arena+view
+  （改所有权 API）、Connection 无锁化（上限 7.6%）。

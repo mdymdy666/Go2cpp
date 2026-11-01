@@ -10,6 +10,7 @@
 #include "go2cpp/app/stream_table.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <limits>
 
@@ -351,6 +352,7 @@ Stream* StreamTable::CreateLocal(StreamKind kind, FrameProducerPtr producer,
     stream->kind = kind;
     stream->weight = weight == 0 ? m_config.default_weight : std::min<std::uint16_t>(weight, 256);
     stream->parent_id = parent;
+    stream->parent = parent == 0 ? nullptr : Find(parent);
     stream->local = true;
     stream->send_window = m_initial_window;
     stream->recv_window = m_initial_window;
@@ -416,6 +418,7 @@ bool StreamTable::Erase(std::uint32_t id) noexcept {
     if (stream.state != StreamState::kClosed && m_live_streams > 0) {
         --m_live_streams;
     }
+    ClearChildParents(stream);
     DetachIndexes(stream);
     m_streams.erase(it);
     return true;
@@ -649,20 +652,24 @@ bool StreamTable::IsReady(const Stream& stream) const noexcept {
 }
 
 bool StreamTable::HasReadyAncestor(const Stream& stream) const noexcept {
-    std::uint32_t parent = stream.parent_id;
+    const Stream* parent = stream.parent;
     std::uint32_t guard = 0;
-    while (parent != 0 && guard < m_streams.size() + 1) {
-        const auto it = m_streams.find(parent);
-        if (it == m_streams.end()) {
-            return false;
-        }
-        if (IsReady(*it->second)) {
+    while (parent != nullptr && guard < m_streams.size() + 1) {
+        if (IsReady(*parent)) {
             return true;
         }
-        parent = it->second->parent_id;
+        parent = parent->parent;
         ++guard;
     }
     return false;
+}
+
+void StreamTable::ClearChildParents(Stream& stream) noexcept {
+    for (auto& item : m_streams) {
+        if (item.second->parent == &stream) {
+            item.second->parent = nullptr;
+        }
+    }
 }
 
 Stream* StreamTable::PickNext(std::uint32_t max_payload) {
@@ -679,16 +686,22 @@ Stream* StreamTable::PickNext(std::uint32_t max_payload) {
     m_held.clear();
     Stream* best = nullptr;
     while (!m_ready.empty()) {
+        // 堆顶即 finish 最小的流：命中时**不做任何堆操作**直接返回。
+        // 旧实现对所有候选都 RemoveReady+PushReady（每帧 2 次 O(log n) sift），
+        // 256 流规模下这是 ~600ns/帧 的纯浪费；这里把「留在堆里」当常态，
+        // 只有真正要让位的流（关闭/窗口不足/父优先）才出堆。
         Stream* stream = m_ready.front();
-        RemoveReady(*stream);
         if (stream->opened && !stream->can_send()) {
-            continue;  // 已关闭/被重置：不再参与调度。
+            RemoveReady(*stream);  // 已关闭/被重置：不再参与调度。
+            continue;
         }
         if (!IsReady(*stream)) {
             // 窗口在入堆后被吃掉：等对端 WINDOW_UPDATE 后由 refill 重新入堆。
+            RemoveReady(*stream);
             continue;
         }
         if (HasReadyAncestor(*stream)) {
+            RemoveReady(*stream);
             m_held.push_back(stream);  // 父优先：本轮先让父流走。
             continue;
         }
@@ -699,12 +712,8 @@ Stream* StreamTable::PickNext(std::uint32_t max_payload) {
         PushReady(*stream);
     }
     m_held.clear();
-    if (best != nullptr) {
-        // 返回后流仍持有 pending（调用方可能还没写出）：保持在就绪堆里，
-        // 下一次 PickNext 仍能选中它——与原「每轮扫全表」的语义一致。
-        // 调用方写出帧后必须调 ConsumePending，届时才真正出堆。
-        PushReady(*best);
-    }
+    // best 仍留在就绪堆里：调用方写出帧后必须调 ConsumePending 释放 pending；
+    // 若调用方还没写出就再次 PickNext，仍会选中它（与旧语义一致）。
     return best;
 }
 
@@ -757,12 +766,16 @@ bool StreamTable::ConsumeSend(Stream& stream, std::size_t bytes) noexcept {
 }
 
 void StreamTable::ConsumePending(Stream& stream) noexcept {
-    RemoveReady(stream);
     stream.has_pending = false;
     stream.pending.Clear();  // 保留 payload 容量供下一帧复用。
     if (stream.producer && !stream.producer_done && !stream.closed()) {
         AddIdle(stream);  // 下一帧的生产候选（由 PickNext 补产，保持 O(1)/帧）。
+        // 关键：**不从 ready 堆里摘除**。稳态下这条流是堆顶，下轮 PickNext
+        // 补产一帧后直接命中堆顶；旧实现「出堆 → 补产 → 再入堆」等于每帧
+        // 多 2 次 O(log n) 的 sift。补产不改变 finish，堆序因此保持有效。
+        return;
     }
+    RemoveReady(stream);  // 没有后续帧：立即出堆。
 }
 
 void StreamTable::Requeue(Stream& stream) noexcept {
@@ -771,13 +784,41 @@ void StreamTable::Requeue(Stream& stream) noexcept {
     }
 }
 
+namespace {
+
+/// @brief 2 的幂权重 → `20 - log2(weight)`；非 2 的幂为 0xFF。
+constexpr std::array<std::uint8_t, 257> MakePow2Shift() {
+    std::array<std::uint8_t, 257> table{};
+    for (std::uint32_t w = 1; w <= 256; ++w) {
+        table[w] = 0xFF;
+        for (int k = 0; k <= 20; ++k) {
+            if ((1u << k) == w) {
+                table[w] = static_cast<std::uint8_t>(20 - k);
+                break;
+            }
+        }
+    }
+    return table;
+}
+
+constexpr std::array<std::uint8_t, 257> kPow2Shift = MakePow2Shift();
+
+}  // namespace
+
 void StreamTable::ChargeFinish(Stream& stream, std::size_t bytes) noexcept {
     if (bytes == 0) {
         return;
     }
     const std::uint32_t weight = std::max<std::uint16_t>(1, stream.weight);
-    stream.finish += static_cast<std::int64_t>(bytes) * (1 << 20) / weight;
-    // 理论上发送后流已出堆；若调用方在其它时机推进信用，这里维持堆序。
+    // 旧实现每帧一次 64 位除法（idiv ~20-40 周期）。权重在 [1,256] 且默认
+    // 16，2 的幂时 `bytes * 2^20 / weight` 精确等价于定长左移，查表 O(1)。
+    const std::uint8_t shift = weight <= 256 ? kPow2Shift[weight] : 0xFF;
+    if (shift != 0xFF) {
+        stream.finish += static_cast<std::int64_t>(bytes) << shift;
+    } else {
+        stream.finish += static_cast<std::int64_t>(bytes) * (1 << 20) / weight;
+    }
+    // 流仍在就绪堆里时 finish 变大 → 只需下沉（finish 单调增，永不需上浮）。
     if (stream.ready_slot != Stream::kNoSlot) {
         SiftDown(stream.ready_slot);
     }
@@ -887,17 +928,17 @@ bool StreamTable::IsAncestor(std::uint32_t ancestor, std::uint32_t id) const noe
     if (ancestor == 0 || ancestor == id) {
         return false;
     }
-    std::uint32_t current = id;
+    const Stream* stream = Find(id);
+    if (stream == nullptr) {
+        return false;
+    }
+    const Stream* parent = stream->parent;
     std::size_t guard = 0;
-    while (current != 0 && guard <= m_streams.size() + 1) {
-        const auto it = m_streams.find(current);
-        if (it == m_streams.end()) {
-            return false;
-        }
-        current = it->second->parent_id;
-        if (current == ancestor) {
+    while (parent != nullptr && guard <= m_streams.size() + 1) {
+        if (parent->id == ancestor) {
             return true;
         }
+        parent = parent->parent;
         ++guard;
     }
     return false;
@@ -919,6 +960,7 @@ bool StreamTable::SetPriority(std::uint32_t id, std::uint32_t parent, std::uint1
         return false;
     }
     stream->parent_id = parent;
+    stream->parent = parent == 0 ? nullptr : Find(parent);
     stream->weight = weight == 0 ? 1 : std::min<std::uint16_t>(weight, 256);
     return true;
 }
@@ -974,6 +1016,7 @@ void StreamTable::PruneClosedStreams() {
         if (stream.state != StreamState::kClosed) {
             continue;
         }
+        ClearChildParents(stream);
         DetachIndexes(stream);
         m_streams.erase(it);
         ++m_retired_streams;

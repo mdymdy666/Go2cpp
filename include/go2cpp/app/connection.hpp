@@ -358,7 +358,7 @@ class Connection {
     bool m_preface_received = false;          ///< 是否收到对端 preface。
     bool m_settings_received = false;         ///< 是否收到对端 SETTINGS。
     bool m_started = false;                   ///< 是否已 Start。
-    bool m_closed = false;                    ///< 是否已关闭。
+    std::atomic<bool> m_closed{false};        ///< 是否已关闭（closed() 无锁读）。
     bool m_goaway_received = false;           ///< 是否收到 GOAWAY。
     bool m_goaway_sent = false;               ///< 是否发送 GOAWAY。
     ErrorCode m_close_error = ErrorCode::kNoError;  ///< 关闭错误码。

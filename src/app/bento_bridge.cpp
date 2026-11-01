@@ -112,6 +112,37 @@ Status Decode(const std::uint8_t* data, std::size_t size, Frame* out,
     return Status::kOk;
 }
 
+Status DecodeView(const std::uint8_t* data, std::size_t size, Frame* out,
+                  std::size_t* consumed, const Config& config) {
+    if (out == nullptr || (data == nullptr && size != 0)) {
+        return Status::kBadPayload;
+    }
+    go2cpp::bento::net::FrameView view;
+    std::size_t bento_consumed = 0;
+    const auto status =
+        go2cpp::bento::net::DecodeView(Format(), data, size, &view, &bento_consumed);
+    if (status == go2cpp::bento::net::FrameStatus::kNeedMoreData) {
+        return Status::kNeedMoreData;
+    }
+    if (status != go2cpp::bento::net::FrameStatus::kOk) {
+        return Status::kBadFrame;
+    }
+    if (view.type != config.frame_type) {
+        return Status::kBadFrameType;
+    }
+    std::size_t app_consumed = 0;
+    const FrameStatus app_status = DecodeFrameView(view.payload, view.payload_bytes,
+                                                   config.max_app_payload, out,
+                                                   &app_consumed);
+    if (app_status != FrameStatus::kOk) {
+        return Status::kBadPayload;
+    }
+    if (consumed != nullptr) {
+        *consumed = bento_consumed;
+    }
+    return Status::kOk;
+}
+
 struct Decoder::Impl {
     explicit Impl(const Config& cfg)
         : config(cfg), decoder(go2cpp::bento::net::kFrameMaxPayload, Format()) {}
@@ -145,6 +176,29 @@ Status Decoder::Next(Frame* out) {
     }
     const FrameStatus app_status = DecodeFrame(bento.payload.data(), bento.payload.size(),
                                                m_impl->config.max_app_payload, out);
+    if (app_status != FrameStatus::kOk) {
+        return Status::kBadPayload;
+    }
+    return Status::kOk;
+}
+
+Status Decoder::NextView(Frame* out) {
+    if (out == nullptr) {
+        return Status::kBadPayload;
+    }
+    go2cpp::bento::net::FrameView view;
+    const auto status = m_impl->decoder.NextView(&view);
+    if (status == go2cpp::bento::net::FrameStatus::kNeedMoreData) {
+        return Status::kNeedMoreData;
+    }
+    if (status != go2cpp::bento::net::FrameStatus::kOk) {
+        return Status::kBadFrame;
+    }
+    if (view.type != m_impl->config.frame_type) {
+        return Status::kBadFrameType;
+    }
+    const FrameStatus app_status = DecodeFrameView(view.payload, view.payload_bytes,
+                                                   m_impl->config.max_app_payload, out);
     if (app_status != FrameStatus::kOk) {
         return Status::kBadPayload;
     }
