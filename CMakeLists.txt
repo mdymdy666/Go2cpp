@@ -90,3 +90,7 @@ include(cmake/Go2CppRpc.cmake)
 # 嵌入式存储（SQLite，GO2CPP_WITH_SQLITE 默认 OFF）。
 include(cmake/Go2CppStorage.cmake)
 include(cmake/Go2CppKv.cmake)
+
+# 运维能力：日志轮转（include/go2cpp/logging/rotate.hpp）+ 配置热更新
+# （include/go2cpp/config/watch.hpp）。测试目标由该文件定义，默认 ON。
+include(cmake/Go2CppOpsLogConfig.cmake)

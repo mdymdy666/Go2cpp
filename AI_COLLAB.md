@@ -948,14 +948,14 @@ errno noinline），不是寄存器保存。
     0 重复、0 乱序、0 撕裂**；12 个 `.gz` 全部通过 `Gzip::Reader` 的
     CRC32/ISIZE 校验；并发 8 线程 × 5000 条、8 个真实场景（含打开失败恢复、
     保留策略、按天轮转、随机混合）全部 PASS。
-  - 配置：1e4 次原子替换变更 **0 失败**（221.8 µs/次）；4 读者 + 2000 次
+  - 配置：1e4 次原子替换变更 **0 失败**（206.6 µs/次）；4 读者 + 2000 次
     发布共 956 万次 `Load()` **0 撕裂**；删除重建、非法配置保留旧值、
     validator 拒绝、轮询回退、Stop 语义全部 PASS。
   - TSAN（`setarch -R`，WSL 需关闭 ASLR）：配置热更新测试 PASS，
     **0 条 ThreadSanitizer 警告**。
 - **数据**（WSL ext4，/tmp，单次运行）
-  - 日志：write 0.176 s（约 227 MB/s）、close（压缩+清理）0.182 s、
-    端到端 0.358 s（106 MB/s）。
+  - 日志：write 0.160 s（约 238 MB/s）、close（压缩+清理）0.157 s、
+    端到端 0.317 s（120 MB/s）。
   - 配置：`ConfigStore::Load()` 3.58 ns/次；`Store()` 1.0 µs/次（1 写 + 4 读）；
     inotify 1e4 次变更事件数恰好 10000。
 - **状态**：完成，未 commit。报告 `/tmp/ops_log_config.md`。
