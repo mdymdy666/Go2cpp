@@ -434,6 +434,12 @@ void SysmonHeartbeatUnderLoad() {
 
 /**
  * @brief 验证任务类别亲和预算有界且不会阻塞其他类别。
+ *
+ * @details 交替类别（1,2,1,2,…）在「同类才算命中」的计数契约下，只有靠
+ *          出队时的亲和扫描才会取到与 last_task_class 相同的任务。因此
+ *          提交必须走全局队列（见函数内 producer 注释），否则 hits 恒 0。
+ *          有界性由 `first_foreign <= 4` 保证：budget=3 时最多把另一类
+ *          推迟 3 个位置。
  * @return 无；测试失败由统一断言统计。
  */
 void BoundedClassAffinity() {
@@ -442,19 +448,29 @@ void BoundedClassAffinity() {
     config.min_workers = 1;
     config.max_workers = 1;
     config.task_affinity_budget = 3;
-    config.local_queue_limit = 0;  // One global queue makes order observable.
+    // 本地环容量 0 + 在受管 G 内提交：任务全部落到全局 FIFO 队列，worker
+    // 出队时才会执行「按类别扫描前 budget 个」的亲和路径（见下方 producer）。
+    config.local_queue_limit = 0;
     go2cpp::Scheduler scheduler(config);
+    scheduler.start();
     std::mutex order_mutex;
     std::vector<int> order;
     std::vector<std::shared_ptr<go2cpp::Task>> tasks;
-    for (int index = 0; index < 80; ++index) {
-        const int task_class = index % 2 + 1;
-        tasks.emplace_back(scheduler.spawn([&, task_class] {
-            std::lock_guard<std::mutex> lock(order_mutex);
-            order.push_back(task_class);
-        }, go2cpp::TaskOptions{0, static_cast<go2cpp::TaskClassId>(task_class)}));
-    }
-    scheduler.start();
+    // ★ 必须从受管 G 内部提交：外部线程的 spawn 走「直投本地环」快路径，
+    //   而本地环出队是纯 FIFO（不做类别扫描），交替类别永远不可能命中。
+    //   在 Fiber 内提交时 enqueue 走 admission 分支，local_queue_limit=0
+    //   让它们全部落到全局队列；worker 从全局队列出队才会按 last_task_class
+    //   扫描前 task_affinity_budget 个元素（scheduler.cpp:5785-5816）。
+    auto producer = scheduler.spawn([&] {
+        for (int index = 0; index < 80; ++index) {
+            const int task_class = index % 2 + 1;
+            tasks.emplace_back(scheduler.spawn([&, task_class] {
+                std::lock_guard<std::mutex> lock(order_mutex);
+                order.push_back(task_class);
+            }, go2cpp::TaskOptions{0, static_cast<go2cpp::TaskClassId>(task_class)}));
+        }
+    });
+    GO2CPP_CHECK(producer->wait_for(5s));
     for (const auto& task : tasks) {
         GO2CPP_CHECK(task->wait_for(2s));
     }

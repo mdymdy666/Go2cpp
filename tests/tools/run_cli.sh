@@ -22,7 +22,7 @@ fi
 
 if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
     echo "SKIP tools-cli：未找到 go2cpp-cli"
-    echo "  期望: $GO2CPP_CLI_BIN 或 <repo>/build-cli/tools/cli/go2cpp-cli"
+    echo "  期望: ${GO2CPP_CLI_BIN:-<未设置>} 或 <repo>/build-cli/tools/cli/go2cpp-cli"
     echo "  构建: cmake -S . -B build-cli -DGO2CPP_WITH_CLI=ON && cmake --build build-cli -j"
     exit 77
 fi

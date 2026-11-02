@@ -121,7 +121,12 @@ bool scenario_snapshots() {
 bool scenario_metrics() {
     using namespace go2cpp;
     std::clog << "[full][场景5] 指标：metrics()\n";
-    Scheduler scheduler(2);
+    // collect_metrics 自 75dba1a 起默认关闭（热路径零开销）。本场景验证的
+    // 就是 metrics() 的累加，必须显式打开，否则无论跑多久都读到 0。
+    SchedulerConfig config;
+    config.processor_count = 2;
+    config.collect_metrics = true;
+    Scheduler scheduler(config);
     scheduler.start();
 
     constexpr int kTasks = 12;

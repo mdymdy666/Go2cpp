@@ -328,22 +328,41 @@ void run_debug_dump_tests() {
     // 场景 2：fiber（状态 + 父 Fiber + 栈范围/committed）
     // -------------------------------------------------------------------
     {
-        Fiber fiber([] { (void)Fiber::Suspend(SuspendReason::Yield); });
+        // FIBER-01 契约（fiber.hpp:225-253）：栈字段只在「当前线程正在执行
+        // 本 Fiber」时可读；`Current() != this` 一律 has_stack=false、地址
+        // 全 0 —— 完成路径可能在另一个线程释放 FiberStack，跨线程解引用
+        // 就是 use-after-free。所以先在执行中的 Fiber 内部取真实栈范围，
+        // 再在主线程验证「非当前 Fiber 必须隐藏」。
+        bool inner_has_stack = false;
+        std::uint64_t inner_base = 0;
+        std::uint64_t inner_top = 0;
+        std::uint64_t inner_committed = 0;
+        Fiber fiber([&] {
+            const DumpPayload snapshot = DumpFiber(*Fiber::Current());
+            inner_has_stack = Contains(snapshot.text, "has_stack=true");
+            inner_base = ParseHex(snapshot.text, "mapping_base");
+            inner_top = ParseHex(snapshot.text, "mapping_top");
+            inner_committed = ParseHex(snapshot.text, "committed_begin");
+            (void)Fiber::Suspend(SuspendReason::Yield);
+        });
         GO2CPP_CHECK(fiber.resume());
         GO2CPP_CHECK(fiber.state() == FiberState::Suspended);
+        GO2CPP_CHECK(inner_has_stack);
+        GO2CPP_CHECK(inner_base != 0 && inner_top > inner_base);
+        GO2CPP_CHECK(inner_committed >= inner_base &&
+                     inner_committed <= inner_top);
+
         const DumpPayload payload = DumpFiber(fiber);
         GO2CPP_CHECK(Contains(payload.text, "schema=go2cpp.dump.fiber/1"));
         GO2CPP_CHECK(Contains(payload.text, "state=kSuspended"));
-        GO2CPP_CHECK(Contains(payload.text, "has_stack=true"));
+        // 主线程不是执行本 Fiber 的线程：栈字段必须如实隐藏、不伪造地址。
+        GO2CPP_CHECK(Contains(payload.text, "has_stack=false"));
         GO2CPP_CHECK(Contains(payload.text, "nesting_depth=1"));
         GO2CPP_CHECK(Contains(payload.text, "requested_bytes="));
         GO2CPP_CHECK(Contains(payload.text, "usable_bytes="));
-        const std::uint64_t base = ParseHex(payload.text, "mapping_base");
-        const std::uint64_t top = ParseHex(payload.text, "mapping_top");
-        const std::uint64_t committed =
-            ParseHex(payload.text, "committed_begin");
-        GO2CPP_CHECK(base != 0 && top > base);
-        GO2CPP_CHECK(committed >= base && committed <= top);
+        GO2CPP_CHECK(ParseHex(payload.text, "mapping_base") == 0);
+        GO2CPP_CHECK(ParseHex(payload.text, "mapping_top") == 0);
+        GO2CPP_CHECK(ParseHex(payload.text, "current_sp") == 0);
         GO2CPP_CHECK(JsonParses(payload.json, "go2cpp.dump.fiber/1"));
         GO2CPP_CHECK(fiber.resume());
         GO2CPP_CHECK(fiber.state() == FiberState::Completed);

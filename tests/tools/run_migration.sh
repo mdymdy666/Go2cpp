@@ -23,7 +23,7 @@ fi
 
 if [ -z "$BUILD" ] || [ ! -x "$BUILD/migrate" ]; then
     echo "SKIP tools-migration：未找到 tools/migration 构建产物"
-    echo "  期望: $GO2CPP_MIGRATION_BUILD_DIR 或 <repo>/build-migration/migrate"
+    echo "  期望: ${GO2CPP_MIGRATION_BUILD_DIR:-<未设置>} 或 <repo>/build-migration/migrate"
     echo "  构建: cmake -S tools/migration -B build-migration && cmake --build build-migration -j"
     exit 77
 fi

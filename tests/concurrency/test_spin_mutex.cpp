@@ -11,7 +11,8 @@
  * 2. 随机测试：随机 G 序列（Lock/TryLock/Unlock/yield），验证
  *    `no_park_depth` 与嵌套层数一致、每个 G 结束归零；
  * 3. 真实场景 ≥5：
- *    - SpinMutex 临界区内 `read`（debug：子进程 abort；release：降级计数）；
+ *    - SpinMutex 临界区内显式 park（debug：子进程 abort；release：降级
+ *      计数；不依赖 syscall hook，Hook-off 的静态构建同样覆盖该契约）；
  *    - SpinMutex 临界区内纯计算（正例，正常完成）；
  *    - 普通 Mutex 临界区内 `read`（允许，但 held 计数 +1）；
  *    - `Mutex` 套 `SpinMutex` 后 `read`（内层优先：只计 SpinMutex 降级）；
@@ -320,6 +321,61 @@ ReadParkRun RunReadScenario(IOManager& manager, bool hold_spin_mutex,
     return result;
 }
 
+/**
+ * @brief 普通 Mutex 的作用域锁（仅测试辅助；Mutex 自身不提供 Guard）。
+ */
+struct PlainMutexGuard {
+    explicit PlainMutexGuard(Mutex& mutex) : mutex(mutex) { (void)mutex.Lock(); }
+    ~PlainMutexGuard() { mutex.Unlock(); }
+    PlainMutexGuard(const PlainMutexGuard&) = delete;
+    PlainMutexGuard& operator=(const PlainMutexGuard&) = delete;
+    Mutex& mutex;
+};
+
+/**
+ * @brief 在 SpinMutex 临界区内显式 park，触发 no-park 契约检查。
+ *
+ * @details 不依赖 syscall hook：`GO2CPP_BUILD_HOOK=OFF` 的静态 profile 里
+ *          `read` 根本不会 park，旧场景因此永远走不到 `park_for_scheduler`
+ *          的契约检查，release 降级计数不涨。`park_current()` 直接调用
+ *          `Task::park_for_scheduler()`（所有 park 路径的唯一提交点）：
+ *          release 下必降级计数且绝不 abort，debug 下必 abort。
+ *
+ * @param nested_plain_outer 是否先持有普通 Mutex（验证内层 SpinMutex 优先，
+ *                           普通 Mutex 的 held 计数不得增长）。
+ */
+void RunSpinParkScenario(bool nested_plain_outer) {
+    Scheduler scheduler(MakeConfig(2, 2));
+    scheduler.start();
+    SpinMutex spin;
+    Mutex outer;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> finished{false};
+    const std::uint64_t spin_before = SpinDegradeTotal();
+    const std::uint64_t held_before = MutexHeldParkTotal();
+    auto task = scheduler.spawn([&] {
+        std::unique_ptr<PlainMutexGuard> outer_guard;
+        if (nested_plain_outer) {
+            outer_guard = std::make_unique<PlainMutexGuard>(outer);
+        }
+        SpinMutex::Guard guard(spin);
+        entered.store(true, std::memory_order_release);
+        (void)scheduler.park_current();
+        finished.store(true, std::memory_order_release);
+    });
+    GO2CPP_REQUIRE_EVENTUALLY(entered.load(std::memory_order_acquire), 5s);
+    // 状态先于切换写成 Waiting：看到 kWaiting 就说明契约检查已在 park 内执行。
+    GO2CPP_REQUIRE_EVENTUALLY(task->state() == go2cpp::GState::kWaiting, 5s);
+    GO2CPP_CHECK(SpinDegradeTotal() >= spin_before + 1U);
+    // 内层 SpinMutex 优先：普通 Mutex 的告警计数不得增长。
+    GO2CPP_CHECK(MutexHeldParkTotal() == held_before);
+    GO2CPP_CHECK(scheduler.wake(task));
+    GO2CPP_CHECK(task->wait_for(5s));
+    GO2CPP_CHECK(finished.load(std::memory_order_acquire));
+    GO2CPP_CHECK(WaitDepth(task, 0U));
+    ShutdownOrReport(scheduler);
+}
+
 /// 场景 2：临界区内纯计算，正常完成。
 void TestPureComputationInsideCriticalSection() {
     Scheduler scheduler(MakeConfig(2));
@@ -369,37 +425,10 @@ void TestPlainMutexHeldPark() {
 
 /// 场景 3/5：release 下降级；debug 由子进程验证 abort（本函数不执行）。
 void TestSpinMutexReleaseDegrade() {
-    const bool saved_detection = go2cpp::sync::HeldLockParkDetection();
-    go2cpp::sync::SetHeldLockParkDetection(true);
-
-    {
-        IOManager manager(MakeConfig(2));
-        GO2CPP_CHECK(manager.Start());
-        const std::uint64_t spin_before = SpinDegradeTotal();
-        const std::uint64_t held_before = MutexHeldParkTotal();
-        const ReadParkRun run = RunReadScenario(manager, true, false, false);
-        GO2CPP_CHECK(run.saw_read);
-        // release：必须降级、计数增长，且绝不能 abort。
-        GO2CPP_CHECK(SpinDegradeTotal() >= spin_before + 1U);
-        // 内层 SpinMutex 优先，普通 Mutex 的告警计数不应增长。
-        GO2CPP_CHECK(MutexHeldParkTotal() == held_before);
-        manager.shutdown();
-    }
-
-    {
-        // 场景 5：Mutex 套 SpinMutex，内层优先。
-        IOManager manager(MakeConfig(2));
-        GO2CPP_CHECK(manager.Start());
-        const std::uint64_t spin_before = SpinDegradeTotal();
-        const std::uint64_t held_before = MutexHeldParkTotal();
-        const ReadParkRun run = RunReadScenario(manager, false, false, true);
-        GO2CPP_CHECK(run.saw_read);
-        GO2CPP_CHECK(SpinDegradeTotal() >= spin_before + 1U);
-        GO2CPP_CHECK(MutexHeldParkTotal() == held_before);
-        manager.shutdown();
-    }
-
-    go2cpp::sync::SetHeldLockParkDetection(saved_detection);
+    // 场景 3：SpinMutex 临界区内 park -> 降级计数 +1、绝不 abort。
+    RunSpinParkScenario(false);
+    // 场景 5：Mutex 套 SpinMutex，内层优先（只计 SpinMutex 降级）。
+    RunSpinParkScenario(true);
 }
 
 /// 场景 6：跨 G 解锁后 owner 的深度必须归零。
@@ -542,17 +571,9 @@ bool ForkChildExpectAbort(const char* scenario) {
  *          不会在 release 下调用本入口）。
  */
 void run_spin_mutex_child(const char* scenario) {
-    go2cpp::IOManager manager(MakeConfig(2));
-    if (!manager.Start()) {
-        std::fprintf(stderr, "[spin-mutex-child] manager start failed\n");
-        std::exit(127);
-    }
-    if (std::strcmp(scenario, "nested") == 0) {
-        (void)RunReadScenario(manager, false, false, true);
-    } else {
-        (void)RunReadScenario(manager, true, false, false);
-    }
-    manager.shutdown();
+    go2cpp::Scheduler scheduler(MakeConfig(2, 2));
+    scheduler.start();
+    RunSpinParkScenario(std::strcmp(scenario, "nested") == 0);
     // 走到这里说明没有 abort —— debug 契约检查失效。
     std::fprintf(stderr,
                  "[spin-mutex-child] scenario '%s' did not abort; debug lock "

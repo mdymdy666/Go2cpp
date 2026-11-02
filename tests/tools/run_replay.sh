@@ -22,7 +22,7 @@ fi
 
 if [ -z "$DIR" ] || [ ! -x "$DIR/go2cpp_replay_tests" ] || [ ! -x "$DIR/replay" ]; then
     echo "SKIP tools-replay：未找到 tools/replay 构建产物"
-    echo "  期望: $GO2CPP_REPLAY_BUILD_DIR 或 <repo>/build-replay/{replay,go2cpp_replay_tests}"
+    echo "  期望: ${GO2CPP_REPLAY_BUILD_DIR:-<未设置>} 或 <repo>/build-replay/{replay,go2cpp_replay_tests}"
     echo "  构建: GO2CPP_REPLAY_BUILD_DIR=build-replay ./tools/replay/build.sh"
     exit 77
 fi

@@ -378,10 +378,13 @@ Applied ExpectGEvent(GRow row, GEvent event) {
         case GEvent::kWakeForWait:
             expected.has_wake = true;
             if (row == GRow::kWaiting) {
-                // Waiting fixture 仍持有 execution_claim（真实场景：G 在
-                // 自己所在的 M 上 park）。唤醒方只发布 pending 令牌，
-                // 由持有执行权的 M 在退出时入队。
-                expected.wake = WakeAction::kPending;
+                // Waiting fixture 由 try_mark_running() 置起 execution_claim
+                // 后 park_for_scheduler() 提交挂起（真实场景：G 在自己所在
+                // 的 M 上 park）。5189382 起，「已提交挂起、执行权尚未释放」
+                // 的唤醒返回 kRegistered：状态已推进到 kRunnable 并置
+                // deferred_enqueue，由拥有者的收尾路径补入队；它与
+                // kPending（运行中 G 的令牌待消费）是两条不同的成功路径。
+                expected.wake = WakeAction::kRegistered;
             } else if (row == GRow::kRunning) {
                 expected.wake = WakeAction::kPending;
             } else {
