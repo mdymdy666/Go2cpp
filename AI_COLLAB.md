@@ -1053,3 +1053,18 @@ errno noinline），不是寄存器保存。
 - **报告**：`/tmp/tools_vs_industry.md`（每项 vs 工业库与是否 <1.1×）。
 - **未达标**：gzip 解压 1.59×（CRC 需 PCLMULQDQ）、reflect 二进制解码 1.43×（自描述字段名开销）、
   文本路径 vs rapidjson 2.5~2.8×（envelope + 建树，vs nlohmann 已达标）。
+
+## 2026-11-02 · 复用纪律（先查项目内，再查项目外）
+
+**背景**：这一天内发生 3 次「重复造轮子」——
+① picoquic 早已在 ~/build-deps/picoquic（docs/quic.md 写死），仍自研 QUIC 570 行；
+② LevelDB 集成前没查 docs/modules/，重复 clone/编译（正确做法后来还是自编译，但查文档能少走弯路）；
+③ 9eab7203 为「不改一行 CMake」把 21 GB/s 的 CRC 实现复制进 src/compress/crc32_x86.hpp。
+
+**规则（写进 docs/engineering-standards.md §1.1，强制）**：
+1. 新功能动工前**先查项目内**：docs/ 模块文档 → xample/+xamples/ → grep 全仓 → docs/reports/reuse-audit.md → AI_COLLAB.md；
+2. 再查项目外工业库（§四参考清单）；
+3. **禁止**不问不查就新写一份；**禁止**把已有实现复制进自己模块（宁可改一行 CMake 加链接）；
+4. 复用顺序：项目内已有 > 工业库 > 自己写。
+
+**当天的量化结果**：复用审查（docs/reports/reuse-audit.md，408 行）查出真重复 15 组 / 部分重复 4 组 / 看似重复但不同 14 组 / 薄封装 8 类；据此派出 4 个修复 agent（随机源 5 处、endian 13 处、CRC 2 套、字符串/解析 39 处、SHA-256 3 份、FNV 5 处）。
