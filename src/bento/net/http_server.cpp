@@ -12,6 +12,8 @@
 
 #include <sys/socket.h>
 
+#include <netinet/tcp.h>
+
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -66,9 +68,26 @@ std::string SystemErrorText(int error) {
     return std::strerror(error);
 }
 
+/// TCP_CORK 只对「头 + 大文件」划算：合包省下的一个 TCP 段抵不过两次
+/// setsockopt 的开销（实测 1 KiB/10 KiB 档因此回退 6-10%）。16 KiB 以上
+/// 才启用，与 nginx 在大响应上收益更明显的实测一致。
+constexpr std::uint64_t kCorkMinFileBytes = 16 * 1024;
+/// 小于等于此长度的文件体走「header + body 一次写」而不是 sendfile：
+/// 1 KiB 档的 sendfile 需要「头一次 write + 文件一次 sendfile」两个段，
+/// 读进用户态反而能用一次 send 发完（网络往返次数不变，但段数减半）。
+/// 上限与 CORK 阈值一致，再大就进入「sendfile + TCP_CORK」路径。
+constexpr std::uint64_t kInlineFileBytes = 16 * 1024;
+
 /// @brief 响应带文件体时用 sendfile(2) 发送（静态文件/Range 零拷贝）。
 /// @details 头由调用方先写出；本函数只负责文件体，`HEAD` 不调用。
-bool SendFileBody(const net::Socket::Ptr& connection, const http::FileBody& file) {
+///          `tcp_cork` 为真时按 nginx `ngx_linux_sendfile_chain` 的做法用
+///          TCP_CORK 把「响应头 + 文件体」括起来：头先进入内核发送队列但
+///          不立即出包，第一次 sendfile 之后内核把两者合并成尽量少的 TCP
+///          段（1 KiB 静态响应从 2 段降到 1 段）。nginx 在
+///          `header.count != 0 && cl->buf->in_file` 时无条件打开 nopush
+///          （即 TCP_CORK），并在文件发完后关闭，这里同构。
+bool SendFileBody(const net::Socket::Ptr& connection, const http::FileBody& file,
+                  bool tcp_cork) {
     if (file.length == 0) {
         return true;
     }
@@ -76,6 +95,18 @@ bool SendFileBody(const net::Socket::Ptr& connection, const http::FileBody& file
     if (fd < 0) {
         return false;
     }
+    bool corked = false;
+#if defined(TCP_CORK)
+    // TCP_CORK 与 TCP_NODELAY 互斥：打开 CORK 后内核会等积累到 MSS 或
+    // uncork 才发包，这正是「头 + 文件」合包需要的语义。
+    int enable = 1;
+    if (tcp_cork &&
+        connection->set_option(IPPROTO_TCP, TCP_CORK, &enable, sizeof(enable))) {
+        corked = true;
+    }
+#else
+    (void)tcp_cork;
+#endif
     off_t offset = static_cast<off_t>(file.offset);
     std::uint64_t remaining = file.length;
     bool ok = true;
@@ -89,6 +120,14 @@ bool SendFileBody(const net::Socket::Ptr& connection, const http::FileBody& file
         remaining -= static_cast<std::uint64_t>(written.transferred);
     }
     (void)::close(fd);
+#if defined(TCP_CORK)
+    if (corked) {
+        int disable = 0;
+        // uncork 失败不影响已发送的数据；连接会由调用方按写错误处理。
+        (void)connection->set_option(IPPROTO_TCP, TCP_CORK, &disable,
+                                     sizeof(disable));
+    }
+#endif
     return ok;
 }
 
@@ -463,21 +502,73 @@ void HttpServer::ServeConnection(const net::Socket::Ptr& connection) {
         buffered.emplace(*batch_sink, m_config.bufio_capacity);
         net::ApplyProtocolBatchDefaults(*buffered);
     }
+    // 偷自 nginx `ngx_http_write_filter` 的 postpone_output：同一次 recv 里
+    // 连续解析出的流水线响应不逐条 write，先攒在用户态，攒到上限、必须阻塞
+    // 读、或遇到文件体时再一次性写出。pipeline=N 时把 N 次 send / N 个 TCP
+    // 段压成 1 次 send（nginx 在小响应上同样是用缓冲换系统调用）。
+    constexpr std::size_t kWriteBatchBytes = 16 * 1024;
+    std::string out;
+    out.reserve(kWriteBatchBytes);
+    // 小文件内联发送的复用缓冲：每个连接只分配一次，避免每请求 malloc。
+    std::vector<char> file_buffer;
+    // 把攒着的响应一次写出；返回 false 表示连接已不可写。失败也清空缓冲
+    // （连接即将关闭，不会再重试）。
+    const auto flush_out = [&]() -> bool {
+        if (out.empty()) {
+            return true;
+        }
+        const bool written = stream.write_all(out.data(), out.size());
+        out.clear();
+        return written;
+    };
 
     for (std::size_t served = 0; served < m_config.max_requests_per_connection; ++served) {
         if (m_stopping.load(std::memory_order_acquire)) {
             return;
         }
         http::Request request;
-        if (!ReadRequest(connection, parser, pending, request, read_buffer.data(),
-                         read_buffer.size())) {
-            return;
+        // 读出一个完整请求：pending 里还有字节就先解析；解析不出完整请求
+        // 说明这一批流水线请求处理完了，再阻塞 recv。recv 之前必须先把攒着
+        // 的响应发出去，否则对端等响应、我们等请求会互等。
+        for (;;) {
+            if (!pending.empty()) {
+                const auto parsed = parser.feed(pending, request);
+                pending.clear();
+                if (parsed.state == http::ParseState::Error) {
+                    (void)flush_out();
+                    return;
+                }
+                if (parsed.state == http::ParseState::Complete) {
+                    break;
+                }
+                continue;
+            }
+            if (!flush_out()) {
+                return;
+            }
+            const auto count = connection->recv(read_buffer.data(), read_buffer.size());
+            if (count.transferred <= 0) {
+                (void)flush_out();
+                return;
+            }
+            const auto parsed = parser.feed(
+                std::string_view(read_buffer.data(),
+                                 static_cast<std::size_t>(count.transferred)),
+                request);
+            if (parsed.state == http::ParseState::Error) {
+                (void)flush_out();
+                return;
+            }
+            if (parsed.state == http::ParseState::Complete) {
+                break;
+            }
         }
         // 同一 recv 里可能还有流水线的下一个请求，留给下一轮。
         pending = parser.take_remaining();
 
         const SseHandler sse_handler = FindSseHandler(request.path_view());
         if (sse_handler) {
+            (void)flush_out();
             ServeSse(connection, request, sse_handler);
             return;
         }
@@ -502,44 +593,89 @@ void HttpServer::ServeConnection(const net::Socket::Ptr& connection) {
         if (m_stopping.load(std::memory_order_acquire)) {
             response.close = true;
         }
-        const std::string wire =
-            response.to_string(request.method == http::Method::Head);
+        const bool head_request = request.method == http::Method::Head;
+        const std::string wire = response.to_string(head_request);
         if (wire.empty()) {
+            (void)flush_out();
             return;
         }
-        const bool buffered_path =
-            m_config.use_bufio && wire.size() <= m_config.bufio_capacity;
-        if (buffered_path) {
-            if (!WriteBufferedResponse(*buffered, wire)) {
-                m_write_errors.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-            m_write_responses.fetch_add(1, std::memory_order_relaxed);
-            m_write_batches.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            if (!stream.write_all(wire.data(), wire.size())) {
-                if (m_config.use_bufio) {
+        const bool has_file = !head_request && response.has_file();
+        if (m_config.use_bufio) {
+            // 原有 bufio 路径：逐响应 flush，保持 writev_calls 语义不变。
+            if (wire.size() <= m_config.bufio_capacity) {
+                if (!WriteBufferedResponse(*buffered, wire)) {
                     m_write_errors.fetch_add(1, std::memory_order_relaxed);
+                    return;
                 }
-                return;
-            }
-            m_write_responses.fetch_add(1, std::memory_order_relaxed);
-            if (m_config.use_bufio) {
+                m_write_batches.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (!stream.write_all(wire.data(), wire.size())) {
+                    m_write_errors.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
                 m_write_direct.fetch_add(1, std::memory_order_relaxed);
             }
-        }
-        // 文件体（StaticFiles/Range）走 sendfile(2)：数据不进入用户态。
-        // HEAD 只回头；头已由上面的两条写路径 flush，这里不会与缓冲顺序冲突。
-        if (request.method != http::Method::Head && response.has_file()) {
-            if (!SendFileBody(connection, *response.file)) {
+            // 文件体在两条 bufio 路径之后统一发送（与原实现一致）：
+            // 头已经 flush 到内核，sendfile 才能保证字节顺序。
+            if (has_file &&
+                !SendFileBody(connection, *response.file,
+                              response.file->length >= kCorkMinFileBytes)) {
+                m_write_errors.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        } else if (has_file && response.file->length <= kInlineFileBytes) {
+            // 小文件走「header + body 一次写出」：nginx `ngx_writev_chain`
+            // 的核心是让头和内容处在同一次写里，这里把这一小段 pread 进
+            // 用户态、与响应头拼进同一个批量缓冲，一次 send 发出 →
+            // 1 个 TCP 段 + 1 次写系统调用（省掉头/体两段与 setsockopt）。
+            const std::size_t body_size =
+                static_cast<std::size_t>(response.file->length);
+            file_buffer.resize(body_size);
+            const int file_fd =
+                ::open(response.file->path.c_str(), O_RDONLY | O_CLOEXEC);
+            bool body_ok = file_fd >= 0;
+            if (body_ok) {
+                const ssize_t got = ::pread(
+                    file_fd, file_buffer.data(), body_size,
+                    static_cast<off_t>(response.file->offset));
+                body_ok = got == static_cast<ssize_t>(body_size);
+                (void)::close(file_fd);
+            }
+            if (!body_ok) {
+                m_write_errors.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            out.append(wire);
+            out.append(file_buffer.data(), body_size);
+            if (out.size() >= kWriteBatchBytes && !flush_out()) {
+                m_write_errors.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        } else if (has_file) {
+            // 文件体必须严格按序：先把攒着的响应落地，再写「头 + 文件」。
+            if (!flush_out() || !stream.write_all(wire.data(), wire.size())) {
+                m_write_errors.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            if (!SendFileBody(connection, *response.file,
+                              response.file->length >= kCorkMinFileBytes)) {
+                m_write_errors.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        } else {
+            out.append(wire);
+            if (out.size() >= kWriteBatchBytes && !flush_out()) {
                 m_write_errors.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
         }
+        m_write_responses.fetch_add(1, std::memory_order_relaxed);
         if (request.close || response.close) {
+            (void)flush_out();
             return;
         }
     }
+    (void)flush_out();
 }
 
 void HttpServer::ServeSse(const net::Socket::Ptr& connection,
