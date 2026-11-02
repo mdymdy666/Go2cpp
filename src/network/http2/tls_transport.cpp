@@ -16,10 +16,12 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/socket.h>
 #include <signal.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <climits>
 #include <cstring>
@@ -45,6 +47,130 @@ std::string DrainOpenSslErrors() {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// 自定义 socket BIO：写走 send(MSG_NOSIGNAL)
+// ---------------------------------------------------------------------------
+// OpenSSL 自带 socket BIO 用 write()，对端关闭时触发 SIGPIPE（默认动作是
+// 终止进程）。旧实现靠每次 SSL_* 前 pthread_sigmask 屏蔽，代价是每次写
+// 2 次 rt_sigprocmask（64B 小包实测 2.3us 中约 0.5us）。send(MSG_NOSIGNAL)
+// 从源头不产生 SIGPIPE：语义仍是 EPIPE -> SSL_ERROR_SYSCALL，但写路径零
+// 信号系统调用。读也走 recv，保持 OpenSSL 的 retry 标志语义不变。
+int NoSignalBioWrite(BIO* bio, const char* data, int len) {
+    BIO_clear_retry_flags(bio);
+    const int fd = static_cast<int>(reinterpret_cast<std::intptr_t>(BIO_get_data(bio)));
+    ssize_t written;
+    do {
+        written = ::send(fd, data, static_cast<std::size_t>(len), MSG_NOSIGNAL);
+    } while (written < 0 && errno == EINTR);
+    if (written < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            BIO_set_retry_write(bio);
+        }
+        return -1;
+    }
+    return static_cast<int>(written);
+}
+
+int NoSignalBioRead(BIO* bio, char* data, int len) {
+    BIO_clear_retry_flags(bio);
+    const int fd = static_cast<int>(reinterpret_cast<std::intptr_t>(BIO_get_data(bio)));
+    ssize_t got;
+    do {
+        got = ::recv(fd, data, static_cast<std::size_t>(len), 0);
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            BIO_set_retry_read(bio);
+        }
+        return -1;
+    }
+    return static_cast<int>(got);
+}
+
+long NoSignalBioCtrl(BIO* bio, int cmd, long /*num*/, void* ptr) {
+    const int fd = static_cast<int>(reinterpret_cast<std::intptr_t>(BIO_get_data(bio)));
+    switch (cmd) {
+        case BIO_CTRL_FLUSH:
+            return 1;
+        case BIO_C_GET_FD:
+            if (ptr != nullptr) {
+                *static_cast<int*>(ptr) = fd;
+            }
+            return fd;
+        case BIO_CTRL_GET_CLOSE:
+            return 0;  // fd 由 Socket 拥有，BIO 不关闭它
+        case BIO_CTRL_SET_CLOSE:
+            return 0;
+        case BIO_CTRL_DUP:
+            return 1;
+        case BIO_CTRL_PENDING:
+        case BIO_CTRL_WPENDING:
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+int NoSignalBioCreate(BIO* bio) {
+    BIO_set_init(bio, 1);
+    BIO_set_data(bio, nullptr);
+    return 1;
+}
+
+int NoSignalBioDestroy(BIO* bio) {
+    BIO_set_init(bio, 0);
+    return 1;
+}
+
+BIO_METHOD* NoSignalBioMethod() {
+    static BIO_METHOD* method = [] () -> BIO_METHOD* {
+        BIO_METHOD* created = BIO_meth_new(BIO_TYPE_SOCKET, "go2cpp/send-nosignal");
+        if (created == nullptr) {
+            return nullptr;
+        }
+        BIO_meth_set_write(created, NoSignalBioWrite);
+        BIO_meth_set_read(created, NoSignalBioRead);
+        BIO_meth_set_ctrl(created, NoSignalBioCtrl);
+        BIO_meth_set_create(created, NoSignalBioCreate);
+        BIO_meth_set_destroy(created, NoSignalBioDestroy);
+        return created;
+    }();
+    return method;
+}
+
+/// 给 SSL 挂上 MSG_NOSIGNAL BIO；失败返回 false，调用方回退 SSL_set_fd
+/// （回退路径仍由 ScopedSigpipeBlock 兜底）。
+bool AttachNoSignalBio(SSL* ssl, int fd) {
+    BIO_METHOD* method = NoSignalBioMethod();
+    if (method == nullptr) {
+        return false;
+    }
+    BIO* bio = BIO_new(method);
+    if (bio == nullptr) {
+        return false;
+    }
+    BIO_set_data(bio, reinterpret_cast<void*>(static_cast<std::intptr_t>(fd)));
+    SSL_set_bio(ssl, bio, bio);
+    return true;
+}
+
+/// 进程是否已把 SIGPIPE 设为 SIG_IGN（结果缓存一次）。
+/// @details SIG_IGN 时内核不会为失败的 write 生成 SIGPIPE，阻塞与消费
+///          都是纯开销。缓存一份处置，避免每次 SSL_write 前再 sigaction。
+bool SigpipeGloballyIgnored() {
+    static std::atomic<int> cached{-1};  // -1 未知，0 未忽略，1 已忽略
+    int state = cached.load(std::memory_order_relaxed);
+    if (state < 0) {
+        struct sigaction action {};
+        state = (::sigaction(SIGPIPE, nullptr, &action) == 0 &&
+                 action.sa_handler == SIG_IGN)
+                    ? 1
+                    : 0;
+        cached.store(state, std::memory_order_relaxed);
+    }
+    return state == 1;
+}
+
 /// 在作用域内屏蔽 SIGPIPE。
 /// @details OpenSSL 的 socket BIO 用 write()，对端关闭后写会触发 SIGPIPE，
 ///          默认动作是**终止进程**。屏蔽后 write 返回 EPIPE，由调用方转成
@@ -52,9 +178,20 @@ std::string DrainOpenSslErrors() {
 ///          关闭写 close_notify 都必须带上它，否则「正常关闭」反而可能杀死
 ///          进程（实测对端先 close 时客户端析构触发 SIGPIPE）。用线程级
 ///          pthread_sigmask 而不是全局 signal()，不改变进程其它线程的行为。
+/// @note 两条快路径（性能相关，见 docs/reports 的 TLS 汇编对比）：
+///       1. 进程已 SIG_IGN SIGPIPE → 完全不进内核（0 次系统调用）；
+///       2. SSL_* 成功 → 跳过 sigpending/sigtimedwait（成功的 write 不会
+///          产生 pending SIGPIPE），只保留阻塞/恢复两次 rt_sigprocmask。
 class ScopedSigpipeBlock {
 public:
-    ScopedSigpipeBlock() {
+    explicit ScopedSigpipeBlock(bool required = true) {
+        // 已挂 MSG_NOSIGNAL BIO 时 SSL_* 根本不产生 SIGPIPE。
+        if (!required) {
+            return;
+        }
+        if (SigpipeGloballyIgnored()) {
+            return;
+        }
         ::sigemptyset(&m_blocked);
         ::sigaddset(&m_blocked, SIGPIPE);
         m_active = ::pthread_sigmask(SIG_BLOCK, &m_blocked, &m_previous) == 0;
@@ -66,17 +203,22 @@ public:
         // 关键：只恢复掩码还不够。写失败时内核把 SIGPIPE 记为「本线程
         // pending」，恢复掩码的一瞬间会按默认动作投递并终止进程（实测
         // 对端先 close 时客户端析构仍然 SIGPIPE）。恢复前必须先把本线程
-        // pending 的 SIGPIPE 取走消费掉。
-        sigset_t pending;
-        if (::sigpending(&pending) == 0 && ::sigismember(&pending, SIGPIPE) == 1) {
-            struct timespec zero {};
-            siginfo_t info {};
-            // SIGPIPE 是标准信号不排队；循环仅防御性处理多次 pending。
-            while (::sigtimedwait(&m_blocked, &info, &zero) == SIGPIPE) {
+        // pending 的 SIGPIPE 取走消费掉。只有本次 SSL_* 失败（MarkFailure）
+        // 才可能有 pending，成功路径直接恢复掩码。
+        if (m_failed) {
+            sigset_t pending;
+            if (::sigpending(&pending) == 0 && ::sigismember(&pending, SIGPIPE) == 1) {
+                struct timespec zero {};
+                siginfo_t info {};
+                // SIGPIPE 是标准信号不排队；循环仅防御性处理多次 pending。
+                while (::sigtimedwait(&m_blocked, &info, &zero) == SIGPIPE) {
+                }
             }
         }
         ::pthread_sigmask(SIG_SETMASK, &m_previous, nullptr);
     }
+    /// 标记本次 SSL_* 调用失败（返回 <=0 且不是 WANT_*）。
+    void MarkFailure() noexcept { m_failed = true; }
     ScopedSigpipeBlock(const ScopedSigpipeBlock&) = delete;
     ScopedSigpipeBlock& operator=(const ScopedSigpipeBlock&) = delete;
 
@@ -84,6 +226,7 @@ private:
     sigset_t m_previous{};
     sigset_t m_blocked{};
     bool m_active{false};
+    bool m_failed{false};
 };
 
 /// 把 `SSL_get_error()` 的常量映射成可读名字（日志/诊断用）。
@@ -171,7 +314,12 @@ std::unique_ptr<TlsTransport> TlsTransport::CreateClient(
     // 关键：把 socket 设为非阻塞，避免 SSL 内部阻塞整个 worker 线程。
     // 本项目的 hook 会拦截 poll，让它变成 Fiber 友好的等待。
     ::fcntl(transport->m_fd, F_SETFL, ::fcntl(transport->m_fd, F_GETFL, 0) | O_NONBLOCK);
-    if (SSL_set_fd(transport->m_ssl, transport->m_fd) != 1) {
+    // 优先挂 send(MSG_NOSIGNAL) 的自定义 BIO；失败回退 SSL_set_fd，
+    // 由 ScopedSigpipeBlock 继续兜底。
+    transport->m_nosignal_bio =
+        AttachNoSignalBio(transport->m_ssl, transport->m_fd);
+    if (!transport->m_nosignal_bio &&
+        SSL_set_fd(transport->m_ssl, transport->m_fd) != 1) {
         return nullptr;
     }
     if (!server_name.empty()) {
@@ -333,7 +481,7 @@ void TlsTransport::Close() {
     // 此时本端通知已经发出，直接结束。
     // 对端可能已经先关闭：向死连接写 close_notify 会触发 SIGPIPE，必须
     // 屏蔽，让 SSL_shutdown 返回错误而不是终止进程。
-    [[maybe_unused]] ScopedSigpipeBlock sigpipe_block;
+    [[maybe_unused]] ScopedSigpipeBlock sigpipe_block{!m_nosignal_bio};
     const auto budget = std::min(m_timeout, Duration{500});
     const auto deadline = std::chrono::steady_clock::now() + budget;
     for (int attempt = 0; attempt < 8; ++attempt) {
@@ -356,6 +504,7 @@ void TlsTransport::Close() {
             m_eof = true;
             return;
         }
+        sigpipe_block.MarkFailure();
         RecordSslError(ssl_error);
         m_eof = true;
         return;
@@ -368,7 +517,7 @@ bool TlsTransport::Handshake(std::string* error) {
         return false;
     }
     // 对端可能在握手期间关闭；ClientHello 写失败不能把进程 SIGPIPE 掉。
-    [[maybe_unused]] ScopedSigpipeBlock sigpipe_block;
+    [[maybe_unused]] ScopedSigpipeBlock sigpipe_block{!m_nosignal_bio};
     const auto deadline = Deadline();
     for (;;) {
         if (m_cancelled.load(std::memory_order_acquire)) {
@@ -403,6 +552,7 @@ bool TlsTransport::Handshake(std::string* error) {
             }
             continue;
         }
+        sigpipe_block.MarkFailure();
         RecordSslError(ssl_error);
         if (error != nullptr) {
             *error = "TLS 握手失败: " + LastErrorString();
@@ -476,7 +626,7 @@ std::size_t TlsTransport::Write(const std::uint8_t* data, std::size_t length) {
         return 0;
     }
     // 对端可能已经关闭；应用数据写失败同样不能把进程 SIGPIPE 掉。
-    [[maybe_unused]] ScopedSigpipeBlock sigpipe_block;
+    [[maybe_unused]] ScopedSigpipeBlock sigpipe_block{!m_nosignal_bio};
     const auto deadline = Deadline();
     std::size_t total = 0;
     while (total < length) {
@@ -499,6 +649,7 @@ std::size_t TlsTransport::Write(const std::uint8_t* data, std::size_t length) {
             if (!WaitFor(true, deadline)) break;
             continue;
         }
+        sigpipe_block.MarkFailure();
         RecordSslError(ssl_error);
         m_eof = true;
         break;
