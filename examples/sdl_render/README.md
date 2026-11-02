@@ -40,6 +40,23 @@ DISPLAY=:0 .build-sdl-render/sdl_render_bench --artifacts examples/sdl_render/ar
 需要 WSLg（`DISPLAY=:0`）与 SDL2。无 DISPLAY 时基准只跑 `headless-fixed`，
 测试整体 SKIP（退出码 0）。
 
+## 采集/渲染专项基准（media_capture_render_bench）
+
+`sdl_render_bench` 量的是整链 + vsync 相位；`media_capture_render_bench` 把范围
+收窄到**采集与渲染本身**：
+
+```bash
+DISPLAY=:0 .build-sdl-render/media_capture_render_bench \
+    --frames 100000 --render-frames 100000 --out /tmp/media_capture_render_data.md
+# vs FFmpeg x11grab（同区域 320x240；脚本内含 dup/无 MIT-SHM 的语义说明）
+DISPLAY=:0 .build-sdl-render/bench_vs_ffmpeg.sh .build-sdl-render 3000
+```
+
+- XShm **零拷贝**采集（`VideoFrame::Borrow` 直接映射，无整帧 memcpy）vs owned 拷贝；
+- SDL **纹理直传**（BGRA 直接 `SDL_UpdateTexture`）vs 整帧拷贝基线；
+- 1e5 帧 fps / p50 / p90 / p99 / RSS +「采集→直传→回读」逐字节 0 差异；
+- 不写 PPM：渲染路径上不存在文件 IO，验证只做内存回读。
+
 ## 场景
 
 | 场景 | 节拍 | 说明 |

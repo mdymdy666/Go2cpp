@@ -4,6 +4,9 @@
  * @details 无头渲染器不依赖任何图形库，CI 与「只验证像素正确性」的端到端测试
  *          走这条路径；SDL 渲染器在 WSLg 下创建真实窗口，用 `SDL_UpdateTexture`
  *          上传 BGRA，`SDL_RENDERER_ACCELERATED` 失败时自动回退 software。
+ *          BGRA 帧**直传**纹理（`frame.Bytes()` + `EffectiveStride()`），不复制到
+ *          中间帧、不写 PPM；I420 输入才做一次格式转换（目标缓冲复用）。
+ *          `Readback()` 用 `SDL_RenderReadPixels` 回读窗口内容，供像素级验证。
  * @author go2cpp contributors
  * @date 2026-11-01
  * @copyright MIT License
@@ -128,6 +131,7 @@ class SdlRenderer final : public FrameRenderer {
             return false;
         }
         m_last_checksum = frame.Checksum();
+        m_zero_copy = false;
         if (!m_visible) {
             ++m_presented;
             return true;
@@ -135,17 +139,29 @@ class SdlRenderer final : public FrameRenderer {
         if (!EnsureTexture(frame.width, frame.height)) {
             return false;
         }
+        const std::uint8_t* pixels = nullptr;
+        int stride = 0;
         if (frame.format == PixelFormat::kI420) {
-            m_bgra.width = frame.width;
-            m_bgra.height = frame.height;
-            m_bgra.format = PixelFormat::kBGRA;
-            m_bgra.stride = frame.width * 4;
-            m_bgra.data.resize(BgraFrameBytes(frame.width, frame.height));
-            I420ToBgra(frame.data.data(), frame.width, frame.height, m_bgra.data.data(), m_bgra.stride);
+            // I420 → BGRA 是格式转换，不可避免；转换缓冲复用成员，不重新分配。
+            if (m_bgra.width != frame.width || m_bgra.height != frame.height ||
+                m_bgra.format != PixelFormat::kBGRA ||
+                m_bgra.data.size() < BgraFrameBytes(frame.width, frame.height)) {
+                m_bgra.width = frame.width;
+                m_bgra.height = frame.height;
+                m_bgra.format = PixelFormat::kBGRA;
+                m_bgra.stride = frame.width * 4;
+                m_bgra.data.resize(BgraFrameBytes(frame.width, frame.height));
+            }
+            I420ToBgra(frame.Bytes(), frame.width, frame.height, m_bgra.data.data(), m_bgra.stride);
+            pixels = m_bgra.data.data();
+            stride = m_bgra.stride;
         } else {
-            m_bgra = frame;
+            // 直传：BGRA 帧的像素指针/stride 直接交给 SDL，不做中间拷贝。
+            pixels = frame.Bytes();
+            stride = frame.EffectiveStride();
+            m_zero_copy = true;
         }
-        if (SDL_UpdateTexture(m_texture, nullptr, m_bgra.data.data(), m_bgra.EffectiveStride()) != 0) {
+        if (SDL_UpdateTexture(m_texture, nullptr, pixels, stride) != 0) {
             return false;
         }
         SDL_RenderClear(m_renderer);
@@ -162,6 +178,25 @@ class SdlRenderer final : public FrameRenderer {
         return true;
     }
 
+    bool Readback(VideoFrame* out) override {
+        if (out == nullptr || !m_visible || m_renderer == nullptr || m_texture == nullptr) {
+            return false;
+        }
+        const int width = m_texture_width;
+        const int height = m_texture_height;
+        if (width <= 0 || height <= 0) {
+            return false;
+        }
+        out->width = width;
+        out->height = height;
+        out->format = PixelFormat::kBGRA;
+        out->stride = width * 4;
+        out->data.resize(BgraFrameBytes(width, height));
+        // ARGB8888 在小端的内存布局就是 B,G,R,A，与我们的 BGRA 帧逐字节对应。
+        return SDL_RenderReadPixels(m_renderer, nullptr, SDL_PIXELFORMAT_ARGB8888,
+                                    out->data.data(), out->stride) == 0;
+    }
+
     const char* name() const noexcept override {
         return m_visible ? "sdl-window" : "sdl-headless";
     }
@@ -173,6 +208,9 @@ class SdlRenderer final : public FrameRenderer {
     }
     std::uint64_t last_checksum() const noexcept override {
         return m_last_checksum;
+    }
+    bool last_present_zero_copy() const noexcept override {
+        return m_zero_copy;
     }
 
    private:
@@ -206,6 +244,7 @@ class SdlRenderer final : public FrameRenderer {
     int m_texture_height = 0;
     bool m_visible = false;
     bool m_sdl_owned = false;
+    bool m_zero_copy = false;
     VideoFrame m_bgra;
     std::uint64_t m_presented = 0;
     std::uint64_t m_last_checksum = 0;

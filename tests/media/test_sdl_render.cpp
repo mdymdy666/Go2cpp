@@ -31,8 +31,10 @@
 #include <vector>
 
 #include "e2e_common.hpp"
+#include "go2cpp/media/capture.hpp"
 #include "go2cpp/media/frame.hpp"
 #include "go2cpp/media/pixel.hpp"
+#include "go2cpp/media/render.hpp"
 
 namespace {
 
@@ -119,6 +121,17 @@ class TestX11Window {
             return false;
         }
         return m_image->bits_per_pixel == 32 && m_image->byte_order == LSBFirst;
+    }
+
+    /// @brief 窗口 XID（供 X11Capture 的 target_window 使用）。
+    Window window() const noexcept {
+        return m_window;
+    }
+    int width() const noexcept {
+        return m_width;
+    }
+    int height() const noexcept {
+        return m_height;
     }
 
     bool Draw(const VideoFrame& bgra) {
@@ -367,6 +380,49 @@ int main() {
     const double vsync_p50 = vsync_cost[vsync_cost.size() / 2];
     Check(vsync_p50 > 6.0,
           "vsync=on 的 present p50=" + std::to_string(vsync_p50) + " ms（> 6 ms 表示生效）");
+
+    // 5) 库级闭环：XShm 零拷贝采集（target_window）→ 库 SdlRenderer 纹理直传 → 回读。
+    //    这是「采集 vs 渲染逐像素 0 差异」的真实窗口证据：采集帧的 Bytes() 直接
+    //    喂给 SDL_UpdateTexture，回读结果与采集帧逐字节比对。
+    {
+        X11CaptureConfig config;
+        config.width = kWidth;
+        config.height = kHeight;
+        config.target_window = static_cast<unsigned long>(window.window());
+        config.use_shm = true;
+        config.zero_copy = true;
+        std::string library_error;
+        auto capture = CreateX11Capture(config, &library_error);
+        if (capture == nullptr) {
+            std::printf("[INFO] library X11 capture unavailable: %s\n", library_error.c_str());
+        } else {
+            VideoFrame grabbed;
+            Check(capture->Capture(&grabbed), "库级 XShm 零拷贝采集成功");
+            Check(capture->last_capture_borrowed(), "采集帧是借用视图（无整帧拷贝）");
+            auto sdl = CreateSdlRenderer(kWidth, kHeight, false, &library_error);
+            if (sdl == nullptr) {
+                std::printf("[INFO] library SdlRenderer unavailable: %s\n",
+                            library_error.c_str());
+            } else {
+                Check(sdl->Present(grabbed), "库渲染器 Present 成功");
+                Check(sdl->last_present_zero_copy(), "BGRA 纹理直传（无中间帧拷贝）");
+                VideoFrame back;
+                if (sdl->Readback(&back)) {
+                    const std::size_t bytes = std::min(back.PlaneBytes(), grabbed.PlaneBytes());
+                    std::size_t diff = 0;
+                    for (std::size_t i = 0; i < bytes; ++i) {
+                        if (back.data[i] != grabbed.Bytes()[i]) {
+                            ++diff;
+                        }
+                    }
+                    Check(bytes == grabbed.PlaneBytes() && diff == 0,
+                          "采集→直传→回读逐字节一致（差异 " + std::to_string(diff) + "B）");
+                } else {
+                    Check(false, "库 SdlRenderer Readback 失败");
+                }
+            }
+        }
+    }
 
     SDL_Quit();
     std::printf("[test_sdl_render] checks=%d failures=%d %s\n", g_checks, g_failures,

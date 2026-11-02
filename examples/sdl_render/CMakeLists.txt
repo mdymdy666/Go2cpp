@@ -58,6 +58,10 @@ endfunction()
 add_executable(sdl_render_bench sdl_render_bench.cpp)
 sdl_render_target(sdl_render_bench)
 
+# --- 采集/渲染专项基准（XShm 零拷贝 + SDL 纹理直传 + 1e5 帧压测）-----------
+add_executable(media_capture_render_bench media_capture_render_bench.cpp)
+sdl_render_target(media_capture_render_bench)
+
 # --- 真实验证测试（X11 采集往返 + SDL 渲染契约）----------------------------
 if(EXISTS "${GO2CPP_ROOT}/tests/media/test_sdl_render.cpp")
     add_executable(sdl_test_render "${GO2CPP_ROOT}/tests/media/test_sdl_render.cpp")
@@ -67,6 +71,9 @@ endif()
 enable_testing()
 add_test(NAME sdl_render_bench
          COMMAND sdl_render_bench --quick --artifacts "${CMAKE_BINARY_DIR}/artifacts")
+add_test(NAME media_capture_render_bench
+         COMMAND media_capture_render_bench --quick
+                 --out "${CMAKE_BINARY_DIR}/media_capture_render_data.md")
 if(TARGET sdl_test_render)
     add_test(NAME sdl_render_contract COMMAND sdl_test_render)
 endif()

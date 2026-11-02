@@ -10,7 +10,12 @@
  *
  *          `SdlRenderer` 用 `SDL_CreateTexture(SDL_PIXELFORMAT_ARGB8888)` 上传 BGRA
  *          （小端下 ARGB8888 的内存布局就是 B,G,R,A），一次 `RenderCopy` + `Present`。
- *          `SDL_VIDEODRIVER=dummy` 时窗口不可见但接口仍可用，便于 CI 覆盖。
+ *          上传走**直传**：BGRA 帧的 `Bytes()`/`EffectiveStride()` 直接交给
+ *          `SDL_UpdateTexture`，不经过中间 `VideoFrame` 拷贝、更不落 PPM；只有 I420
+ *          输入需要先转一次 BGRA。`SDL_VIDEODRIVER=dummy` 时窗口不可见但接口仍可用。
+ *
+ *          `Readback()` 在窗口渲染器上把当前渲染目标读回 BGRA（`SDL_RenderReadPixels`），
+ *          用于「采集 → 渲染 → 回读」逐像素验证；无头渲染器不支持，返回 false。
  * @author go2cpp contributors
  * @date 2026-11-01
  * @copyright MIT License
@@ -49,6 +54,22 @@ class FrameRenderer {
 
     /// @brief 已呈现帧的内容校验和（用于断言「渲染器收到了正确的帧」）。
     virtual std::uint64_t last_checksum() const noexcept = 0;
+
+    /// @brief 回读当前渲染目标为 BGRA（仅窗口渲染器；无头返回 false）。
+    /// @details 读出的是**当前渲染目标**（窗口后缓冲）的内容，调用方应在
+    ///          `Present()` 之前或紧接着调用；用途是「采集 → 渲染 → 回读」的
+    ///          逐像素一致性验证，不在渲染热路径上。
+    virtual bool Readback(VideoFrame* out) {
+        (void)out;
+        return false;
+    }
+
+    /// @brief 最近一次 `Present()` 是否零拷贝直传（BGRA 直接上传到纹理）。
+    /// @details true 表示渲染器没有为这次呈现分配/拷贝中间帧；I420 输入需要
+    ///          色度转换，恒为 false。仅用于验证与统计。
+    virtual bool last_present_zero_copy() const noexcept {
+        return false;
+    }
 
    protected:
     FrameRenderer() = default;

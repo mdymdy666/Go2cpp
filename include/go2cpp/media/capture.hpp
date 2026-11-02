@@ -7,9 +7,16 @@
  *
  *          1. `XOpenDisplay(nullptr)` 打开 `$DISPLAY`（WSLg 里是 `:0`）；
  *          2. `XShmQueryExtension` 判定共享内存扩展；可用则 `XShmCreateImage`
- *             + `shmget/shmat` + `XShmAttach`，每帧 `XShmGetImage`（一次共享
- *             内存拷贝，无 socket 往返）；
+ *             + `shmget/shmat` + `XShmAttach`，每帧 `XShmGetImage`（服务器直接
+ *             写共享段，无 socket 往返）；
  *          3. 扩展不可用时回退 `XGetImage`（走 X11 协议，慢但总能跑）。
+ *
+ *          **零拷贝**：XShm 路径默认仍把共享段拷进 `VideoFrame::data`（历史行为，
+ *          兼容 `codec.cpp` 等直接读 `frame.data` 的调用方）。打开
+ *          `X11CaptureConfig::zero_copy` 后，采集帧改为 `VideoFrame::Borrow()`
+ *          的**借用视图**，直接指向 XShm 段，只把 alpha 字节原地填 0xFF；整帧
+ *          memcpy 消失。借用视图的像素**只在下一次 `Capture()` 之前有效**，调用方
+ *          必须在这之前用 `Bytes()` 消费（不能长期持有，也不能跨线程读）。
  *
  *          采集结果统一转成 **BGRA**（X11 depth-24 小端 ZPixmap 的内存布局是
  *          B,G,R,X，把 X 通道填 0xFF 得到 BGRA，后续转换按 B/G/R 取）。
@@ -55,17 +62,40 @@ class VideoSource {
     /// @brief 是否真的连上了图形后端（合成源恒 true）。
     virtual bool available() const noexcept = 0;
 
+    /// @brief 最近一次 `Capture()` 是否返回零拷贝视图（借用外部缓冲）。
+    /// @details 默认 false（自有内存）。仅用于验证/统计：true 时帧的 `data` 为空，
+    ///          像素由 `Bytes()` 指向源缓冲，生命周期到下一次 `Capture()`。
+    virtual bool last_capture_borrowed() const noexcept {
+        return false;
+    }
+
    protected:
     VideoSource() = default;
 };
 
 /// @brief X11 采集配置。
 struct X11CaptureConfig {
-    int width = 640;   ///< 抓取宽度；<=0 表示用屏幕全宽。
-    int height = 480;  ///< 抓取高度；<=0 表示用屏幕全高。
-    int x = 0;         ///< 抓取起点 X。
-    int y = 0;         ///< 抓取起点 Y。
+    int width = 640;   ///< 抓取宽度；<=0 表示用屏幕全宽（窗口模式下用窗口宽度）。
+    int height = 480;  ///< 抓取高度；<=0 表示用屏幕全高（窗口模式下用窗口高度）。
+    int x = 0;         ///< 抓取起点 X（相对抓取目标）。
+    int y = 0;         ///< 抓取起点 Y（相对抓取目标）。
     bool use_shm = true;  ///< 优先 XShm；测试里可关掉以覆盖 XGetImage 路径。
+    /// @brief 零拷贝：XShm 段直接借给 `VideoFrame`，不 memcpy 到自有缓冲。
+    /// @details 默认 false 保持历史 API 语义（帧拥有像素、可长期持有）。开启后：
+    ///          - `VideoFrame::data` 为空、`borrowed` 指向 XShm 段；
+    ///          - 帧只在下一次 `Capture()` 前有效，调用方必须用 `Bytes()` 读；
+    ///          - `use_shm=true` 且 XShm 初始化成功时才生效；回退 `XGetImage`
+    ///            的路径必须拷贝（`XDestroyImage` 会释放图像），此时仍是自有帧。
+    bool zero_copy = false;
+    /// @brief 零拷贝模式下是否原地把 alpha 填 0xFF（默认 true）。
+    /// @details XShm 段里第 4 字节是 X11 的填充字节，不是 alpha。填 0xFF 得到
+    ///          与 owned 路径逐字节一致的 BGRA；关掉可省掉这一遍原地写（下游若
+    ///          只用 B/G/R，例如 BGRA→I420 编码，可以关）。
+    bool fill_alpha_in_place = true;
+    /// @brief 抓取目标窗口（0 = root window）。
+    /// @details 用于抓自建窗口（测试/合成画面），避免依赖 WSLg root 画面；
+    ///          XShmGetImage 对 InputOutput 窗口是合法 drawable。
+    unsigned long target_window = 0;
 };
 
 /// @brief 创建 X11 采集源。
