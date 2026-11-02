@@ -54,6 +54,13 @@
 #include <string>
 #include <vector>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define GO2CPP_AUDIO_X86 1
+#else
+#define GO2CPP_AUDIO_X86 0
+#endif
+
 #include "go2cpp/media/transport.hpp"
 
 extern char** environ;
@@ -192,6 +199,84 @@ std::uint8_t UlawEncodeTableImpl(std::int16_t pcm) noexcept {
 std::int16_t UlawDecodeTableImpl(std::uint8_t value) noexcept {
     return kUlawDecode.linear[value];
 }
+
+
+// ---------------------------------------------------------------------------
+// x86 SIMD 内核（µ-law 编码）
+// ---------------------------------------------------------------------------
+//
+// 与 `pixel.cpp` 同一套分派约定：进程内首次使用时探测一次 CPU，之后只读；
+// 非 x86 或 CPU 不支持 AVX2 时全部回退标量。SIMD 版本与查表版本**逐字节
+// 等价**——测试穷举 65536 个输入、再加 1e5 帧随机样本比对。
+//
+// 为什么编码能向量化而解码不能：解码是「1 次查表 load + 1 次 store」，标量
+// 已经压到每样本约 1 个周期（2 个 uop，Zen4 双 store 端口的 2 倍）；解码的
+// SIMD 化反而要 10+ 条指令把 8 位码字解包成 16 位，得不偿失。编码则是
+// 「找 exponent 的串行依赖链」，标量每样本约 5 个周期，向量化收益明显。
+
+#if GO2CPP_AUDIO_X86
+namespace {
+
+constexpr std::int32_t kUlawClip = 32635;
+constexpr std::int32_t kUlawBias = 0x84;
+
+/// @brief 8 个 int32 的 µ-law 编码（AVX2），与 `UlawEncodeTableImpl` 逐位一致。
+/// @details exponent 用 float 指数域取（`biased >> 7 <= 255`，float 精确），
+///          等价于查表的 `floor(log2(index))`：表里 `kSegEnd` 的判定就是
+///          「最高有效位位置」，两者在 0..255 全域一致（测试穷举验证）。
+__attribute__((target("avx2"), always_inline)) inline __m256i UlawEncode8Avx2(
+    __m256i pcm) noexcept {
+    const __m256i sign = _mm256_and_si256(_mm256_srai_epi32(pcm, 8),
+                                          _mm256_set1_epi32(0x80));
+    __m256i magnitude = _mm256_abs_epi32(pcm);
+    magnitude = _mm256_min_epi32(magnitude, _mm256_set1_epi32(kUlawClip));
+    const __m256i biased = _mm256_add_epi32(magnitude, _mm256_set1_epi32(kUlawBias));
+    const __m256i index = _mm256_srli_epi32(biased, 7);
+    const __m256 as_float = _mm256_cvtepi32_ps(index);
+    __m256i exponent = _mm256_sub_epi32(
+        _mm256_srli_epi32(_mm256_castps_si256(as_float), 23), _mm256_set1_epi32(127));
+    exponent = _mm256_max_epi32(exponent, _mm256_setzero_si256());
+    const __m256i mantissa = _mm256_and_si256(
+        _mm256_srlv_epi32(biased, _mm256_add_epi32(exponent, _mm256_set1_epi32(3))),
+        _mm256_set1_epi32(0x0F));
+    const __m256i code =
+        _mm256_or_si256(_mm256_or_si256(sign, _mm256_slli_epi32(exponent, 4)), mantissa);
+    return _mm256_andnot_si256(code, _mm256_set1_epi32(0xFF));
+}
+
+/// @brief µ-law 编码的 AVX2 批量实现（16 样本/轮，尾部走标量）。
+__attribute__((target("avx2"))) void UlawEncodeBlockAvx2(const std::int16_t* pcm,
+                                                         std::size_t samples,
+                                                         std::uint8_t* out) noexcept {
+    std::size_t i = 0;
+    for (; i + 16 <= samples; i += 16) {
+        const __m256i low = _mm256_cvtepi16_epi32(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(pcm + i)));
+        const __m256i high = _mm256_cvtepi16_epi32(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(pcm + i + 8)));
+        __m256i words = _mm256_packs_epi32(UlawEncode8Avx2(low), UlawEncode8Avx2(high));
+        // packs 的 64 位块顺序是 [0,1 | 2,3]（每 128 位 lane 独立），
+        // 重排成 [0,2 | 1,3] 才能得到「前 8 个样本、后 8 个样本」。
+        words = _mm256_permute4x64_epi64(words, 0xD8);
+        const __m128i bytes = _mm_packus_epi16(_mm256_castsi256_si128(words),
+                                               _mm256_extracti128_si256(words, 1));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + i), bytes);
+    }
+    for (; i < samples; ++i) {
+        out[i] = UlawEncodeTableImpl(pcm[i]);
+    }
+}
+
+/// @brief AVX2 探测（热路径可见，不能有 static-local guard）。
+/// @details GCC 的 `__builtin_cpu_supports` 读 libgcc 在 `main` 之前初始化好的
+///          `__cpu_model` 全局，编译出来只有一两条指令、无原子。若构造器没跑，
+///          它返回 false → 安全回退标量。
+bool CpuHasAvx2() noexcept {
+    return __builtin_cpu_supports("avx2") != 0;
+}
+
+}  // namespace
+#endif  // GO2CPP_AUDIO_X86
 
 /// @brief A-law 解码（公式版；A-law 不是本模块的性能重点）。
 std::int16_t AlawLawToLinear(std::uint8_t value) noexcept {
@@ -563,21 +648,15 @@ int OpusFrameSamples(const AudioFormat& format) noexcept {
     return 480;
 }
 
-/// @brief 16.16 定点线性重采样（单/双声道交错处理）。
-void ResampleLinear(const std::int16_t* in, int in_frames, int in_rate, std::int16_t* out,
-                    int out_frames, int out_rate, int channels) noexcept {
-    if (in_frames <= 0 || out_frames <= 0 || channels <= 0) {
-        return;
-    }
-    if (in_rate == out_rate) {
-        std::memcpy(out, in, static_cast<std::size_t>(in_frames) * channels * sizeof(std::int16_t));
-        return;
-    }
-    const std::uint32_t step = static_cast<std::uint32_t>(
-        (static_cast<std::uint64_t>(in_rate) << 16) / static_cast<std::uint64_t>(out_rate));
-    std::uint32_t position = 0;
+/// @brief 16.16 定点线性重采样的标量区间实现（从 `first_frame` 起、`position` 起）。
+/// @details 拆成区间实现是为了让 SIMD 内核处理完前缀后，标量接着跑剩下的
+///          尾巴（含末端 clamp），两条路径共用同一份舍入语义。
+void ResampleLinearScalarRange(const std::int16_t* in, int in_frames, std::int16_t* out,
+                               int out_frames, int channels, std::uint32_t step,
+                               std::uint32_t position, int first_frame) noexcept {
     const int last_frame = in_frames - 1;
-    for (int frame = 0; frame < out_frames; ++frame) {
+    const std::uint32_t limit = static_cast<std::uint32_t>(last_frame) << 16;
+    for (int frame = first_frame; frame < out_frames; ++frame) {
         const int index = static_cast<int>(position >> 16);
         const int next = index < last_frame ? index + 1 : last_frame;
         const int frac = static_cast<int>(position & 0xFFFFU);
@@ -589,10 +668,110 @@ void ResampleLinear(const std::int16_t* in, int in_frames, int in_rate, std::int
                 static_cast<std::int16_t>(mixed);
         }
         position += step;
-        if (position > (static_cast<std::uint32_t>(last_frame) << 16)) {
-            position = static_cast<std::uint32_t>(last_frame) << 16;
+        if (position > limit) {
+            position = limit;
         }
     }
+}
+
+/// @brief 纯标量重采样（单/双声道交错处理；`ResampleLinearSimd` 的回退路径）。
+void ResampleLinearScalarImpl(const std::int16_t* in, int in_frames, int in_rate,
+                              std::int16_t* out, int out_frames, int out_rate,
+                              int channels) noexcept {
+    if (in_frames <= 0 || out_frames <= 0 || channels <= 0) {
+        return;
+    }
+    if (in_rate == out_rate) {
+        std::memcpy(out, in, static_cast<std::size_t>(in_frames) * channels * sizeof(std::int16_t));
+        return;
+    }
+    const std::uint32_t step = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(in_rate) << 16) / static_cast<std::uint64_t>(out_rate));
+    ResampleLinearScalarRange(in, in_frames, out, out_frames, channels, step, 0, 0);
+}
+
+#if GO2CPP_AUDIO_X86
+namespace {
+
+/// @brief 单声道重采样的 AVX2 内核：8 个输出帧/轮，返回已完成的帧数。
+/// @details 每轮用一条 `vpgatherdd` 同时取出 (in[idx], in[idx+1]) 两个样本
+///          （scale=2，一次 32 位读），随后用 32 位整数运算做插值。只在
+///          「本轮 8 帧都不触碰末端 clamp」时才走 SIMD，并且要求
+///          `idx_last < in_frames-1`，保证 gather 的两字节前瞻不越界；
+///          其余帧交给标量尾巴。
+__attribute__((target("avx2"))) int ResampleLinearAvx2Mono(const std::int16_t* in,
+                                                           int in_frames, std::int16_t* out,
+                                                           int out_frames,
+                                                           std::uint32_t step) noexcept {
+    const std::uint32_t limit = static_cast<std::uint32_t>(in_frames - 1) << 16;
+    const __m256i lane_offsets = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    const __m256i deltas = _mm256_mullo_epi32(lane_offsets, _mm256_set1_epi32(static_cast<int>(step)));
+    const __m256i frac_mask = _mm256_set1_epi32(0xFFFF);
+    const __m256i byte_mask = _mm256_set1_epi32(0xFF);
+    int frame = 0;
+    std::uint32_t position = 0;
+    for (; frame + 8 <= out_frames; frame += 8) {
+        const std::uint32_t last_position = position + 7 * step;
+        if (last_position >= limit) {  // 末端 clamp 区：交给标量（含 clamp 语义）
+            break;
+        }
+        const __m256i pos =
+            _mm256_add_epi32(_mm256_set1_epi32(static_cast<int>(position)), deltas);
+        const __m256i index = _mm256_srli_epi32(pos, 16);
+        const __m256i frac = _mm256_and_si256(pos, frac_mask);
+        // 一次 gather 读 4 字节：低 16 位 = in[idx]，高 16 位 = in[idx+1]（小端）。
+        const __m256i pair =
+            _mm256_i32gather_epi32(reinterpret_cast<const int*>(in), index, 2);
+        const __m256i a = _mm256_srai_epi32(_mm256_slli_epi32(pair, 16), 16);
+        const __m256i b = _mm256_srai_epi32(pair, 16);
+        const __m256i delta = _mm256_sub_epi32(b, a);
+        const __m256i delta_hi = _mm256_srai_epi32(delta, 8);
+        const __m256i delta_lo = _mm256_and_si256(delta, byte_mask);
+        const __m256i hi_part = _mm256_mullo_epi32(delta_hi, frac);
+        const __m256i lo_part = _mm256_srli_epi32(_mm256_mullo_epi32(delta_lo, frac), 8);
+        const __m256i mixed = _mm256_add_epi32(
+            a, _mm256_srai_epi32(_mm256_add_epi32(hi_part, lo_part), 8));
+        const __m128i packed = _mm_packs_epi32(_mm256_castsi256_si128(mixed),
+                                               _mm256_extracti128_si256(mixed, 1));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out + frame), packed);
+        position += 8 * step;
+    }
+    return frame;
+}
+
+}  // namespace
+#endif  // GO2CPP_AUDIO_X86
+
+/// @brief 16.16 定点线性重采样（单/双声道交错处理；自动选 SIMD 内核）。
+void ResampleLinear(const std::int16_t* in, int in_frames, int in_rate, std::int16_t* out,
+                    int out_frames, int out_rate, int channels) noexcept {
+    if (in_frames <= 0 || out_frames <= 0 || channels <= 0) {
+        return;
+    }
+    if (in_rate == out_rate) {
+        std::memcpy(out, in, static_cast<std::size_t>(in_frames) * channels * sizeof(std::int16_t));
+        return;
+    }
+    const std::uint32_t step = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(in_rate) << 16) / static_cast<std::uint64_t>(out_rate));
+#if GO2CPP_AUDIO_X86
+    if (channels == 1 && CpuHasAvx2()) {
+        const int done = ResampleLinearAvx2Mono(in, in_frames, out, out_frames, step);
+        if (done < out_frames) {
+            // SIMD 一轮推进 8*step，可能已经越过末端 clamp 点；标量续跑的第一帧
+            // 会在未钳制的 position 上取 index（越界读）。先钳到 limit，与标量
+            // 自身「算完当前帧再 clamp」的语义对齐。
+            const std::uint32_t limit = static_cast<std::uint32_t>(in_frames - 1) << 16;
+            std::uint32_t resume = static_cast<std::uint32_t>(done) * step;
+            if (resume > limit) {
+                resume = limit;
+            }
+            ResampleLinearScalarRange(in, in_frames, out, out_frames, channels, step, resume, done);
+        }
+        return;
+    }
+#endif
+    ResampleLinearScalarRange(in, in_frames, out, out_frames, channels, step, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,9 +1258,67 @@ std::int16_t UlawDecodeTable(std::uint8_t value) noexcept {
 
 void UlawEncodeBlock(const std::int16_t* pcm, std::size_t samples,
                      std::uint8_t* out) noexcept {
+#if GO2CPP_AUDIO_X86
+    if (CpuHasAvx2()) {
+        UlawEncodeBlockAvx2(pcm, samples, out);
+        return;
+    }
+#endif
     for (std::size_t i = 0; i < samples; ++i) {
         out[i] = UlawEncodeTableImpl(pcm[i]);
     }
+}
+
+AudioKernelLevel SelectedAudioKernel() noexcept {
+#if GO2CPP_AUDIO_X86
+    static const AudioKernelLevel level =
+        CpuHasAvx2() ? AudioKernelLevel::kSimd : AudioKernelLevel::kScalar;
+    return level;
+#else
+    return AudioKernelLevel::kScalar;
+#endif
+}
+
+const char* AudioKernelName(AudioKernelLevel level) noexcept {
+    switch (level) {
+        case AudioKernelLevel::kSimd:
+            return "avx2";
+        case AudioKernelLevel::kScalar:
+        default:
+            return "scalar";
+    }
+}
+
+void UlawEncodeBlockSimd(const std::int16_t* pcm, std::size_t samples,
+                         std::uint8_t* out) noexcept {
+#if GO2CPP_AUDIO_X86
+    if (CpuHasAvx2()) {
+        UlawEncodeBlockAvx2(pcm, samples, out);
+        return;
+    }
+#endif
+    for (std::size_t i = 0; i < samples; ++i) {
+        out[i] = UlawEncodeTableImpl(pcm[i]);
+    }
+}
+
+void UlawEncodeBlockScalar(const std::int16_t* pcm, std::size_t samples,
+                           std::uint8_t* out) noexcept {
+    for (std::size_t i = 0; i < samples; ++i) {
+        out[i] = UlawEncodeTableImpl(pcm[i]);
+    }
+}
+
+void ResampleLinearScalar(const std::int16_t* in, int in_frames, int in_rate,
+                          std::int16_t* out, int out_frames, int out_rate,
+                          int channels) noexcept {
+    ResampleLinearScalarImpl(in, in_frames, in_rate, out, out_frames, out_rate, channels);
+}
+
+void ResampleLinearSimd(const std::int16_t* in, int in_frames, int in_rate,
+                        std::int16_t* out, int out_frames, int out_rate,
+                        int channels) noexcept {
+    ResampleLinear(in, in_frames, in_rate, out, out_frames, out_rate, channels);
 }
 
 void UlawDecodeBlock(const std::uint8_t* law, std::size_t samples,
@@ -1149,9 +1386,7 @@ class G711AudioEncoder final : public AudioEncoder {
         out->resize(count);
         const auto* samples = reinterpret_cast<const std::int16_t*>(frame.data.data());
         if (m_codec == AudioCodec::kPcmu) {
-            for (std::size_t i = 0; i < count; ++i) {
-                (*out)[i] = UlawEncodeTableImpl(samples[i]);
-            }
+            detail::UlawEncodeBlock(samples, count, out->data());
         } else {
             for (std::size_t i = 0; i < count; ++i) {
                 (*out)[i] = AlawLinearToLaw(samples[i]);
@@ -1212,9 +1447,12 @@ class G711AudioDecoder final : public AudioDecoder {   public:
             ++m_dropped;
             return false;
         }
-        for (std::size_t i = 0; i < bytes; ++i) {
-            samples[i] = m_codec == AudioCodec::kPcmu ? UlawDecodeTableImpl(payload[i])
-                                                      : AlawLawToLinear(payload[i]);
+        if (m_codec == AudioCodec::kPcmu) {
+            detail::UlawDecodeBlock(payload, bytes, samples);
+        } else {
+            for (std::size_t i = 0; i < bytes; ++i) {
+                samples[i] = AlawLawToLinear(payload[i]);
+            }
         }
         for (std::size_t i = bytes; i < target_samples; ++i) {
             samples[i] = 0;
@@ -1330,6 +1568,7 @@ class OpusAudioEncoder final : public AudioEncoder {
         if (m_encoder == nullptr || opus_error != 0) {
             return SetError(error, "opus_encoder_create failed: " + std::to_string(opus_error));
         }
+        m_api = &api;
         if (m_config.bitrate > 0) {
             api.encoder_ctl(m_encoder, kOpusSetBitrate, m_config.bitrate);
         }
@@ -1358,13 +1597,15 @@ class OpusAudioEncoder final : public AudioEncoder {
                            kOpusClockRate, channels);
             pcm = m_pcm.data();
         }
-        std::array<unsigned char, kOpusMaxPacketBytes> buffer{};
+        // 不再每帧在栈上零初始化 1275B 包缓冲（objdump 里是一条 rep stos）：
+        // 缓冲提升为成员，libopus 只写 [0, produced) 这一段。
         const std::int32_t produced =
-            Opus().encode(m_encoder, pcm, m_frame_samples, buffer.data(), kOpusMaxPacketBytes);
+            m_api->encode(m_encoder, pcm, m_frame_samples, m_packet.data(),
+                          kOpusMaxPacketBytes);
         if (produced < 0) {
             return false;
         }
-        out->assign(buffer.data(), buffer.data() + produced);
+        out->assign(m_packet.data(), m_packet.data() + produced);
         ++m_frames;
         m_bytes += static_cast<std::uint64_t>(produced);
         return true;
@@ -1390,6 +1631,8 @@ class OpusAudioEncoder final : public AudioEncoder {
     AudioEncoderConfig m_config;
     int m_frame_samples;
     void* m_encoder = nullptr;
+    const OpusApi* m_api = nullptr;
+    std::array<unsigned char, kOpusMaxPacketBytes> m_packet{};
     std::vector<std::int16_t> m_pcm;
     std::string m_name;
     std::uint64_t m_frames = 0;

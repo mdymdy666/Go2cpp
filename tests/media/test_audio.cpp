@@ -1140,7 +1140,167 @@ void TestPulsePlayback() {
 }
 
 // ---------------------------------------------------------------------------
-// 12. 压测（>=1e7）
+// 12. SIMD 内核：与标量/查表逐字节一致
+// ---------------------------------------------------------------------------
+
+void TestAudioSimd() {
+    std::printf("[TEST] simd kernels\n");
+    const char* kernel = detail::AudioKernelName(detail::SelectedAudioKernel());
+    std::printf("       kernel=%s\n", kernel);
+    MEDIA_CHECK(kernel != nullptr);
+
+    // 1) µ-law 编码：65536 个输入穷举（SIMD 一次性跑完），与查表逐字节比对。
+    std::vector<std::int16_t> all(65536);
+    for (std::size_t i = 0; i < all.size(); ++i) {
+        all[i] = static_cast<std::int16_t>(static_cast<std::uint32_t>(i) - 32768U);
+    }
+    std::vector<std::uint8_t> simd(all.size());
+    detail::UlawEncodeBlockSimd(all.data(), all.size(), simd.data());
+    std::size_t encode_mismatch = 0;
+    for (std::size_t i = 0; i < all.size(); ++i) {
+        if (simd[i] != detail::UlawEncodeTable(all[i])) {
+            ++encode_mismatch;
+        }
+    }
+    MEDIA_CHECK_EQ(encode_mismatch, static_cast<std::size_t>(0));
+
+    // 2) 不整齐长度：16 的倍数走 SIMD 主循环，其余是标量尾巴。
+    std::mt19937 rng(0x5151U);
+    std::size_t tail_mismatch = 0;
+    for (std::size_t samples : {1U, 7U, 15U, 16U, 17U, 31U, 441U, 1000U, 4097U}) {
+        std::vector<std::int16_t> src(samples);
+        for (std::size_t i = 0; i < samples; ++i) {
+            src[i] = static_cast<std::int16_t>(rng() & 0xFFFFU);
+        }
+        std::vector<std::uint8_t> fast(samples);
+        detail::UlawEncodeBlockSimd(src.data(), samples, fast.data());
+        for (std::size_t i = 0; i < samples; ++i) {
+            if (fast[i] != detail::UlawEncodeTable(src[i])) {
+                ++tail_mismatch;
+            }
+        }
+    }
+    MEDIA_CHECK_EQ(tail_mismatch, static_cast<std::size_t>(0));
+
+    // 3) 重采样：SIMD 与标量逐样本一致（含末端 clamp、超短帧、等采样率）。
+    struct ResampleCase {
+        int in_frames;
+        int in_rate;
+        int out_frames;
+        int out_rate;
+    };
+    const ResampleCase cases[] = {
+        {441, 44100, 480, 48000}, {882, 44100, 960, 48000}, {480, 48000, 441, 44100},
+        {1, 44100, 1, 48000},     {2, 44100, 2, 48000},     {3, 44100, 441, 48000},
+        {441, 44100, 441, 44100}, {100, 8000, 480, 48000},  {960, 48000, 441, 44100},
+    };
+    std::size_t resample_mismatch = 0;
+    for (const ResampleCase& item : cases) {
+        std::vector<std::int16_t> src(static_cast<std::size_t>(std::max(item.in_frames, 1)));
+        for (std::size_t i = 0; i < src.size(); ++i) {
+            src[i] = static_cast<std::int16_t>(rng() & 0xFFFFU);
+        }
+        std::vector<std::int16_t> fast(static_cast<std::size_t>(item.out_frames) + 8);
+        std::vector<std::int16_t> slow(static_cast<std::size_t>(item.out_frames) + 8);
+        detail::ResampleLinearSimd(src.data(), item.in_frames, item.in_rate, fast.data(),
+                                   item.out_frames, item.out_rate, 1);
+        detail::ResampleLinearScalar(src.data(), item.in_frames, item.in_rate, slow.data(),
+                                     item.out_frames, item.out_rate, 1);
+        if (std::memcmp(fast.data(), slow.data(),
+                        static_cast<std::size_t>(item.out_frames) * sizeof(std::int16_t)) != 0) {
+            ++resample_mismatch;
+        }
+    }
+    // 4) 随机帧数/随机采样率组合。
+    const int rates[] = {8000, 12000, 16000, 24000, 44100, 48000};
+    for (int round = 0; round < 400; ++round) {
+        const int in_frames = 1 + static_cast<int>(rng() % 500U);
+        const int out_frames = 1 + static_cast<int>(rng() % 500U);
+        const int in_rate = rates[rng() % 6U];
+        const int out_rate = rates[rng() % 6U];
+        std::vector<std::int16_t> src(static_cast<std::size_t>(in_frames));
+        for (std::size_t i = 0; i < src.size(); ++i) {
+            src[i] = static_cast<std::int16_t>(rng() & 0xFFFFU);
+        }
+        // 等采样率时输出帧数 = in_frames（memcpy 分支），缓冲按两者最大值开。
+        const std::size_t capacity =
+            static_cast<std::size_t>(std::max(in_frames, out_frames)) + 8;
+        std::vector<std::int16_t> fast(capacity);
+        std::vector<std::int16_t> slow(capacity);
+        detail::ResampleLinearSimd(src.data(), in_frames, in_rate, fast.data(), out_frames, out_rate,
+                                   1);
+        detail::ResampleLinearScalar(src.data(), in_frames, in_rate, slow.data(), out_frames,
+                                     out_rate, 1);
+        if (std::memcmp(fast.data(), slow.data(),
+                        static_cast<std::size_t>(out_frames) * sizeof(std::int16_t)) != 0) {
+            ++resample_mismatch;
+        }
+    }
+    MEDIA_CHECK_EQ(resample_mismatch, static_cast<std::size_t>(0));
+}
+
+// ---------------------------------------------------------------------------
+// 13. 编解码延迟（Opus 包装 vs 源采样率）
+// ---------------------------------------------------------------------------
+
+void TestCodecLatency() {
+    std::printf("[TEST] codec latency\n");
+    const AudioCodecAvailability availability = ProbeAudioCodecs();
+    if (!availability.opus) {
+        media_test::Skip("libopus.so.0 unavailable");
+        return;
+    }
+    struct Case {
+        AudioFormat format;
+        const char* name;
+        bool resampled;
+    };
+    const Case cases[] = {
+        {MakeFormat(48000, 1), "48k-mono", false},
+        {MakeFormat(44100, 1), "44.1k-mono", true},
+    };
+    for (const Case& item : cases) {
+        AudioEncoderConfig config;
+        config.codec = AudioCodec::kOpus;
+        config.format = item.format;
+        config.bitrate = 32000;
+        std::string error;
+        auto encoder = CreateAudioEncoder(config, &error);
+        MEDIA_CHECK(encoder != nullptr);
+        if (encoder == nullptr) {
+            std::printf("       %s: %s\n", item.name, error.c_str());
+            continue;
+        }
+        AudioCaptureConfig capture = MakeCapture(item.format, SyntheticAudioPattern::kSine440);
+        auto source = CreateSyntheticAudioSource(capture, nullptr);
+        constexpr int kFrames = 600;
+        std::vector<AudioFrame> frames(static_cast<std::size_t>(kFrames));
+        for (int i = 0; i < kFrames; ++i) {
+            MEDIA_CHECK(source->Read(&frames[static_cast<std::size_t>(i)]));
+        }
+        std::vector<std::uint8_t> payload;
+        payload.reserve(1275);
+        for (int i = 0; i < 50; ++i) {  // 预热
+            MEDIA_CHECK(encoder->Encode(frames[static_cast<std::size_t>(i)], &payload));
+        }
+        std::uint64_t bytes = 0;
+        const auto start = Clock::now();
+        for (int i = 0; i < kFrames; ++i) {
+            MEDIA_CHECK(encoder->Encode(frames[static_cast<std::size_t>(i)], &payload));
+            bytes += payload.size();
+        }
+        const double ms = MsSince(start);
+        std::printf(
+            "[PERF] opus_encode format=%s resampled=%d frames=%d ms=%.3f ns_per_frame=%.1f "
+            "avg_packet=%.1f B\n",
+            item.name, item.resampled ? 1 : 0, kFrames, ms, ms * 1e6 / kFrames,
+            static_cast<double>(bytes) / kFrames);
+        MEDIA_CHECK_EQ(encoder->encoded_frames(), static_cast<std::uint64_t>(kFrames + 50));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 14. 压测（>=1e7）
 // ---------------------------------------------------------------------------
 
 void TestBench() {
@@ -1267,6 +1427,57 @@ void TestBench() {
     MEDIA_CHECK_GE(kSamples, static_cast<std::size_t>(10000000));
     MEDIA_CHECK_EQ(fragments, kFrames);
     MEDIA_CHECK_GE(fresh_ns, reuse_ns);
+
+    // ---- SIMD 内核：µ-law 编码（1e7）与重采样（1e5 帧 × 441→480）----------
+    std::printf("[PERF] audio_kernel=%s\n", detail::AudioKernelName(detail::SelectedAudioKernel()));
+    std::vector<std::uint8_t> scalar_encoded(kSamples);
+    start = Clock::now();
+    detail::UlawEncodeBlockScalar(pcm.data(), kSamples, scalar_encoded.data());
+    const double scalar_encode_ms = MsSince(start);
+    std::vector<std::uint8_t> simd_encoded(kSamples);
+    start = Clock::now();
+    detail::UlawEncodeBlockSimd(pcm.data(), kSamples, simd_encoded.data());
+    const double simd_encode_ms = MsSince(start);
+    std::printf(
+        "[PERF] ulaw_encode_simd samples=%zu scalar_ns=%.3f simd_ns=%.3f speedup=%.2fx\n",
+        kSamples, scalar_encode_ms * 1e6 / static_cast<double>(kSamples),
+        simd_encode_ms * 1e6 / static_cast<double>(kSamples),
+        scalar_encode_ms / std::max(simd_encode_ms, 1e-9));
+    // 与查表路径（encoded 里是 baseline 的结果）逐字节比对，防止「测了个错的实现」。
+    MEDIA_CHECK_EQ(std::memcmp(encoded.data(), simd_encoded.data(), kSamples), 0);
+    MEDIA_CHECK_EQ(std::memcmp(encoded.data(), scalar_encoded.data(), kSamples), 0);
+
+    constexpr int kResampleFrames = 100000;
+    std::vector<std::int16_t> resample_in(441);
+    std::vector<std::int16_t> resample_out(480);
+    for (int i = 0; i < 441; ++i) {
+        resample_in[static_cast<std::size_t>(i)] = static_cast<std::int16_t>(16000 * std::sin(
+            6.283185307179586 * 440.0 * i / 44100.0));
+    }
+    start = Clock::now();
+    for (int i = 0; i < kResampleFrames; ++i) {
+        resample_in[0] = static_cast<std::int16_t>(i & 0x7FFF);  // 防止循环被整体提升
+        detail::ResampleLinearScalar(resample_in.data(), 441, 44100, resample_out.data(), 480,
+                                     48000, 1);
+    }
+    const double resample_scalar_ms = MsSince(start);
+    std::vector<std::int16_t> resample_ref(resample_out);
+    start = Clock::now();
+    for (int i = 0; i < kResampleFrames; ++i) {
+        resample_in[0] = static_cast<std::int16_t>(i & 0x7FFF);
+        detail::ResampleLinearSimd(resample_in.data(), 441, 44100, resample_out.data(), 480,
+                                   48000, 1);
+    }
+    const double resample_simd_ms = MsSince(start);
+    MEDIA_CHECK_EQ(std::memcmp(resample_ref.data(), resample_out.data(),
+                               resample_ref.size() * sizeof(std::int16_t)),
+                   0);
+    std::printf(
+        "[PERF] resample_44100_to_48000 frames=%d scalar_ms=%.2f simd_ms=%.2f "
+        "scalar_ns_per_frame=%.1f simd_ns_per_frame=%.1f speedup=%.2fx\n",
+        kResampleFrames, resample_scalar_ms, resample_simd_ms,
+        resample_scalar_ms * 1e6 / kResampleFrames, resample_simd_ms * 1e6 / kResampleFrames,
+        resample_scalar_ms / std::max(resample_simd_ms, 1e-9));
 }
 
 }  // namespace
@@ -1276,6 +1487,8 @@ int main() {
     TestG711();
     TestPcmPipeline1e5();
     TestOpus();
+    TestAudioSimd();
+    TestCodecLatency();
     TestRtpHeader();
     TestPacketizeReassemble();
     TestJitterBuffer();

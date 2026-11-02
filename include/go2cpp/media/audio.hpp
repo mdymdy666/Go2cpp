@@ -898,6 +898,36 @@ void UlawEncodeBlock(const std::int16_t* pcm, std::size_t samples,
 void UlawDecodeBlock(const std::uint8_t* law, std::size_t samples,
                      std::int16_t* out) noexcept;
 
+/// @brief 音频内核层级（标量基线 / x86 SIMD）。
+enum class AudioKernelLevel : int {
+    kScalar = 0,  ///< 纯标量实现（任何平台）。
+    kSimd = 1,    ///< AVX2/SSSE3 实现（x86-64；其余平台自动回退标量）。
+};
+
+/// @brief 当前进程实际选中的内核（首次调用探测一次，之后只读）。
+AudioKernelLevel SelectedAudioKernel() noexcept;
+
+/// @brief 内核层级转可读名字（"scalar" / "avx2"）。
+const char* AudioKernelName(AudioKernelLevel level) noexcept;
+
+/// @brief µ-law 编码的 SIMD 批量实现（与 UlawEncodeBlock 逐字节一致）。
+void UlawEncodeBlockSimd(const std::int16_t* pcm, std::size_t samples,
+                         std::uint8_t* out) noexcept;
+
+/// @brief µ-law 编码的强制标量批量实现（性能 A/B 基线，逐字节等价）。
+void UlawEncodeBlockScalar(const std::int16_t* pcm, std::size_t samples,
+                           std::uint8_t* out) noexcept;
+
+/// @brief 16.16 定点线性重采样的标量基线实现。
+void ResampleLinearScalar(const std::int16_t* in, int in_frames, int in_rate,
+                          std::int16_t* out, int out_frames, int out_rate,
+                          int channels) noexcept;
+
+/// @brief 重采样的 SIMD 实现（与标量逐样本一致；CPU 不支持时内部回退标量）。
+void ResampleLinearSimd(const std::int16_t* in, int in_frames, int in_rate,
+                        std::int16_t* out, int out_frames, int out_rate,
+                        int channels) noexcept;
+
 }  // namespace detail
 
 // ===========================================================================
