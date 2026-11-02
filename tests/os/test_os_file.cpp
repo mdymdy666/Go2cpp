@@ -31,6 +31,10 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <csignal>
+#include <cstdint>
+#include <sys/time.h>
+#include <sys/uio.h>
 #include <fcntl.h>
 #include <random>
 #include <string>
@@ -603,6 +607,411 @@ void ScenarioAuditRegressions() {
     Check(fd_flags >= 0 && (fd_flags & FD_CLOEXEC) != 0, "fd flags: FD_CLOEXEC");
 }
 
+
+// ---------------------------------------------------------------------------
+// 场景 13：1e6 次读写 —— 逐字节一致
+// ---------------------------------------------------------------------------
+// 口径：1e6 条 8 字节记录，每条 = 序号(4B) + 反码(4B)。写完用两种路径各校验
+// 一次：(a) 顺序 File::Read 逐条比对；(b) ReadFile 整文件再逐条比对。
+// 只断言「字节完全一致」，不测性能 —— 性能数据在 /tmp/os_asm.md。
+void ScenarioMillionRoundTrip() {
+    const std::string path = Path("million.bin");
+    constexpr int kCount = 1000000;
+    constexpr std::size_t kRec = 8;
+    constexpr std::uint32_t kSalt = 0xA5A5A5A5u;
+
+    File file;
+    Check(File::Create(path, 0644, &file).ok(), "million: create");
+    if (!file.valid()) {
+        return;
+    }
+    std::uint8_t rec[kRec];
+    int write_fail_at = -1;
+    for (int i = 0; i < kCount; ++i) {
+        const auto seq = static_cast<std::uint32_t>(i);
+        const std::uint32_t tag = seq ^ kSalt;
+        std::memcpy(rec, &seq, 4);
+        std::memcpy(rec + 4, &tag, 4);
+        if (file.Write(rec, kRec) != static_cast<ssize_t>(kRec)) {
+            write_fail_at = i;
+            break;
+        }
+    }
+    Check(write_fail_at < 0, "million: 1e6 writes must all succeed");
+    Check(file.Size() == static_cast<off_t>(static_cast<off_t>(kCount) * kRec),
+          "million: file size must be 8e6");
+    Check(file.Seek(0, SEEK_SET) == 0, "million: seek back");
+
+    int read_fail_at = -1;
+    for (int i = 0; i < kCount; ++i) {
+        if (file.Read(rec, kRec) != static_cast<ssize_t>(kRec)) {
+            read_fail_at = i;
+            break;
+        }
+        std::uint32_t seq = 0;
+        std::uint32_t tag = 0;
+        std::memcpy(&seq, rec, 4);
+        std::memcpy(&tag, rec + 4, 4);
+        if (seq != static_cast<std::uint32_t>(i) || tag != (seq ^ kSalt)) {
+            read_fail_at = i;
+            break;
+        }
+    }
+    Check(read_fail_at < 0, "million: sequential read must match byte-for-byte");
+    file.Close();
+
+    // 第二遍：整文件读回再逐条比对（覆盖 ReadFile 的分块拼接路径）
+    std::string all;
+    Check(ReadFile(path, &all).ok(), "million: ReadFile");
+    Check(all.size() == static_cast<std::size_t>(kCount) * kRec,
+          "million: ReadFile length must be 8e6");
+    int verify_fail_at = -1;
+    for (int i = 0; i < kCount; ++i) {
+        std::uint32_t seq = 0;
+        std::memcpy(&seq, all.data() + static_cast<std::size_t>(i) * kRec, 4);
+        if (seq != static_cast<std::uint32_t>(i)) {
+            verify_fail_at = i;
+            break;
+        }
+    }
+    Check(verify_fail_at < 0, "million: ReadFile must match byte-for-byte");
+    ::unlink(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// 场景 14：批量 IO（readv/writev）正确性
+// ---------------------------------------------------------------------------
+void ScenarioVectoredIo() {
+    const std::string path = Path("vectored.bin");
+    constexpr int kBatch = 1024;
+    constexpr std::size_t kRec = 8;
+    std::vector<std::uint8_t> pool(static_cast<std::size_t>(kBatch) * kRec);
+    for (std::size_t i = 0; i < pool.size(); ++i) {
+        pool[i] = static_cast<std::uint8_t>((i * 131u + 17u) & 0xFFu);
+    }
+    std::vector<struct iovec> iov(static_cast<std::size_t>(kBatch));
+    for (int i = 0; i < kBatch; ++i) {
+        iov[static_cast<std::size_t>(i)].iov_base = &pool[static_cast<std::size_t>(i) * kRec];
+        iov[static_cast<std::size_t>(i)].iov_len = kRec;
+    }
+    const std::size_t batch_bytes = pool.size();
+
+    File file;
+    Check(File::Create(path, 0644, &file).ok(), "vectored: create");
+    if (!file.valid()) {
+        return;
+    }
+    // 14.1 Writev 写满一批；WritevAll 再写 10 批
+    Check(file.Writev(iov.data(), kBatch) == static_cast<ssize_t>(batch_bytes),
+          "vectored: Writev must write the whole batch");
+    for (int round = 0; round < 10; ++round) {
+        Check(file.WritevAll(iov.data(), kBatch) == batch_bytes,
+              "vectored: WritevAll must write whole batch");
+    }
+    const std::size_t total_records = 11;
+    Check(file.Size() == static_cast<off_t>(batch_bytes * total_records),
+          "vectored: size after batch writes");
+
+    // 14.2 Readv / ReadvAll 读回并逐字节比对
+    Check(file.Seek(0, SEEK_SET) == 0, "vectored: seek");
+    std::vector<std::uint8_t> readback(pool.size(), 0);
+    for (int i = 0; i < kBatch; ++i) {
+        iov[static_cast<std::size_t>(i)].iov_base =
+            readback.data() + static_cast<std::size_t>(i) * kRec;
+        iov[static_cast<std::size_t>(i)].iov_len = kRec;
+    }
+    for (std::size_t round = 0; round < total_records; ++round) {
+        std::fill(readback.begin(), readback.end(), 0);
+        Check(file.ReadvAll(iov.data(), kBatch) == static_cast<ssize_t>(batch_bytes),
+              "vectored: ReadvAll must fill whole batch");
+        Check(std::memcmp(readback.data(), pool.data(), pool.size()) == 0,
+              "vectored: ReadvAll content mismatch");
+    }
+
+    // 14.3 EOF 时 Readv 读不满：文件只剩 100 字节，iov 总长 8192
+    Check(file.Seek(-100, SEEK_END) == static_cast<off_t>(batch_bytes * total_records) - 100,
+          "vectored: seek near EOF");
+    std::fill(readback.begin(), readback.end(), 0);
+    const ssize_t eof_read = file.ReadvAll(iov.data(), kBatch);
+    Check(eof_read == 100, "vectored: ReadvAll must stop at EOF with 100 bytes");
+    Check(std::memcmp(readback.data(), pool.data() + pool.size() - 100, 100) == 0,
+          "vectored: EOF partial read content");
+
+    // 14.4 参数边界：nullptr / 0 / 超 IOV_MAX
+    Check(file.Writev(nullptr, 4) == -1 && file.last_error() == EINVAL,
+          "vectored: Writev(nullptr) must EINVAL");
+    Check(file.Writev(iov.data(), 0) == -1 && file.last_error() == EINVAL,
+          "vectored: Writev(0) must EINVAL");
+    Check(file.Writev(iov.data(), 1025) == -1 && file.last_error() == EINVAL,
+          "vectored: Writev(1025) must EINVAL (IOV_MAX=1024)");
+    Check(file.WritevAll(nullptr, 4) == 0 && file.last_error() == EINVAL,
+          "vectored: WritevAll(nullptr) must EINVAL");
+    Check(file.Readv(iov.data(), 0) == -1 && file.last_error() == EINVAL,
+          "vectored: Readv(0) must EINVAL");
+
+    // 14.5 全零长度 iovec：合法，返回 0 且不报错
+    struct iovec zeros[4] = {{nullptr, 0}, {nullptr, 0}, {nullptr, 0}, {nullptr, 0}};
+    Check(file.Writev(zeros, 4) == 0 && file.last_error() == 0,
+          "vectored: zero-length iovecs must write 0 without error");
+
+    // 14.6 混合零长段：仍按顺序写满
+    const std::string mixed_path = Path("vectored_mixed.bin");
+    File mixed;
+    Check(File::Create(mixed_path, 0644, &mixed).ok(), "vectored: mixed create");
+    std::uint8_t chunk[3][4] = {{'a', 'b', 'c', 'd'}, {'e', 'f', 'g', 'h'}, {'i', 'j', 'k', 'l'}};
+    struct iovec mix[6] = {{chunk[0], 4}, {nullptr, 0}, {chunk[1], 4},
+                           {nullptr, 0},  {chunk[2], 4}, {nullptr, 0}};
+    Check(mixed.WritevAll(mix, 6) == 12, "vectored: mixed WritevAll must write 12 bytes");
+    Check(mixed.Seek(0, SEEK_SET) == 0, "vectored: mixed seek");
+    std::uint8_t mixed_out[12] = {0};
+    struct iovec mix_in[3] = {{mixed_out, 4}, {mixed_out + 4, 4}, {mixed_out + 8, 4}};
+    Check(mixed.ReadvAll(mix_in, 3) == 12, "vectored: mixed ReadvAll must read 12 bytes");
+    Check(std::memcmp(mixed_out, "abcdefghijkl", 12) == 0, "vectored: mixed content");
+    mixed.Close();
+    ::unlink(mixed_path.c_str());
+
+    file.Close();
+    ::unlink(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// 场景 15：CopyTo（sendfile 零拷贝）正确性
+// ---------------------------------------------------------------------------
+void ScenarioCopyTo() {
+    const std::string src = Path("copy_src.bin");
+    const std::string dst = Path("copy_dst.bin");
+    constexpr std::size_t kTotal = 8u * 1024u * 1024u;
+
+    // 15.1 8 MiB 内容 → 拷贝 → 逐字节一致
+    {
+        File out;
+        Check(File::Create(src, 0644, &out).ok(), "copy: create src");
+        std::vector<std::uint8_t> chunk(64 * 1024);
+        for (std::size_t i = 0; i < chunk.size(); ++i) {
+            chunk[i] = static_cast<std::uint8_t>((i * 37u + 11u) & 0xFFu);
+        }
+        for (std::size_t wrote = 0; wrote < kTotal; wrote += chunk.size()) {
+            Check(out.WriteAll(chunk.data(), chunk.size()) == chunk.size(),
+                  "copy: write src chunk");
+        }
+        out.Close();
+    }
+    {
+        File in;
+        File out;
+        Check(File::Open(src, OpenFlag::kReadOnly, 0, &in).ok(), "copy: open src");
+        Check(File::Create(dst, 0644, &out).ok(), "copy: create dst");
+        std::size_t copied = 0;
+        const auto status = in.CopyTo(out, &copied);
+        Check(status.ok(), "copy: CopyTo must succeed");
+        Check(copied == kTotal, "copy: CopyTo must copy 8 MiB");
+        Check(out.Size() == static_cast<off_t>(kTotal), "copy: dst size");
+        // 偏移语义：拷贝后 src 的偏移应等于已拷贝字节数
+        Check(in.Tell() == static_cast<off_t>(kTotal), "copy: src offset must advance");
+        out.Close();
+        in.Close();
+    }
+    {
+        std::string a;
+        std::string b;
+        Check(ReadFile(src, &a).ok(), "copy: ReadFile src");
+        Check(ReadFile(dst, &b).ok(), "copy: ReadFile dst");
+        Check(a == b, "copy: 8 MiB content must be identical");
+    }
+
+    // 15.2 空文件：拷 0 字节，成功
+    {
+        const std::string empty = Path("copy_empty.bin");
+        const std::string empty_dst = Path("copy_empty_dst.bin");
+        Check(WriteFile(empty, "").ok(), "copy: create empty");
+        File in;
+        File out;
+        Check(File::Open(empty, OpenFlag::kReadOnly, 0, &in).ok(), "copy: open empty");
+        Check(File::Create(empty_dst, 0644, &out).ok(), "copy: create empty dst");
+        std::size_t copied = 12345;
+        Check(in.CopyTo(out, &copied).ok(), "copy: empty CopyTo must succeed");
+        Check(copied == 0, "copy: empty CopyTo must copy 0");
+        Check(out.Size() == 0, "copy: empty dst size");
+        out.Close();
+        in.Close();
+        ::unlink(empty.c_str());
+        ::unlink(empty_dst.c_str());
+    }
+
+    // 15.3 max_bytes 截断 + 从中间偏移开始
+    {
+        const std::string part = Path("copy_part.bin");
+        File in;
+        File out;
+        Check(File::Open(src, OpenFlag::kReadOnly, 0, &in).ok(), "copy: open src again");
+        Check(File::Create(part, 0644, &out).ok(), "copy: create part dst");
+        Check(in.Seek(1024, SEEK_SET) == 1024, "copy: seek src to 1024");
+        std::size_t copied = 0;
+        Check(in.CopyTo(out, &copied, 4096).ok(), "copy: CopyTo max_bytes");
+        Check(copied == 4096, "copy: max_bytes must cap at 4096");
+        Check(out.Size() == 4096, "copy: part dst size");
+        Check(in.Tell() == 1024 + 4096, "copy: offset after capped copy");
+        // 内容比对：dst 的 4096 字节 == src 偏移 1024 起的 4096 字节
+        out.Seek(0, SEEK_SET);
+        std::string got(4096, '\0');
+        Check(out.Read(&got[0], got.size()) == static_cast<ssize_t>(got.size()),
+              "copy: read part dst");
+        std::string whole;
+        Check(ReadFile(src, &whole).ok(), "copy: ReadFile whole src");
+        Check(whole.compare(1024, 4096, got) == 0, "copy: offset content must match");
+        out.Close();
+        in.Close();
+        ::unlink(part.c_str());
+    }
+
+    // 15.4 坏句柄：两个都关闭 → kInvalidHandle
+    {
+        File a;
+        File b;
+        std::size_t copied = 7;
+        const auto status = a.CopyTo(b, &copied);
+        Check(!status.ok() && status.code == OsError::kInvalidHandle &&
+                  status.system_error == EBADF,
+              "copy: invalid handles must report kInvalidHandle/EBADF");
+        Check(copied == 0, "copy: invalid handles must reset copied");
+    }
+
+    ::unlink(src.c_str());
+    ::unlink(dst.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// 场景 16：EINTR —— 信号打断读写时必须自动重试，不丢数据
+// ---------------------------------------------------------------------------
+namespace {
+volatile std::sig_atomic_t g_alarm_hits = 0;
+void OnAlarm(int) { ++g_alarm_hits; }
+}  // namespace
+
+void ScenarioEintr() {
+    const std::string path = Path("eintr.bin");
+    constexpr std::size_t kTotal = 8u * 1024u * 1024u;
+    constexpr std::size_t kChunk = 4096;
+
+    // 16.1 先写一个 8 MiB 文件（同时验证 WriteAll 的抗 EINTR）
+    struct sigaction action {};
+    action.sa_handler = OnAlarm;
+    ::sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;   // 关键：不加 SA_RESTART，让 read/write 真的返回 EINTR
+    struct sigaction old_action {};
+    Check(::sigaction(SIGALRM, &action, &old_action) == 0, "eintr: install SIGALRM");
+
+    struct itimerval timer {};
+    timer.it_interval.tv_usec = 1000;   // 每 1 ms 一次
+    timer.it_value.tv_usec = 1000;
+    Check(::setitimer(ITIMER_REAL, &timer, nullptr) == 0, "eintr: start timer");
+
+    const std::vector<std::uint8_t> chunk(kChunk, 0x5A);
+    {
+        File out;
+        Check(File::Create(path, 0644, &out).ok(), "eintr: create");
+        std::size_t total = 0;
+        while (total < kTotal) {
+            const std::size_t wrote = out.WriteAll(chunk.data(), kChunk);
+            if (wrote != kChunk) {
+                break;
+            }
+            total += wrote;
+        }
+        Check(total == kTotal, "eintr: WriteAll must complete under signals");
+        out.Close();
+    }
+
+    // 16.2 读回：Read 必须自己吃掉 EINTR
+    {
+        File in;
+        Check(File::Open(path, OpenFlag::kReadOnly, 0, &in).ok(), "eintr: open");
+        std::vector<std::uint8_t> buffer(kChunk, 0);
+        std::size_t total = 0;
+        int failures = 0;
+        while (total < kTotal) {
+            const ssize_t got = in.Read(buffer.data(), buffer.size());
+            if (got < 0) {
+                ++failures;
+                break;
+            }
+            if (got == 0) {
+                break;
+            }
+            // 逐个字节校验，确保信号没有把数据打乱
+            for (std::size_t i = 0; i < static_cast<std::size_t>(got); ++i) {
+                if (buffer[i] != 0x5A) {
+                    ++failures;
+                    break;
+                }
+            }
+            total += static_cast<std::size_t>(got);
+        }
+        Check(failures == 0, "eintr: Read must never surface EINTR");
+        Check(total == kTotal, "eintr: read must see all 8 MiB");
+        in.Close();
+    }
+
+    // 16.3 关闭定时器、恢复 handler
+    struct itimerval stop {};
+    Check(::setitimer(ITIMER_REAL, &stop, nullptr) == 0, "eintr: stop timer");
+    ::sigaction(SIGALRM, &old_action, nullptr);
+    Check(g_alarm_hits > 0, "eintr: signals must actually have been delivered");
+    ::unlink(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// 场景 17：文件大小边界（0 字节 / 64 MiB）
+// ---------------------------------------------------------------------------
+void ScenarioSizeBoundaries() {
+    // 17.1 0 字节文件：ReadFile 成功且返回空串
+    const std::string empty = Path("boundary_empty.bin");
+    Check(WriteFile(empty, "").ok(), "boundary: WriteFile empty");
+    std::string content = "not empty";
+    Check(ReadFile(empty, &content).ok(), "boundary: ReadFile empty");
+    Check(content.empty(), "boundary: empty file must read back empty");
+    struct ::stat info {};
+    Check(::stat(empty.c_str(), &info) == 0 && info.st_size == 0, "boundary: empty size 0");
+
+    // 17.2 64 MiB：分块写 + ReadFile 整读，按块校验
+    const std::string big = Path("boundary_big.bin");
+    constexpr std::size_t kTotal = 64u * 1024u * 1024u;
+    constexpr std::size_t kChunk = 256u * 1024u;
+    {
+        File out;
+        Check(File::Create(big, 0644, &out).ok(), "boundary: create big");
+        std::vector<std::uint8_t> chunk(kChunk);
+        std::size_t total = 0;
+        std::uint32_t block = 0;
+        while (total < kTotal) {
+            std::memset(chunk.data(), static_cast<int>(block & 0xFFu), chunk.size());
+            if (out.WriteAll(chunk.data(), chunk.size()) != chunk.size()) {
+                break;
+            }
+            total += chunk.size();
+            ++block;
+        }
+        Check(total == kTotal, "boundary: 64 MiB write");
+        out.Close();
+    }
+    {
+        std::string all;
+        Check(ReadFile(big, &all).ok(), "boundary: ReadFile 64 MiB");
+        Check(all.size() == kTotal, "boundary: 64 MiB read length");
+        std::size_t bad = 0;
+        for (std::size_t i = 0; i < all.size(); i += kChunk) {
+            const std::uint8_t expected = static_cast<std::uint8_t>((i / kChunk) & 0xFFu);
+            if (static_cast<std::uint8_t>(all[i]) != expected ||
+                static_cast<std::uint8_t>(all[i + kChunk - 1]) != expected) {
+                ++bad;
+            }
+        }
+        Check(bad == 0, "boundary: 64 MiB block pattern must match");
+    }
+    ::unlink(empty.c_str());
+    ::unlink(big.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -633,6 +1042,16 @@ int main() {
     ScenarioConfigIntegration();
     std::printf("[os][场景12] 审计回归\n");
     ScenarioAuditRegressions();
+    std::printf("[os][场景13] 1e6 次读写逐字节一致\n");
+    ScenarioMillionRoundTrip();
+    std::printf("[os][场景14] 批量 IO（readv/writev）\n");
+    ScenarioVectoredIo();
+    std::printf("[os][场景15] CopyTo 零拷贝\n");
+    ScenarioCopyTo();
+    std::printf("[os][场景16] EINTR 重试\n");
+    ScenarioEintr();
+    std::printf("[os][场景17] 大小边界\n");
+    ScenarioSizeBoundaries();
 
     if (g_failures == 0) {
         std::printf("\n[os] failures=0\n");

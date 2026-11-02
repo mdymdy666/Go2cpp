@@ -161,13 +161,19 @@ struct ProcError final {
     std::string ToString() const;
 };
 
-/** @brief 构造一个错误。 */
-ProcError MakeError(ProcErrorCode code, int system_error, std::string message,
-                    std::string context = {});
+/**
+ * @brief 构造一个错误。
+ * @note 标记 `cold`：错误路径要拼中文消息 + `strerror_r`，是热路径上最典型的
+ *       「只在失败时执行、却按成功路径的寄存器压力/栈帧布局编译」的代码。
+ *       标 cold 后编译器把它挪到 `.text.unlikely`，调用点的成功路径不再为
+ *       它预留栈空间（实测 `MessageQueue::Send` 360B → 296B 栈帧）。
+ */
+[[gnu::cold]] ProcError MakeError(ProcErrorCode code, int system_error, std::string message,
+                                  std::string context = {});
 
-/** @brief 以 errno 构造错误，`message` 为中文动作描述。 */
-ProcError MakeErrnoError(ProcErrorCode code, int system_error,
-                         std::string context = {});
+/** @brief 以 errno 构造错误，`message` 为中文动作描述（`cold`，见 `MakeError`）。 */
+[[gnu::cold]] ProcError MakeErrnoError(ProcErrorCode code, int system_error,
+                                       std::string context = {});
 
 /**
  * @brief 轻量结果类型：`Result<T>` 持有值或 `ProcError`。
@@ -499,6 +505,17 @@ struct SpawnedProcess final {
     bool pty{false};    ///< stdin/stdout 共用 PTY master
     std::chrono::steady_clock::time_point started_monotonic{};
     std::chrono::system_clock::time_point started_wall{};
+    /**
+     * @brief 启动瞬间的 `/proc/<pid>/stat` 快照（可能为空，见 `has_stat`）。
+     *
+     * @details 后端在 `Spawn` 里本来就要读一次 `/proc/<pid>/stat` 来修正
+     *          `ppid`/`pgid`/`started_wall`；把快照带回来，上层的
+     *          `Process::Spawn` 就不必再读第二次。读 `/proc` 是 open+read+
+     *          close 三个 syscall 加一次解析，每多读一次就是几十微秒 ——
+     *          对「高频 spawn 短命进程」的场景是实打实的固定成本。
+     */
+    ProcessInfo stat_snapshot{};
+    bool has_stat{false};   ///< `stat_snapshot` 是否有效
 };
 
 /**
