@@ -129,6 +129,12 @@ void TestLinkAbr() {
         },
         20000);
     BENTO_CHECK(delivered);
+    // ABR 回调按 abr_interval_ms（这里 20ms）周期触发；quickack 之后 300 条
+    // 1200B 在回环上几毫秒就交付完，传输期间可能不足一个周期。这里补一段
+    // 抽水等首个回调，避免测试依赖「传输耗时 > ABR 周期」这个时序假设。
+    if (reports.empty()) {
+        (void)bento_test::PumpUntil(client, server, [&]() { return !reports.empty(); }, 2000);
+    }
     BENTO_CHECK(!reports.empty());
     const std::uint64_t estimate = client.BandwidthEstimate();
     BENTO_CHECK(estimate > 0);

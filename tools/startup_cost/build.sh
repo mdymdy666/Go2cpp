@@ -74,4 +74,10 @@ echo "[build] 基准主程序 -> ${OUT_DIR}/startup_cost"
     "${LINK_FLAGS[@]}" "${LIBS[@]}" \
     -o "${OUT_DIR}/startup_cost"
 
+echo "[build] park→wake 长尾工具 -> ${OUT_DIR}/startup_cost_park_wake"
+"${CXX}" "${CXXFLAGS[@]}" "${DEFINES[@]}" "${INCLUDES[@]}" \
+    "${SCRIPT_DIR}/park_wake.cpp" \
+    "${LINK_FLAGS[@]}" "${LIBS[@]}" \
+    -o "${OUT_DIR}/startup_cost_park_wake"
+
 echo "[build] 完成"
