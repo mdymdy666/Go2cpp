@@ -155,11 +155,23 @@ class Ring {
         if (r == nullptr) {
             return;
         }
-        const std::size_t n = r->Len();
-        Ring* node = r;
-        for (std::size_t i = 0; i < n; ++i) {
+        // 单遍删除：先摘掉 r 并把剩余节点断开成普通链，避免析构函数访问
+        // 已释放的邻居；同时省掉旧实现的 Len() 全环遍历（O(2n) → O(n)）。
+        Ring* node = r->m_next;
+        if (node == r) {
+            delete r;
+            return;
+        }
+        r->m_prev->m_next = nullptr;  // 尾节点成为链尾
+        node->m_prev = nullptr;
+        r->m_next = nullptr;  // 让 r 的析构跳过“修正邻居”分支
+        r->m_prev = nullptr;
+        delete r;
+        while (node != nullptr) {
             Ring* next = node->m_next;
-            delete node;  // 析构函数会修正 next/prev，next 仍然有效
+            node->m_next = nullptr;
+            node->m_prev = nullptr;
+            delete node;
             node = next;
         }
     }
