@@ -87,6 +87,8 @@ include(cmake/Go2CppFrame.cmake)
 # RPC 框架（Go 风格服务注册/调用/流式）：默认 ON，定义见 cmake/Go2CppRpc.cmake。
 include(cmake/Go2CppRpc.cmake)
 
+# RPC over picoquic（QUIC 传输，GO2CPP_WITH_PICOQUIC 默认 OFF）：见
+
 # 嵌入式存储（SQLite，GO2CPP_WITH_SQLITE 默认 OFF）。
 include(cmake/Go2CppStorage.cmake)
 include(cmake/Go2CppKv.cmake)

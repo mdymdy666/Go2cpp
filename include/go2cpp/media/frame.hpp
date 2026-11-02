@@ -54,6 +54,15 @@ inline std::size_t BgraFrameBytes(int width, int height) noexcept {
 }
 
 /// @brief 一帧原始视频数据 + 采集元数据。
+/// @details 像素存储有两种形态：
+///          - **自有**（默认）：`data` 拥有内存，写入用 `data`；
+///          - **借用**（零拷贝）：`borrowed` 指向外部缓冲（例如 XShm 共享段），
+///            此时 `data` 为空，像素只读，生命周期由提供者保证（X11 采集的约定
+///            是**直到下一次 Capture 之前有效**）。
+///
+///          只读访问统一走 `Bytes()`；长度用 `PlaneBytes()`（BGRA 为
+///          stride*height，可能含行尾 padding）。写帧用 `data`（自有缓冲）
+///          或 `Reset()` 重新分配。
 struct VideoFrame {
     int width = 0;                            ///< 宽（像素），> 0。
     int height = 0;                           ///< 高（像素），> 0。
@@ -63,6 +72,7 @@ struct VideoFrame {
     std::uint32_t frame_id = 0;               ///< 单调递增帧号，源端赋值。
     std::int64_t capture_ns = 0;              ///< 采集时刻（steady_clock 纳秒）。
     bool keyframe = false;                    ///< 是否是关键帧（编码器置位）。
+    const std::uint8_t* borrowed = nullptr;   ///< 零拷贝视图（非空时像素只读）。
 
     /// @brief 推导行字节数：BGRA = width*4；I420 = width（Y 平面）。
     int ComputeStride() const noexcept {
@@ -85,7 +95,17 @@ struct VideoFrame {
         return I420FrameBytes(width, height);
     }
 
-    /// @brief 帧是否可参与编解码：尺寸合法、数据长度足够。
+    /// @brief 像素数据只读入口（自有缓冲与零拷贝视图统一走这里）。
+    const std::uint8_t* Bytes() const noexcept {
+        return borrowed != nullptr ? borrowed : data.data();
+    }
+
+    /// @brief 是否拥有像素内存（false = 零拷贝视图，数据只在下一次采集前有效）。
+    bool OwnsStorage() const noexcept {
+        return borrowed == nullptr;
+    }
+
+    /// @brief 帧是否可参与编解码：尺寸合法、数据长度足够（借用视图按 stride 视为足够）。
     bool Valid() const noexcept {
         if (width <= 0 || height <= 0) {
             return false;
@@ -93,7 +113,25 @@ struct VideoFrame {
         if (format == PixelFormat::kBGRA && stride != 0 && stride < width * 4) {
             return false;
         }
+        if (borrowed != nullptr) {
+            return true;
+        }
         return data.size() >= PlaneBytes();
+    }
+
+    /// @brief 把本帧切到零拷贝视图（丢弃自有存储）。
+    /// @param bytes 外部像素缓冲（不可为 nullptr）。
+    /// @param row_stride 外部缓冲的行字节数；<= 0 时按格式推导。
+    void Borrow(const std::uint8_t* bytes, int row_stride = 0) noexcept {
+        borrowed = bytes;
+        stride = row_stride > 0 ? row_stride : ComputeStride();
+        data.clear();
+        data.shrink_to_fit();
+    }
+
+    /// @brief 取消借用，回到自有存储（不分配；下次 Reset 时使用 data）。
+    void Unborrow() noexcept {
+        borrowed = nullptr;
     }
 
     /// @brief 重新分配帧存储并清零。
@@ -103,6 +141,7 @@ struct VideoFrame {
         format = new_format;
         stride = 0;
         keyframe = false;
+        borrowed = nullptr;
         data.assign(PlaneBytes(), 0);
     }
 
