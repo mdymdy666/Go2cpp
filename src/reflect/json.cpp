@@ -8,6 +8,8 @@
 
 #include "go2cpp/reflect/json.hpp"
 
+#include "go2cpp/encoding/hex_core.hpp"
+
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -21,7 +23,6 @@
 namespace go2cpp::reflect {
 namespace {
 
-constexpr char kHexDigits[] = "0123456789abcdef";
 
 bool IsHexDigit(char value) noexcept {
     return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') ||
@@ -450,8 +451,7 @@ std::string EscapeJsonString(std::string_view text) {
             default:
                 if (value < 0x20u) {
                     out += "\\u00";
-                    out.push_back(kHexDigits[(value >> 4) & 0x0fu]);
-                    out.push_back(kHexDigits[value & 0x0fu]);
+                    encoding::hexcore::AppendEncodedByte(out, value);
                 } else {
                     out.push_back(static_cast<char>(value));
                 }
@@ -548,8 +548,7 @@ void JsonWriter::AppendEscaped(std::string_view text) {
             default:
                 if (value < 0x20u) {
                     m_out += "\\u00";
-                    m_out.push_back(kHexDigits[(value >> 4) & 0x0fu]);
-                    m_out.push_back(kHexDigits[value & 0x0fu]);
+                    encoding::hexcore::AppendEncodedByte(m_out, value);
                 } else {
                     m_out.push_back(static_cast<char>(value));
                 }

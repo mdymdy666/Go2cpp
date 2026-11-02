@@ -25,7 +25,11 @@
  */
 #include "go2cpp/config/so_manifest.hpp"
 
+#include "go2cpp/encoding/hex_core.hpp"
+
 #include "go2cpp/hash/sha256.hpp"
+#include "go2cpp/tools/strconv_core.hpp"
+#include "go2cpp/tools/strings.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -40,25 +44,12 @@
 namespace go2cpp::config {
 namespace {
 
-std::string Trim(std::string value) {
-    const auto first = value.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) return {};
-    const auto last = value.find_last_not_of(" \t\r\n");
-    return value.substr(first, last - first + 1);
-}
+/// 去掉首尾 `" \t\r\n"`（委托 `AsciiTrim`，字节集合显式给出）。
+std::string Trim(std::string value) { return AsciiTrim(value, " \t\r\n"); }
 
 bool ParseU64(const std::string& text, std::uint64_t* value) {
-    if (!value) return false;
-    const auto clean = Trim(text);
-    if (clean.empty()) return false;
-    std::uint64_t parsed = 0;
-    const auto result =
-        std::from_chars(clean.data(), clean.data() + clean.size(), parsed);
-    if (result.ec != std::errc{} || result.ptr != clean.data() + clean.size()) {
-        return false;
-    }
-    *value = parsed;
-    return true;
+    // 修剪 + 十进制 + 溢出拒绝都在 strconv_core（与旧的 Trim + from_chars 等价）。
+    return strconv_core::ParseU64DecimalTrimmed(text, value);
 }
 
 bool ParseSize(const std::string& text, std::size_t* value) {
@@ -71,19 +62,8 @@ bool ParseSize(const std::string& text, std::size_t* value) {
 
 bool ParseBool(const std::string& text, bool* value) {
     if (!value) return false;
-    auto clean = Trim(text);
-    std::transform(clean.begin(), clean.end(), clean.begin(), [](char c) {
-        return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
-    });
-    if (clean == "1" || clean == "true" || clean == "yes" || clean == "on") {
-        *value = true;
-        return true;
-    }
-    if (clean == "0" || clean == "false" || clean == "no" || clean == "off") {
-        *value = false;
-        return true;
-    }
-    return false;
+    const std::string clean = Trim(text);
+    return strconv_core::ParseBoolLooseWords(clean, value);
 }
 
 // 空文本表示「空列表」；非空文本中出现空项（a,,b 或尾逗号）视为书写错误。
@@ -158,14 +138,8 @@ bool VersionedFileName(const std::string& path, const std::string& version) {
 }
 
 std::string HexDigest(const std::vector<std::uint8_t>& digest) {
-    static constexpr char kDigits[] = "0123456789abcdef";
-    std::string hex;
-    hex.reserve(digest.size() * 2);
-    for (const auto byte : digest) {
-        hex.push_back(kDigits[(byte >> 4U) & 0x0FU]);
-        hex.push_back(kDigits[byte & 0x0FU]);
-    }
-    return hex;
+    return encoding::hexcore::Encode(
+        std::string_view(reinterpret_cast<const char*>(digest.data()), digest.size()));
 }
 
 }  // namespace

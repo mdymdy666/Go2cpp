@@ -11,30 +11,25 @@
 #include <algorithm>
 #include <cstring>
 
+#include "go2cpp/network/endian.hpp"
+
 namespace go2cpp::p2p::detail {
 namespace {
 
 std::uint16_t ReadU16(const std::uint8_t* data) noexcept {
-    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[0]) << 8U) |
-                                      static_cast<std::uint16_t>(data[1]));
+    return go2cpp::net::ReadBE16(data);
 }
 
 std::uint32_t ReadU32(const std::uint8_t* data) noexcept {
-    return (static_cast<std::uint32_t>(data[0]) << 24U) |
-           (static_cast<std::uint32_t>(data[1]) << 16U) |
-           (static_cast<std::uint32_t>(data[2]) << 8U) | static_cast<std::uint32_t>(data[3]);
+    return go2cpp::net::ReadBE32(data);
 }
 
 void StoreU16(std::uint8_t* data, std::uint16_t value) noexcept {
-    data[0] = static_cast<std::uint8_t>(value >> 8U);
-    data[1] = static_cast<std::uint8_t>(value & 0xFFU);
+    go2cpp::net::WriteBE16(data, value);
 }
 
 void StoreU32(std::uint8_t* data, std::uint32_t value) noexcept {
-    data[0] = static_cast<std::uint8_t>((value >> 24U) & 0xFFU);
-    data[1] = static_cast<std::uint8_t>((value >> 16U) & 0xFFU);
-    data[2] = static_cast<std::uint8_t>((value >> 8U) & 0xFFU);
-    data[3] = static_cast<std::uint8_t>(value & 0xFFU);
+    go2cpp::net::WriteBE32(data, value);
 }
 
 }  // namespace

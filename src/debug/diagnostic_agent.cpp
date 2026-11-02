@@ -37,8 +37,10 @@
 #include "go2cpp/debug/diagnostic_agent.hpp"
 
 #include "go2cpp/debug/debug_event_ring.hpp"
+#include "go2cpp/encoding/hex_core.hpp"
 #include "go2cpp/debug/debug_server.hpp"
 #include "go2cpp/json.hpp"
+#include "go2cpp/tools/strings.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -95,19 +97,7 @@ std::uint64_t ToMs(std::uint64_t ns) noexcept { return ns / 1000000U; }
 std::uint64_t ToUs(std::uint64_t ns) noexcept { return ns / 1000U; }
 
 std::string Trim(const std::string& input) {
-    std::size_t begin = 0;
-    while (begin < input.size() &&
-           (input[begin] == ' ' || input[begin] == '\t' ||
-            input[begin] == '\r' || input[begin] == '\n')) {
-        ++begin;
-    }
-    std::size_t end = input.size();
-    while (end > begin &&
-           (input[end - 1] == ' ' || input[end - 1] == '\t' ||
-            input[end - 1] == '\r' || input[end - 1] == '\n')) {
-        --end;
-    }
-    return input.substr(begin, end - begin);
+    return AsciiTrim(input, " \t\r\n");
 }
 
 std::string Lower(std::string value) {
@@ -236,14 +226,7 @@ std::uint64_t ReadLe64(const unsigned char* data) noexcept {
 }
 
 std::string HexBytes(const unsigned char* data, std::size_t size) {
-    static const char* digits = "0123456789abcdef";
-    std::string text;
-    text.reserve(size * 2U);
-    for (std::size_t i = 0; i < size; ++i) {
-        text.push_back(digits[(data[i] >> 4) & 0x0FU]);
-        text.push_back(digits[data[i] & 0x0FU]);
-    }
-    return text;
+    return encoding::hexcore::Encode(std::string_view(reinterpret_cast<const char*>(data), size));
 }
 
 /// 读 ELF64 的 `.note.gnu.build-id`；失败返回空串（不猜、不伪造）。

@@ -19,6 +19,8 @@
 
 #include "go2cpp/config/config_codec.hpp"
 
+#include "go2cpp/tools/strings.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -33,26 +35,11 @@ namespace {
 
 /// @brief 去掉首尾空白（含 `\r`），与 `IniFile` 的 Trim 语义一致。
 std::string_view TrimView(std::string_view text) {
-    const auto first = text.find_first_not_of(" \t\r\n");
-    if (first == std::string_view::npos) {
-        return {};
-    }
-    const auto last = text.find_last_not_of(" \t\r\n");
-    return text.substr(first, last - first + 1);
+    return AsciiTrimView(text, " \t\r\n");
 }
 
 /// @brief 转小写；只用于 ASCII 词表比较。
-std::string ToLower(std::string_view text) {
-    std::string out(text);
-    std::transform(out.begin(), out.end(), out.begin(), [](char character) {
-        const auto value = static_cast<unsigned char>(character);
-        return value >= static_cast<unsigned char>('A') &&
-                       value <= static_cast<unsigned char>('Z')
-                   ? static_cast<char>(value - 'A' + 'a')
-                   : character;
-    });
-    return out;
-}
+std::string ToLower(std::string_view text) { return AsciiToLower(text); }
 
 }  // namespace
 

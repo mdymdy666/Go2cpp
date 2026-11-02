@@ -293,6 +293,15 @@ void BenchReflect(int iters) {
     }, iters);
     Report("reflect_json_binary_encode", binc_ns, static_cast<double>(binary.size()), iters);
 
+    // 同环境对照：自描述编码（旧线上格式）vs 紧凑编码（默认）。
+    const double bincd_ns = TimeNs([&] {
+        std::vector<std::uint8_t> out;
+        go2cpp::reflect::ReflectCodec::Encode(login, out, go2cpp::reflect::Encoding::kBinary,
+                                              go2cpp::reflect::Compression::kNone,
+                                              go2cpp::reflect::WireFormat::kSelfDescribed);
+    }, iters);
+    Report("reflect_json_binary_encode_desc", bincd_ns, static_cast<double>(binary.size()), iters);
+
     const double bind_ns = TimeNs([&] {
         LoginRequest decoded;
         go2cpp::reflect::ReflectCodec::Decode(binary, decoded);

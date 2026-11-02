@@ -22,8 +22,34 @@
  *   inotify 优先、轮询兜底，目录级监听因此兼容「写临时文件再 rename」的
  *   原子替换写法；
  * - `ConfigStore<T>`：无锁读的多版本配置存储，`Snapshot` 是 RAII 引用；
+ * - `ReloadEvent` / `EventChannel`：**协程安全**的事件投递面，重载线程只做
+ *   非阻塞入队，消费者在自己的协程/线程里取；
  * - `ConfigWatcher<T>`：把 `FileWatcher` + loader + `ConfigStore` 串起来，
  *   变更时重载、校验失败保留旧值、成功后原子发布并回调。
+ *
+ * ## 线程模型与安全边界（接入前必读）
+ *
+ * 这是本模块最容易踩的三个坑，都是**语义约束而非实现缺陷**：
+ *
+ * 1. **`OnReload` / `OnError` 回调跑在重载线程（普通 OS 线程）上**，不是
+ *    调用方线程，也不是协程。回调里**禁止**调用任何需要协程上下文的 API
+ *    （`Park`、无缓冲/满 `Channel::Send`、`Fiber` 同步原语等）：这类调用会
+ *    在 OS 线程上阻塞或触发未定义行为，而重载线程被卡住就意味着热更新
+ *    停摆。回调里也**禁止**调用 `Stop()`、`ReloadNow()`、析构 watcher
+ *    （前者自 join，后者需要重入 `m_reload_mutex` 之外的派发路径）。
+ *    需要在回调里驱动协程时，用 `OnReloadEvent()` 投递事件：投递路径是
+ *    **非阻塞**的，回调本身立即返回；
+ * 2. **`ConfigStore::Store()` 可能等待空闲槽**（8 个槽都被长期 `Snapshot`
+ *    占满时）。它会在 `condition_variable` 上阻塞 OS 线程，因此
+ *    **必须在 OS 线程/写线程里调用，不能在协程里调用**——在协程里阻塞会
+ *    占住整个 M，读者又可能同样跑在被占住的 M 上，形成死锁。协程侧需要
+ *    发布时用 `ConfigStore::TryStore()`（非阻塞，无空槽立即返回 false），
+ *    或先在 OS 线程发布再唤醒协程；
+ * 3. **错误文本可能带出配置内容**。`loader`/`validator` 返回的 error 会被
+ *    写进 `last_error()`、错误回调与事件通道。默认有一层脱敏
+ *    （`password=`/`token=`/`secret=` 等键值对打码、超长截断），但仍要求
+ *    loader 不要主动把敏感值拼进 error；需要更强策略时用
+ *    `SetErrorRedactor()` 覆盖。
  *
  * ## 读侧为什么可以无锁
  *
@@ -75,8 +101,9 @@
  * - 重载失败（文件暂时不完整、校验失败、loader 抛异常）**保留旧配置**并
  *   计入 `failed_reloads()`，监听线程不会退出；
  * - 文件路径为空、loader 为空时 `Start()` 直接失败；
- * - `Stop()` 是幂等的；析构会 `Stop()`，可在任意线程调用（不能在 watcher
- *   自己的回调里调用，否则会自 join——`Stop()` 检测到同线程会 detach）。
+ * - `Stop()` 是幂等的；析构会 `Stop()`，可在任意线程调用，但**不要在
+ *   watcher 自己的回调里调用**（`Stop()` 检测到同线程会 detach，随后对象
+ *   可能被析构，而重载线程仍在访问 `this`）；
  *
  * ## 阅读建议
  *
@@ -86,19 +113,23 @@
  * 拆成「失败保留旧值」。
  */
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #if defined(__linux__)
 #include <poll.h>
@@ -110,6 +141,35 @@
 #endif
 
 namespace go2cpp::config {
+
+namespace detail {
+
+/**
+ * @brief 当前线程是否正在执行 `ConfigWatcher` 的用户回调。
+ *
+ * ## 为什么需要
+ * 发布与回调拆到 `m_reload_mutex` 之外以后，回调里调用 `ReloadNow()` 不会
+ * 再死锁，但会**无限递归**（每次重载又触发回调）。用一个线程局部标志把
+ * 这种重入显式拒绝，比让它栈溢出更容易诊断。错误回调走同一标志。
+ */
+inline thread_local bool t_in_watcher_callback = false;
+
+/// 在作用域内把当前线程标记为「正在执行用户回调」。
+class CallbackScope final {
+public:
+    CallbackScope() : m_previous(t_in_watcher_callback) {
+        t_in_watcher_callback = true;
+    }
+    ~CallbackScope() { t_in_watcher_callback = m_previous; }
+
+    CallbackScope(const CallbackScope&) = delete;
+    CallbackScope& operator=(const CallbackScope&) = delete;
+
+private:
+    bool m_previous;
+};
+
+}  // namespace detail
 
 /**
  * @brief 单文件监听到的变更类型。
@@ -474,6 +534,10 @@ public:
      * @param value 新配置；为空时忽略（不发布空配置）。
      * @note 写路径可能因为「7 个槽都被长期 Snapshot 占用」而等待；这是
      *       有意的背压，不覆盖读者正在读的数据。
+     * @warning **必须在 OS 线程调用**。等待空槽时本函数会在
+     *          `condition_variable` 上阻塞线程；在协程里调用会占住整个 M，
+     *          而占住槽位的读者可能正排队等这个 M —— 形成死锁。协程/不能
+     *          阻塞的调用方请用 `TryStore()`。
      */
     void Store(std::shared_ptr<const T> value) {
         if (!value) {
@@ -507,7 +571,60 @@ public:
         }
     }
 
-    /// 当前版本号（每次 `Store` +1；无锁读）。
+    /**
+     * @brief 非阻塞发布：没有空闲槽或另一个写者正在发布时立即失败。
+     *
+     * ## 为什么需要
+     * `Store()` 是**协程不安全**的：等空槽会阻塞 OS 线程。协程里发布配置
+     * 必须用本函数——它不 park、不等待、不睡眠，最坏情况返回 false。
+     *
+     * ## 语义
+     * - 拿不到写锁（另一个写者正在发布）返回 false；
+     * - 没有 `refs == 0` 的非 active 槽（被长期 `Snapshot` 占满）返回 false；
+     * - 选槽后读者抢先进入（CAS 失败）时最多重试 `kSlotCount` 次，仍失败
+     *   返回 false；
+     * - 成功时与 `Store()` 完全等价：原子发布 + 版本 +1。
+     *
+     * @return 成功发布返回 true；否则 false（调用方可以退避后重试，或改用
+     *         OS 线程上的 `Store()`）。
+     * @note 不保证公平性；被 `Store()` 长时间占用的写锁会让协程侧持续
+     *       失败，因此不要把 `TryStore()` 放在无退避的忙等循环里。
+     */
+    bool TryStore(std::shared_ptr<const T> value) {
+        if (!value) {
+            return false;
+        }
+        std::unique_lock<std::mutex> write_lock(m_write_mutex,
+                                                std::try_to_lock);
+        if (!write_lock.owns_lock()) {
+            return false;
+        }
+        std::shared_ptr<const T> pending = std::move(value);
+        for (std::size_t attempt = 0; attempt < kSlotCount; ++attempt) {
+            std::size_t slot = 0;
+            {
+                std::lock_guard<std::mutex> wait_lock(m_wait_mutex);
+                if (!FindAvailableSlotLocked(&slot)) {
+                    return false;
+                }
+            }
+            std::uint32_t expected = 0;
+            if (!m_slots[slot].refs.compare_exchange_strong(
+                    expected, kLocked, std::memory_order_acquire,
+                    std::memory_order_relaxed)) {
+                continue;
+            }
+            m_slots[slot].value = std::move(pending);
+            m_active.store(static_cast<std::uint32_t>(slot),
+                           std::memory_order_release);
+            m_version.fetch_add(1, std::memory_order_acq_rel);
+            m_slots[slot].refs.store(0, std::memory_order_release);
+            return true;
+        }
+        return false;
+    }
+
+    /// 当前版本号（每次 `Store`/`TryStore` 成功 +1；无锁读）。
     std::uint64_t version() const noexcept {
         return m_version.load(std::memory_order_acquire);
     }
@@ -601,6 +718,232 @@ private:
 };
 
 /**
+ * @brief 把错误文本里常见的敏感键值对打码，并限制长度。
+ *
+ * ## 为什么需要
+ * `ConfigWatcher` 的 loader/validator 由调用方提供，它们的 `error` 可能
+ * 带出配置原文（例如「token abc123 无效」）。这条文本会进入
+ * `last_error()`、错误回调、`EventChannel` 和日志，一旦拼进去就无法回收。
+ * 默认脱敏是**兜底**，不能替代调用方「不要把敏感值写进 error」的纪律。
+ *
+ * ## 规则
+ * - 识别 `password`/`passwd`/`pwd`/`secret`/`token`/`api_key`/`apikey`/
+ *   `access_key`/`private_key`（大小写不敏感），后面跟 `=` 或 `:` 时，把
+ *   值替换成 `***`；值到空白、`,`、`;`、`}`、引号或行尾结束；
+ * - 超过 `max_length` 字节截断并追加 `...(截断)`，避免恶意 loader 用超长
+ *   错误文本刷爆日志/事件队列；
+ * - 不做「自动识别任意敏感字段」，也不改写不含上述键名的文本。
+ *
+ * @param text 原始错误文本。
+ * @param max_length 输出上限（字节）；0 表示不限制。
+ * @return 脱敏并截断后的文本。
+ */
+inline std::string RedactSensitiveConfigText(std::string_view text,
+                                             std::size_t max_length = 512) {
+    std::string out(text.substr(0, max_length == 0 ? text.size()
+                                                   : std::min(text.size(),
+                                                              max_length)));
+    if (max_length != 0 && text.size() > out.size()) {
+        out += "...(截断)";
+    }
+    static constexpr std::string_view kKeys[] = {
+        "password", "passwd", "pwd",         "secret",     "token",
+        "api_key",  "apikey", "access_key", "private_key"};
+    std::string lowered = out;
+    for (char& character : lowered) {
+        if (character >= 'A' && character <= 'Z') {
+            character = static_cast<char>(character - 'A' + 'a');
+        }
+    }
+    // 从后往前替换，避免前面的替换改变后面的下标。
+    struct Span {
+        std::size_t begin;
+        std::size_t end;
+    };
+    std::vector<Span> spans;
+    for (const std::string_view key : kKeys) {
+        std::size_t position = 0;
+        while ((position = lowered.find(key, position)) != std::string::npos) {
+            const std::size_t key_end = position + key.size();
+            const bool left_boundary =
+                position == 0 || !(lowered[position - 1] >= 'a' &&
+                                   lowered[position - 1] <= 'z');
+            std::size_t cursor = key_end;
+            while (cursor < out.size() &&
+                   (out[cursor] == ' ' || out[cursor] == '\t')) {
+                ++cursor;
+            }
+            if (left_boundary && cursor < out.size() &&
+                (out[cursor] == '=' || out[cursor] == ':')) {
+                ++cursor;
+                while (cursor < out.size() &&
+                       (out[cursor] == ' ' || out[cursor] == '\t')) {
+                    ++cursor;
+                }
+                const std::size_t value_begin = cursor;
+                while (cursor < out.size() && out[cursor] != ' ' &&
+                       out[cursor] != '\t' && out[cursor] != ',' &&
+                       out[cursor] != ';' && out[cursor] != '}' &&
+                       out[cursor] != '"' && out[cursor] != '\'' &&
+                       out[cursor] != '\n' && out[cursor] != '\r') {
+                    ++cursor;
+                }
+                if (cursor > value_begin) {
+                    spans.push_back({value_begin, cursor});
+                }
+            }
+            position = key_end;
+        }
+    }
+    for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+        out.replace(it->begin, it->end - it->begin, "***");
+    }
+    return out;
+}
+
+/**
+ * @brief 热更新事件的类型。
+ */
+enum class ReloadEventKind : std::uint8_t {
+    kPublished = 0,  ///< 成功发布：`version` 是刚发布的版本号。
+    kFailed,         ///< 重载/校验失败：旧配置保留，`message` 已脱敏。
+};
+
+/**
+ * @brief 一次热更新事件。
+ */
+struct ReloadEvent {
+    ReloadEventKind kind{ReloadEventKind::kPublished};
+    std::uint64_t version{0};
+    std::string message;
+};
+
+/**
+ * @brief 协程安全的事件投递通道：生产非阻塞，消费两种模式。
+ *
+ * ## 定位
+ * `ConfigWatcher` 的回调跑在**重载 OS 线程**，不能安全地驱动协程；本类是
+ * 官方推荐的事件出口：重载线程只做一次非阻塞入队，协程在自己的循环里
+ * `TryPop()`（不阻塞、不需要协程上下文），或 OS 线程用 `WaitPop()` 阻塞等。
+ *
+ * ## 语义
+ * - 固定容量（默认 256）：满时**丢弃最旧**事件并 `dropped() + 1`，绝不阻塞
+ *   生产者。热更新不能因为消费者慢而停摆；
+ * - `TryPush()` 非阻塞，可从任意线程（含重载线程）调用；
+ * - `TryPop()` 非阻塞，协程/任意线程可调用；
+ * - `WaitPop()` 会阻塞调用线程，**只能在 OS 线程用**，协程里请用 `TryPop()`
+ *   配合自己的等待原语；
+ * - 本类不是 `concurrency::Channel<T>` 的替代品：它只解决「跨线程投递」，
+ *   不提供 select、关闭语义或协程 park。
+ *
+ * ## 生命周期
+ * `ConfigWatcher::OnReloadEvent()` 持有一个 `shared_ptr`，因此通道可以活得
+ * 比 watcher 长；用裸指针注册时由调用方保证生命周期覆盖 watcher。
+ */
+class EventChannel final {
+public:
+    /// 构造指定容量的通道（0 视为 1）。
+    explicit EventChannel(std::size_t capacity = 256)
+        : m_capacity(capacity == 0 ? 1 : capacity) {}
+
+    EventChannel(const EventChannel&) = delete;
+    EventChannel& operator=(const EventChannel&) = delete;
+    EventChannel(EventChannel&&) = delete;
+    EventChannel& operator=(EventChannel&&) = delete;
+
+    ~EventChannel() = default;
+
+    /**
+     * @brief 非阻塞投递。
+     * @return 入队成功且没有丢弃旧事件返回 true；因满丢弃最旧事件返回 false
+     *         （新事件仍然入队）；`event` 总是被消费。
+     */
+    bool TryPush(ReloadEvent event) {
+        bool dropped_oldest = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_queue.size() >= m_capacity) {
+                m_queue.pop_front();
+                m_dropped.fetch_add(1, std::memory_order_relaxed);
+                dropped_oldest = true;
+            }
+            m_queue.push_back(std::move(event));
+        }
+        if (m_waiting.load(std::memory_order_relaxed) != 0) {
+            m_cv.notify_one();
+        }
+        return !dropped_oldest;
+    }
+
+    /// 非阻塞取出一个事件；队列为空返回 false。
+    bool TryPop(ReloadEvent* event) {
+        if (event == nullptr) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_queue.empty()) {
+            return false;
+        }
+        *event = std::move(m_queue.front());
+        m_queue.pop_front();
+        return true;
+    }
+
+    /**
+     * @brief 阻塞取事件（**只能从 OS 线程调用**）。
+     * @param event 输出参数；为空返回 false。
+     * @param timeout 最长等待时间。
+     * @return 取到返回 true；超时返回 false。
+     */
+    bool WaitPop(ReloadEvent* event, std::chrono::milliseconds timeout) {
+        if (event == nullptr) {
+            return false;
+        }
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_queue.empty()) {
+            ++m_waiting;
+            const bool ready = m_cv.wait_for(
+                lock, timeout, [this]() { return !m_queue.empty(); });
+            --m_waiting;
+            if (!ready || m_queue.empty()) {
+                return false;
+            }
+        }
+        *event = std::move(m_queue.front());
+        m_queue.pop_front();
+        return true;
+    }
+
+    /// 当前排队事件数（快照值）。
+    std::size_t size() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_queue.size();
+    }
+
+    /// 容量。
+    std::size_t capacity() const noexcept { return m_capacity; }
+
+    /// 因满被丢弃的事件总数。
+    std::uint64_t dropped() const noexcept {
+        return m_dropped.load(std::memory_order_relaxed);
+    }
+
+private:
+    /// 固定容量队列；`m_capacity` 之后元素必然被丢弃。
+    std::deque<ReloadEvent> m_queue;
+    /// 队列容量。
+    std::size_t m_capacity;
+    /// 保护队列与等待计数。
+    mutable std::mutex m_mutex;
+    /// 等待取事件的消费者（用于避免无意义的 notify）。
+    std::condition_variable m_cv;
+    /// 正在 `WaitPop()` 的线程数。
+    std::atomic<std::uint32_t> m_waiting{0};
+    /// 丢弃计数。
+    std::atomic<std::uint64_t> m_dropped{0};
+};
+
+/**
  * @brief 配置文件热更新器：监听 → 重载 → 校验 → 原子发布 → 回调。
  *
  * ## 定位
@@ -609,7 +952,8 @@ private:
  *
  * ## 不变量
  * - 只有在 loader 成功且 validator 通过后才 `Store()`；失败保留旧快照；
- * - 发布与回调串行（`m_reload_mutex`），不会出现两个线程同时发布；
+ * - 发布串行（`m_reload_mutex`），不会出现两个线程同时写 `ConfigStore`；
+ *   回调与事件投递在释放该锁之后执行，因此回调可以安全重入 `ReloadNow()`；
  * - `Load()` 完全转发给 `ConfigStore`，无锁；
  * - watcher 线程只置脏标记，重载在独立线程完成，慢解析不会阻塞事件读取。
  *
@@ -623,7 +967,16 @@ private:
  * ## 线程模型
  * - `Start()`/`Stop()` 由调用方线程调用；
  * - 内部有两条线程：`FileWatcher` 的事件线程 + 本类的重载线程；
- * - `Load()`/`version()`/统计接口可在任意线程调用。
+ * - `Load()`/`version()`/统计接口可在任意线程（含协程）调用，加锁的
+ *   `last_error()` 也是；
+ * - `OnReload`/`OnError` 回调在**重载线程**执行（`ReloadNow()` 手动调用时
+ *   在调用方线程执行），**不是协程上下文**：回调里不要 `Park`、不要向
+ *   无缓冲或已满的 `Channel` 做阻塞 `Send`、不要调用 `ReloadNow()`/
+ *   `Stop()`/析构 watcher（会重入或自 join）。需要驱动协程时用
+ *   `OnReloadEvent()` 投递事件，投递路径非阻塞；
+ * - 发布与回调**不再持有** `m_reload_mutex`：回调可以安全地再次读取配置、
+ *   也可以从其他线程并发触发 `ReloadNow()`。代价是两个线程同时重载时
+ *   回调顺序可能与版本号顺序不一致，需要严格顺序时按 `version` 排序。
  */
 template <typename T>
 class ConfigWatcher final {
@@ -639,6 +992,13 @@ public:
         std::function<void(const T& value, std::uint64_t version)>;
     /// 失败回调。
     using ErrorCallback = std::function<void(const std::string& message)>;
+
+    /**
+     * @brief 错误文本脱敏策略：输入原始文本，返回可对外暴露的文本。
+     * @details 默认实现是 `RedactSensitiveConfigText`（敏感键值打码 + 512
+     *          字节截断）。需要接密钥轮换/审计日志时覆盖它。
+     */
+    using ErrorRedactor = std::function<std::string(std::string_view)>;
 
     /// 快照类型别名。
     using Snapshot = typename ConfigStore<T>::Snapshot;
@@ -793,16 +1153,73 @@ public:
         m_validator = std::move(validator);
     }
 
-    /// 设置发布成功回调（线程安全）。
+    /**
+     * @brief 设置发布成功回调（线程安全）。
+     * @warning 回调在重载 OS 线程执行。**禁止**在回调里 `Park`、做阻塞
+     *          `Channel::Send`、调用 `ReloadNow()`/`Stop()` 或析构 watcher。
+     *          要驱动协程请改用 `OnReloadEvent()`。
+     */
     void OnReload(ReloadCallback callback) {
         std::lock_guard<std::mutex> lock(m_callback_mutex);
         m_on_reload = std::move(callback);
     }
 
-    /// 设置失败回调（线程安全）。
+    /**
+     * @brief 设置失败回调（线程安全）。
+     * @warning 与 `OnReload` 相同的线程约束；`message` 已按 `ErrorRedactor`
+     *          脱敏，但不要把它当成「可以安全写进日志的完整配置内容」。
+     */
     void OnError(ErrorCallback callback) {
         std::lock_guard<std::mutex> lock(m_callback_mutex);
         m_on_error = std::move(callback);
+    }
+
+    /**
+     * @brief 注册**协程安全**的事件投递通道（推荐的热更新出口）。
+     *
+     * ## 为什么用它
+     * 回调线程是 OS 线程，协程 API 在其中不可用。本接口让重载线程只做
+     * 一次非阻塞 `EventChannel::TryPush()`，投递失败（队列满）只丢最旧
+     * 事件并计数，**绝不阻塞热更新**；协程侧用 `TryPop()` 非阻塞消费。
+     *
+     * @param channel 事件通道；`nullptr` 表示解绑。watcher 持有一份
+     *                `shared_ptr`，通道可以比 watcher 活得更久。
+     */
+    void OnReloadEvent(std::shared_ptr<EventChannel> channel) {
+        std::lock_guard<std::mutex> lock(m_callback_mutex);
+        m_event_channel = std::move(channel);
+    }
+
+    /**
+     * @brief 以裸指针注册事件通道（不持有所有权）。
+     * @param channel 生命周期必须覆盖 watcher；`nullptr` 表示解绑。
+     * @note `OnReloadEvent(nullptr)` 会与 `shared_ptr` 重载产生歧义，解绑
+     *       请显式传 `std::shared_ptr<EventChannel>()` 或
+     *       `static_cast<EventChannel*>(nullptr)`。
+     */
+    void OnReloadEvent(EventChannel* channel) {
+        if (channel == nullptr) {
+            OnReloadEvent(std::shared_ptr<EventChannel>());
+            return;
+        }
+        OnReloadEvent(std::shared_ptr<EventChannel>(channel,
+                                                    [](EventChannel*) {}));
+    }
+
+    /// 已注册的事件通道；未注册返回空。
+    std::shared_ptr<EventChannel> event_channel() const {
+        std::lock_guard<std::mutex> lock(m_callback_mutex);
+        return m_event_channel;
+    }
+
+    /**
+     * @brief 覆盖错误文本脱敏策略（线程安全）。
+     * @param redactor 空函数表示恢复默认的
+     *                 `RedactSensitiveConfigText`。
+     */
+    void SetErrorRedactor(ErrorRedactor redactor) {
+        std::lock_guard<std::mutex> lock(m_callback_mutex);
+        m_error_redactor = std::move(redactor);
     }
 
     /**
@@ -854,91 +1271,152 @@ private:
     }
 
     /// 执行一次「读取 → 校验 → 发布 → 回调」；失败保留旧配置。
+    /// @note `m_reload_mutex` 只覆盖 loader/validator/发布；用户回调与事件
+    ///       投递在锁外执行，回调里再次 `ReloadNow()` 不会自锁。
     bool ReloadOnce(std::string* error) {
-        std::lock_guard<std::mutex> reload_lock(m_reload_mutex);
-        std::string local_error;
+        if (detail::t_in_watcher_callback) {
+            // 回调里再触发重载会「发布 → 回调 → 发布」无限递归；显式拒绝。
+            if (error != nullptr) {
+                *error =
+                    "配置回调内不允许重入重载（会无限递归）；请改为投递事件";
+            }
+            return false;
+        }
         std::shared_ptr<const T> value;
-        try {
-            value = m_loader(m_path, &local_error);
-        } catch (const std::exception& exception) {
-            local_error = std::string("loader 异常: ") + exception.what();
-        } catch (...) {
-            local_error = "loader 抛出未知异常";
-        }
-        if (!value) {
-            return Fail(local_error.empty() ? "配置加载失败" : local_error,
-                        error);
-        }
-        Validator validator;
+        std::uint64_t published = 0;
+        std::string failure;
         {
-            std::lock_guard<std::mutex> lock(m_callback_mutex);
-            validator = m_validator;
-        }
-        if (validator) {
-            std::string validate_error;
-            bool valid = false;
+            std::lock_guard<std::mutex> reload_lock(m_reload_mutex);
+            std::string local_error;
             try {
-                valid = validator(*value, &validate_error);
+                value = m_loader(m_path, &local_error);
             } catch (const std::exception& exception) {
-                validate_error =
-                    std::string("validator 异常: ") + exception.what();
+                local_error = std::string("loader 异常: ") + exception.what();
             } catch (...) {
-                validate_error = "validator 抛出未知异常";
+                local_error = "loader 抛出未知异常";
             }
-            if (!valid) {
-                return Fail(validate_error.empty() ? "配置校验失败"
-                                                   : validate_error,
-                            error);
+            if (!value) {
+                failure = local_error.empty() ? "配置加载失败" : local_error;
+            } else {
+                Validator validator;
+                {
+                    std::lock_guard<std::mutex> lock(m_callback_mutex);
+                    validator = m_validator;
+                }
+                if (validator) {
+                    std::string validate_error;
+                    bool valid = false;
+                    try {
+                        valid = validator(*value, &validate_error);
+                    } catch (const std::exception& exception) {
+                        validate_error =
+                            std::string("validator 异常: ") + exception.what();
+                    } catch (...) {
+                        validate_error = "validator 抛出未知异常";
+                    }
+                    if (!valid) {
+                        failure = validate_error.empty() ? "配置校验失败"
+                                                         : validate_error;
+                    }
+                }
+                if (failure.empty()) {
+                    m_store.Store(value);
+                    published = m_store.version();
+                    m_reloads.fetch_add(1, std::memory_order_relaxed);
+                    std::lock_guard<std::mutex> lock(m_error_mutex);
+                    m_last_error.clear();
+                }
             }
         }
-        m_store.Store(value);
-        const std::uint64_t published = m_store.version();
-        m_reloads.fetch_add(1, std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lock(m_error_mutex);
-            m_last_error.clear();
+        if (!failure.empty()) {
+            return Fail(failure, error);
         }
-        ReloadCallback callback;
-        {
-            std::lock_guard<std::mutex> lock(m_callback_mutex);
-            callback = m_on_reload;
-        }
-        if (callback) {
-            try {
-                callback(*value, published);
-            } catch (...) {
-                // 用户回调异常不能终止热更新循环。
-            }
-        }
+        DispatchPublished(*value, published);
         if (error != nullptr) {
             error->clear();
         }
         return true;
     }
 
-    /// 记录失败并调用错误回调；旧配置保持不变。
-    bool Fail(const std::string& message, std::string* error) {
-        {
-            std::lock_guard<std::mutex> lock(m_error_mutex);
-            m_last_error = message;
-        }
-        m_failed_reloads.fetch_add(1, std::memory_order_relaxed);
-        if (error != nullptr) {
-            *error = message;
-        }
-        ErrorCallback callback;
+    /// 发布后的派发（不持 `m_reload_mutex`）：先投递事件，再调用回调。
+    void DispatchPublished(const T& value, std::uint64_t version) {
+        ReloadCallback callback;
+        std::shared_ptr<EventChannel> channel;
         {
             std::lock_guard<std::mutex> lock(m_callback_mutex);
-            callback = m_on_error;
+            callback = m_on_reload;
+            channel = m_event_channel;
+        }
+        if (channel) {
+            ReloadEvent event;
+            event.kind = ReloadEventKind::kPublished;
+            event.version = version;
+            (void)channel->TryPush(std::move(event));
         }
         if (callback) {
             try {
-                callback(message);
+                detail::CallbackScope scope;
+                callback(value, version);
+            } catch (...) {
+                // 用户回调异常不能终止热更新循环。
+            }
+        }
+    }
+
+    /// 记录失败并调用错误回调；旧配置保持不变。
+    /// @note 文本先脱敏再进入 `m_last_error`/错误回调/事件，避免 loader 把
+    ///       配置原文带进日志。
+    bool Fail(const std::string& message, std::string* error) {
+        const std::string redacted = Redact(message);
+        {
+            std::lock_guard<std::mutex> lock(m_error_mutex);
+            m_last_error = redacted;
+        }
+        m_failed_reloads.fetch_add(1, std::memory_order_relaxed);
+        if (error != nullptr) {
+            *error = redacted;
+        }
+        ErrorCallback callback;
+        std::shared_ptr<EventChannel> channel;
+        {
+            std::lock_guard<std::mutex> lock(m_callback_mutex);
+            callback = m_on_error;
+            channel = m_event_channel;
+        }
+        if (channel) {
+            ReloadEvent event;
+            event.kind = ReloadEventKind::kFailed;
+            event.version = m_store.version();
+            event.message = redacted;
+            (void)channel->TryPush(std::move(event));
+        }
+        if (callback) {
+            try {
+                detail::CallbackScope scope;
+                callback(redacted);
             } catch (...) {
                 // 同上：错误回调异常不影响监听。
             }
         }
         return false;
+    }
+
+    /// 应用脱敏策略；未设置时用内置 `RedactSensitiveConfigText`。
+    std::string Redact(const std::string& text) {
+        ErrorRedactor redactor;
+        {
+            std::lock_guard<std::mutex> lock(m_callback_mutex);
+            redactor = m_error_redactor;
+        }
+        if (!redactor) {
+            return RedactSensitiveConfigText(text);
+        }
+        try {
+            return redactor(text);
+        } catch (...) {
+            // 脱敏策略自身失败时退回内置实现，绝不把原文泄露出去。
+            return RedactSensitiveConfigText(text);
+        }
     }
 
     /// 配置文件路径。
@@ -973,6 +1451,10 @@ private:
     ErrorCallback m_on_error;
     /// 校验器。
     Validator m_validator;
+    /// 协程安全的事件投递通道；空表示不投递。
+    std::shared_ptr<EventChannel> m_event_channel;
+    /// 错误文本脱敏策略；空表示用内置 `RedactSensitiveConfigText`。
+    ErrorRedactor m_error_redactor;
     /// 保护错误文本。
     mutable std::mutex m_error_mutex;
     /// 最近错误。

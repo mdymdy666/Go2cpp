@@ -31,6 +31,7 @@
 #include "go2cpp/encoding/hex.hpp"
 
 #include "go2cpp/encoding/errors.hpp"
+#include "go2cpp/encoding/hex_core.hpp"
 
 #include <cstdint>
 #include <string>
@@ -40,18 +41,8 @@ namespace go2cpp::encoding {
 
 namespace {
 
-constexpr char kLowerHexDigits[] = "0123456789abcdef";
-
 inline unsigned char ByteAt(std::string_view src, std::size_t index) noexcept {
     return static_cast<unsigned char>(src[index]);
-}
-
-/// 单字符转十六进制值；非法返回 -1。大小写都接受（对齐 Go `fromHexChar`）。
-int HexValue(unsigned char c) noexcept {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
 }
 
 /// 把非法字节格式化成 Go 风格的可读形式（`U+0067 'g'`）。
@@ -79,16 +70,8 @@ std::string DescribeByte(unsigned char c) {
  * step3. 返回追加字节数。
  */
 std::size_t Hex::Encode(std::string& dst, std::string_view src) {
-    // step1: 记录追加起点并预留空间
-    const std::size_t start = dst.size();
-    dst.reserve(start + src.size() * 2);
-    // step2: 每字节固定输出两个小写字符
-    for (std::size_t i = 0; i < src.size(); ++i) {
-        const unsigned char byte = ByteAt(src, i);
-        dst.push_back(kLowerHexDigits[byte >> 4]);
-        dst.push_back(kLowerHexDigits[byte & 0x0f]);
-    }
-    return dst.size() - start;
+    // 编码循环只有一份：encoding/encoding::hexcore::AppendEncoded（各模块也复用它）。
+    return encoding::hexcore::AppendEncoded(dst, src);
 }
 
 std::string Hex::EncodeToString(std::string_view src) {
@@ -109,31 +92,16 @@ std::string Hex::EncodeToString(std::string_view src) {
  * 失败时 `dst` 保持不变；错误位置指向第一个非法字符。
  */
 ErrorPtr Hex::Decode(std::string& dst, std::string_view src) {
-    // step1: 长度必须是偶数
-    if (src.size() % 2 != 0) {
-        return detail::Tagged("encoding/hex: odd length hex string",
-                              HexOddLength());
-    }
-
-    std::string out;
-    out.reserve(src.size() / 2);
-    // step2: 高/低 nibble 分别校验，错误必须定位到具体字符
-    for (std::size_t i = 0; i < src.size(); i += 2) {
-        const int high = HexValue(ByteAt(src, i));
-        if (high < 0) {
-            return detail::Tagged(DescribeByte(ByteAt(src, i)),
-                                  HexInvalidByte());
+    // 解码循环与「失败时不污染 dst」的语义都在 hexcore 里，这里只负责错误文本。
+    encoding::hexcore::DecodeFailure failure;
+    if (!encoding::hexcore::Decode(dst, src, &failure)) {
+        if (failure.odd_length) {
+            return detail::Tagged("encoding/hex: odd length hex string",
+                                  HexOddLength());
         }
-        const int low = HexValue(ByteAt(src, i + 1));
-        if (low < 0) {
-            return detail::Tagged(DescribeByte(ByteAt(src, i + 1)),
-                                  HexInvalidByte());
-        }
-        out.push_back(static_cast<char>((high << 4) | low));
+        return detail::Tagged(DescribeByte(ByteAt(src, failure.index)),
+                              HexInvalidByte());
     }
-
-    // step3: 成功后才提交，保证失败时 dst 不被污染
-    dst += out;
     return nullptr;
 }
 

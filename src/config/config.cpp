@@ -34,6 +34,9 @@
  */
 #include "go2cpp/config.hpp"
 
+#include "go2cpp/tools/strconv_core.hpp"
+#include "go2cpp/tools/strings.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
@@ -47,12 +50,8 @@
 namespace go2cpp::config {
 namespace {
 
-std::string Trim(std::string value) {
-    const auto first = value.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) return {};
-    const auto last = value.find_last_not_of(" \t\r\n");
-    return value.substr(first, last - first + 1);
-}
+/// 去掉首尾 `" \t\r\n"`（委托 `AsciiTrim`，字节集合显式给出）。
+std::string Trim(std::string value) { return AsciiTrim(value, " \t\r\n"); }
 
 // ---------------------------------------------------------------------------
 // INI 值转义：DumpIni 与 Parse 的唯一约定
@@ -132,25 +131,18 @@ std::string ExtractIniValue(const std::string& raw) {
 
 bool ParseSize(const std::string& text, std::size_t* value) {
     if (!value) return false;
-    const auto clean = Trim(text);
-    if (clean.empty()) return false;
-    std::size_t parsed = 0;
-    const auto result = std::from_chars(clean.data(), clean.data() + clean.size(), parsed);
-    if (result.ec != std::errc{} || result.ptr != clean.data() + clean.size()) return false;
-    *value = parsed;
+    std::uint64_t parsed = 0;
+    if (!strconv_core::ParseU64DecimalTrimmed(text, &parsed)) return false;
+    if (parsed > static_cast<std::uint64_t>(SIZE_MAX)) return false;
+    *value = static_cast<std::size_t>(parsed);
     return true;
 }
 
 bool ParseBool(const std::string& text, bool* value) {
     if (!value) return false;
-    auto clean = Trim(text);
-    std::transform(clean.begin(), clean.end(), clean.begin(), [](char c) {
-        return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
-    });
-    if (clean == "1" || clean == "true" || clean == "yes" || clean == "on") *value = true;
-    else if (clean == "0" || clean == "false" || clean == "no" || clean == "off") *value = false;
-    else return false;
-    return true;
+    // 词表与大小写折叠都在 strconv_core 里（大小写不敏感），这里只保留 Trim。
+    const std::string clean = Trim(text);
+    return strconv_core::ParseBoolLooseWords(clean, value);
 }
 
 // 配置文件是外部输入。这里集中定义上限，避免某一个模块单独放宽
@@ -1193,7 +1185,6 @@ namespace {
 ///          `#`/`;` 必须编码，否则读回时会被当成行内注释截断；首尾空格必须
 ///          编码，否则会被 Parse 的 Trim 吃掉。
 std::string EscapeIniValue(const std::string& input) {
-    static const char kHexDigits[] = "0123456789abcdef";
     const auto first_not_space = input.find_first_not_of(' ');
     const auto last_not_space = input.find_last_not_of(' ');
     std::string out;
@@ -1215,8 +1206,7 @@ std::string EscapeIniValue(const std::string& input) {
         const auto byte = static_cast<unsigned char>(character);
         out += '\\';
         out += 'x';
-        out += kHexDigits[byte >> 4U];
-        out += kHexDigits[byte & 0x0FU];
+        encoding::hexcore::AppendEncodedByte(out, byte);
     }
     return out;
 }

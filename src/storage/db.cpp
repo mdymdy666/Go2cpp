@@ -35,6 +35,8 @@
  */
 #include "go2cpp/storage/db.hpp"
 
+#include "go2cpp/tools/strings.hpp"
+
 #include <sqlite3.h>
 
 #include <cctype>
@@ -155,14 +157,7 @@ int BindOne(sqlite3_stmt* stmt, int index, const Value& value) noexcept {
 }
 
 /// @brief ASCII 大写（PRAGMA 关键字不受 locale 影响）。
-std::string ToUpperAscii(std::string_view text) {
-    std::string out(text);
-    for (char& ch : out) {
-        ch = static_cast<char>(
-            std::toupper(static_cast<unsigned char>(ch)));
-    }
-    return out;
-}
+std::string ToUpperAscii(std::string_view text) { return AsciiToUpper(text); }
 
 /// @brief 大小写不敏感的 ASCII 比较（journal_mode 返回值）。
 bool EqualsIgnoreCase(std::string_view left, std::string_view right) noexcept {

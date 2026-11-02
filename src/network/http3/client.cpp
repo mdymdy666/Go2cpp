@@ -48,6 +48,7 @@
 #include "go2cpp/network/http3/client.hpp"
 
 #include "go2cpp/network/http2/transport.hpp"
+#include "go2cpp/tools/strings.hpp"
 #include "go2cpp/network/quic/picoquic_connection.hpp"
 
 #include <h3zero.h>
@@ -74,19 +75,9 @@ void SetError(std::string* error, const std::string& message) {
     }
 }
 
-std::string ToUpperAscii(std::string text) {
-    for (char& c : text) {
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-    return text;
-}
+std::string ToUpperAscii(std::string text) { return AsciiToUpper(text); }
 
-std::string ToLowerAscii(std::string text) {
-    for (char& c : text) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return text;
-}
+std::string ToLowerAscii(std::string text) { return AsciiToLower(text); }
 
 std::string HexCode(std::uint64_t code) {
     char buffer[24];

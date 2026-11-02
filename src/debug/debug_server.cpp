@@ -7,6 +7,7 @@
 
 #include "go2cpp/json.hpp"
 #include "go2cpp/network/socket.hpp"
+#include "go2cpp/tools/strings.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -66,19 +67,7 @@ const char* const kKnownComponents[] = {
 };
 
 std::string Trim(const std::string& input) {
-    std::size_t begin = 0;
-    while (begin < input.size() &&
-           (input[begin] == ' ' || input[begin] == '\t' ||
-            input[begin] == '\r' || input[begin] == '\n')) {
-        ++begin;
-    }
-    std::size_t end = input.size();
-    while (end > begin &&
-           (input[end - 1] == ' ' || input[end - 1] == '\t' ||
-            input[end - 1] == '\r' || input[end - 1] == '\n')) {
-        --end;
-    }
-    return input.substr(begin, end - begin);
+    return AsciiTrim(input, " \t\r\n");
 }
 
 std::string Upper(std::string value) {

@@ -18,6 +18,9 @@
 
 #include "go2cpp/media/signaling.hpp"
 
+#include "go2cpp/tools/strconv_core.hpp"
+#include "go2cpp/tools/strings.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -39,46 +42,21 @@ constexpr std::string_view kSignalMagic = "g2p-signal/1";
 // 字符串/数字工具
 // ---------------------------------------------------------------------------
 
-std::string_view TrimView(std::string_view text) {
-    std::size_t begin = 0;
-    std::size_t end = text.size();
-    while (begin < end && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
-        ++begin;
-    }
-    while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
-        --end;
-    }
-    return text.substr(begin, end - begin);
-}
+std::string_view TrimView(std::string_view text) { return AsciiTrimView(text); }
 
-std::string ToLower(std::string_view text) {
-    std::string lowered(text);
-    for (char& ch : lowered) {
-        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-    }
-    return lowered;
-}
+std::string ToLower(std::string_view text) { return AsciiToLower(text); }
 
 bool StartsWith(std::string_view text, std::string_view prefix) {
-    return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
+    return HasPrefix(text, prefix);
 }
 
 bool ParseUint(std::string_view text, std::uint64_t limit, std::uint64_t* value) {
-    if (text.empty() || text.size() > 20) {
+    // 旧实现的「长度 > 20 直接拒绝」前置条件原样保留（u64 十进制最多 20 位；
+    // 保留它才能维持对前导零长串的既有拒绝行为），数值语义交给 strconv_core。
+    if (text.size() > 20) {
         return false;
     }
-    std::uint64_t parsed = 0;
-    for (const char ch : text) {
-        if (ch < '0' || ch > '9') {
-            return false;
-        }
-        parsed = parsed * 10U + static_cast<std::uint64_t>(ch - '0');
-        if (parsed > limit) {
-            return false;
-        }
-    }
-    *value = parsed;
-    return true;
+    return strconv_core::ParseU64Within(text, limit, value);
 }
 
 bool ParseU8(std::string_view text, std::uint8_t* value) {
