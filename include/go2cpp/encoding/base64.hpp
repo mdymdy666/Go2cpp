@@ -148,7 +148,15 @@ class Base64Encoding {
      */
     constexpr Base64Encoding(std::string_view alphabet, char pad,
                              bool strict = false) noexcept
-        : m_alphabet(alphabet), m_pad(pad), m_strict(strict) {}
+        : m_alphabet(alphabet), m_pad(pad), m_strict(strict) {
+        for (std::size_t i = 0; i < m_decode.size(); ++i) {
+            m_decode[i] = -1;
+        }
+        for (std::size_t i = 0; i < 64; ++i) {
+            m_decode[static_cast<unsigned char>(alphabet[i])] =
+                static_cast<std::int8_t>(i);
+        }
+    }
 
     /// 对应 Go `EncodedLen`：`src_len` 字节编码后的长度（含填充）。
     std::size_t EncodedLen(std::size_t src_len) const noexcept;
@@ -205,6 +213,8 @@ class Base64Encoding {
     std::string_view m_alphabet; ///< 64 字符字母表（非拥有）；构造时设置，Encode/Decode/Strict 读取
     char m_pad;                  ///< 填充字符，'\0' 表示 Raw；构造时设置，Encode/IsRaw/Decode 读取
     bool m_strict{false};        ///< 是否校验尾部填充位；构造/Strict() 设置，Decode 读取
+    /// 256 项反查表（-1=非法）：构造期由字母表展开，Decode 热路径直接索引。
+    std::array<std::int8_t, 256> m_decode{};
 };
 
 /// Go 包名 `encoding/base64` 的类型别名；四种预定义实例见下方常量。

@@ -1023,3 +1023,33 @@ errno noinline），不是寄存器保存。
   `docs/reports/asm-storage-features.md`。已知边界：冷读每次 Refill 都会
   打开段索引（未做索引缓存）；Queue 单 topic 消费串行；Watch 前缀线性匹配；
   MemCache 分片数应按并发度配置（单线程 8 分片比 1 分片慢 14%）。
+
+## 2026-11-02 工具类模块汇编级优化（Base64 / gzip / reflect JSON）
+
+- **Base64**：反查表移入 `constexpr` 构造期（256 项成员表，四个预定义实例编译期常量）；
+  编码改 `resize` + 单次 32-bit store（原每字符 `push_back`）；解码单遍 quantum +
+  `thread_local` scratch（零堆分配，长度错误才走「先找非法字符」慢路径），端序分支安全。
+  16 MiB：编码 1004→**1980 MiB/s**、解码 600→**1566 MiB/s**（Go 同机 1663/1582，0.84×/1.01×）；
+  60 B 编码 58.5→**30.9 ns**（Go 41.9）。
+- **gzip 压缩**：BitWriter 改 64 位累加器 + 32 位整字落盘（`Align` 按 `m_bits&7` 补位）；
+  固定 Huffman 反转码表（288+32 项）；哈希链跨块持久（绝对位置 + 32 KiB 环形前驱表，
+  不再每块重建 128 KiB head / 重插 history）；匹配比较 8 字节 + ctz；按格式只算一种校验和；
+  CRC slice-by-8。1 MiB L6：235.7→**550 MiB/s**（zlib 421，0.77×）。
+- **gzip 解压**：LZ77 匹配整段 `memcpy`（距离<长度时倍增展开）+ 窗口环形批量读写 +
+  批量校验和（gzip slice-by-16 CRC32 / zlib adler32 分块 / raw 跳过）。
+  1 MiB：486.8→**1880 MiB/s**（zlib 2984，1.59×；剩余瓶颈是 CRC，下一步 PCLMULQDQ）。
+- **reflect JSON**：`Buffer::GetStringView`（字段名零分配）、`DeserializeReflect` 栈数组、
+  `DecodeBinary` 零拷贝指针解析（原 3 次整消息/载荷复制）、payload `move`、
+  `WireFieldTable<T>()` 字段表按类型缓存、`JsonWriter` 转义零临时串、
+  `JsonParser` 字符串整段 append + `members.reserve(8)`、Envelope 直接写 `out`。
+  二进制编 225.6→**79.6 ns**（protobuf 81.7，0.97×）、解 159.3→**111.7 ns**（protobuf 78.1，1.43×）；
+  文本编 340.4→**259.4 ns**、解 929.3→**772.3 ns**（nlohmann 477.3/809.3，0.54×/0.95×；
+  rapidjson 103.8/275.9，2.50×/2.80×）；JSON 文档解析 334.3→292.4 ns（rapidjson 275.9，1.06×）。
+- **测试**：`ctest -R 'encoding|compress|reflect'` 5/5 通过（compress 1196 checks，含 GNU gzip /
+  Python zlib 双向互操作；reflect 10969 checks；encoding 全过）；全量 496 目标
+  `-Werror` 构建成功。未 commit。
+- **基准**：`tests/bench/bench_tools_industry.cpp` + `tools_bench.proto`（手工编译，不登记 CMake）；
+  Go 对照 `/tmp/gobench/main.go`。
+- **报告**：`/tmp/tools_vs_industry.md`（每项 vs 工业库与是否 <1.1×）。
+- **未达标**：gzip 解压 1.59×（CRC 需 PCLMULQDQ）、reflect 二进制解码 1.43×（自描述字段名开销）、
+  文本路径 vs rapidjson 2.5~2.8×（envelope + 建树，vs nlohmann 已达标）。

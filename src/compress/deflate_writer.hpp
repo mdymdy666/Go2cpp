@@ -61,6 +61,9 @@ public:
     };
 
     /// 写 `count` 位（`value` 的低位在前，即 DEFLATE 的 LSB-first）。
+    /// @note 位累加器按 32 位整字落盘（一条 32-bit store），不再逐字节
+    ///       `push_back`：后者每个字节一次容量检查 + 长度更新，是编码热路径
+    ///       上最贵的一段。
     void PutBits(std::uint32_t value, int count) {
         if (count <= 0) {
             return;
@@ -69,10 +72,8 @@ public:
         m_buffer |= (static_cast<std::uint64_t>(value) & mask) << m_bits;
         m_bits += count;
         m_position += static_cast<std::uint64_t>(count);
-        while (m_bits >= 8) {
-            m_bytes.push_back(static_cast<std::uint8_t>(m_buffer & 0xFFU));
-            m_buffer >>= 8U;
-            m_bits -= 8;
+        while (m_bits >= 32) {
+            FlushWord();
         }
     }
 
@@ -82,34 +83,65 @@ public:
     }
 
     /// 补齐到下一个字节边界（补 0 位）。
+    /// @note 位累加器可能持有 8~31 位（32 位批量落盘的尾部），因此必须按
+    ///       `m_bits & 7` 补位，不能写死 `8 - m_bits`（后者只有 m_bits<8 时成立）。
     void Align() {
-        if (m_bits > 0) {
-            PutBits(0, 8 - m_bits);
+        const int drop = m_bits & 7;
+        if (drop != 0) {
+            PutBits(0, 8 - drop);
         }
+        FlushCompleteBytes();
     }
 
     /// 当前绝对位位置（含未满字节的位）。
     std::uint64_t position() const noexcept { return m_position; }
 
     Checkpoint Save() const noexcept {
-        return Checkpoint{m_bytes.size(), m_buffer, m_bits, m_position};
+        return Checkpoint{m_size, m_buffer, m_bits, m_position};
     }
 
     void Restore(const Checkpoint& checkpoint) {
-        m_bytes.resize(checkpoint.size);
+        m_size = checkpoint.size;
         m_buffer = checkpoint.buffer;
         m_bits = checkpoint.bits;
         m_position = checkpoint.position;
     }
 
-    /// 已写出的完整字节。
-    const std::vector<std::uint8_t>& bytes() const noexcept { return m_bytes; }
+    /// 把累加器里已凑满的整字节落到输出缓冲（不改变位流顺序）。
+    /// @details 32 位批量落盘会留下 8~31 位的尾部，其中 >=8 位的部分是
+    ///          已确定的整字节；`data()/size()` 的语义要求把它们算进去。
+    void FlushCompleteBytes() {
+        while (m_bits >= 8) {
+            EnsureCapacity(1);
+            m_bytes[m_size++] = static_cast<std::uint8_t>(m_buffer & 0xFFU);
+            m_buffer >>= 8U;
+            m_bits -= 8;
+        }
+    }
 
-    /// 排空后释放整字节缓冲；保留未满字节的位缓存。
-    void ConsumeBytes() noexcept { m_bytes.clear(); }
+    /// 写对齐后的原始字节（调用方必须先 `Align()`）。
+    void PutBytes(const std::uint8_t* data, std::size_t size) {
+        if (size == 0) {
+            return;
+        }
+        FlushCompleteBytes();
+        EnsureCapacity(size);
+        std::memcpy(m_bytes.data() + m_size, data, size);
+        m_size += size;
+        m_position += static_cast<std::uint64_t>(size) * 8U;
+    }
+
+    /// 已写出的完整字节（只读视图）。
+    const std::uint8_t* data() const noexcept { return m_bytes.data(); }
+
+    /// 已写出的完整字节数。
+    std::size_t size() const noexcept { return m_size; }
+
+    /// 排空后释放整字节缓冲；保留未满字节的位缓存与已分配容量。
+    void ConsumeBytes() noexcept { m_size = 0; }
 
     /// 是否有尚未交给调用方的完整字节。
-    bool HasBytes() const noexcept { return !m_bytes.empty(); }
+    bool HasBytes() const noexcept { return m_size != 0; }
 
 private:
     static std::uint32_t Reverse(std::uint32_t code, int bits) noexcept {
@@ -121,10 +153,43 @@ private:
         return reversed;
     }
 
-    std::vector<std::uint8_t> m_bytes;
-    std::uint64_t m_buffer{0};
-    int m_bits{0};
-    std::uint64_t m_position{0};
+    /// 把累加器低 32 位落到输出缓冲（小端序，LSB-first 位流）。
+    void FlushWord() {
+        EnsureCapacity(4);
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+        const std::uint32_t word = static_cast<std::uint32_t>(m_buffer & 0xFFFFFFFFU);
+        std::memcpy(m_bytes.data() + m_size, &word, sizeof(word));
+#else
+        m_bytes[m_size + 0] = static_cast<std::uint8_t>(m_buffer & 0xFFU);
+        m_bytes[m_size + 1] = static_cast<std::uint8_t>((m_buffer >> 8U) & 0xFFU);
+        m_bytes[m_size + 2] = static_cast<std::uint8_t>((m_buffer >> 16U) & 0xFFU);
+        m_bytes[m_size + 3] = static_cast<std::uint8_t>((m_buffer >> 24U) & 0xFFU);
+#endif
+        m_size += 4;
+        m_buffer >>= 32U;
+        m_bits -= 32;
+    }
+
+    void EnsureCapacity(std::size_t extra) {
+        const std::size_t need = m_size + extra;
+        if (m_bytes.size() >= need) {
+            return;
+        }
+        std::size_t next = m_bytes.size() * 2U;
+        if (next < need) {
+            next = need;
+        }
+        if (next < 4096U) {
+            next = 4096U;
+        }
+        m_bytes.resize(next);
+    }
+
+    std::vector<std::uint8_t> m_bytes;  ///< 输出字节（容量复用）
+    std::size_t m_size{0};              ///< 已写出的完整字节数
+    std::uint64_t m_buffer{0};          ///< 位累加器
+    int m_bits{0};                      ///< 累加器中未落盘的位数
+    std::uint64_t m_position{0};        ///< 绝对位位置
 };
 
 /**
@@ -169,6 +234,11 @@ public:
         m_writer = BitWriter{};
         m_input.clear();
         m_history.clear();
+        m_combined.clear();
+        m_head.assign(kHashSize, kInvalidPosition);
+        m_previous.assign(kWindowSize, kInvalidPosition);
+        m_consumed = 0;
+        m_block_start = 0;
         m_header_done = false;
         m_sync_done = false;
         m_finished = false;
@@ -185,8 +255,13 @@ public:
         if (!m_ok || data == nullptr || size == 0) {
             return;
         }
-        UpdateAdler(data, size);
-        UpdateCrc(data, size);
+        // 只有对应格式才需要校验和：zlib 用 adler32、gzip 用 crc32，raw 都不用。
+        // 旧实现无条件两样都算，等于白烧一半的校验和带宽。
+        if (m_format == Format::kZlib) {
+            UpdateAdler(data, size);
+        } else if (m_format == Format::kGzip) {
+            UpdateCrc(data, size);
+        }
         m_total_in += size;
         m_input.insert(m_input.end(), data, data + size);
         m_sync_done = false;
@@ -195,7 +270,9 @@ public:
     /// 把已满一个块的数据编码出去，控制内部缓冲不超过一个块。
     void Pump() {
         while (m_input.size() >= kBlockSize) {
+            m_block_start = m_consumed;
             EncodeBlock(m_input.data(), kBlockSize, false);
+            m_consumed += kBlockSize;
             AppendHistory(m_input.data(), kBlockSize);
             m_input.erase(m_input.begin(),
                           m_input.begin() + static_cast<std::ptrdiff_t>(kBlockSize));
@@ -210,7 +287,9 @@ public:
         EnsureHeader();
         Pump();
         if (!m_input.empty()) {
+            m_block_start = m_consumed;
             EncodeBlock(m_input.data(), m_input.size(), false);
+            m_consumed += m_input.size();
             AppendHistory(m_input.data(), m_input.size());
             m_input.clear();
         }
@@ -227,7 +306,9 @@ public:
         EnsureHeader();
         Pump();
         if (!m_input.empty()) {
+            m_block_start = m_consumed;
             EncodeBlock(m_input.data(), m_input.size(), true);
+            m_consumed += m_input.size();
             AppendHistory(m_input.data(), m_input.size());
             m_input.clear();
         } else {
@@ -242,25 +323,28 @@ public:
 
     /// 把已产出的完整字节复制到 `out`；返回本次复制字节数。
     std::size_t Drain(std::uint8_t* out, std::size_t capacity) {
-        const std::vector<std::uint8_t>& bytes = m_writer.bytes();
-        if (m_drain_offset >= bytes.size()) {
+        m_writer.FlushCompleteBytes();
+        const std::uint8_t* bytes = m_writer.data();
+        const std::size_t total = m_writer.size();
+        if (m_drain_offset >= total) {
             m_writer.ConsumeBytes();
             m_drain_offset = 0;
             return 0;
         }
-        const std::size_t available = bytes.size() - m_drain_offset;
+        const std::size_t available = total - m_drain_offset;
         const std::size_t take = std::min(available, capacity);
-        std::memcpy(out, bytes.data() + m_drain_offset, take);
+        std::memcpy(out, bytes + m_drain_offset, take);
         m_drain_offset += take;
-        if (m_drain_offset == bytes.size()) {
+        if (m_drain_offset == total) {
             m_writer.ConsumeBytes();
             m_drain_offset = 0;
         }
         return take;
     }
 
-    bool HasPending() const noexcept {
-        return m_drain_offset < m_writer.bytes().size();
+    bool HasPending() {
+        m_writer.FlushCompleteBytes();
+        return m_drain_offset < m_writer.size();
     }
 
     const std::string& message() const noexcept { return m_error; }
@@ -268,8 +352,10 @@ public:
 private:
     static constexpr std::size_t kBlockSize = 32U * 1024U;
     static constexpr std::size_t kWindowSize = 32U * 1024U;
+    static constexpr std::size_t kWindowMask = kWindowSize - 1U;
     static constexpr int kHashBits = 15;
     static constexpr std::size_t kHashSize = std::size_t{1} << kHashBits;
+    static constexpr std::uint32_t kInvalidPosition = 0xFFFFFFFFU;
 
     static constexpr int kLengthBase[29] = {
         3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27,
@@ -287,7 +373,7 @@ private:
 
     struct Match {
         int length{0};
-        int position{-1};
+        std::uint32_t position{kInvalidPosition};
     };
 
     int MaxChain() const noexcept {
@@ -413,9 +499,7 @@ private:
         m_writer.Align();
         m_writer.PutBits(static_cast<std::uint32_t>(size & 0xFFFFU), 16);
         m_writer.PutBits(static_cast<std::uint32_t>((~size) & 0xFFFFU), 16);
-        for (std::size_t index = 0; index < size; ++index) {
-            m_writer.PutBits(data[index], 8);
-        }
+        m_writer.PutBytes(data, size);
     }
 
     void EmitFixedEmptyFinal() {
@@ -438,33 +522,35 @@ private:
             EmitSymbol(256);
             return;
         }
-        std::vector<std::uint8_t> combined;
-        combined.reserve(m_history.size() + size);
-        combined.insert(combined.end(), m_history.begin(), m_history.end());
-        combined.insert(combined.end(), data, data + size);
+        m_combined.clear();
+        m_combined.reserve(m_history.size() + size);
+        m_combined.insert(m_combined.end(), m_history.begin(), m_history.end());
+        m_combined.insert(m_combined.end(), data, data + size);
         const std::size_t history_size = m_history.size();
-        std::vector<std::int32_t> head(kHashSize, -1);
-        std::vector<std::int32_t> previous(combined.size(), -1);
-        for (std::size_t index = 0; index < history_size; ++index) {
-            InsertHash(combined, index, head, previous);
-        }
+        // 哈希链**跨块保留**：位置用流内绝对偏移，前驱表按 32 KiB 环形索引。
+        // 旧实现每块重建 head（128 KiB 清零）并把 history 逐位置重插一遍，
+        // 32 KiB 一块的额外代价约等于数据本身，且丢掉了跨块匹配。
+        const std::uint32_t base =
+            static_cast<std::uint32_t>(m_block_start - history_size);
         const int max_chain = MaxChain();
         const int nice_length = NiceLength();
         std::size_t position = history_size;
-        while (position < combined.size()) {
+        while (position < m_combined.size()) {
             const Match match =
-                FindMatch(combined, position, head, previous, max_chain, nice_length);
+                FindMatch(m_combined, position, base, max_chain, nice_length);
             if (match.length >= 3) {
-                EmitLengthDistance(static_cast<std::size_t>(match.length),
-                                   position - static_cast<std::size_t>(match.position));
+                const std::uint32_t absolute =
+                    base + static_cast<std::uint32_t>(position);
+                EmitLengthDistance(
+                    static_cast<std::size_t>(match.length),
+                    static_cast<std::size_t>(absolute - match.position));
                 for (int offset = 0; offset < match.length; ++offset) {
-                    InsertHash(combined, position + static_cast<std::size_t>(offset),
-                               head, previous);
+                    InsertHash(m_combined, position + static_cast<std::size_t>(offset), base);
                 }
                 position += static_cast<std::size_t>(match.length);
             } else {
-                EmitSymbol(combined[position]);
-                InsertHash(combined, position, head, previous);
+                EmitSymbol(m_combined[position]);
+                InsertHash(m_combined, position, base);
                 ++position;
             }
         }
@@ -478,42 +564,67 @@ private:
         return (value * 2654435761U) >> (32 - kHashBits);
     }
 
-    static void InsertHash(const std::vector<std::uint8_t>& data, std::size_t position,
-                           std::vector<std::int32_t>& head,
-                           std::vector<std::int32_t>& previous) {
+    /// 从两个位置开始比较，返回公共前缀长度（8 字节一跳，按 ctz 定位差异）。
+    static std::size_t MatchLength(const std::uint8_t* lhs,
+                                   const std::uint8_t* rhs,
+                                   std::size_t max_length) noexcept {
+        std::size_t length = 0;
+        while (length + 8 <= max_length) {
+            std::uint64_t a = 0;
+            std::uint64_t b = 0;
+            std::memcpy(&a, lhs + length, sizeof(a));
+            std::memcpy(&b, rhs + length, sizeof(b));
+            const std::uint64_t diff = a ^ b;
+            if (diff != 0) {
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+                return length + static_cast<std::size_t>(__builtin_ctzll(diff) >> 3);
+#else
+                return length + static_cast<std::size_t>(__builtin_clzll(diff) >> 3);
+#endif
+            }
+            length += 8;
+        }
+        while (length < max_length && lhs[length] == rhs[length]) {
+            ++length;
+        }
+        return length;
+    }
+
+    /// 插入当前位置的哈希链（绝对位置，前驱表环形）。
+    void InsertHash(const std::vector<std::uint8_t>& data, std::size_t position,
+                    std::uint32_t base) {
         if (position + 2U >= data.size()) {
             return;
         }
+        const std::uint32_t absolute = base + static_cast<std::uint32_t>(position);
         const std::uint32_t hash = Hash3(data.data() + position);
-        previous[position] = head[hash];
-        head[hash] = static_cast<std::int32_t>(position);
+        m_previous[absolute & kWindowMask] = m_head[hash];
+        m_head[hash] = absolute;
     }
 
-    static Match FindMatch(const std::vector<std::uint8_t>& data, std::size_t position,
-                           const std::vector<std::int32_t>& head,
-                           const std::vector<std::int32_t>& previous, int max_chain,
-                           int nice_length) {
+    /// 在 32 KiB 窗口内找最长匹配；`base` 是 `data[0]` 的流内绝对偏移。
+    Match FindMatch(const std::vector<std::uint8_t>& data, std::size_t position,
+                    std::uint32_t base, int max_chain, int nice_length) const {
         Match best;
         if (position + 2U >= data.size()) {
             return best;
         }
+        const std::uint32_t absolute = base + static_cast<std::uint32_t>(position);
         const std::size_t max_length = std::min<std::size_t>(258U, data.size() - position);
-        int candidate = head[Hash3(data.data() + position)];
+        std::uint32_t candidate = m_head[Hash3(data.data() + position)];
         int chain = max_chain;
-        while (candidate >= 0 && chain-- > 0) {
-            const std::size_t candidate_position = static_cast<std::size_t>(candidate);
-            const std::size_t distance = position - candidate_position;
-            if (distance > kWindowSize) {
+        while (candidate != kInvalidPosition && chain-- > 0) {
+            const std::uint32_t distance = absolute - candidate;
+            if (distance == 0 || distance > kWindowSize) {
                 break;
             }
+            const std::size_t candidate_position = candidate - base;
             if (best.length == 0 ||
                 data[candidate_position + static_cast<std::size_t>(best.length)] ==
                     data[position + static_cast<std::size_t>(best.length)]) {
-                std::size_t length = 0;
-                while (length < max_length &&
-                       data[candidate_position + length] == data[position + length]) {
-                    ++length;
-                }
+                const std::size_t length =
+                    MatchLength(data.data() + candidate_position,
+                                data.data() + position, max_length);
                 if (length > static_cast<std::size_t>(best.length)) {
                     best.length = static_cast<int>(length);
                     best.position = candidate;
@@ -522,7 +633,7 @@ private:
                     }
                 }
             }
-            candidate = previous[candidate_position];
+            candidate = m_previous[candidate & kWindowMask];
         }
         return best;
     }
@@ -545,7 +656,8 @@ private:
                distance < static_cast<std::size_t>(kDistanceBase[distance_index])) {
             --distance_index;
         }
-        m_writer.PutCode(static_cast<std::uint32_t>(distance_index), 5);
+        // 固定 Huffman 的距离码只有 5 位，反转结果可预计算。
+        m_writer.PutBits(ReversedDistCodes()[distance_index], 5);
         const int distance_extra = kDistanceExtra[distance_index];
         if (distance_extra > 0) {
             m_writer.PutBits(static_cast<std::uint32_t>(
@@ -557,11 +669,61 @@ private:
 
     void EmitSymbol(int symbol) { EmitFixedCode(symbol); }
 
+    /// 固定 Huffman 码字表（已按位流顺序反转），避免每符号做位反转循环。
+    static const std::array<std::uint32_t, 288>& ReversedLitCodes() {
+        static const std::array<std::uint32_t, 288> table = [] {
+            std::array<std::uint32_t, 288> result{};
+            for (int symbol = 0; symbol < 288; ++symbol) {
+                std::uint32_t code = 0;
+                int bits = 0;
+                FixedLitCode(symbol, &code, &bits);
+                result[static_cast<std::size_t>(symbol)] =
+                    BitWriterReverse(code, bits);
+            }
+            return result;
+        }();
+        return table;
+    }
+
+    static const std::array<std::uint8_t, 288>& LitCodeBits() {
+        static const std::array<std::uint8_t, 288> table = [] {
+            std::array<std::uint8_t, 288> result{};
+            for (int symbol = 0; symbol < 288; ++symbol) {
+                std::uint32_t code = 0;
+                int bits = 0;
+                FixedLitCode(symbol, &code, &bits);
+                result[static_cast<std::size_t>(symbol)] =
+                    static_cast<std::uint8_t>(bits);
+            }
+            return result;
+        }();
+        return table;
+    }
+
+    static const std::array<std::uint32_t, 32>& ReversedDistCodes() {
+        static const std::array<std::uint32_t, 32> table = [] {
+            std::array<std::uint32_t, 32> result{};
+            for (int index = 0; index < 32; ++index) {
+                result[static_cast<std::size_t>(index)] =
+                    BitWriterReverse(static_cast<std::uint32_t>(index), 5);
+            }
+            return result;
+        }();
+        return table;
+    }
+
+    static std::uint32_t BitWriterReverse(std::uint32_t code, int bits) noexcept {
+        std::uint32_t reversed = 0;
+        for (int index = 0; index < bits; ++index) {
+            reversed = (reversed << 1U) | (code & 1U);
+            code >>= 1U;
+        }
+        return reversed;
+    }
+
     void EmitFixedCode(int symbol) {
-        std::uint32_t code = 0;
-        int bits = 0;
-        FixedLitCode(symbol, &code, &bits);
-        m_writer.PutCode(code, bits);
+        m_writer.PutBits(ReversedLitCodes()[static_cast<std::size_t>(symbol)],
+                         LitCodeBits()[static_cast<std::size_t>(symbol)]);
     }
 
     static void FixedLitCode(int symbol, std::uint32_t* code, int* bits) noexcept {
@@ -610,27 +772,48 @@ private:
     }
 
     void UpdateCrc(const std::uint8_t* data, std::size_t size) {
-        const std::array<std::uint32_t, 256>& table = CrcTable();
+        const auto& tables = CrcTables();
         std::uint32_t crc = m_crc;
-        for (std::size_t index = 0; index < size; ++index) {
-            crc = table[(crc ^ data[index]) & 0xFFU] ^ (crc >> 8U);
+        std::size_t index = 0;
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+        // slice-by-8：每 8 字节 8 次查表，比逐字节查表快数倍。
+        for (; index + 8 <= size; index += 8) {
+            std::uint64_t block = 0;
+            std::memcpy(&block, data + index, sizeof(block));
+            crc ^= static_cast<std::uint32_t>(block & 0xFFFFFFFFU);
+            const std::uint32_t high = static_cast<std::uint32_t>(block >> 32U);
+            crc = tables[7][crc & 0xFFU] ^ tables[6][(crc >> 8U) & 0xFFU] ^
+                  tables[5][(crc >> 16U) & 0xFFU] ^ tables[4][(crc >> 24U) & 0xFFU] ^
+                  tables[3][high & 0xFFU] ^ tables[2][(high >> 8U) & 0xFFU] ^
+                  tables[1][(high >> 16U) & 0xFFU] ^ tables[0][(high >> 24U) & 0xFFU];
+        }
+#endif
+        for (; index < size; ++index) {
+            crc = tables[0][(crc ^ data[index]) & 0xFFU] ^ (crc >> 8U);
         }
         m_crc = crc;
     }
 
-    static const std::array<std::uint32_t, 256>& CrcTable() {
-        static const std::array<std::uint32_t, 256> table = [] {
-            std::array<std::uint32_t, 256> result{};
+    static const std::array<std::array<std::uint32_t, 256>, 8>& CrcTables() {
+        static const std::array<std::array<std::uint32_t, 256>, 8> tables = [] {
+            std::array<std::array<std::uint32_t, 256>, 8> result{};
             for (std::uint32_t index = 0; index < 256; ++index) {
                 std::uint32_t value = index;
                 for (int bit = 0; bit < 8; ++bit) {
                     value = (value & 1U) ? (0xEDB88320U ^ (value >> 1U)) : (value >> 1U);
                 }
-                result[index] = value;
+                result[0][index] = value;
+            }
+            for (std::size_t slice = 1; slice < 8; ++slice) {
+                for (std::uint32_t index = 0; index < 256; ++index) {
+                    const std::uint32_t previous = result[slice - 1][index];
+                    result[slice][index] =
+                        (previous >> 8U) ^ result[0][previous & 0xFFU];
+                }
             }
             return result;
         }();
-        return table;
+        return tables;
     }
 
     Format m_format{Format::kRaw};
@@ -640,6 +823,15 @@ private:
     BitWriter m_writer;
     std::vector<std::uint8_t> m_input;
     std::vector<std::uint8_t> m_history;
+    /// 块内拼接缓冲（history + 当前块），跨块复用避免每次分配。
+    std::vector<std::uint8_t> m_combined;
+    /// 哈希头表与前驱表，跨块持久（位置为流内绝对偏移）。
+    std::vector<std::uint32_t> m_head;
+    std::vector<std::uint32_t> m_previous;
+    /// 已编码的流内字节数（块起点的绝对偏移基准）。
+    std::size_t m_consumed{0};
+    /// 当前块在流内的绝对起点。
+    std::size_t m_block_start{0};
     bool m_header_done{false};
     bool m_sync_done{false};
     bool m_finished{false};

@@ -35,81 +35,104 @@ constexpr std::uint8_t kFlagCompressed = 0x01u;
 /// @brief 文本消息协议版本。
 constexpr std::int64_t kTextVersion = 1;
 
+/// @brief 与 `Buffer::GetVarint` 相同规则的指针版 varint 读取（零拷贝解码用）。
+bool ReadVarintRaw(const std::uint8_t*& cursor, const std::uint8_t* end,
+                   std::uint64_t& value) noexcept {
+    std::uint64_t result = 0;
+    unsigned shift = 0;
+    for (std::size_t index = 0; index < 10; ++index) {
+        if (cursor >= end) {
+            return false;
+        }
+        const std::uint8_t byte = *cursor++;
+        if (index == 9 && byte > 1) {
+            return false;
+        }
+        result |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
+        if ((byte & 0x80u) == 0) {
+            value = result;
+            return true;
+        }
+        shift += 7;
+    }
+    return false;
+}
+
 CodecStatus DecodeBinary(const std::uint8_t* data, std::size_t size, Envelope& out,
                          std::size_t* consumed) {
-    Buffer in;
-    if (!in.PutBytes(data, size)) {
-        return CodecStatus::kTooLarge;
-    }
-    std::uint8_t magic[4] = {};
-    if (!in.GetBytes(magic, sizeof(magic))) {
+    // 零拷贝：旧实现先把整条消息复制进 Buffer、再把 payload 复制进 raw、
+    // 最后复制进 out.payload（60 字节消息 = 3 次分配 + 3 次 memcpy）。
+    // 现在直接在原指针上解析，只有 payload 落一次。
+    const std::uint8_t* cursor = data;
+    const std::uint8_t* const end = data + size;
+    if (size < sizeof(kBinaryMagic)) {
         return CodecStatus::kTruncated;
     }
-    if (std::memcmp(magic, kBinaryMagic, sizeof(magic)) != 0) {
+    if (std::memcmp(cursor, kBinaryMagic, sizeof(kBinaryMagic)) != 0) {
         return CodecStatus::kBadMagic;
     }
-    std::uint8_t version = 0;
-    if (!in.GetU8(version)) {
+    cursor += sizeof(kBinaryMagic);
+    if (cursor >= end) {
         return CodecStatus::kTruncated;
     }
+    const std::uint8_t version = *cursor++;
     if (version != kBinaryVersion) {
         return CodecStatus::kBadVersion;
     }
-    std::uint8_t flags = 0;
-    if (!in.GetU8(flags)) {
+    if (cursor >= end) {
         return CodecStatus::kTruncated;
     }
+    const std::uint8_t flags = *cursor++;
     if ((flags & ~kFlagCompressed) != 0) {
         return CodecStatus::kBadVersion;
     }
     std::uint64_t type_id = 0;
-    if (!in.GetVarint(type_id)) {
+    if (!ReadVarintRaw(cursor, end, type_id)) {
         return CodecStatus::kTruncated;
     }
     if (type_id > std::numeric_limits<TypeId>::max()) {
         return CodecStatus::kBadPayload;
     }
-    std::string type_name;
-    if (!in.GetString(type_name)) {
+    std::uint64_t name_length = 0;
+    if (!ReadVarintRaw(cursor, end, name_length)) {
         return CodecStatus::kTruncated;
     }
-    if (type_name.size() > kMaxTypeNameBytes) {
+    if (name_length > kMaxStringBytes ||
+        name_length > static_cast<std::uint64_t>(end - cursor)) {
+        return CodecStatus::kTruncated;
+    }
+    if (name_length > kMaxTypeNameBytes) {
         return CodecStatus::kTooLarge;
     }
+    out.type_name.assign(reinterpret_cast<const char*>(cursor),
+                         static_cast<std::size_t>(name_length));
+    cursor += name_length;
     std::uint64_t payload_length = 0;
-    if (!in.GetVarint(payload_length)) {
+    if (!ReadVarintRaw(cursor, end, payload_length)) {
         return CodecStatus::kTruncated;
     }
     if (payload_length > kMaxBufferBytes) {
         return CodecStatus::kTooLarge;
     }
-    if (payload_length > in.Remaining()) {
-        return CodecStatus::kTruncated;
-    }
-    std::vector<std::uint8_t> raw;
-    try {
-        raw.resize(static_cast<std::size_t>(payload_length));
-    } catch (const std::bad_alloc&) {
-        return CodecStatus::kTooLarge;
-    }
-    if (!in.GetBytes(raw.data(), raw.size())) {
+    if (payload_length > static_cast<std::uint64_t>(end - cursor)) {
         return CodecStatus::kTruncated;
     }
     out.payload.Clear();
     const bool compressed = (flags & kFlagCompressed) != 0;
     if (compressed) {
-        if (!RleDecompress(raw.data(), raw.size(), out.payload.data(), kMaxBufferBytes)) {
+        if (!RleDecompress(cursor, static_cast<std::size_t>(payload_length),
+                           out.payload.data(), kMaxBufferBytes)) {
             return CodecStatus::kCompressionError;
         }
-    } else if (!out.payload.PutBytes(raw.data(), raw.size())) {
+    } else if (!out.payload.PutBytes(cursor, static_cast<std::size_t>(payload_length))) {
         return CodecStatus::kTooLarge;
     }
     out.encoding = Encoding::kBinary;
     out.compressed = compressed;
     out.type_id = static_cast<TypeId>(type_id);
-    out.type_name = std::move(type_name);
     if (consumed != nullptr) {
-        *consumed = in.ReadPosition();
+        *consumed = static_cast<std::size_t>(cursor - data) +
+                    static_cast<std::size_t>(payload_length);
     }
     return CodecStatus::kOk;
 }
@@ -234,14 +257,31 @@ CodecStatus EncodeEnvelope(TypeId type_id, std::string_view type_name, Encoding 
                 payload_size = compressed.size();
             }
         }
-        Buffer buffer;
-        if (!buffer.PutBytes(kBinaryMagic, sizeof(kBinaryMagic)) || !buffer.PutU8(kBinaryVersion) ||
-            !buffer.PutU8(flags) || !buffer.PutVarint(type_id) || !buffer.PutString(type_name) ||
-            !buffer.PutVarint(static_cast<std::uint64_t>(payload_size)) ||
-            !buffer.PutBytes(payload_data, payload_size)) {
+        // 直接写 out，省掉中间 Buffer 的一次分配 + 整体搬移。
+        try {
+            out.clear();
+            out.reserve(sizeof(kBinaryMagic) + 2U + 20U + type_name.size() + payload_size);
+        } catch (const std::bad_alloc&) {
             return CodecStatus::kTooLarge;
         }
-        out = std::move(buffer.data());
+        const auto append_varint = [&out](std::uint64_t value) {
+            while (value >= 0x80u) {
+                out.push_back(static_cast<std::uint8_t>(value & 0x7fu) | 0x80u);
+                value >>= 7;
+            }
+            out.push_back(static_cast<std::uint8_t>(value));
+        };
+        out.insert(out.end(), kBinaryMagic, kBinaryMagic + sizeof(kBinaryMagic));
+        out.push_back(kBinaryVersion);
+        out.push_back(flags);
+        append_varint(type_id);
+        append_varint(type_name.size());
+        out.insert(out.end(), type_name.begin(), type_name.end());
+        append_varint(payload_size);
+        out.insert(out.end(), payload_data, payload_data + payload_size);
+        if (out.size() > kMaxBufferBytes) {
+            return CodecStatus::kTooLarge;
+        }
         return CodecStatus::kOk;
     }
 
@@ -265,7 +305,8 @@ CodecStatus EncodeEnvelope(TypeId type_id, std::string_view type_name, Encoding 
     if (text.size() > kMaxBufferBytes) {
         return CodecStatus::kTooLarge;
     }
-    out.assign(text.begin(), text.end());
+    out.assign(reinterpret_cast<const std::uint8_t*>(text.data()),
+               reinterpret_cast<const std::uint8_t*>(text.data()) + text.size());
     return CodecStatus::kOk;
 }
 

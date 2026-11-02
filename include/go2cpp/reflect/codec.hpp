@@ -105,15 +105,17 @@ CodecStatus CheckWireType(const Envelope& envelope) {
 }
 
 /// @brief 把已解析的外层载荷解码为目标类型。
+/// @note `envelope` 按非 const 引用传入：二进制模式下 payload 会被 move 进
+///       解码 Buffer（旧实现是整段复制一次），调用方传入局部 Envelope 即可。
 template <typename T>
-CodecStatus DecodeEnvelopeValue(const Envelope& envelope, T& out) {
+CodecStatus DecodeEnvelopeValue(Envelope& envelope, T& out) {
     using Value = std::remove_cv_t<std::remove_reference_t<T>>;
     const CodecStatus type_status = CheckWireType<Value>(envelope);
     if (type_status != CodecStatus::kOk) {
         return type_status;
     }
     if (envelope.encoding == Encoding::kBinary) {
-        Buffer in = envelope.payload;
+        Buffer in = std::move(envelope.payload);
         Value temp{};
         CodecStatus status = CodecStatus::kOk;
         if constexpr (HasFieldList<Value>::value) {

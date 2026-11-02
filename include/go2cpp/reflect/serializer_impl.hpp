@@ -14,6 +14,7 @@
  * @copyright MIT License
  */
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -96,6 +97,29 @@ inline bool GetBlob(Buffer& in, std::vector<std::uint8_t>& value) {
     return in.GetBytes(value.data(), value.size());
 }
 
+/// @brief 字段表（count + 每字段 name/type_id）的线上字节，按类型缓存一次。
+/// @details 字段表是编译期常量，旧实现每条消息都重新写一遍字符串与 varint；
+///          对 60 B 的小消息，这部分约占序列化时间的三分之一。
+template <typename T>
+const std::vector<std::uint8_t>& WireFieldTable() {
+    static const std::vector<std::uint8_t> table = [] {
+        std::size_t count = 0;
+        const FieldDescriptor* fields = FieldList<T>::Fields(count);
+        Buffer buffer;
+        if (!buffer.PutVarint(static_cast<std::uint64_t>(count))) {
+            return std::vector<std::uint8_t>{};
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            if (!buffer.PutString(fields[index].name) ||
+                !buffer.PutVarint(fields[index].type_id)) {
+                return std::vector<std::uint8_t>{};
+            }
+        }
+        return std::move(buffer.data());
+    }();
+    return table;
+}
+
 template <typename T>
 bool SerializeReflect(const T& value, Buffer& out) {
     std::size_t count = 0;
@@ -103,15 +127,11 @@ bool SerializeReflect(const T& value, Buffer& out) {
     if (count > kMaxReflectFields) {
         return false;
     }
-    if (!out.PutVarint(static_cast<std::uint64_t>(count))) {
-        return false;
-    }
     // 字段表：每个字段的名字与 TypeId 只出现一次；随后按声明顺序写值。
     // 这样单条消息里字段名不重复，跨字段更不会重复（名字表就是去重表）。
-    for (std::size_t index = 0; index < count; ++index) {
-        if (!out.PutString(fields[index].name) || !out.PutVarint(fields[index].type_id)) {
-            return false;
-        }
+    const std::vector<std::uint8_t>& table = WireFieldTable<T>();
+    if (table.empty() || !out.PutBytes(table.data(), table.size())) {
+        return false;
     }
     for (std::size_t index = 0; index < count; ++index) {
         if (!fields[index].ops.encode(&value, out)) {
@@ -130,18 +150,25 @@ CodecStatus DeserializeReflect(Buffer& in, T& value) {
     if (count > kMaxReflectFields) {
         return CodecStatus::kTooLarge;
     }
-    std::vector<const FieldDescriptor*> wire;
-    try {
-        wire.reserve(static_cast<std::size_t>(count));
-    } catch (const std::bad_alloc&) {
-        return CodecStatus::kTooLarge;
+    // 字段表很小（典型 4~10 个），用栈上数组保存匹配结果，避免每条消息
+    // 一次 vector 分配；只有异常大的结构体才退回堆。
+    std::array<const FieldDescriptor*, 32> inline_wire{};
+    std::vector<const FieldDescriptor*> heap_wire;
+    const FieldDescriptor** wire = inline_wire.data();
+    if (count > inline_wire.size()) {
+        try {
+            heap_wire.resize(static_cast<std::size_t>(count));
+        } catch (const std::bad_alloc&) {
+            return CodecStatus::kTooLarge;
+        }
+        wire = heap_wire.data();
     }
     // 先完整读取字段表并逐项匹配本地字段，再读值：这样未知字段/类型不符
     // 能在写入任何成员之前拒绝，调用方的目标对象保持原样。
     for (std::uint64_t index = 0; index < count; ++index) {
-        std::string name;
+        std::string_view name;
         std::uint64_t type_id = 0;
-        if (!in.GetString(name) || !in.GetVarint(type_id)) {
+        if (!in.GetStringView(name) || !in.GetVarint(type_id)) {
             return CodecStatus::kBadPayload;
         }
         if (type_id > std::numeric_limits<TypeId>::max()) {
@@ -154,10 +181,10 @@ CodecStatus DeserializeReflect(Buffer& in, T& value) {
         if (local->type_id != static_cast<TypeId>(type_id)) {
             return CodecStatus::kTypeMismatch;
         }
-        wire.push_back(local);
+        wire[index] = local;
     }
-    for (const FieldDescriptor* field : wire) {
-        if (!field->ops.decode(in, &value)) {
+    for (std::uint64_t index = 0; index < count; ++index) {
+        if (!wire[index]->ops.decode(in, &value)) {
             return CodecStatus::kBadPayload;
         }
     }

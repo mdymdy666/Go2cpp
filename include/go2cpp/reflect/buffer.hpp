@@ -173,14 +173,16 @@ class Buffer {
 
     /// @brief 写入无符号 LEB128 varint。
     bool PutVarint(std::uint64_t value) {
-        std::uint8_t scratch[kMaxVarintBytes] = {};
-        std::size_t count = 0;
+        if (!CanWrite(kMaxVarintBytes)) {
+            return false;
+        }
+        // 直接 push_back，省掉「先拼 scratch 再 insert」的一次 memcpy 调用。
         while (value >= 0x80u) {
-            scratch[count++] = static_cast<std::uint8_t>(value) | 0x80u;
+            m_data.push_back(static_cast<std::uint8_t>(value & 0x7fu) | 0x80u);
             value >>= 7;
         }
-        scratch[count++] = static_cast<std::uint8_t>(value);
-        return PutBytes(scratch, count);
+        m_data.push_back(static_cast<std::uint8_t>(value));
+        return true;
     }
 
     /// @brief 写入 zigzag varint（有符号整数）。
@@ -218,6 +220,23 @@ class Buffer {
         const auto* source = m_data.data() + m_read;
         std::memcpy(out, source, size);
         m_read += size;
+        return true;
+    }
+
+    /// @brief 读取「varint 长度 + 字节」为只读视图（零分配，供字段名匹配）。
+    bool GetStringView(std::string_view& out) {
+        std::uint64_t length = 0;
+        if (!GetVarint(length)) {
+            return false;
+        }
+        if (length > kMaxStringBytes || length > Remaining()) {
+            Fail();
+            return false;
+        }
+        out = std::string_view(
+            reinterpret_cast<const char*>(m_data.data() + m_read),
+            static_cast<std::size_t>(length));
+        m_read += static_cast<std::size_t>(length);
         return true;
     }
 

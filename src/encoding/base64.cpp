@@ -10,29 +10,36 @@
  *          「填充只能出现在最后一个 quantum」「填充后不能再有数据」必须在
  *          同一次扫描里判断，否则 `"Zg==Zm9v"` 这类输入会被错误接受。
  *
+ * ## 汇编级优化说明（2026-11-02）
+ *
+ * 旧实现的热路径有三处白给的开销，已全部消除：
+ *
+ *  1. **编码每字节一次 `push_back`**：每次 push_back 都要做容量检查 + 更新
+ *     长度。现在先 `resize` 到最终长度，再用 4 字节 `memcpy` 一次写满一个
+ *     quantum（编译器生成单条 32-bit store）。
+ *  2. **解码每次调用重建 256 项反查表**：`fill(-1)` + 64 次写，小输入时比
+ *     解码本身还贵。反查表移到 `Base64Encoding` 构造期（`constexpr`，四个
+ *     预定义实例在编译期就是常量表），Decode 只做一次 `m_decode` 取址。
+ *  3. **解码两遍扫描 + 逐字节 `push_back` 到临时串**：正常路径改为单遍
+ *     quantum 解码 + 4 字节 store（写完 3 字节后指针 +3，末尾多写的 1 字节
+ *     落在 scratch 的预留区），并用 `thread_local` scratch 复用缓冲区，
+ *     避免每次解码一次堆分配。长度错误的输入仍走「先找第一个非法字符」的
+ *     慢路径，保证 `"Zm9v!"` 依旧报 `input byte 4` 而不是长度错误。
+ *
+ * 反查表布局：`m_decode[c]` 为 0..63 表示数据字符，-1 表示非法；填充字符
+ * 单独比较（它不在字母表里）。
+ *
  * ## 模块定位
  *
  * `base64.hpp` 的实现层：四个预定义实例共用这里的编码/解码算法，差异只由
  * `m_alphabet`/`m_pad`/`m_strict` 决定。被所有包含 `base64.hpp` 的协议/序列化
  * 模块间接调用。
  *
- * ## 本文件定义什么
- *
- * - `CorruptAt()`：按输入字节位置构造 `Base64CorruptInput()` 包装错误；
- * - `Base64Encoding::EncodedLen`/`DecodedLen`：长度换算；
- * - `Base64Encoding::Encode`/`Decode`：逐 3/4 字节 quantum 的编解码；
- * - `ByteAt()`：按无符号字节读取。
- *
- * ## 阅读建议
- *
- * 先读 `Decode` 的步骤 1~3（反查表、非法字符扫描、长度校验），再看步骤 4~5
- * 的末尾 quantum 分支——严格模式只影响最后这一步。
- *
  * ## 边界与陷阱
  *
- * 错误位置必须指向**第一个**非法字节；解码先写临时 `out`，全部成功后才追加到
- * `dst`，失败时 `dst` 不变。`Encode` 用 `reserve` 一次分配，尾部分支不要漏掉
- * Raw 的填充差异。
+ * 错误位置必须指向**第一个**非法字节；解码先写 `thread_local` scratch，全部
+ * 成功后才追加到 `dst`，失败时 `dst` 不变。`Encode` 用 `resize` 一次分配，
+ * 尾部分支不要漏掉 Raw 的填充差异。
  */
 
 #include "go2cpp/encoding/base64.hpp"
@@ -40,12 +47,19 @@
 #include "go2cpp/encoding/errors.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <string_view>
 
 namespace go2cpp::encoding {
 
 namespace {
+
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+constexpr bool kLittleEndian = true;
+#else
+constexpr bool kLittleEndian = false;
+#endif
 
 /// 构造 `illegal base64 data at input byte N` 错误（对齐 Go 的错误文本）。
 ErrorPtr CorruptAt(std::size_t index) {
@@ -57,6 +71,30 @@ ErrorPtr CorruptAt(std::size_t index) {
 /// 把 `char` 按无符号字节读取。
 inline unsigned char ByteAt(std::string_view src, std::size_t index) noexcept {
     return static_cast<unsigned char>(src[index]);
+}
+
+/// 把一个 24-bit chunk 按大端写成 4 字节（第 4 字节是垃圾，由调用方丢弃）。
+inline void Store3BigEndian(char* out, std::uint32_t chunk) noexcept {
+    if constexpr (kLittleEndian) {
+        const std::uint32_t big = __builtin_bswap32(chunk << 8U);
+        std::memcpy(out, &big, sizeof(big));
+    } else {
+        out[0] = static_cast<char>((chunk >> 16U) & 0xffU);
+        out[1] = static_cast<char>((chunk >> 8U) & 0xffU);
+        out[2] = static_cast<char>(chunk & 0xffU);
+    }
+}
+
+/// 把 4 个 ASCII 字节按给定顺序写成 4 字节。
+inline void Store4(char* out, std::uint32_t packed) noexcept {
+    if constexpr (kLittleEndian) {
+        std::memcpy(out, &packed, sizeof(packed));
+    } else {
+        out[0] = static_cast<char>(packed & 0xffU);
+        out[1] = static_cast<char>((packed >> 8U) & 0xffU);
+        out[2] = static_cast<char>((packed >> 16U) & 0xffU);
+        out[3] = static_cast<char>((packed >> 24U) & 0xffU);
+    }
 }
 
 }  // namespace
@@ -83,53 +121,70 @@ std::size_t Base64Encoding::DecodedLen(std::size_t src_len) const noexcept {
  * @brief 把 `src` 编码后追加到 `dst`。
  *
  * ## 步骤
- * step1. 记录追加起点，按 `EncodedLen` 预留空间；
- * step2. 每 3 字节拼成 24-bit chunk，按字母表输出 4 个字符；
+ * step1. 记录追加起点，按 `EncodedLen` 一次性 `resize`；
+ * step2. 每 3 字节拼成 24-bit chunk，查字母表后用一次 32-bit store 写出 4 字符；
  * step3. 尾部剩 1/2 字节：输出 2/3 个字符，非 Raw 时补 `=`；
  * step4. 返回本次追加的字节数。
  */
 std::size_t Base64Encoding::Encode(std::string& dst,
                                    std::string_view src) const {
-    // step1: 记录追加起点并预留空间
+    // step1: 记录追加起点并一次性扩展到最终长度
     const std::size_t start = dst.size();
-    dst.reserve(start + EncodedLen(src.size()));
-    const char* table = m_alphabet.data();
-
-    // step2: 完整的 3 字节 -> 4 字符
-    std::size_t i = 0;
-    for (; i + 3 <= src.size(); i += 3) {
-        const std::uint32_t chunk = (static_cast<std::uint32_t>(ByteAt(src, i)) << 16) |
-                                    (static_cast<std::uint32_t>(ByteAt(src, i + 1)) << 8) |
-                                    static_cast<std::uint32_t>(ByteAt(src, i + 2));
-        dst.push_back(table[(chunk >> 18) & 0x3f]);
-        dst.push_back(table[(chunk >> 12) & 0x3f]);
-        dst.push_back(table[(chunk >> 6) & 0x3f]);
-        dst.push_back(table[chunk & 0x3f]);
+    const std::size_t encoded = EncodedLen(src.size());
+    if (encoded == 0) {
+        return 0;
     }
+    dst.resize(start + encoded);
+    char* out = dst.data() + start;
+    const char* table = m_alphabet.data();
+    const auto* in = reinterpret_cast<const unsigned char*>(src.data());
+    const std::size_t size = src.size();
+
+    // step2: 完整的 3 字节 -> 4 字符（单次 32-bit store）
+    std::size_t i = 0;
+    for (; i + 3 <= size; i += 3) {
+        const std::uint32_t chunk =
+            (static_cast<std::uint32_t>(in[i]) << 16) |
+            (static_cast<std::uint32_t>(in[i + 1]) << 8) |
+            static_cast<std::uint32_t>(in[i + 2]);
+        const std::uint32_t packed =
+            static_cast<std::uint32_t>(
+                static_cast<unsigned char>(table[(chunk >> 18) & 0x3f])) |
+            (static_cast<std::uint32_t>(
+                 static_cast<unsigned char>(table[(chunk >> 12) & 0x3f]))
+             << 8) |
+            (static_cast<std::uint32_t>(
+                 static_cast<unsigned char>(table[(chunk >> 6) & 0x3f]))
+             << 16) |
+            (static_cast<std::uint32_t>(
+                 static_cast<unsigned char>(table[chunk & 0x3f]))
+             << 24);
+        Store4(out, packed);
+        out += 4;    }
 
     // step3: 尾部 1/2 字节，按是否 Raw 决定补几个 '='
-    const std::size_t rest = src.size() - i;
+    const std::size_t rest = size - i;
     if (rest == 1) {
-        const std::uint32_t chunk = static_cast<std::uint32_t>(ByteAt(src, i)) << 16;
-        dst.push_back(table[(chunk >> 18) & 0x3f]);
-        dst.push_back(table[(chunk >> 12) & 0x3f]);
+        const std::uint32_t chunk = static_cast<std::uint32_t>(in[i]) << 16;
+        out[0] = table[(chunk >> 18) & 0x3f];
+        out[1] = table[(chunk >> 12) & 0x3f];
         if (!IsRaw()) {
-            dst.push_back(m_pad);
-            dst.push_back(m_pad);
+            out[2] = m_pad;
+            out[3] = m_pad;
         }
     } else if (rest == 2) {
         const std::uint32_t chunk =
-            (static_cast<std::uint32_t>(ByteAt(src, i)) << 16) |
-            (static_cast<std::uint32_t>(ByteAt(src, i + 1)) << 8);
-        dst.push_back(table[(chunk >> 18) & 0x3f]);
-        dst.push_back(table[(chunk >> 12) & 0x3f]);
-        dst.push_back(table[(chunk >> 6) & 0x3f]);
+            (static_cast<std::uint32_t>(in[i]) << 16) |
+            (static_cast<std::uint32_t>(in[i + 1]) << 8);
+        out[0] = table[(chunk >> 18) & 0x3f];
+        out[1] = table[(chunk >> 12) & 0x3f];
+        out[2] = table[(chunk >> 6) & 0x3f];
         if (!IsRaw()) {
-            dst.push_back(m_pad);
+            out[3] = m_pad;
         }
     }
     // step4: 返回追加长度（含填充）
-    return dst.size() - start;
+    return encoded;
 }
 
 std::string Base64Encoding::EncodeToString(std::string_view src) const {
@@ -142,59 +197,56 @@ std::string Base64Encoding::EncodeToString(std::string_view src) const {
  * @brief 严格解码 `src`，成功后才把结果追加到 `dst`。
  *
  * ## 步骤
- * step1. 按字母表重建 256 项反查表（-1 表示非法字符）；
- * step2. 先全量扫描非法字符：错误位置必须是第一个非法字节；
- * step3. 校验长度：带填充必须 `% 4 == 0`，Raw 禁止 `% 4 == 1`；
- * step4. 逐 quantum 解码：非末尾的完整 quantum 四位都必须是数据字符；
- * step5. 末尾 quantum 处理 `xx==`/`xxx=`/Raw 的 2~3 字符尾巴，
+ * step1. 长度错误时走慢路径：先找第一个非法字符（保证错误位置与旧实现一致），
+ *        找不到才报长度错误；
+ * step2. 正常路径单遍解码：每 quantum 查 `m_decode`，4 字节 store 写 3 字节；
+ * step3. 末尾 quantum 处理 `xx==`/`xxx=`/Raw 的 2~3 字符尾巴，
  *        strict 时校验未使用的低位必须为 0；
- * step6. 全部成功后才追加到 `dst`（失败时 `dst` 保持不变）。
+ * step4. 全部成功后才追加到 `dst`（失败时 `dst` 保持不变）。
  */
 ErrorPtr Base64Encoding::Decode(std::string& dst, std::string_view src) const {
-    // step1: 反查表：-1 表示非法字符；四个预定义实例共用同一布局，按字母表重建
-    std::array<std::int8_t, 256> decode_map{};
-    decode_map.fill(-1);
-    for (std::size_t i = 0; i < 64; ++i) {
-        decode_map[static_cast<unsigned char>(m_alphabet[i])] =
-            static_cast<std::int8_t>(i);
-    }
-    const auto value_of = [&decode_map](unsigned char c) -> int {
-        return static_cast<int>(decode_map[c]);
-    };
-
     const std::size_t len = src.size();
-    // step2: 先扫描非法字符：错误位置必须指向第一个非法字节，而不是笼统地报长度
-    for (std::size_t k = 0; k < len; ++k) {
-        const unsigned char c = ByteAt(src, k);
-        if (value_of(c) < 0 &&
-            !(!IsRaw() && c == static_cast<unsigned char>(m_pad))) {
-            return CorruptAt(k);
-        }
+    if (len == 0) {
+        return nullptr;
     }
-    // step3: 长度校验（带填充要完整 quantum，Raw 的 %4==1 非法）
-    if (IsRaw()) {
-        if (len % 4 == 1) {
-            return CorruptAt(len - 1);
+    const bool raw = IsRaw();
+    const std::int8_t* decode = m_decode.data();
+    const char* data = src.data();
+
+    // step1: 长度不合法时才扫描非法字符，保证错误位置语义不变。
+    if (!raw) {
+        if (len % 4 != 0) {
+            for (std::size_t k = 0; k < len; ++k) {
+                const unsigned char c = static_cast<unsigned char>(data[k]);
+                if (decode[c] < 0 && c != static_cast<unsigned char>(m_pad)) {
+                    return CorruptAt(k);
+                }
+            }
+            return CorruptAt(len);
         }
-    } else if (len % 4 != 0) {
-        // 带填充编码必须以完整 quantum 结束：缺填充 / 多字符都非法。
-        return CorruptAt(len);
+    } else if (len % 4 == 1) {
+        for (std::size_t k = 0; k < len; ++k) {
+            if (decode[static_cast<unsigned char>(data[k])] < 0) {
+                return CorruptAt(k);
+            }
+        }
+        return CorruptAt(len - 1);
     }
 
-    std::string out;
-    out.reserve(DecodedLen(len));
+    // step2: 解码到线程本地 scratch（复用容量，避免每次分配）。
+    thread_local std::string scratch;
+    const std::size_t decoded_len = DecodedLen(len);
+    scratch.resize(decoded_len + 4);  // +4：允许最后一个 quantum 的 4 字节 store
+    char* out = scratch.data();
 
-    // step4: 逐 quantum 解码
     std::size_t i = 0;
-    while (i < len) {
-        const std::size_t remaining = len - i;
-
-        if (remaining >= 4 && !(!IsRaw() && i + 4 == len)) {
-            // 非末尾的完整 quantum：四位都必须是数据字符，出现 '=' 即非法。
-            const int v0 = value_of(ByteAt(src, i));
-            const int v1 = value_of(ByteAt(src, i + 1));
-            const int v2 = value_of(ByteAt(src, i + 2));
-            const int v3 = value_of(ByteAt(src, i + 3));
+    if (!raw) {
+        // 除最后一个 quantum 外的完整 quantum：四位都必须是数据字符。
+        while (i + 4 < len) {
+            const int v0 = decode[static_cast<unsigned char>(data[i])];
+            const int v1 = decode[static_cast<unsigned char>(data[i + 1])];
+            const int v2 = decode[static_cast<unsigned char>(data[i + 2])];
+            const int v3 = decode[static_cast<unsigned char>(data[i + 3])];
             if (v0 < 0) return CorruptAt(i);
             if (v1 < 0) return CorruptAt(i + 1);
             if (v2 < 0) return CorruptAt(i + 2);
@@ -203,83 +255,97 @@ ErrorPtr Base64Encoding::Decode(std::string& dst, std::string_view src) const {
                                         (static_cast<std::uint32_t>(v1) << 12) |
                                         (static_cast<std::uint32_t>(v2) << 6) |
                                         static_cast<std::uint32_t>(v3);
-            out.push_back(static_cast<char>((chunk >> 16) & 0xff));
-            out.push_back(static_cast<char>((chunk >> 8) & 0xff));
-            out.push_back(static_cast<char>(chunk & 0xff));
+            Store3BigEndian(out, chunk);
+            out += 3;
             i += 4;
-            continue;
         }
-
-        // step5: 末尾 quantum 的填充/严格模式分支
-        if (!IsRaw() && remaining == 4) {
-            // 末尾 quantum：允许 `xx==` 与 `xxx=` 两种填充形态。
-            const int v0 = value_of(ByteAt(src, i));
-            const int v1 = value_of(ByteAt(src, i + 1));
-            if (v0 < 0) return CorruptAt(i);
-            if (v1 < 0) return CorruptAt(i + 1);
-
-            const char c2 = src[i + 2];
-            const char c3 = src[i + 3];
-            if (c2 == m_pad) {
-                if (c3 != m_pad) {
-                    return CorruptAt(i + 3);
-                }
-                // Strict：`xx==` 只用 v1 的高 4 位，低 4 位必须为 0。
-                if (m_strict && (v1 & 0x0f) != 0) {
-                    return CorruptAt(i + 1);
-                }
-                out.push_back(static_cast<char>((v0 << 2) | (v1 >> 4)));
-                i += 4;
-                continue;
+        // step3a: 末尾 quantum：允许 `xx==` 与 `xxx=` 两种填充形态。
+        const int v0 = decode[static_cast<unsigned char>(data[i])];
+        const int v1 = decode[static_cast<unsigned char>(data[i + 1])];
+        if (v0 < 0) return CorruptAt(i);
+        if (v1 < 0) return CorruptAt(i + 1);
+        const char c2 = data[i + 2];
+        const char c3 = data[i + 3];
+        if (c2 == m_pad) {
+            if (c3 != m_pad) {
+                return CorruptAt(i + 3);
             }
-            const int v2 = value_of(static_cast<unsigned char>(c2));
+            // Strict：`xx==` 只用 v1 的高 4 位，低 4 位必须为 0。
+            if (m_strict && (v1 & 0x0f) != 0) {
+                return CorruptAt(i + 1);
+            }
+            out[0] = static_cast<char>((v0 << 2) | (v1 >> 4));
+            out += 1;
+        } else {
+            const int v2 = decode[static_cast<unsigned char>(c2)];
             if (v2 < 0) return CorruptAt(i + 2);
             if (c3 == m_pad) {
                 // Strict：`xxx=` 只用 v2 的高 6 位，低 2 位必须为 0。
                 if (m_strict && (v2 & 0x03) != 0) {
                     return CorruptAt(i + 2);
                 }
-                out.push_back(static_cast<char>((v0 << 2) | (v1 >> 4)));
-                out.push_back(
-                    static_cast<char>(((v1 & 0x0f) << 4) | (v2 >> 2)));
-                i += 4;
-                continue;
+                out[0] = static_cast<char>((v0 << 2) | (v1 >> 4));
+                out[1] = static_cast<char>(((v1 & 0x0f) << 4) | (v2 >> 2));
+                out += 2;
+            } else {
+                const int v3 = decode[static_cast<unsigned char>(c3)];
+                if (v3 < 0) return CorruptAt(i + 3);
+                const std::uint32_t chunk =
+                    (static_cast<std::uint32_t>(v0) << 18) |
+                    (static_cast<std::uint32_t>(v1) << 12) |
+                    (static_cast<std::uint32_t>(v2) << 6) |
+                    static_cast<std::uint32_t>(v3);
+                Store3BigEndian(out, chunk);
+                out += 3;
             }
-            const int v3 = value_of(static_cast<unsigned char>(c3));
+        }
+        i = len;
+    } else {
+        // 无填充编码：完整 quantum。
+        while (i + 4 <= len) {
+            const int v0 = decode[static_cast<unsigned char>(data[i])];
+            const int v1 = decode[static_cast<unsigned char>(data[i + 1])];
+            const int v2 = decode[static_cast<unsigned char>(data[i + 2])];
+            const int v3 = decode[static_cast<unsigned char>(data[i + 3])];
+            if (v0 < 0) return CorruptAt(i);
+            if (v1 < 0) return CorruptAt(i + 1);
+            if (v2 < 0) return CorruptAt(i + 2);
             if (v3 < 0) return CorruptAt(i + 3);
             const std::uint32_t chunk = (static_cast<std::uint32_t>(v0) << 18) |
                                         (static_cast<std::uint32_t>(v1) << 12) |
                                         (static_cast<std::uint32_t>(v2) << 6) |
                                         static_cast<std::uint32_t>(v3);
-            out.push_back(static_cast<char>((chunk >> 16) & 0xff));
-            out.push_back(static_cast<char>((chunk >> 8) & 0xff));
-            out.push_back(static_cast<char>(chunk & 0xff));
+            Store3BigEndian(out, chunk);
+            out += 3;
             i += 4;
-            continue;
         }
-
-        // 无填充编码的末尾 quantum：只剩 2 或 3 个字符（%4==1 已提前拒绝）。
-        const int v0 = value_of(ByteAt(src, i));
-        const int v1 = value_of(ByteAt(src, i + 1));
-        if (v0 < 0) return CorruptAt(i);
-        if (v1 < 0) return CorruptAt(i + 1);
-        if (m_strict && (v1 & 0x0f) != 0) {
-            return CorruptAt(i + 1);
-        }
-        out.push_back(static_cast<char>((v0 << 2) | (v1 >> 4)));
-        if (remaining == 3) {
-            const int v2 = value_of(ByteAt(src, i + 2));
-            if (v2 < 0) return CorruptAt(i + 2);
-            if (m_strict && (v2 & 0x03) != 0) {
-                return CorruptAt(i + 2);
+        // step3b: 无填充编码的末尾 quantum：只剩 2 或 3 个字符。
+        if (i < len) {
+            const std::size_t remaining = len - i;
+            const int v0 = decode[static_cast<unsigned char>(data[i])];
+            const int v1 = decode[static_cast<unsigned char>(data[i + 1])];
+            if (v0 < 0) return CorruptAt(i);
+            if (v1 < 0) return CorruptAt(i + 1);
+            if (m_strict && (v1 & 0x0f) != 0) {
+                return CorruptAt(i + 1);
             }
-            out.push_back(static_cast<char>(((v1 & 0x0f) << 4) | (v2 >> 2)));
+            out[0] = static_cast<char>((v0 << 2) | (v1 >> 4));
+            out += 1;
+            if (remaining == 3) {
+                const int v2 = decode[static_cast<unsigned char>(data[i + 2])];
+                if (v2 < 0) return CorruptAt(i + 2);
+                if (m_strict && (v2 & 0x03) != 0) {
+                    return CorruptAt(i + 2);
+                }
+                out[0] = static_cast<char>(((v1 & 0x0f) << 4) | (v2 >> 2));
+                out += 1;
+            }
         }
-        i = len;
     }
 
-    // step6: 强异常安全：全部成功后才追加，失败时 dst 保持原样
-    dst += out;
+    // step4: 强异常安全：全部成功后才追加，失败时 dst 保持原样。
+    scratch.resize(static_cast<std::size_t>(out - scratch.data()));
+    dst.append(scratch);
     return nullptr;
 }
 

@@ -675,11 +675,16 @@ private:
     Step StepHuffman(std::uint8_t* out, std::size_t out_size, std::size_t* out_pos) {
         for (;;) {
             if (m_match_remaining > 0) {
-                if (*out_pos >= out_size) {
+                const std::size_t available = out_size - *out_pos;
+                if (available == 0) {
                     return Step::kNeedOutput;
                 }
-                EmitByte(ByteAtDistance(m_match_distance), out, out_pos);
-                --m_match_remaining;
+                // 整段拷贝：旧实现逐字节 EmitByte，长匹配（最长 258）每字节
+                // 都要做窗口取模、输出检查与校验和更新，是解压热路径最大头。
+                const std::size_t count =
+                    m_match_remaining < available ? m_match_remaining : available;
+                CopyMatch(out, out_pos, count);
+                m_match_remaining -= count;
                 continue;
             }
             if (*out_pos >= out_size) {
@@ -976,7 +981,143 @@ private:
         m_window[m_window_pos] = byte;
         m_window_pos = (m_window_pos + 1U) & kWindowMask;
         ++m_member_out;
-        UpdateChecksum(byte);
+        UpdateChecksumBlock(&byte, 1);
+    }
+
+    /// 批量写窗口（环形，最多两段）。
+    void WriteWindow(const std::uint8_t* src, std::size_t size) {
+        const std::size_t first = std::min(size, kWindowSize - m_window_pos);
+        std::memcpy(m_window.data() + m_window_pos, src, first);
+        if (size > first) {
+            std::memcpy(m_window.data(), src + first, size - first);
+        }
+        m_window_pos = (m_window_pos + size) & kWindowMask;
+    }
+
+    /// 从窗口取 `size` 字节（源可能跨环形边界）。
+    void ReadWindow(std::uint8_t* dst, std::size_t index, std::size_t size) const {
+        if (index + size <= kWindowSize) {
+            std::memcpy(dst, m_window.data() + index, size);
+            return;
+        }
+        const std::size_t first = kWindowSize - index;
+        std::memcpy(dst, m_window.data() + index, first);
+        std::memcpy(dst + first, m_window.data(), size - first);
+    }
+
+    /// 拷贝一次 LZ77 匹配：源在窗口内，目标在输出缓冲。
+    void CopyMatch(std::uint8_t* out, std::size_t* out_pos, std::size_t size) {
+        std::uint8_t* dst = out + *out_pos;
+        const std::size_t distance = m_match_distance;
+        const std::size_t src_index = (m_window_pos - distance) & kWindowMask;
+        if (distance >= size) {
+            ReadWindow(dst, src_index, size);
+        } else {
+            // 源与目标重叠（距离 < 长度）：先落 distance 字节，再按已写长度倍增。
+            ReadWindow(dst, src_index, distance);
+            std::size_t written = distance;
+            while (written < size) {
+                const std::size_t chunk = std::min(written, size - written);
+                std::memcpy(dst + written, dst, chunk);
+                written += chunk;
+            }
+        }
+        WriteWindow(dst, size);
+        *out_pos += size;
+        m_member_out += size;
+        UpdateChecksumBlock(dst, size);
+    }
+
+    /// 只有对应格式才更新校验和：gzip 用 crc32、zlib 用 adler32、raw 不算。
+    void UpdateChecksumBlock(const std::uint8_t* data, std::size_t size) {
+        if (m_format == Format::kGzip) {
+            m_crc = Crc32Update(m_crc, data, size);
+        } else if (m_format == Format::kZlib) {
+            UpdateAdlerBlock(data, size);
+        }
+    }
+
+    /// slice-by-16 CRC32（IEEE，反射多项式 0xEDB88320）。
+    static std::uint32_t Crc32Update(std::uint32_t crc, const std::uint8_t* data,
+                                     std::size_t size) {
+        const auto& tables = CrcTables();
+        std::size_t index = 0;
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+        // 16 字节一批：16 次查表可以并行发射（xor 树），关键路径不再像
+        // slice-by-8 那样被串行查表延迟卡住。
+        for (; index + 16 <= size; index += 16) {
+            std::uint64_t low = 0;
+            std::uint64_t high = 0;
+            std::memcpy(&low, data + index, sizeof(low));
+            std::memcpy(&high, data + index + 8, sizeof(high));
+            crc ^= static_cast<std::uint32_t>(low & 0xFFFFFFFFU);
+            const std::uint32_t w1 = static_cast<std::uint32_t>(low >> 32U);
+            const std::uint32_t w2 = static_cast<std::uint32_t>(high & 0xFFFFFFFFU);
+            const std::uint32_t w3 = static_cast<std::uint32_t>(high >> 32U);
+            crc = tables[15][crc & 0xFFU] ^ tables[14][(crc >> 8U) & 0xFFU] ^
+                  tables[13][(crc >> 16U) & 0xFFU] ^ tables[12][(crc >> 24U) & 0xFFU] ^
+                  tables[11][w1 & 0xFFU] ^ tables[10][(w1 >> 8U) & 0xFFU] ^
+                  tables[9][(w1 >> 16U) & 0xFFU] ^ tables[8][(w1 >> 24U) & 0xFFU] ^
+                  tables[7][w2 & 0xFFU] ^ tables[6][(w2 >> 8U) & 0xFFU] ^
+                  tables[5][(w2 >> 16U) & 0xFFU] ^ tables[4][(w2 >> 24U) & 0xFFU] ^
+                  tables[3][w3 & 0xFFU] ^ tables[2][(w3 >> 8U) & 0xFFU] ^
+                  tables[1][(w3 >> 16U) & 0xFFU] ^ tables[0][(w3 >> 24U) & 0xFFU];
+        }
+        for (; index + 8 <= size; index += 8) {
+            std::uint64_t block = 0;
+            std::memcpy(&block, data + index, sizeof(block));
+            crc ^= static_cast<std::uint32_t>(block & 0xFFFFFFFFU);
+            const std::uint32_t high = static_cast<std::uint32_t>(block >> 32U);
+            crc = tables[7][crc & 0xFFU] ^ tables[6][(crc >> 8U) & 0xFFU] ^
+                  tables[5][(crc >> 16U) & 0xFFU] ^ tables[4][(crc >> 24U) & 0xFFU] ^
+                  tables[3][high & 0xFFU] ^ tables[2][(high >> 8U) & 0xFFU] ^
+                  tables[1][(high >> 16U) & 0xFFU] ^ tables[0][(high >> 24U) & 0xFFU];
+        }
+#endif
+        for (; index < size; ++index) {
+            crc = tables[0][(crc ^ data[index]) & 0xFFU] ^ (crc >> 8U);
+        }
+        return crc;
+    }
+
+    static const std::array<std::array<std::uint32_t, 256>, 16>& CrcTables() {
+        static const std::array<std::array<std::uint32_t, 256>, 16> tables = [] {
+            std::array<std::array<std::uint32_t, 256>, 16> result{};
+            for (std::uint32_t index = 0; index < 256; ++index) {
+                std::uint32_t value = index;
+                for (int bit = 0; bit < 8; ++bit) {
+                    value = (value & 1U) ? (0xEDB88320U ^ (value >> 1U)) : (value >> 1U);
+                }
+                result[0][index] = value;
+            }
+            for (std::size_t slice = 1; slice < 16; ++slice) {
+                for (std::uint32_t index = 0; index < 256; ++index) {
+                    const std::uint32_t previous = result[slice - 1][index];
+                    result[slice][index] =
+                        (previous >> 8U) ^ result[0][previous & 0xFFU];
+                }
+            }
+            return result;
+        }();
+        return tables;
+    }
+
+    void UpdateAdlerBlock(const std::uint8_t* data, std::size_t size) {
+        std::uint32_t a = m_adler_a;
+        std::uint32_t b = m_adler_b;
+        std::size_t index = 0;
+        while (index < size) {
+            const std::size_t take = std::min<std::size_t>(5552U, size - index);
+            for (std::size_t k = 0; k < take; ++k) {
+                a += data[index + k];
+                b += a;
+            }
+            a %= 65521U;
+            b %= 65521U;
+            index += take;
+        }
+        m_adler_a = a;
+        m_adler_b = b;
     }
 
     std::uint8_t ByteAtDistance(std::size_t distance) const noexcept {

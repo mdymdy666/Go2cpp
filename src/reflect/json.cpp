@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <new>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -162,6 +163,12 @@ class Parser {
         }
         out.kind = JsonValue::Kind::kObject;
         out.members.clear();
+        // 小对象（配置/消息体）预留固定槽位，避免 vector 的 1→2→4 次重分配。
+        try {
+            out.members.reserve(8);
+        } catch (const std::bad_alloc&) {
+            return Fail("out of memory");
+        }
         SkipWhitespace();
         if (Consume('}')) {
             return true;
@@ -234,7 +241,27 @@ class Parser {
             return Fail("expected string");
         }
         out.clear();
-        while (m_pos < m_text.size()) {
+        // 整段扫描 + append：绝大多数字符串没有转义，旧实现逐字符 push_back
+        // 会在每个字节上做一次容量检查（32 字节的 token 就是 32 次）。
+        for (;;) {
+            const std::size_t start = m_pos;
+            while (m_pos < m_text.size()) {
+                const unsigned char value =
+                    static_cast<unsigned char>(m_text[m_pos]);
+                if (value == '"' || value == '\\' || value < 0x20u) {
+                    break;
+                }
+                ++m_pos;
+            }
+            if (m_pos > start) {
+                if (out.size() + (m_pos - start) > kMaxJsonStringBytes) {
+                    return Fail("string too large");
+                }
+                out.append(m_text.data() + start, m_pos - start);
+            }
+            if (m_pos >= m_text.size()) {
+                return Fail("unterminated string");
+            }
             const char value = m_text[m_pos++];
             if (value == '"') {
                 return true;
@@ -245,15 +272,8 @@ class Parser {
                 }
                 continue;
             }
-            if (static_cast<unsigned char>(value) < 0x20u) {
-                return Fail("control character in string");
-            }
-            if (out.size() >= kMaxJsonStringBytes) {
-                return Fail("string too large");
-            }
-            out.push_back(value);
+            return Fail("control character in string");
         }
-        return Fail("unterminated string");
     }
 
     bool ParseEscape(std::string& out) {
@@ -488,7 +508,54 @@ void JsonWriter::BeforeValue() {
 }
 
 void JsonWriter::AppendEscaped(std::string_view text) {
-    m_out += EscapeJsonString(text);
+    // 常见路径：没有需要转义的字节，整段一次 append（旧实现先构造一个
+    // 临时 std::string 再拷贝，每写一个字段就多一次堆分配）。
+    const char* data = text.data();
+    const std::size_t size = text.size();
+    std::size_t plain = 0;
+    while (plain < size) {
+        const unsigned char value = static_cast<unsigned char>(data[plain]);
+        if (value < 0x20u || value == '"' || value == '\\') {
+            break;
+        }
+        ++plain;
+    }
+    m_out.append(data, plain);
+    for (std::size_t index = plain; index < size; ++index) {
+        const unsigned char value = static_cast<unsigned char>(data[index]);
+        switch (value) {
+            case '"':
+                m_out += "\\\"";
+                break;
+            case '\\':
+                m_out += "\\\\";
+                break;
+            case '\b':
+                m_out += "\\b";
+                break;
+            case '\f':
+                m_out += "\\f";
+                break;
+            case '\n':
+                m_out += "\\n";
+                break;
+            case '\r':
+                m_out += "\\r";
+                break;
+            case '\t':
+                m_out += "\\t";
+                break;
+            default:
+                if (value < 0x20u) {
+                    m_out += "\\u00";
+                    m_out.push_back(kHexDigits[(value >> 4) & 0x0fu]);
+                    m_out.push_back(kHexDigits[value & 0x0fu]);
+                } else {
+                    m_out.push_back(static_cast<char>(value));
+                }
+                break;
+        }
+    }
 }
 
 void JsonWriter::BeginObject() {
