@@ -13,6 +13,7 @@ namespace go2cpp::mcp {
 Registry::Registry(Registry&& other) noexcept {
     std::lock_guard<std::mutex> lock(other.m_mutex);
     m_tools = std::move(other.m_tools);
+    m_schema_cache = std::move(other.m_schema_cache);
     m_prompts = std::move(other.m_prompts);
     m_resources = std::move(other.m_resources);
     m_tool_listeners = std::move(other.m_tool_listeners);
@@ -24,6 +25,7 @@ Registry& Registry::operator=(Registry&& other) noexcept {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::lock_guard<std::mutex> other_lock(other.m_mutex);
         m_tools = std::move(other.m_tools);
+        m_schema_cache = std::move(other.m_schema_cache);
         m_prompts = std::move(other.m_prompts);
         m_resources = std::move(other.m_resources);
         m_tool_listeners = std::move(other.m_tool_listeners);
@@ -72,12 +74,18 @@ void Registry::RegisterTool(Tool tool) {
     // 先留一份用于通知，再 move 进注册表。拷贝 std::function 只是引用计数，
     // 不会复制 handler 的捕获状态。
     Tool notification = tool;
+    const std::string name = tool.name;
     std::vector<ToolChangeListener> listeners;
     ToolChangeKind kind = ToolChangeKind::kAdded;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         kind = UpsertTool(m_tools, std::move(tool)) ? ToolChangeKind::kUpdated
                                                     : ToolChangeKind::kAdded;
+        const auto stored = std::find_if(m_tools.begin(), m_tools.end(),
+                                         [&](const Tool& item) { return item.name == name; });
+        if (stored != m_tools.end()) {
+            m_schema_cache[name] = std::make_shared<const json>(stored->input_schema);
+        }
         listeners = ListenerSnapshotLocked();
     }
     // 锁外通知：监听器（检索层增量索引）可以安全地回头读注册表或再次注册。
@@ -108,6 +116,7 @@ bool Registry::UnregisterTool(const std::string& name) {
         }
         removed = std::move(*it);
         m_tools.erase(it);
+        m_schema_cache.erase(name);
         listeners = ListenerSnapshotLocked();
     }
     // 与注册一致：锁外通知，监听器里可以安全地查询/修改注册表。
@@ -181,6 +190,15 @@ std::optional<json> Registry::ToolSchema(const std::string& name) const {
         return std::nullopt;
     }
     return it->input_schema;
+}
+
+std::shared_ptr<const json> Registry::ToolSchemaShared(const std::string& name) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto it = m_schema_cache.find(name);
+    if (it == m_schema_cache.end()) {
+        return nullptr;
+    }
+    return it->second;
 }
 
 std::optional<ToolResult> Registry::InvokeTool(const std::string& name, const ToolContext& context) const {

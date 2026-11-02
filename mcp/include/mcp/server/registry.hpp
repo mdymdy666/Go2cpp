@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -90,6 +91,10 @@ public:
     /// 取工具的 inputSchema；工具不存在返回 nullopt（校验层使用）。
     std::optional<json> ToolSchema(const std::string& name) const;
 
+    /// 取工具 inputSchema 的共享只读视图：注册/覆盖时构造一次，调用方零拷贝。
+    /// 已取到旧指针的调用方在工具被覆盖后仍然看到一致的一份 schema。
+    std::shared_ptr<const json> ToolSchemaShared(const std::string& name) const;
+
     std::optional<ToolResult> InvokeTool(const std::string& name, const ToolContext& context) const;
 
     /// 获取提示；不存在返回 `std::nullopt`。
@@ -108,6 +113,8 @@ private:
 
     mutable std::mutex m_mutex;
     std::vector<Tool> m_tools;
+    /// inputSchema 的共享副本：tools/call 每请求都读，避免深拷贝（17 次分配/次）。
+    std::unordered_map<std::string, std::shared_ptr<const json>> m_schema_cache;
     std::vector<Prompt> m_prompts;
     std::vector<Resource> m_resources;
     std::unordered_map<std::size_t, ToolChangeListener> m_tool_listeners;
