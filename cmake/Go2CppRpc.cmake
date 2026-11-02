@@ -89,3 +89,40 @@ if (GO2CPP_BUILD_TESTS AND GO2CPP_RPC_TESTS)
         set_tests_properties(go2cpp_rpc_websocket_test PROPERTIES TIMEOUT 300)
     endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# RPC over QUIC 风格传输（UDP + Bento 可靠层，可选）
+#
+# 独立静态库：go2cpp_rpc 只依赖 frame/reflect，不把 Bento（UDP/加密/拥塞）
+# 拖进默认链接面。只有 GO2CPP_WITH_BENTO=ON 时才构建。
+#
+# 目标：
+#   - go2cpp_rpc_quic：QuicClient / QuicListener / QuicStream（rpc::Transport）；
+#   - go2cpp_rpc_quic_test：端到端/多流复用/0-RTT/丢包/性能（ctest）。
+# ---------------------------------------------------------------------------
+if (TARGET go2cpp_bento)
+    add_library(go2cpp_rpc_quic STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/rpc/transport_quic.cpp)
+    add_library(go2cpp::rpc_quic ALIAS go2cpp_rpc_quic)
+    target_include_directories(go2cpp_rpc_quic
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    target_compile_features(go2cpp_rpc_quic PUBLIC cxx_std_17)
+    target_compile_options(go2cpp_rpc_quic PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    set_target_properties(go2cpp_rpc_quic PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(go2cpp_rpc_quic
+        PUBLIC go2cpp_rpc go2cpp_bento Threads::Threads)
+
+    if (GO2CPP_BUILD_TESTS AND GO2CPP_RPC_TESTS)
+        add_executable(go2cpp_rpc_quic_test
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/rpc/test_rpc_quic.cpp)
+        target_include_directories(go2cpp_rpc_quic_test
+            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/rpc)
+        target_link_libraries(go2cpp_rpc_quic_test PRIVATE go2cpp_rpc_quic)
+        target_compile_options(go2cpp_rpc_quic_test PRIVATE
+            -O2 -Wall -Wextra -Wpedantic -Werror)
+        add_test(NAME go2cpp_rpc_quic_test COMMAND go2cpp_rpc_quic_test)
+        set_tests_properties(go2cpp_rpc_quic_test PROPERTIES TIMEOUT 1800)
+    endif()
+endif()
