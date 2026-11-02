@@ -165,6 +165,36 @@ cmake --build build -j"$(nproc)"
 | 错误处理 | [docs/error_guide.md](../docs/error_guide.md) |
 | 历史审计记录 | `WarningDocement/`（模块级问题的原始记录，非教程） |
 
+## 全模块交接文档（16 份）
+
+[`docs/`](docs/) 下每个模块一份**交接文档**（180–400 行），统一 9 节结构：
+这个模块是什么 / 架构与数据流 / 对外 API / 最小用法 / 源码位置 / 性能数据 /
+边界与已知限制 / 测试与验证 / 交接注意。新人接手某模块时**先读这一份**，
+再按文末链接进入设计全文。
+
+| # | 模块 | 交接文档 | 一句话 |
+|---:|---|---|---|
+| 1 | 并发 | [01-concurrency.md](docs/01-concurrency.md) | GMP 调度器 + Fiber + Channel/Select + Context/Future/Timer + 跨执行流同步 |
+| 2 | 网络 | [02-network.md](docs/02-network.md) | epoll `IOManager` + `LD_PRELOAD` Hook + Socket/TCP/UDP + HTTP/1.1/2 + WS/SSE + TLS |
+| 3 | Bento | [03-bento.md](docs/03-bento.md) | UDP 上的 Bento v0.2 可靠传输：STREAM/DATAGRAM/VIDEO + SACK/FEC/BBR + PeerHub |
+| 4 | 存储 | [04-storage.md](docs/04-storage.md) | SQLite/ORM、LevelDB 风格 KV、LSM、Queue/Watch、MemCache |
+| 5 | 缓存 | [05-cache.md](docs/05-cache.md) | 7 种淘汰策略统一接口（LRU/LRU-K/2Q/TinyLFU/GDSF/ARC/CLOCK）与命中率对比 |
+| 6 | 媒体 | [06-media.md](docs/06-media.md) | 采集→编码→分片→jitter→降级→SFU/信令→渲染/音频/AVI 的实时链路 |
+| 7 | P2P | [07-p2p.md](docs/07-p2p.md) | STUN/TURN/ICE、UDP 打洞、TCP 同时打开与候选交换 |
+| 8 | RPC | [08-rpc.md](docs/08-rpc.md) | G2RP 协议、服务注册、同步/异步/流式调用、WebSocket 传输 |
+| 9 | 分布式 | [09-distributed.md](docs/09-distributed.md) | ServiceRegistry、分布式锁、LeaderElection、Coordinator |
+| 10 | 可观测 | [10-observability.md](docs/10-observability.md) | metrics/Prometheus、日志/脱敏/轮转、配置热更新、debug 事件环/回放 |
+| 11 | 工具 | [11-tools.md](docs/11-tools.md) | hash/encoding/compress/reflect/container/math/path/strconv/strings |
+| 12 | 应用层 | [12-app.md](docs/12-app.md) | HTTP/2 风格流表、两级流控、资源/KV 分块传输、bento app |
+| 13 | Relay/JinShan | [13-relay-jinshan.md](docs/13-relay-jinshan.md) | FrameCodec + RelayPipe + Hub/Lease + 有界队列（relay 替换四件套） |
+| 14 | Tunnel | [14-tunnel.md](docs/14-tunnel.md) | 公网穿透：PSK 鉴权、多路复用、心跳、drain、metrics |
+| 15 | os | [15-os.md](docs/15-os.md) | file/dir + Process/Run + pipe/shm/mq/pty + Supervisor/ProcessPool |
+| 16 | Go API | [16-go-api.md](docs/16-go-api.md) | Go 标准库兼容层：net/sync/chan/context/error/time/io/os/signal/crc32/rand/flag |
+
+> 约定：每份都标注「哪些数据是实测、哪些没测」；性能数字一律指向
+> [`docs/reports/asm-*.md`](../docs/reports/) 或 `docs/modules/*.md` 的原始出处，
+> 不复制二手数字。
+
 ## 约定
 
 - **`demo` vs `full`**：`demo` 是 3 个左右主干场景的最小版；`full` 是同一组件的
