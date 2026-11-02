@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "go2cpp/bento/net/peer_hub.hpp"
+#include "loss_proxy.hpp"
 #include "test_util.hpp"
 
 namespace {
@@ -934,6 +935,135 @@ void TestPeersActiveCountMatchesSnapshot() {
     BENTO_CHECK_EQ(server.stats().peers_active, static_cast<std::uint64_t>(count_connected()));
 }
 
+
+/// 场景 13（遗留优化）：5% 双向丢包下，PeerHub 的 FEC 把重传次数压下去。
+/// 两轮用同一条丢包序列（同种子）：
+///   A. FEC 关闭 —— 只有 RTO/快速重传；
+///   B. FEC = XOR(8+1) —— 每 8 个 STREAM 帧附 1 个校验帧（kFec）。
+/// 断言两轮都 100% 送达，且 B 的 retransmits 严格低于 A。
+void TestFecUnderLoss() {
+    constexpr std::uint32_t kMessages = 200;
+    constexpr std::size_t kPayload = 200;
+
+    struct Result {
+        std::uint64_t retransmits = 0;
+        std::uint64_t fec_encoded = 0;
+        std::uint64_t fec_frames = 0;
+        std::uint64_t fec_recovered = 0;
+        std::uint64_t proxy_dropped = 0;
+        int delivered = 0;
+        int corrupted = 0;
+        bool connected = false;
+        bool complete = false;
+    };
+
+    const auto run = [&](bool fec_on) -> Result {
+        Result result;
+        PeerHubConfig server_config = MakeConfig("127.0.0.1");
+        PeerHubConfig client_config = MakeConfig("127.0.0.1");
+        if (fec_on) {
+            // 发送端编码 + 接收端解码都必须打开；XOR 组 8+1 是 5% 丢包下的
+            // 典型配置（12.5% 冗余换掉一次 RTT 的恢复延迟）。
+            client_config.fec.enabled = true;
+            client_config.fec.kind = go2cpp::bento::FecKind::kXor;
+            client_config.fec.data_shards = 8;
+            client_config.fec.parity_shards = 1;
+            server_config.fec = client_config.fec;
+        }
+        PeerHub server(server_config);
+        std::string error;
+        BENTO_CHECK(server.Open(&error));
+        bento_test::LossProxy proxy(server.local_port(), 0.05, 20261102u);
+        BENTO_CHECK(proxy.Start(&error));
+
+        PeerHub client(client_config);
+        BENTO_CHECK(client.Open(&error));
+        BENTO_CHECK(client.AddPeer(1, "127.0.0.1", proxy.port(), &error));
+
+        server.on_stream = [&](std::uint32_t, std::uint8_t channel,
+                               const std::uint8_t* data, std::size_t bytes) {
+            if (channel != 0 || bytes != kPayload) {
+                ++result.corrupted;
+                return;
+            }
+            const std::uint32_t seq = ReadU32(data);
+            if (seq >= kMessages || ReadU32(data + 4) != seq * 2654435761U) {
+                ++result.corrupted;
+                return;
+            }
+            for (std::size_t i = 8; i < kPayload; ++i) {
+                if (data[i] != static_cast<std::uint8_t>(i * 7U + seq)) {
+                    ++result.corrupted;
+                    return;
+                }
+            }
+            ++result.delivered;
+        };
+
+        std::vector<PeerHub*> hubs{&server, &client};
+        result.connected = PumpHubs(
+            hubs, [&]() { return client.peer_state(1) == PeerState::kConnected; }, 15000);
+        if (!result.connected) {
+            return result;
+        }
+
+        std::uint32_t next = 0;
+        const std::uint64_t deadline = go2cpp::bento::NowMs() + 40000;
+        while (go2cpp::bento::NowMs() < deadline) {
+            if (next < kMessages) {
+                std::vector<std::uint8_t> payload(kPayload, 0x5A);
+                WriteU32(payload.data(), next);
+                WriteU32(payload.data() + 4, next * 2654435761U);
+                for (std::size_t i = 8; i < kPayload; ++i) {
+                    payload[i] = static_cast<std::uint8_t>(i * 7U + next);
+                }
+                if (client.SendStream(1, 0, payload.data(), payload.size())) {
+                    ++next;
+                }
+            }
+            server.RunOnce(1);
+            client.RunOnce(1);
+            if (next >= kMessages && result.delivered >= static_cast<int>(kMessages)) {
+                break;
+            }
+        }
+        PumpHubs(hubs, [&]() { return result.delivered >= static_cast<int>(kMessages); }, 3000);
+
+        const auto client_stats = client.reliable_stats(1, 0);
+        result.retransmits = client_stats.retransmits;
+        result.fec_encoded = client_stats.fec_groups_encoded;
+        result.fec_frames = client_stats.fec_frames_sent;
+        const auto peer_ids = server.PeerIds();
+        if (!peer_ids.empty()) {
+            result.fec_recovered = server.reliable_stats(peer_ids.front(), 0).fec_frames_recovered;
+        }
+        result.proxy_dropped = proxy.dropped();
+        result.complete = result.delivered >= static_cast<int>(kMessages) &&
+                          result.corrupted == 0;
+        proxy.Stop();
+        return result;
+    };
+
+    const Result without = run(false);
+    const Result with = run(true);
+    std::printf(
+        "[INFO] fec_loss: off delivered=%d retrans=%llu dropped=%llu | "
+        "on delivered=%d retrans=%llu groups=%llu parity=%llu recovered=%llu dropped=%llu\n",
+        without.delivered, static_cast<unsigned long long>(without.retransmits),
+        static_cast<unsigned long long>(without.proxy_dropped), with.delivered,
+        static_cast<unsigned long long>(with.retransmits),
+        static_cast<unsigned long long>(with.fec_encoded),
+        static_cast<unsigned long long>(with.fec_frames),
+        static_cast<unsigned long long>(with.fec_recovered),
+        static_cast<unsigned long long>(with.proxy_dropped));
+    BENTO_CHECK(without.connected);
+    BENTO_CHECK(with.connected);
+    BENTO_CHECK(without.complete);
+    BENTO_CHECK(with.complete);
+    BENTO_CHECK(with.fec_encoded > 0);
+    BENTO_CHECK(with.fec_frames > 0);
+    BENTO_CHECK(with.retransmits < without.retransmits);
+}
 }  // namespace
 
 int main() {
@@ -949,5 +1079,6 @@ int main() {
     TestRemovePeerRejectsReconnectInCallback();
     TestRemovePeerDoesNotCountAsTimeout();
     TestPeersActiveCountMatchesSnapshot();
+    TestFecUnderLoss();
     return bento_test::Finish("test_peer_hub");
 }

@@ -12,6 +12,7 @@
 #include <linux/errqueue.h>
 #include <netdb.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -269,7 +270,8 @@ bool UdpSocket::ResolveIPv4(const std::string& address, std::uint16_t port, sock
     return true;
 }
 
-bool UdpSocket::Open(const std::string& bind_address, std::uint16_t port, std::string* error) {
+bool UdpSocket::Open(const std::string& bind_address, std::uint16_t port, std::string* error,
+                     bool reuse_port) {
     // Open 与 Close/迁移互斥；发送/接收持共享锁，不会被 Open 阻塞。
     std::unique_lock<std::shared_mutex> lifecycle(m_lifecycle);
     if (m_fd >= 0) {
@@ -311,6 +313,15 @@ bool UdpSocket::Open(const std::string& bind_address, std::uint16_t port, std::s
         }
         const int reuse = 1;
         (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        if (reuse_port) {
+            // 多队列必须所有 socket 都设 REUSEPORT，否则第二个 bind 直接
+            // EADDRINUSE。失败时明确报错，由 Link 回退单队列而不是静默半开。
+            if (::setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) != 0) {
+                last_error = std::string("SO_REUSEPORT: ") + std::strerror(errno);
+                ::close(fd);
+                continue;
+            }
+        }
         // 突发流量下内核接收队列是 UDP 的第一道丢包点：默认 rmem ~212KB，
         // 多 peer 场景下 150 个 80B 小包叠加 skb 开销就可能溢出。统一抬到
         // 1MB（内核按 rmem_max 截断），显著降低回环与弱网突发丢包。
@@ -542,6 +553,47 @@ int UdpSocket::RecvFrom(std::uint8_t* buffer, std::size_t capacity, sockaddr_in*
     return received;
 }
 
+int UdpSocket::RecvBatch(std::uint8_t* storage, std::size_t slot_bytes, Datagram* out,
+                         int max) noexcept {
+    std::shared_lock<std::shared_mutex> lifecycle(m_lifecycle);
+    const int fd = m_fd;
+    if (fd < 0 || storage == nullptr || out == nullptr || slot_bytes == 0 || max <= 0) {
+        return -1;
+    }
+    const int n = max < kMaxRecvBatch ? max : kMaxRecvBatch;
+    mmsghdr messages[kMaxRecvBatch] = {};
+    iovec iovs[kMaxRecvBatch] = {};
+    sockaddr_storage peers[kMaxRecvBatch] = {};
+    for (int i = 0; i < n; ++i) {
+        iovs[i].iov_base = storage + static_cast<std::size_t>(i) * slot_bytes;
+        iovs[i].iov_len = slot_bytes;
+        messages[i].msg_hdr.msg_iov = &iovs[i];
+        messages[i].msg_hdr.msg_iovlen = 1;
+        messages[i].msg_hdr.msg_name = &peers[i];
+        messages[i].msg_hdr.msg_namelen = sizeof(sockaddr_storage);
+    }
+    int received = 0;
+    for (;;) {
+        received = ::recvmmsg(fd, messages, static_cast<unsigned int>(n), MSG_DONTWAIT, nullptr);
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+    if (received <= 0) {
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
+        }
+        return received < 0 ? -1 : 0;
+    }
+    for (int i = 0; i < received; ++i) {
+        out[i].bytes = messages[i].msg_len;
+        out[i].from = peers[i];
+        out[i].from_len = messages[i].msg_hdr.msg_namelen;
+    }
+    return received;
+}
+
 bool UdpSocket::SamePeer(const sockaddr_storage& a, const sockaddr_storage& b) noexcept {
     if (a.ss_family != b.ss_family) {
         return false;
@@ -574,6 +626,8 @@ bool UdpSocket::SamePeer(const sockaddr_in& a, const sockaddr_in& b) noexcept {
 // ---------------------------------------------------------------------------
 
 Link::Link(LinkConfig config) : m_config(std::move(config)), m_rx_buffer(65536) {
+    m_rx_batch_storage.resize(static_cast<std::size_t>(UdpSocket::kMaxRecvBatch) * kRxSlotBytes);
+    m_rx_batch.resize(UdpSocket::kMaxRecvBatch);
     m_video = std::make_unique<VideoChannel>(
         [this](const std::uint8_t* data, std::size_t bytes) { return SendBuiltFrame(data, bytes); },
         [this](std::uint32_t frame_id, bool key, const std::uint8_t* data, std::size_t bytes) {
@@ -613,12 +667,29 @@ bool Link::Open(std::string* error) {
         return false;
     }
     std::string local_error;
-    if (!m_socket.Open(m_config.bind_address, m_config.bind_port, &local_error)) {
+    std::uint32_t wanted_queues = m_config.rx_queues;
+    if (wanted_queues < 1) {
+        wanted_queues = 1;
+    }
+    if (wanted_queues > 16) {
+        wanted_queues = 16;
+    }
+    // 多队列时主 socket 也要设 REUSEPORT，否则后续队列 bind 会失败。
+    if (!m_socket.Open(m_config.bind_address, m_config.bind_port, &local_error,
+                       wanted_queues > 1)) {
         if (error != nullptr) {
             *error = local_error;
         }
         return false;
     }
+    if (!OpenRxQueues(&local_error)) {
+        m_socket.Close();
+        if (error != nullptr) {
+            *error = local_error;
+        }
+        return false;
+    }
+    StartRxThreads();
     // remote（P1）优先于旧字段 peer_address；两者都支持 IPv4/IPv6/域名。
     const std::string& peer_address =
         m_config.remote.empty() ? m_config.peer_address : m_config.remote;
@@ -728,12 +799,19 @@ bool Link::insecure_plaintext() const noexcept {
 }
 
 void Link::Close() {
+    // 先停收包线程：它们还持有各队列 fd，必须在 socket 关闭前退出。
+    StopRxThreads();
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         // 关闭前把服务端会话快照写入缓存，供对端下一次 0-RTT 恢复使用。
         CacheServerSession();
         m_state = LinkState::kClosed;
         m_socket.Close();
+        for (auto& queue : m_rx_queues) {
+            if (queue) {
+                queue->socket.Close();
+            }
+        }
         if (m_secure_enabled) {
             ResetSecureSession();
         }
@@ -771,48 +849,9 @@ int Link::RunOnce(int timeout_ms) {
         // 的 timeout，而不是协议的定时器。定时器已到期时返回 0（先干活）。
         wait_ms = ClampPollTimeout(timeout_ms, NowMs());
     }
-    const int ready = m_socket.WaitReadable(wait_ms);
-    int processed = 0;
     bool rx_drained = false;
-    if (ready > 0) {
-        while (processed < kMaxFramesPerRun) {
-            bool stop = false;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                sockaddr_storage from{};
-                socklen_t from_len = sizeof(from);
-                const int received = m_socket.RecvFrom(m_rx_buffer.data(), m_rx_buffer.size(),
-                                                       &from, &from_len);
-                if (received <= 0) {
-                    if (received < 0) {
-                        ++m_stats.recv_errors;
-                    } else {
-                        // EAGAIN：内核接收队列已抽干（不是「本轮帧数到上限」），
-                        // 接收方马上要回到 poll 睡眠——必须立刻把 ACK 发出去，
-                        // 否则对端要多等一个 ack_interval 才拿到确认。
-                        rx_drained = true;
-                    }
-                    break;
-                }
-                ++m_stats.frames_received;
-                m_stats.bytes_received += static_cast<std::uint64_t>(received);
-                HandleFrame(m_rx_buffer.data(), static_cast<std::size_t>(received), from, from_len);
-                ++processed;
-                stop = (m_state == LinkState::kTimedOut || m_state == LinkState::kClosed);
-            }
-            // 锁外：派发本帧产生的回调 / 发出本帧入队的帧。锁只覆盖「一帧」，
-            // 发送线程最多等一帧的处理时间，而不是整批 256 帧或一个 poll 周期。
-            if (m_events_pending.load(std::memory_order_acquire)) {
-                DispatchEvents();
-            }
-            if (m_tx_pending.load(std::memory_order_acquire)) {
-                DrainTx();
-            }
-            if (stop) {
-                break;
-            }
-        }
-    } else if (ready < 0) {
+    const int processed = ReceiveOnce(wait_ms, &rx_drained);
+    if (processed < 0) {
         std::lock_guard<std::mutex> lock(m_mutex);
         ++m_stats.poll_errors;
     }
@@ -831,6 +870,364 @@ int Link::RunOnce(int timeout_ms) {
     }
     if (m_tx_pending.load(std::memory_order_acquire)) {
         DrainTx();
+    }
+    return processed > 0 ? processed : 0;
+}
+
+UdpSocket& Link::RxSocket(std::size_t index) noexcept {
+    if (index == 0 || index >= m_rx_queues.size() || m_rx_queues[index] == nullptr) {
+        return m_socket;
+    }
+    return m_rx_queues[index]->socket;
+}
+
+bool Link::OpenRxQueues(std::string* error) {
+    std::uint32_t wanted = m_config.rx_queues;
+    if (wanted < 1) {
+        wanted = 1;
+    }
+    if (wanted > 16) {
+        wanted = 16;
+    }
+    m_rx_queue_count = wanted;
+    m_rx_threads = m_config.rx_threads < wanted ? m_config.rx_threads : wanted;
+    m_rx_queues.clear();
+    m_rx_queues.reserve(wanted);
+    for (std::uint32_t i = 0; i < wanted; ++i) {
+        auto queue = std::make_unique<RxQueue>();
+        queue->ring_capacity = kRxRingSlots;
+        queue->ring_slots.resize(static_cast<std::size_t>(kRxRingSlots) * kRxSlotBytes);
+        queue->ring_len.resize(kRxRingSlots);
+        queue->ring_peer.resize(kRxRingSlots);
+        queue->ring_peer_len.resize(kRxRingSlots);
+        m_rx_queues.push_back(std::move(queue));
+    }
+    if (m_rx_queue_count == 1) {
+        return true;
+    }
+    const std::uint16_t port = m_socket.local_port();
+    std::size_t opened = 1;
+    std::string queue_error;
+    for (std::size_t i = 1; i < m_rx_queue_count; ++i) {
+        if (!m_rx_queues[i]->socket.Open(m_config.bind_address, port, &queue_error, true)) {
+            break;
+        }
+        ++opened;
+    }
+    if (opened < m_rx_queue_count) {
+        // 内核不支持 SO_REUSEPORT 或端口被占：回退到已打开的数量。
+        for (std::size_t i = opened; i < m_rx_queue_count; ++i) {
+            m_rx_queues[i]->socket.Close();
+        }
+        m_rx_queue_count = opened;
+        if (m_rx_threads > opened) {
+            m_rx_threads = static_cast<std::uint32_t>(opened);
+        }
+        if (opened == 1) {
+            if (error != nullptr) {
+                *error = queue_error.empty() ? "SO_REUSEPORT unavailable" : queue_error;
+            }
+        }
+    }
+    return true;
+}
+
+void Link::StartRxThreads() {
+    if (m_rx_threads == 0 || m_rx_queue_count == 0) {
+        return;
+    }
+    m_rx_event_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (m_rx_event_fd < 0) {
+        // 拿不到 eventfd 就退回「调用线程轮询所有队列」，不影响正确性。
+        m_rx_threads = 0;
+        return;
+    }
+    m_rx_stop.store(false, std::memory_order_release);
+    for (std::uint32_t t = 0; t < m_rx_threads && t < m_rx_queue_count; ++t) {
+        m_rx_queues[t]->thread = std::thread([this, t]() { RxLoop(t); });
+        m_rx_queues[t]->thread_started = true;
+    }
+}
+
+void Link::StopRxThreads() noexcept {
+    m_rx_stop.store(true, std::memory_order_release);
+    for (auto& queue : m_rx_queues) {
+        if (queue && queue->thread_started) {
+            if (queue->thread.joinable()) {
+                queue->thread.join();
+            }
+            queue->thread_started = false;
+        }
+    }
+    if (m_rx_event_fd >= 0) {
+        ::close(m_rx_event_fd);
+        m_rx_event_fd = -1;
+    }
+    m_rx_threads = 0;
+}
+
+void Link::RxLoop(std::size_t thread_index) {
+    std::vector<pollfd> fds;
+    std::vector<std::size_t> queue_of;
+    for (std::size_t q = thread_index; q < m_rx_queue_count; q += m_rx_threads) {
+        const int fd = RxSocket(q).fd();
+        if (fd < 0) {
+            continue;
+        }
+        pollfd descriptor{};
+        descriptor.fd = fd;
+        descriptor.events = POLLIN;
+        fds.push_back(descriptor);
+        queue_of.push_back(q);
+    }
+    if (fds.empty()) {
+        return;
+    }
+    std::vector<std::uint8_t> storage(static_cast<std::size_t>(UdpSocket::kMaxRecvBatch) *
+                                      kRxSlotBytes);
+    std::vector<UdpSocket::Datagram> batch(UdpSocket::kMaxRecvBatch);
+    while (!m_rx_stop.load(std::memory_order_acquire)) {
+        int ready = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), 50);
+        if (ready < 0 && errno == EINTR) {
+            continue;
+        }
+        if (ready <= 0) {
+            continue;
+        }
+        for (std::size_t i = 0; i < fds.size(); ++i) {
+            if ((fds[i].revents & POLLIN) == 0) {
+                continue;
+            }
+            const int n = RxSocket(queue_of[i]).RecvBatch(storage.data(), kRxSlotBytes,
+                                                          batch.data(),
+                                                          UdpSocket::kMaxRecvBatch);
+            if (n <= 0) {
+                continue;
+            }
+            bool pushed = false;
+            for (int j = 0; j < n; ++j) {
+                pushed |= RxRingPush(
+                    *m_rx_queues[queue_of[i]],
+                    storage.data() + static_cast<std::size_t>(j) * kRxSlotBytes, batch[j].bytes,
+                    batch[j].from, batch[j].from_len);
+            }
+            if (pushed) {
+                const std::uint64_t one = 1;
+                const ssize_t written = ::write(m_rx_event_fd, &one, sizeof(one));
+                (void)written;
+            }
+        }
+    }
+}
+
+bool Link::RxRingPush(RxQueue& queue, const std::uint8_t* data, std::size_t bytes,
+                      const sockaddr_storage& from, socklen_t from_len) noexcept {
+    if (queue.ring_capacity == 0 || bytes > kRxSlotBytes) {
+        return false;
+    }
+    const std::uint32_t head = queue.ring_head.load(std::memory_order_relaxed);
+    const std::uint32_t tail = queue.ring_tail.load(std::memory_order_acquire);
+    if (head - tail >= queue.ring_capacity) {
+        return false;  // 环满：丢包，可靠性由通道重传兜底。
+    }
+    const std::uint32_t index = head % queue.ring_capacity;
+    std::memcpy(queue.ring_slots.data() + static_cast<std::size_t>(index) * kRxSlotBytes, data,
+                bytes);
+    queue.ring_len[index] = static_cast<std::uint16_t>(bytes);
+    queue.ring_peer[index] = from;
+    queue.ring_peer_len[index] = from_len;
+    queue.ring_head.store(head + 1, std::memory_order_release);
+    return true;
+}
+
+int Link::DrainRxRings(int budget, bool* drained) {
+    int processed = 0;
+    if (drained != nullptr) {
+        *drained = true;
+    }
+    for (std::size_t qi = 0; qi < m_rx_queue_count; ++qi) {
+        RxQueue& queue = *m_rx_queues[qi];
+        for (;;) {
+            if (processed >= budget) {
+                if (drained != nullptr) {
+                    *drained = false;
+                }
+                return processed;
+            }
+            const std::uint32_t tail = queue.ring_tail.load(std::memory_order_relaxed);
+            const std::uint32_t head = queue.ring_head.load(std::memory_order_acquire);
+            if (tail == head) {
+                break;
+            }
+            const std::uint32_t index = tail % queue.ring_capacity;
+            const std::uint8_t* data =
+                queue.ring_slots.data() + static_cast<std::size_t>(index) * kRxSlotBytes;
+            const std::size_t bytes = queue.ring_len[index];
+            const sockaddr_storage from = queue.ring_peer[index];
+            const socklen_t from_len = queue.ring_peer_len[index];
+            queue.ring_tail.store(tail + 1, std::memory_order_release);
+            bool stop = false;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ++m_stats.frames_received;
+                m_stats.bytes_received += static_cast<std::uint64_t>(bytes);
+                HandleFrame(data, bytes, from, from_len);
+                ++processed;
+                stop = (m_state == LinkState::kTimedOut || m_state == LinkState::kClosed);
+            }
+            if (m_events_pending.load(std::memory_order_acquire)) {
+                DispatchEvents();
+            }
+            if (m_tx_pending.load(std::memory_order_acquire)) {
+                DrainTx();
+            }
+            if (stop) {
+                if (drained != nullptr) {
+                    *drained = false;
+                }
+                return processed;
+            }
+        }
+    }
+    return processed;
+}
+
+int Link::PollRxQueues(int timeout_ms) {
+    pollfd fds[16] = {};
+    std::size_t queue_of[16] = {};
+    std::size_t n = 0;
+    for (std::size_t q = 0; q < m_rx_queue_count && n < 16; ++q) {
+        const int fd = RxSocket(q).fd();
+        if (fd < 0) {
+            continue;
+        }
+        fds[n].fd = fd;
+        fds[n].events = POLLIN;
+        queue_of[n] = q;
+        ++n;
+    }
+    if (n == 0) {
+        return -1;
+    }
+    int ready = 0;
+    for (;;) {
+        ready = ::poll(fds, static_cast<nfds_t>(n), timeout_ms);
+        if (ready < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+    if (ready <= 0) {
+        return ready;
+    }
+    m_rx_ready_count = 0;
+    for (std::size_t i = 0; i < n && m_rx_ready_count < 16; ++i) {
+        if ((fds[i].revents & (POLLIN | POLLERR)) != 0) {
+            m_rx_ready[m_rx_ready_count++] = queue_of[i];
+        }
+    }
+    return ready;
+}
+
+int Link::ReceiveOnce(int wait_ms, bool* rx_drained) {
+    int processed = 0;
+    if (rx_drained != nullptr) {
+        *rx_drained = false;
+    }
+
+    // ---- 线程模式：收包线程已经把数据报放进无锁环，这里只做协议处理 ----
+    if (m_rx_threads > 0 && m_rx_event_fd >= 0) {
+        processed += DrainRxRings(kMaxFramesPerRun, rx_drained);
+        if (processed == 0) {
+            // 先 drain 再 poll：收包线程 push 之后才写 eventfd，因此这里
+            // 不会丢失唤醒（drain 之后到达的包一定会让 poll 立刻返回）。
+            pollfd descriptor{};
+            descriptor.fd = m_rx_event_fd;
+            descriptor.events = POLLIN;
+            int ready = 0;
+            for (;;) {
+                ready = ::poll(&descriptor, 1, wait_ms);
+                if (ready < 0 && errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if (ready < 0) {
+                return -1;
+            }
+            if (ready > 0) {
+                std::uint64_t ticks = 0;
+                const ssize_t consumed = ::read(m_rx_event_fd, &ticks, sizeof(ticks));
+                (void)consumed;
+                processed += DrainRxRings(kMaxFramesPerRun, rx_drained);
+            }
+        }
+        return processed;
+    }
+
+    // ---- 无线程：poll 全部队列，就绪队列 recvmmsg 批量收包 ----
+    const int ready = PollRxQueues(wait_ms);
+    if (ready < 0) {
+        return -1;
+    }
+    if (ready == 0) {
+        return 0;
+    }
+    for (std::size_t i = 0; i < m_rx_ready_count; ++i) {
+        const std::size_t q = m_rx_ready[i];
+        // 内层循环：一次 poll 之后把该队列抽干（最多 kMaxFramesPerRun）。
+        // 原实现只收一批就返回，调用方每次 RunOnce 都要重新 poll —— 每 16
+        // 包一次 poll，poll 次数被放大 16 倍，单 peer 吞吐反而腰斩。
+        for (;;) {
+            int n = 0;
+            for (;;) {
+                n = RxSocket(q).RecvBatch(m_rx_batch_storage.data(), kRxSlotBytes,
+                                          m_rx_batch.data(), UdpSocket::kMaxRecvBatch);
+                if (n < 0 && errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if (n < 0) {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ++m_stats.recv_errors;
+                break;
+            }
+            if (n == 0) {
+                if (rx_drained != nullptr) {
+                    *rx_drained = true;  // 该队列已抽干
+                }
+                break;
+            }
+            bool stop = false;
+            for (int j = 0; j < n && processed < kMaxFramesPerRun; ++j) {
+                const std::uint8_t* data =
+                    m_rx_batch_storage.data() + static_cast<std::size_t>(j) * kRxSlotBytes;
+                const std::size_t bytes = m_rx_batch[j].bytes;
+                const sockaddr_storage from = m_rx_batch[j].from;
+                const socklen_t from_len = m_rx_batch[j].from_len;
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    ++m_stats.frames_received;
+                    m_stats.bytes_received += static_cast<std::uint64_t>(bytes);
+                    HandleFrame(data, bytes, from, from_len);
+                    ++processed;
+                    stop = (m_state == LinkState::kTimedOut || m_state == LinkState::kClosed);
+                }
+                if (m_events_pending.load(std::memory_order_acquire)) {
+                    DispatchEvents();
+                }
+                if (m_tx_pending.load(std::memory_order_acquire)) {
+                    DrainTx();
+                }
+                if (stop) {
+                    return processed;
+                }
+            }
+            if (stop || processed >= kMaxFramesPerRun) {
+                return processed;
+            }
+        }
     }
     return processed;
 }
@@ -2058,6 +2455,15 @@ bool Link::Migrate(const std::string& new_address, std::uint16_t new_port, std::
         }
         return false;
     }
+    // 迁移只重建主 socket：收包线程必须停，附加队列随旧地址一起关闭，
+    // 迁移后退回单队列（新地址上重新开多队列需要重新协商 REUSEPORT 组）。
+    StopRxThreads();
+    for (auto& queue : m_rx_queues) {
+        if (queue) {
+            queue->socket.Close();
+        }
+    }
+    m_rx_queue_count = 1;
     UdpSocket replacement;
     if (!replacement.Open(new_address, new_port, error)) {
         return false;

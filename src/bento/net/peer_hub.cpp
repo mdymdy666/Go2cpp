@@ -43,6 +43,8 @@ bool ValidateControlPayloadShape(FrameType type, std::size_t payload_bytes) noex
         case FrameType::kPmtudProbe:
         case FrameType::kPmtudAck:
             return payload_bytes >= kPmtudPayloadBytes;
+        case FrameType::kFec:
+            return payload_bytes >= kFecHeaderBytes;
     }
     return false;
 }
@@ -324,6 +326,11 @@ PeerHub::~PeerHub() {
 bool PeerHub::Open(std::string* error) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     m_security_error = SecurityError::kOk;
+    // FEC 便捷字段合并进通道配置：Open 之前设置都生效，之后创建的通道
+    // （以及 ResetChannels 重建的通道）统一走这份配置。
+    if (m_config.fec.enabled) {
+        m_config.reliable.fec = m_config.fec;
+    }
     // 默认安全策略先于 socket 创建校验：无 PSK 的 Hub 不允许出网/监听。
     if (m_config.require_encryption && !m_secure_enabled &&
         m_config.pre_shared_key.empty()) {
@@ -1547,10 +1554,21 @@ void PeerHub::DispatchFrame(Peer& peer, const FrameView& view) {
         case FrameType::kVideo:
         case FrameType::kPmtudProbe:
         case FrameType::kPmtudAck:
-            // PeerHub 的 P0 范围只覆盖 STREAM/DATAGRAM/ACK/BARRIER/MAX_DATA；
-            // 视频分片与路径 MTU 探测在 Link 上实现，见场景矩阵的缺口说明。
+            // 视频分片与路径 MTU 探测在 Link 上实现（PeerHub 不承载视频）。
             ++m_stats.unknown_peer_frames;
             break;
+        case FrameType::kFec: {
+            // 校验帧按 channel 路由到对应的可靠通道；凑够 k 片时由通道
+            // 恢复丢失的数据帧并注入交付（与 Link 的处理一致）。
+            const auto found = peer.reliable.find(view.header.channel);
+            if (found == peer.reliable.end()) {
+                // 校验帧先于数据帧到达，或通道已随 peer 重置：合法但无意义。
+                ++m_stats.unknown_peer_frames;
+                break;
+            }
+            found->second->OnFecFrame(view.header, view.payload, view.payload_bytes);
+            break;
+        }
     }
 }
 

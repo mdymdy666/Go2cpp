@@ -55,6 +55,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "go2cpp/bento/net/channel.hpp"
@@ -70,6 +71,17 @@ struct LinkConfig {
     /// 绑定地址：IPv4/IPv6 字面量或主机名；"0.0.0.0"/"::" 表示通配。
     std::string bind_address = "127.0.0.1";
     std::uint16_t bind_port = 0;  ///< 0 = 由内核分配。
+    /// 接收队列数（1..16）。>1 时在同一个端口上再开 N-1 个 SO_REUSEPORT
+    /// socket，由内核按四元组哈希分发。**单 peer 链路的四元组固定，只会
+    /// 命中一个队列**（多队列对单 peer 不损也不增）；收益在多 peer/多客户端：
+    /// 不同来源端口的流量落到不同队列，配合 `rx_threads` 并行收包。
+    /// 内核不支持 SO_REUSEPORT 时自动回退为 1 个队列（不报错）。
+    std::uint32_t rx_queues = 1;
+    /// 内部收包线程数（0 = 由 RunOnce 调用线程轮询所有队列）。
+    /// >0 时收包线程只做 poll+recvmmsg 并把数据报放进每队列的无锁环，
+    /// 协议处理与回调仍在 RunOnce 调用线程 —— 回调线程语义不变，但收包
+    /// 系统调用被摊到多核。`rx_queues` 个队列按 round-robin 分给线程。
+    std::uint32_t rx_threads = 0;
     /// 对端地址（IPv4/IPv6/主机名）。为空 = 监听方。
     /// 保留旧字段名以兼容既有代码；新代码建议用 remote。
     std::string peer_address;
@@ -174,7 +186,10 @@ class UdpSocket final {
 
     /// @brief 创建、绑定并设置为非阻塞。地址由 getaddrinfo(AF_UNSPEC) 解析。
     /// @param error 失败原因（可为 nullptr）。
-    bool Open(const std::string& bind_address, std::uint16_t port, std::string* error);
+    /// @param reuse_port 是否设置 SO_REUSEPORT（多队列绑定同一端口时必需）。
+    ///        setsockopt 失败只记录在 error 里并返回 false（由调用方回退单队列）。
+    bool Open(const std::string& bind_address, std::uint16_t port, std::string* error,
+              bool reuse_port = false);
 
     /// @brief 配置 PMTUD 相关 socket 选项：DF 位（IP_MTU_DISCOVER）与
     ///        ICMP 错误队列（IP_RECVERR）。幂等；失败时静默降级。
@@ -222,6 +237,21 @@ class UdpSocket final {
 
     /// @brief IPv4 兼容重载；收到非 IPv4 包返回 -1。
     int RecvFrom(std::uint8_t* buffer, std::size_t capacity, sockaddr_in* from) noexcept;
+
+    /// @brief 一次 recvmmsg 读取多个数据报（非阻塞）。
+    /// @details 每包一次 recvfrom 在 1e6 pps 下 syscall 就是瓶颈；批量把
+    ///          N 次系统调用压成 1 次。调用方提供连续槽位存储。
+    /// @param storage 槽位区，第 i 个包放在 storage + i*slot_bytes。
+    /// @param max 本次最多读取的包数（<= 16）。
+    /// @return 实际读到的包数；0 = 当前无数据；-1 = 错误。
+    struct Datagram {
+        std::size_t bytes = 0;
+        sockaddr_storage from{};
+        socklen_t from_len = 0;
+    };
+    static constexpr int kMaxRecvBatch = 16;
+    int RecvBatch(std::uint8_t* storage, std::size_t slot_bytes, Datagram* out,
+                  int max) noexcept;
 
     /// @brief 解析主机名/IPv4/IPv6 字面量（AF_UNSPEC，SOCK_DGRAM）。
     /// @param out_len 输出 sockaddr 实际长度。
@@ -622,6 +652,55 @@ class Link final {
 
     LinkConfig m_config;
     UdpSocket m_socket;
+    // ---- 接收多队列（SO_REUSEPORT）----
+    /// 每个接收槽的字节数（覆盖 1500B MTU + 余量）。
+    static constexpr std::size_t kRxSlotBytes = 2048;
+    /// 线程模式每队列的环容量：满则丢包（UDP 语义允许，可靠性由通道兜底）。
+    static constexpr std::uint32_t kRxRingSlots = 1024;
+
+    /// @brief 一个接收队列：socket + （线程模式）SPSC 环。
+    /// @details 环是「收包线程写、RunOnce 线程读」的单生产/单消费结构：
+    ///          head/tail 各一个原子，槽位拷贝数据报字节与来源地址。
+    struct RxQueue {
+        UdpSocket socket;  ///< 队 0 不使用（复用 m_socket），其余队列独立绑定。
+        std::vector<std::uint8_t> ring_slots;
+        std::vector<std::uint16_t> ring_len;
+        std::vector<sockaddr_storage> ring_peer;
+        std::vector<socklen_t> ring_peer_len;
+        std::uint32_t ring_capacity = 0;
+        std::atomic<std::uint32_t> ring_head{0};
+        std::atomic<std::uint32_t> ring_tail{0};
+        std::thread thread;
+        bool thread_started = false;
+    };
+
+    UdpSocket& RxSocket(std::size_t index) noexcept;
+    bool OpenRxQueues(std::string* error);
+    void StartRxThreads();
+    void StopRxThreads() noexcept;
+    void RxLoop(std::size_t thread_index);
+    bool RxRingPush(RxQueue& queue, const std::uint8_t* data, std::size_t bytes,
+                    const sockaddr_storage& from, socklen_t from_len) noexcept;
+    /// @brief 把环里的数据报逐包交给 HandleFrame（每包一次短锁）。
+    /// @return 处理的帧数；drained 输出「环已空」。
+    int DrainRxRings(int budget, bool* drained);
+    /// @brief poll 所有接收队列，记录就绪队列；返回 poll 的结果。
+    int PollRxQueues(int timeout_ms);
+    /// @brief 接收一批并逐帧处理（两种模式统一入口）。
+    int ReceiveOnce(int wait_ms, bool* rx_drained);
+
+    std::vector<std::unique_ptr<RxQueue>> m_rx_queues;
+    std::size_t m_rx_queue_count = 1;
+    std::uint32_t m_rx_threads = 0;
+    int m_rx_event_fd = -1;
+    std::atomic<bool> m_rx_stop{false};
+    /// PollRxQueues 的就绪队列下标（仅 RunOnce 线程读写）。
+    std::size_t m_rx_ready[16] = {};
+    std::size_t m_rx_ready_count = 0;
+    /// 无线程模式的批量接收缓冲（每队列一组槽位）。
+    std::vector<std::uint8_t> m_rx_batch_storage;
+    std::vector<UdpSocket::Datagram> m_rx_batch;
+
     LinkState m_state = LinkState::kIdle;
     bool m_is_listener = false;
     bool m_peer_configured = false;

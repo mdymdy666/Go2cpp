@@ -110,6 +110,13 @@ struct PeerHubConfig {
     std::uint32_t random_seed = 0;
     /// STREAM 通道默认配置（与 Link 默认一致：动态 PTO/快速重传/分片/流控）。
     ReliableChannel::Config reliable;
+    /// 可靠通道的前向纠错（默认关闭）。开启后每 k 个 STREAM 分片附带 m 个
+    /// 校验分片（kFec 帧）：接收端凑够组内任意 k 片即可恢复丢失帧，把一次
+    /// 丢包的恢复时间从「1 个 RTT」压到「组内最后一帧到达」，代价是 m/k
+    /// 的冗余带宽。这是 PeerHub 相对 Link 的唯一缺口——RunOnce/DispatchFrame
+    /// 过去把 kFec 当未知帧丢弃，现在路由到对应通道的 OnFecFrame。
+    /// @note 与 `reliable.fec` 等价；两者都配置时以本字段为准（Open 时合并）。
+    FecConfig fec;
     /// ---- 默认安全策略（准 P0） ----
     /// 是否强制加密（**默认 true**）。true 时 `Open` 在没有 32B 默认 PSK
     /// 时失败并返回 `SecurityError::kEncryptionRequired`；监听端拒绝明文
