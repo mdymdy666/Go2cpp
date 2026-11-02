@@ -619,9 +619,17 @@ private:
                 break;
             }
             const std::size_t candidate_position = candidate - base;
-            if (best.length == 0 ||
-                data[candidate_position + static_cast<std::size_t>(best.length)] ==
-                    data[position + static_cast<std::size_t>(best.length)]) {
+            const std::size_t best_length =
+                static_cast<std::size_t>(best.length);
+            // 已到本次可比较上限（258 或块尾）：data[position + best_length]
+            // 可能正好是 data.size()，读它就是越界（ASan 实测 1 字节）；
+            // 而且不可能再找到更长的匹配，直接结束链扫描。
+            if (best_length >= max_length) {
+                break;
+            }
+            if (best_length == 0 ||
+                data[candidate_position + best_length] ==
+                    data[position + best_length]) {
                 const std::size_t length =
                     MatchLength(data.data() + candidate_position,
                                 data.data() + position, max_length);

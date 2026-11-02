@@ -271,7 +271,8 @@ add_library(go2cpp_container
 # compress 模块：Go `compress/flate`、`compress/zlib`、`compress/gzip` 的薄封装。
 # **自研 DEFLATE**：LZ77 滑动窗口 + 固定 Huffman 编码在 src/compress/
 # deflate_writer.hpp，解码器（stored/fixed/dynamic Huffman）在
-# deflate_reader.hpp。RFC 1950/1952 的头尾与 adler32/crc32 也由本模块实现，
+# deflate_reader.hpp。RFC 1950/1952 的头尾与 adler32 由本模块实现；
+# CRC-32（gzip）复用 hash 模块的 PCLMULQDQ 实现（见下面的链接说明），
 # 因此不再需要 find_package(ZLIB)，也不链接 libz。
 add_library(go2cpp_compress
     ${CMAKE_CURRENT_SOURCE_DIR}/src/compress/compress.cpp
@@ -280,7 +281,9 @@ add_library(go2cpp_compress
     ${CMAKE_CURRENT_SOURCE_DIR}/src/compress/inflater.cpp)
 # go2cpp_error 是 PUBLIC 依赖：Reader/Writer 是头文件模板，模板实例化时会调用
 # go2cpp::Is / streams::IoEof，使用方必须能链接到 error 模块。
-target_link_libraries(go2cpp_compress PUBLIC go2cpp_error)
+# go2cpp_hash：gzip 解压的 CRC-32 直接复用 hash 模块的 PCLMULQDQ 实现
+# （go2cpp::hash::Crc32），compress 不再自建一份 CRC 表/折叠代码。
+target_link_libraries(go2cpp_compress PUBLIC go2cpp_error go2cpp_hash)
 
 # encoding 模块：Go `encoding/{base64,hex,binary,csv}` 的 C++ 对应实现。
 # 纯 CPU、无 IO / 调度依赖，只链接 error（错误身份锚点）。

@@ -14,6 +14,7 @@
  *   1 MiB / 2 MiB 随机）对三种格式各跑一遍，避免随机抽样恰好漏掉极端值。
  */
 #include "compress_test_support.hpp"
+#include "go2cpp/hash/crc32.hpp"
 
 #include <cstdio>
 
@@ -192,6 +193,63 @@ void TestRandomFlushPatterns() {
   }
 }
 
+/**
+ * @brief gzip 解压侧 CRC-32 与独立逐位参考实现对拍。
+ *
+ * @details 解压器的 CRC 现在批量走 `hash::Crc32`（x86-64 为 PCLMULQDQ 折叠），
+ *   性能提升的前提是「折叠路径与逐位定义逐字节一致」。本测试用测试支持里
+ *   **独立实现的逐位 CRC**（不调用 hash 模块，也不调用 zlib）做 oracle：
+ *
+ *   - 1e6 随机数据的整体 CRC；
+ *   - 长度 0..300 + 1023/1024/4095/4096/65535/65536/999999/1000000：
+ *     覆盖折叠门槛 64B 两侧、16 字节整块尾部、Byte 收尾与 1 MiB 大块；
+ *   - 随机分段 update：把 1e6 数据切成 1..4096 字节的随机段，累积结果必须
+ *     等于整段 CRC（gzip 解压正是按 32 KiB~1 MiB 分段提交的）。
+ */
+void TestCrc32AgainstReference() {
+  Announce("random: crc32 vs independent bitwise reference (1e6 random + length sweep)");
+  const std::string pool = MakeRandomBytes(1000000, 505);
+  const auto* const bytes = reinterpret_cast<const std::uint8_t*>(pool.data());
+  std::vector<std::size_t> lengths;
+  lengths.reserve(320);
+  for (std::size_t n = 0; n <= 300; ++n) {
+    lengths.push_back(n);
+  }
+  for (const std::size_t n : {1023U, 1024U, 4095U, 4096U, 65535U, 65536U,
+                              999999U, 1000000U}) {
+    lengths.push_back(n);
+  }
+  for (const std::size_t n : lengths) {
+    const std::uint32_t want = Crc32(std::string_view(pool.data(), n));
+    const std::uint32_t got = go2cpp::hash::Crc32::ChecksumIEEE(
+        go2cpp::hash::AsBytes(bytes, n));
+    if (want != got) {
+      std::fprintf(stderr,
+                   "[compress] crc32 length %zu mismatch: %08x vs %08x\n", n,
+                   want, got);
+    }
+    COMPRESS_CHECK(want == got);
+  }
+
+  const std::uint32_t whole =
+      Crc32(std::string_view(pool.data(), pool.size()));
+  std::mt19937_64 rng(506);
+  std::uint32_t streamed = 0;
+  std::size_t offset = 0;
+  while (offset < pool.size()) {
+    const std::size_t take = 1 + static_cast<std::size_t>(rng() % 4096);
+    const std::size_t n = std::min(take, pool.size() - offset);
+    streamed = go2cpp::hash::Crc32::Update(
+        streamed, go2cpp::hash::IEEETable,
+        go2cpp::hash::AsBytes(bytes + offset, n));
+    offset += n;
+  }
+  COMPRESS_CHECK(streamed == whole);
+  std::printf(
+      "[compress] random: crc32 1e6 random + %zu lengths + segmented update ok\n",
+      lengths.size());
+}
+
 }  // namespace
 
 /// 随机测试入口。
@@ -200,4 +258,5 @@ void RunRandomTests() {
   TestRandomizedRoundTrips();
   TestExplicitBoundaries();
   TestRandomFlushPatterns();
+  TestCrc32AgainstReference();
 }

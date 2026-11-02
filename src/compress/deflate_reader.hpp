@@ -21,6 +21,11 @@
  *      上层 ReaderEngine 在源 EOF 时统一报 `ErrUnexpectedEof`。
  *   4. **动态 Huffman 表**：用 `1 << max_bits` 的查表数组解码，码长上限 15；
  *      建表时检查过订阅（over-subscribed）与空表。固定表在构造时建一次。
+ *   5. **校验和批量提交**：`EmitByte` / `CopyMatch` 只写输出，不再逐字节
+ *      更新校验和；每次 `Inflate` 出口统一 `CommitOutput`，gzip 的 CRC-32
+ *      走 `hash::Crc32`（x86-64 为 PCLMULQDQ 折叠，~20 GB/s），zlib 的
+ *      adler32 也是整段一次算。1 MiB 输出从上百万次小调用变成几十次大块
+ *      调用——这是 gzip 解压吞吐翻倍的主因（见 /tmp/gzip_crc.md）。
  *
  * 未实现项与原因：
  *   - 预置字典：公开 API 没有字典入口，遇到 FDICT 直接 `ErrDictionary`；
@@ -32,6 +37,7 @@
 #pragma once
 
 #include "go2cpp/compress/errors.hpp"
+#include "go2cpp/hash/crc32.hpp"
 
 #include <algorithm>
 #include <array>
@@ -144,12 +150,20 @@ public:
             return DecodeStatus::kMemberEnd;
         }
         std::size_t out_pos = 0;
+        m_out_committed = 0;
         for (;;) {
             const Step step = StepOnce(out, out_size, &out_pos);
+            // 尾部校验（StepTrailer）要读完整的 CRC / ISIZE：进入它之前必须
+            // 先把本批输出提交掉。EndBlock 返回 kContinue 并切到 kTrailer，
+            // 因此这里能稳定赶上（CommitOutput 幂等）。
+            if (m_phase == Phase::kTrailer) {
+                CommitOutput(out, out_pos);
+            }
             if (step == Step::kContinue) {
                 continue;
             }
             if (step == Step::kError) {
+                CommitOutput(out, out_pos);
                 if (error) {
                     *error = m_error ? m_error : ErrCorrupt();
                 }
@@ -160,12 +174,14 @@ public:
             }
             if (step == Step::kMemberEnd) {
                 m_phase = Phase::kDone;
+                CommitOutput(out, out_pos);
                 if (produced) {
                     *produced = out_pos;
                 }
                 return DecodeStatus::kMemberEnd;
             }
             // kNeedInput / kNeedOutput 对上层都是「先返回已产出数据」。
+            CommitOutput(out, out_pos);
             if (produced) {
                 *produced = out_pos;
             }
@@ -776,8 +792,12 @@ private:
                     const std::size_t distance =
                         static_cast<std::size_t>(kDistanceBase[distance_index]) +
                         distance_value;
+                    // m_member_out 只在 CommitOutput 时推进；本批已产出但
+                    // 尚未提交的部分必须算进去，否则合法的近距离匹配会被
+                    // 误判成 corrupt。
                     if (distance == 0 || distance > kWindowSize ||
-                        distance > m_member_out) {
+                        distance >
+                            m_member_out + (*out_pos - m_out_committed)) {
                         return Fail(ErrCorrupt());
                     }
                     m_match_remaining = m_pending_length;
@@ -961,7 +981,7 @@ private:
                 (static_cast<std::uint32_t>(m_trailer[5]) << 8U) |
                 (static_cast<std::uint32_t>(m_trailer[6]) << 16U) |
                 (static_cast<std::uint32_t>(m_trailer[7]) << 24U);
-            const std::uint32_t actual_crc = m_crc ^ 0xFFFFFFFFU;
+            const std::uint32_t actual_crc = m_crc;
             const std::uint32_t actual_size =
                 static_cast<std::uint32_t>(m_member_out & 0xFFFFFFFFU);
             if (expected_crc != actual_crc || expected_size != actual_size) {
@@ -980,8 +1000,6 @@ private:
         out[(*out_pos)++] = byte;
         m_window[m_window_pos] = byte;
         m_window_pos = (m_window_pos + 1U) & kWindowMask;
-        ++m_member_out;
-        UpdateChecksumBlock(&byte, 1);
     }
 
     /// 批量写窗口（环形，最多两段）。
@@ -1024,82 +1042,38 @@ private:
         }
         WriteWindow(dst, size);
         *out_pos += size;
-        m_member_out += size;
-        UpdateChecksumBlock(dst, size);
     }
 
-    /// 只有对应格式才更新校验和：gzip 用 crc32、zlib 用 adler32、raw 不算。
-    void UpdateChecksumBlock(const std::uint8_t* data, std::size_t size) {
+    /**
+     * @brief 提交本批尚未计入校验和的输出。
+     * @param out 本次 `Inflate` 的输出缓冲。
+     * @param out_pos 本次已写出的字节数（含已提交部分）。
+     *
+     * @details 旧实现在 `EmitByte`/`CopyMatch` 里逐字节/逐匹配更新校验和：
+     *  gzip 每个字面量都要进一次 CRC 循环，1 MiB 输出被切成上百万次小调用，
+     *  查表/折叠的固定开销全落在热路径上。改成出口批量提交后，CRC 一次处理
+     *  32 KiB~1 MiB 的连续段，PCLMUL 折叠才有意义；`EmitByte` 也回到纯写。
+     *
+     *  幂等：`out_pos <= m_out_committed` 时直接返回，所以可以先在尾部校验
+     *  前提交、再在统一出口提交一次。
+     */
+    void CommitOutput(std::uint8_t* out, std::size_t out_pos) {
+        if (out_pos <= m_out_committed) {
+            return;
+        }
+        const std::uint8_t* const data = out + m_out_committed;
+        const std::size_t size = out_pos - m_out_committed;
         if (m_format == Format::kGzip) {
-            m_crc = Crc32Update(m_crc, data, size);
+            // 复用 hash 模块的 CRC-32（x86-64 走 PCLMULQDQ 折叠，~20 GB/s），
+            // 语义就是 Go crc32.Update：入参/返回都是「已完成」的 CRC，可分段。
+            m_crc = ::go2cpp::hash::Crc32::Update(
+                m_crc, ::go2cpp::hash::IEEETable,
+                ::go2cpp::hash::AsBytes(data, size));
         } else if (m_format == Format::kZlib) {
             UpdateAdlerBlock(data, size);
         }
-    }
-
-    /// slice-by-16 CRC32（IEEE，反射多项式 0xEDB88320）。
-    static std::uint32_t Crc32Update(std::uint32_t crc, const std::uint8_t* data,
-                                     std::size_t size) {
-        const auto& tables = CrcTables();
-        std::size_t index = 0;
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
-        // 16 字节一批：16 次查表可以并行发射（xor 树），关键路径不再像
-        // slice-by-8 那样被串行查表延迟卡住。
-        for (; index + 16 <= size; index += 16) {
-            std::uint64_t low = 0;
-            std::uint64_t high = 0;
-            std::memcpy(&low, data + index, sizeof(low));
-            std::memcpy(&high, data + index + 8, sizeof(high));
-            crc ^= static_cast<std::uint32_t>(low & 0xFFFFFFFFU);
-            const std::uint32_t w1 = static_cast<std::uint32_t>(low >> 32U);
-            const std::uint32_t w2 = static_cast<std::uint32_t>(high & 0xFFFFFFFFU);
-            const std::uint32_t w3 = static_cast<std::uint32_t>(high >> 32U);
-            crc = tables[15][crc & 0xFFU] ^ tables[14][(crc >> 8U) & 0xFFU] ^
-                  tables[13][(crc >> 16U) & 0xFFU] ^ tables[12][(crc >> 24U) & 0xFFU] ^
-                  tables[11][w1 & 0xFFU] ^ tables[10][(w1 >> 8U) & 0xFFU] ^
-                  tables[9][(w1 >> 16U) & 0xFFU] ^ tables[8][(w1 >> 24U) & 0xFFU] ^
-                  tables[7][w2 & 0xFFU] ^ tables[6][(w2 >> 8U) & 0xFFU] ^
-                  tables[5][(w2 >> 16U) & 0xFFU] ^ tables[4][(w2 >> 24U) & 0xFFU] ^
-                  tables[3][w3 & 0xFFU] ^ tables[2][(w3 >> 8U) & 0xFFU] ^
-                  tables[1][(w3 >> 16U) & 0xFFU] ^ tables[0][(w3 >> 24U) & 0xFFU];
-        }
-        for (; index + 8 <= size; index += 8) {
-            std::uint64_t block = 0;
-            std::memcpy(&block, data + index, sizeof(block));
-            crc ^= static_cast<std::uint32_t>(block & 0xFFFFFFFFU);
-            const std::uint32_t high = static_cast<std::uint32_t>(block >> 32U);
-            crc = tables[7][crc & 0xFFU] ^ tables[6][(crc >> 8U) & 0xFFU] ^
-                  tables[5][(crc >> 16U) & 0xFFU] ^ tables[4][(crc >> 24U) & 0xFFU] ^
-                  tables[3][high & 0xFFU] ^ tables[2][(high >> 8U) & 0xFFU] ^
-                  tables[1][(high >> 16U) & 0xFFU] ^ tables[0][(high >> 24U) & 0xFFU];
-        }
-#endif
-        for (; index < size; ++index) {
-            crc = tables[0][(crc ^ data[index]) & 0xFFU] ^ (crc >> 8U);
-        }
-        return crc;
-    }
-
-    static const std::array<std::array<std::uint32_t, 256>, 16>& CrcTables() {
-        static const std::array<std::array<std::uint32_t, 256>, 16> tables = [] {
-            std::array<std::array<std::uint32_t, 256>, 16> result{};
-            for (std::uint32_t index = 0; index < 256; ++index) {
-                std::uint32_t value = index;
-                for (int bit = 0; bit < 8; ++bit) {
-                    value = (value & 1U) ? (0xEDB88320U ^ (value >> 1U)) : (value >> 1U);
-                }
-                result[0][index] = value;
-            }
-            for (std::size_t slice = 1; slice < 16; ++slice) {
-                for (std::uint32_t index = 0; index < 256; ++index) {
-                    const std::uint32_t previous = result[slice - 1][index];
-                    result[slice][index] =
-                        (previous >> 8U) ^ result[0][previous & 0xFFU];
-                }
-            }
-            return result;
-        }();
-        return tables;
+        m_member_out += size;
+        m_out_committed = out_pos;
     }
 
     void UpdateAdlerBlock(const std::uint8_t* data, std::size_t size) {
@@ -1124,34 +1098,10 @@ private:
         return m_window[(m_window_pos - distance) & kWindowMask];
     }
 
-    void UpdateChecksum(std::uint8_t byte) noexcept {
-        m_adler_a += byte;
-        m_adler_b += m_adler_a;
-        if (++m_adler_count >= 5552U) {
-            FinishAdler();
-        }
-        m_crc = CrcTable()[(m_crc ^ byte) & 0xFFU] ^ (m_crc >> 8U);
-    }
-
     void FinishAdler() noexcept {
         m_adler_a %= 65521U;
         m_adler_b %= 65521U;
         m_adler_count = 0;
-    }
-
-    static const std::array<std::uint32_t, 256>& CrcTable() {
-        static const std::array<std::uint32_t, 256> table = [] {
-            std::array<std::uint32_t, 256> result{};
-            for (std::uint32_t index = 0; index < 256; ++index) {
-                std::uint32_t value = index;
-                for (int bit = 0; bit < 8; ++bit) {
-                    value = (value & 1U) ? (0xEDB88320U ^ (value >> 1U)) : (value >> 1U);
-                }
-                result[index] = value;
-            }
-            return result;
-        }();
-        return table;
     }
 
     void ResetDynamicHeader() {
@@ -1206,7 +1156,8 @@ private:
         m_adler_a = 1;
         m_adler_b = 0;
         m_adler_count = 0;
-        m_crc = 0xFFFFFFFFU;
+        m_crc = 0;
+        m_out_committed = 0;
         m_member_out = 0;
         m_window_pos = 0;
     }
@@ -1272,7 +1223,8 @@ private:
     std::uint32_t m_adler_a{1};
     std::uint32_t m_adler_b{0};
     std::uint32_t m_adler_count{0};
-    std::uint32_t m_crc{0xFFFFFFFFU};
+    std::uint32_t m_crc{0};                   ///< gzip 成员 CRC（已完成值，初值 0）
+    std::size_t m_out_committed{0};           ///< 本批已计入校验和的输出字节数
     std::uint64_t m_member_out{0};
 
     // 输出窗口
