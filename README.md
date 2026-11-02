@@ -235,13 +235,14 @@ ctest 数量随构建配置变化，**以 `ctest -N` 为准**（逐条清单见 
 
 | 构建配置 | profile | ctest 总数 |
 | --- | --- | --- |
-| 主构建 `.build-bento-wsl`（Bento + MCP + runtime + app + p2p） | `bento+mcp+runtime` | **230**（59 bento + 8 app + 4 p2p + 2 cache + 3 bufio + 1 reflect_codec + 21 MCP 框架 + 132 运行时/示例/工具） |
+| 主构建 `.build-bento-wsl`（Bento + MCP + runtime + app + p2p） | `bento+mcp+runtime` | **290**（62 bento + 8 app + 4 p2p + 2 cache + 3 bufio + 1 reflect_codec + 21 MCP 框架 + 189 运行时/示例/工具） |
 | Bento + MCP（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`，`GO2CPP_BUILD_TESTS=OFF`） | `bento+mcp` | **80**（60 bento + 12 os/monitor + 3 bufio + 4 p2p + 1 reflect_codec） |
 | MCP 集成（`-DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_OS_MONITOR_TESTS=ON`） | `mcp+osmon` | **20**（12 os/monitor + 3 bufio + 4 p2p + 1 reflect_codec） |
 
-主构建注册 **Total Tests: 230**，2026-10-31 全量 `ctest` 实测 149 passed / 7 failed / 74 not run
-（示例可执行未编译、`libgo2cpp_debug.so` 与源码 ABI 不一致、`go2cpp_tests` 的 spin-mutex 计数断言
-时序敏感、3 个 `tools-*` 缺 CLI/迁移/回放产物；详见 [testing.md](docs/testing.md)「测试地图」）。
+主构建注册 **Total Tests: 290**，2026-11-02 全量 `ctest -j4`：7 项测试/文档滞后已全部修复，
+4 项按设计 SKIP（`tools-migration`/`tools-cli`/`tools-replay` 缺独立工程产物按 77 SKIP、
+`bento_netem` 无 `CAP_NET_ADMIN` SKIP）；当日 RPC 迁移新增的 `go2cpp_rpc_picoquic_test` 仍在
+独立复跑中失败（非本轮修复范围）。详见 [testing.md](docs/testing.md)「测试地图」。
 `mcp+osmon` 配置同日在独立构建目录实测 **20/20 passed**。80/20 都不含 21 个 MCP 框架用例：
 `MCP_BUILD_TESTS` 没有 `option()` 声明，需要显式 `-DMCP_BUILD_TESTS=ON`。
 

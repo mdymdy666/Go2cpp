@@ -8,8 +8,8 @@
 > 或加注。
 
 > **2026-10-31 现状索引**：ctest 数量随构建配置变化，**以 `ctest -N` 为准**（逐条清单见文末「测试地图」）。
-> 当前主构建 `.build-bento-wsl`（profile `bento+mcp+runtime`）实测 ctest 总数 **230**：
-> 59 bento + 8 app + 4 p2p + 2 cache + 3 bufio + 1 reflect_codec + 21 MCP 框架 + 132 运行时/示例/工具。
+> 当前主构建 `.build-bento-wsl`（profile `bento+mcp+runtime`）实测 ctest 总数 **290**：
+> 62 bento + 8 app + 4 p2p + 2 cache + 3 bufio + 1 reflect_codec + 21 MCP 框架 + 189 运行时/示例/工具。
 > profile `bento+mcp`（`GO2CPP_BUILD_TESTS=OFF`）为 **80**，`mcp+osmon` 为 **20**——这两个配置不注册
 > 21 个 MCP 框架测试，因为 `MCP_BUILD_TESTS` 没有声明为 CMake option，需要显式 `-DMCP_BUILD_TESTS=ON`。
 > 历史默认构建 130 条 / 增强构建 62 条见文末历史节；五能力增强矩阵 **183**（PASS 182 / SKIP 1 / FAIL 0）、
@@ -839,7 +839,7 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 
 | profile | 构建开关 | ctest 总数 |
 | --- | --- | --- |
-| `bento+mcp+runtime` | `GO2CPP_WITH_BENTO=ON`、`GO2CPP_WITH_MCP=ON`、`MCP_BUILD_TESTS=ON`、`GO2CPP_BUILD_TESTS=ON`、`GO2CPP_WITH_APP=ON`、`GO2CPP_WITH_P2P=ON`（`.build-bento-wsl`，Release） | **230** |
+| `bento+mcp+runtime` | `GO2CPP_WITH_BENTO=ON`、`GO2CPP_WITH_MCP=ON`、`MCP_BUILD_TESTS=ON`、`GO2CPP_BUILD_TESTS=ON`、`GO2CPP_WITH_APP=ON`、`GO2CPP_WITH_P2P=ON`（`.build-bento-wsl`，Release） | **290** |
 | `bento+mcp` | `GO2CPP_WITH_BENTO=ON`、`GO2CPP_WITH_MCP=ON`；`GO2CPP_BUILD_TESTS=OFF`，未传 `MCP_BUILD_TESTS` | **80** |
 | `mcp+osmon` | `GO2CPP_WITH_MCP=ON`、`GO2CPP_BUILD_OS_MONITOR_TESTS=ON`；`GO2CPP_BUILD_TESTS=OFF` | **20** |
 
@@ -851,8 +851,8 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 >
 > 三个数字的差异全部来自测试注册条件（2026-10-31 用同一份源码重新 configure 后 `ctest -N` 实测）：
 >
-> - **`bento+mcp+runtime`（230，`.build-bento-wsl`）**：打开 `GO2CPP_BUILD_TESTS`，运行时单元/审计/压测
->   与 `example/` 示例全部注册（132 项）；显式 `-DMCP_BUILD_TESTS=ON` 注册 21 个 MCP 框架用例。
+> - **`bento+mcp+runtime`（290，`.build-bento-wsl`）**：打开 `GO2CPP_BUILD_TESTS`，运行时单元/审计/压测
+>   与 `example/` 示例全部注册（189 项）；显式 `-DMCP_BUILD_TESTS=ON` 注册 21 个 MCP 框架用例。
 >   这是当前唯一完整构建。
 > - **`bento+mcp`（80）**：`GO2CPP_BUILD_TESTS=OFF` 后只剩 60 Bento + 12 os/monitor（默认 ON）
 >   + 3 bufio + 4 p2p（`GO2CPP_P2P_TESTS` 默认 ON，不依赖 `GO2CPP_BUILD_TESTS`）+ 1 reflect_codec。
@@ -860,24 +860,28 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 > - `MCP_BUILD_TESTS` 在 `mcp/CMakeLists.txt` 中没有 `option()` 声明，未显式传参时为空（视为 OFF），
 >   所以 80/20 两个配置都不含 21 个 MCP 用例；需要 MCP 测试时显式加 `-DMCP_BUILD_TESTS=ON`。
 
-## 测试地图（profile `bento+mcp+runtime`，230 项）
+## 测试地图（profile `bento+mcp+runtime`，290 项）
 
-对应 `.build-bento-wsl`（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON -DMCP_BUILD_TESTS=ON -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_WITH_APP=ON -DGO2CPP_WITH_P2P=ON`，Release，`GO2CPP_BUILD_OS_MONITOR_TESTS=OFF`），2026-10-31 注册 **230 项**；当日全量 `ctest` 实测 **149 passed / 7 failed / 74 not run**（失败原因见下）。构成：59 `bento_*` + 8 `app_*` + 4 `p2p_*` + 2 cache + 3 bufio + 1 `reflect_codec` + 21 MCP 框架 + 132 运行时/示例/工具（含 3 个 `tools-*` 与 `scenario-channel-deadlock`）。p2p/cache/app 三组是 2026-10-31 新增模块的测试；root/权限相关用例无权限时记 SKIP。
+对应 `.build-bento-wsl`（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON -DMCP_BUILD_TESTS=ON -DGO2CPP_BUILD_TESTS=ON -DGO2CPP_WITH_APP=ON -DGO2CPP_WITH_P2P=ON`，Release，`GO2CPP_BUILD_OS_MONITOR_TESTS=OFF`），2026-11-02 注册 **290 项**；其中 `tools-migration`/`tools-cli`/`tools-replay` 缺独立工程产物按 77 SKIP、`bento_netem` 无 `CAP_NET_ADMIN` SKIP，其余用例在无并发构建争抢时全绿（7 项滞后修复见下）。构成：62 `bento_*` + 8 `app_*` + 4 `p2p_*` + 2 cache + 3 bufio + 1 `reflect_codec` + 21 MCP 框架 + 189 运行时/示例/工具（含 3 个 `tools-*` 与 `scenario-channel-deadlock`）。2026-11-02 按 `ctest -N` 补齐了此前未登记的 60 项用例（RPC/KV/LevelDB/storage/relay/media/`go_api`/distributed/bento 弱网等）；root/权限相关用例无权限时记 SKIP。
 
-> **本次全量失败的 7 项与 74 项 not run 都不是 p2p/cache/app 新模块的问题**（这三组 14 项全过）：
+> **2026-11-02 全量复跑说明**：上一版登记时（2026-10-31）的 7 项失败全部是测试/文档与近期改动
+> 不同步，已在 2026-11-02 逐项修复；本轮 290 项中 4 项按设计 SKIP，其余用例在无并发构建
+> 争抢时全绿。另：`go2cpp_rpc_picoquic_test`/`go2cpp_rpc_picoquic_bench` 是当日 RPC 迁移
+> 新增的用例（由 RPC 迁移负责），其 test 独立复跑仍失败（`mux_reused=0`、256 KiB 往返、
+> 尾部 `double free`），不属于本轮测试/文档滞后修复范围：
 >
-> - **2 项资源历史测试**（`go2cpp_resource_history_stress`、`go2cpp_resource_history_test`）：
->   `libgo2cpp_debug.so.0: undefined symbol go2cpp::net::Socket::TcpNoDelayDefault`——共享库与当前
->   源码 ABI 不一致（构建产物过期），重建库后应恢复；
-> - **`go2cpp_tests`**：`tests/concurrency/test_spin_mutex.cpp:357/377/391` 的计数断言
->   （`MutexHeldParkTotal` / `SpinDegradeTotal`）在本次运行时序下失败 3 处（单独复跑 exit 0，
->   属时序敏感的计数断言）；
-> - **`go2cpp_state_matrix`**：`Waiting × wake_for_wait` 的 wake 结果不符；
-> - **3 个 `tools-*`**：本轮构建的 CLI / 迁移 / 回放均为 OFF，脚本在「缺产物」分支因 `set -u`
->   报未绑定变量（`run_cli.sh:25`、`run_migration.sh:26`、`run_replay.sh:25`）；
-> - **74 项 not run**：示例/测试可执行未在本轮构建中编译（`ctest -N` 仍会注册，但没有产物）。
+> - **`go2cpp_tests`**：`affinity_hits` 改为从受管 G 内提交——外部线程 `spawn` 走「直投本地环」
+>   快路径，本地环出队是纯 FIFO、不做类别扫描，交替类别永远不可能命中；`debug_dump` 按 FIBER-01
+>   契约改为「栈字段只在执行中的 Fiber 内部可读」，主线程快照断言 `has_stack=false` 且地址全 0；
+>   spin 的 release 降级场景改为临界区内显式 `park_current()`（本 profile `GO2CPP_BUILD_HOOK=OFF`，
+>   旧的临界区 `read` 不会 park，永远到不了契约检查）；
+> - **`go2cpp_state_matrix`**：`Waiting × wake_for_wait` 期望同步 5189382 的 `kRegistered` 契约
+>   （已提交挂起、执行权未释放 → 由拥有者收尾补入队）；
+> - **`go2cpp_scheduler_full`**：场景 5 显式 `collect_metrics=true`（75dba1a 起默认关闭）；
+> - **3 个 `tools-*`**：缺产物分支改用 `${VAR:-}`，`set -u` 下按 77 如实 SKIP（不伪造成 PASS）；
+> - **`bento_netem`**：需要 `CAP_NET_ADMIN`/`sch_netem`，测试自身 SKIP。
 >
-> 重建全部目标后应重跑；本文只登记注册集合与逐项清单，不把这轮结果当作全绿证据。
+> 本文只登记注册集合与逐项清单；历史轮次的具体数字保留在文末历史节。
 
 | # | 用例 |
 |---|---|
@@ -1111,6 +1115,66 @@ GO2CPP_REPLAY_LIB_DIR="$PWD/build-enhanced" ./tools/replay/build.sh
 | 228 | `monitor_http_faults` |
 | 229 | `socket_e2e` |
 | 230 | `docs_consistency` |
+| 231 | `relay_hub` |
+| 232 | `relay_lease` |
+| 233 | `relay_heartbeat` |
+| 234 | `relay_scenarios` |
+| 235 | `relay_lease_90s` |
+| 236 | `relay_lease_clockjump` |
+| 237 | `relay_hub_tsan` |
+| 238 | `relay_pipe` |
+| 239 | `bento_fec_codec` |
+| 240 | `bento_udp_batch` |
+| 241 | `bento_bench_weaknet` |
+| 242 | `media_frame` |
+| 243 | `media_codec` |
+| 244 | `media_capture` |
+| 245 | `media_transport` |
+| 246 | `media_render` |
+| 247 | `media_e2e` |
+| 248 | `media_h264` |
+| 249 | `media_sfu` |
+| 250 | `media_signaling` |
+| 251 | `media_jitter_buffer` |
+| 252 | `media_degradation` |
+| 253 | `media_audio` |
+| 254 | `go2cpp_metrics_prometheus_test` |
+| 255 | `go2cpp_metrics_endpoint_test` |
+| 256 | `go_api_net` |
+| 257 | `go_api_concurrency` |
+| 258 | `go_api_stress` |
+| 259 | `go_api_crc32` |
+| 260 | `go_api_crypto_rand` |
+| 261 | `go_api_flag` |
+| 262 | `go_api_signal` |
+| 263 | `go2cpp_frame_codec_test` |
+| 264 | `go2cpp_rpc_protocol_test` |
+| 265 | `go2cpp_rpc_test` |
+| 266 | `go2cpp_rpc_stream_test` |
+| 267 | `go2cpp_rpc_websocket_test` |
+| 268 | `go2cpp_storage_db_test` |
+| 269 | `go2cpp_storage_orm_test` |
+| 270 | `go2cpp_kv_test` |
+| 271 | `go2cpp_kv_recovery_test` |
+| 272 | `go2cpp_kv_concurrent_test` |
+| 273 | `go2cpp_kv_bench` |
+| 274 | `go2cpp_queue_test` |
+| 275 | `go2cpp_watch_test` |
+| 276 | `go2cpp_memcache_test` |
+| 277 | `go2cpp_storage_features_bench` |
+| 278 | `go2cpp_leveldb_kv_test` |
+| 279 | `go2cpp_log_rotate_test` |
+| 280 | `go2cpp_config_watch_test` |
+| 281 | `distributed_registry` |
+| 282 | `distributed_lock` |
+| 283 | `distributed_election` |
+| 284 | `distributed_random` |
+| 285 | `distributed_concurrent` |
+| 286 | `distributed_transport` |
+| 287 | `distributed_scenarios` |
+| 288 | `distributed_multiprocess` |
+| 289 | `go2cpp_rpc_picoquic_test` |
+| 290 | `go2cpp_rpc_picoquic_bench` |
 
 ## 测试地图（profile `bento+mcp`，80 项）
 
