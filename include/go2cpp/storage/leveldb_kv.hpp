@@ -1,10 +1,16 @@
 // Copyright 2026 Go2Cpp Authors. All rights reserved.
 // 官方 LevelDB（1.23.x）C++ 包装层，接口形状对齐 include/go2cpp/storage/kv.hpp。
 //
-// 为什么引入：自研 KV 的块索引 / SSTable 元数据随数据量增长，1e8 级数据的
+// **定位：opt-in 对照后端，不是生产默认路径。** 默认/生产存储是自研的
+// `include/go2cpp/storage/kv.hpp`；本后端由 `GO2CPP_WITH_LEVELDB`（默认 OFF）
+// 显式打开，当前仓库里唯一使用方是 `tests/storage/test_leveldb_kv.cpp`
+// （含对拍、边界、kill -9 与 1e7/1e8 压测），没有任何生产代码在运行时切换到它。
+//
+// 为什么还保留：自研 KV 的块索引 / SSTable 元数据随数据量增长，1e8 级数据的
 // RSS 不可控；LevelDB 用固定容量的 block cache + L0-L6 多级 compaction，RSS
-// 有界（1e8 实测见 docs/modules/storage-leveldb.md）。自研实现保留作对照组，
-// 两份头文件可在同一个 TU 内共存，便于逐操作对拍。
+// 有界（1e8 实测见 docs/modules/storage-leveldb.md）。这份「RSS 有界」是
+// **该后端自身**的实测结论，说明它具备作为可选后端的资格，**不代表**生产
+// 已切换。两套实现保留对照，头文件可在同一个 TU 内共存，便于逐操作对拍。
 //
 // 语义差异（使用前必读）：
 //   * Flush() = CompactRange(nullptr, nullptr)：刷 memtable + 全层 compaction，

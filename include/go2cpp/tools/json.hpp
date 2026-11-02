@@ -42,22 +42,34 @@
  *   - 本地位置：`third_party/nlohmann/json.hpp`，由 CMake 的 third_party
  *     包含路径暴露为 `#include "nlohmann/json.hpp"`。
  *
- * ## 依赖治理状态（2026-10-30，降级 TODO）
+ * ## 依赖治理状态（2026-11-02 更新：Reflect JSON 已交付，迁移仍未做）
  *
- * 任务要求用 Reflect 模块的 JSON-like 格式化替换本文件。实际检查
- * `include/go2cpp/bento/reflect/`：目前只有 CSV/config 用的
- * `TypeTraits<T>`、`FieldList<T>` 与 `Bind`，**没有 JSON 值类型、解析或
- * 序列化接口**（目录内 grep 无 JSON 相关符号），因此无法在不丢失
- * `Json` / `ParseJson` 调用面的前提下替换。
+ * 2026-10-30 的判断是「Reflect 目录还没有 JSON 后端，无法替换」，**这一条
+ * 已过时**：`include/go2cpp/reflect/json.hpp`（实现 `src/reflect/json.cpp`）
+ * 已交付 `JsonValue` / `JsonWriter` / `JsonParser`，随 `ReflectCodec` 的文本
+ * 模式一起使用。但它与 `go2cpp::Json` 不是同一个东西，不能直接顶替：
  *
- * 按任务约定走降级路径：暂不硬替换，保留 vendored 的 nlohmann 单头
- * （header-only，不参与链接，不进入 `go2cpp_runtime` 的链接依赖）；
- * Reflect 交付 JSON 格式化后再迁移。
+ *   - `Json` 在本文件里是 `nlohmann::json` 的**直接别名**，调用方用的是
+ *     nlohmann 的 DOM API（迭代器、`operator[]`、隐式类型转换、异常）；
+ *   - `reflect::JsonValue` 是反射编解码专用子集：数字保留**原文**、对象成员
+ *     是 `vector<pair>`、错误走 `bool` + 错误串，不提供 nlohmann 的 DOM API；
+ *   - 两套实现对数字精度 / NaN / 非法输入的处理不同（见
+ *     `docs/reports/reuse-audit.md`「四、风险清单」第 8 条），静默替换会让
+ *     配置与调试输出漂移。
  *
- * TODO(deps-cleanup, 2026-10-30): Reflect 提供 JSON 后端后，删除对
- * `nlohmann/json.hpp` 的 include，保持 `Json` / `ParseJson` /
- * `JsonScanDepth` 的调用面不变，并把 `third_party/nlohmann` 从默认
- * 包含路径中移除。
+ * 现存调用方集中在 debug 模块（`src/debug/debug_dump.cpp`、
+ * `src/debug/debug_server.cpp`、`src/debug/diagnostic_agent.cpp`），另有
+ * `tests/debug/test_debug_*.cpp` 与 `example/concurrency/fiber_stack_limit*`
+ * 示例；它们都依赖 nlohmann 的 DOM 操作（例如 `debug_dump.cpp` 用
+ * `ViewJson` 构造事件视图并 `dump()`）。因此继续保留 vendored 的 nlohmann
+ * 单头（header-only，不参与链接，不进入 `go2cpp_runtime` 的链接依赖）。
+ *
+ * TODO(deps-cleanup, 重定于 2026-11-02): 迁移的前置条件不再是「等 Reflect
+ * 交付」，而是先把 debug 模块与示例的用法收敛到窄接口（查字段、取标量、
+ * 序列化），再让 `reflect::JsonValue` 覆盖这些接口；迁移时保持
+ * `Json` / `ParseJson` / `JsonScanDepth` 的调用面与
+ * `JsonDepthExceededError()` 的身份语义不变，最后把 `third_party/nlohmann`
+ * 从默认包含路径中移除。
  *
  * @note 本头文件**不进入** `go2cpp/runtime.hpp` 聚合头：引入 900+ KB 的单头
  *       文件会显著增加所有使用者的编译时间，而 JSON 并非运行时语义的一部分。

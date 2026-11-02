@@ -75,10 +75,25 @@
  *
  * 本文件（`include/go2cpp/hash/hash.hpp`）定义 `hash` 模块的**公共契约层**。
  * `hash` 位于项目最底层：不依赖调度器、IO 或任何其它业务模块，只依赖 C++
- * 标准库；上层按需 include 具体算法头即可，不会反向被依赖。当前仓库里引用
- * 本目录的**唯一**入口是 `tests/hash/hash_test_support.hpp`（标准向量、随机
- * 对拍与压测）；`compress`、`http2`、`websocket` 等模块目前各自实现或尚未
- * 接入校验和，因此本模块没有生产调用方，也没有 IO/线程依赖。
+ * 标准库；上层按需 include 具体算法头即可，不会反向被依赖。
+ *
+ * ## 生产调用方（2026-11-02 核实）
+ *
+ * 本模块**有**生产调用方，主要用 CRC-32（`crc32.hpp`）；没有任何 IO/线程
+ * 依赖，调用方都在自己的线程里同步调用：
+ *
+ * | 调用方 | 用法 |
+ * |---|---|
+ * | `src/bento/net/frame.cpp` | bento 帧校验：`ChecksumIEEE` 算头部 + 流式 `Update` 续算载荷 |
+ * | `src/bento/app/zip.cpp` | ZIP 写入 / 解包校验 CRC：`Crc32` 流式累加（各一处） |
+ * | `src/frame/frame_codec.cpp` | rpc 帧头 CRC：`ChecksumIEEE` |
+ * | `src/app/resource.cpp` | 静态资源校验：`ChecksumIEEE`（分片）+ `Crc32` 流式（整体） |
+ *
+ * 测试入口是 `tests/hash/hash_test_support.hpp`（标准向量、随机对拍与压测）
+ * 与 `tests/hash/bench_crc32_hw.cpp`。早期注释称「唯一入口是 tests、没有
+ * 生产调用方、compress 尚未接入校验和」，与现状不符：除上表外，compress
+ * 的 gzip 解压流尾 CRC 也已改为调用 `Crc32::Update`（见
+ * `src/compress/deflate_reader.hpp`）。
  *
  * ## 本文件定义什么
  *
