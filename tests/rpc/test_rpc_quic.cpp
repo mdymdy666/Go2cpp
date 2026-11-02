@@ -177,6 +177,10 @@ struct QuicClientSession {
     }
 };
 
+// 弱网公平对照：同一个内核 netem 注入器同时作用于 UDP 与 TCP。
+// 必须放在 QuicServer/QuicClientSession 之后（依赖两者），且只在 root 下启用。
+#include "weaknet_compare.hpp"
+
 // ---------------------------------------------------------------------------
 // UDP 丢包/乱序 relay（测试用；不改 Bento）
 // ---------------------------------------------------------------------------
@@ -1023,6 +1027,13 @@ int main() {
     }
     std::printf("# RPC over QUIC 测试（%s）\n", __DATE__);
     std::printf("- TCP 地址：%s\n", test_server.address.c_str());
+
+    // 弱网公平对照（需要 root：内核 netem）。默认 0 = 关闭，不影响既有测试。
+    const int weaknet_iterations =
+        static_cast<int>(EnvIntAllowZero("RPC_QUIC_WEAKNET_ITERS", 0));
+    if (weaknet_iterations > 0) {
+        weaknet::WeakNetCompare(test_server.server, weaknet_iterations);
+    }
 
     const bool bench_only = std::getenv("RPC_QUIC_BENCH_ONLY") != nullptr;
     const int loss_iterations = static_cast<int>(EnvIntAllowZero("RPC_QUIC_LOSS_ITERS", 500));
