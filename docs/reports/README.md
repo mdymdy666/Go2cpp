@@ -37,3 +37,14 @@
 1. 报告以 `asm-<模块>.md` 命名，正文含环境、方法论、实测数据与「离物理下限几倍」的判断。
 2. 归档文件保留原始正文，仅文首追加来源行；后续修订在正文内以日期小节追加，不改历史数据。
 3. 索引按归档批次累加，新批次追加新章节，不覆盖旧批次。
+
+## 模块审计与使用限制（37 份）
+
+> 原 `user/WarningDocement/`（目录名拼写有误）已于 2026-11-02 迁入 [docs/audit/](../audit/README.md)，
+> 与「性能报告」区分：这里是**逐条 file:line 证据的使用限制与模块级审计**，不是 asm 级性能数据。
+
+| 类别 | 份数 | 入口 |
+| --- | --- | --- |
+| 使用限制索引（模块��� | 7 | [audit/README.md](../audit/README.md) |
+| 模块审计（audit-*.md） | 26 | [audit/](../audit/) |
+| 设计稿（context-callback / waitnode-lock / network-p1-fix / jinshan-protocol-gaps） | 4 | [audit/](../audit/) |

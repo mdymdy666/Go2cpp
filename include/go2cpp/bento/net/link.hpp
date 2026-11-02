@@ -106,7 +106,7 @@ struct LinkConfig {
     /// 携带 caps 位，双方都置位才使用扩展；对端是旧端（12B 载荷、无 caps）
     /// 时自动降级为 32 位位图。加密握手（PSK）的 HELLO body 长度固定，
     /// 不携带该 caps，因此在加密会话里保持降级——这是已知限制，见
-    /// example/WarningDocement/audit-sack.md。
+    /// docs/audit/audit-sack.md。
     bool enable_sack_ext = true;
     /// ABR 回调最小间隔（毫秒）。带宽变化超过 10% 时才回调。
     std::uint32_t abr_interval_ms = 200;

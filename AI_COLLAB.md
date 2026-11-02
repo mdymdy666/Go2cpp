@@ -130,7 +130,7 @@
 ### 一、结论
 
 无 P0；修复 1 个 P1 与 2 个 P2 加固；2 项性能优化；P2 记录 6 项。
-交付文档：`example/WarningDocement/audit-pairing.md`、`/tmp/audit_pairing.md`。
+交付文档：`docs/audit/audit-pairing.md`、`/tmp/audit_pairing.md`。
 
 ### 二、代码改动
 
@@ -173,7 +173,7 @@
 ### 一、结论
 
 无 P0；修复 2 个 P1、记录 7 个 P2 / 5 个 P3。详见
-`example/WarningDocement/audit-udp-transport.md`。
+`docs/audit/audit-udp-transport.md`。
 
 ### 二、代码改动
 
@@ -216,7 +216,7 @@
 ### 一、结论
 
 4 个 socket 工具完成并接入 `mcp_server`；`mcp/` 编译 0 警告；35/35 ctest 通过；
-ASan/LSan 0 报告。详细报告见 `example/WarningDocement/audit-mcp-socket.md`。
+ASan/LSan 0 报告。详细报告见 `docs/audit/audit-mcp-socket.md`。
 
 ### 二、代码改动
 
@@ -281,7 +281,7 @@ ASan/LSan 0 报告。详细报告见 `example/WarningDocement/audit-mcp-socket.m
 - `GO2CPP_TEST_FILTER=sync`、`=locks` 通过；`go2cpp_sync_cancel_stress 5000` 通过。
 - `.build-bento-wsl` 干净重建：`sync.cpp` 0 警告；全量 0 error（其他文件既有
   24 个警告，不在本任务边界内）。
-- 报告：`example/WarningDocement/audit-base-sync.md` §6/§8；详细数据
+- 报告：`docs/audit/audit-base-sync.md` §6/§8；详细数据
   `/tmp/sync_p1_fix.md`。
 
 ### 三、后续状态

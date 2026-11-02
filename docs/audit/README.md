@@ -1,6 +1,6 @@
-# example 使用限制索引（WarningDocement）
+# 使用限制与模块审计索引（docs/audit）
 
-> 逐条对照 `user/` 代码提炼的**使用限制**，每条附 file:line 证据。
+> 逐条对照 `include/go2cpp/` 与 `user/` 代码提炼的**使用限制**，每条附 file:line 证据。
 > 只写「违反会坏」的约束，不写 API 教程与设计长文。生成日期：2026-10-29。
 
 ## 模块文档

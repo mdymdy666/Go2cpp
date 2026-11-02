@@ -235,7 +235,7 @@
 - `src/bento/net/command.cpp`（5 个 P1 + 4 个 P2 修复）
 - `tests/bento/test_command.cpp`（14/93 → 16/153）
 - `tests/bento/audit_command_stress.cpp`（新增压测工具，不注册 CTest）
-- `user/WarningDocement/audit-command.md`（本文）
+- `audit-command.md`（本文）
 
 复现命令：
 

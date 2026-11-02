@@ -340,7 +340,7 @@ ack_interval/PTO 参数」，不是数据面；② 5% 丢包重传 105 次 vs TC
 2. **加密默认开启**：`require_encryption=true` 时无 32B PSK 的 `Open/Connect` 直接失败；
    老代码若忽略返回值仍然「能跑」，但所有发送都会被安全策略拒绝。
 3. **SACK 扩展在加密会话降级**：PSK 加密握手的 HELLO body 长度固定、不带 caps，因此加密会话
-   只用 32 位位图（已知限制，见 `include/.../link.hpp` 注释与 `audit-sack.md`）。
+   只用 32 位位图（已知限制，见 `include/go2cpp/bento/net/link.hpp` 注释与 `audit-sack.md`）。
 4. **FEC 默认关闭**：开启是「带宽换延迟」；`k+m <= 255`（GF(256)）；组内分片零填充到 max_len。
 5. **BBR 是 v1 最小子集**：没有 ack aggregation、没有包级精确 round 判定、没有完整 inflight_hi
    探测；媒体层（`media/`）目前**没有接入** `congestion.hpp`，端到端码率闭环未做。

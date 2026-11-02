@@ -713,7 +713,7 @@ CMakeLists.txt                           +12 行（standalone 分支 + include�
   15 块 + 最远 1 块。发送端用扩展块把「对端已收到」的项移出 inflight，并用
   最远已收 seq 判定窗口外空洞，精确快速重传，不再等 PTO 整批兜底。
 - 加密会话（PSK）的 HELLO body 长度固定，无法追加 caps，因此**恒为降级**
-  （32 位位图），见 `example/WarningDocement/audit-sack.md` 的已知限制。
+  （32 位位图），见 `docs/audit/audit-sack.md` 的已知限制。
 
 ---
 

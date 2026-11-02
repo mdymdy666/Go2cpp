@@ -45,7 +45,7 @@ user/
 ├── logging/             ← 日志四层组合、INI 日志配置（3 个）
 ├── debug/               ← 运行期内省、事件环、断点、dump CLI（1 个）
 ├── app/                 ← 应用级服务：web/chat/p2p/cache/stream（7 个程序）
-└── WarningDocement/     ← 历史模块审计记录（不是示例，按需查证用）
+
 ```
 
 每个子目录都有自己的 `README.md`（这个模块是什么 / 架构 / 最小用法 / 示例清单 /
@@ -163,9 +163,9 @@ cmake --build build -j"$(nproc)"
 | 网络/协议设计 | [docs/network.md](../docs/network.md)、[docs/sse.md](../docs/sse.md)、[docs/quic.md](../docs/quic.md) |
 | Fiber/Context/控制流指南 | [docs/fiber_guide.md](../docs/fiber_guide.md)、[docs/context_guide.md](../docs/context_guide.md)、[docs/control_flow_guide.md](../docs/control_flow_guide.md) |
 | 错误处理 | [docs/error_guide.md](../docs/error_guide.md) |
-| 历史审计记录 | `WarningDocement/`（模块级问题的原始记录，非教程） |
+| 历史审计记录 | 已迁至 [`docs/audit/`](../docs/audit/README.md)（37 份使用限制 + 模块审计，非教程） |
 
-## 全模块交接文档（16 份）
+## 全模块交接文档（17 份）
 
 [`docs/`](docs/) 下每个模块一份**交接文档**（180–400 行），统一 9 节结构：
 这个模块是什么 / 架构与数据流 / 对外 API / 最小用法 / 源码位置 / 性能数据 /
@@ -190,6 +190,7 @@ cmake --build build -j"$(nproc)"
 | 14 | Tunnel | [14-tunnel.md](docs/14-tunnel.md) | 公网穿透：PSK 鉴权、多路复用、心跳、drain、metrics |
 | 15 | os | [15-os.md](docs/15-os.md) | file/dir + Process/Run + pipe/shm/mq/pty + Supervisor/ProcessPool |
 | 16 | Go API | [16-go-api.md](docs/16-go-api.md) | Go 标准库兼容层：net/sync/chan/context/error/time/io/os/signal/crc32/rand/flag |
+| 17 | bufio | [17-bufio.md](docs/17-bufio.md) | 缓冲 IO：Reader/Writer/Scanner/ByteSpan/Batch，含批量 flush 与零拷贝 Span |
 
 > 约定：每份都标注「哪些数据是实测、哪些没测」；性能数字一律指向
 > [`docs/reports/asm-*.md`](../docs/reports/) 或 `docs/modules/*.md` 的原始出处，

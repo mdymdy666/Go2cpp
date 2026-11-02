@@ -2,7 +2,7 @@
 
 - 日期：2026-10-30
 - 工作树：`/UserData/CodexWorkSpace/Go2cpp`（WSL2 Ubuntu 24.04）
-- 审计来源：`user/WarningDocement/audit-base-network.md`
+- 审计来源：`audit-base-network.md`（同目录）
 - 构建目录：
   - `.build-bento-wsl`：Release，`GO2CPP_BUILD_TESTS=OFF`，`GO2CPP_BUILD_HOOK=OFF`
   - `.build-p1-test-wsl`：Release，`GO2CPP_BUILD_TESTS=ON`，`GO2CPP_BUILD_HOOK=OFF`（本次新建，仅用于跑测试）

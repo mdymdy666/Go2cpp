@@ -164,4 +164,4 @@ g++ -std=c++20 -O2 -DNDEBUG -pthread -Iinclude \
   `hook::mark_system_nonblocking` 的调用不参与编译。验证：`nm -uC` 无 hook 未解析
   符号；不含 hook stub 的最小程序链接/运行成功；HOOK=ON 构建仍引用该符号且
   `DT_NEEDED` 含 `libgo2cpp_hook.so`。
-- 详细修复报告见 `user/WarningDocement/network-p1-fix.md`。
+- 详细修复报告见 `network-p1-fix.md`（同目录）。

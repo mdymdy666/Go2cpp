@@ -26,7 +26,7 @@
  *            「deadline <= now」的队头，而不是每次写操作扫全表。没有这条
  *            索引时 `Touch` 在 1024 key 的表上要遍历整表（实测
  *            3625 ns/op）；加入索引后约 200 ns/op（见
- *            `example/WarningDocement/audit-session-table.md`）。`lease_ms == 0`
+ *            `docs/audit/audit-session-table.md`）。`lease_ms == 0`
  *            （永不过期）不建索引、不做任何过期扫描。
  *
  *          租约语义（`lease_ms == 0` 表示永不过期，仅测试/嵌入式建议）：
