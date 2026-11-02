@@ -78,6 +78,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -263,7 +264,7 @@ private:
     bool ReadRequest(const net::Socket::Ptr& connection, http::Parser& parser,
                      std::string& pending, http::Request& request, char* buffer,
                      std::size_t capacity);
-    SseHandler FindSseHandler(const std::string& path) const;
+    SseHandler FindSseHandler(std::string_view path) const;
     RequestHandler FindRequestHandler() const;
     /// 在路由锁内匹配 `m_router`；命中时把参数写入 `request.path_values`。
     bool MatchRoute(http::Request& request, RequestHandler* handler) const;
@@ -283,7 +284,7 @@ private:
     std::uint16_t m_port{0};
 
     /// 路由锁：保护 m_request_handler 与 m_sse_routes（运行期可改）。
-    mutable std::mutex m_route_mutex;
+    mutable std::shared_mutex m_route_mutex;
     /// 普通请求处理器；OnRequest() 写，FindRequestHandler() 拷贝读取。
     RequestHandler m_request_handler;
     /// 路由表（精确哈希 + 参数/通配 trie）；Route() 写，MatchRoute() 读。

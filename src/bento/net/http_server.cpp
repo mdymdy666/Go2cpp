@@ -213,18 +213,18 @@ HttpServerResult HttpServer::Listen(const std::string& host, std::uint16_t port,
 }
 
 void HttpServer::OnRequest(RequestHandler handler) {
-    std::lock_guard<std::mutex> lock(m_route_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_route_mutex);
     m_request_handler = std::move(handler);
 }
 
 void HttpServer::Route(http::Method method, std::string pattern,
                        RequestHandler handler) {
-    std::lock_guard<std::mutex> lock(m_route_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_route_mutex);
     m_router.add(method, std::move(pattern), std::move(handler));
 }
 
 bool HttpServer::MatchRoute(http::Request& request, RequestHandler* handler) const {
-    std::lock_guard<std::mutex> lock(m_route_mutex);
+    std::shared_lock<std::shared_mutex> lock(m_route_mutex);
     if (m_router.empty()) {
         return false;
     }
@@ -248,7 +248,7 @@ void HttpServer::AsSse(std::string path, SseHandler handler) {
     if (path.empty()) {
         return;
     }
-    std::lock_guard<std::mutex> lock(m_route_mutex);
+    std::unique_lock<std::shared_mutex> lock(m_route_mutex);
     for (auto& route : m_sse_routes) {
         if (route.first == path) {
             route.second = std::move(handler);
@@ -476,7 +476,7 @@ void HttpServer::ServeConnection(const net::Socket::Ptr& connection) {
         // 同一 recv 里可能还有流水线的下一个请求，留给下一轮。
         pending = parser.take_remaining();
 
-        const SseHandler sse_handler = FindSseHandler(request.path());
+        const SseHandler sse_handler = FindSseHandler(request.path_view());
         if (sse_handler) {
             ServeSse(connection, request, sse_handler);
             return;
@@ -556,10 +556,13 @@ void HttpServer::ServeSse(const net::Socket::Ptr& connection,
     (void)stream.close();
 }
 
-HttpServer::SseHandler HttpServer::FindSseHandler(const std::string& path) const {
-    std::lock_guard<std::mutex> lock(m_route_mutex);
+HttpServer::SseHandler HttpServer::FindSseHandler(std::string_view path) const {
+    std::shared_lock<std::shared_mutex> lock(m_route_mutex);
+    if (m_sse_routes.empty()) {
+        return {};
+    }
     for (const auto& route : m_sse_routes) {
-        if (route.first == path) {
+        if (std::string_view(route.first) == path) {
             return route.second;
         }
     }
@@ -567,7 +570,7 @@ HttpServer::SseHandler HttpServer::FindSseHandler(const std::string& path) const
 }
 
 HttpServer::RequestHandler HttpServer::FindRequestHandler() const {
-    std::lock_guard<std::mutex> lock(m_route_mutex);
+    std::shared_lock<std::shared_mutex> lock(m_route_mutex);
     return m_request_handler;
 }
 
