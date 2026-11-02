@@ -22,6 +22,10 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
 endif()
 
 include(cmake/Go2CppOptions.cmake)
+# 链接时优化（LTO）：`-DGO2CPP_ENABLE_LTO=ON` 启用，默认 OFF。
+# 默认共享库构建下 LTO 无法跨 DSO 内联，没有性能收益；静态链接时可消
+# 除 math 的跨库调用开销（详见 cmake/Go2CppLto.cmake 与 /tmp/lto.md）。
+include(cmake/Go2CppLto.cmake)
 # Reflect 库定义必须在 Modules 之前：go2cpp_config 的配置编解码依赖
 # go2cpp_reflect（字段反射 + JSON + ReflectCodec）。测试目标放在
 # Go2CppReflectTests.cmake，于 Bento 之后 include。
@@ -56,11 +60,11 @@ include(cmake/Go2CppBento.cmake)
 include(cmake/Go2CppMedia.cmake)
 include(cmake/Go2CppMetricsPrometheus.cmake)
 
-# 应用级示例（example/app）：web_server / chat_server 的 simple 与 full 两版。
+# 应用级示例（user/app）：web_server / chat_server 的 simple 与 full 两版。
 # 它们依赖 Bento 的 HttpServer/LinkServer，必须放在 Go2CppBento.cmake 之后；
 # app/CMakeLists.txt 内部按 TARGET 存在性判断，Bento 关闭时只打印跳过原因。
 if (GO2CPP_BUILD_EXAMPLES)
-    add_subdirectory(example/app)
+    add_subdirectory(user/app)
 endif()
 
 # Reflect 测试（帧对接测试优先复用 go2cpp_bento，因此必须在 Bento 之后）。

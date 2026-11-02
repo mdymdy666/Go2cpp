@@ -312,6 +312,11 @@ add_library(go2cpp::hash ALIAS go2cpp_hash)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GO2CPP_BUILD_HOOK)
     add_library(go2cpp_hook SHARED ${CMAKE_CURRENT_SOURCE_DIR}/src/network/hook.cpp)
+    # hook 是 LD_PRELOAD 拦截器：拦截语义依赖「调用方经 PLT 走动态符号解析」。
+    # LTO 可能把库内调用改写为直接调用/内联而绕过拦截点，所以它是全项目
+    # 唯一显式关闭 IPO 的目标（见 cmake/Go2CppLto.cmake）。
+    set_target_properties(go2cpp_hook PROPERTIES
+        INTERPROCEDURAL_OPTIMIZATION OFF)
 endif()
 
 # The public umbrella target keeps one stable link name while the module
@@ -581,7 +586,7 @@ if (GO2CPP_WITH_PICOQUIC)
         ssl crypto pthread)
 
     add_executable(go2cpp_picoquic_hq_client
-        ${CMAKE_CURRENT_SOURCE_DIR}/example/network/picoquic_hq_client.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/user/network/picoquic_hq_client.cpp)
     target_link_libraries(go2cpp_picoquic_hq_client PRIVATE go2cpp_quic_picoquic)
 
     # HTTP/3 客户端：QPACK 与 h3 帧全部走 picohttp（h3zero），不自研。

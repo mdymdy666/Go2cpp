@@ -896,7 +896,7 @@ if (GO2CPP_BUILD_TESTS)
 
     # 817 行线程版 channel 高频混合压测（mpmc64 / mpmc8_64 / mpmc8_0 /
     # mpmc1 / mpmc0 / rtt0 / mixed，纯 std::thread，不启动 Scheduler）。
-    # 审计 example/WarningDocement/audit-base-channel.md C2 记录：本文件
+    # 审计 user/WarningDocement/audit-base-channel.md C2 记录：本文件
     # 长期只靠手工编译运行，817 行压力在 ctest 中完全不存在。这里按审计
     # 建议以**小规模**注册（2 轮 × 2 万条 × 7 场景，实测约 2s），长跑仍用
     # 二进制直接加参数：--rounds=100 --msgs=100000 --no-gdb。
@@ -1201,7 +1201,7 @@ if (GO2CPP_BUILD_EXAMPLES)
     foreach(example_name IN LISTS GO2CPP_EXAMPLES)
         get_filename_component(example_target ${example_name} NAME_WE)
         add_executable(go2cpp_${example_target}
-            ${CMAKE_CURRENT_SOURCE_DIR}/example/${example_name}.cpp)
+            ${CMAKE_CURRENT_SOURCE_DIR}/user/${example_name}.cpp)
         target_link_libraries(go2cpp_${example_target} PRIVATE go2cpp_runtime)
         target_compile_options(go2cpp_${example_target} PRIVATE
             -Wall -Wextra -Wpedantic)
