@@ -106,3 +106,10 @@ include(cmake/Go2CppOpsLogConfig.cmake)
 
 # 分布式原语（服务发现/锁/选主）。
 include(cmake/Go2CppDistributed.cmake)
+
+# 公网穿透（include/go2cpp/tunnel/）：tunnel-server + tunnel-client，
+# 一条命令把本地端口发布成公网 HTTP URL。默认 ON，POSIX only。
+# 与 Go2CppFrame.cmake 同策略：库不进入 install(EXPORT)，头文件随
+# install(DIRECTORY include/) 安装。
+include(cmake/Go2CppTunnel.cmake)
+
