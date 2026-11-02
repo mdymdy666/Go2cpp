@@ -14,10 +14,13 @@
  *
  * ## 本文件定义什么
  * - 协议常量与名字转换：`Method`、`Status`、`method_name()`/`parse_method()`/`status_text()`；
- * - 消息模型：`Headers`（保留重复值、大小写不敏感）、`Request`、`Response`；
+ * - 消息模型：`Headers`（保留重复值、大小写不敏感）、`Request`、`Response`、
+ *   `FileBody`（文件体，由 `Server` 用 `sendfile(2)` 发送）；
  * - 解析：`ParserLimits`、`ParseState`、`ParseResult`、`Parser`；
  * - 客户端：`Result`、`Client` 与 `Get`/`Post`/`Head` 便捷入口；
- * - 服务端：`Handler`、`ResponseWriter`（分块流式响应）、`Server`（路由）。
+ * - 服务端：`Handler`、`ResponseWriter`（分块流式响应）、`Server`；
+ * - 路由：`Router`（精确哈希 + 参数/尾部通配 trie）；
+ * - 静态文件：`StaticFiles`（sendfile + Range/304/HEAD）。
  *
  * ## 阅读建议
  * 先看 `Parser` 的三态与 `feed()` 的步骤（半包/粘包/Content-Length/chunked 都在这里），
@@ -28,31 +31,39 @@
  * - 解析器**有状态**：一次 `feed()` 可以只喂半包，必须持续喂到 Complete；
  * - 收到 `Error` 后应丢弃该 Parser（`reset()` 或重建），不要继续复用；
  * - 响应若无 Content-Length 且非 chunked，body 由连接 EOF 定界，需要 `finish()`；
- * - `Client` 的 socket 不跨请求复用；`Server::serve_connection()` 不设 recv 超时。
+ * - `Client` 的 socket 不跨请求复用；`Server::serve_connection()` 不设 recv 超时；
+ * - `Response::file` 非空时 body 不参与序列化：`to_string()` 只回头，文件体由
+ *   Server 发送；`ResponseWriter`（chunked 流）会忽略文件体；
+ * - HEAD 未注册时路由回退到同路径 GET（`StaticFiles` 因此可直接用于 HEAD）。
  */
 
 #include "go2cpp/network/socket.hpp"
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
-#include <atomic>
+#include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace go2cpp::http {
 
 enum class Method { Delete, Get, Head, Post, Put, Connect, Options, Trace, Patch, Unknown };
-enum class Status : int { Continue = 100, SwitchingProtocols = 101, OK = 200, Created = 201, NoContent = 204, Found = 302,
+enum class Status : int { Continue = 100, SwitchingProtocols = 101, OK = 200, Created = 201,
+                          NoContent = 204, PartialContent = 206, Found = 302, NotModified = 304,
                           BadRequest = 400, Unauthorized = 401, Forbidden = 403,
                           NotFound = 404, MethodNotAllowed = 405, RequestTimeout = 408,
-                          Conflict = 409, PayloadTooLarge = 413, InternalError = 500,
-                          NotImplemented = 501, BadGateway = 502, ServiceUnavailable = 503,
-                          GatewayTimeout = 504 };
+                          Conflict = 409, PayloadTooLarge = 413, RangeNotSatisfiable = 416,
+                          InternalError = 500, NotImplemented = 501, BadGateway = 502,
+                          ServiceUnavailable = 503, GatewayTimeout = 504 };
 std::string method_name(Method method);
 Method parse_method(std::string_view value);
 std::string status_text(Status status);
@@ -134,6 +145,26 @@ public:
     std::string to_string() const;
 };
 
+/**
+ * @brief 响应体为文件时的描述：`Server` 用 `sendfile(2)` 零拷贝发送。
+ *
+ * ## 定位
+ * 静态文件服务的产出；与 `Response::body` 互斥，`body` 非空时以 `file` 为准。
+ *
+ * ## 不变量
+ * - `length` 是**要发送的字节数**，不是文件大小（Range 时小于文件大小）；
+ * - `offset + length` 必须落在文件范围内，发送前不再做边界修正；
+ * - `Server` 每次发送时 `open()` 一次，不缓存 fd（响应可拷贝、可跨线程）。
+ */
+struct FileBody {
+    /// 文件路径（绝对路径或相对工作目录）；发送时 `open(O_RDONLY)`。
+    std::string path;
+    /// 起始偏移（Range 请求的 first 字节）。
+    std::uint64_t offset{0};
+    /// 发送字节数；0 表示空文件体（只发头）。
+    std::uint64_t length{0};
+};
+
 /** @brief HTTP 响应消息。 */
 /**
  * @brief HTTP 响应消息。
@@ -143,6 +174,7 @@ public:
  *
  * ## 不变量
  * `to_string()` 的输出与 `close` 一致：`close == true` 时会带 `Connection: close`。
+ * `file` 非空时 `body` 不参与序列化，`Content-Length` 由 `file->length` 补齐。
  */
 class Response final {
 public:
@@ -155,9 +187,15 @@ public:
     /// 响应尾（chunked trailer）；to_string() 在终止块前输出。
     Headers trailer;
     /// 响应 body；`head_request` 为真时 to_string() 仍会算 Content-Length 但不输出。
+    /// 与 `file` 互斥：`file` 非空时本字段被忽略（文件体不进入内存）。
     std::string body;
+    /// 文件体（静态文件/Range）：非空时 `Server` 走 `sendfile(2)`，不读进内存。
+    std::shared_ptr<FileBody> file;
     /// 是否在响应后关闭连接；to_string() 据此输出 Connection: close。
     bool close{false};
+
+    /// 是否携带文件体；`Server` 的发送路径据此选择 sendfile 或普通 write。
+    bool has_file() const noexcept { return static_cast<bool>(file); }
     void set_cookie(std::string name, std::string value,
                     std::string attributes = {});
     void redirect(std::string location, Status code = Status::Found);
@@ -370,6 +408,125 @@ Result Post(const std::string& url, std::string body,
 Request NewRequest(Method method, std::string target, std::string body = {});
 
 using Handler = std::function<Response(const Request&)>;
+
+/// 路由参数表：键为 `:name` 中的 name，值是路径段原文（未做百分号解码）。
+using RouteParams = std::map<std::string, std::string>;
+
+/**
+ * @brief 精确哈希 + 段 trie 的路由表：注册期可写，匹配期只读。
+ *
+ * ## 定位
+ * `http::Server::route()` 与 `bento::HttpServer::Route()` 的底层匹配结构，
+ * 也供业务在 `OnRequest` 之上自行做二级路由。注册集中在启动期，匹配在每请求
+ * 热路径，因此匹配路径**不加锁**；运行期改路由需调用方自行同步（`bento::HttpServer`
+ * 用路由锁包住注册与匹配）。
+ *
+ * ## 匹配优先级
+ * 1. **静态精确**（`/api/items`）：每方法一张 `unordered_map<string_view, Handler>`，
+ *    平均 O(1)，替代原实现的线性扫描（64 条路由时平均 32 次字符串比较）；
+ * 2. **参数段**（`/api/items/:id`）：按 `/` 切段的 trie，逐段下降；
+ * 3. **尾部通配**（`/static/` 后接 `*` 或 `*path`，或整条路由就是 `*`）：
+ *    trie 的叶子节点。
+ * 同一节点上静态子节点优先于参数子节点；同一段位置允许并存多个不同参数名
+ * （`/users/:id` 与 `/users/:uid/posts/:pid` 可同时注册），按注册顺序回溯。
+ *
+ * ## 不变量
+ * - 同一 `(method, pattern)` 重复注册保留第一次的 handler（与原线性匹配一致）；
+ * - 参数段必须为非空路径段；`*` 通配匹配剩余全部（含空串）路径；
+ * - `match()` 返回的 `Handler*` 指向表内存储，生命周期与 Router 相同。
+ */
+class Router final {
+public:
+    Router();
+    ~Router();
+    Router(const Router&) = delete;
+    Router& operator=(const Router&) = delete;
+
+    /**
+     * @brief 注册一条路由。
+     * @param method 请求方法；`Method::Unknown` 不参与匹配。
+     * @param pattern 以 '/' 开头的模式：静态段、`:name` 参数段、尾部 `*`/`*name`
+     *        通配；单独的 `*` 表示任意路径。
+     * @param handler 命中后的处理器；空 handler 不注册（与「未命中」等价）。
+     */
+    void add(Method method, std::string pattern, Handler handler);
+
+    /**
+     * @brief 按 method + path 匹配。
+     * @param path 请求路径（不含查询串），通常是 `Request::path_view()`。
+     * @param params 命中时写入参数表；未命中不修改。
+     * @return 命中返回表内 handler 指针；未命中返回 nullptr。
+     */
+    const Handler* match(Method method, std::string_view path,
+                         RouteParams* params = nullptr) const;
+
+    std::size_t size() const noexcept;
+    bool empty() const noexcept;
+    void clear();
+
+private:
+    struct Impl;
+    /// 路由表实现（精确哈希 + trie）；头文件不暴露节点细节。
+    std::unique_ptr<Impl> m_impl;
+};
+
+/// 静态文件服务配置；构造期快照，运行期不再改变。
+struct StaticFilesOptions {
+    /// 文档根目录（绝对路径或相对工作目录）；空表示禁用。
+    std::string root;
+    /// 挂载前缀（如 `/static`）：请求路径先剥离它再映射到 root；空表示原样映射。
+    std::string prefix;
+    /// 目录请求返回的默认文件；空表示目录请求不处理（返回 false）。
+    std::string index{"index.html"};
+    /// 单文件上限（字节）；超过返回 413。
+    std::uint64_t max_bytes{8ull * 1024 * 1024};
+    /// 是否支持 `Range: bytes=`（单区间）；关闭时忽略 Range 返回 200。
+    bool enable_range{true};
+    /// 是否生成 ETag / 处理 `If-None-Match`（304）。
+    bool enable_etag{true};
+    /// 是否输出 Last-Modified / 处理 `If-Modified-Since`（304）。
+    bool enable_last_modified{true};
+};
+
+/**
+ * @brief 静态文件服务：`open` + `sendfile(2)` 零拷贝 + Range/304/HEAD。
+ *
+ * ## 定位
+ * 把目录挂到路由上的可复用组件（替代示例里 `read` 整个文件再 `body` 的做法）。
+ * 返回的 `Response::file` 由 `Server` 用 `sendfile(2)` 发送，数据不经过用户态：
+ * 每请求只 `stat`/`open` 一次元数据，文件内容不进进程地址空间。
+ *
+ * ## 安全边界
+ * - 请求路径先做百分号解码，再按 `/` 切段；任一段为 `..` 直接 403；
+ * - 拒绝空路径、NUL、非法百分号编码、非 origin-form（不以 '/' 开头）；
+ * - 目标路径由 root + 相对路径拼成，且相对路径不含 `..`/绝对路径，
+ *   因此无法越过 root；root 内的 symlink 原样跟随（与 nginx
+ *   `disable_symlinks off` 的默认行为一致）。
+ *
+ * ## 返回语义
+ * - true：已生成响应（200/206/304/400/403/413/416）；
+ * - false：路径不存在或方法不是 GET/HEAD，交上层继续路由（上层可回 404）。
+ */
+class StaticFiles final {
+public:
+    explicit StaticFiles(StaticFilesOptions options);
+
+    /// 尝试用静态文件响应请求；`response` 非空。
+    bool serve(const Request& request, Response* response) const;
+
+    /// 生成挂到 `Router`/`Server` 的 Handler：未命中时返回 404。
+    Handler handler() const;
+
+    const StaticFilesOptions& options() const noexcept { return m_options; }
+
+private:
+    /// 配置快照；构造时规范化 root（去掉尾部的 '/'）。
+    StaticFilesOptions m_options;
+};
+
+/// 便捷入口：等价于 `StaticFiles(options).serve(request, response)`。
+bool ServeStaticFile(const Request& request, const StaticFilesOptions& options,
+                     Response* response);
 /** @brief 可替换的线程/Fiber HTTP 服务端核心，监听与调度由调用方控制。 */
 /**
  * @brief 可替换的线程/Fiber HTTP 服务端核心，监听与调度由调用方控制。
@@ -380,11 +537,19 @@ using Handler = std::function<Response(const Request&)>;
  *
  * ## 不变量
  * - 每个连接只在一个 Fiber 中串行处理（`serve_connection()`）；
- * - 路由匹配 method + 精确 path；未命中走 `m_fallback`。
+ * - 路由 = `Router`（精确哈希 + 参数/通配 trie）；未命中走 `m_fallback`；
+ * - 响应带 `Response::file` 时走 `sendfile(2)`，不把文件读进内存。
  */
 class Server final {
 public:
     explicit Server(net::Socket::Ptr listener);
+
+    /**
+     * @brief 注册路由。
+     * @param method 请求方法。
+     * @param path 支持静态路径、`:name` 参数段与尾部 `*` 通配（见 `Router::add`）。
+     * @param handler 命中后的处理器。
+     */
     void route(Method method, std::string path, Handler handler);
     void set_fallback(Handler handler);
     /**
@@ -400,8 +565,8 @@ public:
 private:
     /// 监听 socket；由构造注入，供调用方 accept 后配合 serve_connection()。
     net::Socket::Ptr m_listener;
-    /// 路由表（method + 精确 path + handler）；`route()` 追加，服务时线性匹配。
-    std::vector<std::tuple<Method, std::string, Handler>> m_routes;
+    /// 路由表（精确哈希 + 参数/通配 trie）；`route()` 注册，服务时按优先级匹配。
+    Router m_router;
     /// 兜底 handler；未命中路由时调用，`set_fallback()` 设置。
     Handler m_fallback;
     /// 停止标记；`stop()` 置位，服务循环据此退出（原子量支持跨线程停止）。

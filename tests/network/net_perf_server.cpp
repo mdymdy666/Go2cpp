@@ -21,7 +21,7 @@
  *
  * ## 用法
  * ```sh
- * taskset -c 2,3 ./net_perf_server http 0 2
+ * taskset -c 2,3 ./net_perf_server http 0 2 [hello|route|static]
  * taskset -c 2,3 ./net_perf_server tcp 0 2
  * taskset -c 2,3 ./net_perf_server udp 0 2
  * ```
@@ -351,27 +351,42 @@ void ServeCoap(std::uint16_t port, int workers) {
     manager.shutdown();
 }
 
-/// HTTP：bento::HttpServer 内部每连接一 Fiber；handler 返回固定 12 字节。
-void ServeHttp(std::uint16_t port, int workers) {
+/// HTTP：bento::HttpServer 内部每连接一 Fiber；三种变体与 Go 基线同口径。
+/// @param variant hello（12B）/ route（64 条路由）/ static（sendfile 静态目录）。
+void ServeHttp(std::uint16_t port, int workers, const std::string& variant) {
     HttpServer server;
     HttpServerConfig config;
     config.worker_threads = static_cast<std::size_t>(workers > 0 ? workers : 2);
     config.max_requests_per_connection = 1000000;
-    server.OnRequest([](const go2cpp::http::Request& request) {
-        go2cpp::http::Response response;
-        response.header.set("Content-Type", "text/plain");
-        if (request.path() == "/hello") {
-            response.status = go2cpp::http::Status::OK;
-            response.body = "hello world";
-        } else if (request.path() == "/big") {
-            response.status = go2cpp::http::Status::OK;
-            response.body.assign(16 * 1024, 'x');
-        } else {
-            response.status = go2cpp::http::Status::NotFound;
-            response.body = "not found";
+
+    const auto text = [](std::string body) {
+        return [body = std::move(body)](const go2cpp::http::Request&) {
+            go2cpp::http::Response response;
+            response.header.set("Content-Type", "text/plain");
+            response.body = body;
+            return response;
+        };
+    };
+
+    if (variant == "route") {
+        // 64 条静态路由：验证 Router 的精确哈希（对应 Go ServeMux 的 64 条注册）。
+        for (int index = 0; index < 64; ++index) {
+            server.Route(go2cpp::http::Method::Get, "/r" + std::to_string(index),
+                         text("r" + std::to_string(index) + "\n"));
         }
-        return response;
-    });
+    } else if (variant == "static") {
+        // 静态文件：open + sendfile(2)（对应 Go http.FileServer 的 SendFile）。
+        go2cpp::http::StaticFilesOptions options;
+        options.root = "/tmp/httpbench/www";
+        options.prefix = "/static";
+        server.Route(go2cpp::http::Method::Get, "/static/*path",
+                     go2cpp::http::StaticFiles(options).handler());
+        server.Route(go2cpp::http::Method::Get, "/hello", text("hello world\n"));
+    } else {
+        server.Route(go2cpp::http::Method::Get, "/hello", text("hello world\n"));
+        server.Route(go2cpp::http::Method::Get, "/big",
+                     text(std::string(16 * 1024, 'x')));
+    }
     const auto listened = server.Listen("127.0.0.1", port, config);
     if (!listened.ok()) {
         std::fprintf(stderr, "http: listen failed: %s\n", listened.message.c_str());
@@ -437,7 +452,7 @@ int main(int argc, char** argv) {
     } else if (mode == "udp") {
         ServeUdp(port, workers);
     } else if (mode == "http") {
-        ServeHttp(port, workers);
+        ServeHttp(port, workers, argc > 4 ? argv[4] : "hello");
     } else if (mode == "ws") {
         ServeWs(port, workers);
     } else if (mode == "mqtt") {

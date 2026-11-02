@@ -19,6 +19,10 @@
 #include <ctime>
 #include <iomanip>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 namespace go2cpp::http {
 
 namespace {
@@ -251,9 +255,9 @@ Method parse_method(std::string_view value) {
 }
 std::string_view status_text_view(Status status) noexcept {
     switch (status) { case Status::Continue: return "Continue"; case Status::SwitchingProtocols: return "Switching Protocols"; case Status::OK: return "OK"; case Status::Created: return "Created"; case Status::Found: return "Found";
-    case Status::NoContent: return "No Content"; case Status::BadRequest: return "Bad Request"; case Status::Unauthorized: return "Unauthorized";
+    case Status::NoContent: return "No Content"; case Status::PartialContent: return "Partial Content"; case Status::NotModified: return "Not Modified"; case Status::BadRequest: return "Bad Request"; case Status::Unauthorized: return "Unauthorized";
     case Status::Forbidden: return "Forbidden"; case Status::NotFound: return "Not Found"; case Status::MethodNotAllowed: return "Method Not Allowed";
-    case Status::RequestTimeout: return "Request Timeout"; case Status::Conflict: return "Conflict"; case Status::PayloadTooLarge: return "Payload Too Large";
+    case Status::RequestTimeout: return "Request Timeout"; case Status::Conflict: return "Conflict"; case Status::PayloadTooLarge: return "Payload Too Large"; case Status::RangeNotSatisfiable: return "Range Not Satisfiable";
     case Status::InternalError: return "Internal Server Error"; case Status::NotImplemented: return "Not Implemented";
     case Status::BadGateway: return "Bad Gateway"; case Status::ServiceUnavailable: return "Service Unavailable";
     case Status::GatewayTimeout: return "Gateway Timeout"; default: return {}; }
@@ -364,16 +368,20 @@ std::string Response::to_string(bool head_request) const {
     // 「无 body」与「body 直到连接关闭」，双方会互等（http1.md §4 已记录）。
     // 有 Transfer-Encoding（chunked）时不补 CL（两种 framing 互斥）。
     if (!body_forbidden && !has_content_length && !has_transfer_encoding) {
+        // 文件体不进入内存：Content-Length 取 Range 后的发送字节数。
+        const std::size_t content_size =
+            file ? static_cast<std::size_t>(file->length) : body.size();
         char length_buffer[24];
         const auto length_end = std::to_chars(length_buffer,
                                               length_buffer + sizeof(length_buffer),
-                                              body.size()).ptr;
+                                              content_size).ptr;
         out.append("Content-Length: ");
         out.append(length_buffer, length_end);
         out.append("\r\n");
     }
     out.append("\r\n");
-    if (!head_request && !body_forbidden) out.append(body);
+    // 文件体走 sendfile(2)，绝不拷贝进内存；HEAD 只回头。
+    if (!head_request && !body_forbidden && !file) out.append(body);
     return out;
 }
 
@@ -756,6 +764,9 @@ bool ResponseWriter::start(Response response) {
     response.header.erase("Content-Length");
     response.header.set("Transfer-Encoding", "chunked");
     response.body.clear();
+    // chunked 流没有 sendfile 路径：文件体必须丢弃，否则 to_string() 会
+    // 因为 file->length 与 Transfer-Encoding 冲突而不补 Content-Length。
+    response.file.reset();
     const auto wire = response.to_string(false);
     if (m_timeout != std::chrono::milliseconds::max() && !m_socket->set_send_timeout(m_timeout)) {
         m_state = StreamState::Failed;
@@ -813,8 +824,594 @@ bool ResponseWriter::close() {
     return true;
 }
 
+namespace {
+
+/// 文件体发送：open + sendfile 循环；返回 false 表示连接已不可继续。
+/// @note `Socket::send_file` 内部已处理 EINTR/EAGAIN 与部分写，这里只累计进度。
+bool send_file_body(const net::Socket::Ptr& socket, const FileBody& file) {
+    if (file.length == 0) return true;
+    const int fd = ::open(file.path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    off_t offset = static_cast<off_t>(file.offset);
+    std::uint64_t remaining = file.length;
+    bool ok = true;
+    while (remaining > 0) {
+        const auto written =
+            socket->send_file(fd, &offset, static_cast<std::size_t>(remaining));
+        if (written.transferred <= 0) {
+            ok = false;
+            break;
+        }
+        remaining -= static_cast<std::uint64_t>(written.transferred);
+    }
+    (void)::close(fd);
+    return ok;
+}
+
+/// 十六进制字符转数值；非法返回 -1。
+int hex_value(char value) noexcept {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+/// 百分号解码；出现非法转义或 NUL 返回 false（调用方按 400 处理）。
+bool percent_decode(std::string_view input, std::string& output) {
+    output.clear();
+    output.reserve(input.size());
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        const char value = input[index];
+        if (value == '%') {
+            if (index + 2 >= input.size()) return false;
+            const int high = hex_value(input[index + 1]);
+            const int low = hex_value(input[index + 2]);
+            if (high < 0 || low < 0) return false;
+            const char decoded = static_cast<char>((high << 4) | low);
+            if (decoded == '\0') return false;
+            output.push_back(decoded);
+            index += 2;
+            continue;
+        }
+        if (value == '\0') return false;
+        output.push_back(value);
+    }
+    return true;
+}
+
+/// 解码后的路径是否含 `..` 段；含则拒绝，避免目录穿越。
+bool has_parent_segment(std::string_view path) noexcept {
+    std::size_t begin = 0;
+    while (begin <= path.size()) {
+        const auto end = path.find('/', begin);
+        const auto length = (end == std::string_view::npos ? path.size() : end) - begin;
+        if (path.substr(begin, length) == "..") return true;
+        if (end == std::string_view::npos) break;
+        begin = end + 1;
+    }
+    return false;
+}
+
+/// 扩展名 → Content-Type；返回值指向静态字面量，未知类型回退 octet-stream。
+const char* mime_type(std::string_view path) noexcept {
+    const auto dot = path.rfind('.');
+    if (dot == std::string_view::npos) return "application/octet-stream";
+    const std::string_view extension = path.substr(dot);
+    char lowered[16];
+    if (extension.size() >= sizeof(lowered)) return "application/octet-stream";
+    for (std::size_t index = 0; index < extension.size(); ++index) {
+        lowered[index] = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(extension[index])));
+    }
+    const std::string_view value(lowered, extension.size());
+    if (value == ".html" || value == ".htm") return "text/html; charset=utf-8";
+    if (value == ".css") return "text/css; charset=utf-8";
+    if (value == ".js" || value == ".mjs") return "application/javascript; charset=utf-8";
+    if (value == ".json") return "application/json; charset=utf-8";
+    if (value == ".xml") return "application/xml; charset=utf-8";
+    if (value == ".svg") return "image/svg+xml";
+    if (value == ".png") return "image/png";
+    if (value == ".jpg" || value == ".jpeg") return "image/jpeg";
+    if (value == ".gif") return "image/gif";
+    if (value == ".webp") return "image/webp";
+    if (value == ".ico") return "image/x-icon";
+    if (value == ".woff") return "font/woff";
+    if (value == ".woff2") return "font/woff2";
+    if (value == ".wasm") return "application/wasm";
+    if (value == ".pdf") return "application/pdf";
+    if (value == ".txt" || value == ".log") return "text/plain; charset=utf-8";
+    if (value == ".mp4") return "video/mp4";
+    if (value == ".mp3") return "audio/mpeg";
+    return "application/octet-stream";
+}
+
+/// 秒级时间 → IMF-fixdate（Last-Modified 用）。
+std::string http_date(std::time_t value) {
+    std::tm tm{};
+    if (::gmtime_r(&value, &tm) == nullptr) return {};
+    char buffer[40];
+    const std::size_t length =
+        std::strftime(buffer, sizeof(buffer), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+    return std::string(buffer, length);
+}
+
+/// 文件元数据 → 强 ETag（mtime-size，十六进制）。
+std::string make_etag(std::uint64_t size, std::time_t modified) {
+    char buffer[32];
+    std::string etag = "\"";
+    const auto modified_end =
+        std::to_chars(buffer, buffer + sizeof(buffer),
+                      static_cast<unsigned long long>(modified), 16).ptr;
+    etag.append(buffer, modified_end);
+    etag.push_back('-');
+    const auto size_end =
+        std::to_chars(buffer, buffer + sizeof(buffer),
+                      static_cast<unsigned long long>(size), 16).ptr;
+    etag.append(buffer, size_end);
+    etag.push_back('"');
+    return etag;
+}
+
+/// `Range` 解析结果：不处理 / 单区间 / 不可满足（416）。
+enum class RangeState { Ignore, Partial, Unsatisfiable };
+
+RangeState parse_range(std::string_view value, std::uint64_t size,
+                       std::uint64_t& first, std::uint64_t& length) {
+    constexpr std::string_view prefix = "bytes=";
+    if (value.rfind(prefix, 0) != 0) return RangeState::Ignore;
+    value.remove_prefix(prefix.size());
+    // 多区间（含逗号）不支持：按 RFC 允许的方式忽略 Range，返回 200 全量。
+    if (value.empty() || value.find(',') != std::string_view::npos) {
+        return RangeState::Ignore;
+    }
+    const auto dash = value.find('-');
+    if (dash == std::string_view::npos) return RangeState::Ignore;
+    const auto first_text = trim_view(value.substr(0, dash));
+    const auto last_text = trim_view(value.substr(dash + 1));
+    std::size_t parsed = 0;
+    if (first_text.empty()) {
+        // 后缀区间 `-N`：最后 N 字节。
+        if (last_text.empty() || !parse_size(last_text, parsed)) return RangeState::Ignore;
+        if (parsed == 0) return RangeState::Unsatisfiable;
+        const std::uint64_t suffix = static_cast<std::uint64_t>(parsed);
+        if (suffix >= size) {
+            first = 0;
+            length = size;
+        } else {
+            first = size - suffix;
+            length = suffix;
+        }
+        return RangeState::Partial;
+    }
+    if (!parse_size(first_text, parsed)) return RangeState::Ignore;
+    const std::uint64_t start = static_cast<std::uint64_t>(parsed);
+    if (size == 0 || start >= size) return RangeState::Unsatisfiable;
+    std::uint64_t end = size - 1;
+    if (!last_text.empty()) {
+        if (!parse_size(last_text, parsed)) return RangeState::Ignore;
+        end = static_cast<std::uint64_t>(parsed);
+        if (end < start) return RangeState::Ignore;
+        if (end >= size) end = size - 1;
+    }
+    first = start;
+    length = end - start + 1;
+    return RangeState::Partial;
+}
+
+/// 生成纯文本错误响应（400/403/413/416）。
+Response make_text_response(Status status, std::string_view message) {
+    Response response;
+    response.status = status;
+    response.header.set("Content-Type", "text/plain; charset=utf-8");
+    response.body.assign(message);
+    return response;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Router：精确哈希 + 段 trie
+// ---------------------------------------------------------------------------
+
+struct Router::Impl {
+    /// 段 trie 节点：静态子节点 + 至多一个参数子节点 + 当前节点的通配。
+    struct Node {
+        std::map<std::string, std::unique_ptr<Node>, std::less<>> children;
+        /// 参数子节点：同一段位置允许并存多个不同参数名（按注册顺序回溯）。
+        std::vector<std::pair<std::string, std::unique_ptr<Node>>> parameters;
+        Handler handler;
+        Handler wildcard;
+        std::string wildcard_name;
+        bool has_handler{false};
+        bool has_wildcard{false};
+    };
+
+    /// 每个方法一棵 trie；数组下标 = Method 的枚举值（Delete..Patch = 0..8）。
+    std::array<Node, 9> roots;
+    /// 每个方法一张精确表；key 指向 `patterns` 中的稳定存储，查找零分配。
+    std::array<std::unordered_map<std::string_view, Handler>, 9> exact;
+    /// 精确路由 pattern 的稳定存储（deque 的引用在 push_back 后不变）。
+    std::deque<std::string> patterns;
+    std::size_t size{0};
+
+    /// 递归匹配：静态子节点优先，失败回退参数子节点，最后尾部通配。
+    const Handler* match_node(const Node& node, std::string_view path,
+                              RouteParams& params) const {
+        if (path.empty()) {
+            if (node.has_handler) return &node.handler;
+            if (node.has_wildcard) {
+                if (!node.wildcard_name.empty()) params[node.wildcard_name] = std::string{};
+                return &node.wildcard;
+            }
+            return nullptr;
+        }
+        const auto slash = path.find('/');
+        const std::string_view segment =
+            path.substr(0, slash == std::string_view::npos ? path.size() : slash);
+        const std::string_view rest =
+            slash == std::string_view::npos ? std::string_view{} : path.substr(slash + 1);
+        if (!segment.empty()) {
+            const auto child = node.children.find(segment);
+            if (child != node.children.end()) {
+                if (const Handler* found = match_node(*child->second, rest, params)) {
+                    return found;
+                }
+            }
+            for (const auto& entry : node.parameters) {
+                const std::string& name = entry.first;
+                const auto existing = params.find(name);
+                const bool had_value = existing != params.end();
+                std::string saved;
+                if (had_value) saved = existing->second;
+                params[name] = std::string(segment);
+                if (const Handler* found = match_node(*entry.second, rest, params)) {
+                    return found;
+                }
+                if (had_value) params[name] = std::move(saved);
+                else params.erase(name);
+            }
+        }
+        if (node.has_wildcard) {
+            if (!node.wildcard_name.empty()) params[node.wildcard_name] = std::string(path);
+            return &node.wildcard;
+        }
+        return nullptr;
+    }
+};
+
+Router::Router() : m_impl(std::make_unique<Impl>()) {}
+Router::~Router() = default;
+
+std::size_t Router::size() const noexcept { return m_impl ? m_impl->size : 0; }
+bool Router::empty() const noexcept { return size() == 0; }
+void Router::clear() { m_impl = std::make_unique<Impl>(); }
+
+void Router::add(Method method, std::string pattern, Handler handler) {
+    if (!m_impl || method == Method::Unknown || pattern.empty() || !handler) return;
+    const auto index = static_cast<std::size_t>(method);
+    if (index >= m_impl->exact.size()) return;
+    if (pattern.front() != '/') pattern.insert(pattern.begin(), '/');
+    // 尾斜杠归一：`/api/items/` 与 `/api/items` 视为同一条路由（根路径除外）。
+    if (pattern.size() > 1 && pattern.back() == '/') pattern.pop_back();
+
+    std::vector<std::string> segments;
+    if (pattern.size() > 1) {
+        std::size_t begin = 1;
+        for (;;) {
+            const auto end = pattern.find('/', begin);
+            const auto length = (end == std::string::npos ? pattern.size() : end) - begin;
+            if (length > 0) segments.emplace_back(pattern, begin, length);
+            if (end == std::string::npos) break;
+            begin = end + 1;
+        }
+    }
+
+    // 只有最后一段的 `*`/`*name` 是通配；中间段的 `*` 按字面量处理。
+    bool wildcard = false;
+    std::string wildcard_name;
+    if (!segments.empty() && segments.back().front() == '*') {
+        wildcard = true;
+        wildcard_name = segments.back().substr(1);
+        segments.pop_back();
+    }
+    bool dynamic = wildcard;
+    for (const auto& segment : segments) {
+        if (segment.size() > 1 && segment.front() == ':') {
+            dynamic = true;
+            break;
+        }
+    }
+
+    if (!dynamic) {
+        m_impl->patterns.push_back(std::move(pattern));
+        const std::string_view key(m_impl->patterns.back());
+        const auto inserted = m_impl->exact[index].emplace(key, std::move(handler));
+        if (inserted.second) ++m_impl->size;
+        return;
+    }
+
+    Impl::Node* node = &m_impl->roots[index];
+    for (const auto& segment : segments) {
+        if (segment.size() > 1 && segment.front() == ':') {
+            const std::string name = segment.substr(1);
+            Impl::Node* next = nullptr;
+            for (auto& entry : node->parameters) {
+                if (entry.first == name) {
+                    next = entry.second.get();
+                    break;
+                }
+            }
+            if (next == nullptr) {
+                node->parameters.emplace_back(name, std::make_unique<Impl::Node>());
+                next = node->parameters.back().second.get();
+            }
+            node = next;
+        } else {
+            auto& child = node->children[segment];
+            if (!child) child = std::make_unique<Impl::Node>();
+            node = child.get();
+        }
+    }
+    if (wildcard) {
+        if (node->has_wildcard) return;
+        node->has_wildcard = true;
+        node->wildcard = std::move(handler);
+        node->wildcard_name = std::move(wildcard_name);
+        ++m_impl->size;
+        return;
+    }
+    if (node->has_handler) return;
+    node->has_handler = true;
+    node->handler = std::move(handler);
+    ++m_impl->size;
+}
+
+const Handler* Router::match(Method method, std::string_view path,
+                             RouteParams* params) const {
+    if (!m_impl || method == Method::Unknown) return nullptr;
+    const auto index = static_cast<std::size_t>(method);
+    if (index >= m_impl->exact.size()) return nullptr;
+    const auto& table = m_impl->exact[index];
+    const auto exact = table.find(path);
+    if (exact != table.end()) return &exact->second;
+    const auto& root = m_impl->roots[index];
+    if (root.children.empty() && root.parameters.empty() && !root.has_wildcard &&
+        !root.has_handler) {
+        return nullptr;
+    }
+    std::string_view remaining = path;
+    if (!remaining.empty() && remaining.front() == '/') remaining.remove_prefix(1);
+    RouteParams collected;
+    if (const Handler* handler = m_impl->match_node(root, remaining, collected)) {
+        if (params) *params = std::move(collected);
+        return handler;
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// StaticFiles：open + sendfile + Range/304/HEAD
+// ---------------------------------------------------------------------------
+
+StaticFiles::StaticFiles(StaticFilesOptions options) : m_options(std::move(options)) {
+    if (m_options.root.size() > 1 && m_options.root.back() == '/') {
+        m_options.root.pop_back();
+    }
+    if (!m_options.prefix.empty() && m_options.prefix.front() != '/') {
+        m_options.prefix.insert(m_options.prefix.begin(), '/');
+    }
+    if (m_options.prefix.size() > 1 && m_options.prefix.back() == '/') {
+        m_options.prefix.pop_back();
+    }
+}
+
+namespace {
+
+/// 线程局部文件元数据缓存：同一工作线程重复请求同一文件时省掉 ETag 格式化
+/// 与 strftime（静态文件吞吐的热路径）。size+mtime 相同即视为同一版本；
+/// 缓存不改变语义（同样的输入本来就生成同样的 ETag/Last-Modified）。
+struct CachedFileMeta {
+    std::uint64_t size{0};
+    std::time_t modified{0};
+    std::string etag;
+    std::string last_modified;
+};
+
+struct CachedFileMetaView {
+    std::string_view etag;
+    std::string_view last_modified;
+};
+
+CachedFileMetaView cached_file_meta(std::uint64_t size, std::time_t modified) {
+    static constexpr std::size_t kSlots = 4;
+    static thread_local std::array<CachedFileMeta, kSlots> slots;
+    static thread_local std::size_t next = 0;
+    for (const auto& slot : slots) {
+        if (!slot.etag.empty() && slot.size == size && slot.modified == modified) {
+            return {slot.etag, slot.last_modified};
+        }
+    }
+    CachedFileMeta& slot = slots[next];
+    next = (next + 1) % kSlots;
+    slot.size = size;
+    slot.modified = modified;
+    slot.etag = make_etag(size, modified);
+    slot.last_modified = http_date(modified);
+    return {slot.etag, slot.last_modified};
+}
+
+}  // namespace
+
+bool StaticFiles::serve(const Request& request, Response* response) const {
+    if (response == nullptr || m_options.root.empty()) return false;
+    if (request.method != Method::Get && request.method != Method::Head) return false;
+    std::string_view raw_path = request.path_view();
+    if (!m_options.prefix.empty()) {
+        // 挂载前缀：`/static` 只匹配 `/static` 与 `/static/...`。
+        if (raw_path.size() < m_options.prefix.size() ||
+            raw_path.compare(0, m_options.prefix.size(), m_options.prefix) != 0) {
+            return false;
+        }
+        raw_path.remove_prefix(m_options.prefix.size());
+        if (raw_path.empty()) raw_path = "/";
+        else if (raw_path.front() != '/') return false;
+    }
+    if (raw_path.empty() || raw_path.front() != '/') return false;
+
+    // 快路径：没有 '%' 时不复制路径（静态文件请求绝大多数不需要解码）。
+    std::string decoded_storage;
+    std::string_view decoded;
+    if (raw_path.find('%') == std::string_view::npos) {
+        decoded = raw_path;
+    } else {
+        if (!percent_decode(raw_path, decoded_storage)) {
+            *response = make_text_response(Status::BadRequest, "bad request\n");
+            return true;
+        }
+        decoded = decoded_storage;
+    }
+    if (has_parent_segment(decoded)) {
+        *response = make_text_response(Status::Forbidden, "forbidden\n");
+        return true;
+    }
+
+    // 拼路径：一次 reserve，避免逐段 append 扩容。
+    std::string full;
+    const std::string_view relative =
+        decoded == "/" ? std::string_view(m_options.index) : decoded.substr(1);
+    full.reserve(m_options.root.size() + 1 + relative.size());
+    full.append(m_options.root);
+    if (full.empty() || full.back() != '/') full.push_back('/');
+    if (decoded == "/") {
+        if (m_options.index.empty()) return false;
+        full.append(m_options.index);
+    } else {
+        full.append(decoded.substr(1));
+    }
+
+    struct stat status {};
+    if (::stat(full.c_str(), &status) != 0) return false;
+    if (S_ISDIR(status.st_mode)) {
+        if (m_options.index.empty()) return false;
+        if (!full.empty() && full.back() != '/') full.push_back('/');
+        full.append(m_options.index);
+        if (::stat(full.c_str(), &status) != 0) return false;
+    }
+    if (!S_ISREG(status.st_mode) || status.st_size < 0) return false;
+
+    const auto file_size = static_cast<std::uint64_t>(status.st_size);
+    if (file_size > m_options.max_bytes) {
+        *response = make_text_response(Status::PayloadTooLarge, "file too large\n");
+        return true;
+    }
+
+    const auto meta = cached_file_meta(file_size, status.st_mtime);
+    const std::string_view etag = meta.etag;
+    const std::string_view last_modified = meta.last_modified;
+
+    // 条件请求：If-None-Match 优先于 If-Modified-Since（RFC 7232 §6）。
+    if (m_options.enable_etag) {
+        const std::string if_none_match = request.header.get("If-None-Match");
+        if (!if_none_match.empty() &&
+            (std::string_view(if_none_match) == etag || if_none_match == "*")) {
+            *response = Response{};
+            response->status = Status::NotModified;
+            response->header.set("ETag", std::string(etag));
+            if (m_options.enable_last_modified) {
+                response->header.set("Last-Modified", std::string(last_modified));
+            }
+            return true;
+        }
+    }
+    if (m_options.enable_last_modified) {
+        const std::string if_modified_since = request.header.get("If-Modified-Since");
+        std::chrono::system_clock::time_point since;
+        if (!if_modified_since.empty() &&
+            parse_http_time(if_modified_since, since) &&
+            std::chrono::system_clock::to_time_t(since) >= status.st_mtime) {
+            *response = Response{};
+            response->status = Status::NotModified;
+            if (m_options.enable_etag) response->header.set("ETag", std::string(etag));
+            response->header.set("Last-Modified", std::string(last_modified));
+            return true;
+        }
+    }
+
+    std::uint64_t offset = 0;
+    std::uint64_t length = file_size;
+    Status code = Status::OK;
+    if (m_options.enable_range) {
+        const std::string range = request.header.get("Range");
+        if (!range.empty()) {
+            // If-Range：只支持 ETag 形式；不匹配时按 RFC 忽略 Range 返回全量。
+            const std::string if_range = request.header.get("If-Range");
+            const bool range_applies =
+                if_range.empty() || std::string_view(if_range) == etag;
+            if (range_applies) {
+                std::uint64_t first = 0;
+                std::uint64_t ranged_length = 0;
+                const auto state = parse_range(range, file_size, first, ranged_length);
+                if (state == RangeState::Unsatisfiable) {
+                    *response = make_text_response(Status::RangeNotSatisfiable,
+                                                   "range not satisfiable\n");
+                    response->header.set("Content-Range",
+                                         "bytes */" + std::to_string(file_size));
+                    response->header.set("Accept-Ranges", "bytes");
+                    return true;
+                }
+                if (state == RangeState::Partial) {
+                    offset = first;
+                    length = ranged_length;
+                    code = Status::PartialContent;
+                }
+            }
+        }
+    }
+
+    *response = Response{};
+    response->status = code;
+    response->header.reserve(8);
+    response->header.set("Content-Type", mime_type(full));
+    response->header.set("X-Content-Type-Options", "nosniff");
+    response->header.set("Accept-Ranges",
+                         m_options.enable_range ? "bytes" : "none");
+    if (m_options.enable_etag) response->header.set("ETag", std::string(etag));
+    if (m_options.enable_last_modified) {
+        response->header.set("Last-Modified", std::string(last_modified));
+    }
+    if (code == Status::PartialContent) {
+        response->header.set("Content-Range",
+                             "bytes " + std::to_string(offset) + "-" +
+                                 std::to_string(offset + length - 1) + "/" +
+                                 std::to_string(file_size));
+    }
+    response->header.set("Content-Length", std::to_string(length));
+    response->file = std::make_shared<FileBody>(FileBody{std::move(full), offset, length});
+    return true;
+}
+
+Handler StaticFiles::handler() const {
+    auto files = std::make_shared<StaticFiles>(*this);
+    return [files](const Request& request) {
+        Response response;
+        if (!files->serve(request, &response)) {
+            response.status = Status::NotFound;
+            response.header.set("Content-Type", "text/plain; charset=utf-8");
+            response.body = "not found\n";
+        }
+        return response;
+    };
+}
+
+bool ServeStaticFile(const Request& request, const StaticFilesOptions& options,
+                     Response* response) {
+    return StaticFiles(options).serve(request, response);
+}
+
 Server::Server(net::Socket::Ptr listener) : m_listener(std::move(listener)) {}
-void Server::route(Method method, std::string path, Handler handler) { m_routes.emplace_back(method, std::move(path), std::move(handler)); }
+void Server::route(Method method, std::string path, Handler handler) {
+    m_router.add(method, std::move(path), std::move(handler));
+}
 void Server::set_fallback(Handler handler) { m_fallback = std::move(handler); }
 /**
  * @brief 在一个已接受的连接上服务若干请求（keep-alive 循环）。
@@ -835,9 +1432,11 @@ void Server::set_fallback(Handler handler) { m_fallback = std::move(handler); }
  *        收到 0 字节或解析错误就返回（连接结束）；
  * step3. `pending = take_remaining()`：同一 recv 里可能还有下一个请求的字节，
  *        留给下一轮循环；
- * step4. 路由：按 (method, path) 精确匹配 `m_routes`，未命中用 `m_fallback`；
+ * step4. 路由：`Router` 按「精确哈希 → 参数段 → 尾部通配」匹配，未命中用
+ *        `m_fallback`；命中时把参数写入 `request.path_values`；
  *        handler 抛异常时降级成 500 且**强制 close**；
- * step5. 序列化响应并 `write_all`；写失败直接返回；
+ * step5. 序列化响应并 `write_all`；带 `Response::file` 时再用 `sendfile(2)`
+ *        零拷贝发送文件体（HEAD 只回头）；写失败直接返回；
  *        `request.close || response.close` 为真则结束循环（关闭连接）。
  *
  * ## 并发/失败语义
@@ -870,27 +1469,28 @@ void Server::serve_connection(net::Socket::Ptr connection, std::size_t max_reque
         } while (parsed.state == ParseState::NeedMore);
         // step3: 同一 recv 里可能还有下一个请求，留给下一轮。
         pending = parser.take_remaining();
-        // step4: 精确匹配路由，未命中用 fallback；handler 异常转 500 并强制 close。
-        // 路径只算一次视图（原来每个候选路由都分配一次 Request::path()），
-        // 命中结果用指针而不是按值拷贝 std::function。
-        const std::string_view request_path = request.path_view();
+        // step4: Router 匹配（精确哈希 → 参数段 → 尾部通配），未命中用 fallback；
+        // 命中时参数直接写入 request.path_values，handler 异常转 500 并强制 close。
         Response response;
-        const Handler* selected = &m_fallback;
-        for (const auto& route : m_routes) {
-            if (std::get<0>(route) == request.method &&
-                std::string_view(std::get<1>(route)) == request_path) {
-                selected = &std::get<2>(route);
-                break;
-            }
+        const Handler* selected = m_router.match(request.method, request.path_view(),
+                                                 &request.path_values);
+        // HEAD 是 GET 的无体版本：未单独注册 HEAD 时回退到同一路径的 GET 路由。
+        if (selected == nullptr && request.method == Method::Head) {
+            selected = m_router.match(Method::Get, request.path_view(),
+                                      &request.path_values);
         }
+        if (selected == nullptr) selected = &m_fallback;
         if (*selected) {
             try { response = (*selected)(request); }
             catch (...) { response = Response{}; response.status = Status::InternalError; response.close = true; }
         } else response.status = Status::NotFound;
-        // step5: 写响应；close 标志决定是否结束本连接。
+        // step5: 写响应头；文件体走 sendfile(2)（HEAD 只回头）。
         const auto wire = response.to_string(request.method == Method::Head);
         net::SocketStream stream(connection, false);
         if (!stream.write_all(wire.data(), wire.size())) return;
+        if (request.method != Method::Head && response.has_file()) {
+            if (!send_file_body(connection, *response.file)) return;
+        }
         if (request.close || response.close) return;
     }
 }
