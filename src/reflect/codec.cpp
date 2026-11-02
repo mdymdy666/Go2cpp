@@ -29,8 +29,9 @@ constexpr std::uint8_t kBinaryMagic[4] = {'G', '2', 'R', 'F'};
 /// @brief 二进制消息格式版本。
 constexpr std::uint8_t kBinaryVersion = 1;
 
-/// @brief flags 位定义：载荷已 RLE 压缩。
-constexpr std::uint8_t kFlagCompressed = 0x01u;
+/// @brief flags 位定义：载荷已 RLE 压缩 / 载荷为紧凑格式（无字段表）。
+constexpr std::uint8_t kFlagCompressed = kFlagCompressedPayload;
+constexpr std::uint8_t kFlagCompact = kFlagCompactPayload;
 
 /// @brief 文本消息协议版本。
 constexpr std::int64_t kTextVersion = 1;
@@ -83,7 +84,7 @@ CodecStatus DecodeBinary(const std::uint8_t* data, std::size_t size, Envelope& o
         return CodecStatus::kTruncated;
     }
     const std::uint8_t flags = *cursor++;
-    if ((flags & ~kFlagCompressed) != 0) {
+    if ((flags & ~(kFlagCompressed | kFlagCompact)) != 0) {
         return CodecStatus::kBadVersion;
     }
     std::uint64_t type_id = 0;
@@ -129,6 +130,7 @@ CodecStatus DecodeBinary(const std::uint8_t* data, std::size_t size, Envelope& o
     }
     out.encoding = Encoding::kBinary;
     out.compressed = compressed;
+    out.compact = (flags & kFlagCompact) != 0;
     out.type_id = static_cast<TypeId>(type_id);
     if (consumed != nullptr) {
         *consumed = static_cast<std::size_t>(cursor - data) +
@@ -234,7 +236,7 @@ namespace detail {
 
 CodecStatus EncodeEnvelope(TypeId type_id, std::string_view type_name, Encoding encoding,
                            Compression compression, const Buffer& payload,
-                           std::vector<std::uint8_t>& out) {
+                           std::vector<std::uint8_t>& out, bool compact) {
     out.clear();
     if (type_name.size() > kMaxTypeNameBytes) {
         return CodecStatus::kTooLarge;
@@ -244,7 +246,7 @@ CodecStatus EncodeEnvelope(TypeId type_id, std::string_view type_name, Encoding 
     }
     if (encoding == Encoding::kBinary) {
         std::vector<std::uint8_t> compressed;
-        std::uint8_t flags = 0;
+        std::uint8_t flags = compact ? kFlagCompact : 0;
         const std::uint8_t* payload_data = payload.data().data();
         std::size_t payload_size = payload.size();
         if (compression == Compression::kRle && payload_size > 0) {

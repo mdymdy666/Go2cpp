@@ -36,8 +36,12 @@
  * @copyright MIT License
  */
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include <system_error>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -64,10 +68,27 @@ enum class Compression : std::uint8_t {
     kRle = 1,   ///< 字节级 RLE（仅二进制模式生效）。
 };
 
+/// @brief 二进制载荷的字段描述方式。
+enum class WireFormat : std::uint8_t {
+    /// 紧凑格式（默认）：只写字段号 + 值，字段名/类型由本地 schema 还原。
+    /// 比自描述格式每字段省「名字长度 + 名字 + TypeId」，但要求收发两端
+    /// 的字段表一致；嵌套结构体同样使用紧凑格式。
+    kCompact = 0,
+    /// 自描述格式（向后兼容）：每条消息带字段表（名字 + TypeId），
+    /// 可跨版本/跨语言解码，旧数据与旧实现都走这条。
+    kSelfDescribed = 1,
+};
+
+/// @brief 二进制载荷 flags：bit0 = RLE 压缩。
+inline constexpr std::uint8_t kFlagCompressedPayload = 0x01u;
+/// @brief 二进制载荷 flags：bit1 = 紧凑载荷（无字段表）。
+inline constexpr std::uint8_t kFlagCompactPayload = 0x02u;
+
 /// @brief 消息外层（类型信息 + 已解压载荷）。
 struct Envelope {
     Encoding encoding = Encoding::kBinary;  ///< 编码模式。
     bool compressed = false;                ///< 载荷是否经过 RLE。
+    bool compact = false;                   ///< 二进制载荷是否紧凑格式。
     TypeId type_id = kUnknownType;          ///< 线上类型 id。
     std::string type_name;                  ///< 线上类型名。
     Buffer payload;                         ///< 二进制载荷或文本字段 JSON。
@@ -78,7 +99,7 @@ namespace detail {
 /// @brief 编码消息外层；`payload` 是已序列化的载荷。
 CodecStatus EncodeEnvelope(TypeId type_id, std::string_view type_name, Encoding encoding,
                            Compression compression, const Buffer& payload,
-                           std::vector<std::uint8_t>& out);
+                           std::vector<std::uint8_t>& out, bool compact = false);
 
 /// @brief 解析消息外层（含解压），不解释载荷。
 CodecStatus DecodeEnvelope(const std::uint8_t* data, std::size_t size, Envelope& out,
@@ -104,6 +125,237 @@ CodecStatus CheckWireType(const Envelope& envelope) {
     return CodecStatus::kUnknownType;
 }
 
+/// @brief 二进制紧凑消息的零拷贝快路径。
+/// @details 不构造 Envelope、不复制载荷、不做字段名比较：直接按本地 schema
+///          把 tag/值读进目标对象。只在「无压缩 + 紧凑 + 类型 id 命中」时接手；
+///          其余情况（含需要精确错误码的坏数据）返回 `kUnsupportedEncoding`，
+///          由通用路径给出与旧实现一致的错误语义。
+template <typename T>
+CodecStatus DecodeBinaryCompact(const std::uint8_t* data, std::size_t size, T& out,
+                                std::size_t* consumed) {
+    using Value = std::remove_cv_t<std::remove_reference_t<T>>;
+    if (data == nullptr || size < 6) {
+        return CodecStatus::kUnsupportedEncoding;
+    }
+    if (data[0] != 'G' || data[1] != '2' || data[2] != 'R' || data[3] != 'F') {
+        return CodecStatus::kUnsupportedEncoding;
+    }
+    if (data[4] != 1) {
+        return CodecStatus::kUnsupportedEncoding;
+    }
+    const std::uint8_t flags = data[5];
+    // 只接手「紧凑且未压缩」的消息；压缩/自描述走通用路径。
+    if ((flags & kFlagCompactPayload) == 0 || (flags & kFlagCompressedPayload) != 0) {
+        return CodecStatus::kUnsupportedEncoding;
+    }
+    const std::uint8_t* cursor = data + 6;
+    const std::uint8_t* const end = data + size;
+    std::uint64_t type_id = 0;
+    if (!ReadVarintPtr(cursor, end, type_id)) {
+        return CodecStatus::kUnsupportedEncoding;
+    }
+    if (type_id > static_cast<std::uint64_t>(std::numeric_limits<TypeId>::max()) ||
+        static_cast<TypeId>(type_id) != TypeIdOf<Value>()) {
+        return CodecStatus::kUnsupportedEncoding;
+    }
+    std::uint64_t name_length = 0;
+    if (!ReadVarintPtr(cursor, end, name_length)) {
+        return CodecStatus::kUnsupportedEncoding;
+    }
+    if (name_length > kMaxTypeNameBytes ||
+        name_length > static_cast<std::uint64_t>(end - cursor)) {
+        return CodecStatus::kUnsupportedEncoding;
+    }
+    cursor += static_cast<std::size_t>(name_length);
+    std::uint64_t payload_length = 0;
+    if (!ReadVarintPtr(cursor, end, payload_length)) {
+        return CodecStatus::kUnsupportedEncoding;
+    }
+    if (payload_length > kMaxBufferBytes ||
+        payload_length > static_cast<std::uint64_t>(end - cursor)) {
+        return CodecStatus::kUnsupportedEncoding;
+    }
+    const std::uint8_t* const payload_end = cursor + static_cast<std::size_t>(payload_length);
+    Value temp{};
+    if (!DeserializeCompact(cursor, payload_end, temp) || cursor != payload_end) {
+        // 载荷坏/截断：交给通用路径产生精确错误码。
+        return CodecStatus::kUnsupportedEncoding;
+    }
+    out = std::move(temp);
+    if (consumed != nullptr) {
+        *consumed = static_cast<std::size_t>(payload_end - data);
+    }
+    return CodecStatus::kOk;
+}
+
+/// @brief 文本消息直写：先按上界 resize，再逐字段写（无中间 payload 串）。
+/// @return 只有 `kOk`（已写完）与 `kUnsupportedEncoding`（不适用，调用方回退）。
+template <typename T>
+CodecStatus EncodeTextFast(const T& value, std::vector<std::uint8_t>& out) {
+    using Value = std::remove_cv_t<std::remove_reference_t<T>>;
+    if constexpr (!HasFieldList<Value>::value) {
+        (void)value;
+        (void)out;
+        return CodecStatus::kUnsupportedEncoding;
+    } else {
+        const std::size_t payload_estimate = EstimateJson(value);
+        if (payload_estimate == std::numeric_limits<std::size_t>::max()) {
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        const char* const type_name = TypeNameOf<Value>();
+        const std::size_t type_name_size = std::strlen(type_name);
+        // 固定部分：{"v":1,"id": + id(<=10) + ,"type":" + name + ","payload": + } = 34 字节
+        constexpr std::size_t kFixedBytes = 34 + 10;
+        if (payload_estimate > kMaxBufferBytes ||
+            type_name_size > kMaxBufferBytes - payload_estimate - kFixedBytes) {
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        const std::size_t total = kFixedBytes + type_name_size + payload_estimate;
+        try {
+            out.clear();
+            out.resize(total);
+        } catch (const std::bad_alloc&) {
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        JsonByteWriter writer(out);
+        writer.Put("{\"v\":1,\"id\":", 12);
+        char id_buffer[16] = {};
+        const auto id_result = std::to_chars(id_buffer, id_buffer + sizeof(id_buffer),
+                                             TypeIdOf<Value>());
+        if (id_result.ec != std::errc()) {
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        writer.Put(id_buffer, static_cast<std::size_t>(id_result.ptr - id_buffer));
+        writer.Put(",\"type\":\"", 9);
+        writer.Put(type_name, type_name_size);
+        writer.Put("\",\"payload\":", 12);
+        AppendJson(value, writer);
+        writer.Put('}');
+        if (!writer.ok() || writer.size() > kMaxBufferBytes) {
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        out.resize(writer.size());
+        return CodecStatus::kOk;
+    }
+}
+
+/// @brief 文本消息直读：单遍扫描 envelope + payload，不建 JSON 树。
+/// @return `kOk` 表示已解码；`kBadPayload` 表示载荷字段不合法；
+///         `kUnsupportedEncoding` 表示不适用（调用方回退建树路径拿准确错误码）。
+template <typename T>
+CodecStatus DecodeTextDirect(const std::uint8_t* data, std::size_t size, T& out,
+                             std::size_t* consumed) {
+    using Value = std::remove_cv_t<std::remove_reference_t<T>>;
+    if constexpr (!HasFieldList<Value>::value) {
+        (void)data;
+        (void)size;
+        (void)out;
+        (void)consumed;
+        return CodecStatus::kUnsupportedEncoding;
+    } else {
+        std::string_view text(reinterpret_cast<const char*>(data), size);
+        DirectReader reader(text);
+        reader.SkipWhitespace();
+        if (!reader.Consume('{')) {
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        std::int64_t version = 0;
+        std::uint64_t type_id = 0;
+        std::string_view type_name;
+        bool has_version = false;
+        bool has_id = false;
+        bool has_type = false;
+        bool type_escaped = false;
+        bool has_payload = false;
+        Value temp{};
+        reader.SkipWhitespace();
+        if (reader.Consume('}')) {
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        for (;;) {
+            reader.SkipWhitespace();
+            std::string_view key;
+            bool key_escaped = false;
+            if (!reader.ScanString(key, key_escaped)) {
+                return CodecStatus::kUnsupportedEncoding;
+            }
+            reader.SkipWhitespace();
+            if (!reader.Consume(':')) {
+                return CodecStatus::kUnsupportedEncoding;
+            }
+            reader.SkipWhitespace();
+            if (!key_escaped && key == "v") {
+                if (!reader.ReadInt64(version)) {
+                    return CodecStatus::kUnsupportedEncoding;
+                }
+                has_version = true;
+            } else if (!key_escaped && key == "id") {
+                if (!reader.ReadUint64(type_id)) {
+                    return CodecStatus::kUnsupportedEncoding;
+                }
+                has_id = true;
+            } else if (!key_escaped && key == "type") {
+                if (!reader.ScanString(type_name, type_escaped)) {
+                    return CodecStatus::kUnsupportedEncoding;
+                }
+                has_type = true;
+            } else if (!key_escaped && key == "payload") {
+                if (!ReadJsonDirect(reader, temp)) {
+                    // 类型不匹配（名字与 id 都不对）时优先交给通用路径给出
+                    // kTypeMismatch/kUnknownType——旧实现先校验类型再读载荷。
+                    const bool current_name_ok =
+                        has_type && !type_escaped &&
+                        type_name == std::string_view(TypeNameOf<Value>());
+                    const bool current_id_ok =
+                        has_id && static_cast<TypeId>(type_id) == TypeIdOf<Value>();
+                    if (!current_name_ok && !current_id_ok) {
+                        return CodecStatus::kUnsupportedEncoding;
+                    }
+                    return reader.status() == CodecStatus::kBadPayload
+                               ? CodecStatus::kBadPayload
+                               : CodecStatus::kUnsupportedEncoding;
+                }
+                has_payload = true;
+            } else if (!reader.SkipValue()) {
+                return CodecStatus::kUnsupportedEncoding;
+            }
+            reader.SkipWhitespace();
+            if (reader.Consume('}')) {
+                break;
+            }
+            if (!reader.Consume(',')) {
+                return CodecStatus::kUnsupportedEncoding;
+            }
+        }
+        reader.SkipWhitespace();
+        if (!reader.AtEnd()) {
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        if (!has_version || !has_id || !has_payload) {
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        constexpr std::int64_t kTextVersionValue = 1;
+        if (version != kTextVersionValue) {
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        if (type_id > static_cast<std::uint64_t>(std::numeric_limits<TypeId>::max())) {
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        const bool name_ok =
+            has_type && !type_escaped && type_name == std::string_view(TypeNameOf<Value>());
+        const bool id_ok = static_cast<TypeId>(type_id) == TypeIdOf<Value>();
+        if (!name_ok && !id_ok) {
+            // 类型不匹配/未知类型：交给建树路径给出 kTypeMismatch/kUnknownType。
+            return CodecStatus::kUnsupportedEncoding;
+        }
+        out = std::move(temp);
+        if (consumed != nullptr) {
+            *consumed = reader.position();
+        }
+        return CodecStatus::kOk;
+    }
+}
+
 /// @brief 把已解析的外层载荷解码为目标类型。
 /// @note `envelope` 按非 const 引用传入：二进制模式下 payload 会被 move 进
 ///       解码 Buffer（旧实现是整段复制一次），调用方传入局部 Envelope 即可。
@@ -118,6 +370,20 @@ CodecStatus DecodeEnvelopeValue(Envelope& envelope, T& out) {
         Buffer in = std::move(envelope.payload);
         Value temp{};
         CodecStatus status = CodecStatus::kOk;
+        if (envelope.compact) {
+            // 兼容路径里的紧凑载荷：仍是零拷贝指针解码，只是载荷已经落进
+            // Envelope::payload（通用入口需要精确错误码）。
+            const std::uint8_t* cursor = in.size() == 0 ? nullptr : in.data().data();
+            const std::uint8_t* end = in.size() == 0 ? nullptr : in.data().data() + in.size();
+            if (!DeserializeCompact(cursor, end, temp)) {
+                return CodecStatus::kBadPayload;
+            }
+            if (cursor != end) {
+                return CodecStatus::kBadPayload;
+            }
+            out = std::move(temp);
+            return CodecStatus::kOk;
+        }
         if constexpr (HasFieldList<Value>::value) {
             status = DeserializeReflect(in, temp);
         } else if constexpr (TypeTraits<Value>::kBuiltin) {
@@ -178,12 +444,14 @@ class ReflectCodec {
     template <typename T>
     static CodecStatus Encode(const T& value, std::vector<std::uint8_t>& out,
                               Encoding encoding = Encoding::kBinary,
-                              Compression compression = Compression::kNone);
+                              Compression compression = Compression::kNone,
+                              WireFormat wire_format = WireFormat::kCompact);
 
     /// @brief 编码为完整消息字节；失败返回空 vector。
     template <typename T>
     static std::vector<std::uint8_t> Encode(const T& value, Encoding encoding = Encoding::kBinary,
-                                            Compression compression = Compression::kNone);
+                                            Compression compression = Compression::kNone,
+                                            WireFormat wire_format = WireFormat::kCompact);
 
     /**
      * @brief 从字节流解码。
@@ -214,15 +482,23 @@ class ReflectCodec {
 
 template <typename T>
 CodecStatus ReflectCodec::Encode(const T& value, std::vector<std::uint8_t>& out, Encoding encoding,
-                                 Compression compression) {
+                                 Compression compression, WireFormat wire_format) {
     using Value = std::remove_cv_t<std::remove_reference_t<T>>;
     out.clear();
     Buffer payload;
+    const bool compact = encoding == Encoding::kBinary && wire_format == WireFormat::kCompact;
     if (encoding == Encoding::kBinary) {
-        if (!Serialize(value, payload)) {
+        const bool ok = compact ? SerializeCompact(value, payload) : Serialize(value, payload);
+        if (!ok) {
             return CodecStatus::kBadPayload;
         }
     } else {
+        // 快速直写：一次 resize + 裸指针写，成功就不再有中间 payload 串。
+        const CodecStatus fast = detail::EncodeTextFast(value, out);
+        if (fast == CodecStatus::kOk) {
+            return fast;
+        }
+        out.clear();
         std::string text;
         JsonWriter writer(text);
         if (!WriteJson(value, writer) || !writer.ok()) {
@@ -233,20 +509,33 @@ CodecStatus ReflectCodec::Encode(const T& value, std::vector<std::uint8_t>& out,
         }
     }
     return detail::EncodeEnvelope(TypeIdOf<Value>(), TypeNameOf<Value>(), encoding, compression,
-                                  payload, out);
+                                  payload, out, compact);
 }
 
 template <typename T>
 std::vector<std::uint8_t> ReflectCodec::Encode(const T& value, Encoding encoding,
-                                               Compression compression) {
+                                               Compression compression, WireFormat wire_format) {
     std::vector<std::uint8_t> out;
-    (void)Encode(value, out, encoding, compression);
+    (void)Encode(value, out, encoding, compression, wire_format);
     return out;
 }
 
 template <typename T>
 CodecStatus ReflectCodec::Decode(const std::uint8_t* data, std::size_t size, T& out,
                                  std::size_t* consumed) {
+    if (data == nullptr) {
+        return CodecStatus::kInvalidArgument;
+    }
+    // 快路径：紧凑 + 未压缩 + 类型 id 命中时，不构造 Envelope、不复制载荷。
+    const CodecStatus fast = detail::DecodeBinaryCompact<T>(data, size, out, consumed);
+    if (fast != CodecStatus::kUnsupportedEncoding) {
+        return fast;
+    }
+    // 文本快路径：单遍直读，不建 JSON 树。
+    const CodecStatus text_fast = detail::DecodeTextDirect<T>(data, size, out, consumed);
+    if (text_fast != CodecStatus::kUnsupportedEncoding) {
+        return text_fast;
+    }
     Envelope envelope;
     const CodecStatus status = detail::DecodeEnvelope(data, size, envelope, consumed);
     if (status != CodecStatus::kOk) {

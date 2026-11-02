@@ -28,6 +28,7 @@
  */
 
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -38,6 +39,8 @@
 namespace go2cpp::reflect {
 
 class JsonWriter;
+class JsonByteWriter;
+class DirectReader;
 struct JsonValue;
 
 // 字段编解码回调通过这四个模板把工作委托给具体类型；定义在
@@ -50,6 +53,16 @@ template <typename T>
 bool WriteJson(const T& value, JsonWriter& out);
 template <typename T>
 bool ReadJson(const JsonValue& json, T& value);
+template <typename T>
+bool SerializeCompact(const T& value, Buffer& out);
+template <typename T>
+bool DeserializeCompact(const std::uint8_t*& cursor, const std::uint8_t* end, T& value);
+template <typename T>
+std::size_t EstimateJson(const T& value);
+template <typename T>
+void AppendJson(const T& value, JsonByteWriter& out);
+template <typename T>
+bool ReadJsonDirect(DirectReader& reader, T& value);
 
 /**
  * @brief 单字段的四类操作。
@@ -62,10 +75,20 @@ struct FieldOps {
     bool (*encode)(const void* object, Buffer& out);
     /// 二进制解码：写入 `object` 指向的结构体。
     bool (*decode)(Buffer& in, void* object);
+    /// 二进制紧凑编码：只写字段号 + 值，字段名/类型由本地 schema 还原。
+    bool (*encode_compact)(const void* object, Buffer& out);
+    /// 二进制紧凑解码：按字段号直接写值（指针游标，零拷贝）。
+    bool (*decode_compact)(const std::uint8_t*& cursor, const std::uint8_t* end, void* object);
     /// 文本编码（JSON）。
     bool (*write_text)(const void* object, JsonWriter& out);
     /// 文本解码（JSON）。
     bool (*read_text)(const JsonValue& json, void* object);
+    /// 文本编码的字节数上界（快速直写用）。
+    std::size_t (*estimate_text)(const void* object);
+    /// 文本编码直写（已按上界预留容量）。
+    void (*write_text_fast)(const void* object, JsonByteWriter& out);
+    /// 文本直读（不建树，直接写值）。
+    bool (*read_text_direct)(DirectReader& reader, void* object);
 };
 
 /**
@@ -73,6 +96,7 @@ struct FieldOps {
  */
 struct FieldDescriptor {
     const char* name;    ///< 字段名（字符串字面量，进程生命周期）。
+    std::size_t name_size;  ///< 字段名字节数（编译期常量，热路径免 strlen）。
     TypeId type_id;      ///< 字段类型的 TypeId。
     std::size_t offset;  ///< 相对结构体起始地址的字节偏移。
     std::size_t size;    ///< `sizeof(字段类型)`。
@@ -179,7 +203,8 @@ const FieldDescriptor* FindField(std::string_view name, std::size_t* index = nul
  */
 #define GO2CPP_REFLECT_FIELD(Class, member)                                                        \
     ::go2cpp::reflect::FieldDescriptor {                                                           \
-        #member, ::go2cpp::reflect::TypeIdOf<decltype(Class::member)>(),                           \
+        #member, sizeof(#member) - 1,                                                          \
+            ::go2cpp::reflect::TypeIdOf<decltype(Class::member)>(),                                \
             ::go2cpp::reflect::FieldOffset(&Class::member), sizeof(decltype(Class::member)),       \
             ::go2cpp::reflect::FieldOps {                                                          \
             [](const void* object, ::go2cpp::reflect::Buffer& out) -> bool {                       \
@@ -190,12 +215,31 @@ const FieldDescriptor* FindField(std::string_view name, std::size_t* index = nul
                     return ::go2cpp::reflect::Deserialize(in,                                      \
                                                           static_cast<Class*>(object)->member);    \
                 },                                                                                 \
+                [](const void* object, ::go2cpp::reflect::Buffer& out) -> bool {                   \
+                    return ::go2cpp::reflect::SerializeCompact(                                    \
+                        static_cast<const Class*>(object)->member, out);                           \
+                },                                                                                 \
+                [](const std::uint8_t*& cursor, const std::uint8_t* end, void* object) -> bool {   \
+                    return ::go2cpp::reflect::DeserializeCompact(                                  \
+                        cursor, end, static_cast<Class*>(object)->member);                         \
+                },                                                                                 \
                 [](const void* object, ::go2cpp::reflect::JsonWriter& out) -> bool {               \
                     return ::go2cpp::reflect::WriteJson(static_cast<const Class*>(object)->member, \
                                                         out);                                      \
                 },                                                                                 \
                 [](const ::go2cpp::reflect::JsonValue& json, void* object) -> bool {               \
                     return ::go2cpp::reflect::ReadJson(json, static_cast<Class*>(object)->member); \
+                },                                                                                 \
+                [](const void* object) -> std::size_t {                                            \
+                    return ::go2cpp::reflect::EstimateJson(                                        \
+                        static_cast<const Class*>(object)->member);                                \
+                },                                                                                 \
+                [](const void* object, ::go2cpp::reflect::JsonByteWriter& out) {                   \
+                    ::go2cpp::reflect::AppendJson(static_cast<const Class*>(object)->member, out); \
+                },                                                                                 \
+                [](::go2cpp::reflect::DirectReader& reader, void* object) -> bool {                \
+                    return ::go2cpp::reflect::ReadJsonDirect(                                      \
+                        reader, static_cast<Class*>(object)->member);                              \
                 }                                                                                  \
         }                                                                                          \
     }

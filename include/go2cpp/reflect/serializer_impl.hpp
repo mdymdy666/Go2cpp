@@ -191,6 +191,208 @@ CodecStatus DeserializeReflect(Buffer& in, T& value) {
     return CodecStatus::kOk;
 }
 
+/// @brief 指针版 varint 读取（紧凑格式零拷贝解码用，规则与 Buffer 一致）。
+inline bool ReadVarintPtr(const std::uint8_t*& cursor, const std::uint8_t* end,
+                          std::uint64_t& value) noexcept {
+    std::uint64_t result = 0;
+    unsigned shift = 0;
+    for (std::size_t index = 0; index < kMaxVarintBytes; ++index) {
+        if (cursor >= end) {
+            return false;
+        }
+        const std::uint8_t byte = *cursor++;
+        if (index == kMaxVarintBytes - 1 && byte > 1u) {
+            return false;
+        }
+        result |= static_cast<std::uint64_t>(byte & 0x7fu) << shift;
+        if ((byte & 0x80u) == 0) {
+            value = result;
+            return true;
+        }
+        shift += 7;
+    }
+    return false;
+}
+
+/// @brief 紧凑格式的内置类型解码：直接写指针游标，不经过 Buffer。
+template <typename T>
+bool DecodeCompactBuiltin(const std::uint8_t*& cursor, const std::uint8_t* end, T& value) {
+    if constexpr (std::is_same_v<T, bool>) {
+        if (cursor >= end) {
+            return false;
+        }
+        const std::uint8_t byte = *cursor++;
+        if (byte > 1u) {
+            return false;
+        }
+        value = byte != 0;
+        return true;
+    } else if constexpr (std::is_integral_v<T>) {
+        std::uint64_t raw = 0;
+        if (!ReadVarintPtr(cursor, end, raw)) {
+            return false;
+        }
+        if constexpr (std::is_signed_v<T>) {
+            const std::int64_t decoded = static_cast<std::int64_t>(raw >> 1) ^
+                                         -static_cast<std::int64_t>(raw & 1u);
+            if (decoded < static_cast<std::int64_t>(std::numeric_limits<T>::min()) ||
+                decoded > static_cast<std::int64_t>(std::numeric_limits<T>::max())) {
+                return false;
+            }
+            value = static_cast<T>(decoded);
+        } else {
+            if (raw > static_cast<std::uint64_t>(std::numeric_limits<T>::max())) {
+                return false;
+            }
+            value = static_cast<T>(raw);
+        }
+        return true;
+    } else if constexpr (std::is_same_v<T, double>) {
+        if (end - cursor < 8) {
+            return false;
+        }
+        std::uint64_t bits = 0;
+        for (std::size_t index = 0; index < 8; ++index) {
+            bits |= static_cast<std::uint64_t>(cursor[index]) << (8 * index);
+        }
+        cursor += 8;
+        std::memcpy(&value, &bits, sizeof(value));
+        return true;
+    } else if constexpr (std::is_same_v<T, std::string>) {
+        std::uint64_t length = 0;
+        if (!ReadVarintPtr(cursor, end, length)) {
+            return false;
+        }
+        if (length > kMaxStringBytes ||
+            length > static_cast<std::uint64_t>(end - cursor)) {
+            return false;
+        }
+        try {
+            value.assign(reinterpret_cast<const char*>(cursor), static_cast<std::size_t>(length));
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        cursor += static_cast<std::size_t>(length);
+        return true;
+    } else if constexpr (std::is_same_v<T, std::vector<std::uint8_t>>) {
+        std::uint64_t length = 0;
+        if (!ReadVarintPtr(cursor, end, length)) {
+            return false;
+        }
+        if (length > kMaxBlobBytes || length > static_cast<std::uint64_t>(end - cursor)) {
+            return false;
+        }
+        try {
+            value.resize(static_cast<std::size_t>(length));
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        if (length != 0) {
+            std::memcpy(value.data(), cursor, static_cast<std::size_t>(length));
+        }
+        cursor += static_cast<std::size_t>(length);
+        return true;
+    } else {
+        static_assert(kAlwaysFalse<T>, "unsupported builtin type for compact codec");
+    }
+}
+
+/// @brief 紧凑格式前缀（count + 全部字段号）的线上字节，按类型缓存一次。
+/// @details 字段号序列是编译期常量；缓存后编码只需一次 `PutBytes`，
+///          不必为每个字段调用一次 `PutVarint`。
+template <typename T>
+const std::vector<std::uint8_t>& CompactFieldPrefix() {
+    static const std::vector<std::uint8_t> prefix = [] {
+        std::size_t count = 0;
+        (void)FieldList<T>::Fields(count);
+        Buffer buffer;
+        if (!buffer.PutVarint(static_cast<std::uint64_t>(count))) {
+            return std::vector<std::uint8_t>{};
+        }
+        for (std::size_t index = 0; index < count; ++index) {
+            if (!buffer.PutVarint(static_cast<std::uint64_t>(index))) {
+                return std::vector<std::uint8_t>{};
+            }
+        }
+        return std::move(buffer.data());
+    }();
+    return prefix;
+}
+
+/// @brief 紧凑格式：只写字段号 + 值；字段名/类型由本地 schema 还原。
+/// @details 载荷布局为「varint 字段数 + 全部字段号 + 全部值」。字段号必须
+///          严格递增；解码端按字段号直接索引本地字段表，不做字符串比较，
+///          因此报文的 schema 必须与发送端一致。
+template <typename T>
+bool SerializeReflectCompact(const T& value, Buffer& out) {
+    std::size_t count = 0;
+    const FieldDescriptor* fields = FieldList<T>::Fields(count);
+    if (count > kMaxReflectFields) {
+        return false;
+    }
+    const std::vector<std::uint8_t>& prefix = CompactFieldPrefix<T>();
+    if (prefix.empty()) {
+        return false;
+    }
+    // 紧凑前缀只有 1~2 字节/字段；若不预留，vector 会从 5 字节开始反复扩容
+    // （5→10→20→40…），单这一项就比自描述格式多 20 ns。按每字段 16 字节
+    // 预留一个保守上界，一次性分配到位。
+    out.Reserve(prefix.size() + count * 16 + 16);
+    if (!out.PutBytes(prefix.data(), prefix.size())) {
+        return false;
+    }
+    for (std::size_t index = 0; index < count; ++index) {
+        if (!fields[index].ops.encode_compact(&value, out)) {
+            return false;
+        }
+    }
+    return out.ok();
+}
+
+/// @brief 紧凑格式解码：按字段号直接写成员，全程零拷贝（字符串除外，需分配）。
+template <typename T>
+bool DeserializeCompactReflect(const std::uint8_t*& cursor, const std::uint8_t* end, T& value) {
+    std::uint64_t count = 0;
+    if (!ReadVarintPtr(cursor, end, count)) {
+        return false;
+    }
+    std::size_t local_count = 0;
+    const FieldDescriptor* fields = FieldList<T>::Fields(local_count);
+    // 线上字段数多于本地：发送端 schema 与本地不一致，直接拒绝。
+    if (count > kMaxReflectFields || count > local_count) {
+        return false;
+    }
+    std::array<std::uint64_t, 32> inline_tags{};
+    std::vector<std::uint64_t> heap_tags;
+    std::uint64_t* tags = inline_tags.data();
+    if (count > inline_tags.size()) {
+        try {
+            heap_tags.resize(static_cast<std::size_t>(count));
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
+        tags = heap_tags.data();
+    }
+    std::uint64_t last = 0;
+    for (std::uint64_t index = 0; index < count; ++index) {
+        std::uint64_t tag = 0;
+        if (!ReadVarintPtr(cursor, end, tag)) {
+            return false;
+        }
+        if (tag >= local_count || (index > 0 && tag <= last)) {
+            return false;
+        }
+        last = tag;
+        tags[index] = tag;
+    }
+    for (std::uint64_t index = 0; index < count; ++index) {
+        if (!fields[tags[index]].ops.decode_compact(cursor, end, &value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template <typename T>
 bool WriteJsonReflect(const T& value, JsonWriter& out) {
     std::size_t count = 0;
@@ -495,4 +697,39 @@ bool ReadJson(const JsonValue& json, T& value) {
     }
 }
 
+/// @brief 紧凑二进制序列化：字段名/类型不落盘，靠 schema 还原。
+/// @note 与 `Serialize` 的自描述格式互不兼容；`DeserializeCompact` 只认紧凑格式。
+template <typename T>
+bool SerializeCompact(const T& value, Buffer& out) {
+    using Value = std::remove_cv_t<std::remove_reference_t<T>>;
+    if constexpr (HasFieldList<Value>::value) {
+        return detail::SerializeReflectCompact(value, out);
+    } else if constexpr (TypeTraits<Value>::kBuiltin) {
+        // 内置类型的 Buffer 失败位由 Put* 自己维护，无额外的 ok/Fail 包装。
+        return Serializer<Value>::Serialize(value, out);
+    } else {
+        return false;
+    }
+}
+
+/// @brief 紧凑二进制反序列化：成功后才覆盖 `value`（失败时保持原值）。
+template <typename T>
+bool DeserializeCompact(const std::uint8_t*& cursor, const std::uint8_t* end, T& value) {
+    using Value = std::remove_cv_t<std::remove_reference_t<T>>;
+    Value temp{};
+    bool ok = false;
+    if constexpr (HasFieldList<Value>::value) {
+        ok = detail::DeserializeCompactReflect(cursor, end, temp);
+    } else if constexpr (TypeTraits<Value>::kBuiltin) {
+        ok = detail::DecodeCompactBuiltin(cursor, end, temp);
+    }
+    if (!ok) {
+        return false;
+    }
+    value = std::move(temp);
+    return true;
+}
+
 }  // namespace go2cpp::reflect
+
+#include "go2cpp/reflect/json_direct.hpp"

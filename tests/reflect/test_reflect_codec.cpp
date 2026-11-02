@@ -306,9 +306,10 @@ std::vector<std::uint8_t> ToBytes(std::string_view text) {
 
 template <typename T>
 std::vector<std::uint8_t> EncodeBytes(const T& value, Encoding encoding = Encoding::kBinary,
-                                      Compression compression = Compression::kNone) {
+                                      Compression compression = Compression::kNone,
+                                      WireFormat wire_format = WireFormat::kCompact) {
     std::vector<std::uint8_t> bytes;
-    const CodecStatus status = ReflectCodec::Encode(value, bytes, encoding, compression);
+    const CodecStatus status = ReflectCodec::Encode(value, bytes, encoding, compression, wire_format);
     CHECK_TRUE(status == CodecStatus::kOk);
     return bytes;
 }
@@ -344,11 +345,11 @@ void CheckBuiltinRoundTrip(const T& value) {
 /// @brief 手工拼一条二进制 Reflect 消息（用于构造异常/未知类型输入）。
 std::vector<std::uint8_t> MakeBinaryEnvelope(TypeId type_id, std::string_view type_name,
                                              const std::vector<std::uint8_t>& payload,
-                                             bool compressed = false) {
+                                             bool compressed = false, bool compact = false) {
     Buffer buffer;
     CHECK_TRUE(buffer.PutBytes("G2RF", 4));
     CHECK_TRUE(buffer.PutU8(1));
-    CHECK_TRUE(buffer.PutU8(compressed ? 1u : 0u));
+    CHECK_TRUE(buffer.PutU8((compressed ? 1u : 0u) | (compact ? 2u : 0u)));
     CHECK_TRUE(buffer.PutVarint(type_id));
     CHECK_TRUE(buffer.PutString(type_name));
     CHECK_TRUE(buffer.PutVarint(static_cast<std::uint64_t>(payload.size())));
@@ -663,8 +664,9 @@ void TestStructBinaryRoundTrip() {
     CHECK_TRUE(BinaryRoundTrip(config) == config);
     CHECK_TRUE(BinaryRoundTrip(config, Compression::kRle) == config);
 
-    // 字段名在整条消息里只应出现一次（字段表），不会每个字段重复。
-    const std::vector<std::uint8_t> bytes = EncodeBytes(login, Encoding::kBinary);
+    // 字段名在整条消息里只应出现一次（自描述格式的字段表）；紧凑格式没有字段名。
+    const std::vector<std::uint8_t> bytes =
+        EncodeBytes(login, Encoding::kBinary, Compression::kNone, WireFormat::kSelfDescribed);
     const std::string raw = ToText(bytes);
     CHECK_EQ(CountOccurrences(raw, "user"), std::size_t{1});
     CHECK_EQ(CountOccurrences(raw, "token"), std::size_t{1});
@@ -683,6 +685,104 @@ void TestStructBinaryRoundTrip() {
     Buffer empty;
     CHECK_TRUE(!Deserialize(empty, target));
     CHECK_TRUE(target.user == "keep");
+}
+
+// ---------------------------------------------------------------------------
+// 5b. 紧凑二进制格式（只带字段号，字段名/类型由 schema 还原）
+// ---------------------------------------------------------------------------
+
+void TestCompactWireFormat() {
+    const testmsg::LoginRequest login = MakeLogin();
+
+    // ① 默认编码是紧凑格式：flags bit1 置位，载荷里没有字段名。
+    const std::vector<std::uint8_t> compact = EncodeBytes(login, Encoding::kBinary);
+    CHECK_TRUE((compact[5] & kFlagCompactPayload) != 0);
+    const std::string compact_raw = ToText(compact);
+    CHECK_EQ(CountOccurrences(compact_raw, "user"), std::size_t{0});
+    CHECK_EQ(CountOccurrences(compact_raw, "token"), std::size_t{0});
+    CHECK_EQ(CountOccurrences(compact_raw, "timestamp"), std::size_t{0});
+    CHECK_EQ(CountOccurrences(compact_raw, "remember"), std::size_t{0});
+
+    // ② 自描述格式仍可显式使用（旧线上格式），不带紧凑位、带字段表。
+    const std::vector<std::uint8_t> described =
+        EncodeBytes(login, Encoding::kBinary, Compression::kNone, WireFormat::kSelfDescribed);
+    CHECK_TRUE((described[5] & kFlagCompactPayload) == 0);
+    const std::string described_raw = ToText(described);
+    CHECK_EQ(CountOccurrences(described_raw, "user"), std::size_t{1});
+    CHECK_EQ(CountOccurrences(described_raw, "token"), std::size_t{1});
+    CHECK_EQ(CountOccurrences(described_raw, "timestamp"), std::size_t{1});
+    CHECK_EQ(CountOccurrences(described_raw, "remember"), std::size_t{1});
+
+    // ③ 紧凑格式每字段省掉「名字 + TypeId」：4 字段至少省 20 字节。
+    CHECK_TRUE(compact.size() + 20 <= described.size());
+
+    // ④ 两种格式都能被当前解码器读取（新解码器兼容旧数据）。
+    testmsg::LoginRequest from_compact;
+    CHECK_TRUE(ReflectCodec::Decode(compact, from_compact) == CodecStatus::kOk);
+    CHECK_TRUE(from_compact == login);
+    testmsg::LoginRequest from_described;
+    CHECK_TRUE(ReflectCodec::Decode(described, from_described) == CodecStatus::kOk);
+    CHECK_TRUE(from_described == login);
+
+    // ⑤ 解码后再编码逐字节一致（幂等，无隐藏状态）。
+    std::vector<std::uint8_t> re_compact;
+    CHECK_TRUE(ReflectCodec::Encode(from_compact, re_compact) == CodecStatus::kOk);
+    CHECK_TRUE(re_compact == compact);
+    std::vector<std::uint8_t> re_described;
+    CHECK_TRUE(ReflectCodec::Encode(from_described, re_described, Encoding::kBinary,
+                                    Compression::kNone, WireFormat::kSelfDescribed) ==
+               CodecStatus::kOk);
+    CHECK_TRUE(re_described == described);
+
+    // ⑥ 新旧格式互转：自描述 -> 解码 -> 紧凑编码 -> 解码，值不变。
+    std::vector<std::uint8_t> converted;
+    CHECK_TRUE(ReflectCodec::Encode(from_described, converted) == CodecStatus::kOk);
+    testmsg::LoginRequest converted_back;
+    CHECK_TRUE(ReflectCodec::Decode(converted, converted_back) == CodecStatus::kOk);
+    CHECK_TRUE(converted_back == login);
+
+    // ⑦ 紧凑 + RLE 压缩共存（flags 两位同时置位）。
+    const std::vector<std::uint8_t> packed =
+        EncodeBytes(login, Encoding::kBinary, Compression::kRle);
+    testmsg::LoginRequest from_packed;
+    CHECK_TRUE(ReflectCodec::Decode(packed, from_packed) == CodecStatus::kOk);
+    CHECK_TRUE(from_packed == login);
+
+    // ⑧ 嵌套结构体递归使用紧凑格式，且比自描述短。
+    const testmsg::ServerConfig config = MakeConfig();
+    const std::vector<std::uint8_t> config_compact = EncodeBytes(config, Encoding::kBinary);
+    const std::vector<std::uint8_t> config_described =
+        EncodeBytes(config, Encoding::kBinary, Compression::kNone, WireFormat::kSelfDescribed);
+    CHECK_TRUE(config_compact.size() < config_described.size());
+    testmsg::ServerConfig config_out;
+    CHECK_TRUE(ReflectCodec::Decode(config_compact, config_out) == CodecStatus::kOk);
+    CHECK_TRUE(config_out == config);
+
+    // ⑨ 错误路径与自描述一致：类型不匹配、截断、坏 tag、字段数超界。
+    testmsg::Wrong wrong;
+    CHECK_TRUE(ReflectCodec::Decode(compact, wrong) == CodecStatus::kTypeMismatch);
+    std::vector<std::uint8_t> truncated(compact.begin(), compact.end() - 1);
+    testmsg::LoginRequest truncated_out;
+    CHECK_TRUE(ReflectCodec::Decode(truncated, truncated_out) == CodecStatus::kTruncated);
+
+    const std::vector<std::uint8_t> bad_tag =
+        MakeBinaryEnvelope(kLoginType, "LoginRequest", {4, 9}, false, true);
+    testmsg::LoginRequest ignored;
+    CHECK_TRUE(ReflectCodec::Decode(bad_tag, ignored) == CodecStatus::kBadPayload);
+
+    const std::vector<std::uint8_t> too_many =
+        MakeBinaryEnvelope(kLoginType, "LoginRequest", {5}, false, true);
+    CHECK_TRUE(ReflectCodec::Decode(too_many, ignored) == CodecStatus::kBadPayload);
+
+    const std::vector<std::uint8_t> duplicate_tag =
+        MakeBinaryEnvelope(kLoginType, "LoginRequest", {2, 1, 0x01, 1, 0x01}, false, true);
+    CHECK_TRUE(ReflectCodec::Decode(duplicate_tag, ignored) == CodecStatus::kBadPayload);
+
+    // ⑩ 失败时目标对象不变（强保证）。
+    testmsg::LoginRequest keep = MakeLogin();
+    keep.user = "keep";
+    CHECK_TRUE(ReflectCodec::Decode(truncated, keep) == CodecStatus::kTruncated);
+    CHECK_TRUE(keep.user == "keep");
 }
 
 // ---------------------------------------------------------------------------
@@ -716,6 +816,118 @@ void TestTextFieldFormat() {
     const std::string compressed_text =
         ToText(EncodeBytes(chat, Encoding::kText, Compression::kRle));
     CHECK_TRUE(compressed_text.find("\"type\":\"ChatMessage\"") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// 6b. 文本快速路径：直写与建树一致、直读与建树语义一致
+// ---------------------------------------------------------------------------
+
+void TestTextFastPath() {
+    // ① 转义字符往返（引号/反斜杠/控制字符/中文/emoji）。
+    testmsg::ChatMessage escaped;
+    escaped.room = "room-\"quoted\"-\\slash";
+    escaped.sender = "发送者-中文";
+    escaped.text = std::string("line1\nline2\t") + "\x01" + " emoji-\xF0\x9F\x98\x80";
+    escaped.sent_at = -1730000000;
+    const std::vector<std::uint8_t> escaped_text = EncodeBytes(escaped, Encoding::kText);
+    const std::string escaped_raw = ToText(escaped_text);
+    CHECK_TRUE(escaped_raw.find("\\\"") != std::string::npos);
+    CHECK_TRUE(escaped_raw.find("\\\\") != std::string::npos);
+    CHECK_TRUE(escaped_raw.find("\\n") != std::string::npos);
+    CHECK_TRUE(escaped_raw.find("\\u0001") != std::string::npos);
+    testmsg::ChatMessage escaped_out;
+    CHECK_TRUE(ReflectCodec::Decode(escaped_text, escaped_out) == CodecStatus::kOk);
+    CHECK_TRUE(escaped_out == escaped);
+
+    // ② 直写结果与「JsonWriter + envelope 拼接」逐字节一致。
+    std::string payload_text;
+    {
+        JsonWriter writer(payload_text);
+        CHECK_TRUE(WriteJson(escaped, writer));
+    }
+    std::string expected = "{\"v\":1,\"id\":";
+    expected += std::to_string(TypeIdOf<testmsg::ChatMessage>());
+    expected += ",\"type\":\"";
+    expected += TypeNameOf<testmsg::ChatMessage>();
+    expected += "\",\"payload\":";
+    expected += payload_text;
+    expected += '}';
+    CHECK_TRUE(escaped_raw == expected);
+
+    // ③ 直读支持 \uXXXX 转义。
+    const std::string unicode_text =
+        R"({"v":1,"id":100,"type":"LoginRequest","payload":{"user":"\u4e2d\u6587","token":"a\u0062c","timestamp":1,"remember":true}})";
+    testmsg::LoginRequest unicode_login;
+    CHECK_TRUE(ReflectCodec::Decode(ToBytes(unicode_text), unicode_login) == CodecStatus::kOk);
+    CHECK_TRUE(unicode_login.user == "中文");
+    CHECK_TRUE(unicode_login.token == "abc");
+    CHECK_TRUE(unicode_login.timestamp == 1);
+    CHECK_TRUE(unicode_login.remember);
+
+    // ④ 未知字段整条拒绝（与建树路径一致）。
+    const std::string unknown_field =
+        R"({"v":1,"id":100,"type":"LoginRequest","payload":{"user":"a","unknown":1}})";
+    testmsg::LoginRequest target;
+    CHECK_TRUE(ReflectCodec::Decode(ToBytes(unknown_field), target) == CodecStatus::kBadPayload);
+
+    // ⑤ 重复键：kBadText。
+    const std::string duplicate =
+        R"({"v":1,"id":100,"type":"LoginRequest","payload":{"user":"a","user":"b"}})";
+    CHECK_TRUE(ReflectCodec::Decode(ToBytes(duplicate), target) == CodecStatus::kBadText);
+
+    // ⑥ 字段类型错误：kBadPayload。
+    const std::string wrong_type =
+        R"({"v":1,"id":100,"type":"LoginRequest","payload":{"timestamp":"nope"}})";
+    CHECK_TRUE(ReflectCodec::Decode(ToBytes(wrong_type), target) == CodecStatus::kBadPayload);
+
+    // ⑦ 数字越界：kBadPayload。
+    const std::string overflow =
+        R"({"v":1,"id":100,"type":"LoginRequest","payload":{"timestamp":99999999999999999999999}})";
+    CHECK_TRUE(ReflectCodec::Decode(ToBytes(overflow), target) == CodecStatus::kBadPayload);
+
+    // ⑧ payload 缺失：kBadText。
+    const std::string no_payload = R"({"v":1,"id":100,"type":"LoginRequest"})";
+    CHECK_TRUE(ReflectCodec::Decode(ToBytes(no_payload), target) == CodecStatus::kBadText);
+
+    // ⑨ id 未知但类型名匹配（改 id 兼容）：kOk。
+    const std::string renamed =
+        R"({"v":1,"id":9999,"type":"LoginRequest","payload":{"user":"alice"}})";
+    testmsg::LoginRequest renamed_out;
+    CHECK_TRUE(ReflectCodec::Decode(ToBytes(renamed), renamed_out) == CodecStatus::kOk);
+    CHECK_TRUE(renamed_out.user == "alice");
+
+    // ⑩ 尾随字符：kBadText。
+    const std::string trailing =
+        R"({"v":1,"id":100,"type":"LoginRequest","payload":{}} x)";
+    CHECK_TRUE(ReflectCodec::Decode(ToBytes(trailing), target) == CodecStatus::kBadText);
+
+    // ⑪ 缺字段保留默认值（文本模式允许），整体替换目标对象。
+    testmsg::LoginRequest defaults = MakeLogin();
+    const std::string partial =
+        R"({"v":1,"id":100,"type":"LoginRequest","payload":{"user":"only"}})";
+    CHECK_TRUE(ReflectCodec::Decode(ToBytes(partial), defaults) == CodecStatus::kOk);
+    CHECK_TRUE(defaults.user == "only");
+    CHECK_TRUE(defaults.token.empty());
+
+    // ⑫ 非有限浮点：文本编码拒绝（与旧路径一致）。
+    testmsg::PlayerState nan_state = MakePlayer();
+    nan_state.x = std::numeric_limits<double>::quiet_NaN();
+    std::vector<std::uint8_t> nan_bytes;
+    CHECK_TRUE(ReflectCodec::Encode(nan_state, nan_bytes, Encoding::kText) ==
+               CodecStatus::kUnsupportedEncoding);
+
+    // ⑬ double 边界值与 blob 字段的文本往返。
+    testmsg::PlayerState player = MakePlayer();
+    player.x = 1.5e-300;
+    player.y = -0.0;
+    CHECK_TRUE(TextRoundTrip(player) == player);
+
+    // ⑭ 文本消息的 forward 兼容：id 命中但类型名不同时仍接受。
+    const std::string id_only =
+        R"({"v":1,"id":100,"type":"RenamedLogin","payload":{"user":"bob"}})";
+    testmsg::LoginRequest id_out;
+    CHECK_TRUE(ReflectCodec::Decode(ToBytes(id_only), id_out) == CodecStatus::kOk);
+    CHECK_TRUE(id_out.user == "bob");
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,7 +1549,9 @@ int main() {
         {"BufferVarint", TestBufferVarint},
         {"BuiltinBinaryRoundTrip", TestBuiltinBinaryRoundTrip},
         {"StructBinaryRoundTrip", TestStructBinaryRoundTrip},
+        {"CompactWireFormat", TestCompactWireFormat},
         {"TextFieldFormat", TestTextFieldFormat},
+        {"TextFastPath", TestTextFastPath},
         {"FieldDescriptorAccess", TestFieldDescriptorAccess},
         {"RleCompression", TestRleCompression},
         {"FrameIntegration", TestFrameIntegration},
