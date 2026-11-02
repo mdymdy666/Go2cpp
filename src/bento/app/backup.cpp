@@ -30,7 +30,9 @@
 #include "go2cpp/bento/app/backup.hpp"
 
 #include "go2cpp/bento/app/detail/retry.hpp"
+#include "go2cpp/encoding/hex_core.hpp"
 #include "go2cpp/hash/sha256.hpp"
+#include "go2cpp/tools/strings.hpp"
 
 #include "go2cpp/os/proc.hpp"
 
@@ -70,38 +72,17 @@ constexpr std::chrono::seconds kMaxRetryDelay{30}; ///< 单次重试等待上限
 /// 临时包序号；只在同一进程内保证唯一（与 fetch/file_browser 的做法一致）。
 std::atomic<std::uint64_t> g_part_seq{0};
 
-/// 去掉首尾空白。
-std::string Trim(std::string_view text) {
-    std::size_t begin = 0;
-    std::size_t end = text.size();
-    while (begin < end && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
-        ++begin;
-    }
-    while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) {
-        --end;
-    }
-    return std::string(text.substr(begin, end - begin));
-}
+/// 去掉首尾空白（委托 `AsciiTrim`；C locale 的 `isspace` 集合与它一致）。
+std::string Trim(std::string_view text) { return AsciiTrim(text); }
 
-/// 大小写不敏感比较。
+/// 大小写不敏感比较（委托 `AsciiEqualIgnoreCase`）。
 bool EqualsIgnoreCase(std::string_view first, std::string_view second) {
-    if (first.size() != second.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < first.size(); ++i) {
-        const auto a = static_cast<unsigned char>(first[i]);
-        const auto b = static_cast<unsigned char>(second[i]);
-        if (std::tolower(a) != std::tolower(b)) {
-            return false;
-        }
-    }
-    return true;
+    return AsciiEqualIgnoreCase(first, second);
 }
 
-/// 判断是否以 prefix 开头（大小写不敏感）。
+/// 判断是否以 prefix 开头（大小写不敏感；委托 `AsciiHasPrefixIgnoreCase`）。
 bool StartsWithIgnoreCase(std::string_view text, std::string_view prefix) {
-    return text.size() >= prefix.size() &&
-           EqualsIgnoreCase(text.substr(0, prefix.size()), prefix);
+    return AsciiHasPrefixIgnoreCase(text, prefix);
 }
 
 /// 是否含 CR/LF/NUL 或其它控制字符。
@@ -447,13 +428,8 @@ bool HashFile(const fs::path& path, std::string* hex, std::uint64_t* bytes,
         *error = "SHA-256 计算失败";
         return false;
     }
-    static constexpr char kHexDigits[] = "0123456789abcdef";
-    std::string text(digest.size() * 2, '0');
-    for (std::size_t i = 0; i < digest.size(); ++i) {
-        text[i * 2] = kHexDigits[digest[i] >> 4];
-        text[i * 2 + 1] = kHexDigits[digest[i] & 0x0fu];
-    }
-    *hex = std::move(text);
+    *hex = encoding::hexcore::Encode(
+        std::string_view(reinterpret_cast<const char*>(digest.data()), digest.size()));
     *bytes = total;
     return true;
 }
@@ -557,22 +533,13 @@ bool NormalizeSha256(std::string_view raw, std::string* hex) {
     if (value.size() != 64) {
         return false;
     }
-    static constexpr char kHexDigits[] = "0123456789abcdef";
     std::string normalized(64, '0');
     for (std::size_t i = 0; i < 64; ++i) {
-        const char ch = value[i];
-        int digit = -1;
-        if (ch >= '0' && ch <= '9') {
-            digit = ch - '0';
-        } else if (ch >= 'a' && ch <= 'f') {
-            digit = ch - 'a' + 10;
-        } else if (ch >= 'A' && ch <= 'F') {
-            digit = ch - 'A' + 10;
-        }
+        const int digit = encoding::hexcore::HexValue(static_cast<unsigned char>(value[i]));
         if (digit < 0) {
             return false;
         }
-        normalized[i] = kHexDigits[digit];
+        normalized[i] = encoding::hexcore::kLowerHexDigits[digit];
     }
     *hex = std::move(normalized);
     return true;

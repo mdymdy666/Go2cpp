@@ -3,9 +3,10 @@
 /**
  * @file random.hpp
  * @brief P2P 模块使用的随机数工具（事务 ID、nonce、候选 foundation 等）。
- * @details 统一走 `getrandom(2)`，失败时退回 `/dev/urandom`，最后才用
- *          `std::random_device`。不用 `rand()`：STUN 事务 ID 与 TURN 请求 ID
- *          需要跨进程不重复，低熵源会显著提高碰撞概率。
+ * @details 唯一熵源是 `go::crypto::rand`（`getrandom(2)` 优先、`/dev/urandom`
+ *          兜底）；本文件只额外做「每线程 1 KiB 池化」，把 STUN 事务 ID /
+ *          TURN 请求 ID 的逐包系统调用摊薄。不用 `rand()`：这些 ID 需要跨进程
+ *          不重复，低熵源会显著提高碰撞概率。
  *
  * @author go2cpp contributors
  * @date 2026-10-31

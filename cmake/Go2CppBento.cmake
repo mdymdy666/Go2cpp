@@ -222,6 +222,11 @@ if (GO2CPP_WITH_BENTO)
         -Wall -Wextra -Wpedantic -Werror ${BENTO_OPT_FLAGS})
     target_link_libraries(go2cpp_bento_keystore
         PUBLIC go2cpp_bento_error Threads::Threads)
+    # base64 解码复用 encoding/base64（不再自写一套）；目标由 Go2CppModules.cmake
+    # 无条件定义，这里仍用 if(TARGET) 兜底，保证只构建 Bento 时不会因缺失目标失败。
+    if (TARGET go2cpp_encoding)
+        target_link_libraries(go2cpp_bento_keystore PUBLIC go2cpp_encoding)
+    endif()
     set_target_properties(go2cpp_bento_keystore PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_library(go2cpp::bento_keystore ALIAS go2cpp_bento_keystore)
 

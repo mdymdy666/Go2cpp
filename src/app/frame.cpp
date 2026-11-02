@@ -12,63 +12,29 @@
 #include <algorithm>
 #include <cstring>
 
+#include "go2cpp/network/endian.hpp"
+
 namespace go2cpp::app {
 namespace {
 
 /**
  * @brief 一次未对齐 32 位读 + 字节序转换（大端网络序 → 主机序）。
- * @details 旧实现逐字节 `movzx + shift + or`（4 次 load、3 次 shift、3 次 or），
- *          这里是 1 次 `mov` + 1 条 `bswap`。调用方契约仍是「至少 4 字节可读」。
+ * @details 公共实现同样是「1 次 `mov` + 1 条 `bswap`」（见
+ *          `go2cpp/network/endian.hpp`）；保留本函数名只为固定原有调用点，
+ *          调用方契约仍是「至少 4 字节可读」。
  */
 inline std::uint32_t LoadBE32(const std::uint8_t* p) noexcept {
-#if defined(__GNUC__) || defined(__clang__)
-    std::uint32_t value = 0;
-    std::memcpy(&value, p, sizeof(value));
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
-    return value;
-#else
-    return __builtin_bswap32(value);
-#endif
-#else
-    return (static_cast<std::uint32_t>(p[0]) << 24) |
-           (static_cast<std::uint32_t>(p[1]) << 16) |
-           (static_cast<std::uint32_t>(p[2]) << 8) | static_cast<std::uint32_t>(p[3]);
-#endif
+    return go2cpp::net::ReadBE32(p);
 }
 
 /// @brief 一次未对齐 16 位读 + 字节序转换。
 inline std::uint16_t LoadBE16(const std::uint8_t* p) noexcept {
-#if defined(__GNUC__) || defined(__clang__)
-    std::uint16_t value = 0;
-    std::memcpy(&value, p, sizeof(value));
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
-    return value;
-#else
-    return __builtin_bswap16(value);
-#endif
-#else
-    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8) |
-                                      static_cast<std::uint16_t>(p[1]));
-#endif
+    return go2cpp::net::ReadBE16(p);
 }
 
 /// @brief 一次未对齐 64 位读 + 字节序转换。
 inline std::uint64_t LoadBE64(const std::uint8_t* p) noexcept {
-#if defined(__GNUC__) || defined(__clang__)
-    std::uint64_t value = 0;
-    std::memcpy(&value, p, sizeof(value));
-#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
-    return value;
-#else
-    return __builtin_bswap64(value);
-#endif
-#else
-    std::uint64_t value = 0;
-    for (int i = 0; i < 8; ++i) {
-        value = (value << 8) | static_cast<std::uint64_t>(p[i]);
-    }
-    return value;
-#endif
+    return go2cpp::net::ReadBE64(p);
 }
 
 /// @brief 帧类型是否已知（位图判定：一条 `bt`/`shr+and`）。

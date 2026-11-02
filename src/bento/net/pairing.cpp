@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <utility>
 
+#include "go2cpp/network/endian.hpp"
+
 namespace go2cpp::bento {
 namespace {
 
@@ -20,39 +22,27 @@ namespace {
 // ---------------------------------------------------------------------------
 
 void WriteU16(std::uint8_t* out, std::uint16_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>(value >> 8);
-    out[1] = static_cast<std::uint8_t>(value);
+    go2cpp::net::WriteBE16(out, value);
 }
 
 void WriteU32(std::uint8_t* out, std::uint32_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>(value >> 24);
-    out[1] = static_cast<std::uint8_t>(value >> 16);
-    out[2] = static_cast<std::uint8_t>(value >> 8);
-    out[3] = static_cast<std::uint8_t>(value);
+    go2cpp::net::WriteBE32(out, value);
 }
 
 void WriteU64(std::uint8_t* out, std::uint64_t value) noexcept {
-    for (int index = 0; index < 8; ++index) {
-        out[index] = static_cast<std::uint8_t>(value >> ((7 - index) * 8));
-    }
+    go2cpp::net::WriteBE64(out, value);
 }
 
 std::uint16_t ReadU16(const std::uint8_t* in) noexcept {
-    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(in[0]) << 8) |
-                                      static_cast<std::uint16_t>(in[1]));
+    return go2cpp::net::ReadBE16(in);
 }
 
 std::uint32_t ReadU32(const std::uint8_t* in) noexcept {
-    return (static_cast<std::uint32_t>(in[0]) << 24) | (static_cast<std::uint32_t>(in[1]) << 16) |
-           (static_cast<std::uint32_t>(in[2]) << 8) | static_cast<std::uint32_t>(in[3]);
+    return go2cpp::net::ReadBE32(in);
 }
 
 std::uint64_t ReadU64(const std::uint8_t* in) noexcept {
-    std::uint64_t value = 0;
-    for (int index = 0; index < 8; ++index) {
-        value = (value << 8) | static_cast<std::uint64_t>(in[index]);
-    }
-    return value;
+    return go2cpp::net::ReadBE64(in);
 }
 
 /// 64 位雪崩混合（splitmix64 的 finalizer），用于 nonce/pair_id 派生。

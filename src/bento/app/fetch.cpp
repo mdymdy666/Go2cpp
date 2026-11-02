@@ -26,9 +26,12 @@
 #include "go2cpp/bento/app/fetch.hpp"
 
 #include "go2cpp/bento/app/detail/retry.hpp"
+#include "go2cpp/encoding/hex_core.hpp"
 
 #include "go2cpp/hash/sha256.hpp"
 #include "go2cpp/os/proc.hpp"
+#include "go2cpp/tools/strconv_core.hpp"
+#include "go2cpp/tools/strings.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -80,77 +83,25 @@ bool IsControlByte(char ch) noexcept {
     return byte < 0x20 || byte == 0x7f;
 }
 
-/// ASCII 小写化（只影响 A-Z）。
-std::string ToLowerAscii(std::string_view text) {
-    std::string out;
-    out.reserve(text.size());
-    for (char ch : text) {
-        if (ch >= 'A' && ch <= 'Z') {
-            out.push_back(static_cast<char>(ch - 'A' + 'a'));
-        } else {
-            out.push_back(ch);
-        }
-    }
-    return out;
-}
+/// ASCII 小写化（委托 `AsciiToLower`）。
+std::string ToLowerAscii(std::string_view text) { return AsciiToLower(text); }
 
-/// 去掉首尾 ASCII 空白（空格、\t、\r、\n）。
-std::string TrimAscii(std::string_view text) {
-    std::size_t begin = 0;
-    std::size_t end = text.size();
-    while (begin < end && (text[begin] == ' ' || text[begin] == '\t' || text[begin] == '\r' ||
-                           text[begin] == '\n')) {
-        ++begin;
-    }
-    while (end > begin && (text[end - 1] == ' ' || text[end - 1] == '\t' ||
-                           text[end - 1] == '\r' || text[end - 1] == '\n')) {
-        --end;
-    }
-    return std::string(text.substr(begin, end - begin));
-}
+/// 去掉首尾 ASCII 空白（委托 `AsciiTrim`，字节集合 `" \t\r\n"`）。
+std::string TrimAscii(std::string_view text) { return AsciiTrim(text, " \t\r\n"); }
 
-/// 大小写不敏感的前缀判断（用于 scheme）。
+/// 大小写不敏感的前缀判断（用于 scheme；委托 `AsciiHasPrefixIgnoreCase`）。
 bool StartsWithIgnoreCase(std::string_view text, std::string_view prefix) noexcept {
-    if (text.size() < prefix.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < prefix.size(); ++i) {
-        const char left = text[i];
-        const char right = prefix[i];
-        const char lower_left =
-            (left >= 'A' && left <= 'Z') ? static_cast<char>(left - 'A' + 'a') : left;
-        const char lower_right =
-            (right >= 'A' && right <= 'Z') ? static_cast<char>(right - 'A' + 'a') : right;
-        if (lower_left != lower_right) {
-            return false;
-        }
-    }
-    return true;
+    return AsciiHasPrefixIgnoreCase(text, prefix);
 }
 
 /// 十六进制字符值；非法返回 -1。
 int HexValue(char ch) noexcept {
-    if (ch >= '0' && ch <= '9') {
-        return ch - '0';
-    }
-    if (ch >= 'a' && ch <= 'f') {
-        return ch - 'a' + 10;
-    }
-    if (ch >= 'A' && ch <= 'F') {
-        return ch - 'A' + 10;
-    }
-    return -1;
+    return encoding::hexcore::HexValue(static_cast<unsigned char>(ch));
 }
 
 /// 32 字节摘要转 64 位小写十六进制。
 std::string DigestToHex(const std::uint8_t* digest) {
-    static constexpr char kHex[] = "0123456789abcdef";
-    std::string out(64, '0');
-    for (std::size_t i = 0; i < 32; ++i) {
-        out[i * 2] = kHex[digest[i] >> 4];
-        out[i * 2 + 1] = kHex[digest[i] & 0x0f];
-    }
-    return out;
+    return encoding::hexcore::Encode(std::string_view(reinterpret_cast<const char*>(digest), 32));
 }
 
 /// 从已打开的 fd 流式计算 SHA-256 与字节数（不关闭 fd）。
@@ -879,22 +830,7 @@ int ParseStatusCode(std::string_view line) noexcept {
 
 /// 十进制 u64 解析（拒绝空串、符号、溢出）。
 bool ParseU64Decimal(std::string_view text, std::uint64_t* out) noexcept {
-    if (text.empty()) {
-        return false;
-    }
-    std::uint64_t value = 0;
-    for (char ch : text) {
-        if (ch < '0' || ch > '9') {
-            return false;
-        }
-        const std::uint64_t digit = static_cast<std::uint64_t>(ch - '0');
-        if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
-            return false;
-        }
-        value = value * 10 + digit;
-    }
-    *out = value;
-    return true;
+    return strconv_core::ParseU64Decimal(text, out);
 }
 
 /// 十六进制 u64 解析（chunk 大小，允许空串以外的数字）。
@@ -1788,7 +1724,7 @@ bool ParseSha256Hex(std::string_view text, std::string* canonical_lower_hex) {
         if (value < 0) {
             return false;
         }
-        normalized[i] = "0123456789abcdef"[value];
+        normalized[i] = encoding::hexcore::kLowerHexDigits[value];
     }
     *canonical_lower_hex = std::move(normalized);
     return true;

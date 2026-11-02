@@ -12,29 +12,26 @@
 
 #include <chrono>
 
+#include "go2cpp/network/endian.hpp"
+
 namespace go2cpp::bento {
 namespace {
 
+// 大端读写统一走 network/endian.hpp（全仓唯一实现），保留原名以固定调用点。
 void WriteU16(std::uint8_t* out, std::uint16_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>(value >> 8);
-    out[1] = static_cast<std::uint8_t>(value);
+    go2cpp::net::WriteBE16(out, value);
 }
 
 void WriteU32(std::uint8_t* out, std::uint32_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>(value >> 24);
-    out[1] = static_cast<std::uint8_t>(value >> 16);
-    out[2] = static_cast<std::uint8_t>(value >> 8);
-    out[3] = static_cast<std::uint8_t>(value);
+    go2cpp::net::WriteBE32(out, value);
 }
 
 std::uint16_t ReadU16(const std::uint8_t* in) noexcept {
-    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(in[0]) << 8) |
-                                      static_cast<std::uint16_t>(in[1]));
+    return go2cpp::net::ReadBE16(in);
 }
 
 std::uint32_t ReadU32(const std::uint8_t* in) noexcept {
-    return (static_cast<std::uint32_t>(in[0]) << 24) | (static_cast<std::uint32_t>(in[1]) << 16) |
-           (static_cast<std::uint32_t>(in[2]) << 8) | static_cast<std::uint32_t>(in[3]);
+    return go2cpp::net::ReadBE32(in);
 }
 
 /// 分片标志只允许出现在 STREAM 上，且载荷必须够放 8B 子头。

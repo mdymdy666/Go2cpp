@@ -13,6 +13,8 @@
 
 #include "go2cpp/bento/error/mapping.hpp"
 
+#include "go2cpp/encoding/hex_core.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -30,7 +32,6 @@ constexpr std::size_t kMaxJsonDepth = 64;
 
 /// @brief 追加 JSON 字符串转义（含控制字符与中文 UTF-8 透传）。
 void AppendJsonEscaped(std::string& out, std::string_view text) {
-    static constexpr char kHexDigits[] = "0123456789abcdef";
     for (const char raw : text) {
         const auto ch = static_cast<unsigned char>(raw);
         switch (ch) {
@@ -58,8 +59,7 @@ void AppendJsonEscaped(std::string& out, std::string_view text) {
             default:
                 if (ch < 0x20U) {
                     out += "\\u00";
-                    out += kHexDigits[(ch >> 4U) & 0x0FU];
-                    out += kHexDigits[ch & 0x0FU];
+                    encoding::hexcore::AppendEncodedByte(out, ch);
                 } else {
                     out += static_cast<char>(ch);
                 }

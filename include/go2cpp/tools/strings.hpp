@@ -200,6 +200,78 @@ inline bool CutsetContains(std::string_view cutset, char32_t rune) noexcept {
 }
 
 // ============================================================================
+// ASCII 快路径（纯字节，不做 UTF-8 解码）
+// ============================================================================
+// 为什么单独成组：本文件的 `ToLower`/`TrimSpace`/`EqualFold` 是 **UTF-8 rune 语义**
+// （`TrimSpace` 把 U+00A0 当空白、`ToLower` 折叠 Latin-1）。协议/配置解析的热路径
+// 只需要纯 ASCII 语义；直接换用 rune 版会多付一次 UTF-8 解码，而且**会改变行为**
+// （把 0xC0 字节当 Latin-1 大写折叠）。因此这里保留一组语义明确的字节函数，
+// 命名统一带 `Ascii` 前缀；需要 Go 语义的地方仍用上面的 rune 版本。
+
+/// ASCII 空白集合：与 C locale 的 `std::isspace` 完全一致（6 个字符）。
+inline bool IsAsciiSpace(char c) noexcept {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+}
+
+/// 只把 `'A'`-`'Z'` 折叠为小写，其余字节（含高位字节）原样保留。
+inline std::string AsciiToLower(std::string_view text) {
+    std::string result(text);
+    for (char& c : result) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return result;
+}
+
+/// 只把 `'a'`-`'z'` 折叠为大写，其余字节原样保留。
+inline std::string AsciiToUpper(std::string_view text) {
+    std::string result(text);
+    for (char& c : result) {
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+    }
+    return result;
+}
+
+/**
+ * @brief 去掉两端属于 `cutset` 的**字节**，返回零分配视图。
+ * @param cutset 字节集合（不是 rune 集合，不支持区间）。默认是 6 个 ASCII 空白。
+ * @note 与 `TrimSpace` 的区别：只认 `cutset` 里的字节，不识别 U+0085/U+00A0 等
+ *       Unicode 空白；高位字节永远不会被当作空白剥掉。
+ */
+inline std::string_view AsciiTrimView(
+    std::string_view text, std::string_view cutset = " \t\n\v\f\r") noexcept {
+    std::size_t begin = 0;
+    std::size_t end = text.size();
+    while (begin < end && cutset.find(text[begin]) != std::string_view::npos) ++begin;
+    while (end > begin && cutset.find(text[end - 1]) != std::string_view::npos) --end;
+    return text.substr(begin, end - begin);
+}
+
+/// 同 `AsciiTrimView`，返回 `std::string` 副本。
+inline std::string AsciiTrim(std::string_view text,
+                             std::string_view cutset = " \t\n\v\f\r") {
+    return std::string(AsciiTrimView(text, cutset));
+}
+
+/// 忽略 ASCII 大小写的前缀判断（高位字节按原值比较，不做 Latin-1 折叠）。
+inline bool AsciiHasPrefixIgnoreCase(std::string_view text, std::string_view prefix) noexcept {
+    if (text.size() < prefix.size()) return false;
+    for (std::size_t i = 0; i < prefix.size(); ++i) {
+        char left = text[i];
+        char right = prefix[i];
+        if (left >= 'A' && left <= 'Z') left = static_cast<char>(left - 'A' + 'a');
+        if (right >= 'A' && right <= 'Z') right = static_cast<char>(right - 'A' + 'a');
+        if (left != right) return false;
+    }
+    return true;
+}
+
+/// 忽略 ASCII 大小写的整串比较（高位字节按原值比较）。
+inline bool AsciiEqualIgnoreCase(std::string_view left, std::string_view right) noexcept {
+    if (left.size() != right.size()) return false;
+    return AsciiHasPrefixIgnoreCase(left, right);
+}
+
+// ============================================================================
 // 判定
 // ============================================================================
 

@@ -12,6 +12,8 @@
 #include <cstring>
 #include <utility>
 
+#include "go2cpp/network/endian.hpp"
+
 namespace go2cpp::bento {
 namespace {
 
@@ -22,13 +24,11 @@ std::uint32_t ClampRtt(std::uint64_t rtt_ms) noexcept {
 }
 
 void WriteU16BE(std::uint8_t* out, std::uint16_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>(value >> 8);
-    out[1] = static_cast<std::uint8_t>(value);
+    go2cpp::net::WriteBE16(out, value);
 }
 
 std::uint16_t ReadU16BE(const std::uint8_t* in) noexcept {
-    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(in[0]) << 8) |
-                                      static_cast<std::uint16_t>(in[1]));
+    return go2cpp::net::ReadBE16(in);
 }
 
 /// 确保视频重组缓冲至少覆盖到 end 字节；按 2 倍几何增长，避免每片一次重新分配。

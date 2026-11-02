@@ -24,6 +24,7 @@
 #include "go2cpp/bento/net/heartbeat.hpp"
 #include "go2cpp/bento/net/pairing.hpp"
 #include "go2cpp/bento/net/tcp_transport.hpp"
+#include "go2cpp/network/endian.hpp"
 
 namespace go2cpp::bento::app {
 namespace {
@@ -66,23 +67,22 @@ std::string ErrorText(int error) {
 }
 
 void WriteU16(std::vector<std::uint8_t>* out, std::uint16_t value) {
-    out->push_back(static_cast<std::uint8_t>((value >> 8U) & 0xffU));
-    out->push_back(static_cast<std::uint8_t>(value & 0xffU));
+    std::uint8_t bytes[2];
+    go2cpp::net::WriteBE16(bytes, value);
+    out->insert(out->end(), bytes, bytes + 2);
 }
 
 void WriteU32(std::vector<std::uint8_t>* out, std::uint32_t value) {
-    out->push_back(static_cast<std::uint8_t>((value >> 24U) & 0xffU));
-    out->push_back(static_cast<std::uint8_t>((value >> 16U) & 0xffU));
-    out->push_back(static_cast<std::uint8_t>((value >> 8U) & 0xffU));
-    out->push_back(static_cast<std::uint8_t>(value & 0xffU));
+    std::uint8_t bytes[4];
+    go2cpp::net::WriteBE32(bytes, value);
+    out->insert(out->end(), bytes, bytes + 4);
 }
 
 bool ReadU16(const std::uint8_t* data, std::size_t size, std::uint16_t* value) {
     if (data == nullptr || size < 2) {
         return false;
     }
-    *value = static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[0]) << 8U) |
-                                        static_cast<std::uint16_t>(data[1]));
+    *value = go2cpp::net::ReadBE16(data);
     return true;
 }
 
@@ -90,10 +90,7 @@ bool ReadU32(const std::uint8_t* data, std::size_t size, std::uint32_t* value) {
     if (data == nullptr || size < 4) {
         return false;
     }
-    *value = (static_cast<std::uint32_t>(data[0]) << 24U) |
-             (static_cast<std::uint32_t>(data[1]) << 16U) |
-             (static_cast<std::uint32_t>(data[2]) << 8U) |
-             static_cast<std::uint32_t>(data[3]);
+    *value = go2cpp::net::ReadBE32(data);
     return true;
 }
 

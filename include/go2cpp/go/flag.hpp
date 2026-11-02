@@ -106,6 +106,7 @@
 
 #pragma once
 
+#include "go2cpp/tools/strconv_core.hpp"
 #include "go2cpp/tools/time.hpp"
 
 #include <cerrno>
@@ -177,51 +178,19 @@ public:
 
 namespace detail {
 
-/// Go `strconv.ParseBool` 接受的全部字面量。
+/// Go `strconv.ParseBool` 接受的全部字面量（词表唯一实现在 strconv_core）。
 inline bool ParseBoolText(std::string_view text, bool* out) {
-    if (text == "1" || text == "t" || text == "T" || text == "TRUE" ||
-        text == "true" || text == "True") {
-        *out = true;
-        return true;
-    }
-    if (text == "0" || text == "f" || text == "F" || text == "FALSE" ||
-        text == "false" || text == "False") {
-        *out = false;
-        return true;
-    }
-    return false;
+    return strconv_core::ParseBoolGoWords(text, out);
 }
 
-/// 整数文本：允许前导 `+`/`-`，必须完整消费，溢出返回 false。
+/// 整数文本：允许前导 `+`/`-`，必须完整消费，溢出返回 false（strtoll 语义）。
 inline bool ParseIntText(std::string_view text, std::int64_t* out) {
-    if (text.empty()) {
-        return false;
-    }
-    const std::string buffer(text);
-    char* end = nullptr;
-    errno = 0;
-    const long long value = std::strtoll(buffer.c_str(), &end, 10);
-    if (end == buffer.c_str() || *end != '\0' || errno == ERANGE) {
-        return false;
-    }
-    *out = static_cast<std::int64_t>(value);
-    return true;
+    return strconv_core::ParseI64Argument(text, out);
 }
 
-/// 浮点文本：必须完整消费，`NaN`/`Inf` 允许（与 Go 的 ParseFloat 一致）。
+/// 浮点文本：必须完整消费，`NaN`/`Inf` 允许（strtod 语义，与替换前一致）。
 inline bool ParseFloatText(std::string_view text, double* out) {
-    if (text.empty()) {
-        return false;
-    }
-    const std::string buffer(text);
-    char* end = nullptr;
-    errno = 0;
-    const double value = std::strtod(buffer.c_str(), &end);
-    if (end == buffer.c_str() || *end != '\0' || errno == ERANGE) {
-        return false;
-    }
-    *out = value;
-    return true;
+    return strconv_core::ParseDoubleArgument(text, out);
 }
 
 /**

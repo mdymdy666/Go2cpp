@@ -25,9 +25,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <random>
+#include <stdexcept>
 
 #include "go2cpp/bento/net/protocol.hpp"
+
+#include "go2cpp/encoding/hex_core.hpp"
+#include "go2cpp/go/crypto_rand.hpp"
 
 namespace go2cpp::bento {
 
@@ -37,23 +40,13 @@ namespace {
 /// 概率约为 2^-128，设置上限只是为了不让失败路径变成死循环。
 constexpr int kIssueAttempts = 2;
 
-/// 十六进制字符表。只输出小写，与 IsValidToken 的严格校验保持一致。
-constexpr char kHexDigits[] = "0123456789abcdef";
-
-/// 每线程复用一个 random_device，避免每次 GenerateToken 都重新打开熵源。
-/// random_device 自身不保证线程安全，thread_local 保证每个线程各用各的。
-std::random_device& ThreadRandomDevice() {
-    static thread_local std::random_device device;
-    return device;
-}
-
-/// 生成一个 8 字节随机值。libstdc++ 的 random_device 每次调用返回一个
-/// 均匀分布的 32 位值，两次拼成 64 位，减少一半的熵源读取次数。
+/// 生成一个 8 字节随机值；唯一熵源是 go::crypto::rand（getrandom → /dev/urandom）。
 std::uint64_t RandomU64() {
-    std::random_device& device = ThreadRandomDevice();
-    const std::uint64_t high = static_cast<std::uint64_t>(device());
-    const std::uint64_t low = static_cast<std::uint64_t>(device());
-    return (high << 32) | low;
+    std::uint64_t value = 0;
+    if (go2cpp::go::crypto::rand::Read(&value, sizeof(value)) != sizeof(value)) {
+        throw std::runtime_error("bento: secure random source unavailable");
+    }
+    return value;
 }
 
 }  // namespace
@@ -68,8 +61,8 @@ std::string TokenPairing::GenerateToken() {
         // 高位在前，保证同一随机值总是编码成同一文本（便于测试复现）。
         const std::uint8_t byte =
             static_cast<std::uint8_t>(value >> (8U * (kTokenBytes - 1U - index)));
-        token[2U * index] = kHexDigits[byte >> 4U];
-        token[2U * index + 1U] = kHexDigits[byte & 0x0FU];
+        token[2U * index] = encoding::hexcore::kLowerHexDigits[byte >> 4U];
+        token[2U * index + 1U] = encoding::hexcore::kLowerHexDigits[byte & 0x0FU];
     }
     return token;
 }

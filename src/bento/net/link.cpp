@@ -26,6 +26,8 @@
 #include <sstream>
 #include <utility>
 
+#include "go2cpp/network/endian.hpp"
+
 namespace go2cpp::bento {
 namespace {
 
@@ -41,24 +43,19 @@ bool IsHelloMagic(const std::uint8_t* payload) noexcept {
 }
 
 void WriteU32(std::uint8_t* out, std::uint32_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>(value >> 24);
-    out[1] = static_cast<std::uint8_t>(value >> 16);
-    out[2] = static_cast<std::uint8_t>(value >> 8);
-    out[3] = static_cast<std::uint8_t>(value);
+    go2cpp::net::WriteBE32(out, value);
 }
 
 std::uint32_t ReadU32(const std::uint8_t* in) noexcept {
-    return (static_cast<std::uint32_t>(in[0]) << 24) | (static_cast<std::uint32_t>(in[1]) << 16) |
-           (static_cast<std::uint32_t>(in[2]) << 8) | static_cast<std::uint32_t>(in[3]);
+    return go2cpp::net::ReadBE32(in);
 }
 
 void WriteU64(std::uint8_t* out, std::uint64_t value) noexcept {
-    WriteU32(out, static_cast<std::uint32_t>(value >> 32));
-    WriteU32(out + 4, static_cast<std::uint32_t>(value));
+    go2cpp::net::WriteBE64(out, value);
 }
 
 std::uint64_t ReadU64(const std::uint8_t* in) noexcept {
-    return (static_cast<std::uint64_t>(ReadU32(in)) << 32) | ReadU32(in + 4);
+    return go2cpp::net::ReadBE64(in);
 }
 
 /// 生成非零 32 位随机数（握手 wire seq，避免跨连接 nonce 复用）。

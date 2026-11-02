@@ -9,11 +9,14 @@
 
 #include "go2cpp/app/resource.hpp"
 
+#include "go2cpp/encoding/hex_core.hpp"
+
 #include "go2cpp/app/kv_stream.hpp"
 
 #include "go2cpp/app/sha256_ni.hpp"
 #include "go2cpp/hash/crc32.hpp"
 #include "go2cpp/hash/sha256.hpp"
+#include "go2cpp/tools/strconv_core.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -48,14 +51,7 @@ void SetError(std::string* error, std::string message) {
 }
 
 std::string ToHex(const std::uint8_t* data, std::size_t size) {
-    static const char kHex[] = "0123456789abcdef";
-    std::string out;
-    out.resize(size * 2);
-    for (std::size_t i = 0; i < size; ++i) {
-        out[i * 2] = kHex[(data[i] >> 4) & 0x0f];
-        out[i * 2 + 1] = kHex[data[i] & 0x0f];
-    }
-    return out;
+    return encoding::hexcore::Encode(std::string_view(reinterpret_cast<const char*>(data), size));
 }
 
 bool IsHexSha256(const std::string& value) {
@@ -74,17 +70,11 @@ bool IsHexSha256(const std::string& value) {
 }
 
 bool ParseU64(const std::string* text, std::uint64_t* out) {
-    if (text == nullptr || text->empty() || out == nullptr) {
+    if (text == nullptr) {
         return false;
     }
-    errno = 0;
-    char* end = nullptr;
-    const unsigned long long value = std::strtoull(text->c_str(), &end, 10);
-    if (end == text->c_str() || *end != '\0' || errno == ERANGE) {
-        return false;
-    }
-    *out = static_cast<std::uint64_t>(value);
-    return true;
+    // 语义与旧 strtoull(…, 10) 完全一致（含前导空白/`+` 的接受集）。
+    return strconv_core::ParseU64Argument(*text, out);
 }
 
 bool ParseU32(const std::string* text, std::uint32_t* out) {

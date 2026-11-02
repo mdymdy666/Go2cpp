@@ -10,9 +10,10 @@
 
 #include <algorithm>
 #include <cstring>
-#include <random>
+#include <stdexcept>
 
 #include "go2cpp/bento/net/protocol.hpp"
+#include "go2cpp/go/crypto_rand.hpp"
 
 namespace go2cpp::bento {
 namespace {
@@ -396,15 +397,13 @@ void SecureRandomBytes(std::uint8_t* out, std::size_t bytes) {
     if (out == nullptr || bytes == 0) {
         return;
     }
-    // 每次取 32 位再拆字节：random_device 的一次读取通常要 4 字节以上的
-    // 系统调用/熵池交互，逐字节调用会把密钥与 nonce 生成放慢约 4 倍。
-    std::random_device device;
-    std::size_t offset = 0;
-    while (offset < bytes) {
-        const std::uint32_t value = device();
-        for (int byte = 0; byte < 4 && offset < bytes; ++byte, ++offset) {
-            out[offset] = static_cast<std::uint8_t>(value >> (8 * byte));
-        }
+    // 唯一 CSPRNG 实现：go::crypto::rand（getrandom(2) → /dev/urandom）。
+    // 本函数曾用 std::random_device：与 p2p::SecureRandomBytes 同名同签名、
+    // 安全强度却不同（见 docs/reports/reuse-audit.md T3），现已统一到同一底座。
+    if (go2cpp::go::crypto::rand::Read(out, bytes) != bytes) {
+        // 熵源整体不可用属于系统级故障：不回退到确定性填充，
+        // 避免静默产出可预测的密钥 / nonce。
+        throw std::runtime_error("bento: secure random source unavailable");
     }
 }
 

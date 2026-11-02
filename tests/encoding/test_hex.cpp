@@ -6,9 +6,11 @@
 #include "encoding_test_support.hpp"
 
 #include "go2cpp/encoding/hex.hpp"
+#include "go2cpp/encoding/hex_core.hpp"
 #include "go2cpp/error.hpp"
 
 #include <cstddef>
+#include <random>
 #include <string>
 #include <string_view>
 
@@ -126,4 +128,45 @@ void RunHexTests() {
     const auto upper_decoded = e::Hex::DecodeString(upper);
     ENCODING_REQUIRE(upper_decoded);
     ENCODING_CHECK_BYTES(upper_decoded.data, all);
+
+
+    go2cpp_encoding_test::Announce("hex: hexcore 与 Hex 逐字节对拍（1 万组随机）");
+
+    {
+        // 背景：各模块的自写 hex 循环已统一到 encoding/hex_core.hpp（零依赖）。
+        // Hex 与 hexcore 必须给出相同的编码、解码结果与失败定位。
+        std::mt19937_64 rng(0x5EED1234ULL);
+        const std::string alphabet = "0123456789abcdefABCDEFxyz+- ";
+        std::size_t mismatches = 0;
+        for (int iteration = 0; iteration < 10000; ++iteration) {
+            std::string bytes;
+            const std::size_t length = rng() % 33;
+            bytes.resize(length);
+            for (char& ch : bytes) {
+                ch = static_cast<char>(rng() & 0xff);
+            }
+            if (e::Hex::EncodeToString(bytes) != e::hexcore::Encode(bytes)) ++mismatches;
+            if (e::Hex::EncodedLen(bytes.size()) != e::hexcore::EncodedLen(bytes.size())) {
+                ++mismatches;
+            }
+
+            std::string text;
+            const std::size_t text_length = rng() % 21;
+            for (std::size_t i = 0; i < text_length; ++i) {
+                text.push_back(alphabet[rng() % alphabet.size()]);
+            }
+            std::string hex_dst;
+            const go2cpp::ErrorPtr error = e::Hex::Decode(hex_dst, text);
+            std::string core_dst;
+            e::hexcore::DecodeFailure failure;
+            const bool core_ok = e::hexcore::Decode(core_dst, text, &failure);
+            if ((error == nullptr) != core_ok) ++mismatches;
+            if (error == nullptr && hex_dst != core_dst) ++mismatches;
+            if (error != nullptr) {
+                if (!hex_dst.empty() || !core_dst.empty()) ++mismatches;
+                if (Is(error, e::HexOddLength()) != failure.odd_length) ++mismatches;
+            }
+        }
+        ENCODING_CHECK(mismatches == 0);
+    }
 }

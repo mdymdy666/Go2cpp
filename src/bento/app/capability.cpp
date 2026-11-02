@@ -8,6 +8,10 @@
 
 #include "go2cpp/bento/app/capability.hpp"
 
+#include "go2cpp/encoding/hex_core.hpp"
+#include "go2cpp/tools/strconv_core.hpp"
+#include "go2cpp/tools/strings.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -55,7 +59,6 @@ std::string ErrorText(int error) {
 
 /// 十六进制小写输出（CapEff 用）。
 std::string ToHex(std::uint64_t value) {
-    static const char kDigits[] = "0123456789abcdef";
     if (value == 0) {
         return "0";
     }
@@ -68,7 +71,7 @@ std::string ToHex(std::uint64_t value) {
             continue;
         }
         started = true;
-        out.push_back(kDigits[digit]);
+        out.push_back(encoding::hexcore::kLowerHexDigits[digit]);
     }
     return out;
 }
@@ -131,16 +134,8 @@ bool ReadFile(const std::string& path, std::string* out) {
     return true;
 }
 
-std::string_view TrimView(std::string_view text) {
-    const auto not_space = [](unsigned char character) { return std::isspace(character) == 0; };
-    while (!text.empty() && !not_space(static_cast<unsigned char>(text.front()))) {
-        text.remove_prefix(1);
-    }
-    while (!text.empty() && !not_space(static_cast<unsigned char>(text.back()))) {
-        text.remove_suffix(1);
-    }
-    return text;
-}
+/// 去掉两端 ASCII 空白（委托 `AsciiTrimView`，零分配）。
+std::string_view TrimView(std::string_view text) { return AsciiTrimView(text); }
 
 /// 在 `Key: value` 形式的多行文本里查找一行并返回值部分。
 /// 用 string_view 逐行扫描，避免为每一行分配 std::string
@@ -167,27 +162,8 @@ bool LookupLineValue(std::string_view text, std::string_view key, std::string* v
 /// 解析前导十进制整数；允许尾随单位（meminfo 的 "12345 kB"），
 /// 但必须至少有一位数字。cgroup 的纯数值同样适用。
 bool ParseU64(std::string_view text, std::uint64_t* value) {
-    std::size_t index = 0;
-    while (index < text.size() && std::isspace(static_cast<unsigned char>(text[index])) != 0) {
-        ++index;
-    }
-    if (index == text.size() || text[index] < '0' || text[index] > '9') {
-        return false;
-    }
-    std::uint64_t result = 0;
-    for (; index < text.size(); ++index) {
-        const char character = text[index];
-        if (character < '0' || character > '9') {
-            break;
-        }
-        const std::uint64_t digit = static_cast<std::uint64_t>(character - '0');
-        if (result > (UINT64_MAX - digit) / 10U) {
-            return false;
-        }
-        result = result * 10U + digit;
-    }
-    *value = result;
-    return true;
+    // 「跳过前导空白 + 取数字前缀 + 允许尾随单位」的语义在 strconv_core 里统一维护。
+    return strconv_core::ParseU64Prefix(text, value);
 }
 
 void SetAvailable(CapabilityItem* item, std::string detail) {

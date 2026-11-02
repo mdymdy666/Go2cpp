@@ -91,9 +91,9 @@ inline constexpr std::uint8_t kX25519BasePoint[kX25519KeyBytes] = {9};
  *          RFC 7748 测试向量保持一致，也允许调用方把私钥原样存盘（是否允许
  *          落盘由调用方的密钥管理策略决定）。
  *
- * @note 使用 `std::random_device`；在 Linux 上它读取内核 CSPRNG。若平台实现
- *       不可用，`std::random_device` 可能抛出异常，调用方应把密钥生成放在
- *       握手失败处理路径之外。
+ * @note 使用 `go::crypto::rand`（getrandom(2) → /dev/urandom），与 p2p /
+ *       bento 其余密钥与随机路径共用同一底座。若系统 CSPRNG 整体不可用会抛出
+ *       `std::runtime_error`，调用方应把密钥生成放在握手失败处理路径之外。
  */
 void X25519GeneratePrivateKey(std::uint8_t private_key[kX25519KeyBytes]);
 

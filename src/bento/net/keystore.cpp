@@ -15,6 +15,10 @@
 
 #include "go2cpp/bento/net/keystore.hpp"
 
+#include "go2cpp/encoding/base64.hpp"
+#include "go2cpp/encoding/hex_core.hpp"
+#include "go2cpp/tools/strings.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -52,23 +56,9 @@ void SecureClear(void* data, std::size_t bytes) noexcept {
     ::explicit_bzero(data, bytes);
 }
 
-char ToLowerAscii(char value) noexcept {
-    if (value >= 'A' && value <= 'Z') {
-        return static_cast<char>(value - 'A' + 'a');
-    }
-    return value;
-}
-
+/// 大小写不敏感的前缀判断（委托 `AsciiHasPrefixIgnoreCase`）。
 bool StartsWithIgnoreCase(std::string_view text, std::string_view prefix) noexcept {
-    if (text.size() < prefix.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < prefix.size(); ++i) {
-        if (ToLowerAscii(text[i]) != ToLowerAscii(prefix[i])) {
-            return false;
-        }
-    }
-    return true;
+    return AsciiHasPrefixIgnoreCase(text, prefix);
 }
 
 bool IsAsciiWhitespace(char value) noexcept {
@@ -96,31 +86,8 @@ std::string StripWhitespace(std::string_view text) {
     return stripped;
 }
 
-int HexValue(char value) noexcept {
-    if (value >= '0' && value <= '9') {
-        return value - '0';
-    }
-    if (value >= 'a' && value <= 'f') {
-        return value - 'a' + 10;
-    }
-    if (value >= 'A' && value <= 'F') {
-        return value - 'A' + 10;
-    }
-    return -1;
-}
-
-/// 仅当串非空、偶数长度且全部是 hex 字符时返回 true。
-bool IsHexText(std::string_view text) noexcept {
-    if (text.empty() || (text.size() % 2U) != 0) {
-        return false;
-    }
-    for (const char value : text) {
-        if (HexValue(value) < 0) {
-            return false;
-        }
-    }
-    return true;
-}
+/// 仅当串非空、偶数长度且全部是 hex 字符时返回 true（复用 hex_core）。
+bool IsHexText(std::string_view text) noexcept { return encoding::hexcore::IsHex(text); }
 
 int Base64Value(char value) noexcept {
     if (value >= 'A' && value <= 'Z') {
@@ -162,7 +129,8 @@ error::ErrorPtr DecodeHex(std::string_view text, std::uint8_t* out, std::size_t*
     }
     const std::size_t bytes = text.size() / 2U;
     for (std::size_t i = 0; i < bytes; ++i) {
-        if (HexValue(text[i * 2U]) < 0 || HexValue(text[i * 2U + 1U]) < 0) {
+        if (encoding::hexcore::HexValue(static_cast<unsigned char>(text[i * 2U])) < 0 ||
+            encoding::hexcore::HexValue(static_cast<unsigned char>(text[i * 2U + 1U])) < 0) {
             return error::NewError("keystore: hex key contains a non-hex character",
                                    error::ErrorCode::kInvalidArgument);
         }
@@ -171,8 +139,9 @@ error::ErrorPtr DecodeHex(std::string_view text, std::uint8_t* out, std::size_t*
         return MakeLengthError(bytes);
     }
     for (std::size_t i = 0; i < bytes; ++i) {
-        const int high = HexValue(text[i * 2U]);
-        const int low = HexValue(text[i * 2U + 1U]);
+        const int high = encoding::hexcore::HexValue(static_cast<unsigned char>(text[i * 2U]));
+        const int low =
+            encoding::hexcore::HexValue(static_cast<unsigned char>(text[i * 2U + 1U]));
         out[i] = static_cast<std::uint8_t>((high << 4) | low);
     }
     *out_bytes = bytes;
@@ -217,19 +186,26 @@ error::ErrorPtr DecodeBase64(std::string_view text, std::uint8_t* out, std::size
         return MakeLengthError(decoded_bytes);
     }
 
-    std::uint32_t accumulator = 0;
-    int bits = 0;
-    std::size_t written = 0;
-    for (std::size_t i = 0; i < data_bytes; ++i) {
-        accumulator = (accumulator << 6U) | static_cast<std::uint32_t>(Base64Value(text[i]));
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out[written] = static_cast<std::uint8_t>((accumulator >> bits) & 0xFFU);
-            ++written;
-        }
+    // 解码交给 encoding/base64：旧实现接受「缺失 padding」与「非规范尾部填充位」，
+    // 这里先把去掉尾部 '=' 的正文按 4 的倍数补齐，再用**非严格**的 StdEncoding
+    // （不调用 Strict()），解码结果与旧的手写 6-bit 累加循环逐字节一致。
+    std::string padded(text.substr(0, data_bytes));
+    if (const std::size_t remainder = padded.size() % 4U; remainder != 0) {
+        padded.append(4U - remainder, '=');
     }
-    *out_bytes = written;
+    std::string decoded;
+    // 注意：encoding 返回的是 go2cpp::ErrorPtr（主错误体系），与 bento 的
+    // error::ErrorPtr 是两套类型，这里只判断成功/失败，错误文本用 keystore 自己的。
+    if (encoding::StdEncoding.Decode(decoded, padded) != nullptr ||
+        decoded.size() != decoded_bytes) {
+        // 预校验已排除非法字符与长度问题；走到这里只可能是编码器内部不一致。
+        return error::NewError("keystore: base64 key contains an invalid character",
+                               error::ErrorCode::kInvalidArgument);
+    }
+    std::memcpy(out, decoded.data(), decoded.size());
+    *out_bytes = decoded.size();
+    // 解码结果等价于密钥明文，离开作用域前清零。
+    SecureClear(decoded.data(), decoded.size());
     return nullptr;
 }
 
@@ -354,20 +330,14 @@ std::size_t KeyStore::Key::size() const noexcept { return m_bytes_used; }
 const std::uint8_t* KeyStore::Key::data() const noexcept { return m_bytes.data(); }
 
 std::string KeyStore::Key::ToHex() const {
-    static constexpr char kHexDigits[] = "0123456789abcdef";
-    std::string hex(m_bytes_used * 2U, '\0');
-    for (std::size_t i = 0; i < m_bytes_used; ++i) {
-        hex[i * 2U] = kHexDigits[m_bytes[i] >> 4U];
-        hex[i * 2U + 1U] = kHexDigits[m_bytes[i] & 0x0FU];
-    }
-    return hex;
+    return encoding::hexcore::Encode(std::string_view(
+        reinterpret_cast<const char*>(m_bytes.data()), m_bytes_used));
 }
 
 std::string KeyStore::Key::Masked() const {
     if (!valid()) {
         return "<empty>";
     }
-    static constexpr char kHexDigits[] = "0123456789abcdef";
     const std::size_t hex_chars = m_bytes_used * 2U;
     std::string masked(hex_chars, '*');
     if (hex_chars <= 8U) {
@@ -375,14 +345,15 @@ std::string KeyStore::Key::Masked() const {
         return masked;
     }
     // 直接写前 4 / 后 4 个十六进制字符，不生成完整明文临时串。
-    masked[0] = kHexDigits[m_bytes[0] >> 4U];
-    masked[1] = kHexDigits[m_bytes[0] & 0x0FU];
-    masked[2] = kHexDigits[m_bytes[1] >> 4U];
-    masked[3] = kHexDigits[m_bytes[1] & 0x0FU];
-    masked[hex_chars - 4U] = kHexDigits[m_bytes[m_bytes_used - 2U] >> 4U];
-    masked[hex_chars - 3U] = kHexDigits[m_bytes[m_bytes_used - 2U] & 0x0FU];
-    masked[hex_chars - 2U] = kHexDigits[m_bytes[m_bytes_used - 1U] >> 4U];
-    masked[hex_chars - 1U] = kHexDigits[m_bytes[m_bytes_used - 1U] & 0x0FU];
+    const char* digits = encoding::hexcore::kLowerHexDigits;
+    masked[0] = digits[m_bytes[0] >> 4U];
+    masked[1] = digits[m_bytes[0] & 0x0FU];
+    masked[2] = digits[m_bytes[1] >> 4U];
+    masked[3] = digits[m_bytes[1] & 0x0FU];
+    masked[hex_chars - 4U] = digits[m_bytes[m_bytes_used - 2U] >> 4U];
+    masked[hex_chars - 3U] = digits[m_bytes[m_bytes_used - 2U] & 0x0FU];
+    masked[hex_chars - 2U] = digits[m_bytes[m_bytes_used - 1U] >> 4U];
+    masked[hex_chars - 1U] = digits[m_bytes[m_bytes_used - 1U] & 0x0FU];
     return masked;
 }
 

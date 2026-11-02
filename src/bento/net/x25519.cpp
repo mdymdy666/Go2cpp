@@ -21,7 +21,9 @@
 #include "go2cpp/bento/net/x25519.hpp"
 
 #include <cstring>
-#include <random>
+#include <stdexcept>
+
+#include "go2cpp/go/crypto_rand.hpp"
 
 namespace go2cpp::bento {
 namespace {
@@ -263,15 +265,10 @@ void ScalarMult(std::uint8_t out[kX25519KeyBytes],
     Zeroize(f, sizeof(f));
 }
 
-/// 用 std::random_device 填满缓冲；每次取 32 位，按小端拆字节。
+/// 填满密码学随机缓冲；唯一熵源是 go::crypto::rand（getrandom → /dev/urandom）。
 void FillRandom(std::uint8_t* out, std::size_t size) {
-    std::random_device device;
-    std::size_t offset = 0;
-    while (offset < size) {
-        const unsigned int value = device();
-        for (int byte = 0; byte < 4 && offset < size; ++byte, ++offset) {
-            out[offset] = static_cast<std::uint8_t>(value >> (8 * byte));
-        }
+    if (go2cpp::go::crypto::rand::Read(out, size) != size) {
+        throw std::runtime_error("bento: secure random source unavailable");
     }
 }
 

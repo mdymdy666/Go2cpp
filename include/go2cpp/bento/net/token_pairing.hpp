@@ -102,9 +102,9 @@ class TokenPairing final {
     TokenPairing& operator=(TokenPairing&&) = delete;
 
     /// @brief 生成 8 字节随机 token，输出 16 个小写 hex 字符。
-    /// @note 每次调用重新取熵（Linux 下 std::random_device 读 /dev/urandom），
+    /// @note 每次调用重新取熵（go::crypto::rand：getrandom(2) → /dev/urandom），
     ///       不保证跨调用唯一；需要唯一性时由 Pair 的查重保证。
-    /// @throws 熵源不可用时 std::random_device 会抛异常，按系统级故障处理。
+    /// @throws std::runtime_error 系统 CSPRNG 整体不可用时，按系统级故障处理。
     static std::string GenerateToken();
 
     /// @brief 校验 token 文本：必须恰好是 16 个小写 hex 字符。

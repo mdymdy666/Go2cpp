@@ -13,6 +13,7 @@
  * ⚠️ 注释中不得出现连续的斜杠加星号（GCC -Wcomment）。
  */
 #include "go2cpp/strconv.hpp"
+#include "go2cpp/tools/strconv_core.hpp"
 #include "test_support.hpp"
 
 #include <charconv>
@@ -240,5 +241,107 @@ void run_strconv_tests() {
             }
         }
         GO2CPP_CHECK(mismatches == 0);
+    }
+
+
+    // ---------------- strconv_core 对拍：与公开 Go 语义实现逐字节一致 ----------------
+    // 背景：各模块原来的私有 ParseU64/ParseBool 已统一到 tools/strconv_core.hpp。
+    // 这里用「已有测试覆盖的公开实现」当参考，保证下沉前后判定与取值完全一致。
+    {
+        std::mt19937_64 rng(20261102ULL);
+        const std::string alphabet =
+            std::string("0123456789+- \t\r\n\v\faxX.:/eE_") +
+            "00000000001844674407370955161518446744073709551616";
+        std::int64_t decimal_mismatch = 0;
+        std::int64_t trimmed_mismatch = 0;
+        std::int64_t prefix_mismatch = 0;
+        std::int64_t bool_mismatch = 0;
+        for (int iteration = 0; iteration < 20000; ++iteration) {
+            std::string text;
+            const std::size_t length = rng() % 24;
+            for (std::size_t i = 0; i < length; ++i) {
+                text.push_back(alphabet[rng() % alphabet.size()]);
+            }
+
+            // (1) 严格十进制：等价于 ParseUint(text, 10, 64)。
+            std::uint64_t actual = 0;
+            const bool actual_ok = strconv_core::ParseU64Decimal(text, &actual);
+            const StrconvUintResult reference = ParseUint(text, 10, 64);
+            if (actual_ok != reference.ok()) ++decimal_mismatch;
+            if (actual_ok && reference.ok() && actual != reference.value) ++decimal_mismatch;
+
+            // (2) 修剪后十进制：等价于 ParseUint(Trim(text), 10, 64)。
+            const std::size_t first = text.find_first_not_of(" \t\r\n");
+            const std::string trimmed =
+                first == std::string::npos
+                    ? std::string()
+                    : text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+            std::uint64_t trimmed_actual = 0;
+            const bool trimmed_ok = strconv_core::ParseU64DecimalTrimmed(text, &trimmed_actual);
+            const StrconvUintResult trimmed_reference = ParseUint(trimmed, 10, 64);
+            if (trimmed_ok != trimmed_reference.ok()) ++trimmed_mismatch;
+            if (trimmed_ok && trimmed_reference.ok() && trimmed_actual != trimmed_reference.value) {
+                ++trimmed_mismatch;
+            }
+
+            // (3) Go 布尔词表：等价于 ParseBool(text)。
+            bool bool_actual = false;
+            const bool bool_ok = strconv_core::ParseBoolGoWords(text, &bool_actual);
+            const StrconvBoolResult bool_reference = ParseBool(text);
+            if (bool_ok != bool_reference.ok()) ++bool_mismatch;
+            if (bool_ok && bool_reference.ok() && bool_actual != bool_reference.value) {
+                ++bool_mismatch;
+            }
+
+            // (4) 数字前缀：跳过前导空白后至少一位数字，尾随内容忽略。
+            std::uint64_t prefix_actual = 0;
+            const bool prefix_ok = strconv_core::ParseU64Prefix(text, &prefix_actual);
+            std::size_t index = 0;
+            while (index < text.size() &&
+                   (text[index] == ' ' || text[index] == '\t' || text[index] == '\n' ||
+                    text[index] == '\v' || text[index] == '\f' || text[index] == '\r')) {
+                ++index;
+            }
+            bool prefix_reference_ok = index < text.size() && text[index] >= '0' &&
+                                       text[index] <= '9';
+            std::uint64_t prefix_reference = 0;
+            if (prefix_reference_ok) {
+                for (; index < text.size(); ++index) {
+                    if (text[index] < '0' || text[index] > '9') break;
+                    const std::uint64_t digit = static_cast<std::uint64_t>(text[index] - '0');
+                    if (prefix_reference > (UINT64_MAX - digit) / 10U) {
+                        prefix_reference_ok = false;
+                        break;
+                    }
+                    prefix_reference = prefix_reference * 10U + digit;
+                }
+            }
+            if (prefix_ok != prefix_reference_ok) ++prefix_mismatch;
+            if (prefix_ok && prefix_reference_ok && prefix_actual != prefix_reference) {
+                ++prefix_mismatch;
+            }
+        }
+        GO2CPP_CHECK(decimal_mismatch == 0);
+        GO2CPP_CHECK(trimmed_mismatch == 0);
+        GO2CPP_CHECK(prefix_mismatch == 0);
+        GO2CPP_CHECK(bool_mismatch == 0);
+
+        // 固定边界：这些是旧实现里最容易漂移的点。
+        std::uint64_t value = 0;
+        GO2CPP_CHECK(!strconv_core::ParseU64Decimal("+12", &value));
+        GO2CPP_CHECK(!strconv_core::ParseU64Decimal(" 12", &value));
+        GO2CPP_CHECK(strconv_core::ParseU64Decimal("0012", &value) && value == 12);
+        GO2CPP_CHECK(!strconv_core::ParseU64Decimal("18446744073709551616", &value));
+        GO2CPP_CHECK(strconv_core::ParseU64DecimalTrimmed(" \t42\r\n", &value) && value == 42);
+        GO2CPP_CHECK(!strconv_core::ParseU64DecimalTrimmed(" \t ", &value));
+        GO2CPP_CHECK(strconv_core::ParseU64Prefix("  12345 kB", &value) && value == 12345);
+        GO2CPP_CHECK(!strconv_core::ParseU64Prefix("k 1", &value));
+        bool flag = false;
+        GO2CPP_CHECK(strconv_core::ParseBoolLooseWords("ON", &flag) && flag);
+        GO2CPP_CHECK(strconv_core::ParseBoolLooseWords("False", &flag) && !flag);
+        GO2CPP_CHECK(!strconv_core::ParseBoolLooseWords(" on", &flag));
+        GO2CPP_CHECK(strconv_core::ParseBoolLooseWords("2", &flag) == false);
+        GO2CPP_CHECK(strconv_core::ParseBoolGoWords("T", &flag) && flag);
+        GO2CPP_CHECK(!strconv_core::ParseBoolGoWords("tRuE", &flag));
     }
 }

@@ -13,6 +13,8 @@
  */
 #include "hash_test_support.hpp"
 
+#include "go2cpp/hash/fnv.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -238,6 +240,39 @@ void CheckAdler32Vectors() {
     HASH_CHECK(adler.Sum32() == 1u);
 }
 
+
+void CheckFnvVectors() {
+    go2cpp_hash_test::Announce("FNV-1a 32/64 vectors");
+    struct FnvVector {
+        const char* input;
+        std::uint64_t hash64;
+        std::uint32_t hash32;
+    };
+    const FnvVector vectors[] = {
+        {"", 0xcbf29ce484222325ULL, 0x811c9dc5u},
+        {"a", 0xaf63dc4c8601ec8cULL, 0xe40c292cu},
+        {"b", 0xaf63df4c8601f1a5ULL, 0xe70c2de5u},
+        {"foo", 0xdcb27518fed9d577ULL, 0xa9f37ed7u},
+        {"foobar", 0x85944171f73967e8ULL, 0xbf9cf968u},
+        {"hello", 0xa430d84680aabd0bULL, 0x4f9f2cabu},
+    };
+    for (const FnvVector& vector : vectors) {
+        const std::string_view text(vector.input);
+        HASH_CHECK(Fnv1a64(AsBytes(text)) == vector.hash64);
+        HASH_CHECK(Fnv1a32(AsBytes(text)) == vector.hash32);
+    }
+
+    // 增量组合律：分段 Update 必须等于一次性计算（p2p 的增量用法）。
+    const std::string_view text("foobar");
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(text.data());
+    const std::uint64_t chained64 = Fnv1a64Update(
+        Fnv1a64Update(kFnv1a64OffsetBasis, bytes, 3), bytes + 3, 3);
+    HASH_CHECK(chained64 == Fnv1a64(AsBytes(text)));
+    const std::uint32_t chained32 = Fnv1a32Update(
+        Fnv1a32Update(kFnv1a32OffsetBasis, bytes, 3), bytes + 3, 3);
+    HASH_CHECK(chained32 == Fnv1a32(AsBytes(text)));
+}
+
 void CheckSizeAndBlockSize() {
     go2cpp_hash_test::Announce("Hash interface: Size() / BlockSize()");
     const Md5 md5;
@@ -414,6 +449,7 @@ void RunVectorTests() {
     CheckEmptyWriteAfterData<Sha512>("sha512 empty write");
     CheckCrc32Vectors();
     CheckAdler32Vectors();
+    CheckFnvVectors();
     CheckSizeAndBlockSize();
     CheckSumIsPure<Md5>();
     CheckSumIsPure<Sha1>();

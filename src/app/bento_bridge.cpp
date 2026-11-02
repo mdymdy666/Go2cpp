@@ -10,6 +10,7 @@
 #include "go2cpp/app/bento_bridge.hpp"
 
 #include "go2cpp/bento/net/frame.hpp"
+#include "go2cpp/network/endian.hpp"
 
 namespace go2cpp::app::bento_bridge {
 namespace {
@@ -22,15 +23,11 @@ using BentoFrame = go2cpp::bento::net::Frame;
 FrameFormat Format() { return go2cpp::bento::net::kDefaultFrameFormat; }
 
 void WriteU16(std::uint8_t* out, std::uint16_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>(value >> 8);
-    out[1] = static_cast<std::uint8_t>(value);
+    go2cpp::net::WriteBE16(out, value);
 }
 
 void WriteU32(std::uint8_t* out, std::uint32_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>(value >> 24);
-    out[1] = static_cast<std::uint8_t>(value >> 16);
-    out[2] = static_cast<std::uint8_t>(value >> 8);
-    out[3] = static_cast<std::uint8_t>(value);
+    go2cpp::net::WriteBE32(out, value);
 }
 
 }  // namespace

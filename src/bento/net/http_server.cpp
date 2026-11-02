@@ -12,9 +12,13 @@
 
 #include <sys/socket.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <optional>
@@ -60,6 +64,32 @@ std::string SystemErrorText(int error) {
         return {};
     }
     return std::strerror(error);
+}
+
+/// @brief 响应带文件体时用 sendfile(2) 发送（静态文件/Range 零拷贝）。
+/// @details 头由调用方先写出；本函数只负责文件体，`HEAD` 不调用。
+bool SendFileBody(const net::Socket::Ptr& connection, const http::FileBody& file) {
+    if (file.length == 0) {
+        return true;
+    }
+    const int fd = ::open(file.path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    off_t offset = static_cast<off_t>(file.offset);
+    std::uint64_t remaining = file.length;
+    bool ok = true;
+    while (remaining > 0) {
+        const auto written = connection->send_file(
+            fd, &offset, static_cast<std::size_t>(remaining));
+        if (written.transferred <= 0) {
+            ok = false;
+            break;
+        }
+        remaining -= static_cast<std::uint64_t>(written.transferred);
+    }
+    (void)::close(fd);
+    return ok;
 }
 
 /// @brief 用 bufio 一次 writev 写出「响应头 + 响应体」两段（B-06）。
@@ -185,6 +215,33 @@ HttpServerResult HttpServer::Listen(const std::string& host, std::uint16_t port,
 void HttpServer::OnRequest(RequestHandler handler) {
     std::lock_guard<std::mutex> lock(m_route_mutex);
     m_request_handler = std::move(handler);
+}
+
+void HttpServer::Route(http::Method method, std::string pattern,
+                       RequestHandler handler) {
+    std::lock_guard<std::mutex> lock(m_route_mutex);
+    m_router.add(method, std::move(pattern), std::move(handler));
+}
+
+bool HttpServer::MatchRoute(http::Request& request, RequestHandler* handler) const {
+    std::lock_guard<std::mutex> lock(m_route_mutex);
+    if (m_router.empty()) {
+        return false;
+    }
+    const http::Handler* matched =
+        m_router.match(request.method, request.path_view(), &request.path_values);
+    // HEAD 是 GET 的无体版本：未单独注册 HEAD 时回退到同一路径的 GET 路由。
+    if (matched == nullptr && request.method == http::Method::Head) {
+        matched = m_router.match(http::Method::Get, request.path_view(),
+                                 &request.path_values);
+    }
+    if (matched == nullptr) {
+        return false;
+    }
+    if (handler != nullptr) {
+        *handler = *matched;
+    }
+    return true;
 }
 
 void HttpServer::AsSse(std::string path, SseHandler handler) {
@@ -426,7 +483,10 @@ void HttpServer::ServeConnection(const net::Socket::Ptr& connection) {
         }
 
         http::Response response;
-        const RequestHandler request_handler = FindRequestHandler();
+        RequestHandler request_handler;
+        if (!MatchRoute(request, &request_handler)) {
+            request_handler = FindRequestHandler();
+        }
         if (request_handler) {
             try {
                 response = request_handler(request);
@@ -466,6 +526,14 @@ void HttpServer::ServeConnection(const net::Socket::Ptr& connection) {
             m_write_responses.fetch_add(1, std::memory_order_relaxed);
             if (m_config.use_bufio) {
                 m_write_direct.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        // 文件体（StaticFiles/Range）走 sendfile(2)：数据不进入用户态。
+        // HEAD 只回头；头已由上面的两条写路径 flush，这里不会与缓冲顺序冲突。
+        if (request.method != http::Method::Head && response.has_file()) {
+            if (!SendFileBody(connection, *response.file)) {
+                m_write_errors.fetch_add(1, std::memory_order_relaxed);
+                return;
             }
         }
         if (request.close || response.close) {

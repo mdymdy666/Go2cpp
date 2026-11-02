@@ -242,4 +242,52 @@ void run_strings_tests() {
         }
         GO2CPP_CHECK(mismatches == 0);
     }
+
+
+    // ---------------- ASCII 快路径：与 rune 版本的差异必须显式且稳定 ----------------
+    // 背景：各模块的 ToLowerAscii/TrimAscii/StartsWithIgnoreCase 已统一到 strings 的
+    // Ascii* 系列。它们**刻意**不是 TrimSpace/ToLower 的别名：高位字节不做 Latin-1
+    // 折叠、U+00A0 不会被当空白。下面的断言把这层差异钉住，防止有人「顺手」换成
+    // rune 版本而让热路径改变行为。
+    {
+        // "Ä"（U+00C4，UTF-8 两字节）：AsciiToLower 原样保留，ToLower 折叠成 "ä"（U+00E4）。
+        GO2CPP_CHECK(AsciiToLower(std::string("\xC3\x84", 2)) == std::string("\xC3\x84", 2));
+        GO2CPP_CHECK(ToLower(std::string("\xC3\x84", 2)) == std::string("\xC3\xA4", 2));
+        GO2CPP_CHECK(AsciiTrim(std::string("\xC2\xA0x\xC2\xA0", 5)) ==
+                     std::string("\xC2\xA0x\xC2\xA0", 5));
+        GO2CPP_CHECK(TrimSpace(std::string("\xC2\xA0x\xC2\xA0", 5)) == "x");
+        GO2CPP_CHECK(AsciiToUpper(std::string("a\xE0z", 3)) == std::string("A\xE0Z", 3));
+
+        std::mt19937 rng(90210U);
+        std::int64_t mismatches = 0;
+        for (int iteration = 0; iteration < 20000; ++iteration) {
+            std::string text;
+            const std::size_t length = rng() % 40;
+            for (std::size_t i = 0; i < length; ++i) {
+                text.push_back(static_cast<char>(rng() & 0xff));
+            }
+
+            // (1) 与 std::string::find_first_not_of 的字节集合语义逐字节一致。
+            const std::size_t first = text.find_first_not_of(" \t\r\n");
+            const std::string expected =
+                first == std::string::npos
+                    ? std::string()
+                    : text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+            if (AsciiTrim(text, " \t\r\n") != expected) ++mismatches;
+            if (AsciiTrimView(text, " \t\r\n") != std::string_view(expected)) ++mismatches;
+
+            // (2) 折叠只影响 A-Z / a-z，其余字节原样保留。
+            std::string lowered = text;
+            for (char& ch : lowered) {
+                if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+            }
+            if (AsciiToLower(text) != lowered) ++mismatches;
+
+            // (3) 前缀判断：自身前缀在忽略大小写后必然命中。
+            const std::size_t prefix_length = rng() % 8;
+            const std::string prefix = text.substr(0, prefix_length);
+            if (!AsciiHasPrefixIgnoreCase(text, prefix)) ++mismatches;
+        }
+        GO2CPP_CHECK(mismatches == 0);
+    }
 }

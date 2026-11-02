@@ -19,7 +19,10 @@
 
 #include "go2cpp/bento/net/file_transfer.hpp"
 
+#include "go2cpp/encoding/hex_core.hpp"
+
 #include "go2cpp/hash/sha256.hpp"
+#include "go2cpp/network/endian.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -43,46 +46,34 @@ namespace {
 // 大端读写（与 command.cpp / protocol.cpp 同构；字段少，不抽公共头）
 // ---------------------------------------------------------------------------
 
-/// 写 16 位大端。
+/// 写 16 位大端（委托 network/endian.hpp 的唯一实现）。
 void WriteU16(std::uint8_t* out, std::uint16_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>(value >> 8);
-    out[1] = static_cast<std::uint8_t>(value);
+    go2cpp::net::WriteBE16(out, value);
 }
 
 /// 写 32 位大端。
 void WriteU32(std::uint8_t* out, std::uint32_t value) noexcept {
-    out[0] = static_cast<std::uint8_t>(value >> 24);
-    out[1] = static_cast<std::uint8_t>(value >> 16);
-    out[2] = static_cast<std::uint8_t>(value >> 8);
-    out[3] = static_cast<std::uint8_t>(value);
+    go2cpp::net::WriteBE32(out, value);
 }
 
 /// 写 64 位大端。
 void WriteU64(std::uint8_t* out, std::uint64_t value) noexcept {
-    for (int i = 7; i >= 0; --i) {
-        out[7 - i] = static_cast<std::uint8_t>(value >> (i * 8));
-    }
+    go2cpp::net::WriteBE64(out, value);
 }
 
 /// 读 16 位大端。
 std::uint16_t ReadU16(const std::uint8_t* in) noexcept {
-    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(in[0]) << 8) |
-                                      static_cast<std::uint16_t>(in[1]));
+    return go2cpp::net::ReadBE16(in);
 }
 
 /// 读 32 位大端。
 std::uint32_t ReadU32(const std::uint8_t* in) noexcept {
-    return (static_cast<std::uint32_t>(in[0]) << 24) | (static_cast<std::uint32_t>(in[1]) << 16) |
-           (static_cast<std::uint32_t>(in[2]) << 8) | static_cast<std::uint32_t>(in[3]);
+    return go2cpp::net::ReadBE32(in);
 }
 
 /// 读 64 位大端。
 std::uint64_t ReadU64(const std::uint8_t* in) noexcept {
-    std::uint64_t value = 0;
-    for (int i = 0; i < 8; ++i) {
-        value = (value << 8) | static_cast<std::uint64_t>(in[i]);
-    }
-    return value;
+    return go2cpp::net::ReadBE64(in);
 }
 
 // ---------------------------------------------------------------------------
@@ -317,14 +308,8 @@ const char* FileTransferStatusToString(FileTransferStatus status) noexcept {
 }
 
 std::string FileHashHex(const FileHash& hash) {
-    static const char* kHex = "0123456789abcdef";
-    std::string text;
-    text.reserve(kFileHashBytes * 2);
-    for (const std::uint8_t byte : hash) {
-        text.push_back(kHex[byte >> 4]);
-        text.push_back(kHex[byte & 0x0f]);
-    }
-    return text;
+    return encoding::hexcore::Encode(
+        std::string_view(reinterpret_cast<const char*>(hash.data()), hash.size()));
 }
 
 FileHash Sha256Of(const std::uint8_t* data, std::size_t size) {

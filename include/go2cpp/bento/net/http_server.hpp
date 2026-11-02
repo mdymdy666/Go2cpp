@@ -20,9 +20,11 @@
  *
  * ## 已实现 / 未实现（骨架边界）
  *          已实现：GET/POST 等任意方法、请求头与 body、keep-alive、404、
+ *          路由（精确哈希 / `:name` 参数 / 尾部 `*` 通配）、静态文件 sendfile
+ *          （`http::StaticFiles` 生成 handler，`Response::file` 走 sendfile(2)）、
  *          SSE 事件推流、优雅 Stop、并发 accept。
- *          未实现：TLS、HTTP/2、路由参数/通配符、请求体流式读取、每连接读超时、
- *          连接级限流；SSE handler 必须自己观察 `sse::Stream::send()` 的返回值
+ *          未实现：TLS、HTTP/2、请求体流式读取、每连接读超时、连接级限流；
+ *          SSE handler 必须自己观察 `sse::Stream::send()` 的返回值
  *          （或 `HttpServer::IsStopping()`）来退出长循环，否则 Stop 只能靠
  *          socket shutdown 让写入失败。
  *
@@ -196,7 +198,17 @@ public:
                             HttpServerConfig config = {});
 
     /// @brief 设置普通请求处理器；传空函数对象表示取消。
+    /// @note 注册过 `Route()` 时，先按路由表匹配；未命中才回落到本处理器。
     void OnRequest(RequestHandler handler);
+
+    /**
+     * @brief 注册一条普通请求路由（优先于 `OnRequest` 的兜底处理器）。
+     * @param method 请求方法。
+     * @param pattern 支持静态路径、`:name` 参数段与尾部 `*`/`*name` 通配；
+     *        命中时参数写入 `request.path_values`（见 `http::Router`）。
+     * @param handler 命中后的处理器；空 handler 表示「命中但交兜底」。
+     */
+    void Route(http::Method method, std::string pattern, RequestHandler handler);
 
     /// @brief 注册/替换一个 SSE 路由（path 精确匹配）。
     void AsSse(std::string path, SseHandler handler);
@@ -253,6 +265,8 @@ private:
                      std::size_t capacity);
     SseHandler FindSseHandler(const std::string& path) const;
     RequestHandler FindRequestHandler() const;
+    /// 在路由锁内匹配 `m_router`；命中时把参数写入 `request.path_values`。
+    bool MatchRoute(http::Request& request, RequestHandler* handler) const;
     void CloseAllConnections() noexcept;
     void JoinWorkers() noexcept;
     void CloseListener() noexcept;
@@ -272,6 +286,8 @@ private:
     mutable std::mutex m_route_mutex;
     /// 普通请求处理器；OnRequest() 写，FindRequestHandler() 拷贝读取。
     RequestHandler m_request_handler;
+    /// 路由表（精确哈希 + 参数/通配 trie）；Route() 写，MatchRoute() 读。
+    http::Router m_router;
     /// SSE 路由表（path + handler）；AsSse() 写，FindSseHandler() 拷贝读取。
     std::vector<std::pair<std::string, SseHandler>> m_sse_routes;
 

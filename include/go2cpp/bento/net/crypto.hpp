@@ -157,8 +157,9 @@ const char* SecurityErrorName(SecurityError error) noexcept;
 ///          `std::strstr(error, "kEncryptionRequired")` 判断类别。
 const char* SecurityErrorMessage(SecurityError error) noexcept;
 
-/// @brief 生成密码学随机字节（std::random_device，无第三方依赖）。
+/// @brief 生成密码学随机字节（go::crypto::rand：getrandom(2) → /dev/urandom）。
 /// @note 仅在握手/测试等低频路径调用；不要用于每包 nonce 生成。
+/// @throws std::runtime_error 系统 CSPRNG 整体不可用时（不静默降级）。
 void SecureRandomBytes(std::uint8_t* out, std::size_t bytes);
 
 /// @brief ChaCha20 块函数（RFC 8439 §2.3）。
