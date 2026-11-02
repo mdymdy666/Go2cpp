@@ -8,7 +8,8 @@
  *  3. 1e6 行全表扫描（封装 Rows vs 原生 sqlite3_step）；
  *  4. 1e6 次预编译复用（内存库，Bind/Step/Reset）；
  *  5. 1e7 次 `SELECT ?` 微基准（内存库，纯 API 开销）；
- *  6. 逐字节一致：封装与原生写出的数据库文件逐字节比较。
+ *  6. 1e6 行 UPDATE / DELETE（文件库，同数据、同事务边界）；
+ *  7. 逐字节一致：封装与原生写出的数据库文件与表内容逐字节比较。
  *
  * 用法：`go2cpp_storage_bench [输出数据库目录]`
  *       缺省在临时目录运行并在结束时清理。
@@ -35,6 +36,14 @@ namespace {
 using go2cpp::storage::DB;
 using go2cpp::storage::Rows;
 using go2cpp::storage::Stmt;
+
+// 场景函数一律 noinline：objdump 才能按场景对比封装与原生循环体的
+// 指令数 / call 数（见 /tmp/sqlite_asm.md）。每个场景只调用一次，开销可忽略。
+#if defined(__GNUC__) || defined(__clang__)
+#define BENCH_NOINLINE __attribute__((noinline))
+#else
+#define BENCH_NOINLINE
+#endif
 
 using Clock = std::chrono::steady_clock;
 
@@ -94,6 +103,7 @@ struct InsertStats {
     std::int64_t last_rowid = 0;
 };
 
+BENCH_NOINLINE
 InsertStats InsertWithWrapper(const std::string& path, bool memory,
                               int rows) {
     InsertStats stats;
@@ -139,6 +149,7 @@ InsertStats InsertWithWrapper(const std::string& path, bool memory,
     return stats;
 }
 
+BENCH_NOINLINE
 InsertStats InsertWithNative(const std::string& path, int rows) {
     InsertStats stats;
     const auto start = Clock::now();
@@ -173,7 +184,145 @@ InsertStats InsertWithNative(const std::string& path, int rows) {
     return stats;
 }
 
+
+/// @brief 原生插入，绑定策略 SQLITE_TRANSIENT（对齐封装旧语义）。
+BENCH_NOINLINE
+InsertStats InsertWithNativeTransient(const std::string& path, int rows) {
+    InsertStats stats;
+    const auto start = Clock::now();
+    NativeDb native(path);
+    sqlite3* db = native.get();
+    if (db == nullptr) {
+        return stats;
+    }
+    (void)NativeExec(db, "DROP TABLE IF EXISTS t");
+    (void)NativeExec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, "
+                         "name TEXT)");
+    (void)NativeExec(db, "BEGIN IMMEDIATE");
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db,
+                           "INSERT INTO t(id, v, name) VALUES(?, ?, ?)", -1,
+                           &stmt, nullptr) != SQLITE_OK) {
+        return stats;
+    }
+    for (int i = 0; i < rows; ++i) {
+        sqlite3_bind_int64(stmt, 1, i);
+        sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(i) * 2);
+        sqlite3_bind_text(stmt, 3, "abcdefgh", 8, SQLITE_TRANSIENT);
+        (void)sqlite3_step(stmt);
+        (void)sqlite3_reset(stmt);
+        stats.checksum += i * 2;
+    }
+    (void)sqlite3_finalize(stmt);
+    (void)NativeExec(db, "COMMIT");
+    stats.last_rowid = sqlite3_last_insert_rowid(db);
+    (void)NativeExec(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    stats.ms = ElapsedMs(start);
+    return stats;
+}
+
+/// @brief 封装 UPDATE 1e6 行（单事务），checksum = changes。
+BENCH_NOINLINE
+InsertStats UpdateWithWrapper(const std::string& path) {
+    InsertStats stats;
+    const auto start = Clock::now();
+    auto opened = DB::Open(path);
+    if (!opened.ok()) {
+        return stats;
+    }
+    std::unique_ptr<DB> db = std::move(opened.Value());
+    if (!db->Begin().ok()) {
+        return stats;
+    }
+    const auto updated = db->Exec("UPDATE t SET v = v + 1");
+    if (!updated.ok()) {
+        (void)db->Rollback();
+        return stats;
+    }
+    stats.checksum = updated.Value().changes;
+    if (!db->Commit().ok()) {
+        return stats;
+    }
+    stats.ms = ElapsedMs(start);
+    return stats;
+}
+
+/// @brief 原生 UPDATE 1e6 行（单事务），checksum = changes。
+BENCH_NOINLINE
+InsertStats UpdateWithNative(const std::string& path) {
+    InsertStats stats;
+    const auto start = Clock::now();
+    NativeDb native(path);
+    sqlite3* db = native.get();
+    if (db == nullptr) {
+        return stats;
+    }
+    (void)NativeExec(db, "BEGIN IMMEDIATE");
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, "UPDATE t SET v = v + 1", -1, &stmt, nullptr) !=
+        SQLITE_OK) {
+        return stats;
+    }
+    (void)sqlite3_step(stmt);
+    (void)sqlite3_finalize(stmt);
+    stats.checksum = sqlite3_changes(db);
+    (void)NativeExec(db, "COMMIT");
+    stats.ms = ElapsedMs(start);
+    return stats;
+}
+
+/// @brief 封装 DELETE 1e6 行（单事务），checksum = changes。
+BENCH_NOINLINE
+InsertStats DeleteWithWrapper(const std::string& path) {
+    InsertStats stats;
+    const auto start = Clock::now();
+    auto opened = DB::Open(path);
+    if (!opened.ok()) {
+        return stats;
+    }
+    std::unique_ptr<DB> db = std::move(opened.Value());
+    if (!db->Begin().ok()) {
+        return stats;
+    }
+    const auto deleted = db->Exec("DELETE FROM t");
+    if (!deleted.ok()) {
+        (void)db->Rollback();
+        return stats;
+    }
+    stats.checksum = deleted.Value().changes;
+    if (!db->Commit().ok()) {
+        return stats;
+    }
+    stats.ms = ElapsedMs(start);
+    return stats;
+}
+
+/// @brief 原生 DELETE 1e6 行（单事务），checksum = changes。
+BENCH_NOINLINE
+InsertStats DeleteWithNative(const std::string& path) {
+    InsertStats stats;
+    const auto start = Clock::now();
+    NativeDb native(path);
+    sqlite3* db = native.get();
+    if (db == nullptr) {
+        return stats;
+    }
+    (void)NativeExec(db, "BEGIN IMMEDIATE");
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, "DELETE FROM t", -1, &stmt, nullptr) !=
+        SQLITE_OK) {
+        return stats;
+    }
+    (void)sqlite3_step(stmt);
+    (void)sqlite3_finalize(stmt);
+    stats.checksum = sqlite3_changes(db);
+    (void)NativeExec(db, "COMMIT");
+    stats.ms = ElapsedMs(start);
+    return stats;
+}
+
 /// @brief 封装全表扫描；校验和按 id*3+v 累加。
+BENCH_NOINLINE
 InsertStats SelectWithWrapper(const std::string& path) {
     InsertStats stats;
     const auto start = Clock::now();
@@ -198,6 +347,7 @@ InsertStats SelectWithWrapper(const std::string& path) {
     return stats;
 }
 
+BENCH_NOINLINE
 InsertStats SelectWithNative(const std::string& path) {
     InsertStats stats;
     const auto start = Clock::now();
@@ -226,6 +376,7 @@ InsertStats SelectWithNative(const std::string& path) {
 }
 
 /// @brief 预编译复用：1e6 次 Bind/Step/Reset（内存库）。
+BENCH_NOINLINE
 InsertStats PreparedWithWrapper(int rows) {
     InsertStats stats;
     const auto start = Clock::now();
@@ -252,6 +403,7 @@ InsertStats PreparedWithWrapper(int rows) {
     return stats;
 }
 
+BENCH_NOINLINE
 InsertStats PreparedWithNative(int rows) {
     InsertStats stats;
     const auto start = Clock::now();
@@ -281,6 +433,7 @@ InsertStats PreparedWithNative(int rows) {
 }
 
 /// @brief 1e7 次 `SELECT ?` 微基准：只测绑定/执行/取列/重置的 API 开销。
+BENCH_NOINLINE
 InsertStats MicroWithWrapper(std::int64_t iterations) {
     InsertStats stats;
     const auto start = Clock::now();
@@ -303,6 +456,7 @@ InsertStats MicroWithWrapper(std::int64_t iterations) {
     return stats;
 }
 
+BENCH_NOINLINE
 InsertStats MicroWithNative(std::int64_t iterations) {
     InsertStats stats;
     const auto start = Clock::now();
@@ -370,11 +524,12 @@ bool ReadFileBytes(const std::string& path, std::string* out) {
     return true;
 }
 
-/// @brief 封装与原生各写 1000 行，比较数据库文件字节。
-void ByteIdentical(const std::string& dir) {
-    const std::string wrapper_path = dir + "/bytes_wrapper.db";
-    const std::string native_path = dir + "/bytes_native.db";
-    constexpr int kRows = 1000;
+/// @brief 封装与原生各写 rows 行，比较数据库文件字节与内容 dump。
+BENCH_NOINLINE
+void ByteIdentical(const std::string& dir, int rows, const char* tag) {
+    const std::string wrapper_path =
+        dir + "/bytes_" + tag + "_wrapper.db";
+    const std::string native_path = dir + "/bytes_" + tag + "_native.db";
 
     {
         auto opened = DB::Open(wrapper_path);
@@ -389,7 +544,7 @@ void ByteIdentical(const std::string& dir) {
                       "name TEXT)");
         (void)db.Begin();
         auto stmt = db.Prepare("INSERT INTO t(id, v, name) VALUES(?, ?, ?)");
-        for (int i = 0; i < kRows; ++i) {
+        for (int i = 0; i < rows; ++i) {
             stmt.Value().Reset();
             (void)stmt.Value().Bind(i, i * 2, "abcdefgh");
             (void)stmt.Value().Step();
@@ -411,7 +566,7 @@ void ByteIdentical(const std::string& dir) {
         (void)sqlite3_prepare_v2(
             db, "INSERT INTO t(id, v, name) VALUES(?, ?, ?)", -1, &stmt,
             nullptr);
-        for (int i = 0; i < kRows; ++i) {
+        for (int i = 0; i < rows; ++i) {
             sqlite3_bind_int64(stmt, 1, i);
             sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(i) * 2);
             sqlite3_bind_text(stmt, 3, "abcdefgh", 8, SQLITE_STATIC);
@@ -470,13 +625,13 @@ void ByteIdentical(const std::string& dir) {
         }
     }
 
-    std::printf("[byte-identical] files: %s=%zu bytes, %s=%zu bytes, "
-                "file_bytes_equal=%s\n",
+    std::printf("[byte-identical:%s] files: %s=%zu bytes, %s=%zu bytes, "
+                "file_bytes_equal=%s\n", tag,
                 wrapper_path.c_str(), wrapper_bytes.size(),
                 native_path.c_str(), native_bytes.size(),
                 identical ? "yes" : "no");
-    std::printf("[byte-identical] dump: wrapper=%zu bytes fnv=%016llx, "
-                "native=%zu bytes fnv=%016llx, dump_equal=%s\n",
+    std::printf("[byte-identical:%s] dump: wrapper=%zu bytes fnv=%016llx, "
+                "native=%zu bytes fnv=%016llx, dump_equal=%s\n", tag,
                 wrapper_dump.size(),
                 static_cast<unsigned long long>(Fnv1a64(wrapper_dump)),
                 native_dump.size(),
@@ -520,6 +675,10 @@ int main(int argc, char** argv) {
         InsertWithNative(dir + "/native.db", kRows);
     Report("insert-file-native", kRows, native_file.ms,
            native_file.checksum);
+    const InsertStats native_transient =
+        InsertWithNativeTransient(dir + "/native_transient.db", kRows);
+    Report("insert-file-native-transient", kRows, native_transient.ms,
+           native_transient.checksum);
 
     // ---- 2. 内存库插入 1e6 ----
     const InsertStats wrapper_mem =
@@ -539,6 +698,22 @@ int main(int argc, char** argv) {
     Report("select-file-native", kRows, native_select.ms,
            native_select.checksum);
 
+    // ---- 3b. 同一对 1e6 行文件库上 UPDATE 再 DELETE ----
+    const InsertStats wrapper_update =
+        UpdateWithWrapper(dir + "/wrapper.db");
+    Report("update-file-wrapper", kRows, wrapper_update.ms,
+           wrapper_update.checksum);
+    const InsertStats native_update = UpdateWithNative(dir + "/native.db");
+    Report("update-file-native", kRows, native_update.ms,
+           native_update.checksum);
+    const InsertStats wrapper_delete =
+        DeleteWithWrapper(dir + "/wrapper.db");
+    Report("delete-file-wrapper", kRows, wrapper_delete.ms,
+           wrapper_delete.checksum);
+    const InsertStats native_delete = DeleteWithNative(dir + "/native.db");
+    Report("delete-file-native", kRows, native_delete.ms,
+           native_delete.checksum);
+
     // ---- 4. 预编译复用 1e6（内存库插入）----
     const InsertStats wrapper_prep = PreparedWithWrapper(kRows);
     Report("prepared-memory-wrapper", kRows, wrapper_prep.ms,
@@ -555,8 +730,9 @@ int main(int argc, char** argv) {
     Report("micro-1e7-select-native", kMicroRows, native_micro.ms,
            native_micro.checksum);
 
-    // ---- 6. 逐字节一致 ----
-    ByteIdentical(dir);
+    // ---- 6. 逐字节一致（1000 行与 1e6 行两档）----
+    ByteIdentical(dir, 1000, "1k");
+    ByteIdentical(dir, kRows, "1m");
 
     // ---- 汇总（封装/原生倍数）----
     auto ratio = [](double wrapper_ms, double native_ms) {
@@ -569,6 +745,12 @@ int main(int argc, char** argv) {
                 ratio(wrapper_mem.ms, native_mem.ms));
     std::printf("select-file:   %.3fx\n",
                 ratio(wrapper_select.ms, native_select.ms));
+    std::printf("update-file:   %.3fx\n",
+                ratio(wrapper_update.ms, native_update.ms));
+    std::printf("delete-file:   %.3fx\n",
+                ratio(wrapper_delete.ms, native_delete.ms));
+    std::printf("insert-file (vs native TRANSIENT): %.3fx\n",
+                ratio(wrapper_file.ms, native_transient.ms));
     std::printf("prepared-1e6:      %.3fx\n",
                 ratio(wrapper_prep.ms, native_prep.ms));
     std::printf("micro-1e7:         %.3fx\n",

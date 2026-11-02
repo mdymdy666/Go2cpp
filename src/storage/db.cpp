@@ -188,6 +188,11 @@ bool TailIsOnlyWhitespace(const char* tail) noexcept {
     return true;
 }
 
+/// @brief 成功时返回的空错误：静态对象，热路径零构造/析构。
+/// @note 返回引用的 API 在下一次调用同一对象的方法前有效；调用方要长期
+///       保存时请拷贝（`Error e = stmt.Step();`）。
+const Error kOkError{};
+
 /// @brief 参数个数不匹配的统一错误文本。
 Error ParamCountError(int expected, std::size_t actual) {
     return Error(static_cast<int>(Code::kMisuse), 0,
@@ -303,7 +308,7 @@ Stmt::~Stmt() {
     }
 }
 
-Error Stmt::BindValues(const Value* values, std::size_t count) {
+const Error& Stmt::BindValues(const Value* values, std::size_t count) {
     if (m_stmt == nullptr) {
         m_error = Error(static_cast<int>(Code::kMisuse), 0,
                         "cannot bind a closed statement");
@@ -321,33 +326,37 @@ Error Stmt::BindValues(const Value* values, std::size_t count) {
             return m_error;
         }
     }
-    return {};
+    return kOkError;
 }
 
-Error Stmt::ClearBindings() {
+const Error& Stmt::ClearBindings() {
     if (m_stmt == nullptr) {
-        return Error(static_cast<int>(Code::kMisuse), 0,
-                     "cannot clear bindings of a closed statement");
+        m_error = Error(static_cast<int>(Code::kMisuse), 0,
+                        "cannot clear bindings of a closed statement");
+        return m_error;
     }
-    return sqlite3_clear_bindings(m_stmt) == SQLITE_OK
-               ? Error{}
-               : ErrorFromDb(sqlite3_db_handle(m_stmt), SQLITE_ERROR);
+    if (sqlite3_clear_bindings(m_stmt) != SQLITE_OK) {
+        m_error = ErrorFromDb(sqlite3_db_handle(m_stmt), SQLITE_ERROR);
+        return m_error;
+    }
+    return kOkError;
 }
 
-Error Stmt::Reset() {
+const Error& Stmt::Reset() {
     if (m_stmt == nullptr) {
-        return Error(static_cast<int>(Code::kMisuse), 0,
-                     "cannot reset a closed statement");
+        m_error = Error(static_cast<int>(Code::kMisuse), 0,
+                        "cannot reset a closed statement");
+        return m_error;
     }
     // sqlite3_reset 的返回值是「上一次 Step 的错误」；这里不重复上报，
     // 错误已在 Step 时返回给调用方（见头文件说明）。
     (void)sqlite3_reset(m_stmt);
     m_has_row = false;
     m_done = false;
-    return {};
+    return kOkError;
 }
 
-Error Stmt::Step() {
+const Error& Stmt::Step() {
     if (m_stmt == nullptr) {
         m_error = Error(static_cast<int>(Code::kMisuse), 0,
                         "cannot step a closed statement");
@@ -358,19 +367,19 @@ Error Stmt::Step() {
     const int rc = sqlite3_step(m_stmt);
     if (rc == SQLITE_ROW) {
         m_has_row = true;
-        return {};
+        return kOkError;
     }
     if (rc == SQLITE_DONE) {
         m_done = true;
-        return {};
+        return kOkError;
     }
     m_error = ErrorFromDb(sqlite3_db_handle(m_stmt), rc);
     return m_error;
 }
 
-Error Stmt::Finalize() {
+const Error& Stmt::Finalize() {
     if (m_stmt == nullptr) {
-        return {};
+        return kOkError;
     }
     // finalize 的返回值是上一次执行的错误码；错误已由 Step 返回，这里
     // 只负责释放，不再重复上报。
@@ -381,7 +390,7 @@ Error Stmt::Finalize() {
     m_column_count = 0;
     m_has_row = false;
     m_done = false;
-    return {};
+    return kOkError;
 }
 
 bool Stmt::IsNull(int column) const {
@@ -471,7 +480,7 @@ bool Rows::Next() {
         // 已遍历到结尾：重复 Next 不重新执行（再 step 会返回 SQLITE_MISUSE）。
         return false;
     }
-    const Error error = m_stmt.Step();
+    const Error& error = m_stmt.Step();
     if (error) {
         m_err = error;
         return false;

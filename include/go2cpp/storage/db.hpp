@@ -325,24 +325,25 @@ public:
     /**
      * @brief 绑定全部参数（变参版本）。
      * @return 成功返回空错误；个数不匹配或绑定失败返回错误。
+     * @note 返回的引用在下一次调用本对象的方法前有效，需要保存请拷贝。
      * @note 只绑定参数，不执行；`Step` 前可反复调用覆盖。
      */
     template <typename... Args>
-    Error Bind(const Args&... args) {
+    const Error& Bind(const Args&... args) {
         const auto values = MakeValues(args...);
         return BindValues(values.data(), values.size());
     }
 
     /// @brief 按数组绑定；个数必须等于 `ParameterCount()`。
-    Error BindValues(const Value* values, std::size_t count);
+    const Error& BindValues(const Value* values, std::size_t count);
     /// @brief 按 `std::array` 绑定。
     template <std::size_t N>
-    Error BindValues(const std::array<Value, N>& values) {
+    const Error& BindValues(const std::array<Value, N>& values) {
         return BindValues(values.data(), N);
     }
 
     /// @brief 清空全部绑定（未绑定的参数在 Step 时视为 NULL）。
-    Error ClearBindings();
+    const Error& ClearBindings();
 
     /**
      * @brief 重置语句到执行前状态，保留绑定值。
@@ -350,14 +351,14 @@ public:
      * @note 不返回上一次执行的错误——错误已在 `Step` 时返回过，这里重复
      *       上报会让调用方误判为 Reset 失败。
      */
-    Error Reset();
+    const Error& Reset();
 
     /**
      * @brief 执行一步。
      * @return 有行（ROW）或执行完毕（DONE）都返回空错误；否则返回错误。
      *         执行后用 `HasRow()` 区分「有行」与「完毕」。
      */
-    Error Step();
+    const Error& Step();
 
     /// @brief 上一次 `Step` 是否停在结果行。
     bool HasRow() const noexcept { return m_has_row; }
@@ -367,7 +368,7 @@ public:
     const Error& Err() const noexcept { return m_error; }
 
     /// @brief 手动 finalize；幂等，之后 `Valid()` 为 false。
-    Error Finalize();
+    const Error& Finalize();
 
     /// @brief 列是否为 NULL。
     bool IsNull(int column) const;
