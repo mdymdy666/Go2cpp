@@ -29,6 +29,8 @@
 
 #include "go2cpp/media/audio.hpp"
 
+#include "go2cpp/hash/fnv.hpp"
+
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -95,13 +97,9 @@ inline std::uint32_t GetBe32(const std::uint8_t* data) noexcept {
 }
 
 /// @brief FNV-1a 64（与 VideoFrame::Checksum 同一算法，便于跨模块对齐）。
+/// @note 偏移量沿用历史的 1469598103934665603（少一位），保证既有校验值不变。
 std::uint64_t Fnv1a64(const std::uint8_t* data, std::size_t bytes) noexcept {
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (std::size_t i = 0; i < bytes; ++i) {
-        hash ^= data[i];
-        hash *= 1099511628211ULL;
-    }
-    return hash;
+    return go2cpp::hash::Fnv1a64Update(1469598103934665603ULL, data, bytes);
 }
 
 // ---------------------------------------------------------------------------

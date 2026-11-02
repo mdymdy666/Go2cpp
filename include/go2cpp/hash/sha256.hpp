@@ -59,15 +59,21 @@ namespace go2cpp::hash {
 /**
  * @brief SHA-256 摘要器（FIPS 180-4）。
  *
- * @details 性能预期：Release（`-O3`）下 200~500 MB/s 属正常范围（标量实现，
- *          未用 SHA-NI 指令）；与 Go 的汇编实现相比会有差距，但满足「纯 C++、
- *          零依赖」的约束。压测数据见 `tests/hash/test_hash_stress.cpp`。
+ * @details 压缩函数有两套实现，进程内按 CPUID 自动选择：
+ *          - x86-64 且 CPU 支持 SHA 扩展（Intel Goldmont / AMD Zen 起）时走
+ *            SHA-NI（`sha256rnds2` / `sha256msg1` / `sha256msg2`），按整块
+ *            批量压缩，实测约 2.2~2.3 GB/s；
+ *          - 其它平台或不支持 SHA-NI 时走标量实现（约 0.42~0.47 GB/s）。
+ *          两条路径的输出逐字节一致（`tests/hash/` 对拍）。运行时检测用
+ *          `__builtin_cpu_supports("sha")`，进程内只做一次；不引入新的链接
+ *          依赖（仍是纯 C++ + 编译器自带 intrinsics）。
  *
  * ## 定位
  *
  * 本模块的默认安全摘要，供需要抗碰撞的调用方直接使用（一次性用 `Digest`，
- * 流式用 `Write`+`Sum`），也可作为 `Hash&` 擦除；当前仓库调用方仅为
- * `tests/hash/`。
+ * 流式用 `Write`+`Sum`），也可作为 `Hash&` 擦除。生产调用方：
+ * `logging/redact`（`key_id`，一次性摘要）与 `app/sha256_ni.hpp`（资源校验，
+ * 薄转发到本类）。
  *
  * ## 状态机
  *
@@ -105,13 +111,23 @@ class Sha256 final : public Hash {
 
     /**
      * @brief 一次性计算 SHA-256（对应 Go `sha256.Sum256`）。
+     *
+     * @details 直接压缩整块 + 一次填充，不经过流式 `Write`/`Sum` 的对象拷贝，
+     *          适合 `redact` 这类「短输入、高频调用」的场景。
      * @param data 输入字节视图（只读）。
      * @return 32 字节摘要。
      */
     static std::array<std::uint8_t, kSize> Digest(ByteSpan data);
 
+    /// @brief 当前进程是否启用 SHA-NI 硬件加速（CPUID 只探测一次）。
+    /// @note 设置 `GO2CPP_HASH_DISABLE_SHA_NI` 环境变量可强制标量路径（测试用），
+    ///       此时返回 false。
+    static bool HardwareAccelerated() noexcept;
+
  private:
     void Transform(const std::uint8_t* block) noexcept;
+    /// @brief 连续压缩 `blocks` 个块；硬件路径一次调用摊掉逐块调度开销。
+    void TransformRange(const std::uint8_t* data, std::size_t blocks) noexcept;
     void Finish(std::uint8_t* out) noexcept;
 
     std::uint32_t m_state[8]{};  ///< A..H 八个链接变量；Reset 置初值、Transform 更新、Finish 输出

@@ -8,6 +8,8 @@
 
 #include "go2cpp/p2p/endpoint.hpp"
 
+#include "go2cpp/hash/fnv.hpp"
+
 #include <arpa/inet.h>
 #include <netdb.h>
 
@@ -18,15 +20,9 @@
 namespace go2cpp::p2p {
 namespace {
 
-constexpr std::size_t kFnvOffsetBasis = 1469598103934665603ULL;
-constexpr std::size_t kFnvPrime = 1099511628211ULL;
-
-void HashBytes(std::size_t* hash, const std::uint8_t* data, std::size_t length) noexcept {
-    for (std::size_t index = 0; index < length; ++index) {
-        *hash ^= static_cast<std::size_t>(data[index]);
-        *hash *= kFnvPrime;
-    }
-}
+// 历史偏移量少一位（标准值是 14695981039346656037）；该值已进入线上候选
+// 排序结果，不能顺手改，保持逐字节兼容。
+constexpr std::uint64_t kFnvOffsetBasis = 1469598103934665603ULL;
 
 bool ParsePort(std::string_view text, std::uint16_t* port) {
     if (text.empty() || text.size() > 5) {
@@ -349,15 +345,15 @@ bool Endpoint::operator<(const Endpoint& other) const noexcept {
 }
 
 std::size_t Endpoint::Hash() const noexcept {
-    std::size_t hash = kFnvOffsetBasis;
+    std::uint64_t hash = kFnvOffsetBasis;
     const std::uint8_t family_byte = static_cast<std::uint8_t>(family() & 0xFF);
-    HashBytes(&hash, &family_byte, 1);
+    hash = go2cpp::hash::Fnv1a64Update(hash, &family_byte, 1);
     const auto bytes = AddressBytes();
-    HashBytes(&hash, bytes.data(), bytes.size());
+    hash = go2cpp::hash::Fnv1a64Update(hash, bytes.data(), bytes.size());
     const std::uint8_t port_bytes[2] = {static_cast<std::uint8_t>(port() >> 8U),
                                         static_cast<std::uint8_t>(port() & 0xFFU)};
-    HashBytes(&hash, port_bytes, sizeof(port_bytes));
-    return hash;
+    hash = go2cpp::hash::Fnv1a64Update(hash, port_bytes, sizeof(port_bytes));
+    return static_cast<std::size_t>(hash);
 }
 
 std::optional<Endpoint> ResolveEndpoint(std::string_view host, std::uint16_t port,

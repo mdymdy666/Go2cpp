@@ -12,6 +12,7 @@
 #include "go2cpp/hash/sha1.hpp"
 
 #include "go2cpp/hash/hash.hpp"
+#include "go2cpp/network/endian.hpp"
 
 #include <cassert>
 #include <cstddef>
@@ -26,12 +27,9 @@ inline std::uint32_t Rotl(std::uint32_t value, int shift) noexcept {
     return (value << shift) | (value >> (32 - shift));
 }
 
-/// 读 4 字节 big-endian（SHA-1 消息字与长度字段均为大端）。
+/// 读 4 字节 big-endian（委托 network/endian.hpp 的唯一实现）。
 inline std::uint32_t LoadBE32(const std::uint8_t* p) noexcept {
-    return (static_cast<std::uint32_t>(p[0]) << 24) |
-           (static_cast<std::uint32_t>(p[1]) << 16) |
-           (static_cast<std::uint32_t>(p[2]) << 8) |
-           static_cast<std::uint32_t>(p[3]);
+    return go2cpp::net::ReadBE32(p);
 }
 
 }  // namespace

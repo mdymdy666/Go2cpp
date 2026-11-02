@@ -8,6 +8,9 @@
 
 #include "go2cpp/p2p/candidate.hpp"
 
+#include "go2cpp/encoding/hex_core.hpp"
+#include "go2cpp/hash/fnv.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -19,8 +22,9 @@
 namespace go2cpp::p2p {
 namespace {
 
-constexpr std::size_t kFnvOffsetBasis = 1469598103934665603ULL;
-constexpr std::size_t kFnvPrime = 1099511628211ULL;
+// 历史偏移量少一位（标准值是 14695981039346656037）；该值已进入线上
+// foundation 字符串，保持逐字节兼容。
+constexpr std::uint64_t kFnvOffsetBasis = 1469598103934665603ULL;
 
 std::string Trim(std::string_view text) {
     std::size_t begin = 0;
@@ -70,18 +74,10 @@ bool ParseU32(const std::string& text, std::uint32_t* value) {
     return true;
 }
 
-void HashBytes(std::size_t* hash, const std::uint8_t* data, std::size_t length) noexcept {
-    for (std::size_t index = 0; index < length; ++index) {
-        *hash ^= static_cast<std::size_t>(data[index]);
-        *hash *= kFnvPrime;
-    }
-}
-
 std::string Hex8(std::uint32_t value) {
-    static constexpr char kDigits[] = "0123456789abcdef";
     std::string text(8, '0');
     for (std::size_t index = 0; index < 8; ++index) {
-        text[7 - index] = kDigits[value & 0xFU];
+        text[7 - index] = encoding::hexcore::kLowerHexDigits[value & 0xFU];
         value >>= 4U;
     }
     return text;
@@ -226,11 +222,12 @@ void FinalizeCandidate(Candidate* candidate, std::uint32_t local_pref) {
 }
 
 std::string MakeFoundation(CandidateType type, const Endpoint& base) {
-    std::size_t hash = kFnvOffsetBasis;
+    std::uint64_t hash = kFnvOffsetBasis;
     const std::uint8_t type_byte = static_cast<std::uint8_t>(type);
-    HashBytes(&hash, &type_byte, 1);
+    hash = go2cpp::hash::Fnv1a64Update(hash, &type_byte, 1);
     const std::string text = base.valid() ? base.ToString() : "<invalid>";
-    HashBytes(&hash, reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+    hash = go2cpp::hash::Fnv1a64Update(
+        hash, reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
     return Hex8(static_cast<std::uint32_t>(hash & 0xFFFFFFFFULL));
 }
 

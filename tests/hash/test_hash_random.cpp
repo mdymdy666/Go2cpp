@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <random>
 #include <sstream>
@@ -287,6 +288,39 @@ void CheckCrcUpdateComposition() {
     }
 }
 
+
+// 一次性 Digest（整块批量 + 单次填充）与流式 Write/Sum 必须逐字节一致。
+// 覆盖批量压缩路径、块边界与随机分片，防止两条代码路径漂移。
+void CheckSha256DigestPaths() {
+    go2cpp_hash_test::Announce("random: sha256 Digest vs streaming");
+    std::mt19937_64 rng(0x5eed5eed5eed5eedULL);
+    for (int iteration = 0; iteration < 20000; ++iteration) {
+        const std::size_t length =
+            (iteration % 3 == 0) ? (rng() % 4096) : (rng() % 200);
+        std::vector<std::uint8_t> data(length);
+        for (std::uint8_t& byte : data) {
+            byte = static_cast<std::uint8_t>(rng() & 0xFFu);
+        }
+
+        const auto oneshot = Sha256::Digest(AsBytes(data));
+
+        Sha256 hasher;
+        std::size_t offset = 0;
+        while (offset < length) {
+            std::size_t take = 1 + (rng() % 97);
+            if (take > length - offset) {
+                take = length - offset;
+            }
+            hasher.Write(AsBytes(data.data() + offset, take));
+            offset += take;
+        }
+        std::uint8_t streamed[32] = {};
+        hasher.Sum(AsBytes(streamed, sizeof(streamed)));
+        HASH_CHECK(oneshot.size() == sizeof(streamed));
+        HASH_CHECK(std::memcmp(oneshot.data(), streamed, sizeof(streamed)) == 0);
+    }
+}
+
 void CheckSingleBitDetection() {
     go2cpp_hash_test::Announce("random: CRC single-bit flip detection");
     std::mt19937_64 rng(0xa4093822299f31d0ULL);
@@ -318,5 +352,6 @@ void RunRandomTests() {
     CheckRandomFuzz();
     CheckIndependentReferences();
     CheckCrcUpdateComposition();
+    CheckSha256DigestPaths();
     CheckSingleBitDetection();
 }

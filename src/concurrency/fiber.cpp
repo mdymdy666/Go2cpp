@@ -24,6 +24,7 @@
 #include "go2cpp/fiber.hpp"
 
 #include "go2cpp/debug/debug_resources.hpp"
+#include "go2cpp/hash/fnv.hpp"
 
 #include "go2cpp/detail/context_backend.hpp"
 #include "go2cpp/fiber_local.hpp"
@@ -3022,12 +3023,7 @@ const MigrationModuleSpan* MigrationFindModuleForAddress(
 }
 
 std::uint64_t MigrationFnv1a(const std::uint8_t* data, std::size_t size) {
-    std::uint64_t hash = 0xcbf29ce484222325ULL;
-    for (std::size_t index = 0; index < size; ++index) {
-        hash ^= data[index];
-        hash *= 0x100000001b3ULL;
-    }
-    return hash;
+    return go2cpp::hash::Fnv1a64(data, size);
 }
 
 /// 读取 ELF 文件的 GNU build-id 并哈希成 u64；失败返回 false。
