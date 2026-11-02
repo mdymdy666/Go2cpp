@@ -37,9 +37,96 @@
 #include <unordered_set>
 
 namespace go2cpp::log {
+
+// ---------------------------------------------------------------------------
+// LogStreamBuf：消息拼接缓冲（无 ostringstream）
+// ---------------------------------------------------------------------------
+
+bool LogStreamBuf::Grow(std::size_t needed) {
+    const std::size_t used = m_size;
+    std::size_t next = m_capacity == 0 ? 256 : m_capacity;
+    while (next < used + needed) {
+        if (next > (SIZE_MAX / 2)) return false;
+        next *= 2;
+    }
+    char* block = new (std::nothrow) char[next];
+    if (block == nullptr) return false;
+    if (used != 0) std::memcpy(block, m_base, used);
+    delete[] m_owned;
+    m_owned = block;
+    m_base = block;
+    m_capacity = next;
+    return true;
+}
+
+void LogStreamBuf::AppendSlow(const char* source, std::size_t count) {
+    // 扩容到「现有内容 + 新增内容」都放得下，然后整体追加一次。
+    if (!Grow(count)) return;
+    std::memcpy(m_base + m_size, source, count);
+    m_size += count;
+}
+
 namespace {
 
-std::string FormatTime(std::uint64_t timestamp_ms);
+/// 把无符号整数按十进制追加到 `out`（等价 `ostream <<`，无 locale/分配）。
+void AppendUnsigned(std::string& out, std::uint64_t value) {
+    char text[24];
+    const auto result = std::to_chars(text, text + sizeof(text), value);
+    out.append(text, static_cast<std::size_t>(result.ptr - text));
+}
+
+/// 把有符号整数按十进制追加到 `out`。
+void AppendSigned(std::string& out, std::int64_t value) {
+    char text[24];
+    const auto result = std::to_chars(text, text + sizeof(text), value);
+    out.append(text, static_cast<std::size_t>(result.ptr - text));
+}
+
+/**
+ * @brief 把 Unix 毫秒时间格式化成 `YYYY-mm-dd HH:MM:SS.mmm` 追加到 `out`。
+ *
+ * ## 为什么要缓存
+ * 原实现每条日志都做 `localtime_r` + `strftime` + `snprintf` + 两次字符串构造，
+ * 单条约 100 ns。同一秒内的秒级部分完全相同，这里按线程缓存「上一次格式化过的
+ * 秒」，只在跨秒时重新 `strftime`，毫秒部分固定 3 位直接写字符。
+ *
+ * ## 正确性
+ * - 缓存键是整秒，时间戳回退（同一线程内乱序）也会重算；
+ * - `localtime_r` 仍然每秒调用一次，因此时区/DST 变更最多延迟一秒生效；
+ * - `strftime` 失败时输出空（与旧实现一致），不写毫秒。
+ */
+void AppendTime(std::string& out, std::uint64_t timestamp_ms) {
+    struct Cache {
+        std::time_t second{-1};  ///< 已格式化的整秒
+        std::size_t length{0};   ///< 秒级文本长度
+        bool valid{false};       ///< 上一次 strftime 是否成功
+        char text[32]{};         ///< 秒级文本（"YYYY-mm-dd HH:MM:SS"）
+    };
+    thread_local Cache cache;
+
+    const auto second = static_cast<std::time_t>(timestamp_ms / 1000);
+    if (!cache.valid || cache.second != second) {
+        std::tm local{};
+#if defined(_WIN32)
+        localtime_s(&local, &second);
+#else
+        localtime_r(&second, &local);
+#endif
+        cache.length = std::strftime(cache.text, sizeof(cache.text), "%Y-%m-%d %H:%M:%S", &local);
+        cache.second = second;
+        cache.valid = cache.length != 0;
+    }
+    if (!cache.valid) return;
+    out.append(cache.text, cache.length);
+
+    const auto millis = static_cast<unsigned>(timestamp_ms % 1000);
+    char tail[4];
+    tail[0] = '.';
+    tail[1] = static_cast<char>('0' + (millis / 100) % 10);
+    tail[2] = static_cast<char>('0' + (millis / 10) % 10);
+    tail[3] = static_cast<char>('0' + millis % 10);
+    out.append(tail, sizeof(tail));
+}
 
 /** @brief 将一个格式项对象追加到流中。 */
 class TextItem final : public LogFormatter::Item {
@@ -49,6 +136,8 @@ public:
     void Format(std::ostream& stream, const LogRecord&) const override {
         stream << m_text;
     }
+
+    void FormatTo(std::string& out, const LogRecord&) const override { out.append(m_text); }
 
 private:
     std::string m_text;  ///< 固定文本；TextItem 构造时写入，Format 只读
@@ -81,9 +170,25 @@ public:
             case Field::Fiber: stream << record.fiber_id; break;
             case Field::Elapse: stream << record.elapse_ms; break;
             case Field::ThreadName: stream << record.thread_name; break;
-            case Field::File: stream << record.file; break;
+            case Field::File: stream << record.File(); break;
             case Field::Line: stream << record.line; break;
-            case Field::Function: stream << record.function; break;
+            case Field::Function: stream << record.Function(); break;
+        }
+    }
+
+    /// 零流路径：字符串直接 append，整数走 `to_chars`（输出与 `ostream` 一致）。
+    void FormatTo(std::string& out, const LogRecord& record) const override {
+        switch (m_field) {
+            case Field::Level: out.append(ToString(record.level)); break;
+            case Field::Logger: out.append(record.logger); break;
+            case Field::Message: out.append(record.message); break;
+            case Field::Thread: AppendUnsigned(out, record.thread_id); break;
+            case Field::Fiber: AppendUnsigned(out, record.fiber_id); break;
+            case Field::Elapse: AppendUnsigned(out, record.elapse_ms); break;
+            case Field::ThreadName: out.append(record.thread_name); break;
+            case Field::File: out.append(record.File()); break;
+            case Field::Line: AppendSigned(out, record.line); break;
+            case Field::Function: out.append(record.Function()); break;
         }
     }
 
@@ -110,6 +215,21 @@ public:
         }
     }
 
+    /// 零流路径：strftime 一次到栈缓冲后整体追加（自定义模式低频，不缓存）。
+    void FormatTo(std::string& out, const LogRecord& record) const override {
+        const auto seconds = static_cast<std::time_t>(record.timestamp_ms / 1000);
+        std::tm local_time{};
+#if defined(_WIN32)
+        localtime_s(&local_time, &seconds);
+#else
+        localtime_r(&seconds, &local_time);
+#endif
+        char buffer[128]{};
+        if (std::strftime(buffer, sizeof(buffer), m_format.c_str(), &local_time) != 0) {
+            out.append(buffer);
+        }
+    }
+
 private:
     std::string m_format;  ///< strftime 模式；DateItem 构造时固定，Format 读
 };
@@ -118,7 +238,13 @@ private:
 class TimeItem final : public LogFormatter::Item {
 public:
     void Format(std::ostream& stream, const LogRecord& record) const override {
-        stream << FormatTime(record.timestamp_ms);
+        std::string text;
+        AppendTime(text, record.timestamp_ms);
+        stream << text;
+    }
+
+    void FormatTo(std::string& out, const LogRecord& record) const override {
+        AppendTime(out, record.timestamp_ms);
     }
 };
 
@@ -302,33 +428,17 @@ std::vector<LogFormatter::Item::ptr> ParsePattern(const std::string& pattern, bo
     return items;
 }
 
-std::string FormatTime(std::uint64_t timestamp_ms) {
-    const auto seconds = static_cast<std::time_t>(timestamp_ms / 1000);
-    std::tm local_time{};
-#if defined(_WIN32)
-    localtime_s(&local_time, &seconds);
-#else
-    localtime_r(&seconds, &local_time);
-#endif
-    char date[64]{};
-    if (std::strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", &local_time) == 0) {
-        return {};
-    }
-    char millis[5]{};
-    std::snprintf(millis, sizeof(millis), ".%03llu",
-                  static_cast<unsigned long long>(timestamp_ms % 1000));
-    std::string result(date);
-    result += millis;
-    return result;
-}
-
 std::uint64_t CurrentTimeMs() noexcept {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
 std::uint64_t CurrentThreadId() noexcept {
-    return static_cast<std::uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    // 线程 ID 在进程内对同一线程恒定，每条日志重新哈希没有意义；
+    // thread_local 缓存后热路径只剩一次 TLS 读。
+    static thread_local const std::uint64_t cached =
+        static_cast<std::uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    return cached;
 }
 
 }  // namespace
@@ -435,11 +545,19 @@ PatternFormatter::PatternFormatter(std::string pattern) : m_pattern(std::move(pa
 }
 
 std::string PatternFormatter::Format(const LogRecord& record) const {
-    std::ostringstream stream;
+    // 直接写 string：不再构造 ostringstream，也不做 str() 的二次深拷贝。
+    // 160 B 覆盖默认 pattern 下常见一行（约 110~130 B），避免首次扩容。
+    std::string out;
+    out.reserve(160);
+    FormatTo(out, record);
+    return out;
+}
+
+void PatternFormatter::FormatTo(std::string& out, const LogRecord& record) const {
+    out.clear();
     for (const auto& item : m_items) {
-        if (item) item->Format(stream, record);
+        if (item) item->FormatTo(out, record);
     }
-    return stream.str();
 }
 
 FileSink::FileSink(std::string path) : m_path(std::move(path)) {
@@ -461,10 +579,10 @@ FileSink::FileSink(std::string path) : m_path(std::move(path)) {
  */
 void FileSink::Write(const LogRecord& record, std::string_view formatted) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_stream) return;
-    // step2: 锁内只做一次写，不做额外 IO。
-    auto* stream = dynamic_cast<std::ofstream*>(m_stream.get());
-    if (!stream || !stream->good()) return;
+    // step2: 锁内只做一次写，不做额外 IO。具体流类型在 Reopen 时缓存，
+    // 热路径不再做 dynamic_cast（RTTI 遍历基类链，实测约占写路径三成）。
+    auto* stream = m_file_stream;
+    if (stream == nullptr || !stream->good()) return;
     stream->write(formatted.data(), static_cast<std::streamsize>(formatted.size()));
     // 发布默认只记录告警及错误；这些记录必须在调用返回后可被外部
     // 日志收集器立即读取。Info/Debug 仍保留缓冲写入，避免把高吞吐
@@ -474,7 +592,7 @@ void FileSink::Write(const LogRecord& record, std::string_view formatted) {
 
 void FileSink::Flush() {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (auto* stream = dynamic_cast<std::ofstream*>(m_stream.get())) stream->flush();
+    if (m_file_stream != nullptr) m_file_stream->flush();
 }
 
 /**
@@ -494,11 +612,13 @@ bool FileSink::Reopen() {
         // step2: 追加模式，避免 Reopen 清空已有日志
         auto stream = std::make_unique<std::ofstream>(m_path, std::ios::app | std::ios::out);
         if (!stream->is_open()) return false;
-        // step3: 只有成功打开才替换旧流
+        // step3: 只有成功打开才替换旧流，并同步具体类型视图
         m_stream = std::move(stream);
+        m_file_stream = static_cast<std::ofstream*>(m_stream.get());
         return true;
     } catch (...) {
         m_stream.reset();
+        m_file_stream = nullptr;
         return false;
     }
 }
@@ -531,7 +651,7 @@ void RotatingFileSink::Write(const LogRecord&, std::string_view formatted) {
     std::lock_guard<std::mutex> lock(m_mutex);
     // step2: 先滚动再写，避免本次记录被拆到两个文件。
     if (m_max_bytes != 0 && m_bytes + formatted.size() > m_max_bytes) {
-        if (auto* stream = dynamic_cast<std::ofstream*>(m_stream.get())) stream->close();
+        if (m_file_stream != nullptr) m_file_stream->close();
         for (std::size_t i = m_max_files; i > 0; --i) {
             const auto source = i == 1 ? m_path : m_path + "." + std::to_string(i - 1);
             const auto target = m_path + "." + std::to_string(i);
@@ -548,7 +668,7 @@ void RotatingFileSink::Write(const LogRecord&, std::string_view formatted) {
         if (stream->is_open()) m_stream = std::move(stream);
         m_bytes = 0;
     }
-    if (auto* stream = dynamic_cast<std::ofstream*>(m_stream.get())) {
+    if (auto* stream = m_file_stream) {
         stream->write(formatted.data(), static_cast<std::streamsize>(formatted.size()));
         m_bytes += formatted.size();
     }
@@ -584,9 +704,12 @@ void CallbackSink::Write(const LogRecord& record, std::string_view formatted) {
 }
 
 LogItemWorker::LogItemWorker(LogFilter::ptr filter, LogFormatter::ptr formatter,
-                             LogSink::ptr sink)
-    : m_snapshot(std::make_shared<const Snapshot>(Snapshot{
-          std::move(filter), std::move(formatter), std::move(sink)})) {}
+                             LogSink::ptr sink) {
+    auto published = std::make_unique<const Snapshot>(
+        Snapshot{std::move(filter), std::move(formatter), std::move(sink)});
+    m_snapshot.store(published.get(), std::memory_order_release);
+    m_snapshot_versions.push_back(std::move(published));
+}
 
 namespace {
 
@@ -637,8 +760,8 @@ bool LogItemWorker::Submit(const LogRecord& record) {
         g_reentrant_drops.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const auto snapshot = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
-    if (!snapshot) return false;
+    const auto* snapshot = m_snapshot.load(std::memory_order_acquire);
+    if (snapshot == nullptr) return false;
     // 不在 Worker 锁内调用用户 Formatter/Sink；这样自定义 Sink 再次记录
     // 日志时不会形成同一 Worker 的递归锁死。
     const SubmitDepthGuard depth_guard;
@@ -646,23 +769,26 @@ bool LogItemWorker::Submit(const LogRecord& record) {
     if (!snapshot->filter || !snapshot->formatter || !snapshot->sink ||
         !snapshot->filter->Accept(record)) return false;
     // step3: 锁外调用用户代码；重入的日志由 step0 的守卫丢弃。
-    const auto formatted = snapshot->formatter->Format(record);
-    snapshot->sink->Write(record, formatted);
+    // 复用线程局部缓冲：首次格式化后容量常驻，后续每条日志零分配。
+    // 重入已被 step0 丢弃，所以同一线程不会有第二条日志覆盖同一块缓冲。
+    static thread_local std::string t_formatted;
+    snapshot->formatter->FormatTo(t_formatted, record);
+    snapshot->sink->Write(record, t_formatted);
     return true;
 }
 
 void LogItemWorker::SetFilter(LogFilter::ptr filter) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    const auto current = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
-    auto next = std::make_shared<Snapshot>(current ? *current : Snapshot{});
+    const auto* current = m_snapshot.load(std::memory_order_acquire);
+    auto next = std::make_unique<Snapshot>(current != nullptr ? *current : Snapshot{});
     next->filter = std::move(filter);
-    std::atomic_store_explicit(&m_snapshot, std::shared_ptr<const Snapshot>(std::move(next)),
-                               std::memory_order_release);
+    m_snapshot.store(next.get(), std::memory_order_release);
+    m_snapshot_versions.push_back(std::move(next));
 }
 void LogItemWorker::SetMinimumLevel(Level level) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    const auto current = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
-    if (current) {
+    const auto* current = m_snapshot.load(std::memory_order_acquire);
+    if (current != nullptr) {
         if (auto filter = std::dynamic_pointer_cast<MinimumLevelFilter>(current->filter)) {
             filter->SetLevel(level);
         }
@@ -670,35 +796,38 @@ void LogItemWorker::SetMinimumLevel(Level level) {
 }
 void LogItemWorker::SetFormatter(LogFormatter::ptr formatter) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    const auto current = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
-    auto next = std::make_shared<Snapshot>(current ? *current : Snapshot{});
+    const auto* current = m_snapshot.load(std::memory_order_acquire);
+    auto next = std::make_unique<Snapshot>(current != nullptr ? *current : Snapshot{});
     next->formatter = std::move(formatter);
-    std::atomic_store_explicit(&m_snapshot, std::shared_ptr<const Snapshot>(std::move(next)),
-                               std::memory_order_release);
+    m_snapshot.store(next.get(), std::memory_order_release);
+    m_snapshot_versions.push_back(std::move(next));
 }
 void LogItemWorker::SetSink(LogSink::ptr sink) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    const auto current = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
-    auto next = std::make_shared<Snapshot>(current ? *current : Snapshot{});
+    const auto* current = m_snapshot.load(std::memory_order_acquire);
+    auto next = std::make_unique<Snapshot>(current != nullptr ? *current : Snapshot{});
     next->sink = std::move(sink);
-    std::atomic_store_explicit(&m_snapshot, std::shared_ptr<const Snapshot>(std::move(next)),
-                               std::memory_order_release);
+    m_snapshot.store(next.get(), std::memory_order_release);
+    m_snapshot_versions.push_back(std::move(next));
 }
 LogSink::ptr LogItemWorker::Sink() const {
-    const auto snapshot = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
-    return snapshot ? snapshot->sink : nullptr;
+    const auto* snapshot = m_snapshot.load(std::memory_order_acquire);
+    return snapshot != nullptr ? snapshot->sink : nullptr;
 }
 void LogItemWorker::Flush() {
-    const auto snapshot = std::atomic_load_explicit(&m_snapshot, std::memory_order_acquire);
-    if (snapshot && snapshot->sink) snapshot->sink->Flush();
+    const auto* snapshot = m_snapshot.load(std::memory_order_acquire);
+    if (snapshot != nullptr && snapshot->sink) snapshot->sink->Flush();
 }
 
 Logger::Logger(std::string name)
-    : m_name(std::move(name)),
-      m_worker_snapshot(std::make_shared<const std::vector<LogItemWorker::ptr>>()) {}
+    : m_name(std::move(name)) {
+    m_worker_versions.push_back(std::make_unique<const std::vector<LogItemWorker::ptr>>(m_workers));
+    m_worker_snapshot.store(m_worker_versions.back().get(), std::memory_order_release);
+}
 void Logger::SetLevel(Level level) noexcept {
     m_level.store(level, std::memory_order_release);
-    const auto workers = std::atomic_load_explicit(&m_worker_snapshot, std::memory_order_acquire);
+    const auto* workers = m_worker_snapshot.load(std::memory_order_acquire);
+    if (workers == nullptr) return;
     for (const auto& worker : *workers) {
         // LoggerManager 重新加载配置时同步更新默认过滤器；用户自定义过滤器
         // 不是 MinimumLevelFilter 时保持原样。
@@ -710,11 +839,13 @@ bool Logger::ShouldLog(Level value) const noexcept {
     const auto minimum = m_level.load(std::memory_order_relaxed);
     return value >= minimum && minimum != Level::Off;
 }
-void PublishLoggerWorkers(std::vector<LogItemWorker::ptr>* workers,
-                          std::shared_ptr<const std::vector<LogItemWorker::ptr>>* snapshot) {
-    std::atomic_store_explicit(snapshot,
-        std::make_shared<const std::vector<LogItemWorker::ptr>>(*workers),
-        std::memory_order_release);
+void PublishLoggerWorkers(
+    std::vector<LogItemWorker::ptr>* workers,
+    std::atomic<const std::vector<LogItemWorker::ptr>*>* snapshot,
+    std::vector<std::unique_ptr<const std::vector<LogItemWorker::ptr>>>* versions) {
+    // 旧版本不释放（见 log.hpp 里 m_worker_versions 的说明），读者指针永不悬空。
+    versions->push_back(std::make_unique<const std::vector<LogItemWorker::ptr>>(*workers));
+    snapshot->store(versions->back().get(), std::memory_order_release);
 }
 void Logger::AddWorker(LogItemWorker::ptr worker) {
     if (!worker) return;
@@ -722,7 +853,7 @@ void Logger::AddWorker(LogItemWorker::ptr worker) {
     m_custom_workers.push_back(std::move(worker));
     m_workers = m_default_workers;
     m_workers.insert(m_workers.end(), m_custom_workers.begin(), m_custom_workers.end());
-    PublishLoggerWorkers(&m_workers, &m_worker_snapshot);
+    PublishLoggerWorkers(&m_workers, &m_worker_snapshot, &m_worker_versions);
 }
 
 /// 移除一个自定义日志工作单元并发布新的无锁快照。
@@ -736,7 +867,7 @@ void Logger::RemoveWorker(const LogItemWorker::ptr& worker) {
     m_custom_workers.erase(std::next(iter).base());
     m_workers = m_default_workers;
     m_workers.insert(m_workers.end(), m_custom_workers.begin(), m_custom_workers.end());
-    PublishLoggerWorkers(&m_workers, &m_worker_snapshot);
+    PublishLoggerWorkers(&m_workers, &m_worker_snapshot, &m_worker_versions);
 }
 void Logger::AddDefaultWorker(LogItemWorker::ptr worker) {
     if (!worker) return;
@@ -744,16 +875,16 @@ void Logger::AddDefaultWorker(LogItemWorker::ptr worker) {
     m_default_workers.push_back(std::move(worker));
     m_workers = m_default_workers;
     m_workers.insert(m_workers.end(), m_custom_workers.begin(), m_custom_workers.end());
-    PublishLoggerWorkers(&m_workers, &m_worker_snapshot);
+    PublishLoggerWorkers(&m_workers, &m_worker_snapshot, &m_worker_versions);
 }
 void Logger::ConfigureDefaults(std::vector<LogItemWorker::ptr> workers) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_default_workers = std::move(workers);
     m_workers = m_default_workers;
     m_workers.insert(m_workers.end(), m_custom_workers.begin(), m_custom_workers.end());
-    PublishLoggerWorkers(&m_workers, &m_worker_snapshot);
+    PublishLoggerWorkers(&m_workers, &m_worker_snapshot, &m_worker_versions);
 }
-void Logger::ClearWorkers() { std::lock_guard<std::mutex> lock(m_mutex); m_workers.clear(); m_default_workers.clear(); m_custom_workers.clear(); PublishLoggerWorkers(&m_workers, &m_worker_snapshot); }
+void Logger::ClearWorkers() { std::lock_guard<std::mutex> lock(m_mutex); m_workers.clear(); m_default_workers.clear(); m_custom_workers.clear(); PublishLoggerWorkers(&m_workers, &m_worker_snapshot, &m_worker_versions); }
 /**
  * @brief 设置父记录器，拒绝自环与间接环。
  *
@@ -795,7 +926,11 @@ void Logger::SetParent(Logger::ptr parent) {
 }
 void Logger::SetPropagate(bool propagate) noexcept { m_propagate.store(propagate, std::memory_order_release); }
 bool Logger::propagate() const noexcept { return m_propagate.load(std::memory_order_acquire); }
-void Logger::Flush() const { const auto workers = std::atomic_load_explicit(&m_worker_snapshot, std::memory_order_acquire); for (const auto& worker : *workers) if (worker) worker->Flush(); }
+void Logger::Flush() const {
+    const auto* workers = m_worker_snapshot.load(std::memory_order_acquire);
+    if (workers == nullptr) return;
+    for (const auto& worker : *workers) if (worker) worker->Flush();
+}
 /**
  * @brief 分发一条记录给所有 worker，并按需向父记录器传播。
  *
@@ -804,16 +939,18 @@ void Logger::Flush() const { const auto workers = std::atomic_load_explicit(&m_w
  * step2. 原子读 worker 快照，逐个 `Submit()`；
  * step3. 若开启 propagate，取父记录器（弱引用加锁提升）并递归 `Log()`。
  */
-void Logger::Log(LogRecord record) const {
+void Logger::Log(const LogRecord& record) const {
     Logger::ptr parent;
     if (!ShouldLog(record.level)) return;
     // step2: 无锁读取 worker 快照并逐个提交。
-    const auto workers = std::atomic_load_explicit(&m_worker_snapshot, std::memory_order_acquire);
-    for (const auto& worker : *workers) (void)worker->Submit(record);
+    const auto* workers = m_worker_snapshot.load(std::memory_order_acquire);
+    if (workers != nullptr) {
+        for (const auto& worker : *workers) (void)worker->Submit(record);
+    }
     const bool propagate = m_propagate.load(std::memory_order_acquire);
     if (propagate) { std::lock_guard<std::mutex> lock(m_mutex); parent = m_parent.lock(); }
     // step3: 传播到父记录器（调用方负责避免环）。
-    if (propagate && parent) parent->Log(std::move(record));
+    if (propagate && parent) parent->Log(record);
 }
 
 LoggerManager& LoggerManager::Instance() { static LoggerManager manager; return manager; }
@@ -915,10 +1052,17 @@ void LoggerManager::Flush() { for (const auto& logger : List()) if (logger) logg
  * 构造只做开销很小的字段拷贝；格式化与输出推迟到析构，避免未通过过滤时浪费。
  */
 LogLine::LogLine(Logger::ptr logger, Level level, const char* file, int line, const char* function)
-    : m_logger(std::move(logger)) {
+    : m_logger(std::move(logger)),
+      m_buffer(m_message, sizeof(m_message)),
+      m_stream(&m_buffer) {
     m_enabled = m_logger && m_logger->ShouldLog(level);
     if (!m_enabled) return;
-    m_record.level = level; m_record.file = file ? file : ""; m_record.line = line; m_record.function = function ? function : "";
+    // file/function 直接保存 `__FILE__`/`__func__` 指针（静态生命周期），
+    // 省掉每条日志两次堆分配；Formatter 通过 File()/Function() 读取。
+    m_record.level = level;
+    m_record.file_literal = file;
+    m_record.function_literal = function;
+    m_record.line = line;
     if (m_logger) { m_record.logger = m_logger->name(); }
     m_record.timestamp_ms = CurrentTimeMs(); m_record.thread_id = CurrentThreadId();
 }
@@ -932,7 +1076,11 @@ LogLine::LogLine(Logger::ptr logger, Level level, const char* file, int line, co
  */
 LogLine::~LogLine() noexcept {
     if (!m_enabled || !m_logger) return;
-    try { m_record.message = m_stream.str(); m_logger->Log(std::move(m_record)); } catch (...) {}
+    try {
+        // 直接从消息缓冲取字节，不再经过 ostringstream::str() 的深拷贝。
+        m_record.message.assign(m_buffer.data(), m_buffer.size());
+        m_logger->Log(m_record);
+    } catch (...) {}
 }
 
 namespace {

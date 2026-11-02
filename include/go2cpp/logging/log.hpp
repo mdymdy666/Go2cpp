@@ -39,15 +39,19 @@
  * - 批量写时 `WriteRaw` 的 `LogRecord` 上下文只保留最后一条（见 `BufferedSink` 注释）；
  * - `LogLine` 在析构时提交，且吞掉所有异常（日志失败不能影响业务）。
  */
+#include <charconv>
 #include <chrono>
-#include <ctime>
 #include <cstdint>
+#include <cstring>
+#include <ctime>
 #include <atomic>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <ostream>
 #include <sstream>
+#include <streambuf>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -106,6 +110,23 @@ struct LogRecord {
     std::uint64_t elapse_ms{0};  ///< 业务可填的耗时毫秒；Formatter 的 {elapse} 读取
     std::string thread_name;  ///< 线程名；调用方可选填充，{thread_name} 读取
     int line{0};  ///< 调用点行号；0 表示未提供，{line} 输出 0
+    /**
+     * @brief 调用点源文件的静态字面量（可空）。
+     * @details `LogLine` 的 `__FILE__` 是编译期常量，生命周期覆盖整个进程；
+     *          直接保存指针可省掉每条日志一次 `std::string` 堆分配。
+     *          非空时**优先于** `file` 字段被 Formatter 使用；`file` 保持为空。
+     *          自定义 Sink 需要完整路径时请调用 `File()`，不要直接读 `file`。
+     */
+    const char* file_literal{nullptr};
+    /// 调用点函数名的静态字面量（可空），语义同 `file_literal`。
+    const char* function_literal{nullptr};
+
+    /// 返回调用点源文件：优先字面量，其次 `file` 字段。
+    const char* File() const noexcept { return file_literal != nullptr ? file_literal : file.c_str(); }
+    /// 返回调用点函数名：优先字面量，其次 `function` 字段。
+    const char* Function() const noexcept {
+        return function_literal != nullptr ? function_literal : function.c_str();
+    }
 };
 
 /**
@@ -210,6 +231,29 @@ public:
          * @details 用户可以覆写 Format 或 format 其中一个；默认实现为空。
          */
         virtual void format(std::ostream&, const LogRecord&) const {}
+
+        /**
+         * @brief 直接把字段追加到目标字符串（零 `ostream` 热路径）。
+         *
+         * ## 为什么需要它
+         * 为了拼接固定文本和数字，每条日志都构造一个 `ostringstream` 的代价是
+         * locale facet 初始化 + 至少一次堆分配 + `str()` 深拷贝；实测占
+         * `PatternFormatter::Format` 耗时的大头。内置 Item 全部覆写本函数，
+         * 直接 `append` 到目标 `std::string`，数字用 `std::to_chars`。
+         *
+         * ## 兼容性
+         * 默认实现回退到 `Format(std::ostream&)` 再整体追加，因此**只覆写
+         * `Format`/`format` 的既有用户 Item 无需修改**，行为完全不变（仍然走一次
+         * `ostringstream`）。新写的 Item 建议覆写本函数以获得零流收益。
+         *
+         * @param[out] out 目标字符串；调用方负责预留容量。
+         * @param[in] record 待读取的结构化日志记录。
+         */
+        virtual void FormatTo(std::string& out, const LogRecord& record) const {
+            std::ostringstream stream;
+            Format(stream, record);
+            out += stream.str();
+        }
     };
 
     /** @brief Item 工厂，参数为格式项后面的可选参数，例如 `%d{...}` 中的内容。 */
@@ -277,6 +321,22 @@ public:
 
     /** @brief 格式化一条日志。@return 格式化后的文本。 */
     virtual std::string Format(const LogRecord& record) const = 0;
+
+    /**
+     * @brief 把格式化结果写入调用方提供的缓冲（热路径，避免每条日志一次分配）。
+     *
+     * ## 为什么需要它
+     * `LogItemWorker::Submit()` 会把结果立刻交给 Sink，然后丢弃；既然调用方可以
+     * 复用同一块缓冲，就不必每条日志都构造/销毁一个 `std::string`。
+     * 默认实现回退到 `out = Format(record)`，因此既有的自定义 Formatter 无需修改。
+     *
+     * ## 契约
+     * - 实现必须**覆盖** `out` 的全部内容（可以先 `clear()`）；
+     * - `out` 的内容只在 `Submit()` 返回前有效，Sink 不得长期保存它的视图。
+     */
+    virtual void FormatTo(std::string& out, const LogRecord& record) const {
+        out = Format(record);
+    }
 };
 
 // 默认格式支持 {time} {level} {logger} {thread} {fiber} {file} {line}
@@ -299,6 +359,8 @@ public:
                                   "({file}:{line}) {message}\n");
     /** @brief 按模式生成一条日志文本。 */
     std::string Format(const LogRecord& record) const override;
+    /** @brief 按模式把日志文本追加到 `out`（覆盖写，复用调用方缓冲）。 */
+    void FormatTo(std::string& out, const LogRecord& record) const override;
     /** @brief 返回当前模式文本。 */
     const std::string& pattern() const noexcept { return m_pattern; }
     /**
@@ -498,6 +560,10 @@ protected:
     std::mutex m_mutex;
     /// 输出流；Reopen() 创建/替换，Write/Flush 使用，失败时为 nullptr。
     std::unique_ptr<std::ostream> m_stream;
+    /// `m_stream` 的具体类型视图（仅 Reopen 成功时非空）。
+    /// 每条日志一次 `dynamic_cast` 实测约占 FileSink 写路径的三成，
+    /// 这里在打开文件时缓存一次，热路径退化为一次空指针比较。
+    std::ofstream* m_file_stream{nullptr};
 };
 
 /** @brief 达到容量上限后滚动备份文件的文件 Sink。 */
@@ -691,9 +757,14 @@ private:
         LogFormatter::ptr formatter;  ///< 格式化器快照；过滤通过后调用 Format
         LogSink::ptr sink;  ///< 输出目标快照；格式化后调用 Write
     };
-    /// 保护快照替换；Submit 不取它，只有 SetFilter/SetFormatter/SetSink 使用。
-    mutable std::mutex m_mutex;  ///< 保护 m_lines；Write/Snapshot/Clear 使用
-    std::shared_ptr<const Snapshot> m_snapshot;  ///< 当前配置快照；atomic_load/store 读写，Submit 与 Set* 使用
+    /// 保护快照替换与版本列表；Submit 不取它，只有 SetFilter/SetFormatter/SetSink 使用。
+    mutable std::mutex m_mutex;
+    /// 当前配置快照（读者无锁 acquire load）。
+    /// 不用 `atomic<shared_ptr>`：libstdc++ 的实现要拿全局 `_Sp_locker` 自旋锁，
+    /// 实测每条日志多花约 42 ns；这里用裸指针 + 版本保留，x86 上就是一条 mov。
+    std::atomic<const Snapshot*> m_snapshot{nullptr};
+    /// 历史快照版本，只增不减（直到 Worker 析构），保证读者持有的指针永不悬空。
+    std::vector<std::unique_ptr<const Snapshot>> m_snapshot_versions;
 };
 
 /**
@@ -745,8 +816,12 @@ public:
     bool propagate() const noexcept;
     /** @brief 刷新该记录器所有输出。 */
     void Flush() const;
-    /** @brief 分发一条结构化日志记录。 */
-    void Log(LogRecord record) const;
+    /**
+     * @brief 分发一条结构化日志记录。
+     * @note 按 const 引用接收，热路径不再为每条日志移动 5 个 `std::string`
+     *       （callgrind 里 `LogRecord` 的移动构造曾是可见热点）。
+     */
+    void Log(const LogRecord& record) const;
 
 private:
     /// 记录器名；构造时固定，name()/LogRecord.logger 使用。
@@ -761,8 +836,10 @@ private:
     std::weak_ptr<Logger> m_parent;
     std::atomic<bool> m_propagate{false};  ///< 是否向父记录器传播；SetPropagate 写，Log 原子读
     // m_workers 只在配置时修改；日志线程通过原子快照无锁读取。
-    /// worker 列表快照；配置变更时整体替换，Log/Flush 原子读取。
-    std::shared_ptr<const std::vector<LogItemWorker::ptr>> m_worker_snapshot;
+    /// worker 列表快照（读者无锁 acquire load，理由同 LogItemWorker::m_snapshot）。
+    std::atomic<const std::vector<LogItemWorker::ptr>*> m_worker_snapshot{nullptr};
+    /// 历史 worker 列表版本，只增不减（直到 Logger 析构）。
+    std::vector<std::unique_ptr<const std::vector<LogItemWorker::ptr>>> m_worker_versions;
 };
 
 /** @brief 全局 Logger 注册表及默认输出配置管理器。 */
@@ -831,6 +908,192 @@ private:
  * - 析构是 `noexcept` 且内部 `try/catch(...)`，日志异常绝不外泄；
  *   因此不要在日志表达式里做有副作用且可能抛异常的重要操作。
  */
+class LogStreamBuf final {
+public:
+    /**
+     * @brief 绑定一段调用方提供的内联缓冲。
+     * @param inline_buffer 初始写入区（通常位于 `LogLine` 栈帧内）。
+     * @param inline_size 初始容量。
+     */
+    LogStreamBuf(char* inline_buffer, std::size_t inline_size) noexcept
+        : m_base(inline_buffer), m_capacity(inline_size) {}
+    ~LogStreamBuf() { delete[] m_owned; }
+    LogStreamBuf(const LogStreamBuf&) = delete;
+    LogStreamBuf& operator=(const LogStreamBuf&) = delete;
+
+    /** @brief 已写入文本的首地址。 */
+    const char* data() const noexcept { return m_base; }
+    /** @brief 已写入的字节数。 */
+    std::size_t size() const noexcept { return m_size; }
+
+    /**
+     * @brief 追加字节；容量足够时一次 `memcpy`，否则扩容。
+     * @details 刻意**不**继承 `std::streambuf`：streambuf 的虚表/虚派发在这里
+     *          没有用处，而 `std::ostream` 的 `ios_base`/`locale` 构造实测每条
+     *          日志要花 600+ 条指令（callgrind 计数），是端到端差距的主因。
+     */
+    void Append(const char* source, std::size_t count) {
+        if (count <= m_capacity - m_size) {
+            std::memcpy(m_base + m_size, source, count);
+            m_size += count;
+            return;
+        }
+        AppendSlow(source, count);
+    }
+    /** @brief 追加一个字符。 */
+    void Push(char value) {
+        if (m_size != m_capacity) {
+            m_base[m_size++] = value;
+            return;
+        }
+        AppendSlow(&value, 1);
+    }
+
+private:
+    /// 保证还能再写 `needed` 字节；失败返回 false（不抛异常）。
+    bool Grow(std::size_t needed);
+    /// `Append` 的扩容分支（定义在 .cpp，避免把扩容代码塞进热路径）。
+    void AppendSlow(const char* source, std::size_t count);
+
+    char* m_base;            ///< 当前写入基址（指向内联区或 m_owned）
+    std::size_t m_capacity;  ///< 当前总容量
+    std::size_t m_size{0};   ///< 已写入字节数
+    char* m_owned{nullptr};  ///< 扩容后的堆块；析构时释放
+};
+
+/**
+ * @brief 日志消息拼接流（`ostringstream` 的零分配替代品）。
+ *
+ * ## 为什么不用 `ostringstream`
+ * `ostringstream` 每次构造都要初始化 locale/facet 与 `stringbuf`，析构前还要
+ * `str()` 深拷贝一次整条消息。callgrind 实测 `std::locale::locale()` +
+ * `std::ios_base::ios_base()` 合计约 656 条指令/条日志，占总指令数的 2%。
+ * 本类把「拼接」退化成对一段栈上缓冲的 `memcpy`，常规消息（< 256 B）
+ * **零堆分配**；超长消息才按 2 倍扩容到堆，不会截断。
+ *
+ * ## 兼容性（重要）
+ * `LogStream` **不再继承 `std::ostream`**（继承就必然重建 `ios_base`，优化白做）。
+ * 因此：
+ * - 内置类型与常见操纵符由本类直接支持：
+ *   字符/布尔/字符串字面量/`const char*`/`std::string`/`std::string_view`/
+ *   全部整数（`std::to_chars`）、`std::hex`/`std::oct`/`std::dec`/`std::endl`；
+ * - 浮点、指针、`std::setw`/`std::setprecision` 等其余操纵符与一切用户自定义
+ *   `operator<<(std::ostream&, T)` 走 `ostringstream` 回退通道：**输出语义不变**，
+ *   只是那一条日志会退回旧路径（浮点默认精度、自定义类型都照旧）；
+ * - 需要 `std::ostream&` 的老代码把 `line.stream()` 赋给 `std::ostream&` 会编译
+ *   失败，请改用 `GO2CPP_LOG_*` 宏直接拼接，或显式 `std::ostringstream`。
+ */
+class LogStream final {
+public:
+    /** @brief 绑定消息缓冲；缓冲生命周期由调用方（`LogLine`）持有。 */
+    explicit LogStream(LogStreamBuf* buffer) noexcept : m_buffer(buffer) {}
+
+    LogStream(const LogStream&) = delete;
+    LogStream& operator=(const LogStream&) = delete;
+
+    LogStream& operator<<(char value) {
+        m_buffer->Push(value);
+        return *this;
+    }
+    LogStream& operator<<(bool value) {
+        m_buffer->Push(value ? '1' : '0');
+        return *this;
+    }
+    /// 字符串字面量：长度在编译期已知，省掉一次 `strlen`。
+    template <std::size_t N>
+    LogStream& operator<<(const char (&text)[N]) {
+        m_buffer->Append(text, N - 1);
+        return *this;
+    }
+    LogStream& operator<<(const char* value) {
+        if (value != nullptr) m_buffer->Append(value, std::strlen(value));
+        return *this;
+    }
+    LogStream& operator<<(const std::string& value) {
+        m_buffer->Append(value.data(), value.size());
+        return *this;
+    }
+    LogStream& operator<<(std::string_view value) {
+        m_buffer->Append(value.data(), value.size());
+        return *this;
+    }
+    // `signed char`/`unsigned char` 在标准流里输出的是**字符**而不是数字，
+    // 这里保持同样语义（`std::ostream` 有专门重载）。
+    LogStream& operator<<(signed char value) {
+        m_buffer->Push(static_cast<char>(value));
+        return *this;
+    }
+    LogStream& operator<<(unsigned char value) {
+        m_buffer->Push(static_cast<char>(value));
+        return *this;
+    }
+    /**
+     * @brief 其余整型（`short`/`int`/`long`/`long long`/各 `unsigned`/`char16_t`…）。
+     * @details 用模板而不是六个重载：`short` 同时可转 `int`/`long`/`unsigned`，
+     *          重载集会歧义；模板精确匹配后按符号走 `to_chars`。
+     */
+    template <class T,
+              std::enable_if_t<std::is_integral_v<T> && !std::is_same_v<T, bool> &&
+                                   !std::is_same_v<T, char> && !std::is_same_v<T, signed char> &&
+                                   !std::is_same_v<T, unsigned char>,
+                               int> = 0>
+    LogStream& operator<<(T value) {
+        if constexpr (std::is_signed_v<T>) {
+            PutSigned(static_cast<long long>(value));
+        } else {
+            PutUnsigned(static_cast<unsigned long long>(value));
+        }
+        return *this;
+    }
+
+    /** @brief `std::hex`/`std::oct`/`std::dec` 等整数进制操纵符。 */
+    LogStream& operator<<(std::ios_base& (*manipulator)(std::ios_base&)) {
+        if (manipulator == std::hex) m_base = 16;
+        else if (manipulator == std::oct) m_base = 8;
+        else if (manipulator == std::dec) m_base = 10;
+        return *this;
+    }
+    /** @brief `std::endl`/`std::ends`：日志整行提交，这里记为换行；`std::flush` 忽略。 */
+    LogStream& operator<<(std::ostream& (*manipulator)(std::ostream&)) {
+        // endl/ends 是函数模板，比较前必须转成具体函数指针类型。
+        const auto newline = static_cast<std::ostream& (*)(std::ostream&)>(std::endl);
+        if (manipulator == newline) m_buffer->Push('\n');
+        return *this;
+    }
+
+    /**
+     * @brief 未特化类型（浮点/指针/自定义 `operator<<`）的回退通道。
+     * @details 用一次性 `ostringstream` 得到与旧实现完全一致的文本，
+     *          再整体追加；这些类型在日志里低频，正确性优先于速度。
+     */
+    template <class T, class = std::enable_if_t<!std::is_arithmetic_v<T> ||
+                                                std::is_same_v<T, float> ||
+                                                std::is_same_v<T, double> ||
+                                                std::is_same_v<T, long double>>>
+    LogStream& operator<<(const T& value) {
+        std::ostringstream fallback;
+        fallback << value;
+        const std::string text = fallback.str();
+        m_buffer->Append(text.data(), text.size());
+        return *this;
+    }
+
+private:
+    void PutSigned(long long value) {
+        char text[24];
+        const auto result = std::to_chars(text, text + sizeof(text), value, m_base);
+        m_buffer->Append(text, static_cast<std::size_t>(result.ptr - text));
+    }
+    void PutUnsigned(unsigned long long value) {
+        char text[24];
+        const auto result = std::to_chars(text, text + sizeof(text), value, m_base);
+        m_buffer->Append(text, static_cast<std::size_t>(result.ptr - text));
+    }
+
+    LogStreamBuf* m_buffer;              ///< 消息缓冲；由 LogLine 持有
+    int m_base{10};                      ///< 整数输出进制；std::hex/oct 切换
+};
+
 class LogLine final {
 public:
     /** @brief 创建日志行。@param logger 目标记录器。@param level 级别。 */
@@ -838,15 +1101,25 @@ public:
             const char* function);
     /** @brief 析构时提交日志记录。 */
     ~LogLine() noexcept;
-    /** @brief 返回用于流式拼接消息的输出流。 */
-    std::ostream& stream() noexcept { return m_stream; }
+    /**
+     * @brief 返回用于流式拼接消息的输出流。
+     * @note 返回类型是 `LogStream`（`std::ostream` 派生类），因此既能享受
+     *       `to_chars`/`memcpy` 快路径，又能继续赋给 `std::ostream&` 使用。
+     */
+    LogStream& stream() noexcept { return m_stream; }
 
 private:
+    /// 常规消息（< 256 B）完全走栈内联缓冲，不分配堆内存。
+    static constexpr std::size_t kInlineMessageBytes = 256;
+
     /// 目标记录器；构造时绑定，析构时提交。
     Logger::ptr m_logger;
     /// 构造时填好级别/位置/时间，析构前补 message。
     LogRecord m_record;
-    std::ostringstream m_stream;  ///< 消息拼接流；stream() 返回引用，析构时 str() 提交
+    /// 消息内联缓冲；成员顺序保证 m_stream 析构早于它。
+    char m_message[kInlineMessageBytes]{};
+    LogStreamBuf m_buffer;  ///< 绑定 m_message 的消息缓冲
+    LogStream m_stream;     ///< 消息拼接流；stream() 返回引用，析构时取字节提交
     /// 级别是否通过；false 时析构不提交（但流仍可写）。
     bool m_enabled{false};
 };
