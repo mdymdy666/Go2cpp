@@ -106,6 +106,16 @@ std::string EncodeCommentCursor(const StoredComment& comment);
 bool DecodeCommentCursor(const std::string& cursor, std::int64_t* created_at,
                          std::int64_t* id);
 
+/// @brief rooms 表里的一行直播间（C7）。
+struct StoredRoom {
+    std::int64_t id{0};            ///< 自增主键。
+    std::int64_t user_id{0};       ///< 房主 id。
+    std::string title;             ///< 房间标题。
+    int status{0};                 ///< 0=关播，1=直播中。
+    std::int64_t viewer_count{0};  ///< 当前观众数（原子增减，>=0）。
+    std::int64_t created_at{0};    ///< Unix 秒。
+};
+
 /// @brief SQLite 连接 + 建表 + users/follows 访问器。
 /// @note 同一个 `Store` 由 HTTP 事件循环单线程调用；`DB`/`Session` 自身另有锁。
 class Store {
@@ -310,6 +320,43 @@ class Store {
     bool SearchVideos(const std::string& query, std::int64_t limit,
                       std::int64_t offset, std::vector<StoredVideo>* out,
                       std::string* error);
+
+    // ---- C7 直播：rooms + room_viewers（只加不改既有） ----
+
+    /**
+     * @brief 创建直播间（status=0 关播，viewer_count=0）。
+     * @return 新房间 id；失败返回 -1。
+     */
+    std::int64_t CreateRoom(std::int64_t user_id, const std::string& title,
+                            std::string* error);
+
+    /// @brief 按 id 查房间；未找到返回 false 且 error 为空。
+    bool FindRoom(std::int64_t id, StoredRoom* out, std::string* error);
+
+    /**
+     * @brief 房间列表，按 `created_at DESC, id DESC`。
+     * @param status <0 表示不限；0/1 只列该状态。
+     */
+    bool ListRooms(int status, std::vector<StoredRoom>* out, std::string* error);
+
+    /**
+     * @brief 开播/关播，仅房主可改（user_id 同时作为 SQL 条件）。
+     * @return 受影响行数（0 = 不存在或非房主）；出错 -1。
+     */
+    int UpdateRoomStatus(std::int64_t id, std::int64_t user_id, int status,
+                         std::string* error);
+
+    /**
+     * @brief 进房：room_viewers 唯一约束保证幂等，只有首次进入才 +1。
+     * @return 1=本次新进；0=已在该房间（不变）；-1=数据库错误或房间不存在。
+     */
+    int EnterRoom(std::int64_t id, std::int64_t user_id, std::string* error);
+
+    /**
+     * @brief 出房：只有确实在房间内才 -1，且 viewer_count 不会为负。
+     * @return 1=本次离开；0=本不在房间（不变）；-1=数据库错误。
+     */
+    int LeaveRoom(std::int64_t id, std::int64_t user_id, std::string* error);
 
    private:
     std::unique_ptr<go2cpp::storage::DB> m_db;

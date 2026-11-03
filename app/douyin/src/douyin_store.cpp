@@ -135,7 +135,22 @@ constexpr const char* kSchemaSql =
     "  created_at INTEGER NOT NULL"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_comments_video "
-    "ON comments(video_id, created_at DESC);";
+    "ON comments(video_id, created_at DESC);"
+    "CREATE TABLE IF NOT EXISTS rooms ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  user_id INTEGER NOT NULL,"
+    "  title TEXT NOT NULL,"
+    "  status INTEGER NOT NULL DEFAULT 0,"
+    "  viewer_count INTEGER NOT NULL DEFAULT 0,"
+    "  created_at INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_rooms_status ON rooms(status, created_at DESC);"
+    "CREATE TABLE IF NOT EXISTS room_viewers ("
+    "  room_id INTEGER NOT NULL,"
+    "  user_id INTEGER NOT NULL,"
+    "  created_at INTEGER NOT NULL,"
+    "  PRIMARY KEY (room_id, user_id)"
+    ");";
 
 /// @brief 把 `Error` 写成可读文本。
 std::string DescribeError(const go2cpp::storage::Error& error) {
@@ -1020,6 +1035,251 @@ bool Store::SearchVideos(const std::string& query, std::int64_t limit,
         return false;
     }
     return true;
+}
+
+// ---- C7 直播：rooms + room_viewers ----
+
+namespace {
+
+/// @brief rooms 查询的固定列顺序（与 `ReadRoomRow` 的下标对应）。
+constexpr const char* kRoomColumns =
+    "id, user_id, title, status, viewer_count, created_at";
+
+/// @brief 读当前行（列顺序必须为 `kRoomColumns`）。
+void ReadRoomRow(go2cpp::storage::Rows* rows, StoredRoom* out) {
+    out->id = rows->Int64(0);
+    out->user_id = rows->Int64(1);
+    out->title = rows->Text(2);
+    out->status = static_cast<int>(rows->Int64(3));
+    out->viewer_count = rows->Int64(4);
+    out->created_at = rows->Int64(5);
+}
+
+}  // namespace
+
+std::int64_t Store::CreateRoom(std::int64_t user_id, const std::string& title,
+                               std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+    auto inserted = m_db->Exec(
+        "INSERT INTO rooms(user_id, title, status, viewer_count, created_at) "
+        "VALUES(?, ?, 0, 0, ?)",
+        user_id, title, now);
+    if (!inserted) {
+        if (error != nullptr) {
+            *error = "创建房间失败: " + DescribeError(inserted.Err());
+        }
+        return -1;
+    }
+    return inserted.Value().last_insert_row_id;
+}
+
+bool Store::FindRoom(std::int64_t id, StoredRoom* out, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto found = m_db->Query(
+        std::string("SELECT ") + kRoomColumns + " FROM rooms WHERE id = ?", id);
+    if (!found) {
+        if (error != nullptr) {
+            *error = "查询房间失败: " + DescribeError(found.Err());
+        }
+        return false;
+    }
+    if (!found.Value().Next()) {
+        if (found.Value().Err()) {
+            if (error != nullptr) {
+                *error = "遍历房间失败: " + DescribeError(found.Value().Err());
+            }
+        }
+        return false;
+    }
+    ReadRoomRow(&found.Value(), out);
+    return true;
+}
+
+bool Store::ListRooms(int status, std::vector<StoredRoom>* out,
+                      std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = status < 0
+                    ? m_db->Query(std::string("SELECT ") + kRoomColumns +
+                                  " FROM rooms ORDER BY created_at DESC, id DESC")
+                    : m_db->Query(std::string("SELECT ") + kRoomColumns +
+                                      " FROM rooms WHERE status = ?"
+                                      " ORDER BY created_at DESC, id DESC",
+                                  static_cast<std::int64_t>(status));
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询房间列表失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        StoredRoom room;
+        ReadRoomRow(&rows.Value(), &room);
+        out->push_back(std::move(room));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历房间失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+int Store::UpdateRoomStatus(std::int64_t id, std::int64_t user_id, int status,
+                            std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    auto updated = m_db->Exec(
+        "UPDATE rooms SET status = ? WHERE id = ? AND user_id = ?", status, id,
+        user_id);
+    if (!updated) {
+        if (error != nullptr) {
+            *error = "更新房间状态失败: " + DescribeError(updated.Err());
+        }
+        return -1;
+    }
+    return updated.Value().changes;
+}
+
+int Store::EnterRoom(std::int64_t id, std::int64_t user_id, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    auto exists = m_db->Query("SELECT 1 FROM rooms WHERE id = ?", id);
+    if (!exists) {
+        if (error != nullptr) {
+            *error = "查询房间失败: " + DescribeError(exists.Err());
+        }
+        return -1;
+    }
+    if (!exists.Value().Next()) {
+        if (error != nullptr) {
+            *error = "房间不存在";
+        }
+        return -1;
+    }
+
+    go2cpp::storage::Transaction tx(*m_db);
+    const go2cpp::storage::Error began = tx.Begin();
+    if (!began.ok()) {
+        if (error != nullptr) {
+            *error = "开启事务失败: " + began.ToString();
+        }
+        return -1;
+    }
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+    auto inserted = m_db->Exec(
+        "INSERT OR IGNORE INTO room_viewers(room_id, user_id, created_at) "
+        "VALUES(?, ?, ?)",
+        id, user_id, now);
+    if (!inserted) {
+        if (error != nullptr) {
+            *error = "记录进房失败: " + DescribeError(inserted.Err());
+        }
+        return -1;
+    }
+    if (inserted.Value().changes == 0) {
+        const go2cpp::storage::Error committed = tx.Commit();
+        if (!committed.ok()) {
+            if (error != nullptr) {
+                *error = "提交事务失败: " + committed.ToString();
+            }
+            return -1;
+        }
+        return 0;
+    }
+    auto bumped = m_db->Exec(
+        "UPDATE rooms SET viewer_count = viewer_count + 1 WHERE id = ?", id);
+    if (!bumped) {
+        if (error != nullptr) {
+            *error = "更新观众数失败: " + DescribeError(bumped.Err());
+        }
+        return -1;
+    }
+    const go2cpp::storage::Error committed = tx.Commit();
+    if (!committed.ok()) {
+        if (error != nullptr) {
+            *error = "提交事务失败: " + committed.ToString();
+        }
+        return -1;
+    }
+    return 1;
+}
+
+int Store::LeaveRoom(std::int64_t id, std::int64_t user_id, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    go2cpp::storage::Transaction tx(*m_db);
+    const go2cpp::storage::Error began = tx.Begin();
+    if (!began.ok()) {
+        if (error != nullptr) {
+            *error = "开启事务失败: " + began.ToString();
+        }
+        return -1;
+    }
+    auto removed = m_db->Exec(
+        "DELETE FROM room_viewers WHERE room_id = ? AND user_id = ?", id,
+        user_id);
+    if (!removed) {
+        if (error != nullptr) {
+            *error = "删除进房记录失败: " + DescribeError(removed.Err());
+        }
+        return -1;
+    }
+    if (removed.Value().changes == 0) {
+        const go2cpp::storage::Error committed = tx.Commit();
+        if (!committed.ok()) {
+            if (error != nullptr) {
+                *error = "提交事务失败: " + committed.ToString();
+            }
+            return -1;
+        }
+        return 0;
+    }
+    auto lowered = m_db->Exec(
+        "UPDATE rooms SET viewer_count = MAX(0, viewer_count - 1) WHERE id = ?",
+        id);
+    if (!lowered) {
+        if (error != nullptr) {
+            *error = "更新观众数失败: " + DescribeError(lowered.Err());
+        }
+        return -1;
+    }
+    const go2cpp::storage::Error committed = tx.Commit();
+    if (!committed.ok()) {
+        if (error != nullptr) {
+            *error = "提交事务失败: " + committed.ToString();
+        }
+        return -1;
+    }
+    return 1;
 }
 
 }  // namespace douyin
