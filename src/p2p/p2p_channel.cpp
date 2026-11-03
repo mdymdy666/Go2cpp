@@ -355,6 +355,35 @@ public:
         SortCandidatesByPriority(&m_remote_candidates);
     }
 
+    /**
+     * @brief ICE 式选路：交换候选 → 直连优先 → 预算内中继降级，直到连上或超时。
+     *
+     * @param timeout [in] 总预算毫秒；<=0 时改用配置的 connect_timeout。
+     *
+     * @return
+     * - true：已进入 kConnected/kRelayed——调用方**必须**用 state() 区分直连还是中继；
+     * - false：已置失败态（kFailed）或已关闭——调用方**必须**读 LastError，不要立即重试同一批候选。
+     *
+     * ## 定位
+     * P2P 通道唯一的连接决策点。直连与中继的预算分配（70%/30%）写错会让弱网永远退化到中继，
+     * 或在有中继可用时白白超时；候选未排序会优先尝试低成功率地址。
+     *
+     * ## 步骤
+     * step1. 校验传输，归一化 timeout；
+     * step2. 持锁检查当前状态：已连直接成功，已关直接失败，清空错误；
+     * step3. 发布 kConnecting 快照；
+     * step4. 本地候选为空时现场采集；
+     * step5. 配置了信令时交换候选（用总预算的一半作为上限）；
+     * step6. 按类型拆分直连/中继目标并排序；
+     * step7. 直连优先，有中继时只给直连 70% 预算；
+     * step8. 剩余预算尝试中继，全失败则置失败并返回 false。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：同一通道不可并发 Connect；状态发布用原子快照，读路径无锁。
+     * - 原子性：状态迁移是「先快照后工作」，中途读到的 state 可能仍是 kConnecting。
+     * - 失败语义：不抛异常；失败写入 m_error 并发布 kFailed。
+     * - 不变量：返回 true 后 state 一定是 kConnected 或 kRelayed。
+     */
     bool Connect(std::chrono::milliseconds timeout) {
         if (!m_transport) {
             SetError("传输未初始化");

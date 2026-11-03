@@ -432,6 +432,32 @@ thread_local Session* Session::t_transaction_owner = nullptr;
 Session::Session(DB& db) : m_db(&db), m_raw(db.Handle()) {}
 Session::~Session() = default;
 
+/**
+ * @brief 取得（或惰性构建）某张表映射对应的 TableState 缓存。
+ *
+ * @param table [in] 表定义，引用；columns 非空，生命周期覆盖 Session——不取得所有权。
+ * @param error [out] 失败原因；成功时不修改。
+ *
+ * @return
+ * - 非空 `TableState*`：缓存命中或首次构建成功——指针归 Session 所有，调用方**不要**释放；
+ * - nullptr：映射非法或建 SQL 失败——error 已被写入，调用方**必须**原样返回。
+ *
+ * ## 定位
+ * 表映射缓存唯一入口。每次 CRUD 都先经过这里；错了会导致反复重建 SQL（性能塌方）或复用错误列映射（写错列）。
+ *
+ * ## 步骤
+ * step1. 校验 columns 非空；
+ * step2. 命中 last_table 快速路径（连续操作同一张表时省一次哈希查找）；
+ * step3. 查 m_tables；
+ * step4. 未命中则构建，并把失败结果一起缓存，避免反复编译坏 SQL；
+ * step5. 成功时更新 last_table 便于下次快速命中。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：调用方必须已持 Session 锁（后缀 Locked 即此约定）。
+ * - 原子性：构建与入表在同一临界区内完成，不会出现半初始化状态。
+ * - 失败语义：失败结果被缓存，后续调用返回同一错误，不重试。
+ * - 不变量：返回的裸指针在 Session 生命周期内稳定（unique_ptr 存于 map）。
+ */
 Session::TableState* Session::StateLocked(const TableDef& table,
                                           Error& error) {
     if (table.columns == nullptr) {
@@ -463,11 +489,37 @@ Session::TableState* Session::StateLocked(const TableDef& table,
     return raw;
 }
 
+/**
+ * @brief 按 SQL 文本缓存 Prepare 结果，供动态查询复用。
+ *
+ * @param sql [in] 完整 SQL 文本，UTF-8；内部按值复制为 key——引用只需在本调用期间有效。
+ * @param error [out] prepare 失败原因；成功时不修改。
+ *
+ * @return
+ * - 非空 `Stmt*`：指向缓存中的语句——归 Session 所有且**可能被下一次清空失效**，调用方只能当次使用；
+ * - nullptr：prepare 失败，error 已写入——调用方**必须**原样返回。
+ *
+ * ## 定位
+ * 动态查询语句唯一缓存点。错了会语句泄漏（sqlite3 句柄）或缓存无界增长。
+ *
+ * ## 步骤
+ * step1. 查 map，命中直接返回；
+ * step2. 达到 kMaxCachedStatements 时整表清空（粗粒度回收，省去 LRU 记账）；
+ * step3. Prepare 新语句；
+ * step4. 成功后 emplace 并返回稳定指针。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：必须持 Session 锁。
+ * - 原子性：清空 + 插入在同一临界区，不会返回悬空指针。
+ * - 失败语义：prepare 失败不入缓存，避免错误被永久记住。
+ * - 不变量：返回的指针在下一次清空或 Session 析构前有效。
+ */
 Stmt* Session::StatementLocked(const std::string& sql, Error& error) {
     const auto cached = m_statements.find(sql);
     if (cached != m_statements.end()) {
         return &cached->second;
     }
+    // step2: 整表清空是有意为之：动态 SQL 的缓存命中率低，逐条 LRU 记账不如一次性回收便宜。
     if (m_statements.size() >= kMaxCachedStatements) {
         m_statements.clear();
     }
@@ -480,6 +532,35 @@ Stmt* Session::StatementLocked(const std::string& sql, Error& error) {
     return &entry.first->second;
 }
 
+/**
+ * @brief 按列映射把对象 INSERT 进表，可选把自增主键回填到对象。
+ *
+ * @param table [in] 表定义；columns 与 bind 回调必须有效，生命周期覆盖 Session。
+ * @param object [in,out] 待插入对象裸指针；可为 nullptr 但 bind 回调会解引用——所有权借用，仅在 fill_key 时回写主键。
+ * @param fill_key [in] 是否在自增主键表上把新 rowid 写回对象；false 时对象保持不变。
+ *
+ * @return
+ * - 成功 `rowid`：新行主键（>0）——调用方**必须**在 fill_key=false 时自行保存；
+ * - 失败 `Error`：对象内容**未写入**库——调用方**不要**假定已插入，按错误码处理。
+ *
+ * ## 定位
+ * 唯一 INSERT 提交点。错了会写错列、参数错位或主键没回填，后者会让后续 Update 静默更新 0 行。
+ *
+ * ## 步骤
+ * step1. 加锁并取表状态；
+ * step2. 惰性 prepare 并校验占位符数，防止映射与 SQL 漂移；
+ * step3. 逐列调用 bind 回调生成 Value；
+ * step4. Reset 清掉上一次绑定；
+ * step5. 绑定并单步执行；
+ * step6. 确认语句 DONE；
+ * step7. 读 rowid，需要时回填主键。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程，内部持 Session 锁；同一 Session 的写被串行化。
+ * - 原子性：单条 INSERT 原子；跨 Session 依赖 SQLite 锁与 busy_timeout。
+ * - 失败语义：返回 Error 时不改对象（fill_key 尚未执行）；语句已 Reset，可安全重试。
+ * - 不变量：成功返回时 rowid 与库中该行主键一致。
+ */
 Result<std::int64_t> Session::InsertImpl(const TableDef& table, void* object,
                                          bool fill_key) {
     auto lock = Lock();
@@ -522,6 +603,7 @@ Result<std::int64_t> Session::InsertImpl(const TableDef& table, void* object,
     }
     const std::int64_t row_id = static_cast<std::int64_t>(
         sqlite3_last_insert_rowid(m_raw));
+    // step7: 只在「自增 + 主键有映射 + 有 assign 回调」三者齐全时回填，避免误写非主键列。
     if (fill_key && state->auto_increment && state->primary_key >= 0) {
         const Column& key = table.columns[state->primary_key];
         if (key.assign != nullptr) {
@@ -531,6 +613,33 @@ Result<std::int64_t> Session::InsertImpl(const TableDef& table, void* object,
     return row_id;
 }
 
+/**
+ * @brief 按主键更新整行可更新列，返回受影响行数。
+ *
+ * @param table [in] 表定义；primary_key 必须有效，生命周期覆盖 Session。
+ * @param object [in] 源对象裸指针，只读；可为 nullptr 但 bind 回调会解引用——所有权借用。
+ *
+ * @return
+ * - 成功 `changes`：受影响行数——0 表示主键不存在，调用方**必须**把 0 当「未命中」而非成功更新；
+ * - 失败 `Error`：语句/映射错误，库内容未变。
+ *
+ * ## 定位
+ * 唯一 UPDATE 提交点。主键必须绑定在最后一个占位符，错位会导致全表更新。
+ *
+ * ## 步骤
+ * step1. 加锁取表状态；
+ * step2. 无可更新列时报映射错误；
+ * step3. prepare 并校验占位符数 = 列数 + 1；
+ * step4. 逐列绑定新值，最后绑定主键；
+ * step5. Reset + Bind + Step，确认 DONE；
+ * step6. 返回 sqlite3_changes。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程，内部持 Session 锁。
+ * - 原子性：单条 UPDATE 原子。
+ * - 失败语义：失败不改库；语句已 Reset，可安全重试。
+ * - 不变量：返回 0 只代表主键不存在，不代表执行失败。
+ */
 Result<int> Session::UpdateImpl(const TableDef& table, const void* object) {
     auto lock = Lock();
     Error error;
@@ -559,6 +668,7 @@ Result<int> Session::UpdateImpl(const TableDef& table, const void* object) {
         const Column& column = table.columns[state->update_columns[index]];
         column.bind(object, column.context, state->bind_values[index]);
     }
+    // step4: 主键必须最后绑定，SQL 的 WHERE 占位符排在 SET 之后。
     const Column& key = table.columns[state->primary_key];
     key.bind(object, key.context, state->bind_values[count]);
     if (Error reset = statement->Reset()) {
@@ -603,6 +713,34 @@ Result<int> Session::DeleteImpl(const TableDef& table, std::int64_t key) {
     return sqlite3_changes(m_raw);
 }
 
+/**
+ * @brief 按主键查询单行，命中时把列值写回对象。
+ *
+ * @param table [in] 表定义；primary_key 与 read 回调必须有效。
+ * @param key [in] 主键值，int64 范围；表无主键映射时按生成的 SQL 语义（通常查不到）。
+ * @param object [out] 写回目标，裸指针；可为 nullptr 但 read 回调会解引用——所有权借用，不改其生命周期。
+ *
+ * @return
+ * - true：命中并已写回——调用方**必须**认为对象字段已被覆盖；
+ * - false：未命中，对象**保持原值**——调用方**不要**当错误处理；
+ * - Error：SQL/映射失败，对象内容未定义。
+ *
+ * ## 定位
+ * 唯一按主键读路径。错了会把「未命中」当错误重试风暴，或把列错位读进对象。
+ *
+ * ## 步骤
+ * step1. 加锁取表状态；
+ * step2. 惰性 prepare find_stmt；
+ * step3. Reset + 绑定主键；
+ * step4. Step 后以 HasRow 判定命中；
+ * step5. 按 min(映射列数, 结果列数) 逐列 read 写回，缺列时截断保护。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程，内部持 Session 锁；同一语句不可并发复用。
+ * - 原子性：单次查询原子。
+ * - 失败语义：未命中不是错误；错误通过 Result 返回且不改对象。
+ * - 不变量：返回 true 时 object 的映射列全部来自同一行。
+ */
 Result<bool> Session::FindImpl(const TableDef& table, std::int64_t key,
                                void* object) {
     auto lock = Lock();
@@ -628,6 +766,7 @@ Result<bool> Session::FindImpl(const TableDef& table, std::int64_t key,
     if (!statement->HasRow()) {
         return false;
     }
+    // step5: 以实际结果列数为上限，避免 schema 漂移时越界读列。
     const int available = statement->ColumnCount();
     std::size_t count = table.count;
     if (count > static_cast<std::size_t>(available)) {
@@ -643,6 +782,36 @@ Result<bool> Session::FindImpl(const TableDef& table, std::int64_t key,
     return true;
 }
 
+/**
+ * @brief 执行参数化查询并逐行回调，返回处理行数。
+ *
+ * @param sql [in] 单条 SELECT，UTF-8；同时作为语句缓存 key——引用只需在本调用期间有效。
+ * @param params [in] 绑定值数组，可为 nullptr（仅当 param_count==0）——所有权借用。
+ * @param param_count [in] 参数个数，必须等于占位符总数，否则报映射错误。
+ * @param sink [in] 行回调，返回 false 提前终止；可为 nullptr 表示只计数——只在本次调用期间有效。
+ * @param context [in] 透传给 sink 的裸指针，可为 nullptr；所有权归调用方。
+ *
+ * @return
+ * - 成功行数：已成功回调的行数（提前终止时是已处理数）——调用方**必须**结合 sink 状态判断是否完整；
+ * - 失败 `Error`：已处理的部分行**不回滚**——调用方**不要**把部分结果当完整结果。
+ *
+ * ## 定位
+ * 唯一通用查询迭代点（ORM 的 Query 即由此承载）。错了会漏行、重复 step，或语句未复位污染下一次查询。
+ *
+ * ## 步骤
+ * step1. 加锁并取缓存语句（可能触发 prepare）；
+ * step2. 校验参数个数；
+ * step3. Reset 回到初始状态；
+ * step4. 绑定参数；
+ * step5. 循环 Step，直到无行；
+ * step6. 每行先计数再回调，回调返回 false 立即停止。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：内部持 Session 锁且**覆盖整个迭代**；sink 内**禁止**再调用同一 Session（std::mutex 非递归，会死锁）。
+ * - 原子性：单次查询；无跨行事务保证。
+ * - 失败语义：Step 失败立即返回错误；语句已 Reset，可再次调用。
+ * - 不变量：返回 n 表示 sink 恰好被调用 n 次且都返回 true，或第 n 次返回 false。
+ */
 Result<std::int64_t> Session::ForEachRow(const std::string& sql,
                                          const Value* params,
                                          std::size_t param_count, RowSink sink,
@@ -665,6 +834,7 @@ Result<std::int64_t> Session::ForEachRow(const std::string& sql,
     if (Error bound = statement->BindValues(params, param_count)) {
         return bound;
     }
+    // step5: 每轮先 Step 再判断 HasRow；不要把 Step 的返回值当行存在与否。
     std::int64_t rows = 0;
     for (;;) {
         if (Error stepped = statement->Step()) {

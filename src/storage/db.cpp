@@ -471,7 +471,32 @@ const char* Stmt::ColumnName(int column) const {
 // Rows
 // ---------------------------------------------------------------------------
 
+/**
+ * @brief 把游标推进到下一行；结果集结束、已关闭或出错均返回 false。
+ *
+ * @param （无显式参数；隐式状态是本对象持有的 Stmt 与上一次 step 的结果）
+ *
+ * @return
+ * - true：当前行可读——调用方**必须**在本行内取完需要的数据再调 Next；
+ * - false：结束/已关闭/出错——调用方**必须**用 `Err()` 区分「正常结束」与「执行失败」。
+ *
+ * ## 定位
+ * 唯一游标推进点。错一次就会丢行、重复 step 触发 SQLITE_MISUSE，或把错误当结束静默吞掉。
+ *
+ * ## 步骤
+ * step1. 已 Close 直接返回 false，且不覆盖既有错误（与 Go Rows 语义一致）；
+ * step2. 已 Done 不再 step，避免对已完成的语句再次 step；
+ * step3. Step 出错时锁存到 m_err 并返回 false；
+ * step4. 以 HasRow 判定本行是否可读。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：单线程顺序使用；Rows 独占该语句，不得并发迭代同一对象。
+ * - 原子性：单次 step 由 SQLite 保证原子。
+ * - 失败语义：错误被锁存而非抛出，可重复查询 Err()。
+ * - 不变量：返回 true 时列访问接口在本行有效，直到下一次 Next/Close。
+ */
 bool Rows::Next() {
+    // step1: finalize 过的语句再 step 属于误用，这里直接短路且不污染 m_err。
     if (!m_stmt.Valid()) {
         // 已 Close：与 Go 的 Rows 关闭后 Next=false 一致，不产生新错误。
         return false;
@@ -480,6 +505,7 @@ bool Rows::Next() {
         // 已遍历到结尾：重复 Next 不重新执行（再 step 会返回 SQLITE_MISUSE）。
         return false;
     }
+    // step3: 错误只锁存不抛；调用方用 Err() 判断是失败还是正常结束。
     const Error& error = m_stmt.Step();
     if (error) {
         m_err = error;
@@ -507,8 +533,34 @@ DB::~DB() {
     Close();
 }
 
+/**
+ * @brief 打开（必要时创建）一个 SQLite 数据库文件，并把连接所有权移交调用方。
+ *
+ * @param path [in] 数据库文件路径，UTF-8 编码；不可为 nullptr；`:memory:` 表示私有内存库——只在本次调用期间被读取，所有权不转移。
+ *
+ * @return
+ * - `Result` 持有值：打开成功——调用方**必须**用 `std::unique_ptr` 独占持有，析构时自动 Close；
+ * - `Result` 持有错误：打开失败——调用方**必须**先看 `Error::Code()` 区分 BUSY/PERM 再决定是否重试，不要盲目循环。
+ *
+ * ## 定位
+ * 全模块唯一的连接创建点：扩展错误码与 busy 超时只在这里设置一次。漏掉扩展码会把 BUSY_SNAPSHOT 折叠成 BUSY，上层无法区分「快照失效」与「锁竞争」；漏掉 busy_timeout 会让并发写在默认 0ms 下立刻失败。
+ *
+ * ## 步骤
+ * step1. 以 READWRITE|CREATE|FULLMUTEX 打开；FULLMUTEX 让连接可跨线程使用；
+ * step2. 失败时先从 raw 取 errmsg/extended code，再 close，避免句柄泄漏；
+ * step3. 主错误码只保留低 8 位，扩展码原样保留，便于上层细分；
+ * step4. 打开扩展错误码并设 5s busy 超时；
+ * step5. 把裸句柄包装成 unique_ptr，由 DB 析构负责关闭。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：可在任意线程调用；返回的连接自身线程安全（FULLMUTEX）。
+ * - 原子性：失败路径已关闭 raw 句柄，不留下半开连接。
+ * - 失败语义：不抛异常（`std::bad_alloc` 除外）；失败后 raw 不泄漏。
+ * - 不变量：成功返回的连接已启用扩展错误码与 5s busy 超时。
+ */
 Result<std::unique_ptr<DB>> DB::Open(const std::string& path) {
     sqlite3* raw = nullptr;
+    // step1: 一次把读写/创建/跨线程三件事都定死，后续不再改打开方式。
     const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
                       SQLITE_OPEN_FULLMUTEX;
     const int rc = sqlite3_open_v2(path.c_str(), &raw, flags, nullptr);
@@ -529,11 +581,35 @@ Result<std::unique_ptr<DB>> DB::Open(const std::string& path) {
     return std::unique_ptr<DB>(new DB(raw, path));
 }
 
+/**
+ * @brief 关闭连接；仍有未 finalize 的语句时按 close_v2 语义延迟回收。
+ *
+ * @return
+ * - 空 `Error`：已关闭或本就未打开——调用方**不要**重复关闭；
+ * - 非空 `Error`：仍有未 finalize 的语句——连接保持打开，调用方**必须**先 finalize 语句再重试。
+ *
+ * ## 定位
+ * 唯一释放 sqlite3 句柄的地方。漏关会泄漏文件描述符；提前关会 UAF。
+ *
+ * ## 步骤
+ * step1. 持锁，与所有公开方法互斥；
+ * step2. 已关闭时幂等返回成功；
+ * step3. 先置空再 close_v2，防止回调重入看到悬空句柄；
+ * step4. 关闭失败时恢复 m_db 并锁存 last_error，调用方拿到可重试的句柄。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；内部持 m_mutex，不可在持有期间回调用户代码。
+ * - 原子性：句柄摘除与 close 在同一把锁内完成。
+ * - 失败语义：失败后 m_db 仍有效（不是悬空指针），可修正后重试。
+ * - 不变量：返回空 Error 后 IsOpen() 必为 false。
+ */
 Error DB::Close() {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_db == nullptr) {
         return {};
     }
+    // step3: 先摘空 m_db 再 close_v2；这样 close 回调里任何重入都看到「已关闭」，
+    //        而不是一个正在析构的悬空句柄。
     sqlite3* db = m_db;
     m_db = nullptr;
     const int rc = sqlite3_close_v2(db);
@@ -584,6 +660,36 @@ Error DB::BindLocked(sqlite3_stmt* stmt, const Value* params,
     return {};
 }
 
+/**
+ * @brief 依次执行 sql 里的每条语句；带参数时只允许单条。
+ *
+ * @param sql [in] 一条或多条 SQL 文本，UTF-8；带参数时必须只含单条语句——引用在本调用期间有效。
+ * @param params [in] 绑定值数组，可为 nullptr（仅当 count==0）；按 1-based 占位符顺序绑定——所有权借用，SQLITE_TRANSIENT 保证返回后调用方可立即释放。
+ * @param count [in] 参数个数，必须等于占位符总数，否则返回参数个数错误；无负数语义（size_t）。
+ *
+ * @return
+ * - 成功 `ExecResult`：changes 是多条语句的累加值，last_insert_row_id 取最后一条——调用方**必须**按语句条数理解该值；
+ * - 失败 `Error`：已执行的前序语句**不会回滚**——调用方**必须**用事务包裹多语句写。
+ *
+ * ## 定位
+ * Exec 的唯一实现，所有 DDL/DML 都从这里落地。错了会半执行、静默丢语句或参数错位写库。
+ *
+ * ## 步骤
+ * step1. 持锁并检查连接是否已关闭；
+ * step2. 循环 prepare，一次推进一条语句；
+ * step3. stmt 为空表示空白/纯注释，前移游标继续；
+ * step4. 已执行过语句又带参数时拒绝，避免参数归属歧义；
+ * step5. 绑定参数并 step，失败路径也要 finalize；
+ * step6. 累加 changes、记录最后 rowid；
+ * step7. 成功后立即 finalize，释放语句资源；
+ * step8. 全程未执行任何语句时，按 SQLite CLI 语义返回成功。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；内部持 m_mutex，同一连接上的 Exec/Query 被串行化。
+ * - 原子性：单语句原子，多语句非原子；失败时 m_last_error 被更新。
+ * - 失败语义：不抛异常，返回 Error；失败后连接仍可用。
+ * - 不变量：成功返回时 SQL 中的语句全部执行完毕且无残留 prepared stmt。
+ */
 Result<ExecResult> DB::ExecImpl(const std::string& sql, const Value* params,
                                 std::size_t count) {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -592,6 +698,7 @@ Result<ExecResult> DB::ExecImpl(const std::string& sql, const Value* params,
     }
     ExecResult result{};
     bool executed = false;
+    // step2: 用 tail 游标逐条推进，而不是一次性 split——SQLite 的切分规则以 prepare 为准。
     const char* cursor = sql.c_str();
     while (cursor != nullptr && *cursor != '\0') {
         sqlite3_stmt* stmt = nullptr;
@@ -609,6 +716,7 @@ Result<ExecResult> DB::ExecImpl(const std::string& sql, const Value* params,
             cursor = tail;
             continue;
         }
+        // step4: 多语句 + 参数会让「第 N 个参数属于哪条语句」变得不可判定，直接拒绝。
         if (executed && count != 0) {
             (void)sqlite3_finalize(stmt);
             m_last_error = Error(
@@ -629,6 +737,7 @@ Result<ExecResult> DB::ExecImpl(const std::string& sql, const Value* params,
             return error;
         }
         result.last_insert_row_id = sqlite3_last_insert_rowid(m_db);
+        // step6: last_insert_rowid 是连接级状态，取最后一次；changes 逐条累加。
         result.changes += sqlite3_changes(m_db);
         (void)sqlite3_finalize(stmt);
         executed = true;
@@ -641,6 +750,33 @@ Result<ExecResult> DB::ExecImpl(const std::string& sql, const Value* params,
     return result;
 }
 
+/**
+ * @brief 准备并执行一条查询语句，把游标封装成 Rows 返回。
+ *
+ * @param sql [in] 单条 SQL（SELECT/PRAGMA 等），UTF-8；尾随分号与空白允许——引用在本调用期间有效。
+ * @param params [in] 绑定值数组，可为 nullptr（仅当 count==0）——所有权借用，绑定后即可释放。
+ * @param count [in] 参数个数，必须与占位符总数相等。
+ *
+ * @return
+ * - 成功 `Rows`：持有语句所有权，析构/Close 时 finalize——调用方**必须**迭代完或显式 Close；
+ * - 失败 `Error`：语句已 finalize，连接不受影响——调用方**不要**继续使用旧 Rows。
+ *
+ * ## 定位
+ * 唯一查询入口。把「第二条语句」静默丢弃会让调用方以为 SQL 全部生效，因此这里是严格的单语句检查点。
+ *
+ * ## 步骤
+ * step1. 持锁并检查连接；
+ * step2. prepare 单条语句；
+ * step3. 空语句报 misuse，尾随非空白报 misuse；
+ * step4. 绑定参数；
+ * step5. 把 stmt 所有权移交给 Rows，锁在构造后释放。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；锁只覆盖 prepare/bind，Rows 迭代期间不持锁。
+ * - 原子性：prepare 失败不会留下半初始化语句。
+ * - 失败语义：所有失败路径都 finalize 临时 stmt。
+ * - 不变量：成功返回的 Rows 至少包含一条可执行语句。
+ */
 Result<Rows> DB::QueryImpl(const std::string& sql, const Value* params,
                            std::size_t count) {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -670,6 +806,7 @@ Result<Rows> DB::QueryImpl(const std::string& sql, const Value* params,
         m_last_error = error;
         return error;
     }
+    // step5: 所有权移交 Rows；本函数返回后不再触碰 stmt。
     return Rows(Stmt(m_db, stmt));
 }
 
@@ -699,11 +836,34 @@ Result<Stmt> DB::Prepare(const std::string& sql) {
     return Stmt(m_db, stmt);
 }
 
+/**
+ * @brief 开启一个写事务（BEGIN IMMEDIATE），保证 BEGIN 时就拿到写锁。
+ *
+ * @return
+ * - 空 `Error`：事务已开启——调用方**必须**随后 Commit 或 Rollback，不得嵌套 Begin；
+ * - `kMisuse`：已关闭或已有活动事务——调用方**不要**重试 Begin，先结束当前事务；
+ * - 其他 `Error`：锁/IO 失败——调用方**必须**按 IsBusy 决定退避重试。
+ *
+ * ## 定位
+ * 事务唯一起点。用 IMMEDIATE 把「事务中途升级为写」的 BUSY 提前到 BEGIN，错误位置更可控。
+ *
+ * ## 步骤
+ * step1. 持锁并检查连接；
+ * step2. autocommit==0 说明事务已活动，拒绝嵌套；
+ * step3. 执行 BEGIN IMMEDIATE，失败时记录并释放 errmsg。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；事务状态是连接级的，跨线程共享，调用方需自行保证同一连接不并发开事务。
+ * - 原子性：BEGIN 本身由 SQLite 原子完成。
+ * - 失败语义：失败后连接仍处于 autocommit，可安全重试。
+ * - 不变量：返回成功时 InTransaction() 为 true。
+ */
 Error DB::Begin() {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (const Error error = CheckOpenLocked(); error) {
         return error;
     }
+    // step2: autocommit 为 0 表示已有事务；嵌套 BEGIN 会让 Commit 语义错位，直接拒绝。
     if (sqlite3_get_autocommit(m_db) == 0) {
         return Error(static_cast<int>(Code::kMisuse), 0,
                      "a transaction is already active");
@@ -721,6 +881,28 @@ Error DB::Begin() {
     return {};
 }
 
+/**
+ * @brief 提交当前事务；无活动事务时报 misuse。
+ *
+ * @return
+ * - 空 `Error`：事务已提交——调用方**必须**把「提交成功」当作数据可见的唯一信号；
+ * - `kMisuse`：无活动事务或连接已关闭——调用方**不要**重复 Commit；
+ * - 其他 `Error`：提交失败（BUSY/IO）——调用方**必须**按 IsBusy 决定重试或回滚。
+ *
+ * ## 定位
+ * 事务唯一提交点。错把失败当成功会导致「以为已落库」的上层状态机出现半提交。
+ *
+ * ## 步骤
+ * step1. 持锁并检查连接；
+ * step2. autocommit!=0 说明没有活动事务，报 misuse；
+ * step3. 执行 COMMIT，失败时锁存错误并释放 errmsg。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；与同连接的写操作串行（持 m_mutex）。
+ * - 原子性：COMMIT 由 SQLite 保证原子；失败后事务仍处于活动状态，需显式 Rollback。
+ * - 失败语义：不抛异常；失败后 m_last_error 反映具体原因。
+ * - 不变量：返回空 Error 后 InTransaction() 为 false 且数据对其他连接可见。
+ */
 Error DB::Commit() {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (const Error error = CheckOpenLocked(); error) {
@@ -731,6 +913,7 @@ Error DB::Commit() {
                      "no transaction is active");
     }
     char* message = nullptr;
+    // step3: COMMIT 失败时事务并未结束，调用方仍需 Rollback 才能回到 autocommit。
     const int rc = sqlite3_exec(m_db, "COMMIT", nullptr, nullptr, &message);
     if (rc != SQLITE_OK) {
         m_last_error = ErrorFromDb(m_db, rc);
@@ -742,6 +925,28 @@ Error DB::Commit() {
     return {};
 }
 
+/**
+ * @brief 回滚当前事务，丢弃自 Begin 以来的全部写入。
+ *
+ * @return
+ * - 空 `Error`：已回滚——调用方**必须**把对象状态恢复到 Begin 之前；
+ * - `kMisuse`：无活动事务或连接已关闭——调用方**不要**重复回滚；
+ * - 其他 `Error`：回滚失败——调用方**必须**停止复用该连接并上报。
+ *
+ * ## 定位
+ * 事务唯一撤销点，也是异常路径上保证「不留半写」的最后一道闸。
+ *
+ * ## 步骤
+ * step1. 持锁并检查连接；
+ * step2. 无活动事务时报 misuse；
+ * step3. 执行 ROLLBACK，失败时锁存错误并释放 errmsg。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；与同连接写操作串行。
+ * - 原子性：ROLLBACK 由 SQLite 原子完成。
+ * - 失败语义：失败后事务状态不变，仍可再试；m_last_error 记录原因。
+ * - 不变量：返回空 Error 后 autocommit 恢复为 1。
+ */
 Error DB::Rollback() {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (const Error error = CheckOpenLocked(); error) {
@@ -752,6 +957,7 @@ Error DB::Rollback() {
                      "no transaction is active");
     }
     char* message = nullptr;
+    // step3: 回滚失败属于严重状态，保留 m_last_error 供上层上报而不是静默吞掉。
     const int rc = sqlite3_exec(m_db, "ROLLBACK", nullptr, nullptr, &message);
     if (rc != SQLITE_OK) {
         m_last_error = ErrorFromDb(m_db, rc);

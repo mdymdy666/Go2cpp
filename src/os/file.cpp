@@ -635,6 +635,23 @@ constexpr int kMergeMinIov = 8;
 /// @param out 输出数组，容量必须 >= iovcnt。
 /// @param total 输出：所有段字节数之和。
 /// @return 合并后的段数；零长段不搬运字节，直接丢弃。
+///
+/// ## 定位
+/// 向量 I/O 的「固定成本摊销器」：内核按段收费，1024 段 8B 的 readv 约 32us，
+/// 合并成 1 段同样字节数约 1us。合并不改变字节语义，只减少 iovcnt；
+/// 一旦把不相邻的段误判为相邻，就会读到/写到错误地址，属于内存破坏级错误。
+///
+/// ## 步骤
+/// step1. 逐段累加总字节数（含零长段，保证 total 与输入一致）；
+/// step2. 零长段直接丢弃，不占输出名额；
+/// step3. 用「上一段尾地址 == 本段首地址」判定相邻，命中则只加长上一段；
+/// step4. 不相邻则原样拷贝到输出数组。
+///
+/// ## 并发/失败语义
+/// - 调用约束：纯函数，任意线程可并发调用；out 必须由调用方保证容量 >= iovcnt。
+/// - 原子性：无共享状态，不修改输入。
+/// - 失败语义：noexcept，无分配；指针比较只在同一对象内有效，跨对象比较由调用方语义保证。
+/// - 不变量：返回段数 <= iovcnt；*total 恒等于所有输入段长度之和。
 int MergeAdjacentIov(const struct iovec* iov, int iovcnt, struct iovec* out,
                      std::size_t* total) noexcept {
     int count = 0;
@@ -712,6 +729,34 @@ ssize_t File::Writev(const struct iovec* iov, int iovcnt) noexcept {
     }
 }
 
+/**
+ * @brief 把 iov 全部写完，处理短写与 EINTR；必要时合并相邻段降低内核固定成本。
+ *
+ * @param iov [in] 待写段数组，不可为 nullptr——引用在本调用期间有效，函数不改其内容。
+ * @param iovcnt [in] 段数，必须满足 1 <= iovcnt <= kMaxIov；超界返回 EINVAL。
+ *
+ * @return 实际写入的总字节数：== 期望值时表示写满——调用方**必须**按成功处理；
+ *         小于期望值时表示短写后写不动（管道关闭/慢盘）——调用方**必须**从返回值处续写，
+ *         不要把部分写入当失败重发整段。
+ *
+ * ## 定位
+ * 数据面唯一的「写满」入口。若把短写当成功直接返回，会静默丢掉后半段数据；
+ * 若失败时返回非零而不设 errno，调用方无法区分 EOF 与错误。
+ *
+ * ## 步骤
+ * step1. 校验 fd 与 iov 参数；
+ * step2. 段数够多且存在相邻段时才堆分配合并数组，分配失败退回原数组（语义不变）；
+ * step3. 总长度为 0 直接成功返回；
+ * step4. 快路径：一次 Writev 写满就返回，不复制 iovec；
+ * step5. 慢路径：复制可推进的 iovec 副本，用 AdvanceIov 跳过已写段继续写；
+ * step6. 写不动（<=0）时停止并返回已写字节数。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同一 File 的写操作需调用方串行化（fd 偏移是共享状态）。
+ * - 原子性：单次 writev 原子；多轮续写不是原子的，可能与其他写者交错。
+ * - 失败语义：noexcept；失败通过返回 0/部分值与 m_last_error 表达，不抛异常。
+ * - 不变量：返回值 <= 所有段长度之和；返回满值时 iov 内容已全部写出。
+ */
 std::size_t File::WritevAll(const struct iovec* iov, int iovcnt) noexcept {
     if (m_fd < 0) {
         m_last_error = EBADF;
@@ -778,6 +823,33 @@ std::size_t File::WritevAll(const struct iovec* iov, int iovcnt) noexcept {
     return total;
 }
 
+/**
+ * @brief 把 iov 读满（直到所有段填满或 EOF），必要时合并相邻段。
+ *
+ * @param iov [in,out] 接收缓冲区段数组，不可为 nullptr；函数只写缓冲区内容，不改 iov 本身——引用在本调用期间有效。
+ * @param iovcnt [in] 段数，必须满足 1 <= iovcnt <= kMaxIov；超界返回 EINVAL。
+ *
+ * @return 读到的总字节数：等于期望总量表示读满——调用方**必须**按完整数据处理；
+ *         小于期望值表示 EOF（含一开始就 EOF 的 0）——调用方**必须**当作流结束；
+ *         -1 表示错误——调用方**必须**读 m_last_error 并停止。
+ *
+ * ## 定位
+ * 数据面唯一的「读满」入口，用于定长协议头/帧体。少读一个字节就会让上层解析读到半截帧。
+ *
+ * ## 步骤
+ * step1. 校验 fd 与 iov 参数；
+ * step2. 段数够多且存在相邻段时才堆分配合并数组，分配失败退回原数组；
+ * step3. 总长度为 0 直接返回 0；
+ * step4. 首轮 Readv 读满或 EOF 时立即返回；
+ * step5. 否则复制 iovec 副本，按已读字节推进后继续读；
+ * step6. 读到 0 视为 EOF 并返回；读出错返回 -1。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同一 File 的读操作需调用方串行化。
+ * - 原子性：单次 readv 原子；多轮续读可能与其他读者交错。
+ * - 失败语义：noexcept；错误经 m_last_error 返回，不抛异常。
+ * - 不变量：返回正数时，前 n 个字节分布在 iov 覆盖的连续区域中。
+ */
 ssize_t File::ReadvAll(const struct iovec* iov, int iovcnt) noexcept {
     if (m_fd < 0) {
         m_last_error = EBADF;

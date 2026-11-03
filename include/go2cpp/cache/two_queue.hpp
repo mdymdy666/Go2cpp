@@ -79,6 +79,32 @@ public:
         }
     }
 
+    /**
+     * @brief 2Q 读取：Am 命中移到头部，A1in 命中保持 FIFO 位置；ghost 命中登记待提升。
+     *
+     * @param key [in] 查找键，const 引用——生命周期只需覆盖本次调用。
+     * @param value [out] 命中时写入；可为 nullptr 表示只探测——未命中时不修改。
+     *
+     * @return
+     * - true：命中——调用方**必须**使用写回值；
+     * - false：未命中（包括 ghost 命中）——调用方**必须**回源加载；ghost 命中已为下次 Put 预埋提升标记。
+     *
+     * ## 定位
+     * 唯一读取路径。若让 A1in 也 move_to_front，2Q 就退化成 LRU，抗顺序扫描特性消失。
+     *
+     * ## 步骤
+     * step1. 在索引里查条目；
+     * step2. Am 段命中才移到头部；A1in 是 FIFO，命中不动；
+     * step3. 写回值并清除 pending 标记（已消费的提升意图）；
+     * step4. 未命中时查 ghost：命中则搬进 pending 表并记 ghost_hit；
+     * step5. 记 miss 并返回 false。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：非线程安全，需外部加锁。
+     * - 原子性：ghost 搬迁与 pending 插入在同一临界区。
+     * - 失败语义：pending 超容时丢最老一条，不影响正确性。
+     * - 不变量：返回 false 后，若曾 ghost 命中，该 key 已在 pending 表中。
+     */
     bool Get(const K& key, V* value) override {
         Entry* entry = Lookup(key);
         if (entry != nullptr) {
@@ -125,6 +151,31 @@ public:
         return true;
     }
 
+    /**
+     * @brief 插入或更新；ghost/pending 命中的 key 直接进 Am，新 key 进 A1in。
+     *
+     * @param key [in] 键，const 引用。
+     * @param value [in] 值，按值移交（内部 move）。
+     * @param weight [in] 权重，默认 1；只影响统计与 weight_，容量按条数计算。
+     *
+     * @return 无返回值。
+     *
+     * ## 定位
+     * 唯一写入路径，也是 2Q「二次访问才提升」策略的落点：错过 TakePending 会让热点永远留在 A1in。
+     *
+     * ## 步骤
+     * step1. 查已有条目，命中走更新分支；
+     * step2. 更新分支调整权重/值，Am 内提头，消费 pending；
+     * step3. 新条目先看 pending：命中说明近期被淘汰过，直接进 Am；
+     * step4. 否则先进 A1in；
+     * step5. 两个插入分支都先 ReclaimForInsert 腾出名额。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：非线程安全，需外部加锁。
+     * - 原子性：腾位与插入在同一临界区，不会出现 Size 超容的中间态。
+     * - 失败语义：节点池分配失败会抛异常，缓存不变。
+     * - 不变量：返回后 Size() < Capacity()。
+     */
     void Put(const K& key, V value, std::size_t weight = 1) override {
         Entry* entry = Lookup(key);
         if (entry != nullptr) {
@@ -288,6 +339,26 @@ private:
         weight_ += weight;
     }
 
+    /**
+     * @brief 插入前把 A1in+Am 压到容量以下：按 2Q 规则在淘汰 Am 与降级 A1in 之间选择。
+     *
+     * @return 无返回值；循环直到 `a1in_.size() + am_.size() < capacity_`。
+     *
+     * ## 定位
+     * 唯一容量回收点。分支选择错了会让 A1in 长期占满、Am 反复空转，或陷入死循环（两个分支都不推进）。
+     *
+     * ## 步骤
+     * step1. 只要总量还 >= 容量就继续；
+     * step2. Am 非空且（A1in 未达份额或 A1in 已空）时，淘汰 Am 尾部（真正丢掉热数据）；
+     * step3. 否则把 A1in 尾部降级成 ghost（保留「访问过」的记忆）；
+     * step4. 只剩 Am 可淘汰时兜底淘汰 Am 尾部。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：只能由 Put 在持锁时调用。
+     * - 原子性：每次循环至少减少一个条目，保证终止。
+     * - 失败语义：无分配，不抛异常。
+     * - 不变量：返回后总量严格小于容量。
+     */
     void ReclaimForInsert() {
         while (a1in_.size() + am_.size() >= capacity_) {
             if (!am_.empty() &&

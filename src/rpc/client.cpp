@@ -430,6 +430,27 @@ bool Connection::CancelStream(std::uint64_t call_id) {
     return true;
 }
 
+/**
+ * @brief 客户端读线程主循环：读字节流、切帧、逐帧分派，退出时关闭连接。
+ *
+ * @return 无返回值；EOF、协议错误或 m_closed 都会结束循环。
+ *
+ * ## 定位
+ * 客户端唯一的帧来源。切帧失败若继续读，后续帧边界会全部错位；退出时不 Close 会让等待者永不苏醒。
+ *
+ * ## 步骤
+ * step1. 循环直到关闭标志；
+ * step2. 从 transport 读一块字节，<=0 视为 EOF/错误退出；
+ * step3. 交给 codec 切帧，畸形流直接断开；
+ * step4. 逐帧 Dispatch，任一失败立即断开；
+ * step5. 退出时 Close，唤醒所有等待中的调用。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：每连接一个读线程，由 Start 启动。
+ * - 原子性：codec 内部保留跨读的半帧状态，只能单线程 Feed。
+ * - 失败语义：不抛异常；Close 幂等。
+ * - 不变量：循环退出后连接一定处于关闭状态，所有 pending 调用被唤醒。
+ */
 void Connection::ReaderLoop() {
     while (!m_closed.load(std::memory_order_acquire)) {
         Status status;
@@ -459,6 +480,30 @@ void Connection::ReaderLoop() {
     Close();
 }
 
+/**
+ * @brief 按帧类型把服务端下行帧分派到对应处理器。
+ *
+ * @param frame_value [in] 已解析的完整帧；引用只在本次调用内有效。
+ *
+ * @return
+ * - true：帧已处理（含可忽略的未知类型）——调用方**必须**继续读下一帧；
+ * - false：收到非法方向帧或处理器失败——调用方**必须**断开，字节流已不可信。
+ *
+ * ## 定位
+ * 客户端唯一的帧分派点。把 Request/Cancel 当成可忽略会让协议方向错误被静默掩盖；
+ * 把未知类型当致命会让协议无法向前兼容。
+ *
+ * ## 步骤
+ * step1. 按 type 分派 Response/StreamData/StreamEnd/Pong；
+ * step2. 服务端方向的 Request/Cancel/Ping 一律返回 false；
+ * step3. 未知类型返回 true（向前兼容，忽略）。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：只能在 ReaderLoop 线程调用。
+ * - 原子性：单帧处理；各处理器内部自行加锁。
+ * - 失败语义：返回 false 表示连接级错误，不抛异常。
+ * - 不变量：返回 true 后该帧的协议状态已完全消费。
+ */
 bool Connection::Dispatch(const frame::Frame& frame_value) {
     switch (static_cast<FrameType>(frame_value.type)) {
         case FrameType::kResponse:
@@ -477,6 +522,31 @@ bool Connection::Dispatch(const frame::Frame& frame_value) {
     return true;  // 未知类型：向前兼容，忽略。
 }
 
+/**
+ * @brief 解码 Response，按 call_id 唤醒等待中的调用；迟到响应直接丢弃。
+ *
+ * @param frame_value [in] Response 帧；payload 已由 codec 校验。
+ *
+ * @return true 表示已处理（含丢弃迟到响应）——调用方**必须**继续读；
+ *         false 表示协议错误——调用方**必须**断开。
+ *
+ * ## 定位
+ * 客户端等待链路的唯一唤醒点。漏掉 notify 会让调用方等到超时；把迟到响应当成错误会让取消路径误报。
+ * 流式请求被服务端用普通 Response 回复时，必须转成 StreamEnd，否则流永远收不到结束。
+ *
+ * ## 步骤
+ * step1. 解码 call_id/status/payload；
+ * step2. 持 pending 锁取出并移除 CallState；
+ * step3. 找不到调用时查流表：命中则把 Response 转成 StreamEnd 并唤醒；
+ * step4. 都找不到说明已超时/取消，返回 true 丢弃；
+ * step5. 命中则填状态、置 done、notify_all。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：ReaderLoop 线程调用；与 Wait/CancelCall 通过 CallState::mutex 同步。
+ * - 原子性：从 pending 摘除与写状态分两把锁，但 done 标志保证只唤醒一次。
+ * - 失败语义：不抛异常；重复响应被 done 检查吞掉。
+ * - 不变量：返回 true 后该 call_id 不会再收到第二次唤醒。
+ */
 bool Connection::HandleResponse(const frame::Frame& frame_value) {
     ResponseMessage message;
     std::string error;

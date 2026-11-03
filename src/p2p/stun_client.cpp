@@ -53,6 +53,35 @@ bool IsLocalMappedEndpoint(DatagramTransport* transport, const Endpoint& mapped)
 StunClient::StunClient(DatagramTransport* transport, Endpoint server)
     : m_transport(transport), m_server(std::move(server)), m_buffer(2048) {}
 
+/**
+ * @brief 发送一条 STUN 请求并等待事务 ID 匹配的成功/错误响应（通用路径）。
+ *
+ * @param request [in] 已构造的 STUN 请求，事务 ID 由此决定匹配条件——引用在本调用期间有效。
+ * @param timeout [in] 接收上限毫秒；<=0 时首轮 poll 立即超时，通常应传正数。
+ * @param error [out] 失败原因，可为 nullptr；成功时不修改。
+ *
+ * @return
+ * - 有值 `StunExchangeResult`：收到匹配响应，含消息、来源地址与 RTT——调用方**必须**检查 klass 再取属性；
+ * - `std::nullopt`：超时/发送失败/未配置——调用方**必须**读 error，不要假定网络不可用。
+ *
+ * ## 定位
+ * STUN 事务的唯一通用收发点。漏掉事务 ID 匹配会把过期响应当成本次结果；
+ * 不丢弃不相关数据报会让 NAT 探测在多客户端场景下串包。
+ *
+ * ## 步骤
+ * step1. 校验 transport 与服务器地址；
+ * step2. 序列化请求，失败即返回；
+ * step3. 记录起始时间并发送；
+ * step4. 循环接收，直到超过 deadline；
+ * step5. 解析失败或事务 ID/方法/类型不匹配的数据报直接丢弃并继续；
+ * step6. 命中则移动消息、记录来源与 RTT 返回。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同一 StunClient 的 m_buffer 被复用，不可并发调用 Exchange/Binding。
+ * - 原子性：一次事务的发送与接收之间不持锁，其他线程的收发可能插入。
+ * - 失败语义：超时返回 nullopt 且不修改 request；error 只在失败分支写入。
+ * - 不变量：成功返回的 message.transaction_id 一定等于 request.transaction_id。
+ */
 std::optional<StunExchangeResult> StunClient::Exchange(const StunMessage& request,
                                                        std::chrono::milliseconds timeout,
                                                        std::string* error) {
@@ -123,6 +152,34 @@ std::optional<StunExchangeResult> StunClient::Exchange(const StunMessage& reques
     return std::nullopt;
 }
 
+/**
+ * @brief 快速 Binding 探测：栈上写线格式请求，零拷贝视图解析，返回映射地址。
+ *
+ * @param timeout [in] 接收上限毫秒；<=0 立即超时。
+ * @param error [out] 失败原因，可为 nullptr；成功时不修改。
+ *
+ * @return
+ * - 有值 `Endpoint`：服务器观察到的本端公网地址——调用方**必须**把它作为 srflx 候选，不要当本地地址；
+ * - `std::nullopt`：超时/无 XOR-MAPPED-ADDRESS/未配置——调用方**必须**降级处理。
+ *
+ * ## 定位
+ * NAT 类型探测与 srflx 候选采集的热路径。它绕过通用序列化，因此字段布局必须与协议严格一致；
+ * 一旦解析出的地址错位，ICE 会拿错误候选做连通性检查，表现为「永远连不上」。
+ *
+ * ## 步骤
+ * step1. 校验 transport 与服务器地址；
+ * step2. 用 64B 栈缓冲直接写 Binding 请求并生成事务 ID；
+ * step3. 发送并记录 deadline；
+ * step4. 循环接收，解析为只读视图；
+ * step5. 非 Binding 响应或事务 ID 不匹配则丢弃；
+ * step6. 提取 XOR-MAPPED-ADDRESS 返回。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：与 Exchange 共用 m_buffer，不可并发。
+ * - 原子性：单次发送/接收；不持锁。
+ * - 失败语义：不抛异常；超时返回 nullopt。
+ * - 不变量：成功返回的地址 family 与 socket 家族一致。
+ */
 std::optional<Endpoint> StunClient::Binding(std::chrono::milliseconds timeout,
                                             std::string* error) {
     // 快路径：请求用栈缓冲直接写线格式（SOFTWARE 属性 + 事务 ID），响应用

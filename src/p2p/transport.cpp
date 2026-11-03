@@ -133,6 +133,36 @@ bool UdpTransport::SendTo(const Endpoint& destination, const void* data, std::si
     }
 }
 
+/**
+ * @brief 带超时接收一个 UDP 数据报，并回填来源地址。
+ *
+ * @param source [out] 来源端点，可为 nullptr 表示不关心；成功时写入，失败/超时时保持原值。
+ * @param buffer [out] 接收缓冲区，不可为 nullptr；capacity 为可用字节数。
+ * @param capacity [in] 缓冲区容量字节，必须 >0；超出部分的数据报会被内核截断。
+ * @param timeout [in] 等待上限毫秒；负值按 poll 的无限等待处理，0 为非阻塞探测。
+ *
+ * @return
+ * - >0：收到的字节数——调用方**必须**只使用前 n 字节；
+ * - 0：超时或 EINTR——调用方**必须**判断自己的 deadline 后决定是否续等，不要当 EOF；
+ * - -1：套接字错误——调用方**必须**停止使用该 transport。
+ *
+ * ## 定位
+ * 所有 P2P 收包路径的唯一系统调用点（STUN/TURN/数据/keepalive 共用）。
+ * 把「超时」返回成 -1 会让上层把正常空闲当连接断开。
+ *
+ * ## 步骤
+ * step1. 校验 fd；
+ * step2. poll 等待 POLLIN，超时返回 0，EINTR 也返回 0；
+ * step3. recvfrom 读取一个数据报；
+ * step4. EAGAIN/EWOULDBLOCK/EINTR 统一返回 0；
+ * step5. 成功时回填来源地址并返回字节数。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同一 fd 可多线程并发 recvfrom（内核串行化），但 m_local 由锁保护。
+ * - 原子性：单数据报接收原子；截断由内核完成且无错误提示。
+ * - 失败语义：不抛异常；-1 表示 fd 级错误。
+ * - 不变量：返回 >0 时 source 已写入有效端点（当 source 非空）。
+ */
 int UdpTransport::RecvFrom(Endpoint* source, void* buffer, std::size_t capacity,
                            std::chrono::milliseconds timeout) {
     if (m_fd < 0) {

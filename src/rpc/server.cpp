@@ -387,6 +387,33 @@ bool ServerConnection::HandleFrame(const Frame& frame_value) {
     return true;  // 未知类型：向前兼容，忽略。
 }
 
+/**
+ * @brief 解码一个 Request 帧，登记取消位，再分派到读线程快路径或工作队列。
+ *
+ * @param frame_value [in] 已从字节流切出的完整帧，payload 由 codec 校验；引用只在本次调用内有效。
+ *
+ * @return
+ * - true：请求已受理（同步已完成或已入队）——调用方**必须**继续读下一帧；
+ * - false：解码失败或连接已关闭——调用方**必须**断开连接，否则字节流状态已不可信。
+ *
+ * ## 定位
+ * 服务端唯一请求入口，也是「快慢路径」的分叉点。分错路径会让流式 handler 阻塞读线程，
+ * 从而收不到 Cancel 帧；漏登记取消位会让 Cancel 永远无效。
+ *
+ * ## 步骤
+ * step1. 解码 call_id/method/args/streaming，失败即断开；
+ * step2. 构造 PendingRequest，分配共享取消位；
+ * step3. 先登记到 m_cancels，保证随后到达的 Cancel 能命中；
+ * step4. 非流式请求在读线程直接执行（省一次线程唤醒）；
+ * step5. 流式请求入队并唤醒工作线程，让读线程继续收 Cancel；
+ * step6. 入队前再检查一次关闭标志，避免关闭后仍投递。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：只能在 ReaderLoop 线程调用；m_cancels/m_queue 各自有互斥保护。
+ * - 原子性：取消位登记先于执行，Cancel 与执行之间有明确先后。
+ * - 失败语义：返回 false 表示连接级故障，调用方断开；不抛异常。
+ * - 不变量：返回 true 后该 call_id 一定在 m_cancels 中（直到 EraseCancel）。
+ */
 bool ServerConnection::HandleRequest(const Frame& frame_value) {
     RequestMessage message;
     std::string error;
@@ -451,6 +478,26 @@ bool ServerConnection::HandlePing(const Frame& frame_value) {
     return SendPayload(FrameType::kPong, 0, payload);
 }
 
+/**
+ * @brief 工作线程主循环：阻塞等待队列，取出流式请求并执行。
+ *
+ * @return 无返回值；m_closed 置位后退出并标记 m_worker_done。
+ *
+ * ## 定位
+ * 流式请求的唯一执行线程。漏掉唤醒会让请求永远躺在队列里；漏掉关闭检查会让线程无法退出。
+ *
+ * ## 步骤
+ * step1. 持队列锁等待「有请求或已关闭」；
+ * step2. 已关闭则退出循环；
+ * step3. 取队首并弹栈；
+ * step4. 释放锁后执行 Process，避免长 handler 阻塞入队。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：每连接一个工作线程；与 ReaderLoop 通过 m_queue + condvar 通信。
+ * - 原子性：出队与关闭检查在同一临界区，不会丢唤醒。
+ * - 失败语义：无异常出口；Process 内部已吞掉错误。
+ * - 不变量：退出后 m_worker_done 为 true，Join 可以安全等待。
+ */
 void ServerConnection::WorkerLoop() {
     for (;;) {
         std::shared_ptr<PendingRequest> request;
@@ -475,6 +522,31 @@ void ServerConnection::EraseCancel(std::uint64_t call_id) {
     m_cancels.erase(call_id);
 }
 
+/**
+ * @brief 在注册表里查方法并执行，把结果编码成 Response 或 StreamEnd 发回客户端。
+ *
+ * @param request [in] 已解码的待处理请求，shared_ptr 保证执行期间存活——所有权借用，不延长生命周期。
+ *
+ * @return 无返回值；所有失败都通过错误响应表达，不向调用方抛异常。
+ *
+ * ## 定位
+ * 唯一的方法执行点。方法未注册与 streaming 标志不匹配都必须回错误帧，否则客户端会永久等待；
+ * 漏发 StreamEnd 会让流式调用挂死。
+ *
+ * ## 步骤
+ * step1. 查注册表，未命中回 kNotFound（流式用 StreamEnd）；
+ * step2. 校验 streaming 标志与注册绑定一致，不一致回 kInvalidArgument；
+ * step3. 构造 CallContext（携带取消位）；
+ * step4. 流式：建 StreamSender 并执行，最后 Finish 发送 StreamEnd；
+ * step5. 非流式：执行后直接回 Response；
+ * step6. 所有分支清理取消位登记。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：读线程（非流式）或工作线程（流式）调用，same 连接可并发执行多个请求。
+ * - 原子性：单个请求的执行是串行的；跨请求并发由 handler 自行保证安全。
+ * - 失败语义：handler 抛异常会由上层捕获转成 kInternal（见调用点）；本函数不抛。
+ * - 不变量：返回前该 call_id 的取消位已从 m_cancels 移除。
+ */
 void ServerConnection::Process(const std::shared_ptr<PendingRequest>& request) {
     const BoundMethod* bound = m_server->Registry().Find(request->method);
     if (bound == nullptr) {

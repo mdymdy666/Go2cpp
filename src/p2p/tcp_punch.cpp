@@ -116,6 +116,35 @@ void TcpPuncher::ResetSocket() {
     m_connected = false;
 }
 
+/**
+ * @brief TCP 同时打开打洞：反复 connect，直到成功或超时。
+ *
+ * @param remote [in] 对端 IPv4 端点；不可为 IPv6，否则返回 false。
+ * @param timeout [in] 总预算毫秒；<=0 时循环体一次都不执行，直接超时。
+ * @param error [out] 最后一次失败原因，可为 nullptr。
+ *
+ * ## 定位
+ * TCP NAT 穿透的唯一发起者。对端未同时打开时每次 connect 都会被 RST，
+ * 因此必须「重建 socket + 重试」，否则会永久卡在坏 socket 上。
+ *
+ * @return
+ * - true：已连接——调用方**必须**开始收发，并注意连接随时可能被对端关闭；
+ * - false：超时或参数非法——调用方**必须**放弃该候选，不要无限重试。
+ *
+ * ## 步骤
+ * step1. 校验 fd 与对端（只支持 IPv4）；
+ * step2. 记录 deadline 与本地地址；
+ * step3. 循环直到 deadline：fd 失效则重建；
+ * step4. 非阻塞 connect，返回 EINPROGRESS 时 poll(POLLOUT)；
+ * step5. 可写后用 SO_ERROR/getpeername 判定是否真的连上；
+ * step6. 失败则重置 socket 并 sleep 5ms，避免忙转。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同一 TcpPuncher 不可并发 Connect/Close（m_fd 是共享状态）。
+ * - 原子性：socket 重建与 connect 之间可能被对端 RST 打断，循环保证状态可恢复。
+ * - 失败语义：不抛异常；失败时 socket 可能已被重置。
+ * - 不变量：返回 true 后 m_connected 为 true 且 m_remote 有效。
+ */
 bool TcpPuncher::Connect(const Endpoint& remote, std::chrono::milliseconds timeout,
                          std::string* error) {
     if (m_fd < 0) {

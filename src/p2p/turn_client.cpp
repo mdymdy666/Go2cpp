@@ -71,6 +71,38 @@ void RelayClient::EnsureSendBuffer(std::size_t bytes) {
     }
 }
 
+/**
+ * @brief 发送一条中继协议请求，等待 request_id 匹配的响应并取回状态码与 body。
+ *
+ * @param type [in] 中继消息类型（Allocate/Refresh/Release 等），取值来自 RelayMessageType。
+ * @param body [in] 请求体，可为空 vector；引用在本调用期间有效。
+ * @param timeout [in] 接收上限毫秒；<=0 立即超时。
+ * @param status [out] 响应首字节状态码，成功时写入；失败时未定义。
+ * @param response_body [out] 响应体（含状态字节），可为 nullptr 表示不取；失败时不修改。
+ * @param error [out] 失败原因，可为 nullptr。
+ *
+ * @return
+ * - true：收到匹配响应——调用方**必须**先检查 status 再解析 body；
+ * - false：超时/发送失败/格式非法——调用方**必须**读 error 并决定重试。
+ *
+ * ## 定位
+ * 中继控制面唯一的请求/响应点。request_id 不匹配的响应必须丢弃，否则并发分配会串结果；
+ * 响应体长度小于 1 时必须报错，否则调用方会读到未定义的 status。
+ *
+ * ## 步骤
+ * step1. 校验 transport 与服务器地址；
+ * step2. 生成请求 id 并序列化到复用缓冲；
+ * step3. 发送；
+ * step4. 循环接收直到 deadline；
+ * step5. 丢弃解析失败或 request_id 不匹配的数据报；
+ * step6. 校验 body 至少含状态字节，写回 status 与可选 body。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：共用 m_request_wire/m_request_buffer，不可并发调用。
+ * - 原子性：请求-响应窗口内无锁，其他收发可能插入。
+ * - 失败语义：返回 false 不抛异常；status 只在成功路径写入。
+ * - 不变量：成功返回时 status 指向有效字节。
+ */
 bool RelayClient::Request(std::uint8_t type, const std::vector<std::uint8_t>& body,
                           std::chrono::milliseconds timeout, std::uint8_t* status,
                           std::vector<std::uint8_t>* response_body, std::string* error) {
@@ -141,6 +173,33 @@ bool RelayClient::Request(std::uint8_t type, const std::vector<std::uint8_t>& bo
     return false;
 }
 
+/**
+ * @brief 申请中继端点；已分配时幂等成功，失败按配置次数重试。
+ *
+ * @param error [out] 最后一次失败原因，可为 nullptr；成功时不修改。
+ *
+ * @return
+ * - true：已分配——调用方**必须**用 relayed_endpoint() 获取中继地址；
+ * - false：所有尝试失败或响应格式非法——调用方**必须**降级到直连或报错。
+ *
+ * ## 定位
+ * 中继数据面的前提。分配未成功就让 SendTo 走中继会静默丢包；
+ * 不校验响应里的端点/生命周期字段会把垃圾数据当分配结果。
+ *
+ * ## 步骤
+ * step1. 持锁并检查是否已分配（幂等快路径）；
+ * step2. 按 allocate_attempts 循环；
+ * step3. 每次发 Allocate 请求；
+ * step4. 状态非 OK 或请求失败则记错误并重试；
+ * step5. 解析中继端点与生命周期，格式非法同样重试；
+ * step6. 成功后写 m_relayed/m_lifetime 并 release 置已分配。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：内部持 m_mutex，与 Refresh/Release 串行。
+ * - 原子性：分配成功标志在字段写完之后 release 发布。
+ * - 失败语义：不抛异常；失败后 allocated() 仍为 false，可重试。
+ * - 不变量：allocated()==true 时 relayed_endpoint() 一定有效。
+ */
 bool RelayClient::Allocate(std::string* error) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_allocated.load(std::memory_order_relaxed)) {

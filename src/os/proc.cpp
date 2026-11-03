@@ -857,6 +857,34 @@ private:
     static Result<ExitStatus> WaitFor(pid_t pid, std::chrono::milliseconds timeout);
 };
 
+/**
+ * @brief 按选项 fork/exec 一个子进程，建立 stdio/PTY 通道并返回句柄。
+ *
+ * @param options [in] 启动参数（argv/env/cwd/stdio/pty/nice/affinity/oom 等）；argv 不可为空——引用只需在本调用期间有效。
+ *
+ * @return
+ * - 成功 `SpawnedProcess`：子进程已启动，fd 所有者已移交——调用方**必须**接管并在退出时回收；
+ * - 失败 `ProcError`：参数非法/找不到可执行文件/系统调用失败——调用方**必须**按 code 区分「参数错误」与「环境错误」。
+ *
+ * ## 定位
+ * 进程生命周期的唯一起点，也是 fd 所有权最集中的地方。任一中间步骤失败未回收 fd，
+ * 就会在长驻服务里泄漏 fd；fork 后子进程侧的错误处理不当会留下僵尸。
+ *
+ * ## 步骤
+ * step1. 逐项校验 argv/nice/调度策略/oom/PTY 行列，非法立即返回；
+ * step2. 解析可执行文件路径，找不到返回 kExecFailed；
+ * step3. 构造 envp/argv 的 C 字符串数组；
+ * step4. 需要 PTY 时先打开并只移交 slave 给子进程，master 留在父进程；
+ * step5. fork+exec，子进程侧失败通过错误管道回传，避免 exec 失败被误判为成功；
+ * step6. 父进程关闭子端 fd，设置 pgid/session、nice、亲和性等属性；
+ * step7. 把父端 fd 移交给 FdOwner，全部成功后才返回句柄。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；fork 后子进程只执行 async-signal-safe 操作。
+ * - 原子性：fd 生命周期由 FdOwner 统一回收，失败路径不泄漏。
+ * - 失败语义：返回错误码而非抛异常；失败后不留下子进程。
+ * - 不变量：成功返回的句柄中 pid 有效且 stdio 通道已就绪。
+ */
 Result<SpawnedProcess> RealBackend::Spawn(const ProcessOptions& options) {
     if (options.argv.empty() || options.argv[0].empty()) {
         return MakeError(ProcErrorCode::kInvalidArgument, EINVAL, "argv 不能为空",
@@ -1189,6 +1217,34 @@ Result<SpawnedProcess> RealBackend::Spawn(const ProcessOptions& options) {
     return spawned;
 }
 
+/**
+ * @brief 等待指定子进程退出，支持超时与 pidfd 事件驱动。
+ *
+ * @param pid [in] 子进程 pid，必须 >0；无效 pid 返回 kInvalidArgument。
+ * @param timeout [in] 等待上限毫秒；负值表示无限等待；0 表示只做一次非阻塞探测。
+ *
+ * @return
+ * - 成功 `ExitStatus`：已回收，含 exited/signaled/stopped 与退出码——调用方**必须**按 reaped 状态停止再次 Wait；
+ * - `kTimeout`：超时且子进程仍存活——调用方**必须**决定继续等或 Terminate，**不要**当崩溃；
+ * - 其他 `ProcError`：waitpid 失败——调用方**必须**检查 ECHILD（可能已被其他线程回收）。
+ *
+ * ## 定位
+ * 唯一回收子进程的入口。重复 waitpid 会返回 ECHILD；漏回收会产生僵尸进程。
+ *
+ * ## 步骤
+ * step1. 计算绝对截止时间（负超时=无限）；
+ * step2. 尝试打开 pidfd，内核不支持时降级为轮询；
+ * step3. 循环非阻塞 waitpid，命中则解码退出状态并关闭 pidfd；
+ * step4. waitpid 报错时区分 EINTR 与其他错误；
+ * step5. 检查截止时间，超时返回 kTimeout；
+ * step6. 有 pidfd 时 poll 等待可读事件；没有则 1ms 睡眠轮询。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同一 pid 只允许一个等待者（多线程等待会互相偷取 ECHILD）。
+ * - 原子性：waitpid 回收是内核原子操作；pidfd 只是加速通知。
+ * - 失败语义：不抛异常；任何分支都关闭已打开的 pidfd。
+ * - 不变量：返回成功状态后该 pid 已可被系统复用。
+ */
 Result<ExitStatus> RealBackend::WaitFor(pid_t pid, std::chrono::milliseconds timeout) {
     if (pid <= 0) {
         return MakeError(ProcErrorCode::kInvalidArgument, EINVAL, "pid 无效", "wait");
@@ -1659,6 +1715,33 @@ Result<void> Process::Kill(int signal) {
     return m_impl->KillImpl(signal);
 }
 
+/**
+ * @brief 先 SIGTERM 并等待 grace，超时再 SIGKILL 强杀，保证进程最终退出。
+ *
+ * @param grace [in] 优雅退出等待毫秒；负值按默认 5000ms 处理。
+ *
+ * @return
+ * - 成功：进程已退出并被回收——调用方**必须**停止对该句柄发信号；
+ * - `kNotRunning`：进程未启动——调用方**不要**重试；
+ * - 其他错误：信号或等待失败——调用方**必须**上报，不要假定进程已死。
+ *
+ * ## 定位
+ * 优雅关闭的唯一实现。漏掉 SIGKILL 兜底会让不响应 SIGTERM 的服务永久卡住；漏掉回收会留僵尸。
+ *
+ * ## 步骤
+ * step1. 校验句柄与是否已回收（已退出直接成功）；
+ * step2. 归一化 grace；
+ * step3. 运行中则发 SIGTERM，忽略「已不存在」错误；
+ * step4. 在 grace 内等待退出；
+ * step5. 超时则发 SIGKILL 并再等 5s；
+ * step6. 任何非超时错误原样返回。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同一 Process 的 Terminate/Wait 不可并发（状态机会竞争）。
+ * - 原子性：SIGTERM→等待→SIGKILL 是三步非原子流程，中间状态对其他线程可见。
+ * - 失败语义：不抛异常；失败后 state 可能已被推进为 kKilled。
+ * - 不变量：返回成功时 exit_status 已就绪、pid 已被回收。
+ */
 Result<void> Process::Terminate(std::chrono::milliseconds grace) {
     if (!m_impl || !m_impl->valid) {
         return MakeError(ProcErrorCode::kNotRunning, ESRCH, "进程未启动",
@@ -1696,6 +1779,32 @@ Result<void> Process::Terminate(std::chrono::milliseconds grace) {
     return OkResult();
 }
 
+/**
+ * @brief 向子进程所在的整个进程组发信号（含其派生的后代）。
+ *
+ * @param signal [in] 正信号值（如 SIGTERM/SIGKILL）；<=0 返回 kInvalidArgument。
+ *
+ * @return
+ * - 成功：信号已投递给进程组——调用方**必须**随后 Wait 回收组长；
+ * - `kNotRunning`：进程未启动或已回收——调用方**不要**重试；
+ * - `kUnsupported`：目标不是进程组长——调用方**必须**改用 Kill，否则会误杀调用方进程组。
+ *
+ * ## 定位
+ * 清理进程树的唯一入口。用 -pgid 发信号意味着「组长之外的人」也可能被杀，所以组长校验是硬闸门。
+ *
+ * ## 步骤
+ * step1. 校验句柄与是否已回收；
+ * step2. 校验 pgid == pid（Spawn 时 new_session=true 才成立），否则拒绝；
+ * step3. 校验信号值；
+ * step4. 向 -pgid 发信号；
+ * step5. 记一次 kill 统计。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；与 Terminate 并发时结果取决于信号先后，调用方需自行串行化。
+ * - 原子性：kill(-pgid) 由内核一次完成。
+ * - 失败语义：不抛异常；错误原样返回。
+ * - 不变量：返回成功后该进程组至少收到一次指定信号。
+ */
 Result<void> Process::KillTree(int signal) {
     if (!m_impl || !m_impl->valid) {
         return MakeError(ProcErrorCode::kNotRunning, ESRCH, "进程未启动",

@@ -91,6 +91,33 @@ public:
         }
     }
 
+    /**
+     * @brief W-TinyLFU 读取：先采样频率，再查表，命中按所在段提升。
+     *
+     * @param key [in] 查找键，const 引用。
+     * @param value [out] 命中时写入；可为 nullptr 表示只探测。
+     *
+     * @return
+     * - true：命中并已更新段位置——调用方**必须**使用写回值；
+     * - false：未命中并计入 miss——调用方**必须**回源加载。
+     *
+     * ## 定位
+     * 唯一读取路径，也是频率素描的唯一采样点。漏采样会让准入比较失真；漏提升会让热数据卡在 probation。
+     *
+     * ## 步骤
+     * step1. 计算混合哈希并记一次频率（doorkeeper 去过重、sketch 计数、定期 halve）；
+     * step2. 用折叠后的 32 位哈希查索引；
+     * step3. 未命中记 miss 并返回；
+     * step4. 写回值；
+     * step5. 按段处理：window 晋升主缓存、protected 前移、probation 晋升 protected；
+     * step6. 记 hit。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：非线程安全，需外部加锁。
+     * - 原子性：频率采样与查表在同一临界区，素描不会观察到半更新。
+     * - 失败语义：无分配、不抛异常。
+     * - 不变量：返回 true 后条目不在 window（除非 main_capacity 为 0）。
+     */
     bool Get(const K& key, V* value) override {
         const std::uint64_t hash = HashOf(key);
         RecordFrequency(hash);
@@ -132,6 +159,30 @@ public:
         return true;
     }
 
+    /**
+     * @brief 插入或更新；新条目先进 window，再由 TrimWindow 送进准入竞争。
+     *
+     * @param key [in] 键，const 引用。
+     * @param value [in] 值，按值移交。
+     * @param weight [in] 权重，默认 1；容量按条数计算，权重只用于统计。
+     *
+     * @return 无返回值。
+     *
+     * ## 定位
+     * 唯一写入路径。漏调 TrimWindow 会让 window 无界增长；漏更新 weight_ 会让统计失真。
+     *
+     * ## 步骤
+     * step1. 查已有条目并走更新分支（按段提热）；
+     * step2. main_capacity==0 时 window 就是全部，直接淘汰尾部后插入；
+     * step3. 常规插入：新节点进 window 头部、写索引、加权重、记 insert；
+     * step4. 调 TrimWindow 把超出 1% 窗口的候选交给 AdmitToMain。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：非线程安全，需外部加锁。
+     * - 原子性：插入与修剪在同一临界区，外部看不到中间态。
+     * - 失败语义：节点池分配失败抛异常，缓存不变。
+     * - 不变量：返回后 window_.size() <= window_capacity_。
+     */
     void Put(const K& key, V value, std::size_t weight = 1) override {
         const std::uint64_t hash = HashOf(key);
         const std::uint32_t table_hash = TableHash(hash);
@@ -346,7 +397,30 @@ private:
         InsertProtected(entry);
     }
 
-    /** @brief 候选进入主缓存：与 probation 尾部比较频率后决定接纳/拒绝。 */
+    /**
+     * @brief 候选进入主缓存：与 probation 尾部比较频率后决定接纳或拒绝。
+     *
+     * @param candidate [in] 待准入条目，裸指针——**所有权可能在本函数内销毁**（拒绝分支），调用方不得再用。
+     * @param promote [in] true 进 protected（来自 window 晋升），false 进 probation（window 淘汰降级）。
+     *
+     * @return 无返回值；被拒绝时条目已被销毁并计入 rejection。
+     *
+     * ## 定位
+     * 唯一的准入裁判，W-TinyLFU 的核心决策点。比较方向写反或在满容量时仍插入，会让缓存超过主缓存上限或把热数据拒之门外。
+     *
+     * ## 步骤
+     * step1. 主缓存容量为 0 时没有准入空间，直接销毁候选；
+     * step2. 主缓存已满：probation 为空而 protected 非空时先降级 protected 尾部，保证有比较对象；
+     * step3. 取 probation 尾部作为受害者，候选频率更高才淘汰受害者腾位；
+     * step4. 频率不更高则拒绝候选（销毁并记 rejection）；
+     * step5. 按 promote 把候选插入 protected 或 probation。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：只能由 TrimWindow/Promote 在持锁时调用。
+     * - 原子性：淘汰与插入在同一临界区，主缓存不会短暂超容。
+     * - 失败语义：拒绝分支销毁候选后立即返回，调用方**不得**再访问 candidate。
+     * - 不变量：返回后 protected_+probation_ 不超过 main_capacity_。
+     */
     void AdmitToMain(Entry* candidate, bool promote) {
         if (main_capacity_ == 0) {
             weight_ -= candidate->weight;
