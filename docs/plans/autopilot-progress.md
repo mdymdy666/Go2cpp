@@ -43,19 +43,23 @@
 | v3-审查 | 三件套（架构/汇编/正确性+性能） | ✅ d3af2db（docs/reports/rdnet-v3-review.md） |
 | C1 | 抖音骨架 + IDL | ✅ 89ccb58 |
 | C2 | user 服务（存储/鉴权/4 接口） | ✅ 3ff147f：25 PASS；QPS 1918.5、p50 4.04ms、p99 7.55ms |
-| C3–C10 | 抖音 video/feed/interaction/search/live/gateway/验收/可靠性 | 🔄 进行中（C3+C4 = `7767cd2c`） |
+| C3 | video 服务（videos 表/游标/403/404） | ✅ d0d7798：52 PASS；QPS 3197/p99 0.51ms |
+| C4 | feed 服务（热度/关注流/分页） | ✅ d0d7798：25 条 3 页无重复；QPS 1773.8/p99 0.94ms |
+| C5–C10 | interaction/search/live/gateway/验收/可靠性 | ⏳ 下一个 C5+C6 |
 | 通用组件 | singleflight + 一致性哈希 + Gateway | ✅ 93864a6（singleflight 80.6 ns/op、一致性哈希 13.1 ns/op）+ 50a2abf（Gateway checks=50） |
 | B-REQ | B 站复刻需求文档 | ✅ 2a9d43a（255 行） |
-| B1–B4 | B 站实现（存储/用户 → 视频/播放 → 弹幕 WS → 压测） | ⏸ 暂停（用户 17:55：应用层抖音优先）；需求文档保留 |
+| B-弹幕 | B 站弹幕服务（WS/广播/历史/限流） | ✅ d55cb83：A 发 B 收；50 连接 p99 9.43ms |
+| realtime | 通用实时房间组件（给抖音复用） | 🔄 精简版重派中（首次派单超时） |
+| B1–B4 | B 站其余（用户/视频/会员/压测） | ⏸ 暂停（抖音优先）；需求文档保留 |
 
 ## 下一个任务
 
-**C3+C4 抖音 video + feed（下一个，7767cd2c 在跑）**：
-1. 扩展 `douyin_store`：videos 表 + `CreateVideo/FindVideo/ListByUser/DeleteVideo/ListFeed/ListFollowingFeed`（热度公式 + cursor）；
-2. video_service（29102）：发布/详情/我的/删除（403/404/400）；
-3. feed_service（29103）：推荐流（时间+热度）、关注流、分页不重不漏；
-4. 验收：5+ 场景 + 25 条分页验证 + 1000 次压测。
-注：B 站方案已暂停（用户：应用层抖音优先）；B1 agent 已停，需求文档 `2a9d43a` 保留。
+**C5+C6 抖音 interaction + search（下一个）**：
+1. 扩展 `douyin_store`：likes（幂等主键）、comments 表 + 计数更新；
+2. interaction_service（29104）：点赞/取消赞（幂等）、评论/列表、计数同步；
+3. search_service（29106）：`/api/search?q=&type=` 前缀+包含匹配、空 q 400；
+4. 验收：5+ 场景（重复点赞幂等、评论列表、搜索命中/空 q）+ 压测。
+注：通用 realtime 房间组件（B 站弹幕抽出）精简版重派中，交付后接抖音直播间弹幕。
 
 ## 本轮记录
 
@@ -96,3 +100,7 @@
 - 17:40 **转向 B 站复刻**：用户确认「B 站弹幕+播放+会员」核心闭环；需求文档 `app/bilibili/REQUIREMENTS.md` 255 行（5 表、WS 协议、7 场景、B1-B4）提交 `2a9d43a`；B1（存储+用户）派 `4ff5f73f`。
 
 - 17:55 **抖音恢复优先**（用户决定）：B 站 B1（`4ff5f73f`）已停，B 站需求文档保留；恢复抖音 C3+C4（`7767cd2c`：扩展 store videos + video_service + feed_service + 分页/压测）。
+
+- 17:05 **C3+C4 完成**（7767cd2c → d0d7798）：videos 游标分页 52 PASS、25 条 3 页无重复、详情 QPS 3197/p99 0.51ms、feed QPS 1773.8/p99 0.94ms；修多进程 WAL ORM 残留游标。
+- 17:06 **B 站弹幕完成**（675cf514 → d55cb83）：A 发 B 收（3 条同时到达）、429/屏蔽词/房间隔离、50 连接 p99 9.43ms。
+- 17:07 realtime 组件首次派单超时（零产出），已缩小范围重派。
