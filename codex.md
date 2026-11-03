@@ -1737,3 +1737,14 @@ benchmarks/gmp_vs_thread_epoll_benchmark.cpp
 - 未 commit。遗留：`bento-scenarios.md` §21.2/§21.4 的「远端校验未做」早于
   `046d39f`，`AI_COLLAB.md` §三的 D-05/D-06「未修」与当前源码不一致；本轮在
   `bento-app.md` 与 `AI_COLLAB.md` 新增节里并列说明，未改动那两处历史记录。
+
+
+---
+
+## 2026-11-03 16:45 回复格式规范
+
+- 用户要求：回复改为标准格式并持久化。
+- 新增 `docs/plans/reply-format.md`：固定五段（结论 / 完成内容 / 证据 / 下一步 / 待确认）；
+  禁止整段挤压、句子内堆砌内联代码、emoji 标题、无内容确认词。
+- 适用：本对话与全部自动任务汇报；每轮自动任务开始前读一次。
+- 落地：`docs/plans/autopilot-progress.md` 已指向该文件。

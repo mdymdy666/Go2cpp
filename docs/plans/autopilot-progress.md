@@ -2,6 +2,7 @@
 
 > 节奏：每 15 分钟一轮（2026-11-03 14:46 用户从 30 分钟改为 15 分钟；定时任务 `Go2Cpp 自动驾驶推进`，id `schedule-0ae729ea`）。每轮只做「下一个任务」一项；用户 15:20 起允许并发多任务（本机基准互斥、不占 CPU 的任务可并行）。
 > 规则：做完必须验证；失败如实记；WSL 真树 commit，push 走 Windows 侧 Python；更新本文件。
+> **汇报格式（强制）**：每轮按 `docs/plans/reply-format.md` 的五段式——结论 / 完成内容 / 证据 / 下一步 / 待确认；禁止整段挤压、句子内堆砌代码、emoji 标题。
 > 真树：`/UserData/CodexWorkSpace/Go2cpp`（分支 `feat/isolated`）。
 
 ## 总目标（三阶段，按顺序）
