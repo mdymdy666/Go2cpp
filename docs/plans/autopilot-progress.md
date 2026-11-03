@@ -27,7 +27,7 @@
 | A1–A5 | ledger/三基线/M04-M15/全量校验 | ✅ 至 b0c9013 |
 | M16 | Go 基线本机实测 + 固化 | ✅ 1b4ae22 + 本轮固化（tools/bench/） |
 | M03 | scheduler 三件套 | 🔄 判定不达标 2.21×；目标追 Go@4 151–163 |
-| borrow | Go 源码借鉴（runqput/runqsteal/findrunnable） | 🔄 子 agent `b5ccd296` 在跑（8 分钟时间盒） |
+| borrow | Go 源码借鉴（3 函数，73 行：runnext 位移 / steal runnext / netpoll 前移） | ✅ 本轮（b5ccd296） |
 | B1 | VPS `tunnel-server.service` | 🔄 子 agent `8af8dbe4` 在跑 |
 | A6 | 清理 122/135/411k/0.98× 文档漂移 | 🔄 子 agent `f3638275` 在跑 |
 | M10/M11 | os readv / gzip 三件套 | ⏳ 排队（等基准独占窗口） |
@@ -36,8 +36,12 @@
 
 ## 下一个任务
 
-等三路交付（borrow / B1 / A6）后并行审查；随后**选 borrow 的 Top-1 落地架构改动**（目标 Go@4 151–163，当前 283–359，需 1.7–2.2×）：
-- 先 baseline（同命令 3 次中位，独占）→ 一条架构改动 → 汇编对比（若涉及）→ 全量正确性 + 1e6 压力 → 前/后数据；失败即回滚。
+**M03c（进行中）**：p22 分块复核 + borrow 建议 1。
+1. 二分定位 p22 的哪一块触发 smoke（P19/P20/P21/P22 分别单独应用各跑 20 次）；判定「断言竞态」还是「语义破坏」（park 是否最终到 kWaiting、wake 是否正常）；
+2. 若为语义破坏 → 永久放弃该块；若为竞态 → 修断言（`wait_until(kWaiting, 200ms)`）后全量 ctest + 1e6 压力；
+3. 落地 borrow 建议 1（`publish_runnext` 的 displaced 由本 P overflow 承接，避免 `enqueue` 全局锁）：先测 displaced 频率，再改，跑 bench + 正确性；
+4. 给「baseline → 每块 → 组合」的前/后数据；目标追 Go@4 151–163（当前 283–359）。
+注：borrow 的 Top-1 是 netpoll 前移，但它对 churn 基准收益不确定、且与 M03c 改同一文件，排在其后单独做。
 
 ## 本轮记录
 
@@ -46,4 +50,5 @@
 - 15:00 Go 重测：Go@4 162.7（@1 736/@2 264.9/@8 183.4/GOGC off 179.4）、C++ 359 → 2.21×（最好组合 1.47×）；历史 122/135 判口径不可考。
 - 15:03 派 borrow（`7bfcd2c6`，11 分钟无产出被 interrupt）→ 改派 `b5ccd296`（只读 3 函数、8 分钟时间盒）。
 - 15:14 按用户「并发开启其他任务」并发 4 个：`8af8dbe4`（VPS systemd）、`f3638275`（A6 文档漂移）、`24415abc`（固化 Go 基准）、`b5ccd296`（borrow）。
-- 15:18 **固化完成**（`24415abc`）：`tools/bench/go_sched_bench.go`（75 行，正文与 /tmp 版 `BODY_IDENTICAL`）+ `tools/bench/README.md`（37 行）；编译 BUILD_OK；3 轮 290/176/133（median 176.19，min 133.43），复跑 256/131.8/184.2、5 轮中位 184.55 —— 与 M16 162.7 同量级但抖动大（核 2 有 cpptools/mysqld 共享），程序逐字节一致；主控抽查：75/37 行、BODY_IDENTICAL、`git status` 仅 `?? tools/bench/`。ledger M16 脚本路径已更新。
+- 15:18 **固化完成**（`24415abc`）：`tools/bench/go_sched_bench.go`（75 行，正文与 /tmp 版 `BODY_IDENTICAL`）+ `tools/bench/README.md`（37 行）；编译 BUILD_OK；3 轮 290/176/133（median 176.19，min 133.43），复跑 256/131.8/184.2、5 轮中位 184.55 —— 与 M16 162.7 同量级但抖动大（核 2 有 cpptools/mysqld 共享），程序逐字节一致；主控抽查：75/37 行、BODY_IDENTICAL、`git status` 仅 `?? tools/bench/`。ledger M16 脚本路径已更新。已合并 `a2ce97b`。
+- 15:22 **borrow 完成**（`b5ccd296`，73 行，8 分钟时间盒内）：3 条建议——① `publish_runnext` 的 displaced 满环时走 `enqueue` 全局锁（Go 无条件踢回普通 runq 尾，`proc.go:7547-7549` ↔ `scheduler.cpp:4015/4031-4033`）→ 改由本 P overflow/incoming 承接；② 本项目刻意不偷 runnext（`:5866` 注释 + 历史「跨 M 恢复 15%→85%」反证），Go 有 `stealRunNextG` 3µs 退避（`proc.go:7720-7724`）→ 加开关、默认关；③ netpoll(0) 前移（Go `proc.go:3510-3513` 在偷之前 poll，本项目 `:6278` 无 G 才进 IO）→ Top-1；主控抽查：Go 7547/7718/7720/3510-3512 与 scheduler.cpp 4015/4031-4033/5859/5866 全部命中；主控决定先做「p22 分块复核 + 建议①」而非 netpoll（对 churn 收益更直接）。
