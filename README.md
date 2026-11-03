@@ -99,33 +99,141 @@ Go 的运行时语义，并针对 C++ 场景做工程化取舍（无 GC、RAII�
 
 ## 三、快速开始
 
+### 3.1 `go()`：提交一个协程
+
+最常用形式——启动调度器，提交 Fiber，等它结束：
+
 ```cpp
 #include "go2cpp/runtime.hpp"
 
 int main() {
-    go2cpp::Scheduler scheduler(2);
+    go2cpp::Scheduler scheduler(4);   // 4 个 P（worker 线程）
     scheduler.start();
 
     auto task = go2cpp::go(scheduler, [] {
-        // Fiber 内：read()/Sleep() 看起来同步，实际自动 park，让出 worker
+        // 这是一条 Fiber：内部 Sleep / read / Channel 会自动 park，不阻塞 worker
     });
-    task->wait();
+    task->wait();                     // 阻塞当前线程，直到 Fiber 结束
 
+    if (auto err = task->failure()) { // Fiber 边界捕获的异常（可选）
+        std::fprintf(stderr, "task failed: %s\n", err->Error().c_str());
+    }
     scheduler.shutdown();
 }
 ```
 
-不想管理 Scheduler 时使用进程级默认调度器：
+不想管理调度器时，用进程级默认调度器：
 
 ```cpp
 auto task = go2cpp::go([] { /* Fiber 工作 */ });
 task->wait();
-go2cpp::shutdown_default_scheduler();
+go2cpp::shutdown_default_scheduler();   // 程序结束前必须显式关闭
 ```
 
-完整入门：[`docs/getting_started.md`](docs/getting_started.md)；示例见 `example/`。
+Fiber 之间用 Channel / Context 协作：
 
----
+```cpp
+auto ch = go2cpp::make_channel<int>(8);           // 有缓冲 Channel
+go2cpp::go([ch] { ch->Send(42); });               // 发送
+int v = 0;
+ch->Recv(&v);                                     // 当前 Fiber 或主线程接收
+
+auto ctx = go2cpp::context::WithCancel(go2cpp::Context::Background());
+go2cpp::go([ctx] {
+    if (auto err = go2cpp::Sleep(std::chrono::seconds(10), ctx); err) {
+        // ctx 取消后 Sleep 立即返回
+    }
+});
+ctx->Cancel();
+```
+
+要点：
+
+| 概念 | 说明 |
+|---|---|
+| `go(scheduler, fn)` | 提交一个 Fiber，返回 `Task`；`Task::wait()` 等待、`failure()` 取异常 |
+| `fiber` | 轻量描述器，`fiber::bind()` 可把已有任务挂到调度器 |
+| 自动 park | Fiber 内的 `Sleep`/`read`/`write`/Channel 操作会让出 worker，不阻塞线程 |
+| 线程 vs Fiber | 普通线程可直接用 Channel/Context；`BlockingRegion` 把「真阻塞」显式标出 |
+| 禁止 | 持锁时 park（Go 不存在的死锁形态，本项目会检测并报错） |
+
+完整示例：`example/concurrency/beginner_demo.cpp`、`runtime_demo.cpp`；规则见
+[`docs/fiber_guide.md`](docs/fiber_guide.md)。
+
+### 3.2 UDP 协议注入（`rd::net`，约 20 行 echo）
+
+上层自定义 UDP 协议（RDT/UDP、游戏封包、IM 帧）只需要实现 `Protocol`，
+**不改 Go2Cpp 一行代码**：
+
+```cpp
+#include "go2cpp/rd_net/event_loop.hpp"
+#include "go2cpp/rd_net/protocol.hpp"
+
+// 自定义协议：收到什么就回什么（真实协议在这里解析 24 字节头/ACK/重传）
+class Echo : public rd::net::Protocol {
+public:
+    void OnDatagram(rd::net::ProtocolContext& ctx, rd::net::ByteView data,
+                    const rd::net::Endpoint& from) override {
+        ctx.SendTo(data, from);   // ByteView 借用：不拷贝，本 tick 内真正 send
+    }
+    void OnSendComplete(rd::net::ProtocolContext&, std::uint64_t token,
+                        rd::net::SendResult result) override {
+        // 一个数据报真正发完（成功/失败）：token 与 SendTo 返回值一致
+    }
+};
+
+int main() {
+    auto loop = rd::net::EventLoop::Create();                 // 单线程事件循环
+    auto sock = rd::net::DatagramSocket::Open({"0.0.0.0", 9000}, {});
+    if (!loop || !sock) return 1;
+
+    Echo echo;
+    rd::net::AttachProtocol(**loop, *sock, echo);             // 注入点：不动库代码
+    (*loop)->Run();                                           // 阻塞，直到 Stop()
+}
+```
+
+关键语义：
+
+| 项 | 行为 |
+|---|---|
+| `ByteView` | **借用视图**，回调返回后失效；`SendTo` 只入队、不拷贝（memset 反证通过） |
+| `SendTo` | 一律入队并返回 `token`；真正 send 在同一 tick 内完成，`OnSendComplete` 回调 |
+| `ScheduleAfter` | 毫秒定时器（RTO/心跳），到期回调 `OnTimer` |
+| 单 tick 包数 | 每 socket ≤ 64 包，防止饿死其它 socket |
+| 边界 | Go2Cpp **不认 magic、不校验字段、不分帧、不重排、不决定重传**——全由上层协议实现 |
+| 线程 | 所有回调在 `Run()` 所在线程，上层不用加锁 |
+
+编译（`rd_net` 是源码模块，直接编进你的程序）：
+
+```sh
+g++ -std=c++17 -O2 -Iinclude \
+    src/rd_net/socket.cpp src/rd_net/event_loop.cpp src/rd_net/protocol.cpp \
+    your_server.cc \
+    -L.build-bento-wsl -Wl,-rpath,$PWD/.build-bento-wsl \
+    -lgo2cpp_network -lgo2cpp_io -lgo2cpp_context -lgo2cpp_error -lpthread
+```
+
+完整可编译示例：`collab/examples/{frame_codec,relay_pipe,hub,lease}/`；
+协议注入验收记录见 [`docs/reports/rdnet-v3-review.md`](docs/reports/rdnet-v3-review.md)。
+
+### 3.3 最小 HTTP 服务
+
+```cpp
+#include "go2cpp/bento/net/http_server.hpp"
+
+int main() {
+    auto server = go2cpp::bento::net::HttpServer::Create(8080);
+    server->Route(go2cpp::http::Method::kGet, "/hello",
+                  [](const go2cpp::http::Request&) {
+                      return go2cpp::http::Response::Text("hello");
+                  });
+    server->Start();
+}
+```
+
+应用层脚手架（流表/连接/资源/KV）见 `example/app/`；
+通用网关（注册式路由 + 中间件 + 可插拔上游）见 `include/go2cpp/app/gateway.hpp`。
 
 ## 四、构建与测试
 
