@@ -10,7 +10,13 @@
  *
  *          交互模型（对齐抖音的「一屏一条 + 右侧操作栏」）：
  *          - `#feed` 是 `scroll-snap-type: y mandatory` 的全屏滚动容器，
- *            每个 `.slide` 高 `100vh`、`scroll-snap-align: start`；
+ *            每个 `.slide` 宽 100%、高 `100dvh`（`100vh` 兜底）、
+ *            `scroll-snap-align: start`；
+ *          - 视频 `position:absolute; inset:0; width/height:100%` 铺满整屏，
+ *            默认 `object-fit:contain`（完整显示留黑边），底部按钮可切
+ *            `cover`（铺满裁切），选择写入 localStorage；
+ *          - 底部信息与右侧操作栏均绝对定位叠加在视频上，`z-index` 更高，
+ *            由半透明渐变遮罩保证可读性；
  *          - `IntersectionObserver`（阈值 0.6）只播放当前屏视频、暂停其它；
  *          - 评论图标打开右侧抽屉，`GET api/comment/<id>?limit=50` 拉列表，
  *            登录后 `POST api/comment` 发送并插入列表头、同步计数；
@@ -118,22 +124,34 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     -webkit-overflow-scrolling: touch;
   }
   .feed::-webkit-scrollbar { display: none; }
+  /* 每个 slide 就是一屏：尺寸跟随视口（100dvh 处理移动端地址栏伸缩，
+     不支持的浏览器回退到 100vh）。不写死像素高度，窗口缩放由浏览器重排。 */
   .slide {
     position: relative;
+    width: 100%;
     height: 100vh; height: 100dvh;
+    overflow: hidden;
+    background: #000;
     scroll-snap-align: start;
     scroll-snap-stop: always;
-    display: grid; place-items: center;
-    background: #000; overflow: hidden;
   }
+  /* 视频绝对定位铺满 slide：inset:0 + 宽高 100% 让视频随窗口同步缩放。
+     默认 object-fit:contain（完整显示，必要时留黑边）；加 .cover 后为
+     object-fit:cover（铺满容器，超出部分裁切），两种模式由底部按钮切换。 */
   .slide .main-video {
+    position: absolute; inset: 0; z-index: 0;
     width: 100%; height: 100%;
+    display: block;
     object-fit: contain; background: #000;
     cursor: pointer;
   }
+  .slide .main-video.cover { object-fit: cover; }
+  /* 半透明渐变遮罩：底部保证信息区可读，右侧保证操作栏可读；z-index 高于视频 */
   .slide .shade {
     position: absolute; inset: 0; z-index: 2; pointer-events: none;
-    background: linear-gradient(to top, rgba(0, 0, 0, .86) 0%, rgba(0, 0, 0, .18) 34%, rgba(0, 0, 0, 0) 55%);
+    background:
+      linear-gradient(to top, rgba(0, 0, 0, .88) 0%, rgba(0, 0, 0, .22) 34%, rgba(0, 0, 0, 0) 56%),
+      linear-gradient(to left, rgba(0, 0, 0, .42) 0%, rgba(0, 0, 0, 0) 26%);
   }
   .pause-hint {
     position: absolute; inset: 0; z-index: 3; display: grid; place-items: center;
@@ -148,9 +166,10 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     box-shadow: 0 10px 30px rgba(0, 0, 0, .55);
   }
 
-  /* 底部信息 */
+  /* 底部信息：absolute 叠加在视频上，z-index 高于视频与遮罩 */
   .meta {
     position: absolute; left: 18px; right: 96px; bottom: 26px; z-index: 4;
+    padding-bottom: env(safe-area-inset-bottom);
     text-shadow: 0 1px 8px rgba(0, 0, 0, .8);
   }
   .meta .title {
@@ -176,10 +195,27 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   .author-meta { font-size: 12px; color: rgba(255, 255, 255, .58); }
   .stats { margin-top: 7px; display: flex; gap: 16px; font-size: 12.5px; color: rgba(255, 255, 255, .72); }
   .stats b { color: #fff; font-weight: 600; }
+  /* 画幅切换：完整（contain，留黑边）/ 铺满（cover，裁切） */
+  .fit-btn {
+    margin-top: 10px;
+    display: inline-flex; align-items: center;
+    padding: 4px 11px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; line-height: 1.5;
+    color: rgba(255, 255, 255, .86);
+    background: rgba(0, 0, 0, .42);
+    border: 1px solid rgba(255, 255, 255, .26);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    text-shadow: none;
+    transition: background .16s, border-color .16s;
+  }
+  .fit-btn:hover { background: rgba(0, 0, 0, .64); border-color: rgba(255, 255, 255, .46); }
+  .fit-btn[aria-pressed="true"] { border-color: rgba(37, 244, 238, .6); color: #d9fffd; }
 
-  /* 右侧操作栏 */
+  /* 右侧操作栏：absolute 叠加在视频上，z-index 高于视频与遮罩 */
   .rail {
-    position: absolute; right: 12px; bottom: 128px; z-index: 5;
+    position: absolute; right: 12px; bottom: calc(128px + env(safe-area-inset-bottom));
+    z-index: 5;
     display: flex; flex-direction: column; align-items: center; gap: 20px;
   }
   .rail .avatar { width: 46px; height: 46px; font-size: 19px; border: 2px solid #fff; }
@@ -367,7 +403,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     .auth input[type=password] { width: 88px; }
     .meta { left: 14px; right: 86px; bottom: 22px; }
     .meta .title { font-size: 16px; }
-    .rail { right: 8px; bottom: 118px; }
+    .fit-btn { margin-top: 8px; padding: 4px 10px; font-size: 11.5px; }
+    .rail { right: 8px; bottom: calc(118px + env(safe-area-inset-bottom)); }
     .comment-panel { width: 100%; }
     .profile-card { flex-direction: column; text-align: center; }
   }
@@ -437,6 +474,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   var TOKEN_KEY = 'douyin_token';
   var USER_KEY = 'douyin_user';
   var LIKES_KEY = 'douyin_likes';
+  var FIT_KEY = 'douyin_fit';
 
   var state = {
     token: localStorage.getItem(TOKEN_KEY) || '',
@@ -448,7 +486,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     panelVideoId: '',
     panelSlide: null,
     profileUserId: '',
-    modalOpen: false
+    modalOpen: false,
+    fit: 'contain'
   };
   try {
     state.user = JSON.parse(localStorage.getItem(USER_KEY) || 'null');
@@ -457,6 +496,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     state.user = null;
     state.likes = {};
   }
+  /* 画幅持久化：cover=铺满裁切，其余一律按默认 contain（完整显示） */
+  state.fit = localStorage.getItem(FIT_KEY) === 'cover' ? 'cover' : 'contain';
 
   var feedEl = document.getElementById('feed');
   var toastEl = document.getElementById('toast');
@@ -504,6 +545,25 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   function initial(name) {
     var s = String(name || '?').trim();
     return s ? s.charAt(0).toUpperCase() : '?';
+  }
+
+  /* 画幅按钮文案：显示当前模式（完整 / 铺满），点击切换 */
+  function fitLabel() {
+    return '画幅：' + (state.fit === 'cover' ? '铺满' : '完整');
+  }
+
+  /* 切换所有 feed 视频的画幅模式并持久化；新插入的 slide 在 buildSlide 里套用 */
+  function setFit(mode) {
+    state.fit = mode === 'cover' ? 'cover' : 'contain';
+    try { localStorage.setItem(FIT_KEY, state.fit); } catch (e) {}
+    feedEl.querySelectorAll('.main-video').forEach(function (v) {
+      v.classList.toggle('cover', state.fit === 'cover');
+    });
+    feedEl.querySelectorAll('.fit-btn').forEach(function (btn) {
+      btn.textContent = fitLabel();
+      btn.setAttribute('aria-pressed', state.fit === 'cover' ? 'true' : 'false');
+    });
+    toast(state.fit === 'cover' ? '画幅：铺满（可能裁切）' : '画幅：完整（保留黑边）');
   }
 
   /* 相对路径：/douyin/ 前缀下解析为 /douyin/api/...，本机解析为 /api/... */
@@ -880,7 +940,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     slide.setAttribute('data-user-id', String(v.user_id || ''));
 
     var video = document.createElement('video');
-    video.className = 'main-video';
+    video.className = 'main-video' + (state.fit === 'cover' ? ' cover' : '');
     video.src = videoSrc(v);
     video.muted = true;
     video.loop = true;
@@ -928,9 +988,21 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     stats.querySelector('.stat-like').textContent = fmt(v.like_count);
     stats.querySelector('.stat-comment').textContent = fmt(v.comment_count);
 
+    var fitBtn = document.createElement('button');
+    fitBtn.type = 'button';
+    fitBtn.className = 'fit-btn';
+    fitBtn.textContent = fitLabel();
+    fitBtn.title = '切换 铺满/完整 画幅（记住选择）';
+    fitBtn.setAttribute('aria-pressed', state.fit === 'cover' ? 'true' : 'false');
+    fitBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      setFit(state.fit === 'cover' ? 'contain' : 'cover');
+    });
+
     meta.appendChild(title);
     meta.appendChild(authorRow);
     meta.appendChild(stats);
+    meta.appendChild(fitBtn);
 
     var rail = document.createElement('div');
     rail.className = 'rail';
