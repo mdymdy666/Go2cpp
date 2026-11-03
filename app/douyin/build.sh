@@ -58,10 +58,13 @@ EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
 build_one user_service        "$ROOT/src/user_service.cpp"        "$STORE" "$AUTH" "$PROTO"
 build_one video_service       "$ROOT/src/video_service.cpp"       "$STORE" "$AUTH" "$PROTO"
 build_one feed_service        "$ROOT/src/feed_service.cpp"        "$STORE" "$AUTH" "$PROTO"
+EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
+build_one interaction_service "$ROOT/src/interaction_service.cpp" "$STORE" "$AUTH" "$PROTO"
 EXTRA_LDLIBS=()
-build_one interaction_service "$ROOT/src/interaction_service.cpp" "$PROTO"
 build_one live_service        "$ROOT/src/live_service.cpp"        "$PROTO"
-build_one search_service      "$ROOT/src/search_service.cpp"      "$PROTO"
+EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
+build_one search_service      "$ROOT/src/search_service.cpp"      "$STORE" "$PROTO"
+EXTRA_LDLIBS=()
 build_one gateway             "$ROOT/src/gateway.cpp"             "$PROTO"
 
 echo "[build] 完成：$ROOT/build/{gateway,user_service,video_service,feed_service,interaction_service,live_service,search_service}"

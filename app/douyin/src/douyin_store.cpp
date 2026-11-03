@@ -78,6 +78,18 @@ bool DecodeVideoCursor(const std::string& cursor, std::int64_t* created_at,
     return true;
 }
 
+std::string EncodeCommentCursor(const StoredComment& comment) {
+    if (comment.id <= 0) {
+        return std::string();
+    }
+    return std::to_string(comment.created_at) + "-" + std::to_string(comment.id);
+}
+
+bool DecodeCommentCursor(const std::string& cursor, std::int64_t* created_at,
+                         std::int64_t* id) {
+    return DecodeVideoCursor(cursor, created_at, id);
+}
+
 namespace {
 
 /// @brief 建表 + 索引脚本（幂等）。
@@ -108,7 +120,22 @@ constexpr const char* kSchemaSql =
     "  created_at INTEGER NOT NULL"
     ");"
     "CREATE INDEX IF NOT EXISTS idx_videos_user ON videos(user_id, created_at DESC);"
-    "CREATE INDEX IF NOT EXISTS idx_videos_created ON videos(created_at DESC);";
+    "CREATE INDEX IF NOT EXISTS idx_videos_created ON videos(created_at DESC);"
+    "CREATE TABLE IF NOT EXISTS likes ("
+    "  video_id INTEGER NOT NULL,"
+    "  user_id INTEGER NOT NULL,"
+    "  created_at INTEGER NOT NULL,"
+    "  PRIMARY KEY (video_id, user_id)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS comments ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  video_id INTEGER NOT NULL,"
+    "  user_id INTEGER NOT NULL,"
+    "  content TEXT NOT NULL,"
+    "  created_at INTEGER NOT NULL"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_comments_video "
+    "ON comments(video_id, created_at DESC);";
 
 /// @brief 把 `Error` 写成可读文本。
 std::string DescribeError(const go2cpp::storage::Error& error) {
@@ -143,6 +170,34 @@ void ReadVideoRow(go2cpp::storage::Rows* rows, StoredVideo* out) {
     out->like_count = rows->Int64(4);
     out->comment_count = rows->Int64(5);
     out->created_at = rows->Int64(6);
+}
+
+/// @brief comments 查询的固定列顺序（与 `ReadCommentRow` 的下标对应）。
+constexpr const char* kCommentColumns = "id, video_id, user_id, content, created_at";
+
+/// @brief 读当前行（列顺序必须为 `kCommentColumns`）。
+void ReadCommentRow(go2cpp::storage::Rows* rows, StoredComment* out) {
+    out->id = rows->Int64(0);
+    out->video_id = rows->Int64(1);
+    out->user_id = rows->Int64(2);
+    out->content = rows->Text(3);
+    out->created_at = rows->Int64(4);
+}
+
+/**
+ * @brief 把搜索词包成 LIKE 模式 `%q%`，转义 `%` `_` `\`。
+ * @note SQL 侧用 `ESCAPE '\'` 声明转义符。
+ */
+std::string LikePattern(const std::string& query) {
+    std::string escaped;
+    escaped.reserve(query.size() + 2);
+    for (const char c : query) {
+        if (c == '\\' || c == '%' || c == '_') {
+            escaped += '\\';
+        }
+        escaped += c;
+    }
+    return "%" + escaped + "%";
 }
 
 /// @brief 执行查询并把全部视频按已排好的顺序装进 `all`。
@@ -661,6 +716,309 @@ bool Store::ListFollowingFeed(std::int64_t user_id, const std::string& cursor,
         return false;
     }
     PageVideos(all, cursor, limit, out, next_cursor);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// C5 互动：likes / comments / 计数同步
+// ---------------------------------------------------------------------------
+
+int Store::Like(std::int64_t video_id, std::int64_t user_id, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    auto inserted = m_db->Exec(
+        "INSERT OR IGNORE INTO likes(video_id, user_id, created_at) VALUES(?, ?, ?)",
+        video_id, user_id, static_cast<std::int64_t>(std::time(nullptr)));
+    if (!inserted) {
+        if (error != nullptr) {
+            *error = "点赞失败: " + DescribeError(inserted.Err());
+        }
+        return -1;
+    }
+    return inserted.Value().changes > 0 ? 1 : 0;
+}
+
+bool Store::Unlike(std::int64_t video_id, std::int64_t user_id,
+                   std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto deleted = m_db->Exec(
+        "DELETE FROM likes WHERE video_id = ? AND user_id = ?", video_id, user_id);
+    if (!deleted) {
+        if (error != nullptr) {
+            *error = "取消赞失败: " + DescribeError(deleted.Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+std::int64_t Store::LikeCount(std::int64_t video_id, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    auto rows = m_db->Query("SELECT COUNT(*) FROM likes WHERE video_id = ?",
+                            video_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "统计点赞失败: " + DescribeError(rows.Err());
+        }
+        return -1;
+    }
+    if (!rows.Value().Next()) {
+        if (error != nullptr) {
+            *error = "统计点赞失败: 空结果";
+        }
+        return -1;
+    }
+    return rows.Value().Int64(0);
+}
+
+bool Store::HasLiked(std::int64_t video_id, std::int64_t user_id,
+                     std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query(
+        "SELECT 1 FROM likes WHERE video_id = ? AND user_id = ?", video_id,
+        user_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询点赞失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    return rows.Value().Next();
+}
+
+std::int64_t Store::AddComment(std::int64_t video_id, std::int64_t user_id,
+                               const std::string& content, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    auto inserted = m_db->Exec(
+        "INSERT INTO comments(video_id, user_id, content, created_at) "
+        "VALUES(?, ?, ?, ?)",
+        video_id, user_id, content,
+        static_cast<std::int64_t>(std::time(nullptr)));
+    if (!inserted) {
+        if (error != nullptr) {
+            *error = "插入评论失败: " + DescribeError(inserted.Err());
+        }
+        return -1;
+    }
+    return inserted.Value().last_insert_row_id;
+}
+
+bool Store::ListComments(std::int64_t video_id, const std::string& cursor,
+                         std::int64_t limit, std::vector<StoredComment>* out,
+                         std::string* next_cursor, std::string* error) {
+    next_cursor->clear();
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    if (limit <= 0) {
+        return true;
+    }
+    const bool has_cursor = !cursor.empty();
+    std::int64_t cursor_created = 0;
+    std::int64_t cursor_id = 0;
+    if (has_cursor &&
+        !DecodeCommentCursor(cursor, &cursor_created, &cursor_id)) {
+        if (error != nullptr) {
+            *error = "cursor 非法";
+        }
+        return false;
+    }
+
+    std::string sql = std::string("SELECT ") + kCommentColumns +
+                      " FROM comments WHERE video_id = ?";
+    if (has_cursor) {
+        sql += " AND (created_at < ? OR (created_at = ? AND id < ?))";
+    }
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?";
+
+    auto rows = has_cursor
+                    ? m_db->Query(sql, video_id, cursor_created, cursor_created,
+                                  cursor_id, limit + 1)
+                    : m_db->Query(sql, video_id, limit + 1);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询评论失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    std::vector<StoredComment> page;
+    while (rows.Value().Next()) {
+        StoredComment comment;
+        ReadCommentRow(&rows.Value(), &comment);
+        page.push_back(std::move(comment));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历评论失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    if (static_cast<std::int64_t>(page.size()) > limit) {
+        page.resize(static_cast<std::size_t>(limit));
+        if (!page.empty()) {
+            *next_cursor = EncodeCommentCursor(page.back());
+        }
+    }
+    for (StoredComment& comment : page) {
+        out->push_back(std::move(comment));
+    }
+    return true;
+}
+
+int Store::DeleteComment(std::int64_t id, std::int64_t user_id,
+                         std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    auto deleted = m_db->Exec("DELETE FROM comments WHERE id = ? AND user_id = ?",
+                              id, user_id);
+    if (!deleted) {
+        if (error != nullptr) {
+            *error = "删除评论失败: " + DescribeError(deleted.Err());
+        }
+        return -1;
+    }
+    return deleted.Value().changes;
+}
+
+bool Store::UpdateVideoCounts(std::int64_t video_id, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    if (auto begin_error = m_db->Begin(); begin_error) {
+        if (error != nullptr) {
+            *error = "计数事务开始失败: " + begin_error.ToString();
+        }
+        return false;
+    }
+    auto updated = m_db->Exec(
+        "UPDATE videos SET"
+        " like_count = (SELECT COUNT(*) FROM likes WHERE video_id = ?),"
+        " comment_count = (SELECT COUNT(*) FROM comments WHERE video_id = ?)"
+        " WHERE id = ?",
+        video_id, video_id, video_id);
+    if (!updated) {
+        (void)m_db->Rollback();
+        if (error != nullptr) {
+            *error = "更新计数失败: " + DescribeError(updated.Err());
+        }
+        return false;
+    }
+    if (auto commit_error = m_db->Commit(); commit_error) {
+        if (error != nullptr) {
+            *error = "计数事务提交失败: " + commit_error.ToString();
+        }
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// C6 搜索
+// ---------------------------------------------------------------------------
+
+bool Store::SearchUsers(const std::string& query, std::int64_t limit,
+                        std::int64_t offset, std::vector<StoredUser>* out,
+                        std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    const std::string pattern = LikePattern(query);
+    auto rows = m_db->Query(
+        "SELECT id, name, created_at FROM users"
+        " WHERE lower(name) LIKE lower(?) ESCAPE '\\'"
+        " ORDER BY id DESC LIMIT ? OFFSET ?",
+        pattern, limit, offset);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "搜索用户失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        StoredUser user;
+        user.id = rows.Value().Int64(0);
+        user.name = rows.Value().Text(1);
+        user.created_at = rows.Value().Int64(2);
+        out->push_back(std::move(user));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历用户失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::SearchVideos(const std::string& query, std::int64_t limit,
+                         std::int64_t offset, std::vector<StoredVideo>* out,
+                         std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    const std::string pattern = LikePattern(query);
+    auto rows = m_db->Query(
+        std::string("SELECT ") + kVideoColumns +
+            " FROM videos WHERE lower(title) LIKE lower(?) ESCAPE '\\'"
+            " ORDER BY id DESC LIMIT ? OFFSET ?",
+        pattern, limit, offset);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "搜索视频失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        StoredVideo video;
+        ReadVideoRow(&rows.Value(), &video);
+        out->push_back(std::move(video));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历视频失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
     return true;
 }
 

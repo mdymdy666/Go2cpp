@@ -69,6 +69,15 @@ struct StoredVideo {
     std::int64_t created_at{0};     ///< Unix 秒。
 };
 
+/// @brief `comments` 表里的一行评论（C5）。
+struct StoredComment {
+    std::int64_t id{0};          ///< 自增主键。
+    std::int64_t video_id{0};    ///< 评论的视频。
+    std::int64_t user_id{0};     ///< 评论者。
+    std::string content;         ///< 正文（1~500 字，由 service 校验）。
+    std::int64_t created_at{0};  ///< Unix 秒。
+};
+
 /**
  * @brief 编码视频分页游标：`"<created_at>-<id>"`（十进制，两个非负整数）。
  * @param video 游标指向的视频（通常是本页最后一条）。
@@ -85,6 +94,17 @@ std::string EncodeVideoCursor(const StoredVideo& video);
  */
 bool DecodeVideoCursor(const std::string& cursor, std::int64_t* created_at,
                        std::int64_t* id);
+
+/**
+ * @brief 编码评论分页游标：`"<created_at>-<id>"`，语义与视频游标一致。
+ * @param comment 游标指向的评论（通常是本页最后一条）。
+ * @return 形如 `1762260000-42` 的串；`id<=0` 时返回空串。
+ */
+std::string EncodeCommentCursor(const StoredComment& comment);
+
+/// @brief 解码评论分页游标；规则同 `DecodeVideoCursor`。
+bool DecodeCommentCursor(const std::string& cursor, std::int64_t* created_at,
+                         std::int64_t* id);
 
 /// @brief SQLite 连接 + 建表 + users/follows 访问器。
 /// @note 同一个 `Store` 由 HTTP 事件循环单线程调用；`DB`/`Session` 自身另有锁。
@@ -230,6 +250,66 @@ class Store {
     bool ListFollowingFeed(std::int64_t user_id, const std::string& cursor,
                            std::int64_t limit, std::vector<StoredVideo>* out,
                            std::string* next_cursor, std::string* error);
+
+    // ---- C5 互动：likes / comments / 计数同步（只加不改既有） ----
+
+    /**
+     * @brief 点赞（幂等：`INSERT OR IGNORE`，主键 `(video_id,user_id)`）。
+     * @return 1=本次新插入；0=已点过（计数不变）；-1=数据库错误。
+     */
+    int Like(std::int64_t video_id, std::int64_t user_id, std::string* error);
+
+    /// @brief 取消赞（幂等：未点过也不报错）；成功返回 true。
+    bool Unlike(std::int64_t video_id, std::int64_t user_id, std::string* error);
+
+    /// @brief 点赞数；出错返回 -1。
+    std::int64_t LikeCount(std::int64_t video_id, std::string* error);
+
+    /// @brief 是否已点赞；数据库错误时返回 false（error 非空）。
+    bool HasLiked(std::int64_t video_id, std::int64_t user_id, std::string* error);
+
+    /**
+     * @brief 发评论。
+     * @return 新评论 id；失败返回 -1。
+     */
+    std::int64_t AddComment(std::int64_t video_id, std::int64_t user_id,
+                            const std::string& content, std::string* error);
+
+    /**
+     * @brief 某视频的评论，`created_at` 倒序（同秒按 id 倒序）keyset 分页。
+     * @param cursor 空串表示第一页；否则为本页最后一条的游标。
+     * @param out 追加到末尾。
+     * @param next_cursor 还有下一页时写游标，否则空串。
+     */
+    bool ListComments(std::int64_t video_id, const std::string& cursor,
+                      std::int64_t limit, std::vector<StoredComment>* out,
+                      std::string* next_cursor, std::string* error);
+
+    /// @brief 删除评论（仅作者）；返回受影响行数，出错 -1。
+    int DeleteComment(std::int64_t id, std::int64_t user_id, std::string* error);
+
+    /**
+     * @brief 按 likes/comments 实表重算 `videos.like_count/comment_count`。
+     * @note 单事务内完成，供点赞/评论/取消赞后调用。
+     */
+    bool UpdateVideoCounts(std::int64_t video_id, std::string* error);
+
+    // ---- C6 搜索：name/title 包含匹配（大小写不敏感） ----
+
+    /**
+     * @brief 搜索用户：`lower(name) LIKE lower('%q%')`，按 id 倒序。
+     * @param limit 最多返回条数。
+     * @param offset 跳过条数（游标分页）。
+     * @param out 追加到末尾；password_hash/salt 留空。
+     */
+    bool SearchUsers(const std::string& query, std::int64_t limit,
+                     std::int64_t offset, std::vector<StoredUser>* out,
+                     std::string* error);
+
+    /// @brief 搜索视频：`lower(title) LIKE lower('%q%')`，按 id 倒序。
+    bool SearchVideos(const std::string& query, std::int64_t limit,
+                      std::int64_t offset, std::vector<StoredVideo>* out,
+                      std::string* error);
 
    private:
     std::unique_ptr<go2cpp::storage::DB> m_db;
