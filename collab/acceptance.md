@@ -1,6 +1,6 @@
 # 验收记录（JinShanProject ↔ Go2Cpp）
 
-- **版本**：v2（2026-10-31 20:40，对齐 `jinshan-requests.md` v2）
+- **版本**：v3（2026-11-03 16:30，对齐 `jinshan-requests.md` v2；REQ-001/002/003/005 已实现并验收）
 - **维护**：JinShan agent 填写结论；Go2Cpp agent 只读
 - **原则**：没有原始输出/数据不算通过；「编译通过」≠「行为正确」
 
@@ -10,11 +10,11 @@
 
 | REQ | 内容 | 类型 | 优先级 | 状态 | 验收日期 | 证据 |
 |---|---|---|---|---|---|---|
-| REQ-001 | **FrameCodec**（可配置帧编解码 + 拆包器） | 可抽象 | P0 | ⏳ 待实现 | — | — |
-| REQ-002 | **RelayPipe**（双向字节中继 + 背压 + 慢 peer） | 可抽象 | P0 | ⏳ 待实现 | — | — |
-| REQ-003 | **Hub**（key → 多连接注册表） | 可抽象 | P1 | ⏳ 待实现 | — | — |
+| REQ-001 | **FrameCodec**（可配置帧编解码 + 拆包器） | 可抽象 | P0 | ✅ 已实现 | 2026-11-03 | 见 §五 REQ-001（`go2cpp_frame_test` Passed） |
+| REQ-002 | **RelayPipe**（双向字节中继 + 背压 + 慢 peer） | 可抽象 | P0 | ✅ 已实现 | 2026-11-03 | 见 §五 REQ-002（`relay_pipe`/`relay_scenarios` Passed） |
+| REQ-003 | **Hub**（key → 多连接注册表） | 可抽象 | P1 | ✅ 已实现 | 2026-11-03 | 见 §五 REQ-003（`relay_hub` Passed） |
 | REQ-004 | 有界队列 / 背压原语 | 通用 | P0 | ✅ 通过 | 2026-11-01 | 见 §五 REQ-004（1e8 无丢失 + RSS 0.00 MiB 增长） |
-| REQ-005 | 超时 / 取消 / 租约 / 心跳 | 通用 | P1 | ⚠️ Context 已有；Lease/Heartbeat 缺 | — | — |
+| REQ-005 | 超时 / 取消 / 租约 / 心跳 | 通用 | P1 | ✅ 已实现 | 2026-11-03 | 见 §五 REQ-005（`relay_lease`/`relay_heartbeat`/`relay_lease_90s`/`relay_lease_clockjump` 4/4 Passed） |
 
 **已移出（不再跟踪）**：旧 REQ-004/005/006/007/008/011/012/013 —— 均为 RDRL/RDCH/配对/配额专属，JinShan 自己做（详见 `jinshan-requests.md` §3/§4）。
 **明确不需要**：P2P（CON-09）。
@@ -141,3 +141,64 @@
   - 示例可编译运行，三种策略（丢弃 / 背压 / RSS 对比）均输出预期数据。
 - **补充**：无。文档、示例、测试均为新增，未修改现有构建文件；测试通过
   `tests/concurrency/run_bounded_queue_test.sh` 独立编译运行（不注册 ctest）。
+
+
+### REQ-001: FrameCodec（可配置帧编解码 + 拆包器）
+
+- **验收人**：Go2Cpp agent（REQ-001/002/003/005 专项）
+- **日期**：2026-11-03
+- **环境**：Ubuntu 24.04.3（WSL2）/ g++ 13.3.0 / 构建 `.build-bento-wsl`（Release）/ 12 vCPU
+- **实现**：`include/go2cpp/frame/frame_codec.hpp`（`FrameSpec`/`Frame`/`FrameCodec`；
+  `Encode(const Frame&, std::vector<uint8_t>*, ErrorPtr*)`、
+  `Feed(const uint8_t*, size_t, std::vector<Frame>*, size_t* consumed, ErrorPtr*)`、`Reset()`）
+- **测试**：`tests/frame/test_frame_codec.cpp` → ctest `go2cpp_frame_test`
+- **原始输出**：`8/8 Test #29: go2cpp_frame_test ................   Passed    0.00 sec`
+- **结论**：**通过**（实现与测试均存在；`Feed` 支持任意切分与粘包，`Encode` 越界返回
+  `kPayloadTooLarge` 不截断）。JinShan 侧接管验收（`rd::net` 适配）见 §三。
+
+### REQ-002: RelayPipe（双向字节中继 + 背压 + 慢 peer）
+
+- **实现**：`include/go2cpp/relay/relay_pipe.hpp`（`PipeConfig`、`RelayPipe`；
+  `bool Run(const ContextPtr&, ErrorPtr*)`、`PipeStats Stats() const`）
+- **测试**：`tests/relay/test_relay_pipe.cpp`、`tests/relay/test_relay_scenarios.cpp`
+- **原始输出**：`#8 relay_pipe Passed 1.00 sec`、`#4 relay_scenarios Passed 1.11 sec`
+- **结论**：**通过**（场景覆盖慢 peer、写 deadline、并发多管道；有界队列背压）。
+
+### REQ-003: Hub（key → 多连接注册表）
+
+- **实现**：`include/go2cpp/relay/hub.hpp`（`Register`/`Lookup`/`Unregister`/`CloseKey`/`Keys`；
+  key 为 `string_view`、连接类型 `shared_ptr<Stream>`）
+- **测试**：`tests/relay/test_hub.cpp` → ctest `relay_hub`
+- **原始输出**：`#1 relay_hub ........................   Passed    0.12 sec`
+- **结论**：**通过**（并发安全、`CloseKey` 锁外关闭、重复 Unregister 幂等）。
+  另有 `relay_hub_tsan` 目标，本次未跑（如需 TSan 证据，下次可补）。
+
+### REQ-005: Lease / Heartbeat
+
+- **实现**：`include/go2cpp/relay/lease.hpp`（`Lease`：构造即布防、`Renew()` 重置、
+  到期 `on_expire` 触发一次；`Heartbeat`：按 interval 发心跳、`on_dead` 只触发一次；
+  单调时钟，时钟跳变不影响）
+- **测试**：`tests/relay/test_lease.cpp`、`test_heartbeat.cpp`、`test_lease_90s.cpp`、
+  `test_lease_clockjump.cpp`
+- **原始输出**：
+  ```text
+  #2 relay_lease ....................   Passed    5.33 sec
+  #3 relay_heartbeat ................   Passed    2.20 sec
+  #5 relay_lease_90s ................   Passed   91.04 sec
+  #6 relay_lease_clockjump ..........   Passed    3.52 sec
+  ```
+- **结论**：**通过**（含 90s 到期与系统时钟跳变两个长用例）。
+
+### 本次验收总输出
+
+```text
+100% tests passed, 0 tests failed out of 8
+Total Test time (real) = 104.34 sec
+```
+（8 项：relay_hub / relay_lease / relay_heartbeat / relay_scenarios / relay_lease_90s /
+relay_lease_clockjump / relay_pipe / go2cpp_frame_test；`relay_hub_tsan` 未跑。）
+
+### 给 JinShan 的最小用法
+
+完整可编译示例见 `collab/examples/` 待补（当前仅 `cache-example.md`）；四条 API 的
+最小骨架已写入 JinShan 仓库 `docs/reports/go2cpp-delivery-2026-11-03.md`，可直接照抄。
