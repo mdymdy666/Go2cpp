@@ -10,7 +10,8 @@
  *            douyin_auth::VerifyToken 校验 Bearer token，失败回 401；
  *          - 读方法（GET/HEAD）为公开读（详情、feed、评论列表、房间列表、
  *            搜索），不要求网关鉴权；
- *          - /health、/api/health/all 由组件内建，无需注册。
+ *          - /health、/api/health/all 由组件内建，无需注册；
+ *          - GET /videos/<name> 由本地 handler 直接返回 web/videos 下的 mp4。
  *
  * @note 路由按「业务前缀」组织；读/写语义不同的前缀按方法掩码拆成两条
  *       RouteSpec（同一上游），避免把公开读误挡在 401 之后。
@@ -21,6 +22,7 @@
  */
 
 #include "douyin_auth.hpp"
+#include "douyin_home_page.hpp"
 #include "go2cpp/app/gateway.hpp"
 
 #include <atomic>
@@ -29,6 +31,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -66,6 +69,14 @@ constexpr std::uint16_t kLivePort = 29105;
 constexpr std::uint16_t kSearchPort = 29106;
 /// @brief 服务名（日志用）。
 constexpr const char* kServiceName = "gateway";
+/// @brief 静态资源根目录：build.sh 用 -DDOUYIN_WEB_DIR 注入绝对路径，
+///        未定义时退回相对工作目录的 `web`（仅本地手工运行时的兜底）。
+#ifndef DOUYIN_WEB_DIR
+#define DOUYIN_WEB_DIR "web"
+#endif
+constexpr const char* kWebDir = DOUYIN_WEB_DIR;
+/// @brief 单个静态视频的大小上限（64 MiB），防止误放超大文件撑爆内存。
+constexpr std::uint64_t kMaxVideoBytes = 64ULL * 1024 * 1024;
 /// @brief 读方法掩码：GET / HEAD。
 constexpr MethodMask kReadMask = method_mask::kGet | method_mask::kHead;
 /// @brief 写方法掩码：POST / DELETE / PATCH（需要 Bearer 鉴权）。
@@ -110,70 +121,6 @@ bool VerifyBearer(const Request& request, std::string* user_id, std::string* err
     return true;
 }
 
-/// @brief 根路径页面（本地渲染，不转发任何上游服务）。
-constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Go2Cpp 抖音 Demo</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { margin: 0; padding: 40px 20px; background: #0f1115; color: #e6e8ee;
-         font: 15px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
-  main { max-width: 880px; margin: 0 auto; }
-  h1 { font-size: 27px; margin: 0 0 6px; }
-  h2 { font-size: 17px; margin: 30px 0 10px; color: #c7cedd; }
-  .sub { color: #8b93a7; margin: 0; }
-  table { width: 100%; border-collapse: collapse; background: #161a22;
-          border: 1px solid #242a36; border-radius: 10px; overflow: hidden; }
-  th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid #242a36; }
-  th { color: #8b93a7; font-size: 13px; font-weight: 600; }
-  tr:last-child td { border-bottom: 0; }
-  code { background: #1d232e; border: 1px solid #2b3240; border-radius: 5px;
-         padding: 1px 6px; font: 13px/1.5 "JetBrains Mono", Consolas, monospace; color: #9fd2ff; }
-  pre { background: #161a22; border: 1px solid #242a36; border-radius: 10px;
-        padding: 14px 16px; overflow-x: auto; }
-  pre code { background: none; border: 0; padding: 0; color: #d6e2f5; }
-  a { color: #6cb6ff; }
-  .ok { color: #67d68b; }
-</style>
-</head>
-<body>
-<main>
-  <h1>Go2Cpp 抖音 Demo</h1>
-  <p class="sub">网关根路径 · 本地页面（不转发上游）· 监听端口 <code>28080</code></p>
-
-  <h2>服务状态</h2>
-  <table>
-    <tr><th>服务</th><th>端口</th><th>状态</th><th>职责</th></tr>
-    <tr><td>user</td><td><code>29101</code></td><td class="ok">已注册</td><td>注册 / 登录 / 资料 / 关注</td></tr>
-    <tr><td>video</td><td><code>29102</code></td><td class="ok">已注册</td><td>视频发布 / 详情 / 删除</td></tr>
-    <tr><td>feed</td><td><code>29103</code></td><td class="ok">已注册</td><td>推荐流 / 关注流</td></tr>
-    <tr><td>interaction</td><td><code>29104</code></td><td class="ok">已注册</td><td>点赞 / 评论</td></tr>
-    <tr><td>live</td><td><code>29105</code></td><td class="ok">已注册</td><td>直播间创建 / 列表</td></tr>
-    <tr><td>search</td><td><code>29106</code></td><td class="ok">已注册</td><td>视频搜索</td></tr>
-  </table>
-
-  <h2>可用接口</h2>
-  <table>
-    <tr><th>方法</th><th>路径</th><th>说明</th></tr>
-    <tr><td>GET</td><td><code>/api/feed?limit=3</code></td><td>推荐流（公开读）</td></tr>
-    <tr><td>GET</td><td><code>/api/video/1</code></td><td>视频详情（公开读）</td></tr>
-    <tr><td>GET</td><td><code>/api/health/all</code></td><td>六个上游的聚合健康</td></tr>
-    <tr><td>POST</td><td><code>/api/user/register</code></td><td>注册（JSON：name / email / password）</td></tr>
-  </table>
-
-  <h2>试一下</h2>
-  <p><a href="api/feed?limit=3">打开 /api/feed?limit=3</a>（相对路径：本机 / 与公网 /douyin/ 前缀下都可直接点开）</p>
-  <pre><code>curl -s -X POST http://82.157.147.127:8443/douyin/api/user/register \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"alice","email":"alice@example.com","password":"s3cret"}'</code></pre>
-  <p class="sub">/api/** 请求由网关转发到对应上游；写操作需 <code>Authorization: Bearer &lt;token&gt;</code>。</p>
-</main>
-</body>
-</html>)HTML";
 
 /**
  * @brief 首页匹配器：只接管 GET / HEAD 的 `/` 与 `/index.html`。
@@ -211,7 +158,7 @@ Result<void> ServeHome(Request& /*request*/, Response& response) {
     response.status = Status::OK;
     response.header.set("Content-Type", "text/html; charset=utf-8");
     response.header.set("Cache-Control", "no-store");
-    response.body = kHomePageHtml;
+    response.body = douyin::kHomePageHtml;
     return Result<void>::Ok();
 }
 
@@ -221,6 +168,200 @@ bool AddHomeRoute(Gateway* gateway) {
         std::make_shared<HomeMatcher>(), std::make_shared<Handler>(&ServeHome));
     if (!result.ok()) {
         std::fprintf(stderr, "[%s] 注册首页路由失败：%s\n", kServiceName,
+                     result.error().c_str());
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// 静态视频：GET/HEAD /videos/<name> → <web>/videos/<name>
+// 与 HomeMatcher 相同，用自定义 Matcher 注册，避免被 /api/** 通配路由吞掉。
+// ---------------------------------------------------------------------------
+
+/// @brief 静态视频的 URL 前缀（tail 只允许单段文件名）。
+constexpr std::string_view kVideoUrlPrefix = "/videos/";
+
+/**
+ * @brief 判断视频文件名是否只由安全字符组成（防目录穿越）。
+ *
+ * @param name [in] 去掉前缀后的路径尾段——借用，调用期间有效；不可为 nullptr 语义（值传递）。
+ *        取值：非空、长度 ≤ 128 的字节序列；含 `/`、`\`、`%`、空白一律非法。
+ * @return
+ * - true：文件名安全，调用方**必须**再与固定目录拼接后打开；
+ * - false：非法输入，调用方**不要**打开文件，应按 404 处理。
+ *
+ * ## 定位
+ * 唯一的路径注入防线：一旦放过 `..` 或分隔符，`/videos/../../etc/passwd`
+ * 会读到任意文件；因此这里做白名单而不是黑名单。
+ *
+ * ## 步骤
+ * step1. 拒绝空名、超长名与 `.` / `..` 两个特殊段；
+ * step2. 逐字节白名单 `[A-Za-z0-9_.-]`，任何分隔符/编码符直接判否。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：无状态纯函数，可在任意 worker 线程并发调用；
+ * - 不变量：返回 true 时字符串中不含路径分隔符，拼接到固定目录不会逃逸。
+ */
+bool IsSafeVideoName(std::string_view name) {
+    // step1: 空名/超长/特殊段直接拒绝（`..` 完全由白名单字符组成，必须单独挡）。
+    if (name.empty() || name.size() > 128) {
+        return false;
+    }
+    if (name == "." || name == "..") {
+        return false;
+    }
+    // step2: 白名单校验，排除 `/`、`\`、`%` 等可构造穿越或二次解码的字符。
+    for (const char ch : name) {
+        const bool ascii_lower = ch >= 'a' && ch <= 'z';
+        const bool ascii_upper = ch >= 'A' && ch <= 'Z';
+        const bool ascii_digit = ch >= '0' && ch <= '9';
+        if (!ascii_lower && !ascii_upper && !ascii_digit && ch != '_' && ch != '-' &&
+            ch != '.') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief 从请求路径中提取 `/videos/<name>` 的文件名。
+ *
+ * @param path [in] 请求路径（不含 query）——借用，调用期间有效。
+ * @param name [out] 成功时写入文件名视图；失败时保持原值，生命周期依附于 path。
+ * @return
+ * - true：调用方**可以**用该名字拼路径并打开文件；
+ * - false：请求不是静态视频，调用方**不要**读写文件，交给后续路由或回 404。
+ *
+ * ## 定位
+ * Matcher 与 Handler 共用同一个解析入口，保证「是否命中」与「读哪个文件」
+ * 永远一致；两边各写一份解析迟早会出现匹配了却读错文件。
+ *
+ * ## 步骤
+ * step1. 前缀必须严格等于 `/videos/`（大小写敏感，避免大小写绕过）；
+ * step2. 尾段必须非空且通过白名单校验。
+ *
+ * ## 并发/失败语义
+ * - 纯函数、无状态；返回 true 时 `*name` 只指向 path 的内部区间。
+ */
+bool ExtractVideoName(std::string_view path, std::string_view* name) {
+    // step1: 前缀判断放在 size 检查之后，避免 substr 越界。
+    if (path.size() <= kVideoUrlPrefix.size()) {
+        return false;
+    }
+    if (path.compare(0, kVideoUrlPrefix.size(), kVideoUrlPrefix) != 0) {
+        return false;
+    }
+    // step2: 尾段白名单（内部会拒绝空串与 `..`）。
+    const std::string_view tail = path.substr(kVideoUrlPrefix.size());
+    if (!IsSafeVideoName(tail)) {
+        return false;
+    }
+    *name = tail;
+    return true;
+}
+
+/// @brief 静态视频匹配器：只接管 GET / HEAD 的 `/videos/<安全文件名>`。
+/**
+ * ## 定位
+ * 与 HomeMatcher 一样注册为自定义 Matcher，优先级高于静态/参数/通配路由，
+ * 确保 `/videos/*` 不会被 `/api/**` 通配吞掉而误转发到上游。
+ *
+ * ## 并发/失败语义
+ * - 无状态，worker 线程并发调用安全；
+ * - 仅当方法为 GET/HEAD 且路径通过 ExtractVideoName 时返回 true。
+ */
+class VideoMatcher final : public Matcher {
+public:
+    /// @brief 命中静态视频路径。
+    /// @param request [in] 入站请求——借用，调用期间有效；读取 method 与 path_view()。
+    /// @param params [out] 不写入（文件名在 handler 内重新解析，避免跨层传递）。
+    /// @return true 表示由 ServeVideo 处理；false 交给后续路由。
+    bool Match(const Request& request, PathParams* /*params*/) const override {
+        if (request.method != Method::Get && request.method != Method::Head) {
+            return false;
+        }
+        std::string_view name;
+        return ExtractVideoName(request.path_view(), &name);
+    }
+};
+
+/**
+ * @brief 静态视频 handler：从磁盘读取 mp4 并整块写入响应体。
+ *
+ * @param request [in] 入站请求——借用；只读 path_view()（HEAD 也走这里）。
+ * @param response [out] 出站响应——成功为 200 + `video/mp4` + 完整字节；
+ *        文件不存在为 404；读取失败为 500。失败时只写状态与短文本。
+ * @return 总是 Ok（错误通过 response.status 表达）；网络错误由网关层处理。
+ *
+ * ## 定位
+ * 唯一的视频字节出口：路径校验（ExtractVideoName）、大小上限与 Content-Length
+ * 都在这里收口；一旦拼路径绕过校验就会变成任意文件读取。
+ *
+ * ## 步骤
+ * step1. 重新解析并校验文件名，非法直接 404（Matcher 已挡一次，这里防御调用方变化）；
+ * step2. 以 ate 模式打开并取文件大小，不存在 → 404，超限/负值 → 500；
+ * step3. 预分配后整块 read，长度不符 → 500；
+ * step4. 填 200、Content-Type、Content-Length、Cache-Control 与 body。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：worker 线程并发；每次请求独立 ifstream，无共享状态；
+ * - 原子性：响应在内存中构造完整后由网关一次性写出；
+ * - 失败语义：不抛异常；失败响应 body 非空、无文件句柄泄漏（RAII）；
+ * - 不变量：返回 200 时 body.size() 与磁盘文件字节数完全一致。
+ */
+Result<void> ServeVideo(Request& request, Response& response) {
+    // step1: 路径再校验；非法输入按「不存在」处理，不泄露目录结构。
+    std::string_view name;
+    if (!ExtractVideoName(request.path_view(), &name)) {
+        response.status = Status::NotFound;
+        response.header.set("Content-Type", "text/plain; charset=utf-8");
+        response.body = "404 video not found\n";
+        return Result<void>::Ok();
+    }
+    // step2: ate 模式把读指针放到末尾，tellg 即文件大小；失败即不存在/无权限。
+    const std::string path = std::string(kWebDir) + "/videos/" + std::string(name);
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input.is_open()) {
+        response.status = Status::NotFound;
+        response.header.set("Content-Type", "text/plain; charset=utf-8");
+        response.body = "404 video not found\n";
+        return Result<void>::Ok();
+    }
+    const std::streamoff file_size = input.tellg();
+    if (file_size < 0 || static_cast<std::uint64_t>(file_size) > kMaxVideoBytes) {
+        response.status = Status::InternalError;
+        response.header.set("Content-Type", "text/plain; charset=utf-8");
+        response.body = "500 video unreadable\n";
+        return Result<void>::Ok();
+    }
+    // step3: 预分配后一次读完，避免逐字符迭代器的额外拷贝。
+    std::string content(static_cast<std::size_t>(file_size), '\0');
+    input.seekg(0, std::ios::beg);
+    if (file_size > 0) {
+        input.read(content.data(), static_cast<std::streamsize>(file_size));
+        if (input.gcount() != static_cast<std::streamsize>(file_size)) {
+            response.status = Status::InternalError;
+            response.header.set("Content-Type", "text/plain; charset=utf-8");
+            response.body = "500 video unreadable\n";
+            return Result<void>::Ok();
+        }
+    }
+    // step4: 全量返回；HEAD 由网关序列化层去掉 body，但仍带正确的 Content-Length。
+    response.status = Status::OK;
+    response.header.set("Content-Type", "video/mp4");
+    response.header.set("Content-Length", std::to_string(content.size()));
+    response.header.set("Cache-Control", "public, max-age=3600");
+    response.body = std::move(content);
+    return Result<void>::Ok();
+}
+
+/// @brief 注册静态视频路由（自定义 Matcher + 本地 Handler）；失败时打印并返回 false。
+bool AddVideoRoute(Gateway* gateway) {
+    const auto result = gateway->AddRoute(
+        std::make_shared<VideoMatcher>(), std::make_shared<Handler>(&ServeVideo));
+    if (!result.ok()) {
+        std::fprintf(stderr, "[%s] 注册静态视频路由失败：%s\n", kServiceName,
                      result.error().c_str());
         return false;
     }
@@ -285,7 +426,7 @@ int main(int argc, char** argv) {
     }
     auto gateway = std::move(created.value());
 
-    if (!AddHomeRoute(gateway.get())) {
+    if (!AddHomeRoute(gateway.get()) || !AddVideoRoute(gateway.get())) {
         return 1;
     }
 

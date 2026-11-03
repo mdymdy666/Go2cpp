@@ -54,7 +54,7 @@ say "  token: ${T1:0:12}… ${T2:0:12}… ${T3:0:12}…"
 
 publish_one() { # token title
   local token="$1" title="$2"
-  local url="https://picsum.photos/seed/$(date +%s%N)/640/360"
+  local url="videos/$(( (RANDOM % 3) + 1 )).mp4"
   local id
   id=$(publish "$token" "$title" "$url")
   if [[ -n "$id" ]]; then

@@ -57,7 +57,7 @@ pub=0
 for i in $(seq 1 "$VIDEOS"); do
   t="${tokens[$(( (i * 7) % ${#tokens[@]} ))]}"
   title=$(printf '视频 #%04d' "$i")
-  url="https://picsum.photos/seed/v${i}/640/360"
+  url="videos/$(( (i % 3) + 1 )).mp4"
   body=$(post "/video" "$t" "{\"title\":\"$title\",\"url\":\"$url\"}")
   if echo "$body" | grep -q '"ok":true'; then pub=$((pub+1)); fi
   if (( i % 200 == 0 )); then say "  视频进度 $i/$VIDEOS（已发布 $pub）"; fi

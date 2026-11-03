@@ -24,7 +24,8 @@ fi
 mkdir -p "$ROOT/build" "$ROOT/logs" "$ROOT/data"
 
 CXXFLAGS=(-std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter
-          -I"$GO2CPP/include" -I"$ROOT/include")
+          -I"$GO2CPP/include" -I"$ROOT/include"
+          -DDOUYIN_WEB_DIR="\"$ROOT/web\"")
 
 # network 依赖 io/sync/context 等，用 --start-group 消掉静态顺序问题。
 LDFLAGS=(-L"$BUILD_LIB" -Wl,-rpath,"$BUILD_LIB" -Wl,--start-group
