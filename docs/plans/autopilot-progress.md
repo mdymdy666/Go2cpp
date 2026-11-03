@@ -35,15 +35,22 @@
 | B2 | 本机 start-all/stop-all/健康检查 | ✅ 36e980d（固化 scripts/shop/，全停→全起 6 项 200、幂等） |
 | B3 | 外部探针 60s | ✅ 36e980d（probe.sh，5 分钟 5 次全 200） |
 | B4 | 断线恢复 | ✅ 本轮：根因不是崩溃而是 GOAWAY 后僵尸态；改 client 退避重连 + watchdog 兜底；VPS restart 后 25s 自动 200 |
-| C1–C10 | 抖音 P0 | ⏳ |
+| v3-006 | 四态 Socket（绑定 net::Socket + SendBatch） | ✅ b88de85+dbd0f68+6820dd1：406 checks；TCP 批量 20.8×、UDP 1.20× |
+| v3-007 | EventLoop + 毫秒定时器 | ✅ ec088d3：44 checks；1000 定时器 max 1.2 ms、64 包/tick |
+| v3-008 | 协议注入 + memset 零拷贝反证 | ✅ 6820dd1：44 checks；反证合规 + 负向对照抓 bug |
+| v3-009 | 可靠传输骨架 | ✅ 07eb241：64 checks；1e6 次 47–52 ns/op |
+| v3-审查 | 三件套（架构/汇编/正确性+性能） | ✅ d3af2db（docs/reports/rdnet-v3-review.md） |
+| C1 | 抖音骨架 + IDL | ✅ 89ccb58 |
+| C2–C10 | 抖音业务服务/网关/验收/压测 | ⏳ 下一个 |
 
 ## 下一个任务
 
-**JinShan v3 收口（下一个）**：
-1. `df6a7f7c`（REQ-008 协议注入 + memset 反证）与 `e3f7876e`（REQ-006 绑定 `go2cpp::net::Socket` + bufio 批量 + `SocketOptions` 配置注入）交付后，主控复跑全量测试（socket 353 checks、event_loop 44、reliability 64、protocol 新增）；
-2. 更新 `collab/acceptance.md` v3 章节（补 REQ-007/008 与「已绑定现有栈 + bufio 批量可配」说明）与 JinShan 回执 G-004；
-3. **三件套**：架构审查（分层/所有权/零拷贝路径）→ `objdump` 指令/栈帧 → 正确性 + 性能复验（默认 vs batch 配置）；
-4. 之后回 C2（抖音 user 服务）与 M11（gzip 口径对齐）。
+**C2 抖音 user 服务（下一个）**：
+1. 在 `demos/douyin/` 实现 user 服务：注册/登录/资料查询（SQLite 持久化），REST 路径与 `demos/douyin/README.md` 草案一致；
+2. 真实场景 ≥5：注册→登录→重复注册→错误密码→查询资料，全部 curl 可复现；
+3. 压测：`wrk` 或 `ab` 1000 并发 30s，记录 QPS/p99，写入 `demos/douyin/README.md`；
+4. 正确性：重复注册返回 409、错误密码 401、缺字段 400。
+注：JinShan v3 已全部交付并过三件套（`d3af2db`），后续只需按他们回执修补充；M11（gzip 口径对齐）排 C2 之后。
 
 ## 本轮记录
 
@@ -70,3 +77,9 @@
   - 主控复跑：VPS restart → 25s 后 `public_health=200`、client 存活（PID 211474）；
   - 已知缺口：错误 token 时 server 在 AUTH 阶段回 kUnauthorized 后立刻断连（`server.cpp:797-814`），client 未起 mux、ACK 丢失 → 误判为网络错误并退避重试（与修复前一致，属 server 侧既有协议缺口，未动）。
 - 15:42 **M03c 收口**（`109eec90`，超时 45 分钟）：分块 smoke 各 10 次 → **P20 0/10**、其余 10/10；探针证明 P20 非语义破坏（park 最终到 kWaiting、p50<1µs、wake 正常），是 :111 断言在 park 前检查的竞态被放大；组合 **P19+P21+P22** 通过 ctest 5/5、smoke 20/20、1e6 压力；bench baseline 305 → 组合 **293（−3.9%）/ 324 vs 338（−4.1%）**，**<5% 门槛** → 回滚（`scheduler.cpp` 与 bak 逐字节一致，无改动）；borrow 建议①核实「现实现已一致」且 metrics 无法测 displaced。**M03 判「无可验证 >5% 空间」收口。**
+
+- 17:20 **REQ-008 完成**（6820dd1）：memset 反证合规（负向对照 failures=2 能抓 bug）、SendTo 1 万次 0.79 ms、64 包/tick、44 checks。
+- 17:30 **命名空间统一**（425a460b）：`event_loop.hpp` include `protocol.hpp`、删占位类 -43 行、`protocol.hpp` 回 `rd::net`；两测试 44/44 全过。
+- 17:35 **SendBatch**（5e102f7f）：一次 sendmmsg/writev 提交 N 段；TCP **21.2×**（225 vs 4804 ns/seg）、UDP **1.20×**；部分提交 kWouldBlock + K；checks 406。
+- 17:40 主控统一提交 6820dd1（REQ-008+SendBatch+命名空间+event_loop 链接修复），四套 406/44/64/44 全绿；acceptance v3 与 JinShan G-004 已写。
+- 17:45 **三件套完成**（d3af2db）：架构（分层/所有权/零拷贝/批量）、汇编（SendBatch 3107 指令、WriteBatch 311、EventLoop::Run 栈帧 152B）、正确性+性能（TCP 20.8×/UDP 1.20×、单条开批量 0.90× 默认关）。
