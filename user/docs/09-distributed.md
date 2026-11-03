@@ -3,7 +3,7 @@
 > **定位**：三个基础原语——服务发现、分布式锁、选主——共享同一个**租约表**与同一个协调者。
 > 可进程内嵌入，也可经 TCP 暴露给多进程。
 > **源码**：`include/go2cpp/distributed/`、`src/distributed/`　**构建**：`cmake/Go2CppDistributed.cmake`（目标 `go2cpp_distributed`）
-> **测试**：`tests/distributed/`（9 个可执行，ctest 标签 `distributed`，多进程用例另带 `long`）
+> **测试**：`tests/distributed/`（10 个可执行，ctest 标签 `distributed`，多进程用例另带 `long`）
 > **设计全文**：[distributed.md](../../docs/modules/distributed.md)（语义、故障模型、API、性能基线）
 > **汇编证据**：[asm-distributed.md](../../docs/reports/asm-distributed.md)（objdump、callgrind、vs etcd）
 
@@ -304,7 +304,7 @@ ctest --test-dir .build-dist -L distributed --output-on-failure
 `remaining > 0`，同 key token 严格单调；③ leader 必是候选者中租约编号最小者；④ 错误 owner 的
 续约/释放被拒绝且不改变状态。
 
-实测：`ctest -L distributed` **8/8 通过（9.29 s，含多进程 SIGKILL 重选）**；1e6 次压力 3 轮
+实测：`ctest -L distributed` **8/8 通过（9.29 s，含多进程 SIGKILL 重选；当时注册 8 个，现目录 10 个可执行，实际数量以 `ctest -N -L distributed` 为准）**；1e6 次压力 3 轮
 `STRESS_OK`，fencing token 连续唯一（1..1000000），收尾 `locks=0`、`candidates=1`。
 
 ## 9. 交接注意

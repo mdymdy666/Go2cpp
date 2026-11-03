@@ -1,7 +1,7 @@
 # 应用层（交接文档）
 
 > **定位**：把「一次游戏资源下发」和「一张 `k1=v1;…` 表」统一抽象成 **HTTP/2 风格的流表**，并给出可直接跑的传输适配与测试。
-> **源码**：`include/go2cpp/app/`（11 个头）、`src/app/`（10 个实现）；构建开关 `-DGO2CPP_WITH_APP=ON`（默认 OFF）、测试 `-DGO2CPP_APP_TESTS=ON`
+> **源码**：`include/go2cpp/app/`（13 个头）、`src/app/`（12 个实现）；构建开关 `-DGO2CPP_WITH_APP=ON`（默认 OFF）、测试 `-DGO2CPP_APP_TESTS=ON`
 > **构建接入**：库目标 `go2cpp_app`；Bento 目标存在时追加帧桥与 Link 适配，`bento::HttpServer` 存在时追加 HTTP 隧道
 > **测试目标**：`app_test_frame`、`app_test_stream_table`、`app_test_resource`、`app_test_kv`、`app_test_connection`、`app_test_load`、`app_test_bento`、`app_test_http`
 > **设计全文**：[app-framework.md](../../docs/modules/app-framework.md)（协议表、状态机、WFQ、全部实测数字）、[bento-app.md](../../docs/modules/bento-app.md)（相邻层：fetch/zip/backup/capability/command/file_transfer）
@@ -253,6 +253,8 @@ g++ -std=c++17 -O2 -Iinclude app_demo.cpp -Lbuild \
 | `app/bento_bridge.hpp` / `src/app/bento_bridge.cpp` | 约 80 / 211 | App 帧 ↔ Bento 20 B 通用帧（CRC32） |
 | `app/bento_link_transport.hpp` / `src/app/bento_link_transport.cpp` | 约 70 / 149 | Bento Link STREAM 通道 → `ITransport` |
 | `app/http_tunnel.hpp` / `src/app/http_tunnel.cpp` | 约 90 / 189 | 帧流 over HTTP（TCP）批式隧道 |
+| `app/gateway.hpp` / `src/app/gateway.cpp` | 460 / 1,560 | 通用 HTTP 网关：注册式路由、中间件链、可插拔上游解析、JSON 配置 |
+| `app/realtime_room.hpp` / `src/app/realtime_room.cpp` | 95 / 382 | 通用实时房间：房间聚合连接 + 每连接有界队列异步广播 |
 
 `app/sha256_ni.hpp` 现在是 `hash::Sha256` 的薄转发，建议下一轮让 `resource.cpp` 直调 hash 后删除。
 
@@ -305,6 +307,8 @@ ctest --test-dir build -R 'app_' --output-on-failure
 | `app_test_bento` / `app_test_http` | 4 / 5 | 真实 UDP Link 与真实 TCP HttpServer 上的 KV / 资源 / 索引 / 坏 body |
 
 自建最小闭环：① 跑 §4 的 `app_demo` 应打印 `k1=v1 k2=v2`；② 把 `MemoryTransport::CreatePair(1024)` 调到 1 KiB 以下验证背压（`WriteAll` 阻塞至超时）；③ 用 `PatternChunkSource(1ull << 30)` + `DiscardSink` 跑 1 GiB 核对 `stats.verified == true`；④ 故意改坏一块 CRC，接收端应收到 `kResourceComplete(ok=false)` 且发送端收到 `RST_STREAM(kChecksumError)`。
+
+`gateway` / `realtime_room` 不注册 ctest，用独立脚本编译运行：`tests/app/build_and_run_gateway.sh`（路由/鉴权/透传/超时/502/中间件/Resolver/配置/压测）、`tests/app/build_and_run_realtime.sh`（同房间广播、房间隔离、慢连接踢出、Leave/CloseAll、100 连接并发广播）。
 
 ## 9. 交接注意
 

@@ -2,7 +2,7 @@
 
 > **定位**：Go 风格协作式并发运行时——GMP 调度器 + 可挂起 Fiber + Channel/Select + 同步原语 + Context/Future/Timer。
 > **源码**：`include/go2cpp/concurrency/`、`src/concurrency/`（约 2.0 万行实现）　**构建**：`cmake/Go2CppModules.cmake`，目标 `go2cpp_scheduler` / `go2cpp_fiber` / `go2cpp_channel` / `go2cpp_sync` / `go2cpp_future` / `go2cpp_context`
-> **测试**：`tests/concurrency/`（88 个文件：`test_*` / `bench_*` / `stress_*`）
+> **测试**：`tests/concurrency/`（93 个文件：`test_*` / `bench_*` / `stress_*`）
 > **设计全文**：[scheduler.md](../../docs/modules/scheduler.md)、[fiber.md](../../docs/modules/fiber.md)、[channel.md](../../docs/modules/channel.md)、[sync.md](../../docs/modules/sync.md)、[select-semantics.md](../../docs/modules/select-semantics.md)、[timer.md](../../docs/modules/timer.md)
 > **配套**：迁移手册 [concurrency-usage.md](../../docs/modules/concurrency-usage.md)，可运行示例 [user/concurrency/README.md](../concurrency/README.md)
 

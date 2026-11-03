@@ -1,7 +1,7 @@
 # 缓存淘汰策略（交接文档）
 
 > **定位**：header-only 的缓存淘汰策略库——7 种策略（LRU / LRU-K / 2Q / W-TinyLFU / GDSF / ARC / CLOCK）共用一个 `Cache<K,V>` 接口，外加线程安全与分片装饰器、可复现负载生成器。
-> **源码**：`include/go2cpp/cache/**`（约 3700 行，**没有 .cpp**）　**构建**：`cmake/Go2CppCache.cmake`，目标 `go2cpp_cache`（INTERFACE 库，只依赖 `Threads::Threads`）
+> **源码**：`include/go2cpp/cache/**`（约 4000 行，**没有 .cpp**）　**构建**：`cmake/Go2CppCache.cmake`，目标 `go2cpp_cache`（INTERFACE 库，只依赖 `Threads::Threads`）
 > **测试**：`tests/cache/`（16 个文件：`test_lru` / `test_lru_k` / `test_arc` / `test_tiny_lfu` / `test_random` / `test_stress` / `cache_bench` …）
 > **设计全文**：[docs/modules/cache.md](../../docs/modules/cache.md)（策略与论文差异、复杂度、边界）
 > **实测**：[docs/reports/vs-cache.md](../../docs/reports/vs-cache.md)；示例 [user/app/README.md](../app/README.md)（`cache_demo`）

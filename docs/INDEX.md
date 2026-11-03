@@ -1,7 +1,9 @@
 # Go2Cpp 文档索引（INDEX）
 
-> 盘点基准：`HEAD 6c08210`，2026-10-31。
-> 统计：`docs/` 下 **73 篇主题文档**（不含本索引）+ 19 篇状态机 + 24 篇 review + 8 篇 research；
+> 盘点基准：`HEAD eaf5889`，2026-11-03。
+> 统计：`docs/` 下 **77 篇主题文档**（不含本索引）+ 19 篇状态机 + 24 篇 review + 8 篇 research；
+> 子目录另有 `modules/` 58 篇、`reports/` 50 篇、`audit/` 37 篇、`plans/` 3 篇；
+> `user/deep/` 17 篇深入教程（+ README）；应用层需求 `app/douyin/`、`app/bilibili/` 各 1 篇。
 > 另有 MCP 架构文档 `mcp/docs/architecture.md`。
 > 本索引是文档的唯一入口；新增/改名文档必须在此登记。代码语义不在本索引范围内。
 
@@ -17,8 +19,12 @@
 - [六、历史与交接（12）](#六历史与交接12)
 - [七、MCP / eBPF / 工具（入口）](#七mcp--ebpf--工具入口)
 - [八、附录：状态机文档（19）](#八附录状态机文档19)
-- [九、附录：review 问题库（10）](#九附录review-问题库10)
+- [九、附录：review 问题库（24）](#九附录review-问题库24)
 - [十、重复 / 过时 / 孤立清单](#十重复--过时--孤立清单)
+- [十一、工程规范（2）](#十一工程规范2)
+- [十二、报告 / 计划 / 审计（入口）](#十二报告--计划--审计入口)
+- [十三、应用层（app/）（2）](#十三应用层app2)
+- [十四、深入学习（user/deep/）（17）](#十四深入学习userdeep17)
 - [维护约定](#维护约定)
 - [模块文档（docs/modules/）](#模块文档docsmodules)
 
@@ -109,7 +115,7 @@
 | --- | --- | --- |
 | [testing.md](testing.md) | 测试矩阵、构建目录、CTest 超时/看门狗与 CI 入口 | 现行（ctest 数按构建 profile 登记：`bento+mcp+runtime` 230 / `bento+mcp` 80 / `mcp+osmon` 20；历史节仍含 130 等旧计数） |
 | [test-audit-2026-10-21.md](test-audit-2026-10-21.md) | 全量测试审计：0–8 节为早间快照，第 9 节为 `ctest -N` 清单 | 历史 |
-| [performance.md](performance.md) | 2026-10-21 性能数据汇总（并发原语/内存/切换/IO） | 现行 |
+| [performance.md](performance.md) | 2026-10-21 性能数据汇总（并发原语/内存/切换/IO） | 现行（引用数字前按 [metrics-ledger.md](metrics-ledger.md) 核对状态） |
 | [performance-baseline-2026-10-19.md](performance-baseline-2026-10-19.md) | **当前唯一有效性能基线**：公平对比方法、三轮优化根因与前后数据 | 现行 |
 | [memory-benchmark.md](memory-benchmark.md) | Fiber vs 线程内存基准：省虚拟地址与固定开销，RSS 只略省 | 现行 |
 | [switch-benchmark.md](switch-benchmark.md) | Fiber ~500ns vs 线程 ~28µs 的切换开销基准 | 现行 |
@@ -143,7 +149,7 @@
 | [function-annotation-progress.md](function-annotation-progress.md) | 重要函数级注释进度（同上，已停） | 历史 |
 | [so-reload-progress.md](so-reload-progress.md) | SO 热重载 step1–step4 进度与审查记录（ctest 114/114 时期） | 历史 |
 | [gmp-optimization-log.md](gmp-optimization-log.md) | 1,663 行 GMP 优化轮次日志（对比数据自标作废） | 历史 |
-| [code-review-guide.md](code-review-guide.md) | 代码导读/审查路线图（基线 `bd99603`，行号已漂移） | 待更新（未跟踪） |
+| [code-review-guide.md](code-review-guide.md) | 代码导读/审查路线图（基线 `bd99603`，行号已漂移） | 历史（已跟踪；2026-11-03 由 [CODE-REVIEW-MAP.md](CODE-REVIEW-MAP.md) 取代） |
 
 ## 七、MCP / eBPF / 工具（入口）
 
@@ -184,23 +190,25 @@
 | [WebSocket.md](state-machines/WebSocket.md) | `net::WebSocket` |
 | [WriterEngine.md](state-machines/WriterEngine.md) | 写入引擎 |
 
-## 九、附录：review 问题库（10）
+## 九、附录：review 问题库（24）
 
-位置 `docs/review/`，与 `code-review-guide.md` 互补：导读回答“怎么读”，本目录回答“读出了什么”。
-**整个目录当前未被 git 跟踪**（`?? docs/review/`），引用前注意基线为 `bd99603`。
+位置 `docs/review/`，与 [CODE-REVIEW-MAP.md](CODE-REVIEW-MAP.md) 互补：地图回答“按模块去哪抽查”，本目录回答“已读出什么问题”。
+**已修（2026-11-03）：该目录及 `code-review-guide.md` 均已纳入 git 跟踪**，早期“整目录未跟踪、基线 `bd99603`”的提示作废。
+下表为 2026-10-29 首批 10 篇；目录内另有 14 篇（`review-*.md` 批量审查、`transport-comparison-2026-10-28.md`、
+`weaknet-real-2026-10-28.md` 等），按同一模板追加，未逐条入表。
 
 | 文档 | 内容 | 状态 |
 | --- | --- | --- |
-| [README.md](review/README.md) | 索引、状态图例、维护规则 | 未跟踪 |
-| [_TEMPLATE.md](review/_TEMPLATE.md) | 单模块问题文档模板 | 未跟踪 |
-| [00-overview.md](review/00-overview.md) | 模块阅读顺序与依赖摘要 | 未跟踪 |
-| [00-concurrency-policy.md](review/00-concurrency-policy.md) | 全局并发安全政策（默认 `sync::Mutex`，禁裸 `std::mutex`） | 未跟踪 |
-| [01-error.md](review/01-error.md) | error 模块问题记录（含与 Go error 生态差距） | 未跟踪 |
-| [02-config.md](review/02-config.md) | config 模块问题记录（**暂停，待专项审查**） | 未跟踪 |
-| [03-log.md](review/03-log.md) | log 模块问题记录（4 条已确认问题） | 未跟踪 |
-| [04-context.md](review/04-context.md) | context 模块问题记录（待读） | 未跟踪 |
-| [05-default-value-drift.md](review/05-default-value-drift.md) | 默认配置漂移（文档一致性）问题 | 未跟踪 |
-| [06-fiber.md](review/06-fiber.md) | fiber 状态机与成员变量跟踪（专项审查待办） | 未跟踪 |
+| [README.md](review/README.md) | 索引、状态图例、维护规则 | 已跟踪 |
+| [_TEMPLATE.md](review/_TEMPLATE.md) | 单模块问题文档模板 | 已跟踪 |
+| [00-overview.md](review/00-overview.md) | 模块阅读顺序与依赖摘要 | 已跟踪 |
+| [00-concurrency-policy.md](review/00-concurrency-policy.md) | 全局并发安全政策（默认 `sync::Mutex`，禁裸 `std::mutex`） | 已跟踪 |
+| [01-error.md](review/01-error.md) | error 模块问题记录（含与 Go error 生态差距） | 已跟踪 |
+| [02-config.md](review/02-config.md) | config 模块问题记录（**暂停，待专项审查**） | 已跟踪 |
+| [03-log.md](review/03-log.md) | log 模块问题记录（4 条已确认问题） | 已跟踪 |
+| [04-context.md](review/04-context.md) | context 模块问题记录（待读） | 已跟踪 |
+| [05-default-value-drift.md](review/05-default-value-drift.md) | 默认配置漂移（文档一致性）问题 | 已跟踪 |
+| [06-fiber.md](review/06-fiber.md) | fiber 状态机与成员变量跟踪（专项审查待办） | 已跟踪 |
 
 ---
 
@@ -229,7 +237,14 @@
   （`bento+mcp+runtime` 230 / `bento+mcp` 80 / `mcp+osmon` 20）。
 - `modules.md`：原写“13 个模块 target”，本次已修正为 24（含 `math/rand/path/container/compress/encoding/hash/metrics/debug`）；第 1 节表格仍只列 7 个目录。
 - `testing.md`：路径约定与 130/183 等历史数字跨多次重构，引用前必须按当前树核对；当前 ctest 总数已按构建 profile 校准（见其「测试地图」）。
-- `code-review-guide.md`：基线 `bd99603`，行号已漂移，且文件未跟踪。
+- `code-review-guide.md`：基线 `bd99603`，行号已漂移——**已修**：2026-11-03 起被
+  [CODE-REVIEW-MAP.md](CODE-REVIEW-MAP.md) 取代（按模块给入口头文件、测试命令与高风险函数），
+  文件也已纳入 git 跟踪，不再是“未跟踪”状态。
+- `docs/reports/2026-10-30-*.md` 五篇（`summary`/`final`/`handoff`/`performance`/`backlog`）：
+  **历史，勿作现状**。HEAD、ctest 数、性能数字均为 2026-10-30 当日快照；其中
+  `2026-10-30-performance.md` 的并发原语数字引用前须按 [metrics-ledger.md](metrics-ledger.md) 的状态核对。
+- `docs/reports/` 的 `asm-*.md`、`vs-*.md`：单篇结论按 [reports/README.md](reports/README.md) 的归档摘要引用，
+  涉及性能数字时必须先查 [metrics-ledger.md](metrics-ledger.md) 的状态（`待复跑`/`STALE`/`无出处` 不得作为结论）。
 - `trace_format.md`：设计未落地，源码无 trace 实现。
 
 ### 孤立（零引用，没有任何其他文档链接）
@@ -244,12 +259,87 @@
 `channel-hang.md`、`quality_backlog.md` 是现行有效文档，本索引已把它们接到入口，不再孤立；
 其余为历史快照，保留原样即可。
 
+2026-11-03 复查：新增的 `CODE-REVIEW-MAP.md`、`metrics-ledger.md`、`user/deep/*`、`docs/plans/*`、
+`docs/reports/*` 多数尚未被其他文档引用，但已由本索引第十一–十四节接到入口，同样不再视为孤立。
+
 ### 缺口
 
 - ~~`mcp/` 没有 README，`mcp/docs/architecture.md` 顶部链接 `../README.md` 断链（全仓唯一断链）。~~
   **2026-10-26 已修复**：新增 `mcp/README.md`（指向 `docs/modules/mcp.md`）。
 - `bpf/` 6 个 eBPF 程序没有使用/设计文档，只在 `cmake/Go2CppMonitor.cmake` 注释里有说明。
 - ~~`go2cpp::os` 无独立文档~~：**2026-10-26 已补** `docs/modules/os.md`；接入说明仍在 `modules.md`。
+- ~~本索引未接 `docs/reports/`（50 篇）、`docs/audit/`（37 篇）、`docs/plans/`（3 篇）的入口~~：
+  **2026-11-03 已修**——`reports/`、`audit/` 各有 `README.md` 自索引（2026-11-02 提交），
+  本索引第十二节已接入；`plans/` 三篇逐条登记在第十二节。
+
+---
+
+## 十一、工程规范（2）
+
+2026-11 初新增的项目级强制规范，与 `~/.dsh/AGENTS.md` 配套；动代码或写报告前先读这两篇。
+
+| 文档 | 一句话说明 | 状态 |
+| --- | --- | --- |
+| [engineering-standards.md](engineering-standards.md) | 工程标准：实现前先查项目内/外、对标工业级、复用优先、构建/测试/性能口径（强制） | 现行 |
+| [correctness-standards.md](correctness-standards.md) | 正确性标准：与基线逐字节一致、≥1e7 压测 0 错误、边界与并发门槛（强制） | 现行 |
+
+## 十二、报告 / 计划 / 审计（入口）
+
+`docs/reports/`（50 篇）、`docs/audit/`（37 篇）、`docs/plans/`（3 篇）位于 `docs/` 子目录，各目录有 `README.md`
+或本表入口；逐篇摘要以目录自索引为准，本索引只登记入口与 2026-11-03 新增的关键文档。
+
+| 文档 | 一句话说明 | 状态 |
+| --- | --- | --- |
+| [reports/README.md](reports/README.md) | reports 目录自索引：汇编取证、工业库对标、开源复用报告（2026-11-02 归档 15 份） | 现行 |
+| [audit/README.md](audit/README.md) | audit 目录自索引：逐模块「使用限制」清单，每条带 `file:line`（2026-10-29 生成） | 现行 |
+| [metrics-ledger.md](metrics-ledger.md) | 性能数字台账：每条数字须有测量命令/环境/日期/复现脚本，状态分 `实测`/`待复跑`/`STALE`/`无出处` | 现行（2026-11-03 新增） |
+| [CODE-REVIEW-MAP.md](CODE-REVIEW-MAP.md) | 代码审查地图：25.8 万行实现 + 23.4 万行测试按模块抽查（入口头文件、测试命令、高风险函数、门禁） | 现行（2026-11-03 新增） |
+| [reports/rdnet-v3-review.md](reports/rdnet-v3-review.md) | rd::net v3 三件套（REQ-006…009）审查：分层、Socket 四态、协议边界 | 现行（2026-11-03） |
+| [reports/go-scheduler-borrow.md](reports/go-scheduler-borrow.md) | Go 1.27 `runqput`/`runqsteal`/`findRunnable` 与本地调度器的三处差异及可执行改动 | 现行（2026-11-03） |
+| [plans/reply-format.md](plans/reply-format.md) | 回复格式规范：五段固定结构（结论/完成内容/证据/下一步/待确认），2026-11-03 生效 | 现行 |
+| [plans/douyin-clone.md](plans/douyin-clone.md) | 抖音级应用分布式落地路线图（每一步可运行、可验证） | 现行（2026-11-03） |
+| [plans/autopilot-progress.md](plans/autopilot-progress.md) | Autopilot 自动推进进度板（15 分钟一轮、总目标三阶段） | 现行（滚动更新） |
+
+> `docs/reports/` 内 2026-10-30 五篇为历史快照，定性见第十节「过时」；`asm-*.md`/`vs-*.md` 逐篇摘要见
+> `reports/README.md`，本索引不重复。
+
+## 十三、应用层（app/）（2）
+
+`app/douyin/`、`app/bilibili/` 是单机可跑的业务 demo（不属于 `docs/`，此前索引无归属分类），
+需求文档是验收依据，故新增本节登记；实现代码看 `app/*/src/`，模块级入口见 `CODE-REVIEW-MAP.md` §1。
+
+| 文档 | 一句话说明 | 状态 |
+| --- | --- | --- |
+| [app/douyin/REQUIREMENTS.md](../app/douyin/REQUIREMENTS.md) | 抖音 Demo P0 需求（APP-DOUYIN-REQ-01）：短视频/直播，C2–C10 的实现与验收依据 | 现行（2026-11-03） |
+| [app/bilibili/REQUIREMENTS.md](../app/bilibili/REQUIREMENTS.md) | B 站核心复刻需求（APP-BILIBILI-REQ-01）：弹幕/播放/大会员，B1–B4 验收依据 | 现行（2026-11-03） |
+
+## 十四、深入学习（user/deep/）（17）
+
+面向「要接手改代码的人」的深读教程：每篇给 `文件:行`、状态机与不变量；与 `user/docs/`（交接摘要）的分工、
+写作铁律与 17 篇状态表见 [user/deep/README.md](../user/deep/README.md)。行数为 `wc -l` 实测（2026-11-03）。
+
+| 文档 | 主题 | 行数 |
+| --- | --- | ---: |
+| [README.md](../user/deep/README.md) | 定位、与 `user/docs/` 的分工、写作铁律、17 篇状态表 | 113 |
+| [01-concurrency.md](../user/deep/01-concurrency.md) | 并发运行时：Fiber / Scheduler / Channel / 同步原语 | 636 |
+| [02-network.md](../user/deep/02-network.md) | 网络：Socket / Hook / epoll / HTTP1 / HTTP2 / TLS / WS / SSE / QUIC | 558 |
+| [03-bento.md](../user/deep/03-bento.md) | Bento 传输：UDP 可靠层 / FEC / BBR / 0-RTT / PeerHub | 529 |
+| [04-storage.md](../user/deep/04-storage.md) | 存储模块 | 361 |
+| [05-cache.md](../user/deep/05-cache.md) | 缓存模块 | 357 |
+| [06-media.md](../user/deep/06-media.md) | 媒体（media） | 476 |
+| [07-p2p.md](../user/deep/07-p2p.md) | P2P 与 NAT 穿透 | 360 |
+| [08-rpc.md](../user/deep/08-rpc.md) | RPC | 353 |
+| [09-distributed.md](../user/deep/09-distributed.md) | 分布式设施（distributed） | 351 |
+| [10-observability.md](../user/deep/10-observability.md) | 可观测（observability） | 398 |
+| [11-tools.md](../user/deep/11-tools.md) | 开发者工具链与 Go 兼容工具层 | 424 |
+| [12-app.md](../user/deep/12-app.md) | 应用层流框架（app） | 445 |
+| [13-relay-jinshan.md](../user/deep/13-relay-jinshan.md) | Relay / JinShan 基础件（frame / relay / rd_net / collab） | 339 |
+| [14-tunnel.md](../user/deep/14-tunnel.md) | 公网穿透 Tunnel：协议 / 多路复用 / 服务端 / 客户端 | 692 |
+| [15-os.md](../user/deep/15-os.md) | OS 模块 | 351 |
+| [16-go-api.md](../user/deep/16-go-api.md) | Go API 兼容层（go-api） | 354 |
+| [17-bufio.md](../user/deep/17-bufio.md) | Bufio 模块 | 350 |
+
+---
 
 ## 维护约定
 

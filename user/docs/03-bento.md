@@ -2,7 +2,7 @@
 
 > **定位**：跑在 UDP 上的应用层可靠传输协议（Bento Transport Protocol v0.2）：可靠有序 STREAM、
 > 不可靠 DATAGRAM、视频 VIDEO 三种通道 + SACK/快速重传 + FEC + BBR 拥塞控制 + 连接迁移 + 加密。
-> **源码**：`include/go2cpp/bento/`（44 个头文件）、`src/bento/`（40+ 实现）
+> **源码**：`include/go2cpp/bento/`（49 个头文件）、`src/bento/`（40+ 实现）
 > **构建**：`cmake/Go2CppBento.cmake`，开关 `GO2CPP_WITH_BENTO`（默认 **OFF**）
 > **测试**：`tests/bento/`；线上协议全文 [tests/bento/PROTOCOL.md](../../tests/bento/PROTOCOL.md)
 > **模块设计**：[bento-foundation](../../docs/modules/bento-foundation.md)、[bento-transport](../../docs/modules/bento-transport.md)、

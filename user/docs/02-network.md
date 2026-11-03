@@ -1,7 +1,7 @@
 # 网络栈（交接文档）
 
 > **定位**：与 Go `net` 包对等的网络栈——地址/监听/连接、epoll IO 管理器、syscall Hook（阻塞转 park）、HTTP/1.1、HTTP/2、TLS 封装、WebSocket、SSE、QUIC/HTTP3 薄封装。
-> **源码**：`include/go2cpp/network/**`、`src/network/**`（约 1.17 万行实现）　**构建**：`cmake/Go2CppModules.cmake`，目标 `go2cpp_network`（Hook 另建 `go2cpp_hook` 共享库）
+> **源码**：`include/go2cpp/network/**`、`src/network/**`（约 1.8 万行实现）　**构建**：`cmake/Go2CppModules.cmake`，目标 `go2cpp_network`（Hook 另建 `go2cpp_hook` 共享库）
 > **测试**：`tests/network/`（30 个文件：`test_network` / `test_hook*` / `test_http2*` / `test_http_e2e` / `test_sse` …）
 > **设计全文**：[network.md](../../docs/modules/network.md)（总览）、[http1.md](../../docs/modules/http1.md)、[http2.md](../../docs/modules/http2.md)、[tls.md](../../docs/modules/tls.md)、[ws.md](../../docs/modules/ws.md)、[sse.md](../../docs/modules/sse.md)
 > **配套**：可运行示例 [user/network/README.md](../network/README.md)
@@ -337,4 +337,4 @@ cmake --build build -j && ctest --test-dir build -R "network|hook|http|sse|http2
 - **fd 是瞬时值**：`Socket::fd()` 不进入 in-flight 保护，取到后可能被 close/复用（ABA），
   **不要跨操作持有**。
 - **未完成事项**：HTTP/2 服务端 + h2 over TLS 全链路未验证（缺 nginx/nghttpd 对端）、TLS 服务端/
-  会话复用、QUIC ctest、`hpack.cpp:465` 的 unused-function 告警阻塞零警告目标。
+  会话复用、QUIC ctest 仍缺；`hpack.cpp` 的 unused-function 告警已修复（当前源码无 unused 告警点）。

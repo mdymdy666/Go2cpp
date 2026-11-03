@@ -4,6 +4,7 @@
 > 双向字节中继 `relay::RelayPipe`、连接注册表 `relay::Hub`、租约与心跳 `relay::Lease`/`Heartbeat`，
 > 外加贯穿各层的背压工具「有界队列」（`Channel`/`FastChannel` 的 `TrySend`）。
 > **源码**：`include/go2cpp/frame/`、`include/go2cpp/relay/`、`src/frame/`、`src/relay/`
+> **协作/新增层**：`collab/`（JinShan 需求/验收/能力清单）；`include/go2cpp/rd_net/` + `src/rd_net/`（REQ-008 协议注入层 `rd::net`，只挂协议不解析字节）
 > **构建**：`cmake/Go2CppFrame.cmake`、`cmake/Go2CppRelay.cmake`、`cmake/Go2CppRelayHubLease.cmake`
 > **测试**：`tests/frame/test_frame_codec.cpp`、`tests/relay/`（含 `go2cpp_relay_bench`）
 > **设计全文**：[frame-codec](../../docs/modules/frame-codec.md)、[relay-pipe](../../docs/modules/relay-pipe.md)、
