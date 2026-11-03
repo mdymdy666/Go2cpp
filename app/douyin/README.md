@@ -1,5 +1,8 @@
 # 抖音 P0 骨架 + 共享 IDL
 
+> **完整需求文档见 [REQUIREMENTS.md](REQUIREMENTS.md)**（功能需求 FR-01..FR-10、数据模型、接口规范、
+> 非功能指标、5 个验收场景、C2–C10 里程碑）。本 README 只描述骨架现状与构建/启动命令。
+
 单机 6 服务 + 1 网关的最小骨架。**当前只实现 `GET /health`**，业务、存储、RPC 均未实现。
 构建产物在 `build/`（已被 `.gitignore` 忽略），不提交。
 
@@ -20,7 +23,7 @@
 ## 目录
 
 ```
-demos/douyin/
+app/douyin/
 ├── README.md
 ├── build.sh                 # 编译 7 个二进制
 ├── include/douyin_proto.hpp # 共享 IDL（结构 + ToJson/FromJson 声明）
@@ -76,7 +79,7 @@ JSON 解析为手写最小实现（缺字段保留默认值），不引第三方
 ## 构建
 
 ```bash
-cd demos/douyin
+cd app/douyin
 ./build.sh          # 默认读 $GO2CPP_ROOT(.build-bento-wsl)，可用环境变量覆盖
 ```
 
@@ -85,7 +88,7 @@ cd demos/douyin
 ## 启动
 
 ```bash
-cd demos/douyin
+cd app/douyin
 setsid nohup ./build/gateway 28080 > logs/gateway.log 2>&1 &
 setsid nohup ./build/user_service 29101 > logs/user_service.log 2>&1 &
 # video 29102 / feed 29103 / interaction 29104 / live 29105 / search 29106 同理
