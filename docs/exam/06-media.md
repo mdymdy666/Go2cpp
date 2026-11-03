@@ -57,7 +57,7 @@
 - **追查位置**：
   - `src/media/codec_delta.cpp:195-200`（是否关键帧：`m_force_keyframe || geometry_changed || m_ref.empty()`；
     关键帧时先 `m_ref.assign` 并清 `m_force_keyframe`）
-  - `src/media/codec_delta.cpp:271-277`（**先** `m_ref.assign(i420...)`，**再**判断
+  - `src/media/codec_delta.cpp:274-277`（**先** `m_ref.assign(i420...)`，**再**判断
     `out->size() > kMaxEncodedFrameBytes`，超限才 `++m_oversize; return false`）
   - `include/go2cpp/media/codec.hpp:182-184`（`kMaxEncodedFrameBytes = 256 * 1200 - 64`，受
     VideoChannel 分片上限约束）

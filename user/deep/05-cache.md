@@ -324,4 +324,34 @@ detail::NodePool<Entry> pool_;
 6. `factory.hpp`（分片与线程安全边界）；
 7. 最后跑 `tests/cache/test_scenarios.cpp`，把每个场景的 baseline/recovery 与代码对上。
 
+### 2.18 三条「代码注释里写着」的真实踩坑（改代码前必读）
+
+1. **GDSF 的 Get 曾经把自己淘汰**：旧实现只更新 map 里的 `key_value`、不 push 新堆节点也不递增 version，结果堆顶还是该 key 的旧代价，下一次淘汰就选中它。现注释在 `gdsf.hpp:79`-`:82`，修复是把 `version` 纳入堆节点并在 `EvictOne` 校验（`:264`）。
+2. **TinyLFU 段间搬家曾经每次命中 3.93 次 `operator new`**：旧实现三段各一张 `unordered_map` + `std::list`，窗口命中提升/protected 降级都要新建 list 节点；现在三段共用一张 `BucketMap` + NodePool，段标记在条目里，搬家只改指针（`tiny_lfu.hpp` 文件头「容器层」段）。改这段时不要退回「每段一条 list」。
+3. **2Q 的 Get 曾经查三次哈希**：旧顺序是 am -> a1in -> ghost，三个独立表；现在 A1in/Am 共用一张索引（条目带段标记），Get 降为两次查找（`two_queue.hpp:27`）。新增字段时别把两段又拆回两张表，否则热路径多一次哈希。
+
+这三条都不是「性能优化故事」，而是**语义曾经坏掉**的记录：第 1 条会淘汰热数据，第 2/3 条会改变命中率与内存行为。改任何一条路径前先读对应注释。
+
+### 2.19 术语对照与边界（读论文/注释时别混）
+
+| 本实现 | 论文/常见叫法 | 边界（必须知道） | 位置 |
+|---|---|---|---|
+| corral | LRU-K 的 history queue | 容量 = `max(4,capacity)`，不是论文的「小比例」；总内存约 2×capacity | `lru_k.hpp:74` |
+| A1out | 2Q 的 ghost queue | 只存 key，不存 value；命中仍是 miss | `two_queue.hpp:96` |
+| pending | ghost 命中凭证 | 容量 = ghost 容量；没有后续 Put 就永远不提升 | `two_queue.hpp:103` |
+| window | W-TinyLFU 的 window LRU | 1% 容量；容量很小时被压到 1 条 | `tiny_lfu.hpp:67` |
+| probation/protected | SLRU 两段 | probation 20% / protected 80%；protected 满会降级 | `tiny_lfu.hpp:69` |
+| `L` | GDSF 的 age/inflation | 淘汰时 `L += victim.key_value`，只影响相对顺序 | `gdsf.hpp:265` 附近 |
+| `p` | ARC 的 T1 目标 | 单位是条目数，clamp 到 `[0,capacity]`；B1 增/B2 减 | `arc.hpp:112` |
+| referenced | CLOCK 的 reference bit | 只有 1 bit，没有计数；扫描后恢复能力差 | `clock.hpp:81` |
+| ghost_size | Stats 的 ghost 水位 | 2Q/ARC 是 ghost 表；GDSF 是「堆项超出条目数」的近似 | `gdsf.hpp` Stats |
+| peak_bytes | 基准里的峰值内存 | 由测试的自定义 allocator 统计，不是进程 RSS | `tests/cache/cache_bench.cpp` |
+
+三个常见混淆：
+1. 「ghost 命中」不是「缓存命中」——2Q/ARC 都返回 false，数据要调用方自己加载再 Put。
+2. 「rejections」不是「evictions」——前者是没进缓存，后者是进了又被淘汰；命中率分母都不含二者。
+3. 「容量」在 `ShardedCache` 下是各片实际容量之和，可能与配置不同（2.10）。
+
+
+
 
