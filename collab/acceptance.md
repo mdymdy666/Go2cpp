@@ -231,3 +231,25 @@ relay_lease_clockjump / relay_pipe / go2cpp_frame_test；`relay_hub_tsan` 未跑
 - **测试**：`tests/rd_net/test_reliability.cpp`（336 行）+ `build_and_run_reliability.sh`，`64 项检查 0 失败`；
 - **数字**：`0xFFFFFFFF.Next()=0`、半程两侧均 false；1e5 项 `PopDue` 一次取全且无重复；RFC 6298 100 ms→RTO 300、200→360、300→507，max/initial 夹紧；AIMD 替换容器 0 改动；随机对拍 1e5 次 0 不匹配；
 - **压测**：1e6 次 **47.3–51.7 ns/op**，RSS 22 MiB。
+
+### REQ-007：EventLoop + 毫秒定时器（✅ 2026-11-03）
+
+- **实现**：`include/go2cpp/rd_net/event_loop.hpp`（158 行）+ `src/rd_net/event_loop.cpp`（601 行）：单线程 `poll(2)` + `eventfd`；定时器最小堆（惰性取消 + 阈值重建）；单 tick 顺序固定 **Post → 到期定时器 → IO**；每 socket 每 tick 上限 64 包；
+- **测试**：`tests/rd_net/test_event_loop.cpp`（586 行），`checks=44 failures=0`；
+- **实测（3 轮）**：1000 定时器 1 s 内 `p50 533 µs / p99 1076 µs / max 1211 µs`（<5 ms）；A 狂收 14.8 万包时 B 的 1 ms 定时器 `p50 3 µs / max 228 µs`；`Post` 1e5 次 `out_of_order=0`；`max_per_tick=64`；Cancel/Stop 正确；200 轮 Create/destroy `fd 6→6`、`RSS delta 0`；ASAN 43 checks 无泄漏。
+
+### REQ-008：协议注入入口（✅ 2026-11-03）
+
+- **实现**：`include/go2cpp/rd_net/protocol.hpp`（143 行）+ `src/rd_net/protocol.cpp`（398 行）：`rd::net::Protocol`/`StreamProtocol`/`ProtocolContext`/`DetachReason`；`ByteView` 借用零拷贝；
+- **测试**：`tests/rd_net/test_protocol.cpp`（576 行），`checks=44 failures=0`；
+- **memset 反证（零拷贝）**：`SendTo` 返回后立即 `memset(0xCC)` → 对端收到全 `0xCC`（全 `0x5A`=0）→ **合规**；负向对照（在 SendTo 内偷偷拷贝）→「全 0x5A=1、failures=2」→ **用例确实能抓 bug**；
+- **其它**：`SendTo` 1 万次 0.79 ms（阈值 10 ms）、完成回调 10000/10000、被拒 0；单 tick 64 包（tick1=64/tick2=36）；`git diff -- include/go2cpp/rd_net src/rd_net` = 0 行（协议全在测试侧）；
+- **命名空间**：统一为 `rd::net`（event_loop.hpp include protocol.hpp，删占位类 -43 行；`plugin` 命名空间已移除）。
+
+### REQ-006 补充：已绑定现有栈 + bufio 批量可配（✅ 2026-11-03）
+
+- **绑定**：`DatagramSocket/StreamSocket` 内部持 `go2cpp::net::Socket::Ptr`；`Open/Close/bind/connect` 全走 `Socket::CreateUDP/CreateTCP` + `Address::Create`；收发用 `fd()` + `MSG_DONTWAIT`/`MSG_TRUNC`，四态不变（FIN `revents=0x1/errno=0`、RST `revents=0x19/errno=104`、Truncated `actual=65507`、WouldBlock 重试不丢）；
+- **批量配置注入**：`SocketOptions`/`DialOptions` 增 `batch_bytes/batch_entries/enable_writev/enable_sendmmsg`（默认全关）；
+- **批量入口**：`SendBatch(entries, count, SendResult*)` 一次 `sendmmsg`(UDP)/`writev`(TCP)；实测 **TCP 21.2×**（225 vs 4804 ns/seg、4358 vs 203 MiB/s）、**UDP 1.20×**（3038 vs 3661 ns/dgram）；部分提交 `kWouldBlock` + `last_batch_submitted()=K`（TCP `SO_SNDBUF=4096` 实测 31/64）；`count=0` no-op；`count>1024` 截断；
+- **测试**：`checks=406 failures=0`（原 353 条全保留）；10 万次 4123 ns/op；
+- **范围限定**：`ack_bits` 在 `tests/rd_net` 有 8 处（REQ-008 测试自身的 ACK 位图验收代码），交付目录 `include/go2cpp/rd_net` + `src/rd_net` **0 命中**；G6 按交付目录判。
