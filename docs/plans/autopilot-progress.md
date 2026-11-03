@@ -28,10 +28,12 @@
 | M16 | Go 基线本机实测 + 固化 | ✅ 1b4ae22 + 本轮固化（tools/bench/） |
 | M03 | scheduler 三件套 | ⛔ **关闭**（用户 15:50 决定）：架构本就比 Go 复杂（无 GC/RAII/Context），优化 <5%、回归风险高；零改动 |
 | borrow | Go 源码借鉴（3 函数，73 行：runnext 位移 / steal runnext / netpoll 前移） | ✅ 本轮（b5ccd296） |
-| B1 | VPS `tunnel-server.service` | ✅ 本轮（enabled/active/restart 正常；公网 404 根因 client 未重注册，主控重启 client 后 200） |
+| B1 | VPS `tunnel-server.service` | ✅ systemd enabled/active，restart 正常 |
 | A6 | 清理 122/135/411k/0.98× 文档漂移 | ✅ 本轮（12 处 / 7 个 .md，未改历史数字，只加注） |
 | M10/M11 | os readv / gzip 三件套 | ⏳ 排队（等基准独占窗口） |
-| B2–B4 | 本机 start-all / 探针 / 断线恢复 | ⏳ 下一个（B2/B3 可并行） |
+| B2 | 本机 start-all/stop-all/健康检查 | ✅ 36e980d（固化 scripts/shop/，全停→全起 6 项 200、幂等） |
+| B3 | 外部探针 60s | ✅ 36e980d（probe.sh，5 分钟 5 次全 200） |
+| B4 | 断线恢复 | ✅ 本轮：根因不是崩溃而是 GOAWAY 后僵尸态；改 client 退避重连 + watchdog 兜底；VPS restart 后 25s 自动 200 |
 | C1–C10 | 抖音 P0 | ⏳ |
 
 ## 下一个任务
@@ -39,8 +41,9 @@
 **B2+B3（并行）**：本机 `start-all.sh` + 健康检查脚本 + 60s 外部探针。
 - B2：启动 gateway(8080)/product(9101)/review(9102)/order(9103)/tunnel-client 的统一脚本（setsid nohup、日志、`pkill -x` 停止），并做一次「全停 → 全起 → 五项健康检查」验证；
 - B3：探针脚本（每 60s curl 公网 `/shop/api/health`，失败写日志与连续失败数），先跑 5 分钟看无失败。
-**M03 已关闭**（2026-11-03 15:50 用户决定）：架构更复杂是事实，取消优化，不再投入。
-**M10 三件套（进行中）**：os readv（当前 14.68×，历史 20.9×）。先 baseline（`/tmp/bench_vectored /tmp` 3 次）→ 架构（批大小/iovec 复用/去掉每批 vector）→ 汇编（`AdvanceIov`/readv 包装指令）→ 正确性（os_test + 边界 1025 段/零长/EOF）→ 前/后数据。
+**M03 已关闭**（2026-11-03 15:50 用户决定）。
+**M10b（进行中）**：修 16 KiB 栈帧（`f5653fb1`）；M10 主改动已实测 读 15.32×→约 205×、写 17.86×→约 110×。
+**JinShan 对接（进行中）**：`5f5a8fa9` 写 `collab/examples/` 四条可编译示例。先 baseline（`/tmp/bench_vectored /tmp` 3 次）→ 架构（批大小/iovec 复用/去掉每批 vector）→ 汇编（`AdvanceIov`/readv 包装指令）→ 正确性（os_test + 边界 1025 段/零长/EOF）→ 前/后数据。
 1. 二分定位 p22 的哪一块触发 smoke（P19/P20/P21/P22 分别单独应用各跑 20 次）；判定「断言竞态」还是「语义破坏」（park 是否最终到 kWaiting、wake 是否正常）；
 2. 若为语义破坏 → 永久放弃该块；若为竞态 → 修断言（`wait_until(kWaiting, 200ms)`）后全量 ctest + 1e6 压力；
 3. 落地 borrow 建议 1（`publish_runnext` 的 displaced 由本 P overflow 承接，避免 `enqueue` 全局锁）：先测 displaced 频率，再改，跑 bench + 正确性；
@@ -59,4 +62,11 @@
 - 15:26 **B1 完成**（`8af8dbe4`）：VPS 装 `/etc/systemd/system/tunnel-server.service`（17 行，`--display-host 82.157.147.127`，Restart=always），`enable --now` 后 is-enabled=enabled / is-active=active、8443+7443 LISTEN、`systemctl --failed` 无本项目；`restart` 后 PID 308685→308884、端口仍在。**公网 404** 根因定位：`/__tunnel__/status` 的 `tunnels:[]`，本机 client(PID 1684) 存活但未重注册。主控重启 client（`pkill -x` + `setsid nohup`，新 PID 198565）后：**public_products=200、public_health=200**，status 出现 `"subdomain":"shop"`、online_ms=6690。
 - 15:28 **A6 完成**（`f3638275`）：12 处 / 7 个 .md 加注，历史数字保留；主控抽查 3 处通过；已合并 `6e1c568`。
 - 15:50 **用户决定放弃 Scheduler 优化**：本项目 Scheduler 在状态机/所有权/Context/栈增长/IO 模型五个维度比 Go 更复杂（无 GC 的 C++ 运行时必须用引用计数+固定栈+显式状态机替代 GC 安全点与栈复制），2.21× 是语义代价不是实现差；M03 关闭，后续不再投入。
+- 16:20 **B4 修复完成**（`3a632dd2`）：
+  - 根因纠正：不是「server restart 让 client 退出」，而是 GOAWAY → `RunLoop` 旧 `:377-380` 直接 break → 控制线程退出、进程存活但永不再连（**僵尸态**，公网 404）；「tunnel-client 已停止」只在 SIGINT/SIGTERM 时打印，是人工 pkill 打的；
+  - 修 `src/tunnel/client.cpp:377-395`：GOAWAY 分支改为清 flag + `backoff.Next()`（500ms→15s、抖动 0.2）退避重连；`kUnauthorized/kBadVersion` 的 fatal 不重试语义保留；
+  - 新增 `scripts/shop/watchdog.sh`（85 行，flock 单实例、10s 轮询 `pgrep -x` ∪ 公网 health、按精确 pid 收尾），定位「运维兜底非自愈」；
+  - 验证：VPS restart 后 T+10..60s 全 200、PID 不变（日志「退避 486ms 后重连」）；`pkill -x tunnel-client` 后 T+5s 502 → T+10s 200（watchdog 拉起）；错误 token 10 秒 11 行不刷屏；
+  - 主控复跑：VPS restart → 25s 后 `public_health=200`、client 存活（PID 211474）；
+  - 已知缺口：错误 token 时 server 在 AUTH 阶段回 kUnauthorized 后立刻断连（`server.cpp:797-814`），client 未起 mux、ACK 丢失 → 误判为网络错误并退避重试（与修复前一致，属 server 侧既有协议缺口，未动）。
 - 15:42 **M03c 收口**（`109eec90`，超时 45 分钟）：分块 smoke 各 10 次 → **P20 0/10**、其余 10/10；探针证明 P20 非语义破坏（park 最终到 kWaiting、p50<1µs、wake 正常），是 :111 断言在 park 前检查的竞态被放大；组合 **P19+P21+P22** 通过 ctest 5/5、smoke 20/20、1e6 压力；bench baseline 305 → 组合 **293（−3.9%）/ 324 vs 338（−4.1%）**，**<5% 门槛** → 回滚（`scheduler.cpp` 与 bak 逐字节一致，无改动）；borrow 建议①核实「现实现已一致」且 metrics 无法测 displaced。**M03 判「无可验证 >5% 空间」收口。**

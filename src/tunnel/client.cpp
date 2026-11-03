@@ -374,12 +374,19 @@ void TunnelClient::RunLoop() {
         if (!m_running.load(std::memory_order_acquire)) {
             break;
         }
-        if (server_draining()) {
-            Emit("[tunnel] 服务端 GOAWAY，停止重连");
-            break;
-        }
         std::uint32_t delay_ms = 0;
-        if (registered) {
+        if (server_draining()) {
+            // 服务端优雅关闭/重启（GOAWAY）：对端只是要换进程，重新监听后会
+            // 再次接受注册，所以这里必须退避重连；原实现直接 break，一次
+            // systemctl restart 就会让 client 变成不下线的僵尸（公网 404）。
+            m_server_draining.store(false, std::memory_order_release);
+            delay_ms = backoff.Next();
+            if (m_metric_reconnects != nullptr) {
+                m_metric_reconnects->Inc();
+            }
+            Emit("[tunnel] 服务端 GOAWAY（重启/关闭），退避 " +
+                 std::to_string(delay_ms) + " ms 后重连");
+        } else if (registered) {
             ever_online = true;
             backoff.Reset();
             delay_ms = 200;
