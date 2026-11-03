@@ -156,12 +156,43 @@
 
 ### M10 os 批量 writev/readv 加速比
 
-- **历史值**：writev 17.9×、readv 20.9×（1e6 条 8B、批 1024）
-- **测量命令**：`.build-bento-wsl/go2cpp_os_test`（本轮只验证功能 `failures=0`，未计时）
-- **环境**：未记录
-- **日期**：未记录
-- **脚本路径**：`tests/os/test_os_file.cpp`（`ScenarioVectoredIo`）
-- **状态**：`待复跑`
+- **历史值**：writev 17.9×、readv 20.9×（1e6 条 8B、批 1024；条件未记录）
+- **测量命令**：`taskset -c 2,3 /tmp/bench_vectored /tmp`（源码 `tests/os/bench_vectored.cpp`，手工编译，详见文件头注释；p1 预编译 `libgo2cpp_os.so` 早于 `WritevAll/ReadvAll`，必须直接编 `src/os` 源）
+- **环境**：12 vCPU / `taskset -c 2,3` / ext4 / 页缓存热（写不 fsync，读前已完整写过）/ 1e6 条 8B、批 1024（尾批 576）/ 3 次进程 × 每次 3 轮取中位
+- **日期**：2026-11-03
+- **脚本路径**：`tests/os/bench_vectored.cpp`（本轮新增，233 行）
+- **状态**：`实测` —— 写：逐条 **822.8 ns/条** → `WritevAll` **49.1 ns/条**，三次中位 **17.96×**（17.96/17.48/19.23）；读：逐条 **496.0 ns/条** → `ReadvAll` **32–33 ns/条**，中位 **14.68×**（14.68/15.11/14.17）。
+- **备注**：写加速比基本复现历史 17.9×；**readv 14.68× 未达历史 20.9×**（历史条件未记录，本机绝对 ns 已接近 syscall 下限，不据此判退化）。主控复跑旁证：17.66× / 15.24×（同口径，宿主负载略高），可复现。
+
+### M11 gzip 压缩/解压吞吐
+
+- **历史值**：压缩 550 MiB/s、解压 1880 MiB/s（asm-tools 口径）；后续 asm-compress 记解压 5219.7 MiB/s vs zlib 3633.0（比值 0.696×）
+- **测量命令**：`/tmp/bench_tools_industry`（按源码重编）与 `/tmp/bench_gzip_crc`（交叉）；1 MiB L6、3 轮中位
+- **环境**：12 vCPU / `taskset -c 2,3` / 单线程 / 页缓存热
+- **日期**：2026-11-03
+- **脚本路径**：`tests/bench/bench_tools_industry.cpp`、`tests/bench/bench_gzip_crc.cpp`（手工编译，不进 CMake）
+- **状态**：`实测` —— 压缩 **612.2 MiB/s**、解压 **3648.0 MiB/s**；同轮 zlib **463.7 / 3138.3 MiB/s**（压缩 1.32× 于 zlib，解压 1.16×）；交叉 `bench_gzip_crc`：解压 **5814.3 MiB/s**、压缩 637.6 MiB/s、crc32 22.14 GB/s。
+- **注意**：go2cpp 产物 18496 B vs zlib 13139 B，**压缩率不同**，不能只看吞吐；`.build-p1-test-wsl` 的 compress `.so` 是 10-30 旧版，直接链接会得到 248/519 MiB/s 的**过期假低值**（主控已核 mtime：p1=10-30，bento-wsl=11-03），必须按当前源码重编。
+
+### M12 hash 吞吐
+
+- **历史值**：SHA-256 2.0–2.4 GB/s（SHA-NI）、CRC-32/IEEE 18.38 GB/s（asm-reuse-hash / go-stdlib-gaps）
+- **测量命令**：`.build-bento-wsl/go2cpp_hash_test`（3 次取中位；测试二进制 11-01、动态链接 11-03 重编的 `libgo2cpp_hash.so`）
+- **环境**：12 vCPU / 单线程 / 1 GiB 输入
+- **日期**：2026-11-03
+- **脚本路径**：`tests/（hash 测试）`（`go2cpp_hash_test`）
+- **状态**：`实测` —— SHA-256 **2002.60 MiB/s**（2099.88 MB/s，SHA-NI）、crc32 **18731.55 MiB/s**、adler32 4396.48 MiB/s、sha1 255.60、md5 889.79。
+- **备注**：数字来自测试程序输出，非文档；SHA-256 略低于历史 2.0–2.4 GB/s 区间上沿，属同量级。
+
+### M13 reflect 编解码 ns/op
+
+- **历史值**：二进制编码 51.4–55.9 ns、解码 51.5–54.5 ns（asm-reflect 紧凑格式）
+- **测量命令**：`/tmp/bench_reflect_stage`（按源码重编），3 轮中位
+- **环境**：12 vCPU / `taskset -c 2,3` / 单线程
+- **日期**：2026-11-03
+- **脚本路径**：`tests/bench/bench_reflect_stage.cpp`（手工编译）
+- **状态**：`实测` —— 二进制编码 **52.64 ns/op**、解码 **54.89 ns/op**；描述格式 78.28 ns/op；文本编码 81.31 / 解码 145.93 ns/op。
+- **备注**：与历史紧凑格式区间一致。
 
 ## 历史值汇总（只作对照，不得引用为结论）
 
@@ -179,12 +210,15 @@
 | M07 | LevelDB 1e7 Put / 1e8 RSS | 583k / 87 MiB | 待复跑 |
 | M08 | bufio 1 MiB 分块 | 1853.9 MiB/s | 实测 |
 | M09 | cache hotspot ARC/LRU | 0.7817 / 0.5580（历史）→ 0.7764 / 0.5594（本轮） | 实测 |
-| M10 | os 批量 writev/readv | 17.9× / 20.9× | 待复跑 |
+| M10 | os 批量 writev/readv | 写 17.96× / 读 14.68×（读未达历史 20.9×） | 实测 |
+| M11 | gzip 压缩/解压 | 612.2 / 3648.0 MiB/s（zlib 463.7/3138.3） | 实测 |
+| M12 | hash 吞吐 | SHA-256 2002.60 MiB/s、crc32 18731.55 MiB/s | 实测 |
+| M13 | reflect 编解码 | 编码 52.64 / 解码 54.89 ns/op | 实测 |
 
 ## 待办
 
 - ✅ A2 完成：`tools/verify_metrics.sh`（M01b/M02/M03），M01b 已拆为 a/b。
 - ✅ A3 完成：M04/M05/M06 已填实（M04 双口径、M05 120.8k、M06 1.074×）。
-- ⏳ A4：M07、M10 及其余模块（bento/link、TLS、gzip、reflect/hash）。
+- 🔄 A4：M07 LevelDB 复跑中（A4a）；M10/gzip/hash/reflect 已完成（A4b）。TLS 与 bento/link 待下一轮。
 - ⏳ A6：把 docs 里 411k、160ns 等改为指向本文件或标 STALE。
 - ⏳ A7 架构级：M01b-a 通用 Channel 无锁化（覆盖 Send/Recv/Select/Close，需完整验证窗口，单独立项）。

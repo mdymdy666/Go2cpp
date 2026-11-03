@@ -25,41 +25,36 @@
 
 | 任务 | 内容 | 状态 |
 |---|---|---|
-| A1 | `docs/metrics-ledger.md`：四要素格式 + 首批 10 条核心数字 | ✅ be73a4e |
-| A2 | `tools/verify_metrics.sh`：接 M01b/M02/M03 | ✅ 92dcb25 |
-| A3 | M04/M05/M06 复跑填实 | ✅ 本轮（M04 双口径 119/355.7、M05 120.8k、M06 1.074×） |
-| A4 | 复跑其余：M07 LevelDB、M10 os 批量、TLS、gzip、reflect/hash、bento/link | ⏳ 下一个 |
-| A5 | ledger 接成可校验：一条命令全量对照 + STALE 列表；CI/CMake 钩子警告 | ⏳ |
-| A6 | 清理漂移：411k、160ns 等改为指向 ledger 或标 STALE；grep 无孤立数字 | ⏳ |
-| A7 | 不达标模块优化 | 🔄 首项 M01b 完成判定+汇编级；**架构级（通用 Channel 无锁化）待立项** |
-| B1 | VPS `tunnel-server.service`（`--display-host 82.157.147.127`），enable + 重启验证 | ⏳ |
+| A1 | ledger 建档（12 条，四要素） | ✅ be73a4e |
+| A2 | `tools/verify_metrics.sh` 三基线 | ✅ 92dcb25 |
+| A3 | M04/M05/M06 复跑填实 | ✅ 55a3f0e |
+| A4a | M07 LevelDB 1e7 Put / 1e8 RSS | 🔄 子 agent `a535fda9` 在跑 |
+| A4b | M10 os 批量 + gzip + hash + reflect | ✅ 本轮（M10 写 17.96×/读 14.68×；gzip 612/3648；hash SHA-256 2002 MiB/s；reflect 52.64/54.89） |
+| A4c | TLS 握手/写路径 + bento/link 吞吐 | ⏳ 下一个 |
+| A5 | ledger 一条命令全量对照 + CI 钩子 | ⏳ |
+| A6 | 清理漂移（411k/160ns 等） | ⏳ |
+| A7 | 不达标模块优化 | 🔄 首项 M01b 完成；**通用 Channel 无锁化待立项** |
+| B1 | VPS `tunnel-server.service` | ⏳ |
 | B2 | 本机 `start-all.sh` + 健康检查 | ⏳ |
-| B3 | 外部探针：每 60s curl 公网 health | ⏳ |
-| B4 | 断线恢复验证；结论写 HANDOFF | ⏳ |
-| C1 | `/tmp/douyin` 骨架 + 6 服务端口 + 共享 IDL | ⏳ |
-| C2 | user 服务（SQLite） | ⏳ |
-| C3 | video 服务（LevelDB） | ⏳ |
-| C4 | feed 服务（聚合 user+video） | ⏳ |
-| C5 | interaction 服务（SQLite） | ⏳ |
-| C6 | live 服务（WebSocket 占位） | ⏳ |
-| C7 | search 服务（内存倒排） | ⏳ |
-| C8 | 网关（静态路由 + 聚合） | ⏳ |
-| C9 | 端到端验收：≥5 个真实场景 | ⏳ |
-| C10 | 压测 + 报告进 `docs/reports/` | ⏳ |
+| B3 | 外部探针（60s） | ⏳ |
+| B4 | 断线恢复验证 | ⏳ |
+| C1–C10 | 抖音 P0 | ⏳ |
 
 ## 下一个任务
 
-**A4** — 复跑其余模块并填实 ledger（每条四要素；跑不动写「无法复现 + 缺什么」，不许沿用旧数字）：
-- **A4a**：M07 LevelDB 1e7 Put ops/s + 1e8 RSS（`go2cpp_leveldb_kv_test`；1e8 若超时就只报 1e7 + 说明）；
-- **A4b**：M10 os 批量 writev/readv（`go2cpp_os_test` 的 `ScenarioVectoredIo`，需要自己计时）、TLS（`asm-tls` 的握手/写路径基准若已有工具则跑）、gzip（`bench_gzip_crc` 或 compress 测试）、reflect/hash（`bench_reflect_stage` / hash 测试）、bento/link（`tests/bento` 的吞吐基准或 `go2cpp_bento_*`）。
+**A4c** — TLS 与 bento/link：
+1. **TLS**：`docs/reports/asm-tls.md` 的握手/32KB 写/64B 小包三组数字，找现成基准（`tests/network/*tls*` 或 `bench`），按当前源码重编后复跑 3 轮中位；跑不动写「无法复现 + 缺什么」。
+2. **bento/link**：`tests/bento/` 是否有吞吐基准（Link loopback / PeerHub）；有就跑 3 轮，报 rps/字节吞吐与条件；没有就写「仅有功能测试，无吞吐基准，需新建」。
+3. 同时确认 A4a 的 LevelDB 结果（若已回）并填 ledger M07。
 
 ## 本轮记录
 
-- 13:20 启动；13:2x A1（be73a4e）；13:33 A2（92dcb25）；13:43 用户补充优化规则（456ec05）。
-- 13:50 **A7 首项 M01b**（310cf0ca）：口径判定 + 汇编级优化（TryRecv −18%/TrySend −17%），合并 3a7aa4f；ledger 拆 M01b-a（不达标 4.8×）/M01b-b（达标）。
-- 13:59 **A3 完成**（41fd2142）：
-  - 新增 `tests/concurrency/bench_scheduler_submit.cpp`（191 行，计时只包 `spawn()`，:150-163 已抽查）；
-  - M04：batch=1024 中位 **119.0 ns**（35 轮，p25 92.1/p75 133.6），batch=65536 中位 **355.7 ns**（p25 312.1/p75 402.7）——历史 326.7 落在积压口径，条件未记录，**不能断言同口径**；
-  - M05：pipeline=16 单连接 **120,755 rps**（6 轮中位，p50 7–8 µs、p99 15–16 µs、errors=0），pipeline=1 对照 9,122 rps；历史 72.9k 无法用旧二进制复验（旧 `libgo2cpp_bento_http.a` 缺 `HttpServer::Route`），重编后 +65.7%，已标注「库版本+负载差异，非同二进制对照」；
-  - M06：**1.074×**（7 轮中位，wrapper 368.1 ms vs native 344.9 ms），历史 1.078 复现（−0.4%），达标；
-  - 主控抽查：bench 文件 191 行、计时区 :156-163 确实只包 spawn、`git status` 仅新增该文件 + 9 项历史完好、日志 `/tmp/m04_*.log`/`m06_rounds.txt` 存在、`HttpServer::Route` 在源码 :259（旧库缺符号说法成立）。
+- 13:20 启动；13:2x A1（be73a4e）；13:33 A2（92dcb25）；13:43 用户补充优化规则（456ec05）；13:50 A7 首项 M01b（3a7aa4f）；13:59 A3（55a3f0e）。
+- 14:10 **A4b 完成**（`a6dffee9`）：
+  - 新增 `tests/os/bench_vectored.cpp`（233 行，页缓存热/不 fsync/读前已写，3 次进程×3 轮）；
+  - M10：写 822.8→49.1 ns/条 = **17.96×**（复现历史 17.9）；读 496.0→32~33 ns/条 = **14.68×**（未达历史 20.9×，条件不可考，不据此判退化）；主控复跑 17.66×/15.24× 可复现；
+  - gzip：压缩 **612.2 MiB/s**、解压 **3648.0 MiB/s**（同轮 zlib 463.7/3138.3，压缩率不同不可只看吞吐）；交叉 bench 解压 5814.3；
+  - hash：SHA-256 **2002.60 MiB/s**（SHA-NI）、crc32 18731.55 MiB/s；
+  - reflect：二进制编码 **52.64 ns**、解码 **54.89 ns**；
+  - 主控审查：文件 233 行、计时逻辑公平（memset 预热、不 fsync）、复跑数字同量级、`git status` 仅新增该文件 + 9 历史完好、旧库假低值说法成立（mtime：p1=10-30 / bento-wsl=11-03）。
+  - ledger 新增 M11/M12/M13 并更新 M10。
