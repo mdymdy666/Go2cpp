@@ -155,6 +155,7 @@
 - **原始输出**：`8/8 Test #29: go2cpp_frame_test ................   Passed    0.00 sec`
 - **结论**：**通过**（实现与测试均存在；`Feed` 支持任意切分与粘包，`Encode` 越界返回
   `kPayloadTooLarge` 不截断）。JinShan 侧接管验收（`rd::net` 适配）见 §三。
+- **示例**：`collab/examples/frame_codec/`（main.cpp 89 行 + build_and_run.sh + README，主控实跑 rc=0，半包/粘包/坏 magic/坏 CRC/越界全 PASS）。
 
 ### REQ-002: RelayPipe（双向字节中继 + 背压 + 慢 peer）
 
@@ -163,6 +164,7 @@
 - **测试**：`tests/relay/test_relay_pipe.cpp`、`tests/relay/test_relay_scenarios.cpp`
 - **原始输出**：`#8 relay_pipe Passed 1.00 sec`、`#4 relay_scenarios Passed 1.11 sec`
 - **结论**：**通过**（场景覆盖慢 peer、写 deadline、并发多管道；有界队列背压）。
+- **示例**：`collab/examples/relay_pipe/`（main.cpp 124 行，双向 8 MiB、两端 SHA-256 一致、Stats 字节数正确，实跑 rc=0）。
 
 ### REQ-003: Hub（key → 多连接注册表）
 
@@ -172,6 +174,7 @@
 - **原始输出**：`#1 relay_hub ........................   Passed    0.12 sec`
 - **结论**：**通过**（并发安全、`CloseKey` 锁外关闭、重复 Unregister 幂等）。
   另有 `relay_hub_tsan` 目标，本次未跑（如需 TSan 证据，下次可补）。
+- **示例**：`collab/examples/hub/`（main.cpp 70 行，2 key × 2 连接、重复 Register/Unregister、CloseKey 幂等，实跑 rc=0）。
 
 ### REQ-005: Lease / Heartbeat
 
@@ -188,6 +191,7 @@
   #6 relay_lease_clockjump ..........   Passed    3.52 sec
   ```
 - **结论**：**通过**（含 90s 到期与系统时钟跳变两个长用例）。
+- **示例**：`collab/examples/lease/`（main.cpp 67 行，100 ms 到期恰好一次、Renew 延后、Stop 幂等，实跑 rc=0）。
 
 ### 本次验收总输出
 
@@ -200,5 +204,6 @@ relay_lease_clockjump / relay_pipe / go2cpp_frame_test；`relay_hub_tsan` 未跑
 
 ### 给 JinShan 的最小用法
 
-完整可编译示例见 `collab/examples/` 待补（当前仅 `cache-example.md`）；四条 API 的
-最小骨架已写入 JinShan 仓库 `docs/reports/go2cpp-delivery-2026-11-03.md`，可直接照抄。
+完整可编译示例已交付：`collab/examples/{frame_codec,relay_pipe,hub,lease}/`（各含
+`main.cpp` + `build_and_run.sh` + `README.md`，主控实跑 4/4 rc=0）；四条 API 的最小骨架
+同时见 JinShan 仓库 `docs/reports/go2cpp-delivery-2026-11-03.md`。
