@@ -111,3 +111,12 @@
 
 - 18:05 **C5+C6 完成**（344a41e8 产出 + 主控验证 → 8709fd1）：interaction（点赞幂等/评论/计数）+ search（空 q/非法 type 400、limit 夹紧）；accept 脚本 80 PASS / 0 FAIL。
 - 18:06 代码量统计：C++ 498,319 行 / 1,090 文件（include 103,899、src 153,800、tests 234,304、app 6,316）；已给用户审查策略（自动化门禁 + 接口/测试审查 + 高风险抽查 + 每轮 diff），待确认是否生成审查地图。
+
+## 抖音 demo 状态（2026-11-03 23:00，用户指示「先留着」）
+
+- **保留，不删除、不回滚**：`app/douyin/` 全部代码 + `web/videos/` 素材 + `data/douyin.db` 数据（1001 用户 / 1000+ 视频）；
+- 公网在线：`http://82.157.147.127:8443/douyin/`（隧道 subdomain=douyin → 本机 28080）；
+- 前端：上下滑 feed、视频播放（真实素材 demo1-5）、点赞/评论面板、用户主页、上传按钮；
+- 后端：6 服务 + gateway（69 PASS）、上传接口（raw mp4 ≤32MiB）、可靠性脚本（19 PASS）；
+- 启动/停止：`app/douyin/scripts/serve_public.sh` / `stop_public.sh`；
+- 后续改动需用户明确指令，**默认不再动**。
