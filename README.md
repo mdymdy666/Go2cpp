@@ -216,6 +216,49 @@ g++ -std=c++17 -O2 -Iinclude \
 完整可编译示例：`collab/examples/{frame_codec,relay_pipe,hub,lease}/`；
 协议注入验收记录见 [`docs/reports/rdnet-v3-review.md`](docs/reports/rdnet-v3-review.md)。
 
+#### 不可靠 UDP 与可靠 UDP：Go2Cpp 提供什么、你填什么
+
+同一个 `DatagramSocket` + `Protocol` 注入点，可以搭出两种形态：
+
+| 形态 | 你实现 | Go2Cpp 提供 |
+|---|---|---|
+| **不可靠 UDP**（DNS/发现/实时音视频） | 直接 `SendTo`/`RecvFrom`，自己处理丢包 | `DatagramSocket`（四态：`kTruncated`/`kWouldBlock`/`kReset`/`kClosed`）、`Endpoint` |
+| **可靠 UDP**（RDT/KCP/QUIC 风格） | 协议头、握手、ACK 位图、分片重组、重传策略、拥塞算法 | `Protocol` 注入点 + `EventLoop` 毫秒定时器 + 可靠性骨架（`SeqNum`/`RetransmitQueue`/`RttEstimator`/`CongestionController` 纯虚） |
+
+可靠 UDP 的骨架用法（Go2Cpp 只给容器与公式，**不替你决定重传/握手/位图语义**）：
+
+```cpp
+#include "go2cpp/rd_net/reliability.hpp"
+
+class RdtProtocol : public rd::net::Protocol {
+    rd::net::SeqNum<std::uint32_t> next_seq_{0};
+    rd::net::RetransmitQueue queue_;
+    rd::net::RttEstimator rtt_;                    // RFC 6298 公式
+
+public:
+    void OnDatagram(rd::net::ProtocolContext& ctx, rd::net::ByteView data,
+                    const rd::net::Endpoint& from) override {
+        // 1) 你解析 24 字节头 / ACK 位图 / 分片（Go2Cpp 不解析）
+        // 2) ACK 到达：queue_.Ack(token); rtt_.OnSample(rtt_ms);
+        // 3) 新数据：ctx.SendTo(wire, from); queue_.Push(token, wire, deadline);
+    }
+    void OnTimer(rd::net::ProtocolContext& ctx, std::uint64_t) override {
+        // 到期重传：auto due = queue_.PopDue(now()); 逐条 ctx.SendTo(...)
+        // RTO 用 rtt_.rto()，重传上限/退避策略由你决定
+    }
+};
+```
+
+要点：
+
+- `SeqNum<Seq>` 只做**回绕安全比较**，「序号是字节偏移还是报文号」由你定义；
+- `RetransmitQueue` 只**按 deadline 存取**，不决定重传几次、RTO 怎么算；
+- `RttEstimator` 只实现 RFC 6298 公式，采样时机由你决定；
+- `CongestionController` 是**纯虚**，AIMD/CUBIC 由你实现；
+- 边界：Go2Cpp 交付物里不出现 `ack_bits`/`frame_id`/`nonce` 等协议符号（G6 机器判据）。
+
+
+
 ### 3.3 最小 HTTP 服务
 
 ```cpp
