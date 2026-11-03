@@ -11,9 +11,9 @@
 | 4 | `user/docs/14-tunnel.md:298` | `go2cpp_tunnel_test --filter protocol` | 测试程序不读 argv，无 `--filter` | `tests/tunnel/test_tunnel.cpp` grep 无命中 | 已修（`a8eaced`） |
 | 5 | `docs/exam/14-tunnel.md` Q17 | 「回调里调 `Stop()` 会自 join 永久死锁」 | `client.cpp:83-98` 有 self-detach 分支；真实后果是 detached 线程 + 析构后可能 UAF | 已贴源码 | 已修（`a8eaced`） |
 | 6 | 出题简报 | tunnel metrics「7 个」 | 实际 **9 个**（server 6 + client 3） | `src/tunnel/server.cpp` BuildStatusJson | 已更正 |
-| 7 | `docs/exam/02-network.md` Q18 | 「HTTP/2 五个 .cpp 只在测试目标编译，导出库缺符号」 | **已进 `go2cpp_network`**；CMake 注释就写着「此前只在测试目标里编译」 | `cmake/Go2CppModules.cmake:217-224` | 本次修 |
-| 8 | `docs/exam/02-network.md` Q18 | 「视频每帧一次性大分配」 | 视频帧已改**按需增长**（注释明确）；仍预分配的是 `StreamReassembler`：`assembly.data.assign(frag_count*kStreamFragmentBytes, 0)` | `include/go2cpp/bento/net/channel.hpp:815-820`、`src/bento/net/channel.cpp:202` | 本次修 |
-| 9 | `docs/exam/02-network.md` Q16 / `docs/reports/asm-tls.md` | ChaCha20 `13.41×` | 那是**加 SIMD 前**的口径；`crypto.cpp` 367 行起已有 AVX2 8 路 / AVX-512 16 路后端，现状未实测 | `src/bento/net/crypto.cpp:366-382` | 本次修 |
+| 7 | `docs/exam/02-network.md` Q18（原题） | 「HTTP/2 五个 .cpp 只在测试目标编译，导出库缺符号」 | **已并入 `go2cpp_network`**；CMake 注释原文即「此前只在测试目标里编译」 | `cmake/Go2CppModules.cmake:217-224` | 已重写该题（改为考漂移教训） |
+| 8 | `user/docs/02-network.md`（bento 章节） | 「视频每帧一次性大分配」 | 视频帧已改**按需增长**（注释明确）；仍预分配的是 `StreamReassembler`：`assembly.data.assign(frag_count*kStreamFragmentBytes, 0)` | `include/go2cpp/bento/net/channel.hpp:815-820`、`src/bento/net/channel.cpp:202` | 已在 deep/03-bento 中点名 |
+| 9 | `docs/reports/asm-tls.md` | ChaCha20 `13.41×` | 那是**加 SIMD 前**的口径；`crypto.cpp` 367 行起已有 AVX2 8 路 / AVX-512 16 路后端，现状未实测 | `src/bento/net/crypto.cpp:366-382` | 已记录；asm-tls.md 待补现状 |
 
 ## 为什么这份清单重要
 

@@ -252,18 +252,24 @@
   4. TLS 只有客户端：没有 `SSL_accept` 路径、没有会话复用/0-RTT/ticket。
 - **常见错误答案**：「默认不校验，方便测试」「关掉只影响链，主机名还会校验」。
 
-### Q18 【L2 陷阱】HTTP/2 的源文件为什么不在 `go2cpp_network` 里？链接报 undefined symbol 怎么修？
+### Q18 【L4 陷阱】HTTP/2 核心实现曾经不在 `go2cpp_network` 里，加入时为什么是并库而不是新建目标？
 
-- **痛点**：以为「没链接库」是 CMake 写错，实际是根本没有 `go2cpp_http2` 库目标。
+- **痛点**：只看当前代码，不知道它曾缺库；也答不出「修好之后还剩什么隐患」。
 - **追查位置**：
-  - `user/docs/02-network.md:290`（`connection.cpp`/`frame.cpp`/`hpack.cpp`/`huffman.cpp`/`stream_state.cpp` 只在测试 target 中编译，没有 `go2cpp_http2` 库目标）
-  - `user/docs/02-network.md:331`（新目标用到 `http2::Connection` 时链接错误是「未定义符号」）
-- **验收标准**：
-  1. HTTP/2 核心五个 `.cpp` 只在测试 target 编译，生产目标要自己把它们加进去。
-  2. 报错形态就是「未定义符号」，不是找不到头文件；加 `-lgo2cpp_http2` 没用，因为没有这个库。
-  3. 文档还记录了 `hpack.cpp` 的 unused-function 告警阻塞零警告目标（`user/docs/02-network.md:340`），加进生产目标前要处理。
-  4. HTTP/2 服务端 + h2 over TLS 全链路未验证（缺 nginx/nghttpd 对端）。
-- **常见错误答案**：「加 `-lgo2cpp_http2` 就好」「undefined symbol 是 ABI 不兼容」。
+  - `cmake/Go2CppModules.cmake:217-224`（五个 `.cpp` 已并入 `go2cpp_network`，注释原文：
+    「HTTP/2 协议核心：此前只在测试目标里编译，导出库缺这些符号，生产使用需自行加源文件」）
+  - `docs/modules/http2.md` §6（当时记录的缺符号问题）
+  - `user/docs/02-network.md:290,331,340`（**已被本次修复作废，仅作历史记录**）
+- **验收标准**（答到这些算过）：
+  1. 说清「曾经缺库」的表现形态：**未定义符号**（不是找不到头文件），且加 `-lgo2cpp_http2` 无效——没有这个目标。
+  2. 说清修复方式：把 `huffman/hpack/frame/stream_state/connection` 五个 `.cpp` **并入 `go2cpp_network` 的源列表**，
+     而不是新建 `go2cpp_http2` 库——因为它与 `http2/tls_transport.cpp` 同属一个传输层，拆开会造成符号分散。
+  3. 指出加进去之后**仍未解决**的两件：`hpack.cpp` 的 unused-function 告警（阻塞零警告目标）；
+     HTTP/2 服务端与 h2-over-TLS 全链路缺对端（nginx/nghttpd）验证。
+  4. 能指出这条漂移的教训：文档记的是「修复前状态」，代码修好后文档没改 →
+     后来人会照着文档写出错误的构建命令、或误判「这个功能不可用」。
+- **常见错误答案**：「加 `-lgo2cpp_http2` 就好」「undefined symbol 是 ABI 不兼容」
+  —— 都是当年的答案，现在连这个库目标都不存在。
 
 ### Q19 【L2 概念】WebSocket 的析构会关闭 fd 吗？读写方向各能几个线程？
 
