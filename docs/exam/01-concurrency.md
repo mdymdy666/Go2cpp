@@ -189,7 +189,7 @@
 
 - **痛点**：把两个 claim 当冗余；或把「状态」和「唤醒令牌」拆成两个原子——这正是「Runnable 但无人调度」的来源。
 - **追查位置**：
-  - `src/concurrency/scheduler.cpp:1913-1919`（两个 claim 必须在同一临界区一起翻转，否则新执行者会在 `run()` 入口被静默拒绝，G 永久 `kRunning`）
+  - `src/concurrency/scheduler.cpp:1916-1919`（两个 claim 必须在同一临界区一起翻转，否则新执行者会在 `run()` 入口被静默拒绝，G 永久 `kRunning`）
   - `src/concurrency/scheduler.cpp:1712-1731`（`run_claim` 失败时把 G 回滚为 Runnable 并 `deferred_enqueue`）
   - `src/concurrency/scheduler.cpp:1489-1513`（`claim_from_queue`：一次 CAS 完成 Runnable→Running 与执行权仲裁）
   - `src/concurrency/scheduler.cpp:1424-1468`（park：要求整个字「Running 且无令牌」才 CAS 成 Waiting）

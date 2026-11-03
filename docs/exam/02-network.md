@@ -144,7 +144,7 @@
 - **痛点**：压测脚本跑到第 101 个请求连接被关，误判为连接泄漏或 keep-alive 坏了。
 - **追查位置**：
   - `src/network/http.cpp:1419`（`max_requests` 是本连接最多服务的请求数，防单连接饿死其它连接）
-  - `src/network/http.cpp:1462`（主循环上限 `max_requests`）
+  - `src/network/http.cpp:1465`（主循环上限 `max_requests`）
 - **验收标准**：
   1. 这是**公平性保护**：没有它，一个 keep-alive 连接可以长期占用 worker，其它连接排不上。
   2. 默认 100；超过后服务端主动断开，客户端应重连（或把压测改成多连接）。

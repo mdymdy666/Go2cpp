@@ -1,0 +1,327 @@
+# 缓存模块 · 深入学习
+
+> 面向「要接手改 `include/go2cpp/cache/**` 的人」。
+> 行号全部对 `include/go2cpp/cache/**` 与 `tests/cache/**` 复核过；性能只写「本机怎么测」，不写结论数字。
+
+---
+
+## 第一部分 · 总：这个模块怎么跑起来
+
+### 1.1 入口点清单
+
+| 入口（类/函数） | 文件:行 | 谁调用它 | 触发什么 | 返回什么 |
+|---|---|---|---|---|
+| `enum class Policy` | `include/go2cpp/cache/factory.hpp:35` | 配置/基准 | 选 7 种策略之一 | 枚举值 |
+| `MakeCache<K,V>(policy, options)` | `include/go2cpp/cache/factory.hpp:72` | 业务、基准、`ShardedCache` | `new` 具体策略对象 | `unique_ptr<Cache<K,V>>` |
+| `MakeThreadSafeCache<K,V,Lock>` | `include/go2cpp/cache/factory.hpp:100` | 多线程业务 | 策略外套 `ThreadSafeCache` | `unique_ptr<Cache>` |
+| `ShardedCache(policy, options, shards)` | `include/go2cpp/cache/factory.hpp:117` | 多核高吞吐场景 | 按 key 哈希切分 N 个独立缓存 | 分片缓存对象 |
+| `Cache::Get/Peek/Put/Erase/Clear` | `include/go2cpp/cache/cache.hpp:149`（接口从 149 行起） | 所有上层 | 改变/查询策略状态 | `bool`/`void` |
+| `ThreadSafeCache` | `include/go2cpp/cache/cache.hpp:209` | 多线程 | 每个方法一把粗粒度锁 | 转发 inner 的结果 |
+| `LruCache::Get/Put` | `include/go2cpp/cache/lru.hpp:64` / `:89` | `MakeCache` | 命中移到 MRU；满时淘汰尾 | 命中 bool |
+| `LruKCache::Get/Put` | `include/go2cpp/cache/lru_k.hpp:90` / `:128` | 抗扫描场景 | 第一次进 corral，第二次进主表 | 命中 bool |
+| `TwoQueueCache::Get/Put` | `include/go2cpp/cache/two_queue.hpp:96`（ghost 分支）/ `:128` | 抗一次性流量 | A1in→A1out→Am | 命中 bool |
+| `TinyLfuCache::Get/Put` | `include/go2cpp/cache/tiny_lfu.hpp:94` / `:135` | 通用高命中 | 窗口 + SLRU + 频率准入 | 命中 bool |
+| `GdsfCache::Get/Put` | `include/go2cpp/cache/gdsf.hpp:68` / `:103` | 大小差异大的对象 | `H=L+cost/size*freq` 加权淘汰 | 命中 bool |
+| `ArcCache::Get/Put` | `include/go2cpp/cache/arc.hpp:100`（ghost）/ `:136` | 读写混合、要自适应 | 用 B1/B2 调 `p` | 命中 bool |
+| `ClockCache::Get/Put` | `include/go2cpp/cache/clock.hpp:74` / `:100` | 条目小、QPS 极高 | referenced 位二次机会 | 命中 bool |
+| `detail::BucketMap` | `include/go2cpp/cache/detail/bucket_map.hpp:63` | 所有策略做 key→节点索引 | 链式哈希桶 | 节点指针 |
+| `detail::IntrusiveList` | `include/go2cpp/cache/detail/intrusive.hpp:69` | 各策略的 LRU/FIFO 链 | 只改指针，不分配 | — |
+| `detail::NodePool` | `include/go2cpp/cache/detail/intrusive.hpp:242` | 所有策略的节点来源 | 块分配 + free list 复用 | `T*` |
+| `detail::TimestampWheel` | `include/go2cpp/cache/detail/time_wheel.hpp:63` | 仅 LRU-K | 按 reference_time 找最老条目 | `Entry*` |
+| `detail::CountMinSketch4` | `include/go2cpp/cache/detail/sketch.hpp:41` | 仅 TinyLFU | 4 行 4-bit 频率素描 | 估计值 |
+| `detail::BloomDoorkeeper` | `include/go2cpp/cache/detail/sketch.hpp:143` | 仅 TinyLFU | 一次性 key 不污染素描 | 是否第一次 |
+
+> 编译开关：本模块 header-only，无独立 `.cpp`/无 `GO2CPP_WITH_*`。测试目标由 `cmake/Go2CppCache.cmake` 注册（`go2cpp_cache_test` / `go2cpp_cache_bench`）。
+
+### 1.2 总架构图
+
+```
+调用方（业务 / 基准 / MemCache）
+        │  Cache<K,V> 接口（cache.hpp:149）
+        ▼
+┌──────────────────────────────────────────────┐
+│ 装饰层（可选，二选一或叠加）                  │
+│  ThreadSafeCache（cache.hpp:209，单锁）       │
+│  ShardedCache（factory.hpp:117，N 片各自锁）  │
+└──────────────────────┬───────────────────────┘
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 策略核心（无锁，单线程语义）                                  │
+│  LRU / LRU-K / 2Q / TinyLFU / GDSF / ARC / CLOCK             │
+│  ┌───────────────┐   ┌─────────────────────────────────┐    │
+│  │ 条目索引       │   │ 策略元数据                       │    │
+│  │ BucketMap     │   │ LRU-K: TimestampWheel            │    │
+│  │ (bucket_map)  │   │ TinyLFU: Sketch + Doorkeeper     │    │
+│  └───────┬───────┘   │ GDSF: priority_queue + version   │    │
+│          │           │ ARC: p + T1/T2/B1/B2            │    │
+│          ▼           └─────────────────────────────────┘    │
+│  IntrusiveList（LRU/FIFO/ghost 链，只改 prev/next）           │
+│  NodePool（64/块，稳态 Create/Destroy 命中 free list，0 malloc）│
+└─────────────────────────────────────────────────────────────┘
+        │ 不调用任何 syscall；不持有文件/网络 fd
+        ▼
+   纯用户态内存结构（无 I/O、无 Fiber、无锁；锁只在上面的装饰层）
+```
+
+线程边界：策略核心**不是**线程安全的（`cache.hpp:23`）；`ThreadSafeCache` 一次只允许一个读者/写者（`cache.hpp:25`）；`ShardedCache` 按 key 分片，跨片无全局顺序。
+
+### 1.3 复杂场景详解
+
+#### 场景 A：LRU 一次 `Get` 命中（12 步）
+
+1. 业务调用 `Cache::Get`（虚接口，`cache.hpp:158`）→ 实际进入 `LruCache::Get`（`lru.hpp:64`）。
+2. `LruCache::Get` 先 `index_.Find(key)`（`lru.hpp:65` 附近）→ `BucketMap::Find`（`bucket_map.hpp:87`）算 `HashKey`，再 `FindHashed` 沿桶链比较 key（`bucket_map.hpp:92`）。
+3. 未命中：`stats_.RecordMiss()`，返回 false；不改任何链表。
+4. 命中：拿到 `Entry*`，先判断 value 指针是否为空（允许只查存在性）。
+5. 命中统计：`stats_.RecordHit()`。
+6. 把条目移到链表头：`lru_.move_to_front(entry)`（`lru.hpp:75` 附近 → `intrusive.hpp:140`）。
+7. `move_to_front` 先 `erase(node)`（`intrusive.hpp:133`，只改 4 个指针），再 `push_front`（`intrusive.hpp:87`）；节点不重新分配。
+8. 写回 `*value = entry->value`（拷贝；`V` 大时这是主要成本）。
+9. 返回 true。
+10. 若上层是 `ThreadSafeCache::Get`（`cache.hpp:224`），整段在 `lock_guard<Lock>` 内；锁在函数返回时释放。
+11. 若上层是 `ShardedCache::Get`（`factory.hpp:151`），先 `ShardIndex(key)`（`factory.hpp:240`）选片，再拿该片自己的 mutex。
+12. 失败/阻塞路径：本模块不阻塞、不抛异常（除构造时参数非法）；`Get` 只有 true/false。
+
+#### 场景 B：TinyLFU 一次 `Put` 触发准入/淘汰（14 步）
+
+1. 调用 `TinyLfuCache::Put`（`tiny_lfu.hpp:135`），传入 key/value/weight。
+2. 先查 `index_`：key 已存在 → 更新 value、`stats_.RecordUpdate()`，若是窗口条目则移到 window 头，返回。
+3. 新 key：计算 64 位混合哈希，作为 `sketch_hash` 存进 `Entry`。
+4. 记录频率：`RecordFrequency`（`tiny_lfu.hpp:306` 附近）先 `doorkeeper_.TestAndSet(hash)`（`sketch.hpp:153`）——第一次出现只置 Bloom 位，不写素描。
+5. 第二次出现才 `sketch_.Increment(hash)`（`sketch.hpp:57`，4 路饱和到 15）。
+6. 每累计 `sample_size_` 次记录，`sketch_.Halve()`（`sketch.hpp:100`）：所有 4-bit 计数器右移一位，历史频率指数衰减。
+7. 新条目先 `window_.push_front(fresh)`（`tiny_lfu.hpp:172`），window 容量是总容量的 1%（`WindowCapacity`，构造在 `tiny_lfu.hpp:67`）。
+8. 若 `window_.size() > window_capacity_`（`tiny_lfu.hpp:325`）：取 window 尾部作为 candidate，`window_.erase(candidate)`。
+9. 若主缓存容量为 0（`main_capacity_ == 0`，`tiny_lfu.hpp:157`），candidate 直接丢弃并 `RecordEviction`。
+10. 否则进入 `AdmitToMain(candidate,false)`（`tiny_lfu.hpp:350`）：若主缓存未满，candidate 进 probation；满则取 probation 尾部 victim。
+11. 频率比较：`Estimate(candidate) > Estimate(victim)` 才允许替换；否则 `RecordRejection` 后丢弃 candidate（数据没进缓存）。
+12. 允许替换：`EvictProbationTail()`（`tiny_lfu.hpp:414`）→ 摘索引、`pool_.Destroy(entry)`、`RecordEviction()`。
+13. candidate 进 probation 头；`stats_.RecordInsert()`。
+14. 失败路径：`Put` 返回 void——被拒绝时调用方**不会**收到错误，只能看 `Stats().rejections`；`weight` 超过 `max_weight` 时同样静默拒绝。
+
+#### 场景 C：LRU-K 第二次访问晋升主表（12 步）
+
+1. 首次 `Put`：新条目进 corral FIFO（`lru_k.hpp:128` 起），`in_main=false`。
+2. corral 容量 `history_limit_ = max(4, capacity)`（`lru_k.hpp:74` 注释解释了为什么和主表同容量）。
+3. corral 满：`pop_front` 最老条目，`pool_.Destroy`，`RecordEviction`。
+4. 第一次 `Get`：命中 corral 条目（`lru_k.hpp:90`），`last_visit` 更新，但**不**晋升。
+5. 第二次 `Get`：`PromoteToMain`（`lru_k.hpp:242`）把它从 corral 摘出。
+6. 晋升时用 `reference_time = last_visit`（倒数第二次访问时间，`lru_k.hpp:237`），插入 `TimestampWheel`（`time_wheel.hpp:87`）。
+7. 主表满：从时间轮 `Min()`（`time_wheel.hpp:84`）取 reference_time 最小的条目淘汰。
+8. `Min()` 读锦标赛树根；树是 256 叶对应 256 桶，桶内 min 是链表的绝对最小。
+9. 淘汰时 `Erase(entry)`（`time_wheel.hpp:110`）从桶链摘除并刷新桶 min + 自底向上刷 8 层树。
+10. 桶号 = `(reference_time >> 8) & 255`；跨 65536 tick 的条目会落回同一桶，靠桶内绝对时间戳比较避免误判（`time_wheel.hpp:63` 注释）。
+11. 命中主表：`move_to_front` 不适用（主表按 reference_time 排序），要 `Erase` 旧时间、改 `reference_time`、再 `Insert` 新时间。
+12. 失败路径：容量 0 构造抛异常；`Erase`/`Clear` 必须遍历 `index_.ForEach` 逐个 `pool_.Destroy`（`lru_k.hpp:81` 析构即此逻辑），否则非平凡 `V` 泄漏。
+
+### 1.4 关键不变量（破一条就出 bug）
+
+| # | 不变量 | 位置 | 破了会怎样 |
+|---|---|---|---|
+| 1 | `index_.size()` 等于条目数，每个 key 只出现一次 | `bucket_map.hpp:75` `size_` | 双插入导致链表断裂/重复淘汰 |
+| 2 | 每个 `Entry` 同一时刻只属于一条侵入式链（lru/window/probation/T1/T2/corral） | `intrusive.hpp:69` | prev/next 被覆盖，链成环或丢节点 |
+| 3 | NodePool 的 `Create` 与 `Destroy` 必须配对；`Clear` 前先逐个 Destroy | `intrusive.hpp:263` / `:276` / `:282` | 非平凡 `V` 不析构（泄漏）；池内 double-free |
+| 4 | GDSF 的 `version_` 单调递增，命中必须重写 `entry.version` | `gdsf.hpp:84` | 旧堆节点被当成当前值，热条目被自己淘汰 |
+| 5 | 2Q 的 pending 只是「下次 Put 进 Am 的凭证」，不等于数据在缓存 | `two_queue.hpp:141` | 把 ghost 命中当命中，返回未加载的数据 |
+| 6 | ARC 的 `p_ ∈ [0, capacity]`，B1 增 / B2 减 | `arc.hpp:112` | 方向调反，缓存偏向错误的工作集 |
+| 7 | TinyLFU 的 `window + main` 总量受 `capacity_` 约束 | `tiny_lfu.hpp:439` | 段间搬家导致超容量 |
+| 8 | 裸策略类不可并发调用；并发必须走装饰层 | `cache.hpp:23` | 链表/索引损坏、统计丢更新 |
+| 9 | `ShardedCache` 的 `Capacity()` 是各片实际容量之和 | `factory.hpp:190` | 调用方以为总容量等于配置值 |
+| 10 | `Stats()` 是累计值，`Clear()` 不清统计 | `cache.hpp:78` | 基准分段统计出错 |
+
+---
+
+## 第二部分 · 分：逐块细讲
+
+### 2.1 接口与装饰器（`cache.hpp`）
+
+**职责**：定义 `Cache<K,V>` 的十个纯虚函数，提供 `StatsRecorder` 与 `ThreadSafeCache`。
+
+**关键结构**：
+- `CacheStats`（`cache.hpp:58` 起）：`hits/misses/inserts/updates/evictions/ghost_hits/rejections/removals` + 水位 `size/capacity/weight/max_weight/ghost_size`。
+- `StatsRecorder`（`cache.hpp:104`）：8 个 `uint64_t` 计数器，`Snapshot()` 只拷贝计数，水位由各策略补。
+- `ThreadSafeCache`（`cache.hpp:209`）：`mutable Lock mutex_` + `unique_ptr<Cache> inner_`；`Capacity()`/`Name()` 不加锁（不读可变状态），其余都加。
+
+**状态机**：无。**失败路径**：构造时 `inner_` 为空抛 `invalid_argument`；运行时不抛。
+
+**典型误用**：把 `ThreadSafeCache` 当读多写少优化——它连 `Peek/Get` 都拿同一把互斥锁，多核下是串行点；要高吞吐应用 `ShardedCache`（代价见 2.10）。
+
+### 2.2 LRU（`lru.hpp`）
+
+**职责**：基线策略，按最近访问时间淘汰；所有其它策略的对照。
+
+**关键字段**（`lru.hpp:177`）：
+```cpp
+detail::IntrusiveList<Entry> lru_;   // head=MRU, tail=LRU
+detail::BucketMap<K, Entry, Hash, Equal> index_;
+detail::NodePool<Entry> pool_;
+```
+**关键函数**：`Get`（`:64`）Find→RecordHit→move_to_front→拷 value；`Put`（`:89`）已存在则更新+移到头，新条目满时先 `pop_front` 尾再 `Destroy`；`Erase`（`:110`）从两条结构摘除后 `Destroy`；`Clear`（`:123`）遍历销毁。
+
+**失败路径**：容量 0 构造抛异常（各策略一致）。**已知限制**：对顺序扫描零抵抗——一次全表扫描把所有热点挤出（考试 Q05 的对照基线）。
+
+**典型误用**：用 `Get` 做「只查询」——它会改 LRU 顺序；只想看用 `Peek`。
+
+### 2.3 容器层（`detail/bucket_map.hpp`、`detail/intrusive.hpp`）
+
+**BucketMap**：链式哈希（不是开放寻址，尽管某些注释这样写），`Find`（`:87`）/`Insert`（`:103`）/`Erase`（`:119`）/`Clear`（`:134`）。桶数按 `expected*2` 向上取 2 的幂（`:152`），`mask_` 做取模。节点由策略的 NodePool 提供，`Insert` 只挂链。
+**IntrusiveList**：head/tail/count；`push_front`（`:87`）、`pop_front`（`:115`）、`erase`（`:133`）、`move_to_front`（`:140`）都只改指针；跨链搬家用 `move_to_front(src,node)`（`:158`）。
+**NodePool**：`kBlockSize=64`（`:241`），`Create`（`:263`）先 free list 再块内 bump，`Destroy`（`:276`）只 `push_back` 到 free list、**不析构内存**（调用方负责 `T` 析构？实际 `Destroy` 会显式调用析构——见实现），`Clear`（`:282`）释放所有块。
+
+**不变量**：节点只能属于一条链；`Destroy` 后不能再访问；池不缩容（RSS 不降）。
+**典型误用**：`Clear()` 直接 `pool_.Clear()` 而不逐个 `Destroy`——非平凡 `V` 不析构。
+
+### 2.4 LRU-K 与 TimestampWheel（`lru_k.hpp`、`detail/time_wheel.hpp`）
+
+**职责**：K=2，用「倒数第二次访问时间」排序，抗扫描。
+**结构**：corral FIFO（容量 `max(4,capacity)`）+ 主表（`TimestampWheel` + `BucketMap` 合并索引，`in_main` 标记）+ 节点池。
+**状态机**：
+
+| 当前 | 事件 | 下一步 |
+|---|---|---|
+| 不在缓存 | Put | corral 尾 |
+| corral | 第 1 次 Get | 仍 corral（更新 last_visit） |
+| corral | 第 2 次 Get | 晋升主表，reference_time=last_visit |
+| 主表 | Get | 重插时间轮（新 reference_time） |
+| 主表 | 容量满 | 淘汰时间轮 Min |
+
+**时间轮**：256 桶（`time_wheel.hpp:63`）、桶内链 + 256 叶锦标赛树；`Min()` O(1)（`:84`）；跨圈靠绝对时间戳比较，不靠桶号。
+**失败路径**：容量 0 抛异常；corral 溢出丢最老（不是错误）。
+**典型误用**：对冷数据主动 `Put`——重复写也会晋升，LRU-K 的扫描抗性只对「读未命中+按需加载」有效。
+
+### 2.5 2Q（`two_queue.hpp`）
+
+**职责**：A1in（FIFO 准入）/ A1out（ghost，只存 key）/ Am（LRU 主缓存）。
+**关键行**：Get 先查 Am/A1in（`:90` 附近），再查 ghost（`:96`）；ghost 命中写 pending（`:107`）后返回 false（`:110`）；Put 先 `TakePending`（`:141`）决定进 Am 还是 A1in。
+**状态机**：新 key→A1in；A1in 满→最老进 A1out（ghost）；Get 命中 ghost→pending；下一次 Put→Am；Am 满→LRU 淘汰。
+**失败路径**：ghost 容量 `capacity/2+1`（构造 `:59`），pending 容量同 ghost；满了丢最老（`:103`）。
+**典型误用**：认为 ghost 命中会返回数据；认为 Get 会自动加载。
+
+### 2.6 TinyLFU（`tiny_lfu.hpp` + `detail/sketch.hpp`）
+
+**职责**：窗口 LRU（1%）+ SLRU（probation 20% / protected 80%）+ 频率准入。
+**关键行**：构造算四段容量（`:67`-`:70`）；Get 命中窗口/probation 提升 protected（`:107` 起）；Put 先落窗口（`:172`），窗口满取 candidate（`:325`），`AdmitToMain`（`:350`）比较频率；`EvictProbationTail`（`:414`）/`EvictWindowTail`（`:426`）。
+**Sketch**：`CountMinSketch4`（`sketch.hpp:41`）4 行 4-bit、饱和 15；`Increment`（`:57`）/`Halve`（`:100`）/`Estimate`；`BloomDoorkeeper`（`:143`）第一次只置 Bloom。
+**失败路径**：`Put` 无返回值，准入失败只记 `rejections`；`main_capacity_==0` 时窗口条目直接丢。
+**典型误用**：容量很小时期待 TinyLFU 有效——窗口/probation 都被压到 1 条，退化明显。
+
+### 2.7 GDSF（`gdsf.hpp`）
+
+**职责**：按 `H = L + cost/size * freq` 淘汰，适合对象大小差异大。
+**字段**：`index_`（unordered_map，权威）+ `heap_`（priority_queue 候选）+ `l_`（年龄水位）+ `version_`。
+**关键函数**：Get（`:68`）freq++/重算 key_value/version++/push；Put（`:103`）更新时先摘旧再 `MakeRoomForInsert`（`:250`）；EvictOne（`:262` 起）懒惰删除，version 不匹配就 `continue`（`:264`）；`MaybeCompact`（`:276`）堆超过 `size*4+64` 重建。
+**失败路径**：`weight==0` 按 1；`weight>max_weight` 直接拒绝；`capacity==0 && max_weight==0` 构造抛异常。
+**典型误用**：以为堆里每 key 一条；忘记命中要 push 新版本。
+
+### 2.8 ARC（`arc.hpp`）
+
+**职责**：T1/T2 常驻 + B1/B2 ghost，用 ghost 命中调 `p`。
+**关键行**：Get ghost 分支（`:100`）；B2 命中 p 减（`:104`-`:107`）；B1 命中 p 增（`:109`-`:112`）；Put ghost 分支（`:159`）`EvictForInsert` + `PushT2`。
+**状态机**：新 key→T1；T1 满→尾进 B1；Get 命中 T1→T2；T2 满→尾进 B2；ghost 命中→pending，下次 Put 进 T2。
+**失败路径**：`capacity==0` 抛异常；ghost 表容量 = capacity，`Erase` 会删 ghost + pending。
+**典型误用**：p 方向调反；以为 ghost 命中返回数据。
+
+### 2.9 CLOCK（`clock.hpp`）
+
+**职责**：环 + referenced 位，低开销近似 LRU。
+**字段**：`slots_`（vector<Slot>，`Slot` 含 optional<V>/IndexNode*/referenced/weight，`:202`）、`free_slots_`、`hand_`、`index_`、`pool_`。
+**关键函数**：Get（`:74`）命中置 `referenced=true`（`:81`）；Put（`:100`）先找空槽，否则 `FindVictim`（`:213`）扫描；`FindVictim` 遇 1 清 0 跳过（`:221`）、遇 0/空槽选中；`Erase`（`:137`）归还槽位。
+**失败路径**：容量 0 抛异常；全 1 时最多扫 2×capacity。
+**已知限制**：扫描污染后恢复能力差（考试 Q05）。
+**典型误用**：当严格 LRU 用；期待扫描后自动恢复。
+
+### 2.10 ShardedCache（`factory.hpp`）
+
+**职责**：按 key 哈希分片，每片独立锁。**容量切分**：`base/extra`（`:123`），空片提到 1（`:128`），`capacity_` 累加实际值（`:143`）。**语义损失**：全局 LRU/ARC 顺序、TinyLFU 频率素描都不再跨片。
+**失败路径**：`shards=0` 被 `max(1,shards)` 兜底（`:120`）；单片容量 0 被提到 1。
+**典型误用**：`capacity < shards` 时以为总容量不变；用分片跑需要全局频率的负载。
+
+### 2.11 基准与负载（`tests/cache`）
+
+- `cache_test`：单元（每策略一个 TU）+ 随机 + 5 场景 + 压测；`Announce` 打印场景名。
+- `cache_bench`：`--quick`（ctest 默认）/`--full`/`--ops=/--capacity=`；输出命中率、recovery、Mops/s、peak_bytes。
+- 本机怎么测（不写结论）：
+  ```bash
+  cd .build-bento-wsl
+  ./go2cpp_cache_test
+  ./go2cpp_cache_bench --quick
+  ```
+  记录 CPU 型号、是否绑核、轮数；换机器必须重测。
+
+### 2.12 统计口径：`hits/misses` 与 `ghost_hits/rejections` 不是一回事
+
+| 事件 | 计入 | 不计入 | 代码位置 |
+|---|---|---|---|
+| `Get` 命中真实条目 | `hits++` | — | 各策略 `RecordHit` |
+| `Get` 未命中（含 ghost 命中） | `misses++` | — | `two_queue.hpp:110`、`arc.hpp:117` |
+| 2Q/ARC ghost 命中 | 额外 `ghost_hits++` | 不增加 hits | `two_queue.hpp:109` |
+| TinyLFU 准入被拒 | `rejections++` | 不算 miss（Put 不计 Total） | `tiny_lfu.hpp:350` 起 |
+| GDSF `weight>max_weight` | `rejections++` | 不算 miss | `gdsf.hpp:107` |
+| `Peek` | 什么都不计 | hits/misses 都不加 | `cache.hpp:160` |
+| `Clear()` | 只清条目/权重 | **不清统计** | `cache.hpp:78` |
+
+推论：`HitRate()` 的分母是 `hits+misses`，不含 `rejections`；「Put 被拒绝」不会让命中率变难看，但会让调用方以为缓存成功。基准里要同时看 `rejections` 与 `size`，否则会把「没缓存」误读成「缓存了但没命中」。
+
+### 2.13 策略选择矩阵（按语义，不按性能数字）
+
+| 负载特征 | 首选 | 原因（来自实现语义） | 已知反例 |
+|---|---|---|---|
+| 均匀随机、无扫描 | LRU | 最简单、命中率基线 | 周期扫描会把热点挤光 |
+| 有周期性全表扫描 | LRU-K / 2Q / TinyLFU | 二次访问才晋升 / ghost 凭证 / 频率准入 | 冷数据被主动 Put 时仍会晋升 |
+| 对象大小差异 1:1000 | GDSF | `cost/size*freq` 按收益密度淘汰 | 大小相近时不如 LRU 简单 |
+| 读写混合、工作集漂移 | ARC | ghost 命中自动调 `p` | `p` 方向/容量极小时震荡 |
+| 小条目、极高 QPS、能接受近似 | CLOCK | 无链表、命中只写 1 bit | 扫描后恢复差 |
+| 多核吞吐优先 | ShardedCache | 每片独立锁 | 全局顺序/频率丢失、容量可能放大 |
+| 需要绝对线程安全且简单 | ThreadSafeCache | 一把锁，语义不变 | 读也串行，16 核上是瓶颈 |
+
+### 2.14 改这个模块前的检查清单
+
+1. 新增策略：先实现 `Cache<K,V>` 全部纯虚函数（`cache.hpp:149`），再在 `MakeCache`（`factory.hpp:72`）注册，最后补 `tests/cache/test_<policy>.cpp` 与 `Announce` 场景。
+2. 任何 `Entry` 只能挂一条链；跨链搬家必须用 `IntrusiveList::move_to_front/back`（`intrusive.hpp:158`），不能手动改 `prev/next`。
+3. 析构/Clear 必须先 `index_.ForEach` 逐个 `pool_.Destroy`，再 `pool_.Clear`（参考 `lru_k.hpp:81`）；否则非平凡 `V` 泄漏。
+4. 统计只在策略层记；装饰层不要重复计数（`ThreadSafeCache` 只转发）。
+5. 新策略若要 ghost/pending，容量必须从 `CacheOptions` 推导并写进 `Stats().ghost_size`。
+6. 任何「可能不插入」的 `Put` 语义必须记 `rejections`；不要改 `Put` 签名返回 bool（接口已固定）。
+7. 分片/线程安全改动只放装饰层，不改策略核心（策略核心保持无锁单线程语义）。
+8. 性能结论必须附命令与环境（见 2.11），文档里不写「比 X 快 N 倍」这种无出处的数字。
+
+### 2.15 场景 D：`ShardedCache` 一次并发 `Get`（12 步）
+
+1. 构造 `ShardedCache(policy, options, shards)`（`factory.hpp:117`），`shard_count_ = max(1, shards)`（`:120`）。
+2. 计算每片容量 `base = capacity/shard_count_`、`extra = capacity%shard_count_`（`:123`-`:124`）。
+3. 空片容量强制为 1（`:128`-`:129`），所以 `capacity < shards` 时总容量被放大。
+4. 每片 `MakeCache(policy, shard_options)`（`:142`），`capacity_ += cache->Capacity()`（`:143`）。
+5. 业务调用 `ShardedCache::Get`（`factory.hpp:151`）。
+6. `ShardIndex(key)`（`:240`）用 `std::hash<K>` 取模选片。
+7. `std::lock_guard<std::mutex>` 锁住该片（`:153`），不同 key 落在不同片时互不阻塞。
+8. 片内 `inner_->Get` 执行策略逻辑（LRU 移动、TinyLFU 频率等），统计也记在片内。
+9. 命中返回 true，解锁；片内 `StatsRecorder` 不共享，无需原子。
+10. `Stats()`（`:200` 起）逐片加锁、把各片统计相加；这不是原子快照。
+11. `Capacity()`（`:190`）直接返回成员，不加锁——容量构造后不变。
+12. 失败路径：`std::hash<K>` 抛异常会直接穿透（没有 catch）；`Get` 本身不抛。
+
+### 2.16 `Put` 失败矩阵（为什么「没报错」不等于「缓存成功」）
+
+| 策略 | 失败条件 | 结果 | 可观察量 | 行号 |
+|---|---|---|---|---|
+| 全部 | 容量已满且无法淘汰 | 条目未插入 | `size` 不增 | 各策略 |
+| TinyLFU | 候选频率 ≤ victim | 候选被丢弃 | `rejections++` | `tiny_lfu.hpp:350` |
+| GDSF | `weight > max_weight` | 直接拒绝 | `rejections++` | `gdsf.hpp:107` |
+| GDSF | 堆空且 `CanFit` 失败 | 拒绝 | `rejections++` | `gdsf.hpp:250` |
+| 2Q | ghost 命中的 key 没有后续 Put | 只在 pending，没有数据 | `ghost_hits++`、`misses++` | `two_queue.hpp:110` |
+| ARC | ghost 命中后没有 Put | 只在 pending | `ghost_hits++`、`misses++` | `arc.hpp:117` |
+| Sharded | 哈希到某片但该片满 | 该片自己淘汰 | 片内 `evictions` | `factory.hpp:163` |
+
+写业务代码时：需要「是否真的缓存了」的语义，必须在 `Put` 后 `Peek` 或看 `Stats().rejections`；接口不返回 bool 是有意为之（避免调用方为每次写分支）。
+
+### 2.17 建议阅读顺序
+
+1. `cache.hpp:149` 接口 → 2. `lru.hpp` + `detail/intrusive.hpp`（容器层）→ 3. `detail/bucket_map.hpp`；
+2. `lru_k.hpp` + `detail/time_wheel.hpp`（最复杂的索引）；
+3. `tiny_lfu.hpp` + `detail/sketch.hpp`（准入语义）；
+4. `two_queue.hpp` / `arc.hpp`（ghost/pending 状态机）；
+5. `gdsf.hpp`（惰性堆）；
+6. `factory.hpp`（分片与线程安全边界）；
+7. 最后跑 `tests/cache/test_scenarios.cpp`，把每个场景的 baseline/recovery 与代码对上。
+
+

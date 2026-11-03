@@ -103,7 +103,7 @@
 - **痛点**：以为抖动只是「加点随机」，不知道封顶处会堆积；或者把「不重试」当 bug。
 - **追查位置**：
   - `src/tunnel/client.cpp:170`（`MakeBackoff`：`reconnect_min_ms=500`、`reconnect_max_ms=15000`、`jitter=0.2`）
-  - `src/tunnel/client.cpp:369`（重连主循环用同一个 `Backoff` 取延迟）
+  - `src/tunnel/client.cpp:372`（重连主循环用同一个 `Backoff` 取延迟）
 - **验收标准**：
   1. 退避范围 0.5 s → 15 s，±20% 抖动（`docs/modules/tunnel.md:217`）。
   2. 抖动的目的：多客户端同时断线后不要同一刻一起重连（重连风暴）。

@@ -72,7 +72,7 @@
 - **追查位置**：
   - `include/go2cpp/cache/factory.hpp:120`（`ShardedCache` 构造：按 key 哈希分片）
   - `include/go2cpp/cache/factory.hpp:123`（`base = capacity / shards`、`extra = capacity % shards`）
-  - `include/go2cpp/cache/factory.hpp:128`（分片容量为 0 时强制提升到 1）
+  - `include/go2cpp/cache/factory.hpp:131`（分片容量为 0 时强制提升到 1）
   - `include/go2cpp/cache/factory.hpp:143`（`capacity_ += cache->Capacity()`：累加的是**每片实际容量**）
   - `include/go2cpp/cache/factory.hpp:190`（`Capacity()` 返回实际总容量，不是构造参数）
   - `include/go2cpp/cache/cache.hpp:21`（线程模型：裸策略不是线程安全的，`ThreadSafeCache` 是粗粒度锁，分片是另一种取舍）

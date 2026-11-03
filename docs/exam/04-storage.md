@@ -64,7 +64,7 @@
 - **追查位置**：
   - `src/storage/leveldb_kv.cpp:257`（`Iterator::~Iterator`：只有 `owner_->LoadDb() != nullptr` 才 `delete iter_`）
   - `src/storage/leveldb_kv.cpp:261`（注释写明「table cache / memtable 引用已随 DB 释放，delete 会 UAF」）
-  - `src/storage/leveldb_kv.cpp:509`（`DB::Close` 先 `delete db` 再 `filter_policy.reset()`、`cache.reset()`）
+  - `src/storage/leveldb_kv.cpp:512`（`DB::Close` 先 `delete db` 再 `filter_policy.reset()`、`cache.reset()`）
   - `include/go2cpp/storage/leveldb_kv.hpp:23`（原生约束：迭代器必须在 DB 关闭前销毁；`key()/value()` 只在下一次 Next/Seek 前有效）
   - `tests/storage/test_leveldb_kv.cpp:1088`（测试先 `iterator.reset()` 再 `db->Close()`，顺序不能反）
 - **验收标准**：

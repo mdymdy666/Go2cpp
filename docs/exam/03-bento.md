@@ -108,7 +108,7 @@
 - **追查位置**：
   - `src/bento/net/link.cpp:316`（`SO_REUSEPORT` 建多队列 socket）
   - `src/bento/net/link.cpp:667`（按 `rx_queues` 建队列）
-  - `src/bento/net/link.cpp:574`（`recvmmsg` 批量收包）
+  - `src/bento/net/link.cpp:577`（`recvmmsg` 批量收包）
 - **验收标准**：
   1. 多队列解决的是**收包 syscall 的核间扩展**：每队列一个 fd、内核按四元组哈希分流，配合 `recvmmsg` 一次收多包。
   2. 单 peer 时协议处理仍在 `RunOnce` 单线程：解帧/ACK/重组/回调都串行，收包 syscall 根本不是瓶颈 → **收益为零**（提交 `475cc15` 标题明确「单 peer 无收益已证」）。
