@@ -124,7 +124,9 @@ std::string ToJson(const Video& value) {
     return std::string("{\"id\":") + std::to_string(value.id) + "," + Key("user_id") +
            std::to_string(value.user_id) + "," + Key("title") + "\"" +
            EscapeJson(value.title) + "\"," + Key("url") + "\"" + EscapeJson(value.url) + "\"," +
-           Key("created_at") + std::to_string(value.created_at) + "}";
+           Key("like_count") + std::to_string(value.like_count) + "," + Key("comment_count") +
+           std::to_string(value.comment_count) + "," + Key("created_at") +
+           std::to_string(value.created_at) + "}";
 }
 
 std::string ToJson(const FeedItem& value) {
@@ -178,6 +180,8 @@ bool FromJson(const std::string& text, Video* out) {
     ReadInt(text, "user_id", &value.user_id);
     ReadString(text, "title", &value.title);
     ReadString(text, "url", &value.url);
+    ReadInt(text, "like_count", &value.like_count);
+    ReadInt(text, "comment_count", &value.comment_count);
     ReadInt(text, "created_at", &value.created_at);
     *out = std::move(value);
     return true;

@@ -110,6 +110,9 @@ bool HandleRegister(douyin::Store& store, const douyin::HttpRequest& request,
     const std::string salt = douyin::RandomSaltHex();
     const std::string hash = douyin::HashPassword(password, salt);
     douyin::StoredUser created;
+    // 写前清空 ORM 语句缓存：FindUserByEmail 提前结束会残留读游标，
+    // 多服务共享 WAL 库时会让本进程的写触发 SQLITE_BUSY_SNAPSHOT。
+    store.ResetStatements();
     const douyin::CreateUserResult result =
         store.CreateUser(name, email, hash, salt, &created, &error);
     if (result == douyin::CreateUserResult::kConflict) {
@@ -212,6 +215,9 @@ bool HandleFollow(douyin::Store& store, const douyin::HttpRequest& request,
     if (!found) {
         return Fail(response, 404, "用户不存在");
     }
+    // 写前清空 ORM 语句缓存：FindUserById 提前结束会残留读游标，
+    // 多服务共享 WAL 库时会让本进程的写触发 SQLITE_BUSY_SNAPSHOT。
+    store.ResetStatements();
     const bool ok = follow ? store.Follow(actor, target_id, &error)
                            : store.Unfollow(actor, target_id, &error);
     if (!ok) {
