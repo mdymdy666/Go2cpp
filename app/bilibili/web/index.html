@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>B 站弹幕 Web Demo · video_id=1</title>
+<style>
+  :root {
+    --bg: #0e1016;
+    --panel: #171a23;
+    --line: #272c3a;
+    --text: #e9ebf2;
+    --muted: #8d95a8;
+    --pink: #fb7299;
+    --ok: #5ee6a8;
+    --warn: #ffcc66;
+    --bad: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    min-height: 100vh;
+    padding: 24px 16px 56px;
+    color: var(--text);
+    background: radial-gradient(1100px 520px at 50% -12%, #1e2433 0%, var(--bg) 62%);
+    font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  h1 { margin: 0; font-size: 20px; letter-spacing: .4px; }
+  h1 b { color: var(--pink); }
+  .sub { color: var(--muted); font-size: 12px; }
+  .player {
+    position: relative;
+    aspect-ratio: 16 / 9;
+    background: #000;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 14px 44px rgba(0, 0, 0, .55);
+  }
+  video { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #stage {
+    position: absolute; inset: 0;
+    overflow: hidden;
+    pointer-events: none;
+    contain: layout paint;
+  }
+  .danmaku {
+    position: absolute; left: 0; top: 0;
+    white-space: nowrap;
+    font-weight: 700;
+    line-height: 1.2;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, .95), 0 0 6px rgba(0, 0, 0, .85);
+    will-change: transform;
+    user-select: none;
+  }
+  .toolbar {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    margin-top: 12px; padding: 10px 14px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+  }
+  .toolbar label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  .toolbar select {
+    padding: 4px 8px; border-radius: 7px;
+    color: var(--text); background: #10131b;
+    border: 1px solid var(--line);
+  }
+  input[type="checkbox"] { accent-color: var(--pink); width: 16px; height: 16px; }
+  .spacer { flex: 1 1 auto; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; color: var(--muted);
+    background: #10131b; border: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  .pill::before {
+    content: ""; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--warn);
+  }
+  #conn[data-state="open"] { color: var(--ok); }
+  #conn[data-state="open"]::before { background: var(--ok); }
+  #conn[data-state="closed"], #conn[data-state="error"] { color: var(--bad); }
+  #conn[data-state="closed"]::before, #conn[data-state="error"]::before { background: var(--bad); }
+  #online::before { background: #4cc2ff; }
+  .sender {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin-top: 12px; padding: 12px 14px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+  }
+  #text {
+    flex: 1 1 340px; min-width: 220px;
+    padding: 9px 12px;
+    color: var(--text); background: #10131b;
+    border: 1px solid var(--line); border-radius: 8px;
+    font-size: 14px; outline: none;
+  }
+  #text:focus { border-color: var(--pink); }
+  .swatches { display: flex; gap: 6px; }
+  .swatch {
+    width: 22px; height: 22px; padding: 0; border-radius: 50%;
+    background: var(--c); border: 2px solid transparent; cursor: pointer;
+  }
+  .swatch[aria-pressed="true"] { border-color: #fff; box-shadow: 0 0 0 2px rgba(251, 114, 153, .5); }
+  input[type="color"] {
+    width: 36px; height: 30px; padding: 2px;
+    background: #10131b; border: 1px solid var(--line); border-radius: 8px; cursor: pointer;
+  }
+  #send {
+    padding: 9px 22px; border: 0; border-radius: 8px;
+    color: #fff; background: var(--pink);
+    font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  #send:hover { filter: brightness(1.08); }
+  .meta {
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    margin-top: 10px; color: var(--muted); font-size: 12px;
+  }
+  #send-note[data-kind="bad"] { color: var(--bad); }
+  #send-note[data-kind="ok"] { color: var(--ok); }
+  footer { margin-top: 22px; color: var(--muted); font-size: 12px; line-height: 1.9; }
+  code { padding: 1px 5px; border-radius: 5px; background: #10131b; color: #b9c2d6; }
+  @media (max-width: 640px) {
+    .toolbar { gap: 10px; }
+    #text { flex-basis: 100%; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>B 站弹幕 <b>Web Demo</b></h1>
+    <span class="sub">video_id=1 · 40s 测试视频 · danmaku_service:29203</span>
+  </header>
+
+  <div class="player" id="player">
+    <video id="video" src="demo.mp4" controls autoplay muted loop playsinline preload="auto"></video>
+    <div id="stage" aria-hidden="true"></div>
+  </div>
+
+  <div class="toolbar">
+    <label><input type="checkbox" id="toggle-show" checked> 显示弹幕</label>
+    <label>大小
+      <select id="size">
+        <option value="small">小</option>
+        <option value="medium" selected>中</option>
+        <option value="large">大</option>
+      </select>
+    </label>
+    <label>速度
+      <select id="speed">
+        <option value="slow">慢</option>
+        <option value="medium" selected>中</option>
+        <option value="fast">快</option>
+      </select>
+    </label>
+    <span class="spacer"></span>
+    <span class="pill" id="conn" data-state="connecting">连接中…</span>
+    <span class="pill" id="online">在线 0</span>
+  </div>
+
+  <form class="sender" id="sender" autocomplete="off">
+    <input id="text" maxlength="100" placeholder="发条弹幕试试（Enter 发送，落在当前播放时间）">
+    <div class="swatches" id="swatches">
+      <button type="button" class="swatch" data-color="16777215" style="--c:#ffffff" aria-pressed="true" title="白"></button>
+      <button type="button" class="swatch" data-color="16432985" style="--c:#fb7299" aria-pressed="false" title="粉"></button>
+      <button type="button" class="swatch" data-color="5025279" style="--c:#4cc2ff" aria-pressed="false" title="蓝"></button>
+      <button type="button" class="swatch" data-color="16765952" style="--c:#ffcc00" aria-pressed="false" title="黄"></button>
+      <button type="button" class="swatch" data-color="6474073" style="--c:#62c554" aria-pressed="false" title="绿"></button>
+      <button type="button" class="swatch" data-color="15597568" style="--c:#ee00ff" aria-pressed="false" title="紫"></button>
+    </div>
+    <input type="color" id="color" value="#ffffff" title="自定义颜色">
+    <button type="submit" id="send">发送</button>
+  </form>
+
+  <div class="meta">
+    <span id="history-note">历史弹幕加载中…</span>
+    <span id="send-note"></span>
+  </div>
+
+  <footer>
+    两个浏览器窗口打开同一地址即可互看弹幕（A 发 B 收）。历史弹幕走 REST：
+    <code>GET /api/danmaku/1</code>；服务端未开 CORS 时自动降级为“仅实时弹幕”，不影响演示。
+  </footer>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---- 配置 ---------------------------------------------------------------
+  var VIDEO_ID = 1;
+  var SERVICE_PORT = 29203;
+  var SIZES = { small: 16, medium: 22, large: 30 };
+  var SPEEDS = { slow: 13, medium: 8, fast: 5 };   // 横穿屏幕耗时（秒）
+  var MAX_ITEMS = 5000;
+  var FIRE_BUDGET = 4;                            // 每帧最多上屏条数，防刷屏
+
+  // ---- DOM ----------------------------------------------------------------
+  var video = document.getElementById('video');
+  var stage = document.getElementById('stage');
+  var connEl = document.getElementById('conn');
+  var onlineEl = document.getElementById('online');
+  var showToggle = document.getElementById('toggle-show');
+  var sizeSel = document.getElementById('size');
+  var speedSel = document.getElementById('speed');
+  var textInput = document.getElementById('text');
+  var colorInput = document.getElementById('color');
+  var sendNote = document.getElementById('send-note');
+  var historyNote = document.getElementById('history-note');
+  var form = document.getElementById('sender');
+  var swatches = document.getElementById('swatches');
+
+  // ---- 状态 ---------------------------------------------------------------
+  var items = [];          // 全部弹幕 {id,text,time_ms,color}
+  var seen = new Set();    // 去重
+  var fired = new Set();   // 本轮循环已上屏
+  var pending = [];        // 等待 time_ms 到达
+  var active = [];         // 正在滚动 {el,x,w,lane}
+  var laneLast = [];       // 每条轨道最后一个弹幕
+  var lastTime = 0;        // 上一帧视频时间
+  var onlineCount = 0;
+  var ws = null;
+  var reconnectTimer = 0;
+  var reconnectDelay = 1000;
+
+  function apiOrigin() {
+    return location.protocol + '//' + location.hostname + ':' + SERVICE_PORT;
+  }
+
+  function setConn(state, text) {
+    connEl.dataset.state = state;
+    connEl.textContent = text;
+  }
+
+  function flash(msg, kind) {
+    sendNote.textContent = msg;
+    sendNote.dataset.kind = kind || '';
+    clearTimeout(flash.timer);
+    flash.timer = setTimeout(function () {
+      sendNote.textContent = '';
+      sendNote.dataset.kind = '';
+    }, 2600);
+  }
+
+  function colorToCss(n) {
+    var v = (Number(n) >>> 0) & 0xffffff;
+    return '#' + v.toString(16).padStart(6, '0');
+  }
+
+  // ---- 弹幕数据 -----------------------------------------------------------
+  function ingest(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var text = String(raw.text == null ? '' : raw.text);
+    if (!text) return null;
+    var id = Number(raw.id);
+    if (Number.isFinite(id) && id !== 0) {
+      if (seen.has(id)) return null;
+      seen.add(id);
+    } else {
+      id = 'x' + Math.random().toString(36).slice(2);
+    }
+    var color = Number(raw.color);
+    var d = {
+      id: id,
+      text: text.slice(0, 100),
+      time_ms: Math.max(0, Math.round(Number(raw.time_ms) || 0)),
+      color: Number.isFinite(color) ? ((color >>> 0) & 0xffffff) : 0xffffff
+    };
+    items.push(d);
+    pending.push(d);
+    if (items.length > MAX_ITEMS) items.splice(0, 1000);
+    return d;
+  }
+
+  // ---- 渲染 ---------------------------------------------------------------
+  function pickLane(count, stageW) {
+    for (var i = 0; i < count; i++) {
+      var last = laneLast[i];
+      if (!last || last.x + last.w < stageW - 16) return i;
+    }
+    var best = 0;
+    var minX = Infinity;
+    for (var j = 0; j < count; j++) {
+      var it = laneLast[j];
+      if (it && it.x < minX) { minX = it.x; best = j; }
+    }
+    return best;
+  }
+
+  function spawn(d) {
+    var stageW = stage.clientWidth;
+    var stageH = stage.clientHeight;
+    if (!stageW || !stageH) return false;
+
+    var fontSize = SIZES[sizeSel.value] || 22;
+    var el = document.createElement('div');
+    el.className = 'danmaku';
+    el.textContent = d.text;
+    el.style.fontSize = fontSize + 'px';
+    el.style.color = colorToCss(d.color);
+    stage.appendChild(el);
+
+    var laneH = Math.max(fontSize + 8, Math.round(stageH / 8));
+    var laneCount = Math.max(2, Math.floor(stageH / laneH));
+    var lane = pickLane(laneCount, stageW);
+    el.style.top = Math.round(lane * laneH + (laneH - fontSize * 1.2) / 2) + 'px';
+
+    var w = el.offsetWidth;
+    var startX = stageW + 4;
+    el.style.transform = 'translateX(' + startX + 'px)';
+
+    var item = { el: el, x: startX, w: w, lane: lane };
+    active.push(item);
+    laneLast[lane] = item;
+    return true;
+  }
+
+  function advance(dt) {
+    var dur = SPEEDS[speedSel.value] || 8;
+    var stageW = stage.clientWidth;
+    var keep = [];
+    for (var i = 0; i < active.length; i++) {
+      var it = active[i];
+      it.x -= ((stageW + it.w) / dur) * dt;
+      it.el.style.transform = 'translateX(' + it.x + 'px)';
+      if (it.x + it.w >= -10) {
+        keep.push(it);
+      } else {
+        it.el.remove();
+      }
+    }
+    active = keep;
+  }
+
+  function clearStage() {
+    for (var i = 0; i < active.length; i++) active[i].el.remove();
+    active = [];
+    laneLast = [];
+  }
+
+  function fireDue(nowMs) {
+    if (!pending.length) return;
+    var remain = [];
+    var budget = FIRE_BUDGET;
+    for (var i = 0; i < pending.length; i++) {
+      var d = pending[i];
+      if (fired.has(d.id)) continue;
+      if (d.time_ms > nowMs) { remain.push(d); continue; }
+      if (!showToggle.checked) { fired.add(d.id); continue; }
+      if (budget <= 0) { remain.push(d); continue; }
+      if (spawn(d)) { budget--; fired.add(d.id); }
+      else { remain.push(d); }
+    }
+    pending = remain;
+  }
+
+  // ---- 主循环：按 video.currentTime 驱动 -----------------------------------
+  function tick() {
+    var vt = video.currentTime || 0;
+    var jump = vt - lastTime;
+    if (jump < -0.5) {
+      // video 循环回放（loop），清空本轮已上屏状态
+      fired.clear();
+      clearStage();
+      pending = items.slice();
+    } else if (jump > 0.5) {
+      // 用户拖动进度条：跳过 1.2s 之前的弹幕，避免一次性刷屏
+      var cutoff = vt * 1000 - 1200;
+      for (var i = 0; i < pending.length; i++) {
+        if (pending[i].time_ms < cutoff) fired.add(pending[i].id);
+      }
+      pending = pending.filter(function (d) { return !fired.has(d.id); });
+    }
+    var dt = Math.min(0.2, Math.max(0, jump));
+    lastTime = vt;
+    if (!video.paused) advance(dt);
+    fireDue(vt * 1000);
+    requestAnimationFrame(tick);
+  }
+
+  // ---- WebSocket ----------------------------------------------------------
+  function connect() {
+    var scheme = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var url = scheme + location.hostname + ':' + SERVICE_PORT +
+              '/ws/danmaku?video_id=' + VIDEO_ID;
+    setConn('connecting', '连接中…');
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      setConn('error', '地址非法');
+      return;
+    }
+    ws.onopen = function () {
+      reconnectDelay = 1000;
+      setConn('open', '已连接');
+    };
+    ws.onmessage = function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'danmaku') {
+        var d = ingest(msg);
+        if (d) {
+          // time_ms 已过 → 下一帧立刻上屏（fireDue 处理）
+          flash('收到弹幕：' + d.text, 'ok');
+        }
+      } else if (msg.type === 'online') {
+        onlineCount = Number(msg.count) || 0;
+        onlineEl.textContent = '在线 ' + onlineCount;
+      } else if (msg.type === 'error') {
+        flash('服务端：' + (msg.message || ('错误 ' + msg.code)), 'bad');
+      }
+    };
+    ws.onerror = function () {
+      setConn('error', '连接异常');
+    };
+    ws.onclose = function () {
+      setConn('closed', '已断开，重连中…');
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 8000);
+    };
+  }
+
+  // ---- 历史弹幕（REST，CORS 失败则降级）-----------------------------------
+  function loadHistory() {
+    var url = apiOrigin() + '/api/danmaku/' + VIDEO_ID + '?limit=2000';
+    fetch(url, { cache: 'no-store' })
+      .then(function (resp) {
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        return resp.json();
+      })
+      .then(function (data) {
+        var list = (data && Array.isArray(data.danmaku)) ? data.danmaku : [];
+        var nowMs = video.currentTime * 1000;
+        var added = 0;
+        for (var i = 0; i < list.length; i++) {
+          var d = ingest(list[i]);
+          if (!d) continue;
+          added++;
+          // 已经过去很久的历史弹幕不补播，等下一轮循环再出现
+          if (d.time_ms < nowMs - 3000) fired.add(d.id);
+        }
+        historyNote.textContent = '历史弹幕 ' + added + ' 条';
+      })
+      .catch(function (err) {
+        historyNote.textContent = '历史弹幕不可用（服务端无 CORS 头）→ 仅显示实时弹幕';
+        historyNote.title = String(err && err.message ? err.message : err);
+      });
+  }
+
+  // ---- 发送 ---------------------------------------------------------------
+  function colorValue() {
+    var hex = colorInput.value.replace('#', '');
+    var v = parseInt(hex, 16);
+    return Number.isFinite(v) ? (v & 0xffffff) : 0xffffff;
+  }
+
+  function send() {
+    var text = textInput.value.trim();
+    if (!text) {
+      flash('先输入弹幕内容', 'bad');
+      textInput.focus();
+      return;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      flash('WebSocket 未连接，稍等重连或检查 danmaku_service', 'bad');
+      return;
+    }
+    var timeMs = Math.round(video.currentTime * 1000);
+    var payload = {
+      type: 'send',
+      text: text,
+      time_ms: timeMs,
+      color: colorValue()
+    };
+    try {
+      ws.send(JSON.stringify(payload));
+    } catch (e) {
+      flash('发送失败：' + e.message, 'bad');
+      return;
+    }
+    textInput.value = '';
+    flash('已发送 @ ' + (timeMs / 1000).toFixed(1) + 's', 'ok');
+    textInput.focus();
+  }
+
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    send();
+  });
+
+  textInput.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter' && !ev.shiftKey) {
+      ev.preventDefault();
+      send();
+    }
+  });
+
+  swatches.addEventListener('click', function (ev) {
+    var btn = ev.target.closest ? ev.target.closest('.swatch') : null;
+    if (!btn) return;
+    colorInput.value = '#' + (Number(btn.dataset.color).toString(16).padStart(6, '0'));
+    var all = swatches.querySelectorAll('.swatch');
+    for (var i = 0; i < all.length; i++) {
+      all[i].setAttribute('aria-pressed', String(all[i] === btn));
+    }
+  });
+
+  colorInput.addEventListener('input', function () {
+    var all = swatches.querySelectorAll('.swatch');
+    for (var i = 0; i < all.length; i++) all[i].setAttribute('aria-pressed', 'false');
+  });
+
+  showToggle.addEventListener('change', function () {
+    if (!showToggle.checked) clearStage();
+  });
+
+  // ---- 启动 ---------------------------------------------------------------
+  loadHistory();
+  connect();
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>

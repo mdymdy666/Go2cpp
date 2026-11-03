@@ -3,3 +3,9 @@ data/
 logs/
 __pycache__/
 *.pyc
+
+# Web demo（40s 演示视频体积大，不入库）
+web/demo.mp4
+web/*.log
+web/*.pid
+logs/*.pid
