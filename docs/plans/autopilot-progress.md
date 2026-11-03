@@ -39,17 +39,11 @@
 
 ## 下一个任务
 
-**B2+B3（并行）**：本机 `start-all.sh` + 健康检查脚本 + 60s 外部探针。
-- B2：启动 gateway(8080)/product(9101)/review(9102)/order(9103)/tunnel-client 的统一脚本（setsid nohup、日志、`pkill -x` 停止），并做一次「全停 → 全起 → 五项健康检查」验证；
-- B3：探针脚本（每 60s curl 公网 `/shop/api/health`，失败写日志与连续失败数），先跑 5 分钟看无失败。
-**M03 已关闭**（2026-11-03 15:50 用户决定）。
-**M11 三件套（下一个）**：gzip 解压（本机 3648 MiB/s，历史 asm-compress 5219.7，交叉 bench 5814）。先口径对齐（1 MiB L6 vs 64 KiB 预分配），再决定优化/只标差异。
-**JinShan 对接（进行中）**：`5f5a8fa9` 写 `collab/examples/` 四条可编译示例。先 baseline（`/tmp/bench_vectored /tmp` 3 次）→ 架构（批大小/iovec 复用/去掉每批 vector）→ 汇编（`AdvanceIov`/readv 包装指令）→ 正确性（os_test + 边界 1025 段/零长/EOF）→ 前/后数据。
-1. 二分定位 p22 的哪一块触发 smoke（P19/P20/P21/P22 分别单独应用各跑 20 次）；判定「断言竞态」还是「语义破坏」（park 是否最终到 kWaiting、wake 是否正常）；
-2. 若为语义破坏 → 永久放弃该块；若为竞态 → 修断言（`wait_until(kWaiting, 200ms)`）后全量 ctest + 1e6 压力；
-3. 落地 borrow 建议 1（`publish_runnext` 的 displaced 由本 P overflow 承接，避免 `enqueue` 全局锁）：先测 displaced 频率，再改，跑 bench + 正确性；
-4. 给「baseline → 每块 → 组合」的前/后数据；目标追 Go@4 151–163（当前 283–359）。
-注：borrow 的 Top-1 是 netpoll 前移，但它对 churn 基准收益不确定、且与 M03c 改同一文件，排在其后单独做。
+**JinShan v3 收口（下一个）**：
+1. `df6a7f7c`（REQ-008 协议注入 + memset 反证）与 `e3f7876e`（REQ-006 绑定 `go2cpp::net::Socket` + bufio 批量 + `SocketOptions` 配置注入）交付后，主控复跑全量测试（socket 353 checks、event_loop 44、reliability 64、protocol 新增）；
+2. 更新 `collab/acceptance.md` v3 章节（补 REQ-007/008 与「已绑定现有栈 + bufio 批量可配」说明）与 JinShan 回执 G-004；
+3. **三件套**：架构审查（分层/所有权/零拷贝路径）→ `objdump` 指令/栈帧 → 正确性 + 性能复验（默认 vs batch 配置）；
+4. 之后回 C2（抖音 user 服务）与 M11（gzip 口径对齐）。
 
 ## 本轮记录
 
