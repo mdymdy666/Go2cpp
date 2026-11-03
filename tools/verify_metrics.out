@@ -1,0 +1,72 @@
+==============================================================
+ verify_metrics 开始: 2026-11-03 13:33:10 +0800
+ repo=/UserData/CodexWorkSpace/Go2cpp
+ 环境: nproc=12 绑定=taskset -c 2,3 构建库=/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl
+ 容差: ±30%  输出=/UserData/CodexWorkSpace/Go2cpp/tools/verify_metrics.out
+==============================================================
+
+[M01b] 通用 Channel<int> 1P1C ns/条
+  编译: g++ -O3 -DNDEBUG -std=c++20 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_channel_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_channel -lgo2cpp_context -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_log -pthread -o /tmp/verify_metrics.vzcL2C/bench_channel_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.vzcL2C/bench_channel_opt 1000000 3 spsc
+     | === Channel SPSC 性能基准 ===
+     | 参数: total=1000000 reps=3 ping-pong rounds=200000 mode=spsc
+     | 
+     | [1] SPSC 吞吐（1 生产 + 1 消费）
+     |   Channel cap=0                              min     172.5  median     186.9  max     189.4  ns/op
+     |   Channel cap=64                             min     124.5  median     133.4  max     134.6  ns/op
+     |   Channel cap=1024                           min     109.2  median     112.6  max     113.8  ns/op
+     | 
+     | 语义校验: 乱序/丢失/重复/意外命中 = 0（通过）
+  实测: 112.6 ns  [1e6 条 ×3 reps，[1] SPSC cap=1024，taskset 2,3]
+  对照: ledger=10.73(偏差+949.4%) 容差 ±30%（主对照=最近一次 ledger=10.73）
+  => STALE
+
+[M02] Fiber 全量切换 ns/往返
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_fiber_switch_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_fiber -lgo2cpp_debug -lgo2cpp_debug_event -lgo2cpp_error -pthread -o /tmp/verify_metrics.vzcL2C/bench_fiber_switch
+  运行: taskset -c 2,3 /tmp/verify_metrics.vzcL2C/bench_fiber_switch 1000000
+     | == fiber switch bench: iterations=1000000 ==
+     | -- 理论下限：底层 JumpContext 裸往返 --
+     | JumpContext ping-pong (raw asm)                            4.84 ns/op
+     | -- Fiber 切换 --
+     | Fiber::resume ping-pong (yield)                           19.84 ns/op
+     | Fiber::resume ping-pong                  mean   30.87  P50     28  P95     37  P99     37  min     19  max    25824 ns
+     | Fiber::resume ping-pong (park)                            19.14 ns/op
+     | Fiber::resume ping-pong park             mean   28.82  P50     28  P95     37  P99     37  min     27  max    22108 ns
+     | Fiber::resume_from_scheduler ping-pong (park)             19.06 ns/op
+     | resume_from_scheduler park               mean   29.31  P50     28  P95     37  P99     37  min     19  max    18696 ns
+     | two-Fiber alternating resume                              18.86 ns/op
+     | two-Fiber alternating resume             mean   30.90  P50     28  P95     37  P99     37  min     18  max    20785 ns
+     | -- 栈分配/释放（创建 + 首切 + 完成 + 析构）--
+     | stack hot 4KiB fixed                                      84.75 ns/op
+     | stack hot 4KiB growable                                   96.22 ns/op
+     | stack hot 128KiB growable                                 95.80 ns/op
+     | stack cold rotating sizes (8 keys)                        90.93 ns/op
+     | create+destroy only 4KiB (no resume)                      27.85 ns/op
+  实测: 19.84 ns  [resume↔Suspend 往返，1e6 次，taskset 2,3]
+  对照: ledger=33.80(偏差-41.3%) ledger=23.5(偏差-15.6%) 容差 ±30%（主对照=最近一次 ledger=23.5）
+  => OK
+
+[M03] Scheduler task churn wall ns/task
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_task_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.vzcL2C/bench_scheduler_task_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.vzcL2C/bench_scheduler_task_opt 4 100000 5
+     | [cfg] workers=4 tasks=100000 rounds=5
+     | [start] VmSize=0.05 GiB Rss=4.0 MiB
+     | [round 0] cpu 627 ns/task  wall 299 ns/task  (3 k tasks/s)
+     | [round] VmSize=0.36 GiB Rss=6.2 MiB
+     | [round 1] cpu 575 ns/task  wall 268 ns/task  (4 k tasks/s)
+     | [round] VmSize=0.36 GiB Rss=8.2 MiB
+     | [round 2] cpu 986 ns/task  wall 460 ns/task  (2 k tasks/s)
+     | [round] VmSize=0.37 GiB Rss=11.0 MiB
+     | [round 3] cpu 1769 ns/task  wall 817 ns/task  (1 k tasks/s)
+     | [round] VmSize=0.37 GiB Rss=11.0 MiB
+     | [round 4] cpu 578 ns/task  wall 267 ns/task  (4 k tasks/s)
+     | [round] VmSize=0.37 GiB Rss=11.0 MiB
+     | [shutdown] VmSize=0.42 GiB Rss=11.1 MiB
+  cpu 中位: 627 ns/task（同 5 轮，仅诊断宿主负载，不参与判定）
+  实测: 299 ns  [4 worker/100k tasks/5 轮 wall 中位，taskset 2,3]
+  对照: ledger=122.0(偏差+145.1%) ledger=239(偏差+25.1%) 容差 ±30%（主对照=最近一次 ledger=239）
+  => OK
+
+==============================================================
+TOTAL=3 OK=2 STALE=1 未接线=0
+==============================================================

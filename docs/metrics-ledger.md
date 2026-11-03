@@ -46,7 +46,7 @@
 - **环境**：待定
 - **日期**：未记录
 - **脚本路径**：`tests/concurrency/bench_channel_opt.cpp`（2026-11-03 `ls` 已确认存在）
-- **状态**：`待复跑`
+- **状态**：`STALE`（2026-11-03 `tools/verify_metrics.sh` 实测 **112.6 ns/条**：cap=1024 SPSC、1e6×3 reps、`taskset -c 2,3`、12 vCPU、复用 `.build-bento-wsl` 库；与历史 10.73 差 9 倍。两者都被标为「通用 Channel 1P1C」，故判 STALE；A3 需查历史 10.73 的原始口径——可能是不同实现或早已退化）
 
 ### M02 Fiber 全量切换 ns/往返
 
@@ -54,8 +54,8 @@
 - **测量命令**：待补（`tests/concurrency/` 下切换基准 + `bench_fast_channel` 的 fiber 段不是同一口径）
 - **环境**：未记录
 - **日期**：未记录
-- **脚本路径**：`待建`
-- **状态**：`待复跑`
+- **脚本路径**：`tests/concurrency/bench_fiber_switch_opt.cpp`（:308 `PrintRow("Fiber::resume ping-pong (yield)")`，本轮 `sed` 已核）
+- **状态**：`实测（推断口径）`（2026-11-03 `tools/verify_metrics.sh` 测得 **19.84 ns/往返**：1e6 次、`taskset -c 2,3`、12 vCPU；对 23.5 快照 −15.6%，对 33.80 差 41%。历史未写明 API，A3 需确认「全量切换」是否就是 yield ping-pong，否则改口径）
 
 ### M03 Scheduler task churn wall ns/task
 
@@ -72,7 +72,7 @@
 - **日期**：2026-11-03（本轮实测）
 - **脚本路径**：`tests/concurrency/bench_scheduler_task_opt.cpp`
 - **状态**：`实测`（wall 287/239/267/236/225 ns，中位 239；cpu 619/519/582/514/478）
-- **备注**：与历史 122.0 不一致，原因是核数/绑核/轮次/宿主负载不同；对外只能报「口径 + 条件 + 中位」。
+- **备注**：与历史 122.0 不一致，原因是核数/绑核/轮次/宿主负载不同；对外只能报「口径 + 条件 + 中位」。2026-11-03 13:33 复跑中位 **299 ns**（同 5 轮 cpu 中位 627），同日另一轮 5 轮波动 245–787 —— 该基准对宿主负载敏感，单次数字不可单独引用，必须带 cpu 中位与轮次分布。
 
 ### M04 Scheduler submit ns/task
 
