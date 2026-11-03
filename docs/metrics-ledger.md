@@ -129,12 +129,17 @@
 
 ### M07 LevelDB 1e7 Put ops/s 与 1e8 RSS
 
-- **历史值**：1e7 Put 58.3 万 ops/s（3.7× 自研）；1e8 后 RSS 87 MiB（数据量 4.9%）
-- **测量命令**：`.build-bento-wsl/go2cpp_leveldb_kv_test`（本轮 1e5 写入 669k ops/s、VmHWM 9.0 MiB，规模不同）
-- **环境**：未记录
-- **日期**：未记录
-- **脚本路径**：`tests/storage/test_leveldb_kv.cpp`
-- **状态**：`待复跑`
+- **历史值**：1e7 Put 58.3 万 ops/s（3.7× 自研）；1e8 后 RSS 87 MiB（数据量 4.9%；分母口径未记录）
+- **测量命令**：`.build-bento-wsl/go2cpp_leveldb_kv_test --bench --n=10000000`（20B/22B，LevelDB vs 自研 KV）；`--mem --n=10000000`（8B/8B）；`--mem --n=100000000`（1e8 RSS）
+- **环境**：WSL2 6.6.87.2-microsoft-standard-WSL2 / 12 vCPU / `taskset -c 2,3` / Release / `GO2CPP_WITH_KV=ON` / 库目录 mkdtemp 自清理 / loadavg 0.43（前）→1.48（中）
+- **日期**：2026-11-03 14:01–14:13
+- **脚本路径**：`tests/storage/test_leveldb_kv.cpp`（`--bench` / `--mem`，见 :1096-1102）
+- **状态**：`实测`：
+  - 1e7 Put（`--bench`，20B/22B）：644000 / 648630 / 647521 ops/s，**3 轮中位 647,521**（历史 583k，+11%）；
+  - 1e7 Put（`--mem`，8B/8B）：663786 / 633193 / 659304，中位 **659,304**；
+  - **1e8 跑完**：230.8 s、**433,369 ops/s**、采样 RSS 峰值 **82.4 MiB**、VmHWM **122.8 MiB**、磁盘 **2511.6 MiB**；RSS/数据量 = 82.4/1525.9 = **5.40%**（VmHWM 口径 8.05%）；
+  - 自研对照：LevelDB/自研 Put = 3.95 / 4.14 / 4.51×，中位 **4.14×**（历史 3.7×）；Get 反向 530,742 vs 576,109/s。
+- **备注**：历史 87 MiB 应为采样瞬时值（本轮 VmHWM 122.8 更高，属正常）；历史环境/轮数/是否绑核、4.9% 分母口径均未记录。
 
 ### M08 bufio 1 MiB 分块读 MiB/s
 
@@ -207,7 +212,7 @@
 | M05 | HTTP pipeline=16 rps | 120,755（6 轮中位） | 实测 |
 | M05b | HTTP pipeline 411k rps | 无出处 | 无出处 |
 | M06 | SQLite 1e6 插入 | 1.074×（7 轮中位） | 实测·达标 |
-| M07 | LevelDB 1e7 Put / 1e8 RSS | 583k / 87 MiB | 待复跑 |
+| M07 | LevelDB 1e7 Put / 1e8 RSS | 647.5k（14.7 MiB 写入 15.1s 级）/ 82.4 MiB 峰值（VmHWM 122.8，5.40%） | 实测 |
 | M08 | bufio 1 MiB 分块 | 1853.9 MiB/s | 实测 |
 | M09 | cache hotspot ARC/LRU | 0.7817 / 0.5580（历史）→ 0.7764 / 0.5594（本轮） | 实测 |
 | M10 | os 批量 writev/readv | 写 17.96× / 读 14.68×（读未达历史 20.9×） | 实测 |
@@ -219,6 +224,8 @@
 
 - ✅ A2 完成：`tools/verify_metrics.sh`（M01b/M02/M03），M01b 已拆为 a/b。
 - ✅ A3 完成：M04/M05/M06 已填实（M04 双口径、M05 120.8k、M06 1.074×）。
-- 🔄 A4：M07 LevelDB 复跑中（A4a）；M10/gzip/hash/reflect 已完成（A4b）。TLS 与 bento/link 待下一轮。
+- ✅ A4a 完成：M07 已填（1e7 647.5k、1e8 RSS 82.4 MiB/VmHWM 122.8、对照 4.14×）。
+- ✅ A4b 完成：M10/M11/M12/M13 已填。
+- ⏳ A4c（下一个）：TLS 与 bento/link。
 - ⏳ A6：把 docs 里 411k、160ns 等改为指向本文件或标 STALE。
 - ⏳ A7 架构级：M01b-a 通用 Channel 无锁化（覆盖 Send/Recv/Select/Close，需完整验证窗口，单独立项）。

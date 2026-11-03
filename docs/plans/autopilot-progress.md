@@ -28,33 +28,30 @@
 | A1 | ledger 建档（12 条，四要素） | ✅ be73a4e |
 | A2 | `tools/verify_metrics.sh` 三基线 | ✅ 92dcb25 |
 | A3 | M04/M05/M06 复跑填实 | ✅ 55a3f0e |
-| A4a | M07 LevelDB 1e7 Put / 1e8 RSS | 🔄 子 agent `a535fda9` 在跑 |
-| A4b | M10 os 批量 + gzip + hash + reflect | ✅ 本轮（M10 写 17.96×/读 14.68×；gzip 612/3648；hash SHA-256 2002 MiB/s；reflect 52.64/54.89） |
-| A4c | TLS 握手/写路径 + bento/link 吞吐 | ⏳ 下一个 |
-| A5 | ledger 一条命令全量对照 + CI 钩子 | ⏳ |
+| A4a | M07 LevelDB 1e7/1e8 | ✅ 本轮（1e7 647.5k、1e8 230.8s/82.4 MiB、对照 4.14×） |
+| A4b | M10 os 批量 + gzip + hash + reflect | ✅ e7fcbbb |
+| A4c | TLS + bento/link | 🔄 子 agent `b03dca46` 在跑 |
+| A5 | ledger 一条命令全量对照 + CI 钩子 | ⏳ 下一个 |
 | A6 | 清理漂移（411k/160ns 等） | ⏳ |
-| A7 | 不达标模块优化 | 🔄 首项 M01b 完成；**通用 Channel 无锁化待立项** |
-| B1 | VPS `tunnel-server.service` | ⏳ |
-| B2 | 本机 `start-all.sh` + 健康检查 | ⏳ |
-| B3 | 外部探针（60s） | ⏳ |
-| B4 | 断线恢复验证 | ⏳ |
+| A7 | 不达标模块优化 | 🔄 M01b 判定+汇编级完成；通用 Channel 无锁化待立项 |
+| B1–B4 | 公网变服务 | ⏳ |
 | C1–C10 | 抖音 P0 | ⏳ |
 
 ## 下一个任务
 
-**A4c** — TLS 与 bento/link：
-1. **TLS**：`docs/reports/asm-tls.md` 的握手/32KB 写/64B 小包三组数字，找现成基准（`tests/network/*tls*` 或 `bench`），按当前源码重编后复跑 3 轮中位；跑不动写「无法复现 + 缺什么」。
-2. **bento/link**：`tests/bento/` 是否有吞吐基准（Link loopback / PeerHub）；有就跑 3 轮，报 rps/字节吞吐与条件；没有就写「仅有功能测试，无吞吐基准，需新建」。
-3. 同时确认 A4a 的 LevelDB 结果（若已回）并填 ledger M07。
+**A5** — 让 ledger 可一条命令校验（在 A4c 回来后如仍有缺口，先补缺口再做 A5）：
+1. 扩展 `tools/verify_metrics.sh`：把已实测且可自动跑的条目接进来（M01b-a/M01b-b、M02、M03、M04、M06、M08、M09、M10、M11/M12/M13 中可跑的），跑不到的显式输出「无法自动校验：原因」，**不许假装通过**；
+2. 输出一份 `STALE 列表`（相对 ledger 当前值，容差按条目定义），退出码 0/1/2；
+3. CI/CMake 钩子：在 `cmake/` 里加一个可选的 `GO2CPP_VERIFY_METRICS` 目标或脚本文档，让「跑测试时可选地跑一次台账校验」；不强制默认开启（避免 CI 因宿主负载误报）。
 
 ## 本轮记录
 
-- 13:20 启动；13:2x A1（be73a4e）；13:33 A2（92dcb25）；13:43 用户补充优化规则（456ec05）；13:50 A7 首项 M01b（3a7aa4f）；13:59 A3（55a3f0e）。
-- 14:10 **A4b 完成**（`a6dffee9`）：
-  - 新增 `tests/os/bench_vectored.cpp`（233 行，页缓存热/不 fsync/读前已写，3 次进程×3 轮）；
-  - M10：写 822.8→49.1 ns/条 = **17.96×**（复现历史 17.9）；读 496.0→32~33 ns/条 = **14.68×**（未达历史 20.9×，条件不可考，不据此判退化）；主控复跑 17.66×/15.24× 可复现；
-  - gzip：压缩 **612.2 MiB/s**、解压 **3648.0 MiB/s**（同轮 zlib 463.7/3138.3，压缩率不同不可只看吞吐）；交叉 bench 解压 5814.3；
-  - hash：SHA-256 **2002.60 MiB/s**（SHA-NI）、crc32 18731.55 MiB/s；
-  - reflect：二进制编码 **52.64 ns**、解码 **54.89 ns**；
-  - 主控审查：文件 233 行、计时逻辑公平（memset 预热、不 fsync）、复跑数字同量级、`git status` 仅新增该文件 + 9 历史完好、旧库假低值说法成立（mtime：p1=10-30 / bento-wsl=11-03）。
-  - ledger 新增 M11/M12/M13 并更新 M10。
+- 13:20 启动；A1 be73a4e；A2 92dcb25；13:43 优化规则 456ec05；A7 首项 3a7aa4f；A3 55a3f0e；A4b e7fcbbb。
+- 14:14 **A4a 完成**（`a535fda9`）：
+  - 确认 `--bench` 口径是 20B/22B（含自研对照）、`--mem` 是 8B/8B（RSS），两者**不可混比**（源码 :914/:951/:1096-1102）；
+  - 1e7 Put（`--bench`）：644000/648630/647521，中位 **647,521**（历史 583k，+11%）；自研侧中位 156,588（历史推算 157.6k，几乎复现）→ 差异在 LevelDB/环境，不在自研；
+  - 1e8 **未降级**：230.8 s、433,369 ops/s、采样峰值 **82.4 MiB**、VmHWM **122.8 MiB**、磁盘 2511.6 MiB；RSS/数据量 5.40%（VmHWM 8.05%）；
+  - 自研对照 LevelDB/自研 Put 3.95/4.14/4.51×，中位 **4.14×**（历史 3.7×）；Get 反向 530,742 vs 576,109/s；
+  - 主控审查：7 个 `/tmp/m07_*.log` 存在且抽样行一致、`--bench` flag 在源码 :1102、`git status` 仍 9 项、磁盘 43G/1007G 合规；
+  - 记下：历史 87 MiB 是采样瞬时值（本轮 VmHWM 更高），历史 4.9% 分母口径不可考。
+- 14:16 **A4c 派活**（`b03dca46`）：TLS 三组 + bento/link 吞吐。
