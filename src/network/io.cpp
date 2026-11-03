@@ -783,6 +783,37 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         return m_running.load(std::memory_order_acquire);
     }
 
+    /**
+     * @brief 在 fd 所属条带锁内校验代际、复用/新建等待节点、（必要时）二次确认 pending 就绪并 arm epoll。
+     *
+     * @param fd [in] 等待的 fd 编号——无 token 时要求 >=0 且已打开；有 token 时必须与 token 的代际一致。
+     * @param event [in] 等待方向——kRead/kWrite；event_mask 为 0 时置 EINVAL 并返回空。
+     * @param deadline [in] 绝对截止时刻——nullopt 表示无超时，不创建定时器节点。
+     * @param error [out] 失败错误码——成功时写 0；可为 nullptr；失败时写入 errno 风格值，调用方据此映射 WaitStatus。
+     * @param expected_descriptor [in] 代际令牌——所有权移交本函数；可为 nullptr，此时先查 FdSlot 缓存再 Capture。
+     *
+     * @return
+     * - 非空 NodePtr：节点已入队，且（若需要）已 arm epoll——调用方**必须**最终经 complete/recycle_node 归还；
+     * - nullptr：注册失败，原因见 `*error`——调用方**不要** park，按 ESHUTDOWN/EBADF/EINVAL 直接返回。
+     *
+     * ## 定位
+     * 等待队列的唯一入队点，同时是 fd 代际（close/dup2）与 epoll arm 之间的线性化门。
+     * 写错会出现「已入队但未 arm epoll」——该等待永远收不到就绪，表现为永久挂起而非错误。
+     *
+     * ## 步骤
+     * step1. 校验 token 与 fd 的一致性以及事件掩码，失败即回错误码，不触碰任何容器；
+     * step2. 取当前 task 与描述符令牌：优先复用 FdSlot 缓存（省一次 F_GETFD 与全局注册锁），否则 Capture；
+     * step3. 进入 fd 条带锁并二次校验代际——这是 close/dup2 与入队之间的第二个线性化点，防止旧代际被重新放回队列；
+     * step4. 维护 FdSlot 的代际与 descriptor 引用，同代际复用同一控制块，避免每轮 Wait 重新分配 Token；
+     * step5. 消耗 pending 就绪提示，并用零超时原生 poll 二次确认，避免把已被业务线程读空的 stale ready 当成就绪；
+     * step6. arm epoll；失败则回滚节点、槽位与定时器；仅新增定时器时 tickle，避免空转唤醒。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：必须在 managed Fiber 上调用；内部取条带锁与 m_mutex，调用方不得再持同类锁。
+     * - 原子性：入队与 epoll arm 在同一 m_mutex 内完成，对 complete/notify_close 线性化。
+     * - 失败语义：不抛异常（新节点分配失败经 error 回 ENOMEM）；失败时节点未入队，容器保持原状。
+     * - 不变量：返回非空节点时该节点在对应读写队列中恰好出现一次；返回 nullptr 时队列与 epoll 注册均无变化。
+     */
     NodePtr register_wait(int fd, IOEvent event,
                           std::optional<TimePoint> deadline, int* error,
                           DescriptorTokenPtr expected_descriptor) {
@@ -792,6 +823,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         if (error != nullptr) {
             *error = 0;
         }
+        // step1: 校验 token 与 fd 的一致性及事件掩码；失败只回错误码，不触碰任何容器。
         if ((expected_descriptor &&
              (!expected_descriptor->valid() || expected_descriptor->fd() != fd)) ||
             (fd < 0 && !expected_descriptor)) {
@@ -810,6 +842,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         }
 
         auto task = Scheduler::current_task();
+        // step2: 取当前 task 与代际令牌——先查 FdSlot 缓存（省 F_GETFD 与全局注册锁），未命中才 Capture。
         DescriptorTokenPtr descriptor = std::move(expected_descriptor);
         if (!descriptor) {
             // 同一 fd 的连续等待通常跨越多个 Fiber 调度轮次，但仍由同一
@@ -841,6 +874,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         }
         NodePtr node;
 
+        // step3: 进入 fd 条带锁并二次校验代际；这是 close/dup2 与入队之间的第二个线性化点，防止旧代际回队列。
         int arm_error = 0;
         {
             // 同一 fd 的注册/完成/关闭/事件处理都落在这一条带上，因此下面
@@ -892,6 +926,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             node->task = std::move(task);
             node->descriptor = std::move(descriptor);
 
+            // step4: 维护 FdSlot 的代际与 descriptor 引用，同代际复用同一控制块，避免每轮 Wait 重新分配 Token。
             auto found = stripe.slots.find(fd);
             if (found == stripe.slots.end()) {
                 auto slot = std::make_unique<FdSlot>();
@@ -927,6 +962,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             node->generation = slot.generation;
 
             try {
+                // step5: 消耗 pending 就绪提示，并用零超时 poll 二次确认，避免把已被读空的 stale ready 当成就绪。
                 bool consume_pending = event == IOEvent::kRead
                                            ? slot.pending_read
                                            : slot.pending_write;
@@ -1003,6 +1039,7 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
                 return {};
             }
 
+            // step6: arm epoll；失败回滚节点/槽位/定时器。仅新增定时器时才 tickle，避免无谓唤醒。
             arm_error = update_interest_locked(slot);
             if (arm_error != 0) {
                 erase_node_locked(slot, node);
@@ -1875,6 +1912,33 @@ private:
      * - `noexcept`：本函数在 worker 空闲路径上，不能因异常把线程带崩；
      * - 有效超时为 0 时不阻塞，但**仍会**处理已经就绪的事件与到期定时器。
      */
+    /**
+     * @brief 执行一轮多路复用等待：算超时、等事件、处理就绪、清 eventfd 并触发到期定时器。
+     *
+     * @param timeout_ms [in] 本轮最长阻塞毫秒——负数按 0 处理（只做非阻塞轮询）；实际取值还会被最近定时器截止时间收紧。
+     *
+     * @return
+     * - >=0：本轮返回的就绪事件数（可能为 0，表示超时）——调用方**必须**继续循环，不要把它当成结束；
+     * - -1：后端缺失、poller 已停止或 wait 出错——调用方**不要**重试，按关停路径退出循环。
+     *
+     * ## 定位
+     * 唯一把「内核就绪」转成「节点唤醒」的入口，也是 Worker 空闲时的 epoll 驱动点。
+     * 写错会丢事件（节点永远不唤醒）或把 eventfd 唤醒计数吃错（tickle 失效），两者都让事件循环停摆。
+     *
+     * ## 步骤
+     * step1. 校验后端与停止标志；把负超时归零，并用最近定时器截止时间收紧本轮超时；
+     * step2. 在栈上开批量事件数组（刻意不写 `{}`，避免每轮无条件清零 4KB），登记本线程正在 poll；
+     * step3. 调后端 wait，EINTR 时重试，返回后立即撤销登记；
+     * step4. 若批次里出现 wake token，排空 eventfd 并清 pending 标志，保证下一次 tickle 能再次写入；
+     * step5. 把就绪事件交给 process_events_batch 批量派发（内部按 fd 条带锁唤醒节点）；
+     * step6. 结算到期定时器并清除 t_inside_poll 标记，返回就绪数。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：只能在 poller 线程（或接管 poll 的 M）上调用；不得与其他 poll_once 并发进入。
+     * - 原子性：m_waiters 计数用 release/acquire 递增递减，供关闭路径判断「是否有人正在 epoll_wait」。
+     * - 失败语义：noexcept；后端出错时返回 -1 并复位 t_inside_poll，不抛出、不残留状态。
+     * - 不变量：返回 >=0 时本轮的到期定时器已触发、wake 计数已排空；t_inside_poll 在本函数退出时必为 false。
+     */
     int poll_once(int timeout_ms) noexcept {
         if (!m_backend) {
             return -1;
@@ -1883,6 +1947,7 @@ private:
             return -1;
         }
         int effective = timeout_ms < 0 ? 0 : timeout_ms;
+        // step1: 结算本轮超时——负值归零，并被最近定时器截止时间收紧，保证定时器不被 poll 拖过点。
         const int deadline_timeout = poll_timeout_ms();
         if (deadline_timeout == 0) {
             effective = 0;
@@ -1893,6 +1958,7 @@ private:
         // 不写 `{}`：epoll_wait 只填充 count 个元素，值初始化会无条件
         // 清零 4KB（每次 poll_once 一次，空转时占主导）。
         BackendEvent events[kEventBatch];
+        // step2: 登记「有人正在 epoll_wait」，关闭路径据此决定是否需要 eventfd 唤醒。
         m_waiters.fetch_add(1, std::memory_order_release);
         t_inside_poll = true;
         int count;
@@ -1904,18 +1970,22 @@ private:
             t_inside_poll = false;
             return -1;
         }
+        // step3: 调后端等待；EINTR 重试，失败立即撤销登记并返回 -1。
         bool saw_wake = false;
         for (int index = 0; index < count; ++index) {
             saw_wake = saw_wake || events[index].token == kWakeRegistration;
         }
+        // step4: 出现 wake token 时排空 eventfd 并清 pending，保证下一次 tickle 仍能写入。
         if (saw_wake) {
             // 由谁排空都行：eventfd 是计数语义，排空后 tickle 可以再次写入。
             drain_wake_fd();
             m_tickle_pending.exchange(0, std::memory_order_acq_rel);
         }
         if (count > 0) {
+            // step5: 批量派发就绪事件，由内部按 fd 条带锁唤醒对应节点。
             process_events_batch(events, static_cast<std::size_t>(count));
         }
+        // step6: 结算到期定时器并清除 poll 标记，保证标志在所有出口都被复位。
         expire_timers();
         t_inside_poll = false;
         return count;
@@ -2240,12 +2310,46 @@ std::shared_ptr<Task> IOManager::go(Task::Function function) {
     return m_scheduler.go(std::move(function));
 }
 
+/**
+ * @brief 把一个 fd 的读写就绪等待提交给 IO 多路复用器，并 park 当前 Fiber 直到就绪/超时/取消。
+ *
+ * @param fd [in] 目标文件描述符——单位：fd 编号；必须已打开；<0 仅在 expected_descriptor 非空时允许（继承式等待）。
+ * @param event [in] 等待方向——kRead/kWrite 二选一；event_mask 为 0 视为非法，返回 EINVAL。
+ * @param deadline [in] 绝对截止时刻——TimePoint::max() 表示「无超时」，归一化为 nullopt；已过期时改走零拷贝探测，不注册。
+ * @param context [in] 可选取消上下文——可为 nullptr；非空时其 Done() 会被挂回调，触发即以 kCancelled/kTimeout 完成节点。
+ * @param expected_descriptor [in] 描述符代际令牌——所有权移交给本函数（失败时同样被消费）；可为 nullptr，此时复用 FdSlot 缓存或自行 Capture。
+ *
+ * @return
+ * - WaitResult{kReady}：fd 已就绪——调用方**必须**立刻做真实 syscall，并接受它仍可能返回 EAGAIN；
+ * - WaitResult{kTimeout}：超时——调用方**不要**重试同一 deadline，按 POSIX SO_*TIMEO 语义返回 EAGAIN/ETIMEDOUT；
+ * - WaitResult{kCancelled|kClosed}：取消或对端关闭——调用方**必须**放弃本次 IO，且不要在同一 fd 代际上再次注册；
+ * - WaitResult{kError}：参数/注册/内存错误——调用方**不要** park 重试，直接按 system_error 上抛。
+ *
+ * ## 定位
+ * 这是 network 层唯一的「就绪等待提交点」，socket/stream/hook 的所有 park 都汇聚到这里。
+ * 写错会让等待节点滞留在 epoll（永久挂起）或丢唤醒（G 睡死），二者都表现为整条连接卡住而不是报错。
+ *
+ * ## 步骤
+ * step1. 校验调用线程是本 IOManager 的 managed G，并归一化 deadline 与事件掩码——非 managed 线程返回 EPERM，绝不偷偷阻塞线程；
+ * step2. 早退路径：已取消上下文、已过期 deadline 分别返回取消或零超时探测结果，避免为注定失败的等待分配定时器节点；
+ * step3. register_wait 注册节点（内部完成代际校验、节点复用与 epoll arm），失败以错误码返回而不抛异常；
+ * step4. 注册即已满足（pending readiness 抢跑）时不 park，直接回收节点返回结果；
+ * step5. 挂取消回调后反复 park_io，直到 outcome 被写成或检测到调度器停止/任务身份变化；
+ * step6. 摘除取消回调、解码 outcome、回收节点，返回最终结果。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：必须在该 IOManager 的 managed Fiber 上调用；park 期间执行流会切走，进入前不得持任何用户锁。
+ * - 原子性：结果通过 node->outcome 的 acquire/release 一次性发布，同一节点只会被 complete 认领一次。
+ * - 失败语义：不抛异常（内部 catch 全部转错误码）；失败后节点已回收，fd 上不留注册残留。
+ * - 不变量：返回 kReady 时该 fd 在返回瞬间是就绪的（可能被其它线程抢先消费）；返回后本函数不再持有节点所有权。
+ */
 WaitResult IOManager::wait(int fd, IOEvent event,
                            std::optional<TimePoint> deadline,
                            ContextPtr context,
                            DescriptorTokenPtr expected_descriptor) {
     GO2CPP_DEBUG_EVENT(kIoWait, 0,
                        static_cast<std::uint64_t>(fd < 0 ? 0 : fd));
+    // step1: 校验 managed G 身份，并把 deadline/事件掩码归一化；非 managed 线程直接 EPERM，绝不阻塞调用线程。
     GO2CPP_DEBUG_PARK_HINT(kIo);
     if (Scheduler::current_scheduler() != &m_scheduler ||
         !Scheduler::current_task()) {
@@ -2260,6 +2364,7 @@ WaitResult IOManager::wait(int fd, IOEvent event,
     if (event_mask(event) == 0) {
         return {WaitStatus::kError, EINVAL};
     }
+    // step2: 早退——已取消上下文与已过期 deadline 不注册节点，避免为注定失败的等待分配定时器。
     if (context && context->IsDone()) {
         const bool timed_out = Is(context->Err(), DeadlineExceededError());
         return {timed_out ? WaitStatus::kTimeout : WaitStatus::kCancelled,
@@ -2269,6 +2374,7 @@ WaitResult IOManager::wait(int fd, IOEvent event,
         return probe_immediate(fd, event, expected_descriptor);
     }
 
+    // step3: 注册等待节点；register_wait 内部完成代际校验与 epoll arm，失败以错误码而非异常返回。
     int registration_error = 0;
     State::NodePtr node;
     try {
@@ -2283,12 +2389,14 @@ WaitResult IOManager::wait(int fd, IOEvent event,
                                                 : WaitStatus::kError,
                 registration_error == 0 ? EIO : registration_error};
     }
+    // step4: 注册即已满足（pending readiness 抢跑）时不 park，直接回收节点返回。
     if (node->outcome.load(std::memory_order_acquire) != 0) {
         const auto result = decode_outcome(node->outcome.load(std::memory_order_acquire));
         m_state->recycle_node(std::move(node));
         return result;
     }
 
+    // step5: 挂取消回调后反复 park_io；只有 outcome 被写成或调度器停止/任务身份变化才脱离循环。
     DoneSignal::CallbackId callback_id = 0;
     if (context) {
         const std::weak_ptr<State> weak_state(m_state);
@@ -2365,6 +2473,7 @@ WaitResult IOManager::wait(int fd, IOEvent event,
         }
     }
 
+    // step6: 摘除取消回调、解码 outcome、回收节点，返回最终结果。
     if (context && callback_id != 0) {
         context->Done().RemoveCallback(callback_id);
     }
@@ -2399,6 +2508,36 @@ WaitResult IOManager::wait_for(int fd, IOEvent event, Duration timeout,
     return wait(fd, event, deadline, std::move(context));
 }
 
+/**
+ * @brief 一次性等待多个 fd/方向的集合，任一成员就绪即返回其下标集合。
+ *
+ * @param requests [in] 请求集合——每个元素含 fd/event/可选代际令牌；同一 fd+方向不得重复（重复返回 EINVAL）。
+ * @param deadline [in] 集合级绝对截止时刻——nullopt 表示无超时；已过期时退化为零超时 poll 探测。
+ * @param context [in] 可选取消上下文——可为 nullptr；触发时整个集合按 kCancelled/kTimeout 失败。
+ *
+ * @return
+ * - WaitManyResult{kReady, ready_indices}：至少一个成员就绪——调用方**必须**对每个下标做真实 syscall，且仍可能 EAGAIN；
+ * - WaitManyResult{kTimeout}：集合超时——调用方**不要**复用本次节点，按 ETIMEDOUT 处理；
+ * - WaitManyResult{kError|kClosed|kCancelled}：校验/注册/取消失败——调用方**不要** park 重试，按 system_error 上抛。
+ *
+ * ## 定位
+ * 多 fd 等待（poll/select 语义）的唯一实现点，hook 的 poll/ppoll/select 都落到这里。
+ * 写错会出现「部分成员已注册、部分未注册」的半提交，导致调用方拿到错误的下标集合而漏读数据。
+ *
+ * ## 步骤
+ * step1. 空集合、非 managed 线程、已取消上下文三类早退，直接失败返回；
+ * step2. 先整体校验重复项与非法掩码/无效 fd，避免前面的可读 fd 先触发而把后面的非法项静默跳过；
+ * step3. deadline 已过期时构造 pollfd 数组做零超时探测，把就绪下标直接返回；
+ * step4. 逐个 register_wait 注册节点，任一失败或返回终态错误就 cleanup 取消已注册成员；
+ * step5. 挂取消回调后 park，直到至少一个成员完成或整体失败；
+ * step6. 汇总就绪下标、回收所有节点并返回。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：必须在 managed Fiber 上调用；普通线程请直接用原生 poll/select，本函数不会阻塞调用方线程。
+ * - 原子性：集合不是原子的——任一成员失败会取消其余成员，调用方只能看到全成功或全失败。
+ * - 失败语义：不抛异常；失败时 cleanup 保证已注册节点全部取消并回收，不留悬挂注册。
+ * - 不变量：返回 kReady 时 ready_indices 中每个下标都对应一个已就绪成员；返回失败时 ready_indices 为空。
+ */
 WaitManyResult IOManager::wait_many(
     const std::vector<WaitRequest>& requests,
     std::optional<TimePoint> deadline,
@@ -2410,6 +2549,7 @@ WaitManyResult IOManager::wait_many(
         result.ready_indices.clear();
     };
 
+    // step1: 空集合直接 EINVAL，避免上层拿到空 ready 集合却以为等待成功。
     if (requests.empty()) {
         fail(WaitStatus::kError, EINVAL);
         return result;
@@ -2429,6 +2569,7 @@ WaitManyResult IOManager::wait_many(
     }
     // 一个 WaitMany 集合中同一 fd/方向只能出现一次；否则一次 readiness
     // 可能同时消费多个请求，无法给外部 waiter 提供可验证的 FIFO。
+    // step2: 先整体校验重复项，保证一次 readiness 不会被两个请求重复消费，维持 FIFO 可验证性。
     for (std::size_t i = 0; i < requests.size(); ++i) {
         for (std::size_t j = 0; j < i; ++j) {
             if (requests[i].fd == requests[j].fd &&
@@ -2455,6 +2596,7 @@ WaitManyResult IOManager::wait_many(
         }
     }
 
+    // step3: deadline 已过期时用零超时 poll 探测，把就绪下标直接返回，不注册任何节点。
     if (deadline.has_value() && *deadline <= Clock::now()) {
         std::vector<pollfd> probes;
         try {
@@ -2510,6 +2652,7 @@ WaitManyResult IOManager::wait_many(
         return result;
     }
 
+    // step4: 注册失败时的统一清理：未完成的节点先 complete 取消再 disarm，避免半提交。
     const auto cleanup = [&nodes, this] {
         for (const auto& node : nodes) {
             if (!node) {
@@ -2532,6 +2675,7 @@ WaitManyResult IOManager::wait_many(
         int registration_error = 0;
         State::NodePtr node;
         try {
+            // step5: 逐成员注册；任一失败或返回终态错误即取消已注册成员，调用方只会看到全成功或全失败。
             node = m_state->register_wait(
                 request.fd, request.event, deadline, &registration_error,
                 request.expected_descriptor);

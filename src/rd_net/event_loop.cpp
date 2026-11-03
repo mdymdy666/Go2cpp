@@ -116,7 +116,34 @@ void EventLoop::DrainWakeFd() {
     }
 }
 
+/**
+ * @brief 把一个已打开的 DatagramSocket 挂到事件循环的 slot 表，并绑定协议处理器。
+ *
+ * @param socket [in] 数据报 socket——按引用借用，生命周期必须长于挂载期；invalid 的 socket 直接拒绝。
+ * @param handler [in] 协议处理器——可为 nullptr（只占位不回调）；非空时本函数会立即回调其 OnAttached。
+ *
+ * @return
+ * - true：已挂载（或该 socket 之前已挂载，仅替换 handler）——调用方**必须**保证 socket 活到 Detach；
+ * - false：impl_ 缺失或 socket 无效——调用方**不要**假定已挂载，需先修好 socket/loop。
+ *
+ * ## 定位
+ * 事件循环与 socket 之间唯一的挂载点；slot 下标是 poll 结果到 socket 的唯一映射依据。
+ * 写错会让事件被派发到错误的 socket（fd 错配），表现为「A 的数据出现在 B」。
+ *
+ * ## 步骤
+ * step1. 校验 impl_ 与 socket 有效性，失败即返回 false；
+ * step2. 先查重：同一 socket 已挂载时只替换 handler，不新增 slot（避免同一 fd 被 poll 两次、事件被消费两遍）；
+ * step3. 构造 Slot 并优先复用空闲槽位；复用失败才 push_back 并预留 poll 表容量；
+ * step4. 挂载成功后立即回调 handler->OnAttached，让协议层可以马上发起首包或注册定时器。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：只能在事件循环线程（Run 所在线程）或 loop 启动前调用；slot 表无锁。
+ * - 原子性：slot 写入与 poll 表刷新不是原子的——挂载后到下一次 RefreshPollSet 之前不会有该 fd 的事件。
+ * - 失败语义：不抛异常；返回 false 时 slot 表未被修改。
+ * - 不变量：返回 true 时恰好有一个 active slot 指向该 socket；handler 至多被 OnAttached 一次。
+ */
 bool EventLoop::AttachDatagram(DatagramSocket& socket, Protocol* handler) {
+    // step1: 校验 impl_ 与 socket 有效性；失败返回 false，slot 表不变。
     if (!impl_ || !socket.valid()) {
         return false;
     }
@@ -126,6 +153,7 @@ bool EventLoop::AttachDatagram(DatagramSocket& socket, Protocol* handler) {
             return true;
         }
     }
+    // step2: 构造 Slot 前先查重——同 socket 已挂载时只替换 handler，避免同一 fd 被 poll 两次。
     Slot fresh;
     fresh.fd = socket.fd();
     fresh.is_stream = false;
@@ -141,10 +169,12 @@ bool EventLoop::AttachDatagram(DatagramSocket& socket, Protocol* handler) {
             return true;
         }
     }
+    // step3: 优先复用空闲槽位，无空位才追加并预留 poll 表容量。
     impl_->slots.push_back(fresh);
     impl_->pollfds.reserve(impl_->slots.size() + 1);
     impl_->poll_to_slot.reserve(impl_->slots.size() + 1);
     if (handler != nullptr) {
+        // step4: 挂载成功后立即回调 OnAttached，让协议层可马上发起首包或注册定时器。
         handler->OnAttached(*this);
     }
     return true;
@@ -210,7 +240,30 @@ bool EventLoop::Detach(StreamSocket& socket) {
     return false;
 }
 
+/**
+ * @brief 释放一个 slot：清空 fd 与处理器引用，并回调对应协议层的 OnDetached。
+ *
+ * @param slot_index [in] slot 下标——越界或该槽位已 inactive 时静默返回（幂等）。
+ *
+ * ## 定位
+ * slot 生命周期的唯一回收点；Detach 与「socket 出错被摘除」都走这里。
+ * 写错会让 slot 残留 active 状态，poll 派发到已销毁的 socket（悬垂引用）或重复回调 OnDetached。
+ *
+ * @return 无返回值——调用方**不要**在返回后继续使用该 slot 的 handler。
+ *
+ * ## 步骤
+ * step1. 越界与已 inactive 的幂等早退，保证重复 Detach 不会二次回调；
+ * step2. 先置 active=false 并清 fd，使后续 poll 刷新不会再包含它（先摘除再回调）；
+ * step3. 按 stream/datagram 分支取出 handler 并清空引用，再调用 OnDetached——保证回调内看不到已失效的槽位。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：只能在事件循环线程调用；slot 表无锁。
+ * - 原子性：active 置位与 handler 清空在同一线程顺序执行，对 poll 刷新可见。
+ * - 失败语义：不抛异常；越界/重复调用均为 no-op。
+ * - 不变量：返回后该 slot 的 active 为 false 且不再持有任何 socket/handler 指针。
+ */
 void EventLoop::DetachSlot(std::size_t slot_index) {
+    // step1: 越界与已 inactive 的幂等早退，保证重复 Detach 不会二次回调 OnDetached。
     if (slot_index >= impl_->slots.size()) {
         return;
     }
@@ -218,8 +271,10 @@ void EventLoop::DetachSlot(std::size_t slot_index) {
     if (!slot.active) {
         return;
     }
+    // step2: 先清 active 与 fd，使后续 poll 刷新不再包含它（先摘除、再回调）。
     slot.active = false;
     slot.fd = -1;
+    // step3: 按 stream/datagram 分支取出 handler 并清空引用，再回调 OnDetached，避免回调内看到失效槽位。
     if (slot.is_stream) {
         StreamProtocol* handler = slot.stream_handler;
         slot.stream_handler = nullptr;
@@ -295,21 +350,50 @@ void EventLoop::Post(std::function<void()> task) {
     }
 }
 
+/**
+ * @brief 事件循环主循环：按「Post 任务 → 到期定时器 → poll → 派发」四阶段推进，直到 Stop。
+ *
+ * @param 无（依赖 impl_、stop_、tick_ 等成员状态）。
+ *
+ * @return
+ * - 无返回值：仅在本循环因 stop_ 置位或 poll 致命错误而退出——调用方**必须**在返回后自行清理已挂载资源；
+ * - 循环体内的派发不产生返回值——调用方**不要**期望这里上报单次 IO 结果，结果经 Protocol 回调送出。
+ *
+ * ## 定位
+ * 整个 rd_net 的唯一驱动点；tick 顺序（任务→定时器→IO）决定了同一时刻的公平性与延迟上界。
+ * 写错会让定时器饿死（IO 密集时永不触发）或 Post 任务插队，破坏调用方对时序的假设。
+ *
+ * ## 步骤
+ * step1. 读取 tick 起点作为 cutoff 并自增 tick 计数，保证本轮到期判定有统一时间基准；
+ * step2. 整批排空 Post 队列（FIFO），每轮检查 Stop 以便及时退出；
+ * step3. 触发 cutoff 之前到期的定时器（回调内 Stop 也立即退出）；
+ * step4. 刷新 poll 集合并计算本轮超时（最近定时器截止时间，被 kMaxPollTimeoutMs 截断）；
+ * step5. 调 poll：EINTR 直接重试下一轮，其它错误 Stop 并退出；成功则派发就绪事件。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：只能由一条线程调用 Run；Post/ScheduleAfter 可跨线程（内部有锁）但 Run 本身不可重入。
+ * - 原子性：tick 计数是原子自增，仅用于观测；stop_ 用 acquire 读取，保证外部 Stop 能被看到。
+ * - 失败语义：不抛异常（回调异常由回调方自行处理）；poll 致命错误等价于 Stop。
+ * - 不变量：退出时 stop_ 为真；每轮至多派发一轮 poll 结果，不会在同一 tick 内二次阻塞。
+ */
 void EventLoop::Run() {
     if (!impl_) {
         return;
     }
+    // step1: 每轮取 tick 起点作为 cutoff 并自增计数，保证本轮到期判定共用同一时间基准。
     while (!stop_.load(std::memory_order_acquire)) {
         const EventTimePoint cutoff = EventClock::now();
         tick_.fetch_add(1, std::memory_order_acq_rel);
 
         // 阶段 1：Post 任务（FIFO 整批）。
+        // step2: 整批排空 Post 队列（FIFO），并在批后检查 Stop 以便及时退出。
         DrainPostedTasks();
         if (stop_.load(std::memory_order_acquire)) {
             break;
         }
 
         // 阶段 2：截止 tick 起点已经到期的定时器。
+        // step3: 触发 cutoff 之前到期的定时器；回调内 Stop 也会立即退出。
         FireDueTimers(cutoff);
         if (stop_.load(std::memory_order_acquire)) {
             break;
@@ -318,6 +402,7 @@ void EventLoop::Run() {
         // 阶段 3：poll 等待 + IO 派发。
         RefreshPollSet();
         const int timeout_ms = ComputePollTimeoutMs();
+        // step4: 刷新 poll 集合并按最近定时器截止时间计算超时；EINTR 重试，其它错误 Stop 退出。
         const int ready = ::poll(impl_->pollfds.data(),
                                  static_cast<nfds_t>(impl_->pollfds.size()),
                                  timeout_ms);
@@ -328,6 +413,7 @@ void EventLoop::Run() {
             Stop();
             break;
         }
+        // step5: 派发本轮就绪事件，把数据推给对应协议处理器。
         DispatchReadyEvents(ready);
     }
 }
@@ -348,7 +434,30 @@ void EventLoop::DrainPostedTasks() {
     impl_->draining.clear();
 }
 
+/**
+ * @brief 弹出并执行所有截止时间不晚于 cutoff 的定时器回调，跳过已取消项。
+ *
+ * @param cutoff [in] 本轮到期判定上界——用 Run 的 tick 起点，保证同一 tick 内判定一致；早于等于它的定时器才触发。
+ *
+ * ## 定位
+ * 定时器堆的唯一消费点；取消与到期的竞争在这里收敛。
+ * 写错会重复触发同一回调或漏触发（堆序被破坏），前者导致重传风暴，后者导致超时逻辑失效。
+ *
+ * @return 无返回值——到期回调在本次调用内同步执行；调用方**不要**在其返回后再次假定定时器未触发。
+ *
+ * ## 步骤
+ * step1. 循环看堆顶：先剔除已取消的 id（惰性删除），保持 pop_heap/pop_back 的堆结构；
+ * step2. 堆顶截止时间晚于 cutoff 时停止（堆按最早到期排序，后续不可能到期）；
+ * step3. 弹出堆顶并执行回调；每执行一个都检查 Stop，保证长回调链不会拖延关停。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：只能在 Run 所在线程调用；timers/cancelled 无锁。
+ * - 原子性：单个定时器「弹出 + 执行」之间不原子，回调内 CancelTimer 只能影响尚未弹出的项。
+ * - 失败语义：不抛异常到循环层；回调自身异常需在回调内消化。
+ * - 不变量：返回后堆顶的截止时间一定晚于 cutoff；被取消的定时器不会再触发。
+ */
 void EventLoop::FireDueTimers(EventTimePoint cutoff) {
+    // step1: 先惰性剔除堆顶已取消的 id，保持 pop_heap/pop_back 的堆结构完整。
     std::vector<TimerEntry>& timers = impl_->timers;
     while (!timers.empty()) {
         if (impl_->cancelled.erase(timers.front().id) > 0) {
@@ -356,12 +465,14 @@ void EventLoop::FireDueTimers(EventTimePoint cutoff) {
             timers.pop_back();
             continue;
         }
+        // step2: 堆按最早到期排序，堆顶晚于 cutoff 即说明本轮没有更多到期项，直接结束。
         if (timers.front().deadline > cutoff) {
             break;
         }
         std::pop_heap(timers.begin(), timers.end(), TimerEarlier{});
         TimerEntry entry = std::move(timers.back());
         timers.pop_back();
+        // step3: 弹出堆顶并执行回调；每执行一个都检查 Stop，避免长回调链拖延关停。
         if (entry.callback) {
             entry.callback();
         }

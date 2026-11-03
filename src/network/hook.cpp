@@ -1030,10 +1030,40 @@ std::optional<IOManager::TimePoint> deadline_from_timeout(
     return now + *timeout;
 }
 
+/**
+ * @brief 在没有 IOManager 可用时，用短切片原生 poll 模拟一次可被 close 打断的等待。
+ *
+ * @param fd [in] 目标 fd——必须是已接管（有 descriptor 元数据）的 socket/FIFO，否则调用方不该走本函数。
+ * @param event [in] 等待方向——kRead→POLLIN，kWrite→POLLOUT；其它值按 kWrite 处理。
+ * @param deadline [in] 绝对截止时刻——nullopt 表示无超时，按 10ms 切片无限轮询。
+ * @param descriptor [in] 描述符元数据——借用，持生命周期门时有效；用于检测 close/dup2 代际失效。
+ * @param timeout_error [in] 超时映射的 errno——数据面传 EAGAIN，connect 传 ETIMEDOUT。
+ *
+ * @return
+ * - 0：fd 已就绪——调用方**必须**随后做真实 syscall，并容忍它仍返回 EAGAIN；
+ * - 其它 errno：EBADF（已关闭/复用）、超时映射值或 poll 失败——调用方**不要**重试同一代际。
+ *
+ * ## 定位
+ * Hook 已启用但没有 IOManager 时的唯一等待回退路径（managed 延迟接管、纯原生线程）。
+ * 写错会在被 close 的 fd 上永久阻塞，或在 fd 号被复用后读到别人的数据。
+ *
+ * ## 步骤
+ * step1. 每轮先过生命周期门检查代际是否已失效，失效立即返回 EBADF；
+ * step2. 依据 deadline 计算本轮切片毫秒数（上限 10ms），先做范围钳制再用作 int，避免 TimePoint::max() 溢出；
+ * step3. 执行一次原生 poll，EINTR 由外层循环重试，其它错误直接返回 errno；
+ * step4. 有事件时再次过生命周期门确认代际，POLLNVAL 视作 EBADF，否则返回 0。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：只能在调用线程内短切片轮询；每轮都会释放 DescriptorGuard，不跨 poll 持有门。
+ * - 原子性：代际判定与 poll 之间不原子，因此 poll 返回后必须二次校验（step4），这是防 fd 复用的关键。
+ * - 失败语义：不抛异常；返回错误码后不修改 descriptor 状态。
+ * - 不变量：返回 0 时该 fd 在返回瞬间就绪且代际未变；返回 EBADF 时本代际确已失效。
+ */
 int native_wait(int fd, IOEvent event,
                 const std::optional<IOManager::TimePoint>& deadline,
                 const std::shared_ptr<Descriptor>& descriptor,
                 int timeout_error) {
+    // step1: 每轮先过生命周期门检查代际，失效立即 EBADF，避免在被复用/关闭的 fd 上等待。
     // 另一个线程中的 poll 不一定会被 close 可靠中断。有限时长的 poll 切片让
     // 保留的代次检测 close，同时不持有 IOManager，也不会在复用的数字描述符
     // 上永久等待。
@@ -1044,6 +1074,7 @@ int native_wait(int fd, IOEvent event,
                 return EBADF;
             }
         }
+        // step2: 按 deadline 计算切片毫秒（上限 10ms），先钳制范围再转 int，避免 TimePoint::max() 溢出。
         int milliseconds = 10;
         if (deadline) {
             const auto now = IOManager::Clock::now();
@@ -1071,6 +1102,7 @@ int native_wait(int fd, IOEvent event,
         pollfd poll_descriptor{};
         poll_descriptor.fd = fd;
         poll_descriptor.events = event == IOEvent::kRead ? POLLIN : POLLOUT;
+        // step3: 执行一次原生 poll；EINTR 由外层循环重试，其它错误直接返回 errno。
         const long result = ::syscall(SYS_poll, &poll_descriptor, 1,
                                       milliseconds);
         if (result < 0) {
@@ -1084,6 +1116,7 @@ int native_wait(int fd, IOEvent event,
             if (descriptor_closed(descriptor)) {
                 return EBADF;
             }
+            // step4: 有事件时再次过生命周期门确认代际，POLLNVAL 视作 EBADF，否则返回就绪。
             return (poll_descriptor.revents & POLLNVAL) != 0 ? EBADF : 0;
         }
     }
@@ -1254,7 +1287,38 @@ std::optional<Duration> connect_wait_timeout(
     return std::chrono::milliseconds(milliseconds);
 }
 
+/**
+ * @brief connect(2) 的协作式 Hook：先真实发起连接，EINPROGRESS 时 park 到可写就绪，再用 SO_ERROR 判定结果。
+ *
+ * @param fd [in] socket fd——必须在已接管的 descriptor 表中，或有 managed 准入资格可被 adopt；否则退回原生调用。
+ * @param address [in] 目标地址——借用，sockaddr 家族需与 fd 匹配；不可为 nullptr。
+ * @param length [in] address 字节长度——必须与 address 家族匹配，否则内核返回 EINVAL。
+ *
+ * @return
+ * - 0：连接已建立——调用方**必须**直接开始收发，不要重复 connect；
+ * - -1：失败，errno 已设置（EINPROGRESS 等中间态不会透出，已被 park 吸收）——调用方**不要**用同一 fd 重试，需重建 socket。
+ *
+ * ## 定位
+ * 非阻塞 connect 的唯一协作式实现点：所有经 Hook 的 TCP/Unix 连接都走这里。
+ * 写错会出现「连接已建立但调用方以为失败」或反过来的半连接状态，后续收发全错。
+ *
+ * ## 步骤
+ * step1. 校验原始 connect 指针是否可用（未初始化则 ENOSYS）；
+ * step2. 计算准入资格并为 managed G 准备 BlockingRegion，保证回退路径在 sysmon 可见；
+ * step3. 查 descriptor，未接管时尝试 adopt；仍失败则退回原生 connect（可能真阻塞）；
+ * step4. 在生命周期门内做一次真实 connect——门保证调用期间 fd 不被 close/dup2 抽走，但绝不跨 park 持有；
+ * step5. EINTR 原样透出（连接过程已被信号中止，重试只会得到 EALREADY 类误导错误）；不可 park 时直接返回结果；
+ * step6. 仅对 EINPROGRESS/EALREADY/EAGAIN 进入等待：有 manager 走 wait_for_io，否则走 native_wait，超时统一映射 ETIMEDOUT；
+ * step7. 等待成功后再次过生命周期门并用 SO_ERROR 判定最终结果，非零则映射到 errno 返回。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：在发起连接的业务线程/Fiber 上调用；park 期间不持 DescriptorGuard，也不持任何用户锁。
+ * - 原子性：fd 代际在 park 前后各校验一次；两次校验之间若发生 close/dup2，本次连接按 EBADF 失败。
+ * - 失败语义：不抛异常；失败后 fd 仍处于原状态（未连接），调用方需自行 close。
+ * - 不变量：返回 0 时 SO_ERROR 为 0 且 descriptor 未关闭；返回 -1 时 errno 一定被设置。
+ */
 int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
+    // step1: 原始 connect 指针不可用时返回 ENOSYS，绝不回落到可能被 Hook 的符号。
     if (!s_originals.m_connect) {
         errno = ENOSYS;
         return -1;
@@ -1267,11 +1331,13 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
          go2cpp::Fiber::Current() != nullptr);
     // 启用 Hook 时，没有 IOManager 的 managed Fiber 仍可使用有限时长的原生
     // poll 回退。禁用 Hook 时保留原生语义，只发布 M::Blocking。
+    // step2: 计算准入资格并为 managed G 准备 BlockingRegion，保证回退的原生调用在 sysmon 可见。
     std::optional<go2cpp::BlockingRegion> blocking_region;
     if (manager == nullptr && go2cpp::Scheduler::current_task() != nullptr) {
         blocking_region.emplace();
     }
     auto descriptor = descriptor_for(fd);
+    // step3: 查 descriptor 并尝试 adopt；仍未接管则退回原生 connect（可能真阻塞），语义保持原生。
     if (!descriptor && managed_hook_admission) {
         descriptor = try_adopt_socket(fd);
     }
@@ -1291,8 +1357,10 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
             errno = EBADF;
             return -1;
         }
+        // step4: 在生命周期门内做一次真实 connect；门只在 syscall 期间持有，绝不跨越后续 park。
         result = invoke_real(s_originals.m_connect, fd, address, length);
     }
+    // step5: EINTR 原样透出（连接过程已被信号中止），不可 park 时也直接返回结果。
     if (result < 0 && errno == EINTR) {
         // HOOK-03 / POSIX：connect 返回 EINTR 表示「连接建立过程已被信号
         // 中止」。内核侧这次连接不再处于 in-progress 状态，重试只会得到
@@ -1315,6 +1383,7 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
     // 配置的 connect 超时同样适用于 managed 延迟接管后的原生 poll 回退。若
     // 元数据分配失败或显式禁用 Hook，原始 libc 调用仍是文档规定的原生阻塞边界。
     const auto deadline =
+        // step6: 仅对 EINPROGRESS/EALREADY/EAGAIN 等待可写：有 manager 走 wait_for_io，否则 native_wait。
         deadline_from_timeout(connect_wait_timeout(descriptor));
     const auto token = snapshot_descriptor(descriptor).m_token;
     int wait_errno = 0;
@@ -1344,6 +1413,7 @@ int cooperative_connect(int fd, const sockaddr* address, socklen_t length) {
         return -1;
     }
 
+    // step7: 等待成功后再次过生命周期门，用 SO_ERROR 判定最终结果并映射 errno。
     int socket_error = 0;
     socklen_t error_size = sizeof(socket_error);
     if (!s_originals.m_getsockopt ||

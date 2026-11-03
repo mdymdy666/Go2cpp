@@ -450,8 +450,35 @@ void Socket::SetTcpNoDelayDefault(bool enabled) noexcept {
 bool Socket::TcpNoDelayDefault() noexcept {
     return g_tcp_nodelay_default.load(std::memory_order_acquire);
 }
+/**
+ * @brief 从监听 socket 接出一个已连接 fd，做成非阻塞 + TCP_NODELAY 的 Socket 对象。
+ *
+ * @param timeout [in] 单次 accept 的总预算时长——Duration::max() 表示不限；到点返回 ETIMEDOUT；计数单位：内部 steady_clock 时长。
+ *
+ * @return
+ * - 非空 Socket::Ptr：新连接已创建并归属调用方（独占所有权）——调用方**必须**负责关闭；
+ * - nullptr：无连接/超时/取消/系统错误，errno 已设置——调用方**不要**假定监听 fd 失效，可继续 accept。
+ *
+ * ## 定位
+ * 监听 fd 上唯一的「接连接 + 属性纠正」点：accept4 出来的 fd 由这里决定是否交给 Hook 协作调度。
+ * 写错会让新连接退回 100ms 分片轮询（每请求数十次 epoll_ctl），吞吐掉一个数量级。
+ *
+ * ## 步骤
+ * step1. begin_operation 固化 fd 并记录读取消代际，close 与 accept 竞争时据此判定取消；
+ * step2. 循环 accept4(SOCK_CLOEXEC|SOCK_NONBLOCK)，EINTR 重试，EAGAIN 转入等待；
+ * step3. 成功时先 mark_system_nonblocking 纠正内核标志（否则 Hook 会误判为用户要求非阻塞而拒绝 park），再 FromFd 包装；
+ * step4. 对新连接按需设 TCP_NODELAY（仅 AF_INET/AF_INET6 的 SOCK_STREAM，UDP/Unix 不设）；
+ * step5. EAGAIN 时按剩余预算 wait_ready，超时置 ETIMEDOUT，等待失败则结束操作并返回空。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同一 Socket 上的 accept 不保证并发安全，应由单一线程/单条 Fiber 调用。
+ * - 原子性：end_operation 在所有出口恰好调用一次，保证 fd 引用计数与操作标志配平。
+ * - 失败语义：noexcept 无关但内部不抛异常；返回空时新 fd 已被 accept4 回收，无泄漏。
+ * - 不变量：返回非空时该 Socket 的 m_connected 已置真且 fd 有效；返回空时监听 fd 未被本函数关闭。
+ */
 Socket::Ptr Socket::accept(Duration timeout) {
     const auto start = std::chrono::steady_clock::now();
+    // step1: begin_operation 固化 fd 并记录读取消代际，close 与 accept 竞争时据此判定取消。
     const auto cancel_generation = m_read_cancel_generation.load(std::memory_order_acquire);
     int fd = -1; if (!begin_operation(fd)) return {};
     if (m_read_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
@@ -460,9 +487,11 @@ Socket::Ptr Socket::accept(Duration timeout) {
         return {};
     }
     for (;;) {
+        // step2: 循环 accept4；EINTR 重试，EAGAIN 转入等待，其它错误结束操作返回空。
         sockaddr_storage storage{}; socklen_t length = sizeof(storage);
         const int accepted = ::accept4(fd, reinterpret_cast<sockaddr*>(&storage), &length,
                                        SOCK_CLOEXEC | SOCK_NONBLOCK);
+        // step3: 先纠正内核非阻塞标志（否则 Hook 误判为用户意图而拒绝 park），再 FromFd 包装并记录调试事件。
         if (accepted >= 0) {
             // accept4(SOCK_NONBLOCK) 的 O_NONBLOCK 是运行时为了让「先试一次」
             // 不阻塞 M 而设置的，不是用户要的 EAGAIN 语义。Hook 会把内核标志
@@ -492,6 +521,7 @@ Socket::Ptr Socket::accept(Duration timeout) {
         }
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) { end_operation(); return {}; }
+        // step4: 按剩余预算 wait_ready；预算耗尽置 ETIMEDOUT，等待失败则结束操作返回空。
         auto left = remaining(timeout, start);
         if (left.count() == 0 && timeout != Duration::max()) { errno = ETIMEDOUT; end_operation(); return {}; }
         if (wait_ready(fd, io::IOEvent::kRead, left, cancel_generation) != 0) {
@@ -500,7 +530,35 @@ Socket::Ptr Socket::accept(Duration timeout) {
         }
     }
 }
+/**
+ * @brief 发起一次（可能异步的）连接：真调 connect，EINPROGRESS 时等可写再用 SO_ERROR 定成败。
+ *
+ * @param address [in] 目标地址——借用，生命周期需覆盖本次调用；家族必须与 socket 匹配。
+ * @param timeout [in] 连接预算时长——Duration::max() 表示不限；到点返回 ETIMEDOUT。
+ *
+ * @return
+ * - true：连接已建立，m_connected 已置真——调用方**必须**直接开始收发；
+ * - false：失败，errno 已设置——调用方**不要**复用同一 fd 重试，需重建 Socket。
+ *
+ * ## 定位
+ * Socket 层唯一的连接状态提交点：m_connected 只在这里被置真，所有上层协议依赖它判断可用性。
+ * 写错会让「连接已建立」与「调用方认为失败」不一致，后续读写全部落到错误状态。
+ *
+ * ## 步骤
+ * step1. begin_operation 固化 fd 并记录写取消代际，已取消则 ECANCELED 直接返回；
+ * step2. 先记录 m_remote，保证失败后仍可 reconnect 到同一目标；
+ * step3. 真调 connect(2)：立即成功即提交状态；非 EINPROGRESS/EALREADY 的错误原样失败；
+ * step4. 异步进行中则按剩余预算 wait_ready，等待失败按 errno 返回；
+ * step5. 就绪后用 SO_ERROR 取最终结果，非零则映射 errno 失败，否则提交 m_connected=true。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同一 Socket 上不应并发 connect/close；m_remote/m_connected 由 m_mutex 保护。
+ * - 原子性：m_connected 的写与 m_remote 的写分别持锁，SO_ERROR 读取在其后单线程完成。
+ * - 失败语义：不抛异常；失败时 m_connected 保持原值（false），fd 未被关闭。
+ * - 不变量：返回 true 时 SO_ERROR 为 0；返回 false 时 errno 必被设置且 m_connected 为 false。
+ */
 bool Socket::connect(const Address& address, Duration timeout) {
+    // step1: begin_operation 固化 fd 并记录写取消代际，已取消则 ECANCELED 直接失败。
     const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
     int fd = -1; if (!begin_operation(fd)) return false;
 #if GO2CPP_DEBUG_SOCKET
@@ -523,8 +581,10 @@ bool Socket::connect(const Address& address, Duration timeout) {
     }
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        // step2: 先记录 m_remote，保证失败后仍可 reconnect 到同一目标。
         m_remote = std::make_shared<UnknownAddress>(address.addr(), address.addr_len());
     }
+    // step3: 真调 connect：立即成功即提交状态；非 EINPROGRESS/EALREADY 的错误原样失败。
     const int result = ::connect(fd, address.addr(), address.addr_len());
     if (result == 0) {
         { std::lock_guard<std::mutex> lock(m_mutex); m_connected = true; }
@@ -541,6 +601,7 @@ bool Socket::connect(const Address& address, Duration timeout) {
     }
     const auto start = std::chrono::steady_clock::now();
     auto left = remaining(timeout, start);
+    // step4: 异步进行中则按剩余预算等可写，等待失败按 errno 返回，不提交 m_connected。
     const int wait_error = wait_ready(fd, io::IOEvent::kWrite, left, cancel_generation);
     if (wait_error != 0) {
         errno = wait_error;
@@ -550,6 +611,7 @@ bool Socket::connect(const Address& address, Duration timeout) {
         end_operation(); return false;
     }
     int error = 0; socklen_t length = sizeof(error);
+    // step5: 就绪后用 SO_ERROR 取最终结果；非零即失败，否则才提交 m_connected=true。
     if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) != 0 || error != 0) {
         if (error) errno = error;
 #if GO2CPP_DEBUG_SOCKET

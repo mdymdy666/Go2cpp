@@ -94,13 +94,42 @@ public:
 
     // ---- ProtocolContext ----
 
+    /**
+     * @brief 协议层 SendTo 的入队实现：只分配 token 并把借用视图压进待发队列，不发 syscall。
+     *
+     * @param data [in] 载荷视图——借用，必须活到真正 send 的那一刻（调用方需保证内存不被提前释放）。
+     * @param to [in] 目标端点——按值复制进队列（SSO，不分配）。
+     *
+     * @return
+     * - SendResult{kOk, token}：已入队——调用方**不要**认为已发出，完成通知经 OnSendComplete 异步到达；
+     * - SendResult{kWouldBlock, 0}：队列已满（kMaxPendingSends）——调用方**必须**退避后重试，不要丢弃数据；
+     * - SendResult{kInvalid, 0}：桥接器未挂载——调用方**不要**继续发送，等 OnAttached 之后再试。
+     *
+     * ## 定位
+     * 发送队列的唯一入队点；队列长度与借用语义共同决定内存安全边界。
+     * 写错（例如这里拷贝或提前释放视图）会导致悬垂读取或数据错发到别的连接。
+     *
+     * ## 步骤
+     * step1. 校验 attached_，未挂载直接 kInvalid；
+     * step2. 队列达到上限时返回 kWouldBlock，让调用方背压而不是无界增长内存；
+     * step3. 分配递增 token 并入队 {view, to, token}，立即返回 kOk（真正的发送交给 Pump）。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：只在协议回调内（事件循环线程）调用；pending_ 无锁。
+     * - 原子性：一次入队是单步 push_back；失败时队列不变。
+     * - 失败语义：不抛异常（deque 分配失败会 terminate，取决于分配器；队列有上限，正常不触发）。
+     * - 不变量：返回 kOk 时 token 唯一且一定会有一次 OnSendComplete（或 OnDetached 清空队列）。
+     */
     SendResult SendTo(ByteView data, const Endpoint& to) override {
+        // step1: 未挂载直接 kInvalid，避免把数据压进一个永不 Pump 的队列。
         if (!attached_) {
             return SendResult{IoStatus::kInvalid, 0};
         }
+        // step2: 队列达上限时返回 kWouldBlock，让调用方背压而不是无界增长内存。
         if (pending_.size() >= kMaxPendingSends) {
             return SendResult{IoStatus::kWouldBlock, 0};
         }
+        // step3: 分配唯一 token 并入队借用视图，立即返回 kOk；真正发送由 Pump 在回调后完成。
         const std::uint64_t token = next_token_++;
         pending_.push_back(PendingDatagram{data, to, token});
         return SendResult{IoStatus::kOk, token};
@@ -132,14 +161,41 @@ public:
 
 private:
     /// @brief 把队列里的数据报真正发出去；回调返回后由外层调用。
+    /**
+     * @brief 每个 tick 把待发队列真正发出去（每 tick 有预算），剩余部分挂 0ms 定时器续发。
+     *
+     * @param 无（消费 pending_ 并复用 socket_/handler_）。
+     *
+     * ## 定位
+     * 发送队列的唯一出队点，也是「回调后立即 flush」与「限流续发」的结合处。
+     * 写错会让队列无限堆积（饿死其它 socket）或在 OnDetached 之后继续发送（悬垂引用）。
+     *
+     * @return 无返回值——发送结果通过 handler_.OnSendComplete 逐个回调；调用方**不要**等待返回值。
+     *
+     * ## 步骤
+     * step1. 未挂载或已在 pump 中时直接返回，防止 OnSendComplete 回调里重入 Pump 造成递归；
+     * step2. 置 pumping_ 标志，取得本 tick 预算 kSendBudgetPerTick；
+     * step3. 逐条取出队首调用 socket_.SendTo，发送后立即回调 OnSendComplete（含本次 token 与四态）；
+     * step4. 回调可能触发 Detach：每轮回调后重新检查 attached_，已摘除则直接返回（不续发）；
+     * step5. 预算耗尽且仍有剩余时挂 0ms 定时器在下一 tick 续发，避免长时间占用同一 tick 饿死定时器。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：只在事件循环线程调用（OnAttached/OnDatagram/OnTimer 之后）。
+     * - 原子性：单条发送与它的 OnSendComplete 之间不原子——回调内可能再次入队，但不会重入 Pump。
+     * - 失败语义：不抛异常；发送失败仅通过 OnSendComplete 的 status 表达，不中断后续条目。
+     * - 不变量：返回时 pumping_ 必为 false（早退路径除外，此时由外层持有）；pump 期间的 pending_ 只减不增（回调内的新增除外）。
+     */
     void Pump() {
+        // step1: 未挂载或已在 pump 中直接返回，防止 OnSendComplete 回调里重入导致递归。
         if (!attached_ || pumping_) {
             return;
         }
+        // step2: 置重入标志并取本 tick 发送预算 kSendBudgetPerTick。
         pumping_ = true;
         std::size_t budget = kSendBudgetPerTick;
         while (budget > 0 && attached_ && !pending_.empty()) {
             --budget;
+            // step3: 取出队首真正发送，并立即以本次 token 回调 OnSendComplete（成功/失败都回调）。
             const PendingDatagram item = pending_.front();
             pending_.pop_front();
             SendResult raw{};
@@ -153,6 +209,7 @@ private:
         pumping_ = false;
         if (attached_ && !pending_.empty()) {
             const std::weak_ptr<DatagramBridge> weak = weak_from_this();
+            // step4: 预算耗尽仍有剩余时挂 0ms 定时器续发，避免长时间占用同一 tick 饿死定时器与其它 socket。
             loop_.ScheduleAfter(std::chrono::milliseconds(0), [weak]() {
                 if (const std::shared_ptr<DatagramBridge> self = weak.lock()) {
                     self->Pump();

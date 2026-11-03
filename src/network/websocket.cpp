@@ -637,6 +637,30 @@ WebSocketResult WebSocket::write_all(const void* data, std::size_t size) {
  * ## 失败语义
  * 协议违规走 `protocol_error()`（发 Close 后返回 `Protocol`）；IO 失败原样返回。
  */
+/**
+ * @brief 从传输层读出一个完整的 WebSocket 帧，完成长度、掩码与合法性校验。
+ *
+ * @param frame [out] 帧对象——成功时写入 fin/opcode/masked/payload；失败时内容未定义，调用方不应读取。
+ *
+ * @return
+ * - WebSocketResult{ok}：已读出完整帧——调用方**必须**按 opcode 分派（控制帧立即处理，数据帧按 FIN 拼接分片）；
+ * - WebSocketResult{错误}：读失败/协议违规/超限——调用方**必须**关闭连接，不要继续读下一帧（字节流已不同步）。
+ *
+ * ## 定位
+ * 接收方向唯一的帧边界解析点：帧长或掩码判定错一次，之后所有帧都会错位，表现为持续乱码而不是单帧失败。
+ *
+ * ## 步骤
+ * step1. 读 2 字节基础头，校验 RSV 位、opcode 合法性与掩码方向（服务端要求带掩码，客户端要求不带）；
+ * step2. 解析 7/16/64 位扩展长度，拒绝非最小表示与最高位为 1 的 64 位长度；
+ * step3. 校验控制帧约束（必须 FIN、载荷 <=125）与 max_frame_payload 上限，超限按 1009 关闭；
+ * step4. 读掩码键与 payload；分配失败按 MessageTooLarge 关闭传输层；带掩码则整字解掩码后返回成功。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同一 WebSocket 的读只能由一条执行流调用；写侧另有 m_write_mutex，读写可并发。
+ * - 原子性：一次调用要么完整消费一帧，要么以关闭连接收场，不存在半个 payload 继续复用的中间态。
+ * - 失败语义：不抛异常；bad_alloc 会置 m_closed 并 abort_transport，保证不在边界不确定时继续解析。
+ * - 不变量：返回 ok 时 frame.payload 长度等于线缆载荷长度；返回错误时连接不可继续使用。
+ */
 WebSocketResult WebSocket::read_frame(Frame& frame) {
     std::array<std::uint8_t, 2> header{};
     auto result = read_exact(header.data(), header.size());

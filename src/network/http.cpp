@@ -407,6 +407,37 @@ ParseResult Parser::finish(Response& response) {
     return {ParseState::Complete, consumed, {}};
 }
 std::string Parser::take_remaining() { std::string result; result.swap(m_buffer); reset(); return result; }
+/**
+ * @brief HTTP 增量解析核心：把新到的字节并入缓冲，推进请求行/头部/消息体状态机，产出解析结果。
+ *
+ * @param bytes [in] 本次新到的字节——借用，仅在本调用内读取；可空（finish 路径用它推进 EOF 语义）。
+ * @param response [in] 解析方向——true 按响应报文解析，false 按请求报文解析；决定起始行与 body framing 规则。
+ * @param request [out] 请求对象——response=false 时必填，成功解析出完整报文才写入；失败保持未完成状态。
+ * @param result [out] 响应对象——response=true 时必填，同上。
+ *
+ * @return
+ * - ParseResult{kComplete, consumed}：报文已完整——调用方**必须**按 consumed 处理流水线剩余字节，不要丢弃尾部；
+ * - ParseResult{kNeedMore, consumed}：还缺数据——调用方**不要**重复喂同一段已消费字节，继续 recv 再 feed；
+ * - ParseResult{kError}：协议/限额错误——调用方**必须**关闭连接，不要尝试跳过该报文继续解析。
+ *
+ * ## 定位
+ * 唯一的报文状态推进点：请求与响应共用同一实现，所有 framing（CL/chunked/EOF 定界）判定都在这里。
+ * 写错会造成半包误判（提前 Complete）或粘包丢字节（consumed 与缓冲不一致），两者都是数据面静默错误。
+ *
+ * ## 步骤
+ * step1. 校验缓冲上限并按需追加新字节，分配失败转 ParseState::Error 而不是抛异常；
+ * step2. 若已判定为「EOF 定界响应」则不再找头部，只做体积检查并继续 NeedMore，直到 finish() 收尾；
+ * step3. 查找头部结束标记；未找到时按头部上限判定 NeedMore 或 Error；
+ * step4. 从起始行切分版本/状态码或方法/目标，逐段做格式与长度校验；
+ * step5. 解析头部字段并据 Content-Length/Transfer-Encoding 选择 framing，推进到消息体状态；
+ * step6. 按 framing 判定 Complete 或 NeedMore，返回 consumed 供上层切分流水线。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：Parser 是单连接状态机，同一实例只能由一条执行流串行 feed；不内部加锁。
+ * - 原子性：状态推进非事务性——一旦返回 Error，内部 m_finished/m_error 已落定，实例不可复用（除非 reset）。
+ * - 失败语义：不抛异常；所有分配失败都转成 ParseState::Error 并写 m_error。
+ * - 不变量：返回 Complete 时缓冲中 [0, consumed) 属于该报文；返回 NeedMore 时已消费字节不会在下次调用中重复计算。
+ */
 ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* request, Response* result) {
     if (m_finished) return {ParseState::Complete, 0, {}};
     if (m_buffer.size() > std::numeric_limits<std::size_t>::max() - bytes.size() ||
@@ -414,16 +445,19 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
          m_buffer.size() + bytes.size() - m_limits.max_header_bytes > m_limits.max_body_bytes))
         return {ParseState::Error, 0, "input too large"};
     try {
+        // step1: 校验缓冲上限后追加新字节；分配失败转 ParseState::Error 并写 m_error，不抛异常。
         m_buffer.append(bytes.data(), bytes.size());
     } catch (const std::exception&) {
         m_error = "input allocation failed";
         return {ParseState::Error, 0, m_error};
     }
+    // step2: EOF 定界响应不再找头部，只做体积检查并继续 NeedMore，直到 finish() 收尾。
     if (response && m_response_close_delimited) {
         if (m_buffer.size() - m_body_start > m_limits.max_body_bytes)
             return {ParseState::Error, bytes.size(), "body too large"};
         return {ParseState::NeedMore, bytes.size(), {}};
     }
+    // step3: 查找头部结束标记；未找到按头部上限判定 NeedMore 或 Error，防止无界增长。
     const auto header_end = find_header_end(m_buffer);
     if (header_end == std::string::npos) {
         if (m_buffer.size() > m_limits.max_header_bytes) { m_error = "header too large"; return {ParseState::Error, bytes.size(), m_error}; }
@@ -434,6 +468,7 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
     std::size_t line_end = header_block.find("\r\n");
     if (line_end == std::string::npos || line_end > m_limits.max_line_bytes)
         return {ParseState::Error, bytes.size(), "invalid start line"};
+    // step4: 切分起始行并做格式/长度校验；请求行只允许三段，响应行第三段可含空格。
     const std::string_view start_line = header_block.substr(0, line_end);
     // 起始行手写切分：istringstream 每请求要构造流对象并分配，是解析热路径上
     // 最大的一笔固定开销。

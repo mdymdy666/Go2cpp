@@ -288,8 +288,36 @@ DatagramSocket& DatagramSocket::operator=(DatagramSocket&& other) noexcept {
     return *this;
 }
 
+/**
+ * @brief 创建并绑定一个 UDP 数据报 socket，把选项与批量发送参数固化成 DatagramSocket。
+ *
+ * @param local [in] 本地绑定端点——借用，仅在本调用内读取；端口 0 表示由内核分配。
+ * @param options [in] socket 选项——借用；reuse_address/broadcast 为真时才设对应 SO_*；缓冲大小为 0 表示不设。
+ *
+ * @return
+ * - Result::Ok(DatagramSocket)：已创建并 bind 成功，fd 所有权移交返回对象——调用方**必须**负责 Close；
+ * - Result::Err(kInvalid)：端点解析失败或地址构造失败——调用方**不要**重试同一端点，先修正地址文本/家族；
+ * - Result::Err(kIoError)：socket/bind/选项失败，error 为 errno——调用方按 errno 决定是否换端口重试。
+ *
+ * ## 定位
+ * UDP 数据面唯一的建链入口；fd 生命周期从这里开始，参数写死会影响该 socket 后续所有发送路径的语义。
+ *
+ * ## 步骤
+ * step1. 把 Endpoint 解析成 sockaddr（失败即 kInvalid），并包装成 Address；
+ * step2. 按地址族创建 UDP socket，失败返回 kIoError；
+ * step3. 依序应用 REUSEADDR/BROADCAST/收发缓冲选项，任一失败立即失败（避免半配置的 socket 外泄）；
+ * step4. bind 到解析出的本地地址，失败返回 kIoError；
+ * step5. 组装 DatagramSocket：移交 socket、记录 fd/local 与批量发送参数，返回 Ok。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：建链期单线程使用；返回前对象未被发布，无并发读者。
+ * - 原子性：任一步失败都会销毁已建 socket（RAII），不会留下未绑定的 fd。
+ * - 失败语义：不抛异常；Err 时返回对象未构造，fd 已被析构路径关闭。
+ * - 不变量：返回 Ok 时 valid() 为真、local() 是实际绑定地址；返回 Err 时无 fd 泄漏。
+ */
 Result<DatagramSocket> DatagramSocket::Open(const Endpoint& local,
                                             const SocketOptions& options) {
+    // step1: 解析绑定端点（端口 0 由内核分配）；失败按 kInvalid 返回，不建 socket。
     sockaddr_storage addr{};
     socklen_t addr_len = 0;
     int resolve_err = 0;
@@ -300,10 +328,12 @@ Result<DatagramSocket> DatagramSocket::Open(const Endpoint& local,
     if (!bind_address) {
         return Result<DatagramSocket>::Err(IoStatus::kInvalid, EINVAL);
     }
+    // step2: 按地址族创建 UDP socket；失败按 kIoError 返回 errno。
     Socket::Ptr socket = Socket::CreateUDP(addr.ss_family);
     if (!socket) {
         return Result<DatagramSocket>::Err(IoStatus::kIoError, errno);
     }
+    // step3: 依序应用 REUSEADDR/BROADCAST/收发缓冲；任一失败立即返回，避免半配置的 socket 外泄。
     if (options.reuse_address && !SetIntOption(*socket, SOL_SOCKET, SO_REUSEADDR, 1)) {
         return Result<DatagramSocket>::Err(IoStatus::kIoError, errno);
     }
@@ -320,6 +350,7 @@ Result<DatagramSocket> DatagramSocket::Open(const Endpoint& local,
                       static_cast<int>(options.send_buffer_bytes))) {
         return Result<DatagramSocket>::Err(IoStatus::kIoError, errno);
     }
+    // step4: bind 到解析出的本地地址；失败按 kIoError 返回，fd 由 RAII 关闭。
     if (!socket->bind(*bind_address)) {
         return Result<DatagramSocket>::Err(IoStatus::kIoError, errno);
     }
@@ -329,6 +360,7 @@ Result<DatagramSocket> DatagramSocket::Open(const Endpoint& local,
     if (sock.fd_ < 0) {
         return Result<DatagramSocket>::Err(IoStatus::kIoError, EBADF);
     }
+    // step5: 组装 DatagramSocket，记录实际绑定地址与批量发送参数后返回 Ok（fd 所有权移交返回对象）。
     sock.local_ = EndpointFromAddress(sock.socket_->local_address());
     sock.batch_bytes_ = options.batch_bytes;
     sock.batch_entries_ = options.batch_entries;
@@ -336,14 +368,45 @@ Result<DatagramSocket> DatagramSocket::Open(const Endpoint& local,
     return Result<DatagramSocket>::Ok(std::move(sock));
 }
 
+/**
+ * @brief 向指定端点发送一个不可切分的 UDP 数据报，返回四态结果。
+ *
+ * @param data [in] 载荷视图——借用；data 为 nullptr 时 size 必须为 0；size 超过 ssize_t 上限返回 kInvalid。
+ * @param to [in] 目标端点——借用；每次调用都重新解析，并记入 batch_target_ 供 SendBatch 复用。
+ * @param out [out] 发送结果——可为 nullptr；成功/失败都写入（含 token 与 status）；失败时 token 仍是本次分配值。
+ *
+ * @return
+ * - IoStatus::kOk：整条数据报已提交给内核——调用方**必须**认为该报文已发出（UDP 无重传保证）；
+ * - IoStatus::kWouldBlock：内核缓冲暂满——调用方**不要**忙等，应让出并按退避策略重试；
+ * - IoStatus::kIoError/kInvalid：系统错误/参数错误——调用方**不要**原样重试，按 last_error() 处理。
+ *
+ * ## 定位
+ * 单播数据面的唯一提交点，也是四态（Ok/WouldBlock/IoError/Invalid）映射的基准实现。
+ * 写错会导致「部分发送被当成成功」或「EAGAIN 被吞成错误」，前者静默丢包、后者误杀连接。
+ *
+ * ## 步骤
+ * step1. 初始化 SendResult 并分配 token，先把结果写回 out，保证任何早退都有可读状态；
+ * step2. 校验 fd 有效性与载荷参数，非法直接 kInvalid；
+ * step3. 解析目标端点；失败 kInvalid。解析成功后记录 batch_target_，供后续批量入口复用；
+ * step4. 大包且启用 sendmmsg 时走批量适配器（count=1，timeout=0 不重试）：先探测可写性，把 EAGAIN 原样透出为 kWouldBlock；
+ * step5. 普通路径循环 sendto(MSG_DONTWAIT|MSG_NOSIGNAL)：EINTR 重试，短写按 kIoError 上报（UDP 不允许部分发送），其余错误经 MapSendErrno 映射。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同一 DatagramSocket 不保证并发安全（next_token_/batch_target_/last_error_ 无锁），需外部串行化。
+ * - 原子性：单次 sendto 是一个数据报的原子提交；不存在半条报文可见的情况。
+ * - 失败语义：不抛异常；失败时 last_error_ 为 errno（kWouldBlock 时清 0），socket 状态不变。
+ * - 不变量：返回 kOk 时内核已接收整条数据报；返回 kWouldBlock 时一个字节都没发出。
+ */
 IoStatus DatagramSocket::SendTo(ByteView data, const Endpoint& to, SendResult* out) {
     SendResult result;
+    // step1: 初始化 SendResult 并分配 token；先写回 out，保证任何早退都有可读状态。
     result.token = ++next_token_;
     result.status = IoStatus::kInvalid;
     last_error_ = 0;
     if (out != nullptr) {
         *out = result;
     }
+    // step2: 校验 fd 与载荷参数（空指针只允许长度为 0），非法直接 kInvalid。
     if (!valid() || (data.data == nullptr && data.size != 0) ||
         data.size > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
         last_error_ = EINVAL;
@@ -355,6 +418,7 @@ IoStatus DatagramSocket::SendTo(ByteView data, const Endpoint& to, SendResult* o
     sockaddr_storage dst{};
     socklen_t dst_len = 0;
     int resolve_err = 0;
+    // step3: 解析目标端点；失败 kInvalid。成功后记录 batch_target_ 供批量入口复用。
     if (!ResolveEndpoint(to, SOCK_DGRAM, false, &dst, &dst_len, &resolve_err)) {
         last_error_ = resolve_err;
         if (out != nullptr) {
@@ -374,6 +438,7 @@ IoStatus DatagramSocket::SendTo(ByteView data, const Endpoint& to, SendResult* o
     // 「全有或全无」语义；因此这里用 sendmmsg 提交**单条**（count=1），
     // 由批量适配器统一超时/错误处理。可写性仍先由内核 poll 探测，
     // 保证 EAGAIN 能原样透出为 kWouldBlock，而不是被内部重试吞掉。
+    // step4: 大包走 sendmmsg 适配器（count=1、timeout=0）：先探测可写，EAGAIN 原样透出为 kWouldBlock。
     if (batch_bytes_ > 0 && enable_sendmmsg_ && data.size >= batch_bytes_) {
         const int writable = ProbeWritable(fd);
         if (writable == 0) {
@@ -418,6 +483,7 @@ IoStatus DatagramSocket::SendTo(ByteView data, const Endpoint& to, SendResult* o
     }
     for (;;) {
         const ssize_t n =
+            // step5: 普通路径循环 sendto；EINTR 重试，短写按 kIoError 上报（UDP 不允许部分发送），其余经 MapSendErrno 映射。
             ::sendto(fd, data.data, data.size, MSG_DONTWAIT | MSG_NOSIGNAL,
                      reinterpret_cast<const sockaddr*>(&dst), dst_len);
         if (n >= 0) {
@@ -472,6 +538,35 @@ IoStatus DatagramSocket::SetBatchTarget(const Endpoint& to, SendResult* out) {
     return IoStatus::kOk;
 }
 
+/**
+ * @brief 用 sendmmsg 把一个批次的 UDP 报文发往最近一次 SendTo/SetBatchTarget 记录的目标。
+ *
+ * @param entries [in] 批次数组——借用；长度由 count 给出，每项 data 非空；超过 kMaxBatchEntries 的部分被静默截断。
+ * @param count [in] 条目数——0 是合法 no-op（仍分配 token）；>0 时 entries 不可为 nullptr。
+ * @param out [out] 发送结果——可为 nullptr；写入 token/status，成功时 last_batch_submitted_ 记录实际提交条数。
+ *
+ * @return
+ * - IoStatus::kOk：整批都已提交——调用方**必须**视为全部发出；
+ * - IoStatus::kWouldBlock：部分或零条提交（见 last_batch_submitted_）——调用方**必须**从该下标起重试剩余部分；
+ * - IoStatus::kInvalid：参数非法/无目标（EDESTADDRREQ）——调用方**不要**重试，先修正批次或先调 SetBatchTarget。
+ *
+ * ## 定位
+ * 批量数据面的唯一提交点；截断与部分提交语义直接决定上层是否丢包。
+ * 写错会让调用方把「只发了 3 条」当成「64 条都发了」，是最隐蔽的丢包来源。
+ *
+ * ## 步骤
+ * step1. 初始化 token 与计数，count==0 直接成功返回（不产生系统调用）；
+ * step2. 校验 valid/entries/每条 data 非空，非法即 kInvalid；
+ * step3. 校验 batch_target_ 已就绪，否则 EDESTADDRREQ；
+ * step4. 解析目标端点并构造 SendBatchEntry 数组（每条都指向同一目标）；
+ * step5. 以 timeout=0 调 SocketBatchWriter：EAGAIN/ETIMEDOUT 映射 kWouldBlock，其余按 MapSendErrno；成功则按提交条数决定 Ok/WouldBlock。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同 DatagramSocket 需外部串行化；batch_target_ 与 last_batch_submitted_ 无锁。
+ * - 原子性：sendmmsg 逐条提交，整批不是原子的——部分成功必须通过 last_batch_submitted_ 观察。
+ * - 失败语义：不抛异常；kWouldBlock 时 last_error_ 清 0，kInvalid 时写入具体 errno。
+ * - 不变量：返回 kOk 时 last_batch_submitted_ == limit；返回 kWouldBlock 时它 < limit 且等于内核实际接受条数。
+ */
 IoStatus DatagramSocket::SendBatch(const go2cpp::bufio::BatchEntry* entries,
                                    std::size_t count, SendResult* out) {
     SendResult result;
@@ -482,6 +577,7 @@ IoStatus DatagramSocket::SendBatch(const go2cpp::bufio::BatchEntry* entries,
     if (out != nullptr) {
         *out = result;
     }
+    // step1: count==0 是合法 no-op：不产生系统调用，但仍分配 token 保持调用计数语义。
     if (count == 0) {
         // 合法 no-op：不产生系统调用，token 仍按调用分配。
         return IoStatus::kOk;
@@ -494,6 +590,7 @@ IoStatus DatagramSocket::SendBatch(const go2cpp::bufio::BatchEntry* entries,
         }
         return IoStatus::kInvalid;
     }
+    // step2: 校验 entries 与每条 data 非空，并把条目数截断到 kMaxBatchEntries。
     const std::size_t limit = std::min(count, kMaxBatchEntries);
     for (std::size_t i = 0; i < limit; ++i) {
         if (entries[i].data == nullptr) {
@@ -505,6 +602,7 @@ IoStatus DatagramSocket::SendBatch(const go2cpp::bufio::BatchEntry* entries,
             return IoStatus::kInvalid;
         }
     }
+    // step3: 批量入口没有目标参数，必须先 SetBatchTarget 或至少 SendTo 过一次，否则 EDESTADDRREQ。
     if (batch_target_.empty()) {
         // 批量入口没有目标参数：必须先 SetBatchTarget 或至少调用过一次 SendTo。
         last_error_ = EDESTADDRREQ;
@@ -526,6 +624,7 @@ IoStatus DatagramSocket::SendBatch(const go2cpp::bufio::BatchEntry* entries,
         }
         return IoStatus::kInvalid;
     }
+    // step4: 解析目标端点并构造 SendBatchEntry 数组，所有条目指向同一目标。
     std::vector<go2cpp::net::SendBatchEntry> batch;
     batch.reserve(limit);
     for (std::size_t i = 0; i < limit; ++i) {
@@ -538,6 +637,7 @@ IoStatus DatagramSocket::SendBatch(const go2cpp::bufio::BatchEntry* entries,
     }
     // timeout=0：不等待、不重试，EAGAIN 原样透出（映射成 kWouldBlock）。
     go2cpp::net::SocketBatchWriter writer(socket_, std::chrono::milliseconds(0), true);
+    // step5: timeout=0 调批量写入器：EAGAIN/ETIMEDOUT 映射 kWouldBlock，其余按 MapSendErrno；成功按提交条数定 Ok/WouldBlock。
     const go2cpp::net::SocketResult sent = writer.SendToBatch(batch.data(), batch.size());
     if (sent.error != 0 || sent.transferred < 0) {
         const int err = sent.error != 0 ? sent.error : EAGAIN;
@@ -563,6 +663,35 @@ IoStatus DatagramSocket::SendBatch(const go2cpp::bufio::BatchEntry* entries,
     return result.status;
 }
 
+/**
+ * @brief 从一个 UDP socket 收取一条数据报，同时给出源端点和真实报文长度。
+ *
+ * @param buf [out] 接收缓冲——写入最多 buf.size 字节；data 为 nullptr 或 size==0 视为非法参数。
+ * @param from [out] 源端点——可为 nullptr；成功时写入实际来源（含截断报文）。
+ * @param received [out] 实际报文长度——可为 nullptr；成功与截断时都写入内核报告的真实长度。
+ *
+ * @return
+ * - IoStatus::kOk：收到完整数据报——调用方**必须**只消费 received 字节；
+ * - IoStatus::kTruncated：报文大于缓冲（MSG_TRUNC）——调用方**必须**按 received 扩容或丢弃，不要当成功处理；
+ * - IoStatus::kWouldBlock：暂无数据——调用方**不要**忙等，交给事件循环/退避重试；
+ * - IoStatus::kInvalid：参数或 fd 非法——调用方**不要**重试，修正用法。
+ *
+ * ## 定位
+ * UDP 接收方向的唯一出口，也是「截断 vs 成功」判定的唯一位置。
+ * 写错会把被截断的报文当完整报文交给上层，造成协议解析错位且无任何错误信号。
+ *
+ * ## 步骤
+ * step1. 先把 received 置 0 并清 last_error_，再校验 fd 与缓冲参数，非法即 kInvalid；
+ * step2. 组装 msghdr（单 iovec + 源地址缓冲），带 MSG_TRUNC 调 recvmsg，使返回值是真实报文长度；
+ * step3. 成功时写入 from 与 received，并按 MSG_TRUNC/长度判断返回 kTruncated 或 kOk；
+ * step4. EINTR 时复位 msg_namelen/msg_flags 后重试；其它错误经 MapRecvErrno 映射（EAGAIN 清 last_error_）。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同 DatagramSocket 需外部串行化；buf 的有效期只需覆盖本次调用。
+ * - 原子性：一次 recvmsg 取走整条数据报，不存在「半条报文留在内核缓冲」的情况。
+ * - 失败语义：不抛异常；kWouldBlock 时 last_error_ 为 0，其它失败写入 errno。
+ * - 不变量：返回 kTruncated 时 received 是真实报文长度；返回 kOk 时 received <= buf.size。
+ */
 IoStatus DatagramSocket::RecvFrom(MutableByteView buf, Endpoint* from,
                                   std::size_t* received) {
     if (received != nullptr) {
@@ -574,6 +703,7 @@ IoStatus DatagramSocket::RecvFrom(MutableByteView buf, Endpoint* from,
         last_error_ = EINVAL;
         return IoStatus::kInvalid;
     }
+    // step1: 先置 received=0 并清 last_error_，校验 fd/缓冲；随后组装单 iovec 的 msghdr。
     iovec iov{};
     iov.iov_base = buf.data;
     iov.iov_len = buf.size;
@@ -586,6 +716,7 @@ IoStatus DatagramSocket::RecvFrom(MutableByteView buf, Endpoint* from,
     for (;;) {
         // 传入 MSG_TRUNC：报文大于缓冲时返回值是**实际报文长度**，
         // 同时 msg_flags 置 MSG_TRUNC。这样「截断」与「成功」可区分。
+        // step2: 带 MSG_TRUNC 收包，使返回值是真实报文长度，从而能区分「截断」与「成功」。
         const ssize_t n = ::recvmsg(fd, &msg, MSG_DONTWAIT | MSG_TRUNC);
         if (n >= 0) {
             const std::size_t actual = static_cast<std::size_t>(n);
@@ -611,6 +742,7 @@ IoStatus DatagramSocket::RecvFrom(MutableByteView buf, Endpoint* from,
         if (err == EAGAIN) {
             last_error_ = 0;
         }
+        // step3: EINTR 复位 msg 字段后重试；其它错误映射为四态（EAGAIN 清 last_error_ 后转 kWouldBlock）。
         return MapRecvErrno(err);
     }
 }
