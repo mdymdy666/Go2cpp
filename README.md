@@ -1,100 +1,121 @@
-# Go2Cpp 运行时语义兼容层
+# Go2Cpp —— Go 并发/网络语义的 C++ 复刻与优化工具库
 
-本仓库提供一个可独立使用的 C++17 库，实现文档明确的 Go 运行时语义子集。
-它是运行时/库，不是 Go 解析器，也不是 Go 到 C++ 的源码转译器。
+> **一句话**：把 Go 运行时的并发与网络模型（GMP 调度、Fiber、Channel、Context、netpoll）复刻到 C++17，
+> 在关键路径上做数量级优化；同时提供一套 **Go 语义开发工具**，让 Go 代码「几乎不改」迁移到 C++；
+> 以及覆盖 **多网络场景** 的快速开发组件（TCP/UDP/HTTP/WebSocket/MQTT/CoAP/SOCKS5、RPC、P2P、
+> 隧道、帧编解码、中继、缓存、存储、序列化、日志、配置）。
 
-仓库同时内置多块可选能力：MCP 框架 `mcp/`（`-DGO2CPP_WITH_MCP=ON`，默认 OFF）、
-统一命令行 `tools/cli`（`-DGO2CPP_WITH_CLI=ON`，默认 OFF）、主机监控与 eBPF 采集
-（`bpf/` + `go2cpp::os_monitor`，`-DGO2CPP_ENABLE_EBPF=ON`，默认开；eBPF 不可用时自动降级为
-`/proc` 采集）、P2P 公网穿透 `go2cpp::p2p`（`-DGO2CPP_WITH_P2P=ON`，默认 ON）、应用层流表框架
-`go2cpp::app`（`-DGO2CPP_WITH_APP=ON`，默认 OFF）与 header-only 缓存策略库 `go2cpp::cache`
-（默认可用，7 种淘汰策略）。
+这不是 Go 解析器，也不是源码转译器——它是一个可独立链接的 C++ 库，用 C++ 的类型系统重新表达
+Go 的运行时语义，并针对 C++ 场景做工程化取舍（无 GC、RAII、固定栈）。
 
-公共 API 位于 `go2cpp` 命名空间，包含：
+---
 
-- M/P/G 风格调度器：受限 P、本地/全局队列、工作窃取、M 动态增减、显式
-  `BlockingRegion` 替代 M、park 和 shutdown；
-- 带截止时间、值和取消原因的 context 取消树；
-- 可迁移的栈式 Fiber、`FiberLocal` 值、调度器感知的互斥锁/条件变量/等待组，
-  以及支持阻塞、关闭和 select 的类型化 channel；
-- Linux epoll `IOManager` 和默认启用、带 FD generation 关闭保护的 socket Hook；
-- 支持 `Is`、`As`、`Unwrap`、`Join` 的不可变错误链；
-- 线程安全、可替换 Filter/Formatter/Worker/Sink 的日志模块，以及可校验的 INI
-  配置模块；默认 warning/error 写入 `log/go2cpp.log`，stdout 需显式开启。
-- Fiber 边界捕获普通 C++ 异常并通过 Fiber::failure()/Task::failure() 报告；资源清理由 RAII 和 try/catch 负责。
-- 提供显式 defer、panic、recover 状态对象：defer 用 RAII 保证作用域退出的 LIFO 回调，
-  panic::call() 发布共享错误状态，recover::take() 只能在 defer 回调中消费；它不会伪造 C++ 栈跳转。
-- 独立的 SelectValue/SelectCaster 提供可替换的类型擦除中介；它可以承载不可
-  复制值并转换成业务类型。内建 Channel 的 RecvCase/SendCase 和 EventBatch
-  为保证等待节点可回滚，要求 T 可复制；move-only 值请使用普通 Send/Recv 或
-  直接使用 SelectValue。
+## 一、三大定位
 
-性能基线与优化记录见 [docs/performance-baseline-2026-10-19.md](docs/performance-baseline-2026-10-19.md)：
-包含公平对比方法（排除 warmup、随机负载、同构 epoll 模型）、三轮优化的
-根因/改动/前后数据，以及与 coost 的三框架对比。
+### 1. Go 运行时并发/网络的复刻与优化
 
-构建并运行默认测试套件：
+| 能力 | 实现 | 与 Go 的关系 |
+|---|---|---|
+| GMP 调度 | `Task=G` / `Scheduler` / `P` / `M` / worker / sysmon，P 本地队列 + 全局队列 + 工作窃取 | 对齐 Go `proc.go`，但**纯协作式**（无异步抢占），用 `BlockingRegion` 替代 M |
+| Fiber | 可迁移栈式协程 + `FiberLocal` + `FiberBin` 栈池 | 对齐 goroutine，但**固定栈**（默认 128 KiB，可调），无栈复制 |
+| Channel | 类型化 `Channel<T>`（阻塞/关闭/select/Context 注入）+ `FastChannel`（Vyukov ring） | 对标 Go `chan`；通用 Channel 默认带 Context 语义，FastChannel 对标无锁队列 |
+| 同步原语 | 调度器感知的 Mutex/RWMutex/Cond/WaitGroup，parking 机制 | 对齐 `sync` 包 |
+| Context | 取消树 + 截止时间 + 取消原因 | 对齐 `context` |
+| 错误链 | `Error/Wrap/Is/As/Unwrap/Join` | 对齐 `errors` |
+| 网络 IO | epoll `IOManager` + 透明 Socket Hook + FD generation 关闭保护 | 对齐 netpoll + runtime hook |
+| 调试 | `debug` 只读观察（事件环、等待图、诊断） | 自研 |
 
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
-```
+**优化不是口号**：所有性能数字都记录在 [`docs/metrics-ledger.md`](docs/metrics-ledger.md)，
+每条带「命令 / 环境 / 日期 / 脚本」，可用 `tools/verify_metrics.sh` 一条命令复跑。
 
-默认 Linux 构建启用共享模块和透明 Hook。静态构建请使用
-`-DBUILD_SHARED_LIBS=OFF -DGO2CPP_BUILD_HOOK=OFF`。
+已量化的优化示例（详见台账）：
 
-兼容性矩阵、设计边界和可复现验证矩阵分别见
-[`docs/compatibility.md`](docs/compatibility.md)、[`docs/design.md`](docs/design.md)
-以及模块扩展契约 [`docs/extensibility.md`](docs/extensibility.md)
-和 [`docs/testing.md`](docs/testing.md)。源码/依赖清单及 Go 参考版本见
-[`docs/dependencies.md`](docs/dependencies.md) 和
-[`third_party/go-reference/README.md`](third_party/go-reference/README.md)。
+| 项 | 数据 |
+|---|---|
+| os readv 合并（M10） | 写 17.96× → **≈111×**、读 15.32× → **≈213×**（相邻 iovec 合并，内核逐段成本 32.2 µs → 1.0 µs） |
+| FastChannel（M01b-b） | 16.07 / 6.23 ns 每操作（对标无锁队列，达标） |
+| HTTP 吞吐（M05） | 120,755 rps |
+| lru 缓存（M07） | 647.5k ops/s、82.4 MiB（vs 工业库 1.0×） |
+| TLS 吞吐（M14） | 1.061× vs 工业库 |
+| bento 流（M15） | 282,210 pps |
+| 调度器 vs Go（M16） | Go@4 **162.7 ns**、C++ 同轮 283–359 ns；差距归因于 Context 语义/单锁/跨 M 唤醒（架构差异，非实现缺陷，已收口） |
 
-第一次使用请先阅读
-[`docs/getting_started.md`](docs/getting_started.md)。该文档包含环境要求、最短
-可运行程序、Fiber/线程混合规则、Channel/Context/IO 生命周期、配置校验和常见
-错误排查步骤。
+### 2. Go 语义开发工具（Go 代码几乎不改迁移）
 
-可运行示例位于 `example/`，按模块子目录维护；完整清单、场景说明与运行方式见
-[`example/README.md`](example/README.md)：
+`include/go2cpp/go/**` 提供与 Go 标准库同形的 API：
 
-- `example/concurrency/`：`beginner_demo.cpp`、`runtime_demo.cpp`、
-  `fiber_sync_demo.cpp`、`managed_pipeline_demo.cpp`、`dynamic_gmp_demo.cpp`、
-  `mixed_runtime_demo.cpp`、`context_rollback_demo.cpp`、`timer_task_demo.cpp`；
-- `example/network/`：`network_demo.cpp`、`io_wait_many_demo.cpp`、
-  `io_hook_demo.cpp`（仅 Linux Hook 构建）、`sse_demo.cpp`、`websocket_demo.cpp`；
-- `example/logging/log_config_demo.cpp`、`example/tools/control_flow_demo.cpp`；
-- `example/app/`：`web_server_simple`、`web_server_full`、`chat_server_simple`、`chat_server_full`
-  四个服务示例（不注册 ctest，用 curl/客户端驱动），另有 `p2p_demo`、`cache_demo`、`stream_demo`
-  等演示程序；清单与运行方式见 [`example/app/README.md`](example/app/README.md)，需
-  `-DGO2CPP_WITH_APP=ON` 或对应模块开关。
+| 包 | 头文件 | 覆盖 |
+|---|---|---|
+| `chan` | `go/chan.go.hpp` | 有缓冲/无缓冲、select、range、close |
+| `context` | `go/context.go.hpp` | WithCancel/Timeout/Deadline/Value |
+| `error` | `go/error.go.hpp` | errors.New/Is/As/Unwrap/Join |
+| `io` | `go/io.go.hpp` | Reader/Writer/Closer/ReadAll/Copy |
+| `net` | `go/net.go.hpp` | Dial/Listen/Accept/Conn |
+| `sync` | `go/sync.go.hpp` | Mutex/RWMutex/WaitGroup/Once |
+| `time` | `go/time.go.hpp` | Timer/Ticker/After/Sleep |
+| `flag` | `go/flag.hpp` | 命令行解析 |
+| 其他 | `os_signal` / `crypto_rand` / `crc32` | 对齐 Go 同名包 |
 
-其中 `mixed_runtime_demo.cpp` 展示普通线程与 Fiber 的同步、FiberLocal 值、
-线程级 Hook 策略和显式 `BlockingRegion`。日志和配置的完整新手示例是
-`example/logging/log_config_demo.cpp`，工程配置模板是根目录的 `go2cpp.ini`，
-详细说明见 [`docs/logging.md`](docs/logging.md) 和
-[`docs/configuration.md`](docs/configuration.md)。
+设计目标：**Go 业务代码迁移到 C++ 时，主要改 import 与少量语法，不改并发/网络结构。**
 
-配置中心支持强类型 `ConfigVar<T>`、变更监听器和文件热加载；日志模块支持多
-Formatter/Sink、Sylar 风格格式、Logger 父级传播和滚动文件输出。
+### 3. 多网络场景快速开发 C++ 库
 
+| 场景 | 组件 |
+|---|---|
+| 传输层 | TCP/UDP（`network/socket`）、地址/流/字节数组、endian、批量 send/recv（`bufio_socket`） |
+| 应用协议 | HTTP/1.1 客户端/服务端、WebSocket、SSE、HTTP/2（HPACK/帧/流状态机）、QUIC/HTTP3（可选 picoquic） |
+| 物联网 | MQTT、CoAP |
+| 代理/隧道 | SOCKS5、TCP 隧道（`tunnel`）、HTTP 隧道（`app/http_tunnel`） |
+| RPC | 服务端/客户端/注册表、protobuf 风格编解码 |
+| P2P | STUN、打洞、TURN、ICE 候选、P2PChannel |
+| 可靠传输 | 帧编解码（FrameCodec）、中继管道（RelayPipe）、连接注册表（Hub）、租约/心跳（Lease/Heartbeat）、可靠骨架（SeqNum/重传队列/RFC 6298/拥塞控制纯虚）——见 `rd_net` |
+| 缓存 | 7 种淘汰策略：LRU / LRU-K / 2Q / W-TinyLFU / GDSF / ARC / CLOCK |
+| 存储 | SQLite（DB/ORM/迁移）、LevelDB 兼容 KV、memcache、队列、watch |
+| 序列化 | JSON、CSV、二进制、base64/hex、protobuf 风格 reflect codec |
+| 工程化 | 日志（分级/脱敏/滚动）、配置（INI + 热加载 + ConfigVar）、指标（metrics）、限流、退避、压缩（gzip/snappy/lz4/zstd） |
+| 运维 | MCP 框架、eBPF 主机监控（sched/futex/syscall/net/tcp/fileio）、CLI、诊断/回放 |
+| 应用层 | 流表框架（`app`：帧/流表/连接/资源/KV/传输适配）、通用 Gateway（注册式路由/中间件/可插拔 Resolver/JSON 热更新）、实时房间（RoomHub）、单飞（singleflight）、一致性哈希 |
 
-## 新手入口
+---
 
-如果只需要类似 Go 的提交方式，可以先启动一个 Scheduler，然后直接调用：
+## 二、能力矩阵（按模块）
+
+| 层 | 模块 | 状态 |
+|---|---|---|
+| 并发 | `scheduler` `fiber` `channel` `sync` `future` `context` `error` `timer` | ✅ 9 原语，1e9×3 压测通过 |
+| 网络 | `socket` `http` `websocket` `sse` `http2` `quic`（可选）`mqtt` `coap` `socks5` | ✅ 14/14 ≤1.1× Go |
+| 缓存 | `cache`（7 策略） | ✅ Go 标准库没有；几何 1.91× |
+| 存储 | `storage`（SQLite/ORM/LevelDB/memcache/queue/watch） | ✅ |
+| 序列化 | `encoding`（JSON/CSV/binary/base64/hex）+ reflect codec | ✅ |
+| RPC | `rpc`（server/client/registry） | ✅ |
+| P2P | `p2p`（STUN/TURN/打洞/ICE） | ✅ |
+| 可靠传输 | `rd_net`（四态 socket/EventLoop/协议注入/可靠骨架） | ✅ v3 交付（406/44/44/64 checks） |
+| 应用层 | `app`（流表/资源/KV/隧道）、`app::gateway`、`app::realtime_room`、`singleflight`、`consistent_hash` | ✅ |
+| 工程化 | `logging` `config` `metrics` `compress` `bufio` | ✅ |
+| 运维 | `mcp` `bpf` `os_monitor` `cli` `debug` | ✅ 可选构建 |
+| Go 语义 | `go/**`（chan/context/error/io/net/sync/time/flag） | 🔄 持续补齐 |
+
+---
+
+## 三、快速开始
 
 ```cpp
 #include "go2cpp/runtime.hpp"
 
-go2cpp::Scheduler scheduler(2);
-scheduler.start();
-auto task = go2cpp::go(scheduler, [] { /* Fiber 工作 */ });
-task->wait();
-scheduler.shutdown();
+int main() {
+    go2cpp::Scheduler scheduler(2);
+    scheduler.start();
+
+    auto task = go2cpp::go(scheduler, [] {
+        // Fiber 内：read()/Sleep() 看起来同步，实际自动 park，让出 worker
+    });
+    task->wait();
+
+    scheduler.shutdown();
+}
 ```
 
-不想管理 Scheduler 时，可使用进程级默认调度器，并在程序结束前显式关闭：
+不想管理 Scheduler 时使用进程级默认调度器：
 
 ```cpp
 auto task = go2cpp::go([] { /* Fiber 工作 */ });
@@ -102,149 +123,19 @@ task->wait();
 go2cpp::shutdown_default_scheduler();
 ```
 
-`go2cpp::fiber` 是保存一个任务的轻量描述器，`Scheduler::add()` 或
-`fiber::bind()` 会把它加入指定调度器。`go2cpp::SelectLoop`/`EventBatch`
-只包装已有的 channel `SelectCase`；可能阻塞的业务逻辑仍应放进 `go()`，
-再通过 channel 传递结果。事件状态访问支持普通线程与 Fiber 并发，结构修改
-采用锁保护和快照语义；批次对象仍须长于所有调用者，`stop()` 通过内部 Context 唤醒等待，并只发出协作式停止请求。
+完整入门：[`docs/getting_started.md`](docs/getting_started.md)；示例见 `example/`。
 
-转译代码需要完整公共接口时，包含 `go2cpp/runtime.hpp`。模块 target（`go2cpp::error`、
-`go2cpp::control_flow`、`go2cpp::context`、`go2cpp::channel`、`go2cpp::scheduler`、
-`go2cpp::fiber`、`go2cpp::sync`、`go2cpp::future`、`go2cpp::io`、`go2cpp::network`、
-`go2cpp::log`、`go2cpp::config`，以及 Hook 构建下的 `go2cpp::hook`）既可在源码树中
-单独使用，也会与 `go2cpp::runtime` umbrella target 一起导出。
+---
 
-2026-10-31 新增三个可选模块 target：`go2cpp::p2p`（NAT 穿透，`-DGO2CPP_WITH_P2P=ON`，默认 ON）、
-`go2cpp::app`（应用层流表框架，`-DGO2CPP_WITH_APP=ON`，默认 OFF）、`go2cpp::cache`（header-only
-7 策略缓存，INTERFACE）。三者都不进入 `install(EXPORT)`，头文件随整个 `include/` 目录安装。
-
-
-新手完整示例是 `example/concurrency/beginner_demo.cpp`，构建后运行：
+## 四、构建与测试
 
 ```sh
-cmake --build build --target go2cpp_beginner_demo
-./build/go2cpp_beginner_demo
-```
-## 显式控制流与类型转换
-
-    go2cpp::panic failure;
-    go2cpp::recover recovery(failure);
-    {
-        go2cpp::defer cleanup([&] {
-            if (auto info = recovery.take()) {
-                // 处理显式 panic 状态
-            }
-        });
-        failure.call("错误码", 7);
-        return;  // C++ 不会自动跳转，业务代码自行结束当前路径
-    }
-
-defer 的带参数构造会在注册时复制/移动参数；回调异常不会穿过析构函数，
-可通过 LastDeferException() 查询。SelectResult::TypedValue<T>() 和
-MakeCaster<From, To>() 用于把 channel/select 的类型擦除值转换成业务类型；
-move-only 结果使用 SelectResult::TakeValue<T>()；但 Channel Select/EventBatch
-不会对 move-only T 建立异步等待，调用会立即返回 kInvalid，避免静默挂起。
-panic/recover 是显式共享状态，库不验证 G/Fiber 身份，调用方应把它们限制在同一
-执行流中。
-
-## 多 FD 等待
-
-IOManager::WaitAnyFor() 和 WaitManyFor() 只在该 IOManager 的 managed Fiber
-中挂起并接入 epoll；普通线程返回 EPERM，应直接使用原生 poll/select。
-
-## 目录结构
-
-| 路径 | 内容 |
-| --- | --- |
-| `src/` | 运行时实现，按模块分为 `concurrency/`、`network/`、`os/`、`logging/`、`config/`、`debug/`、`tools/`、`bufio/`、`p2p/`、`app/` 等 |
-| `include/go2cpp/p2p/` | 公网穿透头文件：STUN 消息/客户端/服务器、ICE 候选与信令、TURN 客户端/服务器、`P2PChannel`、TCP 同时打开 |
-| `include/go2cpp/app/` | 应用层流表框架头文件：帧、流表、连接、资源、KV、传输适配（Memory/Bento/HTTP） |
-| `include/go2cpp/cache/` | header-only 缓存策略：`Cache<K,V>` 接口 + LRU/LRU-K/2Q/W-TinyLFU/GDSF/ARC/CLOCK + 工厂/分片 |
-| `include/go2cpp/` | 公共头文件；`include/go2cpp/*.hpp` 是兼容转发头，真实定义在模块子目录 |
-| `mcp/` | 内置 MCP 框架：`protocol/`、`server/`、`transport/`、`tools/`、`llm/`、`plugin/`、`vector/`、`retrieval/`、`app/` |
-| `bpf/` | 6 个 eBPF C 程序（sched/futex/syscall/net/tcp/fileio），由 `cmake/embed_bpf.cmake` 编译并嵌入 |
-| `tests/` | 测试源码，按 `tools/`、`concurrency/`、`network/`、`os/`、`debug/`、`bufio/` 等模块划分 |
-| `tools/` | 独立工具：`cli/`、`migration/`、`replay/`、`persistence/` |
-| `cmake/` | 8 个构建模块：选项、模块 target、测试、安装、迁移、监控、eBPF 嵌入、运行时配置 |
-| `docs/` | 设计与使用文档，入口见 [`docs/INDEX.md`](docs/INDEX.md) |
-| `example/` | 按模块分类的可运行示例，清单见 [`example/README.md`](example/README.md) |
-| `benchmarks/` | 独立性能基准（需 `GO2CPP_BUILD_BENCHMARKS=ON`） |
-| `third_party/` | 第三方与 Go 参考源码（大部分归档被 `.gitignore` 排除） |
-| `build-*/`、`Testing/` | 本地构建与 CTest 产物，均被 `.gitignore` 忽略，不入库 |
-
-推荐在源码树外构建（例如 `/UserData/build/go2cpp-mcp-integrated`），避免在仓库内产生
-`build-*/`；仓库内构建同样被忽略。
-
-## CMake 选项
-
-| 选项 | 默认 | 说明 |
-| --- | --- | --- |
-| `BUILD_SHARED_LIBS` | `ON` | 构建共享模块（`.so`）；静态构建需同时关闭 Hook |
-| `GO2CPP_BUILD_HOOK` | `ON` | Linux 系统调用 Hook（透明 park Fiber），依赖共享库 |
-| `GO2CPP_BUILD_TESTS` | `ON` | 构建运行时测试并注册 CTest |
-| `GO2CPP_BUILD_EXAMPLES` | `ON` | 构建 `example/` 示例 |
-| `GO2CPP_BUILD_BENCHMARKS` | `OFF` | 构建独立性能基准 |
-| `GO2CPP_ENABLE_TSAN` | `OFF` | 支持时启用 ThreadSanitizer |
-| `GO2CPP_BUILD_ENHANCED` | `OFF` | 一键打开 DEBUG_DUMP + DIAGNOSTIC + REPLAY + MIGRATION_API（未显式指定时也打开 CLI） |
-| `GO2CPP_WITH_MCP` | `OFF` | 构建内置 MCP 框架与 `mcp_server` |
-| `GO2CPP_WITH_CLI` | `OFF` | 构建 `go2cpp-cli` 统一命令行 |
-| `GO2CPP_WITH_P2P` | `ON` | 构建 P2P 公网穿透模块与 `go2cpp::p2p`（零外部依赖） |
-| `GO2CPP_P2P_TESTS` | `ON` | 注册 4 个 `p2p_*` ctest（不依赖 `GO2CPP_BUILD_TESTS`） |
-| `GO2CPP_WITH_APP` | `OFF` | 构建应用层流表框架 `go2cpp_app` 与 8 个 `app_*` ctest |
-| `GO2CPP_APP_TESTS` | `ON` | 注册 `app_*` ctest（仅在 `GO2CPP_WITH_APP=ON` 时生效） |
-| `MCP_BUILD_TESTS` | （未声明 option） | 注册 21 个 MCP 框架 ctest；需显式 `-DMCP_BUILD_TESTS=ON` |
-| `GO2CPP_BUILD_OS_MONITOR_TESTS` | `ON` | 构建 `go2cpp::os::monitor` 测试并并入 CTest |
-| `GO2CPP_ENABLE_EBPF` | `ON` | 编译并嵌入 eBPF 程序；缺少 clang/libbpf/libelf/libz 时自动降级 |
-| `GO2CPP_DEBUG_DUMP` | `OFF` | 事件环 + DebugServer（Unix socket），默认零开销 |
-| `GO2CPP_REPLAY` | `OFF` | 资源事件回放录制（G2CRPLY） |
-| `GO2CPP_DIAGNOSTIC` | `OFF` | 在线诊断 Doctor（命令平面/等待图/受控唤醒） |
-| `GO2CPP_DIAGNOSTIC_QUIC` | `OFF` | Doctor 的 QUIC 承载，需同时打开 DIAGNOSTIC 与 PICOQUIC |
-| `GO2CPP_MIGRATION_API` | `OFF` | 跨进程 Fiber/Channel 迁移实验 API |
-| `GO2CPP_WITH_PICOQUIC` | `OFF` | picoquic 承载的 QUIC/HTTP3 transport |
-| `GO2CPP_DEBUG_EVENT_CAPACITY` | `256` | 每线程普通事件环容量（仅 DEBUG_DUMP=ON） |
-| `GO2CPP_DEBUG_EVENT_CRITICAL_CAPACITY` | `64` | 每线程关键事件环容量（仅 DEBUG_DUMP=ON） |
-| `MCP_BUILD_EXAMPLES` | `ON` | MCP 示例（仅在 `GO2CPP_WITH_MCP=ON` 时生效） |
-
-MCP 集成构建示例：
-
-```sh
-cmake -S . -B /UserData/build/go2cpp-mcp-integrated -DCMAKE_BUILD_TYPE=Release \
-      -DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_TESTS=OFF
-cmake --build /UserData/build/go2cpp-mcp-integrated -j
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ```
 
-该配置（`GO2CPP_BUILD_TESTS=OFF`）只注册 20 个 CTest 用例（12 os/monitor + 3 bufio +
-4 p2p + 1 reflect_codec）；完整运行时测试需 `-DGO2CPP_BUILD_TESTS=ON`，MCP 框架用例还需
-显式 `-DMCP_BUILD_TESTS=ON`。
-
-## 文档导航
-
-文档总入口是 [`docs/INDEX.md`](docs/INDEX.md)（全量文档的分类、状态与重复/过时/孤立清单）。常用入口：
-
-- 入门：[getting_started.md](docs/getting_started.md)、[compatibility.md](docs/compatibility.md)、[design.md](docs/design.md)；
-- 核心设计：[scheduler.md](docs/scheduler.md)、[modules.md](docs/modules.md)、[fiber-migration.md](docs/fiber-migration.md)；
-- 使用：[configuration.md](docs/configuration.md)、[logging.md](docs/logging.md)、[fiber_guide.md](docs/fiber_guide.md)、[network.md](docs/network.md)、[cli.md](docs/cli.md)；
-- 诊断：[diagnostic-channel.md](docs/diagnostic-channel.md)、[debug-reliability.md](docs/debug-reliability.md)；
-- 测试与性能：[testing.md](docs/testing.md)、[performance-baseline-2026-10-19.md](docs/performance-baseline-2026-10-19.md)；
-- MCP：[mcp/docs/architecture.md](mcp/docs/architecture.md)；
-- 历史：[AGENT-HANDOFF.md](docs/AGENT-HANDOFF.md)、[NEXT-STEPS.md](docs/NEXT-STEPS.md)（仅追溯，数字不代表现状）。
-
-## 测试
-
-ctest 数量随构建配置变化，**以 `ctest -N` 为准**（逐条清单见 [testing.md](docs/testing.md)「测试地图」）：
-
-| 构建配置 | profile | ctest 总数 |
-| --- | --- | --- |
-| 主构建 `.build-bento-wsl`（Bento + MCP + runtime + app + p2p） | `bento+mcp+runtime` | **290**（62 bento + 8 app + 4 p2p + 2 cache + 3 bufio + 1 reflect_codec + 21 MCP 框架 + 189 运行时/示例/工具） |
-| Bento + MCP（`-DGO2CPP_WITH_BENTO=ON -DGO2CPP_WITH_MCP=ON`，`GO2CPP_BUILD_TESTS=OFF`） | `bento+mcp` | **80**（60 bento + 12 os/monitor + 3 bufio + 4 p2p + 1 reflect_codec） |
-| MCP 集成（`-DGO2CPP_WITH_MCP=ON -DGO2CPP_BUILD_OS_MONITOR_TESTS=ON`） | `mcp+osmon` | **20**（12 os/monitor + 3 bufio + 4 p2p + 1 reflect_codec） |
-
-主构建注册 **Total Tests: 290**，2026-11-02 全量 `ctest -j4`：7 项测试/文档滞后已全部修复，
-4 项按设计 SKIP（`tools-migration`/`tools-cli`/`tools-replay` 缺独立工程产物按 77 SKIP、
-`bento_netem` 无 `CAP_NET_ADMIN` SKIP）；当日 RPC 迁移新增的 `go2cpp_rpc_picoquic_test` 仍在
-独立复跑中失败（非本轮修复范围）。详见 [testing.md](docs/testing.md)「测试地图」。
-`mcp+osmon` 配置同日在独立构建目录实测 **20/20 passed**。80/20 都不含 21 个 MCP 框架用例：
-`MCP_BUILD_TESTS` 没有 `option()` 声明，需要显式 `-DMCP_BUILD_TESTS=ON`。
+推荐在源码树外构建。主构建（Bento + MCP + runtime + app + p2p）的完整配置：
 
 ```sh
 cmake -S . -B .build-bento-wsl -DCMAKE_BUILD_TYPE=Release \
@@ -255,4 +146,78 @@ cmake --build .build-bento-wsl --parallel
 ctest --test-dir .build-bento-wsl --output-on-failure
 ```
 
-MCP 内置工具共 **33 个**（22 内置 + 3 检索 + 4 监控 + 4 Socket = 33 个工具）。
+测试数量随配置变化，**以 `ctest -N` 为准**：主构建 290 项；`bento+mcp` 80 项；`mcp+osmon` 20 项
+（详见 [`docs/testing.md`](docs/testing.md)「测试地图」）。
+
+---
+
+## 五、目录结构
+
+| 路径 | 内容 |
+|---|---|
+| `include/go2cpp/` | 公共头文件（按模块子目录；`*.hpp` 为兼容转发头） |
+| `src/` | 实现：`concurrency/` `network/` `os/` `logging/` `config/` `storage/` `cache/` `bufio/` `p2p/` `app/` `rd_net/` `tunnel/` `rpc/` `encoding/` `hash/` `compress/` |
+| `app/` | 应用级 demo：`douyin/`（电商/短视频 6 服务 + 网关）、`bilibili/`（弹幕服务 + Web demo） |
+| `collab/` | 与 JinShanProject 的协作区（需求/验收/示例） |
+| `tests/` | 测试源码（约 23 万行），按模块划分 |
+| `tools/` | 基准（`bench/`）、指标校验（`verify_metrics.sh`）、CLI、迁移/回放 |
+| `docs/` | 设计与使用文档，入口 [`docs/INDEX.md`](docs/INDEX.md)；性能台账 [`docs/metrics-ledger.md`](docs/metrics-ledger.md) |
+| `example/` | 可运行示例，清单见 [`example/README.md`](example/README.md) |
+| `mcp/` `bpf/` | 可选：MCP 框架、eBPF 监控 |
+| `third_party/` | 第三方与 Go 参考源码（多数归档被 ignore） |
+
+---
+
+## 六、应用示例
+
+| 示例 | 内容 | 入口 |
+|---|---|---|
+| 电商 demo | gateway + product/review/order 三服务 + 公网隧道（VPS systemd + 探针 + 断线恢复） | `scripts/shop/`（守护脚本） |
+| 抖音 demo | 6 服务 + 网关：用户/视频/Feed/互动/搜索/直播，SQLite 持久化 | `app/douyin/` + [`REQUIREMENTS.md`](app/douyin/REQUIREMENTS.md) |
+| B 站弹幕 | WebSocket 房间广播 + 历史弹幕 + 限流 + 40s 视频 Web demo | `app/bilibili/` + [`REQUIREMENTS.md`](app/bilibili/REQUIREMENTS.md) |
+
+---
+
+## 七、设计约束（重要）
+
+| 维度 | Go | Go2Cpp | 后果 |
+|---|---|---|---|
+| 调度 | 抢占式 | **纯协作式**（只有显式 park/yield） | 长计算会饿死同 P 的 G；持锁 park 是 Go 不存在的死锁形态 |
+| 栈 | 可增长（复制搬迁） | **固定栈**（默认 128 KiB） | 深递归会失败；FiberBin 池化复用降低建栈成本 |
+| 内存 | GC | **无 GC**（RAII + 引用计数） | 无 GC 停顿；需显式管理生命周期 |
+| Channel | 无 Context | **默认注入 Context**（取消/超时/select 回滚） | 比 Go `chan` 多一次状态检查，语义更强 |
+
+这些差异是**设计取舍**，不是缺陷；对应模块的「vs Go」差距已在台账中如实标注（如 M03 调度器收口为
+「架构代价，非实现缺陷」）。
+
+---
+
+## 八、文档导航
+
+| 主题 | 入口 |
+|---|---|
+| 新手 | [`docs/getting_started.md`](docs/getting_started.md) |
+| 兼容性/设计边界 | [`docs/compatibility.md`](docs/compatibility.md)、[`docs/design.md`](docs/design.md) |
+| 调度器/模块 | [`docs/scheduler.md`](docs/scheduler.md)、[`docs/modules.md`](docs/modules.md) |
+| 网络 | [`docs/network.md`](docs/network.md) |
+| 性能台账 | [`docs/metrics-ledger.md`](docs/metrics-ledger.md) + `tools/verify_metrics.sh` |
+| 测试 | [`docs/testing.md`](docs/testing.md) |
+| 协作（JinShan） | [`collab/README.md`](collab/README.md)、[`docs/reports/rdnet-v3-review.md`](docs/reports/rdnet-v3-review.md) |
+| 全量索引 | [`docs/INDEX.md`](docs/INDEX.md) |
+
+---
+
+## 九、CMake 选项（摘要）
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `BUILD_SHARED_LIBS` | `ON` | 共享模块；静态构建需同时 `-DGO2CPP_BUILD_HOOK=OFF` |
+| `GO2CPP_BUILD_HOOK` | `ON` | Linux 系统调用 Hook（透明 park） |
+| `GO2CPP_BUILD_TESTS` | `ON` | 构建并注册 ctest |
+| `GO2CPP_WITH_P2P` | `ON` | P2P 公网穿透 |
+| `GO2CPP_WITH_APP` | `OFF` | 应用层流表框架 |
+| `GO2CPP_WITH_MCP` | `OFF` | 内置 MCP 框架 |
+| `GO2CPP_ENABLE_EBPF` | `ON` | eBPF 监控（缺依赖自动降级） |
+| `GO2CPP_ENABLE_TSAN` | `OFF` | ThreadSanitizer |
+
+完整列表见下方历史版本或 `cmake/Go2CppOptions.cmake`。
