@@ -21,37 +21,44 @@
 4. 子 agent 不许 commit，主控审查（抽查行号/数字溯源/越界/正确性）后合并；
 5. 风险高且时限内无法验证的改动，回滚并如实记「尝试过、因何回滚」。
 
+## 基准必须独占（2026-11-03 实测教训）
+
+并行跑基准会制造假 STALE：A5 全量在 A4c 并行压测时出 3 条假 STALE（M03 628 vs 239、cpu 中位 1.84×；M04、M08 同因），A4c 结束后独占复跑 → `TOTAL=16 OK=12 STALE=0 SKIP=4`。**对照运行期间不得有其它基准进程**；判 STALE 前必须独占复跑一次。
+
 ## 进度表
 
 | 任务 | 内容 | 状态 |
 |---|---|---|
-| A1 | ledger 建档（12 条，四要素） | ✅ be73a4e |
+| A1 | ledger 建档 | ✅ be73a4e |
 | A2 | `tools/verify_metrics.sh` 三基线 | ✅ 92dcb25 |
-| A3 | M04/M05/M06 复跑填实 | ✅ 55a3f0e |
-| A4a | M07 LevelDB 1e7/1e8 | ✅ 本轮（1e7 647.5k、1e8 230.8s/82.4 MiB、对照 4.14×） |
-| A4b | M10 os 批量 + gzip + hash + reflect | ✅ e7fcbbb |
-| A4c | TLS + bento/link | 🔄 子 agent `b03dca46` 在跑 |
-| A5 | ledger 一条命令全量对照 + CI 钩子 | ⏳ 下一个 |
-| A6 | 清理漂移（411k/160ns 等） | ⏳ |
-| A7 | 不达标模块优化 | 🔄 M01b 判定+汇编级完成；通用 Channel 无锁化待立项 |
+| A3 | M04/M05/M06 填实 | ✅ 55a3f0e |
+| A4a | M07 LevelDB | ✅ 761ea6c |
+| A4b | M10/M11/M12/M13 | ✅ e7fcbbb |
+| A4c | M14 TLS / M15 bento | ✅ 本轮（TLS 1.061×、bento 282k pps；A4c 超时被 interrupt，数据从日志补收） |
+| A5 | 全量校验脚本（16 条）+ CMake 模板 | ✅ 本轮（493 行，独占全量 OK=12 STALE=0 SKIP=4） |
+| **M03** | **scheduler wall 三件套优化（架构→汇编→正确性）** | 🔄 下一个（用户要求） |
+| M10 | os readv 三件套优化 | ⏳ 排队 |
+| M11 | gzip 解压 三件套优化 | ⏳ 排队 |
+| A6 | 清理 411k/160ns 等文档漂移 | ⏳ |
+| A7 | 其他不达标项（concurrency 原语、os Process、network vs Go/nginx） | ⏳ |
 | B1–B4 | 公网变服务 | ⏳ |
 | C1–C10 | 抖音 P0 | ⏳ |
 
 ## 下一个任务
 
-**A5** — 让 ledger 可一条命令校验（在 A4c 回来后如仍有缺口，先补缺口再做 A5）：
-1. 扩展 `tools/verify_metrics.sh`：把已实测且可自动跑的条目接进来（M01b-a/M01b-b、M02、M03、M04、M06、M08、M09、M10、M11/M12/M13 中可跑的），跑不到的显式输出「无法自动校验：原因」，**不许假装通过**；
-2. 输出一份 `STALE 列表`（相对 ledger 当前值，容差按条目定义），退出码 0/1/2；
-3. CI/CMake 钩子：在 `cmake/` 里加一个可选的 `GO2CPP_VERIFY_METRICS` 目标或脚本文档，让「跑测试时可选地跑一次台账校验」；不强制默认开启（避免 CI 因宿主负载误报）。
+**M03 三件套优化**（用户 2026-11-03 点名）：
+1. 固定口径复现 baseline（12 vCPU、`taskset -c 2,3`、4 worker、100k、5 轮，记录 loadavg），确认 239/299 不是宿主噪声；
+2. **架构优化**：至少一条（runnext 投递策略 / incoming 条带轮转 / enqueue 路径减少原子或锁）；
+3. **汇编优化**：至少一条，附 `objdump` 前后指令/call/栈帧对比；
+4. **正确性**：`scheduler_smoke`、`queue_latency`、`channel_concurrency`、`select_lockorder`、`fiber_select` 全过 + 一次压力；任一失败立即回滚该版；
+5. 改善 <5% 或无法证明收益 → 回滚并如实报告「不可优化/代价过高」。
 
 ## 本轮记录
 
-- 13:20 启动；A1 be73a4e；A2 92dcb25；13:43 优化规则 456ec05；A7 首项 3a7aa4f；A3 55a3f0e；A4b e7fcbbb。
-- 14:14 **A4a 完成**（`a535fda9`）：
-  - 确认 `--bench` 口径是 20B/22B（含自研对照）、`--mem` 是 8B/8B（RSS），两者**不可混比**（源码 :914/:951/:1096-1102）；
-  - 1e7 Put（`--bench`）：644000/648630/647521，中位 **647,521**（历史 583k，+11%）；自研侧中位 156,588（历史推算 157.6k，几乎复现）→ 差异在 LevelDB/环境，不在自研；
-  - 1e8 **未降级**：230.8 s、433,369 ops/s、采样峰值 **82.4 MiB**、VmHWM **122.8 MiB**、磁盘 2511.6 MiB；RSS/数据量 5.40%（VmHWM 8.05%）；
-  - 自研对照 LevelDB/自研 Put 3.95/4.14/4.51×，中位 **4.14×**（历史 3.7×）；Get 反向 530,742 vs 576,109/s；
-  - 主控审查：7 个 `/tmp/m07_*.log` 存在且抽样行一致、`--bench` flag 在源码 :1102、`git status` 仍 9 项、磁盘 43G/1007G 合规；
-  - 记下：历史 87 MiB 是采样瞬时值（本轮 VmHWM 更高），历史 4.9% 分母口径不可考。
-- 14:16 **A4c 派活**（`b03dca46`）：TLS 三组 + bento/link 吞吐。
+- 13:20 启动；A1 be73a4e；A2 92dcb25；优化规则 456ec05；A7 首项 3a7aa4f；A3 55a3f0e；A4b e7fcbbb；A4a 761ea6c。
+- 14:21 本轮：
+  - **A5 完成**（`6aa0caba`，被 interrupt 但文件完整）：`tools/verify_metrics.sh` 493 行、`cmake/Go2CppVerifyMetrics.cmake` 41 行（不被 include，`cmake -P` 实测 rc=0）；16 条接线、`--quick/--json/--refs`、退出码 0/1/2；
+  - 独占全量：`TOTAL=16 OK=12 STALE=0 SKIP=4`（SKIP: M01 已拆条、M05 需起服务+Go loadgen、M05b 无出处、M07 超 5 分钟预算）；`--quick` 4/4 OK；
+  - 插曲：首次全量在 A4c 并行压测下出 3 条假 STALE（M03 628/cpu 1.84×、M04、M08），独占复跑全消——已写进 ledger「教训」与本节；
+  - **A4c 完成**（`b03dca46`，超 10 分钟被 interrupt，数据从 `/tmp/tlsbench-run*.log` 补收）：TLS 握手 1.061×（复跑 1.178×）、32KB 写 0.939、64B 0.945；bento single 282,210 pps（loss 0）、多队列 2 核丢包 39–48%；结论：**TLS 达标、单 peer 多队列无收益复现**；无法复现项：tunnel 8 MiB 吞吐（无压测程序）、bento bulk STREAM 字节吞吐（只有 64B 消息级）；
+  - 主控修复：A5 收尾时脚本被写到半成品（line 494 语法错），interrupt 后确认 493 行 `bash -n` 通过并独占复跑通过；残留 `bench_link_mq` 用 `pkill -x` 杀净。

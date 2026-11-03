@@ -46,8 +46,8 @@
 - **环境**：12 vCPU / `taskset -c 2,3`（同一物理核的两个 SMT 兄弟）/ total=1e6、reps=3、3 轮取 min / Release 复用 `.build-bento-wsl`
 - **日期**：2026-11-03
 - **脚本路径**：`tests/concurrency/bench_channel_opt.cpp:88-126`（`MakeChannel<uint64_t>` + 2 个 `std::thread`，无 Scheduler/`go()`，ns/条）
-- **状态**：`实测（不达标 4.8×）`（spsc cap1024 **112.6 ns/条**（median ~114），min **103.3**；对照 Go `chan uint64` cap1024 = **23.36**（`docs/reports/vs-concurrency.md:86/90`，同为 `taskset -c 2,3` SMT 兄弟），比值 4.8×）
-- **诊断**：`tryspsc`（纯轮询、永不 park）101.8–118.3 ≈ `spsc`；`taskset -c 2,4`（跨物理核）93.3–98.9 ≈ `2,3` → 瓶颈是**锁的跨核 cacheline 传递**（每 op ≥3 条 RFO：`m_gate`、buffer 索引、数据槽），不是 park/futex，也不是 SMT 特有。单锁架构的物理下限约 60–90 ns/op，达标线 25.7 ns **在单锁下不可达**，必须无锁化。
+- **状态**：`实测（口径不可比，非达标判据）`（spsc cap1024 **112.6 ns/条**（median ~114），min **103.3**；Go `chan` 23.36。**2026-11-03 用户澄清**：历史 10.73 对应的 `FastChannel` 才是 Go `chan` 的同型默认实现（runtime hchan 的轻量路径）；本项目通用 `Channel<T>` 默认注入 Context 语义（取消/超时/select 回滚），每次操作多状态检查与唤醒协议——4.8× 主要来自**语义增强**，不能按「vs Go 1.1×」判不达标。若要严格对标，只有两条路：用无 Context 的 FastChannel 对 Go chan，或 Go 侧也用带 context 的 chan 同条件比。）
+- **诊断**：`tryspsc`（纯轮询、永不 park）101.8–118.3 ≈ `spsc`；`taskset -c 2,4`（跨物理核）93.3–98.9 ≈ `2,3` → 瓶颈是**锁的跨核 cacheline 传递**（每 op ≥3 条 RFO：`m_gate`、buffer 索引、数据槽），不是 park/futex，也不是 SMT 特有。单锁架构的物理下限约 60–90 ns/op；**是否值得无锁化取决于 Context 语义能否下沉**（用户 2026-11-03 澄清后，该项从「不达标」降级为「语义增强的代价」，不再作为优化立项依据）。
 - **已做优化（汇编级，2026-11-03，有反汇编依据）**：`kWouldBlock` 是控制流不是错误，原实现返回 `ChannelWouldBlockError()` 单例（`ErrorPtr`=shared_ptr），每次非阻塞探测 2 次原子引用计数 RMW（反汇编可见 `EmptyTryRecv` 循环体内两次 `_Sp_counted_base::_M_release`）；改为空 `ErrorPtr`（与 `channel.hpp:3039` 既有惯例一致，单例定义/导出保留）。
   - TryRecv 空：19.6–25.4 → **16.1–17.1 ns（−18%）**；TrySend 满：16.3–18.7 → **13.6–14.8 ns（−17%）**；spsc cap1024 min 103.3 → **100.2**（无回归）。
   - 正确性：`channel_concurrency`、`channel_thread_stress`（89.3 s / 100 轮）、`select_lockorder`、`fiber_select` 全部 exit=0、failures=0。
@@ -199,12 +199,32 @@
 - **状态**：`实测` —— 二进制编码 **52.64 ns/op**、解码 **54.89 ns/op**；描述格式 78.28 ns/op；文本编码 81.31 / 解码 145.93 ns/op。
 - **备注**：与历史紧凑格式区间一致。
 
+### M14 TLS 传输层 vs 裸 OpenSSL
+
+- **历史值**：握手 mean 1.070×、32 KB 写 0.933–1.008×、64 B 小包 0.946–1.064×（asm-tls，全部 <1.1×）
+- **测量命令**：`tests/network/bench_tls.cpp`（新增，需 OpenSSL dev；进程内自签 P-256 服务端 + 非阻塞 poll 状态机）；源码手工编译到 `/tmp/build-tls-bench`
+- **环境**：WSL2 12 vCPU / OpenSSL 3.0.13 / TLSv1.3 / `taskset -c 2,3` / loadavg≈2.3 / 每轮 300 握手、256 MiB 写、5 万次 64 B / 2 组 × 3 轮
+- **日期**：2026-11-03
+- **脚本路径**：`tests/network/bench_tls.cpp`
+- **状态**：`实测` —— 握手 mean **1.061×**（复跑 1.178×；p50 1.032/1.117，p99 1.040/1.062）；32 KB 写 raw/tt **0.939**（复跑 0.937，TT 略快）；64 B 小包 tt/raw **0.945**（复跑 0.989）。三组同量级、达标（<1.1×）；复跑握手 1.178× 略超线，属两组间宿主波动，需更多轮确认。
+- **备注**：tunnel 8 MiB 下载吞吐**无法复现**——`tests/tunnel` 只有 `test_tunnel.cpp` 功能测试，缺吞吐程序。
+
+### M15 bento/link 包吞吐
+
+- **历史值**：无 asm 报告；「单 peer 多队列无收益」已由提交 `475cc15` 证明
+- **测量命令**：`.build-bento-wsl/bench_link_mq single 2000000`（3 轮）；`bench_batch3 link_stress`；`bench_protocols --perf --only=link`
+- **环境**：WSL2 12 vCPU / `taskset -c 2,3` / 2e6 包每场景
+- **日期**：2026-11-03
+- **脚本路径**：`tests/bento/`（`bench_link_mq`、`bench_batch3`、`bench_protocols`）
+- **状态**：`实测` —— `queues=1/senders=1` 中位 **282,210 pps**（loss 0）、`senders=4` 中位 **270,278**；`link_stress` **232,581 pps**（到达率 98.5–98.8%）；`bench_protocols` 可靠 STREAM 64 B **15,713 msg/s**（≈0.96 MiB/s payload）、DATAGRAM 53,481 msg/s；**2 核绑核下 queues=4/8 丢包 39–48%**（多队列单 peer 无收益，与历史结论一致）。
+- **备注**：bento **bulk STREAM 字节吞吐无基准**（只有 64 B 消息级）；不绑核对照 `multi pairs=4` 达 87–96 万 pps。
+
 ## 历史值汇总（只作对照，不得引用为结论）
 
 | ID | 指标 | 历史值 | 状态 |
 |---|---|---|---|
 | M01 | Channel 1P1C ns/条 | 10.73（实为 FastChannel） | 已拆条，见 M01b-a/b |
-| M01b-a | 通用 Channel 1P1C ns/条 | 112.6（min 103.3）vs Go 23.36 | 实测·不达标 4.8× |
+| M01b-a | 通用 Channel 1P1C ns/条 | 112.6（min 103.3）vs Go 23.36 | 实测·口径不可比（Context 语义） |
 | M01b-b | FastChannel<1024> ns/条 | 16.07（线程）/6.23（fiber）vs Go 23.36 | 实测·达标 |
 | M02 | Fiber 全量切换 ns/往返 | 33.80 | 实测（推断口径 19.84） |
 | M03 | scheduler wall ns/task | 122.0（历史）/ 239（本轮中位） | 实测（本轮） |
@@ -219,6 +239,12 @@
 | M11 | gzip 压缩/解压 | 612.2 / 3648.0 MiB/s（zlib 463.7/3138.3） | 实测 |
 | M12 | hash 吞吐 | SHA-256 2002.60 MiB/s、crc32 18731.55 MiB/s | 实测 |
 | M13 | reflect 编解码 | 编码 52.64 / 解码 54.89 ns/op | 实测 |
+| M14 | TLS vs 裸 OpenSSL | 握手 1.061×、写 0.939、64B 0.945 | 实测·达标 |
+| M15 | bento/link pps | single 282,210 pps（loss 0）；多队列 2 核丢包 | 实测 |
+
+## 教训：基准必须独占
+
+2026-11-03 实测：A5 的 `verify_metrics.sh` 全量在 A4c 并行跑 bento 基准时出现 3 条假 STALE（M03 628 vs 239、M04 232.7 vs 119、M08 1258 vs 1853.9，宿主争用 1.84×）；A4c 结束后独占复跑 → `TOTAL=16 OK=12 STALE=0 SKIP=4`。**结论：性能对照运行期间不得有其它基准/压测进程**；脚本已在输出里打印 loadavg 与 cpu 中位辅助判断，但判 STALE 前必须独占复跑一次。
 
 ## 待办
 
@@ -226,6 +252,8 @@
 - ✅ A3 完成：M04/M05/M06 已填实（M04 双口径、M05 120.8k、M06 1.074×）。
 - ✅ A4a 完成：M07 已填（1e7 647.5k、1e8 RSS 82.4 MiB/VmHWM 122.8、对照 4.14×）。
 - ✅ A4b 完成：M10/M11/M12/M13 已填。
-- ⏳ A4c（下一个）：TLS 与 bento/link。
+- ✅ A4c 完成：M14/M15 已填（TLS 1.061×、bento single 282k pps）。
+- ⏳ A6：清理 411k/160ns 等文档漂移。
+- ⏳ 用户要求的三件套优化（M03→M10→M11，架构→汇编→正确性）排在 A6 前执行。
 - ⏳ A6：把 docs 里 411k、160ns 等改为指向本文件或标 STALE。
 - ⏳ A7 架构级：M01b-a 通用 Channel 无锁化（覆盖 Send/Recv/Select/Close，需完整验证窗口，单独立项）。

@@ -70,3 +70,1005 @@
 ==============================================================
 TOTAL=3 OK=2 STALE=1 未接线=0
 ==============================================================
+==============================================================
+ verify_metrics 全量校验: 2026-11-03 14:29:15 +0800  mode=full
+ repo=/UserData/CodexWorkSpace/Go2cpp
+ 环境: nproc=12 绑定=taskset -c 2,3 构建库=.build-bento-wsl 单条上限=300s
+ 判定: 任一 ledger 值落在该条容差内=OK；全部超出=STALE；跑不起来=SKIP（不算通过）
+==============================================================
+台账引用: 16 条，失配 0 条
+
+[M01b-a] 通用 Channel<uint64_t> 1P1C cap1024 ns/条（ledger:42）
+  编译: g++ -O3 -DNDEBUG -std=c++20 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_channel_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_channel -lgo2cpp_context -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_log -pthread -o /tmp/verify_metrics.Vrww5A/bench_channel_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.Vrww5A/bench_channel_opt 1000000 3 spsc
+       |   Channel cap=1024                           min     104.3  median     129.4  max     133.4  ns/op
+  对照（相对容差 ±30%）: ledger=112.6(偏差+14.9% ✓) 
+[M01b-a] 实测=129.4 ns/条 ledger=112.6 判定=OK
+      注: 1e6 条×3 reps，取 [1] SPSC cap=1024 median；容差 ±30%
+
+[M01b-b] FastChannel<1024> 1P1C ns/条（ledger:56）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_fast_channel_bench 1000000 5
+       |   fast-cap1024               median    14.48  min    13.53  ns/op  bad=0
+       |   fiber-fast-cap1024         median     6.39  min     6.21  ns/op  bad=0
+  对照（相对容差 ±30%）: ledger=12.83 16.07(偏差+12.9% ✓) 
+[M01b-b] 实测=14.48 ns/条 ledger=12.83 16.07 判定=OK
+      注: 1e6×5 reps 线程段 median（min=13.53）；容差 ±30%
+
+[M02] Fiber 全量切换 ns/往返（ledger:66）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_fiber_switch_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_fiber -lgo2cpp_debug -lgo2cpp_debug_event -lgo2cpp_error -pthread -o /tmp/verify_metrics.Vrww5A/bench_fiber_switch
+  运行: taskset -c 2,3 /tmp/verify_metrics.Vrww5A/bench_fiber_switch 1000000
+       | Fiber::resume ping-pong (yield)                           21.41 ns/op
+  对照（相对容差 ±30%）: ledger=33.80 23.5 19.84(偏差-36.7%) 
+[M02] 实测=21.41 ns/往返 ledger=33.80 23.5 19.84 判定=STALE
+      注: resume↔Suspend 往返 1e6 次（口径见 ledger M02 备注）；容差 ±30%
+
+[M03] Scheduler task churn wall ns/task（ledger:75）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_task_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.Vrww5A/bench_scheduler_task_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.Vrww5A/bench_scheduler_task_opt 4 100000 5
+       | [round 0] cpu 1191 ns/task  wall 603 ns/task  (2 k tasks/s)
+       | [round] VmSize=0.37 GiB Rss=11.1 MiB
+       | [round 1] cpu 1198 ns/task  wall 589 ns/task  (2 k tasks/s)
+       | [round] VmSize=0.37 GiB Rss=11.2 MiB
+       | [round 2] cpu 554 ns/task  wall 273 ns/task  (4 k tasks/s)
+      cpu 中位: 1191 ns/task（仅诊断宿主负载，不参与判定）
+  对照（相对容差 ±30%）: ledger=122.0 239 299(偏差+382.8%) 
+[M03] 实测=589 ns/task ledger=122.0 239 299 判定=STALE
+      注: 4 worker/100k tasks/5 轮 wall 中位；容差 ±30%
+
+[M04] Scheduler submit ns/task（batch=1024 / 65536，ledger:92）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_submit.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.Vrww5A/bench_scheduler_submit
+  运行: taskset -c 2,3 /tmp/verify_metrics.Vrww5A/bench_scheduler_submit 4 1000000 3 1024
+       | [summary] rounds=3 median 203.9 ns/task  min 159.0  max 211.5
+  运行: taskset -c 2,3 /tmp/verify_metrics.Vrww5A/bench_scheduler_submit 4 1000000 3 65536
+       | [summary] rounds=3 median 410.3 ns/task  min 253.6  max 454.8
+  batch=1024 对照（±30%）: ledger=119.0(偏差+71.3%) 
+  batch=65536 对照（±30%）: ledger=355.7(偏差+15.4% ✓) 
+[M04] 实测=batch1024 203.9 / batch65536 410.3 ns/task ledger=119.0 / 355.7 ns/task 判定=STALE
+      注: 至少一个 batch 口径超出 ±30%
+
+[M01] Channel 1P1C 有缓冲 ns/条
+  无法自动校验：已拆条：10.73 实为 FastChannel<1024>，校验见 M01b-b；通用 Channel 见 M01b-a
+[M01] 实测=— ledger=10.73（已拆条） 判定=SKIP
+      注: 已拆条：10.73 实为 FastChannel<1024>，校验见 M01b-b；通用 Channel 见 M01b-a
+
+[M05] HTTP/1.1 pipeline=16 单连接 rps
+  无法自动校验：需先起 net_perf_server（READY 行取端口）再用 Go http_loadgen 压测，非单进程基准
+[M05] 实测=— ledger=120,755 rps 判定=SKIP
+      注: 需先起 net_perf_server（READY 行取端口）再用 Go http_loadgen 压测，非单进程基准
+
+[M05b] 「HTTP pipeline 411k rps」（无出处）
+  无法自动校验：台账记为无出处，没有可校验的数字（禁止引用）
+[M05b] 实测=— ledger=411k rps（无出处） 判定=SKIP
+      注: 台账记为无出处，没有可校验的数字（禁止引用）
+
+[M07] LevelDB 1e7 Put 与 1e8 RSS
+  无法自动校验：1e7 Put 需 3 轮×2 实现、1e8 RSS 段单独约 230 s，超出单条 5 分钟预算，需手工执行
+[M07] 实测=— ledger=647.5k ops/s / 82.4 MiB 判定=SKIP
+      注: 1e7 Put 需 3 轮×2 实现、1e8 RSS 段单独约 230 s，超出单条 5 分钟预算，需手工执行
+
+[M06] SQLite 1e6 行插入 wrapper/native 比值（ledger:121）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 1/3 轮）
+  第 1 轮 insert-file = 1.151×
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 2/3 轮）
+  第 2 轮 insert-file = 1.127×
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 3/3 轮）
+  第 3 轮 insert-file = 1.141×
+  对照（相对容差 ±15%）: ledger=1.074(偏差+6.2% ✓) 
+[M06] 实测=1.141 × ledger=1.074 判定=OK
+      注: 1e6 行 insert-file 3 轮中位（ledger 为 7 轮，轮数已降）；容差 ±15%
+
+[M08] bufio 分块传输 1 MiB 读 MiB/s（ledger:144）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 1/3 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1349.7 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 2/3 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1535.1 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 3/3 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1581.1 MiB/s
+  对照（相对容差 ±30%）: ledger=1853.9(偏差-17.2% ✓) 
+[M08] 实测=1535.1 MiB/s ledger=1853.9 判定=OK
+      注: 1 MiB 分块读 3 次中位，未绑核（单次仅约 0.5 ms，故取中位）；容差 ±30%
+
+[M09] Cache hotspot 命中率 ARC/LRU（ledger:153）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_cache_test（未绑核，固定 seed）
+       | [cache]   hotspot LRU        hit=0.5594
+       | [cache]   hotspot ARC        hit=0.7764
+  ARC 对照（绝对容差 ±0.02）: ledger=0.7817 0.7764(Δ-0.7817) 
+  LRU 对照（绝对容差 ±0.02）: ledger=0.5580 0.5594(Δ-0.5580) 
+[M09] 实测=ARC done:
+0.7764
+baseline=1.000
+0.6512 / LRU done:
+0.5594
+baseline=1.000
+0.5610
+0.2406
+0.5827 ledger=ARC 0.7764 / LRU 0.5594 判定=STALE
+      注: 至少一个策略超出 ±0.02
+
+[M10] os 批量 writev/readv 加速比（ledger:162）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/src/os /UserData/CodexWorkSpace/Go2cpp/tests/os/bench_vectored.cpp /UserData/CodexWorkSpace/Go2cpp/src/os/file.cpp /UserData/CodexWorkSpace/Go2cpp/src/os/config.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_config -lgo2cpp_error -lgo2cpp_log -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -pthread -o /tmp/verify_metrics.Vrww5A/bench_vectored
+  运行: taskset -c 2,3 /tmp/verify_metrics.Vrww5A/bench_vectored <workdir>
+  无法自动校验：运行失败或超时
+[M10] 实测=— ledger=写 17.96× / 读 14.68× 判定=SKIP
+      注: 运行失败或超时
+
+[M11] gzip 压缩/解压吞吐 + crc32（ledger:172）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/tests/bench/gen -I/UserData/CodexWorkSpace/Go2cpp/tests/compress /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_tools_industry.cpp /UserData/CodexWorkSpace/Go2cpp/tests/bench/gen/tools_bench.pb.cc /UserData/CodexWorkSpace/Go2cpp/tests/compress/compress_test_support.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_reflect -lgo2cpp_encoding -lgo2cpp_compress -lgo2cpp_error -lz -lprotobuf -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -o /tmp/verify_metrics.Vrww5A/bench_tools_industry
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_gzip_crc.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_compress -lgo2cpp_hash -lgo2cpp_error -lz -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -o /tmp/verify_metrics.Vrww5A/bench_gzip_crc
+  运行: taskset -c 2,3 /tmp/verify_metrics.Vrww5A/bench_tools_industry
+  运行: taskset -c 2,3 /tmp/verify_metrics.Vrww5A/bench_gzip_crc
+       | gzip_compress_L6                    1869396.0 ns/op     534.9 MiB/s
+       | gzip_decompress                      289952.0 ns/op    3448.8 MiB/s
+       | zlib_gzip_compress_L6               2491357.2 ns/op     401.4 MiB/s
+       | zlib_gzip_decompress                 356658.5 ns/op    2803.8 MiB/s
+       | gzip_compress L6 1MiB: 531.8 MiB/s
+       | crc32 1MiB (hash::Crc32/PCLMUL):  19.20 GB/s
+  压缩 对照（±30%）: ledger=612.2(偏差-12.6% ✓) 
+  解压 对照（±30%）: ledger=3648.0(偏差-5.5% ✓) 
+  crc32 对照（±30%）: ledger=22.14(偏差-13.3% ✓) 
+[M11] 实测=压缩 534.9 MiB/s / 解压 3448.8 MiB/s / crc32 19.20 GB/s ledger=612.2 / 3648.0 MiB/s，crc32 22.14 GB/s 判定=OK
+      注: 1 MiB L6，同轮交替测，3 轮中位
+
+[M12] hash 吞吐 SHA-256 / crc32（ledger:182）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_hash_test（未绑核，1 GiB 流式）
+       | [hash]   crc32(IEEE)    20389.67 MiB/s  21380.12 MB/s  (1073741824 B, digest 5a099670)
+       | [hash]   sha256          2293.38 MiB/s   2404.79 MB/s  (1073741824 B, digest 7dea7eac46bdb4903cde2db2ab2e79a6e055f4c5ad75c8e3ed446ca7877bfa56)
+  SHA-256 对照（±30%）: ledger=2002.60(偏差+14.5% ✓) 
+  crc32 对照（±30%）: ledger=18731.55(偏差+8.9% ✓) 
+[M12] 实测=SHA-256 2293.38 / crc32 20389.67 MiB/s ledger=SHA-256 2002.60 / crc32 18731.55 MiB/s 判定=OK
+      注: 1 GiB 流式单线程；ledger 环境为未绑核，本脚本不 taskset
+
+[M13] reflect 二进制编解码 ns/op（ledger:192）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/tests/bench/gen /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_reflect_stage.cpp /UserData/CodexWorkSpace/Go2cpp/tests/bench/gen/tools_bench.pb.cc /UserData/CodexWorkSpace/Go2cpp/src/reflect/codec.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/compress.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/json.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/type.cpp -lprotobuf -o /tmp/verify_metrics.Vrww5A/bench_reflect_stage
+  运行: taskset -c 2,3 /tmp/verify_metrics.Vrww5A/bench_reflect_stage
+       | bin_encode_compact                         57.85 ns/op   1187.0 MiB/s
+       | bin_decode_full                            57.07 ns/op   1203.2 MiB/s
+  编码 对照（±30%）: ledger=52.64(偏差+9.9% ✓) 
+  解码 对照（±30%）: ledger=54.89(偏差+4.0% ✓) 
+[M13] 实测=编码 57.85 / 解码 57.07 ns/op ledger=编码 52.64 / 解码 54.89 ns/op 判定=OK
+      注: 二进制紧凑格式；描述/文本格式仅打印不判定
+
+==============================================================
+TOTAL=16 OK=7 STALE=4 SKIP=5
+STALE 列表: M02 M03 M04 M09
+SKIP 列表: M01 M05 M05b M07 M10
+人读日志: tools/verify_metrics.out
+==============================================================
+==============================================================
+ verify_metrics 全量校验: 2026-11-03 14:31:16 +0800  mode=quick
+ repo=/UserData/CodexWorkSpace/Go2cpp
+ 环境: nproc=12 绑定=taskset -c 2,3 构建库=.build-bento-wsl 单条上限=300s
+ 判定: 任一 ledger 值落在该条容差内=OK；全部超出=STALE；跑不起来=SKIP（不算通过）
+==============================================================
+台账引用: 16 条，失配 0 条
+
+[M01b-a] 通用 Channel<uint64_t> 1P1C cap1024 ns/条（ledger:42）
+  编译: g++ -O3 -DNDEBUG -std=c++20 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_channel_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_channel -lgo2cpp_context -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_log -pthread -o /tmp/verify_metrics.lTFc29/bench_channel_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.lTFc29/bench_channel_opt 1000000 3 spsc
+       |   Channel cap=1024                           min     102.3  median     110.1  max     126.1  ns/op
+  对照（相对容差 ±30%）: ledger=112.6(偏差-2.2% ✓) 
+[M01b-a] 实测=110.1 ns/条 ledger=112.6 判定=OK
+      注: 1e6 条×3 reps，取 [1] SPSC cap=1024 median；容差 ±30%
+
+[M01b-b] FastChannel<1024> 1P1C ns/条（ledger:56）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_fast_channel_bench 1000000 5
+       |   fast-cap1024               median    14.72  min    14.24  ns/op  bad=0
+       |   fiber-fast-cap1024         median     6.06  min     5.99  ns/op  bad=0
+  对照（相对容差 ±30%）: ledger=12.83(偏差+14.7% ✓) ledger=16.07(偏差-8.4% ✓) 
+[M01b-b] 实测=14.72 ns/条 ledger=12.83 16.07 判定=OK
+      注: 1e6×5 reps 线程段 median（min=14.24）；容差 ±30%
+
+[M02] Fiber 全量切换 ns/往返（ledger:66）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_fiber_switch_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_fiber -lgo2cpp_debug -lgo2cpp_debug_event -lgo2cpp_error -pthread -o /tmp/verify_metrics.lTFc29/bench_fiber_switch
+  运行: taskset -c 2,3 /tmp/verify_metrics.lTFc29/bench_fiber_switch 1000000
+       | Fiber::resume ping-pong (yield)                           22.27 ns/op
+  对照（相对容差 ±30%）: ledger=33.80(偏差-34.1%) ledger=23.5(偏差-5.2% ✓) ledger=19.84(偏差+12.2% ✓) 
+[M02] 实测=22.27 ns/往返 ledger=33.80 23.5 19.84 判定=OK
+      注: resume↔Suspend 往返 1e6 次（口径见 ledger M02 备注）；容差 ±30%
+
+[M03] Scheduler task churn wall ns/task（ledger:75）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_task_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.lTFc29/bench_scheduler_task_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.lTFc29/bench_scheduler_task_opt 4 100000 5
+       | [round 0] cpu 631 ns/task  wall 315 ns/task  (3 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=6.6 MiB
+       | [round 1] cpu 544 ns/task  wall 273 ns/task  (4 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=7.9 MiB
+       | [round 2] cpu 609 ns/task  wall 308 ns/task  (3 k tasks/s)
+      cpu 中位: 578 ns/task（仅诊断宿主负载，不参与判定）
+  对照（相对容差 ±30%）: ledger=122.0(偏差+132.0%) ledger=239(偏差+18.4% ✓) ledger=299(偏差-5.4% ✓) 
+[M03] 实测=283 ns/task ledger=122.0 239 299 判定=OK
+      注: 4 worker/100k tasks/5 轮 wall 中位；容差 ±30%
+
+==============================================================
+TOTAL=4 OK=4 STALE=0 SKIP=0
+STALE 列表: 无
+人读日志: tools/verify_metrics.out
+==============================================================
+==============================================================
+ verify_metrics 全量校验: 2026-11-03 14:31:33 +0800  mode=full
+ repo=/UserData/CodexWorkSpace/Go2cpp
+ 环境: nproc=12 绑定=taskset -c 2,3 构建库=.build-bento-wsl 单条上限=300s
+ 判定: 任一 ledger 值落在该条容差内=OK；全部超出=STALE；跑不起来=SKIP（不算通过）
+==============================================================
+台账引用: 16 条，失配 0 条
+
+[M01b-a] 通用 Channel<uint64_t> 1P1C cap1024 ns/条（ledger:42）
+  编译: g++ -O3 -DNDEBUG -std=c++20 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_channel_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_channel -lgo2cpp_context -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_log -pthread -o /tmp/verify_metrics.Yke51L/bench_channel_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.Yke51L/bench_channel_opt 1000000 3 spsc
+       |   Channel cap=1024                           min     113.0  median     139.4  max     140.8  ns/op
+  对照（相对容差 ±30%）: ledger=112.6(偏差+23.8% ✓) 
+[M01b-a] 实测=139.4 ns/条 ledger=112.6 判定=OK
+      注: 1e6 条×3 reps，取 [1] SPSC cap=1024 median；容差 ±30%
+
+[M01b-b] FastChannel<1024> 1P1C ns/条（ledger:56）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_fast_channel_bench 1000000 5
+       |   fast-cap1024               median    16.20  min    15.15  ns/op  bad=0
+       |   fiber-fast-cap1024         median     7.03  min     6.88  ns/op  bad=0
+  对照（相对容差 ±30%）: ledger=12.83(偏差+26.3% ✓) ledger=16.07(偏差+0.8% ✓) 
+[M01b-b] 实测=16.20 ns/条 ledger=12.83 16.07 判定=OK
+      注: 1e6×5 reps 线程段 median（min=15.15）；容差 ±30%
+
+[M02] Fiber 全量切换 ns/往返（ledger:66）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_fiber_switch_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_fiber -lgo2cpp_debug -lgo2cpp_debug_event -lgo2cpp_error -pthread -o /tmp/verify_metrics.Yke51L/bench_fiber_switch
+  运行: taskset -c 2,3 /tmp/verify_metrics.Yke51L/bench_fiber_switch 1000000
+       | Fiber::resume ping-pong (yield)                           24.53 ns/op
+  对照（相对容差 ±30%）: ledger=33.80(偏差-27.4% ✓) ledger=23.5(偏差+4.4% ✓) ledger=19.84(偏差+23.6% ✓) 
+[M02] 实测=24.53 ns/往返 ledger=33.80 23.5 19.84 判定=OK
+      注: resume↔Suspend 往返 1e6 次（口径见 ledger M02 备注）；容差 ±30%
+
+[M03] Scheduler task churn wall ns/task（ledger:75）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_task_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.Yke51L/bench_scheduler_task_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.Yke51L/bench_scheduler_task_opt 4 100000 5
+       | [round 0] cpu 575 ns/task  wall 312 ns/task  (3 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=6.5 MiB
+       | [round 1] cpu 802 ns/task  wall 451 ns/task  (2 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=8.0 MiB
+       | [round 2] cpu 1483 ns/task  wall 805 ns/task  (1 k tasks/s)
+      cpu 中位: 1156 ns/task（仅诊断宿主负载，不参与判定）
+  对照（相对容差 ±30%）: ledger=122.0(偏差+414.8%) ledger=239(偏差+162.8%) ledger=299(偏差+110.0%) 
+[M03] 实测=628 ns/task ledger=122.0 239 299 判定=STALE
+      注: 4 worker/100k tasks/5 轮 wall 中位；容差 ±30%
+
+[M04] Scheduler submit ns/task（batch=1024 / 65536，ledger:92）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_submit.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.Yke51L/bench_scheduler_submit
+  运行: taskset -c 2,3 /tmp/verify_metrics.Yke51L/bench_scheduler_submit 4 1000000 3 1024
+       | [summary] rounds=3 median 232.7 ns/task  min 220.2  max 249.5
+  运行: taskset -c 2,3 /tmp/verify_metrics.Yke51L/bench_scheduler_submit 4 1000000 3 65536
+       | [summary] rounds=3 median 463.0 ns/task  min 419.8  max 536.2
+  batch=1024 对照（±30%）: ledger=119.0(偏差+95.5%) 
+  batch=65536 对照（±30%）: ledger=355.7(偏差+30.2%) 
+[M04] 实测=batch1024 232.7 / batch65536 463.0 ns/task ledger=119.0 / 355.7 ns/task 判定=STALE
+      注: 至少一个 batch 口径超出 ±30%
+
+[M01] Channel 1P1C 有缓冲 ns/条
+  无法自动校验：已拆条：10.73 实为 FastChannel<1024>，校验见 M01b-b；通用 Channel 见 M01b-a
+[M01] 实测=— ledger=10.73（已拆条） 判定=SKIP
+      注: 已拆条：10.73 实为 FastChannel<1024>，校验见 M01b-b；通用 Channel 见 M01b-a
+
+[M05] HTTP/1.1 pipeline=16 单连接 rps
+  无法自动校验：需先起 net_perf_server（READY 行取端口）再用 Go http_loadgen 压测，非单进程基准
+[M05] 实测=— ledger=120,755 rps 判定=SKIP
+      注: 需先起 net_perf_server（READY 行取端口）再用 Go http_loadgen 压测，非单进程基准
+
+[M05b] 「HTTP pipeline 411k rps」（无出处）
+  无法自动校验：台账记为无出处，没有可校验的数字（禁止引用）
+[M05b] 实测=— ledger=411k rps（无出处） 判定=SKIP
+      注: 台账记为无出处，没有可校验的数字（禁止引用）
+
+[M07] LevelDB 1e7 Put 与 1e8 RSS
+  无法自动校验：1e7 Put 需 3 轮×2 实现、1e8 RSS 段单独约 230 s，超出单条 5 分钟预算，需手工执行
+[M07] 实测=— ledger=647.5k ops/s / 82.4 MiB 判定=SKIP
+      注: 1e7 Put 需 3 轮×2 实现、1e8 RSS 段单独约 230 s，超出单条 5 分钟预算，需手工执行
+
+[M06] SQLite 1e6 行插入 wrapper/native 比值（ledger:121）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 1/3 轮）
+  第 1 轮 insert-file = 1.012×
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 2/3 轮）
+  第 2 轮 insert-file = 1.083×
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 3/3 轮）
+  第 3 轮 insert-file = 1.047×
+  对照（相对容差 ±15%）: ledger=1.074(偏差-2.5% ✓) 
+[M06] 实测=1.047 × ledger=1.074 判定=OK
+      注: 1e6 行 insert-file 3 轮中位（ledger 为 7 轮，轮数已降）；容差 ±15%
+
+[M08] bufio 分块传输 1 MiB 读 MiB/s（ledger:144）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 1/3 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1258.1 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 2/3 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1434.2 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 3/3 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1186.2 MiB/s
+  对照（相对容差 ±30%）: ledger=1853.9(偏差-32.1%) 
+[M08] 实测=1258.1 MiB/s ledger=1853.9 判定=STALE
+      注: 1 MiB 分块读 3 次中位，未绑核（单次仅约 0.5 ms，故取中位）；容差 ±30%
+
+[M09] Cache hotspot 命中率 ARC/LRU（ledger:153）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_cache_test（未绑核，固定 seed）
+       | [cache]   hotspot LRU        hit=0.5594
+       | [cache]   hotspot ARC        hit=0.7764
+  ARC 对照（绝对容差 ±0.02）: ledger=0.7817(Δ-0.0053 ✓) ledger=0.7764(Δ+0.0000 ✓) 
+  LRU 对照（绝对容差 ±0.02）: ledger=0.5580(Δ+0.0014 ✓) ledger=0.5594(Δ+0.0000 ✓) 
+[M09] 实测=ARC 0.7764 / LRU 0.5594 ledger=ARC 0.7764 / LRU 0.5594 判定=OK
+      注: 命中率绝对容差 ±0.02，未绑核
+
+[M10] os 批量 writev/readv 加速比（ledger:162）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/src/os /UserData/CodexWorkSpace/Go2cpp/tests/os/bench_vectored.cpp /UserData/CodexWorkSpace/Go2cpp/src/os/file.cpp /UserData/CodexWorkSpace/Go2cpp/src/os/config.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_config -lgo2cpp_error -lgo2cpp_log -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -pthread -o /tmp/verify_metrics.Yke51L/bench_vectored
+  运行: taskset -c 2,3 /tmp/verify_metrics.Yke51L/bench_vectored <workdir>
+       | [bench_vectored] MEDIAN write: single=946.5 ns/rec (8.1 MiB/s) batch=50.5 ns/rec (151.0 MiB/s) speedup=18.56x
+       | [bench_vectored] MEDIAN read : single=524.1 ns/rec (14.6 MiB/s) batch=33.7 ns/rec (226.6 MiB/s) speedup=15.74x
+       | [bench_vectored] failures=0
+  写 对照（±30%）: ledger=17.96(偏差+3.3% ✓) 
+  读 对照（±30%）: ledger=14.68(偏差+7.2% ✓) 
+[M10] 实测=写 18.56× / 读 15.74× ledger=写 17.96× / 读 14.68× 判定=OK
+      注: 3 轮中位；读口径历史 20.9× 未复现，ledger 已按 14.68× 记账
+
+[M11] gzip 压缩/解压吞吐 + crc32（ledger:172）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/tests/bench/gen -I/UserData/CodexWorkSpace/Go2cpp/tests/compress /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_tools_industry.cpp /UserData/CodexWorkSpace/Go2cpp/tests/bench/gen/tools_bench.pb.cc /UserData/CodexWorkSpace/Go2cpp/tests/compress/compress_test_support.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_reflect -lgo2cpp_encoding -lgo2cpp_compress -lgo2cpp_error -lz -lprotobuf -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -o /tmp/verify_metrics.Yke51L/bench_tools_industry
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_gzip_crc.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_compress -lgo2cpp_hash -lgo2cpp_error -lz -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -o /tmp/verify_metrics.Yke51L/bench_gzip_crc
+  运行: taskset -c 2,3 /tmp/verify_metrics.Yke51L/bench_tools_industry
+  运行: taskset -c 2,3 /tmp/verify_metrics.Yke51L/bench_gzip_crc
+       | gzip_compress_L6                    1801730.2 ns/op     555.0 MiB/s
+       | gzip_decompress                      273908.0 ns/op    3650.9 MiB/s
+       | zlib_gzip_compress_L6               2390992.2 ns/op     418.2 MiB/s
+       | zlib_gzip_decompress                 333346.5 ns/op    2999.9 MiB/s
+       | gzip_compress L6 1MiB: 561.2 MiB/s
+       | crc32 1MiB (hash::Crc32/PCLMUL):  19.30 GB/s
+  压缩 对照（±30%）: ledger=612.2(偏差-9.3% ✓) 
+  解压 对照（±30%）: ledger=3648.0(偏差+0.1% ✓) 
+  crc32 对照（±30%）: ledger=22.14(偏差-12.8% ✓) 
+[M11] 实测=压缩 555.0 MiB/s / 解压 3650.9 MiB/s / crc32 19.30 GB/s ledger=612.2 / 3648.0 MiB/s，crc32 22.14 GB/s 判定=OK
+      注: 1 MiB L6，同轮交替测，3 轮中位
+
+[M12] hash 吞吐 SHA-256 / crc32（ledger:182）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_hash_test（未绑核，1 GiB 流式）
+       | [hash]   crc32(IEEE)    18370.82 MiB/s  19263.20 MB/s  (1073741824 B, digest 5a099670)
+       | [hash]   sha256          2081.45 MiB/s   2182.56 MB/s  (1073741824 B, digest 7dea7eac46bdb4903cde2db2ab2e79a6e055f4c5ad75c8e3ed446ca7877bfa56)
+  SHA-256 对照（±30%）: ledger=2002.60(偏差+3.9% ✓) 
+  crc32 对照（±30%）: ledger=18731.55(偏差-1.9% ✓) 
+[M12] 实测=SHA-256 2081.45 / crc32 18370.82 MiB/s ledger=SHA-256 2002.60 / crc32 18731.55 MiB/s 判定=OK
+      注: 1 GiB 流式单线程；ledger 环境为未绑核，本脚本不 taskset
+
+[M13] reflect 二进制编解码 ns/op（ledger:192）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/tests/bench/gen /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_reflect_stage.cpp /UserData/CodexWorkSpace/Go2cpp/tests/bench/gen/tools_bench.pb.cc /UserData/CodexWorkSpace/Go2cpp/src/reflect/codec.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/compress.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/json.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/type.cpp -lprotobuf -o /tmp/verify_metrics.Yke51L/bench_reflect_stage
+  运行: taskset -c 2,3 /tmp/verify_metrics.Yke51L/bench_reflect_stage
+       | bin_encode_compact                         63.33 ns/op   1084.2 MiB/s
+       | bin_decode_full                            53.04 ns/op   1294.6 MiB/s
+  编码 对照（±30%）: ledger=52.64(偏差+20.3% ✓) 
+  解码 对照（±30%）: ledger=54.89(偏差-3.4% ✓) 
+[M13] 实测=编码 63.33 / 解码 53.04 ns/op ledger=编码 52.64 / 解码 54.89 ns/op 判定=OK
+      注: 二进制紧凑格式；描述/文本格式仅打印不判定
+
+==============================================================
+TOTAL=16 OK=9 STALE=3 SKIP=4
+STALE 列表: M03 M04 M08
+SKIP 列表: M01 M05 M05b M07
+人读日志: tools/verify_metrics.out
+==============================================================
+==============================================================
+ verify_metrics 全量校验: 2026-11-03 14:33:18 +0800  mode=quick
+ repo=/UserData/CodexWorkSpace/Go2cpp
+ 环境: nproc=12 绑定=taskset -c 2,3 构建库=.build-bento-wsl 单条上限=300s
+ 判定: 任一 ledger 值落在该条容差内=OK；全部超出=STALE；跑不起来=SKIP（不算通过）
+==============================================================
+台账引用: 16 条，失配 0 条
+
+[M01b-a] 通用 Channel<uint64_t> 1P1C cap1024 ns/条（ledger:42）
+  编译: g++ -O3 -DNDEBUG -std=c++20 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_channel_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_channel -lgo2cpp_context -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_log -pthread -o /tmp/verify_metrics.jo8JcW/bench_channel_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.jo8JcW/bench_channel_opt 1000000 3 spsc
+       |   Channel cap=1024                           min     110.5  median     119.5  max     141.6  ns/op
+  对照（相对容差 ±30%）: ledger=112.6(偏差+6.1% ✓) 
+[M01b-a] 实测=119.5 ns/条 ledger=112.6 判定=OK
+      注: 1e6 条×3 reps，取 [1] SPSC cap=1024 median；容差 ±30%
+
+[M01b-b] FastChannel<1024> 1P1C ns/条（ledger:56）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_fast_channel_bench 1000000 5
+       |   fast-cap1024               median    14.43  min     9.91  ns/op  bad=0
+       |   fiber-fast-cap1024         median     6.10  min     6.02  ns/op  bad=0
+  对照（相对容差 ±30%）: ledger=12.83(偏差+12.5% ✓) ledger=16.07(偏差-10.2% ✓) 
+[M01b-b] 实测=14.43 ns/条 ledger=12.83 16.07 判定=OK
+      注: 1e6×5 reps 线程段 median（min=9.91）；容差 ±30%
+
+[M02] Fiber 全量切换 ns/往返（ledger:66）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_fiber_switch_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_fiber -lgo2cpp_debug -lgo2cpp_debug_event -lgo2cpp_error -pthread -o /tmp/verify_metrics.jo8JcW/bench_fiber_switch
+  运行: taskset -c 2,3 /tmp/verify_metrics.jo8JcW/bench_fiber_switch 1000000
+       | Fiber::resume ping-pong (yield)                           22.73 ns/op
+  对照（相对容差 ±30%）: ledger=33.80(偏差-32.8%) ledger=23.5(偏差-3.3% ✓) ledger=19.84(偏差+14.6% ✓) 
+[M02] 实测=22.73 ns/往返 ledger=33.80 23.5 19.84 判定=OK
+      注: resume↔Suspend 往返 1e6 次（口径见 ledger M02 备注）；容差 ±30%
+
+[M03] Scheduler task churn wall ns/task（ledger:75）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_task_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.jo8JcW/bench_scheduler_task_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.jo8JcW/bench_scheduler_task_opt 4 100000 5
+       | [round 0] cpu 911 ns/task  wall 456 ns/task  (2 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=6.6 MiB
+       | [round 1] cpu 986 ns/task  wall 480 ns/task  (2 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=6.6 MiB
+       | [round 2] cpu 1453 ns/task  wall 701 ns/task  (1 k tasks/s)
+      cpu 中位: 911 ns/task（仅诊断宿主负载，不参与判定）
+  对照（相对容差 ±30%）: ledger=122.0(偏差+273.8%) ledger=239(偏差+90.8%) ledger=299(偏差+52.5%) 
+[M03] 实测=456 ns/task ledger=122.0 239 299 判定=STALE
+      注: 4 worker/100k tasks/5 轮 wall 中位；容差 ±30%
+
+==============================================================
+TOTAL=4 OK=3 STALE=1 SKIP=0
+STALE 列表: M03
+人读日志: tools/verify_metrics.out
+==============================================================
+==============================================================
+ verify_metrics 全量校验: 2026-11-03 14:33:32 +0800  mode=full
+ repo=/UserData/CodexWorkSpace/Go2cpp
+ 环境: nproc=12 绑定=taskset -c 2,3 构建库=.build-bento-wsl 单条上限=300s
+ 判定: 任一 ledger 值落在该条容差内=OK；全部超出=STALE；跑不起来=SKIP（不算通过）
+==============================================================
+台账引用: 16 条，失配 0 条
+
+[M01b-a] 通用 Channel<uint64_t> 1P1C cap1024 ns/条（ledger:42）
+  编译: g++ -O3 -DNDEBUG -std=c++20 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_channel_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_channel -lgo2cpp_context -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_log -pthread -o /tmp/verify_metrics.69ahbM/bench_channel_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.69ahbM/bench_channel_opt 1000000 3 spsc
+       |   Channel cap=1024                           min      94.6  median     101.0  max     105.3  ns/op
+  对照（相对容差 ±30%）: ledger=112.6(偏差-10.3% ✓) 
+[M01b-a] 实测=101.0 ns/条 ledger=112.6 判定=OK
+      注: 1e6 条×3 reps，取 [1] SPSC cap=1024 median；容差 ±30%
+
+[M01b-b] FastChannel<1024> 1P1C ns/条（ledger:56）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_fast_channel_bench 1000000 5
+       |   fast-cap1024               median    14.34  min    13.65  ns/op  bad=0
+       |   fiber-fast-cap1024         median     5.78  min     5.69  ns/op  bad=0
+  对照（相对容差 ±30%）: ledger=12.83(偏差+11.8% ✓) ledger=16.07(偏差-10.8% ✓) 
+[M01b-b] 实测=14.34 ns/条 ledger=12.83 16.07 判定=OK
+      注: 1e6×5 reps 线程段 median（min=13.65）；容差 ±30%
+
+[M02] Fiber 全量切换 ns/往返（ledger:66）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_fiber_switch_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_fiber -lgo2cpp_debug -lgo2cpp_debug_event -lgo2cpp_error -pthread -o /tmp/verify_metrics.69ahbM/bench_fiber_switch
+  运行: taskset -c 2,3 /tmp/verify_metrics.69ahbM/bench_fiber_switch 1000000
+       | Fiber::resume ping-pong (yield)                           19.41 ns/op
+  对照（相对容差 ±30%）: ledger=33.80(偏差-42.6%) ledger=23.5(偏差-17.4% ✓) ledger=19.84(偏差-2.2% ✓) 
+[M02] 实测=19.41 ns/往返 ledger=33.80 23.5 19.84 判定=OK
+      注: resume↔Suspend 往返 1e6 次（口径见 ledger M02 备注）；容差 ±30%
+
+[M03] Scheduler task churn wall ns/task（ledger:75）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_task_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.69ahbM/bench_scheduler_task_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.69ahbM/bench_scheduler_task_opt 4 100000 5
+       | [round 0] cpu 1482 ns/task  wall 689 ns/task  (1 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=7.4 MiB
+       | [round 1] cpu 1577 ns/task  wall 724 ns/task  (1 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=7.4 MiB
+       | [round 2] cpu 882 ns/task  wall 411 ns/task  (2 k tasks/s)
+      cpu 中位: 1252 ns/task（仅诊断宿主负载，不参与判定）
+  对照（相对容差 ±30%）: ledger=122.0(偏差+382.8%) ledger=239(偏差+146.4%) ledger=299(偏差+97.0%) 
+[M03] 实测=589 ns/task ledger=122.0 239 299 判定=STALE
+      注: 4 worker/100k tasks/5 轮 wall 中位；容差 ±30%
+
+[M04] Scheduler submit ns/task（batch=1024 / 65536，ledger:92）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_submit.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.69ahbM/bench_scheduler_submit
+  运行: taskset -c 2,3 /tmp/verify_metrics.69ahbM/bench_scheduler_submit 4 1000000 3 1024
+       | [summary] rounds=3 median 92.7 ns/task  min 69.7  max 105.2
+  运行: taskset -c 2,3 /tmp/verify_metrics.69ahbM/bench_scheduler_submit 4 1000000 3 65536
+==============================================================
+ verify_metrics 全量校验: 2026-11-03 14:33:48 +0800  mode=quick
+ repo=/UserData/CodexWorkSpace/Go2cpp
+ 环境: nproc=12 绑定=taskset -c 2,3 构建库=.build-bento-wsl 单条上限=300s
+ 判定: 任一 ledger 值落在该条容差内=OK；全部超出=STALE；跑不起来=SKIP（不算通过）
+==============================================================
+台账引用: 16 条，失配 0 条
+
+[M01b-a] 通用 Channel<uint64_t> 1P1C cap1024 ns/条（ledger:42）
+  编译: g++ -O3 -DNDEBUG -std=c++20 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_channel_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_channel -lgo2cpp_context -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_log -pthread -o /tmp/verify_metrics.RFdJ3Z/bench_channel_opt
+       | [summary] rounds=3 median 491.9 ns/task  min 477.1  max 660.0
+  batch=1024 对照（±30%）: ledger=119.0(偏差-22.1% ✓) 
+  batch=65536 对照（±30%）: ledger=355.7(偏差+38.3%) 
+[M04] 实测=batch1024 92.7 / batch65536 491.9 ns/task ledger=119.0 / 355.7 ns/task 判定=STALE
+      注: 至少一个 batch 口径超出 ±30%
+
+[M01] Channel 1P1C 有缓冲 ns/条
+  无法自动校验：已拆条：10.73 实为 FastChannel<1024>，校验见 M01b-b；通用 Channel 见 M01b-a
+[M01] 实测=— ledger=10.73（已拆条） 判定=SKIP
+      注: 已拆条：10.73 实为 FastChannel<1024>，校验见 M01b-b；通用 Channel 见 M01b-a
+
+[M05] HTTP/1.1 pipeline=16 单连接 rps
+  无法自动校验：需先起 net_perf_server（READY 行取端口）再用 Go http_loadgen 压测，非单进程基准
+[M05] 实测=— ledger=120,755 rps 判定=SKIP
+      注: 需先起 net_perf_server（READY 行取端口）再用 Go http_loadgen 压测，非单进程基准
+
+[M05b] 「HTTP pipeline 411k rps」（无出处）
+  无法自动校验：台账记为无出处，没有可校验的数字（禁止引用）
+[M05b] 实测=— ledger=411k rps（无出处） 判定=SKIP
+      注: 台账记为无出处，没有可校验的数字（禁止引用）
+
+[M07] LevelDB 1e7 Put 与 1e8 RSS
+  无法自动校验：1e7 Put 需 3 轮×2 实现、1e8 RSS 段单独约 230 s，超出单条 5 分钟预算，需手工执行
+[M07] 实测=— ledger=647.5k ops/s / 82.4 MiB 判定=SKIP
+      注: 1e7 Put 需 3 轮×2 实现、1e8 RSS 段单独约 230 s，超出单条 5 分钟预算，需手工执行
+
+[M06] SQLite 1e6 行插入 wrapper/native 比值（ledger:121）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 1/3 轮）
+  运行: taskset -c 2,3 /tmp/verify_metrics.RFdJ3Z/bench_channel_opt 1000000 3 spsc
+  第 1 轮 insert-file = 1.127×
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 2/3 轮）
+  第 2 轮 insert-file = 1.400×
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 3/3 轮）
+       |   Channel cap=1024                           min      59.2  median      60.8  max      73.6  ns/op
+  对照（相对容差 ±30%）: ledger=112.6(偏差-46.0%) 
+[M01b-a] 实测=60.8 ns/条 ledger=112.6 判定=STALE
+      注: 1e6 条×3 reps，取 [1] SPSC cap=1024 median；容差 ±30%
+
+[M01b-b] FastChannel<1024> 1P1C ns/条（ledger:56）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_fast_channel_bench 1000000 5
+  第 3 轮 insert-file = 1.066×
+  对照（相对容差 ±15%）: ledger=1.074(偏差+4.9% ✓) 
+[M06] 实测=1.127 × ledger=1.074 判定=OK
+      注: 1e6 行 insert-file 3 轮中位（ledger 为 7 轮，轮数已降）；容差 ±15%
+
+[M08] bufio 分块传输 1 MiB 读 MiB/s（ledger:144）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 1/3 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1408.4 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 2/3 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1479.3 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 3/3 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1313.4 MiB/s
+  对照（相对容差 ±30%）: ledger=1853.9(偏差-24.0% ✓) 
+[M08] 实测=1408.4 MiB/s ledger=1853.9 判定=OK
+      注: 1 MiB 分块读 3 次中位，未绑核（单次仅约 0.5 ms，故取中位）；容差 ±30%
+
+[M09] Cache hotspot 命中率 ARC/LRU（ledger:153）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_cache_test（未绑核，固定 seed）
+       | [cache]   hotspot LRU        hit=0.5594
+       | [cache]   hotspot ARC        hit=0.7764
+  ARC 对照（绝对容差 ±0.02）: ledger=0.7817(Δ-0.0053 ✓) ledger=0.7764(Δ+0.0000 ✓) 
+  LRU 对照（绝对容差 ±0.02）: ledger=0.5580(Δ+0.0014 ✓) ledger=0.5594(Δ+0.0000 ✓) 
+[M09] 实测=ARC 0.7764 / LRU 0.5594 ledger=ARC 0.7764 / LRU 0.5594 判定=OK
+      注: 命中率绝对容差 ±0.02，未绑核
+
+[M10] os 批量 writev/readv 加速比（ledger:162）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/src/os /UserData/CodexWorkSpace/Go2cpp/tests/os/bench_vectored.cpp /UserData/CodexWorkSpace/Go2cpp/src/os/file.cpp /UserData/CodexWorkSpace/Go2cpp/src/os/config.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_config -lgo2cpp_error -lgo2cpp_log -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -pthread -o /tmp/verify_metrics.69ahbM/bench_vectored
+  运行: taskset -c 2,3 /tmp/verify_metrics.69ahbM/bench_vectored <workdir>
+       |   fast-cap1024               median    16.52  min    14.89  ns/op  bad=0
+       |   fiber-fast-cap1024         median     6.12  min     6.10  ns/op  bad=0
+  对照（相对容差 ±30%）: ledger=12.83(偏差+28.8% ✓) ledger=16.07(偏差+2.8% ✓) 
+[M01b-b] 实测=16.52 ns/条 ledger=12.83 16.07 判定=OK
+      注: 1e6×5 reps 线程段 median（min=14.89）；容差 ±30%
+
+[M02] Fiber 全量切换 ns/往返（ledger:66）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_fiber_switch_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_fiber -lgo2cpp_debug -lgo2cpp_debug_event -lgo2cpp_error -pthread -o /tmp/verify_metrics.RFdJ3Z/bench_fiber_switch
+  运行: taskset -c 2,3 /tmp/verify_metrics.RFdJ3Z/bench_fiber_switch 1000000
+       | Fiber::resume ping-pong (yield)                           20.59 ns/op
+  对照（相对容差 ±30%）: ledger=33.80(偏差-39.1%) ledger=23.5(偏差-12.4% ✓) ledger=19.84(偏差+3.8% ✓) 
+[M02] 实测=20.59 ns/往返 ledger=33.80 23.5 19.84 判定=OK
+      注: resume↔Suspend 往返 1e6 次（口径见 ledger M02 备注）；容差 ±30%
+
+[M03] Scheduler task churn wall ns/task（ledger:75）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_task_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.RFdJ3Z/bench_scheduler_task_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.RFdJ3Z/bench_scheduler_task_opt 4 100000 5
+       | [round 0] cpu 777 ns/task  wall 514 ns/task  (2 k tasks/s)
+       | [round] VmSize=0.37 GiB Rss=13.0 MiB
+       | [round 1] cpu 571 ns/task  wall 478 ns/task  (2 k tasks/s)
+       | [round] VmSize=0.37 GiB Rss=19.0 MiB
+       | [round 2] cpu 650 ns/task  wall 394 ns/task  (3 k tasks/s)
+      cpu 中位: 662 ns/task（诊断宿主负载；ledger 同口径 627）
+  对照（相对容差 ±30%）: ledger=122.0(偏差+291.8%) ledger=239(偏差+100.0%) ledger=299(偏差+59.9%) 
+[M03] 实测=478 ns/task ledger=122.0 239 299 判定=STALE
+      注: 4 worker/100k tasks/5 轮 wall 中位；容差 ±30%
+
+==============================================================
+TOTAL=4 OK=2 STALE=2 SKIP=0
+STALE 列表: M01b-a M03
+人读日志: tools/verify_metrics.out
+==============================================================
+       | [bench_vectored] MEDIAN write: single=897.4 ns/rec (8.5 MiB/s) batch=52.6 ns/rec (145.0 MiB/s) speedup=16.96x
+       | [bench_vectored] MEDIAN read : single=535.1 ns/rec (14.3 MiB/s) batch=37.0 ns/rec (206.2 MiB/s) speedup=14.34x
+       | [bench_vectored] failures=0
+  写 对照（±30%）: ledger=17.96(偏差-5.6% ✓) 
+  读 对照（±30%）: ledger=14.68(偏差-2.3% ✓) 
+[M10] 实测=写 16.96× / 读 14.34× ledger=写 17.96× / 读 14.68× 判定=OK
+      注: 3 轮中位；读口径历史 20.9× 未复现，ledger 已按 14.68× 记账
+
+[M11] gzip 压缩/解压吞吐 + crc32（ledger:172）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/tests/bench/gen -I/UserData/CodexWorkSpace/Go2cpp/tests/compress /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_tools_industry.cpp /UserData/CodexWorkSpace/Go2cpp/tests/bench/gen/tools_bench.pb.cc /UserData/CodexWorkSpace/Go2cpp/tests/compress/compress_test_support.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_reflect -lgo2cpp_encoding -lgo2cpp_compress -lgo2cpp_error -lz -lprotobuf -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -o /tmp/verify_metrics.69ahbM/bench_tools_industry
+==============================================================
+ verify_metrics 全量校验: 2026-11-03 14:34:19 +0800  mode=full
+ repo=/UserData/CodexWorkSpace/Go2cpp
+ 环境: nproc=12 绑定=taskset -c 2,3 构建库=.build-bento-wsl 单条上限=300s
+ 判定: 任一 ledger 值落在该条容差内=OK；全部超出=STALE；跑不起来=SKIP（不算通过）
+==============================================================
+台账引用: 16 条，失配 0 条
+
+[M01b-a] 通用 Channel<uint64_t> 1P1C cap1024 ns/条（ledger:42）
+  编译: g++ -O3 -DNDEBUG -std=c++20 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_channel_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_channel -lgo2cpp_context -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_log -pthread -o /tmp/verify_metrics.H2ft2x/bench_channel_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.H2ft2x/bench_channel_opt 1000000 3 spsc
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_gzip_crc.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_compress -lgo2cpp_hash -lgo2cpp_error -lz -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -o /tmp/verify_metrics.69ahbM/bench_gzip_crc
+       |   Channel cap=1024                           min      86.4  median     115.1  max     119.8  ns/op
+  对照（相对容差 ±30%）: ledger=112.6(偏差+2.2% ✓) 
+[M01b-a] 实测=115.1 ns/条 ledger=112.6 判定=OK
+      注: 1e6 条×3 reps，取 [1] SPSC cap=1024 median；容差 ±30%
+
+[M01b-b] FastChannel<1024> 1P1C ns/条（ledger:56）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_fast_channel_bench 1000000 5
+  运行: taskset -c 2,3 /tmp/verify_metrics.69ahbM/bench_tools_industry
+  运行: taskset -c 2,3 /tmp/verify_metrics.69ahbM/bench_gzip_crc
+       | gzip_compress_L6                    2103552.2 ns/op     475.4 MiB/s
+       | gzip_decompress                      280447.2 ns/op    3565.7 MiB/s
+       | zlib_gzip_compress_L6               2356724.2 ns/op     424.3 MiB/s
+       | zlib_gzip_decompress                 327520.2 ns/op    3053.2 MiB/s
+       | gzip_compress L6 1MiB: 563.9 MiB/s
+       | crc32 1MiB (hash::Crc32/PCLMUL):  20.86 GB/s
+  压缩 对照（±30%）: ledger=612.2(偏差-22.3% ✓) 
+  解压 对照（±30%）: ledger=3648.0(偏差-2.3% ✓) 
+  crc32 对照（±30%）: ledger=22.14(偏差-5.8% ✓) 
+[M11] 实测=压缩 475.4 MiB/s / 解压 3565.7 MiB/s / crc32 20.86 GB/s ledger=612.2 / 3648.0 MiB/s，crc32 22.14 GB/s 判定=OK
+      注: 1 MiB L6，同轮交替测，3 轮中位
+
+[M12] hash 吞吐 SHA-256 / crc32（ledger:182）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_hash_test（未绑核，1 GiB 流式）
+       | [hash]   crc32(IEEE)    17880.83 MiB/s  18749.40 MB/s  (1073741824 B, digest 5a099670)
+       | [hash]   sha256          2070.03 MiB/s   2170.58 MB/s  (1073741824 B, digest 7dea7eac46bdb4903cde2db2ab2e79a6e055f4c5ad75c8e3ed446ca7877bfa56)
+  SHA-256 对照（±30%）: ledger=2002.60(偏差+3.4% ✓) 
+  crc32 对照（±30%）: ledger=18731.55(偏差-4.5% ✓) 
+[M12] 实测=SHA-256 2070.03 / crc32 17880.83 MiB/s ledger=SHA-256 2002.60 / crc32 18731.55 MiB/s 判定=OK
+      注: 1 GiB 流式单线程；ledger 环境为未绑核，本脚本不 taskset
+
+[M13] reflect 二进制编解码 ns/op（ledger:192）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/tests/bench/gen /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_reflect_stage.cpp /UserData/CodexWorkSpace/Go2cpp/tests/bench/gen/tools_bench.pb.cc /UserData/CodexWorkSpace/Go2cpp/src/reflect/codec.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/compress.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/json.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/type.cpp -lprotobuf -o /tmp/verify_metrics.69ahbM/bench_reflect_stage
+       |   fast-cap1024               median    14.30  min    13.92  ns/op  bad=0
+       |   fiber-fast-cap1024         median     5.95  min     5.90  ns/op  bad=0
+  对照（相对容差 ±30%）: ledger=12.83(偏差+11.5% ✓) ledger=16.07(偏差-11.0% ✓) 
+[M01b-b] 实测=14.30 ns/条 ledger=12.83 16.07 判定=OK
+      注: 1e6×5 reps 线程段 median（min=13.92）；容差 ±30%
+
+[M02] Fiber 全量切换 ns/往返（ledger:66）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_fiber_switch_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_fiber -lgo2cpp_debug -lgo2cpp_debug_event -lgo2cpp_error -pthread -o /tmp/verify_metrics.H2ft2x/bench_fiber_switch
+  运行: taskset -c 2,3 /tmp/verify_metrics.H2ft2x/bench_fiber_switch 1000000
+       | Fiber::resume ping-pong (yield)                           20.45 ns/op
+  对照（相对容差 ±30%）: ledger=33.80(偏差-39.5%) ledger=23.5(偏差-13.0% ✓) ledger=19.84(偏差+3.1% ✓) 
+[M02] 实测=20.45 ns/往返 ledger=33.80 23.5 19.84 判定=OK
+      注: resume↔Suspend 往返 1e6 次（口径见 ledger M02 备注）；容差 ±30%
+
+[M03] Scheduler task churn wall ns/task（ledger:75）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_task_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.H2ft2x/bench_scheduler_task_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.H2ft2x/bench_scheduler_task_opt 4 100000 5
+       | [round 0] cpu 756 ns/task  wall 368 ns/task  (3 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=7.9 MiB
+       | [round 1] cpu 1583 ns/task  wall 767 ns/task  (1 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=8.0 MiB
+       | [round 2] cpu 813 ns/task  wall 393 ns/task  (3 k tasks/s)
+      cpu 中位: 813 ns/task（诊断宿主负载；ledger 同口径 627）
+  对照（相对容差 ±30%）: ledger=122.0(偏差+222.1%) ledger=239(偏差+64.4%) ledger=299(偏差+31.4%) 
+[M03] 实测=393 ns/task ledger=122.0 239 299 判定=STALE
+      注: 4 worker/100k tasks/5 轮 wall 中位；容差 ±30%
+
+[M04] Scheduler submit ns/task（batch=1024 / 65536，ledger:92）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_submit.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.H2ft2x/bench_scheduler_submit
+  运行: taskset -c 2,3 /tmp/verify_metrics.H2ft2x/bench_scheduler_submit 4 1000000 3 1024
+       | [summary] rounds=3 median 114.0 ns/task  min 110.2  max 135.8
+  运行: taskset -c 2,3 /tmp/verify_metrics.H2ft2x/bench_scheduler_submit 4 1000000 3 65536
+  运行: taskset -c 2,3 /tmp/verify_metrics.69ahbM/bench_reflect_stage
+       | bin_encode_compact                        181.72 ns/op    377.9 MiB/s
+       | bin_decode_full                           142.59 ns/op    481.5 MiB/s
+  编码 对照（±30%）: ledger=52.64(偏差+245.2%) 
+  解码 对照（±30%）: ledger=54.89(偏差+159.8%) 
+[M13] 实测=编码 181.72 / 解码 142.59 ns/op ledger=编码 52.64 / 解码 54.89 ns/op 判定=STALE
+      注: 编码或解码超出 ±30%
+
+==============================================================
+TOTAL=16 OK=9 STALE=3 SKIP=4
+STALE 列表: M03 M04 M13
+SKIP 列表: M01 M05 M05b M07
+人读日志: tools/verify_metrics.out
+==============================================================
+       | [summary] rounds=3 median 312.0 ns/task  min 297.1  max 376.9
+  batch=1024 对照（±50%）: ledger=119.0(偏差-4.2% ✓) 
+  batch=65536 对照（±50%）: ledger=355.7(偏差-12.3% ✓) 
+[M04] 实测=batch1024 114.0 / batch65536 312.0 ns/task ledger=119.0 / 355.7 ns/task 判定=OK
+      注: 两个 batch 口径都命中；3 轮中位（ledger 为 5 轮×7 进程）；ledger 自身 p25–p75 已 ±15%，宿主争用再放大故容差取 ±50%
+
+[M01] Channel 1P1C 有缓冲 ns/条
+  无法自动校验：已拆条：10.73 实为 FastChannel<1024>，校验见 M01b-b；通用 Channel 见 M01b-a
+[M01] 实测=— ledger=10.73（已拆条） 判定=SKIP
+      注: 已拆条：10.73 实为 FastChannel<1024>，校验见 M01b-b；通用 Channel 见 M01b-a
+
+[M05] HTTP/1.1 pipeline=16 单连接 rps
+  无法自动校验：需先起 net_perf_server（READY 行取端口）再用 Go http_loadgen 压测，非单进程基准
+[M05] 实测=— ledger=120,755 rps 判定=SKIP
+      注: 需先起 net_perf_server（READY 行取端口）再用 Go http_loadgen 压测，非单进程基准
+
+[M05b] 「HTTP pipeline 411k rps」（无出处）
+  无法自动校验：台账记为无出处，没有可校验的数字（禁止引用）
+[M05b] 实测=— ledger=411k rps（无出处） 判定=SKIP
+      注: 台账记为无出处，没有可校验的数字（禁止引用）
+
+[M07] LevelDB 1e7 Put 与 1e8 RSS
+  无法自动校验：1e7 Put 需 3 轮×2 实现、1e8 RSS 段单独约 230 s，超出单条 5 分钟预算，需手工执行
+[M07] 实测=— ledger=647.5k ops/s / 82.4 MiB 判定=SKIP
+      注: 1e7 Put 需 3 轮×2 实现、1e8 RSS 段单独约 230 s，超出单条 5 分钟预算，需手工执行
+
+[M06] SQLite 1e6 行插入 wrapper/native 比值（ledger:121）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 1/3 轮）
+  第 1 轮 insert-file = 1.120×
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 2/3 轮）
+  第 2 轮 insert-file = 1.121×
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 3/3 轮）
+  第 3 轮 insert-file = 1.093×
+  对照（相对容差 ±15%）: ledger=1.074(偏差+4.3% ✓) 
+[M06] 实测=1.120 × ledger=1.074 判定=OK
+      注: 1e6 行 insert-file 3 轮中位（ledger 为 7 轮，轮数已降）；容差 ±15%
+
+[M08] bufio 分块传输 1 MiB 读 MiB/s（ledger:144）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 1/5 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1479.5 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 2/5 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1562.3 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 3/5 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1527.4 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 4/5 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1470.3 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 5/5 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1193.3 MiB/s
+  对照（相对容差 ±30%）: ledger=1853.9(偏差-20.2% ✓) 
+[M08] 实测=1479.5 MiB/s ledger=1853.9 判定=OK
+      注: 1 MiB 分块读 5 次中位，未绑核（单次仅约 0.5 ms，故取中位）；容差 ±30%
+
+[M09] Cache hotspot 命中率 ARC/LRU（ledger:153）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_cache_test（未绑核，固定 seed）
+Terminated
+  无法自动校验：运行失败或超时
+[M09] 实测=— ledger=ARC 0.7764 / LRU 0.5594 判定=SKIP
+      注: 运行失败或超时
+
+[M10] os 批量 writev/readv 加速比（ledger:162）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/src/os /UserData/CodexWorkSpace/Go2cpp/tests/os/bench_vectored.cpp /UserData/CodexWorkSpace/Go2cpp/src/os/file.cpp /UserData/CodexWorkSpace/Go2cpp/src/os/config.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_config -lgo2cpp_error -lgo2cpp_log -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -pthread -o /tmp/verify_metrics.H2ft2x/bench_vectored
+  运行: taskset -c 2,3 /tmp/verify_metrics.H2ft2x/bench_vectored <workdir>
+       | [bench_vectored] MEDIAN write: single=846.9 ns/rec (9.0 MiB/s) batch=47.3 ns/rec (161.3 MiB/s) speedup=17.90x
+       | [bench_vectored] MEDIAN read : single=483.8 ns/rec (15.8 MiB/s) batch=32.3 ns/rec (235.9 MiB/s) speedup=14.90x
+       | [bench_vectored] failures=0
+  写 对照（±30%）: ledger=17.96(偏差-0.3% ✓) 
+  读 对照（±30%）: ledger=14.68(偏差+1.5% ✓) 
+[M10] 实测=写 17.90× / 读 14.90× ledger=写 17.96× / 读 14.68× 判定=OK
+      注: 3 轮中位；读口径历史 20.9× 未复现，ledger 已按 14.68× 记账
+
+[M11] gzip 压缩/解压吞吐 + crc32（ledger:172）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/tests/bench/gen -I/UserData/CodexWorkSpace/Go2cpp/tests/compress /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_tools_industry.cpp /UserData/CodexWorkSpace/Go2cpp/tests/bench/gen/tools_bench.pb.cc /UserData/CodexWorkSpace/Go2cpp/tests/compress/compress_test_support.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_reflect -lgo2cpp_encoding -lgo2cpp_compress -lgo2cpp_error -lz -lprotobuf -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -o /tmp/verify_metrics.H2ft2x/bench_tools_industry
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_gzip_crc.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_compress -lgo2cpp_hash -lgo2cpp_error -lz -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -o /tmp/verify_metrics.H2ft2x/bench_gzip_crc
+  运行: taskset -c 2,3 /tmp/verify_metrics.H2ft2x/bench_tools_industry
+Terminated
+  无法自动校验：bench_tools_industry 运行失败
+[M11] 实测=— ledger=612.2 / 3648.0 MiB/s 判定=SKIP
+      注: bench_tools_industry 运行失败
+
+[M12] hash 吞吐 SHA-256 / crc32（ledger:182）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_hash_test（未绑核，1 GiB 流式）
+       | [hash]   crc32(IEEE)    20732.31 MiB/s  21739.40 MB/s  (1073741824 B, digest 5a099670)
+       | [hash]   sha256          2325.54 MiB/s   2438.50 MB/s  (1073741824 B, digest 7dea7eac46bdb4903cde2db2ab2e79a6e055f4c5ad75c8e3ed446ca7877bfa56)
+  SHA-256 对照（±30%）: ledger=2002.60(偏差+16.1% ✓) 
+  crc32 对照（±30%）: ledger=18731.55(偏差+10.7% ✓) 
+[M12] 实测=SHA-256 2325.54 / crc32 20732.31 MiB/s ledger=SHA-256 2002.60 / crc32 18731.55 MiB/s 判定=OK
+      注: 1 GiB 流式单线程；ledger 环境为未绑核，本脚本不 taskset
+
+[M13] reflect 二进制编解码 ns/op（ledger:192）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/tests/bench/gen /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_reflect_stage.cpp /UserData/CodexWorkSpace/Go2cpp/tests/bench/gen/tools_bench.pb.cc /UserData/CodexWorkSpace/Go2cpp/src/reflect/codec.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/compress.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/json.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/type.cpp -lprotobuf -o /tmp/verify_metrics.H2ft2x/bench_reflect_stage
+  运行: taskset -c 2,3 /tmp/verify_metrics.H2ft2x/bench_reflect_stage
+       | bin_encode_compact                         56.17 ns/op   1222.5 MiB/s
+       | bin_decode_full                            56.75 ns/op   1209.9 MiB/s
+  编码 对照（±30%）: ledger=52.64(偏差+6.7% ✓) 
+  解码 对照（±30%）: ledger=54.89(偏差+3.4% ✓) 
+[M13] 实测=编码 56.17 / 解码 56.75 ns/op ledger=编码 52.64 / 解码 54.89 ns/op 判定=OK
+      注: 二进制紧凑格式；描述/文本格式仅打印不判定
+
+==============================================================
+TOTAL=16 OK=9 STALE=1 SKIP=6
+STALE 列表: M03
+SKIP 列表: M01 M05 M05b M07 M09 M11
+人读日志: tools/verify_metrics.out
+==============================================================
+==============================================================
+ verify_metrics 全量校验: 2026-11-03 14:35:34 +0800  mode=quick
+ repo=/UserData/CodexWorkSpace/Go2cpp
+ 环境: nproc=12 绑定=taskset -c 2,3 构建库=.build-bento-wsl 单条上限=300s
+ 判定: 任一 ledger 值落在该条容差内=OK；全部超出=STALE；跑不起来=SKIP（不算通过）
+==============================================================
+台账引用: 16 条，失配 0 条
+
+[M01b-a] 通用 Channel<uint64_t> 1P1C cap1024 ns/条（ledger:42）
+  编译: g++ -O3 -DNDEBUG -std=c++20 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_channel_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_channel -lgo2cpp_context -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_log -pthread -o /tmp/verify_metrics.cm5SbE/bench_channel_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.cm5SbE/bench_channel_opt 1000000 3 spsc
+       |   Channel cap=1024                           min      97.2  median     106.1  max     106.3  ns/op
+  对照（相对容差 ±30%）: ledger=112.6(偏差-5.8% ✓) 
+[M01b-a] 实测=106.1 ns/条 ledger=112.6 判定=OK
+      注: 1e6 条×3 reps，取 [1] SPSC cap=1024 median；容差 ±30%
+
+[M01b-b] FastChannel<1024> 1P1C ns/条（ledger:56）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_fast_channel_bench 1000000 5
+       |   fast-cap1024               median    13.74  min    13.48  ns/op  bad=0
+       |   fiber-fast-cap1024         median     6.02  min     5.74  ns/op  bad=0
+  对照（相对容差 ±30%）: ledger=12.83(偏差+7.1% ✓) ledger=16.07(偏差-14.5% ✓) 
+[M01b-b] 实测=13.74 ns/条 ledger=12.83 16.07 判定=OK
+      注: 1e6×5 reps 线程段 median（min=13.48）；容差 ±30%
+
+[M02] Fiber 全量切换 ns/往返（ledger:66）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_fiber_switch_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_fiber -lgo2cpp_debug -lgo2cpp_debug_event -lgo2cpp_error -pthread -o /tmp/verify_metrics.cm5SbE/bench_fiber_switch
+  运行: taskset -c 2,3 /tmp/verify_metrics.cm5SbE/bench_fiber_switch 1000000
+       | Fiber::resume ping-pong (yield)                           22.64 ns/op
+  对照（相对容差 ±30%）: ledger=33.80(偏差-33.0%) ledger=23.5(偏差-3.7% ✓) ledger=19.84(偏差+14.1% ✓) 
+[M02] 实测=22.64 ns/往返 ledger=33.80 23.5 19.84 判定=OK
+      注: resume↔Suspend 往返 1e6 次（口径见 ledger M02 备注）；容差 ±30%
+
+[M03] Scheduler task churn wall ns/task（ledger:75）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_task_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.cm5SbE/bench_scheduler_task_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.cm5SbE/bench_scheduler_task_opt 4 100000 5
+       | [round 0] cpu 622 ns/task  wall 311 ns/task  (3 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=7.1 MiB
+       | [round 1] cpu 760 ns/task  wall 381 ns/task  (3 k tasks/s)
+       | [round] VmSize=0.36 GiB Rss=8.4 MiB
+       | [round 2] cpu 672 ns/task  wall 339 ns/task  (3 k tasks/s)
+      cpu 中位: 672 ns/task（诊断宿主负载；ledger 同口径 627）
+  对照（相对容差 ±30%）: ledger=122.0(偏差+177.9%) ledger=239(偏差+41.8%) ledger=299(偏差+13.4% ✓) 
+[M03] 实测=339 ns/task ledger=122.0 239 299 判定=OK
+      注: 4 worker/100k tasks/5 轮 wall 中位；容差 ±30%
+
+==============================================================
+TOTAL=4 OK=4 STALE=0 SKIP=0
+STALE 列表: 无
+人读日志: tools/verify_metrics.out
+==============================================================
+==============================================================
+ verify_metrics 全量校验: 2026-11-03 14:35:46 +0800  mode=full
+ repo=/UserData/CodexWorkSpace/Go2cpp
+ 环境: nproc=12 绑定=taskset -c 2,3 构建库=.build-bento-wsl 单条上限=300s
+ 判定: 任一 ledger 值落在该条容差内=OK；全部超出=STALE；跑不起来=SKIP（不算通过）
+==============================================================
+台账引用: 16 条，失配 0 条
+
+[M01b-a] 通用 Channel<uint64_t> 1P1C cap1024 ns/条（ledger:42）
+  编译: g++ -O3 -DNDEBUG -std=c++20 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_channel_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_channel -lgo2cpp_context -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_log -pthread -o /tmp/verify_metrics.KXnYtx/bench_channel_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.KXnYtx/bench_channel_opt 1000000 3 spsc
+       |   Channel cap=1024                           min      85.1  median      86.6  max      96.7  ns/op
+  对照（相对容差 ±30%）: ledger=112.6(偏差-23.1% ✓) 
+[M01b-a] 实测=86.6 ns/条 ledger=112.6 判定=OK
+      注: 1e6 条×3 reps，取 [1] SPSC cap=1024 median；容差 ±30%
+
+[M01b-b] FastChannel<1024> 1P1C ns/条（ledger:56）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_fast_channel_bench 1000000 5
+       |   fast-cap1024               median    14.95  min    13.54  ns/op  bad=0
+       |   fiber-fast-cap1024         median     5.84  min     5.79  ns/op  bad=0
+  对照（相对容差 ±30%）: ledger=12.83(偏差+16.5% ✓) ledger=16.07(偏差-7.0% ✓) 
+[M01b-b] 实测=14.95 ns/条 ledger=12.83 16.07 判定=OK
+      注: 1e6×5 reps 线程段 median（min=13.54）；容差 ±30%
+
+[M02] Fiber 全量切换 ns/往返（ledger:66）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_fiber_switch_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_fiber -lgo2cpp_debug -lgo2cpp_debug_event -lgo2cpp_error -pthread -o /tmp/verify_metrics.KXnYtx/bench_fiber_switch
+  运行: taskset -c 2,3 /tmp/verify_metrics.KXnYtx/bench_fiber_switch 1000000
+       | Fiber::resume ping-pong (yield)                           20.16 ns/op
+  对照（相对容差 ±30%）: ledger=33.80(偏差-40.4%) ledger=23.5(偏差-14.2% ✓) ledger=19.84(偏差+1.6% ✓) 
+[M02] 实测=20.16 ns/往返 ledger=33.80 23.5 19.84 判定=OK
+      注: resume↔Suspend 往返 1e6 次（口径见 ledger M02 备注）；容差 ±30%
+
+[M03] Scheduler task churn wall ns/task（ledger:75）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_task_opt.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.KXnYtx/bench_scheduler_task_opt
+  运行: taskset -c 2,3 /tmp/verify_metrics.KXnYtx/bench_scheduler_task_opt 4 100000 5
+       | [round 0] cpu 1452 ns/task  wall 708 ns/task  (1 k tasks/s)
+       | [round] VmSize=0.37 GiB Rss=11.4 MiB
+       | [round 1] cpu 1377 ns/task  wall 661 ns/task  (2 k tasks/s)
+       | [round] VmSize=0.37 GiB Rss=11.4 MiB
+       | [round 2] cpu 498 ns/task  wall 239 ns/task  (4 k tasks/s)
+      cpu 中位: 561 ns/task（诊断宿主负载；ledger 同口径 627）
+  对照（相对容差 ±30%）: ledger=122.0(偏差+122.1%) ledger=239(偏差+13.4% ✓) ledger=299(偏差-9.4% ✓) 
+[M03] 实测=271 ns/task ledger=122.0 239 299 判定=OK
+      注: 4 worker/100k tasks/5 轮 wall 中位；容差 ±30%
+
+[M04] Scheduler submit ns/task（batch=1024 / 65536，ledger:92）
+  编译: g++ -O2 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/bench_scheduler_submit.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event -pthread -o /tmp/verify_metrics.KXnYtx/bench_scheduler_submit
+  运行: taskset -c 2,3 /tmp/verify_metrics.KXnYtx/bench_scheduler_submit 4 1000000 3 1024
+       | [summary] rounds=3 median 139.5 ns/task  min 126.3  max 156.8
+  运行: taskset -c 2,3 /tmp/verify_metrics.KXnYtx/bench_scheduler_submit 4 1000000 3 65536
+       | [summary] rounds=3 median 425.9 ns/task  min 349.9  max 483.7
+  batch=1024 对照（±50%）: ledger=119.0(偏差+17.2% ✓) 
+  batch=65536 对照（±50%）: ledger=355.7(偏差+19.7% ✓) 
+[M04] 实测=batch1024 139.5 / batch65536 425.9 ns/task ledger=119.0 / 355.7 ns/task 判定=OK
+      注: 两个 batch 口径都命中；3 轮中位（ledger 为 5 轮×7 进程）；ledger 自身 p25–p75 已 ±15%，宿主争用再放大故容差取 ±50%
+
+[M01] Channel 1P1C 有缓冲 ns/条
+  无法自动校验：已拆条：10.73 实为 FastChannel<1024>，校验见 M01b-b；通用 Channel 见 M01b-a
+[M01] 实测=— ledger=10.73（已拆条） 判定=SKIP
+      注: 已拆条：10.73 实为 FastChannel<1024>，校验见 M01b-b；通用 Channel 见 M01b-a
+
+[M05] HTTP/1.1 pipeline=16 单连接 rps
+  无法自动校验：需先起 net_perf_server（READY 行取端口）再用 Go http_loadgen 压测，非单进程基准
+[M05] 实测=— ledger=120,755 rps 判定=SKIP
+      注: 需先起 net_perf_server（READY 行取端口）再用 Go http_loadgen 压测，非单进程基准
+
+[M05b] 「HTTP pipeline 411k rps」（无出处）
+  无法自动校验：台账记为无出处，没有可校验的数字（禁止引用）
+[M05b] 实测=— ledger=411k rps（无出处） 判定=SKIP
+      注: 台账记为无出处，没有可校验的数字（禁止引用）
+
+[M07] LevelDB 1e7 Put 与 1e8 RSS
+  无法自动校验：1e7 Put 需 3 轮×2 实现、1e8 RSS 段单独约 230 s，超出单条 5 分钟预算，需手工执行
+[M07] 实测=— ledger=647.5k ops/s / 82.4 MiB 判定=SKIP
+      注: 1e7 Put 需 3 轮×2 实现、1e8 RSS 段单独约 230 s，超出单条 5 分钟预算，需手工执行
+
+[M06] SQLite 1e6 行插入 wrapper/native 比值（ledger:121）
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 1/3 轮）
+  第 1 轮 insert-file = 1.025×
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 2/3 轮）
+  第 2 轮 insert-file = 1.078×
+  运行: taskset -c 2,3 /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_storage_bench <tmpdir> 1000000（第 3/3 轮）
+  第 3 轮 insert-file = 1.116×
+  对照（相对容差 ±15%）: ledger=1.074(偏差+0.4% ✓) 
+[M06] 实测=1.078 × ledger=1.074 判定=OK
+      注: 1e6 行 insert-file 3 轮中位（ledger 为 7 轮，轮数已降）；容差 ±15%
+
+[M08] bufio 分块传输 1 MiB 读 MiB/s（ledger:144）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 1/5 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1470.7 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 2/5 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1557.4 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 3/5 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1469.7 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 4/5 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1463.8 MiB/s
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_bufio_test（第 5/5 次，未绑核）
+       | [bufio] 分块传输 1MiB: 1048576 字节, 0.001 s, 1545.2 MiB/s
+  对照（相对容差 ±30%）: ledger=1853.9(偏差-20.7% ✓) 
+[M08] 实测=1470.7 MiB/s ledger=1853.9 判定=OK
+      注: 1 MiB 分块读 5 次中位，未绑核（单次仅约 0.5 ms，故取中位）；容差 ±30%
+
+[M09] Cache hotspot 命中率 ARC/LRU（ledger:153）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_cache_test（未绑核，固定 seed）
+       | [cache]   hotspot LRU        hit=0.5594
+       | [cache]   hotspot ARC        hit=0.7764
+  ARC 对照（绝对容差 ±0.02）: ledger=0.7817(Δ-0.0053 ✓) ledger=0.7764(Δ+0.0000 ✓) 
+  LRU 对照（绝对容差 ±0.02）: ledger=0.5580(Δ+0.0014 ✓) ledger=0.5594(Δ+0.0000 ✓) 
+[M09] 实测=ARC 0.7764 / LRU 0.5594 ledger=ARC 0.7764 / LRU 0.5594 判定=OK
+      注: 命中率绝对容差 ±0.02，未绑核
+
+[M10] os 批量 writev/readv 加速比（ledger:162）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/src/os /UserData/CodexWorkSpace/Go2cpp/tests/os/bench_vectored.cpp /UserData/CodexWorkSpace/Go2cpp/src/os/file.cpp /UserData/CodexWorkSpace/Go2cpp/src/os/config.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_config -lgo2cpp_error -lgo2cpp_log -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -pthread -o /tmp/verify_metrics.KXnYtx/bench_vectored
+  运行: taskset -c 2,3 /tmp/verify_metrics.KXnYtx/bench_vectored <workdir>
+       | [bench_vectored] MEDIAN write: single=805.9 ns/rec (9.5 MiB/s) batch=45.7 ns/rec (166.9 MiB/s) speedup=17.71x
+       | [bench_vectored] MEDIAN read : single=471.6 ns/rec (16.2 MiB/s) batch=30.2 ns/rec (252.2 MiB/s) speedup=15.64x
+       | [bench_vectored] failures=0
+  写 对照（±30%）: ledger=17.96(偏差-1.4% ✓) 
+  读 对照（±30%）: ledger=14.68(偏差+6.5% ✓) 
+[M10] 实测=写 17.71× / 读 15.64× ledger=写 17.96× / 读 14.68× 判定=OK
+      注: 3 轮中位；读口径历史 20.9× 未复现，ledger 已按 14.68× 记账
+
+[M11] gzip 压缩/解压吞吐 + crc32（ledger:172）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/tests/bench/gen -I/UserData/CodexWorkSpace/Go2cpp/tests/compress /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_tools_industry.cpp /UserData/CodexWorkSpace/Go2cpp/tests/bench/gen/tools_bench.pb.cc /UserData/CodexWorkSpace/Go2cpp/tests/compress/compress_test_support.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_reflect -lgo2cpp_encoding -lgo2cpp_compress -lgo2cpp_error -lz -lprotobuf -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -o /tmp/verify_metrics.KXnYtx/bench_tools_industry
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_gzip_crc.cpp -L/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -lgo2cpp_compress -lgo2cpp_hash -lgo2cpp_error -lz -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -o /tmp/verify_metrics.KXnYtx/bench_gzip_crc
+  运行: taskset -c 2,3 /tmp/verify_metrics.KXnYtx/bench_tools_industry
+  运行: taskset -c 2,3 /tmp/verify_metrics.KXnYtx/bench_gzip_crc
+       | gzip_compress_L6                    1714532.2 ns/op     583.2 MiB/s
+       | gzip_decompress                      250642.5 ns/op    3989.7 MiB/s
+       | zlib_gzip_compress_L6               2266102.8 ns/op     441.3 MiB/s
+       | zlib_gzip_decompress                 290087.2 ns/op    3447.2 MiB/s
+       | gzip_compress L6 1MiB: 592.3 MiB/s
+       | crc32 1MiB (hash::Crc32/PCLMUL):  20.60 GB/s
+  压缩 对照（±30%）: ledger=612.2(偏差-4.7% ✓) 
+  解压 对照（±30%）: ledger=3648.0(偏差+9.4% ✓) 
+  crc32 对照（±30%）: ledger=22.14(偏差-7.0% ✓) 
+[M11] 实测=压缩 583.2 MiB/s / 解压 3989.7 MiB/s / crc32 20.60 GB/s ledger=612.2 / 3648.0 MiB/s，crc32 22.14 GB/s 判定=OK
+      注: 1 MiB L6，同轮交替测，3 轮中位
+
+[M12] hash 吞吐 SHA-256 / crc32（ledger:182）
+  运行: /UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl/go2cpp_hash_test（未绑核，1 GiB 流式）
+       | [hash]   crc32(IEEE)    19338.60 MiB/s  20278.00 MB/s  (1073741824 B, digest 5a099670)
+       | [hash]   sha256          2249.11 MiB/s   2358.37 MB/s  (1073741824 B, digest 7dea7eac46bdb4903cde2db2ab2e79a6e055f4c5ad75c8e3ed446ca7877bfa56)
+  SHA-256 对照（±30%）: ledger=2002.60(偏差+12.3% ✓) 
+  crc32 对照（±30%）: ledger=18731.55(偏差+3.2% ✓) 
+[M12] 实测=SHA-256 2249.11 / crc32 19338.60 MiB/s ledger=SHA-256 2002.60 / crc32 18731.55 MiB/s 判定=OK
+      注: 1 GiB 流式单线程；ledger 环境为未绑核，本脚本不 taskset
+
+[M13] reflect 二进制编解码 ns/op（ledger:192）
+  编译: g++ -O3 -DNDEBUG -std=c++17 -I/UserData/CodexWorkSpace/Go2cpp/include -I/UserData/CodexWorkSpace/Go2cpp/tests/bench/gen /UserData/CodexWorkSpace/Go2cpp/tests/bench/bench_reflect_stage.cpp /UserData/CodexWorkSpace/Go2cpp/tests/bench/gen/tools_bench.pb.cc /UserData/CodexWorkSpace/Go2cpp/src/reflect/codec.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/compress.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/json.cpp /UserData/CodexWorkSpace/Go2cpp/src/reflect/type.cpp -lprotobuf -o /tmp/verify_metrics.KXnYtx/bench_reflect_stage
+  运行: taskset -c 2,3 /tmp/verify_metrics.KXnYtx/bench_reflect_stage
+       | bin_encode_compact                         54.89 ns/op   1251.0 MiB/s
+       | bin_decode_full                            51.53 ns/op   1332.5 MiB/s
+  编码 对照（±30%）: ledger=52.64(偏差+4.3% ✓) 
+  解码 对照（±30%）: ledger=54.89(偏差-6.1% ✓) 
+[M13] 实测=编码 54.89 / 解码 51.53 ns/op ledger=编码 52.64 / 解码 54.89 ns/op 判定=OK
+      注: 二进制紧凑格式；描述/文本格式仅打印不判定
+
+==============================================================
+TOTAL=16 OK=12 STALE=0 SKIP=4
+STALE 列表: 无
+SKIP 列表: M01 M05 M05b M07
+人读日志: tools/verify_metrics.out
+==============================================================
