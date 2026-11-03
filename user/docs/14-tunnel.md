@@ -180,7 +180,7 @@ token 明文从不上线，挑战每次随机所以无法重放。
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target tunnel-server tunnel-client -j
+cmake --build build --target tunnel_server tunnel_client -j
 # 产物固定：build/tunnel-server、build/tunnel-client
 ```
 
@@ -295,7 +295,7 @@ ctest --test-dir build -R tunnel --output-on-failure
 ./build/go2cpp_tunnel_test
 
 # 只验协议层
-./build/go2cpp_tunnel_test --filter protocol
+./build/go2cpp_tunnel_test
 ```
 
 自建最小闭环（不依赖公网）：
@@ -315,7 +315,7 @@ ctest --test-dir build -R tunnel --output-on-failure
 - **错误 token 不重试**：服务端明确拒绝（token 错/版本错）时客户端不进入退避重试，
   避免刷日志；改重连逻辑时别把这条丢掉。
 - **Stop() 的时序**：`TunnelClient::Stop()` 返回后保证没有工作线程再访问对象；
-  在回调里调 `Stop()` 会自 join 死锁——回调必须快速返回。
+  在回调里调 `Stop()` 走 self-detach（`client.cpp:83-98` 用 `get_id()==this_thread` 判断），不会永久死锁，但会留下 detached 线程；析构后若该线程仍回调可能 UAF——回调必须快速返回。
 - **`with_checksum` 两端必须一致**，默认关；打开会多 4 B/帧。
 - **端口 0 是测试入口**：`control_port/public_port = 0` 让内核分配，`Start()` 后用
   `control_port()` 取实际值——写集成测试时用这个，别硬编码端口。
