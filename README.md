@@ -115,9 +115,8 @@ int main() {
     });
     task->wait();                     // 阻塞当前线程，直到 Fiber 结束
 
-    if (auto err = task->failure()) { // Fiber 边界捕获的异常（可选）
-        std::fprintf(stderr, "task failed: %s\n", err->Error().c_str());
-    }
+    // Fiber 内未捕获的异常通过 Task::failure() 暴露（可选）
+    // if (auto err = task->failure()) { ... }
     scheduler.shutdown();
 }
 ```
@@ -133,18 +132,18 @@ go2cpp::shutdown_default_scheduler();   // 程序结束前必须显式关闭
 Fiber 之间用 Channel / Context 协作：
 
 ```cpp
-auto ch = go2cpp::make_channel<int>(8);           // 有缓冲 Channel
-go2cpp::go([ch] { ch->Send(42); });               // 发送
+// 有缓冲 Channel：MakeChannel<T>(capacity)
+auto ch = go2cpp::MakeChannel<int>(8);
+go2cpp::go([ch] { ch->Send(42); });      // 发送
 int v = 0;
-ch->Recv(&v);                                     // 当前 Fiber 或主线程接收
+ch->Recv(&v);                            // 当前 Fiber 或主线程接收
 
-auto ctx = go2cpp::context::WithCancel(go2cpp::Context::Background());
+// 取消树：WithCancel 返回 {ctx, cancel}
+auto [ctx, cancel] = go2cpp::Context::WithCancel(go2cpp::Context::Background());
 go2cpp::go([ctx] {
-    if (auto err = go2cpp::Sleep(std::chrono::seconds(10), ctx); err) {
-        // ctx 取消后 Sleep 立即返回
-    }
+    // 用 ctx->Done()/Err() 检查取消；阻塞操作（Channel/IO）会被 ctx 唤醒
 });
-ctx->Cancel();
+cancel();                                // 触发取消
 ```
 
 要点：
@@ -223,12 +222,20 @@ g++ -std=c++17 -O2 -Iinclude \
 #include "go2cpp/bento/net/http_server.hpp"
 
 int main() {
-    auto server = go2cpp::bento::net::HttpServer::Create(8080);
-    server->Route(go2cpp::http::Method::kGet, "/hello",
-                  [](const go2cpp::http::Request&) {
-                      return go2cpp::http::Response::Text("hello");
-                  });
-    server->Start();
+    go2cpp::bento::net::HttpServer server;
+    if (!server.Listen("127.0.0.1:8080").ok()) return 1;
+
+    server.Route(go2cpp::http::Method::kGet, "/hello",
+                 [](const go2cpp::http::Request&) {
+                     go2cpp::http::Response res;
+                     res.status = go2cpp::http::Status::OK;
+                     res.body = "hello";
+                     return res;
+                 });
+
+    server.Start();   // accept + worker 线程
+    // ... 运行 ...
+    server.Stop();
 }
 ```
 
