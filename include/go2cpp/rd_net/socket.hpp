@@ -4,7 +4,10 @@
 /// @brief JinShan REQ-006：UDP/TCP 统一 Socket 抽象与四态错误模型（rd::net）。
 ///
 /// @details 本层只做「轻量 rd::net 封装」：
-///          - 非阻塞 POSIX 系统调用（fcntl O_NONBLOCK + MSG_DONTWAIT），**不建线程**；
+///          - 底层**复用仓库现有的 `go2cpp::net::Socket`**（生命周期、fd、
+///            bind/connect/listen/close 与地址类型全部走它），不在本层新建
+///            POSIX 实现；收发仍用 `fd()` 拿到的 fd 做非阻塞系统调用，
+///            **不建线程**；
 ///          - 把内核返回值映射成显式状态：kClosed（FIN）/ kReset（RST）/
 ///            kTruncated（UDP 报文大于缓冲）/ kWouldBlock（非阻塞重试）四态可分；
 ///          - 不解析任何协议语义，不接管事件循环，不持有缓冲区所有权。
@@ -18,9 +21,14 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
+
+namespace go2cpp::net {
+class Socket;
+}  // namespace go2cpp::net
 
 namespace rd::net {
 
@@ -80,6 +88,18 @@ struct SocketOptions {
     std::uint32_t send_buffer_bytes{0};  ///< SO_SNDBUF，0 = 用系统默认。
     bool reuse_address{false};           ///< SO_REUSEADDR。
     bool broadcast{false};               ///< SO_BROADCAST。
+
+    // ---- 批量写（复用 go2cpp 的 bufio 批量能力；默认全关 = 单次 send）----
+    /// @brief 聚合阈值（字节）。0 = 关闭批量路径，走单次 send/sendto。
+    /// @note 开启后单次 SendTo/Send 会按 `batch_entries` 切成多段，
+    ///       由 `SocketBatchWriter` 用一次 `writev`/`sendmmsg` 提交。
+    std::uint32_t batch_bytes{0};
+    /// @brief 单次批量提交的段数上限（iovec / sendmsg 数组长度），0 视为 1。
+    std::uint32_t batch_entries{0};
+    /// @brief TCP 走 `writev(2)` 批量提交（仅在 batch_bytes > 0 时生效）。
+    bool enable_writev{false};
+    /// @brief UDP 走 `sendmmsg(2)` 批量提交（仅在 batch_bytes > 0 时生效）。
+    bool enable_sendmmsg{false};
 };
 
 /// @brief TCP 拨号选项。
@@ -88,6 +108,14 @@ struct DialOptions {
     bool tcp_no_delay{true};             ///< TCP_NODELAY。
     std::uint32_t recv_buffer_bytes{0};  ///< SO_RCVBUF，0 = 用系统默认。
     std::uint32_t send_buffer_bytes{0};  ///< SO_SNDBUF，0 = 用系统默认。
+
+    // ---- 批量写（同 SocketOptions，默认全关）----
+    /// @brief 聚合阈值（字节）。0 = 关闭批量路径，走单次 send。
+    std::uint32_t batch_bytes{0};
+    /// @brief 单次批量提交的段数上限（iovec 长度），0 视为 1。
+    std::uint32_t batch_entries{0};
+    /// @brief 走 `writev(2)` 批量提交（仅在 batch_bytes > 0 时生效）。
+    bool enable_writev{false};
 };
 
 /// @brief 打开结果：成功时持有可移动的对象，失败时只带状态与 errno。
@@ -130,6 +158,12 @@ private:
     Endpoint local_{};
     std::uint64_t next_token_{0};
     int last_error_{0};
+    /// @brief 底层 go2cpp Socket（拥有 fd；Close 走它的 close）。
+    std::shared_ptr<go2cpp::net::Socket> socket_;
+    /// @brief 批量配置快照（Open 时从 SocketOptions 拷入）。
+    std::uint32_t batch_bytes_{0};
+    std::uint32_t batch_entries_{0};
+    bool enable_sendmmsg_{false};
 };
 
 /// @brief TCP 流套接字：非阻塞连接 + 非阻塞收发。
@@ -171,6 +205,12 @@ private:
     std::uint64_t next_token_{0};
     std::size_t last_transferred_{0};
     int last_error_{0};
+    /// @brief 底层 go2cpp Socket（拥有 fd；Close 走它的 close）。
+    std::shared_ptr<go2cpp::net::Socket> socket_;
+    /// @brief 批量配置快照（Open 时从 DialOptions 拷入）。
+    std::uint32_t batch_bytes_{0};
+    std::uint32_t batch_entries_{0};
+    bool enable_writev_{false};
 };
 
 /// @brief 最小 Result：成功时持有 T，失败时带 IoStatus + errno。

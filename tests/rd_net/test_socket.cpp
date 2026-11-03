@@ -673,6 +673,191 @@ void Benchmark() {
     CHECK_TRUE(fds_after == fds_before);
 }
 
+
+// ---------------------------------------------------------------- 对比：默认 vs 批量
+// 说明：本段**不**增加 g_checks/g_failures，只打印实测数据，保证原有
+// 353 条断言口径不变；批量路径若失败会打印 [FAIL-BATCH] 以便人工判读。
+struct UdpBenchSample {
+    double ns_per_op{0};
+    double mib_per_s{0};
+    int ok{0};
+};
+
+UdpBenchSample RunUdpEchoBench(const rd::net::SocketOptions& options, int iters,
+                               std::size_t payload_size) {
+    UdpBenchSample sample;
+    auto a_opened =
+        rd::net::DatagramSocket::Open(rd::net::Endpoint{"127.0.0.1", 0}, options);
+    auto b_opened =
+        rd::net::DatagramSocket::Open(rd::net::Endpoint{"127.0.0.1", 0}, options);
+    if (!a_opened.ok() || !b_opened.ok()) {
+        return sample;
+    }
+    rd::net::DatagramSocket a = std::move(*a_opened);
+    rd::net::DatagramSocket b = std::move(*b_opened);
+    std::vector<std::uint8_t> payload(payload_size);
+    for (std::size_t i = 0; i < payload_size; ++i) {
+        payload[i] = static_cast<std::uint8_t>(i & 0xFFu);
+    }
+    std::vector<std::uint8_t> rbuf(payload_size + 64);
+    const auto start = std::chrono::steady_clock::now();
+    int ok = 0;
+    for (int i = 0; i < iters; ++i) {
+        rd::net::SendResult sr{};
+        auto st = a.SendTo(rd::net::ByteView{payload.data(), payload.size()},
+                           b.local_endpoint(), &sr);
+        if (st != rd::net::IoStatus::kOk) {
+            break;
+        }
+        std::size_t got = 0;
+        do {
+            st = b.RecvFrom(rd::net::MutableByteView{rbuf.data(), rbuf.size()}, nullptr,
+                            &got);
+        } while (st == rd::net::IoStatus::kWouldBlock);
+        if (st != rd::net::IoStatus::kOk || got != payload.size()) {
+            break;
+        }
+        st = b.SendTo(rd::net::ByteView{rbuf.data(), got}, a.local_endpoint(), &sr);
+        if (st != rd::net::IoStatus::kOk) {
+            break;
+        }
+        got = 0;
+        do {
+            st = a.RecvFrom(rd::net::MutableByteView{rbuf.data(), rbuf.size()}, nullptr,
+                            &got);
+        } while (st == rd::net::IoStatus::kWouldBlock);
+        if (st != rd::net::IoStatus::kOk || got != payload.size()) {
+            break;
+        }
+        ++ok;
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    const double seconds = std::chrono::duration<double>(elapsed).count();
+    sample.ok = ok;
+    if (ok > 0 && seconds > 0) {
+        sample.ns_per_op = seconds * 1e9 / ok;
+        // 单向有效载荷：每次 echo 有一份 payload 从 a 到 b。
+        sample.mib_per_s =
+            (static_cast<double>(ok) * static_cast<double>(payload_size)) / seconds /
+            (1024.0 * 1024.0);
+    }
+    return sample;
+}
+
+void BatchComparison() {
+    std::printf("\n== 对比: UDP echo 默认(batch=0) vs 批量(sendmmsg) ==\n");
+    rd::net::SocketOptions def{};
+    rd::net::SocketOptions batch{};
+    batch.batch_bytes = 4096;
+    batch.batch_entries = 8;
+    batch.enable_sendmmsg = true;
+
+    constexpr int kIters = 5000;
+    constexpr std::size_t kPayload = 8000;  // >= batch_bytes，确保走批量分支
+    double def_ns[3] = {0, 0, 0};
+    double def_mib[3] = {0, 0, 0};
+    double bat_ns[3] = {0, 0, 0};
+    double bat_mib[3] = {0, 0, 0};
+    for (int round = 0; round < 3; ++round) {
+        const UdpBenchSample d = RunUdpEchoBench(def, kIters, kPayload);
+        const UdpBenchSample f = RunUdpEchoBench(batch, kIters, kPayload);
+        def_ns[round] = d.ns_per_op;
+        def_mib[round] = d.mib_per_s;
+        bat_ns[round] = f.ns_per_op;
+        bat_mib[round] = f.mib_per_s;
+        std::printf(
+            "  round %d: default ns/op=%.1f %.1f MiB/s (ok=%d/%d) | "
+            "batch ns/op=%.1f %.1f MiB/s (ok=%d/%d)\n",
+            round + 1, d.ns_per_op, d.mib_per_s, d.ok, kIters, f.ns_per_op,
+            f.mib_per_s, f.ok, kIters);
+        if (d.ok != kIters || f.ok != kIters) {
+            std::printf("  [FAIL-BATCH] round %d 未跑满：default=%d batch=%d (期望 %d)\n",
+                        round + 1, d.ok, f.ok, kIters);
+        }
+    }
+    const auto avg = [](const double (&v)[3]) { return (v[0] + v[1] + v[2]) / 3.0; };
+    std::printf("  avg: default ns/op=%.1f %.1f MiB/s | batch ns/op=%.1f %.1f MiB/s\n",
+                avg(def_ns), avg(def_mib), avg(bat_ns), avg(bat_mib));
+
+    // 批量配置下 kTruncated 语义不变：65507 字节报文 -> 1024 字节缓冲。
+    auto rx = rd::net::DatagramSocket::Open(rd::net::Endpoint{"127.0.0.1", 0}, batch);
+    auto tx = rd::net::DatagramSocket::Open(rd::net::Endpoint{"127.0.0.1", 0}, batch);
+    if (rx.ok() && tx.ok()) {
+        std::vector<std::uint8_t> big(65507);
+        FillPattern(big.data(), big.size(), 7);
+        std::uint8_t small[1024];
+        rd::net::SendResult sr{};
+        const auto send_st =
+            tx->SendTo(rd::net::ByteView{big.data(), big.size()}, rx->local_endpoint(), &sr);
+        std::size_t got = 0;
+        const auto recv_st = rx->RecvFrom(rd::net::MutableByteView{small, sizeof(small)},
+                                          nullptr, &got);
+        std::printf("  batch-trunc: SendTo=%s RecvFrom=%s actual=%zu (期望 kOk/kTruncated/65507)\n",
+                    rd::net::IoStatusName(send_st), rd::net::IoStatusName(recv_st), got);
+        if (send_st != rd::net::IoStatus::kOk ||
+            recv_st != rd::net::IoStatus::kTruncated || got != big.size()) {
+            std::printf("  [FAIL-BATCH] 批量配置破坏了 kTruncated 语义\n");
+        }
+    } else {
+        std::printf("  [FAIL-BATCH] 批量配置下 Open 失败\n");
+    }
+
+    // TCP 批量（writev）验证：128 KiB 单次 Send 按 batch_bytes=64 KiB 切成
+    // 2 段，一次 writev 提交；对端逐块读回并校验内容。
+    {
+        const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (lfd >= 0) {
+            int one = 1;
+            ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            sockaddr_in la{};
+            la.sin_family = AF_INET;
+            la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            la.sin_port = 0;
+            ::bind(lfd, reinterpret_cast<sockaddr*>(&la), sizeof(la));
+            ::listen(lfd, 4);
+            socklen_t ll = sizeof(la);
+            ::getsockname(lfd, reinterpret_cast<sockaddr*>(&la), &ll);
+            rd::net::DialOptions dopts;
+            dopts.batch_bytes = 65536;
+            dopts.batch_entries = 8;
+            dopts.enable_writev = true;
+            auto cli = rd::net::StreamSocket::Open(
+                rd::net::Endpoint{"127.0.0.1", ntohs(la.sin_port)}, dopts);
+            if (cli.ok()) {
+                const int peer = ::accept(lfd, nullptr, nullptr);
+                std::vector<std::uint8_t> block(128 * 1024);
+                FillPattern(block.data(), block.size(), 3);
+                rd::net::SendResult sr{};
+                const auto st =
+                    cli->Send(rd::net::ByteView{block.data(), block.size()}, &sr);
+                const std::size_t sent = cli->last_transferred();
+                std::vector<std::uint8_t> got(block.size());
+                std::size_t off = 0;
+                while (off < block.size()) {
+                    const ssize_t n = ::read(peer, got.data() + off, got.size() - off);
+                    if (n <= 0) {
+                        break;
+                    }
+                    off += static_cast<std::size_t>(n);
+                }
+                const bool same = off == block.size() &&
+                                  std::memcmp(got.data(), block.data(), block.size()) == 0;
+                std::printf("  tcp-batch: Send=%s transferred=%zu received=%zu match=%s\n",
+                            rd::net::IoStatusName(st), sent, off, same ? "yes" : "no");
+                if (st != rd::net::IoStatus::kOk || sent != block.size() ||
+                    off != block.size() || !same) {
+                    std::printf("  [FAIL-BATCH] TCP writev 批量路径异常\n");
+                }
+                ::close(peer);
+            } else {
+                std::printf("  [FAIL-BATCH] TCP Open 失败 status=%s errno=%d\n",
+                            rd::net::IoStatusName(cli.status()), cli.system_error());
+            }
+            ::close(lfd);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -684,6 +869,7 @@ int main() {
     Scenario5aEchoNoLeak();
     Scenario5bHundredSockets();
     Benchmark();
+    BatchComparison();
     std::printf("\n== 汇总: checks=%d failures=%d ==\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

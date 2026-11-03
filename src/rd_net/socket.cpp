@@ -1,10 +1,21 @@
 #include "go2cpp/rd_net/socket.hpp"
 
 /// @file socket.cpp
-/// @brief REQ-006 的平台实现：非阻塞 POSIX socket + 四态错误映射。
+/// @brief REQ-006 的平台实现：绑定 go2cpp::net::Socket + 非阻塞四态错误映射。
+///
+/// @details 生命周期/地址/bind/connect/close 全部走仓库现有的
+///          `go2cpp::net::Socket`；收发用它的 `fd()` 做 MSG_DONTWAIT 系统调用，
+///          从而同时保留内核级四态（kClosed/kReset/kTruncated/kWouldBlock）。
+///          批量写（`batch_bytes > 0`）复用 `SocketBatchWriter`：
+///          TCP → `writev`，UDP → `sendmmsg`。
 
 #if !defined(_WIN32)
 
+#include "go2cpp/network/address.hpp"
+#include "go2cpp/network/bufio_socket.hpp"
+#include "go2cpp/network/socket.hpp"
+
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdio>
@@ -22,6 +33,13 @@
 
 namespace rd::net {
 namespace {
+
+using go2cpp::net::Address;
+using go2cpp::net::AddressPtr;
+using go2cpp::net::Socket;
+
+/// @brief 单次批量提交允许的最大段数（栈上数组上限）。
+constexpr std::size_t kMaxBatchEntries = 64;
 
 /// @brief 解析 IP 字面量（快速路径，避免热路径反复 getaddrinfo）。
 bool ParseIpLiteral(const Endpoint& ep, int sock_type, sockaddr_storage* out,
@@ -84,6 +102,12 @@ bool ResolveEndpoint(const Endpoint& ep, int sock_type, bool passive,
     return copied;
 }
 
+/// @brief sockaddr → go2cpp 的地址类型（IPv4/IPv6/Unix/Unknown 由它分派）。
+AddressPtr MakeAddress(const sockaddr_storage& storage, socklen_t length) {
+    return Address::Create(reinterpret_cast<const sockaddr*>(&storage), length);
+}
+
+/// @brief go2cpp 地址类型 → rd::net::Endpoint（走 addr()/addr_len() 访问器）。
 Endpoint EndpointFromSockaddr(const sockaddr* sa, socklen_t len) {
     Endpoint ep;
     if (sa == nullptr) {
@@ -100,16 +124,33 @@ Endpoint EndpointFromSockaddr(const sockaddr* sa, socklen_t len) {
     return ep;
 }
 
-bool SetNonBlocking(int fd) {
-    const int flags = ::fcntl(fd, F_GETFL, 0);
-    if (flags < 0) {
-        return false;
+Endpoint EndpointFromAddress(const AddressPtr& address) {
+    if (!address) {
+        return Endpoint{};
     }
-    return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+    return EndpointFromSockaddr(address->addr(), address->addr_len());
 }
 
-bool SetIntOption(int fd, int level, int name, int value) {
-    return ::setsockopt(fd, level, name, &value, sizeof(value)) == 0;
+/// @brief 设置整数 socket 选项（走 go2cpp Socket，失败时 errno 由内核保留）。
+bool SetIntOption(Socket& socket, int level, int name, int value) {
+    return socket.set_option(level, name, &value, sizeof(value));
+}
+
+/// @brief 非阻塞可写探测：用于在批量聚合前把 kWouldBlock 透出。
+/// @return 1=可写，0=不可写（EAGAIN），-1=错误（errno 有效）。
+int ProbeWritable(int fd) {
+    pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    const int rc = ::poll(&pfd, 1, 0);
+    if (rc > 0) {
+        if ((pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            // 先让调用方按需触发一次 sendto/send 取得精确 errno，这里不算错误。
+            return 1;
+        }
+        return (pfd.revents & POLLOUT) != 0 ? 1 : 0;
+    }
+    return rc == 0 ? 0 : -1;
 }
 
 /// @brief 收发 errno → IoStatus（EINTR 已在调用点重试）。
@@ -187,10 +228,17 @@ DatagramSocket::DatagramSocket(DatagramSocket&& other) noexcept
     : fd_(other.fd_),
       local_(std::move(other.local_)),
       next_token_(other.next_token_),
-      last_error_(other.last_error_) {
+      last_error_(other.last_error_),
+      socket_(std::move(other.socket_)),
+      batch_bytes_(other.batch_bytes_),
+      batch_entries_(other.batch_entries_),
+      enable_sendmmsg_(other.enable_sendmmsg_) {
     other.fd_ = -1;
     other.next_token_ = 0;
     other.last_error_ = 0;
+    other.batch_bytes_ = 0;
+    other.batch_entries_ = 0;
+    other.enable_sendmmsg_ = false;
 }
 
 DatagramSocket& DatagramSocket::operator=(DatagramSocket&& other) noexcept {
@@ -200,9 +248,16 @@ DatagramSocket& DatagramSocket::operator=(DatagramSocket&& other) noexcept {
         local_ = std::move(other.local_);
         next_token_ = other.next_token_;
         last_error_ = other.last_error_;
+        socket_ = std::move(other.socket_);
+        batch_bytes_ = other.batch_bytes_;
+        batch_entries_ = other.batch_entries_;
+        enable_sendmmsg_ = other.enable_sendmmsg_;
         other.fd_ = -1;
         other.next_token_ = 0;
         other.last_error_ = 0;
+        other.batch_bytes_ = 0;
+        other.batch_entries_ = 0;
+        other.enable_sendmmsg_ = false;
     }
     return *this;
 }
@@ -215,55 +270,43 @@ Result<DatagramSocket> DatagramSocket::Open(const Endpoint& local,
     if (!ResolveEndpoint(local, SOCK_DGRAM, true, &addr, &addr_len, &resolve_err)) {
         return Result<DatagramSocket>::Err(IoStatus::kInvalid, resolve_err);
     }
-    const int fd = ::socket(addr.ss_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
+    AddressPtr bind_address = MakeAddress(addr, addr_len);
+    if (!bind_address) {
+        return Result<DatagramSocket>::Err(IoStatus::kInvalid, EINVAL);
+    }
+    Socket::Ptr socket = Socket::CreateUDP(addr.ss_family);
+    if (!socket) {
         return Result<DatagramSocket>::Err(IoStatus::kIoError, errno);
     }
-    if (options.reuse_address && !SetIntOption(fd, SOL_SOCKET, SO_REUSEADDR, 1)) {
-        const int err = errno;
-        ::close(fd);
-        return Result<DatagramSocket>::Err(IoStatus::kIoError, err);
+    if (options.reuse_address && !SetIntOption(*socket, SOL_SOCKET, SO_REUSEADDR, 1)) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, errno);
     }
-    if (options.broadcast && !SetIntOption(fd, SOL_SOCKET, SO_BROADCAST, 1)) {
-        const int err = errno;
-        ::close(fd);
-        return Result<DatagramSocket>::Err(IoStatus::kIoError, err);
+    if (options.broadcast && !SetIntOption(*socket, SOL_SOCKET, SO_BROADCAST, 1)) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, errno);
     }
     if (options.recv_buffer_bytes != 0 &&
-        !SetIntOption(fd, SOL_SOCKET, SO_RCVBUF,
+        !SetIntOption(*socket, SOL_SOCKET, SO_RCVBUF,
                       static_cast<int>(options.recv_buffer_bytes))) {
-        const int err = errno;
-        ::close(fd);
-        return Result<DatagramSocket>::Err(IoStatus::kIoError, err);
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, errno);
     }
     if (options.send_buffer_bytes != 0 &&
-        !SetIntOption(fd, SOL_SOCKET, SO_SNDBUF,
+        !SetIntOption(*socket, SOL_SOCKET, SO_SNDBUF,
                       static_cast<int>(options.send_buffer_bytes))) {
-        const int err = errno;
-        ::close(fd);
-        return Result<DatagramSocket>::Err(IoStatus::kIoError, err);
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, errno);
     }
-    if (::bind(fd, reinterpret_cast<const sockaddr*>(&addr), addr_len) != 0) {
-        const int err = errno;
-        ::close(fd);
-        return Result<DatagramSocket>::Err(IoStatus::kIoError, err);
-    }
-    if (!SetNonBlocking(fd)) {
-        const int err = errno;
-        ::close(fd);
-        return Result<DatagramSocket>::Err(IoStatus::kIoError, err);
-    }
-    sockaddr_storage bound{};
-    socklen_t bound_len = sizeof(bound);
-    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bound_len) != 0) {
-        const int err = errno;
-        ::close(fd);
-        return Result<DatagramSocket>::Err(IoStatus::kIoError, err);
+    if (!socket->bind(*bind_address)) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, errno);
     }
     DatagramSocket sock;
-    sock.fd_ = fd;
-    sock.local_ = EndpointFromSockaddr(reinterpret_cast<const sockaddr*>(&bound),
-                                       bound_len);
+    sock.socket_ = std::move(socket);
+    sock.fd_ = sock.socket_->fd();
+    if (sock.fd_ < 0) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, EBADF);
+    }
+    sock.local_ = EndpointFromAddress(sock.socket_->local_address());
+    sock.batch_bytes_ = options.batch_bytes;
+    sock.batch_entries_ = options.batch_entries;
+    sock.enable_sendmmsg_ = options.enable_sendmmsg;
     return Result<DatagramSocket>::Ok(std::move(sock));
 }
 
@@ -293,9 +336,61 @@ IoStatus DatagramSocket::SendTo(ByteView data, const Endpoint& to, SendResult* o
         }
         return IoStatus::kInvalid;
     }
+    const int fd = socket_ ? socket_->fd() : -1;
+    if (fd < 0) {
+        last_error_ = EBADF;
+        return IoStatus::kInvalid;
+    }
+    // ---- 批量路径：复用 go2cpp 的 SocketBatchWriter（sendmmsg）----
+    // UDP 的「一条数据报」不可切分，否则接收端会看到多条报文、破坏
+    // 「全有或全无」语义；因此这里用 sendmmsg 提交**单条**（count=1），
+    // 由批量适配器统一超时/错误处理。可写性仍先由内核 poll 探测，
+    // 保证 EAGAIN 能原样透出为 kWouldBlock，而不是被内部重试吞掉。
+    if (batch_bytes_ > 0 && enable_sendmmsg_ && data.size >= batch_bytes_) {
+        const int writable = ProbeWritable(fd);
+        if (writable == 0) {
+            last_error_ = 0;
+            result.status = IoStatus::kWouldBlock;
+            if (out != nullptr) {
+                *out = result;
+            }
+            return IoStatus::kWouldBlock;
+        }
+        if (writable < 0) {
+            last_error_ = errno;
+            result.status = IoStatus::kIoError;
+            if (out != nullptr) {
+                *out = result;
+            }
+            return IoStatus::kIoError;
+        }
+        go2cpp::net::SendBatchEntry entry{};
+        entry.data = data.data;
+        entry.length = data.size;
+        entry.to = reinterpret_cast<const sockaddr*>(&dst);
+        entry.to_length = dst_len;
+        // timeout=0：不允许内部 park/重试，与四态的非阻塞语义一致。
+        go2cpp::net::SocketBatchWriter writer(socket_,
+                                              std::chrono::milliseconds(0), true);
+        const go2cpp::net::SocketResult sent = writer.SendToBatch(&entry, 1);
+        if (sent.transferred == 1) {
+            result.status = IoStatus::kOk;
+            if (out != nullptr) {
+                *out = result;
+            }
+            return IoStatus::kOk;
+        }
+        const int err = sent.error != 0 ? sent.error : EAGAIN;
+        last_error_ = err;
+        result.status = MapSendErrno(err);
+        if (out != nullptr) {
+            *out = result;
+        }
+        return result.status;
+    }
     for (;;) {
         const ssize_t n =
-            ::sendto(fd_, data.data, data.size, MSG_DONTWAIT | MSG_NOSIGNAL,
+            ::sendto(fd, data.data, data.size, MSG_DONTWAIT | MSG_NOSIGNAL,
                      reinterpret_cast<const sockaddr*>(&dst), dst_len);
         if (n >= 0) {
             if (static_cast<std::size_t>(n) != data.size) {
@@ -331,7 +426,8 @@ IoStatus DatagramSocket::RecvFrom(MutableByteView buf, Endpoint* from,
         *received = 0;
     }
     last_error_ = 0;
-    if (!valid() || buf.data == nullptr || buf.size == 0) {
+    const int fd = socket_ ? socket_->fd() : -1;
+    if (!valid() || fd < 0 || buf.data == nullptr || buf.size == 0) {
         last_error_ = EINVAL;
         return IoStatus::kInvalid;
     }
@@ -347,7 +443,7 @@ IoStatus DatagramSocket::RecvFrom(MutableByteView buf, Endpoint* from,
     for (;;) {
         // 传入 MSG_TRUNC：报文大于缓冲时返回值是**实际报文长度**，
         // 同时 msg_flags 置 MSG_TRUNC。这样「截断」与「成功」可区分。
-        const ssize_t n = ::recvmsg(fd_, &msg, MSG_DONTWAIT | MSG_TRUNC);
+        const ssize_t n = ::recvmsg(fd, &msg, MSG_DONTWAIT | MSG_TRUNC);
         if (n >= 0) {
             const std::size_t actual = static_cast<std::size_t>(n);
             if (from != nullptr) {
@@ -377,10 +473,11 @@ IoStatus DatagramSocket::RecvFrom(MutableByteView buf, Endpoint* from,
 }
 
 void DatagramSocket::Close() noexcept {
-    if (fd_ >= 0) {
-        ::close(fd_);
-        fd_ = -1;
+    if (socket_) {
+        (void)socket_->close();
+        socket_.reset();
     }
+    fd_ = -1;
     next_token_ = 0;
 }
 
@@ -394,11 +491,18 @@ StreamSocket::StreamSocket(StreamSocket&& other) noexcept
       local_(std::move(other.local_)),
       next_token_(other.next_token_),
       last_transferred_(other.last_transferred_),
-      last_error_(other.last_error_) {
+      last_error_(other.last_error_),
+      socket_(std::move(other.socket_)),
+      batch_bytes_(other.batch_bytes_),
+      batch_entries_(other.batch_entries_),
+      enable_writev_(other.enable_writev_) {
     other.fd_ = -1;
     other.next_token_ = 0;
     other.last_transferred_ = 0;
     other.last_error_ = 0;
+    other.batch_bytes_ = 0;
+    other.batch_entries_ = 0;
+    other.enable_writev_ = false;
 }
 
 StreamSocket& StreamSocket::operator=(StreamSocket&& other) noexcept {
@@ -410,10 +514,17 @@ StreamSocket& StreamSocket::operator=(StreamSocket&& other) noexcept {
         next_token_ = other.next_token_;
         last_transferred_ = other.last_transferred_;
         last_error_ = other.last_error_;
+        socket_ = std::move(other.socket_);
+        batch_bytes_ = other.batch_bytes_;
+        batch_entries_ = other.batch_entries_;
+        enable_writev_ = other.enable_writev_;
         other.fd_ = -1;
         other.next_token_ = 0;
         other.last_transferred_ = 0;
         other.last_error_ = 0;
+        other.batch_bytes_ = 0;
+        other.batch_entries_ = 0;
+        other.enable_writev_ = false;
     }
     return *this;
 }
@@ -426,101 +537,47 @@ Result<StreamSocket> StreamSocket::Open(const Endpoint& remote,
     if (!ResolveEndpoint(remote, SOCK_STREAM, false, &addr, &addr_len, &resolve_err)) {
         return Result<StreamSocket>::Err(IoStatus::kInvalid, resolve_err);
     }
-    const int fd = ::socket(addr.ss_family, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (fd < 0) {
+    AddressPtr remote_address = MakeAddress(addr, addr_len);
+    if (!remote_address) {
+        return Result<StreamSocket>::Err(IoStatus::kInvalid, EINVAL);
+    }
+    Socket::Ptr socket = Socket::CreateTCP(addr.ss_family);
+    if (!socket) {
         return Result<StreamSocket>::Err(IoStatus::kIoError, errno);
     }
-    if (options.tcp_no_delay && !SetIntOption(fd, IPPROTO_TCP, TCP_NODELAY, 1)) {
-        const int err = errno;
-        ::close(fd);
-        return Result<StreamSocket>::Err(IoStatus::kIoError, err);
+    if (options.tcp_no_delay &&
+        !SetIntOption(*socket, IPPROTO_TCP, TCP_NODELAY, 1)) {
+        return Result<StreamSocket>::Err(IoStatus::kIoError, errno);
     }
     if (options.recv_buffer_bytes != 0 &&
-        !SetIntOption(fd, SOL_SOCKET, SO_RCVBUF,
+        !SetIntOption(*socket, SOL_SOCKET, SO_RCVBUF,
                       static_cast<int>(options.recv_buffer_bytes))) {
-        const int err = errno;
-        ::close(fd);
-        return Result<StreamSocket>::Err(IoStatus::kIoError, err);
+        return Result<StreamSocket>::Err(IoStatus::kIoError, errno);
     }
     if (options.send_buffer_bytes != 0 &&
-        !SetIntOption(fd, SOL_SOCKET, SO_SNDBUF,
+        !SetIntOption(*socket, SOL_SOCKET, SO_SNDBUF,
                       static_cast<int>(options.send_buffer_bytes))) {
-        const int err = errno;
-        ::close(fd);
-        return Result<StreamSocket>::Err(IoStatus::kIoError, err);
+        return Result<StreamSocket>::Err(IoStatus::kIoError, errno);
     }
-    if (!SetNonBlocking(fd)) {
-        const int err = errno;
-        ::close(fd);
-        return Result<StreamSocket>::Err(IoStatus::kIoError, err);
+    std::chrono::milliseconds budget = options.connect_timeout;
+    if (budget.count() <= 0) {
+        budget = std::chrono::milliseconds(1);
     }
-
-    int rc = ::connect(fd, reinterpret_cast<const sockaddr*>(&addr), addr_len);
-    if (rc != 0 && errno != EINPROGRESS) {
+    if (!socket->connect(*remote_address, budget)) {
         const int err = errno;
-        ::close(fd);
         return Result<StreamSocket>::Err(MapConnectErrno(err), err);
     }
-    if (rc != 0) {
-        // 非阻塞 connect 进行中：等 POLLOUT + 查 SO_ERROR，带 connect_timeout。
-        std::chrono::milliseconds budget = options.connect_timeout;
-        if (budget.count() <= 0) {
-            budget = std::chrono::milliseconds(1);
-        }
-        const auto deadline = std::chrono::steady_clock::now() + budget;
-        pollfd pfd{};
-        pfd.fd = fd;
-        pfd.events = POLLOUT;
-        for (;;) {
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) {
-                ::close(fd);
-                return Result<StreamSocket>::Err(IoStatus::kTimeout, ETIMEDOUT);
-            }
-            const auto remain =
-                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-            const int timeout_ms =
-                remain.count() > 0 ? static_cast<int>(remain.count()) : 1;
-            const int pr = ::poll(&pfd, 1, timeout_ms);
-            if (pr == 0) {
-                ::close(fd);
-                return Result<StreamSocket>::Err(IoStatus::kTimeout, ETIMEDOUT);
-            }
-            if (pr < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                const int err = errno;
-                ::close(fd);
-                return Result<StreamSocket>::Err(IoStatus::kIoError, err);
-            }
-            break;
-        }
-        int so_error = 0;
-        socklen_t so_len = sizeof(so_error);
-        if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) != 0) {
-            const int err = errno;
-            ::close(fd);
-            return Result<StreamSocket>::Err(IoStatus::kIoError, err);
-        }
-        if (so_error != 0) {
-            ::close(fd);
-            return Result<StreamSocket>::Err(MapConnectErrno(so_error), so_error);
-        }
-    }
-
-    sockaddr_storage bound{};
-    socklen_t bound_len = sizeof(bound);
-    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &bound_len) != 0) {
-        const int err = errno;
-        ::close(fd);
-        return Result<StreamSocket>::Err(IoStatus::kIoError, err);
-    }
     StreamSocket sock;
-    sock.fd_ = fd;
-    sock.peer_ = EndpointFromSockaddr(reinterpret_cast<const sockaddr*>(&addr), addr_len);
-    sock.local_ =
-        EndpointFromSockaddr(reinterpret_cast<const sockaddr*>(&bound), bound_len);
+    sock.socket_ = std::move(socket);
+    sock.fd_ = sock.socket_->fd();
+    if (sock.fd_ < 0) {
+        return Result<StreamSocket>::Err(IoStatus::kIoError, EBADF);
+    }
+    sock.peer_ = EndpointFromAddress(sock.socket_->remote_address());
+    sock.local_ = EndpointFromAddress(sock.socket_->local_address());
+    sock.batch_bytes_ = options.batch_bytes;
+    sock.batch_entries_ = options.batch_entries;
+    sock.enable_writev_ = options.enable_writev;
     return Result<StreamSocket>::Ok(std::move(sock));
 }
 
@@ -541,8 +598,80 @@ IoStatus StreamSocket::Send(ByteView data, SendResult* out) {
         }
         return IoStatus::kInvalid;
     }
+    const int fd = socket_ ? socket_->fd() : -1;
+    if (fd < 0) {
+        last_error_ = EBADF;
+        return IoStatus::kInvalid;
+    }
+    // ---- 批量路径：复用 go2cpp 的 SocketBatchWriter（writev）----
+    // 把本次负载按 batch_bytes 均分成 ≤ batch_entries 个 iovec，用**一次**
+    // writev 提交；TCP 是字节流，切段不改变语义，partial write 仍由
+    // last_transferred() 如实上报。可写性先由 poll 探测，保证 EAGAIN
+    // 原样透出为 kWouldBlock，不会被内部重试吞掉。
+    if (batch_bytes_ > 0 && enable_writev_ && data.size >= batch_bytes_) {
+        const int writable = ProbeWritable(fd);
+        if (writable == 0) {
+            last_error_ = 0;
+            result.status = IoStatus::kWouldBlock;
+            if (out != nullptr) {
+                *out = result;
+            }
+            return IoStatus::kWouldBlock;
+        }
+        if (writable < 0) {
+            last_error_ = errno;
+            result.status = IoStatus::kIoError;
+            if (out != nullptr) {
+                *out = result;
+            }
+            return IoStatus::kIoError;
+        }
+        std::size_t count = (data.size + batch_bytes_ - 1) / batch_bytes_;
+        const std::size_t limit =
+            batch_entries_ > 0 ? std::min<std::size_t>(batch_entries_, kMaxBatchEntries)
+                               : 1;
+        if (count > limit) {
+            count = limit;
+        }
+        if (count == 0) {
+            count = 1;
+        }
+        go2cpp::bufio::BatchEntry entries[kMaxBatchEntries];
+        const std::size_t seg = (data.size + count - 1) / count;
+        std::size_t used = 0;
+        for (std::size_t i = 0; i < count && used < kMaxBatchEntries; ++i) {
+            const std::size_t offset = i * seg;
+            if (offset >= data.size) {
+                break;
+            }
+            const std::size_t length = std::min(seg, data.size - offset);
+            entries[used].data = reinterpret_cast<const char*>(data.data + offset);
+            entries[used].size = length;
+            ++used;
+        }
+        go2cpp::net::SocketBatchWriter writer(socket_,
+                                              std::chrono::milliseconds(0), false);
+        const go2cpp::streams::WriteResult written = writer.WriteBatch(entries, used);
+        if (written.error == nullptr) {
+            last_transferred_ = written.count;
+            result.status = IoStatus::kOk;
+            if (out != nullptr) {
+                *out = result;
+            }
+            return IoStatus::kOk;
+        }
+        last_transferred_ = written.count;
+        const int err = writer.last_system_error() != 0 ? writer.last_system_error()
+                                                        : EIO;
+        last_error_ = err;
+        result.status = MapSendErrno(err);
+        if (out != nullptr) {
+            *out = result;
+        }
+        return result.status;
+    }
     for (;;) {
-        const ssize_t n = ::send(fd_, data.data, data.size, MSG_DONTWAIT | MSG_NOSIGNAL);
+        const ssize_t n = ::send(fd, data.data, data.size, MSG_DONTWAIT | MSG_NOSIGNAL);
         if (n >= 0) {
             last_transferred_ = static_cast<std::size_t>(n);
             result.status = IoStatus::kOk;
@@ -570,12 +699,13 @@ IoStatus StreamSocket::Recv(MutableByteView buf, std::size_t* received) {
     }
     last_transferred_ = 0;
     last_error_ = 0;
-    if (!valid() || buf.data == nullptr || buf.size == 0) {
+    const int fd = socket_ ? socket_->fd() : -1;
+    if (!valid() || fd < 0 || buf.data == nullptr || buf.size == 0) {
         last_error_ = EINVAL;
         return IoStatus::kInvalid;
     }
     for (;;) {
-        const ssize_t n = ::recv(fd_, buf.data, buf.size, MSG_DONTWAIT);
+        const ssize_t n = ::recv(fd, buf.data, buf.size, MSG_DONTWAIT);
         if (n > 0) {
             last_transferred_ = static_cast<std::size_t>(n);
             if (received != nullptr) {
@@ -600,10 +730,11 @@ IoStatus StreamSocket::Recv(MutableByteView buf, std::size_t* received) {
 }
 
 void StreamSocket::Close() noexcept {
-    if (fd_ >= 0) {
-        ::close(fd_);
-        fd_ = -1;
+    if (socket_) {
+        (void)socket_->close();
+        socket_.reset();
     }
+    fd_ = -1;
     next_token_ = 0;
     last_transferred_ = 0;
 }
