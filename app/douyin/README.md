@@ -98,3 +98,99 @@ pkill -x user_service        # interaction_service 的 comm 被截断为 interac
 # gateway 与 8080 电商 demo 同名，勿直接 pkill -x gateway；按 PID 或会话杀：
 # pkill -x -s <gateway的会话ID> gateway
 ```
+
+## 完整验收（C10）
+
+> 本节是 C10 补充的当前状态说明。上文「骨架现状」「当前唯一可用路由」「验收场景（当前仅第 0 项达成）」
+> 是 C0 时点的描述；六服务与网关的业务接口已按 C2–C8 落地，实际行为以本节、`REQUIREMENTS.md`
+> 与脚本实跑结果为准。
+
+### 1. 启动全部 7 个进程（28080 / 29101–29106）
+
+```bash
+cd app/douyin
+mkdir -p logs
+./build.sh                    # 7 个二进制已存在时可跳过
+
+# 六服务共享一个库，启动时都要执行 PRAGMA journal_mode=WAL；
+# 同时拉起会偶发 SQLITE_BUSY，所以每条之间错开 0.4s（见「已知限制」）。
+start() { # 服务名 端口
+  nohup "./build/$1" "$2" > "logs/$1.log" 2>&1 &
+  echo $! > "logs/$1.pid"
+  sleep 0.4
+}
+start gateway             28080
+start user_service        29101
+start video_service       29102
+start feed_service        29103
+start interaction_service 29104
+start live_service        29105
+start search_service      29106
+
+for port in 28080 29101 29102 29103 29104 29105 29106; do
+  curl -fsS "http://127.0.0.1:$port/health" && echo
+done
+```
+
+- 六个服务默认共享同一个 SQLite 库 `data/douyin.db`（WAL）；可用 `DOUYIN_DB=/path/to.db` 指定。
+- 端口是各服务 `main` 的第 1 个位置参数：`./build/user_service 39101` 即可换端口。
+- 停止时按上面记录的 PID，不用 `pkill -f`：
+
+```bash
+for pid_file in logs/*.pid; do
+  kill "$(cat "$pid_file")" 2>/dev/null && echo "stopped $pid_file"
+  rm -f "$pid_file"
+done
+```
+
+### 2. 一键验收（C9 交付）
+
+```bash
+./scripts/accept_all.sh          # 功能验收
+./scripts/accept_all.sh --bench  # 功能验收后追加两轮压测
+```
+
+`scripts/accept_all.sh` 会自己拉起 6 个服务 + 网关，经网关 28080 跑注册、发视频、
+feed 分页、点赞评论、直播、搜索等整套 REST 接口，输出 PASS/FAIL 并以退出码表示结果。
+**跑之前先停掉手动启动的 7 个进程**（同上按 `logs/*.pid` 停止），否则 28080/29101–29106
+端口冲突、脚本内启动的服务会失败。单服务验收脚本仍可用（各自起进程、独立临时库）：
+`scripts/accept_user.sh`、`scripts/accept_video_feed.sh`、
+`scripts/accept_interaction_search.sh`、`scripts/accept_live.sh`。
+
+### 3. 压测（C9 交付）
+
+```bash
+./build/loadgen --url "http://127.0.0.1:28080/api/feed?limit=20" \
+                --concurrency 32 --requests 2000
+```
+
+`scripts/loadgen.cpp` 是 C9 自研压测工具（无第三方依赖，每请求独立建连，与网关
+「一连接一请求」的模型一致），统计 QPS、p50/p99 与非 200 数。参数：`--url`、`--concurrency`、
+`--requests`、`--method`、`--body`，`--help` 查看完整用法；`build.sh` 会顺带构建 `build/loadgen`。
+
+### 4. 可靠性验收（C10 交付）
+
+```bash
+./scripts/reliability_test.sh
+```
+
+流程：起 `user_service`(29101) + `video_service`(29102) 共用一个库 → 注册 alice、发 2 条视频 →
+用 python3 标准库记录 `users`/`videos` 行数与库文件（db + wal + shm）字节数 →
+`kill -9` 两个进程、等 1 秒重启 → 再查 alice 资料与两条视频详情（校验 `author` 为 alice、标题不变）→
+比对重启前后快照 → 打印 PASS/FAIL 并以 0/1 退出。默认端口被占用时自动换到 +10000 起的临时端口；
+清理只用脚本记录的 PID，不用 `pkill -f`；不要求安装 `sqlite3` 客户端（用 python3 标准库读取）。
+
+C10 实跑：19 PASS / 0 FAIL，重启前后均为 `users=1`、`videos=2`、库文件合计 214056 字节。
+
+### 5. 已知限制
+
+- **SQLite 单写者**：六个服务共享一个 SQLite 库，WAL 仍只有单写者，写并发靠
+  `busy_timeout=5000` 串行重试；写压力大时会遇到 SQLITE_BUSY，仅适合 demo，不是生产存储。
+- **自写 HTTP 每连接一线程**：`include/douyin_http.hpp` 是 demo 用的最小 HTTP/1.1 实现，
+  每条连接一个线程、无 keep-alive，并发连接数受线程与 fd 约束；压测数字不代表生产框架上限。
+- **demo 不做转码/推荐**：视频只保存 URL，不落盘、不转码、不生成封面；feed「推荐流」是
+  `ORDER BY like_count*2 + comment_count*3 + 0.1*created_at/3600` 的固定 SQL 热度公式，
+  不是推荐算法；token 为 HMAC 自签，无刷新/吊销。
+- **启动竞态**：六服务共享一个库，启动时每个进程都要执行 `PRAGMA journal_mode=WAL`；
+  同时拉起会偶发 `SQLITE_BUSY` 使后启动的服务直接退出（C10 自检时 video_service 实测命中过），
+  按上面的 0.4s 间隔启动即可规避。

@@ -63,7 +63,18 @@ build_one interaction_service "$ROOT/src/interaction_service.cpp" "$STORE" "$AUT
 build_one live_service        "$ROOT/src/live_service.cpp"        "$STORE" "$AUTH" "$PROTO"
 EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
 build_one search_service      "$ROOT/src/search_service.cpp"      "$STORE" "$PROTO"
-EXTRA_LDLIBS=()
-build_one gateway             "$ROOT/src/gateway.cpp"             "$PROTO"
+EXTRA_LDLIBS=(-lgo2cpp_encoding)
+# C8 网关：通用 Gateway 组件在 src/app/gateway.cpp，尚未打进 libgo2cpp_app.a，
+# 这里把它作为独立编译单元一起编；AUTH 提供 douyin::VerifyToken 做 Bearer 校验。
+build_one gateway             "$ROOT/src/gateway.cpp" "$AUTH" "$GO2CPP/src/app/gateway.cpp"
 
-echo "[build] 完成：$ROOT/build/{gateway,user_service,video_service,feed_service,interaction_service,live_service,search_service}"
+# C9 压测工具：纯 POSIX socket，不依赖 Go2Cpp 库。
+printf '  CC %-20s ' loadgen
+if "$CXX" "${CXXFLAGS[@]}" "$ROOT/scripts/loadgen.cpp" -o "$ROOT/build/loadgen" -pthread; then
+  echo "ok"
+else
+  echo "失败"
+  exit 1
+fi
+
+echo "[build] 完成：$ROOT/build/{gateway,loadgen,user_service,video_service,feed_service,interaction_service,live_service,search_service}"
