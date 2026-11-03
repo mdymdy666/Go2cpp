@@ -96,6 +96,9 @@
   - bench 两次较干净测量：baseline 305 → 组合 **293（−3.9%）**、A/B 交替 **324 vs 338（−4.1%）**，**均 <5% 门槛**；第三组 422 受宿主干扰不采信。
   - borrow 建议①核实：现实现已经是「displaced 先进本 P 256 槽环、环满才 `clear_queued()+enqueue`」（`scheduler.cpp:4031-4034`），方向一致；且 `SchedulerMetrics` 只填前 6 字段，`runnext_pushes/displaced` 恒 0，无法测比例。
   - **结论：scheduler churn 无可验证的 >5% 优化空间**，按规则回滚（`scheduler.cpp` 零改动，回滚后 smoke 10/10）。剩余 1.7–2.2× 差距归因架构差异（Context 语义注入、单锁、跨 M 唤醒），不是单点可优化；M03 收口为「不达标但已尽力」，不再投入。
+- **2026-11-03 15:50 用户决定：放弃 Scheduler 优化**。理由：本项目 Scheduler 架构相对 Go 本就**更复杂**（见下），复杂度是为 C++ 语义（无 GC、RAII、Context）付出的必要代价，不是实现缺陷；继续优化收益 <5%（M03c 已验证）而回归风险高。
+  - 复杂度对比（Go runtime ↔ 本项目）：① 任务所有权：g 复用池 ↔ `shared_ptr<Task>` + FiberBin；② 状态机：6 态分散字段 ↔ `GState` 8 态 + `state_word`（低 8 位状态 + bit8 wake 令牌）+ `execution_claim`/`run_claim` 双位；③ 队列：runnext + 256 环 + 全局 runq ↔ runnext + 256 环 + **incoming 16 条带** + admission 慢路径（emergency/本地 FIFO/全局 FIFO/窃取）；④ Context：无内置（chan 不带 ctx）↔ **每个 Channel/Task 注入 Context**（取消/超时/select 回滚）；⑤ 栈：栈复制（grow/shrink）↔ 8 MiB VA 预留 + 按页增长 + SIGSEGV handler；⑥ 抢占：异步抢占（1.14+）↔ 无抢占（协作 + BlockingRegion + sysmon detach）；⑦ 内存：GC（mcache/mheap）↔ 无 GC（RAII/引用计数）；⑧ IO：netpoll 一种 ↔ 独立 poller / worker poll 两种可配。
+  - 判定：在「状态机/所有权/Context/栈增长/IO 模型」5 个维度本项目更复杂；在「抢占/GC」2 个维度 Go 更复杂——两者不是同类系统（无 GC 的 C++ 运行时必须用引用计数 + 固定栈 + 显式状态机替代 GC 安全点与栈复制）。**因此 2.21× 不是「实现差」，而是「语义更重的代价」**；Scheduler 优化就此关闭。
 
 - **2026-11-03 14:53 三件套尝试（架构→汇编→正确性）**：
   - baseline（`taskset -c 2,3 /tmp/bench_sched 4 100000 7`，三次进程 × 7 轮）：320 / 296 / 351 → **中位 320 ns**，loadavg 0.47–0.69；同命令后续批次中位漂到 306–449，**宿主噪声大于待测效应**。
