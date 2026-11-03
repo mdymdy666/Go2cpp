@@ -233,7 +233,7 @@
 - **测量命令**：`taskset -c 2,3 /tmp/go_sched_bench 100000 5 <GOMAXPROCS>`（Go 1.27.1；`/tmp/go_sched_bench.go`：N 个空 goroutine + WaitGroup，5 轮）
 - **环境**：WSL2 12 vCPU Ryzen 9 8945HX / `taskset -c 2,3` / 100k 任务 × 5 轮 × 3 进程 / loadavg 0.16–1.34 / 无其它 bench 进程
 - **日期**：2026-11-03
-- **脚本路径**：`/tmp/go_sched_bench.go`（**临时，未进仓库**；长期复现需固化到 `tools/`，列为待办）
+- **脚本路径**：`tools/bench/go_sched_bench.go`（2026-11-03 固化；编译/运行见 `tools/bench/README.md`）；对照 C++ 用 `tests/concurrency/bench_scheduler_task_opt.cpp`
 - **状态**：`实测` —— GOMAXPROCS=1 **736.2**；=2 **264.9**（6 进程复跑 251.0）；=4 **162.7**（9 进程复跑 151.0）；=8 **183.4**；`GOGC=off`@4 179.4。
 - **对照**：C++ 同轮 `taskset -c 2,3 /tmp/bench_sched 4 100000 7` ×3 次进程 → 359/333/366，中位 **359**（5 轮口径 283）。比值 Go@4/C++ = **2.21×**（全量中位 333/151=2.21；5 轮 283/163=1.74；Go@2/C++ 1.35）。
 - **判定**：**不达标**（>1.1×），但真实差距 **1.4–2.5×**，不是历史宣称的 5×。135.49 只与「min 统计 / @4 下尾」吻合；122 无出处，不能与 135.49 并列算 0.98×。
