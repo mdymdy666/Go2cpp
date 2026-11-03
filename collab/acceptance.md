@@ -207,3 +207,27 @@ relay_lease_clockjump / relay_pipe / go2cpp_frame_test；`relay_hub_tsan` 未跑
 完整可编译示例已交付：`collab/examples/{frame_codec,relay_pipe,hub,lease}/`（各含
 `main.cpp` + `build_and_run.sh` + `README.md`，主控实跑 4/4 rc=0）；四条 API 的最小骨架
 同时见 JinShan 仓库 `docs/reports/go2cpp-delivery-2026-11-03.md`。
+
+## 六、v3 章节（REQ-006…009，C++ 侧 `rd::net`）
+
+> 依据 `collab/examples/REQUIREMENTS-JINSHAN-TRANSPORT-SPEC.md`（REF-GO2CPP-01，六道门禁 G1–G6）。
+> 环境：WSL2 / Ubuntu 24.04 / g++ 13.3.0 / `-std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror`。
+
+### REQ-006：四态 Socket 抽象（✅ 2026-11-03）
+
+- **实现**：`include/go2cpp/rd_net/socket.hpp`（214 行，`IoStatus` 8 态 + `SendResult` + `DatagramSocket`/`StreamSocket`）、`src/rd_net/socket.cpp`（661 行，`fcntl(O_NONBLOCK)`+`MSG_DONTWAIT`，零线程）；
+- **测试**：`tests/rd_net/test_socket.cpp`（689 行）+ `build_and_run_socket.sh`，`checks=353 failures=0`；
+- **四态证据**（同一用例内可区分）：
+  - FIN：`poll revents=0x1` → `kClosed`、`errno=0`；
+  - RST（`SO_LINGER{1,0}`）：`revents=0x19` → `kReset`、`errno=104(ECONNRESET)`；
+  - 截断：UDP 65507 B → 1024 B 缓冲 → `kTruncated`、`actual=65507`（70000 B 在 IPv4 上直接 `EMSGSIZE`，先断言 `kIoError`）；
+  - `kWouldBlock`：发送塞满对端后出现，重试后 `sent=received=524288` 不丢数据；
+- **其它**：1e4 UDP echo `ok=10000/10000`（RSS +128 kB、fd 不变）；100 socket 并发 `cross_talk=0`；10 万次 `SendTo+RecvFrom` **4411 ns/op**；
+- **偏差**：真树无 `include/go2cpp/platform/`、也无现成 `rd::net`，本层自包含最小 `Endpoint/ByteView/Result`（不引 Windows 头；`_WIN32` 仅占位）。
+
+### REQ-009：可靠传输骨架（✅ 2026-11-03）
+
+- **实现**：`include/go2cpp/rd_net/reliability.hpp`（179 行：`SeqNum` 回绕安全、`RttEstimator` RFC 6298、`RetransmitQueue`、`CongestionController` 纯虚）；
+- **测试**：`tests/rd_net/test_reliability.cpp`（336 行）+ `build_and_run_reliability.sh`，`64 项检查 0 失败`；
+- **数字**：`0xFFFFFFFF.Next()=0`、半程两侧均 false；1e5 项 `PopDue` 一次取全且无重复；RFC 6298 100 ms→RTO 300、200→360、300→507，max/initial 夹紧；AIMD 替换容器 0 改动；随机对拍 1e5 次 0 不匹配；
+- **压测**：1e6 次 **47.3–51.7 ns/op**，RSS 22 MiB。
