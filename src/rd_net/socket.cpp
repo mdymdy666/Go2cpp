@@ -30,6 +30,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <vector>
 
 namespace rd::net {
 namespace {
@@ -38,8 +39,8 @@ using go2cpp::net::Address;
 using go2cpp::net::AddressPtr;
 using go2cpp::net::Socket;
 
-/// @brief 单次批量提交允许的最大段数（栈上数组上限）。
-constexpr std::size_t kMaxBatchEntries = 64;
+/// @brief 单条 Send 隐式切段时栈上数组上限（显式批量入口用公开的 kMaxBatchEntries）。
+constexpr std::size_t kSingleSendMaxSegments = 64;
 
 /// @brief 解析 IP 字面量（快速路径，避免热路径反复 getaddrinfo）。
 bool ParseIpLiteral(const Endpoint& ep, int sock_type, sockaddr_storage* out,
@@ -196,6 +197,25 @@ IoStatus MapConnectErrno(int err) {
     }
 }
 
+/// @brief 计算「已写入 bytes 字节」完整覆盖的前缀段数（size==0 的段视为已提交）。
+std::size_t CompletePrefixSegments(const go2cpp::bufio::BatchEntry* entries,
+                                   std::size_t limit, std::size_t bytes) {
+    std::size_t prefix = 0;
+    std::size_t cumulative = 0;
+    for (std::size_t i = 0; i < limit; ++i) {
+        if (entries[i].size == 0) {
+            ++prefix;
+            continue;
+        }
+        if (entries[i].size > bytes - cumulative) {
+            break;
+        }
+        cumulative += entries[i].size;
+        ++prefix;
+    }
+    return prefix;
+}
+
 }  // namespace
 
 const char* IoStatusName(IoStatus status) noexcept {
@@ -232,7 +252,9 @@ DatagramSocket::DatagramSocket(DatagramSocket&& other) noexcept
       socket_(std::move(other.socket_)),
       batch_bytes_(other.batch_bytes_),
       batch_entries_(other.batch_entries_),
-      enable_sendmmsg_(other.enable_sendmmsg_) {
+      enable_sendmmsg_(other.enable_sendmmsg_),
+      last_batch_submitted_(other.last_batch_submitted_),
+      batch_target_(std::move(other.batch_target_)) {
     other.fd_ = -1;
     other.next_token_ = 0;
     other.last_error_ = 0;
@@ -252,12 +274,16 @@ DatagramSocket& DatagramSocket::operator=(DatagramSocket&& other) noexcept {
         batch_bytes_ = other.batch_bytes_;
         batch_entries_ = other.batch_entries_;
         enable_sendmmsg_ = other.enable_sendmmsg_;
+        last_batch_submitted_ = other.last_batch_submitted_;
+        batch_target_ = std::move(other.batch_target_);
         other.fd_ = -1;
         other.next_token_ = 0;
         other.last_error_ = 0;
         other.batch_bytes_ = 0;
         other.batch_entries_ = 0;
         other.enable_sendmmsg_ = false;
+        other.last_batch_submitted_ = 0;
+        other.batch_target_ = Endpoint{};
     }
     return *this;
 }
@@ -336,6 +362,8 @@ IoStatus DatagramSocket::SendTo(ByteView data, const Endpoint& to, SendResult* o
         }
         return IoStatus::kInvalid;
     }
+    // 记录最近一次解析出的目标，供 SendBatch 复用（不要求本次发送有结果）。
+    batch_target_ = to;
     const int fd = socket_ ? socket_->fd() : -1;
     if (fd < 0) {
         last_error_ = EBADF;
@@ -420,6 +448,121 @@ IoStatus DatagramSocket::SendTo(ByteView data, const Endpoint& to, SendResult* o
     }
 }
 
+IoStatus DatagramSocket::SetBatchTarget(const Endpoint& to, SendResult* out) {
+    last_error_ = 0;
+    if (out != nullptr) {
+        *out = SendResult{};
+        out->status = IoStatus::kInvalid;
+    }
+    if (!valid() || to.host.empty() || to.port == 0) {
+        last_error_ = EINVAL;
+        return IoStatus::kInvalid;
+    }
+    sockaddr_storage dst{};
+    socklen_t dst_len = 0;
+    int resolve_err = 0;
+    if (!ResolveEndpoint(to, SOCK_DGRAM, false, &dst, &dst_len, &resolve_err)) {
+        last_error_ = resolve_err;
+        return IoStatus::kInvalid;
+    }
+    batch_target_ = to;
+    if (out != nullptr) {
+        out->status = IoStatus::kOk;
+    }
+    return IoStatus::kOk;
+}
+
+IoStatus DatagramSocket::SendBatch(const go2cpp::bufio::BatchEntry* entries,
+                                   std::size_t count, SendResult* out) {
+    SendResult result;
+    result.token = ++next_token_;
+    result.status = IoStatus::kOk;
+    last_batch_submitted_ = 0;
+    last_error_ = 0;
+    if (out != nullptr) {
+        *out = result;
+    }
+    if (count == 0) {
+        // 合法 no-op：不产生系统调用，token 仍按调用分配。
+        return IoStatus::kOk;
+    }
+    if (!valid() || entries == nullptr) {
+        last_error_ = EINVAL;
+        result.status = IoStatus::kInvalid;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return IoStatus::kInvalid;
+    }
+    const std::size_t limit = std::min(count, kMaxBatchEntries);
+    for (std::size_t i = 0; i < limit; ++i) {
+        if (entries[i].data == nullptr) {
+            last_error_ = EINVAL;
+            result.status = IoStatus::kInvalid;
+            if (out != nullptr) {
+                *out = result;
+            }
+            return IoStatus::kInvalid;
+        }
+    }
+    if (batch_target_.empty()) {
+        // 批量入口没有目标参数：必须先 SetBatchTarget 或至少调用过一次 SendTo。
+        last_error_ = EDESTADDRREQ;
+        result.status = IoStatus::kInvalid;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return IoStatus::kInvalid;
+    }
+    sockaddr_storage dst{};
+    socklen_t dst_len = 0;
+    int resolve_err = 0;
+    if (!ResolveEndpoint(batch_target_, SOCK_DGRAM, false, &dst, &dst_len,
+                         &resolve_err)) {
+        last_error_ = resolve_err;
+        result.status = IoStatus::kInvalid;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return IoStatus::kInvalid;
+    }
+    std::vector<go2cpp::net::SendBatchEntry> batch;
+    batch.reserve(limit);
+    for (std::size_t i = 0; i < limit; ++i) {
+        go2cpp::net::SendBatchEntry entry{};
+        entry.data = entries[i].data;
+        entry.length = entries[i].size;
+        entry.to = reinterpret_cast<const sockaddr*>(&dst);
+        entry.to_length = dst_len;
+        batch.push_back(entry);
+    }
+    // timeout=0：不等待、不重试，EAGAIN 原样透出（映射成 kWouldBlock）。
+    go2cpp::net::SocketBatchWriter writer(socket_, std::chrono::milliseconds(0), true);
+    const go2cpp::net::SocketResult sent = writer.SendToBatch(batch.data(), batch.size());
+    if (sent.error != 0 || sent.transferred < 0) {
+        const int err = sent.error != 0 ? sent.error : EAGAIN;
+        if (err == ETIMEDOUT || err == EAGAIN) {
+            // 非阻塞入口：超时预算为 0 等价于「当前不可写」。
+            last_error_ = 0;
+            result.status = IoStatus::kWouldBlock;
+        } else {
+            last_error_ = err;
+            result.status = MapSendErrno(err);
+        }
+        if (out != nullptr) {
+            *out = result;
+        }
+        return result.status;
+    }
+    last_batch_submitted_ = static_cast<std::size_t>(sent.transferred);
+    result.status = last_batch_submitted_ >= limit ? IoStatus::kOk
+                                                   : IoStatus::kWouldBlock;
+    if (out != nullptr) {
+        *out = result;
+    }
+    return result.status;
+}
+
 IoStatus DatagramSocket::RecvFrom(MutableByteView buf, Endpoint* from,
                                   std::size_t* received) {
     if (received != nullptr) {
@@ -479,6 +622,8 @@ void DatagramSocket::Close() noexcept {
     }
     fd_ = -1;
     next_token_ = 0;
+    last_batch_submitted_ = 0;
+    batch_target_ = Endpoint{};
 }
 
 // ---------------------------------------------------------------- StreamSocket
@@ -495,7 +640,8 @@ StreamSocket::StreamSocket(StreamSocket&& other) noexcept
       socket_(std::move(other.socket_)),
       batch_bytes_(other.batch_bytes_),
       batch_entries_(other.batch_entries_),
-      enable_writev_(other.enable_writev_) {
+      enable_writev_(other.enable_writev_),
+      last_batch_submitted_(other.last_batch_submitted_) {
     other.fd_ = -1;
     other.next_token_ = 0;
     other.last_transferred_ = 0;
@@ -518,6 +664,7 @@ StreamSocket& StreamSocket::operator=(StreamSocket&& other) noexcept {
         batch_bytes_ = other.batch_bytes_;
         batch_entries_ = other.batch_entries_;
         enable_writev_ = other.enable_writev_;
+        last_batch_submitted_ = other.last_batch_submitted_;
         other.fd_ = -1;
         other.next_token_ = 0;
         other.last_transferred_ = 0;
@@ -525,6 +672,7 @@ StreamSocket& StreamSocket::operator=(StreamSocket&& other) noexcept {
         other.batch_bytes_ = 0;
         other.batch_entries_ = 0;
         other.enable_writev_ = false;
+        other.last_batch_submitted_ = 0;
     }
     return *this;
 }
@@ -628,7 +776,7 @@ IoStatus StreamSocket::Send(ByteView data, SendResult* out) {
         }
         std::size_t count = (data.size + batch_bytes_ - 1) / batch_bytes_;
         const std::size_t limit =
-            batch_entries_ > 0 ? std::min<std::size_t>(batch_entries_, kMaxBatchEntries)
+            batch_entries_ > 0 ? std::min<std::size_t>(batch_entries_, kSingleSendMaxSegments)
                                : 1;
         if (count > limit) {
             count = limit;
@@ -636,10 +784,10 @@ IoStatus StreamSocket::Send(ByteView data, SendResult* out) {
         if (count == 0) {
             count = 1;
         }
-        go2cpp::bufio::BatchEntry entries[kMaxBatchEntries];
+        go2cpp::bufio::BatchEntry entries[kSingleSendMaxSegments];
         const std::size_t seg = (data.size + count - 1) / count;
         std::size_t used = 0;
-        for (std::size_t i = 0; i < count && used < kMaxBatchEntries; ++i) {
+        for (std::size_t i = 0; i < count && used < kSingleSendMaxSegments; ++i) {
             const std::size_t offset = i * seg;
             if (offset >= data.size) {
                 break;
@@ -691,6 +839,73 @@ IoStatus StreamSocket::Send(ByteView data, SendResult* out) {
         }
         return result.status;
     }
+}
+
+IoStatus StreamSocket::SendBatch(const go2cpp::bufio::BatchEntry* entries,
+                                 std::size_t count, SendResult* out) {
+    SendResult result;
+    result.token = ++next_token_;
+    result.status = IoStatus::kOk;
+    last_batch_submitted_ = 0;
+    last_transferred_ = 0;
+    last_error_ = 0;
+    if (out != nullptr) {
+        *out = result;
+    }
+    if (count == 0) {
+        // 合法 no-op：不产生系统调用，token 仍按调用分配。
+        return IoStatus::kOk;
+    }
+    if (!valid() || entries == nullptr) {
+        last_error_ = EINVAL;
+        result.status = IoStatus::kInvalid;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return IoStatus::kInvalid;
+    }
+    const std::size_t limit = std::min(count, kMaxBatchEntries);
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < limit; ++i) {
+        if (entries[i].data == nullptr && entries[i].size != 0) {
+            last_error_ = EINVAL;
+            result.status = IoStatus::kInvalid;
+            if (out != nullptr) {
+                *out = result;
+            }
+            return IoStatus::kInvalid;
+        }
+        total += entries[i].size;
+    }
+    // timeout=0：不等待、不重试；一次 writev 提交全部段。
+    go2cpp::net::SocketBatchWriter writer(socket_, std::chrono::milliseconds(0), false);
+    const go2cpp::streams::WriteResult written = writer.WriteBatch(entries, limit);
+    const std::size_t transferred = written.count;
+    last_transferred_ = transferred;
+    last_batch_submitted_ = CompletePrefixSegments(entries, limit, transferred);
+    if (written.error == nullptr) {
+        // 部分写不是错误：已提交前缀段数由 last_batch_submitted() 给出。
+        result.status = transferred >= total ? IoStatus::kOk : IoStatus::kWouldBlock;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return result.status;
+    }
+    int err = writer.last_system_error();
+    if (err == 0) {
+        err = EIO;
+    }
+    if (err == ETIMEDOUT || err == EAGAIN) {
+        last_error_ = 0;
+        result.status = IoStatus::kWouldBlock;
+    } else {
+        last_error_ = err;
+        result.status = MapSendErrno(err);
+    }
+    if (out != nullptr) {
+        *out = result;
+    }
+    return result.status;
 }
 
 IoStatus StreamSocket::Recv(MutableByteView buf, std::size_t* received) {
@@ -759,6 +974,21 @@ IoStatus DatagramSocket::SendTo(ByteView, const Endpoint&, SendResult* out) {
     }
     return IoStatus::kInvalid;
 }
+IoStatus DatagramSocket::SetBatchTarget(const Endpoint&, SendResult* out) {
+    if (out != nullptr) {
+        *out = SendResult{};
+        out->status = IoStatus::kInvalid;
+    }
+    return IoStatus::kInvalid;
+}
+IoStatus DatagramSocket::SendBatch(const go2cpp::bufio::BatchEntry*, std::size_t,
+                                   SendResult* out) {
+    if (out != nullptr) {
+        *out = SendResult{};
+        out->status = IoStatus::kInvalid;
+    }
+    return IoStatus::kInvalid;
+}
 IoStatus DatagramSocket::RecvFrom(MutableByteView, Endpoint*, std::size_t* received) {
     if (received != nullptr) {
         *received = 0;
@@ -776,6 +1006,14 @@ Result<StreamSocket> StreamSocket::Open(const Endpoint&, const DialOptions&) {
 IoStatus StreamSocket::Send(ByteView, SendResult* out) {
     if (out != nullptr) {
         *out = SendResult{};
+    }
+    return IoStatus::kInvalid;
+}
+IoStatus StreamSocket::SendBatch(const go2cpp::bufio::BatchEntry*, std::size_t,
+                                 SendResult* out) {
+    if (out != nullptr) {
+        *out = SendResult{};
+        out->status = IoStatus::kInvalid;
     }
     return IoStatus::kInvalid;
 }

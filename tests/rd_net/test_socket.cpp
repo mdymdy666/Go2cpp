@@ -1,5 +1,7 @@
 #include "go2cpp/rd_net/socket.hpp"
 
+#include "go2cpp/bufio/batch.hpp"
+
 /// @file test_socket.cpp
 /// @brief REQ-006 验收：四态可分（kClosed / kReset / kTruncated / kWouldBlock）
 ///        + 1e4 无泄漏 + 100 socket 不串包 + 10 万次压测。
@@ -858,6 +860,546 @@ void BatchComparison() {
     }
 }
 
+
+// ---------------------------------------------------------------- 场景 6：UDP SendBatch
+/// @brief 等待并逐条校验 count 条数据报；返回实际匹配条数。
+int RecvUdpBatchExact(rd::net::DatagramSocket& rx,
+                      const std::vector<std::vector<std::uint8_t>>& payloads,
+                      std::size_t first, std::size_t count, std::size_t seg) {
+    std::vector<std::uint8_t> buf(seg + 64);
+    int matched = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (WaitEvents(rx.fd(), POLLIN, 2000) <= 0) {
+            std::printf("  [recv] poll timeout at %zu/%zu\n", i, count);
+            break;
+        }
+        std::size_t got = 0;
+        rd::net::Endpoint from;
+        const auto st = rx.RecvFrom(
+            rd::net::MutableByteView{buf.data(), buf.size()}, &from, &got);
+        if (st != rd::net::IoStatus::kOk || got != seg) {
+            std::printf("  [recv] i=%zu status=%s got=%zu\n", i,
+                        rd::net::IoStatusName(st), got);
+            break;
+        }
+        if (std::memcmp(buf.data(), payloads[first + i].data(), seg) != 0) {
+            std::printf("  [recv] i=%zu content mismatch\n", i);
+            break;
+        }
+        ++matched;
+    }
+    return matched;
+}
+
+struct UdpBatchBench {
+    double ns_per_datagram{0};
+    double mib_per_s{0};
+    int rounds{0};
+};
+
+/// @brief 每轮：发送 entries 条（只对发送计时）→ 逐条收干净并校验。
+UdpBatchBench RunUdpBatchBench(bool batched, int rounds, std::size_t entries,
+                               std::size_t seg) {
+    UdpBatchBench sample;
+    auto rx_opened = rd::net::DatagramSocket::Open(rd::net::Endpoint{"127.0.0.1", 0});
+    auto tx_opened = rd::net::DatagramSocket::Open(rd::net::Endpoint{"127.0.0.1", 0});
+    if (!rx_opened.ok() || !tx_opened.ok()) {
+        return sample;
+    }
+    rd::net::DatagramSocket rx = std::move(*rx_opened);
+    rd::net::DatagramSocket tx = std::move(*tx_opened);
+    if (tx.SetBatchTarget(rx.local_endpoint()) != rd::net::IoStatus::kOk) {
+        return sample;
+    }
+    std::vector<std::vector<std::uint8_t>> payloads(entries,
+                                                    std::vector<std::uint8_t>(seg));
+    std::vector<go2cpp::bufio::BatchEntry> batch(entries);
+    for (std::size_t i = 0; i < entries; ++i) {
+        FillPattern(payloads[i].data(), seg, i * 13);
+        batch[i].data = reinterpret_cast<const char*>(payloads[i].data());
+        batch[i].size = seg;
+    }
+    long long send_ns = 0;
+    int ok = 0;
+    for (int r = 0; r < rounds; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        bool sent = true;
+        if (batched) {
+            rd::net::SendResult sr{};
+            if (tx.SendBatch(batch.data(), batch.size(), &sr) != rd::net::IoStatus::kOk ||
+                tx.last_batch_submitted() != entries) {
+                sent = false;
+            }
+        } else {
+            for (std::size_t i = 0; i < entries; ++i) {
+                rd::net::SendResult sr{};
+                const rd::net::ByteView view{
+                    reinterpret_cast<const std::uint8_t*>(batch[i].data), batch[i].size};
+                if (tx.SendTo(view, rx.local_endpoint(), &sr) != rd::net::IoStatus::kOk) {
+                    sent = false;
+                    break;
+                }
+            }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        if (!sent) {
+            break;
+        }
+        send_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        if (RecvUdpBatchExact(rx, payloads, 0, entries, seg) !=
+            static_cast<int>(entries)) {
+            break;
+        }
+        ++ok;
+    }
+    sample.rounds = ok;
+    if (ok > 0 && send_ns > 0) {
+        const double bytes = static_cast<double>(ok) * static_cast<double>(entries) *
+                             static_cast<double>(seg);
+        sample.ns_per_datagram =
+            static_cast<double>(send_ns) / (static_cast<double>(ok) * entries);
+        sample.mib_per_s = bytes / (static_cast<double>(send_ns) / 1.0e9) /
+                           (1024.0 * 1024.0);
+    }
+    return sample;
+}
+
+void Scenario6UdpSendBatch() {
+    std::printf("\n== 场景 6: UDP SendBatch 一次 sendmmsg 提交 64 条 ==\n");
+    constexpr std::size_t kEntries = 64;
+    constexpr std::size_t kSeg = 1024;
+
+    auto rx_opened = rd::net::DatagramSocket::Open(rd::net::Endpoint{"127.0.0.1", 0});
+    auto tx_opened = rd::net::DatagramSocket::Open(rd::net::Endpoint{"127.0.0.1", 0});
+    CHECK_TRUE(rx_opened.ok());
+    CHECK_TRUE(tx_opened.ok());
+    if (!rx_opened.ok() || !tx_opened.ok()) {
+        return;
+    }
+    rd::net::DatagramSocket rx = std::move(*rx_opened);
+    rd::net::DatagramSocket tx = std::move(*tx_opened);
+
+    std::vector<std::vector<std::uint8_t>> payloads(kEntries,
+                                                    std::vector<std::uint8_t>(kSeg));
+    std::vector<go2cpp::bufio::BatchEntry> entries(kEntries);
+    for (std::size_t i = 0; i < kEntries; ++i) {
+        FillPattern(payloads[i].data(), kSeg, i * 37);
+        entries[i].data = reinterpret_cast<const char*>(payloads[i].data());
+        entries[i].size = kSeg;
+    }
+
+    // 未设置目标：SendBatch 必须返回 kInvalid。
+    {
+        auto alone_opened =
+            rd::net::DatagramSocket::Open(rd::net::Endpoint{"127.0.0.1", 0});
+        CHECK_TRUE(alone_opened.ok());
+        if (alone_opened.ok()) {
+            rd::net::DatagramSocket alone = std::move(*alone_opened);
+            rd::net::SendResult sr{};
+            CHECK_STATUS(alone.SendBatch(entries.data(), 1, &sr),
+                         rd::net::IoStatus::kInvalid);
+        }
+    }
+
+    CHECK_STATUS(tx.SetBatchTarget(rx.local_endpoint()), rd::net::IoStatus::kOk);
+
+    // count=0：kOk no-op，对端收不到数据。
+    {
+        rd::net::SendResult sr{};
+        CHECK_STATUS(tx.SendBatch(entries.data(), 0, &sr), rd::net::IoStatus::kOk);
+        CHECK_TRUE(tx.last_batch_submitted() == 0);
+        std::uint8_t probe[16];
+        std::size_t got = 0;
+        CHECK_STATUS(rx.RecvFrom(rd::net::MutableByteView{probe, sizeof(probe)},
+                                 nullptr, &got),
+                     rd::net::IoStatus::kWouldBlock);
+    }
+
+    // count=1。
+    {
+        rd::net::SendResult sr{};
+        CHECK_STATUS(tx.SendBatch(entries.data(), 1, &sr), rd::net::IoStatus::kOk);
+        CHECK_TRUE(tx.last_batch_submitted() == 1);
+        CHECK_TRUE(RecvUdpBatchExact(rx, payloads, 0, 1, kSeg) == 1);
+    }
+
+    // 一次 64 条 1KB：对端逐条收全、顺序一致。
+    {
+        rd::net::SendResult sr{};
+        CHECK_STATUS(tx.SendBatch(entries.data(), entries.size(), &sr),
+                     rd::net::IoStatus::kOk);
+        CHECK_TRUE(tx.last_batch_submitted() == entries.size());
+        const int matched = RecvUdpBatchExact(rx, payloads, 0, kEntries, kSeg);
+        std::printf("  udp-batch: status=%s submitted=%zu received=%d/%zu\n",
+                    rd::net::IoStatusName(sr.status), tx.last_batch_submitted(),
+                    matched, kEntries);
+        CHECK_TRUE(matched == static_cast<int>(kEntries));
+    }
+
+    // 超过上限：1500 段 × 32B -> 只提交前 1024 段，剩余 476 段下一次提交。
+    {
+        constexpr std::size_t kSmallSeg = 32;
+        constexpr std::size_t kBig = 1500;
+        std::vector<std::vector<std::uint8_t>> small(
+            kBig, std::vector<std::uint8_t>(kSmallSeg));
+        std::vector<go2cpp::bufio::BatchEntry> big_entries(kBig);
+        for (std::size_t i = 0; i < kBig; ++i) {
+            FillPattern(small[i].data(), kSmallSeg, i * 7);
+            big_entries[i].data = reinterpret_cast<const char*>(small[i].data());
+            big_entries[i].size = kSmallSeg;
+        }
+        rd::net::SendResult sr{};
+        CHECK_STATUS(tx.SendBatch(big_entries.data(), kBig, &sr),
+                     rd::net::IoStatus::kOk);
+        CHECK_TRUE(tx.last_batch_submitted() == rd::net::kMaxBatchEntries);
+        // 接收端 rcvbuf 约 208KB，1024 条小报文会在内核接收队列溢出（UDP 语义），
+        // 这里只验证提交计数；顺序与内容由前面 64 条 × 1KB 用例覆盖。
+        const std::size_t rest = kBig - rd::net::kMaxBatchEntries;
+        CHECK_STATUS(tx.SendBatch(big_entries.data() + rd::net::kMaxBatchEntries,
+                                  rest, &sr),
+                     rd::net::IoStatus::kOk);
+        CHECK_TRUE(tx.last_batch_submitted() == rest);
+        std::printf("  udp-limit: count=1500 committed=%zu + %zu (cap=%zu)\n",
+                    rd::net::kMaxBatchEntries, rest, rd::net::kMaxBatchEntries);
+    }
+
+    // UDP 部分提交尝试：小 rcvbuf/sndbuf + 对端不读（loopback 可能直接丢包，
+    // 不返回 EAGAIN；如实打印结果，不作硬断言）。
+    {
+        rd::net::SocketOptions ro;
+        ro.recv_buffer_bytes = 2048;
+        rd::net::SocketOptions so;
+        so.send_buffer_bytes = 4096;
+        auto r2o = rd::net::DatagramSocket::Open(rd::net::Endpoint{"127.0.0.1", 0}, ro);
+        auto t2o = rd::net::DatagramSocket::Open(rd::net::Endpoint{"127.0.0.1", 0}, so);
+        if (r2o.ok() && t2o.ok()) {
+            constexpr std::size_t kPartial = 200;
+            constexpr std::size_t kPartialSeg = 512;
+            std::vector<std::vector<std::uint8_t>> pp(
+                kPartial, std::vector<std::uint8_t>(kPartialSeg));
+            std::vector<go2cpp::bufio::BatchEntry> pe(kPartial);
+            for (std::size_t i = 0; i < kPartial; ++i) {
+                FillPattern(pp[i].data(), kPartialSeg, i * 3);
+                pe[i].data = reinterpret_cast<const char*>(pp[i].data());
+                pe[i].size = kPartialSeg;
+            }
+            CHECK_STATUS(t2o->SetBatchTarget(r2o->local_endpoint()),
+                         rd::net::IoStatus::kOk);
+            rd::net::SendResult sr{};
+            const auto st = t2o->SendBatch(pe.data(), pe.size(), &sr);
+            std::printf("  udp-partial-attempt: status=%s submitted=%zu/%zu "
+                        "(rcvbuf=2048 sndbuf=4096, 对端不读)\n",
+                        rd::net::IoStatusName(st), t2o->last_batch_submitted(),
+                        pe.size());
+            if (st == rd::net::IoStatus::kWouldBlock) {
+                CHECK_TRUE(t2o->last_batch_submitted() > 0);
+                CHECK_TRUE(t2o->last_batch_submitted() < pe.size());
+            }
+        }
+    }
+
+    // 3 轮对比：批量 64 条 vs 64 次单条 SendTo（只计发送阶段）。
+    constexpr int kRounds = 100;
+    double batched_ns[3] = {0, 0, 0};
+    double batched_mib[3] = {0, 0, 0};
+    double single_ns[3] = {0, 0, 0};
+    double single_mib[3] = {0, 0, 0};
+    for (int round = 0; round < 3; ++round) {
+        const UdpBatchBench b = RunUdpBatchBench(true, kRounds, kEntries, kSeg);
+        const UdpBatchBench s = RunUdpBatchBench(false, kRounds, kEntries, kSeg);
+        batched_ns[round] = b.ns_per_datagram;
+        batched_mib[round] = b.mib_per_s;
+        single_ns[round] = s.ns_per_datagram;
+        single_mib[round] = s.mib_per_s;
+        std::printf(
+            "  round %d: batch ns/dgram=%.1f %.1f MiB/s (rounds=%d) | "
+            "single ns/dgram=%.1f %.1f MiB/s (rounds=%d)\n",
+            round + 1, b.ns_per_datagram, b.mib_per_s, b.rounds, s.ns_per_datagram,
+            s.mib_per_s, s.rounds);
+        if (b.rounds != kRounds || s.rounds != kRounds) {
+            std::printf("  [FAIL-BATCH] UDP bench 未跑满：batch=%d single=%d\n",
+                        b.rounds, s.rounds);
+        }
+    }
+    const auto avg = [](const double (&v)[3]) { return (v[0] + v[1] + v[2]) / 3.0; };
+    std::printf("  avg: batch ns/dgram=%.1f %.1f MiB/s | single ns/dgram=%.1f "
+                "%.1f MiB/s | batch_faster=%s\n",
+                avg(batched_ns), avg(batched_mib), avg(single_ns), avg(single_mib),
+                avg(batched_ns) < avg(single_ns) ? "yes" : "no");
+}
+
+// ---------------------------------------------------------------- 场景 7：TCP SendBatch
+std::size_t ReadFullBytes(int fd, std::uint8_t* dst, std::size_t n) {
+    std::size_t off = 0;
+    while (off < n) {
+        const ssize_t got = ::read(fd, dst + off, n - off);
+        if (got > 0) {
+            off += static_cast<std::size_t>(got);
+            continue;
+        }
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+    return off;
+}
+
+struct TcpBatchBench {
+    double ns_per_segment{0};
+    double mib_per_s{0};
+    int rounds{0};
+};
+
+TcpBatchBench RunTcpBatchBench(bool batched, int rounds, std::size_t entries,
+                               std::size_t seg) {
+    TcpBatchBench sample;
+    std::uint16_t port = 0;
+    const int lfd = MakeListener(&port);
+    if (lfd < 0) {
+        return sample;
+    }
+    auto opened = rd::net::StreamSocket::Open(rd::net::Endpoint{"127.0.0.1", port});
+    if (!opened.ok()) {
+        ::close(lfd);
+        return sample;
+    }
+    rd::net::StreamSocket cli = std::move(*opened);
+    const int peer = AcceptOne(lfd);
+    ::close(lfd);
+    if (peer < 0) {
+        return sample;
+    }
+    std::vector<std::uint8_t> block(entries * seg);
+    std::vector<go2cpp::bufio::BatchEntry> batch(entries);
+    for (std::size_t i = 0; i < entries; ++i) {
+        FillPattern(block.data() + i * seg, seg, i * 19);
+        batch[i].data = reinterpret_cast<const char*>(block.data() + i * seg);
+        batch[i].size = seg;
+    }
+    std::vector<std::uint8_t> got(entries * seg);
+    long long send_ns = 0;
+    int ok = 0;
+    for (int r = 0; r < rounds; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        bool sent = true;
+        if (batched) {
+            rd::net::SendResult sr{};
+            if (cli.SendBatch(batch.data(), batch.size(), &sr) !=
+                    rd::net::IoStatus::kOk ||
+                cli.last_batch_submitted() != entries) {
+                sent = false;
+            }
+        } else {
+            for (std::size_t i = 0; i < entries; ++i) {
+                rd::net::SendResult sr{};
+                const rd::net::ByteView view{
+                    reinterpret_cast<const std::uint8_t*>(batch[i].data), batch[i].size};
+                if (cli.Send(view, &sr) != rd::net::IoStatus::kOk ||
+                    cli.last_transferred() != seg) {
+                    sent = false;
+                    break;
+                }
+            }
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        if (!sent) {
+            break;
+        }
+        send_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        if (ReadFullBytes(peer, got.data(), got.size()) != got.size() ||
+            std::memcmp(got.data(), block.data(), block.size()) != 0) {
+            break;
+        }
+        ++ok;
+    }
+    ::close(peer);
+    sample.rounds = ok;
+    if (ok > 0 && send_ns > 0) {
+        const double bytes = static_cast<double>(ok) * static_cast<double>(entries) *
+                             static_cast<double>(seg);
+        sample.ns_per_segment =
+            static_cast<double>(send_ns) / (static_cast<double>(ok) * entries);
+        sample.mib_per_s = bytes / (static_cast<double>(send_ns) / 1.0e9) /
+                           (1024.0 * 1024.0);
+    }
+    return sample;
+}
+
+void Scenario7TcpSendBatch() {
+    std::printf("\n== 场景 7: TCP SendBatch 一次 writev 提交 64 段 ==\n");
+    constexpr std::size_t kEntries = 64;
+    constexpr std::size_t kSeg = 1024;
+
+    std::uint16_t port = 0;
+    const int lfd = MakeListener(&port);
+    CHECK_TRUE(lfd >= 0);
+    if (lfd < 0) {
+        return;
+    }
+    auto opened = rd::net::StreamSocket::Open(rd::net::Endpoint{"127.0.0.1", port});
+    CHECK_TRUE(opened.ok());
+    if (!opened.ok()) {
+        ::close(lfd);
+        return;
+    }
+    rd::net::StreamSocket cli = std::move(*opened);
+    const int peer = AcceptOne(lfd);
+    ::close(lfd);
+    CHECK_TRUE(peer >= 0);
+    if (peer < 0) {
+        return;
+    }
+
+    std::vector<std::uint8_t> block(kEntries * kSeg);
+    std::vector<go2cpp::bufio::BatchEntry> entries(kEntries);
+    for (std::size_t i = 0; i < kEntries; ++i) {
+        FillPattern(block.data() + i * kSeg, kSeg, i * 53);
+        entries[i].data = reinterpret_cast<const char*>(block.data() + i * kSeg);
+        entries[i].size = kSeg;
+    }
+
+    // 一次 64 段：字节流顺序与内容必须一致。
+    {
+        rd::net::SendResult sr{};
+        const auto st = cli.SendBatch(entries.data(), entries.size(), &sr);
+        CHECK_STATUS(st, rd::net::IoStatus::kOk);
+        CHECK_TRUE(cli.last_batch_submitted() == entries.size());
+        CHECK_TRUE(cli.last_transferred() == block.size());
+        std::vector<std::uint8_t> got(block.size());
+        const std::size_t off = ReadFullBytes(peer, got.data(), got.size());
+        const bool same = off == block.size() &&
+                          std::memcmp(got.data(), block.data(), block.size()) == 0;
+        std::printf("  tcp-batch: status=%s submitted=%zu transferred=%zu "
+                    "received=%zu match=%s\n",
+                    rd::net::IoStatusName(st), cli.last_batch_submitted(),
+                    cli.last_transferred(), off, same ? "yes" : "no");
+        CHECK_TRUE(off == block.size());
+        CHECK_TRUE(same);
+    }
+
+    // count=0：kOk no-op。
+    {
+        rd::net::SendResult sr{};
+        CHECK_STATUS(cli.SendBatch(entries.data(), 0, &sr), rd::net::IoStatus::kOk);
+        CHECK_TRUE(cli.last_batch_submitted() == 0);
+        CHECK_TRUE(cli.last_transferred() == 0);
+    }
+
+    // count=1。
+    {
+        rd::net::SendResult sr{};
+        CHECK_STATUS(cli.SendBatch(entries.data(), 1, &sr), rd::net::IoStatus::kOk);
+        CHECK_TRUE(cli.last_batch_submitted() == 1);
+        CHECK_TRUE(cli.last_transferred() == kSeg);
+        std::vector<std::uint8_t> got(kSeg);
+        CHECK_TRUE(ReadFullBytes(peer, got.data(), got.size()) == kSeg);
+        CHECK_TRUE(std::memcmp(got.data(), block.data(), kSeg) == 0);
+    }
+
+    // 超过上限：1500 段 × 16B -> 1024 段 + 476 段两次提交。
+    {
+        constexpr std::size_t kSmallSeg = 16;
+        constexpr std::size_t kBig = 1500;
+        std::vector<std::uint8_t> small(kBig * kSmallSeg);
+        std::vector<go2cpp::bufio::BatchEntry> be(kBig);
+        for (std::size_t i = 0; i < kBig; ++i) {
+            FillPattern(small.data() + i * kSmallSeg, kSmallSeg, i * 5);
+            be[i].data = reinterpret_cast<const char*>(small.data() + i * kSmallSeg);
+            be[i].size = kSmallSeg;
+        }
+        rd::net::SendResult sr{};
+        CHECK_STATUS(cli.SendBatch(be.data(), kBig, &sr), rd::net::IoStatus::kOk);
+        CHECK_TRUE(cli.last_batch_submitted() == rd::net::kMaxBatchEntries);
+        std::vector<std::uint8_t> got(rd::net::kMaxBatchEntries * kSmallSeg);
+        CHECK_TRUE(ReadFullBytes(peer, got.data(), got.size()) == got.size());
+        CHECK_TRUE(std::memcmp(got.data(), small.data(), got.size()) == 0);
+        const std::size_t rest = kBig - rd::net::kMaxBatchEntries;
+        CHECK_STATUS(cli.SendBatch(be.data() + rd::net::kMaxBatchEntries, rest, &sr),
+                     rd::net::IoStatus::kOk);
+        CHECK_TRUE(cli.last_batch_submitted() == rest);
+        std::vector<std::uint8_t> got2(rest * kSmallSeg);
+        CHECK_TRUE(ReadFullBytes(peer, got2.data(), got2.size()) == got2.size());
+        CHECK_TRUE(std::memcmp(got2.data(), small.data() +
+                                                 rd::net::kMaxBatchEntries * kSmallSeg,
+                               got2.size()) == 0);
+        std::printf("  tcp-limit: count=1500 committed=%zu + %zu\n",
+                    rd::net::kMaxBatchEntries, rest);
+    }
+    ::close(peer);
+
+    // 部分提交（对端慢读）：SO_SNDBUF=4096，64 段 × 1KB 一次提交。
+    {
+        std::uint16_t p2 = 0;
+        const int l2 = MakeListener(&p2);
+        CHECK_TRUE(l2 >= 0);
+        if (l2 >= 0) {
+            rd::net::DialOptions opts;
+            opts.send_buffer_bytes = 4096;
+            opts.tcp_no_delay = true;
+            auto c2_opened =
+                rd::net::StreamSocket::Open(rd::net::Endpoint{"127.0.0.1", p2}, opts);
+            CHECK_TRUE(c2_opened.ok());
+            if (c2_opened.ok()) {
+                rd::net::StreamSocket c2 = std::move(*c2_opened);
+                const int peer2 = AcceptOne(l2);
+                CHECK_TRUE(peer2 >= 0);
+                if (peer2 >= 0) {
+                    rd::net::SendResult sr{};
+                    const auto st = c2.SendBatch(entries.data(), entries.size(), &sr);
+                    std::printf("  tcp-partial: status=%s submitted=%zu/%zu "
+                                "transferred=%zu (SO_SNDBUF=4096, 对端不读)\n",
+                                rd::net::IoStatusName(st), c2.last_batch_submitted(),
+                                entries.size(), c2.last_transferred());
+                    CHECK_STATUS(st, rd::net::IoStatus::kWouldBlock);
+                    CHECK_TRUE(c2.last_batch_submitted() > 0);
+                    CHECK_TRUE(c2.last_batch_submitted() < entries.size());
+                    CHECK_TRUE(c2.last_transferred() >=
+                               c2.last_batch_submitted() * kSeg);
+                    CHECK_TRUE(c2.last_transferred() <
+                               (c2.last_batch_submitted() + 1) * kSeg);
+                    std::vector<std::uint8_t> got(c2.last_transferred());
+                    CHECK_TRUE(ReadFullBytes(peer2, got.data(), got.size()) ==
+                               got.size());
+                    CHECK_TRUE(std::memcmp(got.data(), block.data(), got.size()) == 0);
+                    ::close(peer2);
+                }
+                c2.Close();
+            }
+            ::close(l2);
+        }
+    }
+
+    // 3 轮对比：批量 64 段 vs 64 次单条 Send（只计发送阶段）。
+    constexpr int kRounds = 100;
+    double batched_ns[3] = {0, 0, 0};
+    double batched_mib[3] = {0, 0, 0};
+    double single_ns[3] = {0, 0, 0};
+    double single_mib[3] = {0, 0, 0};
+    for (int round = 0; round < 3; ++round) {
+        const TcpBatchBench b = RunTcpBatchBench(true, kRounds, kEntries, kSeg);
+        const TcpBatchBench s = RunTcpBatchBench(false, kRounds, kEntries, kSeg);
+        batched_ns[round] = b.ns_per_segment;
+        batched_mib[round] = b.mib_per_s;
+        single_ns[round] = s.ns_per_segment;
+        single_mib[round] = s.mib_per_s;
+        std::printf(
+            "  round %d: batch ns/seg=%.1f %.1f MiB/s (rounds=%d) | "
+            "single ns/seg=%.1f %.1f MiB/s (rounds=%d)\n",
+            round + 1, b.ns_per_segment, b.mib_per_s, b.rounds, s.ns_per_segment,
+            s.mib_per_s, s.rounds);
+        if (b.rounds != kRounds || s.rounds != kRounds) {
+            std::printf("  [FAIL-BATCH] TCP bench 未跑满：batch=%d single=%d\n",
+                        b.rounds, s.rounds);
+        }
+    }
+    const auto avg = [](const double (&v)[3]) { return (v[0] + v[1] + v[2]) / 3.0; };
+    std::printf("  avg: batch ns/seg=%.1f %.1f MiB/s | single ns/seg=%.1f "
+                "%.1f MiB/s | batch_faster=%s\n",
+                avg(batched_ns), avg(batched_mib), avg(single_ns), avg(single_mib),
+                avg(batched_ns) < avg(single_ns) ? "yes" : "no");
+}
+
 }  // namespace
 
 int main() {
@@ -870,6 +1412,8 @@ int main() {
     Scenario5bHundredSockets();
     Benchmark();
     BatchComparison();
+    Scenario6UdpSendBatch();
+    Scenario7TcpSendBatch();
     std::printf("\n== 汇总: checks=%d failures=%d ==\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

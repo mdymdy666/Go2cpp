@@ -30,6 +30,10 @@ namespace go2cpp::net {
 class Socket;
 }  // namespace go2cpp::net
 
+namespace go2cpp::bufio {
+struct BatchEntry;
+}  // namespace go2cpp::bufio
+
 namespace rd::net {
 
 /// @brief 一次 I/O 操作的状态（四态模型 + 通用错误）。
@@ -46,6 +50,12 @@ enum class IoStatus : std::uint8_t {
 
 /// @brief 返回状态的可读名称，用于日志与测试失败信息；未知值返回 "Unknown"。
 const char* IoStatusName(IoStatus status) noexcept;
+
+/// @brief SendBatch 单次调用允许提交的最大段数（与 go2cpp::net::Socket::kMaxBatch
+///        及内核 IOV_MAX 对齐）。
+/// @note SendBatch 是显式批量入口，**不受** SocketOptions/DialOptions 里
+///       batch_entries 的限制（该配置只影响单条 SendTo/Send 的隐式切段）。
+inline constexpr std::size_t kMaxBatchEntries = 1024;
 
 /// @brief 发送结果。token 是本 socket 上单调递增的发送序号（从 1 开始），
 ///        无论成功、kWouldBlock 还是错误都会分配，便于上层关联完成事件与重试。
@@ -142,6 +152,47 @@ public:
     /// @brief 发送一个数据报。UDP 语义为「全有或全无」，不产生部分发送。
     IoStatus SendTo(ByteView data, const Endpoint& to, SendResult* out);
 
+    /// @brief 设置 SendBatch 的缺省目标端点（只解析地址，不发送数据报）。
+    /// @return kOk；kInvalid 参数非法或对象未打开；errno 见 last_system_error()。
+    IoStatus SetBatchTarget(const Endpoint& to, SendResult* out = nullptr);
+
+    /// @brief 一次 `sendmmsg(2)` 提交多条数据报（显式批量入口，不阻塞）。
+    ///
+    /// @details 目标地址来自最近一次 `SetBatchTarget()` 或 `SendTo()` 解析出的
+    ///          端点；从未设置过目标时返回 `kInvalid`（errno=EDESTADDRREQ）。
+    ///          每条 `entries[i]` 就是**一条独立数据报**，按数组顺序提交；
+    ///          size==0 且 data 非空的段提交为空数据报。
+    ///          始终走 `SocketBatchWriter::SendToBatch`（一次 `sendmmsg`），
+    ///          **不受** `SocketOptions::batch_bytes/batch_entries/
+    ///          enable_sendmmsg` 影响——后者只控制单条 `SendTo` 的隐式切段。
+    ///
+    /// @par 上限与截断
+    ///      单次最多提交 `min(count, kMaxBatchEntries)` 段（kMaxBatchEntries=1024）。
+    ///      超出部分**本次不提交**：返回 `kOk` 时 `last_batch_submitted()` 为
+    ///      1024，调用方应从第 1024 段继续提交。
+    ///
+    /// @par 部分提交规则
+    ///      内核发送缓冲不足时 `sendmmsg` 只提交前 K 条：本函数返回
+    ///      `kWouldBlock`，`last_batch_submitted() == K`（0 < K < 提交上限），
+    ///      表示 `entries[0..K)` 已整条进入内核、`entries[K..)` 均未提交，
+    ///      调用方从第 K 条重试即可（UDP 不会产生半条数据报）。token 仍是
+    ///      本次调用的发送序号，**不**编码段数。
+    ///
+    /// @par 返回值
+    ///      - kOk：提交上限内的段全部提交（`last_batch_submitted()==limit`）；
+    ///      - kWouldBlock：一条都没提交（K==0）或只提交了前 K 条；
+    ///      - kInvalid/kIoError/kReset/kClosed/kTimeout：参数非法或系统错误，
+    ///        errno 见 last_system_error()；非阻塞入口内部不等待，EAGAIN 一律
+    ///        映射成 kWouldBlock。
+    /// @note `count == 0` 是合法 no-op：返回 kOk，不产生系统调用，
+    ///       `last_batch_submitted()==0`，token 仍按调用分配。
+    /// @note entries 只在调用期间借用，本函数不保存指针。
+    IoStatus SendBatch(const go2cpp::bufio::BatchEntry* entries, std::size_t count,
+                       SendResult* out);
+
+    /// @brief 最近一次 SendBatch 已**完整提交**的前缀段数 K。
+    std::size_t last_batch_submitted() const noexcept { return last_batch_submitted_; }
+
     /// @brief 接收一个数据报。缓冲不足时返回 kTruncated，*received 给出**实际报文长度**。
     IoStatus RecvFrom(MutableByteView buf, Endpoint* from, std::size_t* received);
 
@@ -164,6 +215,10 @@ private:
     std::uint32_t batch_bytes_{0};
     std::uint32_t batch_entries_{0};
     bool enable_sendmmsg_{false};
+    /// @brief SendBatch 已完整提交的前缀段数（最近一次调用）。
+    std::size_t last_batch_submitted_{0};
+    /// @brief SendBatch 的缺省目标（SetBatchTarget 或最近一次 SendTo 写入）。
+    Endpoint batch_target_{};
 };
 
 /// @brief TCP 流套接字：非阻塞连接 + 非阻塞收发。
@@ -184,6 +239,38 @@ public:
     /// @brief 发送。可能部分发送：kOk 时用 last_transferred() 取得实发字节数，
     ///        调用方应推进视图后继续发送剩余部分。
     IoStatus Send(ByteView data, SendResult* out);
+
+    /// @brief 一次 `writev(2)` 提交全部段（显式批量入口，不阻塞）。
+    ///
+    /// @details 所有段按数组顺序写入同一字节流，等价于把各段拼成一块后一次
+    ///          `write`，但保留段边界、不需要调用方先拷贝成大缓冲。始终走
+    ///          `SocketBatchWriter::WriteBatch`，**不受** `DialOptions::batch_*`
+    ///          与 `enable_writev` 影响——后者只控制单条 `Send` 的隐式切段。
+    ///
+    /// @par 上限与截断
+    ///      单次最多提交 `min(count, kMaxBatchEntries)` 段（1024）；超出部分
+    ///      本次不提交，返回 `kOk` 且 `last_batch_submitted()==1024`。
+    ///
+    /// @par 部分提交规则
+    ///      对端读得慢、发送缓冲放不下全部段时，`writev` 只写入前若干字节：
+    ///      - 返回 `kWouldBlock`；
+    ///      - `last_batch_submitted() == K`：`entries[0..K)` 已**整段**写入；
+    ///      - `last_transferred()` 为实际写入的总字节数，满足
+    ///        `prefix(K) <= last_transferred() < prefix(K+1)`，其中
+    ///        `prefix(K)` 是前 K 段字节和；
+    ///      - 调用方应从第 K 段继续，并把该段起点前移
+    ///        `last_transferred() - prefix(K)` 字节（该段可能已被部分写入）。
+    ///      `kOk` 表示提交上限内的段全部写入（`last_batch_submitted()==limit`）。
+    ///
+    /// @par 其它
+    ///      - `count == 0`：kOk no-op，不产生系统调用；
+    ///      - 内部 timeout=0，不等待、不重试；EAGAIN 映射成 kWouldBlock；
+    ///      - entries 仅借用，不保存指针。
+    IoStatus SendBatch(const go2cpp::bufio::BatchEntry* entries, std::size_t count,
+                       SendResult* out);
+
+    /// @brief 最近一次 SendBatch 已**整段提交**的前缀段数 K。
+    std::size_t last_batch_submitted() const noexcept { return last_batch_submitted_; }
 
     /// @brief 接收。返回 0 字节且无错误 → kClosed（FIN）；ECONNRESET → kReset。
     IoStatus Recv(MutableByteView buf, std::size_t* received);
@@ -211,6 +298,8 @@ private:
     std::uint32_t batch_bytes_{0};
     std::uint32_t batch_entries_{0};
     bool enable_writev_{false};
+    /// @brief SendBatch 已整段提交的前缀段数（最近一次调用）。
+    std::size_t last_batch_submitted_{0};
 };
 
 /// @brief 最小 Result：成功时持有 T，失败时带 IoStatus + errno。

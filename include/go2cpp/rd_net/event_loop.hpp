@@ -6,8 +6,10 @@
 /// @details 职责边界：
 ///          - **单线程**：本类不建线程。Run() 阻塞在调用它的线程上，所有 IO /
 ///            定时器 / Post 回调都在该线程执行，上层不需要加锁；
-///          - **不解析协议**：收到的数据报/流字节原样交给 Protocol / StreamProtocol
-///            回调，本层不认魔法数、不分帧、不做重排或重传决策（属于 REQ-008/REQ-009）；
+///          - **不解析协议**：收到的数据报/流字节原样交给统一的
+///            `rd::net::Protocol` / `rd::net::StreamProtocol` 事件循环层回调
+///            （定义见 protocol.hpp），本层不认魔法数、不分帧、不做重排或重传决策
+///            （属于 REQ-008/REQ-009）；
 ///          - **平台**：Linux/POSIX 为验收实现（poll(2) + eventfd(2)）；_WIN32 分支
 ///            只有占位，Create() 返回 IoStatus::kInvalid。socket.hpp 没有
 ///            kUnsupported，本层不新增枚举值，以免改动 REQ-006 产物；
@@ -26,6 +28,10 @@
 ///
 ///          线程安全：只有 Post() 与 Stop() 允许从其它线程调用；其余接口必须在
 ///          Run() 之前或 loop 线程内调用。
+///
+///          依赖方向：本头 include protocol.hpp（后者只前置声明 EventLoop），
+///          `rd::net::Protocol` / `rd::net::StreamProtocol` 只有单一来源，不再有
+///          占位定义，也无头文件循环。
 
 #include <atomic>
 #include <chrono>
@@ -34,6 +40,7 @@
 #include <functional>
 #include <memory>
 
+#include "go2cpp/rd_net/protocol.hpp"
 #include "go2cpp/rd_net/socket.hpp"
 
 namespace rd::net {
@@ -41,47 +48,6 @@ namespace rd::net {
 /// @brief 事件循环使用的单调时钟（不受系统时间调整影响）。
 using EventClock = std::chrono::steady_clock;
 using EventTimePoint = EventClock::time_point;
-
-class EventLoop;
-
-/// @brief REQ-008 的协议上下文。本层只做前向声明，接口由 REQ-008 定义。
-class ProtocolContext;
-
-/// @brief UDP 协议插件的最小接口（REQ-007 版本）。
-/// @details REQ-008 将把 ProtocolContext& 注入回调，并补上 OnTimer /
-///          OnSendComplete / OnDetached(DetachReason) 等语义；本版只声明事件循环
-///          真正会调用的方法，不在 REQ-007 里实现 REQ-008 的细节。
-class Protocol {
-public:
-    virtual ~Protocol() = default;
-
-    /// @brief 绑定到事件循环后回调一次（loop 线程），handler 可在此调度自己的定时器。
-    virtual void OnAttached(EventLoop& loop) { (void)loop; }
-
-    /// @brief 收到一个数据报。data 是借用视图，回调返回后失效。
-    virtual void OnDatagram(ByteView data, const Endpoint& from) = 0;
-
-    /// @brief 从事件循环解绑或 socket 因错误被摘除后回调一次。
-    virtual void OnDetached() {}
-};
-
-/// @brief TCP 流协议插件的最小接口（REQ-007 版本，REQ-008 再扩展）。
-class StreamProtocol {
-public:
-    virtual ~StreamProtocol() = default;
-
-    /// @brief 绑定到事件循环后回调一次（loop 线程）。
-    virtual void OnAttached(EventLoop& loop) { (void)loop; }
-
-    /// @brief 收到一段字节。data 是借用视图，回调返回后失效。
-    virtual void OnData(ByteView data) = 0;
-
-    /// @brief 对端关闭/重置（随后会自动 Detach，并回调 OnDetached）。
-    virtual void OnClosed() {}
-
-    /// @brief 从事件循环解绑后回调一次。
-    virtual void OnDetached() {}
-};
 
 /// @brief 单线程事件循环（poll(2) + 最小堆定时器 + eventfd 跨线程唤醒）。
 class EventLoop {
