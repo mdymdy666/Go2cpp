@@ -40,6 +40,25 @@
     box-shadow: 0 14px 44px rgba(0, 0, 0, .55);
   }
   video { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .ctlbar {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 2;
+    display: flex; align-items: center; gap: 10px;
+    padding: 18px 12px 8px;
+    background: linear-gradient(to top, rgba(0, 0, 0, .82), rgba(0, 0, 0, 0));
+  }
+  .cbtn {
+    min-width: 58px; height: 30px; padding: 0 10px;
+    color: var(--text); background: rgba(16, 19, 27, .88);
+    border: 1px solid var(--line); border-radius: 8px;
+    font-size: 13px; cursor: pointer;
+  }
+  .cbtn:hover { border-color: var(--pink); }
+  .ctime {
+    color: #dfe4f0; font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+  }
+  .player:fullscreen { aspect-ratio: auto; width: 100vw; height: 100vh; border-radius: 0; }
   #stage {
     position: absolute; inset: 0;
     overflow: hidden;
@@ -139,8 +158,15 @@
   </header>
 
   <div class="player" id="player">
-    <video id="video" src="demo.mp4" controls autoplay muted loop playsinline preload="auto"></video>
+    <video id="video" src="demo.mp4" autoplay muted loop playsinline preload="auto"></video>
     <div id="stage" aria-hidden="true"></div>
+    <div class="ctlbar" id="ctlbar">
+      <button type="button" class="cbtn" id="btn-play" title="播放/暂停">暂停</button>
+      <span class="ctime" id="time">0:00 / 0:00</span>
+      <span class="spacer"></span>
+      <button type="button" class="cbtn" id="btn-mute" title="静音切换">取消静音</button>
+      <button type="button" class="cbtn" id="btn-full" title="全屏">全屏</button>
+    </div>
   </div>
 
   <div class="toolbar">
@@ -199,7 +225,9 @@
   var SIZES = { small: 16, medium: 22, large: 30 };
   var SPEEDS = { slow: 13, medium: 8, fast: 5 };   // 横穿屏幕耗时（秒）
   var MAX_ITEMS = 5000;
-  var FIRE_BUDGET = 4;                            // 每帧最多上屏条数，防刷屏
+  var GUARD_TOLERANCE = 0.25;                     // 进度守卫允许误差（秒）
+  var REWIND_GRACE_MS = 2000;                     // 跳变后补播窗口（毫秒）
+  var STAGGER_MS = 40;                            // 同刻多条错峰（毫秒）
 
   // ---- DOM ----------------------------------------------------------------
   var video = document.getElementById('video');
@@ -215,15 +243,25 @@
   var historyNote = document.getElementById('history-note');
   var form = document.getElementById('sender');
   var swatches = document.getElementById('swatches');
+  var player = document.getElementById('player');
+  var timeEl = document.getElementById('time');
+  var btnPlay = document.getElementById('btn-play');
+  var btnMute = document.getElementById('btn-mute');
+  var btnFull = document.getElementById('btn-full');
 
   // ---- 状态 ---------------------------------------------------------------
   var items = [];          // 全部弹幕 {id,text,time_ms,color}
   var seen = new Set();    // 去重
-  var fired = new Set();   // 本轮循环已上屏
-  var pending = [];        // 等待 time_ms 到达
+  var fired = new Set();   // 本轮已上屏/已丢弃
+  var timers = [];         // 每条弹幕一个 setTimeout id
   var active = [];         // 正在滚动 {el,x,w,lane}
   var laneLast = [];       // 每条轨道最后一个弹幕
   var lastTime = 0;        // 上一帧视频时间
+  var guardTime = 0;       // 允许的播放进度（秒）
+  var restoring = false;   // 正在把进度拉回 guardTime
+  var slotLastTs = -1;     // 本批同刻错峰游标
+  var slotStagger = 0;
+  var overdueStagger = 0;
   var onlineCount = 0;
   var ws = null;
   var reconnectTimer = 0;
@@ -273,8 +311,11 @@
       color: Number.isFinite(color) ? ((color >>> 0) & 0xffffff) : 0xffffff
     };
     items.push(d);
-    pending.push(d);
     if (items.length > MAX_ITEMS) items.splice(0, 1000);
+    // 新弹幕：按当前进度单独排一条；超出补播窗口的直接丢弃
+    var nowMs = (video.currentTime || 0) * 1000;
+    if (d.time_ms < nowMs - REWIND_GRACE_MS) fired.add(d.id);
+    else scheduleOne(d, nowMs, false);
     return d;
   }
 
@@ -344,45 +385,180 @@
     laneLast = [];
   }
 
-  function fireDue(nowMs) {
-    if (!pending.length) return;
-    var remain = [];
-    var budget = FIRE_BUDGET;
-    for (var i = 0; i < pending.length; i++) {
-      var d = pending[i];
-      if (fired.has(d.id)) continue;
-      if (d.time_ms > nowMs) { remain.push(d); continue; }
-      if (!showToggle.checked) { fired.add(d.id); continue; }
-      if (budget <= 0) { remain.push(d); continue; }
-      if (spawn(d)) { budget--; fired.add(d.id); }
-      else { remain.push(d); }
+  function clearTimers() {
+    for (var i = 0; i < timers.length; i++) clearTimeout(timers[i]);
+    timers = [];
+  }
+
+  // 单条弹幕上屏
+  function show(d) {
+    if (fired.has(d.id)) return;
+    if (!showToggle.checked) { fired.add(d.id); return; }
+    if (!spawn(d)) {
+      if (!d._retry) { d._retry = true; schedule(d, 100); }
+      return;
     }
-    pending = remain;
+    fired.add(d.id);
+  }
+
+  function schedule(d, delay) {
+    var tid = setTimeout(function () {
+      var at = timers.indexOf(tid);
+      if (at >= 0) timers.splice(at, 1);
+      show(d);
+    }, Math.max(0, delay));
+    timers.push(tid);
+  }
+
+  // 按 time_ms 相对当前进度排一条；batched 时同刻/已到期错开 40ms
+  function scheduleOne(d, nowMs, batched) {
+    var delay;
+    if (d.time_ms <= nowMs) {
+      delay = batched ? overdueStagger : 0;
+      if (batched) overdueStagger += STAGGER_MS;
+    } else {
+      delay = d.time_ms - nowMs;
+      if (batched) {
+        if (d.time_ms === slotLastTs) slotStagger += STAGGER_MS;
+        else { slotLastTs = d.time_ms; slotStagger = 0; }
+        delay += slotStagger;
+      }
+    }
+    schedule(d, delay);
+  }
+
+  // 进度跳变（含回退）后重建：清定时器、清屏，按新进度重排
+  function rebuild(nowMs) {
+    clearTimers();
+    clearStage();
+    fired.clear();
+    slotLastTs = -1;
+    slotStagger = 0;
+    overdueStagger = 0;
+    var list = items.slice().sort(function (a, b) { return a.time_ms - b.time_ms; });
+    for (var i = 0; i < list.length; i++) {
+      var d = list[i];
+      if (d.time_ms < nowMs - REWIND_GRACE_MS) {
+        fired.add(d.id);              // 太旧的不补播，绝不批量跳出
+        continue;
+      }
+      scheduleOne(d, nowMs, true);
+    }
   }
 
   // ---- 主循环：按 video.currentTime 驱动 -----------------------------------
   function tick() {
     var vt = video.currentTime || 0;
     var jump = vt - lastTime;
-    if (jump < -0.5) {
-      // video 循环回放（loop），清空本轮已上屏状态
-      fired.clear();
-      clearStage();
-      pending = items.slice();
-    } else if (jump > 0.5) {
-      // 用户拖动进度条：跳过 1.2s 之前的弹幕，避免一次性刷屏
-      var cutoff = vt * 1000 - 1200;
-      for (var i = 0; i < pending.length; i++) {
-        if (pending[i].time_ms < cutoff) fired.add(pending[i].id);
-      }
-      pending = pending.filter(function (d) { return !fired.has(d.id); });
-    }
+    // 任何跳变（拖动/循环/回退）都按新进度重建，绝不批量补播
+    if (Math.abs(jump) > 0.5) rebuild(vt * 1000);
     var dt = Math.min(0.2, Math.max(0, jump));
     lastTime = vt;
     if (!video.paused) advance(dt);
-    fireDue(vt * 1000);
     requestAnimationFrame(tick);
   }
+
+  // ---- 自建控制条 / 进度守卫 ----------------------------------------------
+  function fmtTime(sec) {
+    var s = Math.max(0, Math.floor(sec || 0));
+    var m = Math.floor(s / 60);
+    return m + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  function updateTimeUi() {
+    timeEl.textContent = fmtTime(video.currentTime) + ' / ' + fmtTime(video.duration);
+  }
+
+  function updatePlayBtn() {
+    btnPlay.textContent = video.paused ? '播放' : '暂停';
+  }
+
+  function updateMuteBtn() {
+    btnMute.textContent = video.muted ? '取消静音' : '静音';
+  }
+
+  function updateFullBtn() {
+    btnFull.textContent = document.fullscreenElement ? '退出全屏' : '全屏';
+  }
+
+  btnPlay.addEventListener('click', function () {
+    if (video.paused) {
+      var p = video.play();
+      if (p && p.catch) p.catch(function () {});
+    } else {
+      video.pause();
+    }
+  });
+
+  btnMute.addEventListener('click', function () {
+    video.muted = !video.muted;
+    updateMuteBtn();
+  });
+
+  btnFull.addEventListener('click', function () {
+    try {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else if (player.requestFullscreen) {
+        var p = player.requestFullscreen();
+        if (p && p.catch) p.catch(function () {});
+      }
+    } catch (e) {}
+  });
+
+  video.addEventListener('play', updatePlayBtn);
+  video.addEventListener('pause', updatePlayBtn);
+  video.addEventListener('volumechange', updateMuteBtn);
+  video.addEventListener('loadedmetadata', updateTimeUi);
+  video.addEventListener('durationchange', updateTimeUi);
+  document.addEventListener('fullscreenchange', updateFullBtn);
+
+  // 进度守卫：只允许自然播放；seeking 超出误差就拉回 guardTime
+  video.addEventListener('timeupdate', function () {
+    if (!video.seeking) guardTime = video.currentTime || 0;
+    updateTimeUi();
+  });
+
+  video.addEventListener('seeking', function () {
+    if (restoring) return;
+    var vt = video.currentTime || 0;
+    var dur = Number(video.duration) || 0;
+    // loop 回放：结尾跳回 0 属于正常循环，放行并同步水位
+    if (vt < 0.5 && dur > 0 && guardTime > dur - 1.5) {
+      guardTime = vt;
+      return;
+    }
+    if (Math.abs(vt - guardTime) > GUARD_TOLERANCE) {
+      restoring = true;
+      video.currentTime = guardTime;
+      flash('不能跳过进度', 'bad');
+      setTimeout(function () { restoring = false; }, 400);
+    }
+  });
+
+  video.addEventListener('seeked', function () {
+    if (restoring) return;
+    lastTime = video.currentTime || 0;
+    rebuild(lastTime * 1000);
+  });
+
+  // 右键菜单会暴露原生进度/倍速入口，直接禁用
+  player.addEventListener('contextmenu', function (ev) {
+    ev.preventDefault();
+  });
+
+  // 倍速强制 1，左右方向键禁止原生快进/快退
+  video.addEventListener('ratechange', function () {
+    if (video.playbackRate !== 1) video.playbackRate = 1;
+  });
+  try { video.playbackRate = 1; } catch (e) {}
+
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+    var t = ev.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' ||
+              t.tagName === 'SELECT' || t.isContentEditable)) return;
+    ev.preventDefault();
+  });
 
   // ---- WebSocket ----------------------------------------------------------
   function connect() {
@@ -407,7 +583,7 @@
       if (msg.type === 'danmaku') {
         var d = ingest(msg);
         if (d) {
-          // time_ms 已过 → 下一帧立刻上屏（fireDue 处理）
+          // ingest 已按 time_ms 排入 setTimeout，到点自动上屏
           flash('收到弹幕：' + d.text, 'ok');
         }
       } else if (msg.type === 'online') {
@@ -447,6 +623,7 @@
           // 已经过去很久的历史弹幕不补播，等下一轮循环再出现
           if (d.time_ms < nowMs - 3000) fired.add(d.id);
         }
+        rebuild(video.currentTime * 1000);   // 历史到齐后统一按当前进度重建
         historyNote.textContent = '历史弹幕 ' + added + ' 条';
       })
       .catch(function (err) {
@@ -523,6 +700,12 @@
   });
 
   // ---- 启动 ---------------------------------------------------------------
+  guardTime = video.currentTime || 0;
+  lastTime = guardTime;
+  updateTimeUi();
+  updatePlayBtn();
+  updateMuteBtn();
+  rebuild(guardTime * 1000);
   loadHistory();
   connect();
   requestAnimationFrame(tick);
