@@ -43,19 +43,19 @@
 | v3-审查 | 三件套（架构/汇编/正确性+性能） | ✅ d3af2db（docs/reports/rdnet-v3-review.md） |
 | C1 | 抖音骨架 + IDL | ✅ 89ccb58 |
 | C2 | user 服务（存储/鉴权/4 接口） | ✅ 3ff147f：25 PASS；QPS 1918.5、p50 4.04ms、p99 7.55ms |
-| C3–C10 | 抖音 video/feed/interaction/search/live/gateway/验收/可靠性 | ⏸ 暂停（转向 B 站复刻） |
+| C3–C10 | 抖音 video/feed/interaction/search/live/gateway/验收/可靠性 | 🔄 进行中（C3+C4 = `7767cd2c`） |
 | 通用组件 | singleflight + 一致性哈希 + Gateway | ✅ 93864a6（singleflight 80.6 ns/op、一致性哈希 13.1 ns/op）+ 50a2abf（Gateway checks=50） |
 | B-REQ | B 站复刻需求文档 | ✅ 2a9d43a（255 行） |
-| B1–B4 | B 站实现（存储/用户 → 视频/播放 → 弹幕 WS → 压测） | ⏳ 下一个 B1（4ff5f73f 在跑） |
+| B1–B4 | B 站实现（存储/用户 → 视频/播放 → 弹幕 WS → 压测） | ⏸ 暂停（用户 17:55：应用层抖音优先）；需求文档保留 |
 
 ## 下一个任务
 
-**B1 B 站存储 + 用户（下一个，4ff5f73f 在跑）**：
-1. `app/bilibili/`：bili_http（复制 douyin）、bili_store（SQLite WAL + 5 表）、bili_auth（复制 douyin）；
-2. user_service（29201）：注册/登录/资料/大会员（vip 到期时间）；
-3. 验收：4 条 curl + 409/401/404 + 100 并发注册 + 1000 次压测；
-4. 数据回写 `app/bilibili/REQUIREMENTS.md`。
-注：抖音 C3-C10 暂停；B 站完成后回抖音或继续 B2-B4。
+**C3+C4 抖音 video + feed（下一个，7767cd2c 在跑）**：
+1. 扩展 `douyin_store`：videos 表 + `CreateVideo/FindVideo/ListByUser/DeleteVideo/ListFeed/ListFollowingFeed`（热度公式 + cursor）；
+2. video_service（29102）：发布/详情/我的/删除（403/404/400）；
+3. feed_service（29103）：推荐流（时间+热度）、关注流、分页不重不漏；
+4. 验收：5+ 场景 + 25 条分页验证 + 1000 次压测。
+注：B 站方案已暂停（用户：应用层抖音优先）；B1 agent 已停，需求文档 `2a9d43a` 保留。
 
 ## 本轮记录
 
@@ -94,3 +94,5 @@
 
 - 17:20 **通用组件收口**：`50a2abf` Gateway（注册式路由/中间件/Resolver/JSON 热更新，checks=50、QPS 2206.5）；`93864a6` singleflight + 一致性哈希（80.6/13.1 ns/op）。
 - 17:40 **转向 B 站复刻**：用户确认「B 站弹幕+播放+会员」核心闭环；需求文档 `app/bilibili/REQUIREMENTS.md` 255 行（5 表、WS 协议、7 场景、B1-B4）提交 `2a9d43a`；B1（存储+用户）派 `4ff5f73f`。
+
+- 17:55 **抖音恢复优先**（用户决定）：B 站 B1（`4ff5f73f`）已停，B 站需求文档保留；恢复抖音 C3+C4（`7767cd2c`：扩展 store videos + video_service + feed_service + 分页/压测）。
