@@ -1949,7 +1949,36 @@ struct Fiber::Impl {
         std::terminate();
     }
 
+    /**
+     * @brief 把已挂起的 Fiber 恢复执行，直到它再次挂起或运行结束。
+     *
+     * @return
+     * - true：本次完整执行了一段，Fiber 已再次挂起或进入终态——调用方**必须**重新读取 `state()` 再决定后续；
+     * - false：状态不允许（Running/终态/并发 resume）——调用方**不要**重试，这是 owner 生命周期契约被违反的信号。
+     *
+     * ## 定位
+     * Fiber 执行流的**唯一恢复点**（用户 `Fiber::resume()` 与调度器 `resume_from_scheduler()` 共用这套热/慢路径）。
+     * 写错会怎样：两个线程同时切进同一栈 → 栈与 errno 数据损坏；漏绑父级 → 取消链断裂，取消请求传不到子 Fiber。
+     *
+     * ## 步骤
+     * step1. 一次 acquire load 读状态字。
+     * step2. 检查可增长栈所需的 TLS 前提。
+     * step3. 快路径：Suspended + 无 claim + 父级匹配则直接切换。
+     * step4. 否则走慢路径，做并发检测与父级绑定。
+     * step5. 契约：并发 resume 直接失败，不排队。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：同一 Fiber 的调用必须串行；只能在 owner 存活期内调用。
+     * - 原子性：状态与 claim 位打包在 `m_switch` 一个字里，用 acquire/release 发布。
+     * - 失败语义：noexcept；失败时不做任何状态修改，Fiber 保持原状。
+     * - 不变量：返回 true 时当前线程一定从该 Fiber 的上下文中切回，且 errno 已按线程恢复。
+     */
     GO2CPP_FIBER_HOT bool resume() noexcept {
+        // step1: 一次 acquire load 取 `kStateMask|kClaimBit` 打包字，未竞争时不再付 lock cmpxchg。
+        // step2: 可增长栈要求当前线程已装备用信号栈（TLS 缓存，每线程只安装一次），不满足就不进快路径。
+        // step3: 状态为 Suspended、无并发 claim、父级就是当前 Fiber 时走 resume_fast，跳过 claim CAS 与两次 acquire load。
+        // step4: 条件不满足交给 resume_slow：负责并发检测（Running 可见即失败）、父级绑定与状态发布。
+        // step5: 同一 Fiber 的 resume 必须串行，本函数不排队第二个 resume，而是直接拒绝。
         // 热路径（顺序 resume 的稳态）：已挂起、没有并发 resume 在飞、
         // 调用者就是首次绑定的父级。三个条件都只要普通 load。
         //
@@ -2517,9 +2546,40 @@ Fiber::Fiber(Function function, std::size_t stack_size,
     : m_impl(std::make_unique<Impl>(this, std::move(function), stack_size,
                                    stack_reserve_size, stack_growable)) {}
 
+/**
+ * @brief 为调度器取一个可复用的 Fiber（本线程池优先，池空则新建）。
+ *
+ * @param function [in] 新 Fiber 的主体——所有权移交给本函数（move）；空可调用对象执行时被跳过。
+ * @param stack_size [in] 栈大小（字节）——0 表示沿用默认；超出平台限制由 Impl 抛异常。
+ * @param bin_capacity [in] 每线程池容量（个数）——0 表示默认 32；上限 4096，超过按上限钳制。
+ * @param stack_reserve_size [in] 可增长栈保留区大小（字节）——0 表示平台默认。
+ * @param stack_growable [in] 是否启用可增长栈——true 时首次 resume 需装备用信号栈。
+ *
+ * @return 非空 unique_ptr——调用方拥有所有权，用完后必须交回 `RecycleForScheduler` 或让其析构；**不要**直接 delete。
+ *
+ * ## 定位
+ * 调度器创建 Fiber 的**唯一分配点**，也是「复用失败不污染池」的守门人。写错会怎样：重绑定失败的对象被放回池 →
+ * 下一个 G 继承脏状态（父记录/栈标记）；容量无界 → 池只增不减。
+ *
+ * ## 步骤
+ * step1. 容量钳制（默认值、上限、槽数三重限制）。
+ * step2. 池非空则 LIFO 取栈顶对象。
+ * step3. 重绑定闭包与栈参数，失败即丢弃该对象。
+ * step4. 池空时新建。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：只能在目标线程上调用（池是 thread_local）。
+ * - 原子性：无跨线程共享状态，不需要锁。
+ * - 失败语义：重绑定异常被吞掉并回退到新建；新建失败时异常向调用方传播。
+ * - 不变量：返回的对象一定已完成重置，可直接 resume。
+ */
 std::unique_ptr<Fiber> Fiber::AcquireForScheduler(
     Function function, std::size_t stack_size, std::size_t bin_capacity,
     std::size_t stack_reserve_size, bool stack_growable) {
+    // step1: bin_capacity=0 取默认 32，上限 kMaxFiberBinCapacity，再受定长槽 FiberBin::kSlots 限制。
+    // step2: 本线程 FiberBin 非空时弹栈顶（LIFO 复用最近释放的栈，保留缓存热度与已映射页）。
+    // step3: reset_for_scheduler 重置闭包、栈尺寸与可增长标志；抛出时丢弃该对象走新构造，绝不把状态不明的 Fiber 放回池。
+    // step4: 池空时 make_unique 新建（首次运行才真正建栈）。
     const auto capacity = std::min(
         kMaxFiberBinCapacity,
         bin_capacity == 0 ? kDefaultFiberBinCapacity : bin_capacity);
@@ -2541,8 +2601,38 @@ std::unique_ptr<Fiber> Fiber::AcquireForScheduler(
                                    stack_reserve_size, stack_growable);
 }
 
+/**
+ * @brief 回收一个已结束的 Fiber：能缓存就入本线程池，否则析构。
+ *
+ * @param fiber [in] 待回收对象——所有权移交给本函数；nullptr 直接返回。
+ * @param bin_capacity [in] 池容量（个数）——0 表示默认 32；上限 4096。
+ *
+ * @return 无返回值（void，noexcept）——调用方交出所有权后**不得**再访问该指针。
+ *
+ * ## 定位
+ * Fiber 回收的**唯一入口**，决定对象留在池里还是析构。写错会怎样：嵌套子 Fiber 仍持有 parent 记录时复用，
+ * 下一个 G 会看到上一个 G 的取消链与栈元数据（跨任务污染 + 取消误触发）。
+ *
+ * ## 步骤
+ * step1. 空指针返回。
+ * step2. 容量钳制。
+ * step3. 准入判定（终态 / 非当前执行 / 记录独占）。
+ * step4. 槽未满则移动入池。
+ * step5. 槽满则析构，栈仍由栈缓存回收。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：只能在 Fiber 所属线程上调用（池是 thread_local）。
+ * - 原子性：状态与引用计数读取是 acquire load；入池本身无锁（单线程）。
+ * - 失败语义：noexcept；任何不满足准入的情况都只是「不缓存」，不影响正确性。
+ * - 不变量：被缓存的 Fiber 一定是 Completed/Failed 且无外部引用。
+ */
 void Fiber::RecycleForScheduler(std::unique_ptr<Fiber> fiber,
                                 std::size_t bin_capacity) noexcept {
+    // step1: 空指针直接返回（noexcept，不做任何清理假设）。
+    // step2: 容量钳制规则与 AcquireForScheduler 一致，capacity==0 表示关闭缓存。
+    // step3: 只有 Completed/Failed、不是当前正在执行的 Fiber、且 m_record 引用计数为 1 才可回收；嵌套子 Fiber 仍持有 parent 时复用会污染下一项任务。
+    // step4: 在定长槽内联存放，count 未满就把 unique_ptr 移入槽位，全程零堆分配。
+    // step5: 槽满时 unique_ptr 析构该 Fiber，栈仍由 FiberStack 的栈缓存回收。
     if (!fiber) {
         return;
     }

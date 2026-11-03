@@ -2492,10 +2492,38 @@ public:
         notify_all_workers();
     }
 
-    // sysmon 只做可逆的资源记账：它不会从别的线程跳转或终止正在
-    // syscall 中的 C++ 栈。达到阈值后，M 继续执行原生调用，但从 P 的
-    // attached 计数中移除，并按阻塞数申请替代 M。
+    /**
+     * @brief 周期性巡检阻塞中的 M，把长时间 syscall 的 M 从 P 上逻辑解绑并按需补充 M。
+     *
+     * @param scheduler [in] 目标调度器——不可为 nullptr；仅借用，sysmon 线程保证其生命周期覆盖本调用。
+     *
+     * @return 无返回值（void）——调用方（`sysmon_loop`）直接进入下一拍，无需检查结果。
+     *
+     * ## 定位
+     * 长 syscall 解绑的**唯一提交点**：只有它把 M 的 `processor_detached` 置位并扣减 P 的
+     * `active_machines`。漏扫会让阻塞在 syscall 中的 M 永久占住 P，可运行 G 等不到 M 而饥饿；
+     * 误扫则会把正在执行用户代码的 M 标成 detached，同一 P 被两个 M 执行而数据竞争。
+     *
+     * ## 步骤
+     * step1. 入口校验，心跳先于主锁更新。
+     * step2. try_lock 主锁，失败置重试位后返回。
+     * step3. 只挑 kBlocking 且超阈值的 M。
+     * step4. 逻辑解绑并扣减 P 的 active_machines。
+     * step5. 锁外补充 M 并唤醒空闲 worker。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：只在 sysmon 线程执行；不得在持 P 锁或 admission 锁时调用。
+     * - 原子性：各字段独立原子操作，整轮扫描不是原子的；`processor_detached` 是只置一次的门。
+     * - 失败语义：noexcept；拿不到主锁即返回，本轮不改变任何 M 状态，等下一拍重试。
+     * - 安全性：只做可逆的资源记账（观察 + 摘 P），绝不从别的线程跳转或终止正在 syscall 中的 C++ 栈。
+     * - 不变量：同一 M 的同一段阻塞最多被解绑一次。
+     */
     void sysmon_pass(Scheduler* scheduler) noexcept {
+        // step1: 没有 scheduler 或 sysmon 关闭时直接返回；先更新心跳，保证高负载下即使本轮抢不到锁，外部仍能观察到 monitor 在线。
+        // step2: try_lock 抢主锁；抢不到只置 sysmon_retry_pending，让 monitor 下一拍提前重试，绝不把一次锁竞争当成本轮扫描完成。
+        // step3: 遍历 machines，只看 state==kBlocking、blocking_since_ns 有效、阻塞时长达到 long_syscall_threshold 且尚未解绑的 M。
+        // step4: 置 processor_detached、累加 long_syscall_count、扣减该 P 的 active_machines；减到 0 且未 stopping 时把 P 置 kIdle，这个 P 才能被别的 M 接管。
+        // step5: 有解绑则在锁外 maybe_grow 申请替代 M，再 notify_all_workers 唤醒空闲 M 接手空出的 P。
         if (!scheduler || !config.enable_sysmon) {
             return;
         }
@@ -3797,7 +3825,40 @@ namespace {
 
 }  // namespace
 
+/**
+ * @brief 把一个尚未运行的 task 提交到调度器的可运行队列，并完成 owner/存活计数绑定。
+ *
+ * @param task [in] 待提交任务——可为 nullptr（返回 false）；仅借用 shared_ptr，函数内部通过队列节点延长生命周期。
+ *
+ * @return
+ * - true：已发布到本地环/incoming/全局队列或救援链——调用方**必须**把它当作已可运行，不要再自行入队；
+ * - false：被 admission 拒绝、已终态或分配失败（必要时已就地取消）——调用方**不要**盲目重试，按取消或错误路径处理。
+ *
+ * ## 定位
+ * 提交热路径的**唯一入口**：`go()`、外部唤醒、requeue 最终都汇到这里。写错会怎样：丢 `m_queued` 位
+ * → 唤醒永久丢失、G 卡在 Runnable；锁序颠倒（incoming 条带锁嵌 admission）→ 与 shutdown 反向嵌套死锁（SCHED-02）。
+ *
+ * ## 步骤
+ * step1. 入口校验：空指针 / 无 impl / 已终态直接拒绝。
+ * step2. 锁序守卫与目标 P 选择（决定存活计数分片）。
+ * step3. admission 门槛：关闭期只放行取消恢复，其余就地取消收尾。
+ * step4. 状态预占：只接受 kNew/kRunnable，`prepare_enqueue` 绑定 owner 与取消门。
+ * step5. 入队分流：worker 走 admission 锁，外部生产者走无锁直投 → incoming 条带 → 救援链。
+ * step6. 唤醒与维护：按摊销票触发 maybe_grow，最后 notify_worker。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；不得在持有 incoming 条带锁时调用（会触发 SCHED-02 报告）。
+ * - 原子性：`prepare_enqueue` 的 `m_queued` 置位与状态校验在同一 transition 临界区；队列发布本身是 CAS 或条带锁保护。
+ * - 失败语义：不抛异常（除标准容器 `bad_alloc` 被就地捕获）；失败时保证不残留无队列节点的 reservation。
+ * - 不变量：返回 true 时任务一定能被某个 worker 取到；返回 false 时任务不在任何队列里。
+ */
 bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
+    // step1: 空 task、未初始化 impl、或已处于 kDead/kCancelled/kFailed 终态时返回 false，并用调试事件记下拒绝原因。
+    // step2: 当前线程仍持有 incoming 条带锁时报告锁序违规（SCHED-02）；worker 调用沿用本 P，外部调用按轮转游标选 P，该 P 同时决定存活计数分片。
+    // step3: 非 draining 或非 stopping 才继续；关闭期间对 owner 归属任务先 request_cancel、必要时 notify_terminal，不留下无人唤醒的 G。
+    // step4: 只接受 kNew/kRunnable，prepare_enqueue 绑定 owner、取消门与存活计数分片，失败返回 false；P7 之后不在热路径注册进注册表。
+    // step5: worker/关闭恢复走 admission 锁 + 本地环（环满溢出全局队列，即 runqputslow）；外部生产者先无锁直投本地环，环满回退到固定条带的 incoming，再失败按是否已启动分别走 emergency_enqueue_locked 或就地取消。
+    // step6: 线程局部维护票每 64 次或 needs_grow 置位时才 maybe_grow，最后 notify_worker 唤醒空闲 M。
     GO2CPP_DEBUG_EVENT(kEnqueue, task ? task->id() : 0, 0);
     if (!task || !m_impl) {
         GO2CPP_DEBUG_EVENT(kEnqueueRejected, task ? task->id() : 0, 1);
@@ -4002,19 +4063,39 @@ bool Scheduler::enqueue(const std::shared_ptr<Task>& task) {
 }
 
 /**
- * @brief 把已占用 queued 的任务发布到 P 的 runnext 快速槽。
+ * @brief 把已占用 queued 的任务发布到指定 P 的 runnext 单槽，并处理被挤出的旧任务。
  *
- * @details 被挤出的旧任务落回同一 P 的 256 槽环尾（Go `runqputslow` 的
- *          下一层）；环也满时清掉 queued 后交给全局 enqueue 收敛。
- *          发布本身不会失败——除非 task 为空。
- * @param processor 目标 P。
- * @param task 调用方已成功占用 m_queued 的任务。
- * @param allow_notify 是否允许在本 P 没有运行中的 M 时唤醒 worker。
- * @return 成功发布返回 true。
+ * @param processor_id [in] 目标 P 编号——必须小于 `processors.size()`，越界返回 false；仅借用，不持有。
+ * @param task [in] 已占用 `m_queued` 的任务——不可为 nullptr；所有权仍归调用方，本函数只借用并把被挤出者交回队列。
+ * @param allow_notify [in] 是否允许唤醒 worker——true 时本 P 无运行中 M 会广播；false 由调用方自行决定后续唤醒。
+ *
+ * @return
+ * - true：任务已占住 runnext——调用方**必须**停止再发布同一个 G，否则会得到两个队列节点；
+ * - false：参数非法或推入失败——调用方**不要**当成功处理，需回退到普通队列。
+ *
+ * ## 定位
+ * runnext 单槽的**唯一发布点**，也是「快槽换人但不丢 G」的不变量维护点。写错会怎样：被挤出的 G 失去队列节点
+ * → 永久停在 Runnable；而本 P 无 M 时只做 notify_one → 唤醒别的 P 空转，实测退化到 9.67ms 的 idle_wait 量级。
+ *
+ * ## 步骤
+ * step1. 参数校验。
+ * step2. 原子交换抢占单槽，拿回被挤出的旧任务。
+ * step3. 旧任务回本 P 环尾，环满交给 enqueue 收敛。
+ * step4. 按本 P 是否正在执行决定广播或单播唤醒。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；调用前必须已成功占用 `m_queued`（`try_mark_queued`）。
+ * - 原子性：`runnext.push` 内部用 CAS/自旋锁完成交换，单槽因此只可能有一个赢家。
+ * - 失败语义：不抛异常；返回 false 时单槽内容不变。
+ * - 不变量：返回 true 时 `task` 在 runnext 里，且被挤出者一定在本地环、全局队列或救援链之一。
  */
 bool Scheduler::publish_runnext(PId processor_id,
                                 const std::shared_ptr<Task>& task,
                                 bool allow_notify) {
+    // step1: task 为空或 P 越界直接返回 false，不触碰任何队列。
+    // step2: runnext.push 原子交换占位并返回被挤出的旧任务；交换失败说明槽状态异常，返回 false。
+    // step3: 旧任务优先回本 P 的 256 槽环尾；环满时先 clear_queued 再交给 enqueue 收敛，保证换槽不丢 G。
+    // step4: 本 P 没有 running M 时用 notify_all_workers（runnext 只有 owner 消费，单播可能唤醒错误的 P）；有 M 在跑且环积压 >=16 时才 notify_one，避免 futex 抖动。
     if (!task || processor_id >= m_impl->processors.size()) {
         return false;
     }
@@ -4529,8 +4610,40 @@ bool Scheduler::park_io(const std::shared_ptr<Task>& task) {
     return !task->cancellation_requested();
 }
 
+/**
+ * @brief 把当前正在执行的 G 挂起，提交 Waiting 状态并按给定原因让出执行流。
+ *
+ * @param task [in] 当前任务——必须等于 `current_task_ptr()`，否则拒绝；仅借用，任务由调用方持有。
+ * @param reason [in] 挂起原因（Park/Wait/Io 等枚举）——只用于诊断与 sysmon 归类，不改变状态机。
+ *
+ * @return
+ * - true：被正常唤醒且期间未请求取消——调用方**必须**继续走自己的等待后逻辑；
+ * - false：上下文不符 / 已关闭 / 已取消 / 让出失败——调用方**不要**假设 G 一定挂起过，按取消路径收尾。
+ *
+ * ## 定位
+ * 阻塞路径的**统一状态转移点**（`park` / `park_wait` / `park_io` 都收敛到这里）。写错会怎样：在 shutdown 扫描开始后
+ * 才进入 Waiting → G 永远无人唤醒；注册晚于 admission 锁 → 条带锁嵌在 admission 下，锁序反转死锁。
+ *
+ * ## 步骤
+ * step1. 校验「本调度器 + 当前线程 + 当前 task」三重身份。
+ * step2. 先注册（为外部唤醒与诊断提供锚点）。
+ * step3. 持 admission 锁复查关闭/取消，再原子提交 kWaiting + 唤醒令牌。
+ * step4. 切栈让出执行流，失败则回滚状态。
+ * step5. 恢复后按取消标记给出返回值。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：只能在 G 自己的执行流中调用；不得持任何调度器锁进入。
+ * - 原子性：状态与唤醒令牌打包在同一个 32 位字里提交，避免「已挂起但令牌丢失」。
+ * - 失败语义：不抛异常；让出失败时用 `resume_after_failed_park` 回滚，不会留下无执行者的 Waiting。
+ * - 不变量：返回 true 时 G 至少完整经历一次 park→wake；返回 false 时 G 仍在执行流上。
+ */
 bool Scheduler::park_with_reason(const std::shared_ptr<Task>& task,
                                   SuspendReason reason) {
+    // step1: 必须是本调度器、当前线程、当前 task 才能 park（park 只能挂起自己），否则返回 false。
+    // step2: ensure_registered 把 G 挂进注册表，为外部唤醒与诊断提供生命周期锚点；必须在 admission 锁之前完成。
+    // step3: 持 admission 锁复查 stop_requested / cancellation_requested，再 park_for_scheduler 提交「kWaiting + 唤醒令牌」；不是 kParked 就返回 false。
+    // step4: Fiber::SuspendForScheduler 切栈；失败时 resume_after_failed_park 回滚状态并返回 false。
+    // step5: 被唤醒后按「是否仍未请求取消」返回，调用方据此区分正常唤醒与取消唤醒。
     GO2CPP_DEBUG_EVENT(kParkEnter, task ? task->id() : 0,
                        static_cast<std::uint64_t>(reason));
     if (!task || current_scheduler() != this ||
@@ -4574,7 +4687,38 @@ bool Scheduler::wake(const std::shared_ptr<Task>& task) {
     return wake_or_cancel(task);
 }
 
+/**
+ * @brief 唤醒一个已注册的等待中 G：把唤醒登记成令牌、转成入队，或就地拒绝。
+ *
+ * @param task [in] 目标任务——可为 nullptr（返回 false）；仅借用，唤醒可能把它发布进队列。
+ *
+ * @return
+ * - true：唤醒已登记（令牌/延后入队）或已成功入队——调用方**必须**停止重复唤醒，第二次会被状态检查拒绝；
+ * - false：G 正在执行（只登记令牌）/ 所有权不符 / 入队失败——调用方**不要**当作「已唤醒」记账，按自身协议处理。
+ *
+ * ## 定位
+ * 外部唤醒的**唯一入口**（sync、channel、timer 全部经此）。写错会怎样：把 kPending 当已入队 → 唤醒丢失、等待者睡死；
+ * 预留入队权在注册表回收后不退回 → 后续 `prepare_enqueue` 看到残留 `m_queued` 而永远拒绝该 G。
+ *
+ * ## 步骤
+ * step1. 入口校验（release 用免锁 owner_bound 快路径位）。
+ * step2. 本 M 走预留入队权版本，跨线程走完整版本。
+ * step3. 按 kPending / kRegistered 分支处理令牌与延后入队。
+ * step4. kEnqueue 时发布节点，注册表已回收则退回预留权再走 enqueue。
+ * step5. 其余分支返回 false 并记录原因。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；不要求持调度器锁（内部自行加锁）。
+ * - 原子性：唤醒状态转换与 `try_mark_queued` 在同一个 transition 临界区内完成。
+ * - 失败语义：不抛异常；失败后任务状态保持不变或已转 kRunnable+deferred，不会半提交。
+ * - 不变量：返回 true 后该 G 一定会在有限步内被 worker 看到。
+ */
 bool Scheduler::wake_registered(const std::shared_ptr<Task>& task) {
+    // step1: 空 task / 无 impl 返回 false；debug 构建做完整 owner 复核，release 用免锁 owner_bound 位判断。
+    // step2: 本 M 上已注册的 G 走 wake_for_wait_reserve（状态转换与占位合并到一个临界区），跨线程走完整 wake_for_wait。
+    // step3: kPending 表示 G 正在执行，只登记令牌位、没有队列节点，返回 false；kRegistered 表示已提交 Waiting，状态推进到 kRunnable 并置 deferred_enqueue，返回 true。
+    // step4: kEnqueue 且仍注册时，worker 本地走 requeue_from_worker_reserved，否则走完整 enqueue；若注册表条目已被回收，先 clear_queued 退回预留权再回退 enqueue。
+    // step5: 其余分支记录拒绝原因并返回 false，由调用方决定取消或终态收尾。
     GO2CPP_DEBUG_EVENT(kWakeRequest, task ? task->id() : 0, 0);
     if (!task || !m_impl) {
         return false;

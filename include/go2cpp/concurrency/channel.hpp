@@ -1680,9 +1680,36 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     }
   }
 
-  // 关闭操作幂等并唤醒所有阻塞操作。重复关闭返回 kAlreadyClosed，不抛
-  // C++ 异常；关闭后发送返回关闭状态，接收在排空缓冲后返回零值。
+  /**
+   * @brief 关闭通道，并把「已关闭」交付给所有排队中的发送者与接收者。
+   *
+   * @return
+   * - kReady：本次调用完成关闭——调用方**必须**认为后续 Send 一律失败、Recv 在排空缓冲后返回 kClosed；
+   * - kAlreadyClosed：此前已关闭——调用方**不要**当错误处理，按幂等成功继续。
+   *
+   * ## 定位
+   * 通道关闭的**唯一提交点**，负责把关闭状态传播给每个等待节点。写错会怎样：漏唤醒 → 等待 Fiber 永久挂起；
+   * 持 `m_lock` 调 `NotifyChange()` → 锁序反转；关闭时直接给缓冲非空的接收者判 kClosed → 丢值。
+   *
+   * ## 步骤
+   * step1. 持自旋锁做幂等检查。
+   * step2. 置关闭位并推进 generation。
+   * step3. 逐个唤醒发送者（select 节点走探测提交）。
+   * step4. 逐个唤醒接收者，先把缓冲残留值交付出去。
+   * step5. 锁外通知等待变更者并返回。
+   *
+   * ## 并发/失败语义
+   * - 调用约束：任意线程；不可重入本通道的 Send/Recv（会自锁）。
+   * - 原子性：关闭位与 generation 在同一临界区内发布，等待者要么看到关闭、要么看到自己的探测结果。
+   * - 失败语义：noexcept；任何节点唤醒失败都不会中断关闭流程。
+   * - 不变量：返回后 `m_senders`/`m_receivers` 为空，不存在无人负责的等待节点。
+   */
   ChannelSendResult Close() noexcept {
+      // step1: 持自旋锁，已关闭直接返回 kAlreadyClosed（noexcept，不抛异常）。
+      // step2: 置 m_closed 并让 generation 前进，使 WaitForChange/select 观察者能感知状态变化。
+      // step3: 逐个摘链发送者：select 节点用 kClosed 探测尝试提交，失败就 Cancel 该 select；普通节点写 closed/status/signal 后 WakeNodeLocked。
+      // step4: 逐个摘链接收者：先把缓冲里残留的值以 kReady 交付（select 交付失败要把值放回队首），缓冲为空才给 kClosed，避免丢值。
+      // step5: 在锁外调 NotifyChange（持 m_mutex 调用会锁序反转），返回 kReady。
     bool published = false;
     {
       std::lock_guard<detail::ChannelSpinLock> lock(m_lock);

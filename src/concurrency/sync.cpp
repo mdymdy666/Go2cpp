@@ -2324,7 +2324,41 @@ ConditionVariable::~ConditionVariable() {
 #endif
 }
 
+/**
+ * @brief 在条件变量上等待一次通知，期间释放并重新获取外部 mutex。
+ *
+ * @param mutex [in,out] 外部互斥量——不可为空（引用）；调用前必须已持有，返回时保证仍被持有（否则抛异常）。
+ * @param context [in] 取消上下文——可为 nullptr（不可取消）；仅借用，函数在等待期间注册/撤销回调。
+ *
+ * @return
+ * - true：收到通知并已重新持锁——调用方**必须**重新检查自己的谓词（可能是伪唤醒）；
+ * - false：取消 / 超时 / 手动 Fiber——调用方**不要**假设已被通知，按取消路径退出（锁状态见下）。
+ *
+ * ## 定位
+ * 条件变量等待的**唯一入口**，也是「释放锁 → 入队 → park → 重锁」这条链的唯一实现。写错会怎样：
+ * 快路径清槽与入队不在同一临界区 → 通知丢失、等待者永久挂起；重锁失败当成功返回 → 上层在未持锁状态下改容器（UB）。
+ *
+ * ## 步骤
+ * step1. 识别等待者类型（受管 G / 普通线程 / 手动 Fiber）。
+ * step2. 取消早退：必须完成 cleanup 重锁。
+ * step3. 从线程本地池取等待节点并挂订阅。
+ * step4. 1P1C 快路径：CAS 抢单槽后自旋。
+ * step5. 自旋超预算时在同一临界区内清槽并入队。
+ * step6. 通用等待、唤醒分类与强制重锁。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：必须持有 `mutex` 调用；不得在持调度器锁时调用。
+ * - 原子性：入队与槽操作在同一 `m_mutex` 临界区；唤醒与节点摘除在锁外完成。
+ * - 失败语义：重锁失败抛异常（D3），绝不把「未持锁」返回给调用方；手动 Fiber 保留进入时的锁状态。
+ * - 不变量：正常返回（true/false）时 `mutex` 一定被本线程持有。
+ */
 bool ConditionVariable::Wait(Mutex& mutex, const ContextPtr& context) {
+    // step1: 先读 Scheduler::current_scheduler()，纯 native 线程保持默认 WaitTarget（省跨库调用与 shared_ptr 拷贝）；有 Fiber 无 scheduler 时标记 unsupported_manual_fiber。
+    // step2: 手动 Fiber 保留进入时的锁状态直接返回 false；ctx 已取消或 G 已请求取消时，先 Unlock 再用 cleanup 重锁，抢不回就抛重锁失败异常。
+    // step3: 从线程本地池取 WaitNode（避免每次 40~60ns 的控制块分配），并挂 Context 取消订阅。
+    // step4: 普通线程且无 context 时 CAS 抢占 m_fast_waiter 单槽，Unlock 后只读 CV 的槽缓存行自旋（预算 kCvFastSpinBudget），通知方 exchange 槽即完成交接。
+    // step5: 自旋超预算时必须在同一个 m_mutex 临界区内完成「清槽 + 入队」，堵住「槽已清空、节点未入队」的通知丢失窗口；入队后若槽已被认领则自行摘队按已通知返回。
+    // step6: 入队后 park，醒来按通知/取消/deadline 分类收尾，最后必须重新持有 mutex（抢不回就抛异常，而不是把未持锁返回给假定持锁的调用方）。
     // 必须先识别手动 Fiber。即使 Context 已取消，也不能走普通线程的
     // unlock/relock 路径，否则竞争中的重锁会阻塞 carrier 线程。
     //
@@ -2616,7 +2650,32 @@ bool ConditionVariable::WaitFor(Mutex& mutex, ContextDuration timeout,
     return Wait(mutex, context);
 }
 
+/**
+ * @brief 唤醒条件变量上一个等待者（若有），优先走无锁单槽快路径。
+ *
+ * @return 无返回值（void，noexcept）——调用方无需检查；没有等待者时什么也不做是正常语义。
+ *
+ * ## 定位
+ * 单播唤醒的**唯一提交点**，同时负责「快槽认领」与「慢路径挑一个可交付节点」。写错会怎样：用裸 store 清槽
+ * → 覆盖另一个等待者刚 CAS 进去的槽，它的唤醒永久丢失；持 `m_mutex` 调用 `Wake()` → 死锁。
+ *
+ * ## 步骤
+ * step1. 先探快槽，非空才 exchange 认领。
+ * step2. 无快槽等待者且计数为 0 时直接返回。
+ * step3. 持锁挑选一个可交付节点，跳过已取消者。
+ * step4. 一次性记账并在锁外唤醒。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；不要求持外部锁（但通常持锁修改状态后再通知）。
+ * - 原子性：快槽用 exchange（RMW）认领，慢路径的计数与队列在同一把锁内维护。
+ * - 失败语义：noexcept；节点已取消/超时时自动跳过，不会误唤醒。
+ * - 不变量：最多唤醒一个等待者；被唤醒者一定收到了 kNotified 结果。
+ */
 void ConditionVariable::NotifyOne() noexcept {
+    // step1: 先用一次 acquire load 判空（空槽是常态，省掉无人等待也付的隐式 lock 的 exchange）；非空才 exchange(0) 认领；必须用 RMW 而非裸 store，否则会覆盖另一个等待者刚 CAS 进去的槽。
+    // step2: 快路径等待者不计入 m_waiter_count，所以先走快槽；计数为 0 时队列必然为空（两者同一把锁维护），连队列锁都不取。
+    // step3: 持 m_mutex，优先取 m_single，再取 FIFO 队首；TryFinish 失败（已取消/超时）的节点跳过继续，直到选中一个可交付节点或队列为空。
+    // step4: removed 非 0 时一次性 fetch_sub waiter_count；选中节点在锁外 Wake（持队列锁唤醒会死锁）。
     // 1P1C 快路径：独占槽里有 native 等待者时，无锁认领并唤醒。
     // 必须排在「计数为 0 直接返回」之前 —— 快路径等待者不计入计数。
     {
@@ -2841,7 +2900,36 @@ WaitGroup::~WaitGroup() {
 #endif
 }
 
+/**
+ * @brief 调整 WaitGroup 的计数，并在计数归零时唤醒全部等待者。
+ *
+ * @param delta [in] 计数增量——正数增加、负数减少、0 为空操作；负数绝对值不得超过当前计数（否则抛 logic_error）。
+ *
+ * @return 无返回值（void）——正常返回表示计数已更新；抛异常表示溢出/下溢且计数已回滚。
+ *
+ * ## 定位
+ * WaitGroup 计数的**唯一写入口**（`Done` 是它的 -1 特化）。写错会怎样：下溢不回滚 → 后续 Wait 永远等不到 0；
+ * 归零不唤醒 → 所有等待者睡死；多一次全局 RMW → 热路径直接变慢 2~3 倍。
+ *
+ * ## 步骤
+ * step1. 零增量直接返回。
+ * step2. 单次 RMW 完成计数更新。
+ * step3. 溢出/下溢回滚并抛错。
+ * step4. 判断是否需要进入唤醒路径。
+ * step5. 归零且有等待者时批量唤醒。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；无锁调用。
+ * - 原子性：计数用一条 acq_rel 的 fetch_add 更新，边界检查在事后进行。
+ * - 失败语义：抛 `std::logic_error` 前已用 fetch_sub 回滚，计数保持不变。
+ * - 不变量：函数返回后计数 = 旧值 + delta；抛异常时计数 = 旧值。
+ */
 void WaitGroup::Add(std::int64_t delta) {
+    // step1: 零增量不改计数；计数为 0 时 Wait 入口即返回，也不存在该被唤醒的等待者，省一次原子 RMW。
+    // step2: fetch_add(acq_rel) 同时拿到旧值并完成更新，热路径只有一条原子指令（旧 CAS 重试实测慢 2~3 倍）。
+    // step3: 正增量溢出、负增量下溢（含 INT64_MIN）时反向 fetch_sub 回滚，再抛 logic_error，异常路径不留下错误计数。
+    // step4: 正增量永不归零；负增量打到 0 但 waiter_count==0 时同样直接返回，不取锁。
+    // step5: 确实归零且有等待者时 CompleteWave 在锁内摘走等待者并逐个唤醒。
     if (delta == 0) {
         // 零增量不改变计数；`Wait` 在计数为 0 时入口即返回，因此也不存在
         // 「该被这次 Add 唤醒」的合法等待者。省掉一次原子 RMW。
@@ -2928,7 +3016,36 @@ void WaitGroup::Done() {
     m_impl->CompleteWave(-1);
 }
 
+/**
+ * @brief 阻塞到 WaitGroup 计数归零，或在取消时提前返回。
+ *
+ * @param context [in] 取消上下文——可为 nullptr（不可取消）；仅借用，等待期间注册回调。
+ *
+ * @return
+ * - true：计数已经归零——调用方**必须**认为所有被等待的工作都已完成；
+ * - false：取消 / 手动 Fiber / 上下文不支持——调用方**不要**把它当「计数还没到 0」重试，按取消处理。
+ *
+ * ## 定位
+ * WaitGroup 的**唯一等待点**，也是「登记等待者」与「复查计数」的线性化点。写错会怎样：先查计数后登记 →
+ * Done 读到 0 跳过唤醒、本线程随后入队睡死；摘链失败仍减计数 → 计数泄漏，后续 Wait 永久阻塞。
+ *
+ * ## 步骤
+ * step1. 快路径与早退。
+ * step2. 取节点并放宽自旋预算。
+ * step3. 锁内「先登记再复查」，必要时回滚。
+ * step4. 等待、摘链与计数回收。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；不可持有会阻塞 Done 的锁。
+ * - 原子性：`waiter_count` 先加后查计数，Done 归零时能看到这个镜像。
+ * - 失败语义：noexcept 之外的异常只可能来自节点分配；失败时已入队节点会被摘除。
+ * - 不变量：返回 true 时计数为 0；返回 false 时本线程已不在等待队列中。
+ */
 bool WaitGroup::Wait(const ContextPtr& context) {
+    // step1: 计数已为 0 立即返回 true（不必抢 m_mutex）；ctx 已取消、手动 Fiber、G 已请求取消都返回 false。
+    // step2: 从线程本地池取 WaitNode，把自旋预算调到 32768（Done 只发布一次归零，长自旋可省掉 FUTEX_WAKE），再挂 Context 订阅。
+    // step3: 先 waiter_count++ 再复查计数（顺序反过来会出现 Done 读到 0 跳过唤醒、本线程随后入队睡死）；已归零或已取消则回滚计数退出，否则入队，托管 G 还需 Arm 才能接受 pending 唤醒。
+    // step4: Await 返回后 Reset 订阅；非 kNotified 时持锁把节点摘链，并按「确实摘到」减 waiter_count，避免计数泄漏。
     // 计数已是原子量：归零时直接返回，不必为一次「已经完成」的检查去抢
     // m_mutex —— Done 的归零批次正持有它时，这里会白等一个唤醒周期。
     if (m_impl->m_ctr.count.load(std::memory_order_acquire) == 0) {
