@@ -12,27 +12,27 @@
 | 入口（类/函数/宏） | 文件:行 | 谁调用它 | 触发什么 | 返回什么 |
 |---|---|---|---|---|
 | `Server::Server(ServerOptions)` | `include/go2cpp/rpc/server.hpp:147` | 应用 | 建注册表/impl；不监听 | 对象 |
-| `Server::Register<Service>(name, svc)` | `server.hpp:159-170` | 应用（Listen 前） | 调 `ServiceRegistry::AddService`，ADL 找 `RpcMethods` | bool（重名/非法/空表 false） |
-| `Server::Listen(address/Endpoint)` | `server.hpp:182/185` | 应用 | 注册表 `Freeze()`、绑监听、起 accept 线程 | bool |
-| `Server::AddConnection(Transport)` | `server.hpp:192` | 应用（WS 升级后） | 接管已建连接，起 reader/worker | bool |
-| `Server::Stop()` | `server.hpp:195` | 应用 | 关监听、`shutdown` 连接、join 全部线程 | void，幂等 |
+| `Server::Register<Service>(name, svc)` | `include/go2cpp/rpc/server.hpp:159-170` | 应用（Listen 前） | 调 `ServiceRegistry::AddService`，ADL 找 `RpcMethods` | bool（重名/非法/空表 false） |
+| `Server::Listen(address/Endpoint)` | `include/go2cpp/rpc/server.hpp:182/185` | 应用 | 注册表 `Freeze()`、绑监听、起 accept 线程 | bool |
+| `Server::AddConnection(Transport)` | `include/go2cpp/rpc/server.hpp:192` | 应用（WS 升级后） | 接管已建连接，起 reader/worker | bool |
+| `Server::Stop()` | `include/go2cpp/rpc/server.hpp:195` | 应用 | 关监听、`shutdown` 连接、join 全部线程 | void，幂等 |
 | `GO2CPP_RPC_SERVICE(Service, M...)` | `include/go2cpp/rpc/registry.hpp:671-675` | 服务类命名空间 | 生成 `inline auto RpcMethods(Service*)`，返回 `Method<&Service::M>("#M")` 的 tuple | 编译期方法表 |
 | `Client::Client(address/Transport, opts)` | `include/go2cpp/rpc/client.hpp:358/365` | 应用 | 建 TCP 或接管 Transport；起读线程 | 对象；失败 `connected()==false` |
-| `Client::Call<Result>(method, args...)` | `client.hpp:393-416` | 应用 | 组请求 → 写 → 等响应 → 反序列化 | `Result`，失败抛 `RpcError` |
-| `Client::TryCall<Result>(method, out, args...)` | `client.hpp:418-450` | 应用 | 同上，但不抛异常 | `Status` |
-| `Client::CallStatus(method, args...)` | `client.hpp:452-472` | 应用 | 无返回值调用 | `Status` |
-| `Client::AsyncCall<Result>(method, args...)` | `client.hpp:474-493` | 应用 | 发起后立即返回 `PendingCall` | `PendingCall<Result>` |
-| `PendingCall::Wait(out, timeout)` | `client.hpp:293-318` | 应用 | 等完成/超时；结果只能取一次 | `Status` |
-| `PendingCall::Cancel()` | `client.hpp:280-290` | 应用 | 本地唤醒 `kCancelled` + 发 `kCancel` | bool |
-| `Client::OpenStream(method, args...)` | `client.hpp:495-504` | 应用 | 发流式请求，登记 `StreamState` | `ClientStream` |
-| `ClientStream::Next<T>(out, status, timeout)` | `client.hpp:195-227` | 应用 | 从流缓冲取一条；必要时等 | bool |
-| `ClientStream::Finish(timeout)` | `client.hpp:229` | 应用 | 等 `StreamEnd` / 连接关闭 | `Status` |
-| `ClientStream::Cancel()` | `client.hpp:232` | 应用 | 本地结束 + 发 `kCancel` | bool |
-| `Client::Ping()` | `client.hpp:506` | 应用 | 发 `kPing`，等 `kPong` | `Status` |
-| `ServerStream::Send<T>(v)` | `server.hpp:78-92` | 服务端 handler | 序列化 + `SendStreamData` | bool |
-| `ServerStream::SendSerialized` | `server.hpp:94` / `server.cpp:212-226` | 服务端 handler | 同上，字节版 | bool |
-| `ServerStream::Finish(status)` | `server.hpp:101` / `server.cpp:228-242` | 服务端 handler | 发 `kStreamEnd` | `Status` |
-| `ServerStream::cancelled()` | `server.hpp:104` | 服务端 handler | 读 `kCancel` 置的原子标志 | bool |
+| `Client::Call<Result>(method, args...)` | `include/go2cpp/rpc/client.hpp:394-416` | 应用 | 组请求 → 写 → 等响应 → 反序列化 | `Result`，失败抛 `RpcError` |
+| `Client::TryCall<Result>(method, out, args...)` | `include/go2cpp/rpc/client.hpp:419-450` | 应用 | 同上，但不抛异常 | `Status` |
+| `Client::CallStatus(method, args...)` | `include/go2cpp/rpc/client.hpp:452-472` | 应用 | 无返回值调用 | `Status` |
+| `Client::AsyncCall<Result>(method, args...)` | `include/go2cpp/rpc/client.hpp:475-493` | 应用 | 发起后立即返回 `PendingCall` | `PendingCall<Result>` |
+| `PendingCall::Wait(out, timeout)` | `include/go2cpp/rpc/client.hpp:293-318` | 应用 | 等完成/超时；结果只能取一次 | `Status` |
+| `PendingCall::Cancel()` | `include/go2cpp/rpc/client.hpp:280-290` | 应用 | 本地唤醒 `kCancelled` + 发 `kCancel` | bool |
+| `Client::OpenStream(method, args...)` | `include/go2cpp/rpc/client.hpp:496-504` | 应用 | 发流式请求，登记 `StreamState` | `ClientStream` |
+| `ClientStream::Next<T>(out, status, timeout)` | `include/go2cpp/rpc/client.hpp:195-227` | 应用 | 从流缓冲取一条；必要时等 | bool |
+| `ClientStream::Finish(timeout)` | `include/go2cpp/rpc/client.hpp:229` | 应用 | 等 `StreamEnd` / 连接关闭 | `Status` |
+| `ClientStream::Cancel()` | `include/go2cpp/rpc/client.hpp:232` | 应用 | 本地结束 + 发 `kCancel` | bool |
+| `Client::Ping()` | `include/go2cpp/rpc/client.hpp:506` | 应用 | 发 `kPing`，等 `kPong` | `Status` |
+| `ServerStream::Send<T>(v)` | `include/go2cpp/rpc/server.hpp:79-92` | 服务端 handler | 序列化 + `SendStreamData` | bool |
+| `ServerStream::SendSerialized` | `include/go2cpp/rpc/server.hpp:94` / `src/rpc/server.cpp:212-226` | 服务端 handler | 同上，字节版 | bool |
+| `ServerStream::Finish(status)` | `include/go2cpp/rpc/server.hpp:101` / `src/rpc/server.cpp:228-242` | 服务端 handler | 发 `kStreamEnd` | `Status` |
+| `ServerStream::cancelled()` | `include/go2cpp/rpc/server.hpp:104` | 服务端 handler | 读 `kCancel` 置的原子标志 | bool |
 | `TcpTransport::Connect/Listen` | `include/go2cpp/rpc/transport.hpp:109+` | Client / Server | TCP 连接/监听；`TCP_NODELAY` | 对象/`unique_ptr` |
 | `WebSocketTransport::WebSocketTransport(ws)` | `include/go2cpp/rpc/websocket_transport.hpp:65+` | 应用（HTTP 升级后） | 把一条 WS 连接适配成 `Transport` | 对象 |
 | `ServiceRegistry::Find(full_name)` | `include/go2cpp/rpc/registry.hpp:494+` | 每次请求 | 无锁开放寻址查找 | `const BoundMethod*` |
@@ -87,42 +87,42 @@ Client
 
 ### 1.3 复杂场景一：一次 streaming 调用（建立→数据→半关闭→收尾→超时恢复）
 
-1. 应用 `auto stream = client.OpenStream("User.Watch", req)`（`client.hpp:495-504`）→
-   `OpenStreamRaw`（`client.hpp:518`）。
-2. `PackArguments`（`client.hpp:112-120`）把 `req` 序列化；`BeginCall(..., streaming=true, ...)`
-   （`client.hpp:510-512`）分配 `call_id`、创建 `StreamState`、登记 `m_streams`，
-   然后 `SendRequest`（`client.cpp:232-241`）。
+1. 应用 `auto stream = client.OpenStream("User.Watch", req)`（`include/go2cpp/rpc/client.hpp:496-504`）→
+   `OpenStreamRaw`（`include/go2cpp/rpc/client.hpp:518`）。
+2. `PackArguments`（`include/go2cpp/rpc/client.hpp:112-120`）把 `req` 序列化；`BeginCall(..., streaming=true, ...)`
+   （`include/go2cpp/rpc/client.hpp:510-512`）分配 `call_id`、创建 `StreamState`、登记 `m_streams`，
+   然后 `SendRequest`（`src/rpc/client.cpp:232-241`）。
 3. 服务端 reader 线程 `FrameCodec::Feed` 解出 `kRequest`，`HandleRequest`
-   （`server.cpp:391-425`）看到 `streaming=true` → 创建 `PendingRequest`，把
+   （`src/rpc/server.cpp:391-425`）看到 `streaming=true` → 创建 `PendingRequest`，把
    `shared_ptr<atomic<bool>> cancelled` 登记进 `m_cancels[call_id]`，再入 `m_queue`
-   （`server.cpp:411-424`）。
-4. worker 线程 `WorkerLoop`（`server.cpp:454-476`）`pop` 请求 → `Process`
-   （`server.cpp:478-523`）；`bound->binding.streaming` 必须匹配，否则回 `kStreamEnd` +
-   `kInvalidArgument`（`server.cpp:494-507`）。
+   （`src/rpc/server.cpp:411-424`）。
+4. worker 线程 `WorkerLoop`（`src/rpc/server.cpp:454-476`）`pop` 请求 → `Process`
+   （`src/rpc/server.cpp:478-523`）；`bound->binding.streaming` 必须匹配，否则回 `kStreamEnd` +
+   `kInvalidArgument`（`src/rpc/server.cpp:494-507`）。
 5. `Process` 创建 `StreamSenderImpl` + `ServerStream`，调用 handler
-   `invoke(service, ctx, args, result, &stream)`（`server.cpp:512-518`）。
+   `invoke(service, ctx, args, result, &stream)`（`src/rpc/server.cpp:512-518`）。
 6. handler 调 `stream.Send(v)` → `ServerStream::Send` → `SendSerialized` →
-   `StreamSenderImpl::SendSerialized`（`server.cpp:212-226`）：加 `m_mutex`，检查
+   `StreamSenderImpl::SendSerialized`（`src/rpc/server.cpp:212-226`）：加 `m_mutex`，检查
    `m_finished`，`m_sequence++`，`SendStreamData`。
-7. `ServerConnection::SendStreamData`（`server.cpp:327-332`）编码 `kStreamData`（call_id +
-   seq + len + payload），`SendPayload`（`server.cpp:296-318`）在 `m_write_mutex` 下
+7. `ServerConnection::SendStreamData`（`src/rpc/server.cpp:327-332`）编码 `kStreamData`（call_id +
+   seq + len + payload），`SendPayload`（`src/rpc/server.cpp:296-318`）在 `m_write_mutex` 下
    `WriteAll`。
-8. 客户端读线程 `Dispatch`（`client.cpp:451-474`）→ `HandleStreamData`
-   （`client.cpp:520-556`）：`FindStream(call_id)`；若队列满/字节超限 →
+8. 客户端读线程 `Dispatch`（`src/rpc/client.cpp:451-474`）→ `HandleStreamData`
+   （`src/rpc/client.cpp:520-556`）：`FindStream(call_id)`；若队列满/字节超限 →
    `ended=true`、`kResourceExhausted`、`RemoveStream`、`SendCancel`；否则入队并 `notify_all`。
-9. 应用 `stream.Next<T>(&out, &status, timeout)`（`client.hpp:195-227`）→
-   `NextPayload`（`client.hpp:243`）→ `WaitForStreamFrame`（`client.cpp:353-390`）：
+9. 应用 `stream.Next<T>(&out, &status, timeout)`（`include/go2cpp/rpc/client.hpp:195-227`）→
+   `NextPayload`（`include/go2cpp/rpc/client.hpp:243`）→ `WaitForStreamFrame`（`src/rpc/client.cpp:353-390`）：
    `cv.wait_for` 直到有帧/结束/超时；反序列化。
 10. handler 结束：`stream.Finish(status)` → `StreamSenderImpl::Finish`
-    （`server.cpp:228-242`）→ `SendStreamEnd`（`server.cpp:334-340`）；之后 `Process` 末尾
-    `EraseCancel(call_id)`（`server.cpp:524`）。
-11. 客户端 `HandleStreamEnd`（`client.cpp:557-577`）：置 `ended/end_status`，`notify_all`，
-    `RemoveStream`；应用 `stream.Finish()`（`client.cpp:660-670`）返回最终状态。
-12. 半关闭/取消路径：应用 `stream.Cancel()`（`client.cpp:674-690`）→ 本地置 `kCancelled`、
-    唤醒、发 `kCancel`；服务端 `HandleCancel`（`server.cpp:428-445`）置原子标志；
+    （`src/rpc/server.cpp:228-242`）→ `SendStreamEnd`（`src/rpc/server.cpp:334-340`）；之后 `Process` 末尾
+    `EraseCancel(call_id)`（`src/rpc/server.cpp:524`）。
+11. 客户端 `HandleStreamEnd`（`src/rpc/client.cpp:557-577`）：置 `ended/end_status`，`notify_all`，
+    `RemoveStream`；应用 `stream.Finish()`（`src/rpc/client.cpp:660-670`）返回最终状态。
+12. 半关闭/取消路径：应用 `stream.Cancel()`（`src/rpc/client.cpp:674-690`）→ 本地置 `kCancelled`、
+    唤醒、发 `kCancel`；服务端 `HandleCancel`（`src/rpc/server.cpp:428-445`）置原子标志；
     handler 通过 `stream.cancelled()` 观察，自行收尾。
 13. 超时恢复路径：`Next` 超时返回 `kDeadlineExceeded`，但流仍可继续 `Next`（测试
-    `test_rpc_stream.cpp:71` 的 `recv timeout then resume`）；连接不因单次读超时断开。
+    `tests/rpc/test_rpc_stream.cpp:71` 的 `recv timeout then resume`）；连接不因单次读超时断开。
 14. 连接断开：`Read` 返回 0 → reader 退出、`Close()`、`m_queue_cv.notify_all()`；
     worker 退出；客户端读线程 `Close()`；所有 pending/stream 被唤醒为 `kUnavailable`。
 
@@ -134,26 +134,26 @@ Client
 
 1. **建立**：TCP 由 `TcpTransport::Connect` 建 socket、设 `TCP_NODELAY`
    （`src/rpc/transport.cpp:51-54`）；WS 由 `net::WebSocket::Connect/Accept` 完成 HTTP 升级，
-   再把 `WebSocket` 交给 `WebSocketTransport`（`websocket_transport.hpp:65-83`）。
+   再把 `WebSocket` 交给 `WebSocketTransport`（`include/go2cpp/rpc/websocket_transport.hpp:65-83`）。
 2. **服务端接入**：TCP 由 `TcpListener::Accept` → `AcceptLoop` → `ServerConnection`；
    WS 由应用在升级后 `server.AddConnection(std::make_unique<WebSocketTransport>(ws))`
-   （`server.hpp:192`）。
+   （`include/go2cpp/rpc/server.hpp:192`）。
 3. **写路径**：`Client::SendRequest` / `ServerConnection::SendPayload` 都先编码完整帧，
    加 `m_write_mutex`，调 `Transport::WriteAll`。
-   - TCP：`TcpTransport::WriteAll` 循环 `send` 直到写完或失败（`transport.cpp:227-272`）。
+   - TCP：`TcpTransport::WriteAll` 循环 `send` 直到写完或失败（`src/rpc/transport.cpp:227-272`）。
    - WS：`WebSocketTransport::WriteAll` 把整段字节作为**一条二进制消息** `send_binary`
-     （`websocket_transport.hpp:85-117`）。
+     （`include/go2cpp/rpc/websocket_transport.hpp:85-117`）。
 4. **读路径**：
    - TCP：`TcpTransport::Read` 一次 `recv`，返回内核给多少算多少；EAGAIN 时 `poll` 1s
-     （`transport.cpp:274-300`）。
+     （`src/rpc/transport.cpp:274-300`）。
    - WS：`WebSocketTransport::Read` 先消费 `m_pending` 当前消息的剩余字节；读空才
-     `read_message()` 取下一条（`websocket_transport.hpp:121-160`）。
+     `read_message()` 取下一条（`include/go2cpp/rpc/websocket_transport.hpp:121-160`）。
 5. **帧边界**：两者都不保证一次 `Read` 等于一帧；`FrameCodec::Feed` 负责半包/粘包
-   （`client.cpp:440-449`、`server.cpp:348-356`）。WS 的「一条消息 = 一帧」只在上层每次
+   （`src/rpc/client.cpp:440-449`、`src/rpc/server.cpp:348-356`）。WS 的「一条消息 = 一帧」只在上层每次
    `WriteAll` 一整帧时成立，是**约定**不是传输保证。
 6. **关闭**：TCP `Close()` 只 `shutdown(SHUT_RDWR)` 唤醒阻塞读，真正 `close` 在析构
-   （`transport.hpp:30-31`、`transport.cpp:308-316`）；WS `Close()` 发 Close 帧并标记，
-   唤醒读（`websocket_transport.hpp:167-176`）。
+   （`include/go2cpp/rpc/transport.hpp:30-31`、`src/rpc/transport.cpp:308-316`）；WS `Close()` 发 Close 帧并标记，
+   唤醒读（`include/go2cpp/rpc/websocket_transport.hpp:167-176`）。
 7. **错误映射**：TCP `recv==0` → EOF；`ECONNRESET/EPIPE` → `kUnavailable`；WS
    `read_message` 的 `Closed` → `Read` 返回 0，其它错误 → `kUnavailable`。
 8. **半包示例**：客户端一次写入 2 帧（TCP 合法；WS 会变成一条消息含 2 帧），
@@ -168,15 +168,15 @@ Client
 
 | # | 不变量 | 证据 | 破法后果 |
 |---|---|---|---|
-| 1 | 普通 handler 在 reader 线程执行 | `server.cpp:401-410` | 慢 handler 阻塞同连接后续请求/Ping |
-| 2 | 流式 handler 在单 worker 串行执行 | `server.cpp:454-476` | 一条长流挡住同连接后续流 |
-| 3 | 注册表 `Listen` 时冻结，之后只读 | `registry.hpp`（`Freeze`）、`server.cpp:531+` | 动态注册返回 false；改锁会毁掉无锁查找 |
-| 4 | `BoundMethod*` 指向注册表内部，生命周期 = Server | `registry.hpp:481-485` | Server 析构后持有 → UAF |
-| 5 | 服务对象是裸指针，Server 存活期间不能析构 | `registry.hpp:503-507` | 悬空调用 |
-| 6 | 每连接一把写锁，`WriteAll` 必须全写或失败 | `server.cpp:314-315`、`transport.hpp:70-75` | 帧交错/半帧 |
-| 7 | `call_id` 单调且 pending 表按 id 分派 | `client.cpp:480-505` | 迟到响应串话 |
-| 8 | 超时只清客户端等待项，服务端继续执行 | `client.cpp:288-297`、`server.cpp:478-523` | 误以为取消生效；同连接排队 |
-| 9 | 流式缓冲是客户端单侧上限，无协议窗口 | `client.hpp:131-132`、`client.cpp:532-556` | 慢消费者丢流，服务端不降速 |
+| 1 | 普通 handler 在 reader 线程执行 | `src/rpc/server.cpp:401-410` | 慢 handler 阻塞同连接后续请求/Ping |
+| 2 | 流式 handler 在单 worker 串行执行 | `src/rpc/server.cpp:454-476` | 一条长流挡住同连接后续流 |
+| 3 | 注册表 `Listen` 时冻结，之后只读 | `registry.hpp`（`Freeze`）、`src/rpc/server.cpp:531+` | 动态注册返回 false；改锁会毁掉无锁查找 |
+| 4 | `BoundMethod*` 指向注册表内部，生命周期 = Server | `include/go2cpp/rpc/registry.hpp:481-485` | Server 析构后持有 → UAF |
+| 5 | 服务对象是裸指针，Server 存活期间不能析构 | `include/go2cpp/rpc/registry.hpp:503-507` | 悬空调用 |
+| 6 | 每连接一把写锁，`WriteAll` 必须全写或失败 | `src/rpc/server.cpp:314-315`、`include/go2cpp/rpc/transport.hpp:70-75` | 帧交错/半帧 |
+| 7 | `call_id` 单调且 pending 表按 id 分派 | `src/rpc/client.cpp:480-505` | 迟到响应串话 |
+| 8 | 超时只清客户端等待项，服务端继续执行 | `src/rpc/client.cpp:288-297`、`src/rpc/server.cpp:478-523` | 误以为取消生效；同连接排队 |
+| 9 | 流式缓冲是客户端单侧上限，无协议窗口 | `include/go2cpp/rpc/client.hpp:131-132`、`src/rpc/client.cpp:532-556` | 慢消费者丢流，服务端不降速 |
 | 10 | 当前 RPC 只有 TCP/WS 两种 Transport | `src/rpc/`、`CMakeLists.txt:92-94` | 按旧文档找 picoquic 会扑空 |
 
 ---
@@ -196,7 +196,7 @@ Client
 
 ### 2.2 协议与帧
 
-- `FrameType`（`protocol.hpp:61-69`）：Request/Response/StreamData/StreamEnd/Cancel/Ping/Pong。
+- `FrameType`（`include/go2cpp/rpc/protocol.hpp:61-69`）：Request/Response/StreamData/StreamEnd/Cancel/Ping/Pong。
 - `RequestMessage`（82-88）：call_id + method + streaming + args。
 - `ResponseMessage`（90-95）：call_id + Status + payload。
 - `StreamDataMessage`（97-102）：call_id + sequence + payload。
@@ -211,11 +211,11 @@ Client
 
 ### 2.3 注册表与方法表宏
 
-- `ServiceRegistry`（`registry.hpp:494+`）：开放寻址哈希（2 的幂、线性探测、FNV-1a 64）、
+- `ServiceRegistry`（`include/go2cpp/rpc/registry.hpp:494+`）：开放寻址哈希（2 的幂、线性探测、FNV-1a 64）、
   `std::deque<BoundMethod>` 保证指针稳定、查找无锁、注册加锁。
 - `BoundMethod`（481-485）：`full_name`、`service`、`binding`。
 - `MethodBinding`：`name`（短名，指向字面量）、`argc`、`streaming`、`invoke` 函数指针。
-- `Method<M>(name)`（`registry.hpp:460-471`）：`static_assert(argc<=255)`，填 `binding.invoke`。
+- `Method<M>(name)`（`include/go2cpp/rpc/registry.hpp:460-471`）：`static_assert(argc<=255)`，填 `binding.invoke`。
 - `GO2CPP_RPC_SERVICE`（671-675）：
   ```cpp
   #define GO2CPP_RPC_DETAIL_ENTRY(ServiceType, MethodName) \
@@ -235,10 +235,10 @@ Client
 
 ### 2.4 服务端
 
-- `ServerOptions`（`server.hpp:119-140`）：`max_payload_bytes=4MiB`、`checksum=true`、
+- `ServerOptions`（`include/go2cpp/rpc/server.hpp:119-140`）：`max_payload_bytes=4MiB`、`checksum=true`、
   `backlog=128`、`accept_poll_ms=20`、`max_connections=1024`。
 - `Server`（144-216）：`Register/Listen/AddConnection/Stop/running/port/registry`。
-- `ServerImpl`：accept 线程 + 连接表；`Stop()`（`server.cpp:609-625`）关监听 → join accept →
+- `ServerImpl`：accept 线程 + 连接表；`Stop()`（`src/rpc/server.cpp:609-625`）关监听 → join accept →
   swap 连接表 → 对每个 `Close()` → `Join()`。
 - `ServerConnection`：
   - `ReaderLoop`（342-370）：`Transport::Read` → `FrameCodec::Feed` → `HandleFrame`。
@@ -248,7 +248,7 @@ Client
   - `Process`（478-523）：查表、校验 streaming、调用 handler、回 Response/StreamEnd。
   - `SendPayload`（296-318）：编码 + 写锁 + `WriteAll`。
 - `ServerStream`（60-116）：`Send/SendSerialized/Finish/cancelled/valid`；
-  `StreamSenderImpl`（`server.cpp:212-242`）负责序号与 finished 状态。
+  `StreamSenderImpl`（`src/rpc/server.cpp:212-242`）负责序号与 finished 状态。
 
 **状态机**：
 ```
@@ -262,12 +262,12 @@ Closed ──Join──► 回收
 
 ### 2.5 客户端
 
-- `ClientOptions`（`client.hpp:122-138`）：`connect_timeout=1000`、`timeout=5000`、
+- `ClientOptions`（`include/go2cpp/rpc/client.hpp:122-138`）：`connect_timeout=1000`、`timeout=5000`、
   `max_payload_bytes=4MiB`、`checksum`、`max_stream_frames=1024`、`max_stream_bytes=16MiB`、
   `tcp_no_delay`。
 - `Connection`：读线程 + `m_pending`（call_id→CallState）+ `m_streams`（call_id→StreamState）
   + `m_write_mutex`。
-- `Wait`（`client.cpp:275-300`）：100µs 自旋 → condvar；超时 `RemovePending` + `SendCancel` +
+- `Wait`（`src/rpc/client.cpp:275-300`）：100µs 自旋 → condvar；超时 `RemovePending` + `SendCancel` +
   `kDeadlineExceeded`。
 - `CancelCall`（304-329）：从 pending 移除、置 `kCancelled`、唤醒、`SendCancel`。
 - `HandleResponse`（480-505）：找不到 pending 丢弃；流式请求收到普通 Response 时转
@@ -281,8 +281,8 @@ Closed ──Join──► 回收
 
 ### 2.6 TCP 传输
 
-- `Endpoint::Parse` 只支持 IPv4/域名，不支持 `[::1]:port`（`transport.hpp:55-65`）。
-- `TcpTransport::Connect`：`socket` + `connect` + `TCP_NODELAY`（`transport.cpp:51-54`）。
+- `Endpoint::Parse` 只支持 IPv4/域名，不支持 `[::1]:port`（`include/go2cpp/rpc/transport.hpp:55-65`）。
+- `TcpTransport::Connect`：`socket` + `connect` + `TCP_NODELAY`（`src/rpc/transport.cpp:51-54`）。
 - `WriteAll`（227-272）：循环 `send`，处理 EINTR/EAGAIN，`Close` 后快速失败。
 - `Read`（274-300）：`recv`；EAGAIN → `poll` 1s；返回 0 表示 EOF。
 - `Close`（308-316）：只 `shutdown`，真正 `close` 在析构；避免 reader 还阻塞时 fd 被复用。
@@ -292,7 +292,7 @@ Closed ──Join──► 回收
 
 ### 2.7 WebSocket 传输
 
-- `WebSocketTransport`（`websocket_transport.hpp:65-196`）：把 `net::WebSocket` 适配成
+- `WebSocketTransport`（`include/go2cpp/rpc/websocket_transport.hpp:65-196`）：把 `net::WebSocket` 适配成
   `Transport`。
 - `WriteAll`（85-117）：`send_binary(string_view)`，一条消息 = 一次写；失败返回
   `kUnavailable`。
@@ -323,6 +323,19 @@ Closed ──Join──► 回收
   `net::quic::PicoquicConnection`，服务端自写 picoquic 泵。
 - 结论：如果重做，应先抽 `PicoquicServer`（多连接、单线程驱动），再写 RPC 适配层；
   不要复活旧文件，也不要相信 `ctest -N`。
+
+### 2.9 观测与排障
+
+- `Server::running()` / `Server::port()`（`include/go2cpp/rpc/server.hpp:198-205`）：确认监听是否真的起来、
+  端口 0 时实际分配到哪个端口；`registry()`（207）用于枚举已注册方法。
+- `Client::connected()` / `Client::last_error()`（`include/go2cpp/rpc/client.hpp:372-375`）：构造失败不会抛，
+  必须在第一次调用前检查；否则会得到 `kInvalidArgument`/`kUnavailable`。
+- `ServerConnection` 的 `m_reader_done` / `m_worker_done`（`src/rpc/server.cpp:285-292` 的
+  `Finished()`）：判断连接是否完全退出；`Stop()` 之后应两者都为 true。
+- 排障顺序：先看 `ctest -N` 是否只是旧构建目录（Q05 的坑），再看 `connected()`/`port()`，
+  然后看 `registry().Find("Svc.Method")` 是否命中，最后才看 handler 内部。
+- `max_payload_bytes` / `checksum` 两端必须一致；不一致的典型现象是连接能建、第一次大载荷
+  调用就 `kDataLoss` 或断连。
 
 ---
 

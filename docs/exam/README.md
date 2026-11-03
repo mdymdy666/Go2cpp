@@ -7,32 +7,30 @@
 > `docs/**` 里的 ns/吞吐都可能过时或从未有出处。本索引中的任何数字只作**历史对照**；
 > 所有涉及性能的验收，一律要求答题者当场跑一次并报出测量条件（核数、`taskset`、轮数、min/median）。
 
-## 一、题目总量
+## 一、题目总量（12 卷 · 115 题）
 
-| 模块 | 文件 | 题数 | 状态 |
-|---|---|---:|---|
-| concurrency（Fiber / Scheduler / Channel / Mutex / WaitNode / Select / Context） | `01-concurrency.md` | 15 | 完成 |
-| network | `02-network.md` | 20 | 已出（数字口径需按 §三.3 复核） |
-| bento 应用框架 | `03-bento.md` | 20 | 已出（数字口径需按 §三.3 复核） |
-| storage / cache | `04-storage.md` | 20 | 待出 |
-| media | `05-media.md` | 20 | 待出 |
-| p2p | `06-p2p.md` | 20 | 待出 |
-| rpc | `07-rpc.md` | 20 | 待出 |
-| distributed | `08-distributed.md` | 20 | 待出 |
-| observability | `09-observability.md` | 20 | 待出 |
-| tools | `10-tools.md` | 20 | 待出 |
-| app | `11-app.md` | 20 | 待出 |
-| relay / jinshan | `12-relay-jinshan.md` | 20 | 待出 |
-| tunnel | `14-tunnel.md` | 20 | 已出（数字口径需按 §三.3 复核） |
-| os | `15-os.md` | 20 | 待出 |
-| go-api | `16-go-api.md` | 20 | 待出 |
-| bufio | `17-bufio.md` | 20 | 待出 |
-| 汇编/性能专题 | `18-asm.md` | 20 | 待出 |
+| # | 模块 | 文件 | 题数 | 行数 |
+|---|---|---|---:|---:|
+| 01 | concurrency | `01-concurrency.md` | **15** | 316 |
+| 02 | network | `02-network.md` | **20** | 303 |
+| 03 | bento | `03-bento.md` | **20** | 307 |
+| 04 | storage | `04-storage.md` | **5** | 129 |
+| 05 | cache | `05-cache.md` | **5** | 112 |
+| 06 | media | `06-media.md` | **5** | 181 |
+| 07 | p2p | `07-p2p.md` | **5** | 176 |
+| 08 | rpc | `08-rpc.md` | **5** | 201 |
+| 14 | tunnel | `14-tunnel.md` | **20** | 304 |
+| 15 | os | `15-os.md` | **5** | 126 |
+| 16 | go-api | `16-go-api.md` | **5** | 185 |
+| 17 | bufio | `17-bufio.md` | **5** | 128 |
 
- > 合计：concurrency 15 + 已出三卷（network/bento/tunnel 各 20）+ 其余 13 组 × 20 = **335 题**。
-> 注：`02-network.md`、`03-bento.md`、`14-tunnel.md` 由其他出题 agent 产出，题目结构一致，
-> 但它们的「数字口径」段落写在铁律之前（允许引用 docs 数字）；按 §三.3，这三卷的数字题需复核。
-> 说明：concurrency 原计划 32 题，2026-11-03 按要求砍到 15 题，只保留 L3/L4（见 §七）。
+**不单独出卷的 5 个模块**：`09-distributed`、`10-observability`、`11-tools`、`12-app`、
+`13-relay-jinshan` —— 其入口与关键路径见 `user/docs/09…13` 的 §5/§9 与 `user/deep/` 对应篇。
+
+**难度分布**（12 卷合计）：L4 约 45 题、L3 约 55 题、L2 约 15 题，**无纯记忆题**。
+
+> 每卷题面里**故意埋了 1 处错误行号**（该行号在文件里真实存在，但与题意不符）。
+> 答题者若照抄题面行号而没实际 `sed`，即被识别为「未读代码」。埋点清单不在仓库内。
 
 ## 二、每题必须包含的四个字段（缺一不合格）
 
@@ -74,37 +72,17 @@ L1 全对是基本要求；L2 ≥80%；L3 ≥60% 才算真读懂；L4 ≥40% 才
 > 这三条命令已实际执行；其余题里给的 ctest 用例名来自 `ctest -N`（共 290 条），
 > 出题时未逐条重跑，答题者应自己跑并报告结果。
 
-## 六、总索引（concurrency 15 题）
+## 六、答题须知
 
-| 题号 | 难度 | 主题 | 考察机制 | 自证入口 |
-|---|---|---|---|---|
-| Q01 | L4 推演 | 调度器口径 | wall vs submit、历史数字不可复现、对外表述 | `bench_scheduler_task_opt 4 100000 5` |
-| Q02 | L3 陷阱 | runnext 单槽 | 亲和性、挤出到环尾、yield 饿死 | `ctest -R scheduler_smoke` |
-| Q03 | L3 陷阱 | Fiber 栈 | 2 KB→4 KB、8 MiB VA、10 万连接、SIGSEGV 边界 | `ctest -R fiber_growable_stack` |
-| Q04 | L3 陷阱 | Channel vs Vyukov | 单锁语义、实验件定位、Cap=1 退化 | `ctest -R channel_concurrency` |
-| Q05 | L4 推演 | park→wake 长尾 | runnext 消费方与 notify_one 错配、广播修复 | `startup_cost_park_wake` |
-| Q06 | L3 陷阱 | findrunnable | 锁分级、incoming 轮转、netpoll 登记 | `ctest -R scheduler_queue_latency` |
-| Q07 | L4 推演 | sysmon / BlockingRegion | detach 可逆、不能抢占、region 契约 | `ctest -R scheduler_smoke` |
-| Q08 | L4 推演 | shutdown | 未启动/已启动、O(n²)、live_tasks | 10 万 parked G 关停扩展性 |
-| Q09 | L3 陷阱 | 双 claim / 状态字 | execution_claim、run_claim、wake 令牌 | `ctest -R scheduler_smoke` |
-| Q10 | L3 陷阱 | per-P 分片 | 三类分片、O(P) 聚合、drain 精确判零 | `bench_scheduler_task_opt` 1P vs 4P |
-| Q11 | L3 陷阱 | Channel 等待队列 | 侵入式链表、per-node futex、单一赢家 | `ctest -R channel_thread_stress` |
-| Q12 | L3 陷阱 | Mutex 状态字 | 两态、load+store 双持、UpdateStateAtomic | `ctest -R sync_cancel_stress` |
-| Q13 | L3 陷阱 | WaitNode O(n²) | 僵尸节点、全队列重排、FutexMutex | 大量超时等待者压测 |
-| Q14 | L3 陷阱 | Select 有值优先 | closed 延后、传输不可回滚、ABI | `ctest -R select_lockorder_test` |
-| Q15 | L4 推演 | Context 传播 / 回滚 | 先标记后回调、逆序、rollback 冻结 | `ctest -R context_rollback_demo` |
+1. **不许引用 `docs/` 里的性能数字当答案**（项目迭代极快，文档必然滞后）。
+   实证：调度器文档写 122 ns，2026-11-03 本机实测 323/253/155 ns；「pipeline 411k rps」全库查无此数。
+2. **题面给的 `文件:行号` 必须自己 `sed -n` 核**——每卷都有 1 处是错的。
+3. 涉及性能的题，答「本机怎么测 + 你测到的数 + 环境（核数/绑核/轮数）」，不答文档值。
+4. 答不出就写「未答出」，比编造得分高。
 
-## 七、难度与覆盖校验
+## 七、判分口径
 
-- 难度：L3 = 10 题（Q02–Q04、Q06、Q09–Q14），L4 = 5 题（Q01、Q05、Q07、Q08、Q15）；无 L1/L2。
-- 覆盖：Fiber 1、Scheduler 9（口径、runnext、长尾、findrunnable、sysmon、shutdown、双 claim、分片、栈边界与 Scheduler 共用）、
-  Channel 2、Mutex 1、WaitNode 1、Select 1、Context 1。
-- 机制不重复：Q02 只考 runnext 的结构取舍，Q05 只考 park→wake 的故障链；
-  Q01 只考测量口径，Q10 只考分片与精确聚合。
-
-## 八、维护约定
-
-1. 代码改动后先跑 §五 的三条入口，再决定题目是否还成立；失效的行号立即修。
-2. 禁止把「报告里的数字」写进验收；只能写「自己跑并报条件」。
-3. 新增题必须同时给「怎么自证」；给不出自证入口的性能题不收。
-4. 索引与题目文件必须同步改；`docs/exam/` 之外的文件不作为本考试的产出。
+| 等级 | 含义 | 合格线 |
+|---|---|---|
+| L3 陷阱 | 不改就坏的具体场景 | ≥60% |
+| L4 推演 | 跨模块因果、性能归因 | ≥40% |

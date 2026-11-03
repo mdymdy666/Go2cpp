@@ -75,7 +75,7 @@
      `User.Touch` 等到 handler 跑完仍能在 5 s 内成功；这不是取消生效，只是等到了。
   5. 说出 `Stop()` 的死锁条件：在 handler（reader 线程）里调 `Server::Stop()` → `Stop` 对当前
      连接 `Join()` 自己 → `std::system_error`/死锁；正确做法是另起线程或只置停止标志。
-- **自证**：`ctest --test-dir .build-bento-wsl -R '^go2cpp_rpc_test$' --output-on-failure`，
+- **怎么自证**：`ctest --test-dir .build-bento-wsl -R '^go2cpp_rpc_test$' --output-on-failure`，
   它包含 5 ms 超时 + 恢复 + 20 次连续超时。再加探针：服务端 `User.Slow` 睡 300 ms，客户端
   `timeout=5ms`；超时后立刻 `Ping()`，测 `Ping` 的返回时间 → 期望 ≈ 剩余 handler 时间（约 295 ms），
   证明 reader 被占。另起一条连接再 `Ping` → 期望立刻返回，证明阻塞是**每连接**的。
@@ -146,7 +146,7 @@
      `Read` 返回 0（EOF）；`max_message_payload` 默认 64 MiB，大于 RPC 的 4 MiB 帧上限。
   5. 说出线程约束：`Read` 只允许一个线程；`WriteAll` 由上层 `m_write_mutex` 串行化，
      不是靠 WS 自身的写锁。
-- **自证**：`ctest --test-dir .build-bento-wsl -R '^go2cpp_rpc_websocket_test$' --output-on-failure`
+- **怎么自证**：`ctest --test-dir .build-bento-wsl -R '^go2cpp_rpc_websocket_test$' --output-on-failure`
   （真实 WS 握手 + 调用 + 流 + 心跳 + 关闭）。再写探针：把 `WebSocketTransport` 的 `Read` 缓冲
   设为 1 字节，喂一个完整 `kRequest` 帧 → 期望 `FrameCodec::Feed` 分多次才吐出一帧；
   再用 `TcpTransport` 一次写入两个帧 → 期望一次 `Feed` 吐出两帧。

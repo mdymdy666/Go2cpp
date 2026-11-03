@@ -51,29 +51,25 @@
 状态机（表格或 ASCII）/ 失败路径与已知限制 / 典型误用与后果。
 ```
 
-## 四、模块索引（编号与 `user/docs/`、`docs/exam/` 完全一致）
+## 四、模块索引（编号与 `user/docs/`、`docs/exam/` 一致）
 
 | # | 模块 | 文件 | 状态 |
 |---|---|---|---|
-| 01 | 并发运行时（Fiber/Scheduler/Channel/同步原语） | `01-concurrency.md` | **已写**（636 行，13 节） |
-| 02 | 网络数据面（socket/epoll/HTTP/TLS/WS） | `02-network.md` | 待写 |
-| 03 | Bento 传输与会话（Link/PeerHub/FEC/BBR） | `03-bento.md` | 待写 |
-| 04 | 存储（SQLite/ORM/LevelDB/LSM 功能层） | `04-storage.md` | 待写 |
-| 05 | 缓存（7 策略 + TimestampWheel + NodePool） | `05-cache.md` | **已写**（327 行） |
-| 06 | 媒体（采集/编码/传输/渲染/音频） | `06-media.md` | 待写 |
-| 07 | P2P（STUN/打洞/TURN/ICE） | `07-p2p.md` | 待写 |
-| 08 | RPC（G2RP 三形态 + 传输） | `08-rpc.md` | 待写 |
-| 14 | Tunnel（控制/数据分离 + 多路复用） | `14-tunnel.md` | 待写 |
-| 15 | OS（file/Process/epoll/批量 syscall） | `15-os.md` | 待写 |
-| 16 | Go API（标准库兼容层的语义对齐） | `16-go-api.md` | 待写 |
-| 17 | bufio（Reader/Writer/Scanner/ByteSpan） | `17-bufio.md` | 待写 |
+| 01 | concurrency | `01-concurrency.md` | **已写** 636 行 |
+| 02 | network | `02-network.md` | 待写 |
+| 03 | bento | `03-bento.md` | 待写 |
+| 04 | storage | `04-storage.md` | **已写** 361 行 |
+| 05 | cache | `05-cache.md` | **已写** 357 行 |
+| 06 | media | `06-media.md` | **已写** 476 行 |
+| 07 | p2p | `07-p2p.md` | **已写** 360 行 |
+| 08 | rpc | `08-rpc.md` | **已写** 353 行 |
+| 14 | tunnel | `14-tunnel.md` | 待写 |
+| 15 | os | `15-os.md` | **已写** 351 行 |
+| 16 | go-api | `16-go-api.md` | **已写** 354 行 |
+| 17 | bufio | `17-bufio.md` | **已写** 350 行 |
 
-**不单独写 deep 的 5 个模块**：`09-distributed`、`10-observability`、`11-tools`、`12-app`、
-`13-relay-jinshan` —— 这五个的入口与关键路径已在 `user/docs/09…13` 的 §5「源码位置」
-与 §9「交接注意」里给全，深度阅读时按那里的行号直接进源码。若后续要补，编号沿用 09–13。
-
-> `deep/` 与 `exam/` 是两套东西：`exam/` 考「你是否读懂了」，`deep/` 教「你怎么读懂的」。
-> 两者编号一致，同一模块可以对着看：先读 `deep/NN-xxx.md` 建立全局，再用 `exam/NN-xxx.md` 自检。
+**已写 9 份 / 3598 行**；`02-network`、`03-bento`、`14-tunnel` 待写。
+`09–13` 不单独写 deep —— 入口与关键路径见 `user/docs/09…13` 的 §5/§9；阅读时按那里的行号直接进源码。
 
 ## 五、写作与复核流程
 

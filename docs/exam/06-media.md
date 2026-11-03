@@ -4,7 +4,7 @@
 > SFU 指针转发的生命周期与延迟回收、音频重采样的 SIMD 分派边界。
 > 出题依据：`user/docs/06-media.md`、`docs/modules/{webrtc-media,media-audio,jitter-degradation,sfu-signaling}.md`、
 > `docs/audit/`、`AI_COLLAB.md`，以及**当前工作树源码**。
-> 难度分布：L1 = 0、L2 = 0、L3 = 3、L4 = 2。
+> 难度分布：L1 = 0、L2 = 0、L3 = 2、L4 = 3。
 > **本卷数字均需自测，文档数字仅作历史对照。** 文中若出现历史数字，一律视为「可能已过时」；
 > 验收以你跑出来的数为准，并说明测量条件（构建目录、机器、轮数、负载）。
 

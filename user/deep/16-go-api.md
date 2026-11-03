@@ -12,40 +12,40 @@
 | 包 | 入口（类/函数） | 文件:行 | 谁调用它 | 触发什么 | 返回什么 |
 |---|---|---|---|---|---|
 | error | `go::error`（=`ErrorPtr`） | `include/go2cpp/go/error.go.hpp:49` | 所有包 | 错误接口值；`nullptr` = nil | `shared_ptr<const Error>` |
-| error | `New/Wrap/Join/Unwrap` | `error.go.hpp:52/57/62/72` | 业务代码 | 建错误/包一层/聚合/解一层 | `error` |
-| error | `Is/As<T>/ErrorString` | `error.go.hpp:77/83/88` | 业务代码 | 错误图匹配/类型提取/文本 | bool / `shared_ptr<const T>` / string |
-| error | `ErrEOF/ErrClosed/ErrTimeout` | `error.go.hpp:135+` | io/net | 哨兵错误 | `const error&` |
-| context | `Background/TODO` | `context.go.hpp:58/63` | 所有包 | 根上下文 | `ContextPtr` |
-| context | `WithCancel/WithTimeout/WithDeadline` | `context.go.hpp:82/94/101` | 业务代码 | 派生子上下文 + 取消函数 | `CancelContext{context,cancel}` |
-| context | `Done/Err/Cause/Deadline/Value` | `context.go.hpp`（`Done` 在 126 附近） | 业务代码 | 读取消信号/原因/截止/值 | `DoneSignal&` / `error` / optional |
-| context | `WaitDone(ctx[,timeout])` | `context.go.hpp:137-150` | 业务代码 | 阻塞等取消 | void / bool |
-| chan | `Chan<T>::Make(cap)` | `chan.go.hpp:73-89` | 业务代码 | 创建有/无缓冲通道 | `Chan<T>` |
-| chan | `Send/SendCtx/TrySend` | `chan.go.hpp:95/103/111` | 业务代码 | 发送（阻塞/可取消/非阻塞） | bool |
-| chan | `Recv/RecvCtx/TryRecv` | `chan.go.hpp:117/131/149` | 业务代码 | 接收 | `pair<T,bool>` / optional / bool |
-| chan | `Close/IsClosed/Len/Cap` | `chan.go.hpp:172/177/186/183` | 业务代码 | 关闭/查询 | bool / size_t |
-| chan | `Select(cases)` | `chan.go.hpp:235/243` | 业务代码 | 多路等待 | `SelectResult{index,value,...}` |
-| sync | `Mutex::Lock/Unlock/TryLock/LockCtx` | `sync.go.hpp:57-87` | 业务代码 | Fiber 感知互斥 | void/bool |
-| sync | `RWMutex::RLock/...` | `sync.go.hpp:93-112` | 业务代码 | 读写锁（写者优先） | void/bool |
-| sync | `WaitGroup::Add/Done/Wait/WaitCtx` | `sync.go.hpp:114-145` | 业务代码 | 计数等待 | void/bool |
-| sync | `Once::Do/DoNoThrow` | `sync.go.hpp:147-170` | 业务代码 | 只执行一次 | bool |
-| sync | `Cond` | `sync.go.hpp:191+` | 业务代码 | 条件变量 | — |
-| time | `Now/Since/Until/Sleep` | `time.go.hpp:69/74/79/84` | 业务代码 | 时钟/睡眠 | Time/Duration |
+| error | `New/Wrap/Join/Unwrap` | `include/go2cpp/go/error.go.hpp:52/57/62/72` | 业务代码 | 建错误/包一层/聚合/解一层 | `error` |
+| error | `Is/As<T>/ErrorString` | `include/go2cpp/go/error.go.hpp:77/83/88` | 业务代码 | 错误图匹配/类型提取/文本 | bool / `shared_ptr<const T>` / string |
+| error | `ErrEOF/ErrClosed/ErrTimeout` | `include/go2cpp/go/error.go.hpp:135+` | io/net | 哨兵错误 | `const error&` |
+| context | `Background/TODO` | `include/go2cpp/go/context.go.hpp:58/63` | 所有包 | 根上下文 | `ContextPtr` |
+| context | `WithCancel/WithTimeout/WithDeadline` | `include/go2cpp/go/context.go.hpp:82/94/101` | 业务代码 | 派生子上下文 + 取消函数 | `CancelContext{context,cancel}` |
+| context | `Done/Err/Cause/Deadline/Value` | include/go2cpp/go/context.go.hpp:121/127/... | 业务代码 | 读取消信号/原因/截止/值 | `DoneSignal&` / `error` / optional |
+| context | `WaitDone(ctx[,timeout])` | `include/go2cpp/go/context.go.hpp:143-151` | 业务代码 | 阻塞等取消 | void / bool |
+| chan | `Chan<T>::Make(cap)` | `include/go2cpp/go/chan.go.hpp:73-89` | 业务代码 | 创建有/无缓冲通道 | `Chan<T>` |
+| chan | `Send/SendCtx/TrySend` | `include/go2cpp/go/chan.go.hpp:95/103/111` | 业务代码 | 发送（阻塞/可取消/非阻塞） | bool |
+| chan | `Recv/RecvCtx/TryRecv` | `include/go2cpp/go/chan.go.hpp:117/131/159` | 业务代码 | 接收 | `pair<T,bool>` / optional / bool |
+| chan | `Close/IsClosed/Len/Cap` | `include/go2cpp/go/chan.go.hpp:172/188/185/180` | 业务代码 | 关闭/查询 | bool / size_t |
+| chan | `Select(cases)` | `include/go2cpp/go/chan.go.hpp:235/243` | 业务代码 | 多路等待 | `SelectResult{index,value,...}` |
+| sync | `Mutex::Lock/Unlock/TryLock/LockCtx` | `include/go2cpp/go/sync.go.hpp:57-87` | 业务代码 | Fiber 感知互斥 | void/bool |
+| sync | `RWMutex::RLock/...` | `include/go2cpp/go/sync.go.hpp:93-112` | 业务代码 | 读写锁（写者优先） | void/bool |
+| sync | `WaitGroup::Add/Done/Wait/WaitCtx` | `include/go2cpp/go/sync.go.hpp:114-145` | 业务代码 | 计数等待 | void/bool |
+| sync | `Once::Do/DoNoThrow` | `include/go2cpp/go/sync.go.hpp:147-170` | 业务代码 | 只执行一次 | bool |
+| sync | `Cond` | `include/go2cpp/go/sync.go.hpp:191+` | 业务代码 | 条件变量 | — |
+| time | `Now/Since/Until/Sleep` | `include/go2cpp/go/time.go.hpp:69/74/79/84` | 业务代码 | 时钟/睡眠 | Time/Duration |
 | time | `NewTimer/After/AfterChan/NewTicker` | `time.go.hpp`（`After` 等） | 业务代码 | 定时器 | `Timer::Ptr` / `Chan<Time>` |
-| io | `ReadFull/CopyBuffer/WriteString` | `io.go.hpp:83/105/117` | 业务代码 | 读满/拷贝/写串 | `ReadResult`/`WriteResult` |
-| io | `ConnIO` | `io.go.hpp:186` | 业务代码 | net::Conn → io 适配 | 对象 |
+| io | `ReadFull/CopyBuffer/WriteString` | `include/go2cpp/go/io.go.hpp:83/105/117` | 业务代码 | 读满/拷贝/写串 | `ReadResult`/`WriteResult` |
+| io | `ConnIO` | `include/go2cpp/go/io.go.hpp:186` | 业务代码 | net::Conn → io 适配 | 对象 |
 | net | `Listen/Dial` | `net.go.hpp`（`Listen`/`Dial` 自由函数） | 业务代码 | TCP/UDP 监听/连接 | `ListenResult`/`DialResult` |
-| net | `Conn::Read/Write/Close` | `net.go.hpp:102-123` | 业务代码 | 字节流 IO | `IOResult{n,err}` / error |
-| net | `SetDeadline/SetRead/WriteDeadline` | `net.go.hpp:116-123` | 业务代码 | 设置超时 | error |
-| net | `Deadline`（内部） | `net.go.hpp:176-213` | `TCPConn/UDPConn` | 线程安全 deadline 槽 | `SocketDuration` |
-| signal | `Notify/Stop/Ignore/Reset` | `os_signal.hpp:493/560/...` | 业务代码 | 注册/撤销/忽略/恢复 | void |
-| signal | `NotifyList` / `InstallHandler` | `os_signal.hpp:493/381` | 内部 | 装 sigaction + 起分发线程 | void/bool |
-| crc32 | `ChecksumIEEE/Checksum/Update/New` | `crc32.hpp:112/121/132/138` | 业务代码 | 标准 CRC-32 | uint32/`Hash` |
+| net | `Conn::Read/Write/Close` | `include/go2cpp/go/net.go.hpp:102-123` | 业务代码 | 字节流 IO | `IOResult{n,err}` / error |
+| net | `SetDeadline/SetRead/WriteDeadline` | `include/go2cpp/go/net.go.hpp:116-123` | 业务代码 | 设置超时 | error |
+| net | `Deadline`（内部） | `include/go2cpp/go/net.go.hpp:176-213` | `TCPConn/UDPConn` | 线程安全 deadline 槽 | `SocketDuration` |
+| signal | `Notify/Stop/Ignore/Reset` | `include/go2cpp/go/os_signal.hpp:493/560/...` | 业务代码 | 注册/撤销/忽略/恢复 | void |
+| signal | `NotifyList` / `InstallHandler` | `include/go2cpp/go/os_signal.hpp:493/381` | 内部 | 装 sigaction + 起分发线程 | void/bool |
+| crc32 | `ChecksumIEEE/Checksum/Update/New` | `include/go2cpp/go/crc32.hpp:112/121/132/138` | 业务代码 | 标准 CRC-32 | uint32/`Hash` |
 | rand | `Read/Int/Prime` | `crypto_rand.hpp`（`Source` 141、`BigInt` 185、`BigResult` 272） | 业务代码 | CSPRNG/大整数/素数 | `BigResult` |
-| flag | `FlagSet::Parse/Set/PrintDefaults` | `flag.hpp:495/546/581` | 业务代码 | 命令行解析 | `ParseResult` |
-| flag | 全局 `Parse/Set/PrintDefaults` | `flag.hpp:806/836/851` | 业务代码 | 包级 FlagSet | 同左 |
+| flag | `FlagSet::Parse/Set/PrintDefaults` | `include/go2cpp/go/flag.hpp:495/546/581` | 业务代码 | 命令行解析 | `ParseResult` |
+| flag | 全局 `Parse/Set/PrintDefaults` | `include/go2cpp/go/flag.hpp:806/836/851` | 业务代码 | 包级 FlagSet | 同左 |
 
 平台/编译：
-- `signal` 只有 POSIX 实现；`Supported()` 在 Windows 返回 false（`os_signal.hpp:290-296`）。
+- `signal` 只有 POSIX 实现；`Supported()` 在 Windows 返回 false（`include/go2cpp/go/os_signal.hpp:290-296`）。
 - `net` 依赖 `go2cpp::net::Socket`（Fiber 感知的非阻塞 + IOManager 等待）。
 - `crc32` / `crypto_rand` 是项目 `hash` / 自带实现的别名/包装，不是重新实现。
 - 没有独立的 `go::os` 包；`os/signal` 在 `os_signal.hpp`，文件系统能力走 `go2cpp::os`。
@@ -88,25 +88,25 @@
 ### 1.3 复杂场景一：一次 context 取消如何传播到 Fiber/IO
 
 1. 业务：`auto [ctx, cancel] = go::WithTimeout(go::Background(), 100ms);`
-   （`context.go.hpp:94`）→ `Context::WithTimeout`（`src/concurrency/context.cpp:238` 附近）
-   创建子 `State`，把父 `DoneSignal` 的内部回调注册到子（`context.cpp:1854-1877`）。
+   （`include/go2cpp/go/context.go.hpp:94`）→ `Context::WithTimeout`（`src/concurrency/context.cpp:238` 附近）
+   创建子 `State`，把父 `DoneSignal` 的内部回调注册到子（`src/concurrency/context.cpp:1854-1877`）。
 2. 子 `State` 同时起一个 timer，到期调 `CancelDeadline()`；timer 句柄存在 `State` 里，
    `cancel` 或析构时可以撤销。
-3. Fiber 调 `go::net::Conn::Read` → `TCPConn::Read`（`net.go.hpp:326`）→
+3. Fiber 调 `go::net::Conn::Read` → `TCPConn::Read`（`include/go2cpp/go/net.go.hpp:326`）→
    `m_socket->recv(buffer, size, 0, timeout)`。
 4. `Socket::recv` 在非阻塞 fd 上 `recvmsg`；EAGAIN → `wait_ready(fd, kRead, left, cancel_gen)`
    → hook 把当前 Fiber 挂起并注册 epoll（`src/network/socket.cpp` 的 `recv_impl`）。
 5. 100ms 到期（或显式 `cancel()`）：timer 线程/调用线程进入 `DoneSignal::Signal()`
-   （`context.cpp:667`）。
+   （`src/concurrency/context.cpp:667`）。
 6. `Signal()` 锁内把 `internal_callbacks` / `callbacks` 搬到局部，置 `done=true`，锁外
-   `notify_all()`（`context.cpp:690-698`）。
+   `notify_all()`（`src/concurrency/context.cpp:690-698`）。
 7. 先跑 internal 回调：`ContextRollback` 冻结 undo 记录；再跑用户回调。
-   典型用户回调只做 `chan.TrySend` / `Future.Notify`（`context.hpp:25-27` 的警告）。
+   典型用户回调只做 `chan.TrySend` / `Future.Notify`（`include/go2cpp/concurrency/context.hpp:25-27` 的警告）。
 8. 等待 `DoneSignal` 的 Fiber 被 `notify_all` 唤醒（`DoneSignal::Wait` 的 cv）；
-   或 `Select` 的 `DoneCase` 被选中（`chan.go.hpp:221`）。
+   或 `Select` 的 `DoneCase` 被选中（`include/go2cpp/go/chan.go.hpp:221`）。
 9. 如果 IO 等待注册了取消回调，Socket 的 `wait_ready` 被唤醒后返回 `ECANCELED`；
    `recv` 返回 `{-1, ECANCELED}`；`MapSocketError` 把它映射成什么？
-   看 `net.go.hpp:216-232`：`ECANCELED` 不在超时/关闭分支，会落到
+   看 `include/go2cpp/go/net.go.hpp:216-232`：`ECANCELED` 不在超时/关闭分支，会落到
    `New("read: " + strerror)`，**不是** `ErrCanceled`（这是一个语义缺口，移植时要自己判）。
 10. `TCPConn::Read` 返回 `{0, err}`；业务看到错误，检查 `go::Err(ctx)` 或
     `go::Is(err, go::ErrCanceled())`。
@@ -126,9 +126,9 @@
    ...
    ```
    C++ 没有 `defer`；对应物是 RAII/scope guard + `go::Wrap`。
-2. 打开：`go::net::Dial` / 文件 API 返回 `Result<T>`（`error.go.hpp:174-205`）；
+2. 打开：`go::net::Dial` / 文件 API 返回 `Result<T>`（`include/go2cpp/go/error.go.hpp:174-205`）；
    失败时 `err != nullptr`，成功时 `value` 有效。
-3. 包装：`err = go::Wrap(err, "open " + name)`（`error.go.hpp:57`）→ `go2cpp::Wrap`
+3. 包装：`err = go::Wrap(err, "open " + name)`（`include/go2cpp/go/error.go.hpp:57`）→ `go2cpp::Wrap`
    建 `WrappedError`，`Unwrap()` 指向原因。
 4. 判错：`go::Is(err, go::ErrClosed())` 沿错误图遍历，调用每层的 `Is`；
    `SentinelError` 的文本扩展只在哨兵层生效（Q01）。
@@ -154,15 +154,15 @@
 | # | 不变量 | 证据 | 破法后果 |
 |---|---|---|---|
 | 1 | 门面不持有状态/不加缓存/不重试 | `user/docs/16-go-api.md:327-333`、各头文件 | 语义分裂成两套 |
-| 2 | 阻塞点必须进调度器 | `net.go.hpp:326-338`、`Socket::recv` hook | Fiber 占住 M，吞吐塌 |
-| 3 | `go::error` 是 `shared_ptr<const Error>`，空 = nil | `error.go.hpp:26-30`、49 | 把 `New("")` 当 nil |
-| 4 | 哨兵文本匹配只在 `SentinelError` 层 | `error.go.hpp:110-122` | 误以为所有 "EOF" 都匹配 |
-| 5 | context 回调在通知线程同步执行 | `context.hpp:25-27`、`context.cpp:698-718` | 回调阻塞拖住整棵取消树 |
-| 6 | 取消顺序：done → notify → internal → user | `context.cpp:667-718` | 调换会破坏 rollback/等待者 |
-| 7 | nil channel 不阻塞、closed 不 panic | `chan.go.hpp:38-42`、95-100、172-177 | 移植代码静默丢数据 |
-| 8 | `WaitGroup::Wait`/`Mutex::Lock` 无调度器会抛 | `sync.go.hpp:68-70`、124-128 | 裸线程里未捕获 → terminate |
-| 9 | signal handler 只做 async-signal-safe 操作 | `os_signal.hpp:381-415` | 死锁/崩溃 |
-| 10 | `net.Conn::Write` 允许部分写 | `net.go.hpp:108`、326-338 | 半帧发送，协议错位 |
+| 2 | 阻塞点必须进调度器 | `include/go2cpp/go/net.go.hpp:326-338`、`Socket::recv` hook | Fiber 占住 M，吞吐塌 |
+| 3 | `go::error` 是 `shared_ptr<const Error>`，空 = nil | `include/go2cpp/go/error.go.hpp:26-30`、49 | 把 `New("")` 当 nil |
+| 4 | 哨兵文本匹配只在 `SentinelError` 层 | `include/go2cpp/go/error.go.hpp:110-122` | 误以为所有 "EOF" 都匹配 |
+| 5 | context 回调在通知线程同步执行 | `include/go2cpp/concurrency/context.hpp:25-27`、`src/concurrency/context.cpp:698-718` | 回调阻塞拖住整棵取消树 |
+| 6 | 取消顺序：done → notify → internal → user | `src/concurrency/context.cpp:667-718` | 调换会破坏 rollback/等待者 |
+| 7 | nil channel 不阻塞、closed 不 panic | `include/go2cpp/go/chan.go.hpp:38-42`、95-100、172-177 | 移植代码静默丢数据 |
+| 8 | `WaitGroup::Wait`/`Mutex::Lock` 无调度器会抛 | `include/go2cpp/go/sync.go.hpp:68-70`、124-128 | 裸线程里未捕获 → terminate |
+| 9 | signal handler 只做 async-signal-safe 操作 | `include/go2cpp/go/os_signal.hpp:381-415` | 死锁/崩溃 |
+| 10 | `net.Conn::Write` 允许部分写 | `include/go2cpp/go/net.go.hpp:108`、326-338 | 半帧发送，协议错位 |
 
 ---
 
@@ -172,7 +172,7 @@
 
 **职责**：用 C++ 值语义表达 Go 的 `error` 接口，保留 `Is/As/Unwrap/Join`。
 
-- `using error = ErrorPtr`（`error.go.hpp:49`）：`shared_ptr<const Error>`；零值 = nil。
+- `using error = ErrorPtr`（`include/go2cpp/go/error.go.hpp:49`）：`shared_ptr<const Error>`；零值 = nil。
 - `New`（52）→ `NewError`；`Wrap`（57）→ `go2cpp::Wrap`；`Join`（62/67）；`Unwrap`（72）。
 - `Is`（77）→ `go2cpp::Is`：遍历错误图，调用源错误的 `Is(target)`。
 - `As<T>`（83）：`T` 必须继承 `go2cpp::Error`，返回 `shared_ptr<const T>`。
@@ -200,11 +200,11 @@ Is(err, target):
 - `DoneSignal`（71-162）：`Wait/WaitFor/IsDone/AddCallback/AddBeforeDoneCallback`；
   拷贝共享同一状态。
 - `CancelFunc` = `std::function<void()>`；`CancelCauseFunc` = `std::function<void(ErrorPtr)>`。
-- 取消实现（`context.cpp:1266-1288`）：`Cancel` 构造 `CancellationWork`，`DrainCancellation`
+- 取消实现（`src/concurrency/context.cpp:1266-1288`）：`Cancel` 构造 `CancellationWork`，`DrainCancellation`
   迭代传播；已完成直接返回（幂等）。
-- `Signal()`（`context.cpp:667-718`）：顺序 done → notify_all → internal → user；
+- `Signal()`（`src/concurrency/context.cpp:667-718`）：顺序 done → notify_all → internal → user；
   每个回调 try/catch。
-- 值查找（`context.cpp:1300+`）：`Lookup` 沿 parent 链，先 typed_values 再 named_values。
+- 值查找（`src/concurrency/context.cpp:1300+`）：`Lookup` 沿 parent 链，先 typed_values 再 named_values。
 - 深树释放：线程本地 `t_state_release_queue` 迭代析构，避免递归爆栈。
 
 **状态机**：
@@ -219,7 +219,7 @@ Active ──cancel()/deadline/父取消──► Canceled(Err=Canceled/Deadline
 
 ### 2.3 chan / select
 
-- `Chan<T>`（`chan.go.hpp:73-204`）：包装 `go2cpp::Channel<T>`；`Make(cap)`、`Send`、
+- `Chan<T>`（`include/go2cpp/go/chan.go.hpp:73-204`）：包装 `go2cpp::Channel<T>`；`Make(cap)`、`Send`、
   `SendCtx`、`TrySend`、`Recv`、`RecvCtx`、`TryRecv`、`Close`、`Len/Cap`、`RecvCase/SendCase`。
 - `SelectCase` / `SelectResult`：底层 `go2cpp::Select`；`DefaultCase`（216）、`DoneCase`（221）、
   `AfterCase`（time.go.hpp）。
@@ -232,7 +232,7 @@ Active ──cancel()/deadline/父取消──► Canceled(Err=Canceled/Deadline
 
 ### 2.4 sync
 
-- `Mutex`（`sync.go.hpp:57-91`）：`Lock/Unlock/TryLock/LockCtx`；`Lock` 失败抛
+- `Mutex`（`include/go2cpp/go/sync.go.hpp:57-91`）：`Lock/Unlock/TryLock/LockCtx`；`Lock` 失败抛
   `std::logic_error`（无调度器）。
 - `RWMutex`（93-112）：写者优先；`RLock/RUnlock/Lock/Unlock/TryRLock/TryLock`。
 - `WaitGroup`（114-145）：`Add/Done/Wait/WaitCtx/WaitFor`；`Wait` 无调度器抛。
@@ -255,7 +255,7 @@ Active ──cancel()/deadline/父取消──► Canceled(Err=Canceled/Deadline
 
 ### 2.6 io
 
-- `ReadFull`（`io.go.hpp:83`）、`CopyBuffer`（105）、`WriteString`（117）。
+- `ReadFull`（`include/go2cpp/go/io.go.hpp:83`）、`CopyBuffer`（105）、`WriteString`（117）。
 - `ConnIO`（186）：把 `net::Conn` 适配成 `Reader/Writer/Closer`。
 - 语义：`ReadFull` 读满或返回 `ErrUnexpectedEOF`；`Copy` 直到 EOF；`WriteString` 处理短写？
   看 `streams::WriteString` 实现（可能循环）。
@@ -266,7 +266,7 @@ Active ──cancel()/deadline/父取消──► Canceled(Err=Canceled/Deadline
 
 ### 2.7 net
 
-- `Addr`（`net.go.hpp:66-88`）、`Conn`（102-123）、`Listener`（138-150）。
+- `Addr`（`include/go2cpp/go/net.go.hpp:66-88`）、`Conn`（102-123）、`Listener`（138-150）。
 - `TCPConn::Read`（326-338）：deadline 过期立刻 `ErrDeadlineExceeded`；`recv` 返回 0 →
   `ErrEOF`；其它 errno 走 `MapSocketError`（216-232）。
 - `TCPConn::Write`（326-338）：`send` 返回 `transferred >= 0` 就成功，**允许部分写**（Q05）。
@@ -280,7 +280,7 @@ Active ──cancel()/deadline/父取消──► Canceled(Err=Canceled/Deadline
 
 ### 2.8 signal
 
-- `Signal`（`os_signal.hpp:145-187`）：编号 + `String()`；`Interrupt/Kill` 常量。
+- `Signal`（`include/go2cpp/go/os_signal.hpp:145-187`）：编号 + `String()`；`Interrupt/Kill` 常量。
 - `SignalHub`（320-336）：watchers map、watched/ignored/armed 原子掩码、pipe fd、分发线程；
   `g_hub` 是进程级单例，**永不销毁**（避免静态析构期 UAF）。
 - `InstallHandler`（381-415）：`sigaction` + `SA_RESTART`；handler 只做原子读 + `write` +
@@ -305,14 +305,14 @@ Active ──cancel()/deadline/父取消──► Canceled(Err=Canceled/Deadline
 
 ### 2.9 crc32 / crypto/rand / flag
 
-- `crc32`（`crc32.hpp:84-138`）：`Table/Hash/ByteSpan` 是 `go2cpp::hash` 的别名；
+- `crc32`（`include/go2cpp/go/crc32.hpp:84-138`）：`Table/Hash/ByteSpan` 是 `go2cpp::hash` 的别名；
   `IEEE/Castagnoli/Koopman` 常量；`ChecksumIEEE`、`Checksum`、`Update`、`New`。
   任何「优化 crc32」都应落在 `include/go2cpp/hash/crc32.hpp`，不要在门面复制实现。
-- `crypto/rand`（`crypto_rand.hpp:141-...`）：`Source`（141）、`OsSource`（160）、
+- `crypto/rand`（`include/go2cpp/go/crypto_rand.hpp:141-...`）：`Source`（141）、`OsSource`（160）、
   `BigInt`（185）、`BigResult`（272）；`Read/Int/Prime`；`ProbablyPrime` 是小素数试除 +
   Miller-Rabin（没有 Baillie-PSW）；`Prime` 最高两位置 1。
   **差异**：Go 1.26+ 的 `Prime` 忽略传入 reader，这里始终用传入 `Source`（保留可测试性）。
-- `flag`（`flag.hpp:142-581`）：`ParseResult`、`Value`、`FlagSet::Parse/Set/PrintDefaults`；
+- `flag`（`include/go2cpp/go/flag.hpp:142-581`）：`ParseResult`、`Value`、`FlagSet::Parse/Set/PrintDefaults`；
   失败**不退出进程、不自动打印用法**（`-h` 除外）；`ParseDuration` 内联了一份，
   `tools/time.hpp` 的版本待统一。
 
