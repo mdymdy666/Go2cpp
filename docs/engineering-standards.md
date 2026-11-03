@@ -121,7 +121,7 @@ picoquic 重复自研、LevelDB 重复编译、CRC 重复实现。三次都是�
 | 缓存 | Caffeine/Ristretto | ✅ 几何 1.91×（LRU-K 时间轮在跑） |
 | P2P | libnice/Pion | ✅ STUN/打洞/TURN 4/4 |
 | 媒体 | libwebrtc | ✅ 延迟 p50 0.31ms / 差分 514× |
-| 调度器 | Go runtime | ⏳ 160ns vs Go 135（1.19×） |
+| 调度器 | Go runtime | ⏳ 326.7ns vs Go 135.49（**2.41×**，项目最大短板）——出处 `docs/reports/2026-11-01-plan.md:34`、`vs-concurrency.md:199`；阶段 2/3（FiberBin 去锁）未做。历史：685.03 → 326.7（−32.9%）。根治需改 TaskHandle 为侵入式引用（触 API 语义），见 `2026-11-01-plan.md:58-70` |
 | 序列化 | Protobuf | ⏳ 未对比 |
 | 应用框架 | GoFrame/Gin | ⏳ 未对比 |
 
