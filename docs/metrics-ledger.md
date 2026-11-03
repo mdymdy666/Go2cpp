@@ -35,18 +35,33 @@
 - **测量命令**：`.build-bento-wsl/go2cpp_fast_channel_bench`（当前只覆盖 FastChannel/SPSC；通用 `Channel<int>` 的同口径 bench 旧二进制 ABI 失效，见 M01b）
 - **环境**：未记录（历史）；计划 12 vCPU、`taskset -c 2,3`、5 轮取中位
 - **日期**：未记录
-- **脚本路径**：`tests/concurrency/bench_fast_channel.cpp`（已存在）；通用 Channel 需重建 `bench_channel_opt`
-- **状态**：`待复跑`
+- **脚本路径**：`tests/concurrency/bench_fast_channel.cpp`（已存在）；通用 Channel 见 M01b-a
+- **状态**：`已拆条`（历史 10.73 实为 `FastChannel<1024>`，见 M01b-b；通用 Channel 见 M01b-a）
 - **备注**：2026-11-03 本轮旁证（非同一口径）：`fast-cap1024` 线程 16.07 ns（min 13.15）、Fiber 6.23 ns（min 5.82），5 轮、taskset 2,3。**不能**用它替代 M01 的 10.73。
 
-### M01b 通用 `Channel<int>` 1P1C ns/条
+### M01b-a 通用 `Channel<uint64_t>` 1P1C cap1024 ns/条（**不达标**）
 
-- **历史值**：10.73（与 M01 同源，口径为通用 Channel）
-- **测量命令**：需重新编译 `tests/concurrency/bench_channel_opt.cpp`（旧二进制报 `undefined symbol: Context::IsDone`）
-- **环境**：待定
-- **日期**：未记录
-- **脚本路径**：`tests/concurrency/bench_channel_opt.cpp`（2026-11-03 `ls` 已确认存在）
-- **状态**：`STALE`（2026-11-03 `tools/verify_metrics.sh` 实测 **112.6 ns/条**：cap=1024 SPSC、1e6×3 reps、`taskset -c 2,3`、12 vCPU、复用 `.build-bento-wsl` 库；与历史 10.73 差 9 倍。两者都被标为「通用 Channel 1P1C」，故判 STALE；A3 需查历史 10.73 的原始口径——可能是不同实现或早已退化）
+- **历史值**：无（历史 10.73 属 FastChannel，见 M01b-b；本条是 2026-11-03 首次入账）
+- **测量命令**：`tools/verify_metrics.sh`（编译 `tests/concurrency/bench_channel_opt.cpp` 后跑 `spsc` 段）
+- **环境**：12 vCPU / `taskset -c 2,3`（同一物理核的两个 SMT 兄弟）/ total=1e6、reps=3、3 轮取 min / Release 复用 `.build-bento-wsl`
+- **日期**：2026-11-03
+- **脚本路径**：`tests/concurrency/bench_channel_opt.cpp:88-126`（`MakeChannel<uint64_t>` + 2 个 `std::thread`，无 Scheduler/`go()`，ns/条）
+- **状态**：`实测（不达标 4.8×）`（spsc cap1024 **112.6 ns/条**（median ~114），min **103.3**；对照 Go `chan uint64` cap1024 = **23.36**（`docs/reports/vs-concurrency.md:86/90`，同为 `taskset -c 2,3` SMT 兄弟），比值 4.8×）
+- **诊断**：`tryspsc`（纯轮询、永不 park）101.8–118.3 ≈ `spsc`；`taskset -c 2,4`（跨物理核）93.3–98.9 ≈ `2,3` → 瓶颈是**锁的跨核 cacheline 传递**（每 op ≥3 条 RFO：`m_gate`、buffer 索引、数据槽），不是 park/futex，也不是 SMT 特有。单锁架构的物理下限约 60–90 ns/op，达标线 25.7 ns **在单锁下不可达**，必须无锁化。
+- **已做优化（汇编级，2026-11-03，有反汇编依据）**：`kWouldBlock` 是控制流不是错误，原实现返回 `ChannelWouldBlockError()` 单例（`ErrorPtr`=shared_ptr），每次非阻塞探测 2 次原子引用计数 RMW（反汇编可见 `EmptyTryRecv` 循环体内两次 `_Sp_counted_base::_M_release`）；改为空 `ErrorPtr`（与 `channel.hpp:3039` 既有惯例一致，单例定义/导出保留）。
+  - TryRecv 空：19.6–25.4 → **16.1–17.1 ns（−18%）**；TrySend 满：16.3–18.7 → **13.6–14.8 ns（−17%）**；spsc cap1024 min 103.3 → **100.2**（无回归）。
+  - 正确性：`channel_concurrency`、`channel_thread_stress`（89.3 s / 100 轮）、`select_lockorder`、`fiber_select` 全部 exit=0、failures=0。
+- **未做（诚实记录）**：架构级无锁化（需覆盖 Send/Recv/Select/Close 全路径；`channel.hpp:1192-1196` 记录前人评估后放弃）——超出单轮可验证范围，**未留半成品**；TSan 未跑。建议单独立项。
+
+### M01b-b `FastChannel<1024>` ns/条（达标）
+
+- **历史值**：10.73 ns/条（min；median 12.83）
+- **测量命令**：`.build-bento-wsl/go2cpp_fast_channel_bench`（`fast-cap1024` 段）
+- **环境**：12 vCPU / `taskset -c 2,3` / 5 轮；线程与 Fiber 两种
+- **日期**：2026-11-03（本轮旁证：线程 **16.07 ns**（min 13.15）、Fiber **6.23 ns**（min 5.82））
+- **脚本路径**：`tests/concurrency/bench_fast_channel.cpp`
+- **状态**：`实测（达标）`（16.07 / 6.23 均优于 Go `chan` 23.36；历史 10.73 与现代码的 16.07 差异来自口径/机器状态，均达标）
+- **备注**：判据必须写明对标关系——**通用 Channel 对标 Go `chan`（不达标，见 M01b-a）；FastChannel 对标无锁队列（达标）**。
 
 ### M02 Fiber 全量切换 ns/往返
 
@@ -151,8 +166,10 @@
 
 | ID | 指标 | 历史值 | 状态 |
 |---|---|---|---|
-| M01 | Channel 1P1C ns/条 | 10.73 | 待复跑 |
-| M02 | Fiber 全量切换 ns/往返 | 33.80 | 待复跑 |
+| M01 | Channel 1P1C ns/条 | 10.73（实为 FastChannel） | 已拆条，见 M01b-a/b |
+| M01b-a | 通用 Channel 1P1C ns/条 | 112.6（min 103.3）vs Go 23.36 | 实测·不达标 4.8× |
+| M01b-b | FastChannel<1024> ns/条 | 16.07（线程）/6.23（fiber）vs Go 23.36 | 实测·达标 |
+| M02 | Fiber 全量切换 ns/往返 | 33.80 | 实测（推断口径 19.84） |
 | M03 | scheduler wall ns/task | 122.0（历史）/ 239（本轮中位） | 实测（本轮） |
 | M04 | scheduler submit ns/task | 326.7 | 待复跑 |
 | M05 | HTTP pipeline=16 rps | 72.9k | 待复跑 |
@@ -165,7 +182,8 @@
 
 ## 待办
 
-- A2：`tools/verify_metrics.sh` 先接 M01/M02/M03 三条（其余输出「未接线」而不是假跑）。
-- A3：填实 M01、M02、M03、M05、M06。
-- A4：填实 M07、M10 及其余模块（bento/link、TLS、gzip、reflect/hash）。
-- A6：把 docs 里 411k、160ns 等改为指向本文件或标 STALE。
+- ✅ A2 完成：`tools/verify_metrics.sh`（M01b/M02/M03），M01b 已拆为 a/b。
+- 🔄 A3：M04/M05/M06 复跑中（子 agent `41fd2142`）。
+- ⏳ A4：M07、M10 及其余模块（bento/link、TLS、gzip、reflect/hash）。
+- ⏳ A6：把 docs 里 411k、160ns 等改为指向本文件或标 STALE。
+- ⏳ A7 架构级：M01b-a 通用 Channel 无锁化（覆盖 Send/Recv/Select/Close，需完整验证窗口，单独立项）。

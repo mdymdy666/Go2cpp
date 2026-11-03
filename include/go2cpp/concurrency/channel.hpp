@@ -2860,7 +2860,14 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     }
 
     if (nonblocking) {
-      return {ChannelStatus::kWouldBlock, ChannelWouldBlockError()};
+      // `kWouldBlock` 是「现在不能完成」这一控制流的返回值，不是错误：语义已由
+      // `status` 完整表达（Go 的非阻塞 send 也不产生 error）。原实现返回
+      // `ChannelWouldBlockError()` 单例，而 `ErrorPtr` 是 `shared_ptr`，每次探测
+      // 都要复制一次（原子引用计数 ++）并在结果析构时 --。实测空通道 `TryRecv`
+      // 单次约 20ns，其中大部分是这两三次原子 RMW（反汇编可见循环体内两次
+      // _Sp_counted_base::_M_release 调用）。这里返回空 ErrorPtr，把非阻塞探测
+      // 降回纯状态判断；`ChannelWouldBlockError()` 仍保留定义与导出（公共 API）。
+      return {ChannelStatus::kWouldBlock, {}};
     }
     if (DeadlineReached(deadline)) {
       return {ChannelStatus::kTimedOut, ChannelTimeoutError()};
@@ -3241,8 +3248,9 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       return {std::nullopt, false, true, context_status, context_error};
     }
     if (nonblocking) {
-      return {std::nullopt, false, false, ChannelStatus::kWouldBlock,
-              ChannelWouldBlockError()};
+      // 同 SendUntil：kWouldBlock 是控制流，不携带 ErrorPtr（省掉 shared_ptr
+      // 拷贝/析构的原子引用计数 RMW）。
+      return {std::nullopt, false, false, ChannelStatus::kWouldBlock, {}};
     }
     if (DeadlineReached(deadline)) {
       return {std::nullopt, false, false, ChannelStatus::kTimedOut,

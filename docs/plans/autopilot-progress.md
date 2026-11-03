@@ -26,12 +26,12 @@
 | 任务 | 内容 | 状态 |
 |---|---|---|
 | A1 | `docs/metrics-ledger.md`：四要素格式 + 首批 10 条核心数字 | ✅ be73a4e |
-| A2 | `tools/verify_metrics.sh`：接 M01b/M02/M03，跑出 OK/STALE/未接线 | ✅ 本轮（M01b STALE、M02 推断口径、M03 OK） |
-| A3 | 复跑并填实剩余 5 条：M04 scheduler submit、M05 HTTP pipeline=16、M06 SQLite 插入；并确认 M01b 历史 10.73 口径、M02 API 口径 | ⏳ 下一个 |
+| A2 | `tools/verify_metrics.sh`：接 M01b/M02/M03，跑出 OK/STALE/未接线 | ✅ 92dcb25 |
+| A3 | 复跑并填实剩余 5 条：M04 scheduler submit、M05 HTTP pipeline=16、M06 SQLite 插入 | 🔄 子 agent `41fd2142` 在跑 |
 | A4 | 复跑其余：bento/link、bufio、cache、os 批量、TLS、gzip、reflect/hash；不能跑的标原因 | ⏳ |
 | A5 | ledger 接成可校验：一条命令全量对照 + STALE 列表；CI/CMake 钩子警告 | ⏳ |
 | A6 | 清理漂移：411k、160ns 等改为指向 ledger 或标 STALE；grep 无孤立数字 | ⏳ |
-| A7 | 不达标模块优化（首个：M01b 通用 Channel 112.6 ns vs Go 23.36；先口径对齐，确认不达标才按架构→汇编→正确性优化） | 🔄 子 agent `310cf0ca` |
+| A7 | 不达标模块优化（架构→汇编→正确性） | 🔄 首项 M01b 已完成判定+汇编级；架构级（无锁化）建议单独立项 |
 | B1 | VPS `tunnel-server.service`（`--display-host 82.157.147.127`），enable + 重启验证 | ⏳ |
 | B2 | 本机 `start-all.sh` + 健康检查（8080/9101/9102/9103/tunnel-client） | ⏳ |
 | B3 | 外部探针：每 60s curl 公网 health，失败写日志与连续失败数 | ⏳ |
@@ -49,22 +49,21 @@
 
 ## 下一个任务
 
-**A3** — 复跑并填实剩余 5 条，写在 `docs/metrics-ledger.md`：
-1. **M04 scheduler submit ns/task**（单段计时，区别于 M03 的 wall；需要新计时脚本或改 bench）；
-2. **M05 HTTP pipeline=16 单连接 rps**（`tests/network/net_perf_server.cpp` + `tests/network/http_loadgen.go`，Go 环境；跑不到就写「无法复现：缺 X」）；
-3. **M06 SQLite 1e6 行插入 vs 原生**（`tests/storage/bench_db.cpp`，7 轮中位）；
-4. 确认 **M01b** 历史 10.73 的原始口径（是否 FastChannel 而非通用 Channel；查 docs 与提交史）；
-5. 确认 **M02** 的 ledger API 口径（yield ping-pong 是否等价「全量切换」）。
-
-约束：每条必须附「命令 + 环境（核数/绑核/轮数）+ 日期 + 脚本路径」；跑不出就写「无法复现 + 原因」，**不许沿用旧数字**。M01b 若确认历史口径不同，把 ledger 的 M01b 拆成两条（通用 Channel / FastChannel）并各自给实测。
+**A4**（A3 交付后若已填实 M04/M05/M06，则进入 A4）— 复跑其余模块：
+bento/link、bufio（已有 M08）、cache（已有 M09）、os 批量 syscall（M10）、TLS（握手 1.070×）、gzip（压缩/解压）、reflect/hash（SHA-256 2.0–2.4 GB/s、FNV）。
+每条四要素；不能复跑的写「无法复现 + 缺什么」。M01b 的架构级无锁化单独立项（需完整验证窗口）。
 
 ## 本轮记录
 
 - 2026-11-03 13:20 启动：建定时任务 `schedule-0ae729ea`（1800s），建本文件。
-- 2026-11-03 13:2x **A1 完成**（be73a4e）：`docs/metrics-ledger.md` 12 条（M01/M01b/M02/M03/M04/M05/M05b/M06/M07/M08/M09/M10），M03/M08/M09 标实测，M05b（411k）标无出处。
-- 2026-11-03 13:33 **A2 完成**（派子 agent `90a2d336`）：`tools/verify_metrics.sh` 198 行 + `.out` 72 行；
-  - 实跑：M01b **112.6 ns** vs 10.73 → **STALE**（+949%）；M02 **19.84 ns** vs 23.5 → OK（推断口径）；M03 **299 ns** vs 239 → OK（+25%，cpu 中位 627）；
-  - `TOTAL=3 OK=2 STALE=1 未接线=0`，退出码 1；
-  - 主控抽查：`wc -l` 198/72 一致；行号 3 条（bench_channel_opt.cpp:84 PrintRow、bench_fiber_switch_opt.cpp:308 yield PrintRow、bench_scheduler_task_opt.cpp:102 printf）`sed` 全部命中；`git status` 仅新增 tools 两文件，未越界；无临时垃圾；
-  - 已写回 ledger：M01b → STALE、M02 → 实测（推断口径）、M03 备注补 299；
-  - 另有子 agent `18625e09`（doc-drift 台账）在跑，未回。
+- 13:2x **A1**（be73a4e）：ledger 12 条，M03/M08/M09 实测，M05b 无出处。
+- 13:33 **A2**（92dcb25）：`tools/verify_metrics.sh` 198 行；M01b 112.6→STALE、M02 19.84 OK、M03 299 OK；抽查 3 行号命中、无越界。
+- 13:43 用户补充「不达标模块按架构→汇编→正确性优化」，写成硬规则（456ec05）。
+- 13:50 **A7 首项 M01b 完成**（子 agent `310cf0ca`）：
+  - 口径判定：历史 10.73 是 `FastChannel<1024>`（`vs-concurrency.md:88`、`survey.md:133`），不是通用 Channel；Go 23.36 同为 `taskset -c 2,3` SMT 兄弟；
+  - 通用 Channel 实测 112.6（min 103.3）vs Go 23.36 = **4.8×，不达标**；`tryspsc≈spsc`、跨物理核同值 → 瓶颈是跨核 cacheline 传递，单锁下限 60–90 ns，达标需无锁化；
+  - 汇编级优化：`kWouldBlock` 返回空 `ErrorPtr`（省 2 次 shared_ptr 原子 RMW）→ TryRecv −18%、TrySend −17%、spsc 103.3→100.2 无回归；4 个正确性用例全过；
+  - 架构级未做（覆盖 Send/Recv/Select/Close 全路径，超出可验证范围），建议立项；
+  - 主控审查：diff 仅 +11/−3 两处、证据行号全命中（vs-concurrency:88、survey:43/51/133、channel.hpp:3039）、9 项历史改动完好、ctest 3/3 通过；
+  - ledger 拆为 M01b-a（不达标 4.8×）与 M01b-b（FastChannel 达标）。
+- 13:51 **A3 派活**（子 agent `41fd2142`）：M04/M05/M06，Go 1.27.1 已确认可用，`net_perf_server.cpp` 与 `http_loadgen.go` 存在。
