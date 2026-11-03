@@ -91,21 +91,22 @@
 
 ### M04 Scheduler submit ns/task
 
-- **历史值**：326.7 ns
-- **测量命令**：待补（submit 侧单段计时，非 wall）
-- **环境**：未记录
-- **日期**：未记录
-- **脚本路径**：`待建`（需单段 rdtsc 计时脚本）
-- **状态**：`待复跑`
+- **历史值**：326.7 ns（条件未记录；落在本轮「持续积压」口径区间内，不能断言同口径）
+- **测量命令**：`/tmp/bench_scheduler_submit 4 1000000 5 <batch>`（源码 `tests/concurrency/bench_scheduler_submit.cpp`；计时只包 `spawn()` 调用，不含等待，见 :150-163）
+- **环境**：12 vCPU Ryzen 9 8945HX / `taskset -c 2,3` / 4 worker / 1e6 任务每轮 / 每进程 5 轮 × 7 进程 = 35 轮/口径 / loadavg 2.0–3.0
+- **日期**：2026-11-03
+- **脚本路径**：`tests/concurrency/bench_scheduler_submit.cpp`（本轮新增，191 行）
+- **状态**：`实测（双口径）` —— **batch=1024（队列排空直投 P 队列）中位 119.0 ns/task**（p25 92.1 / p75 133.6，min 70.3 / max 210.4）；**batch=65536（持续积压回退 incoming 条带锁）中位 355.7 ns/task**（p25 312.1 / p75 402.7）。两者差 3 倍，**batch 条件必须随数字一起引用**。
 
 ### M05 HTTP/1.1 pipeline=16 单连接 rps
 
 - **历史值**：72.9k req/s（串行 8.9k 的 8.2×）；另 8 连接 239.5k
-- **测量命令**：`net_perf_server` + `tests/network/http_loadgen.go`（需 Go 环境）；当前无现成脚本
-- **环境**：未记录（WSL2 回环口径）
-- **日期**：未记录
-- **脚本路径**：`tests/network/net_perf_server.cpp` + `http_loadgen.go`（`待接线`）
-- **状态**：`待复跑`
+- **测量命令**：服务端 `taskset -c 2,3 net_perf_server http 0 2 hello`（READY 行取端口）；客户端 `loadgen -conns 1 -pipeline 16 -duration 5s -warmup 1s`（`taskset 4-9`）
+- **环境**：12 vCPU / WSL2 回环 / 服务端 2 worker 绑 `2,3` / loadgen 绑 `4-9` / 6 轮 / loadavg 1.4–1.6
+- **日期**：2026-11-03
+- **脚本路径**：`tests/network/net_perf_server.cpp` + `tests/network/http_loadgen.go`（Go 1.27.1）
+- **状态**：`实测` —— **120,755 rps**（6 轮中位：117548 / 118482 / 120624 / 120886 / 126179 / 126485），p50 7–8 µs、p99 15–16 µs、errors=0；pipeline=1 对照 9,122 rps（8.2× 量级，与历史「pipeline 16 是串行 8.2×」同向）。
+- **备注**：历史 72.9k 无法用旧二进制复验（`.build-bento-wsl` 旧 `libgo2cpp_bento_http.a` 缺 `HttpServer::Route` 符号），按当前源码增量重编后测得 120.8k（+65.7%）；差异归因「库版本 + 宿主负载」，基准口径一致，但**不是同二进制对照**。
 - **备注**：「411k rps」全库查无此数，已列为 `无出处`（见 M05b）。
 
 ### M05b 「HTTP pipeline 411k rps」
@@ -120,11 +121,11 @@
 ### M06 SQLite 封装 1e6 行插入 vs 原生
 
 - **历史值**：1.078×（文件库，7 轮中位数）
-- **测量命令**：`.build-bento-wsl/go2cpp_storage_bench`（本轮用 `go2cpp_storage_db_test` 得到 insert 2.72M rows/s，非同一口径）
-- **环境**：未记录
-- **日期**：未记录
+- **测量命令**：`taskset -c 2,3 .build-bento-wsl/go2cpp_storage_bench <每轮独立 tmpdir> 1000000`
+- **环境**：12 vCPU / `taskset -c 2,3` / 文件库 WAL + synchronous=NORMAL + 单事务 + 预编译语句 / SQLite 3.45.1 / 单线程 / 7 轮 / loadavg 0.84–0.91
+- **日期**：2026-11-03
 - **脚本路径**：`tests/storage/bench_db.cpp`
-- **状态**：`待复跑`
+- **状态**：`实测` —— **1.074×（7 轮中位）**：wrapper 368.1 ms（2.72M ops/s）vs 原生 344.9 ms（2.90M ops/s）；逐轮比值 1.040 / 1.088 / 1.134 / 1.074 / 1.046 / 1.071 / 1.088。历史 1.078× 复现（−0.4%），达标（<1.1×）。
 
 ### M07 LevelDB 1e7 Put ops/s 与 1e8 RSS
 
@@ -171,10 +172,10 @@
 | M01b-b | FastChannel<1024> ns/条 | 16.07（线程）/6.23（fiber）vs Go 23.36 | 实测·达标 |
 | M02 | Fiber 全量切换 ns/往返 | 33.80 | 实测（推断口径 19.84） |
 | M03 | scheduler wall ns/task | 122.0（历史）/ 239（本轮中位） | 实测（本轮） |
-| M04 | scheduler submit ns/task | 326.7 | 待复跑 |
-| M05 | HTTP pipeline=16 rps | 72.9k | 待复跑 |
+| M04 | scheduler submit ns/task | 119.0（batch1024）/ 355.7（batch65536） | 实测·双口径 |
+| M05 | HTTP pipeline=16 rps | 120,755（6 轮中位） | 实测 |
 | M05b | HTTP pipeline 411k rps | 无出处 | 无出处 |
-| M06 | SQLite 1e6 插入 | 1.078× | 待复跑 |
+| M06 | SQLite 1e6 插入 | 1.074×（7 轮中位） | 实测·达标 |
 | M07 | LevelDB 1e7 Put / 1e8 RSS | 583k / 87 MiB | 待复跑 |
 | M08 | bufio 1 MiB 分块 | 1853.9 MiB/s | 实测 |
 | M09 | cache hotspot ARC/LRU | 0.7817 / 0.5580（历史）→ 0.7764 / 0.5594（本轮） | 实测 |
@@ -183,7 +184,7 @@
 ## 待办
 
 - ✅ A2 完成：`tools/verify_metrics.sh`（M01b/M02/M03），M01b 已拆为 a/b。
-- 🔄 A3：M04/M05/M06 复跑中（子 agent `41fd2142`）。
+- ✅ A3 完成：M04/M05/M06 已填实（M04 双口径、M05 120.8k、M06 1.074×）。
 - ⏳ A4：M07、M10 及其余模块（bento/link、TLS、gzip、reflect/hash）。
 - ⏳ A6：把 docs 里 411k、160ns 等改为指向本文件或标 STALE。
 - ⏳ A7 架构级：M01b-a 通用 Channel 无锁化（覆盖 Send/Recv/Select/Close，需完整验证窗口，单独立项）。
