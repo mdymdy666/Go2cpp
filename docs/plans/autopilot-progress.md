@@ -45,7 +45,11 @@
 | C2 | user 服务（存储/鉴权/4 接口） | ✅ 3ff147f：25 PASS；QPS 1918.5、p50 4.04ms、p99 7.55ms |
 | C3 | video 服务（videos 表/游标/403/404） | ✅ d0d7798：52 PASS；QPS 3197/p99 0.51ms |
 | C4 | feed 服务（热度/关注流/分页） | ✅ d0d7798：25 条 3 页无重复；QPS 1773.8/p99 0.94ms |
-| C5–C10 | interaction/search/live/gateway/验收/可靠性 | ⏳ 下一个 C5+C6 |
+| C5 | interaction（点赞幂等/评论/计数） | ✅ 8709fd1：80 PASS |
+| C6 | search（前缀+包含/空 q 400/分页） | ✅ 8709fd1：5 用户命中、非法参数 400 |
+| C7 | live（创建/开播/关播/进出） | 🔄 63e1b702 进行中 |
+| C8 | gateway（接通用组件：6 路由/401/聚合健康） | 🔄 63e1b702 进行中 |
+| C9–C10 | 验收脚本 + loadgen + 可靠性 | ⏳ |
 | 通用组件 | singleflight + 一致性哈希 + Gateway | ✅ 93864a6（singleflight 80.6 ns/op、一致性哈希 13.1 ns/op）+ 50a2abf（Gateway checks=50） |
 | B-REQ | B 站复刻需求文档 | ✅ 2a9d43a（255 行） |
 | B-弹幕 | B 站弹幕服务（WS/广播/历史/限流） | ✅ d55cb83：A 发 B 收；50 连接 p99 9.43ms |
@@ -54,12 +58,12 @@
 
 ## 下一个任务
 
-**C5+C6 抖音 interaction + search（下一个）**：
-1. 扩展 `douyin_store`：likes（幂等主键）、comments 表 + 计数更新；
-2. interaction_service（29104）：点赞/取消赞（幂等）、评论/列表、计数同步；
-3. search_service（29106）：`/api/search?q=&type=` 前缀+包含匹配、空 q 400；
-4. 验收：5+ 场景（重复点赞幂等、评论列表、搜索命中/空 q）+ 压测。
-注：通用 realtime 房间组件（B 站弹幕抽出）精简版重派中，交付后接抖音直播间弹幕。
+**C7+C8 抖音 live + gateway（下一个，63e1b702 在跑）**：
+1. 扩展 store rooms 表；live_service（29105）：创建/开播/关播/列表/进出（viewer_count 不为负、非房主 403）；
+2. gateway.cpp 改用 `go2cpp::app::gateway`：6 条前缀路由 + Bearer 中间件 + `/api/health/all` 聚合；
+3. 验收：经网关 6 路由 200、无 token 401、未知 404、聚合健康；live 进房并发 viewer_count 归零；
+4. 压测：经网关 `/api/feed` 1000 次报 QPS/p99。
+注：B 站弹幕 demo 修复（禁跳进度/批量跳出/大小速度）由 `5d0663af` 并行；代码量统计：C++ 498,319 行 / 1090 文件（include 103,899 + src 153,800 + tests 234,304 + app 6,316）。
 
 ## 本轮记录
 
@@ -104,3 +108,6 @@
 - 17:05 **C3+C4 完成**（7767cd2c → d0d7798）：videos 游标分页 52 PASS、25 条 3 页无重复、详情 QPS 3197/p99 0.51ms、feed QPS 1773.8/p99 0.94ms；修多进程 WAL ORM 残留游标。
 - 17:06 **B 站弹幕完成**（675cf514 → d55cb83）：A 发 B 收（3 条同时到达）、429/屏蔽词/房间隔离、50 连接 p99 9.43ms。
 - 17:07 realtime 组件首次派单超时（零产出），已缩小范围重派。
+
+- 18:05 **C5+C6 完成**（344a41e8 产出 + 主控验证 → 8709fd1）：interaction（点赞幂等/评论/计数）+ search（空 q/非法 type 400、limit 夹紧）；accept 脚本 80 PASS / 0 FAIL。
+- 18:06 代码量统计：C++ 498,319 行 / 1,090 文件（include 103,899、src 153,800、tests 234,304、app 6,316）；已给用户审查策略（自动化门禁 + 接口/测试审查 + 高风险抽查 + 每轮 diff），待确认是否生成审查地图。
