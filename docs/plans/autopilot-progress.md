@@ -28,14 +28,17 @@
 | M16 | Go 基线本机实测 + 固化 | ✅ 1b4ae22 + 本轮固化（tools/bench/） |
 | M03 | scheduler 三件套 | 🔄 判定不达标 2.21×；目标追 Go@4 151–163 |
 | borrow | Go 源码借鉴（3 函数，73 行：runnext 位移 / steal runnext / netpoll 前移） | ✅ 本轮（b5ccd296） |
-| B1 | VPS `tunnel-server.service` | 🔄 子 agent `8af8dbe4` 在跑 |
-| A6 | 清理 122/135/411k/0.98× 文档漂移 | 🔄 子 agent `f3638275` 在跑 |
+| B1 | VPS `tunnel-server.service` | ✅ 本轮（enabled/active/restart 正常；公网 404 根因 client 未重注册，主控重启 client 后 200） |
+| A6 | 清理 122/135/411k/0.98× 文档漂移 | ✅ 本轮（12 处 / 7 个 .md，未改历史数字，只加注） |
 | M10/M11 | os readv / gzip 三件套 | ⏳ 排队（等基准独占窗口） |
-| B2–B4 | 本机 start-all / 探针 / 断线恢复 | ⏳ |
+| B2–B4 | 本机 start-all / 探针 / 断线恢复 | ⏳ 下一个（B2/B3 可并行） |
 | C1–C10 | 抖音 P0 | ⏳ |
 
 ## 下一个任务
 
+**B2+B3（并行）**：本机 `start-all.sh` + 健康检查脚本 + 60s 外部探针。
+- B2：启动 gateway(8080)/product(9101)/review(9102)/order(9103)/tunnel-client 的统一脚本（setsid nohup、日志、`pkill -x` 停止），并做一次「全停 → 全起 → 五项健康检查」验证；
+- B3：探针脚本（每 60s curl 公网 `/shop/api/health`，失败写日志与连续失败数），先跑 5 分钟看无失败。
 **M03c（进行中）**：p22 分块复核 + borrow 建议 1。
 1. 二分定位 p22 的哪一块触发 smoke（P19/P20/P21/P22 分别单独应用各跑 20 次）；判定「断言竞态」还是「语义破坏」（park 是否最终到 kWaiting、wake 是否正常）；
 2. 若为语义破坏 → 永久放弃该块；若为竞态 → 修断言（`wait_until(kWaiting, 200ms)`）后全量 ctest + 1e6 压力；
@@ -51,4 +54,6 @@
 - 15:03 派 borrow（`7bfcd2c6`，11 分钟无产出被 interrupt）→ 改派 `b5ccd296`（只读 3 函数、8 分钟时间盒）。
 - 15:14 按用户「并发开启其他任务」并发 4 个：`8af8dbe4`（VPS systemd）、`f3638275`（A6 文档漂移）、`24415abc`（固化 Go 基准）、`b5ccd296`（borrow）。
 - 15:18 **固化完成**（`24415abc`）：`tools/bench/go_sched_bench.go`（75 行，正文与 /tmp 版 `BODY_IDENTICAL`）+ `tools/bench/README.md`（37 行）；编译 BUILD_OK；3 轮 290/176/133（median 176.19，min 133.43），复跑 256/131.8/184.2、5 轮中位 184.55 —— 与 M16 162.7 同量级但抖动大（核 2 有 cpptools/mysqld 共享），程序逐字节一致；主控抽查：75/37 行、BODY_IDENTICAL、`git status` 仅 `?? tools/bench/`。ledger M16 脚本路径已更新。已合并 `a2ce97b`。
-- 15:22 **borrow 完成**（`b5ccd296`，73 行，8 分钟时间盒内）：3 条建议——① `publish_runnext` 的 displaced 满环时走 `enqueue` 全局锁（Go 无条件踢回普通 runq 尾，`proc.go:7547-7549` ↔ `scheduler.cpp:4015/4031-4033`）→ 改由本 P overflow/incoming 承接；② 本项目刻意不偷 runnext（`:5866` 注释 + 历史「跨 M 恢复 15%→85%」反证），Go 有 `stealRunNextG` 3µs 退避（`proc.go:7720-7724`）→ 加开关、默认关；③ netpoll(0) 前移（Go `proc.go:3510-3513` 在偷之前 poll，本项目 `:6278` 无 G 才进 IO）→ Top-1；主控抽查：Go 7547/7718/7720/3510-3512 与 scheduler.cpp 4015/4031-4033/5859/5866 全部命中；主控决定先做「p22 分块复核 + 建议①」而非 netpoll（对 churn 收益更直接）。
+- 15:22 **borrow 完成**（`b5ccd296`，73 行）：3 条建议（runnext displaced 走全局锁 / steal runnext / netpoll 前移），Go 与 scheduler.cpp 行号抽查全命中；已合并 `30220e3`。主控决定先做「p22 分块复核 + 建议①」。
+- 15:26 **B1 完成**（`8af8dbe4`）：VPS 装 `/etc/systemd/system/tunnel-server.service`（17 行，`--display-host 82.157.147.127`，Restart=always），`enable --now` 后 is-enabled=enabled / is-active=active、8443+7443 LISTEN、`systemctl --failed` 无本项目；`restart` 后 PID 308685→308884、端口仍在。**公网 404** 根因定位：`/__tunnel__/status` 的 `tunnels:[]`，本机 client(PID 1684) 存活但未重注册。主控重启 client（`pkill -x` + `setsid nohup`，新 PID 198565）后：**public_products=200、public_health=200**，status 出现 `"subdomain":"shop"`、online_ms=6690。
+- 15:28 **A6 完成**（`f3638275`）：12 处 / 7 个 .md 加注（engineering-standards:124-125「口径不可考，不构成达标证据」、survey:35/222/247、vs-concurrency:28/207/227、user/docs/01:271、doc-drift:8、opt-review:6、asm-review:6），历史表格数字保留、只加「135.49 是 min（median 185）、源码丢失、见 M16/M03」；明确不改 exam 题面、411k、160ns（分布式清扫）、两处独立 0.98×。主控抽查 3 处通过。

@@ -3,7 +3,7 @@
 - 审查对象：`/UserData/CodexWorkSpace/Go2cpp`（WSL），构建目录 `.build-bento-wsl`（Release）
 - 审查性质：**只读**。未修改工作树内任何实现/测试/文档文件；本报告与临时基准二进制只落在 `/tmp`、`/var/tmp`
 - 基准：`tests/concurrency/bench_scheduler_task_opt.cpp`（4P/4M、单生产者、空任务体、N 轮）
-- 关联：#task 池化后 557ns、Go 135ns；待消除 gap 分项由上层给出
+- 关联：#task 池化后 557ns、Go 135ns（历史 min 口径，median≈185，源码已丢失；口径不可考，见 `docs/metrics-ledger.md` M16）；待消除 gap 分项由上层给出
 
 ---
 

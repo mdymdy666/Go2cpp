@@ -5,7 +5,7 @@
 
 | # | 位置 | 文档说 | 源码/事实 | 证据 | 状态 |
 |---|---|---|---|---|---|
-| 1 | `docs/engineering-standards.md` §六 | 调度器 `160ns vs Go 135（1.19×）` | 全仓无任何报告支撑该数字；实测基线是 wall 122.0（`3b4e590`）与 submit 326.7（`127a688`），两者不同口径 | `git log -- src/concurrency/scheduler.cpp` | 已修（`18e985b`） |
+| 1 | `docs/engineering-standards.md` §六 | 调度器 `160ns vs Go 135（1.19×）` | 全仓无任何报告支撑该数字；122.0（`3b4e590`）与 submit 326.7（`127a688`）是两个不可混用口径，且 122.0 本身口径不可考（见 `docs/metrics-ledger.md` M03） | `git log -- src/concurrency/scheduler.cpp` | 已修（`18e985b`） |
 | 2 | 多处口头/文档 | HTTP pipeline `411k rps` | 全库查无此数；可复核的是 pipeline=16 单连接 **72.9k**、深度 8 → 53.7k、串行 8.9k | `docs/reports/asm-http-e2e.md:18,127,234` | 已更正 |
 | 3 | `user/docs/14-tunnel.md:183` | `cmake --build --target tunnel-server tunnel-client` | CMake target 是 `tunnel_server`/`tunnel_client`，横线只是 `OUTPUT_NAME` | `cmake/Go2CppTunnel.cmake:77-83` | 已修（`a8eaced`） |
 | 4 | `user/docs/14-tunnel.md:298` | `go2cpp_tunnel_test --filter protocol` | 测试程序不读 argv，无 `--filter` | `tests/tunnel/test_tunnel.cpp` grep 无命中 | 已修（`a8eaced`） |

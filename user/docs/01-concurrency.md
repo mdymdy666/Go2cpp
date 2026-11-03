@@ -268,6 +268,8 @@ AMD Ryzen 9 8945HX / WSL2 12 vCPU，`taskset -c 2,3` 绑同一物理核的两个
 | Context `IsDone`（ns） | **0.42** | Go 6.24 | **赢 14.9×**（`WithCancel` 创建 265.6 反而输 3.5×） |
 | 调度器任务（ns/任务） | 685.03（后续快照 326.7） | Go 135.49 | **输 5.06×（最大短板）** |
 
+> ⚠️ **2026-11-03 复核**：Go 135.49 ns 是 **min** 统计（median 185）、`bench_go.go` 已丢失，口径不可考；5.06× 仅作历史对照。本机 Go@4 基线见 `docs/metrics-ledger.md` M16（151–163 ns）。
+
 指令级证据见 [2026-11-01-asm-concurrency-review.md](../../docs/reports/2026-11-01-asm-concurrency-review.md)
 （`objdump -d` 数指令，GCC 13.3 `-O3 -DNDEBUG`）：`Scheduler::spawn` **194** 条指令、
 `Scheduler::enqueue` **789** 条 / 栈帧 **712 B**、`Scheduler::wake_registered` **294** 条、

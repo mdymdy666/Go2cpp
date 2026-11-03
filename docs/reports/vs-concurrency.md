@@ -25,6 +25,8 @@
 | Context `WithCancel` 创建（ns） | 265.6 | Go 76.0 | **输 3.5×** |
 | 调度器任务（ns/任务） | 685.03（后续快照 326.7） | Go 135.49 | **输 5.06×（最大短板）** |
 
+> ⚠️ **2026-11-03 复核**：Go 135.49 ns 是 **min** 统计（median 185），`bench_go.go` 源码已丢失，口径不可考；5.06× 仅作历史对照。本机重测见 `docs/metrics-ledger.md` M16（Go@4 151–163 ns）。
+
 **一句话**：数据面（Channel / 裸切换 / Fiber 切换 / Mutex 快路径 / WG / Context 读路径）已达或超过工业库；
 控制面（调度器任务生命周期、CV 热路径、Context 创建）落后 Go 一档到一档半。
 
@@ -202,6 +204,8 @@ fast-cap1024（Fiber 模式）median **7.79 ns/op**、min 7.15；fast-cap64（Fi
 
 > **口径警告**：三个数字来自三个不同快照与三种「任务」定义（是否含入队、是否含 `wait_for` 完成通知），
 > **不可画成一条下降曲线**。这一点列入 §11「待补/需统一口径」。
+>
+> ⚠️ 另（2026-11-03 复核）：Go 135.49 ns 为 **min** 统计（median 185），且 `bench_go.go` 源码已丢失 → 口径不可考；本机 Go@4 基线见 `docs/metrics-ledger.md` M16（151–163 ns），C++ 同轮中位见 M03（239 ns）。
 
 **结论**：调度器是唯一「明显没到极速」的项——数据面已到位（Channel 赢 Go 2.18×、Fiber 23.5 ns 近物理下限 21 ns），
 但任务创建仍 2.4–5× Go。汇编审查给出的根因不是换栈汇编（只占 6.4 ns），而是
@@ -220,7 +224,7 @@ fast-cap1024（Fiber 模式）median **7.79 ns/op**、min 7.15；fast-cap64（Fi
 | CV 287 vs Go 175 | Go 用用户态 park/unpark（同 P 内状态切换）；我们是原子槽 + 自旋观察，跨 OS 线程付缓存行迁移 |
 | WG 唤醒 35.7 µs vs Go 10.9 µs | 我们走 `FUTEX_WAKE`（单次 19–20 µs，WSL2 内核成本）；Go 在用户态链上直接 goready |
 | ctx 创建 265.6 vs 76 | 我们 5 次堆分配 + WithTimeout 专用 timer 线程；Go 一个结构体 + 定时器堆 |
-| 调度器 685 vs 135 | `shared_ptr<Task>` + 独立 Fiber + 入队/出队 + `wait_for` 完成通知；Go 2 KB 栈 + P 本地缓存 + freelist |
+| 调度器 685 vs 135（历史 min，见 ledger M16） | `shared_ptr<Task>` + 独立 Fiber + 入队/出队 + `wait_for` 完成通知；Go 2 KB 栈 + P 本地缓存 + freelist |
 
 **共性结论**：
 1. **数据面赢在「零同步 / 零分配」**——凡是稳态可以纯原子推进的路径，我们都到或超过工业库；

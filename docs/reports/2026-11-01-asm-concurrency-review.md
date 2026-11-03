@@ -3,7 +3,7 @@
 - 审查对象：`/UserData/CodexWorkSpace/Go2cpp`，构建 `.build-bento-wsl`（Release, `-O3 -DNDEBUG`，GCC 13.3，x86-64）
 - 方法：`objdump -d --no-show-raw-insn -C` 反汇编 `libgo2cpp_scheduler.so` / `libgo2cpp_sync.so` / `libgo2cpp_channel.so` / `bento_channel_thread_stress`，逐函数数指令、定位原子/调用/分支；`go tool objdump` 反汇编 Go 1.x `runtime.newproc/newproc1` 做对照
 - 边界：全程只读，未修改任何仓库文件；本报告与中间反汇编产物仅落在 `/tmp`
-- 基线（来自任务背景）：任务 656–764 ns（Go 135 ns，4.2×）；Channel 10.73 ns（第一）；Mutex 3.75 ns；Fiber 切换 23.5 ns（物理下限 21 ns，不在本次范围）
+- 基线（来自任务背景）：任务 656–764 ns（Go 135 ns 为历史 min 口径、median≈185，口径不可考，见 `docs/metrics-ledger.md` M16；4.2× 仅作历史对照）；Channel 10.73 ns（第一）；Mutex 3.75 ns；Fiber 切换 23.5 ns（物理下限 21 ns，不在本次范围）
 
 ---
 
