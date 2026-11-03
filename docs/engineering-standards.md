@@ -121,7 +121,8 @@ picoquic 重复自研、LevelDB 重复编译、CRC 重复实现。三次都是�
 | 缓存 | Caffeine/Ristretto | ✅ 几何 1.91×（LRU-K 时间轮在跑） |
 | P2P | libnice/Pion | ✅ STUN/打洞/TURN 4/4 |
 | 媒体 | libwebrtc | ✅ 延迟 p50 0.31ms / 差分 514× |
-| 调度器 | Go runtime | ⏳ 326.7ns vs Go 135.49（**2.41×**，项目最大短板）——出处 `docs/reports/2026-11-01-plan.md:34`、`vs-concurrency.md:199`；阶段 2/3（FiberBin 去锁）未做。历史：685.03 → 326.7（−32.9%）。根治需改 TaskHandle 为侵入式引用（触 API 语义），见 `2026-11-01-plan.md:58-70` |
+| 调度器 | Go runtime | ✅ **wall 122.0ns vs Go 135.49（0.98×，首次赢）** —— `3b4e590`（11-01 09:41，per-P runnable 分片，wall 156.7→122.0，−34.7%）
+| | | ⚠️ **另一口径 submit 326.7ns** —— `127a688`（10-31 20:17 阶段1，486.7→326.7，−32.9%）。**两个口径不可混用**（`2026-11-01-scheduler-opt-review.md:19,272` 明确要求 wall 与 提交侧 rdtsc 分开报）。完整链：685（`75dba1a`）→ 557（`b1298bb`）→ 326.7 submit（`127a688`）→ **122.0 wall**（`3b4e590`）→ wall 249→189（`3e04af0`，另一场景）；`49223be` 是长尾修复（p50 9.72ms→18.66µs，521×），非吞吐 |
 | 序列化 | Protobuf | ⏳ 未对比 |
 | 应用框架 | GoFrame/Gin | ⏳ 未对比 |
 
