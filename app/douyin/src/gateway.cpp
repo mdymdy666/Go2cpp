@@ -44,6 +44,7 @@ using go2cpp::app::gateway::Gateway;
 using go2cpp::app::gateway::Handler;
 using go2cpp::app::gateway::Matcher;
 using go2cpp::app::gateway::MethodMask;
+using go2cpp::app::gateway::Next;
 using go2cpp::app::gateway::PathParams;
 using go2cpp::app::gateway::Request;
 using go2cpp::app::gateway::Response;
@@ -160,6 +161,40 @@ Result<void> ServeHome(Request& /*request*/, Response& response) {
     response.header.set("Cache-Control", "no-store");
     response.body = douyin::kHomePageHtml;
     return Result<void>::Ok();
+}
+
+/// @brief 上传体积上限（32 MiB），与 video_service 的 kMaxUploadBytes 保持一致。
+constexpr std::size_t kMaxUploadBytes = 32 * 1024 * 1024;
+
+/**
+ * @brief 上传体中间件：`POST /api/video/upload` 超过 32 MiB 在网关直接 400。
+ *
+ * @param request [in,out] 入站请求——借用；只读 method / path / body。
+ * @param response [out] 出站响应——超限时写 400 JSON；放行时保持原值。
+ * @param next [in] 中间件链的下一环——**必须**在放行时调用且只调用一次。
+ * @return 总是 Ok；超限时链被截断，响应已填好。
+ *
+ * ## 定位
+ * 网关是视频字节的第一道闸门：请求体已被网关完整读入，若超限仍转发，
+ * 上游 video_service 会在读满上限后直接回包并关闭连接，客户端剩余字节
+ * 触发 RST，最终表现为 502 而不是 400。这里提前拒绝保证语义稳定。
+ */
+Result<void> LimitUploadSize(Request& request, Response& response,
+                             const Next& next) {
+    // step1: 只拦上传路径，其余请求原样交给后续路由。
+    if (request.method != Method::Post ||
+        request.path_view() != "/api/video/upload") {
+        return next();
+    }
+    // step2: 超限直接 400，不再产生上游连接。
+    if (request.body.size() > kMaxUploadBytes) {
+        response.status = Status::BadRequest;
+        response.header.set("Content-Type", "application/json; charset=utf-8");
+        response.body =
+            "{\"ok\":false,\"error\":\"视频不能超过 32 MiB\",\"code\":400}";
+        return Result<void>::Ok();
+    }
+    return next();
 }
 
 /// @brief 注册首页路由（自定义 Matcher + 本地 Handler）；失败时打印并返回 false。
@@ -425,6 +460,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     auto gateway = std::move(created.value());
+
+    // 上传体积闸门：放在路由/转发之前，超 32 MiB 的请求不产生上游连接。
+    gateway->Use(LimitUploadSize);
 
     if (!AddHomeRoute(gateway.get()) || !AddVideoRoute(gateway.get())) {
         return 1;

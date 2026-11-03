@@ -89,6 +89,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   }
   .auth input:focus { border-color: rgba(37, 244, 238, .55); box-shadow: 0 0 0 3px rgba(37, 244, 238, .12); }
   .auth input[type=password] { width: 118px; }
+  .upload-btn { white-space: nowrap; }
   .btn-primary {
     padding: 7px 17px; font-size: 13px; font-weight: 700; color: #fff;
     border-radius: 9px; background: linear-gradient(92deg, var(--pink), #ff5c7a);
@@ -382,6 +383,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     <input class="login-only" id="password" type="password" value="123456"
            placeholder="密码" autocomplete="current-password">
     <button class="btn-primary login-only" id="loginBtn" type="button">登录</button>
+    <input type="file" id="uploadInput" accept="video/mp4" hidden>
+    <button class="btn-ghost upload-btn" id="uploadBtn" type="button">上传</button>
     <button class="btn-ghost" id="logoutBtn" type="button" style="display:none">退出</button>
   </div>
 </header>
@@ -470,6 +473,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   var modalEl = document.getElementById('videoModal');
   var modalVideo = document.getElementById('modalVideo');
   var modalTitle = document.getElementById('vmTitle');
+  var uploadBtn = document.getElementById('uploadBtn');
+  var uploadInput = document.getElementById('uploadInput');
 
   /* ---------- 基础工具 ---------- */
 
@@ -793,10 +798,71 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     }
   }
 
+  /* ---------- 上传自己的视频 ---------- */
+
+  /* 上传成功后把新视频插到 feed 首位：服务端 feed 按热度排序，新视频
+     没有互动分，不插入的话会被种子数据的高评论视频挤到后面。 */
+  function insertUploaded(video) {
+    var item = {
+      video: video,
+      author: (state.user && (state.user.name || state.user.email)) ||
+              ('user' + (video.user_id || ''))
+    };
+    state.items.unshift(item);
+    feedEl.innerHTML = '';
+    var frag = document.createDocumentFragment();
+    state.items.forEach(function (it, i) { frag.appendChild(buildSlide(it, i)); });
+    feedEl.appendChild(frag);
+    feedEl.scrollTop = 0;
+    setupObserver();
+  }
+
+  function uploadVideo(file) {
+    var title = file.name || '未命名视频';
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', 'api/video/upload?title=' + encodeURIComponent(title));
+    xhr.setRequestHeader('Authorization', 'Bearer ' + state.token);
+    xhr.setRequestHeader('Content-Type', 'video/mp4');
+    uploadBtn.disabled = true;
+    uploadBtn.textContent = '上传 0%';
+    var reset = function () {
+      uploadBtn.disabled = false;
+      uploadBtn.textContent = '上传';
+    };
+    xhr.upload.onprogress = function (e) {
+      if (e.lengthComputable && e.total > 0) {
+        uploadBtn.textContent =
+          '上传 ' + Math.round(e.loaded / e.total * 100) + '%';
+      }
+    };
+    xhr.onload = function () {
+      reset();
+      var data = null;
+      try { data = JSON.parse(xhr.responseText || '{}'); } catch (e) { data = null; }
+      if (xhr.status === 200 && data && data.ok && data.video) {
+        toast('上传成功', 'ok');
+        insertUploaded(data.video);
+        return;
+      }
+      var err = new Error((data && data.error) || ('HTTP ' + xhr.status));
+      err.status = xhr.status;
+      if (!handleAuthError(err)) toast('上传失败：' + err.message, 'err');
+    };
+    xhr.onerror = function () {
+      reset();
+      toast('上传失败：网络错误', 'err');
+    };
+    xhr.send(file);
+  }
+
   /* ---------- feed 渲染 ---------- */
 
-  function videoSrc(id) {
-    return 'videos/' + ((Number(id) % 3) + 1) + '.mp4';
+  /* 上传的视频用服务端返回的 videos/upload_* 相对路径；其余沿用 1..3 演示源。 */
+  function videoSrc(v) {
+    v = v || {};
+    var url = String(v.url || '');
+    if (/^videos\/[A-Za-z0-9_.-]+$/.test(url)) return url;
+    return 'videos/' + ((Number(v.id) % 3) + 1) + '.mp4';
   }
 
   function authorName(item) {
@@ -815,7 +881,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
     var video = document.createElement('video');
     video.className = 'main-video';
-    video.src = videoSrc(id);
+    video.src = videoSrc(v);
     video.muted = true;
     video.loop = true;
     video.playsInline = true;
@@ -1044,7 +1110,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         cardBtn.className = 'pv-card';
         cardBtn.dataset.id = String(v.id || 0);
         var pv = document.createElement('video');
-        pv.src = videoSrc(v.id);
+        pv.src = videoSrc(v);
         pv.muted = true;
         pv.playsInline = true;
         pv.preload = 'metadata';
@@ -1106,7 +1172,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     state.modalOpen = true;
     modalTitle.textContent = (v.title || ('视频 #' + v.id)) +
       ' · @' + authorName(item || { video: v });
-    modalVideo.src = videoSrc(v.id);
+    modalVideo.src = videoSrc(v);
     modalEl.hidden = false;
     var p = modalVideo.play();
     if (p && p.catch) p.catch(function () {});
@@ -1123,6 +1189,15 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   /* ---------- 事件绑定与启动 ---------- */
 
   document.getElementById('loginBtn').addEventListener('click', login);
+  document.getElementById('uploadBtn').addEventListener('click', function () {
+    if (!state.token) { toast('请先登录', 'err'); return; }
+    uploadInput.click();
+  });
+  uploadInput.addEventListener('change', function () {
+    var file = uploadInput.files && uploadInput.files[0];
+    uploadInput.value = '';
+    if (file) uploadVideo(file);
+  });
   document.getElementById('logoutBtn').addEventListener('click', logout);
   document.getElementById('password').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') login();

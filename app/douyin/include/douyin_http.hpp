@@ -60,9 +60,9 @@ struct HttpResponse {
 /// @brief 命中路由返回 true 并填好 response；返回 false 由服务器回 404。
 using HttpHandler = std::function<bool(const HttpRequest&, HttpResponse*)>;
 
-/// @brief 单次请求的字节上限（头 64 KiB + body 1 MiB）。
+/// @brief 单次请求的字节上限（头 64 KiB + body 32 MiB，容纳视频上传）。
 inline constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
-inline constexpr std::size_t kMaxBodyBytes = 1024 * 1024;
+inline constexpr std::size_t kMaxBodyBytes = 32 * 1024 * 1024;
 
 /// @brief 状态码 → reason phrase。
 inline const char* StatusText(int status) {
@@ -315,7 +315,7 @@ inline bool JsonStringField(std::string_view body, std::string_view key, std::st
 /// @brief 单连接处理：读完整请求 → 交给 handler → 写响应。
 inline void ServeConnection(go2cpp::net::Socket& connection, const HttpHandler& handler) {
     std::string buffer;
-    char chunk[4096];
+    char chunk[64 * 1024];
     std::size_t body_begin = 0;
     bool header_done = false;
 
