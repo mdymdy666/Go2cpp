@@ -26,7 +26,7 @@
 |---|---|---|
 | A1–A5 | ledger/三基线/M04-M15/全量校验 | ✅ 至 b0c9013 |
 | M16 | Go 基线本机实测 + 固化 | ✅ 1b4ae22 + 本轮固化（tools/bench/） |
-| M03 | scheduler 三件套 | 🔄 判定不达标 2.21×；目标追 Go@4 151–163 |
+| M03 | scheduler 三件套 | ✅ 收口：P19+P21+P22 组合 −3.9~−4.1%（<5%），P20 剔除；已回滚零改动，判「无可验证 >5% 空间」 |
 | borrow | Go 源码借鉴（3 函数，73 行：runnext 位移 / steal runnext / netpoll 前移） | ✅ 本轮（b5ccd296） |
 | B1 | VPS `tunnel-server.service` | ✅ 本轮（enabled/active/restart 正常；公网 404 根因 client 未重注册，主控重启 client 后 200） |
 | A6 | 清理 122/135/411k/0.98× 文档漂移 | ✅ 本轮（12 处 / 7 个 .md，未改历史数字，只加注） |
@@ -39,7 +39,7 @@
 **B2+B3（并行）**：本机 `start-all.sh` + 健康检查脚本 + 60s 外部探针。
 - B2：启动 gateway(8080)/product(9101)/review(9102)/order(9103)/tunnel-client 的统一脚本（setsid nohup、日志、`pkill -x` 停止），并做一次「全停 → 全起 → 五项健康检查」验证；
 - B3：探针脚本（每 60s curl 公网 `/shop/api/health`，失败写日志与连续失败数），先跑 5 分钟看无失败。
-**M03c（进行中）**：p22 分块复核 + borrow 建议 1。
+**M10 三件套（下一个）**：os readv（当前 14.68×，历史 20.9×）。先 baseline（`/tmp/bench_vectored /tmp` 3 次）→ 架构（批大小/iovec 复用/去掉每批 vector）→ 汇编（`AdvanceIov`/readv 包装指令）→ 正确性（os_test + 边界 1025 段/零长/EOF）→ 前/后数据。
 1. 二分定位 p22 的哪一块触发 smoke（P19/P20/P21/P22 分别单独应用各跑 20 次）；判定「断言竞态」还是「语义破坏」（park 是否最终到 kWaiting、wake 是否正常）；
 2. 若为语义破坏 → 永久放弃该块；若为竞态 → 修断言（`wait_until(kWaiting, 200ms)`）后全量 ctest + 1e6 压力；
 3. 落地 borrow 建议 1（`publish_runnext` 的 displaced 由本 P overflow 承接，避免 `enqueue` 全局锁）：先测 displaced 频率，再改，跑 bench + 正确性；
@@ -56,4 +56,5 @@
 - 15:18 **固化完成**（`24415abc`）：`tools/bench/go_sched_bench.go`（75 行，正文与 /tmp 版 `BODY_IDENTICAL`）+ `tools/bench/README.md`（37 行）；编译 BUILD_OK；3 轮 290/176/133（median 176.19，min 133.43），复跑 256/131.8/184.2、5 轮中位 184.55 —— 与 M16 162.7 同量级但抖动大（核 2 有 cpptools/mysqld 共享），程序逐字节一致；主控抽查：75/37 行、BODY_IDENTICAL、`git status` 仅 `?? tools/bench/`。ledger M16 脚本路径已更新。已合并 `a2ce97b`。
 - 15:22 **borrow 完成**（`b5ccd296`，73 行）：3 条建议（runnext displaced 走全局锁 / steal runnext / netpoll 前移），Go 与 scheduler.cpp 行号抽查全命中；已合并 `30220e3`。主控决定先做「p22 分块复核 + 建议①」。
 - 15:26 **B1 完成**（`8af8dbe4`）：VPS 装 `/etc/systemd/system/tunnel-server.service`（17 行，`--display-host 82.157.147.127`，Restart=always），`enable --now` 后 is-enabled=enabled / is-active=active、8443+7443 LISTEN、`systemctl --failed` 无本项目；`restart` 后 PID 308685→308884、端口仍在。**公网 404** 根因定位：`/__tunnel__/status` 的 `tunnels:[]`，本机 client(PID 1684) 存活但未重注册。主控重启 client（`pkill -x` + `setsid nohup`，新 PID 198565）后：**public_products=200、public_health=200**，status 出现 `"subdomain":"shop"`、online_ms=6690。
-- 15:28 **A6 完成**（`f3638275`）：12 处 / 7 个 .md 加注（engineering-standards:124-125「口径不可考，不构成达标证据」、survey:35/222/247、vs-concurrency:28/207/227、user/docs/01:271、doc-drift:8、opt-review:6、asm-review:6），历史表格数字保留、只加「135.49 是 min（median 185）、源码丢失、见 M16/M03」；明确不改 exam 题面、411k、160ns（分布式清扫）、两处独立 0.98×。主控抽查 3 处通过。
+- 15:28 **A6 完成**（`f3638275`）：12 处 / 7 个 .md 加注，历史数字保留；主控抽查 3 处通过；已合并 `6e1c568`。
+- 15:42 **M03c 收口**（`109eec90`，超时 45 分钟）：分块 smoke 各 10 次 → **P20 0/10**、其余 10/10；探针证明 P20 非语义破坏（park 最终到 kWaiting、p50<1µs、wake 正常），是 :111 断言在 park 前检查的竞态被放大；组合 **P19+P21+P22** 通过 ctest 5/5、smoke 20/20、1e6 压力；bench baseline 305 → 组合 **293（−3.9%）/ 324 vs 338（−4.1%）**，**<5% 门槛** → 回滚（`scheduler.cpp` 与 bak 逐字节一致，无改动）；borrow 建议①核实「现实现已一致」且 metrics 无法测 displaced。**M03 判「无可验证 >5% 空间」收口。**
