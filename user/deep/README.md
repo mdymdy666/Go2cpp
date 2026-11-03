@@ -56,20 +56,26 @@
 | # | 模块 | 文件 | 状态 |
 |---|---|---|---|
 | 01 | concurrency | `01-concurrency.md` | **已写** 636 行 |
-| 02 | network | `02-network.md` | 待写 |
-| 03 | bento | `03-bento.md` | 待写 |
+| 02 | network | `02-network.md` | **已写** 558 行 |
+| 03 | bento | `03-bento.md` | **已写** 529 行 |
 | 04 | storage | `04-storage.md` | **已写** 361 行 |
 | 05 | cache | `05-cache.md` | **已写** 357 行 |
 | 06 | media | `06-media.md` | **已写** 476 行 |
 | 07 | p2p | `07-p2p.md` | **已写** 360 行 |
 | 08 | rpc | `08-rpc.md` | **已写** 353 行 |
-| 14 | tunnel | `14-tunnel.md` | 待写 |
+| 09 | distributed | `09-distributed.md` | **已写** 351 行 |
+| 10 | observability | `10-observability.md` | **已写** 398 行 |
+| 11 | tools | `11-tools.md` | **已写** 424 行 |
+| 12 | app | `12-app.md` | **已写** 445 行 |
+| 13 | relay-jinshan | `13-relay-jinshan.md` | **已写** 339 行 |
+| 14 | tunnel | `14-tunnel.md` | **已写** 692 行 |
 | 15 | os | `15-os.md` | **已写** 351 行 |
 | 16 | go-api | `16-go-api.md` | **已写** 354 行 |
 | 17 | bufio | `17-bufio.md` | **已写** 350 行 |
 
-**12 份全部已写 / 约 4900 行**（与 `docs/exam/` 的 12 卷一一对应）。
-`09–13` 不单独写 deep —— 入口与关键路径见 `user/docs/09…13` 的 §5/§9；阅读时按那里的行号直接进源码。
+**17 份全部已写 / 约 7,900 行**（编号与 `user/docs/` 的 17 篇一一对应）。
+09–13 与 01–08 一样按本文件 §三 的固定结构写；`13-relay-jinshan.md` 覆盖
+`frame/`、`relay/`、`rd_net/` 与 `collab/` 协作区。
 
 ## 五、写作与复核流程
 
