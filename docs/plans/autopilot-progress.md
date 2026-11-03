@@ -42,16 +42,17 @@
 | v3-009 | 可靠传输骨架 | ✅ 07eb241：64 checks；1e6 次 47–52 ns/op |
 | v3-审查 | 三件套（架构/汇编/正确性+性能） | ✅ d3af2db（docs/reports/rdnet-v3-review.md） |
 | C1 | 抖音骨架 + IDL | ✅ 89ccb58 |
-| C2–C10 | 抖音业务服务/网关/验收/压测 | ⏳ 下一个 |
+| C2 | user 服务（存储/鉴权/4 接口） | ✅ 3ff147f：25 PASS；QPS 1918.5、p50 4.04ms、p99 7.55ms |
+| C3–C10 | 抖音 video/feed/interaction/search/live/gateway/验收/可靠性 | ⏳ 下一个 C3 |
 
 ## 下一个任务
 
-**C2 抖音 user 服务（下一个）**：
-1. 在 `demos/douyin/` 实现 user 服务：注册/登录/资料查询（SQLite 持久化），REST 路径与 `demos/douyin/README.md` 草案一致；
-2. 真实场景 ≥5：注册→登录→重复注册→错误密码→查询资料，全部 curl 可复现；
-3. 压测：`wrk` 或 `ab` 1000 并发 30s，记录 QPS/p99，写入 `demos/douyin/README.md`；
-4. 正确性：重复注册返回 409、错误密码 401、缺字段 400。
-注：JinShan v3 已全部交付并过三件套（`d3af2db`），后续只需按他们回执修补充；M11（gzip 口径对齐）排 C2 之后。
+**C3 抖音 video 服务（下一个）**：
+1. 复用 `douyin_store`（videos 表）+ `douyin_auth`（Bearer 校验），实现发布/详情/我的视频/删除 4 接口；
+2. 真实场景 ≥5：发布→详情→我的列表→非作者删除 403→不存在 404；
+3. 压测：1000 次 GET /api/video/:id，报 QPS/p50/p99；
+4. 数据回写 `REQUIREMENTS.md` §6。
+注：C2 已收（3ff147f）；通用 Gateway 组件由 `b2d4cf18` 并行实现（注册式路由/中间件/Resolver/JSON 热加载），交付后接入 C8。
 
 ## 本轮记录
 
@@ -84,3 +85,6 @@
 - 17:35 **SendBatch**（5e102f7f）：一次 sendmmsg/writev 提交 N 段；TCP **21.2×**（225 vs 4804 ns/seg）、UDP **1.20×**；部分提交 kWouldBlock + K；checks 406。
 - 17:40 主控统一提交 6820dd1（REQ-008+SendBatch+命名空间+event_loop 链接修复），四套 406/44/64/44 全绿；acceptance v3 与 JinShan G-004 已写。
 - 17:45 **三件套完成**（d3af2db）：架构（分层/所有权/零拷贝/批量）、汇编（SendBatch 3107 指令、WriteBatch 311、EventLoop::Run 栈帧 152B）、正确性+性能（TCP 20.8×/UDP 1.20×、单条开批量 0.90× 默认关）。
+
+- 16:45 **C2 完成**（dbd542d5 → 3ff147f）：`douyin_store`（SQLite WAL + users/follows）、`douyin_auth`（SHA-256+盐/HMAC-SHA256/base64url）、user_service 4 接口；accept_user.sh **25 PASS / 0 FAIL**；并发 100 不同 email 全 200、同 email 1×200+99×409；GET 1000 次 **QPS 1918.5、p50 4.04ms、p99 7.55ms**；随机 token 1000 全对。
+- 16:50 **通用 Gateway 组件**（b2d4cf18）按用户要求重做为注册式路由 + 中间件链 + 可插拔 Resolver + JSON 热加载（初版 `std::vector<Route>` 被否）。
