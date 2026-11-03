@@ -21,9 +21,9 @@ if [[ ! -d "$BUILD_LIB" ]]; then
   exit 1
 fi
 
-mkdir -p "$ROOT/build" "$ROOT/logs"
+mkdir -p "$ROOT/build" "$ROOT/logs" "$ROOT/data"
 
-CXXFLAGS=(-std=c++17 -O2 -g -Wall -Wextra -Wno-unused-parameter
+CXXFLAGS=(-std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter
           -I"$GO2CPP/include" -I"$ROOT/include")
 
 # network 依赖 io/sync/context 等，用 --start-group 消掉静态顺序问题。
@@ -32,11 +32,14 @@ LDFLAGS=(-L"$BUILD_LIB" -Wl,-rpath,"$BUILD_LIB" -Wl,--start-group
          -lgo2cpp_error -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_log
          -lgo2cpp_hash -Wl,--end-group -lpthread)
 
+# user 服务额外依赖 storage（libgo2cpp_storage.so + 系统 sqlite3）。
+EXTRA_LDLIBS=()
+
 build_one() {
   local name="$1"
   shift
   printf '  CC %-20s ' "$name"
-  if "$CXX" "${CXXFLAGS[@]}" "$@" "${LDFLAGS[@]}" -o "$ROOT/build/$name"; then
+  if "$CXX" "${CXXFLAGS[@]}" "$@" "${EXTRA_LDLIBS[@]}" "${LDFLAGS[@]}" -o "$ROOT/build/$name"; then
     echo "ok"
   else
     echo "失败"
@@ -48,7 +51,12 @@ echo "[build] Go2Cpp 头文件: $GO2CPP/include"
 echo "[build] Go2Cpp 库目录: $BUILD_LIB"
 
 PROTO="$ROOT/src/douyin_proto.cpp"
-build_one user_service        "$ROOT/src/user_service.cpp"        "$PROTO"
+STORE="$ROOT/src/douyin_store.cpp"
+AUTH="$ROOT/src/douyin_auth.cpp"
+
+EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
+build_one user_service        "$ROOT/src/user_service.cpp"        "$STORE" "$AUTH" "$PROTO"
+EXTRA_LDLIBS=()
 build_one video_service       "$ROOT/src/video_service.cpp"       "$PROTO"
 build_one feed_service        "$ROOT/src/feed_service.cpp"        "$PROTO"
 build_one interaction_service "$ROOT/src/interaction_service.cpp" "$PROTO"
