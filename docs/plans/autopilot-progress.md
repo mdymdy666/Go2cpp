@@ -1,6 +1,6 @@
 # Autopilot 进度（Go2Cpp）
 
-> 节奏：每 30 分钟一轮（定时任务 `Go2Cpp 自动驾驶推进`，id `schedule-0ae729ea`）。每轮只做「下一个任务」一项（可派 1–2 个子 agent）。
+> 节奏：每 15 分钟一轮（2026-11-03 14:46 用户从 30 分钟改为 15 分钟；定时任务 `Go2Cpp 自动驾驶推进`，id `schedule-0ae729ea`）。每轮只做「下一个任务」一项（可派 1–2 个子 agent）。
 > 规则：做完必须验证；失败如实记；WSL 真树 commit，push 走 Windows 侧 Python；更新本文件。
 > 真树：`/UserData/CodexWorkSpace/Go2cpp`（分支 `feat/isolated`）。
 
@@ -21,9 +21,9 @@
 4. 子 agent 不许 commit，主控审查（抽查行号/数字溯源/越界/正确性）后合并；
 5. 风险高且时限内无法验证的改动，回滚并如实记「尝试过、因何回滚」。
 
-## 基准必须独占（2026-11-03 实测教训）
+## 基准必须独占（实测教训）
 
-并行跑基准会制造假 STALE：A5 全量在 A4c 并行压测时出 3 条假 STALE（M03 628 vs 239、cpu 中位 1.84×；M04、M08 同因），A4c 结束后独占复跑 → `TOTAL=16 OK=12 STALE=0 SKIP=4`。**对照运行期间不得有其它基准进程**；判 STALE 前必须独占复跑一次。
+并行跑基准会制造假 STALE：A5 全量在 A4c 并行压测时出 3 条假 STALE（M03 628 vs 239、cpu 中位 1.84×；M04、M08 同因），A4c 结束后独占复跑 → `TOTAL=16 OK=12 STALE=0 SKIP=4`。**对照运行期间不得有其它基准进程**。
 
 ## 进度表
 
@@ -34,11 +34,11 @@
 | A3 | M04/M05/M06 填实 | ✅ 55a3f0e |
 | A4a | M07 LevelDB | ✅ 761ea6c |
 | A4b | M10/M11/M12/M13 | ✅ e7fcbbb |
-| A4c | M14 TLS / M15 bento | ✅ 本轮（TLS 1.061×、bento 282k pps；A4c 超时被 interrupt，数据从日志补收） |
-| A5 | 全量校验脚本（16 条）+ CMake 模板 | ✅ 本轮（493 行，独占全量 OK=12 STALE=0 SKIP=4） |
-| **M03** | **scheduler wall 三件套优化（架构→汇编→正确性）** | 🔄 下一个（用户要求） |
-| M10 | os readv 三件套优化 | ⏳ 排队 |
-| M11 | gzip 解压 三件套优化 | ⏳ 排队 |
+| A4c | M14 TLS / M15 bento | ✅ b0c9013 |
+| A5 | 全量校验（16 条）+ CMake 模板 | ✅ b0c9013 |
+| M03 | scheduler wall 三件套 | 🔄 第一轮回滚（零改动）；p22 候选 −15~35%，M03b `e06ac499` 复核中 |
+| M10 | os readv 三件套 | ⏳ 排队（M03 收口后） |
+| M11 | gzip 解压 三件套 | ⏳ 排队 |
 | A6 | 清理 411k/160ns 等文档漂移 | ⏳ |
 | A7 | 其他不达标项（concurrency 原语、os Process、network vs Go/nginx） | ⏳ |
 | B1–B4 | 公网变服务 | ⏳ |
@@ -46,19 +46,18 @@
 
 ## 下一个任务
 
-**M03 三件套优化**（用户 2026-11-03 点名）：
-1. 固定口径复现 baseline（12 vCPU、`taskset -c 2,3`、4 worker、100k、5 轮，记录 loadavg），确认 239/299 不是宿主噪声；
-2. **架构优化**：至少一条（runnext 投递策略 / incoming 条带轮转 / enqueue 路径减少原子或锁）；
-3. **汇编优化**：至少一条，附 `objdump` 前后指令/call/栈帧对比；
-4. **正确性**：`scheduler_smoke`、`queue_latency`、`channel_concurrency`、`select_lockorder`、`fiber_select` 全过 + 一次压力；任一失败立即回滚该版；
-5. 改善 <5% 或无法证明收益 → 回滚并如实报告「不可优化/代价过高」。
+**M03b（在跑）→ 视结果收口 M03**：
+- 若 M03b 判定「断言竞态」且 p22 修正断言后 20/20 + 全量 + 1e6 压力全过 → 合入 p22 + 测试断言修正，ledger 记前/后数据；
+- 若判定「语义破坏」或仍失败 → 永久放弃 p22，M03 记「已尝试、不可行」，转 M10。
 
 ## 本轮记录
 
-- 13:20 启动；A1 be73a4e；A2 92dcb25；优化规则 456ec05；A7 首项 3a7aa4f；A3 55a3f0e；A4b e7fcbbb；A4a 761ea6c。
-- 14:21 本轮：
-  - **A5 完成**（`6aa0caba`，被 interrupt 但文件完整）：`tools/verify_metrics.sh` 493 行、`cmake/Go2CppVerifyMetrics.cmake` 41 行（不被 include，`cmake -P` 实测 rc=0）；16 条接线、`--quick/--json/--refs`、退出码 0/1/2；
-  - 独占全量：`TOTAL=16 OK=12 STALE=0 SKIP=4`（SKIP: M01 已拆条、M05 需起服务+Go loadgen、M05b 无出处、M07 超 5 分钟预算）；`--quick` 4/4 OK；
-  - 插曲：首次全量在 A4c 并行压测下出 3 条假 STALE（M03 628/cpu 1.84×、M04、M08），独占复跑全消——已写进 ledger「教训」与本节；
-  - **A4c 完成**（`b03dca46`，超 10 分钟被 interrupt，数据从 `/tmp/tlsbench-run*.log` 补收）：TLS 握手 1.061×（复跑 1.178×）、32KB 写 0.939、64B 0.945；bento single 282,210 pps（loss 0）、多队列 2 核丢包 39–48%；结论：**TLS 达标、单 peer 多队列无收益复现**；无法复现项：tunnel 8 MiB 吞吐（无压测程序）、bento bulk STREAM 字节吞吐（只有 64B 消息级）；
-  - 主控修复：A5 收尾时脚本被写到半成品（line 494 语法错），interrupt 后确认 493 行 `bash -n` 通过并独占复跑通过；残留 `bench_link_mq` 用 `pkill -x` 杀净。
+- 13:20 启动；A1 be73a4e；A2 92dcb25；优化规则 456ec05；A7 首项 3a7aa4f；A3 55a3f0e；A4b e7fcbbb；A4a 761ea6c；A5+A4c b0c9013。
+- 14:46 用户改为 **15 分钟一轮**（`schedule_update` every_seconds=900，下次 15:01）。
+- 14:53 **M03 三件套第一轮**（`9d68482e`）：
+  - baseline 三次进程中位 320/296/351 → **320 ns**（loadavg 0.47–0.69）；后续批次漂到 306–449 → 宿主噪声大于待测效应；
+  - 架构 P19（runnext 空槽无锁短路）−5.0%/cpu −6.6%（175 轮随机），1e6 长测不稳定；
+  - 汇编 P21+P22：enqueue 597→580 指令、栈帧 104→88 B、divq 1→0（call/原子不变）；
+  - p22（删每任务 2 次全局 `running_workers` RMW）−15.1%/−34.7%，但 smoke 10/10 失败于 park 时序断言；
+  - **按铁律回滚，scheduler.cpp 零改动**（与 .bak 逐字节一致），git status 仅原有 9 项；补丁留 `/tmp/scheduler.cpp.p22`；
+  - 主控已派 **M03b**（`e06ac499`）：原版/p22 各跑 smoke 20 次判定竞态 vs 语义破坏；若竞态则修正断言后重跑全量 + 1e6 压力再决定合入/回滚。
