@@ -66,7 +66,10 @@ build_one search_service      "$ROOT/src/search_service.cpp"      "$STORE" "$PRO
 EXTRA_LDLIBS=(-lgo2cpp_encoding)
 # C8 网关：通用 Gateway 组件在 src/app/gateway.cpp，尚未打进 libgo2cpp_app.a，
 # 这里把它作为独立编译单元一起编；AUTH 提供 douyin::VerifyToken 做 Bearer 校验。
-build_one gateway             "$ROOT/src/gateway.cpp" "$AUTH" "$GO2CPP/src/app/gateway.cpp"
+# 上游 src/app/gateway.cpp 的文档注释里有字面量 "/*"（method 支持字符串/数组/*），
+# GCC 会报 -Wcomment；只对这个编译单元关闭该类警告，不修改上游源码。
+build_one gateway             "$ROOT/src/gateway.cpp" "$AUTH" "$GO2CPP/src/app/gateway.cpp" \
+  -Wno-comment
 
 # C9 压测工具：纯 POSIX socket，不依赖 Go2Cpp 库。
 printf '  CC %-20s ' loadgen
