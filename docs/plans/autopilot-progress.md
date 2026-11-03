@@ -43,16 +43,19 @@
 | v3-审查 | 三件套（架构/汇编/正确性+性能） | ✅ d3af2db（docs/reports/rdnet-v3-review.md） |
 | C1 | 抖音骨架 + IDL | ✅ 89ccb58 |
 | C2 | user 服务（存储/鉴权/4 接口） | ✅ 3ff147f：25 PASS；QPS 1918.5、p50 4.04ms、p99 7.55ms |
-| C3–C10 | 抖音 video/feed/interaction/search/live/gateway/验收/可靠性 | ⏳ 下一个 C3 |
+| C3–C10 | 抖音 video/feed/interaction/search/live/gateway/验收/可靠性 | ⏸ 暂停（转向 B 站复刻） |
+| 通用组件 | singleflight + 一致性哈希 + Gateway | ✅ 93864a6（singleflight 80.6 ns/op、一致性哈希 13.1 ns/op）+ 50a2abf（Gateway checks=50） |
+| B-REQ | B 站复刻需求文档 | ✅ 2a9d43a（255 行） |
+| B1–B4 | B 站实现（存储/用户 → 视频/播放 → 弹幕 WS → 压测） | ⏳ 下一个 B1（4ff5f73f 在跑） |
 
 ## 下一个任务
 
-**C3 抖音 video 服务（下一个）**：
-1. 复用 `douyin_store`（videos 表）+ `douyin_auth`（Bearer 校验），实现发布/详情/我的视频/删除 4 接口；
-2. 真实场景 ≥5：发布→详情→我的列表→非作者删除 403→不存在 404；
-3. 压测：1000 次 GET /api/video/:id，报 QPS/p50/p99；
-4. 数据回写 `REQUIREMENTS.md` §6。
-注：C2 已收（3ff147f）；通用 Gateway 组件由 `b2d4cf18` 并行实现（注册式路由/中间件/Resolver/JSON 热加载），交付后接入 C8。
+**B1 B 站存储 + 用户（下一个，4ff5f73f 在跑）**：
+1. `app/bilibili/`：bili_http（复制 douyin）、bili_store（SQLite WAL + 5 表）、bili_auth（复制 douyin）；
+2. user_service（29201）：注册/登录/资料/大会员（vip 到期时间）；
+3. 验收：4 条 curl + 409/401/404 + 100 并发注册 + 1000 次压测；
+4. 数据回写 `app/bilibili/REQUIREMENTS.md`。
+注：抖音 C3-C10 暂停；B 站完成后回抖音或继续 B2-B4。
 
 ## 本轮记录
 
@@ -88,3 +91,6 @@
 
 - 16:45 **C2 完成**（dbd542d5 → 3ff147f）：`douyin_store`（SQLite WAL + users/follows）、`douyin_auth`（SHA-256+盐/HMAC-SHA256/base64url）、user_service 4 接口；accept_user.sh **25 PASS / 0 FAIL**；并发 100 不同 email 全 200、同 email 1×200+99×409；GET 1000 次 **QPS 1918.5、p50 4.04ms、p99 7.55ms**；随机 token 1000 全对。
 - 16:50 **通用 Gateway 组件**（b2d4cf18）按用户要求重做为注册式路由 + 中间件链 + 可插拔 Resolver + JSON 热加载（初版 `std::vector<Route>` 被否）。
+
+- 17:20 **通用组件收口**：`50a2abf` Gateway（注册式路由/中间件/Resolver/JSON 热更新，checks=50、QPS 2206.5）；`93864a6` singleflight + 一致性哈希（80.6/13.1 ns/op）。
+- 17:40 **转向 B 站复刻**：用户确认「B 站弹幕+播放+会员」核心闭环；需求文档 `app/bilibili/REQUIREMENTS.md` 255 行（5 表、WS 协议、7 场景、B1-B4）提交 `2a9d43a`；B1（存储+用户）派 `4ff5f73f`。
