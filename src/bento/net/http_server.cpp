@@ -256,6 +256,24 @@ void HttpServer::OnRequest(RequestHandler handler) {
     m_request_handler = std::move(handler);
 }
 
+/**
+ * @brief 向路由表注册一条「方法 + 路径模式」规则，运行期可安全并发注册。
+ * @param method [in] HTTP 方法——按值传入，精确匹配；HEAD 未单独注册时由 MatchRoute 回退到同路径 GET。
+ * @param pattern [in] 路由模式——按值移交（内部 move），支持路径参数语法；调用后调用方不得再引用。
+ * @param handler [in] 请求处理函数——按值移交，需可拷贝；不可为空，空 handler 会产生「命中但不可调用」的路由。
+ * @return 无返回值；注册总是成功（重复模式由路由器按注册顺序决定优先级）。
+ * ## 定位
+ * 路由表唯一写入口，与 MatchRoute（读锁）构成读写锁对。
+ * 若漏锁或与匹配并发写，会出现迭代器失效/数据竞争，表现为随机 404 或崩溃。
+ * ## 步骤
+ * step1. 取 m_route_mutex 写锁，阻塞所有匹配侧读者；
+ * step2. 把模式与 handler 移交给 m_router，由路由器维护匹配顺序。
+ * ## 并发/失败语义
+ * - 调用约束：任意线程可调用；不要在请求处理函数内部对本 server 做阻塞式大规模注册。
+ * - 原子性：单条路由的插入在写锁内完成，读者要么看到整条路由，要么看不到。
+ * - 失败语义：不抛异常（容器分配失败会 terminate）；注册后立即对后续请求生效。
+ * - 不变量：返回后该 (method, pattern) 一定能被 MatchRoute 命中（除非被更新的同模式规则覆盖）。
+ */
 void HttpServer::Route(http::Method method, std::string pattern,
                        RequestHandler handler) {
     std::unique_lock<std::shared_mutex> lock(m_route_mutex);
@@ -297,6 +315,29 @@ void HttpServer::AsSse(std::string path, SseHandler handler) {
     m_sse_routes.emplace_back(std::move(path), std::move(handler));
 }
 
+/**
+ * @brief 校验监听与运行状态后启动 Fiber 调度器，并异步投递 AcceptLoop。
+ * @return HttpServerResult：
+ * - ok()==true：调度器已运行、accept 循环已投递——调用方**必须**在销毁前调用 Stop()；
+ * - NotListening：未先调用 Listen()——调用方**必须**先 Listen 再 Start；
+ * - AlreadyRunning：重复启动——调用方**不要**再次 Start，直接复用现有实例；
+ * - UnsupportedModel/ThreadFailure：模型未实现或线程创建失败——调用方**必须**终止启动流程并销毁实例。
+ * ## 定位
+ * 服务启动的唯一闸门：running 标志与调度器生命周期在这里绑定。
+ * 若先置 running 再建调度器且失败不回滚，Stop 会 join 一个不存在的 manager，
+ * 或对外表现为「running 但永不 accept」。
+ * ## 步骤
+ * step1. 前置校验：listener 必须存在、不能已在运行、模型必须支持；
+ * step2. 先复位 stopping 再发布 running，保证上一轮 Stop 的残留状态不阻塞新循环；
+ * step3. 按 worker_threads 构造 IOManager（每连接一个 Fiber，连接数不受线程池限制）；
+ * step4. 启动失败回滚 running 并返回 ThreadFailure；
+ * step5. 保存 manager 并 go(AcceptLoop)，把 accept 与连接处理都放到 Fiber 上。
+ * ## 并发/失败语义
+ * - 调用约束：任意线程可调用，但应在 Listen 之后、对外提供服务之前调用；Stop 与 Start 不可并发。
+ * - 原子性：running 的置位先于调度器启动；失败时显式回滚，不留下「假运行」状态。
+ * - 失败语义：不抛异常，所有失败经 HttpServerResult 返回；失败后对象仍可重新 Listen/Start。
+ * - 不变量：返回 ok 时 m_manager 非空且 AcceptLoop 已被调度；返回失败时 m_manager 为空、running==false。
+ */
 HttpServerResult HttpServer::Start() {
     if (!m_listener) {
         return HttpServerResult::Failure(HttpServerError::NotListening,
@@ -333,6 +374,25 @@ HttpServerResult HttpServer::Start() {
     return HttpServerResult::Success();
 }
 
+/**
+ * @brief 幂等地停止 HTTP 服务：断开活动连接、关闭监听、停调度器并释放资源（noexcept）。
+ * @return 无返回值；无论此前是否运行都保证返回后不再接受新连接、不再有该实例的 Fiber 在跑。
+ * ## 定位
+ * 服务生命周期的唯一收尾点，析构函数也会调用它。
+ * 顺序写错会死锁（先 join 再 shutdown）或让 accept 线程永久阻塞在 listen socket 上；
+ * 由于是 noexcept，任何异常都必须在这里吞掉，否则析构期间 terminate。
+ * ## 步骤
+ * step1. 交换 running/stopping 并判断是否无事可做，保证重复调用幂等；
+ * step2. shutdown 所有活动连接，唤醒阻塞在 recv 上的连接 Fiber；
+ * step3. shutdown 监听 socket，让 accept 的等待尽快返回；
+ * step4. 停止 Fiber 调度器（AcceptLoop 最多一个 accept 超时周期内退出）；
+ * step5. 兜底再扫一次活动表（覆盖「扫描后才登记」的竞态），最后释放监听 socket。
+ * ## 并发/失败语义
+ * - 调用约束：可与 Start 之外的任意线程调用；不要在连接 Fiber 内销毁 server（会 join 自身）。
+ * - 原子性：running 的交换保证只有一个线程执行真正的收尾；其余调用直接返回。
+ * - 失败语义：noexcept；shutdown/close 的错误被忽略，只为唤醒等待者。
+ * - 不变量：返回后 m_manager 为空、listener 已释放、活动连接表为空。
+ */
 void HttpServer::Stop() noexcept {
     const bool had_listener = static_cast<bool>(m_listener);
     const bool was_running = m_running.exchange(false, std::memory_order_acq_rel);

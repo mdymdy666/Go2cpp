@@ -206,6 +206,27 @@ RoomHub::RoomHub(RoomConfig cfg) : m_impl(std::make_unique<Impl>(cfg)) {}
 
 RoomHub::~RoomHub() { CloseAll(); }
 
+/**
+ * @brief 新建一个连接对象加入房间，并在锁外启动其发送线程，返回连接 id。
+ * @param room [in] 房间名——借用，函数内拷贝为 key；空串视为合法房间。
+ * @param send [in] 发送函数——所有权移交给连接对象（用于投递消息）；不可为空，空则直接返回 0。
+ * @return
+ * - >0：新连接 id——调用方**必须**保存并在断开时调用 Leave(id)，否则发送线程泄漏；
+ * - 0：send 为空，未加入——调用方**不要**把 0 当作有效 id 使用。
+ * ## 定位
+ * 房间成员的唯一创建点。写错会让发送线程在 hub 锁内启动，导致 Join 串行化甚至死锁；
+ * 或漏登记 room_of，使 Leave 找不到连接、留下僵尸发送线程。
+ * ## 步骤
+ * step1. 拒绝空发送函数，避免创建永远收不到消息的连接；
+ * step2. 持 hub 锁分配 id、构造 Conn，并同时写入 rooms[room][id] 与 room_of[id]；
+ * step3. 释放锁后再 Start 发送线程，避免线程启动被 hub 锁串行化；
+ * step4. 返回 id。
+ * ## 并发/失败语义
+ * - 调用约束：任意线程可调用；conn->Start 在锁外执行。
+ * - 原子性：id 分配、两条索引登记在同一把锁内完成；失败只可能是 send 为空，不会半登记。
+ * - 失败语义：不抛异常；创建失败仅出现在 send 为空的分支。
+ * - 不变量：返回 id>0 后，rooms 与 room_of 都能查到该连接，且发送线程已启动。
+ */
 RoomHub::ConnId RoomHub::Join(std::string_view room, SendFn send) {
     if (!send) {
         return 0;
@@ -224,6 +245,23 @@ RoomHub::ConnId RoomHub::Join(std::string_view room, SendFn send) {
     return id;
 }
 
+/**
+ * @brief 幂等地把一个连接移出房间：先从索引摘除，再在锁外 stop/join 其发送线程。
+ * @param id [in] Join 返回的连接 id——0 或未知 id 视为已离开，直接返回。
+ * @return 无返回值；无论 id 是否存在都保证返回后 hub 中不再有该连接。
+ * ## 定位
+ * 成员移除的唯一入口（析构走 CloseAll）。写错会在持 hub 锁时 join 发送线程：
+ * 发送线程若正在回调中再访问 hub 就会死锁；顺序颠倒还会让广播拿到已停的连接。
+ * ## 步骤
+ * step1. 锁内查 room_of，查不到直接返回（幂等）；
+ * step2. 从 rooms 与 room_of 同时摘除，房间空了顺手删房间；
+ * step3. 锁外 Stop()（join 发送线程）并让 shared_ptr 析构。
+ * ## 并发/失败语义
+ * - 调用约束：可在任意线程调用；Stop 必须在锁外。
+ * - 原子性：两条索引的摘除在同一临界区内完成，广播不会看到半移除状态。
+ * - 失败语义：不抛异常；重复 Leave 是安全的空操作。
+ * - 不变量：返回后 hub 中不存在该 id，且其发送线程已 join 完毕。
+ */
 void RoomHub::Leave(ConnId id) {
     std::shared_ptr<Conn> removed;
     {
@@ -252,6 +290,26 @@ void RoomHub::Leave(ConnId id) {
     }
 }
 
+/**
+ * @brief 把一条消息入队到房间内所有连接（非阻塞），并顺带清理已退出的连接。
+ * @param room [in] 房间名——借用，查找用的 key；不存在的房间返回 0。
+ * @param message [in] 消息内容——借用，锁内拷贝一份供所有连接共享，返回后调用方可复用。
+ * @return 成功入队的连接数——**不代表已送达**；慢连接队列满时不计入。
+ * ## 定位
+ * 广播的唯一入口：所有房间消息都从这里进入各连接的发送队列。
+ * 写错会在锁内做 I/O 或 join，造成广播延迟随连接数线性恶化；漏清理则房间表无限增长。
+ * ## 步骤
+ * step1. 持 hub 锁查房间，不存在直接返回 0；
+ * step2. 拷贝一次 payload，逐连接 Enqueue（队列满则丢，不阻塞广播）；
+ * step3. 统计入队成功数；
+ * step4. 顺手 TakeFinishedLocked 摘除发送线程已退出的连接；
+ * step5. 锁外释放 finished，让 Conn 析构时的 join 不占 hub 锁。
+ * ## 并发/失败语义
+ * - 调用约束：任意线程可调用；与 Join/Leave 通过同一把 hub 锁互斥。
+ * - 原子性：一次广播在锁内对房间成员快照式入队，期间不会看到 Join/Leave 的半状态。
+ * - 失败语义：不抛异常；单连接队列满只减少返回值，不影响其它连接。
+ * - 不变量：返回计数 <= 广播时刻房间内未被停止的连接总数。
+ */
 std::size_t RoomHub::Broadcast(std::string_view room, std::string_view message) {
     std::size_t queued = 0;
     std::vector<std::shared_ptr<Conn>> finished;

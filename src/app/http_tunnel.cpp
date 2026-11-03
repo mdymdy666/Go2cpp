@@ -162,13 +162,37 @@ void HttpTunnelServer::SetEventHandler(std::function<void(const Event&)> handler
     m_conn->SetEventHandler(std::move(handler));
 }
 
+/**
+ * @brief 处理一次 HTTP 批量隧道请求：把请求体喂进内存传输并推进协议栈，返回待写出的响应字节。
+ * @param body [in] 请求体（对端上行字节）——借用，仅本次调用有效；可为空（表示只取输出）。
+ * @param max_steps [in] 单次调用最多推进的协议步数——步；0 表示不推进，仅返回现有输出。
+ * @return 待写出的响应字节——调用方**必须**原样作为 HTTP 响应体发回；空表示本次没有可写数据。
+ * ## 定位
+ * 服务端隧道唯一驱动器：把无状态的 HTTP 请求/响应映射到有状态的连接协议上。
+ * 写错会让一次请求里永不返回（协议栈空转），或让病态输入把 worker 内存撑爆。
+ * ## 步骤
+ * step1. 计请求数；连接已关闭时直接取走并返回残留输出；
+ * step2. 把请求体 Feed 进内存传输，作为协议栈的上行输入；
+ * step3. 最多循环 max_steps 次 Step(0)，每次检查是否有进展（输入消费/帧产出）；
+ * step4. 无进展、输入耗尽且输出未增长时提前退出，避免空转；
+ * step5. 输出超过 16MB 时提前截断本轮，防止病态输入造成内存膨胀；
+ * step6. TakeOutput 取走全部待发字节返回。
+ * ## 并发/失败语义
+ * - 调用约束：每个 HttpTunnelServer 只能被单线程串行调用（内部 m_conn/m_transport 无锁）。
+ * - 原子性：一次调用内完成「喂输入 → 推进 → 取输出」，中间状态不对外可见。
+ * - 失败语义：不抛异常；Step 返回负值视为连接不可用，直接返回已产生的输出。
+ * - 不变量：返回的字节全部来自本连接输出缓冲；调用后缓冲已清空。
+ */
 std::vector<std::uint8_t> HttpTunnelServer::HandleRequest(
     const std::vector<std::uint8_t>& body, std::uint32_t max_steps) {
+    // step1: 先计一次请求；连接已关闭时不再喂输入，只把残留输出交给调用方写回。
     ++m_handled_requests;
     if (m_conn->closed()) {
         return m_transport->TakeOutput();
     }
+    // step2: Feed 只做入队；真正的协议推进在下面的 Step(0) 循环里。
     m_transport->Feed(body);
+    // step3: 有预算才推进；每轮用 before/size 判断是否真的产生了进展。
     for (std::uint32_t i = 0; i < max_steps; ++i) {
         const std::size_t before = m_transport->output_size();
         const int frames = m_conn->Step(0);
@@ -183,6 +207,7 @@ std::vector<std::uint8_t> HttpTunnelServer::HandleRequest(
             break;  // 单次响应上限，防止病态输入让 worker 内存膨胀。
         }
     }
+    // step6: 一次性取走本轮产生的全部输出，输出缓冲随之清空。
     return m_transport->TakeOutput();
 }
 

@@ -1126,12 +1126,38 @@ int Link::PollRxQueues(int timeout_ms) {
     return ready;
 }
 
+/**
+ * @brief 从接收队列批量收包并完成链路层协议处理，单次最多处理 kMaxFramesPerRun 帧。
+ * @param wait_ms [in] poll 等待上限——毫秒；0 表示不等待直接返回，负数按 poll 语义视为无限等待。
+ * @param rx_drained [out] 接收队列是否已抽干——可为 nullptr（调用方不关心）；仅在正常路径写入，poll 失败时不保证。
+ * @return
+ * - >0：本次处理的帧数——调用方**必须**继续驱动事件循环，不得据此判定连接结束；
+ * - 0：本轮无包/未就绪——调用方**不要**忙等，交给 RunFor/Tick 让出 CPU；
+ * - -1：poll/recv 系统调用失败（EINTR 已内部重试）——调用方**必须**检查 errno 并按致命错误处理，不要重试同一链路。
+ * ## 定位
+ * 链路层唯一收包入口（RunOnce/RunFor → ReceiveOnce）。写错会导致丢包、丢唤醒或重复派发：
+ * 收包线程模式的 eventfd 唤醒一旦丢失，整条链路会静默挂死且没有任何错误返回。
+ * ## 步骤
+ * step1. 复位 rx_drained，按 m_rx_threads 选择「收包线程环」或「单线程 poll」路径；
+ * step2. 线程模式先 drain 无锁环，再 poll eventfd（先 drain 后 poll 才不会漏唤醒）；
+ * step3. eventfd 就绪时读走计数并再次 drain，把新到数据报交给协议层；
+ * step4. 无线程模式 poll 就绪队列，逐队列 recvmmsg 批量收包直到抽干或耗尽预算；
+ * step5. 每帧持 m_mutex 更新统计并 HandleFrame，随后立即处理待派发事件与待发帧；
+ * step6. 状态进入超时/关闭时提前返回，不再处理剩余帧。
+ * ## 并发/失败语义
+ * - 调用约束：链路所有者线程调用；收包线程模式下收包线程只写无锁环，不碰协议状态。
+ * - 原子性：HandleFrame 全程持 m_mutex；事件派发与 DrainTx 在锁外执行，回调用 Send* / Close 不会重入。
+ * - 失败语义：不抛异常，错误以 -1 + errno 返回；失败后链路状态与队列不变（统计计数除外）。
+ * - 不变量：返回 >0 时每帧都已过 conn_id/重放校验；rx_drained 仅在确认对应队列空后才置 true。
+ */
 int Link::ReceiveOnce(int wait_ms, bool* rx_drained) {
+    // step1: 先复位抽出标志；两条路径都只在确认本轮处理完时才改写它。
     int processed = 0;
     if (rx_drained != nullptr) {
         *rx_drained = false;
     }
 
+    // step2: 先 drain 再 poll：收包线程 push 之后才写 eventfd，顺序反过来会丢唤醒。
     // ---- 线程模式：收包线程已经把数据报放进无锁环，这里只做协议处理 ----
     if (m_rx_threads > 0 && m_rx_event_fd >= 0) {
         processed += DrainRxRings(kMaxFramesPerRun, rx_drained);
@@ -1162,6 +1188,7 @@ int Link::ReceiveOnce(int wait_ms, bool* rx_drained) {
         return processed;
     }
 
+    // step4: 无线程模式：一次 poll 后把就绪队列抽干，避免每 16 包重新 poll 一次。
     // ---- 无线程：poll 全部队列，就绪队列 recvmmsg 批量收包 ----
     const int ready = PollRxQueues(wait_ms);
     if (ready < 0) {
@@ -1217,6 +1244,7 @@ int Link::ReceiveOnce(int wait_ms, bool* rx_drained) {
                 if (m_tx_pending.load(std::memory_order_acquire)) {
                     DrainTx();
                 }
+                // step6: 链路已进入超时/关闭：剩余帧不再处理，立刻把控制权还给调用方。
                 if (stop) {
                     return processed;
                 }
@@ -1441,6 +1469,30 @@ void Link::HandleBarrier(const FrameView& view) {
     ++m_stats.barriers_received;
 }
 
+/**
+ * @brief 校验并解密一个入站数据报，把合法内层帧交给 DispatchFrame 分派。
+ * @param data [in] 原始数据报，含 16B 外层头——借用，仅本函数调用期间有效；不可为 nullptr。
+ * @param bytes [in] 数据报长度——字节，必须 >= kFrameHeaderBytes，否则计为 invalid_frames。
+ * @param from [in] 数据报源地址——由收包路径填入，未认证前不得用于迁移对端地址。
+ * @param from_len [in] from 的实际长度——字节，传给地址比较/更新逻辑。
+ * @return 无返回值；所有拒绝路径只累加对应统计计数（invalid/replay/auth/plaintext），不影响链路状态。
+ * ## 定位
+ * 入站安全边界：所有「这个包是否属于本连接」的判断都收敛在这里。漏一个校验就会让
+ * 伪造/重放/迁移前的旧路径包进入可靠通道，造成数据错乱或会话被劫持。
+ * ## 步骤
+ * step1. 解外层头；解不出直接丢弃（insecure 与 secure 共用此入口）；
+ * step2. HELLO/HELLO_ACK 走握手专用路径，避免被当作数据帧处理；
+ * step3. 0-RTT：监听方凭 conn_id 尝试从会话缓存接管首包，解不开绝不改状态；
+ * step4. 仅已连接状态接受数据帧，并用 conn_id（而非源地址）路由；
+ * step5. 迁移静默期内丢弃旧地址来包，防止延迟包把对端地址拉回去；
+ * step6. PSK 模式必须 AEAD 认证成功才允许 UpdatePeerAddress，明文档单独计数；
+ * step7. 认证/解析成功后刷新 m_last_rx_ms，交给 DispatchFrame。
+ * ## 并发/失败语义
+ * - 调用约束：仅 Link 所有者线程调用，且调用方已持 m_mutex；本函数不做加锁。
+ * - 原子性：单帧要么完整通过全部校验并派发，要么在任一步被丢弃；不存在半更新（地址更新在认证之后）。
+ * - 失败语义：不抛异常、不返回错误码，丢弃即返回；失败不改变 m_state 与密钥状态。
+ * - 不变量：通过 AEAD 认证的帧才可能改写 m_peer；统计计数单调递增。
+ */
 void Link::HandleFrame(const std::uint8_t* data, std::size_t bytes,
                         const sockaddr_storage& from, socklen_t from_len) {
     // 加密帧的外层头明文可见（conn_id/wire seq 用于路由与重放窗口），
@@ -1797,6 +1849,26 @@ bool Link::SendPacketLocked(const std::uint8_t* data, std::size_t bytes) {
     return SendRawPacket(data, bytes);
 }
 
+/**
+ * @brief 把发送队列里的帧一次性 seal+sendto 发完，多个生产者只允许一个线程做 drainer。
+ * @return
+ * - true：队列已清空且本批全部发送成功——调用方**必须**视为「已尽力发出」，但 UDP 不保证送达；
+ * - false：队列已清空但有帧发送失败——调用方**必须**累加/上报发送错误，不要重试同一帧；
+ * - 本函数不会因队列为空而阻塞返回（只在另一 drainer 在跑时短暂等待）。
+ * ## 定位
+ * 发送侧唯一出口：所有通道的 Send* 都只入队，真正的 seal/sendto 在这里串行化。
+ * 若允许多个 drainer 并发取批，seal 的 wire seq 会乱序、重传窗口错乱，接收端会大面积判丢包。
+ * ## 步骤
+ * step1. 抢 drainer 资格：队列空且无 drainer 时清 pending 后返回；已有 drainer 则等它收尾再重查；
+ * step2. 取走整批帧并记录水位 upto，锁外释放 tx 锁；
+ * step3. 持 m_mutex 逐帧 SendPacketLocked（seal 需要 tx key/wire seq，sendto 需要 peer）；
+ * step4. 收尾：清 draining、推进 m_tx_drained、记录本批成败；队列仍有新帧则重新置 pending 继续循环。
+ * ## 并发/失败语义
+ * - 调用约束：任意线程可调用；内部用 m_tx_mutex 保证单 drainer，用 m_mutex 保护发送状态。
+ * - 原子性：一批帧的 seal+send 在 m_mutex 下串行执行；m_tx_drained 只在整批结束后更新。
+ * - 失败语义：单帧 sendto 失败不中断本批（继续发后续帧），最终以 ok 汇总返回；失败帧不重排。
+ * - 不变量：同一时刻至多一个 drainer；upto 之前的帧在本函数返回前都已尝试发送。
+ */
 bool Link::DrainTx() {
     // 循环直到队列为空：等待者醒来后重新检查，而不是「等自己的序号被处理」。
     // 这样即使自己的帧是在 drainer 取批之后才入队的，也会由自己接手发出，
@@ -2141,6 +2213,28 @@ bool Link::SendAckFrame(std::uint8_t channel, bool heartbeat) {
     return true;
 }
 
+/**
+ * @brief 推进链路定时器：握手重发/超时、延迟 ACK、心跳、重传、PMTU 与 peer 超时。
+ * @param now_ms [in] 当前单调时钟毫秒——由调用方（RunOnce/RunFor）统一采样，保证同一次 tick 内时间一致。
+ * @return 无返回值；副作用是发送控制帧、推进通道定时器，或在超时时调用 Fail() 关闭链路。
+ * ## 定位
+ * 链路层唯一时间驱动点：重传、超时、保活全部依赖它被周期性调用。
+ * 若被漏调或调用间隔远大于 ack_interval/heartbeat_interval，会出现 ACK 饥饿、
+ * 假掉线（peer timeout）与重传风暴；调用过频则放大 CPU 与无效控制帧。
+ * ## 步骤
+ * step1. 握手期：按 PTO 宽限判超时并 Fail，否则到点重发 HELLO；
+ * step2. 未连接则直接返回，避免对空通道跑定时器；
+ * step3. 到 ack_interval 时给所有待确认可靠通道补发延迟 ACK；
+ * step4. 到 heartbeat_interval 时发心跳，维持 NAT 映射与对端活跃判定；
+ * step5. 驱动可靠通道 OnTimer（重传）并按需通告 MAX_DATA 窗口；
+ * step6. 驱动不可靠/视频通道 OnTimer，跳过乱序缺口并回收帧；
+ * step7. 上报带宽、探测 PMTU，最后按 peer_timeout 判对端失联。
+ * ## 并发/失败语义
+ * - 调用约束：Link 所有者线程调用，需持 m_mutex（RunOnce 在锁内调用）。
+ * - 原子性：同一 now_ms 下各定时器独立判定；Fail 之后本函数立即返回，不再发任何帧。
+ * - 失败语义：不抛异常；发送失败只影响对应控制帧，链路状态由 tick 的超时判定决定。
+ * - 不变量：同一 deadline 在一个 tick 内最多触发一次；状态非 kConnected 时不推进数据面定时器。
+ */
 void Link::Tick(std::uint64_t now_ms) {
     if (m_state == LinkState::kConnecting) {
         // 握手超时按当前退避节奏自适应：固定超时会在「最后一次 HELLO 刚

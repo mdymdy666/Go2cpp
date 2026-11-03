@@ -904,7 +904,32 @@ struct Gateway::Impl {
     }
 
     // ---- 转发 -------------------------------------------------------------
+    /**
+     * @brief 把一次请求转发到路由对应的上游，并把上游结果（或 502/504 错误响应）写回 response。
+     * @param route [in] 命中的路由条目——借用，含默认 upstream/timeout；不可为 nullptr（引用）。
+     * @param request [in,out] 入站请求——转发前被复制并改写 target/头，原始对象不被修改。
+     * @param response [out] 出站响应——总是被覆盖：成功时为上游响应，失败时为 502/504 错误体。
+     * @return
+     * - Ok：总是返回 Ok——调用方**必须**检查 response.status 而不是返回值，不要把 502 当成功转发；
+     * - 本函数不会返回 Err，上游故障已降级为网关错误响应。
+     * ## 定位
+     * 网关的转发终点：所有「代理」语义在这里落地。写错会泄漏 hop-by-hop 头、
+     * 丢失 base_path 前缀，或把上游超时误报成 200。
+     * ## 步骤
+     * step1. 读锁下快照 resolver；存在则解析出目标 upstream，失败回 502；
+     * step2. 校验 host/port，并按 route.timeout → 500ms 顺序兜底超时；
+     * step3. 复制请求并 PrepareOutgoing（剥 hop-by-hop 头、拼接 base_path）；
+     * step4. 用 http::Client 同步请求上游；
+     * step5. 失败分类：Timeout 计 timeouts 回 504，其余计 upstream_errors 回 502；
+     * step6. 成功则拷状态/体，并过滤上游 hop-by-hop 头后合并。
+     * ## 并发/失败语义
+     * - 调用约束：worker 线程调用，禁止持 routes_mutex；resolver 在锁内只做拷贝。
+     * - 原子性：response 在返回前整体赋值；转发计数用 relaxed 原子累加。
+     * - 失败语义：不抛异常；上游错误不传播为 Result::Err，保证连接仍能写出错误响应。
+     * - 不变量：返回后 response.status 一定是最终可下发状态（2xx/4xx/5xx 之一）。
+     */
     Result<void> Forward(const RouteEntry& route, Request& request, Response& response) {
+        // step1: 先快照 resolver，避免网络调用期间一直占着路由读锁。
         Upstream upstream = route.upstream;
         Resolver resolver_snapshot;
         {
@@ -922,6 +947,7 @@ struct Gateway::Impl {
             }
             upstream = resolved.value();
         }
+        // step2: upstream 非法或超时缺失：按路由配置与 500ms 兜底，绝不发起无效连接。
         if (upstream.port == 0 || upstream.host.empty()) {
             upstream_errors.fetch_add(1, std::memory_order_relaxed);
             response = ErrorResponse(502, "invalid upstream");
@@ -934,9 +960,11 @@ struct Gateway::Impl {
             upstream.timeout = std::chrono::milliseconds(500);
         }
 
+        // step3: 复制后再改写，保证中间件/日志看到的仍是原始入站请求。
         Request outgoing = request;
         PrepareOutgoing(&outgoing, upstream);
         http::Client client(upstream.timeout);
+        // step4: 同步阻塞转发；超时由 client 自己的 deadline 控制，不受 worker 队列影响。
         const http::Result result =
             client.do_request(outgoing, upstream.host, upstream.port);
         if (!result.ok() || !result.response) {
@@ -951,6 +979,7 @@ struct Gateway::Impl {
             }
             return Result<void>::Ok();
         }
+        // step6: 成功路径：状态/体原样透传，头逐条过滤 hop-by-hop 后合并。
         forwarded.fetch_add(1, std::memory_order_relaxed);
         response.status = result.response->status;
         response.version = "HTTP/1.1";
@@ -991,7 +1020,26 @@ struct Gateway::Impl {
     }
 
     // ---- 聚合健康 ---------------------------------------------------------
+    /**
+     * @brief 聚合所有路由上游的 /health 探测结果，生成 `{ok, services}` JSON 响应。
+     * @return 200 的 JSON 响应——body 中 ok 表示全部上游健康，services 为每个 upstream 文本到结果的映射。
+     * ## 定位
+     * 健康检查端点（/health）的唯一实现：串行探测所有去重后的上游。
+     * 写错会让就绪探针误判（把不可达当健康，或把 4xx 当故障），触发错误的摘流/重启。
+     * ## 步骤
+     * step1. 读锁下遍历路由，跳过 Custom/空 upstream，按文本去重；
+     * step2. 累加 health_checks，health_timeout 缺省 300ms；
+     * step3. 逐个拼 `http://host:port/health` 并发起 GET（IPv6 字面量补方括号）；
+     * step4. 只有 200 才算健康，其余记录错误或状态码；
+     * step5. 拼装服务映射与总 ok，JsonResponse 返回。
+     * ## 并发/失败语义
+     * - 调用约束：可在任意连接线程调用；探测是同步串行，上游数量多时会拉长响应时间。
+     * - 原子性：路由列表在读锁内一次性拷贝，探测期间新增路由不影响本次结果。
+     * - 失败语义：不抛异常；单个上游失败只影响其条目与总 ok，不会中断整体聚合。
+     * - 不变量：返回的 JSON 一定可被解析，services 的键为原始 upstream 文本。
+     */
     Response AggregateHealth() {
+        // step1: 读锁下收集去重后的 upstream 文本，锁外再做网络探测。
         std::vector<std::string> upstreams;
         {
             std::shared_lock<std::shared_mutex> lock(routes_mutex);
@@ -1005,6 +1053,7 @@ struct Gateway::Impl {
                 }
             }
         }
+        // step2: 计一次健康检查；timeout 非正时用 300ms，避免永久阻塞探针。
         health_checks.fetch_add(1, std::memory_order_relaxed);
         std::chrono::milliseconds timeout = config.health_timeout;
         if (timeout.count() <= 0) {
@@ -1094,7 +1143,27 @@ struct Gateway::Impl {
     }
 
     /// @brief 单连接循环：Parser 解析一个请求 → Dispatch → 显式序列化写回 → 关闭。
+    /**
+     * @brief 在一条已 accept 的连接上读一个请求、分发、写回响应（每连接一次请求，不支持 keep-alive 循环）。
+     * @param connection [in] 已就绪的连接——借用，生命周期由 worker 持有；不可为 nullptr；函数返回后由调用方 close。
+     * @return 无返回值；任何 I/O 或解析失败都直接 return（连接留给调用方关闭），不产生错误响应。
+     * ## 定位
+     * 网关连接处理的唯一入口（WorkerLoop → ServeConnection）：请求解析、Dispatch、序列化、写回全在这里。
+     * 若解析失败仍尝试写响应，会对半包/恶意连接写脏数据；若 recv 不设超时，慢连接会永久占住 worker。
+     * ## 步骤
+     * step1. 优先消费 pending 里上次 recv 的剩余字节，否则带 30s 超时 recv 新数据；
+     * step2. 解析到完整请求为止；NeedMore 继续读，Error 立即返回；
+     * step3. Dispatch 得到响应（路由/鉴权/限流/转发都在其中）；
+     * step4. 按方法序列化（HEAD 去体）；
+     * step5. WriteAll 一次性写回，失败由调用方关闭连接。
+     * ## 并发/失败语义
+     * - 调用约束：每个连接只由一个 worker 线程处理；parser/buffer 都是栈上局部对象，天然线程隔离。
+     * - 原子性：响应在内存中完整构造后才写 socket，不会写出半个响应。
+     * - 失败语义：不抛异常；读写失败静默返回，调用方统一 close 并回收 active 表项。
+     * - 不变量：返回时该连接的状态要么已写完整响应，要么确定不可继续使用。
+     */
     void ServeConnection(const net::Socket::Ptr& connection) {
+        // step1/step2: 循环读取并喂给 parser；pending 表示同一 recv 里剩余的流水线字节。
         http::Parser parser;
         std::string pending;
         std::array<char, 8192> buffer{};
@@ -1120,6 +1189,7 @@ struct Gateway::Impl {
             }
         } while (parsed.state == http::ParseState::NeedMore);
 
+        // step3/step4: 分发完成后按方法序列化，HEAD 需要去掉响应体。
         const Response response = Dispatch(request);
         const std::string wire = SerializeResponse(request.method, response);
         WriteAll(connection, wire);
@@ -1288,6 +1358,28 @@ void Gateway::Use(Middleware middleware) { m_impl->AddMiddleware(std::move(middl
 
 void Gateway::SetResolver(Resolver resolver) { m_impl->SetResolver(std::move(resolver)); }
 
+/**
+ * @brief 从 JSON 文本加载并逐条注册路由；任一条非法则整体失败（已注册的前缀保留）。
+ * @param json [in] 配置文本——借用，仅本函数调用期间有效；不可为空，支持 `{"routes":[...]}` 或直接数组。
+ * @return
+ * - Ok：全部路由已注册——调用方**必须**据此认为配置生效；
+ * - Err：JSON 语法错误或首个非法条目的带下标原因——调用方**必须**把 error 原样上报，
+ *   并注意此前已成功的条目已经生效（本函数不是事务性的）。
+ * ## 定位
+ * 启动期配置唯一入口（LoadConfigFile → LoadConfig）。写错会静默丢掉路由或把合法配置判死，
+ * 直接影响网关能否转发；由于非事务，错误发生点必须在 error 文本中精确到 routes[i]。
+ * ## 步骤
+ * step1. 解析 JSON 根，语法错误直接返回；
+ * step2. 定位 routes 数组：缺省时允许根本身就是数组；
+ * step3. 逐条校验类型与必填字段（path/upstream），method 支持字符串/数组/*；
+ * step4. 可选字段校验：require_auth 布尔、timeout_ms 正数、priority 数字、name 字符串；
+ * step5. 通过后 AddRoute 注册，失败时把下标与原因拼进 error 返回。
+ * ## 并发/失败语义
+ * - 调用约束：通常在服务启动前由控制线程调用；运行期调用与请求处理并发是安全的（AddRoute 加写锁）。
+ * - 原子性：单条路由注册原子；整体加载非事务，失败时保留前面已注册的条目。
+ * - 失败语义：不抛异常，校验错误以 Err(std::string) 返回，对象状态保持可用。
+ * - 不变量：返回 Ok 时 routes 中每条都已通过字段与路由表校验。
+ */
 Result<void> Gateway::LoadConfig(std::string_view json) {
     JsonValue root;
     std::string error;
@@ -1306,6 +1398,7 @@ Result<void> Gateway::LoadConfig(std::string_view json) {
     if (routes->type != JsonValue::Type::Array) {
         return Result<void>::Err("config: 'routes' must be an array");
     }
+    // step3: 逐条校验必填字段；下标写进前缀，出错时调用方一眼定位到具体条目。
     for (std::size_t index = 0; index < routes->items.size(); ++index) {
         const JsonValue& item = routes->items[index];
         const std::string prefix = "routes[" + std::to_string(index) + "]: ";
@@ -1380,6 +1473,7 @@ Result<void> Gateway::LoadConfig(std::string_view json) {
         if (name != nullptr && name->type == JsonValue::Type::String) {
             spec.name = name->text;
         }
+        // step5: 单条字段全部通过后才进路由表；失败只返回，不回滚已注册条目（非事务语义）。
         const Result<void> added = AddRoute(std::move(spec));
         if (!added.ok()) {
             return Result<void>::Err(prefix + added.error());

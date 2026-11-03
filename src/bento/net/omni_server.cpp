@@ -411,6 +411,29 @@ OmniServerImpl::~OmniServerImpl() {
     Stop(CloseMode::kAbort);
 }
 
+/**
+ * @brief 原子地把 NetServer 从「未启动」切到「已启动」，并按配置绑定/启动 UDP 或 HTTP 后端。
+ * @param error [out] 失败原因文本——可为 nullptr；成功时清空，失败时写入面向人类的中文描述，生命周期只到返回为止。
+ * @return
+ * - true：后端已启动、port 已发布——调用方**必须**在销毁前调用 Stop()，否则端口与线程泄漏；
+ * - false：未启动，running 已回滚为 false、last_error 已置具体错误——调用方**必须**读取 error/last_error 并向用户报错，不要重试同一实例（M1 不支持重启）。
+ * ## 定位
+ * 服务生命周期唯一启动点：端口绑定、后端线程创建与 running 状态发布都在这里。
+ * 若 CAS 与后端启动之间失败没有回滚 running，后续 Stop 会走到半初始化后端；
+ * 若允许重复启动，同一个端口会被绑定两次并产生两个收包线程。
+ * ## 步骤
+ * step1. 清空错误并拒绝「已 Stop 的实例」（M1 不支持重启，必须重新 Create）；
+ * step2. CAS 抢占 running，把并发 Start 收敛为一次成功、其余 AlreadyStarted；
+ * step3. UDP：复用已 Listen 的视图，否则按 bind 配置 Listen，再 Start 收包线程；
+ * step4. TCP/HTTP：未监听时先 Listen，再 Start 调度器与 accept 循环；
+ * step5. Memory：无监听/无线程，只用状态切换表达「可轮询」；
+ * step6. 任一步失败都回滚 running 并写入 last_error，保证对象仍处于可安全析构的状态。
+ * ## 并发/失败语义
+ * - 调用约束：任意线程可调用；与 Stop 通过 running/stopped 的原子交换互斥，backend 指针在构造后不再变化。
+ * - 原子性：running 的发布是 CAS；后端启动本身不是原子的，失败由本函数负责回滚。
+ * - 失败语义：不抛异常；失败后不留下半启动的后端（该后端会在析构/Stop 中清理），端口可能已在 Listen 阶段被占用并随后释放。
+ * - 不变量：返回 true 时 port 不为 0（Memory 除外）且后端已处于运行态；返回 false 时 running==false 且 last_error!=kOk。
+ */
 bool OmniServerImpl::Start(std::string* error) {
     SetError(error, std::string{});
     last_error.store(OmniError::kOk, std::memory_order_release);
@@ -827,6 +850,28 @@ IoOutcome OmniServerImpl::DrainOutboundLocked(const std::shared_ptr<ConnectionSt
     return outcome;
 }
 
+/**
+ * @brief 单连接一轮驱动：先排空出站队列，再在反压允许时批量读入站并投递成 RawFrame。
+ * @param state [in] 连接状态——不可为 nullptr；借用（shared_ptr 保证生命周期），调用方不得已持有 state->mutex。
+ * @param reason [out] 关闭原因——kNone 表示本轮无需关闭；非 kNone 时调用方**必须**调用 CloseConnection(state, reason, mode)。
+ * @param mode [out] 关闭方式——与 reason 配套；reason 为 kNone 时未定义，调用方**不要**读取。
+ * @return 本轮产生的事件数（出站帧 + 入站帧）——0 表示「本轮该连接无事发生」，调用方不要据此判定连接死亡。
+ * ## 定位
+ * 连接数据面唯一泵：Poll 模式下所有 I/O 都从这里进出。写错会导致
+ * 背压丢失（无界内存）、帧顺序错乱或读到 EOF 却不断开连接。
+ * ## 步骤
+ * step1. 持 state->mutex，已关闭的连接直接返回；
+ * step2. 出站：DrainOutboundLocked 排空应用写的帧，失败即带 reason 返回；
+ * step3. 检查反压：Inbound 有空位就解除暂停，仍满则本轮不读（等消费者取走）；
+ * step4. 入站：非阻塞批量 Read，Timeout 结束本轮，Closed 转 PeerClosed；
+ * step5. 每次 Read 的字节数按 Memory/M0 语义作为一帧 TrySend 到 Inbound，失败按关闭/反压区分；
+ * step6. 成功投递后更新连接级与全局统计并累加事件数。
+ * ## 并发/失败语义
+ * - 调用约束：单线程（Poll 所有者）驱动；每连接一把 state->mutex，与 DrainOutboundLocked 共用同一把锁。
+ * - 原子性：出站与入站分别成批处理；本轮不会同时读写同一个 Inbound 通道的两端。
+ * - 失败语义：不抛异常；传输错误通过 reason/mode 转成关闭请求，不在本函数内关闭连接。
+ * - 不变量：返回时若 reason==kNone，连接仍处于打开状态且 stats 已反映本轮读写的字节与消息数。
+ */
 std::size_t OmniServerImpl::PumpConnection(const std::shared_ptr<ConnectionState>& state,
                                            CloseReason* reason, CloseMode* mode) {
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -931,6 +976,28 @@ std::size_t OmniServerImpl::PumpAll() {
     return events;
 }
 
+/**
+ * @brief 在 Poll 并发模型下反复泵所有连接，直到产生事件或到达超时。
+ * @param timeout [in] 本轮最长阻塞时间——Milliseconds；负数按 0 处理，0 表示单轮非阻塞检查。
+ * @return PollResult：
+ * - error==kOk 且 events>0：本轮有读写/关闭事件——调用方**必须**处理完后再进入下一轮；
+ * - error==kOk 且 timeout==true：超时无事件——调用方**不要**立即空转重试，按业务节流；
+ * - error==kNotRunning/kNotPollMode/kReentrant：调用前提不满足——调用方**必须**停止本轮循环并按 error 排查，不要重试。
+ * ## 定位
+ * Poll 模式下唯一的服务循环驱动点，同时用 polling 标志把「并发调用」变成显式错误。
+ * 若去掉重入保护，两个线程会同时泵同一个连接，破坏通道的单生产者假设。
+ * ## 步骤
+ * step1. 校验 running 与 Poll 并发模型，不满足直接返回错误；
+ * step2. CAS polling 抢驱动权，RAII guard 保证任何返回路径都会释放；
+ * step3. 负超时按 0 处理，计算本轮的绝对 deadline；
+ * step4. 循环 PumpAll：有事件立刻返回，否则到 deadline 返回 timeout；
+ * step5. 中间用 kPollSlice 短睡眠让出 CPU，避免忙轮询打满核。
+ * ## 并发/失败语义
+ * - 调用约束：仅允许一个线程同时进入；不同实例可并行。
+ * - 原子性：polling 的抢占与释放是原子的；事件与超时判定基于同一 deadline。
+ * - 失败语义：不抛异常；提前返回错误时 polling 已由 guard 释放，可再次调用。
+ * - 不变量：返回 kOk 时 result.events 与 result.timeout 恰好一个表达「有事发生」或「等到超时」。
+ */
 PollResult OmniServerImpl::PollOnce(Milliseconds timeout) {
     PollResult result;
     if (!running.load(std::memory_order_acquire)) {
