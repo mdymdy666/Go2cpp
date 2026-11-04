@@ -948,6 +948,7 @@ void TestRawAckNoPreread() {
 void TestRawStreamLimit() {
     std::printf("[test] 10. raw 流并发上限（上限 2、并发 3）\n");
     setenv("GO2CPP_TUNNEL_RAW_STREAM", "1", 1);
+    setenv("GO2CPP_TUNNEL_RAW_THRESHOLD", "0", 1);
     std::string error;
     TcpListener::Ptr slow = TcpListener::Listen("127.0.0.1", 0, &error);
     TUNNEL_CHECK(slow != nullptr);
@@ -1099,6 +1100,7 @@ void TestRawStreamLimit() {
         }
     }
     setenv("GO2CPP_TUNNEL_RAW_STREAM", "0", 1);
+    unsetenv("GO2CPP_TUNNEL_RAW_THRESHOLD");
 }
 
 }  // namespace

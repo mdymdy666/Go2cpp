@@ -80,6 +80,24 @@ struct HttpHead {
     std::vector<std::pair<std::string, std::string>> headers;
 };
 
+/// 解析 Content-Length 十进制值；缺失/非法返回 -1（视为未知长度，走 mux）。
+std::int64_t ParseContentLengthValue(const std::string& text) {
+    if (text.empty()) {
+        return -1;
+    }
+    std::int64_t value = 0;
+    for (char character : text) {
+        if (character < '0' || character > '9') {
+            return -1;
+        }
+        value = value * 10 + (character - '0');
+        if (value > (std::int64_t{1} << 40)) {  // >1 TiB 视为未知，防溢出
+            return -1;
+        }
+    }
+    return value;
+}
+
 /// 取 header 值（大小写不敏感）；不存在返回空。
 std::string GetHeader(const HttpHead& head, const std::string& name) {
     const std::string wanted = ToLower(name);
@@ -1224,7 +1242,11 @@ void TunnelServer::HandlePublic(TcpConn::Ptr conn) {
                      "tunnel '" + route.subdomain + "' has no live session\n");
         return;
     }
-    if (RawStreamEnabledFromEnv()) {
+    // per-stream raw 按请求大小选择：大 body 走 raw（两端 socket 直接
+    // splice，零用户态拷贝）；小请求与未知长度走 mux（省一次握手 RTT）。
+    const std::int64_t request_content_length =
+        ParseContentLengthValue(GetHeader(head, "content-length"));
+    if (ShouldUseRawStream(request_content_length)) {
         // 上面的检查只是快速失败；并发抢占必须靠原子预留，否则多个请求可以
         // 同时通过检查、一起超过上限。
         if (!TryAcquireRawSlot(entry)) {

@@ -118,10 +118,33 @@ inline constexpr std::uint32_t kHelloFlagRawStream = 1U << 1U;
 /**
  * @brief 读环境变量 GO2CPP_TUNNEL_RAW_STREAM（1/true/on/yes，大小写不敏感）。
  *
- * @return 开关状态；默认 false（保持旧的 mux 帧化路径）。两端必须同时开启：
- *         服务端决定是否发 kOpenRaw，客户端决定是否响应。
+ * @return 开关状态；默认 true（per-stream raw TCP，2026-11-04 起默认化）。
+ *         显式设 0/false/off/no 回退旧 mux 帧化路径。两端必须都支持：
+ *         服务端决定是否发 kOpenRaw，客户端决定是否响应；老客户端不认
+ *         kOpenRaw 会断控制连接，升级时先升级客户端，或临时设 0。
  */
 bool RawStreamEnabledFromEnv();
+
+/**
+ * @brief 读 GO2CPP_TUNNEL_RAW_THRESHOLD：多大的请求 body 才走 per-stream raw。
+ *
+ * @return 阈值字节数；默认 1048576（1 MiB）。0 = 全部请求走 raw（含未知长度）；
+ *         -1 = 全走 mux；非法值/空值按默认处理。Content-Length 缺失（未知长度）
+ *         一律走 mux——raw 数据通道要在写请求头前决定，无法等 body 到齐。
+ */
+std::int64_t RawStreamThresholdBytesFromEnv();
+
+/**
+ * @brief 按请求 body 长度决定走 raw 还是 mux。
+ *
+ * @param content_length [in] 请求 Content-Length；负数表示未知/缺失。
+ * @return true = raw 数据通道（零拷贝 splice）；false = mux 帧化路径。
+ *
+ * ## 定位
+ * 服务端 HandlePublic 的唯一路径选择点。选错只会损失性能或增加一次握手，
+ * 不影响正确性；但小请求误走 raw 会多 1 RTT + 4 帧握手。
+ */
+bool ShouldUseRawStream(std::int64_t content_length);
 
 /// PSK 字节数，与 Bento 的 32B PSK 约定一致。
 inline constexpr std::size_t kPskBytes = 32;

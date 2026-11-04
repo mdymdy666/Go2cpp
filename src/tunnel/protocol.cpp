@@ -654,15 +654,57 @@ std::string MakeRandomSubdomain(std::size_t length) {
 
 bool RawStreamEnabledFromEnv() {
     const char* raw = std::getenv("GO2CPP_TUNNEL_RAW_STREAM");
-    if (raw == nullptr) {
-        return false;
+    // 2026-11-04：per-stream raw TCP 默认启用（soak 实测 830 MiB/s / 3.56x ->
+    // 1469-1903 MiB/s / 1.03-1.44x）。显式设 0/false/off/no 回退旧 mux 路径；
+    // 变量为空也按默认启用，避免 GO2CPP_TUNNEL_RAW_STREAM= 意外关掉。
+    if (raw == nullptr || *raw == '\0') {
+        return true;
     }
     std::string value(raw);
     for (char& ch : value) {
         ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     }
-    return value == "1" || value == "true" || value == "on" ||
-           value == "yes";
+    if (value == "0" || value == "false" || value == "off" || value == "no") {
+        return false;
+    }
+    return true;
+}
+
+std::int64_t RawStreamThresholdBytesFromEnv() {
+    const char* raw = std::getenv("GO2CPP_TUNNEL_RAW_THRESHOLD");
+    if (raw == nullptr || *raw == '\0') {
+        return 1024 * 1024;
+    }
+    try {
+        std::size_t consumed = 0;
+        const long long value = std::stoll(raw, &consumed);
+        if (consumed != std::strlen(raw)) {
+            return 1024 * 1024;
+        }
+        if (value < 0) {
+            return -1;
+        }
+        return static_cast<std::int64_t>(value);
+    } catch (...) {
+        return 1024 * 1024;
+    }
+}
+
+bool ShouldUseRawStream(std::int64_t content_length) {
+    if (!RawStreamEnabledFromEnv()) {
+        return false;
+    }
+    const std::int64_t threshold = RawStreamThresholdBytesFromEnv();
+    if (threshold < 0) {
+        return false;  // -1：全走 mux
+    }
+    if (threshold == 0) {
+        return true;  // 0：全走 raw（含未知长度，调试/压测用）
+    }
+    if (content_length < 0) {
+        return false;  // 未知长度 → mux，不等 body 到齐再选路
+    }
+    return content_length > threshold;
 }
 
 }  // namespace tunnel
