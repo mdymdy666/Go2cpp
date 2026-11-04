@@ -1649,33 +1649,63 @@ void ScenarioChunkedTransfer() {
         payload[index] = static_cast<char>((index * 31U + 7U) & 0xFFU);
     }
 
-    MemorySource source(payload);
-    source.plan = {1, 3, 7, 13, 64, 1024, 4096};  // 不规则分块
-    Reader<MemorySource> reader(source, 4096);
+    /// 一次完整运行的结果：只保留最后一次用于断言。
+    struct Sample {
+        double seconds{0.0};
+        std::string received;
+        std::uint64_t source_calls{0};
+        bool eof{false};
+    };
 
-    const auto start = std::chrono::steady_clock::now();
-    std::string received;
-    received.reserve(kTotal);
-    char buffer[512];
-    while (true) {
-        const std::size_t got = reader.Read(AsBytes(buffer, sizeof(buffer)));
-        if (got == 0) {
-            break;
+    const auto measure_once = [&payload]() {
+        MemorySource source(payload);
+        source.plan = {1, 3, 7, 13, 64, 1024, 4096};  // 不规则分块
+        Reader<MemorySource> reader(source, 4096);
+        Sample sample;
+        sample.received.reserve(kTotal);
+        char buffer[512];
+        const auto start = std::chrono::steady_clock::now();
+        while (true) {
+            const std::size_t got = reader.Read(AsBytes(buffer, sizeof(buffer)));
+            if (got == 0) {
+                break;
+            }
+            sample.received.append(buffer, got);
         }
-        received.append(buffer, got);
-    }
-    const auto finish = std::chrono::steady_clock::now();
-    const double seconds =
-        std::chrono::duration<double>(finish - start).count();
+        const auto finish = std::chrono::steady_clock::now();
+        sample.seconds = std::chrono::duration<double>(finish - start).count();
+        sample.source_calls = source.calls;
+        sample.eof = IsEof(reader.Err());
+        return sample;
+    };
 
-    CHECK(received.size() == kTotal);
-    CHECK(received == payload);
-    CHECK(IsEof(reader.Err()));
-    // 512 字节请求 × 2048 次，但底层只被调用「分块次数」量级（远小于 1M）
-    CHECK(source.calls < kTotal / 10);
-    ReportRate("分块传输 1MiB", kTotal, seconds);
+    // 1 MiB 目标缓冲首次写入走 mmap，256 个页各触发一次缺页，合计约 0.5 ms，而 1 MiB
+    // 的真实搬运只要约 0.06 ms——单轮会把缺页算进吞吐（实测 1.7 vs 12-19 GiB/s）。
+    // 因此先跑 1 轮丢弃（glibc 借此提升 mmap 阈值并复用已映射页），再取 5 轮 median，
+    // 与 Go 侧 21 轮取 median 的口径对齐。
+    constexpr int kRounds = 6;
+    std::vector<double> rates;
+    rates.reserve(kRounds - 1);
+    Sample last;
+    for (int round = 0; round < kRounds; ++round) {
+        last = measure_once();
+        if (round > 0) {
+            rates.push_back(static_cast<double>(kTotal) / (1024.0 * 1024.0) / last.seconds);
+        }
+    }
+    std::sort(rates.begin(), rates.end());
+    const double median = rates[rates.size() / 2];
+
+    CHECK(last.received.size() == kTotal);
+    CHECK(last.received == payload);
+    CHECK(last.eof);
+    CHECK(last.source_calls < kTotal / 10);
+    ReportRate("分块传输 1MiB（median）", kTotal,
+               static_cast<double>(kTotal) / (1024.0 * 1024.0) / median);
+    std::printf("[bufio]   median=%.1f MiB/s, best=%.1f MiB/s, 轮数=%d（首轮丢弃）\n",
+                median, rates.back(), kRounds - 1);
     std::printf("[bufio]   Read 调用=%zu, 底层 Read=%llu, 每次请求=512B\n",
-                kTotal / 512, static_cast<unsigned long long>(source.calls));
+                kTotal / 512, static_cast<unsigned long long>(last.source_calls));
 }
 
 /// 场景 6：慢速对端（每次最多 512 字节）写 256 KiB。

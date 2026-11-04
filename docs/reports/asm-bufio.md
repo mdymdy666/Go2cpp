@@ -69,3 +69,93 @@ cd /tmp/gobufio && taskset -c 4 go run main.go             # Go 对照（需 /tm
 
 > Go 对照脚本是一次性的，未写入仓库（避免新增无法维护的基准）；若需要长期回归，
 > 建议后续在 `tests/bufio/` 增 `bench_bufio_go_parity` 并登记 M08 的双口径。
+
+## 12× 定位（2026-11-04）
+
+**结论：「落后 12×」是单轮测量的缺页假象，不是 bufio 实现退化。**
+同一 TU、同一 `Reader<MemorySource>` 热态实测 **17524.8 MiB/s**（0.89× Go 19775.4），
+冷单轮 1704 MiB/s——9–10× 的差额全部来自「首次触碰新分配的 1 MiB 目标缓冲」。
+
+### 1. 分段计时（8 轮，丢弃前 2 轮，`taskset -c 4`，`clock_gettime(CLOCK_MONOTONIC)`）
+
+| 段 | 中位耗时 |
+|---|---|
+| payload 构造（1 MiB 填充） | 236.2 µs |
+| MemorySource + Reader 构造（1 MiB 拷贝 + 4 KiB 缓冲） | 23.2 µs |
+| **Read + append 循环** | **57.1 µs** → 17524.8 MiB/s |
+| 校验（1 MiB `operator==`，即 memcmp） | 15.2 µs |
+
+循环只占全流程 **17.2%**。而 `ScenarioChunkedTransfer` 单轮自报 0.588 ms（1704 MiB/s），
+差额约 0.53 ms 全部落在「首次写新分配的 1 MiB 页」上。
+
+### 2. 根因实验：每轮新建 vs 复用同一缓冲
+
+同样 2048 次 `memcpy(512) + append`，只改目标缓冲分配方式：
+
+| 方式 | round 0 | round 1 | round 2 | round 3 |
+|---|---|---|---|---|
+| 每轮新建 `std::string received` | **1622.4** | **1663.9** | 14597.3 | 10893.6 MiB/s |
+| 复用同一 `received`（只 `clear()`） | 17834.8 | 15445.7 | 19807.1 | 15607.7 MiB/s |
+
+glibc 对 ≥128 KiB 的请求走 `mmap`，首次写入 1 MiB 触发 **256 次缺页**（约 0.5 ms）；
+连续 `mmap`/`munmap` 后 `mmap_threshold` 被抬高，**第 3 轮起**改走 `brk` 复用已映射页，
+吞吐跳 9×。官方测试只跑 1 轮 → 永远测到 round 0。
+
+Go 侧数据同向：21 轮里 `min=1742.1`（首轮缺页）、`median=19775.4`——旧报告拿
+C++ 单轮比 Go 的 median，**口径本身就不对称**。
+
+同时复现了「同构 Go 程序」：同 plan、同 4096 缓冲、同 512 B 读 + append，
+Go 仍是 `srcCalls=1415 / userReads=3025`，与 C++ 逐项一致，`median=19775.4`。
+
+### 3. 已排除的假设（每条都有数据）
+
+| 假设 | 数据 | 结论 |
+|---|---|---|
+| `ByteSpan` 深拷贝 | 仅 `(ptr,size)` 两个字段，`byte_span.hpp` 构造函数是 `constexpr` | 排除 |
+| 外层 `append` 每次 realloc | `received.reserve(kTotal)` 后 2048 次 append 不扩容 | 排除 |
+| `-O2` vs `-O3` | 同源码 `-O3` 与 `-O2` 差值 <10% | 非主因 |
+| 热函数未内联是主因 | 探针 A 加 `-fno-inline`：11055.6 vs 17752.2 MiB/s（1.6×） | 只解释剩余 1.6× |
+| `fill()` 的 memmove 每次触发 | 缓冲空时 `m_r==0`，`memmove` 不执行；热路径 1415 次 fill 中 memmove 仅在非空残余时 | 排除 |
+| 指令数 | 旧报告 `Read` 103 / `fill` 88 条；热态 57.1 µs ÷ 3025 次 = **18.9 ns/次** | 与指令数吻合，不支持 12× |
+
+### 4. 改动（测试侧，未动库）
+
+`tests/bufio/test_bufio.cpp::ScenarioChunkedTransfer`：
+
+- 首轮丢弃（预热：让 glibc 抬高 mmap 阈值并复用已映射页），再取 **5 轮 median**；
+- 每轮完整重建 `MemorySource`/`Reader`/`received`，断言只看最后一轮；
+- 与 Go 侧 21 轮取 median 的口径对齐。
+
+```cpp
+constexpr int kRounds = 6;   // 1 轮预热 + 5 轮计时
+```
+
+### 5. 前后
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| 场景5 自报（4 跑 median） | 1596.7 / 1654.2 / 1707.5 / 1723.5 / 1767.3（5 次） | **14047.7 / 12455.3 / 8359.7 / 6002.4** |
+| best | — | 18766.7 |
+| 热态循环（分段计时） | — | **17524.8** |
+
+提升 **3.4–8×**（median；WSL 共享机，轮间抖动 2–3×，best 单跑最高 18766.7）；相对 Go 的 19775.4 为 **0.30–0.71×**，**未达 0.9× 目标**。最能代表实现本身的是分段计时里的热态循环 **17524.8 MiB/s（0.89×）**——该值在同一次运行的 8 轮里稳定。
+
+### 6. 剩余瓶颈（未达 0.9× 的原因）
+
+1. **`Reader::Read`/`fill` 在大 TU 中不被内联**：`-fno-inline` 对照 11055.6 vs 17752.2 MiB/s。
+   Go 的 `fill` 被内联。强行 `always_inline` 属编译器扩展，未引入。
+2. **测试桩的 `%` 取模**：`MemorySource::Read` 每次 fill 一次 64 位
+   `plan_position % plan.size()`（约 20–40 cycle），1415 次 ≈ 12 µs，占循环 57 µs 的 21%。
+   这是**测试桩**开销，不在库里。
+3. 以上都不在 `include/go2cpp/bufio/*`，按铁律未改库。
+
+**未确认**：本机无 `perf`，缺页结论靠「新建 vs 复用」对照 + glibc mmap 阈值行为间接证明，
+未用 `perf stat -e page-faults` 直接计数。
+
+### 7. 复现
+
+```bash
+cd /UserData/CodexWorkSpace/Go2cpp
+taskset -c 4 ./.build-bento-wsl/go2cpp_bufio_test          # 改后应报 median/best 两行
+# Go 对照（严格同构，plan 与 512B 读循环）见本次临时脚本 /tmp/gobufio2/main.go（未入库）
+```
