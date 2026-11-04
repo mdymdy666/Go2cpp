@@ -282,8 +282,6 @@ private:
     ParserLimits m_limits;
     /// 未消费字节；feed() 追加、feed_impl() 按 consumed 擦除。
     std::string m_buffer;
-    /// Content-Length 声明的 body 长度；0 表示未声明或无需 body。
-    std::size_t m_expected_body{0};
     /// 头部是否已解析（true 时后续 feed 跳过头部重解析，直接进 body 阶段）。
     bool m_header_parsed{false};
     /// 头部解析结果快照：body 起始偏移 / Content-Length / chunked / 是否无 body。
@@ -291,14 +289,10 @@ private:
     std::size_t m_content_length{0};
     bool m_has_length{false};
     bool m_no_body{false};
-    /// 当前 chunk 还剩多少字节；chunked 解析时逐块递减。
-    std::size_t m_chunk_remaining{0};
     /// 是否 chunked 传输；由 Transfer-Encoding 头设置，决定 body 解析路径。
     bool m_chunked{false};
     /// 当前消息是否已完整交付；`finished()` 只读，reset() 清零。
     bool m_finished{false};
-    /// 是否正在读 chunked 的 trailer 段；解析头部时切换。
-    bool m_in_chunk_trailer{false};
     /// chunked 已解码 body；跨 feed 累积，完成时 move 给 Response/Request。
     /// 与 m_chunk_scan_pos 一起把增量解析从 O(n²) 降到 O(n)。
     std::string m_chunked_body;

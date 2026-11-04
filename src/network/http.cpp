@@ -386,7 +386,7 @@ std::string Response::to_string(bool head_request) const {
 }
 
 Parser::Parser(ParserLimits limits) : m_limits(limits) {}
-void Parser::reset() { m_buffer.clear(); m_chunked_body.clear(); m_chunk_scan_pos = 0; m_expected_body = 0; m_header_parsed = false; m_body_start_offset = 0; m_content_length = 0; m_chunked = false; m_has_length = false; m_no_body = false; m_chunk_remaining = 0; m_chunked = false; m_finished = false; m_in_chunk_trailer = false; m_response_close_delimited = false; m_body_start = 0; m_error.clear(); }
+void Parser::reset() { m_buffer.clear(); m_chunked_body.clear(); m_chunk_scan_pos = 0; m_header_parsed = false; m_body_start_offset = 0; m_content_length = 0; m_chunked = false; m_has_length = false; m_no_body = false; m_finished = false; m_response_close_delimited = false; m_body_start = 0; m_response_to_head = false; m_error.clear(); }
 ParseResult Parser::feed(std::string_view bytes, Request& request) { return feed_impl(bytes, false, &request, nullptr); }
 ParseResult Parser::feed(std::string_view bytes, Response& response) { return feed_impl(bytes, true, nullptr, &response); }
 ParseResult Parser::finish(Response& response) {
@@ -537,8 +537,8 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
     // 增量 feed 时 header_block 每次都是同一段（m_buffer 保留未消费字节），
     // 若不清空会把同名头重复追加，最终 wire 头膨胀到上百 KB 并被对端拒绝。
     // 先清空再逐行重建，保证每次 feed 后 header 恰好一份。
-    if (response) result->header.clear();
-    else request->header.clear();
+    if (response) { result->header.clear(); result->trailer.clear(); }
+    else { request->header.clear(); request->trailer.clear(); }
     bool has_transfer_encoding = false;
     // 每个头都要 emplace_back：先按 CRLF 计数预留，消除 vector 扩容与搬移。
     {
@@ -582,8 +582,8 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
         (static_cast<int>(result->status) >= 100 && static_cast<int>(result->status) < 200) ||
         result->status == Status::NoContent || static_cast<int>(result->status) == 304);
     if (no_body) {
-        if (chunked || (!m_response_to_head && has_length && content_length != 0))
-            return {ParseState::Error, bytes.size(), "body framing forbidden for response"};
+        // RFC 7230 §3.3.3：304 可带 Content-Length（选中表示的尺寸）、HEAD 可带
+        // Transfer-Encoding，二者都不得据此读取 body——忽略而不是判错。
         result->body.clear();
     }
     if (response && !no_body && !chunked && !has_length) {
@@ -689,7 +689,9 @@ body_phase:
     const std::size_t consumed = body_end; m_buffer.erase(0, consumed); m_finished = true;
     if (response) result->close = has_connection_token(result->header, "close");
     else request->close = has_connection_token(request->header, "close") || request->version == "HTTP/1.0";
-    return {ParseState::Complete, bytes.size(), {}};
+    // consumed 语义：本报文在 m_buffer 中占用的字节数（跨 feed 累积），不是本次
+    // feed 的输入长度——调用方按它切分流水线剩余字节。
+    return {ParseState::Complete, consumed, {}};
 }
 
 std::string query_escape(std::string_view value) { static const char* hex = "0123456789ABCDEF"; std::string result; for (unsigned char c : value) { if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') result += static_cast<char>(c); else if (c == ' ') result += '+'; else { result += '%'; result += hex[c >> 4]; result += hex[c & 15]; } } return result; }
