@@ -13,6 +13,10 @@
 # 测试由 GO2CPP_APP_TESTS 独立控制（默认 ON）：
 #   cmake -DGO2CPP_WITH_APP=ON -DGO2CPP_APP_TESTS=OFF
 # ---------------------------------------------------------------------------
+# 本文件被重复 include 会重复 add_executable / add_test（CMake 报
+# "already exists"）。GLOBAL 守卫让第二次 include 整体空操作，配置幂等。
+include_guard(GLOBAL)
+
 option(GO2CPP_WITH_APP "Build the application-layer stream framework (app/)" OFF)
 
 include(GNUInstallDirs)
@@ -142,15 +146,37 @@ if (GO2CPP_WITH_APP AND GO2CPP_APP_TESTS)
         target_compile_options(app_test_gateway PRIVATE
             -Wall -Wextra -Wpedantic -Werror ${APP_OPT_FLAGS})
     endif()
-    if (NOT TARGET app_gateway)
+    # `app_gateway` 是 test 名，不是 add_library/add_executable 的产物；
+    # `if (NOT TARGET app_gateway)` 恒为真（TARGET 谓词只认 target），
+    # 起不到去重作用。改用显式哨兵变量，保证 add_test 只注册一次。
+    if (NOT GO2CPP_APP_GATEWAY_TEST_REGISTERED)
         add_test(NAME app_gateway COMMAND app_test_gateway)
         set_tests_properties(app_gateway PROPERTIES TIMEOUT 300)
+        set(GO2CPP_APP_GATEWAY_TEST_REGISTERED TRUE)
     endif()
 
     set_tests_properties(app_frame app_stream_table app_resource app_kv
         app_connection app_realtime_resume PROPERTIES TIMEOUT 180)
     # 1 GiB 资源 + 1000 并发流的负载用例：给足时间，不掩盖真实性能。
     set_tests_properties(app_load PROPERTIES TIMEOUT 900)
+
+    # realtime_room 测试此前只由 tests/app/build_and_run_realtime.sh
+    # 独立编译：脚本不定义 go2cpp_app 的 GO2CPP_APP_HAS_* 宏，与 CMake
+    # 产物可能行为不一致。纳入统一构建后脚本只作快速单文件入口。
+    if (NOT TARGET app_test_realtime_room)
+        add_executable(app_test_realtime_room
+            ${GO2CPP_APP_TEST_DIR}/test_realtime_room.cpp)
+        target_include_directories(app_test_realtime_room PRIVATE
+            ${GO2CPP_APP_TEST_DIR})
+        target_link_libraries(app_test_realtime_room PRIVATE go2cpp_app)
+        target_compile_options(app_test_realtime_room PRIVATE
+            -Wall -Wextra -Wpedantic -Werror ${APP_OPT_FLAGS})
+    endif()
+    if (NOT GO2CPP_APP_REALTIME_ROOM_TEST_REGISTERED)
+        add_test(NAME app_realtime_room COMMAND app_test_realtime_room)
+        set_tests_properties(app_realtime_room PROPERTIES TIMEOUT 300)
+        set(GO2CPP_APP_REALTIME_ROOM_TEST_REGISTERED TRUE)
+    endif()
 
     # Bento 帧桥 + Link 真实 UDP 回环。
     if (TARGET go2cpp_bento)

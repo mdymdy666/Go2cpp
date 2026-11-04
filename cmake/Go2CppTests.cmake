@@ -1322,4 +1322,18 @@ if (GO2CPP_BUILD_TESTS)
     target_link_libraries(go2cpp_fast_channel_bench PRIVATE go2cpp_runtime)
     target_compile_options(go2cpp_fast_channel_bench PRIVATE
         -O2 -Wall -Wextra -Wpedantic)
+
+    # ---- 韧性三件套（resilience：Retry / CircuitBreaker / RateLimiter）----
+    # header-only，不链接 go2cpp_runtime。此前只由
+    # tests/resilience/build_and_run.sh 独立编译，ctest / CI 门禁看不到。
+    add_executable(go2cpp_resilience_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/resilience/test_resilience.cpp)
+    target_include_directories(go2cpp_resilience_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(go2cpp_resilience_test PRIVATE
+        -O2 -Wall -Wextra -Wpedantic -Werror -pthread)
+    target_link_options(go2cpp_resilience_test PRIVATE -pthread)
+    add_test(NAME go2cpp_resilience_test COMMAND go2cpp_resilience_test)
+    set_tests_properties(go2cpp_resilience_test PROPERTIES TIMEOUT 300)
+
 endif()

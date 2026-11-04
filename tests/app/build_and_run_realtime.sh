@@ -25,11 +25,19 @@ fi
 
 mkdir -p "$OUT_DIR"
 
-# realtime_room.cpp 用 GO2CPP_LOG_WARN，必须链接已构建的 libgo2cpp_log；
-# 其余依赖仍只用标准库与 pthread（不重复链接整个 go2cpp 家族）。
+# realtime_room.cpp 用 GO2CPP_LOG_WARN，必须链接日志实现。两种路径与 CMake
+# 的 go2cpp_app 保持一致：构建目录有 libgo2cpp_log 就链接它；否则（例如
+# GO2CPP_WITH_LOGGING=OFF 的 standalone 构建）直接把 src/logging/log.cpp
+# 作为额外编译单元，避免脚本因缺库直接失败。
 CXXFLAGS=(-std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror
           -I"$ROOT/include" -I"$ROOT/tests/app")
-LDFLAGS=(-L"$BUILD_LIB" -Wl,-rpath,"$BUILD_LIB" -lgo2cpp_log)
+LOG_SRCS=()
+LDFLAGS=(-L"$BUILD_LIB" -Wl,-rpath,"$BUILD_LIB")
+if compgen -G "$BUILD_LIB/libgo2cpp_log.*" > /dev/null; then
+  LDFLAGS+=(-lgo2cpp_log)
+else
+  LOG_SRCS+=("$ROOT/src/logging/log.cpp")
+fi
 
 echo "[env] $(uname -srm)"
 echo "[env] $("$CXX" --version | head -n 1)"
@@ -39,6 +47,7 @@ echo "[build] $CXX ${CXXFLAGS[*]} src/app/realtime_room.cpp tests/app/test_realt
 "$CXX" "${CXXFLAGS[@]}" \
   "$ROOT/src/app/realtime_room.cpp" \
   "$ROOT/tests/app/test_realtime_room.cpp" \
+  "${LOG_SRCS[@]}" \
   "${LDFLAGS[@]}" -pthread -o "$BIN"
 
 echo "[run] $BIN"
