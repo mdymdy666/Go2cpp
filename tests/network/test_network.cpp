@@ -239,6 +239,118 @@ void run_network_tests() {
     GO2CPP_CHECK(head_parser.feed("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n",
                                   head_response).state == go2cpp::http::ParseState::Complete &&
                  head_response.body.empty());
+    // 回归 9f7ab5c：Parser 增量 feed 时 header_block 每次都是同一段
+    // （m_buffer 保留未消费字节），若不先 clear() 就会把同名头重复追加。
+    // 6 MiB 是抖音上传触发全 502 的真实量级：原实现把 User-Agent /
+    // Authorization / Content-Type 重复上千份，wire 头膨胀到 ~147 KB。
+    {
+        go2cpp::http::Parser large_parser;
+        go2cpp::http::Request large_request;
+        constexpr std::size_t kBodySize = 6U * 1024U * 1024U;  // 6291456
+        constexpr std::size_t kChunkSize = 1024U;              // 每次 feed 1 KiB
+        constexpr std::size_t kChunkCount = kBodySize / kChunkSize;
+        static_assert(kChunkCount == 6144, "6 MiB / 1 KiB 必须是整数块");
+        const std::string large_head =
+            "POST /api/douyin/video-write HTTP/1.1\r\n"
+            "Host: 127.0.0.1:18080\r\n"
+            "User-Agent: go2cpp-test/1.0\r\n"
+            "Authorization: Bearer header-dup-regression\r\n"
+            "Content-Type: video/mp4\r\n"
+            "Content-Length: 6291456\r\n\r\n";
+        // 每个字节由偏移决定：既能校验首尾抽样，也能发现错位或丢字节。
+        const auto sample_byte = [](std::size_t offset) {
+            return static_cast<char>((offset * 31U + (offset >> 8U) + 0x5AU) & 0xFFU);
+        };
+        // 头部单独一次喂入（真实 recv 边界），body 严格按 1 KiB 逐块喂。
+        auto large_result = large_parser.feed(large_head, large_request);
+        GO2CPP_CHECK(large_result.state == go2cpp::http::ParseState::NeedMore);
+        GO2CPP_CHECK(large_request.header.entries().size() == 5);
+        std::string block(kChunkSize, '\0');
+        std::size_t fed_blocks = 0;
+        for (std::size_t offset = 0; offset < kBodySize; offset += kChunkSize) {
+            const std::size_t size = std::min(kChunkSize, kBodySize - offset);
+            for (std::size_t i = 0; i < size; ++i) block[i] = sample_byte(offset + i);
+            large_result = large_parser.feed(std::string_view(block.data(), size), large_request);
+            ++fed_blocks;
+            // 第 100 块时头仍必须恰好一份——这正是修复前最先膨胀的位置。
+            if (fed_blocks == 100) {
+                GO2CPP_CHECK(large_request.header.entries().size() == 5);
+                GO2CPP_CHECK(large_request.header.values("User-Agent").size() == 1);
+            }
+            if (large_result.state != go2cpp::http::ParseState::NeedMore) break;
+        }
+        GO2CPP_CHECK(large_result.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(fed_blocks == kChunkCount);
+        GO2CPP_CHECK(large_request.header.entries().size() == 5);
+        GO2CPP_CHECK(large_request.header.values("User-Agent").size() == 1);
+        GO2CPP_CHECK(large_request.header.values("Authorization").size() == 1);
+        GO2CPP_CHECK(large_request.header.values("Content-Type").size() == 1);
+        GO2CPP_CHECK(large_request.header.values("Content-Length").size() == 1);
+        GO2CPP_CHECK(large_request.header.get("Content-Type") == "video/mp4");
+        GO2CPP_CHECK(large_request.body.size() == 6291456);
+        GO2CPP_CHECK(large_request.body.front() == sample_byte(0));
+        GO2CPP_CHECK(large_request.body[1] == sample_byte(1));
+        GO2CPP_CHECK(large_request.body[kBodySize - 2] == sample_byte(kBodySize - 2));
+        GO2CPP_CHECK(large_request.body.back() == sample_byte(kBodySize - 1));
+        GO2CPP_CHECK(large_request.body[kBodySize / 2] == sample_byte(kBodySize / 2));
+    }
+    // 快速路径：16 KiB body 分 16 次喂，确认短消息同样逐次重建头而不是累加。
+    {
+        go2cpp::http::Parser small_parser;
+        go2cpp::http::Request small_request;
+        constexpr std::size_t kSmallBody = 16U * 1024U;
+        constexpr std::size_t kSmallChunk = 1024U;
+        const std::string small_head =
+            "POST /upload HTTP/1.1\r\n"
+            "Host: 127.0.0.1:18080\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: 16384\r\n\r\n";
+        go2cpp::http::ParseResult small_result;
+        GO2CPP_CHECK(small_parser.feed(small_head, small_request).state ==
+                     go2cpp::http::ParseState::NeedMore);
+        GO2CPP_CHECK(small_request.header.entries().size() == 3);
+        std::string small_block(kSmallChunk, '\0');
+        std::size_t small_feeds = 0;
+        for (std::size_t offset = 0; offset < kSmallBody; offset += kSmallChunk) {
+            // 第 n 块全填 'a'+n，便于定位错位。
+            std::fill(small_block.begin(), small_block.end(),
+                      static_cast<char>('a' + (offset / kSmallChunk)));
+            small_result = small_parser.feed(small_block, small_request);
+            ++small_feeds;
+            if (small_result.state != go2cpp::http::ParseState::NeedMore) break;
+        }
+        GO2CPP_CHECK(small_result.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(small_feeds == 16);
+        GO2CPP_CHECK(small_request.header.entries().size() == 3);
+        GO2CPP_CHECK(small_request.header.values("Content-Type").size() == 1);
+        GO2CPP_CHECK(small_request.header.values("Content-Length").size() == 1);
+        GO2CPP_CHECK(small_request.body.size() == 16384);
+        GO2CPP_CHECK(small_request.body.front() == 'a');
+        GO2CPP_CHECK(small_request.body[1024] == 'b');
+        GO2CPP_CHECK(small_request.body.back() == 'p');
+    }
+    // 响应侧同样按「每次 feed 重建一份」：9f7ab5c 同时覆盖 Request/Response。
+    {
+        go2cpp::http::Parser response_parser;
+        go2cpp::http::Response dup_response;
+        const std::string response_wire =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 8\r\n"
+            "\r\n"
+            "{\"ok\":1}";
+        go2cpp::http::ParseResult response_result;
+        for (std::size_t offset = 0; offset < response_wire.size(); offset += 8) {
+            const std::size_t size = std::min<std::size_t>(8, response_wire.size() - offset);
+            response_result = response_parser.feed(
+                std::string_view(response_wire.data() + offset, size), dup_response);
+        }
+        GO2CPP_CHECK(response_result.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(dup_response.header.entries().size() == 2);
+        GO2CPP_CHECK(dup_response.header.values("Content-Type").size() == 1);
+        GO2CPP_CHECK(dup_response.body == "{\"ok\":1}");
+    }
+
     // 流式响应只允许 Idle -> HeadersCommitted -> Closed，重复 close/write 必须失败。
     int stream_pair[2]{};
     GO2CPP_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, stream_pair) == 0);
