@@ -107,6 +107,38 @@ std::string EncodeCommentCursor(const StoredComment& comment);
 bool DecodeCommentCursor(const std::string& cursor, std::int64_t* created_at,
                          std::int64_t* id);
 
+/**
+ * @brief 编码推荐流随机游标：`"r<seed_hex>_<index>"`。
+ * @param seed [in] 洗牌种子（首屏随机生成，后续页原样带回）。
+ * @param index [in] 下一页起始下标（已消费条数）。
+ * @return 形如 `r1a2b3c_20` 的串；**不要**手写该格式——解码失败即 400。
+ */
+std::string EncodeFeedCursor(std::uint64_t seed, std::size_t index);
+
+/**
+ * @brief 解码推荐流随机游标。
+ * @param cursor [in] 非空游标串，来自 `EncodeFeedCursor`。
+ * @param seed [out] 输出洗牌种子；不可为 nullptr。
+ * @param index [out] 输出起始下标；不可为 nullptr。
+ * @return 格式合法返回 true；否则 false（调用方回 400，**不要**回 500）。
+ */
+bool DecodeFeedCursor(const std::string& cursor, std::uint64_t* seed,
+                      std::size_t* index);
+
+/// @brief `upload_sessions` 表里的一行分片上传会话（断点续传状态）。
+/// @note `upload_id` 是服务端生成的 UUID v4，同时是继续上传的唯一凭据；
+///       `path` 只由服务端拼出（`web/videos/.upload_<upload_id>.part`），
+///       绝不接受客户端传路径。
+struct StoredUpload {
+    std::string upload_id;           ///< UUID v4 文本（36 字符，小写）。
+    std::int64_t user_id{0};         ///< 发起者 id；只有本人能续传/完成。
+    std::string path;                ///< `.part` 暂存文件的绝对路径。
+    std::string title;               ///< 标题（init 时可选，finish 时覆盖）。
+    std::int64_t total{0};           ///< 声明的总字节数（1 ~ 32 MiB）。
+    std::int64_t received_bytes{0};  ///< 已确认落盘的**连续前缀**字节数。
+    std::int64_t created_at{0};      ///< Unix 秒。
+};
+
 /// @brief rooms 表里的一行直播间（C7）。
 struct StoredRoom {
     std::int64_t id{0};            ///< 自增主键。
@@ -145,6 +177,14 @@ class Store {
 
     /// @brief 连接是否已打开。
     bool Ok() const noexcept;
+
+    /**
+     * @brief 底层 SQLite 连接（借用；仅 Open 成功后非空）。
+     * @details 供同进程的横向组件复用同一连接（例如幂等中间件写
+     *          `idempotency_keys` 表），避免第二个连接在 WAL 下多一份锁竞争。
+     * @return 连接指针；未 Open 或已失败时返回 nullptr，调用方不得 Close。
+     */
+    go2cpp::storage::DB* Database() noexcept { return m_db.get(); }
 
     /**
      * @brief 创建用户。
@@ -265,12 +305,21 @@ class Store {
     int DeleteVideo(std::int64_t id, std::int64_t user_id, std::string* error);
 
     /**
-     * @brief 推荐流：热度序（见文件头公式）+ 游标分页。
-     * @param cursor 空串表示第一页。
-     * @param limit 期望条数。
-     * @param out 追加到末尾。
-     * @param next_cursor 还有下一页时写游标，否则空串。
-     * @param error 失败时写错误文本。
+     * @brief 推荐流：**随机序** + 游标分页（候选池=全库视频，不做作者过滤，
+     *        所以当前用户自己的视频也在池里，能刷到自己）。
+     *
+     * @details 首屏生成随机 seed，用 seed 确定性洗牌全库；游标携带
+     *          `(seed, 已消费条数)`，下一页用同一 seed 重新洗牌后从该位置续取，
+     *          因此翻页不重复、不漏条，且每次首屏顺序都不同。等价于
+     *          `ORDER BY RANDOM() LIMIT n`，但保持了可续页性。
+     *
+     * @param cursor [in] 空串=第一页；否则必须是 `EncodeFeedCursor` 产物，
+     *        格式非法返回 false——调用方**必须**回 400 而不是 500。
+     * @param limit [in] 期望条数；<=0 返回空页，**不要**当错误。
+     * @param out [out] 追加到末尾；失败时内容未定义。
+     * @param next_cursor [out] 还有下一页时写游标，否则空串。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return true=成功（可能空页）；false=cursor 非法或数据库错误。
      */
     bool ListFeed(const std::string& cursor, std::int64_t limit,
                   std::vector<StoredVideo>* out, std::string* next_cursor,
@@ -398,6 +447,43 @@ class Store {
      * @return 1=本次离开；0=本不在房间（不变）；-1=数据库错误。
      */
     int LeaveRoom(std::int64_t id, std::int64_t user_id, std::string* error);
+
+    // ---- 分片上传（断点续传）：upload_sessions 持久化 ----
+
+    /**
+     * @brief 插入一条上传会话（upload_id 为主键，冲突即失败）。
+     * @param session [in] 已填好全部字段的会话；upload_id 由 service 生成。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true。
+     */
+    bool CreateUploadSession(const StoredUpload& session, std::string* error);
+
+    /**
+     * @brief 按 upload_id 查上传会话。
+     * @param upload_id [in] UUID v4 文本。
+     * @param out [out] 找到时写入；未找到保持原值。
+     * @param error [out] 数据库错误时写文本（未找到时为空）。
+     * @return 找到返回 true。
+     */
+    bool FindUploadSession(const std::string& upload_id, StoredUpload* out,
+                           std::string* error);
+
+    /**
+     * @brief 更新已收字节数（每个分片落盘后调用一次）。
+     * @param upload_id [in] 会话 id。
+     * @param received_bytes [in] 新的连续前缀字节数（>=0，<=total）。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true。
+     */
+    bool UpdateUploadProgress(const std::string& upload_id,
+                              std::int64_t received_bytes, std::string* error);
+
+    /**
+     * @brief 删除上传会话（finish 成功后调用）。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true（会话本就不存在也算成功）。
+     */
+    bool DeleteUploadSession(const std::string& upload_id, std::string* error);
 
    private:
     std::unique_ptr<go2cpp::storage::DB> m_db;

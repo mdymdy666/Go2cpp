@@ -71,6 +71,10 @@ struct HttpResponse {
     int status{200};
     std::string content_type{"application/json; charset=utf-8"};
     std::string body;
+    /// @brief 额外响应头（如幂等中间件的 `Idempotency-Replayed`）。
+    /// @note 键按调用方给的大小写原样输出；Serialize 会跳过含 CR/LF 的字段
+    ///       以防止响应头注入（跳过不影响 body，只丢这一条头）。
+    std::map<std::string, std::string> headers;
     /// @brief 是否在响应里显式声明 `Connection: close`。
     ///        默认 true：本服务器每连接只处理一个请求；检测到 pipeline 残留
     ///        字节时会再次置 true 并记日志，让对端明确知道后续请求未被处理。
@@ -116,6 +120,16 @@ inline std::string Serialize(const HttpResponse& response) {
                        StatusText(response.status) + "\r\n";
     head += "Content-Type: " + response.content_type + "\r\n";
     head += "Content-Length: " + std::to_string(response.body.size()) + "\r\n";
+    for (const auto& header : response.headers) {
+        // 只跳过非法字段（防 CRLF 注入）：只读请求头可能带有攻击者构造的值，
+        // 不能原样回显到响应头里。
+        if (header.first.empty() ||
+            header.first.find_first_of("\r\n") != std::string::npos ||
+            header.second.find_first_of("\r\n") != std::string::npos) {
+            continue;
+        }
+        head += header.first + ": " + header.second + "\r\n";
+    }
     if (response.connection_close) {
         head += "Connection: close\r\n";
     }

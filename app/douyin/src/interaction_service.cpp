@@ -22,6 +22,7 @@
 #include "douyin_http.hpp"
 #include "douyin_proto.hpp"
 #include "douyin_store.hpp"
+#include "idempotency.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +41,8 @@ constexpr const char* kServiceName = "interaction";
 constexpr std::int64_t kDefaultPageSize = 20;
 constexpr std::int64_t kMaxPageSize = 100;
 constexpr std::size_t kMaxCommentChars = 500;
+/// @brief 幂等记录默认 TTL：24 小时（与 PRD 的「重发窗口」一致）。
+constexpr std::int64_t kDefaultIdempotencyTtlSeconds = 24 * 60 * 60;
 
 /// @brief 单线程事件循环上的计数器（无需原子）。
 struct ServiceMetrics {
@@ -52,6 +55,26 @@ ServiceMetrics g_metrics;
 /// @brief 当前 Unix 秒。
 std::int64_t NowSeconds() {
     return static_cast<std::int64_t>(std::time(nullptr));
+}
+
+/**
+ * @brief 读幂等 TTL 环境变量（秒）。
+ * @return 正整数秒；变量缺失、非数字、<=0 时回落到 24h，避免 0 TTL 把
+ *         幂等直接关掉（0 会让所有记录一写入就过期）。
+ * @note 环境变量 `DOUYIN_IDEMPOTENCY_TTL_SECONDS` 只用于测试缩短 TTL，
+ *       生产保持默认 24h。
+ */
+std::int64_t IdempotencyTtlSeconds() {
+    const char* env = std::getenv("DOUYIN_IDEMPOTENCY_TTL_SECONDS");
+    if (env == nullptr || *env == '\0') {
+        return kDefaultIdempotencyTtlSeconds;
+    }
+    char* end = nullptr;
+    const long long value = std::strtoll(env, &end, 10);
+    if (end == env || value <= 0) {
+        return kDefaultIdempotencyTtlSeconds;
+    }
+    return static_cast<std::int64_t>(value);
 }
 
 /// @brief 统一错误响应。
@@ -503,18 +526,34 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // 幂等中间件：和业务共用同一个 SQLite 连接（WAL 下少一份锁竞争），
+    // 表前缀 idempotency_，挂在整个路由外层（POST /api/comment、/api/like
+    // 自动受保护；GET/HEAD 在中间件内部直通）。
+    douyin::IdempotencyOptions idempotency_options;
+    idempotency_options.ttl_seconds = IdempotencyTtlSeconds();
+    douyin::IdempotencyMiddleware idempotency(store.Database(), idempotency_options);
+    if (!idempotency.EnsureSchema(&error)) {
+        std::fprintf(stderr, "[%s] %s\n", kServiceName, error.c_str());
+        return 1;
+    }
+
     douyin::HttpServer server(kServiceName, port);
     if (!server.Start(&error)) {
         std::fprintf(stderr, "[%s] %s\n", kServiceName, error.c_str());
         return 1;
     }
-    std::printf("[%s] 监听 0.0.0.0:%u db=%s\n", kServiceName,
-                static_cast<unsigned>(port), db_path.c_str());
+    std::printf("[%s] 监听 0.0.0.0:%u db=%s idempotency_ttl=%llds\n", kServiceName,
+                static_cast<unsigned>(port), db_path.c_str(),
+                static_cast<long long>(idempotency_options.ttl_seconds));
     std::fflush(stdout);
 
-    server.ServeForever([&store](const douyin::HttpRequest& request,
-                                 douyin::HttpResponse* response) {
+    const douyin::HttpHandler route = [&store](const douyin::HttpRequest& request,
+                                               douyin::HttpResponse* response) {
         return Handle(store, request, response);
+    };
+    server.ServeForever([&idempotency, &route](const douyin::HttpRequest& request,
+                                               douyin::HttpResponse* response) {
+        return idempotency.Handle(request, response, route);
     });
     return 0;
 }

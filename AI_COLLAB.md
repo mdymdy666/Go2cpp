@@ -1119,3 +1119,43 @@ handler 异常导致 SIGABRT；slowloris 靠单次 recv 30s 无限占住 worker�
 **坑**：`http::Parser` 完成后 `m_finished=true`，必须 `take_remaining()` 后再用**新 Parser**
 解析下一条，否则 feed 直接返回 Complete；`Response::close` 必须与实际连接去留同步，
 否则客户端会按 keep-alive 等待已关闭的连接。
+
+## 2026-11-04 · 抖音写接口幂等键中间件（可靠性主线 1）
+
+**背景**：切网/断线重连后客户端重发，抖音评论等写接口没有幂等键，同一请求
+重发会重复执行（重复评论）。服务端此前只有示例 `Idempotency-Key` 思路
+（`user/modules/network/02-connection-reset.cpp`），无实现。
+
+**改动**：
+- 新增 `app/douyin/include/idempotency.hpp`：`IdempotencyMiddleware`，去重表
+  `idempotency_keys(key PK, method, path, status, response_body, created_at)`
+  与业务同库（`data/douyin.db`，表前缀 `idempotency_`）；只对
+  POST/PUT/PATCH/DELETE 生效；key 命中且未过 TTL → 回放首次状态码/body 并加
+  `Idempotency-Replayed: true`；未命中 → 执行 handler，仅 2xx 写表；TTL 默认
+  24h（`DOUYIN_IDEMPOTENCY_TTL_SECONDS` 可覆盖，测试用），访问时懒删除过期行；
+  缺 key 放行并记 WARN，DB 故障降级直通。
+- `app/douyin/include/douyin_http.hpp`：`HttpResponse` 增加 `headers`（额外响应
+  头），`Serialize` 输出时跳过含 CR/LF 的字段（防响应头注入）。
+- `app/douyin/include/douyin_store.hpp`：新增 `Store::Database()` 借用底层
+  `storage::DB*`，中间件复用同一连接。
+- `app/douyin/src/interaction_service.cpp`：启动时 `EnsureSchema` 建幂等表，
+  整个路由外层挂 `IdempotencyMiddleware`（`POST /api/comment`、`/api/like`
+  自动受保护；GET/HEAD 在中间件内直通）。
+- 新增 `app/douyin/scripts/idempotency_test.sh`：四组真实 HTTP 验收。
+
+**验证**：
+- `scripts/idempotency_test.sh`（独立库 `data/idempotency_test.db`，29201/29202/
+  29204 三进程）：22 项断言全过。同 key 两次 → 第二次同 comment id、响应体
+  字节一致、`Idempotency-Replayed: true`、DB 1 条；不同 key → 2 条；无 key →
+  2 条且日志有「缺少 Idempotency-Key」WARN；TTL=1s 重启等 2.5s → 重新执行
+  （新 id、无 Replayed），累计 6 条。
+- `app/douyin/build.sh`：8 目标（含 gateway/loadgen）全 ok，`-Werror` 零告警。
+- `scripts/accept_all.sh`：70 PASS / 0 FAIL，无回归。
+- 生产：按 pid 停旧 interaction（122204）→ 新 pid 130904 重启（`idempotency_ttl=86400s`），
+  `serve_public.pids` 已更新；公网 `http://82.157.147.127:8443/douyin/health` = 200、
+  `/api/feed` = 200。
+
+**未提交**：不 commit。
+
+**坑**：并行 agent 同改 `douyin_store.hpp` 导致上传声明块重复声明而编译失败，
+已按当前版本恢复（`StoredUpload`/上传方法各 1 份）；同文件改动需串行合并。
