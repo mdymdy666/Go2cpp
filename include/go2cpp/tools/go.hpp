@@ -28,11 +28,19 @@
  *
  * 默认调度器状态故意进程级泄漏（避免静态析构顺序问题）；`shutdown` 是终态，
  * 之后再次 `go()` 会创建新实例，旧引用不能继续提交任务。
+ *
+ * 两个已知陷阱（本文件把它们变成显式失败，而不是静默丢任务）：
+ * - 显式 `go(scheduler, fn)` 对**已 shutdown** 的实例返回**空句柄**：`start()`
+ *   对终态实例是空操作，继续 `spawn()` 只会得到一个已取消、永不运行的 Task；
+ * - `default_scheduler()` 返回**裸引用**，`shutdown_default_scheduler()` 之后
+ *   立即失效（对象可能已销毁）。需要跨关闭持有请用
+ *   `default_scheduler_handle()` 的 `shared_ptr`。
  */
 
 #include "go2cpp/log.hpp"
 #include "go2cpp/scheduler/scheduler.hpp"
 
+#include <cassert>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -133,31 +141,51 @@ inline std::shared_ptr<Scheduler> default_scheduler_handle(
     return detail::ensure_default_scheduler(config);
 }
 
-/** @brief 获取默认调度器引用；调用者不负责释放返回对象。 */
+/**
+ * @brief 获取默认调度器引用；调用者不负责释放返回对象。
+ * @return 当前处于运行状态的默认调度器引用。
+ * @warning 返回的是**裸引用**，不延长生命周期：其后的任意一次
+ *          `shutdown_default_scheduler()` 都会让该引用立即失效（对象可能
+ *          已销毁），继续使用是**未定义行为**。需要跨关闭持有的代码请改用
+ *          `default_scheduler_handle()` 的 `shared_ptr`。只在本区间内直接
+ *          调用 `go(scheduler, fn)` 的代码可以安全使用该引用。
+ * @note debug 构建下断言返回实例确实在运行；若「确保/关闭」发生竞态，
+ *       会在这里 abort，而不是把一个已停止实例交给调用方。
+ */
 inline Scheduler& default_scheduler() {
-    return *detail::ensure_default_scheduler();
+    auto scheduler = detail::ensure_default_scheduler();
+    assert(scheduler && scheduler->is_running());
+    return *scheduler;
 }
 
 /**
  * @brief 获取默认调度器引用，并在首次创建时应用给定配置。
  * @param config [in] 首次创建时的配置；已存在实例时忽略（保持首次配置）。
  * @return 默认调度器引用；调用者不负责释放。
+ * @warning 该裸引用在下一次 `shutdown_default_scheduler()` 后立即失效，
+ *          持续使用是未定义行为；跨关闭请持有 `default_scheduler_handle()`。
  * @note 配置只在创建时生效；要换配置先 `shutdown_default_scheduler()`。
  */
 inline Scheduler& default_scheduler(const SchedulerConfig& config) {
-    return *detail::ensure_default_scheduler(config);
+    auto scheduler = detail::ensure_default_scheduler(config);
+    assert(scheduler && scheduler->is_running());
+    return *scheduler;
 }
 
 /**
  * @brief 获取默认调度器引用，并在首次创建时指定 P 数量。
  * @param processor_count [in] 逻辑处理器数量；0 表示按硬件并发度自动选择。
  * @return 默认调度器引用；调用者不负责释放。
+ * @warning 该裸引用在下一次 `shutdown_default_scheduler()` 后立即失效，
+ *          持续使用是未定义行为；跨关闭请持有 `default_scheduler_handle()`。
  * @note 已存在实例时忽略该参数；要换 P 数量先 `shutdown_default_scheduler()`。
  */
 inline Scheduler& default_scheduler(std::size_t processor_count) {
     SchedulerConfig config;
     config.processor_count = processor_count;
-    return *detail::ensure_default_scheduler(config);
+    auto scheduler = detail::ensure_default_scheduler(config);
+    assert(scheduler && scheduler->is_running());
+    return *scheduler;
 }
 
 // 停止默认调度器中的工作线程；已提交任务仍遵守 Scheduler 的排空规则。
@@ -165,6 +193,13 @@ inline Scheduler& default_scheduler(std::size_t processor_count) {
 /** @brief 停止默认调度器并等待其工作线程退出。 */
 /**
  * @brief 停止默认调度器并等待工作线程退出。
+ *
+ * ## 生命周期
+ * 返回后，所有先前由 `default_scheduler()`/`DefaultScheduler()` 取得的
+ * **裸引用立即失效**（句柄已移出并 `shutdown()`，对象可能已被销毁）；
+ * 缓存这些引用跨越关闭属于未定义行为，debug 构建不会替调用方兜底。
+ * `default_scheduler_handle()` 的 `shared_ptr` 不受影响，仍可等待已提交
+ * 任务，但不应用它提交新任务。
  *
  * ## 步骤
  * step1. 持锁把句柄移出状态，保证下一次 `go()` 重建新实例；
@@ -194,15 +229,50 @@ inline void shutdown_default_scheduler() noexcept {
 // 显式调度器版本，适合库代码和需要明确所有权的程序。
 /**
  * @brief 向指定调度器提交一个 Fiber 任务。
- * @param scheduler 目标调度器；未运行时会自动启动。
- * @param function 任务入口函数。
- * @return 任务句柄；提交失败返回空指针。
+ * @param scheduler [in] 目标调度器；**未启动**时会自动 `start()`，但已
+ *        `shutdown()` 的实例是终态、无法复活。引用必须指向存活对象。
+ * @param function [in] 任务入口函数；所有权移交给新 Task。
+ * @return
+ * - 非空句柄：任务已入队，可 `wait()`/`cancel()`/查询状态；
+ * - 空句柄：**任务未提交**——调用方必须按失败处理（新建调度器/上报），
+ *   **不要**对空句柄等待或当成已提交。
+ *
+ * ## 定位
+ * 库代码提交任务的显式入口；新手入口 `go(fn)` 只是先取默认调度器。
+ * 写错会怎样：调用方若把「已停止调度器」当成可提交，任务会被静默丢弃。
+ *
+ * ## 步骤
+ * step1. 未运行时尝试 `start()`；
+ * step2. 若 `start()` 之后仍未运行，说明实例已 `shutdown()`（终态），记录
+ *        警告并返回空——旧实现这里会返回一个已取消、永不运行的 Task；
+ * step3. `spawn()` 提交；与 `shutdown()` 并发的窄窗口里 `spawn()` 返回的是
+ *        「已取消」而非空，这里把「从未 started 的取消句柄」归一成空值。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程可调；与 `shutdown()` 并发时可能拿到空句柄；
+ * - 失败语义：不抛异常（`enqueue` 失败就地取消），返回空即代表未提交；
+ * - 不变量：返回非空句柄时，任务要么在运行队列中，要么已完成。
  */
 inline std::shared_ptr<Task> go(Scheduler& scheduler, Task::Function function) {
+    // step1: 未启动实例可以现场启动
     if (!scheduler.is_running()) {
         scheduler.start();
+        // step2: shutdown 是终态，start() 对已停止实例是空操作
+        if (!scheduler.is_running()) {
+            auto logger = GO2CPP_LOG_NAME("Go");
+            GO2CPP_LOG_WARN(logger)
+                << "go(scheduler, fn): 目标 Scheduler 已 shutdown（终态，无法"
+                   "重启），任务未提交并返回空句柄；请改用 go(fn)/"
+                   "default_scheduler() 或新建 Scheduler 实例";
+            return {};
+        }
     }
-    return scheduler.spawn(std::move(function));
+    // step3: 提交，并把「从未运行就被取消」归一成空，守住返回契约
+    auto task = scheduler.spawn(std::move(function));
+    if (task && !task->started() && task->state() == GState::kCancelled) {
+        return {};
+    }
+    return task;
 }
 
 // 新手入口：先隐式取得默认调度器，再提交一个 Fiber 任务。

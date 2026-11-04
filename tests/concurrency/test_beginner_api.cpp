@@ -145,6 +145,13 @@ void run_beginner_api_tests() {
 
     scheduler.shutdown();
 
+    // shutdown 是终态：显式 go(scheduler, fn) 必须返回空句柄，而不是一个
+    // 已取消、永不运行的 Task（旧行为会让只判空的调用方静默丢任务）。
+    {
+        auto stopped_task = go(scheduler, [] { GO2CPP_CHECK(false); });
+        GO2CPP_CHECK(stopped_task == nullptr);
+    }
+
     std::atomic<bool> default_done{false};
     auto default_task = go([&] { default_done.store(true, std::memory_order_release); });
     GO2CPP_REQUIRE(default_task->wait_for(2s));
@@ -159,4 +166,11 @@ void run_beginner_api_tests() {
     GO2CPP_REQUIRE(restarted_task->wait_for(2s));
     GO2CPP_CHECK(restarted_done.load(std::memory_order_acquire));
     shutdown_default_scheduler();
+
+    // 默认调度器关闭后，先前取得的引用已停止——这里用 shared_ptr 保活，
+    // 引用本身不悬空，因此可以安全验证「停止后提交返回空」的契约。
+    auto retained_handle = default_scheduler_handle();
+    Scheduler& retained_ref = *retained_handle;
+    shutdown_default_scheduler();
+    GO2CPP_CHECK(go(retained_ref, [] {}).get() == nullptr);
 }
