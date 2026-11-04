@@ -18,6 +18,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -137,6 +138,41 @@ std::string ReadUntilEof(int fd) {
     std::string output;
     std::array<char, 4096> chunk{};
     for (;;) {
+        const ssize_t got = ::recv(fd, chunk.data(), chunk.size(), 0);
+        if (got <= 0) {
+            break;
+        }
+        output.append(chunk.data(), static_cast<std::size_t>(got));
+    }
+    return output;
+}
+
+/// @brief 读到第一个 `\r\n\r\n`（响应头结束）为止；用于 100 Continue 预应答。
+std::string ReadHeaderBlock(int fd) {
+    std::string output;
+    std::array<char, 1024> chunk{};
+    while (output.find("\r\n\r\n") == std::string::npos) {
+        const ssize_t got = ::recv(fd, chunk.data(), chunk.size(), 0);
+        if (got <= 0) {
+            break;
+        }
+        output.append(chunk.data(), static_cast<std::size_t>(got));
+    }
+    return output;
+}
+
+/// @brief 在 timeout_ms 内读取已到达字节；超时或对端关闭即返回已读内容（不阻塞 5s）。
+std::string ReadAvailable(int fd, int timeout_ms) {
+    std::string output;
+    std::array<char, 1024> chunk{};
+    for (;;) {
+        pollfd entry{};
+        entry.fd = fd;
+        entry.events = POLLIN;
+        const int ready = ::poll(&entry, 1, timeout_ms);
+        if (ready <= 0) {
+            break;
+        }
         const ssize_t got = ::recv(fd, chunk.data(), chunk.size(), 0);
         if (got <= 0) {
             break;
@@ -751,6 +787,133 @@ int main() {
         std::printf("  [pipeline] responses=%zu bytes=%zu\n", response_count,
                     responses.size());
         Check(response_count == 3, "3 个 pipeline 请求都得到响应（修复前只回 1 个）");
+    }
+
+    // ---- 12. G4：Expect: 100-continue → 先 100，再读 body，最后 200 ------
+    std::printf("\n[12] G4 Expect: 100-continue → 先 100 再 200\n");
+    {
+        const int expect_fd = OpenRaw(port);
+        if (expect_fd >= 0) {
+            const std::string head_only =
+                "POST /api/echo/g4 HTTP/1.1\r\nHost: e\r\n"
+                "Content-Length: 5\r\nExpect: 100-continue\r\n\r\n";
+            Check(SendRaw(expect_fd, head_only), "发送带 Expect 的请求头");
+            const std::string interim = ReadHeaderBlock(expect_fd);
+            std::printf("  [100-continue] interim=%zu bytes\n", interim.size());
+            Check(interim.rfind("HTTP/1.1 100 Continue", 0) == 0,
+                  "读 body 前先收到 100 Continue（修复前直接等 body 超时/关闭）");
+            Check(SendRaw(expect_fd, "hello"), "收到 100 后再发 body");
+            const std::string final_response = ReadUntilEof(expect_fd);
+            ::close(expect_fd);
+            Check(final_response.find("HTTP/1.1 200") != std::string::npos,
+                  "body 到达后返回 200");
+            Check(final_response.find("body=hello") != std::string::npos,
+                  "Expect 请求的 body 被完整转发");
+        }
+    }
+
+    // ---- 13. G7：畸形请求 → 400 再关 --------------------------------------
+    std::printf("\n[13] G7 畸形请求 → 400 再关\n");
+    {
+        const int bad_fd = OpenRaw(port);
+        if (bad_fd >= 0) {
+            Check(SendRaw(bad_fd, "GET /health HTTP/1.1\r\nBrokenHeader\r\n\r\n"),
+                  "发送缺冒号的畸形头");
+            const std::string response = ReadUntilEof(bad_fd);
+            ::close(bad_fd);
+            std::printf("  [400] bytes=%zu\n", response.size());
+            Check(response.find("HTTP/1.1 400") != std::string::npos,
+                  "畸形请求得到 400（修复前静默断连）");
+            Check(response.find("\"code\":400") != std::string::npos,
+                  "400 错误体格式");
+            Check(response.find("Connection: close") != std::string::npos,
+                  "400 声明 Connection: close");
+        }
+    }
+
+    // ---- 14. G6：队列满 → 503 + Connection: close -------------------------
+    std::printf("\n[14] G6 背压：队列满 → 503\n");
+    {
+        GatewayHarness busy;
+        busy.config.listen_host = "127.0.0.1";
+        busy.config.port = 0;
+        busy.config.worker_threads = 1;
+        busy.config.max_queued_connections = 1;
+        busy.config.request_timeout = std::chrono::milliseconds(5000);
+        if (busy.Start()) {
+            const auto entered = std::make_shared<std::atomic<bool>>(false);
+            const auto release = std::make_shared<std::atomic<bool>>(false);
+            struct BlockMatcher final : Matcher {
+                bool Match(const Request& request, PathParams*) const override {
+                    return request.path() == "/block";
+                }
+            };
+            Check(busy.gateway
+                      ->AddRoute(std::make_shared<BlockMatcher>(),
+                                 std::make_shared<Handler>(
+                                     [entered, release](Request&, Response& response) {
+                                         entered->store(true);
+                                         while (!release->load()) {
+                                             std::this_thread::sleep_for(
+                                                 std::chrono::milliseconds(5));
+                                         }
+                                         response.status = http::Status::OK;
+                                         response.body = "released";
+                                         return Result<void>::Ok();
+                                     }))
+                      .ok(),
+                  "注册阻塞路由 /block");
+            const std::uint16_t busy_port = busy.gateway->port();
+            const int blocker_fd = OpenRaw(busy_port);
+            const int queued_fd = OpenRaw(busy_port);
+            Check(blocker_fd >= 0 && queued_fd >= 0, "占满唯一 worker + 占 1 个队列槽");
+            if (blocker_fd >= 0) {
+                Check(SendRaw(blocker_fd,
+                              "GET /block HTTP/1.1\r\nHost: b\r\n\r\n"),
+                      "发送阻塞请求占住 worker");
+            }
+            bool in_handler = false;
+            for (int i = 0; i < 400 && !in_handler; ++i) {
+                if (entered->load()) {
+                    in_handler = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            Check(in_handler, "worker 已进入阻塞 handler");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // 队列满的判定依赖 accept 线程时序：连续建连探测，直到某条连接被
+            // 拒绝（503）；未被拒绝的连接会占住队列槽，因此最多几次必中。
+            std::string rejected;
+            for (int attempt = 0; attempt < 8 && rejected.empty(); ++attempt) {
+                const int probe_fd = OpenRaw(busy_port);
+                if (probe_fd < 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    continue;
+                }
+                const std::string chunk = ReadAvailable(probe_fd, 300);
+                ::close(probe_fd);
+                if (chunk.find("HTTP/1.1 503") != std::string::npos) {
+                    rejected = chunk;
+                }
+            }
+            std::printf("  [backpressure] bytes=%zu\n", rejected.size());
+            Check(rejected.find("HTTP/1.1 503") != std::string::npos,
+                  "队列满的新连接得到 503（修复前静默 close）");
+            Check(rejected.find("Connection: close") != std::string::npos,
+                  "503 声明 Connection: close");
+            release->store(true);
+            if (blocker_fd >= 0) {
+                const std::string blocker_response = ReadUntilEof(blocker_fd);
+                ::close(blocker_fd);
+                Check(blocker_response.find("HTTP/1.1 200") != std::string::npos,
+                      "释放后阻塞请求正常 200");
+            }
+            if (queued_fd >= 0) {
+                ::close(queued_fd);
+            }
+        }
+        busy.Stop();
     }
 
     // ---- 汇总 ------------------------------------------------------------

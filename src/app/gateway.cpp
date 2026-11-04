@@ -89,6 +89,90 @@ bool EqualsIgnoreCase(std::string_view left, std::string_view right) {
     return true;
 }
 
+/// @brief 去掉首尾的 HTTP 空白（空格/制表符），用于头名与头值。
+std::string_view TrimOws(std::string_view text) {
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
+/**
+ * @brief 判断已收齐的请求头是否需要在读 body 前先回 `100 Continue`（G4）。
+ * @param head [in] 本请求已收到的原始字节——借用，仅本次调用期间有效；不可为空，
+ *        且必须包含完整头部块（含结尾 `\r\n\r\n`）。
+ * @param header_end [in] 头部终止符 `\r\n\r\n` 在 `head` 中的起始偏移——由调用方
+ *        用 `find()` 得到，必须小于 `head.size()`。
+ * @return
+ * - true：调用方**必须**先写出 `HTTP/1.1 100 Continue\r\n\r\n`，否则客户端会在
+ *   等 100 时白等到超时；
+ * - false：直接解析，别发 100，否则无 body 的请求会多收到一个状态行。
+ *
+ * ## 定位
+ * 100-continue 的唯一判据（ServeConnection 解析前的探测）。判断错会导致客户端
+ * 等待 100 超时（漏发）或把 100 误当最终响应（白发）。
+ *
+ * ## 步骤
+ * step1. 起始行必须声明 HTTP/1.1——HTTP/1.0 没有 100-continue 语义；
+ * step2. 逐行扫描头部：`Expect: 100-continue` 置位，`Content-Length > 0` 或存在
+ *        非空 `Transfer-Encoding` 置「有 body」；
+ * step3. 两者同时成立才发；无 body 的 Expect 客户端本就不会等 body。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：纯函数，无共享状态；可在任意线程调用。
+ * - 失败语义：不抛异常；头部畸形时返回 false，交由 Parser 报 Error（400）。
+ */
+bool ShouldSendContinue(std::string_view head, std::size_t header_end) {
+    // step1: HTTP/1.0 客户端不支持 100-continue，按普通请求处理。
+    const std::size_t request_line_end = head.find("\r\n");
+    if (request_line_end == std::string_view::npos || request_line_end > header_end) {
+        return false;
+    }
+    if (head.substr(0, request_line_end).find("HTTP/1.1") == std::string_view::npos) {
+        return false;
+    }
+    // step2: 逐行提取 Expect 与 body 定界信息。
+    bool expect_continue = false;
+    bool has_body = false;
+    std::size_t line = request_line_end + 2;
+    while (line <= header_end) {
+        const std::size_t line_end = head.find("\r\n", line);
+        const std::size_t stop =
+            (line_end == std::string_view::npos || line_end > header_end) ? header_end
+                                                                         : line_end;
+        const std::string_view field = head.substr(line, stop - line);
+        const std::size_t colon = field.find(':');
+        if (colon != std::string_view::npos) {
+            const std::string_view name = TrimOws(field.substr(0, colon));
+            const std::string_view value = TrimOws(field.substr(colon + 1));
+            if (EqualsIgnoreCase(name, "Expect") &&
+                EqualsIgnoreCase(value, "100-continue")) {
+                expect_continue = true;
+            } else if (EqualsIgnoreCase(name, "Content-Length")) {
+                std::uint64_t length = 0;
+                for (const char c : value) {
+                    if (c < '0' || c > '9') {
+                        break;
+                    }
+                    length = length * 10 + static_cast<std::uint64_t>(c - '0');
+                }
+                has_body = length > 0;
+            } else if (EqualsIgnoreCase(name, "Transfer-Encoding") && !value.empty()) {
+                has_body = true;
+            }
+        }
+        if (stop == header_end) {
+            break;
+        }
+        line = stop + 2;
+    }
+    // step3: 只有「客户端确实在等，而且后面有 body」时才预应答。
+    return expect_continue && has_body;
+}
+
 /// @brief JSON 字符串转义（用于错误体与聚合健康）。
 std::string JsonEscape(std::string_view text) {
     std::string out;
@@ -1020,6 +1104,9 @@ struct Gateway::Impl {
         request->header.erase("Proxy-Authenticate");
         request->header.erase("Proxy-Authorization");
         request->header.erase(kAuthHeader);
+        // G4：100-continue 已由网关预应答，转发时摘掉 Expect，避免上游再发一次
+        // 100 被 http::Client 当成最终响应。
+        request->header.erase("Expect");
         if (!upstream.base_path.empty() && upstream.base_path != "/") {
             std::string prefix = upstream.base_path;
             if (prefix.back() == '/') {
@@ -1189,7 +1276,8 @@ struct Gateway::Impl {
      * ## 步骤
      * step1. 为本请求建立 `request_timeout` 总 deadline（第一次 recv 前起算），
      *        每次 recv 只等「剩余时间」与 30s 的较小值，到期立即关闭；
-     * step2. 解析到完整请求为止：NeedMore 继续读，Error 立即返回；
+     * step2. 头部先攒到 `\r\n\r\n` 再交给 Parser；`Expect: 100-continue` 且有 body
+     *        时先回 100 再读 body；NeedMore 继续读，Error 回 400 后关闭；
      *        首个请求允许阻塞等数据，后续流水线请求只消费已缓冲字节（残包仍可续读）；
      * step3. 同一 recv 的剩余字节交给下一条请求（`take_remaining()`），不再丢弃；
      * step4. Dispatch 外包 try/catch：handler/中间件任何异常 → 500 + close + 计数；
@@ -1218,45 +1306,72 @@ struct Gateway::Impl {
             // 首个请求允许等 socket 新数据；后续请求只有已缓冲字节时才继续读，
             // 防止空闲 keep-alive 连接把 worker 占在 recv 上。
             bool allow_recv = served == 0 || !pending.empty();
-            do {
-                if (!pending.empty()) {
-                    parsed = parser.feed(pending, request);
-                    pending.clear();
-                    allow_recv = true;
-                } else {
-                    if (!allow_recv) {
-                        return;
-                    }
-                    // step1: 每次 recv 只看总 deadline 的剩余时间，慢连接无法靠
-                    // 「每次多等 30s」续期；到点直接放弃该连接。
-                    const auto now = std::chrono::steady_clock::now();
-                    if (now >= deadline) {
-                        request_timeouts.fetch_add(1, std::memory_order_relaxed);
-                        return;
-                    }
-                    const auto remaining =
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            deadline - now);
-                    const auto slice = std::min(remaining, kMaxRecvSlice);
-                    const auto count = connection->recv(
-                        buffer.data(), buffer.size(), 0,
-                        slice.count() > 0 ? slice : std::chrono::milliseconds(1));
-                    if (!count.ok() || count.transferred <= 0) {
-                        if (std::chrono::steady_clock::now() >= deadline) {
-                            request_timeouts.fetch_add(1,
-                                                       std::memory_order_relaxed);
+            // G4：头部先在 head 里攒齐再交给 Parser，这样才能赶在 body 之前判定
+            // 是否需要回 100 Continue；已缓冲的流水线字节直接作为初值。
+            std::string head = std::move(pending);
+            pending.clear();
+            bool header_done = false;
+            for (;;) {
+                if (!head.empty() && !header_done) {
+                    const std::size_t header_end = head.find("\r\n\r\n");
+                    // 头部收齐（或超限）后才进入解析；超限交给 Parser 判 Error。
+                    if (header_end != std::string::npos ||
+                        head.size() > parser.limits().max_header_bytes) {
+                        header_done = true;
+                        if (header_end != std::string::npos &&
+                            ShouldSendContinue(head, header_end)) {
+                            if (!WriteAll(connection,
+                                          "HTTP/1.1 100 Continue\r\n\r\n")) {
+                                return;
+                            }
                         }
+                    }
+                }
+                if (header_done) {
+                    if (!head.empty()) {
+                        parsed = parser.feed(head, request);
+                        head.clear();
+                        allow_recv = true;
+                    }
+                    if (parsed.state == http::ParseState::Error) {
+                        // G7：畸形请求必须回 400 再关；静默断连会让客户端只看到
+                        // reset，无法区分「网关拒绝」与「网络故障」。
+                        Response bad = ErrorResponse(
+                            400, parsed.error.empty() ? "bad request" : parsed.error);
+                        bad.close = true;
+                        WriteAll(connection, SerializeResponse(request.method, bad));
                         return;
                     }
-                    parsed = parser.feed(
-                        std::string_view(buffer.data(),
-                                         static_cast<std::size_t>(count.transferred)),
-                        request);
+                    if (parsed.state == http::ParseState::Complete) {
+                        break;
+                    }
                 }
-                if (parsed.state == http::ParseState::Error) {
+                if (!allow_recv) {
                     return;
                 }
-            } while (parsed.state == http::ParseState::NeedMore);
+                // step1: 每次 recv 只看总 deadline 的剩余时间，慢连接无法靠
+                // 「每次多等 30s」续期；到点直接放弃该连接。
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    request_timeouts.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - now);
+                const auto slice = std::min(remaining, kMaxRecvSlice);
+                const auto count = connection->recv(
+                    buffer.data(), buffer.size(), 0,
+                    slice.count() > 0 ? slice : std::chrono::milliseconds(1));
+                if (!count.ok() || count.transferred <= 0) {
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        request_timeouts.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    return;
+                }
+                head.append(buffer.data(),
+                            static_cast<std::size_t>(count.transferred));
+            }
 
             // step3: 同一 recv 里可能已带着下一条请求，留给下一轮而不是丢弃。
             pending = parser.take_remaining();
@@ -1623,6 +1738,11 @@ void Gateway::Run() {
             }
         }
         if (!accepted) {
+            // G6 背压：队列已满时先回 503 + Connection: close 再关，让客户端
+            // 看到明确的「服务暂时不可用」，而不是被静默重置连接。
+            Response busy = ErrorResponse(503, "server busy");
+            busy.close = true;
+            WriteAll(connection, SerializeResponse(http::Method::Get, busy));
             connection->close();
         }
     }

@@ -34,6 +34,12 @@
  *   按序全部处理（不再只回第一个），缓冲耗尽后关闭连接；**不做跨包空闲
  *   keep-alive 等待**——空闲连接若继续占住 worker，会被 slowloris 放大成
  *   全站 DoS。每个请求另有 `Config::request_timeout` 的读取总时限。
+ * - 协议边界：`Expect: 100-continue` 在请求头收齐后、读 body 前先回
+ *   `100 Continue`；请求解析失败回 `400`；待处理连接队列满回 `503`；三者
+ *   都以 `Connection: close` 收尾，客户端不会只看到静默 reset。
+ *   **不做 101 Switching Protocols 透传**：WebSocket/HTTP Upgrade 需要 raw
+ *   双向复制，超出本组件的 HTTP 代理路径；需要时由业务在自定义 Handler 中
+ *   接管底层连接（本组件不暴露 Socket，因此当前版本不支持）。
  *
  * ## 路由匹配
  * - `path_pattern` 三种形态：
@@ -342,7 +348,7 @@ struct Config {
     std::uint16_t port{28080};
     /// 连接 worker 线程数；0 按 4 处理。
     std::size_t worker_threads{4};
-    /// 待处理连接队列上限；超过时直接关闭新连接（背压）。
+    /// 待处理连接队列上限；超过时先回 503 + `Connection: close` 再关闭新连接（背压）。
     std::size_t max_queued_connections{256};
     /// accept 轮询超时（决定 Stop 的响应速度）。
     std::chrono::milliseconds accept_timeout{100};
