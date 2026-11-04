@@ -168,6 +168,139 @@
 - **该做什么**：各补一份 `asm-<module>.md`（可复用提交里的数字 + 重跑一次 objdump），成本约 0.5 天/份。
 - **收益/风险**：零代码风险；不做的话下一轮审计仍只能判 🟡。
 
+
+### 缺失项归属判定（2026-11-04）
+
+对 P2-2 列的 7 个「无三件套」模块逐个判定归属。判据只有三条：**在不在数据面**（每次请求 / 每帧是否经过）、
+**有没有可复跑的基准**、**仓库内有没有可复核的证据**（file:line）。本节只做判定，**不改上表**；
+若采纳，覆盖计数的变化见小节末尾。
+
+**结论速览**
+
+| 模块 | 判定 | 要补的一件 | 现有基准 / 压测 |
+|---|---|---|---|
+| A08 encoding/csv+hex | ⚪ 不适用 | —（hex 保留现有 1 MiB 压测作回归） | `tests/encoding/test_stress.cpp`（hex/base64 1 MiB） |
+| A16 leveldb 封装 | 要补（低） | 汇编：`ldb::DB::{Put,Get}` objdump | `test_leveldb_kv.cpp --bench` 1e7/1e8 ✅ |
+| A20 bufio | 要补（中） | 对标 + 汇编：Go `bufio` 同口径、`Writer::Flush`/`Reader::fill` | `bench_bufio_batch.cpp` ✅、M08 单点无对标 |
+| A24 rpc | **已具备，只需归档** | 无（把 `docs/modules/rpc.md` 的表搬进 `asm-rpc.md`） | `bench_rpc.cpp` 1e6/1e7 ✅ |
+| A25 tunnel | 要补（高） | 基准 + 汇编：8 MiB 吞吐程序、转发循环 objdump | ❌ 仅 300 次延迟对比（M14 备注「无法复现」） |
+| A41 frame | 要补（低） | 汇编：`Feed` 逐字节喂入 + 错误恢复路径 | 1e6 帧压测 ✅（`frame-codec.md:215-222`） |
+| A42 config | ⚪ 不适用 | —（控制面，不该有数据面基准） | 无 bench（5 个功能测试） |
+
+#### A08 encoding/csv+hex → ⚪ 不适用
+
+- **csv 无生产调用点**：`src/encoding/csv.cpp`（419 行）的 `CsvReader` 只从构造时传入的**完整内存文本**解析，
+  不支持 `io::Reader` 流式（`include/go2cpp/encoding/csv.hpp:24-25,37`），`CsvWriter` 只写内存 `std::string`、
+  `Flush()` 是空操作（`:83`）；全仓 `encoding/csv.hpp` 的引用只有实现自身（`src/encoding/csv.cpp:40`）、
+  汇总头（`include/go2cpp/encoding/encoding.hpp:37`）和 `tests/encoding/{test_csv,test_random,test_scenarios}.cpp`，
+  **src/app/tools 无任何调用**（`grep -rn 'encoding/csv.hpp' src app tools` 结果为 0）。
+- **hex 在热路径之外**：`include/go2cpp/encoding/hex_core.hpp`（168 行，header-only inline）被 12 个模块使用，
+  但都是**短串**——`keystore.cpp:20`（key_id 8 hex / 掩码）、`token_pairing.cpp:32`、`so_manifest.cpp:28`、
+  `reflect/json.cpp:11`、`logging/redact.hpp:63`、`p2p/candidate.cpp:11`、`app/resource.cpp:12`、
+  `bento/app/{capability,backup,fetch}.cpp`、`bento/error/mapping.cpp:16`、`bento/net/file_transfer.cpp:22`。
+  调用频率是握手 / 配置 / 日志级，不是每帧。
+- **基准**：`tests/encoding/test_stress.cpp:1-10` 有 1 MiB、15 轮取最快的 hex/base64 吞吐（取最快是为了压 WSL 抖动），
+  足以证明「没有逐字节分配退化」；csv 无 bench，也没有调用方需要。
+- **结论**：csv ⚪（无调用）；hex ⚪（不承压，保留 stress 作回归）。**不补三件套。**
+
+#### A16 leveldb 封装 → 要补（低优先）
+
+- **读/写路径**（`src/storage/leveldb_kv.cpp`）：`DB::Put`（:316-340）= `impl_->LoadDb()`（一次 `atomic` load）
+  + `ToSlice`（:84，只取指针与长度，**零拷贝**）+ `leveldb::DB::Put` + 可选 stats（`enable_stats` 关时无计数）；
+  `DB::Get`（:432-470）往调用方 `std::string*` 写，空指针时用栈上 `scratch` 兜底。
+- **压测在**：`tests/storage/test_leveldb_kv.cpp`（`--bench` 1e7、`--mem` 1e8）；台账
+  `docs/metrics-ledger.md:149-161`（647,521 ops/s、RSS 82.4 MiB、VmHWM 122.8 MiB）；
+  `docs/modules/storage-leveldb.md:256-274` 有与自研 KV 的 1e7 对比表（Put 3.7×、Get 0.88×）。
+- **缺**：objdump。封装层只有 1 次 atomic load + 1 次转发，**预期额外 ≤5 条指令、0 次堆分配**（stats 关）。
+- **该做什么**：对 `ldb::DB::Put`/`Get` 出指令/call/栈帧/原子计数，与裸 `leveldb::DB::Put/Get` 并排。
+  收益不是提速，而是把「封装层 ≈1.0×」从推断变成证据（P2-1 已列，成本 ≈0.5 天）。
+
+#### A20 bufio → 要补（中优先）
+
+- **在数据面**：`include/go2cpp/network/bufio_socket.hpp:3-31` 是 `bufio` 与 `net::Socket` 的适配层
+  （缓冲读、`FlushBatch` 批量写、`writev`/`sendmmsg`）；`src/rd_net/socket.cpp:570,923,980,1123` 的
+  `SendBatch` 直接用 `bufio::BatchEntry`；rd_net 的 TCP 批量 20.8× 就建立在它上面。
+- **基准**：`tests/bufio/bench_bufio_batch.cpp`（611 行，真实 TCP loopback，16/64/256 B 三档 + 4 种 `FlushPolicy`，
+  输出 msg/s + p50/p99/p999 + syscall 计数），CMake **只构建不注册 ctest**（`cmake/Go2CppTests.cmake:1115-1121`，
+  理由「基准不是正确性用例」正确）；M08 `test_bufio.cpp`「分块传输 1 MiB」1853.9 MiB/s
+  （`metrics-ledger.md:163-171`）。
+- **已有架构结论但不在 asm 报告**：`docs/reports/2026-10-31-http-perf.md:166-190` 三档写路径对比
+  （小包 21–33×、大包 **−19%**、batch 的真实价值是「何时成批」），全文 objdump **0 次**。
+- **缺**：① Go `bufio` 同口径 1 MiB 分块读对照——M08 **没有对标**，1853.9 MiB/s 无法判断好坏；
+  ② `bufio::Writer::Flush`/`Reader::fill` 的 objdump（memcpy 次数、call 数）。
+- **预期收益**：把 M08 从单点变成有对照的结论；若对照 <0.9× 再谈优化（当前无证据支持优化）。成本 ≈0.5–1 天。
+
+#### A24 rpc → 已具备三件套，只需归档（不补做）
+
+- **汇编证据已在仓库**：`docs/modules/rpc.md:300-320` 有 9 个符号的指令/call/栈帧/分配/原子表——
+  `EncodeRequest` 165/9/24 B、`DecodeRequest` 517/13/88 B、`ServiceRegistry::FindUnlocked` 59/2/24 B、
+  `ServerConnection::Process` 793/50/328 B、`Connection::Wait` 255/20/104 B、`FrameCodec::Encode` 328/11/8 B、
+  `FrameCodec::FeedImpl` 284/13/88 B、`MethodBinder::Invoke` 469/19/392 B，并注明「直接 malloc/free 为 0」。
+- **性能与下限**：`rpc.md:252-296`——1e6 次 p50 97.3 µs / p99 299.2 µs、协议层 109.2 ns/op、
+  序列化 70.5 ns/op、TCP echo 1B 下限 106.2 µs、连接复用前后 546.3→97.6 µs（**5.6×**）。
+- **正确性**：5 套 ctest（`rpc.md:322-328`）+ `tests/rpc/bench_rpc.cpp`（379 行，1e6/1e7 可复跑）。
+- **缺口只有两处**：`rpc.md:6` 引用的 `/tmp/rpc.md` **不是仓库文件**；覆盖总表未收录 rpc。
+- **该做什么**：新建 `docs/reports/asm-rpc.md`，把 `rpc.md:300-320` 的表与复跑命令搬过去，并把 A24 行指向它。
+  **成本 0.5 天、零代码风险**；不做的代价是每轮审计继续把 rpc 误判为 ❌。
+
+#### A25 tunnel → 要补（高优先）
+
+- **在数据面**：`src/tunnel/mux.cpp:46-121`（`FrameReader::Next` 500 ms 超时读、`WriteFrame`）、`:132+`
+  （`MuxStream::Read/Write` 按 chunk 走 `WriteAll`）；`src/tunnel/net.cpp` 为 RelayPipe 转发。
+- **日志现状**（用户提到「刚加了日志」）：`GO2CPP_LOG` 只出现在进程入口——`src/tunnel/client_main.cpp` 13 条、
+  `server_main.cpp` 14 条；**`mux.cpp`/`net.cpp`/`server.cpp`/`client.cpp`/`protocol.cpp` 各 0 条**。
+  即：入口有观测、每 chunk 转发路径无日志（不污染热路径，但转发路径本身没有观测点）。
+- **基准**：`tests/tunnel/test_tunnel.cpp:868-908` 用例 9 只做「直连 vs 隧道」300 次 p50 对比（1.96×），
+  **没有 8 MiB 吞吐程序**；`docs/metrics-ledger.md:232` 明确「tunnel 8 MiB 下载吞吐无法复现——缺吞吐程序」。
+- **文档数字无法复跑**：`docs/modules/tunnel.md:229-241` 的 8 MiB 488 MiB/s（0.37×）、keep-alive 2.99×、
+  32 并发，来自一次性手工脚本，仓库内无对应可执行目标。
+- **该做什么**：① 新增 `tests/tunnel/bench_tunnel_throughput.cpp`（复用测试里的本地站点，8 MiB ×3 轮，
+  直连 vs 隧道，输出 MiB/s + p50）；② 对 `FrameReader::Next`/`WriteFrame`/`MuxStream::Write` 出 objdump；
+  ③ 与 rd_net 已有 `SendBatch`（3107 指令、TCP 批量 20.8×）对比，判断转发循环能否借 `sendmmsg`。
+- **预期收益**：488 MiB/s 已超 1 Gbps 网卡上限（119 MiB/s），**优化空间不在吞吐而在固定开销**
+  （两端各 5 条线程 + 4 次队列唤醒 ≈0.6 ms，`tunnel.md:241` 自述）。基准的主要价值是止损：
+  让 1.96× 可复跑，给 `4fcc407`（日志）/`d79abe8`（GOAWAY 退避重连）之后的改动留回归锚点。
+
+#### A41 frame → 要补（低优先，已有 2/3）
+
+- **每帧路径**：`src/frame/frame_codec.cpp:129`（`Encode`）、`:186`（`Feed`）、`:219`（`FeedImpl`，
+  显式 `resize`+`memcpy` 规避 GCC 13 `-Wstringop-overflow` 假阳性）；被 rpc（`include/go2cpp/rpc/protocol.hpp:52`、
+  `src/rpc/client.cpp:26`、`server.cpp:27`）与 tunnel（`include/go2cpp/tunnel/protocol.hpp:62`、`mux.hpp:42`）直接使用。
+- **架构 + 部分汇编已在**：`docs/modules/frame-codec.md:212-222`（1e6 帧 **4.59 Mframes/s**、peak buffered 134 B、
+  常用路径只拷 1 次 payload）；objdump 两项在 `rpc.md:312-313`（`FrameCodec::Encode` 328 指令 / 8 B 栈帧、
+  `FrameCodec::FeedImpl` 284 / 88 B）。
+- **正确性**：`tests/frame/test_frame_codec.cpp`（1130 行，黄金向量/半包/粘包/畸形/随机/fuzz/1e6 压测），
+  ctest 注册于 `cmake/Go2CppFrame.cmake:37-43`。
+- **缺**：`Feed` 的**逐字节喂入**指令数与 `memcpy` 次数（测试「100 B 帧按 1 B 喂 100 次」决定半包是否 O(n²)），
+  以及错误恢复路径（清空缓冲）的取证。
+- **该做什么**：补这两个路径的 objdump + 一次 1 B 切分的帧率（对比整帧 4.59 Mframes/s）。成本半天。
+- **注意**：不要与 app 层 `src/app/frame.cpp`（HTTP2 9 B 帧，`de916bc` 98→4.7 ns）混淆——那是另一条线，已记在 A38。
+
+#### A42 config → ⚪ 不适用
+
+- **只在启动/运维路径**：`src/config/config.cpp`（1382 行）的 `LoadFromIni`（:599）、`LoadFromFile`（:697）
+  由启动或显式调用触发；`StartWatcher`（:768）的读取间隔是**调用方传入**的 `interval`，
+  线程用 `cv.wait_for(interval)` 轮询 mtime（:802），空闲不占 CPU。
+- **调用频率**：`Config::Instance()` 全仓 13 处（`src/network/hook.cpp`、`src/os/proc.cpp`、`src/os/config.cpp`、
+  `mcp/src/config/config.cpp` 等），都在初始化/进程入口，**没有每请求读取**。
+- **测试**：`tests/config/` 5 个功能测试（reflect/registry_macro/transaction/watch/so_manifest），无 bench；
+  `docs/modules/config.md` 无性能章节（`ops-log-config.md:249-250` 的 `ConfigStore::Load` 3.58 ns 是 logging 配置，
+  不是本模块）。
+- **结论**：⚪ 控制面，不做数据面下限；最多在归档时补一句「启动路径 1 次 `LoadFromFile`，不进入承压路径」。
+
+**若采纳本判定，覆盖变化（总表 44 行不变）**：✅ 11→**12**（A24）、🟡 24→**27**（A16/A20/A41）、
+❌ 7→**1**（只剩 A25）、⚪ 2→**4**（A08/A42）。
+
+**要补项 TOP3（按「数据面程度 × 证据缺口 × 成本」）**
+
+1. **tunnel**——唯一「数据面 + 零吞吐基准 + 文档数字不可复现」的模块，且刚经历日志/退避改动，最需要回归锚点。
+2. **bufio**——rd_net 批量发送的底座；M08 只有单点没有对标，补一个 Go 对照 + 两个函数 objdump，成本最低。
+3. **frame**——每帧路径，2/3 证据已在，只差 `Feed` 逐字节路径，半天可完成。
+
+（rpc 不计入 TOP3：证据已齐，属「归档」而非「补做」，0.5 天即可从 ❌ 纠正为 ✅。）
+
+**本节边界**：未跑任何基准、未改代码、未 commit；时间盒 30 分钟；所有数字均转引仓库内文件，不引用 `/tmp` 或外部记忆。
+
 ---
 
 ## 4. 用户会踩到的热路径 × 三件套
