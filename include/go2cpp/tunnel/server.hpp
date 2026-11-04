@@ -305,9 +305,24 @@ private:
     go2cpp::metrics::Counter* m_metric_bytes_out = nullptr;
     go2cpp::metrics::Gauge* m_metric_online = nullptr;
 
-    std::mutex m_worker_mutex;
-    std::condition_variable m_worker_cv;
-    int m_workers = 0;
+    /// 工作线程共享记账块（detached 线程只经 `shared_ptr` 持有它）。
+    ///
+    /// @details 为什么不用裸成员：`Stop()` 的等待是**带超时**的，超时后对象
+    ///          仍会被析构。若 worker 退出时直接访问成员 mutex/cv，一旦
+    ///          "计数先归零、析构先发生"而线程随后才 `notify_all`，就是
+    ///          condvar use-after-destroy（TSan 实测 P1）。把记账块放进
+    ///          `shared_ptr` 后，worker 的最后一次访问落在仍存活的对象上，
+    ///          与析构彻底解耦。
+    struct WorkerRegistry {
+        std::mutex mutex;              ///< 保护下面三个字段。
+        std::condition_variable cv;    ///< 计数归零时唤醒 `WaitWorkers`。
+        std::size_t active = 0;        ///< 尚未退出的 worker 数。
+        bool stopping = false;         ///< `Stop()` 已开始，拒绝再起线程。
+    };
+
+    /// 所有 worker 共享同一个记账块；`shared_ptr` 保证线程退出时它一定存活。
+    std::shared_ptr<WorkerRegistry> m_workers =
+        std::make_shared<WorkerRegistry>();
 };
 
 }  // namespace tunnel

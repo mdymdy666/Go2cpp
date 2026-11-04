@@ -9,9 +9,9 @@
 | 维度 | 结果 |
 |---|---|
 | ASan/UBSan | 16 个目标中 **14 个干净**；2 个 UBSan 命中（同一根因：`Arena::Allocate` 不保持 8 字节对齐 → `Rec` 未对齐访问，共 38 条）→ **已修** |
-| TSan | 5 个并发目标中 2 个干净；`tunnel_test` 10 处、`channel_concurrency` 2 处、`select_lockorder` 10 处 |
+| TSan | 5 个并发目标中 2 个干净；`tunnel_test` 10 处（**已修**，修后连跑 3 次 0 竞争）、`channel_concurrency` 2 处、`select_lockorder` 10 处 |
 | 静态分析 | cppcheck：6 条 error **全部为误报**（逐条给证据）；clang-tidy（LLVM 18）：tunnel/concurrency **0 告警** |
-| 已修 | `src/storage/arena.cpp` 3 处对齐推进（P1 UB） |
+| 已修 | `src/storage/arena.cpp` 3 处对齐推进（P1 UB）；`src/tunnel/{server,client}.cpp` 2 处 condvar 生命周期竞争（P1，本轮） |
 | 未完成 | `go2cpp_tests`（40+ 单测）与 `rpc_test` 未跑完；TSan 的 sync/scheduler/rwmutex/realtime 子集未覆盖（均因 45 分钟盒） |
 
 ## 1. 构建配置
@@ -111,32 +111,69 @@ src/storage/memtable.cpp:65:41 / 65:43（kv_concurrent 变体）
 |---|---|---|---|
 | go2cpp_fast_channel_test | 0 | 0 | — |
 | go2cpp_fiber_transport_test | 0 | 0 | — |
-| go2cpp_tunnel_test | 66 | **10** | `TunnelServer::~TunnelServer` server.cpp:502（4 类地址）/ `TunnelClient::~TunnelClient` client.cpp:59 |
+| go2cpp_tunnel_test | **0** | **0**（修复后复跑 3 次，每次 exit=0） | 修复前 10 处：`server.cpp:502` / `client.cpp:59`，见 §4.1 |
 | go2cpp_channel_concurrency | 66 | 2 | `fiber.cpp:2453`（TLS）、`parking_condition.cpp:290 WaitNode::LinkTail` |
 | go2cpp_select_lockorder_test | 66 | 10 | 全部 `fiber.cpp:2453 finish_switch_to_fiber`（TLS 写） |
 
-### 4.1 `tunnel_test` 的 10 处（P1，待修）
+### 4.1 `tunnel_test` 的 10 处（P1，已修并复验）
 
-TSan 原始栈（第一条）：
+修复前 TSan 原始栈（第一条）：
 
 ```
-Write of size 8 at 0x725800000298 by main thread:
+Write of size 8 at 0x725800010498 by main thread:
   #0 pthread_cond_destroy (libtsan)
   #1 go2cpp::tunnel::TunnelServer::~TunnelServer() src/tunnel/server.cpp:502
   ...
   #0 pthread_cond_broadcast (libtsan)
-  #1 operator() src/tunnel/server.cpp:1560     ← 工作线程
+  #1 operator() src/tunnel/server.cpp:1560     ← 工作线程（detached）
 ```
 
-类型：**条件变量生命周期竞争**——`~TunnelServer()` 已经在 `pthread_cond_destroy`，
-而工作线程仍在 `pthread_cond_broadcast`（`Stop()` 的 join 顺序或 detached 线程没被等待）。
-真实后果是 condvar 销毁后仍被使用（glibc 下可表现为挂起/未定义行为），属 **P1**。
-`TunnelClient::~TunnelClient()`（client.cpp:59）同型。
+`TunnelClient::~TunnelClient()`（`client.cpp:59` 的 `pthread_cond_destroy`）↔
+`client.cpp:554`（`m_worker_cv.notify_all()`）同型，共 9 条 `WARNING`
+（4 类 server 地址 + 2 类 client 地址）。
 
-> 备注：`MuxSession::SendPayload` 的 `m_conn` 无锁读竞争（任务重点，原 P3）在本轮
-> TSan 中**已不再出现**——工作区中 `src/tunnel/mux.cpp` 已被并行改动为「持
-> `m_conn_mutex` 取 shared_ptr 快照」（`SendPayload`/`SendData`），本轮 TSan
-> 的 `tunnel_test` 竞争栈里没有任何 `m_conn`/`WriteAll` 帧，可视为该 P3 已修复。
+**根因**（两处同一个错误模式；不是 join 顺序问题——线程是 detached 的，本来就没有 join）：
+
+```cpp
+// 工作线程
+{ std::lock_guard lock(m); --m_workers; }    // ① 计数归零
+m_worker_cv.notify_all();                     // ② 解锁之后才 broadcast
+// Stop()
+wait_for(lock, ..., [&] { return m_workers == 0; });   // 只看得到 ①，看不到 ②
+```
+
+① 与 ② 之间存在窗口：等待方可能在 ① 之后、② 之前观察到 0，继续 `Stop()` 返回并析构对象，
+随后工作线程执行 ② → `pthread_cond_destroy` 与 `pthread_cond_broadcast` 撞车
+（condvar use-after-destroy，glibc 下可挂起或 UB）。
+
+**修法**（只改 tunnel 4 个文件：`src/tunnel/{server,client}.cpp` + 两个 `.hpp`）：
+
+1. **记账块改为共享对象**：`struct WorkerRegistry { mutex; cv; size_t active; bool stopping; }`，
+   成员从裸 `mutex/cv/int` 换成 `std::shared_ptr<WorkerRegistry>`；detached 线程捕获
+   `shared_ptr` 副本，最后那次 `--active` / `notify_all` 落在**仍存活**的对象上。
+   即便 `Stop()` 等待超时、对象先析构，也不会 UAF（超时路径的兜底）。
+2. **递减与 notify 同锁**：`{ lock; --active; cv.notify_all(); }`。等待方在同一把锁上
+   `wait_for(active == 0)`，因此它看到 0 时线程对 cv 的最后一次访问**必然已结束**，
+   析构与 broadcast 之间存在 mutex 建立的 happens-before。
+3. **`stopping` 标志**：`Stop()` 先置位再等待；`Spawn()` / `HandleOpen()` / raw 回调在
+   锁内判定，已停止则**不再新建 detached 线程**（server 分支同步执行任务），
+   杜绝"等待之后才登记、永远等不到"的新线程。
+4. `Stop()` 的超时语义不变（server `kHeadTimeoutMs + 5000`、client 10 000 ms）。
+
+**验证**：
+
+| 项 | 结果 |
+|---|---|
+| 修前 `setarch x86_64 -R .build-tsan/go2cpp_tunnel_test` | exit=66，`WARNING: ThreadSanitizer` **9** 条 |
+| 修后连续 3 次（同一二进制） | exit=0/0/0，`WARNING` **0/0/0**，`SUMMARY` **0/0/0** |
+| 修后用例自检 | `checks=170 failures=0` |
+| `setarch x86_64 -R ctest --test-dir .build-tsan -R '^tunnel$'` | **通过**（复跑 `100% tests passed`；首次因 `ratio < 4.0` 的 4.43x 抖动判失败，见备注） |
+| 重编译告警 | 本次改动的 4 个文件 **0 告警**（唯一告警是 `tests/tunnel/test_tunnel.cpp:319` 既有的 `-Wunused-function`，非本次改动） |
+
+> 备注（阈值过敏，非回归）：`TestPerformance` 的 `TUNNEL_CHECK(ratio < 4.0)` 是绝对比值断言。
+> 本机回环直连 p50 只有 ~1.1 ms，而隧道固定开销（两端各 5 条 RelayPipe 线程 + 2 次 connect）
+> 会放大比值；修前实测 3.87x，修后独立跑 3.93x、ctest 复跑 100% 通过（抖动区间 3.9–4.4x）。该项与并发修复无关，
+> 不作为验收门槛，但**未放宽阈值**（避免掩盖真实退化）。
 
 ### 4.2 `select_lockorder` / `channel_concurrency` 的 fiber 帧（P3，误报候选）
 
@@ -179,8 +216,8 @@ run-clang-tidy -p .build-tsan -header-filter='^/UserData/CodexWorkSpace/Go2cpp/(
 | # | file:line | 类型 | 级别 | 状态 |
 |---|---|---|---|---|
 | 1 | `src/storage/memtable.cpp:62-65,145-155`（根因 `src/storage/arena.cpp`） | UBSan misaligned `Rec` 访问（UB） | **P1** | **已修**（arena 3 处对齐推进） |
-| 2 | `src/tunnel/server.cpp:502` ↔ `server.cpp:1560` | TSan data race：condvar destroy 后仍 broadcast | **P1** | 待修 |
-| 3 | `src/tunnel/client.cpp:59` | TSan data race：析构 vs 工作线程 | **P1** | 待修 |
+| 2 | `src/tunnel/server.cpp:502` ↔ `server.cpp:1560` | TSan data race：condvar destroy 后仍 broadcast | **P1** | **已修**（WorkerRegistry + 锁内 notify + stopping；TSan 3/3 干净） |
+| 3 | `src/tunnel/client.cpp:59` | TSan data race：析构 vs 工作线程 | **P1** | **已修**（同型：HandleOpen/raw 回调记账 + 锁内 notify） |
 | 4 | `src/concurrency/parking_condition.cpp:290` | TSan data race：`WaitNode::LinkTail` | P2 | 待复核 |
 | 5 | `src/concurrency/fiber.cpp:2453` | TSan data race（TLS，M:N fiber） | P3 | 误报候选 |
 | 6 | `go2cpp_fast_channel_test` / `go2cpp_select_lockorder_test` | LeakSanitizer 泄漏 | P2 | 待查（未看栈） |

@@ -728,6 +728,13 @@ void TunnelServer::Stop() {
     }
     m_control_listener.reset();
     m_public_listener.reset();
+    // 先置 stopping 再等待：与 Spawn() 的判定同锁，保证此后不会再有新的
+    // detached 线程被创建（否则它会在 WaitWorkers 之后才登记，永远等不到）。
+    {
+        std::lock_guard<std::mutex> lock(m_workers->mutex);
+        m_workers->stopping = true;
+    }
+    m_workers->cv.notify_all();
     (void)WaitWorkers(kHeadTimeoutMs + 5000);
     Emit("server stopped");
 }
@@ -1545,33 +1552,73 @@ std::string TunnelServer::PublicUrlFor(const std::string& subdomain) const {
     return BuildPublicUrl(entry->subdomain, entry->scheme);
 }
 
+/**
+ * @brief 起一个 detached 工作线程，并在共享记账块里登记它的存活。
+ *
+ * @param task [in] 工作体；所有权移交给本函数（成功时由工作线程执行）。
+ *        任务必须能在 `WaitWorkers` 的窗口内结束，否则 `Stop()` 超时返回。
+ *
+ * @return 无返回值；`std::thread` 构造失败时计数已回滚，调用方**不需要**
+ *         做清理。
+ *
+ * ## 定位
+ * 服务端所有后台工作（控制连接、公网连接）的唯一入口。记账漏计或漏减会
+ * 让 `WaitWorkers` 超时，对象析构后线程仍访问 this——TSan 实测的
+ * condvar use-after-destroy 正是这么来的。
+ *
+ * ## 步骤
+ * step1. 取记账块强引用：worker 线程持有副本，与对象析构解耦；
+ * step2. 锁内判定 `stopping` 并递增 `active`，与 `Stop()` 的置位互斥；
+ * step3. 已停止时同步执行任务，绝不新建 detached 线程；
+ * step4. 线程体在**同一把锁内**递减并 notify，保证等待方看到 0 时本线程
+ *        对 cv 的访问已经结束。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意线程；`task` 内部不得再调用 `Stop()`（会自等待）。
+ * - 原子性：计数增减与 `stopping` 判定都在 `registry->mutex` 下。
+ * - 失败语义：不抛异常；构造线程失败时计数回滚。
+ * - 不变量：正常返回时 `active` 已包含本任务（stopping 分支除外）。
+ */
 void TunnelServer::Spawn(std::function<void()> task) {
+    // step1: 强引用记账块，worker 退出时即使本对象已析构也安全。
+    const std::shared_ptr<WorkerRegistry> registry = m_workers;
+    bool stopping = false;
     {
-        std::lock_guard<std::mutex> lock(m_worker_mutex);
-        ++m_workers;
+        // step2: 与 Stop() 的 stopping 置位同锁，避免"判定未停止"与
+        // "Stop 已结束等待"交错后仍新建 detached 线程。
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        stopping = registry->stopping;
+        if (!stopping) {
+            ++registry->active;
+        }
+    }
+    if (stopping) {
+        // step3: 已进入 Stop()：同步执行，绝不新建线程。
+        task();
+        return;
     }
     try {
-        std::thread([this, task = std::move(task)]() mutable {
+        // step4: 递减与 notify 同在锁内——这是等待方可以安全析构的前提。
+        std::thread([registry, task = std::move(task)]() mutable {
             task();
-            {
-                std::lock_guard<std::mutex> lock(m_worker_mutex);
-                --m_workers;
-            }
-            m_worker_cv.notify_all();
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            --registry->active;
+            registry->cv.notify_all();
         }).detach();
     } catch (...) {
         {
-            std::lock_guard<std::mutex> lock(m_worker_mutex);
-            --m_workers;
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            --registry->active;
         }
-        m_worker_cv.notify_all();
+        registry->cv.notify_all();
     }
 }
 
 bool TunnelServer::WaitWorkers(int timeout_ms) {
-    std::unique_lock<std::mutex> lock(m_worker_mutex);
-    return m_worker_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                                [this] { return m_workers == 0; });
+    const std::shared_ptr<WorkerRegistry> registry = m_workers;
+    std::unique_lock<std::mutex> lock(registry->mutex);
+    return registry->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                 [&registry] { return registry->active == 0; });
 }
 
 }  // namespace tunnel

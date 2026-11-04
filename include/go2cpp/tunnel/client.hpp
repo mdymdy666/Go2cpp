@@ -212,9 +212,22 @@ private:
     go2cpp::metrics::Counter* m_metric_streams = nullptr;
     go2cpp::metrics::Gauge* m_metric_online = nullptr;
 
-    std::mutex m_worker_mutex;
-    std::condition_variable m_worker_cv;
-    int m_workers = 0;
+    /// 本地转发 / raw 流线程的共享记账块（detached 线程经 `shared_ptr` 持有）。
+    ///
+    /// @details 与 `TunnelServer::WorkerRegistry` 同型：`Stop()` 带超时等待，
+    ///          超时后对象仍会析构；记账块放 `shared_ptr` 里，线程最后一次
+    ///          `--active` / `notify_all` 落在存活对象上，不会出现 condvar
+    ///          已销毁后仍被 broadcast 的 use-after-destroy。
+    struct WorkerRegistry {
+        std::mutex mutex;              ///< 保护下面三个字段。
+        std::condition_variable cv;    ///< 计数归零时唤醒 `Stop()`。
+        std::size_t active = 0;        ///< 在跑的转发线程数（兼作并发额度）。
+        bool stopping = false;         ///< `Stop()` 已开始，拒绝再起线程。
+    };
+
+    /// 所有转发线程共享同一个记账块；`shared_ptr` 保证线程退出时它存活。
+    std::shared_ptr<WorkerRegistry> m_workers =
+        std::make_shared<WorkerRegistry>();
 };
 
 }  // namespace tunnel

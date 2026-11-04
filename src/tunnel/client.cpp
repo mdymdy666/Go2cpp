@@ -99,10 +99,20 @@ void TunnelClient::Stop() {
         }
     }
     m_data_threads.clear();
+    // 先置 stopping：此后 HandleOpen / raw 回调不再新建 detached 线程，
+    // 否则新线程会在下面等待之后才登记，永远等不到。
     {
-        std::unique_lock<std::mutex> lock(m_worker_mutex);
-        m_worker_cv.wait_for(lock, std::chrono::milliseconds(10000),
-                             [this] { return m_workers == 0; });
+        std::lock_guard<std::mutex> lock(m_workers->mutex);
+        m_workers->stopping = true;
+    }
+    m_workers->cv.notify_all();
+    // 等所有本地转发线程退出。递减与 notify 在工作线程的同一把锁内完成，
+    // 因此这里观察到 active == 0 时它们不会再触碰 cv。
+    {
+        const std::shared_ptr<WorkerRegistry> registry = m_workers;
+        std::unique_lock<std::mutex> lock(registry->mutex);
+        registry->cv.wait_for(lock, std::chrono::milliseconds(10000),
+                              [&registry] { return registry->active == 0; });
     }
     SetState(false, {}, {});
     if (m_metric_online != nullptr) {
@@ -287,27 +297,31 @@ bool TunnelClient::ConnectAndRegister(bool data_role,
             !m_running.load(std::memory_order_acquire)) {
             return;
         }
-        // 先登记再起线程：Stop() 通过 m_workers 等待本地转发线程退出，若
-        // 建连阶段不计入，Stop() 返回后 detach 线程仍会访问已析构的 this。
+        // 先登记再起线程：Stop() 通过记账块等待转发线程退出，若建连阶段
+        // 不计入，Stop() 返回后 detach 线程仍会访问已析构的 this。
+        const std::shared_ptr<WorkerRegistry> registry = m_workers;
         {
-            std::lock_guard<std::mutex> lock(m_worker_mutex);
-            ++m_workers;
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            if (registry->stopping) {
+                return;
+            }
+            ++registry->active;
         }
         try {
-            std::thread([this, stream_id] {
+            // 递减与 notify 同在锁内：等待方看到 active == 0 时，本线程对
+            // cv 的访问必然已经结束（否则析构会与 broadcast 竞争）。
+            std::thread([this, registry, stream_id] {
                 RelayRawStream(stream_id);
-                {
-                    std::lock_guard<std::mutex> lock(m_worker_mutex);
-                    --m_workers;
-                }
-                m_worker_cv.notify_all();
+                std::lock_guard<std::mutex> lock(registry->mutex);
+                --registry->active;
+                registry->cv.notify_all();
             }).detach();
         } catch (...) {
             {
-                std::lock_guard<std::mutex> lock(m_worker_mutex);
-                --m_workers;
+                std::lock_guard<std::mutex> lock(registry->mutex);
+                --registry->active;
             }
-            m_worker_cv.notify_all();
+            registry->cv.notify_all();
             Emit("[tunnel] raw 流线程启动失败");
         }
     });
@@ -523,42 +537,47 @@ void TunnelClient::HandleOpen(const MuxStream::Ptr& stream) {
     if (!stream) {
         return;
     }
+    const std::shared_ptr<WorkerRegistry> registry = m_workers;
     std::size_t active = 0;
+    bool stopping = false;
     {
-        std::lock_guard<std::mutex> lock(m_worker_mutex);
-        active = static_cast<std::size_t>(m_workers);
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        active = registry->active;
+        stopping = registry->stopping;
     }
-    if (active >= m_config.max_local_streams) {
+    if (stopping || active >= m_config.max_local_streams) {
         const std::string response =
-            LocalErrorResponse(503, "Service Unavailable",
-                               "too many concurrent streams");
+            stopping ? LocalErrorResponse(503, "Service Unavailable",
+                                          "tunnel client stopping")
+                     : LocalErrorResponse(503, "Service Unavailable",
+                                          "too many concurrent streams");
         (void)stream->Write(response.data(), response.size());
         (void)stream->Close();
         return;
     }
     {
-        std::lock_guard<std::mutex> lock(m_worker_mutex);
-        ++m_workers;
+        std::lock_guard<std::mutex> lock(registry->mutex);
+        ++registry->active;
     }
     m_streams_total.fetch_add(1, std::memory_order_relaxed);
     if (m_metric_streams != nullptr) {
         m_metric_streams->Inc();
     }
     try {
-        std::thread([this, stream] {
+        // 递减与 notify 同在锁内：等待方看到 active == 0 时，本线程对 cv
+        // 的访问必然已经结束（否则析构会与 broadcast 竞争）。
+        std::thread([this, registry, stream] {
             RelayLocal(stream);
-            {
-                std::lock_guard<std::mutex> lock(m_worker_mutex);
-                --m_workers;
-            }
-            m_worker_cv.notify_all();
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            --registry->active;
+            registry->cv.notify_all();
         }).detach();
     } catch (...) {
         {
-            std::lock_guard<std::mutex> lock(m_worker_mutex);
-            --m_workers;
+            std::lock_guard<std::mutex> lock(registry->mutex);
+            --registry->active;
         }
-        m_worker_cv.notify_all();
+        registry->cv.notify_all();
         (void)stream->Close();
     }
 }
