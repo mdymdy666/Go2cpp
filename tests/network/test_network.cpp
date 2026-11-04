@@ -1469,6 +1469,57 @@ void run_network_tests() {
         writer->close();
     }
 
+    // 审查回归：三处改动叠加后的行为。
+    // ① recv(Duration::max()) 无数据时不能变成「100ms 返回」——100ms 分片只
+    //    用于让 sysmon/close 可见，语义仍是无限阻塞；有数据必须立刻唤醒。
+    // ② 负数超时是非法参数（文档承诺 EINVAL），数据已就绪时也不能算成功。
+    // ③ SendAll 对端关闭：必须报错，不能死循环或谎报全量。
+    {
+        int pair[2]{};
+        GO2CPP_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+        auto reader = go2cpp::net::Socket::FromFd(pair[0], AF_UNIX, SOCK_STREAM);
+        auto writer = go2cpp::net::Socket::FromFd(pair[1], AF_UNIX, SOCK_STREAM);
+        GO2CPP_REQUIRE(reader && writer);
+        using Duration = go2cpp::net::Socket::Duration;
+
+        std::atomic<bool> done{false};
+        std::atomic<int> blocked_error{0};
+        std::atomic<ssize_t> blocked_transferred{0};
+        std::thread blocked([&] {
+            char byte{};
+            const auto result = reader->recv(&byte, 1, 0, Duration::max());
+            blocked_transferred.store(result.transferred, std::memory_order_release);
+            blocked_error.store(result.error, std::memory_order_release);
+            done.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        GO2CPP_CHECK(!done.load(std::memory_order_acquire));
+        GO2CPP_REQUIRE(::write(pair[1], "x", 1) == 1);
+        GO2CPP_REQUIRE_EVENTUALLY(done.load(std::memory_order_acquire),
+                                  std::chrono::seconds(2));
+        blocked.join();
+        GO2CPP_CHECK(blocked_error.load() == 0);
+        GO2CPP_CHECK(blocked_transferred.load() == 1);
+
+        char byte{};
+        const auto negative = reader->recv(&byte, 1, 0, Duration(-1));
+        GO2CPP_CHECK(negative.transferred == -1 && negative.error == EINVAL);
+        GO2CPP_REQUIRE(::write(pair[1], "y", 1) == 1);
+        const auto negative_ready = reader->recv(&byte, 1, 0, Duration(-1));
+        GO2CPP_CHECK(negative_ready.transferred == -1 &&
+                     negative_ready.error == EINVAL);
+        const auto normal = reader->recv(&byte, 1, 0, Duration(100));
+        GO2CPP_CHECK(normal.ok() && normal.transferred == 1 && byte == 'y');
+
+        GO2CPP_REQUIRE(writer->close());
+        std::vector<char> payload(64 * 1024, 'z');
+        const auto broken = reader->SendAll(payload.data(), payload.size(), 0,
+                                            Duration(500));
+        GO2CPP_CHECK(!broken.ok());
+        GO2CPP_CHECK(broken.error == EPIPE || broken.error == ECONNRESET);
+        reader->close();
+    }
+
     // P1 H-05：Server 默认读/写各 10s（旧实现无限），且非法配置被拒绝。
     {
         go2cpp::http::ServerOptions defaults;

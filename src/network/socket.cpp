@@ -896,6 +896,9 @@ SocketResult Socket::recv(void* data, std::size_t length, int flags, Duration ti
     iovec vector{data, length}; return recvv(&vector, 1, flags, timeout);
 }
 SocketResult Socket::sendv(const iovec* buffers, std::size_t count, int flags, Duration timeout) {
+    // H-02 的负数分支：文档承诺「负数非法返回 EINVAL」，但 remaining() 会把
+    // 负数当成「预算已耗尽」变成 ETIMEDOUT——必须在这里先拦，不能靠下游。
+    if (timeout.count() < 0) return {-1, EINVAL};
     const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
     int fd = -1; if (!begin_operation(fd)) return {-1, errno};
     if (m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
@@ -919,6 +922,7 @@ SocketResult Socket::SendAll(const void* data, std::size_t length, int flags,
     if (length == 0) return {0, 0};
     if (data == nullptr) return {-1, EINVAL};
     if (length > static_cast<std::size_t>(SSIZE_MAX)) return {-1, EINVAL};
+    if (timeout.count() < 0) return {-1, EINVAL};
     const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
     int fd = -1;
     if (!begin_operation(fd)) return {-1, errno};
@@ -980,6 +984,9 @@ SocketResult Socket::SendAll(const void* data, std::size_t length, int flags,
     return result;
 }
 SocketResult Socket::recvv(iovec* buffers, std::size_t count, int flags, Duration timeout) {
+    // 同 sendv：recv 文档的三态承诺「负数 -> EINVAL」必须在这里兑现，否则
+    // 负数会被 remaining() 降级成 ETIMEDOUT（数据就绪时甚至直接成功）。
+    if (timeout.count() < 0) return {-1, EINVAL};
     const auto cancel_generation = m_read_cancel_generation.load(std::memory_order_acquire);
     int fd = -1; if (!begin_operation(fd)) return {-1, errno};
     if (m_read_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
