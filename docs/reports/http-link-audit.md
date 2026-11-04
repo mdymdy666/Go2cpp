@@ -1,104 +1,96 @@
-# HTTP 链路审计修复：Gateway 两个高危 + 流水线缺陷
+# HTTP 链路 bug 全清单（应用驱动排查，2026-11-04）
 
-- 审计基线：`src/app/gateway.cpp` @ HEAD `19562e9`
-- 修复日期：2026-11-04
-- 范围：仅网关生产代码（`src/app/gateway.cpp` + `include/go2cpp/app/gateway.hpp`）与
-  `tests/app/test_gateway.cpp` 测试；未 commit，未改动本轮无关文件。
+> 触发：抖音上传 6 MB+ 视频经 gateway 全 502。
+> 方法：症状 → 按链路拆 4 环节 → 逐环节只读排查 + 最小复现 → 修 → 回归。
+> 结论：一次应用故障暴露 **34 个底层问题**，其中 1 个数据损坏、5 个高危崩溃/DoS、4 个数量级性能缺陷。
 
-## 结论（先看这里）
+## 一、总览
 
-| 编号 | 缺陷 | 修复前实测 | 修复后实测 | 状态 |
+| 环节 | 条数 | 已修 | 待修 | 已排除/设计 |
+|---|---:|---:|---:|---:|
+| `http::Parser` | 8 | 5 | 1 | 2 |
+| `app::gateway`（HttpServer 连接循环） | 10 | 3 | 5 | 2 |
+| `http::Client`（转发） | 7 | 2 | 3 | 2 |
+| `douyin_http`（6 个业务服务） | 9 | 4 | 3 | 2 |
+| **合计** | **34** | **14** | **12** | **8** |
+
+## 二、Parser（8 条）
+
+| # | 级别 | 问题 | 位置 | 状态 |
 |---|---|---|---|---|
-| TOP1（高） | `Dispatch`/`WorkerLoop` 无异常保护，handler `throw` → `std::terminate` → 进程 SIGABRT | `terminate called after throwing ... Aborted (core dumped)` | HTTP 500，进程存活，后续 `/health` 仍 200 | 已修 |
-| TOP2（高） | 慢连接独占 worker；30s 是**单次 recv** 空闲超时，可被 slowloris 无限续期 | `worker=2` + 2 条半开连接，新请求 **29773 ms** 才响应 | 默认总时限 10s：**9712 ms**；配置 800ms：**601 ms** | 已修（有界） |
-| TOP3（中） | `pending` 恒空、`take_remaining()` 从未调用，一次 send 3 个请求只回 1 个 | 3 请求 → 1 响应 | 3 请求 → **3 响应** | 已修（同包流水线） |
+| P1 | 高 | 增量 feed 重复追加 header（6 MB body → 1280 份、wire 头 147 KB） | `http.cpp` header 解析段 | ✅ `9f7ab5c`（clear 重建）+ `19562e9` 回归 |
+| P2 | 高 | 头部每次 feed 重解析（64 KiB 头 + 1 MiB body 分片 **66.3 ms**） | `http.cpp:518-558` | ✅ `d538326`（`m_header_parsed` 快路径，**1.95 ms**） |
+| P3 | 高 | chunked 每次 feed 从头重扫（6 MiB **4017 ms**） | `http.cpp:585-621` | ✅ `e84bbec`（游标复用，**17 ms**） |
+| P4 | 中 | 零头 1xx 必失败（`100 Continue\r\n\r\n` → Parse(7)） | `http.cpp:469-471` | ✅ `e84bbec`（`line_end` 兜底） |
+| P5 | 中 | `reset()` 漏 `m_response_to_head`（HEAD 后复用吞 body） | `http.cpp:389` | ✅ `be0d0a3` |
+| P6 | 低 | trailer 不清空（复用 Request 残留） | header 解析段 | ✅ `be0d0a3` |
+| P7 | 低 | 304+CL / HEAD+TE 合法响应被拒 | `http.cpp:562-567` | ✅ `be0d0a3`（RFC 7230 §3.3.3） |
+| P8 | — | `consumed` 语义不一致 | `http.cpp:629/632` | ✅ `be0d0a3`（改为实际消费量） |
 
-## TOP1：Dispatch 异常兜底
+## 三、app::gateway（10 条）
 
-**根因**：`ServeConnection` 直接调用 `Dispatch`，`WorkerLoop` 直接调用
-`ServeConnection`；自定义 handler / 中间件抛出的异常没有任何 `catch`，穿过
-`std::thread` 入口触发 `std::terminate`。
+| # | 级别 | 问题 | 位置 | 状态 |
+|---|---|---|---|---|
+| G1 | 高 | Dispatch 无 try/catch → handler throw **SIGABRT** | `gateway.cpp:1203` | ✅ `76f47be`（500 + 计数） |
+| G2 | 高 | 慢连接独占 worker → 全站 DoS（2 条半开 → 29.7 s） | `gateway.cpp:1140-1181` | ✅ `76f47be`（`request_timeout` 10 s → 9.7 s） |
+| G3 | 中 | pipeline 静默丢弃（3 请求只回 1） | `gateway.cpp:1175-1211` | ✅ `76f47be`（同包流水线 1→3） |
+| G4 | 中 | 无 `Expect: 100-continue` 响应 | — | ⏳ 待修 |
+| G5 | 中 | 无 101/Upgrade 隧道（`PrepareOutgoing` 删 Upgrade） | `gateway.cpp:1013` | ⏳ 待修 |
+| G6 | 低 | 背压满 256 直接 close 无响应 | `gateway.cpp:1528` | ⏳ 待修 |
+| G7 | 低 | parser Error 不回 400 | — | ⏳ 待修 |
+| G8 | 低 | 30 s 是单次 recv 空闲超时（slowloris 可拖） | `gateway.cpp:1181` | ✅ `76f47be` 已加总时限 |
+| G9 | 低 | 库层 `serve_connection` 无 recv 超时 | `http.cpp:1509` | ⏳（网关未用） |
+| G10 | 设计 | 连接一一占用 worker（无事件循环/池化） | 架构 | ⏳ 记 TODO |
 
-**修法**（`src/app/gateway.cpp`）：
-- `ServeConnection` 内 `Dispatch` 外包 `try/catch (const std::exception&)` +
-  `catch (...)`：记 `internal_errors`、日志、返回 `500 internal server error`，
-  并置 `response.close = true`（异常后协议状态不可信，必须断开）；
-- `WorkerLoop` 调用点再包一层 `try/catch` 兜底（覆盖序列化/写回等边缘路径），
-  捕获后计数、打印日志，并尽力写一条最小 500 响应再关闭连接；
-- `Stats` 新增 `internal_errors` 计数（`include/go2cpp/app/gateway.hpp:378`）。
+## 四、http::Client（7 条）
 
-**验证**：注册一个 `throw std::runtime_error` 的自定义路由后 `GET /boom`：
-- 修复前：`terminate called after throwing an instance of 'std::runtime_error'`
-  → `Aborted (core dumped)`；
-- 修复后：`status=500`、错误体 `{"code":500,...}`、`internal_errors >= 1`，
-  紧接一次 `/health` 仍 200（进程未退出）。
+| # | 级别 | 问题 | 位置 | 状态 |
+|---|---|---|---|---|
+| C1 | 高 | 零头 1xx 解析失败（gateway 遇上游 100 → 502） | 同 P4 | ✅ `e84bbec` |
+| C2 | 高 | chunked O(n²)（6 MiB 211×） | 同 P3 | ✅ `e84bbec` |
+| C3 | 中低 | 空 body POST 不补 `Content-Length: 0` | `http.cpp:313` | ⏳ 待修 |
+| C4 | 低 | `classify_io` 不映射 `ECONNRESET/EPIPE` | `http.cpp:687` | ⏳ 待修 |
+| C5 | 低 | connect 失败用 errno 兜底（fiber 迁移后可能旧值） | `http.cpp` | ⏳ 待确认 |
+| C6 | 低 | 1xx 无计数上限（上游可无限 1xx） | `do_request` | ⏳ 待修 |
+| C7 | 设计 | 101 返回后立即关连接（upgrade 转发不可用） | — | ⏳ 记 TODO |
 
-## TOP2：请求级总时限（替代单次 recv 30s）
+## 五、douyin_http（9 条）
 
-**根因**：`connection->recv(..., 30000ms)` 每次 recv 重新计时。slowloris 每隔
-<30s 发一个字节即可永久占住 worker；`worker_threads=4` 时 4 条半开连接打满全站。
+| # | 级别 | 问题 | 位置 | 状态 |
+|---|---|---|---|---|
+| D1 | **高（数据损坏）** | body 未读满按完整处理（CL 32 MB 发 1 KB → 200 + 1024 B 进 DB） | `douyin_http.hpp:359-375` + `video_service.cpp:303` | ✅ `71568c9`（400、0 文件、0 行） |
+| D2 | 中 | DELETE 只删 DB 不删文件（孤儿 mp4） | `video_service.cpp:434-466` | ✅ `71568c9` |
+| D3 | 中 | 重复 Content-Length 无冲突检测 | `douyin_http.hpp:167` | ✅ `71568c9`（400） |
+| D4 | 中 | 超限静默 clamp 到 32 MB | `douyin_http.hpp:355-357` | ⏳ 待修 |
+| D5 | 中 | 畸形请求行/70 KB 头 → 404（应 400/431） | `douyin_http.hpp:375-381` | ✅ `71568c9`（400/431） |
+| D6 | 中 | 串行阻塞（慢上传期间其它请求 1.61 s） | `douyin_http.hpp:414-423` | ⏳ 待修 |
+| D7 | 低 | chunked 不支持却报「请求体为空」 | — | ⏳ 待修 |
+| D8 | 低 | 非法 CL 经 `atoll` 静默按 0 | — | ⏳ 待修 |
+| D9 | 低 | pipeline 第二请求静默丢弃 | — | ⏳ 待修 |
 
-**修法**：
-- `Config` 新增 `request_timeout{10000}`（`gateway.hpp:352`），0 在 `Create`
-  归一化为 10s；
-- `ServeConnection` 每个请求在**第一次 recv 前**建立
-  `deadline = steady_clock::now() + request_timeout`，覆盖头部 + body；
-- 每次 recv 的超时取 `min(deadline - now, 30s)`（`gateway.cpp:1205` 起）。
-  每次 recv 后都回到同一 deadline，慢连接无法续期；到期计数
-  `request_timeouts` 并直接关闭；
-- 仍保留 100 次/连接上限，防止单连接恶意流水线长期占用 worker。
+## 六、影响面
 
-**验证**（`worker_threads=2`，2 条只发 `"GET /health HTTP/1.1\r\nHost: slow\r\n"`
-半开连接，200ms 后发正常 `/health`）：
-- 修复前：**29773 ms**（≈30s 单次 recv 超时释放 worker）；
-- 修复后默认 10s：**9712 ms**；
-- 测试配置 `request_timeout=800ms`：**601 ms**，且 `request_timeouts >= 1`。
+| 问题 | 影响 |
+|---|---|
+| P1/P2/P3/P4 | **所有**经 gateway 转发的请求（不只抖音） |
+| C1/C2 | 所有 `http::Client` 调用方（gateway 转发、上传 example、rpc 之外的 HTTP） |
+| G1/G2 | 所有 gateway 实例（电商、抖音、任何用 app::gateway 的服务） |
+| D1–D9 | 抖音 6 个业务服务（douyin_http 独立实现） |
 
-**边界说明**：本修复把「无限」压到「≤ 总时限」，但线程/连接一一占用的架构仍在：
-worker 满时新连接要等到某个慢连接被淘汰。彻底消除需要事件循环/连接池化
-（见 TODO），本轮按任务要求先做时限与快速淘汰。
+## 七、回归索引
 
-## TOP3：同包流水线不再丢请求
+| Bug | 回归位置 |
+|---|---|
+| P1 | `tests/network/test_network.cpp`（6 MiB 分块 feed、header 计数） |
+| P4/P3 | `tests/network/test_network.cpp`（空头 100、6 MiB chunked） |
+| G1/G2/G3 | `tests/app/test_gateway.cpp`（62 checks，含 throw/slowloris/pipeline） |
+| D1–D5 | `app/douyin/scripts/accept_video_feed.sh`（52 PASS） |
+| 端到端 | `app/douyin/scripts/soak_matrix.sh`（断线重连/点赞风暴/slowloris） |
 
-**根因**：解析完第一个请求后没有调用 `parser.take_remaining()`，同一 recv 里
-后续请求的字节被丢弃；`pending` 分支是死代码。
+## 八、方法论（可复用）
 
-**修法**：`ServeConnection` 改为**流水线排空循环**：
-- 每轮用新 `Parser` 解析一个请求；解析完成后
-  `pending = parser.take_remaining()` 交给下一轮；
-- 只有缓冲里确实还有下一条请求时才继续处理并回
-  `Connection: keep-alive`，最后一条回 `Connection: close`；
-- 不做跨包空闲 keep-alive 等待：空闲连接若继续占 worker，会以新的方式放大
-  slowloris 风险；客户端后续请求重连即可；
-- `SerializeResponse` 的 `Connection` 头改为跟随 `Response::close`，
-  保证响应头与实际关闭行为一致。
-
-**验证**：一条连接一次 `send` 三个 `GET /health`，读到 EOF：
-修复前 1 个 `HTTP/1.1 200`，修复后 **3 个**。
-
-## 验证与回归
-
-```bash
-cd /UserData/CodexWorkSpace/Go2cpp
-tests/app/build_and_run_gateway.sh
-```
-
-- 编译：`-O2 -g -Wall -Wextra -Wpedantic -Werror`，**0 warning**（`grep -ci warning` = 0）；
-- 结果：`checks=62 failures=0`（原有 50 项 + 本次新增 12 项）；
-- 覆盖：原有路由/鉴权/限流/404/透传/504/502/健康聚合/Resolver/LoadConfig/1000 次压测
-  全部保持通过；新增 throw、slowloris、pipeline 三组修复验证；
-- `test_gateway` 未注册进 CMake/CTest（审计前既存问题），故按任务要求直接运行
-  `tests/app/build_and_run_gateway.sh`。
-
-## TODO / 未覆盖
-
-1. **handler 执行时间不计入 `request_timeout`**：总时限目前覆盖读取阶段；
-   慢 handler 仍占 worker，需配合上游超时或异步化。
-2. **连接模型仍是 thread-per-connection**：建议后续改事件循环或连接池，
-   把「连接占用」与「请求处理」解耦；届时可安全启用跨包 keep-alive。
-3. **`test_gateway` 未进 CTest**：建议在 `cmake/Go2CppApp.cmake` 注册
-   `add_test(NAME app_gateway ...)`，否则 CI 不会跑这 62 项。
-4. **跨包 keep-alive 明确未启用**：本轮的「流水线」只消费已到达字节；
-   若产品需要连接复用，需先解决空闲连接占 worker 的问题。
-5. **pipeline 中间件语义**：同一连接内多个请求各自独立走完整中间件链/装饰器，
-   与单请求行为一致；未做请求间共享状态测试。
+1. **症状**：先拿到一个真实失败（本例：6 MB 上传 502），拿到最小复现；
+2. **分层排除**：直连业务服务成功 → 问题在转发层（gateway/Client）；
+3. **逐环节排查**：Parser / 连接循环 / Client / 应用层 HTTP，各派一个只读 agent；
+4. **每环节三件**：读码 + 最小复现 + 前后对比；
+5. **修一个补一条回归**，并在报告里留「影响面」——决定优先级的是影响面，不是难度。
