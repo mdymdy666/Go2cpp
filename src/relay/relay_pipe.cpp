@@ -227,7 +227,13 @@ struct RelayPipeState final {
     }
 
     /// 启动看门狗线程；`Run` 在方向线程启动前调用。
-    void StartWatchdog() { watchdog = std::thread([this] { WatchdogLoop(); }); }
+    void StartWatchdog() {
+        // 防御重复启动：旧线程必须先回收，否则 std::thread 赋值会 terminate。
+        if (watchdog.joinable()) {
+            watchdog.join();
+        }
+        watchdog = std::thread([this] { WatchdogLoop(); });
+    }
 
     /// 停止并回收看门狗；方向线程都已 join 后调用。
     void StopWatchdog() {
@@ -799,7 +805,11 @@ private:
 
 namespace detail {
 
-RelayPipeState::~RelayPipeState() = default;
+RelayPipeState::~RelayPipeState() {
+    // 兜底：Run 的早退/异常路径若未显式停止，joinable 的 std::thread 在析构时
+    // 会 std::terminate，进程退出时则表现为 TSan thread leak。StopWatchdog 幂等。
+    StopWatchdog();
+}
 
 void RelayPipeState::WatchdogLoop() {
     std::unique_lock<std::mutex> lock(write_mutex);
@@ -895,6 +905,12 @@ bool RelayPipe::Run(const ContextPtr& context, ErrorPtr* err) {
     });
 
     state.StartWatchdog();
+    // 看门狗一旦启动，后续任何返回路径（含未来新增的早退/异常）都必须回收，
+    // 否则线程对象留在 state 里无人 join，进程退出即 TSan thread leak。
+    struct WatchdogGuard {
+        detail::RelayPipeState* state;
+        ~WatchdogGuard() { state->StopWatchdog(); }
+    } watchdog_guard{&state};
     state.directions[0]->Start();
     state.directions[1]->Start();
 
@@ -913,7 +929,7 @@ bool RelayPipe::Run(const ContextPtr& context, ErrorPtr* err) {
 
     state.directions[0]->Join();
     state.directions[1]->Join();
-    state.StopWatchdog();
+    // 看门狗由 watchdog_guard 在函数返回时统一停止（含所有早退路径）。
     ctx->Done().RemoveCallback(callback_id);
 
     bool all_clean = true;

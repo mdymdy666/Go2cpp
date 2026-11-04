@@ -1023,15 +1023,23 @@ class WaitQueue {
 };
 
 /// @brief 线程本地节点池（稳态零分配；上限 128，超出后释放）。
+///
+/// @details 槽位直接放在 TLS 内（固定数组 + 长度），而不是 std::vector：
+/// - vector 的元素缓冲在堆上，线程退出时只析构 vector 自身，槽里的裸指针
+///   永远失去所有者——ASan 实测 fast_channel 因此泄漏 3968 B / 38 次分配
+///   （泄漏栈即本类 Acquire() 的 new Node()）；
+/// - 槽位在 TLS 内时，即使泄漏检查早于 TLS 析构执行，缓存节点也从 TLS 根
+///   可达，不会被误判；线程退出时由 LocalPool 的析构函数逐个 delete，真正归还。
+///
+/// 池内节点只属于本线程（Acquire/Release 都在同一线程池结算），因此
+/// 析构时无跨线程所有权问题。
 template <typename Node>
 class WaitNodePool {
  public:
   static Node* Acquire() {
-    auto& pool = Local();
-    if (!pool.empty()) {
-      Node* node = pool.back();
-      pool.pop_back();
-      return node;
+    LocalPool& pool = Local();
+    if (pool.size != 0) {
+      return pool.slots[--pool.size];
     }
     return new Node();
   }
@@ -1041,9 +1049,9 @@ class WaitNodePool {
       return;
     }
     node->Reset();
-    auto& pool = Local();
-    if (pool.size() < kLocalCapacity) {
-      pool.push_back(node);
+    LocalPool& pool = Local();
+    if (pool.size < kLocalCapacity) {
+      pool.slots[pool.size++] = node;
     } else {
       delete node;
     }
@@ -1052,8 +1060,20 @@ class WaitNodePool {
  private:
   static constexpr std::size_t kLocalCapacity = 128;
 
-  static std::vector<Node*>& Local() {
-    static thread_local std::vector<Node*> pool;
+  /// @brief TLS 池存储：固定槽位；线程退出时释放全部缓存节点。
+  struct LocalPool {
+    Node* slots[kLocalCapacity]{};
+    std::size_t size{0};
+
+    ~LocalPool() {
+      for (std::size_t index = 0; index < size; ++index) {
+        delete slots[index];
+      }
+    }
+  };
+
+  static LocalPool& Local() {
+    static thread_local LocalPool pool;
     return pool;
   }
 };
