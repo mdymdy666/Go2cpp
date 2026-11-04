@@ -1,7 +1,8 @@
 # rd_net 平台差异：Linux/POSIX 与 Windows（MSVC/Winsock）
 
 - 状态：Windows 分支已实现（`src/rd_net/socket.cpp`、`src/rd_net/event_loop.cpp`
-  的 `#if defined(_WIN32)` 段），**尚未在 Windows 上实测编译**（见第 8 节）。
+  的 `#if defined(_WIN32)` 段），**已于 2026-11-04 用真 MSVC 2022 编译并运行四个
+  测试（406/44/44/64 全 0 失败）**；9 项测试期平台差异逐条登记在第 9 节。
 - 范围：REQ-006 四态 Socket、REQ-007 事件循环；REQ-008/009 的 protocol.cpp
   只依赖本层接口，未新增平台分支。
 - 原则：Windows 头（`winsock2.h` / `ws2tcpip.h` / `windows.h`）只出现在
@@ -171,7 +172,7 @@
 7. **`last_system_error()` 是 WSA 码**：不是 errno，不能与 `EAGAIN` 等比较。
 8. **hook / eBPF / bento / relay / tunnel 等模块**：与本层无关，Windows
    构建中保持关闭（`GO2CPP_BUILD_HOOK=OFF`、`GO2CPP_ENABLE_EBPF=OFF`）。
-9. **`tests/rd_net/*.cpp` 不可在 Windows 编译**：依赖 `dirent.h`、`poll.h`、
+9. **`tests/rd_net/*.cpp` 不可在 Windows 编译**（2026-11-04 已推翻：适配后经 MSVC 编译通过，见第 9 节）：依赖 `dirent.h`、`poll.h`、
    `fork`、`socketpair` 等 POSIX 设施；Windows 侧只能做「编译库」门禁，
    运行期测试待移植（这是当前最大的验证缺口）。
 
@@ -180,10 +181,102 @@
 | 验证项 | 状态 | 依据 |
 |---|---|---|
 | Linux 分支回归 | ✅ 已做 | WSL `g++ -std=c++17 -Iinclude -c src/rd_net/{socket,event_loop,protocol}.cpp -Wall -Wextra -Wpedantic` 三个编译单元零告警、零错误 |
-| Windows 分支语法/语义 | ⚠️ **未在本机编译** | WSL 无 mingw-w64、无 wine、无外网（装不了）；本机无法交叉编译 MSVC。只能靠静态审查 + CI |
+| Windows 分支语法/语义 | ✅ 已做（2026-11-04） | 真 MSVC 2022 x64（`vcvars64.bat`）以 `/W4 /WX` 编译四个测试 rc=0；此前只能静态审查，因为 WSL 无 mingw-w64/wine |
 | Windows 真实构建 | ⏳ 待 CI | `.github/workflows/ci.yml` 的 `windows-configure` job 升级为 `cmake --build --target go2cpp_rd_net`；首次运行前保留 `continue-on-error` |
-| Windows 运行期行为 | ❌ 未覆盖 | 无 MSVC 运行环境、无 Windows 测试用例；`WaitForMultipleObjects` 路径的正确性依赖 CI 构建 + 后续补测试 |
+| Windows 运行期行为 | ✅ 已做（2026-11-04） | 真 MSVC 2022 x64 编译并运行四个测试：406/44/44/64 全 0 失败，9 项差异见第 9 节 |
+| Windows cmake/CI 路径 | ⏳ 待首次运行 | 本机用 `cl` 直接编译（`E:\tmp\msvc-build\*.bat`），仓库内 `build_and_run_windows.bat` / CMake 未走通（acceptance:370 遗留） |
 
-结论：**不要**把本文件当作「Windows 已验证通过」的证据；它描述的是实现
-与设计取舍。Windows 侧的验收需要 CI 构建通过后再补一套可移植的测试
-（把 `tests/rd_net` 里依赖 POSIX 的部分改成条件编译或独立用例）。
+结论：第 1–7 节是实现取舍与降级清单（仍适用于实现层）；**Windows 运行期已实测**，
+证据见第 9 节。Linux 侧回归以 `tests/rd_net/build_and_run_*.sh` 为准；cmake/CI 的
+Windows job 尚未首次运行（acceptance:370 记为遗留）。
+
+---
+
+## 9. rd_net 测试平台差异（REQ-010，2026-11-04）
+
+> 背景：2026-11-04 用**真 MSVC 2022 BuildTools x64** 编译并运行 `tests/rd_net/`
+> 四个测试（`test_socket` 406、`test_event_loop` 44、`test_protocol` 44、
+> `test_reliability` 64，全 0 失败），见 `collab/acceptance.md:346-370`。为消除
+> MSVC 下的编译错误与运行期断言差异，共处理 **9 项**平台差异；本节逐项登记
+> 「Linux 行为 / Windows 行为 / 处理 / 等价性 / 验证位置」，并把 acceptance 的
+> 5 行归因拆成 9 个可独立核查的点（拆分映射见 9.1 末注）。
+
+### 9.1 差异清单（9/9）
+
+| # | 差异项 | Linux 行为 | Windows 行为 | 处理（实现/断言） | 等价性 | 验证位置（file:line） |
+|---|---|---|---|---|---|---|
+| 1 | UDP 截断长度 | `recvmsg(MSG_TRUNC)` 返回**真实报文长度** 65507，断言 `got==65507` | `WSARecvFrom` 只报 `WSAEMSGSIZE`，内核不交真实长度；实现只能把 `*received` 记为缓冲大小 | `_WIN32` 断言 `got == sizeof(small)`（=1024）；POSIX 分支保留 65507。实现侧 `RecvDatagramRaw` 在 `WSAEMSGSIZE` 时 `*received = buf.size` | 截断态 `received` 必须**恰等于**调用方缓冲：不谎报 0（不丢「有数据」信号）、不超过缓冲（不被当完整报文）；首尾字节仍与实发 payload 比对 | `tests/rd_net/test_socket.cpp:564-574`（断言 :571）；实现 `src/rd_net/socket.cpp:1378-1380` |
+| 2 | TCP 批量提交：`kOk` 态 | `sendmsg`/`writev` 一次提交受 `SO_SNDBUF` 硬约束，对端不读时必为部分提交 → 只出现 `kWouldBlock` | `WSASend` 把 `SO_SNDBUF` 当**提示**，AFD 可整吞一次 64KB gather 写 → 额外出现 `kOk` | 允许两态；`kOk` 断言 `submitted==64 && transferred==65536`，随后按 `transferred` 逐字节回读比对；**不伪造部分提交**（内核已全收时谎报会导致重发重复） | `kOk` 是「全部 64 段已提交」的合法实现结果，与 Linux 的「全量提交」同一语义；字节内容比对不放宽 | `test_socket.cpp:1627-1632`（`kOk` 分支）；实现 `src/rd_net/socket.cpp:2038` |
+| 3 | TCP 批量提交：`kWouldBlock` 态 | 前缀提交：`1<=K<64` 段完整，`transferred` 落在第 K 段内 | 同样可能发生（内核先收一部分再阻塞） | 保留原断言：`submitted>0 && submitted<64`、`transferred∈[K*seg,(K+1)*seg)`，逐字节回读前缀 | 与 Linux 完全同一组断言，未放宽；段边界（写入原子性）仍被检查 | `test_socket.cpp:1633-1643`（`kWouldBlock` 分支） |
+| 4 | 事件派发时序：Test1 同 tick | `poll` 一次返回全部就绪 fd，Post/定时器/IO **同 tick**（`io_tick==1`） | `WSAEventSelect`+`WaitForMultipleObjectsEx` 一次只报索引最小的句柄；唤醒事件在 `handles[0]`，IO 顺延下一 tick | 断言 `handler.io_tick == post_tick + 1`（严格晚一 tick、不能更晚）；顺序 `0→1→2` 不变 | 「Post 先于定时器先于 IO」不变，只允许 IO 晚**一个** tick；多晚一个 tick 即失败，不是恒真 | `tests/rd_net/test_event_loop.cpp:247-256`（断言 :253）；实现 `src/rd_net/event_loop.cpp:1122-1137` |
+| 5 | 事件派发时序：Test5 first_tick | A/B 同 tick 派发，`B.first_tick == A.first_tick` | 一次只派发一个句柄；A（索引小）先按 64/tick 排空 1000 包（16 tick），B 的 1 包之后才派发 | 断言 `B.first_tick > A.first_tick`；其余不变：`A.first_tick_count==64`、`A.max_per_tick<=64`、`B.count==1`、`A.count>=64` | 两 socket 都**没有被饿死**（B 仍恰好派发 1 次、A 仍收满且每 tick ≤64）；只改「同 tick」为「严格晚」，不放宽单 tick 预算 | `test_event_loop.cpp:565-573`（断言 :570） |
+| 6 | Stop 条件根因 | A 收满即 `Stop()` 安全——同一 tick 内 B 也已派发 | 同 tick 只派发 A，A 收满即停会让 B 的 1 包**永远没有机会**（表现：`b_rx=0`/`timed_out`） | 改为两 socket 都收满才停：`handler_a.on_packet` 增加 `handler_b.count>=1` 条件，`handler_b.on_packet` 在 A 满时停 | Stop 条件从「A 完成」改为「A+B 都完成」，不放宽任何计数断言；`B.count==1`、`timed_out==false` 仍检查 | `test_event_loop.cpp:531-544`（注释 :531-533；acceptance 记作 `:517/:518`，行号随提交漂移） |
+| 7 | 定时精度 | `poll` 毫秒超时 + 1ms 内核粒度，1000 定时器 `Max()<5000µs` | 系统时钟中断默认 15.625ms，`WaitForMultipleObjectsEx` 最坏晚一个时钟周期（未调 `timeBeginPeriod`，避免全局副作用） | 仅 `_WIN32` 阈值放宽到 `Max()<20000`；保留 `elapsed∈[990,1100]ms` | 误差上界从 5ms 变为 2 个时钟周期；「1000 个定时器整体在 1s 附近跑完」不变（退化成秒级立即失败）；Test3 的 `stats.Max()<5000` **未放宽**作对照 | `test_event_loop.cpp:301-310`（断言 :307）；对照 `:424` |
+| 8 | UDP 吞吐 | 环回 500ms 窗口内可发 >10 万包，断言 `sent>=100000` | 环回每包一次 `sendto` + 发送线程与 loop 线程抢核，实测 3~8 万包 | 阈值降为 `sent>=30000`（仍 ≥60 包/ms） | 仍能抓「发送线程没起来 / 出错提前退出 / 卡死」：这些情况 `sent` 停在原位，30000 也过不去 | `test_event_loop.cpp:425-433`（断言 :430）；实测区间依据 commit `4cc501a` 注释 |
+| 9 | UDP 发送临时错误 | 缓冲满时 `sendto` 接受并丢弃，只有 `EWOULDBLOCK` 重试；其他错误 `break` | 环回 UDP 缓冲满可能返回 `WSAENOBUFS` 等非 `kOk`；原逻辑 `break` 会让发送线程提前退出、`sent` 断言失真 | `_WIN32` 下非 `kOk` 一律 `yield`+`continue` 重试（窗口由 `stop_sender` 截止）；POSIX 分支保持原逻辑 | 用「窗口内持续成功发送 ≥30000」兜底；若 socket 真损坏，`sent` 停住仍失败，**不会静默放过** | `test_event_loop.cpp:362-380`（重试 :368-371） |
+
+**拆分映射（acceptance 5 行 → 本节 9 项）**：`socket:564`→#1；`socket:1608/1610`
+两态→#2+#3；`event_loop:247/517/518` 三件事→#4（同 tick 派发）+ #6（Stop 条件根因）
++ #5（first_tick 语义）；`event_loop:292` 定时精度→#7；`event_loop:395` UDP 吞吐→#8，
+其隐含的发送错误处理→#9。acceptance 表格中的行号为提交时快照，当前 HEAD 见上表。
+
+### 9.2 MSVC 编译期兼容修复（3 处，不属运行期语义差异）
+
+| 错误 | 原因 | 修复 | 位置 |
+|---|---|---|---|
+| `C3493` | lambda 隐式捕获 `kTimerCount`；MSVC 拒绝对 constexpr 局部变量做隐式捕获 | 显式列入捕获列表 `[&stats, &fired, &loop, expected, kTimerCount]` | `test_event_loop.cpp:282` |
+| `C2589/C2059` | `windows.h` 的 `min/max` 宏破坏 `std::min/std::max` | `NOMINMAX` 在包含 `windows.h` 前定义；两处 `std::min` 改 `(std::min)` 抑制宏展开 | `test_socket.cpp:40-44`、`:656`、`:685` |
+| `C4244` | `SOCKET`（`UINT_PTR`，64 位）塞进 `int` | 测试侧统一 `tsock::Handle = std::uintptr_t`，`const int peer` → `const tsock::Handle peer` | `test_socket.cpp:96`、`:434`、`:474`、`:614` |
+
+### 9.3 MSVC 原始命令与输出
+
+构建脚本在 `E:\tmp\msvc-build\`（**展平副本**：`include/`、`src/`、`tests/`，
+源文件与仓库 HEAD 同源；用 `cl` 直接编译，**未走 cmake**）：
+
+```bat
+call "...\VC\Auxiliary\Build\vcvars64.bat"
+cl /nologo /std:c++17 /W4 /WX /utf-8 /EHsc /D_WIN32_WINNT=0x0601 ^
+   /D_CRT_SECURE_NO_WARNINGS /I include ^
+   tests/test_socket.cpp src/socket.cpp ^
+   /Fe:test_socket.exe /link ws2_32.lib psapi.lib
+
+cl ... /I include tests/test_event_loop.cpp src/socket.cpp src/event_loop.cpp ^
+   /Fe:test_event_loop.exe /link ws2_32.lib psapi.lib
+
+cl ... /I include tests/test_protocol.cpp src/socket.cpp src/event_loop.cpp ^
+   src/protocol.cpp /Fe:test_protocol.exe /link ws2_32.lib psapi.lib
+
+cl ... /I include tests/test_reliability.cpp ^
+   /Fe:test_reliability.exe /link ws2_32.lib psapi.lib
+```
+
+运行结果（原始记录见 `collab/acceptance.md:352-357`）：
+
+```text
+test_socket      编译 rc=0 → 运行 checks=406 failures=0
+test_event_loop  编译 rc=0 → 运行 checks=44  failures=0
+test_protocol    编译 rc=0 → 运行 checks=44  failures=0
+test_reliability 编译 rc=0 → 运行 检查 64 项，失败 0 项
+```
+
+**证据边界（如实）**：`E:\tmp\msvc-build` 未保留 stdout 日志文件，只留下
+`.bat` 与 `.obj/.exe` 产物（exe 时间戳 `2026-11-04 13:05:53`–`13:06:00`，与
+提交 `4cc501a` 的 13:06:19 吻合）；上表运行行为验收记录，**不是**本节现场复跑。
+`tests/rd_net/build_and_run_windows.bat` 与 `tests/rd_net/CMakeLists.txt` 的 cmake
+路径未在本机走通（acceptance:370 遗留），CI 的 Windows job 尚未首次运行。
+
+### 9.4 长期规则（自本节起强制）
+
+1. **新增平台分支必须登记到本文件**：任何 `#if defined(_WIN32)` 新增/修改，
+   都要在 9.1 表格加一行并给 `file:line`；未登记视为该改动未完成。
+2. **断言只能改期望值/阈值，不能改语义**：禁止把「必须发生」退化为「可能发生」
+   后不再验证另一半；允许两态（如 `kOk`/`kWouldBlock`）时必须**两态各自**给出
+   断言，且两态都要做内容比对。
+3. **不允许 skip**：不得用 `#if 0`、提前 `return`、空断言、恒真断言绕过平台差异；
+   确实无法验证的项写「未确认」并给出替代断言，不得删除原断言。
+4. **阈值放宽必须自证**：写清实测区间（如 `3~8 万包`）与放宽后仍能抓住的失败模式
+   （如「线程未启动仍会让 `sent>=30000` 失败」）；只写「Windows 比较慢」不合格。
+5. **行号不是契约**：acceptance/本文中的 `:行号` 会随提交漂移；引用时以
+   `git log -S<断言文本>` 或提交 hash 定位，并同步更新本表。
+6. **平台差异只允许出现在 `#if defined(_WIN32)` 块内**，块内注释必须写清
+   「Linux 行为 / Windows 行为 / 等价性」三要素，否则 review 直接打回。
