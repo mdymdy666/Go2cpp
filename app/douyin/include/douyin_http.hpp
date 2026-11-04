@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <map>
 #include <string>
 #include <string_view>
@@ -75,6 +76,7 @@ inline const char* StatusText(int status) {
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 409: return "Conflict";
+        case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
         case 502: return "Bad Gateway";
         case 504: return "Gateway Timeout";
@@ -143,9 +145,11 @@ inline std::string Trim(std::string_view text) {
 /**
  * @brief 解析请求头。
  * @param block 请求行之后、空行之前的文本（含各行行尾）。
- * @param request 输出；键统一转小写。
+ * @param request [out] 输出；键统一转小写，重复头以后出现者为准。
+ * @return 头合法返回 true；重复的 `Content-Length` 取值不一致返回 false。
+ *         重复且同值的 `Content-Length` 合法（RFC 7230 允许合并同值）。
  */
-inline void ParseHeaders(std::string_view block, HttpRequest* request) {
+inline bool ParseHeaders(std::string_view block, HttpRequest* request) {
     std::size_t pos = 0;
     while (pos < block.size()) {
         std::size_t line_end = block.find('\n', pos);
@@ -164,8 +168,18 @@ inline void ParseHeaders(std::string_view block, HttpRequest* request) {
         std::string key = Trim(std::string_view(line).substr(0, colon));
         std::transform(key.begin(), key.end(), key.begin(),
                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        request->headers[key] = Trim(std::string_view(line).substr(colon + 1));
+        const std::string value = Trim(std::string_view(line).substr(colon + 1));
+        // 两个 Content-Length 指向不同长度时无法判断以哪个为准，按 RFC 7230
+        // 视为消息定界错误直接拒绝，避免请求走私/截断。
+        if (key == "content-length") {
+            const auto existing = request->headers.find(key);
+            if (existing != request->headers.end() && existing->second != value) {
+                return false;
+            }
+        }
+        request->headers[key] = value;
     }
+    return true;
 }
 
 /// @brief 查请求头结束位置（`\r\n\r\n` 或 `\n\n`），返回 body 起始偏移。
@@ -184,12 +198,38 @@ inline bool FindHeaderEnd(const std::string& buffer, std::size_t* body_begin) {
 }
 
 /**
- * @brief 从已读缓冲区解析完整请求（请求行 + 头 + body）。
- * @param buffer 已读字节（至少含完整头；body 长度已由调用方保证）。
- * @param body_begin `FindHeaderEnd` 得到的 body 起始偏移。
- * @return 请求行合法返回 true。
+ * @brief 解析 Content-Length：只接受非负十进制整数。
+ * @param text 头部原值（首尾空白已由 ParseHeaders 去掉）。
+ * @param out [out] 成功时写入字节数；失败时保持原值。
+ * @return 合法返回 true；空串、含非数字字符或超出 size_t 返回 false。
  */
-inline bool ParseHttpRequest(const std::string& buffer, std::size_t body_begin,
+inline bool ParseContentLength(std::string_view text, std::size_t* out) {
+    if (text.empty() || out == nullptr) {
+        return false;
+    }
+    std::size_t value = 0;
+    for (const char ch : text) {
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        const auto digit = static_cast<std::size_t>(ch - '0');
+        if (value > (std::numeric_limits<std::size_t>::max() - digit) / 10) {
+            return false;
+        }
+        value = value * 10 + digit;
+    }
+    *out = value;
+    return true;
+}
+
+/**
+ * @brief 只解析请求行与请求头（不解析 body）。
+ * @param buffer 已读字节，至少包含完整头。
+ * @param body_begin `FindHeaderEnd` 得到的 body 起始偏移。
+ * @param request [out] 输出；重复且冲突的 Content-Length 会让本函数返回 false。
+ * @return 请求行与头合法返回 true。
+ */
+inline bool ParseRequestHead(const std::string& buffer, std::size_t body_begin,
                              HttpRequest* request) {
     if (!ParseRequestLine(buffer, request)) {
         return false;
@@ -198,9 +238,22 @@ inline bool ParseHttpRequest(const std::string& buffer, std::size_t body_begin,
     if (header_line_end == std::string::npos || header_line_end + 1 > body_begin) {
         return true;
     }
-    ParseHeaders(std::string_view(buffer).substr(header_line_end + 1,
-                                                 body_begin - header_line_end - 1),
-                 request);
+    return ParseHeaders(std::string_view(buffer).substr(header_line_end + 1,
+                                                        body_begin - header_line_end - 1),
+                        request);
+}
+
+/**
+ * @brief 从已读缓冲区解析完整请求（请求行 + 头 + body）。
+ * @param buffer 已读字节（至少含完整头；body 长度已由调用方保证）。
+ * @param body_begin `FindHeaderEnd` 得到的 body 起始偏移。
+ * @return 请求行与头合法返回 true。
+ */
+inline bool ParseHttpRequest(const std::string& buffer, std::size_t body_begin,
+                             HttpRequest* request) {
+    if (!ParseRequestHead(buffer, body_begin, request)) {
+        return false;
+    }
     request->body = buffer.substr(body_begin);
     return true;
 }
@@ -312,72 +365,112 @@ inline bool JsonStringField(std::string_view body, std::string_view key, std::st
     return false;
 }
 
-/// @brief 单连接处理：读完整请求 → 交给 handler → 写响应。
-inline void ServeConnection(go2cpp::net::Socket& connection, const HttpHandler& handler) {
-    std::string buffer;
+/**
+ * @brief 读取请求头直到空行出现。
+ * @param connection [in,out] 已 accept 的连接；只读不写。
+ * @param buffer [out] 累积读到的字节（可能已含部分 body）。
+ * @param body_begin [out] 空行之后的 body 起始偏移；仅在返回 true 时有效。
+ * @param too_large [in,out] 调用方初始化为 false；头超过 kMaxHeaderBytes 时置 true。
+ * @return 头完整返回 true；连接提前关闭返回 false。
+ */
+inline bool ReadRequestHead(go2cpp::net::Socket& connection, std::string* buffer,
+                            std::size_t* body_begin, bool* too_large) {
     char chunk[64 * 1024];
-    std::size_t body_begin = 0;
-    bool header_done = false;
+    for (;;) {
+        if (buffer->size() >= kMaxHeaderBytes) {
+            *too_large = true;
+            return false;
+        }
+        const auto result =
+            connection.recv(chunk, sizeof(chunk), 0, std::chrono::milliseconds(2000));
+        if (!result.ok() || result.transferred <= 0) {
+            return false;
+        }
+        buffer->append(chunk, static_cast<std::size_t>(result.transferred));
+        if (FindHeaderEnd(*buffer, body_begin)) {
+            // 头结束位置也可能一次读超 64 KiB（上次读 60 KiB + 本次 20 KiB）。
+            if (*body_begin > kMaxHeaderBytes) {
+                *too_large = true;
+                return false;
+            }
+            return true;
+        }
+    }
+}
 
-    while (buffer.size() < kMaxHeaderBytes) {
-        const auto result = connection.recv(chunk, sizeof(chunk), 0,
-                                            std::chrono::milliseconds(2000));
+/**
+ * @brief 按 Content-Length 读满 body。
+ * @param connection [in,out] 已 accept 的连接；只读不写。
+ * @param buffer [in,out] 已含完整头；返回时可能追加 body，超长部分被截掉。
+ * @param body_begin [in] body 起始偏移。
+ * @param content_length [in] 声明长度（字节，已由调用方限制在 kMaxBodyBytes 内）。
+ * @return 实际读到的 body 字节数；连接提前关闭/超时时小于 content_length。
+ */
+inline std::size_t ReadRequestBody(go2cpp::net::Socket& connection, std::string* buffer,
+                                   std::size_t body_begin, std::size_t content_length) {
+    char chunk[64 * 1024];
+    const std::size_t wanted = body_begin + content_length;
+    while (buffer->size() < wanted) {
+        const auto result =
+            connection.recv(chunk, sizeof(chunk), 0, std::chrono::milliseconds(2000));
         if (!result.ok() || result.transferred <= 0) {
             break;
         }
-        buffer.append(chunk, static_cast<std::size_t>(result.transferred));
-        if (FindHeaderEnd(buffer, &body_begin)) {
-            header_done = true;
-            break;
-        }
+        buffer->append(chunk, static_cast<std::size_t>(result.transferred));
     }
-
-    if (header_done) {
-        std::size_t content_length = 0;
-        {
-            HttpRequest probe;
-            if (ParseRequestLine(buffer, &probe)) {
-                const std::size_t line_end = buffer.find('\n');
-                if (line_end != std::string::npos && line_end + 1 <= body_begin) {
-                    ParseHeaders(std::string_view(buffer).substr(
-                                     line_end + 1, body_begin - line_end - 1),
-                                 &probe);
-                }
-                const std::string length_text = probe.Header("content-length");
-                if (!length_text.empty()) {
-                    const long long parsed = std::atoll(length_text.c_str());
-                    if (parsed > 0) {
-                        content_length = static_cast<std::size_t>(parsed);
-                    }
-                }
-            }
-        }
-        if (content_length > kMaxBodyBytes) {
-            content_length = kMaxBodyBytes;
-        }
-        const std::size_t wanted = body_begin + content_length;
-        while (buffer.size() < wanted && buffer.size() < kMaxBodyBytes + kMaxHeaderBytes) {
-            const auto result = connection.recv(chunk, sizeof(chunk), 0,
-                                                std::chrono::milliseconds(2000));
-            if (!result.ok() || result.transferred <= 0) {
-                break;
-            }
-            buffer.append(chunk, static_cast<std::size_t>(result.transferred));
-        }
-        if (buffer.size() > wanted) {
-            buffer.resize(wanted);
-        }
+    if (buffer->size() > wanted) {
+        buffer->resize(wanted);
     }
+    return buffer->size() - body_begin;
+}
 
+/// @brief 单连接处理：读完整请求 → 交给 handler → 写响应。
+inline void ServeConnection(go2cpp::net::Socket& connection, const HttpHandler& handler) {
+    std::string buffer;
+    std::size_t body_begin = 0;
+    bool header_too_large = false;
     HttpRequest request;
     HttpResponse response;
-    bool handled = false;
-    if (header_done && ParseHttpRequest(buffer, body_begin, &request)) {
-        handled = handler(request, &response);
-    }
-    if (!handled) {
-        response.status = 404;
-        response.body = ErrorBody(404, "not found");
+    const auto set_error = [&response](int status, std::string_view message) {
+        response.status = status;
+        response.body = ErrorBody(status, message);
+    };
+
+    if (!ReadRequestHead(connection, &buffer, &body_begin, &header_too_large)) {
+        // 头没读完不能进路由：畸形请求行 / 超长头必须是 400/431，不能落成 404。
+        if (header_too_large) {
+            set_error(431, "请求头超过 64 KiB");
+        } else {
+            set_error(400, "请求头不完整或连接提前关闭");
+        }
+    } else if (!ParseRequestHead(buffer, body_begin, &request)) {
+        set_error(400, "请求行或请求头非法");
+    } else {
+        std::size_t content_length = 0;
+        bool length_valid = true;
+        const auto length_header = request.headers.find("content-length");
+        if (length_header != request.headers.end() &&
+            !ParseContentLength(length_header->second, &content_length)) {
+            length_valid = false;
+        }
+        if (!length_valid) {
+            set_error(400, "Content-Length 非法");
+        } else if (content_length > kMaxBodyBytes) {
+            set_error(400, "请求体超过 32 MiB");
+        } else {
+            const std::size_t actual =
+                ReadRequestBody(connection, &buffer, body_begin, content_length);
+            if (actual != content_length) {
+                // 短 body 绝不能当完整请求处理：上传会落盘半截文件并写 DB。
+                set_error(400, "请求体不完整");
+            } else {
+                request.body.assign(buffer, body_begin, content_length);
+                if (!handler(request, &response)) {
+                    response.status = 404;
+                    response.body = ErrorBody(404, "not found");
+                }
+            }
+        }
     }
 
     const std::string payload = Serialize(response);

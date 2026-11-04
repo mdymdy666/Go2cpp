@@ -296,14 +296,23 @@ bool HandleUpload(douyin::Store& store, const douyin::HttpRequest& request,
     if (title.empty() || Utf8Length(title) > kMaxTitleChars) {
         return Fail(response, 400, "title 长度需为 1-80 字");
     }
-    // step3: 体积检查。读取层超过上限会截断，Content-Length 是原始大小的唯一信号。
+    // step3: 体积与完整性检查。读取层负责按 Content-Length 读满；这里再比对一次
+    // 声明长度与实际 body，防止短 body 被当成完整视频落盘（读取层换实现时的兜底）。
     if (request.body.empty()) {
         return Fail(response, 400, "请求体为空");
     }
     const std::string length_text = request.Header("content-length");
-    if (!length_text.empty() &&
-        std::strtoull(length_text.c_str(), nullptr, 10) > kMaxUploadBytes) {
-        return Fail(response, 400, "视频不能超过 32 MiB");
+    if (!length_text.empty()) {
+        std::size_t declared = 0;
+        if (!douyin::ParseContentLength(length_text, &declared)) {
+            return Fail(response, 400, "Content-Length 非法");
+        }
+        if (declared > kMaxUploadBytes) {
+            return Fail(response, 400, "视频不能超过 32 MiB");
+        }
+        if (declared != request.body.size()) {
+            return Fail(response, 400, "请求体不完整");
+        }
     }
     if (request.body.size() > kMaxUploadBytes) {
         return Fail(response, 400, "视频不能超过 32 MiB");
@@ -430,7 +439,54 @@ bool HandleMine(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
-/// @brief 删除视频（仅作者）。
+/// @brief 删除上传视频对应的本地文件；url 不是 `videos/<单段文件名>` 时跳过。
+/// @param url [in] DB 里存的相对 url；外部 http(s) 地址不归本服务管理，不删。
+/// @note 失败只记日志：DB 记录已删除，文件残留不应把成功的删除改成 500。
+void RemoveUploadedVideoFile(const std::string& url) {
+    constexpr std::string_view kPrefix = "videos/";
+    if (url.size() <= kPrefix.size() || url.compare(0, kPrefix.size(), kPrefix) != 0) {
+        std::fprintf(stderr, "[%s] 非本地上传路径，跳过文件删除: %s\n", kServiceName,
+                     url.c_str());
+        return;
+    }
+    const std::string name = url.substr(kPrefix.size());
+    // 只允许单段文件名，挡掉 `..`、绝对路径与子目录，防止越界删除。
+    if (name == "." || name == ".." || name.find('/') != std::string::npos ||
+        name.find('\\') != std::string::npos) {
+        std::fprintf(stderr, "[%s] 非法上传文件名，跳过文件删除: %s\n", kServiceName,
+                     url.c_str());
+        return;
+    }
+    const std::filesystem::path path =
+        std::filesystem::path(WebDir()) / "videos" / name;
+    std::error_code ec;
+    const bool removed = std::filesystem::remove(path, ec);
+    if (ec) {
+        std::fprintf(stderr, "[%s] 删除上传文件失败: %s（%s）\n", kServiceName,
+                     path.c_str(), ec.message().c_str());
+    } else if (!removed) {
+        std::fprintf(stderr, "[%s] 上传文件不存在，跳过: %s\n", kServiceName,
+                     path.c_str());
+    }
+}
+
+/**
+ * @brief 删除视频记录，并清理该记录对应的本地上传文件。
+ *
+ * @param store [in,out] 已打开的存储——成功时删除 videos 行。
+ * @param request [in] HTTP 请求——借用；只读 Authorization。
+ * @param id [in] 视频 id；数据库按 id + user_id 删除。
+ * @param response [out] 出站响应——401/403/404/500，成功 200。
+ * @return 总是 true；调用方**不要**再回 404。
+ *
+ * ## 步骤
+ * step1. 鉴权并解析用户；step2. 查记录、校验作者；
+ * step3. 删 DB 行（唯一提交点）；step4. 删本地文件，失败只记日志。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：单线程事件循环内调用；
+ * - 不变量：返回 200 时 videos 行已不存在；文件删除失败不回滚 DB。
+ */
 bool HandleDelete(douyin::Store& store, const douyin::HttpRequest& request,
                   std::int64_t id, douyin::HttpResponse* response) {
     std::int64_t actor = 0;
@@ -459,6 +515,8 @@ bool HandleDelete(douyin::Store& store, const douyin::HttpRequest& request,
     if (changed == 0) {
         return Fail(response, 404, "视频不存在");
     }
+    // 先删 DB 再删文件：顺序反了会出现「文件没了但记录还在」。
+    RemoveUploadedVideoFile(stored.url);
     response->status = 200;
     response->body = "{\"ok\":true,\"deleted\":true,\"id\":" +
                      std::to_string(id) + "}";
