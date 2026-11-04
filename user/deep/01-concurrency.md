@@ -1,535 +1,439 @@
-# 并发运行时（Fiber / Scheduler / Channel / 同步原语）· 深入学习
+# 并发运行时（Fiber / Scheduler / Channel / 同步原语）· 逐层深入
 
-> 读法：先读第一部分建立全局图，再按需下钻第二部分。每个结论都给了 `文件:行`，
-> 行号以 2026-11-03 的工作树为准；代码会漂移，读到时先 `sed -n` 看一眼。
-> **数字纪律**：本文不引用任何历史文档的 ns/吞吐当结论。凡给性能，都是
-> 「2026-11-03 本机实测（12 vCPU WSL2，未绑核，3 轮）」，换环境必须重测。
-> 配套考试：`docs/exam/01-concurrency.md`。
+> 这份文档按**五层**组织，一层比一层靠近源码。不要跳层读：
+> 第 1 层回答「为什么要有它」，第 2 层回答「它长什么样、怎么动」，
+> 第 3 层回答「每一行在哪、失败会怎样」，第 4 层回答「真实场景怎么踩坑」，
+> 第 5 层回答「慢在哪、怎么调」。
+>
+> **行号纪律**：所有 `文件:行` 都以 2026-11-04 的工作树
+> （WSL `/UserData/CodexWorkSpace/Go2cpp`）为准，写作时逐条 `sed -n` / `grep -n`
+> 核对过；代码会漂移，读到时先看一眼再信。
+> **数字纪律**：第 5 层的每个数字都标了出处（`docs/reports/asm-*` 或
+> `docs/metrics-ledger.md`），没有出处的数字一律写「未实测」，不编。
+> 浅层「模块是什么」在 `user/docs/01-concurrency.md`；本文只讲
+> **为什么这么设计 / 改哪里 / 会踩什么坑**。
 
-## 代码地图
+## 五层导航
 
-| 层 | 文件 | 规模 | 职责 |
+| 层 | 主题 | 读完能回答 | 行数占比 |
 |---|---|---|---|
-| 门面 | `include/go2cpp/concurrency/scheduler.hpp` | 18 行 | 转发到 `scheduler/scheduler.hpp` |
-| 调度器 | `include/go2cpp/concurrency/scheduler/scheduler.hpp` | 1310 行 | G/M/P 状态、配置、Task、公开 API |
-| 调度器实现 | `src/concurrency/scheduler.cpp` | 6528 行 | 队列、park/wake、worker_loop、sysmon、shutdown |
-| Fiber | `include/go2cpp/concurrency/fiber.hpp` / `src/concurrency/fiber.cpp` | 552 / 4074 行 | 栈、上下文切换、FiberLocal、复用池 |
-| Channel | `include/go2cpp/concurrency/channel.hpp` / `src/concurrency/channel.cpp` | 4305 / 829 行 | hchan 缓冲、等待队列、Select |
-| 同步 | `src/concurrency/sync.cpp` + `rwmutex.hpp` 等 | 3068 行 | Mutex/RWMutex/Cond/WaitGroup/WaitNode |
-| 等待原语 | `include/go2cpp/concurrency/core/parking_condition.hpp` | 214 行 | Fiber/线程双路径等待、per-node futex |
-| Context/Future | `src/concurrency/context.cpp` / `future.hpp` | 2733 / 1237 行 | 取消传播、回滚、Promise/Future |
-| Timer | `src/concurrency/timer.cpp` / `core/timer.hpp` | 1343 / 505 行 | multimap + 单后台线程 |
+| 1 | What / Why | 它解决什么问题、边界在哪、和 Go 差在哪 | ~20% |
+| 2 | How | 数据结构字段级、关键函数逐步、对象图 | ~30% |
+| 3 | 源码细节 | 逐函数 `file:line`、状态机、锁/所有权、失败路径 | ~30% |
+| 4 | 实战与陷阱 | 三个真场景（含超时/取消/关闭）、默认行为、调试 | ~20% |
+| 5 | 性能与调优 | 已知瓶颈、实测数字、调参建议 | ~10% |
 
 ---
 
-## 第一部分 · 总：这个模块怎么跑起来
+# 第一层 · What / Why：这个模块到底在解决什么
 
-### 1.1 入口点清单
+## 1.1 一句话定位
 
-**调度器生命周期**
+把 Go 的「**G（任务）— M（线程）— P（处理器）**」调度模型、`chan`/`select`、
+`sync` 原语、`context` 取消树，在 C++17 上重做一遍：**让阻塞等待不占线程**，
+同时保留「可以随时换回原生 `std::thread`」的逃生门。
 
-| 入口 | 文件:行 | 谁调用 | 触发什么 | 返回 |
-|---|---|---|---|---|
-| `Scheduler(SchedulerConfig)` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:892` | 用户 / 默认调度器 | 归一化配置、创建 P 数组（`src/concurrency/scheduler.cpp:2103-2116`） | 对象 |
-| `Scheduler(processor_count)` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:893` | 用户 | 等价于只设 P 数 | 对象 |
-| `start()` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:899`，实现 `src/concurrency/scheduler.cpp:3282` | 用户 / `spawn` 前 | 拉起 `min_workers` 个基础 M + sysmon | void |
-| `run_main(fn)` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:925`，实现 `src/concurrency/scheduler.cpp:3317` | 想要 Go `main` 语义的用户 | 当前线程当 m0，main G 绑定到本 M | bool |
-| `shutdown_for(d)` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:931`，实现 `src/concurrency/scheduler.cpp:3402` | 所有者线程 | 关 admission → drain → 等终态 → 停 sysmon → join | bool（超时/worker 内调用为 false） |
-| `shutdown()` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:926`，实现 `src/concurrency/scheduler.cpp:3616` | 所有者线程 | `shutdown_for(duration::max())` | void |
+它不是「协程库」，也不是「线程池」。区别在于三条硬约束：
 
-**任务提交与等待**
+1. **一个 G 的挂起必须能跨线程恢复**——所以栈不能是线程栈；
+2. **挂起/唤醒必须是无锁快路径**——所以状态和唤醒令牌打包进同一个字；
+3. **所有等待必须有超时/取消入口**——否则 C++ 里没有 `select` 兜底，一挂就死。
 
-| 入口 | 文件:行 | 谁调用 | 触发什么 | 返回 |
-|---|---|---|---|---|
-| `spawn(fn)` / `spawn(fn, opts)` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:981-982`，实现 `src/concurrency/scheduler.cpp:3750` | 用户 / `go()` | 构造 Task（首次执行才建栈）、入队 | `shared_ptr<Task>` |
-| `go(fn)` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:1001` | 用户 | `spawn` 别名 | 同上 |
-| `park_wait(task)` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:1026`，实现 `src/concurrency/scheduler.cpp:4426` | 同步原语（Mutex/CV/WaitGroup） | 把当前 G 置 Waiting 并切走 | bool（被唤醒/取消） |
-| `yield_current()` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:1033`，实现 `src/concurrency/scheduler.cpp:4384` | 用户 / 调度器 | 当前 G 回本 P 环尾 | bool |
-| `park_current()` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:1034`，实现 `src/concurrency/scheduler.cpp:4569` | 用户 | 当前 G park | bool |
-| `wake(task)` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:1038`，实现 `src/concurrency/scheduler.cpp:4573` | 任意线程 | Waiting→Runnable 并入队 | bool |
-| `wake_io(task)` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:1043` | IO 轮询器 | 只发布状态/token，不碰 Fiber 栈 | bool |
-| `cancel(task)` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:1055` | 任意线程 | 协作取消 + 唤醒 | bool |
-| `current_task()` / `current_scheduler()` | `include/go2cpp/concurrency/scheduler/scheduler.hpp:1181` / `:1186` | 任意代码 | 读 TLS 的当前 G / 调度器 | 指针 |
+## 1.2 问题域：从 Go 迁移到 C++ 时，到底缺什么
 
-**Fiber**
-
-| 入口 | 文件:行 | 谁调用 | 触发什么 | 返回 |
-|---|---|---|---|---|
-| `Fiber(fn, stack_size=128 KiB, reserve=0, growable=true)` | `include/go2cpp/concurrency/fiber.hpp:303-306` | 手动 Fiber 用户 | 建栈（growable 时 mmap + 顶部提交） | 对象 |
-| `resume()` | `include/go2cpp/concurrency/fiber.hpp:347`，实现 `src/concurrency/fiber.cpp:2601` | 任意线程（同一时刻一个） | 换栈进入/恢复 | bool（claim 失败为 false） |
-| `Suspend(reason)` | `include/go2cpp/concurrency/fiber.hpp:360`，实现 `src/concurrency/fiber.cpp:2629` | Fiber 内部 | 切回 resume 者 | bool |
-| `Current()` | `include/go2cpp/concurrency/fiber.hpp:368` | 任意代码 | 当前线程正在跑的 Fiber | 指针 |
-| `LockToCurrentM()` | `include/go2cpp/concurrency/fiber.hpp:418`，实现 `src/concurrency/scheduler.cpp:1005` | 需要线程亲和的 G | 把 G 绑定到当前 M | M id（0=失败） |
-| `DefaultStackSize()` / `DefaultStackReserveSize()` | `include/go2cpp/concurrency/fiber.hpp:284` / `:291` | 构造函数默认值 | 128 KiB / 8 MiB | size_t |
-
-**Channel / Select**
-
-| 入口 | 文件:行 | 谁调用 | 触发什么 | 返回 |
-|---|---|---|---|---|
-| `MakeChannel<T>(cap=0)` | `include/go2cpp/concurrency/channel.hpp:3569` | 用户 | 建 Channel；cap=0 不分配缓冲 | `ChannelPtr<T>` |
-| `Send(v)` / `SendFor` | `include/go2cpp/concurrency/channel.hpp:1548`（落点 `SendUntil` `:2740`） | 用户 | 直交等待接收者 → 入缓冲 → 否则登记 PendingSend 并 park | `ChannelSendResult` |
-| `Recv()` / `RecvFor` | `include/go2cpp/concurrency/channel.hpp:1618`（落点 `RecvUntil` `:3114`） | 用户 | 直交 / 取缓冲 / 否则登记 PendingRecv 并 park | `ChannelRecvResult<T>` |
-| `TrySend` / `TryRecv` | `include/go2cpp/concurrency/channel.hpp:1591` / `:1656` | 用户 | 非阻塞版本；失败返回 `kWouldBlock` | 同上 |
-| `Close()` | `include/go2cpp/concurrency/channel.hpp:1685` | 用户 | 置 closed、唤醒全部等待者、缓冲值仍可读完 | `ChannelSendResult` |
-| `Select(cases, ctx, timeout)` | `include/go2cpp/concurrency/channel.hpp:4295` | 用户 | 探测 → arm（全序锁）→ park → 单赢家提交 | `SelectResult` |
-| `RecvCase` / `SendCase` / `DefaultCase` / `DoneCase` / `AfterCase` | `include/go2cpp/concurrency/channel.hpp:3850` / `:3932` / `:4038` / `:4171` / `:4246` | 用户 | 构造 SelectCase（`probe` 闭包） | `SelectCase` |
-
-**同步原语 / Context / Future / Timer**
-
-| 入口 | 文件:行 | 谁调用 | 触发什么 | 返回 |
-|---|---|---|---|---|
-| `Mutex::Lock` / `TryLock` / `Unlock` | `src/concurrency/sync.cpp:1572` / `:1928` / `:1994`（UnlockSlow） | 用户 / 上层原语 | 混合锁：CAS → 自旋 → FIFO 队列 park | bool / void |
-| `ConditionVariable::Wait` / `NotifyOne` | `src/concurrency/sync.cpp:2327` / `:2619` | 用户 / RWMutex | 入队、解锁、park、重锁（D3 失败抛异常） | bool |
-| `WaitGroup::Add` / `Done` / `Wait` | `src/concurrency/sync.cpp:2844` / `:2897` / `:2931` | 用户 | 计数 + 归零唤醒 | void / bool |
-| `RWMutex::RLock` / `Lock` | `include/go2cpp/concurrency/rwmutex.hpp:147` / `:206` | 用户 | 写者优先的门 + 读者计数 | bool / void |
-| `Context::Background` / `WithCancel` / `WithTimeout` | `include/go2cpp/concurrency/context.hpp:225` / `:230` / `:238` | 用户 | 建上下文树 | `ContextPtr` |
-| `Context::Cancel` / `IsDone` / `Err` | `include/go2cpp/concurrency/context.hpp:303` / `:263` / `:266` | 用户 / 内部 | 取消整棵子树 | void / bool / `ErrorPtr` |
-| `MakePromise<T>()` | `include/go2cpp/concurrency/future.hpp:1232` | 用户 | 建 Promise/Future 对 | pair |
-| `Future::GetResult` / `GetResultFor` | `include/go2cpp/concurrency/future.hpp:1077` / `:1083` | 用户 | 等待完成（可带 Context/超时） | `FutureResult<T>` |
-| `TimerService::Default()` | `include/go2cpp/concurrency/core/timer.hpp:379` | 任意代码 | 进程级单例（单后台线程） | `TimerService&` |
-| `ScheduleAfter` / `ScheduleEvery` | `include/go2cpp/concurrency/core/timer.hpp:396` / `:406` | 用户 | 插入 multimap，到期回调 | `Timer` 句柄 |
-| `SpinMutex::Lock` / `TryLock` / `Unlock` | `include/go2cpp/concurrency/spin_mutex.hpp:223` / `:237` / `:261` | 极短临界区 | CAS → 64 次 PAUSE → 门 | void / bool |
-
-**默认值与编译开关**（`include/go2cpp/concurrency/scheduler/scheduler.hpp:240-308`）
-
-| 配置 | 默认 | 说明 |
-|---|---|---|
-| `processor_count` | 0 → 硬件并发 | P 数 = 并行度 |
-| `min_workers` / `max_workers` | 0 → P / 0 → 2P | 基础 M 常驻；补充 M 阻塞补位 |
-| `local_queue_limit` | 256 | 只约束 admission 入队，不约束 incoming 条带 |
-| `fiber_stack_size` / `reserve` | 2048 / 8 MiB | 页对齐后初始 4096；reserve 是 PROT_NONE VA |
-| `fiber_stack_growable` | true | false/非 Linux/非原生后端 → 固定栈，不装 SIGSEGV handler |
-| `task_affinity_budget` | 4 | 软亲和扫描预算 |
-| `wake_policy` | `kRunNext` | `kLastMachine` / `kRunNext` / `kRoundRobin` |
-| `collect_metrics` | **false** | 打开后每任务多两次取钟 + 跨核 RMW |
-| `allow_idle_shrink` | false | true 才恢复空闲缩容 |
-| `enable_sysmon` / 周期 / 阈值 | true / 10 ms / 50 ms | 只观察已声明的阻塞 |
-
-编译开关：`GO2CPP_GROWABLE_STACK=0` 禁用栈增长；`GO2CPP_DEBUG_LOCKS` 强制 SpinMutex 的 debug 契约；`GO2CPP_COUNT_GLOBAL_LOCK` 统计 admission 锁；`GO2CPP_DEBUG_RESOURCES` 注册调试资源；`GO2CPP_FIBER_GROWABLE_STACK` 控制 handler 编译。
-
-### 1.2 总架构图
-
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ 用户代码：go(fn) / ch->Send(v) / mu.Lock() / ctx->Cancel() / future.Get()    │
-└───────────────────────────────┬──────────────────────────────────────────────┘
-                                │ 公开 API（§1.1）
-┌───────────────────────────────▼──────────────────────────────────────────────┐
-│ 门面层                                                                        │
-│  Scheduler ── Task(G) ── Fiber        Channel<T> ── SelectCase                │
-│  sync::Mutex/RWMutex/Cond/WG          Context/Future        Timer             │
-└───────┬───────────────────────┬───────────────────────┬──────────────────────┘
-        │ 调度                    │ 数据面                 │ 等待/超时
-┌───────▼───────────────────────▼───────────────────────▼──────────────────────┐
-│ 核心层（本模块）                                                               │
-│  ┌──────────── Scheduler::Impl ────────────┐  ┌──── 等待原语 ────┐            │
-│  │ P[0..N-1]：本地 256 槽环 + runnext 单槽  │  │ ParkingCondition │            │
-│  │ incoming[16] 条带（外部生产者）          │  │  └ WaitNode      │            │
-│  │ global_queue + emergency 链              │  │     ├ per-node  │            │
-│  │ registry[16] 条带（强持有非终态 G）      │  │     │   futex    │            │
-│  │ M[]：基础 M（常驻）/ 补充 M（阻塞补位）  │  │     └ 队列锁     │            │
-│  │ sysmon 线程（10ms 扫描，只 detach）      │  └──────────────────┘            │
-│  └─────────────────────────────────────────┘                                 │
-│  Fiber：mmap 8MiB VA + 顶部 4KiB 提交 + SIGSEGV 增长 + TLS FiberBin(128)      │
-│  Channel：RingBuffer(head/tail/count) + 自旋锁 + 侵入式 sendq/recvq            │
-└───────┬───────────────────────┬───────────────────────┬──────────────────────┘
-        │ 线程边界               │ 系统调用               │ 信号
-┌───────▼───────────────────────▼───────────────────────▼──────────────────────┐
-│ 运行时/内核                                                                    │
-│  std::thread（M）  futex（WaitNode/FutexMutex）  epoll（idle poller）          │
-│  mmap/mprotect（Fiber 栈）  SIGSEGV handler（栈增长）  clock_gettime           │
-└──────────────────────────────────────────────────────────────────────────────┘
-
-跨层数据流（一次 park→wake）：
-  G 在 M 上执行
-    → 调用 Channel/Send 等：登记等待节点            （include/go2cpp/concurrency/channel.hpp:2740 起）
-    → Task::park_for_scheduler：状态字 CAS 成 Waiting（src/concurrency/scheduler.cpp:1424）
-    → Fiber::SuspendForScheduler：换栈回 worker      （src/concurrency/fiber.cpp:2629）
-  worker 继续取下一个 G（src/concurrency/scheduler.cpp:5548 循环）
-    → 唤醒方（另一 G/线程）：signal CAS + 锁外 notify（include/go2cpp/concurrency/channel.hpp:2757 起）
-    → Task::wake_for_wait_impl：Waiting→Runnable     （src/concurrency/scheduler.cpp:1353）
-    → 入目标 P 的 runnext 或本地环                   （src/concurrency/scheduler.cpp:4186 起）
-    → 某个 M 取到、claim、Task::run → Fiber::resume  （src/concurrency/scheduler.cpp:6045）
-    → 回到 park 点继续执行
-```
-
-**三个边界要记牢**：
-
-1. **Fiber 栈边界**：G 挂起时栈还在；`resume` 只换 rsp，不拷贝栈（`src/concurrency/fiber.cpp:885-893`）。
-2. **M 线程边界**：G 可以在任意 M 上恢复；TLS（`t_scheduler/t_machine_id/t_processor_id/t_task`）在 worker_loop 入口设置（`src/concurrency/scheduler.cpp:5466-5471`）。
-3. **内核边界**：只有普通线程/`*_f` 会真阻塞；受管 G 的等待走 park，不占 M（`include/go2cpp/concurrency/core/parking_condition.hpp:14-22`）。
-
-### 1.3 复杂场景 ≥10 步详解
-
-#### 场景 A：一次任务提交 → 执行 → park → wake → 完成（14 步）
-
-1. **用户调用** `go(fn)` → `Scheduler::spawn`（`include/go2cpp/concurrency/scheduler/scheduler.hpp:981`，实现 `src/concurrency/scheduler.cpp:3750`）。此时只构造 Task，**不建栈**（`src/concurrency/scheduler.cpp:1741-1745` 才建）。
-2. **入队**：`spawn` 末尾 `enqueue(task)`（`src/concurrency/scheduler.cpp:3768`）；失败则 `task->cancel()`，返回一个终态句柄，而不是永不运行的句柄。
-3. **外部生产者路径**：`enqueue`（`src/concurrency/scheduler.cpp:3800`）按 16 条带选一条 incoming 队列；条带锁是叶子锁，持锁期间**禁止**再调 `enqueue`（`src/concurrency/scheduler.cpp:1970-1977`）。
-4. **worker 取任务**：`worker_loop`（`src/concurrency/scheduler.cpp:5461`）每轮按 step0 inbox → runnext（`:5558-5577`）→ step2 本地环（`:5602-5637`）→ step3 incoming（`:5641-5763`）→ step4 admission（`:5767-5838`）找活。
-5. **认领**：`claim_from_queue`（`src/concurrency/scheduler.cpp:1489`）用一次 CAS 把 Runnable→Running，同时清 `m_queued`、置 `m_execution_claim`。
-6. **执行**：`t_task->run()`（`src/concurrency/scheduler.cpp:6045`）→ `Task::run`（`:1712`）→ 首次创建/复用 Fiber（`:1745-1759`）→ `Fiber::resume`。
-7. **用户函数运行**：G 在 M 上跑；若调用 `ch->Send` 且无接收者，进入 `Channel::SendUntil`（`include/go2cpp/concurrency/channel.hpp:2740`），登记 `PendingSend`（`:2312`）并 park。
-8. **park 提交**：`Task::park_for_scheduler`（`src/concurrency/scheduler.cpp:1424`）先做契约检查（SpinMutex 临界区禁止、持普通 Mutex 告警，`:1429-1437`），再把状态字 CAS 成 Waiting；`Fiber::SuspendForScheduler`（`src/concurrency/fiber.cpp:2629`）切回 worker。
-9. **worker 记账**：`run()` 返回后处理状态（`src/concurrency/scheduler.cpp:6046-6076`），把 G 的 `kWaiting` 记成 `kTaskSuspended` 事件；worker 继续下一轮。
-10. **接收者出现**：另一个 G 调 `Recv`，在 Channel 锁内摘 `sendq` 队首，写入值并 CAS `signal`（`include/go2cpp/concurrency/channel.hpp:2757-2769`），锁外 `NotifyChange`（`:2727-2738`）。
-11. **唤醒**：`wake_for_wait_impl`（`src/concurrency/scheduler.cpp:1353`）把 Waiting→Runnable；执行权仍被占时只置 `deferred_enqueue`（`:1366-1369`），等 `run()` 退出后再发布。
-12. **重新入队**：目标 P 有运行中的 M 就投 runnext（`src/concurrency/scheduler.cpp:4186-4198`），否则投本地环（任意 M 可窃取）；`publish_runnext` 被挤出者落回环尾（`:4005-4035`）。
-13. **再次执行**：另一个（或同一个）M 取到、claim、`Task::run` → `Fiber::resume` 回到第 8 步的 park 点；`SendUntil` 的等待循环重检 `accepted`（`include/go2cpp/concurrency/channel.hpp:3030` 起）。
-14. **完成**：用户函数返回 → Fiber trampoline 回收 → `Task::run` 进入终态（`src/concurrency/scheduler.cpp:1921-1944`）→ `notify_terminal` + `Fiber::RecycleForScheduler`；注册表按节拍回收（`:6187-6200`）。
-
-失败/阻塞分支：
-- 第 3 步入队失败 → 第 2 步已 `cancel()`，句柄终态 `kCancelled`；
-- 第 5 步 claim 失败 → `recover_unclaimed`（`src/concurrency/scheduler.cpp:5507-5522`）判定是否需要补发布；
-- 第 8 步 Fiber 拒绝挂起 → `resume_after_failed_park`（`:1618` 附近）回滚为 Running，调用方重试或返回；
-- 第 14 步 `run()` 返回后仍是 Running → `recover_orphan_running`（`src/concurrency/scheduler.cpp:6153`）自愈重发布。
-
-#### 场景 B：无缓冲 Channel 的 Send/Recv + 超时 + 取消（15 步）
-
-1. **接收者先到**：G2 调 `Recv`（`include/go2cpp/concurrency/channel.hpp:1618`）→ `RecvUntil`（`:3114`）；无值、无发送者 → 创建 `PendingRecv`（`:2340`）挂到 `m_receivers`。
-2. **接收者 park**：`ParkingCondition::wait` 或 Scheduler `park_wait`（`src/concurrency/scheduler.cpp:4426`）→ `park_for_scheduler`（`:1424`）→ 状态 Waiting。
-3. **发送者到达**：G1 调 `Send`（`include/go2cpp/concurrency/channel.hpp:1548`）→ `SendUntil`（`:2740`）；锁内看到 `m_receivers` 非空。
-4. **直交**：摘队首、跳过已取消节点（`:2759-2769`），把值 `emplace` 进节点，CAS `signal` 0→kReady；值只在交接成功后移动（`:2729-2730`）。
-5. **锁外通知**：释放 Channel 锁后再 `NotifyChange`/唤醒，避免锁序反转（`:2716`、`:2727-2728`）。
-6. **接收者被唤醒**：等待循环重检 `signal`，读到 kReady，取走值并返回 `kReady`。
-7. **超时路径**：若 G2 用 `RecvFor(1ms)`，`RecvUntil` 带 deadline（`include/go2cpp/concurrency/channel.hpp:3114`）；到期后 `TryFinish(kTimedOut)`，等待循环返回 `kTimedOut` 并摘除节点。
-8. **取消路径**：Context 取消回调只持 `weak_ptr<CancelHub>` + token，在 hub/Channel 锁内按 token 定位节点、CAS signal 后唤醒（`include/go2cpp/concurrency/channel.hpp:778-782`）；回调从不直接解引用队列外节点。
-9. **Close 并发**：G3 `Close`（`include/go2cpp/concurrency/channel.hpp:1685`）先置 `m_closed`，再逐个唤醒等待者；对接收者**先交付缓冲值**，缓冲空才给 `kClosed`（`:1725-1785`）。
-10. **发送者遇到关闭**：`SendUntil` 在 step2 看到 `m_closed` 直接返回 `kClosed`（`:2753-2755`）；重复 `Close` 返回 `kAlreadyClosed`（`:1689-1691`）。
-11. **僵尸节点清理**：取消/超时节点不从队列中间摘；交接方 `pop_front` 时跳过并回收（`:2759-2769`）。
-12. **Select 变体**：如果 G2 用 `Select`，先按随机起点探测（`src/concurrency/channel.cpp:446-501`）：`kReady` 立即返回，closed/nil 暂存；没有 ready 才 arm。
-13. **arm**：按 `SelectLockKey`（对象地址）全序一次性持有整组 Channel 锁（`include/go2cpp/concurrency/channel.hpp:1894-1896`、`:3746`），锁内重新验证并登记等待节点。
-14. **单赢家**：`SelectWaitState` 的 `TrySelect/TrySelectPair`（`include/go2cpp/concurrency/channel.hpp:651` 起）保证取消/超时/交接只有一个能提交结果。
-15. **关闭后的排空**：接收者循环 `Recv` 直到 `kClosed`；缓冲值先读完（`:53-54`、`:1725-1785`），不会因为 closed 丢掉已入队的值。
-
-失败/阻塞分支：
-- 第 4 步值构造抛异常 → 保留接收/发送节点，后续可重试（`include/go2cpp/concurrency/channel.hpp:2729-2730`）；
-- 第 6 步等待者被错误唤醒 → `signal` 已是终态，循环重检后返回，不会重复提交；
-- 第 9 步关闭与发送并发 → 发送方在锁内看到 closed，返回 `kClosed`，不会写入已关闭通道。
-
-#### 场景 C：`shutdown()`（12 步）
-
-1. **入口**：`shutdown()`（`src/concurrency/scheduler.cpp:3616`）→ `shutdown_for(max)`（`:3402`）；worker 自己调用时只发布请求，不 join 自己（`:3421-3430`）。
-2. **关 admission**：持 `Impl::mutex`，`set_accepting(false)`、`set_draining(true)`（`:3440-3449`）。
-3. **排空 P**：`begin_shutdown_locked`（`:2753`）对每个 P：取 runnext（`:2764`）+ 逐个 `queue.pop()`（`:2767`）。
-4. **区分已启动/未启动**：`started()` 的 G 只 `request_cancel` 并放回可运行（`:2768-2770`）；未启动的 G 原地取消、清队列、进延迟析构（`:2771-2776`）。
-5. **排空 global/inbox/incoming**：global（`:2789-2803`）、每台 M 的 inbox（`:2807-2825`）、16 条 incoming 条带（`:2830-2858`）按同样规则处理。
-6. **唤醒 parked G**：扫注册表 16 条带（`:2870-2897`），对非终态 G `request_cancel`；已启动的用 `wake_for_scheduler` 放回可运行。
-7. **等终态**：`shutdown_for` 用 `live_tasks_total()==0` 的 O(1) 谓词等待（`:3503-3513`）；有界超时返回 false，保持 draining 以便下次继续（`:3515-3527`）。
-8. **停 sysmon**：终态归零后 `set_stopping(true)`、`stop_sysmon(true)`（`:3529-3532`）；draining 期间 sysmon 仍在跑，保证长 syscall 返回前替代 M 不丢。
-9. **等 worker 退出**：有界路径先等 `active_workers==0`（`:3538-3555`）；无界路径直接进入 join。
-10. **join**：持 `Impl::mutex` 逐个摘出 `std::thread`，释放锁后 `join`（`:3564-3582`）；worker 尾声会先拿 `Impl::mutex`，所以必须先放锁。
-11. **收尾**：把 P 置 Dead、确认没有 joinable 线程、清 `started`（`:3584-3601`）。
-12. **锁外析构**：`deferred_destruction` 里的用户捕获在锁外释放（`:3606-3613`），避免在调度器锁内跑任意 C++ 析构。
-
-失败/阻塞分支：
-- 有界 timeout：返回 false，draining 保持、取消请求保持，后续 `shutdown()` 可继续；
-- 未启动调度器：走 `!was_started` 分支（`:3463-3486`），直接停 sysmon、置 Dead，不 join；
-- 长 syscall 的 M：draining 期间 sysmon 仍可能 detach 并补 M，所以不能提前停 sysmon。
-
-### 1.4 关键不变量（破了就一定出 bug）
-
-| # | 不变量 | 依据 | 破了会怎样 |
+| Go 里免费得到的东西 | C++ 里默认没有 | 本模块的对应物 | 不做的后果 |
 |---|---|---|---|
-| I1 | 一个 G 同时最多一个执行者：`execution_claim` 与 `run_claim` 必须在同一临界区一起翻转 | `src/concurrency/scheduler.cpp:1913-1919`、`:1712-1731` | 两个 M 同时进同一个栈 → 栈被踩烂；或 G 永久 `kRunning`，shutdown 永不返回 |
-| I2 | 一个可运行 G 最多一个队列节点：`m_queued` 是入队权 | `src/concurrency/scheduler.cpp:1489-1513`、`:5507-5522` | 重复入队 → 同一 G 被两个 M 取到；丢节点 → 「Runnable 但无人调度」的丢唤醒 |
-| I3 | G 状态与唤醒令牌在同一个 32 位字里（低 8 位状态、bit8 令牌） | `src/concurrency/scheduler.cpp:1424-1468`、`:1353-1387` | 拆成两个原子会留下「令牌已发布、挂起已提交、却没人消费」的窗口 |
-| I4 | 注册表强持有所有非终态 G（含已 park、不在任何队列里的） | `src/concurrency/scheduler.cpp:1956`、`:2708-2719` | 挂起栈被提前析构 → resume 时踩已释放内存 |
-| I5 | `incoming` 里的 G 一定没有 P（`processor == kInvalidPId`） | `src/concurrency/scheduler.cpp:1984` | 跨 P 误认领 → 同一 G 被两个 P 的 worker 抢 |
-| I6 | 锁层次严格为 admission → 条带 → P → Task；incoming 条带锁是叶子锁 | `src/concurrency/scheduler.cpp:1960-1977` | 反向嵌套 → ABBA 死锁（SCHED-01/02 的真实来源） |
-| I7 | Channel 等待节点由等待者栈帧持有，队列只持裸指针；取消回调不解引用队列外节点 | `include/go2cpp/concurrency/channel.hpp:768-782` | UAF；或取消路径把节点删了、交接方还在用 |
-| I8 | WaitNode 内部锁必须无 owner、可跨线程解锁、且临界区禁 park | `src/concurrency/sync.cpp:309-320`、`docs/audit/waitnode-lock-design.md` | 用 `std::mutex` 跨线程解锁是 UB；持锁 park 会自死锁 |
-| I9 | shutdown 期间已启动 G 必须保持可运行，不能强制释放其栈 | `src/concurrency/scheduler.cpp:2756-2759`、`:3503-3513` | 跳过栈上 RAII、泄漏锁；或 Fiber 永远不返回 |
-| I10 | Timer 回调里不能销毁 `TimerService` | `src/concurrency/timer.cpp:276-278` | 后台线程 join 自身 → `std::terminate()` |
+| `go f()` 廉价创建任务 | `std::thread` 每线程 ~8 MiB 栈 + 内核调度 | `Scheduler::spawn` + 128 KiB 可增长 Fiber 栈 | 1 万并发要 80 GiB 虚拟地址 |
+| 阻塞调用自动让出 P | 阻塞 = 占死一个 OS 线程 | `park_for_scheduler` + `ParkingCondition` | 线程数 = 并发数，2k 就崩 |
+| `chan T` 的直交语义 | 无 | `Channel<T>` + `PendingSend/Recv` | 手写条件变量，丢唤醒/丢值 |
+| `select` 多路等待 | 无 | `Select` + `SelectWaitState` 单赢家 | 多通道等待只能轮询 |
+| `context` 取消传播 | 无 | `Context` 取消树 + `DrainCancellation` | 超时后后台任务继续跑 |
+| `sync.Mutex` 的 FIFO + 饥饿保护 | `std::mutex` 无公平性保证 | `sync::Mutex`（正常/饥饿双模式） | 尾延迟尖刺、写者饿死 |
+| `time.After` 廉价定时器 | 每个定时器一个线程/轮询 | `TimerService` 单线程 + `multimap` | 定时器数量一多就炸 |
+
+**关键取舍**：Go 的运行时改不了，C++ 的运行时可以「按需启用」。所以本模块
+把很多东西做成**可选**（`collect_metrics`、`enable_sysmon`、`wake_policy`、
+`fiber_stack_growable`），默认值偏向「像 Go」，但每一个都能关掉换确定性。
+
+## 1.3 边界：明确不做什么
+
+| 不做 | 原因 | 替代方案 |
+|---|---|---|
+| 异步抢占（信号强制切 G） | C++ 栈上对象没有 GC 安全点，强切会撕裂 RAII | 只在 park/yield 点协作让出；CPU 密集任务自己 `yield_current()` |
+| 手动 Fiber 上的 `Select`/`Channel` park | 手动 Fiber 没有「回到调度器」的路径 | 返回 `kInvalid`，或改用受管 `spawn` |
+| `Channel` 的 `range` 语法糖 | C++ 没有语言级 range-over-channel | 循环 `Recv()` 直到 `kClosed` |
+| nil channel 的永久阻塞 | 与「所有等待可取消」冲突 | 返回 `kNil`，让调用方显式处理 |
+| G 的栈收缩 | 收缩要搬栈 + 修指针，C++ 没有精确栈图 | 只增长不收缩，靠 FiberBin 复用 |
+| 跨进程/分布式调度 | 不是本模块范围 | 见 `docs/reports/asm-distributed.md` |
+
+**边界的实际含义**：如果一个任务在用户代码里写了 `while(true) { compute(); }`
+且不调用任何 park/yield，它会**独占一个 M 直到结束**。sysmon 只能观察
+「已声明的阻塞」（`blocking_since_ns`），不能抢占纯计算。
+
+## 1.4 与 Go 的对照：语义差异表
+
+这张表是本文最重要的一张——**迁移代码时踩的坑，90% 在这里**。
+
+| 维度 | Go | 本模块 | 差异的后果 |
+|---|---|---|---|
+| 默认 P 数 | `GOMAXPROCS`（默认核数） | `processor_count=0 → 硬件并发` | 一致；但可用 `SchedulerConfig` 固定 |
+| 任务创建 | `go f()`，栈 2 KiB 起按需增长 | `spawn(fn)`，默认 2 KiB 提交、8 MiB 预留 VA | 10 万 G ≈ 819 GB VA，会被 `max_map_count` 卡住 |
+| 栈增长 | 复制栈 + 修指针 | `mprotect` 提交新页，**不搬栈** | 栈地址稳定（好事），但不能收缩（坏事） |
+| 抢占 | 异步抢占（1.14+ 基于信号） | 只有协作点 | 纯计算任务会拖住 M |
+| `chan` 关闭后读 | 返回零值 + `ok=false` | 返回 `kClosed` + 空 optional | 语义等价，但**必须检查状态码** |
+| `chan` 关闭后写 | panic | 返回 `kClosed`，不抛 | 更安全，但错误可能被忽略 |
+| nil channel | 永久阻塞 | 返回 `kNil` | 依赖「阻塞」做设计的代码会空转 |
+| `select` 多路就绪 | 均匀随机选一个 | 线程本地随机起点轮转 + 有值优先 | 有值优先是**故意**的（修 D1 丢值） |
+| `sync.Mutex` | 正常/饥饿双模式，1 ms 阈值 | 同左，阈值也是 1 ms | 基本一致 |
+| `sync.RWMutex` | 写者优先 | 写者优先 | 一致 |
+| `context` 取消 | 先标记、再通知，回调异步 | 先标记整棵子树、再逆序回调 | 回调**同步**执行，禁止阻塞 |
+| 定时器 | 每 P 一个四叉堆 | 全进程一个后台线程 + `multimap` | 单线程串行，慢回调拖全局 |
+| 错误处理 | `panic`/`error` | `ErrorPtr` + 状态码，不抛 | 需要显式检查每个返回值 |
+
+## 1.5 一条设计主线：把「等待」从线程里拿出去
+
+整个模块可以浓缩成一句话：**等待状态是 G 的属性，不是线程的属性。**
+
+```
+传统线程模型：            本模块：
+  线程阻塞在 recv           G 调 recv → 无数据
+  ├─ 内核挂起线程           ├─ 登记 PendingRecv 到 Channel 队列
+  ├─ 线程栈保留             ├─ G 状态字 CAS 成 Waiting
+  └─ 1 个线程 = 1 个等待    ├─ Fiber 换栈回 worker（栈保留，线程继续跑）
+                            └─ 唤醒方把 G 放回队列，任意 M 可恢复
+```
+
+代价是三个必须自己解决的问题，这也正是模块最复杂的三个地方：
+
+1. **栈要能离开线程**：Fiber 栈 mmap + 上下文切换（第 2.1 节）；
+2. **状态转移要原子且不留窗口**：状态 + 唤醒令牌打包成一个 32 位字（第 2.4 节）；
+3. **唤醒必须能找到「谁在等」**：Channel/WaitNode/注册表三套索引（第 2.7、3.4 节）。
+
+## 1.6 术语表（后文只用这些词）
+
+| 词 | 含义 | 源码里的名字 |
+|---|---|---|
+| G / Task | 可调度任务，拥有独立栈 | `Task`（`scheduler.cpp:1717` 的 `run()`） |
+| M / Machine | OS 线程 | `Machine`（`scheduler.cpp:2042` 附近） |
+| P / Processor | 逻辑处理器，持有本地队列 | `Processor`（`scheduler.cpp:2017` 附近） |
+| park | G 主动挂起，让出 M | `Task::park_for_scheduler`（`scheduler.cpp:1429`） |
+| wake | 把 Waiting 的 G 改成 Runnable 并入队 | `Task::wake_for_wait_impl`（`scheduler.cpp:1358`） |
+| 令牌（token） | 状态字里的 bit8，表示「已有人在等你醒」 | `kWakePendingBit` |
+| 条带（stripe） | 按对象地址/ID 分片，降低锁竞争 | `incoming[16]`、`registry[16]` |
+| claim | 抢占执行权/队列节点所有权 | `claim_from_queue`（`scheduler.cpp:1494`） |
+
+## 1.7 第一层小结 & 下一层看什么
+
+**小结**：这是一个「按需复刻 Go 运行时」的库。它的价值不在 API 长得像 Go，
+而在**把阻塞从线程里解耦**；它的复杂度也不在调度算法，而在
+「原子状态 + 栈所有权 + 可取消等待」三件事的交界处。
+
+**下一层看什么**：先看 Task/P/M 三个结构体的字段（谁保护谁、哪些是原子），
+再看 `spawn → enqueue → worker_loop → claim → run → park → wake` 这条主链，
+最后看 Channel 的直交/缓冲/等待三条分支——这三段读懂了，第三层才有意义。
 
 ---
 
-## 第二部分 · 分：逐块细讲
+# 第二层 · How：结构与方法
 
-### 2.1 Fiber
-
-**职责**：G 的执行载体。提供独立栈、可挂起/恢复的上下文、Fiber 局部存储、以及按 M 复用的 FiberBin。
-
-**关键数据结构**
-
-| 结构 | 字段 | 行号 | 说明 |
-|---|---|---|---|
-| `Fiber::Impl` | `m_switch` | `src/concurrency/fiber.cpp:2442` | 打包状态 + claim 位 + 传播位，独占缓存行 |
-| | `m_context` / `m_caller` | `src/concurrency/fiber.cpp:2449-2451` | 目标栈上下文 / 切回点 |
-| | `m_stack` / `m_stack_size` / `m_stack_growable` | `src/concurrency/fiber.cpp:2478-2481` | 独立栈；规范化后的初始提交量；是否真增长 |
-| | `m_record` | `src/concurrency/fiber.cpp:2469` | 与观察者共享的元数据（父链/时间戳） |
-| `FiberStack` | `m_initial_usable` / `m_reserve` / `m_committed` | `src/concurrency/fiber.cpp:914-935` | 顶部已提交窗口；8 MiB 预留；committed 向下移动 |
-| `FiberBin` | `kSlots=128`，默认 32 / 调度器 128 / 上限 4096 | `src/concurrency/fiber.cpp:282`、`include/go2cpp/concurrency/fiber.hpp:317` | 每 M 复用终态 Fiber；复用时 `use_count()!=1` 就丢弃（`src/concurrency/fiber.cpp:2559`） |
-
-**`resume()` 逐步拆**
-
-1. 读 `m_switch`，检查是否已有执行者（claim 位）；有则返回 false（`src/concurrency/fiber.cpp:1952-1965`）。
-2. 首次 resume：`initialize_context` 绑定栈入口与父链；之后只更新 caller（`src/concurrency/fiber.cpp:2088-2103`）。
-3. `switch_to_fiber`（`src/concurrency/fiber.cpp:2214-2260`）：保存 6 个 callee-saved + 返回地址、换 rsp、跳转（汇编在 `src/concurrency/context_x64.S:54-73`）。
-4. Fiber 端 `entry`（`src/concurrency/fiber.cpp:1907-1944`）：执行用户函数；异常写入 `m_failure`；结束发布 Completed/Failed。
-5. `Suspend`（`src/concurrency/fiber.cpp:2629`）切回 caller；`resume` 返回后释放 claim 位（`src/concurrency/fiber.cpp:2159-2167`）。
-
-**状态机**（`include/go2cpp/concurrency/fiber.hpp:164-170`）：`Ready → Running → Suspended → Running → Completed/Failed`。`Suspended` 只在挂起期间可见；`Completed/Failed` 才允许进 FiberBin。
-
-**失败路径与限制**
-
-- 并发 `resume` 的第二个调用直接返回 false，不会破坏栈（`src/concurrency/fiber.cpp:1961-1965`）；
-- 跨线程恢复会更新 `m_last_resume_thread_hash` 并触发诊断（`src/concurrency/fiber.cpp:2236`），但**不禁止**——调度器本来就要迁移 G；
-- 固定栈路径不安装 SIGSEGV handler、不分配 sigaltstack（`src/concurrency/fiber.cpp:1053-1056`），爆栈 = 进程被杀；
-- handler 只处理「fault 在未提交区 + rsp 在预留区 + 距离 ≤256 KiB」（`src/concurrency/fiber.cpp:1290-1308`），其余恢复默认动作保留 core。
-
-**典型误用**：把 `FiberLocal` 当 `thread_local`（G 迁移后读到别的 G 的值，`src/concurrency/fiber_local.cpp:7-17`）；在手动 Fiber 里用 `Select`（返回 `kInvalid`，因为无法 park）。
-
-### 2.2 Scheduler
-
-**职责**：把 Task 包成 G，交给 P 排队、M 执行；负责 park/wake、work stealing、sysmon、shutdown、观测。
-
-**关键数据结构**
-
-| 结构 | 关键字段 | 行号 | 说明 |
-|---|---|---|---|
-| `Task`（G） | `m_state_word` / `m_execution_claim` / `m_run_claim` / `m_queued` | `src/concurrency/scheduler.cpp:1472-1513`、`:1913-1919` | 状态与令牌同字；两个 claim 描述「谁在执行」 |
-| `Processor`（P） | `queue`（256 槽环）、`runnext`、`active_machines`、`running_machines` | `src/concurrency/scheduler.cpp:2019-2040` | 本地队列 + 快速槽 + 活动 M 计数 |
-| `Machine`（M） | `processor`、`replacement`、`inbox`、`blocking_since_ns` | `src/concurrency/scheduler.cpp:2042-2101` | 基础 M / 补充 M；定向槽；阻塞记账 |
-| `LocalRunQueue` | `m_cells[256]`、`m_head`、`m_tail` | `src/concurrency/scheduler.cpp:410-574` | Vyukov 有界 MPMC 环；满时返回 false |
-| `RunNextSlot` | `m_task`、`m_mutex` | `src/concurrency/scheduler.cpp:599-646` | 单槽 LIFO；被挤出者回环尾 |
-
-**`worker_loop` 逐步拆**
-
-1. 入口设置 TLS：`t_scheduler/t_machine_id/t_processor_id`（`src/concurrency/scheduler.cpp:5466-5471`）；可选绑核（`:5475-5485`）。
-2. 取活：inbox → runnext（`:5558-5577`）→ 本地环（`:5602-5637`）→ incoming 16 条带（`:5641-5763`）→ admission（`:5767-5838`）。
-3. claim：`claim_from_queue` 单 CAS（`:1489-1513`）；失败走 `recover_unclaimed`（`:5507-5522`）。
-4. 执行：`t_task->run()`（`:6045`）；`Task::run` 内建栈/复用 Fiber 并 resume（`:1712-1810`）。
-5. 终态/挂起：按 `run()` 返回后的状态记账（`:6046-6076`）；yield 回队（`:6120-6146`）；orphan 自愈（`:6153`）。
-6. 维护：每 64 拍 `maybe_grow`（`:6007-6021`）；按节拍回收终态 G（`:6187-6200`）。
-7. 无活：IO idle poller（`:6277-6330`）→ 有界自旋（`:6343-6350`）→ 条件变量（`:6360-6476`）。
-
-**状态机**
+## 2.1 对象图（先建立空间感）
 
 ```
-G: New → Runnable → Running → {Dead, Cancelled, Failed}
-                    Running → Waiting → Runnable
-M: Idle → Running → {Blocking, Parked, Stopping} → Dead
-P: Idle → Running → Stopping → Dead
+┌──────────────────────────── Scheduler ────────────────────────────┐
+│  Impl                                                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐ │
+│  │ P[0..N-1]    │  │ M[0..K-1]    │  │ registry[16] 条带         │ │
+│  │  queue: 256  │  │  thread      │  │  └ 强持有所有非终态 G     │ │
+│  │  runnext: 1  │  │  inbox: 1    │  │ incoming[16] 条带         │ │
+│  │  active_mach │  │  blocking_*  │  │ global_queue + emergency  │ │
+│  └──────┬───────┘  └──────┬───────┘  └────────────┬─────────────┘ │
+└─────────┼─────────────────┼───────────────────────┼───────────────┘
+          │ 取/放 G          │ 执行                  │ 保活/遍历
+          ▼                 ▼                       ▼
+      ┌──────────────────────────────────────────────────┐
+      │ Task (G)                                          │
+      │  m_state_word   [state:8 | token:1 | ...]         │
+      │  m_execution_claim / m_run_claim / m_queued       │
+      │  fiber (首次执行才创建)                            │
+      │  m_processor (kInvalidPId = 不在任何 P 上)         │
+      └───────────────┬──────────────────────────────────┘
+                      │ 挂起时
+                      ▼
+      ┌──────────────────────────────┐     ┌───────────────────────┐
+      │ Channel<T> / Mutex / CV / WG │────▶│ ParkingCondition      │
+      │  等待队列（侵入式节点）        │     │  queue_mutex + 链表   │
+      └──────────────────────────────┘     │  per-node futex 字    │
+                                           │  broadcast 代际字     │
+                                           └───────────────────────┘
 ```
 
-**失败路径与限制**
+**三条所有权线**（第 3 层会逐条展开）：
 
-- **无异步抢占**：CPU 密集 G 只能靠 yield/park 让出；sysmon 只处理已声明的阻塞（`src/concurrency/scheduler.cpp:2498-2556`）；
-- **本地队列边界不能动**：把窃取移出全局锁实测更慢（`src/concurrency/scheduler.cpp:2009-2010`）；
-- **8 MiB VA/G**：10 万 G 约 819 GB VA，默认 `max_map_count` 下约 3 万 G 触顶；
-- **draining 判零必须精确**：用 `live_tasks` 而非分片近似（`:6170-6186`）。
+- **G 的生命周期**：调用方 `shared_ptr<Task>` + `registry` 强持有非终态 G；
+  终态后注册表放手，等调用方释放。
+- **栈的生命周期**：G 持 `Fiber`；G 结束时 `Fiber::RecycleForScheduler`
+  进 FiberBin（每 M 一个池）；池满才真析构。
+- **等待节点的生命周期**：节点在**等待者栈帧**上，队列只存裸指针；
+  取消/超时只是置标记，真正摘除由交接方做（防 UAF）。
 
-**典型误用**：在 `SpinMutex` 临界区里 park（debug abort / release 降级，`src/concurrency/scheduler.cpp:1429-1437`）；在持普通 Mutex 时做长阻塞（只告警不禁止，但会把 M 占住）。
+## 2.2 Task（G）字段级
 
-### 2.3 Channel
+| 字段 | 类型/位宽 | 谁写 | 保护方式 | 作用 |
+|---|---|---|---|---|
+| `m_state_word` | `atomic<uint32_t>` | park/wake/claim/终态 | CAS/acq_rel | 低 8 位状态、bit8 唤醒令牌 |
+| `m_execution_claim` | `atomic<bool>` | claim、`try_mark_running` | 原子 | 「有人正在执行这个 G」 |
+| `m_run_claim` | `atomic<bool>` | `Task::run` 入口 | 原子 | 防止重入 `run()` |
+| `m_queued` | `atomic<bool>` | 入队/出队 | 原子 | 「已有一个队列节点」，入队权 |
+| `m_processor` | `atomic<PId>` | 入队/窃取 | 原子 | 当前归属 P；`kInvalidPId` 合法 |
+| `m_fiber` | `shared_ptr<Fiber>` | `Task::run` | 仅执行者 | 首次运行时创建 |
+| `m_no_park_depth` | `atomic<uint32_t>` | SpinMutex | 原子 | park 契约检查（禁止区深度） |
+| `m_held_mutexes` | `atomic<uint32_t>` | Mutex | 原子 | 持锁 park 告警 |
 
-**职责**：Go 风格带缓冲/无缓冲通道，外加 Select 的多路等待；阻塞时 park G，不占 M。
+**为什么状态和令牌要打包**（`scheduler.cpp:1429` 的 `park_for_scheduler`）：
 
-**关键数据结构**（`include/go2cpp/concurrency/channel.hpp:3534-3563`）
+```
+线程 A（park）                      线程 B（wake）
+ 读 word = Running                  读 word = Running
+ CAS(Running → Waiting)              CAS(Running → Running|token)
+   ├─ 成功 → kParked                   ├─ 成功 → 看到 token 后
+   │   此后 B 的 wake 看到 Waiting      │   若 A 已 Waiting，B 负责
+   │   必须由 B 负责入队                │   把 Waiting→Runnable 并入队
+   └─ 失败（B 先置 token）→ 重读        └─ 失败（A 已 Waiting）→ 走唤醒
+       看到 token → 清 token 返回 kRequeued
+```
 
-| 字段 | 行号 | 说明 |
+如果拆成「状态原子 + 令牌原子」两个变量，就会出现
+「令牌已发布、挂起已提交、但没人消费」的窗口——这是 Go runtime 里
+`park` 与 `ready` 必须共用 `g.status` 的同一个原因。
+
+## 2.3 P（Processor）与本地队列
+
+`Processor`（`scheduler.cpp:2017` 附近）只有 6 个字段，但每个都有讲究：
+
+| 字段 | 说明 | 不变量 |
 |---|---|---|
-| `m_capacity` | `:3534` | 0 = rendezvous，不分配缓冲 |
-| `m_lock`（ChannelSpinLock） | `:3541` | 保护 buffer/senders/receivers/closed；**绝不允许持锁 park** |
-| `m_buffer`（RingBuffer） | `:3547` | head/tail/count 环形数组；`cap==0` 不分配（`:1290-1300`） |
-| `m_senders` / `m_receivers` | `:3549-3552` | 侵入式等待队列，节点由等待者栈帧持有 |
-| `m_closed` | `:3555` | 关闭标记；关闭后 Send 返回 kClosed |
-| `m_generation` / `m_change_waiters` | `:3557-3561` | 状态代际；为 0 时快路径不写，避免跨核 cacheline 迁移 |
+| `id` | P 编号，0 合法 | 不要用 `!=0` 判断存在 |
+| `mutex` | 冷路径锁（shutdown 排空/快照） | 热路径**不进入** |
+| `queue` | 256 槽有界 MPMC 环（Vyukov） | 满时 push 返回 false，调用方回落全局队列 |
+| `runnext` | 单槽 LIFO | 只有 owner 消费；窃取者**不偷** |
+| `state` | idle/running/dead | 快照可锁外读 |
+| `active_machines` / `running_machines` | 附着 M 数 / 正在跑 G 的 M 数 | 增减在 `Impl::mutex` 内 |
 
-**`SendUntil` 逐步拆**（`:2740` 起）
+**为什么要 `runnext` 单槽**：刚被唤醒的 G 与唤醒者在同一条数据链上，
+放 runnext 可以让它**立刻**在本 P 执行（缓存热、锁热）；放环尾要等 256 个。
 
-1. 上下文已取消/超时 → 直接返回，不进锁（`:2743-2747`）。
-2. 持 Channel 自旋锁；`m_closed` → `kClosed`（`:2750-2755`）。
-3. 优先直交 `m_receivers` 队首：跳过已取消节点；普通节点 `emplace` + `notify_one`；select 节点走 `TrySelect`（`:2757-2785`）。
-4. 无接收者但有缓冲空位 → 入缓冲（`:2831` 附近）。
-5. 都失败 → 检查 deadline/Fiber 支持；创建 `PendingSend`（`:2312`）入 `m_senders`，把 `context->Done()` 回调注册成「唤醒这个 pending」。
-6. 等待循环：每次醒来重检 `accepted/closed/cancelled/deadline`，任一成立就清理并返回（`:3030` 起）。
+**为什么窃取者不偷 runnext**：如果偷了，owner 下次取活会扑空，
+而 runnext 的语义是「本 P 的下一口」；偷它会破坏 `wake_policy=kRunNext` 的局部性。
+`publish_runnext`（`scheduler.cpp:4138`）被挤出者会回落到环尾。
 
-**状态机**：`kReady`（成功）/`kWouldBlock`（Try* 非阻塞）/`kClosed`/`kAlreadyClosed`/`kCancelled`/`kTimedOut`/`kNil`/`kInvalid`（`include/go2cpp/concurrency/channel.hpp:117-127`）。
+```
+LocalRunQueue（256 槽环）:
+  head ──▶ [ G ][ G ][   ][ G ] ... [ G ] ◀── tail
+            ↑ pop 端                      ↑ push 端
+  满：push 返回 false（调用方转 global_queue）
+  空：pop 返回 null（调用方去窃取/incoming）
+```
 
-**失败路径与限制**
-
-- **D1 丢值**：旧 Select「第一个 ready 就返回」会让 closed 遮蔽同批另一个通道的缓冲值；现在 `kReady` 立即返回、closed 延后（`src/concurrency/channel.cpp:446-501`）；
-- **D2 错唤醒**：共享 futex 字会唤醒错节点；现在每节点自己的 32 位字（`include/go2cpp/concurrency/channel.hpp:778-782`）；
-- **ABI 约束**：不能给 `SelectCase` 加字段；公共结构体尺寸变化会让旧库+新头在增量构建切换点 SEGFAULT（`src/concurrency/channel.cpp:457-461` 注释）；
-- **Close 与 Send 并发**：Send 在锁内看到 closed 返回 `kClosed`，不会写入已关闭通道。
-
-**典型误用**：把 nil channel 当 Go 的永久阻塞（本项目返回 `kNil`）；丢弃 `Close()` 的返回值；在 Channel 锁内做用户回调。
-
-### 2.4 Mutex
-
-**职责**：Go 风格不可重入互斥锁；受管 G 竞争时 park，普通线程走自旋 + futex；带 1 ms 饥饿保护。
-
-**关键数据结构**
-
-| 字段 | 行号 | 说明 |
-|---|---|---|
-| 状态位 `kLocked/kWaiter/kStarving/kWoken` | `src/concurrency/sync.cpp:1303-1306` | 同一个原子字节；内联快路径与慢路径同源 |
-| `m_state` | 内联在 `Mutex` 对象（独立 cacheline） | Impl 只保存指向它的指针（`src/concurrency/sync.cpp:1299-1301`） |
-| `m_waiters` | `src/concurrency/sync.cpp:1321-1321` | FIFO，存 `shared_ptr<WaitNode>`；先出队、锁外 Wake |
-
-**`LockImpl` 逐步拆**（`src/concurrency/sync.cpp:1572`）
-
-1. 上下文已失效 → 返回 false（`:1574-1577`）。
-2. 快路径：状态无 `kLocked/kStarving` 时一次 CAS 拿锁（`:1554`）。
-3. 判定等待者类型：受管 G / 普通线程 / 手动 Fiber；手动 Fiber 无法 park，直接返回 false。
-4. 普通线程先短自旋（8 次），再进等待队列；受管 G 直接 park（不自旋）。
-5. 在 `m_mutex` 下发布 `kWaiter`（必要时 `kStarving`）并 push（`:1726-1742`）。
-6. 等待结束：普通唤醒回顶部重新 CAS；饥饿交接直接持锁返回；超时/取消从队列摘除且不持锁返回。
-
-**状态机**：正常模式（释放后唤醒、允许插队）↔ 饥饿模式（等待 >1 ms 触发；不释放 `kLocked`，直接交给 FIFO 队首；队列空或被交接者未超阈值时退出）。
-
-**失败路径与限制**
-
-- **状态字必须原子 RMW**：`load+store` 曾抹掉并发 `TryLock` 的 `kLocked`，造成双持 + 解锁异常（`src/concurrency/sync.cpp:1276-1279`、`:1347`）；
-- 正常模式不保证「唤醒即持有」，只保证 1 ms 饥饿上界；
-- 队列存 `shared_ptr`，否则「出队→Wake」窗口内等待方销毁栈节点会 UAF（`src/concurrency/sync.cpp:1283`）。
-
-**典型误用**：假设锁有 owner（Go 风格允许 A 加锁 B 解锁，`src/concurrency/sync.cpp:1539-1549` 的两态描述不包含 owner）；持锁 park（只告警，但会把 M 占住）。
-
-### 2.5 RWMutex
-
-**职责**：写者优先的读写锁；读者快路径一次 `fetch_add`，写者慢路径用内部 `sync::Mutex` 做 FIFO。
-
-**关键数据结构**（`include/go2cpp/concurrency/rwmutex.hpp`）
-
-| 字段 | 行号 | 说明 |
-|---|---|---|
-| `m_state` | `:789` | 读者计数 + 写者门 + 慢路径标记的合并原子字，独占缓存行 |
-| `m_pending` | `:794` | 正在慢路径等待的写者数；>0 时读者不再走快路径 |
-| `m_writer_mutex` / `m_park_mutex` | `:796-800` | 写者 FIFO / 慢路径 park 的互斥量 |
-| `m_reader_cv` / `m_writer_cv` | `:802-804` | 读者等门开；写者等上一个写者开门 / 读者归零 |
-| `m_waiting_readers` / `m_gate_waiters` / `m_drain_waiters` | `:806-808` | 唤醒短路计数 |
-
-**关键函数**
-
-- `RLock`（`:147`）：一次 `fetch_add`，结果落在 `[0, kGate)` 且 `m_pending==0` 就进入；否则走慢路径。
-- `Lock`（`:211`）：先宣告「有写者在等」（读者快路径看到就不再进门），再单 CAS 关门；慢路径进 `m_writer_mutex` 排队、等读者归零。
-- `Unlock`（`:235`）：一次性还原写者位 + 慢路径位 + 门偏移；写者持锁期间读者不可能登记。
-
-**状态机**：门开（N 个读者）↔ 门关（最多 1 个写者 + R 个未退出读者）。写者优先：一旦 `m_pending>0`，新读者必须排队。
-
-**失败路径与限制**
-
-- 读者可能被写者压制，这是有意取舍（`:15-20`）；
-- 旧实现写者 park 与 `NotifyOne` 之间丢唤醒，8 线程 50/50 混合负载卡死（`:66-69`）；
-- **不提供升级**：读锁持有者申请写锁必然自己等自己（`:71`）；写锁不可重入；读锁重入在有写者排队时同样自死锁（`:76`）；
-- `TryLock` 在「锁空闲但有写者排队」时返回 false，以保护写者 FIFO（`:113`）。
-
-**典型误用**：写锁临界区里做 IO（写者队列整体停摆）；用 `RLock` 递归保护同一容器（有写者排队时自死锁）。
-
-### 2.6 ConditionVariable
-
-**职责**：条件等待；本身无状态，等待队列与快路径槽都在 `Impl`；受管 G park、普通线程走 futex。
-
-**关键数据结构**（`src/concurrency/sync.cpp:2245-2280`）
+## 2.4 M（Machine）字段级与阻塞记账
 
 | 字段 | 说明 |
 |---|---|
-| `m_single` / `m_fast_waiter` | 1P1C 快路径的「唯一等待者」原子槽 |
-| `m_waiters` | 通用路径的 FIFO 队列，存 `shared_ptr<WaitNode>` |
-| `m_change_mutex` / 条件 | 冷路径等待互斥量（若实现含） |
+| `id` / `processor` | 全局递增 id（不从 0 开始）/ 首选 P |
+| `replacement` | 补充 M 标记；启动前写一次，之后只读 |
+| `thread` | `std::thread` 本体；shutdown 时 join |
+| `state` | Idle/Running/Blocking/Parked/Stopping/Dead |
+| `inbox` | 定向槽（`LockToCurrentM` 绑定的 G 只投这里） |
+| `processor_detached` | 是否已从 P 解绑（sysmon 据此补 M） |
+| `blocking_since_ns` | 进入阻塞区的时刻；sysmon 用它判长 syscall |
+| `long_syscall_count` | 观测计数 |
 
-**`Wait` 逐步拆**（`src/concurrency/sync.cpp:2327`）
+**基础 M vs 补充 M**：
 
-1. 识别手动 Fiber：即使 Context 已取消，也不能走普通线程 unlock/relock 路径（`:2328-2345`）。
-2. 取/复用 `WaitNode`（线程本地缓存，`AcquireWaitNode`，`:2381`）。
-3. **先入队（或占快路径槽）再解锁**：入队与清槽必须在同一临界区（`:2451`），否则通知落在入队前就丢。
-4. 解锁后 park；被唤醒后重新加锁。
-5. 重锁失败（调度器关闭）→ 先 8192 次无 park 抢回，抢不回抛 `runtime_error`（`:2193`、`:2359`）。
+- 基础 M：启动时创建 `min_workers` 个，**永不因空闲退出**；
+- 补充 M：`blocking_workers > 0` 时创建，阻塞归零后**立即退休**。
 
-**`NotifyOne`**（`:2619`）：锁内摘节点/清槽，锁外唤醒；裸 `store` 会覆盖新等待者刚发布的槽，导致唤醒永久丢失（`:2628`）。
+sysmon 每 10 ms 扫一次（`enable_sysmon` 默认 true），只处理**已声明**的阻塞：
+普通线程跑长 syscall 不会被告知，只有走 `BlockingRegion` 的 M 才会被补位。
 
-**失败路径与限制**
+## 2.5 主链：spawn → enqueue → 取活 → claim → run
 
-- **D3**：`Wait` 返回时调用方假定仍持锁；重锁失败不能返回 false，否则上层会在未持锁状态下改容器；
-- `notify-before-park` 窗口只能靠「入队/清槽同临界区 + 谓词复检」闭合；
-- 节点池化：每次 `make_shared` 一个含原子/互斥/条件变量的控制块约 40–60 ns（源码注释），比一次交接还贵。
+### spawn（`scheduler.cpp:3805` / 带 options 的 `:3824`）
 
-**状态机**：CV 对象本身无状态；每个等待节点走 `Waiting → Notified | TimedOut | Cancelled`，由节点结果的 CAS 选唯一赢家。
+```
+step1. 构造 Task（shared_ptr），此时不建 Fiber、不建栈
+step2. registry 登记（强持有，保证非终态 G 不会被析构）
+step3. enqueue(task)
+step4. 入队失败 → task->cancel()，返回终态句柄（不是永不运行的句柄）
+```
 
-**典型误用**：不持外部锁调用 `wait`（契约要求调用方持有传入锁）；把通知方当成「转移锁所有权」（Cond 不做 handoff，锁由等待者重锁）。
+**为什么首次执行才建栈**：spawn 是热路径，建栈要 mmap + mprotect；
+而很多任务在排队期间就被取消/shutdown 了。这一取舍让 spawn 只付
+一次堆分配 + 引用计数（第 5 层会看到它的代价）。
 
-### 2.7 WaitGroup
+### enqueue（`scheduler.cpp:3901`）
 
-**职责**：计数 + 归零唤醒；`Add/Done` 是热路径，用单次 RMW 而非 CAS 循环。
+```
+外部生产者：
+  按 GId/地址选 16 条带之一 → 该条带的 incoming 队列（叶子锁）
+  持锁期间禁止再调 enqueue（锁层次：admission → 条带 → P → Task）
+目标 P 的 M 正在跑：
+  publish_runnext（scheduler.cpp:4138）→ runnext 单槽，被挤出者回环尾
+否则：
+  本地环 push；失败则 global_queue
+```
 
-**关键数据结构**（`src/concurrency/sync.cpp:2741-2770`）：计数原子 + `m_waiters` 队列（`shared_ptr<WaitNode>`）。
+### worker_loop（`scheduler.cpp:5651`）取活顺序
 
-**关键函数**
+```
+step0  inbox（定向槽）
+step1  runnext
+step2  本地环（256 槽）
+step3  incoming[16] 条带（窃取外部生产者投递的任务）
+step4  admission（全局队列 + 紧急链）
+step5  都没有 → IO idle poller → 有界自旋 → 条件变量睡眠
+```
 
-- `Add(n)`（`:2844`）：单次 `fetch_add` 更新计数并判零；负数/溢出抛 `logic_error`（`:2860-2870`）。
-- `Done()`（`:2897`）：`fetch_sub`；归零时整波 `TryFinish` + swap，锁外唤醒。
-- `Wait(ctx)`（`:2931`）：先自旋预算（`:2953`），超出后睡 futex；取消/超时返回 false。
+**顺序不是随便排的**：先拿「本 P 私有、最热」的，再拿「共享、要加锁」的。
+把 incoming 放到本地环之前会破坏局部性；放到 admission 之后会让外部
+生产者饿死。这个顺序在 `scheduler.cpp:5651` 起的循环里可以逐段对应。
 
-**复用语义**：计数归零后可开始新一轮（`:2727-2740`），前提是上一轮等待者已全部返回；`Add` 与 `Wait` 并发是调用方错误（`docs/modules/sync.md:210`）。
+### claim（`scheduler.cpp:1494`）
 
-**状态机**：计数 `0 → N → 0`；归零瞬间把当前等待者整波置 `Notified`；新一轮从 0 开始，前提是上一轮等待者已全部返回。
+```
+for (;;) {
+  word = m_state_word.load(acquire)
+  if (状态 != Runnable) return false          // 已被别人抢/已取消
+  if (CAS(word, Running)) {                    // 一次 CAS 即执行权仲裁
+    m_queued = false                           // 释放入队权
+    m_execution_claim = true                   // 标记执行者
+    return true
+  }
+}
+```
 
-**典型误用**：在 `Wait` 之后 `Add`（Wait 可能已返回）；把 WaitGroup 当一次性屏障反复复用而不等上一轮收尾。
+注释里写明「先抢 claim 再改状态要多付一次 RMW，实测 1P2M 的 CV 往返
+每次切换多 ~8ns」，所以合并成单 CAS。**这是「测量驱动设计」的典型例子**：
+教科书会先写 claim 再写 state，这里因为实测差 8 ns 而反过来。
 
-### 2.8 Select
+### run（`scheduler.cpp:1717`）
 
-**职责**：把 N 个 channel 的等待折叠成一次「探测 + 一个等待节点」，保证单赢家与有值优先。
+```
+step1. m_run_claim CAS，防重入
+step2. 首次：创建 Fiber（128 KiB 默认栈、8 MiB 预留）
+       非首次：从 FiberBin 取复用（use_count()!=1 就丢弃）
+step3. Fiber::resume → 用户函数
+step4. 返回后清理 claim、按状态记账：
+       终态 → notify_terminal（scheduler.cpp:1115）+ RecycleForScheduler
+       Waiting → 记 kTaskSuspended 事件
+       Running（异常/未挂起）→ recover_orphan_running（scheduler.cpp:1638）
+```
 
-**关键数据结构**
+## 2.6 park / wake 的完整时序
 
-| 结构 | 行号 | 说明 |
-|---|---|---|
-| `SelectCase` / `SelectProbe` | `channel.hpp`（Select 段，`3850` 起构造） | case 的 probe 闭包与结果 |
-| `SelectWaitState` | `:651` | 等待路径的单赢家状态 |
-| `SelectLockKey` | `:1894-1896` | 用对象地址做全序键；arm 按它排序加锁 |
+```
+G 在 M 上跑                    Channel 队列                 另一个 G / 线程
+    │                              │                              │
+    ├─ Send，无接收者               │                              │
+    ├─ 建 PendingSend ────────────▶│ 入 m_senders                 │
+    ├─ 注册 Context Done 回调       │                              │
+    ├─ park_for_scheduler()        │                              │
+    │    CAS Running→Waiting       │                              │
+    ├─ Fiber 换栈回 worker ────────┼──────────────────────────────┤
+    │                              │        Recv 到达             │
+    │                              │◀─── 摘队首、写值、CAS signal │
+    │                              │      锁外 NotifyChange       │
+    │                              │───────────▶ wake_for_wait_impl
+    │                              │             Waiting→Runnable
+    │                              │             投 runnext/本地环
+    │◀──── 某 M 取到、claim、resume ┘                              │
+    ├─ 等待循环重检 accepted/closed/cancelled/deadline             │
+    └─ 返回 kReady                                                │
+```
 
-**执行流程**
+**三个必须理解的细节**：
 
-1. **探测**（`src/concurrency/channel.cpp:446-501`）：线程本地随机起点轮转；`probe()` 是真实传输。
-2. `kReady` 立即返回（传输已发生，不可回滚）；closed/nil/invalid 无副作用，暂存到扫描结束（`:479-490`）。
-3. 没有 ready → 检查取消/default/超时。
-4. **arm**：按 `SelectLockKey` 全序一次性持有整组 Channel 锁（`include/go2cpp/concurrency/channel.hpp:3746`），锁内重新验证并登记节点。
-5. **单赢家**：任一 channel 就绪只会有一个 case 提交结果（`SelectWaitState`）。
+1. **park 前先登记等待节点，再改状态**——顺序反了会出现「已挂起但没人知道」；
+2. **通知必须在锁外**——锁内 notify 会引入「Channel 锁 → 调度器锁」的反向嵌套；
+3. **醒来必须重检**——`signal` 可能被取消/超时抢先，单赢家语义靠 CAS 保证。
 
-**失败路径与限制**
+## 2.7 Channel 的结构与三条分支
 
-- 不给 `SelectCase` 加 `peek` 字段：公共结构体尺寸变化 → 旧 .so + 新头 SEGFAULT（`docs/modules/select-semantics.md:94-104` 记录的历史事故）；
-- 外部再用 `std::mutex` 保护多通道，锁序不确定可死锁（`docs/modules/concurrency-usage.md:387`）；
-- 「有值 vs 可发送」不排序：两者都立即传输，谁先探测到谁赢。
+`Channel<T>` 的核心字段（`include/go2cpp/concurrency/channel.hpp`）：
 
-**典型误用**：以为 closed 一定优先（本项目是有值优先）；在 select 的 case 里做阻塞操作。
+| 字段 | 作用 |
+|---|---|
+| `m_capacity` | 0 = rendezvous，不分配缓冲 |
+| `m_lock`（ChannelSpinLock） | 保护 buffer/senders/receivers/closed，**禁止持锁 park** |
+| `m_buffer`（RingBuffer） | head/tail/count；cap=0 不分配 |
+| `m_senders` / `m_receivers` | 侵入式等待队列，节点由等待者栈帧持有 |
+| `m_closed` | 关闭标记 |
+| `m_generation` / `m_change_waiters` | 状态代际；为 0 时快路径不写，避免 cacheline 迁移 |
 
-### 2.9 Future
+**三条分支**（`SendUntil` `include/go2cpp/concurrency/channel.hpp:2881` / `RecvUntil` `include/go2cpp/concurrency/channel.hpp:3262`）：
 
-**职责**：一次性的异步结果；Promise 写、Future 读；等待可带 Context/超时。
+```
+Send(v):
+  ├─ 锁内看到 m_receivers 非空 → 直交（值直接 emplace 进节点）
+  ├─ 否则缓冲有空位 → 入缓冲，返回 kReady
+  └─ 否则 → 登记 PendingSend + 注册取消回调 → park
+             醒来重检 accepted/closed/cancelled/deadline
 
-**关键数据结构**
+Recv():
+  ├─ 锁内看到 m_senders 非空 → 直交（取值）
+  ├─ 否则缓冲有值 → 取出
+  └─ 否则 → 登记 PendingRecv → park
 
-| 结构 | 行号 | 说明 |
-|---|---|---|
-| `FutureStatus` | `include/go2cpp/concurrency/future.hpp:168` | Ready/Error/Cancelled 等结果分类 |
-| `FutureStateKind` | `:213` | 状态机种类 |
-| `FutureState<T,false>` / `<T,true>` | `:340` / `:598` | 可拷贝 / move-only 两套实现 |
-| `FutureWaiterCount` | `:271` | 等待者计数（唤醒短路） |
+Close():
+  置 m_closed → 先唤醒接收者（缓冲值仍可读完）→ 再唤醒发送者（kClosed）
+```
 
-**关键函数**
+**直交为什么必须在锁内完成「写值 + CAS signal」**：如果先唤醒再写值，
+接收者可能被别的线程恢复后读到空值。所以顺序是
+「值先落位 → CAS signal → 锁外通知」。
 
-- `MakePromise<T>()`（`:1232`）：建 pair。
-- `Promise::SetValue`（`:965`）：写结果 + 唤醒；重复设置返回 false。
-- `Future::GetResult` / `GetResultFor`（`:1077` / `:1083`）：等待完成；带 Context/超时。
-- **先注册取消回调再取状态锁**（`:425`）：`AddCallback` 在已取消时会同步执行回调，先取锁会自锁。
-- **每个等待者独立取消标记**（`:258`）：共享会让一个超时误唤醒其他等待者。
-- **Promise 析构发布 broken-promise**（`:26`）：消费者不会永久等待。
+## 2.8 Select：探测 + arm + 单赢家
 
-**状态机**：`Pending → Ready | Error | Broken`（终态不可逆；重复 set 返回 false）。
+```
+step1. 随机起点探测每个 case 的 probe()
+       kReady → 立即返回（传输已发生，不可回滚）
+       closed/nil/invalid → 暂存（无副作用）
+step2. 无 ready → 检查 default / 取消 / 超时
+step3. arm：按 SelectLockKey（对象地址）全序，一次性持有整组 Channel 锁
+       锁内重新验证并登记等待节点
+step4. park
+step5. 任一 channel 就绪 → SelectWaitState::TrySelect 只有一个赢家
+       输家节点由清理逻辑摘除（不重复提交结果）
+```
 
-**典型误用**：把 `GetResult` 的返回值当异常（只有 `GetOrThrow` 才抛）；多个线程共享一个取消标记。
+**为什么要全序加锁**：N 个 channel 两两组合，任意顺序加锁都可能 ABBA。
+用地址排序后，所有 Select 的加锁顺序一致。
 
-### 2.10 Context
+**为什么 closed 不优先**：旧实现「第一个 ready 就返回」导致 closed 遮蔽
+同批另一个通道的缓冲值（D1 丢值）。现在 `kReady` 立即返回、closed 延后，
+代价是「有值 vs 可发送」不排序——两者都立即传输，谁先探测到谁赢。
 
-**职责**：取消树、deadline、值传递；取消传播两阶段（先标记整棵子树、再执行回调），外加局部回滚。
+## 2.9 同步原语的结构速览
 
-**关键数据结构**（`src/concurrency/context.cpp:928-985`、`:220`）
+| 原语 | 核心字段 | 快路径 | 慢路径 |
+|---|---|---|---|
+| `Mutex` | 状态字节（Locked/Waiter/Starving/Woken）+ FIFO `m_waiters` | 一次 CAS | 自旋 8 次 → 入队 → park |
+| `RWMutex` | 读者计数 + 写者门 + `m_pending` 合并原子字 | 读者一次 `fetch_add` | 写者进 `m_writer_mutex` 排队 |
+| `ConditionVariable` | `m_single` 快路径槽 + `m_waiters` FIFO | 1P1C 无锁槽 | 入队 + park + 重锁 |
+| `WaitGroup` | 计数原子 + 等待者队列 | `fetch_add/sub` | 归零整波唤醒 |
+| `SpinMutex` | 门（内部 Mutex）+ 热字 + owner | CAS 0→1 | 64 次 PAUSE → 门 |
+| `ParkingCondition` | `queue_mutex` + 侵入链表 + per-node futex | 自旋预算 | futex_wait / park |
 
-| 字段 | 说明 |
+**Mutex 的状态字为什么是「一个字节」**：`kLocked/kWaiter/kStarving/kWoken`
+四个位必须在同一个原子字里，否则「释放时判断有没有等待者」会出现
+「读到没有 → 直接释放 → 等待者入队 → 永久睡眠」的丢唤醒。
+`src/concurrency/sync.cpp:1577` 的 `LockImpl` 与 `:1999` 的 `UnlockSlow`
+就是围绕这一个字节做文章。
+
+## 2.10 Context 与 Timer 的结构
+
+**Context**（`src/concurrency/context.cpp`）：
+
+| 字段 | 作用 |
 |---|---|
 | `error` / `cause` | 取消原因；非空即已取消（幂等） |
 | `children` | 子节点集合；取消时收集并清空 |
@@ -537,100 +441,509 @@ P: Idle → Running → Stopping → Dead
 | `timer_id` | deadline 定时器；取消时锁外移除 |
 | `done`（DoneSignal） | 等待者信号；锁内只翻转 done 并搬出回调 |
 
-**`DrainCancellation` 逐步拆**（`src/concurrency/context.cpp:1133`）
+**Timer**（`src/concurrency/timer.cpp`）：
 
-1. 显式栈 `work` 迭代（不递归，深树不爆栈）。
-2. 每轮在 `state->mutex` 内标记 error/cause、摘 timer、搬回调、收集 children 并清空；已取消子树跳过（`:1143-1202`）。
-3. 锁外移除 timer、从父节点解绑、把回调收集到全局列表。
-4. 全部标记完成后，**逆序**执行 `before_done`，再**逆序** `Signal`（`:1219-1232`）。
-5. 先标记后唤醒的原因：父回调里可能同步等子；先通知父会父等子、子等父（`:1119-1121`）。
+| 字段 | 作用 |
+|---|---|
+| `m_entries`（`multimap<time_point, State>`） | 按 deadline 有序，`begin()` 即下一个 |
+| `m_index`（`unordered_map<State*, iterator>`） | 取消 O(1) 定位 |
+| `m_generation` | 插入/删除递增，后台线程据此重算等待 |
 
-**`ContextRollback`**：先标记所有 Context 取消，再冻结 undo（`:1214-1218`）；`Commit` 发现 child 已取消就转回滚（`:1560-1630`），避免取消窗口里把新动作当可提交。
+**单线程 + multimap 的取舍**：插入 O(log n)、删除 O(1)、到期 O(k)；
+代价是所有回调串行，一个慢回调拖慢该服务全部任务。
 
-**失败路径与限制**：回调在通知线程同步执行，禁止 park/阻塞（`include/go2cpp/concurrency/context.hpp:25`）；回调异常被吞掉；补偿按逆序执行。
+## 2.11 第二层小结 & 下一层看什么
 
-**典型误用**：在 `Done` 回调里同步等待子 Context；在回调里捕获裸指针（UAF）。
+**小结**：结构上有三个「反直觉」但必需的设计——状态与令牌同字、
+runnext 单槽、等待节点放栈上。它们分别解决原子性、局部性、UAF 三个问题。
 
-### 2.11 Timer
-
-**职责**：业务定时器；单后台线程 + `multimap` 按 deadline 有序 + 反向索引；`Timer` 是句柄，析构即取消。
-
-**关键数据结构**
-
-| 字段 | 行号 | 说明 |
-|---|---|---|
-| `Timer::State::m_status` | `src/concurrency/timer.cpp:210` | `kPending/kRunning/kCompleted/kCancelled/kFailed` |
-| `m_next_deadline` / `m_callback` / `m_executor` | `src/concurrency/timer.cpp:206-213` | 到期时间、回调、可插拔执行器 |
-| `Impl::m_entries` | `src/concurrency/timer.cpp:973` | `multimap<time_point, State>`，`begin()` 是下一个 |
-| `Impl::m_index` | `timer.cpp`（紧邻） | `unordered_map<State*, iterator>`，取消 O(1) 定位 |
-| `m_generation` | `src/concurrency/timer.cpp:234-235` | 插入/删除递增，后台线程据此重算等待 |
-
-**线程模型**：一个后台线程，`wait_until` 最近 deadline；到期后把 State 摘出，**锁外**执行回调（`src/concurrency/timer.cpp:274-275`）。回调里可以再操作定时器而不死锁；但在回调里销毁 `TimerService` 会 join 自身 → `terminate()`（`:276-278`）。
-
-**状态机**：`Pending → Running → Completed`；`Cancelled/Failed` 为终态。取消只阻止尚未领取的回调（`include/go2cpp/concurrency/core/timer.hpp:46-48`）。
-
-**失败路径与限制**
-
-- 单线程串行：一个慢回调拖慢该服务所有后续任务（`:280-284` 建议 IO 超时走 IOManager 的 deadline 队列）；
-- `~Timer()` = `Cancel()`（`src/concurrency/timer.cpp:1006`）；临时句柄 `(void)ScheduleAfter(...)` 会当场取消；
-- 已 Running 的回调不会被强杀。
-
-**典型误用**：丢弃 `Timer` 返回值；在回调里销毁服务；把每请求 IO 超时塞进 TimerService。
-
-### 2.12 SpinMutex
-
-**职责**：极短纯计算临界区；禁止 park；debug abort / release 降级。
-
-**关键数据结构**（`include/go2cpp/concurrency/spin_mutex.hpp:68-82`）
-
-| 字段 | 位置 | 说明 |
-|---|---|---|
-| `m_impl` | 对象 offset 0 | 门（内部 `sync::Mutex`）；必须第一个成员（测试依赖地址相等） |
-| `m_state` | offset 128 | 快路径唯一热字，独占 cacheline |
-| `m_owner` | 同行 | 受管 G 的 owner 记录 |
-
-**三段式**（`include/go2cpp/concurrency/spin_mutex.hpp:29-66`）：CAS 0→1 → 64 次 PAUSE → 门 `m_impl.Lock()`，唤醒后门内再自旋 16 次。
-
-**状态机**：`0`（空闲）/`1`（持有）；`no_park_depth` 在 `Lock` 成功后 +1、`Unlock` 时按加锁 G 递减。
-
-**失败路径**：debug 下 park 直接 abort；release 不 abort、降级为普通 Mutex 语义并计数（`:86-93`）；普通 OS 线程没有 `no_park_depth`，退化为普通 Mutex（`:196`）。
-
-**典型误用**：在临界区里做 IO 或竞争 `Mutex::Lock`；用 `*_f` 版本规避 park（它不 park，但真阻塞整个 M，`include/go2cpp/concurrency/spin_mutex.hpp:115`）。
-
-### 2.13 ParkingCondition
-
-**职责**：运行时唯一的等待原语；同一份代码在受管 G 上 park、在普通线程上走 per-node futex。
-
-**关键数据结构**（`include/go2cpp/concurrency/core/parking_condition.hpp:195-211`）
-
-| 字段 | 行号 | 说明 |
-|---|---|---|
-| `m_queue_mutex` | `:195` | 只保护链表链接关系与计数；与节点门从不嵌套 |
-| `m_head/m_tail/m_waiter_count` | `:196-198` | 侵入式双向链表；入队/摘链 O(1) |
-| `BroadcastState{seq,waiters}` | `:206-211` | `notify_all` 的共享广播字；`futex_waitv` 同时监听「节点字 + 广播字」 |
-
-**两条路径**（`:14-22`）
-
-- **Fiber**：Scheduler park；唤醒方走 `wake_or_cancel` 把 G 放回调度队列，不经过 futex。
-- **线程**：每节点自己的 32 位 futex 代际字；`notify_one` 只推进选中节点；`notify_all` 一次广播字 + 一次 `FUTEX_WAKE(INT_MAX)`，不支持 `futex_waitv` 时退回逐节点唤醒。
-
-**为什么 park 前要自旋**（`:24-30`）：直接 `FUTEX_WAIT` 会在「刚检查完条件、还没进内核」的窗口丢唤醒；`kSpinBudget` 自旋把窗口跨过去。
-
-**失败路径**：共享代际字会唤醒错节点（审计 D2）；`notify_all` 的广播路径在无 `futex_waitv` 环境退化为 N 次唤醒。
-
-**状态机**：节点 `Waiting → Notified | TimedOut | Cancelled`；`notify_all` 推进广播代际，native 等待者由一次 `FUTEX_WAKE(INT_MAX)` 唤醒。
-
-**典型误用**：不持外部锁调用 `wait`；把 `notify_one` 当成「一定唤醒我指定的那个线程」（FIFO 队首，不指定）。
+**下一层看什么**：带着三个问题读第 3 层——
+「这个函数在哪个文件哪一行？」「它失败时对象处于什么状态？」
+「它持有什么锁，锁序是什么？」
 
 ---
 
-## 附：读完之后的自检清单
+# 第三层 · 源码细节：逐函数、状态机、锁与失败路径
 
-1. 能否不看文档画出「G → P → M → 内核」的完整路径，并指出每一步的锁？
+## 3.1 逐函数索引（写作时逐条核对）
+
+| 函数 | 位置 | 职责 | 失败返回 |
+|---|---|---|---|
+| `Task::park_for_scheduler` | `scheduler.cpp:1429` | 契约检查 + 状态字 CAS | `kRejected` / `kRequeued` / `kParked` |
+| `Task::claim_from_queue` | `scheduler.cpp:1494` | 单 CAS 抢执行权 | false（已被抢/非 Runnable） |
+| `Task::wake_for_wait_impl` | `scheduler.cpp:1358` | Waiting→Runnable，必要时延迟入队 | `WakeAction` |
+| `Task::resume_after_failed_park` | `scheduler.cpp:1616` | Fiber 拒绝挂起时回滚 Running | bool |
+| `Task::notify_terminal` | `scheduler.cpp:1115` | 终态通知（等待者/注册表） | — |
+| `Task::mark_runnable` | `scheduler.cpp:1520` | 把 G 放回可运行并发布 | bool |
+| `Task::recover_orphan_running` | `scheduler.cpp:1638` | 自愈：run 返回后仍 Running | bool |
+| `Task::run` | `scheduler.cpp:1717` | 建/复用 Fiber 并 resume | — |
+| `Scheduler::spawn` | `scheduler.cpp:3805` / `:3824` | 建 Task + 入队 | 终态句柄 |
+| `Scheduler::enqueue` | `scheduler.cpp:3901` | 选条带/投 runnext/本地环/全局 | bool |
+| `Scheduler::publish_runnext` | `scheduler.cpp:4138` | 单槽投递 + 挤出者回环 | bool |
+| `Scheduler::worker_loop` | `scheduler.cpp:5651` | 取活/执行/记账/休眠 | — |
+| `Scheduler::start` | `scheduler.cpp:3323` | 拉起基础 M + sysmon | void |
+| `Scheduler::run_main` | `scheduler.cpp:3382` | 当前线程当 m0 | bool |
+| `Scheduler::shutdown_for` | `scheduler.cpp:3467` | 关 admission → drain → 等终态 → join | bool（超时） |
+| `Scheduler::shutdown` | `scheduler.cpp:3686` | `shutdown_for(max)` | void |
+| `begin_shutdown_locked` | `scheduler.cpp:2792` | 排空所有队列、取消/唤醒 | — |
+| `Channel::SendUntil` | `include/go2cpp/concurrency/channel.hpp:2881` | 直交/缓冲/等待三路 | `ChannelSendResult` |
+| `Channel::RecvUntil` | `include/go2cpp/concurrency/channel.hpp:3262` | 直交/取缓冲/等待三路 | `ChannelRecvResult` |
+| `Channel::Close` | `include/go2cpp/concurrency/channel.hpp:1821` | 置 closed + 分波唤醒 | `ChannelCloseResult` |
+| `Mutex::LockImpl` | `sync.cpp:1577` | 快路径/自旋/入队/park | bool（可取消） |
+| `Mutex::UnlockSlow` | `sync.cpp:1999` | 交接/唤醒/饥饿降级 | void |
+| `ConditionVariable::Wait` | `sync.cpp:2360` | 入队→解锁→park→重锁 | bool |
+| `ConditionVariable::NotifyOne` | `sync.cpp:2679` | 摘节点/清槽 + 锁外唤醒 | void |
+| `WaitGroup::Add` / `Done` / `Wait` | `sync.cpp:2935` / `:2993` / `:3052` | 计数与归零 | void / bool |
+| `Context::DrainCancellation` | `context.cpp`（`DrainCancellation`） | 标记整棵子树 + 逆序回调 | — |
+| `IOManager::wait` | `io.cpp:2545` | 登记 waiter + park | `WaitResult` |
+
+## 3.2 状态机全集
+
+**G（Task）**：
+
+```
+New ──spawn──▶ Runnable ──claim──▶ Running
+                  ▲                  │
+                  │                  ├─ park ──▶ Waiting ──wake──▶ Runnable
+                  │                  ├─ yield ──▶ Runnable（回环尾）
+                  │                  ├─ 返回 ──▶ Completed/Failed
+                  └──cancel──────────┴─ cancel ──▶ Cancelled
+Waiting 下被 cancel：置 token，唤醒后由等待循环收尾（不直接改终态）
+```
+
+**M**：`Idle → Running → {Blocking → Idle | Parked → Idle | Stopping → Dead}`
+
+**P**：`Idle → Running → Stopping → Dead`
+
+**Fiber**：`Ready → Running → Suspended → Running → Completed/Failed`；
+只有 Completed/Failed 才允许进 FiberBin。
+
+**Channel 等待节点**：`Waiting → kReady | kClosed | kCancelled | kTimedOut`，
+由 `signal` 的 CAS 选出唯一赢家；输家只做清理，不改结果。
+
+**Mutex**：`正常模式 ↔ 饥饿模式`（等待 >1 ms 触发；队列空或被交接者
+未超阈值时退出）。状态位是 `kLocked/kWaiter/kStarving/kWoken`。
+
+**Timer**：`Pending → Running → Completed`；`Cancelled/Failed` 终态。
+取消只阻止尚未领取的回调。
+
+## 3.3 锁层次与所有权
+
+**全局锁序**（任意时刻只能按这个方向嵌套，反向必死锁）：
+
+```
+admission（Impl::mutex）
+   └─▶ incoming 条带锁（叶子锁，持锁期间禁止再调 enqueue）
+        └─▶ P 锁（冷路径）
+             └─▶ Task 状态字（原子，不是锁）
+```
+
+**另外三条独立链**（与上面不交叉）：
+
+- Channel：`ChannelSpinLock` → 等待者 futex 字（**不能**在持 Channel 锁时 park）；
+- ParkingCondition：`queue_mutex` ↔ 节点门（注释明确「从不嵌套」）；
+- IO：`IOManager::State::m_mutex`（deadline/registrations）→ 条带锁。
+
+**所有权三条铁律**：
+
+1. `fd`/Fiber 栈/等待节点都是「**谁创建谁持有，谁出队谁负责**」；
+2. 队列只存裸指针/弱引用，**不允许**在队列里放 `shared_ptr` 之外的强生命周期延长；
+3. 回调（Context/Channel 取消）**永远**在锁外执行，且禁止 park。
+
+## 3.4 失败路径分类（F1–F12）
+
+| # | 失败 | 触发点 | 代码行为 | 调用方该做什么 |
+|---|---|---|---|---|
+| F1 | 入队失败 | `enqueue` 返回 false | `spawn` 内 `cancel()`，返回终态句柄 | 检查 `task->done()`，别当它还会跑 |
+| F2 | claim 失败 | `claim_from_queue` false | `recover_unclaimed`（`scheduler.cpp:5697` 的 lambda）判定是否补发布 | 无（内部自愈），但可观测计数 |
+| F3 | Fiber 拒绝挂起 | `park_for_scheduler` 返回 kRejected | `resume_after_failed_park` 回滚 Running | 重试或直接返回错误 |
+| F4 | 取消先于 park | 状态字已 Cancelled | `kRejected`，等待循环立即返回 | 检查 `kCancelled` |
+| F5 | 唤醒令牌先到 | bit8 已置 | 清令牌返回 `kRequeued`，**不挂起** | 继续执行（不要假设一定睡过） |
+| F6 | 超时 | deadline 到期，`TryFinish(kTimedOut)` | 摘节点、返回 `kTimedOut` | 区分「没等到」与「关闭」 |
+| F7 | 关闭与发送并发 | Send 锁内看到 `m_closed` | 返回 `kClosed`，不写入 | 停止发送，排空接收 |
+| F8 | 重复关闭 | 第二次 `Close` | `kAlreadyClosed` | 幂等处理 |
+| F9 | 重锁失败（CV） | 调度器已关闭 | 先 8192 次无 park 抢回，抢不回抛异常 | 捕获，别在未持锁时改容器 |
+| F10 | shutdown 超时 | `shutdown_for` 有界超时 | 返回 false，保持 draining | 可再次 `shutdown()` 继续 |
+| F11 | 锁内 park | `no_park_depth != 0` | debug abort / release 降级 + 计数 | 拆临界区，别在 SpinMutex 里等 |
+| F12 | 注册表泄漏 | 非终态 G 未释放 | shutdown 永不返回 | 检查是否有 G 卡在 Running |
+
+## 3.5 三个关键时序的逐行读法
+
+### 时序 1：park 的原子提交（`scheduler.cpp:1429`）
+
+```
+1. 读 no_park_depth / m_held_mutexes（只在当前 G 是 this 时）
+2. load state_word(acquire)
+3. 状态 != Running → kRejected（已取消/终态）
+4. token 位已置 → CAS 清 token → kRequeued（不睡）
+5. CAS(Running → Waiting) → kParked
+6. Fiber::Suspend 换栈；worker 继续下一轮
+```
+
+**读法**：这段代码没有锁、没有分配、`noexcept`。它的正确性完全依赖
+「状态 + token 在同一个字」。第 4 步是「唤醒先到」的快速路径，
+第 5 步失败说明有人并发改了状态，循环重读。
+
+### 时序 2：wake 的延迟入队（`scheduler.cpp:1358`）
+
+```
+1. CAS(Waiting → Runnable)
+2. 若执行权仍被占（m_execution_claim）→ 只置 deferred_enqueue
+3. 否则立即入队（runnext/本地环）
+```
+
+**为什么延迟**：唤醒者可能是在被唤醒 G 自己的栈上（同线程回调），
+此时立刻入队会被同一 M 取到并重入。延迟到 `run()` 退出后再发布，
+保证「一个 G 不会在自己还没退出时被再次执行」。
+
+### 时序 3：shutdown 的 12 步（`scheduler.cpp:3467` / `:2792`）
+
+```
+1. 关 admission（set_accepting(false)、set_draining(true)）
+2. begin_shutdown_locked 排空 P：runnext + 环
+3. 已启动 G → request_cancel + 放回可运行；未启动 → 原地取消
+4. 排空 global / 每台 M 的 inbox / 16 条 incoming
+5. 扫 registry[16] 唤醒 parked G
+6. 等 live_tasks_total()==0（O(1) 谓词）
+7. 超时 → 返回 false，保持 draining
+8. 停 sysmon（set_stopping + stop_sysmon）
+9. 等 active_workers==0（有界路径）
+10. 持锁摘 thread，放锁后 join
+11. P 置 Dead、清 started
+12. 锁外释放 deferred_destruction 里的用户捕获
+```
+
+**第 10 步的顺序不能反**：worker 尾声要先拿 `Impl::mutex`，
+如果持锁 join 会自死锁。
+
+## 3.6 Fiber 栈增长与信号路径
+
+前面把 G 当成「有栈的任务」，但栈从哪来、用完怎么办，是本节的内容。
+这一节没有新概念，只有四个必须同时成立的约束。
+
+### 3.6.1 栈的三段式布局
+
+```
+高地址
+┌──────────────────────────┐  ← 预留区顶端（8 MiB VA，PROT_NONE）
+│  guard / 未提交预留区      │     访问 → SIGSEGV → 增长判定
+├──────────────────────────┤  ← 已提交窗口顶端（初始 4 KiB，页对齐）
+│  已提交可用栈（向下增长）   │     正常 push/pop 在这里
+├──────────────────────────┤  ← 当前 rsp 附近
+│  已提交保留区（低水位）     │     增长时 mprotect 把窗口往下推
+└──────────────────────────┘  ← 预留区底端
+低地址
+```
+
+对应实现：`FiberStack` 的 `m_initial_usable / m_reserve / m_committed`
+（`src/concurrency/fiber.cpp` 的 `FiberStack` 段），以及 `Fiber::Impl`
+的 `m_stack / m_stack_size / m_stack_growable`。三个数字的含义分别是
+「一开始能用的字节数」「VA 预留总量」「已提交到哪」。
+
+**为什么预留不等于提交**：8 MiB × 10 万 G = 819 GB VA，但实际只提交
+每栈顶部几 KiB。VA 不占物理页，但占 `vm.max_map_count` 的映射数——
+这是「3 万 G 触顶」的根因（每个 G 至少两个映射：栈 + guard）。
+
+### 3.6.2 增长判定：handler 只认三种信号
+
+访问未提交页 → SIGSEGV。handler 必须判断「这是栈增长，还是真 bug」，
+只有同时满足才增长：
+
+```
+条件 1：fault 地址落在该 Fiber 的预留区内（不是任意地址）
+条件 2：当前 rsp 也在预留区内（不是野指针写到了栈区）
+条件 3：距离已提交窗口不超过 256 KiB（防止一次跳太远把 guard 跨过去）
+```
+
+三条都成立 → `mprotect` 提交下一页/一段 → 返回继续执行；
+任一不成立 → 恢复默认动作，保留 core（**不要吞掉真崩溃**）。
+
+**固定栈退化**：`fiber_stack_growable=false`、非 Linux、非原生后端三种情况
+都不安装 handler、不分配 `sigaltstack`。此时爆栈 = 进程被杀，
+没有「增长失败」这种中间态。这是可移植性换来的代价。
+
+### 3.6.3 切换只换 rsp
+
+`resume()` 与 `Suspend()` 的核心是保存 6 个 callee-saved 寄存器 +
+返回地址，然后换 rsp 跳转（汇编在 `src/concurrency/context_x64.S`）。
+**不拷贝栈**，所以 G 迁移到另一个 M 时栈地址不变——这既是优点
+（指针稳定、无需修栈）也是限制（不能收缩、不能搬栈）。
+
+`resume()` 的并发保护是 `m_switch` 里的 claim 位：第二个并发 resume
+直接返回 false，不破坏栈。跨线程 resume 会更新
+`m_last_resume_thread_hash` 并触发诊断，但**不禁止**——调度器本来就
+要迁移 G。
+
+### 3.6.4 复用：FiberBin
+
+终态 Fiber 进每 M 的 `FiberBin`（默认 32/调度器 128/上限 4096 槽）。
+复用时要求 `use_count()==1`，否则丢弃——因为还有别人持有这个 Fiber
+（观察者/调试器），复用会撕裂其视图。池满则真析构（归还 VA）。
+
+**代价**：池化让「首次执行」与「复用执行」走不同分支，
+`Task::run` 里因此有一次 `if (首次)`；这也是 spawn 路径指令数偏高的
+原因之一（见第 5 层）。
+
+## 3.7 锁序自检表（改代码前先过一遍）
+
+| 你要拿的锁 | 允许先持有 | 禁止先持有 | 违反后果 |
+|---|---|---|---|
+| `Impl::mutex`（admission） | 无 | 任何条带锁、P 锁 | ABBA 死锁 |
+| incoming 条带锁 | admission | P 锁、Task 状态 | 死锁 + 丢唤醒 |
+| P 锁 | admission | 条带锁 | 反向嵌套 |
+| `ChannelSpinLock` | 无 | 任何调度器锁 | 持锁 park → 自死锁 |
+| `ParkingCondition::m_queue_mutex` | 无 | 节点门 | 注释明确「从不嵌套」 |
+| `IOManager::State::m_mutex` | 无 | 条带锁 | `expire_timers` 两阶段就是为了破这个环 |
+
+**读法**：这张表是「静态检查清单」，不是运行期机制。代码 review 时
+先看新加的锁在表里的哪一行，再看它上方允许的锁是否真的持有。
+
+## 3.8 第三层小结 & 下一层看什么
+
+
+**小结**：这一层的关键不是记住行号，而是记住**失败路径的形状**——
+几乎所有错误都被折叠成「状态码 + 等待循环重检」，而不是异常。
+唯一的例外是 CV 重锁失败（F9），因为它破坏了「返回即持锁」的契约。
+
+**下一层看什么**：拿三个真实场景去验证上面的机制——
+一次 Channel 超时、一次取消与关闭的竞态、一次 shutdown 卡住。
+重点看「默认值在什么情况下会坑你」。
+
+---
+
+# 第四层 · 实战与陷阱
+
+## 4.1 场景 1：Channel 超时（`RecvFor`）
+
+**背景**：一个 worker 从任务通道收活，等待 1 ms 超时后去检查退出标志。
+
+```cpp
+auto r = ch->RecvFor(std::chrono::milliseconds(1), ctx);
+switch (r.status) {
+  case ChannelStatus::kReady:      handle(r.value); break;
+  case ChannelStatus::kTimedOut:   check_shutdown(); break;
+  case ChannelStatus::kClosed:     return;   // 通道关了
+  case ChannelStatus::kCancelled:  return;   // ctx 取消了
+  default: /* kWouldBlock / kNil */ break;
+}
+```
+
+**会发生什么**（按源码顺序）：
+
+1. `RecvUntil`（`include/go2cpp/concurrency/channel.hpp:3262`）先做一次锁内直交/缓冲检查；
+2. 没有值 → 建 `PendingRecv` 入 `m_receivers`，注册 Context 回调；
+3. 计算 deadline，用 `TimerService::Default().Schedule`（`include/go2cpp/concurrency/channel.hpp:2645`）登记超时；
+4. park；超时后 `TryFinish(kTimedOut)` 摘节点、返回 `kTimedOut`；
+5. 如果此刻发送者正好到达，`signal` 的 CAS 只有一个赢家——
+   要么拿到值（kReady），要么超时（kTimedOut），**不会两者都发生**。
+
+**坑 1：1 ms 不是精确值**。Timer 是单线程 + `multimap`，后台线程
+`wait_until` 到期后才摘；实际误差取决于该线程被调度的时间。要用
+精确超时，走 `IOManager` 的 deadline 队列（IO 路径），不要用业务 Timer。
+
+**坑 2：超时后节点不会立刻从队列中间消失**。取消/超时节点靠交接方
+`pop_front` 时跳过并回收（僵尸节点）。所以「超时后立刻复用同一个
+Channel 对象」是安全的，但「超时后立刻销毁 Channel」要看是否还有
+交接方在跑——这也是为什么 `Channel` 用 `shared_ptr` 管理。
+
+**坑 3：`kTimedOut` 与 `kCancelled` 要分开处理**。前者是「这次没等到」，
+后者是「整体取消了」。混在一起会导致退出流程吞掉真实错误。
+
+## 4.2 场景 2：取消与关闭的竞态（UAF 风险点）
+
+**背景**：HTTP handler 用 `ctx` 取消一个正在 `Send` 的 goroutine，
+同时另一个线程 `Close()` 通道。
+
+三个角色同时动：
+
+```
+G1: Send(v)  → 已登记 PendingSend，park
+G2: Close()  → 置 m_closed，准备唤醒 senders
+G3: ctx.Cancel() → 回调按 token 找到 PendingSend，CAS signal=kCancelled
+```
+
+**源码怎么保证不 UAF**：
+
+1. 取消回调只持 `weak_ptr<CancelHub>` + token，在 hub/Channel 锁内
+   按 token 定位节点并 CAS；**从不直接解引用队列外节点**；
+2. 节点在 G1 的栈帧上，G1 不返回，节点就不会失效；
+3. Close 与 Cancel 都只做「CAS signal + 唤醒」，真正的摘除由 G1
+   醒来后的等待循环做；
+4. 若 G1 先被唤醒并已返回，Cancel 的 token 查找会失败（节点已标记），
+   回调变成 no-op。
+
+**坑**：在取消回调里做重活。回调在通知线程同步执行，
+阻塞会拖住整个取消链（Context 的 `DrainCancellation` 是迭代的，
+但单个回调慢仍会拖慢整批）。禁止在回调里 park。
+
+**验证方法**：开 `-fsanitize=address` 跑 `tests/concurrency/test_channel.cpp`，
+再用 `GO2CPP_DEBUG_LOCKS=1` 抓「回调里持锁」的误用。
+
+## 4.3 场景 3：shutdown 卡住不返回
+
+**症状**：`shutdown_for(1s)` 返回 false，再调一次还是 false，进程退不出。
+
+**排查顺序**（按概率）：
+
+| 步 | 检查 | 命令/入口 | 结论 |
+|---|---|---|---|
+| 1 | 是否还有非终态 G | `live_tasks_total()`（`scheduler.cpp` 内） | >0 说明有 G 卡住 |
+| 2 | 哪个 G 卡在 Running | 注册表遍历 + `Task::state()` | Running 但无 M 执行 → orphan |
+| 3 | 是否在等一个永远不会来的条件 | gdb 抓所有 worker 栈 | 看是否在 `park_for_scheduler` |
+| 4 | 是否有人在 SpinMutex 里 park | `GO2CPP_DEBUG_LOCKS=1` | debug 下会 abort 并打印 |
+| 5 | 是否 `max_workers` 用尽 | `machine_stats()` | 全是 Blocking → 补 M 失败 |
+
+**最常见的两个真因**：
+
+- **F12 注册表泄漏**：某个 G 在 `Running` 状态但对应 M 已经死了
+  （例如用户代码 `std::terminate` 前没有走 run 的收尾）。自愈路径
+  `recover_orphan_running`（`scheduler.cpp:1638`）只在 `run()` 正常返回时触发。
+- **在 `no_park_depth != 0` 的临界区里 park**：release 下会降级而不是
+  abort，表现为「任务偶尔卡死」；开 debug 立刻暴露。
+
+**注意**：draining 期间 sysmon 仍在跑，这是故意的——长 syscall 的 M
+需要被 detach 并补位，提前停 sysmon 会让 shutdown 永远等不到
+`active_workers==0`。
+
+## 4.4 默认行为表（不知道这些就会误判）
+
+| 项 | 默认 | 出处 | 什么时候会坑你 |
+|---|---|---|---|
+| `collect_metrics` | **false** | `include/go2cpp/concurrency/scheduler/scheduler.hpp:240-308` | 想看指标发现全 0；打开后每任务多两次取钟 |
+| `enable_sysmon` | true，10 ms | 同上 | 以为长 syscall 会自动补 M，其实只补「已声明」的 |
+| `allow_idle_shrink` | false | 同上 | 空闲 M 不缩容，容器里 RSS 偏高 |
+| `fiber_stack_growable` | true | 同上 | 非 Linux/非原生后端自动退化固定栈 |
+| `wake_policy` | `kRunNext` | 同上 | 跨 P 唤醒多时局部性差，可换 `kLastMachine` |
+| `local_queue_limit` | 256 | 同上 | 只约束 admission，不约束 incoming 条带 |
+| `TimerService` | 单线程 | `timer.cpp` | 慢回调拖全局；每请求超时别塞这里 |
+| `Context` 回调 | 同步、锁外 | `include/go2cpp/concurrency/context.hpp:25` | 回调里阻塞会拖慢取消链 |
+
+## 4.5 可选策略（按场景选，不要默认全开）
+
+| 场景 | 建议 | 理由 |
+|---|---|---|
+| 延迟敏感、任务短 | `wake_policy=kRunNext` + 小 `local_queue_limit` | 保持缓存局部性 |
+| 跨 P 唤醒多（生产者/消费者分离） | `wake_policy=kLastMachine` | 减少 G 迁移 |
+| 容器内、内存敏感 | `fiber_stack_size` 调小 + `allow_idle_shrink=true` | VA 与 RSS 都降 |
+| 需要排障 | `collect_metrics=true` + `GO2CPP_DEBUG_LOCKS=1` | 指标 + 契约检查 |
+| 纯计算任务 | 显式 `yield_current()`，别指望抢占 | 没有异步抢占 |
+| 大量短定时器 | 用 `IOManager` deadline，不用业务 Timer | 单线程 Timer 是瓶颈 |
+
+## 4.6 调试方法
+
+**gdb**：卡死时 `thread apply all bt`，重点看三类栈——
+`park_for_scheduler`（正常挂起）、`FutexMutex::lock`（等锁）、
+`SpinMutex::Lock`（自旋中，通常是 bug）。
+
+**日志/计数**：`machine_stats()` 给每台 M 的
+`runnext_hits/inbox_hits/same_machine_resumes/cross_machine_resumes/
+long_syscall_count`；`cross_machine_resumes` 突然升高说明亲和性失效。
+
+**指标**：打开 `collect_metrics` 后看任务延迟分布；注意它本身有成本
+（每任务两次取钟 + 跨核 RMW），压测时要关。
+
+**Sanitizer**：ASan 抓 UAF（Channel 节点/Context 回调），
+TSan 抓锁序（admission/条带/P 的反向嵌套）。
+
+**契约检查**：`GO2CPP_DEBUG_LOCKS=1` 让 SpinMutex 的「禁止 park」
+从 release 降级变成 abort；`GO2CPP_DEBUG_RESOURCES` 注册调试资源，
+用于查泄漏。
+
+## 4.7 第四层小结 & 下一层看什么
+
+**小结**：这一层的三个场景分别对应「超时」「取消」「关闭」——
+它们是并发原语最容易出错的三个边界。共同规律是：
+**所有等待都必须有出口，所有出口都必须能区分原因**。
+
+**下一层看什么**：既然默认值有成本（metrics、sysmon、栈预留），
+第 5 层就用实测数字回答「这些成本具体是多少、值不值得关」。
+
+---
+
+# 第五层 · 性能与调优
+
+> 数字口径：全部来自仓库内报告，标注了文件名与行号；**不是本文新测**。
+> 换机器/换编译器必须重测，不要跨环境引用。
+
+## 5.1 已知基线（引用）
+
+| 指标 | 数值 | 出处 |
+|---|---|---|
+| 任务创建（spawn 全链） | 656–764 ns | `docs/reports/2026-11-01-asm-concurrency-review.md:6`（引 `docs/metrics-ledger.md` M16） |
+| Channel 单次收发 | 10.73 ns | 同上 `:6` |
+| Mutex 加解锁 | 3.75 ns | 同上 `:6` |
+| Fiber 上下文切换 | 23.5 ns（物理下限 21 ns） | 同上 `:6` |
+| `Scheduler::spawn` 指令数 | 194 条，栈帧 0x58 | 同上 `:14` |
+| `Scheduler::enqueue` 指令数 | **789 条，栈帧 712 B** | 同上 `:15` |
+| 优化后目标（A 档：编译选项+局部改写） | 560–600 ns | 同上 `:211` |
+| 优化后目标（B 档：结构小改） | 470–520 ns | 同上 `:212` |
+
+**判读**：Fiber 切换已经贴着物理下限（23.5 vs 21 ns），所以「优化协程切换」
+没有意义；真正的差距在**每个任务要付一次堆分配、5 次引用计数、
+2 套同步原语、148 个函数的栈保护**（同报告 `:202` 的结论）。
+
+## 5.2 瓶颈在哪（按收益排序）
+
+| 瓶颈 | 证据 | 收益估计 | 风险 |
+|---|---|---|---|
+| `enqueue` 789 指令 / 712 B 栈帧 | 反汇编统计（`:15`） | 15–25 ns/任务 | 低（拆分函数/减内联） |
+| spawn 路径的堆分配 + 40 条清 0 | `:105` 的 `operator new` + 清 0 store | 10–15 ns/任务 | 中（对象池） |
+| 引用计数 5 次 | `:202` | 结构改动 | 高（改所有权模型） |
+| TLS 访问 `__tls_get_addr` | `:64`（park/wake 往返 6–10 次） | 10–20 ns/park | 低（initial-exec） |
+| 栈保护 canary | `:38`（GCC 默认 `-fstack-protector-strong`） | 2–5 ns/任务 | 低（`-fno-stack-protector` 局部） |
+| 可运行计数重复计算 4 次 | `:70` | 10–20 ns/wake | 低 |
+
+**架构 > 汇编**：上表前两项是「结构」（分配/所有权），后两项是「指令」。
+按仓库的性能标准，先把架构问题解决，再抠指令。
+
+## 5.3 调参建议（按代价从低到高）
+
+1. **关掉不需要的观测**：`collect_metrics=false`（默认就是 false，
+   确认没被环境变量打开）；压测时尤其要关。
+2. **栈参数**：`fiber_stack_size` 默认 2 KiB 提交、8 MiB 预留；
+   短任务多时把预留调小（例如 1 MiB）可显著降 VA 压力，
+   但要接受「栈增长到上限就崩」。
+3. **队列边界**：`local_queue_limit=256` 是实测最优点
+   （`scheduler.cpp:2009` 附近注释：把窃取移出全局锁实测 -34%），
+   不要凭直觉调大。
+4. **wake_policy**：默认 `kRunNext`；跨 P 通信多时试 `kLastMachine`。
+5. **worker 数**：`min_workers=0 → P`、`max_workers=0 → 2P`；
+   IO 密集可上调 `max_workers`，CPU 密集保持默认。
+6. **Timer**：业务定时器与 IO deadline 分开，别把每请求超时塞进
+   `TimerService`（单线程）。
+
+## 5.4 怎么验证调参有效
+
+- 用仓库 bench（`bench_scheduler_task_opt`、`startup_cost_park_wake`），
+  **绑核 + 多轮 + 报中位数**，不要单轮；
+- 每次只改一个参数，记录「前/后 + 条件」；
+- 指标看 p99 而不是均值——调度器的退化通常先体现在尾部；
+- 反汇编确认改动生效（`objdump -d -C --no-show-raw-insn` 数指令/栈帧）。
+
+## 5.5 第五层小结
+
+**小结**：这个模块的性能已经「接近下限」的部分是 Fiber 切换与
+Channel 快路径；差距在任务创建路径的分配与引用计数。调参能拿到
+个位数到十几个百分点的收益，结构改动（对象池/所有权）才能拿到
+数量级——但风险也高一个量级。
+
+---
+
+# 附：读完之后的自检清单
+
+1. 能否画出「G → P → M → 内核」的完整路径，并指出每一步的锁？
 2. 能否解释 `runnext` 为什么是单槽、为什么窃取者不偷它？
-3. 能否说出一个 G 从 `kWaiting` 回到 `kRunning` 的完整链路（谁改状态、谁入队、谁 resume）？
-4. 能否指出 `Channel` 的 D1/D2 两个历史缺陷分别修在哪一行？
-5. 能否解释 `Context` 为什么必须「先标记完整子树、再执行回调」？
-6. 能否在 10 分钟内用 `bench_scheduler_task_opt` / `startup_cost_park_wake` 实测一次并报出条件？
+3. 能否说出一个 G 从 `kWaiting` 回到 `kRunning` 的完整链路
+   （谁改状态、谁入队、谁 resume）？
+4. 能否指出 Channel 的 D1/D2 两个历史缺陷分别修在哪一段？
+5. 能否解释 Context 为什么必须「先标记完整子树、再执行回调」？
+6. 能否解释为什么「状态 + 令牌」必须在同一个 32 位字里？
+7. 能否在 10 分钟内用 bench 实测一次 spawn 并报出条件？
 
-如果有一题答不上，回到对应小节重读；这份文档不替代源码，只负责告诉你「该看哪一段、为什么」。
+# 附-2：本文明确「未复跑」的地方
+
+- 第 5 层的全部数字都来自报告引用，**本文没有重新压测**；
+- `cross_machine_resumes` 等计数的实际分布未采样；
+- 64 条带/16 条带在极端分布下的碰撞未压测；
+- `fiber_stack_growable=false` 的性能差异未测；
+- 所有结论以当前工作树为准，代码漂移后请先 `grep -n` 再引用。
