@@ -75,8 +75,17 @@ int main() {
     // false，于是不执行任何模块却仍然打印 "all checks passed" 并返回 0，把「空跑」
     // 伪装成「通过」（台账 T-08）。这里显式检测并返回非零。
     bool any_selected = false;
-    const auto selected = [filter, &any_selected](std::string_view name) {
-        const bool match = filter.empty() || filter == name;
+    // `concurrency` 是聚合模块名：一次跑完 tests/concurrency/ 下全部已
+    // 注册模块。此前它不在合法列表里，多个 agent 用
+    // GO2CPP_TEST_FILTER=concurrency 时命中「未匹配任何测试模块」而空跑
+    // （台账 T-08）。第二个参数标记该模块是否属于 concurrency 目录，
+    // 非 concurrency 模块不受聚合影响。
+    const bool concurrency_all = filter == "concurrency";
+    const auto selected = [filter, concurrency_all, &any_selected](
+                              std::string_view name,
+                              bool in_concurrency = false) {
+        const bool match = filter.empty() || filter == name ||
+                           (concurrency_all && in_concurrency);
         if (match && !filter.empty()) {
             any_selected = true;
         }
@@ -84,30 +93,30 @@ int main() {
     };
     if (selected("error")) run_error_tests();
     if (selected("control_flow") || selected("defer")) run_control_flow_tests();
-    if (selected("context")) run_context_tests();
-    if (selected("channel")) run_channel_tests();
-    if (selected("scheduler")) run_scheduler_tests();
-    if (selected("scheduler_stress")) run_scheduler_stress_tests();
-    if (selected("terminal_reclaim")) run_terminal_reclaim_tests();
-    if (selected("dynamic")) run_dynamic_scheduler_tests();
-    if (selected("fiber")) run_fiber_tests();
-    if (selected("fiber_growable")) run_fiber_growable_stack_tests();
-    if (selected("sync")) run_sync_tests();
-    if (selected("locks")) run_locks_tests();
-    if (selected("future")) run_future_tests();
+    if (selected("context", true)) run_context_tests();
+    if (selected("channel", true)) run_channel_tests();
+    if (selected("scheduler", true)) run_scheduler_tests();
+    if (selected("scheduler_stress", true)) run_scheduler_stress_tests();
+    if (selected("terminal_reclaim", true)) run_terminal_reclaim_tests();
+    if (selected("dynamic", true)) run_dynamic_scheduler_tests();
+    if (selected("fiber", true)) run_fiber_tests();
+    if (selected("fiber_growable", true)) run_fiber_growable_stack_tests();
+    if (selected("sync", true)) run_sync_tests();
+    if (selected("locks", true)) run_locks_tests();
+    if (selected("future", true)) run_future_tests();
     if (selected("io")) run_io_tests();
-    if (selected("timer")) run_timer_tests();
-    if (selected("beginner")) run_beginner_api_tests();
+    if (selected("timer", true)) run_timer_tests();
+    if (selected("beginner", true)) run_beginner_api_tests();
     if (selected("log")) run_log_config_tests();
     if (selected("config_transaction")) run_config_transaction_tests();
     if (selected("network")) run_network_tests();
     if (selected("socket_observer")) run_socket_observer_tests();
     if (selected("sse")) run_sse_tests();
-    if (selected("futex_mutex")) run_futex_mutex_tests();
-    if (selected("parking_condition")) run_parking_condition_tests();
-    if (selected("thread_policy")) run_thread_policy_tests();
-    if (selected("fiber_local")) run_fiber_local_tests();
-    if (selected("event_go")) run_event_go_tests();
+    if (selected("futex_mutex", true)) run_futex_mutex_tests();
+    if (selected("parking_condition", true)) run_parking_condition_tests();
+    if (selected("thread_policy", true)) run_thread_policy_tests();
+    if (selected("fiber_local", true)) run_fiber_local_tests();
+    if (selected("event_go", true)) run_event_go_tests();
     if (selected("fd_manager")) run_fd_manager_tests();
     if (selected("errors_ns")) run_errors_namespace_tests();
     if (selected("strings")) run_strings_tests();
@@ -132,7 +141,7 @@ int main() {
 #if defined(GO2CPP_DIAGNOSTIC) && GO2CPP_DIAGNOSTIC
     if (selected("diagnostic")) run_diagnostic_tests();
 #endif
-    if (selected("spin_mutex")) run_spin_mutex_tests();
+    if (selected("spin_mutex", true)) run_spin_mutex_tests();
 #ifdef GO2CPP_TEST_HOOK
     if (selected("hook")) run_hook_tests();
 #endif

@@ -128,6 +128,25 @@ if (GO2CPP_WITH_APP AND GO2CPP_APP_TESTS)
     add_test(NAME app_connection COMMAND app_test_connection)
     add_test(NAME app_load COMMAND app_test_load)
     add_test(NAME app_realtime_resume COMMAND app_test_realtime_resume)
+
+    # gateway：独立编译单元（tests/app/test_gateway.cpp），不并入上面的
+    # CORE 列表。此前手工注册时 CMake 报过 "already exists"，根因是同一
+    # target / test 名被注册两次（CORE 循环 + 单独 add_executable，或重复
+    # include 本文件）。这里先判 TARGET 再注册，二次配置保持幂等。
+    if (NOT TARGET app_test_gateway)
+        add_executable(app_test_gateway
+            ${GO2CPP_APP_TEST_DIR}/test_gateway.cpp)
+        target_include_directories(app_test_gateway PRIVATE
+            ${GO2CPP_APP_TEST_DIR})
+        target_link_libraries(app_test_gateway PRIVATE go2cpp_app)
+        target_compile_options(app_test_gateway PRIVATE
+            -Wall -Wextra -Wpedantic -Werror ${APP_OPT_FLAGS})
+    endif()
+    if (NOT TARGET app_gateway)
+        add_test(NAME app_gateway COMMAND app_test_gateway)
+        set_tests_properties(app_gateway PROPERTIES TIMEOUT 300)
+    endif()
+
     set_tests_properties(app_frame app_stream_table app_resource app_kv
         app_connection app_realtime_resume PROPERTIES TIMEOUT 180)
     # 1 GiB 资源 + 1000 并发流的负载用例：给足时间，不掩盖真实性能。

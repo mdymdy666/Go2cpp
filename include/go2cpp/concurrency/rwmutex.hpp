@@ -340,6 +340,18 @@ public:
                 return false;
             }
             m_waiting_readers.fetch_add(1, std::memory_order_relaxed);
+            // 登记后必须重新检查谓词：Unlock 先改 m_state、再读
+            // m_waiting_readers 决定是否唤醒。若本线程的登记落在「改状态」
+            // 与「读计数」之间，这次唤醒会被跳过；不重查就会一直 park 到
+            // 超时（有写者再来时才可能获救）。条件已成立就回滚计数，回到
+            // 循环顶部走登记路径。
+            const std::int64_t rechecked =
+                m_state.load(std::memory_order_acquire);
+            if (rechecked >= 0 && rechecked < kGate &&
+                m_pending.load(std::memory_order_acquire) == 0) {
+                m_waiting_readers.fetch_sub(1, std::memory_order_relaxed);
+                continue;
+            }
             bool notified = false;
             try {
                 notified = WaitReaderLocked(deadline - now);
@@ -614,6 +626,17 @@ private:
                     m_waiting_readers.load(std::memory_order_relaxed)),
                 true, 0, -1, 0, 0);
 #endif
+            // 登记后重查谓词，闭合与 Unlock 的「先改状态、后读等待计数」
+            // 之间的丢唤醒窗口：若写者已在本线程登记前释放，这里必然看到
+            // 门开；若写者在本线程登记后释放，Unlock 的计数检查会看到本
+            // 线程并唤醒。两种顺序都不会永久 park。
+            const std::int64_t rechecked =
+                m_state.load(std::memory_order_acquire);
+            if (rechecked >= 0 && rechecked < kGate &&
+                m_pending.load(std::memory_order_acquire) == 0) {
+                m_waiting_readers.fetch_sub(1, std::memory_order_relaxed);
+                continue;
+            }
             bool notified = false;
             try {
                 notified = m_reader_cv.Wait(m_park_mutex);

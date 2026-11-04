@@ -1382,3 +1382,21 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
   仍在工作区未提交。本次任务本身未 commit。
 - **已知限制**：收藏列表上限 100（前端 limit=100），无 cursor 分页；二维码为视觉占位
   不可扫码；演示环境未接第三方分享 SDK。
+
+## 2026-11-04 18:05 修 flaky + 注册测试（修 flaky agent）
+
+- **locks flaky 根因**：`RWMutex::RLockSlow` / `RLockFor` 在
+  `m_waiting_readers++` 之后、park 之前没有重查谓词；`Unlock` 先改
+  `m_state`、再读等待计数决定是否唤醒，读者登记恰好落在两者之间时丢唤醒，
+  永久 park（连接池 stat 线程 30s watchdog、BenchRw 60s watchdog）。
+  修复：登记后重查 `m_state` / `m_pending`，已满足就回滚计数回到登记路径。
+- **验证**：`GO2CPP_TEST_FILTER=locks` 连跑 20 次全过（修复前 10 次 2 失败）；
+  `GO2CPP_TEST_FILTER=concurrency` 聚合模块 8.9s 全过。
+- `tests/app/build_and_run_realtime.sh` 补 `-lgo2cpp_log`（`GO2CPP_BUILD` + rpath），
+  52 checks / 0 failures。
+- `cmake/Go2CppApp.cmake` 注册 `app_test_gateway` + ctest `app_gateway`
+  （`if (NOT TARGET ...)` 防重名），`ctest -R gateway` 2.68s 通过。
+- `tests/test_main.cpp` 新增合法模块名 `concurrency`（聚合 19 个 concurrency 模块）。
+- 未 commit。`go2cpp_tests` 全量仍有既存失败：`tests/network/test_hook.cpp:518`
+  `worker_count() >= 2`，与本次改动无关（并发会话改动 `user/modules/network/io_hook_*`
+  正在工作区）。
