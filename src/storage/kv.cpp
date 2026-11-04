@@ -452,6 +452,7 @@ class KV::Impl {
   bool WriteSingle(std::string_view key, std::string_view value,
                    internal::ValueType type);
   bool FlushLocked();
+  bool RotateWalLocked();
   void MaybeCompactLocked();
   void PublishSnapshot(std::unique_ptr<Snapshot> next);
   bool GroupSync(std::uint64_t seq);
@@ -476,6 +477,9 @@ class KV::Impl {
   std::string last_error_;
   std::string scratch_;
   bool closed_ = false;
+  // 刷盘失败后置位：写路径在故障态直接拒绝写入，直到一次成功 flush
+  // 清除。没有它时失败后的写会继续进 WAL/memtable，调用方误以为已持久化。
+  bool flush_failed_ = false;
 };
 
 std::string KV::Impl::PathFor(std::uint64_t no, const char* ext) const {
@@ -667,6 +671,12 @@ bool KV::Impl::ApplyBatch(std::string_view data) {
 }
 
 bool KV::Impl::WriteLocked(std::string_view data) {
+  if (flush_failed_) {
+    // 故障态：上一次刷盘失败，内存表与旧 WAL 仍保有已确认写；继续写会
+    // 让调用方误判持久化成功，也让失败重试路径更复杂。
+    SetError("write stalled: previous flush failed");
+    return false;
+  }
   if (mutable_->ShouldFlush()) {
     if (!FlushLocked()) {
       return false;
@@ -854,78 +864,227 @@ void KV::Impl::PublishSnapshot(std::unique_ptr<Snapshot> next) {
   }
 }
 
+/**
+ * @brief 把内存表与未落盘的 immutable 表合并成一个 SSTable，成功后才切换
+ *        内存表与 WAL。
+ *
+ * @return
+ * - true：SSTable 已持久化（builder 内部 fdatasync + rename），快照已发布，
+ *   新 WAL 已接上——调用方可以继续写；
+ * - false：失败已通过 LastError() 可见。SSTable 构建阶段失败时内存表、
+ *   immutable 表与旧 WAL 全部保持原样；即使失败发生在 WAL 轮换阶段，数据
+ *   也已持久化在 SST 里——没有任何一条已确认写丢失。flush_failed_ 置位，
+ *   写路径进入故障态，直到下一次成功 flush。
+ *
+ * ## 定位
+ * 数据从内存/WAL 转移到 SSTable 的唯一提交点。旧实现的顺序是「先换空表并
+ * 发布 immutable，再构建 SSTable」：构建失败时 immutable 永久停在内存里，
+ * 后续 flush 成功只写新表并 unlink 旧 WAL，immutable 数据在进程退出后
+ * 永久丢失（P1-1）。现在还修了「忽略 wal_->Close() 返回值」（P1-3）。
+ *
+ * ## 步骤
+ * step1. 若上次在 WAL 轮换阶段失败（wal_ 已关闭），先把 WAL 接上；
+ * step2. 收集 mutable_（优先级 0）与所有 immutables（优先级递增）的条目，
+ *        用 shared_ptr 持有表，保证条目视图在构建期间有效；
+ * step3. 按 key 升序、同 key 优先级升序排序，同一 key 只写最新版本；
+ * step4. 构建 SSTable（写 tmp 文件 + fdatasync + rename），失败直接返回，
+ *        不动任何已发布结构；
+ * step5. 发布新快照（新 SSTable 头插、清空 immutables）并换空表；旧表交给
+ *        epoch 延迟回收，避免并发 Get 持有旧指针时 UAF；
+ * step6. 轮换 WAL：检查旧 WAL Close 的返回值；失败时数据已在 SST，删除
+ *        旧 WAL 防止恢复回滚，同时把这次 I/O 失败上抛并置故障态（P1-3）。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：必须持有 mu_；与写路径串行，Get 无锁读 mutable_ptr_。
+ * - 原子性：SSTable 持久化之前不改任何已发布结构；之后发布快照。
+ * - 失败语义：失败时内存数据与旧 WAL 完好，重启可重放；flush_failed_ 置位。
+ * - 不变量：返回 true 后 mutable_ 为空表、immutables 为空、WAL 指向新文件。
+ */
 bool KV::Impl::FlushLocked() {
-  if (mutable_ == nullptr || mutable_->Empty()) {
-    return true;
-  }
-  std::shared_ptr<MemTable> old(mutable_.release());
-  mutable_ = std::make_unique<MemTable>(opt_);
-  MemTable* fresh = mutable_.get();
-
-  auto next =
-      std::make_unique<Snapshot>(*snapshot_.load(std::memory_order_acquire));
-  next->immutables.insert(next->immutables.begin(), old);
-  PublishSnapshot(std::move(next));
-  mutable_ptr_.store(fresh, std::memory_order_release);
-
-  const std::uint64_t no = next_file_no_++;
-  const std::string path = PathFor(no, "sst");
-  SSTableBuilder builder(opt_, path);
-  if (!builder.Open()) {
-    SetError("open sstable failed: " + path);
-    return false;
-  }
-  std::vector<EntryRef> refs;
-  refs.reserve(old->NumEntries());
-  old->ForEach([&refs](std::string_view k, std::string_view v, bool deleted) {
-    refs.push_back({k, v, deleted ? internal::ValueType::kDeletion
-                                  : internal::ValueType::kValue});
-  });
-  std::sort(refs.begin(), refs.end(),
-            [](const EntryRef& a, const EntryRef& b) { return a.key < b.key; });
-  for (const auto& r : refs) {
-    if (!builder.Add(r.key, r.type, r.value)) {
-      SetError("sstable add failed: " + path);
+  // step1: 上次 flush 若在 WAL 轮换阶段失败，wal_ 已被 Close；先接上新
+  // WAL，否则后续 AddRecord 必然失败。数据已在 SST 里，轮换可重试。
+  if (wal_ == nullptr || !wal_->is_open()) {
+    if (!RotateWalLocked()) {
       return false;
     }
   }
-  if (!builder.Finish()) {
-    SetError("sstable finish failed: " + path);
+
+  // step2: 收集待落盘条目。mutable_ 最新（prio 0），immutables 依次更旧。
+  // shared_ptr 拷贝让条目视图在构建期间保持有效（表不会被释放/修改）。
+  const Snapshot* snap = snapshot_.load(std::memory_order_acquire);
+  std::vector<std::shared_ptr<MemTable>> pending;
+  if (snap != nullptr) {
+    pending = snap->immutables;
+  }
+  struct Ref {
+    std::string_view key;
+    std::string_view value;
+    internal::ValueType type;
+    std::uint32_t prio;
+  };
+  std::vector<Ref> refs;
+  if (mutable_ != nullptr) {
+    mutable_->ForEach([&refs](std::string_view k, std::string_view v, bool del) {
+      refs.push_back({k, v,
+                      del ? internal::ValueType::kDeletion
+                          : internal::ValueType::kValue,
+                      0});
+    });
+  }
+  std::uint32_t prio = 1;
+  for (const auto& im : pending) {
+    im->ForEach([&refs, prio](std::string_view k, std::string_view v,
+                              bool del) {
+      refs.push_back({k, v,
+                      del ? internal::ValueType::kDeletion
+                          : internal::ValueType::kValue,
+                      prio});
+    });
+    ++prio;
+  }
+  if (refs.empty()) {
+    flush_failed_ = false;
+    return true;
+  }
+
+  // step3: 同 key 只保留优先级最高（最新）的一条，旧版本不能再写回 SST。
+  std::sort(refs.begin(), refs.end(), [](const Ref& a, const Ref& b) {
+    if (a.key != b.key) {
+      return a.key < b.key;
+    }
+    return a.prio < b.prio;
+  });
+
+  // step4: 构建 SSTable。任何一步失败都直接返回，已发布结构保持原样。
+  const std::uint64_t no = next_file_no_++;
+  const std::string path = PathFor(no, "sst");
+  std::uint64_t sst_size = 0;
+  bool built = false;
+  {
+    SSTableBuilder builder(opt_, path);
+    if (builder.Open()) {
+      built = true;
+      for (std::size_t i = 0; i < refs.size() && built; ++i) {
+        if (i > 0 && refs[i].key == refs[i - 1].key) {
+          continue;  // 同 key 的旧版本
+        }
+        if (!builder.Add(refs[i].key, refs[i].type, refs[i].value)) {
+          built = false;
+        }
+      }
+      if (built && !builder.Finish()) {
+        built = false;
+      }
+      sst_size = builder.file_size();
+    }
+  }
+  if (!built) {
+    ::unlink(path.c_str());
+    SetError("sstable build failed: " + path);
+    flush_failed_ = true;
     return false;
   }
   auto table = SSTable::Open(path, opt_);
   if (table == nullptr) {
+    ::unlink(path.c_str());
     SetError("reopen sstable failed: " + path);
+    flush_failed_ = true;
     return false;
   }
 
-  next =
-      std::make_unique<Snapshot>(*snapshot_.load(std::memory_order_acquire));
-  next->sstables.insert(next->sstables.begin(), std::move(table));
-  for (auto it = next->immutables.begin(); it != next->immutables.end(); ++it) {
-    if (it->get() == old.get()) {
-      next->immutables.erase(it);
-      break;
-    }
+  // step5: 发布快照并换空表。旧 mutable_/immutables 的引用转交给 epoch，
+  // 等所有已进入慢路径的读者退出后再释放（Get 先查 mutable_ptr_ 无锁）。
+  auto next = std::make_unique<Snapshot>();
+  if (snap != nullptr) {
+    *next = *snap;
   }
+  next->sstables.insert(next->sstables.begin(), std::move(table));
+  next->immutables.clear();
   PublishSnapshot(std::move(next));
 
-  const std::uint64_t new_wal_no = next_file_no_++;
-  const std::string new_wal_path = PathFor(new_wal_no, "log");
-  wal_->Close();
-  wal_ = std::make_unique<WalWriter>(opt_);
-  if (!wal_->Open(new_wal_path)) {
-    SetError("cannot create wal: " + new_wal_path);
+  std::shared_ptr<MemTable> old_mutable;
+  if (mutable_ != nullptr) {
+    old_mutable = std::shared_ptr<MemTable>(mutable_.release());
+  }
+  mutable_ = std::make_unique<MemTable>(opt_);
+  mutable_ptr_.store(mutable_.get(), std::memory_order_release);
+  pending.push_back(std::move(old_mutable));
+  epoch_.Retire([pending]() {});
+
+  // step6: 轮换 WAL。Close 失败时 RotateWalLocked 保留旧文件并置故障态。
+  if (!RotateWalLocked()) {
     return false;
   }
-  ::unlink(wal_path_.c_str());
-  wal_path_ = new_wal_path;
-
+  flush_failed_ = false;
   counters_.Add(Counters::kMemtableFlushes);
-  counters_.Add(Counters::kBytesWritten,
-                static_cast<std::uint64_t>(builder.file_size()));
+  counters_.Add(Counters::kBytesWritten, sst_size);
   epoch_.Reclaim();
   MaybeCompactLocked();
+  return true;
+}
+
+/**
+ * @brief 把 WAL 切换到新文件；旧 WAL 只有确认尾部全部落盘后才允许删除。
+ *
+ * @return
+ * - true：新 WAL 已打开，旧 WAL（若存在）已 Close 并 unlink，wal_path_ 指向
+ *   新文件——调用方可以继续 AddRecord；
+ * - false：切换失败，flush_failed_ 已置位。调用方**必须**立即返回错误并
+ *   停止写入，直到下一次成功 flush。
+ *
+ * ## 定位
+ * 刷盘与崩溃恢复的交界点。旧实现直接 `wal_->Close(); unlink(...)`，忽略
+ * Close 返回值：ENOSPC/EIO 导致 WAL 尾部没落盘时，调用方仍以为刷盘成功，
+ * 写路径继续前进，I/O 错误被静默吞掉（P1-3——恢复时的数据完整性依赖
+ * 「SST 已持久」这一前提，但失败必须可见，否则上层无法降级/告警）。
+ *
+ * ## 步骤
+ * step1. 先创建并打开新 WAL；失败时旧 WAL 与旧 fd 原样保留；
+ * step2. 再 Close 旧 WAL：失败说明尾部可能只落了前缀，保留文件供恢复重放
+ *        （重放幂等：本次 SST 已包含这些记录）；同时丢弃刚建的空 WAL；
+ * step3. Close 成功后 unlink 旧文件；unlink 失败只告警（残留旧文件下次
+ *        恢复会重放并清理，数据正确性不受影响）。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：由 KV 写锁串行化。
+ * - 失败语义：wal_ 可能仍指向旧对象（fd 已关）或新对象；wal_path_ 始终
+ *   指向需要保留的文件；flush_failed_ = true。
+ */
+bool KV::Impl::RotateWalLocked() {
+  // step1
+  const std::string next_path = PathFor(next_file_no_++, "log");
+  auto next = std::make_unique<WalWriter>(opt_);
+  if (!next->Open(next_path)) {
+    SetError("cannot create wal: " + next_path);
+    flush_failed_ = true;
+    return false;
+  }
+
+  // step2
+  if (wal_ != nullptr && !wal_->Close()) {
+    // Close 失败说明旧 WAL 尾部可能没落盘；但轮换发生在 SSTable 已
+    // fdatasync + rename 之后，内存里的全部数据都在 SST，旧 WAL 只是
+    // 子集。保留旧 WAL 反而会在下次恢复时把旧值重放到 SST 之上（回滚），
+    // 因此这里必须删除它；错误本身不能静默：上抛 + 故障态，让写路径
+    // 和调用方看见这次 I/O 失败。
+    const std::string failed = wal_path_;
+    next.reset();  // 关闭并删除刚建的空 WAL
+    ::unlink(next_path.c_str());
+    if (!failed.empty()) {
+      ::unlink(failed.c_str());  // 数据已在 SST：删除旧 WAL，防止恢复回滚
+    }
+    SetError("wal close failed: " + failed);
+    flush_failed_ = true;
+    return false;
+  }
+
+  // step3
+  wal_ = std::move(next);
+  if (!wal_path_.empty() && ::unlink(wal_path_.c_str()) != 0 && errno != ENOENT) {
+    GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("storage"))
+        << "cannot remove old wal: " << wal_path_ << " errno=" << errno;
+  }
+  wal_path_ = next_path;
   return true;
 }
 

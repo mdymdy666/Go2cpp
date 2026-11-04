@@ -10,6 +10,7 @@
 #include "go2cpp/storage/kv.hpp"
 
 #include <atomic>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -229,12 +231,247 @@ void TestConcurrentFlushCompaction() {
   std::filesystem::remove_all(dir);
 }
 
+// 场景 5：刷盘失败（目录 0555）后写路径必须报错并进入故障态；恢复权限后
+// 一次成功 Flush 应把失败前已确认的写全部落盘，重启不得丢数据（P1-1）。
+void TestFlushFailureKeepsData() {
+  const std::string dir = TempDir("flush_fail");
+  CHECK(!dir.empty());
+  if (dir.empty()) {
+    return;
+  }
+  CHECK(::chmod(dir.c_str(), 0777) == 0);
+  const bool drop = ::geteuid() == 0;
+  if (drop) {
+    CHECK(::chown(dir.c_str(), 65534, 65534) == 0);
+  }
+  const pid_t pid = ::fork();
+  if (pid == 0) {
+    if (drop && (::setgid(65534) != 0 || ::setuid(65534) != 0)) {
+      ::_exit(20);
+    }
+    Options opt;
+    opt.memtable_size = 16 * 1024;  // 失败前最后一批写仍留在内存表
+    opt.sync_writes = true;
+    auto db = KV::Open(dir, opt);
+    if (!db) {
+      ::_exit(21);
+    }
+    for (int i = 0; i < 10; ++i) {
+      if (!db->Put("k" + std::to_string(i), std::string(300, 'k'))) {
+        ::_exit(22);
+      }
+    }
+    if (::chmod(dir.c_str(), 0555) != 0) {
+      ::_exit(23);
+    }
+    bool failed = false;
+    for (int i = 0; i < 300 && !failed; ++i) {
+      failed = !db->Put("b" + std::to_string(i), std::string(400, 'b'));
+    }
+    if (!failed) {
+      ::_exit(24);  // 表满必须撞上刷盘失败
+    }
+    if (::chmod(dir.c_str(), 0755) != 0) {
+      ::_exit(25);
+    }
+    // 故障态语义：还没有一次成功 flush 之前，写路径必须继续报错。
+    if (db->Put("stalled", "1")) {
+      ::_exit(26);
+    }
+    db->Flush();  // 恢复点：权限恢复后这次 flush 必须成功
+    if (!db->Put("after", "ok")) {
+      ::_exit(27);
+    }
+    for (int i = 0; i < 20; ++i) {
+      if (!db->Put("c" + std::to_string(i), std::string(200, 'c'))) {
+        ::_exit(28);
+      }
+    }
+    db->Close();
+    ::_exit(0);
+  }
+  int status = 0;
+  ::waitpid(pid, &status, 0);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  {
+    auto db = KV::Open(dir);
+    CHECK(db != nullptr);
+    if (db) {
+      for (int i = 0; i < 10; ++i) {
+        std::string v;
+        CHECK(db->Get("k" + std::to_string(i), &v) &&
+              v == std::string(300, 'k'));
+      }
+      std::string v;
+      CHECK(db->Get("after", &v) && v == "ok");
+      db->Close();
+    }
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// 场景 6：WAL 部分写失败（RLIMIT_FSIZE 截断）后重试，已落盘前缀不得重写：
+// 重启后 WAL 必须能完整解析，k9/k10 不得因重复前缀而损坏丢失（P1-2）。
+void TestWalPartialWriteRetry() {
+  const std::string dir = TempDir("wal_partial");
+  CHECK(!dir.empty());
+  if (dir.empty()) {
+    return;
+  }
+  const pid_t pid = ::fork();
+  if (pid == 0) {
+    ::signal(SIGXFSZ, SIG_IGN);
+    Options opt;
+    opt.write_buffer_size = 4096;  // 记录攒在用户态缓冲，由阈值触发 write
+    opt.sync_writes = false;
+    auto db = KV::Open(dir, opt);
+    if (!db) {
+      ::_exit(30);
+    }
+    // 7 条 × (510B 记录 + 7B 块头) ≈ 3619B，不到 4096 阈值，尚未落盘。
+    for (int i = 1; i <= 7; ++i) {
+      if (!db->Put("k" + std::to_string(i), std::string(500, 'a'))) {
+        ::_exit(31);
+      }
+    }
+    struct rlimit saved;
+    if (::getrlimit(RLIMIT_FSIZE, &saved) != 0) {
+      ::_exit(32);
+    }
+    struct rlimit rl = saved;
+    rl.rlim_cur = 64;  // WAL 仍为 0 字节：只允许 64 字节落地 -> 部分写
+    if (::setrlimit(RLIMIT_FSIZE, &rl) != 0) {
+      ::_exit(33);
+    }
+    // 第 8 条把缓冲顶过阈值 -> 部分写失败（Put 必须报错）。
+    if (db->Put("k8", std::string(500, 'b'))) {
+      ::_exit(34);
+    }
+    if (::setrlimit(RLIMIT_FSIZE, &saved) != 0) {
+      ::_exit(35);
+    }
+    // 重试只允许写剩余后缀；若重写前缀，WAL 流会重复损坏。
+    if (!db->Put("k9", std::string(500, 'c'))) {
+      ::_exit(36);
+    }
+    // 大 value 再次顶过阈值，把 k10 与剩余后缀一起落盘。
+    if (!db->Put("k10", std::string(4500, 'd'))) {
+      ::_exit(37);
+    }
+    ::_exit(0);  // 模拟崩溃：不 Close，恢复只能依赖 WAL
+  }
+  int status = 0;
+  ::waitpid(pid, &status, 0);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    std::fprintf(stderr, "  partial-write child status: exited=%d code=%d sig=%d\n",
+                 WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                 WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+  }
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  auto db = KV::Open(dir);
+  CHECK(db != nullptr);
+  if (db) {
+    for (int i = 1; i <= 7; ++i) {
+      std::string v;
+      CHECK(db->Get("k" + std::to_string(i), &v) &&
+            v == std::string(500, 'a'));
+    }
+    std::string v8;
+    CHECK(db->Get("k8", &v8) && v8 == std::string(500, 'b'));
+    std::string v9;
+    CHECK(db->Get("k9", &v9) && v9 == std::string(500, 'c'));
+    std::string v10;
+    CHECK(db->Get("k10", &v10) && v10 == std::string(4500, 'd'));
+    db->Close();
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// 场景 7：刷盘时 WAL Close 失败（尾部写不进，RLIMIT_FSIZE）必须被上抛：
+// 错误可见、写路径进入故障态；本次数据已进 SST，重启不得回滚（P1-3）。
+void TestWalCloseFailureVisible() {
+  const std::string dir = TempDir("wal_close_fail");
+  CHECK(!dir.empty());
+  if (dir.empty()) {
+    return;
+  }
+  const pid_t pid = ::fork();
+  if (pid == 0) {
+    ::signal(SIGXFSZ, SIG_IGN);
+    Options opt;
+    opt.memtable_size = 64u << 20;    // 不自动刷盘，让数据停在内存/WAL 缓冲
+    opt.write_buffer_size = 64u << 20;  // 不自动落 WAL，Close 时一次性写
+    opt.sync_writes = false;
+    auto db = KV::Open(dir, opt);
+    if (!db) {
+      ::_exit(40);
+    }
+    for (int round = 0; round < 200; ++round) {
+      for (int i = 0; i < 10; ++i) {
+        const std::string v(500, static_cast<char>('a' + i));
+        if (!db->Put("k" + std::to_string(i), v)) {
+          ::_exit(41);
+        }
+      }
+    }
+    struct rlimit saved;
+    if (::getrlimit(RLIMIT_FSIZE, &saved) != 0) {
+      ::_exit(42);
+    }
+    struct rlimit rl = saved;
+    rl.rlim_cur = 64 * 1024;  // SST(~6KB) 可落盘，WAL(~1MB) 只能写前缀
+    if (::setrlimit(RLIMIT_FSIZE, &rl) != 0) {
+      ::_exit(43);
+    }
+    db->Flush();
+    if (db->LastError().find("wal close failed") == std::string::npos) {
+      ::_exit(44);  // 旧实现静默忽略 Close 返回值
+    }
+    if (db->Put("x", "y")) {
+      ::_exit(45);  // 故障态：没有成功 flush 之前写必须失败
+    }
+    if (::setrlimit(RLIMIT_FSIZE, &saved) != 0) {
+      ::_exit(46);
+    }
+    db->Flush();  // 恢复：重新接上 WAL
+    if (!db->Put("after", "ok")) {
+      ::_exit(47);
+    }
+    db->Close();
+    ::_exit(0);
+  }
+  int status = 0;
+  ::waitpid(pid, &status, 0);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    std::fprintf(stderr, "  wal-close child status: exited=%d code=%d sig=%d\n",
+                 WIFEXITED(status), WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                 WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+  }
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  auto db = KV::Open(dir);
+  CHECK(db != nullptr);
+  if (db) {
+    for (int i = 0; i < 10; ++i) {
+      std::string v;
+      CHECK(db->Get("k" + std::to_string(i), &v) &&
+            v == std::string(500, static_cast<char>('a' + i)));
+    }
+    std::string v;
+    CHECK(db->Get("after", &v) && v == "ok");
+    db->Close();
+  }
+  std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
   TestStaleWalAfterRestart();
   TestTruncatedWalAfterRestart();
   TestReadOnlyDirectory();
+  TestFlushFailureKeepsData();
+  TestWalPartialWriteRetry();
+  TestWalCloseFailureVisible();
   TestConcurrentFlushCompaction();
   std::printf("storage_audit_test: %d checks, %d failures\n", g_checks,
               g_failures);

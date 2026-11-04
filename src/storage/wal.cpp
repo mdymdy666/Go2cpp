@@ -230,6 +230,29 @@ bool WalWriter::AddRecord(std::string_view record) {
   return true;
 }
 
+/**
+ * @brief 把用户态写缓冲交给内核；部分写失败时只保留未落盘后缀。
+ *
+ * @return
+ * - true：缓冲区已全部写入内核，buf_ 为空——调用方可以继续追加；
+ * - false：内核没有接受全部字节（ENOSPC/EDQUOT/EIO/EFBIG），buf_ 中只剩
+ *   未落盘的后缀。调用方**必须**把这次失败上抛给写路径；稍后重试时只会
+ *   写后缀，不会重复写已落盘前缀。
+ *
+ * ## 定位
+ * WAL 字节流的唯一提交点。部分写之后若保留整个缓冲区，重试会把已落盘
+ * 前缀再写一遍：WAL 流中出现重复记录，恢复端按长度/CRC 解析立刻错位，
+ * 整段已确认写被当作损坏尾部丢弃（P1-2，数据丢失）。
+ *
+ * ## 步骤
+ * step1. 循环 write 直到缓冲区写完；EINTR 重试，返回 0 视为失败防死循环；
+ * step2. 失败时把已落盘的 off 字节从 buf_ 前缀丢弃并计入 bytes_written_；
+ * step3. 返回 buf_ 是否已清空——只有清空才算提交成功。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：由 KV 写锁串行化，非线程安全。
+ * - 失败语义：fd_ 不变，buf_ 只保留未落盘后缀，可安全重试。
+ */
 bool WalWriter::FlushBuffer() {
   if (fd_ < 0) {
     return false;
@@ -244,13 +267,20 @@ bool WalWriter::FlushBuffer() {
       if (errno == EINTR) {
         continue;
       }
-      return false;
+      break;  // 失败收尾：丢弃已落盘前缀，保留后缀。
+    }
+    if (n == 0) {
+      break;  // 内核拒绝推进：按失败处理，避免永久自旋。
     }
     off += static_cast<std::size_t>(n);
   }
-  bytes_written_ += buf_.size();
-  buf_.clear();
-  return true;
+  if (off > 0) {
+    // 已落盘前缀必须先记账再丢弃：重试只能写剩余字节，否则重复写会让
+    // WAL 流出现重复记录（P1-2）。
+    bytes_written_ += off;
+    buf_.erase(0, off);
+  }
+  return buf_.empty();
 }
 
 bool WalWriter::Sync() {
