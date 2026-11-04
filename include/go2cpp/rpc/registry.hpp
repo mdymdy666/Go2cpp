@@ -35,9 +35,12 @@
  * | 仅状态 | `Status Remove(const Id&)` | result 为空 |
  * | 仅动作 | `void Touch(const Id&)` | result 为空 |
  * | 服务端流 | `Status Watch(const Req&, ServerStream*)` | 逐条 `StreamData`，结束发 `StreamEnd` |
+ * | 取消上下文 | `Status Slow(CallContext&, const Req&)` | 首参收到本次调用的 `CallContext` |
  *
  * `const` 成员函数同样支持（`std::invoke` 统一处理）。输入参数按注册时的
  * 类型依次从请求字节流反序列化；参数个数由签名决定（`MethodBinding::argc`）。
+ * `CallContext` 只能作为**第一个**形参，且不占用线上参数，handler 可在长循环里
+ * 轮询 `done()`（非流式 handler 同样生效）。
  *
  * ## 线程模型
  *
@@ -114,6 +117,9 @@ class CallContext {
         return m_cancelled != nullptr && m_cancelled->load(std::memory_order_relaxed);
     }
 
+    /// @brief 对端是否已请求取消（`cancelled()` 的别名，读起来更像「结束」）。
+    bool done() const noexcept { return cancelled(); }
+
    private:
     std::uint64_t m_id = 0;                        ///< 调用 id。
     const std::string* m_method = nullptr;         ///< 方法名（不拥有）。
@@ -182,6 +188,17 @@ struct TuplePrefixImpl<Tuple, std::index_sequence<I...>> {
 template <typename Tuple, std::size_t N>
 using TuplePrefix = typename TuplePrefixImpl<Tuple, std::make_index_sequence<N>>::Type;
 
+/// @brief 取 tuple 子区间 `[Offset, Offset + Count)` 的类型。
+template <typename Tuple, std::size_t Offset, typename IndexSequence>
+struct TupleSliceImpl;
+template <typename Tuple, std::size_t Offset, std::size_t... I>
+struct TupleSliceImpl<Tuple, Offset, std::index_sequence<I...>> {
+    using Type = std::tuple<std::tuple_element_t<Offset + I, Tuple>...>;
+};
+template <typename Tuple, std::size_t Offset, std::size_t Count>
+using TupleSlice =
+    typename TupleSliceImpl<Tuple, Offset, std::make_index_sequence<Count>>::Type;
+
 /**
  * @brief 把 tuple 里每个类型退化为值类型。
  *
@@ -200,11 +217,12 @@ using TupleDecay = typename TupleDecayImpl<
     Tuple, std::make_index_sequence<std::tuple_size<Tuple>::value>>::Type;
 
 /**
- * @brief 取 tuple 第 N 个类型（从 1 开始数）；N 为 0 时给 `void`。
+ * @brief 取 tuple 第 N 个类型（从 1 开始数）；N 超出范围时给 `void`。
  * @tparam Tuple 类型列表。
  * @tparam N 位置（1..size）。
  */
-template <typename Tuple, std::size_t N, bool = (N > 0)>
+template <typename Tuple, std::size_t N,
+          bool = (N > 0 && N <= std::tuple_size<Tuple>::value)>
 struct TupleElementAt {
     using Type = void;  ///< 越界时的占位。
 };
@@ -287,10 +305,18 @@ struct MethodBinder {
     using AdjustedLast = typename TupleElementAt<Args, kTailAdjusted>::Type;
     /// 是否有输出参数（`T*`，且不是流式方法）。
     static constexpr bool kHasOut = !kStreaming && OutPointer<AdjustedLast>::kValue;
-    /// 输入参数个数（去掉尾部的流式/输出参数）。
-    static constexpr std::size_t kInputCount = kTailAdjusted - (kHasOut ? 1u : 0u);
-    /// 输入参数类型 tuple（引用/const 已退化为值类型）。
-    using InputArgs = TupleDecay<TuplePrefix<Args, kInputCount>>;
+    /// 首参数是否为调用上下文（`CallContext&` / `const CallContext&`）。
+    static constexpr bool kHasContext =
+        std::is_same_v<std::remove_cv_t<std::remove_reference_t<
+                           typename TupleElementAt<Args, 1>::Type>>,
+                       CallContext>;
+    /// 上下文占用的形参个数（0/1）。
+    static constexpr std::size_t kContextCount = kHasContext ? 1u : 0u;
+    /// 输入参数个数（去掉头部的上下文与尾部的流式/输出参数）。
+    static constexpr std::size_t kInputCount =
+        kTailAdjusted - (kHasOut ? 1u : 0u) - kContextCount;
+    /// 输入参数类型 tuple（跳过上下文；引用/const 已退化为值类型）。
+    using InputArgs = TupleDecay<TupleSlice<Args, kContextCount, kInputCount>>;
     /// 输出值类型（无输出参数时为 void）。
     using OutValue = typename OutPointer<AdjustedLast>::Value;
     /// 线上参数个数（u8）。
@@ -307,7 +333,6 @@ struct MethodBinder {
      */
     static Status Invoke(void* service, CallContext& context, reflect::Buffer& args,
                          reflect::Buffer& result, void* stream) {
-        (void)context;
         auto* object = static_cast<Class*>(service);
         if (object == nullptr) {
             return Status(StatusCode::kInternal, "null service instance");
@@ -320,19 +345,32 @@ struct MethodBinder {
             return Status(StatusCode::kInvalidArgument,
                           "trailing bytes after request arguments");
         }
+        // 有上下文时把它拼在实参最前面；tuple 里的引用保持左值，可绑定到
+        // `CallContext&` / `const CallContext&` / 按值形参。
+        auto handler_args = std::tuple_cat(MakeContextArgs(context), std::move(inputs));
         if constexpr (kStreaming) {
             if (stream == nullptr) {
                 return Status(StatusCode::kInternal, "streaming handler without stream");
             }
-            return InvokeStreaming(object, std::move(inputs), static_cast<ServerStream*>(stream));
+            return InvokeStreaming(object, std::move(handler_args),
+                                   static_cast<ServerStream*>(stream));
         } else if constexpr (kHasOut) {
-            return InvokeWithOutput(object, std::move(inputs), result);
+            return InvokeWithOutput(object, std::move(handler_args), result);
         } else {
-            return InvokePlain(object, std::move(inputs), result);
+            return InvokePlain(object, std::move(handler_args), result);
         }
     }
 
    private:
+    /// @brief 构造 context 实参：有上下文时返回单元素 tuple（引用），否则空 tuple。
+    static auto MakeContextArgs(CallContext& context) {
+        if constexpr (kHasContext) {
+            return std::tuple<CallContext&>(context);
+        } else {
+            return std::tuple<>();
+        }
+    }
+
     /// @brief 按尾参数形态构造流式 tail（指针或引用）。
     template <typename StreamTail>
     static StreamTail MakeStreamTail(ServerStream* stream) {

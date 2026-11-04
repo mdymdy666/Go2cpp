@@ -1,6 +1,7 @@
 /**
  * @file test_rpc.cpp
- * @brief RPC 端到端验收测试：基本调用/错误/超时/取消/并发/1e6 延迟/断连。
+ * @brief RPC 端到端验收测试：基本调用/错误/超时/取消（含非流式取消传播）/
+ *        有界队列/并发/1e6 延迟/断连。
  *
  * @details 测试规模可用环境变量调整（默认按任务要求取满）：
  * - `RPC_ITERATIONS`：单次调用延迟样本数（默认 1e6）；
@@ -16,13 +17,76 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+namespace rpctest {
+
+/// @brief 取消/队列测试服务：`WaitCancel` 轮询 `CallContext::done()`，
+///        `Block` 阻塞在门上直到测试放行。两个方法共用一个服务是为了避开
+///        `GO2CPP_RPC_SERVICE` 对单方法可变参数的空展开。
+class ProbeService {
+   public:
+    /// @brief 最多等 500ms；首次观察到取消时记录 steady 时间（微秒）。
+    Status WaitCancel(rpc::CallContext& context, const UserId& id) {
+        (void)id;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (context.done()) {
+                m_observed_us.store(NowMicros(), std::memory_order_release);
+                return Status(StatusCode::kCancelled, "observed cancel");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return Status(StatusCode::kDeadlineExceeded, "cancel not observed");
+    }
+
+    /// @brief 进入后阻塞，放行后把 id 写回 out（保证响应载荷非空）。
+    Status Block(const UserId& id, UserId* out) {
+        if (out == nullptr) {
+            return Status(StatusCode::kInternal, "null out");
+        }
+        *out = id;
+        m_entered.fetch_add(1, std::memory_order_acq_rel);
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [this]() { return m_released; });
+        return Status::Ok();
+    }
+
+    /// @brief 首次观察到取消的时间（微秒，0 表示未观察到）。
+    double observed_us() const { return m_observed_us.load(std::memory_order_acquire); }
+
+    /// @brief 已进入 Block handler 的次数。
+    std::int64_t entered() const { return m_entered.load(std::memory_order_acquire); }
+
+    /// @brief 放行所有阻塞的 handler。
+    void Release() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_released = true;
+        }
+        m_cv.notify_all();
+    }
+
+   private:
+    std::atomic<double> m_observed_us{0.0};  ///< 观察到取消的时间。
+    std::mutex m_mutex;                      ///< 保护 m_released。
+    std::condition_variable m_cv;            ///< 放行通知。
+    bool m_released = false;                 ///< 是否已放行。
+    std::atomic<std::int64_t> m_entered{0};  ///< 进入次数。
+};
+
+GO2CPP_RPC_SERVICE(ProbeService, WaitCancel, Block)
+
+}  // namespace rpctest
 
 namespace {
 
@@ -215,6 +279,127 @@ void TestCancel(const std::string& address) {
 // handler 异常隔离：一个 handler 抛异常不能终止服务端进程
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 非流式取消传播：读线程不能被 handler 阻塞
+// ---------------------------------------------------------------------------
+
+void TestUnaryCancelPropagation() {
+    Announce("call: unary cancel propagation");
+    rpc::ServerOptions options;
+    // 默认值就是任务要求的配置：4 个 worker。
+    RPC_CHECK_EQ(options.worker_threads, static_cast<std::size_t>(4));
+    rpc::Server server(options);
+    ProbeService probe;
+    if (!server.Register("Probe", &probe)) {
+        RPC_CHECK(false);
+        return;
+    }
+    rpc::Endpoint endpoint;
+    endpoint.host = "127.0.0.1";
+    endpoint.port = 0;
+    if (!server.Listen(endpoint)) {
+        RPC_CHECK(false);
+        return;
+    }
+    const std::string address = "127.0.0.1:" + std::to_string(server.port());
+    rpc::Client client(address);
+    RPC_CHECK(client.connected());
+
+    auto pending = client.AsyncCall<CounterSnapshot>("Probe.WaitCancel", UserId{1});
+    RPC_CHECK(pending.valid());
+
+    // handler 正在轮询时，读线程必须还能处理 Ping（改造前会被 handler 占住）。
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const double ping_start_us = NowMicros();
+    RPC_CHECK(client.Ping().ok());
+    const double ping_us = NowMicros() - ping_start_us;
+    std::printf("  ping while unary handler running: %.1fms\n", ping_us / 1000.0);
+    RPC_CHECK(ping_us < 200000.0);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const double cancel_sent_us = NowMicros();
+    RPC_CHECK(pending.Cancel());
+    CounterSnapshot ignored;
+    RPC_CHECK(pending.Wait(&ignored).code == rpc::StatusCode::kCancelled);
+
+    // 服务端必须在 200ms 内由 handler 自己观察到取消。
+    bool observed = false;
+    for (int attempt = 0; attempt < 400; ++attempt) {
+        if (probe.observed_us() > 0.0) {
+            observed = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    RPC_CHECK(observed);
+    if (observed) {
+        const double delta_us = probe.observed_us() - cancel_sent_us;
+        std::printf("  handler observed cancel after %.1fms\n", delta_us / 1000.0);
+        RPC_CHECK(delta_us >= 0.0);
+        RPC_CHECK(delta_us <= 200000.0);
+    }
+
+    // 取消之后同一连接继续可用。
+    RPC_CHECK(client.Ping().ok());
+    server.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// 有界队列：满时立刻回 kResourceExhausted，读线程不被卡住
+// ---------------------------------------------------------------------------
+
+void TestQueueFull() {
+    Announce("call: bounded queue -> resource exhausted");
+    rpc::ServerOptions options;
+    options.worker_threads = 1;
+    options.max_pending_requests = 1;
+    rpc::Server server(options);
+    ProbeService gate;
+    if (!server.Register("Gate", &gate)) {
+        RPC_CHECK(false);
+        return;
+    }
+    rpc::Endpoint endpoint;
+    endpoint.host = "127.0.0.1";
+    endpoint.port = 0;
+    if (!server.Listen(endpoint)) {
+        RPC_CHECK(false);
+        return;
+    }
+    const std::string address = "127.0.0.1:" + std::to_string(server.port());
+    rpc::Client client(address);
+    RPC_CHECK(client.connected());
+
+    auto first = client.AsyncCall<UserId>("Gate.Block", UserId{1});
+    bool entered = false;
+    for (int attempt = 0; attempt < 2000; ++attempt) {
+        if (gate.entered() >= 1) {
+            entered = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    RPC_CHECK(entered);
+    RPC_CHECK_EQ(gate.entered(), static_cast<std::int64_t>(1));
+
+    // worker 已被占用：第二个请求占满唯一的队列槽，第三个必须立刻被拒。
+    auto second = client.AsyncCall<UserId>("Gate.Block", UserId{2});
+    auto third = client.AsyncCall<UserId>("Gate.Block", UserId{3});
+    UserId third_result;
+    RPC_CHECK(third.Wait(&third_result).code == rpc::StatusCode::kResourceExhausted);
+
+    gate.Release();
+    UserId first_result;
+    UserId second_result;
+    const rpc::Status first_status = first.Wait(&first_result);
+    const rpc::Status second_status = second.Wait(&second_result);
+    RPC_CHECK(first_status.ok());
+    RPC_CHECK(second_status.ok());
+    RPC_CHECK_EQ(first_result.id, static_cast<std::int64_t>(1));
+    RPC_CHECK_EQ(second_result.id, static_cast<std::int64_t>(2));
+    server.Stop();
+}
+
 void TestHandlerException(const std::string& address) {
     Announce("call: handler exception isolation");
     rpc::Client client(address);
@@ -372,6 +557,8 @@ int main() {
     TestErrorPaths(address);
     TestTimeout(address);
     TestCancel(address);
+    TestUnaryCancelPropagation();
+    TestQueueFull();
     TestHandlerException(address);
     TestConcurrency(address);
     TestLatency(address);

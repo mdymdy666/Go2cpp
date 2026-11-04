@@ -5,18 +5,20 @@
  * @brief RPC 服务端：服务注册、TCP 监听、同步/流式方法分发。
  *
  * @details
- * 服务端为每条连接起两个线程：
+ * 服务端为每条连接起 `1 + worker_threads` 个线程：
  *
- * - **读线程**：`recv → FrameCodec::Feed → 解析帧`。请求入队；`Cancel` 帧
- *   直接置位对应调用的取消标志；心跳立刻回 `Pong`。
- * - **工作线程**：串行执行该连接上的请求（handler 内可阻塞）。流式 handler
- *   在同一线程里通过 `ServerStream::Send` 逐条推送，返回后框架补发
- *   `StreamEnd`。
+ * - **读线程**：`recv → FrameCodec::Feed → 解析帧`。只做协议层工作：请求
+ *   解码后放进有界队列并立刻回到读循环；`Cancel` 帧直接置位对应调用的
+ *   取消标志；心跳立刻回 `Pong`。**任何 handler 都不在读线程里执行**。
+ * - **工作线程池**（默认 4 个）：从队列取请求执行（handler 内可阻塞）。
+ *   流式 handler 通过 `ServerStream::Send` 逐条推送，返回后框架补发
+ *   `StreamEnd`；同一连接上的多个请求可以在多个 worker 上并发执行。
  *
- * 为什么拆两个线程：如果 handler 和读帧共用一个线程，一个慢 handler 或
- * 长时间流式 handler 会让 `Cancel` 帧永远读不到，取消就变成了「等它跑完」。
- * 拆开后，取消/心跳在 handler 阻塞期间仍然可用；代价是每连接 2 个线程
- * （线程数由客户端连接数决定，RPC 场景可接受）。
+ * 为什么这样拆：如果 handler 和读帧共用一个线程，一个慢 handler 或长
+ * 时间流式 handler 会让 `Cancel` 帧永远读不到，取消就变成了「等它跑完」。
+ * 读线程只入队后，取消/心跳在 handler 阻塞期间仍然可用。队列有界
+ * （`ServerOptions::max_pending_requests`），满时立刻回
+ * `kResourceExhausted`，不会因 handler 变慢而无限占用内存。
  *
  * ## 线程与生命周期
  *
@@ -127,6 +129,10 @@ struct ServerOptions {
     int accept_poll_ms = 20;
     /// 同时在线连接上限；超过后新连接被立即关闭。
     std::size_t max_connections = 1024;
+    /// 每条连接的工作线程数（0 按 1 处理）：读线程只入队，handler 在池中执行。
+    std::size_t worker_threads = 4;
+    /// 每条连接待执行请求队列上限（0 按 1 处理）：满时回 `kResourceExhausted`。
+    std::size_t max_pending_requests = 4096;
 };
 
 /**

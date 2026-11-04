@@ -1,6 +1,6 @@
 /**
  * @file server.cpp
- * @brief RPC 服务端实现：accept 线程 + 每连接读/工作线程 + 流式发送器。
+ * @brief RPC 服务端实现：accept 线程 + 每连接读线程与工作线程池 + 流式发送器。
  *
  * @author go2cpp contributors
  * @date 2026-11-01
@@ -83,11 +83,16 @@ class StreamSender {
 class ServerImpl;
 
 /**
- * @brief 一条服务端连接：读线程 + 工作线程 + 写锁。
+ * @brief 一条服务端连接：读线程 + 工作线程池 + 写锁。
+ *
+ * 读线程只负责解码帧、登记取消位、把请求放进有界队列；handler 全部在
+ * `m_worker_count` 个工作线程上执行。这样 `Cancel`/`Ping` 帧在慢 handler
+ * 执行期间仍能被及时处理，取消对非流式调用同样生效。
  */
 class ServerConnection : public std::enable_shared_from_this<ServerConnection> {
    public:
-    ServerConnection(ServerImpl* server, std::unique_ptr<Transport> transport, FrameSpec spec);
+    ServerConnection(ServerImpl* server, std::unique_ptr<Transport> transport, FrameSpec spec,
+                     std::size_t worker_threads, std::size_t max_pending);
     ~ServerConnection();
 
     /// @brief 启动读/工作线程（必须由 shared_ptr 调用）。
@@ -126,13 +131,15 @@ class ServerConnection : public std::enable_shared_from_this<ServerConnection> {
 
     ServerImpl* m_server;                    ///< 所属服务端。
     std::unique_ptr<Transport> m_transport;  ///< 传输。
-    FrameCodec m_codec;                      ///< 帧编解码（读线程独占）。
-    std::mutex m_write_mutex;                ///< 串行化写。
+    FrameCodec m_codec;                      ///< 帧编解码（Encode/Feed 无共享状态，多线程可用）。
+    std::mutex m_write_mutex;                ///< 串行化写（读线程与多个 worker 共用）。
     std::atomic<bool> m_closed{false};       ///< 关闭标志。
     std::atomic<bool> m_reader_done{false};  ///< 读线程已退出。
-    std::atomic<bool> m_worker_done{false};  ///< 工作线程已退出。
+    std::atomic<std::size_t> m_workers_done{0};  ///< 已退出的工作线程数。
     std::thread m_reader;                    ///< 读线程。
-    std::thread m_worker;                    ///< 工作线程。
+    std::vector<std::thread> m_workers;      ///< 工作线程池。
+    std::size_t m_worker_count = 1;          ///< 工作线程数（构造时固定）。
+    std::size_t m_max_pending = 1;           ///< 待执行队列上限。
 
     std::mutex m_queue_mutex;                         ///< 请求队列锁。
     std::condition_variable m_queue_cv;               ///< 请求到达/关闭通知。
@@ -263,8 +270,14 @@ class StreamSenderImpl final : public StreamSender {
 // ServerConnection
 // ---------------------------------------------------------------------------
 
-ServerConnection::ServerConnection(ServerImpl* server, std::unique_ptr<Transport> transport, FrameSpec spec)
-    : m_server(server), m_transport(std::move(transport)), m_codec(spec) {
+ServerConnection::ServerConnection(ServerImpl* server, std::unique_ptr<Transport> transport,
+                                 FrameSpec spec, std::size_t worker_threads,
+                                 std::size_t max_pending)
+    : m_server(server),
+      m_transport(std::move(transport)),
+      m_codec(spec),
+      m_worker_count(worker_threads == 0 ? 1 : worker_threads),
+      m_max_pending(max_pending == 0 ? 1 : max_pending) {
     m_read_buffer.resize(64 * 1024);
 }
 
@@ -275,7 +288,10 @@ ServerConnection::~ServerConnection() {
 void ServerConnection::Start() {
     auto self = shared_from_this();
     m_reader = std::thread([self]() { self->ReaderLoop(); });
-    m_worker = std::thread([self]() { self->WorkerLoop(); });
+    m_workers.reserve(m_worker_count);
+    for (std::size_t index = 0; index < m_worker_count; ++index) {
+        m_workers.emplace_back([self]() { self->WorkerLoop(); });
+    }
 }
 
 void ServerConnection::Close() {
@@ -290,14 +306,16 @@ void ServerConnection::Join() {
     if (m_reader.joinable()) {
         m_reader.join();
     }
-    if (m_worker.joinable()) {
-        m_worker.join();
+    for (std::thread& worker : m_workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
     }
 }
 
 bool ServerConnection::Finished() const noexcept {
     return m_reader_done.load(std::memory_order_acquire) &&
-           m_worker_done.load(std::memory_order_acquire);
+           m_workers_done.load(std::memory_order_acquire) >= m_worker_count;
 }
 
 bool ServerConnection::SendPayload(FrameType type, std::uint16_t flags,
@@ -394,31 +412,33 @@ bool ServerConnection::HandleFrame(const Frame& frame_value) {
 }
 
 /**
- * @brief 解码一个 Request 帧，登记取消位，再分派到读线程快路径或工作队列。
+ * @brief 解码一个 Request 帧，登记取消位，放入有界请求队列。
  *
  * @param frame_value [in] 已从字节流切出的完整帧，payload 由 codec 校验；引用只在本次调用内有效。
  *
  * @return
- * - true：请求已受理（同步已完成或已入队）——调用方**必须**继续读下一帧；
+ * - true：请求已受理或已回 `kResourceExhausted`——调用方**必须**继续读下一帧；
  * - false：解码失败或连接已关闭——调用方**必须**断开连接，否则字节流状态已不可信。
  *
  * ## 定位
- * 服务端唯一请求入口，也是「快慢路径」的分叉点。分错路径会让流式 handler 阻塞读线程，
- * 从而收不到 Cancel 帧；漏登记取消位会让 Cancel 永远无效。
+ * 服务端唯一请求入口。读线程**绝不能**在这里执行 handler：一旦执行，Cancel/Ping
+ * 帧就会被拖到 handler 结束之后才读到，取消对非流式调用完全失效。队列有界是为了
+ * 让「worker 卡住 + 客户端猛发」不会把内存吃光；满时立刻回错误而不是阻塞读线程。
  *
  * ## 步骤
  * step1. 解码 call_id/method/args/streaming，失败即断开；
  * step2. 构造 PendingRequest，分配共享取消位；
- * step3. 先登记到 m_cancels，保证随后到达的 Cancel 能命中；
- * step4. 非流式请求在读线程直接执行（省一次线程唤醒）；
- * step5. 流式请求入队并唤醒工作线程，让读线程继续收 Cancel；
- * step6. 入队前再检查一次关闭标志，避免关闭后仍投递。
+ * step3. 先登记到 m_cancels，保证随后到达的 Cancel 能命中（含已入队未执行的请求）；
+ * step4. 持队列锁检查关闭与队列余量，有空位则入队；
+ * step5. 队列满：清掉取消位并回 `kResourceExhausted`（流式用 StreamEnd，否则客户端挂死）；
+ * step6. 入队成功后唤醒一个 worker，立刻返回读循环。
  *
  * ## 并发/失败语义
  * - 调用约束：只能在 ReaderLoop 线程调用；m_cancels/m_queue 各自有互斥保护。
- * - 原子性：取消位登记先于执行，Cancel 与执行之间有明确先后。
+ * - 原子性：取消位登记先于入队，Cancel 与执行之间有明确先后；队列余量判断与
+ *   入队在同一临界区，不会超卖容量。
  * - 失败语义：返回 false 表示连接级故障，调用方断开；不抛异常。
- * - 不变量：返回 true 后该 call_id 一定在 m_cancels 中（直到 EraseCancel）。
+ * - 不变量：返回 true 后该 call_id 要么在 m_cancels 中等待执行，要么已收到错误响应。
  */
 bool ServerConnection::HandleRequest(const Frame& frame_value) {
     RequestMessage message;
@@ -436,18 +456,29 @@ bool ServerConnection::HandleRequest(const Frame& frame_value) {
         std::lock_guard<std::mutex> lock(m_cancels_mutex);
         m_cancels[request->call_id] = request->cancelled;
     }
-    // 快路径：普通（非流式）请求由读线程直接执行，省掉一次线程唤醒。
-    // 流式请求必须入队：handler 可能长时间推送，读线程要继续读 Cancel 帧。
-    if (!request->streaming) {
-        Process(request);
-        return !m_closed.load(std::memory_order_acquire);
-    }
+    bool accepted = false;
     {
         std::lock_guard<std::mutex> lock(m_queue_mutex);
         if (m_closed.load(std::memory_order_acquire)) {
             return false;
         }
-        m_queue.push_back(std::move(request));
+        if (m_queue.size() < m_max_pending) {
+            m_queue.push_back(request);
+            accepted = true;
+        }
+    }
+    if (!accepted) {
+        // step5: 队列满不是连接级故障：回错误帧让客户端立刻失败，读线程继续工作。
+        EraseCancel(request->call_id);
+        const Status overloaded(StatusCode::kResourceExhausted,
+                                "server request queue is full");
+        if (request->streaming) {
+            (void)SendStreamEnd(request->call_id, overloaded);
+        } else {
+            reflect::Buffer empty;
+            (void)SendResponse(request->call_id, overloaded, empty);
+        }
+        return !m_closed.load(std::memory_order_acquire);
     }
     m_queue_cv.notify_one();
     return true;
@@ -485,24 +516,26 @@ bool ServerConnection::HandlePing(const Frame& frame_value) {
 }
 
 /**
- * @brief 工作线程主循环：阻塞等待队列，取出流式请求并执行。
+ * @brief 工作线程主循环：阻塞等待队列，取出请求并执行。
  *
- * @return 无返回值；m_closed 置位后退出并标记 m_worker_done。
+ * @return 无返回值；m_closed 置位后退出并递增 m_workers_done。
  *
  * ## 定位
- * 流式请求的唯一执行线程。漏掉唤醒会让请求永远躺在队列里；漏掉关闭检查会让线程无法退出。
+ * handler 的唯一执行位置（每连接 N 个这样的线程）。漏掉唤醒会让请求永远躺在队列里；
+ * 漏掉关闭检查会让线程无法退出，`Stop()` 随之挂死。
  *
  * ## 步骤
  * step1. 持队列锁等待「有请求或已关闭」；
  * step2. 已关闭则退出循环；
  * step3. 取队首并弹栈；
- * step4. 释放锁后执行 Process，避免长 handler 阻塞入队。
+ * step4. 释放锁后执行 Process，避免长 handler 阻塞入队与其它 worker。
  *
  * ## 并发/失败语义
- * - 调用约束：每连接一个工作线程；与 ReaderLoop 通过 m_queue + condvar 通信。
- * - 原子性：出队与关闭检查在同一临界区，不会丢唤醒。
+ * - 调用约束：每连接 m_worker_count 个 worker 共享同一队列；与 ReaderLoop 通过
+ *   m_queue + condvar 通信。
+ * - 原子性：出队与关闭检查在同一临界区，不会丢唤醒；多个 worker 各自取走不同请求。
  * - 失败语义：无异常出口；Process 内部已吞掉错误。
- * - 不变量：退出后 m_worker_done 为 true，Join 可以安全等待。
+ * - 不变量：每个线程退出时对 m_workers_done +1；全部退出后 Join 可以安全等待。
  */
 void ServerConnection::WorkerLoop() {
     for (;;) {
@@ -520,7 +553,7 @@ void ServerConnection::WorkerLoop() {
         }
         Process(request);
     }
-    m_worker_done.store(true, std::memory_order_release);
+    m_workers_done.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void ServerConnection::EraseCancel(std::uint64_t call_id) {
@@ -548,7 +581,7 @@ void ServerConnection::EraseCancel(std::uint64_t call_id) {
  * step6. 所有分支清理取消位登记。
  *
  * ## 并发/失败语义
- * - 调用约束：读线程（非流式）或工作线程（流式）调用，same 连接可并发执行多个请求。
+ * - 调用约束：只能由工作线程调用；同一连接上的多个请求可并发执行。
  * - 原子性：单个请求的执行是串行的；跨请求并发由 handler 自行保证安全。
  * - 失败语义：handler 抛异常会由上层捕获转成 kInternal（见调用点）；本函数不抛。
  * - 不变量：返回前该 call_id 的取消位已从 m_cancels 移除。
@@ -617,7 +650,10 @@ void ServerConnection::Process(const std::shared_ptr<PendingRequest>& request) {
             status = Status(StatusCode::kInternal, "handler threw unknown exception");
             result.Clear();
         }
-        (void)SendResponse(request->call_id, status, result);
+        // 客户端已取消：响应已无人接收，省掉一次写；取消位在函数末尾统一清理。
+        if (!request->cancelled->load(std::memory_order_acquire)) {
+            (void)SendResponse(request->call_id, status, result);
+        }
     }
     EraseCancel(request->call_id);
 }
@@ -655,8 +691,9 @@ bool ServerImpl::AddConnection(std::unique_ptr<Transport> transport) {
         transport->Close();
         return false;
     }
-    auto connection =
-        std::make_shared<ServerConnection>(this, std::move(transport), MakeFrameSpecFromOptions(m_options));
+    auto connection = std::make_shared<ServerConnection>(
+        this, std::move(transport), MakeFrameSpecFromOptions(m_options),
+        m_options.worker_threads, m_options.max_pending_requests);
     {
         std::lock_guard<std::mutex> lock(m_connections_mutex);
         if (!m_running.load(std::memory_order_acquire)) {
