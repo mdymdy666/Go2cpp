@@ -1,4 +1,4 @@
-# user/concurrency —— 调度器 / Fiber / Channel / Context / Sync
+# user/modules/concurrency —— 调度器 / Fiber / Channel / Context / Sync
 
 > 这个目录是「并发运行时」的人手示例：一台用 C++17 实现的 GMP 调度器，
 > 以及长在它上面的 Channel、Select、Context、同步原语、Future、定时器。
@@ -142,6 +142,41 @@ cmake --build /tmp/build-user --target go2cpp_beginner_demo -j
 带 `full` 的是同一组件的多场景版（通常 6–8 个场景，含错误/边界路径）；
 `demo` 版只有 3 个左右的主干场景，适合第一次读。
 
+## 异常处理示例（默认行为 + 可选策略）
+
+这三个示例回答同一个问题：**真实场景里出错时，模块默认怎么处理，调用方
+还能怎么选**。每个文件头都写明「场景 / 默认行为（file:line）/ 可选策略 /
+如何选择」，代码可独立编译运行。
+
+| 示例 | 场景 | 默认行为 | 可选策略 |
+| --- | --- | --- | --- |
+| `01-send-on-closed.cpp` | 向已关闭的 Channel 发送 | `Send` 返回 `kClosed`，不 panic、不抛异常（`channel.hpp:2894`）；返回值 `[[nodiscard]]`（`channel.hpp:521`） | 检查返回值并记录 / `SendOrThrow`（`channel.hpp:1679`）/ 关闭后 drain / `SendFor` 超时 |
+| `02-blocking-in-thread.cpp` | 普通线程（非 Fiber）里用 Channel/Mutex | park 走 native futex 路径，阻塞整个 OS 线程（`parking_condition.cpp:407`）；单线程「先 Send 后 Recv」必自死锁 | 放进 `go()` / 带缓冲 + `TrySend` / `BlockingRegion` / `SendFor`·`RecvFor` 超时 |
+| `03-context-cancel-leak.cpp` | `WithCancel` 后忘记 `cancel()` | Context 不会自动取消，等待 `Done()` 的 goroutine 永久 park（`context.hpp:230`、`:304`） | `CancelGuard`（defer cancel）/ `WithTimeout` / 主动检查 `Done()`·`Err()` / 第二个退出信号 |
+
+编译与运行（这三个示例尚未注册进 ctest，用已构建好的库直接编）：
+
+```sh
+ROOT=/UserData/CodexWorkSpace/Go2cpp
+BUILD=${BUILD:-$ROOT/.build-bento-wsl}   # 任一已编译好的构建目录
+g++ -std=c++17 -Wall -Wextra -Wpedantic -I"$ROOT/include" \
+  "$ROOT/user/modules/concurrency/01-send-on-closed.cpp" \
+  -L"$BUILD" -Wl,-rpath,"$BUILD" \
+  -lgo2cpp_channel -lgo2cpp_context -lgo2cpp_scheduler -lgo2cpp_fiber \
+  -lgo2cpp_sync -lgo2cpp_error -lgo2cpp_debug -lgo2cpp_debug_event \
+  -lgo2cpp_io -lgo2cpp_hook -lgo2cpp_config -lgo2cpp_network \
+  -lgo2cpp_log -lgo2cpp_future -lgo2cpp_control_flow -lgo2cpp_os \
+  -lgo2cpp_math -lgo2cpp_rand -lgo2cpp_path -lgo2cpp_container \
+  -lgo2cpp_compress -lgo2cpp_encoding -lgo2cpp_metrics \
+  -lgo2cpp_relay_pipe -lgo2cpp_os_monitor -lgo2cpp_hash \
+  -lpthread -ldl -o /tmp/01-send-on-closed
+/tmp/01-send-on-closed
+```
+
+三个示例都在当前树实测通过（退出码 0、`-Wall -Wextra -Wpedantic` 零告警）。
+`01` 里的 `[[nodiscard]]` 可以这样自查：把某处写成 `ch->Send(v);`，
+`-Wall` 会给出 `-Wunused-result`，并指向 `channel.hpp:1626` 与 `:521`。
+
 ## 源码位置
 
 | 能力 | 头文件 | 实现 |
@@ -176,3 +211,6 @@ cmake --build /tmp/build-user --target go2cpp_beginner_demo -j
   超时是 `kTimedOut`，取消是 `kCancelled`，不要把两者混为一谈。
 - **示例日志里的「失败状态」是教学内容**，不代表进程失败；每个示例以退出码 0/1 表示
   自身断言是否全过。
+- **异常路径默认不 panic**：关闭后 `Send` 返回 `kClosed`、普通线程的阻塞会占住
+  OS 线程、`Context` 不会自动取消。三者的完整默认行为与替代策略见上面的
+  「异常处理示例」，改代码前先确认自己要的是默认语义还是显式策略。
