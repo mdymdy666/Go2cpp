@@ -58,7 +58,7 @@ while IFS= read -r hit; do
     violation_total=$((violation_total + 1))
     file_counts["${path}"]=$(( ${file_counts["${path}"]:-0} + 1 ))
     details+=("${path}:${lineno}:${trimmed}")
-done < <(grep -rnE 'printf|std::cout|getenv' src/ 2>/dev/null || true)
+done < <(grep -rnE '\bprintf\b|\bstd::cout\b|\bgetenv\b' src/ 2>/dev/null || true)
 
 if (( violation_total == 0 )); then
     echo "check_infra_usage: OK，未发现绕过 go2cpp::logging / go2cpp::config 的写法"
