@@ -22,6 +22,19 @@
  * 低频看门狗线程负责写 deadline。方向之间只共享统计原子量与取消标志，
  * 队列、错误与生命周期完全独立——一条方向卡住不会阻塞另一条方向的读写。
  *
+ * ## 直通模式（`PipeConfig::direct` / `GO2CPP_RELAY_DIRECT`）
+ *
+ * 开启后每方向只有 **一条** 泵线程，不建队列、不建写线程：
+ *
+ * ```
+ *   A --Read--> [pump] --Write--> B      A <--Write-- [pump] <--Read-- B
+ * ```
+ *
+ * 消掉每 chunk 的入队/出队（2 次互斥 + 2 次条件变量唤醒）与一次线程接力；
+ * 读缓冲直接作为写缓冲，少 1 次 chunk 分配与 1 次拷贝。两个方向仍是独立
+ * 线程，因此「一端慢拖垮另一端」不会发生；背压来自写阻塞本身（读不快于写），
+ * 慢 peer 仍按 `write_timeout` 判定并由看门狗只关该方向的目的端。
+ *
  * ```
  *   A --Read--> [reader] --> bounded queue --> [writer] --Write--> B
  *   A <--Write-- [writer] <-- bounded queue <-- [reader] <--Read--  B
@@ -152,6 +165,21 @@ struct PipeConfig {
     std::size_t queue_cap = 256U * 1024U;
     /// 单个 chunk 的写 deadline，同时作为队列停滞预算；默认 30 s。
     std::chrono::milliseconds write_timeout{30000};
+    /**
+     * @brief 直通模式：每个方向只保留一条线程「读到就写」，不建队列、不建写线程。
+     *
+     * @details 默认 `false`（走「读线程 → 有界队列 → 写线程」）。置 `true` 时
+     *          每方向只有一条泵线程：`Read` 到的字节直接 `Write` 到目的端，
+     *          省掉每 chunk 一次入队/出队与一次线程接力（以及 chunk 的堆分配
+     *          与拷贝）。背压由「写阻塞」天然提供：读线程读不快于目的端的
+     *          写出速度；慢 peer 仍由 write deadline + 看门狗隔离——单次写
+     *          超过 `write_timeout` 只关闭该方向的**目的端**，另一方向不受影响。
+     *
+     *          环境变量 `GO2CPP_RELAY_DIRECT=1|true|on|yes`（大小写不敏感）
+     *          可在未显式置位本字段时打开直通；字段为 `true` 时优先。
+     *          默认关，便于 A/B 对比。
+     */
+    bool direct = false;
 };
 
 /// 运行期累计统计；`Stats()` 返回的是某一时刻的快照。

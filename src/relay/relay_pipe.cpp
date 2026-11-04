@@ -9,7 +9,8 @@
  * ```
  *
  * 每个方向两条线程。读线程只负责「读 + 入队」，队列满时阻塞；写线程只负责
- * 「出队 + 写满一个 chunk」。队列容量按字节计，任何时刻都不会超过
+ * 「出队 + 写满一个 chunk」。直通模式（`PipeConfig::direct`）下每方向只有
+ * 一条线程，读到就写，不建队列——见 `Direction::DirectLoop`。队列容量按字节计，任何时刻都不会超过
  * `queue_cap`（外加当前正在写的那一个 chunk）。看门狗线程每 5 ms 检查一次
  * 写 deadline；超时只关闭该方向的**目的端**，不取消另一方向。
  *
@@ -41,9 +42,11 @@
 #include "go2cpp/streams.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -71,6 +74,20 @@ constexpr int kMaxNoProgress = 100;
 /// 看门狗轮询间隔；只影响超时判定的上限误差，不参与数据路径。
 constexpr std::chrono::milliseconds kWatchdogTick{5};
 
+/// 读 `GO2CPP_RELAY_DIRECT`：1/true/on/yes（大小写不敏感）打开直通。
+bool EnvDirectMode() {
+    const char* raw = std::getenv("GO2CPP_RELAY_DIRECT");
+    if (raw == nullptr) {
+        return false;
+    }
+    std::string value(raw);
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value == "1" || value == "true" || value == "on" ||
+           value == "yes";
+}
+
 /// 归一化配置：零值/非正值回落默认，队列至少能容纳一个 chunk。
 PipeConfig NormalizeConfig(PipeConfig cfg) {
     if (cfg.copy_buf == 0) {
@@ -84,6 +101,10 @@ PipeConfig NormalizeConfig(PipeConfig cfg) {
     }
     if (cfg.write_timeout <= std::chrono::milliseconds::zero()) {
         cfg.write_timeout = kDefaultWriteTimeout;
+    }
+    // 直通开关默认关；环境变量只在字段未显式置位时生效（便于 A/B 对比）。
+    if (!cfg.direct) {
+        cfg.direct = EnvDirectMode();
     }
     return cfg;
 }
@@ -390,8 +411,12 @@ public:
     Direction(const Direction&) = delete;
     Direction& operator=(const Direction&) = delete;
 
-    /// 启动读/写线程。
+    /// 启动泵线程：直通模式每方向一条，否则读/写各一条。
     void Start() {
+        if (m_state->cfg.direct) {
+            m_reader = std::thread([this] { DirectLoop(); });
+            return;
+        }
         m_reader = std::thread([this] { ReaderLoop(); });
         m_writer = std::thread([this] { WriterLoop(); });
     }
@@ -491,6 +516,80 @@ private:
         }
     }
 
+    /**
+     * @brief 直通模式的单线程泵：读到就写，不经过队列。
+     *
+     * @details 与 `ReaderLoop + WriterLoop` 的产物完全等价（统计、错误、EOF、
+     *          超时、取消语义一致），区别只在于没有中间队列与写线程：
+     * - 读缓冲直接作为 `WriteChunk` 的输入，不构造 chunk、不入队、不唤醒；
+     * - 背压 = 目的端写阻塞，读线程自然停在 `Read` 之前，不会无界积压；
+     * - 写 deadline 仍由 `BeginWrite/EndWrite` + 看门狗维护，慢 peer 只关
+     *   本方向的目的端，另一方向继续。
+     *
+     * ## 并发/失败语义
+     * - 只在 `Start()` 创建的唯一线程里运行；
+     * - `m_phase` 在读前后切换，使 `Abort` 能判断「是否正阻塞在 Read」；
+     * - 任一失败路径都经 `Abort` 记录首个错误并结束本方向，另一方向独立。
+     */
+    void DirectLoop() {
+        std::vector<char> buffer(m_state->cfg.copy_buf);
+        int empty_reads = 0;
+        while (true) {
+            {
+                std::lock_guard<std::mutex> lock(m_control_mutex);
+                if (m_aborting.load(std::memory_order_acquire)) {
+                    break;
+                }
+                m_phase = ReaderPhase::kReading;
+            }
+            const streams::ReadResult result =
+                m_from->Read(buffer.data(), buffer.size());
+            bool aborted = false;
+            {
+                std::lock_guard<std::mutex> lock(m_control_mutex);
+                m_phase = ReaderPhase::kIdle;
+                aborted = m_aborting.load(std::memory_order_acquire);
+            }
+            if (result.count > buffer.size()) {
+                SetError(NewError(m_label + " read returned too many bytes"));
+                break;
+            }
+            if (result.count > 0) {
+                empty_reads = 0;
+                if (aborted) {
+                    m_state->AddDropped(result.count);
+                    break;
+                }
+                // 直通：读缓冲直接写目的端，无 chunk 分配、无队列、无接力。
+                if (!WriteChunk(buffer.data(), result.count)) {
+                    break;
+                }
+            }
+            if (result.error) {
+                if (Is(result.error, streams::IoEof())) {
+                    m_reader_clean = true;
+                } else {
+                    SetError(Wrap(result.error, m_label + " read"));
+                }
+                break;
+            }
+            if (result.count == 0) {
+                if (++empty_reads >= kMaxNoProgress) {
+                    SetError(NewError(m_label + " read made no progress"));
+                    break;
+                }
+                std::this_thread::yield();
+            }
+            if (aborted) {
+                break;
+            }
+        }
+        if (!m_aborting.load(std::memory_order_acquire)) {
+            m_clean = m_reader_clean;
+        }
+        m_state->OnDirectionDone();
+    }
+
     /// 读线程主循环。
     void ReaderLoop() {
         std::vector<char> buffer(m_state->cfg.copy_buf);
@@ -575,7 +674,7 @@ private:
                 failed = true;
                 break;
             }
-            if (!WriteChunk(chunk)) {
+            if (!WriteChunk(chunk.data(), chunk.size())) {
                 failed = true;
                 break;
             }
@@ -586,32 +685,43 @@ private:
         m_state->OnDirectionDone();
     }
 
-    /// 写满一个 chunk；失败时把未写部分与队列剩余计入 dropped。
-    bool WriteChunk(const std::vector<char>& chunk) {
+    /**
+     * @brief 把一段字节写满目的端；失败时未写部分与队列剩余计入 dropped。
+     *
+     * @param data [in] 待写字节；调用期间有效，本函数不保留指针。
+     * @param size [in] 字节数；0 直接返回 true。
+     * @return 全部写出返回 true；超时/写错误/取消返回 false（已记录首个错误）。
+     *
+     * ## 并发/失败语义
+     * - 只在所属方向的泵线程调用；`m_to` 由看门狗在超时时并发 `Close()`；
+     * - 每次底层 `Write` 前刷新 deadline，chunk 内多次短写共用同一 deadline；
+     * - 失败后本方向 abort，队列剩余由 `DiscardAll` 计为 dropped。
+     */
+    bool WriteChunk(const char* data, std::size_t size) {
         const TimePoint deadline = Clock::now() + m_state->cfg.write_timeout;
         std::size_t offset = 0;
         int no_progress = 0;
-        while (offset < chunk.size()) {
+        while (offset < size) {
             if (m_aborting.load(std::memory_order_acquire)) {
-                m_state->AddDropped(chunk.size() - offset);
+                m_state->AddDropped(size - offset);
                 m_state->AddDropped(m_queue.DiscardAll());
                 return false;
             }
             if (Clock::now() >= deadline) {
                 NoteTimeout();
                 Abort(TimeoutError(m_label + " write"), true);
-                m_state->AddDropped(chunk.size() - offset);
+                m_state->AddDropped(size - offset);
                 m_state->AddDropped(m_queue.DiscardAll());
                 return false;
             }
             m_state->BeginWrite(m_index, deadline);
             const streams::WriteResult result =
-                m_to->Write(chunk.data() + offset, chunk.size() - offset);
+                m_to->Write(data + offset, size - offset);
             const bool timed_out = m_state->EndWrite(m_index);
             if (result.count > 0) {
-                if (result.count > chunk.size() - offset) {
+                if (result.count > size - offset) {
                     Abort(NewError(m_label + " write returned too many bytes"), true);
-                    m_state->AddDropped(chunk.size() - offset);
+                    m_state->AddDropped(size - offset);
                     m_state->AddDropped(m_queue.DiscardAll());
                     return false;
                 }
@@ -623,20 +733,20 @@ private:
                 // 看门狗已关闭目的端并计入 timeouts；这里补上方向级 abort，
                 // 让 Run 返回失败（否则读端已 EOF，可能被误判成干净结束）。
                 Abort(TimeoutError(m_label + " write"), true);
-                m_state->AddDropped(chunk.size() - offset);
+                m_state->AddDropped(size - offset);
                 m_state->AddDropped(m_queue.DiscardAll());
                 return false;
             }
             if (result.error) {
                 Abort(Wrap(result.error, m_label + " write"), true);
-                m_state->AddDropped(chunk.size() - offset);
+                m_state->AddDropped(size - offset);
                 m_state->AddDropped(m_queue.DiscardAll());
                 return false;
             }
             if (result.count == 0) {
                 if (++no_progress >= kMaxNoProgress) {
                     Abort(NewError(m_label + " write made no progress"), true);
-                    m_state->AddDropped(chunk.size() - offset);
+                    m_state->AddDropped(size - offset);
                     m_state->AddDropped(m_queue.DiscardAll());
                     return false;
                 }
