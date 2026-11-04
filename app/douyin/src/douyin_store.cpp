@@ -12,9 +12,12 @@
 #include "go2cpp/storage/db.hpp"
 #include "go2cpp/storage/orm.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <memory>
+#include <random>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -75,6 +78,80 @@ bool DecodeVideoCursor(const std::string& cursor, std::int64_t* created_at,
     if (id != nullptr) {
         *id = id_value;
     }
+    return true;
+}
+
+/**
+ * @brief 生成推荐流随机种子：random_device 与纳秒时钟混合。
+ *
+ * @note 只用 random_device 时，某些平台（含部分 libstdc++ 构建）会退化成
+ *       确定性序列，导致每次刷新顺序相同；混入纳秒时间可避免这一退化。
+ * @return 非零种子（0 也可用，只是洗牌结果固定，不影响正确性）。
+ */
+std::uint64_t RandomFeedSeed() {
+    std::random_device device;
+    const auto ticks = std::chrono::high_resolution_clock::now().time_since_epoch();
+    const std::uint64_t nano = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(ticks).count());
+    const std::uint64_t rnd = (static_cast<std::uint64_t>(device()) << 32) ^
+                              static_cast<std::uint64_t>(device());
+    return rnd ^ (nano + 0x9e3779b97f4a7c15ULL + (rnd << 6) + (rnd >> 2));
+}
+
+std::string EncodeFeedCursor(std::uint64_t seed, std::size_t index) {
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string text;
+    text.reserve(18);
+    do {
+        text.push_back(kHex[seed & 0xFU]);
+        seed >>= 4;
+    } while (seed != 0);
+    std::reverse(text.begin(), text.end());
+    return "r" + text + "_" + std::to_string(index);
+}
+
+bool DecodeFeedCursor(const std::string& cursor, std::uint64_t* seed,
+                      std::size_t* index) {
+    if (seed == nullptr || index == nullptr) {
+        return false;
+    }
+    if (cursor.size() < 4 || cursor.front() != 'r') {
+        return false;
+    }
+    const std::size_t underscore = cursor.find('_');
+    if (underscore == std::string::npos || underscore <= 1 ||
+        underscore + 2 > cursor.size()) {
+        return false;
+    }
+    std::uint64_t seed_value = 0;
+    for (std::size_t i = 1; i < underscore; ++i) {
+        const char c = cursor[i];
+        std::uint64_t digit = 0;
+        if (c >= '0' && c <= '9') {
+            digit = static_cast<std::uint64_t>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            digit = static_cast<std::uint64_t>(c - 'a') + 10U;
+        } else {
+            return false;
+        }
+        if (seed_value >> 60 != 0) {
+            return false;
+        }
+        seed_value = (seed_value << 4) | digit;
+    }
+    std::uint64_t index_value = 0;
+    for (std::size_t i = underscore + 1; i < cursor.size(); ++i) {
+        const char c = cursor[i];
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        index_value = index_value * 10U + static_cast<std::uint64_t>(c - '0');
+        if (index_value > (1ULL << 32)) {
+            return false;
+        }
+    }
+    *seed = seed_value;
+    *index = static_cast<std::size_t>(index_value);
     return true;
 }
 
@@ -151,6 +228,15 @@ constexpr const char* kSchemaSql =
     "  user_id INTEGER NOT NULL,"
     "  created_at INTEGER NOT NULL,"
     "  PRIMARY KEY (room_id, user_id)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS upload_sessions ("
+    "  upload_id TEXT PRIMARY KEY,"
+    "  user_id INTEGER NOT NULL,"
+    "  path TEXT NOT NULL,"
+    "  title TEXT NOT NULL DEFAULT '',"
+    "  total INTEGER NOT NULL,"
+    "  received_bytes INTEGER NOT NULL DEFAULT 0,"
+    "  created_at INTEGER NOT NULL"
     ");";
 
 /// @brief 把 `Error` 写成可读文本。
@@ -758,19 +844,51 @@ int Store::DeleteVideo(std::int64_t id, std::int64_t user_id,
 bool Store::ListFeed(const std::string& cursor, std::int64_t limit,
                      std::vector<StoredVideo>* out, std::string* next_cursor,
                      std::string* error) {
+    next_cursor->clear();
     if (!Ok()) {
         if (error != nullptr) {
             *error = "数据库尚未打开";
         }
         return false;
     }
+    if (limit <= 0) {
+        return true;
+    }
+    std::uint64_t seed = 0;
+    std::size_t start = 0;
+    if (!cursor.empty()) {
+        if (!DecodeFeedCursor(cursor, &seed, &start)) {
+            if (error != nullptr) {
+                *error = "cursor 非法";
+            }
+            return false;
+        }
+    } else {
+        seed = RandomFeedSeed();
+    }
+    // 随机推荐：池子是全库视频，**不按作者过滤**——本人视频也在池中，
+    // 因此随机首屏能刷到自己（旧热度序会把 0 互动的新视频挤到末页）。
     std::vector<StoredVideo> all;
     const std::string sql =
-        std::string("SELECT ") + kVideoColumns + " FROM videos" + kVideoOrder;
+        std::string("SELECT ") + kVideoColumns + " FROM videos";
     if (!LoadVideos(*m_db, sql, &all, error)) {
         return false;
     }
-    PageVideos(all, cursor, limit, out, next_cursor);
+    std::mt19937_64 engine(seed);
+    std::shuffle(all.begin(), all.end(), engine);
+    if (start >= all.size()) {
+        return true;
+    }
+    const std::size_t remaining = all.size() - start;
+    const std::size_t take = remaining < static_cast<std::size_t>(limit)
+                                 ? remaining
+                                 : static_cast<std::size_t>(limit);
+    for (std::size_t i = 0; i < take; ++i) {
+        out->push_back(all[start + i]);
+    }
+    if (start + take < all.size()) {
+        *next_cursor = EncodeFeedCursor(seed, start + take);
+    }
     return true;
 }
 
@@ -1403,6 +1521,103 @@ int Store::LeaveRoom(std::int64_t id, std::int64_t user_id, std::string* error) 
         return -1;
     }
     return 1;
+}
+
+// ---- 分片上传（断点续传）：upload_sessions 持久化 --------------------------
+
+bool Store::CreateUploadSession(const StoredUpload& session, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto inserted = m_db->Exec(
+        "INSERT INTO upload_sessions(upload_id, user_id, path, title, total, "
+        "received_bytes, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+        session.upload_id, session.user_id, session.path, session.title,
+        session.total, session.received_bytes, session.created_at);
+    if (!inserted) {
+        if (error != nullptr) {
+            *error = "插入上传会话失败: " + DescribeError(inserted.Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::FindUploadSession(const std::string& upload_id, StoredUpload* out,
+                              std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query(
+        "SELECT upload_id, user_id, path, title, total, received_bytes, created_at "
+        "FROM upload_sessions WHERE upload_id = ?",
+        upload_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询上传会话失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    if (!rows.Value().Next()) {
+        if (rows.Value().Err() && error != nullptr) {
+            *error = "遍历上传会话失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    if (out != nullptr) {
+        out->upload_id = rows.Value().Text(0);
+        out->user_id = rows.Value().Int64(1);
+        out->path = rows.Value().Text(2);
+        out->title = rows.Value().Text(3);
+        out->total = rows.Value().Int64(4);
+        out->received_bytes = rows.Value().Int64(5);
+        out->created_at = rows.Value().Int64(6);
+    }
+    return true;
+}
+
+bool Store::UpdateUploadProgress(const std::string& upload_id,
+                                 std::int64_t received_bytes, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto updated = m_db->Exec(
+        "UPDATE upload_sessions SET received_bytes = ? WHERE upload_id = ?",
+        received_bytes, upload_id);
+    if (!updated) {
+        if (error != nullptr) {
+            *error = "更新上传进度失败: " + DescribeError(updated.Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::DeleteUploadSession(const std::string& upload_id, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto removed =
+        m_db->Exec("DELETE FROM upload_sessions WHERE upload_id = ?", upload_id);
+    if (!removed) {
+        if (error != nullptr) {
+            *error = "删除上传会话失败: " + DescribeError(removed.Err());
+        }
+        return false;
+    }
+    return true;
 }
 
 }  // namespace douyin

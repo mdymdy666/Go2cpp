@@ -265,7 +265,25 @@ for _ in $(seq 1 10); do
 done
 expect_eq "分页总条数（limit=1 翻页）" 3 "${#PAGE_IDS[@]}"
 expect_eq "分页无重复" 3 "$(printf '%s\n' "${PAGE_IDS[@]}" | sort -u | wc -l)"
-expect_eq "分页顺序（最新在前）" "$V3,$V2,$V1" "$(IFS=,; echo "${PAGE_IDS[*]}")"
+# 推荐流改成随机序后，翻页不再保证「最新在前」，但必须覆盖全部视频。
+expect_eq "分页覆盖全部视频（集合一致）" \
+  "$(printf '%s\n' "$V1" "$V2" "$V3" | sort | tr '\n' ',')" \
+  "$(printf '%s\n' "${PAGE_IDS[@]}" | sort | tr '\n' ',')"
+
+# 随机推荐：连续 5 次首屏至少出现两种不同顺序（3 条视频共 6 种排列，
+# 5 次全同序的概率 = 1/6^4 ≈ 7.7e-4），防止 RANDOM 实现退化成固定排序。
+FIRST_ORDER=""
+ORDER_DIFF=0
+for _ in $(seq 1 5); do
+  get "/api/feed?limit=20" >/dev/null
+  ORDER="$(grep -o '"video":{"id":[0-9]*' "$TMP/body" | sed 's/.*://' | tr '\n' ',')"
+  if [[ -z "$FIRST_ORDER" ]]; then
+    FIRST_ORDER="$ORDER"
+  elif [[ "$ORDER" != "$FIRST_ORDER" ]]; then
+    ORDER_DIFF=1
+  fi
+done
+expect_eq "随机推荐：5 次首屏出现不同顺序" 1 "$ORDER_DIFF"
 
 echo "[5/9] 点赞两次幂等（经网关 → interaction）"
 code=$(post "/api/like" "{\"video_id\":$V1}" "$TOKEN_B")

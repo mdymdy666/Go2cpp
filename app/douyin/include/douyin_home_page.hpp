@@ -433,26 +433,6 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     border-radius: 999px;
   }
 
-  /* ---------- 主页视频弹层 ---------- */
-  .video-modal {
-    position: fixed; inset: 0; z-index: 80;
-    display: grid; place-items: center;
-    background: rgba(0, 0, 0, .94);
-  }
-  .video-modal video {
-    width: min(100vw, 920px); max-height: 86vh;
-    background: #000; object-fit: contain;
-  }
-  .video-modal .vm-close {
-    position: absolute; top: 16px; right: 18px;
-    width: 38px; height: 38px; border-radius: 50%;
-    background: rgba(255, 255, 255, .12); color: #fff; font-size: 17px;
-  }
-  .video-modal .vm-title {
-    position: absolute; left: 20px; bottom: 20px; right: 20px;
-    font-size: 14px; color: #e7e8ef; text-shadow: 0 1px 8px #000;
-  }
-
   /* 骨架屏 / 空态 */
   .skeleton {
     height: 100vh; height: 100dvh;
@@ -531,12 +511,6 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   <div class="profile-body" id="profileBody"></div>
 </section>
 
-<div class="video-modal" id="videoModal" hidden>
-  <button class="vm-close" id="vmClose" type="button" aria-label="关闭">✕</button>
-  <video id="modalVideo" muted loop playsinline webkit-playsinline></video>
-  <div class="vm-title" id="vmTitle"></div>
-</div>
-
 <script>
 (function () {
   'use strict';
@@ -569,7 +543,6 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     panelVideoId: '',
     panelSlide: null,
     profileUserId: '',
-    modalOpen: false,
     fit: 'contain',
     muted: true,
     volume: 1,
@@ -606,9 +579,6 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   var cpSend = document.getElementById('cpSend');
   var profileEl = document.getElementById('profileView');
   var profileBody = document.getElementById('profileBody');
-  var modalEl = document.getElementById('videoModal');
-  var modalVideo = document.getElementById('modalVideo');
-  var modalTitle = document.getElementById('vmTitle');
   var uploadBtn = document.getElementById('uploadBtn');
   var uploadInput = document.getElementById('uploadInput');
 
@@ -1250,12 +1220,17 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
   /* ---------- feed 渲染 ---------- */
 
-  /* 上传的视频用服务端返回的 videos/upload_* 路径；其余按 id 映射到
-     demo1..5.mp4（五个素材都带音轨，id%5 分布均匀）。 */
+  /* 视频地址解析：DB 里存的是 `videos/<文件名>`，但历史数据也可能是
+     `/videos/x.mp4`、纯文件名或外部 http(s) 地址；四种都归一，避免「同一个
+     视频在 feed 能播、在主页播不了」这类前缀不一致。全都不匹配才退回 demo。 */
   function videoSrc(v) {
     v = v || {};
     var url = String(v.url || '');
-    if (/^videos\/[A-Za-z0-9_.-]+$/.test(url)) return BASE + url;
+    if (/^https?:\/\//i.test(url)) return url;
+    if (/^\/?videos\/[A-Za-z0-9_.-]+$/.test(url)) {
+      return BASE + url.replace(/^\//, '');
+    }
+    if (/^[A-Za-z0-9_.-]+\.(mp4|webm|m4v)$/i.test(url)) return BASE + 'videos/' + url;
     return BASE + 'videos/demo' + ((Number(v.id) % 5) + 1) + '.mp4';
   }
 
@@ -1461,23 +1436,30 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     }
   }
 
+  /* 按 state.items 重建全部 slide：feed 首次加载与「主页点视频补进 feed」
+     共用这一处，保证两边永远同一套播放器与同一套 observer。 */
+  function renderFeed() {
+    feedEl.innerHTML = '';
+    var frag = document.createDocumentFragment();
+    state.items.forEach(function (item, i) { frag.appendChild(buildSlide(item, i)); });
+    feedEl.appendChild(frag);
+    feedEl.scrollTop = 0;
+    setupObserver();
+    applySound();
+  }
+
   function loadFeed() {
     showSkeleton();
     api('api/feed?limit=20')
       .then(function (data) {
         var items = data.items || [];
         state.items = items;
-        feedEl.innerHTML = '';
         if (!items.length) {
+          feedEl.innerHTML = '';
           showNotice('还没有视频，先跑 scripts/seed_bulk.sh 灌数据', true);
           return;
         }
-        var frag = document.createDocumentFragment();
-        items.forEach(function (item, i) { frag.appendChild(buildSlide(item, i)); });
-        feedEl.appendChild(frag);
-        feedEl.scrollTop = 0;
-        setupObserver();
-        applySound();
+        renderFeed();
         if (state.deepLink) {
           jumpToVideo(state.deepLink);
           toast('已定位到分享的视频 #' + state.deepLink, 'ok');
@@ -1598,7 +1580,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
         pt.textContent = v.title || ('视频 #' + (v.id || ''));
         cardBtn.appendChild(pv);
         cardBtn.appendChild(pt);
-        cardBtn.addEventListener('click', function () { openVideoModal(v, item); });
+        cardBtn.addEventListener('click', function () { playInFeed(item, v); });
         grid.appendChild(cardBtn);
       });
     }).catch(function (err) {
@@ -1645,24 +1627,35 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     if (active) playOnly(active);
   }
 
-  /* ---------- 主页视频弹层 ---------- */
+  /* ---------- 主页点视频：切回 feed，复用同一个播放器 ---------- */
 
-  function openVideoModal(v, item) {
-    state.modalOpen = true;
-    modalTitle.textContent = (v.title || ('视频 #' + v.id)) +
-      ' · @' + authorName(item || { video: v });
-    modalVideo.src = videoSrc(v);
-    modalEl.hidden = false;
-    var p = modalVideo.play();
-    if (p && p.catch) p.catch(function () {});
-  }
-
-  function closeVideoModal() {
-    state.modalOpen = false;
-    modalEl.hidden = true;
-    modalVideo.pause();
-    modalVideo.removeAttribute('src');
-    modalVideo.load();
+  /* 以前这里弹独立 <video> 播放器，和 feed 是两条路径：一旦那条路径出问题
+     （地址前缀、解码、自动播放策略）就只剩黑屏，而 feed 明明能播。现在统一
+     走 feed：视频不在当前 feed 里就先补进去，滚动到该屏再用 playOnly 播放。 */
+  function playInFeed(item, v) {
+    v = v || (item && item.video) || {};
+    var id = String(v.id || 0);
+    if (!id || id === '0') { toast('视频信息缺失', 'err'); return; }
+    var known = false;
+    for (var i = 0; i < state.items.length; i++) {
+      if (String((state.items[i].video || {}).id) === id) { known = true; break; }
+    }
+    if (!known) {
+      state.items.unshift(item && item.video
+        ? item
+        : { video: v, author: authorName(item || { video: v }) });
+      renderFeed();
+    }
+    hideProfile();
+    var slide = feedEl.querySelector('.slide[data-id="' + id + '"]');
+    if (!slide) { toast('视频未找到', 'err'); return; }
+    slide.classList.add('active');
+    slide.scrollIntoView({ block: 'start' });
+    var video = slide.querySelector('video');
+    if (!video) { toast('播放器初始化失败', 'err'); return; }
+    video.currentTime = 0;
+    playOnly(video);
+    toast('正在播放：' + (v.title || ('视频 #' + id)), 'ok');
   }
 
   /* ---------- 事件绑定与启动 ---------- */
@@ -1706,13 +1699,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       applySound();
     }
   });
-  document.getElementById('vmClose').addEventListener('click', closeVideoModal);
-  modalEl.addEventListener('click', function (e) {
-    if (e.target === modalEl) closeVideoModal();
-  });
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
-    if (state.modalOpen) { closeVideoModal(); return; }
     if (!profileEl.hidden) { hideProfile(); return; }
     if (panelEl.classList.contains('open')) closeComments();
   });

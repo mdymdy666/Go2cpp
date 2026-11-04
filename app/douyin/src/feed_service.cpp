@@ -103,9 +103,10 @@ bool ReadCursor(const douyin::HttpRequest& request, std::string* cursor) {
     if (cursor->empty()) {
         return true;
     }
-    std::int64_t created_at = 0;
-    std::int64_t id = 0;
-    return douyin::DecodeVideoCursor(*cursor, &created_at, &id);
+    // 推荐流游标改为「随机种子 + 起始下标」，不再按 created_at/id 定位。
+    std::uint64_t seed = 0;
+    std::size_t index = 0;
+    return douyin::DecodeFeedCursor(*cursor, &seed, &index);
 }
 
 /// @brief 把视频行 + 作者名编成一条 feed JSON。

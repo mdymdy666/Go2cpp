@@ -1159,3 +1159,47 @@ handler 异常导致 SIGABRT；slowloris 靠单次 recv 30s 无限占住 worker�
 
 **坑**：并行 agent 同改 `douyin_store.hpp` 导致上传声明块重复声明而编译失败，
 已按当前版本恢复（`StoredUpload`/上传方法各 1 份）；同文件改动需串行合并。
+
+## 2026-11-04 · 抖音「我的主页播视频」+ 推荐流随机化
+
+**背景**：用户报「我的主页点自己的视频放不了」+「智能推荐要随机、要能刷到自己」。
+
+**根因（实测）**：
+- 服务端 URL 没问题：`GET /api/video/mine` 返回 `videos/upload_31_*.mp4`，经网关
+  `GET /videos/...` 与公网 `/douyin/videos/...` 均 200 / `video/mp4`。
+- 真正问题在**两条播放路径**：主页点视频走独立 `<video>` 弹层（`openVideoModal`），
+  与 feed 的 `playOnly`/IntersectionObserver 不是同一套；该弹层没有 error 监听、
+  没有 controls，地址前缀只认 `^videos/`（历史数据是 `/videos/x`、纯文件名或外链时
+  会静默回退成随机 demo 视频）。一旦这条路径出问题，界面就是黑屏无提示。
+- 推荐流是固定热度序（`kVideoOrder`），0 互动的新视频永远在末页，`limit=20`
+  的首屏（全库 22 条）根本刷不到自己。
+
+**改动**：
+- `include/douyin_home_page.hpp`：删除主页弹层（HTML/CSS/JS 共 3 处），新增
+  `renderFeed()` 与 `playInFeed(item,v)`——主页点视频先关主页，视频不在当前
+  feed 就 `state.items.unshift` 后重建，再 `scrollIntoView` + `playOnly`，与 feed
+  完全同一套播放器；`videoSrc()` 兼容 `http(s)://`、`/videos/x`、`x.mp4`、`videos/x`。
+- `src/douyin_store.cpp` / `include/douyin_store.hpp`：`ListFeed` 改随机推荐——
+  全库候选（不按作者过滤）→ `std::shuffle(mt19937_64(seed))`；游标编码
+  `r<seed_hex>_<index>`（`EncodeFeedCursor`/`DecodeFeedCursor`），同一 seed
+  重新洗牌从下标续取，**随机但翻页不重不漏**。
+- `src/feed_service.cpp`：`ReadCursor` 改用 `DecodeFeedCursor`（非法 400）。
+- `scripts/accept_all.sh`：feed 断言从「最新在前」改为「集合覆盖 + 5 次首屏出现
+  不同顺序」。
+
+**验证**：
+- 随机：连续 5 次 `/api/feed?limit=20` 顺序互不相同（4/4 相邻不同）；10 次
+  首屏 10/10 都能刷到 admin 自己的视频（id 59/60）；`limit=5` 三页 15 条无重复；
+  非法 cursor 400。
+- 主页播放（无头 Edge + CDP 实跑）：点「我的主页」→ 2 张卡 → 点卡 → 主页关闭、
+  feed 该屏 active、`readyState=4`、`paused=false`、`currentTime` 前进；把首屏压到
+  2 条（视频不在 feed）时自动补插成 3 屏并播放。
+- `scripts/accept_all.sh`：70 PASS / 0 FAIL；`build.sh` 8 目标 `-Werror` 零告警；
+  公网 `/douyin/` 200（页面已含 `playInFeed`、无 `openVideoModal`）、公网 feed
+  3 次顺序不同、公网 mine 两条 url 均 200。
+- 按 pid 重启 7 进程（user 131636 / video 131637 / feed 131638 / interaction 131639 /
+  live 131640 / search 131641 / gateway 131642），未用 pkill -f。
+
+**未提交**：本 agent 不 commit。注意 `douyin_store.hpp` 的改动被并行 agent 的
+`5dcca19`（幂等键中间件）一并提交；`src/video_service.cpp`、`scripts/accept_upload_resume.sh`
+是并行 agent 的改动，不属于本次。
