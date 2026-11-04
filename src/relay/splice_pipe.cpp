@@ -161,12 +161,16 @@ struct SplicePipe::State final
     /// 取消：置标志并 shutdown 两端，打断阻塞中的 `poll`/`splice`。
     void Cancel() {
         cancel.store(true, std::memory_order_release);
+#if defined(__linux__)
+        // 非 Linux 平台没有 splice 路径（Run 因 Supported() 为假直接返回），
+        // 这里也必须隔离 ::shutdown，否则非 Linux 编译缺少声明。
         if (a_fd >= 0) {
             (void)::shutdown(a_fd, SHUT_RDWR);
         }
         if (b_fd >= 0) {
             (void)::shutdown(b_fd, SHUT_RDWR);
         }
+#endif
         std::lock_guard<std::mutex> lock(done_mutex);
         done_cv.notify_all();
     }
@@ -350,6 +354,23 @@ bool SplicePipe::State::Run(const ContextPtr& context, ErrorPtr* err) {
         workers[0] = std::thread([this] { Loop(0, a_fd, b_fd); });
         workers[1] = std::thread([this] { Loop(1, b_fd, a_fd); });
     } catch (...) {
+        // 已启动的方向线程可能正阻塞在 poll/splice：先置取消并 shutdown 两端，
+        // 再回收。否则 joinable 的 std::thread 在 State 析构时 std::terminate，
+        // 且线程会继续访问即将销毁的 State（use-after-free）。
+        cancel.store(true, std::memory_order_release);
+#if defined(__linux__)
+        if (a_fd >= 0) {
+            (void)::shutdown(a_fd, SHUT_RDWR);
+        }
+        if (b_fd >= 0) {
+            (void)::shutdown(b_fd, SHUT_RDWR);
+        }
+#endif
+        for (std::thread& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
         ctx->Done().RemoveCallback(callback_id);
         if (err != nullptr) {
             *err = NewError("splice: cannot start worker thread");
