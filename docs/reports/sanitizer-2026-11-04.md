@@ -65,7 +65,21 @@ cmake -S . -B .build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
 | go2cpp_kv_recovery_test | 0 | 2s | 0 |
 | go2cpp_os_test | 0 | 2s | 0 |
 | go2cpp_rpc_test | — | 超时 | 未完成 |
-| go2cpp_tests（主单测集） | — | 超时 | 未完成 |
+| go2cpp_tests（主单测集） | — | 跑到 fiber 用例时中止 | **1（ASan stack-overflow）** |
+
+### 2.1 `go2cpp_tests`（主单测集）的 ASan 命中
+
+```
+==787982==ERROR: AddressSanitizer: stack-overflow on address 0x7b019074bf18 (T0)
+SUMMARY: AddressSanitizer: stack-overflow /UserData/CodexWorkSpace/Go2cpp/tests/concurrency/test_fiber.cpp:52 in DeepWalk
+```
+
+`DeepWalk` 是**测试故意**做的每层 256B `volatile` 局部深递归（验证 fiber 的几何增长栈），
+ASan 下 fiber 栈增长后的新栈页不在 ASan 记录的 stack bounds 内，被判 stack-overflow。
+属 **ASan 与自定义 fiber growable stack 的兼容性问题**（测试代码、非产品路径）；
+记为 P2/环境限制，建议该用例在 ASan 构建中跳过，或在栈增长后补
+`__sanitizer_start_switch_fiber` 注解新范围。除此之外主单测集历史输出中未见
+heap-buffer-overflow / use-after-free / LeakSanitizer。
 
 ## 3. UBSan 明细（P1，已修）
 
@@ -174,8 +188,9 @@ run-clang-tidy -p .build-tsan -header-filter='^/UserData/CodexWorkSpace/Go2cpp/(
 
 ## 7. 未完成与后续
 
-1. `go2cpp_tests`（40+ 单测，含 network/concurrency/replay）在 ASan 下**未跑完**
-   （45 分钟盒到点时仍在运行/超时）；`go2cpp_rpc_test` 同样超时。
+1. `go2cpp_tests`（40+ 单测，含 network/concurrency/replay）在 ASan 下跑到
+   `test_fiber.cpp:52 DeepWalk` 的 fiber 栈增长用例时被 ASan 判 stack-overflow 中止
+   （见 §2.1，环境/测试兼容性，非产品缺陷）；`go2cpp_rpc_test` 超时未跑完。
 2. TSan 的 **sync / scheduler / rwmutex / realtime** 子集都在 `go2cpp_tests` 目标里，
    本轮只覆盖 channel（fast_channel / channel_concurrency）、fiber、select、tunnel。
 3. 修复后 `kv_test` / `kv_concurrent_test` 的 UBSan 已复验清零（见 §3）——修复有效。
