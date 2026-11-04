@@ -9,6 +9,8 @@
 
 #include "go2cpp/rpc/client.hpp"
 
+#include "go2cpp/logging/log.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -185,6 +187,12 @@ void Connection::FailAll() {
         std::lock_guard<std::mutex> lock(m_pending_mutex);
         pending.swap(m_pending);
     }
+    if (!pending.empty()) {
+        // 连接断开让在途调用统一失败，数量是定位「批量超时」的第一线索。
+        GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("rpc"))
+            << "client: connection closed, " << pending.size()
+            << " pending calls failed";
+    }
     for (auto& entry : pending) {
         const std::shared_ptr<CallState>& state = entry.second;
         {
@@ -270,6 +278,9 @@ bool Connection::SendFrame(FrameType type, std::uint16_t flags,
     thread_local std::vector<std::uint8_t> wire;
     frame::Error error;
     if (!m_codec.Encode(frame, &wire, &error)) {
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("rpc"))
+            << "client: frame encode failed type=" << static_cast<int>(type)
+            << " bytes=" << payload.size() << " error=" << error.message;
         return false;
     }
     std::lock_guard<std::mutex> lock(m_write_mutex);
@@ -468,6 +479,9 @@ void Connection::ReaderLoop() {
         std::size_t consumed = 0;
         if (!m_codec.Feed(m_read_buffer.data(), static_cast<std::size_t>(received), &m_frames,
                           &consumed, &error)) {
+            // 解码失败会让读循环退出并关闭连接：不留痕就无法区分对端异常与本地 bug。
+            GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("rpc"))
+                << "client: frame decode failed, closing connection: " << error.message;
             break;
         }
         bool healthy = true;

@@ -17,10 +17,11 @@ if (NOT GO2CPP_WITH_RPC)
     return()
 endif()
 
-if (NOT TARGET go2cpp_frame OR NOT TARGET go2cpp_reflect)
+if (NOT TARGET go2cpp_frame OR NOT TARGET go2cpp_reflect OR NOT TARGET go2cpp_log)
     message(FATAL_ERROR
-        "GO2CPP_WITH_RPC 需要 go2cpp_frame 与 go2cpp_reflect 目标（分别由 "
-        "cmake/Go2CppFrame.cmake 与 cmake/Go2CppReflect.cmake 定义）。")
+        "GO2CPP_WITH_RPC 需要 go2cpp_frame、go2cpp_reflect 与 go2cpp_log 目标"
+        "（分别由 cmake/Go2CppFrame.cmake、cmake/Go2CppReflect.cmake 与 "
+        "cmake/Go2CppModules.cmake 定义）。")
 endif()
 
 find_package(Threads REQUIRED)
@@ -41,7 +42,9 @@ target_compile_features(go2cpp_rpc PUBLIC cxx_std_17)
 # 新增目标按零警告维护：模块内全部代码都在本次变更范围内。
 target_compile_options(go2cpp_rpc PRIVATE -Wall -Wextra -Wpedantic -Werror)
 set_target_properties(go2cpp_rpc PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(go2cpp_rpc PUBLIC go2cpp_frame go2cpp_reflect Threads::Threads)
+# 编解码失败、handler 异常、连接断开走统一日志；log 不反向依赖 rpc，无环。
+target_link_libraries(go2cpp_rpc PUBLIC go2cpp_frame go2cpp_reflect go2cpp_log
+    Threads::Threads)
 
 option(GO2CPP_RPC_TESTS "Build RPC framework tests" ON)
 

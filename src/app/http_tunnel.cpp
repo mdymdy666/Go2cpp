@@ -9,6 +9,8 @@
 
 #include "go2cpp/app/http_tunnel.hpp"
 
+#include "go2cpp/logging/log.hpp"
+
 #include <algorithm>
 #include <utility>
 
@@ -148,7 +150,11 @@ HttpTunnelServer::HttpTunnelServer(ConnectionConfig config) {
                                           std::move(config));
     std::string error;
     // 服务端 preface + SETTINGS 先进入输出缓冲，随第一次响应发出。
-    m_conn->Start(&error);
+    if (!m_conn->Start(&error)) {
+        // 构造函数里没有返回值可上报，失败必须落日志，否则隧道静默不可用。
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("app"))
+            << "http_tunnel: server connection start failed: " << error;
+    }
 }
 
 HttpTunnelServer::~HttpTunnelServer() = default;

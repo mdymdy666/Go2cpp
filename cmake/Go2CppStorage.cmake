@@ -76,9 +76,18 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
             "LINKER:-Bsymbolic-functions")
     endif()
 endif()
-target_link_libraries(go2cpp_storage
-    PUBLIC Threads::Threads
-    PRIVATE ${GO2CPP_SQLITE3_LIBRARIES})
+# DB open/exec/事务失败要打日志；log 只依赖标准库，不反向依赖 storage，无环。
+if (TARGET go2cpp_log)
+    target_link_libraries(go2cpp_storage
+        PUBLIC Threads::Threads go2cpp_log
+        PRIVATE ${GO2CPP_SQLITE3_LIBRARIES})
+else()
+    target_link_libraries(go2cpp_storage
+        PUBLIC Threads::Threads
+        PRIVATE ${GO2CPP_SQLITE3_LIBRARIES})
+    target_sources(go2cpp_storage PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/logging/log.cpp)
+endif()
 set_target_properties(go2cpp_storage PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     VERSION ${PROJECT_VERSION}

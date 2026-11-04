@@ -60,7 +60,16 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
     endif()
 endif()
 
-target_link_libraries(go2cpp_kv PUBLIC Threads::Threads)
+# 失败路径（WAL/SSTable 打开、fsync、校验）需要统一日志；go2cpp_log 只依赖
+# C++17 标准库，不反向依赖 kv，因此 PUBLIC 链接不构成依赖环。standalone
+# 构建（未注册 go2cpp_log 目标）时把日志实现并入本目标，保持可独立编译。
+if (TARGET go2cpp_log)
+    target_link_libraries(go2cpp_kv PUBLIC Threads::Threads go2cpp_log)
+else()
+    target_link_libraries(go2cpp_kv PUBLIC Threads::Threads)
+    target_sources(go2cpp_kv PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/logging/log.cpp)
+endif()
 
 if (GO2CPP_BUILD_TESTS)
     # ---- 正确性：功能/边界/持久化/迭代器/批 ----

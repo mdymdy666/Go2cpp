@@ -9,6 +9,8 @@
 
 #include "go2cpp/rpc/transport.hpp"
 
+#include "go2cpp/logging/log.hpp"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -203,6 +205,12 @@ std::unique_ptr<TcpTransport> TcpTransport::Connect(const Endpoint& endpoint,
     }
     ::freeaddrinfo(results);
 
+    if (!transport) {
+        // 所有地址候选都失败才走到这里；记录目标与最后一次 errno 便于排查。
+        GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("rpc"))
+            << "tcp connect failed: endpoint=" << endpoint.ToString()
+            << " error=" << last_error.message;
+    }
     if (!transport && status != nullptr) {
         *status = std::move(last_error);
     } else if (status != nullptr) {

@@ -12,6 +12,8 @@
 #include "format.hpp"
 #include "go2cpp/storage/kv.hpp"
 
+#include "go2cpp/logging/log.hpp"
+
 #if defined(__x86_64__) || defined(__i386__)
 #include <nmmintrin.h>
 #define GO2CPP_HAVE_SSE42 1
@@ -259,10 +261,17 @@ bool WalWriter::Sync() {
     return false;
   }
 #if defined(__linux__)
-  return ::fdatasync(fd_) == 0;
+  const int sync_rc = ::fdatasync(fd_);
 #else
-  return ::fsync(fd_) == 0;
+  const int sync_rc = ::fsync(fd_);
 #endif
+  if (sync_rc != 0) {
+    // 同步失败 = WAL 记录可能未落盘，崩溃后数据丢失，必须可见。
+    GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("storage"))
+        << "WAL sync failed: errno=" << errno;
+    return false;
+  }
+  return true;
 }
 
 bool WalWriter::Close() {

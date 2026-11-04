@@ -14,6 +14,8 @@
 
 #include "go2cpp/storage/kv.hpp"
 
+#include "go2cpp/logging/log.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -1170,6 +1172,9 @@ KV::~KV() = default;
 std::unique_ptr<KV> KV::Open(const std::string& path, const Options& options) {
   auto impl = std::make_unique<Impl>(path, options);
   if (!impl->Open()) {
+    // 返回 nullptr 而丢弃 LastError() 会让「打不开」变成无信息失败。
+    GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("storage"))
+        << "KV::Open failed: path=" << path << " error=" << impl->LastError();
     return nullptr;
   }
   return std::unique_ptr<KV>(new KV(std::move(impl)));

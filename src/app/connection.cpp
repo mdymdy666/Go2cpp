@@ -9,6 +9,8 @@
 
 #include "go2cpp/app/connection.hpp"
 
+#include "go2cpp/logging/log.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -316,6 +318,9 @@ bool Connection::Start(std::string* error) {
     }
     if (!m_transport->WriteAll(kPreface, kPrefaceBytes)) {
         SetError(error, "failed to write preface");
+        // 握手写失败会直接关连接，且错误文本只回给调用方，日志留一份便于关联。
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("app"))
+            << "connection: failed to write preface, closing";
         CloseInternal(ErrorCode::kInternalError, "failed to write preface", false);
         return false;
     }
@@ -325,6 +330,8 @@ bool Connection::Start(std::string* error) {
     m_control_queue.pop_front();
     if (!WriteFrame(settings)) {
         SetError(error, "failed to write settings");
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("app"))
+            << "connection: failed to write settings frame";
         return false;
     }
     return true;

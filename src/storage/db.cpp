@@ -35,6 +35,8 @@
  */
 #include "go2cpp/storage/db.hpp"
 
+#include "go2cpp/logging/log.hpp"
+
 #include "go2cpp/tools/strings.hpp"
 
 #include <sqlite3.h>
@@ -569,6 +571,11 @@ Result<std::unique_ptr<DB>> DB::Open(const std::string& path) {
             raw != nullptr ? sqlite3_errmsg(raw) : sqlite3_errstr(rc);
         const int extended =
             raw != nullptr ? sqlite3_extended_errcode(raw) : 0;
+        // 失败的 Open 是整条存储链路的起点故障，调用方只看到 Error 码，
+        // 拿不到路径与 libsqlite3 原始文本；这里补上诊断上下文。
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("storage"))
+            << "DB::Open failed: path=" << path << " rc=" << rc
+            << " extended=" << extended << " message=" << message;
         if (raw != nullptr) {
             sqlite3_close(raw);
         }
@@ -787,6 +794,10 @@ Result<Rows> DB::QueryImpl(const std::string& sql, const Value* params,
     const char* tail = nullptr;
     const int rc = sqlite3_prepare_v2(m_db, sql.c_str(), -1, &stmt, &tail);
     if (rc != SQLITE_OK) {
+        // SQL 语法/IO 错误：调用方只拿到错误码，日志里补语句前缀便于定位。
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("storage"))
+            << "DB::Exec prepare failed: " << m_last_error.ToString()
+            << " sql=" << sql.substr(0, 64);
         m_last_error = MakeErrorLocked(rc);
         return m_last_error;
     }
@@ -917,6 +928,9 @@ Error DB::Commit() {
     const int rc = sqlite3_exec(m_db, "COMMIT", nullptr, nullptr, &message);
     if (rc != SQLITE_OK) {
         m_last_error = ErrorFromDb(m_db, rc);
+        // 提交失败意味着事务仍活动，上层若误判会写坏状态机；必须留痕。
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("storage"))
+            << "DB::Commit failed: " << m_last_error.ToString();
         if (message != nullptr) {
             sqlite3_free(message);
         }
@@ -961,6 +975,9 @@ Error DB::Rollback() {
     const int rc = sqlite3_exec(m_db, "ROLLBACK", nullptr, nullptr, &message);
     if (rc != SQLITE_OK) {
         m_last_error = ErrorFromDb(m_db, rc);
+        // 回滚失败通常意味着连接/磁盘已坏，后续写入都不可信。
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("storage"))
+            << "DB::Rollback failed: " << m_last_error.ToString();
         if (message != nullptr) {
             sqlite3_free(message);
         }

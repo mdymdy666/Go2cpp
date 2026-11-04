@@ -43,7 +43,15 @@ if (GO2CPP_WITH_APP)
     target_compile_features(go2cpp_app PUBLIC cxx_std_17)
     target_compile_options(go2cpp_app PRIVATE
         -Wall -Wextra -Wpedantic -Werror ${APP_OPT_FLAGS})
-    target_link_libraries(go2cpp_app PUBLIC Threads::Threads)
+    # 连接/流异常与 gateway 转发失败需要统一日志；standalone 构建没有 log 目标时
+    # 把日志实现并入本目标（与下方 go2cpp_hash 的 fallback 同一模式）。
+    if (TARGET go2cpp_log)
+        target_link_libraries(go2cpp_app PUBLIC Threads::Threads go2cpp_log)
+    else()
+        target_link_libraries(go2cpp_app PUBLIC Threads::Threads)
+        target_sources(go2cpp_app PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/logging/log.cpp)
+    endif()
     set_target_properties(go2cpp_app PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_library(go2cpp::app ALIAS go2cpp_app)
 

@@ -18,6 +18,8 @@
 
 #include "go2cpp/app/realtime_room.hpp"
 
+#include "go2cpp/logging/log.hpp"
+
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -135,7 +137,10 @@ class Conn {
             try {
                 ok = m_send && m_send(message);
             } catch (...) {
-                ok = false;  // 业务回调抛异常同样视为连接已坏。
+                // 业务回调抛异常被当作「连接已坏」并停止推送；吞掉异常但留下证据。
+                GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("app"))
+                    << "realtime_room: send callback threw, stopping room";
+                ok = false;
             }
             if (!ok) {
                 {

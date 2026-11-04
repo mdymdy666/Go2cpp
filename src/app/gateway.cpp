@@ -16,6 +16,8 @@
 
 #include "go2cpp/app/gateway.hpp"
 
+#include "go2cpp/logging/log.hpp"
+
 #include "go2cpp/network/socket.hpp"
 
 #include <algorithm>
@@ -968,6 +970,14 @@ struct Gateway::Impl {
         const http::Result result =
             client.do_request(outgoing, upstream.host, upstream.port);
         if (!result.ok() || !result.response) {
+            // 上游失败被折叠成 502/504 返回给客户端，服务端日志必须保留原因。
+            GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("app"))
+                << "gateway forward failed: upstream=" << upstream.host << ":"
+                << upstream.port
+                << " kind=" << (result.error == http::Result::Error::Timeout
+                                    ? "timeout"
+                                    : "upstream_error")
+                << " detail=" << result.message;
             if (result.error == http::Result::Error::Timeout) {
                 timeouts.fetch_add(1, std::memory_order_relaxed);
                 response = ErrorResponse(504, "upstream timeout");

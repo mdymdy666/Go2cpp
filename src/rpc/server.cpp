@@ -9,6 +9,8 @@
 
 #include "go2cpp/rpc/server.hpp"
 
+#include "go2cpp/logging/log.hpp"
+
 #include <algorithm>
 #include <condition_variable>
 #include <cstddef>
@@ -352,6 +354,9 @@ void ServerConnection::ReaderLoop() {
         std::size_t consumed = 0;
         if (!m_codec.Feed(m_read_buffer.data(), static_cast<std::size_t>(received), &m_frames,
                           &consumed, &error)) {
+            // 畸形字节流会静默断开连接；服务端要能区分「对端发脏数据」与「自身逻辑错」。
+            GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("rpc"))
+                << "server: frame decode failed, dropping connection: " << error.message;
             break;  // 字节流畸形：断开。
         }
         bool healthy = true;
