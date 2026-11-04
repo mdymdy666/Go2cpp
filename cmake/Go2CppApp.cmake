@@ -32,7 +32,9 @@ if (GO2CPP_WITH_APP)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/app/transport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/app/resource.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/app/kv_stream.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/app/connection.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/app/connection.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/app/gateway.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/app/realtime_room.cpp)
 
     add_library(go2cpp_app STATIC ${GO2CPP_APP_CORE_SOURCES})
 
@@ -54,6 +56,11 @@ if (GO2CPP_WITH_APP)
     endif()
     set_target_properties(go2cpp_app PROPERTIES POSITION_INDEPENDENT_CODE ON)
     add_library(go2cpp::app ALIAS go2cpp_app)
+
+    # gateway / realtime_room 依赖 network 的 Socket/HttpServer。
+    if (TARGET go2cpp_network)
+        target_link_libraries(go2cpp_app PUBLIC go2cpp_network)
+    endif()
 
     # 校验和复用仓库的 hash 模块；standalone 构建时把两个实现并入本目标。
     if (TARGET go2cpp_hash)

@@ -1381,7 +1381,7 @@ void Gateway::SetResolver(Resolver resolver) { m_impl->SetResolver(std::move(res
  * ## 步骤
  * step1. 解析 JSON 根，语法错误直接返回；
  * step2. 定位 routes 数组：缺省时允许根本身就是数组；
- * step3. 逐条校验类型与必填字段（path/upstream），method 支持字符串/数组/*；
+ * step3. 逐条校验类型与必填字段（path/upstream），method 支持字符串/数组/通配符 *；
  * step4. 可选字段校验：require_auth 布尔、timeout_ms 正数、priority 数字、name 字符串；
  * step5. 通过后 AddRoute 注册，失败时把下标与原因拼进 error 返回。
  * ## 并发/失败语义
