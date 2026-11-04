@@ -13,7 +13,7 @@
 |---|---|---|---|
 | ① | 全量 ctest | **绿** | 203 项：200 通过 / 0 失败 / 3 跳过（tools-migration、tools-cli、tools-replay，缺 go 工具链），`100% tests passed`，159.86 s（`-j4`，为 40 分钟盒采用并行；0 失败故无需串行复核） |
 | ② | ASan/UBSan | **绿** | 3 个核心二进制：`net_batch` 46156 checks/0 fail；`kv` 52665 checks/0 fail；`fast_channel` 修复后 3/3 次 0 泄漏（`WaitNodePool` TLS 池已归还）、功能全过；无 ASan 越界、无 UBSan 报告 |
-| ③ | TSan | **黄（client/server 取消链路均已打通；仅剩 server 偶发 1 条）** | `setarch x86_64 -R` + TSan `go2cpp_tunnel_test` 连跑 5 次：thread leak 数量 1 / 2 / 0 / 0 / 0（修前 4/5 次复现）。server 侧已改「可取消 context + 在途连接登记 + Stop 主动 shutdown」，`HandlePublic` 的 Direction 泄漏降为偶发 1 条；client 侧 `RelayLocal` 同构泄漏已修复（见 ③-3）：15 次连跑 client 栈 0 条，残余仅 `HandlePublic` 偶发 1 条。0 data race、功能 checks 全过（`ratio<4.0` 阈值偶发过敏除外） |
+| ③ | TSan | **绿（20/20 零 thread leak）** | `setarch x86_64 -R` + TSan `go2cpp_tunnel_test` 连跑 20 次（两组各 10 次）：thread leak **0/20**，每次均 `170 checks / 0 failures`（ratio 3.46–3.87x，全部 < 4.0）。根因是 `MuxStream::Read` 的条件变量**丢失唤醒**（`Close`/`MarkPeerClosed` 在锁外改标志 + notify，撞上「谓词已判 false、尚未 futex 等待」窗口 → 读线程永久阻塞 → `RelayPipe::Run` 的 `Join` 卡死）；已改为持锁置位 + 唤醒，并在 `SendPayload` 取到发送锁后复查 `alive()`（session Stop 后不再进入 30 s 写）。0 data race。详见 ③-4 |
 | ④ | 零告警 | **红** | 构建日志 54 条 `warning:`，排除 8 条 debug_dump 后 **46 条**：unused-function 23、unused-result 15、-Wcomment 14、switch 2；集中于未改动的既有文件（test_hook_correctness 13、hpack.cpp 8、debug_event_ring 5、container/ring/list 头 14） |
 | ⑤ | 构建一致性 | **绿** | `check_build_freshness.sh --build-dir .build-gate` → `RESULT: FRESH`（源码最新 18:52:49 < 产物最新 18:57:34；sources 491 / artifacts 34） |
 | ⑥ | soak 二进制一致性 | **红（不一致）** | soak 报告自述被测二进制构建于 18:24–18:36；而 `src/tunnel/{client,server}.cpp` 于 **18:44:06** 被 `fe54cc5` 修改（200 行），soak 的 tunnel 段**不含**该修复。network/ws/http 源码在 18:35 后未变，这两段有效 |
@@ -129,8 +129,35 @@
   栈 `relay_pipe.cpp:916` ← `server.cpp:1287`），与 ③-2 记录一致；需在 server/mux 侧保证
   `Run` 返回后两个 Direction 都能 join（writer 卡在无超时的 `MuxStream::Write`）。
 
+### ③-4 TSan thread leak 清零 —— mux 条件变量丢失唤醒（2026-11-04 19:35–20:05）
+
+- 复现：`.build-tsan` 重编译后首跑即 1 条，栈 `relay_pipe.cpp:916`（`directions[1]->Start`）
+  ← `server.cpp:1287`（`HandlePublic` 的 `pipe.Run`），TSan 标记该线程 **finished**。
+- 根因（`src/tunnel/mux.cpp`）：`MuxStream::Read` 在 `m_mutex` 内检查「队列非空 /
+  `m_closed` / `m_eof`」后进入 `m_cv.wait`，但 `Close()` 与 `MarkPeerClosed()` 在
+  **锁外**改标志并 `notify_all`。两者交错时（谓词检查为 false → 对端置位 + notify →
+  本线程才挂 futex）唤醒丢失，读线程永久睡眠；`RelayPipe::Run` 因此卡在 `Join`，进程退出
+  时 Direction 线程即 TSan thread leak。这也解释了「Stop 取消链路已打通、仍偶发 1 条」，
+  并与 TSan 的 finished 状态相符（泄漏的不是 writer，而是 Run 在 join 另一个方向）。
+- 修法（仅 `src/tunnel/mux.cpp`，未改 relay_pipe）：
+  1. `MuxStream::Close()` 改为**持 `m_mutex`** 做 CAS 置位 + `notify_all`；网络动作
+     （CLOSE 帧 / `RemoveStream`）移到锁外，避免持流锁做最长 30 s 的写；
+  2. `MarkPeerClosed()` 同样持锁置位 + 唤醒；
+  3. `MuxSession::SendPayload()` 在拿到 `m_send_mutex` 后**复查 `alive()`**：等锁
+     期间会话已 Stop 时立即失败返回，不再进入 `WriteAll`（writer 因而可 join）。
+  说明：`PushData` 本就「锁内入队、锁外 notify」，谓词受锁保护，无丢失唤醒。
+- 验证：
+  - `setarch x86_64 -R` + TSan 连跑 **20 次（两组各 10 次）：thread leak 0/20**；每次均
+    `170 checks / 0 failures`，ratio 3.46x–3.87x。
+  - 修前同一二进制首跑即复现 1 条（栈见上）。
+  - `setarch x86_64 -R ctest --test-dir .build-tsan -R '^tunnel$'`：
+    **1/1 Passed（6.19 s）**；`clang-format --dry-run --Werror` 通过，重编译零告警。
+- 为什么没给 `Run` 的 `done_cv.wait` 加 5 s 超时：它等的是「两方向都结束」，
+  keep-alive / 大文件等长连接正常可持续数分钟，5 s 超时会误杀健康连接；真正要修的是
+  唤醒丢失，已在 mux 侧闭环。
+
 ### 门禁状态变化
 
 - ② ASan：红 → **绿**（3/3 零泄漏）。
-- ③ TSan：红 → **黄**（server/client 两侧取消链路均已打通；client `RelayLocal` 泄漏已闭环，
-  15 次连跑 client 栈 0 条。残余仅 `HandlePublic` 偶发 1 条 Direction leak，需 server 侧继续）。
+- ③ TSan：红 → **绿**（mux 丢失唤醒修复后 20/20 零 thread leak，170 checks 全过；
+  `ctest -R '^tunnel$'` 通过）。

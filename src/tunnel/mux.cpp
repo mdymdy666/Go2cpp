@@ -320,18 +320,26 @@ streams::WriteResult MuxStream::Write(const char* data, std::size_t size) {
 }
 
 ErrorPtr MuxStream::Close() {
-    bool expected = false;
-    if (!m_closed.compare_exchange_strong(expected, true,
-                                          std::memory_order_acq_rel)) {
-        return nullptr;
+    {
+        // 必须持 `m_mutex` 置位并唤醒：`Read` 在锁内检查谓词后进入等待，
+        // 若在锁外 notify，会撞上「谓词已判 false、线程尚未挂上 futex」的
+        // 窗口，唤醒直接丢失，读线程永久阻塞——RelayPipe 的 Join 随之卡死
+        // （TSan 报 Direction 线程 finished-but-not-joined）。
+        std::lock_guard<std::mutex> lock(m_mutex);
+        bool expected = false;
+        if (!m_closed.compare_exchange_strong(expected, true,
+                                              std::memory_order_acq_rel)) {
+            return nullptr;
+        }
+        m_cv.notify_all();
     }
+    // 锁外再做网络动作：`SendPayload` 可能阻塞到写超时，不能占着流锁。
     const MuxSession::Ptr session = m_session.lock();
     if (session) {
         (void)session->SendPayload(FrameType::kClose,
                                    MakeClosePayload(m_id, 0));
         session->RemoveStream(m_id);
     }
-    m_cv.notify_all();
     return nullptr;
 }
 
@@ -360,6 +368,8 @@ bool MuxStream::PushData(const std::uint8_t* data, std::size_t length,
 }
 
 void MuxStream::MarkPeerClosed(const char* /*reason*/) {
+    // 同 `Close()`：持锁置位 + 唤醒，避免与 `Read` 的谓词检查交错时丢唤醒。
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_eof.store(true, std::memory_order_release);
     m_cv.notify_all();
 }
@@ -509,6 +519,11 @@ bool MuxSession::SendPayload(FrameType type,
     std::vector<std::uint8_t> wire;
     frame::Error frame_error;
     std::lock_guard<std::mutex> lock(m_send_mutex);
+    // 取到发送锁后再次确认会话存活：等锁期间 `Stop()` 可能已经完成，这里
+    // 立即失败返回，不进入最长 30 s 的 `WriteAll`（writer 因而可被 join）。
+    if (!alive()) {
+        return false;
+    }
     // `m_conn` 由 `m_conn_mutex` 保护（`DetachConn` 会并发清空它）：持锁取一份
     // 快照，既消除数据竞争，也保证 WriteAll 期间连接不会被摘走。
     TcpConn::Ptr conn;
