@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <random>
 #include <stdexcept>
@@ -717,6 +718,203 @@ void run_network_tests() {
     auto client = go2cpp::net::Socket::CreateTCP(AF_INET);
     GO2CPP_REQUIRE(client && client->connect(*listener_address, std::chrono::seconds(2)));
     GO2CPP_CHECK(client->send("tcp", 3).ok());
+    // H-06：SendAll 全量语义 vs 单次 send 短写。
+    // 8 MiB 远大于回环缓冲区，单次 send 必然只写进一部分；SendAll 在同一个
+    // socket 上循环到全部写完，慢读端逐字节校验内容后再断言 transferred。
+    {
+        constexpr std::size_t kTotal = 8U * 1024U * 1024U;
+        std::vector<std::uint8_t> payload(kTotal);
+        for (std::size_t index = 0; index < kTotal; ++index) {
+            payload[index] = static_cast<std::uint8_t>((index * 131U + 7U) & 0xffU);
+        }
+        const auto make_listener = [] {
+            auto socket = go2cpp::net::Socket::CreateTCP(AF_INET);
+            if (!socket) return socket;
+            const int buffer = 64 * 1024;
+            socket->set_option(SOL_SOCKET, SO_RCVBUF, &buffer, sizeof(buffer));
+            if (!socket->bind(*go2cpp::net::IPv4Address::Create("127.0.0.1", 0)) ||
+                !socket->listen(8)) {
+                return go2cpp::net::Socket::Ptr{};
+            }
+            return socket;
+        };
+        // 1) 对照：单次 send 对 8 MiB 只写入缓冲区容量，ok() 仍为 true——
+        //    这正是 H-06 说的「部分成功即成功」，按 Go Write 用会静默丢数据。
+        {
+            auto control_listener = make_listener();
+            GO2CPP_REQUIRE(control_listener);
+            auto control_address = std::dynamic_pointer_cast<go2cpp::net::IPv4Address>(
+                control_listener->local_address());
+            GO2CPP_REQUIRE(control_address);
+            std::thread idle_reader([control_listener] {
+                auto accepted = control_listener->accept(std::chrono::seconds(3));
+                GO2CPP_CHECK(accepted && accepted->valid());
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            });
+            auto control_sender = go2cpp::net::Socket::CreateTCP(AF_INET);
+            GO2CPP_REQUIRE(control_sender);
+            const int send_buffer = 64 * 1024;
+            control_sender->set_option(SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                                       sizeof(send_buffer));
+            GO2CPP_REQUIRE(control_sender->connect(*control_address,
+                                                  std::chrono::seconds(3)));
+            const auto single = control_sender->send(payload.data(), payload.size(), 0,
+                                                     std::chrono::seconds(5));
+            GO2CPP_CHECK(single.ok());
+            GO2CPP_CHECK(single.transferred > 0);
+            GO2CPP_CHECK(static_cast<std::size_t>(single.transferred) < kTotal);
+            go2cpp_tests::announce(
+                "SendAll baseline: single send wrote " +
+                std::to_string(single.transferred) + " of " +
+                std::to_string(kTotal) + " bytes (ok=true, short write)");
+            control_sender->close();
+            GO2CPP_JOIN_WITH_WATCHDOG(idle_reader, std::chrono::seconds(5));
+            control_listener->close();
+        }
+        // 2) SendAll：慢读端每 64 KiB 停 1 ms，逼发送侧跨多轮 EAGAIN 等待；
+        //    全部 8 MiB 必须逐字节按序到达。
+        {
+            auto all_listener = make_listener();
+            GO2CPP_REQUIRE(all_listener);
+            auto all_address = std::dynamic_pointer_cast<go2cpp::net::IPv4Address>(
+                all_listener->local_address());
+            GO2CPP_REQUIRE(all_address);
+            std::atomic<std::size_t> received_total{0};
+            std::atomic<bool> content_ok{true};
+            std::atomic<bool> reader_done{false};
+            std::thread slow_reader([&, all_listener] {
+                auto accepted = all_listener->accept(std::chrono::seconds(3));
+                if (!accepted) {
+                    reader_done.store(true, std::memory_order_release);
+                    return;
+                }
+                std::vector<std::uint8_t> chunk(64U * 1024U);
+                std::size_t offset = 0;
+                while (offset < kTotal) {
+                    const auto read = accepted->recv(chunk.data(), chunk.size(), 0,
+                                                     std::chrono::seconds(5));
+                    if (!read.ok() || read.transferred == 0) break;
+                    const auto count = static_cast<std::size_t>(read.transferred);
+                    for (std::size_t index = 0; index < count; ++index) {
+                        if (chunk[index] != payload[(offset + index) % kTotal]) {
+                            content_ok.store(false, std::memory_order_release);
+                        }
+                    }
+                    offset += count;
+                    received_total.store(offset, std::memory_order_release);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                reader_done.store(true, std::memory_order_release);
+            });
+            auto all_sender = go2cpp::net::Socket::CreateTCP(AF_INET);
+            GO2CPP_REQUIRE(all_sender);
+            const int all_buffer = 64 * 1024;
+            all_sender->set_option(SOL_SOCKET, SO_SNDBUF, &all_buffer,
+                                   sizeof(all_buffer));
+            GO2CPP_REQUIRE(all_sender->connect(*all_address,
+                                              std::chrono::seconds(3)));
+            const auto send_started = std::chrono::steady_clock::now();
+            const auto all_sent = all_sender->SendAll(payload.data(), payload.size(), 0,
+                                                      std::chrono::seconds(10));
+            const auto send_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - send_started);
+            GO2CPP_CHECK(all_sent.ok());
+            GO2CPP_CHECK(all_sent.transferred == static_cast<ssize_t>(kTotal));
+            GO2CPP_REQUIRE_EVENTUALLY(reader_done.load(std::memory_order_acquire),
+                                      std::chrono::seconds(10));
+            GO2CPP_JOIN_WITH_WATCHDOG(slow_reader, std::chrono::seconds(10));
+            GO2CPP_CHECK(received_total.load(std::memory_order_acquire) == kTotal);
+            GO2CPP_CHECK(content_ok.load(std::memory_order_acquire));
+            go2cpp_tests::announce(
+                "SendAll 8MiB slow reader: sent=" +
+                std::to_string(all_sent.transferred) + " received=" +
+                std::to_string(received_total.load(std::memory_order_acquire)) +
+                " in " + std::to_string(send_elapsed.count()) + " ms");
+            all_sender->close();
+            all_listener->close();
+        }
+        // 3) 边界：空写成功；非空 + nullptr 拒绝；对端不读时总超时生效，
+        //    且失败返回保留已发送进度（不会把前缀重发算进去）。
+        {
+            auto empty_socket = go2cpp::net::Socket::CreateTCP(AF_INET);
+            GO2CPP_REQUIRE(empty_socket);
+            const auto empty = empty_socket->SendAll(nullptr, 0);
+            GO2CPP_CHECK(empty.ok() && empty.transferred == 0);
+            const auto null_data = empty_socket->SendAll(nullptr, 1);
+            GO2CPP_CHECK(!null_data.ok() && null_data.error == EINVAL &&
+                         null_data.transferred == -1);
+            empty_socket->close();
+            int stalled_pair[2]{};
+            GO2CPP_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, stalled_pair) == 0);
+            auto stalled_sender = go2cpp::net::Socket::FromFd(stalled_pair[0], AF_UNIX,
+                                                              SOCK_STREAM);
+            auto stalled_peer = go2cpp::net::Socket::FromFd(stalled_pair[1], AF_UNIX,
+                                                            SOCK_STREAM);
+            GO2CPP_REQUIRE(stalled_sender && stalled_peer);
+            const int stalled_buffer = 64 * 1024;
+            stalled_sender->set_option(SOL_SOCKET, SO_SNDBUF, &stalled_buffer,
+                                       sizeof(stalled_buffer));
+            const auto stalled = stalled_sender->SendAll(payload.data(), payload.size(), 0,
+                                                         std::chrono::milliseconds(100));
+            GO2CPP_CHECK(!stalled.ok());
+            GO2CPP_CHECK(stalled.error == ETIMEDOUT);
+            GO2CPP_CHECK(stalled.transferred > 0 &&
+                         static_cast<std::size_t>(stalled.transferred) < kTotal);
+            go2cpp_tests::announce(
+                "SendAll timeout: transferred=" +
+                std::to_string(stalled.transferred) + " error=" +
+                std::to_string(stalled.error));
+            stalled_sender->close();
+            stalled_peer->close();
+        }
+    }
+
+    // H-04：DNS 查询在受管 Fiber 里包 BlockingRegion——结果正确、不挂死，
+    // 查询后调度器（sysmon）仍在推进；普通线程路径与受管路径结果一致。
+    {
+        const auto plain = go2cpp::net::Address::LookupAnyIPAddress("localhost:80");
+        GO2CPP_REQUIRE(plain);
+        GO2CPP_CHECK(plain->port() == 80);
+        go2cpp::SchedulerConfig dns_config;
+        dns_config.processor_count = 1;
+        dns_config.max_workers = 2;
+        dns_config.enable_sysmon = true;
+        dns_config.sysmon_interval = std::chrono::milliseconds(1);
+        dns_config.long_syscall_threshold = std::chrono::milliseconds(1);
+        go2cpp::Scheduler dns_scheduler(dns_config);
+        dns_scheduler.start();
+        std::atomic<bool> dns_done{false};
+        std::atomic<bool> dns_ok{false};
+        std::atomic<bool> dns_managed{false};
+        dns_scheduler.Go([&] {
+            // 受管 G 里 current_task() 非空，Address::Lookup 会走 BlockingRegion
+            // 分支（sysmon 可见的前提条件）；普通线程上构造则是 no-op。
+            dns_managed.store(go2cpp::Scheduler::current_task() != nullptr,
+                              std::memory_order_release);
+            const auto resolved =
+                go2cpp::net::Address::LookupAnyIPAddress("localhost:80");
+            dns_ok.store(resolved && resolved->port() == 80,
+                         std::memory_order_release);
+            dns_done.store(true, std::memory_order_release);
+        });
+        GO2CPP_REQUIRE_EVENTUALLY(dns_done.load(std::memory_order_acquire),
+                                  std::chrono::seconds(5));
+        GO2CPP_CHECK(dns_managed.load(std::memory_order_acquire));
+        GO2CPP_CHECK(dns_ok.load(std::memory_order_acquire));
+        // sysmon 活过查询：即使 getaddrinfo 较慢，阻塞区也能让替代 M 接管 P。
+        // sysmon 是独立线程，查询本身可能几微秒就结束；这里等它至少跑完一轮
+        // 周期再断言计数，避免把「还没来得及采样」误判成「sysmon 挂了」。
+        GO2CPP_CHECK(dns_scheduler.sysmon_running());
+        const auto sysmon_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (dns_scheduler.sysmon_pass_count() == 0 &&
+               std::chrono::steady_clock::now() < sysmon_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        GO2CPP_CHECK(dns_scheduler.sysmon_pass_count() > 0);
+        dns_scheduler.shutdown();
+    }
+
     GO2CPP_JOIN_WITH_WATCHDOG(acceptor, std::chrono::seconds(3));
     auto udp_server = go2cpp::net::Socket::CreateUDP(AF_INET);
     GO2CPP_REQUIRE(udp_server && udp_server->bind(*go2cpp::net::IPv4Address::Create("127.0.0.1", 0)));

@@ -913,6 +913,72 @@ SocketResult Socket::sendv(const iovec* buffers, std::size_t count, int flags, D
     end_operation();
     return result;
 }
+SocketResult Socket::SendAll(const void* data, std::size_t length, int flags,
+                             Duration timeout) {
+    // step1: 空写与非法长度在进入系统调用前拦掉，避免无意义的重试。
+    if (length == 0) return {0, 0};
+    if (data == nullptr) return {-1, EINVAL};
+    if (length > static_cast<std::size_t>(SSIZE_MAX)) return {-1, EINVAL};
+    const auto cancel_generation = m_write_cancel_generation.load(std::memory_order_acquire);
+    int fd = -1;
+    if (!begin_operation(fd)) return {-1, errno};
+    if (m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
+        end_operation();
+        return {-1, ECANCELED};
+    }
+    // step2: 整个循环共用一份总预算。Duration::max() 仍表示采用 send 超时
+    // 配置（默认无限），由 send_impl 的 100ms 分片保证 close() 可打断。
+    Duration effective = timeout;
+    if (effective == Duration::max()) effective = send_timeout();
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t total = 0;
+    SocketResult result{0, 0};
+    while (total < length) {
+        if (is_closing() ||
+            m_write_cancel_generation.load(std::memory_order_acquire) != cancel_generation) {
+            result = total > 0 ? SocketResult{static_cast<ssize_t>(total), ECANCELED}
+                               : SocketResult{-1, ECANCELED};
+            break;
+        }
+        // step3: 每轮只把「总预算的剩余量」交给单次 send_impl；send_impl
+        // 内部等待可写时也用这份剩余量，因此总超时不会被每轮重置。
+        const auto left = remaining(effective, started);
+        if (left.count() == 0 && left != Duration::max()) {
+            result = total > 0 ? SocketResult{static_cast<ssize_t>(total), ETIMEDOUT}
+                               : SocketResult{-1, ETIMEDOUT};
+            break;
+        }
+        // step4: 从句柄偏移推进，只发送尚未确认的尾部。
+        iovec vector{
+            const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(data)) + total,
+            length - total};
+        msghdr message{};
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1;
+        const auto sent = send_impl(fd, &message, flags, left, cancel_generation);
+        if (!sent.ok()) {
+            // step5: 失败保留进度：transferred 为已进入内核的字节数，调用方
+            // 只能从 data + transferred 续传；零进展返回 -1。
+            result = total > 0 ? SocketResult{static_cast<ssize_t>(total), sent.error}
+                               : SocketResult{-1, sent.error};
+            break;
+        }
+        // step6: 非空缓冲区的单次 sendmsg 返回 0 属于异常且无进展；继续
+        // 循环会原地空转，按 EPIPE 上报（对端已不再接收）。
+        if (sent.transferred == 0) {
+            result = total > 0 ? SocketResult{static_cast<ssize_t>(total), EPIPE}
+                               : SocketResult{-1, EPIPE};
+            break;
+        }
+        total += static_cast<std::size_t>(sent.transferred);
+        result = {static_cast<ssize_t>(total), 0};
+    }
+    GO2CPP_SOCKET_DEBUG_RECORD(SocketDebug::RecordWrite(
+        fd, result.ok() ? static_cast<std::uint64_t>(result.transferred) : 0,
+        result.error));
+    end_operation();
+    return result;
+}
 SocketResult Socket::recvv(iovec* buffers, std::size_t count, int flags, Duration timeout) {
     const auto cancel_generation = m_read_cancel_generation.load(std::memory_order_acquire);
     int fd = -1; if (!begin_operation(fd)) return {-1, errno};

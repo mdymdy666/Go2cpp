@@ -144,8 +144,64 @@ public:
     /** @brief 半关闭连接，how 取 SHUT_RD/SHUT_WR/SHUT_RDWR。 */
     bool shutdown(int how) noexcept;
 
+    /**
+     * @brief 单次 write 语义：发起一次 sendmsg(2)，允许短写。
+     *
+     * @param data [in] 待发送缓冲区首地址；length > 0 时不可为 nullptr；
+     *        仅调用期间借用，返回后不再访问。
+     * @param length [in] 待发送字节数；0 表示空写，直接返回 {0, 0}。
+     * @param flags [in] 透传给 sendmsg(2) 的 flags；内部始终附加
+     *        MSG_NOSIGNAL。
+     * @param timeout [in] 发送缓冲满时的最长等待；Duration::max() 表示
+     *        采用 send_timeout()（默认无限）。
+     *
+     * @return transferred 为本次已交给内核的字节数，可能小于 length。
+     *
+     * ## 定位
+     * 小包的单次提交点：长度小于内核发送缓冲、只需一次 write 的场景用它；
+     * 大包、循环写、或需要「全部发完」语义时必须用 SendAll()。
+     *
+     * ## 并发/失败语义
+     * - 部分成功也返回 ok() == true（与 Go Write 的语义不同），按 Go
+     *   Write 的用法直接使用会静默丢数据；
+     * - 调用约束：任意线程或受管 Fiber，内部通过挂起等待可写；
+     * - 不变量：ok() 只表示「写入了非负字节且无错误」，不代表全量。
+     */
     SocketResult send(const void* data, std::size_t length, int flags = 0,
                       Duration timeout = Duration::max());
+    /**
+     * @brief 循环发送直到 length 字节全部写完（Go Write 的全量语义）。
+     *
+     * @param data [in] 待发送缓冲区首地址；length > 0 时不可为 nullptr；
+     *        仅调用期间借用，返回后不再访问。
+     * @param length [in] 待发送字节数；0 表示空写，直接返回 {0, 0}。
+     * @param flags [in] 透传给 sendmsg(2) 的 flags；内部始终附加
+     *        MSG_NOSIGNAL，调用方不必处理 SIGPIPE。
+     * @param timeout [in] 整次调用的总超时（不是每轮的超时）；
+     *        Duration::max() 表示采用 send_timeout()（默认无限）。
+     *
+     * @return
+     * - ok() == true 且 transferred == length：全部发完——调用方可以释放
+     *   缓冲区，不必再重试；
+     * - transferred >= 0 且 error != 0：部分发送后失败（超时 / 取消 /
+     *   对端关闭）；transferred 是已进入内核的字节数，调用方必须从
+     *   data + transferred 继续，不能重发前缀；
+     * - transferred == -1：一个字节也没发出，按 error 处理。
+     *
+     * ## 定位
+     * 写路径的完整提交点。send() 是单次 write（部分成功也算 ok()），大包
+     * 直接用 send() 会静默丢数据；本函数在内部循环到全量或错误为止，是
+     * 「小包用 send、大包/循环用 SendAll」的分界线。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：与 send() 相同，任意线程或受管 Fiber；整个循环只做一次
+     *   begin_operation，超时覆盖全部重试；
+     * - 原子性：不保证——中途失败时前缀已进入内核，调用方只能续传；
+     * - 不变量：ok() 为真当且仅当 transferred == length；失败时
+     *   0 <= transferred <= length（返回 -1 表示零进展）。
+     */
+    SocketResult SendAll(const void* data, std::size_t length, int flags = 0,
+                         Duration timeout = Duration::max());
     SocketResult recv(void* data, std::size_t length, int flags = 0,
                       Duration timeout = Duration::max());
     SocketResult sendv(const iovec* buffers, std::size_t count, int flags = 0,

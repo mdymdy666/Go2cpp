@@ -1226,3 +1226,34 @@ handler 异常导致 SIGABRT；slowloris 靠单次 recv 30s 无限占住 worker�
 **未决**：协议只接受连续前缀（乱序直接 400，不支持空洞补传）；`upload_sessions`
 无定期清理，中断会话的 `.part` 需要后续 GC 策略。
 **未提交**。
+
+## 2026-11-04 · SendAll + DNS BlockingRegion（H-06 / H-04）
+
+**背景**：`docs/reports/mindset-network.md` 的两个高危——`Socket::send` 部分成功即
+返回 `ok()=true`（按 Go `Write` 用会静默丢数据，库无 SendAll）；`Address::Lookup`
+直调 `getaddrinfo`、无超时、Hook 未接管，DNS 慢时卡 M 5–20s。
+
+**改动**：
+- `include/go2cpp/network/socket.hpp` + `src/network/socket.cpp`：新增
+  `Socket::SendAll`——循环 sendmsg 到全量/超时/错误，整个循环共享一份总超时
+  （`remaining()` 逐轮扣减），一次 `begin_operation`；失败返回已进入内核的字节数
+  （调用方从 `data + transferred` 续传），零进展返回 -1；空写 `{0,0}`、
+  `nullptr` → `EINVAL`、单次写 0 字节按 `EPIPE` 上报防空转。`send` 语义不变，
+  只补文档标注「小包用 send，大包/循环用 SendAll」。
+- `src/network/address.cpp`：`Address::Lookup` 的 `getaddrinfo` 外包
+  `std::optional<BlockingRegion>`（仅 `Scheduler::current_task() != nullptr` 时
+  emplace），region 只覆盖该调用、不跨 park/yield；普通线程上为 no-op。
+
+**验证**（`GO2CPP_TEST_FILTER=network`，连跑 2 次全过，约 13 s/次）：
+- 单次 `send` 8 MiB 短写对照：`transferred=130964 / 8388608`（`ok=true`）；
+- `SendAll` + 慢读端（64 KiB/1 ms）：`sent=8388608 received=8388608`，
+  199 ms / 198 ms，逐字节内容校验通过；
+- `SendAll` 对端不读 + 100 ms 总超时：`transferred=146176`、`error=110`
+  （`ETIMEDOUT`），证明超时不被每轮重置且保留进度；
+- 受管 Fiber 内 `LookupAnyIPAddress("localhost:80")` 成功，`sysmon_running`
+  且 `sysmon_pass_count > 0`；普通线程对照结果一致；
+- `build-channel-audit` 增量构建，`-Wall -Wextra -Wpedantic` 零告警。
+
+**未决**：DNS 仍是「阻塞但可见」（sysmon 可补 M），真正的异步 resolver 线程池
+不在本次范围；`SendAll` 未覆盖 UDP 批量语义（批量走 `send_batch`）。
+**未提交**：本 agent 不 commit。

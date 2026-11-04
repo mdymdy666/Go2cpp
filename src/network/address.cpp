@@ -25,12 +25,14 @@
  */
 #include "go2cpp/network/address.hpp"
 
+#include "go2cpp/concurrency/scheduler/scheduler.hpp"
 #include "go2cpp/log.hpp"
 #include "go2cpp/network/endian.hpp"
 
 #include <arpa/inet.h>
 #include <cstring>
 #include <netdb.h>
+#include <optional>
 #include <sstream>
 #include <algorithm>
 #include <charconv>
@@ -130,10 +132,25 @@ bool Address::Lookup(std::vector<Ptr>& result, const std::string& host,
     const std::string node = service_host(host);
     const std::string service = service_port(host);
     addrinfo* list = nullptr;
+    // H-04：getaddrinfo 是典型的不可中断同步调用——glibc resolver 内部直接
+    // 走 socket/connect/poll，不经过本库的 Hook；DNS 慢时当前 M 会被卡住
+    // 5–20s（默认 timeout:5 attempts:2），期间这个 P 上的其他 G 全部停摆。
+    // 受管 Fiber 里显式声明阻塞区：enter_blocking 把 M 标为 kBlocking、
+    // blocking_workers+1，sysmon 超过 long_syscall_threshold 后解绑 P 并
+    // 申请替代 M，排队的 G 才能继续运行。普通 OS 线程（current_task() 为空）
+    // 上构造是 no-op，不引入额外语义。region 只覆盖这一次 getaddrinfo，
+    // 不跨 Fiber park/yield，满足 BlockingRegion 的使用约束。
     // step3: node/service 为空时传 nullptr（表示任意地址/端口）。
-    const int error = ::getaddrinfo(node.empty() ? nullptr : node.c_str(),
-                                    service.empty() ? nullptr : service.c_str(),
-                                    &hints, &list);
+    int error = 0;
+    {
+        std::optional<go2cpp::BlockingRegion> blocking_region;
+        if (go2cpp::Scheduler::current_task() != nullptr) {
+            blocking_region.emplace();
+        }
+        error = ::getaddrinfo(node.empty() ? nullptr : node.c_str(),
+                              service.empty() ? nullptr : service.c_str(),
+                              &hints, &list);
+    }
     if (error != 0) {
         // 失败原因在 errno 之外（gai_strerror），调用方只能看到 bool；
         // 这里补一条 WARN，不改变返回值与结果清空语义。
