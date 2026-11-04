@@ -10,10 +10,14 @@
 ///            `rd::net::Protocol` / `rd::net::StreamProtocol` 事件循环层回调
 ///            （定义见 protocol.hpp），本层不认魔法数、不分帧、不做重排或重传决策
 ///            （属于 REQ-008/REQ-009）；
-///          - **平台**：Linux/POSIX 为验收实现（poll(2) + eventfd(2)）；_WIN32 分支
-///            只有占位，Create() 返回 IoStatus::kInvalid。socket.hpp 没有
-///            kUnsupported，本层不新增枚举值，以免改动 REQ-006 产物；
-///            将来接 Windows 时用 WSAPoll/select 须注意 select 的 FD_SETSIZE=64 上限。
+///          - **平台**：Linux/POSIX 用 poll(2) + eventfd(2)；Windows 用
+///            WSAEventSelect + WaitForMultipleObjectsEx（每个 socket 一个
+///            WSAEVENT），Post/Stop 用 CreateEvent 的自动重置事件唤醒。
+///            **Windows 上限**：WaitForMultipleObjects 的句柄上限是 64
+///            （MAXIMUM_WAIT_OBJECTS），其中 1 个留给唤醒事件，所以单个
+///            事件循环最多挂 63 个 socket；超出时 Attach* 返回 false。
+///            Windows 不用 WSAPoll：它对非阻塞 connect/UDP 的事件语义与
+///            poll(2) 不一致，且无法等待非 socket 的 HANDLE。
 ///
 ///          单 tick 回调顺序（固定，测试断言）：
 ///          1. **Post 任务**：上一 tick 结束后新投递的任务，FIFO 保序，整批执行；
@@ -49,7 +53,8 @@ namespace rd::net {
 using EventClock = std::chrono::steady_clock;
 using EventTimePoint = EventClock::time_point;
 
-/// @brief 单线程事件循环（poll(2) + 最小堆定时器 + eventfd 跨线程唤醒）。
+/// @brief 单线程事件循环（POSIX: poll(2) + eventfd；Windows:
+///        WSAEventSelect + WaitForMultipleObjects 唤醒事件），最小堆定时器。
 class EventLoop {
 public:
     /// @brief 创建事件循环。失败时返回 Err(kIoError, errno)。

@@ -15,8 +15,14 @@
 ///          缓冲区所有权：ByteView / MutableByteView 是**调用方借用的视图**，
 ///          本层不做拷贝、不延长其生命周期；缓冲区由调用方保证在调用期间有效。
 ///
-///          平台：Linux/POSIX 为验收实现；_WIN32 分支只保留接口占位，
-///          不引入任何 Windows 头，由 JinShan 侧适配 WSA 错误码。
+///          平台：Linux/POSIX 用 `go2cpp::net::Socket` + 非阻塞系统调用；
+///          Windows 用 Winsock 实现，**全部放在 socket.cpp 的
+///          `#if defined(_WIN32)` 分支内**，本头不 include 任何 Windows 头
+///          （只用整数 `std::uintptr_t` 保存 SOCKET）。因此 Windows 上
+///          `last_system_error()` 返回 Winsock 错误码（WSA*），不是 errno。
+///          事件循环在 Windows 必须用 `native_handle()` 取 SOCKET；
+///          `fd()` 的 int 在 Windows 上只作诊断（SOCKET 为 UINT_PTR，
+///          理论上有截断风险）。
 
 #include <chrono>
 #include <cstddef>
@@ -35,6 +41,12 @@ struct BatchEntry;
 }  // namespace go2cpp::bufio
 
 namespace rd::net {
+
+/// @brief 无效原生句柄的整数表示。
+/// @details Windows 的 `INVALID_SOCKET` 是 `(SOCKET)(~0)`（UINT_PTR 全 1）；
+///          公共头不引 winsock2.h，故这里用字面量表示。POSIX 分支不使用它。
+inline constexpr std::uintptr_t kInvalidNativeHandle =
+    ~static_cast<std::uintptr_t>(0);
 
 /// @brief 一次 I/O 操作的状态（四态模型 + 通用错误）。
 enum class IoStatus : std::uint8_t {
@@ -199,9 +211,20 @@ public:
     /// @brief 关闭并释放 fd；幂等。
     void Close() noexcept;
 
-    bool valid() const noexcept { return fd_ >= 0; }
+    /// @brief 是否持有可用句柄（POSIX: fd>=0；Windows: SOCKET != INVALID_SOCKET）。
+    bool valid() const noexcept {
+#if defined(_WIN32)
+        return native_socket_ != kInvalidNativeHandle;
+#else
+        return fd_ >= 0;
+#endif
+    }
+    /// @brief POSIX fd；Windows 上返回 SOCKET 的低 32 位（仅诊断，可能为负）。
     int fd() const noexcept { return fd_; }
+    /// @brief 原生句柄：POSIX 为 fd，Windows 为 SOCKET（事件循环用它注册等待）。
+    std::uintptr_t native_handle() const noexcept;
     Endpoint local_endpoint() const noexcept { return local_; }
+    /// @brief 最近一次系统调用错误（POSIX: errno；Windows: WSA* 错误码）。
     int last_system_error() const noexcept { return last_error_; }
 
 private:
@@ -209,8 +232,13 @@ private:
     Endpoint local_{};
     std::uint64_t next_token_{0};
     int last_error_{0};
+#if defined(_WIN32)
+    /// @brief Windows：Winsock 句柄（UINT_PTR 宽，不能塞进 int，故单独保存）。
+    std::uintptr_t native_socket_{kInvalidNativeHandle};
+#else
     /// @brief 底层 go2cpp Socket（拥有 fd；Close 走它的 close）。
     std::shared_ptr<go2cpp::net::Socket> socket_;
+#endif
     /// @brief 批量配置快照（Open 时从 SocketOptions 拷入）。
     std::uint32_t batch_bytes_{0};
     std::uint32_t batch_entries_{0};
@@ -278,11 +306,22 @@ public:
     /// @brief 关闭并释放 fd；幂等。
     void Close() noexcept;
 
-    bool valid() const noexcept { return fd_ >= 0; }
+    /// @brief 是否持有可用句柄（POSIX: fd>=0；Windows: SOCKET != INVALID_SOCKET）。
+    bool valid() const noexcept {
+#if defined(_WIN32)
+        return native_socket_ != kInvalidNativeHandle;
+#else
+        return fd_ >= 0;
+#endif
+    }
+    /// @brief POSIX fd；Windows 上返回 SOCKET 的低 32 位（仅诊断，可能为负）。
     int fd() const noexcept { return fd_; }
+    /// @brief 原生句柄：POSIX 为 fd，Windows 为 SOCKET（事件循环用它注册等待）。
+    std::uintptr_t native_handle() const noexcept;
     Endpoint peer_endpoint() const noexcept { return peer_; }
     Endpoint local_endpoint() const noexcept { return local_; }
     std::size_t last_transferred() const noexcept { return last_transferred_; }
+    /// @brief 最近一次系统调用错误（POSIX: errno；Windows: WSA* 错误码）。
     int last_system_error() const noexcept { return last_error_; }
 
 private:
@@ -292,8 +331,13 @@ private:
     std::uint64_t next_token_{0};
     std::size_t last_transferred_{0};
     int last_error_{0};
+#if defined(_WIN32)
+    /// @brief Windows：Winsock 句柄（UINT_PTR 宽，不能塞进 int，故单独保存）。
+    std::uintptr_t native_socket_{kInvalidNativeHandle};
+#else
     /// @brief 底层 go2cpp Socket（拥有 fd；Close 走它的 close）。
     std::shared_ptr<go2cpp::net::Socket> socket_;
+#endif
     /// @brief 批量配置快照（Open 时从 DialOptions 拷入）。
     std::uint32_t batch_bytes_{0};
     std::uint32_t batch_entries_{0};

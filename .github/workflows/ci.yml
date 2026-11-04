@@ -274,15 +274,16 @@ jobs:
           path: ci-logs/
           if-no-files-found: ignore
 
-  # Windows 骨架（探测性，不作为门禁）：
+  # Windows 实构建（rd_net Winsock 后端）：
   # 仓库历史构建链只有 Linux/WSL（README、docs/testing.md、原有 CI 全部
-  # ubuntu）。本 job 只验证「Windows 上能否 configure + 编出最小骨架」，
-  # 用 continue-on-error 标记为非阻塞：结果失败时 workflow 显示黄色而不是
-  # 伪造绿色通过，也不会挡住 Linux 门禁。等 Windows 适配完成后再去掉
-  # continue-on-error。POSIX 专属模块（hook/bento/tunnel/relay/eBPF 等）
-  # 全部关闭，只保留可移植的核心库。
+  # ubuntu）。REQ-006/007 的 _WIN32 分支无法在 WSL 里交叉编译验证
+  # （无 mingw-w64、无 wine），只能靠 windows-latest 的 MSVC 真实构建。
+  # 本 job 只构建 go2cpp_rd_net 静态库，**不跑 ctest**：tests/rd_net/*.cpp
+  # 依赖 dirent/poll/fork，是 POSIX 专用用例，Windows 上不可编译
+  # （见 docs/reports/platform-diff.md 第 7 节）。
+  # continue-on-error 暂时保留：首次 Windows 实测通过后再改成门禁。
   windows-configure:
-    name: windows configure skeleton (probe, non-blocking)
+    name: windows rd_net build (Winsock backend, non-blocking)
     runs-on: windows-latest
     continue-on-error: true
     timeout-minutes: 30
@@ -307,9 +308,22 @@ jobs:
             -DGO2CPP_WITH_RELAY=OFF `
             -DGO2CPP_WITH_FRAME=OFF `
             -DGO2CPP_BUILD_HOOK=OFF `
-            -DGO2CPP_ENABLE_EBPF=OFF
+            -DGO2CPP_ENABLE_EBPF=OFF `
+            -DGO2CPP_WITH_RD_NET=ON
 
-      - name: Build skeleton
+      - name: Build rd_net (Winsock backend)
+        shell: pwsh
+        run: cmake --build build-win --config Release --target go2cpp_rd_net --parallel 4
+
+      - name: Build full skeleton (probe)
         shell: pwsh
         continue-on-error: true
         run: cmake --build build-win --config Release --parallel 4
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-log
+          path: build-win/CMakeFiles/CMakeOutput.log
+          if-no-files-found: ignore

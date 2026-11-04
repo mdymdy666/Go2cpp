@@ -747,6 +747,10 @@ IoStatus DatagramSocket::RecvFrom(MutableByteView buf, Endpoint* from,
     }
 }
 
+std::uintptr_t DatagramSocket::native_handle() const noexcept {
+    return fd_ >= 0 ? static_cast<std::uintptr_t>(fd_) : kInvalidNativeHandle;
+}
+
 void DatagramSocket::Close() noexcept {
     if (socket_) {
         (void)socket_->close();
@@ -1076,6 +1080,10 @@ IoStatus StreamSocket::Recv(MutableByteView buf, std::size_t* received) {
     }
 }
 
+std::uintptr_t StreamSocket::native_handle() const noexcept {
+    return fd_ >= 0 ? static_cast<std::uintptr_t>(fd_) : kInvalidNativeHandle;
+}
+
 void StreamSocket::Close() noexcept {
     if (socket_) {
         (void)socket_->close();
@@ -1088,74 +1096,1064 @@ void StreamSocket::Close() noexcept {
 
 }  // namespace rd::net
 
-#else  // _WIN32：只保留接口占位，不引入 Windows 头，由 JinShan 侧适配 WSA。
+#else  // _WIN32：Winsock 实现。Windows 头只在本 .cpp 内出现，公共头保持干净。
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#if !defined(_WIN32_WINNT)
+#define _WIN32_WINNT 0x0601  // Windows 7+：inet_pton / WSAPoll / getnameinfo
+#endif
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <utility>
+#include <vector>
+
+#include "go2cpp/bufio/batch.hpp"
+
+#if defined(_MSC_VER)
+#pragma comment(lib, "ws2_32.lib")
+#endif
 
 namespace rd::net {
+namespace {
 
-const char* IoStatusName(IoStatus) noexcept { return "kInvalid"; }
+using go2cpp::bufio::BatchEntry;
 
-DatagramSocket::~DatagramSocket() = default;
-DatagramSocket::DatagramSocket(DatagramSocket&&) noexcept = default;
-DatagramSocket& DatagramSocket::operator=(DatagramSocket&&) noexcept = default;
-Result<DatagramSocket> DatagramSocket::Open(const Endpoint&, const SocketOptions&) {
-    return Result<DatagramSocket>::Err(IoStatus::kInvalid, 0);
+/// @brief INVALID_SOCKET 的整数表示，与 socket.hpp 的 kInvalidNativeHandle 一致。
+constexpr std::uintptr_t kInvalidSocket = kInvalidNativeHandle;
+
+/// @brief 进程级 Winsock 初始化（一次，线程安全）。返回 0 或 WSA 错误码。
+/// @note 不调用 WSACleanup：库不该替宿主进程决定何时销毁 Winsock；
+///       进程退出时由 OS 回收，代价只是引用计数不归零。
+int EnsureWinsock() noexcept {
+    static const int result = []() noexcept -> int {
+        WSADATA data{};
+        return ::WSAStartup(MAKEWORD(2, 2), &data);
+    }();
+    return result;
 }
-IoStatus DatagramSocket::SendTo(ByteView, const Endpoint&, SendResult* out) {
-    if (out != nullptr) {
-        *out = SendResult{};
+
+SOCKET NativeSocket(std::uintptr_t handle) noexcept {
+    return static_cast<SOCKET>(handle);
+}
+
+/// @brief SOCKET 守卫：Open 的失败路径靠它关闭已建 socket，避免句柄泄漏。
+class SocketGuard {
+public:
+    explicit SocketGuard(SOCKET socket) noexcept : socket_(socket) {}
+    ~SocketGuard() { Reset(); }
+    SocketGuard(const SocketGuard&) = delete;
+    SocketGuard& operator=(const SocketGuard&) = delete;
+
+    SOCKET get() const noexcept { return socket_; }
+
+    SOCKET Release() noexcept {
+        const SOCKET socket = socket_;
+        socket_ = INVALID_SOCKET;
+        return socket;
     }
-    return IoStatus::kInvalid;
+
+    void Reset() noexcept {
+        if (socket_ != INVALID_SOCKET) {
+            ::closesocket(socket_);
+            socket_ = INVALID_SOCKET;
+        }
+    }
+
+private:
+    SOCKET socket_{INVALID_SOCKET};
+};
+
+/// @brief 解析 IP 字面量（快速路径，避免热路径反复 getaddrinfo）。
+bool ParseIpLiteral(const Endpoint& ep, sockaddr_storage* out, int* out_len) {
+    if (ep.host.empty()) {
+        return false;
+    }
+    sockaddr_in v4{};
+    if (::inet_pton(AF_INET, ep.host.c_str(), &v4.sin_addr) == 1) {
+        v4.sin_family = AF_INET;
+        v4.sin_port = htons(ep.port);
+        std::memcpy(out, &v4, sizeof(v4));
+        *out_len = static_cast<int>(sizeof(v4));
+        return true;
+    }
+    sockaddr_in6 v6{};
+    if (::inet_pton(AF_INET6, ep.host.c_str(), &v6.sin6_addr) == 1) {
+        v6.sin6_family = AF_INET6;
+        v6.sin6_port = htons(ep.port);
+        std::memcpy(out, &v6, sizeof(v6));
+        *out_len = static_cast<int>(sizeof(v6));
+        return true;
+    }
+    return false;
 }
-IoStatus DatagramSocket::SetBatchTarget(const Endpoint&, SendResult* out) {
+
+/// @brief Endpoint → sockaddr；passive=true 用于 bind。失败时写入 WSA 错误码。
+bool ResolveEndpoint(const Endpoint& ep, int sock_type, bool passive,
+                     sockaddr_storage* out, int* out_len, int* error) {
+    if (ParseIpLiteral(ep, out, out_len)) {
+        return true;
+    }
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = sock_type;
+    hints.ai_flags = passive ? AI_PASSIVE : 0;
+    char service[16];
+    std::snprintf(service, sizeof(service), "%u", static_cast<unsigned>(ep.port));
+    const char* node = ep.host.empty() ? nullptr : ep.host.c_str();
+    addrinfo* list = nullptr;
+    const int rc = ::getaddrinfo(node, service, &hints, &list);
+    if (rc != 0) {
+        // 注意：Windows 的 EAI_* 取值与 POSIX 不同，直接透传 WSA 错误码。
+        *error = rc;
+        return false;
+    }
+    bool copied = false;
+    for (const addrinfo* it = list; it != nullptr; it = it->ai_next) {
+        if (it->ai_addrlen > 0 && it->ai_addrlen <= sizeof(sockaddr_storage)) {
+            std::memcpy(out, it->ai_addr, it->ai_addrlen);
+            *out_len = static_cast<int>(it->ai_addrlen);
+            copied = true;
+            break;
+        }
+    }
+    ::freeaddrinfo(list);
+    if (!copied) {
+        *error = WSAEAFNOSUPPORT;
+    }
+    return copied;
+}
+
+/// @brief sockaddr → Endpoint（数字形式，不做反向 DNS）。
+Endpoint EndpointFromSockaddr(const sockaddr* sa, int len) {
+    Endpoint ep;
+    if (sa == nullptr) {
+        return ep;
+    }
+    char host[NI_MAXHOST] = {};
+    char service[NI_MAXSERV] = {};
+    if (::getnameinfo(sa, len, host, static_cast<DWORD>(sizeof(host)), service,
+                      static_cast<DWORD>(sizeof(service)),
+                      NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
+        return ep;
+    }
+    ep.host = host;
+    ep.port = static_cast<std::uint16_t>(std::strtoul(service, nullptr, 10));
+    return ep;
+}
+
+bool SetIntOption(SOCKET socket, int level, int name, int value) {
+    return ::setsockopt(socket, level, name, reinterpret_cast<const char*>(&value),
+                        static_cast<int>(sizeof(value))) == 0;
+}
+
+/// @brief 发送错误（WSA*）→ 四态。WSAENOBUFS 在 UDP 发送缓冲不足时出现，
+///        语义等价 POSIX 的 ENOBUFS，按可重试处理（与 libuv 一致）。
+IoStatus MapSendError(int err) {
+    switch (err) {
+        case WSAEWOULDBLOCK:
+        case WSAENOBUFS:
+            return IoStatus::kWouldBlock;
+        case WSAECONNRESET:
+        case WSAECONNABORTED:
+        case WSAECONNREFUSED:
+            return IoStatus::kReset;
+        case WSAETIMEDOUT:
+            return IoStatus::kTimeout;
+        case WSAENOTCONN:
+        case WSAESHUTDOWN:
+            return IoStatus::kClosed;
+        default:
+            return IoStatus::kIoError;
+    }
+}
+
+/// @brief 接收错误（WSA*）→ 四态。WSAEMSGSIZE 表示 UDP 报文大于缓冲。
+IoStatus MapRecvError(int err) {
+    switch (err) {
+        case WSAEWOULDBLOCK:
+            return IoStatus::kWouldBlock;
+        case WSAEMSGSIZE:
+            return IoStatus::kTruncated;
+        case WSAECONNRESET:
+        case WSAECONNABORTED:
+            return IoStatus::kReset;
+        case WSAENOTCONN:
+        case WSAESHUTDOWN:
+        case WSAEDISCON:
+            return IoStatus::kClosed;
+        case WSAETIMEDOUT:
+            return IoStatus::kTimeout;
+        default:
+            return IoStatus::kIoError;
+    }
+}
+
+IoStatus MapConnectError(int err) {
+    switch (err) {
+        case WSAECONNREFUSED:
+        case WSAECONNRESET:
+        case WSAECONNABORTED:
+            return IoStatus::kReset;
+        case WSAETIMEDOUT:
+            return IoStatus::kTimeout;
+        default:
+            return IoStatus::kIoError;
+    }
+}
+
+/// @brief 计算「已写入 bytes 字节」完整覆盖的前缀段数（size==0 的段视为已提交）。
+std::size_t CompletePrefixSegments(const BatchEntry* entries, std::size_t limit,
+                                   std::size_t bytes) {
+    std::size_t prefix = 0;
+    std::size_t cumulative = 0;
+    for (std::size_t i = 0; i < limit; ++i) {
+        if (entries[i].size == 0) {
+            ++prefix;
+            continue;
+        }
+        if (entries[i].size > bytes - cumulative) {
+            break;
+        }
+        cumulative += entries[i].size;
+        ++prefix;
+    }
+    return prefix;
+}
+
+/// @brief 一条 UDP 数据报的原子提交（WSASendTo 单缓冲）。
+IoStatus SendDatagramRaw(SOCKET socket, ByteView data, const sockaddr* to,
+                         int to_len, int* error) {
+    WSABUF buffer{};
+    buffer.buf = const_cast<char*>(reinterpret_cast<const char*>(data.data));
+    buffer.len = static_cast<ULONG>(data.size);
+    DWORD sent = 0;
+    const int rc = ::WSASendTo(socket, &buffer, 1, &sent, 0,
+                               const_cast<sockaddr*>(to), to_len, nullptr, nullptr);
+    if (rc == 0) {
+        if (sent != data.size) {
+            // UDP 不允许部分发送；内核若仍返回短写，按错误上报，避免静默丢包。
+            *error = WSAEINVAL;
+            return IoStatus::kIoError;
+        }
+        *error = 0;
+        return IoStatus::kOk;
+    }
+    *error = ::WSAGetLastError();
+    return MapSendError(*error);
+}
+
+/// @brief 一条 UDP 数据报的接收（WSARecvFrom 单缓冲）。
+/// @note 截断语义与 POSIX 不同：Windows 不返回真实报文长度，
+///       kTruncated 时 *received 记为缓冲大小（见 docs/reports/platform-diff.md）。
+IoStatus RecvDatagramRaw(SOCKET socket, MutableByteView buf, sockaddr_storage* src,
+                         int* src_len, std::size_t* received, int* error) {
+    WSABUF buffer{};
+    buffer.buf = reinterpret_cast<char*>(buf.data);
+    buffer.len = static_cast<ULONG>(buf.size);
+    DWORD flags = 0;
+    DWORD got = 0;
+    const int rc = ::WSARecvFrom(socket, &buffer, 1, &got, &flags,
+                                 reinterpret_cast<sockaddr*>(src), src_len, nullptr,
+                                 nullptr);
+    if (rc == 0) {
+        *error = 0;
+        *received = static_cast<std::size_t>(got);
+        return IoStatus::kOk;
+    }
+    const int err = ::WSAGetLastError();
+    *error = err;
+    if (err == WSAEMSGSIZE) {
+        *received = buf.size;
+        return IoStatus::kTruncated;
+    }
+    if (err == WSAEWOULDBLOCK) {
+        *error = 0;
+    }
+    return MapRecvError(err);
+}
+
+}  // namespace
+
+const char* IoStatusName(IoStatus status) noexcept {
+    switch (status) {
+        case IoStatus::kOk:
+            return "kOk";
+        case IoStatus::kWouldBlock:
+            return "kWouldBlock";
+        case IoStatus::kTimeout:
+            return "kTimeout";
+        case IoStatus::kClosed:
+            return "kClosed";
+        case IoStatus::kReset:
+            return "kReset";
+        case IoStatus::kTruncated:
+            return "kTruncated";
+        case IoStatus::kIoError:
+            return "kIoError";
+        case IoStatus::kInvalid:
+            return "kInvalid";
+    }
+    return "Unknown";
+}
+
+// ---------------------------------------------------------------- DatagramSocket
+
+DatagramSocket::~DatagramSocket() { Close(); }
+
+DatagramSocket::DatagramSocket(DatagramSocket&& other) noexcept
+    : fd_(other.fd_),
+      local_(std::move(other.local_)),
+      next_token_(other.next_token_),
+      last_error_(other.last_error_),
+      native_socket_(other.native_socket_),
+      batch_bytes_(other.batch_bytes_),
+      batch_entries_(other.batch_entries_),
+      enable_sendmmsg_(other.enable_sendmmsg_),
+      last_batch_submitted_(other.last_batch_submitted_),
+      batch_target_(std::move(other.batch_target_)) {
+    other.fd_ = -1;
+    other.native_socket_ = kInvalidSocket;
+    other.next_token_ = 0;
+    other.last_error_ = 0;
+    other.batch_bytes_ = 0;
+    other.batch_entries_ = 0;
+    other.enable_sendmmsg_ = false;
+    other.last_batch_submitted_ = 0;
+    other.batch_target_ = Endpoint{};
+}
+
+DatagramSocket& DatagramSocket::operator=(DatagramSocket&& other) noexcept {
+    if (this != &other) {
+        Close();
+        fd_ = other.fd_;
+        local_ = std::move(other.local_);
+        next_token_ = other.next_token_;
+        last_error_ = other.last_error_;
+        native_socket_ = other.native_socket_;
+        batch_bytes_ = other.batch_bytes_;
+        batch_entries_ = other.batch_entries_;
+        enable_sendmmsg_ = other.enable_sendmmsg_;
+        last_batch_submitted_ = other.last_batch_submitted_;
+        batch_target_ = std::move(other.batch_target_);
+        other.fd_ = -1;
+        other.native_socket_ = kInvalidSocket;
+        other.next_token_ = 0;
+        other.last_error_ = 0;
+        other.batch_bytes_ = 0;
+        other.batch_entries_ = 0;
+        other.enable_sendmmsg_ = false;
+        other.last_batch_submitted_ = 0;
+        other.batch_target_ = Endpoint{};
+    }
+    return *this;
+}
+
+/**
+ * @brief 创建并绑定一个 UDP 数据报 socket（Winsock 版）。
+ *
+ * @param local [in] 本地绑定端点——借用，仅本次调用读取；port=0 由系统分配。
+ * @param options [in] socket 选项——借用；缓冲为 0 表示不设置。
+ *
+ * @return
+ * - Ok：已 bind 成功，SOCKET 所有权移交返回对象——调用方**必须**负责 Close；
+ * - Err(kInvalid)：地址解析失败——调用方**不要**重试同一端点；
+ * - Err(kIoError)：WSAStartup/socket/bind/选项失败，error 为 WSA 错误码。
+ *
+ * ## 步骤
+ * step1. 确保 Winsock 已初始化（进程级一次）；
+ * step2. 解析 Endpoint 并按地址族建 UDP socket；
+ * step3. 依序应用 REUSEADDR/BROADCAST/收发缓冲（任一失败即整体失败）；
+ * step4. bind，然后 ioctlsocket(FIONBIO) 置非阻塞；
+ * step5. 组装对象：句柄移交，getsockname 回填 local_。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：建链期单线程；对象发布前无并发读者。
+ * - 失败语义：不抛异常；任一步失败由 SocketGuard 关闭已建 socket。
+ * - 不变量：返回 Ok 时 valid() 为真。
+ */
+Result<DatagramSocket> DatagramSocket::Open(const Endpoint& local,
+                                            const SocketOptions& options) {
+    // step1: Winsock 初始化失败直接报错，不进入建链。
+    const int startup = EnsureWinsock();
+    if (startup != 0) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, startup);
+    }
+    // step2: 解析绑定端点（端口 0 由系统分配）。
+    sockaddr_storage addr{};
+    int addr_len = 0;
+    int resolve_err = 0;
+    if (!ResolveEndpoint(local, SOCK_DGRAM, true, &addr, &addr_len, &resolve_err)) {
+        return Result<DatagramSocket>::Err(IoStatus::kInvalid, resolve_err);
+    }
+    SocketGuard guard(::socket(addr.ss_family, SOCK_DGRAM, IPPROTO_UDP));
+    if (guard.get() == INVALID_SOCKET) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    // step3: 依序应用选项；任一失败立即返回，SocketGuard 负责关闭。
+    if (options.reuse_address &&
+        !SetIntOption(guard.get(), SOL_SOCKET, SO_REUSEADDR, 1)) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    if (options.broadcast && !SetIntOption(guard.get(), SOL_SOCKET, SO_BROADCAST, 1)) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    if (options.recv_buffer_bytes != 0 &&
+        !SetIntOption(guard.get(), SOL_SOCKET, SO_RCVBUF,
+                      static_cast<int>(options.recv_buffer_bytes))) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    if (options.send_buffer_bytes != 0 &&
+        !SetIntOption(guard.get(), SOL_SOCKET, SO_SNDBUF,
+                      static_cast<int>(options.send_buffer_bytes))) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    // step4: bind + 非阻塞。
+    if (::bind(guard.get(), reinterpret_cast<const sockaddr*>(&addr), addr_len) ==
+        SOCKET_ERROR) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    u_long nonblocking = 1;
+    if (::ioctlsocket(guard.get(), FIONBIO, &nonblocking) == SOCKET_ERROR) {
+        return Result<DatagramSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    // step5: 句柄移交并回填实际绑定地址。
+    DatagramSocket sock;
+    sockaddr_storage bound{};
+    int bound_len = static_cast<int>(sizeof(bound));
+    if (::getsockname(guard.get(), reinterpret_cast<sockaddr*>(&bound), &bound_len) == 0) {
+        sock.local_ = EndpointFromSockaddr(reinterpret_cast<const sockaddr*>(&bound),
+                                           bound_len);
+    } else {
+        sock.local_ = local;
+    }
+    sock.native_socket_ = static_cast<std::uintptr_t>(guard.Release());
+    sock.fd_ = static_cast<int>(sock.native_socket_);  // 诊断字段（SOCKET 通常 < 2^31）
+    sock.batch_bytes_ = options.batch_bytes;
+    sock.batch_entries_ = options.batch_entries;
+    sock.enable_sendmmsg_ = options.enable_sendmmsg;
+    return Result<DatagramSocket>::Ok(std::move(sock));
+}
+
+/**
+ * @brief 向指定端点发送一个不可切分的 UDP 数据报。
+ *
+ * @param data [in] 载荷视图——借用；nullptr 只允许 size==0。
+ * @param to [in] 目标端点——借用；每次重新解析并记入 batch_target_。
+ * @param out [out] 结果——可为 nullptr；成功/失败都写入 token 与 status。
+ *
+ * @return kOk（整条已提交）/ kWouldBlock（暂不可发，退避重试）/
+ *         kInvalid（参数或地址非法）/ kReset / kClosed / kIoError。
+ *
+ * ## 步骤
+ * step1. 分配 token 并先写回 out，任何早退都有可读状态；
+ * step2. 校验句柄与载荷（长度不得超 ULONG 上限）；
+ * step3. 解析目标端点并记录 batch_target_；
+ * step4. WSASendTo 单缓冲提交，按 WSA 错误映射四态。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同对象需外部串行化（token/target 无锁）。
+ * - 原子性：单次 WSASendTo 提交整条数据报。
+ * - 不变量：kOk 时内核已接收整条报文；kWouldBlock 时一个字节都没发出。
+ */
+IoStatus DatagramSocket::SendTo(ByteView data, const Endpoint& to, SendResult* out) {
+    SendResult result;
+    // step1: 分配 token 并先写回 out。
+    result.token = ++next_token_;
+    result.status = IoStatus::kInvalid;
+    last_error_ = 0;
+    if (out != nullptr) {
+        *out = result;
+    }
+    // step2: 校验句柄与载荷。
+    if (!valid() || (data.data == nullptr && data.size != 0) ||
+        data.size > static_cast<std::size_t>(std::numeric_limits<ULONG>::max())) {
+        last_error_ = WSAEINVAL;
+        if (out != nullptr) {
+            out->status = IoStatus::kInvalid;
+        }
+        return IoStatus::kInvalid;
+    }
+    // step3: 解析目标端点并记录供 SendBatch 复用。
+    sockaddr_storage dst{};
+    int dst_len = 0;
+    int resolve_err = 0;
+    if (!ResolveEndpoint(to, SOCK_DGRAM, false, &dst, &dst_len, &resolve_err)) {
+        last_error_ = resolve_err;
+        if (out != nullptr) {
+            out->status = IoStatus::kInvalid;
+        }
+        return IoStatus::kInvalid;
+    }
+    batch_target_ = to;
+    // step4: WSASendTo 提交并按 WSA 错误映射四态。
+    int err = 0;
+    const IoStatus status =
+        SendDatagramRaw(NativeSocket(native_socket_), data,
+                        reinterpret_cast<const sockaddr*>(&dst), dst_len, &err);
+    last_error_ = err;
+    result.status = status;
+    if (out != nullptr) {
+        *out = result;
+    }
+    return status;
+}
+
+IoStatus DatagramSocket::SetBatchTarget(const Endpoint& to, SendResult* out) {
+    last_error_ = 0;
     if (out != nullptr) {
         *out = SendResult{};
         out->status = IoStatus::kInvalid;
     }
-    return IoStatus::kInvalid;
+    if (!valid() || to.host.empty() || to.port == 0) {
+        last_error_ = WSAEINVAL;
+        return IoStatus::kInvalid;
+    }
+    sockaddr_storage dst{};
+    int dst_len = 0;
+    int resolve_err = 0;
+    if (!ResolveEndpoint(to, SOCK_DGRAM, false, &dst, &dst_len, &resolve_err)) {
+        last_error_ = resolve_err;
+        return IoStatus::kInvalid;
+    }
+    batch_target_ = to;
+    if (out != nullptr) {
+        out->status = IoStatus::kOk;
+    }
+    return IoStatus::kOk;
 }
-IoStatus DatagramSocket::SendBatch(const go2cpp::bufio::BatchEntry*, std::size_t,
+
+/**
+ * @brief Windows 上没有 sendmmsg：逐条 WSASendTo，保持「前缀提交」语义。
+ *
+ * @param entries [in] 批次数组——借用；每条 data 非空。
+ * @param count [in] 条目数——0 是合法 no-op（仍分配 token）。
+ * @param out [out] 结果——可为 nullptr；写入 token/status。
+ *
+ * @return kOk（limit 条全部提交）/ kWouldBlock（前 K 条提交，见
+ *         last_batch_submitted()，从第 K 条重试）/ kInvalid（参数或缺少目标）。
+ *
+ * ## 步骤
+ * step1. 分配 token，count==0 直接成功；
+ * step2. 校验句柄、entries 与每条 data，截断到 kMaxBatchEntries；
+ * step3. 校验 batch_target_ 并解析目标；
+ * step4. 逐条 WSASendTo；遇到 wouldblock 立即停止，返回已提交条数。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同对象需外部串行化；entries 仅在调用期间借用。
+ * - 原子性：不是一次系统调用，部分提交必须通过 last_batch_submitted_ 观察。
+ * - 不变量：kOk 时 last_batch_submitted_ == limit。
+ */
+IoStatus DatagramSocket::SendBatch(const BatchEntry* entries, std::size_t count,
                                    SendResult* out) {
+    SendResult result;
+    // step1: 分配 token；count==0 为合法 no-op。
+    result.token = ++next_token_;
+    result.status = IoStatus::kOk;
+    last_batch_submitted_ = 0;
+    last_error_ = 0;
     if (out != nullptr) {
-        *out = SendResult{};
-        out->status = IoStatus::kInvalid;
+        *out = result;
     }
-    return IoStatus::kInvalid;
-}
-IoStatus DatagramSocket::RecvFrom(MutableByteView, Endpoint*, std::size_t* received) {
-    if (received != nullptr) {
-        *received = 0;
+    if (count == 0) {
+        return IoStatus::kOk;
     }
-    return IoStatus::kInvalid;
+    // step2: 校验参数并截断到公开上限。
+    if (!valid() || entries == nullptr) {
+        last_error_ = WSAEINVAL;
+        result.status = IoStatus::kInvalid;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return IoStatus::kInvalid;
+    }
+    const std::size_t limit = std::min(count, kMaxBatchEntries);
+    for (std::size_t i = 0; i < limit; ++i) {
+        if (entries[i].data == nullptr) {
+            last_error_ = WSAEINVAL;
+            result.status = IoStatus::kInvalid;
+            if (out != nullptr) {
+                *out = result;
+            }
+            return IoStatus::kInvalid;
+        }
+    }
+    // step3: 批量入口没有目标参数，必须先 SetBatchTarget 或 SendTo 过一次。
+    if (batch_target_.empty()) {
+        last_error_ = WSAEDESTADDRREQ;
+        result.status = IoStatus::kInvalid;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return IoStatus::kInvalid;
+    }
+    sockaddr_storage dst{};
+    int dst_len = 0;
+    int resolve_err = 0;
+    if (!ResolveEndpoint(batch_target_, SOCK_DGRAM, false, &dst, &dst_len, &resolve_err)) {
+        last_error_ = resolve_err;
+        result.status = IoStatus::kInvalid;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return IoStatus::kInvalid;
+    }
+    // step4: 逐条提交；wouldblock 时保留已完成前缀。
+    for (std::size_t i = 0; i < limit; ++i) {
+        const ByteView view{reinterpret_cast<const std::uint8_t*>(entries[i].data),
+                            entries[i].size};
+        int err = 0;
+        const IoStatus status =
+            SendDatagramRaw(NativeSocket(native_socket_), view,
+                            reinterpret_cast<const sockaddr*>(&dst), dst_len, &err);
+        if (status == IoStatus::kOk) {
+            ++last_batch_submitted_;
+            continue;
+        }
+        last_error_ = err;
+        result.status = status;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return status;
+    }
+    result.status = IoStatus::kOk;
+    if (out != nullptr) {
+        *out = result;
+    }
+    return IoStatus::kOk;
 }
-void DatagramSocket::Close() noexcept {}
 
-StreamSocket::~StreamSocket() = default;
-StreamSocket::StreamSocket(StreamSocket&&) noexcept = default;
-StreamSocket& StreamSocket::operator=(StreamSocket&&) noexcept = default;
-Result<StreamSocket> StreamSocket::Open(const Endpoint&, const DialOptions&) {
-    return Result<StreamSocket>::Err(IoStatus::kInvalid, 0);
-}
-IoStatus StreamSocket::Send(ByteView, SendResult* out) {
-    if (out != nullptr) {
-        *out = SendResult{};
-    }
-    return IoStatus::kInvalid;
-}
-IoStatus StreamSocket::SendBatch(const go2cpp::bufio::BatchEntry*, std::size_t,
-                                 SendResult* out) {
-    if (out != nullptr) {
-        *out = SendResult{};
-        out->status = IoStatus::kInvalid;
-    }
-    return IoStatus::kInvalid;
-}
-IoStatus StreamSocket::Recv(MutableByteView, std::size_t* received) {
+/**
+ * @brief 收取一个 UDP 数据报，给出源端点与长度。
+ *
+ * @param buf [out] 接收缓冲——非空且 size>0。
+ * @param from [out] 源端点——可为 nullptr；成功/截断时写入。
+ * @param received [out] 长度——可为 nullptr；截断时是缓冲大小（Windows 限制）。
+ *
+ * @return kOk / kTruncated / kWouldBlock / kInvalid / kReset / kIoError。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同对象需外部串行化。
+ * - 原子性：一次 WSARecvFrom 取走整条数据报。
+ * - 不变量：kOk 时 received <= buf.size；kTruncated 时 received == buf.size。
+ */
+IoStatus DatagramSocket::RecvFrom(MutableByteView buf, Endpoint* from,
+                                  std::size_t* received) {
     if (received != nullptr) {
         *received = 0;
     }
-    return IoStatus::kInvalid;
+    last_error_ = 0;
+    if (!valid() || buf.data == nullptr || buf.size == 0 ||
+        buf.size > static_cast<std::size_t>(std::numeric_limits<ULONG>::max())) {
+        last_error_ = WSAEINVAL;
+        return IoStatus::kInvalid;
+    }
+    sockaddr_storage src{};
+    int src_len = static_cast<int>(sizeof(src));
+    std::size_t got = 0;
+    int err = 0;
+    const IoStatus status = RecvDatagramRaw(NativeSocket(native_socket_), buf, &src,
+                                            &src_len, &got, &err);
+    if (status == IoStatus::kOk || status == IoStatus::kTruncated) {
+        if (from != nullptr) {
+            *from = EndpointFromSockaddr(reinterpret_cast<const sockaddr*>(&src), src_len);
+        }
+        if (received != nullptr) {
+            *received = got;
+        }
+        return status;
+    }
+    last_error_ = err;
+    return status;
 }
-void StreamSocket::Close() noexcept {}
+
+std::uintptr_t DatagramSocket::native_handle() const noexcept { return native_socket_; }
+
+void DatagramSocket::Close() noexcept {
+    if (native_socket_ != kInvalidSocket) {
+        ::closesocket(NativeSocket(native_socket_));
+        native_socket_ = kInvalidSocket;
+    }
+    fd_ = -1;
+    next_token_ = 0;
+    last_batch_submitted_ = 0;
+    batch_target_ = Endpoint{};
+}
+
+// ---------------------------------------------------------------- StreamSocket
+
+StreamSocket::~StreamSocket() { Close(); }
+
+StreamSocket::StreamSocket(StreamSocket&& other) noexcept
+    : fd_(other.fd_),
+      peer_(std::move(other.peer_)),
+      local_(std::move(other.local_)),
+      next_token_(other.next_token_),
+      last_transferred_(other.last_transferred_),
+      last_error_(other.last_error_),
+      native_socket_(other.native_socket_),
+      batch_bytes_(other.batch_bytes_),
+      batch_entries_(other.batch_entries_),
+      enable_writev_(other.enable_writev_),
+      last_batch_submitted_(other.last_batch_submitted_) {
+    other.fd_ = -1;
+    other.native_socket_ = kInvalidSocket;
+    other.next_token_ = 0;
+    other.last_transferred_ = 0;
+    other.last_error_ = 0;
+    other.batch_bytes_ = 0;
+    other.batch_entries_ = 0;
+    other.enable_writev_ = false;
+    other.last_batch_submitted_ = 0;
+}
+
+StreamSocket& StreamSocket::operator=(StreamSocket&& other) noexcept {
+    if (this != &other) {
+        Close();
+        fd_ = other.fd_;
+        peer_ = std::move(other.peer_);
+        local_ = std::move(other.local_);
+        next_token_ = other.next_token_;
+        last_transferred_ = other.last_transferred_;
+        last_error_ = other.last_error_;
+        native_socket_ = other.native_socket_;
+        batch_bytes_ = other.batch_bytes_;
+        batch_entries_ = other.batch_entries_;
+        enable_writev_ = other.enable_writev_;
+        last_batch_submitted_ = other.last_batch_submitted_;
+        other.fd_ = -1;
+        other.native_socket_ = kInvalidSocket;
+        other.next_token_ = 0;
+        other.last_transferred_ = 0;
+        other.last_error_ = 0;
+        other.batch_bytes_ = 0;
+        other.batch_entries_ = 0;
+        other.enable_writev_ = false;
+        other.last_batch_submitted_ = 0;
+    }
+    return *this;
+}
+
+/**
+ * @brief 非阻塞连接远端（Winsock 版），成功后保持非阻塞。
+ *
+ * @param remote [in] 远端端点——借用，仅本次调用读取。
+ * @param options [in] 连接选项——借用；connect_timeout<=0 按 1ms 处理。
+ *
+ * @return Ok（已连接）/ Err(kInvalid)（地址非法）/ Err(kTimeout)（超时）/
+ *         Err(kReset)（被拒绝/重置）/ Err(kIoError)（其它 WSA 错误）。
+ *
+ * ## 步骤
+ * step1. 确保 Winsock 初始化并解析远程地址；
+ * step2. 建 TCP socket 并应用 TCP_NODELAY / 收发缓冲；
+ * step3. FIONBIO 置非阻塞后 connect；WSAEWOULDBLOCK 表示进行中；
+ * step4. select 等可写（timeout 由 connect_timeout 给出），超时返回 kTimeout；
+ * step5. getsockopt(SO_ERROR) 取最终结果，回填 peer_/local_。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：建链期单线程，对象发布前无并发读者。
+ * - 失败语义：不抛异常；SocketGuard 关闭半开 socket。
+ * - 不变量：Ok 时 valid() 为真且 socket 处于非阻塞模式。
+ */
+Result<StreamSocket> StreamSocket::Open(const Endpoint& remote,
+                                        const DialOptions& options) {
+    // step1: Winsock 初始化 + 地址解析。
+    const int startup = EnsureWinsock();
+    if (startup != 0) {
+        return Result<StreamSocket>::Err(IoStatus::kIoError, startup);
+    }
+    sockaddr_storage addr{};
+    int addr_len = 0;
+    int resolve_err = 0;
+    if (!ResolveEndpoint(remote, SOCK_STREAM, false, &addr, &addr_len, &resolve_err)) {
+        return Result<StreamSocket>::Err(IoStatus::kInvalid, resolve_err);
+    }
+    // step2: 建 TCP socket 并应用选项。
+    SocketGuard guard(::socket(addr.ss_family, SOCK_STREAM, IPPROTO_TCP));
+    if (guard.get() == INVALID_SOCKET) {
+        return Result<StreamSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    if (options.tcp_no_delay && !SetIntOption(guard.get(), IPPROTO_TCP, TCP_NODELAY, 1)) {
+        return Result<StreamSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    if (options.recv_buffer_bytes != 0 &&
+        !SetIntOption(guard.get(), SOL_SOCKET, SO_RCVBUF,
+                      static_cast<int>(options.recv_buffer_bytes))) {
+        return Result<StreamSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    if (options.send_buffer_bytes != 0 &&
+        !SetIntOption(guard.get(), SOL_SOCKET, SO_SNDBUF,
+                      static_cast<int>(options.send_buffer_bytes))) {
+        return Result<StreamSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    // step3: 非阻塞 connect。
+    u_long nonblocking = 1;
+    if (::ioctlsocket(guard.get(), FIONBIO, &nonblocking) == SOCKET_ERROR) {
+        return Result<StreamSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+    }
+    if (::connect(guard.get(), reinterpret_cast<const sockaddr*>(&addr), addr_len) ==
+        SOCKET_ERROR) {
+        const int err = ::WSAGetLastError();
+        if (err != WSAEWOULDBLOCK) {
+            return Result<StreamSocket>::Err(MapConnectError(err), err);
+        }
+        // step4: 等待可写或超时；Windows 的 select 忽略 nfds 参数。
+        std::chrono::milliseconds budget = options.connect_timeout;
+        if (budget.count() <= 0) {
+            budget = std::chrono::milliseconds(1);
+        }
+        fd_set write_set;
+        FD_ZERO(&write_set);
+        FD_SET(guard.get(), &write_set);
+        fd_set error_set;
+        FD_ZERO(&error_set);
+        FD_SET(guard.get(), &error_set);
+        timeval tv{};
+        tv.tv_sec = static_cast<long>(budget.count() / 1000);
+        tv.tv_usec = static_cast<long>((budget.count() % 1000) * 1000);
+        const int ready = ::select(0, nullptr, &write_set, &error_set, &tv);
+        if (ready == 0) {
+            return Result<StreamSocket>::Err(IoStatus::kTimeout, WSAETIMEDOUT);
+        }
+        if (ready == SOCKET_ERROR) {
+            return Result<StreamSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+        }
+        // step5: SO_ERROR 是 connect 的最终结果。
+        int so_error = 0;
+        int so_error_len = static_cast<int>(sizeof(so_error));
+        if (::getsockopt(guard.get(), SOL_SOCKET, SO_ERROR,
+                         reinterpret_cast<char*>(&so_error), &so_error_len) ==
+            SOCKET_ERROR) {
+            return Result<StreamSocket>::Err(IoStatus::kIoError, ::WSAGetLastError());
+        }
+        if (so_error != 0) {
+            return Result<StreamSocket>::Err(MapConnectError(so_error), so_error);
+        }
+    }
+    StreamSocket sock;
+    sockaddr_storage peer{};
+    int peer_len = static_cast<int>(sizeof(peer));
+    if (::getpeername(guard.get(), reinterpret_cast<sockaddr*>(&peer), &peer_len) == 0) {
+        sock.peer_ = EndpointFromSockaddr(reinterpret_cast<const sockaddr*>(&peer), peer_len);
+    } else {
+        sock.peer_ = remote;
+    }
+    sockaddr_storage local{};
+    int local_len = static_cast<int>(sizeof(local));
+    if (::getsockname(guard.get(), reinterpret_cast<sockaddr*>(&local), &local_len) == 0) {
+        sock.local_ = EndpointFromSockaddr(reinterpret_cast<const sockaddr*>(&local),
+                                           local_len);
+    }
+    sock.native_socket_ = static_cast<std::uintptr_t>(guard.Release());
+    sock.fd_ = static_cast<int>(sock.native_socket_);  // 诊断字段
+    sock.batch_bytes_ = options.batch_bytes;
+    sock.batch_entries_ = options.batch_entries;
+    sock.enable_writev_ = options.enable_writev;
+    return Result<StreamSocket>::Ok(std::move(sock));
+}
+
+IoStatus StreamSocket::Send(ByteView data, SendResult* out) {
+    SendResult result;
+    result.token = ++next_token_;
+    result.status = IoStatus::kInvalid;
+    last_transferred_ = 0;
+    last_error_ = 0;
+    if (out != nullptr) {
+        *out = result;
+    }
+    if (!valid() || (data.data == nullptr && data.size != 0) ||
+        data.size > static_cast<std::size_t>(std::numeric_limits<ULONG>::max())) {
+        last_error_ = WSAEINVAL;
+        if (out != nullptr) {
+            out->status = IoStatus::kInvalid;
+        }
+        return IoStatus::kInvalid;
+    }
+    WSABUF buffer{};
+    buffer.buf = const_cast<char*>(reinterpret_cast<const char*>(data.data));
+    buffer.len = static_cast<ULONG>(data.size);
+    DWORD sent = 0;
+    const int rc = ::WSASend(NativeSocket(native_socket_), &buffer, 1, &sent, 0, nullptr,
+                             nullptr);
+    if (rc == 0) {
+        last_transferred_ = static_cast<std::size_t>(sent);
+        result.status = IoStatus::kOk;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return IoStatus::kOk;
+    }
+    const int err = ::WSAGetLastError();
+    if (err == WSAEWOULDBLOCK) {
+        // 非阻塞下发送缓冲满：可能已发送 0 字节，按 kWouldBlock 上报。
+        last_error_ = 0;
+        result.status = IoStatus::kWouldBlock;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return IoStatus::kWouldBlock;
+    }
+    last_error_ = err;
+    result.status = MapSendError(err);
+    if (out != nullptr) {
+        *out = result;
+    }
+    return result.status;
+}
+
+/**
+ * @brief 用一次 WSASend 的 scatter/gather 提交多段（Windows 的 writev 等价物）。
+ *
+ * @param entries [in] 段数组——借用；段边界不改变字节流语义。
+ * @param count [in] 段数——0 是合法 no-op（仍分配 token）。
+ * @param out [out] 结果——可为 nullptr；写入 token/status。
+ *
+ * @return kOk（全部写入）/ kWouldBlock（部分写入，见 last_batch_submitted()
+ *         与 last_transferred()）/ kInvalid（参数非法）/ 其它映射状态。
+ *
+ * ## 步骤
+ * step1. 分配 token，count==0 直接成功；
+ * step2. 校验 entries 并累计总字节；
+ * step3. 构造 WSABUF 数组，一次 WSASend 提交；
+ * step4. 按已写字节数计算完整前缀段数，部分写按 kWouldBlock 上报。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：同对象需外部串行化；entries 仅调用期间借用。
+ * - 原子性：WSASend 不是整批原子，部分写入必须按 last_batch_submitted_ 推进。
+ * - 不变量：kOk 时 last_transferred_ >= 所有段字节和。
+ */
+IoStatus StreamSocket::SendBatch(const BatchEntry* entries, std::size_t count,
+                                 SendResult* out) {
+    SendResult result;
+    result.token = ++next_token_;
+    result.status = IoStatus::kOk;
+    last_batch_submitted_ = 0;
+    last_transferred_ = 0;
+    last_error_ = 0;
+    if (out != nullptr) {
+        *out = result;
+    }
+    if (count == 0) {
+        return IoStatus::kOk;
+    }
+    if (!valid() || entries == nullptr) {
+        last_error_ = WSAEINVAL;
+        result.status = IoStatus::kInvalid;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return IoStatus::kInvalid;
+    }
+    const std::size_t limit = std::min(count, kMaxBatchEntries);
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < limit; ++i) {
+        if (entries[i].data == nullptr && entries[i].size != 0) {
+            last_error_ = WSAEINVAL;
+            result.status = IoStatus::kInvalid;
+            if (out != nullptr) {
+                *out = result;
+            }
+            return IoStatus::kInvalid;
+        }
+        total += entries[i].size;
+    }
+    // 一次 WSASend 提交全部段（limit <= 1024，WSABUF 数组在栈上）。
+    std::vector<WSABUF> buffers(limit);
+    for (std::size_t i = 0; i < limit; ++i) {
+        buffers[i].buf = const_cast<char*>(entries[i].data);
+        buffers[i].len = static_cast<ULONG>(entries[i].size);
+    }
+    DWORD sent = 0;
+    const int rc = ::WSASend(NativeSocket(native_socket_), buffers.data(),
+                             static_cast<DWORD>(limit), &sent, 0, nullptr, nullptr);
+    if (rc == 0) {
+        last_transferred_ = static_cast<std::size_t>(sent);
+        last_batch_submitted_ = CompletePrefixSegments(entries, limit, last_transferred_);
+        result.status = last_transferred_ >= total ? IoStatus::kOk : IoStatus::kWouldBlock;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return result.status;
+    }
+    const int err = ::WSAGetLastError();
+    if (err == WSAEWOULDBLOCK) {
+        last_error_ = 0;
+        result.status = IoStatus::kWouldBlock;
+        if (out != nullptr) {
+            *out = result;
+        }
+        return IoStatus::kWouldBlock;
+    }
+    last_error_ = err;
+    result.status = MapSendError(err);
+    if (out != nullptr) {
+        *out = result;
+    }
+    return result.status;
+}
+
+IoStatus StreamSocket::Recv(MutableByteView buf, std::size_t* received) {
+    if (received != nullptr) {
+        *received = 0;
+    }
+    last_transferred_ = 0;
+    last_error_ = 0;
+    if (!valid() || buf.data == nullptr || buf.size == 0 ||
+        buf.size > static_cast<std::size_t>(std::numeric_limits<ULONG>::max())) {
+        last_error_ = WSAEINVAL;
+        return IoStatus::kInvalid;
+    }
+    WSABUF buffer{};
+    buffer.buf = reinterpret_cast<char*>(buf.data);
+    buffer.len = static_cast<ULONG>(buf.size);
+    DWORD flags = 0;
+    DWORD got = 0;
+    const int rc =
+        ::WSARecv(NativeSocket(native_socket_), &buffer, 1, &got, &flags, nullptr, nullptr);
+    if (rc == 0) {
+        if (got == 0) {
+            // 有序关闭：对端发了 FIN，之后不会再有数据。
+            return IoStatus::kClosed;
+        }
+        last_transferred_ = static_cast<std::size_t>(got);
+        if (received != nullptr) {
+            *received = static_cast<std::size_t>(got);
+        }
+        return IoStatus::kOk;
+    }
+    const int err = ::WSAGetLastError();
+    if (err == WSAEWOULDBLOCK) {
+        last_error_ = 0;
+        return IoStatus::kWouldBlock;
+    }
+    last_error_ = err;
+    return MapRecvError(err);
+}
+
+std::uintptr_t StreamSocket::native_handle() const noexcept { return native_socket_; }
+
+void StreamSocket::Close() noexcept {
+    if (native_socket_ != kInvalidSocket) {
+        ::closesocket(NativeSocket(native_socket_));
+        native_socket_ = kInvalidSocket;
+    }
+    fd_ = -1;
+    next_token_ = 0;
+    last_transferred_ = 0;
+}
 
 }  // namespace rd::net
 
