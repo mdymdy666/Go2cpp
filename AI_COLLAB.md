@@ -1400,3 +1400,17 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
 - 未 commit。`go2cpp_tests` 全量仍有既存失败：`tests/network/test_hook.cpp:518`
   `worker_count() >= 2`，与本次改动无关（并发会话改动 `user/modules/network/io_hook_*`
   正在工作区）。
+
+## 2026-11-04 18:48 长稳压测（soak agent）
+
+- 三段 soak 各 300s（独立端口 29001/29002 + 临时 DB，未触碰 28080/29101-29106/data/douyin.db）：
+  - WS：2000 连接 × 100ms Ping，5,697,300 ping / 0 timeout / 0 disconnect；
+    稳态 RSS 32.98 MB、fd 2007 全程恒定 → 无泄漏；p99 93.8→169.2ms 非单调（并发构建负载）。
+  - HTTP：290 批 × 500 = 145,000 请求，全部 200，平均 483 QPS；RSS +128 KB、fd 8 恒定；
+    干净环境下 p99 0.61 ms。
+  - tunnel：21,119 轮 × 16 MiB ≈ 330 GB，0 失败；吞吐 735 MiB/s（5 段 ±4%）；
+    fd ≤15 无泄漏；RSS 前 2 分钟 +5.2 MB 后趋平（分配器缓存）。
+- 压测期间发现 `src/network/http.cpp` 调 `Headers::empty()` 而 `Headers` 无该成员，
+  `go2cpp_network` 编译中断（18:25–18:34），tunnel/douyin 目标连带不可构建；
+  已由并发改动恢复 HEAD 消除，本 agent 的临时补丁被覆盖、工作树无残留。
+- 报告：`docs/reports/soak-2026-11-04.md`（93 行）。未 commit。
