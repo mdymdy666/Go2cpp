@@ -27,11 +27,16 @@ Arena::~Arena() {
 }
 
 char* Arena::Allocate(std::size_t bytes) {
+  // 按 kAlign 向上取整推进：块起点由 malloc 保证 8 字节对齐，只要每次
+  // 推进量为 8 的倍数，返回的首地址就始终 8 字节对齐。否则上一条任意
+  // 长度的记录会把后续分配整体错位（UBSan 实报 memtable.cpp 的 Rec 落在
+  // 0x...80e 这类不满足 4 字节对齐的地址）。
+  const std::size_t need = AlignUp(bytes, kAlign);
   // 热路径：当前块还有空间时只做两次减法。
-  if (bytes <= remaining_) {
+  if (need <= remaining_) {
     char* result = ptr_;
-    ptr_ += bytes;
-    remaining_ -= bytes;
+    ptr_ += need;
+    remaining_ -= need;
     return result;
   }
   return AllocateFallback(bytes);
@@ -43,10 +48,12 @@ char* Arena::AllocateAligned(std::size_t bytes, std::size_t align) {
     const std::uintptr_t mod = reinterpret_cast<std::uintptr_t>(ptr_) & (align - 1);
     slop = mod == 0 ? 0 : align - mod;
   }
-  if (bytes + slop <= remaining_) {
+  const std::size_t need = AlignUp(bytes, kAlign);
+  if (need + slop <= remaining_) {
     char* result = ptr_ + slop;
-    ptr_ = result + bytes;
-    remaining_ -= bytes + slop;
+    // 推进量按 kAlign 取整：保证下一个 Allocate 拿到的起点仍 8 字节对齐。
+    ptr_ = result + need;
+    remaining_ -= need + slop;
     return result;
   }
   // 新块由 malloc 返回，天然满足 16 字节对齐（超过 16 的场景本模块不用）。
@@ -80,8 +87,9 @@ char* Arena::AllocateFallback(std::size_t bytes) {
   ptr_ = block;
   remaining_ = block_size_;
   char* result = ptr_;
-  ptr_ += bytes;
-  remaining_ -= bytes;
+  const std::size_t need = AlignUp(bytes, kAlign);
+  ptr_ += need;
+  remaining_ -= need;
   return result;
 }
 
