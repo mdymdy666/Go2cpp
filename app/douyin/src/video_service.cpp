@@ -10,11 +10,18 @@
  *                                         热度序；响应
  *                                         `{"ok":true,"items":[{"video":...}],
  *                                         "next_cursor":"..."}`）
+ *          - POST   /api/video/:id/favorite 收藏 / 取消收藏（Bearer；切换语义，
+ *                                         响应 `{"ok":true,"favorited":bool}`）
+ *          - GET    /api/video/favorites   我的收藏（Bearer；按收藏时间倒序，
+ *                                         响应 `{"ok":true,"items":[{"video":...}],
+ *                                         "total":N}`）
  *          - DELETE /api/video/:id        删除（Bearer；非作者 403、不存在 404）
  *          - POST   /api/video/upload/init        开启分片上传（Bearer；返回 upload_id）
  *          - POST   /api/video/upload/chunk       追加分片（Bearer；Content-Range）
  *          - POST   /api/video/upload/finish      校验并转正式文件 + 建记录（Bearer）
  *          - GET    /api/video/upload/status/:id  断点进度（Bearer；仅本人）
+ *          - GET    /api/tag/list       热门话题（按视频数降序；limit 默认 20）
+ *          - GET    /api/tag/<tag>       话题下的视频（page/page_size 分页）
  *          - GET    /health, /metrics
  *
  * @author douyin demo
@@ -26,6 +33,7 @@
 #include "douyin_http.hpp"
 #include "douyin_proto.hpp"
 #include "douyin_store.hpp"
+#include "douyin_tag.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -36,6 +44,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <random>
 #include <string>
 #include <string_view>
@@ -403,6 +412,7 @@ douyin::Video PublicVideo(const douyin::StoredVideo& stored) {
     video.like_count = stored.like_count;
     video.comment_count = stored.comment_count;
     video.created_at = stored.created_at;
+    video.tags = douyin::ExtractTags(stored.title);
     return video;
 }
 
@@ -1012,6 +1022,94 @@ bool HandleMine(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
+/// @brief 从 `/api/video/<id>/favorite` 解析 id；其它路径返回 false。
+bool ParseFavoritePath(std::string_view path, std::int64_t* id) {
+    constexpr std::string_view kPrefix = "/api/video/";
+    constexpr std::string_view kSuffix = "/favorite";
+    if (path.size() <= kPrefix.size() + kSuffix.size() ||
+        path.compare(0, kPrefix.size(), kPrefix) != 0) {
+        return false;
+    }
+    const std::size_t suffix_at = path.size() - kSuffix.size();
+    if (suffix_at <= kPrefix.size() ||
+        path.compare(suffix_at, kSuffix.size(), kSuffix) != 0) {
+        return false;
+    }
+    const std::string_view number =
+        path.substr(kPrefix.size(), suffix_at - kPrefix.size());
+    if (number.empty() || number.size() > 18) {
+        return false;
+    }
+    std::int64_t value = 0;
+    const auto parsed =
+        std::from_chars(number.data(), number.data() + number.size(), value);
+    if (parsed.ec != std::errc() ||
+        parsed.ptr != number.data() + number.size() || value <= 0) {
+        return false;
+    }
+    *id = value;
+    return true;
+}
+
+/// @brief `POST /api/video/<id>/favorite`：切换当前用户对该视频的收藏状态。
+bool HandleFavorite(std::int64_t video_id, douyin::Store& store,
+                    const douyin::HttpRequest& request,
+                    douyin::HttpResponse* response) {
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    // 先确认视频存在：否则收藏表里会积累指向已删除视频的孤儿行。
+    douyin::StoredVideo video;
+    std::string error;
+    if (!store.FindVideo(video_id, &video, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 查询收藏目标失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        return Fail(response, 404, "视频不存在");
+    }
+    const int changed = store.ToggleFavorite(video_id, actor, &error);
+    if (changed < 0) {
+        std::fprintf(stderr, "[%s] 切换收藏失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    response->status = 200;
+    response->body = std::string("{\"ok\":true,\"favorited\":") +
+                     (changed > 0 ? "true" : "false") + "}";
+    return true;
+}
+
+/// @brief `GET /api/video/favorites`：当前用户的收藏列表（按收藏时间倒序）。
+bool HandleFavorites(douyin::Store& store, const douyin::HttpRequest& request,
+                     douyin::HttpResponse* response) {
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    const std::int64_t limit = ParseLimit(request);
+    std::vector<douyin::StoredVideo> videos;
+    std::string error;
+    if (!store.ListFavorites(actor, limit, &videos, &error)) {
+        std::fprintf(stderr, "[%s] 查询收藏列表失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    std::string body = "{\"ok\":true,\"items\":[";
+    for (std::size_t i = 0; i < videos.size(); ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += "{\"video\":" + douyin::ToJson(PublicVideo(videos[i])) + "}";
+    }
+    body += "],\"total\":" + std::to_string(videos.size()) + "}";
+    response->status = 200;
+    response->body = std::move(body);
+    return true;
+}
+
 /// @brief 删除上传视频对应的本地文件；url 不是 `videos/<单段文件名>` 时跳过。
 /// @param url [in] DB 里存的相对 url；外部 http(s) 地址不归本服务管理，不删。
 /// @note 失败只记日志：DB 记录已删除，文件残留不应把成功的删除改成 500。
@@ -1096,6 +1194,247 @@ bool HandleDelete(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
+
+/// @brief 一个话题的聚合统计（话题名 + 视频数 + 去重作者）。
+struct TagSummary {
+    std::string tag;
+    std::int64_t video_count{0};
+    std::vector<std::int64_t> users;
+};
+
+/**
+ * @brief 把 percent-encoded 的路径片段还原成 UTF-8 文本。
+ *
+ * @param text [in] 原始路径片段（如 `%E7%88%AC%E5%B1%B1`）——借用。
+ * @return 解码结果；非法 `%XX` 原样保留，不抛异常。
+ *
+ * ## 定位
+ * 浏览器对 `/api/tag/爬山` 会发 `%E7%88%AC...`；不解码的话话题永远
+ * 匹配不上。错了会怎样：中文话题一律 0 条视频。
+ */
+std::string PercentDecode(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '%' && i + 2 < text.size()) {
+            int hi = -1;
+            int lo = -1;
+            const char a = text[i + 1];
+            const char b = text[i + 2];
+            if (a >= '0' && a <= '9') {
+                hi = a - '0';
+            } else if (a >= 'a' && a <= 'f') {
+                hi = a - 'a' + 10;
+            } else if (a >= 'A' && a <= 'F') {
+                hi = a - 'A' + 10;
+            }
+            if (b >= '0' && b <= '9') {
+                lo = b - '0';
+            } else if (b >= 'a' && b <= 'f') {
+                lo = b - 'a' + 10;
+            } else if (b >= 'A' && b <= 'F') {
+                lo = b - 'A' + 10;
+            }
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>(hi * 16 + lo));
+                i += 2;
+                continue;
+            }
+        }
+        if (text[i] == '+') {
+            out.push_back(' ');
+            continue;
+        }
+        out.push_back(text[i]);
+    }
+    return out;
+}
+
+/// @brief 解析正整数 query 参数；缺省或非法回退 `fallback`，再夹紧到区间。
+std::int64_t QueryInt(const douyin::HttpRequest& request, std::string_view name,
+                      std::int64_t fallback, std::int64_t min_value,
+                      std::int64_t max_value) {
+    const std::string text = douyin::QueryParam(request, name);
+    if (text.empty()) {
+        return fallback;
+    }
+    char* end = nullptr;
+    const long long value = std::strtoll(text.c_str(), &end, 10);
+    if (end == text.c_str()) {
+        return fallback;
+    }
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return static_cast<std::int64_t>(value);
+}
+
+/**
+ * @brief 扫全库视频，按话题聚合成 `tag -> TagSummary`。
+ *
+ * @param store [in,out] 存储；只读查询。
+ * @param stats [out] 先清空再填。
+ * @param error [out] 失败时写错误文本。
+ * @return 成功返回 true。
+ *
+ * ## 步骤
+ * step1. 取全部视频（demo 几十条，全表扫描可接受）；
+ * step2. 每条视频调 `ExtractTags`（与卡片展示同一函数，保证口径一致）；
+ * step3. 按 tag 累计视频数并去重作者 id。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：单线程事件循环内调用；
+ * - 失败语义：数据库错误返回 false，调用方回 500。
+ */
+bool LoadTagStats(douyin::Store& store,
+                  std::map<std::string, TagSummary>* stats,
+                  std::string* error) {
+    stats->clear();
+    std::vector<douyin::StoredVideo> videos;
+    if (!store.ListAllVideos(&videos, error)) {
+        return false;
+    }
+    for (const douyin::StoredVideo& video : videos) {
+        for (const std::string& tag : douyin::ExtractTags(video.title)) {
+            TagSummary& summary = (*stats)[tag];
+            summary.tag = tag;
+            ++summary.video_count;
+            if (std::find(summary.users.begin(), summary.users.end(),
+                          video.user_id) == summary.users.end()) {
+                summary.users.push_back(video.user_id);
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief `GET /api/tag/list?limit=20`：热门话题（按视频数降序）。
+ *
+ * @param store [in,out] 存储。
+ * @param request [in] HTTP 请求；只读 query `limit`（默认 20，夹紧 1~100）。
+ * @param response [out] 200 + `{"ok":true,"tags":[...]}`。
+ * @return 总是 true。
+ */
+bool HandleTagList(douyin::Store& store, const douyin::HttpRequest& request,
+                   douyin::HttpResponse* response) {
+    std::map<std::string, TagSummary> stats;
+    std::string error;
+    if (!LoadTagStats(store, &stats, &error)) {
+        std::fprintf(stderr, "[%s] 话题聚合失败: %s\n", kServiceName, error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    std::vector<TagSummary> list;
+    list.reserve(stats.size());
+    for (const auto& entry : stats) {
+        list.push_back(entry.second);
+    }
+    std::sort(list.begin(), list.end(),
+              [](const TagSummary& a, const TagSummary& b) {
+                  if (a.video_count != b.video_count) {
+                      return a.video_count > b.video_count;
+                  }
+                  return a.tag < b.tag;
+              });
+    const std::int64_t limit = QueryInt(request, "limit", 20, 1, 100);
+    std::string body = "{\"ok\":true,\"tags\":[";
+    const std::size_t count = static_cast<std::size_t>(limit) < list.size()
+                                  ? static_cast<std::size_t>(limit)
+                                  : list.size();
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += "{\"tag\":\"" + douyin::JsonEscape(list[i].tag) +
+                "\",\"video_count\":" + std::to_string(list[i].video_count) +
+                ",\"participants\":" + std::to_string(list[i].users.size()) + "}";
+    }
+    body += "]}";
+    response->status = 200;
+    response->body = std::move(body);
+    return true;
+}
+
+/**
+ * @brief `GET /api/tag/<tag>?page=1&page_size=20`：话题下的视频分页。
+ *
+ * @param store [in,out] 存储。
+ * @param raw_tag [in] 路径里的原始话题（percent-encoded）——借用。
+ * @param request [in] HTTP 请求；只读 query `page` / `page_size`。
+ * @param response [out] 200 + 话题信息与 `items`；空话题返回 0 条而非 404。
+ * @return 总是 true。
+ *
+ * ## 步骤
+ * step1. 解码并校验话题名（空 -> 400）；
+ * step2. 全库过滤 `ExtractTags` 命中该话题的视频；
+ * step3. 切片分页并序列化（视频结构复用 video JSON，含 tags）。
+ *
+ * ## 失败语义
+ * - 数据库错误回 500；不存在的 tag 是合法空结果（200）。
+ */
+bool HandleTagDetail(douyin::Store& store, std::string_view raw_tag,
+                     const douyin::HttpRequest& request,
+                     douyin::HttpResponse* response) {
+    const std::string tag = PercentDecode(raw_tag);
+    if (tag.empty() || tag.size() > 60) {
+        return Fail(response, 400, "话题名非法");
+    }
+    std::vector<douyin::StoredVideo> videos;
+    std::string error;
+    if (!store.ListAllVideos(&videos, &error)) {
+        std::fprintf(stderr, "[%s] 查询话题视频失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    std::vector<douyin::StoredVideo> matched;
+    std::vector<std::int64_t> users;
+    for (const douyin::StoredVideo& video : videos) {
+        const std::vector<std::string> tags = douyin::ExtractTags(video.title);
+        if (std::find(tags.begin(), tags.end(), tag) == tags.end()) {
+            continue;
+        }
+        matched.push_back(video);
+        if (std::find(users.begin(), users.end(), video.user_id) == users.end()) {
+            users.push_back(video.user_id);
+        }
+    }
+    const std::int64_t page = QueryInt(request, "page", 1, 1, 100000);
+    const std::int64_t page_size = QueryInt(request, "page_size", 20, 1, 50);
+    const std::size_t total = matched.size();
+    const std::size_t begin = static_cast<std::size_t>((page - 1) * page_size);
+    std::string body = "{\"ok\":true,\"tag\":\"" + douyin::JsonEscape(tag) +
+                       "\",\"video_count\":" + std::to_string(total) +
+                       ",\"participants\":" + std::to_string(users.size()) +
+                       ",\"page\":" + std::to_string(page) +
+                       ",\"page_size\":" + std::to_string(page_size) +
+                       ",\"total\":" + std::to_string(total) + ",\"items\":[";
+    if (begin < total) {
+        const std::size_t end = std::min(total, begin + static_cast<std::size_t>(page_size));
+        for (std::size_t i = begin; i < end; ++i) {
+            if (i != begin) {
+                body += ',';
+            }
+            std::string author;
+            if (!store.FindUserName(matched[i].user_id, &author, &error) &&
+                !error.empty()) {
+                std::fprintf(stderr, "[%s] 查询作者失败: %s\n", kServiceName,
+                             error.c_str());
+                return Fail(response, 500, "数据库错误");
+            }
+            body += "{\"video\":" +
+                    douyin::ToJson(PublicVideo(matched[i])) +
+                    ",\"author\":\"" + douyin::JsonEscape(author) + "\"}";
+        }
+    }
+    body += "]}";
+    response->status = 200;
+    response->body = std::move(body);
+    return true;
+}
+
 /// @brief 总路由。
 bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
             douyin::HttpResponse* response) {
@@ -1112,6 +1451,25 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
                          ",\"errors\":" + std::to_string(g_metrics.errors) + "}";
         return true;
     }
+    if (request.path == "/api/tag/list") {
+        if (request.method == "GET") {
+            return HandleTagList(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    {
+        constexpr std::string_view kTagPrefix = "/api/tag/";
+        if (request.path.size() > kTagPrefix.size() &&
+            request.path.compare(0, kTagPrefix.size(), kTagPrefix) == 0) {
+            if (request.method != "GET") {
+                return Fail(response, 405, "方法不允许");
+            }
+            return HandleTagDetail(
+                store,
+                std::string_view(request.path).substr(kTagPrefix.size()),
+                request, response);
+        }
+    }
     if (request.path == "/api/video") {
         if (request.method == "POST") {
             return HandleCreate(store, request, response);
@@ -1123,6 +1481,22 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
             return HandleMine(store, request, response);
         }
         return Fail(response, 405, "方法不允许");
+    }
+
+    if (request.path == "/api/video/favorites") {
+        if (request.method == "GET") {
+            return HandleFavorites(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    {
+        std::int64_t favorite_id = 0;
+        if (ParseFavoritePath(request.path, &favorite_id)) {
+            if (request.method == "POST") {
+                return HandleFavorite(favorite_id, store, request, response);
+            }
+            return Fail(response, 405, "方法不允许");
+        }
     }
 
     if (request.path == "/api/video/upload/init") {

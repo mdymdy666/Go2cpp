@@ -1326,3 +1326,59 @@ latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
 
 **已知限制 / 后续**：journal 按 video_id 常驻内存，生产需加 TTL 或房间空闲回收；
 未 commit。
+
+
+## 2026-11-04 抖音话题标签聚合（P1 需求 14）
+
+- **提取方案**：不建表，查询时实时解析 `videos.title`。新增
+  `app/douyin/include/douyin_tag.hpp` + `src/douyin_tag.cpp` 的 `ExtractTags()`：
+  显式 `#tag` 优先（UTF-8 按码点扫描，遇空白/中英文标点/下一个 `#` 终止，去重上限 5）；
+  标题没有 `#` 时走内置关键词映射表（爬山/云海→爬山、木雕/手工→手工/木雕、猫/雪→萌宠…，
+  覆盖 demo 20 条历史标题，去重上限 3）。卡片、feed、话题页共用同一函数，口径一致。
+- **接口**（video 服务；网关新增 `/api/tag/**` → 29102）：
+  - `GET /api/tag/list?limit=20`：热门话题，按视频数降序，附 `participants`（去重作者数）；
+  - `GET /api/tag/<tag>?page=1&page_size=20`：话题下视频分页，路径 percent 解码，
+    不存在的 tag 返回 200 + 0 条；
+  - 视频 JSON 新增 `tags` 数组（video 详情/发布、feed 两条路径都填）。
+- **前端**：`app/douyin/include/douyin_home_page.hpp` 标题里的 `#tag` 渲染为 `.topic-link`；
+  无 `#` 的历史视频用后端 `tags` 渲染 `.tag-chip`；点击打开话题页（参与人数 + 视频数 +
+  视频网格，复用 feed 播放器与 `playInFeed`），支持 `#tag=xxx` 直达。
+- **验证**：`/api/tag/list` 返回 14 个话题（生活 4 / 旅行 3 / 萌宠 3 / 修复 2 / 烘焙 2…）；
+  `/api/tag/爬山` 1 条、`/api/tag/萌宠` 3 条 3 人；发布标题「周末 #爬山 #云海 测试」得到
+  `tags:["爬山","云海"]`，爬山话题变 2 条 2 人参与（测试视频已删）。页面 HTML 含
+  `tagView`/`openTag`/`topic-link`/`tag-chip`。
+- **回归**：`scripts/accept_all.sh` 70 PASS / 0 FAIL（清空独立验收库后默认端口复跑）；
+  `build.sh` 全量 8 个二进制零告警（-Werror）。
+- **已知**：话题统计为全表扫描（demo 几十条可接受）；未 commit。注意 `gateway.cpp` 的
+  Range 注释里原有 4 处 `bytes */` 会提前闭合块注释导致编译失败，已改为 `bytes * /`。
+
+## 2026-11-04 抖音收藏 + 分享面板（P1 需求 12/17）
+
+- **后端**（`app/douyin/src/video_service.cpp` + `douyin_store.{hpp,cpp}`）：
+  - 新增 `favorites(user_id, video_id, created_at, UNIQUE(user_id, video_id))`
+    与 `idx_favorites_user`（`CREATE TABLE IF NOT EXISTS`，旧库自动迁移）；
+  - `POST /api/video/:id/favorite` toggle → `{"ok":true,"favorited":bool}`
+    （Bearer；视频不存在 404；`INSERT OR IGNORE` + UNIQUE 兜底并发重复）；
+  - `GET /api/video/favorites?limit=N` →
+    `{"ok":true,"items":[{"video":...}],"total":N}`（Bearer；按收藏时间倒序，
+    INNER JOIN videos 过滤已被作者删除的视频）。
+- **前端**（`app/douyin/include/douyin_home_page.hpp`）：
+  - rail 新增 ⭐/☆ 收藏按钮（`.fav-btn`），登录后拉一次收藏 id 集合，按钮统一刷新；
+    未登录点击提示「登录后才能收藏」；
+  - 顶栏新增「⭐ 我的收藏」入口 + `favView` 收藏页（网格、点击复用 `playInFeed`、
+    空态提示），登录/退出时自动显隐；
+  - 分享按钮从「直接复制」改为底部面板：复制链接 / 二维码占位（21×21 伪点阵，
+    面板内明确标注「演示占位，不可扫」）/ 微信好友、朋友圈占位 / 关闭；
+    Esc、遮罩点击、取消按钮均可关闭。
+- **验证**：
+  - 独立端口（29201/29202 + 独立 /tmp 库）56 项断言 **0 FAIL**：收藏→列表有→再点取消→列表空、
+    未登录 401、不存在视频 404、路径边界 404/405、跨用户隔离、多次 toggle 不产生重复行、
+    删视频后收藏列表不残留、20 并发 toggle 状态仍为 0/1 且单次翻转正确；
+  - 经网关 28080 端到端 22 项 **0 FAIL**（favtest 账号：初始 0 → 收藏 1 → 取消 0，
+    页面 HTML 含 `favBtn`/`favView`/`shareSheet`/`qr-box` 等）；
+  - `scripts/accept_all.sh` **72 PASS / 0 FAIL**；`build.sh` 8 个二进制零告警（-Werror）。
+- **说明**：并发会话提交 `6cb4fef` 时把本改动的 `douyin_store.{hpp,cpp}`、
+  `douyin_home_page.hpp` 一并提交了；`video_service.cpp`（收藏 handler/路由，374 行）
+  仍在工作区未提交。本次任务本身未 commit。
+- **已知限制**：收藏列表上限 100（前端 limit=100），无 cursor 分页；二维码为视觉占位
+  不可扫码；演示环境未接第三方分享 SDK。

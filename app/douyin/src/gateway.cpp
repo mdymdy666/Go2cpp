@@ -495,7 +495,7 @@ ByteRange ParseRangeHeader(std::string_view value, std::uint64_t file_size) {
  * @param response [out] 出站响应：
  *        - 无 Range → 200 + 完整字节 + `Accept-Ranges: bytes`；
  *        - 单段 Range → 206 + 区间字节 + `Content-Range` + `Accept-Ranges: bytes`；
- *        - 越界/语法错 → 416 + 空体 + `Content-Range: bytes * /<total>`；
+ *        - 越界/语法错 → 416 + 短文本 + `Content-Range: bytes * /<total>`；
  *        - 文件不存在 → 404；读取失败 → 500。
  * @return 总是 Ok（错误通过 response.status 表达）；网络错误由网关层处理。
  *
@@ -552,7 +552,7 @@ Result<void> ServeVideo(Request& request, Response& response) {
     if (range.unsatisfiable) {
         response.status = Status::RangeNotSatisfiable;
         response.header.set("Content-Type", "text/plain; charset=utf-8");
-        response.header.set("Content-Range", "bytes * /" + std::to_string(total));
+        response.header.set("Content-Range", "bytes */" + std::to_string(total));
         response.header.set("Accept-Ranges", "bytes");
         response.header.set("Cache-Control", "public, max-age=3600");
         response.body = "416 range not satisfiable\n";
