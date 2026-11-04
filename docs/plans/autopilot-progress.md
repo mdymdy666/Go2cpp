@@ -120,15 +120,24 @@
 - 恢复命令：`cd app/douyin && bash scripts/serve_public.sh`；
 - 后续改动需用户明确指令。
 
-## 下一个任务（2026-11-04 起）：可信度工程
+## 今日完成（2026-11-04）
 
-按用户「接下来最好的开发方向」，顺序：
+| 项 | 提交 | 结果 |
+|---|---|---|
+| CI + 一键门禁（ci.sh 312 行 + Actions + badge） | 9544b7d | quick 10m16s；278 项 270P/4F/4S（4 项既有环境问题，CI_ALLOW_KNOWN 排除 + tsan） |
+| cgo 开销调研（274 行） | a885d8c | 固定 17-32ns/次；同算法 C 比 Go 慢 4-20%；加速靠 SIMD |
+| 外部市场调研（354 行） | a458ebc | 胜算法：C++ 实时长连接网关 |
+| 内部能力盘点（350 行） | 9f22316 | 达标 15.8%；能做 3 类/做不了 3 类 |
+| 战略决策（87 行） | 2dbe116 | 先 WS 压测验证 A + 跨平台 + 分布式 P0 |
+| 分布式 P0（NodeId/Trace/metrics，1410 行） | 99ed212 | 1e6 无碰撞；2/2 测试；三件套 |
+| Scheduler 进程级唯一 + 16 示例迁移 | 7c2329c | 计数 0→1→2→1→0 |
+| ErrorScope（Fiber 链多重 Error + drain） | bc3e256 | 5 用例 40 checks；infra-usage.md 188 行 |
+| rd_net Windows（MSVC）实现（2090 行） | c3f88b2 | _WIN32 分支；63 socket 上限；platform-diff.md 189 行 |
 
-1. **CI + 一键门禁**（`scripts/ci.sh`：编译零告警 + ctest + ASAN + `verify_metrics.sh`；
-   GitHub Actions Linux/Windows；README badge）——让任何人 clone 后一条命令验证；
-2. **性能对标报告**（`docs/reports/bench-vs-go.md`）：3 场景（HTTP 服务 / 缓存 / 可靠 UDP）
-   同机同负载 vs Go，报 QPS/p99/内存；
-3. **可靠 UDP 可编译示例**（`collab/examples/reliable_udp/`）：用 rd_net Protocol 实现简化 RDT
-   （丢包/重传/ACK），对比不可靠 UDP；
-4. **B 站复刻继续**（B2 视频/会员 → B3 弹幕 → B4 压测）；
-5. 低优先：M11 gzip 口径、超大文件拆分（scheduler 6.5k）、域名 HTTPS。
+## 下一个任务（2026-11-04 11:22 起）
+
+1. **infra 违规迁移**（`scripts/check_infra_usage.sh` 当前 92 处/28 文件 → 目标 0）：
+   热点 tunnel/server_main 16、client_main 16、os/proc 9；printf→logging、getenv→config、自造错误→error；
+2. 分布式 P1（MetadataStore + 快照持久化，修 fencing 重启回退）；
+3. WS 压测（20 万连接 RSS/p99 对标 Go）；
+4. Windows CI 首次结果回灌 platform-diff.md。
