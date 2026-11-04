@@ -31,7 +31,7 @@ CXXFLAGS=(-std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror -Wno-unused-paramet
 LDFLAGS=(-L"$BUILD_LIB" -Wl,-rpath,"$BUILD_LIB" -Wl,--start-group
          -lgo2cpp_network -lgo2cpp_io -lgo2cpp_sync -lgo2cpp_context
          -lgo2cpp_error -lgo2cpp_scheduler -lgo2cpp_fiber -lgo2cpp_log
-         -lgo2cpp_hash -Wl,--end-group -lpthread)
+         -lgo2cpp_hash -lgo2cpp_metrics -Wl,--end-group -lpthread)
 
 # user 服务额外依赖 storage（libgo2cpp_storage.so + 系统 sqlite3）。
 EXTRA_LDLIBS=()
@@ -70,7 +70,8 @@ EXTRA_LDLIBS=(-lgo2cpp_encoding)
 # 这里把它作为独立编译单元一起编；AUTH 提供 douyin::VerifyToken 做 Bearer 校验。
 # 上游 src/app/gateway.cpp 的文档注释里有字面量 "/*"（method 支持字符串/数组/*），
 # GCC 会报 -Wcomment；只对这个编译单元关闭该类警告，不修改上游源码。
-build_one gateway             "$ROOT/src/gateway.cpp" "$AUTH" "$GO2CPP/src/app/gateway.cpp" \
+build_one gateway             "$ROOT/src/gateway.cpp" "$ROOT/src/douyin_observability.cpp" \
+  "$AUTH" "$GO2CPP/src/app/gateway.cpp" \
   -Wno-comment
 
 # C9 压测工具：纯 POSIX socket，不依赖 Go2Cpp 库。

@@ -23,7 +23,10 @@
 
 #include "douyin_auth.hpp"
 #include "douyin_home_page.hpp"
+#include "douyin_shutdown.hpp"
+#include "douyin_observability.hpp"
 #include "go2cpp/app/gateway.hpp"
+#include "go2cpp/network/socket.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -103,11 +106,27 @@ constexpr MethodMask kReadMask = method_mask::kGet | method_mask::kHead;
 constexpr MethodMask kWriteMask =
     method_mask::kPost | method_mask::kDelete | method_mask::kPatch;
 
-/// @brief 信号处理只置位；由监控线程在普通上下文调用 Gateway::Stop()。
-volatile std::sig_atomic_t g_stop_requested = 0;
+/// @brief 关闭闸门：置位后新请求立即回 503，不再进入业务处理。
+std::atomic<bool> g_draining{false};
+/// @brief 在途请求数：drain 等待归零的依据（只统计真正进入业务的请求）。
+std::atomic<int> g_inflight{0};
 
-/// @brief 记录停止请求（async-signal-safe）。
-void RequestStop(int /*signal*/) { g_stop_requested = 1; }
+/// @brief 在途请求计数的 RAII 守卫：构造 +1、析构 -1，异常/错误路径都能归零。
+class InflightGuard {
+public:
+    /// @brief 进入业务处理前 +1。
+    /// @param counter [in] 计数器——非空，生命周期覆盖本对象。
+    explicit InflightGuard(std::atomic<int>* counter) : m_counter(counter) {
+        m_counter->fetch_add(1, std::memory_order_relaxed);
+    }
+    /// @brief 请求处理结束（成功或失败）时 -1。
+    ~InflightGuard() { m_counter->fetch_sub(1, std::memory_order_relaxed); }
+    InflightGuard(const InflightGuard&) = delete;
+    InflightGuard& operator=(const InflightGuard&) = delete;
+
+private:
+    std::atomic<int>* m_counter;  ///< 借用；指向进程级 g_inflight。
+};
 
 /// @brief 上游地址文本 `127.0.0.1:<port>`。
 std::string Upstream(std::uint16_t port) {
@@ -195,6 +214,89 @@ Result<void> ServeHome(Request& /*request*/, Response& response) {
     response.header.set("Cache-Control", "no-store");
     response.body = douyin::kHomePageHtml;
     return Result<void>::Ok();
+}
+
+/// @brief 健康探针路由的匹配器：只命中 `/health/live` 与 `/health/ready`。
+class HealthMatcher final : public Matcher {
+public:
+    /// @brief 命中两个探针路径（GET/HEAD）。
+    /// @param request [in] 入站请求——借用，调用期间有效；读取 method 与 path_view()。
+    /// @param params [out] 不写入（探针无路径参数）。
+    /// @return true 表示由 ServeHealth 处理；false 交给后续路由。
+    bool Match(const Request& request, PathParams* /*params*/) const override {
+        if (request.method != Method::Get && request.method != Method::Head) {
+            return false;
+        }
+        const std::string_view path = request.path_view();
+        return path == "/health/live" || path == "/health/ready";
+    }
+};
+
+/**
+ * @brief 健康探针 handler：liveness 恒 200，readiness 检查上游可达性。
+ *
+ * @details
+ * - `/health/live`：进程还能回响应就返回 200（关闭中也是 200，存活语义）；
+ * - `/health/ready`：非关闭中且六个上游 TCP 均可达 → 200，否则 503。
+ *   TCP 连接成功即视为「上游可达」，避免在探针里再发一次 HTTP 影响延迟。
+ *
+ * @param request [in] 入站请求——借用；用 path_view() 区分两个探针。
+ * @param response [out] 探针响应——成功与失败都整体覆盖。
+ * @return 总是 Ok（探针失败用 503 表达，不是 handler 错误）。
+ */
+Result<void> ServeHealth(Request& request, Response& response) {
+    response.header.set("Content-Type", "application/json; charset=utf-8");
+    response.header.set("Cache-Control", "no-store");
+    // step1: liveness——只证明进程活着，不做任何依赖检查。
+    if (request.path_view() == "/health/live") {
+        response.status = Status::OK;
+        response.body = "{\"ok\":true,\"status\":\"live\",\"service\":\"gateway\"}";
+        return Result<void>::Ok();
+    }
+    // step2: readiness——关闭中或任一上游不可达即 503，并给出第一个失败项。
+    struct UpstreamEntry {
+        const char* name;   ///< 上游名（错误信息用）。
+        std::uint16_t port; ///< 上游端口。
+    };
+    const UpstreamEntry upstreams[] = {
+        {"user", kUserPort},         {"video", kVideoPort},
+        {"feed", kFeedPort},         {"interaction", kInteractionPort},
+        {"live", kLivePort},         {"search", kSearchPort},
+    };
+    std::string reason;
+    if (douyin::ShutdownRequested()) {
+        reason = "shutting down";
+    } else {
+        for (const auto& entry : upstreams) {
+            if (!go2cpp::net::DialTCP("127.0.0.1", entry.port,
+                                      std::chrono::milliseconds(200))) {
+                reason = std::string("upstream ") + entry.name + " unreachable";
+                break;
+            }
+        }
+    }
+    if (reason.empty()) {
+        response.status = Status::OK;
+        response.body = "{\"ok\":true,\"status\":\"ready\",\"service\":\"gateway\"}";
+    } else {
+        response.status = Status::ServiceUnavailable;
+        response.body =
+            "{\"ok\":false,\"status\":\"not-ready\",\"service\":\"gateway\","
+            "\"reason\":\"" + reason + "\"}";
+    }
+    return Result<void>::Ok();
+}
+
+/// @brief 注册健康探针路由；失败时打印并返回 false。
+bool AddHealthRoutes(Gateway* gateway) {
+    const auto result = gateway->AddRoute(
+        std::make_shared<HealthMatcher>(), std::make_shared<Handler>(&ServeHealth));
+    if (!result.ok()) {
+        std::fprintf(stderr, "[%s] 注册健康探针路由失败：%s\n", kServiceName,
+                     result.error().c_str());
+        return false;
+    }
+    return true;
 }
 
 /// @brief 上传体积上限（32 MiB），与 video_service 的 kMaxUploadBytes 保持一致。
@@ -686,10 +788,38 @@ int main(int argc, char** argv) {
     }
     auto gateway = std::move(created.value());
 
+    // 关闭闸门放最外层：draining 后任何请求都在这里回 503，不再进入上传解析、
+    // 鉴权与转发；在途请求用 RAII 计数，供 watcher 等待归零（上限 5 s）。
+    gateway->Use([](Request&, Response& response, const Next& next) -> Result<void> {
+        if (g_draining.load(std::memory_order_acquire)) {
+            response.status = Status::ServiceUnavailable;
+            response.header.set("Content-Type", "application/json; charset=utf-8");
+            response.close = true;
+            response.body = "{\"ok\":false,\"error\":\"shutting down\"}";
+            return Result<void>::Ok();
+        }
+        const InflightGuard guard(&g_inflight);
+        return next();
+    });
     // 上传体积闸门：放在路由/转发之前，超 32 MiB 的请求不产生上游连接。
     gateway->Use(LimitUploadSize);
 
-    if (!AddHomeRoute(gateway.get()) || !AddVideoRoute(gateway.get())) {
+    // 可观测性：先 trace（给请求打 trace id）再 metrics（统计耗时与状态码）。
+    douyin::observability::Init();
+    gateway->Use(douyin::observability::Trace());
+    gateway->Use(douyin::observability::Metrics());
+
+    // `/metrics` 必须用自定义 Matcher 注册，否则会被 /api/** 通配吞掉。
+    std::string metrics_error;
+    if (!douyin::observability::AttachMetricsRoute(gateway.get(),
+                                                   &metrics_error)) {
+        std::fprintf(stderr, "[%s] 注册 /metrics 失败：%s\n", kServiceName,
+                     metrics_error.c_str());
+        return 1;
+    }
+
+    if (!AddHomeRoute(gateway.get()) || !AddVideoRoute(gateway.get()) ||
+        !AddHealthRoutes(gateway.get())) {
         return 1;
     }
 
@@ -730,25 +860,49 @@ int main(int argc, char** argv) {
         static_cast<unsigned>(kSearchPort));
     std::fflush(stdout);
 
-    std::signal(SIGINT, RequestStop);
-    std::signal(SIGTERM, RequestStop);
+    // 信号只置位；5 s 看门狗负责超时强制退出码 1。
+    douyin::InstallShutdownSignals();
+    douyin::ArmShutdownWatchdog();
 
     std::atomic<bool> finished{false};
     std::thread watcher([&gateway, &finished]() {
-        while (!finished.load(std::memory_order_relaxed)) {
-            if (g_stop_requested != 0) {
-                gateway->Stop();
-                return;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        while (!finished.load(std::memory_order_relaxed) &&
+               !douyin::ShutdownRequested()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        if (finished.load(std::memory_order_relaxed)) {
+            return;
+        }
+        // step1: 关闭闸门——新请求立即 503，不再进入业务处理。
+        g_draining.store(true, std::memory_order_release);
+        std::printf("[%s] 优雅关闭：停止接收新请求，等待在途请求完成（在途 %d）\n",
+                    kServiceName, g_inflight.load(std::memory_order_acquire));
+        std::fflush(stdout);
+        // step2: 等在途请求归零，上限 5 s；超时直接强制退出码 1。
+        const auto deadline =
+            std::chrono::steady_clock::now() + douyin::kGracefulShutdownTimeout;
+        while (g_inflight.load(std::memory_order_acquire) > 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const int left = g_inflight.load(std::memory_order_acquire);
+        if (left > 0) {
+            std::fprintf(stderr,
+                         "[%s] 优雅关闭超时（5s）：%d 个在途请求未完成，强制退出（退出码 1）\n",
+                         kServiceName, left);
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+        // step3: 在途已归零 → 关监听、唤醒 worker，Run() 返回后进程正常退出。
+        gateway->Stop();
     });
 
     gateway->Run();
     finished.store(true, std::memory_order_relaxed);
     watcher.join();
 
-    std::printf("[%s] 已停止\n", kServiceName);
+    douyin::MarkShutdownFinished();
+    std::printf("[%s] 优雅关闭完成：在途请求已处理完，退出码 0\n", kServiceName);
     std::fflush(stdout);
     return 0;
 }
