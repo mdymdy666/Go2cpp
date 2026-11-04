@@ -156,8 +156,38 @@ const char* FrameTypeName(FrameType type) noexcept {
     return "UNKNOWN";
 }
 
+/// @brief 写 8 字节大端整数（追踪上下文的线上表示）。
+void WriteU64(Writer& writer, std::uint64_t value) {
+    std::uint8_t bytes[8];
+    for (int index = 7; index >= 0; --index) {
+        bytes[index] = static_cast<std::uint8_t>(value & 0xFFu);
+        value >>= 8;
+    }
+    writer.Bytes(bytes, sizeof(bytes));
+}
+
+/// @brief 读 8 字节大端整数；失败返回 false 且不写 out。
+bool ReadU64(Reader& reader, std::uint64_t& out) noexcept {
+    const std::uint8_t* bytes = nullptr;
+    if (!reader.Slice(8, &bytes)) {
+        return false;
+    }
+    std::uint64_t value = 0;
+    for (int index = 0; index < 8; ++index) {
+        value = (value << 8) | bytes[index];
+    }
+    out = value;
+    return true;
+}
+
 bool EncodeRequest(std::vector<std::uint8_t>& out, std::uint64_t call_id,
                    std::string_view method, const reflect::Buffer& args) {
+    return EncodeRequest(out, call_id, method, args, distributed::TraceContext{});
+}
+
+bool EncodeRequest(std::vector<std::uint8_t>& out, std::uint64_t call_id,
+                   std::string_view method, const reflect::Buffer& args,
+                   const distributed::TraceContext& trace) {
     if (method.empty() || method.size() > kMaxMethodBytes) {
         out.clear();
         return false;
@@ -167,6 +197,13 @@ bool EncodeRequest(std::vector<std::uint8_t>& out, std::uint64_t call_id,
     writer.String(method);
     writer.Varint(static_cast<std::uint64_t>(args.size()));
     writer.Bytes(args.data().data(), args.size());
+    if (trace.IsValid()) {
+        // 固定 32 字节：trace.hi | trace.lo | span | parent（大端）。
+        WriteU64(writer, trace.trace.high());
+        WriteU64(writer, trace.trace.low());
+        WriteU64(writer, trace.span.value());
+        WriteU64(writer, trace.parent.value());
+    }
     return true;
 }
 
@@ -230,6 +267,9 @@ bool DecodeRequest(const frame::Frame& input, RequestMessage* out, std::string* 
     if (input.type != static_cast<std::uint8_t>(FrameType::kRequest)) {
         return Fail(error, "frame is not a request");
     }
+    // 每次解码都从「无 trace」开始，避免复用 RequestMessage 时残留旧值。
+    out->has_trace = false;
+    out->trace = distributed::TraceContext{};
     Reader reader(input.payload.data(), input.payload.size());
     std::uint64_t call_id = 0;
     std::string method;
@@ -246,6 +286,20 @@ bool DecodeRequest(const frame::Frame& input, RequestMessage* out, std::string* 
     const std::uint8_t* args = nullptr;
     if (!reader.Slice(args_size, &args)) {
         return Fail(error, "request: truncated arguments");
+    }
+    if ((input.flags & kFlagTrace) != 0) {
+        std::uint64_t high = 0;
+        std::uint64_t low = 0;
+        std::uint64_t span = 0;
+        std::uint64_t parent = 0;
+        if (!ReadU64(reader, high) || !ReadU64(reader, low) ||
+            !ReadU64(reader, span) || !ReadU64(reader, parent)) {
+            return Fail(error, "request: truncated trace context");
+        }
+        out->trace.trace = distributed::TraceId::FromParts(high, low);
+        out->trace.span = distributed::SpanId(span);
+        out->trace.parent = distributed::SpanId(parent);
+        out->has_trace = out->trace.IsValid();
     }
     if (!reader.AtEnd()) {
         return Fail(error, "request: trailing bytes");

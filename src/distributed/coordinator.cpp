@@ -18,6 +18,8 @@
 
 #include "go2cpp/distributed/coordinator.hpp"
 
+#include "go2cpp/distributed/metrics.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <utility>
@@ -123,6 +125,9 @@ std::size_t Coordinator::SweepExpired() {
     }
     ++m_sweeps;
     m_expired_total += expired.size();
+    if (!expired.empty()) {
+        metrics::LeasesExpired().Add(expired.size());
+    }
     return expired.size();
 }
 
@@ -284,6 +289,7 @@ Result<LeaseView> Coordinator::RegisterService(const ServiceRegistration &regist
             record.ttl = registration.ttl;
             record.deadline = now + registration.ttl;
             ++record.revision;
+            metrics::LeasesGranted().Inc();
             return Result<LeaseView>::Success(MakeViewLocked(record, now));
         }
         // 不同 owner 或已过期：旧实例被替换，回收后重新分配（编号递增）。
@@ -305,6 +311,7 @@ Result<LeaseView> Coordinator::RegisterService(const ServiceRegistration &regist
     // 的租约」的窗口。
     m_services[record.name][record.instance] = id;
     m_leases.emplace(id, std::move(record));
+    metrics::LeasesGranted().Inc();
     return Result<LeaseView>::Success(MakeViewLocked(m_leases.at(id), now));
 }
 
@@ -429,9 +436,11 @@ Result<LeaseView> Coordinator::AcquireLock(std::string_view key, std::string_vie
     record.ttl = ttl;
     record.revision = 1;
     record.fencing = ++m_fencing[record.name];
+    metrics::FencingAdvanced().Inc();
     const LeaseId id = record.id;
     m_locks[record.name] = id;
     m_leases.emplace(id, std::move(record));
+    metrics::LeasesGranted().Inc();
     return Result<LeaseView>::Success(MakeViewLocked(m_leases.at(id), now));
 }
 
@@ -509,6 +518,7 @@ Result<LeaseView> Coordinator::JoinElection(std::string_view election_name,
             record.deadline = now + ttl;
             ++record.revision;
             RecomputeLeaderLocked(election, now);
+            metrics::LeasesGranted().Inc();
             return Result<LeaseView>::Success(MakeViewLocked(record, now));
         }
         // 过期记录还在索引里：先回收，再当作新候选者重新排队。
@@ -527,6 +537,7 @@ Result<LeaseView> Coordinator::JoinElection(std::string_view election_name,
     election.candidates[record.owner] = id;
     m_leases.emplace(id, std::move(record));
     RecomputeLeaderLocked(election, now);
+    metrics::LeasesGranted().Inc();
     return Result<LeaseView>::Success(MakeViewLocked(m_leases.at(id), now));
 }
 

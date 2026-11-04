@@ -5,6 +5,8 @@
 
 #include "go2cpp/distributed/lease_session.hpp"
 
+#include "go2cpp/distributed/metrics.hpp"
+
 #include "go2cpp/relay/lease.hpp"
 
 #include <algorithm>
@@ -157,6 +159,7 @@ Result<LeaseView> LeaseSession::RenewNow() {
             return Result<LeaseView>::Failure(Status::kClosed, "lease session stopped");
         }
         if (!m_state->lost) {
+            metrics::LeaseRenew().Inc();
             m_state->deadline = Clock::now() + m_state->ttl;
             if (m_state->lease != nullptr) {
                 m_state->lease->Renew();
@@ -202,6 +205,7 @@ bool LeaseSession::RenewFromHeartbeat(const std::shared_ptr<State> &state) {
         if (state->stopped || state->lost) {
             return false;
         }
+        metrics::LeaseRenew().Inc();
         state->deadline = Clock::now() + state->ttl;
         if (state->lease != nullptr) {
             state->lease->Renew();
@@ -219,6 +223,7 @@ void LeaseSession::MarkLostState(const std::shared_ptr<State> &state, std::strin
         }
         state->lost = true;
         state->lost_reason = std::move(reason);
+        metrics::LeaseLost().Inc();
         callback = state->on_lost;
     }
     if (callback) {

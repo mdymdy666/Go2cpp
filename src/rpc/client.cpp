@@ -232,10 +232,14 @@ void Connection::RemovePending(std::uint64_t call_id) {
 Status Connection::SendRequest(std::uint64_t call_id, std::string_view method,
                                const reflect::Buffer& args, bool streaming) {
     thread_local std::vector<std::uint8_t> payload;
-    if (!EncodeRequest(payload, call_id, method, args)) {
+    // P0：把调用线程当前的 TraceContext 注入请求帧；未设置时保持旧格式。
+    const distributed::TraceContext& trace = distributed::CurrentTraceContext();
+    const std::uint16_t trace_flag = trace.IsValid() ? kFlagTrace : 0;
+    if (!EncodeRequest(payload, call_id, method, args, trace)) {
         return Status(StatusCode::kInvalidArgument, "invalid method name or arguments");
     }
-    return SendFrame(FrameType::kRequest, streaming ? kFlagStreaming : 0, payload)
+    return SendFrame(FrameType::kRequest, (streaming ? kFlagStreaming : 0) | trace_flag,
+                     payload)
                ? Status::Ok()
                : Status(StatusCode::kUnavailable, "failed to send request");
 }

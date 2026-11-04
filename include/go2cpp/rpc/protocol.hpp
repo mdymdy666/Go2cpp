@@ -50,6 +50,7 @@
 #include <vector>
 
 #include "go2cpp/frame/frame_codec.hpp"
+#include "go2cpp/distributed/trace.hpp"
 #include "go2cpp/reflect/buffer.hpp"
 #include "go2cpp/rpc/status.hpp"
 
@@ -70,6 +71,8 @@ enum class FrameType : std::uint8_t {
 
 /// @brief 请求帧的 flags：该调用是服务端流式。
 inline constexpr std::uint16_t kFlagStreaming = 0x0001;
+/// @brief 请求帧的 flags：载荷尾部带 32 字节追踪上下文（P0 新增）。
+inline constexpr std::uint16_t kFlagTrace = 0x0002;
 /// @brief 方法名上限（含 `"服务.方法"` 分隔符）。
 inline constexpr std::size_t kMaxMethodBytes = 128;
 /// @brief 错误文本上限（防止对端塞大段文本）。
@@ -83,6 +86,10 @@ struct RequestMessage {
     std::uint64_t call_id = 0;  ///< 调用 id。
     std::string method;         ///< 完整方法名。
     bool streaming = false;     ///< 是否流式请求。
+    /// 追踪上下文；`has_trace == false` 时无效（旧客户端/未埋点调用）。
+    distributed::TraceContext trace;
+    /// 是否携带追踪上下文（对应 flags 的 kFlagTrace 位）。
+    bool has_trace = false;
     reflect::Buffer args;       ///< 参数区（按签名顺序，带长度前缀的副本）。
 };
 
@@ -114,6 +121,19 @@ struct StreamEndMessage {
 /// @return 成功 true；方法名超限返回 false（`out` 为空）。
 bool EncodeRequest(std::vector<std::uint8_t>& out, std::uint64_t call_id,
                    std::string_view method, const reflect::Buffer& args);
+
+/**
+ * @brief 编码请求载荷并在尾部附带追踪上下文（调用方须在 flags 置 kFlagTrace）。
+ * @param out [out] 输出缓冲（清零后写入）。
+ * @param call_id [in] 调用 id。
+ * @param method [in] 完整方法名；空或超限返回 false。
+ * @param args [in] 参数区（可为空）。
+ * @param trace [in] 追踪上下文；无效时不追加字节（等价旧编码）。
+ * @return 成功 true；方法名超限返回 false（`out` 为空）。
+ */
+bool EncodeRequest(std::vector<std::uint8_t>& out, std::uint64_t call_id,
+                   std::string_view method, const reflect::Buffer& args,
+                   const distributed::TraceContext& trace);
 
 /// @brief 编码响应载荷（不含帧头）。
 /// @return 成功 true；错误文本超限返回 false。

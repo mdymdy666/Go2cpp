@@ -41,6 +41,7 @@ set(GO2CPP_DISTRIBUTED_TESTS_DIR ${GO2CPP_DISTRIBUTED_ROOT}/tests/distributed)
 
 set(GO2CPP_DISTRIBUTED_SOURCES
     ${GO2CPP_DISTRIBUTED_ROOT}/src/distributed/coordinator.cpp
+    ${GO2CPP_DISTRIBUTED_ROOT}/src/distributed/node_id.cpp
     ${GO2CPP_DISTRIBUTED_ROOT}/src/distributed/lease_session.cpp
     ${GO2CPP_DISTRIBUTED_ROOT}/src/distributed/registry.cpp
     ${GO2CPP_DISTRIBUTED_ROOT}/src/distributed/lock.cpp
@@ -105,6 +106,12 @@ endif()
 target_link_libraries(go2cpp_distributed
     PUBLIC ${GO2CPP_DISTRIBUTED_RELAY_LIB} ${GO2CPP_DISTRIBUTED_BASE_LIB}
            Threads::Threads)
+# P0：Coordinator / LeaseSession / Lock 接入进程级 metrics 注册表。
+if (TARGET go2cpp_metrics)
+    target_link_libraries(go2cpp_distributed PUBLIC go2cpp_metrics)
+else()
+    message(STATUS "distributed: go2cpp_metrics missing, metrics hooks stay unused")
+endif()
 
 if (GO2CPP_DISTRIBUTED_TESTS)
     enable_testing()
@@ -129,6 +136,14 @@ if (GO2CPP_DISTRIBUTED_TESTS)
         ${GO2CPP_DISTRIBUTED_TESTS_DIR}/test_transport.cpp)
     go2cpp_distributed_add_test(go2cpp_distributed_scenarios_test
         ${GO2CPP_DISTRIBUTED_TESTS_DIR}/test_scenarios.cpp)
+    go2cpp_distributed_add_test(go2cpp_distributed_node_id_test
+        ${GO2CPP_DISTRIBUTED_TESTS_DIR}/test_node_id.cpp)
+    go2cpp_distributed_add_test(go2cpp_distributed_trace_test
+        ${GO2CPP_DISTRIBUTED_TESTS_DIR}/test_trace.cpp)
+    if (TARGET go2cpp_rpc)
+        # trace 透传用例直接验证 rpc 请求帧编解码（P0）。
+        target_link_libraries(go2cpp_distributed_trace_test PRIVATE go2cpp_rpc)
+    endif()
 
     add_test(NAME distributed_registry COMMAND go2cpp_distributed_registry_test)
     add_test(NAME distributed_lock COMMAND go2cpp_distributed_lock_test)
@@ -137,10 +152,12 @@ if (GO2CPP_DISTRIBUTED_TESTS)
     add_test(NAME distributed_concurrent COMMAND go2cpp_distributed_concurrent_test)
     add_test(NAME distributed_transport COMMAND go2cpp_distributed_transport_test)
     add_test(NAME distributed_scenarios COMMAND go2cpp_distributed_scenarios_test)
+    add_test(NAME distributed_node_id COMMAND go2cpp_distributed_node_id_test)
+    add_test(NAME distributed_trace COMMAND go2cpp_distributed_trace_test)
     set_tests_properties(
         distributed_registry distributed_lock distributed_election
         distributed_random distributed_concurrent distributed_transport
-        distributed_scenarios
+        distributed_scenarios distributed_node_id distributed_trace
         PROPERTIES LABELS distributed TIMEOUT 180)
 
     if (UNIX AND GO2CPP_DISTRIBUTED_MULTIPROCESS_TESTS)

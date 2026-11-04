@@ -5,6 +5,8 @@
 
 #include "go2cpp/distributed/lock.hpp"
 
+#include "go2cpp/distributed/metrics.hpp"
+
 #include "go2cpp/distributed/lease_session.hpp"
 
 #include <mutex>
@@ -140,6 +142,7 @@ void LockHandle::Release() {
         m_impl->released = true;
     }
     m_impl->session->Stop();
+    metrics::LockRelease().Inc();
     // 已过期/已被清扫时协调者返回 not_found；释放语义是幂等的，直接忽略。
     m_impl->coordinator->ReleaseLease(m_impl->lease, m_impl->owner);
 }
@@ -155,8 +158,10 @@ DistributedLock::DistributedLock(ICoordinator &coordinator) noexcept
 
 Result<LockHandle> DistributedLock::Acquire(std::string key, std::string owner, Duration ttl,
                                             LockOptions options) {
+    metrics::LockAcquire().Inc();
     const Result<LeaseView> granted = m_coordinator.AcquireLock(key, owner, ttl);
     if (!granted.ok()) {
+        metrics::LockAcquireFail().Inc();
         return Result<LockHandle>::Failure(granted.status, granted.message);
     }
 
