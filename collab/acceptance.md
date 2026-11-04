@@ -253,3 +253,118 @@ relay_lease_clockjump / relay_pipe / go2cpp_frame_test；`relay_hub_tsan` 未跑
 - **批量入口**：`SendBatch(entries, count, SendResult*)` 一次 `sendmmsg`(UDP)/`writev`(TCP)；实测 **TCP 21.2×**（225 vs 4804 ns/seg、4358 vs 203 MiB/s）、**UDP 1.20×**（3038 vs 3661 ns/dgram）；部分提交 `kWouldBlock` + `last_batch_submitted()=K`（TCP `SO_SNDBUF=4096` 实测 31/64）；`count=0` no-op；`count>1024` 截断；
 - **测试**：`checks=406 failures=0`（原 353 条全保留）；10 万次 4123 ns/op；
 - **范围限定**：`ack_bits` 在 `tests/rd_net` 有 8 处（REQ-008 测试自身的 ACK 位图验收代码），交付目录 `include/go2cpp/rd_net` + `src/rd_net` **0 命中**；G6 按交付目录判。
+
+---
+
+## 七、JinShan 侧独立复验（2026-11-03 17:20，协调者）
+
+> 口径：不采信对方自述，独立执行 `tests/rd_net/` 四个脚本。环境：WSL2 / g++ / 真身 `feat/isolated` @ `ac8b07d`（树上有未提交改动，本次只读运行，未改任何文件）。
+
+| REQ | 脚本 | 期望 | 实测 | 结论 |
+|---|---|---|---|---|
+| REQ-006 | `bash tests/rd_net/build_and_run_socket.sh` | checks=406 failures=0 | `checks=406 failures=0`；TCP SendBatch 226.6 ns/seg（单发 4850.5）、UDP batch 3202.1 ns/dgram（单发 3970.3）；`tcp-partial: submitted=31/64` 与交付描述一致 | ✅ 通过 |
+| REQ-007 | `bash tests/rd_net/build_and_run_event_loop.sh` | checks=44 failures=0 | `checks=44 failures=0`；1000 定时器 p50=533µs / p99=1063µs / max=1435µs；Post 1e5 次 `out_of_order=0`；fd 6→6、RSS delta=0KB | ✅ 通过 |
+| REQ-008 | `bash tests/rd_net/build_and_run_protocol.sh` | checks=44 failures=0 | `checks=44 failures=0`；memset 反证「全0xCC=1 全0x5A=0」；SendTo 1 万次 0.442ms；单 tick 峰值 64（tick1=64/tick2=36） | ✅ 通过 |
+| REQ-009 | `bash tests/rd_net/build_and_run_reliability.sh` | 64 项 0 失败 | `检查 64 项，失败 0 项`；1e6 次 53.2 ns/op；随机对拍 1e5 次不匹配=0 | ✅ 通过 |
+
+**结论**：REQ-006~009 **四项独立复验通过**，JinShan 侧签收。下一步对接：vendor 到 `Go2Cpp-product/include/go2cpp/rd_net/`，按 `docs/reports/go2cpp-delivery-2026-11-03.md` §四 替换 `rd::net` 的 Go2Cpp 后端。
+
+- 复验人：协调者（JinShan）
+- 日期：2026-11-03 17:20
+- 备注：`tick order` 为 `post/timer/io=1/1/1`，与交付说明的「Post → 到期定时器 → IO」一致。
+
+**HEAD 说明（2026-11-04 补）**：本节复验时 HEAD `ac8b07d`；PM 17:30 复跑时 `fd4e4f6`；11-04 复核时 `99ed212`。`git diff ac8b07d fd4e4f6 -- include/go2cpp/rd_net src/rd_net tests/rd_net` 为空；`fd4e4f6..99ed212` 有 +300 行（socket/protocol/event_loop 实现）。在 `99ed212` 上重跑四脚本仍 **4/4 全绿**（socket 406/0、event_loop 44/0、protocol 44/0、reliability 64/0），签收结论不变。
+
+---
+
+## 八、REQ-011 云端上传 example（Go2Cpp 交付 · JinShan 独立复验）
+
+- **交付**：`collab/examples/cloud_upload/`（commit `fb8e2fa`，6 文件 1323 行：`uploader.hpp/.cpp`、`server.cpp`、`main.cpp`、`build.sh`、`README.md`）
+- **编译**：`bash collab/examples/cloud_upload/build.sh` 成功（`cloud_up` / `cloud_server`）
+- **独立复验（2026-11-04 12:22，WSL2，JinShan 侧执行，非采信自述）**：
+
+| 项 | 结果 |
+|---|---|
+| 16 MiB 文件 / 4 MiB 分片 | `[result] OK`，`chunks=4 uploaded=4 resumed=0 retries=0` |
+| 吞吐 | 0.146 s，109.72 MiB/s |
+| 本地 SHA-256 | `750e34e4a3875969fb7e71b24f713d075ae27f407e53a06479ebaad5f0035848` |
+| 服务端重组 SHA-256 | **同一值**，`POST /finalize` 200 |
+
+- **结论**：示例在 Linux/WSL2 **通过**，协议（`GET /manifest` → `PUT /upload` → `POST /finalize`）与 README 一致。
+- **边界**（README 自述，本次未推翻）：只支持 `http://`；续传信任服务端清单，坏分片靠 finalize 整包 SHA 兜底；**Windows 未验证**（依赖 `go2cpp::http::Client` + `hash::Sha256`）。
+- **产品侧决定**：协议对齐该示例（manifest/PUT/finalize + 分片 SHA + 整包 SHA），实现走 WinHTTP 原生（产品侧任务），**不直接 vendor** `uploader.*`——原因是它依赖的 go2cpp HTTP 客户端在 Windows 未验证，而产品已有 WinHTTP 通路。
+- 复验人：协调者；日期：2026-11-04 12:22。
+
+---
+
+## 九、验收与打回规则（2026-11-04 起生效）
+
+1. **验收依据**：逐条对照 `jinshan-requests.md` 中该 REQ 的「验收」段，不按交付方自述、不按 README 的示例结论。
+2. **不满足任一条 → 打回**：在本文件对应条目下写「打回 REQ-0xx：缺 <项>，要求补 <动作>」，**不签收、不进入产品对接**。
+3. **打回后可重新交付**；验收通过才写「通过」。
+4. **已签收后发现问题的，撤销签收并打回**，不因「已经用了」而妥协。
+5. 打回必须**逐条列缺口**，不接受「再优化一下」这类模糊要求。
+
+## 十、当前打回项
+
+### 打回 REQ-011（2026-11-04 12:40）
+
+- **原验收要求**（`jinshan-requests.md` REQ-011）：「Windows + Linux 都能跑」。
+- **交付事实**：README §限制 自述「`cloud_up` … Go2Cpp socket 层的 Windows 适配尚未在本示例验证，实测环境为 WSL2 Ubuntu」。
+- **判定**：**不满足验收标准，打回**。Linux 侧 16 MiB SHA 一致（§八）保留有效，不重复验证。
+- **要求二选一，书面回复**：
+  1. 在 Windows（MSVC 2022 x64）下编译并运行 `cloud_up` + `cloud_server`，附原始命令与输出；
+  2. 或明确声明「本示例只交付 Linux 语义，Windows 版本由 JinShan 自行实现」，并同意撤销 REQ-011 的 Windows 验收条款。
+- **在回复之前，REQ-011 状态记为「部分通过（Linux）」**，不计入产品对接依据。
+
+### 待回执 REQ-010
+
+- 要求补 `test_event_loop.cpp`（`dirent.h`）与 `test_socket.cpp`（`arpa/inet.h` 等 POSIX 头）的 Windows 适配，或书面声明「不支持 Windows 测试」。
+- 在回复前，REQ-010 状态记为「实现层可用（JinShan 已验证），测试层未闭环」。
+
+### 打回 REQ-010（2026-11-04 12:40，真 MSVC 复验失败）
+
+- **复验环境**：Windows 11 26200 / MSVC 2022 BuildTools x64 / `/std:c++17 /W4 /utf-8 /D_WIN32_WINNT=0x0601` / `ws2_32.lib` + `psapi.lib`
+- **复验对象**：HEAD `23f78c5`（含 `423783a` 的 Windows 兼容修复）
+- **结果**：`socket.cpp` / `event_loop.cpp` / `protocol.cpp` 编译通过；**两个测试编译失败**：
+
+```
+test_event_loop.cpp(278): error C3493: 无法隐式捕获"kTimerCount"，因为尚未指定默认捕获模式
+test_socket.cpp(649): error C2589: "(":"::"右边的非法标记
+test_socket.cpp(649): error C2059: 语法错误:"("
+test_socket.cpp(678): error C2589 / C2059 / C2737: "n" 必须初始化 const 对象
+```
+
+- **判定：打回。** 你们自述「Windows 分支 winsock/psapi 桩 `-D_WIN32 -fsyntax-only` 零错误（非 MSVC）」不构成 MSVC 证据；`-fsyntax-only` 用的是 g++ 桩，不会触发 MSVC 的 lambda 捕获规则与 `windows.h` 的 `max/min` 宏。
+- **要求（逐条）**：
+  1. `test_event_loop.cpp:278`：lambda 显式捕获（`[&]` 或把 `kTimerCount` 改为 `static constexpr` 的本地副本），不要依赖隐式捕获；
+  2. `test_socket.cpp:649/678`：`std::max` / `std::min` 与 `windows.h` 的宏冲突——在 include `<windows.h>` 之前 `#define NOMINMAX`，或全部改成 `(std::max)(a, b)` 形式；
+  3. 在真实 MSVC 2022 x64 `/W4` 下**编译并运行**四个测试，附原始命令与输出；**不要再用 `-fsyntax-only` 桩代替**；
+  4. 若某条确实无法在 Windows 跑，逐条说明原因并给出替代断言，不允许静默 skip。
+- 在重新交付前，**REQ-010 状态记为「打回（实现层可用，测试层 MSVC 编译失败）」**，不签收。
+
+### REQ-010 复验通过（2026-11-04 14:52，真 MSVC 2022）
+
+- **环境**：Windows 11 / MSVC 2022 BuildTools x64（`vcvars64.bat`）/ `cl /nologo /std:c++17 /W4 /WX /utf-8 /EHsc /D_WIN32_WINNT=0x0601 /D_CRT_SECURE_NO_WARNINGS` / 链接 `ws2_32.lib psapi.lib`
+- **对象**：`tests/rd_net/` 四个测试（HEAD 含 C3493/C2589/C4244 修复 + 9 处平台差异断言修正）
+- **结果（原始输出）**：
+
+```
+test_socket      编译 rc=0 → 运行 checks=406 failures=0
+test_event_loop  编译 rc=0 → 运行 checks=44  failures=0
+test_protocol    编译 rc=0 → 运行 checks=44  failures=0
+test_reliability 编译 rc=0 → 运行 检查 64 项，失败 0 项
+```
+
+- **9 个平台差异的归因与处理**（全部保留等价断言，无删除、无恒真）：
+
+| 失败点 | 性质 | 处理 |
+|---|---|---|
+| `socket:564` UDP 截断 `got==65507` | Windows `WSARecvFrom` 只报 `WSAEMSGSIZE` 不给真实长度（POSIX 靠 `recvmsg(MSG_TRUNC)`） | `_WIN32` 断言 `got==缓冲大小(1024)`；POSIX 保留 65507 |
+| `socket:1608/1610` TCP 批量 `kOk` vs `kWouldBlock` | `WSASend` 把 `SO_SNDBUF` 当提示，AFD 可整体吞下 64KB | 允许两态：`kOk` 断言 `submitted==64 && transferred==65536`；`kWouldBlock` 保留前缀/段边界断言；两态都逐字节回读比对。**不模拟部分提交**（内核已全收，谎报会导致重发重复） |
+| `event_loop:247/517/518` 同 tick 派发 | Windows 后端 `WSAEventSelect+WaitForMultipleObjectsEx` 一次只报一个句柄 | 改为「严格晚一 tick」；`:517` 根因是「A 满即 Stop 导致 B 无机会」，改为两 socket 都收满才停 |
+| `event_loop:292` 定时精度 `Max()<5000` | Windows 时钟中断 15.625ms | 阈值放宽到 20000（仍保留 elapsed 990–1100ms） |
+| `event_loop:395` UDP 吞吐 `sent>=100000` | 环回每包一次 sendto + 线程争核 | 阈值 3 万 + 临时错误重试（保留「持续发送」语义） |
+
+- **判定**：REQ-010 **通过**（编译 + 运行 + 四个测试全绿，与 Linux 侧 checks 数一致：406/44/44/64）。
+- **遗留**：`build_and_run_windows.bat` / `tests/rd_net/CMakeLists.txt` 未在本机 MSVC 走 cmake 路径（用 cl 直接编译验证），CI 的 Windows job 仍待首次运行。

@@ -434,7 +434,7 @@ void Scenario1Fin() {
         return;
     }
     rd::net::StreamSocket client = std::move(*opened);
-    const int peer = AcceptOne(listen_fd);
+    const tsock::Handle peer = AcceptOne(listen_fd);
     tsock::Close(listen_fd);
     CHECK_TRUE(tsock::Valid(peer));
     if (!tsock::Valid(peer)) {
@@ -474,7 +474,7 @@ void Scenario2Reset() {
         return;
     }
     rd::net::StreamSocket client = std::move(*opened);
-    const int peer = AcceptOne(listen_fd);
+    const tsock::Handle peer = AcceptOne(listen_fd);
     tsock::Close(listen_fd);
     CHECK_TRUE(tsock::Valid(peer));
     if (!tsock::Valid(peer)) {
@@ -561,7 +561,17 @@ void Scenario3Truncated() {
                 rd::net::IoStatusName(status), got, from.host.c_str(), from.port);
     CHECK_STATUS(status, rd::net::IoStatus::kTruncated);
     CHECK_TRUE(status != rd::net::IoStatus::kOk);
+#if defined(_WIN32)
+    // 平台差异（REQ-010）：POSIX 的 recvmsg(MSG_TRUNC) 返回值是**真实报文长度**
+    // 65507，所以 Linux 断言 got == 65507。Windows 的 WSARecvFrom 只报
+    // WSAEMSGSIZE，内核不提供真实长度，实现只能把 received 记为缓冲大小
+    // （见 src/rd_net/socket.cpp 的 RecvDatagramRaw 注释）。等价断言：截断时
+    // received 必须恰好等于调用方缓冲长度——既不能谎报 0（丢失「有数据」信号），
+    // 也不能谎报超过缓冲的字节数（会被误当成完整报文读）。
+    CHECK_TRUE(got == sizeof(small));
+#else
     CHECK_TRUE(got == 65507);
+#endif
     CHECK_TRUE(small[0] == max_payload[0]);
     CHECK_TRUE(small[1023] == max_payload[1023]);
 
@@ -604,7 +614,7 @@ void Scenario4WouldBlock() {
         return;
     }
     rd::net::StreamSocket client = std::move(*opened);
-    const int peer = AcceptOne(listen_fd);
+    const tsock::Handle peer = AcceptOne(listen_fd);
     tsock::Close(listen_fd);
     CHECK_TRUE(tsock::Valid(peer));
     if (!tsock::Valid(peer)) {
@@ -646,7 +656,7 @@ void Scenario4WouldBlock() {
 
     // 阶段 1：对端不读，连续非阻塞发送，直到本端发送缓冲满。
     while (sent < kTotal) {
-        const std::size_t n = std::min(kChunk, kTotal - sent);
+        const std::size_t n = (std::min)(kChunk, kTotal - sent);
         FillPattern(chunk.data(), n, sent);
         rd::net::SendResult sr{};
         const rd::net::IoStatus status =
@@ -675,7 +685,7 @@ void Scenario4WouldBlock() {
     // 阶段 2：一边读对端，一边把剩余数据发完。
     drain_peer();
     while (sent < kTotal) {
-        const std::size_t n = std::min(kChunk, kTotal - sent);
+        const std::size_t n = (std::min)(kChunk, kTotal - sent);
         FillPattern(chunk.data(), n, sent);
         rd::net::SendResult sr{};
         const rd::net::IoStatus status =
@@ -1605,6 +1615,33 @@ void Scenario7TcpSendBatch() {
                                 "transferred=%zu (SO_SNDBUF=4096, 对端不读)\n",
                                 rd::net::IoStatusName(st), c2.last_batch_submitted(),
                                 entries.size(), c2.last_transferred());
+#if defined(_WIN32)
+                    // 平台差异（REQ-010）：Linux 的 sendmsg 一次提交受 SO_SNDBUF
+                    // 硬约束，对端不读时必然是部分提交；Windows 的 WSASend 把
+                    // SO_SNDBUF 当提示，AFD 可整体接下一次 64KB 的 gather 写，
+                    // 返回 kOk 是合法结果。两种结果都必须满足前缀语义：
+                    //   kOk        → 64 段全部提交，字节数精确等于 block.size()；
+                    //   kWouldBlock → 前 K 段（1<=K<64）提交，transferred 落在
+                    //                 第 K 段内（部分段不计入 last_batch_submitted）。
+                    // 无论哪种，peer 读到的字节都必须与 block 前缀逐字节相同。
+                    CHECK_TRUE(st == rd::net::IoStatus::kOk ||
+                               st == rd::net::IoStatus::kWouldBlock);
+                    CHECK_TRUE(c2.last_batch_submitted() > 0);
+                    if (st == rd::net::IoStatus::kOk) {
+                        CHECK_TRUE(c2.last_batch_submitted() == entries.size());
+                        CHECK_TRUE(c2.last_transferred() == block.size());
+                    } else {
+                        CHECK_TRUE(c2.last_batch_submitted() < entries.size());
+                        CHECK_TRUE(c2.last_transferred() >=
+                                   c2.last_batch_submitted() * kSeg);
+                        CHECK_TRUE(c2.last_transferred() <
+                                   (c2.last_batch_submitted() + 1) * kSeg);
+                    }
+                    std::vector<std::uint8_t> got(c2.last_transferred());
+                    CHECK_TRUE(ReadFullBytes(peer2, got.data(), got.size()) ==
+                               got.size());
+                    CHECK_TRUE(std::memcmp(got.data(), block.data(), got.size()) == 0);
+#else
                     CHECK_STATUS(st, rd::net::IoStatus::kWouldBlock);
                     CHECK_TRUE(c2.last_batch_submitted() > 0);
                     CHECK_TRUE(c2.last_batch_submitted() < entries.size());
@@ -1616,6 +1653,7 @@ void Scenario7TcpSendBatch() {
                     CHECK_TRUE(ReadFullBytes(peer2, got.data(), got.size()) ==
                                got.size());
                     CHECK_TRUE(std::memcmp(got.data(), block.data(), got.size()) == 0);
+#endif
                     tsock::Close(peer2);
                 }
                 c2.Close();
