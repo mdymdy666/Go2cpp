@@ -86,6 +86,7 @@ if (GO2CPP_ERROR_NATIVE_CONTEXT)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/context_backend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/context_x64.S
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/debug/debug_event_ring.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/logging/log.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/tools/error.cpp)
 
     target_include_directories(error_fiber_test PRIVATE
@@ -115,7 +116,8 @@ if (GO2CPP_ERROR_NATIVE_CONTEXT)
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/fiber_local.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/context_backend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/context_x64.S
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/debug/debug_event_ring.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/debug/debug_event_ring.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/logging/log.cpp)
 
     target_include_directories(error_control_flow_fiber_test PRIVATE
         ${GO2CPP_ERROR_INCLUDE_DIR}
@@ -130,6 +132,33 @@ if (GO2CPP_ERROR_NATIVE_CONTEXT)
 
     add_test(NAME error_control_flow_fiber COMMAND error_control_flow_fiber_test)
     set_tests_properties(error_control_flow_fiber PROPERTIES TIMEOUT 300)
+
+    # ErrorScope：Fiber 链级多重错误收集 + Fiber 退出自动抽干。抽干走
+    # go2cpp::logging，因此把 log.cpp 一起编进可执行（tests/error 是独立
+    # 工程，不链接主库目标）。
+    add_executable(error_scope_test
+        test_error_scope.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/logging/log.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/fiber.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/fiber_local.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/context_backend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/concurrency/context_x64.S
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/debug/debug_event_ring.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../src/tools/error.cpp)
+
+    target_include_directories(error_scope_test PRIVATE
+        ${GO2CPP_ERROR_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party)
+    target_compile_definitions(error_scope_test PRIVATE GO2CPP_USE_NATIVE_CONTEXT=1)
+    target_compile_options(error_scope_test PRIVATE -Wall -Wextra -Wpedantic)
+    set_source_files_properties(test_error_scope.cpp PROPERTIES COMPILE_OPTIONS "-Werror")
+    if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+        target_compile_options(error_scope_test PRIVATE -O2)
+    endif()
+    target_link_libraries(error_scope_test PRIVATE Threads::Threads)
+
+    add_test(NAME error_scope COMMAND error_scope_test)
+    set_tests_properties(error_scope PROPERTIES TIMEOUT 300)
 else()
     message(STATUS "error_fiber_test: skipped (需要 Linux x86_64 原生 context)")
 endif()

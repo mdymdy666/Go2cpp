@@ -24,6 +24,8 @@
 #include "go2cpp/fiber.hpp"
 
 #include "go2cpp/debug/debug_resources.hpp"
+#include "go2cpp/error/error_fiber.hpp"
+#include "go2cpp/error/error_scope.hpp"
 #include "go2cpp/hash/fnv.hpp"
 
 #include "go2cpp/detail/context_backend.hpp"
@@ -1922,6 +1924,9 @@ struct Fiber::Impl {
             terminal_state = FiberState::Failed;
         }
         self->m_function = {};
+        // 错误收集器存放在 FiberLocal 里，会随 Cleanup 一起销毁；必须在清理
+        // 之前抽干，否则本 G 收集的错误不再有机会上报。
+        error::detail::DrainErrorScopeOnFiberExit();
         // Fiber-local 值属于逻辑 G，而不是 worker M。主体栈展开后、把控制权
         // 交回调用者前，执行这些值的析构函数。
         fiber_local::detail::Cleanup(self->m_owner);

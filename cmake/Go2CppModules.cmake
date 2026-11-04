@@ -471,6 +471,10 @@ target_include_directories(go2cpp_runtime INTERFACE
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
+# Fiber trampoline 在退出时抽干 ErrorScope（go2cpp/error/error_scope.hpp），
+# 抽干路径调用 go2cpp::logging 打印未处理错误。因此 fiber 必须显式依赖 log；
+# log 不反向依赖 fiber，不构成环。
+target_link_libraries(go2cpp_fiber PUBLIC go2cpp_log)
 target_link_libraries(go2cpp_context PUBLIC go2cpp_error go2cpp_scheduler)
 target_link_libraries(go2cpp_channel PUBLIC go2cpp_context go2cpp_error)
 target_link_libraries(go2cpp_scheduler PUBLIC go2cpp_fiber go2cpp_log)
