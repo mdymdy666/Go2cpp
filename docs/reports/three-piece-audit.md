@@ -34,7 +34,7 @@
 | A05 | compress / gzip | 有：64 KiB 输出块 + CRC 合并 | ❌ **无**：`asm-compress.md` 全文 0 次 objdump/反汇编/指令数 | 吞吐 + zlib 同流对照 | 🟡 解压 5219.7 MiB/s、0.696× zlib（`asm-compress.md:14-19`），但**缺指令级取证** |
 | A06 | reflect（二进制/文本） | 有：紧凑格式 + 不建树直读 | ❌ **无**：`asm-reflect.md` 0 次 objdump（只有 ns/op 分阶段） | 四项对拍 | 🟡 编码 51.4–55.9 ns、解码 51.5–54.5 ns，全项 <1.1×（`asm-reflect.md:16-22`）但无指令证据 |
 | A07 | encoding / base64 | 有：数据布局 + 预置表 | 🟡 弱：`asm-tools.md` 仅 1 处 objdump 引用 | 16 MiB 对拍 Go | 🟡 1980 MiB/s、0.84× Go（`asm-tools.md:14-16`） |
-| A08 | encoding / csv+hex+binary | ❌ 无报告 | ❌ 无 | 仅 `tests/encoding/` 功能测试 | ❌ 完全缺失 |
+| A08 | encoding / csv+hex+binary | ⚪ 不适用：csv 无生产调用点，hex 只处理短串（§A08） | ⚪ 不适用 | 仅 `tests/encoding/` 功能测试 + 1 MiB stress | ⚪ 不适用（无数据面调用） |
 | A09 | hash（SHA-256/CRC32） | 有：SHA-NI、查表 CRC | 🟡 硬件指令已用，但**无归档反汇编**（`asm-reuse-hash.md` 0 次 objdump） | `tests/hash/bench_crc32_hw.cpp` | 🟡 SHA-256 2002.60 MiB/s、crc32 18731.55 MiB/s（`metrics-ledger.md` M12） |
 | A10 | os / file（读写、writev/readv） | 有：相邻 iovec 合并、内联 syscall | 有：`Read` 46→38 指令 / 0 call / 0 B 栈帧（`asm-os.md:31`） | 1e6 逐字节 + 边界 | ✅ 写 109.72×、读 207.49×（`metrics-ledger.md` M10）；`asm-os.md:18-22` |
 | A11 | os / proc（Process spawn+wait） | 有：去掉重复 /proc 读取 | 有：objdump 统计 | 同进程 A/B | 🟡 1.13–1.22× 未达标（`asm-os.md:24`） |
@@ -42,16 +42,16 @@
 | A13 | storage / sqlite 封装 | 有：`const Error&` 返回、语句复用 | 有：objdump + callgrind（`asm-storage-sqlite.md` 18 处） | 7 场景 × 7 轮 | ✅ 1e6 插入 1.074×（`asm-storage-sqlite.md:8-10`；M06） |
 | A14 | storage / kv（LSM 引擎） | 有 | 有：objdump（`asm-storage-kv.md` 2 处） | 1e7 压测 | 🟡 Put 562,669 ops/s、Get 475,125（读 0.48× 于 LevelDB，`asm-storage-kv.md:15-18`） |
 | A15 | storage / features（Queue/Watch/MemCache） | 有：复用 WAL/SSTable | 🟡 弱：仅 2 处 objdump 引用 | 三套功能测试 | 🟡 `asm-storage-features.md:12-22` |
-| A16 | storage / leveldb 封装 | ❌ 无报告 | ❌ 无 | `tests/storage/test_leveldb_kv.cpp`（1e7/1e8） | ❌ 有压测无三件套 |
+| A16 | storage / leveldb 封装 | 有：pimpl + `string_view` 零拷贝 + relaxed 统计 | 有：objdump，Put 173/热 54、Get 197/热 69、0 分配 0 锁（`asm-storage-leveldb.md`） | `tests/storage/test_leveldb_kv.cpp`（1e7/1e8） | 🟡 汇编补齐；关 canary 后净增 5 条，缺独立端到端对标 |
 | A17 | network / http 服务端（路由/静态/pipelining） | 有：每方法哈希 + 段 trie、sendfile、pipelining | ❌ **无**：`asm-http-e2e.md` 0 次 objdump | 260 条 socket 断言 | 🟡 nginx 1.03–1.89×、Go 1.28–3.21×（`asm-http-e2e.md:16-21`）；M05 120,755 rps |
 | A18 | network / http parser + ws | 有：WS 掩码 PRNG、ResponseWriter | 有：审查 objdump 20 点（`2026-11-01-asm-network-review.md:13-17`）+ `f40e007` | 回归测试 | 🟡 WS 长连接 RSS 2.20–2.32×、p99 2.06–3.06× 于 Go（`ws-200k-bench.md:20-21`） |
 | A19 | network / tls | 有 | 有：objdump 9 处 / 20 行（`asm-tls.md`） | 对拍 + 吞吐 | 🟡 握手 1.061×、64B 0.945 达标；**大包 AEAD 13.41×**（`asm-tls.md:29,240`） |
-| A20 | network / bufio | ❌ 无报告 | ❌ 无 | `tests/bufio/bench_bufio_batch.cpp` | ❌ 有 bench 无优化记录（M08 1853.9 MiB/s 无对标） |
+| A20 | network / bufio | ❌ 无报告 | ❌ 无 | `tests/bufio/bench_bufio_batch.cpp` | 🟡 有 bench 无优化记录（M08 1853.9 MiB/s 无对标），§A20 判定「要补（中）」 |
 | A21 | bento / link（多队列） | 有：SO_REUSEPORT + recvmmsg 批收 | ❌ 无：`asm-legacy.md` 0 次 objdump | 1e6 包 | 🟡 单 peer 无收益（−1.3%）、2 核多队列丢包 39–48%（`asm-legacy.md:17`；M15） |
 | A22 | bento / peer_hub FEC | 有：FEC 接入 | ❌ 无 | 1e6 包 + 丢包注入 | 🟡 重传 17→6（−64.7%）（`asm-legacy.md:18`） |
 | A23 | p2p / stun+relay+random | 有：`06f9e59`（Relay 3.3×/STUN 5–10×） | 🟡 提交信息有数字，**无报告归档** | `tests/p2p/bench_*` 3 个 | 🟡 只能引用提交号，无 objdump 表 |
-| A24 | rpc | ❌ 无报告 | ❌ 无 | `tests/rpc/bench_rpc.cpp` | ❌ 完全缺失 |
-| A25 | tunnel | ❌ 无报告 | ❌ 无 | `tests/tunnel/test_tunnel.cpp` 功能 | ❌ 无吞吐程序（M14 备注已指出） |
+| A24 | rpc | 有：分层编解码（`docs/modules/rpc.md`） | 有：`docs/modules/rpc.md` 的 objdump 表（待归档 `asm-rpc.md`） | `tests/rpc/bench_rpc.cpp` 1e6/1e7 | ✅ 判定段「已具备，只需归档」（§A24） |
+| A25 | tunnel | ❌ 无报告 | ❌ 无 | `tests/tunnel/test_tunnel.cpp` 功能 | ❌ 无吞吐程序（M14）；§A25 判定「要补（高）」 |
 | A26 | rd_net（v3） | 有：分层单向、零拷贝反证、sendmmsg/writev | 有：`SendBatch` 3107 指令、`EventLoop::Run` 栈帧 152 B（`rdnet-v3-review.md:47-58`） | 406/44/64/44 全绿 + 1e6 | ✅ TCP 批量 20.8×、UDP 1.20×（`rdnet-v3-review.md:71-87`） |
 | A27 | concurrency / channel | 有：Context 语义 + 错误路径改造 | 有：`EmptyTryRecv` 两次 `_M_release` 消除（M01b-a） | channel/select/fiber 4 套 + 89.3 s 压测 | 🟡 112.6 ns vs Go 23.36（语义增强），无锁化未做（M01b-a） |
 | A28 | concurrency / scheduler | 有：P19–P22 四项（3 项保留） | 有：enqueue 597→580 指令、栈帧 104→88 B（M03） | ctest + smoke 20/20 + 1e6 | 🟡 **做了但未达标**（M03 2.21×，2026-11-03 用户决定关闭） |
@@ -65,18 +65,18 @@
 | A36 | media / signaling（SDP） | ⚪ 控制面 | 有：审查级反汇编 | 1e4 往返 | ⚪ 报告自述控制面，不做数据面下限（`asm-signaling.md:9-18`） |
 | A37 | distributed（lease/lock/election） | 有 | 有：291 指令/29 call/296 B/0 原子 + callgrind（`asm-distributed.md:13-20`） | ctest 8/8 + 1e6 STRESS_OK | ✅ renew 65 ns、etcd 本地 5000–6200×（`asm-distributed.md:21-32`） |
 | A38 | app（gateway/stream_table/kv） | 有：`de916bc` | 🟡 提交有数字（PickNext 20.6×、帧解码 98→4.7 ns），无报告 | app 测试 | 🟡 证据未归档 |
-| A39 | cache（ARC/LRU/2Q/CLOCK） | 有：侵入式链表 + 节点池（`057257b`） | 🟡 提交称「堆分配→0」，无 objdump 归档 | 命中率逐位一致 + `cache_bench` | 🟡 几何 1.91×/LRU 2.57× 只在提交信息 |
+| A39 | cache（ARC/LRU/2Q/CLOCK） | 有：侵入式链表 + 开放寻址 + 64 节点块池（`057257b`） | 有：objdump，Get 73/306/373、Put 227/251/420、0 锁（`asm-cache.md`） | 命中率逐位一致 + `cache_bench` | ✅ 三条齐备（`asm-cache.md`） |
 | A40 | relay | 有：并入 `06f9e59` | 🟡 同上 | `tests/relay/bench_relay.cpp` | 🟡 无独立报告 |
-| A41 | frame（帧编解码） | ❌ 无报告 | ❌ 无 | `tests/frame/` | ❌ 完全缺失 |
-| A42 | config | ❌ 无报告 | ❌ 无 | `tests/config/` | ❌ 完全缺失 |
+| A41 | frame（帧编解码） | ❌ 无报告 | ❌ 无 | `tests/frame/` + 1e6 帧压测（`frame-codec.md:215-222`） | 🟡 有压测，§A41 判定「要补（低）」 |
+| A42 | config | ⚪ 不适用：控制面 | ⚪ 不适用 | `tests/config/` 5 个功能测试 | ⚪ 不适用（无数据面基准） |
 | A43 | tools（Base64/gzip/JSON 工具） | 有 | 🟡 `asm-tools.md` 仅 1 处 objdump | 5/5 测试 | 🟡 7 达标 3 未达标（`asm-tools.md:25`） |
 | A44 | core / error / go（基础设施） | ⚪ | ⚪ | error 5 套 ctest | ⚪ 不适用（无数据面热路径） |
 
-**计数（与上表逐行核对）：44 项 / ✅ 11 / 🟡 24 / ❌ 7 / ⚪ 2。**
+**计数（与上表逐行核对）：44 项 / ✅ 13 / 🟡 26 / ❌ 1 / ⚪ 4（2026-11-04 落地缺失项归属判定 + A16/A39 更新）。**
 
 ---
 
-## 2. 已完整的清单（11 项，附证据）
+## 2. 已完整的清单（11 项正文证据；A24/A39 证据见表注与本日报告）
 
 1. **os / file**——`asm-os.md:18-33`：单条 read 1.01–1.03×、write 1.00–1.01×；writev/readv 架构合并后
    写 17.9×→109.72×、读 20.9×→207.49×（`metrics-ledger.md` M10）；`File::Read` 46→38 指令、栈帧 24→0 B。
@@ -288,7 +288,7 @@
   不是本模块）。
 - **结论**：⚪ 控制面，不做数据面下限；最多在归档时补一句「启动路径 1 次 `LoadFromFile`，不进入承压路径」。
 
-**若采纳本判定，覆盖变化（总表 44 行不变）**：✅ 11→**12**（A24）、🟡 24→**27**（A16/A20/A41）、
+**已采纳本判定并同步总表（2026-11-04）**：✅ 11→**13**（A24、A39）、🟡 24→**26**（A16/A20/A41 升 🟡，A39 升 ✅）、
 ❌ 7→**1**（只剩 A25）、⚪ 2→**4**（A08/A42）。
 
 **要补项 TOP3（按「数据面程度 × 证据缺口 × 成本」）**
