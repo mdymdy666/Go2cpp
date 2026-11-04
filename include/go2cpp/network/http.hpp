@@ -333,6 +333,14 @@ struct Result {
     bool ok() const noexcept { return error == Error::None && response != nullptr; }
 };
 
+/**
+ * @brief 把一次 IO 失败的 errno 归类为 `Result::Error`。
+ * @param normal [in] 阶段默认错误（Connect/Send/Receive）。
+ * @param error [in] 失败 errno 快照；0 表示无错误。
+ * @return 归类结果；`Closed` 表示连接已结束，调用方应重建连接而不是重试。
+ */
+Result::Error classify_io_error(Result::Error normal, int error) noexcept;
+
 /** @brief 基于 Socket 的最小 HTTP/1.1 客户端，连接不跨协程共享。 */
 /**
  * @brief 基于 Socket 的最小 HTTP/1.1 客户端，连接不跨协程共享。

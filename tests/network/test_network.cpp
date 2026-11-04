@@ -536,6 +536,41 @@ void run_network_tests() {
     GO2CPP_JOIN_WITH_WATCHDOG(continue_server, std::chrono::seconds(3));
     continue_listener->close();
 
+    // C6：对端只回 1xx。超过 10 次 informational 响应必须返回 Parse，
+    // 而不是无限消费 pending 假死。
+    auto informational_listener = go2cpp::net::Socket::CreateTCP(AF_INET);
+    GO2CPP_REQUIRE(informational_listener &&
+                   informational_listener->bind(*go2cpp::net::IPv4Address::Create("127.0.0.1", 0)) &&
+                   informational_listener->listen(4));
+    auto informational_address = std::dynamic_pointer_cast<go2cpp::net::IPv4Address>(
+        informational_listener->local_address());
+    GO2CPP_REQUIRE(informational_address);
+    std::thread informational_server([informational_listener] {
+        auto accepted = informational_listener->accept(std::chrono::seconds(2));
+        if (!accepted) return;
+        std::string request_bytes;
+        std::array<char, 512> request_buffer{};
+        while (request_bytes.find("\r\n\r\n") == std::string::npos) {
+            const auto read = accepted->recv(request_buffer.data(), request_buffer.size(), 0,
+                                              std::chrono::seconds(2));
+            if (!read.ok() || read.transferred == 0) return;
+            request_bytes.append(request_buffer.data(), static_cast<std::size_t>(read.transferred));
+        }
+        std::string informational;
+        for (int i = 0; i < 11; ++i) informational += "HTTP/1.1 100 Continue\r\n\r\n";
+        const auto sent = accepted->send(informational.data(), informational.size(), 0,
+                                         std::chrono::seconds(2));
+        GO2CPP_CHECK(sent.ok() &&
+                     sent.transferred == static_cast<ssize_t>(informational.size()));
+        accepted->close();
+    });
+    const auto informational_result = go2cpp::http::Client(std::chrono::seconds(2)).get(
+        "http://127.0.0.1:" + std::to_string(informational_address->port()) + "/informational");
+    GO2CPP_CHECK(informational_result.error == go2cpp::http::Result::Error::Parse);
+    GO2CPP_CHECK(!informational_result.ok());
+    GO2CPP_JOIN_WITH_WATCHDOG(informational_server, std::chrono::seconds(3));
+    informational_listener->close();
+
     // 流式响应只允许 Idle -> HeadersCommitted -> Closed，重复 close/write 必须失败。
     int stream_pair[2]{};
     GO2CPP_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, stream_pair) == 0);
@@ -558,6 +593,54 @@ void run_network_tests() {
                  go2cpp::http::Result::Error::InvalidUrl);
     GO2CPP_CHECK(go2cpp::http::Client{}.get("http://::1/").error ==
                  go2cpp::http::Result::Error::InvalidUrl);
+
+    // C3：POST/PUT/PATCH 的空 body 也必须显式补 Content-Length: 0，否则服务端
+    // 会按未定长度等待请求体；已显式设置时不重复追加，GET 不引入多余头。
+    {
+        go2cpp::http::Request empty_post;
+        empty_post.method = go2cpp::http::Method::Post;
+        empty_post.target = "/upload";
+        const std::string empty_post_wire = empty_post.to_string();
+        GO2CPP_CHECK(empty_post_wire.find("Content-Length: 0\r\n") != std::string::npos);
+        empty_post.header.set("Content-Length", "0");
+        const std::string explicit_wire = empty_post.to_string();
+        GO2CPP_CHECK(explicit_wire.find("Content-Length") == explicit_wire.rfind("Content-Length"));
+        go2cpp::http::Request empty_get;
+        empty_get.method = go2cpp::http::Method::Get;
+        GO2CPP_CHECK(empty_get.to_string().find("Content-Length") == std::string::npos);
+        go2cpp::http::Request body_post;
+        body_post.method = go2cpp::http::Method::Post;
+        body_post.body = "abc";
+        GO2CPP_CHECK(body_post.to_string().find("Content-Length: 3\r\n") != std::string::npos);
+    }
+    // C4：对端 RST（ECONNRESET）与写已关闭套接字（EPIPE）归为 Closed；
+    // 超时/取消保持独立语义，其余 errno 回落阶段错误。
+    GO2CPP_CHECK(go2cpp::http::classify_io_error(go2cpp::http::Result::Error::Receive, ECONNRESET) ==
+                 go2cpp::http::Result::Error::Closed);
+    GO2CPP_CHECK(go2cpp::http::classify_io_error(go2cpp::http::Result::Error::Send, EPIPE) ==
+                 go2cpp::http::Result::Error::Closed);
+    GO2CPP_CHECK(go2cpp::http::classify_io_error(go2cpp::http::Result::Error::Connect, ETIMEDOUT) ==
+                 go2cpp::http::Result::Error::Timeout);
+    GO2CPP_CHECK(go2cpp::http::classify_io_error(go2cpp::http::Result::Error::Receive, ECANCELED) ==
+                 go2cpp::http::Result::Error::Cancelled);
+    GO2CPP_CHECK(go2cpp::http::classify_io_error(go2cpp::http::Result::Error::Send, EIO) ==
+                 go2cpp::http::Result::Error::Send);
+    // C5：connect 失败取 socket 记录的 error（errno 兜底）。绑定了但已关闭的
+    // 端口必然返回 ECONNREFUSED，分类为 Connect 且诊断文本来自真实 errno。
+    std::uint16_t refused_port = 0;
+    {
+        auto probe = go2cpp::net::Socket::CreateTCP(AF_INET);
+        GO2CPP_REQUIRE(probe && probe->bind(*go2cpp::net::IPv4Address::Create("127.0.0.1", 0)));
+        auto probe_address =
+            std::dynamic_pointer_cast<go2cpp::net::IPv4Address>(probe->local_address());
+        GO2CPP_REQUIRE(probe_address);
+        refused_port = probe_address->port();
+        probe->close();
+    }
+    const auto refused_result = go2cpp::http::Client(std::chrono::seconds(2)).get(
+        "http://127.0.0.1:" + std::to_string(refused_port) + "/refused");
+    GO2CPP_CHECK(refused_result.error == go2cpp::http::Result::Error::Connect);
+    GO2CPP_CHECK(refused_result.message.find("Connection refused") != std::string::npos);
     // 客户端收到 EOF 才能完成无长度响应；不能把连接关闭误判为缺失 body。
     auto close_listener = go2cpp::net::Socket::CreateTCP(AF_INET);
     GO2CPP_REQUIRE(close_listener && close_listener->bind(*go2cpp::net::IPv4Address::Create("127.0.0.1", 0)) &&

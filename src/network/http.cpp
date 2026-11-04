@@ -301,7 +301,12 @@ std::string Request::to_string() const {
     for (const auto& item : header.entries())
         total += item.first.size() + item.second.size() + 4;
     if (close && !has_connection) total += 19;
-    if (!body.empty() && !has_content_length) total += 20;
+    // C3：POST/PUT/PATCH 是「有消息体语义」的方法，即使 body 为空也必须显式
+    // 发 Content-Length: 0；否则部分服务端会按未定长度/chunked 等待请求体，
+    // 客户端只能挂到超时。GET/HEAD 等不带体的方法保持原样，不引入多余头。
+    const bool zero_length_body = body.empty() &&
+        (method == Method::Post || method == Method::Put || method == Method::Patch);
+    if ((!body.empty() || zero_length_body) && !has_content_length) total += 20;
     std::string wire;
     wire.reserve(total);
     wire.append(token).push_back(' ');
@@ -310,8 +315,9 @@ std::string Request::to_string() const {
     for (const auto& item : header.entries())
         wire.append(item.first).append(": ").append(item.second).append("\r\n");
     if (close && !has_connection) wire.append("Connection: close\r\n");
-    if (!body.empty() && !has_content_length) {
+    if ((!body.empty() || zero_length_body) && !has_content_length) {
         char digits[24];
+        // 空 body 时 body.size() 为 0，to_chars 直接产出 "0"。
         const auto converted = std::to_chars(digits, digits + sizeof(digits), body.size());
         wire.append("Content-Length: ").append(digits, converted.ptr).append("\r\n");
     }
@@ -702,6 +708,31 @@ bool parse_http_time(std::string_view value, std::chrono::system_clock::time_poi
 std::string encode_query(const QueryValues& values) { std::string result; for (const auto& [key, list] : values) for (const auto& value : list) { if (!result.empty()) result += '&'; result += query_escape(key) + '=' + query_escape(value); } return result; }
 bool decode_query(std::string_view value, QueryValues& output) { output.clear(); while (!value.empty()) { const auto amp = value.find('&'); const auto item = value.substr(0, amp); const auto equal = item.find('='); const auto key_part = item.substr(0, equal); const auto value_part = equal == std::string_view::npos ? std::string_view{} : item.substr(equal + 1); std::string key, decoded; if (!query_unescape(key_part, key) || !query_unescape(value_part, decoded)) return false; output[key].push_back(std::move(decoded)); if (amp == std::string_view::npos) break; value.remove_prefix(amp + 1); } return true; }
 
+/**
+ * @brief 把一次 IO 失败的 errno 归类为 HTTP 客户端公开的错误码。
+ *
+ * @param normal [in] 该阶段的默认错误（Connect/Send/Receive）；无特殊 errno 时原样返回。
+ * @param error [in] 失败 errno 的显式快照；0 表示无错误，此时返回 `normal`。
+ * @return 映射后的错误码——调用方**必须**把 `Closed` 当作连接级失败并重建连接，
+ *         不要在同一 fd 上重试；`Timeout`/`Cancelled` 应停止本次请求。
+ *
+ * ## 定位
+ * `Client::do_request` 的连接/发送/接收三个阶段共用；错映射会让上层把对端
+ * 主动断开当成普通 IO 失败，从而重试一条已经死掉的连接。
+ *
+ * ## 并发/失败语义
+ * - 纯函数：无状态、无锁、`noexcept`，可被任意线程并发调用；
+ * - 不读取线程 `errno`：失败原因由调用方显式传入，避免被其他 syscall 污染。
+ */
+Result::Error classify_io_error(Result::Error normal, int error) noexcept {
+    if (error == ETIMEDOUT) return Result::Error::Timeout;
+    if (error == ECANCELED) return Result::Error::Cancelled;
+    // C4：ECONNRESET（对端发 RST）与 EPIPE（写已关闭的管道/套接字）都是
+    // 「连接已经结束」，不是 Send/Receive 阶段的普通失败；统一归 Closed，
+    // 让上层走重连分支，而不是在同一个已死 fd 上继续重试。
+    if (error == ECONNRESET || error == EPIPE) return Result::Error::Closed;
+    return normal;
+}
 Client::Client(std::chrono::milliseconds timeout) : m_timeout(timeout) {}
 /**
  * @brief 执行一次完整的 HTTP/1.x 请求：解析地址 → 连接 → 发送 → 读响应。
@@ -719,12 +750,14 @@ Client::Client(std::chrono::milliseconds timeout) : m_timeout(timeout) {}
  *
  * ## 步骤
  *
- * step1. 定义 `classify_io`：把 errno 的 `ETIMEDOUT`/`ECANCELED` 提升为
- *        对应的 `Result::Error`，其余归到调用方指定的阶段错误（Connect/Send/Receive）；
+ * step1. 用 `classify_io_error` 归类 errno：`ETIMEDOUT`/`ECANCELED`/`ECONNRESET`/
+ *        `EPIPE` 提升为 `Timeout`/`Cancelled`/`Closed`，其余归到调用方指定的
+ *        阶段错误（Connect/Send/Receive）；
  * step2. 计算绝对 deadline（`make_deadline`），做 DNS 解析；
  *        **每次 IO 前都用 `remaining_time(deadline)` 重算剩余时间**，
  *        而不是每步用一个固定超时——否则总耗时会被阶段数放大；
- * step3. 创建 TCP socket 并 connect；失败时按 `classify_io` 归类；
+ * step3. 创建 TCP socket 并 connect；失败时优先取 socket 记录的 error、
+ *        errno 兜底，再按 `classify_io_error` 归类；
  * step4. 补全 `Host` 与 `Connection: close` 头，序列化成 wire 字节；
  *        然后**循环发送**直到 `sent == wire.size()`（部分写是合法的）；
  * step5. 创建 `Parser`（HEAD 请求要求「无响应体」），准备 8KiB 栈上缓冲与
@@ -732,7 +765,8 @@ Client::Client(std::chrono::milliseconds timeout) : m_timeout(timeout) {}
  * step6. **接收 + 解析循环**：有待处理数据就先 `feed`，否则 `recv`；
  *        `transferred == 0` 说明对端关闭，用 `finish` 尝试收尾；
  *        `Complete` → 若状态码是 100~199（且非 101）则**跳过 informational
- *        响应**（保留剩余字节、重建 Response）继续等最终响应；否则返回；
+ *        响应**（保留剩余字节、重建 Response）继续等最终响应；同一请求最多
+ *        跳过 10 次，超过返回 `Parse`（防止对端无限 1xx 拖死客户端）；否则返回；
  *        `Error` → 返回解析错误。
  *
  * ## 并发/失败语义
@@ -750,12 +784,7 @@ Client::Client(std::chrono::milliseconds timeout) : m_timeout(timeout) {}
  * - 本函数**不做重定向跟随**，3xx 原样返回给调用方。
  */
 Result Client::do_request(const Request& request, const std::string& host, std::uint16_t port) {
-    // step1: 错误分类器——把超时/取消从普通阶段错误里分出来。
-    const auto classify_io = [](Result::Error normal, int error) {
-        if (error == ETIMEDOUT) return Result::Error::Timeout;
-        if (error == ECANCELED) return Result::Error::Cancelled;
-        return normal;
-    };
+    // step1: 错误分类统一走 classify_io_error（超时/取消/对端复位各有独立语义）。
     const auto deadline = make_deadline(m_timeout);
     // step2: 计算全局 deadline 后做 DNS 解析。
     auto address = net::Address::LookupAny(host + ":" + std::to_string(port), AF_UNSPEC, SOCK_STREAM);
@@ -766,9 +795,13 @@ Result Client::do_request(const Request& request, const std::string& host, std::
     // step3: 建 TCP 连接（超时用 deadline 的剩余时间）。
     auto socket = net::Socket::CreateTCP(address->family());
     if (!socket || !socket->connect(*address, remaining)) {
-        const int error = errno == 0 ? EIO : errno;
-        const auto category = classify_io(Result::Error::Connect, error);
-        return {category, std::strerror(error), {}};
+        // C5：connect 内部依次经历 connect/wait_ready/SO_ERROR，失败原因以
+        // Socket 自己记录的 error 为准；errno 只做兜底——异步等待路径可能把
+        // 线程 errno 覆盖成与建连失败无关的值，拿它当首选会误报失败原因。
+        int error = socket ? socket->last_error() : 0;
+        if (error == 0) error = errno;
+        if (error == 0) error = EIO;
+        return {classify_io_error(Result::Error::Connect, error), std::strerror(error), {}};
     }
     Request outgoing = request; if (!outgoing.header.has("Host")) outgoing.header.set("Host", host); if (!outgoing.header.has("Connection")) outgoing.header.set("Connection", "close");
     const auto wire = outgoing.to_string();
@@ -786,7 +819,7 @@ Result Client::do_request(const Request& request, const std::string& host, std::
         const auto written = socket->send(wire.data() + sent, chunk, 0, remaining);
         if (!written.ok() || written.transferred == 0) {
             const int error = written.error == 0 ? (errno == 0 ? EIO : errno) : written.error;
-            return {classify_io(Result::Error::Send, error), std::strerror(error), {}};
+            return {classify_io_error(Result::Error::Send, error), std::strerror(error), {}};
         }
         sent += static_cast<std::size_t>(written.transferred);
     }
@@ -794,6 +827,9 @@ Result Client::do_request(const Request& request, const std::string& host, std::
     Parser parser; parser.set_response_to_head(request.method == Method::Head);
     auto response = std::make_shared<Response>(); std::array<char, 8192> buffer{};
     std::string pending;
+    // C6：1xx 中间响应不设上限时，故障或恶意对端可以无限回 100 Continue，
+    // do_request 会一直消费 pending 而不返回，表现为客户端假死。
+    std::size_t informational_count = 0;
     // step6: 接收 + 解析循环（含 1xx informational 响应的处理）。
     for (;;) {
         ParseResult parsed;
@@ -805,7 +841,7 @@ Result Client::do_request(const Request& request, const std::string& host, std::
             if (remaining == std::chrono::milliseconds::zero())
                 return {Result::Error::Timeout, "request deadline exceeded", {}};
             auto received = socket->recv(buffer.data(), buffer.size(), 0, remaining);
-            if (!received.ok()) return {classify_io(Result::Error::Receive, received.error), std::strerror(received.error), {}};
+            if (!received.ok()) return {classify_io_error(Result::Error::Receive, received.error), std::strerror(received.error), {}};
             if (received.transferred == 0) {
                 parsed = parser.finish(*response);
                 if (parsed.state == ParseState::Complete)
@@ -819,6 +855,8 @@ Result Client::do_request(const Request& request, const std::string& host, std::
             // 100 Continue 等 informational 响应不是最终结果；保留同一
             // recv 中的流水线剩余并重新建立响应对象，直到收到最终响应。
             if (status >= 100 && status < 200 && status != 101) {
+                if (++informational_count > 10)
+                    return {Result::Error::Parse, "too many informational responses", {}};
                 pending = parser.take_remaining();
                 *response = Response{};
                 parser.set_response_to_head(request.method == Method::Head);
