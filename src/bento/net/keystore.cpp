@@ -13,6 +13,7 @@
  * @copyright MIT License
  */
 
+#include "go2cpp/config/env.hpp"
 #include "go2cpp/bento/net/keystore.hpp"
 
 #include "go2cpp/encoding/base64.hpp"
@@ -372,16 +373,16 @@ error::ErrorPtr KeyStore::LoadFromString(std::string_view text) {
 }
 
 error::ErrorPtr KeyStore::LoadFromEnv(const std::string& variable) {
-    const char* value = std::getenv(variable.c_str());
-    if (value == nullptr) {
+    const auto value = go2cpp::config::GetEnv(variable);
+    if (!value.has_value()) {
         return error::NewError("keystore: environment variable '" + variable + "' is not set",
                                error::ErrorCode::kNotFound);
     }
-    if (*value == '\0') {
+    if (value->empty()) {
         return error::NewError("keystore: environment variable '" + variable + "' is empty",
                                error::ErrorCode::kInvalidArgument);
     }
-    return LoadDecoded(value, "environment");
+    return LoadDecoded(*value, "environment");
 }
 
 error::ErrorPtr KeyStore::LoadFromFile(const std::string& path) {

@@ -500,6 +500,37 @@ public:
     // 按名称返回非模板变量；不存在时返回空指针。
     /** @brief 以非模板基类指针查找配置变量。 */
     ConfigVarBase::ptr LookupBase(const std::string& name) const;
+
+    /**
+     * @brief 用 `GO2CPP_<PREFIX>_<MODULE>_<KEY>` 环境变量覆盖已注册变量。
+     *
+     * @details 环境变量是配置的外部来源，优先级高于默认值与已加载的文件值。
+     *          每个匹配项走 `ConfigVarBase::FromString`：转换/校验失败时该项
+     *          保持原值并继续处理其余项（环境变量在进程启动后通常不变，
+     *          部分失败比整批拒绝更容易定位）。
+     *          变量名规则：完整名 `module.key` 逐字符转大写、非字母数字转 `_`；
+     *          `prefix` 非空时作为第二段加在 `GO2CPP_` 之后（大小写不敏感）。
+     *          例：`prefix="envtest"`、变量 `svc.port`
+     *          → 环境变量 `GO2CPP_ENVTEST_SVC_PORT`。
+     *
+     * @param prefix [in] 环境变量前缀段（只保留字母数字，其它转 `_`）；
+     *        空串表示只加 `GO2CPP_`。借用，不保存。
+     * @param error [out] 首个失败项的诊断（`环境变量名: 原因`）；成功时写空串。
+     *        可为 nullptr。
+     * @return 实际应用成功的配置项数量；未设置对应环境变量的项不计入。
+     *
+     * ## 定位
+     * 启动期把部署环境注入配置的**唯一批量入口**：调用方应在
+     * `LoadFromFile`/`StartWatcher` 之后调用，让环境变量覆盖文件值。
+     * 读错会静默沿用默认值；因此启动日志应记录返回值与 error。
+     *
+     * ## 并发/失败语义
+     * - 逐项调用 `FromString`，每项内部加锁；整体**不是**事务，观察者可能看到
+     *   部分项已更新；
+     * - 单项失败不中断，继续处理后续项；`error` 只保留首个失败原因；
+     * - 不修改未设置环境变量的项，保留文件/默认值。
+     */
+    std::size_t FromEnv(const std::string& prefix, std::string* error = nullptr);
     // 预检所有已注册变量后批量应用 INI 中出现的键；预检、写入与广播在同一个
     // 可重入事务临界区内完成，观察者不会看到半批配置。
     /** @brief 先整体校验、再应用并原子发布 INI 配置。 */

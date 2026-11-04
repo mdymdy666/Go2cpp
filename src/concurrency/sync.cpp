@@ -30,6 +30,7 @@
  *
  * 因此这块的注释会特别强调**锁契约**，不要随意简化。
  */
+#include "go2cpp/config/env.hpp"
 #include "go2cpp/sync.hpp"
 
 #include "go2cpp/concurrency/core/futex_mutex.hpp"
@@ -126,8 +127,12 @@ namespace {
 /// @note 显式 noinline：这是 .so 初始化阶段只跑一次的冷代码，绝不能被内联
 ///       进任何热路径（getenv/atoi 会污染 Lock/Unlock 的代码布局）。
 GO2CPP_SYNC_COLD int ResolveHeldParkDefault() noexcept {
-    if (const char* value = std::getenv("GO2CPP_DETECT_HELD_PARK")) {
-        return std::atoi(value) != 0 ? 1 : 0;
+    try {
+        if (const auto value = ::go2cpp::config::GetEnv("GO2CPP_DETECT_HELD_PARK")) {
+            return std::atoi(value->c_str()) != 0 ? 1 : 0;
+        }
+    } catch (...) {
+        // 分配失败按未设置处理：默认值仍由 NDEBUG 决定。
     }
 #if !defined(NDEBUG)
     return 1;
@@ -2828,6 +2833,9 @@ struct WaitGroup::Impl {
      *       做免锁判空 —— 绝大多数 Done 没有任何等待者，不该进这把锁。
      */
     void CompleteWave(std::int64_t delta) noexcept {
+        // delta 只在调试事件里使用；当前未接入事件时显式忽略，避免
+        // -Wunused-parameter 告警（参数保留是为了接口与注释契约）。
+        (void)delta;
         std::deque<std::shared_ptr<WaitNode>> released;
         {
             // 归零批次：与 Wait 的入队在同一把锁内线性化。先标记本轮所有

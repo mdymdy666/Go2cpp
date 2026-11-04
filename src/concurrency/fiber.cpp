@@ -21,6 +21,7 @@
  * 本文件只调用 `context_backend` 的两个原语，具体寄存器操作在
  * `context_x64.S`。阅读时可以把"换栈"当成一个原子动作，不必跟进汇编。
  */
+#include "go2cpp/config/env.hpp"
 #include "go2cpp/fiber.hpp"
 
 #include "go2cpp/debug/debug_resources.hpp"
@@ -423,12 +424,17 @@ bool growable_stack_env_enabled() noexcept {
     // 路径。缓存一次结果，语义与 Go runtime「启动期读取环境变量」一致；
     // 运行期再 setenv 不会改变已经创建过的 Fiber 行为（本来也不保证）。
     static const bool enabled = [] {
-        const char* value = std::getenv("GO2CPP_GROWABLE_STACK");
-        if (value == nullptr || *value == '\0') {
+        try {
+            const auto value = go2cpp::config::GetEnv("GO2CPP_GROWABLE_STACK");
+            if (!value.has_value() || value->empty()) {
+                return true;
+            }
+            return (*value)[0] != '0' && *value != "false" &&
+                   *value != "off";
+        } catch (...) {
+            // 分配失败按未设置处理：默认启用可增长栈。
             return true;
         }
-        return value[0] != '0' && std::strcmp(value, "false") != 0 &&
-               std::strcmp(value, "off") != 0;
     }();
     return enabled;
 }

@@ -32,6 +32,7 @@
  * - `ReadFile` 的 `st_size` 只是容量提示；`os.max_file_size` 由读取循环**累计**
  *   判断 —— procfs 的 `st_size==0` 与「读期间被并发追加」都不能绕过上限。
  */
+#include "go2cpp/config/env.hpp"
 #include "go2cpp/os/file.hpp"
 #include "go2cpp/os/os.hpp"
 
@@ -1187,12 +1188,10 @@ std::optional<std::string> Getenv(const std::string& name) {
     if (name.empty() || detail::ContainsNul(name)) {
         return std::nullopt;
     }
-    // 必须拷贝：getenv 返回 libc 内部缓冲区指针，另一个线程 setenv 后即失效。
-    const char* value = ::getenv(name.c_str());
-    if (value == nullptr) {
-        return std::nullopt;
-    }
-    return std::string(value);
+    // 统一走配置来源适配层：os 原语（与 Setenv 成对）不直接调 getenv，
+    // 读取实现集中在一处，便于审计与测试隔离。返回的 std::string 是拷贝，
+    // 不持有 libc 缓冲区（并发 setenv 会使其失效）。
+    return go2cpp::config::GetEnv(name);
 }
 
 FileStatus Setenv(const std::string& name, const std::string& value, bool overwrite,

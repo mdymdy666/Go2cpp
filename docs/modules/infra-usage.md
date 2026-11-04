@@ -20,6 +20,13 @@
 - 唯一入口：`go2cpp::config::Config`（`include/go2cpp/config/config.hpp`），
   需要支持热更新时用 `watch.hpp` / `so_reloader.hpp`。
 - **禁止**：模块内散落 `getenv` / `secure_getenv` / 自己解析 ini、json、命令行。
+- 环境变量作为**外部来源**由配置层统一读取，模块不得直接 `getenv`：
+  - 批量注入：`Config::FromEnv(prefix)` 按 `GO2CPP_<PREFIX>_<MODULE>_<KEY>`
+    覆盖已注册变量（启动期在文件加载之后调用，优先级最高）；
+  - 单值读取：`go2cpp::config::GetEnv(name)` / `GetEnvOr(name, fallback)`
+    （`include/go2cpp/config/env.hpp`）。该头是 header-only，供不能依赖
+    `go2cpp_config` 的底层库（scheduler/sync/fiber）使用，避免
+    `config -> scheduler` 的循环依赖；返回值区分「未设置」与「空串」。
 - 理由：配置来源、优先级、类型转换、默认值、热更新与审计集中在一处；
   散落 `getenv` 无法被配置系统观测，也无法在测试中隔离。
 
@@ -127,6 +134,11 @@ bool Parse(const std::string& text) {
    走 `MemorySink`；
 3. 第三方库适配层（如 `src/bento/`、`third_party/` 封装）在**无法**避免时，
    必须在文件头注释说明原因，并把输出转发到 `go2cpp::logging`。
+4. `src/os/proc.cpp` 的子进程环境遍历（`environ` 继承）属于 POSIX 语义，
+   传递的是**子进程环境**而不是应用配置，保留 `::getenv`；
+5. `include/go2cpp/config/env.hpp` 是配置系统的环境变量来源适配层，其内联
+   `getenv` 属于 `src/config/` 实现的一部分（header-only 是为了避免
+   `go2cpp_config -> go2cpp_scheduler` 与底层库之间的循环依赖）。
 
 ## 4. ErrorScope：Fiber 链级多重错误
 
@@ -146,16 +158,16 @@ bool Parse(const std::string& text) {
 grep -rn "printf\|std::cout\|getenv" src/ | grep -v "logging/config"
 ```
 
-**统计时点（2026-11-04 11:05）真实结果：98 行命中**，真树
-`/UserData/CodexWorkSpace/Go2cpp`。注意该过滤串只能排除「同一行里出现
-logging/config 字样」的情况，几乎不排除目录，因此 98 基本等于全量。按目录
-排除 `src/logging/`、`src/config/` 后为 **96 行**；再排除纯注释行后为
-**91 行**待迁移。
+**当前结果（2026-11-04 11:42）：`scripts/check_infra_usage.sh` 报告 1 处**，即
+`src/os/proc.cpp:633` 的子进程环境继承（已列入第 3 节例外清单）。第二批
+迁移把 scheduler/sync/fiber/debug/hook/hash/bento/os-file/audio 的 13 处
+`getenv` 收敛到 `go2cpp::config::GetEnv`，加上首批 tunnel/os 的 42 处，
+基线从 91 行降到 1 行；config 新增 `FromEnv(prefix)` 批量环境变量来源。
 
-> 基线会漂移：撰写期间仓库有并行任务在改 `src/`，11:10 复测已是 99 / 92。
-> 以 `scripts/check_infra_usage.sh` 当次输出为准，本表只作量级参考。
+> 历史基线（2026-11-04 11:05）：`grep` 原始命令 98 行，排除
+> `src/logging/`、`src/config/` 后 96 行，再排除纯注释行 91 行。仅作量级参考。
 
-热点文件（非注释命中，前 10）：
+热点文件（迁移前基线，2026-11-04 11:05；首批与第二批已清零，仅供了解历史分布）：
 
 | 文件 | 命中 |
 |---|---:|

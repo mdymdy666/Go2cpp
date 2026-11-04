@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <unistd.h>
 #include <sstream>
@@ -211,6 +212,44 @@ void ScenarioValueEscaping() {
 }
 
 // ---------------------------------------------------------------------------
+// 场景 10：环境变量来源 FromEnv（设置生效 / 未设置保留默认值 / 非法值拒绝）
+// ---------------------------------------------------------------------------
+void ScenarioFromEnv() {
+    auto& cfg = go2cpp::config::Config::Instance();
+    const auto port = cfg.Lookup<int>("svc.port", -1, "x");
+    Check(port != nullptr, "svc.port missing before FromEnv");
+    if (!port) {
+        return;
+    }
+
+    // 10.1 未设置：不覆盖默认值，返回 0，error 为空。
+    ::unsetenv("GO2CPP_ENVTEST_SVC_PORT");
+    const int before = port->GetValue();
+    std::string error = "sentinel";
+    const std::size_t unset_applied = cfg.FromEnv("envtest", &error);
+    Check(unset_applied == 0, "FromEnv applied while env unset");
+    Check(port->GetValue() == before, "FromEnv changed value while env unset");
+    Check(error.empty(), "FromEnv reported error while env unset");
+
+    // 10.2 设置后生效：prefix 大小写不敏感，完整名转大写 + '.' -> '_'。
+    ::setenv("GO2CPP_ENVTEST_SVC_PORT", "9090", 1);
+    const std::size_t applied = cfg.FromEnv("envtest", &error);
+    Check(applied == 1, "FromEnv apply count wrong");
+    Check(port->GetValue() == 9090, "FromEnv value not applied");
+
+    // 10.3 非法值：该项保持旧值，error 记录原因，其余项不受影响。
+    ::setenv("GO2CPP_ENVTEST_SVC_PORT", "not-an-int", 1);
+    std::string bad_error;
+    const std::size_t bad_applied = cfg.FromEnv("envtest", &bad_error);
+    Check(bad_applied == 0, "FromEnv applied invalid value");
+    Check(port->GetValue() == 9090, "invalid env value overwrote config");
+    Check(!bad_error.empty(), "invalid env value did not set error");
+
+    ::unsetenv("GO2CPP_ENVTEST_SVC_PORT");
+    (void)port->FromString("8080");
+}
+
+// ---------------------------------------------------------------------------
 // 场景 9：并发注册/注销/导出（压测）
 // ---------------------------------------------------------------------------
 void ScenarioConcurrent() {
@@ -263,6 +302,8 @@ int main() {
     ScenarioValueEscaping();
     std::printf("[cfgmacro][场景9] 并发压测 6x120\n");
     ScenarioConcurrent();
+    std::printf("[cfgmacro][场景10] 环境变量来源 FromEnv\n");
+    ScenarioFromEnv();
 
     if (g_failures == 0) {
         std::printf("\n[cfgmacro] failures=0\n");

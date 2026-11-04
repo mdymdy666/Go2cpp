@@ -34,6 +34,7 @@
  * 假装可移植的空实现）。
  */
 
+#include "go2cpp/config/env.hpp"
 #include "go2cpp/debug/diagnostic_agent.hpp"
 
 #include "go2cpp/debug/debug_event_ring.hpp"
@@ -922,9 +923,9 @@ std::string DiagnosticAgent::ResolveSocketPath(const std::string& configured) {
     if (!configured.empty()) {
         return configured;
     }
-    const char* environment = std::getenv("GO2CPP_DOCTOR_SOCKET");
-    if (environment != nullptr && *environment != '\0') {
-        return environment;
+    const auto environment = go2cpp::config::GetEnv("GO2CPP_DOCTOR_SOCKET");
+    if (environment.has_value() && !environment->empty()) {
+        return *environment;
     }
     return DefaultSocketPath();
 }

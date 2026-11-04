@@ -18,6 +18,7 @@
  * 两段容量都是编译期常量，见 debug_event_ring.hpp。
  */
 
+#include "go2cpp/config/env.hpp"
 #include "go2cpp/debug/debug_event_ring.hpp"
 #include "go2cpp/debug/debug_resources.hpp"
 
@@ -631,15 +632,15 @@ void detail::EnsureDebugConfigEnv() noexcept {
     }
     DebugConfig config;
     bool ok = true;
-    const char* categories = std::getenv("GO2CPP_DEBUG_CATEGORIES");
-    if (categories != nullptr && *categories != '\0') {
-        ok = DebugConfig::ParseCategories(categories, &config);
+    const auto categories = go2cpp::config::GetEnv("GO2CPP_DEBUG_CATEGORIES");
+    if (categories.has_value() && !categories->empty()) {
+        ok = DebugConfig::ParseCategories(categories->c_str(), &config);
     }
-    const char* shift_text = std::getenv("GO2CPP_DEBUG_SAMPLE_SHIFT");
-    if (shift_text != nullptr && *shift_text != '\0') {
+    const auto shift_text = go2cpp::config::GetEnv("GO2CPP_DEBUG_SAMPLE_SHIFT");
+    if (shift_text.has_value() && !shift_text->empty()) {
         char* end = nullptr;
-        const unsigned long value = std::strtoul(shift_text, &end, 10);
-        if (end == shift_text || *end != '\0' || value > kMaxSampleShift) {
+        const unsigned long value = std::strtoul(shift_text->c_str(), &end, 10);
+        if (end == shift_text->c_str() || *end != '\0' || value > kMaxSampleShift) {
             ok = false;
         } else {
             config.sample_shift = static_cast<std::uint32_t>(value);
@@ -1407,16 +1408,22 @@ constexpr std::uint32_t kDefaultResourceChainSampleEvery = 16;
 constexpr std::size_t kMaxResourceEntries = 4096;
 
 std::uint32_t ReadSampleEnv(const char* name, std::uint32_t fallback) noexcept {
-    const char* text = std::getenv(name);
-    if (text == nullptr || *text == '\0') {
+    try {
+        const auto text = go2cpp::config::GetEnv(
+            name != nullptr ? std::string_view(name) : std::string_view{});
+        if (!text.has_value() || text->empty()) {
+            return fallback;
+        }
+        char* end = nullptr;
+        const unsigned long value = std::strtoul(text->c_str(), &end, 10);
+        if (end == text->c_str() || value == 0UL || value > 1000000UL) {
+            return fallback;
+        }
+        return static_cast<std::uint32_t>(value);
+    } catch (...) {
+        // noexcept 函数：读取失败退化为默认采样周期。
         return fallback;
     }
-    char* end = nullptr;
-    const unsigned long value = std::strtoul(text, &end, 10);
-    if (end == text || value == 0UL || value > 1000000UL) {
-        return fallback;
-    }
-    return static_cast<std::uint32_t>(value);
 }
 
 std::atomic<std::uint32_t>& StackEverySlot() {

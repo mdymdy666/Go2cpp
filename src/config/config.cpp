@@ -34,11 +34,14 @@
  */
 #include "go2cpp/config.hpp"
 
+#include "go2cpp/config/env.hpp"
+
 #include "go2cpp/tools/strconv_core.hpp"
 #include "go2cpp/tools/strings.hpp"
 
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
@@ -1234,6 +1237,61 @@ std::string RenderComment(const std::string& description) {
 }
 
 }  // namespace
+
+namespace {
+
+/// @brief 把配置名/前缀转为环境变量片段：大写，非字母数字统一为 `_`。
+/// @param text [in] UTF-8 文本；借用，不保存。
+/// @return 可直接拼进环境变量名的纯 ASCII 片段。
+std::string EnvToken(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (const char ch : text) {
+        const auto uch = static_cast<unsigned char>(ch);
+        out.push_back(std::isalnum(uch) != 0
+                          ? static_cast<char>(std::toupper(uch))
+                          : '_');
+    }
+    return out;
+}
+
+}  // namespace
+
+std::size_t Config::FromEnv(const std::string& prefix, std::string* error) {
+    if (error != nullptr) {
+        error->clear();
+    }
+    // step1: 环境变量名 = GO2CPP_ + [PREFIX_] + 完整名；prefix 用于多环境
+    //        隔离，避免同一进程里不同部署共用一套变量。
+    std::string env_prefix = "GO2CPP_";
+    if (!prefix.empty()) {
+        env_prefix += EnvToken(prefix);
+        env_prefix += '_';
+    }
+    // step2: 先取注册表快照再逐项应用：FromString 内部加锁，且监听器可能
+    //        再次读配置；持注册表锁遍历会与监听器形成锁反转。
+    const std::vector<ConfigVarBase::ptr> variables = List();
+    std::size_t applied = 0;
+    for (const auto& variable : variables) {
+        if (!variable) {
+            continue;
+        }
+        const std::string env_name = env_prefix + EnvToken(variable->name());
+        const auto value = config::GetEnv(env_name);
+        if (!value.has_value()) {
+            continue;
+        }
+        std::string apply_error;
+        if (!variable->FromString(*value, &apply_error)) {
+            if (error != nullptr && error->empty()) {
+                *error = env_name + ": " + apply_error;
+            }
+            continue;
+        }
+        ++applied;
+    }
+    return applied;
+}
 
 bool Config::Remove(const std::string& name) {
     std::lock_guard<std::mutex> lock(m_mutex);

@@ -27,6 +27,7 @@
  * @copyright MIT License
  */
 
+#include "go2cpp/config/env.hpp"
 #include "go2cpp/media/audio.hpp"
 
 #include "go2cpp/hash/fnv.hpp"
@@ -345,10 +346,11 @@ bool ExecutableExists(const char* name) {
     if (std::strchr(name, '/') != nullptr) {
         return ::access(name, X_OK) == 0;
     }
-    const char* path = std::getenv("PATH");
-    if (path == nullptr) {
+    const std::string path_text = go2cpp::config::GetEnvOr("PATH", {});
+    if (path_text.empty()) {
         return false;
     }
+    const char* path = path_text.c_str();
     std::string current;
     for (const char* cursor = path;; ++cursor) {
         if (*cursor == ':' || *cursor == '\0') {

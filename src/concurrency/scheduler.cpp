@@ -32,6 +32,7 @@
  *
  * 这些结论都来自 `build-bench`（Release）实测，改动这块之前请先看 codex.md。
  */
+#include "go2cpp/config/env.hpp"
 #include "go2cpp/scheduler/scheduler.hpp"
 
 #include "go2cpp/debug/debug_event_ring.hpp"
@@ -2400,8 +2401,14 @@ public:
         // 诊断旁路（默认不生效）：GO2CPP_NO_GROW=1 时直接跳过维护，
         // 用于判断 maybe_grow/reap_dead_workers 是否是 worker 劣化的来源。
         static const bool no_grow = [] {
-            const char* v = std::getenv("GO2CPP_NO_GROW");
-            return v != nullptr && v[0] == '1';
+            try {
+                const auto v = go2cpp::config::GetEnv("GO2CPP_NO_GROW");
+                return v.has_value() && !v->empty() && (*v)[0] == '1';
+            } catch (...) {
+                // 读取失败（内存分配失败）按未设置处理：诊断旁路绝不能
+                // 阻断正常入队路径。
+                return false;
+            }
         }();
         if (no_grow) {
             return;

@@ -7,6 +7,7 @@
  * @copyright BSD-3-Clause（算法按 FIPS 180-4 独立实现）
  */
 
+#include "go2cpp/config/env.hpp"
 #include "go2cpp/hash/sha256.hpp"
 
 #include <cassert>
@@ -373,7 +374,13 @@ bool ShaNiAvailable() noexcept {
 /// 用于在没有「无 SHA-NI 机器」的环境里验证回退路径的逐字节一致性。
 bool ShaNiEnabled() noexcept {
 #if GO2CPP_HASH_SHA_NI
-    return std::getenv("GO2CPP_HASH_DISABLE_SHA_NI") == nullptr && ShaNiAvailable();
+    try {
+        return !go2cpp::config::GetEnv("GO2CPP_HASH_DISABLE_SHA_NI").has_value() &&
+               ShaNiAvailable();
+    } catch (...) {
+        // 分配失败按未设置处理：仍走 CPU 探测结果。
+        return ShaNiAvailable();
+    }
 #else
     return false;
 #endif

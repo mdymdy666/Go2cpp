@@ -56,6 +56,7 @@
  * - `docs/hook-blocking-policy.md`：判定准则与 FIFO park 的实测数据；
  * - `docs/concurrency-park-points.md`：哪些函数会 park、哪些阻塞 M、哪些是纯计算。
  */
+#include "go2cpp/config/env.hpp"
 #include "go2cpp/hook.hpp"
 #include "go2cpp/config/config.hpp"
 
@@ -1465,8 +1466,13 @@ thread_local int t_sleep_eventfd = -1;
 /// - 未设置或 `0`：保持协作睡眠（默认，park 让出 M）。
 bool sleep_should_block() noexcept {
     static const bool value = [] {
-        const char* env = std::getenv("GO2CPP_SLEEP_BLOCKING");
-        return env != nullptr && *env != '0' && *env != '\0';
+        try {
+            const auto env = go2cpp::config::GetEnv("GO2CPP_SLEEP_BLOCKING");
+            return env.has_value() && !env->empty() && (*env)[0] != '0';
+        } catch (...) {
+            // 分配失败按未设置处理：保持协作睡眠的默认行为。
+            return false;
+        }
     }();
     return value;
 }
