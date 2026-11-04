@@ -9,6 +9,8 @@
 #include "go2cpp/network/hook.hpp"
 #include "go2cpp/network/socket_debug.hpp"
 
+#include "go2cpp/log.hpp"
+
 #include <arpa/inet.h>
 #include <cerrno>
 #include <fcntl.h>
@@ -429,11 +431,24 @@ void Socket::set_waiter(std::shared_ptr<SocketWaiter> waiter) noexcept { std::lo
 bool Socket::bind(const Address& address) {
     int fd = -1; if (!begin_operation(fd)) return false;
     const bool result = ::bind(fd, address.addr(), address.addr_len()) == 0;
+    if (!result) {
+        // 先固化 errno：to_string() 可能分配内存并覆盖它。
+        const int saved_errno = errno;
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("net.socket"))
+            << "bind failed: " << address.to_string()
+            << " errno=" << saved_errno;
+    }
     end_operation(); return result;
 }
 bool Socket::listen(int backlog) {
     int fd = -1; if (!begin_operation(fd)) return false;
     const bool result = ::listen(fd, backlog) == 0;
+    if (!result) {
+        const int saved_errno = errno;
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("net.socket"))
+            << "listen failed: fd=" << fd << " backlog=" << backlog
+            << " errno=" << saved_errno;
+    }
     end_operation(); return result;
 }
 bool Socket::SetTcpNoDelay(int fd) noexcept {

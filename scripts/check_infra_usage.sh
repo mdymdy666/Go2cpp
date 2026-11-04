@@ -14,14 +14,18 @@
 # 用法：
 #   scripts/check_infra_usage.sh            # 输出违规文件列表
 #   scripts/check_infra_usage.sh --verbose  # 附带 file:line 明细
+#   scripts/check_infra_usage.sh --coverage # 四类基础设施覆盖统计（不设门禁）
 #
 # 退出码：0 = 没有违规；1 = 存在违规；2 = 运行环境异常（不在仓库根等）。
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
 verbose=0
+coverage=0
 if [[ "${1:-}" == "--verbose" || "${1:-}" == "-v" ]]; then
     verbose=1
+elif [[ "${1:-}" == "--coverage" ]]; then
+    coverage=1
 fi
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -31,6 +35,41 @@ if [[ ! -d "${repo_root}/src" ]]; then
     exit 2
 fi
 cd "${repo_root}" || exit 2
+
+# --coverage：只报告 reflect / error / config / logging 四类的模块覆盖，
+# 不参与门禁（始终 exit 0）。统计口径与 docs/reports/infra-coverage.md 一致：
+# 按调用点计数，不按 include 计数；config/logging/reflect 自身是提供者，排除。
+if (( coverage == 1 )); then
+    consumers=0
+    with_reflect=0
+    with_error=0
+    with_config=0
+    with_log=0
+    printf '%-14s %9s %9s %9s %9s\n' "MODULE" "reflect" "error" "config" "log"
+    for dir in src/*/; do
+        mod=${dir#src/}; mod=${mod%/}
+        case "${mod}" in
+            config|logging|reflect) continue ;;
+        esac
+        consumers=$((consumers + 1))
+        r=$(grep -rE '\breflect::' "${dir}" 2>/dev/null | wc -l)
+        e=$(grep -rE '\bErrorPtr\b|\berror::MakeError\b' "${dir}" 2>/dev/null | wc -l)
+        c=$(grep -rE '\bconfig::Config\b|\bconfig::GetEnv\b' "${dir}" 2>/dev/null | wc -l)
+        l=$(grep -rE 'GO2CPP_LOG_' "${dir}" 2>/dev/null | wc -l)
+        (( r > 0 )) && with_reflect=$((with_reflect + 1))
+        (( e > 0 )) && with_error=$((with_error + 1))
+        (( c > 0 )) && with_config=$((with_config + 1))
+        (( l > 0 )) && with_log=$((with_log + 1))
+        printf '%-14s %9d %9d %9d %9d\n' "${mod}" "${r}" "${e}" "${c}" "${l}"
+    done
+    echo
+    printf '覆盖汇总（有使用的模块数 / 消费模块数 %d）：\n' "${consumers}"
+    printf '  reflect %2d / %d\n' "${with_reflect}" "${consumers}"
+    printf '  error   %2d / %d\n' "${with_error}" "${consumers}"
+    printf '  config  %2d / %d\n' "${with_config}" "${consumers}"
+    printf '  log     %2d / %d\n' "${with_log}" "${consumers}"
+    exit 0
+fi
 
 # grep 的命中行格式固定为 path:line:content；用 read 拆分，避免再嵌套 grep。
 declare -A file_counts=()

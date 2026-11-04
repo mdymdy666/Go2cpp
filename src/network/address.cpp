@@ -24,6 +24,8 @@
  * - IPv6 的 `%scope` 只接受十进制（`from_chars`），不解析接口名（如 `eth0`）。
  */
 #include "go2cpp/network/address.hpp"
+
+#include "go2cpp/log.hpp"
 #include "go2cpp/network/endian.hpp"
 
 #include <arpa/inet.h>
@@ -132,7 +134,14 @@ bool Address::Lookup(std::vector<Ptr>& result, const std::string& host,
     const int error = ::getaddrinfo(node.empty() ? nullptr : node.c_str(),
                                     service.empty() ? nullptr : service.c_str(),
                                     &hints, &list);
-    if (error != 0) return false;
+    if (error != 0) {
+        // 失败原因在 errno 之外（gai_strerror），调用方只能看到 bool；
+        // 这里补一条 WARN，不改变返回值与结果清空语义。
+        GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("net.address"))
+            << "getaddrinfo failed: host=" << host << " error=" << error
+            << " (" << ::gai_strerror(error) << ")";
+        return false;
+    }
     for (auto* item = list; item; item = item->ai_next) {
         auto address = Create(item->ai_addr, static_cast<socklen_t>(item->ai_addrlen));
         if (address) result.push_back(std::move(address));
