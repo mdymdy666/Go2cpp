@@ -450,8 +450,9 @@ void TestManualFiberDoesNotBlockCarrier() {
     GO2CPP_CHECK(!mutex_result.load(std::memory_order_acquire));
     GO2CPP_CHECK(!condition_result.load(std::memory_order_acquire));
     GO2CPP_CHECK(!group_result.load(std::memory_order_acquire));
+    // 手动 Fiber 无 Scheduler：channel 不能 park，返回明确的 kNoScheduler。
     GO2CPP_CHECK(channel_result.load(std::memory_order_acquire) ==
-                 go2cpp::ChannelStatus::kInvalid);
+                 go2cpp::ChannelStatus::kNoScheduler);
 
     // 即使 Context 已取消，手动 Fiber 也必须保留调用方持有的锁，
     // 不能走普通线程的 unlock/relock 路径而阻塞 carrier。

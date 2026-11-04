@@ -1,4 +1,5 @@
 #include "go2cpp/channel.hpp"
+#include "go2cpp/concurrency/fiber.hpp"
 #include "go2cpp/core/timer.hpp"
 #include "go2cpp/scheduler.hpp"
 #include "test_support.hpp"
@@ -7,6 +8,8 @@
 #include <chrono>
 #include <deque>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -96,6 +99,57 @@ void run_channel_tests() {
     GO2CPP_CHECK(closed.ValueOrDefault() == 0);
     GO2CPP_CHECK(close_channel->Close().status == ChannelStatus::kAlreadyClosed);
     GO2CPP_CHECK(close_channel->Send(8).Closed());
+
+    // 关闭后发送：现有 Send 保持返回 kClosed（可区分），新增 SendOrThrow
+    // 对齐 Go 的 panic("send on closed channel")。
+    bool closed_send_threw = false;
+    std::string closed_send_what;
+    try {
+      close_channel->SendOrThrow(9);
+    } catch (const std::logic_error& error) {
+      closed_send_threw = true;
+      closed_send_what = error.what();
+    }
+    GO2CPP_CHECK(closed_send_threw);
+    GO2CPP_CHECK(closed_send_what == "send on closed channel");
+    bool closed_view_threw = false;
+    try {
+      AsSendOnly(close_channel).SendOrThrow(10);
+    } catch (const std::logic_error&) {
+      closed_view_threw = true;
+    }
+    GO2CPP_CHECK(closed_view_threw);
+
+    // 手动 Fiber（无 Scheduler）不能 park：状态必须是明确的
+    // kNoScheduler，且状态名与错误文本都能读出原因，而不是笼统的 kInvalid。
+    auto unbound = MakeChannel<int>(0);
+    ChannelSendResult manual_send;
+    ChannelRecvResult<int> manual_recv;
+    ChannelStatus manual_select = ChannelStatus::kReady;
+    bool manual_send_threw = false;
+    Fiber manual_fiber([&] {
+      manual_send = unbound->Send(1);
+      manual_recv = unbound->Recv();
+      manual_select = Select({RecvCase(unbound)}).status;
+      // SendOrThrow 在手动 Fiber 里同样是 kNoScheduler -> runtime_error，
+      // 不能落回 native 等待（那会永久 park）。
+      try {
+        unbound->SendOrThrow(2);
+      } catch (const std::runtime_error& error) {
+        manual_send_threw =
+            std::string(error.what()).find("kNoScheduler") != std::string::npos;
+      }
+    });
+    GO2CPP_CHECK(manual_fiber.resume());
+    GO2CPP_CHECK(manual_send.status == ChannelStatus::kNoScheduler);
+    GO2CPP_CHECK(manual_recv.status == ChannelStatus::kNoScheduler);
+    GO2CPP_CHECK(manual_select == ChannelStatus::kNoScheduler);
+    GO2CPP_CHECK(std::string(ChannelStatusName(ChannelStatus::kNoScheduler)) ==
+                 "kNoScheduler");
+    GO2CPP_CHECK(manual_send.error != nullptr);
+    GO2CPP_CHECK(manual_send.error->Message().find("scheduler") !=
+                 std::string::npos);
+    GO2CPP_CHECK(manual_send_threw);
 
     const auto nil_send = SendChecked<int>({}, 1);
     GO2CPP_CHECK(nil_send.status == ChannelStatus::kNil);
@@ -503,7 +557,9 @@ void run_channel_tests() {
         std::atomic<long long> bulk_sum{0};
         std::thread bulk_producer([&] {
             for (int i = 0; i < kRingTotal; ++i) {
-                bulk->Send(i);
+                // 消费者持续接收、容量 7，理论上不会失败；用 (void) 显式
+                // 承认这里不检查返回值，满足 [[nodiscard]] 契约。
+                (void)bulk->Send(i);
             }
         });
         std::thread bulk_consumer([&] {

@@ -49,11 +49,17 @@
  *
  * - 无缓冲 channel 的 `Send` 会等到有接收者（会 park），`cap==0` 不分配缓冲；
  * - `Close` 后 `Recv` 返回 `kClosed`；对已关闭的 channel `Send` 返回
- *   `kClosed`（不抛异常）；`kAlreadyClosed` 只用于重复 `Close()`；
+ *   `kClosed`（可区分、不抛异常）；`kAlreadyClosed` 只用于重复 `Close()`；
+ * - `ChannelSendResult`/`ChannelRecvResult` 标了 `[[nodiscard]]`：忽略
+ *   Send/Recv 返回值会在编译期告警——关闭后的 `kClosed` 绝不能被当成
+ *   发送成功；需要“关闭即异常”的调用方用 `SendOrThrow`（抛
+ *   `std::logic_error("send on closed channel")`，对齐 Go 的 panic）；
  * - 排空语义：关闭后仍能把缓冲区里的剩余值读完，再收 `kClosed` 退出
  *   （没有 `Range` 成员，需要调用方循环 `Recv`）；
- * - 手动 Fiber（未归属 Scheduler）里 `Select` 返回 `kInvalid`，而
- *   `ParkingCondition` 返回 `kCancelled` —— 两者语义不同，别当成等价。
+ * - 手动 Fiber（未归属 Scheduler）里 `Send`/`Recv`/`Select` 返回明确的
+ *   `kNoScheduler`（不再是笼统的 `kInvalid`），`ChannelStatusName()` 与
+ *   `error->Message()` 都能读出原因；该场景下 `ParkingCondition` 返回
+ *   `kCancelled` —— 两者语义不同，别当成等价。
  */
 #pragma once
 
@@ -87,6 +93,8 @@
 #include <new>
 #include <optional>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <typeinfo>
@@ -124,7 +132,42 @@ enum class ChannelStatus {
   kTimedOut,
   kNil,
   kInvalid,
+  /// @brief 需要受管 Scheduler 才能 park，但当前上下文没有（典型：手动 Fiber）。
+  kNoScheduler,
 };
+
+/**
+ * @brief 把 `ChannelStatus` 转成稳定的可读名（日志、测试断言、异常文本用）。
+ *
+ * @param status [in] 任意 `ChannelStatus` 值。
+ * @return 形如 `"kNoScheduler"` 的静态字符串；未知值返回 `"kUnknown"`。
+ *         调用方**不要**释放返回值（静态存储，进程生命周期有效）。
+ */
+inline const char* ChannelStatusName(ChannelStatus status) noexcept {
+  switch (status) {
+    case ChannelStatus::kReady:
+      return "kReady";
+    case ChannelStatus::kWouldBlock:
+      return "kWouldBlock";
+    case ChannelStatus::kClosed:
+      return "kClosed";
+    case ChannelStatus::kAlreadyClosed:
+      return "kAlreadyClosed";
+    case ChannelStatus::kCancelled:
+      return "kCancelled";
+    case ChannelStatus::kDeadlineExceeded:
+      return "kDeadlineExceeded";
+    case ChannelStatus::kTimedOut:
+      return "kTimedOut";
+    case ChannelStatus::kNil:
+      return "kNil";
+    case ChannelStatus::kInvalid:
+      return "kInvalid";
+    case ChannelStatus::kNoScheduler:
+      return "kNoScheduler";
+  }
+  return "kUnknown";
+}
 
 /** @brief 判断状态是否代表一次可交付的结果。 */
 inline bool ChannelStatusIsReady(ChannelStatus status) noexcept {
@@ -141,6 +184,8 @@ ErrorPtr ChannelWouldBlockError() noexcept;
 ErrorPtr ChannelNilError() noexcept;
 /** @brief 创建通道超时错误。 */
 ErrorPtr ChannelTimeoutError() noexcept;
+/** @brief 创建“当前上下文无法安全 park”错误（手动 Fiber 未绑定 Scheduler）。 */
+ErrorPtr ChannelNoSchedulerError() noexcept;
 
 // SelectValue 是 select 结果使用的共享类型擦除载体。它不要求实际值可复制，
 // 用户可以通过 Get/Take 或 SelectCaster 将它转换成自己的业务类型。
@@ -378,6 +423,7 @@ inline go2cpp::debug::ResourceResult ChannelDebugResult(
       return go2cpp::debug::ResourceResult::kTimeout;
     case ChannelStatus::kNil:
     case ChannelStatus::kInvalid:
+    case ChannelStatus::kNoScheduler:
       return go2cpp::debug::ResourceResult::kFailed;
   }
   return go2cpp::debug::ResourceResult::kFailed;
@@ -464,8 +510,15 @@ std::shared_ptr<const SelectCaster> SelectCaster::Create(Function&& function) {
       std::forward<Function>(function));
 }
 
-/** @brief Channel 发送操作的状态和错误结果。 */
-struct ChannelSendResult {
+/**
+ * @brief Channel 发送操作的状态和错误结果。
+ *
+ * @note 本类型标了 `[[nodiscard]]`：`Send`/`SendFor`/`TrySend` 的返回值
+ *       不允许静默丢弃。关闭后 `Send` 返回 `kClosed`（可区分、不抛异常），
+ *       丢弃它等于把“消息没发出去”伪装成成功；需要关闭即异常的代码改用
+ *       `Channel<T>::SendOrThrow`。
+ */
+struct [[nodiscard]] ChannelSendResult {
   ChannelStatus status{ChannelStatus::kInvalid};
   ErrorPtr error;
 
@@ -481,6 +534,31 @@ struct ChannelSendResult {
            status == ChannelStatus::kTimedOut;
   }
   explicit operator bool() const noexcept { return Ok(); }
+};
+
+/**
+ * @brief `Channel::Close()` 的结果。
+ *
+ * @details 字段与 `ChannelSendResult` 一致，便于继续按状态判断；但本类型
+ *   **不标** `[[nodiscard]]`——Go 的 `close(ch)` 没有返回值，关闭是幂等
+ *   清理动作，忽略其结果不属于“静默丢消息”。真正需要强制检查的是
+ *   `Send`/`Recv`，它们的返回类型仍是 `[[nodiscard]]`。
+ */
+struct ChannelCloseResult {
+  ChannelStatus status{ChannelStatus::kInvalid};
+  ErrorPtr error;
+
+  bool Ok() const noexcept { return status == ChannelStatus::kReady; }
+  bool AlreadyClosed() const noexcept {
+    return status == ChannelStatus::kAlreadyClosed;
+  }
+  bool Closed() const noexcept {
+    return status == ChannelStatus::kClosed ||
+           status == ChannelStatus::kAlreadyClosed;
+  }
+  explicit operator bool() const noexcept { return Ok(); }
+  /// @brief 兼容旧代码：允许用 `ChannelSendResult` 接收 Close 的结果。
+  operator ChannelSendResult() const { return {status, error}; }
 };
 
 /** @brief Select case 试探结果，包含可选类型擦除值。 */
@@ -1145,7 +1223,7 @@ void ChannelWakeManaged(WaitNodeBase* node) noexcept;
 
 /** @brief Channel 接收操作的值、成功标记和状态。 */
 template <typename T>
-struct ChannelRecvResult {
+struct [[nodiscard]] ChannelRecvResult {
   std::optional<T> value;
   bool ok{false};
   bool ready{false};
@@ -1573,6 +1651,42 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     }
   }
 
+  /**
+   * @brief 发送一个值；channel 已关闭时抛 `std::logic_error`，其它失败抛
+   *        `std::runtime_error`。
+   *
+   * @param value [in] 要发送的值（按值传入，成功时移动进 channel）。
+   * @param context [in] 可选取消上下文；`Done()` 触发时按取消失败抛出。
+   *
+   * @throw std::logic_error channel 已关闭——消息固定为
+   *        `"send on closed channel"`，对齐 Go 的
+   *        `panic("send on closed channel")`；调用方**不要**吞掉，
+   *        这是编程错误（向已关闭 channel 发送）。
+   * @throw std::runtime_error 其它非成功状态（取消/超时/手动 Fiber 无法
+   *        park 等），`what()` 包含 `ChannelStatusName(status)`；调用方
+   *        **应该**按可恢复失败处理。
+   *
+   * ## 定位
+   * 关闭后发送的**显式失败出口**。现有 `Send` 保持返回 `kClosed` 不变
+   * （兼容既有调用方）；本函数供“关闭即 bug”的新代码使用，使失败无法
+   * 被静默丢弃。
+   *
+   * ## 并发/失败语义
+   * - 等价于 `Send` + 结果判定，不改变 channel 状态机；
+   * - 关闭判定复用 `ChannelSendResult::Closed()`，与 `Send` 的关闭路径同源；
+   * - 只在 `Send` 返回后（锁外）抛异常，不会把异常带进等待队列。
+   */
+  void SendOrThrow(T value, const ContextPtr& context = {}) {
+    const ChannelSendResult result = Send(std::move(value), context);
+    if (result.Closed()) {
+      throw std::logic_error("send on closed channel");
+    }
+    if (!result.Ok()) {
+      throw std::runtime_error(std::string("send failed: ") +
+                               ChannelStatusName(result.status));
+    }
+  }
+
   // 最多等待 timeout 发送；返回 ChannelSendResult 状态和错误。
   ChannelSendResult SendFor(T value, Duration timeout,
                             const ContextPtr& context = {}) {
@@ -1704,7 +1818,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
    * - 失败语义：noexcept；任何节点唤醒失败都不会中断关闭流程。
    * - 不变量：返回后 `m_senders`/`m_receivers` 为空，不存在无人负责的等待节点。
    */
-  ChannelSendResult Close() noexcept {
+  ChannelCloseResult Close() noexcept {
       // step1: 持自旋锁，已关闭直接返回 kAlreadyClosed（noexcept，不抛异常）。
       // step2: 置 m_closed 并让 generation 前进，使 WaitForChange/select 观察者能感知状态变化。
       // step3: 逐个摘链发送者：select 节点用 kClosed 探测尝试提交，失败就 Cancel 该 select；普通节点写 closed/status/signal 后 WakeNodeLocked。
@@ -2761,7 +2875,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
    *   否则等待者会永远留在队列里，且 generation 不前进会让 select 看不到变化；
    * - **`nonblocking` 与 `deadline` 的交互**：无空位且已到 deadline 时，
    *   非阻塞返回 `kWouldBlock`，阻塞返回 `kTimedOut`——两者的 `errno` 语义不同；
-   * - **Fiber 不支持时返回 `kInvalid`**（手动 Fiber 无法 park），
+   * - **Fiber 不支持时返回 `kNoScheduler`**（手动 Fiber 无法 park），
    *   绝不阻塞 carrier 线程。
    */
   ChannelSendResult SendUntil(T value, std::optional<TimePoint> deadline,
@@ -2900,7 +3014,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
       return {ChannelStatus::kTimedOut, ChannelTimeoutError()};
     }
     if (core::ParkingCondition::FiberWaitUnsupported()) {
-      return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+      return {ChannelStatus::kNoScheduler, ChannelNoSchedulerError()};
     }
 
     // step5: 登记节点并挂 context 取消回调。节点从线程本地池取，稳态零分配。
@@ -2917,7 +3031,7 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     node->generation = NextWaiterGeneration();
     if (!native_caller && !detail::ChannelBindManaged(node)) {
       ReleaseSendNode(node);
-      return {ChannelStatus::kInvalid, detail::ValueOperationError()};
+      return {ChannelStatus::kNoScheduler, ChannelNoSchedulerError()};
     }
     m_senders.push_back(node);
     // 窗口闭合：注册取消回调期间释放过 Channel 锁，可能已有接收者入队或
@@ -3284,8 +3398,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
               ChannelTimeoutError()};
     }
     if (core::ParkingCondition::FiberWaitUnsupported()) {
-      return {std::nullopt, false, true, ChannelStatus::kInvalid,
-              detail::ValueOperationError()};
+      return {std::nullopt, false, true, ChannelStatus::kNoScheduler,
+              ChannelNoSchedulerError()};
     }
 
     PendingRecv* node = nullptr;
@@ -3298,8 +3412,8 @@ class Channel final : public std::enable_shared_from_this<Channel<T>>
     node->generation = NextWaiterGeneration();
     if (!native_caller && !detail::ChannelBindManaged(node)) {
       ReleaseRecvNode(node);
-      return {std::nullopt, false, true, ChannelStatus::kInvalid,
-              detail::ValueOperationError()};
+      return {std::nullopt, false, true, ChannelStatus::kNoScheduler,
+              ChannelNoSchedulerError()};
     }
     m_receivers.push_back(node);
     // 窗口闭合：注册取消回调期间可能已有发送者入队（与 SendUntil 对称）。
@@ -3630,6 +3744,19 @@ class SendOnlyChannel final {
     return SendChecked(m_channel, std::move(value), context);
   }
 
+  /// @brief 同 `Channel<T>::SendOrThrow`；nil 视图抛 `std::runtime_error`。
+  void SendOrThrow(T value, const ContextPtr& context = {}) const {
+    const ChannelSendResult result =
+        SendChecked(m_channel, std::move(value), context);
+    if (result.Closed()) {
+      throw std::logic_error("send on closed channel");
+    }
+    if (!result.Ok()) {
+      throw std::runtime_error(std::string("send failed: ") +
+                               ChannelStatusName(result.status));
+    }
+  }
+
   ChannelSendResult SendFor(T value, ContextDuration timeout,
                             const ContextPtr& context = {}) const {
     if (!m_channel) {
@@ -3645,7 +3772,7 @@ class SendOnlyChannel final {
     return m_channel->TrySend(std::move(value));
   }
 
-  ChannelSendResult Close() const noexcept {
+  ChannelCloseResult Close() const noexcept {
     if (!m_channel) {
       return {ChannelStatus::kNil, ChannelNilError()};
     }

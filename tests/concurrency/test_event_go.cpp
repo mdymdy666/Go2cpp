@@ -117,10 +117,10 @@ void check_stop_and_reset() {
  * @brief 手动 Fiber（无 Scheduler 归属）中调用 Select 必须立即失败而非阻塞。
  * @details 源码 `src/concurrency/channel.cpp:189-193` 在进入等待**之前**检查
  *          `ParkingCondition::FiberWaitUnsupported()`，是 Fiber 且无 Scheduler 时
- *          返回 `kInvalid`。若该检查缺失或缺位，Select 会退化到 native 等待并
+ *          返回 `kNoScheduler`。若该检查缺失或缺位，Select 会退化到 native 等待并
  *          整条占住 carrier OS 线程——这是最危险的回归之一。
  * @note 与 `ParkingCondition` 自身在同类情形返回 `kCancelled` 不同：
- *       Select 在更外层提前失败，返回的是 `kInvalid`。
+ *       Select 在更外层提前失败，返回的是 `kNoScheduler`。
  */
 void check_manual_fiber_select_rejected() {
     auto channel = go2cpp::MakeChannel<int>(1);
@@ -133,7 +133,7 @@ void check_manual_fiber_select_rejected() {
     });
     GO2CPP_REQUIRE(fiber.resume());
     GO2CPP_REQUIRE(ran);
-    GO2CPP_CHECK(observed == go2cpp::ChannelStatus::kInvalid);
+    GO2CPP_CHECK(observed == go2cpp::ChannelStatus::kNoScheduler);
 }
 
 /** @brief go(scheduler, fn) 与 go(fn) 两个入口都能提交并等待任务。 */

@@ -301,6 +301,12 @@ ErrorPtr ChannelTimeoutError() noexcept {
   return error;
 }
 
+ErrorPtr ChannelNoSchedulerError() noexcept {
+  static const ErrorPtr error = make_channel_error(
+      "channel wait unsupported: current fiber has no scheduler");
+  return error;
+}
+
 /**
  * @brief 在多个 channel 操作之间做多路复用（Go 的 `select`）。
  *
@@ -529,8 +535,7 @@ SelectResult Select(const std::vector<SelectCase>& cases,
     }
     if (core::ParkingCondition::FiberWaitUnsupported()) {
       return {SelectResult::kNoSelection, false, false, {},
-              ChannelStatus::kInvalid,
-              detail::ValueOperationError()};
+              ChannelStatus::kNoScheduler, ChannelNoSchedulerError()};
     }
 
     // step3 开始：注册阶段。为本次等待创建共享状态，然后把每个 case
