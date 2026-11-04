@@ -433,7 +433,7 @@ inline void DispatchLoop(SignalHub* hub) noexcept {
                 const Signal value(number);
                 for (const auto& channel : targets) {
                     if (channel) {
-                        channel->TrySend(value);  // 非阻塞：满了就丢
+                        (void)channel->TrySend(value);  // 信号通道满时丢弃（系统信号不阻塞）  // 非阻塞：满了就丢
                     }
                 }
             }

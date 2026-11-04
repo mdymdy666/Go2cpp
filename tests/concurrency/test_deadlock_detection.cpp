@@ -90,12 +90,14 @@ void ChannelDeadlock() {
     auto left = MakeChannel<int>(0);
     auto right = MakeChannel<int>(0);
     std::thread first([&] {
-        left->Send(1);   // 无接收者：永久 park
-        right->Recv();
+        // 故意构造死锁：Send 永不返回，返回值（[[nodiscard]]）不可达，显式
+        // 丢弃以满足 -Werror 的零告警要求。
+        (void)left->Send(1);
+        (void)right->Recv();
     });
     std::thread second([&] {
-        right->Send(2);  // 无接收者：永久 park
-        left->Recv();
+        (void)right->Send(2);
+        (void)left->Recv();
     });
     first.join();
     second.join();

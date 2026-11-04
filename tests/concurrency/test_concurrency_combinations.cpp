@@ -348,7 +348,9 @@ void TestReadWriteCacheCancel() {
             mutex.Lock();
             ++cache.version;
             mutex.Unlock();
-            invalidation->TrySend(i);
+            // 通知通道满/关闭时丢弃是测试本意（缓存失效只是提示），
+            // 显式丢弃 [[nodiscard]] 结果以保持零告警。
+            (void)invalidation->TrySend(i);
             std::this_thread::sleep_for(100us);
         }
     });
