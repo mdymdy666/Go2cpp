@@ -501,7 +501,11 @@ void test_native_fallback_grows_replacement_m() {
         go2cpp::ScopedThreadHookMode disabled(
             go2cpp::ThreadHookMode::kDisabled);
         entered.store(true, std::memory_order_release);
-        const timespec request{0, 50 * 1000 * 1000};
+        // 300ms 必须显著大于 SchedulerConfig::long_syscall_threshold
+        // （默认 50ms）：sysmon 只在阻塞**超过**阈值后才标记 long_syscall
+        // 并补 replacement M。此前这里是 50ms —— 与阈值相等，阻塞在阈值
+        // 判定前就结束，sysmon 永远观察不到，worker_count()>=2 必然失败。
+        const timespec request{0, 300 * 1000 * 1000};
         (void)::nanosleep(&request, nullptr);
     });
     GO2CPP_CHECK(wait_until(entered));

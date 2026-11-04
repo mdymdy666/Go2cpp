@@ -1390,6 +1390,12 @@ void TestScenarioConfigHotReload() {
             while (!done.load(std::memory_order_acquire)) {
                 mutex.RLock();
                 const Config snapshot = config;
+                // `RUnlock` 是 release 操作，只保证之前的写不下沉，不约束
+                // 普通读；-O3 下编译器可以把 snapshot 的加载下沉到
+                // RUnlock 之后，导致读者读到写者正在改写的中间态（实测
+                // 撕裂率 0.15%~2.2%，-O0 与加屏障后均为 0）。这里用纯编译
+                // 器屏障把拷贝锚定在临界区内，零运行时开销。
+                std::atomic_signal_fence(std::memory_order_seq_cst);
                 mutex.RUnlock();
                 if (snapshot.checksum != checksum_of(snapshot.values)) {
                     torn_reads.fetch_add(1, std::memory_order_relaxed);

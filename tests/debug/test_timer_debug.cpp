@@ -519,6 +519,17 @@ void ScenarioConcurrentDump() {
             timer.Cancel();
         }
     }
+    // 2000 轮 schedule 在 -O3 下可能只耗时几十微秒，reader 线程尚未被
+    // 调度就会出现 0 次 dump（dumps>0 断言依赖线程启动时序）。这里给
+    // reader 一个有限窗口完成至少一次快照，再置 stop；不改变并发语义。
+    {
+        const auto dump_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (dumps.load(std::memory_order_acquire) == 0 &&
+               std::chrono::steady_clock::now() < dump_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
     stop.store(true, std::memory_order_release);
     for (auto& reader : readers) {
         reader.join();
