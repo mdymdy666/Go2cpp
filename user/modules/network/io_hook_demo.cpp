@@ -11,7 +11,7 @@
 /**
  * @brief 演示 Hook 后的 socket 接收、发送和 SO_RCVTIMEO 超时行为。
  * @details 读 Fiber 在没有数据时交还执行权，写 Fiber 发送数据后唤醒读者；
- *          第二次读取验证系统级超时仍会转换为 ETIMEDOUT。
+ *          第二次读取验证系统级超时按 POSIX socket(7) 转换为 EAGAIN。
  * @return 数据接收和超时检查均通过时返回 0。
  */
 int main() {
@@ -44,9 +44,11 @@ int main() {
         received.store(first_ok);
         std::clog << "[hook-io][场景1] recv=" << first_ok << " value=" << value << '\n';
         const int result = static_cast<int>(::recv(sockets[0], &value, 1, 0));
-        timed_out.store(result == -1 && errno == ETIMEDOUT);
+        // POSIX socket(7)：SO_RCVTIMEO 到期返回 EAGAIN（与「缓冲区空」同义），
+        // 不是 ETIMEDOUT；hook 层有意保留该语义（src/network/hook.cpp）。
+        timed_out.store(result == -1 && (errno == EAGAIN || errno == EWOULDBLOCK));
         std::clog << "[hook-io][场景2] SO_RCVTIMEO result=" << result
-                  << " errno=" << errno << "（预期 ETIMEDOUT）\n";
+                  << " errno=" << errno << "（预期 EAGAIN=" << EAGAIN << "）\n";
     });
     auto writer = manager.Go([&] {
         ::usleep(20000);

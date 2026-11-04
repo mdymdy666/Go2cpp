@@ -910,7 +910,7 @@ void ScenarioTimerMatrix() {
 // 4. Channel 关闭态矩阵
 // ===========================================================================
 
-const char* ChannelStatusName(go2cpp::ChannelStatus status) {
+const char* LocalChannelStatusName(go2cpp::ChannelStatus status) {
     switch (status) {
         case go2cpp::ChannelStatus::kReady: return "kReady";
         case go2cpp::ChannelStatus::kWouldBlock: return "kWouldBlock";
@@ -979,8 +979,8 @@ void ScenarioChannelMatrix() {
             const ChannelStatus expected =
                 closed ? item.closed_expected : item.open_expected;
             Check(actual == expected, name + ": 实际=" +
-                                          ChannelStatusName(actual) + " 期望=" +
-                                          ChannelStatusName(expected));
+                                          LocalChannelStatusName(actual) + " 期望=" +
+                                          LocalChannelStatusName(expected));
         }
     }
 }

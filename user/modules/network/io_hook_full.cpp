@@ -13,7 +13,7 @@
 //   2  IOManager + hook recv  受管 Fiber 里用原生 recv，无数据时交还执行权
 //   3  hook send              写端发送后唤醒读者
 //   4  ★ 读 Fiber 不阻塞 M     P=1 下"读者先等、写者后发"仍能跑通
-//   5  SO_RCVTIMEO 超时        系统级超时转换成 ETIMEDOUT
+//   5  SO_RCVTIMEO 超时        按 POSIX socket(7) 转换成 EAGAIN
 //   6  ScopedIOManagerBinding 作用域绑定/解绑 IOManager
 //   7  connect_timeout        读写该超时配置
 //
@@ -136,7 +136,7 @@ bool scenario_reader_does_not_block_m(go2cpp::IOManager& manager) {
 }
 
 bool scenario_recv_timeout(go2cpp::IOManager& manager) {
-    std::clog << "[full][场景5] SO_RCVTIMEO 转换为 ETIMEDOUT\n";
+    std::clog << "[full][场景5] SO_RCVTIMEO 转换为 EAGAIN（POSIX socket(7)）\n";
     SocketPair pair;
     if (!pair.open() || !set_recv_timeout(pair.fds[0], 100000)) {
         return false;
@@ -147,11 +147,13 @@ bool scenario_recv_timeout(go2cpp::IOManager& manager) {
         char value = 0;
         const auto result = ::recv(pair.fds[0], &value, 1, 0);
         seen_errno.store(errno);
-        timed_out.store(result == -1 && errno == ETIMEDOUT);
+        // POSIX socket(7)：SO_RCVTIMEO 到期返回 EAGAIN（与「缓冲区空」同义），
+        // 不是 ETIMEDOUT；hook 层有意保留该语义（src/network/hook.cpp）。
+        timed_out.store(result == -1 && (errno == EAGAIN || errno == EWOULDBLOCK));
     });
     (void)reader->wait_for(std::chrono::seconds(3));
     std::cout << "  超时=" << timed_out.load() << " errno=" << seen_errno.load()
-              << "（预期超时=1，errno=" << ETIMEDOUT << "）\n";
+              << "（预期超时=1，errno=" << EAGAIN << "）\n";
     return timed_out.load();
 }
 
