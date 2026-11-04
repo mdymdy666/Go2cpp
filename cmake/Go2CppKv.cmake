@@ -106,6 +106,14 @@ if (GO2CPP_BUILD_TESTS)
     add_test(NAME go2cpp_kv_bench COMMAND go2cpp_kv_bench --n=1000000)
     set_tests_properties(go2cpp_kv_bench PROPERTIES TIMEOUT 900)
 
+    # ---- 审计：异常路径 / 生命周期 / 并发刷盘（2026-11-04） ----
+    add_executable(go2cpp_storage_audit_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/storage/storage_audit_test.cpp)
+    target_link_libraries(go2cpp_storage_audit_test PRIVATE go2cpp_kv)
+    target_compile_options(go2cpp_storage_audit_test PRIVATE -Wall -Wextra)
+    add_test(NAME go2cpp_storage_audit_test COMMAND go2cpp_storage_audit_test)
+    set_tests_properties(go2cpp_storage_audit_test PROPERTIES TIMEOUT 600)
+
     # ---- 功能层：Queue（MQ）/ Watch（订阅）/ MemCache（内存缓存） ----
     # 三者共用同一个 LSM：Queue/Watch 的游标是 KV 记录，MemCache 可写穿。
     foreach(feature queue watch memcache)

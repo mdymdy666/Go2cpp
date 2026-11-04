@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -554,8 +555,11 @@ bool KV::Impl::Recover() {
   std::uint64_t recovered_bytes = 0;
   for (const auto& f : log_files) {
     WalReader reader(opt_);
+    // 打开失败（权限/IO）不能静默跳过：跳过等于把这段已确认写丢弃，
+    // 且 Open 仍返回成功，调用方无从得知。
     if (!reader.Open(JoinPath(dir_, f.second))) {
-      continue;
+      SetError("cannot open wal: " + f.second);
+      return false;
     }
     std::string record;
     while (reader.ReadRecord(&record)) {
@@ -565,6 +569,13 @@ bool KV::Impl::Recover() {
       }
       ++recovered_records;
       recovered_bytes += record.size();
+    }
+    if (reader.corrupted()) {
+      // 半写尾部是崩溃恢复的正常现象：截断点之前的记录已重放，之后的
+      // 记录未确认，丢弃即可；但必须留下可见痕迹，便于排查数据少了一块。
+      GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("storage"))
+          << "WAL " << f.second << " has a partial/corrupt tail; "
+          << "records after the damage are dropped";
     }
   }
   if (recovered_records > 0) {
@@ -592,6 +603,23 @@ bool KV::Impl::Recover() {
   if (!wal_->Open(wal_path_)) {
     SetError("cannot create wal: " + wal_path_);
     return false;
+  }
+
+  // 重放过的 WAL 必须先落成 SST，再删除旧文件。旧 log 留在目录里会在下次
+  // 重启时被再次重放，而它携带的是更旧的版本，会盖掉之后写入 SST 的新值
+  // （实测：崩溃恢复 v1 → Put v2 + Flush → 重启读回 v1）。
+  // 先 flush 再删：SST 内容就是这些 log 的重放结果，即使删前崩溃，再次
+  // 重放也是幂等的；反过来先删后 flush 则会在崩溃窗口丢数据。
+  if (recovered_records > 0 && !FlushLocked()) {
+    SetError("flush recovered wal failed");
+    return false;
+  }
+  for (const auto& f : log_files) {
+    const std::string path = JoinPath(dir_, f.second);
+    if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+      SetError("cannot remove recovered wal: " + f.second);
+      return false;
+    }
   }
   return true;
 }
