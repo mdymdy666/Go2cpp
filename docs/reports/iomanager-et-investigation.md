@@ -440,3 +440,136 @@ WebSocket 侧每次 `read_message` 都走 `socket->recv`（`websocket.cpp:598`�
 - `git status --porcelain` 在调查前后一致（见交付消息）；`src/network/` 下无任何修改；
 - 未执行任何压测/benchmark；未启动 `app/ws_bench`；
 - 报告中所有「推导/未实测」均已显式标注。
+
+## 单 poller 实现（2026-11-04）
+
+> 目标：把「多 M 争用单一 epoll + 每事件取条带锁 + 逐个唤醒 fiber」改为
+> 「单 poller 收事件 → 本地批量队列 → worker 批量取再逐个唤醒」。
+> 开关 `GO2CPP_IO_SINGLE_POLLER`，**默认关**；关闭时行为与改造前逐字节一致。
+
+### 一、设计
+
+| 角色 | 线程 | 做什么 |
+|---|---|---|
+| 生产端 | 专用 poller 线程（`std::thread`，`start()` 拉起） | 独占 `epoll_wait`，把 `BackendEvent` 批量写入本地环形队列，满时溢出就地处理 |
+| 消费端 | scheduler 的空闲 worker（`poll_once` 空闲回调） | 一次从队列取 ≤256 个事件，先 `process_events_batch` 再统一 `wake_io_batch` |
+
+关键点：
+
+1. **单 poller 独占 epoll**：`IOManager` 构造期在单 poller 模式下把
+   `set_worker_polling(false)`，`start()` 照常创建 poller 线程；worker 不再
+   `epoll_wait`，消除 4–12 个 M 抢同一个 epoll 的唤醒/自旋争用。
+2. **本地批量队列**：环形缓冲 8192 × `BackendEvent`(16B) = 128KB；单生产者
+   （poller）+ 多消费者（worker），索引只在 `m_queue_mutex` 内搬动，临界区
+   是「memcpy + 两个索引」；`m_queue_depth` 原子量只作锁外快速提示。
+   - 选有锁环形队列而不是自研 MPSC：生产端唯一、临界区远小于「每事件取
+     条带锁 + `epoll_ctl`」，自研无锁队列只会引入 ABA/内存序风险。
+3. **批量交付**：消费者一次取最多 256 个事件后**统一**交给
+   `process_events_batch`；该函数按 fd 取条带锁、按 FIFO 取等待者，最后
+   一次 `wake_io_batch` 把整批 Task 按 `last_processor_id` 分组投递——
+   唤醒次数从「每事件一次」降为「每批一次」。
+4. **不丢事件**：队列满（消费端长时间不空闲的极端情况）时**不丢弃**，由
+   poller 就地 `process_events_batch` 处理溢出尾部，并累加
+   `m_queue_overflow`（本次压测未单独导出该计数，属保守兜底路径）。
+5. **FIFO / wait_many 语义**：事件按入队顺序被批量搬出，同一 fd 仍由同一条
+   带锁串行化，同一 fd/方向的等待者 FIFO 不变；`wait_many` 每个 fd 一个节点，
+   走同一条路径，语义未变。
+6. **关停**：`shutdown()` 先置停止标志并 `notify_all` 唤醒阻塞消费者，再按
+   原路径以 `kCancelled` 排空全部条带；join poller 后清空残留队列（等待者
+   已全部完成，不会留下悬挂 G）。
+7. **唤醒合并**：一次入队只 `notify_one`；消费者处理完若仍有积压再唤醒下一个。
+   poller 在队列有积压时把下一轮 `epoll_wait` 超时取 0，持续把内核就绪搬空。
+
+### 二、改动文件与位置
+
+| 文件:行 | 改动 |
+|---|---|
+| `src/network/io.cpp:39` | `env_flag_enabled()` 环境变量布尔解析 |
+| `src/network/io.cpp:682` | `State` 构造期读取 `GO2CPP_IO_SINGLE_POLLER` |
+| `src/network/io.cpp:1883` | `single_poller()` 只读访问器 |
+| `src/network/io.cpp:1785` | `poll_loop` 单 poller 分支：积压时零超时；事件只入队不解析 |
+| `src/network/io.cpp:1941` | `enqueue_events()`：批量入队 + 队满就地处理溢出 |
+| `src/network/io.cpp:1999` | `drain_event_batch()`：worker 批量取 ≤256 + 批处理后唤醒 |
+| `src/network/io.cpp:2348` | 环形队列成员（8192 容量、深度/互斥/条件变量/溢出计数） |
+| `src/network/io.cpp:2446` | `IOManager` 构造期 `set_worker_polling(!single_poller())` |
+| `src/network/io.cpp:765/804` | shutdown 唤醒 + join 后清队 |
+
+`io_backend.cpp` 未改：Linux 后端已是 `EPOLLET` + `supports_one_shot()==false`，
+`wait()` 接口本身满足「批量返回 256」。
+
+### 三、20k 压测数据
+
+命令（同机同参数，服务端 pin CPU 2-9，客户端 pin CPU 0）：
+
+```bash
+# 关（默认）
+BIN=/home/ubunturoot/wsbench-bin bash app/ws_bench/run_bench.sh go2cpp 20000 20 18083 4
+# 开
+GO2CPP_IO_SINGLE_POLLER=1 BIN=/home/ubunturoot/wsbench-bin \
+  bash app/ws_bench/run_bench.sh go2cpp 20000 20 18082 4
+```
+
+三组对照：A = 改动前二进制（保留本报告历史口径）；B = 改动后二进制、开关关
+（验证默认路径未退化）；C = 改动后二进制、开关开。
+
+| 组 | 轮次 | RSS 峰值/均值 (KB) | CPU 均值/峰值% | p50 (ms) | **p99 (ms)** | p999 (ms) |
+|---|---|---|---|---|---|---|
+| A 关(旧) | 1 | 254176 / 227797 | 70.6 / 222 | 1.064 | 2.933 | 3.600 |
+| A 关(旧) | 2 | 253696 / 228679 | 68.1 / 161 | 1.183 | 13.702 | 58.050 |
+| A 关(旧) | 3 | 253804 / 228490 | 72.4 / 159 | 1.192 | 4.640 | 7.532 |
+| B 关(新) | 1 | 253920 / 229386 | 67.8 / 148 | 1.013 | 2.728 | 3.990 |
+| B 关(新) | 2 | 254048 / 228810 | 65.6 / 147 | 1.084 | 3.078 | 4.343 |
+| B 关(新) | 3 | 253920 / 229603 | 68.7 / 152 | 1.056 | 3.208 | 6.221 |
+| C 开 | 1 | 253952 / 228980 | 75.3 / 194 | 0.604 | 1.575 | 5.553 |
+| C 开 | 2 | 254048 / 228067 | 76.3 / 183 | 0.642 | 2.232 | 3.480 |
+| C 开 | 3 | 254048 / 228557 | 76.5 / 197 | 0.614 | 1.691 | 2.300 |
+
+- 20000 连接全部握手成功，`ping_timeout=0`、`disconnects=0`（三组均如此）。
+- 2k 连接冒烟（开）：p50 0.224 / p99 0.517 / p999 0.783 ms，无超时。
+- **RSS**：B 组均值 228.8–229.6 MB，C 组 228.1–229.0 MB，差异 <0.4%；
+  RSS 口径不变（基线 227.7 MB ≈ Go 的 0.96×）。
+- **默认路径未退化**：B（新二进制关）与 A（旧二进制）在噪声范围内一致
+  （p99 中位 3.078 vs 4.640，A 组第 2 轮 13.7 ms 为已知离群；p50 1.056 vs
+  1.183；RSS 一致）⇒ 开关关闭时行为不变。
+- **开关收益（B → C，同二进制同参数）**：p99 中位 3.078 → **1.691 ms
+  （−45.1%，1.82×）**；p999 中位 4.343 → 3.480 ms（−19.9%）；p50 1.056 →
+  0.614 ms（−41.9%）。
+- **目标 ≤1.45 ms：未达**。C 组最好轮 1.575（差 8.6%），中位 1.691（差 16.6%）。
+
+### 四、未达目标的书面瓶颈
+
+1. **批大小被事件到达率限制**：20k 心跳 ≈ 20k 事件/s（客户端把 ping 分散在
+   1s 内），`epoll_wait` 单批多为个位数事件；批量交付只能把「唤醒次数」
+   摊薄到每批一次，仍存在一次 `poller → worker` 的条件变量/futex 唤醒
+   （WSL2 单次约 5–50µs），这是 p99 尾部的主项。
+2. **每事件工作未减少**：worker 侧仍是「逐事件取 fd 条带锁 + 可能
+   `epoll_ctl(MOD)`」（读写方向交替，即本报告 R6）——本次只改事件分发架构，
+   未动 MOD 振荡，这部分 syscall 与内核 `ep->mtx` 争用仍在。
+3. **客户端成为下限**：客户端单线程 pin CPU 0、CPU 57–59%；同 harness 下
+   Go 参考为 p50 0.625 / p99 1.810 / p999 2.651，本实现（p99 1.575–2.232）
+   已与 Go 同量级；1.45 ms 低于该 harness 下 Go 的实测值，端到端分布受
+   客户端调度约束。
+4. **后续方向（按收益排序）**：
+   a) poller 在批内直接完成「事件 → 等待者 → Task」解析（免第二次跨线程
+      唤醒），批量只把 Task 交给调度器；
+   b) 实施 R6 的 sticky interest，消掉方向交替的 `epoll_ctl MOD`；
+   c) 后端换 io_uring 批量提交/完成，彻底去掉每事件 `epoll_ctl`。
+
+### 五、回归测试（`GO2CPP_IO_SINGLE_POLLER` 关/开各跑一遍）
+
+| 测试 | 关 | 开 |
+|---|---|---|
+| `go2cpp_io_audit` | PASS | PASS |
+| `bento_ws_server` | PASS (5.49s) | PASS (5.50s) |
+| `go2cpp_io_hook_demo` | FAIL（既有） | FAIL（同样输出） |
+| `go2cpp_io_hook_full` | FAIL（既有） | FAIL（同样输出） |
+
+`go2cpp_io_hook_demo/full` 的失败是**改动前既有**的环境性失败：10:49 构建的
+旧二进制同样 `returncode=1`，输出 `socket-timeout=0`（`SO_RCVTIMEO` 返回
+`EAGAIN` 而非 `ETIMEDOUT`）。开关打开/关闭下失败现象完全一致，与本次改动无关。
+
+### 六、回滚
+
+删掉环境变量即回到原路径（`m_single_poller=false`：不建 poller 线程、
+`poll_once` 仍直接 `epoll_wait`），无需改代码；队列成员只在单 poller 模式
+被访问。

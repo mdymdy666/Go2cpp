@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <condition_variable>
 #include <limits>
@@ -33,6 +34,12 @@ namespace {
 constexpr std::uint64_t kWakeRegistration = 0;
 constexpr std::uint32_t kReadMask = 1U;
 constexpr std::uint32_t kWriteMask = 2U;
+
+/// @brief 读取布尔环境变量：未设置、空串或以 '0' 开头一律视为关闭。
+bool env_flag_enabled(const char* name) noexcept {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
 std::mutex& manager_registry_mutex() {
     static std::mutex mutex;
@@ -669,6 +676,10 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
 
     explicit State(Scheduler* scheduler, IOBackendPtr backend)
         : m_scheduler(scheduler), m_backend(std::move(backend)) {
+        // 单 poller 模式：poll_once 从「直接 epoll_wait」切换为「从 poller
+        // 线程的批量队列取事件」，IOManager 构造期据此决定 worker 是否还
+        // 自己 poll。默认关闭，保证存量行为不变。
+        m_single_poller = env_flag_enabled("GO2CPP_IO_SINGLE_POLLER");
         if (!m_backend) {
             m_backend = CreateBackend();
         }
@@ -748,6 +759,11 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
             }
             m_permanently_stopped.store(true, std::memory_order_release);
             m_stop_poller.store(true, std::memory_order_release);
+            if (m_single_poller) {
+                // 叫醒阻塞在批量队列上的 worker；它们看到停止标志后
+                // 返回 -1，退回调度器条件变量路径。
+                m_queue_cv.notify_all();
+            }
 
             {
                 // 先清定时器表，再逐条带排空：drain_queue_locked 会在条带锁
@@ -775,6 +791,13 @@ struct IOManager::State : public std::enable_shared_from_this<State> {
         if (m_poller.joinable() &&
             m_poller.get_id() != std::this_thread::get_id()) {
             m_poller.join();
+        }
+        if (m_single_poller) {
+            // 停止后队列里的事件已无意义：所有等待者已在上面的条带排空
+            // 中以 kCancelled 完成，丢弃不会留下悬挂 G。
+            std::lock_guard<std::mutex> lock(m_queue_mutex);
+            m_queue_head = m_queue_tail;
+            m_queue_depth.store(0, std::memory_order_release);
         }
         m_running.store(false, std::memory_order_release);
     }
@@ -1771,11 +1794,18 @@ private:
                 // 登记等待者之后，并发发布才需要 eventfd 打断 epoll_wait。
                 m_waiters.fetch_add(1, std::memory_order_release);
             }
+            // 单 poller 模式下队列仍有积压时用零超时继续搬事件，尽快把
+            // 内核就绪排空到本地批量队列；否则按最近定时器截止时间等待。
+            const int poll_timeout =
+                m_single_poller &&
+                        m_queue_depth.load(std::memory_order_acquire) != 0
+                    ? 0
+                    : poll_timeout_ms();
             int count;
             do {
                 count = m_backend
                             ? m_backend->wait(events, kEventBatch,
-                                              poll_timeout_ms())
+                                              poll_timeout)
                             : -ENODEV;
             } while (count < 0 && -count == EINTR);
             m_waiters.fetch_sub(1, std::memory_order_release);
@@ -1816,12 +1846,22 @@ private:
                 drain_wake_fd();
                 m_tickle_pending.exchange(0, std::memory_order_acq_rel);
             }
-            process_events_batch(events, static_cast<std::size_t>(count));
+            if (m_single_poller) {
+                // 只登记事件，不在 poller 线程里解析 fd / 唤醒 fiber：
+                // 解析与唤醒交给取到批次的 worker，poller 保持单线程最简。
+                enqueue_events(events, static_cast<std::size_t>(count));
+            } else {
+                process_events_batch(events,
+                                     static_cast<std::size_t>(count));
+            }
             expire_timers();
 
             if (m_stop_poller.load(std::memory_order_acquire)) {
                 break;
             }
+        }
+        if (m_single_poller) {
+            m_queue_cv.notify_all();
         }
         m_running.store(false, std::memory_order_release);
     }
@@ -1838,6 +1878,9 @@ private:
     ///          因此启用 worker 轮询时只保留 worker 作为等待者；timer 的
     ///          到期处理也由 worker 的 epoll_wait 超时驱动。
     void set_worker_polling(bool enabled) noexcept { m_worker_polling = enabled; }
+
+    /// @brief 是否启用「单 poller + 批量交付」（构造期读取，之后只读）。
+    bool single_poller() const noexcept { return m_single_poller; }
 
     void tickle() noexcept {
         if (!m_backend) {
@@ -1859,6 +1902,143 @@ private:
         if (m_tickle_pending.fetch_add(1, std::memory_order_acq_rel) == 0) {
             m_backend->wake();
         }
+    }
+
+    // ---- 单 poller 模式的批量交付 ----
+    //
+    // 生产端：专用 poller 线程（poll_loop）独占 epoll，把就绪事件按批
+    // 登记进下面的环形队列；消费端：空闲 worker 调 poll_once ->
+    // drain_event_batch，一次取一批再逐个解析 fd/唤醒 fiber。
+    //
+    // 为什么不是无锁队列：生产端唯一、消费端只在锁内搬指针，临界区是
+    // 「memcpy + 两个索引」，远小于每事件取条带锁 + epoll_ctl 的代价；
+    // 引入自研 MPSC 反而增加 ABA/内存序风险。m_queue_depth 只做锁外提示。
+    //
+    // 不丢事件：环形队列满时不丢弃，由 poller 就地处理溢出尾部；
+    // shutdown 时残留事件对应的等待者已由 shutdown 统一以 kCancelled 唤醒，
+    // 因此丢弃队列内容不会产生悬挂 G。
+    /**
+     * @brief 把一批后端事件登记进本地批量队列；队列满时就地处理溢出尾部。
+     *
+     * @param events [in] 后端返回的事件数组——借用，函数返回后失效；count>0 时不可为 nullptr。
+     * @param count [in] 事件个数——0 表示无事件，立即返回。
+     * @return 无返回值；事件要么入队，要么在本线程被 process_events_batch 处理。
+     *
+     * ## 定位
+     * 单 poller 模式唯一的生产端。写错（丢事件）会让对应 fd 的等待者
+     * 永久 park；队列满时直接丢弃是最危险的退化，因此这里改为就地处理。
+     *
+     * ## 步骤
+     * step1. 加队列锁，把能放下的前缀拷进环形缓冲并发布深度；
+     * step2. 有入队则唤醒一个等待中的 worker；
+     * step3. 剩余放不下的尾部在本线程批量处理，保证不丢事件。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：只允许 poller 线程调用（单生产者）；与消费端通过 m_queue_mutex 互斥；
+     * - 原子性：入队与 m_queue_depth 发布在同一临界区完成，消费端看到非零深度必有事件；
+     * - 失败语义：noexcept，无动态分配，不会因内存不足丢事件。
+     */
+    void enqueue_events(const BackendEvent* events,
+                        std::size_t count) noexcept {
+        if (events == nullptr || count == 0) {
+            return;
+        }
+        std::size_t offset = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_queue_mutex);
+            while (offset < count &&
+                   m_queue_tail - m_queue_head < kEventQueueCapacity) {
+                m_event_queue[m_queue_tail & (kEventQueueCapacity - 1)] =
+                    events[offset];
+                ++m_queue_tail;
+                ++offset;
+            }
+            if (offset != 0) {
+                m_queue_depth.store(m_queue_tail - m_queue_head,
+                                    std::memory_order_release);
+            }
+        }
+        if (offset != 0) {
+            m_queue_cv.notify_one();
+        }
+        if (offset < count) {
+            // 队列满（消费端长时间不空闲的极端情况）：poller 就地处理
+            // 尾部，宁可在本线程多花时间也不能丢事件。
+            m_queue_overflow.fetch_add(1, std::memory_order_relaxed);
+            process_events_batch(events + offset, count - offset);
+        }
+    }
+
+    /**
+     * @brief 单 poller 模式下 worker 的等待入口：批量取事件、逐个唤醒、结算定时器。
+     *
+     * @param timeout_ms [in] 最长等待毫秒——负数按 0 处理；还会被最近定时器截止时间收紧。
+     *
+     * @return
+     * - >=0：本轮取到/处理的事件数（0 表示超时或纯定时器结算）——调用方**必须**继续循环；
+     * - -1：IOManager 已停止——调用方**不要**重试，按关停路径退出。
+     *
+     * ## 定位
+     * 单 poller 模式下唯一的「队列 -> 等待节点」出口。一次取最多 256 个
+     * 事件后统一交给 process_events_batch（按 fd 条带锁逐个解析），因此
+     * 唤醒以批为单位摊薄，而不是每个事件一次跨线程通知。
+     *
+     * ## 步骤
+     * step1. 归一化超时（负数归零、被最近定时器收紧）；
+     * step2. 队列空时在条件变量上等到「有事件 / 停止 / 超时」；
+     * step3. 锁内搬一批事件到栈上缓冲并同步深度；
+     * step4. 批量解析事件（FIFO 顺序、每 fd 条带锁串行）；若仍有积压再叫醒一个 worker；
+     * step5. 结算到期定时器；停止且空队列返回 -1。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：只在 scheduler worker 线程（IO 空闲路径）调用；
+     * - 原子性：取事件在队列锁内完成，同一事件只会被一个 worker 取走；
+     * - 失败语义：noexcept；停止返回 -1，不阻塞、不留状态；
+     * - 不变量：返回 >=0 时本轮取到的事件已全部交由 process_events_batch。
+     */
+    int drain_event_batch(int timeout_ms) noexcept {
+        int effective = timeout_ms < 0 ? 0 : timeout_ms;
+        const int deadline_timeout = poll_timeout_ms();
+        if (deadline_timeout == 0) {
+            effective = 0;
+        } else if (deadline_timeout > 0 && deadline_timeout < effective) {
+            effective = deadline_timeout;
+        }
+        constexpr std::size_t kConsumerBatch = 256;
+        BackendEvent events[kConsumerBatch];
+        std::size_t count = 0;
+        {
+            std::unique_lock<std::mutex> lock(m_queue_mutex);
+            if (m_queue_depth.load(std::memory_order_acquire) == 0 &&
+                !m_stop_poller.load(std::memory_order_acquire)) {
+                m_queue_cv.wait_for(
+                    lock, std::chrono::milliseconds(effective), [this] {
+                        return m_queue_depth.load(
+                                   std::memory_order_acquire) != 0 ||
+                               m_stop_poller.load(
+                                   std::memory_order_acquire);
+                    });
+            }
+            while (count < kConsumerBatch &&
+                   m_queue_head != m_queue_tail) {
+                events[count++] =
+                    m_event_queue[m_queue_head & (kEventQueueCapacity - 1)];
+                ++m_queue_head;
+            }
+            m_queue_depth.store(m_queue_tail - m_queue_head,
+                                std::memory_order_release);
+        }
+        if (count != 0) {
+            process_events_batch(events, count);
+            if (m_queue_depth.load(std::memory_order_acquire) != 0) {
+                m_queue_cv.notify_one();
+            }
+        }
+        expire_timers();
+        if (count == 0 && m_stop_poller.load(std::memory_order_acquire)) {
+            return -1;
+        }
+        return static_cast<int>(count);
     }
 
     /**
@@ -1945,6 +2125,10 @@ private:
         }
         if (m_stop_poller.load(std::memory_order_acquire)) {
             return -1;
+        }
+        // 单 poller 模式：worker 不再碰 epoll，只从批量队列取事件。
+        if (m_single_poller) {
+            return drain_event_batch(timeout_ms);
         }
         int effective = timeout_ms < 0 ? 0 : timeout_ms;
         // step1: 结算本轮超时——负值归零，并被最近定时器截止时间收紧，保证定时器不被 poll 拖过点。
@@ -2153,9 +2337,22 @@ private:
     std::atomic<bool> m_accepting{false};
     std::atomic<bool> m_stop_poller{false};
     bool m_worker_polling{false};
+    /// @brief 单 poller + 批量交付开关（构造期读取，之后只读）。
+    bool m_single_poller{false};
     std::atomic<bool> m_permanently_stopped{false};
     std::atomic<bool> m_running{false};
     std::thread m_poller;
+
+    // 单 poller 模式的批量交付队列：poller 单生产者、空闲 worker 多消费者。
+    // 容量取 2 的幂以便用掩码取模；8192 × 16B = 128KB，稳态远低于该水位。
+    static constexpr std::size_t kEventQueueCapacity = 8192;
+    BackendEvent m_event_queue[kEventQueueCapacity];
+    std::size_t m_queue_head{0};
+    std::size_t m_queue_tail{0};
+    std::atomic<std::size_t> m_queue_depth{0};
+    std::mutex m_queue_mutex;
+    std::condition_variable m_queue_cv;
+    std::atomic<std::uint64_t> m_queue_overflow{0};
 
     // 定时器表是「最近截止时间」这个全局视图，无法按 fd 切开；但它不再是
     // 每个 IO 事件的必经之路，只在注册定时器与到期处理时短暂持有。
@@ -2244,7 +2441,9 @@ IOManager::IOManager(SchedulerConfig config, IOBackendPtr backend)
     // 本 P，消除 poller -> worker 的跨线程唤醒。必须在 start() 之前安装，
     // 所以放在构造期；State 生命周期短于 Scheduler，回调只用 weak_ptr。
     if (m_state) {
-        m_state->set_worker_polling(true);
+        // 单 poller 模式必须保留独立 poller 线程（worker_polling=false），
+        // 否则没人消费 epoll；worker 仍装 idle 回调，用于批量取队列。
+        m_state->set_worker_polling(!m_state->single_poller());
         (void)m_scheduler.set_io_idle_poller(
             [weak_state](int timeout_ms) {
                 const auto state = weak_state.lock();
