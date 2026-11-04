@@ -294,3 +294,64 @@ tunnel 的数据面恰好是 **3 段 TCP**（bench→server 公网口、server�
 - 注意：`PipeConfig` 新增字段是源码级 ABI 变更，所有使用方（含 `go2cpp_relay_pipe_test`）必须重编；本次验证中「旧测试二进制 + 新库」曾表现为慢 peer 用例失败（读到错位的 `direct`），重编后 8/8 通过。
 
 > 测量前提说明：本机同时有其他任务在跑，直连基线在 2227–3463 MiB/s 间波动（±50%），因此上表用「隧道绝对值中位」而非「开销倍率」做主结论；开销倍率只作参考。
+
+## splice 零拷贝（2026-11-04）
+
+目标：把 3 段 TCP 的数据面改成内核 `splice` 转发，验证能否把单连接开销压到 ≤2×。
+
+### 1. 拷贝点定位（每 64 KiB 帧）
+
+| # | 位置 | 拷贝 | 分配 |
+|---|---|---|---|
+| 1 | `MuxStream::Write` → `MuxSession::SendData` | 帧载荷进 iovec（零拷贝，仅帧头落栈） | 0 |
+| 2 | `FrameCodec::Feed` → `ExtractFrame` | 重组缓冲把载荷拷出 | 1 |
+| 3 | `MuxStream::PushData` | 帧载荷拷进队列 `vector` | 1 |
+| 4 | `MuxStream::Read` → RelayPipe 缓冲 | 队列 front 拷给调用方 | 0（释放 1） |
+| 5 | RelayPipe `Read`/`Write` 两侧 | 内核 → 用户态 → 内核各一次 | 0 |
+
+即每 64 KiB 帧 **4 次用户态拷贝 + 2–3 次堆分配**，与报告第 3.2 节一致。
+
+### 2. 改动
+
+| 文件 | 内容 |
+|---|---|
+| `include/go2cpp/relay/splice_pipe.hpp`（137 行） | `SplicePipe` / `SpliceConfig` / `SpliceStats` 接口与语义文档 |
+| `src/relay/splice_pipe.cpp`（445 行） | 双向 `splice` 循环：`socket → pipe → socket`；`F_SETPIPE_SZ` 调 1 MiB；部分写推进；`EAGAIN` → `poll`；`write_timeout` 判定慢 peer；EOF → `shutdown(目的端, SHUT_WR)`；取消回调 `shutdown` 两端；非 Linux `Supported()=false` |
+| `include/go2cpp/relay/relay_pipe.hpp` | `Stream::NativeFd()` 默认 -1（非纯虚，旧实现零改动） |
+| `include/go2cpp/tunnel/net.hpp` / `src/tunnel/net.cpp` | `SocketStream::NativeFd()` 返回底层 fd |
+| `cmake/Go2CppRelayPipe.cmake` | relay 库加入 `splice_pipe.cpp` |
+| `src/tunnel/server.cpp:1164` / `client.cpp:522` | `GO2CPP_TUNNEL_SPLICE` 开启且两端 fd ≥ 0 时走 `SplicePipe`，否则回退 `RelayPipe` |
+
+开关 `GO2CPP_TUNNEL_SPLICE=1|true|on|yes`，默认关；非 Linux 编译期回退。
+
+### 3. 实测（环回，`taskset -c 0-7`，5 轮，`bench_tunnel`）
+
+| 指标 | 默认 | splice 开 | 直连 |
+|---|---|---|---|
+| 单连接吞吐 | 837.17 MiB/s（开销 **3.77×**） | 785.97 MiB/s（3.78×） | 3154.55 / 2971.08 |
+| 4 并发吞吐 | 1274.57 MiB/s（开销 7.06×） | 1006.84 MiB/s（7.87×） | 8996.68 / 7921.45 |
+| 延迟 p50 / p99（64 KiB POST） | 1.519 / 2.153 ms | 1.435 / 2.231 ms | 0.325 / 0.544 ms |
+| integrity | `requests=212..242 bytes=... failures=0` | 同左，0 失败 | — |
+| `ctest -R tunnel` | 1/1 Passed | 1/1 Passed | — |
+
+**开/关差异在噪声内（±6%）**，且 4 并发 splice 侧反而低 21%——原因是 splice 路径在 tunnel 拓扑里**从未被进入**。
+
+### 4. 为什么没进 splice 路径（物理阻断）
+
+`SplicePipe` 自测（socketpair ×2，8 MiB 双向）通过：`forward=1 reverse=1 run_ok=1 a_to_b=8388608 b_to_a=8388608 timeouts=0`——转发器本身正确。
+
+但 tunnel 每侧的 `RelayPipe` 两端是「公网/本地 socket」+「`MuxStream`」：
+
+```
+server: public socket  ⇄  RelayPipe  ⇄  MuxStream（用户态帧化，NativeFd=-1）
+client: local  socket  ⇄  RelayPipe  ⇄  MuxStream（同上）
+```
+
+`MuxStream` 是帧化后的用户态字节流，不是 fd，`splice` 无法跨过它。因此 `NativeFd() >= 0` 恒为假，走回退分支——**开关打开不改变数据面，实测数字与默认一致**。
+
+### 5. 结论与后续
+
+1. **splice 原语已实现并可用**（自测 8 MiB 双向 0 错误），但在现有 mux 架构下**无法触达数据面**；tunnel 仍 3.77×（单连接）/ 7.06×（4 并发），**未达 ≤2×**。
+2. 达标的前提是**每段纯 socket 对 socket**：需要为每条隧道流建一条 per-stream raw TCP 数据通道（控制连接只传 OPEN/CLOSE 信令），server 侧 `splice(公网 socket → pipe → raw)`、client 侧 `splice(raw → pipe → 本地 socket)`。这样 3 段全零拷贝，按物理实测（1/2/3/4 段 = 2517/1851/1291/739 MiB/s），3 段上限 1291 MiB/s ≈ 1.95×，恰好压在门槛上。
+3. 该改动需要协议新增「数据通道」握手与配对表，超出本次时间盒；本次交付的是可复用的 `SplicePipe` + 接线点，raw 通道落地后只需把 server/client 的 `MuxStream` 换成 raw socket 的 `SocketStream` 即可自动启用。
+4. 回退：`GO2CPP_TUNNEL_SPLICE` 默认关；非 Linux 编译期 `Supported()=false`；两端 fd 任一为 -1 自动回退 `RelayPipe`，行为与改动前完全一致。

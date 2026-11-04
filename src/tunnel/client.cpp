@@ -20,6 +20,8 @@
 
 #include "go2cpp/tunnel/client.hpp"
 
+#include "go2cpp/relay/splice_pipe.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <utility>
@@ -519,9 +521,17 @@ void TunnelClient::RelayLocal(const MuxStream::Ptr& stream) {
     pipe_config.copy_buf = 256U * 1024U;
     pipe_config.queue_cap = 512U * 1024U;
     pipe_config.write_timeout = std::chrono::milliseconds(30000);
-    relay::RelayPipe pipe(&local_stream, &tunnel_side, pipe_config);
-    ErrorPtr pipe_error;
-    (void)pipe.Run(nullptr, &pipe_error);
+    if (relay::SpliceEnabledFromEnv() && relay::SplicePipe::Supported() &&
+        local_stream.NativeFd() >= 0 && stream->NativeFd() >= 0) {
+        relay::SplicePipe splice_pipe(local_stream.NativeFd(),
+                                      stream->NativeFd());
+        ErrorPtr splice_error;
+        (void)splice_pipe.Run(nullptr, &splice_error);
+    } else {
+        relay::RelayPipe pipe(&local_stream, &tunnel_side, pipe_config);
+        ErrorPtr pipe_error;
+        (void)pipe.Run(nullptr, &pipe_error);
+    }
     (void)stream->Close();
     local->Shutdown();
 }

@@ -23,6 +23,8 @@
 
 #include "go2cpp/tunnel/server.hpp"
 
+#include "go2cpp/relay/splice_pipe.hpp"
+
 #include <arpa/inet.h>
 #include <cerrno>
 #include <netinet/in.h>
@@ -1161,9 +1163,20 @@ void TunnelServer::HandlePublic(TcpConn::Ptr conn) {
     pipe_config.copy_buf = 256U * 1024U;
     pipe_config.queue_cap = 512U * 1024U;
     pipe_config.write_timeout = std::chrono::milliseconds(30000);
-    relay::RelayPipe pipe(&public_side, &tunnel_side, pipe_config);
-    ErrorPtr pipe_error;
-    (void)pipe.Run(nullptr, &pipe_error);
+    // splice 零拷贝：两端都必须是内核 socket。隧道侧是 MuxStream（用户态帧化），
+    // NativeFd() 返回 -1，因此当前拓扑下恒回退 RelayPipe——保留接线是为了让
+    // 「raw socket 对 socket」的转发（裸 TCP 隧道 / 后续 per-stream 数据通道）直接受益。
+    if (relay::SpliceEnabledFromEnv() && relay::SplicePipe::Supported() &&
+        public_stream.NativeFd() >= 0 && stream->NativeFd() >= 0) {
+        relay::SplicePipe splice_pipe(public_stream.NativeFd(),
+                                      stream->NativeFd());
+        ErrorPtr splice_error;
+        (void)splice_pipe.Run(nullptr, &splice_error);
+    } else {
+        relay::RelayPipe pipe(&public_side, &tunnel_side, pipe_config);
+        ErrorPtr pipe_error;
+        (void)pipe.Run(nullptr, &pipe_error);
+    }
     stream->Close();
     conn->Shutdown();
 }

@@ -608,6 +608,10 @@ void TcpListener::Close() noexcept {
 SocketStream::SocketStream(TcpConn::Ptr conn, int read_timeout_ms)
     : m_conn(std::move(conn)), m_read_timeout_ms(read_timeout_ms) {}
 
+int SocketStream::NativeFd() const noexcept {
+    return m_conn ? m_conn->fd() : -1;
+}
+
 streams::ReadResult SocketStream::Read(char* data, std::size_t size) {
     if (!m_conn) {
         return {0, NewError("tunnel: null connection")};

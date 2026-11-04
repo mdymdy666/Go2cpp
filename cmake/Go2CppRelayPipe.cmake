@@ -25,7 +25,8 @@ if (NOT GO2CPP_WITH_RELAY_PIPE)
 endif()
 
 add_library(go2cpp_relay_pipe
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/relay/relay_pipe.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/relay/relay_pipe.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/relay/splice_pipe.cpp)
 add_library(go2cpp::relay_pipe ALIAS go2cpp_relay_pipe)
 
 target_include_directories(go2cpp_relay_pipe

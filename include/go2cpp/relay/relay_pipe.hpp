@@ -149,6 +149,9 @@ namespace relay {
 class Stream : public streams::Reader, public streams::Writer, public streams::Closer {
 public:
     ~Stream() override = default;
+
+    /// 底层 fd（诊断 / splice 用）；默认 -1 表示不是内核对象，无法 splice。
+    virtual int NativeFd() const noexcept { return -1; }
 };
 
 /**

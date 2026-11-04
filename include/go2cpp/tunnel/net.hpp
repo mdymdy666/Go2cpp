@@ -233,6 +233,9 @@ public:
 
     const TcpConn::Ptr& conn() const noexcept { return m_conn; }
 
+    /// 底层 socket fd；无连接时 -1（供 relay::SplicePipe 零拷贝转发）。
+    int NativeFd() const noexcept override;
+
 private:
     TcpConn::Ptr m_conn;
     int m_read_timeout_ms;
