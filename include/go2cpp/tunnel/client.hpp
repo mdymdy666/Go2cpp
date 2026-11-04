@@ -29,6 +29,7 @@
  */
 
 #include "go2cpp/bento/net/backoff.hpp"
+#include "go2cpp/concurrency/context.hpp"
 #include "go2cpp/metrics/metrics.hpp"
 #include "go2cpp/tunnel/mux.hpp"
 
@@ -41,6 +42,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace go2cpp {
@@ -181,6 +183,36 @@ private:
     void SetState(bool online_now, const std::string& subdomain,
                   const std::string& url);
 
+    /// 等待在途转发线程计数归零。
+    ///
+    /// @param timeout_ms [in] 最长等待毫秒数；0 表示不等待（立即返回）；
+    ///        负数按 0 处理。
+    ///
+    /// @return true 表示所有 worker 已退出——调用方**可以**继续析构；
+    ///         false 表示超时，仍有线程可能访问本对象。
+    ///
+    /// ## 定位
+    /// `Stop()` 的唯一收尾等待点。漏等会让对象先析构、detached 线程后
+    /// 访问 `this`（TSan 实测的 thread leak / UAF）。
+    ///
+    /// ## 并发/失败语义
+    /// - 调用约束：`Stop()` 已置 `stopping` 后调用；不得在 worker 内自调。
+    /// - 原子性：计数递减与 notify 在 worker 的同一把锁内完成。
+    bool WaitWorkers(int timeout_ms);
+
+    /// 登记一条在途本地连接；`RelayLocal` / `RelayRawStream` 的 RAII 守卫
+    /// 在拨号成功后调用。
+    ///
+    /// @param conn [in] 连接强引用；为空时为空操作。所有权**不**移交，
+    ///        登记表只持副本保证连接在 `Stop()` 快照期间存活。
+    void TrackInflight(const TcpConn::Ptr& conn);
+
+    /// 注销一条在途本地连接；`Stop()` 已清空表时为空操作（幂等）。
+    ///
+    /// @param conn [in] 裸指针仅作 key；可为 nullptr。调用方保证它在
+    ///        调用期间仍存活（RAII 守卫保证在本函数之后才析构连接）。
+    void UntrackInflight(TcpConn* conn);
+
     TunnelClientConfig m_config;
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_online{false};
@@ -204,6 +236,22 @@ private:
     std::atomic<bool> m_data_started{false};
     std::vector<std::thread> m_data_threads;
 
+    /// `Stop()` 的取消信号：所有在途 `RelayPipe::Run` / `SplicePipe::Run`
+    /// 都挂在它下面。
+    ///
+    /// @details 之前传 `Context::Background()`——永不取消，`Run` 只能靠两端
+    ///          EOF 自然结束。`Stop()` 断链后若对端不再发数据，`Run` 会永远
+    ///          卡在 `done_cv.wait` 等另一个方向，Direction 线程
+    ///          finished-not-joined，TSan 报 thread leak。改成可取消上下文后，
+    ///          `Stop()` 一次 cancel 就让 `Run` 醒来并 `ForceCloseAll`。
+    ContextPtr m_stop_ctx;
+    CancelFunc m_stop_cancel;
+
+    /// 在途本地连接登记表：`Stop()` 必须主动 `Shutdown()` 它们，否则
+    /// worker 会一直阻塞在本地 `Read` / 写队列上，`WaitWorkers` 必然超时。
+    mutable std::mutex m_inflight_mutex;
+    std::unordered_map<TcpConn*, TcpConn::Ptr> m_inflight_local;
+
     /// 鉴权：token -> 32B PSK（与 Bento 的 PSK 派生一致）。
     Psk m_psk{};
     bool m_auth_required = false;
@@ -220,7 +268,7 @@ private:
     ///          已销毁后仍被 broadcast 的 use-after-destroy。
     struct WorkerRegistry {
         std::mutex mutex;              ///< 保护下面三个字段。
-        std::condition_variable cv;    ///< 计数归零时唤醒 `Stop()`。
+        std::condition_variable cv;    ///< 计数归零时唤醒 `WaitWorkers()`。
         std::size_t active = 0;        ///< 在跑的转发线程数（兼作并发额度）。
         bool stopping = false;         ///< `Stop()` 已开始，拒绝再起线程。
     };

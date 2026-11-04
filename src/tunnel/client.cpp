@@ -30,6 +30,9 @@ namespace go2cpp {
 namespace tunnel {
 namespace {
 
+/// `Stop()` 等待转发线程退出的上限（毫秒），与 server 侧同口径。
+constexpr int kStopTimeoutMs = 15000;
+
 /// 生成给浏览器的错误响应（本地服务连不上时隧道里直接回一个 502）。
 std::string LocalErrorResponse(int code, const char* reason,
                                const std::string& detail) {
@@ -65,6 +68,12 @@ bool TunnelClient::Start(ErrorPtr* err) {
         }
         return false;
     }
+    // 每个客户端一个可取消上下文：Stop() 用它打断所有在途 RelayPipe。
+    // 必须在起线程之前建好——worker 只读 m_stop_ctx，Stop() 只触发
+    // m_stop_cancel，二者不写同一个成员，无数据竞争。
+    auto stop_signal = Context::WithCancel(Context::Background());
+    m_stop_ctx = std::move(stop_signal.first);
+    m_stop_cancel = std::move(stop_signal.second);
     try {
         m_run_thread = std::thread([this] { RunLoop(); });
     } catch (const std::exception& error) {
@@ -82,6 +91,37 @@ void TunnelClient::Stop() {
         return;
     }
     m_state_cv.notify_all();
+    // 强制阶段第一步：取消在途转发 + 打断阻塞读写。
+    // - 先 cancel：RelayPipe::Run 挂在 m_stop_ctx 下，done_cv 立即醒来并
+    //   ForceCloseAll，两个 Direction 线程才有机会 join；
+    // - 再 Shutdown：卡在本地 Read / 写队列上的 worker 只有
+    //   shutdown(SHUT_RDWR) 才能返回（TcpConn::Shutdown 幂等、任意线程可调）；
+    // - 必须在 WaitWorkers 之前，否则等的是一个还在阻塞的 worker。
+    if (m_stop_cancel) {
+        m_stop_cancel();
+    }
+    {
+        std::vector<TcpConn::Ptr> inflight;
+        {
+            std::lock_guard<std::mutex> lock(m_inflight_mutex);
+            inflight.reserve(m_inflight_local.size());
+            for (const auto& item : m_inflight_local) {
+                inflight.push_back(item.second);
+            }
+        }
+        // 锁外 shutdown：shutdown 是系统调用，持锁时可能挡住
+        // UntrackInflight 的注销路径。
+        for (const TcpConn::Ptr& conn : inflight) {
+            conn->Shutdown();
+        }
+    }
+    // 先置 stopping 再等待：此后 HandleOpen / raw 回调不再新建 detached
+    // 线程，否则新线程会在 WaitWorkers 之后才登记，永远等不到。
+    {
+        std::lock_guard<std::mutex> lock(m_workers->mutex);
+        m_workers->stopping = true;
+    }
+    m_workers->cv.notify_all();
     if (m_run_thread.joinable()) {
         if (m_run_thread.get_id() == std::this_thread::get_id()) {
             m_run_thread.detach();
@@ -99,25 +139,31 @@ void TunnelClient::Stop() {
         }
     }
     m_data_threads.clear();
-    // 先置 stopping：此后 HandleOpen / raw 回调不再新建 detached 线程，
-    // 否则新线程会在下面等待之后才登记，永远等不到。
-    {
-        std::lock_guard<std::mutex> lock(m_workers->mutex);
-        m_workers->stopping = true;
-    }
-    m_workers->cv.notify_all();
-    // 等所有本地转发线程退出。递减与 notify 在工作线程的同一把锁内完成，
-    // 因此这里观察到 active == 0 时它们不会再触碰 cv。
-    {
-        const std::shared_ptr<WorkerRegistry> registry = m_workers;
-        std::unique_lock<std::mutex> lock(registry->mutex);
-        registry->cv.wait_for(lock, std::chrono::milliseconds(10000),
-                              [&registry] { return registry->active == 0; });
-    }
+    (void)WaitWorkers(kStopTimeoutMs);
     SetState(false, {}, {});
     if (m_metric_online != nullptr) {
         m_metric_online->Set(0);
     }
+}
+
+bool TunnelClient::WaitWorkers(int timeout_ms) {
+    const std::shared_ptr<WorkerRegistry> registry = m_workers;
+    std::unique_lock<std::mutex> lock(registry->mutex);
+    return registry->cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                 [&registry] { return registry->active == 0; });
+}
+
+void TunnelClient::TrackInflight(const TcpConn::Ptr& conn) {
+    if (!conn) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_inflight_mutex);
+    m_inflight_local[conn.get()] = conn;
+}
+
+void TunnelClient::UntrackInflight(TcpConn* conn) {
+    std::lock_guard<std::mutex> lock(m_inflight_mutex);
+    m_inflight_local.erase(conn);
 }
 
 bool TunnelClient::WaitOnline(int timeout_ms) {
@@ -594,6 +640,15 @@ void TunnelClient::RelayLocal(const MuxStream::Ptr& stream) {
         (void)stream->Close();
         return;
     }
+    // 在途登记：Stop() 会 Shutdown 它，打断卡在本地 Read / 写队列上的
+    // relay；RAII 守卫保证任何返回路径都注销（否则 Stop() 会一直持有
+    // 一条已结束连接的 shared_ptr）。
+    struct InflightGuard {
+        TunnelClient* client;
+        TcpConn* conn;
+        ~InflightGuard() { client->UntrackInflight(conn); }
+    } inflight_guard{this, local.get()};
+    TrackInflight(local);
     // 注意方向语义：本地服务发完响应就会 FIN（HTTP/1.0 或 Connection: close），
     // 但此时响应字节可能还排在 RelayPipe 的队列里。若在「读到本地 EOF」时立刻
     // 关闭隧道流，CLOSE 帧会先于剩余 DATA 到达服务端，响应体被截断。因此
@@ -611,11 +666,11 @@ void TunnelClient::RelayLocal(const MuxStream::Ptr& stream) {
         relay::SplicePipe splice_pipe(local_stream.NativeFd(),
                                       stream->NativeFd());
         ErrorPtr splice_error;
-        (void)splice_pipe.Run(nullptr, &splice_error);
+        (void)splice_pipe.Run(m_stop_ctx, &splice_error);
     } else {
         relay::RelayPipe pipe(&local_stream, &tunnel_side, pipe_config);
         ErrorPtr pipe_error;
-        (void)pipe.Run(nullptr, &pipe_error);
+        (void)pipe.Run(m_stop_ctx, &pipe_error);
     }
     (void)stream->Close();
     local->Shutdown();
@@ -644,6 +699,19 @@ void TunnelClient::RelayRawStream(std::uint32_t stream_id) {
         server_conn->Shutdown();
         return;
     }
+    // 两条都是内核 socket：Stop() 需要同时 Shutdown，splice 才会从阻塞
+    // 的 splice/read 返回；RAII 守卫统一注销。
+    struct InflightGuard {
+        TunnelClient* client;
+        TcpConn* server_conn;
+        TcpConn* local_conn;
+        ~InflightGuard() {
+            client->UntrackInflight(server_conn);
+            client->UntrackInflight(local_conn);
+        }
+    } inflight_guard{this, server_conn.get(), local.get()};
+    TrackInflight(server_conn);
+    TrackInflight(local);
     m_streams_total.fetch_add(1, std::memory_order_relaxed);
     if (m_metric_streams != nullptr) {
         m_metric_streams->Inc();
@@ -651,7 +719,7 @@ void TunnelClient::RelayRawStream(std::uint32_t stream_id) {
     // 两端都是内核 socket：整条数据面只有 splice，没有用户态缓冲。
     relay::SplicePipe splice_pipe(server_conn->fd(), local->fd());
     ErrorPtr splice_error;
-    (void)splice_pipe.Run(nullptr, &splice_error);
+    (void)splice_pipe.Run(m_stop_ctx, &splice_error);
     server_conn->Shutdown();
     local->Shutdown();
 }
