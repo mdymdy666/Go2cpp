@@ -95,6 +95,11 @@ struct WebSocketConfig {
     /// 持写锁、帧不交错。置 false 可恢复“单帧超限即 MessageTooLarge”的
     /// 严格单帧语义（此时 >16MiB 的消息发不出去）。
     bool fragment_outgoing{true};
+    /// 帧读预取缓冲大小（字节）；0 表示使用内部默认值 16 KiB。
+    /// `read_exact()` 在第一次读帧时按该值一次性分配、整条连接复用，
+    /// 因此它直接决定**每连接常驻**的读缓冲（长连接场景是主要内存项）。
+    /// 小消息/心跳为主的连接 4 KiB 足够；调大可减少大消息的 recv 次数。
+    std::size_t prefetch_bytes{16 * 1024};
 };
 
 /**

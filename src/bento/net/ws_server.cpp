@@ -48,6 +48,12 @@ WsServerConfig NormalizeConfig(WsServerConfig config) {
     if (config.max_header_bytes == 0) {
         config.max_header_bytes = 16 * 1024;
     }
+    // 预取缓冲整条连接常驻：这里是长连接服务端，默认按 idle 心跳取 4 KiB；
+    // 显式配置 0 表示交给 base 用 16 KiB 默认值。下限 512 字节避免碎 syscall。
+    if (config.websocket_prefetch_bytes != 0) {
+        config.websocket.prefetch_bytes =
+            std::max<std::size_t>(512, config.websocket_prefetch_bytes);
+    }
     return config;
 }
 
@@ -415,22 +421,35 @@ void WsServer::WorkerLoop() {
     }
 }
 
-bool WsServer::ReadHandshake(const net::Socket::Ptr& connection, http::Parser& parser,
-                             http::Request& request, char* buffer, std::size_t capacity) {
+bool WsServer::ReadHandshake(const net::Socket::Ptr& connection, http::Request& request,
+                             std::string& pending) {
+    // 握手请求没有 body：max_body_bytes=0 让任何声明的 body 都直接被 Parser 拒绝。
+    http::ParserLimits limits;
+    limits.max_header_bytes = m_config.max_header_bytes;
+    limits.max_body_bytes = 0;
+    http::Parser parser(limits);
+    // 常见 Upgrade 请求头 <512 字节；缓冲只在本调用内存在，握手返回即释放。
+    // 用堆缓冲而不是栈数组：Fiber 初始栈只有 1 页（4 KiB），在栈上再压
+    // 1 KiB 会把栈顶推到第二页，使每条连接多驻留 1 页（实测 20k 时 80 MB）。
+    std::vector<char> buffer(1024);
     for (;;) {
         if (m_stopping.load(std::memory_order_acquire)) {
             return false;
         }
-        const auto count = connection->recv(buffer, capacity);
+        const auto count = connection->recv(buffer.data(), buffer.size());
         if (count.transferred <= 0) {
             return false;
         }
         const auto parsed = parser.feed(
-            std::string_view(buffer, static_cast<std::size_t>(count.transferred)), request);
+            std::string_view(buffer.data(), static_cast<std::size_t>(count.transferred)),
+            request);
         if (parsed.state == http::ParseState::Error) {
             return false;
         }
         if (parsed.state == http::ParseState::Complete) {
+            // Parser 可能把紧随 Upgrade 请求之后的首个 WebSocket 帧一起读进
+            // 缓冲区，必须交给调用方注入 base WebSocket，否则首帧会被丢弃。
+            pending = parser.take_remaining();
             return true;
         }
     }
@@ -440,22 +459,13 @@ void WsServer::ServeConnection(const net::Socket::Ptr& connection) {
     (void)connection->set_recv_timeout(m_config.handshake_timeout);
     (void)connection->set_send_timeout(m_config.handshake_timeout);
 
-    // 握手请求没有 body：max_body_bytes=0 让任何声明的 body 都直接被 Parser 拒绝。
-    http::ParserLimits limits;
-    limits.max_header_bytes = m_config.max_header_bytes;
-    limits.max_body_bytes = 0;
-    http::Parser parser(limits);
-
     http::Request request;
-    // 连接级握手缓冲：避免 4KB 栈数组在 4KB 初始 Fiber 栈上触发栈增长。
-    std::vector<char> handshake_buffer(4096);
-    if (!ReadHandshake(connection, parser, request, handshake_buffer.data(),
-                       handshake_buffer.size())) {
-        return;
-    }
     // Parser 可能把紧随 Upgrade 请求之后的首个 WebSocket 帧一起读进缓冲区，
     // 必须通过 pending 注入 base WebSocket，否则首帧会被静默丢弃。
-    std::string pending = parser.take_remaining();
+    std::string pending;
+    if (!ReadHandshake(connection, request, pending)) {
+        return;
+    }
 
     std::string key;
     std::string reason;

@@ -133,6 +133,10 @@ struct WsServerConfig {
     /// 握手阶段的 recv/send 超时；内部钳制到 [100ms, 120s]，<=0 按 10s 处理。
     /// 握手完成后恢复为不限时，帧层超时由 `websocket.io_timeout` 控制。
     std::chrono::milliseconds handshake_timeout{10000};
+    /// 每连接帧读预取缓冲（字节）：整条连接常驻。长连接/idle 心跳场景
+    /// 4 KiB 足够；0 表示沿用 base 默认 16 KiB。大消息仍按需分段读取，
+    /// 该值只影响单次 recv 的粒度，不改变帧/消息语义。
+    std::size_t websocket_prefetch_bytes{1024};
     /// 帧/消息上限、帧层 IO 超时等，原样透传给 base WebSocket。
     net::WebSocketConfig websocket{};
 };
@@ -334,9 +338,10 @@ private:
     void AcceptLoop();
     void WorkerLoop();
     void ServeConnection(const net::Socket::Ptr& connection);
-    /// 读一个完整的 HTTP Upgrade 请求；成功时 parser 内部可能保留首帧字节。
-    bool ReadHandshake(const net::Socket::Ptr& connection, http::Parser& parser,
-                       http::Request& request, char* buffer, std::size_t capacity);
+    /// 读一个完整的 HTTP Upgrade 请求；成功后把 Parser 多读的首帧字节交给 pending。
+    /// 握手缓冲只在本调用内存在（1 KiB），避免每条连接常驻 4 KiB。
+    bool ReadHandshake(const net::Socket::Ptr& connection, http::Request& request,
+                       std::string& pending);
     /// 对非法 Upgrade 请求回 400 并关闭（只写响应，不进入 WebSocket 状态）。
     void RejectHandshake(const net::Socket::Ptr& connection) noexcept;
     ConnectionHandler FindConnectionHandler() const;

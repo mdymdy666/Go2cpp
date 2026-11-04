@@ -565,7 +565,14 @@ WebSocketResult WebSocket::read_exact(void* data, std::size_t size) {
     std::size_t offset = 0;
     // 预读块大小：一帧的 header/扩展/掩码/payload 通常一次 recv 就能取回，
     // 原来每个字段各一次 recv（最多 4 次系统调用/帧）。
-    constexpr std::size_t kPrefetchChunk = 16 * 1024;
+    // 该缓冲整条连接复用，是每连接常驻内存的主要项，因此由配置决定：
+    // 0 表示沿用默认 16 KiB；下限 512 字节，避免把一帧拆成过多 syscall。
+    constexpr std::size_t kDefaultPrefetchChunk = 16 * 1024;
+    constexpr std::size_t kMinPrefetchChunk = 512;
+    const std::size_t prefetch_chunk =
+        std::max(m_config.prefetch_bytes == 0 ? kDefaultPrefetchChunk
+                                              : m_config.prefetch_bytes,
+                 kMinPrefetchChunk);
     while (offset < size) {
         if (m_prefetched_offset < m_prefetched_valid) {
             const auto available = m_prefetched_valid - m_prefetched_offset;
@@ -583,7 +590,7 @@ WebSocketResult WebSocket::read_exact(void* data, std::size_t size) {
             else timeout -= elapsed;
         }
         try {
-            if (m_prefetched.size() < kPrefetchChunk) m_prefetched.resize(kPrefetchChunk);
+            if (m_prefetched.size() < prefetch_chunk) m_prefetched.resize(prefetch_chunk);
         } catch (const std::bad_alloc&) {
             return {WebSocketError::MessageTooLarge, ENOMEM,
                     "prefetch buffer allocation failed"};
