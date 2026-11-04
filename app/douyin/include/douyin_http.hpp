@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include "douyin_shutdown.hpp"
 #include "go2cpp/network/socket.hpp"
 
 #include <algorithm>
@@ -667,6 +668,13 @@ inline void ServeConnection(go2cpp::net::Socket& connection, const HttpHandler& 
 ///          生产环境应替换为 bento::HttpServer。
 class HttpServer {
    public:
+    /// @brief 就绪探针：返回 false 表示依赖（数据库等）不可用。
+    /// @details 在 accept 循环线程内串行调用，实现方无需同步。
+    using ReadinessProbe = std::function<bool(std::string* detail)>;
+
+    /// @brief accept 轮询超时：决定收到停止信号后多久停止 accept。
+    static constexpr std::chrono::milliseconds kAcceptPoll{200};
+
     HttpServer(std::string name, std::uint16_t port)
         : m_name(std::move(name)), m_port(port) {}
 
@@ -682,24 +690,134 @@ class HttpServer {
         return true;
     }
 
-    /// @brief 永久接受连接；进程被信号终止时退出。
+    /// @brief 注册就绪探针（例如数据库 `SELECT 1`）；未注册时只看关闭状态。
+    void SetReadinessProbe(ReadinessProbe probe) { m_probe = std::move(probe); }
+
+    /**
+     * @brief 接受连接直到收到 SIGTERM/SIGINT，然后优雅关闭。
+     *
+     * ## 步骤
+     * step1. 安装信号处理器与 5 s 看门狗（幂等）；
+     * step2. accept 前检查停止标志：命中即停止 accept，不再接受新连接；
+     * step3. 已接受的连接按串行语义完整处理完（请求不被打断）；
+     * step4. 回到循环顶部确认停止标志，打印「优雅关闭完成」并以退出码 0 返回。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：只能在主线程调用一次；串行处理，最多 1 个在途请求；
+     * - 信号语义：handler 只置位，`SA_RESTART` 保证在途 `recv` 不被 EINTR 打断；
+     * - 超时语义：看门狗从信号到达起 5 s 未退出则打印日志并 `_Exit(1)`。
+     */
     void ServeForever(const HttpHandler& handler) {
+        // step1: 信号只置位；看门狗负责 5 s 硬上限。
+        InstallShutdownSignals();
+        ArmShutdownWatchdog();
+        const HttpHandler wrapped = [this, &handler](const HttpRequest& request,
+                                                     HttpResponse* response) {
+            return HandleHealth(request, response) || handler(request, response);
+        };
         for (;;) {
-            auto connection = m_listener->accept();
+            // step2: 收到停止信号就停止 accept；本轮已接受的连接不受影响。
+            if (ShutdownRequested()) {
+                std::printf("[%s] 优雅关闭：收到停止信号，停止 accept，等待在途请求完成（在途 %d）\n",
+                            m_name.c_str(), m_inflight.load(std::memory_order_relaxed));
+                std::fflush(stdout);
+                break;
+            }
+            auto connection = m_listener->accept(kAcceptPoll);
             if (!connection) {
                 continue;
             }
-            ServeConnection(*connection, handler);
+            // step3: 串行处理——请求完整走完才回到循环，kill 不会中断在途请求。
+            m_inflight.fetch_add(1, std::memory_order_relaxed);
+            ServeConnection(*connection, wrapped);
+            m_inflight.fetch_sub(1, std::memory_order_relaxed);
             connection->close();
+            // 关闭期间处理完的那一个在途请求：明确记录，便于验证「kill 不中断请求」。
+            if (ShutdownRequested()) {
+                std::printf("[%s] 优雅关闭：在途请求已完成\n", m_name.c_str());
+                std::fflush(stdout);
+            }
         }
+        // step4: 关掉监听 fd，打印完成并交给 main 以 0 退出。
+        m_listener->close();
+        MarkShutdownFinished();
+        std::printf("[%s] 优雅关闭完成：在途请求已处理完，退出码 0\n", m_name.c_str());
+        std::fflush(stdout);
     }
 
     std::uint16_t Port() const noexcept { return m_port; }
 
    private:
+    /// @brief 处理 `/health/live` 与 `/health/ready`；命中返回 true。
+    /// @param request [in] 已解析请求——借用，调用期间有效。
+    /// @param response [out] 命中时写入状态码与 JSON body。
+    /// @return true 表示已处理，不再进入业务路由。
+    bool HandleHealth(const HttpRequest& request, HttpResponse* response) const {
+        // step1: 只响应 GET/HEAD；其余方法交给业务路由（通常回 405）。
+        if (request.method != "GET" && request.method != "HEAD") {
+            return false;
+        }
+        // step2: liveness 只看进程是否还能服务——收到停止信号后仍回 200，
+        //        让编排侧把「关闭中」判定交给 readiness。
+        if (request.path == "/health/live") {
+            response->status = 200;
+            response->content_type = "application/json; charset=utf-8";
+            response->body = "{\"ok\":true,\"status\":\"live\",\"service\":\"" +
+                             JsonEscape(m_name) + "\"}";
+            return true;
+        }
+        // step3: readiness = 未在关闭中 && 依赖探针通过；任一不满足回 503。
+        if (request.path == "/health/ready") {
+            std::string detail;
+            bool ready = !ShutdownRequested();
+            if (!ready) {
+                detail = "shutting down";
+            } else if (m_probe && !m_probe(&detail)) {
+                ready = false;
+            }
+            response->status = ready ? 200 : 503;
+            response->content_type = "application/json; charset=utf-8";
+            if (ready) {
+                response->body = "{\"ok\":true,\"status\":\"ready\",\"service\":\"" +
+                                 JsonEscape(m_name) + "\"}";
+            } else {
+                response->body = "{\"ok\":false,\"status\":\"not-ready\",\"service\":\"" +
+                                 JsonEscape(m_name) + "\",\"reason\":\"" +
+                                 JsonEscape(detail) + "\"}";
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /// @brief 最小 JSON 字符串转义：足够承载探针错误文本，不引入额外依赖。
+    /// @param text [in] 原始文本——借用，调用期间有效。
+    /// @return 可安全嵌入 JSON 字符串的副本。
+    static std::string JsonEscape(std::string_view text) {
+        std::string out;
+        out.reserve(text.size() + 8);
+        for (const char raw : text) {
+            const unsigned char c = static_cast<unsigned char>(raw);
+            switch (c) {
+                case '"': out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                default:
+                    out += (c < 0x20) ? '?' : raw;
+                    break;
+            }
+        }
+        return out;
+    }
+
     std::string m_name;
     std::uint16_t m_port;
     go2cpp::net::Socket::Ptr m_listener;
+    ReadinessProbe m_probe;
+    std::atomic<int> m_inflight{0};
 };
+
 
 }  // namespace douyin

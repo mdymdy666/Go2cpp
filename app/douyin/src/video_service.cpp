@@ -34,6 +34,7 @@
 #include "douyin_proto.hpp"
 #include "douyin_store.hpp"
 #include "douyin_tag.hpp"
+#include "go2cpp/storage/db.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -1587,6 +1588,33 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[%s] %s\n", kServiceName, error.c_str());
         return 1;
     }
+    // 就绪探针：SQLite 连接可读（`SELECT 1`）才算 ready；只读，不改任何数据。
+    // 表被删/连接失效时返回 false，`/health/ready` 回 503。
+    server.SetReadinessProbe([&store](std::string* detail) {
+        if (!store.Ok() || store.Database() == nullptr) {
+            if (detail != nullptr) {
+                *detail = "db not open";
+            }
+            return false;
+        }
+        // 只读查询核心表并真正执行一次（`Query` 只 prepare，`Next` 才 step）：
+        // 连接失效或 videos 表被删都会在 Err() 中体现 → `/health/ready` 503。
+        auto rows = store.Database()->Query("SELECT 1 FROM videos LIMIT 1");
+        if (!rows) {
+            if (detail != nullptr) {
+                *detail = "db prepare failed";
+            }
+            return false;
+        }
+        (void)rows.Value().Next();
+        if (rows.Value().Err()) {
+            if (detail != nullptr) {
+                *detail = "db query failed";
+            }
+            return false;
+        }
+        return true;
+    });
     const std::string web_dir = WebDir();
     std::printf("[%s] 监听 0.0.0.0:%u db=%s web=%s\n", kServiceName,
                 static_cast<unsigned>(port), db_path.c_str(), web_dir.c_str());

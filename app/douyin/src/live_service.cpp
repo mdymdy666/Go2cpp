@@ -20,6 +20,7 @@
 #include "douyin_http.hpp"
 #include "douyin_auth.hpp"
 #include "douyin_store.hpp"
+#include "go2cpp/storage/db.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -378,6 +379,31 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[%s] %s\n", kServiceName, error.c_str());
         return 1;
     }
+    // 就绪探针：核心表可读才算 ready；只读，不改任何数据。
+    // 表被删/连接失效时返回 false，`/health/ready` 回 503。
+    server.SetReadinessProbe([&store](std::string* detail) {
+        if (!store.Ok() || store.Database() == nullptr) {
+            if (detail != nullptr) {
+                *detail = "db not open";
+            }
+            return false;
+        }
+        auto rows = store.Database()->Query("SELECT 1 FROM rooms LIMIT 1");
+        if (!rows) {
+            if (detail != nullptr) {
+                *detail = "db prepare failed";
+            }
+            return false;
+        }
+        (void)rows.Value().Next();
+        if (rows.Value().Err()) {
+            if (detail != nullptr) {
+                *detail = "db query failed";
+            }
+            return false;
+        }
+        return true;
+    });
     std::printf("[%s] 监听 0.0.0.0:%u db=%s\n", kServiceName,
                 static_cast<unsigned>(port), db_path.c_str());
     std::fflush(stdout);
