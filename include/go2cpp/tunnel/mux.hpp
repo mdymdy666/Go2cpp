@@ -87,6 +87,22 @@ public:
      */
     bool Next(int timeout_ms, frame::Frame* out, std::string* err);
 
+    /**
+     * @brief 精确读取下一帧：只消费该帧的字节，不从连接预读。
+     *
+     * @param timeout_ms [in] 最长等待（毫秒）；<=0 立即超时
+     * @param out [out] 成功时写入；失败时保持原值
+     * @param err [out] 失败原因；成功时保持原值；可为 nullptr
+     * @return 成功 true；超时 / 连接关闭 / 帧畸形返回 false
+     *
+     * @details `Next()` 一次 recv 8 KiB，适合握手阶段连发多帧；但 raw 数据
+     *          连接在 HELLO_ACK 之后立刻切换为裸字节流，预读会把紧随其后的
+     *          HTTP 请求头吞进 `FrameCodec` 内部缓冲并在析构时丢弃（表现为
+     *          随机「请求缺头」或 `bad magic`）。本方法按帧头声明的长度
+     *          精确读取，读完 ACK 后连接上不会少一个字节。
+     */
+    bool NextExact(int timeout_ms, frame::Frame* out, std::string* err);
+
 private:
     TcpConn::Ptr m_conn;
     frame::FrameCodec m_codec;

@@ -21,6 +21,8 @@
  */
 
 #include "go2cpp/tunnel/client.hpp"
+#include "go2cpp/frame/frame_codec.hpp"
+#include "go2cpp/tunnel/mux.hpp"
 #include "go2cpp/tunnel/net.hpp"
 #include "go2cpp/tunnel/protocol.hpp"
 #include "go2cpp/tunnel/server.hpp"
@@ -911,6 +913,60 @@ void TestPerformance() {
     TUNNEL_CHECK(ratio < 4.0);
 }
 
+/// raw 数据连接握手回归：HELLO_ACK 之后紧跟的裸字节不能被帧读取器预读吞掉。
+/// @details 旧实现用 `FrameReader::Next`（一次 recv 8 KiB），服务端在 ACK
+///          后立刻写 HTTP 请求头时，请求头会被当成下一帧的半包留在
+///          `FrameCodec` 缓冲里，reader 析构即丢失；表现为随机 bad magic /
+///          请求缺头。`NextExact` 按帧长精确读取，读完 ACK 后一个字节不丢。
+void TestRawAckNoPreread() {
+    std::string error;
+    TcpListener::Ptr listener = TcpListener::Listen("127.0.0.1", 0, &error);
+    TUNNEL_CHECK(listener != nullptr);
+    if (!listener) {
+        return;
+    }
+    const std::string raw = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::thread server([&listener, &raw] {
+        TcpConn::Ptr peer = listener->Accept(3000);
+        if (!peer) {
+            return;
+        }
+        go2cpp::frame::FrameCodec codec(
+            go2cpp::tunnel::MakeTunnelFrameSpec(false));
+        go2cpp::frame::Frame ack;
+        ack.type = static_cast<std::uint8_t>(FrameType::kHelloAck);
+        const std::string payload = "ACKPAYLOAD";
+        ack.payload.assign(payload.begin(), payload.end());
+        std::vector<std::uint8_t> wire;
+        go2cpp::frame::Error encode_error;
+        if (codec.Encode(ack, &wire, &encode_error)) {
+            wire.insert(wire.end(), raw.begin(), raw.end());
+            (void)peer->WriteAll(wire.data(), wire.size(), 3000, nullptr);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        peer->Shutdown();
+    });
+    TcpConn::Ptr conn =
+        TcpConn::Dial("127.0.0.1", listener->BoundPort(), 3000, &error);
+    TUNNEL_CHECK(conn != nullptr);
+    if (conn) {
+        go2cpp::tunnel::FrameReader reader(conn, false);
+        go2cpp::frame::Frame frame;
+        std::string read_error;
+        TUNNEL_CHECK(reader.NextExact(2000, &frame, &read_error));
+        TUNNEL_CHECK(static_cast<FrameType>(frame.type) == FrameType::kHelloAck);
+        char buffer[512] = {};
+        const go2cpp::tunnel::IoResult rest =
+            conn->Read(buffer, sizeof(buffer), 1000);
+        TUNNEL_CHECK(rest.count == raw.size());
+        TUNNEL_CHECK(rest.count == raw.size() &&
+                     std::memcmp(buffer, raw.data(), raw.size()) == 0);
+        conn->Shutdown();
+    }
+    listener->Close();
+    server.join();
+}
+
 }  // namespace
 
 int main() {
@@ -924,6 +980,7 @@ int main() {
     TestReconnect();
     TestConcurrency();
     TestPerformance();
+    TestRawAckNoPreread();
 
     std::printf("\n[summary] checks=%d failures=%d\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

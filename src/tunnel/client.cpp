@@ -283,13 +283,31 @@ bool TunnelClient::ConnectAndRegister(bool data_role,
     session->set_on_raw_open([this](std::uint32_t stream_id,
                                     const std::string& peer_ip) {
         (void)peer_ip;
-        if (!RawStreamEnabledFromEnv()) {
+        if (!RawStreamEnabledFromEnv() ||
+            !m_running.load(std::memory_order_acquire)) {
             return;
         }
+        // 先登记再起线程：Stop() 通过 m_workers 等待本地转发线程退出，若
+        // 建连阶段不计入，Stop() 返回后 detach 线程仍会访问已析构的 this。
+        {
+            std::lock_guard<std::mutex> lock(m_worker_mutex);
+            ++m_workers;
+        }
         try {
-            std::thread([this, stream_id] { RelayRawStream(stream_id); })
-                .detach();
+            std::thread([this, stream_id] {
+                RelayRawStream(stream_id);
+                {
+                    std::lock_guard<std::mutex> lock(m_worker_mutex);
+                    --m_workers;
+                }
+                m_worker_cv.notify_all();
+            }).detach();
         } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(m_worker_mutex);
+                --m_workers;
+            }
+            m_worker_cv.notify_all();
             Emit("[tunnel] raw 流线程启动失败");
         }
     });
@@ -310,7 +328,9 @@ bool TunnelClient::ConnectAndRegister(bool data_role,
             session->Stop();
             return false;
         }
-        if (!reader.Next(m_config.hello_timeout_ms, &frame, &read_error) ||
+        // 必须用 NextExact：服务端在 ACK 之后立刻把 HTTP 请求头写进这条
+        // 连接，Next() 的 8 KiB 预读会把请求头吞进 FrameCodec 缓冲并丢弃。
+        if (!reader.NextExact(m_config.hello_timeout_ms, &frame, &read_error) ||
             static_cast<FrameType>(frame.type) != FrameType::kHelloAck ||
             !DecodeHelloAck(frame.payload.data(), frame.payload.size(), &ack,
                             nullptr)) {
@@ -605,10 +625,6 @@ void TunnelClient::RelayRawStream(std::uint32_t stream_id) {
         server_conn->Shutdown();
         return;
     }
-    {
-        std::lock_guard<std::mutex> lock(m_worker_mutex);
-        ++m_workers;
-    }
     m_streams_total.fetch_add(1, std::memory_order_relaxed);
     if (m_metric_streams != nullptr) {
         m_metric_streams->Inc();
@@ -619,11 +635,6 @@ void TunnelClient::RelayRawStream(std::uint32_t stream_id) {
     (void)splice_pipe.Run(nullptr, &splice_error);
     server_conn->Shutdown();
     local->Shutdown();
-    {
-        std::lock_guard<std::mutex> lock(m_worker_mutex);
-        --m_workers;
-    }
-    m_worker_cv.notify_all();
 }
 
 

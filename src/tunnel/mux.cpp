@@ -85,6 +85,35 @@ void StoreU32Le(std::uint8_t* out, std::uint32_t value) {
     out[3] = static_cast<std::uint8_t>((value >> 24U) & 0xFFU);
 }
 
+/// @brief 精确读满 `bytes` 字节（不预读），到期返回 false。
+/// @param conn [in] 连接；不可为 nullptr
+/// @param out [out] 目标缓冲，至少 `bytes` 字节
+/// @param bytes [in] 需要读满的字节数
+/// @param deadline [in] 绝对截止时间（steady_clock）
+/// @return 读满返回 true；超时 / 对端关闭 / 读错误返回 false
+/// @details 只用于 `FrameReader::NextExact`：任何按 8 KiB 缓冲的预读都会
+///          吞掉 ACK 之后的裸字节流，因此这里每次只请求剩余字节。
+bool ReadExactly(TcpConn* conn, std::uint8_t* out, std::size_t bytes,
+                 std::chrono::steady_clock::time_point deadline) {
+    std::size_t done = 0;
+    while (done < bytes) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return false;
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        const int slice =
+            static_cast<int>(std::max<std::int64_t>(1, remaining.count()));
+        const IoResult result = conn->Read(out + done, bytes - done, slice);
+        if (!result.ok()) {
+            return false;
+        }
+        done += result.count;
+    }
+    return true;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -143,6 +172,62 @@ bool FrameReader::Next(int timeout_ms, frame::Frame* out, std::string* err) {
     }
     for (std::size_t index = 1; index < frames.size(); ++index) {
         m_pending.push_back(std::move(frames[index]));
+    }
+    *out = std::move(frames.front());
+    return true;
+}
+
+bool FrameReader::NextExact(int timeout_ms, frame::Frame* out,
+                            std::string* err) {
+    if (out == nullptr) {
+        return false;
+    }
+    if (!m_pending.empty()) {
+        *out = std::move(m_pending.front());
+        m_pending.pop_front();
+        return true;
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(std::max(0, timeout_ms));
+    std::uint8_t header[kFrameHeaderBytes] = {};
+    if (!ReadExactly(m_conn.get(), header, sizeof(header), deadline)) {
+        if (err != nullptr) {
+            *err = "frame header timeout";
+        }
+        return false;
+    }
+    const std::size_t length = static_cast<std::size_t>(header[8]) |
+                               (static_cast<std::size_t>(header[9]) << 8U) |
+                               (static_cast<std::size_t>(header[10]) << 16U) |
+                               (static_cast<std::size_t>(header[11]) << 24U);
+    if (length > kMaxPayload) {
+        if (err != nullptr) {
+            *err = "frame payload too large";
+        }
+        return false;
+    }
+    const std::size_t trailer = m_codec.Spec().HasChecksum() ? 4U : 0U;
+    std::vector<std::uint8_t> wire(kFrameHeaderBytes + length + trailer);
+    std::memcpy(wire.data(), header, kFrameHeaderBytes);
+    if (!ReadExactly(m_conn.get(), wire.data() + kFrameHeaderBytes,
+                     length + trailer, deadline)) {
+        if (err != nullptr) {
+            *err = "frame payload timeout";
+        }
+        return false;
+    }
+    frame::FrameCodec codec(MakeTunnelFrameSpec(m_codec.Spec().HasChecksum()));
+    std::vector<frame::Frame> frames;
+    std::size_t consumed = 0;
+    frame::Error frame_error;
+    if (!codec.Feed(wire.data(), wire.size(), &frames, &consumed,
+                    &frame_error) ||
+        frames.size() != 1U) {
+        if (err != nullptr) {
+            *err = frame_error.message.empty() ? "malformed frame"
+                                               : frame_error.message;
+        }
+        return false;
     }
     *out = std::move(frames.front());
     return true;
