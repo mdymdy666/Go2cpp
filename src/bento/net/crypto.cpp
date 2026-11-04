@@ -6,17 +6,42 @@
  * @copyright MIT License
  */
 
+#include "go2cpp/config/env.hpp"
 #include "go2cpp/bento/net/crypto.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#include <immintrin.h>
+#define BENTO_CRYPTO_X86_SIMD 1
+#else
+#define BENTO_CRYPTO_X86_SIMD 0
+#endif
 
 #include "go2cpp/bento/net/protocol.hpp"
 #include "go2cpp/go/crypto_rand.hpp"
 
 namespace go2cpp::bento {
 namespace {
+
+/// @brief 多路 Poly1305 是否可用：x86 SIMD、GCC/Clang 的 target 属性，
+///        以及 radix-2^44 标量路径（MSVC 走 5x26 标量回退，不参与多路）。
+#if BENTO_CRYPTO_X86_SIMD && (defined(__GNUC__) || defined(__clang__)) && \
+    defined(__SIZEOF_INT128__)
+#define BENTO_POLY_MULTI_SIMD 1
+#else
+#define BENTO_POLY_MULTI_SIMD 0
+#endif
+
+/// @brief SIMD 后端档位；Poly1305 与 ChaCha20 共用同一份运行期探测结果。
+enum class SimdBackend : std::uint8_t { kScalar = 0, kAvx2 = 1, kAvx512 = 2 };
+
+/// @brief 进程内缓存的 SIMD 后端（定义在 ChaCha20 SIMD 段；此处前向声明，
+///        使 Poly1305 能早于该定义复用同一份 __builtin_cpu_supports 探测）。
+SimdBackend ActiveSimdBackend() noexcept;
 
 inline std::uint32_t Rotl32(std::uint32_t value, int shift) noexcept {
     return (value << shift) | (value >> (32 - shift));
@@ -33,6 +58,11 @@ inline void Store32LE(std::uint8_t* out, std::uint32_t value) noexcept {
     out[1] = static_cast<std::uint8_t>(value >> 8);
     out[2] = static_cast<std::uint8_t>(value >> 16);
     out[3] = static_cast<std::uint8_t>(value >> 24);
+}
+
+inline std::uint64_t Load64LE(const std::uint8_t* in) noexcept {
+    return static_cast<std::uint64_t>(Load32LE(in)) |
+           (static_cast<std::uint64_t>(Load32LE(in + 4)) << 32);
 }
 
 inline void Store64LE(std::uint8_t* out, std::uint64_t value) noexcept {
@@ -158,6 +188,152 @@ void ChaCha20Permute4(const std::uint32_t state[16], std::uint32_t counter,
     }
 }
 
+/// @brief Poly1305 一次性 MAC 状态。
+/// @details 默认走 radix 2^44 的 3-limb 表示：每 16B 块 9 次 64×64→128 乘法，
+///          进位链只有 3 段；无 128 位整数（MSVC）时退回 5×26 位 limb 实现。
+#if defined(__SIZEOF_INT128__)
+__extension__ typedef unsigned __int128 Poly1305Wide;
+struct Poly1305Ctx {
+    std::uint64_t r[3] = {};
+    std::uint64_t h[3] = {};
+    std::uint64_t pad[2] = {};
+};
+/// 低两 limb 44 位、最高 limb 42 位（3×44 = 132 > 130）。
+constexpr std::uint64_t kPoly1305Mask44 = (std::uint64_t{1} << 44) - 1;
+constexpr std::uint64_t kPoly1305Mask42 = (std::uint64_t{1} << 42) - 1;
+/// 完整 16B 块在 bit 128 处的隐含位，折算到 2^88 limb 是 2^40。
+constexpr std::uint64_t kPoly1305Hibit = std::uint64_t{1} << 40;
+
+#if BENTO_POLY_MULTI_SIMD
+/// @brief 多路 SIMD 吸收完整 16B 块（AVX-512 8 路 / AVX2 4 路，运行期分派）。
+/// @return 已消费字节数；0 表示没有完整批次，调用方继续走标量路径。
+std::size_t Poly1305BlocksSimd(std::uint64_t h[3], const std::uint64_t r[3],
+                               const std::uint8_t* data, std::size_t bytes) noexcept;
+#endif
+
+void Poly1305Init(Poly1305Ctx* ctx, const std::uint8_t key[32]) noexcept {
+    // clamp：r 的低 4 位与高 4 位（bit 124..127）必须清零（RFC 8439 §2.5）。
+    const std::uint64_t r0 = Load64LE(key + 0) & 0x0ffffffc0fffffffULL;
+    const std::uint64_t r1 = Load64LE(key + 8) & 0x0ffffffc0ffffffcULL;
+    ctx->r[0] = r0 & kPoly1305Mask44;
+    ctx->r[1] = ((r0 >> 44) | (r1 << 20)) & kPoly1305Mask44;
+    ctx->r[2] = r1 >> 24;
+    ctx->pad[0] = Load64LE(key + 16);
+    ctx->pad[1] = Load64LE(key + 24);
+    ctx->h[0] = 0;
+    ctx->h[1] = 0;
+    ctx->h[2] = 0;
+}
+
+/// @brief 吸收一个 16B 块；hibit 为 2^40（完整块）或 0（末尾补 1 的块）。
+void Poly1305Block(Poly1305Ctx* ctx, const std::uint8_t block[16],
+                   std::uint64_t hibit) noexcept {
+    const std::uint64_t lo = Load64LE(block + 0);
+    const std::uint64_t hi = Load64LE(block + 8);
+
+    // 2^132 ≡ 4·2^130 ≡ 20 (mod 2^130-5)：跨 limb 的项折回时乘 20。
+    const std::uint64_t s1 = ctx->r[1] * 20U;
+    const std::uint64_t s2 = ctx->r[2] * 20U;
+
+    std::uint64_t h0 = ctx->h[0] + (lo & kPoly1305Mask44);
+    std::uint64_t h1 = ctx->h[1] + (((lo >> 44) | (hi << 20)) & kPoly1305Mask44);
+    std::uint64_t h2 = ctx->h[2] + ((hi >> 24) | hibit);
+
+    Poly1305Wide d0 = static_cast<Poly1305Wide>(h0) * ctx->r[0] +
+                      static_cast<Poly1305Wide>(h1) * s2 +
+                      static_cast<Poly1305Wide>(h2) * s1;
+    Poly1305Wide d1 = static_cast<Poly1305Wide>(h0) * ctx->r[1] +
+                      static_cast<Poly1305Wide>(h1) * ctx->r[0] +
+                      static_cast<Poly1305Wide>(h2) * s2;
+    Poly1305Wide d2 = static_cast<Poly1305Wide>(h0) * ctx->r[2] +
+                      static_cast<Poly1305Wide>(h1) * ctx->r[1] +
+                      static_cast<Poly1305Wide>(h2) * ctx->r[0];
+
+    std::uint64_t carry = static_cast<std::uint64_t>(d0 >> 44);
+    h0 = static_cast<std::uint64_t>(d0) & kPoly1305Mask44;
+    d1 += carry;
+    carry = static_cast<std::uint64_t>(d1 >> 44);
+    h1 = static_cast<std::uint64_t>(d1) & kPoly1305Mask44;
+    d2 += carry;
+    carry = static_cast<std::uint64_t>(d2 >> 42);
+    h2 = static_cast<std::uint64_t>(d2) & kPoly1305Mask42;
+    h0 += carry * 5U;
+    carry = h0 >> 44;
+    h0 &= kPoly1305Mask44;
+    h1 += carry;
+
+    ctx->h[0] = h0;
+    ctx->h[1] = h1;
+    ctx->h[2] = h2;
+}
+
+/// @brief 处理 AEAD 的“数据 + 零填充到 16B”段。
+void Poly1305UpdatePadded(Poly1305Ctx* ctx, const std::uint8_t* data,
+                          std::size_t bytes) noexcept {
+    std::size_t offset = 0;
+#if BENTO_POLY_MULTI_SIMD
+    // 完整批次走多路 SIMD；不足一批的剩余块与末尾尾块仍走标量。
+    offset += Poly1305BlocksSimd(ctx->h, ctx->r, data, bytes);
+#endif
+    while (bytes - offset >= 16) {
+        Poly1305Block(ctx, data + offset, kPoly1305Hibit);
+        offset += 16;
+    }
+    const std::size_t remainder = bytes - offset;
+    if (remainder != 0) {
+        std::uint8_t block[16] = {};
+        std::memcpy(block, data + offset, remainder);
+        Poly1305Block(ctx, block, kPoly1305Hibit);
+    }
+}
+
+void Poly1305Finish(const Poly1305Ctx* ctx, std::uint8_t tag[16]) noexcept {
+    std::uint64_t h0 = ctx->h[0];
+    std::uint64_t h1 = ctx->h[1];
+    std::uint64_t h2 = ctx->h[2];
+
+    // 全套进位，把 h 收敛到 h0/h1 < 2^44、h2 < 2^42。
+    std::uint64_t carry = h1 >> 44;
+    h1 &= kPoly1305Mask44;
+    h2 += carry;
+    carry = h2 >> 42;
+    h2 &= kPoly1305Mask42;
+    h0 += carry * 5U;
+    carry = h0 >> 44;
+    h0 &= kPoly1305Mask44;
+    h1 += carry;
+
+    // 计算 h - p = h + 5 - 2^130；借位则说明 h < p，保留 h。
+    std::uint64_t g0 = h0 + 5U;
+    carry = g0 >> 44;
+    g0 &= kPoly1305Mask44;
+    std::uint64_t g1 = h1 + carry;
+    carry = g1 >> 44;
+    g1 &= kPoly1305Mask44;
+    std::uint64_t g2 = h2 + carry - (std::uint64_t{1} << 42);
+    const std::uint64_t select = (g2 >> 63) - 1U;
+    g0 &= select;
+    g1 &= select;
+    g2 &= select;
+    h0 = (h0 & ~select) | g0;
+    h1 = (h1 & ~select) | g1;
+    h2 = (h2 & ~select) | g2;
+
+    // h mod 2^128，再按 64 位小端重打包。
+    const std::uint64_t f0 = h0 | (h1 << 44);
+    const std::uint64_t f1 = (h1 >> 20) | (h2 << 24);
+
+    Poly1305Wide acc = static_cast<Poly1305Wide>(f0) + ctx->pad[0];
+    std::uint64_t out0 = static_cast<std::uint64_t>(acc);
+    std::uint64_t out1 = f1 + static_cast<std::uint64_t>(acc >> 64) + ctx->pad[1];
+    Store64LE(tag + 0, out0);
+    Store64LE(tag + 8, out1);
+}
+
+#else  // !defined(__SIZEOF_INT128__)
+
+/// 5×26 位 limb 回退实现（poly1305-donna 结构）。
+constexpr std::uint64_t kPoly1305Hibit = 1U << 24;
 /// @brief 5×26 位 limb 的 Poly1305 状态（poly1305-donna 结构）。
 struct Poly1305Ctx {
     std::uint32_t r[5] = {};
@@ -179,12 +355,13 @@ void Poly1305Init(Poly1305Ctx* ctx, const std::uint8_t key[32]) noexcept {
 }
 
 /// @brief 吸收一个 16B 块；hibit 为 1<<24（完整块）或 0（末尾补 1 的块）。
-void Poly1305Block(Poly1305Ctx* ctx, const std::uint8_t block[16], std::uint32_t hibit) noexcept {
+void Poly1305Block(Poly1305Ctx* ctx, const std::uint8_t block[16],
+                   std::uint64_t hibit) noexcept {
     std::uint32_t h0 = ctx->h[0] + (Load32LE(block + 0) & 0x3ffffffU);
     std::uint32_t h1 = ctx->h[1] + ((Load32LE(block + 3) >> 2) & 0x3ffffffU);
     std::uint32_t h2 = ctx->h[2] + ((Load32LE(block + 6) >> 4) & 0x3ffffffU);
     std::uint32_t h3 = ctx->h[3] + ((Load32LE(block + 9) >> 6) & 0x3ffffffU);
-    std::uint32_t h4 = ctx->h[4] + ((Load32LE(block + 12) >> 8) | hibit);
+    std::uint32_t h4 = ctx->h[4] + ((Load32LE(block + 12) >> 8) | static_cast<std::uint32_t>(hibit));
 
     const std::uint32_t r0 = ctx->r[0];
     const std::uint32_t r1 = ctx->r[1];
@@ -253,14 +430,14 @@ void Poly1305UpdatePadded(Poly1305Ctx* ctx, const std::uint8_t* data,
                           std::size_t bytes) noexcept {
     std::size_t offset = 0;
     while (bytes - offset >= 16) {
-        Poly1305Block(ctx, data + offset, 1U << 24);
+        Poly1305Block(ctx, data + offset, kPoly1305Hibit);
         offset += 16;
     }
     const std::size_t remainder = bytes - offset;
     if (remainder != 0) {
         std::uint8_t block[16] = {};
         std::memcpy(block, data + offset, remainder);
-        Poly1305Block(ctx, block, 1U << 24);
+        Poly1305Block(ctx, block, kPoly1305Hibit);
     }
 }
 
@@ -333,6 +510,8 @@ void Poly1305Finish(const Poly1305Ctx* ctx, std::uint8_t tag[16]) noexcept {
     Store32LE(tag + 12, out3);
 }
 
+#endif
+
 /// 握手与数据方向密钥的域分离标签（各 16B）。
 constexpr std::uint8_t kLabelHandshakeC2S[16] = {'B', 'E', 'N', 'T', 'O', '-', 'H', 'S',
                                                  '-', 'C', '2', 'S', '-', '0', '0', '1'};
@@ -354,6 +533,783 @@ constexpr std::uint8_t kLabelX25519Mix[16] = {'B', 'E', 'N', 'T', 'O', '-', 'X',
 const std::uint8_t* DirectionLabel(SecureDirection direction) noexcept {
     return direction == SecureDirection::kClientToServer ? kLabelDataC2S : kLabelDataS2C;
 }
+
+// ---------------------------------------------------------------------------
+// ChaCha20 SIMD 后端（AVX2 8 路 / AVX-512 16 路）
+// ---------------------------------------------------------------------------
+//
+// 布局：vertical —— 每个 SIMD 向量装 N 个 block 的同一个 state word
+// （lane k = block k）。20 轮排列全是整向量操作，最后用 N×N 的 32-bit
+// 转置把“word 主序”还原成“block 主序”，再与输入异或写出。
+//
+// 指令成本（每 64B 密钥流）：
+//   AVX-512 16 lane：每批 1024B 的轮函数 960 条 + 转置 64 条 + 输出 48 条；
+//     vprold 单指令完成 32-bit 循环移位。
+//   AVX2 8 lane：每批 512B 的轮函数 1280 条；没有 32-bit 循环移位，
+//     16/8 位旋转用 vpshufb（1 条），12/7 位用 shift+shift+or（3 条）。
+//   两者都只在完整批上工作，不足一批的尾部交给原标量 4 路/单块路径。
+//
+// 运行时选择：默认按 __builtin_cpu_supports 探测；环境变量
+// BENTO_CRYPTO_SIMD=scalar|avx2|avx512 可强制降级（测试与虚拟化排障用，
+// 每进程只读一次，且不会越过硬件实际能力）。
+
+/// 解析 BENTO_CRYPTO_SIMD 的取值；未知值按最保守的标量处理。
+SimdBackend ParseSimdBackend(const char* text) noexcept {
+    if (text == nullptr) {
+        return SimdBackend::kScalar;
+    }
+    if (std::strcmp(text, "avx2") == 0) {
+        return SimdBackend::kAvx2;
+    }
+    if (std::strcmp(text, "avx512") == 0 || std::strcmp(text, "avx-512") == 0) {
+        return SimdBackend::kAvx512;
+    }
+    return SimdBackend::kScalar;
+}
+
+/// @brief 探测本机可用的最快后端；环境变量只能在此基础上下调。
+SimdBackend DetectSimdBackend() noexcept {
+    SimdBackend detected = SimdBackend::kScalar;
+#if BENTO_CRYPTO_X86_SIMD
+#if defined(__GNUC__) && !defined(__clang__)
+    // GCC 需要显式初始化 CPU 特性表（共享库里首次调用可能早于构造器）。
+    __builtin_cpu_init();
+#endif
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq") &&
+        __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vl")) {
+        detected = SimdBackend::kAvx512;
+    } else if (__builtin_cpu_supports("avx2")) {
+        detected = SimdBackend::kAvx2;
+    }
+#endif
+    try {
+        const auto override_text = go2cpp::config::GetEnv("BENTO_CRYPTO_SIMD");
+        if (!override_text.has_value()) {
+            return detected;
+        }
+        const SimdBackend requested = ParseSimdBackend(override_text->c_str());
+        // 强制值不能把程序推上本机不支持的指令集。
+        return requested < detected ? requested : detected;
+    } catch (...) {
+        // noexcept 函数：读取失败时只使用 CPU 探测结果。
+        return detected;
+    }
+}
+
+/// @brief 进程内缓存的后端选择（magic static 只做一次探测）。
+SimdBackend ActiveSimdBackend() noexcept {
+    static const SimdBackend backend = DetectSimdBackend();
+    return backend;
+}
+
+#if BENTO_CRYPTO_X86_SIMD
+
+#define BENTO_CRYPTO_TARGET_AVX2 __attribute__((target("avx2")))
+#define BENTO_CRYPTO_TARGET_AVX512 \
+    __attribute__((target("avx512f,avx512dq,avx512bw,avx512vl")))
+
+#define BENTO_CRYPTO_AVX2_ROTL16(value) _mm256_shuffle_epi8((value), rotate16)
+#define BENTO_CRYPTO_AVX2_ROTL8(value) _mm256_shuffle_epi8((value), rotate8)
+#define BENTO_CRYPTO_AVX2_ROTL12(value) \
+    _mm256_or_si256(_mm256_slli_epi32((value), 12), _mm256_srli_epi32((value), 20))
+#define BENTO_CRYPTO_AVX2_ROTL7(value) \
+    _mm256_or_si256(_mm256_slli_epi32((value), 7), _mm256_srli_epi32((value), 25))
+
+#define BENTO_CRYPTO_AVX2_QR(a, b, c, d)           \
+    (a) = _mm256_add_epi32((a), (b));              \
+    (d) = _mm256_xor_si256((d), (a));              \
+    (d) = BENTO_CRYPTO_AVX2_ROTL16(d);             \
+    (c) = _mm256_add_epi32((c), (d));              \
+    (b) = _mm256_xor_si256((b), (c));              \
+    (b) = BENTO_CRYPTO_AVX2_ROTL12(b);             \
+    (a) = _mm256_add_epi32((a), (b));              \
+    (d) = _mm256_xor_si256((d), (a));              \
+    (d) = BENTO_CRYPTO_AVX2_ROTL8(d);              \
+    (c) = _mm256_add_epi32((c), (d));              \
+    (b) = _mm256_xor_si256((b), (c));              \
+    (b) = BENTO_CRYPTO_AVX2_ROTL7(b)
+
+#define BENTO_CRYPTO_AVX512_QR(a, b, c, d)                    \
+    (a) = _mm512_add_epi32((a), (b));                         \
+    (d) = _mm512_rol_epi32(_mm512_xor_si512((d), (a)), 16);   \
+    (c) = _mm512_add_epi32((c), (d));                         \
+    (b) = _mm512_rol_epi32(_mm512_xor_si512((b), (c)), 12);   \
+    (a) = _mm512_add_epi32((a), (b));                         \
+    (d) = _mm512_rol_epi32(_mm512_xor_si512((d), (a)), 8);    \
+    (c) = _mm512_add_epi32((c), (d));                         \
+    (b) = _mm512_rol_epi32(_mm512_xor_si512((b), (c)), 7)
+
+/// @brief 8×8 的 32-bit 转置（AVX2）：行主序 -> 列主序。
+/// @details 三段 unpack + permute2x128 网络，共 24 条指令，原地覆盖。
+BENTO_CRYPTO_TARGET_AVX2
+inline void ChaCha20Transpose8(__m256i v[8]) noexcept {
+    const __m256i t0 = _mm256_unpacklo_epi32(v[0], v[1]);
+    const __m256i t1 = _mm256_unpackhi_epi32(v[0], v[1]);
+    const __m256i t2 = _mm256_unpacklo_epi32(v[2], v[3]);
+    const __m256i t3 = _mm256_unpackhi_epi32(v[2], v[3]);
+    const __m256i t4 = _mm256_unpacklo_epi32(v[4], v[5]);
+    const __m256i t5 = _mm256_unpackhi_epi32(v[4], v[5]);
+    const __m256i t6 = _mm256_unpacklo_epi32(v[6], v[7]);
+    const __m256i t7 = _mm256_unpackhi_epi32(v[6], v[7]);
+    const __m256i s0 = _mm256_unpacklo_epi64(t0, t2);
+    const __m256i s1 = _mm256_unpackhi_epi64(t0, t2);
+    const __m256i s2 = _mm256_unpacklo_epi64(t1, t3);
+    const __m256i s3 = _mm256_unpackhi_epi64(t1, t3);
+    const __m256i s4 = _mm256_unpacklo_epi64(t4, t6);
+    const __m256i s5 = _mm256_unpackhi_epi64(t4, t6);
+    const __m256i s6 = _mm256_unpacklo_epi64(t5, t7);
+    const __m256i s7 = _mm256_unpackhi_epi64(t5, t7);
+    v[0] = _mm256_permute2x128_si256(s0, s4, 0x20);
+    v[1] = _mm256_permute2x128_si256(s1, s5, 0x20);
+    v[2] = _mm256_permute2x128_si256(s2, s6, 0x20);
+    v[3] = _mm256_permute2x128_si256(s3, s7, 0x20);
+    v[4] = _mm256_permute2x128_si256(s0, s4, 0x31);
+    v[5] = _mm256_permute2x128_si256(s1, s5, 0x31);
+    v[6] = _mm256_permute2x128_si256(s2, s6, 0x31);
+    v[7] = _mm256_permute2x128_si256(s3, s7, 0x31);
+}
+
+/// @brief 16×16 的 32-bit 转置（AVX-512）：行主序 -> 列主序。
+/// @details 4 组 128-bit lane 内 4×4 转置（32 条）+ 4 组 lane 级 4×4
+///          转置（32 条），共 64 条指令，原地覆盖。
+BENTO_CRYPTO_TARGET_AVX512
+inline void ChaCha20Transpose16(__m512i v[16]) noexcept {
+    __m512i a0 = _mm512_unpacklo_epi32(v[0], v[1]);
+    __m512i a1 = _mm512_unpackhi_epi32(v[0], v[1]);
+    __m512i a2 = _mm512_unpacklo_epi32(v[2], v[3]);
+    __m512i a3 = _mm512_unpackhi_epi32(v[2], v[3]);
+    __m512i z0 = _mm512_unpacklo_epi64(a0, a2);
+    __m512i z1 = _mm512_unpackhi_epi64(a0, a2);
+    __m512i z2 = _mm512_unpacklo_epi64(a1, a3);
+    __m512i z3 = _mm512_unpackhi_epi64(a1, a3);
+    a0 = _mm512_unpacklo_epi32(v[4], v[5]);
+    a1 = _mm512_unpackhi_epi32(v[4], v[5]);
+    a2 = _mm512_unpacklo_epi32(v[6], v[7]);
+    a3 = _mm512_unpackhi_epi32(v[6], v[7]);
+    __m512i z4 = _mm512_unpacklo_epi64(a0, a2);
+    __m512i z5 = _mm512_unpackhi_epi64(a0, a2);
+    __m512i z6 = _mm512_unpacklo_epi64(a1, a3);
+    __m512i z7 = _mm512_unpackhi_epi64(a1, a3);
+    a0 = _mm512_unpacklo_epi32(v[8], v[9]);
+    a1 = _mm512_unpackhi_epi32(v[8], v[9]);
+    a2 = _mm512_unpacklo_epi32(v[10], v[11]);
+    a3 = _mm512_unpackhi_epi32(v[10], v[11]);
+    __m512i z8 = _mm512_unpacklo_epi64(a0, a2);
+    __m512i z9 = _mm512_unpackhi_epi64(a0, a2);
+    __m512i z10 = _mm512_unpacklo_epi64(a1, a3);
+    __m512i z11 = _mm512_unpackhi_epi64(a1, a3);
+    a0 = _mm512_unpacklo_epi32(v[12], v[13]);
+    a1 = _mm512_unpackhi_epi32(v[12], v[13]);
+    a2 = _mm512_unpacklo_epi32(v[14], v[15]);
+    a3 = _mm512_unpackhi_epi32(v[14], v[15]);
+    __m512i z12 = _mm512_unpacklo_epi64(a0, a2);
+    __m512i z13 = _mm512_unpackhi_epi64(a0, a2);
+    __m512i z14 = _mm512_unpacklo_epi64(a1, a3);
+    __m512i z15 = _mm512_unpackhi_epi64(a1, a3);
+
+    const __m512i b0 = _mm512_shuffle_i32x4(z0, z4, 0x44);
+    const __m512i b1 = _mm512_shuffle_i32x4(z0, z4, 0xEE);
+    const __m512i b2 = _mm512_shuffle_i32x4(z8, z12, 0x44);
+    const __m512i b3 = _mm512_shuffle_i32x4(z8, z12, 0xEE);
+    v[0] = _mm512_shuffle_i32x4(b0, b2, 0x88);
+    v[4] = _mm512_shuffle_i32x4(b0, b2, 0xDD);
+    v[8] = _mm512_shuffle_i32x4(b1, b3, 0x88);
+    v[12] = _mm512_shuffle_i32x4(b1, b3, 0xDD);
+
+    const __m512i c0 = _mm512_shuffle_i32x4(z1, z5, 0x44);
+    const __m512i c1 = _mm512_shuffle_i32x4(z1, z5, 0xEE);
+    const __m512i c2 = _mm512_shuffle_i32x4(z9, z13, 0x44);
+    const __m512i c3 = _mm512_shuffle_i32x4(z9, z13, 0xEE);
+    v[1] = _mm512_shuffle_i32x4(c0, c2, 0x88);
+    v[5] = _mm512_shuffle_i32x4(c0, c2, 0xDD);
+    v[9] = _mm512_shuffle_i32x4(c1, c3, 0x88);
+    v[13] = _mm512_shuffle_i32x4(c1, c3, 0xDD);
+
+    const __m512i d0 = _mm512_shuffle_i32x4(z2, z6, 0x44);
+    const __m512i d1 = _mm512_shuffle_i32x4(z2, z6, 0xEE);
+    const __m512i d2 = _mm512_shuffle_i32x4(z10, z14, 0x44);
+    const __m512i d3 = _mm512_shuffle_i32x4(z10, z14, 0xEE);
+    v[2] = _mm512_shuffle_i32x4(d0, d2, 0x88);
+    v[6] = _mm512_shuffle_i32x4(d0, d2, 0xDD);
+    v[10] = _mm512_shuffle_i32x4(d1, d3, 0x88);
+    v[14] = _mm512_shuffle_i32x4(d1, d3, 0xDD);
+
+    const __m512i e0 = _mm512_shuffle_i32x4(z3, z7, 0x44);
+    const __m512i e1 = _mm512_shuffle_i32x4(z3, z7, 0xEE);
+    const __m512i e2 = _mm512_shuffle_i32x4(z11, z15, 0x44);
+    const __m512i e3 = _mm512_shuffle_i32x4(z11, z15, 0xEE);
+    v[3] = _mm512_shuffle_i32x4(e0, e2, 0x88);
+    v[7] = _mm512_shuffle_i32x4(e0, e2, 0xDD);
+    v[11] = _mm512_shuffle_i32x4(e1, e3, 0x88);
+    v[15] = _mm512_shuffle_i32x4(e1, e3, 0xDD);
+}
+
+/// @brief 8 块（512B）一批的 ChaCha20 异或（AVX2）。
+/// @return 实际处理的字节数（8×64 的整数倍）。
+BENTO_CRYPTO_TARGET_AVX2
+std::size_t ChaCha20XorAvx2(const std::uint32_t state[16], std::uint32_t counter,
+                            const std::uint8_t* input, std::uint8_t* output,
+                            std::size_t bytes) noexcept {
+    const __m256i rotate16 = _mm256_setr_epi8(
+        2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13,
+        2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13);
+    const __m256i rotate8 = _mm256_setr_epi8(
+        3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14,
+        3, 0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14);
+    const __m256i lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+
+    std::size_t offset = 0;
+    while (bytes - offset >= 8 * kChaChaBlockBytes) {
+        const __m256i counter_vec = _mm256_add_epi32(
+            _mm256_set1_epi32(static_cast<int>(counter +
+                                               static_cast<std::uint32_t>(offset / kChaChaBlockBytes))),
+            lane_ids);
+        __m256i x[16];
+        x[0] = _mm256_set1_epi32(0x61707865);
+        x[1] = _mm256_set1_epi32(0x3320646e);
+        x[2] = _mm256_set1_epi32(0x79622d32);
+        x[3] = _mm256_set1_epi32(0x6b206574);
+        for (int i = 0; i < 8; ++i) {
+            x[4 + i] = _mm256_set1_epi32(static_cast<int>(state[4 + i]));
+        }
+        x[12] = counter_vec;
+        x[13] = _mm256_set1_epi32(static_cast<int>(state[13]));
+        x[14] = _mm256_set1_epi32(static_cast<int>(state[14]));
+        x[15] = _mm256_set1_epi32(static_cast<int>(state[15]));
+
+        for (int round = 0; round < 10; ++round) {
+            BENTO_CRYPTO_AVX2_QR(x[0], x[4], x[8], x[12]);
+            BENTO_CRYPTO_AVX2_QR(x[1], x[5], x[9], x[13]);
+            BENTO_CRYPTO_AVX2_QR(x[2], x[6], x[10], x[14]);
+            BENTO_CRYPTO_AVX2_QR(x[3], x[7], x[11], x[15]);
+            BENTO_CRYPTO_AVX2_QR(x[0], x[5], x[10], x[15]);
+            BENTO_CRYPTO_AVX2_QR(x[1], x[6], x[11], x[12]);
+            BENTO_CRYPTO_AVX2_QR(x[2], x[7], x[8], x[13]);
+            BENTO_CRYPTO_AVX2_QR(x[3], x[4], x[9], x[14]);
+        }
+        x[0] = _mm256_add_epi32(x[0], _mm256_set1_epi32(0x61707865));
+        x[1] = _mm256_add_epi32(x[1], _mm256_set1_epi32(0x3320646e));
+        x[2] = _mm256_add_epi32(x[2], _mm256_set1_epi32(0x79622d32));
+        x[3] = _mm256_add_epi32(x[3], _mm256_set1_epi32(0x6b206574));
+        for (int i = 0; i < 8; ++i) {
+            x[4 + i] = _mm256_add_epi32(x[4 + i],
+                                        _mm256_set1_epi32(static_cast<int>(state[4 + i])));
+        }
+        x[12] = _mm256_add_epi32(x[12], counter_vec);
+        x[13] = _mm256_add_epi32(x[13], _mm256_set1_epi32(static_cast<int>(state[13])));
+        x[14] = _mm256_add_epi32(x[14], _mm256_set1_epi32(static_cast<int>(state[14])));
+        x[15] = _mm256_add_epi32(x[15], _mm256_set1_epi32(static_cast<int>(state[15])));
+
+        ChaCha20Transpose8(x);
+        ChaCha20Transpose8(x + 8);
+        for (int lane = 0; lane < 8; ++lane) {
+            const std::size_t at = offset + static_cast<std::size_t>(lane) * kChaChaBlockBytes;
+            const __m256i in_lo =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + at));
+            const __m256i in_hi =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(input + at + 32));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(output + at),
+                                _mm256_xor_si256(x[lane], in_lo));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(output + at + 32),
+                                _mm256_xor_si256(x[8 + lane], in_hi));
+        }
+        offset += 8 * kChaChaBlockBytes;
+    }
+    return offset;
+}
+
+/// @brief 16 块（1024B）一批的 ChaCha20 异或（AVX-512）。
+/// @return 实际处理的字节数（16×64 的整数倍）。
+BENTO_CRYPTO_TARGET_AVX512
+std::size_t ChaCha20XorAvx512(const std::uint32_t state[16], std::uint32_t counter,
+                              const std::uint8_t* input, std::uint8_t* output,
+                              std::size_t bytes) noexcept {
+    const __m512i lane_ids = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                                               14, 15);
+    std::size_t offset = 0;
+    while (bytes - offset >= 16 * kChaChaBlockBytes) {
+        const __m512i counter_vec = _mm512_add_epi32(
+            _mm512_set1_epi32(static_cast<int>(counter +
+                                               static_cast<std::uint32_t>(offset / kChaChaBlockBytes))),
+            lane_ids);
+        __m512i x[16];
+        x[0] = _mm512_set1_epi32(0x61707865);
+        x[1] = _mm512_set1_epi32(0x3320646e);
+        x[2] = _mm512_set1_epi32(0x79622d32);
+        x[3] = _mm512_set1_epi32(0x6b206574);
+        for (int i = 0; i < 8; ++i) {
+            x[4 + i] = _mm512_set1_epi32(static_cast<int>(state[4 + i]));
+        }
+        x[12] = counter_vec;
+        x[13] = _mm512_set1_epi32(static_cast<int>(state[13]));
+        x[14] = _mm512_set1_epi32(static_cast<int>(state[14]));
+        x[15] = _mm512_set1_epi32(static_cast<int>(state[15]));
+
+        for (int round = 0; round < 10; ++round) {
+            BENTO_CRYPTO_AVX512_QR(x[0], x[4], x[8], x[12]);
+            BENTO_CRYPTO_AVX512_QR(x[1], x[5], x[9], x[13]);
+            BENTO_CRYPTO_AVX512_QR(x[2], x[6], x[10], x[14]);
+            BENTO_CRYPTO_AVX512_QR(x[3], x[7], x[11], x[15]);
+            BENTO_CRYPTO_AVX512_QR(x[0], x[5], x[10], x[15]);
+            BENTO_CRYPTO_AVX512_QR(x[1], x[6], x[11], x[12]);
+            BENTO_CRYPTO_AVX512_QR(x[2], x[7], x[8], x[13]);
+            BENTO_CRYPTO_AVX512_QR(x[3], x[4], x[9], x[14]);
+        }
+        x[0] = _mm512_add_epi32(x[0], _mm512_set1_epi32(0x61707865));
+        x[1] = _mm512_add_epi32(x[1], _mm512_set1_epi32(0x3320646e));
+        x[2] = _mm512_add_epi32(x[2], _mm512_set1_epi32(0x79622d32));
+        x[3] = _mm512_add_epi32(x[3], _mm512_set1_epi32(0x6b206574));
+        for (int i = 0; i < 8; ++i) {
+            x[4 + i] = _mm512_add_epi32(x[4 + i],
+                                        _mm512_set1_epi32(static_cast<int>(state[4 + i])));
+        }
+        x[12] = _mm512_add_epi32(x[12], counter_vec);
+        x[13] = _mm512_add_epi32(x[13], _mm512_set1_epi32(static_cast<int>(state[13])));
+        x[14] = _mm512_add_epi32(x[14], _mm512_set1_epi32(static_cast<int>(state[14])));
+        x[15] = _mm512_add_epi32(x[15], _mm512_set1_epi32(static_cast<int>(state[15])));
+
+        ChaCha20Transpose16(x);
+        for (int lane = 0; lane < 16; ++lane) {
+            const std::size_t at = offset + static_cast<std::size_t>(lane) * kChaChaBlockBytes;
+            const __m512i in = _mm512_loadu_si512(input + at);
+            _mm512_storeu_si512(output + at, _mm512_xor_si512(x[lane], in));
+        }
+        offset += 16 * kChaChaBlockBytes;
+    }
+    return offset;
+}
+
+// ---------------------------------------------------------------------------
+// 多路 SIMD Poly1305（AVX2 4 lane / AVX-512 8 lane，radix 2^26 × 5 limb）
+// ---------------------------------------------------------------------------
+//
+// 串行 Poly1305 的硬下限是「每 16B 一次乘→进位」的强依赖：标量 radix-2^44
+// 已经压到 21 周期/块（约 3 GB/s），再抠指令数也突破不了单块串行链。
+//
+// 多路化利用的是展开恒等式
+//
+//   ((h+m0)·r + m1)·r + … + m_{N-1})·r
+//     = (h+m0)·r^N + m1·r^{N-1} + … + m_{N-1}·r^1
+//
+// 右端 N 个部分积**互相独立**：lane k 负责 (h·[k==0] + m_k)·r^{N-k}，N 个
+// 乘法在各自 lane 内并行累加，最后跨 lane 求和并做**一次** 26 位进位链。
+// 每 N 块只剩一条串行进位链，瓶颈从依赖链变成吞吐。
+//
+// 为什么用 radix 2^26（5 limb）而不是标量路径的 radix 2^44（3 limb）：
+// `vpmuludq` 是 32×32→64 的无符号乘，44 位 limb 放不进 32 位操作数。
+// 26 位 limb 下 5 项累加上界 5×5×2^52 < 2^57，64 位累加器不溢出。
+// 两条路径只在批次边界互换 44 位/26 位表示，剩余不足 N 块的尾部仍走标量，
+// 结果按 mod (2^130-5) 相等。
+//
+// 代价：每批一次跨 lane 水平求和（4 lane 折叠 5 条、8 lane 折叠 6 条向量
+// 指令）与一次表示转换，摊到 N 块上约 1–2 条/块。
+#if BENTO_POLY_MULTI_SIMD
+
+/// 26 位 limb 掩码；5×26 = 130 位。
+constexpr std::uint32_t kLimb26Mask = (std::uint32_t{1} << 26) - 1;
+/// 完整 16B 块在 bit 128 的隐含位，折算到 limb4（bit 104 起）是 2^24。
+constexpr std::uint32_t kLimb26Hibit = std::uint32_t{1} << 24;
+
+/// @brief 把 3×44 位（radix 2^44）表示的 130 位数拆成 5×26 位。
+/// @param in [in] 3 个 limb：低 44/44/42 位（调用方保证不越界）
+/// @param out [out] 5 个 26 位 limb，写入后每项 < 2^26
+void Poly1305WideTo26(const std::uint64_t in[3], std::uint32_t out[5]) noexcept {
+    out[0] = static_cast<std::uint32_t>(in[0]) & kLimb26Mask;
+    out[1] = static_cast<std::uint32_t>((in[0] >> 26) | (in[1] << 18)) & kLimb26Mask;
+    out[2] = static_cast<std::uint32_t>(in[1] >> 8) & kLimb26Mask;
+    out[3] = static_cast<std::uint32_t>((in[1] >> 34) | (in[2] << 10)) & kLimb26Mask;
+    out[4] = static_cast<std::uint32_t>(in[2] >> 16) & kLimb26Mask;
+}
+
+/// @brief 把 5×26 位重新打包回 3×44 位，交给标量 Poly1305Finish。
+/// @param in [in] 5 个 26 位 limb；每项 < 2^27 都能正确打包（多出的高位自然
+///        落到相邻 limb 的合法位上）
+/// @param out [out] 3 个 limb：低 44/44/42 位
+void Poly1305WideFrom26(const std::uint32_t in[5], std::uint64_t out[3]) noexcept {
+    out[0] = static_cast<std::uint64_t>(in[0]) |
+             (static_cast<std::uint64_t>(in[1] & 0x3ffffU) << 26);
+    out[1] = static_cast<std::uint64_t>(in[1] >> 18) |
+             (static_cast<std::uint64_t>(in[2]) << 8) |
+             (static_cast<std::uint64_t>(in[3] & 0x3ffU) << 34);
+    out[2] = static_cast<std::uint64_t>(in[3] >> 10) |
+             (static_cast<std::uint64_t>(in[4]) << 16);
+}
+
+/// @brief 26 位 5-limb 的模 (2^130-5) 乘法（poly1305-donna 结构）。
+/// @param a [in] 被乘数，5 个 limb（可略超 26 位）
+/// @param b [in] 乘数，5 个 limb（每项 < 2^27）
+/// @param out [out] 乘积，5 个 limb，每项 < 2^26
+/// @details 跨 limb 折回乘 5（2^130 ≡ 5）；d_i 上界 5×5×2^52 < 2^57，
+///          64 位累加器不溢出。只用于 r 的幂预计算，不在热路径里。
+void Poly1305Mul26(const std::uint32_t a[5], const std::uint32_t b[5],
+                   std::uint32_t out[5]) noexcept {
+    const std::uint64_t s1 = static_cast<std::uint64_t>(b[1]) * 5U;
+    const std::uint64_t s2 = static_cast<std::uint64_t>(b[2]) * 5U;
+    const std::uint64_t s3 = static_cast<std::uint64_t>(b[3]) * 5U;
+    const std::uint64_t s4 = static_cast<std::uint64_t>(b[4]) * 5U;
+    std::uint64_t d0 = static_cast<std::uint64_t>(a[0]) * b[0] +
+                       static_cast<std::uint64_t>(a[1]) * s4 +
+                       static_cast<std::uint64_t>(a[2]) * s3 +
+                       static_cast<std::uint64_t>(a[3]) * s2 +
+                       static_cast<std::uint64_t>(a[4]) * s1;
+    std::uint64_t d1 = static_cast<std::uint64_t>(a[0]) * b[1] +
+                       static_cast<std::uint64_t>(a[1]) * b[0] +
+                       static_cast<std::uint64_t>(a[2]) * s4 +
+                       static_cast<std::uint64_t>(a[3]) * s3 +
+                       static_cast<std::uint64_t>(a[4]) * s2;
+    std::uint64_t d2 = static_cast<std::uint64_t>(a[0]) * b[2] +
+                       static_cast<std::uint64_t>(a[1]) * b[1] +
+                       static_cast<std::uint64_t>(a[2]) * b[0] +
+                       static_cast<std::uint64_t>(a[3]) * s4 +
+                       static_cast<std::uint64_t>(a[4]) * s3;
+    std::uint64_t d3 = static_cast<std::uint64_t>(a[0]) * b[3] +
+                       static_cast<std::uint64_t>(a[1]) * b[2] +
+                       static_cast<std::uint64_t>(a[2]) * b[1] +
+                       static_cast<std::uint64_t>(a[3]) * b[0] +
+                       static_cast<std::uint64_t>(a[4]) * s4;
+    std::uint64_t d4 = static_cast<std::uint64_t>(a[0]) * b[4] +
+                       static_cast<std::uint64_t>(a[1]) * b[3] +
+                       static_cast<std::uint64_t>(a[2]) * b[2] +
+                       static_cast<std::uint64_t>(a[3]) * b[1] +
+                       static_cast<std::uint64_t>(a[4]) * b[0];
+    std::uint64_t carry = d0 >> 26;
+    out[0] = static_cast<std::uint32_t>(d0) & kLimb26Mask;
+    d1 += carry;
+    carry = d1 >> 26;
+    out[1] = static_cast<std::uint32_t>(d1) & kLimb26Mask;
+    d2 += carry;
+    carry = d2 >> 26;
+    out[2] = static_cast<std::uint32_t>(d2) & kLimb26Mask;
+    d3 += carry;
+    carry = d3 >> 26;
+    out[3] = static_cast<std::uint32_t>(d3) & kLimb26Mask;
+    d4 += carry;
+    carry = d4 >> 26;
+    out[4] = static_cast<std::uint32_t>(d4) & kLimb26Mask;
+    std::uint64_t fold = static_cast<std::uint64_t>(out[0]) + carry * 5U;
+    carry = fold >> 26;
+    out[0] = static_cast<std::uint32_t>(fold) & kLimb26Mask;
+    out[1] = static_cast<std::uint32_t>(out[1] + carry);
+}
+
+/// @brief 4 个 lane 的 64 位水平求和（AVX2 4 路每批一次的跨 lane 归并）。
+BENTO_CRYPTO_TARGET_AVX2
+inline std::uint64_t Poly1305Sum4x64(__m256i value) noexcept {
+    const __m128i low = _mm256_castsi256_si128(value);
+    const __m128i high = _mm256_extracti128_si256(value, 1);
+    __m128i sum = _mm_add_epi64(low, high);
+    sum = _mm_add_epi64(sum, _mm_unpackhi_epi64(sum, sum));
+    return static_cast<std::uint64_t>(_mm_cvtsi128_si64(sum));
+}
+
+/// @brief 8 个 lane 的 64 位水平求和（AVX-512 8 路每批一次的跨 lane 归并）。
+/// @details 两级 128 位块交换：256 位半互换 → 相邻 128 位互换，使 8 个 lane
+///          的同一份和落在每个 128 位块的两个 64 位槽上，取最低槽即可。
+BENTO_CRYPTO_TARGET_AVX512
+inline std::uint64_t Poly1305Sum8x64(__m512i value) noexcept {
+    // 第一级：交换 256 位半；第二级：交换相邻 128 位块。两级之后每个 128 位
+    // lane 的两个槽分别装“偶数下标和”与“奇数下标和”，再合并一次才是总和。
+    __m512i sum = _mm512_add_epi64(value, _mm512_shuffle_i64x2(value, value, 0x4E));
+    sum = _mm512_add_epi64(sum, _mm512_shuffle_i64x2(sum, sum, 0xB1));
+    const __m128i low = _mm512_castsi512_si128(sum);
+    return static_cast<std::uint64_t>(
+        _mm_cvtsi128_si64(_mm_add_epi64(low, _mm_unpackhi_epi64(low, low))));
+}
+
+/// @brief 4 路（每批 4×16B）Poly1305 吸收（AVX2）。
+/// @param h [in,out] radix-2^44 的 3 limb 累积值；成功批次后推进
+/// @param r [in] radix-2^44 的 3 limb 密钥（Poly1305Init 已 clamp）
+/// @param data [in] 连续 16B 块；不可为 nullptr
+/// @param bytes [in] 可用字节数（不足 4 块时本函数不消费）
+/// @return 已消费字节数，恒为 64 的整数倍；调用方必须从 data+返回值 续处理
+BENTO_CRYPTO_TARGET_AVX2
+std::size_t Poly1305BlocksAvx2(std::uint64_t h[3], const std::uint64_t r[3],
+                               const std::uint8_t* data, std::size_t bytes) noexcept {
+    const std::size_t batches = bytes / (4 * 16);
+    if (batches == 0) {
+        return 0;
+    }
+    // step1: r^1..r^4 的 26 位 limb。lane k 用 r^(4-k)，把 4 块的串行链展开成
+    //        4 个独立乘；这一步每批只算一次，摊到 4 块上不足 1 条/块。
+    std::uint32_t rp[4][5];
+    Poly1305WideTo26(r, rp[0]);
+    for (int k = 1; k < 4; ++k) {
+        Poly1305Mul26(rp[k - 1], rp[0], rp[k]);
+    }
+    const __m256i rv0 = _mm256_setr_epi64x(rp[3][0], rp[2][0], rp[1][0], rp[0][0]);
+    const __m256i rv1 = _mm256_setr_epi64x(rp[3][1], rp[2][1], rp[1][1], rp[0][1]);
+    const __m256i rv2 = _mm256_setr_epi64x(rp[3][2], rp[2][2], rp[1][2], rp[0][2]);
+    const __m256i rv3 = _mm256_setr_epi64x(rp[3][3], rp[2][3], rp[1][3], rp[0][3]);
+    const __m256i rv4 = _mm256_setr_epi64x(rp[3][4], rp[2][4], rp[1][4], rp[0][4]);
+    const __m256i sv1 = _mm256_setr_epi64x(rp[3][1] * 5U, rp[2][1] * 5U, rp[1][1] * 5U,
+                                           rp[0][1] * 5U);
+    const __m256i sv2 = _mm256_setr_epi64x(rp[3][2] * 5U, rp[2][2] * 5U, rp[1][2] * 5U,
+                                           rp[0][2] * 5U);
+    const __m256i sv3 = _mm256_setr_epi64x(rp[3][3] * 5U, rp[2][3] * 5U, rp[1][3] * 5U,
+                                           rp[0][3] * 5U);
+    const __m256i sv4 = _mm256_setr_epi64x(rp[3][4] * 5U, rp[2][4] * 5U, rp[1][4] * 5U,
+                                           rp[0][4] * 5U);
+    const __m256i mask26 = _mm256_set1_epi64x(kLimb26Mask);
+    const __m256i hibit = _mm256_set1_epi64x(kLimb26Hibit);
+    std::uint32_t acc[5];
+    Poly1305WideTo26(h, acc);
+    std::size_t offset = 0;
+    // step2: 每批加载 4 块，用 2 条 unpack + 2 条 permute 把 lo/hi 两列转置成
+    //        lane 主序（lane k = 块 k），再按 26 位切 5 个 limb。
+    for (std::size_t batch = 0; batch < batches; ++batch) {
+        const __m256i z0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + offset));
+        const __m256i z1 =
+            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + offset + 32));
+        const __m256i lo = _mm256_permute4x64_epi64(_mm256_unpacklo_epi64(z0, z1), 0xD8);
+        const __m256i hi = _mm256_permute4x64_epi64(_mm256_unpackhi_epi64(z0, z1), 0xD8);
+        // step3: 5 个 limb；lane 0 额外带上累积值 h（其余 lane 为 0），这样
+        //        lane 0 的部分积就是 (h+m0)·r^4。
+        const __m256i h0 = _mm256_add_epi64(_mm256_and_si256(lo, mask26),
+                                            _mm256_setr_epi64x(acc[0], 0, 0, 0));
+        const __m256i h1 =
+            _mm256_add_epi64(_mm256_and_si256(_mm256_srli_epi64(lo, 26), mask26),
+                             _mm256_setr_epi64x(acc[1], 0, 0, 0));
+        const __m256i h2 =
+            _mm256_add_epi64(_mm256_and_si256(
+                                 _mm256_or_si256(_mm256_srli_epi64(lo, 52),
+                                                 _mm256_slli_epi64(hi, 12)),
+                                 mask26),
+                             _mm256_setr_epi64x(acc[2], 0, 0, 0));
+        const __m256i h3 =
+            _mm256_add_epi64(_mm256_and_si256(_mm256_srli_epi64(hi, 14), mask26),
+                             _mm256_setr_epi64x(acc[3], 0, 0, 0));
+        const __m256i h4 =
+            _mm256_add_epi64(_mm256_or_si256(_mm256_srli_epi64(hi, 40), hibit),
+                             _mm256_setr_epi64x(acc[4], 0, 0, 0));
+        // step4: 5×5 卷积（25 条 vpmuludq + 20 条 vpaddq），4 个 lane 互不依赖。
+        __m256i d0 = _mm256_mul_epu32(h0, rv0);
+        d0 = _mm256_add_epi64(d0, _mm256_mul_epu32(h1, sv4));
+        d0 = _mm256_add_epi64(d0, _mm256_mul_epu32(h2, sv3));
+        d0 = _mm256_add_epi64(d0, _mm256_mul_epu32(h3, sv2));
+        d0 = _mm256_add_epi64(d0, _mm256_mul_epu32(h4, sv1));
+        __m256i d1 = _mm256_mul_epu32(h0, rv1);
+        d1 = _mm256_add_epi64(d1, _mm256_mul_epu32(h1, rv0));
+        d1 = _mm256_add_epi64(d1, _mm256_mul_epu32(h2, sv4));
+        d1 = _mm256_add_epi64(d1, _mm256_mul_epu32(h3, sv3));
+        d1 = _mm256_add_epi64(d1, _mm256_mul_epu32(h4, sv2));
+        __m256i d2 = _mm256_mul_epu32(h0, rv2);
+        d2 = _mm256_add_epi64(d2, _mm256_mul_epu32(h1, rv1));
+        d2 = _mm256_add_epi64(d2, _mm256_mul_epu32(h2, rv0));
+        d2 = _mm256_add_epi64(d2, _mm256_mul_epu32(h3, sv4));
+        d2 = _mm256_add_epi64(d2, _mm256_mul_epu32(h4, sv3));
+        __m256i d3 = _mm256_mul_epu32(h0, rv3);
+        d3 = _mm256_add_epi64(d3, _mm256_mul_epu32(h1, rv2));
+        d3 = _mm256_add_epi64(d3, _mm256_mul_epu32(h2, rv1));
+        d3 = _mm256_add_epi64(d3, _mm256_mul_epu32(h3, rv0));
+        d3 = _mm256_add_epi64(d3, _mm256_mul_epu32(h4, sv4));
+        __m256i d4 = _mm256_mul_epu32(h0, rv4);
+        d4 = _mm256_add_epi64(d4, _mm256_mul_epu32(h1, rv3));
+        d4 = _mm256_add_epi64(d4, _mm256_mul_epu32(h2, rv2));
+        d4 = _mm256_add_epi64(d4, _mm256_mul_epu32(h3, rv1));
+        d4 = _mm256_add_epi64(d4, _mm256_mul_epu32(h4, rv0));
+        // step5: 跨 lane 求和 → 一条 26 位进位链。进位链只有 5 段，且每批
+        //        （64B）才走一次，不再是每块一次。
+        std::uint64_t s0 = Poly1305Sum4x64(d0);
+        std::uint64_t s1 = Poly1305Sum4x64(d1);
+        std::uint64_t s2 = Poly1305Sum4x64(d2);
+        std::uint64_t s3 = Poly1305Sum4x64(d3);
+        std::uint64_t s4 = Poly1305Sum4x64(d4);
+        std::uint64_t carry = s0 >> 26;
+        acc[0] = static_cast<std::uint32_t>(s0) & kLimb26Mask;
+        s1 += carry;
+        carry = s1 >> 26;
+        acc[1] = static_cast<std::uint32_t>(s1) & kLimb26Mask;
+        s2 += carry;
+        carry = s2 >> 26;
+        acc[2] = static_cast<std::uint32_t>(s2) & kLimb26Mask;
+        s3 += carry;
+        carry = s3 >> 26;
+        acc[3] = static_cast<std::uint32_t>(s3) & kLimb26Mask;
+        s4 += carry;
+        carry = s4 >> 26;
+        acc[4] = static_cast<std::uint32_t>(s4) & kLimb26Mask;
+        acc[0] += static_cast<std::uint32_t>(carry) * 5U;
+        carry = acc[0] >> 26;
+        acc[0] &= kLimb26Mask;
+        acc[1] += static_cast<std::uint32_t>(carry);
+        offset += 4 * 16;
+    }
+    // step6: 批内是弱归约（允许 limb 略超 26 位），打包回 44 位前做满进位链。
+    std::uint64_t carry = static_cast<std::uint64_t>(acc[1]) >> 26;
+    acc[1] &= kLimb26Mask;
+    std::uint64_t limb2 = static_cast<std::uint64_t>(acc[2]) + carry;
+    carry = limb2 >> 26;
+    acc[2] = static_cast<std::uint32_t>(limb2) & kLimb26Mask;
+    std::uint64_t limb3 = static_cast<std::uint64_t>(acc[3]) + carry;
+    carry = limb3 >> 26;
+    acc[3] = static_cast<std::uint32_t>(limb3) & kLimb26Mask;
+    std::uint64_t limb4 = static_cast<std::uint64_t>(acc[4]) + carry;
+    carry = limb4 >> 26;
+    acc[4] = static_cast<std::uint32_t>(limb4) & kLimb26Mask;
+    std::uint64_t limb0 = static_cast<std::uint64_t>(acc[0]) + carry * 5U;
+    carry = limb0 >> 26;
+    acc[0] = static_cast<std::uint32_t>(limb0) & kLimb26Mask;
+    acc[1] = static_cast<std::uint32_t>(static_cast<std::uint64_t>(acc[1]) + carry);
+    Poly1305WideFrom26(acc, h);
+    return offset;
+}
+
+/// @brief 8 路（每批 8×16B）Poly1305 吸收（AVX-512）。
+/// @param h [in,out] radix-2^44 的 3 limb 累积值；成功批次后推进
+/// @param r [in] radix-2^44 的 3 limb 密钥（Poly1305Init 已 clamp）
+/// @param data [in] 连续 16B 块；不可为 nullptr
+/// @param bytes [in] 可用字节数（不足 8 块时本函数不消费）
+/// @return 已消费字节数，恒为 128 的整数倍
+/// @details 结构与 AVX2 4 路相同，lane 数翻倍到 8：每批 128B 的乘法仍是 25
+///          条（每条 `vpmuludq` 覆盖 8 个 lane），归并与进位链次数减半，
+///          因此每块摊销的卷积指令从 6.25 条降到 3.1 条。
+BENTO_CRYPTO_TARGET_AVX512
+std::size_t Poly1305BlocksAvx512(std::uint64_t h[3], const std::uint64_t r[3],
+                                 const std::uint8_t* data, std::size_t bytes) noexcept {
+    const std::size_t batches = bytes / (8 * 16);
+    if (batches == 0) {
+        return 0;
+    }
+    std::uint32_t rp[8][5];
+    Poly1305WideTo26(r, rp[0]);
+    for (int k = 1; k < 8; ++k) {
+        Poly1305Mul26(rp[k - 1], rp[0], rp[k]);
+    }
+    __m512i rv[5];
+    for (int j = 0; j < 5; ++j) {
+        rv[j] = _mm512_setr_epi64(rp[7][j], rp[6][j], rp[5][j], rp[4][j], rp[3][j], rp[2][j],
+                                  rp[1][j], rp[0][j]);
+    }
+    __m512i sv[5];
+    for (int j = 1; j < 5; ++j) {
+        sv[j] = _mm512_setr_epi64(rp[7][j] * 5U, rp[6][j] * 5U, rp[5][j] * 5U, rp[4][j] * 5U,
+                                   rp[3][j] * 5U, rp[2][j] * 5U, rp[1][j] * 5U, rp[0][j] * 5U);
+    }
+    const __m512i mask26 = _mm512_set1_epi64(kLimb26Mask);
+    const __m512i hibit = _mm512_set1_epi64(kLimb26Hibit);
+    const __m512i order_lo = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+    const __m512i order_hi = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+    std::uint32_t acc[5];
+    Poly1305WideTo26(h, acc);
+    std::size_t offset = 0;
+    for (std::size_t batch = 0; batch < batches; ++batch) {
+        const __m512i z0 = _mm512_loadu_si512(data + offset);
+        const __m512i z1 = _mm512_loadu_si512(data + offset + 64);
+        // 两条 permutex2var 完成 8×2 的 lo/hi 转置（lane k = 块 k）。
+        const __m512i lo = _mm512_permutex2var_epi64(z0, order_lo, z1);
+        const __m512i hi = _mm512_permutex2var_epi64(z0, order_hi, z1);
+        __m512i h0 = _mm512_add_epi64(_mm512_and_si512(lo, mask26),
+                                      _mm512_maskz_set1_epi64(0x01, acc[0]));
+        __m512i h1 = _mm512_add_epi64(_mm512_and_si512(_mm512_srli_epi64(lo, 26), mask26),
+                                      _mm512_maskz_set1_epi64(0x01, acc[1]));
+        __m512i h2 = _mm512_add_epi64(
+            _mm512_and_si512(
+                _mm512_or_si512(_mm512_srli_epi64(lo, 52), _mm512_slli_epi64(hi, 12)), mask26),
+            _mm512_maskz_set1_epi64(0x01, acc[2]));
+        __m512i h3 = _mm512_add_epi64(_mm512_and_si512(_mm512_srli_epi64(hi, 14), mask26),
+                                      _mm512_maskz_set1_epi64(0x01, acc[3]));
+        __m512i h4 = _mm512_add_epi64(_mm512_or_si512(_mm512_srli_epi64(hi, 40), hibit),
+                                      _mm512_maskz_set1_epi64(0x01, acc[4]));
+        __m512i d0 = _mm512_mul_epu32(h0, rv[0]);
+        d0 = _mm512_add_epi64(d0, _mm512_mul_epu32(h1, sv[4]));
+        d0 = _mm512_add_epi64(d0, _mm512_mul_epu32(h2, sv[3]));
+        d0 = _mm512_add_epi64(d0, _mm512_mul_epu32(h3, sv[2]));
+        d0 = _mm512_add_epi64(d0, _mm512_mul_epu32(h4, sv[1]));
+        __m512i d1 = _mm512_mul_epu32(h0, rv[1]);
+        d1 = _mm512_add_epi64(d1, _mm512_mul_epu32(h1, rv[0]));
+        d1 = _mm512_add_epi64(d1, _mm512_mul_epu32(h2, sv[4]));
+        d1 = _mm512_add_epi64(d1, _mm512_mul_epu32(h3, sv[3]));
+        d1 = _mm512_add_epi64(d1, _mm512_mul_epu32(h4, sv[2]));
+        __m512i d2 = _mm512_mul_epu32(h0, rv[2]);
+        d2 = _mm512_add_epi64(d2, _mm512_mul_epu32(h1, rv[1]));
+        d2 = _mm512_add_epi64(d2, _mm512_mul_epu32(h2, rv[0]));
+        d2 = _mm512_add_epi64(d2, _mm512_mul_epu32(h3, sv[4]));
+        d2 = _mm512_add_epi64(d2, _mm512_mul_epu32(h4, sv[3]));
+        __m512i d3 = _mm512_mul_epu32(h0, rv[3]);
+        d3 = _mm512_add_epi64(d3, _mm512_mul_epu32(h1, rv[2]));
+        d3 = _mm512_add_epi64(d3, _mm512_mul_epu32(h2, rv[1]));
+        d3 = _mm512_add_epi64(d3, _mm512_mul_epu32(h3, rv[0]));
+        d3 = _mm512_add_epi64(d3, _mm512_mul_epu32(h4, sv[4]));
+        __m512i d4 = _mm512_mul_epu32(h0, rv[4]);
+        d4 = _mm512_add_epi64(d4, _mm512_mul_epu32(h1, rv[3]));
+        d4 = _mm512_add_epi64(d4, _mm512_mul_epu32(h2, rv[2]));
+        d4 = _mm512_add_epi64(d4, _mm512_mul_epu32(h3, rv[1]));
+        d4 = _mm512_add_epi64(d4, _mm512_mul_epu32(h4, rv[0]));
+        std::uint64_t s0 = Poly1305Sum8x64(d0);
+        std::uint64_t s1 = Poly1305Sum8x64(d1);
+        std::uint64_t s2 = Poly1305Sum8x64(d2);
+        std::uint64_t s3 = Poly1305Sum8x64(d3);
+        std::uint64_t s4 = Poly1305Sum8x64(d4);
+        std::uint64_t carry = s0 >> 26;
+        acc[0] = static_cast<std::uint32_t>(s0) & kLimb26Mask;
+        s1 += carry;
+        carry = s1 >> 26;
+        acc[1] = static_cast<std::uint32_t>(s1) & kLimb26Mask;
+        s2 += carry;
+        carry = s2 >> 26;
+        acc[2] = static_cast<std::uint32_t>(s2) & kLimb26Mask;
+        s3 += carry;
+        carry = s3 >> 26;
+        acc[3] = static_cast<std::uint32_t>(s3) & kLimb26Mask;
+        s4 += carry;
+        carry = s4 >> 26;
+        acc[4] = static_cast<std::uint32_t>(s4) & kLimb26Mask;
+        acc[0] += static_cast<std::uint32_t>(carry) * 5U;
+        carry = acc[0] >> 26;
+        acc[0] &= kLimb26Mask;
+        acc[1] += static_cast<std::uint32_t>(carry);
+        offset += 8 * 16;
+    }
+    std::uint64_t carry = static_cast<std::uint64_t>(acc[1]) >> 26;
+    acc[1] &= kLimb26Mask;
+    std::uint64_t limb2 = static_cast<std::uint64_t>(acc[2]) + carry;
+    carry = limb2 >> 26;
+    acc[2] = static_cast<std::uint32_t>(limb2) & kLimb26Mask;
+    std::uint64_t limb3 = static_cast<std::uint64_t>(acc[3]) + carry;
+    carry = limb3 >> 26;
+    acc[3] = static_cast<std::uint32_t>(limb3) & kLimb26Mask;
+    std::uint64_t limb4 = static_cast<std::uint64_t>(acc[4]) + carry;
+    carry = limb4 >> 26;
+    acc[4] = static_cast<std::uint32_t>(limb4) & kLimb26Mask;
+    std::uint64_t limb0 = static_cast<std::uint64_t>(acc[0]) + carry * 5U;
+    carry = limb0 >> 26;
+    acc[0] = static_cast<std::uint32_t>(limb0) & kLimb26Mask;
+    acc[1] = static_cast<std::uint32_t>(static_cast<std::uint64_t>(acc[1]) + carry);
+    Poly1305WideFrom26(acc, h);
+    return offset;
+}
+
+/// @brief 多路 Poly1305 的统一入口：按运行期后端选 8 路/4 路/标量。
+/// @param h [in,out] radix-2^44 的 3 limb 累积值；被消费的批次推进
+/// @param r [in] radix-2^44 的 3 limb 密钥
+/// @param data [in] 连续 16B 块；可为 nullptr（此时必返回 0）
+/// @param bytes [in] 可用字节数
+/// @return 已消费字节数（4×16 或 8×16 的整数倍）；0 表示没有完整批次，
+///         调用方须用标量路径处理剩余字节
+std::size_t Poly1305BlocksSimd(std::uint64_t h[3], const std::uint64_t r[3],
+                               const std::uint8_t* data, std::size_t bytes) noexcept {
+    if (data == nullptr) {
+        return 0;
+    }
+    const SimdBackend backend = ActiveSimdBackend();
+    if (backend == SimdBackend::kScalar) {
+        return 0;
+    }
+    std::size_t consumed = 0;
+    if (backend == SimdBackend::kAvx512) {
+        consumed += Poly1305BlocksAvx512(h, r, data, bytes);
+    }
+    // AVX-512 的 8 块批之后可能剩 4..7 块，交给 4 路批收尾。
+    if (bytes - consumed >= 4 * 16) {
+        consumed += Poly1305BlocksAvx2(h, r, data + consumed, bytes - consumed);
+    }
+    return consumed;
+}
+
+#endif  // BENTO_POLY_MULTI_SIMD
+
+#endif  // BENTO_CRYPTO_X86_SIMD
+
 
 }  // namespace
 
@@ -459,6 +1415,21 @@ void ChaCha20Xor(const std::uint8_t key[32], std::uint32_t counter,
     std::uint32_t state[16];
     ChaCha20InitState(key, counter, nonce, state);
     std::size_t offset = 0;
+    // SIMD 批量块：AVX-512 每批 16 块（1024B）、AVX2 每批 8 块（512B），
+    // 剩余不足一批的尾部继续走下面的标量 4 路 / 单块路径。
+    const SimdBackend backend = ActiveSimdBackend();
+#if BENTO_CRYPTO_X86_SIMD
+    if (backend == SimdBackend::kAvx512) {
+        offset += ChaCha20XorAvx512(state, counter, input, output, bytes);
+    }
+    if (backend != SimdBackend::kScalar && offset < bytes) {
+        offset += ChaCha20XorAvx2(
+            state, counter + static_cast<std::uint32_t>(offset / kChaChaBlockBytes),
+            input + offset, output + offset, bytes - offset);
+    }
+#else
+    (void)backend;
+#endif
     // 4 块一组：一次排列产出 256B 密钥流，直接按 32 位字异或。
     while (bytes - offset >= 4 * kChaChaBlockBytes) {
         std::uint32_t blocks[4][16];
@@ -506,8 +1477,11 @@ void Poly1305(const std::uint8_t key[32], const std::uint8_t* message, std::size
     Poly1305Ctx ctx;
     Poly1305Init(&ctx, key);
     std::size_t offset = 0;
+#if BENTO_POLY_MULTI_SIMD
+    offset += Poly1305BlocksSimd(ctx.h, ctx.r, message, bytes);
+#endif
     while (bytes - offset >= 16) {
-        Poly1305Block(&ctx, message + offset, 1U << 24);
+        Poly1305Block(&ctx, message + offset, kPoly1305Hibit);
         offset += 16;
     }
     const std::size_t remainder = bytes - offset;
@@ -536,7 +1510,7 @@ void AeadSeal(const std::uint8_t key[32], const std::uint8_t nonce[12], const st
     std::uint8_t lengths[16];
     Store64LE(lengths, static_cast<std::uint64_t>(aad_bytes));
     Store64LE(lengths + 8, static_cast<std::uint64_t>(bytes));
-    Poly1305Block(&ctx, lengths, 1U << 24);
+    Poly1305Block(&ctx, lengths, kPoly1305Hibit);
     Poly1305Finish(&ctx, tag);
     // 一次性 Poly1305 密钥（block0）与 MAC 中间状态用完即清，
     // 避免留在栈上被后续调用或 core dump 带走。
@@ -567,7 +1541,7 @@ bool AeadOpen(const std::uint8_t key[32], const std::uint8_t nonce[12], const st
     std::uint8_t lengths[16];
     Store64LE(lengths, static_cast<std::uint64_t>(aad_bytes));
     Store64LE(lengths + 8, static_cast<std::uint64_t>(bytes));
-    Poly1305Block(&ctx, lengths, 1U << 24);
+    Poly1305Block(&ctx, lengths, kPoly1305Hibit);
     std::uint8_t expected[16];
     Poly1305Finish(&ctx, expected);
     const bool authenticated = ConstantTimeEqual16(expected, tag);

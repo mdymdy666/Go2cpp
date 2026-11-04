@@ -567,3 +567,130 @@ g++ -O2 -std=c++17 -Iinclude /mnt/e/tmp/tls_bench2/check_vectors.cpp \
 ```
 src/bento/net/crypto.cpp | +约 500 行（SIMD 后端 + radix-2^44 + 分派）
 ```
+
+## 多路 SIMD Poly1305（2026-11-04）
+
+> 工作树 `/UserData/CodexWorkSpace/Go2cpp`；机器同 §0（Ryzen 9 8945HX，Zen 4，
+> AVX2 / AVX-512F/DQ/BW/VL/IFMA 均可用）。只改 `src/bento/net/crypto.cpp`
+> （**+981 行 / −7 行**，全部在匿名命名空间内），**未 commit**。
+
+### 1. 结论（先说数）
+
+| 指标 | 改动前（§13 终态） | 改动后 | 变化 |
+|---|---:|---:|---:|
+| Poly1305 单测 64 KiB | 3.07 GB/s | **9.28 GB/s** | 3.02× |
+| Poly1305 单测 1 MiB | 3.12 GB/s | **9.36 GB/s** | 3.00× |
+| AEAD seal 64 KiB | 1976.6 MB/s | **4211.2 MB/s** | 2.13× |
+| AEAD seal 1 MiB | 1951.1 MB/s | **4376.6 MB/s** | 2.24× |
+| vs EVP 倍率 64 KiB | 2.58× | **1.28×** | −50% |
+| vs EVP 倍率 1 MiB | 2.83× | **1.29×** | −54% |
+
+- 相对 §13 的起点（366.7 MB/s / 13.40×），大包累计 **11.48×**，倍率 13.40× → **1.28×**。
+- **未达 1.1×**：要 ≤1.1× 需总吞吐 ≥4.7 GB/s，即 Poly ≥12.6 GB/s；实测 9.3 GB/s，
+  差 1.35×。瓶颈与下一步见 §5。
+
+### 2. 算法（为什么多路能把 3 GB/s 变成 9 GB/s）
+
+串行的 `h ← (h + m)·r` 是强依赖链：标量 radix-2^44 已压到 21 周期/块，再抠指令
+也突破不了单块串行链（§13.5）。多路化用的是展开恒等式
+
+```
+((h+m0)·r + m1)·r + … + m_{N-1})·r
+  = (h+m0)·r^N + m1·r^{N-1} + … + m_{N-1}·r^1
+```
+
+右端 N 个部分积**互相独立**：lane k 算 `(h·[k==0] + m_k)·r^{N-k}`，N 个乘法在各自
+lane 内并行累加，最后跨 lane 求和并做**一次** 26 位进位链。每 N 块只剩一条串行
+进位链，瓶颈从依赖链变成吞吐。
+
+表示换成 **radix 2^26 × 5 limb**（标量路径是 radix 2^44 × 3 limb）：`vpmuludq` 是
+32×32→64 的无符号乘，44 位 limb 放不进 32 位操作数；26 位 limb 下 5 项累加上界
+`5×5×2^52 < 2^57`，64 位累加器不溢出。两条路径只在批次边界互换 44/26 位表示，
+不足 N 块的尾部仍走原来的标量 `Poly1305Block`。
+
+### 3. 改动
+
+1. **`Poly1305BlocksAvx2`（4 路，每批 64B）**：2 条 `vmovdqu` + 2 条 `vpunpck` +
+   2 条 `vpermq` 把 4 个块的 lo/hi 转置成 lane 主序；5 个 26 位 limb 用 shift/and/or
+   提取；**25 条 `vpmuludq` + 20 条 `vpaddq`** 完成 5×5 卷积（4 个 lane 完全并行）；
+   每批一次跨 lane 求和（5 条向量指令/向量）与 5 段 26 位进位链。
+2. **`Poly1305BlocksAvx512`（8 路，每批 128B）**：`vpermutex2var_epi64` 两条完成
+   8×2 转置；同样 25 条 `vpmuludq` 覆盖 8 个 lane（每块摊销从 6.25 条降到 3.1 条）；
+   `_mm512_maskz_set1_epi64` 把累积值只放进 lane 0。
+3. **运行期分派**：`Poly1305BlocksSimd` 复用 ChaCha20 已有的 `SimdBackend`
+   （`__builtin_cpu_supports` + magic static 缓存）；AVX-512 先按 8 块批吃，
+   剩下 4–7 块交 4 路批收尾，再剩下的走标量。`BENTO_CRYPTO_SIMD=scalar|avx2|avx512`
+   可强制降级（**已实测**三条路径，不是纸面分支）。
+4. **零改动保证**：`Poly1305Ctx`/`Poly1305Finish`/`Poly1305Block` 一行未改；
+   多路只在批次边界读写同一个 `h[3]`/`r[3]`，所以 `Poly1305Finish` 的抗恒等
+   与 tag 归约逻辑仍然只有一份。
+5. `SimdBackend` 枚举与 `ActiveSimdBackend()` 前置声明上移到文件头，供 Poly1305
+   早于 ChaCha 段引用；MSVC（无 `__SIZEOF_INT128__` 或非 GCC/Clang）保持 5×26
+   标量回退，`BENTO_POLY_MULTI_SIMD` 为 0 时整块代码不参与编译。
+6. 零告警：`-O3 -Wall -Wextra -Wpedantic` 下无输出。
+
+### 4. 正确性
+
+```bash
+# 项目单测（含 RFC 8439 §2.5.2/§2.8.2 与帧/重放窗口）
+cmake --build build-review --target bento_test_crypto -j12 && ./build-review/bento_test_crypto
+# → [PASS] test_crypto (5482 checks)；[INFO] aead throughput: seal=3953.8MB/s
+
+# 独立对拍：RFC 向量 + 0..2049 全长度往返 + 逐字节篡改拒绝
+/tmp/tls_bench3/cv2              # AVX-512 8 路 → ALL_VECTORS_OK
+BENTO_CRYPTO_SIMD=avx2  ...      # AVX2 4 路  → ALL_VECTORS_OK
+BENTO_CRYPTO_SIMD=scalar ...     # 标量回退   → ALL_VECTORS_OK
+```
+
+对拍过程中抓到并修掉一个真 bug：AVX-512 的水平求和少做最后一步 128 位块内
+64 位合并，导致只累加了偶数 lane（160B 的篡改被接受）；补上后三后端全过。
+
+### 5. 为什么停在 9.3 GB/s（书面瓶颈）
+
+- 8 路每批 128B 的理论指令量：约 115 条 512 位指令（其中 25 条乘法）→ Zen 4
+  双泵下每批约 29–35 周期 → 每块 3.6–4.4 周期，理论上限约 14–18 GB/s。
+- 实测 9.3 GB/s ≈ 每块 6.9 周期（4 GHz 折算），即每批约 55 周期，比指令吞吐
+  预算多 20 周期。已定位的两块开销：
+  1. **跨 lane 求和是每批的串行尾巴**：5 个 `d` 各要做 3 级折叠（8→4→2→1），
+     每级 shuffle 延迟 3–4 周期，5 个并行后仍占约 30 条指令与 12 周期延迟；
+  2. **批间 `h` 往返**：折叠结果 → 标量进位链 → `vpbroadcastq` 回 lane 0，
+     每批约 10–20 周期纯延迟。
+- 已试过把 `h` 与进位链整体留在向量域（`Poly1305Fold8x64` 返回 zmm、批间只做
+  `maskz_mov`），结果**更慢**（8.19 GB/s，−12%）：512 位 `vpsrlq/vpandq` 在 Zen 4
+  上是双泵、延迟 2–3 周期，6 步串行进位链的延迟反而超过省下的标量往返。
+  该版本已回退，不在工作树里。
+- 再往上只有两条路（本次时间盒内未做）：
+  1. **AVX-512 IFMA（`vpmadd52luq/huq`）做 radix-2^44 的 8 路**：每块 9 对乘加，
+     8 路每批只需 18 条乘加指令（对比现在 25 条 mul + 20 条 add），且 44 位 limb
+     下进位链只有 3 段。预估 18–24 GB/s。工作量约 300–400 行。
+  2. **16 路（2 组 zmm）**：每批 256B 摊薄固定开销，理论 +17%，但寄存器压力
+     到 28/32 个 zmm，收益不如 IFMA。
+- 另一条与 Poly1305 无关的余地：ChaCha20 当前 7.85 GB/s，若与 Poly 同量级提升
+  （例如 16 路 + 更省的转置），合成上限还能再抬 20%；但 1.1× 的门槛卡在
+  Poly 这一侧。
+
+### 6. 复现
+
+```bash
+# 基准（同进程 EVP_chacha20_poly1305 对拍，每尺寸 0.25s，taskset 绑核）
+g++ -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic -fno-plt -Iinclude \
+  /mnt/e/tmp/tls_bench2/bench_aead.cpp src/bento/net/crypto.cpp \
+  src/bento/net/protocol.cpp -lcrypto -o /tmp/tls_bench3/bench_v1
+taskset -c 3 /tmp/tls_bench3/bench_v1 0.25
+BENTO_CRYPTO_SIMD=avx2 taskset -c 4 /tmp/tls_bench3/bench_v1 0.25
+```
+
+4 路 vs 8 路单测（同一二进制，仅改环境变量；注意 `BENTO_CRYPTO_SIMD=avx2`
+会同时把 ChaCha20 降到 8 lane，所以总吞吐那张表不能直接当 Poly 4 路的收益）：
+
+| 后端 | Poly 64 KiB | Poly 1 MiB | ChaCha 64 KiB |
+|---|---:|---:|---:|
+| AVX-512 8 路 | **9.28 GB/s** | **9.36 GB/s** | 7.85 GB/s |
+| AVX2 4 路 | 7.64 GB/s | 7.23 GB/s | 4.07 GB/s |
+
+### 7. 改动清单（未 commit）
+
+```
+src/bento/net/crypto.cpp | +981 −7 行（多路 Poly1305 + 分派 + 前置声明）
+docs/reports/asm-tls.md  | 本节
+```
