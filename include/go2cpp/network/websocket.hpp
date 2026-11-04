@@ -32,6 +32,7 @@
 #include "go2cpp/network/http.hpp"
 #include "go2cpp/sync.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -269,6 +270,21 @@ private:
     std::unique_ptr<MaskRng> m_mask_rng;
     /// 客户端掩码帧的复用缓冲：避免每帧一次 vector 分配 + 拷贝。
     std::vector<std::uint8_t> m_mask_scratch;
+    /// 小帧（header + payload ≤ 526B）的合并写缓冲。
+    ///
+    /// ## 为什么放在成员而不是栈上（2026-11-04 实测）
+    ///
+    /// 原先 `write_frame_unlocked()` 用 526B 栈数组把 header 与 payload 拼成
+    /// 一次 `write_all`。在 fiber 初始栈只有 1 页（4 KiB）时，echo 回写路径
+    /// （ServeConnection → 回调 → SendText → write_frame → write_frame_unlocked）
+    /// 的累计栈深越过 4 KiB，触发一次 64 KiB 栈增长；gdb 在
+    /// `GO2CPP_GROWABLE_STACK=0` 下抓到 SIGSEGV 正好落在
+    /// `write_frame_unlocked+21`。增长虽然只 touch 第二页，却让每条连接多驻留
+    /// 4 KiB（20k 连接约 80 MB）。挪到成员后写路径不再占这 526B 栈。
+    ///
+    /// 只在持有 `m_write_mutex` 的调用里使用；服务端角色（不掩码）才走这条
+    /// 合并写分支。
+    std::array<std::uint8_t, 14 + 512> m_write_scratch{};
 };
 
 }  // namespace go2cpp::net

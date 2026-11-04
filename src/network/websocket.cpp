@@ -789,7 +789,9 @@ WebSocketResult WebSocket::write_frame_unlocked(WebSocketOpcode opcode, std::str
     if (!mask && payload.size() <= kInlineFramePayload) {
         // 只要 [0, header_size + payload.size()) 会被写/发送，不必先清零
         // 526 字节（原实现每小帧一次 memset）。
-        std::array<std::uint8_t, 14 + kInlineFramePayload> buffer;
+        static_assert(sizeof(m_write_scratch) == 14 + kInlineFramePayload,
+                      "write scratch must cover header plus inline payload");
+        auto& buffer = m_write_scratch;
         std::memcpy(buffer.data(), header.data(), header_size);
         if (!payload.empty()) {
             std::memcpy(buffer.data() + header_size, payload.data(), payload.size());
