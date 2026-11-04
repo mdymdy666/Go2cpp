@@ -1203,3 +1203,26 @@ handler 异常导致 SIGABRT；slowloris 靠单次 recv 30s 无限占住 worker�
 **未提交**：本 agent 不 commit。注意 `douyin_store.hpp` 的改动被并行 agent 的
 `5dcca19`（幂等键中间件）一并提交；`src/video_service.cpp`、`scripts/accept_upload_resume.sh`
 是并行 agent 的改动，不属于本次。
+
+
+## 2026-11-04 · 抖音上传断点续传（分片上传协议）
+
+**背景**：`POST /api/video/upload` 是整包 POST，断线即失败、重传从头开始。
+
+**改动**：
+- `app/douyin/src/video_service.cpp`：新增 4 个接口——`POST /api/video/upload/init`
+  （生成 UUID v4 + total/title）、`POST /api/video/upload/chunk`
+  （`Content-Range: bytes a-b/N`，顺序追加 `web/videos/.upload_<id>.part`）、
+  `POST /api/video/upload/finish`（大小 + ftyp 校验 → 改名正式文件 + 建 videos 行）、
+  `GET /api/video/upload/status/<id>`（断点进度）。跨用户/不存在统一 400，防会话探测；
+  `.part` 实际大小与 DB 进度不一致时以磁盘校准（崩溃窗口自愈）。
+- `app/douyin/include/douyin_store.hpp` + `src/douyin_store.cpp`：`upload_sessions`
+  表（upload_id 主键、user_id、path、title、total、received_bytes）+ 4 个访问器，服务重启不丢。
+- `app/douyin/scripts/accept_upload_resume.sh`：50 项真实验收（10 MB 分 5 片 cmp 一致、
+  重启服务后续传、续传中 kill -9 客户端无半片、乱序/总大小不符/跨用户/非法头 400）。
+
+**验证**：`accept_upload_resume.sh` 50 PASS / 0 FAIL；官方 `accept_all.sh`
+70 PASS / 0 FAIL（默认端口全量）；`build.sh` 8 目标 `-Werror` 零告警。
+**未决**：协议只接受连续前缀（乱序直接 400，不支持空洞补传）；`upload_sessions`
+无定期清理，中断会话的 `.part` 需要后续 GC 策略。
+**未提交**。

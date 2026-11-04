@@ -11,6 +11,10 @@
  *                                         `{"ok":true,"items":[{"video":...}],
  *                                         "next_cursor":"..."}`）
  *          - DELETE /api/video/:id        删除（Bearer；非作者 403、不存在 404）
+ *          - POST   /api/video/upload/init        开启分片上传（Bearer；返回 upload_id）
+ *          - POST   /api/video/upload/chunk       追加分片（Bearer；Content-Range）
+ *          - POST   /api/video/upload/finish      校验并转正式文件 + 建记录（Bearer）
+ *          - GET    /api/video/upload/status/:id  断点进度（Bearer；仅本人）
  *          - GET    /health, /metrics
  *
  * @author douyin demo
@@ -24,6 +28,7 @@
 #include "douyin_store.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -31,8 +36,10 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <random>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -152,6 +159,237 @@ bool RequireToken(const douyin::HttpRequest& request, douyin::HttpResponse* resp
         return false;
     }
     *user_id = info.user_id;
+    return true;
+}
+
+/// @brief 生成 UUID v4 文本（36 字符，小写）；上传会话 id 用它防止被枚举。
+std::string NewUuidV4() {
+    static std::mt19937_64 engine([] {
+        std::random_device random;
+        std::seed_seq seed{random(), random(), random(), random()};
+        return std::mt19937_64(seed);
+    }());
+    std::uint64_t high = engine();
+    std::uint64_t low = engine();
+    // 版本位固定 4；变体位固定 10xx（RFC 4122 §4.4），其余位保持随机。
+    high = (high & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
+    low = (low & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
+    char text[37];
+    std::snprintf(text, sizeof(text), "%08x-%04x-%04x-%04x-%012llx",
+                  static_cast<unsigned>(high >> 32),
+                  static_cast<unsigned>((high >> 16) & 0xFFFFU),
+                  static_cast<unsigned>(high & 0xFFFFU),
+                  static_cast<unsigned>((low >> 48) & 0xFFFFU),
+                  static_cast<unsigned long long>(low & 0xFFFFFFFFFFFFULL));
+    return std::string(text);
+}
+
+/// @brief 是否是合法的 UUID v4 文本（36 字符小写；版本 4、变体 8/9/a/b）。
+bool IsUuidV4(std::string_view text) {
+    if (text.size() != 36) {
+        return false;
+    }
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (text[i] != '-') {
+                return false;
+            }
+            continue;
+        }
+        const char c = text[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+            return false;
+        }
+    }
+    return text[14] == '4' &&
+           (text[19] == '8' || text[19] == '9' || text[19] == 'a' ||
+            text[19] == 'b');
+}
+
+/// @brief 严格解析 `Content-Range: bytes <first>-<last>/<total>`。
+bool ParseContentRange(std::string_view text, std::int64_t* first,
+                       std::int64_t* last, std::int64_t* total) {
+    constexpr std::string_view kPrefix = "bytes ";
+    if (text.size() <= kPrefix.size() ||
+        text.compare(0, kPrefix.size(), kPrefix.data(), kPrefix.size()) != 0) {
+        return false;
+    }
+    text.remove_prefix(kPrefix.size());
+    const std::size_t dash = text.find('-');
+    const std::size_t slash = text.find('/');
+    if (dash == std::string_view::npos || slash == std::string_view::npos ||
+        dash > slash) {
+        return false;
+    }
+    const auto parse = [](std::string_view digits, std::int64_t* out) {
+        if (digits.empty()) {
+            return false;
+        }
+        std::int64_t value = 0;
+        const auto result = std::from_chars(digits.data(),
+                                            digits.data() + digits.size(), value, 10);
+        if (result.ec != std::errc() ||
+            result.ptr != digits.data() + digits.size()) {
+            return false;
+        }
+        *out = value;
+        return true;
+    };
+    std::int64_t begin_value = 0;
+    std::int64_t end_value = 0;
+    std::int64_t total_value = 0;
+    if (!parse(text.substr(0, dash), &begin_value) ||
+        !parse(text.substr(dash + 1, slash - dash - 1), &end_value) ||
+        !parse(text.substr(slash + 1), &total_value)) {
+        return false;
+    }
+    // 不变量：0 <= first <= last < total；越界一律非法，避免写出超长前缀。
+    if (begin_value < 0 || end_value < begin_value || total_value <= 0 ||
+        end_value >= total_value) {
+        return false;
+    }
+    *first = begin_value;
+    *last = end_value;
+    *total = total_value;
+    return true;
+}
+
+/// @brief 从扁平 JSON 里取整数字段（只服务本项目固定结构；失败返回 false）。
+bool JsonIntField(std::string_view body, std::string_view key, std::int64_t* out) {
+    const std::string needle = "\"" + std::string(key) + "\"";
+    std::size_t pos = body.find(needle);
+    if (pos == std::string_view::npos) {
+        return false;
+    }
+    pos = body.find(':', pos + needle.size());
+    if (pos == std::string_view::npos) {
+        return false;
+    }
+    ++pos;
+    while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) {
+        ++pos;
+    }
+    std::int64_t value = 0;
+    const char* const begin = body.data() + pos;
+    const char* const end = body.data() + body.size();
+    const auto result = std::from_chars(begin, end, value, 10);
+    if (result.ec != std::errc() || result.ptr == begin) {
+        return false;
+    }
+    *out = value;
+    return true;
+}
+
+/// @brief 上传暂存文件路径：`<web>/videos/.upload_<uuid>.part`（只由服务端拼）。
+std::filesystem::path UploadPartPath(const std::string& upload_id) {
+    return std::filesystem::path(WebDir()) / "videos" /
+           (".upload_" + upload_id + ".part");
+}
+
+/// @brief 上传会话的对外 JSON：不含服务端路径。
+/// @note `ranges` 用半开区间 `[start, end)` 描述已收分片；协议只允许顺序
+///       追加，因此已收部分必然是单段连续前缀，`end` 即已收字节数。
+std::string UploadJson(const douyin::StoredUpload& session) {
+    std::string body = "{\"ok\":true,\"upload_id\":\"" +
+                       douyin::JsonEscape(session.upload_id) +
+                       "\",\"received\":" +
+                       std::to_string(session.received_bytes) + ",\"total\":" +
+                       std::to_string(session.total) + ",\"ranges\":[";
+    if (session.received_bytes > 0) {
+        body += "{\"start\":0,\"end\":" +
+                std::to_string(session.received_bytes) + "}";
+    }
+    body += "]}";
+    return body;
+}
+
+/**
+ * @brief 取上传会话并校验归属；不存在与不属于本人返回同一个 400。
+ *
+ * @param store [in,out] 已打开的存储。
+ * @param upload_id [in] 客户端提交的会话 id——必须已是 UUID v4 形态。
+ * @param actor [in] 当前 Bearer token 对应的用户 id。
+ * @param session [out] 查到且归属正确时写入；失败保持原值。
+ * @param response [out] 失败时写入 400/500 错误体。
+ * @return 查到且归属正确返回 true；否则已写好响应并返回 false。
+ *
+ * ## 定位
+ * 断点续传的唯一鉴权收口：upload_id 是 UUID 不可枚举，但「知道 id」不等于
+ * 「有权限」，跨用户必须在这里被挡下；若漏判，任何人可用别人的 upload_id
+ * 覆盖/收尾别人的视频。
+ */
+bool LoadOwnedUpload(douyin::Store& store, const std::string& upload_id,
+                     std::int64_t actor, douyin::StoredUpload* session,
+                     douyin::HttpResponse* response) {
+    // 注意：Fail() 返回 true（供 handler 直接 `return Fail(...)` 链式返回），
+    // 而本函数的约定是「false = 已写响应、调用方必须立刻 return true」，
+    // 所以每个失败分支都要先 Fail(...) 再显式 return false。
+    // 先校验格式：既挡路径注入，也避免拿任意串去查库。
+    if (!IsUuidV4(upload_id)) {
+        Fail(response, 400, "upload_id 非法");
+        return false;
+    }
+    std::string error;
+    if (!store.FindUploadSession(upload_id, session, &error)) {
+        if (!error.empty()) {
+            std::fprintf(stderr, "[%s] 查询上传会话失败: %s\n", kServiceName,
+                         error.c_str());
+            Fail(response, 500, "数据库错误");
+            return false;
+        }
+        Fail(response, 400, "上传会话不存在或不属于当前用户");
+        return false;
+    }
+    if (session->user_id != actor) {
+        Fail(response, 400, "上传会话不存在或不属于当前用户");
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief 用 `.part` 实际大小校准 DB 里的 received_bytes（崩溃窗口自愈）。
+ *
+ * @param store [in,out] 已打开的存储。
+ * @param session [in,out] 会话——调用前 received_bytes 来自 DB，返回后对齐磁盘。
+ * @param response [out] 失败时写 500 错误体。
+ * @return 校准成功返回 true。
+ *
+ * ## 定位
+ * 「追加写盘 → 更新 DB」不是原子的：两者之间掉电/被杀，磁盘比 DB 多。这里
+ * 以磁盘为准补齐 DB，避免客户端从旧偏移重传导致数据重复；反过来磁盘比 DB
+ * 少说明暂存文件被外部截断，宁可 500 也不静默丢字节。
+ */
+bool SyncUploadProgress(douyin::Store& store, douyin::StoredUpload* session,
+                        douyin::HttpResponse* response) {
+    // 约定同 LoadOwnedUpload：false = 已写响应，调用方必须立刻返回。
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(session->path, ec);
+    if (ec) {
+        std::fprintf(stderr, "[%s] 读取暂存文件大小失败: %s\n", kServiceName,
+                     ec.message().c_str());
+        Fail(response, 500, "上传暂存文件不可用");
+        return false;
+    }
+    const std::int64_t actual = static_cast<std::int64_t>(size);
+    if (actual == session->received_bytes) {
+        return true;
+    }
+    if (actual < session->received_bytes) {
+        std::fprintf(stderr, "[%s] 暂存文件被截断: disk=%lld db=%lld\n",
+                     kServiceName, static_cast<long long>(actual),
+                     static_cast<long long>(session->received_bytes));
+        Fail(response, 500, "上传进度与暂存文件不一致");
+        return false;
+    }
+    std::string error;
+    if (!store.UpdateUploadProgress(session->upload_id, actual, &error)) {
+        std::fprintf(stderr, "[%s] 校准上传进度失败: %s\n", kServiceName,
+                     error.c_str());
+        Fail(response, 500, "数据库错误");
+        return false;
+    }
+    session->received_bytes = actual;
     return true;
 }
 
@@ -377,6 +615,341 @@ bool HandleUpload(douyin::Store& store, const douyin::HttpRequest& request,
     return true;
 }
 
+/**
+ * @brief 开启分片上传：分配 UUID、建空 `.part`、把状态写进 SQLite。
+ *
+ * @param store [in,out] 存储——成功时插入 upload_sessions 行。
+ * @param request [in] HTTP 请求——Bearer 必需；body 为 JSON
+ *        `{"total": <总字节>, "title": "<可选标题>"}`。
+ * @param response [out] 成功 200 + `{"ok":true,"upload_id":...,"received":0,...}`；
+ *        参数非法 400；鉴权失败 401；落盘/建行失败 500。
+ * @return 总是 true。
+ *
+ * ## 定位
+ * 上传会话的唯一创建点：upload_id 在这里生成，客户端拿不到服务端路径；
+ * 一旦允许客户端指定路径或复用 id，就会变成覆盖任意文件的入口。
+ *
+ * ## 步骤
+ * step1. 鉴权——上传必须绑定具体用户；
+ * step2. total——正整数且不超过 32 MiB（与整包上传上限一致）；
+ * step3. title——可选，出现时按 UTF-8 字符数校验 1–80；
+ * step4. 建目录与空 `.part`，再插 upload_sessions；插入失败回滚文件。
+ */
+bool HandleUploadInit(douyin::Store& store, const douyin::HttpRequest& request,
+                      douyin::HttpResponse* response) {
+    // step1: 先鉴权，未登录不产生任何磁盘/DB 副作用。
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    // step2: total 是后续所有 Content-Range 的基准，必须一次定死。
+    std::int64_t total = 0;
+    if (!JsonIntField(request.body, "total", &total) || total <= 0) {
+        return Fail(response, 400, "total 必须是正整数");
+    }
+    if (total > static_cast<std::int64_t>(kMaxUploadBytes)) {
+        return Fail(response, 400, "视频不能超过 32 MiB");
+    }
+    // step3: title 可选；给了就必须可解析且合法（finish 时还会再传一次）。
+    std::string title;
+    if (request.body.find("\"title\"") != std::string::npos &&
+        !douyin::JsonStringField(request.body, "title", &title)) {
+        return Fail(response, 400, "title 字段非法");
+    }
+    if (!title.empty() && Utf8Length(title) > kMaxTitleChars) {
+        return Fail(response, 400, "title 长度需为 1-80 字");
+    }
+    // step4: 先落文件再写 DB；DB 失败要删掉空文件，避免留下无主 .part。
+    std::error_code ec;
+    const std::filesystem::path dir = std::filesystem::path(WebDir()) / "videos";
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        std::fprintf(stderr, "[%s] 创建上传目录失败: %s\n", kServiceName,
+                     ec.message().c_str());
+        return Fail(response, 500, "存储目录不可用");
+    }
+    douyin::StoredUpload session;
+    session.upload_id = NewUuidV4();
+    session.user_id = actor;
+    session.path = UploadPartPath(session.upload_id).string();
+    session.title = title;
+    session.total = total;
+    session.created_at = NowSeconds();
+    {
+        std::ofstream output(session.path, std::ios::binary | std::ios::trunc);
+        if (!output.is_open()) {
+            std::fprintf(stderr, "[%s] 创建暂存文件失败: %s\n", kServiceName,
+                         session.path.c_str());
+            return Fail(response, 500, "写入失败");
+        }
+    }
+    std::string error;
+    if (!store.CreateUploadSession(session, &error)) {
+        std::filesystem::remove(session.path, ec);
+        std::fprintf(stderr, "[%s] 建上传会话失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    response->status = 200;
+    response->body = UploadJson(session);
+    return true;
+}
+
+/**
+ * @brief 追加一个分片：校验 `Content-Range` 与顺序 → 追加 `.part` → 更新进度。
+ *
+ * @param store [in,out] 存储——成功时把 received_bytes 前移。
+ * @param request [in] HTTP 请求——Bearer 必需；`?upload_id=`（或 `X-Upload-Id`
+ *        头）指定会话；`Content-Range: bytes a-b/N`；body 为该片原始字节。
+ * @param response [out] 成功 200 + 最新进度；乱序/重叠/长度不符 400；
+ *        鉴权 401；落盘或 DB 失败 500。
+ * @return 总是 true。
+ *
+ * ## 定位
+ * 字节进入 `.part` 的唯一入口：顺序校验与长度校验都在写盘之前，否则乱序
+ * 追加会静默产生错位文件，finish 时大小恰好相等却内容是坏的。
+ *
+ * ## 步骤
+ * step1. 鉴权 + 取 upload_id；
+ * step2. 严格解析 Content-Range，body 长度必须等于 b-a+1；
+ * step3. 查会话 + 归属校验（跨用户按 400 处理，不泄露会话是否存在）；
+ * step4. 校准磁盘进度后判断：完全落在已收前缀内 = 幂等重传；a > received = 乱序；
+ * step5. 追加写盘，成功后再更新 DB；DB 失败回滚文件长度，保证两边一致。
+ */
+bool HandleUploadChunk(douyin::Store& store, const douyin::HttpRequest& request,
+                       douyin::HttpResponse* response) {
+    // step1: upload_id 允许放 query 或头，body 是纯二进制，不能塞 JSON。
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    std::string upload_id = douyin::QueryParam(request, "upload_id");
+    if (upload_id.empty()) {
+        upload_id = request.Header("x-upload-id");
+    }
+    if (upload_id.empty()) {
+        return Fail(response, 400, "缺少 upload_id");
+    }
+    // step2: 范围与长度必须自洽，且总大小不能超过上传上限。
+    std::int64_t first = 0;
+    std::int64_t last = 0;
+    std::int64_t total = 0;
+    if (!ParseContentRange(request.Header("content-range"), &first, &last, &total)) {
+        return Fail(response, 400, "Content-Range 非法（需 bytes a-b/N）");
+    }
+    if (request.body.empty()) {
+        return Fail(response, 400, "分片为空");
+    }
+    if (static_cast<std::int64_t>(request.body.size()) != last - first + 1) {
+        return Fail(response, 400, "分片长度与 Content-Range 不符");
+    }
+    if (total > static_cast<std::int64_t>(kMaxUploadBytes)) {
+        return Fail(response, 400, "视频不能超过 32 MiB");
+    }
+    // step3: 归属校验；跨用户与不存在同一个错误，避免会话探测。
+    douyin::StoredUpload session;
+    if (!LoadOwnedUpload(store, upload_id, actor, &session, response)) {
+        return true;
+    }
+    if (total != session.total) {
+        return Fail(response, 400, "总大小与 init 不一致");
+    }
+    if (!SyncUploadProgress(store, &session, response)) {
+        return true;
+    }
+    const std::int64_t received = session.received_bytes;
+    // step4: 已收前缀内的重放视为幂等（响应丢失后客户端重试同一片）。
+    if (last < received) {
+        response->status = 200;
+        response->body = UploadJson(session);
+        return true;
+    }
+    if (first != received) {
+        return Fail(response, 400,
+                    "分片乱序：期望从 " + std::to_string(received) + " 开始");
+    }
+    // step5: 追加写盘——先写字节，再更新 DB；DB 失败把文件截回旧长度。
+    {
+        std::ofstream output(session.path, std::ios::binary | std::ios::app);
+        if (!output.is_open()) {
+            std::fprintf(stderr, "[%s] 打开暂存文件失败: %s\n", kServiceName,
+                         session.path.c_str());
+            return Fail(response, 500, "写入失败");
+        }
+        output.write(request.body.data(),
+                     static_cast<std::streamsize>(request.body.size()));
+        output.flush();
+        if (!output.good()) {
+            output.close();
+            std::error_code rollback;
+            std::filesystem::resize_file(
+                session.path, static_cast<std::uintmax_t>(received), rollback);
+            std::fprintf(stderr, "[%s] 写入分片失败: %s\n", kServiceName,
+                         session.path.c_str());
+            return Fail(response, 500, "写入失败");
+        }
+    }
+    std::string error;
+    if (!store.UpdateUploadProgress(session.upload_id, last + 1, &error)) {
+        std::error_code rollback;
+        std::filesystem::resize_file(
+            session.path, static_cast<std::uintmax_t>(received), rollback);
+        std::fprintf(stderr, "[%s] 更新上传进度失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    session.received_bytes = last + 1;
+    response->status = 200;
+    response->body = UploadJson(session);
+    return true;
+}
+
+/**
+ * @brief 收尾：校验总大小与 MP4 魔数 → `.part` 改名为正式文件 → 建视频记录。
+ *
+ * @param store [in,out] 存储——成功时插入 videos 行并删除 upload_sessions 行。
+ * @param request [in] HTTP 请求——Bearer 必需；body 为 JSON
+ *        `{"upload_id":"<uuid>","title":"<1-80 字>"}`。
+ * @param response [out] 成功 200 + `{"ok":true,"video":{...}}`；未传完/魔数错
+ *        400；鉴权 401；改名或建记录失败 500。
+ * @return 总是 true。
+ *
+ * ## 定位
+ * 分片态到正式视频的唯一提交点：只有这里把 `.part` 变成 `videos/upload_*`，
+ * 并保证「文件名/DB 行/url」三者一致；任何一步失败都要回滚，否则会出现
+ * 磁盘有文件但没人能访问（或反过来）的半提交。
+ *
+ * ## 步骤
+ * step1. 鉴权 + 解析 upload_id/title；
+ * step2. 查会话、校验归属，并用磁盘大小校准进度；
+ * step3. 已收字节必须等于 total，否则 400（不自动 finish）；
+ * step4. 读文件头验证 ftyp 魔数（防止把任意字节拼成「视频」）；
+ * step5. 同毫秒重名顺延生成正式文件名并 rename；
+ * step6. 建 videos 行；失败则把文件改回 `.part`，保留续传能力；
+ * step7. 删除会话行（失败只记日志，视频已可用）。
+ */
+bool HandleUploadFinish(douyin::Store& store, const douyin::HttpRequest& request,
+                        douyin::HttpResponse* response) {
+    // step1: 先鉴权；finish 必须带 title（init 的 title 只作展示兜底）。
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    std::string upload_id;
+    if (!douyin::JsonStringField(request.body, "upload_id", &upload_id) ||
+        upload_id.empty()) {
+        return Fail(response, 400, "缺少 upload_id");
+    }
+    std::string title;
+    if (!douyin::JsonStringField(request.body, "title", &title) || title.empty() ||
+        Utf8Length(title) > kMaxTitleChars) {
+        return Fail(response, 400, "title 长度需为 1-80 字");
+    }
+    // step2: 归属校验 + 用磁盘真实大小校准（崩溃窗口里 DB 可能落后）。
+    douyin::StoredUpload session;
+    if (!LoadOwnedUpload(store, upload_id, actor, &session, response)) {
+        return true;
+    }
+    if (!SyncUploadProgress(store, &session, response)) {
+        return true;
+    }
+    // step3: 大小不符直接 400，绝不把半截文件当视频发布。
+    if (session.received_bytes != session.total) {
+        return Fail(response, 400,
+                    "上传未完成：已收 " + std::to_string(session.received_bytes) +
+                        " / 总 " + std::to_string(session.total));
+    }
+    // step4: 魔数检查——只读前 12 字节，不把整包重新读进内存。
+    std::string head(12, '\0');
+    {
+        std::ifstream input(session.path, std::ios::binary);
+        if (!input.is_open()) {
+            std::fprintf(stderr, "[%s] 打开暂存文件失败: %s\n", kServiceName,
+                         session.path.c_str());
+            return Fail(response, 500, "上传暂存文件不可用");
+        }
+        input.read(head.data(), static_cast<std::streamsize>(head.size()));
+        head.resize(static_cast<std::size_t>(input.gcount()));
+    }
+    if (!LooksLikeMp4(head)) {
+        return Fail(response, 400, "不是合法的 mp4（缺少 ftyp 魔数）");
+    }
+    // step5: 正式文件名与整包上传保持一致；同毫秒重名顺延。
+    const std::filesystem::path part(session.path);
+    const std::filesystem::path dir = part.parent_path();
+    std::error_code ec;
+    std::int64_t stamp = NowMilliseconds();
+    std::filesystem::path final_path =
+        dir / ("upload_" + std::to_string(actor) + "_" + std::to_string(stamp) +
+               ".mp4");
+    for (int i = 0; i < 1000 && std::filesystem::exists(final_path); ++i) {
+        ++stamp;
+        final_path = dir / ("upload_" + std::to_string(actor) + "_" +
+                            std::to_string(stamp) + ".mp4");
+    }
+    std::filesystem::rename(part, final_path, ec);
+    if (ec) {
+        std::fprintf(stderr, "[%s] 暂存文件改名失败: %s\n", kServiceName,
+                     ec.message().c_str());
+        return Fail(response, 500, "重命名失败");
+    }
+    // step6: rename 后再建记录；建记录失败把文件改回 `.part`，客户端可重试 finish。
+    const std::string url = "videos/" + final_path.filename().string();
+    std::string error;
+    const std::int64_t id = store.CreateVideo(actor, title, url, &error);
+    if (id <= 0) {
+        std::error_code restore;
+        std::filesystem::rename(final_path, part, restore);
+        std::fprintf(stderr, "[%s] 建视频记录失败: %s\n", kServiceName,
+                     error.c_str());
+        return Fail(response, 500, "数据库错误");
+    }
+    // step7: 会话行删除失败不影响用户；残留行由下次同名 id 覆盖（UUID 不复用）。
+    if (!store.DeleteUploadSession(upload_id, &error)) {
+        std::fprintf(stderr, "[%s] 删除上传会话失败: %s\n", kServiceName,
+                     error.c_str());
+    }
+    douyin::StoredVideo stored;
+    stored.id = id;
+    stored.user_id = actor;
+    stored.title = title;
+    stored.url = url;
+    stored.created_at = NowSeconds();
+    response->status = 200;
+    response->body = "{\"ok\":true,\"video\":" +
+                     douyin::ToJson(PublicVideo(stored)) + "}";
+    return true;
+}
+
+/**
+ * @brief 查断点进度：返回已收字节与已收区间，客户端据此决定从哪片续传。
+ *
+ * @param store [in,out] 只读使用。
+ * @param request [in] HTTP 请求——Bearer 必需（防止他人窥探上传进度）。
+ * @param upload_id [in] 从 `/api/video/upload/status/<upload_id>` 取出的 id。
+ * @param response [out] 成功 200 + `{"ok":true,"received":N,"total":M,...}`；
+ *        非法/跨用户 400；鉴权 401。
+ * @return 总是 true。
+ */
+bool HandleUploadStatus(douyin::Store& store, const douyin::HttpRequest& request,
+                        const std::string& upload_id,
+                        douyin::HttpResponse* response) {
+    std::int64_t actor = 0;
+    if (!RequireToken(request, response, &actor)) {
+        return true;
+    }
+    douyin::StoredUpload session;
+    if (!LoadOwnedUpload(store, upload_id, actor, &session, response)) {
+        return true;
+    }
+    if (!SyncUploadProgress(store, &session, response)) {
+        return true;
+    }
+    response->status = 200;
+    response->body = UploadJson(session);
+    return true;
+}
+
 /// @brief 视频详情（附作者名）。
 bool HandleDetail(douyin::Store& store, std::int64_t id,
                   douyin::HttpResponse* response) {
@@ -550,6 +1123,38 @@ bool Handle(douyin::Store& store, const douyin::HttpRequest& request,
             return HandleMine(store, request, response);
         }
         return Fail(response, 405, "方法不允许");
+    }
+
+    if (request.path == "/api/video/upload/init") {
+        if (request.method == "POST") {
+            return HandleUploadInit(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    if (request.path == "/api/video/upload/chunk") {
+        if (request.method == "POST") {
+            return HandleUploadChunk(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    if (request.path == "/api/video/upload/finish") {
+        if (request.method == "POST") {
+            return HandleUploadFinish(store, request, response);
+        }
+        return Fail(response, 405, "方法不允许");
+    }
+    {
+        constexpr std::string_view kStatusPrefix = "/api/video/upload/status/";
+        if (request.path.size() > kStatusPrefix.size() &&
+            request.path.compare(0, kStatusPrefix.size(), kStatusPrefix.data(),
+                                 kStatusPrefix.size()) == 0) {
+            if (request.method == "GET") {
+                return HandleUploadStatus(
+                    store, request, request.path.substr(kStatusPrefix.size()),
+                    response);
+            }
+            return Fail(response, 405, "方法不允许");
+        }
     }
 
     if (request.path == "/api/video/upload") {
