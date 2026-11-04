@@ -572,7 +572,7 @@ src/bento/net/crypto.cpp | +约 500 行（SIMD 后端 + radix-2^44 + 分派）
 
 > 工作树 `/UserData/CodexWorkSpace/Go2cpp`；机器同 §0（Ryzen 9 8945HX，Zen 4，
 > AVX2 / AVX-512F/DQ/BW/VL/IFMA 均可用）。只改 `src/bento/net/crypto.cpp`
-> （**+981 行 / −7 行**，全部在匿名命名空间内），**未 commit**。
+> （**本次 +约 430 行**：多路实现块 404 行 + 分派/声明/调用点，全部在匿名命名空间内；与 §13 的未提交改动合计 git diff --stat 为 +988 −7），**未 commit**。
 
 ### 1. 结论（先说数）
 
@@ -691,6 +691,128 @@ BENTO_CRYPTO_SIMD=avx2 taskset -c 4 /tmp/tls_bench3/bench_v1 0.25
 ### 7. 改动清单（未 commit）
 
 ```
-src/bento/net/crypto.cpp | +981 −7 行（多路 Poly1305 + 分派 + 前置声明）
+src/bento/net/crypto.cpp | 本次 +约 430 行（实现块 404 行 + 分派/声明/调用点）
+docs/reports/asm-tls.md  | 本节
+```
+
+## AVX-512 IFMA（2026-11-04）
+
+### 1. 结论
+
+- **IFMA 可用**：本机 AMD Ryzen 9 8945HX（Zen 4）`avx512ifma` 探测命中；
+  `Poly1305BlocksIfma` 已实现并**默认启用**，不支持的机器自动回退
+  AVX-512 8 路 → AVX2 4 路 → 标量，回退链四档均实测通过。
+- Poly1305 8.7–9.0 → **10.9–11.1 GB/s**（同窗口 A/B +24%），
+  AEAD 4.00–4.05 → **4.32–4.41 GB/s**；vs EVP 1.25–1.31× → **1.15–1.21×**。
+- **仍未达 1.1× / Poly 12.6 GB/s**：Poly 差 12%（11.1 vs 12.6），总吞吐差
+  7%（4.4 vs 4.7）。书面瓶颈见 §5，未完成的可选优化也列在那里。
+
+### 2. 数据（同窗口 A/B）
+
+`taskset -c 6`，每尺寸 0.5s，同一二进制只切 `BENTO_CRYPTO_SIMD`，各跑 5 轮取中位。
+测量窗口有背景负载（`kvput` 占满 CPU 3），所以 A/B 只用同一窗口的
+AVX-512 路径对照，不直接和历史绝对值混用。
+
+| 场景 | AVX-512 8 路（2^26×5） | IFMA 8 路（2^44×3） | 变化 |
+|---|---:|---:|---:|
+| Poly 64 KiB | 8.73 GB/s | **10.87 GB/s** | +24% |
+| Poly 1 MiB | 8.98 GB/s | **11.10 GB/s** | +24% |
+| AEAD seal 64 KiB | 4050 MB/s | **4405 MB/s** | +8.8% |
+| AEAD seal 1 MiB | 4001 MB/s | **4316 MB/s** | +7.9% |
+| vs EVP 64 KiB | 1.26× | **1.15×** | |
+| vs EVP 1 MiB | 1.31× | **1.21×** | |
+| ChaCha20-only 64 KiB | 7.85 GB/s | 7.85 GB/s | 不变（仍走 16 lane） |
+
+历史无干扰基线（上一节）：Poly 9.28/9.36 GB/s、AEAD 4211/4377 MB/s、
+1.28/1.29×；IFMA 版本相对同窗口 AVX-512 路径稳定 +24%，绝对值随机器负载
+在 10.9–11.4 GB/s 间浮动。交错调度版本复测：Poly 11.0–11.4 GB/s、
+AEAD 4.3–4.6 GB/s、vs EVP 1.10–1.25×（噪声内与表中一致）。
+
+### 3. 改动（`src/bento/net/crypto.cpp`，+218/−6，未 commit）
+
+1. **新后端** `SimdBackend::kAvx512Ifma = 3`；`DetectSimdBackend` 在
+   AVX-512F/DQ/BW/VL 之上加 `__builtin_cpu_supports("avx512ifma")`；
+   `BENTO_CRYPTO_SIMD=avx512ifma|avx512-ifma|ifma` 可强制，`scalar|avx2|avx512`
+   仍只能下调。**ChaCha20 分派从 `== kAvx512` 改为 `>= kAvx512`**——否则
+   IFMA 档会让 ChaCha20 掉到 AVX2 8 lane（按历史数据会掉约 40%，总吞吐被拖垮）。
+2. **`Poly1305BlocksIfma`（8 路，每批 128B）**：radix **2^44 × 3 limb**，
+   与标量路径同一表示，批次边界**不需要** 44/26 位转换。每批 9 对
+   `vpmadd52luq/huq`（18 条 512 位乘加）完成 3×3 卷积；18 条 madd 按轮次
+   交错（同一累加器的相邻两条之间隔 6 条指令），把 4-5 拍累加延迟藏进其余
+   5 个累加器；每批一次 6 次跨 lane 归并（3 个 `d` 各 lo/hi）+ 3 段
+   44/44/42 进位链。`h` 与 `r` 的 limb 都
+   `< 2^49`，落在 IFMA 的 52 位操作数范围内；`d` 的 8 lane 和上界 `2^55`，
+   lo/hi 累加器都不会溢出（推导见代码注释）。
+3. **`Poly1305Sum8x64Ifma`**：IFMA 专用 8 lane 求和，1 条
+   `vextracti64x4` + 256/128 位折叠，比旧 `Poly1305Sum8x64` 少 2 条 512 位
+   shuffle（Zen 4 双泵下每次省约 4 μop，每批 6 次）。
+4. **`Poly1305Mul44`**：`r^1..r^8` 的标量预计算（radix 2^44），每次调用一次，
+   摊到每批不足 1 条。
+5. 未改 `Poly1305Ctx`/`Poly1305Block`/`Poly1305Finish` 与 2^26 路径；
+   `-O3 -Wall -Wextra -Wpedantic` 零告警。
+
+### 4. 正确性
+
+```bash
+cmake --build build-review --target bento_test_crypto -j12 && ./build-review/bento_test_crypto
+# → [PASS] test_crypto (5482 checks)
+
+/tmp/tls_bench3/cv_ifma                               # 默认（探测到 IFMA）→ ALL_VECTORS_OK
+BENTO_CRYPTO_SIMD=avx512ifma /tmp/tls_bench3/cv_ifma  # 强制 IFMA  → ALL_VECTORS_OK
+BENTO_CRYPTO_SIMD=avx512     /tmp/tls_bench3/cv_ifma  # 2^26 8 路  → ALL_VECTORS_OK
+BENTO_CRYPTO_SIMD=avx2       /tmp/tls_bench3/cv_ifma  # 4 路       → ALL_VECTORS_OK
+BENTO_CRYPTO_SIMD=scalar     /tmp/tls_bench3/cv_ifma  # 标量       → ALL_VECTORS_OK
+```
+
+对拍内容：RFC 8439 §2.5.2/§2.8.2、0..2049 全长度往返 + 变长 AAD、
+逐字节篡改拒绝（每个长度翻转一位必须被拒）。
+
+### 5. 为什么停在 11.1 GB/s（书面瓶颈）
+
+Zen 4 的 512 位执行是双泵，每批的端口账：
+
+- **18 条 `vpmadd52` = 36 μop**，只能走 FP0/FP1 两个 FMA 端口 → 约 18 周期/批；
+  乘加次数已是最少的 9 对（3×3 卷积），不可再压。
+- **6 次跨 lane 归并**：每次 1 条 `vextracti64x4`（512 位，2 μop）+ 2 条
+  256/128 位 shuffle + 5 条 ALU，合计约 12–16 周期，与 FMA 端口部分重叠；
+- limb 提取 7 条、转置 2 条、广播 6 条、标量进位链约 12 条。
+
+实测每批约 **46–49 周期**（4.4 GHz 折算），纯端口下限约 30 周期，多出的
+16–19 周期来自两段**串行关键路径**：每个 `d` 的 3 条 madd 是累加依赖
+（延迟 4–5，串起来 12–15 周期），归约后的标量进位链 + 下一批广播再串
+约 13 周期，两者没有足够 ILP 掩盖。
+
+未做的两条可选路径（本次时间盒内未验证）：
+
+1. **16 路（2 组 zmm，每批 256B）**：固定开销（广播/进位链/循环）摊薄一半，
+   理论 +8%，但需要 2 套 `rv/sv`（10 个 zmm）+ 12 个累加器 + 常量，超过 32
+   个寄存器，必然溢出，收益不确定。
+2. **把 3 个 lo 与 3 个 hi 的归并合并成 3 次**（lo 与 hi 打包进同一 zmm 的
+   不同 128 位块）：省约 12 条指令（~5%），实现复杂度高。
+
+### 6. 回退路径
+
+- 运行期：`DetectSimdBackend` 逐级探测；IFMA 不在时走 2^26×5 的 8 路，
+  再退 4 路、标量。`BENTO_CRYPTO_SIMD` 只能下调，不会越过硬件。
+- 编译期：非 GCC/Clang 或 MSVC（无 `__SIZEOF_INT128__`）时
+  `BENTO_POLY_MULTI_SIMD=0`，整块不参与编译。
+- 代码级：IFMA 只新增分支与函数，2^26 路径、标量 `Poly1305Block` 与
+  `Poly1305Finish` 一行未动；回退时行为与上一版完全一致。
+
+### 7. 复现
+
+```bash
+cd /UserData/CodexWorkSpace/Go2cpp
+g++ -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic -fno-plt -Iinclude \
+  /mnt/e/tmp/tls_bench2/bench_aead.cpp src/bento/net/crypto.cpp \
+  src/bento/net/protocol.cpp -lcrypto -o /tmp/tls_bench3/bench_ifma
+taskset -c 6 /tmp/tls_bench3/bench_ifma 0.5
+BENTO_CRYPTO_SIMD=avx512 taskset -c 6 /tmp/tls_bench3/bench_ifma 0.5
+```
+
+### 8. 改动清单（未 commit）
+
+```
+src/bento/net/crypto.cpp | +218 −6（IFMA 实现约 185 行 + 后端/分派/探测 33 行）
 docs/reports/asm-tls.md  | 本节
 ```
