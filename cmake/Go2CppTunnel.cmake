@@ -102,5 +102,13 @@ if (GO2CPP_BUILD_TESTS)
         -O2 -Wall -Wextra -Wpedantic)
     add_test(NAME tunnel COMMAND go2cpp_tunnel_test)
     set_tests_properties(tunnel PROPERTIES LABELS tunnel TIMEOUT 900)
-    message(STATUS "tunnel: ON (go2cpp_tunnel, tunnel-server/client, test=tunnel)")
+
+    # 数据面吞吐/延迟基准：不注册 ctest（8 MiB 往返、耗时且随机器负载变化），
+    # 需要时手动 `ninja bench_tunnel && ./bench_tunnel [rounds] [concurrency]`。
+    add_executable(bench_tunnel
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/tunnel/bench_tunnel.cpp)
+    target_link_libraries(bench_tunnel PRIVATE go2cpp_tunnel)
+    target_compile_options(bench_tunnel PRIVATE
+        -O2 -Wall -Wextra -Wpedantic)
+    message(STATUS "tunnel: ON (go2cpp_tunnel, tunnel-server/client, test=tunnel, bench=bench_tunnel)")
 endif()
