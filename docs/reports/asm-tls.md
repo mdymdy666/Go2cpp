@@ -469,3 +469,101 @@ src/network/http2/tls_transport.cpp            | 175 ++++++++++++++++--
   `SigpipeGloballyIgnored`、`ScopedSigpipeBlock(bool required)` + `MarkFailure()`、
   `CreateClient` 挂 BIO（失败回退 `SSL_set_fd`）、三处 `ScopedSigpipeBlock`
   传 `!m_nosignal_bio`。
+
+---
+
+## 13. 续（2026-11-04）：ChaCha20 AVX2/AVX-512 + Poly1305 radix-2^44
+
+> 日期：2026-11-04；工作树 `/UserData/CodexWorkSpace/Go2cpp`；机器同 §0（Ryzen 9 8945HX，
+> AVX2/AVX-512F/VL/BW/DQ 均可用）。只改 `src/bento/net/crypto.cpp`（+约 500 行，含
+> 回退分支），**未 commit**。
+
+### 13.1 13.41× 的确认
+
+原 §6 的 13.41× 是 **1MB** 处 `EVP/自研` 的比值，64KB 处为 13.40×，测量方法为同进程
+`EVP_chacha20_poly1305` 完整 init 对拍（§2.2）。本次复测沿用同一口径，结论一致：
+**纯标量时自研 AEAD 约 0.4 GB/s 封顶，OpenSSL 5.1–5.4 GB/s，量级差距成立。**
+
+### 13.2 根因（逐条落实）
+
+| # | 根因 | 证据 |
+|---|---|---|
+| 1 | ChaCha20 未向量化 | 原 `crypto_dr.asm` 0 条 `v*` 指令；`ChaCha20Permute4` 是 C 层 4 路交错，编译器无法做 SLP |
+| 2 | Poly1305 是 5×26 位 limb 标量 | `Poly1305Block` 143 指令/16B 块，约 8.9 指令/字节，无延迟隐藏 |
+| 3 | 两者串行、吞吐相乘 | 单测 ChaCha 0.83 GB/s、Poly 0.7 GB/s → 1/(1/0.83+1/0.7)=0.38 GB/s，与实测吻合 |
+| 4 | 无运行期分派 | 编译期无 `target` 属性，整 TU 不能用 AVX2/AVX-512 |
+
+AES-GCM/AES-NI 与本题无关：仓库内 AEAD 只有 ChaCha20-Poly1305（`src/bento/net/crypto.cpp`），
+TLS 握手/记录层由 OpenSSL 提供，没有自研 AES-GCM 路径可加（§1.3/§1.4 已澄清）。
+
+### 13.3 改动
+
+1. **ChaCha20 垂直向量化 + 运行期分派**（`ChaCha20XorAvx512` 16 lane / `ChaCha20XorAvx2` 8 lane）：
+   - 布局 vertical（每个 `__m512i` 装 16 个 block 的同一 state word），20 轮全整向量；
+   - AVX-512 用 `vprold` 单指令轮转，尾部 16×16 32-bit 转置 64 条；
+   - AVX2 用 `vpshufb`（16/8 位）+ shift/or（12/7 位），8×8 转置 24 条；
+   - `__attribute__((target("avx512f,avx512dq,avx512bw,avx512vl")))` /
+     `target("avx2")`，`__builtin_cpu_supports` 探测 + magic static 缓存；
+   - `BENTO_CRYPTO_SIMD=scalar|avx2|avx512` 可强制降级（只下调、不越过硬件）。
+2. **Poly1305 换成 radix-2^44 的 3 limb**（`__SIZEOF_INT128__` 时启用，MSVC 回退原
+   5×26 实现）：每块 9 次 64×64→128 乘法，进位链 3 段；跨 limb 折回项乘 20
+   （2^132 ≡ 20 mod 2^130-5）。`Poly1305Block` 143 → **103 指令**（-28%），
+   一次性 `Poly1305` 431 → **368 指令**（-15%）。
+
+### 13.4 前后数据（同机同口径，每尺寸 0.2s，`bench_aead`）
+
+自研 AEAD seal 吞吐（MB/s）与 `EVP/自研` 倍率：
+
+| 尺寸 | 原（全标量） | 新 scalar | 新 AVX2 | 新 AVX-512 | 原倍率 | 新倍率(AVX-512) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 KiB | 380.4 | 416.7 | 1485.5 | **1803.2** | 8.50× | **1.80×** |
+| 16 KiB | 379.2 | 407.5 | 1631.2 | **2008.1** | 11.93× | **2.40×** |
+| 64 KiB | 366.7 | 425.4 | 1653.0 | **1973.6** | 13.40× | **2.65×** |
+| 1 MiB | 382.6 | 414.9 | 1499.6 | **1901.7** | 13.41× | **2.85×** |
+
+- 大包（64KiB）**366.7 → 1973.6 MB/s，5.38×**；vs EVP 倍率 **13.40× → 2.65×**。
+- ChaCha20 单测：0.83 → **7.88 GB/s**（AVX-512，64KiB）。
+- Poly1305 单测：约 2.4 → **3.0 GB/s**（64KiB，radix-2^44）。
+- ≤64B 仍领先 EVP（0.48×，即自研更快）。
+
+### 13.5 为什么仍未达 1.1×
+
+当前合成上限：`1/(1/7.88 + 1/3.0) = 2.17 GB/s`，实测 1.97 GB/s（91%）。要 <1.1× 需
+≥ 4.7 GB/s，即 Poly1305 需 ≥ 12.6 GB/s（每 16B 块 ≤ 5 周期）。
+
+- 标量 Poly1305 每块 9 次 `mulx` + 3 段进位，实测 21 周期/块，已是单块串行下限；
+  **单块串行在任何标量实现上都难突破 ~3–4 GB/s**。
+- 唯一出路是 **多块并行**：AVX2 4 路 / AVX-512 8 路 26-bit limb（`vpmuludq`，
+  OpenSSL 路线），4 路理论 12 GB/s、8 路 24 GB/s，可把整体推到 4.5–6 GB/s。
+  工作量：约 400–600 行 intrinsics + 延迟归约 + 尾部处理，且需独立向量对拍；
+  本次 40 分钟时间盒内无法完成并验证，故按铁律给书面瓶颈。
+
+### 13.6 正确性与复现
+
+```bash
+# 构建（-Wall -Wextra -Wpedantic，零告警）
+g++ -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic -fno-plt -Iinclude \
+  /mnt/e/tmp/tls_bench2/bench_aead.cpp \
+  src/bento/net/crypto.cpp src/bento/net/protocol.cpp -lcrypto -o /tmp/tls_bench2/bench_aead
+
+# 项目单测（RFC 8439 §2.4.2/§2.5.2/§2.8.2 + 帧/重放窗口）
+cmake --build build-review --target bento_test_crypto -j12 && ./build-review/bento_test_crypto
+# → [PASS] test_crypto (5482 checks)
+
+# 独立对拍：RFC 向量 + 0..2049 全字节长度往返 + 逐字节篡改拒绝
+g++ -O2 -std=c++17 -Iinclude /mnt/e/tmp/tls_bench2/check_vectors.cpp \
+  src/bento/net/crypto.cpp src/bento/net/protocol.cpp -o /tmp/tls_bench2/check_vectors
+/tmp/tls_bench2/check_vectors   # → ALL_VECTORS_OK
+```
+
+- `bento_test_crypto`：5482 checks 全过，含 RFC 向量与 AEAD 往返。
+- 独立对拍：Poly1305/AEAD 的 RFC 向量、0–2049 字节每个长度的 seal→open 往返、
+  每个长度翻一位密文的拒绝，全部通过。
+- 无 AVX-512 机器时 `BENTO_CRYPTO_SIMD=avx2` 或 `scalar`，实测仍分别有 3.14×/12.03×
+  （64KiB）——分派回退路径已实测，不是纸面分支。
+
+### 13.7 改动清单（未 commit）
+
+```
+src/bento/net/crypto.cpp | +约 500 行（SIMD 后端 + radix-2^44 + 分派）
+```

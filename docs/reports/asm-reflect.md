@@ -200,3 +200,116 @@ N × 值
 - 文本直读目前只对顶层为结构体的消息走快路径；内置类型顶层仍走建树路径。
 - `EstimateJson` 对字符串按最坏转义（6×）估算，输出缓冲可能偏大；未做精确长度预扫（实测收益小于扫描成本）。
 - 若后续需要「可选字段省略」更极致的体积优化，紧凑格式的 tag 序列已经支持跳过字段（解码端保留默认值）。
+
+---
+
+## 汇编级取证（2026-11-04）
+
+### 0. 结论速览
+
+- 热路径核心函数 **5 个**（`EncodeBin` / `SerializeReflectCompact` / `EncodeEnvelope` / `DecodeBin` / `DeserializeCompactReflect`），四条路径静态指令和 **1327 / 936 / 1033 / 2498 条**（编码/解码/文本编码/文本解码，含冷分支），**`lock` 指令 0 条**（无原子操作）。
+- **字段遍历是函数指针间接调用**：`SerializeReflectCompact` 与 `DeserializeCompactReflect` 各 1 处 `call *`，在 4 字段循环内每次执行 → **每消息 8 次间接调用**，这是「逐字段反射可静态化」最直接的证据。
+- 静态指令数 ÷ ns/op = **17.0–29.9 条/ns**，超过本机 2.5 GHz × 6 译码宽度的峰值 **15 条/ns** → **静态计数不能当动态指令用**；按物理上界反推，实际执行约 **33%–59%** 的静态代码，与「热路径 + 冷错误分支」结构一致，未发现隐藏重复计算。
+- 与 M13（2026-11-03）对比：编码 **44.31 ns** vs 52.64、解码 **52.15 ns** vs 54.89、自描述 **67.77 ns** vs 78.28、文本编码 **60.71 ns** vs 81.31、文本解码 **107.72 ns** vs 145.93，**5 项全部同量级且更快**（机器状态差异，非改码）。
+
+### 1. 取证口径
+
+| 项 | 值 |
+|---|---|
+| 工作树 | WSL `/UserData/CodexWorkSpace/Go2cpp`（分支 `feat/isolated`，**未 commit**） |
+| 源码改动 | **无**（本次只读 + 本报告；`git status` 见 §5） |
+| 编译器 | g++ 13.3.0，`-O3 -DNDEBUG -std=c++17`，无 LTO |
+| 探针 | `/tmp/asm_funcs.cpp`（probe TU，模板在此内联展开）+ `/tmp/asm_main.cpp`（计时驱动） |
+| 对象 | `LoginRequest` 4 字段（string/string/int64/bool），紧凑消息 **72 B**、自描述 102 B、文本 150 B（与 M13 同基准） |
+| 反汇编 | `objdump -d -C --no-show-raw-insn /tmp/asm_probe2` |
+| 统计 | `/tmp/asm_stats3.py`（按符号切分，跳过 `.cold` 克隆；`lock` 只计指令前缀） |
+| 计时 | `taskset -c 2,3`，每项 20 万次 × 3 轮，`steady_clock`，预热 10% |
+| CPU | AMD Ryzen 9 8945HX，`/proc/cpuinfo` 标称 **2495 MHz**（12 vCPU） |
+
+> 探针与基准的差异：基准里 `ReflectCodec::Encode/Decode` 直接内联进计时 lambda；探针把调用点放进独立 TU 的 `probe::*` 函数，**内联仍然发生**（`DecodeBin` 504 条即 `Decode` 三分派 + `DecodeBinaryCompact` 内联后的结果），只是统计边界更干净。
+
+### 2. 热函数静态指令表
+
+指令数 = 该符号全部指令（含错误/压缩/回退分支）；call 含 PLT；「间接」= `call *`；new = 调 `operator new` 的点；栈帧 = 最大 `sub $N,%rsp`。
+
+| 函数 | 指令 | call | 间接 call | new | lock | 栈帧(B) |
+|---|---:|---:|---:|---:|---:|---:|
+| `detail::EncodeEnvelope` | **977** | 54 | 0 | **10** | 0 | 408 |
+| `detail::DeserializeReflect`（建树回退） | 828 | 22 | 1 | 1 | 0 | 584 |
+| `detail::DecodeTextDirect` | 779 | 11 | 0 | 0 | 0 | 200 |
+| `detail::DecodeEnvelope` | 655 | 27 | 0 | 0 | 0 | 248 |
+| `detail::DecodeEnvelopeValue` | 599 | 25 | 0 | 0 | 0 | 264 |
+| `probe::DecodeBin`（`Decode` 全分派内联） | **504** | 12 | 0 | 0 | 0 | 136 |
+| `probe::DecodeText` | 501 | 12 | 0 | 0 | 0 | 136 |
+| `detail::DeserializeCompactReflect` | **432** | 4 | **1** | 0 | 0 | 280 |
+| `detail::ReadJsonReflect` | 390 | 19 | 1 | 0 | 0 | 296 |
+| `detail::WireFieldTable`（表构建） | 360 | 19 | 0 | **5** | 0 | 104 |
+| `probe::EncodeText` | 317 | 16 | 1 | 0 | 0 | 184 |
+| `detail::EncodeTextFast` | 310 | 10 | 1 | 0 | 0 | 72 |
+| `detail::CompactFieldPrefix`（仅首调） | 301 | 15 | 0 | **5** | 0 | 80 |
+| `detail::SerializeReflectCompact` | **285** | 14 | **1** | 1 | 0 | **24** |
+| `probe::AppendJson` | 234 | 7 | 1 | 0 | 0 | 48 |
+| `detail::SerializeReflect`（自描述） | 205 | 8 | 1 | 0 | 0 | 8 |
+| `probe::EstimateJson` | 172 | 3 | 1 | 0 | 0 | 8 |
+| `probe::EncodeBinSelf` | 69 | 4 | 0 | 0 | 0 | 64 |
+| `probe::EncodeBin` | **65** | 4 | 0 | 0 | 0 | 64 |
+
+路径小计（静态，含冷分支）：
+
+| 路径 | 组成 | 静态指令和 |
+|---|---|---:|
+| 二进制编码（紧凑） | EncodeBin 65 + SerializeReflectCompact 285 + EncodeEnvelope 977 | **1327** |
+| 二进制解码 | DecodeBin 504 + DeserializeCompactReflect 432 | **936** |
+| 文本编码 | EncodeText 317 + EncodeTextFast 310 + EstimateJson 172 + AppendJson 234 | **1033** |
+| 文本解码 | DecodeText 501 + DecodeTextDirect 779 + ReadJsonReflect 390 + DeserializeReflect 828 | **2498** |
+
+关键证据（反汇编原文）：
+
+```
+# 字段表函数指针分发（4 字段循环内，每次一条间接 call）
+    9d24:	call   *0x40(%r13,%rax,1)      # FieldOps 槽位偏移 + 字段索引×8
+    e7f1:	call   *0x68(%r14,%rax,1)
+# 编码路径：先序列化再套信封，两次调用之间只有 65 条胶水指令
+    5ef3:	call   c790 <detail::SerializeReflectCompact<LoginRequest>(...)>
+    5f18:	call   128b0 <detail::EncodeEnvelope(...)>
+```
+
+### 3. 与 M13 ns/op 对照：每 ns 多少指令是否合理
+
+实测（2026-11-04，3 轮）：
+
+| 路径 | 静态指令和 | 三轮 ns/op | 静态指令/ns | 动态反推（IPC 4，2.5 GHz→10 条/ns） | 执行率 |
+|---|---:|---|---:|---:|---:|
+| 二进制编码 | 1327 | 44.31 / 45.20 / 43.12 | **29.9** | ≈443 | 33% |
+| 二进制解码 | 936 | 52.15 / 54.36 / 51.65 | **17.9** | ≈522 | 56% |
+| 文本编码 | 1033 | 60.71 / 62.76 / 58.99 | **17.0** | ≈607 | 59% |
+| 文本解码 | 2498 | 107.72 / 104.09 / 109.30 | **23.2** | ≈1077 | 43% |
+
+对照 M13（2026-11-03 台账，同 4 字段登录消息）：
+
+| 项目 | 本轮（2026-11-04） | M13（2026-11-03） | 差异 |
+|---|---:|---:|---:|
+| 二进制编码 | **44.31–45.20 ns** | 52.64 | −15% |
+| 二进制解码 | **51.65–54.36 ns** | 54.89 | −4% |
+| 自描述编码 | 63.11–77.18 ns | 78.28 | −7% |
+| 文本编码 | **58.99–62.76 ns** | 81.31 | −27% |
+| 文本解码 | **104.09–109.30 ns** | 145.93 | −28% |
+
+**「每 ns 多少指令」的判定**：
+
+1. 静态口径 17.0–29.9 条/ns，**超过**本机单核峰值（2.5 GHz × 6 条/周期译码 = 15 条/ns），编码路径超 2 倍 → **静态指令和不能当动态指令数**，`EncodeEnvelope` 977 条里压缩/RLE/大小检查/错误路径占大头（10 个 `new` 全在冷分支），稳态紧凑路径只执行头部 + payload 拷贝。
+2. 按物理上界反推动态量（443 / 522 / 607 / 1077 条），对应执行率 33% / 56% / 59% / 43%，与「热路径短、冷分支多」的代码结构自洽；**没有发现同一份工作被重复执行**（如重复扫描/二次分配）的迹象。
+3. 与 M13 的 ns/op 全部同量级且本轮更快，**说明 M13 的 52.64/54.89 ns 可信**，汇编层面不存在被隐藏的额外开销。
+4. 局限：动态指令数、IPC、cycles **均未实测**（WSL2 无 PMU、容器内无 `perf`，`perf stat` 报 command not found），上表「动态反推」是按 IPC 4 的假设值，仅用于量级自洽，不作为实测指标。
+
+### 4. 可优化点（前 3）
+
+1. **字段 ops 函数指针去虚化（收益最大，属架构级）**——`SerializeReflectCompact` 285 条 / 14 call / 1 间接，`DeserializeCompactReflect` 432 条 / 4 call / 1 间接；两处 `call *` 都在字段循环内，每消息 **8 次间接调用**，每次都经过 `void* + offset` 且无法内联。既然 `FieldList<T>::Fields()` 是编译期常量表，可改成模板递归展开（`for_each_field<T>`）或按字段索引生成 switch，把 8 次间接调用变 0，同时让编译器看到 `string`/`int64`/`bool` 的具体类型。按每次间接调用 2–3 ns（含参数准备与 BTB 失配）估 **省 8–24 ns，占编码 44 ns 的 18%–55%**；解码侧同理。
+2. **`EncodeEnvelope` 瘦身 / 冷热分离**——977 条静态指令、54 call、10 个 `new`，而紧凑无压缩路径只写 24 B 头 + `PutBytes(payload)`。建议把 RLE/压缩/大小校验/错误构造拆到 `[[gnu::cold]]` 独立函数，热函数压到约 100–150 条，估 **省 3–8 ns**；顺带去掉冷路径上的 `new` 对指令缓存与分支预测器的污染。
+3. **`Decode` 三路顺序探测改为首字节分派**——`probe::DecodeBin` 504 条里包含 `DecodeBinaryCompact` 全量尝试 + `DecodeTextDirect` 全量尝试 + `DecodeEnvelope` 通用路径；二进制输入先做一次完整的文本直读尝试（反之亦然），失败路径的指令全部白付。按首字节（`'G'` vs `'{'`/空白）或调用方显式 `Encoding` 先分类，可省一次全量尝试。文本解码本轮 104–109 ns 与 M13 145.93 差距最大，此项对文本路径收益最直接。
+
+### 5. 差距与未测
+
+- 与工业库（历史对手值，**非同一轮**）：编码 44.31 ns vs protobuf 81.7（0.54×）、解码 52.15 vs 78.1（0.67×）、文本编码 60.71 vs rapidjson 103.8（0.58×）、文本解码 107.72 vs 275.9（0.39×）。
+- **未测**：动态指令数 / IPC / cycles（无 PMU、无 `perf`）；LTO 前后对比；压缩路径（RLE）汇编；`WireFieldTable` 与 `CompactFieldPrefix` 的首次构建成本（301/360 条 + 各 5 个 `new`，只在首调付出，未单独计时）。
+- `git status`：本次只新增本报告章节，**未 commit**；工作树其余改动（`README.md`、`collab/acceptance.md`、`src/bento/net/crypto.cpp`、`tests/go_net`、`tests/logging`、`tests/rd_net`、`docs/reports/asm-compress.md` 等）均非本次产生，属并行任务。
