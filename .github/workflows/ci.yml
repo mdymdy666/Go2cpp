@@ -234,3 +234,82 @@ jobs:
             build-bento/Testing/Temporary/LastTest.log
             build-bento/Testing/Temporary/LastTestsFailed.log
           if-no-files-found: ignore
+
+  # 一条命令门禁：唯一入口是 scripts/ci.sh，本地与 CI 完全同一条命令。
+  # 覆盖 README「四、构建与测试」主构建（Bento + MCP + app + p2p）并额外打开
+  # SQLite（-DGO2CPP_WITH_SQLITE=ON）；依赖依据：
+  #   grep -rn 'find_package\|pkg_check_modules' cmake/ CMakeLists.txt
+  #   → Threads / OpenSSL(GO2CPP_WITH_TLS) / sqlite3(GO2CPP_WITH_SQLITE)。
+  # 未启用 ccache：ci.sh 不接受额外 cmake 参数，保持「一条命令」唯一入口；
+  # 需要时可在本地用 ccache 包装编译器，不影响本 job 的语义。
+  one-command:
+    name: one-command (scripts/ci.sh --quick)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config python3 \
+            libsqlite3-dev libssl-dev zlib1g-dev libboost-context-dev
+
+      - name: One-command gate (configure + build + ctest)
+        env:
+          CI_ALLOW_KNOWN: "1"
+        run: bash scripts/ci.sh --quick --build-dir /tmp/go2cpp-ci
+
+      - name: Collect CI logs on failure
+        if: failure()
+        run: cp -r /tmp/go2cpp-ci/ci-logs ./ci-logs
+
+      - name: Upload CI logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: one-command-logs
+          path: ci-logs/
+          if-no-files-found: ignore
+
+  # Windows 骨架（探测性，不作为门禁）：
+  # 仓库历史构建链只有 Linux/WSL（README、docs/testing.md、原有 CI 全部
+  # ubuntu）。本 job 只验证「Windows 上能否 configure + 编出最小骨架」，
+  # 用 continue-on-error 标记为非阻塞：结果失败时 workflow 显示黄色而不是
+  # 伪造绿色通过，也不会挡住 Linux 门禁。等 Windows 适配完成后再去掉
+  # continue-on-error。POSIX 专属模块（hook/bento/tunnel/relay/eBPF 等）
+  # 全部关闭，只保留可移植的核心库。
+  windows-configure:
+    name: windows configure skeleton (probe, non-blocking)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure minimal skeleton
+        shell: pwsh
+        run: |
+          cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64 `
+            -DGO2CPP_BUILD_TESTS=OFF `
+            -DGO2CPP_BUILD_EXAMPLES=OFF `
+            -DGO2CPP_WITH_BENTO=OFF `
+            -DGO2CPP_WITH_MCP=OFF `
+            -DGO2CPP_WITH_APP=OFF `
+            -DGO2CPP_WITH_P2P=OFF `
+            -DGO2CPP_WITH_SQLITE=OFF `
+            -DGO2CPP_WITH_TLS=OFF `
+            -DGO2CPP_WITH_RPC=OFF `
+            -DGO2CPP_WITH_TUNNEL=OFF `
+            -DGO2CPP_WITH_RELAY=OFF `
+            -DGO2CPP_WITH_FRAME=OFF `
+            -DGO2CPP_BUILD_HOOK=OFF `
+            -DGO2CPP_ENABLE_EBPF=OFF
+
+      - name: Build skeleton
+        shell: pwsh
+        continue-on-error: true
+        run: cmake --build build-win --config Release --parallel 4

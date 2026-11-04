@@ -1,5 +1,17 @@
 # Go2Cpp —— Go 并发/网络语义的 C++ 复刻与优化工具库
 
+[![CI](https://github.com/mdymdy666/Go2cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/mdymdy666/Go2cpp/actions/workflows/ci.yml)
+
+> **一条命令验证**（在仓库根执行，Linux/WSL）：`bash scripts/ci.sh`。
+> 默认做 Release 配置 + 全量构建 + 全量 `ctest`；`--full` 额外做 ASAN 构建、
+> 并发/网络测试子集与 `tools/verify_metrics.sh --quick`；`--build-dir PATH`
+> 可把构建目录移到源码树外（CI 用 `/tmp/go2cpp-ci`）。脚本逐步打印耗时与结果
+> （如 `[ci] build 12m34s OK`），日志写入 `<build-dir>/ci-logs/`，任一步失败即
+> 以退出码 1 结束。
+>
+> 依赖（Ubuntu 24.04）：`cmake` ≥ 3.20、`g++`（C++17）、`ninja`（可选）、
+> `libsqlite3-dev`、`libssl-dev`、`zlib1g-dev`、`libboost-context-dev`。
+
 > **一句话**：把 Go 运行时的并发与网络模型（GMP 调度、Fiber、Channel、Context、netpoll）复刻到 C++17，
 > 在关键路径上做数量级优化；同时提供一套 **Go 语义开发工具**，让 Go 代码「几乎不改」迁移到 C++；
 > 以及覆盖 **多网络场景** 的快速开发组件（TCP/UDP/HTTP/WebSocket/MQTT/CoAP/SOCKS5、RPC、P2P、
