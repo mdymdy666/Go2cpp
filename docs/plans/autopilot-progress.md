@@ -134,19 +134,21 @@
 | ErrorScope（Fiber 链多重 Error + drain） | bc3e256 | 5 用例 40 checks；infra-usage.md 188 行 |
 | rd_net Windows（MSVC）实现（2090 行） | c3f88b2 | _WIN32 分支；63 socket 上限；platform-diff.md 189 行 |
 
-## 今日完成（2026-11-04，32 个提交）
+## 今日完成（2026-11-04，41 个提交）
 
 | 线 | 内容 | 关键提交 |
 |---|---|---|
-| 三件套 | 覆盖盘点（44 模块）+ HTTP 汇编取证（22 热函数）+ gzip（EmitFixedBlock 2757 指令 49 PLT）+ reflect（字段 8 次间接调用）+ TLS（13.40x -> 2.65x）+ 缺失 7 项归属 | 54c439b/e18b5d9/ff15c6c/da07a01/78c66e7 |
-| 基础设施 | reflect/error/config/log 覆盖审计（264 行）；storage/app/rpc 接日志（13 处，log 4/24->7/24）；gateway/realtime_room 纳入构建 | 85315e1/4fcc407/0f6fd2e |
-| JinShan | REQ-010 打回闭环（真 MSVC 2022 编译+运行 406/44/44/64 全过）；REQ-011 待用户选口径 | 423783a/4cc501a/fb8e2fa |
-| WS 性能 | RSS avg 291.6->227.7MB（0.96x Go，达标）；p99 2.37x（未达 1.1x，环境噪声待 A/B）；IOManager 调查纠正（ONESHOT 已移除） | 8b7013c/e85c7b5/af1ad90 |
+| 三件套 | 44 模块盘点 + 7 份新汇编证据（HTTP/gzip/reflect/TLS/WS/tunnel/bufio）+ 缺失项归属 + 真差距表 | 54c439b/756aa6b/76508ed |
+| 架构优化 | **WS 单 poller（p99 −45%，0.93× Go）**、**TLS 多路 SIMD（13.40×→1.28×）**、**tunnel 合并写（+59%）+ RelayPipe 直通（延迟 −22%）** | e9f84d5/7a4d310/b5b2a9e/718336c |
+| 基础设施 | reflect/error/config/log 覆盖审计 + storage/app/rpc 接日志 + app 纳入构建 + platform-diff 9 项 | 85315e1/4fcc407/0f6fd2e/daea8d5 |
+| JinShan | **REQ-010 打回闭环（真 MSVC 2026 编译+运行 406/44/44/64 全过）**；REQ-011 待口径 | 4cc501a |
+| 存储 | kv 读 1.11–1.25×（0.48× 是误引）；写路径 0.24× 待立项 | 7d2870b |
 
-## 下一个任务（2026-11-04 13:10 起）
+## 下一个任务（2026-11-04 13:52 起）
 
 1. **REQ-011 回执**（等用户选：A 声明只交付 Linux / B 做 network Windows 适配）；
-2. **WS p99**：干净环境 A/B（确认 +526B cache 效应）+ 单 poller 批量交付立项；
-3. **kv 0.48×** 收口（`a1611601` 在跑）；
-4. **TLS 多路 SIMD Poly1305**（400–600 行，需单独立项）；
-5. **tunnel / bufio / frame** 补三件套（缺失项 TOP3）。
+2. **TLS AVX-512 IFMA**（Poly1305 9.28→18-24 GB/s，300–400 行，可把 1.28× 压到 ≤1.1×）；
+3. **tunnel splice/io_uring**（每段零拷贝，目标开销 ≤2×；删线程已证伪）；
+4. **WS 剩余**：每事件条带锁 + epoll_ctl MOD + 单批事件数（客户端单线程已构成下限）；
+5. **kv 写路径 0.24×**（8MB memtable 同步 compaction，需另立任务）；
+6. CI Windows 转门禁（待 GitHub runner 首次通过）。
