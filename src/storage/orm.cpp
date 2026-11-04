@@ -240,10 +240,12 @@ std::string AddColumnSql(std::string_view table, std::string_view column,
     sql += QuoteIdentifier(column);
     sql += " ";
     sql += ColumnTypeName(type);
+    // fallback 必须活到函数末尾：default_sql 是 string_view，若 fallback 定义在
+    // 下面的 if 块内，块结束即析构，第 266 行读它必是 stack-use-after-scope（ASan 实测）。
+    std::string fallback;
     if (not_null) {
         // SQLite 要求 ADD COLUMN 的 NOT NULL 带非 NULL 默认值；调用方没给
         // 时按类型补一个哑默认值，避免迁移在运行期才炸。
-        std::string fallback;
         if (default_sql.empty()) {
             switch (type) {
                 case ColumnType::kInteger:
