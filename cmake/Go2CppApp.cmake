@@ -167,9 +167,9 @@ endif()
 #   cmake --build .build-bento-wsl --target go2cpp_stream_demo
 # ---------------------------------------------------------------------------
 if (GO2CPP_WITH_APP AND GO2CPP_BUILD_EXAMPLES AND EXISTS
-        ${CMAKE_CURRENT_SOURCE_DIR}/user/app/stream_demo/main.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/user/modules/app/stream_demo/main.cpp)
     add_executable(go2cpp_stream_demo
-        ${CMAKE_CURRENT_SOURCE_DIR}/user/app/stream_demo/main.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/user/modules/app/stream_demo/main.cpp)
     target_link_libraries(go2cpp_stream_demo PRIVATE go2cpp_app)
     target_compile_options(go2cpp_stream_demo PRIVATE
         -Wall -Wextra -Wpedantic)

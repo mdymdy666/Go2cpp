@@ -1,9 +1,13 @@
-# user/debug —— 运行期内省：快照 / 事件环 / 断点 / dump CLI
+# 调试内省（debug）
+
+> **一句话定位**：运行期内省：快照 / 事件环 / 断点 / dump CLI。
+> 本文是「模块 → 能力 → 异常」手册；[可观测性总览（debug 事件环/回放）](../../deep/10-observability.md)
+
 
 > 调试模块的示例与说明：不打断程序的前提下，看清「调度器在干什么、
 > 谁持有锁、Fiber 叫什么名字、事件怎么流动」。
 
-## 这个模块是什么
+## 能力清单
 
 `go2cpp::debug` 是一个**只读观察层**：它给运行中的调度器、Fiber、锁加上
 元数据与快照能力，而**不改变框架的任何行为**。
@@ -50,7 +54,7 @@
 | `GO2CPP_DIAGNOSTIC` | 在线诊断 agent |
 | `GO2CPP_BUILD_ENHANCED` | 一键打开上面四个（含 `MIGRATION_API`） |
 
-## 最小用法
+## 最小示例
 
 ```cpp
 #include "go2cpp/debug.hpp"
@@ -90,7 +94,24 @@ int main() {
 
 完整版（5 个部分）见 `debug_module_demo.cpp`。
 
-## 示例列表
+## 3 个常见异常
+
+### 1. `DebugServer::Start()` 返回 false
+- **现象**：在线查询端口连不上，Start 返回 false。
+- **原因**：未开 `GO2CPP_DEBUG_DUMP`，事件环与 Server 被宏完全消除——这是**预期行为**，不是故障。
+- **处理**：用 `-DGO2CPP_DEBUG_DUMP=ON`（或 `GO2CPP_BUILD_ENHANCED`）重新编译后重试。
+
+### 2. 通过基类指针 delete `DebugFiber`
+- **现象**：析构时崩溃或内存破坏。
+- **原因**：`Fiber`/`sync::Mutex` 的析构**不是虚函数**，`Debug*` 只是继承扩展。
+- **处理**：始终按具体类型析构；`DebugFiber` 不得放进按 `Fiber*` 删除的位置（如 `Task::m_fiber`）。
+
+### 3. 用快照数字做调度决策
+- **现象**：按 runnable 数扩缩容，行为抖动。
+- **原因**：快照是**瞬时视图**，读到即过期，采集本身也有开销。
+- **处理**：只用于观测/导出；控制回路用框架自身的自适应扩缩，不要自建反馈。
+
+## 示例清单
 
 | 示例 | 演示什么 |
 | --- | --- |
@@ -131,3 +152,10 @@ cmake --build /tmp/build-user --target go2cpp_debug_module_demo -j
   要实现「停在某处」得自己在命中后等待外部 Resume。
 - **快照是瞬时视图**：读到的 worker/runnable 数会立刻过期，别拿它做判断依据。
 - **dump 文件会落在工作目录**：CLI 的路径参数是相对当前工作目录的。
+
+## 深入阅读
+
+- [可观测性总览（debug 事件环/回放）](../../deep/10-observability.md)
+- [交接摘要（docs）](../../docs/10-observability.md)
+- 源码位置：`include/go2cpp/debug/`、`src/debug/`、一次性入口 `include/go2cpp/debug.hpp`
+- 示例目标名 = `go2cpp_<文件名>`；新增示例需同时登记 `cmake/Go2CppTests.cmake` 与本文清单。

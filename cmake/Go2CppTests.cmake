@@ -1201,7 +1201,7 @@ if (GO2CPP_BUILD_EXAMPLES)
     foreach(example_name IN LISTS GO2CPP_EXAMPLES)
         get_filename_component(example_target ${example_name} NAME_WE)
         add_executable(go2cpp_${example_target}
-            ${CMAKE_CURRENT_SOURCE_DIR}/user/${example_name}.cpp)
+            ${CMAKE_CURRENT_SOURCE_DIR}/user/modules/${example_name}.cpp)
         target_link_libraries(go2cpp_${example_target} PRIVATE go2cpp_runtime)
         target_compile_options(go2cpp_${example_target} PRIVATE
             -Wall -Wextra -Wpedantic)

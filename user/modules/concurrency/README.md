@@ -1,9 +1,13 @@
-# user/modules/concurrency —— 调度器 / Fiber / Channel / Context / Sync
+# 并发（concurrency）
+
+> **一句话定位**：调度器 / Fiber / Channel / Context / Sync。
+> 本文是「模块 → 能力 → 异常」手册；[并发深入文档](../../deep/01-concurrency.md)
+
 
 > 这个目录是「并发运行时」的人手示例：一台用 C++17 实现的 GMP 调度器，
 > 以及长在它上面的 Channel、Select、Context、同步原语、Future、定时器。
 
-## 这个模块是什么
+## 能力清单
 
 Go 的并发能力由三件东西组成：**goroutine（轻量执行体）+ channel（通信）
 + context（取消传播）**。本模块把这套语义在 C++ 里重建了一遍：
@@ -71,7 +75,7 @@ Go 的并发能力由三件东西组成：**goroutine（轻量执行体）+ chan
 - `sync::Mutex`/`ConditionVariable`/`WaitGroup` 同时服务 Fiber 与 OS 线程，
   采用 Go 风格所有权：**解锁不要求同线程**（这正是 `std::mutex` 不能替代它的原因）。
 
-## 最小用法
+## 最小示例
 
 ```cpp
 #include "go2cpp/runtime.hpp"
@@ -106,7 +110,7 @@ int main() {
 结束前调用 `shutdown_default_scheduler()`。
 完整可运行版本见 `beginner_demo.cpp`。
 
-## 示例列表
+## 示例清单
 
 全部注册进 ctest，目标名 = `go2cpp_<文件名>`：
 
@@ -141,6 +145,25 @@ cmake --build /tmp/build-user --target go2cpp_beginner_demo -j
 
 带 `full` 的是同一组件的多场景版（通常 6–8 个场景，含错误/边界路径）；
 `demo` 版只有 3 个左右的主干场景，适合第一次读。
+
+## 3 个常见异常
+
+### 1. 向已关闭的 Channel 发送
+- **现象**：数据静默丢失，或调用方以为发送成功。
+- **原因**：`Send` 返回 `kClosed`，**不 panic、不抛异常**；返回值带 `[[nodiscard]]`，忽略后逻辑会继续。
+- **处理**：必须检查返回值；需要「失败即异常」时用 `SendOrThrow`；关闭后先 drain 再退出。
+
+### 2. 普通线程里直接用 Channel / Mutex
+- **现象**：整个线程卡住；单线程「先 Send 后 Recv」必定自死锁。
+- **原因**：非 Fiber 上下文 park 走 native futex 路径，阻塞整个 OS 线程，而不是让出 M。
+- **处理**：把逻辑放进 `go()`；或用有缓冲 channel + `TrySend`；或用 `BlockingRegion` 标记；
+  必须同步等待时用 `SendFor`/`RecvFor` 超时。
+
+### 3. `WithCancel` 后忘记 `cancel()`
+- **现象**：等待 `Done()` 的 goroutine 永久 park，内存/句柄不释放。
+- **原因**：Context **不会**随作用域自动取消，取消是显式动作。
+- **处理**：用 `CancelGuard`（RAII）或 defer cancel；有界场景改用 `WithTimeout`；
+  等待方同时检查 `Done()` 与 `Err()`。
 
 ## 异常处理示例（默认行为 + 可选策略）
 
@@ -214,3 +237,10 @@ g++ -std=c++17 -Wall -Wextra -Wpedantic -I"$ROOT/include" \
 - **异常路径默认不 panic**：关闭后 `Send` 返回 `kClosed`、普通线程的阻塞会占住
   OS 线程、`Context` 不会自动取消。三者的完整默认行为与替代策略见上面的
   「异常处理示例」，改代码前先确认自己要的是默认语义还是显式策略。
+
+## 深入阅读
+
+- [并发模块 · 深入学习](../../deep/01-concurrency.md)
+- [交接摘要](../../docs/01-concurrency.md)
+- 源码位置：`include/go2cpp/concurrency/`、`include/go2cpp/sync.hpp`、`src/concurrency/`
+- 示例目标名 = `go2cpp_<文件名>`；新增示例需登记 `cmake/Go2CppTests.cmake` 与本文清单。

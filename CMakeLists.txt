@@ -60,11 +60,11 @@ include(cmake/Go2CppBento.cmake)
 include(cmake/Go2CppMedia.cmake)
 include(cmake/Go2CppMetricsPrometheus.cmake)
 
-# 应用级示例（user/app）：web_server / chat_server 的 simple 与 full 两版。
+# 应用级示例（user/modules/app）：web_server / chat_server 的 simple 与 full 两版。
 # 它们依赖 Bento 的 HttpServer/LinkServer，必须放在 Go2CppBento.cmake 之后；
 # app/CMakeLists.txt 内部按 TARGET 存在性判断，Bento 关闭时只打印跳过原因。
 if (GO2CPP_BUILD_EXAMPLES)
-    add_subdirectory(user/app)
+    add_subdirectory(user/modules/app)
 endif()
 
 # Reflect 测试（帧对接测试优先复用 go2cpp_bento，因此必须在 Bento 之后）。

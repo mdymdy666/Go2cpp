@@ -1,8 +1,12 @@
-# user/config —— INI 配置、强类型配置项、热加载与运行时快照
+# 配置（config）
+
+> **一句话定位**：INI 配置、强类型配置项、热加载与运行时快照。
+> 本文是「模块 → 能力 → 异常」手册；[配置热更新与运行时快照](../../deep/10-observability.md) · [存储侧配置](../../deep/04-storage.md)
+
 
 > 配置模块的示例：从「读一个 INI 文件」到「进程级配置中心 + 文件监听 + 两阶段提交」。
 
-## 这个模块是什么
+## 能力清单
 
 配置模块解决四类问题，各有一层抽象：
 
@@ -51,7 +55,7 @@ Reflect 的字段反射 + JSON，用于旧配置兼容。
 **线程模型**：`IniFile` 无锁、单线程使用；`ConfigVar`/`Config` 内部有锁，
 可被多个线程读写；文件监听由独立线程驱动，通知在**监听线程**上回调。
 
-## 最小用法
+## 最小示例
 
 ```cpp
 #include "go2cpp/config.hpp"
@@ -98,7 +102,24 @@ auto port = center.Lookup<int>("demo.port", 8080, "监听端口");  // 注册默
 (void)center.LoadFromIni(ini);                                  // 预检 → 写入 → 统一通知
 ```
 
-## 示例列表
+## 3 个常见异常
+
+### 1. 热加载后「配置改了一半」
+- **现象**：批量加载失败，部分值已变、部分没变，运行行为前后不一致。
+- **原因**：`Config::LoadFromIni` 走两阶段提交（预检 → 写入 → 统一通知），任一项校验失败整批回滚；但**已发出的通知不会撤回**。
+- **处理**：监听者按「最终快照」重建状态，不要按增量事件累加；失败后重新读一次 `RuntimeConfig`。
+
+### 2. 缓存了旧的 `RuntimeConfig` 引用
+- **现象**：热加载返回成功，但调度器/日志阈值没变。
+- **原因**：`RuntimeConfig` 是**构造时快照**，配置变更不会刷新已有对象。
+- **处理**：每次重载后重新 `FromIni` 构造，不跨重载持有引用或指针。
+
+### 3. 在监听回调里再次改配置
+- **现象**：卡死、死锁或无限递归。
+- **原因**：通知在**监听线程**上回调，回调内再触发变更会重入 `Config` 的锁。
+- **处理**：回调只做投递（无锁队列 / 原子标志），真正的变更回到主循环执行。
+
+## 示例清单
 
 | 示例 | 演示什么 | ctest |
 | --- | --- | --- |
@@ -123,7 +144,7 @@ cmake --build /tmp/build-user --target go2cpp_config_demo -j && /tmp/build-user/
 | 文件监听 | `include/go2cpp/config/watch.hpp` | `src/config/config.cpp` |
 | 动态库清单/重载 | `include/go2cpp/config/so_manifest.hpp`、`so_reloader.hpp` | `src/config/so_manifest.cpp`、`so_reloader.cpp` |
 
-配置格式与服务端示例的用法见 `user/app/web_server_full/`（`server.ini`）。
+配置格式与服务端示例的用法见 `user/modules/app/web_server_full/`（`server.ini`）。
 
 ## 注意事项
 
@@ -135,3 +156,11 @@ cmake --build /tmp/build-user --target go2cpp_config_demo -j && /tmp/build-user/
 - **`RuntimeConfig` 是快照**：构造后不再变化；改配置后要重新构造，不要缓存旧引用。
 - **`ConfigVar` 的求值顺序坑**：`GetValue()` 与 `FromString()` 不要写在同一个
   `<<` 链里（示例首版踩过），先取值再赋值。
+
+## 深入阅读
+
+- [配置热更新与运行时快照](../../deep/10-observability.md)
+- [存储侧配置](../../deep/04-storage.md)
+- [交接摘要（docs）](../../docs/10-observability.md)
+- 源码位置：`include/go2cpp/config/`、`src/config/`
+- 示例目标名 = `go2cpp_<文件名>`；新增示例需同时登记 `cmake/Go2CppTests.cmake` 与本文清单。

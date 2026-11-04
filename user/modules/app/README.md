@@ -3,7 +3,7 @@
 > 7 个**可运行的服务或完整闭环**：4 个服务型示例（web_server / chat_server 各有
 > simple 与 full 两版）+ 3 个新能力示例（P2P 打洞、缓存策略对比、应用层流表）。
 
-## 这个模块是什么
+## 能力清单
 
 `user/` 下其他目录是「单文件、跑完即退」的组件示例；这里不同：**这些是服务或完整闭环**，
 会监听端口、等待信号或驱动多进程，因此**不注册 ctest**，由各自 README 里的
@@ -78,7 +78,7 @@ cmake --build build --target \
   go2cpp_p2p_demo go2cpp_cache_demo go2cpp_stream_demo -j8
 ```
 
-产物在 `build/user/app/` 下（与其他示例的 `build/` 根目录不同）。
+产物在 `build/user/modules/app/` 下（与其他示例的 `build/` 根目录不同）。
 
 各 target 的注册条件：
 
@@ -96,11 +96,11 @@ CMake 不会静默把示例编译成空壳：缺失依赖时打印明确原因�
 
 ```sh
 # 无端口的两个：直接跑
-./build/user/app/go2cpp_cache_demo
-./build/user/app/go2cpp_stream_demo      # STREAM_OK + SHA-256 一致
+./build/user/modules/app/go2cpp_cache_demo
+./build/user/modules/app/go2cpp_stream_demo      # STREAM_OK + SHA-256 一致
 
 # web：指定端口（默认 8080）
-./build/user/app/go2cpp_web_server_simple 28080
+./build/user/modules/app/go2cpp_web_server_simple 28080
 curl -s http://127.0.0.1:28080/health                       # {"status":"ok"}
 curl -s 'http://127.0.0.1:28080/api/echo?name=Go2Cpp&times=3'
 curl -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:28080/api/echo?times=9'  # 400
@@ -109,10 +109,10 @@ curl -s -X POST -o /dev/null -w '%{http_code}\n' http://127.0.0.1:28080/        
 pkill -TERM -f go2cpp_web_server_simple                     # 优雅关闭，退出码 0
 
 # chat：用内置客户端互测
-./build/user/app/go2cpp_chat_server_simple --client
+./build/user/modules/app/go2cpp_chat_server_simple --client
 
 # p2p：一条脚本起三个进程
-bash user/app/p2p_demo/run_demo.sh
+bash user/modules/app/p2p_demo/run_demo.sh
 ```
 
 实测（WSL，2026-11-02）：`cache_demo` 三张命中率表正常；`stream_demo` 输出
@@ -123,7 +123,7 @@ bash user/app/p2p_demo/run_demo.sh
 
 | 示例 | 演示能力 | 运行方式 | 成功标志 |
 | --- | --- | --- | --- |
-| `p2p_demo` | STUN 地址发现、候选交换、UDP 打洞、keepalive/统计 | `bash user/app/p2p_demo/run_demo.sh` | `P2P_OK role=a/b`、`P2P 演示成功` |
+| `p2p_demo` | STUN 地址发现、候选交换、UDP 打洞、keepalive/统计 | `bash user/modules/app/p2p_demo/run_demo.sh` | `P2P_OK role=a/b`、`P2P 演示成功` |
 | `cache_demo` | 7 策略 × 3 场景命中率/字节命中率对比 | 直接运行 | 三张表 + 平均排名，退出码 0 |
 | `stream_demo` | 流表 + 资源分块传输 + KV 流式/单帧模式 | 直接运行 | `STREAM_OK`、输出文件 SHA-256 一致 |
 
@@ -162,6 +162,23 @@ bash user/app/p2p_demo/run_demo.sh
 
 各示例目录下还有一份独立 README（功能 / 构建 / 运行 / 逐条测试命令 / 实测输出）。
 
+## 3 个常见异常
+
+### 1. 启动即 `bind(...) 失败`
+- **现象**：进程退出，日志提示地址已被占用。
+- **原因**：示例监听固定端口（28080/8080 等），上一次进程没退干净或端口被别的程序占用。
+- **处理**：给程序传别的端口（如 `./go2cpp_web_server_simple 28081`），或先 `ss -lntp | grep 端口` 确认占用者。
+
+### 2. `web_server` / `chat_server` 示例被跳过
+- **现象**：configure 阶段打印 `user/modules/app: ... 示例跳过`，构建后没有对应可执行文件。
+- **原因**：它们依赖 `go2cpp_bento_http` / `go2cpp_bento`，未开 `-DGO2CPP_WITH_BENTO=ON`。
+- **处理**：重新配置时加 `-DGO2CPP_WITH_BENTO=ON`，再构建。
+
+### 3. 服务收到 `SIGTERM` 后不退出或不 drain
+- **现象**：`kill` 后进程仍存活，或在途请求被截断。
+- **原因**：信号处理里直接做关闭/加锁，或关闭顺序错误（先关调度器再关连接）。
+- **处理**：handler 只置 `atomic<bool>`，关闭顺序按 [`recipes/01-http-graceful-shutdown.md`](../../recipes/01-http-graceful-shutdown.md) 执行。
+
 ## 注意事项
 
 - **所有命令以仓库根目录为工作目录**：静态文件与配置都是相对路径。
@@ -174,3 +191,10 @@ bash user/app/p2p_demo/run_demo.sh
 - **IM 模块不在本工作树**：`include/go2cpp/im/` 在早期规划里存在，当前 checkout
   没有该目录，因此没有 `im_demo`；需要 IM 能力时参考 `chat_server_full` 的
   会话/房间模式自行扩展。
+
+## 深入阅读
+
+- [应用层深入文档](../../deep/12-app.md)
+- [交接摘要（docs）](../../docs/12-app.md)
+- 源码位置：`include/go2cpp/app/`、`src/app/`、`include/go2cpp/p2p/`
+- 示例目标名 = `go2cpp_<文件名>`；新增示例需同时登记 `cmake/Go2CppTests.cmake` 与本文清单。

@@ -5,6 +5,18 @@
 
 ---
 
+## 五层地图（这篇怎么读）
+
+| 层 | 回答的问题 | 本文位置 |
+|---|---|---|
+| 层 1 · What | 缓存抽象解决什么、7 种策略各自的承诺与代价 | 第一部分 |
+| 层 2 · How | 容器层（BucketMap/IntrusiveList/NodePool）+ 装饰层的协作 | 第二部分 |
+| 层 3 · 源码 | LRU / 2Q / TinyLFU 逐函数、逐指针、逐条指令 | 第三部分 |
+| 层 4 · 实战 | 并发淘汰 / 容量为 0 / 析构与哈希抛异常 | 第四部分 |
+| 层 5 · 性能 | 73 / 373 / 306 条指令、0 锁 0 分配、怎么复现 | 第五部分 |
+
+每部分末尾有「小结」；小结只写结论与边界。
+
 ## 第一部分 · 总：这个模块怎么跑起来
 
 ### 1.1 入口点清单
@@ -131,6 +143,23 @@
 
 ---
 
+### 1.5 层 1 小结：缓存抽象的四个承诺与四个不承诺
+
+**承诺**：
+
+1. `Get` 命中返回 true 并给出 value；未命中返回 false，不改 value。
+2. 容量上限由 `CacheOptions::capacity` 约束（`ShardedCache` 是各片之和）。
+3. 淘汰顺序由策略定义，且**只由策略层决定**；装饰层不改变顺序。
+4. 统计口径固定：`hits+misses` 是命中率分母，`rejections`/`evictions` 不计入。
+
+**不承诺**：
+
+1. **不承诺 `Put` 一定进缓存**：TinyLFU 频率准入、GDSF 超重、2Q/ARC 的 pending 都可能静默拒绝；接口故意不返回 bool。
+2. **不承诺线程安全**：策略核心无锁、非线程安全（`cache.hpp:23`）；要么 `ThreadSafeCache`，要么 `ShardedCache`，要么调用方自己加锁。
+3. **不承诺跨片全局顺序**：分片后 LRU/ARC 顺序、TinyLFU 频率都不再全局。
+4. **不承诺 `Clear()` 清统计**：统计是累计值（`cache.hpp:78`）。
+
+一句话：**它是「命中率数据结构」，不是「分布式缓存」**——没有过期、没有回源、没有持久化。
 ## 第二部分 · 分：逐块细讲
 
 ### 2.1 接口与装饰器（`cache.hpp`）
@@ -355,3 +384,345 @@ detail::NodePool<Entry> pool_;
 
 
 
+### 2.20 层 2 小结：容器层决定了策略的上限
+
+1. **索引只能是哈希**：`BucketMap` 链式 + `mask_` 取模，查找 O(1) 但有一次指针追逐；没有有序索引，所以任何「按分数找最小」的策略（LRU-K/GDSF）都要额外结构（时间轮/堆）。
+2. **链表只能侵入式**：`Entry : Link<Entry>`，一个节点同一时刻只能挂一条链；这是「段间搬家只改指针」的前提，也是「重复挂链就断链」的根因。
+3. **节点只能来自 NodePool**：64 个一块、`Destroy` 不归还内存只挂 free list，所以稳态 0 分配；代价是 RSS 不缩容。
+4. **装饰层只做锁与分片**：`ThreadSafeCache` 一把锁、`ShardedCache` N 把锁；它们不改变策略语义，也不做跨片协调。
+
+这四条决定了：**策略的正确性主要不在算法，而在「节点只属于一条链、Create/Destroy 配对、索引与链同步」**。层 3 的逐函数拆就是围绕这三件事。
+
+---
+
+## 第三部分 · 层 3：LRU / 2Q / TinyLFU 逐函数
+
+> 行号是 2026-11-04 在真树上 `sed -n` 复核的值。现有 1.1 入口表里的
+> `lru.hpp:64`、`two_queue.hpp:96`、`tiny_lfu.hpp:94` 是更早版本的口径，
+> 与当前代码差 20–30 行；**改代码时以下面的行号为准**，读旧表要换算。
+> 指令数出自 `docs/reports/asm-cache.md`（`int/int` 实例化、`-O3`、GCC 13.3.0）。
+
+### 3.1 LRU：73 条指令的命中路径
+
+**结构**（`lru.hpp:250` 附近）：
+
+```cpp
+detail::IntrusiveList<Entry> lru_;   // head=MRU, tail=LRU
+detail::BucketMap<K, Entry, Hash, Equal> index_;  // 链式哈希
+detail::NodePool<Entry> pool_;       // 64/块
+```
+
+**`Get`（`lru.hpp:90`）逐行**：
+
+1. `index_.Find(key)`：先 `HashKey`（64 位 mix 哈希），再 `FindHashed` 沿桶链比较。**一次哈希 + 平均 1.0–1.3 次节点比较**。
+2. 未命中 → `RecordMiss()`，返回 false。不改链表、不分配。
+3. 命中 → `RecordHit()`（一条 `addq $1, ...`）。
+4. `lru_.move_to_front(entry)`：`erase`（4 个指针写）+ `push_front`（4 个指针写），**没有节点分配/释放**。
+5. `*value = entry->value`：一次拷贝；`V=std::string` 时这是最大成本。
+
+**为什么只有 73 条**（`asm-cache.md` §2.1）：整条路径 0 个 call、0 B 栈帧、0 个 `lock`。73 条里包含未命中分支（RecordMiss + `xor eax,eax` + `ret`）。对比 `std::list + unordered_map` 版本，命中要做一次 `unordered_map::find`（可能一次堆指针追逐）+ `list::splice`（6 个指针），指令数约 2–3 倍。
+
+**`Put`（`lru.hpp:139`）**：227 条、4 个 call、88 B 栈帧。4 个 call 的落点：
+
+| 符号 | 触发条件 |
+|---|---|
+| `operator new` | NodePool 扩块（每 64 个一次，稳态 0） |
+| `vector::_M_realloc_insert` | 节点块表扩容（每 64 个一次） |
+| `__stack_chk_fail` | 金丝雀失败（不可达） |
+
+稳态（容量满、free list 非空）下 `Put` 走 `pool_.Create` 的自由表分支，**0 堆分配**。这解释了为什么「插入 0 分配」不是营销话：反汇编里 `operator new` 的调用点是分摊的。
+
+**淘汰**：`Put` 满时 `pop_front` 尾节点 → `index_.Erase` → `pool_.Destroy`。`Destroy` 把节点挂回 free list，**不调用 `delete`**，但会显式调用 `V` 的析构（否则非平凡 value 泄漏）。Evict 没有独立符号，被内联进 `Put`。
+
+**并发**：`Get`/`Put` 的 `lock` 前缀为 0。裸 `LruCache` 不是线程安全的；`lru.hpp:86-88` 写明由调用方保护。
+
+**已知限制**：对顺序扫描零抵抗。一次全表扫描把 100% 命中打成 0%，且没有恢复机制（LRU 只看最近一次访问）。要抗扫描换 LRU-K/2Q/TinyLFU。
+
+### 3.2 2Q：373 条指令 = 两次哈希的代价
+
+**结构**（`two_queue.hpp`）：
+
+| 段 | 容器 | 容量 | 存什么 |
+|---|---|---|---|
+| `am` | LRU 链 | 主体 | 真数据（热） |
+| `a1in` | FIFO 链 | 一部分 | 真数据（新） |
+| `a1out`（ghost） | FIFO 链 | `capacity/2+1` | **只存 key**，不存 value |
+| `pending_` | 集合 | 同 ghost | ghost 命中的凭证 |
+
+**`Get`（`two_queue.hpp:108`）逐行**：
+
+1. 查 `am`：命中 → `move_to_front`、`RecordHit`、拷 value、返回 true。
+2. 未命中 → 查 `a1in`：命中 → 移到 `am` 头（**晋升**）、`RecordHit`、返回 true。
+3. 仍未命中 → 查 ghost：命中 → `RecordGhostHit` + `pending_.insert(key)`，**返回 false**；未命中 → `RecordMiss`，返回 false。
+
+**为什么是 373 条**（LRU 的 5.1 倍）：两次独立哈希 + 两次桶链探测。第 3 步的 ghost 查是第三次哈希（如果 ghost 与主表不共用索引）。这是 2Q 用「多一次查找」换扫描抗性的必然成本，不是退化。
+
+**`Put`（`two_queue.hpp:179`）**：251 条，比 `Get` 少。分支：
+
+- key 已在 `am` → 更新值 + 移到头。
+- key 在 `a1in` → 更新值 + 移到 `am` 头。
+- `TakePending(key)` 为真（ghost 命中）→ `ReclaimForInsert()` → 直接进 `am` 头。
+- 否则 → `ReclaimForInsert()` → 进 `a1in` 头；`a1in` 满时最老条目进 ghost。
+
+**`ReclaimForInsert`（`two_queue.hpp:362`）**：287 条，包含两级回收：先 `EvictAmTail`（真正 `pool_.Destroy`），再 `EvictA1inTail`（降级进 ghost，**不 Destroy 节点**）。顺序不能反：先降级 a1in 会导致 am 满了却没释放。
+
+**语义陷阱**：ghost 命中返回 false 是**故意的**。2Q 只知道「这个 key 以前被淘汰过」，不知道 value；调用方必须自己回源再 `Put`。把 ghost 命中当命中返回，会返回未初始化/过期的 value。
+
+**`Put` 251 < `Get` 373 的原因**：更新分支不查 ghost；插入分支把淘汰集中到 `ReclaimForInsert`，`Put` 主体只做「查一次 + 跳转」。
+
+### 3.3 TinyLFU：306 条指令 = 4 路素描
+
+**结构**（`tiny_lfu.hpp`）：
+
+| 段 | 容量 | 作用 |
+|---|---|---|
+| `window_` | 1% | 新条目落地，抗突发 |
+| `probation_` | 20% | 试用区 |
+| `protected_` | 79% | 保护区 |
+| `sketch_` | 4 行 × 4 bit | count-min 频率估计，饱和 15 |
+| `doorkeeper_` | Bloom | 第一次出现的 key 不污染素描 |
+
+**`Get`（`tiny_lfu.hpp:121`）逐行**：
+
+1. 算 64 位混合哈希（`sketch_hash`）。
+2. `RecordFrequency(hash)`（`:356`）：先 `doorkeeper_.TestAndSet`，第一次只置 Bloom 位；第二次才 `sketch_.Increment`。
+3. 查 `window_`：命中 → `move_to_front`，返回。
+4. 查 `probation_`：命中 → 晋升 `protected_`（`protected_` 满时降级一个回 probation），返回。
+5. 查 `protected_`：命中 → `move_to_front`，返回。
+6. 都未命中 → `RecordMiss`，返回 false。
+
+**为什么是 306 条**：除哈希与链表外，还要更新 4 路 sketch（4 次索引 + 4 次比较 + 年龄衰减判断）。它是三者中最重的 `Get`，但换来的是**扫描抗性 + 频率准入**：一次性 key 进不了主缓存。
+
+**`Put`（`tiny_lfu.hpp:186`）**：420 条。新条目先 `window_.push_front`；窗口超限时取尾作为 candidate；`main_capacity_==0` 时直接丢弃；否则 `AdmitToMain`（`:424`）比较频率：
+
+```text
+candidate 频率 > victim 频率 ? 替换 : 丢弃（rejections++）
+```
+
+**`AdmitToMain`（`:424`）**：346 条，包含晋升 + 淘汰。`EvictProbationTail`（`:488`）摘索引、`pool_.Destroy`、`RecordEviction`。
+
+**衰减**：每 `sample_size_` 次记录调 `sketch_.Halve()`（所有 4-bit 计数器右移一位）。这保证频率是「近期」而不是「历史总量」，否则老热点永远赖着不走。
+
+**失败路径**：`Put` 返回 void，准入失败只记 `rejections`；`weight > max_weight` 静默拒绝。调用方要确认「真的缓存了」，必须 `Put` 后 `Peek` 或看 `Stats().rejections`。
+
+### 3.4 三实现对照（结构 → 淘汰 → 并发 → 指令）
+
+| 维度 | LRU | 2Q | TinyLFU |
+|---|---|---|---|
+| 索引 | 1 张 BucketMap | 1 张（条目带段标记）+ ghost 表 | 1 张（条目带段标记） |
+| 链 | 1 条 LRU | am + a1in 两条 + ghost | window + probation + protected 三条 |
+| 淘汰依据 | 最近访问时间 | am 尾 + a1in 满降级 | 窗口候选 vs probation 尾的频率 |
+| 命中路径哈希次数 | 1 | 2–3 | 1 + sketch 4 路 |
+| `Get` 指令 | **73** | **373** | **306** |
+| `Put` 指令 | 227 | 251 | 420 |
+| 栈帧（Get） | **0 B** | 56 B | 56 B |
+| `lock` 前缀 | 0 | 0 | 0 |
+| 稳态分配 | 0 | 0 | 0 |
+
+**为什么 TinyLFU 的 `Get` 比 2Q 少**：2Q 要两次哈希定位两个段；TinyLFU 三段共用一张索引，段标记在条目里，只剩 sketch 更新。这是「容器层统一」带来的直接收益（`tiny_lfu.hpp` 文件头「容器层」段）。
+
+### 3.5 容器层的口径澄清（注释 ≠ 代码）
+
+`lru.hpp:9` 的注释写「开放寻址哈希表 `detail::FlatMap`」，但：
+
+- `include/go2cpp/cache/detail/` 目录里**没有** `flat_map.hpp`，只有 `bucket_map.hpp`；
+- `lru.hpp:250` 的实际成员是 `detail::BucketMap<K, Entry, Hash, Equal> index_`；
+- `BucketMap` 是**链式哈希**（桶数组 + 节点 next 指针），不是开放寻址。
+
+`asm-cache.md` §2.1 把 73 条指令解释成「`FlatMap` 线性探测」也沿用了这条旧注释。**实际反汇编的 73 条**是「64 位 mix 哈希 + 桶链探测 + move_to_front + 统计」，没有开放寻址的探测循环。这不影响性能结论（73 条是真的），但影响读者对数据结构的判断——改代码前以 `bucket_map.hpp` 为准。
+
+同类漂移还有：现有 1.1 表把 `LruCache::Get` 标在 `lru.hpp:64`，实际在 `:90`。文档行号会随重构漂移，**任何「按行号跳转」的说法都要当天复核**。
+
+### 3.6 层 3 小结：三条「改了就坏」的线
+
+1. **一个 `Entry` 只能挂一条链**：`move_to_front` 只改 4 个指针；手动改 `prev/next` 会把链成环或丢节点。
+2. **`Create` 与 `Destroy` 必须配对**：`Destroy` 既挂 free list 又调 `V` 析构；漏一个就泄漏或 double-free。
+3. **ghost/pending 不是数据**：2Q/ARC 的 ghost 命中只能返回 false + 凭证；把它当命中会返回脏值。
+
+---
+
+## 第四部分 · 层 4：三个异常场景
+
+### 4.1 场景一：并发淘汰（多线程同时 `Put` 触发淘汰）
+
+**默认行为**：**未定义**。裸 `LruCache`/`TwoQueueCache`/`TinyLfuCache` 都没有锁（`lock` 前缀 0，`cache.hpp:23` 写明非线程安全）。两个线程同时 `Put` 触发淘汰时：
+
+- 两个线程可能同时 `pop_front` 同一个尾节点 → 一个 `Destroy` 后另一个继续用 → **UAF**；
+- 两个线程同时 `move_to_front` 同一节点 → `prev/next` 交叉写 → **链成环**，后续遍历死循环；
+- `size_`/统计是非原子 `uint64_t` → 计数丢更新（不崩，但 `Stats()` 不可信）。
+
+**可选行为**（三选一，不要混用）：
+
+| 方案 | 做法 | 代价 | 适用 |
+|---|---|---|---|
+| `ThreadSafeCache` | 每个方法一把 `std::mutex` | 读也串行；16 核上是瓶颈 | 低并发、要简单 |
+| `ShardedCache` | 按 key 哈希 N 片，每片独立锁 | 全局 LRU/频率丢失；`capacity<shards` 时总容量被放大 | 多核高吞吐 |
+| 调用方分片 | 自己按线程/业务分 key，每线程一个 cache | 需要业务保证 key 不跨线程 | 线程本地缓存 |
+
+**为什么不能「给策略加原子」**：`move_to_front` 是 4 个指针的复合操作，不是单字原子；要无锁化必须整条链用 CAS 重写（ Harris 链），复杂度远超收益。项目选择「策略核心无锁 + 装饰层加锁」，是明确的边界。
+
+**调试**：
+
+```bash
+# 1) 先用 ThreadSanitizer 复现数据竞争
+#    cmake -DCMAKE_CXX_FLAGS="-fsanitize=thread -g" ...
+# 2) 链成环的典型现象：Size() 正常但 Get 某 key 死循环 / 遍历超时
+# 3) 看 Stats：evictions 远大于 inserts 说明多线程在互相踩
+```
+
+**一个真实边界**：`ShardedCache::Stats()`（`factory.hpp:200` 起）逐片加锁再相加，**不是原子快照**——并发 `Put` 期间读到的 `size` 可能比真实值小。不要用它做精确容量判断。
+
+### 4.2 场景二：容量为 0
+
+**默认行为**：**构造抛异常**。各策略在构造函数里 `if (capacity == 0) throw std::invalid_argument(...)`（LRU 在 `lru.hpp:50` 附近，2Q/TinyLFU/GDSF/ARC/CLOCK 一致）。这是「快速失败」：容量 0 的缓存没有语义，允许它存在只会让 `Put` 静默丢弃。
+
+**三个例外/放大点**：
+
+1. `MakeCache`/`MakeThreadSafeCache` 不会替调用方兜底 0，异常直接穿透。
+2. `ShardedCache` 把空片容量提到 1（`factory.hpp:128`）：`capacity < shards` 时总容量被**放大**到 `shards`，`Capacity()` 返回的是实际和（`:143`）。业务以为配了 4，实际 16。
+3. TinyLFU 的 `main_capacity_` 可能算成 0（容量很小时 1% 窗口 + 20% probation 取整后为 0）；此时窗口条目直接丢弃（`tiny_lfu.hpp:157` 附近），不抛异常——**构造成功但什么都不缓存**。
+
+**可选行为**：
+
+- 业务侧把 `capacity` 夹到 `[shards, ...]`，或至少 `max(1, capacity)`；
+- 需要「可关闭的缓存」时，用 `capacity=1` + 不 `Put`，而不是 0；
+- 分片场景先算 `capacity/shards` 是否 ≥ 1，否则调小 `shards`。
+
+**调试**：
+
+```bash
+# 构造异常：catch std::invalid_argument，打印 policy 与 capacity
+# Sharded：打印 Capacity() 与配置值对比，差值 = 被提为 1 的空片数
+# TinyLFU：看 Stats().size 是否长期为 0 且 rejections 增长
+```
+
+### 4.3 场景三：回调/仿函数抛异常（`Hash`、`Equal`、`V` 析构）
+
+**先澄清**：缓存接口没有回调，最接近的三处是「`Hash` 仿函数」「`Equal` 仿函数」「`V` 的析构」。三者抛异常的后果完全不同：
+
+| 抛出点 | 后果 | 标准行为 |
+|---|---|---|
+| `Hash`/`Equal` 抛 | 异常穿透 `Get/Put`；容器可能停在半更新状态（索引已插、链未挂） | 未定义强保证；调用方只能丢弃整个 cache |
+| `V` 拷贝构造抛（`Put` 传值） | 条目未插入；已分配的 `Entry` 可能泄漏 | 基本保证（无泄漏需 `Destroy`） |
+| `V` 析构抛（`Destroy`） | **`std::terminate`** | C++ 析构默认 `noexcept`；抛即终止 |
+
+**为什么析构抛异常是致命的**：`NodePool::Destroy` 在淘汰路径上调用 `~V()`；淘汰可能发生在 `Put` 内、也可能在 `Clear` 内。异常从析构里逃出 → `std::terminate`，进程直接死，没有栈展开。**所以缓存的 `V` 必须是「析构不抛」的类型**（`std::string`/`shared_ptr`/POD 都满足）。
+
+**可选行为**：
+
+1. `Hash` 用 `noexcept` 的哈希（`std::hash` 对标准类型是 noexcept；自定义类型要显式标）。
+2. 需要「可能失败」的 value 初始化，用 `std::optional<V>` 或 `shared_ptr<V>`，让失败发生在构造前而不是析构时。
+3. 不要在缓存里存「析构要写日志/刷盘」的对象；那种对象应该由外部所有权管理。
+
+**调试**：
+
+```bash
+# 1) 析构抛异常：进程收到 SIGABRT，栈里有 std::terminate
+#    gdb -ex 'bt' core  → 看 ~V 与 Destroy 的调用链
+# 2) Hash 抛：catch 到异常后 cache 不可再用，重建即可；不要试图修链
+# 3) 用 -fno-exceptions 构建时，任何 throw 都是编译错误（本项目部分目标这样编）
+```
+
+### 4.4 层 4 小结：异常语义的三句话
+
+1. **构造期快速失败**（容量 0 抛），**运行期静默**（准入失败只记 `rejections`）——这是有意的分工。
+2. **并发不是异常，是未定义**：不加锁就是数据竞争，没有「偶尔出错」这回事。
+3. **析构必须 noexcept**：缓存的 value 类型选择比策略选择更容易埋雷。
+
+---
+
+## 第五部分 · 层 5：性能（指令级证据与复现）
+
+### 5.1 数据口径
+
+| 项 | 值 |
+|---|---|
+| 对象 | `include/go2cpp/cache/{lru,two_queue,tiny_lfu}.hpp`（header-only） |
+| 实例化 | `K=int, V=int`，来自 `tests/cache/*.o` |
+| 编译 | `-O3 -DNDEBUG`（CMake 里 `-O2` 后出现，后者生效）GCC 13.3.0 |
+| 反汇编 | `objdump -d -C --no-show-raw-insn`，剔除 `nop`/对齐填充 |
+| 出处 | `docs/reports/asm-cache.md` §1 |
+
+### 5.2 指令数（9 个函数）
+
+| 实现 | 函数 | 指令 | call | `lock` | 栈帧 |
+|---|---|---:|---:|---:|---:|
+| LRU | `Get` | **73** | 0 | 0 | **0 B** |
+| | `Put` | 227 | 4 | 0 | 88 B |
+| | `Erase` | 95 | 2 | 0 | 24 B |
+| 2Q | `Get` | **373** | 6 | 0 | 56 B |
+| | `Put` | 251 | 7 | 0 | 72 B |
+| | `ReclaimForInsert` | 287 | 6 | 0 | 72 B |
+| TinyLFU | `Get` | **306** | 2 | 0 | 56 B |
+| | `Put` | 420 | 8 | 0 | 88 B |
+| | `AdmitToMain` | 346 | 5 | 0 | 104 B |
+
+**怎么读这张表**：
+
+- **0 个 `lock`**：三者都不是线程安全的，锁在装饰层；这不是「优化掉了锁」，是「没打算在这里加」。
+- **0 次稳态分配**：`operator new` 只在 NodePool 扩块（每 64 节点）；淘汰 `Destroy` 只挂 free list。
+- **栈帧**：LRU `Get` 0 B 是「全寄存器」的直接证据；其他 24–104 B 是保存被调寄存器 + 金丝雀，没有大栈对象。
+- **Evict 无独立符号**：`EvictTail`/`EvictAmTail`/`EvictProbationTail` 都被内联进唯一调用点；表里的 227/287/346 是含淘汰循环的完整入口。
+
+### 5.3 与「朴素实现」的差距（定性，不抄无出处的倍数）
+
+`std::list + unordered_map` 的 LRU：
+
+- 命中 `unordered_map::find` 一次（桶 + 链，可能一次指针追逐）+ `list::splice`（6 个指针）；
+- 插入要 `new` 一个 list 节点 + `unordered_map` 节点（**2 次/插入**）；
+- 淘汰要 `delete` 节点（**1 次/淘汰**）。
+
+本实现：
+
+- 命中 1 次哈希 + 桶链探测 + 4 个指针；
+- 插入/淘汰稳态 0 分配（NodePool 复用）；
+- 链表节点就是 `Entry` 本身，没有额外节点。
+
+这就是 `lru.hpp:12` 说的「插入 0 分配」；`asm-cache.md` §2.1 用反汇编确认了 `operator new` 的分摊性，但没有给出「比 std::list 快 N 倍」的端到端数字——**本文也不编**。要报倍数必须跑 `cache_bench --full` 并附机器/容量/负载，项目里目前没有这份对照数据。
+
+### 5.4 怎么复现
+
+```bash
+# 1) 单元 + 场景 + 压力
+cd .build-bento-wsl
+./go2cpp_cache_test
+
+# 2) 基准（quick 是 ctest 默认）
+./go2cpp_cache_bench --quick
+./go2cpp_cache_bench --full --ops=5000000 --capacity=100000
+
+# 3) 指令级取证（需要 .o 与 asmstat.py）
+python3 /tmp/asmstat.py \
+  .build-bento-wsl/CMakeFiles/go2cpp_cache_test.dir/tests/cache/test_lru.cpp.o \
+  "LruCache<int, int"
+# 2Q / TinyLFU 同理换 .o 与符号前缀
+```
+
+记录：CPU 型号、是否绑核、`--ops`、`capacity`、策略、`K/V` 类型。`int/int` 的指令数与 `string/string` 不可直接比（哈希与拷贝更重）。
+
+### 5.5 性能边界：为什么 LRU 的 73 条不是「还能再砍一半」
+
+- 73 条里约 12 条是哈希、约 20 条是桶链探测、约 16 条是指针写、其余是分支/统计/返回；
+- 再砍只能砍统计（会改变 `Stats` 语义）或砍 `value` 拷贝（`V` 由调用方决定，砍不掉）；
+- 真正的瓶颈在 `V` 的拷贝与哈希质量，不在指令数。
+
+**结论**：缓存模块的性能工作已经做完「架构 + 容器」两层；剩下的是「按负载选策略」而不是「继续抠指令」。选错策略（例如用 LRU 扛扫描）损失的是命中率数量级，指令优化救不回来。
+
+### 5.6 层 5 小结
+
+1. **73 / 373 / 306** 是三种策略命中路径的真实成本，差异来自「查几次索引」，不是实现好坏。
+2. **0 锁 / 0 稳态分配 / 0 B 栈帧（LRU Get）** 是容器层设计的直接结果。
+3. 报性能必须带类型与负载；`int/int` 的指令数不能外推到 `string/string`。
+4. 选策略 > 抠指令：扫描负载下 LRU 的命中率会崩，这不是 73 条能救的。
+
+---
+
+## 收尾：自检清单
+
+1. 能不能说清 LRU `Get` 的 73 条里，「哈希 / 探测 / 指针写 / 统计」各占多少？
+2. 2Q 的 373 条为什么是 LRU 的 5 倍？ghost 命中为什么必须返回 false？
+3. TinyLFU 的 306 条里，4 路 sketch 与三段链各占多少？`Halve()` 为什么必须存在？
+4. `BucketMap` 是链式还是开放寻址？注释与代码哪个为准？
+5. 容量 0 时哪个策略「不抛但什么都不缓存」？`ShardedCache` 为什么会放大总容量？
+6. 为什么缓存的 `V` 必须「析构不抛」？抛了会发生什么？
+7. 三种装饰方案各适合什么并发度？`ShardedCache::Stats()` 为什么不是原子快照？

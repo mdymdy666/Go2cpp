@@ -1,9 +1,13 @@
-# user/tools —— Go 标准库对应物（fmt / strings / strconv / streams / time / error / defer）
+# Go 标准库工具（tools）
+
+> **一句话定位**：Go 标准库对应物（fmt / strings / strconv / streams / time / error / defer）。
+> 本文是「模块 → 能力 → 异常」手册；[工具层总览（hash/encoding/compress/reflect 等）](../../deep/11-tools.md)
+
 
 > 「Go 的常用工具包」在本项目里的对应实现：语义 1:1 对齐 Go 1.23，独立实现，
 > 不依赖第三方运行时。
 
-## 这个模块是什么
+## 能力清单
 
 把 Go 日常最常用的几个标准库搬到 C++17，**语义对齐而不是「差不多的替代品」**：
 
@@ -55,7 +59,7 @@
 - **`defer/panic/recover` 是显式状态机**：`defer` 用 RAII，`panic` 只发布共享状态，
   `recover` 在 defer 回调里消费 —— 不做 `longjmp` 那种栈跳转，因此可与 C++ 异常共存。
 
-## 最小用法
+## 最小示例
 
 ```cpp
 #include "go2cpp/fmt.hpp"
@@ -82,7 +86,24 @@ int main() {
 
 完整场景见 `strings_demo.cpp`（切分/清洗/Builder）与 `strings_full.cpp`（六场景 + 十万字段往返）。
 
-## 示例列表
+## 3 个常见异常
+
+### 1. 把 `go2cpp::io` 当成 Go 的 `io`
+- **现象**：找不到 `Reader/Writer`，编译报错。
+- **原因**：本项目 `go2cpp::io` 是 epoll 调度层 `IOManager`；Go 的 `io` 对应 `go2cpp::streams`。
+- **处理**：流式读写 `#include "go2cpp/streams.hpp"`。
+
+### 2. 以为 `strconv` 越界会抛异常
+- **现象**：`"999"` 解析到 8 位类型得到 127 而不是报错。
+- **原因**：Go 语义是返回 `ErrRange` **并同时给出钳制值**，不抛异常。
+- **处理**：检查返回的 `error`；需要严格拒绝时不要接受钳制值。
+
+### 3. 在调度器 worker 上裸调 `time::Sleep`
+- **现象**：并发度骤降、定时器不准。
+- **原因**：非 Hook/非 Fiber 上下文里 `Sleep` 是**真睡眠**，阻塞当前 OS 线程（Go 是挂起 goroutine）。
+- **处理**：Fiber 内用协作式 Sleep；worker 线程上改用 TimerService 或异步等待。
+
+## 示例清单
 
 全部注册进 ctest，目标名 = `go2cpp_<文件名>`：
 
@@ -135,3 +156,10 @@ cmake --build /tmp/build-user --target go2cpp_fmt_demo -j && /tmp/build-user/go2
 - **`defer` 不是语言级 finally**：它按 RAII 执行，异常仍在正常传播；
   `panic::call()` 只发布状态，**不会中断当前 C++ 栈**，要靠 defer 链收尾。
 - 这些模块是 header-only，**改一行会触发大量重编译**；调试时优先用示例验证语义。
+
+## 深入阅读
+
+- [工具层总览（hash/encoding/compress/reflect 等）](../../deep/11-tools.md)
+- [交接摘要（docs）](../../docs/11-tools.md)
+- 源码位置：`include/go2cpp/tools/`、`src/tools/`（多数 header-only）
+- 示例目标名 = `go2cpp_<文件名>`；新增示例需同时登记 `cmake/Go2CppTests.cmake` 与本文清单。

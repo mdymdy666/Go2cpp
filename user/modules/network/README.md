@@ -1,9 +1,13 @@
-# user/network —— socket / epoll IO / Hook / HTTP / WebSocket / SSE
+# 网络（network）
+
+> **一句话定位**：socket / epoll IO / Hook / HTTP / WebSocket / SSE。
+> 本文是「模块 → 能力 → 异常」手册；[网络深入文档](../../deep/02-network.md)
+
 
 > 网络栈的人手示例：从「一个 fd 怎么包装」到「HTTP 服务端、WebSocket 握手、
 > SSE 推送」的完整链路，每一层都有可运行的最小示例。
 
-## 这个模块是什么
+## 能力清单
 
 本模块是 Go `net` 包在 C++ 里的对应物，解决三件事：
 
@@ -51,7 +55,7 @@
 都是纯计算或只操作传入的 `Socket`，因此同一个协议实现既能跑在服务端，也能
 跑在客户端/测试的 `socketpair` 上。
 
-## 最小用法
+## 最小示例
 
 HTTP 消息与解析器是**纯计算**（无网络），适合先理解协议层：
 
@@ -97,7 +101,24 @@ task->wait_for(3s);
 
 完整版见 `io_wait_many_demo.cpp`（多 fd、超时、取消、Select 桥接）。
 
-## 示例列表
+## 3 个常见异常
+
+### 1. 普通线程里调 `WaitFor`
+- **现象**：崩溃、断言失败，或等待永远不返回。
+- **原因**：`WaitFor`/`WaitManyFor` 依赖当前 Fiber 的 park/wake，只能在**当前 IOManager 管理的 Fiber** 里调用。
+- **处理**：用 `manager.Go(...)` 把逻辑放进 Fiber；普通线程改用系统 `poll/select`。
+
+### 2. `Parser` 喂了半包就不再喂
+- **现象**：请求一直不完整，连接空转直到超时。
+- **原因**：`Parser` 是**有状态**的增量解析器，一次 `feed()` 只处理已到达的字节，必须持续喂到 `Complete`。
+- **处理**：`while (!parser.Complete()) { feed(...); }`；解析出错后 `reset()` 或重建，不要复用旧状态。
+
+### 3. 分帧没设 `max_frame`
+- **现象**：内存暴涨几个 GB 后 OOM。
+- **原因**：长度前缀模式直接信任对端给的帧长，恶意/损坏长度会触发巨额分配。
+- **处理**：先校验 `len <= max_frame` 再等数据；超限立即断开并记日志。
+
+## 示例清单
 
 全部注册进 ctest（`io_hook_*` 需要 `go2cpp_hook` 目标存在），目标名 = `go2cpp_<文件名>`：
 
@@ -158,3 +179,10 @@ cmake --build /tmp/build-user --target go2cpp_http_demo -j && /tmp/build-user/go
   静态内联/直接调用会绕过它 —— 这也是 `go2cpp_hook` 关闭 LTO 的原因。
   关闭 Hook 的进程里，`Socket` 会退化为普通阻塞 socket。
 - **服务端示例监听固定端口**（8080/8081/9100/9200 等），重复运行前先确认端口空闲。
+
+## 深入阅读
+
+- [网络深入文档](../../deep/02-network.md)
+- [交接摘要（docs）](../../docs/02-network.md)
+- 源码位置：`include/go2cpp/network/`、`src/network/`
+- 示例目标名 = `go2cpp_<文件名>`；新增示例需同时登记 `cmake/Go2CppTests.cmake` 与本文清单。

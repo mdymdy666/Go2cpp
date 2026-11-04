@@ -168,7 +168,7 @@ cancel();                                // 触发取消
 | 线程 vs Fiber | 普通线程可直接用 Channel/Context；`BlockingRegion` 把「真阻塞」显式标出 |
 | 禁止 | 持锁时 park（Go 不存在的死锁形态，本项目会检测并报错） |
 
-完整示例：`example/concurrency/beginner_demo.cpp`、`runtime_demo.cpp`；规则见
+完整示例：`user/modules/concurrency/beginner_demo.cpp`、`runtime_demo.cpp`；规则见
 [`docs/fiber_guide.md`](docs/fiber_guide.md)。
 
 ### 3.2 UDP 协议注入（`rd::net`，约 20 行 echo）
@@ -294,7 +294,7 @@ int main() {
 }
 ```
 
-应用层脚手架（流表/连接/资源/KV）见 `example/app/`；
+应用层脚手架（流表/连接/资源/KV）见 `user/modules/app/`；
 通用网关（注册式路由 + 中间件 + 可插拔上游）见 `include/go2cpp/app/gateway.hpp`。
 
 ## 四、构建与测试
@@ -332,7 +332,7 @@ ctest --test-dir .build-bento-wsl --output-on-failure
 | `tests/` | 测试源码（约 23 万行），按模块划分 |
 | `tools/` | 基准（`bench/`）、指标校验（`verify_metrics.sh`）、CLI、迁移/回放 |
 | `docs/` | 设计与使用文档，入口 [`docs/INDEX.md`](docs/INDEX.md)；性能台账 [`docs/metrics-ledger.md`](docs/metrics-ledger.md) |
-| `example/` | 可运行示例，清单见 [`example/README.md`](example/README.md) |
+| `user/` | 可运行示例，清单见 [`user/README.md`](user/README.md) |
 | `mcp/` `bpf/` | 可选：MCP 框架、eBPF 监控 |
 | `third_party/` | 第三方与 Go 参考源码（多数归档被 ignore） |
 

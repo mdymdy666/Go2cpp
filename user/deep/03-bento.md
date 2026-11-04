@@ -162,7 +162,7 @@
 9. **封帧**：`SendNow`（`:489`）→ `FillAck(&ack)`（`:1081`，拿当前接收状态做捎带 ACK）→ flags 叠加 `kFlagAck`/`kFlagRetransmit`/`kFlagFragmented`（`:497-500`）→ `BuildFrame`（`protocol.cpp:297`，16B 头 + 8B ACK + 载荷）→ `m_sink(...)`（`channel.cpp:514`）。
 10. **进 TX 队列**：`m_sink` 是 Link 注入的 lambda → `Link::SendBuiltFrame`（`link.cpp:1732`）→ `EnqueueTxFrame`（`:1736`）：查 socket/peer（`:1737-1746`），统一打 `conn_id` 与 `kFlagResume`（复用 `m_tx_stamp_scratch`，`:1751-1770`）。
 11. **背压**：`m_tx_queue.size() >= kMaxTxQueue` → 丢弃并 `++m_stats.send_errors`（`:1781-1784`）——**UDP 语义，不无限堆**；否则 `push_back`（`:1786`）并 `m_tx_pending=true`（`:1790`）。
-12. **单 drainer 发送**：`DrainTx`（`:1800`）保证只有一个线程在做 seal+sendto（`:1820-1826`），一次取空队列（`:1826-1832`），**锁外** `SendPacketLocked`（`:1840`→`:1794-1799`），完成后更新 `m_tx_drained`、唤醒等待者（`:1850-1858`）。
+12. **单 drainer 发送**：`DrainTx`（`:1872`）保证只有一个线程在做 seal+sendto（`:1820-1826`），一次取空队列（`:1826-1832`），**锁外** `SendPacketLocked`（`:1840`→`:1794-1799`），完成后更新 `m_tx_drained`、唤醒等待者（`:1850-1858`）。
 13. **AEAD**：加密会话走 `SealAndSend` → `SealFrame`（`crypto.cpp:1284`）：外层头明文（`conn_id`/`seq` 用于路由与重放判定，且作为 AAD，`:1299-1308`），内层整帧密文，nonce 由 `direction+seq` 派生（`:1306-1307`）。
 14. **对端收**：`ReceiveOnce`（`link.cpp:1129`）→ `RecvBatch`（`link.cpp:555`，`recvmmsg` `:574`）→ `HandleFrame`（`:1444`）：解外层头（`:1449`）→ 按 `conn_id` 路由（`:1494`）→ `OpenFrame`（`crypto.cpp:1313`，重放窗口 `m_data_rx_window` `link.hpp:783`）→ `DispatchFrame`（`:1570`）。
 15. **回 ACK**：接收端 `FillAck`（`channel.cpp:1081`）在下一个数据帧捎带，或 `Link::Tick` 到 `ack_interval_ms` 时 `SendAckFrame`（`link.cpp:2167-2174`，实现 `:2100`）。
@@ -325,7 +325,7 @@
 6. 锁外 `DispatchEvents()`（`:877`）——回调从这里跳出去。
 7. 锁外 `DrainTx()`（`:880`）。
 
-**`DrainTx` 逐步拆**（`:1800`）
+**`DrainTx` 逐步拆**（`:1872`）
 
 1. 取 `m_tx_mutex`；队列空 → 若有 drainer 在跑就等它（`:1809-1815`），否则 `m_tx_pending=false` 返回 true（`:1816-1818`）。
 2. 已有 drainer → 等这一批结束再看队列（`:1820-1826`）——**N 个发送线程不会各自抢锁做 seal+sendto**。
@@ -503,6 +503,177 @@ Send:  m_unsent ──Pump(cwnd/pacing)──▶ m_inflight ──ACK/SACK──
 
 ---
 
+---
+
+## 第三部分 · 深：三个「架构改动 > 汇编优化」的完整案例
+
+> 第二部分按模块讲「是什么」；这一部分按**改动**讲「为什么动结构、动了多少、怎么验证」。
+> 三个案例都满足同一个模式：瓶颈不在指令，而在锁/所有权/唤醒模型；
+> 修复后收益是数量级，而不是百分之几。
+
+### 3.0 五层映射（这一部分补的是层 3–5）
+
+| 层 | 内容 | 位置 |
+|---|---|---|
+| 层 1 · What | 为什么 UDP 上要自己造可靠层、边界在哪 | 开篇「为什么不用 TCP」 |
+| 层 2 · How | 协议/加密/Link/Channel/FEC/BBR/0-RTT 的结构 | 第一部分 + 第二部分 |
+| 层 3 · 源码 | `RunOnce`/`DrainTx`/`SendHello` 的逐行拆解 | 第二部分 2.3/2.12 + 本部分案例一 |
+| 层 4 · 实战 | 三个真实改动：锁、内存、唤醒 | 本部分 3.1–3.3 |
+| 层 5 · 性能 | p99 1405→0.045 ms、RSS 0.96×、p99 −45% | 本部分 3.1–3.3 的数据段 |
+
+三个案例的顺序不是随意的：**先锁（数量级）、再内存（数量级但另一笔账）、最后唤醒模型（接近数量级）**。
+它们共同回答一个问题：为什么这个项目的优化顺序是「架构 > 汇编」。
+### 3.1 案例一：Link 收发分离（p99 1405 ms → 0.045 ms）
+
+**症状**：弱网下发送延迟 p99 达到 **1405 ms**，而网络 RTT 只有几十毫秒；吞吐也上不去（1e4 包基准 7.4× 提升空间）。
+
+**旧结构（问题根因）**：`RunOnce` 第一行就 `lock_guard<recursive_mutex>`，把
+
+```text
+poll(timeout_ms)  →  recvmmsg  →  逐帧 HandleFrame  →  Tick  →  回调派发
+```
+
+整段罩在同一把锁里。发送入口（`TrySendStream`/`SendPacket`）要拿**同一把** `m_mutex` 才能 `sendto` 或改流控状态，于是：
+
+1. 接收线程持锁一个 `timeout_ms`（默认 50 ms，弱网下 poll 经常等满）；
+2. 发送线程在锁上排队，排队长度 = 并发发送线程数；
+3. p99 ≈ 锁持有时间 × 排队轮数，最坏可以累到秒级——**1405 ms 不是网络抖动，是锁排队**。
+
+用排队论看更清楚：把 `m_mutex` 看成单服务器、服务时间 = 一次 `RunOnce`（poll 等到事件 + 处理一帧），到达率 = 发送请求率。利用率接近 1 时，等待时间发散；p99 对服务时间的长尾极其敏感。**换更快的锁、把 `recursive_mutex` 换成 `mutex`、缩小临界区几个字段，都不改变「单服务器」这个结构**。
+
+**新结构（三步）**：
+
+1. **接收与发送解耦**：`RunOnce` 的 poll 与 `HandleFrame` 仍在 `m_mutex` 内（协议状态必须串行），但**发送不再抢这把锁**——`Send*` 只把帧塞进 `m_tx_queue`（由 `m_tx_mutex` 保护，只护队列本身）。
+2. **单 drainer**：`DrainTx`（`src/bento/net/link.cpp:1872`）用 `m_tx_draining` 保证同一时刻只有一个线程做「取批 → seal → sendto」；其他线程把帧入队后立即返回，不参与发送。
+3. **事件锁外派发**：接收路径「锁内入队事件、锁外 `DispatchEvents`」（`link.cpp:877`），回调里再慢也不占协议锁。
+
+**为什么 p99 能到 0.045 ms**：发送路径只剩「入队（一次短锁）+ 由 drainer 批量 `sendto`」；它不再等待接收循环，也不再受 `timeout_ms` 影响。0.045 ms 是「一次入队 + 一次系统调用」的量级，不是网络 RTT 的量级——这正是「锁延迟」与「网络延迟」的分界。
+
+**吞吐 7.4× 的来源**：旧结构下接收线程持锁期间发送完全停摆，链路有效带宽 = 接收循环空闲时间 × 发送速率；新结构下接收与发送重叠，UDP 的 send/recv 可以并行。
+
+**锁顺序（改动的隐藏契约）**：固定 `m_mutex → m_tx_mutex`（`link.cpp:817` 注释），`Close` 清理段也遵守。反了就是 ABBA 死锁；`m_tx_mutex` **只保护队列**，不保护链路状态（`:791-792` 注释），这是能拆开的前提。
+
+**怎么验证（本文未复跑，给出可执行步骤）**：
+
+```bash
+# 1) 取提交 5a2c0fa 前后两个二进制（或 git checkout 该提交父/子各编一次）
+# 2) 同一弱网配置、同一机器、同一包序列：
+bash tests/bento/test_netem.sh <netem_probe>
+./bench_weaknet --weak-frames=10000 --loss=5 --delay=50
+# 3) 同时抓锁竞争（旧结构应有大量 futex 等待）：
+perf lock record -p <pid> -- sleep 10 && perf lock report
+# 4) 报告必须带：p50/p99/p999、吞吐、丢包率、CPU 型号、是否 taskset
+```
+
+**边界**：1405 ms → 0.045 ms 与 7.4× 出自提交 `5a2c0fa` 的口径，本文**没有复跑**；结构原因可以从 `src/bento/net/link.cpp:828-882`（`RunOnce`）与 `:1872-1861`（`DrainTx`）直接读出来。不要把它当成「所有弱网场景都 3 万倍」——它是「锁排队消失」的收益，不是协议本身的收益。
+
+**这个案例的一般化**：判断该不该动架构，看「临界区里有没有阻塞调用（poll/read/write/回调）」。有 → 先拆锁/拆所有权；没有 → 再谈指令优化。
+
+### 3.2 案例二：WsServer 每连接内存（预取 16 KiB → 1 KiB、526 B 栈 → 成员）
+
+**症状**：20k 长连接下 RSS 是 Go 的 2.2–2.3 倍（`ws-200k-bench.md`：690.4 MB vs 298.2 MB），p99 也是 2–3 倍。
+
+**内存账本（每连接）**：
+
+| 项 | 旧默认 | 新默认 | 20k 连接差额 |
+|---|---|---|---|
+| WebSocket 读预取 | 16 KiB（`network/websocket.hpp:99-103`） | **1 KiB**（`bento/net/ws_server.hpp:139` `websocket_prefetch_bytes{1024}`） | 省 300 MB |
+| 握手读块 | 4 KiB | 4 KiB（`ws_server.cpp:23`） | 不变 |
+| 发送小帧缓冲 | 526 B 在**栈**上（`write_frame_unlocked`，`std::array<uint8_t, 14+512> buffer{}`） | 移到成员 | 每帧省 10–20 条指令 + 526 B 清零 |
+| 连接对象/请求/回调 | 固定 | 固定 | 不变 |
+
+**为什么 16 KiB 是主项**：预取缓冲是**每连接常驻**的；20k × 16 KiB = 320 MB，20k × 1 KiB = 20 MB。仅这一项就能解释 RSS 从 690 MB 降到 220 MB 量级的大部分。三层证据链：
+
+1. 代码：`network/websocket.hpp:99-103` 的 16 KiB 默认与 `bento/net/ws_server.hpp:139` 的 1 KiB 默认；
+2. 压测：`ws-200k-bench.md` 的 RSS 斜率（每连接边际内存）；
+3. 报告：`three-piece-status-2026-11-04.md` 的「读预取 16K→1K、握手 4K→1K、526B 栈→成员 → RSS 227.7 MB = Go 的 0.96×」。
+
+**一个必须指出的文档漂移**：`ws_server.cpp:52-56` 的注释写「默认按 idle 心跳取 4 KiB」，但 `ws_server.hpp:139` 的实际默认是 **1024**；`NormalizeConfig` 只做 `max(512, 配置值)`。也就是说：配置为 0 时走 base 的 16 KiB 默认（注释说的就是这个分支），配置非 0 时下限 512。**读代码要以 hpp 的成员初值为准，注释与代码在此处不一致**。
+
+**526 B 栈帧为什么值得单独说**（`asm-network-review.md` P16）：`write_frame_unlocked` 的栈帧是 `0x1428 = 5160 B`，主要来自那个 526 B 的 inline buffer。超过 4 KiB 保护页 → 每次调用多一条栈探测写；`buffer{}` 还会先零初始化 526 B。每帧省 10–20 条指令看起来小，但小帧路径是每消息一次，20k 连接 × 心跳频率下是可观的热路径。修法：移到成员/线程局部，或拆「小帧/大帧」两条路径。
+
+**为什么内存达标了 p99 还差 2.37 倍**：内存优化减少的是「每连接占用」，不改变「谁来 poll、谁来唤醒」。p99 的瓶颈在 IO 唤醒模型（见 3.3）；两件事必须分开做、分开验证。**这也是为什么不能拿 RSS 达标去宣布延迟达标**。
+
+**怎么验证**：
+
+```bash
+# 1) 每连接边际内存：5k/10k/20k 三档，读 /proc/<pid>/status 的 VmRSS
+# 2) 分解到分配点：heaptrack / massif，或 LD_PRELOAD 统计 malloc 尺寸分布
+# 3) 确认预取真的生效：连接建立后打印 config.websocket.prefetch_bytes
+# 4) 对比必须同客户端、同档位、同心跳间隔
+```
+
+### 3.3 案例三：单 poller（p99 3.078 ms → 1.691 ms，−45%）
+
+**症状**：20k idle WebSocket 心跳 p99 为 Go 的 2.37 倍（1.810 ms vs 2.994–4.294 ms），RSS 已达标。
+
+**旧结构**：每个 worker 自己在空闲时 `epoll_wait`（`io.cpp` 的 `poll_once`），所有 worker 共享同一个 epoll fd。后果：
+
+1. **唤醒风暴**：一个就绪事件可能唤醒多个 worker（thundering herd），只有一个拿到任务，其余白跑一次调度；
+2. **就绪队列争用**：N 个 worker 同时 `epoll_wait` 同一 fd，内核就绪链表上的取事件操作互相竞争；
+3. **事件解析在 worker 内**：取到事件后立刻解析/派发，解析慢会拖长下一次 `epoll_wait` 的间隔。
+
+**新结构（`GO2CPP_IO_SINGLE_POLLER=1`）**：
+
+| 组件 | 旧 | 新 |
+|---|---|---|
+| poll 者 | 每个 worker | **一个 poller 线程**（`poll_loop`，`io.cpp:1785`） |
+| 事件传递 | 内核 → worker 直接处理 | poller 批量入环形队列（8192 容量，`io.cpp:2348`），worker 批量取 ≤256（`drain_event_batch`，`:1999`） |
+| 积压处理 | 无 | poller 发现队列有积压时下一轮 `epoll_wait` 超时取 0，持续搬空 |
+| 唤醒 | 每个事件唤醒 | 批量入队后一次唤醒；worker 处理完仍有积压再唤醒下一个 |
+
+**实测（`iomanager-et-investigation.md` §三，20k 连接、同机同参数）**：
+
+| 组 | p50 | **p99（中位）** | p999 | RSS |
+|---|---:|---:|---:|---:|
+| B：新二进制、开关关 | 1.056 ms | 3.078 ms | 4.343 ms | 228.8–229.6 MB |
+| C：新二进制、开关开 | 0.614 ms | **1.691 ms** | 3.480 ms | 228.1–229.0 MB |
+| 变化 | −42% | **−45.1%（1.82×）** | −19.9% | <0.4% |
+
+- 20k 连接全部握手成功，`ping_timeout=0`、`disconnects=0`；
+- A（旧二进制关）与 B（新二进制关）在噪声内一致 → **默认路径未退化**；
+- 开关默认关闭（`io.cpp:682` 读 env），因为它是行为改变，不是纯优化。
+
+**为什么有效**：p99 的主体是「事件从就绪到被处理」的排队时间。旧结构下 N 个 worker 争抢，排队时间随并发度上升；新结构把「取事件」收敛到一个线程，worker 只做「批量取 + 处理」，队列深度可控、唤醒次数从 O(事件数 × worker 数) 降到 O(批次数)。**这不是把 epoll 换得更快，是把「谁负责等待」这件事改对了**。
+
+**边界与代价**：
+
+1. poller 是单点：它的 `epoll_wait` 循环不能做重活，否则所有连接一起卡；代码里它只入队、不解析。
+2. 环形队列满时「就地处理溢出」（`enqueue_events`，`:1941`）——这是背压，不是丢事件。
+3. 该模式仍是 env 开关，没有默认开启；生产启用前要跑目标负载的 p99/p999 与 CPU。
+4. 客户端单线程在 20k 档已吃掉约 0.57 核，心跳 RTT 含客户端排队；横向差值可信，绝对值有下限。
+
+**怎么复现**：
+
+```bash
+# 关（默认）
+BIN=/home/ubunturoot/wsbench-bin bash app/ws_bench/run_bench.sh go2cpp 20000 20 18083 4
+# 开
+GO2CPP_IO_SINGLE_POLLER=1 BIN=/home/ubunturoot/wsbench-bin \
+  bash app/ws_bench/run_bench.sh go2cpp 20000 20 18082 4
+```
+
+报告必须带：连接数、时长、pin 核、客户端单线程限制、p50/p99/p999、RSS。
+
+### 3.4 三个案例的共同结论
+
+| 案例 | 瓶颈类型 | 改动 | 收益 | 验证方式 |
+|---|---|---|---|---|
+| Link 收发分离 | 锁罩住阻塞调用 | 拆锁 + 单 drainer | p99 3.1 万倍、吞吐 7.4× | 提交口径 + 结构可读 |
+| WsServer 内存 | 每连接常驻缓冲 | 16 KiB→1 KiB、栈→成员 | RSS 690→227.7 MB（0.96× Go） | 压测斜率 |
+| 单 poller | 唤醒模型 | N worker poll → 1 poller + 队列 | p99 −45.1% | A/B 同机对照 |
+
+三条都符合「架构优化 > 汇编优化」：**先问「临界区里有没有阻塞」「每连接有没有常驻大缓冲」「谁在等待」**，再问「这条指令能不能省」。反过来做，就是在错误的架构上抠百分点。
+
+一个反例：把 `m_tx_mutex` 换成无锁队列并不会让 p99 更好——瓶颈是「接收循环持锁时长」，不是「入队那一次 CAS」。这就是「先架构后汇编」的具体含义。
+
+### 3.5 本部分小结
+
+1. **p99 的敌人通常不是网络，是排队**：锁、唤醒、单线程解析都会制造排队。
+2. **内存与延迟是两笔账**：预取从 16 KiB 降到 1 KiB 解决 RSS，不解决 p99；单 poller 解决 p99，不改变 RSS。
+3. **默认关闭的开关是负责任的**：单 poller 改变行为，所以保留 env 开关与 A/B 对照，而不是直接改默认。
+4. **未复跑的数字必须标注**：1405 ms 与 7.4× 来自提交，本文只做结构解释。
+5. **三个案例各有自己的失败条件**：锁顺序反了是 ABBA 死锁；预取配置成 0 会退回 base 的 16 KiB；事件队列满会走「就地处理溢出」的背压路径。改动前先把失败条件写进测试，再谈收益。
 ## 附：读完之后的自检清单
 
 1. 能否不看文档画出「SendStream → m_unsent → m_inflight → TX 队列 → DrainTx → SealFrame → sendto → 对端 OnAck」的完整链路，并指出每一步的锁？
@@ -516,7 +687,7 @@ Send:  m_unsent ──Pump(cwnd/pacing)──▶ m_inflight ──ACK/SACK──
 
 ## 附-2：本文明确「未实测」的地方
 
-- **Link 收发分离的 p99 1405ms → 0.045ms、吞吐 7.4×**：出自提交 `5a2c0fa`，本文**未复跑**；结构原因可以从 `link.cpp:828-882` 直接读。
+- **Link 收发分离的 p99 1405ms → 0.045ms、吞吐 7.4×**：出自提交 `5a2c0fa`，本文**未复跑**；结构原因可以从 `src/bento/net/link.cpp:828-882` 直接读。
 - **PeerHub 5% 丢包重传 -90.3%（517 checks）**：出自提交 `475cc15`，未复跑。
 - **3 peer ≈ 30.7 Mbit/s**：旧口径（`user/docs/03-bento.md:331`），未复跑。
 - **2026-10-28 弱网基线全表**：原始数据在 `tests/bento/compare_results.baseline-2026-10-28.tsv`，之后协议栈改过（SACK/快速重传/BBR/FEC），**没有重跑**。

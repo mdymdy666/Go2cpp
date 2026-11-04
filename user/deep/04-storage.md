@@ -5,6 +5,18 @@
 
 ---
 
+## 五层地图（这篇为什么这么长）
+
+| 层 | 回答的问题 | 本文位置 | 读完能得到 |
+|---|---|---|---|
+| 层 1 · What | 存储抽象解决什么、边界在哪、什么时候不该用 | 第一部分 | 选型判断 |
+| 层 2 · How | 连接/表/段/WAL/compaction 这些结构怎么协作 | 第二部分 | 改代码前的结构图 |
+| 层 3 · 源码 | `DB::Exec/Query`、`KV::Put/Get`、`LevelDBKv`、`compaction` 逐函数逐分支 | 第三部分 | 能对着行号改 |
+| 层 4 · 实战 | 写失败/读未命中/磁盘满：默认、可选、调试 | 第四部分 | 线上排障 |
+| 层 5 · 性能 | 1.109×/1.252×/1.09×/4.4× 的口径、复现、下限 | 第五部分 | 能复现也能反驳 |
+
+每一部分末尾都有「小结」，小结只写结论与边界，不重复正文。
+
 ## 第一部分 · 总：这个模块怎么跑起来
 
 ### 1.1 入口点清单
@@ -146,6 +158,14 @@ ldb::DB ── 官方 LevelDB（block cache + L0-L6 compaction），唯一使用
 
 ---
 
+### 1.5 层 1 小结：存储抽象的四个边界
+
+1. **事务边界**：SQLite 封装有真事务（`BEGIN/COMMIT/ROLLBACK` + 迁移逐条事务）；自研 KV 只有单条/单批原子（`WriteBatch`），**没有跨 key 事务**。业务要「扣库存 + 写订单」原子，只能用 SQLite 或自己在 KV 上做补偿。
+2. **一致性边界**：Queue 是 at-least-once（游标批量落盘），Watcher 是 at-most-once（事件日志写失败即丢），MemCache 写穿失败时缓存与 KV 可能不一致。三者都不提供 exactly-once。
+3. **持久化边界**：`Put`/`Append` 返回 true 默认只代表「进了用户态缓冲」；真正的 `fdatasync` 由 `sync_writes`/`sync_on_append`/`Sync()` 决定。**默认配置下掉电会丢最后一段缓冲**。
+4. **规模边界**：自研 KV 在 1e7（490 MB、4 段）读 1.1–1.25× LevelDB；但迭代器是「快照式全量排序」，1e8 级 RSS 不可控（`leveldb_kv.hpp:11` 注释）。SQLite 适合关系查询与小数据；LevelDB 是 opt-in 对照，不进生产默认路径。
+
+一句话选型：**要事务选 SQLite，要顺序日志选 Queue，要前缀订阅选 Watcher，要低延迟 KV 选自研 KV；四者可以叠，但一致性由调用方兜底。**
 ## 第二部分 · 分：逐块细讲
 
 ### 2.1 SQLite 封装（`db.hpp` / `db.cpp`）
@@ -211,7 +231,7 @@ ldb::DB ── 官方 LevelDB（block cache + L0-L6 compaction），唯一使用
 
 - `KV::Impl`：`mutable_` MemTable + `wal_` + SSTable 列表 + epoch/version 管理 + 写锁。
 - `Open`（`kv.cpp:1170` → `Impl::Open` `:486`）→ `Recover`（`:502`）重放 WAL。
-- `Put`（`:700`）→ `WriteSingle`（`:657`）→ `WriteLocked`（`:637`）：先写 WAL，再改 MemTable；`ShouldFlush` 时 `FlushLocked`（`:825`）落 SST。
+- `Put`（`:700`）→ `WriteSingle`（`:661`）→ `WriteLocked`（`:637`）：先写 WAL，再改 MemTable；`ShouldFlush` 时 `FlushLocked`（`:825`）落 SST。
 - `Get`（`:765`）：先 MemTable，再各层 SSTable；epoch 保护读，不拿写锁。
 - `MaybeCompactLocked`（`:900`）在层数/文件数超限时合并；`GetStats`（`:1101`）汇总计数。
 - 已知短板（`leveldb_kv.hpp:11` 注释）：1e8 级数据 RSS 不可控、读性能低于 LevelDB、迭代器是快照式全量排序。
@@ -359,3 +379,453 @@ cd .build-bento-wsl
 12. 这也是 `db.hpp:39` 那条「Stmt/Rows 不得比 DB 活得更久」的由来：v2 只保证不崩溃，不保证数据可依赖。
 
 
+### 2.18 层 2 小结：结构决定了哪些语义「不可能」实现
+
+- **一连接一 mutex**（`db.cpp:590`）决定 SQLite 封装的并发上限是「同一连接串行」；想要写并发只能每线程一个 `DB` + WAL，代价是 `busy_timeout` 竞争。
+- **MemTable 是固定容量开放寻址**（`memtable.hpp:119-124`）决定它不能原地扩容，只能整表落盘换新表；这也是 `FlushLocked` 存在的根本原因。
+- **SSTable 不可变 + 段列表新→旧**（`kv.cpp:445-470`）决定读必须逐段查、写只能追加；compaction 是唯一的回收手段。
+- **WAL 是块格式 + CRC**（`wal.hpp:24-50`）决定恢复只能「按 CRC 截断到最后一条完整记录」，半条写不会复活，但同批前面的记录可能已生效。
+- **游标与消息体分离**（`queue.cpp:207`）决定 Queue 只能 at-least-once；要 exactly-once 必须把游标写进消息段。
+
+这五条不是实现细节，是**接口承诺的物理来源**。改结构可以，改承诺要先改文档与调用方。
+
+---
+
+## 第三部分 · 层 3：源码逐函数（每个分支都指到行）
+
+> 层 2 回答「有哪些结构」，层 3 回答「一行输入进去，这些结构按什么顺序被改」。
+> 本部分只写**读代码能确认的事实**；凡是推论，句子里会带「因为/所以」。
+
+### 3.1 先看 `KV::Impl` 的字段账本（字段级）
+
+`KV::Impl` 的完整字段在 `src/storage/kv.cpp:441-470`。把它按「谁保护谁」重排，比按声明顺序读有用得多：
+
+| 字段 | 行 | 类型 | 谁写 | 谁读 | 不变量 |
+|---|---|---|---|---|---|
+| `opt_` / `dir_` | `:441-442` | `Options` / `string` | 构造后不变 | 所有路径 | 构造后只读，所以不需要锁 |
+| `mu_` | `:443` | `mutable std::mutex` | — | 写路径 / Flush / Compact | **只保护可变 MemTable 与 SSTable 列表的写侧** |
+| `mutable_` | `:444` | `unique_ptr<MemTable>` | 写锁内替换 | 同上 | 非空时一定已发布到 `mutable_ptr_` |
+| `mutable_ptr_` | `:445` | `atomic<MemTable*>` | `FlushLocked` | `Get` 首行 | acquire 读到即保证该 MemTable 可读 |
+| `snapshot_` | `:446` | `atomic<const Snapshot*>` | `PublishSnapshot` | `Get` 慢路径 | 发布后不再修改；旧值延迟回收 |
+| `epoch_` | `:447` | `EpochManager&` | — | `Get` 的 `Guard` | 全局单例，跨 KV 实例共享 |
+| `wal_` / `wal_path_` | `:448-449` | `unique_ptr<WalWriter>` / `string` | 写锁内换文件 | 写路径 | `AddRecord` 成功前 MemTable 不能改 |
+| `next_file_no_` | `:450` | `uint64_t` | 写锁内 | 建 SST/WAL 名 | 单调递增，不复用 |
+| `issued_` / `sync_done_` | `:451-452` | `atomic<uint64_t>` | 写路径 / GroupSync | 等待者 | `sync_done_ >= target` 时 `target` 之前的写已 fsync |
+| `sync_failed_` | `:453` | `atomic<bool>` | GroupSync 失败 | GroupSync 等待者 | 一旦 true，后续 sync 请求必须失败而不是假装成功 |
+| `sync_mu_` | `:454` | `mutex` | — | GroupSync | 只让一个线程真正 `fdatasync` |
+| `counters_` | `:455` | `Counters` | 所有热路径 | `GetStats` | 分片计数，读侧不加锁 |
+| `last_error_` | `:456` | `string` | `SetError` | `LastError` | 只在失败路径写；成功不清空（这是诊断债，见 4.1） |
+| `scratch_` | `:457` | `string` | 写锁内 | 写锁内 | 复用编码缓冲，避免每次 Put 分配 |
+| `closed_` | `:458` | `bool` | `Close` | 写路径 | 只在 `mu_` 内读写 |
+
+三个「为什么」：
+
+1. **为什么 `mutable_` 和 `mutable_ptr_` 是两个字段**：`Get` 不能拿 `mu_`（否则读写全串行），所以它只 load 原子指针；写侧替换 MemTable 时先构造新的、再 store 指针、最后才在锁内替换 `mutable_`。读者看到的要么是旧表、要么是新表，不会看到「一半」。
+2. **为什么 `snapshot_` 用 `atomic<const Snapshot*>` 而不是 `shared_ptr`**：读路径每次 `shared_ptr` 拷贝都要原子增减引用计数，热路径上这是可观测成本；epoch 把「什么时候能 delete」推迟到所有读者离开临界区之后（`kv.cpp:209-240` 的 `EpochManager`）。
+3. **为什么 `scratch_` 在锁内**：它是写路径的编码缓冲，只有持锁者用；放在锁外复用会串数据。代价是每次 `Put` 先 `clear()` 再 `resize(4)`，但容量保留，稳态不分配。
+
+**这一节的边界**：`KV::Impl` 没有「连接」概念，所以没有连接池。所谓「池」只有 `NodePool`（cache 模块）与 SSTable 的 mmap 页缓存（内核页缓存），存储层本身不维护 fd 池——每个 `KV` 实例一个目录、一把写锁、一个 WAL fd。
+
+### 3.2 `KV::Put`：从一行调用到 WAL 落缓冲（逐分支）
+
+调用链：`KV::Put`（`kv.hpp:135`）→ `Impl::Put`（`kv.cpp:704`）→ `WriteSingle`（`:661`）→ `WriteLocked`（`:641`）→ `WalWriter::AddRecord`（`wal.hpp:35` 声明）+ `ApplyBatch`（`kv.cpp:449` 声明，实现在 `:560` 附近）。
+
+**`WriteSingle` 的五个阶段**（`kv.cpp:661-702`）：
+
+1. **尺寸门**（`:658-661`）：`key.size()`/`value.size()` 超过 `0xffffffff` 直接 `SetError("key/value too large")`。这是格式上限，不是业务限制——超过就编不进 varint32。
+2. **编码进 `scratch_`**（`:668-687`）：先 `clear()`，`resize(4)` 留出 batch 头，push type，再 varint32(key_len)+key、varint32(val_len)+value，最后 `EncodeFixed32(&scratch_[0], 1)` 回填「1 条记录」。**顺序不能换**：头部的 count 必须在内容写完后回填。
+3. **`WriteLocked`**（`:688`）：见下。
+4. **取序号**（`:692`）：`issued_.fetch_add(1)` 已经在 `WriteLocked` 里做过；这里读回自己的序号 `my`，供 group commit 等待。
+5. **同步模式**（`:695-697`）：`opt_.sync_writes` 为真才 `GroupSync(my)`；默认 false，所以 `Put` 返回 true 只代表「进了 WAL 用户态缓冲」。
+
+**`WriteLocked` 的四步**（`kv.cpp:641-655`）：
+
+```text
+if (mutable_->ShouldFlush())        // ① 先判断要不要落盘
+    if (!FlushLocked()) return false;
+if (wal_ == nullptr || !wal_->AddRecord(data))   // ② WAL 先写
+    { SetError("wal append failed"); return false; }
+if (!ApplyBatch(data))              // ③ 再改 MemTable
+    { SetError("apply batch failed"); return false; }
+counters_.Add(kWalRecords / kWalBytes); issued_++;  // ④ 统计
+```
+
+① 为什么先 `FlushLocked`：MemTable 超过预算后再写会让内存无界；先落盘再写新记录，保证「任何时刻只有一张可变 MemTable 超预算」。② 为什么 WAL 必须先于 `ApplyBatch`：崩溃恢复只能重放 WAL，如果先改内存再写日志，日志缺一条而内存已可见，恢复后就少了这条写（丢已确认写）。③ 为什么 `ApplyBatch` 失败不回滚 WAL：WAL 记录格式错误属于实现 bug/磁盘损坏，回滚也没有意义；此时 `last_error_` 被设置，后续写仍会尝试（没有熔断），调用方必须自己看返回值。
+
+**`AddRecord` 内部的三件事**（`wal.hpp:35`，实现 `wal.cpp:168` 附近，与 SegLog 共用块格式）：
+
+1. 当前块剩余空间不够 `7 + len` 时，先补零到块尾，再从新块起写（读侧靠 CRC 判断补零）。
+2. 头 7 字节 = CRC32C(4) + length(2) + type(1)；type 区分整条/分片首/中/尾。
+3. 记录体追加到 `buf_`；`buf_.size() >= flush_threshold_` 才 `write(fd)`。**这是用户态缓冲，不是 fsync**。
+
+**失败路径总表**：
+
+| 失败点 | 返回 | `last_error_` | 数据状态 | 调用方该做什么 |
+|---|---|---|---|---|
+| key/value 过大 | false | `key/value too large` | 未写 | 截断/拒绝业务输入 |
+| `FlushLocked` 失败 | false | 由 Flush 设置（open/write 错误） | 旧 MemTable 仍在，新记录未写 | 停写、查磁盘、重启恢复 |
+| `AddRecord` 失败 | false | `wal append failed` | WAL 可能半条（写失败时块尾可能脏） | 视为实例不可用，`Close` 后重开 |
+| `ApplyBatch` 失败 | false | `apply batch failed` | WAL 有、MemTable 无 | 同上；重启后靠 WAL 补 |
+| `GroupSync` 失败 | false | 无（只置 `sync_failed_`） | 数据在 WAL 缓冲/内核，未 fsync | 不能当持久化成功；重试或报错 |
+
+最后一行是真实的坑：`sync_failed_` 是原子标志，`GroupSync` 失败后所有等待者都返回 false，但 `last_error_` 不会被写——所以「为什么失败」只能靠 errno/日志，不能靠 `LastError()`。这一点在 4.1 展开。
+
+### 3.3 `KV::Get`：三级查找与两次哈希（逐分支）
+
+`KV::Impl::Get` 在 `kv.cpp:769-817`，是本模块最热的一条路径。按执行顺序拆：
+
+1. **计数**（`:768`）：`counters_.Add(kGets)`，分片 TLS 累加，一条 `lock addq`。这是读路径上 12 个 `lock` 的第一个。
+2. **可变 MemTable**（`:769-780`）：acquire load `mutable_ptr_`，`Lookup` 返回三态：
+   - `kFound` → 记 hits/memtable_hits，返回 true；
+   - `kDeleted` → **直接返回 false**，不再查下层（墓碑遮蔽）；
+   - `kNotFound` → 继续。
+3. **进入 epoch 临界区**（`:784`）：`EpochManager::Guard` 构造时把当前线程标成活跃读者；析构时回 idle。它保证这期间 `snapshot_` 指向的 SSTable 不会被 delete。
+4. **immutable MemTable 线性查**（`:785-800`）：`snap->immutables` 是 `FlushLocked` 正在落盘的那张表；命中/墓碑语义同上。
+5. **算一次 key hash**（`:801`）：`Hash32(key)`，后面所有 SSTable 复用。
+6. **逐段 SSTable**（`:802-815`）：
+   - 先 `MayContain(key, key_hash)`（Bloom）。阴性 → `kBloomNegatives++`，跳过；**这是绝大多数未命中的出口**。
+   - 阳性 → `table->Get(key, value)`：内部 `FindBlock` 二分索引 + 4 KiB 块内顺序扫描；命中拷 value 到调用方 string。
+   - 墓碑 → 返回 false。
+7. **全部未命中**（`:816`）：返回 false，不写任何东西。读不产生写放大。
+
+**两次哈希的结构性冗余**（`docs/reports/storage-opt.md` §4 已记录）：`Get` 先 `table->MayContain(key, key_hash)`，`SSTable::Get` 内部又调一次 `MayContain(key)` 重新 `Hash32` + 再探 Bloom。命中段每次 Get 多一次哈希 + 一次 Bloom，估算 30–60 ns（3–5%）。修法是给 `SSTable::Get` 加 `bloom_checked` 参数；本次未改（不在允许修改范围）。
+
+**为什么读路径能不加锁**：`mutable_ptr_` 与 `snapshot_` 都是原子发布；MemTable 的槽位用 `state` 原子从 `kConstructing(1)` 变 `kOccupied(2)`（`memtable.hpp:90-100`），读者看到 constructing 就重试。x86 上 acquire load 是普通 `mov`，所以「无锁」不是靠魔法，是靠「发布顺序 + 不回收」。代价是 epoch 的两次 release store（约 5 ns）。
+
+**读路径的指令画像**（`storage-opt.md` §3.2，`-O3`、`objdump`）：`KV::Impl::Get` 320 条指令、17 个 call、12 个 `lock`、0 次分配、0 把 mutex、40 B 栈帧。12 个 `lock` **全部**是分片统计的 `fetch_add`（7 个调用点在 `Counters::TlsShard`）——读路径没有锁竞争，只有缓存行争用。
+
+### 3.4 `KV::FlushLocked` 与 `MaybeCompactLocked`：写放大的现场
+
+**`FlushLocked`**（`kv.cpp:829-900`）：
+
+1. `mutable_` 为空或空表 → 直接返回 true（`:830-832`）。
+2. 新建 SST 文件号，`SSTableBuilder` 把 MemTable 全量写盘（`:840` 起）；`Finish()` 里做收尾 fsync。
+3. **换 WAL**（`:885-894`）：先开新 WAL、再 `unlink` 旧 WAL。顺序反了会在崩溃窗口里丢掉「已落 SST 但旧 WAL 已删」之间的写。
+4. 发布新快照 `PublishSnapshot`：旧快照进 epoch 退休队列，读者走完才 delete。
+5. `MaybeCompactLocked()`（`:900`）。
+
+**`MaybeCompactLocked`**（`kv.cpp:904-1000`）是本轮性能修复的核心，逐行：
+
+```text
+cur = snapshot_.load(acquire)
+if (cur == nullptr || cur->sstables.size() <= max_sstables) return;  // ①
+total = cur->sstables.size()
+// ② 扫描所有相邻段对，取 file_size 比值最接近 1 的一对
+for (i = total; i > 1; --i) {
+    a = sst[i-2]->file_size(); b = sst[i-1]->file_size();
+    ratio = (hi * 1024) / lo;
+    if (ratio < best_ratio) { best_ratio = ratio; first = i-2; }
+}
+// ③ 只合并 [first, first+2)，输出段替换该区间（保持新→旧顺序）
+// ④ 多路归并：最小堆 + 同 key 时 src 小（更新）优先
+// ⑤ drop_tombstones = (inputs.size() == total)：只有覆盖全部段才能丢墓碑
+```
+
+- ① 是**触发条件**：段数超过 `max_sstables`（默认 4）才合并。注意是 `>`，所以第 5 段出现时才动手。
+- ② 是**几何策略**：旧实现固定取最旧两段，最旧的大段被之后每个新段反复重写，单字节重写次数 O(N) → 1e7 条实测写放大 36×。改成「大小最接近的相邻对」后，每段只在遇到同量级邻居时重写，单字节 O(log N) 次，写放大降到 7×。
+- ③ 的「原地替换区间」很关键：早期写成 `resize(keep)` + 尾插，会把中间位置的合并结果挪到队尾，破坏「新→旧」顺序，读侧就会先读到旧值。现在是 `[first, first+2)` 换成新段。
+- ④ 同 key 时 `src` 小优先，因为 `sstables[0]` 最新；这保证合并后仍是新值覆盖旧值。
+- ⑤ 墓碑只有「合并覆盖全部段」时才能丢；否则删掉的 key 会在更旧段里复活（这是 LSM 最经典的 bug）。
+
+**没采用的方案与原因**（`storage-opt.md` §3 备注）：后台 compaction 线程能把 Put 阶段做到 1.73 M/s、写放大 4×，但与现有测试「未 `Close` 就 `remove_all(dir)`」冲突——后台线程还在写目录，`remove_all` 抛 `Directory not empty`，`kv_test` 崩溃。要保留异步必须改测试清理方式或加生命周期协议，超出「只改 `src/storage`」的边界。
+
+### 3.5 LevelDB 包装：`Put/Get/Close` 的四个易错点
+
+`src/storage/leveldb_kv.cpp` 是 opt-in 对照实现（默认 OFF），但它把「官方 LevelDB 的语义」暴露给测试，所以接口边界必须精确：
+
+| 函数 | 行 | 做了什么 | 易错点 |
+|---|---|---|---|
+| `DB::Open` | `:277` | 翻译 Options、建 block cache、bloom、`leveldb::DB::Open` | 失败只写 `g_last_open_error`，返回 nullptr；不看这个串就只剩「打开失败」 |
+| `Put` | `:218`（声明）/ 实现 `:380` 附近 | `impl_->puts++`（relaxed）+ `db->Put` | 默认 `WriteOptions.sync=false`；返回 true 不等于落盘 |
+| `Get` | `:228` | `db->Get` + `gets/hits` 计数 | 未命中返回 false，不区分「不存在」与「读错误」；错误在 `LastError()` |
+| `Write` | `:224` | 原子批 `leveldb::WriteBatch` | 批内一条失败整批不生效；与自研 KV 的 `WriteBatch` 语义一致 |
+| `Iterator` | `:232` | `NewIterator` + `SeekToFirst` | `Key()/Value()` 是 `string_view`，下一次 `Next/Seek` 后失效 |
+| `Close` | `:509` | `delete db` → `filter_policy.reset()` → `cache.reset()` | 顺序不能反：`DBImpl` 析构前还持有 filter/cache |
+| `Flush` | `:499` | `CompactRange(nullptr,nullptr)` | **只做 compaction，不是 fsync 屏障**；掉电仍可能丢最近写 |
+
+`GetStats`（`:526`）里 `wal_*`/`memtable_flushes` 恒 0——包装层拿不到 LevelDB 内部 WAL 计数。把这份 Stats 与自研 KV 的同名字段直接比较，会得出「LevelDB 不写 WAL」的错误结论。
+
+### 3.6 Queue / Watcher / MemCache 的代码级差异
+
+这三个功能层都建在 `KV` 上，但「谁负责持久化」不同：
+
+| 组件 | 数据落哪 | 谁 fsync | 崩溃后恢复 | 关键行 |
+|---|---|---|---|---|
+| Queue | 消息体 → SegLog；游标 → KV | `Sync()` 或 `sync_on_append` | 扫段重建 `next_offset`，游标取 KV 值 | `queue.cpp:131` / `:207` / `:472` |
+| Watcher | 事件 → SegLog；订阅游标 → KV | 异步派发线程按批 | `Replay` 从游标重放；无日志则只能实时 | `watch.cpp:552` / `:565` |
+| MemCache | 值 → KV（`persist=true` 写穿）；索引不落盘 | 跟随 KV 的 `sync_writes` | 重启后缓存空，命中率从 0 重建 | `memcache.cpp:572` / `:577` |
+
+**Queue 的游标协议**（`queue.cpp:207-230`）：`Ack` 只在 `offset+1 > cur` 时更新，`BumpAckLocked` 累计到 `cursor_flush_interval`（默认 4096）才批量写 KV。这带来 at-least-once：崩溃最多重复一个批量窗口，不丢。**为什么不做 exactly-once**：游标与消息体不在同一个原子写里，要 exactly-once 必须把游标写进消息段（同一次 `Append`），代价是每次消费都要写日志。
+
+**Watcher 的锁外回调**（`watch.cpp:272` / `:444`）：同步模式在写线程内回调，但**不持 `subs_mu_`/`log_mu_`**——先拷贝匹配的订阅者列表，释放锁，再逐个回调。所以回调里再写同一 KV 不会自锁，但会递归触发下一轮事件（业务要自己防环）。
+
+**MemCache 的 TTL 轮**（`memcache.cpp:404-430` + `time_wheel.hpp:63`）：到期时间是绝对毫秒，插入 256 桶轮；`Get` 命中先比较绝对时间，过期就 `RemoveLocked` 并返回 false。`purge_on_get=false`（默认）时每 64 次 Get 才扫一次轮——**过期条目不保证及时释放**，只保证不会被读到。
+
+### 3.7 层 3 小结：三条「顺序不能换」
+
+1. **WAL 先于 MemTable**（`kv.cpp:647` → `:651`）：反了就是丢已确认写。
+2. **新 WAL 开好再删旧 WAL**（`:885-894`）：反了就是崩溃窗口丢数据。
+3. **合并输出替换原区间，而不是挪到队尾**（`kv.cpp` 合并发布段）：反了就是新值被旧值覆盖。
+
+---
+
+## 第四部分 · 层 4：三个异常场景的「默认 / 可选 / 调试」
+
+> 层 3 讲的是正常路径；层 4 讲「坏了以后系统到底处于什么状态」。
+> 每个场景固定三问：**默认行为是什么**、**能开什么可选行为**、**怎么把证据捞出来**。
+
+### 4.1 场景一：写失败（WAL 追加失败 / `fdatasync` 失败 / 写锁内 Flush 失败）
+
+**默认行为（不改任何配置）**
+
+| 失败点 | 返回值 | `last_error_` | 内存状态 | WAL 状态 |
+|---|---|---|---|---|
+| key/value 超 4 GiB | false | `key/value too large` | 未动 | 未写 |
+| `FlushLocked` 打开/写 SST 失败 | false | `open compaction output failed: ...` 或 builder 的错误 | 旧 MemTable 保留、仍可读 | 旧 WAL 保留 |
+| `WalWriter::AddRecord` 失败 | false | `wal append failed` | **未改** | 可能半条（块尾脏） |
+| `ApplyBatch` 失败 | false | `apply batch failed` | 未改 | 有完整条 |
+| `GroupSync` 的 `fdatasync` 失败 | false | **不设置**（只置 `sync_failed_`） | 已改（内存可见） | 已 write 未 sync |
+
+关键结论：**`Put` 返回 false 时，内存与 WAL 可能不一致**。`AddRecord` 失败那条最危险——WAL 可能写了半条，重启时 `WalReader` 会按 CRC 截断到上一条完整记录，于是「失败的写」不会复活；但同一次 `write` 里排在它前面的记录可能已经在 `buf_` 里，`FlushBuffer` 会把它们一起写出去。**所以失败后最安全的动作是 `Close` 再 `Open`**，不要在同一实例上继续写。
+
+**可选行为**
+
+1. `Options::sync_writes=true`：每次 `Put` 走 `GroupSync`，返回 true 才代表 `fdatasync` 完成。代价是每次写一个 fsync（本机 4 KiB 约 475 µs），吞吐掉两个数量级；适合「元数据/游标」这类低频强持久写，不适合消息体。
+2. `Queue` 的 `sync_on_append=true`：把「追加即持久」变成默认，代价同上。
+3. 业务侧重试：只在返回 false 且 `LastError()` 属于**可重试**类别（`EINTR`、`EAGAIN`）时重试；`ENOSPC`/`EIO` 重试只会烧 CPU。
+4. 熔断：本模块**没有**内置熔断，`last_error_` 设置后写路径仍会继续尝试。要熔断必须业务层看到 false 后自己停写并重建实例。
+
+**调试**
+
+```bash
+# 1) 看实例自报的错误（注意：GroupSync 失败不写这里）
+#    C++ 侧：kv.LastError() / kv.GetStats().wal_syncs
+
+# 2) 看系统调用在哪一步失败
+strace -f -e trace=write,fsync,fdatasync,openat,unlink -p <pid>
+
+# 3) 看 WAL 是否在长（写失败但文件在长 = 半条/缓冲）
+ls -l ./data/*.log && stat -c '%s %y' ./data/*.log
+
+# 4) 看统计是否自洽：puts 增而 wal_records 不增 = AddRecord 前就失败
+#    GetStats() 打印 puts/gets/wal_records/wal_bytes/wal_syncs
+```
+
+一个常见误判：`wal_syncs=0` 不代表「没写 WAL」，只代表 `sync_writes=false`（默认）。WAL 仍然每条都写，只是不 fsync。`storage-opt.md` §2 的 36× 写放大实验里 `wal_syncs=0`，WAL 完全不是瓶颈。
+
+### 4.2 场景二：读未命中（key 不存在 / 被删 / Bloom 假阳性 / 读错误）
+
+**默认行为**：`Get` 返回 false，`value` 不被修改（调用方必须自己保证 `value` 的初值可接受）。四种「false」在代码里**不可区分**：
+
+| 原因 | 代码路径 | 统计 | 能否区分 |
+|---|---|---|---|
+| key 从未存在 | 三级查找都 miss | `gets++`，无 hits | 不能（只能看 `bloom_negatives`） |
+| key 被删（墓碑） | MemTable/immutable/SST 返回 `kDeleted` | 无 hits | 不能；墓碑会**遮蔽**更旧的值，这是正确行为 |
+| Bloom 假阳性后块内未找到 | `MayContain` 真、`Get` 返回 not found | `bloom_negatives` 不增 | 不能 |
+| 读错误（mmap 失败/文件被删） | `SSTable::Get` 返回 not found 或错误 | 无专用计数 | 不能；只能看 `LastError()`（读路径不设置它） |
+
+**这是有意的接口选择**：`Get` 的契约是「在不在」，不是「为什么不在」。要区分必须自己加计数或换 `Iterator`（能区分「没有下一个」与「读失败」更差）。
+
+**可选行为**
+
+1. `MemCache::read_through=true`（`memcache.hpp:35` 的选项）：未命中时回填 KV。注意它只在「KV 非空且开启」时生效；`read_through=false` 时 `Get` 未命中就真的什么都不做。
+2. Bloom 参数：`Options` 里 SSTable 的 bloom bits 越高假阳性越低、内存越大；默认 10 bit/key 约 1%。调高到 16 bit 假阳性约 0.05%，但每段 Bloom 从约 3 MB 涨到约 5 MB（4 段多 8 MB 常驻）。
+3. 预取/缓存：`KV` 不做 block cache，靠 mmap + 内核页缓存；工作集超过内存时读放大由页回收决定，调 `vm.swappiness`/`madvise` 比调代码更直接。
+
+**调试**
+
+```bash
+# 1) 看命中的是哪一层：memtable_hits / immutable_hits / sstable_hits
+#    memtable_hits 高 = 工作集新；sstable_hits 高 = 冷读，受页缓存影响
+# 2) 看 Bloom 是否在挡：bloom_negatives 与 gets 的比值
+#    比值接近 1 = 绝大多数 key 根本不在段里（正常）；接近 0 = 段少或 key 集中
+# 3) 确认 key 是否真被删：用 Iterator 扫前缀，墓碑不会出现在迭代器里
+# 4) 确认不是读错误：读路径不写 last_error_，要 strace -e openat,mmap 或看 dmesg
+```
+
+**一个真实陷阱**：`MemCache` 的 `Get` 命中过期条目时返回 false 并删除（`memcache.cpp:577`），调用方如果把它当「KV 里也没有」就会少一次回源。正确写法是「MemCache miss → 查 KV → 回填」，而不是「MemCache miss → 返回不存在」。
+
+### 4.3 场景三：磁盘满（ENOSPC / SQLite `kFull` / 段文件写不进去）
+
+**默认行为**
+
+| 层 | 触发点 | 返回/错误 | 已有数据 | 后续 |
+|---|---|---|---|---|
+| SQLite | `sqlite3_step` 返回 `SQLITE_FULL` | `Code::kFull`（映射见 `db.cpp` 错误表） | 事务未提交则回滚 | 连接仍可用；VACUUM 要额外空间，满了做不了 |
+| 自研 KV | `WalWriter::AddRecord` 的 `write` 返回 ENOSPC | `wal append failed`，`Put` false | WAL 文件可能半条 | 实例应重建；继续写只会反复失败 |
+| 自研 KV | `SSTableBuilder::Finish` 写失败 | `FlushLocked` false，`Put` false | 旧 MemTable 保留 | 同上 |
+| Queue | 段文件写失败 | `Append` false；`Fail(...)` 记录 | 已写段完好 | 消费仍可读旧段 |
+| Watcher | 事件日志写失败 | 同步模式下写调用返回 false | KV 已写、事件没记 | 订阅者收不到这条；`Replay` 也补不回 |
+| MemCache | `persist=true` 写穿失败 | `Set` false | 缓存里可能已有新值 | **缓存与 KV 不一致**；需要业务决定是否回滚缓存 |
+
+最后一行最隐蔽：`Set` 先改缓存再写穿（顺序见 `memcache.cpp:572` 起），写穿失败时缓存里是新值、KV 里是旧值。默认没有回滚——`persist` 的语义是「尽力写穿」，不是「缓存与存储强一致」。
+
+**可选行为**
+
+1. **预留水位**：应用层在磁盘使用率 > 90% 时停写并告警；存储层不做这件事，因为「预留多少」是部署决策。
+2. **先删后写**：`KV::FlushLocked` 会 `unlink` 旧 WAL（`:893`），能回收一点空间，但只在换 WAL 时；不要指望它救急。
+3. **换目录/扩容**：`KV` 的目录在 `Open(dir)` 时固定，不能热迁移；要迁移必须 `Close` → 拷贝 → 新实例 `Open`。
+4. **SQLite 的 `PRAGMA auto_vacuum`**：只能建库时设，已有库要 `VACUUM`，而 `VACUUM` 需要约等量的临时空间——磁盘满时是死锁，必须先在外部腾空间。
+
+**调试**
+
+```bash
+# 1) 谁满了：数据目录所在分区，不是根分区
+df -h ./data && du -sh ./data/*
+
+# 2) 哪些文件在长：WAL 还是 SST
+ls -lS ./data | head
+
+# 3) 确认 errno：write 返回 -1 且 errno=ENOSPC
+strace -f -e trace=write,openat,unlink -p <pid> 2>&1 | grep -E 'ENOSPC|write'
+
+# 4) SQLite：错误码是 kFull 还是 kIoErr（前者满、后者硬件/权限）
+#    db.LastError().message / extended_code
+```
+
+**恢复顺序**（很重要）：先腾空间 → 再 `Close` 当前实例 → 再 `Open`。不要「腾一点空间后继续用同一实例」：WAL 可能停在半条记录上，`AddRecord` 的 `block_offset_` 已经前进，后续记录会接在半条之后，重启时 CRC 截断会把它们一起丢掉。
+
+### 4.4 层 4 小结：三个场景的共同结构
+
+- **默认都不抛异常**：全部走 `bool` + `LastError()`/`Code`，因为存储层要能在 `-fno-exceptions` 的嵌入式构建里用。
+- **默认都不熔断**：失败后实例仍接受调用，是否重建由调用方决定。这是「库」而不是「服务」的定位。
+- **默认都不保证跨结构一致**：WAL 与 MemTable、缓存与 KV、KV 与事件日志，三者都没有分布式事务；一致性边界在调用方。
+
+---
+
+## 第五部分 · 层 5：性能（数字、口径、复现、以及别抄的旧值）
+
+> 原则：**只写本机可复现的数字 + 引用出处**；文档里出现的旧数字必须标口径，
+> 因为本项目已经发生过一次「0.48× 被跨口径对比制造出来」的事故。
+
+### 5.1 机器与编译口径
+
+| 项 | 值 |
+|---|---|
+| CPU | AMD Ryzen 9 8945HX（12 vCPU / 32 MiB L3） |
+| 内存/系统 | 19 GB / WSL2 6.6.87 / ext4（`/dev/sdd`） |
+| 编译器 | g++ 13.3.0 |
+| 选项 | `-O3 -DNDEBUG -fno-semantic-interposition -fno-stack-protector`（与 Release 一致） |
+| 负载 | 单线程、`taskset -c 2,3`；key 20 B、value 22 B；1e7 条 = 490 MB、4 段 |
+
+出处：`docs/reports/storage-opt.md` §1/§2。换机器必须重测，尤其 L3 大小与磁盘。
+
+### 5.2 读：1.109×（全流程）与 1.252×（Get-only 中位）
+
+同机、同 harness、同 key 序列，对官方 LevelDB：
+
+| 口径 | LevelDB | 自研 KV | 倍率 |
+|---|---:|---:|---:|
+| 1e7 全流程 Get（Put 之后随机读） | 613,941 ops/s | 680,915 | **1.109×** |
+| Get-only 三轮中位（预建库，交替跑） | 687,216 | 860,176 | **1.252×** |
+| 仓库自带 `kv_bench` 2e6 | — | 1,099,327（ext4） | — |
+| MemTable-only（2e6 常驻） | — | 3,316,050 | — |
+
+**为什么两个口径差这么多**：全流程的读紧跟在 1e7 次写之后，页缓存被写脏页挤压、compaction 余波未消；Get-only 是「库已建好、只读」，更接近稳态服务。对外报数时**必须两个都给**，只报 1.252× 会被质疑「挑好的说」。
+
+**为什么能赢**：MemTable 用开放寻址哈希（16 B 槽、平均 1.3 次探测、不 rehash）而不是跳表；SSTable 全程 mmap、无 `read()`、无读侧 CRC；块内用 offset 数组二分 + 4 KiB 顺序扫描（约 40 条）。代价是写路径（见 5.3）。
+
+**结构差异表**（`storage-opt.md` §3.3）：
+
+| 层 | LevelDB | 本实现 | 读路径影响 |
+|---|---|---|---|
+| MemTable | 跳表，2–3 次 cache miss | 开放寻址，1.3 次探测 | 内存命中 3–5× |
+| 块内 | restart 点 + 线性 | offset 二分 + 线性 | 块内更快 |
+| 读缓存 | 8 MB block cache | mmap + 页缓存 | 大工作集少一次拷贝 |
+| Compaction | 后台线程 | 写锁内同步 | 读不受影响、写受影响 |
+
+### 5.3 写：1.09×（修复后），以及 36× 写放大是怎么来的
+
+同一 harness、1e7 Put、默认 8 MB MemTable、`sync_writes=false`：
+
+| 版本 | Put ops/s | ns/op | `bytes_written` | 写放大 | 结束段数 |
+|---|---:|---:|---:|---:|---:|
+| 修复前（固定合并最旧两段） | 159,690 | 6262.1 | 17,688 MiB | **36×** | 4 |
+| 修复后（相邻最近大小配对） | **703,517** | 1421.4 | 3,464 MiB | **7×** | 4 |
+| 同轮 LevelDB | 643,160 | 1554.8 | — | — | — |
+| 仓库 `kv_bench` 2e6（32 MB MemTable） | 1,924,739 | — | — | — | — |
+
+- **4.4×** = 703,517 / 159,690；写放大 36× → 7×；Put 阶段 wall 62.6 s → 14.21 s。
+- **1.09×** = 703,517 / 643,160，达到「≥0.9× LevelDB」的目标。
+- `kv_bench` 的 1.92 M/s **不是**引擎更快：它用 32 MB MemTable，92 MB 数据只 flush 3 次、几乎不触发合并。把 1e7 的结果与 2e6 的结果并列比较，就是重复 0.48× 的口径错误。
+
+**二次方的数学**：旧策略每次取最旧两段，`max_sstables=4` 意味着第 5 段起「每写满一个 8 MB MemTable 就重写一次最旧的大段」。1e7 条触发约 61 次 flush，最旧段被重写约 60 次 → 单字节 O(N) 次。几何策略下每段只在遇到同量级邻居时被重写，单字节 O(log N) 次。
+
+**为什么没直接上后台线程**：后台合并实测 Put 1.73 M/s、写放大 4×，但与 `kv_test` 的「未 Close 就 `remove_all(dir)`」冲突（`Directory not empty`）。要异步必须改测试清理或加生命周期协议；本轮只改 `src/storage`，所以保留同步 + 几何策略。
+
+### 5.4 物理下限：还差 7.5–9.9×
+
+| 指标 | 值 |
+|---|---:|
+| Get-only 单次 | 1162.6 ns |
+| 同机 64 MiB 随机依赖链 | 117.8 ns |
+| 倍数 | **7.5–9.9×** |
+
+差在哪（`storage-opt.md` §5）：每次 Get 平均 2.5 次段级 Bloom（4 段、每段约 3 MB）+ 约 15 次索引二分（每段索引约 900 KB）+ 1 次 4 KiB 块扫描，合计 4–6 次 LLC/TLB miss；490 MB 工作集远超 32 MiB L3。**这不是指令数问题，是访存问题**，继续抠指令收益 <2%。
+
+已量化的两处可省（都 <2%，且有语义代价）：
+
+1. 命中路径 3 次分片 `fetch_add`（约 15–20 ns，占 1.3–1.7%）：去掉/合并会改变 `GetStats()` 的 gets/hits/memtable_hits/sstable_hits 语义。
+2. `EpochManager::Guard` 两次 release store（约 5 ns，<0.5%）：去掉会破坏 `Retire/Reclaim` 的延迟回收安全，可能 UAF。
+
+### 5.5 怎么复现（命令级）
+
+```bash
+# 0) 构建（Release，storage 默认不开 SQLite/LevelDB）
+cmake -S . -B .build-bento-wsl -DCMAKE_BUILD_TYPE=Release -DGO2CPP_WITH_KV=ON
+cmake --build .build-bento-wsl -j
+
+# 1) 仓库自带 KV 基准（2e6，快）
+taskset -c 4,5 .build-bento-wsl/go2cpp_kv_bench --n=2000000
+
+# 2) 1e7 同机对照：需要系统 LevelDB 静态库 + 手工编 test_leveldb_kv.cpp
+#    具体步骤见 docs/reports/storage-opt.md §2.1（源码树未改，产物在 /var/tmp）
+
+# 3) 正确性（性能改动后必跑）
+.build-bento-wsl/go2cpp_kv_test
+.build-bento-wsl/go2cpp_kv_concurrent_test
+.build-bento-wsl/go2cpp_kv_recovery_test
+```
+
+记录：CPU 型号、是否 `taskset`、构建类型、`n`、MemTable 大小、`max_sstables`。缺一项，数字就不可比。
+
+### 5.6 别抄的旧数字：0.48× 的完整溯源
+
+| 项 | 内容 |
+|---|---|
+| 旧数字 | 「本实现 47.5 万 ops/s，LevelDB 公开约 100 万，0.48×」 |
+| 出处 | `docs/reports/asm-storage-kv.md:60-68` |
+| 被谁引用 | `three-piece-audit.md:43` A14、`:200` |
+| 错在哪 | LevelDB 侧是**公开/文献数据**（小数据集、单段、块缓存热），本实现是**1e7、490 MB、4 段、Bloom 冷**；机器、规模、缓存状态三项全不同 |
+| 反证 | `docs/metrics-ledger.md` M07 同机同 harness：576,109 vs 530,742 = 1.086×（2026-11-03）；本轮复测 1.109–1.252× |
+| 正确写法 | 「同机同负载 1.109×（全流程）/ 1.252×（Get-only 中位）；0.48× 为跨口径对比，已作废」 |
+
+**教训**：性能数字必须带四元组（机器、数据规模、缓存状态、编译选项）。只写「X 倍」而不写口径，等于制造下一次 0.48×。
+
+### 5.7 层 5 小结：这个模块的性能边界
+
+1. **读已经达标**：1.109–1.252×，剩下的 7.5–9.9× 是访存下限，指令级优化收益 <2%。
+2. **写靠架构达标**：4.4× 来自「固定两段 → 几何配对」这一处结构性修改，不是指令优化。
+3. **真正的下一个数量级**是后台 compaction（1.73 M/s），但它需要生命周期协议，属于架构 + 接口改动，不是「调参」。
+4. **任何报告都要写清口径**，否则会被下一份审计当成事实引用。
+
+---
+
+## 收尾：这篇文档的五层地图与自检
+
+| 层 | 回答什么 | 在哪 |
+|---|---|---|
+| 层 1 · What | 存储抽象解决什么、边界在哪 | 第一部分 1.1–1.4 |
+| 层 2 · How | 关键结构与它们的协作方式 | 第二部分 2.1–2.17 |
+| 层 3 · 源码 | 逐函数、逐分支、逐行号 | 第三部分 3.1–3.7 |
+| 层 4 · 实战 | 写失败/读未命中/磁盘满的默认-可选-调试 | 第四部分 4.1–4.4 |
+| 层 5 · 性能 | 1.109/1.252/1.09/4.4×，口径与下限 | 第五部分 5.1–5.7 |
+
+读完之后应该能回答：
+
+1. `KV::Put` 返回 true 时，数据在「用户态缓冲 / 内核页缓存 / 磁盘」的哪一层？（默认：用户态 WAL 缓冲，未 fsync）
+2. `Get` 返回 false 的四种原因，代码里能不能区分？（不能；靠统计与 Iterator 间接判断）
+3. 为什么合并必须「原地替换区间」而不是「尾插」？（保持新→旧顺序，否则旧值覆盖新值）
+4. 为什么墓碑只在 `inputs.size() == total` 时能丢？（否则被删 key 从更旧段复活）
+5. 写放大 36× 的数学结构是什么？为什么几何配对能降到 7×？（O(N) 重写 → O(log N)）
+6. 0.48× 是怎么来的、为什么必须作废？（跨口径对比；同机实测 1.086–1.252×）

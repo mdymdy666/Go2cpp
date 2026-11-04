@@ -30,7 +30,7 @@ cmake -S . -B build -G Ninja -DGO2CPP_WITH_BENTO=ON
 cmake --build build -j"$(nproc)"
 ```
 
-- `-DGO2CPP_WITH_BENTO=ON` 打开自研 UDP 传输协议，`user/app/` 里的 web/chat
+- `-DGO2CPP_WITH_BENTO=ON` 打开自研 UDP 传输协议，`user/modules/app/` 里的 web/chat
   服务示例依赖它；
 - 示例默认就会构建（`GO2CPP_BUILD_EXAMPLES=ON`），测试也默认构建
   （`GO2CPP_BUILD_TESTS=ON`）；
@@ -64,7 +64,7 @@ ctest --test-dir build -R 'go2cpp_(beginner|channel|context|sync)_' --output-on-
 
 ## 3. 改一个例子
 
-以 `user/concurrency/beginner_demo.cpp` 为例：
+以 `user/modules/concurrency/beginner_demo.cpp` 为例：
 
 1. 打开文件，把第 30 行的输出改掉：
 
@@ -108,9 +108,9 @@ ctest --test-dir build -R '^go2cpp_' --output-on-failure
 ctest --test-dir build -j"$(nproc)" --output-on-failure
 
 # 跑 app 的服务型示例（不注册 ctest，需要自己管端口）
-./build/user/app/go2cpp_cache_demo     # 无端口，直接跑
-./build/user/app/go2cpp_stream_demo    # 需要 -DGO2CPP_WITH_APP=ON
-./build/user/app/go2cpp_web_server_simple 28080
+./build/user/modules/app/go2cpp_cache_demo     # 无端口，直接跑
+./build/user/modules/app/go2cpp_stream_demo    # 需要 -DGO2CPP_WITH_APP=ON
+./build/user/modules/app/go2cpp_web_server_simple 28080
 curl -s http://127.0.0.1:28080/health  # {"status":"ok"}
 
 # 换一个干净的构建目录（推荐用于验证「从零构建」）
@@ -132,7 +132,7 @@ cmake -S . -B /tmp/build-check -G Ninja -DGO2CPP_WITH_BENTO=ON
 ## 6. 下一步
 
 - 想理解某个模块：读对应目录的 `README.md`（从 [README.md](README.md) 的目录地图进入）；
-- 想自己加一个示例：在 `user/<模块>/` 下加 `xxx_demo.cpp`，在
+- 想自己加一个示例：在 `user/modules/<模块>/` 下加 `xxx_demo.cpp`，在
   `cmake/Go2CppTests.cmake` 的 `GO2CPP_EXAMPLES` 里加一行 `<模块>/xxx_demo`，
   再在该模块 README 的示例表里登记；
 - 想看设计动机：`docs/` 下有各模块的专题文档（见 [README.md](README.md#文档索引)）。

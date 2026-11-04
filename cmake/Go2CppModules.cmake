@@ -590,7 +590,7 @@ if (GO2CPP_WITH_PICOQUIC)
         ssl crypto pthread)
 
     add_executable(go2cpp_picoquic_hq_client
-        ${CMAKE_CURRENT_SOURCE_DIR}/user/network/picoquic_hq_client.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/user/modules/network/picoquic_hq_client.cpp)
     target_link_libraries(go2cpp_picoquic_hq_client PRIVATE go2cpp_quic_picoquic)
 
     # HTTP/3 客户端：QPACK 与 h3 帧全部走 picohttp（h3zero），不自研。

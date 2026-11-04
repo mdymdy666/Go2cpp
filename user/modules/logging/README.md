@@ -1,8 +1,12 @@
-# user/logging —— 四层可组合的日志
+# 日志（logging）
+
+> **一句话定位**：四层可组合的日志。
+> 本文是「模块 → 能力 → 异常」手册；[可观测性总览（日志/脱敏/轮转）](../../deep/10-observability.md)
+
 
 > 日志模块的示例：级别过滤、模式化格式化、内存收集、文件轮转、INI 热配置。
 
-## 这个模块是什么
+## 能力清单
 
 一个**零第三方依赖**（只用 C++17 标准库）的日志实现，按四层组合：
 
@@ -47,7 +51,7 @@
 - **默认安全值**：`warning`/`error` 写入 `log/go2cpp.log`，**stdout 默认关闭**，
   避免库把日志喷到调用方的终端（要开就 `Configure(..., stdout_enabled=true, ...)`）。
 
-## 最小用法
+## 最小示例
 
 ```cpp
 #include "go2cpp/log.hpp"
@@ -92,7 +96,24 @@ go2cpp::log::LogFormatter::AddFormat("g", [](const std::string&) {
 go2cpp::log::PatternFormatter fmt("%g %m%n");   // 必须先注册再构造 Formatter
 ```
 
-## 示例列表
+## 3 个常见异常
+
+### 1. 日志「没有输出」
+- **现象**：程序跑完终端空白，以为日志没生效。
+- **原因**：默认 `stdout_enabled=false`，只把 warning/error 写入 `log/go2cpp.log`。
+- **处理**：`LoggerManager::Configure(..., stdout_enabled=true, ...)`，或直接查看日志文件。
+
+### 2. 自定义格式项 `%g` 不生效
+- **现象**：输出里原样打印 `%g`。
+- **原因**：`PatternFormatter` **构造时快照**已注册的格式项；先建 Formatter 再 `AddFormat` 无效。
+- **处理**：先 `LogFormatter::AddFormat("g", ...)`，再构造 `PatternFormatter`。
+
+### 3. 同一条日志重复输出
+- **现象**：一行日志出现两三次。
+- **原因**：父子 Logger 都挂了 sink，记录沿父子链传播时被多次落盘。
+- **处理**：只在根 logger 挂 sink；子 logger 只设级别与字段。
+
+## 示例清单
 
 | 示例 | 演示什么 |
 | --- | --- |
@@ -127,3 +148,10 @@ cmake --build /tmp/build-user --target go2cpp_log_demo -j && /tmp/build-user/go2
   需要序列化大对象时先判断级别。
 - **`Logger` 有父子传播**：没配 sink 的子 logger 会把记录交给父 logger；
   重复挂 sink 会导致同一条日志输出多次。
+
+## 深入阅读
+
+- [可观测性总览（日志/脱敏/轮转）](../../deep/10-observability.md)
+- [交接摘要（docs）](../../docs/10-observability.md)
+- 源码位置：`include/go2cpp/logging/`、`src/logging/`、转发头 `include/go2cpp/log.hpp`
+- 示例目标名 = `go2cpp_<文件名>`；新增示例需同时登记 `cmake/Go2CppTests.cmake` 与本文清单。
