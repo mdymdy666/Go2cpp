@@ -204,3 +204,82 @@ taskset -c 2,3 /var/tmp/kvbench --bench --n=10000000
 - `docs/metrics-ledger.md` M07：追加 2026-11-04 复测（全流程 1.109× / Get-only 1.252×），
   并注明 LevelDB 侧轮间波动 ±20%，以 Get-only 中位为准。
 - `docs/reports/asm-storage-kv.md` 已追加 §7 复核说明。
+
+
+## 写路径定位（2026-11-04）
+
+### 1. 复现
+
+同 harness（key 20B / value 22B，单线程，`taskset -c 2,3`，默认 8 MB memtable，
+`sync_writes=false`）：
+
+| 引擎 | Put ns/op | Put ops/s | 来源 |
+|---|---:|---:|---|
+| LevelDB（同轮对照） | 1554.8 | 643,160 | `/var/tmp/kvput --ldb` |
+| 自研 KV（修复前） | 6262.1 | **159,690** | 与 §2.2 的 163,078 一致 |
+
+### 2. 根因：合并策略造成 36× 写放大，且全部在写锁内
+
+旧 `KV::Impl::MaybeCompactLocked()` 每次固定取「最旧两段」合并，而
+`max_sstables = 4` 意味着第 5 段起**每写满一个 8 MB memtable 就合并一次最旧两段**。
+最旧的大段因此被之后每一个新段反复重写（二次方）：
+
+| 配置（1e7 Put，8 MB memtable） | Put ops/s | `bytes_written` | 写放大 | 结束段数 |
+|---|---:|---:|---:|---:|
+| max_sstables=4（默认，基线） | 159,690 | 17,688 MiB | **36×** | 4 |
+| max_sstables=8 | 168,702 | 15,870 MiB | 32× | 8 |
+| max_sstables=16 | 251,335 | 12,537 MiB | 25× | 16 |
+
+- 62.6 s 里约 55 s 是 compaction 重写（17.7 GiB ÷ 实测 322 MB/s ≈ 55 s）；
+- 提高 `max_sstables` 只减小常数、不改变二次方性质；
+- **WAL 不是瓶颈**：`sync_writes=false`（默认）下 `wal_syncs=0`，只有 1 MB 用户态
+  缓冲的 `write()`；全仓 `fdatasync/fsync` 只出现在 `WalWriter::Sync()`（group commit，
+  仅在 `sync_writes=true` 时调用）与 `SSTableBuilder::Finish()` 的收尾；
+- **`kv_bench` 2e6 的 1.92 M/s 来自配置差异**：`tests/storage/kv_bench.cpp:262-266`
+  用 32 MB memtable，92 MB 数据只有 3 次 flush、几乎不触发合并；不是引擎更快。
+
+### 3. 改动（`src/storage/kv.cpp`，+29/−8，未 commit）
+
+1. **几何合并**：`MaybeCompactLocked()` 不再固定取最旧两段，而是扫描所有相邻段对，
+   取**大小最接近**（`hi*1024/lo` 最小）的一对合并——相邻保证 key 遮蔽顺序不变，
+   大小相近让每段只在遇到同量级邻居时才重写，单字节重写 O(log N) 次；
+2. **原地替换区间**：发布时把 `[first, first+2)` 换成新段（而不是 `resize(keep)` +
+   尾插），中间位置的合并结果仍保持「新→旧」顺序；
+3. **墓碑丢弃条件**修正为 `inputs.size() == total`（只有合并覆盖全部段时才可丢）。
+
+> 已验证但未采用：后台 compaction 线程（I/O 在锁外，Put 阶段 1.73 M/s、写放大 4×）。
+> 它与现有测试「未 `Close` 就 `std::filesystem::remove_all(dir)`」冲突——后台线程还在
+> 写目录，`remove_all` 抛 `filesystem_error: Directory not empty`（`kv_test` 崩溃）。
+> 要保留异步就必须改测试或加生命周期协议，超出本次「只改 `src/storage`」的边界，
+> 故只保留几何策略；单它已达标。
+
+### 4. 前后对比（1e7 Put，同机同 harness）
+
+| 指标 | 修复前 | 修复后 | 变化 |
+|---|---:|---:|---:|
+| Put ops/s | 159,690 | **703,517** | **4.4×** |
+| Put ns/op | 6262.1 | 1421.4 | |
+| 写放大（`bytes_written`） | 17,688 MiB | 3,464 MiB | 36× → 7× |
+| Put 阶段 wall | 62.6 s | 14.21 s | |
+| 结束段数 | 4 | 4 | 不变 |
+| 1e7 随机 Get ops/s | 680,915（§2.2） | **820,857** | 读无退化（段数仍 4） |
+| 同轮 LevelDB Put | 643,160 | 643,160 | **1.09×**（0.9× 目标 = 578,844） |
+
+**已达 0.9× LevelDB 目标**（703,517 ≥ 578,844，实际 1.09×）；`close` 0.17 s。
+
+### 5. 正确性
+
+| 测试 | 结果 |
+|---|---|
+| `go2cpp_kv_test` | 52,665 checks, 0 failures（0.88 s） |
+| `go2cpp_kv_concurrent_test` | 10,031 checks, 0 failures |
+| `go2cpp_kv_recovery_test` | 22 checks, 0 failures（crash_during_flush 19,626/20,000） |
+
+`g++ -Wall -Wextra -Wpedantic` 编译 `src/storage/kv.cpp` 零告警；改动未提交。
+
+### 6. 遗留
+
+- 写放大仍有 7×（几何合并每字节约 log2(61)≈6 次 + 首次落盘）。再降需要 4 路归并
+  （几何级数变 4×）或多层 LSM，但要同步改读侧段数预算；
+- 后台合并是写路径的下一个数量级（1.73 M/s），但需要配套目录生命周期协议，
+  建议单独任务：改测试的清理方式 + 给 `KV` 增加显式 `Close` 约束或合并线程 join 钩子。

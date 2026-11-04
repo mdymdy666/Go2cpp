@@ -10,7 +10,9 @@
 //
 // 写路径：一把写锁串行化 WAL 追加与内存更新；fsync 用 group commit 放到锁外，
 // 并发 sync 写只付一次 fdatasync 的钱。刷盘/合并在写锁内完成（与 LevelDB 的
-// 后台 compaction 不同，换来实现简单和读路径的强一致）。
+// 后台 compaction 不同，换来实现简单和读路径的强一致）。合并只挑「大小相近的
+// 相邻段」：固定合并最旧两段会让最旧的大段被之后每个新段反复重写（1e7 条实测
+// 17.7 GiB、写放大 36x、Put 16 万/s）。
 
 #include "go2cpp/storage/kv.hpp"
 
@@ -905,10 +907,26 @@ void KV::Impl::MaybeCompactLocked() {
     return;
   }
   const std::size_t total = cur->sstables.size();
-  const std::size_t n = std::min(opt_.sstables_per_compaction, total);
-  const std::size_t keep = total - n;
-  std::vector<std::shared_ptr<SSTable>> inputs(cur->sstables.begin() + keep,
-                                               cur->sstables.end());
+  // 选「大小最接近的相邻两段」合并：每段只在遇到同量级邻居时才重写，单字节
+  // 重写 O(log N) 次。旧实现固定取最旧两段，最旧的大段会被之后每个新段反复
+  // 重写——1e7 条实测 17.7 GiB / 写放大 36x / Put 163k/s。
+  std::size_t first = total - 2;
+  std::uint64_t best_ratio = ~static_cast<std::uint64_t>(0);
+  for (std::size_t i = total; i > 1; --i) {
+    const std::uint64_t a = cur->sstables[i - 2]->file_size();
+    const std::uint64_t b = cur->sstables[i - 1]->file_size();
+    const std::uint64_t hi = a > b ? a : b;
+    const std::uint64_t lo = a > b ? b : a;
+    const std::uint64_t ratio =
+        lo == 0 ? ~static_cast<std::uint64_t>(0) : (hi * 1024) / lo;
+    if (ratio < best_ratio) {
+      best_ratio = ratio;
+      first = i - 2;
+    }
+  }
+  std::vector<std::shared_ptr<SSTable>> inputs(
+      cur->sstables.begin() + static_cast<std::ptrdiff_t>(first),
+      cur->sstables.begin() + static_cast<std::ptrdiff_t>(first) + 2);
 
   const std::uint64_t no = next_file_no_++;
   const std::string path = PathFor(no, "sst");
@@ -944,7 +962,7 @@ void KV::Impl::MaybeCompactLocked() {
     }
   }
 
-  const bool drop_tombstones = (n == total);
+  const bool drop_tombstones = (inputs.size() == total);
   while (!heap.empty()) {
     const Node top = heap.top();
     heap.pop();
@@ -982,8 +1000,11 @@ void KV::Impl::MaybeCompactLocked() {
 
   auto next =
       std::make_unique<Snapshot>(*snapshot_.load(std::memory_order_acquire));
-  next->sstables.resize(keep);
-  next->sstables.push_back(std::move(table));
+  // 原地替换 [first, first+2) 为新段：合并只发生在相邻段之间，新旧顺序不变
+  // （新段仍比更旧的段新，比更新的段旧）。
+  next->sstables[first] = std::move(table);
+  next->sstables.erase(next->sstables.begin() +
+                       static_cast<std::ptrdiff_t>(first) + 1);
   PublishSnapshot(std::move(next));
   // 旧文件可以立即 unlink：已经 mmap 的读者仍持有 inode，新读者从新快照
   // 读不到它们。不删会让目录里的 .sst 随合并次数无限增长（实测 2.6 万）。
