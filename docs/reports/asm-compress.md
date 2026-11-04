@@ -182,3 +182,240 @@ taskset -c 9 /tmp/bench_gzip_crc
 未改动：`src/hash/**`（CRC 实现本身）、`include/go2cpp/hash/**`、其它模块。
 （工作树里 include/go2cpp/hash/hash.hpp 的文档更新由并行 agent 完成，
 不是本任务改动。）未 commit。
+
+
+## 汇编级取证（2026-11-04）
+
+> 本节由 gzip 汇编级取证任务追加，**保留上文原文**。只读体检：未改任何代码、
+> 未 commit。所有数字来自 `objdump` 与同机实测，未测项显式标注「未测」。
+
+### 0. 口径与产物
+
+| 项 | 值 |
+|---|---|
+| 真树 | `/UserData/CodexWorkSpace/Go2cpp`（WSL，小写 `pp`；`E:\CodexWorkspace\Go2Cpp` 旧副本未使用） |
+| 源码版本 | HEAD `0f6fd2e`（工作树另有他人未提交改动，本节未触碰） |
+| 反汇编产物 | `.build-bento-wsl/libgo2cpp_compress.so.0.1.0`（CMake `Release`，`-O3 -DNDEBUG`，GCC 13.3.0，2026-11-03 构建） |
+| 交叉验证 | 手工 `g++ -O3 -DNDEBUG -std=c++17 -fPIC -Iinclude -c` 的 `deflater.o` / `inflater.o`；`EmitFixedBlock` 大小与 so 完全一致（12045 B），确认二者同源同优化级别 |
+| 命令 | `objdump -d --no-show-raw-insn -C <so>`；`nm -C -S --defined-only` 取符号大小 |
+| 机器 | AMD Ryzen 9 8945HX（WSL2，12 vCPU），`/proc/cpuinfo` 基频 2495 MHz；`taskset -c 9` 绑核 |
+
+### 1. 热函数静态画像（objdump 指令级）
+
+按压缩/解压两条数据路径，统计每个函数的静态指令数、`call` 数、`call ...@plt`
+数、`operator new` 调用数、`lock` 前缀数、`sub rsp` 最大栈帧、函数字节数：
+
+| 函数（`go2cpp::compress::detail::` 省略） | 指令 | call | 其中 @plt | new | lock | 栈帧(B) | 函数(B) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `DeflateEncoder::EmitFixedBlock` | **2757** | 50 | **49** | 2 | 0 | 328 | 12045 |
+| `InflateDecoder::StepDynamicHeader` | **1466** | 27 | 21 | 4 | 4 | 168 | 5938 |
+| `InflateDecoder::Inflate` | **1044** | 36 | 26 | 0 | **6** | 88 | 4610 |
+| `Deflater::Run` | 744 | 38 | 19 | 0 | 0 | 40 | 2960 |
+| `InflateDecoder::BuildFixedTables` | 694 | 5 | 5 | 2 | 0 | 464 | 2834 |
+| `InflateDecoder::StepHuffman` | **641** | 25 | 19 | 0 | 4 | 88 | 2794 |
+| `DeflateEncoder::EmitFixedEmptyFinal` | 429 | 7 | 7 | 0 | 0 | 56 | 1714 |
+| `DeflateEncoder::EmitStoredBlock` | 380 | 8 | 8 | 0 | 0 | 8 | 1302 |
+| `InflateDecoder::StepGzipHeader` | 377 | 13 | 9 | 0 | 2 | 56 | 1532 |
+| `DeflateEncoder::Pump` | 343 | 10 | 9 | 0 | 0 | 56 | 1330 |
+| `DeflateEncoder::EnsureHeader` | 215 | 4 | 4 | 0 | 0 | 40 | 781 |
+
+主循环定位（对每个函数取跨度最大的向后跳转）：
+
+| 函数 | 主循环地址 | 循环体指令 | 占函数比例 | 循环体内 call |
+|---|---|---:|---:|---:|
+| `EmitFixedBlock` | `0xe002..0x10c6c` | **2574** | 93% | 45 |
+| `StepHuffman` | `0x160f4..0x16b73` | 613 | 96% | 23 |
+| `Inflate` | `0x16c40..0x17c01` | 911 | 87% | 27 |
+| `Deflater::Run` | `0xc74f..0xcee1` | 494 | 66% | 28 |
+
+一句话画像：
+
+- **编码侧是一个 2757 条指令的巨型函数**：`FindMatch`（哈希链扫描）、
+  `InsertHash`、`EmitLengthDistance`、`EmitFixedCode`、`BitWriter::PutBits`
+  全部被内联进 `EmitFixedBlock`，主循环 2574 条指令覆盖 93% 的函数体。
+  这不是「函数调用多」，而是「单函数过大、分支密度高」，I-cache 与分支预测
+  压力都在一个函数里。
+- **解码侧是分层状态机**：`Inflate`（1044）外层 `for(;;) StepOnce()`，
+  `StepHuffman`（641）是符号主循环，`StepDynamicHeader`（1466）只在外部
+  动态 Huffman 流的每个块头走一次；go 自己的流只产出固定 Huffman（BTYPE=01），
+  所以 `StepDynamicHeader` 对自产流不热、对 zlib 流（每 ~16 KiB 一块）热。
+- **`BuildFixedTables` 694 条指令 + 464 B 栈帧 + 2 次 new**，在
+  `InflateDecoder` 构造/`Reset` 时重建 288+32 项固定 Huffman 表——这是每次
+  「新建一个 Inflater」的固定启动成本，不是逐字节成本。
+
+### 2. 「本可内联却 PLT 直呼」与逐字节循环
+
+#### 2.1 `EmitFixedBlock` 的 49 个 PLT 调用构成（全部实测地址）
+
+| 目标 | 次数 | 说明 |
+|---|---:|---|
+| `__cxa_guard_acquire@plt` | **13** | 函数内 `static const std::array` 局部静态的线程安全初始化守卫 |
+| `__cxa_guard_release@plt` | **13** | 同上 |
+| `std::vector<unsigned char>::_M_default_append@plt` | 11 | `m_combined.reserve/insert` 的增长路径 |
+| `memmove@plt` | 6 | `m_combined.insert(history/data)` 的整段搬移 |
+| `operator new@plt` / `operator delete@plt` | 2 / 2 | `m_combined` 扩容 |
+| `std::__throw_length_error@plt` | 2 | 扩容溢出路径 |
+| `vector::_M_range_insert`（本地，非 PLT） | 1 | — |
+
+**这是本节最硬的「本可内联却 PLT 直呼」证据**：`ReversedLitCodes()`、
+`LitCodeBits()`、`ReversedDistCodes()`、`CrcTables()` 都是
+`static const std::array` 的局部静态，编进 `EmitFixedBlock` 后每调用一次就要
+走 26 次 `__cxa_guard_*` PLT（13 对）。这些表完全可以在编译期确定
+（`constexpr`/类静态成员/命名空间级 `const`），守卫、PLT、原子 load 都不必要。
+按 32 KiB 一块、1 MiB 输入 32 块算，固定 Huffman 压缩 1 MiB 会白付
+32 × 26 = **832 次 PLT 调用**。
+
+#### 2.2 `Deflater::Run` 对同 TU 大函数的 PLT 直呼
+
+`Deflater::Run` 的 19 个 PLT 里：
+
+- `DeflateEncoder::Pump@plt` ×3、`EmitFixedBlock@plt` ×3、`EmitStoredBlock@plt` ×3、
+  `EmitFixedEmptyFinal@plt` ×1、`Deflater::ok()@plt` ×1；
+- `BitWriter::PutBits [clone .constprop.0]` ×8（本地直呼，未内联）；
+- `memcpy@plt` ×1、`memmove@plt` ×2、`_M_default_append@plt` ×3、
+  `_M_range_insert` ×2。
+
+`EmitFixedBlock` 是 12 KB 的大函数，GCC 不内联它是合理的；但它被导出为
+default-visibility 符号后，同 TU 调用也只能走 PLT（无 `-fvisibility=hidden`
+/ `-Bsymbolic-functions` / LTO）。每个 32 KiB 块多一次 PLT 间接跳转 +
+一次函数序言（`push` ×6 + `sub rsp,0x148`）。同理 `Inflate` 对
+`StepHuffman@plt` / `StepDynamicHeader@plt` / `StepGzipHeader@plt` 各 1 处。
+
+#### 2.3 `StepHuffman`：短匹配用 PLT `memcpy`
+
+25 个 call 里 **10 个是 `memcpy@plt`**（`0x16357/0x16371/0x1639c/0x1640e/
+0x1642d/0x16450/0x165f6/0x16616/0x1689e/0x168c0`），来自 `CopyMatch` 的
+`ReadWindow` / `WriteWindow`：距离通常只有 3–20 B，`memcpy` 的 PLT 间接
+调用 + 长度分派开销与拷贝本身同量级。另有 `ErrCorrupt@plt` ×3、
+`_M_release@plt` ×2、`_M_release_last_use_cold@plt` ×3、`__stack_chk_fail@plt` ×1
+（错误/析构路径），以及 6 处 `call *0x10(%rax)` / `call *0x18(%rax)` 的
+间接调用（`ErrorPtr` 析构，非热路径）。
+
+#### 2.4 `lock` 前缀与原子操作
+
+| 函数 | `lock` 条数 | 位置 |
+|---|---:|---|
+| `Inflate` | 6 | `CommitOutput` 出口的 `shared_ptr` 控制块 `_M_release`（每批输出/每次错误） |
+| `StepHuffman` | 4 | `ErrCorrupt()` 构造 `ErrorPtr` 的引用计数 |
+| `StepDynamicHeader` | 4 | 同上（块头校验失败路径） |
+| `EmitFixedBlock` / `Deflater::Run` | 0 | 编码侧全程无原子操作 |
+
+结论：**`lock` 不在逐字节热循环里**，只在「每批输出提交」与错误路径；
+不是吞吐主因，但 `CommitOutput` 每 64 KiB 一次 `_M_release` 仍可改成
+无所有权转移的裸指针 CRC 调用。
+
+#### 2.5 逐字节循环可向量化点
+
+- `BuildFixedTables` 的 `for (symbol=0; symbol<=143; ...) lit_lengths[symbol]=8`
+  是 4 段常量填充，反汇编里是逐字节 `movb`；可 `memset`/`constexpr` 表一次拷入。
+- `EmitFixedBlock` 的 `m_huffman_only` 分支是 `for(index<size) EmitSymbol(data[index])`，
+  逐字节查表 + 写位流，无法直接向量化（位流串行），但可改为「先批量查表到
+  临时码字数组、再批量打包」，把查表链路的依赖打断。
+- `UpdateAdlerBlock` 是 `a += data[i]; b += a` 的串行前缀和，标量实现；
+  zlib 用 `adler32_simd`（SSSE3/AVX2）把 5552 字节块做成 16 路并行，
+  go2cpp 目前仍是逐字节（本次未改，因 gzip 路径不走 adler）。
+- `MatchLength` 是逐字节 `while (a[i]==b[i]) ++i`；GCC 未把它向量化
+  （有提前退出的数据依赖），可用 8 字节 XOR + `ctz` 一次比较 8 字节，
+  这是 zlib `longest_match` 的常规做法。
+
+### 3. 与 zlib 同场实测（1 MiB 同一语料，L6）
+
+方法：`tests/bench/bench_asm_gzip.cpp`（临时文件，未入库）复用语料
+（1 MiB 低熵日志，与 `bench_gzip_crc.cpp` 同一份）；链接
+`.build-bento-wsl/libgo2cpp_compress.so`（Release `-O3`）+ 系统 zlib；
+同轮交替（奇偶轮交换先后）、30 次迭代、取中位数；`taskset -c 9`。
+
+| 路径 | go2cpp | zlib | 速度比（go/zlib） | 耗时比（go/zlib） |
+|---|---:|---:|---:|---:|
+| 压缩 L6（1 MiB 输入） | **604.5 MiB/s** | 453.9 MiB/s | **1.347×** | **0.742×** |
+| 解压（同一 go 流，64 KiB 输出块） | **4959.0 MiB/s** | 3293.9 MiB/s | **1.479×** | **0.676×** |
+
+必须同时看的口径差异：
+
+| 项 | go2cpp | zlib |
+|---|---:|---:|
+| 压缩产物 | 18496 B（1.764%） | 13139 B（1.253%） |
+| 产物大小比 | **1.408×**（go 大 40.8%） | 1.0 |
+
+也就是说：**压缩快 1.35× 是用 40.8% 的压缩率换来的**——go 只发固定 Huffman
+块（无动态树、无 lazy matching、无最优解析），不是同压缩率对比；解压的
+1.48× 才是同一条压缩流上的公平对比（与上文 0.696× 的历史数字一致，本次
+0.676×，差异在机器负载）。
+
+### 4. 物理下限估算与「离下限几倍」
+
+**口径**：静态指令数来自 objdump；动态「每字节指令数」由
+`吞吐 × 假设频率/宽度` 反推，频率取基频 2.5 GHz（`/proc/cpuinfo`），
+Zen4 解码宽度 6 条/周期、实际 IPC 按 1.8–3.0 取区间。**这是估算，不是
+`perf stat` 实测**（本机 WSL 未安装 perf，`perf_event_paranoid=2`），
+标注为「估算」。
+
+| 路径 | 每字节必要操作（下界模型） | 指令下限（条/字节） | 实测反推（条/字节） | 指令级离下限 | 吞吐上限（2.5 GHz×6 宽） | 吞吐离下限 |
+|---|---|---:|---:|---:|---:|---:|
+| 压缩 | `Hash3`：load32+shift+mul+shr(4) + head load + head store + prev store = 7 | **7** | 7.0–8.5 | **1.0–1.2×** | 2.14 GB/s | **3.4×**（实测 0.634 GB/s） |
+| 解压 | 每符号 4 条（查表+移位+减位+分支）+ 每字节 1 条 store；按 2.5 B/符号 → 2.2 | **2.2** | 2.0–2.5 | **0.9–1.1×** | 6.8 GB/s | **1.25×**（实测 5.45 GB/s） |
+
+解读：
+
+- **解压已经贴住指令级下限**（1.25×），继续压指令数的收益只有百分点级；
+  它的瓶颈是每符号的查表依赖链与 `CopyMatch` 的短 `memcpy`，不是「指令太多」。
+  这也解释了为什么批量 CRC 改造后能反超 zlib。
+- **压缩的指令数也已到下限（7 条/字节），但吞吐离「满 IPC 下限」差 3.4×**：
+  每字节的 7 条指令里有 3 条是 `m_head`/`m_previous` 的随机读写，哈希链
+  指针追逐的 L2/L3 延迟把 IPC 压到 ~1.8，而不是宽度不够。**优化方向应是
+  减少链扫描次数/改善局部性，不是继续抠指令数。**
+
+### 5. 可优化点前 3（按证据强度与收益排序）
+
+1. **消掉 `EmitFixedBlock` 里 26 次/块的 `__cxa_guard_*` PLT**
+   （证据：`0xe8e8/0xea47/0xef8b/0xf2df/0xf38d/0xf648/0xf934/0xfd1e/0xfe4b/
+   0x10147/0x1047a/0x10776/0x10a29` 共 13 对 acquire/release）。
+   把 `ReversedLitCodes()` / `LitCodeBits()` / `ReversedDistCodes()` /
+   `CrcTables()` 从「函数内 `static const std::array`」改为
+   `static constexpr` 或类静态 `inline constexpr`，守卫与 PLT 一起消失；
+   1 MiB 输入可省 832 次 PLT 调用。**零风险、纯局部改动。**
+2. **去掉每块 64 KiB 的整段拷贝**（证据：`_M_default_append` ×11、
+   `memmove` ×6、`operator new/delete` 各 2，全部在 `EmitFixedBlock` 内）。
+   `EmitFixedBlock` 每块都 `m_combined.clear(); reserve(history+size);
+   insert(history); insert(data)`，把 32 KiB 历史 + 32 KiB 输入搬进一个
+   新 vector；1 MiB 输入 = 32 块 ≈ **2 MiB 纯拷贝 + 32 次扩容检查**。
+   改为「环形窗口 + 跨块视图」（`FindMatch`/`InsertHash` 接受
+   `(buf, base, len)` 两段视图），可把这部分降到 0，同时改善缓存局部性。
+3. **`CopyMatch` 的短拷贝去掉 PLT `memcpy`**（证据：`StepHuffman` 10 处
+   `memcpy@plt`）。距离 < 32 B 时用两条 16 B 的 SSE2 `movdqu` + 尾部
+   掩码写，或直接 8 B 循环展开；距离 ≥ 32 B 再落到 `memcpy`。
+   叠加 `-fvisibility=hidden -Bsymbolic-functions`（或 LTO）消除
+   `Pump@plt`/`EmitFixedBlock@plt`/`StepHuffman@plt` 等同 TU 直呼。
+
+附带项（未列入前 3）：`BuildFixedTables` 每次构造/Reset 重建固定表
+（694 条、464 B 栈帧、2 次 new），可改为进程级 `constexpr` 表一次性构建。
+
+### 6. 复现
+
+```bash
+cd /UserData/CodexWorkSpace/Go2cpp
+# 1) 反汇编（用真实 Release 产物）
+objdump -d --no-show-raw-insn -C \
+  .build-bento-wsl/libgo2cpp_compress.so.0.1.0 > /tmp/compress.dis
+nm -C -S --defined-only .build-bento-wsl/libgo2cpp_compress.so.0.1.0
+
+# 2) 交叉验证（手工 -O3，EmitFixedBlock 应与 so 同为 12045 B）
+g++ -O3 -DNDEBUG -std=c++17 -fPIC -Iinclude -c src/compress/deflater.cpp \
+  -o /tmp/deflater.o && nm -C -S /tmp/deflater.o | grep EmitFixedBlock
+
+# 3) 压/解压同场基准（临时源码，未入库）
+g++ -O2 -DNDEBUG -std=c++17 -Iinclude /tmp/bench_asm_gzip.cpp \
+  -L.build-bento-wsl -lgo2cpp_compress -lgo2cpp_hash -lgo2cpp_error -lz \
+  -Wl,-rpath,/UserData/CodexWorkSpace/Go2cpp/.build-bento-wsl -o /tmp/bench_asm_gzip
+taskset -c 9 /tmp/bench_asm_gzip
+```
+
+### 7. 边界
+
+- `perf stat` 不可用，动态指令数/每周期指令数是**反推估算**，不是硬件计数器；
+  频率取基频 2.5 GHz（未锁频、未关 turbo），误差估计 ±20%。
+- 压缩对比不同压缩率（go 只发固定 Huffman），1.347× 不代表同率优势；
+  同率对比未测。
+- `StepDynamicHeader` 在本机只对 zlib 流热，go 自产流不走；其 1466 条指令
+  的静态成本对「解外部 zlib 流」场景才有意义（未单独计时）。
+- 本节没有改动任何代码，未 commit；工作树中他人的未提交改动未触碰。
