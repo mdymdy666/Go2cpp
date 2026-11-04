@@ -512,6 +512,11 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
         request->target.assign(second);
         request->version.assign(third);
     }
+    // 增量 feed 时 header_block 每次都是同一段（m_buffer 保留未消费字节），
+    // 若不清空会把同名头重复追加，最终 wire 头膨胀到上百 KB 并被对端拒绝。
+    // 先清空再逐行重建，保证每次 feed 后 header 恰好一份。
+    if (response) result->header.clear();
+    else request->header.clear();
     std::size_t content_length = 0;
     bool has_length = false;
     bool chunked = false;
@@ -712,7 +717,11 @@ Result Client::do_request(const Request& request, const std::string& host, std::
         remaining = remaining_time(deadline);
         if (remaining == std::chrono::milliseconds::zero())
             return {Result::Error::Timeout, "request deadline exceeded", {}};
-        const auto written = socket->send(wire.data() + sent, wire.size() - sent, 0, remaining);
+        // 单次 send 限制 1 MiB：大 body（如 6+ MiB 上传）一次性 send 会在内核发送
+        // 缓冲边界上返回 EPIPE/短写，分块后每块都能被对端稳定接收。
+        const std::size_t chunk =
+            std::min<std::size_t>(wire.size() - sent, static_cast<std::size_t>(1) << 20);
+        const auto written = socket->send(wire.data() + sent, chunk, 0, remaining);
         if (!written.ok() || written.transferred == 0) {
             const int error = written.error == 0 ? (errno == 0 ? EIO : errno) : written.error;
             return {classify_io(Result::Error::Send, error), std::strerror(error), {}};

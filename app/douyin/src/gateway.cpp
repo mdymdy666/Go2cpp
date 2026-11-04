@@ -406,13 +406,14 @@ bool AddVideoRoute(Gateway* gateway) {
 /// @brief 注册一条路由；失败时打印并返回 false。
 bool AddRoute(Gateway* gateway, MethodMask methods, const char* pattern,
               std::uint16_t upstream_port, bool require_auth, int priority,
-              const char* name) {
+              const char* name,
+              std::chrono::milliseconds timeout = std::chrono::milliseconds(1000)) {
     RouteSpec spec;
     spec.method_mask = methods;
     spec.path_pattern = pattern;
     spec.upstream = Upstream(upstream_port);
     spec.require_auth = require_auth;
-    spec.timeout = std::chrono::milliseconds(1000);
+    spec.timeout = timeout;
     spec.priority = priority;
     spec.name = name;
     const auto result = gateway->AddRoute(spec);
@@ -473,8 +474,9 @@ int main(int argc, char** argv) {
                  0, "user") &&
         AddRoute(gateway.get(), kReadMask, "/api/video/**", kVideoPort, false, 0,
                  "video-read") &&
+        // 上传大文件需要更长超时（默认 1s 会让 10 MiB 上传在网关侧超时 -> 502）。
         AddRoute(gateway.get(), kWriteMask, "/api/video/**", kVideoPort, true, 10,
-                 "video-write") &&
+                 "video-write", std::chrono::milliseconds(120000)) &&
         AddRoute(gateway.get(), method_mask::kAll, "/api/feed/**", kFeedPort, false,
                  0, "feed") &&
         AddRoute(gateway.get(), kWriteMask, "/api/like/**", kInteractionPort, true,
