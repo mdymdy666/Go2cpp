@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -462,13 +463,37 @@ namespace rpctest {
 GO2CPP_RPC_SERVICE(UserService, Get, Create, Remove, Touch, Watch, Slow, Fail, Add,
                    EchoBytes, EchoString, Big, Snapshot)
 
+/// @brief 专门抛异常的服务：验证 handler 异常不会终止服务进程。
+class ThrowingService {
+   public:
+    /// @brief 普通 handler 抛异常。
+    User Unary(const UserId& id) {
+        (void)id;
+        throw std::runtime_error("handler boom");
+    }
+
+    /// @brief 流式 handler 抛异常（验证 StreamEnd 一定送达）。
+    Status Stream(const WatchRequest& request, rpc::ServerStream* stream) {
+        (void)request;
+        (void)stream;
+        throw std::runtime_error("stream boom");
+    }
+};
+
+GO2CPP_RPC_SERVICE(ThrowingService, Unary, Stream)
+
 /// @brief 新建并启动一个监听回环端口的服务端。
 /// @param server 服务端对象（调用方持有）。
 /// @param service 测试服务（生命周期必须覆盖 server）。
 /// @param address 输出：`"127.0.0.1:port"`。
 /// @return 成功 true。
 inline bool StartTestServer(rpc::Server& server, UserService& service, std::string* address) {
+    // 静态存储：注册表只存裸指针，服务必须比 Server 活得久。
+    static ThrowingService throwing_service;
     if (!server.Register("User", &service)) {
+        return false;
+    }
+    if (!server.Register("Throw", &throwing_service)) {
         return false;
     }
     rpc::Endpoint endpoint;

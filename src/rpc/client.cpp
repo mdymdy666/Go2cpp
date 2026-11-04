@@ -283,8 +283,17 @@ bool Connection::SendFrame(FrameType type, std::uint16_t flags,
             << " bytes=" << payload.size() << " error=" << error.message;
         return false;
     }
-    std::lock_guard<std::mutex> lock(m_write_mutex);
-    return m_transport->WriteAll(wire.data(), wire.size(), nullptr);
+    bool written = false;
+    {
+        std::lock_guard<std::mutex> lock(m_write_mutex);
+        written = m_transport->WriteAll(wire.data(), wire.size(), nullptr);
+    }
+    if (!written) {
+        // 写失败可能已写出半帧，字节流边界不再可信：关闭连接让所有等待者快速失败，
+        // 而不是让后续调用继续往错位的流里写。Encode 失败（本地错误）不走这里。
+        Close();
+    }
+    return written;
 }
 
 Status Connection::Wait(const std::shared_ptr<CallState>& state,
@@ -309,6 +318,18 @@ Status Connection::Wait(const std::shared_ptr<CallState>& state,
                 lock.unlock();
                 RemovePending(state->id);
                 SendCancel(state->id);
+                // 超时也是终态：不置 done 会让调用方看到「永久未完成」的句柄，
+                // 且第二次 Wait 会在已摘除的等待表上再等一遍超时。
+                {
+                    std::lock_guard<std::mutex> done_lock(state->mutex);
+                    if (!state->done) {
+                        state->done = true;
+                        state->status =
+                            Status(StatusCode::kDeadlineExceeded, "rpc call timed out");
+                    }
+                }
+                state->completed.store(true, std::memory_order_release);
+                state->cv.notify_all();
                 return Status(StatusCode::kDeadlineExceeded, "rpc call timed out");
             }
         }

@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -590,12 +591,32 @@ void ServerConnection::Process(const std::shared_ptr<PendingRequest>& request) {
         auto sender = std::make_shared<StreamSenderImpl>(shared_from_this(), request->call_id,
                                                          request->cancelled);
         ServerStream stream(sender);
-        const Status status =
-            bound->binding.invoke(bound->service, context, request->args, result, &stream);
+        Status status;
+        // step4: handler 异常必须在这里转成 kInternal——穿透到线程函数会让整个
+        //        服务进程 std::terminate，客户端只能看到连接突然断开。
+        try {
+            status = bound->binding.invoke(bound->service, context, request->args, result,
+                                           &stream);
+        } catch (const std::exception& error) {
+            status = Status(StatusCode::kInternal,
+                            std::string("handler threw: ") + error.what());
+        } catch (...) {
+            status = Status(StatusCode::kInternal, "handler threw unknown exception");
+        }
         (void)sender->Finish(status);
     } else {
-        const Status status =
-            bound->binding.invoke(bound->service, context, request->args, result, nullptr);
+        Status status;
+        try {
+            status = bound->binding.invoke(bound->service, context, request->args, result,
+                                           nullptr);
+        } catch (const std::exception& error) {
+            status = Status(StatusCode::kInternal,
+                            std::string("handler threw: ") + error.what());
+            result.Clear();
+        } catch (...) {
+            status = Status(StatusCode::kInternal, "handler threw unknown exception");
+            result.Clear();
+        }
         (void)SendResponse(request->call_id, status, result);
     }
     EraseCancel(request->call_id);

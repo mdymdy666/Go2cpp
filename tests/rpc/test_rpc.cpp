@@ -75,6 +75,12 @@ void TestBasicCalls(const std::string& address) {
     RPC_CHECK_EQ(big.size(), static_cast<std::size_t>(1024 * 1024));
     RPC_CHECK(!big.empty() && big.front() == 0x5a && big.back() == 0x5a);
 
+    // 3 MiB：贴近默认 4 MiB 单帧上限，覆盖多段 send/recv 与长度前缀边界。
+    std::vector<std::uint8_t> huge;
+    RPC_CHECK(client.TryCall("User.Big", &huge, BigRequest{3 * 1024 * 1024, 0x33}).ok());
+    RPC_CHECK_EQ(huge.size(), static_cast<std::size_t>(3) * 1024 * 1024);
+    RPC_CHECK(!huge.empty() && huge.front() == 0x33 && huge.back() == 0x33);
+
     const CounterSnapshot snapshot = client.Call<CounterSnapshot>("User.Snapshot");
     RPC_CHECK(snapshot.calls > 0);
     RPC_CHECK(snapshot.touches >= 1);
@@ -158,6 +164,13 @@ void TestTimeout(const std::string& address) {
     const User user = client.Call<User>("User.Get", UserId{11});
     RPC_CHECK_EQ(user.id, static_cast<std::int64_t>(11));
 
+    // 超时是终态：句柄 done() 必须为 true，不能呈现「永久未完成」。
+    client.set_timeout(std::chrono::milliseconds(5));
+    auto timed_out = client.AsyncCall<CounterSnapshot>("User.Slow", UserId{2});
+    CounterSnapshot never;
+    RPC_CHECK(timed_out.Wait(&never).code == rpc::StatusCode::kDeadlineExceeded);
+    RPC_CHECK(timed_out.done());
+
     // 连续超时 20 次，等待表不泄漏，之后仍能正常调用。
     client.set_timeout(std::chrono::milliseconds(1));
     for (int index = 0; index < 20; ++index) {
@@ -196,6 +209,34 @@ void TestCancel(const std::string& address) {
     const User user = completed.Wait();
     RPC_CHECK_EQ(user.id, static_cast<std::int64_t>(21));
     RPC_CHECK(!completed.Cancel());
+}
+
+// ---------------------------------------------------------------------------
+// handler 异常隔离：一个 handler 抛异常不能终止服务端进程
+// ---------------------------------------------------------------------------
+
+void TestHandlerException(const std::string& address) {
+    Announce("call: handler exception isolation");
+    rpc::Client client(address);
+
+    User ignored;
+    const rpc::Status status = client.TryCall("Throw.Unary", &ignored, UserId{1});
+    RPC_CHECK(status.code == rpc::StatusCode::kInternal);
+
+    // 同一连接仍然可用（服务端读/工作线程都没被异常带走）。
+    RPC_CHECK(client.CallStatus("User.Touch", UserId{8}).ok());
+    RPC_CHECK(client.connected());
+
+    // 流式 handler 抛异常：服务端必须补发 StreamEnd，客户端不能永久等待。
+    auto stream = client.OpenStream("Throw.Stream", WatchRequest{1, 0});
+    ChatMessage message;
+    rpc::Status stream_status;
+    RPC_CHECK(!stream.Next(&message, &stream_status, std::chrono::milliseconds(2000)));
+    RPC_CHECK(stream_status.code == rpc::StatusCode::kInternal);
+
+    // 异常之后普通调用继续可用。
+    const User user = client.Call<User>("User.Get", UserId{99});
+    RPC_CHECK_EQ(user.id, static_cast<std::int64_t>(99));
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +372,7 @@ int main() {
     TestErrorPaths(address);
     TestTimeout(address);
     TestCancel(address);
+    TestHandlerException(address);
     TestConcurrency(address);
     TestLatency(address);
     TestDisconnect(server, address);
