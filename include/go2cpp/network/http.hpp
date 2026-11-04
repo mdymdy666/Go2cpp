@@ -284,6 +284,13 @@ private:
     std::string m_buffer;
     /// Content-Length 声明的 body 长度；0 表示未声明或无需 body。
     std::size_t m_expected_body{0};
+    /// 头部是否已解析（true 时后续 feed 跳过头部重解析，直接进 body 阶段）。
+    bool m_header_parsed{false};
+    /// 头部解析结果快照：body 起始偏移 / Content-Length / chunked / 是否无 body。
+    std::size_t m_body_start_offset{0};
+    std::size_t m_content_length{0};
+    bool m_has_length{false};
+    bool m_no_body{false};
     /// 当前 chunk 还剩多少字节；chunked 解析时逐块递减。
     std::size_t m_chunk_remaining{0};
     /// 是否 chunked 传输；由 Transfer-Encoding 头设置，决定 body 解析路径。
@@ -292,6 +299,12 @@ private:
     bool m_finished{false};
     /// 是否正在读 chunked 的 trailer 段；解析头部时切换。
     bool m_in_chunk_trailer{false};
+    /// chunked 已解码 body；跨 feed 累积，完成时 move 给 Response/Request。
+    /// 与 m_chunk_scan_pos 一起把增量解析从 O(n²) 降到 O(n)。
+    std::string m_chunked_body;
+    /// 下一个 chunk-size 行在 m_buffer 中的绝对偏移；0 表示尚未开始。
+    /// NeedMore 不清空缓冲，因此该偏移在后续 feed 中仍然有效。
+    std::size_t m_chunk_scan_pos{0};
     /// 当前响应对应 HEAD 请求；`set_response_to_head()` 设置，解析时跳过 body。
     bool m_response_to_head{false};
     // 响应没有长度/分块标记时，body 由连接 EOF 定界；保存头后偏移，

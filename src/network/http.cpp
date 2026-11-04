@@ -386,7 +386,7 @@ std::string Response::to_string(bool head_request) const {
 }
 
 Parser::Parser(ParserLimits limits) : m_limits(limits) {}
-void Parser::reset() { m_buffer.clear(); m_chunked_body.clear(); m_chunk_scan_pos = 0; m_expected_body = 0; m_chunk_remaining = 0; m_chunked = false; m_finished = false; m_in_chunk_trailer = false; m_response_close_delimited = false; m_body_start = 0; m_error.clear(); }
+void Parser::reset() { m_buffer.clear(); m_chunked_body.clear(); m_chunk_scan_pos = 0; m_expected_body = 0; m_header_parsed = false; m_body_start_offset = 0; m_content_length = 0; m_chunked = false; m_has_length = false; m_no_body = false; m_chunk_remaining = 0; m_chunked = false; m_finished = false; m_in_chunk_trailer = false; m_response_close_delimited = false; m_body_start = 0; m_error.clear(); }
 ParseResult Parser::feed(std::string_view bytes, Request& request) { return feed_impl(bytes, false, &request, nullptr); }
 ParseResult Parser::feed(std::string_view bytes, Response& response) { return feed_impl(bytes, true, nullptr, &response); }
 ParseResult Parser::finish(Response& response) {
@@ -457,6 +457,23 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
             return {ParseState::Error, bytes.size(), "body too large"};
         return {ParseState::NeedMore, bytes.size(), {}};
     }
+    // 头部已解析过：跳过重复解析（每次 feed 重扫 330 条头是 O(n^2) 的根源），
+    // 直接进 body 阶段。变量先声明，header 解析块用独立的 {} 作用域，
+    // 这样 goto 不会跨过任何带初始化的局部变量。
+    std::size_t body_start = 0;
+    std::size_t content_length = 0;
+    bool chunked = false;
+    bool has_length = false;
+    bool no_body = false;
+    if (m_header_parsed) {
+        body_start = m_body_start_offset;
+        content_length = m_content_length;
+        chunked = m_chunked;
+        has_length = m_has_length;
+        no_body = m_no_body;
+        goto body_phase;
+    }
+    {
     // step3: 查找头部结束标记；未找到按头部上限判定 NeedMore 或 Error，防止无界增长。
     const auto header_end = find_header_end(m_buffer);
     if (header_end == std::string::npos) {
@@ -522,9 +539,6 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
     // 先清空再逐行重建，保证每次 feed 后 header 恰好一份。
     if (response) result->header.clear();
     else request->header.clear();
-    std::size_t content_length = 0;
-    bool has_length = false;
-    bool chunked = false;
     bool has_transfer_encoding = false;
     // 每个头都要 emplace_back：先按 CRLF 计数预留，消除 vector 扩容与搬移。
     {
@@ -563,8 +577,8 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
         offset = end + 2;
     }
     if (chunked && has_length) return {ParseState::Error, bytes.size(), "content length with chunked"};
-    const std::size_t body_start = header_end + 4;
-    const bool no_body = response && (m_response_to_head ||
+    body_start = header_end + 4;
+    no_body = response && (m_response_to_head ||
         (static_cast<int>(result->status) >= 100 && static_cast<int>(result->status) < 200) ||
         result->status == Status::NoContent || static_cast<int>(result->status) == 304);
     if (no_body) {
@@ -581,6 +595,15 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
         m_body_start = body_start;
         return {ParseState::NeedMore, bytes.size(), {}};
     }
+    // 保存头部解析结果，后续 feed 直接复用（不再重扫头部）。
+    m_body_start_offset = body_start;
+    m_content_length = content_length;
+    m_chunked = chunked;
+    m_has_length = has_length;
+    m_no_body = no_body;
+    m_header_parsed = true;
+    }  // 头部解析块结束
+body_phase:
     std::size_t body_end = body_start;
     if (no_body) {
         body_end = body_start;
