@@ -205,6 +205,28 @@ if ! cmake --build "$BUILD_DIR" --parallel "$JOBS" 2>&1 | tee "$LOG_DIR/build.lo
 fi
 step_ok
 
+# ---------------------------------------------------------------- freshness
+# 构建一致性门禁（2026-11-04 两次事故：旧 exe + 新 so → 13 个假 SEGFAULT /
+# Parser 假复现）。build 步骤刚跑完，正常情况下这里必然通过；失败说明产物被
+# 手工替换、构建目录不完整，或构建期间源码又变了。先自动重建一次，仍不一致
+# 才 FAIL（并打印「需要重建」清单），绝不带着不同批的产物去跑 ctest。
+step_begin "freshness"
+FRESH_ARGS=(--repo "$ROOT" --build-dir "$BUILD_DIR")
+if ! bash "$ROOT/scripts/check_build_freshness.sh" "${FRESH_ARGS[@]}" \
+        2>&1 | tee "$LOG_DIR/freshness.log"; then
+    printf '[ci] 产物与源码不一致，自动重建后复查 ...\n'
+    if ! cmake --build "$BUILD_DIR" --parallel "$JOBS" \
+            2>&1 | tee "$LOG_DIR/freshness-rebuild.log"; then
+        step_fail
+    fi
+    if ! bash "$ROOT/scripts/check_build_freshness.sh" "${FRESH_ARGS[@]}" \
+            2>&1 | tee "$LOG_DIR/freshness-after-rebuild.log"; then
+        printf '[ci] 重建后仍不一致：产物可能被手工替换（旧 exe + 新 so），请清理构建目录重配\n' >&2
+        step_fail
+    fi
+fi
+step_ok
+
 # -------------------------------------------------------------------- ctest
 step_begin "ctest"
 # 已知的环境相关失败（WSL 内核语义 / 线程数假设 / 文档数字漂移 / TSan 长跑）。
@@ -271,6 +293,23 @@ if [ "$MODE" = "full" ]; then
     step_begin "asan-build"
     if ! cmake --build "$ASAN_DIR" --parallel "$JOBS" 2>&1 | tee "$LOG_DIR/asan-build.log"; then
         step_fail
+    fi
+    step_ok
+
+    step_begin "asan-freshness"
+    ASAN_FRESH_ARGS=(--repo "$ROOT" --build-dir "$ASAN_DIR")
+    if ! bash "$ROOT/scripts/check_build_freshness.sh" "${ASAN_FRESH_ARGS[@]}" \
+            2>&1 | tee "$LOG_DIR/asan-freshness.log"; then
+        printf '[ci] ASAN 产物与源码不一致，自动重建后复查 ...\n'
+        if ! cmake --build "$ASAN_DIR" --parallel "$JOBS" \
+                2>&1 | tee "$LOG_DIR/asan-freshness-rebuild.log"; then
+            step_fail
+        fi
+        if ! bash "$ROOT/scripts/check_build_freshness.sh" "${ASAN_FRESH_ARGS[@]}" \
+                2>&1 | tee "$LOG_DIR/asan-freshness-after-rebuild.log"; then
+            printf '[ci] ASAN 重建后仍不一致（旧 exe + 新 so），请清理 %s 重配\n' "$ASAN_DIR" >&2
+            step_fail
+        fi
     fi
     step_ok
 

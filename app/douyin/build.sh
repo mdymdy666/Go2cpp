@@ -21,6 +21,36 @@ if [[ ! -d "$BUILD_LIB" ]]; then
   exit 1
 fi
 
+# ---- 构建一致性门禁 --------------------------------------------------------
+# 本脚本手工调用 g++，不跟踪 Go2Cpp 的头文件依赖：若 include/ 已更新而
+# libgo2cpp_*.so 仍是上一批，编出来的 exe 会链接到旧接口/旧 ABI，运行期
+# 表现为假 SEGFAULT（2026-11-04 事故）。所以链接前必须先确认两者同批。
+FRESH_CHECK="$GO2CPP/scripts/check_build_freshness.sh"
+if [[ -f "$FRESH_CHECK" ]]; then
+  echo "[build] 校验 Go2Cpp 产物与源码一致性 ..."
+  if ! bash "$FRESH_CHECK" --repo "$GO2CPP" --build-dir "$BUILD_LIB" --quiet; then
+    if [[ "${DOUYIN_AUTOREBUILD:-0}" == "1" ]]; then
+      echo "[build] 产物过期，自动重建 Go2Cpp（DOUYIN_AUTOREBUILD=1）..."
+      if ! cmake --build "$BUILD_LIB" --parallel "$(nproc 2>/dev/null || echo 4)"; then
+        echo "[build] Go2Cpp 自动重建失败，中止" >&2
+        exit 1
+      fi
+      if ! bash "$FRESH_CHECK" --repo "$GO2CPP" --build-dir "$BUILD_LIB" --quiet; then
+        echo "[build] 重建后仍不一致（产物可能被手工替换），中止" >&2
+        exit 1
+      fi
+    else
+      echo "[build] 停止：Go2Cpp 产物与源码不一致（旧 exe + 新 so 会造假 SEGFAULT）" >&2
+      echo "  先重建：cmake --build $BUILD_LIB --parallel \$(nproc)" >&2
+      echo "  或自动：DOUYIN_AUTOREBUILD=1 bash app/douyin/build.sh" >&2
+      exit 1
+    fi
+  fi
+  echo "[build] Go2Cpp 产物与源码一致"
+else
+  echo "[build] 警告：缺少 $FRESH_CHECK，跳过构建一致性校验" >&2
+fi
+
 mkdir -p "$ROOT/build" "$ROOT/logs" "$ROOT/data"
 
 CXXFLAGS=(-std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror -Wno-unused-parameter
