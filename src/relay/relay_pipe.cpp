@@ -911,8 +911,20 @@ bool RelayPipe::Run(const ContextPtr& context, ErrorPtr* err) {
         detail::RelayPipeState* state;
         ~WatchdogGuard() { state->StopWatchdog(); }
     } watchdog_guard{&state};
-    state.directions[0]->Start();
-    state.directions[1]->Start();
+    try {
+        state.directions[0]->Start();
+        state.directions[1]->Start();
+    } catch (...) {
+        // 线程创建失败（EMFILE/ENOMEM）时，已启动的读线程可能正阻塞在 Read；
+        // 必须先关两端再 Join，否则 Direction 析构时 join 永久阻塞。
+        state.ForceCloseAll();
+        state.directions[0]->Join();
+        state.directions[1]->Join();
+        if (err != nullptr) {
+            *err = NewError("relay: cannot start worker thread");
+        }
+        return false;
+    }
 
     bool incomplete = false;
     {
