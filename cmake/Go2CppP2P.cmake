@@ -64,9 +64,11 @@ if (GO2CPP_WITH_P2P)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/p2p/test_tcp_punch.cpp)
         add_executable(p2p_test_p2p_interprocess
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/p2p/test_p2p_interprocess.cpp)
+        add_executable(p2p_test_peer_validation
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/p2p/test_p2p_peer_validation.cpp)
         foreach(p2p_test IN ITEMS
                 p2p_test_stun p2p_test_p2p p2p_test_tcp_punch
-                p2p_test_p2p_interprocess)
+                p2p_test_p2p_interprocess p2p_test_peer_validation)
             target_link_libraries(${p2p_test} PRIVATE go2cpp_p2p)
             target_include_directories(${p2p_test} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/p2p)

@@ -158,6 +158,15 @@ bool LooksLikeStun(const std::uint8_t* data, std::size_t length) {
     return data != nullptr && length >= kStunHeaderSize && ReadU32(data + 4) == kStunMagicCookie;
 }
 
+/// @brief 源地址是否属于已交换的候选集合（ICE 候选对匹配）。
+/// @details 连通性检查的 Request 不带认证信息；若不加来源过滤，任意第三方
+///          只要向本端 UDP 端口发一个 Binding Request 就能把 peer 锁定到
+///          自己的地址，之后数据面全部发给攻击者（连接劫持）。只接受来自
+///          targets 的检查，等价于 RFC 8445 7.2.5.2.1 的候选对约束。
+bool ContainsEndpoint(const std::vector<Endpoint>& targets, const Endpoint& endpoint) {
+    return std::find(targets.begin(), targets.end(), endpoint) != targets.end();
+}
+
 /**
  * @brief 待匹配的 STUN 检查事务 ID（固定容量环形表）。
  * @details 旧实现是 `std::vector<std::array<...>>`：打洞期间每轮每个 target 都
@@ -874,6 +883,11 @@ private:
             return;
         }
         if (message->klass() == StunClass::kRequest) {
+            // 连接后只回应已确认 peer 的检查；任意源都能触发回包会变成
+            // UDP 反射/探测点。
+            if (!SourceMatchesPeer(source)) {
+                return;
+            }
             // 连接后收到对端重传的检查包：回一个 Success，避免对端超时重试。
             std::array<std::uint8_t, 128> wire{};
             std::array<std::uint8_t, kStunTransactionIdSize> transaction_id{};
@@ -981,6 +995,11 @@ private:
                 continue;
             }
             if (message->klass() == StunClass::kRequest) {
+                // 只接受已交换候选的检查：否则任意第三方一个 Request 就能把
+                // peer 锁定到自己（连接劫持）。
+                if (!ContainsEndpoint(targets, source)) {
+                    continue;
+                }
                 std::array<std::uint8_t, 128> wire{};
                 std::array<std::uint8_t, kStunTransactionIdSize> transaction_id{};
                 std::memcpy(transaction_id.data(), message->transaction_id(),
@@ -1060,6 +1079,10 @@ private:
                 continue;
             }
             if (message->klass() == StunClass::kRequest) {
+                // 同 TryDirect：中继路径也必须校验源地址属于候选集合。
+                if (!ContainsEndpoint(targets, source)) {
+                    continue;
+                }
                 std::array<std::uint8_t, 128> wire{};
                 std::array<std::uint8_t, kStunTransactionIdSize> transaction_id{};
                 std::memcpy(transaction_id.data(), message->transaction_id(),
