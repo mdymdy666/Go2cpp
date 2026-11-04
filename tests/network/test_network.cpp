@@ -5,6 +5,7 @@
 #include "go2cpp/network/socket.hpp"
 #include "go2cpp/network/websocket.hpp"
 #include "go2cpp/fiber.hpp"
+#include "go2cpp/go.hpp"
 #include "test_support.hpp"
 
 #include <sys/socket.h>
@@ -1131,6 +1132,113 @@ void run_network_tests() {
     GO2CPP_REQUIRE_EVENTUALLY(pending_ok.load(std::memory_order_acquire), std::chrono::seconds(3));
     GO2CPP_JOIN_WITH_WATCHDOG(pending_server, std::chrono::seconds(3));
     pending_client_socket->close();
+    // H-01：裸 Scheduler（不挂 IOManager）中的阻塞 socket 不能独占 P。
+    // 三条断言：① 100ms 超时的 recv 不会无限挂死；② 长阻塞期间 sysmon 能
+    // 看见（long_syscall_count > 0）并补出替代 M；③ 阻塞未结束时提交的
+    // 第二个 Fiber 仍能运行，证明确实发生了 M 的补位而不是 P 被独占。
+    go2cpp_tests::announce("bare scheduler blocking socket recv");
+    const auto bare_scheduler_config = [] {
+        go2cpp::SchedulerConfig config;
+        config.processor_count = 1;
+        config.min_workers = 1;
+        config.max_workers = 2;  // 只允许一台补位 M，避免普通多 worker 掩盖问题
+        config.allow_worker_oversubscription = true;
+        config.enable_sysmon = true;
+        config.sysmon_interval = std::chrono::milliseconds(10);
+        config.long_syscall_threshold = std::chrono::milliseconds(50);
+        return config;
+    };
+    {
+        int pair[2]{};
+        GO2CPP_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+        auto reader = go2cpp::net::Socket::FromFd(pair[0], AF_UNIX, SOCK_STREAM);
+        auto peer = go2cpp::net::Socket::FromFd(pair[1], AF_UNIX, SOCK_STREAM);
+        GO2CPP_REQUIRE(reader && peer);
+        go2cpp::Scheduler scheduler(bare_scheduler_config());
+        scheduler.start();
+        std::atomic<bool> done{false};
+        std::atomic<int> error{0};
+        std::atomic<long long> elapsed_ms{0};
+        auto task = go2cpp::go(scheduler, [&] {
+            const auto began = std::chrono::steady_clock::now();
+            char byte{};
+            const auto result = reader->recv(&byte, 1, 0,
+                                             std::chrono::milliseconds(100));
+            elapsed_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - began).count(),
+                             std::memory_order_release);
+            error.store(result.error, std::memory_order_release);
+            done.store(true, std::memory_order_release);
+        });
+        GO2CPP_REQUIRE(task != nullptr);
+        GO2CPP_REQUIRE_EVENTUALLY(done.load(std::memory_order_acquire),
+                                  std::chrono::seconds(2));
+        GO2CPP_CHECK(error.load(std::memory_order_acquire) == ETIMEDOUT);
+        GO2CPP_CHECK(elapsed_ms.load(std::memory_order_acquire) >= 90);
+        GO2CPP_CHECK(elapsed_ms.load(std::memory_order_acquire) < 1000);
+        (void)task->wait_for(std::chrono::seconds(1));
+        reader->close();
+        peer->close();
+        scheduler.shutdown();
+    }
+    {
+        int pair[2]{};
+        GO2CPP_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+        auto reader = go2cpp::net::Socket::FromFd(pair[0], AF_UNIX, SOCK_STREAM);
+        auto peer = go2cpp::net::Socket::FromFd(pair[1], AF_UNIX, SOCK_STREAM);
+        GO2CPP_REQUIRE(reader && peer);
+        go2cpp::Scheduler scheduler(bare_scheduler_config());
+        scheduler.start();
+        const std::size_t baseline_workers = scheduler.worker_count();
+        std::atomic<bool> blocked_started{false};
+        std::atomic<int> blocked_error{0};
+        auto blocked = go2cpp::go(scheduler, [&] {
+            blocked_started.store(true, std::memory_order_release);
+            char byte{};
+            const auto result = reader->recv(&byte, 1, 0,
+                                             std::chrono::milliseconds(900));
+            blocked_error.store(result.error, std::memory_order_release);
+        });
+        GO2CPP_REQUIRE(blocked != nullptr);
+        GO2CPP_REQUIRE_EVENTUALLY(blocked_started.load(std::memory_order_acquire),
+                                  std::chrono::seconds(1));
+
+        bool sysmon_detached = false;
+        bool worker_grew = false;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(400);
+        do {
+            for (const auto& machine : scheduler.machines()) {
+                if (machine.long_syscall_count > 0) sysmon_detached = true;
+            }
+            if (scheduler.worker_count() > baseline_workers) worker_grew = true;
+            if (sysmon_detached && worker_grew) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (std::chrono::steady_clock::now() < deadline);
+        GO2CPP_CHECK(sysmon_detached);
+        GO2CPP_CHECK(worker_grew);
+
+        std::atomic<bool> other_done{false};
+        std::atomic<long long> other_elapsed_ms{-1};
+        const auto other_began = std::chrono::steady_clock::now();
+        auto other = go2cpp::go(scheduler, [&] {
+            other_elapsed_ms.store(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - other_began).count(),
+                std::memory_order_release);
+            other_done.store(true, std::memory_order_release);
+        });
+        GO2CPP_REQUIRE(other != nullptr);
+        GO2CPP_REQUIRE_EVENTUALLY(other_done.load(std::memory_order_acquire),
+                                  std::chrono::milliseconds(700));
+        // 第二个 Fiber 必须在 900ms 的 recv 结束前完成，否则说明 P 被独占。
+        GO2CPP_CHECK(other_elapsed_ms.load(std::memory_order_acquire) < 850);
+        (void)blocked->wait_for(std::chrono::seconds(2));
+        GO2CPP_CHECK(blocked_error.load(std::memory_order_acquire) == ETIMEDOUT);
+        reader->close();
+        peer->close();
+        scheduler.shutdown();
+    }
 }
 
 // ---------------------------------------------------------------------------

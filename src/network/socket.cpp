@@ -9,6 +9,7 @@
 #include "go2cpp/network/hook.hpp"
 #include "go2cpp/network/socket_debug.hpp"
 
+#include "go2cpp/fiber.hpp"
 #include "go2cpp/log.hpp"
 
 #include <arpa/inet.h>
@@ -25,6 +26,7 @@
 #include <algorithm>
 #include <cstring>
 #include <climits>
+#include <optional>
 #include <vector>
 
 namespace go2cpp::net {
@@ -718,8 +720,10 @@ bool Socket::shutdown(int how) noexcept {
  * step4. **有 IOManager**（受管 Fiber）：以 **100ms 为片上界**循环调用
  *        `manager->wait_for()`；每片结束后重查取消/关闭/总超时。分片是为了
  *        让 `close()` 能在有限时间内打断一个无限期等待；
- * step5. **普通线程**（无 IOManager，拿不到取消通知）：同样以 100ms 为片上界
- *        调 `poll_wait()`，每片之间检查取消与关闭。
+ * step5. **普通线程 / 裸 Scheduler Fiber**（无 IOManager，拿不到 park 与
+ *        取消通知）：同样以 100ms 为片上界调 `poll_wait()`，每片之间检查
+ *        取消与关闭。整个循环包在 `BlockingRegion` 内——裸 Fiber 的 poll
+ *        会独占 M，必须让 sysmon 看得见，才能在长阻塞时解绑 P 并补 M。
  *
  * ## 并发/失败语义
  *
@@ -792,10 +796,24 @@ int Socket::wait_ready(int fd, io::IOEvent event, Duration timeout,
             }
         }
     }
-    // step5: 普通线程——同样按 100ms 分片 poll，但拿不到取消通知，
-    // 只能靠 is_closing() 退出。每片仍由内核阻塞，不会忙等待。
-    // 普通线程没有 IOManager 的取消通知，按小片轮询检查关闭状态，避免
-    // close() 永久等待一个无限期 poll。每片仍然由内核阻塞，不会忙等待。
+    // step5: 普通线程 / 裸 Scheduler Fiber——同样按 100ms 分片 poll，但
+    // 拿不到取消通知，只能靠 is_closing() 退出。每片仍由内核阻塞，不会
+    // 忙等待。
+    // H-01：裸 Scheduler（全局 go() 未挂 IOManager）里的 Fiber 没有 park
+    // 点，poll 会独占当前 OS 线程；没有 BlockingRegion 时 sysmon 完全看不到
+    // 这段阻塞，既不会解绑 P 也不会补 M，一个 recv 就能把整个 P 卡死。
+    // 这里显式声明阻塞区：enter 把 M 置 kBlocking、blocking_workers +1，
+    // sysmon 超过 long_syscall_threshold（默认 50ms）即可解绑 P 并申请替代
+    // M，排队的 G 才能继续运行。普通 OS 线程（current_task() 为空）上构造
+    // region 是 no-op，不引入额外语义。
+    // Duration::max() 的「无限」语义不会原样交给 poll(-1)：循环固定按
+    // 100ms 分片，既保证 close() 能在有限时间内打断，又长于 sysmon 的默认
+    // 阈值，因此即使默认无限等待也始终可被观测。region 覆盖整个循环且不跨
+    // Fiber park/yield，满足 BlockingRegion 的使用约束。
+    std::optional<go2cpp::BlockingRegion> blocking_region;
+    if (go2cpp::Scheduler::current_task() != nullptr) {
+        blocking_region.emplace();
+    }
     const auto started = std::chrono::steady_clock::now();
     for (;;) {
         Duration slice = timeout;
