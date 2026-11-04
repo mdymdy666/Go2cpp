@@ -2,7 +2,7 @@
 
 > **一句话定位**：本目录只放 **http 的异常处理示例**——客户端超时、服务端被慢
 > 客户端拖住、请求体没读满。每个文件都能单独编译、真实运行，输出带预期值。
-> 模块正式文档见 [`../../network/README.md`](../../network/README.md)；
+> 模块 API 见 [`include/go2cpp/network/http.hpp`](../../../include/go2cpp/network/http.hpp)；
 > 正常路径示例见 [`../../network/http_demo.cpp`](../../network/http_demo.cpp)。
 
 ## 示例一览
