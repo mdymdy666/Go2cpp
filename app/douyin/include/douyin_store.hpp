@@ -296,6 +296,19 @@ class Store {
                     std::string* next_cursor, std::string* error);
 
     /**
+     * @brief 取全部视频（按 id 升序），供话题聚合在内存里过滤。
+     *
+     * @param out [out] 追加到末尾（不清空调用方已有内容）；失败时内容未定义。
+     * @param error [out] 失败时写错误文本。
+     * @return 成功返回 true（可能是空库）。
+     *
+     * ## 定位
+     * 话题聚合的唯一全量入口：demo 视频量级是几十条，全表扫描比维护
+     * `video_tags` 表更简单。错了会怎样：话题页漏视频/重复计数。
+     */
+    bool ListAllVideos(std::vector<StoredVideo>* out, std::string* error);
+
+    /**
      * @brief 删除视频，仅作者本人可删。
      * @param id 视频 id。
      * @param user_id 请求者 id（同时作为 SQL 条件）。
@@ -349,6 +362,45 @@ class Store {
 
     /// @brief 是否已点赞；数据库错误时返回 false（error 非空）。
     bool HasLiked(std::int64_t video_id, std::int64_t user_id, std::string* error);
+
+    // ---- C8 收藏：favorites（只加不改既有） ----
+
+    /**
+     * @brief 切换收藏：已收藏则取消，未收藏则写入（表上有 `UNIQUE(user_id,video_id)`）。
+     * @param video_id [in] 视频 id；调用方**必须**先确认视频存在。
+     * @param user_id [in] 收藏者 id（登录用户）。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return
+     * - 1：本次新增收藏（调用方回 `favorited:true`）；
+     * - 0：本次取消收藏（调用方回 `favorited:false`）；
+     * - -1：数据库错误——调用方**必须**回 500，不要翻转前端状态。
+     *
+     * ## 定位
+     * 收藏是「单用户 × 单视频」的二元状态，这里是唯一提交点；错了会怎样：
+     * 重复行让收藏列表出现同一条视频两次，或前端按钮与库里状态相反。
+     */
+    int ToggleFavorite(std::int64_t video_id, std::int64_t user_id,
+                       std::string* error);
+
+    /// @brief 是否已收藏；数据库错误时返回 false（error 非空）。
+    bool HasFavorited(std::int64_t video_id, std::int64_t user_id,
+                      std::string* error);
+
+    /**
+     * @brief 当前用户的收藏列表，按收藏时间倒序（同秒按视频 id 倒序）。
+     * @param user_id [in] 收藏者 id。
+     * @param limit [in] 最多返回条数；<=0 返回空列表（不当成错误）。
+     * @param out [out] 追加到末尾（不清空调用方已有内容）；失败时内容未定义。
+     * @param error [out] 失败时写错误文本；成功时保持原值。
+     * @return 成功返回 true（可能是空列表）。
+     *
+     * ## 定位
+     * 「我的收藏」唯一数据源；用 INNER JOIN videos 而不是 LEFT JOIN：
+     * 视频被作者删除后收藏记录还在，LEFT JOIN 会返回空 url 的卡片（前端
+     * 只渲染出黑块），不如直接不出现。
+     */
+    bool ListFavorites(std::int64_t user_id, std::int64_t limit,
+                       std::vector<StoredVideo>* out, std::string* error);
 
     /**
      * @brief 发评论（`parent_id` 非 0 表示二级回复）。

@@ -53,17 +53,18 @@ echo "[build] Go2Cpp 库目录: $BUILD_LIB"
 
 PROTO="$ROOT/src/douyin_proto.cpp"
 STORE="$ROOT/src/douyin_store.cpp"
+TAG="$ROOT/src/douyin_tag.cpp"
 AUTH="$ROOT/src/douyin_auth.cpp"
 
 EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
-build_one user_service        "$ROOT/src/user_service.cpp"        "$STORE" "$AUTH" "$PROTO"
-build_one video_service       "$ROOT/src/video_service.cpp"       "$STORE" "$AUTH" "$PROTO"
-build_one feed_service        "$ROOT/src/feed_service.cpp"        "$STORE" "$AUTH" "$PROTO"
+build_one user_service        "$ROOT/src/user_service.cpp"        "$STORE" "$AUTH" "$PROTO" "$TAG"
+build_one video_service       "$ROOT/src/video_service.cpp"       "$STORE" "$AUTH" "$PROTO" "$TAG"
+build_one feed_service        "$ROOT/src/feed_service.cpp"        "$STORE" "$AUTH" "$PROTO" "$TAG"
 EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
-build_one interaction_service "$ROOT/src/interaction_service.cpp" "$STORE" "$AUTH" "$PROTO"
-build_one live_service        "$ROOT/src/live_service.cpp"        "$STORE" "$AUTH" "$PROTO"
+build_one interaction_service "$ROOT/src/interaction_service.cpp" "$STORE" "$AUTH" "$PROTO" "$TAG"
+build_one live_service        "$ROOT/src/live_service.cpp"        "$STORE" "$AUTH" "$PROTO" "$TAG"
 EXTRA_LDLIBS=(-lgo2cpp_storage -lgo2cpp_encoding -lsqlite3)
-build_one search_service      "$ROOT/src/search_service.cpp"      "$STORE" "$PROTO"
+build_one search_service      "$ROOT/src/search_service.cpp"      "$STORE" "$PROTO" "$TAG"
 EXTRA_LDLIBS=(-lgo2cpp_encoding)
 # C8 网关：通用 Gateway 组件在 src/app/gateway.cpp，尚未打进 libgo2cpp_app.a，
 # 这里把它作为独立编译单元一起编；AUTH 提供 douyin::VerifyToken 做 Bearer 校验。

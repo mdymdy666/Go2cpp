@@ -18,6 +18,11 @@
  *          - 底部信息与右侧操作栏均绝对定位叠加在视频上，`z-index` 更高，
  *            由半透明渐变遮罩保证可读性；
  *          - `IntersectionObserver`（阈值 0.6）只播放当前屏视频、暂停其它；
+ *          - 底部进度条随 `timeupdate` 更新，pointer 拖动 seek 到 `pct * duration`；
+ *          - 双击视频任意处点赞（`POST api/like`）+ 心形 keyframes 动画，
+ *            已点赞只播动画不重复请求；单击挂起 240ms 以区分双击；
+ *          - `preload="none"` + 同名 `videos/<name>.jpg` 封面：首屏只拉缩略图，
+ *            视频字节等真正播放/拖动时才加载；
  *          - 评论图标打开右侧抽屉，`GET api/comment/<id>?limit=50` 拉列表，
  *            登录后 `POST api/comment` 发送并插入列表头、同步计数；
  *          - 作者名/头像打开用户主页，`GET api/user/<id>` + `api/feed?limit=100`
@@ -146,6 +151,67 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     cursor: pointer;
   }
   .slide .main-video.cover { object-fit: cover; }
+
+  /* ---------- 播放进度条（底部细条 + 可拖动 seek） ---------- */
+  /* 命中区高 20px、可见轨道仅 3px：手指/鼠标都好按，视觉上仍是细条。
+     hover / 拖动 / 键盘聚焦时才显示圆形拖柄与时间，避免遮挡视频。 */
+  .progress {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 6;
+    height: 20px; display: flex; align-items: flex-end;
+    cursor: pointer; touch-action: none; outline: none;
+  }
+  .progress .progress-rail {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    height: 3px; background: rgba(255, 255, 255, .24);
+    transition: height .15s ease;
+  }
+  .progress .progress-fill {
+    width: 0%; height: 100%;
+    background: linear-gradient(90deg, var(--cyan), var(--pink));
+  }
+  .progress .progress-thumb {
+    position: absolute; bottom: -4px; left: 0;
+    width: 11px; height: 11px; border-radius: 50%;
+    background: #fff; box-shadow: 0 1px 6px rgba(0, 0, 0, .6);
+    transform: translateX(-50%); opacity: 0;
+    transition: opacity .15s ease, transform .15s ease;
+    pointer-events: none;
+  }
+  .progress:hover .progress-rail, .progress.dragging .progress-rail,
+  .progress:focus-visible .progress-rail { height: 5px; }
+  .progress:hover .progress-thumb, .progress.dragging .progress-thumb,
+  .progress:focus-visible .progress-thumb { opacity: 1; }
+  .progress.dragging .progress-thumb { transform: translateX(-50%) scale(1.25); }
+  .progress .progress-time {
+    position: absolute; right: 12px; bottom: 12px;
+    padding: 2px 7px; border-radius: 6px;
+    font-size: 11px; font-variant-numeric: tabular-nums; color: #fff;
+    background: rgba(0, 0, 0, .62); white-space: nowrap;
+    opacity: 0; pointer-events: none; transition: opacity .15s ease;
+  }
+  .progress:hover .progress-time, .progress.dragging .progress-time,
+  .progress:focus-visible .progress-time { opacity: 1; }
+
+  /* ---------- 双击点赞的心形动画 ---------- */
+  .heart-burst {
+    position: absolute; z-index: 7; left: 50%; top: 50%;
+    font-size: 92px; line-height: 1; color: var(--pink);
+    transform: translate(-50%, -50%) scale(.3);
+    opacity: 0; pointer-events: none; user-select: none;
+    filter: drop-shadow(0 8px 26px rgba(254, 44, 85, .55));
+    animation: heart-pop .82s cubic-bezier(.2, .7, .3, 1) forwards;
+  }
+  @keyframes heart-pop {
+    0%   { opacity: 0; transform: translate(-50%, -50%) scale(.25) rotate(-14deg); }
+    18%  { opacity: 1; transform: translate(-50%, -50%) scale(1.18) rotate(6deg); }
+    38%  { transform: translate(-50%, -50%) scale(.94) rotate(-2deg); }
+    68%  { opacity: 1; transform: translate(-50%, -50%) scale(1) rotate(0deg); }
+    100% { opacity: 0; transform: translate(-50%, -74%) scale(1.32) rotate(0deg); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .heart-burst { animation-duration: .01ms; }
+  }
+
   /* 半透明渐变遮罩：底部保证信息区可读，右侧保证操作栏可读；z-index 高于视频 */
   .slide .shade {
     position: absolute; inset: 0; z-index: 2; pointer-events: none;
@@ -232,6 +298,52 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   .rail .like-btn.liked { color: var(--pink); }
   .rail .like-btn.liked .ico { color: var(--pink); }
   .rail .num { font-variant-numeric: tabular-nums; }
+  .rail .fav-btn.faved { color: #ffd479; }
+  .rail .fav-btn.faved .ico { color: #ffd479; }
+
+  /* ---------- 分享面板（底部弹出） ---------- */
+  .share-mask {
+    position: fixed; inset: 0; z-index: 80;
+    background: rgba(0, 0, 0, .55);
+  }
+  .share-sheet {
+    position: fixed; left: 50%; bottom: 0; z-index: 81;
+    width: min(520px, 100%); transform: translateX(-50%);
+    padding: 16px 18px calc(16px + env(safe-area-inset-bottom));
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 18px 18px 0 0;
+    box-shadow: 0 -20px 60px -24px rgba(0, 0, 0, .95);
+  }
+  .ss-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .ss-head b {
+    flex: 1; font-size: 14px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ss-close {
+    width: 30px; height: 30px; border-radius: 50%;
+    background: #23232e; color: var(--text); font-size: 14px; line-height: 1;
+  }
+  .ss-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .ss-item {
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    padding: 12px 4px; color: var(--text); font-size: 12px;
+    background: #1b1b25; border: 1px solid var(--line); border-radius: 12px;
+  }
+  .ss-item:hover { border-color: rgba(255, 255, 255, .24); }
+  .ss-ico { font-size: 22px; line-height: 1; }
+  .ss-qr { margin-top: 14px; text-align: center; }
+  .ss-qr p { margin: 8px 0 0; font-size: 11.5px; color: var(--muted); }
+  .qr-box {
+    display: grid; width: 132px; height: 132px; margin: 0 auto;
+    grid-template-columns: repeat(21, 1fr); grid-template-rows: repeat(21, 1fr);
+    background: #fff; padding: 5px; border-radius: 6px;
+  }
+  .qr-box i { display: block; }
+  .qr-box i.on { background: #0a0a10; }
+  .ss-cancel {
+    width: 100%; margin-top: 14px; padding: 11px; font-size: 13.5px;
+    color: var(--text); background: #23232e; border-radius: 12px;
+  }
 
   /* ---------- toast ---------- */
   .toast {
@@ -303,6 +415,69 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   }
   .cp-form button:disabled { opacity: .5; cursor: default; }
 
+  /* ---------- 顶部搜索框与搜索结果页（用户 / 视频 / 话题） ---------- */
+  .nav-search { display: flex; align-items: center; gap: 6px; }
+  .nav-search input {
+    width: 200px; padding: 7px 11px;
+    background: rgba(20, 20, 28, .82); color: var(--text);
+    border: 1px solid var(--line); border-radius: 9px;
+    font-size: 13px; outline: none;
+  }
+  .nav-search input:focus {
+    border-color: rgba(254, 44, 85, .55);
+    box-shadow: 0 0 0 3px rgba(254, 44, 85, .14);
+  }
+  #searchView { z-index: 68; }
+  #searchView .profile-top { gap: 10px; }
+  #searchView .profile-top input {
+    flex: 1; min-width: 0; padding: 9px 12px;
+    background: #1e1e29; color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px;
+    font-size: 14px; outline: none;
+  }
+  #searchView .profile-top input:focus { border-color: rgba(37, 244, 238, .5); }
+  .search-tabs {
+    display: flex; gap: 8px; padding: 12px 18px 0;
+    max-width: 820px; margin: 0 auto;
+  }
+  .search-tab {
+    padding: 7px 16px; font-size: 13.5px; color: var(--muted);
+    background: transparent; border: 1px solid var(--line);
+    border-radius: 999px;
+  }
+  .search-tab.active {
+    color: #fff; border-color: transparent; font-weight: 700;
+    background: linear-gradient(92deg, var(--pink), #ff5c7a);
+  }
+  .search-row {
+    display: flex; align-items: center; gap: 12px; width: 100%;
+    padding: 12px 0; text-align: left; color: var(--text);
+    background: transparent; border: 0; border-bottom: 1px solid var(--line);
+  }
+  .search-row:hover { background: rgba(255, 255, 255, .03); }
+  .search-avatar {
+    flex: 0 0 44px; width: 44px; height: 44px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; color: #fff;
+    background: linear-gradient(135deg, #2f2f3d, #4a4a5e);
+  }
+  .search-avatar.tag { background: linear-gradient(135deg, var(--cyan), var(--pink)); }
+  .search-cover {
+    flex: 0 0 64px; width: 64px; height: 44px; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    background: #232330; color: var(--muted); font-size: 15px;
+  }
+  .search-main { min-width: 0; flex: 1; display: block; }
+  .search-main b {
+    display: block; font-size: 14px; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .search-main span { display: block; font-size: 12px; color: var(--muted); }
+  .search-empty {
+    padding: 40px 0; text-align: center;
+    color: var(--muted); font-size: 13.5px;
+  }
+
   /* ---------- 用户主页 ---------- */
   .profile-view {
     position: fixed; inset: 0; z-index: 70;
@@ -360,6 +535,24 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .profile-note { margin-top: 16px; color: var(--muted); font-size: 13.5px; }
+
+  /* ---------- 话题页 ---------- */
+  .topic-link { color: #7fd6ff; text-decoration: none; }
+  .topic-link:hover { text-decoration: underline; }
+  .tag-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
+  .tag-chip {
+    display: inline-block; padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; color: #fff; text-decoration: none;
+    background: rgba(255, 255, 255, .14); border: 1px solid rgba(255, 255, 255, .2);
+  }
+  .tag-chip:hover { background: rgba(255, 255, 255, .28); }
+  .tag-hero {
+    padding: 22px; margin-bottom: 18px; border-radius: 18px;
+    background: linear-gradient(120deg, rgba(254, 44, 85, .18), rgba(37, 244, 238, .14));
+    border: 1px solid var(--line);
+  }
+  .tag-hero h3 { margin: 0 0 8px; font-size: 26px; font-weight: 800; }
+  .tag-hero .tag-meta { font-size: 13px; color: var(--muted); }
 
   /* ---------- 视频工具行：画幅 + 声音 ---------- */
   .tools { margin-top: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -465,6 +658,11 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 <body>
 <header class="topbar" id="topbar">
   <div class="brand">Go2Cpp 抖音<small>FEED · PLAY · LIKE · COMMENT</small></div>
+  <div class="nav-search">
+    <input id="navSearch" type="search" placeholder="搜索用户 / 视频 / 话题"
+           autocomplete="off" spellcheck="false">
+    <button class="btn-primary" id="navSearchBtn" type="button">搜索</button>
+  </div>
   <div class="auth">
     <span class="who" id="who" title="点击进入我的主页"><span class="dot"></span><b id="whoName"></b></span>
     <input class="login-only" id="email" type="email" value="admin@demo.local"
@@ -479,6 +677,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     <input type="file" id="uploadInput" accept="video/mp4" hidden>
     <button class="btn-ghost upload-btn" id="uploadBtn" type="button">上传</button>
     <button class="btn-ghost mine-btn" id="mineBtn" type="button" style="display:none">我的主页</button>
+    <button class="btn-ghost fav-btn-top" id="favBtn" type="button" style="display:none">⭐ 我的收藏</button>
     <button class="btn-ghost" id="logoutBtn" type="button" style="display:none">退出</button>
   </div>
 </header>
@@ -488,6 +687,25 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 <main class="feed" id="feed" aria-label="推荐视频流"></main>
 
 <div class="backdrop" id="backdrop"></div>
+
+<div class="share-mask" id="shareMask" hidden></div>
+<div class="share-sheet" id="shareSheet" hidden role="dialog" aria-modal="true" aria-label="分享">
+  <div class="ss-head">
+    <b id="ssTitle">分享</b>
+    <button class="ss-close" id="ssClose" type="button" aria-label="关闭分享">✕</button>
+  </div>
+  <div class="ss-grid" id="ssGrid">
+    <button class="ss-item" data-act="copy" type="button"><span class="ss-ico">🔗</span><span>复制链接</span></button>
+    <button class="ss-item" data-act="qr" type="button"><span class="ss-ico">📱</span><span>二维码</span></button>
+    <button class="ss-item" data-act="wx" type="button"><span class="ss-ico">💬</span><span>微信好友</span></button>
+    <button class="ss-item" data-act="wxline" type="button"><span class="ss-ico">🧭</span><span>朋友圈</span></button>
+  </div>
+  <div class="ss-qr" id="ssQr" hidden>
+    <div class="qr-box" id="qrBox" aria-hidden="true"></div>
+    <p>扫码打开这条视频（演示占位，未接入真正二维码编码）</p>
+  </div>
+  <button class="ss-cancel" id="ssCancel" type="button">关闭</button>
+</div>
 <aside class="comment-panel" id="comment-panel" aria-label="评论面板" aria-hidden="true">
   <div class="cp-head">
     <div class="cp-titles">
@@ -510,6 +728,37 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   </div>
   <div class="profile-body" id="profileBody"></div>
 </section>
+
+<section class="profile-view" id="favView" hidden aria-label="我的收藏">
+  <div class="profile-top">
+    <button class="back" id="favBack" type="button">← 返回</button>
+    <h2>⭐ 我的收藏</h2>
+  </div>
+  <div class="profile-body" id="favBody"></div>
+</section>
+
+<section class="profile-view" id="tagView" hidden aria-label="话题页">
+  <div class="profile-top">
+    <button class="back" id="tagBack" type="button">← 返回</button>
+    <h2 id="tagHead">话题</h2>
+  </div>
+  <div class="profile-body" id="tagBody"></div>
+</section>
+<section class="profile-view" id="searchView" hidden aria-label="搜索结果">
+  <div class="profile-top">
+    <button class="back" id="searchBack" type="button">← 返回</button>
+    <input id="searchInput" type="search" placeholder="搜索用户 / 视频 / 话题"
+           autocomplete="off" spellcheck="false">
+    <button class="btn-primary" id="searchSubmit" type="button">搜索</button>
+  </div>
+  <div class="search-tabs" id="searchTabs">
+    <button class="search-tab active" data-tab="user" type="button">用户</button>
+    <button class="search-tab" data-tab="video" type="button">视频</button>
+    <button class="search-tab" data-tab="tag" type="button">话题</button>
+  </div>
+  <div class="profile-body" id="searchBody"></div>
+</section>
+
 
 <script>
 (function () {
@@ -537,6 +786,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     token: localStorage.getItem(TOKEN_KEY) || '',
     user: null,
     likes: {},
+    favs: {},
     items: [],
     observer: null,
     activeVideo: null,
@@ -579,6 +829,24 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   var cpSend = document.getElementById('cpSend');
   var profileEl = document.getElementById('profileView');
   var profileBody = document.getElementById('profileBody');
+  var tagEl = document.getElementById('tagView');
+  var searchEl = document.getElementById('searchView');
+  var searchBody = document.getElementById('searchBody');
+  var searchInput = document.getElementById('searchInput');
+  var navSearch = document.getElementById('navSearch');
+  var searchTabs = document.getElementById('searchTabs');
+  var searchState = { q: '', tab: 'user', data: null };
+
+  var tagBody = document.getElementById('tagBody');
+  var tagHead = document.getElementById('tagHead');
+  var favViewEl = document.getElementById('favView');
+  var favBody = document.getElementById('favBody');
+  var shareMask = document.getElementById('shareMask');
+  var shareSheet = document.getElementById('shareSheet');
+  var ssTitle = document.getElementById('ssTitle');
+  var ssQr = document.getElementById('ssQr');
+  var qrBox = document.getElementById('qrBox');
+  var ssGrid = document.getElementById('ssGrid');
   var uploadBtn = document.getElementById('uploadBtn');
   var uploadInput = document.getElementById('uploadInput');
 
@@ -667,6 +935,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     cpInput.placeholder = isIn ? '说点什么…' : '登录后参与评论';
     var mineBtn = document.getElementById('mineBtn');
     if (mineBtn) mineBtn.style.display = isIn ? '' : 'none';
+    var favBtn = document.getElementById('favBtn');
+    if (favBtn) favBtn.style.display = isIn ? '' : 'none';
+    loadFavorites();
   }
 
   function clearAuth() {
@@ -734,24 +1005,66 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     try { localStorage.setItem(LIKES_KEY, JSON.stringify(state.likes)); } catch (e) {}
   }
 
-  function toggleLike(slide) {
-    if (!state.token) { toast('请先在右上角登录，再点赞', 'err'); return; }
+  /* 点赞/取消赞的唯一提交点：按钮与双击都走这里，busy 标记挡住并发重复请求。
+     silent=true 时由调用方负责提示（双击只播动画，不弹「点赞成功」）。 */
+  function setLike(slide, liked, silent) {
     var id = slide.dataset.id;
-    var liked = !!state.likes[id];
     var btn = slide.querySelector('.like-btn');
-    if (btn.dataset.busy === '1') return;
-    btn.dataset.busy = '1';
+    if (btn && btn.dataset.busy === '1') return;
+    if (btn) btn.dataset.busy = '1';
     api('api/like', {
-      method: liked ? 'DELETE' : 'POST',
+      method: liked ? 'POST' : 'DELETE',
       body: { video_id: Number(id) }
     }).then(function (data) {
-      paintLike(slide, !liked, data.like_count);
+      paintLike(slide, liked, data.like_count);
       var stat = slide.querySelector('.stat-like');
       if (stat) stat.textContent = fmt(data.like_count);
-      toast(liked ? '已取消点赞' : '点赞成功', 'ok');
+      if (!silent) toast(liked ? '点赞成功' : '已取消点赞', 'ok');
     }).catch(function (err) {
       if (!handleAuthError(err)) toast('点赞失败：' + (err.message || '网络错误'), 'err');
-    }).then(function () { btn.dataset.busy = ''; });
+    }).then(function () { if (btn) btn.dataset.busy = ''; });
+  }
+
+  function toggleLike(slide) {
+    if (!state.token) { toast('请先在右上角登录，再点赞', 'err'); return; }
+    setLike(slide, !state.likes[slide.dataset.id]);
+  }
+
+  /* 双击点赞：先播心形动画（未登录也播，符合抖音观感），再决定是否发请求。
+     已点赞时只动画、不重复 POST，保证 /api/like 幂等语义不被滥用。 */
+  function doubleTapLike(slide, event) {
+    spawnHeart(slide, event);
+    var id = slide.dataset.id;
+    if (!state.token) { toast('请先在右上角登录，再点赞', 'err'); return; }
+    if (state.likes[id]) { toast('已点赞', 'ok'); return; }
+    setLike(slide, true, true);
+  }
+
+  /* 在双击坐标处放一颗心；同屏最多 6 颗，动画结束自动移除（防 DOM 泄漏）。 */
+  function spawnHeart(slide, event) {
+    var rect = slide.getBoundingClientRect();
+    var x = event && typeof event.clientX === 'number' ? event.clientX - rect.left : rect.width / 2;
+    var y = event && typeof event.clientY === 'number' ? event.clientY - rect.top : rect.height / 2;
+    var hearts = slide.querySelectorAll('.heart-burst');
+    if (hearts.length >= 6) slide.removeChild(hearts[0]);
+    var heart = document.createElement('span');
+    heart.className = 'heart-burst';
+    heart.textContent = '♥';
+    heart.style.left = x + 'px';
+    heart.style.top = y + 'px';
+    heart.setAttribute('aria-hidden', 'true');
+    slide.appendChild(heart);
+    setTimeout(function () {
+      if (heart.parentNode) heart.parentNode.removeChild(heart);
+    }, 900);
+  }
+
+  /* 点击落在操作栏/信息区/按钮/进度条上时不抢 slide 的单击、双击语义。 */
+  function isUiTarget(target) {
+    if (!target || !target.closest) return false;
+    return !!(target.closest('.rail') || target.closest('.meta') ||
+              target.closest('button') || target.closest('.author-link') ||
+              target.closest('.progress'));
   }
 
   /* ---------- 评论面板 ---------- */
@@ -1022,6 +1335,149 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     if (!silent) toast(state.muted ? '已静音' : '已开启声音');
   }
 
+  /* ---------- 收藏（⭐） ---------- */
+
+  /* 收藏状态以服务端为准：登录后拉一次全量 id 集合，按钮按集合渲染。
+     不在前端做 localStorage 缓存——换设备登录要能看到同一份收藏。 */
+  function isFaved(id) {
+    return !!state.favs[String(id)];
+  }
+
+  function paintFav(btn, id) {
+    if (!btn) return;
+    var on = isFaved(id);
+    var ico = btn.querySelector('.ico');
+    if (ico) ico.textContent = on ? '⭐' : '☆';
+    var label = btn.querySelector('.fav-label');
+    if (label) label.textContent = on ? '已收藏' : '收藏';
+    btn.classList.toggle('faved', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+
+  /* buildSlide 可能早于收藏集合返回，所以集合更新后统一重刷所有按钮 */
+  function syncFavButtons() {
+    feedEl.querySelectorAll('.fav-btn').forEach(function (btn) {
+      paintFav(btn, btn.dataset.id);
+    });
+  }
+
+  function loadFavorites() {
+    if (!state.token) {
+      state.favs = {};
+      syncFavButtons();
+      return;
+    }
+    api('api/video/favorites?limit=100').then(function (data) {
+      var next = {};
+      (data.items || []).forEach(function (item) {
+        var v = (item && item.video) || item || {};
+        if (v.id) next[String(v.id)] = true;
+      });
+      state.favs = next;
+      syncFavButtons();
+    }).catch(function (err) {
+      /* 拉收藏状态失败不打断浏览：按钮保持默认 ☆，用户点一下会重新提交 */
+      handleAuthError(err);
+    });
+  }
+
+  function toggleFavorite(id, btn) {
+    if (!state.token) { toast('登录后才能收藏', 'err'); return; }
+    var key = String(id);
+    if (btn) btn.disabled = true;
+    api('api/video/' + encodeURIComponent(key) + '/favorite', { method: 'POST' })
+      .then(function (data) {
+        if (data.favorited) state.favs[key] = true; else delete state.favs[key];
+        syncFavButtons();
+        toast(data.favorited ? '已加入我的收藏' : '已取消收藏', 'ok');
+        if (!favViewEl.hidden) renderFavorites();
+      })
+      .catch(function (err) {
+        if (!handleAuthError(err)) {
+          toast('收藏失败：' + (err.message || '网络错误'), 'err');
+        }
+      })
+      .then(function () { if (btn) btn.disabled = false; });
+  }
+
+  /* ---------- 「我的收藏」页 ---------- */
+
+  function renderFavorites() {
+    favBody.innerHTML = '';
+    var loading = document.createElement('div');
+    loading.className = 'notice';
+    loading.textContent = '加载收藏…';
+    favBody.appendChild(loading);
+    api('api/video/favorites?limit=100').then(function (data) {
+      var items = data.items || [];
+      var next = {};
+      items.forEach(function (item) {
+        var v = (item && item.video) || item || {};
+        if (v.id) next[String(v.id)] = true;
+      });
+      state.favs = next;
+      syncFavButtons();
+      favBody.innerHTML = '';
+      if (!items.length) {
+        var empty = document.createElement('div');
+        empty.className = 'notice';
+        empty.textContent = '还没有收藏。点视频右侧的 ☆ 收藏喜欢的视频。';
+        favBody.appendChild(empty);
+        return;
+      }
+      var note = document.createElement('div');
+      note.className = 'profile-note';
+      note.textContent = '共 ' + items.length + ' 条收藏 · 点击播放';
+      favBody.appendChild(note);
+      var grid = document.createElement('div');
+      grid.className = 'profile-grid';
+      items.forEach(function (item) {
+        var v = (item && item.video) || item || {};
+        var cardBtn = document.createElement('button');
+        cardBtn.type = 'button';
+        cardBtn.className = 'pv-card';
+        cardBtn.dataset.id = String(v.id || 0);
+        var pv = document.createElement('video');
+        pv.src = videoSrc(v);
+        pv.muted = true;
+        pv.playsInline = true;
+        pv.preload = 'metadata';
+        pv.setAttribute('muted', '');
+        pv.setAttribute('playsinline', '');
+        var pt = document.createElement('span');
+        pt.className = 'pv-title';
+        pt.textContent = v.title || ('视频 #' + (v.id || ''));
+        cardBtn.appendChild(pv);
+        cardBtn.appendChild(pt);
+        cardBtn.addEventListener('click', function () { playInFeed(item, v); });
+        grid.appendChild(cardBtn);
+      });
+      favBody.appendChild(grid);
+    }).catch(function (err) {
+      if (handleAuthError(err)) return;
+      favBody.innerHTML = '';
+      var box = document.createElement('div');
+      box.className = 'notice';
+      box.textContent = '收藏列表加载失败：' + (err.message || '网络错误');
+      favBody.appendChild(box);
+    });
+  }
+
+  function showFavorites() {
+    if (!state.user) { toast('请先登录', 'err'); return; }
+    closeComments();
+    pauseAllVideos();
+    profileEl.hidden = true;
+    favViewEl.hidden = false;
+    favViewEl.scrollTop = 0;
+    renderFavorites();
+  }
+
+  /* 只负责隐藏；播放由调用方（playInFeed / 返回按钮）决定，避免重复 play */
+  function hideFavorites() {
+    favViewEl.hidden = true;
+  }
+
   /* ---------- 分享链接 / 直达 ---------- */
 
   function videoLink(id) {
@@ -1052,6 +1508,44 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     } else {
       fallbackCopy(url, done);
     }
+  }
+
+  /* ---------- 分享面板（复链接 / 二维码占位 / 第三方占位） ---------- */
+
+  var shareVideoId = '';
+
+  function renderQr(seedText) {
+    var n = 21;
+    var seed = 0;
+    String(seedText).split('').forEach(function (ch) {
+      seed = (seed * 31 + ch.charCodeAt(0)) >>> 0;
+    });
+    var html = '';
+    for (var i = 0; i < n * n; i++) {
+      seed = (seed * 1103515245 + 12345) >>> 0;
+      var row = Math.floor(i / n);
+      var col = i % n;
+      /* 三个 7x7 定位角 + 伪随机点阵，只求「看起来像二维码」；不能真扫 */
+      var corner = (row < 7 && col < 7) || (row < 7 && col >= n - 7) ||
+                   (row >= n - 7 && col < 7);
+      var on = corner || (((seed >>> 16) & 1) === 1);
+      html += on ? '<i class="on"></i>' : '<i></i>';
+    }
+    qrBox.innerHTML = html;
+  }
+
+  function openShare(id, title) {
+    shareVideoId = String(id || '');
+    ssTitle.textContent = '分享「' + (title || ('视频 #' + shareVideoId)) + '」';
+    ssQr.hidden = true;
+    renderQr(shareVideoId);
+    shareMask.hidden = false;
+    shareSheet.hidden = false;
+  }
+
+  function closeShare() {
+    shareMask.hidden = true;
+    shareSheet.hidden = true;
   }
 
   /* 打开分享链接后滚到对应视频并播放；不在当前 feed 时提示。 */
@@ -1234,6 +1728,135 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     return BASE + 'videos/demo' + ((Number(v.id) % 5) + 1) + '.mp4';
   }
 
+  /* 封面地址：与视频同名的 .jpg（构建时用 ffmpeg 抽首帧）。
+     没有对应封面时返回空串，video 退回黑底，不影响播放。 */
+  function posterSrc(v) {
+    var src = String(videoSrc(v) || '');
+    var m = /^(.+\/videos\/[A-Za-z0-9_.-]+)\.(mp4|webm|m4v)$/i.exec(src);
+    if (!m) return '';
+    return m[1] + '.jpg';
+  }
+
+  function fmtClock(seconds) {
+    if (!isFinite(seconds) || seconds < 0) seconds = 0;
+    var total = Math.floor(seconds);
+    var m = Math.floor(total / 60);
+    var s = total % 60;
+    return m + ':' + (s < 10 ? '0' + s : s);
+  }
+
+  /* 进度条：timeupdate 驱动填充；pointer 拖动 seek 到 pct*duration。
+     preload=none 时首次拖动会临时升级到 metadata，拿到 duration 后补一次 seek。 */
+  function buildProgress(slide, video) {
+    var bar = document.createElement('div');
+    bar.className = 'progress';
+    bar.tabIndex = 0;
+    bar.setAttribute('role', 'slider');
+    bar.setAttribute('aria-label', '播放进度');
+    bar.setAttribute('aria-valuemin', '0');
+    bar.setAttribute('aria-valuemax', '100');
+    bar.setAttribute('aria-valuenow', '0');
+    bar.innerHTML = '<div class="progress-rail"><div class="progress-fill"></div></div>' +
+                    '<div class="progress-thumb"></div>' +
+                    '<span class="progress-time">0:00 / 0:00</span>';
+    var fill = bar.querySelector('.progress-fill');
+    var thumb = bar.querySelector('.progress-thumb');
+    var time = bar.querySelector('.progress-time');
+    var dragging = false;
+    var pendingRatio = null;
+
+    function duration() {
+      var d = video.duration;
+      return isFinite(d) && d > 0 ? d : 0;
+    }
+
+    function paint() {
+      var d = duration();
+      var pct = d > 0 ? Math.min(1, Math.max(0, video.currentTime / d)) : 0;
+      fill.style.width = (pct * 100).toFixed(2) + '%';
+      thumb.style.left = (pct * 100).toFixed(2) + '%';
+      time.textContent = fmtClock(video.currentTime) + ' / ' + fmtClock(d);
+      bar.setAttribute('aria-valuenow', String(Math.round(pct * 100)));
+      bar.setAttribute('aria-valuetext', fmtClock(video.currentTime) + ' / ' + fmtClock(d));
+    }
+
+    function ratioOf(event) {
+      var rect = bar.getBoundingClientRect();
+      if (rect.width <= 0) return 0;
+      return Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width));
+    }
+
+    function seekToRatio(ratio) {
+      var d = duration();
+      if (d <= 0) { pendingRatio = ratio; paintPreview(ratio); return; }
+      pendingRatio = null;
+      video.currentTime = ratio * d;
+      paintPreview(ratio);
+    }
+
+    function paintPreview(ratio) {
+      fill.style.width = (ratio * 100).toFixed(2) + '%';
+      thumb.style.left = (ratio * 100).toFixed(2) + '%';
+      var d = duration();
+      time.textContent = fmtClock(d > 0 ? ratio * d : 0) + ' / ' + fmtClock(d);
+    }
+
+    function endDrag(event) {
+      if (!dragging) return;
+      dragging = false;
+      bar.classList.remove('dragging');
+      if (event && bar.hasPointerCapture && bar.hasPointerCapture(event.pointerId)) {
+        bar.releasePointerCapture(event.pointerId);
+      }
+      paint();
+    }
+
+    bar.addEventListener('pointerdown', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      dragging = true;
+      bar.classList.add('dragging');
+      if (bar.setPointerCapture) {
+        try { bar.setPointerCapture(event.pointerId); } catch (e) {}
+      }
+      if (video.readyState === 0) {
+        video.preload = 'metadata';
+        video.load();
+      }
+      seekToRatio(ratioOf(event));
+    });
+    bar.addEventListener('pointermove', function (event) {
+      if (!dragging) return;
+      event.preventDefault();
+      seekToRatio(ratioOf(event));
+    });
+    bar.addEventListener('pointerup', endDrag);
+    bar.addEventListener('pointercancel', endDrag);
+    bar.addEventListener('click', function (event) { event.stopPropagation(); });
+    bar.addEventListener('dblclick', function (event) { event.stopPropagation(); });
+    bar.addEventListener('keydown', function (event) {
+      var d = duration();
+      if (!d) return;
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        event.preventDefault();
+        event.stopPropagation();
+        var next = video.currentTime + (event.key === 'ArrowRight' ? 5 : -5);
+        video.currentTime = Math.min(d, Math.max(0, next));
+        paint();
+      }
+    });
+    video.addEventListener('loadedmetadata', function () {
+      if (pendingRatio !== null) seekToRatio(pendingRatio);
+      paint();
+    });
+    video.addEventListener('durationchange', paint);
+    video.addEventListener('timeupdate', function () { if (!dragging) paint(); });
+    video.addEventListener('seeked', function () { if (!dragging) paint(); });
+    video.addEventListener('emptied', paint);
+    paint();
+    return bar;
+  }
+
   function authorName(item) {
     return item.author || ('user' + ((item.video || {}).user_id || ''));
   }
@@ -1255,7 +1878,13 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     video.volume = state.volume;
     video.loop = true;
     video.playsInline = true;
-    video.preload = 'metadata';
+    /* 首屏不预加载视频本体：只拉同名封面 jpg，真正字节等 play()/拖动时才请求。 */
+    video.preload = 'none';
+    var poster = posterSrc(v);
+    if (poster) {
+      video.poster = poster;
+      video.setAttribute('poster', poster);
+    }
     video.setAttribute('playsinline', '');
     video.setAttribute('webkit-playsinline', '');
 
@@ -1271,7 +1900,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
 
     var title = document.createElement('h1');
     title.className = 'title';
-    title.textContent = v.title || ('视频 #' + id);
+    renderTitleInto(title, v);
 
     var authorRow = document.createElement('div');
     authorRow.className = 'author-row';
@@ -1325,6 +1954,10 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     tools.appendChild(soundBtn);
 
     meta.appendChild(title);
+    var tagChips = document.createElement('div');
+    tagChips.className = 'tag-chips';
+    renderChips(tagChips, v);
+    if (tagChips.childNodes.length) meta.appendChild(tagChips);
     meta.appendChild(authorRow);
     meta.appendChild(stats);
     meta.appendChild(tools);
@@ -1342,6 +1975,19 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     likeBtn.innerHTML = '<span class="ico">♡</span><span class="like-count num">0</span>';
     likeBtn.querySelector('.like-count').textContent = fmt(v.like_count);
     likeBtn.addEventListener('click', function (e) { e.stopPropagation(); toggleLike(slide); });
+
+    var favBtn = document.createElement('button');
+    favBtn.type = 'button';
+    favBtn.className = 'fav-btn';
+    favBtn.dataset.id = id;
+    favBtn.innerHTML = '<span class="ico">☆</span><span class="fav-label">收藏</span>';
+    favBtn.title = '收藏 / 取消收藏';
+    favBtn.setAttribute('aria-pressed', 'false');
+    favBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      toggleFavorite(id, favBtn);
+    });
+    paintFav(favBtn, id);
 
     var cmtBtn = document.createElement('button');
     cmtBtn.type = 'button';
@@ -1361,11 +2007,12 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     shareBtn.title = '复制这条视频的分享链接';
     shareBtn.addEventListener('click', function (e) {
       e.stopPropagation();
-      copyVideoLink(id);
+      openShare(id, v.title);
     });
 
     rail.appendChild(railAvatar);
     rail.appendChild(likeBtn);
+    rail.appendChild(favBtn);
     rail.appendChild(cmtBtn);
     rail.appendChild(shareBtn);
 
@@ -1394,12 +2041,19 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       toast('视频加载失败，检查 /videos 静态路由', 'err');
     });
 
+    /* 单击 = 暂停/播放，双击 = 点赞：单击先挂起 240ms，等第二下不来再执行，
+       否则双击会先暂停再播放（画面闪一下）并多走一次播放切换。 */
+    var tapTimer = 0;
     slide.addEventListener('click', function (e) {
-      if (e.target.closest('.rail') || e.target.closest('.meta') ||
-          e.target.closest('button') || e.target.closest('.author-link')) {
-        return;
-      }
-      togglePlay(slide);
+      if (isUiTarget(e.target)) return;
+      clearTimeout(tapTimer);
+      tapTimer = setTimeout(function () { tapTimer = 0; togglePlay(slide); }, 240);
+    });
+    slide.addEventListener('dblclick', function (e) {
+      if (isUiTarget(e.target)) return;
+      clearTimeout(tapTimer);
+      tapTimer = 0;
+      doubleTapLike(slide, e);
     });
 
     slide.appendChild(video);
@@ -1407,6 +2061,7 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     slide.appendChild(hint);
     slide.appendChild(meta);
     slide.appendChild(rail);
+    slide.appendChild(buildProgress(slide, video));
     return slide;
   }
 
@@ -1468,6 +2123,268 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       .catch(function (err) {
         showNotice('feed 加载失败：' + (err.message || '网络错误'), true);
       });
+  }
+
+  /* ---------- 搜索结果页：用户 / 视频 / 话题三组结果 ---------- */
+
+  function searchTabName(tab) {
+    return tab === 'user' ? '用户' : (tab === 'video' ? '视频' : '话题');
+  }
+
+  function paintSearchTabs() {
+    var tabs = searchTabs.querySelectorAll('.search-tab');
+    for (var i = 0; i < tabs.length; ++i) {
+      var on = tabs[i].dataset.tab === searchState.tab;
+      tabs[i].classList.toggle('active', on);
+    }
+  }
+
+  function searchEmpty(text) {
+    var div = document.createElement('div');
+    div.className = 'search-empty';
+    div.textContent = text;
+    return div;
+  }
+
+  function searchRow(avatarClass, avatarText, title, subtitle, onClick) {
+    var row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'search-row';
+    var av = document.createElement('span');
+    av.className = 'search-avatar' + (avatarClass ? ' ' + avatarClass : '');
+    av.textContent = avatarText;
+    var box = document.createElement('span');
+    box.className = 'search-main';
+    var b = document.createElement('b');
+    b.textContent = title;
+    var s = document.createElement('span');
+    s.textContent = subtitle;
+    box.appendChild(b);
+    box.appendChild(s);
+    row.appendChild(av);
+    row.appendChild(box);
+    row.addEventListener('click', onClick);
+    return row;
+  }
+
+  function searchUserRow(u) {
+    return searchRow('', initial(u.name || '?'),
+      u.name || ('用户 #' + u.id), '用户 · id ' + u.id, function () {
+        showProfile(u.id, u.name);
+      });
+  }
+
+  function searchVideoRow(v) {
+    var row = searchRow('', '▶', v.title || ('视频 #' + v.id),
+      '❤ ' + fmt(v.like_count) + ' · 💬 ' + fmt(v.comment_count), function () {
+        var video = {
+          id: v.id, user_id: v.user_id, title: v.title, url: v.url,
+          like_count: v.like_count, comment_count: v.comment_count
+        };
+        playInFeed({ video: video, author: '用户' + v.user_id });
+        searchEl.hidden = true;
+      });
+    row.firstChild.className = 'search-cover';
+    return row;
+  }
+
+  function searchTagRow(t) {
+    return searchRow('tag', '#', '#' + (t.name || ''),
+      (t.count || 0) + ' 条视频参与', function () { openTag(t.name); });
+  }
+
+  function renderSearchResults() {
+    var data = searchState.data || {};
+    searchBody.innerHTML = '';
+    var list = data[searchState.tab === 'user' ? 'users'
+                 : (searchState.tab === 'video' ? 'videos' : 'tags')] || [];
+    if (!list.length) {
+      searchBody.appendChild(searchEmpty('没有找到相关' +
+        searchTabName(searchState.tab) + '，换个关键词试试'));
+      return;
+    }
+    for (var i = 0; i < list.length; ++i) {
+      var item = list[i];
+      searchBody.appendChild(
+        searchState.tab === 'user' ? searchUserRow(item)
+          : (searchState.tab === 'video' ? searchVideoRow(item)
+            : searchTagRow(item)));
+    }
+  }
+
+  function runSearch(q, tab) {
+    q = String(q || '').trim();
+    if (!q) { toast('请输入搜索词', 'err'); return; }
+    searchState.q = q;
+    if (tab) { searchState.tab = tab; }
+    searchEl.hidden = false;
+    searchInput.value = q;
+    navSearch.value = q;
+    pauseAllVideos();
+    paintSearchTabs();
+    searchBody.innerHTML = '';
+    searchBody.appendChild(searchEmpty('搜索「' + q + '」…'));
+    api('api/search?q=' + encodeURIComponent(q) + '&type=all')
+      .then(function (data) {
+        if (searchState.q !== q) { return; }
+        searchState.data = data;
+        renderSearchResults();
+      })
+      .catch(function (err) {
+        searchBody.innerHTML = '';
+        searchBody.appendChild(searchEmpty('搜索失败：' + (err.message || '网络错误')));
+      });
+  }
+
+  function hideSearch() {
+    searchEl.hidden = true;
+    var active = feedEl.querySelector('.slide.active video') || state.activeVideo;
+    if (active) { playOnly(active); }
+  }
+
+  /* ---------- 话题页 ---------- */
+
+  function topicHash(tag) {
+    return '#tag=' + encodeURIComponent(tag);
+  }
+
+  function tagLink(tag, chip) {
+    var a = document.createElement('a');
+    a.className = chip ? 'tag-chip' : 'topic-link';
+    a.href = topicHash(tag);
+    a.textContent = (chip ? '' : '#') + tag;
+    a.title = '查看话题 #' + tag;
+    a.addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      openTag(tag);
+    });
+    return a;
+  }
+
+  var TAG_RE = /#([^\s#，。！？、；：,.!?;:()（）【】\[\]]{1,20})/g;
+
+  /* 把标题拆成「文本 + #话题链接」；标题没有 # 时保持纯文本，
+     话题由后端 tags 走下方的 chips 展示。 */
+  function renderTitleInto(el, v) {
+    var raw = String(v.title || '');
+    if (!raw) {
+      el.textContent = '视频 #' + (v.id || '');
+      return;
+    }
+    var m;
+    var last = 0;
+    var matched = false;
+    TAG_RE.lastIndex = 0;
+    while ((m = TAG_RE.exec(raw)) !== null) {
+      matched = true;
+      if (m.index > last) {
+        el.appendChild(document.createTextNode(raw.slice(last, m.index)));
+      }
+      el.appendChild(tagLink(m[1], false));
+      last = TAG_RE.lastIndex;
+    }
+    if (!matched) {
+      el.textContent = raw;
+      return;
+    }
+    if (last < raw.length) {
+      el.appendChild(document.createTextNode(raw.slice(last)));
+    }
+  }
+
+  /* 没有显式 #tag 的历史视频，用后端提取的话题渲染成可点击 chips。 */
+  function renderChips(box, v) {
+    if (/#[^\s#]/.test(String(v.title || ''))) return;
+    (v.tags || []).forEach(function (t) { box.appendChild(tagLink(t, true)); });
+  }
+
+  function openTag(tag) {
+    tag = String(tag || '').replace(/^#/, '').trim();
+    if (!tag) { toast('话题为空', 'err'); return; }
+    closeComments();
+    if (!profileEl.hidden) hideProfile();
+    pauseAllVideos();
+    tagEl.hidden = false;
+    tagHead.textContent = '#' + tag;
+    tagBody.scrollTop = 0;
+    tagBody.innerHTML = '';
+    var loading = document.createElement('div');
+    loading.className = 'notice';
+    loading.textContent = '加载话题 #' + tag + ' …';
+    tagBody.appendChild(loading);
+    if (location.hash !== topicHash(tag)) {
+      try {
+        history.replaceState(null, '', location.pathname + location.search + topicHash(tag));
+      } catch (e) { /* 某些 file:// 环境会抛，忽略 */ }
+    }
+    api('api/tag/' + encodeURIComponent(tag) + '?page=1&page_size=50')
+      .then(function (data) { renderTagPage(data); })
+      .catch(function (err) {
+        tagBody.innerHTML = '';
+        var box = document.createElement('div');
+        box.className = 'notice';
+        box.textContent = '话题加载失败：' + (err.message || '网络错误');
+        tagBody.appendChild(box);
+      });
+  }
+
+  function renderTagPage(data) {
+    tagBody.innerHTML = '';
+    var hero = document.createElement('div');
+    hero.className = 'tag-hero';
+    var h3 = document.createElement('h3');
+    h3.textContent = '#' + (data.tag || '');
+    var meta = document.createElement('div');
+    meta.className = 'tag-meta';
+    meta.textContent = (data.participants || 0) + ' 人参与 · ' +
+                       (data.total || data.video_count || 0) + ' 条视频';
+    hero.appendChild(h3);
+    hero.appendChild(meta);
+    tagBody.appendChild(hero);
+
+    var items = data.items || [];
+    if (!items.length) {
+      var empty = document.createElement('div');
+      empty.className = 'notice';
+      empty.textContent = '这个话题下还没有视频';
+      tagBody.appendChild(empty);
+      return;
+    }
+    var grid = document.createElement('div');
+    grid.className = 'profile-grid';
+    items.forEach(function (item) {
+      var v = item.video || item;
+      var card = document.createElement('button');
+      card.type = 'button';
+      card.className = 'pv-card';
+      var thumb = document.createElement('video');
+      thumb.src = videoSrc(v);
+      thumb.muted = true;
+      thumb.playsInline = true;
+      thumb.preload = 'metadata';
+      thumb.setAttribute('muted', '');
+      thumb.setAttribute('playsinline', '');
+      var title = document.createElement('span');
+      title.className = 'pv-title';
+      title.textContent = v.title || ('视频 #' + (v.id || ''));
+      card.appendChild(thumb);
+      card.appendChild(title);
+      card.addEventListener('click', function () { playInFeed(item, v); });
+      grid.appendChild(card);
+    });
+    tagBody.appendChild(grid);
+  }
+
+  function hideTagView() {
+    if (tagEl.hidden) return;
+    tagEl.hidden = true;
+    tagHead.textContent = '话题';
+    if ((location.hash || '').indexOf('#tag=') === 0) {
+      try {
+        history.replaceState(null, '', location.pathname + location.search);
+      } catch (e) { /* 忽略 */ }
+    }
   }
 
   /* ---------- 用户主页 ---------- */
@@ -1647,6 +2564,8 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
       renderFeed();
     }
     hideProfile();
+    hideTagView();
+    hideFavorites();
     var slide = feedEl.querySelector('.slide[data-id="' + id + '"]');
     if (!slide) { toast('视频未找到', 'err'); return; }
     slide.classList.add('active');
@@ -1681,9 +2600,53 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
     sendComment();
   });
   document.getElementById('profileBack').addEventListener('click', hideProfile);
+  document.getElementById('tagBack').addEventListener('click', hideTagView);
+  document.getElementById('searchBack').addEventListener('click', hideSearch);
+  document.getElementById('searchSubmit').addEventListener('click', function () {
+    runSearch(searchInput.value, searchState.tab);
+  });
+  searchInput.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter') { return; }
+    e.preventDefault();
+    runSearch(searchInput.value, searchState.tab);
+  });
+  document.getElementById('navSearchBtn').addEventListener('click', function () {
+    runSearch(navSearch.value, 'user');
+  });
+  navSearch.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter') { return; }
+    e.preventDefault();
+    runSearch(navSearch.value, 'user');
+  });
+  searchTabs.addEventListener('click', function (e) {
+    var btn = e.target.closest('.search-tab');
+    if (!btn) { return; }
+    searchState.tab = btn.dataset.tab;
+    paintSearchTabs();
+    renderSearchResults();
+  });
+
   document.getElementById('mineBtn').addEventListener('click', function () {
     if (!state.user) { toast('请先登录', 'err'); return; }
     showProfile(state.user.id, state.user.name);
+  });
+  document.getElementById('favBtn').addEventListener('click', showFavorites);
+  document.getElementById('favBack').addEventListener('click', function () {
+    hideFavorites();
+    var active = feedEl.querySelector('.slide.active video') || state.activeVideo;
+    if (active) playOnly(active);
+  });
+  document.getElementById('ssClose').addEventListener('click', closeShare);
+  document.getElementById('ssCancel').addEventListener('click', closeShare);
+  shareMask.addEventListener('click', closeShare);
+  ssGrid.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    var act = btn.getAttribute('data-act');
+    if (act === 'copy') { copyVideoLink(shareVideoId); return; }
+    if (act === 'qr') { ssQr.hidden = !ssQr.hidden; return; }
+    toast('分享到' + (act === 'wx' ? '微信好友' : '朋友圈') +
+          '：演示占位，未接入第三方', 'ok');
   });
   document.getElementById('who').addEventListener('click', function () {
     if (!state.user) return;
@@ -1701,6 +2664,9 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   });
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape') return;
+    if (!shareSheet.hidden) { closeShare(); return; }
+    if (!favViewEl.hidden) { hideFavorites(); return; }
+    if (!tagEl.hidden) { hideTagView(); return; }
     if (!profileEl.hidden) { hideProfile(); return; }
     if (panelEl.classList.contains('open')) closeComments();
   });
@@ -1710,6 +2676,12 @@ inline constexpr const char* kHomePageHtml = R"HTML(<!DOCTYPE html>
   }
   applySound();
   loadFeed();
+  (function () {
+    var m = /^#tag=(.+)$/.exec(location.hash || '');
+    if (m) {
+      try { openTag(decodeURIComponent(m[1])); } catch (e) { /* 忽略非法 hash */ }
+    }
+  })();
 })();
 </script>
 </body>

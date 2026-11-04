@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace douyin {
 
@@ -34,6 +35,7 @@ struct Video {
     std::int64_t like_count{0};     ///< 点赞数（interaction 服务维护）。
     std::int64_t comment_count{0};  ///< 评论数（interaction 服务维护）。
     std::int64_t created_at{0};
+    std::vector<std::string> tags;  ///< 话题标签（由标题提取；空 = 无话题）。
 };
 
 /// @brief feed 流中的一项：视频 + 作者名。

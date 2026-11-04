@@ -21,6 +21,7 @@
 #include "douyin_http.hpp"
 #include "douyin_proto.hpp"
 #include "douyin_store.hpp"
+#include "douyin_tag.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -120,6 +121,7 @@ std::string ToFeedJson(const douyin::StoredVideo& stored,
     video.like_count = stored.like_count;
     video.comment_count = stored.comment_count;
     video.created_at = stored.created_at;
+    video.tags = douyin::ExtractTags(stored.title);
 
     douyin::FeedItem item;
     item.video = std::move(video);

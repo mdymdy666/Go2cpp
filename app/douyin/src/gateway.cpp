@@ -336,29 +336,187 @@ public:
     }
 };
 
+/// @brief 按扩展名返回静态文件的 Content-Type。
+/// @param name [in] 已通过 IsSafeVideoName 的文件名——借用；只读末尾扩展名。
+/// @return 图片扩展名返回 image/*，其余（含 .mp4 与未知扩展名）返回 video/mp4。
+/// ## 定位
+/// `/videos/<name>` 同时承载视频与同名首帧封面；若封面也标成 video/mp4，
+/// 浏览器 `<video poster>` 会拒绝渲染，封面功能静默失效。
+const char* ContentTypeForStatic(std::string_view name) {
+    const auto ends_with = [name](std::string_view suffix) {
+        return name.size() >= suffix.size() &&
+               name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+    if (ends_with(".jpg") || ends_with(".jpeg")) return "image/jpeg";
+    if (ends_with(".png")) return "image/png";
+    if (ends_with(".webp")) return "image/webp";
+    return "video/mp4";
+}
+
+/// @brief `Range` 请求头的解析结果（只支持 `bytes=` 单区间）。
+struct ByteRange {
+    /// 可用区间：调用方返回 206 并只读该区间。
+    bool valid{false};
+    /// 语法合法但不可满足（越界/空文件/语法错）：调用方必须返回 416。
+    bool unsatisfiable{false};
+    /// 区间起始偏移（字节，0 基）；valid 时有效。
+    std::uint64_t first{0};
+    /// 区间长度（字节，>0）；valid 时有效。
+    std::uint64_t length{0};
+};
+
+/// @brief 去掉首尾空白（空格 / 制表 / CR），不分配。
+std::string_view TrimRangeView(std::string_view text) {
+    std::size_t begin = 0;
+    while (begin < text.size() &&
+           (text[begin] == ' ' || text[begin] == '\t' || text[begin] == '\r')) {
+        ++begin;
+    }
+    std::size_t end = text.size();
+    while (end > begin &&
+           (text[end - 1] == ' ' || text[end - 1] == '\t' || text[end - 1] == '\r')) {
+        --end;
+    }
+    return text.substr(begin, end - begin);
+}
+
+/// @brief 严格解析十进制无符号整数；空串、负号、非数字、溢出一律返回 false。
+bool ParseRangeUint(std::string_view text, std::uint64_t* value) {
+    if (text.empty()) {
+        return false;
+    }
+    constexpr std::uint64_t kMax = ~std::uint64_t{0};
+    std::uint64_t parsed = 0;
+    for (const char ch : text) {
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        const std::uint64_t digit = static_cast<std::uint64_t>(ch - '0');
+        if (parsed > (kMax - digit) / 10) {
+            return false;
+        }
+        parsed = parsed * 10 + digit;
+    }
+    *value = parsed;
+    return true;
+}
+
 /**
- * @brief 静态视频 handler：从磁盘读取 mp4 并整块写入响应体。
+ * @brief 把 `Range: bytes=a-b` / `bytes=a-` / `bytes=-N` 解析成单区间。
  *
- * @param request [in] 入站请求——借用；只读 path_view()（HEAD 也走这里）。
- * @param response [out] 出站响应——成功为 200 + `video/mp4` + 完整字节；
- *        文件不存在为 404；读取失败为 500。失败时只写状态与短文本。
+ * @param value [in] 请求头原文——借用，调用期间有效；大小写不敏感的前缀 `bytes=`。
+ * @param file_size [in] 目标文件总字节数；0 表示空文件（任何区间都不可满足）。
+ * @return 解析结果：
+ * - `valid`：可满足的单区间，调用方**必须**返回 206 + `Content-Range`；
+ * - `unsatisfiable`：语法错/越界，调用方**必须**返回 416 + `Content-Range: bytes * /<size>`；
+ * - 两者皆 false：非 `bytes=` 单位或多区间，调用方**不要**回 416，按 200 全量返回。
+ *
+ * ## 定位
+ * 唯一的 Range 判定点：返回 206 却读错区间会让浏览器 `seek` 花屏；返回 416
+ * 的边界（`start == size`）与 clamp（`end >= size`）差一位就会误伤合法请求。
+ *
+ * ## 步骤
+ * step1. 前缀不是 `bytes=`（大小写不敏感）→ 忽略，回 200；
+ * step2. 多区间（含逗号）→ 忽略，回 200 全量（本实现只支持单段）；
+ * step3. 无 `-`、空串、非数字、`last < first` → 语法错，按 416；
+ * step4. 后缀 `-N`：N==0 或空文件 → 416，否则取末尾 N 字节（N>size 时取全量）；
+ * step5. `a-b` / `a-`：a>=size → 416；b 缺省或 >=size 时 clamp 到 size-1。
+ *
+ * ## 并发/失败语义
+ * - 纯函数、无状态，worker 线程并发调用安全；不抛异常、不分配。
+ */
+ByteRange ParseRangeHeader(std::string_view value, std::uint64_t file_size) {
+    ByteRange result;
+    constexpr std::string_view kUnit = "bytes=";
+    // step1: 单位名大小写不敏感；其它单位（如 items=）按 RFC 忽略。
+    if (value.size() < kUnit.size()) {
+        return result;
+    }
+    for (std::size_t i = 0; i < kUnit.size(); ++i) {
+        char ch = value[i];
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = static_cast<char>(ch - 'A' + 'a');
+        }
+        if (ch != kUnit[i]) {
+            return result;
+        }
+    }
+    const std::string_view spec = TrimRangeView(value.substr(kUnit.size()));
+    // step2: 多区间不支持：只认单段，含逗号一律按「忽略 Range」回 200。
+    if (spec.find(',') != std::string_view::npos) {
+        return result;
+    }
+    const std::size_t dash = spec.find('-');
+    if (spec.empty() || dash == std::string_view::npos) {
+        result.unsatisfiable = true;  // step3: 语法错 → 416
+        return result;
+    }
+    const std::string_view first_text = TrimRangeView(spec.substr(0, dash));
+    const std::string_view last_text = TrimRangeView(spec.substr(dash + 1));
+    if (first_text.empty()) {
+        // step4: 后缀区间 `-N`。
+        std::uint64_t suffix = 0;
+        if (!ParseRangeUint(last_text, &suffix) || suffix == 0 || file_size == 0) {
+            result.unsatisfiable = true;
+            return result;
+        }
+        result.first = suffix >= file_size ? 0 : file_size - suffix;
+        result.length = suffix >= file_size ? file_size : suffix;
+        result.valid = true;
+        return result;
+    }
+    // step5: `a-b` / `a-`；起点必须落在文件内，终点缺省或越界都 clamp 到末字节。
+    std::uint64_t first = 0;
+    if (!ParseRangeUint(first_text, &first) || first >= file_size) {
+        result.unsatisfiable = true;
+        return result;
+    }
+    std::uint64_t last = file_size - 1;
+    if (!last_text.empty()) {
+        if (!ParseRangeUint(last_text, &last) || last < first) {
+            result.unsatisfiable = true;
+            return result;
+        }
+        if (last >= file_size) {
+            last = file_size - 1;
+        }
+    }
+    result.first = first;
+    result.length = last - first + 1;
+    result.valid = true;
+    return result;
+}
+
+
+/**
+ * @brief 静态视频 handler：支持 `Range` 的静态文件响应（GET/HEAD）。
+ *
+ * @param request [in] 入站请求——借用；读 path_view() 与 `Range` 头（HEAD 也走这里）。
+ * @param response [out] 出站响应：
+ *        - 无 Range → 200 + 完整字节 + `Accept-Ranges: bytes`；
+ *        - 单段 Range → 206 + 区间字节 + `Content-Range` + `Accept-Ranges: bytes`；
+ *        - 越界/语法错 → 416 + 空体 + `Content-Range: bytes * /<total>`；
+ *        - 文件不存在 → 404；读取失败 → 500。
  * @return 总是 Ok（错误通过 response.status 表达）；网络错误由网关层处理。
  *
  * ## 定位
- * 唯一的视频字节出口：路径校验（ExtractVideoName）、大小上限与 Content-Length
- * 都在这里收口；一旦拼路径绕过校验就会变成任意文件读取。
+ * 唯一的视频字节出口：路径校验（ExtractVideoName）、Range 判定、大小上限与
+ * Content-Length 都在这里收口；一旦拼路径绕过校验就会变成任意文件读取。
  *
  * ## 步骤
  * step1. 重新解析并校验文件名，非法直接 404（Matcher 已挡一次，这里防御调用方变化）；
  * step2. 以 ate 模式打开并取文件大小，不存在 → 404，超限/负值 → 500；
- * step3. 预分配后整块 read，长度不符 → 500；
- * step4. 填 200、Content-Type、Content-Length、Cache-Control 与 body。
+ * step3. 解析 `Range`：可用区间 → 206，越界/语法错 → 416，多段/其它单位 → 200 全量；
+ * step4. 定位到区间起点只读区间长度，长度不符 → 500；
+ * step5. 填状态码、Content-Type、Accept-Ranges、Content-Length、Content-Range
+ *        （仅 206）与 body；HEAD 由网关序列化层去掉 body，但长度保持区间长度。
  *
  * ## 并发/失败语义
  * - 调用约束：worker 线程并发；每次请求独立 ifstream，无共享状态；
  * - 原子性：响应在内存中构造完整后由网关一次性写出；
  * - 失败语义：不抛异常；失败响应 body 非空、无文件句柄泄漏（RAII）；
- * - 不变量：返回 200 时 body.size() 与磁盘文件字节数完全一致。
+ * - 不变量：返回 200 时 body.size() 等于文件字节数；返回 206 时
+ *   body.size() 等于 `Content-Range` 声明的长度，且首字节偏移等于声明的起点。
  */
 Result<void> ServeVideo(Request& request, Response& response) {
     // step1: 路径再校验；非法输入按「不存在」处理，不泄露目录结构。
@@ -385,23 +543,55 @@ Result<void> ServeVideo(Request& request, Response& response) {
         response.body = "500 video unreadable\n";
         return Result<void>::Ok();
     }
-    // step3: 预分配后一次读完，避免逐字符迭代器的额外拷贝。
-    std::string content(static_cast<std::size_t>(file_size), '\0');
-    input.seekg(0, std::ios::beg);
-    if (file_size > 0) {
-        input.read(content.data(), static_cast<std::streamsize>(file_size));
-        if (input.gcount() != static_cast<std::streamsize>(file_size)) {
+    // step3: 解析 Range。多段与其它单位按 RFC 忽略（回 200 全量，这里注明）；
+    //        越界/语法错回 416，必须带 `Content-Range: bytes * /<total>`。
+    const std::uint64_t total = static_cast<std::uint64_t>(file_size);
+    const std::string range_value = request.header.get("Range");
+    const ByteRange range =
+        range_value.empty() ? ByteRange{} : ParseRangeHeader(range_value, total);
+    if (range.unsatisfiable) {
+        response.status = Status::RangeNotSatisfiable;
+        response.header.set("Content-Type", "text/plain; charset=utf-8");
+        response.header.set("Content-Range", "bytes * /" + std::to_string(total));
+        response.header.set("Accept-Ranges", "bytes");
+        response.header.set("Cache-Control", "public, max-age=3600");
+        response.body = "416 range not satisfiable\n";
+        return Result<void>::Ok();
+    }
+    // step4: 只读命中区间（无 Range 时 offset=0、length=size）；先 seek 再按长度预分配，
+    //        避免把整个视频读进内存后再截取。
+    const std::uint64_t offset = range.valid ? range.first : 0;
+    const std::uint64_t length = range.valid ? range.length : total;
+    std::string content(static_cast<std::size_t>(length), '\0');
+    input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!input.good()) {
+        response.status = Status::InternalError;
+        response.header.set("Content-Type", "text/plain; charset=utf-8");
+        response.body = "500 video unreadable\n";
+        return Result<void>::Ok();
+    }
+    if (length > 0) {
+        input.read(content.data(), static_cast<std::streamsize>(length));
+        if (input.gcount() != static_cast<std::streamsize>(length)) {
             response.status = Status::InternalError;
             response.header.set("Content-Type", "text/plain; charset=utf-8");
             response.body = "500 video unreadable\n";
             return Result<void>::Ok();
         }
     }
-    // step4: 全量返回；HEAD 由网关序列化层去掉 body，但仍带正确的 Content-Length。
-    response.status = Status::OK;
-    response.header.set("Content-Type", "video/mp4");
+    // step5: 200 全量 / 206 区间；按扩展名给 MIME（同名 .jpg 封面复用这条静态路由），
+    //        HEAD 由网关序列化层去掉 body，但仍带正确的 Content-Length。
+    response.status = range.valid ? Status::PartialContent : Status::OK;
+    response.header.set("Content-Type", ContentTypeForStatic(name));
+    response.header.set("Accept-Ranges", "bytes");
     response.header.set("Content-Length", std::to_string(content.size()));
     response.header.set("Cache-Control", "public, max-age=3600");
+    if (range.valid) {
+        response.header.set("Content-Range",
+                            "bytes " + std::to_string(range.first) + "-" +
+                                std::to_string(range.first + range.length - 1) + "/" +
+                                std::to_string(total));
+    }
     response.body = std::move(content);
     return Result<void>::Ok();
 }
@@ -492,6 +682,8 @@ int main(int argc, char** argv) {
         // 上传大文件需要更长超时（默认 1s 会让 10 MiB 上传在网关侧超时 -> 502）。
         AddRoute(gateway.get(), kWriteMask, "/api/video/**", kVideoPort, true, 10,
                  "video-write", std::chrono::milliseconds(120000)) &&
+        AddRoute(gateway.get(), kReadMask, "/api/tag/**", kVideoPort, false, 0,
+                 "tag-read") &&
         AddRoute(gateway.get(), method_mask::kAll, "/api/feed/**", kFeedPort, false,
                  0, "feed") &&
         AddRoute(gateway.get(), kWriteMask, "/api/like/**", kInteractionPort, true,

@@ -237,7 +237,15 @@ constexpr const char* kSchemaSql =
     "  total INTEGER NOT NULL,"
     "  received_bytes INTEGER NOT NULL DEFAULT 0,"
     "  created_at INTEGER NOT NULL"
-    ");";
+    ");"
+    "CREATE TABLE IF NOT EXISTS favorites ("
+    "  user_id INTEGER NOT NULL,"
+    "  video_id INTEGER NOT NULL,"
+    "  created_at INTEGER NOT NULL,"
+    "  UNIQUE(user_id, video_id)"
+    ");"
+    "CREATE INDEX IF NOT EXISTS idx_favorites_user "
+    "ON favorites(user_id, created_at DESC);";
 
 /// @brief 把 `Error` 写成可读文本。
 std::string DescribeError(const go2cpp::storage::Error& error) {
@@ -1000,6 +1008,105 @@ bool Store::HasLiked(std::int64_t video_id, std::int64_t user_id,
     return rows.Value().Next();
 }
 
+// ---------------------------------------------------------------------------
+// C8 收藏：favorites（UNIQUE(user_id, video_id) 保证不成对重复）
+// ---------------------------------------------------------------------------
+
+int Store::ToggleFavorite(std::int64_t video_id, std::int64_t user_id,
+                          std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return -1;
+    }
+    // step1: 先按唯一键删除——changes>0 说明本来已收藏，本次语义是取消；
+    //        省掉「先查后写」的两次往返，也避免查与写之间的状态漂移。
+    auto removed = m_db->Exec(
+        "DELETE FROM favorites WHERE user_id = ? AND video_id = ?", user_id,
+        video_id);
+    if (!removed) {
+        if (error != nullptr) {
+            *error = "取消收藏失败: " + DescribeError(removed.Err());
+        }
+        return -1;
+    }
+    if (removed.Value().changes > 0) {
+        return 0;
+    }
+    // step2: 原本没收藏 → 插入。INSERT OR IGNORE 兜底并发重复（唯一键冲突
+    //        时 changes=0，但当前状态仍是「已收藏」，所以统一返回 1）。
+    auto inserted = m_db->Exec(
+        "INSERT OR IGNORE INTO favorites(user_id, video_id, created_at) "
+        "VALUES(?, ?, ?)",
+        user_id, video_id, static_cast<std::int64_t>(std::time(nullptr)));
+    if (!inserted) {
+        if (error != nullptr) {
+            *error = "收藏失败: " + DescribeError(inserted.Err());
+        }
+        return -1;
+    }
+    return 1;
+}
+
+bool Store::HasFavorited(std::int64_t video_id, std::int64_t user_id,
+                         std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query(
+        "SELECT 1 FROM favorites WHERE user_id = ? AND video_id = ?", user_id,
+        video_id);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询收藏失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    return rows.Value().Next();
+}
+
+bool Store::ListFavorites(std::int64_t user_id, std::int64_t limit,
+                          std::vector<StoredVideo>* out, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    if (limit <= 0) {
+        return true;
+    }
+    // 列顺序必须与 ReadVideoRow / kVideoColumns 一致；排序键是收藏时间，
+    // 而不是视频发布时间——「最近收藏的排前面」才符合用户预期。
+    auto rows = m_db->Query(
+        "SELECT v.id, v.user_id, v.title, v.url, v.like_count, v.comment_count, "
+        "v.created_at FROM favorites f JOIN videos v ON v.id = f.video_id "
+        "WHERE f.user_id = ? ORDER BY f.created_at DESC, v.id DESC LIMIT ?",
+        user_id, limit);
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询收藏列表失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        StoredVideo video;
+        ReadVideoRow(&rows.Value(), &video);
+        out->push_back(std::move(video));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历收藏列表失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
 std::int64_t Store::AddComment(std::int64_t video_id, std::int64_t user_id,
                                const std::string& content, std::string* error,
                                std::int64_t parent_id) {
@@ -1237,6 +1344,35 @@ bool Store::SearchUsers(const std::string& query, std::int64_t limit,
     if (rows.Value().Err()) {
         if (error != nullptr) {
             *error = "遍历用户失败: " + DescribeError(rows.Value().Err());
+        }
+        return false;
+    }
+    return true;
+}
+
+bool Store::ListAllVideos(std::vector<StoredVideo>* out, std::string* error) {
+    if (!Ok()) {
+        if (error != nullptr) {
+            *error = "数据库尚未打开";
+        }
+        return false;
+    }
+    auto rows = m_db->Query(std::string("SELECT ") + kVideoColumns +
+                            " FROM videos ORDER BY id ASC");
+    if (!rows) {
+        if (error != nullptr) {
+            *error = "查询视频失败: " + DescribeError(rows.Err());
+        }
+        return false;
+    }
+    while (rows.Value().Next()) {
+        StoredVideo video;
+        ReadVideoRow(&rows.Value(), &video);
+        out->push_back(std::move(video));
+    }
+    if (rows.Value().Err()) {
+        if (error != nullptr) {
+            *error = "遍历视频失败: " + DescribeError(rows.Value().Err());
         }
         return false;
     }

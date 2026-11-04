@@ -121,12 +121,22 @@ std::string ToJson(const User& value) {
 }
 
 std::string ToJson(const Video& value) {
-    return std::string("{\"id\":") + std::to_string(value.id) + "," + Key("user_id") +
-           std::to_string(value.user_id) + "," + Key("title") + "\"" +
-           EscapeJson(value.title) + "\"," + Key("url") + "\"" + EscapeJson(value.url) + "\"," +
-           Key("like_count") + std::to_string(value.like_count) + "," + Key("comment_count") +
-           std::to_string(value.comment_count) + "," + Key("created_at") +
-           std::to_string(value.created_at) + "}";
+    std::string body = std::string("{\"id\":") + std::to_string(value.id) + "," +
+                       Key("user_id") + std::to_string(value.user_id) + "," +
+                       Key("title") + "\"" + EscapeJson(value.title) + "\"," +
+                       Key("url") + "\"" + EscapeJson(value.url) + "\"," +
+                       Key("like_count") + std::to_string(value.like_count) + "," +
+                       Key("comment_count") + std::to_string(value.comment_count) + "," +
+                       Key("created_at") + std::to_string(value.created_at) + ",";
+    body += Key("tags") + "[";
+    for (std::size_t i = 0; i < value.tags.size(); ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += "\"" + EscapeJson(value.tags[i]) + "\"";
+    }
+    body += "]}";
+    return body;
 }
 
 std::string ToJson(const FeedItem& value) {
