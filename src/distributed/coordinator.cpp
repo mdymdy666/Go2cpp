@@ -51,12 +51,33 @@ const char *StatusName(Status status) noexcept {
 }
 
 Coordinator::Coordinator(CoordinatorOptions options) : m_options(std::move(options)) {
+    // P1: 先恢复快照再启动清扫线程——避免清扫线程在恢复过程中读半初始化状态。
+    // 加载失败必须 fail-stop：healthy() == false 且所有写操作返回 kUnavailable，
+    // 绝不能静默退化成「fencing 从 0 开始」。
+    if (!m_options.snapshot_path.empty()) {
+        const Outcome restored = Restore();
+        if (!restored.ok()) {
+            m_degraded = true;
+            m_load_error = restored.message;
+        }
+    }
     if (m_options.start_sweeper) {
         Start();
     }
 }
 
-Coordinator::~Coordinator() { Stop(); }
+Coordinator::~Coordinator() {
+    Stop();
+    // 析构时尽力落盘一次：调用方忘了显式 Snapshot() 也不会丢掉最后的 fencing。
+    // 降级状态不写（不能覆盖那份损坏的快照，保留现场）；异常不得逸出析构。
+    if (!m_options.snapshot_path.empty() && !m_degraded) {
+        try {
+            (void)Snapshot();
+        } catch (...) {
+            // 快照失败已在 persist_error() 中记录，析构不抛。
+        }
+    }
+}
 
 void Coordinator::Start() {
     std::lock_guard<std::mutex> lock(m_sweep_mutex);
@@ -111,7 +132,7 @@ bool Coordinator::ValidTtl(Duration ttl) const noexcept {
 }
 
 std::size_t Coordinator::SweepExpired() {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::mutex> lock(m_mutex);
     const TimePoint now = Clock::now();
     std::vector<LeaseId> expired;
     expired.reserve(m_leases.size() / 8 + 1);
@@ -128,7 +149,12 @@ std::size_t Coordinator::SweepExpired() {
     if (!expired.empty()) {
         metrics::LeasesExpired().Add(expired.size());
     }
-    return expired.size();
+    const std::size_t swept = expired.size();
+    lock.unlock();
+    // 删除租约改变了 lease-id 水位与选举 epoch，需要落盘；dirty 未置位时
+    // PersistAfterWrite 是零 I/O 的空操作（清扫每 10ms 一次，不能无脑写盘）。
+    (void)PersistAfterWrite();
+    return swept;
 }
 
 bool Coordinator::EraseLeaseLocked(LeaseId id, TimePoint now) {
@@ -138,6 +164,9 @@ bool Coordinator::EraseLeaseLocked(LeaseId id, TimePoint now) {
     }
     LeaseRecord record = std::move(it->second);
     m_leases.erase(it);
+    // 租约表变化（含 lease-id 释放）需要反映到快照：重启后 m_next_lease 不会
+    // 复用已删除的编号。
+    m_dirty = true;
 
     switch (record.kind) {
     case LeaseKind::kService: {
@@ -200,6 +229,9 @@ void Coordinator::RecomputeLeaderLocked(ElectionRecord &election, TimePoint now)
     // 每次 leader 实际变化都开启新任期（包括「有主 → 无主」）。其余节点用
     // epoch 判断自己看到的 leader 是否已经过时，epoch 不增就说明还是同一任。
     ++election.epoch;
+    // 任期必须持久化：重启后新任期只能在旧任期之上递增（否则旧 leader 的
+    // epoch 会被复用，客户端无法用它区分新旧主）。
+    m_dirty = true;
 }
 
 LeaseView Coordinator::MakeViewLocked(const LeaseRecord &record, TimePoint now) const {
@@ -263,8 +295,11 @@ Result<LeaseView> Coordinator::RegisterService(const ServiceRegistration &regist
         return Result<LeaseView>::Failure(Status::kInvalidArgument,
                                           "ttl out of supported range");
     }
+    if (Outcome writable = EnsureWritable(); !writable.ok()) {
+        return Result<LeaseView>::Failure(writable.status, writable.message);
+    }
 
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::mutex> lock(m_mutex);
     const TimePoint now = Clock::now();
 
     // 不能长期持有 `m_services[service]` 的引用：回收旧租约时如果它是该
@@ -290,7 +325,12 @@ Result<LeaseView> Coordinator::RegisterService(const ServiceRegistration &regist
             record.deadline = now + registration.ttl;
             ++record.revision;
             metrics::LeasesGranted().Inc();
-            return Result<LeaseView>::Success(MakeViewLocked(record, now));
+            Result<LeaseView> result = Result<LeaseView>::Success(MakeViewLocked(record, now));
+            lock.unlock();
+            if (Outcome persisted = PersistAfterWrite(); !persisted.ok()) {
+                return Result<LeaseView>::Failure(persisted.status, persisted.message);
+            }
+            return result;
         }
         // 不同 owner 或已过期：旧实例被替换，回收后重新分配（编号递增）。
         EraseLeaseLocked(existing_lease, now);
@@ -298,6 +338,7 @@ Result<LeaseView> Coordinator::RegisterService(const ServiceRegistration &regist
 
     LeaseRecord record;
     record.id = m_next_lease++;
+    m_dirty = true;  // lease-id 水位必须持久化：重启后编号不复用。
     record.kind = LeaseKind::kService;
     record.name = registration.service;
     record.instance = registration.instance;
@@ -312,11 +353,19 @@ Result<LeaseView> Coordinator::RegisterService(const ServiceRegistration &regist
     m_services[record.name][record.instance] = id;
     m_leases.emplace(id, std::move(record));
     metrics::LeasesGranted().Inc();
-    return Result<LeaseView>::Success(MakeViewLocked(m_leases.at(id), now));
+    Result<LeaseView> result = Result<LeaseView>::Success(MakeViewLocked(m_leases.at(id), now));
+    lock.unlock();
+    if (Outcome persisted = PersistAfterWrite(); !persisted.ok()) {
+        return Result<LeaseView>::Failure(persisted.status, persisted.message);
+    }
+    return result;
 }
 
 Result<LeaseView> Coordinator::RenewLease(LeaseId lease, std::string_view owner) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    if (Outcome writable = EnsureWritable(); !writable.ok()) {
+        return Result<LeaseView>::Failure(writable.status, writable.message);
+    }
+    std::unique_lock<std::mutex> lock(m_mutex);
     const auto it = m_leases.find(lease);
     if (it == m_leases.end()) {
         return Result<LeaseView>::Failure(Status::kNotFound, "unknown lease");
@@ -332,13 +381,18 @@ Result<LeaseView> Coordinator::RenewLease(LeaseId lease, std::string_view owner)
         // 过期租约在返回前直接回收：让紧随其后的抢锁请求立即成功，而不是
         // 等下一次清扫（10ms 的窗口在测试里会被放大成可见的「锁丢了但抢不到」）。
         EraseLeaseLocked(lease, now);
+        lock.unlock();
+        (void)PersistAfterWrite();
         return Result<LeaseView>::Failure(status, std::move(message));
     }
     return Result<LeaseView>::Success(MakeViewLocked(record, now));
 }
 
 Outcome Coordinator::ReleaseLease(LeaseId lease, std::string_view owner) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    if (Outcome writable = EnsureWritable(); !writable.ok()) {
+        return writable;
+    }
+    std::unique_lock<std::mutex> lock(m_mutex);
     const auto it = m_leases.find(lease);
     if (it == m_leases.end()) {
         return Outcome::Failure(Status::kNotFound, "unknown lease");
@@ -347,7 +401,8 @@ Outcome Coordinator::ReleaseLease(LeaseId lease, std::string_view owner) {
         return Outcome::Failure(Status::kNotOwner, "owner does not match lease");
     }
     EraseLeaseLocked(lease, Clock::now());
-    return Outcome::Success();
+    lock.unlock();
+    return PersistAfterWrite();
 }
 
 std::vector<ServiceInstance> Coordinator::LookupService(std::string_view service) const {
@@ -412,8 +467,11 @@ Result<LeaseView> Coordinator::AcquireLock(std::string_view key, std::string_vie
         return Result<LeaseView>::Failure(Status::kInvalidArgument,
                                           "ttl out of supported range");
     }
+    if (Outcome writable = EnsureWritable(); !writable.ok()) {
+        return Result<LeaseView>::Failure(writable.status, writable.message);
+    }
 
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::mutex> lock(m_mutex);
     const TimePoint now = Clock::now();
 
     const auto lock_it = m_locks.find(std::string(key));
@@ -429,6 +487,7 @@ Result<LeaseView> Coordinator::AcquireLock(std::string_view key, std::string_vie
 
     LeaseRecord record;
     record.id = m_next_lease++;
+    m_dirty = true;  // lease-id 水位必须持久化：重启后编号不复用。
     record.kind = LeaseKind::kLock;
     record.name = std::string(key);
     record.owner = std::string(owner);
@@ -436,12 +495,20 @@ Result<LeaseView> Coordinator::AcquireLock(std::string_view key, std::string_vie
     record.ttl = ttl;
     record.revision = 1;
     record.fencing = ++m_fencing[record.name];
+    m_dirty = true;
     metrics::FencingAdvanced().Inc();
     const LeaseId id = record.id;
     m_locks[record.name] = id;
     m_leases.emplace(id, std::move(record));
     metrics::LeasesGranted().Inc();
-    return Result<LeaseView>::Success(MakeViewLocked(m_leases.at(id), now));
+    Result<LeaseView> result = Result<LeaseView>::Success(MakeViewLocked(m_leases.at(id), now));
+    lock.unlock();
+    // fencing token 必须在返回给调用方**之前**落盘：否则返回成功、重启回退，
+    // 下游会同时接受两个持有者的写。
+    if (Outcome persisted = PersistAfterWrite(); !persisted.ok()) {
+        return Result<LeaseView>::Failure(persisted.status, persisted.message);
+    }
+    return result;
 }
 
 std::optional<LockInfo> Coordinator::QueryLock(std::string_view key) const {
@@ -503,8 +570,11 @@ Result<LeaseView> Coordinator::JoinElection(std::string_view election_name,
         return Result<LeaseView>::Failure(Status::kInvalidArgument,
                                           "ttl out of supported range");
     }
+    if (Outcome writable = EnsureWritable(); !writable.ok()) {
+        return Result<LeaseView>::Failure(writable.status, writable.message);
+    }
 
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::mutex> lock(m_mutex);
     const TimePoint now = Clock::now();
     ElectionRecord &election = m_elections[std::string(election_name)];
 
@@ -519,7 +589,13 @@ Result<LeaseView> Coordinator::JoinElection(std::string_view election_name,
             ++record.revision;
             RecomputeLeaderLocked(election, now);
             metrics::LeasesGranted().Inc();
-            return Result<LeaseView>::Success(MakeViewLocked(record, now));
+            Result<LeaseView> result =
+                Result<LeaseView>::Success(MakeViewLocked(record, now));
+            lock.unlock();
+            if (Outcome persisted = PersistAfterWrite(); !persisted.ok()) {
+                return Result<LeaseView>::Failure(persisted.status, persisted.message);
+            }
+            return result;
         }
         // 过期记录还在索引里：先回收，再当作新候选者重新排队。
         EraseLeaseLocked(existing->second, now);
@@ -527,6 +603,7 @@ Result<LeaseView> Coordinator::JoinElection(std::string_view election_name,
 
     LeaseRecord record;
     record.id = m_next_lease++;
+    m_dirty = true;  // lease-id 水位必须持久化：重启后编号不复用。
     record.kind = LeaseKind::kElection;
     record.name = std::string(election_name);
     record.owner = std::string(candidate);
@@ -538,7 +615,12 @@ Result<LeaseView> Coordinator::JoinElection(std::string_view election_name,
     m_leases.emplace(id, std::move(record));
     RecomputeLeaderLocked(election, now);
     metrics::LeasesGranted().Inc();
-    return Result<LeaseView>::Success(MakeViewLocked(m_leases.at(id), now));
+    Result<LeaseView> result = Result<LeaseView>::Success(MakeViewLocked(m_leases.at(id), now));
+    lock.unlock();
+    if (Outcome persisted = PersistAfterWrite(); !persisted.ok()) {
+        return Result<LeaseView>::Failure(persisted.status, persisted.message);
+    }
+    return result;
 }
 
 ElectionState Coordinator::QueryElection(std::string_view election_name) const {

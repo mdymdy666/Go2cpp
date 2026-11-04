@@ -38,11 +38,29 @@
  *
  * ## 不做什么
  *
- * - 不做持久化：协调者重启后所有租约丢失，客户端必须重新注册（这正是
- *   租约语义的一部分，调用方应把「重新注册」写成幂等操作）；
+ * - 不做「租约持有权」的持久化：协调者重启后租约全部失效，客户端必须重新
+ *   注册（这正是租约语义的一部分，调用方应把「重新注册」写成幂等操作）；
+ * - 但 **fencing token / 选举 epoch / 租约编号水位会持久化**（P1）：
+ *   见下面的「快照持久化」一节——这是「永不复用」的最后一道防线；
  * - 不做时钟同步：所有判定基于本进程 `steady_clock`；跨机部署时租约剩余
  *   时间只作为提示，安全边界是 fencing token；
  * - 不做配额：单机内存上限由调用方控制，`Stats` 只用于观测。
+ *
+ * ## 快照持久化（P1）
+ *
+ * 配置 `CoordinatorOptions::snapshot_path` 后：
+ *
+ * 1. 构造时 `Restore()` 从快照恢复 `m_fencing`（锁 key → 已授予最大 token）、
+ *    选举 `epoch` 与租约编号水位（`m_next_lease`）；
+ * 2. 每个**影响单调性**的写（授予新 token、分配新租约编号、epoch 变化、
+ *    删除租约）会置 dirty，并在返回前 `Snapshot()` 落盘（`snapshot_on_write`）；
+ * 3. 快照损坏（魔数/版本/CRC/长度任一不符）→ 构造期加载失败，`healthy()`
+ *    为 false、`load_error()` 非空，且**所有写操作返回 `kUnavailable`**
+ *    （fail-stop）。不会静默回退到「从 0 重新计数」——那正是 P1 要修的 bug；
+ * 4. 恢复**不**重建租约持有权：旧租约一律视为失效，客户端重新抢锁会拿到
+ *    `旧 token + 1`。这样即使协调者重启，下游看到的 token 也严格单调。
+ *
+ * 快照格式与 fsync 策略见 `src/distributed/coordinator_snapshot.cpp` 顶部注释。
  *
  * @author go2cpp contributors
  * @date 2026-11-01
@@ -76,6 +94,13 @@ struct CoordinatorOptions {
     Duration min_ttl{10};                ///< 允许的最小租约。
     Duration max_ttl{10 * 60 * 1000};    ///< 允许的最大租约（10 分钟）。
     bool start_sweeper{true};            ///< 是否在构造时启动后台清扫线程。
+    /// 快照文件路径；空 = 不持久化（重启后 fencing 从 0 开始，仅测试可用）。
+    std::string snapshot_path;
+    /// true：影响单调性的写返回前立即落盘（fencing 安全的关键，默认开）；
+    /// false：只在显式 `Snapshot()` / 析构时落盘——省 IO，但崩溃会丢最后一段。
+    bool snapshot_on_write{true};
+    /// true：落盘时 `fsync` 文件与目录（崩溃/掉电不丢已确认的 token）。
+    bool snapshot_fsync{true};
 };
 
 /**
@@ -183,6 +208,69 @@ public:
 
     const CoordinatorOptions &options() const noexcept { return m_options; }
 
+    /// @brief 快照文件路径；未启用快照持久化时为空字符串。
+    const std::string &snapshot_path() const noexcept { return m_options.snapshot_path; }
+
+    /**
+     * @brief 从 `snapshot_path` 加载 fencing 表、选举 epoch 与租约编号水位。
+     *
+     * @return
+     * - `kOk`：加载成功，或文件不存在（视为全新部署）；调用方继续正常使用；
+     * - `kProtocolError`：文件存在但魔数/版本/CRC/长度任一不符——调用方
+     *   **必须**停止服务（构造期会置 `healthy() == false`，写操作 fail-stop）；
+     * - `kUnavailable`：文件存在但读不了（权限/IO）。
+     *
+     * ## 定位
+     * 单调性的**唯一恢复入口**。加载失败绝不能退化成「空表」：空表意味着
+     * 新 token 可能小于重启前的 token，下游会接受过期持有者的写入。
+     *
+     * ## 步骤
+     * step1. 未配置路径 → 直接成功（内存模式）；
+     * step2. 读整文件；不存在 → 成功；读失败 → `kUnavailable`；
+     * step3. 校验尾部 CRC 后逐条解析（任何越界/未知 kind 都是损坏）；
+     * step4. 与内存状态**取较大值**合并（fencing/epoch/next_lease 只升不降）；
+     * step5. 清 dirty 并返回。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：构造期或显式重载时调用；内部锁 `m_mutex`，可与读并发；
+     * - 失败语义：失败时内存状态**保持调用前**（解析在锁外完成，最后一步
+     *   才提交），调用方决定是否降级；
+     * - 不变量：成功返回后，任何新授予的 token 都严格大于快照里的值。
+     */
+    Outcome Restore();
+
+    /**
+     * @brief 把 fencing 表、租约表、选举 epoch 原子写入 `snapshot_path`。
+     *
+     * @return `kOk`（已落盘，或未配置快照）；`kUnavailable`（写盘失败，
+     *         内部把 dirty 重新置位，下次写会重试）。
+     *
+     * ## 定位
+     * 单调性的**唯一持久化点**。采用「临时文件 + fsync + rename + fsync 目录」
+     * 的原子替换：任何时刻磁盘上要么是旧快照、要么是新快照，不会出现半个文件。
+     *
+     * ## 步骤
+     * step1. 未配置路径 → 成功；降级状态 → `kUnavailable`（不覆盖损坏文件）；
+     * step2. 持 `m_snapshot_mutex` 串行化写者，持 `m_mutex` 序列化状态并清 dirty；
+     * step3. 写 `<path>.tmp`、按配置 fsync、rename、fsync 目录；
+     * step4. 失败则把 dirty 置回并记录 `persist_error()`。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：任意线程；多个写者由 `m_snapshot_mutex` 串行，不阻塞读路径；
+     * - 原子性：rename 是 POSIX 原子操作，读者看不到写了一半的快照；
+     * - 失败语义：返回错误时磁盘上仍是上一份完整快照，内存状态不受影响。
+     */
+    Outcome Snapshot();
+
+    /// @brief 构造期加载是否成功（未启用快照恒为 true）。
+    bool healthy() const noexcept { return !m_degraded; }
+
+    /// @brief 构造期加载失败的原因；成功时为空。
+    const std::string &load_error() const noexcept { return m_load_error; }
+
+    /// @brief 最近一次快照写入失败的原因；成功时为空。
+    std::string persist_error() const;
+
     /// @brief 启动清扫线程（幂等；构造时已按配置启动）。
     void Start();
     /// @brief 停止清扫线程（幂等；停止后仍可同步调用各方法，但不再自动清扫）。
@@ -230,6 +318,12 @@ private:
     };
 
     void SweepLoop();
+    /// @brief 降级检查：构造期加载失败后拒绝一切写（fail-stop，不静默回退）。
+    Outcome EnsureWritable() const;
+    /// @brief dirty 时调用 `Snapshot()`；未启用/未脏时零开销返回。
+    Outcome PersistAfterWrite();
+    /// @brief 序列化当前状态（fencing/租约表/选举 epoch）；调用方必须持有 `m_mutex`。
+    std::string SerializeSnapshotLocked() const;
     /// @brief 删除一条租约并清理所有索引；调用方必须已持有 `m_mutex`。
     bool EraseLeaseLocked(LeaseId id, TimePoint now);
     /// @brief 按当前存活候选者重算 leader；leader 变化时递增任期。
@@ -246,6 +340,14 @@ private:
     CoordinatorOptions m_options;
 
     mutable std::mutex m_mutex;
+    /// 串行化快照写入；写者之间互斥，读者（`Get`/`Lookup*`）完全不碰它。
+    mutable std::mutex m_snapshot_mutex;
+    /// 自上次快照以来是否有影响单调性的变更。
+    bool m_dirty{false};
+    /// 构造期快照加载失败（fail-stop）；true 时一切写操作返回 kUnavailable。
+    bool m_degraded{false};
+    std::string m_load_error;
+    std::string m_persist_error;
     std::unordered_map<LeaseId, LeaseRecord> m_leases;
     /// service → instance → lease id。
     std::unordered_map<std::string, std::unordered_map<std::string, LeaseId>> m_services;

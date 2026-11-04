@@ -41,6 +41,8 @@ set(GO2CPP_DISTRIBUTED_TESTS_DIR ${GO2CPP_DISTRIBUTED_ROOT}/tests/distributed)
 
 set(GO2CPP_DISTRIBUTED_SOURCES
     ${GO2CPP_DISTRIBUTED_ROOT}/src/distributed/coordinator.cpp
+    ${GO2CPP_DISTRIBUTED_ROOT}/src/distributed/coordinator_snapshot.cpp
+    ${GO2CPP_DISTRIBUTED_ROOT}/src/distributed/metadata_store.cpp
     ${GO2CPP_DISTRIBUTED_ROOT}/src/distributed/node_id.cpp
     ${GO2CPP_DISTRIBUTED_ROOT}/src/distributed/lease_session.cpp
     ${GO2CPP_DISTRIBUTED_ROOT}/src/distributed/registry.cpp
@@ -140,6 +142,10 @@ if (GO2CPP_DISTRIBUTED_TESTS)
         ${GO2CPP_DISTRIBUTED_TESTS_DIR}/test_node_id.cpp)
     go2cpp_distributed_add_test(go2cpp_distributed_trace_test
         ${GO2CPP_DISTRIBUTED_TESTS_DIR}/test_trace.cpp)
+    go2cpp_distributed_add_test(go2cpp_distributed_metadata_store_test
+        ${GO2CPP_DISTRIBUTED_TESTS_DIR}/test_metadata_store.cpp)
+    go2cpp_distributed_add_test(go2cpp_distributed_coordinator_snapshot_test
+        ${GO2CPP_DISTRIBUTED_TESTS_DIR}/test_coordinator_snapshot.cpp)
     if (TARGET go2cpp_rpc)
         # trace 透传用例直接验证 rpc 请求帧编解码（P0）。
         target_link_libraries(go2cpp_distributed_trace_test PRIVATE go2cpp_rpc)
@@ -154,10 +160,15 @@ if (GO2CPP_DISTRIBUTED_TESTS)
     add_test(NAME distributed_scenarios COMMAND go2cpp_distributed_scenarios_test)
     add_test(NAME distributed_node_id COMMAND go2cpp_distributed_node_id_test)
     add_test(NAME distributed_trace COMMAND go2cpp_distributed_trace_test)
+    add_test(NAME distributed_metadata_store
+             COMMAND go2cpp_distributed_metadata_store_test)
+    add_test(NAME distributed_coordinator_snapshot
+             COMMAND go2cpp_distributed_coordinator_snapshot_test)
     set_tests_properties(
         distributed_registry distributed_lock distributed_election
         distributed_random distributed_concurrent distributed_transport
         distributed_scenarios distributed_node_id distributed_trace
+        distributed_metadata_store distributed_coordinator_snapshot
         PROPERTIES LABELS distributed TIMEOUT 180)
 
     if (UNIX AND GO2CPP_DISTRIBUTED_MULTIPROCESS_TESTS)

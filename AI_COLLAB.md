@@ -1068,3 +1068,28 @@ errno noinline），不是寄存器保存。
 4. 复用顺序：项目内已有 > 工业库 > 自己写。
 
 **当天的量化结果**：复用审查（docs/reports/reuse-audit.md，408 行）查出真重复 15 组 / 部分重复 4 组 / 看似重复但不同 14 组 / 薄封装 8 类；据此派出 4 个修复 agent（随机源 5 处、endian 13 处、CRC 2 套、字符串/解析 39 处、SHA-256 3 份、FNV 5 处）。
+
+## 2026-11-04 · 分布式 P1：MetadataStore + Coordinator 快照持久化
+
+**背景**：`docs/reports/distributed-analysis.md` P1（4 人天）——`Coordinator` 的 fencing 计数只在内存，
+重启即回退，破坏「永不复用」。P0（NodeId/Trace/metrics，`99ed212`）已完成，本轮只做 P1。
+
+**改动**：
+- 新增 `include/go2cpp/distributed/metadata_store.hpp` + `src/distributed/metadata_store.cpp`：
+  KV + 全局 revision + 前缀 Watch（游标重放/同步异步派发/回调异常隔离）+ 可选 WAL 文件后端；
+- 新增 `src/distributed/coordinator_snapshot.cpp` + `src/distributed/snapshot_codec.hpp`：
+  Coordinator 快照（fencing 表 + 租约表 + 选举 epoch，版本 1，尾部 CRC32，临时文件 + fsync + rename 原子替换）；
+- `coordinator.{hpp,cpp}`：`CoordinatorOptions::{snapshot_path,snapshot_on_write,snapshot_fsync}`、
+  `Restore()/Snapshot()/healthy()/load_error()/persist_error()`；授予路径 dirty + 返回前落盘；
+  快照损坏 → fail-stop（写操作 `kUnavailable`），不静默回退；
+- `tests/distributed/test_metadata_store.cpp` + `test_coordinator_snapshot.cpp`；
+- `cmake/Go2CppDistributed.cmake`：两个源文件 + 两个测试目标（label distributed）。
+
+**未动**：`transport.cpp`、rpc；未 commit。
+
+**验证**：11 个 distributed ctest 全过；`-O2 -Wall -Wextra -Wpedantic -Werror` 三份实现单独编译零告警；
+实测重启 fencing `1 → 2 → 3`、截断快照拒绝启动；报告 `docs/reports/2026-11-04-distributed-p1.md`
+（架构/快照格式/fsync 策略/汇编指令数与耗时/未决项）。
+
+**坑**：改 `CoordinatorOptions` 布局后，只重建新 target 会让**旧测试二进制**与新 `.so` ABI 不匹配
+（表现为 stack smashing / watchdog 超时）。改公共头后必须重建全部相关测试目标再跑 ctest。
