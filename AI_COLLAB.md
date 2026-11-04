@@ -1257,3 +1257,72 @@ handler 异常导致 SIGABRT；slowloris 靠单次 recv 30s 无限占住 worker�
 **未决**：DNS 仍是「阻塞但可见」（sysmon 可补 M），真正的异步 resolver 线程池
 不在本次范围；`SendAll` 未覆盖 UDP 批量语义（批量走 `send_batch`）。
 **未提交**：本 agent 不 commit。
+
+## 2026-11-04 · 抖音 demo 视频压缩（5 个素材）
+
+**背景**：`app/douyin/web/videos/demo1-5.mp4` 合计 8.58 MB（demo3 52 s / 4.37 MB，854×480），
+北京服务器带宽有限，在不明显损失观感的前提下压缩体积。
+
+**改动**（只动数据文件，未改代码）：用 ffmpeg 重编码
+`libx264 -crf 28 -preset medium -vf scale=min(720,iw):-2 -pix_fmt yuv420p`，
+音轨 `aac 96k`，`-movflags +faststart`；原文件备份到 `web/videos/orig/demoN.orig.mp4`
+（静态路由不递归子目录，`/videos/orig/...` 返回 404，备份不会被公网取到）。
+
+**结果**：
+| 文件 | 原体积 | 新体积 | 压缩率 | 时长 | 分辨率 |
+|---|---|---|---|---|---|
+| demo1 | 788,493 | 245,840 | 68.8% | 10.027 s | 320×176（未放大） |
+| demo2 | 1,128,375 | 143,723 | 87.3% | 5.055 s | 960×540 → 720×406 |
+| demo3 | 4,372,373 | 1,919,183 | 56.1% | 52.208 s | 854×480 → 720×404 |
+| demo4 | 1,118,597 | 599,436 | 46.4% | 10.000 s | 640×360（未放大） |
+| demo5 | 1,174,960 | 868,422 | 26.1% | 10.010 s | 640×360（未放大） |
+| 合计 | 8,582,798 | 3,776,604 | 56.0% | — | — |
+
+**验证**：ffprobe 全部 h264+aac、时长变化 ≤0.001 s；`ffmpeg -f null` 全量解码零错误；
+`curl -I http://127.0.0.1:28080/videos/demoN.mp4` 全部 200 + `video/mp4`；
+`moov` 在 offset 36（faststart，可边下边播）；从 HTTP 源 seek 到 20 s 解码 2 s 成功。
+DB `videos.url` 存相对路径 `videos/demoN.mp4`（20 条引用），文件名未变，**无需改库**。
+`upload_31_*.mp4` 未触碰（4717361 B / 原 mtime 不变）。
+
+**未决**：静态服务对 `Range` 返回 200 全量而非 206，浏览器不能 seek；
+demo5 压缩率仅 26.1%（源码率本身偏高），要更小需再降 CRF。
+**未提交**：视频被 `.gitignore`（`web/videos/*.mp4`）覆盖，本 agent 不 commit。
+
+## 2026-11-04 WS 断线补发（Resume）—— bilibili 弹幕房间
+
+**改动**：
+- `include/go2cpp/app/realtime_room.hpp`：新增 header-only `realtime::SeqJournal`
+  （单房间单调 seq + 容量可配环形缓冲 + `Since(last_seq)` 区间/gap 判定）；
+  `RoomHub` 本体未改，接口与行为零变化。
+- `app/bilibili/include/bili_danmaku_room.hpp` / `src/bili_danmaku_room.cpp`：
+  `RoomHub` 接入 SeqJournal，业务广播注入 `"seq":N`；新增 `JoinWithResume()`
+  （持锁「先补发、后登记」，补发必然先于后续实时消息）、`BroadcastEphemeral()`
+  （online 是派生状态，不占 seq、不进缓冲、重连时重新广播）、`LatestSeq()`；
+  `Broadcast()` 改为锁内 Enqueue（Enqueue 不再做 socket I/O，慢连接由发送线程关闭）；
+  `Leave()` 保留 journal，房间暂空时序号不回退。
+- `app/bilibili/src/danmaku_service.cpp`：WS 握手支持 `?last_seq=N`；窗口滚出时回
+  `{"type":"resume_gap","earliest":x,"latest":y}`；新增 `--resume-buffer N`
+  （默认 1000）；连接队列上限取 `max(--max-queue, resume-buffer)`，避免补发被
+  慢消费者保护踢掉。
+- 新增测试：`tests/app/app_test_realtime_resume.cpp`（注册为 ctest `app_realtime_resume`）、
+  `app/bilibili/scripts/accept_resume.sh` + `accept_resume.py`。
+
+**协议**：可续传业务帧为 `{"seq":N,...}`（房间内从 1 单调递增，弹幕）；online 为
+瞬时帧不带 seq。重连带 `?last_seq=N` → 补发 `(N, latest]`；N 早于缓冲起点或大于
+latest（服务重启）→ `resume_gap`，客户端走 REST 全量刷新。
+
+**测试结果**：
+- `ctest -R realtime`：`app_realtime_resume` 1/1 PASS（737 项检查，300 轮随机，
+  20 万条 Assign = 2211 万条/秒）。
+- `app/bilibili/scripts/accept_resume.sh`：45 PASS / 0 FAIL。含 A 收 5 条断开 →
+  发 10 条 → `last_seq=5` 补发 **seq 6..15**；`last_seq=0`（缓冲 4）→
+  `resume_gap earliest=5`；边界/随机 last_seq；20 客户端 × 200 条共 4000 条
+  连续无洞（9103 条/秒）；并发随机重连 10 例补发连续；限流第 6 条仍 429。
+- 既有 `tests/app/test_realtime_room.cpp`：52 项 0 失败（RoomHub 未回归）。
+- bili `build.sh`（-Wall -Wextra -Wpedantic -Werror）：零告警。
+- 抖音 `accept_all.sh` 未跑：并发会话正在重编 douyin `gateway` 且占用
+  28080/29105；douyin 源码不引用 `realtime_room`/`SeqJournal`（grep 无结果），
+  本次改动对抖音零影响。
+
+**已知限制 / 后续**：journal 按 video_id 常驻内存，生产需加 TTL 或房间空闲回收；
+未 commit。

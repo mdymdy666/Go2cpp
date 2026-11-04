@@ -110,7 +110,8 @@ if (GO2CPP_WITH_APP AND GO2CPP_APP_TESTS)
         app_test_resource
         app_test_kv
         app_test_connection
-        app_test_load)
+        app_test_load
+        app_test_realtime_resume)
 
     foreach(app_test ${GO2CPP_APP_TESTS_CORE})
         add_executable(${app_test} ${GO2CPP_APP_TEST_DIR}/${app_test}.cpp)
@@ -126,8 +127,9 @@ if (GO2CPP_WITH_APP AND GO2CPP_APP_TESTS)
     add_test(NAME app_kv COMMAND app_test_kv)
     add_test(NAME app_connection COMMAND app_test_connection)
     add_test(NAME app_load COMMAND app_test_load)
+    add_test(NAME app_realtime_resume COMMAND app_test_realtime_resume)
     set_tests_properties(app_frame app_stream_table app_resource app_kv
-        app_connection PROPERTIES TIMEOUT 180)
+        app_connection app_realtime_resume PROPERTIES TIMEOUT 180)
     # 1 GiB 资源 + 1000 并发流的负载用例：给足时间，不掩盖真实性能。
     set_tests_properties(app_load PROPERTIES TIMEOUT 900)
 

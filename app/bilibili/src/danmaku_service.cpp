@@ -6,7 +6,11 @@
  *          - REST：`GET /api/danmaku/:video_id?from=&to=`、`GET /api/danmaku/:video_id/online`；
  *          - WS：`/ws/danmaku?video_id=1`，文本帧 `{"type":"send",...}`；
  *          - 校验：1–100 字符、屏蔽词、5 条/10s/用户（游客按连接计）；
- *          - 入库后广播 `{"type":"danmaku",...}`，在线数变化广播 `{"type":"online",...}`；
+ *          - 入库后广播 `{"type":"danmaku","seq":N,...}`，在线数变化广播
+ *            `{"type":"online","seq":N,...}`；seq 是房间内从 1 开始的单调序号；
+ *          - 断线续传：重连带 `?last_seq=N`，服务端在 `(N, latest]` 内补发；
+ *            窗口已滚出或 N 大于当前最大序号时回 `{"type":"resume_gap",
+ *            "earliest":x}`，客户端用 REST 全量刷新；
  *          - 非法 JSON 回 `{"type":"error","code":400,...}`，不断连。
  *
  * @author bili demo
@@ -51,6 +55,7 @@ struct ServerOptions {
     std::size_t rate_limit{5};
     std::int64_t rate_window_ms{10000};
     std::size_t max_queue{256};
+    std::size_t resume_buffer{1000};  ///< 每房间续传环形缓冲条数。
     bool verbose{false};
 };
 
@@ -108,14 +113,17 @@ class RateLimiter {
 /// @brief 服务端共享状态（进程内单例，main 持有）。
 struct ServerState {
     explicit ServerState(const ServerOptions& options)
-        : limiter(options.rate_limit, options.rate_window_ms),
+        : hub(options.resume_buffer),
+          limiter(options.rate_limit, options.rate_window_ms),
           max_queue(options.max_queue),
+          resume_buffer(options.resume_buffer),
           verbose(options.verbose) {}
 
     bili::DanmakuStore store;
     bili::RoomHub hub;
     RateLimiter limiter;
     std::size_t max_queue;
+    std::size_t resume_buffer;
     bool verbose;
 };
 
@@ -257,7 +265,8 @@ void BroadcastOnline(ServerState& state, std::int64_t video_id) {
     const std::size_t count = state.hub.OnlineCount(video_id);
     const std::string payload =
         "{\"type\":\"online\",\"count\":" + std::to_string(count) + "}";
-    state.hub.Broadcast(video_id, payload);
+    // online 是派生状态：不占 seq、不进续传缓冲，重连后重新广播最新值。
+    state.hub.BroadcastEphemeral(video_id, payload);
     Log("online video_id=" + std::to_string(video_id) +
         " count=" + std::to_string(count));
 }
@@ -400,13 +409,46 @@ void HandleWebSocket(Socket::Ptr socket, const bili::HttpRequest& parsed,
         ParseUserToken(bili::QueryParam(parsed, "token"));
     const std::string peer = "?";
 
+    // 断线续传：?last_seq=N 表示客户端已收到 N，服务端补发 N+1 起。
+    const std::string last_seq_text = bili::QueryParam(parsed, "last_seq");
+    const bool resume = !last_seq_text.empty();
+    std::uint64_t last_seq = 0;
+    if (resume) {
+        const std::int64_t parsed_last = ParseId(last_seq_text);
+        if (parsed_last < 0) {
+            Log("websocket rejected: last_seq 非法");
+            websocket->close(1008, "last_seq 非法");
+            return;
+        }
+        last_seq = static_cast<std::uint64_t>(parsed_last);
+    }
+
+    // 队列至少覆盖一次最大补发窗口：否则补发会把连接当慢消费者踢掉。
+    const std::size_t queue_cap = std::max(state.max_queue, state.resume_buffer);
     auto connection = std::make_shared<bili::RoomConnection>(websocket, peer,
-                                                             state.max_queue);
+                                                             queue_cap);
     connection->Start();
-    state.hub.Join(video_id, connection);
+    bili::RoomHub::ResumeReport report;
+    state.hub.JoinWithResume(video_id, connection, resume, last_seq, &report);
     Log("ws join conn=" + std::to_string(connection->id()) + " video_id=" +
         std::to_string(video_id) + " user_id=" + std::to_string(user_id) +
-        " peer=" + peer);
+        " peer=" + peer + " last_seq=" +
+        (resume ? std::to_string(last_seq) : std::string("-")));
+    if (report.gap) {
+        // 窗口已滚出（或序号回退）：让客户端全量刷新，绝不静默丢一段。
+        const std::string payload =
+            "{\"type\":\"resume_gap\",\"earliest\":" +
+            std::to_string(report.earliest) + ",\"latest\":" +
+            std::to_string(report.latest) + "}";
+        connection->Enqueue(payload);
+        Log("ws resume gap conn=" + std::to_string(connection->id()) +
+            " last_seq=" + std::to_string(last_seq) + " earliest=" +
+            std::to_string(report.earliest));
+    } else if (resume) {
+        Log("ws resume conn=" + std::to_string(connection->id()) +
+            " last_seq=" + std::to_string(last_seq) + " replayed=" +
+            std::to_string(report.replayed));
+    }
     BroadcastOnline(state, video_id);
 
     for (;;) {
@@ -555,7 +597,8 @@ void HandleConnection(Socket::Ptr socket, ServerState& state) {
 void PrintUsage(const char* program) {
     std::fprintf(stderr,
                  "用法: %s [--port N] [--db PATH] [--rate-limit N] "
-                 "[--rate-window-ms N] [--max-queue N] [--verbose]\n",
+                 "[--rate-window-ms N] [--max-queue N] [--resume-buffer N] "
+                 "[--verbose]\n",
                  program);
 }
 
@@ -603,6 +646,14 @@ int main(int argc, char** argv) {
                 return 2;
             }
             options.max_queue = static_cast<std::size_t>(queue);
+        } else if (arg == "--resume-buffer") {
+            const long buffer =
+                std::strtol(value("--resume-buffer").c_str(), nullptr, 10);
+            if (buffer <= 0) {
+                std::fprintf(stderr, "resume-buffer 非法: %ld\n", buffer);
+                return 2;
+            }
+            options.resume_buffer = static_cast<std::size_t>(buffer);
         } else if (arg == "--verbose") {
             options.verbose = true;
         } else if (arg == "--help" || arg == "-h") {
