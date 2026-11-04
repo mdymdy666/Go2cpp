@@ -148,6 +148,40 @@ void run_network_tests() {
     auto second = parser.feed(std::string_view(message.data() + 11, message.size() - 11), request);
     GO2CPP_CHECK(second.state == go2cpp::http::ParseState::Complete);
     GO2CPP_CHECK(request.body == "hello" && request.path() == "/x");
+    // consumed 是「整条报文占用的字节数」，不是本次 feed 的输入长度：粘包时
+    // 第一条 Complete 后必须按它切分流水线，剩余字节（第二条）留在 Parser 缓冲。
+    {
+        go2cpp::http::Parser pipeline_parser;
+        go2cpp::http::Request pipeline_first;
+        const std::string pipeline_first_wire =
+            "GET /first HTTP/1.1\r\nHost: pipeline\r\n\r\n";
+        const std::string pipeline_second_wire =
+            "POST /second HTTP/1.1\r\nHost: pipeline\r\nContent-Length: 3\r\n\r\nabc";
+        const std::string pipeline_all = pipeline_first_wire + pipeline_second_wire;
+        // 第一条再拆成两次 feed：consumed 必须跨 feed 累积，而不是只算最后一次。
+        const std::size_t pipeline_split = pipeline_first_wire.size() / 2;
+        const auto pipeline_head = pipeline_parser.feed(
+            std::string_view(pipeline_all.data(), pipeline_split), pipeline_first);
+        GO2CPP_CHECK(pipeline_head.state == go2cpp::http::ParseState::NeedMore);
+        const auto pipeline_result = pipeline_parser.feed(
+            std::string_view(pipeline_all.data() + pipeline_split,
+                             pipeline_all.size() - pipeline_split),
+            pipeline_first);
+        GO2CPP_CHECK(pipeline_result.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(pipeline_result.consumed == pipeline_first_wire.size());
+        GO2CPP_CHECK(pipeline_first.path() == "/first");
+        // 第二条报文必须原样留在缓冲区，不能被第一条或 take_remaining() 吞掉。
+        const std::string pipeline_leftover = pipeline_parser.take_remaining();
+        GO2CPP_CHECK(pipeline_leftover == pipeline_second_wire);
+        go2cpp::http::Parser pipeline_second_parser;
+        go2cpp::http::Request pipeline_second;
+        const auto pipeline_second_result = pipeline_second_parser.feed(
+            std::string_view(pipeline_leftover.data(), pipeline_leftover.size()),
+            pipeline_second);
+        GO2CPP_CHECK(pipeline_second_result.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(pipeline_second_result.consumed == pipeline_second_wire.size());
+        GO2CPP_CHECK(pipeline_second.body == "abc" && pipeline_second.path() == "/second");
+    }
     // 没有 Content-Length/Transfer-Encoding 的响应以 EOF 结束 body；EOF
     // 前只能 NeedMore，finish() 后才交付完整响应。
     go2cpp::http::Parser close_delimited_parser;
@@ -194,6 +228,16 @@ void run_network_tests() {
     go2cpp::http::Response no_body_response;
     GO2CPP_CHECK(no_body_parser.feed("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
                                      no_body_response).state == go2cpp::http::ParseState::Complete);
+    // RFC 7230 §3.3.3：304 可以带 Content-Length（表示选中资源的尺寸），但响应
+    // 本身没有 body；解析器必须忽略该 CL 直接 Complete，不能等 123 字节。
+    go2cpp::http::Parser not_modified_parser;
+    go2cpp::http::Response not_modified_response;
+    const auto not_modified_result = not_modified_parser.feed(
+        "HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\n\r\n",
+        not_modified_response);
+    GO2CPP_CHECK(not_modified_result.state == go2cpp::http::ParseState::Complete);
+    GO2CPP_CHECK(not_modified_response.status == go2cpp::http::Status::NotModified);
+    GO2CPP_CHECK(not_modified_response.body.empty());
     go2cpp::http::Response invalid_body_response;
     invalid_body_response.status = go2cpp::http::Status::NoContent;
     invalid_body_response.body = "must not be sent";
@@ -241,6 +285,47 @@ void run_network_tests() {
     GO2CPP_CHECK(head_parser.feed("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n",
                                   head_response).state == go2cpp::http::ParseState::Complete &&
                  head_response.body.empty());
+    // 回归：Parser 一旦 Complete，未 reset()/take_remaining() 就继续 feed 必须
+    // 显式报错。旧实现返回 Complete/0 并在 append 之前丢弃新字节——调用方会
+    // 误以为「消息完成」，实际是静默数据丢失（且违反 Complete => consumed > 0）。
+    {
+        go2cpp::http::Parser completed_parser;
+        go2cpp::http::Response completed_response;
+        GO2CPP_CHECK(completed_parser
+                         .feed("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc",
+                               completed_response)
+                         .state == go2cpp::http::ParseState::Complete);
+        const auto completed_again = completed_parser.feed(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nZ", completed_response);
+        GO2CPP_CHECK(completed_again.state == go2cpp::http::ParseState::Error);
+        GO2CPP_CHECK(!completed_again.error.empty());
+        // reset() 后同一实例必须恢复可用。
+        completed_parser.reset();
+        completed_response = go2cpp::http::Response{};
+        GO2CPP_CHECK(completed_parser
+                         .feed("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                               completed_response)
+                         .state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(completed_response.body == "ok");
+    }
+    // 回归：HEAD 响应完成后 reset() 再解析普通响应，不能被上一条的 no_body
+    // 影响而吞掉 body（framing 快照必须随消息 Complete 清零）。
+    {
+        go2cpp::http::Parser head_reset_parser;
+        head_reset_parser.set_response_to_head(true);
+        go2cpp::http::Response head_reset_response;
+        GO2CPP_CHECK(head_reset_parser
+                         .feed("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n",
+                               head_reset_response)
+                         .state == go2cpp::http::ParseState::Complete);
+        head_reset_parser.reset();
+        go2cpp::http::Response get_response;
+        GO2CPP_CHECK(head_reset_parser
+                         .feed("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc",
+                               get_response)
+                         .state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(get_response.body == "abc");
+    }
     // 回归 9f7ab5c：Parser 增量 feed 时 header_block 每次都是同一段
     // （m_buffer 保留未消费字节），若不先 clear() 就会把同名头重复追加。
     // 6 MiB 是抖音上传触发全 502 的真实量级：原实现把 User-Agent /

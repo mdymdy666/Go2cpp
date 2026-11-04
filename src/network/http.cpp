@@ -447,14 +447,21 @@ std::string Parser::take_remaining() { std::string result; result.swap(m_buffer)
  * - 不变量：返回 Complete 时缓冲中 [0, consumed) 属于该报文；返回 NeedMore 时已消费字节不会在下次调用中重复计算。
  */
 ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* request, Response* result) {
-    if (m_finished) return {ParseState::Complete, 0, {}};
+    // 上一条消息已交付时必须显式 reset()/take_remaining() 后再解析下一条。
+    // 原实现在这里返回 Complete/0：调用方会误以为「消息已完成」，而新字节
+    // 在 append 之前就被丢弃（连 take_remaining() 都取不回来），既违反
+    // ParseResult 的「Complete => consumed > 0」不变量，也把协议错误变成了
+    // 静默数据丢失。这里返回 Error，让误用立刻暴露。
+    if (m_finished) return {ParseState::Error, 0, "parser already completed; call reset()"};
     if (m_buffer.size() > std::numeric_limits<std::size_t>::max() - bytes.size() ||
         (m_buffer.size() + bytes.size() > m_limits.max_header_bytes &&
          m_buffer.size() + bytes.size() - m_limits.max_header_bytes > m_limits.max_body_bytes))
         return {ParseState::Error, 0, "input too large"};
     try {
         // step1: 校验缓冲上限后追加新字节；分配失败转 ParseState::Error 并写 m_error，不抛异常。
-        m_buffer.append(bytes.data(), bytes.size());
+        // 空输入（finish 路径的 feed_impl({}, ...)）不调用 append：string_view 的
+        // data() 此时可能是 nullptr，append(nullptr, 0) 在 C++ 标准下是未定义行为。
+        if (!bytes.empty()) m_buffer.append(bytes.data(), bytes.size());
     } catch (const std::exception&) {
         m_error = "input allocation failed";
         return {ParseState::Error, 0, m_error};
@@ -695,6 +702,11 @@ body_phase:
         if (response) result->body.assign(m_buffer, body_start, content_length); else request->body.assign(m_buffer, body_start, content_length);
     }
     const std::size_t consumed = body_end; m_buffer.erase(0, consumed); m_finished = true;
+    // 本条消息的 framing 快照与消息同生命周期：不复位的话，一旦将来放开
+    // 「完成后再 feed 下一条」（类注释称 Parser 可重复使用），m_header_parsed
+    // 快路径会用上一条的 m_no_body/m_chunked 静默吞掉下一条 body。
+    m_header_parsed = false; m_body_start_offset = 0; m_content_length = 0;
+    m_has_length = false; m_no_body = false; m_chunked = false; m_chunk_scan_pos = 0;
     if (response) result->close = has_connection_token(result->header, "close");
     else request->close = has_connection_token(request->header, "close") || request->version == "HTTP/1.0";
     // consumed 语义：本报文在 m_buffer 中占用的字节数（跨 feed 累积），不是本次

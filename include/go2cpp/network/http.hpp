@@ -234,6 +234,9 @@ struct ParseResult {
  * @note 解析失败返回 `ParseState::Error`，但 Parser **不会**因此进入不可变
  *       终态：继续 feed() 会重新解析缓冲区。调用方一旦收到 Error 应丢弃
  *       该 Parser（或调用 reset()），不要复用（R11）。
+ * @note 一次 `Complete` 之后必须 `reset()` 或 `take_remaining()` 才能解析
+ *       下一条消息；未重置就继续 feed() 会返回 `Error`（旧实现返回
+ *       `Complete/0` 并把新字节静默丢弃）。
  *
  * ## 定位
  * 被 `Client`（解析响应）与 `Server::serve_connection()`（解析请求）使用；
@@ -264,6 +267,7 @@ public:
      *
      * ## 失败语义
      * 冲突的 CL/TE、超限、非法行都返回 `Error`；`error` 字段带中文原因。
+     * 已 `Complete` 后未重置再次 feed 也返回 `Error`，不会静默吞掉新字节。
      */
     ParseResult feed(std::string_view bytes, Request& request);
     ParseResult feed(std::string_view bytes, Response& response);
@@ -283,6 +287,8 @@ private:
     /// 未消费字节；feed() 追加、feed_impl() 按 consumed 擦除。
     std::string m_buffer;
     /// 头部是否已解析（true 时后续 feed 跳过头部重解析，直接进 body 阶段）。
+    /// 只在同一条消息的 NeedMore 期间为 true；消息 Complete 时清零，避免复用
+    /// 时把上一条的 framing 快照带进下一条。
     bool m_header_parsed{false};
     /// 头部解析结果快照：body 起始偏移 / Content-Length / chunked / 是否无 body。
     std::size_t m_body_start_offset{0};
