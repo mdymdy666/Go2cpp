@@ -20,6 +20,8 @@
 
 #include "go2cpp/tunnel/mux.hpp"
 
+#include "go2cpp/logging/log.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -28,6 +30,28 @@
 namespace go2cpp {
 namespace tunnel {
 namespace {
+
+/// 热路径失败日志的冷段：`noinline` + 集中构造，避免日志流被内联进
+/// 每 chunk 调用的 `MuxStream::Write`，把栈帧从 ~150 B 撑到 ~750 B。
+/// @param stream_id 流 id；@param offset 本 chunk 在本次 Write 内的偏移；
+/// @param chunk 本 chunk 字节数；@param detail 失败阶段；@param error 错误文本。
+[[gnu::noinline]] void LogStreamWriteFailure(std::uint32_t stream_id,
+                                             std::size_t offset,
+                                             std::size_t chunk,
+                                             const char* detail,
+                                             const std::string& error) {
+    GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("tunnel.mux"))
+        << detail << " stream=" << stream_id << " offset=" << offset
+        << " chunk=" << chunk << " err=" << error;
+}
+
+/// 帧写失败的冷段日志（连接不可用 / 写超时）。
+[[gnu::noinline]] void LogFrameWriteFailure(int type, std::size_t bytes,
+                                            const std::string& error) {
+    GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("tunnel.mux"))
+        << "frame write failed type=" << type << " bytes=" << bytes
+        << " err=" << error;
+}
 
 /// 把 `stream_id` 拼进 CLOSE 载荷。
 std::vector<std::uint8_t> MakeClosePayload(std::uint32_t stream_id,
@@ -172,19 +196,25 @@ streams::WriteResult MuxStream::Write(const char* data, std::size_t size) {
         return {0, NewError("tunnel: session gone")};
     }
     std::size_t offset = 0;
+    // 复用同一个 payload：EncodeData 只 clear() 不释放容量，稳态每 chunk
+    // 零分配（改动前每个 chunk 新建一个 32 KiB vector）。
+    std::vector<std::uint8_t> payload;
     while (offset < size) {
         if (m_closed.load(std::memory_order_acquire)) {
             return {offset, NewError("tunnel: stream closed")};
         }
         const std::size_t chunk =
             std::min(size - offset, kMaxDataChunk);
-        std::vector<std::uint8_t> payload;
         ErrorPtr encode_error;
         if (!EncodeData(m_id, reinterpret_cast<const std::uint8_t*>(data) + offset,
                         chunk, &payload, &encode_error)) {
+            LogStreamWriteFailure(m_id, offset, chunk, "DATA encode failed",
+                                  ErrorMessage(encode_error));
             return {offset, encode_error};
         }
         if (!session->SendPayload(FrameType::kData, payload)) {
+            LogStreamWriteFailure(m_id, offset, chunk, "DATA send failed",
+                                  std::string());
             return {offset, NewError("tunnel: send failed")};
         }
         offset += chunk;
@@ -348,6 +378,7 @@ bool MuxSession::SendPayload(FrameType type,
     }
     std::string write_error;
     if (!m_conn->WriteAll(wire.data(), wire.size(), 30000, &write_error)) {
+        LogFrameWriteFailure(static_cast<int>(type), wire.size(), write_error);
         return false;
     }
     m_bytes_out.fetch_add(wire.size(), std::memory_order_relaxed);
@@ -518,6 +549,9 @@ void MuxSession::Dispatch(const frame::Frame& frame) {
                 return;
             }
             if (!stream->PushData(data.body, data.length)) {
+                GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("tunnel.mux"))
+                    << "recv queue overflow stream=" << data.stream_id
+                    << " bytes=" << data.length;
                 FailStream(data.stream_id, "recv queue overflow");
             }
             return;
@@ -584,6 +618,8 @@ void MuxSession::ReceiveLoop() {
             continue;  // 空闲由心跳线程判定，这里只是分片等待
         }
         if (!result.ok()) {
+            GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("tunnel.mux"))
+                << "control read failed errno=" << result.error;
             break;
         }
         m_last_rx_ms.store(NowMs(), std::memory_order_relaxed);
@@ -593,6 +629,9 @@ void MuxSession::ReceiveLoop() {
         frames.clear();
         if (!codec.Feed(buffer.data(), result.count, &frames, &consumed,
                         &frame_error)) {
+            GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("tunnel.mux"))
+                << "frame decode failed bytes=" << result.count
+                << " err=" << frame_error.message;
             break;  // 帧边界不可信，整条连接作废
         }
         for (const frame::Frame& frame : frames) {
