@@ -496,6 +496,11 @@ TunnelServer::TunnelServer(TunnelServerConfig config)
         m_psk = DerivePsk(m_config.token);
         m_auth_required = true;
     }
+    // 可取消的停止信号：HandlePublic 里每个 RelayPipe 都挂在它下面，
+    // Stop() 一次 cancel 就能让阻塞在 done_cv 上的 Run 返回。
+    auto stop_signal = Context::WithCancel(Context::Background());
+    m_stop_ctx = std::move(stop_signal.first);
+    m_stop_cancel = std::move(stop_signal.second);
     InitMetrics();
 }
 
@@ -728,6 +733,30 @@ void TunnelServer::Stop() {
     }
     m_control_listener.reset();
     m_public_listener.reset();
+    // 强制阶段第一步：取消在途公网请求 + 打断阻塞读。
+    // - 先 cancel：RelayPipe::Run 挂在 m_stop_ctx 下，done_cv 立即醒来并
+    //   ForceCloseAll，两端的 Direction 线程才有机会 join；
+    // - 再 Shutdown：卡在 ReadHttpHead / Read 上的 worker 只有
+    //   shutdown(SHUT_RDWR) 才能返回（TcpConn::Shutdown 幂等、任意线程可调）；
+    // - 必须在 WaitWorkers 之前，否则等的是一个还在阻塞的 worker。
+    if (m_stop_cancel) {
+        m_stop_cancel();
+    }
+    {
+        std::vector<TcpConn::Ptr> inflight;
+        {
+            std::lock_guard<std::mutex> lock(m_inflight_mutex);
+            inflight.reserve(m_inflight_public.size());
+            for (const auto& item : m_inflight_public) {
+                inflight.push_back(item.second);
+            }
+        }
+        // 锁外 shutdown：shutdown 是系统调用，持锁时可能挡住 HandlePublic
+        // 的注销路径（注销要拿同一把锁）。
+        for (const TcpConn::Ptr& conn : inflight) {
+            conn->Shutdown();
+        }
+    }
     // 先置 stopping 再等待：与 Spawn() 的判定同锁，保证此后不会再有新的
     // detached 线程被创建（否则它会在 WaitWorkers 之后才登记，永远等不到）。
     {
@@ -737,6 +766,19 @@ void TunnelServer::Stop() {
     m_workers->cv.notify_all();
     (void)WaitWorkers(kHeadTimeoutMs + 5000);
     Emit("server stopped");
+}
+
+void TunnelServer::TrackInflight(const TcpConn::Ptr& conn) {
+    if (!conn) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_inflight_mutex);
+    m_inflight_public[conn.get()] = conn;
+}
+
+void TunnelServer::UntrackInflight(TcpConn* conn) {
+    std::lock_guard<std::mutex> lock(m_inflight_mutex);
+    m_inflight_public.erase(conn);
 }
 
 void TunnelServer::ControlAcceptLoop() {
@@ -1025,6 +1067,15 @@ void TunnelServer::HandleControl(TcpConn::Ptr conn) {
 }
 
 void TunnelServer::HandlePublic(TcpConn::Ptr conn) {
+    // RAII 登记：任何返回路径（含早期 400/404 分支）都要注销，否则 Stop()
+    // 会一直持有一条已结束连接的 shared_ptr。此时 m_stop_ctx 若已被取消，
+    // 下面的 RelayPipe::Run 会立即返回 false，不会再有阻塞。
+    struct InflightGuard {
+        TunnelServer* server;
+        TcpConn* conn;
+        ~InflightGuard() { server->UntrackInflight(conn); }
+    } inflight_guard{this, conn.get()};
+    TrackInflight(conn);
     std::string head_raw;
     std::string extra;
     std::string error;
@@ -1229,11 +1280,11 @@ void TunnelServer::HandlePublic(TcpConn::Ptr conn) {
         relay::SplicePipe splice_pipe(public_stream.NativeFd(),
                                       stream->NativeFd());
         ErrorPtr splice_error;
-        (void)splice_pipe.Run(nullptr, &splice_error);
+        (void)splice_pipe.Run(m_stop_ctx, &splice_error);
     } else {
         relay::RelayPipe pipe(&public_side, &tunnel_side, pipe_config);
         ErrorPtr pipe_error;
-        (void)pipe.Run(nullptr, &pipe_error);
+        (void)pipe.Run(m_stop_ctx, &pipe_error);
     }
     stream->Close();
     conn->Shutdown();
@@ -1353,7 +1404,7 @@ void TunnelServer::ServeRawStream(const TcpConn::Ptr& conn,
     }
     relay::SplicePipe splice_pipe(conn->fd(), data_conn->fd());
     ErrorPtr splice_error;
-    (void)splice_pipe.Run(nullptr, &splice_error);
+    (void)splice_pipe.Run(m_stop_ctx, &splice_error);
     data_conn->Shutdown();
     conn->Shutdown();
 }

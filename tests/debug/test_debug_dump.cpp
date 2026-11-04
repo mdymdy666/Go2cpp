@@ -170,7 +170,7 @@ std::string SendSocketRaw(const std::string& path, const std::string& command) {
     return raw;
 }
 
-Response SendSocketCommand(const std::string& path, const std::string& command) {
+[[maybe_unused]] Response SendSocketCommand(const std::string& path, const std::string& command) {
     return ParseResponse(SendSocketRaw(path, command));
 }
 
@@ -183,7 +183,7 @@ std::string TrimTrailingNewlines(std::string value) {
 }
 
 /// 建立一条 Unix socket 连接；失败返回 -1。
-int ConnectUnix(const std::string& path) {
+[[maybe_unused]] int ConnectUnix(const std::string& path) {
     const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
@@ -204,7 +204,7 @@ int ConnectUnix(const std::string& path) {
 }
 
 /// 读一个完整的 `GO2CPP-DEBUG/1 <kind> <bytes>\n<payload>` 帧。
-bool ReadFrame(int fd, std::string* kind, std::string* payload) {
+[[maybe_unused]] bool ReadFrame(int fd, std::string* kind, std::string* payload) {
     std::string header;
     char ch = 0;
     for (;;) {
@@ -255,7 +255,7 @@ bool ReadFrame(int fd, std::string* kind, std::string* payload) {
 }
 
 /// 把 text dump 里的事件行（7 列）拆成 token；非事件行返回空。
-std::vector<std::string> EventLineTokens(const std::string& line) {
+[[maybe_unused]] std::vector<std::string> EventLineTokens(const std::string& line) {
     std::vector<std::string> tokens;
     if (line.empty() || line.front() == '#' ||
         line.find('=') != std::string::npos) {

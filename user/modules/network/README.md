@@ -129,7 +129,7 @@ task->wait_for(3s);
 | --- | --- | --- | --- |
 | 服务端 3s 不回，HTTP 请求超时 | `Socket::recv` 超时返回 `ETIMEDOUT`（`src/network/socket.cpp:887`），HTTP 层映射 `Result::Error::Timeout`（`src/network/http.cpp:728`） | ① 指数退避重试 ② 返回陈旧缓存 ③ 抛业务异常快速失败 | [`01-timeout.cpp:1`](01-timeout.cpp#L1) |
 | 服务端 kill -9 / 对端 RST | `ECONNRESET`/`EPIPE` 统一映射 `Result::Error::Closed`（`src/network/http.cpp:733`） | ① 重连 + 退避 ② 结构化上报 ③ 带 `Idempotency-Key` 幂等重发 | [`02-connection-reset.cpp:1`](02-connection-reset.cpp#L1) |
-| 4 MiB body 只发出一部分 | 单次 `Socket::send` 部分成功仍 `ok()==true`（`src/network/socket.cpp:857`）；库**没有** `SendAll` | ① `send_all` 循环 ② 分片 + checkpoint 续传 ③ 放弃并清理 | [`03-partial-write.cpp:1`](03-partial-write.cpp#L1) |
+| 4 MiB body 只发出一部分 | 单次 `Socket::send` 部分成功仍 `ok()==true`（`src/network/socket.cpp:857`）；库提供 `Socket::SendAll`（`include/go2cpp/network/socket.hpp:208`） | ① 手写 `send_all` 循环（对照库 `SendAll`）② 分片 + checkpoint 续传 ③ 放弃并清理 | [`03-partial-write.cpp:1`](03-partial-write.cpp#L1) |
 
 在仓库根目录编译运行（只依赖 `libgo2cpp_network`）：
 

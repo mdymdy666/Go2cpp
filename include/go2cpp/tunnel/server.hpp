@@ -39,6 +39,7 @@
  * @copyright MIT License
  */
 
+#include "go2cpp/concurrency/context.hpp"
 #include "go2cpp/metrics/metrics.hpp"
 #include "go2cpp/tunnel/mux.hpp"
 
@@ -269,6 +270,11 @@ private:
     void Spawn(std::function<void()> task);
     bool WaitWorkers(int timeout_ms);
 
+    /// 登记一条在途公网连接；`HandlePublic` 的 RAII 守卫在入口调用。
+    void TrackInflight(const TcpConn::Ptr& conn);
+    /// 注销在途公网连接；`Stop()` 已清空表时为空操作（幂等）。
+    void UntrackInflight(TcpConn* conn);
+
     TunnelServerConfig m_config;
     std::string m_display_host;
 
@@ -280,6 +286,22 @@ private:
     std::atomic<bool> m_running{false};
     std::thread m_control_thread;
     std::thread m_public_thread;
+
+    /// `Stop()` 的取消信号：所有在途公网请求的 `RelayPipe` 都挂在它下面。
+    ///
+    /// @details 之前传 `Context::Background()`——永不取消，`RelayPipe::Run` 只能
+    ///          靠两端 EOF 自然结束。`Stop()` 关掉监听后，在途连接若对端不再发
+    ///          数据，`Run` 会永远卡在 `done_cv.wait` 等另一个方向，两个 Direction
+    ///          线程有一个 join 不到、worker 计数不归零，`WaitWorkers` 超时后对象
+    ///          析构，TSan 即报 thread leak。改成可取消上下文后，`Stop()` 一次
+    ///          cancel 就让 `Run` 醒来并 `ForceCloseAll`。
+    ContextPtr m_stop_ctx;
+    CancelFunc m_stop_cancel;
+
+    /// 在途公网连接登记表：`Stop()` 必须主动 `Shutdown()` 它们，否则 worker
+    /// 会一直阻塞在 `ReadHttpHead` / `Read`，`WaitWorkers` 必然超时。
+    mutable std::mutex m_inflight_mutex;
+    std::unordered_map<TcpConn*, TcpConn::Ptr> m_inflight_public;
 
     mutable std::mutex m_tunnels_mutex;
     std::unordered_map<std::string, std::shared_ptr<Entry>> m_tunnels;

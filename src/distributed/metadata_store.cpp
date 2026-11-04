@@ -156,6 +156,8 @@ MetadataStore::~MetadataStore() {
             m_stop_dispatcher = true;
         }
         m_queue_cv.notify_all();
+        // 背压写者也要放行，否则析构会等一个永远不返回的写者。
+        m_space_cv.notify_all();
         if (m_dispatcher.joinable()) {
             m_dispatcher.join();
         }
@@ -316,14 +318,36 @@ bool MetadataStore::AppendWalLocked(const MetadataEvent &event) {
 void MetadataStore::EnqueueLocked(const MetadataEvent &event) {
     {
         std::lock_guard<std::mutex> lock(m_queue_mutex);
-        // 队列满时背压：写线程等待派发线程腾出空间，不丢事件。
-        while (m_queue.size() >= m_options.queue_capacity && !m_stop_dispatcher) {
-            std::this_thread::yield();
-        }
         m_queue.push_back(event);
         ++m_enqueued;
     }
     m_queue_cv.notify_one();
+}
+
+/**
+ * @brief 背压入口：队列满时在 `m_space_cv` 上等待派发线程腾出空间。
+ *
+ * ## 定位
+ * 唯一允许阻塞写线程的地方。**绝不能在持有 `m_mutex` 时调用**：派发线程
+ * 必须先 `pop` 才能腾出空间，而它在 `DeliverLocked` 里也要拿 `m_mutex`——
+ * 写者持锁等待、派发线程持空间等锁，就是死锁（原实现在持锁状态自旋，
+ * 甚至派发线程连 `pop` 都拿不到 `m_queue_mutex`）。
+ *
+ * ## 并发/失败语义
+ * - 调用约束：任意写线程，返回后才去抢 `m_mutex` 分配 revision；
+ * - 原子性：与派发线程通过 `m_queue_mutex` + `m_space_cv` 同步；
+ * - 不变量：返回时要么队列有空位、要么 store 正在关闭；
+ *   因为等待在 `m_mutex` 之外，并发写者可能短暂把队列顶到容量之上（软上限，
+ *   最多超出并发写者数），revision 顺序仍由 `m_mutex` 临界区保证。
+ */
+void MetadataStore::AwaitQueueSpace() {
+    if (m_options.sync_callbacks) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(m_queue_mutex);
+    m_space_cv.wait(lock, [this] {
+        return m_stop_dispatcher || m_queue.size() < m_options.queue_capacity;
+    });
 }
 
 void MetadataStore::DispatchLoop() {
@@ -342,6 +366,8 @@ void MetadataStore::DispatchLoop() {
             }
             event = std::move(m_queue.front());
             m_queue.pop_front();
+            // 空间已经真正释放再唤醒：写者拿到 m_queue_mutex 时谓词一定成立。
+            m_space_cv.notify_one();
         }
         std::lock_guard<std::mutex> dispatch_lock(m_dispatch_mutex);
         std::uint64_t matched = 0;
@@ -425,6 +451,8 @@ Outcome MetadataStore::Put(std::string_view key, std::string_view value,
     event.deleted = false;
 
     std::uint64_t assigned = 0;
+    // step1.5: 背压在 `m_mutex` **之外**等待：持锁等待会与派发线程互等。
+    AwaitQueueSpace();
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_closed) {
@@ -477,6 +505,8 @@ Outcome MetadataStore::Delete(std::string_view key, std::uint64_t *revision) {
     event.deleted = true;
 
     std::uint64_t assigned = 0;
+    // step1.5: 与 Put 相同，背压在 `m_mutex` 之外等待。
+    AwaitQueueSpace();
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (m_closed) {

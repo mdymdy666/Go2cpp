@@ -47,12 +47,6 @@ using Clock = std::chrono::steady_clock;
 
 int g_failures = 0;
 
-void Check(bool condition, const char* what) {
-    if (!condition) {
-        std::fprintf(stderr, "[boundary] FAILED: %s\n", what);
-        ++g_failures;
-    }
-}
 
 constexpr char kPreface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 constexpr std::size_t kPrefaceLen = sizeof(kPreface) - 1;

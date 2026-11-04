@@ -8,7 +8,7 @@
  * ## 模块定位
  *
  * `container` 模块的**汇总入口**，位于 Go 标准库适配层的最外层。下游是
- * `src/container/container.cpp`（用它做头文件自包含检查）与 `tests/container/*`；
+ * `src/container/container.cpp`（用它做头文件自包含检查）与 `tests/container/` 下的用例；
  * 上层业务代码若同时需要多个容器，包含本头即可。
  *
  * ## 本文件定义什么

@@ -5,8 +5,9 @@
  * ## 覆盖（真实场景，不是冒烟测试）
  *
  * 1. **NIST 已知向量**：`KeyId("abc")`、`KeyId("")`、`Redact("")` 的边界值；
- * 2. **与仓库实现的交叉验证**：2000 条随机长度输入，内嵌 SHA-256 与
- *    `go2cpp::hash::Sha256` 前 8 hex 必须完全一致（防止两份实现漂移）；
+ * 2. **与仓库实现的交叉验证**：2000 条随机长度输入，`KeyId`（一次性
+ *    `Sha256::Digest`）与 `go2cpp::hash::Sha256` 流式摘要的前 8 hex 必须
+ *    完全一致（防止两条代码路径漂移）；
  * 3. **token 占位符**：任意长度（含极长）都输出 `tok_***`，不泄露长度；
  * 4. **1e4 条日志全量扫描**：每条日志带随机 key/token 各一个，扫描全部
  *    格式化文本，明文出现次数必须为 **0**；同时 `key_id=` 与 `tok_***`
@@ -131,7 +132,7 @@ void TestKnownVectors() {
 // 2. 与 go2cpp::hash::Sha256 交叉验证
 // ---------------------------------------------------------------------------
 void TestAgainstRepoHash() {
-    BeginTest("内嵌 SHA-256 与 go2cpp::hash::Sha256 对拍（2000 条）");
+    BeginTest("一次性 Digest 与 go2cpp::hash::Sha256 流式摘要对拍（2000 条）");
     std::mt19937_64 rng(0x5eed1234u);
     int mismatches = 0;
     std::string first_mismatch;
@@ -157,7 +158,7 @@ void TestAgainstRepoHash() {
         }
     }
     Check(mismatches == 0,
-          "2000 条随机输入必须与仓库 Sha256 完全一致" +
+          "2000 条随机输入必须与仓库 Sha256 流式摘要完全一致" +
               (first_mismatch.empty() ? std::string() : "（首个：" + first_mismatch + "）"));
 }
 

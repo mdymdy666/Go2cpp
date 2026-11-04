@@ -8,16 +8,28 @@
  * 流式语义的正常现象**。策略 ③ 另外模拟服务端读取到一半就停读 3 秒。
  *
  * ## 默认行为（危险点）
- * - 库**没有** `SendAll`；唯一的发送接口是单次 `Socket::send`。它把
- *   `sendmsg` 的返回值原样带回：只要 `count >= 0` 就 `return {count, 0}`
- *   （src/network/socket.cpp:857-858）。
+ * - 单次 `Socket::send` 是**部分写语义**：把 `sendmsg` 的返回值原样带回，
+ *   只要 `count >= 0` 就 `return {count, 0}`（src/network/socket.cpp:857-858）。
+ *   库另有循环入口 `Socket::SendAll`（include/go2cpp/network/socket.hpp:208）：
+ *   它在内部循环到全量或错误为止，`ok()` 为真当且仅当 `transferred == length`。
  * - 因此「4 MiB 只发出 32 KiB」时 `SocketResult::ok() == true`、`error == 0`。
- *   如果调用方只检查 `ok()` 就认为发送完成，会静默丢数据。
- * - 正确语义必须由调用方补齐：循环发送直到 `sent == total`；HTTP 客户端
- *   自己就是这么做的（src/network/http.cpp:809-823 的 `while (sent < wire.size())`）。
+ *   如果调用方只检查单次 `send` 的 `ok()` 就认为发送完成，会静默丢数据。
+ * - 正确语义必须由调用方补齐：要么直接用 `SendAll`，要么自己循环直到
+ *   `sent == total`；HTTP 客户端自己就是这么做的（src/network/http.cpp:809-823
+ *   的 `while (sent < wire.size())`）。
+ *
+ * ## 手写 send_all 与库 SendAll 的差异
+ * 本示例刻意手写 `send_all()`，再与库实现对照，体现两者的取舍：
+ * - 手写版能按 `chunk` 限制每轮提交量、统计调用次数 `calls`，并把 `sent`
+ *   作为续传位置；适合需要观测中间进度或断点续传的场合；
+ * - 库 `SendAll` 把整个循环收进 socket 层：一次 `begin_operation`、超时覆盖
+ *   全部重试，返回同一个 `SocketResult`；优点是少一层样板、不会忘记处理部分
+ *   写，缺点是看不到中间轮次，也无法按块限制单次提交量；
+ * - 单次 `send` 只适合 ≤ 内核缓冲的小包。
  *
  * ## 可选策略（本文件给出 3 种可运行实现）
- * 1. `SendAll` 循环：`send_all()` 按块循环，直到发完或单次等待超时；
+ * 1. `SendAll` 循环：`send_all()` 按块循环，直到发完或单次等待超时；库等价物
+ *    是 `Socket::SendAll`（差异见上节）；
  * 2. 分片重发：`send_chunked()` 把 body 切成固定大小的片，每片成功后记录
  *    `checkpoint`；失败时从 checkpoint 续传（示例展示成功路径与 checkpoint 语义）；
  * 3. 放弃并清理：超时后记录已发字节、`shutdown` + `close` 连接、释放 body，
@@ -269,11 +281,19 @@ void demo_send_all() {
 
     std::printf("\n[策略① SendAll] 循环发送 %zu 字节\n", body.size());
     const auto outcome = send_all(*socket, body.data(), body.size(), 500ms, 64 * 1024);
-    std::printf("  complete=%d sent=%zu calls=%zu error=%d\n",
+    std::printf("  手写 send_all: complete=%d sent=%zu calls=%zu error=%d\n",
                 static_cast<int>(outcome.complete), outcome.sent, outcome.calls,
                 outcome.error);
-    check("SendAll 循环把 4 MiB 全部发出", outcome.complete && outcome.sent == body.size(),
+    check("手写 send_all 把 4 MiB 全部发出", outcome.complete && outcome.sent == body.size(),
           "以 returned sent 为准，不以单次 ok() 为准");
+    // 库等价物：同样 4 MiB 再发一遍，ok() 直接等价于「全量提交」；代价是看不到
+    // 中间轮次与单次提交量，续传位置只能从 transferred 推断。
+    const auto library = socket->SendAll(body.data(), body.size(), 0, 3s);
+    std::printf("  库 Socket::SendAll: transferred=%zd ok=%d error=%d\n",
+                library.transferred, static_cast<int>(library.ok()), library.error);
+    check("库 Socket::SendAll 的 ok() 等价于全量提交",
+          library.ok() && library.transferred == static_cast<ssize_t>(body.size()),
+          "内部循环到全量或错误为止，超时覆盖全部重试");
     socket->close();
 }
 

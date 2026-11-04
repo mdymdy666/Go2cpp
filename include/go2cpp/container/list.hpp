@@ -158,7 +158,7 @@ struct Element {
  *
  * ## 定位
  *
- * 双向链表的门面，向 `tests/container/*` 与未来的缓存/工作队列提供 Go 形态的 API；
+ * 双向链表的门面，向 `tests/container/` 下的用例 与未来的缓存/工作队列提供 Go 形态的 API；
  * 不提供迭代器，遍历必须走 `Front()` + `Element::Next()`（与 Go 写法一致）。
  *
  * ## 不变量

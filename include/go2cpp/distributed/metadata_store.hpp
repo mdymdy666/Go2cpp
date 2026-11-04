@@ -302,6 +302,8 @@ class MetadataStore {
     void DeliverLocked(const MetadataEvent &event, std::uint64_t *matched);
     /// @brief 把事件放入派发队列并唤醒派发线程；调用方必须持有 `m_mutex`。
     void EnqueueLocked(const MetadataEvent &event);
+    /// @brief 队列满时等待派发线程腾出空间；**不得**在持有 `m_mutex` 时调用。
+    void AwaitQueueSpace();
 
     MetadataStoreOptions m_options;
 
@@ -316,6 +318,10 @@ class MetadataStore {
     mutable std::mutex m_dispatch_mutex;  ///< 串行化所有回调调用（含 Replay）。
     mutable std::mutex m_queue_mutex;  ///< mutable：`GetStats()`（const）也要读计数。
     std::condition_variable m_queue_cv;
+    /// 队列腾出空间时唤醒背压中的写者。**必须与 `m_queue_cv` 分开**：同一个
+    /// cv 上的 notify_one 可能唤醒错误的一方（写者被唤醒后谓词不成立又睡回去，
+    /// 真正该醒的派发线程反而收不到通知），事件会滞留在队列里。
+    std::condition_variable m_space_cv;
     std::condition_variable m_flush_cv;
     std::deque<MetadataEvent> m_queue;
     std::uint64_t m_enqueued{0};

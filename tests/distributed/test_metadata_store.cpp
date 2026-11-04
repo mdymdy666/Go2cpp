@@ -16,12 +16,16 @@
 #include "test_support.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -279,6 +283,117 @@ void TestWalMiddleCorruptionRejected() {
     std::filesystem::remove_all(dir, error);
 }
 
+/**
+ * @brief 背压不能死锁：队列满时写者必须让出 `m_queue_mutex` 等派发线程 pop。
+ *
+ * 旧实现在持有 `m_queue_mutex` 时 `yield()` 自旋等待队列腾空：派发线程连
+ * pop 都拿不到锁，队列永远不腾，写者与派发线程互等（本用例会挂死）。
+ */
+void TestBackpressureNoDeadlock() {
+    go2cpp_tests::announce("metadata_store.backpressure_no_deadlock");
+    MetadataStoreOptions options;
+    options.queue_capacity = 1;  // 最小队列：派发线程一停，第二次写必满。
+    options.sync_callbacks = false;
+    auto opened = MetadataStore::Open(options);
+    GO2CPP_CHECK(opened.ok());
+    auto store = std::move(opened.value);
+
+    std::atomic<bool> release{false};
+    std::atomic<int> delivered{0};
+    const std::uint64_t watch_id = store->Watch("", [&](const MetadataEvent&) {
+        if (delivered.fetch_add(1) == 0) {
+            // 第一条事件把派发线程按在回调里，保证队列被填满。
+            while (!release.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    });
+    GO2CPP_CHECK(watch_id != 0);
+
+    std::atomic<bool> writer_done{false};
+    std::thread writer([&] {
+        for (int index = 0; index < 8; ++index) {
+            (void)store->Put("backpressure/" + std::to_string(index), "v");
+        }
+        writer_done.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // 队列容量 1 + 派发线程卡住：此时写者一定处于背压等待。
+    GO2CPP_CHECK(!writer_done.load(std::memory_order_acquire));
+    release.store(true, std::memory_order_release);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!writer_done.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (!writer_done.load(std::memory_order_acquire)) {
+        // 死锁：不能 join 一个永不返回的线程，直接以失败退出让 ctest 判定。
+        std::fprintf(stderr, "backpressure deadlock: writer blocked forever\n");
+        std::fflush(nullptr);
+        std::_Exit(1);
+    }
+    writer.join();
+    GO2CPP_CHECK(store->Flush());
+    GO2CPP_CHECK(delivered.load() == 8);
+    GO2CPP_CHECK(store->Unwatch(watch_id));
+}
+
+/**
+ * @brief Watch 断线（Unwatch）期间的事件不会自动补发，必须 Replay 补——且
+ *        重建订阅后游标跳到当前 revision，不会把旧事件再投一遍。
+ */
+void TestWatchGapNeedsReplay() {
+    go2cpp_tests::announce("metadata_store.watch_gap_replay");
+    auto opened = MetadataStore::OpenMemory();
+    GO2CPP_CHECK(opened.ok());
+    auto store = std::move(opened.value);
+
+    std::mutex mutex;
+    std::vector<MetadataEvent> seen;
+    auto record = [&](const MetadataEvent& event) {
+        std::lock_guard<std::mutex> lock(mutex);
+        seen.push_back(event);
+    };
+    const std::uint64_t id = store->Watch("cfg/", record);
+    GO2CPP_CHECK(id != 0);
+    GO2CPP_CHECK(store->Put("cfg/a", "1").ok());
+    GO2CPP_CHECK(store->Flush());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        GO2CPP_CHECK(seen.size() == 1);
+    }
+    // 断线：期间发生的变更没有订阅者，只能靠 Replay 补。
+    GO2CPP_CHECK(store->Unwatch(id));
+    GO2CPP_CHECK(store->Put("cfg/b", "2").ok());
+    GO2CPP_CHECK(store->Flush());
+
+    // 重建订阅（复用 stable_id）：游标 = 当前 revision，只收新事件。
+    const std::uint64_t resumed = store->Watch("cfg/", record, id);
+    GO2CPP_CHECK(resumed == id);
+    GO2CPP_CHECK(store->Put("cfg/c", "3").ok());
+    GO2CPP_CHECK(store->Flush());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        GO2CPP_CHECK(seen.size() == 2);  // 断线期间的 b 没有被自动补发
+        GO2CPP_CHECK(seen.back().key == "cfg/c");
+    }
+    // 从断线前的 revision 重放：b 与 c 都应补回来。
+    GO2CPP_CHECK(store->Replay(id, 2).ok());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        bool saw_b = false;
+        bool saw_c = false;
+        for (const MetadataEvent& event : seen) {
+            saw_b = saw_b || (event.revision == 2 && event.key == "cfg/b");
+            saw_c = saw_c || (event.revision == 3 && event.key == "cfg/c");
+        }
+        GO2CPP_CHECK(saw_b);
+        GO2CPP_CHECK(saw_c);
+    }
+    // 前缀不匹配的事件不投递；Replay 未知订阅返回 kNotFound。
+    GO2CPP_CHECK(!store->Replay(id + 999, 0).ok());
+}
+
 } // namespace
 
 int main() {
@@ -291,6 +406,8 @@ int main() {
     TestWalRestart();
     TestWalTruncatedTailRecovers();
     TestWalMiddleCorruptionRejected();
+    TestBackpressureNoDeadlock();
+    TestWatchGapNeedsReplay();
 
     const int failures = go2cpp_tests::g_failures.load();
     if (failures != 0) {

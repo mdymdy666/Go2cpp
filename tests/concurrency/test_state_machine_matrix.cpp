@@ -921,6 +921,8 @@ const char* LocalChannelStatusName(go2cpp::ChannelStatus status) {
         case go2cpp::ChannelStatus::kTimedOut: return "kTimedOut";
         case go2cpp::ChannelStatus::kNil: return "kNil";
         case go2cpp::ChannelStatus::kInvalid: return "kInvalid";
+        case go2cpp::ChannelStatus::kNoScheduler:
+            return "kNoScheduler";
     }
     return "?";
 }

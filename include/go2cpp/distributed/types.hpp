@@ -217,13 +217,16 @@ inline Duration RemainingUntil(TimePoint deadline, TimePoint now) noexcept {
     if (deadline <= now) {
         return Duration::zero();
     }
+    // 余量按纳秒取整（向上取整到 1ms）：先截断到微秒会让 (0, 1µs) 的存活
+    // 余量算出 0，调用方据此把「协调者判定仍有效」的租约当成已过期——语义
+    // 两侧不一致，表现为随机测试里偶发的 remaining == 0 与无谓的重新抢锁。
     const auto remaining =
-        std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
-    return std::chrono::duration_cast<Duration>(remaining) +
-           Duration(remaining % std::chrono::milliseconds(1) !=
-                            std::chrono::microseconds::zero()
-                        ? 1
-                        : 0);
+        std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
+    Duration millis = std::chrono::duration_cast<Duration>(remaining);
+    if (std::chrono::duration_cast<std::chrono::nanoseconds>(millis) < remaining) {
+        millis += Duration(1);
+    }
+    return millis > Duration::zero() ? millis : Duration(1);
 }
 
 } // namespace go2cpp::distributed

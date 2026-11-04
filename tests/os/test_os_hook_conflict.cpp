@@ -44,6 +44,13 @@
 
 namespace {
 
+/// 显式消费 syscall 返回值。
+/// @param value [in] `read`/`write`/`pipe` 的原始返回值；无所有权语义。
+/// @return 原样返回，仅用于让 `warn_unused_result` 看到一次真实使用。
+/// @note 裸 `(void)` 转型无法抑制 GCC 的 -Wunused-result；本文件的断言
+///       覆盖缓冲区内容与 hook 行为，返回值只作「调用已发生」的凭证。
+ssize_t ConsumeIoResult(ssize_t value) noexcept { return value; }
+
 using go2cpp::os::File;
 using go2cpp::os::FileStatus;
 using go2cpp::os::OsError;
@@ -97,7 +104,7 @@ void ScenarioFdSpectrum() {
     const std::string reg_path = ProcessScopedPath("os_hook_regular.txt");
     const char* reg = reg_path.c_str();
     int fd = ::open(reg, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) { ::write(fd, "x", 1); ::lseek(fd, 0, SEEK_SET); }
+    if (fd >= 0) { ConsumeIoResult(::write(fd, "x", 1)); ::lseek(fd, 0, SEEK_SET); }
     owned.push_back(fd);
     entries.push_back({"普通文件", fd, false, true, OsError::kOk});
 
@@ -110,7 +117,7 @@ void ScenarioFdSpectrum() {
     entries.push_back({"FIFO", fd, false, false, OsError::kNotRegularFile});
 
     int pfd[2] = {-1, -1};
-    (void)::pipe(pfd);
+    ConsumeIoResult(::pipe(pfd));
     owned.push_back(pfd[0]);
     owned.push_back(pfd[1]);
     entries.push_back({"pipe 读端", pfd[0], false, false, OsError::kNotRegularFile});

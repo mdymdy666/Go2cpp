@@ -461,43 +461,6 @@ HpackStatus DecodeString(const std::uint8_t* in, std::size_t length,
     return HpackStatus::kOk;
 }
 
-/// 解析「名字」：索引或字面量。
-HpackStatus DecodeName(const std::uint8_t* in, std::size_t length,
-                       std::size_t consumed_prefix, std::string* name,
-                       std::size_t* consumed, const DynamicTable& table,
-                       std::string* error) {
-    if (consumed_prefix >= length) {
-        return HpackStatus::kNeedMore;
-    }
-    std::uint64_t index = 0;
-    std::size_t index_bytes = 0;
-    const auto status = DecodeInteger(in + consumed_prefix, length - consumed_prefix, 7,
-                                      &index, &index_bytes);
-    if (status != HpackStatus::kOk) {
-        return status;
-    }
-    const std::size_t after_index = consumed_prefix + index_bytes;
-    if (index == 0) {
-        // 字面量名字
-        return DecodeString(in, length, after_index, name, consumed, error);
-    }
-    // 索引名字
-    if (index <= StaticTableSize()) {
-        *name = StaticTableEntry(static_cast<std::size_t>(index))->name;
-        *consumed = after_index;
-        return HpackStatus::kOk;
-    }
-    const auto* entry = table.Get(static_cast<std::size_t>(index) - StaticTableSize());
-    if (entry == nullptr) {
-        if (error != nullptr) {
-            *error = "HPACK 名字索引越界: " + std::to_string(index);
-        }
-        return HpackStatus::kIndexOutOfRange;
-    }
-    *name = entry->name;
-    *consumed = after_index;
-    return HpackStatus::kOk;
-}
 
 }  // namespace
 

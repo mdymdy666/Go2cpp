@@ -137,7 +137,7 @@ long long JsonInt(const std::string& json, const std::string& key) {
 }
 
 /// 收集 JSON 中所有 `"resource_id": N` 的数值（root + 每条事件）。
-std::vector<std::uint64_t> CollectResourceIds(const std::string& json) {
+[[maybe_unused]] std::vector<std::uint64_t> CollectResourceIds(const std::string& json) {
     const std::string needle = "\"resource_id\":";
     std::vector<std::uint64_t> ids;
     std::size_t pos = 0;
@@ -161,7 +161,7 @@ std::vector<std::uint64_t> CollectResourceIds(const std::string& json) {
 }
 
 /// 统计注册表中指定 kind 的**存活**条目数。
-std::size_t CountAliveKind(ResourceKind kind) {
+[[maybe_unused]] std::size_t CountAliveKind(ResourceKind kind) {
     std::size_t count = 0;
     for (const auto& info : SnapshotResources()) {
         if (info.alive && info.kind == kind) {

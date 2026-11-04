@@ -228,6 +228,14 @@ void TestIoCopy() {
     GO_CHECK(read.ok());
     GO_CHECK(read.count == payload.size());
     GO_CHECK(received == payload);
+    // 服务端在 io.Write 返回之后才累加 echoed，而客户端 ReadFull 可能先于这次
+    // 累加返回；按时间上限等待计数收敛，避免把调度时序误报成回显失败。
+    const auto echo_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (echoed.load() < payload.size() &&
+           std::chrono::steady_clock::now() < echo_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     GO_CHECK(echoed.load() == payload.size());
 
     (void)client.Close();

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -133,6 +134,45 @@ void TestInvalidInputRejected() {
     GO2CPP_CHECK(zero.ToString() == std::string(32, '0'));
 }
 
+/**
+ * @brief 字节级边界：嵌入 NUL、空白、非 ASCII、极值与大小写等价。
+ *
+ * 这些输入长度都正好 32，只靠「长度校验」挡不住，必须逐字符拒绝——
+ * 否则一个带 `\0` 的配置字符串会被静默解析成另一个身份。
+ */
+void TestParseByteBoundaries() {
+    go2cpp_tests::announce("node_id.byte_boundaries");
+    // 嵌入 NUL：std::string 保留长度 32，但 '\0' 不是十六进制字符。
+    std::string embedded(32, '0');
+    embedded[17] = '\0';
+    GO2CPP_CHECK(!NodeId::Parse(embedded).IsValid());
+    // 空白/制表：长度合法、字符非法。
+    std::string padded(32, 'a');
+    padded[0] = ' ';
+    GO2CPP_CHECK(!NodeId::Parse(padded).IsValid());
+    std::string tabbed(32, 'a');
+    tabbed[31] = '\t';
+    GO2CPP_CHECK(!NodeId::Parse(tabbed).IsValid());
+    // 非 ASCII 字节（0xF0）落在 char 的负数区间，不能被当成十六进制。
+    std::string high(32, 'a');
+    high[5] = static_cast<char>(0xF0);
+    GO2CPP_CHECK(!NodeId::Parse(high).IsValid());
+    // TryParse 对「长度非法」也必须保持 out 原值（不只是字符非法时）。
+    NodeId out = NodeId::FromParts(7, 9);
+    GO2CPP_CHECK(!NodeId::TryParse(std::string(31, 'a'), &out));
+    GO2CPP_CHECK(out == NodeId::FromParts(7, 9));
+    // 两个半区全 1 的极值往返。
+    const NodeId extreme = NodeId::FromParts(~std::uint64_t{0}, ~std::uint64_t{0});
+    GO2CPP_CHECK(extreme.ToString() == std::string(32, 'f'));
+    GO2CPP_CHECK(NodeId::Parse(extreme.ToString()) == extreme);
+    // 只有一半非 0 也算有效：用于「只设置一半」的测试夹具。
+    GO2CPP_CHECK(NodeId::FromParts(0, 5).IsValid());
+    GO2CPP_CHECK(NodeId::FromParts(5, 0).IsValid());
+    // 大写等价：Parse 不区分大小写，ToString 固定小写。
+    const NodeId mixed = NodeId::Parse("0123456789ABCDEFFEDCBA9876543210");
+    GO2CPP_CHECK(mixed == NodeId::FromParts(0x0123456789abcdefULL, 0xfedcba9876543210ULL));
+}
+
 void TestOrdering() {
     go2cpp_tests::announce("node_id.ordering");
     const NodeId a = NodeId::FromParts(1, 2);
@@ -153,6 +193,7 @@ int main() {
     TestConcurrentUnique();
     TestParseRoundTrip();
     TestInvalidInputRejected();
+    TestParseByteBoundaries();
     TestOrdering();
 
     const int failures = go2cpp_tests::g_failures.load();

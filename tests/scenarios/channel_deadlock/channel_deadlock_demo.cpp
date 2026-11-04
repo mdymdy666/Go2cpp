@@ -117,6 +117,8 @@ const char* StatusName(ChannelStatus status) {
     case ChannelStatus::kTimedOut: return "timed-out";
     case ChannelStatus::kNil: return "nil";
     case ChannelStatus::kInvalid: return "invalid";
+    case ChannelStatus::kNoScheduler:
+      return "no-scheduler";
   }
   return "unknown";
 }

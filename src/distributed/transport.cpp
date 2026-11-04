@@ -457,6 +457,9 @@ void CoordinatorServer::Impl::AcceptLoop() {
         if (!socket) {
             // 超时/临时错误：回到循环顶部检查 stopping；监听 socket 被
             // Stop() 关闭后 accept 也会失败，循环随即退出。
+            // 退避 1ms：EMFILE/ENFILE 这类**持续性**错误下裸 continue 会
+            // 把 accept 线程烧成 100% CPU，且日志/指标都看不出异常。
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
         // set_*_timeout 拒绝 0/负数；丢弃返回值会静默保持 max（无限阻塞），必须显式处理。
@@ -820,7 +823,11 @@ struct CoordinatorClient::Impl {
         // 客户端侧也必须关 Nagle：协调者请求都是几十字节的小包，分两次
         // 写的小包在 loopback 上会被延迟 ACK 压成 40ms 级往返。
         const int no_delay = 1;
-        socket->set_option(IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
+        // 丢弃返回值会静默保持 Nagle：小包被延迟 ACK 拖成 40ms 级往返，
+        // 租约 TTL 会被这段人为延迟吃掉（与 set_*_timeout 同一类缺陷）。
+        if (!socket->set_option(IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay))) {
+            std::fprintf(stderr, "[transport] WARN: set TCP_NODELAY failed\n");
+        }
         // set_*_timeout 拒绝 0/负数；丢弃返回值会静默保持 max（无限阻塞），必须显式处理。
         if (!socket->set_recv_timeout(options.io_timeout)) {
             std::fprintf(stderr, "[transport] WARN: set timeout rejected, keep default\n");

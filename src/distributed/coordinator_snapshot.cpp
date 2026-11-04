@@ -190,9 +190,19 @@ bool WriteWholeFileAtomic(const std::string &path, const std::string &blob,
     if (do_fsync) {
         const std::string dir = DirNameOf(path);
         const int dir_fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
-        if (dir_fd >= 0) {
-            (void)::fsync(dir_fd);
-            ::close(dir_fd);
+        if (dir_fd < 0) {
+            // rename 已生效但目录项可能没落盘：必须报失败（调用方置回 dirty
+            // 重试），否则「返回成功 = 掉电后仍在」的承诺失真。
+            *error = DescribeErrno("open snapshot dir");
+            return false;
+        }
+        const int sync_status = ::fsync(dir_fd);
+        const int sync_errno = errno;
+        ::close(dir_fd);
+        if (sync_status != 0) {
+            errno = sync_errno;
+            *error = DescribeErrno("fsync snapshot dir");
+            return false;
         }
     }
     return true;
@@ -422,6 +432,15 @@ Outcome Coordinator::Snapshot() {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         blob = SerializeSnapshotLocked();
+        // 写入上限必须与恢复侧 `ReadWholeFile` 的 `kMaxSnapshotBytes` 一致：
+        // 否则会写出一个「自己重启时拒绝加载」的快照，把可恢复状态变成拒绝启动
+        // （fail-stop 的代价是整机不可用，不能由自己造出来）。
+        if (blob.size() > kMaxSnapshotBytes) {
+            m_persist_error = "snapshot too large (" + std::to_string(blob.size()) +
+                              " bytes > " + std::to_string(kMaxSnapshotBytes) + ")";
+            m_dirty = true;
+            return Outcome::Failure(Status::kUnavailable, m_persist_error);
+        }
         m_dirty = false;
     }
     std::string error;

@@ -825,7 +825,7 @@ namespace {
 /// v7：默认降采样的调度器高频事件（数值 = SchedEventCode）。
 /// 只包含「同一 G 的日常搬运」码；关键事件（wake/*Rejected/claim fail/
 /// G 终态）不在其中，配对与异常分支不受影响。
-bool IsSchedHotEventCode(std::uint32_t code) noexcept {
+[[maybe_unused]] bool IsSchedHotEventCode(std::uint32_t code) noexcept {
     switch (code) {
         case 20:  // kEnqueue
         case 22:  // kRequeueWorker
@@ -1457,7 +1457,7 @@ std::atomic<std::uint32_t>& ResourceChainEverySlot() {
 }
 
 /// 采样周期按 2^shift 放大（v7：资源栈/链与全局位移相乘）。
-std::uint32_t ScaleSampleEvery(std::uint32_t every,
+[[maybe_unused]] std::uint32_t ScaleSampleEvery(std::uint32_t every,
                                std::uint32_t shift) noexcept {
     if (every <= 1U) {
         every = 1U;
@@ -1489,7 +1489,7 @@ struct ResourceRegistry {
     std::size_t dead_count{0}; ///< entries 中已注销条目数（受 mutex 保护）
 };
 
-ResourceRegistry& Registry() {
+[[maybe_unused]] ResourceRegistry& Registry() {
     static ResourceRegistry* registry = new ResourceRegistry();
     return *registry;
 }
@@ -1537,7 +1537,7 @@ std::uint32_t ThreadHash() noexcept {
         std::hash<std::thread::id>{}(std::this_thread::get_id()));
 }
 
-bool IsCriticalResult(ResourceResult result) noexcept {
+[[maybe_unused]] bool IsCriticalResult(ResourceResult result) noexcept {
     switch (result) {
         case ResourceResult::kBlocked:
         case ResourceResult::kWake:
@@ -1934,7 +1934,7 @@ namespace {
 
 /// 栈捕获核心：`every` 已包含全局位移等所有放大因子。
 /// 采样相位是「第 1 次必命中」：低频调用（< every 次）全部保留原始栈。
-StackSampleId CaptureStackSampleImpl(std::uint64_t gid, std::uint32_t every,
+[[maybe_unused]] StackSampleId CaptureStackSampleImpl(std::uint64_t gid, std::uint32_t every,
                                      std::uint32_t& sample_counter) noexcept {
 #if defined(__linux__)
     ++sample_counter;

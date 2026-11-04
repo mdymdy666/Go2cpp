@@ -315,35 +315,6 @@ int ResponseStatus(const std::string& response) {
     return std::atoi(response.c_str() + space + 1);
 }
 
-/// 取响应头里某个字段的值。
-std::string ResponseHeader(const std::string& response, const std::string& name) {
-    const std::string wanted = name + ":";
-    const std::size_t header_end = response.find("\r\n\r\n");
-    const std::string head = header_end == std::string::npos
-                                 ? response
-                                 : response.substr(0, header_end);
-    std::size_t offset = 0;
-    while (offset < head.size()) {
-        const std::size_t line_end = head.find("\r\n", offset);
-        const std::string line =
-            head.substr(offset, line_end == std::string::npos
-                                    ? std::string::npos
-                                    : line_end - offset);
-        if (line.size() > wanted.size() &&
-            line.compare(0, wanted.size(), wanted) == 0) {
-            std::string value = line.substr(wanted.size());
-            while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
-                value.erase(value.begin());
-            }
-            return value;
-        }
-        if (line_end == std::string::npos) {
-            break;
-        }
-        offset = line_end + 2;
-    }
-    return {};
-}
 
 // ---------------------------------------------------------------------------
 // 1. 协议编解码

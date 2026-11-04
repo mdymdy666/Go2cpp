@@ -61,6 +61,13 @@
 
 namespace {
 
+/// 显式消费 syscall 返回值。
+/// @param value [in] `read`/`write`/`pipe` 的原始返回值；无所有权语义。
+/// @return 原样返回，仅用于让 `warn_unused_result` 看到一次真实使用。
+/// @note 裸 `(void)` 转型无法抑制 GCC 的 -Wunused-result；本文件的断言
+///       覆盖缓冲区内容与 hook 行为，返回值只作「调用已发生」的凭证。
+ssize_t ConsumeIoResult(ssize_t value) noexcept { return value; }
+
 using Clock = std::chrono::steady_clock;
 using Ms = std::chrono::milliseconds;
 
@@ -200,7 +207,7 @@ void ScenarioNonSocketZeroImpact() {
                 Heartbeat hb(manager);
                 char buffer[128] = {};
                 for (int i = 0; i < 50; ++i) {
-                    (void)::read(fd, buffer, sizeof(buffer));
+                    ConsumeIoResult(::read(fd, buffer, sizeof(buffer)));
                     (void)::lseek(fd, 0, SEEK_SET);
                 }
                 delta_hook = hb.DeltaOver(Ms(100));
@@ -223,7 +230,7 @@ void ScenarioNonSocketZeroImpact() {
             const int rfd = ::open(fifo.c_str(), O_RDONLY | O_NONBLOCK);
             if (rfd >= 0 && wfd >= 0) {
                 const char value = 'F';
-                (void)::write(wfd, &value, 1);
+                ConsumeIoResult(::write(wfd, &value, 1));
                 char hook_buf = 0;
                 char raw_buf = 0;
                 const auto hook_rc = ::read(rfd, &hook_buf, 1);
@@ -273,7 +280,7 @@ void ScenarioSocketParks() {
                 // 在另一个 Fiber 里做阻塞 read
                 auto reader = manager.Go([&] {
                     char value = 0;
-                    (void)::read(pair.fds[0], &value, 1);   // 无数据 → park
+                    ConsumeIoResult(::read(pair.fds[0], &value, 1));   // 无数据 → park
                     read_done = true;
                 });
                 // 观察 200ms 的心跳增量
@@ -281,7 +288,7 @@ void ScenarioSocketParks() {
                 delta = hb.Count() - before;
                 // 制造数据把 reader 唤醒
                 const char value = 'S';
-                (void)::write(pair.fds[1], &value, 1);
+                ConsumeIoResult(::write(pair.fds[1], &value, 1));
                 (void)reader->wait_for(std::chrono::seconds(3));
                 hb.Stop();
             });
@@ -374,12 +381,12 @@ void ScenarioOsCoexists() {
                 // 2) 紧接着在 socket 上做 hook read（应正常 park）
                 auto reader = manager.Go([&] {
                     char value = 0;
-                    (void)::read(pair.fds[0], &value, 1);
+                    ConsumeIoResult(::read(pair.fds[0], &value, 1));
                     sock_ok = (value == 'M');
                 });
                 std::this_thread::sleep_for(Ms(30));
                 const char value = 'M';
-                (void)::write(pair.fds[1], &value, 1);
+                ConsumeIoResult(::write(pair.fds[1], &value, 1));
                 (void)reader->wait_for(std::chrono::seconds(3));
             });
             std::printf("  3a 交替: os::File 读成功=%d socket read 成功=%d\n",
@@ -452,7 +459,7 @@ void ScenarioMixedApiConsistency() {
                 // 先放一个字节，用 read_f 读掉（不 park）
                 {
                     const char value = 'A';
-                    (void)::write(pair.fds[1], &value, 1);
+                    ConsumeIoResult(::write(pair.fds[1], &value, 1));
                     std::this_thread::sleep_for(Ms(10));
                     char got = 0;
                     raw_ok = (::read_f(pair.fds[0], &got, 1) == 1) && (got == 'A');
@@ -463,13 +470,13 @@ void ScenarioMixedApiConsistency() {
                 const int before = hb.Count();
                 auto reader = manager.Go([&] {
                     char got = 0;
-                    (void)::read(pair.fds[0], &got, 1);
+                    ConsumeIoResult(::read(pair.fds[0], &got, 1));
                     hook_ok = (got == 'B');
                 });
                 std::this_thread::sleep_for(Ms(200));
                 delta_after_mix = hb.Count() - before;
                 const char value = 'B';
-                (void)::write(pair.fds[1], &value, 1);
+                ConsumeIoResult(::write(pair.fds[1], &value, 1));
                 (void)reader->wait_for(std::chrono::seconds(3));
                 hb.Stop();
             });
@@ -532,7 +539,7 @@ void ScenarioStressAndRace() {
                 for (int i = 0; i < kReaders; ++i) {
                     readers.push_back(manager.Go([&] {
                         char value = 0;
-                        (void)::read(pair.fds[0], &value, 1);
+                        ConsumeIoResult(::read(pair.fds[0], &value, 1));
                         readers_done.fetch_add(1, std::memory_order_relaxed);
                     }));
                 }
@@ -540,7 +547,7 @@ void ScenarioStressAndRace() {
                 // 发足够多的字节，让每个 reader 都能拿到一个
                 for (int i = 0; i < kReaders; ++i) {
                     const char value = static_cast<char>('0' + i);
-                    (void)::write(pair.fds[1], &value, 1);
+                    ConsumeIoResult(::write(pair.fds[1], &value, 1));
                     std::this_thread::sleep_for(Ms(5));
                 }
                 for (auto& reader : readers) {
@@ -599,7 +606,7 @@ void ScenarioStressAndRace() {
             (void)RunIsolated(manager, [&] {
                 auto reader = manager.Go([&] {
                     char value = 0;
-                    (void)::read(pair.fds[0], &value, 1);   // park
+                    ConsumeIoResult(::read(pair.fds[0], &value, 1));   // park
                     reader_done.store(true, std::memory_order_relaxed);
                 });
                 std::this_thread::sleep_for(Ms(50));        // reader 已 park
@@ -610,7 +617,7 @@ void ScenarioStressAndRace() {
                 std::printf("  5c 已 park 时关闭 kRead：set_ok=%d\n", set_ok ? 1 : 0);
                 // 再发数据，看已 park 的 reader 会不会被唤醒
                 const char value = 'W';
-                (void)::write(pair.fds[1], &value, 1);
+                ConsumeIoResult(::write(pair.fds[1], &value, 1));
                 const bool woken = reader->wait_for(std::chrono::seconds(3));
                 std::printf("  5c 已 park 的 reader 是否被唤醒=%d（结论：唤醒路径不查开关）\n",
                             woken ? 1 : 0);

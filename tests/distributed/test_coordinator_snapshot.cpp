@@ -212,6 +212,90 @@ void TestCorruptedCrcRejected() {
     std::filesystem::remove_all(dir, error);
 }
 
+/**
+ * @brief 残留 `<path>.tmp`（写完 tmp、rename 前掉电）不能影响恢复。
+ *
+ * 恢复只认正式路径；tmp 不是「更新的快照」，也不是「损坏的快照」——
+ * 误把 tmp 当快照会让 fencing 回退到未提交的状态。
+ */
+void TestLeftoverTempFileIgnored() {
+    go2cpp_tests::announce("coordinator_snapshot.temp_file_ignored");
+    const std::string dir = MakeTempDir("go2cpp_snapshot_tmp");
+    const std::string path = dir + "/coordinator.snapshot";
+    std::uint64_t token = 0;
+    {
+        Coordinator coordinator(MakeOptions(path));
+        token = AcquireToken(coordinator, "lock/tmp", "node-a");
+        GO2CPP_CHECK(token > 0);
+    }
+    // 模拟掉电残骸：一半的新快照内容留在 tmp 里。
+    {
+        std::ofstream tmp(path + ".tmp", std::ios::binary | std::ios::trunc);
+        tmp.write("G2CSNP01", 8);
+        tmp.put('\0');
+        tmp.put('\x01');
+    }
+    Coordinator restored(MakeOptions(path));
+    GO2CPP_CHECK(restored.healthy());
+    GO2CPP_CHECK(restored.load_error().empty());
+    const std::uint64_t next = AcquireToken(restored, "lock/tmp", "node-b");
+    GO2CPP_CHECK(next > token);
+}
+
+/**
+ * @brief 快照写失败时：返回 kUnavailable、旧快照仍可恢复、token 不回退。
+ *
+ * 把 tmp 路径变成目录即可让 `open(tmp, O_CREAT)` 稳定失败（EISDIR），
+ * 不需要制造真实磁盘满，也不破坏正式路径上的上一份快照。
+ */
+void TestWriteFailureKeepsPreviousSnapshot() {
+    go2cpp_tests::announce("coordinator_snapshot.write_failure_keeps_previous");
+    const std::string dir = MakeTempDir("go2cpp_snapshot_writefail");
+    const std::string path = dir + "/coordinator.snapshot";
+    std::uint64_t token = 0;
+    {
+        Coordinator coordinator(MakeOptions(path));
+        token = AcquireToken(coordinator, "lock/fail", "node-a");
+        GO2CPP_CHECK(token > 0);
+        // 让 tmp 路径不可写：open 必然失败。
+        std::error_code ignored;
+        GO2CPP_CHECK(std::filesystem::create_directory(path + ".tmp", ignored));
+        const auto failed = coordinator.Snapshot();
+        GO2CPP_CHECK(!failed.ok());
+        GO2CPP_CHECK(failed.status == Status::kUnavailable);
+        GO2CPP_CHECK(!coordinator.persist_error().empty());
+        GO2CPP_CHECK(std::filesystem::remove(path + ".tmp", ignored));
+    }
+    // 磁盘上仍是上一份完整快照：能加载，且新 token 严格大于旧 token。
+    Coordinator restored(MakeOptions(path));
+    GO2CPP_CHECK(restored.healthy());
+    const std::uint64_t next = AcquireToken(restored, "lock/fail", "node-b");
+    GO2CPP_CHECK(next > token);
+}
+
+/**
+ * @brief 超过恢复侧上限（64 MiB）的快照文件必须被拒绝启动，而不是 OOM/截断。
+ */
+void TestOversizedSnapshotRejected() {
+    go2cpp_tests::announce("coordinator_snapshot.oversized_rejected");
+    const std::string dir = MakeTempDir("go2cpp_snapshot_oversize");
+    const std::string path = dir + "/coordinator.snapshot";
+    {
+        std::ofstream create(path, std::ios::binary | std::ios::trunc);
+        create.put('\0');
+    }
+    std::error_code error;
+    std::filesystem::resize_file(path, (std::uint64_t{64} << 20) + 1, error);
+    GO2CPP_CHECK(!error);
+    Coordinator coordinator(MakeOptions(path));
+    GO2CPP_CHECK(!coordinator.healthy());
+    GO2CPP_CHECK(coordinator.load_error().find("size") != std::string::npos);
+    // fail-stop：写操作一律 kUnavailable（不回退到空表）。
+    const auto acquired = coordinator.AcquireLock("lock/big", "node", Duration(60000));
+    GO2CPP_CHECK(acquired.status == Status::kUnavailable);
+    std::filesystem::remove_all(dir, error);
+}
+
 } // namespace
 
 int main() {
@@ -221,6 +305,9 @@ int main() {
     TestMissingSnapshotStartsFresh();
     TestTruncatedSnapshotRejected();
     TestCorruptedCrcRejected();
+    TestLeftoverTempFileIgnored();
+    TestWriteFailureKeepsPreviousSnapshot();
+    TestOversizedSnapshotRejected();
 
     const int failures = go2cpp_tests::g_failures.load();
     if (failures != 0) {

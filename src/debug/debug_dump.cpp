@@ -2228,36 +2228,7 @@ bool IsResourceEventCode(SchedEventCode code) noexcept {
     }
 }
 
-bool IsChannelResourceCode(SchedEventCode code) noexcept {
-    switch (code) {
-        case SchedEventCode::kChannelSend:
-        case SchedEventCode::kChannelRecv:
-        case SchedEventCode::kChannelWake:
-        case SchedEventCode::kChannelSendOk:
-        case SchedEventCode::kChannelRecvOk:
-        case SchedEventCode::kChannelSelect:
-        case SchedEventCode::kChannelSelectEnter:
-            return true;
-        default:
-            return false;
-    }
-}
 
-bool IsLockEventCode(SchedEventCode code) noexcept {
-    switch (code) {
-        case SchedEventCode::kMutexLock:
-        case SchedEventCode::kMutexUnlock:
-        case SchedEventCode::kRwLockRead:
-        case SchedEventCode::kRwUnlockRead:
-        case SchedEventCode::kRwLockWrite:
-        case SchedEventCode::kRwUnlockWrite:
-        case SchedEventCode::kRecursiveLock:
-        case SchedEventCode::kRecursiveUnlock:
-            return true;
-        default:
-            return false;
-    }
-}
 
 bool IsLockAcquireCode(SchedEventCode code) noexcept {
     return code == SchedEventCode::kMutexLock ||
