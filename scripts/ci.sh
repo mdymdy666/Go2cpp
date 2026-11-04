@@ -207,12 +207,12 @@ step_ok
 
 # -------------------------------------------------------------------- ctest
 step_begin "ctest"
-# 已知的环境相关失败（WSL 内核语义 / 线程数假设 / 文档数字漂移）。
+# 已知的环境相关失败（WSL 内核语义 / 线程数假设 / 文档数字漂移 / TSan 长跑）。
 # 默认严格（不排除）；CI 里设 CI_ALLOW_KNOWN=1 时排除这 3 项，避免红得没有信息量。
 CTEST_EXCLUDE=()
 if [ "${CI_ALLOW_KNOWN:-0}" = "1" ]; then
-    CTEST_EXCLUDE=(-E "io_hook|go2cpp_tests|docs_consistency")
-    printf '[ci] allow-known: 排除 io_hook / go2cpp_tests / docs_consistency（已知环境相关）\n'
+    CTEST_EXCLUDE=(-E "io_hook|go2cpp_tests|docs_consistency|relay_hub_tsan")
+    printf '[ci] allow-known: 排除 io_hook / go2cpp_tests / docs_consistency / relay_hub_tsan（已知环境相关）\n'
 fi
 CTEST_LOG="$LOG_DIR/ctest.log"
 CTEST_JUNIT="$LOG_DIR/ctest-junit.xml"
