@@ -149,8 +149,16 @@ public:
 
     // ---- 仅供 MuxSession 调用（接收线程 / 心跳线程） ----
 
-    /// 接收线程投递一段数据；队列溢出返回 false（调用方应关闭该流）。
-    bool PushData(const std::uint8_t* data, std::size_t length);
+    /**
+     * @brief 接收线程投递一段数据；队列溢出返回 false（调用方应关闭该流）。
+     * @param data [in] 数据首地址，借用（拷贝进队列后即可失效）。
+     * @param length [in] 字节数；`0` 直接返回 true。
+     * @param notify [in] 是否唤醒读线程。批量投递同一流的连续帧时，只有最后
+     *             一帧传 true，把「每帧一次 futex 唤醒」摊薄为「每批一次」。
+     * @return 队列未溢出返回 true；溢出返回 false（调用方应 FailStream）。
+     */
+    bool PushData(const std::uint8_t* data, std::size_t length,
+                  bool notify = true);
     /// 对端关闭（收到 CLOSE 帧或会话断开）。
     void MarkPeerClosed(const char* reason);
 
@@ -222,6 +230,38 @@ public:
     bool SendPayload(FrameType type, const std::vector<std::uint8_t>& payload);
 
     /**
+     * @brief 把一段流数据切成 DATA 帧，用一次 writev 批量发出（合并写）。
+     *
+     * @param stream_id [in] 目标流 id；由本端分配，对端按它分发。
+     * @param data [in] 载荷首地址；`size == 0` 时可为 nullptr，否则不可为 nullptr。
+     *            只在本次调用期间被读取（直接进 iovec，不复制）。
+     * @param size [in] 字节数；按 `kMaxDataChunk` 切帧，单次最多
+     *            `kMaxSendBatchFrames` 帧（约 1 MiB），超出部分连续分批。
+     * @return 全部字节写完返回 true；连接不可用 / 写入失败返回 false。
+     *
+     * ## 定位
+     * 隧道数据面唯一的出站提交点：一次 syscall 写多帧，同时把发送互斥量的
+     * 持有次数从「每帧一次」降到「每批一次」。做错了会出现帧交错（对端解码出
+     * 错误流）或半批丢失（流卡死），因此这里必须整批持锁。
+     *
+     * ## 步骤
+     * step1. 逐帧计算 body 长度（末帧可能不足 `kMaxDataChunk`），帧头写进栈上
+     *         缓冲，body 直接指向 `data`（零拷贝）。
+     * step2. 组 iovec：每帧两段（头 + body），最多 `2 * kMaxSendBatchFrames` 段。
+     * step3. 持 `m_send_mutex` 调 `TcpConn::WriteV`；失败即整条连接不可用。
+     * step4. 推进 offset 到下一批，直到写完 `size`。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：任意线程；与 `SendPayload` 共用 `m_send_mutex`，帧不会交错。
+     * - 原子性：一批内的多帧由 `WriteV` 保证字节流连续；跨批不保证。
+     * - 失败语义：不抛异常；返回 false 后调用方必须按连接失效处理（关流）。
+     * - 不变量：返回 true 时 `m_bytes_out` 已累加全部线上字节（含帧头）。
+     * - 前提：仅在 `with_checksum == false` 时可用；启用校验时帧尾需要 CRC，
+     *   调用方必须回退到 `SendPayload`（逐帧 `FrameCodec::Encode`）。
+     */
+    bool SendData(std::uint32_t stream_id, const char* data, std::size_t size);
+
+    /**
      * @brief 发起优雅关闭：通知对端不再接受新流，在途流继续跑完。
      * @param reason 0=正常关闭、1=维护、2=被替换。
      * @param retry_after_ms 建议重连延迟；0 表示不要重连。
@@ -274,7 +314,19 @@ private:
 
     void ReceiveLoop();
     void HeartbeatLoop();
-    void Dispatch(const frame::Frame& frame);
+    /**
+     * @brief 处理一帧；DATA 帧按 `notify_data` 决定是否唤醒该流读线程。
+     *
+     * @param frame [in] 已解出的完整帧（payload 借用，调用期间有效）。
+     * @param notify_data [in] DATA 帧入队后是否 `notify_one`；批量投递同一流的
+     *        连续帧时，非末帧传 false 可把唤醒次数从每帧一次降到每批一次。
+     *        非 DATA 帧忽略此参数。
+     *
+     * ## 定位
+     * 接收线程唯一的帧分派点；`notify` 传错的最坏后果是读线程延迟到下一帧
+     * 才被唤醒（性能问题），不会丢数据——队列本身是持锁入队的。
+     */
+    void Dispatch(const frame::Frame& frame, bool notify_data = true);
     void RemoveStream(std::uint32_t id);
     /// 从表里删除并标记对端关闭 + 发 CLOSE 帧（队列溢出等异常路径）。
     void FailStream(std::uint32_t id, const char* reason);

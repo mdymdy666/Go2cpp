@@ -39,6 +39,10 @@
 #include <mutex>
 #include <string>
 
+/// 全局作用域前置声明：`WriteV` 的入参类型。POSIX 下由 <sys/uio.h> 定义；
+/// 头文件不直接包含它，避免影响非 POSIX 环境的头文件解析。
+struct iovec;
+
 namespace go2cpp {
 namespace tunnel {
 
@@ -101,6 +105,30 @@ public:
      */
     bool WriteAll(const void* data, std::size_t length, int timeout_ms = 30000,
                   std::string* err = nullptr);
+
+    /**
+     * @brief 用一次 `writev(2)` 写出一组 iovec（合并写）。
+     *
+     * @param iov [in] 分段数组，每段 `{基址, 字节数}`；基址只在调用期间被读取。
+     *            段数上限 64（超出返回 false，不静默截断）。
+     * @param count [in] 段数；0 表示无数据、直接成功；负数非法。
+     * @param timeout_ms [in] 整体写等待上限（毫秒）；0 表示立即超时。
+     * @param err [out] 失败原因；成功时保持原值。
+     * @return 全部字节写完返回 true；连接关闭 / 超时 / 段数过多返回 false，
+     *         此时**可能已有部分字节上线**，调用方必须按「连接不可用」处理。
+     *
+     * ## 定位
+     * 隧道控制连接上唯一的批量提交点：把「帧头 + 载荷」的多个分段合成一次
+     * syscall，省掉每帧一次 `send`。写侧与 `WriteAll` 共用同一把互斥量，
+     * 因此两者混用时帧不会交错；实现错了会导致帧边界错位、对端解码失败。
+     *
+     * ## 并发/失败语义
+     * - 调用约束：任意线程，可与其他 `WriteAll` 并发（内部串行化）。
+     * - 原子性：iovec 前缀按「字节流」推进，不保证一次 syscall 写完。
+     * - 失败语义：不抛异常；失败后 `m_closed` 可能仍为 false，调用方须断开连接。
+     */
+    bool WriteV(const struct iovec* iov, int count, int timeout_ms = 30000,
+                std::string* err = nullptr);
 
     /// 关闭读/写方向（幂等、可跨线程）；不释放 fd。
     void Shutdown() noexcept;

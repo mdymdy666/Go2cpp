@@ -515,8 +515,9 @@ void TunnelClient::RelayLocal(const MuxStream::Ptr& stream) {
     SocketStream local_stream(local, 1000);
     EofClosingStream tunnel_side(stream.get(), &local_stream);
     relay::PipeConfig pipe_config;
-    pipe_config.copy_buf = 32U * 1024U;
-    pipe_config.queue_cap = 256U * 1024U;
+    // 合并写：与 server 侧同口径，单 chunk 256 KiB（MuxStream::Write 一次提交）。
+    pipe_config.copy_buf = 256U * 1024U;
+    pipe_config.queue_cap = 512U * 1024U;
     pipe_config.write_timeout = std::chrono::milliseconds(30000);
     relay::RelayPipe pipe(&local_stream, &tunnel_side, pipe_config);
     ErrorPtr pipe_error;

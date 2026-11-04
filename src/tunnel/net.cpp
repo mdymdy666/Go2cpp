@@ -28,6 +28,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -387,6 +388,87 @@ bool TcpConn::WriteAll(const void* data, std::size_t length, int timeout_ms,
         if (poll_error != 0) {
             if (err != nullptr) {
                 *err = "write: " + std::string(std::strerror(poll_error));
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+
+bool TcpConn::WriteV(const struct iovec* iov, int count, int timeout_ms,
+                     std::string* err) {
+    constexpr int kMaxVectors = 64;
+    if (count < 0 || (iov == nullptr && count != 0)) {
+        if (err != nullptr) {
+            *err = "writev: invalid iovec";
+        }
+        return false;
+    }
+    if (count > kMaxVectors) {
+        if (err != nullptr) {
+            *err = "writev: too many vectors";
+        }
+        return false;
+    }
+    if (count == 0) {
+        return true;
+    }
+    // 本地副本：writev 的部分写会推进 iovec 前缀，调用方的数组必须保持只读。
+    struct iovec local[kMaxVectors];
+    std::memcpy(local, iov,
+                sizeof(struct iovec) * static_cast<std::size_t>(count));
+    int first = 0;
+    int remaining = count;
+    std::lock_guard<std::mutex> lock(m_write_mutex);
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(std::max(0, timeout_ms));
+    while (remaining > 0) {
+        if (m_closed.load(std::memory_order_acquire)) {
+            if (err != nullptr) {
+                *err = "writev: connection closed";
+            }
+            return false;
+        }
+        const ssize_t sent = ::writev(m_fd, local + first, remaining);
+        if (sent > 0) {
+            auto left = static_cast<std::size_t>(sent);
+            while (remaining > 0 &&
+                   left >= static_cast<std::size_t>(local[first].iov_len)) {
+                left -= static_cast<std::size_t>(local[first].iov_len);
+                ++first;
+                --remaining;
+            }
+            if (remaining > 0 && left > 0) {
+                local[first].iov_base =
+                    static_cast<std::uint8_t*>(local[first].iov_base) + left;
+                local[first].iov_len -= left;
+            }
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            if (err != nullptr) {
+                *err = "writev: " + std::string(std::strerror(errno));
+            }
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            if (err != nullptr) {
+                *err = "writev: timeout";
+            }
+            return false;
+        }
+        const int wait_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+                .count());
+        const int poll_error = PollFd(m_fd, POLLOUT, std::max(1, wait_ms));
+        if (poll_error != 0) {
+            if (err != nullptr) {
+                *err = "writev: " + std::string(std::strerror(poll_error));
             }
             return false;
         }

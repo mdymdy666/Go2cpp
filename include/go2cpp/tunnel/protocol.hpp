@@ -75,6 +75,9 @@ inline constexpr std::uint16_t kProtocolVersion = 1;
 /// 4 字节魔数 `"TUNL"`。
 inline constexpr char kFrameMagic[] = "TUNL";
 /// 单帧载荷上限（字节），与 `FrameCodec` 的 `max_payload` 一致。
+/// 2026-11-04 合并写实测：256 KiB 帧在 4 并发下反而比 64 KiB 低 15%
+/// （单帧重组缓冲 + 队列元素跨核迁移压垮 L2），故保持 64 KiB，靠 writev
+/// 一次提交 4-5 帧来减少 syscall。
 inline constexpr std::size_t kMaxPayload = 65536;
 /// `DATA` 帧里单个 body 的上限（`stream_id` 占 4 字节）。
 inline constexpr std::size_t kMaxDataChunk = kMaxPayload - 4;
@@ -82,6 +85,11 @@ inline constexpr std::size_t kMaxDataChunk = kMaxPayload - 4;
 inline constexpr std::size_t kMaxSubdomainLen = 63;
 /// token 最大长度（防止 HELLO 帧过大）。
 inline constexpr std::size_t kMaxTokenLen = 256;
+
+/// 单次 `SendData` 合并写最多几帧（16 x 65532 B ≈ 1 MiB，iovec 段数 32）。
+inline constexpr std::size_t kMaxSendBatchFrames = 16;
+/// 隧道帧头字节数（12 字节，与 `frame::FrameCodec` 的 header_len 一致）。
+inline constexpr std::size_t kFrameHeaderBytes = 12;
 
 /// 帧类型（对应 `frame::Frame::type`）。
 enum class FrameType : std::uint8_t {

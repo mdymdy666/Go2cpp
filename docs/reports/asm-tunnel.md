@@ -151,3 +151,68 @@ $ cd .build-bento-wsl && ctest -R tunnel --output-on-failure
   内存数据面；tunnel 是**网络转发**，每字节都要过 2 次内核 socket 缓冲，
   回环上限本身就在 GB/s 量级。若后续要以 10 GB/s 为目标，只能换
   共享内存/io_uring 路径，不是指令级优化能解决的。
+
+## 合并写优化（2026-11-04）
+
+目标：隧道开销 ≤2×（单连接 ≥1443 MiB/s、4 并发 ≥3640 MiB/s，按本机直连中位折算）。
+
+### 1. 改动清单（7 个代码文件，全部在 `src/tunnel/` + `include/go2cpp/tunnel/`；另加本文档）
+
+| 文件:行 | 改动 | 作用 |
+|---|---|---|
+| `include/go2cpp/tunnel/net.hpp:130` | 新增 `TcpConn::WriteV` 声明 | 批量写入口（`iovec` 最多 64 段） |
+| `src/tunnel/net.cpp:399` | `TcpConn::WriteV` 实现 | 一次 `writev(2)` + 部分写推进 + `EAGAIN`→`poll(POLLOUT)`；与 `WriteAll` 共用 `m_write_mutex`，帧不交错 |
+| `include/go2cpp/tunnel/protocol.hpp:90` | 新增 `kMaxSendBatchFrames=16`、`kFrameHeaderBytes=12` | 单批最多 16 帧（≈1 MiB）、帧头长度 |
+| `include/go2cpp/tunnel/mux.hpp:262` | 新增 `MuxSession::SendData(stream_id, data, size)` | 数据面唯一出站提交点，整段切帧 + 一次 `writev` |
+| `src/tunnel/mux.cpp:403` | `SendData` 实现 | 帧头落栈缓冲、body 直接进 iovec（零中间拷贝）；启用帧尾 CRC 时回退逐帧 `EncodeData`+`SendPayload` |
+| `src/tunnel/mux.cpp:214` | `MuxStream::Write` 改为一次 `SendData` | 改前每 32 KiB chunk 一次 `EncodeData`（1 次 32 KiB 拷贝）+ 一次 `send` + 一次发送锁；改后每 256 KiB 一次 `writev`（4–5 帧） |
+| `src/tunnel/mux.cpp:177` | `MuxStream::Read` 一次锁内取多元素 | 一次 `Read` 拼满调用方缓冲（最多 256 KiB），锁/唤醒从「每 64 KiB 一次」降到「每 256 KiB 一次」 |
+| `src/tunnel/mux.cpp:253` | `PushData` 增加 `notify` 参数 | 批量投递时同一流的连续帧只唤醒一次 |
+| `src/tunnel/mux.cpp:734` | `ReceiveLoop` 相邻同流 DATA 帧只对末帧置 `notify=true` | 一次 `recv`（512 KiB 缓冲）内 8 帧只发 1 次 futex 唤醒 |
+| `src/tunnel/server.cpp:1161` / `client.cpp:519` | `copy_buf` 32 KiB→256 KiB、`queue_cap` 256 KiB→512 KiB | 每次线程接力搬运 8 倍数据，接力次数降 8 倍 |
+| `src/tunnel/mux.cpp:703` | 接收缓冲 64 KiB→512 KiB | 一次 `recv` 拿 2 帧，减少半帧续接 |
+
+为什么帧保持 64 KiB 而不是 256 KiB：实测把 `kMaxPayload` 提到 256 KiB 后，单连接 +19%（687→820），
+但 **4 并发 −15%**（1065→902）——单帧 256 KiB 的重组缓冲 + 队列元素跨核迁移压垮 L2（每流 512 KiB 队列），
+故回退 64 KiB，靠 `writev` 一次提交 4–5 帧来省 syscall。
+
+### 2. 前后数据（`taskset -c 0-7`，每次 5 轮，3 次独立运行取中位，回环）
+
+| 指标 | 改前 | 改后 | 变化 |
+|---|---|---|---|
+| 单连接吞吐（8 MiB POST） | 475.16 MiB/s | **754.05 MiB/s** | **+59%** |
+| 单连接开销（直连/隧道） | 6.55×（直连 3029） | **3.40×**（直连 2886） | −48% |
+| 4 并发吞吐（4×8 MiB） | 686.73 MiB/s | **858.77 MiB/s** | **+25%** |
+| 4 并发开销 | 9.61×（直连 6502） | **7.93×**（直连 7280） | −17% |
+| 隧道延迟 p50（64 KiB POST） | 1.438–1.471 ms | **1.416–1.466 ms** | 持平（+0.7%） |
+| 隧道延迟 p99 | 1.980–2.233 ms | **2.036–2.116 ms** | 持平 |
+| 4 并发单请求 p50 / p99 | 43.8–46.1 / 48.0–59.6 ms | **30.2–32.1 / 39.4–42.1 ms** | −30% / −20% |
+
+三次运行的隧道绝对值：单连接 `643.19 / 858.67 / 754.05`；4 并发 `957.01 / 827.76 / 858.77`。
+完整性：每次 `integrity requests=242 bytes=432013312 failures=0`（8 MiB body 逐请求核验）。
+`ctest -R tunnel` 5/5 通过（含 `ratio < 4.0` 的延迟防回归检查，实测比值 3.55–3.94×）。
+
+### 3. 为什么只到 3.40× / 7.93×，没到 ≤2×
+
+单连接要 ≤2× 需 1443 MiB/s（直连 2886 的一半），当前 754，差 1.9 倍。按 256 KiB chunk 折算，
+当前每 chunk 约 **330 µs**，拆成：
+
+| 成本项 | 每 256 KiB 估算 | 依据 |
+|---|---|---|
+| memcpy ×5 | ~130 µs | relay 读缓冲→队列、`FrameCodec` 重组、`PushData` 入队、`MuxStream::Read` 出队、relay 写队列→socket；5 × 256 KiB @ ~10 GB/s |
+| 线程接力 ×4 | ~160 µs | 「public 读线程 → relay 写线程 → mux 发送 → 对端 ReceiveLoop → PushData 唤醒 → relay 读线程 → 落地」中实际的 4 次跨线程唤醒（每次含 futex + 调度，40 µs 量级） |
+| syscall ×3 | ~30 µs | `writev` 1 次 + `recv` 1 次 + 落地 `write` 1 次 |
+| 锁/分支/统计 | ~10 µs | `m_send_mutex` + `streams_mutex` + 原子计数 |
+
+**结论：瓶颈已从「每 32 KiB 一次 syscall」转为「每 256 KiB 仍有 4 次线程接力 + 5 次 memcpy」，
+其中 4 次接力里 3 次由 `relay::RelayPipe` 的「读线程 + 有界队列 + 写线程」结构决定**——
+`src/tunnel/` 只贡献中间 1 跳。要真正压到 ≤2× 必须把 RelayPipe 换成「同一线程读→写」的直通，
+或两端共享内存 / `io_uring`；这需要改 `include/go2cpp/relay/relay_pipe.hpp`（本次可改范围之外）。
+
+4 并发扩展性更差（7.93×）的两个串行点也在此：一条 `ReceiveLoop` 承担全部流的解帧与投递、
+一把 `m_send_mutex` 串行化全部流的 `writev`。把发送改为 per-session 发送线程 + 无锁队列，
+预计能再拿 20–30%，但仍不足以到 2×。
+
+继续加大 `copy_buf`（1 MiB）单连接到 959 MiB/s（3.24×），但**延迟比值升到 4.04–4.15×**，
+触发 `test_tunnel.cpp:911` 的 `ratio < 4.0`（每请求新建流要新分配 1 MiB 读缓冲 ×2 侧）。
+最终取 256 KiB：吞吐 754 / 4 并发 859，延迟 6/6 通过阈值。

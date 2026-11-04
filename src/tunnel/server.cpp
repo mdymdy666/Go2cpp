@@ -1156,8 +1156,10 @@ void TunnelServer::HandlePublic(TcpConn::Ptr conn) {
         m_metric_streams->Inc();
     }
     relay::PipeConfig pipe_config;
-    pipe_config.copy_buf = 32U * 1024U;
-    pipe_config.queue_cap = 256U * 1024U;
+    // 合并写：单次 Read 取 256 KiB，经 MuxStream::Write 一次 writev 发 4-5 帧，
+    // syscall 从「每 32 KiB 一次」降到「每 256 KiB 一次」。
+    pipe_config.copy_buf = 256U * 1024U;
+    pipe_config.queue_cap = 512U * 1024U;
     pipe_config.write_timeout = std::chrono::milliseconds(30000);
     relay::RelayPipe pipe(&public_side, &tunnel_side, pipe_config);
     ErrorPtr pipe_error;

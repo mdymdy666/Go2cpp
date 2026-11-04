@@ -22,6 +22,8 @@
 
 #include "go2cpp/logging/log.hpp"
 
+#include <sys/uio.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -62,6 +64,25 @@ std::vector<std::uint8_t> MakeClosePayload(std::uint32_t stream_id,
     std::vector<std::uint8_t> payload;
     (void)EncodeClose(close, &payload, nullptr);
     return payload;
+}
+
+/// 从 DATA 帧载荷前 4 字节读出 stream_id（小端）；畸形帧返回 0。
+std::uint32_t PayloadStreamId(const frame::Frame& frame) {
+    if (frame.payload.size() < 4U) {
+        return 0;
+    }
+    return static_cast<std::uint32_t>(frame.payload[0]) |
+           (static_cast<std::uint32_t>(frame.payload[1]) << 8U) |
+           (static_cast<std::uint32_t>(frame.payload[2]) << 16U) |
+           (static_cast<std::uint32_t>(frame.payload[3]) << 24U);
+}
+
+/// 小端写 32 位；批量帧头直接落栈缓冲，不经过 `FrameCodec::Encode`。
+void StoreU32Le(std::uint8_t* out, std::uint32_t value) {
+    out[0] = static_cast<std::uint8_t>(value & 0xFFU);
+    out[1] = static_cast<std::uint8_t>((value >> 8U) & 0xFFU);
+    out[2] = static_cast<std::uint8_t>((value >> 16U) & 0xFFU);
+    out[3] = static_cast<std::uint8_t>((value >> 24U) & 0xFFU);
 }
 
 }  // namespace
@@ -169,18 +190,25 @@ streams::ReadResult MuxStream::Read(char* data, std::size_t size) {
     if (m_queue.empty()) {
         return {0, streams::IoEof()};
     }
-    std::vector<std::uint8_t>& front = m_queue.front();
-    const std::size_t take = std::min(size, front.size());
-    std::memcpy(data, front.data(), take);
-    if (take == front.size()) {
-        m_queued_bytes -= front.size();
-        m_queue.pop_front();
-    } else {
-        front.erase(front.begin(),
-                    front.begin() + static_cast<std::ptrdiff_t>(take));
-        m_queued_bytes -= take;
+    // 批量取：一次锁内把多个队列元素拼进调用方缓冲（最多 size 字节），
+    // 减少「每 64 KiB 帧一次加锁 + 一次唤醒」。改前每次 Read 只取一个元素，
+    // RelayPipe 的 256 KiB 读缓冲要拆 4 次 Read、4 次条件变量等待。
+    std::size_t copied = 0;
+    while (copied < size && !m_queue.empty()) {
+        std::vector<std::uint8_t>& front = m_queue.front();
+        const std::size_t take = std::min(size - copied, front.size());
+        std::memcpy(data + copied, front.data(), take);
+        copied += take;
+        if (take == front.size()) {
+            m_queued_bytes -= front.size();
+            m_queue.pop_front();
+        } else {
+            front.erase(front.begin(),
+                        front.begin() + static_cast<std::ptrdiff_t>(take));
+            m_queued_bytes -= take;
+        }
     }
-    return {take, nullptr};
+    return {copied, nullptr};
 }
 
 streams::WriteResult MuxStream::Write(const char* data, std::size_t size) {
@@ -195,31 +223,14 @@ streams::WriteResult MuxStream::Write(const char* data, std::size_t size) {
     if (!session) {
         return {0, NewError("tunnel: session gone")};
     }
-    std::size_t offset = 0;
-    // 复用同一个 payload：EncodeData 只 clear() 不释放容量，稳态每 chunk
-    // 零分配（改动前每个 chunk 新建一个 32 KiB vector）。
-    std::vector<std::uint8_t> payload;
-    while (offset < size) {
-        if (m_closed.load(std::memory_order_acquire)) {
-            return {offset, NewError("tunnel: stream closed")};
-        }
-        const std::size_t chunk =
-            std::min(size - offset, kMaxDataChunk);
-        ErrorPtr encode_error;
-        if (!EncodeData(m_id, reinterpret_cast<const std::uint8_t*>(data) + offset,
-                        chunk, &payload, &encode_error)) {
-            LogStreamWriteFailure(m_id, offset, chunk, "DATA encode failed",
-                                  ErrorMessage(encode_error));
-            return {offset, encode_error};
-        }
-        if (!session->SendPayload(FrameType::kData, payload)) {
-            LogStreamWriteFailure(m_id, offset, chunk, "DATA send failed",
-                                  std::string());
-            return {offset, NewError("tunnel: send failed")};
-        }
-        offset += chunk;
-        m_bytes_out.fetch_add(chunk, std::memory_order_relaxed);
+    // 合并写：整段数据切成 DATA 帧后由一次 writev 提交；帧头落栈缓冲，
+    // body 直接进 iovec（零拷贝）。改前这里是逐 chunk 的 Encode + send，
+    // 每次 RelayPipe 的 32 KiB chunk 各付一次 syscall 与一次发送锁。
+    if (!session->SendData(m_id, data, size)) {
+        LogStreamWriteFailure(m_id, 0, size, "DATA send failed", std::string());
+        return {0, NewError("tunnel: send failed")};
     }
+    m_bytes_out.fetch_add(size, std::memory_order_relaxed);
     return {size, nullptr};
 }
 
@@ -239,7 +250,8 @@ ErrorPtr MuxStream::Close() {
     return nullptr;
 }
 
-bool MuxStream::PushData(const std::uint8_t* data, std::size_t length) {
+bool MuxStream::PushData(const std::uint8_t* data, std::size_t length,
+                         bool notify) {
     if (length == 0) {
         return true;
     }
@@ -254,6 +266,9 @@ bool MuxStream::PushData(const std::uint8_t* data, std::size_t length) {
     m_queue.emplace_back(data, data + length);
     m_queued_bytes += length;
     lock.unlock();
+    if (!notify) {
+        return true;
+    }
     m_cv.notify_one();
     m_bytes_in.fetch_add(length, std::memory_order_relaxed);
     return true;
@@ -385,6 +400,83 @@ bool MuxSession::SendPayload(FrameType type,
     return true;
 }
 
+bool MuxSession::SendData(std::uint32_t stream_id, const char* data,
+                           std::size_t size) {
+    if (size == 0) {
+        return true;
+    }
+    if (data == nullptr || !alive() || !m_conn) {
+        return false;
+    }
+    // 启用帧尾 CRC 时无法用 iovec 直写（校验和覆盖帧头 + 载荷），
+    // 回退到逐帧 Encode + SendPayload；默认配置走批量路径。
+    if (m_config.with_checksum) {
+        std::vector<std::uint8_t> payload;
+        std::size_t offset = 0;
+        while (offset < size) {
+            const std::size_t chunk = std::min(size - offset, kMaxDataChunk);
+            ErrorPtr encode_error;
+            if (!EncodeData(stream_id,
+                            reinterpret_cast<const std::uint8_t*>(data) + offset,
+                            chunk, &payload, &encode_error) ||
+                !SendPayload(FrameType::kData, payload)) {
+                LogStreamWriteFailure(stream_id, offset, chunk,
+                                      "DATA encode/send failed", std::string());
+                return false;
+            }
+            offset += chunk;
+        }
+        return true;
+    }
+
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(data);
+    // 帧头（12 B）+ stream_id（4 B）拼在一条栈缓冲里，body 直接引用入参，
+    // 因此整个批量发送只有一次 writev、零中间拷贝。
+    std::uint8_t headers[kMaxSendBatchFrames][kFrameHeaderBytes + 4U];
+    struct iovec vectors[kMaxSendBatchFrames * 2U];
+    std::size_t offset = 0;
+    std::lock_guard<std::mutex> lock(m_send_mutex);
+    while (offset < size) {
+        if (!alive() || !m_conn) {
+            return false;
+        }
+        std::size_t frames = 0;
+        std::size_t cursor = offset;
+        std::size_t batch_bytes = 0;
+        while (frames < kMaxSendBatchFrames && cursor < size) {
+            const std::size_t chunk = std::min(size - cursor, kMaxDataChunk);
+            std::uint8_t* const header = headers[frames];
+            std::memcpy(header, kFrameMagic, 4U);
+            header[4] = static_cast<std::uint8_t>(kProtocolVersion);
+            header[5] = static_cast<std::uint8_t>(FrameType::kData);
+            header[6] = 0;
+            header[7] = 0;
+            const std::uint32_t body_length =
+                static_cast<std::uint32_t>(chunk) + 4U;
+            StoreU32Le(header + 8U, body_length);
+            StoreU32Le(header + kFrameHeaderBytes, stream_id);
+            vectors[frames * 2U].iov_base = header;
+            vectors[frames * 2U].iov_len = kFrameHeaderBytes + 4U;
+            vectors[frames * 2U + 1U].iov_base =
+                const_cast<std::uint8_t*>(bytes + cursor);
+            vectors[frames * 2U + 1U].iov_len = chunk;
+            cursor += chunk;
+            batch_bytes += kFrameHeaderBytes + 4U + chunk;
+            ++frames;
+        }
+        std::string write_error;
+        if (!m_conn->WriteV(vectors, static_cast<int>(frames * 2U), 30000,
+                            &write_error)) {
+            LogFrameWriteFailure(static_cast<int>(FrameType::kData), batch_bytes,
+                                 write_error);
+            return false;
+        }
+        m_bytes_out.fetch_add(batch_bytes, std::memory_order_relaxed);
+        offset = cursor;
+    }
+    return true;
+}
+
 bool MuxSession::SendGoAway(std::uint8_t reason,
                             std::uint32_t retry_after_ms) {
     if (!alive()) {
@@ -485,7 +577,7 @@ void MuxSession::MarkAllStreamsClosed(const char* reason) {
     }
 }
 
-void MuxSession::Dispatch(const frame::Frame& frame) {
+void MuxSession::Dispatch(const frame::Frame& frame, bool notify_data) {
     switch (static_cast<FrameType>(frame.type)) {
         case FrameType::kHelloAck: {
             HelloAck ack;
@@ -548,7 +640,7 @@ void MuxSession::Dispatch(const frame::Frame& frame) {
                 // 流已被本端关闭：晚到的数据直接丢弃，不必断开连接。
                 return;
             }
-            if (!stream->PushData(data.body, data.length)) {
+            if (!stream->PushData(data.body, data.length, notify_data)) {
                 GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("tunnel.mux"))
                     << "recv queue overflow stream=" << data.stream_id
                     << " bytes=" << data.length;
@@ -606,7 +698,9 @@ void MuxSession::Dispatch(const frame::Frame& frame) {
 
 void MuxSession::ReceiveLoop() {
     frame::FrameCodec codec(MakeTunnelFrameSpec(m_config.with_checksum));
-    std::vector<std::uint8_t> buffer(64U * 1024U);
+    // 一次 recv 尽量多拿整帧：512 KiB = 2 x 256 KiB 帧，减少 recv 次数与
+    // 「半帧留在 FrameCodec 里」的续接开销。
+    std::vector<std::uint8_t> buffer(512U * 1024U);
     std::vector<frame::Frame> frames;
     while (alive()) {
         const IoResult result = m_conn->Read(
@@ -634,8 +728,18 @@ void MuxSession::ReceiveLoop() {
                 << " err=" << frame_error.message;
             break;  // 帧边界不可信，整条连接作废
         }
-        for (const frame::Frame& frame : frames) {
-            Dispatch(frame);
+        // 同一条流的连续 DATA 帧只对最后一帧唤醒读线程：一次 recv 常含
+        // 多帧（512 KiB 缓冲），改前每帧一次 futex 唤醒。
+        for (std::size_t index = 0; index < frames.size(); ++index) {
+            bool notify = true;
+            if (static_cast<FrameType>(frames[index].type) == FrameType::kData &&
+                index + 1 < frames.size() &&
+                static_cast<FrameType>(frames[index + 1].type) ==
+                    FrameType::kData) {
+                notify = PayloadStreamId(frames[index]) !=
+                         PayloadStreamId(frames[index + 1]);
+            }
+            Dispatch(frames[index], notify);
             if (!alive()) {
                 break;
             }
