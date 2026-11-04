@@ -459,8 +459,14 @@ void CoordinatorServer::Impl::AcceptLoop() {
             // Stop() 关闭后 accept 也会失败，循环随即退出。
             continue;
         }
-        socket->set_recv_timeout(options.io_timeout);
-        socket->set_send_timeout(options.io_timeout);
+        // set_*_timeout 拒绝 0/负数；丢弃返回值会静默保持 max（无限阻塞），必须显式处理。
+        if (!socket->set_recv_timeout(options.io_timeout)) {
+            std::fprintf(stderr, "[transport] WARN: set timeout rejected, keep default\n");
+        }
+        // set_*_timeout 拒绝 0/负数；丢弃返回值会静默保持 max（无限阻塞），必须显式处理。
+        if (!socket->set_send_timeout(options.io_timeout)) {
+            std::fprintf(stderr, "[transport] WARN: set timeout rejected, keep default\n");
+        }
         const std::string key = "conn:" + std::to_string(g_connection_sequence.fetch_add(1));
         auto connection = std::make_shared<ServerConnection>(socket, key);
         hub.Register(key, connection);
@@ -815,8 +821,14 @@ struct CoordinatorClient::Impl {
         // 写的小包在 loopback 上会被延迟 ACK 压成 40ms 级往返。
         const int no_delay = 1;
         socket->set_option(IPPROTO_TCP, TCP_NODELAY, &no_delay, sizeof(no_delay));
-        socket->set_recv_timeout(options.io_timeout);
-        socket->set_send_timeout(options.io_timeout);
+        // set_*_timeout 拒绝 0/负数；丢弃返回值会静默保持 max（无限阻塞），必须显式处理。
+        if (!socket->set_recv_timeout(options.io_timeout)) {
+            std::fprintf(stderr, "[transport] WARN: set timeout rejected, keep default\n");
+        }
+        // set_*_timeout 拒绝 0/负数；丢弃返回值会静默保持 max（无限阻塞），必须显式处理。
+        if (!socket->set_send_timeout(options.io_timeout)) {
+            std::fprintf(stderr, "[transport] WARN: set timeout rejected, keep default\n");
+        }
         return true;
     }
 
