@@ -386,7 +386,7 @@ std::string Response::to_string(bool head_request) const {
 }
 
 Parser::Parser(ParserLimits limits) : m_limits(limits) {}
-void Parser::reset() { m_buffer.clear(); m_expected_body = 0; m_chunk_remaining = 0; m_chunked = false; m_finished = false; m_in_chunk_trailer = false; m_response_close_delimited = false; m_body_start = 0; m_error.clear(); }
+void Parser::reset() { m_buffer.clear(); m_chunked_body.clear(); m_chunk_scan_pos = 0; m_expected_body = 0; m_chunk_remaining = 0; m_chunked = false; m_finished = false; m_in_chunk_trailer = false; m_response_close_delimited = false; m_body_start = 0; m_error.clear(); }
 ParseResult Parser::feed(std::string_view bytes, Request& request) { return feed_impl(bytes, false, &request, nullptr); }
 ParseResult Parser::feed(std::string_view bytes, Response& response) { return feed_impl(bytes, true, nullptr, &response); }
 ParseResult Parser::finish(Response& response) {
@@ -466,7 +466,12 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
     if (header_end + 4 > m_limits.max_header_bytes) { m_error = "header too large"; return {ParseState::Error, bytes.size(), m_error}; }
     const std::string_view header_block(m_buffer.data(), header_end);
     std::size_t line_end = header_block.find("\r\n");
-    if (line_end == std::string::npos || line_end > m_limits.max_line_bytes)
+    // 空头 informational 响应（如 `HTTP/1.1 100 Continue\r\n\r\n`）的
+    // header_block 只有起始行、不含任何 CRLF。此时起始行一直延伸到块尾，
+    // 必须用块长兜底；否则会被误判成 invalid start line（Client 0ms 返回
+    // Parse(7)，gateway 把上游 100 直接变成 502）。
+    if (line_end == std::string::npos) line_end = header_block.size();
+    if (line_end > m_limits.max_line_bytes)
         return {ParseState::Error, bytes.size(), "invalid start line"};
     // step4: 切分起始行并做格式/长度校验；请求行只允许三段，响应行第三段可含空格。
     const std::string_view start_line = header_block.substr(0, line_end);
@@ -582,18 +587,42 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
     } else if (body_start > std::numeric_limits<std::size_t>::max() - content_length) {
         return {ParseState::Error, bytes.size(), "body length overflow"};
     } else if (chunked) {
-        std::size_t cursor = body_start; std::string body;
+        // 增量 chunked 解析：游标与已解码 body 必须跨 feed 复用。原实现把
+        // cursor/body 放在栈上，NeedMore 时丢弃，下一次从 body_start 全量
+        // 重扫——6 MiB body + 1 KiB feed 是 O(n²)（实测 1.6 s）。这里游标是
+        // m_buffer 内绝对偏移：NeedMore 分支不擦除缓冲，偏移在后续 feed 中
+        // 依然有效；只有真正完成时才把 body 移交调用方并清空状态。
+        if (m_chunk_scan_pos == 0) m_chunk_scan_pos = body_start;
+        std::size_t cursor = m_chunk_scan_pos;
         while (true) {
-            const auto end = m_buffer.find("\r\n", cursor); if (end == std::string::npos) return {ParseState::NeedMore, bytes.size(), {}};
-            const auto line = m_buffer.substr(cursor, end - cursor);
+            const std::size_t chunk_line_start = cursor;
+            const auto end = m_buffer.find("\r\n", cursor);
+            if (end == std::string::npos) {
+                // 块大小行还没到齐；同时守住行长上限，避免对端只发无 CRLF
+                // 的长串把缓冲撑到 body 上限。
+                if (m_buffer.size() - cursor > m_limits.max_line_bytes)
+                    return {ParseState::Error, bytes.size(), "chunk line too large"};
+                m_chunk_scan_pos = chunk_line_start;
+                return {ParseState::NeedMore, bytes.size(), {}};
+            }
+            const auto line = std::string_view(m_buffer).substr(cursor, end - cursor);
             if (line.size() > m_limits.max_line_bytes) return {ParseState::Error, bytes.size(), "chunk line too large"};
             std::size_t chunk_size = 0; if (!parse_chunk_size(line, chunk_size)) return {ParseState::Error, bytes.size(), "invalid chunk"};
-            cursor = end + 2; if (chunk_size > m_limits.max_body_bytes || body.size() > m_limits.max_body_bytes - chunk_size) return {ParseState::Error, bytes.size(), "body too large"};
+            cursor = end + 2;
+            if (chunk_size > m_limits.max_body_bytes || m_chunked_body.size() > m_limits.max_body_bytes - chunk_size)
+                return {ParseState::Error, bytes.size(), "body too large"};
             if (chunk_size == 0) {
                 const auto trailer_end = m_buffer.find("\r\n\r\n", cursor);
                 if (trailer_end == std::string::npos) {
                     if (m_buffer.compare(cursor, 2, "\r\n") == 0) body_end = cursor + 2;
-                    else return {ParseState::NeedMore, bytes.size(), {}};
+                    else {
+                        // trailer 还没收全：下次从 0 块行重新扫描即可（trailer
+                        // 上限 16 KiB，重扫代价可忽略），已解码 body 保持不动。
+                        if (m_buffer.size() - cursor > m_limits.max_trailer_bytes)
+                            return {ParseState::Error, bytes.size(), "trailers too large"};
+                        m_chunk_scan_pos = chunk_line_start;
+                        return {ParseState::NeedMore, bytes.size(), {}};
+                    }
                 } else {
                     if (trailer_end - cursor > m_limits.max_trailer_bytes) return {ParseState::Error, bytes.size(), "trailers too large"};
                     const auto trailer_block = m_buffer.substr(cursor, trailer_end - cursor);
@@ -614,10 +643,18 @@ ParseResult Parser::feed_impl(std::string_view bytes, bool response, Request* re
                     }
                     body_end = trailer_end + 4;
                 }
-                if (response) result->body = std::move(body); else request->body = std::move(body); break;
+                if (response) result->body = std::move(m_chunked_body); else request->body = std::move(m_chunked_body);
+                m_chunked_body.clear();
+                m_chunk_scan_pos = 0;
+                break;
             }
-            if (cursor > std::numeric_limits<std::size_t>::max() - chunk_size - 2 || m_buffer.size() < cursor + chunk_size + 2) return {ParseState::NeedMore, bytes.size(), {}};
-            body.append(m_buffer, cursor, chunk_size); cursor += chunk_size; if (m_buffer.compare(cursor, 2, "\r\n") != 0) return {ParseState::Error, bytes.size(), "chunk terminator missing"}; cursor += 2;
+            // 数据不完整时游标回到块行起点：下次重新解析大小行但不会重复
+            // append（append 只发生在完整性检查之后），body 也不会丢。
+            if (cursor > std::numeric_limits<std::size_t>::max() - chunk_size - 2 || m_buffer.size() < cursor + chunk_size + 2) {
+                m_chunk_scan_pos = chunk_line_start;
+                return {ParseState::NeedMore, bytes.size(), {}};
+            }
+            m_chunked_body.append(m_buffer, cursor, chunk_size); cursor += chunk_size; if (m_buffer.compare(cursor, 2, "\r\n") != 0) return {ParseState::Error, bytes.size(), "chunk terminator missing"}; cursor += 2;
         }
     } else {
         if (content_length > m_limits.max_body_bytes) return {ParseState::Error, bytes.size(), "body too large"};

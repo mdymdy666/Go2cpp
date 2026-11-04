@@ -294,6 +294,119 @@ void run_network_tests() {
         GO2CPP_CHECK(large_request.body.back() == sample_byte(kBodySize - 1));
         GO2CPP_CHECK(large_request.body[kBodySize / 2] == sample_byte(kBodySize / 2));
     }
+    // 回归：chunked 增量解析必须跨 feed 复用游标。修复前每次 NeedMore 都
+    // 丢弃局部 body/cursor，下一次从 body_start 全量重扫，6 MiB body 的总
+    // 扫描量是 O(n²)：close-delimited 19 ms vs chunked 4017 ms（211 倍）。
+    // 这里用与真实 recv 一致的 1 KiB 任意边界切片喂完整 chunked wire，
+    // 并同时跑一遍 close-delimited 作为相对基线。
+    {
+        constexpr std::size_t kChunkedBody = 6U * 1024U * 1024U;
+        constexpr std::size_t kChunkUnit = 1024U;  // 每个 chunk 0x400 字节
+        constexpr std::size_t kChunkCount = kChunkedBody / kChunkUnit;
+        constexpr std::size_t kFeedSize = 1024U;   // 每次 feed 1 KiB wire
+        static_assert(kChunkCount == 6144, "6 MiB / 1 KiB 必须是整数块");
+        // 每个字节由偏移决定：既能校验首尾抽样，也能发现错位或丢字节。
+        const auto sample_byte = [](std::size_t offset) {
+            return static_cast<char>((offset * 31U + (offset >> 8U) + 0x5AU) & 0xFFU);
+        };
+        std::string chunked_wire =
+            "HTTP/1.1 200 OK\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Content-Type: application/octet-stream\r\n\r\n";
+        const std::size_t chunked_head_size = chunked_wire.size();
+        chunked_wire.reserve(chunked_head_size + kChunkCount * (kChunkUnit + 8) + 8);
+        for (std::size_t offset = 0; offset < kChunkedBody; offset += kChunkUnit) {
+            chunked_wire += "400\r\n";
+            for (std::size_t i = 0; i < kChunkUnit; ++i)
+                chunked_wire += sample_byte(offset + i);
+            chunked_wire += "\r\n";
+        }
+        chunked_wire += "0\r\n\r\n";
+        // 同样的 6 MiB body 走 close-delimited，仅作性能基线。
+        std::string close_wire = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+        const std::size_t close_head_size = close_wire.size();
+        close_wire.reserve(close_head_size + kChunkedBody);
+        for (std::size_t offset = 0; offset < kChunkedBody; ++offset)
+            close_wire += sample_byte(offset);
+
+        go2cpp::http::Parser close_parser;
+        go2cpp::http::Response close_response;
+        const auto close_begin = std::chrono::steady_clock::now();
+        GO2CPP_CHECK(close_parser.feed(
+                         std::string_view(close_wire.data(), close_head_size), close_response)
+                         .state == go2cpp::http::ParseState::NeedMore);
+        for (std::size_t offset = 0; offset < kChunkedBody; offset += kFeedSize) {
+            const std::size_t size = std::min(kFeedSize, kChunkedBody - offset);
+            close_parser.feed(std::string_view(close_wire.data() + close_head_size + offset, size),
+                              close_response);
+        }
+        const auto close_finished = close_parser.finish(close_response);
+        const auto close_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - close_begin);
+        GO2CPP_CHECK(close_finished.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(close_response.body.size() == kChunkedBody);
+
+        go2cpp::http::Parser chunked_parser;
+        go2cpp::http::Response chunked_response;
+        const auto chunked_begin = std::chrono::steady_clock::now();
+        auto chunked_result = chunked_parser.feed(
+            std::string_view(chunked_wire.data(), chunked_head_size), chunked_response);
+        GO2CPP_CHECK(chunked_result.state == go2cpp::http::ParseState::NeedMore);
+        const std::size_t chunked_body_wire = chunked_wire.size() - chunked_head_size;
+        for (std::size_t offset = 0; offset < chunked_body_wire; offset += kFeedSize) {
+            const std::size_t size = std::min(kFeedSize, chunked_body_wire - offset);
+            chunked_result = chunked_parser.feed(
+                std::string_view(chunked_wire.data() + chunked_head_size + offset, size),
+                chunked_response);
+            if (chunked_result.state != go2cpp::http::ParseState::NeedMore) break;
+        }
+        const auto chunked_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - chunked_begin);
+        GO2CPP_CHECK(chunked_result.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(chunked_response.status == go2cpp::http::Status::OK);
+        GO2CPP_CHECK(chunked_response.body.size() == kChunkedBody);
+        bool chunked_body_ok = chunked_response.body.size() == kChunkedBody;
+        for (std::size_t offset = 0; chunked_body_ok && offset < kChunkedBody; ++offset)
+            chunked_body_ok = chunked_response.body[offset] == sample_byte(offset);
+        GO2CPP_CHECK(chunked_body_ok);
+        // 修复前的 e2e 复现数据是 4017 ms；修复后应在个位数毫秒。
+        // 同时用 close-delimited 基线兜底，避免 CI 慢机把绝对阈值变脆。
+        GO2CPP_CHECK(chunked_elapsed.count() < 100);
+        GO2CPP_CHECK(chunked_elapsed.count() <= close_elapsed.count() * 4 + 50);
+        go2cpp_tests::announce("chunked 6MiB/1KiB feed: " +
+                               std::to_string(chunked_elapsed.count()) + " ms vs close-delimited " +
+                               std::to_string(close_elapsed.count()) + " ms");
+    }
+    // chunked 跨 feed 状态必须随 reset() 清理：复用同一 Parser 解析下一条
+    // 消息时，不能把上一条已解码 body 拼进来（m_chunked_body/m_chunk_scan_pos）。
+    {
+        go2cpp::http::Parser reuse_parser;
+        go2cpp::http::Response reuse_response;
+        GO2CPP_CHECK(reuse_parser
+                         .feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                               "5\r\nfirst\r\n",
+                               reuse_response)
+                         .state == go2cpp::http::ParseState::NeedMore);
+        GO2CPP_CHECK(reuse_response.body.empty());
+        reuse_parser.reset();
+        reuse_response = go2cpp::http::Response{};
+        GO2CPP_CHECK(reuse_parser
+                         .feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                               "6\r\nsecond\r\n0\r\n\r\n",
+                               reuse_response)
+                         .state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(reuse_response.body == "second");
+        // 小限额：chunk 声明超过 max_body_bytes 时必须在读数据前报错，
+        // 不能先把数据攒进 m_chunked_body 再在完成时判超限。
+        go2cpp::http::ParserLimits tight_limits;
+        tight_limits.max_body_bytes = 16;
+        go2cpp::http::Parser tight_parser(tight_limits);
+        go2cpp::http::Response tight_response;
+        GO2CPP_CHECK(tight_parser
+                         .feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n20\r\n",
+                               tight_response)
+                         .state == go2cpp::http::ParseState::Error);
+    }
     // 快速路径：16 KiB body 分 16 次喂，确认短消息同样逐次重建头而不是累加。
     {
         go2cpp::http::Parser small_parser;
@@ -350,6 +463,78 @@ void run_network_tests() {
         GO2CPP_CHECK(dup_response.header.values("Content-Type").size() == 1);
         GO2CPP_CHECK(dup_response.body == "{\"ok\":1}");
     }
+
+    // 回归（BUG-1）：只有起始行、没有头字段的 informational 响应
+    // （`HTTP/1.1 100 Continue\r\n\r\n`）必须解析成完整消息。修复前
+    // header_block 内没有 CRLF，find("\r\n") 返回 npos，被误判为
+    // invalid start line（Client 0ms 返回 Parse(7)）。
+    {
+        go2cpp::http::Parser continue_parser;
+        go2cpp::http::Response continue_response;
+        const auto continue_result =
+            continue_parser.feed("HTTP/1.1 100 Continue\r\n\r\n", continue_response);
+        GO2CPP_CHECK(continue_result.state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(continue_response.status == go2cpp::http::Status::Continue);
+        GO2CPP_CHECK(continue_response.body.empty());
+        GO2CPP_CHECK(continue_parser.take_remaining().empty());
+    }
+    // 同一 recv 内 100 与 200 粘连：100 完成后剩余字节必须原样交给下一次
+    // reset+feed（Client 的 pending/take_remaining 路径）。
+    {
+        go2cpp::http::Parser continued_parser;
+        go2cpp::http::Response continued_response;
+        GO2CPP_CHECK(continued_parser
+                         .feed("HTTP/1.1 100 Continue\r\n\r\n"
+                               "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+                               continued_response)
+                         .state == go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(continued_response.status == go2cpp::http::Status::Continue);
+        const std::string buffered = continued_parser.take_remaining();
+        GO2CPP_CHECK(buffered == "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        continued_parser.reset();
+        continued_response = go2cpp::http::Response{};
+        GO2CPP_CHECK(continued_parser.feed(buffered, continued_response).state ==
+                     go2cpp::http::ParseState::Complete);
+        GO2CPP_CHECK(continued_response.status == go2cpp::http::Status::OK &&
+                     continued_response.body == "ok");
+    }
+    // Client 层：上游先回空头 100、再回 200。修复前 Client 在 100 上直接
+    // 返回 Parse，gateway 把上游 100 变成 502；修复后必须跳过 100 拿到 200。
+    auto continue_listener = go2cpp::net::Socket::CreateTCP(AF_INET);
+    GO2CPP_REQUIRE(continue_listener &&
+                   continue_listener->bind(*go2cpp::net::IPv4Address::Create("127.0.0.1", 0)) &&
+                   continue_listener->listen(4));
+    auto continue_address =
+        std::dynamic_pointer_cast<go2cpp::net::IPv4Address>(continue_listener->local_address());
+    GO2CPP_REQUIRE(continue_address);
+    std::thread continue_server([continue_listener] {
+        auto accepted = continue_listener->accept(std::chrono::seconds(2));
+        if (!accepted) return;
+        std::string request_bytes;
+        std::array<char, 512> request_buffer{};
+        while (request_bytes.find("\r\n\r\n") == std::string::npos) {
+            const auto read = accepted->recv(request_buffer.data(), request_buffer.size(), 0,
+                                              std::chrono::seconds(2));
+            if (!read.ok() || read.transferred == 0) return;
+            request_bytes.append(request_buffer.data(), static_cast<std::size_t>(read.transferred));
+        }
+        static constexpr char responses[] =
+            "HTTP/1.1 100 Continue\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        const auto sent =
+            accepted->send(responses, sizeof(responses) - 1, 0, std::chrono::seconds(2));
+        GO2CPP_CHECK(sent.ok() && sent.transferred == static_cast<ssize_t>(sizeof(responses) - 1));
+        accepted->close();
+    });
+    const auto continue_client_result = go2cpp::http::Client(std::chrono::seconds(2)).get(
+        "http://127.0.0.1:" + std::to_string(continue_address->port()) + "/continue");
+    GO2CPP_CHECK(continue_client_result.ok());
+    if (continue_client_result.response) {
+        GO2CPP_CHECK(continue_client_result.response->status == go2cpp::http::Status::OK);
+        GO2CPP_CHECK(continue_client_result.response->body == "ok");
+    }
+    GO2CPP_JOIN_WITH_WATCHDOG(continue_server, std::chrono::seconds(3));
+    continue_listener->close();
 
     // 流式响应只允许 Idle -> HeadersCommitted -> Closed，重复 close/write 必须失败。
     int stream_pair[2]{};
