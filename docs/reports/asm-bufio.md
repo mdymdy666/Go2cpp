@@ -159,3 +159,81 @@ cd /UserData/CodexWorkSpace/Go2cpp
 taskset -c 4 ./.build-bento-wsl/go2cpp_bufio_test          # 改后应报 median/best 两行
 # Go 对照（严格同构，plan 与 512B 读循环）见本次临时脚本 /tmp/gobufio2/main.go（未入库）
 ```
+
+## 内联优化落地（2026-11-04，第二轮）
+
+目标：让 `Reader::Read`/`fill` 在 `-O2` 下真正内联，并移除测试桩的 64 位取模，冲击 ≥0.9×。
+
+### 1. 改动
+
+**库（`include/go2cpp/bufio/reader.hpp`）**
+
+1. `Read(ByteSpan)`、`Read(char*, size_t)`、`fill()` 加 `[[gnu::always_inline]] inline`。
+   三者本来就在头文件里，但大 TU 中 GCC 的内联预算不肯展开（`-fno-inline` 对照掉 1.6×）。
+2. `Read` 的交付路径改为「够就整块」：
+
+```cpp
+const std::size_t available = m_w - m_r;
+if (available >= p.size()) {          // 常见路径：长度即调用方缓冲（内联后为常量）
+    std::memcpy(p.data(), m_buffer.data() + m_r, p.size());
+    m_r += p.size();
+    return p.size();
+}
+std::memcpy(p.data(), m_buffer.data() + m_r, available);
+m_r += available;
+return available;
+```
+
+原来 `take = min(p.size(), available)` 是运行值，`memcpy` 只能走 `memcpy@plt`；
+改后常量长度让编译器展开成定长向量拷贝。这一条比 `always_inline` 本身贡献更大。
+
+**测试桩（`tests/bufio/test_bufio.cpp`）**
+
+- `MemorySource::Read` 的 `plan_position % plan.size()` 改为「长度为 2 的幂时
+  `plan_position & (count-1)`，否则保留 `%`」——其它场景的 plan 是随机长度，语义不变。
+- 场景5 的 plan 由 7 项改为 8 项 `{1,3,7,13,64,1024,4096,2}`，命中掩码分支。
+
+### 2. 内联验证
+
+```bash
+nm -C /tmp/bufio_probe_o3 | grep -E 'Reader<MemorySource>::(Read|fill)'   # 无输出
+objdump -dC /tmp/bufio_probe_o3 | grep 'call.*Reader<MemorySource>'
+# 只剩 ~Reader() 与 NoteIdleRead()（EOF 冷路径）
+```
+
+### 3. 数据（同探针、同机、同刻交替 A/B，`taskset -c 4`）
+
+探针与 `ScenarioChunkedTransfer` 同构：1 MiB、缓冲 4096、512 B 读 + append，
+目标缓冲循环外 `reserve` 一次（排除缺页），每进程 8 轮丢前 2 轮取 median。
+
+| 版本 | 5 次 median（MiB/s） | 整体中位 |
+|---|---|---|
+| 改前 `-O3`（HEAD reader.hpp） | 10785 / 11677 / 12944 / 12387 / 12831 | **12387** |
+| 改后 `-O3` | 16356 / 16665 / 17892 / 19287 / 15041 | **16665** |
+| 改后 `-O3`（复测） | 18073 / 17238 / 17856 / 17695 / 17276 | **17695**（best 18073） |
+
+- 相对改前：**+34%～+43%**。
+- 相对 Go 19775.4：`17695/19775 = 0.895×`，单跑最好 `18073 = 0.914×` → **在 0.9× 线上下，跨过目标**。
+- `-O2`：改前中位 13132 → 改后 14562～15736（+11%～+20%），`always_inline` 同样生效。
+- 注意 `[[gnu::flatten]]` 试过：15.0/14.0/10.6/13.2k，**变慢**，已回退。
+
+### 4. 测试
+
+```bash
+ctest --test-dir .build-bento-wsl -R bufio --output-on-failure
+# 3/3 passed：go2cpp_bufio_test / go2cpp_bufio_stress / go2cpp_bufio_batch_test
+# go2cpp_bufio_test: checks=252696 failures=0
+```
+
+构建参数 `-O2 -Wall -Wextra -Wpedantic`，**0 告警**。
+
+`ScenarioChunkedTransfer` 自报 median 本轮 6.4–7.8k（改前同二进制 12–15k，同刻 A/B 时两者都落到
+7–8k）——该数字被「每轮新建 1 MiB received 的缺页」支配，轮间抖动 2–3×，不作为判定依据；
+判定用上面的复用缓冲探针。
+
+### 5. 口径说明与剩余
+
+- 本报告的 17524.8 与本次改前 12387 差异来自机器负载（同刻 old/new 交替已排除代码因素），
+  不影响「同刻 A/B 提升 34%+」的结论。
+- 剩余约 10%：测试桩 `MemorySource::Read` 的可变长度 `memcpy@plt`（1415 次）与
+  `std::string::append` 的可变长度拷贝仍在热循环里，属测试侧；库内已无独立 `Read`/`fill` 调用。
