@@ -14,12 +14,13 @@
  * @copyright MIT License
  */
 
+#include "go2cpp/logging/log.hpp"
 #include "go2cpp/tunnel/client.hpp"
 
 #include <csignal>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 
 #include <chrono>
@@ -31,9 +32,44 @@ std::atomic<bool> g_stop{false};
 
 void OnSignal(int /*signal_number*/) { g_stop.store(true); }
 
+/**
+ * @brief 初始化命令行入口的日志出口。
+ *
+ * @details 与 `server_main.cpp` 相同的策略：信息与警告走 stdout、错误走
+ *          stderr，`{message}\n` 模式保持原先单行文本的输出形态。
+ */
+void InitLogging() {
+    using go2cpp::log::Level;
+    using go2cpp::log::LogItemWorker;
+    using go2cpp::log::LogSink;
+    using go2cpp::log::MinimumLevelFilter;
+    using go2cpp::log::PatternFormatter;
+    auto& manager = go2cpp::log::LoggerManager::Instance();
+    manager.Configure(Level::Info, /*stdout_enabled=*/false, "log", "go2cpp.log",
+                      "{message}\n");
+    const auto make_worker = [](Level level, LogSink::ptr sink) {
+        return std::make_shared<LogItemWorker>(
+            std::make_shared<MinimumLevelFilter>(level),
+            std::make_shared<PatternFormatter>("{message}\n"), std::move(sink));
+    };
+    // step1: 信息/警告 → stdout
+    auto info_logger = manager.Get("tunnel");
+    info_logger->SetLevel(Level::Info);
+    info_logger->SetPropagate(false);
+    info_logger->ConfigureDefaults(
+        {make_worker(Level::Info, std::make_shared<go2cpp::log::StdoutSink>())});
+    // step2: 错误 → stderr
+    auto error_logger = manager.Get("tunnel.error");
+    error_logger->SetLevel(Level::Error);
+    error_logger->SetPropagate(false);
+    error_logger->ConfigureDefaults(
+        {make_worker(Level::Error, std::make_shared<go2cpp::log::StderrSink>())});
+}
+
 void PrintUsage(const char* program) {
-    std::printf(
-        "用法: %s --server <host[:port]> --local <port|host:port> "
+    const std::string text =
+        std::string("用法: ") + program +
+        " --server <host[:port]> --local <port|host:port> "
         "[--subdomain <名字>]\n"
         "\n"
         "把本地 HTTP 服务发布成公网 URL（服务端需先运行 tunnel-server）。\n"
@@ -50,9 +86,11 @@ void PrintUsage(const char* program) {
         "  -h, --help              显示本帮助\n"
         "\n"
         "示例:\n"
-        "  %s --server 203.0.113.7:7443 --local 8080 --subdomain shop\n"
-        "  → 已上线: http://203.0.113.7:8443/shop/  →  127.0.0.1:8080\n",
-        program, program);
+        "  " +
+        program +
+        " --server 203.0.113.7:7443 --local 8080 --subdomain shop\n"
+        "  → 已上线: http://203.0.113.7:8443/shop/  →  127.0.0.1:8080";
+    GO2CPP_LOG_INFO(GO2CPP_LOG_NAME("tunnel")) << text;
 }
 
 bool ParseU16(const char* text, std::uint16_t* out) {
@@ -83,7 +121,8 @@ bool ParseSize(const char* text, std::size_t* out) {
 
 const char* NextArg(int argc, char** argv, int* index, const char* name) {
     if (*index + 1 >= argc) {
-        std::fprintf(stderr, "错误: %s 缺少参数\n", name);
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("tunnel.error"))
+            << "错误: " << name << " 缺少参数";
         return nullptr;
     }
     *index += 1;
@@ -120,6 +159,7 @@ bool SplitHostPort(const std::string& text, std::uint16_t default_port,
 }  // namespace
 
 int main(int argc, char** argv) {
+    InitLogging();
     go2cpp::tunnel::TunnelClientConfig config;
     bool quiet = false;
     for (int index = 1; index < argc; ++index) {
@@ -133,7 +173,8 @@ int main(int argc, char** argv) {
             if (value == nullptr ||
                 !SplitHostPort(value, 7443, &config.server_host,
                                &config.server_port)) {
-                std::fprintf(stderr, "错误: 非法 --server（示例 1.2.3.4:7443）\n");
+                GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("tunnel.error"))
+                    << "错误: 非法 --server（示例 1.2.3.4:7443）";
                 return 2;
             }
         } else if (argument == "--local") {
@@ -141,7 +182,8 @@ int main(int argc, char** argv) {
             if (value == nullptr ||
                 !SplitHostPort(value, 80, &config.local_host,
                                &config.local_port)) {
-                std::fprintf(stderr, "错误: 非法 --local（示例 8080）\n");
+                GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("tunnel.error"))
+                    << "错误: 非法 --local（示例 8080）";
                 return 2;
             }
         } else if (argument == "--subdomain") {
@@ -162,14 +204,16 @@ int main(int argc, char** argv) {
             const long parsed = value == nullptr ? -1 : std::strtol(value, &end, 10);
             if (value == nullptr || end == nullptr || *end != '\0' ||
                 parsed < 0 || parsed > 64) {
-                std::fprintf(stderr, "错误: 非法 --data-conns（0..64）\n");
+                GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("tunnel.error"))
+                    << "错误: 非法 --data-conns（0..64）";
                 return 2;
             }
             config.data_conns = static_cast<int>(parsed);
         } else if (argument == "--max-streams") {
             const char* value = NextArg(argc, argv, &index, "--max-streams");
             if (value == nullptr || !ParseSize(value, &config.max_local_streams)) {
-                std::fprintf(stderr, "错误: 非法 --max-streams\n");
+                GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("tunnel.error"))
+                    << "错误: 非法 --max-streams";
                 return 2;
             }
         } else if (argument == "--crc") {
@@ -177,8 +221,8 @@ int main(int argc, char** argv) {
         } else if (argument == "--quiet") {
             quiet = true;
         } else {
-            std::fprintf(stderr, "错误: 未知参数 %s（--help 查看用法）\n",
-                         argument.c_str());
+            GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("tunnel.error"))
+                << "错误: 未知参数 " << argument << "（--help 查看用法）";
             return 2;
         }
     }
@@ -209,39 +253,37 @@ int main(int argc, char** argv) {
     go2cpp::tunnel::TunnelClient client(config);
     if (!quiet) {
         client.set_event_handler([](const std::string& message) {
-            std::printf("%s\n", message.c_str());
-            std::fflush(stdout);
+            GO2CPP_LOG_INFO(GO2CPP_LOG_NAME("tunnel")) << message;
         });
     }
 
     go2cpp::ErrorPtr error;
     if (!client.Start(&error)) {
-        std::fprintf(stderr, "启动失败: %s\n",
-                     go2cpp::ErrorMessage(error).c_str());
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("tunnel.error"))
+            << "启动失败: " << go2cpp::ErrorMessage(error);
         return 1;
     }
-    std::printf("tunnel-client 正在连接 %s:%u …\n", config.server_host.c_str(),
-                static_cast<unsigned>(config.server_port));
-    std::fflush(stdout);
+    GO2CPP_LOG_INFO(GO2CPP_LOG_NAME("tunnel"))
+        << "tunnel-client 正在连接 " << config.server_host << ":"
+        << static_cast<unsigned>(config.server_port) << " …";
 
     if (!client.WaitOnline(15000)) {
-        std::fprintf(stderr,
-                     "错误: 15 秒内未能上线（检查服务端地址、token、子域名）\n");
+        GO2CPP_LOG_ERROR(GO2CPP_LOG_NAME("tunnel.error"))
+            << "错误: 15 秒内未能上线（检查服务端地址、token、子域名）";
         client.Stop();
         return 1;
     }
-    const std::string url = client.public_url();
-    std::printf("\n========================================\n");
-    std::printf(" 公网 URL: %s\n", url.c_str());
-    std::printf(" 本地目标: %s:%u\n", config.local_host.c_str(),
-                static_cast<unsigned>(config.local_port));
-    std::printf("========================================\n\n");
-    std::fflush(stdout);
+    GO2CPP_LOG_INFO(GO2CPP_LOG_NAME("tunnel"))
+        << "\n========================================\n"
+        << " 公网 URL: " << client.public_url() << "\n"
+        << " 本地目标: " << config.local_host << ":"
+        << static_cast<unsigned>(config.local_port) << "\n"
+        << "========================================\n";
 
     while (!g_stop.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     client.Stop();
-    std::printf("tunnel-client 已停止\n");
+    GO2CPP_LOG_INFO(GO2CPP_LOG_NAME("tunnel")) << "tunnel-client 已停止";
     return 0;
 }

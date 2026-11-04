@@ -61,7 +61,7 @@ target_include_directories(go2cpp_tunnel
 target_compile_features(go2cpp_tunnel PUBLIC cxx_std_17)
 target_compile_options(go2cpp_tunnel PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(go2cpp_tunnel
-    PUBLIC go2cpp_frame go2cpp_relay_pipe go2cpp_hash go2cpp_error
+    PUBLIC go2cpp_frame go2cpp_relay_pipe go2cpp_hash go2cpp_error go2cpp_log
            Threads::Threads)
 
 set_target_properties(go2cpp_tunnel PROPERTIES

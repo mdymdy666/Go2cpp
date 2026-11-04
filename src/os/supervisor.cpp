@@ -4,6 +4,7 @@
  */
 #include "go2cpp/os/supervisor.hpp"
 
+#include "go2cpp/logging/log.hpp"
 #include "go2cpp/os/channel.hpp"
 #include "raw_io.hpp"
 
@@ -349,9 +350,10 @@ void Supervisor::Impl::EmitStderr(pid_t pid, pid_t pgid, const std::string& text
     if (!options.forward_stderr) {
         return;
     }
-    std::fprintf(stderr, "[os.supervisor stderr pid=%d pgid=%d] %s%s\n",
-                 static_cast<int>(pid), static_cast<int>(pgid), text.c_str(),
-                 partial ? " <partial>" : "");
+    GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("os.supervisor"))
+        << "stderr pid=" << static_cast<int>(pid) << " pgid="
+        << static_cast<int>(pgid) << "] " << text
+        << (partial ? " <partial>" : "");
 }
 
 void Supervisor::Impl::ApplyHeartbeats() {

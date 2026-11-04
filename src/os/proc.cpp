@@ -20,6 +20,7 @@
 #include "go2cpp/os/proc.hpp"
 
 #include "go2cpp/config/config.hpp"
+#include "go2cpp/logging/log.hpp"
 #include "go2cpp/os/channel.hpp"
 #include "go2cpp/os/pty.hpp"
 #include "raw_io.hpp"
@@ -259,17 +260,18 @@ void EmitStderrLine(const StderrLine& line) {
 }
 
 void DefaultEventLog(const ProcEvent& event) {
-    std::fprintf(stderr,
-                 "[os.proc] event=%s pid=%d pgid=%d exit=%d signal=%d reason=%s\n",
-                 ToString(event.type), static_cast<int>(event.pid),
-                 static_cast<int>(event.pgid), event.exit_code, event.signal,
-                 event.reason.c_str());
+    GO2CPP_LOG_INFO(GO2CPP_LOG_NAME("os.proc"))
+        << "event=" << ToString(event.type) << " pid="
+        << static_cast<int>(event.pid) << " pgid="
+        << static_cast<int>(event.pgid) << " exit=" << event.exit_code
+        << " signal=" << event.signal << " reason=" << event.reason;
 }
 
 void DefaultStderrLog(const StderrLine& line) {
-    std::fprintf(stderr, "[os.proc stderr pid=%d pgid=%d] %s%s\n",
-                 static_cast<int>(line.pid), static_cast<int>(line.pgid),
-                 line.text.c_str(), line.partial ? " <partial>" : "");
+    GO2CPP_LOG_WARN(GO2CPP_LOG_NAME("os.proc"))
+        << "stderr pid=" << static_cast<int>(line.pid) << " pgid="
+        << static_cast<int>(line.pgid) << "] " << line.text
+        << (line.partial ? " <partial>" : "");
 }
 
 void EmitSpawnEvent(pid_t pid, pid_t pgid) {
