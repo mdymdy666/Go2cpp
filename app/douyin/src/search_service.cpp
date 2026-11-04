@@ -22,7 +22,10 @@
 #include "douyin_http.hpp"
 #include "douyin_proto.hpp"
 #include "douyin_store.hpp"
+#include "douyin_tag.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -155,6 +158,45 @@ std::string ToItemJson(const ResultItem& item) {
     return douyin::ToJson(result);
 }
 
+
+/// @brief 话题结果项：name 为话题名，count 为命中视频数。
+struct TagItem {
+    std::string name;
+    std::int64_t count{0};
+};
+
+/// @brief 转小写（按字节，ASCII 足够 demo 使用）。
+std::string Lower(std::string text) {
+    for (char& c : text) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return text;
+}
+
+/// @brief 大小写不敏感的子串包含判断。
+bool ContainsIgnoreCase(const std::string& haystack, const std::string& needle) {
+    return Lower(haystack).find(Lower(needle)) != std::string::npos;
+}
+
+/// @brief 累加话题计数：同名条目 count + 1，否则追加一条。
+void AddTag(const std::string& name, std::vector<TagItem>* out) {
+    for (TagItem& item : *out) {
+        if (item.name == name) {
+            ++item.count;
+            return;
+        }
+    }
+    out->push_back(TagItem{name, 1});
+}
+
+/// @brief 按命中视频数降序（稳定排序，同数保持首次出现顺序）。
+void SortTags(std::vector<TagItem>* tags) {
+    std::stable_sort(tags->begin(), tags->end(),
+                     [](const TagItem& a, const TagItem& b) {
+                         return a.count > b.count;
+                     });
+}
+
 /// @brief 搜索路由。
 bool HandleSearch(douyin::Store& store, const douyin::HttpRequest& request,
                   douyin::HttpResponse* response) {
@@ -167,8 +209,9 @@ bool HandleSearch(douyin::Store& store, const douyin::HttpRequest& request,
     if (type.empty()) {
         type = "all";
     }
-    if (type != "user" && type != "video" && type != "live" && type != "all") {
-        return Fail(response, 400, "type 非法（user/video/live/all）");
+    if (type != "user" && type != "video" && type != "live" && type != "tag" &&
+        type != "all") {
+        return Fail(response, 400, "type 非法（user/video/tag/live/all）");
     }
 
     std::int64_t offset = 0;
@@ -214,7 +257,7 @@ bool HandleSearch(douyin::Store& store, const douyin::HttpRequest& request,
                 items.push_back(ResultItem{"video", video.id, video.title});
             }
         }
-    } else {
+    } else if (type == "all") {
         // all：用户在前、视频在后（固定顺序），live 为空。
         const std::int64_t span = offset + limit + 1;
         std::vector<douyin::StoredUser> users;
@@ -251,7 +294,82 @@ bool HandleSearch(douyin::Store& store, const douyin::HttpRequest& request,
         }
     }
 
-    std::string body = "{\"ok\":true,\"items\":[";
+    // 聚合面板：users / videos / tags 各自最多 10 条（与 items 分页无关）。
+    constexpr std::int64_t kFacetLimit = 10;
+    std::vector<douyin::StoredUser> facet_users;
+    std::vector<douyin::StoredVideo> facet_videos;
+    std::vector<TagItem> facet_tags;
+    if (type == "user" || type == "all") {
+        if (!store.SearchUsers(query, kFacetLimit, 0, &facet_users, &error)) {
+            std::fprintf(stderr, "[%s] 搜索用户失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+    }
+    if (type == "video" || type == "all") {
+        if (!store.SearchVideos(query, kFacetLimit, 0, &facet_videos, &error)) {
+            std::fprintf(stderr, "[%s] 搜索视频失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+    }
+    if (type == "tag" || type == "all") {
+        // 话题没有独立表：demo 视频量级是几十条，全量扫描 + 标题提取即可。
+        // 命中规则：视频标题含 q（视频相关）或话题名含 q（话题直接命中）。
+        std::vector<douyin::StoredVideo> all_videos;
+        if (!store.ListAllVideos(&all_videos, &error)) {
+            std::fprintf(stderr, "[%s] 枚举视频失败: %s\n", kServiceName,
+                         error.c_str());
+            return Fail(response, 500, "数据库错误");
+        }
+        for (const douyin::StoredVideo& video : all_videos) {
+            const bool title_hit = ContainsIgnoreCase(video.title, query);
+            for (const std::string& tag : douyin::ExtractTags(video.title)) {
+                if (title_hit || ContainsIgnoreCase(tag, query)) {
+                    AddTag(tag, &facet_tags);
+                }
+            }
+        }
+        SortTags(&facet_tags);
+        if (static_cast<std::int64_t>(facet_tags.size()) > kFacetLimit) {
+            facet_tags.resize(static_cast<std::size_t>(kFacetLimit));
+        }
+    }
+
+    std::string body = "{\"ok\":true,\"users\":[";
+    for (std::size_t i = 0; i < facet_users.size(); ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += "{\"id\":" + std::to_string(facet_users[i].id) +
+                ",\"name\":\"" + douyin::JsonEscape(facet_users[i].name) + "\"}";
+    }
+    body += "],\"videos\":[";
+    const std::size_t video_count =
+        static_cast<std::size_t>(kFacetLimit) < facet_videos.size()
+            ? static_cast<std::size_t>(kFacetLimit)
+            : facet_videos.size();
+    for (std::size_t i = 0; i < video_count; ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        const douyin::StoredVideo& video = facet_videos[i];
+        body += "{\"id\":" + std::to_string(video.id) + ",\"user_id\":" +
+                std::to_string(video.user_id) + ",\"title\":\"" +
+                douyin::JsonEscape(video.title) + "\",\"url\":\"" +
+                douyin::JsonEscape(video.url) + "\",\"like_count\":" +
+                std::to_string(video.like_count) + ",\"comment_count\":" +
+                std::to_string(video.comment_count) + "}";
+    }
+    body += "],\"tags\":[";
+    for (std::size_t i = 0; i < facet_tags.size(); ++i) {
+        if (i != 0) {
+            body += ',';
+        }
+        body += "{\"name\":\"" + douyin::JsonEscape(facet_tags[i].name) +
+                "\",\"count\":" + std::to_string(facet_tags[i].count) + "}";
+    }
+    body += "],\"items\":[";
     for (std::size_t i = 0; i < items.size(); ++i) {
         if (i != 0) {
             body += ',';

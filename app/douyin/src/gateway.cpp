@@ -54,20 +54,39 @@ using go2cpp::http::Method;
 using go2cpp::http::Status;
 namespace method_mask = go2cpp::app::gateway::method_mask;
 
+/// @brief 读取端口环境变量；缺失/非法时回退 defaultValue，默认部署行为不变。
+///
+/// @details 上游端口允许用 `DOUYIN_<SERVICE>_PORT` 覆盖，与
+///          `scripts/accept_all.sh` 的端口变量同名：脚本一直支持改端口跑，
+///          但网关原来写死上游端口，端口被占用时会把请求转发到别人的实例。
+std::uint16_t PortFromEnv(const char* name, std::uint16_t defaultValue) {
+    const char* text = std::getenv(name);
+    if (text == nullptr || *text == '\0') {
+        return defaultValue;
+    }
+    char* end = nullptr;
+    const long long value = std::strtoll(text, &end, 10);
+    if (end == text || value <= 0 || value > 65535) {
+        return defaultValue;
+    }
+    return static_cast<std::uint16_t>(value);
+}
+
 /// @brief 网关默认监听端口。
 constexpr std::uint16_t kDefaultPort = 28080;
-/// @brief user 服务端口。
-constexpr std::uint16_t kUserPort = 29101;
-/// @brief video 服务端口。
-constexpr std::uint16_t kVideoPort = 29102;
-/// @brief feed 服务端口。
-constexpr std::uint16_t kFeedPort = 29103;
-/// @brief interaction 服务端口（like + comment）。
-constexpr std::uint16_t kInteractionPort = 29104;
-/// @brief live 服务端口。
-constexpr std::uint16_t kLivePort = 29105;
-/// @brief search 服务端口。
-constexpr std::uint16_t kSearchPort = 29106;
+/// @brief user 服务端口（可用 DOUYIN_USER_PORT 覆盖）。
+const std::uint16_t kUserPort = PortFromEnv("DOUYIN_USER_PORT", 29101);
+/// @brief video 服务端口（可用 DOUYIN_VIDEO_PORT 覆盖）。
+const std::uint16_t kVideoPort = PortFromEnv("DOUYIN_VIDEO_PORT", 29102);
+/// @brief feed 服务端口（可用 DOUYIN_FEED_PORT 覆盖）。
+const std::uint16_t kFeedPort = PortFromEnv("DOUYIN_FEED_PORT", 29103);
+/// @brief interaction 服务端口（可用 DOUYIN_INTERACTION_PORT 覆盖）。
+const std::uint16_t kInteractionPort =
+    PortFromEnv("DOUYIN_INTERACTION_PORT", 29104);
+/// @brief live 服务端口（可用 DOUYIN_LIVE_PORT 覆盖）。
+const std::uint16_t kLivePort = PortFromEnv("DOUYIN_LIVE_PORT", 29105);
+/// @brief search 服务端口（可用 DOUYIN_SEARCH_PORT 覆盖）。
+const std::uint16_t kSearchPort = PortFromEnv("DOUYIN_SEARCH_PORT", 29106);
 /// @brief 服务名（日志用）。
 constexpr const char* kServiceName = "gateway";
 /// @brief 静态资源根目录：build.sh 用 -DDOUYIN_WEB_DIR 注入绝对路径，
