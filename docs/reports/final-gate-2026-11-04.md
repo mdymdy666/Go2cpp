@@ -13,7 +13,7 @@
 |---|---|---|---|
 | ① | 全量 ctest | **绿** | 203 项：200 通过 / 0 失败 / 3 跳过（tools-migration、tools-cli、tools-replay，缺 go 工具链），`100% tests passed`，159.86 s（`-j4`，为 40 分钟盒采用并行；0 失败故无需串行复核） |
 | ② | ASan/UBSan | **绿** | 3 个核心二进制：`net_batch` 46156 checks/0 fail；`kv` 52665 checks/0 fail；`fast_channel` 修复后 3/3 次 0 泄漏（`WaitNodePool` TLS 池已归还）、功能全过；无 ASan 越界、无 UBSan 报告 |
-| ③ | TSan | **黄（部分修复）** | 纯净 HEAD 重建 `.build-gate-tsan/go2cpp_tunnel_test`：170 checks / 0 功能失败、**0 data race**；thread leak 修复后 3 次中 1 次复现，残留为 `Direction` 线程 finished-not-joined（根因在 server.cpp 的 detached worker，见修复记录） |
+| ③ | TSan | **黄（server 侧取消链路已打通，未清零）** | `setarch x86_64 -R` + TSan `go2cpp_tunnel_test` 连跑 5 次：thread leak 数量 1 / 2 / 0 / 0 / 0（修前 4/5 次复现）。server 侧已改「可取消 context + 在途连接登记 + Stop 主动 shutdown」，`HandlePublic` 的 Direction 泄漏降为偶发 1 条；新暴露 `src/tunnel/client.cpp:618 RelayLocal` 的同构 `Run(nullptr)` 泄漏（超出本次授权）。0 data race、功能 checks 全过 |
 | ④ | 零告警 | **红** | 构建日志 54 条 `warning:`，排除 8 条 debug_dump 后 **46 条**：unused-function 23、unused-result 15、-Wcomment 14、switch 2；集中于未改动的既有文件（test_hook_correctness 13、hpack.cpp 8、debug_event_ring 5、container/ring/list 头 14） |
 | ⑤ | 构建一致性 | **绿** | `check_build_freshness.sh --build-dir .build-gate` → `RESULT: FRESH`（源码最新 18:52:49 < 产物最新 18:57:34；sources 491 / artifacts 34） |
 | ⑥ | soak 二进制一致性 | **红（不一致）** | soak 报告自述被测二进制构建于 18:24–18:36；而 `src/tunnel/{client,server}.cpp` 于 **18:44:06** 被 `fe54cc5` 修改（200 行），soak 的 tunnel 段**不含**该修复。network/ws/http 源码在 18:35 后未变，这两段有效 |
@@ -72,8 +72,38 @@
 - 结论：relay 侧无法单独闭环；需在 `server.cpp` 的 Stop/析构路径跟踪并关闭在途 public
   连接、join worker（超出本次「只改 relay_pipe.cpp + channel.hpp」授权，保留为阻塞项）。
 
+### ③-2 TSan 线程泄漏 —— server 侧取消链路已打通，未清零（2026-11-04 19:10–19:45）
+
+- 根因确认：`TunnelServer::Spawn` 的记账已在 `fe54cc5` 落地（`m_workers` 计数 +
+  `stopping` 判定），但 `HandlePublic` 里 `RelayPipe::Run(nullptr)` 传的是
+  `Context::Background()`——**永不取消**。`Stop()` 关掉监听后，在途 public 连接的 `Run`
+  只能等两端自然 EOF，卡在 `done_cv.wait`；`WaitWorkers` 超时后对象析构，Direction 线程
+  finished-not-joined。
+- 修法（`src/tunnel/server.cpp` + `include/go2cpp/tunnel/server.hpp`）：
+  1. 新增 `m_stop_ctx` / `m_stop_cancel`（`Context::WithCancel(Background())`）；
+     `Stop()` 在置 `stopping` 之前 `m_stop_cancel()`，在途 `RelayPipe::Run` 立即从
+     `done_cv.wait` 醒来并 `ForceCloseAll`；
+  2. 新增 `m_inflight_public` 登记表 + `TrackInflight` / `UntrackInflight`，
+     `HandlePublic` 入口用 RAII 守卫登记（所有早退路径都注销）；`Stop()` 取快照后在锁外
+     逐条 `TcpConn::Shutdown()`（幂等、任意线程可调、只 `shutdown(SHUT_RDWR)` 不 `close`），
+     打断卡在 `ReadHttpHead` / `Read` 的 worker；
+  3. `HandlePublic` 与 `ServeRawStream` 的 3 处 `Run(nullptr)` 改传 `m_stop_ctx`。
+- 验证（`build-tsan`：Release + `-DGO2CPP_ENABLE_TSAN=ON`，12 核）：
+  `setarch x86_64 -R ./go2cpp_tunnel_test` 连跑 5 次 → 泄漏线程数 **1 / 2 / 0 / 0 / 0**
+  （修前基线 4/5 次复现）。诊断打印证实取消链路有效：`Stop()` 阶段 `stop cancel fired`
+  正常触发，`pipe.Run` 在 Stop 之前的自然返回路径 `IsDone()==0`。
+- 残余（**超出本 agent 授权，需上层继续**）：
+  1. `src/tunnel/client.cpp:618` 的 `RelayLocal` 仍是 `pipe.Run(nullptr)`，与 server 侧
+     修前完全同构——ts2 的泄漏栈之一即 `TunnelClient::RelayLocal`（5 次中 1 次）；
+  2. `HandlePublic` 仍有偶发 1 条 Direction leak（5 次中 2 次）：推测为 `Join()` 卡在另一
+     方向对 `MuxStream::Write`（session 已 Stop、写队列无超时）上，reader 已 finished 而
+     writer 未退；修它要动 mux/client，超出「只改 server.cpp/server.hpp」授权。
+- 性能断言：`tests/tunnel/test_tunnel.cpp:884 ratio < 4.0` 在 TSan 下波动到 5.69x / 8.58x，
+  同一二进制常规构建连跑两次也是 4.08x / 5.69x，属阈值过敏；本次改动不在热路径
+  （每条连接只多 2 次 mutex 登记，relay 数据面未动）。
+
 ### 门禁状态变化
 
 - ② ASan：红 → **绿**（3/3 零泄漏）。
-- ③ TSan：红 → **黄**（watchdog 路径已加固；残留为 `Direction` 线程 finished-not-joined，
-  需上层修 server.cpp 的 detached worker 生命周期）。
+- ③ TSan：红 → **黄**（server 侧取消链路已打通，泄漏由「4/5 次必现」降为「5 次中 2 次各 1 条」；
+  残余为新暴露的 client.cpp `RelayLocal` 同构问题 + `HandlePublic` 偶发 Join 阻塞）。
